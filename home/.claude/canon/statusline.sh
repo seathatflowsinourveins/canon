@@ -18,9 +18,11 @@ if [ -n "$sid" ] && mkdir -p "$dir" "$base/ledger" 2>/dev/null; then
   now_model=$(printf '%s' "$input" | jq -r '.model.id? // empty' 2>/dev/null)
   old_model=$(jq -r '.model // empty' "$dir/$sid.json" 2>/dev/null)
   if [ -n "$now_model" ] && [ -n "$old_model" ] && [ "$now_model" != "$old_model" ]; then
+    # the directory is left out when the input has none, so it never blanks the lane name
     jq -cn --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg sid "$sid" --arg from "$old_model" --arg to "$now_model" \
-       --arg cwd "$(printf '%s' "$input" | jq -r '.cwd? // empty' 2>/dev/null)" \
-       '{ts:$ts, ev:"PostModelSwitch", sid:$sid, cwd:$cwd, from_model:$from, to_model:$to, via:"statusline"}' \
+       --arg cwd "$(printf '%s' "$input" | jq -r '.workspace.current_dir? // .cwd? // empty' 2>/dev/null)" \
+       '{ts:$ts, ev:"PostModelSwitch", sid:$sid, from_model:$from, to_model:$to, via:"statusline"}
+        + (if $cwd == "" then {} else {cwd:$cwd} end)' \
        >> "$base/ledger/$(date -u +%Y-%m-%d).jsonl" 2>/dev/null
   fi
   printf '%s' "$input" | jq -c --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{

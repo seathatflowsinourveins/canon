@@ -9,9 +9,20 @@
 #
 # Usage: scripts/lanes [--days N] [--quiet-min N] [--json]
 #        scripts/lanes --selftest
-# Exit:  0 report printed; 4 ledger empty (hooks not installed, or no sessions yet); 1 selftest failed.
-# States: working | idle (turn finished) | QUIET (turn open, silent past the threshold) |
-#         abandoned (turn open, silent for six hours or more: the app was closed mid-turn) | ended.
+# --days N covers the ledger files of the last N UTC dates, today included (default 2); the header says which.
+# Only the snapshots of sessions that appear in that window are read.
+# Exit:  0 report printed; 2 usage error; 4 no ledger file in the window (hooks not installed, or no
+#        sessions in that period); 1 selftest or another step failed.
+# A line that is not a JSON object with a session id and a ts of the form YYYY-MM-DDTHH:MM:SSZ is counted
+# as unreadable and skipped. Events are ordered by t (epoch seconds with milliseconds, when the line has it),
+# else by ts; at an equal time a prompt sorts before the Stop that ends it.
+# States, decided from the last turn boundary (UserPromptSubmit against Stop, StopFailure, and a SessionStart
+# whose source is not "compact", which Claude Code writes in the middle of a turn that compacts); events
+# after it, such as PreCompact or SubagentStop, do not reopen a finished turn:
+#   working | idle (turn finished) | QUIET (turn open, silent past the threshold) |
+#   abandoned (turn open, silent for six hours or more: the app was closed mid-turn) | ended |
+#   unknown (no turn boundary in the window, so whether a turn is open cannot be told; never flagged QUIET).
+# Known limit: a background subagent still working after its parent turn's Stop reads as idle.
 set -euo pipefail
 
 CFG="${CANON_LEDGER_HOME:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}/canon}"
@@ -19,61 +30,115 @@ DAYS=2
 QUIET=15
 JSON=0
 SELFTEST=0
+usage() {
+  [ -z "${1:-}" ] || echo "lanes: $1" >&2
+  echo "usage: scripts/lanes [--days N] [--quiet-min N] [--json] | --selftest" >&2
+  exit 2
+}
 while [ $# -gt 0 ]; do
   case "$1" in
-    --days)      DAYS="$2"; shift 2 ;;
-    --quiet-min) QUIET="$2"; shift 2 ;;
+    --days)      [ $# -ge 2 ] || usage "--days needs a value"; DAYS="$2"; shift 2 ;;
+    --quiet-min) [ $# -ge 2 ] || usage "--quiet-min needs a value"; QUIET="$2"; shift 2 ;;
     --json)      JSON=1; shift ;;
     --selftest)  SELFTEST=1; shift ;;
-    *) echo "usage: scripts/lanes [--days N] [--quiet-min N] [--json] | --selftest" >&2; exit 2 ;;
+    *) usage ;;
   esac
 done
+case "$DAYS" in ''|*[!0-9]*) usage "--days needs a whole number of 1 or more" ;; esac
+case "$QUIET" in ''|*[!0-9]*) usage "--quiet-min needs a whole number of 1 or more" ;; esac
+DAYS=$((10#$DAYS)); QUIET=$((10#$QUIET))
+[ "$DAYS" -ge 1 ] || usage "--days needs a whole number of 1 or more"
+[ "$QUIET" -ge 1 ] || usage "--quiet-min needs a whole number of 1 or more"
 command -v jq >/dev/null 2>&1 || { echo "lanes: ERROR: jq not found" >&2; exit 1; }
+
+# utc_day <epoch seconds> -> YYYY-MM-DD in UTC (GNU date or BSD date)
+if date --version >/dev/null 2>&1; then
+  utc_day() { date -u -d "@$1" +%Y-%m-%d; }
+else
+  utc_day() { date -u -r "$1" +%Y-%m-%d; }
+fi
 
 # build_report -> one JSON object on stdout
 build_report() {
-  local files snaps="[]"
-  files=$(find "$CFG/ledger" -maxdepth 1 -name "*.jsonl" 2>/dev/null | sort | tail -n "$DAYS")
+  local now from to day i f files="" any=0 t
+  now=$(date -u +%s)
+  to=$(utc_day "$now")
+  from=$(utc_day $((now - (DAYS - 1) * 86400)))
+  i=$((DAYS - 1))
+  while [ "$i" -ge 0 ]; do
+    day=$(utc_day $((now - i * 86400)))
+    [ ! -f "$CFG/ledger/$day.jsonl" ] || files="$files$CFG/ledger/$day.jsonl
+"
+    i=$((i - 1))
+  done
   if [ -z "$files" ]; then
-    echo "lanes: ledger is empty at $CFG/ledger. Install the machine-level hooks with: scripts/bootstrap --user-config" >&2
+    for f in "$CFG"/ledger/*.jsonl; do [ -e "$f" ] && { any=1; break; }; done
+    if [ "$any" = 1 ]; then
+      echo "lanes: no ledger file from $from to $to (UTC) at $CFG/ledger. Widen the window with --days N." >&2
+    else
+      echo "lanes: ledger is empty at $CFG/ledger. Install the machine-level hooks with: scripts/bootstrap --user-config" >&2
+    fi
     return 4
   fi
-  if ls "$CFG"/sessions/*.json >/dev/null 2>&1; then
-    snaps=$(cat "$CFG"/sessions/*.json | jq -s 'map(select(.sid != null))')
-  fi
-  printf '%s\n' "$files" | while IFS= read -r f; do cat "$f"; done \
-  | jq -cR '. as $l | try ($l | fromjson) catch {"_bad": true}' \
-  | jq -s --argjson now "$(date -u +%s)" --argjson quiet "$QUIET" --argjson snaps "$snaps" '
+  t=$(mktemp -d) || return 1
+  # events and snapshots go through files, never through argv, so their number has no limit
+  printf '%s' "$files" | while IFS= read -r f; do cat "$f"; done \
+    | jq -cR '(try fromjson catch null) as $o
+        | if ($o | type) == "object" and $o.sid != null and ($o.ts | type) == "string"
+             and ($o.ts | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
+             and (($o.ts | try fromdateiso8601 catch null) != null)
+          then ($o.ts | fromdateiso8601) as $e
+               | $o + {_e: $e, _k: (if ($o.t | type) == "number" then $o.t else $e end)}
+          else {"_bad": true} end' > "$t/events" \
+    || { rm -rf "$t"; echo "lanes: ERROR: could not read the ledger" >&2; return 1; }
+  jq -r 'select(._bad != true) | .sid | tostring' "$t/events" | sort -u > "$t/sids" \
+    || { rm -rf "$t"; echo "lanes: ERROR: could not list sessions" >&2; return 1; }
+  while IFS= read -r f; do
+    case "$f" in ''|.*|*/*) continue ;; esac
+    [ ! -f "$CFG/sessions/$f.json" ] || { cat "$CFG/sessions/$f.json"; echo; }
+  done < "$t/sids" \
+    | jq -cR 'try fromjson catch empty | select(type == "object" and .sid != null)' > "$t/snaps" \
+    || { rm -rf "$t"; echo "lanes: ERROR: could not read session snapshots" >&2; return 1; }
+  jq -s --argjson now "$now" --argjson quiet "$QUIET" --argjson days "$DAYS" --arg from "$from" --arg to "$to" \
+     --slurpfile snaps "$t/snaps" '
       def count(f): map(select(f)) | length;
       def tally: group_by(.) | map({name: .[0], n: length}) | sort_by(-.n);
+      def boundary: .ev == "UserPromptSubmit" or .ev == "Stop" or .ev == "StopFailure"
+                    or (.ev == "SessionStart" and .source != "compact");
+      # at an equal time: a turn opens before anything else, and Stop or SessionEnd comes last
+      def rank: if .ev == "UserPromptSubmit" or .ev == "SessionStart" then 0
+                elif .ev == "Stop" or .ev == "StopFailure" or .ev == "SessionEnd" then 2 else 1 end;
       (map(select(._bad == true)) | length) as $bad
-      | map(select(._bad != true and .sid != null and .ts != null)) as $ev
-      | ($snaps | map({key: .sid, value: .}) | from_entries) as $snap
+      | map(select(._bad != true)) as $ev
+      | ($snaps | map({key: (.sid | tostring), value: .}) | from_entries) as $snap
       | {
           generated_at: ($now | todate),
+          period: {from: $from, to: $to, days: $days},
           quiet_threshold_min: $quiet,
           events: ($ev | length),
           unreadable_lines: $bad,
           sessions: (
             $ev | group_by(.sid) | map(
-              sort_by(.ts) as $e
-              | ($e | last) as $last
-              | ((($now - ($last.ts | fromdateiso8601)) / 60) | floor) as $q
+              sort_by([._k, rank]) as $e
+              | ([range(0; $e | length) | select($e[.] | boundary)] | last) as $bi
+              | (if $bi == null then null else $e[$bi] end) as $turn
+              | ((($now - ($e | map(._e) | max)) / 60) | floor) as $q
               | ($e | count(.ev == "PostToolUse")) as $tools
               | ($e | count(.ev == "PostToolUseFailure")) as $fail
               | ($e | count(.ev == "StopFailure")) as $stopfail
               | ($e | count(.ev == "PostModelSwitch")) as $switch
               | ($e | count(.ev == "PermissionDenied")) as $denied
               | ($e | count(.ev == "PreCompact")) as $compact
-              | (if $last.ev == "SessionEnd" then "ended"
-                 elif ($last.ev == "Stop" or $last.ev == "StopFailure" or $last.ev == "SessionStart") then "idle"
+              | (if ($e[(($bi // -1) + 1):] | any(.ev == "SessionEnd")) then "ended"
+                 elif $turn == null then "unknown"
+                 elif $turn.ev != "UserPromptSubmit" then "idle"
                  elif $q >= 360 then "abandoned"
                  elif $q >= $quiet then "QUIET"
                  else "working" end) as $state
-              | $e[0].sid as $sid
+              | ($e[0].sid | tostring) as $sid
               | {
                   sid: $sid,
-                  lane: ((($e | map(.cwd // empty) | last) // "?") | split("/") | last),
+                  lane: ((($e | map(.cwd // empty | select(type == "string" and . != "")) | last) // "?") | split("/") | last),
                   state: $state,
                   quiet_min: $q,
                   prompts: ($e | count(.ev == "UserPromptSubmit")),
@@ -106,12 +171,15 @@ build_report() {
                            else ($ev | map(select(.ev == "PostToolUse" and .subagent != null) | .subagent)) end)
                         | tally)
           }
-        }'
+        }' "$t/events" || { rm -rf "$t"; echo "lanes: ERROR: could not build the report" >&2; return 1; }
+  rm -rf "$t"
 }
 
 print_report() {
   local r="$1"
-  echo "Lanes at $(echo "$r" | jq -r '.generated_at')  (events: $(echo "$r" | jq -r '.events'), quiet threshold: ${QUIET}m)"
+  echo "$r" | jq -r '"Lanes at " + .generated_at + ", covering " + .period.from + " to " + .period.to
+                     + " UTC (" + (.period.days | tostring) + " day(s))  (events: " + (.events | tostring)
+                     + ", quiet threshold: " + (.quiet_threshold_min | tostring) + "m)"'
   local bad; bad=$(echo "$r" | jq -r '.unreadable_lines')
   [ "$bad" = "0" ] || echo "WARNING: $bad unreadable ledger line(s) skipped"
   {
@@ -135,47 +203,93 @@ print_report() {
   echo "$flagged of $(echo "$r" | jq '.sessions | length') session(s) flagged. MODEL, CTX and COST come from the status line and are '-' for sessions that never drew one."
 }
 
-# shellcheck disable=SC2129  # one line per synthetic event reads better than grouped redirects
 selftest() {
   local tmp; tmp=$(mktemp -d)
   mkdir -p "$tmp/ledger" "$tmp/sessions"
   ago() { date -u -v-"$1"M +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "$1 minutes ago" +%Y-%m-%dT%H:%M:%SZ; }
-  local L="$tmp/ledger/selftest.jsonl"
-  # A: turn open, silent for 25 minutes -> QUIET
-  echo "{\"ts\":\"$(ago 30)\",\"ev\":\"UserPromptSubmit\",\"sid\":\"aaaaaaaa-1\",\"cwd\":\"/w/alpha\"}" >> "$L"
-  echo "{\"ts\":\"$(ago 25)\",\"ev\":\"PostToolUse\",\"sid\":\"aaaaaaaa-1\",\"cwd\":\"/w/alpha\",\"tool\":\"Bash\"}" >> "$L"
-  # B: many tool failures, then finished -> idle + failures
-  echo "{\"ts\":\"$(ago 12)\",\"ev\":\"UserPromptSubmit\",\"sid\":\"bbbbbbbb-2\",\"cwd\":\"/w/beta\"}" >> "$L"
-  for _ in 1 2 3 4; do echo "{\"ts\":\"$(ago 11)\",\"ev\":\"PostToolUseFailure\",\"sid\":\"bbbbbbbb-2\",\"cwd\":\"/w/beta\",\"tool\":\"Bash\"}" >> "$L"; done
-  for _ in 1 2; do echo "{\"ts\":\"$(ago 10)\",\"ev\":\"PostToolUse\",\"sid\":\"bbbbbbbb-2\",\"cwd\":\"/w/beta\",\"tool\":\"Read\"}" >> "$L"; done
-  echo "{\"ts\":\"$(ago 9)\",\"ev\":\"Stop\",\"sid\":\"bbbbbbbb-2\",\"cwd\":\"/w/beta\"}" >> "$L"
-  # C: model switch, denial, two compactions, API failure
-  echo "{\"ts\":\"$(ago 8)\",\"ev\":\"UserPromptSubmit\",\"sid\":\"cccccccc-3\",\"cwd\":\"/w/gamma\"}" >> "$L"
-  echo "{\"ts\":\"$(ago 7)\",\"ev\":\"PostModelSwitch\",\"sid\":\"cccccccc-3\",\"cwd\":\"/w/gamma\",\"from_model\":\"x\",\"to_model\":\"y\"}" >> "$L"
-  echo "{\"ts\":\"$(ago 7)\",\"ev\":\"PermissionDenied\",\"sid\":\"cccccccc-3\",\"cwd\":\"/w/gamma\",\"tool\":\"Bash\"}" >> "$L"
-  echo "{\"ts\":\"$(ago 6)\",\"ev\":\"PreCompact\",\"sid\":\"cccccccc-3\",\"cwd\":\"/w/gamma\"}" >> "$L"
-  echo "{\"ts\":\"$(ago 5)\",\"ev\":\"PreCompact\",\"sid\":\"cccccccc-3\",\"cwd\":\"/w/gamma\"}" >> "$L"
-  echo "{\"ts\":\"$(ago 4)\",\"ev\":\"StopFailure\",\"sid\":\"cccccccc-3\",\"cwd\":\"/w/gamma\"}" >> "$L"
-  # D: healthy and active, uses a skill, an MCP tool and a subagent
-  echo "{\"ts\":\"$(ago 2)\",\"ev\":\"UserPromptSubmit\",\"sid\":\"dddddddd-4\",\"cwd\":\"/w/delta\"}" >> "$L"
-  echo "{\"ts\":\"$(ago 1)\",\"ev\":\"PostToolUse\",\"sid\":\"dddddddd-4\",\"cwd\":\"/w/delta\",\"tool\":\"Skill\",\"skill\":\"lane-report\"}" >> "$L"
-  echo "{\"ts\":\"$(ago 1)\",\"ev\":\"PostToolUse\",\"sid\":\"dddddddd-4\",\"cwd\":\"/w/delta\",\"tool\":\"mcp__alpaca__get_account\"}" >> "$L"
-  echo "{\"ts\":\"$(ago 1)\",\"ev\":\"SubagentStart\",\"sid\":\"dddddddd-4\",\"cwd\":\"/w/delta\",\"agent\":\"upstream-scout\"}" >> "$L"
-  echo "{\"ts\":\"$(ago 0)\",\"ev\":\"PostToolUse\",\"sid\":\"dddddddd-4\",\"cwd\":\"/w/delta\",\"tool\":\"Edit\"}" >> "$L"
-  # E: turn left open seven hours ago (app closed mid-turn) -> abandoned, and not flagged QUIET
-  echo "{\"ts\":\"$(ago 420)\",\"ev\":\"UserPromptSubmit\",\"sid\":\"eeeeeeee-5\",\"cwd\":\"/w/epsilon\"}" >> "$L"
-  # one corrupt line must be counted, not crash the report
-  echo '{"ts": broken' >> "$L"
-  echo '{"sid":"dddddddd-4","model":"claude-opus-5-5","ctx_pct":23.4,"cost_usd":1.2345}' > "$tmp/sessions/dddddddd-4.json"
-
-  local r fails=0
-  r=$(CFG="$tmp" build_report)
-  check() { # name, jq boolean expression
-    if echo "$r" | jq -e "$2" >/dev/null 2>&1; then echo "  pass  $1"; else echo "  FAIL  $1"; fails=$((fails+1)); fi
+  # ev <minutes ago> <event> <sid> <cwd> [extra json fields]: appends to the ledger file of that UTC date
+  ev() {
+    local ts; ts=$(ago "$1")
+    printf '{"ts":"%s","ev":"%s","sid":"%s","cwd":"%s"%s}\n' "$ts" "$2" "$3" "$4" "${5:+,$5}" >> "$tmp/ledger/${ts:0:10}.jsonl"
   }
-  check "five sessions found"            '.sessions | length == 5'
+  local i
+  # A: turn open, silent for 25 minutes -> QUIET
+  ev 30 UserPromptSubmit aaaaaaaa-1 /w/alpha
+  ev 25 PostToolUse      aaaaaaaa-1 /w/alpha '"tool":"Bash"'
+  # B: many tool failures, then finished -> idle + failures
+  ev 12 UserPromptSubmit bbbbbbbb-2 /w/beta
+  for i in 1 2 3 4; do ev 11 PostToolUseFailure bbbbbbbb-2 /w/beta '"tool":"Bash"'; done
+  for i in 1 2; do ev 10 PostToolUse bbbbbbbb-2 /w/beta '"tool":"Read"'; done
+  ev 9 Stop bbbbbbbb-2 /w/beta
+  # C: model switch, denial, two compactions, API failure
+  ev 8 UserPromptSubmit cccccccc-3 /w/gamma
+  ev 7 PostModelSwitch  cccccccc-3 /w/gamma '"from_model":"x","to_model":"y"'
+  ev 7 PermissionDenied cccccccc-3 /w/gamma '"tool":"Bash"'
+  ev 6 PreCompact       cccccccc-3 /w/gamma
+  ev 5 PreCompact       cccccccc-3 /w/gamma
+  ev 4 StopFailure      cccccccc-3 /w/gamma
+  # D: healthy and active, uses a skill, an MCP tool and a subagent
+  ev 2 UserPromptSubmit dddddddd-4 /w/delta
+  ev 1 PostToolUse      dddddddd-4 /w/delta '"tool":"Skill","skill":"lane-report"'
+  ev 1 PostToolUse      dddddddd-4 /w/delta '"tool":"mcp__alpaca__get_account"'
+  ev 1 SubagentStart    dddddddd-4 /w/delta '"agent":"upstream-scout"'
+  ev 0 PostToolUse      dddddddd-4 /w/delta '"tool":"Edit"'
+  # E: turn left open seven hours ago (app closed mid-turn) -> abandoned, and not flagged QUIET
+  ev 420 UserPromptSubmit eeeeeeee-5 /w/epsilon
+  # F: turn finished 40 minutes ago, then idle compaction and a late subagent stop -> still idle
+  ev 45 UserPromptSubmit ffffffff-6 /w/zeta
+  ev 40 Stop             ffffffff-6 /w/zeta
+  ev 30 PreCompact       ffffffff-6 /w/zeta '"trigger":"auto"'
+  ev 29 SubagentStop     ffffffff-6 /w/zeta
+  # G: a status-line line with an empty directory must not blank the lane name
+  ev 3 UserPromptSubmit  gggggggg-7 /w/eta
+  ev 2 PostModelSwitch   gggggggg-7 ""
+  ev 1 Stop              gggggggg-7 /w/eta
+  ev 0 PreCompact        gggggggg-7 ""
+  # H: a session five days ago, outside the default two-day window
+  ev 7200 UserPromptSubmit hhhhhhhh-8 /w/theta
+  # I: a turn that auto-compacts (SessionStart compact mid-turn) and then stalls -> QUIET
+  ev 60 UserPromptSubmit iiiiiiii-9 /w/iota
+  ev 55 PreCompact       iiiiiiii-9 /w/iota '"trigger":"auto"'
+  ev 54 SessionStart     iiiiiiii-9 /w/iota '"source":"compact"'
+  ev 50 PostToolUse      iiiiiiii-9 /w/iota '"tool":"Bash"'
+  # K: a Stop with no ts is counted as unreadable, as is a line whose ts cannot be parsed
+  ev 20 UserPromptSubmit kkkkkkkk-10 /w/kappa
+  local today; today=$(date -u +%Y-%m-%d)
+  {
+    echo '{"ev":"Stop","sid":"kkkkkkkk-10","cwd":"/w/kappa"}'
+    echo '{"ts":"2026-13-40T99:00:00Z","ev":"Stop","sid":"kkkkkkkk-10"}'
+    echo '{"ts":"yesterday","ev":"Stop","sid":"kkkkkkkk-10"}'
+  } >> "$tmp/ledger/$today.jsonl"
+  # L1, L2: a prompt and its Stop in the same second, written Stop first -> idle, with and without t
+  local lts lt; lts=$(ago 20); lt=$(jq -nr --arg ts "$lts" '$ts | fromdateiso8601')
+  printf '{"ts":"%s","t":%s.9,"ev":"Stop","sid":"llllllll-11","cwd":"/w/lambda1"}\n' "$lts" "$lt" >> "$tmp/ledger/${lts:0:10}.jsonl"
+  printf '{"ts":"%s","t":%s.1,"ev":"UserPromptSubmit","sid":"llllllll-11","cwd":"/w/lambda1"}\n' "$lts" "$lt" >> "$tmp/ledger/${lts:0:10}.jsonl"
+  ev 20 Stop             llllllll-12 /w/lambda2
+  ev 20 UserPromptSubmit llllllll-12 /w/lambda2
+  # M: only a late PreCompact in the window (its prompt is in an older file) -> unknown, not QUIET
+  ev 30 PreCompact       mmmmmmmm-13 /w/mu '"trigger":"auto"'
+  # one corrupt line must be counted, not crash the report
+  echo '{"ts": broken' >> "$tmp/ledger/$today.jsonl"
+  echo '{"sid":"dddddddd-4","model":"claude-opus-5-5","ctx_pct":23.4,"cost_usd":1.2345}' > "$tmp/sessions/dddddddd-4.json"
+  # many large snapshots of sessions outside the window, and one corrupt one: none may break the report
+  local pad; pad=$(printf '%04096d' 0)
+  for i in $(seq 1 300); do printf '{"sid":"old-%s","model":"m","pad":"%s"}\n' "$i" "$pad" > "$tmp/sessions/old-$i.json"; done
+  echo '{"sid": broken' > "$tmp/sessions/old-corrupt.json"
+
+  local r rwide fails=0 rc
+  r=$(CFG="$tmp" build_report) || { echo "  FAIL  report could not be built"; rm -rf "$tmp"; return 1; }
+  rwide=$(CFG="$tmp" DAYS=7 build_report) || { echo "  FAIL  seven-day report could not be built"; rm -rf "$tmp"; return 1; }
+  check() { # name, jq boolean expression [, report]
+    if printf '%s' "${3:-$r}" | jq -e "$2" >/dev/null 2>&1; then echo "  pass  $1"; else echo "  FAIL  $1"; fails=$((fails+1)); fi
+  }
+  check "twelve sessions in the two-day window"  '.sessions | length == 12'
   check "epsilon abandoned, not QUIET"   '.sessions[] | select(.lane=="epsilon") | .state=="abandoned" and (.flags | length == 0)'
-  check "corrupt line counted"           '.unreadable_lines == 1'
+  check "corrupt and ts-less lines counted"      '.unreadable_lines == 4'
+  check "iota QUIET after compacting mid-turn"   '.sessions[] | select(.lane=="iota") | .state=="QUIET" and (.flags | index("QUIET") != null)'
+  check "same-second Stop written first, with t: idle"    '.sessions[] | select(.lane=="lambda1") | .state=="idle"'
+  check "same-second Stop written first, without t: idle" '.sessions[] | select(.lane=="lambda2") | .state=="idle"'
+  check "no turn boundary in the window: unknown, not QUIET" '.sessions[] | select(.lane=="mu") | .state=="unknown" and (.flags | length == 0)'
   check "alpha is QUIET"                 '.sessions[] | select(.lane=="alpha") | .state=="QUIET" and (.flags | index("QUIET") != null)'
   check "beta idle with failures flag"   '.sessions[] | select(.lane=="beta") | .state=="idle" and .fail==4 and (.flags | index("failures") != null)'
   check "gamma model-switch flag"        '.sessions[] | select(.lane=="gamma") | .flags | index("model-switch") != null'
@@ -184,11 +298,27 @@ selftest() {
   check "gamma api-failure flag"         '.sessions[] | select(.lane=="gamma") | .flags | index("api-failure") != null'
   check "delta working, no flags"        '.sessions[] | select(.lane=="delta") | .state=="working" and (.flags | length == 0)'
   check "delta snapshot joined"          '.sessions[] | select(.lane=="delta") | .model=="claude-opus-5-5" and .cost_usd==1.2345'
+  check "zeta idle after late PreCompact and SubagentStop" '.sessions[] | select(.lane=="zeta") | .state=="idle" and (.flags | length == 0)'
+  check "empty cwd keeps the lane name"  '[.sessions[] | select(.sid=="gggggggg-7") | .lane] == ["eta"]'
+  check "five-day-old session left out"  '[.sessions[] | select(.lane=="theta")] | length == 0'
+  check "period covers yesterday to today" ".period.to == \"$(date -u +%Y-%m-%d)\" and .period.days == 2 and .period.from != .period.to"
+  check "--days 7 includes it"           '[.sessions[] | select(.lane=="theta")] | length == 1' "$rwide"
   check "skill use tallied"              '.mix.skills | map(.name) | index("lane-report") != null'
   check "MCP use tallied"                '.mix.mcp | map(.name) | index("mcp__alpaca__get_account") != null'
   check "subagent use tallied"           '.mix.subagents | map(.name) | index("upstream-scout") != null'
+  # usage errors exit 2, never "unbound variable"
+  for i in "--days" "--quiet-min" "--days x" "--days 0" "--quiet-min -1"; do
+    rc=0
+    # shellcheck disable=SC2086  # the case is split into words on purpose
+    "$BASH" "$0" $i >/dev/null 2>&1 || rc=$?
+    if [ "$rc" = 2 ]; then echo "  pass  usage error: $i"; else echo "  FAIL  usage error: $i (exit $rc)"; fails=$((fails+1)); fi
+  done
+  # an empty window is exit 4 and names the period
+  rc=0; CANON_LEDGER_HOME="$tmp/none" "$BASH" "$0" >/dev/null 2>&1 || rc=$?
+  if [ "$rc" = 4 ]; then echo "  pass  empty ledger exits 4"; else echo "  FAIL  empty ledger exits 4 (exit $rc)"; fails=$((fails+1)); fi
   echo
-  CFG="$tmp" print_report "$r"
+  CFG="$tmp" print_report "$r" | sed -n '1p'
+  CFG="$tmp" print_report "$r" >/dev/null || { echo "  FAIL  report could not be printed"; fails=$((fails+1)); }
   rm -rf "$tmp"
   echo
   if [ "$fails" -eq 0 ]; then echo "lanes: selftest passed"; else echo "lanes: selftest FAILED ($fails)"; return 1; fi
