@@ -104,7 +104,8 @@ another until [ADR 0010](docs/adr/0010-strategy-evaluation.md) is accepted.
 checks and the landscape watch are hooks in `.claude/settings.json`. The weekly refresh is a
 scheduled task in the Claude desktop app, and the dependency bot is `.github/dependabot.yml`, which GitHub
 runs.
-`scripts/automation uninstall` reverses the install. The reasoning is in [ADR 0011](docs/adr/0011-automation.md).
+`scripts/automation uninstall` reverses the install. The reasoning is in [ADR 0011](docs/adr/0011-automation.md) and
+[ADR 0026](docs/adr/0026-weekly-model-run.md).
 
 `scripts/canon` and `scripts/lanes` need only `curl` and `jq`, which ship with macOS.
 
@@ -116,7 +117,7 @@ runs.
 | `canon/upstreams.json` | The registry: 37 upstreams with role, licence, evidence, ADR |
 | `canon/upstreams.lock.json` | Resolved commit SHAs (generated) |
 | `canon/models.json` | Model routing by lane and the landscape snapshot behind it |
-| `docs/adr/` | Twenty-three decisions in MADR 4.0.0, each with Evidence and `review-by` |
+| `docs/adr/` | Twenty-four decisions in MADR 4.0.0, each with Evidence and `review-by` |
 | `pyproject.toml`, `uv.lock` | uv workspace root; one lockfile for every package |
 | `src/canon_trading/` | Strategies and node configuration |
 | `packages/canon-alpaca/` | The Alpaca adapter for NautilusTrader: a market-data client and a paper-only execution client |

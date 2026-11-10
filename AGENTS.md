@@ -93,10 +93,11 @@ dependency, pattern and practice traces to a pinned upstream or a dated source. 
 | 0021 | Orca's skills: used from sessions inside Orca, within written limits |
 | 0022 | Claude Code CLI: installed at the registry's pin and never below it |
 | 0023 | Orca's agent-view plugin (proposed): on for now; what a plugin's hooks may approve on this machine |
+| 0026 | The weekly model run: a desktop scheduled task, gated by scripts, that reports and does not decide |
 
 ## Automation
 
-These run without being asked (ADR 0011, ADR 0013). Every commit runs `scripts/ci` through
+These run without being asked (ADR 0011, ADR 0013, ADR 0026). Every commit runs `scripts/ci` through
 `.githooks/pre-commit`. Every push runs `scripts/check-addresses` through `.githooks/pre-push`, which
 refuses an email address that is not a known service or example address in what the push would publish.
 Every edit to a Python file runs ruff on it, and every edit under `canon/` or
