@@ -91,6 +91,10 @@ then ran through the adapter (the package README's matrix): the live quote and t
 without an aggressor side; so did fills, a venue rejection and cancel-all. Still UNVERIFIED against
 Alpaca: `load_all` at full scale and a partial fill through the adapter.
 
+TC-E84, "Reconcile open orders" (2026-11-10, after hours, `mise run paper:test`): a $1.00 buy placed with
+alpaca-py was loaded by a node's start-up reconciliation, with no lookback, with its venue order ID,
+`ACCEPTED`, price, quantity, side and type, through the open-order read that now has no window.
+
 ADR 0036 records the order-management slice, one change at a time, starting with cancel-all.
 
 ## Evidence
@@ -146,3 +150,11 @@ For the execution slice, read 2026-11-10:
   the output held neither key (run).
 * `test_paper_fill_ids.py`, 2026-11-10, six runs, passed: fills and partial fills at Alpaca (ADR 0024; run).
 * `test_paper_matrix.py`, 2026-11-10: upstream's `DataTester` and `ExecTester` rows, in the README (run).
+* A second reader after landing, 2026-11-10: a report request with no window read only Alpaca's newest 500
+  orders of every status, so 500 newer closed orders hid an older working order from start-up
+  reconciliation, and an open-only request applied its window to the open orders. Each reproduced with a
+  test and fixed: open orders are read first, on their own, with no window, up to 500, as upstream's
+  Kraken spot reads its open orders before its windowed history (`request_order_status_reports_checked`,
+  `crates/adapters/kraken/src/http/spot/client.rs` at the pin, fetched, raw); "Get All Orders" gives the
+  limit ("Defaults to 50 and max is 500") and newest-first order
+  (https://docs.alpaca.markets/us/reference/getallorders-1.md, fetched, raw).

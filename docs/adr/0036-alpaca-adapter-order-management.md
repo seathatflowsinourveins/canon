@@ -98,7 +98,13 @@ package README.
 Alpaca's new `cash`; a failed read is logged and changes nothing. Paper, 2026-11-10, `mise run paper:test`:
 a query through a node, the node's USD balance equal to Alpaca's `cash` as `get_account` gives it.
 
-`UNVERIFIED`, shown by no run: an elected stop and its fill, and what the stream sends on election; any sell
+TC-E44, venue side, through alpaca-py (2026-11-10, after hours, `mise run paper:test`, twice): a second
+cancel of a canceled $1.00 buy was answered 204, not 422, and the order still read `canceled`, the
+card's idempotent result. So an order Alpaca canceled while the stream was down is canceled from its
+read only when Alpaca answers 422, as its page documents; on a 204 it waits for NautilusTrader's
+in-flight check.
+
+`UNVERIFIED`, shown by no run: what the regular session answers a second cancel; an elected stop and its fill, and what the stream sends on election; any sell
 stop.
 
 ## Evidence
@@ -149,3 +155,10 @@ Read 2026-11-10; "raw": fetched with `curl` and read, not summarised. NautilusTr
   order this slice cannot represent does (ADR 0030).
 * Modify, its option, outcome, paper rows, `UNVERIFIED` items and their evidence, moved to ADR 0042 on
   2026-11-10 with no change of decision; the source lines that support both are kept in each.
+* A second reader after landing, 2026-11-10: a cancel refused 422 for an order Alpaca had canceled while
+  the stream was down generated nothing, leaving the order pending cancel until reconciliation; and a
+  closed order skipped for its client order ID was logged with another reason. Both reproduced with a
+  test and fixed: the order is canceled from Alpaca's read, as Bybit's `cancel_all_orders` emits
+  `OrderCanceled` from an order it reads canceled (`crates/adapters/bybit/src/execution.rs` at the pin,
+  fetched, raw), but only when Alpaca shows no more filled than the node holds, where Bybit does not
+  check, since a fill the stream also missed would be lost; the skip names its reason.
