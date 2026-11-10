@@ -203,13 +203,16 @@ here, community convergence, then anyone's recollection.
   0024).
   See `packages/canon-alpaca/README.md`.
 * **Little market data in `catalog/`.** `load_bars` writes Alpaca's bars there (ADR 0040), and the only
-  range anything here loads is the paper test's: AAPL's daily bars for the first quarter of 2025. A fresh
-  clone has none until that test runs. Bars are raw and from the IEX feed, the only feed and adjustment
+  ranges anything here loads are the paper tests': AAPL's daily bars for the first quarter of 2025, and
+  SPY's and QQQ's from 2020-07-27 to 2025-12-31 for ADR 0048's study. A fresh clone has none until those
+  tests run. Bars are raw and from the IEX feed, the only feed and adjustment
   the adapter requests.
 * **No ranking of real strategies yet.** The ledger (ADR 0035), the returns matrix and the gate (ADR 0010,
   ADR 0031) are written and tested on generated bars and series. A trial that never traded, or a
   configuration that never runs to the end, stops a ranking: what value it should count as is undecided.
   The overfitting probability has no adopted implementation (ADR 0027 and ADR 0032 are `proposed`).
+  The first study on real bars, eight `MaCross` variants on SPY and QQQ daily bars, is pre-registered
+  in ADR 0048 (`canon_trading.variant_study`) and has not run.
 * **No OpenTelemetry backend.** The local event ledger covers this machine; `home/otel-settings.example.json`
   is ready for when a collector exists.
 * **No eval of our own has run.** Model routing rests on external measurements (ADR 0005). A reviewer
