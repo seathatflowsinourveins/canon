@@ -16,6 +16,8 @@
 #
 # `uv lock --check` and one `uv run --locked` (which creates the Python environment) run first; then every
 # check runs as a background job writing to its own temp file, and the results are printed in a fixed order.
+# Checks run without git's repository-local variables (GIT_DIR, GIT_INDEX_FILE, ...), which a commit hook
+# sets, except the staged secret scan, which needs them.
 #
 # Usage: scripts/ci            check everything; the secret scan covers the whole git history
 #        scripts/ci --staged   same, but the secret scan covers only what is staged (used by pre-commit)
@@ -53,21 +55,42 @@ tool() {
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/canon-ci.XXXXXX") || { echo "ci: FAIL: mktemp failed."; exit 1; }
 trap 'rm -rf "$WORK"' EXIT
 
+# Run from a git hook, this script inherits GIT_DIR, GIT_INDEX_FILE and the other repository-local
+# variables that `git rev-parse --local-env-vars` lists. With them set, a check that builds a scratch
+# repository (git init, git config, git commit) would write to this repository instead. So every check
+# runs with them removed, except the two that need the index being committed:
+#   - the shell-file and test-script lists below, built in this shell, so staged new files are included;
+#   - `gitleaks git --pre-commit --staged`, which scans that index (job --git-env).
+if ! GIT_LOCAL_VARS=$(git rev-parse --local-env-vars); then
+  echo "ci: FAIL: \`git rev-parse --local-env-vars\` failed."; exit 1
+fi
+without_git_env() {
+  local v
+  while IFS= read -r v; do [ -n "$v" ] && unset "$v"; done <<<"$GIT_LOCAL_VARS"
+}
+
 # Entries are printed in the order they are added. KIND is head, job or skip.
 n=0; KIND=(); TEXT=(); NOTE=()
 head_line() { n=$((n+1)); KIND[n]="head"; TEXT[n]="$1"; NOTE[n]=""; }
 skip_line() { n=$((n+1)); KIND[n]="skip"; TEXT[n]="$1"; NOTE[n]=""; }
-# job [--skips] <label> <command...>: start a check in the background; --skips lists pytest skips on success
+# job [--skips] [--git-env] <label> <command...>: start a check in the background, without git's local
+# variables unless --git-env is given; --skips lists pytest skips on success
 job() {
-  local note=""
-  if [ "$1" = "--skips" ]; then note=skips; shift; fi
+  local note="" keep=0
+  while :; do
+    case "$1" in
+      --skips) note=skips; shift ;;
+      --git-env) keep=1; shift ;;
+      *) break ;;
+    esac
+  done
   n=$((n+1)); KIND[n]="job"; TEXT[n]="$1"; NOTE[n]="$note"; shift
-  ( "$@" >"$WORK/$n.out" 2>&1; echo "$?" >"$WORK/$n.rc" ) &
+  ( [ "$keep" -eq 1 ] || without_git_env; "$@" >"$WORK/$n.out" 2>&1; echo "$?" >"$WORK/$n.rc" ) &
 }
-# now <label> <command...>: run a check in the foreground; its status is the command's
+# now <label> <command...>: run a check in the foreground, without git's local variables
 now() {
   n=$((n+1)); KIND[n]="job"; TEXT[n]="$1"; NOTE[n]=""; shift
-  "$@" >"$WORK/$n.out" 2>&1; local rc=$?
+  ( without_git_env; "$@" ) >"$WORK/$n.out" 2>&1; local rc=$?
   echo "$rc" >"$WORK/$n.rc"
   return "$rc"
 }
@@ -157,7 +180,7 @@ else
   skip_line "actionlint (no workflow files in .github/workflows)"
 fi
 if [ "$STAGED" -eq 1 ]; then
-  job "gitleaks (staged changes)"        tool gitleaks git --pre-commit --staged --no-banner --redact
+  job --git-env "gitleaks (staged changes)"  tool gitleaks git --pre-commit --staged --no-banner --redact
 else
   job "gitleaks (git history)"           tool gitleaks git --no-banner --redact
   job "gitleaks (working tree)"          tool gitleaks dir . --no-banner --redact

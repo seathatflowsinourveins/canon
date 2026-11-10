@@ -147,6 +147,27 @@ check "a test script that is not executable is not run" test "$(printf '%s\n' "$
 check "test scripts run in name order"             test "$(printf '%s\n' "$OUT" | sed -n 's/^  [a-zA-Z]*  *\(test-[a-z]*\).*/\1/p' | tr '\n' ' ')" = "$(cd "$C" && git ls-files -s 'scripts/test-*' | awk '$1 == 100755 { sub(".*/", "", $4); printf "%s ", $4 }')"
 check "a failing test script fails the run"        test "$RC" = 1
 
+# --- run from a commit hook, test scripts do not see git's repository variables ---
+fresh hookenv
+cat >"$C/scripts/test-env" <<'EOF'
+#!/bin/bash
+env | grep '^GIT_' >"$ENV_LOG"
+d=$(mktemp -d) && cd "$d" && git init -q && git config test.touched yes
+rm -rf "$d"
+exit 0
+EOF
+chmod +x "$C/scripts/test-env"
+gitq -C "$C" add -A; gitq -C "$C" commit -q -m env
+cp "$C/.git/config" "$C.config.before"
+export ENV_LOG="$C.env.log"
+export GIT_DIR="$C/.git" GIT_INDEX_FILE="$C/.git/index"
+runci --staged
+unset GIT_DIR GIT_INDEX_FILE
+check "staged run under a hook environment passes" test "$RC" = 0
+check "the test script ran"                        test -f "$ENV_LOG"
+check "it saw no GIT_DIR or GIT_INDEX_FILE"        test "$(grep -cE '^GIT_(DIR|INDEX_FILE)=' "$ENV_LOG")" = 0
+check "the repository config is unchanged"         cmp -s "$C.config.before" "$C/.git/config"
+
 # --- checks run concurrently; failures keep their place ---
 fresh parallel
 cat >"$C/scripts/canon" <<EOF
