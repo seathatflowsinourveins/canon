@@ -66,6 +66,16 @@ printf '#!/bin/bash\necho "osascript $*" >> "$STUB/osascript.log"\n' > "$B/osasc
 printf '#!/bin/bash\n[ "${1:-}" = -p ] && echo /Library/Developer/CommandLineTools\nexit 0\n' > "$B/xcode-select"
 printf '#!/bin/bash\n[ "${1:-}" = --version ] && { echo "curl stub"; exit 0; }\necho "curl stub: no network in tests" >&2\nexit 1\n' > "$B/curl"
 printf '#!/bin/bash\ncat "$STUB/claude-version"\n' > "$B/claude"   # claude stub: --version from $STUB/claude-version
+# security stub: logs its arguments; find-generic-password succeeds for an account listed in $STUB/keychain,
+# else exits 44 as Apple's does for an absent item. It never holds a value.
+cat > "$B/security" <<'EOF'
+#!/bin/bash
+echo "security $*" >> "$STUB/security.log"
+[ "${1:-}" = find-generic-password ] || exit 1
+acct=""; while [ $# -gt 0 ]; do [ "$1" = -a ] && acct="$2"; shift; done
+grep -qxF "$acct" "$STUB/keychain" 2>/dev/null || exit 44
+echo 'keychain: "stub"'
+EOF
 chmod +x "$B"/*
 export STUB="$TMP/stub"; mkdir -p "$STUB"
 export PATH="$B:$PATH"
@@ -254,6 +264,25 @@ check "claude CLI below the pin as numbers, above it as text (2.1.99): BEHIND" \
 echo "Claude Code (dev build)" > "$STUB/claude-version"; bs --check; rc=$?
 check "claude CLI version unparseable: UNKNOWN, exit 1" eval 'rowis "$TMP/bs.out" "claude CLI" UNKNOWN && [ "$rc" != 0 ]'
 echo "$CCPIN (Claude Code)" > "$STUB/claude-version"
+
+: > "$STUB/security.log"; rm -f "$STUB/keychain"; bs --check; rc=$?
+check "paper key pair absent: reported, names both" \
+      eval 'rowis "$TMP/bs.out" "paper key pair" absent && grep -q "ALPACA_API_KEY ALPACA_SECRET_KEY; to enter the pair: mise run paper:store" "$TMP/bs.out"'
+echo ALPACA_API_KEY > "$STUB/keychain"; bs --check
+check "paper key pair half there: absent, names the missing one" \
+      eval 'rowis "$TMP/bs.out" "paper key pair" absent && grep -q "item for: ALPACA_SECRET_KEY;" "$TMP/bs.out"'
+printf 'ALPACA_API_KEY\nALPACA_SECRET_KEY\n' > "$STUB/keychain"; bs --check; rc_present=$?
+check "paper key pair present: ok"                 rowis "$TMP/bs.out" "paper key pair" ok
+check "... and its absence does not change the exit status" test "$rc" = "$rc_present"
+check "paper row looks items up by service and account only, never -w or -g" \
+      eval 'grep -q "find-generic-password -s canon-alpaca-paper -a ALPACA_SECRET_KEY\$" "$STUB/security.log" && ! grep -Eq " -(w|g)( |\$)" "$STUB/security.log"'
+rm -f "$STUB/keychain"
+# every keychain service mise.toml's paper tasks name is the one the bootstrap row looks up (ADR 0029)
+paper_names() { grep -oE '(-s |svc=)[A-Za-z0-9"$_-]+' "$ROOT/mise.toml" | sed -E 's/^(-s |svc=)//' | grep -vxF '"$svc"'; }
+# shellcheck disable=SC2034  # read by the eval'd check below
+psvc=$(sed -n 's/^PAPER_SERVICE="\([^"]*\)".*/\1/p' "$ROOT/scripts/bootstrap")
+check "mise.toml's paper tasks name only bootstrap's keychain service" \
+      eval '[ -n "$psvc" ] && [ "$(paper_names | wc -l | tr -d " ")" -ge 5 ] && ! paper_names | grep -vxF "$psvc" | grep -q .'
 
 mkdir -p "$C/canon"; echo "# previous" > "$C/canon/ledger.sh"
 CLAUDE_CONFIG_DIR="$C" bs --user-config; rc=$?
