@@ -2,7 +2,9 @@
 # test-ci — run scripts/ci on a changed copy of this repo and check what it reports.
 # The copy is `git archive HEAD` plus the working tree's scripts/ci, committed into a fresh repository in a
 # temp folder. mise and the tools it provides are fakes first on PATH, and the scripts scripts/ci calls are
-# stubs, so each case takes well under a second. Exit 0 if every case behaves as expected, 1 otherwise.
+# stubs, so each case takes well under a second. Cases run concurrently, each in its own copy, except the
+# first (whose results later cases use) and the signal cases (SIGINT cannot be trapped in a background job).
+# Exit 0 if every case behaves as expected, 1 otherwise.
 # Offline; touches only a temp folder. CANON_TEST_CI marks a run inside this script; scripts/ci then skips
 # scripts/test-ci, and if it did not, the nested run would stop here with a failure.
 set -uo pipefail
@@ -15,7 +17,8 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 while IFS= read -r v; do [ -n "$v" ] && unset "$v"; done <<<"$(git rev-parse --local-env-vars)"
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/canon-test-ci.XXXXXX") || exit 1
 trap 'rm -rf "$TMP"' EXIT
-pass=0; fail=0
+skipped=0
+RESULTS="$TMP/results"; : >"$RESULTS"
 gitq() { git -c user.name=test -c user.email=test@example.invalid -c commit.gpgsign=false \
              -c core.hooksPath=/dev/null "$@"; }
 
@@ -33,6 +36,7 @@ mkdir -p "$TMP/tools"
 cat >"$TMP/tools/uv" <<'EOF'
 #!/bin/bash
 echo "$*" >>"$UV_LOG"
+if [ "$1 $2" = "lock --check" ] && [ -n "${FAKE_LOCK_FAIL:-}" ]; then echo "uv.lock needs to be updated"; exit 1; fi
 if [ "$1 $2 $3" = "run --locked pytest" ]; then
   for a in "$@"; do
     case "$a" in -r*s*) echo "SKIPPED tests/test_x.py::test_net - Skipped: no credentials" ;; esac
@@ -52,7 +56,7 @@ cp "$ROOT/scripts/ci" "$BASE/scripts/ci"
 cp "$ROOT/scripts/test-ci" "$BASE/scripts/test-ci"
 stub() { printf '#!/bin/bash\nexit 0\n' >"$1"; chmod +x "$1"; }
 for s in canon lanes survey-github; do stub "$BASE/scripts/$s"; done
-for s in "$BASE"/scripts/test-*; do [ "${s##*/}" = test-ci ] || stub "$s"; done
+for s in "$BASE"/scripts/test-*; do [ -f "$s" ] && [ "${s##*/}" != test-ci ] && stub "$s"; done
 if git -C "$BASE" rev-parse --git-dir >/dev/null 2>&1; then
   echo "test-ci: $BASE is already inside a repository; stopping"; exit 1
 fi
@@ -73,10 +77,11 @@ runci() {
 }
 # has <regex>: OUT has a line matching the extended regex (reads all of OUT)
 has() { [ "$(printf '%s\n' "$OUT" | grep -cE -- "$1")" -gt 0 ]; }
-# check <label> <command...>: passes when the command succeeds
+# check <label> <command...>: passes when the command succeeds; one line per result in $RESULTS
 check() {
   local label="$1"; shift
-  if "$@"; then pass=$((pass+1)); else fail=$((fail+1)); echo "  FAIL  $label"; printf '%s\n' "$OUT" | sed 's/^/        /'; fi
+  if "$@"; then echo pass >>"$RESULTS"
+  else echo fail >>"$RESULTS"; echo "  FAIL  $label"; printf '%s\n' "$OUT" | sed 's/^/        /'; fi
 }
 # line_after <regex a> <regex b>: some line matching a is followed directly by a line matching b
 line_after() {
@@ -104,18 +109,23 @@ check "Python jobs ran after them"                 test "$(grep -cE '^run --lock
 check "test-ci is skipped inside test-ci"          has '^  skip  test-ci \(running inside scripts/test-ci\)$'
 
 # --- workflows: .yaml counts; none gives a skip line ---
+case_yaml() {
 fresh yaml
 rm -f "$C"/.github/workflows/*.yml
 printf 'name: x\non: push\njobs: {}\n' >"$C/.github/workflows/only.yaml"
 runci
 check "actionlint runs on a .yaml workflow"        has '^  ok    actionlint \(1 workflow files\)$'
+}
+case_noflows() {
 fresh noflows
 rm -f "$C"/.github/workflows/*.yml "$C"/.github/workflows/*.yaml
 runci
 check "no workflows prints a skip line"            has '^  skip  actionlint \(no workflow files'
 check "no workflows still passes"                  test "$RC" = 0
+}
 
 # --- shell files come from the tracked files' shebangs ---
+case_shell() {
 fresh shell
 mkdir -p "$C/.claude/skills/x"
 printf '#!/usr/bin/env bash\nif then\n' >"$C/.claude/skills/x/run.sh"
@@ -125,17 +135,23 @@ runci
 check "script beside a skill is syntax-checked"    has "^  FAIL  shell syntax \($((n0+1)) files\)$"
 check "its error is shown"                         has 'skills/x/run.sh'
 check "a file without a shebang is not checked"    test "$(printf '%s\n' "$OUT" | grep -c 'notes.txt')" = 0
+}
+case_staged() {
 fresh staged
 printf '#!/bin/sh\nif then\n' >"$C/new-hook"
 gitq -C "$C" add new-hook
 runci --staged
 check "staged new shell file is syntax-checked"    has "^  FAIL  shell syntax \($((n0+1)) files\)$"
+}
+case_untracked() {
 fresh untracked
 printf '#!/bin/bash\nif then\n' >"$C/loose"
 runci
 check "an untracked shell file is not checked"     has "^  ok    shell syntax \($n0 files\)$"
+}
 
 # --- test scripts are discovered ---
+case_tests() {
 fresh tests
 printf '#!/bin/bash\necho boom\nexit 1\n' >"$C/scripts/test-aaa"; chmod +x "$C/scripts/test-aaa"
 printf '#!/bin/bash\nexit 1\n' >"$C/scripts/test-bbb"; chmod -x "$C/scripts/test-bbb"
@@ -143,11 +159,88 @@ gitq -C "$C" add -A; gitq -C "$C" commit -q -m tests
 runci
 check "a new test script runs as its own check"    has '^  FAIL  test-aaa$'
 check "its output is shown"                        line_after '^  FAIL  test-aaa$' '^        boom$'
-check "a test script that is not executable is not run" test "$(printf '%s\n' "$OUT" | grep -c 'test-bbb')" = 0
-check "test scripts run in name order"             test "$(printf '%s\n' "$OUT" | sed -n 's/^  [a-zA-Z]*  *\(test-[a-z]*\).*/\1/p' | tr '\n' ' ')" = "$(cd "$C" && git ls-files -s 'scripts/test-*' | awk '$1 == 100755 { sub(".*/", "", $4); printf "%s ", $4 }')"
+check "a test script that is not executable fails" has '^  FAIL  test-bbb \(not executable\)$'
+check "saying so"                                  line_after '^  FAIL  test-bbb' 'mode 100644, not 100755'
+check "test scripts run in name order"             test "$(printf '%s\n' "$OUT" | sed -n 's/^  [a-zA-Z]*  *\(test-[a-z]*\).*/\1/p' | tr '\n' ' ')" = "$(cd "$C" && git ls-files -s 'scripts/test-*' | awk '$4 !~ /^scripts\/.*\// { sub(".*/", "", $4); printf "%s ", $4 }')"
 check "a failing test script fails the run"        test "$RC" = 1
+}
+case_testdir() {
+fresh testdir
+mkdir -p "$C/scripts/test-dir"
+printf '#!/bin/bash\necho helper ran\nexit 1\n' >"$C/scripts/test-dir/helper"; chmod +x "$C/scripts/test-dir/helper"
+gitq -C "$C" add -A; gitq -C "$C" commit -q -m helper
+runci
+check "a file under scripts/test-dir/ is not a check" test "$(printf '%s\n' "$OUT" | grep -c 'helper')" = 0
+check "and the run passes"                         test "$RC" = 0
+}
+case_testgone() {
+fresh testgone
+rm "$C/scripts/test-hooks"
+runci
+check "a test script missing from the tree fails"  has '^  FAIL  test-hooks \(missing\)$'
+}
+
+case_notes() {
+fresh notes
+printf '#!/bin/bash\necho "  skip  case x (no network)"\necho "other output"\nexit 0\n' >"$C/scripts/test-note"
+chmod +x "$C/scripts/test-note"
+gitq -C "$C" add -A; gitq -C "$C" commit -q -m note
+runci
+check "a test script's skip line shows under ok"   line_after '^  ok    test-note$' '^          skip  case x .no network.$'
+check "its other output does not"                  test "$(printf '%s\n' "$OUT" | grep -c 'other output')" = 0
+}
+
+# --- a check that dies before recording its exit status fails ---
+case_died() {
+fresh died
+cat >"$C/scripts/test-die" <<'EOF'
+#!/bin/bash
+kill -9 "$PPID"
+exit 0
+EOF
+chmod +x "$C/scripts/test-die"
+gitq -C "$C" add -A; gitq -C "$C" commit -q -m die
+runci
+check "a check with no exit status fails"          has '^  FAIL  test-die$'
+check "saying why"                                 line_after '^  FAIL  test-die$' 'without recording an exit status'
+check "and the run fails"                          test "$RC" = 1
+}
+
+# --- symlinks and deleted files ---
+case_symlink() {
+fresh symlink
+ln -s canon "$C/scripts/canon-link"
+gitq -C "$C" add -A; gitq -C "$C" commit -q -m link
+runci
+check "a symlink to a shell script is not counted" has "^  ok    shell syntax \($n0 files\)$"
+}
+case_deleted() {
+fresh deleted
+printf '#!/bin/bash\nif then\n' >"$C/broken.sh"
+gitq -C "$C" add broken.sh; rm "$C/broken.sh"
+runci --staged
+check "staged content of a deleted file is checked" has "^  FAIL  shell syntax \($((n0+1)) files\)$"
+}
+case_deleted2() {
+fresh deleted2
+rm "$C/.githooks/pre-commit"
+runci
+check "a deleted shell file is reported"           has '^  skip  shell checks for \.githooks/pre-commit \(deleted from the working tree\)$'
+}
+
+# --- a lock mismatch prints the environment step as skipped ---
+case_lockfail() {
+fresh lockfail
+FAKE_LOCK_FAIL=1; export FAKE_LOCK_FAIL
+runci
+unset FAKE_LOCK_FAIL
+check "the lock check fails"                       has '^  FAIL  uv.lock matches the manifests$'
+check "the environment step is skipped with why"   has '^  skip  Python environment \(uv.lock does not match the manifests\)$'
+check "so are the Python checks"                   has '^  skip  pytest \(uv.lock does not match the manifests\)$'
+}
 
 # --- run from a commit hook, test scripts do not see git's repository variables ---
+case_hookenv() {
 fresh hookenv
 cat >"$C/scripts/test-env" <<'EOF'
 #!/bin/bash
@@ -167,8 +260,10 @@ check "staged run under a hook environment passes" test "$RC" = 0
 check "the test script ran"                        test -f "$ENV_LOG"
 check "it saw no GIT_DIR or GIT_INDEX_FILE"        test "$(grep -cE '^GIT_(DIR|INDEX_FILE)=' "$ENV_LOG")" = 0
 check "the repository config is unchanged"         cmp -s "$C.config.before" "$C/.git/config"
+}
 
 # --- checks run concurrently; failures keep their place ---
+case_parallel() {
 fresh parallel
 cat >"$C/scripts/canon" <<EOF
 #!/bin/bash
@@ -180,6 +275,8 @@ EOF
 printf '#!/bin/bash\n: >"%s"\n' "$C.mark" >"$C/scripts/lanes"
 runci
 check "an earlier check sees a later one run"      has '^  ok    canon registry, lock and ADRs$'
+}
+case_order() {
 fresh order
 printf '#!/bin/bash\necho "lane output"\nexit 3\n' >"$C/scripts/lanes"
 runci
@@ -187,8 +284,10 @@ check "a failure prints in its place"              line_after '^  ok    shellche
 check "with its output"                            line_after '^  FAIL  lane report self-test$' '^        lane output$'
 check "and the run fails"                          test "$RC" = 1
 check "ending with FAILED"                         has '^ci: FAILED$'
+}
 
 # --- a tool missing from the toolchain fails by name ---
+case_missing() {
 fresh missing
 TOOLS="$TMP/tools-missing"; mkdir -p "$TOOLS"; cp "$TMP/tools"/* "$TOOLS/"; rm "$TOOLS/gitleaks"
 runci; TOOLS=""
@@ -196,6 +295,49 @@ check "missing gitleaks fails its check"           has '^  FAIL  gitleaks \(git 
 check "the message names it"                       has 'gitleaks: not found in the mise toolchain'
 check "tools that are present still pass"          has '^  ok    shellcheck$'
 check "the run fails"                              test "$RC" = 1
+}
 
-echo "test-ci: $pass passed, $fail failed"
-[ "$fail" -eq 0 ]
+# Every case above works in its own copy, so they run concurrently; their output prints in this order.
+CASES="yaml noflows shell staged untracked tests testdir testgone notes died symlink deleted deleted2 lockfail hookenv parallel order missing"
+for c in $CASES; do ( "case_$c" ) >"$TMP/out.$c" 2>&1 & done
+wait
+for c in $CASES; do cat "$TMP/out.$c"; done
+
+# --- INT and TERM stop the checks that are running ---
+# A shell started as a background job ignores SIGINT and cannot trap it; scripts/ci runs this script that
+# way. Probe whether SIGINT can be trapped here; if not, the INT case is skipped with a line saying so.
+sigs="TERM INT"
+if ! bash -c 'trap "exit 0" INT; kill -INT $$; exit 1'; then
+  sigs=TERM; skipped=$((skipped+1))
+  echo "  skip  INT case (SIGINT is ignored in this process, as in a background job; TERM runs the same trap)"
+fi
+for sig in $sigs; do
+  fresh "sig$sig"
+  cat >"$C/scripts/test-slow" <<EOF
+#!/bin/bash
+sleep 30 &
+echo "\$!" >"$C.sleep.pid"
+wait
+EOF
+  chmod +x "$C/scripts/test-slow"
+  gitq -C "$C" add -A; gitq -C "$C" commit -q -m slow
+  mkdir -p "$C.tmp"
+  # job control gives the run its own process group, so SIGINT is not ignored as it is for a plain `&`
+  set -m
+  (cd "$C" && PATH="$FAKE:$PATH" TOOLS="$TMP/tools" UV_LOG="$C.uv.log" TMPDIR="$C.tmp" exec scripts/ci) >"$C.out" 2>&1 &
+  cipid=$!
+  set +m
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do [ -s "$C.sleep.pid" ] && break; sleep 0.25; done
+  kill -"$sig" "$cipid"; wait "$cipid"; RC=$?; OUT=$(cat "$C.out")
+  want=143; [ "$sig" = INT ] && want=130
+  alive=1; sleeper=$(cat "$C.sleep.pid" 2>/dev/null)
+  for _ in 1 2 3 4 5 6 7 8; do kill -0 "$sleeper" 2>/dev/null || { alive=0; break; }; sleep 0.25; done
+  [ "$alive" -eq 0 ] || kill "$sleeper" 2>/dev/null
+  check "$sig exits $want"                           test "$RC" = "$want"
+  check "$sig stops the processes checks started"   test "$alive" = 0
+  check "$sig removes the temp files"                test -z "$(ls -A "$C.tmp")"
+done
+
+pass=$(grep -c '^pass$' "$RESULTS"); fail=$(grep -c '^fail$' "$RESULTS")
+echo "test-ci: $pass passed, $fail failed, $skipped skipped"
+[ "$fail" -eq 0 ] && [ "$pass" -gt 0 ]
