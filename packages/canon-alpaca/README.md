@@ -268,6 +268,7 @@ This package has all three for each client, offline, plus a paper test for each:
 | `test_execution_client.py` | A real `LiveNode` with both clients: registration through config and builder, owned and hosted launch, a market order that fills, partial fills, a limit order canceled, cancel-all by ID (side filter, a refused cancel, a failed cancel, nothing to cancel), rejections by HTTP status and by trade update, a cancel refused, stop and stop-limit orders sent with their prices, orders denied before Alpaca (type, time in force, stop trigger type, sub-penny limit and stop prices, not tradable), an unknown submit outcome left `SUBMITTED`, an update for an unknown order dropped, start-up reconciliation of an open order, a filled order, a position and open stop and stop-limit orders, an unmapped open order failing start-up, account state on connect, paper-only client construction, shutdown joining the trade stream thread; the config's paper-only refusals, and a node refusing a plain `ExecutionClientConfig` | None |
 | `test_paper_execution.py` | DAY limit buys of 1 AAPL far below the market on Alpaca's paper Trading API through a real node: one submitted, accepted and canceled; upstream's `ExecTester` running rows of its Execution Testing Spec: TC-E41, a limit buy and a stop buy canceled by `CancelAllOrders` on stop, and TC-E20 and TC-E22, a stop and a stop-limit buy accepted at the prices sent and reported back the same | Paper only; cancels every order it places; each places nothing and fails if the paper account already holds an open AAPL order or position; skipped without `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` |
 | `test_paper_fill_ids.py` | ADR 0024's test, with alpaca-py directly, not through a node: a market buy of 2 AAPL and a market sell of 2 on Alpaca's paper Trading API; every fill and partial fill update's `execution_id` must be the UUID after `::` in one of the order's `FILL` activity `id`s | Paper only; needs the regular session and skips outside it; stops if the account holds any open order or position; sells what it bought; skipped without `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` |
+| `test_paper_matrix.py` | Upstream's `DataTester` and `ExecTester` through a real node on Alpaca's paper environment: the rows in "Upstream's test matrices against paper" | Paper only; needs the regular session for the stream and fill rows; stops if the account holds any open order or position; cancels and closes what its node opened; skipped without `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` |
 | `test_upstream_contract.py` | The upstream names this README quotes still exist in the pinned packages; the execution hooks and `generate_order_filled` signature; alpaca-py's trading clients default to and target paper; the native config drops unknown keywords; the stream stand-ins refuse and keep what alpaca-py's `StockDataStream` and `TradingStream` do | None |
 
 The offline tests use payloads hand-built from the examples in Alpaca's docs (sources in `tests/conftest.py`)
@@ -275,11 +276,68 @@ and stand-ins for the alpaca-py clients. To run the paper tests, enter the pair 
 `mise run paper:store` and then run `mise run paper:test` from the repo root; `mise run paper:check` says
 whether the pair is there (root `README.md`, "Enter the Alpaca paper keys"). The first two passed on
 2026-11-10 (ADR 0030); the TC-E41 test is ADR 0036's.
-Not yet tested against Alpaca: the live quote and trade stream, the asset list at `load_all` scale, and in
-the execution client everything but a limit order accepted and canceled: no fill, partial fill or rejection
-has come from Alpaca through the adapter. Fills and partial fills have come from Alpaca outside it, in
-`test_paper_fill_ids.py` (six runs passed on 2026-11-10, ADR 0024); `mise run paper:test` runs it, and
+Fills and partial fills have come from Alpaca outside the adapter in `test_paper_fill_ids.py` (six runs
+passed on 2026-11-10, ADR 0024); `mise run paper:test` runs it, and
 `mise run paper:test -s -k test_paper_fill_activity_ids` runs it alone.
+Through the adapter, `test_paper_matrix.py` runs upstream's test matrices (below). Not yet tested against
+Alpaca: the asset list at `load_all` scale, and a partial fill through the adapter (each tester order is
+one share).
+
+### Upstream's test matrices against paper
+
+NautilusTrader's Data Testing Spec and Execution Testing Spec
+(https://nautilustrader.io/docs/md/latest/developer_guide/spec_data_testing.md, `spec_exec_testing.md`)
+define the rows an adapter must pass for what it supports, run with the built-in `DataTester` actor and
+`ExecTester` strategy, which v2.0.0rc8 exposes through `nautilus_trader.testkit`. `test_paper_matrix.py`
+runs them through a real node against Alpaca's paper environment, one share of AAPL, IEX feed, during the
+regular session; each test skips outside it. `mise run paper:test` runs them with the other paper tests;
+`mise run paper:test -s -k "test_paper_data_tester or test_paper_exec_tester"` runs them alone. The rows
+below ran on 2026-11-10 between 13:59 and 14:44 New York time: the data rows six times (TC-D70 passed five
+of them), the execution rows three or four times (TC-E11 three times with its final check, TC-E41 and
+TC-E81 twice, after cancel-all was added), unless the row says otherwise. TC-D70 and TC-E83 were checked
+in each run's log, not by an assertion: the test cannot read the node's log.
+
+Tester settings that differ from upstream's defaults, and why: resting orders sit $50 from the touch
+(`tob_offset_ticks=500_000`, since the instrument's price increment is 0.0001); one side per run, because
+Alpaca refuses an opposite-side order while one is open (403 "potential wash trade detected"); no
+reduce-only on stop, which this slice lacks; start-up reconciliation looks back one
+minute on the shared account (see the reconciliation finding below); and the node keeps a post-stop grace
+period, since disconnection "discards queued commands" (python adapter guide, "Disconnect and drain
+tasks"): with none, a queued unsubscribe was discarded and logged as an error once.
+
+| Rows | Outcome |
+|---|---|
+| TC-D03 load an instrument | Passed |
+| TC-D20 subscribe quotes | Passed: 256 to 595 quotes in 30 s; quotes with bid below ask and both sizes positive, none crossed |
+| TC-D30 subscribe trades | Passed, except the aggressor side: 5 to 28 trades in 30 s; Alpaca sends no aggressor, so every trade is `NO_AGGRESSOR` |
+| TC-D41 historical bars | Passed: 60 one-minute bars, valid OHLC, no duplicate timestamps |
+| TC-D70 unsubscribe on stop | Passed with the grace period: quotes and trades unsubscribed, no tick after, no warning or error |
+| TC-D01, D02, D21, D31, D40, D60, D61, D73 | Not in this slice: no instrument requests or subscriptions, no historical quotes or trades, no bar subscriptions, no status or close; D73 not run |
+| TC-D10 to D14, D50 to D53, D62, D63, D71, D72, D74, D75 | Do not apply: no order book in Alpaca's stock stream, no derivatives or options here, no custom parameters, no DeFi |
+| TC-E01 market buy, TC-E80 open on start | Passed: submitted, accepted, filled; the fill's trade ID is Alpaca's `execution_id` |
+| TC-E06, TC-E82 close position on stop | Passed: a market sell, filled, position closed |
+| TC-E10 GTC limit buy | Passed: accepted, then canceled on stop |
+| TC-E11 GTC limit sell | Passed against the tester's long. While the opening market buy was still open, Alpaca refused each sell (403 "potential wash trade detected", 6 times in about 1 s); the first sell after the fill was accepted |
+| TC-E12 limit buy and sell pair | Does not apply to Alpaca: the second side is refused as a potential wash trade |
+| TC-E19 DAY limit | Passed: accepted, then canceled |
+| TC-E40, TC-E42 cancel, one by one on stop | Passed |
+| TC-E41, TC-E81 cancel all on stop | Passed with the cancel-all ADR 0036 added. Before it, `_cancel_all_orders` raised, the orders stayed open, and the closing sell was refused (403 "insufficient qty available") because the open limit sell held the share; the test's clean-up canceled both |
+| TC-E72 unsupported order type, TC-E73 unsupported time in force | Passed: a market-if-touched order and an IOC limit are `DENIED` before Alpaca |
+| Venue rejection (no upstream row) | Passed: a market buy of 1,000,000 shares, refused by Alpaca (403 "insufficient buying power"), ends `REJECTED`; nothing opens |
+| TC-E83 unsubscribe on stop | Passed: the tester's quote and trade subscriptions are removed |
+| TC-E02, E32, E33, E44, E84 to E87 | Not run: a short, cancel-replace, cancel of a canceled order, and reconciliation of a prior session's orders and positions |
+| TC-E20 to E23 stop and stop-limit | Not run here: stop and stop-limit orders were added after these runs (ADR 0036) |
+| TC-E03 to E05, E13 to E18, E24 to E27, E30, E31, E34 to E36, E43, E50 to E53, E60 to E63, E70, E71 | Not in this slice: IOC, FOK, quote quantity, GTD, if-touched orders, modify, batch cancel, brackets, order flags |
+| TC-E74 to E78 | Ambiguous submit and cancel failures run offline only (`test_execution_client.py`); modify and batch do not apply |
+| TC-E88, E89, TC-E90 to E101 | Do not apply: Alpaca reports no commission, and options are not supported |
+
+**Reconciliation finding (not fixed here).** Without a lookback, start-up reconciliation reads the shared
+paper account's last 500 orders and infers one fill for each filled one (ADR 0024). On 2026-11-10 those
+inferred fills netted to a short of 1 AAPL while Alpaca held no position and reported none, and the engine
+kept that short as an `EXTERNAL` position for the whole run. Alpaca's 500-order cap, and orders this slice
+skips (such as `replaced`), can leave a fill without its counterpart. Fill reports keyed by `execution_id`
+(ADR 0024), or a flat position report for an instrument with no position, would address it; neither is
+written.
 
 ## Rules
 

@@ -86,9 +86,10 @@ not run, so the client is UNVERIFIED against Alpaca. Its limits are in the packa
 `mise run paper:test` ran both paper tests and both passed: one asset and a week of daily bars reached a
 strategy through a real node, and a DAY limit buy of 1 AAPL at $1.00 was accepted and then canceled. So the
 two "had not run" statements above no longer hold for those two paths. A fill and a partial fill ran at
-Alpaca the same day, outside the adapter, in ADR 0024's paper test. Still UNVERIFIED against Alpaca: the
-live quote and trade stream, `load_all` at full scale, a fill and a partial fill through the adapter, and
-a rejection.
+Alpaca the same day, outside the adapter, in ADR 0024's paper test. Upstream's data and execution testers
+then ran through the adapter (the package README's matrix): the live quote and trade stream passed, trades
+without an aggressor side; so did fills, a venue rejection and cancel-all. Still UNVERIFIED against
+Alpaca: `load_all` at full scale and a partial fill through the adapter.
 
 ADR 0036 records the order-management slice, one change at a time, starting with cancel-all.
 
@@ -144,3 +145,4 @@ For the execution slice, read 2026-11-10:
 * `mise run paper:test` on `main` at `c87ea07`, 2026-11-10, during the regular session — 2 passed;
   the output held neither key (run).
 * `test_paper_fill_ids.py`, 2026-11-10, six runs, passed: fills and partial fills at Alpaca (ADR 0024; run).
+* `test_paper_matrix.py`, 2026-11-10: upstream's `DataTester` and `ExecTester` rows, in the README (run).
