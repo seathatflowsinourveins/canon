@@ -76,7 +76,9 @@ Binance adapter refuses it in v2. Node configuration itself belongs in `src/cano
 Credentials come from the environment: `ALPACA_API_KEY` and `ALPACA_SECRET_KEY`, holding a **paper** key
 pair. alpaca-py 0.45.0 reads no environment variable itself; these are the names Alpaca's own CLI and MCP
 server read. They are read in the client's `_connect`, never stored in a config, and never logged. If they
-are missing, the connect fails and the node log names both variables.
+are missing, the connect fails and the node log names both variables. On a Mac the pair is entered once
+with `mise run paper:store`, kept in the login keychain, and put in these variables only for
+`mise run paper:test` ([ADR 0029](../../docs/adr/0029-paper-keys-in-the-login-keychain.md)).
 
 ## Contract
 
@@ -256,7 +258,9 @@ This package has all three for each client, offline, plus a paper test for each:
 | `test_upstream_contract.py` | The upstream names this README quotes still exist in the pinned packages; the execution hooks and `generate_order_filled` signature; alpaca-py's trading clients default to and target paper; the native config drops unknown keywords; the stream stand-ins refuse and keep what alpaca-py's `StockDataStream` and `TradingStream` do | None |
 
 The offline tests use payloads hand-built from the examples in Alpaca's docs (sources in `tests/conftest.py`)
-and stand-ins for the alpaca-py clients. Not yet tested against Alpaca: the live quote and trade stream,
+and stand-ins for the alpaca-py clients. To run the two paper tests, enter the pair once with
+`mise run paper:store` and then run `mise run paper:test` from the repo root; `mise run paper:check` says
+whether the pair is there (root `README.md`, "Enter the Alpaca paper keys"). Not yet tested against Alpaca: the live quote and trade stream,
 the asset list at `load_all` scale, and everything in the execution client (its paper test has not run).
 
 ## Rules
