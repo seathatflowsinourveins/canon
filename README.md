@@ -41,6 +41,51 @@ previous copy of each.
 | `scripts/automation status` | Every standing automation and whether it is healthy |
 | `scripts/survey-github report canon/github-practice.json` | What a measured sample of repositories converges on for pull requests and GitHub automation |
 
+## Run the first backtest
+
+`src/canon_trading/` holds one strategy and one way to run it. `MaCross` (`ma_cross.py`) holds a position
+while a fast moving average of bar closes is above a slow one. It is there to move bars, orders, fills and
+an account through NautilusTrader, not as a trading idea. `run_backtest` (`backtest.py`) runs strategies
+over their bars in a `ParquetDataCatalog` on a simulated Alpaca venue and returns the engine's own results.
+
+It needs no network, no credentials and no downloaded data:
+
+```bash
+uv run --locked pytest tests/test_backtest.py
+```
+
+That test generates 40 daily bars, writes them and their instrument to a temporary catalog, runs the
+strategy through a real `BacktestNode`, and checks what came out: every bar delivered, four orders filled
+at known closes, two round trips, and 100,000 USD ending as 100,090. The arithmetic is worked by hand at
+the top of the test file.
+
+To run over a catalog of your own, it must hold the bars and the definition of their instrument, written
+as the test writes them (`canon_alpaca.providers.parse_equity`, `canon_alpaca.data.parse_bar`, then
+`write_instruments` and `write_bars`). Nothing in this repo fills `catalog/` from Alpaca yet.
+
+```python
+from pathlib import Path
+
+from canon_trading.backtest import run_backtest
+from canon_trading.ma_cross import MaCross
+from canon_trading.ma_cross import MaCrossConfig
+from nautilus_trader.model import BarType
+from nautilus_trader.model import Quantity
+
+bar_type = BarType.from_str("AAPL.ALPACA-1-DAY-LAST-EXTERNAL")
+strategy = MaCross(MaCrossConfig(bar_type=bar_type, trade_size=Quantity.from_int(10)))
+run = run_backtest(Path("catalog"), [strategy], starting_balances=["100_000 USD"])
+
+print(run.result)
+print(len(run.orders), "orders;", list(run.account.balances_total().values()))
+```
+
+`run.result` is NautilusTrader's `BacktestResult`; `run.orders`, `run.positions`,
+`run.position_snapshots` and `run.account` are the objects in the engine's cache. The simulated venue's
+settings and what it leaves out (slippage, latency, market hours, margin) are listed at the top of
+`backtest.py`. A result here shows that the plumbing works. It may be reported, but not ranked against
+another until [ADR 0010](docs/adr/0010-strategy-evaluation.md) is accepted.
+
 ## What runs on its own
 
 | Layer | Runs | Costs tokens |
@@ -102,6 +147,8 @@ here, community convergence, then anyone's recollection.
   upstream's guide. The adapter's data client exists (US equities, historical bars, streamed quotes and
   trades, from Alpaca's paper data), with offline tests; its paper integration test has not run yet, and
   there is no execution client. See `packages/canon-alpaca/README.md`.
+* **No market data in `catalog/`.** The first backtest runs on bars generated in its test. Nothing here
+  writes Alpaca's bars to the catalog yet.
 * **No accepted method for comparing strategy variants** (ADR 0010 is `proposed`).
 * **No OpenTelemetry backend.** The local event ledger covers this machine; `home/otel-settings.example.json`
   is ready for when a collector exists.
