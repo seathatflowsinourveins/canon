@@ -27,7 +27,10 @@
 # own and unchanged. A firing cannot overlap another: launchd misses a firing while the job runs, and kills
 # what is left of the job's process group when it ends (launchd.plist(5), AbandonProcessGroup).
 # CANON_PAPER_SESSION_DIR replaces the record folder (tests only).
-PATH=/usr/bin:/bin:/usr/sbin:/sbin
+# exported: under an empty environment bash keeps an assigned PATH to itself, and the task's exec()
+# templates then failed with "exec command: No such file or directory" (observed with env -i, 2026-11-10;
+# why mise needs PATH there is UNVERIFIED against its source)
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
 export GIT_TERMINAL_PROMPT=0   # never wait at a credential prompt: the clone fetches a public repository
 # the clone reads no user git config (no insteadOf rewrite to ssh, no hooks or signing): git-config(1), ENVIRONMENT
 export GIT_CONFIG_GLOBAL=/dev/null

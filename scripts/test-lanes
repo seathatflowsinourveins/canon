@@ -39,7 +39,7 @@ B="$TMP/bin"; mkdir -p "$B"
 cat > "$B/mise" <<'EOF'
 #!/bin/bash
 # mise stub: version from $STUB/mise-version; exec logs MISE_EXEC_AUTO_INSTALL and fakes the tools
-echo "mise $* | exec_auto_install=${MISE_EXEC_AUTO_INSTALL:-unset} | pwd=$PWD | commit=${CANON_COMMIT:-}" >> "$STUB/mise.log"
+echo "mise $* | exec_auto_install=${MISE_EXEC_AUTO_INSTALL:-unset} | pwd=$PWD | commit=${CANON_COMMIT:-} | path=${PATH:-unset}" >> "$STUB/mise.log"
 case "${1:-}" in
   --version) cat "$STUB/mise-version"; exit 0 ;;
   trust|install) exit 0 ;;
@@ -308,7 +308,9 @@ want=$(git -C "$O" rev-parse main)
 check "first firing clones origin's main and runs the window there: exit 0" \
       eval '[ "$rc" = 0 ] && [ "$(git -C "$FK" rev-parse HEAD)" = "$want" ]'
 check "... mise run paper:session --session auto --minutes 25, in the clone, CANON_COMMIT the commit" \
-      eval 'ran | grep -qF "mise run paper:session --session auto --minutes 25 |" && ran | grep -qF "| pwd=$(cd "$FK" && pwd) | commit=$want"'
+      eval 'ran | grep -qF "mise run paper:session --session auto --minutes 25 |" && ran | grep -qF "| pwd=$(cd "$FK" && pwd) | commit=$want |"'
+check "... with PATH exported, which mise's exec() templates need to start a shell" \
+      eval 'ran | grep -qE "\| path=/usr/bin:/bin:/usr/sbin:/sbin\$"'
 echo 2 > "$OW/tracked"; ocommit second; want=$(git -C "$O" rev-parse main)
 mkdir -p "$FK/.venv" "$FK/catalog"; : > "$FK/.venv/kept"; : > "$FK/catalog/bars"; : > "$FK/untracked"; echo local > "$FK/tracked"
 fire "$B/mise" "$FK" "$OURL" --session auto; rc=$?
