@@ -184,7 +184,8 @@ here, community convergence, then anyone's recollection.
 * **Little proven against Alpaca.** NautilusTrader has no official Alpaca adapter; ADR 0009 decides to
   build one to upstream's guide. The adapter has a data client (US equities, historical bars, streamed
   quotes and trades, from Alpaca's paper data) and a first, paper-only execution client (market, limit,
-  stop and stop-limit orders, modify, cancels and cancel-all, fills from trade updates). Both pass their offline
+  stop and stop-limit orders, modify, cancels and cancel-all, extended hours for limit orders, fills from
+  trade updates). Both pass their offline
   tests, and the two paper tests that existed then passed on 2026-11-10: daily bars through a real node,
   and a limit order accepted and canceled (ADR 0030); the order-management paper tests are ADR 0036's.
   Another showed that Alpaca's fill activities carry the trade updates' `execution_id`s (ADR 0024).

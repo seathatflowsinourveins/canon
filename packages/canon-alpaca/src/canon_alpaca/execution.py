@@ -82,13 +82,20 @@ Known limits:
   stop; Alpaca has no trigger type field), and any other is denied. Upstream's Kraken spot adapter maps
   `DEFAULT` and `LAST_PRICE` to its last-trade trigger too, and refuses what its venue has no trigger for.
   Alpaca's extended hours table
-  gives stop and stop-limit orders "No" in every time in force; this client never sends
-  `extended_hours`. The stop price and a stop-limit's limit price follow the sub-penny rule ("Sub-penny
+  gives stop and stop-limit orders "No" in every time in force; a stop marked eligible is denied (below,
+  "Extended hours"). The stop price and a stop-limit's limit price follow the sub-penny rule ("Sub-penny
   increments for stop orders"). Alpaca documents no status or trade update for a stop's election, so no
   `OrderTriggered` is generated: an elected stop-limit stays `ACCEPTED` until it fills or ends. Trailing
   stops stay denied: their stop price moves with Alpaca's high-water mark and no update reports it.
 * Post-only, reduce-only, quote-quantity, display quantity, contingent orders and order lists are denied
-  or not implemented; so are queries and extended hours.
+  or not implemented; so are queries.
+* Extended hours (ADR 0038): `submit_order(order, params={"extended_hours": True})` sends a limit order,
+  `DAY` or `GTC`, with Alpaca's `extended_hours` set; any other order so marked, an unknown params key and
+  a non-boolean value are denied before Alpaca ("Only limit orders with `time_in_force` set to `day` or
+  `gtc` orders are accepted as extended hours eligible", "Orders at Alpaca", "Extended Hours Trading").
+  Its trade updates are mapped as any order's. A `day` order placed overnight stays active through the next
+  trading day and "If unfilled, the order is canceled at 8:00 PM ET" (Alpaca's 24/5 page); which update
+  that cancel sends is not documented.
 * Cancel-all sends one cancel per order, one at a time, in no specified order, skipping an order already
   pending cancel; an order placed after the command was read from the cache is not canceled by it.
 * A limit price at or above $1.00 with more than 2 decimals, or below $1.00 with more than 4, is denied
@@ -479,6 +486,38 @@ def sub_penny_denial(price: Price, what: str = "limit price") -> str | None:
     return None
 
 
+EXTENDED_HOURS = "extended_hours"
+"""The submit parameter that makes an order eligible outside the regular session. Venue-specific order
+parameters travel in the command's `params` (adapter guide: commands "preserve native identifiers and
+params"), as upstream's Bybit, Kraken and OKX adapters read theirs and `ExecTesterConfig.order_params`
+sends them; the name is Alpaca's own field ("Orders at Alpaca", "Extended Hours Trading")."""
+
+
+def extended_hours_param(params: object) -> tuple[bool, str | None]:
+    """The submit's `extended_hours` flag, and why the params are refused, if they are: a parameter this
+    client does not take is refused rather than dropped."""
+    if not params:
+        return False, None
+    if not isinstance(params, dict):
+        return False, f"order params {params!r} are not a mapping"
+    unknown = sorted(str(k) for k in params if k != EXTENDED_HOURS)
+    if unknown:
+        return False, f"order params {unknown} are not taken; only {EXTENDED_HOURS!r}"
+    value = params.get(EXTENDED_HOURS, False)
+    if not isinstance(value, bool):
+        return False, f"{EXTENDED_HOURS} must be true or false, got {value!r}"
+    return value, None
+
+
+def extended_hours_denial(order: Any) -> str | None:
+    """Why Alpaca would reject this order as extended-hours eligible, or None: "Only limit orders with
+    `time_in_force` set to `day` or `gtc` orders are accepted as extended hours eligible. All other order
+    types and TIF values will be rejected with an error" ("Orders at Alpaca", "Extended Hours Trading")."""
+    if order.order_type != OrderType.LIMIT:
+        return f"{EXTENDED_HOURS} is for limit orders only at Alpaca, not {order.order_type.name}"
+    return None  # `_denial` has already refused a time in force other than `DAY` and `GTC`
+
+
 def replaces_as_asked(replacement: AlpacaOrder, request: ReplaceOrderRequest) -> bool:
     """Whether Alpaca's replacement has every term the replace request set."""
     pairs = (
@@ -753,11 +792,14 @@ class AlpacaExecutionClient(ExecutionClient):
     @override
     async def _submit_order(self, command: live.SubmitOrder) -> None:
         order = command.order
-        denial = self._denial(order)
+        extended_hours, denial = extended_hours_param(command.params)
+        denial = denial or self._denial(order)
+        if denial is None and extended_hours:
+            denial = extended_hours_denial(order)
         if denial is not None:
             self.generate_order_denied(order, denial)
             return
-        request = self._order_request(order)
+        request = self._order_request(order, extended_hours)
         venue = self._venue()  # raises before `OrderSubmitted` when not connected: nothing was sent
         self.generate_order_submitted(order)
         try:
@@ -1137,14 +1179,16 @@ class AlpacaExecutionClient(ExecutionClient):
         return None
 
     @staticmethod
-    def _order_request(order: Any) -> OrderRequest:
-        fields = {
+    def _order_request(order: Any, extended_hours: bool = False) -> OrderRequest:
+        fields: dict[str, Any] = {
             "symbol": order.instrument_id.symbol.value,
             "qty": float(int(order.quantity.as_double())),
             "side": ORDER_SIDES[order.side],
             "time_in_force": TIMES_IN_FORCE[order.time_in_force],
             "client_order_id": order.client_order_id.value,
         }
+        if extended_hours:
+            fields["extended_hours"] = True  # only ever with a limit order, `DAY` or `GTC`
         if order.order_type == OrderType.LIMIT:
             return LimitOrderRequest(**fields, limit_price=wire_price(order.price))
         if order.order_type == OrderType.STOP_MARKET:
