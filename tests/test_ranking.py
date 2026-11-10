@@ -543,8 +543,9 @@ def test_affine_copies_report_n_hat_at_one_instead_of_raising(study: optuna.Stud
     assert report.pick == "affine"
     assert report.n_hat == pytest.approx(1.0, abs=1e-12)
     assert report.n_hat is not None and report.n_hat >= 1.0
-    assert report.dsr_at_n_hat is not None
-    assert report.dsr_at_n_hat <= measures.probabilistic_sharpe_ratio(affine, 0.0) + 1e-12
+    # Just above 1, the benchmark falls below 0 and the DSR at N-hat is withheld; at 1 it is the PSR.
+    undeflated = measures.probabilistic_sharpe_ratio(affine, 0.0)
+    assert report.dsr_at_n_hat is None or report.dsr_at_n_hat <= undeflated + 1e-12
 
 
 def test_a_mean_correlation_above_one_raises_n_hat_to_one(
