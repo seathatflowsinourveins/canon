@@ -211,6 +211,7 @@ def window_node(
             slow_period=config.slow_period,
             extended_hours=extended,
             wind_down_at=wind_down_at,
+            warm_up=True,  # the averages start from the adapter's last bars (ADR 0047)
             strategy_id=STRATEGY_ID,
             order_id_tag="001",
             # In the session, `stop()` runs upstream's market exit, with closing orders Alpaca takes.
@@ -246,6 +247,8 @@ class WindowReport:
     left: list[str] = field(default_factory=list)
     closed_after_stop: bool = False
     errors: list[str] = field(default_factory=list)
+    warm_up_bars: int = 0
+    warm_up_dropped: int = 0
 
 
 def paper_trading() -> TradingClient:
@@ -320,6 +323,8 @@ def run_window(config: WindowConfig) -> WindowReport:
                 report.seconds = round(time.monotonic() - started, 1)
                 _fill(report, cache)
                 report.dropped = list(strategy.dropped)
+                report.warm_up_bars = strategy.history_bars
+                report.warm_up_dropped = strategy.history_dropped
                 report.cap_checks, report.cap_peak = cap.checks, str(cap.peak)
                 report.cap_tripped = cap.tripped
             finally:

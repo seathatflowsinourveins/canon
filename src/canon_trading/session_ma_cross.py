@@ -40,8 +40,19 @@ wind-down cancels this strategy's working orders and, once none is working, clos
 again on each later bar while it is still held. A close is sized and sided from the signed position, so a
 short is bought back, not added to.
 
-Known limits: the averages are built from this window's bars only, so the first `slow_period` bars send
-nothing; the strategy does not know the session calendar (the run checks it before it starts).
+**Warm-up** (`warm_up=True`). A window starts with no state from the last (no cache backing for a Python
+client, ADR 0047), so the averages would need `slow_period` live bars before any decision. Instead, as
+upstream's EMA cross does in `on_start` (concepts/strategies, "Handler example": register the indicators,
+`request_bars`, subscribe; "Registered indicators receive the bars from a request response before
+`on_historical_bars()` runs, so a request hydrates them"), the `EXTERNAL` form of the live bar
+type, the bars the adapter serves, is requested before the live subscription, at least an hour of it.
+One departure: the averages are registered for the live bar type only, and `on_historical_bars` feeds the
+history to them, oldest first, only while no live bar has reached them; a later answer (after a live bar,
+or after `WARM_UP_TIMEOUT_SECS`) is dropped and counted, so older bars never follow newer ones. Decisions
+wait until the request completes or times out (`hydrated`). The live bars stay the `INTERNAL` ones built
+from trades; both come from the IEX feed.
+
+Known limit: the strategy does not know the session calendar (the run checks it before it starts).
 """
 
 from __future__ import annotations
@@ -53,6 +64,8 @@ from decimal import ROUND_FLOOR
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
+from nautilus_trader.model import AggregationSource
+from nautilus_trader.model import BarType
 from nautilus_trader.model import ClientOrderId
 from nautilus_trader.model import OrderSide
 from nautilus_trader.model import Price
@@ -64,7 +77,6 @@ from .ma_cross import MaCrossConfig
 if TYPE_CHECKING:
     from nautilus_trader.common import TimeEvent
     from nautilus_trader.model import Bar
-    from nautilus_trader.model import BarType
     from nautilus_trader.model import Quantity
 
 EXTENDED_HOURS = {"extended_hours": True}
@@ -74,6 +86,14 @@ LIMIT_OFFSET = Decimal("0.05")
 limit at the touch may never fill; five cents bounds the price paid at a fraction of a basis point on SPY."""
 LIMIT_TIMEOUT_SECS = 30
 CENT = Decimal("0.01")
+WARM_UP_SPARE_BARS = 5
+"""Bars requested beyond `slow_period`, for minutes the feed had no trade in."""
+WARM_UP_TIMEOUT_SECS = 60
+"""How long decisions wait for the warm-up's answer before going on with live bars alone."""
+WARM_UP_SPAN = timedelta(hours=1)
+"""At least this much history is asked for: on a thin feed (pre-market, after-hours) the last
+`slow_period` minutes can hold fewer than `slow_period` bars; the averages keep the last ones fed."""
+WARM_UP_ALERT = "warm-up-timeout"
 
 
 class SessionMaCrossConfig(MaCrossConfig):
@@ -94,6 +114,7 @@ class SessionMaCrossConfig(MaCrossConfig):
         limit_offset: Decimal = LIMIT_OFFSET,
         limit_timeout_secs: int = LIMIT_TIMEOUT_SECS,
         wind_down_at: datetime | None = None,
+        warm_up: bool = False,
         **kwargs: object,
     ) -> None:
         super().__init__(
@@ -115,6 +136,9 @@ class SessionMaCrossConfig(MaCrossConfig):
         self.limit_offset = limit_offset
         self.limit_timeout_secs = limit_timeout_secs
         self.wind_down_at = wind_down_at
+        if warm_up and not bar_type.spec.is_time_aggregated():
+            raise ValueError(f"warm_up needs time bars to size its request, got {bar_type}")
+        self.warm_up = warm_up
 
 
 def through_the_touch(side: OrderSide, bid: Decimal, ask: Decimal, offset: Decimal) -> Decimal:
@@ -134,11 +158,37 @@ class SessionMaCross(MaCross):
         self.limit_timeout_secs = config.limit_timeout_secs
         self.wind_down_at = config.wind_down_at
         self.manage_stop = config.manage_stop
+        self.warm_up = config.warm_up
+        self.history_bar_type = BarType(
+            self.bar_type.instrument_id, self.bar_type.spec, AggregationSource.EXTERNAL
+        )
+        self.hydrated = not config.warm_up
+        """Whether the warm-up response has arrived, or no warm-up was asked for."""
+        self.history_bars = 0
+        self.history_dropped = 0
+        self.live_bars = 0
         self.winding_down = False
         self.dropped: list[str] = []
         """Why each dropped signal was dropped, for the run's report."""
 
     def on_start(self) -> None:
+        if (
+            self.warm_up
+        ):  # requested before the live subscription, as upstream's handler example does
+            self.hydrated = False
+            self.history_bars = 0
+            self.history_dropped = 0
+            self.live_bars = 0
+            self.request_bars(
+                self.history_bar_type,
+                start=self.clock.utc_now() - self._warm_up_span(),
+                callback=self._on_history,
+            )
+            self.clock.set_time_alert(
+                WARM_UP_ALERT,
+                self.clock.utc_now() + timedelta(seconds=WARM_UP_TIMEOUT_SECS),
+                self._on_history_timeout,
+            )
         super().on_start()
         if self.extended_hours:
             self.subscribe_quotes(self.instrument_id)
@@ -146,6 +196,42 @@ class SessionMaCross(MaCross):
             self.clock.set_time_alert(
                 "wind-down", self.wind_down_at, self._wind_down, allow_past=True
             )
+
+    def _warm_up_span(self) -> timedelta:
+        """`WARM_UP_SPAN`, or `slow_period` plus `WARM_UP_SPARE_BARS` bars if that is longer."""
+        bars = (self.slow.period + WARM_UP_SPARE_BARS) * self.bar_type.spec.timedelta
+        return max(WARM_UP_SPAN, bars)
+
+    def on_historical_bars(self, bars) -> None:
+        """Feed the requested bars to the averages, oldest first, only while no live bar has reached
+        them: the averages are registered for the live bar type alone, so a late answer (after a live
+        bar, or after the timeout) is dropped rather than applied after newer bars."""
+        if self.live_bars or self.hydrated:
+            self.history_dropped += len(bars)
+            self.log.warning(f"Warm-up: {len(bars)} bars arrived after live bars; dropped")
+            return
+        for bar in sorted(bars, key=lambda b: b.ts_init):
+            self.fast.handle_bar(bar)
+            self.slow.handle_bar(bar)
+        self.history_bars += len(bars)
+
+    def _on_history_timeout(self, event: TimeEvent) -> None:  # the alert only times it
+        if not self.hydrated:
+            self.log.warning(
+                f"Warm-up: no answer in {WARM_UP_TIMEOUT_SECS} s; deciding on live bars"
+            )
+            self.hydrated = True
+
+    def _on_history(self, request_id: str) -> None:
+        """The request's completion, whether served or failed (both observed at the pin)."""
+        if not self.hydrated:
+            self.hydrated = True
+            self.log.info(
+                f"Warm-up: {self.history_bars} bars of {self.history_bar_type}; "
+                f"averages initialized: {self.indicators_initialized()}"
+            )
+        if WARM_UP_ALERT in self.clock.timer_names():
+            self.clock.cancel_timer(WARM_UP_ALERT)
 
     def working(self) -> bool:
         """Whether one of this strategy's orders for the instrument is not closed: initialized and not yet
@@ -170,6 +256,8 @@ class SessionMaCross(MaCross):
         )
 
     def on_bar(self, bar: Bar) -> None:
+        if bar.bar_type == self.bar_type:
+            self.live_bars += 1  # the averages have already taken this bar
         if self.working() or self.is_exiting():
             return
         held = self.held()
@@ -180,7 +268,7 @@ class SessionMaCross(MaCross):
         if held < 0:  # it never sells short; a short is closed at once
             self._close()
             return
-        if not self.indicators_initialized():
+        if not self.hydrated or not self.indicators_initialized():
             return
         if self.fast.value > self.slow.value and not held:
             self._enter()
