@@ -1,13 +1,28 @@
 #!/bin/bash
 # ci — every check this repo has, in one place (docs/adr/0013-quality-gates.md).
 #
-# The commit gate (.githooks/pre-commit) and the GitHub workflow (.github/workflows/ci.yml) both run this
-# script, so a change is judged the same way on this Mac and in CI. Tools come from the pinned toolchain:
-# mise.toml + mise.lock for shellcheck, gitleaks, actionlint and uv; uv.lock for ruff, ty and pytest.
+# The commit gate (.githooks/pre-commit), scripts/land and the GitHub workflow (.github/workflows/ci.yml)
+# all run this script, so a change is judged the same way on this Mac and in CI. Tools come from the pinned
+# toolchain: mise.toml + mise.lock for shellcheck, gitleaks, actionlint and uv; uv.lock for ruff, ty and
+# pytest. PATH is set once from `mise env`; a tool counts as present only if it is in a directory mise
+# manages, so a missing tool fails its check by name.
+#
+# What is checked:
+#   shell files   every tracked file (git ls-files, so staged new files too) whose first line is a sh or
+#                 bash shebang: `bash -n` and shellcheck
+#   test scripts  every tracked executable scripts/test-*, each as its own check, in name order
+#   workflows     actionlint on .github/workflows/*.yml and *.yaml; a skip line when there are none
+#   pytest        skipped tests are listed under the `ok pytest` line with their reasons
+#
+# `uv lock --check` and one `uv run --locked` (which creates the Python environment) run first; then every
+# check runs as a background job writing to its own temp file, and the results are printed in a fixed order.
+# Checks run without git's repository-local variables (GIT_DIR, GIT_INDEX_FILE, ...), which a commit hook
+# sets, except the staged secret scan, which needs them.
 #
 # Usage: scripts/ci            check everything; the secret scan covers the whole git history
 #        scripts/ci --staged   same, but the secret scan covers only what is staged (used by pre-commit)
 # A tool that is missing is a failure, never a skip. Exit 0 only if every check passes.
+# CANON_TEST_CI=1 (set by scripts/test-ci) skips scripts/test-ci itself, with a skip line.
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT" || exit 1
@@ -16,47 +31,248 @@ STAGED=0; [ "${1:-}" = "--staged" ] && STAGED=1
 if command -v mise >/dev/null 2>&1; then MISE=$(command -v mise)
 elif [ -x "$HOME/.local/bin/mise" ]; then MISE="$HOME/.local/bin/mise"
 else echo "ci: FAIL: mise not found. Run scripts/bootstrap --install."; exit 1; fi
-tool() { "$MISE" exec -- "$@"; }          # run a tool at the version mise.lock records
 
-fail=0
-# run <label> <command...>
-run() {
-  local label="$1" out; shift
-  if out=$("$@" 2>&1); then printf '  ok    %s\n' "$label"
-  else printf '  FAIL  %s\n' "$label"; printf '%s\n' "$out" | sed 's/^/        /' | head -40; fail=1; fi
+# Load the toolchain once: `mise env -s bash` prints the exports, `mise env --paths` the directories mise
+# manages (both documented in `mise env --help`).
+if ! MISE_ENV_SH=$("$MISE" env -s bash); then echo "ci: FAIL: \`mise env -s bash\` failed."; exit 1; fi
+if ! MISE_PATHS=$("$MISE" env --paths); then echo "ci: FAIL: \`mise env --paths\` failed."; exit 1; fi
+eval "$MISE_ENV_SH"
+# has_tool <name>: true if <name> is an executable in a directory mise manages
+has_tool() {
+  local d
+  while IFS= read -r d; do [ -n "$d" ] && [ -x "$d/$1" ] && return 0; done <<<"$MISE_PATHS"
+  return 1
+}
+# tool <name> [args...]: run a tool from the mise toolchain, or fail naming it
+tool() {
+  if ! has_tool "$1"; then
+    echo "$1: not found in the mise toolchain (mise.toml, mise.lock). Run scripts/bootstrap --install."
+    return 127
+  fi
+  "$@"
 }
 
-SHELL_FILES=()
-for f in scripts/* .claude/hooks/*.sh home/.claude/canon/* .githooks/*; do
-  [ -f "$f" ] && head -1 "$f" | grep -q '^#!.*sh' && SHELL_FILES+=("$f")
-done
-syntax() { local f rc=0; for f in "${SHELL_FILES[@]}"; do bash -n "$f" || rc=1; done; return "$rc"; }
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/canon-ci.XXXXXX") || { echo "ci: FAIL: mktemp failed."; exit 1; }
+trap 'rm -rf "$WORK"' EXIT
 
-echo "Canon and harness:"
-run "canon registry, lock and ADRs"      scripts/canon lint
-run "release-rule self-test"             scripts/canon selftest
-run "shell syntax (${#SHELL_FILES[@]} files)"            syntax
-run "shellcheck"                         tool shellcheck "${SHELL_FILES[@]}"
-run "hook behaviour (guard, marking)"    scripts/test-hooks
-run "lane report self-test"              scripts/lanes --selftest
-run "practice survey self-test"          scripts/survey-github selftest
+# On INT or TERM, stop every background check and the processes it started, then exit 128 + signal.
+# Background jobs of a non-interactive shell ignore SIGINT, so Ctrl-C reaches them only through this.
+PIDS=()
+tree() { local c; echo "$1"; for c in $(pgrep -P "$1"); do tree "$c"; done; }
+stop_jobs() {
+  local p all=""
+  [ "${#PIDS[@]}" -gt 0 ] || return 0
+  for p in "${PIDS[@]}"; do all="$all $(tree "$p")"; done
+  # shellcheck disable=SC2086  # a list of process ids
+  kill -TERM $all 2>/dev/null
+  wait 2>/dev/null
+}
+trap 'stop_jobs; echo "ci: interrupted"; exit 130' INT
+trap 'stop_jobs; echo "ci: terminated"; exit 143' TERM
 
-echo "Python workspace:"
-run "uv.lock matches the manifests"      tool uv lock --check
-run "ruff lint"                          tool uv run --locked ruff check .
-run "ruff format"                        tool uv run --locked ruff format --check .
-run "ty type check"                      tool uv run --locked ty check
-run "pytest"                             tool uv run --locked pytest -q
+# Run from a git hook, this script inherits GIT_DIR, GIT_INDEX_FILE and the other repository-local
+# variables that `git rev-parse --local-env-vars` lists. With them set, a check that builds a scratch
+# repository (git init, git config, git commit) would write to this repository instead. So every check
+# runs with them removed, except the two that need the index being committed:
+#   - the shell-file and test-script lists below, built in this shell, so staged new files are included;
+#   - `gitleaks git --pre-commit --staged`, which scans that index (job --git-env).
+if ! GIT_LOCAL_VARS=$(git rev-parse --local-env-vars); then
+  echo "ci: FAIL: \`git rev-parse --local-env-vars\` failed."; exit 1
+fi
+without_git_env() {
+  local v
+  while IFS= read -r v; do [ -n "$v" ] && unset "$v"; done <<<"$GIT_LOCAL_VARS"
+}
 
-echo "Supply chain:"
-if compgen -G ".github/workflows/*.yml" >/dev/null; then
-  run "actionlint (workflow files)"      tool actionlint
+# Entries are printed in the order they are added. KIND is head, job or skip.
+n=0; KIND=(); TEXT=(); NOTE=()
+head_line() { n=$((n+1)); KIND[n]="head"; TEXT[n]="$1"; NOTE[n]=""; }
+skip_line() { n=$((n+1)); KIND[n]="skip"; TEXT[n]="$1"; NOTE[n]=""; }
+# job [--skips] [--git-env] <label> <command...>: start a check in the background, without git's local
+# variables unless --git-env is given. On success, --skips lists pytest's SKIPPED lines and --notes the
+# `  skip  ` lines a test script prints, so a skip inside a check stays visible.
+job() {
+  local note="" keep=0
+  while :; do
+    case "$1" in
+      --skips) note='^SKIPPED'; shift ;;
+      --notes) note='^  skip  '; shift ;;
+      --git-env) keep=1; shift ;;
+      *) break ;;
+    esac
+  done
+  n=$((n+1)); KIND[n]="job"; TEXT[n]="$1"; NOTE[n]="$note"; shift
+  ( [ "$keep" -eq 1 ] || without_git_env; "$@" >"$WORK/$n.out" 2>&1; echo "$?" >"$WORK/$n.rc" ) &
+  PIDS+=("$!")
+}
+# now <label> <command...>: run a check in the foreground, without git's local variables
+now() {
+  n=$((n+1)); KIND[n]="job"; TEXT[n]="$1"; NOTE[n]=""; shift
+  ( without_git_env; "$@" ) >"$WORK/$n.out" 2>&1; local rc=$?
+  echo "$rc" >"$WORK/$n.rc"
+  return "$rc"
+}
+
+# Shell files: regular files in the index (so staged new files are included) whose first line is a sh or
+# bash shebang. Symlinks (mode 120000) are left out: the file they point to is checked under its own path.
+# A file deleted from the working tree is checked from its staged content in --staged mode, and is listed
+# with a skip line otherwise.
+SHELL_FILES=(); MISSING=()
+list_ok=1
+shebang='^#!.*[/[:space:]](ba)?sh([[:space:]]|$)'
+if git ls-files -s -z >"$WORK/files" 2>"$WORK/files.err"; then
+  mkdir -p "$WORK/staged" "$WORK/blobs"
+  prev=""; k=0
+  while IFS= read -r -d '' entry; do
+    mode=${entry%% *}; f=${entry#*$'\t'}; sha=${entry#* }; sha=${sha%% *}
+    [ "$f" = "$prev" ] && continue; prev=$f        # one entry per path, also during a merge
+    case "$mode" in 100644|100755) ;; *) continue ;; esac
+    src=$f
+    if [ ! -f "$f" ]; then
+      k=$((k+1)); src="$WORK/blobs/$k"
+      git cat-file blob "$sha" >"$src" 2>>"$WORK/files.err" || { list_ok=0; continue; }
+    fi
+    first=""; IFS= read -r first <"$src" || true
+    [[ "$first" =~ $shebang ]] || continue
+    if [ "$src" = "$f" ]; then SHELL_FILES+=("$f")
+    elif [ "$STAGED" -eq 1 ]; then
+      case "$f" in */*) mkdir -p "$WORK/staged/${f%/*}" ;; esac
+      mv "$src" "$WORK/staged/$f"; SHELL_FILES+=("$WORK/staged/$f")
+    else
+      MISSING+=("$f")
+    fi
+  done <"$WORK/files"
+else
+  list_ok=0
+fi
+list_failed() { echo "git ls-files failed:"; cat "$WORK/files.err"; return 1; }
+syntax() {
+  [ "${#SHELL_FILES[@]}" -gt 0 ] || { echo "no shell files found"; return 1; }
+  local f rc=0; for f in "${SHELL_FILES[@]}"; do bash -n "$f" || rc=1; done; return "$rc"
+}
+lint_shell() {
+  [ "${#SHELL_FILES[@]}" -gt 0 ] || { echo "no shell files found"; return 1; }
+  tool shellcheck "${SHELL_FILES[@]}"
+}
+
+# Test scripts: tracked files directly in scripts/ named test-*, in the sorted order git ls-files gives
+# (its `*` also matches `/`, so paths in subdirectories are dropped here). One that is not executable in the
+# index, or is missing from the working tree, gets a FAIL line instead of being run.
+TESTS=(); TEST_MODES=()
+tests_ok=1
+if git ls-files -s -z -- 'scripts/test-*' >"$WORK/tests" 2>"$WORK/tests.err"; then
+  prev=""
+  while IFS= read -r -d '' entry; do
+    mode=${entry%% *}; path=${entry#*$'\t'}
+    [ "$path" = "$prev" ] && continue; prev=$path
+    case "${path#scripts/}" in */*) continue ;; esac
+    TESTS+=("$path"); TEST_MODES+=("$mode")
+  done <"$WORK/tests"
+else
+  tests_ok=0
+fi
+tests_failed() { echo "git ls-files failed:"; cat "$WORK/tests.err"; return 1; }
+not_executable() { echo "$1 is tracked with mode $2, not 100755; run: git update-index --chmod=+x $1"; return 1; }
+not_present() { echo "$1 is tracked but missing from the working tree"; return 1; }
+
+head_line "Canon and harness:"
+job "canon registry, lock and ADRs"      scripts/canon lint
+job "release-rule self-test"             scripts/canon selftest
+if [ "$list_ok" -eq 1 ]; then
+  job "shell syntax (${#SHELL_FILES[@]} files)"  syntax
+  job "shellcheck"                       lint_shell
+  if [ "${#MISSING[@]}" -gt 0 ]; then
+    for f in "${MISSING[@]}"; do skip_line "shell checks for $f (deleted from the working tree)"; done
+  fi
+else
+  job "shell file list"                  list_failed
+fi
+job "lane report self-test"              scripts/lanes --selftest
+job "practice survey self-test"          scripts/survey-github selftest
+if [ "$tests_ok" -eq 0 ]; then
+  job "test script list"                 tests_failed
+fi
+if [ "${#TESTS[@]}" -gt 0 ]; then
+  for j in "${!TESTS[@]}"; do
+    t=${TESTS[j]}; name=${t##*/}
+    if [ "${TEST_MODES[j]}" != 100755 ]; then
+      job "$name (not executable)"       not_executable "$t" "${TEST_MODES[j]}"
+    elif [ ! -f "$t" ]; then
+      job "$name (missing)"              not_present "$t"
+    elif [ "$name" = test-ci ] && [ -n "${CANON_TEST_CI:-}" ]; then
+      skip_line "$name (running inside scripts/test-ci)"
+    else
+      job --notes "$name"                "$t"
+    fi
+  done
+fi
+
+# The Python checks share one environment: check the lock and create the environment before they start.
+head_line "Python workspace:"
+py_ok=0
+if now "uv.lock matches the manifests"   tool uv lock --check; then
+  if now "Python environment (uv run --locked)"  tool uv run --locked python -c pass; then py_ok=1
+  else why="the Python environment could not be created"; fi
+else
+  why="uv.lock does not match the manifests"
+  skip_line "Python environment ($why)"
+fi
+if [ "$py_ok" -eq 0 ]; then
+  for label in "ruff lint" "ruff format" "ty type check" "pytest"; do skip_line "$label ($why)"; done
+fi
+if [ "$py_ok" -eq 1 ]; then
+  job "ruff lint"                        tool uv run --locked ruff check .
+  job "ruff format"                      tool uv run --locked ruff format --check .
+  job "ty type check"                    tool uv run --locked ty check
+  job --skips "pytest"                   tool uv run --locked pytest -q -rfEs --no-fold-skipped
+fi
+
+head_line "Supply chain:"
+WORKFLOWS=()
+for f in .github/workflows/*.yml .github/workflows/*.yaml; do [ -f "$f" ] && WORKFLOWS+=("$f"); done
+if [ "${#WORKFLOWS[@]}" -gt 0 ]; then
+  job "actionlint (${#WORKFLOWS[@]} workflow files)"  tool actionlint "${WORKFLOWS[@]}"
+else
+  skip_line "actionlint (no workflow files in .github/workflows)"
 fi
 if [ "$STAGED" -eq 1 ]; then
-  run "gitleaks (staged changes)"        tool gitleaks git --pre-commit --staged --no-banner --redact
+  job --git-env "gitleaks (staged changes)"  tool gitleaks git --pre-commit --staged --no-banner --redact
 else
-  run "gitleaks (git history)"           tool gitleaks git --no-banner --redact
-  run "gitleaks (working tree)"          tool gitleaks dir . --no-banner --redact
+  job "gitleaks (git history)"           tool gitleaks git --no-banner --redact
+  job "gitleaks (working tree)"          tool gitleaks dir . --no-banner --redact
 fi
+
+wait
+
+# indent <file> [max lines]: print a file indented, reading it to the end
+indent() {
+  awk -v max="${2:-0}" '
+    max == 0 || NR <= max { print "        " $0 }
+    END { if (max > 0 && NR > max) printf "        ... %d more lines\n", NR - max }' "$1"
+}
+
+fail=0
+i=1
+while [ "$i" -le "$n" ]; do
+  case "${KIND[i]}" in
+    head) echo "${TEXT[i]}" ;;
+    skip) printf '  skip  %s\n' "${TEXT[i]}" ;;
+    job)
+      rc=1; [ -s "$WORK/$i.rc" ] && rc=$(cat "$WORK/$i.rc")
+      if [ "$rc" = 0 ]; then
+        printf '  ok    %s\n' "${TEXT[i]}"
+        if [ -n "${NOTE[i]}" ]; then
+          grep -E "${NOTE[i]}" "$WORK/$i.out" >"$WORK/$i.skips"
+          indent "$WORK/$i.skips"
+        fi
+      else
+        printf '  FAIL  %s\n' "${TEXT[i]}"
+        [ -s "$WORK/$i.rc" ] || echo "        the check stopped without recording an exit status"
+        [ -f "$WORK/$i.out" ] && indent "$WORK/$i.out" 40
+        fail=1
+      fi ;;
+  esac
+  i=$((i+1))
+done
 
 if [ "$fail" -eq 0 ]; then echo "ci: all checks passed"; else echo "ci: FAILED"; exit 1; fi
