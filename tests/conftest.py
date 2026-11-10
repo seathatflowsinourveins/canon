@@ -13,6 +13,10 @@ invented. The default series is 40 daily bars on consecutive weekdays from Monda
 opening at midnight New York time; closes climb 101 to 115, fall to 100, then climb to 110, one dollar a
 bar, and each bar opens at the previous close.
 
+`write` records the range the bars cover the way a load by `canon_trading.bars_to_catalog` does, as
+the window it asked for (`write_bars(start, end)`): from the UTC midnight of the first bar's open to
+the UTC midnight after the last bar's `ts_init`, 2025-03-10 to 2025-05-04 for the default series.
+
 `equations_one_and_two` works the DSR without skfolio, under the conventions ADR 0031 read in skfolio's
 source: the sample standard deviation in both Sharpe ratios, population skewness, raw kurtosis and
 sqrt(T - 1).
@@ -116,8 +120,13 @@ class AlpacaBars:
         previous: float = 100.0,
         instrument: bool = True,
         bars: bool = True,
+        covered_from: int | None = None,
     ) -> list[Bar]:
-        """Write each symbol's instrument and bars to the catalog at `path`; return the first's bars."""
+        """Write each symbol's instrument and bars to the catalog at `path`; return the first's bars.
+
+        The range recorded as covered starts at `covered_from` if given (module docstring).
+        """
+        day = 86_400 * 1_000_000_000
         path.mkdir(exist_ok=True)  # the catalog does not create its own directory
         catalog = ParquetDataCatalog(str(path))
         written = []
@@ -127,7 +136,11 @@ class AlpacaBars:
             if instrument:
                 catalog.write_instruments([listed])
             if bars:
-                catalog.write_bars(series)
+                start = (series[0].ts_init - day) // day * day
+                end = series[-1].ts_init // day * day + day
+                catalog.write_bars(
+                    series, start=start if covered_from is None else covered_from, end=end
+                )
             written.append(series)
         return written[0]
 

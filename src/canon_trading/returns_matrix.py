@@ -14,9 +14,11 @@ consecutive UTC midnights; anything else is that fallback or a gap, and is rejec
 
 A closed day is a UTC day on which no bar of the trial's run became available (its `session_days`, ADR
 0035 term 3). Nothing can fill or reprice on such a day, so its return must be 0, and one that is not
-is refused rather than dropped. A return that is not finite is refused too: ADR 0031 requires every
-return of the pick to be finite, and skfolio's `Portfolio` does not raise on one, it turns a NaN into
-0.0 (observed at 1.12.8), so `returns_matrix` refuses one in any series it is given as well.
+is refused rather than dropped. A session day with no return in the series is refused as well, never
+dropped: the series has a key for every UTC day from the first to the last, and a session day it lacks
+is a day of the run the series does not describe. A return that is not finite is refused too: ADR 0031
+requires every return of the pick to be finite, and skfolio's `Portfolio` does not raise on one, it
+turns a NaN into 0.0 (observed at 1.12.8), so `returns_matrix` refuses one in any series it is given as well.
 
 Which upstream call does what:
 
@@ -99,6 +101,13 @@ def daily_series(name: str, returns: object, session_days: object) -> pd.Series:
         raise ReturnsRejected(
             f"{name}: return {returns[str(day)]} on {pd.to_datetime(day, unit='ns', utc=True).date()}, "
             "a day with no bar of the run",
+        )
+    unreturned = sorted(open_days.difference(keys))
+    if unreturned:
+        raise ReturnsRejected(
+            f"{name}: no return on {len(unreturned)} of its {len(open_days)} session days, the "
+            f"first {pd.to_datetime(unreturned[0], unit='ns', utc=True).date()}; the daily "
+            "portfolio series has a return for every day of the run",
         )
     kept = [key for key in keys if key in open_days]
     if not kept:

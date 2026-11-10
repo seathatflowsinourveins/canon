@@ -43,7 +43,8 @@ trial store that meets every driver. Leaving it is cheap, since every trial read
    outside a git checkout a path must be given. Opening never creates a file or study; creating one is
    its own call, with its sample (ADR 0041), under an exclusive `fcntl.flock` on `trials.db.lock`:
    two processes creating one new file raced in `create_all` and crashed in 14 of 15 rounds (measured
-   here). The lock guards first creation only. Recording stays on `RDBStorage`, not the
+   here). The lock guards first creation only. The name and the sample are two writes; a creation
+   interrupted between them is completed by the next creation of that name (ADR 0041 term 1). Recording stays on `RDBStorage`, not the
    `JournalFileBackend` the FAQ gives for parallel optimisation: sessions record trials now and then,
    not in a parallel search, and SQLite serialises those writes (3,100 recordings from 10 processes
    did not fail in the full review). The folder is ignored like `catalog/`. A ranking reads one
@@ -103,6 +104,9 @@ Who decided. The orchestrator chose option 3 and the terms under the owner's del
 * Tests record a trial that traded, one that failed and one that never traded, and one configuration
   twice, then read N back through a new `Study` object; runs differing in one input get different keys.
 * A ranking report names the study.
+* A creation interrupted before its sample is completed by the next creation of its name, and a keyed
+  failure with no sample number stops the ranking until a later record of its key resolves it
+  (`tests/test_ledger.py`).
 
 ## Evidence
 
@@ -164,3 +168,7 @@ Read 2026-11-10. Fetched means read in this session as raw text or source; run m
   worktree (run). Opening an empty file raised `StorageInternalError` and left it unchanged (run).
 * Code review, 2026-11-10 (`/code-review`): term 2 missed a traded run with no finite Sharpe ratio, and
   the value told used calendar days. Both corrected, with no change of decision.
+* A second review of the gate, 2026-11-10, read only: a creation interrupted between the name and the
+  sample could be neither opened nor created again, and a keyed failure written before its sample
+  number was left out of the ranking. Term 1 corrected here; the rest, and the sources, in ADR 0041's
+  Evidence. No change of decision.

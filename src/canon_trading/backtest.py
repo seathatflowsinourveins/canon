@@ -17,8 +17,29 @@ v2.0.0rc8. Read 2026-11-10:
   API takes starting balances as strings; every venue needs an explicit fee model).
 * The installed package's own docstrings, where the pages above are silent: `BacktestNode.add_strategy`
   ("Adds a constructed Python strategy to the engine for the given run config"), `BacktestNode.run`
-  (with `raise_exception` off, a failed run is logged and its result left out) and
-  `ParquetDataCatalog.get_intervals`.
+  (with `raise_exception` off, a failed run is logged and its result left out),
+  `ParquetDataCatalog.get_intervals` and `ParquetDataCatalog.get_missing_intervals_for_request`, and
+  `CacheConfig(bar_capacity)` with `Cache.bars` (the bars the engine's cache keeps, newest first).
+
+A run bounded by `start` and `end` must have its whole range covered by the catalog: any part the
+catalog's own `get_missing_intervals_for_request` reports missing is refused, named. Upstream's
+historical requests likewise read the intervals a catalog holds and fetch only the missing ones
+(concepts/data/catalog.md, "Reading data"), and `canon_trading.bars_to_catalog` checks a load with it.
+A catalog covers what it recorded: the window a load requested (`canon_trading.bars_to_catalog`), or,
+for bars written without one, their first to last `ts_init`. A hole that no load can fill, such as a
+window with no bar at all, which the catalog never records, is closed by upstream's
+`ParquetDataCatalog.consolidate_data`, which merges the files around it into one interval (observed at
+v2.0.0rc8, 2026-11-10). It marks any hole covered, one never loaded too, so it is for a stretch a load
+showed to have no bar. One `ParquetDataCatalog` object asked again after its own write can answer from
+before it (observed), so each call here builds its own and writes nothing.
+
+The engine's cache keeps the bars a run replayed, up to `CacheConfig.bar_capacity` of each bar type
+(10,000 by default; a run of 40 bars kept 10 at a capacity of 10 and 40 at 100, observed at v2.0.0rc8).
+With `keep_bars`, the capacity is raised to the count of each bar type's bars in the range, read from
+the catalog after every other check, never below upstream's default, so `BacktestRun.bars` can hold
+every bar the run read. `BacktestResult.iterations` counts one per data item the engine processed
+(`iteration += 1` in `run_impl`, `crates/backtest/src/engine.rs` at the pinned commit), so on a run of
+bars only it is the number of bars replayed; `canon_trading.ledger` checks the cache against it.
 
 The instrument is not built here. The node reads it from the catalog, so a backtest sees whatever was
 stored, and what `canon_alpaca.providers.parse_equity` stores is the definition a paper run would load.
@@ -65,15 +86,18 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from typing import Any
 
+import pandas as pd
 from canon_alpaca.constants import VENUE
 from nautilus_trader.backtest import BacktestNode
 from nautilus_trader.config import BacktestDataConfig
 from nautilus_trader.config import BacktestEngineConfig
 from nautilus_trader.config import BacktestRunConfig
 from nautilus_trader.config import BacktestVenueConfig
+from nautilus_trader.config import CacheConfig
 from nautilus_trader.config import DataCatalogConfig
 from nautilus_trader.execution import MakerTakerFeeModel
 from nautilus_trader.model import AccountType
+from nautilus_trader.model import BarType
 from nautilus_trader.model import BookType
 from nautilus_trader.model import NautilusDataType
 from nautilus_trader.model import OmsType
@@ -84,6 +108,7 @@ if TYPE_CHECKING:
 
     from nautilus_trader.backtest import BacktestResult
     from nautilus_trader.config import LoggerConfig
+    from nautilus_trader.model import Bar
     from nautilus_trader.model import Position
 
     from .ma_cross import MaCross
@@ -95,7 +120,10 @@ class BacktestRun:
 
     `result` is the node's `BacktestResult`. `orders` is every order in the engine's cache, `positions`
     its positions in their final state, `position_snapshots` the earlier round trips of positions that
-    reopened, and `account` the simulated venue's account. Nothing here is computed by this repo.
+    reopened, and `account` the simulated venue's account. `bars` is what the cache keeps of each bar
+    type the run loaded (`Cache.bars`), in the order the cache gives them; every bar replayed, if the
+    run was built with `keep_bars` and the catalog did not grow in between. Nothing here is computed by
+    this repo.
     """
 
     result: BacktestResult
@@ -103,6 +131,7 @@ class BacktestRun:
     positions: list[Position]
     position_snapshots: list[Position]
     account: Any
+    bars: list[Bar]
 
 
 # The simulated venue's settings, as data: `simulated_alpaca_venue` builds the venue from them and
@@ -139,6 +168,7 @@ def backtest_run_config(
     run_config_id: str | None = None,
     start: int | None = None,
     end: int | None = None,
+    keep_bars: bool = False,
 ) -> BacktestRunConfig:
     """Check `strategies` against the catalog and build the run config `run_backtest` runs.
 
@@ -154,7 +184,11 @@ def backtest_run_config(
 
     `start` and `end`, UTC nanoseconds, bound the bars the node replays (`BacktestRunConfig.start` and
     `end`); with none, it replays every bar the catalog holds. `canon_trading.ledger` passes its study's
-    sample (ADR 0041). A catalog whose stored intervals of a bar type miss that range is refused too.
+    sample (ADR 0041). A catalog that does not cover the whole range for a bar type is refused too,
+    naming what is missing (this module's header); with one bound given, the other is the catalog's.
+
+    With `keep_bars`, the engine's cache is sized to keep every bar of the range (this module's
+    header); without it, the cache keeps upstream's default.
     """
     _require_strategies(strategies)
     bar_types: dict[str, str] = {}  # instrument ID to its one bar type, in the strategies' order
@@ -178,11 +212,31 @@ def backtest_run_config(
         intervals = catalog.get_intervals(NautilusDataType.Bar, bar_type)
         if not intervals:
             raise LookupError(f"The catalog at {path} holds no {bar_type} bars")
-        low, high = start if start is not None else -1, end if end is not None else 2**63
-        if not any(first <= high and last >= low for first, last in intervals):
+        if start is None and end is None:
+            continue
+        low = start if start is not None else min(first for first, _ in intervals)
+        high = end if end is not None else max(last for _, last in intervals)
+        if low > high:  # one bound given, past the catalog's other end
             raise LookupError(
-                f"The catalog at {path} holds no {bar_type} bars from {start} to {end}",
+                f"The catalog at {path} holds no {bar_type} bars from {start} to {end}"
             )
+        missing = catalog.get_missing_intervals_for_request(
+            low, high, NautilusDataType.Bar, bar_type
+        )
+        if missing:
+            parts = ", ".join(f"{_utc(first)} to {_utc(last)}" for first, last in sorted(missing))
+            raise LookupError(
+                f"The catalog at {path} holds {bar_type} bars but does not cover the sample: "
+                f"missing {parts}; load that range. Only if a load of it returned no bar, consolidating "
+                "the catalog's files around it (ParquetDataCatalog.consolidate_data) records it",
+            )
+    cache = None
+    if keep_bars:
+        counts = [
+            len(catalog.query(NautilusDataType.Bar, identifiers=[bar_type], start=start, end=end))
+            for bar_type in bar_types.values()
+        ]
+        cache = CacheConfig(bar_capacity=max([*counts, CacheConfig().bar_capacity]))
 
     return BacktestRunConfig(
         venues=[simulated_alpaca_venue(starting_balances)],
@@ -193,7 +247,7 @@ def backtest_run_config(
                 bar_types=list(bar_types.values()),
             ),
         ],
-        engine=BacktestEngineConfig(logging=logging),
+        engine=BacktestEngineConfig(logging=logging, cache=cache),
         id=run_config_id,
         start=start,
         end=end,
@@ -237,6 +291,10 @@ def run_backtest(
     return run_backtest_config(config, strategies)
 
 
+def _utc(ns: int) -> str:
+    return pd.Timestamp(ns, unit="ns", tz="UTC").isoformat()
+
+
 def _require_strategies(strategies: Sequence[MaCross]) -> None:
     if not strategies:
         raise ValueError("run_backtest needs at least one strategy")
@@ -263,6 +321,12 @@ def run_backtest_config(config: BacktestRunConfig, strategies: Sequence[MaCross]
             positions=cache.positions(),
             position_snapshots=cache.position_snapshots(),
             account=cache.account_for_venue(VENUE),
+            bars=[
+                bar
+                for data in config.data
+                for bar_type in data.bar_types or ()
+                for bar in cache.bars(BarType.from_str(str(bar_type))) or []
+            ],
         )
     finally:
         node.dispose()

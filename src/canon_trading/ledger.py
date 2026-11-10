@@ -7,6 +7,9 @@ decides, over the sample ADR 0041 fixes for each study. Optuna 5.0.0, read 2026-
   `optuna.create_study` without `load_if_exists` creates a study and raises `DuplicatedStudyError` for
   a name already taken; `optuna.load_study` opens one and raises `KeyError` for a name not there.
   `RDBStorage(..., skip_table_creation=True)` creates no tables in the file it opens.
+* `optuna/study/study.py`, `create_study`: the study and its direction are one write
+  (`storage.create_new_study`), and a user attribute is another; Optuna writes no study and its
+  attributes together. With `load_if_exists`, a name already taken returns the study that holds it.
 * `tutorial/20_recipes/009_ask_and_tell.py`, and `Study.ask` and `Study.tell` in
   `optuna/study/study.py`: a trial is asked for before the run and told its state after; `tell` takes
   a value for `COMPLETE` and none for `FAIL`. Under ask and tell nothing upstream marks a raised run
@@ -38,10 +41,19 @@ two processes crashed with "table studies already exists" (measured on this mach
 lock guards first creation only, not recording; Optuna's FAQ keeps `JournalFileBackend` for parallel
 optimisation, and ADR 0035 keeps `RDBStorage` on SQLite for the reasons it gives.
 
+A study is created in two writes, its name and then its sample, under the creation lock. A creation
+interrupted between them leaves a name with no sample and no trial. The next `create_ledger_study` of
+that name takes it through Optuna's `load_if_exists` and writes the sample, so nothing has to be
+edited by hand; a name that has a sample or a trial is a duplicate. Every creator holds the lock, so a
+study with neither, seen under it, is such a leftover and never one being created.
+
 A session day (ADR 0035 term 3) is a UTC day on which a bar of the run became available, its `ts_init`,
-a bar at exactly 00:00 UTC counting for the day ending there, as the daily series books it; read with
-`ParquetDataCatalog.query` (the installed `nautilus_trader/persistence/__init__.pyi`) from the catalog
-the run read, over the study's sample. `BacktestResult` has no such list.
+a bar at exactly 00:00 UTC counting for the day ending there, as the daily series books it.
+`BacktestResult` has no such list. The session days and the data digest are taken from the bars the
+run read: those the engine's cache kept (`BacktestRun.bars`, from `Cache.bars`, with the run built by
+`backtest_run_config(keep_bars=True)` so the cache can keep every one), not a later read of the
+catalog, which may have changed after the replay. A run whose cache holds another number of bars than
+it replayed (`BacktestResult.iterations`), or a bar outside the sample, is told `FAIL`.
 """
 
 from __future__ import annotations
@@ -65,8 +77,7 @@ import optuna
 import pandas as pd
 from canon_alpaca.constants import VENUE
 from nautilus_trader.model import Money
-from nautilus_trader.model import NautilusDataType
-from nautilus_trader.persistence import ParquetDataCatalog
+from optuna.study import StudyDirection
 from optuna.trial import TrialState
 
 from .backtest import FEE_RATES
@@ -173,11 +184,12 @@ def create_ledger_study(
 ) -> Generator[optuna.Study]:
     """Create the study `name` over the sample [start, end] and open it; create the file if need be.
 
-    ADR 0041. A study of that name already in the file raises Optuna's `DuplicatedStudyError`. `start`
-    and `end` are UTC nanoseconds, or a date or time that `pandas.Timestamp` reads, taken as UTC when it
-    has no offset. Both are instants and both are included: a date with no time is its midnight, so an
-    `end` of `"2025-06-16"` leaves out a bar of that day stamped after 00:00. With no `path`, the ledger
-    is `default_ledger_path()`.
+    ADR 0041. A study of that name already in the file raises Optuna's `DuplicatedStudyError`, unless
+    an interrupted creation left it with no sample and no trial: then it is completed (module header).
+    `start` and `end` are UTC nanoseconds, or a date or time that `pandas.Timestamp` reads, taken as UTC
+    when it has no offset. Both are instants and both are included: a date with no time is its
+    midnight, so an `end` of `"2025-06-16"` leaves out a bar of that day stamped after 00:00. With no
+    `path`, the ledger is `default_ledger_path()`.
     """
     sample = Sample(0, *_range(start, end))
     path = _ledger(path)
@@ -187,11 +199,26 @@ def create_ledger_study(
             fcntl.flock(lock, fcntl.LOCK_EX)
             try:
                 storage = opened.enter_context(_storage(path, "rwc"))
-                study = optuna.create_study(study_name=name, storage=storage, direction="maximize")
+                study = optuna.create_study(
+                    study_name=name, storage=storage, direction="maximize", load_if_exists=True
+                )
+                if not _left_by_an_interrupted_creation(study):
+                    raise optuna.exceptions.DuplicatedStudyError(
+                        f"the ledger at {path} already holds study {name!r}; open_study opens it",
+                    )
                 study.set_user_attr(SAMPLES, [_sample_attr(sample)])
             finally:
                 fcntl.flock(lock, fcntl.LOCK_UN)
         yield study
+
+
+def _left_by_an_interrupted_creation(study: optuna.Study) -> bool:
+    """Whether `study`, new or found, has no sample, no trial and the ledger's direction."""
+    return (
+        SAMPLES not in study.user_attrs
+        and not study.get_trials(deepcopy=False)
+        and study.directions == [StudyDirection.MAXIMIZE]
+    )
 
 
 @contextmanager
@@ -217,6 +244,11 @@ def open_study(name: str, path: Path | None = None) -> Generator[optuna.Study]:
             ) from None
         except optuna.exceptions.StorageInternalError as error:
             raise LedgerNotFound(f"the file at {path} is not an Optuna ledger") from error
+        if _left_by_an_interrupted_creation(study):
+            raise LedgerNotFound(
+                f"study {name!r} in the ledger at {path} has no sample: its creation was interrupted "
+                "before the sample was written, and create_ledger_study completes it",
+            )
         samples(study)
         yield study
 
@@ -378,18 +410,6 @@ def config_key(config: dict[str, Any]) -> str:
     return hashlib.sha256(canonical_json(config).encode("utf-8")).hexdigest()
 
 
-def bars_read(catalog_path: Path, bar_types: Sequence[str], start: int, end: int) -> list[Bar]:
-    """The bars of `bar_types` in the catalog with `ts_init` in [start, end], in a stable order.
-
-    The catalog is asked for that range only (`ParquetDataCatalog.query`, `start` and `end`, the bounds
-    the node is given); the bars it returns are checked against the range again by their `ts_init`.
-    """
-    catalog = ParquetDataCatalog(str(Path(catalog_path).resolve()))
-    bars = catalog.query(NautilusDataType.Bar, identifiers=list(bar_types), start=start, end=end)
-    kept = [bar for bar in bars if start <= bar.ts_init <= end]
-    return sorted(kept, key=lambda bar: (str(bar.bar_type), bar.ts_init, bar.ts_event))
-
-
 def session_day(ts: int) -> int:
     """The UTC day, its midnight in nanoseconds, that NautilusTrader's daily series books `ts` on.
 
@@ -452,9 +472,10 @@ def record_trial(
     nothing. What `backtest_run_config` refuses, or a value with no stable text form, raises before
     anything is recorded: such a call is not a trial. The trial is then asked for, so a run that never
     returns stays in the study as `RUNNING`. The run is bounded by the study's current sample and built
-    with the key as its `id`. A run that raises, or whose result cannot be recorded, is told `FAIL` with
-    outcome `failed` and its error, and the exception passes through. A run with no filled order is told
-    `FAIL` with outcome `idle`; any other `COMPLETE` with `traded`, or `FAIL`, still `traded`, if its
+    with the key as its `id`; its session days and data digest are those of the bars the run read, as
+    the engine's cache kept them (module header). A run that raises, or whose result cannot be
+    recorded, is told `FAIL` with outcome `failed` and its error, and the exception passes through. A
+    run with no filled order is told `FAIL` with outcome `idle`; any other `COMPLETE` with `traded`, or `FAIL`, still `traded`, if its
     Sharpe ratio is not finite. The outcome is written last, so a record that has one ran to the end.
     Every write after the trial is asked for, the outcome and the `tell` included, is inside the `try`
     that tells a failure, so an error or `KeyboardInterrupt` there is told `FAIL` with its error. Only
@@ -476,6 +497,7 @@ def record_trial(
         run_config_id=key,
         start=sample.start,
         end=sample.end,
+        keep_bars=True,
     )
     bar_types = [str(bar_type) for data in run_config.data for bar_type in data.bar_types or ()]
     if bar_types != config["data"]["bar_types"]:
@@ -490,7 +512,22 @@ def record_trial(
         run = run_backtest_config(run_config, built)
         result = run.result
         returns = {str(ns): value for ns, value in sorted(result.returns_series.items())}
-        bars = bars_read(catalog_path, bar_types, sample.start, sample.end)
+        # A total order: bars that tie on both times are taken in the order of their text (ADR 0041).
+        bars = sorted(
+            run.bars, key=lambda bar: (str(bar.bar_type), bar.ts_init, bar.ts_event, str(bar))
+        )
+        if len(bars) != result.iterations:
+            raise RuntimeError(
+                f"the engine's cache holds {len(bars)} bars and the run replayed "
+                f"{result.iterations}, so the data it read cannot be identified (ADR 0041); the "
+                "catalog may have grown between the count and the replay: record the trial again",
+            )
+        outside = [bar for bar in bars if not sample.start <= bar.ts_init <= sample.end]
+        if outside:
+            raise RuntimeError(
+                f"the run replayed {len(outside)} bars outside {sample.describe()}, the first "
+                f"at {_date(outside[0].ts_init)}",
+            )
         days = session_days(bars)
         trial.set_user_attr("run_config_id", result.run_config_id)
         trial.set_user_attr("backtest_start", result.backtest_start)

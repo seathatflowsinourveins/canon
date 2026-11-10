@@ -23,9 +23,10 @@ default tolerance (ADR 0031): copies of one configuration differ only in roundin
 pass undeflated. A return that is not finite is refused, for every trial, by
 `canon_trading.returns_matrix`.
 It also stops on what ADR 0035 terms 5 and 6 and ADR 0041 add: a configuration with a failed or
-`RUNNING` record that no later record of it resolves, an idle one, records of one configuration that
-disagree, one not run on the study's current sample, returns ADR 0010 step 2 rejects or a record not in
-the shape `record_trial` writes, records that read one bar type as different bars, trials that do not
+`RUNNING` record that no later record of it resolves (a record with a key and no sample number is
+read as on the current sample, unless it ran), an idle one, records of one configuration that
+disagree, one not run on the study's current sample, returns ADR 0010 step 2 rejects or a record not
+in the shape `record_trial` writes, records that read one bar type as different bars, trials that do not
 cover the same session days over the sample, and a record with no key not marked by `mark_not_run`.
 Every such stop is gathered before one is raised. Configurations tied at the highest Sharpe ratio with
 the same returns are one pick; tied with other returns, they leave no single pick and stop it. N-hat
@@ -52,6 +53,7 @@ from .ledger import Sample
 from .ledger import current_sample
 from .ledger import has_key
 from .ledger import ran_something
+from .ledger import samples
 from .returns_matrix import ReturnsRejected
 from .returns_matrix import daily_series
 from .returns_matrix import returns_matrix
@@ -139,6 +141,18 @@ def _ran(trial: FrozenTrial) -> bool:
     return trial.state.is_finished() and trial.user_attrs.get(OUTCOME) in (TRADED, IDLE)
 
 
+def _known_sample(trial: FrozenTrial, known: set[int]) -> bool:
+    """Whether `trial` holds the number of one of the study's samples (ADR 0041 term 5).
+
+    `rank` reads a record with a key and no such number as on the current sample if it did not run
+    to the end: it is what an error between the key's write and the sample's leaves, before any run,
+    and a later record of its key on the current sample resolves it; left out, its failure would not
+    count. One that ran to the end with no such number came from another writer, and stops.
+    """
+    number = trial.user_attrs.get("sample")
+    return not isinstance(number, bool) and isinstance(number, int) and number in known
+
+
 def _named(key: str, records: Sequence[FrozenTrial]) -> str:
     return f"{key} ({', '.join(f'#{t.number}' for t in records)})"
 
@@ -155,6 +169,7 @@ def rank(study: optuna.Study) -> RankingReport:
     if not trials:
         raise RankingStopped(f"study {study.study_name!r} has no trials")
     sample = current_sample(study)
+    known = {s.number for s in samples(study)}
     not_run = set(study.user_attrs.get(NOT_RUN, []))
     by_key: dict[str, list[FrozenTrial]] = defaultdict(list)
     stops: list[str] = []
@@ -179,7 +194,16 @@ def rank(study: optuna.Study) -> RankingReport:
     on_sample: dict[str, list[FrozenTrial]] = {}
     read: list[FrozenTrial] = []  # every record on the current sample that ran to the end
     for key, every in by_key.items():
-        records = [t for t in every if t.user_attrs.get("sample") == sample.number]
+        records = []
+        for trial in every:
+            if not _known_sample(trial, known) and _ran(trial):
+                stops.append(
+                    f"#{trial.number} ({trial.user_attrs[OUTCOME]}) ran with sample "
+                    f"{trial.user_attrs.get('sample')!r}, not a sample number of the study: not in "
+                    "the shape record_trial writes (ADR 0041)",
+                )
+            elif not _known_sample(trial, known) or trial.user_attrs["sample"] == sample.number:
+                records.append(trial)
         if not records:
             stops.append(
                 f"{key}: tried ({', '.join(map(_describe, every))}) but not run on the current "

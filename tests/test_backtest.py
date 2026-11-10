@@ -409,3 +409,20 @@ def test_config_keeps_the_base_fields_and_upstreams_default_periods() -> None:
 
     assert (made.fast_period, made.slow_period) == (10, 20)
     assert made.order_id_tag == "007"
+
+
+@pytest.mark.parametrize("bound", ["start", "end"])
+def test_one_bound_past_the_catalog_is_refused(
+    alpaca_bars: AlpacaBars, tmp_path: Path, bound: str
+) -> None:
+    """With the other bound taken from the catalog, the range is inverted, which upstream's check of
+    what is missing answers with nothing (observed), so it is refused before that check."""
+    bars = alpaca_bars.write(tmp_path)
+    day = 86_400 * 10**9  # past the recorded window, which runs to midnight beyond the bars
+    start = bars[-1].ts_init + 2 * day if bound == "start" else None
+    end = bars[0].ts_init - 2 * day if bound == "end" else None
+
+    with pytest.raises(LookupError, match="holds no AAPL.ALPACA-1-DAY-LAST-EXTERNAL bars from"):
+        backtest_run_config(
+            tmp_path, [MaCross(config())], starting_balances=["100000 USD"], start=start, end=end
+        )
