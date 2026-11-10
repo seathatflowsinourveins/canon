@@ -12,7 +12,7 @@ to the native composition of the bulk report hooks. Nothing is started in the co
 clients and the task that applies trade updates in order are made in `_connect`, and the stream thread is
 joined and the task ended in `_disconnect`. Hooks not overridden here raise `NotImplementedError`.
 
-Modify (ADR 0036) rests on Alpaca's "Replace Order by ID"
+Modify (ADR 0042) rests on Alpaca's "Replace Order by ID"
 (https://docs.alpaca.markets/us/reference/patchorderbyorderid-1.md) and on a paper observation of
 2026-11-10, 3 of 3 runs, for what that page does not state. The PATCH answer is "The new Order object with
 the new order ID", but a success "does NOT guarantee the existing open order has been replaced", so
@@ -1088,7 +1088,7 @@ class AlpacaExecutionClient(ExecutionClient):
         Alpaca answers with "The new Order object with the new order ID" and says a success "does NOT
         guarantee the existing open order has been replaced". So `OrderUpdated` is not generated from the
         answer: it comes with Alpaca's `replaced` trade update for the node's order, which carries the old
-        order with `replaced_by` (observed on paper, ADR 0036). The answer is kept for that update's values,
+        order with `replaced_by` (observed on paper, ADR 0042). The answer is kept for that update's values,
         and the replacement's Alpaca client order ID is mapped to the node's order. Alpaca refuses a
         replacement that keeps the original client order ID (observed), so none is sent.
         """

@@ -11,6 +11,8 @@ The first places a DAY limit buy of 1 AAPL at $1.00 and cancels it once Alpaca h
 run rows of upstream's Execution Testing Spec through upstream's `ExecTester` (ADR 0036): TC-E41, a limit
 buy $50 below the bid and a stop buy $50 above the ask, canceled by `CancelAllOrders` on stop; TC-E20 and
 TC-E22, a stop and a stop-limit buy $50 above the ask, accepted at the prices sent and canceled on stop.
+Modify (ADR 0042): TC-E30 through the tester, whose one-tick amend the client denies as sub-penny, and a
+$1.00 buy modified to $1.01 through a node, then canceled.
 Two test extended hours (ADR 0038): a $1.00 buy marked eligible, accepted and canceled in any open session;
 and, in pre-market or after-hours only, a buy of 1 AAPL priced through the latest IEX ask (read from
 Alpaca's market data API), filled and sold back through the bid: that one trades a real paper share.
@@ -282,7 +284,7 @@ def paper_node() -> LiveNode:
 
 
 def test_paper_limit_order_is_modified_through_a_node() -> None:
-    """One modify through a real node (ADR 0036): `OrderUpdated` arrives with Alpaca's `replaced`, under the
+    """One modify through a real node (ADR 0042): `OrderUpdated` arrives with Alpaca's `replaced`, under the
     replacement's order ID and the new price, and the cancel after it reaches the replacement."""
     with aapl_left_as_found() as cleaned:
         node = paper_node()

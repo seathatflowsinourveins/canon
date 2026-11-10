@@ -10,8 +10,9 @@ review-by: 2026-12-10
 ## Context and Problem Statement
 
 `AlpacaExecutionClient` (ADR 0030) submitted and canceled market and limit orders on paper, and did not
-cancel all, take stops, modify, or answer an account query. The adapter guide names the hooks, not what each
-must do where Alpaca's endpoint differs from the command. What does each do here, and from which source?
+cancel all, take stops or answer an account query (modify is ADR 0042). The adapter guide names the hooks,
+not what each must do where Alpaca's endpoint differs from the command. What does each do here, and from
+which source?
 
 ## Decision Drivers
 
@@ -23,10 +24,8 @@ must do where Alpaca's endpoint differs from the command. What does each do here
 
 Cancel-all: (1) Alpaca's "Delete All Orders"; (2) the node's open and in-flight orders for the command's
 instrument and side, each canceled by ID; (3) Alpaca's open orders for the symbol, from "Get All Orders",
-each canceled by ID. Stop orders: send what Alpaca's order page lists, deny the rest before Alpaca. Modify:
-(a) `OrderUpdated` from the PATCH answer, as Binance spot's HTTP fallback does; (b) `OrderUpdated` on
-Alpaca's `replaced`, with the replacement's values, as Binance spot's WebSocket path waits for the venue's
-stream; (c) not implemented, with a paper test to settle what the pages leave open.
+each canceled by ID. Stop orders: send what Alpaca's order page lists, deny the rest before Alpaca. Modify
+is ADR 0042, split from this record on 2026-11-10.
 
 ## Decision Outcome
 
@@ -59,29 +58,9 @@ carry the stop price as trigger price, and the node's trigger type, else `DEFAUL
 a report without them makes the reconciler clear the local prices). Trailing stops stay denied: their stop
 price moves with Alpaca's high-water mark and no update reports it.
 
-### Modify: option (b)
-
-Alpaca's "Replace Order by ID" answers "The new Order object with the new order ID", says a success "does
-NOT guarantee the existing open order has been replaced", and gives the replacement's client order ID as "A
-unique identifier for the new order. Automatically generated if not sent." It leaves unstated which order
-`replaced` carries, whether the original ID may be kept, and any error status. A paper observation on
-2026-11-10, 3 of 3 runs, settled those: a kept ID is refused, 422 "client_order_id must be unique"; the
-answer has a new ID, an Alpaca-made client order ID and `replaces`; `replaced` carries the old order with
-`replaced_by`; a second replace of the old order is refused, 422 "order already replaced"; no replacement
-sent `new`. On that, the master orchestrator chose (b) under the owner's delegation of 2026-11-10.
-`_modify_order` sends no client order ID; `OrderUpdated` comes only with `replaced`, its values from the
-replacement as the answer or a read of `replaced_by` gives it, nothing if neither does. Updates and reports
-of a replacement are traced to the node's order through `replaces`, at most 16 links, from the orders
-already fetched first, cached, misses too, and walked again after a restart. A 422 is `OrderModifyRejected`
-unless Alpaca shows the order replaced as asked (alpaca-py's own retry); any other status leaves the outcome
-unknown. `order_replace_rejected` and the `rejected` of a replacement that has not taken over are
-`OrderModifyRejected` too. Denied before Alpaca: no venue order ID, a fractional quantity, a sub-penny
-price, a price the order type lacks.
-
 ### Consequences
 
-* Good: cancel-all cancels exactly what the command names; stops reach Alpaca only in forms its page lists;
-  `OrderUpdated` waits for Alpaca's own confirmation.
+* Good: cancel-all cancels exactly what the command names; stops reach Alpaca only in forms its page lists.
 * Bad: one HTTP call per cancel, one at a time; an order Alpaca holds that the node does not yet, or one
   placed after the cache was read, is not canceled. No `OrderTriggered`: an election shows only as a fill.
 
@@ -93,22 +72,15 @@ ask, canceled by `CancelAllOrders` on stop; its sell is left out, since from a f
 it, 403 "cannot open a short sell while a long buy order is open" (observed). The card's
 `OrderPendingCancel` does not come: the pinned `Strategy` sends the command without one and the binding
 cannot generate it, as Binance spot emits `OrderCanceled` alone. TC-E20 and TC-E22: stop and stop-limit buys
-accepted at the prices sent, as Alpaca holds them, and reported back the same. TC-E30: the tester amends
-"one tick more passive", 0.0001 here, so the client denies it as sub-penny, `OrderModifyRejected`: the row's
-pass criterion, `OrderUpdated`, fails by design, as the card's "different valid price" is not valid at
-Alpaca. TC-E40 is the existing cancel test. Modify through a node, 6 of 6 runs: $1.00 to $1.01,
-`OrderUpdated` under the replacement's ID and price, the cancel reaching the replacement;
-`test_paper_replace.py` asserts the four observed answers. Not run: sells (TC-E21, E23, E31, E33: a short
-sale from flat), TC-E32, E35 and E42 to E44 (no new hook), TC-E34 (offline only); not applicable: TC-E24 to
-E27 and E36. Each test places nothing while the account holds an AAPL order or position, and leaves it as
-found. This is upstream's practice: the spec's rows through its tester, and offline stand-ins as alpaca-py's
-own tests mock its paper endpoints; the offline tests are listed in the package README.
+accepted at the prices sent, as Alpaca holds them, and reported back the same. TC-E40 is the existing cancel
+test. Not run: sells (TC-E21, E23: a short sale from flat), TC-E42 to E44 (no new hook); not applicable:
+TC-E24 to E27. The modify rows are ADR 0042's. Each test places nothing while the account holds an AAPL
+order or position, and leaves it as found. This is upstream's practice: the spec's rows through its tester,
+and offline stand-ins as alpaca-py's own tests mock its paper endpoints; the offline tests are listed in the
+package README.
 
 `UNVERIFIED`, shown by no run: an elected stop and its fill, and what the stream sends on election; any sell
-stop; `order_replace_rejected`; `pending_replace`; a `new` for a replacement later than ~200 ms; a status on
-a replace other than 422; a modify of a partially filled order (what `qty` means then); a fill on the old
-order racing a replace, where the old order's fill applies as usual and the replacement's `rejected` becomes
-`OrderModifyRejected`, not `OrderRejected`.
+stop.
 
 ## Evidence
 
@@ -120,44 +92,30 @@ Read 2026-11-10; "raw": fetched with `curl` and read, not summarised. NautilusTr
   `docs/concepts/execution/policies.md`: the failure events, "parse failures after transmission"; `latest`
   adds `OrderCancelDenied` and `OrderModifyDenied` (fetched, raw; diffed). `docs/concepts/orders/index.md`
   and `stop_market.md`: the trigger types (fetched, raw).
-  https://nautilustrader.io/docs/md/latest/developer_guide/spec_exec_testing.md: groups 3 to 5, the TC-E30
-  and TC-E41 cards, `ExecTester`'s setup (fetched, raw).
+  https://nautilustrader.io/docs/md/latest/developer_guide/spec_exec_testing.md: groups 3 and 5, the
+  TC-E41 card, `ExecTester`'s setup (fetched, raw).
 * `crates/adapters/` at the pin: cancel-all and batch cancel in `kraken/src/execution/spot.rs`,
   `binance/src/spot/execution.rs`, `bybit/src/execution.rs`, `interactive_brokers/src/execution/core.rs`,
   `coinbase/src/execution.rs`, `betfair/src/execution.rs`, `okx/src/execution.rs` and
-  `okx/src/websocket/client.rs`; Kraken's trigger mapping; Coinbase's `OrderContext`; Binance's
-  `modify_order`, both paths (fetched, raw). `crates/trading/src/strategy/mod.rs`: `strategy_only`;
-  `crates/testkit/src/testers/exec/strategy.rs`: `on_stop` (fetched, raw).
+  `okx/src/websocket/client.rs`; Kraken's trigger mapping; Coinbase's `OrderContext` (fetched, raw).
+  `crates/trading/src/strategy/mod.rs`: `strategy_only`; `crates/testkit/src/testers/exec/strategy.rs`:
+  `on_stop` (fetched, raw).
 * https://docs.alpaca.markets/us/: `reference/deleteallorders-1.md` (account-wide, 207 per order),
-  `reference/deleteorderbyorderid-1.md` (422 or 204), `reference/patchorderbyorderid-1.md` (the body, the
-  answer, no error status), `docs/orders-at-alpaca.md` (stop rules and the time-in-force tables, read with
-  markup stripped), `docs/websocket-streaming.md` (the events; none for an election), `llms.txt` "Orders"
-  (no cancel-by-list) (fetched, raw).
+`reference/deleteorderbyorderid-1.md` (422 or 204), `reference/patchorderbyorderid-1.md` (`replaced_by`, for
+  a cancel that meets a replaced order), `docs/orders-at-alpaca.md` (stop rules and the
+  time-in-force tables, read with markup stripped), `docs/websocket-streaming.md` (the events; none for an
+  election), `llms.txt` "Orders" (no cancel-by-list) (fetched, raw).
 * https://github.com/alpacahq/alpaca-py `v0.45.0`, `tests/trading/trading_client/test_order_routes.py`: the
   paper base URL mocked for orders and replaces (fetched, raw).
-* Paper, 2026-11-10, logs kept outside the repo: the replace observation, 18:52 UTC, 3 runs through
-  alpaca-py with `raw_data=True`; TC-E41 as written, the sell refused 241 times; five failed runs, two on the
-  test's code, one on connect timeouts, two refusing to start on open orders on the account; then all passed.
-* Second reader after landing, 2026-11-10: an independent review of the modify change found three
-  defects, each reproduced through the stand-in venue and a real node, and fixed with a regression test
-  each: a filled replacement whose `replaced` was missed went unreported, so its fill was lost; a replace
-  refused on the HTTP answer and on the stream gave two `OrderModifyRejected`; a `replaced` delivered
-  twice gave two `OrderUpdated` (whether Alpaca repeats it is UNVERIFIED). Two more independent reviews the
-  same day added: a trace missed in the start-up window kept for the session; a fill on a replacement
-  before its `replaced` applied to the old terms (an overfill dropped); a late cancel of the replaced order
-  closing the replacement; `pending_replace` failing start-up; a replacement replaced again before its
-  `replaced` was read; a refused second modify taken for a retry; answers kept for the session; a chain
-  past the limit walked again each time. Each reproduced and is fixed with a test, following upstream's
-  Binance spot `dispatch.rs` (`record_order_update`, `record_order_update_from_fill`,
-  `defer_replace_cancel`). Not fixed, UNVERIFIED: whether a replacement's `filled_qty` counts the fills of
-  the order it replaced. A rejected replacement after a fill now leaves the fill as the outcome, since
-  NautilusTrader drops a modify rejection for a filled order (observed).
+* Paper, 2026-11-10, logs kept outside the repo: TC-E41 as written, the sell refused 241 times; five failed
+  runs, two on the test's code, one on connect timeouts, two refusing to start on open orders on the
+  account; then all passed.
 * NautilusTrader `RELEASES.md`: v2.0.0rc9, tagged 2026-11-10, adds `OrderCancelDenied` and
   `OrderModifyDenied` (read by the second reader); the pin stays rc8 until it moves through
   `adopt-upstream`.
-* Second reader (`evidence-verifier`), 2026-11-10, on cancel-all twice, stops once and modify once: the
-  decisions stand. Corrected above: "never wider than the command"; Binance spot and Bybit select from the
-  cache only for a sided command; the retry argument; the 422 exception; who skips `OrderPendingCancel`;
-  Kraken's trigger mapping; the run count; sources for the pending-cancel skip and no cancel-by-list; option
-  3 added; the documented client order ID; no source for a 403 on a replace; TC-E30's criterion; Binance's
-  two paths.
+* Second reader (`evidence-verifier`), 2026-11-10, on cancel-all twice and stops once: the decisions stand.
+  Corrected above: "never wider than the command"; Binance spot and Bybit select from the cache only for a
+  sided command; the retry argument; the 422 exception; who skips `OrderPendingCancel`; Kraken's trigger
+  mapping; the run count; sources for the pending-cancel skip and no cancel-by-list; option 3 added.
+* Modify, its option, outcome, paper rows, `UNVERIFIED` items and their evidence, moved to ADR 0042 on
+  2026-11-10 with no change of decision; the source lines that support both are kept in each.

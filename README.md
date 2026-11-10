@@ -195,7 +195,7 @@ here, community convergence, then anyone's recollection.
   stop and stop-limit orders, modify, cancels and cancel-all, extended hours for limit orders, fills from
   trade updates). Both pass their offline
   tests, and the two paper tests that existed then passed on 2026-11-10: daily bars through a real node,
-  and a limit order accepted and canceled (ADR 0030); the order-management paper tests are ADR 0036's.
+  and a limit order accepted and canceled (ADR 0030);the order-management paper tests are ADR 0036's and ADR 0042's.
   Another showed that Alpaca's fill activities carry the trade updates' `execution_id`s (ADR 0024).
   Upstream's data and execution testers then ran through the adapter on paper: quotes, trades, bars,
   market and limit orders, fills, cancels and a rejection passed (see the package README). The full asset

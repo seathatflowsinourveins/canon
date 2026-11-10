@@ -533,7 +533,7 @@ class FakeOrdersClient(FakeTradingClient):
         self._send("canceled", placed, status="canceled", canceled_at=datetime.now(UTC).isoformat())
 
     def replace_order_by_id(self, order_id: object, order_data: object = None) -> Order:
-        """Answer as the paper observation of 2026-11-10 saw (ADR 0036): the replacement, status `new`,
+        """Answer as the paper observation of 2026-11-10 saw (ADR 0042): the replacement, status `new`,
         with an Alpaca-made client order ID and `replaces`; then, by `replace_script`, the stream's
         `replaced` carrying the old order with `replaced_by` ("replaced"), `order_replace_rejected` for the
         old order ("reject"), or nothing ("silent", for `confirm_replace` to send later). A second replace
