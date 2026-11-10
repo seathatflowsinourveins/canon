@@ -69,6 +69,9 @@ channel. The rest of it stands.
 * Bad: the floor stops a move below the pin only. Above it, the stable channel can still move the CLI
   down from a newer build, and the records were read at the pin, not at what stable serves later.
 * Bad: Fable is the costlier lane (ADR 0005), and it is now what an unnamed session runs on.
+* Bad: while the stable channel serves a version below the floor, each background update is refused and
+  the session footer shows `Auto-update failed · Run claude doctor` in red. Nothing is wrong and nothing
+  is to be done: the line goes when stable reaches the pin.
 * The desktop app bundles its own Claude Code and is outside this decision.
 
 ### Confirmation
@@ -79,7 +82,10 @@ On the owner's machine, 2026-11-10. With 2.1.311, `--model claude-fable-5-2` log
 with no warning, and with `model` set to `fable` a session started with no model named gave the same. A
 model's answer about its own id is weak evidence; the CLI's warning and the docs' version table are the
 firmer part. A session already running kept its 2.1.311 binary. `scripts/bootstrap --check` prints `ok
-2.1.321; pinned 2.1.321`. `scripts/test-lanes` has 62 cases and `scripts/test-canon` 157. UNVERIFIED: the
+2.1.321; pinned 2.1.321`. `scripts/test-lanes` has 62 cases and `scripts/test-canon` 157. Later that day the footer showed the red line above; `claude doctor` gave `Last update
+attempt: failed (install_failed)`, and `claude update` printed "The stable channel is at 2.1.311, which is
+below your minimumVersion setting (2.1.321). Staying on 2.1.321." and changed nothing. That the background
+attempt failed for the same reason is inferred from the two. UNVERIFIED: the
 installer script with a version argument (the tests stub it, and the machine used `claude install`), the
 updater's behaviour on this machine over time, and `--install` on a fresh machine.
 
@@ -102,6 +108,11 @@ quoted sentences verbatim.
   5.2" (fetched; second reader).
 * https://code.claude.com/docs/en/changelog — 2.1.321, November 9, 2026: "Added Claude Fable 5.2
   (`claude-fable-5-2`), now the default Fable model" (fetched; second reader).
+* https://code.claude.com/docs/en/troubleshoot-install.md — the red footer line "means Claude Code tried
+  to update itself in the background and the update didn't install. You can keep working without doing
+  anything"; `claude doctor` "gives a date but no cause", `claude update` shows it (fetched, not
+  summarised). `claude doctor` and `claude update` at 2.1.321, and the release server's `stable` and
+  `latest` files, 2.1.311 and 2.1.322 (run and fetched, 2026-11-10).
 * `claude install --help`, at 2.1.311 and at 2.1.321 — "Use [target] to specify version (stable, latest,
   or specific version)" (bundled).
 * `canon/upstreams.json` — `claude-code` at `tag:v2.1.321`; `canon/models.json` — the orchestrator lane,
