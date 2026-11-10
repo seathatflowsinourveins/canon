@@ -222,7 +222,7 @@ check "model change with a directory records it"      jqt "$TMP/sl.jsonl" 'selec
 # ---------- lane watchdog ----------
 echo "lane watchdog:"
 WD="$TMP/wd"; mkdir -p "$WD/canon"
-printf '#!/bin/bash\ncat "%s/report.json"\nexit "$(cat "%s/lanes-rc")"\n' "$STUB" "$STUB" > "$WD/canon/lanes"
+printf '#!/bin/bash\n/usr/bin/printenv PATH > "%s/lanes-path"\ncat "%s/report.json"\nexit "$(cat "%s/lanes-rc")"\n' "$STUB" "$STUB" "$STUB" > "$WD/canon/lanes"
 chmod +x "$WD/canon/lanes"
 report() { # report <sid> <flags json> [state]: one-session lanes report
   jq -n --arg sid "$1" --argjson flags "$2" --arg state "${3:-working}" \
@@ -249,6 +249,10 @@ check "empty ledger, hook registered but missing: not ok" jqt "$st" '.ok == fals
 printf '#!/bin/bash\nexit 0\n' > "$WD/canon/ledger.sh"; chmod +x "$WD/canon/ledger.sh"
 watch
 check "empty ledger, hook installed and registered: ok" jqt "$st" '.ok == true'
+rm -f "$STUB/lanes-path" "$st"   # the run before wrote both; only this one may
+env -i HOME="$TMP/elsewhere" CLAUDE_CONFIG_DIR="$WD" CANON_WATCH_NO_NOTIFY=1 /bin/bash "$ROOT/home/.claude/canon/lanes-watch.sh"   # stderr kept: empty unless it fails
+check "with an empty environment the lanes report gets the watchdog's PATH, exported" \
+      eval 'jqt "$st" ".ok == true" && [ "$(cat "$STUB/lanes-path" 2>/dev/null)" = /usr/bin:/bin:/usr/sbin:/sbin ]'
 
 # ---------- automation ----------
 echo "automation:"
