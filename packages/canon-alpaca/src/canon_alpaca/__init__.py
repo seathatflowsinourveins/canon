@@ -10,5 +10,5 @@ template at the pinned NautilusTrader commit:
   Alpaca's paper Trading API only
 * `factories` - `AlpacaDataClientFactory`, `AlpacaExecutionClientFactory`
 
-See this package's README.md and docs/adr/0009-trading-foundation.md.
+See this package's README.md, docs/adr/0009-trading-foundation.md and docs/adr/0030-alpaca-adapter.md.
 """

@@ -9,10 +9,10 @@ review-by: 2027-02-08
 
 ## Context and Problem Statement
 
-The adapter reads a paper key pair from `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` (ADR 0009), and the two paper
-tests are skipped until both are set. Nothing in the repository said how the pair gets into a process's
-environment. The owner asked (2026-11-10) for an interactive key store for the paper account, entered once.
-How `paper:store` asks for the pair and checks that it is paper is ADR 0033.
+The adapter reads a paper key pair from `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` (ADR 0030), and the two
+paper tests are skipped until both are set. Nothing in the repository said how the pair gets into a
+process's environment. The owner asked (2026-11-10) for an interactive key store for the paper account,
+entered once. How `paper:store` asks for the pair and checks that it is paper is ADR 0033.
 
 ## Decision Drivers
 
