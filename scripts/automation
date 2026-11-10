@@ -5,6 +5,8 @@
 #   commit gate            on every `git commit`             .githooks/pre-commit via core.hooksPath (githooks(5))
 #   landscape watch        once a day, at session start      .claude/hooks/canon-watch.sh, async SessionStart hook
 #   lane watchdog          every 10 minutes, Mac awake       launchd user agent (launchd.plist(5), launchctl(1))
+#   paper session          every 35 minutes, Mac awake       launchd user agent running one window, if Alpaca's
+#                                                            clock says a session is open (ADR 0047)
 #   weekly refresh         weekly, desktop app open          Claude desktop scheduled task (created from a session)
 #
 # Usage: scripts/automation status | install | uninstall
@@ -15,7 +17,7 @@
 # `status` exits non-zero when any row is not ok, including rows it could not check (UNKNOWN).
 #
 # Overrides: CLAUDE_CONFIG_DIR replaces ~/.claude; CANON_LAUNCHAGENTS_DIR replaces ~/Library/LaunchAgents
-# (tests only); AUTOMATION_SKIP_LAUNCHD=1 is a rehearsal of `install` that does every step except the
+# and CANON_PAPER_SESSION_DIR the session windows' record folder (tests only); AUTOMATION_SKIP_LAUNCHD=1 is a rehearsal of `install` that does every step except the
 # launchctl calls. mise is the one on PATH, else ~/.local/bin/mise; its absolute path goes into the git
 # credential helper.
 set -uo pipefail
@@ -29,6 +31,15 @@ PLIST="$AGENTS_DIR/$LABEL.plist"
 DOMAIN="gui/$(id -u)"
 INTERVAL=600
 TASK_ID="canon-landscape-refresh"
+PAPER_LABEL="local.canon.paper-session"
+PAPER_PLIST="$AGENTS_DIR/$PAPER_LABEL.plist"
+PAPER_INTERVAL=2100                                   # every 35 minutes...
+PAPER_MINUTES=25                                      # ...a 25-minute window: with start-up, stop and the
+                                                      # account check it ends before the next firing less
+                                                      # the 300 s gap (session_window.GAP_SECS)
+PAPER_STALE=4200                                      # a record `running` after 70 minutes, if it gives none
+PAPER_SILENT=$((2 * PAPER_INTERVAL))                  # no firing for two intervals: the schedule has stopped
+PAPER_DIR="${CANON_PAPER_SESSION_DIR:-$(/usr/bin/getconf DARWIN_USER_TEMP_DIR 2>/dev/null)canon-paper-session}"
 STALE_DAYS=2
 
 note() { printf '%s\n' "$*"; }
@@ -92,6 +103,50 @@ write_plist() {
 EOF
 }
 
+# The session window agent runs `mise run paper:session --session auto` in this checkout: the task reads the
+# paper pair from the login keychain, takes the paper lock and runs one window, or prints "nothing to run"
+# when Alpaca's clock says no session is open (weekends and holidays included). Not run at load.
+write_paper_plist() {
+  local m; m=$(xml "$1")
+  # The agent runs in the repository's main checkout, not in the worktree install ran from, which a landed
+  # branch removes; that checkout must be on an up-to-date main.
+  local main_root
+  main_root=$(git -C "$ROOT" worktree list --porcelain 2>/dev/null | awk 'NR == 1 && $1 == "worktree" { print substr($0, 10) }')
+  [ -n "$main_root" ] || main_root="$ROOT"
+  cat > "$PAPER_PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$PAPER_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$m</string>
+    <string>run</string>
+    <string>paper:session</string>
+    <string>--session</string>
+    <string>auto</string>
+    <string>--minutes</string>
+    <string>$PAPER_MINUTES</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>$(xml "$main_root")</string>
+  <key>StartInterval</key>
+  <integer>$PAPER_INTERVAL</integer>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>$(xml "$CANON_HOME")/watch/paper-session.log</string>
+  <key>StandardErrorPath</key>
+  <string>$(xml "$CANON_HOME")/watch/paper-session.log</string>
+</dict>
+</plist>
+EOF
+}
+
 do_install() {
   local ok=0
   note "Commit gate:"
@@ -122,6 +177,25 @@ do_install() {
       note "  FAILED: launchctl bootstrap refused the agent"; ok=1
     fi
   fi
+  note "Paper session:"
+  local paper_mise
+  if ! paper_mise=$(find_mise 2>&1); then
+    note "  FAILED: $paper_mise"; ok=1
+  elif ! write_paper_plist "$paper_mise" || ! plutil -lint "$PAPER_PLIST" >/dev/null; then
+    note "  FAILED: could not write a valid $PAPER_PLIST"; ok=1
+  else
+    note "  wrote      $PAPER_PLIST"
+    if [ "${AUTOMATION_SKIP_LAUNCHD:-0}" = "1" ]; then
+      note "  not loaded (AUTOMATION_SKIP_LAUNCHD=1)"
+    else
+      launchctl bootout "$DOMAIN/$PAPER_LABEL" >/dev/null 2>&1
+      if launchctl bootstrap "$DOMAIN" "$PAPER_PLIST"; then
+        note "  loaded     $PAPER_LABEL (every $((PAPER_INTERVAL / 60)) minutes; a window only when a session is open)"
+      else
+        note "  FAILED: launchctl bootstrap refused the agent"; ok=1
+      fi
+    fi
+  fi
   note "Landing:"
   local mise_bin
   if ! git -C "$ROOT" remote get-url origin >/dev/null 2>&1; then
@@ -147,7 +221,10 @@ do_uninstall() {
   if launchctl bootout "$DOMAIN/$LABEL" >/dev/null 2>&1; then note "  unloaded   $LABEL"; else note "  $LABEL was not loaded"; fi
   if launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then note "  FAILED: $LABEL is still loaded"; left="$left
   launchd job $LABEL"; fi
-  for f in "$PLIST" "$CANON_HOME/lanes" "$CANON_HOME/lanes-watch.sh"; do
+  if launchctl bootout "$DOMAIN/$PAPER_LABEL" >/dev/null 2>&1; then note "  unloaded   $PAPER_LABEL"; else note "  $PAPER_LABEL was not loaded"; fi
+  if launchctl print "$DOMAIN/$PAPER_LABEL" >/dev/null 2>&1; then note "  FAILED: $PAPER_LABEL is still loaded"; left="$left
+  launchd job $PAPER_LABEL"; fi
+  for f in "$PLIST" "$PAPER_PLIST" "$CANON_HOME/lanes" "$CANON_HOME/lanes-watch.sh"; do
     [ -e "$f" ] || continue
     if rm -f "$f" && [ ! -e "$f" ]; then note "  removed    $f"
     else note "  FAILED: could not remove $f"; left="$left
@@ -164,7 +241,8 @@ do_uninstall() {
     else note "  FAILED: could not unset the git sign-in helper"; left="$left
   credential.https://github.com.helper in $ROOT"; fi
   fi
-  note "Left in place: $CANON_HOME/ledger, $CANON_HOME/watch (alert history) and the weekly scheduled task."
+  note "Left in place: $CANON_HOME/ledger, $CANON_HOME/watch (alert history), the session windows' records"
+  note "in $PAPER_DIR and the weekly scheduled task."
   note "Remove the weekly task from the desktop app's Scheduled list."
   if [ -n "$left" ]; then note "uninstall: not removed:$left"; return 1; fi
 }
@@ -227,6 +305,45 @@ do_status() {
     fi
     check_row "lane watchdog" "$label" "$v"
   else check_row "lane watchdog" OFF "run: scripts/automation install"; fi
+
+  if pr=$(launchctl print "$DOMAIN/$PAPER_LABEL" 2>/dev/null); then
+    last=$(printf '%s\n' "$pr" | awk -F' = ' '/^\tlast exit code = / && s == "" { s = $2 } END { print s }')
+    if [ -f "$PAPER_DIR/latest.json" ]; then
+      # the window's own record decides; a `running` one past PAPER_STALE belongs to a window that died
+      v=$(jq -r --argjson now "$(date -u +%s)" --argjson stale "$PAPER_STALE" '
+            ((($now - (.started_epoch // 0)) / 60) | floor) as $m
+            | (.result // "") as $r
+            | (($r | startswith("running")) and ($m * 60) > (.stale_after // $stale)) as $died
+            | (if $r == "ok" then "ok" elif $died then "DIED" elif ($r | startswith("running")) then "ok"
+               elif ($r | startswith("refused")) then "REFUSED" else "FAILED" end) + "\t"
+              + "last window " + (.started // "?") + " (" + ($m | tostring) + " min ago, " + (.session // "?") + "): "
+              + (if $died then "still running after " + ($m | tostring)
+                   + " min, so it died; the next window starts only once the account is flat" else $r end)
+              + (if ((.left // []) | length) > 0 then "; left: " + ((.left // []) | join(", ")) else "" end)' \
+          "$PAPER_DIR/latest.json" 2>/dev/null)
+      [ -n "$v" ] || v=$(printf 'UNKNOWN\t%s is unreadable' "$PAPER_DIR/latest.json")
+    else
+      v=$(printf 'UNKNOWN\tno window has run yet (records in %s)' "$PAPER_DIR")
+    fi
+    # Two failures the record cannot show: a firing that ended before Python wrote anything (an empty
+    # keychain item, a lock wait run out), and a schedule that has stopped firing (every run, a window or
+    # "nothing to run", writes last-firing.json).
+    case "$last" in
+      0|''|*[!0-9-]*) ;;
+      *) [ "${v%%$'\t'*}" != ok ] || v="FAILED${v#ok}; the last firing exited $last" ;;
+    esac
+    if [ -f "$PAPER_DIR/last-firing.json" ]; then
+      local heard
+      heard=$(jq -r --argjson now "$(date -u +%s)" '(($now - (.at_epoch // 0)) | floor | tostring) + "\t" + (.outcome // "?")' "$PAPER_DIR/last-firing.json" 2>/dev/null)
+      if [ -n "$heard" ] && [ "${heard%%$'\t'*}" -gt "$PAPER_SILENT" ]; then
+        v="STALE"$'\t'"no firing for $(( ${heard%%$'\t'*} / 60 )) min (the Mac asleep, or the job not running); last: ${heard#*$'\t'}"
+      elif [ -n "$heard" ]; then
+        v="$v | last firing $(( ${heard%%$'\t'*} / 60 )) min ago: ${heard#*$'\t'}"
+      fi
+    fi
+    v="$v | last exit code=${last:-?}; log $CANON_HOME/watch/paper-session.log"
+    check_row "paper session" "${v%%$'\t'*}" "${v#*$'\t'}"
+  else check_row "paper session" OFF "run: scripts/automation install"; fi
 
   if [ -f "$CLAUDE_HOME/scheduled-tasks/$TASK_ID/SKILL.md" ]; then
     row "weekly refresh" ok "task file present at $CLAUDE_HOME/scheduled-tasks/$TASK_ID; whether it is still scheduled shows only in the desktop app"

@@ -15,7 +15,8 @@ consecutive UTC midnights; anything else is that fallback or a gap, and is rejec
 A closed day is a UTC day on which no bar of the trial's run became available (its `session_days`, ADR
 0035 term 3). Nothing can fill or reprice on such a day, so its return must be 0, and one that is not
 is refused rather than dropped. A return that is not finite is refused too: ADR 0031 requires every
-return of the pick to be finite, and skfolio's `Portfolio` raises on one.
+return of the pick to be finite, and skfolio's `Portfolio` does not raise on one, it turns a NaN into
+0.0 (observed at 1.12.8), so `returns_matrix` refuses one in any series it is given as well.
 
 Which upstream call does what:
 
@@ -37,14 +38,16 @@ import itertools
 import math
 from typing import TYPE_CHECKING
 
+import numpy as np
 import pandas as pd
 from skfolio import Population
 from skfolio import Portfolio
 
-from .ledger import DAY_NS
-
 if TYPE_CHECKING:
     from collections.abc import Sequence
+
+
+DAY_NS = 86_400 * 1_000_000_000
 
 
 class ReturnsRejected(ValueError):
@@ -107,6 +110,21 @@ def daily_series(name: str, returns: object, session_days: object) -> pd.Series:
     )
 
 
+def _portfolio(series: pd.Series) -> Portfolio:
+    """A one-asset skfolio `Portfolio` of `series` with weight 1, on its UTC dates without a zone.
+
+    The dates are the same instants; skfolio builds a portfolio on a zone-aware index about seven
+    times slower (2,500 rows, measured at 1.12.8).
+    """
+    plain = series.tz_convert(None) if getattr(series.index, "tz", None) is not None else series
+    return Portfolio(X=plain.to_frame(), weights=[1.0], name=str(series.name))
+
+
+def session_sharpe(series: pd.Series) -> float:
+    """skfolio's per-session Sharpe ratio of one trial's series from `daily_series`."""
+    return float(_portfolio(series).sharpe_ratio)
+
+
 def _is_ns_text(value: object) -> bool:
     return (
         isinstance(value, str)
@@ -160,10 +178,16 @@ def returns_matrix(series: Sequence[pd.Series]) -> pd.DataFrame:
     names = [s.name for s in series]
     if not series or len(set(names)) != len(names):
         raise ValueError("returns_matrix takes one or more series with distinct names")
-    population = Population(
-        [Portfolio(X=s.to_frame(), weights=[1.0], name=str(s.name)) for s in series],
-    )
+    not_finite = [str(s.name) for s in series if not np.isfinite(s.to_numpy(dtype=float)).all()]
+    if not_finite:
+        raise ReturnsRejected(
+            "\n".join(f"{name}: a return that is not finite" for name in not_finite),
+            names=not_finite,
+        )
+    population = Population([_portfolio(s) for s in series])
     matrix = population.returns_df(use_tag_in_column_name=False)
+    # The UTC dates `daily_series` gave, their zone restored after skfolio's zone-free build.
+    matrix.index = pd.DatetimeIndex(matrix.index).tz_localize("UTC")
     missing = matrix.isna()
     short = [name for name in matrix.columns if missing[name].any()]
     if short:

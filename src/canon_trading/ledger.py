@@ -27,8 +27,16 @@ built from what this repo sets, and the run is built with it as its `id`. Nothin
 the data a run read either, so `data_digest` is glue too (ADR 0041).
 
 The value told for a run that traded is skfolio's `Portfolio.sharpe_ratio` (1.12.8,
-`portfolio/_base.py`) over the run's own series: mean over sample standard deviation, per session. It is
-there for a later sampler; `canon_trading.ranking` does not read it.
+`portfolio/_base.py`) over the run's own series as `canon_trading.returns_matrix.daily_series` accepts
+it: mean over sample standard deviation, per session. It is there for a later sampler;
+`canon_trading.ranking` does not read it.
+
+First creation of a ledger file is serialised with an exclusive `fcntl.flock` (the standard library's
+`fcntl`, POSIX `flock(2)`) on `trials.db.lock` beside it. Optuna's `RDBStorage` runs SQLAlchemy's
+`create_all` on construction, and two processes creating one new file raced on it: 14 of 15 rounds of
+two processes crashed with "table studies already exists" (measured on this machine, 2026-11-10). The
+lock guards first creation only, not recording; Optuna's FAQ keeps `JournalFileBackend` for parallel
+optimisation, and ADR 0035 keeps `RDBStorage` on SQLite for the reasons it gives.
 
 A session day (ADR 0035 term 3) is a UTC day on which a bar of the run became available, its `ts_init`,
 a bar at exactly 00:00 UTC counting for the day ending there, as the daily series books it; read with
@@ -38,6 +46,7 @@ the run read, over the study's sample. `BacktestResult` has no such list.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import math
@@ -59,13 +68,16 @@ from nautilus_trader.model import Money
 from nautilus_trader.model import NautilusDataType
 from nautilus_trader.persistence import ParquetDataCatalog
 from optuna.trial import TrialState
-from skfolio import Portfolio
 
 from .backtest import FEE_RATES
 from .backtest import VENUE_SETTINGS
 from .backtest import backtest_run_config
 from .backtest import run_backtest_config
 from .ma_cross import MaCross
+from .returns_matrix import DAY_NS
+from .returns_matrix import ReturnsRejected
+from .returns_matrix import daily_series
+from .returns_matrix import session_sharpe
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -79,7 +91,6 @@ if TYPE_CHECKING:
     from .ma_cross import MaCrossConfig
 
 LEDGER_FILE = Path("ledger") / "trials.db"
-DAY_NS = 86_400 * 1_000_000_000
 
 # The user attribute holding a trial's outcome, and its three values (ADR 0035 term 2).
 OUTCOME = "outcome"
@@ -171,9 +182,15 @@ def create_ledger_study(
     sample = Sample(0, *_range(start, end))
     path = _ledger(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with _storage(path, "rwc") as storage:
-        study = optuna.create_study(study_name=name, storage=storage, direction="maximize")
-        study.set_user_attr(SAMPLES, [_sample_attr(sample)])
+    with ExitStack() as opened:
+        with (path.parent / f"{path.name}.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                storage = opened.enter_context(_storage(path, "rwc"))
+                study = optuna.create_study(study_name=name, storage=storage, direction="maximize")
+                study.set_user_attr(SAMPLES, [_sample_attr(sample)])
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
         yield study
 
 
@@ -191,8 +208,9 @@ def open_study(name: str, path: Path | None = None) -> Generator[optuna.Study]:
         raise LedgerNotFound(f"there is no ledger at {path}; create_ledger_study creates one")
     with ExitStack() as opened:
         try:
-            storage = opened.enter_context(_storage(path, "rw"))
-            study = optuna.load_study(study_name=name, storage=storage)
+            with _creation_settled(path):
+                storage = opened.enter_context(_storage(path, "rw"))
+                study = optuna.load_study(study_name=name, storage=storage)
         except KeyError:
             raise LedgerNotFound(
                 f"the ledger at {path} holds no study {name!r}; create_ledger_study creates one",
@@ -201,6 +219,26 @@ def open_study(name: str, path: Path | None = None) -> Generator[optuna.Study]:
             raise LedgerNotFound(f"the file at {path} is not an Optuna ledger") from error
         samples(study)
         yield study
+
+
+@contextmanager
+def _creation_settled(path: Path) -> Generator[None]:
+    """Wait out a first creation in progress: a shared `flock` on the creation lock, if it exists.
+
+    A reader never creates the lock file. The creator makes it before the ledger file, so a ledger
+    still being created always has one. The shared lock is held only while the study is loaded.
+    """
+    try:
+        lock = (path.parent / f"{path.name}.lock").open("r")
+    except FileNotFoundError:
+        yield
+        return
+    with lock:
+        fcntl.flock(lock, fcntl.LOCK_SH)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
 
 
 def samples(study: optuna.Study) -> list[Sample]:
@@ -539,8 +577,13 @@ def _tell_failed(study: optuna.Study, trial: optuna.Trial, error: BaseException)
 
 
 def _session_sharpe(returns: dict[str, float], days: Sequence[str]) -> float:
-    """skfolio's per-session Sharpe ratio over the returns on `days`; NaN if none can be taken."""
-    values = [returns[day] for day in days if day in returns]
-    if len(values) < 2 or not all(math.isfinite(value) for value in values):
+    """The per-session Sharpe ratio the gate would take of this run, or NaN where it takes none.
+
+    The series goes through `daily_series`, ADR 0010 step 2 as the gate applies it, so a run whose
+    returns the gate rejects is told no value (and `FAIL`, still `traded`), not one the gate never sees.
+    """
+    try:
+        series = daily_series("run", returns, list(days))
+    except ReturnsRejected:
         return math.nan
-    return float(Portfolio(X=[[value] for value in values], weights=[1.0]).sharpe_ratio)
+    return session_sharpe(series) if len(series) > 1 else math.nan

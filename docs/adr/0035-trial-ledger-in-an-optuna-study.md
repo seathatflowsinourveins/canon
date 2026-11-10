@@ -41,7 +41,12 @@ trial store that meets every driver. Leaving it is cheap, since every trial read
    study; it keeps `JournalFileBackend` for parallel and NFS use. The file is `ledger/trials.db` in the
    main checkout, the folder holding the clone's common git directory, so every worktree shares it;
    outside a git checkout a path must be given. Opening never creates a file or study; creating one is
-   its own call, with its sample (ADR 0041). The folder is ignored like `catalog/`. A ranking reads one
+   its own call, with its sample (ADR 0041), under an exclusive `fcntl.flock` on `trials.db.lock`:
+   two processes creating one new file raced in `create_all` and crashed in 14 of 15 rounds (measured
+   here). The lock guards first creation only. Recording stays on `RDBStorage`, not the
+   `JournalFileBackend` the FAQ gives for parallel optimisation: sessions record trials now and then,
+   not in a parallel search, and SQLite serialises those writes (3,100 recordings from 10 processes
+   did not fail in the full review). The folder is ignored like `catalog/`. A ranking reads one
    study.
 2. **Recording**, through ask and tell, the tutorial's way to apply Optuna to an existing problem. The
    key (term 4) is computed first; a call refused before a config exists is not a trial. The trial is
@@ -87,6 +92,11 @@ Who decided. The orchestrator chose option 3 and the terms under the owner's del
 * Good: the ledger is upstream code called as documented, and N is read from it.
 * Bad: Optuna adds eight packages to `uv.lock`, and the config key is local glue.
 * Bad: a configuration that fails every time, or never trades, blocks the study's ranking.
+* Known limit: Optuna returns a trial's start as naive local time; the report converts it to UTC in
+  the zone the process reads in, taking the earlier instant in the hour a fall-back repeats. A study
+  object kept open while its process changes zone mixes zones.
+* Known limit: when `RDBStorage`'s constructor fails (an older schema), its engine is left to the
+  garbage collector; nothing public lets this repo dispose it.
 
 ### Confirmation
 
@@ -141,6 +151,9 @@ Read 2026-11-10. Fetched means read in this session as raw text or source; run m
   writes after `ask` sat outside the `try`; stops named no trial and came one stage at a time. Terms 3
   and 6 corrected. `crates/analysis/src/analyzer.rs` at the pinned commit: `snapshot_day_start` moves a
   non-zero midnight back one day. Fetched; a run of daily bars stamped at 00:00 UTC ranked T = 40.
+* Full review, 2026-11-10: first creation by two processes crashed; the report's times were naive local
+  time. Term 1 and the two known limits answer them. The standard library's `fcntl.flock`; Optuna
+  5.0.0 `storages/_rdb/models.py`, which stores `datetime_start` in UTC and returns it local. `bundled`.
 * Opening without creating, read 2026-11-10: `optuna.load_study` raises `KeyError` for a missing study
   and `RDBStorage(skip_table_creation=True)` creates no table (Optuna 5.0.0, `study.py`,
   `storages/_rdb/storage.py`, `bundled`); https://www.sqlite.org/uri.html gives `rw` beside `rwc`,

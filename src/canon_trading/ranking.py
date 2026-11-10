@@ -38,9 +38,10 @@ from __future__ import annotations
 import math
 from collections import defaultdict
 from dataclasses import dataclass
+from datetime import UTC
+from datetime import datetime
 from typing import TYPE_CHECKING
 
-from skfolio import Portfolio
 from skfolio import measures
 
 from .ledger import IDLE
@@ -54,6 +55,7 @@ from .ledger import ran_something
 from .returns_matrix import ReturnsRejected
 from .returns_matrix import daily_series
 from .returns_matrix import returns_matrix
+from .returns_matrix import session_sharpe
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -149,7 +151,7 @@ def rank(study: optuna.Study) -> RankingReport:
     and its Sharpe ratio. The stops of the study as a whole (N, V, a tie at the top, the DSR) need
     every trial to have cleared those, and come after.
     """
-    trials = study.trials
+    trials = study.get_trials(deepcopy=False)  # read only; a copy of every series is not needed
     if not trials:
         raise RankingStopped(f"study {study.study_name!r} has no trials")
     sample = current_sample(study)
@@ -240,10 +242,7 @@ def rank(study: optuna.Study) -> RankingReport:
         except ReturnsRejected as rejected:
             named = ", ".join(f"{key} (#{chosen[key].number})" for key in rejected.names)
             stops.append(f"{rejected}\nTrials: {named}")
-    sharpes = {
-        key: float(Portfolio(X=one.to_frame(), weights=[1.0], name=key).sharpe_ratio)
-        for key, one in series.items()
-    }
+    sharpes = {key: session_sharpe(one) for key, one in series.items()}
     stops.extend(
         f"{key}: Sharpe ratio {sharpe} over the sample (#{chosen[key].number})"
         for key, sharpe in sharpes.items()
@@ -304,7 +303,7 @@ def rank(study: optuna.Study) -> RankingReport:
         (trial for records in on_sample.values() for trial in records), key=lambda t: t.number
     )
     numbers = [trial.number for trial in current]
-    starts = sorted(trial.datetime_start for trial in current if trial.datetime_start is not None)
+    starts = sorted(_utc(t.datetime_start) for t in current if t.datetime_start is not None)
     return RankingReport(
         study=study.study_name,
         sample=sample.describe(),
@@ -312,8 +311,8 @@ def rank(study: optuna.Study) -> RankingReport:
         all_records=len(trials),
         first_trial=min(numbers),
         last_trial=max(numbers),
-        first_recorded=starts[0].isoformat() if starts else "unknown",
-        last_recorded=starts[-1].isoformat() if starts else "unknown",
+        first_recorded=starts[0] if starts else "unknown",
+        last_recorded=starts[-1] if starts else "unknown",
         n=n,
         t=t,
         v=v,
@@ -329,6 +328,18 @@ def rank(study: optuna.Study) -> RankingReport:
         dsr_at_n_hat=dsr_at_n_hat,
         n_hat_note=n_hat_note,
     )
+
+
+def _utc(start: datetime) -> str:
+    """A trial's start in UTC, with its offset: ISO 8601, seconds and microseconds.
+
+    Optuna 5.0.0 stores the start in UTC and returns it as naive local time
+    (`storages/_rdb/models.py`, `datetime_start`), so it is read back as local time and converted.
+    The UTC texts sort as the instants do; in the hour a fall-back repeats, the local
+    time is ambiguous and the earlier instant is taken (Python's `fold` = 0). The conversion uses the
+    zone the process has now: a study object kept open while the process changes zone mixes zones.
+    """
+    return start.astimezone(UTC).isoformat()
 
 
 def _same(a: pd.Series, b: pd.Series) -> bool:
