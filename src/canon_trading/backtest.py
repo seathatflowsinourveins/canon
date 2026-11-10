@@ -50,7 +50,8 @@ Known limits:
 * No slippage, latency, partial-fill or market-hours model is configured.
 * A `NETTING` position that reopens keeps its ID; each earlier round trip is a snapshot (observed at
   v2.0.0rc8), which is why `BacktestRun` carries both lists.
-* How runs are compared is not decided here (ADR 0010 is `proposed`).
+* Runs are not compared here. Variants are ranked only by ADR 0010's protocol, and the trial ledger it
+  needs is not written yet, so until it is a result is reported and not ranked.
 * The catalog path is made absolute before use. Upstream's guides build it from `Path.cwd()`; given a
   relative path, the node's catalog query fails at v2.0.0rc8 with "No suitable object store found for
   file://catalog/..." (observed 2026-11-10), although `ParquetDataCatalog` itself reads and writes one.

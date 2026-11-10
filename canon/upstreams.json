@@ -532,6 +532,22 @@
       ],
       "adr": "0008",
       "mise": "gh"
+    },
+    {
+      "id": "skfolio",
+      "field": "strategy-evaluation",
+      "repo": "skfolio/skfolio",
+      "track": "tag:v1.12.8",
+      "role": "tool",
+      "license": "BSD-3-Clause",
+      "why": "Computes the deflated Sharpe ratio that gates a ranking (ADR 0010): measures.expected_max_sharpe_ratio, probabilistic_sharpe_ratio and deflated_sharpe_ratio follow Bailey and Lopez de Prado (2014), eqs. 1-2. The gate calls only those three; the test also reads its mean, standard_deviation, skew and kurtosis.",
+      "evidence": [
+        "https://pypi.org/pypi/skfolio/json",
+        "https://raw.githubusercontent.com/skfolio/skfolio/433991778607285ecd274942e89029190c45e44c/src/skfolio/measures/_measures.py",
+        "https://raw.githubusercontent.com/skfolio/skfolio/433991778607285ecd274942e89029190c45e44c/.github/workflows/ci.yml"
+      ],
+      "adr": "0010",
+      "pypi": "skfolio"
     }
   ]
 }

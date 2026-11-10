@@ -297,6 +297,15 @@
       "sha": "aac0823e6b58f8a499e856e93738082691cbf212",
       "track": "tag:v0.11.0"
     },
+    "skfolio": {
+      "default_branch": "main",
+      "default_sha": "433991778607285ecd274942e89029190c45e44c",
+      "ref": "refs/tags/v1.12.8",
+      "repo": "skfolio/skfolio",
+      "resolved_at": "2026-11-10T16:15:25Z",
+      "sha": "433991778607285ecd274942e89029190c45e44c",
+      "track": "tag:v1.12.8"
+    },
     "spec-kit": {
       "default_branch": "main",
       "default_sha": "0382d7a08d7d37b13f40cd3c385e40c394206113",

@@ -22,5 +22,7 @@ paths:
   `packages/canon-alpaca/`. Upstream keeps the two apart; so do we.
 * Market data goes in `catalog/` and is never committed.
 * Add a dependency with `uv add`, pinned exactly, after it is in `canon/upstreams.json`.
-* Backtest results may be reported but not ranked as winners until ADR 0010 is accepted.
+* Rank backtest variants only by ADR 0010's protocol: every trial in the ledger, and the pick's deflated
+  Sharpe ratio at 0.95 or above. The ledger is not written yet, so until it is, report results and do not
+  rank them.
 * This is engineering work, not investment advice. Do not recommend trades, positions or strategies to hold.
