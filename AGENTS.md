@@ -40,7 +40,7 @@ dependency, pattern and practice traces to a pinned upstream or a dated source. 
 | `scripts/canon resolve <id>` | Resolve one pin and merge it into the lock; without an id, re-resolve all (ask first) |
 | `uv sync` | Install exactly what `uv.lock` records into `.venv` |
 | `uv run --locked pytest` | Run every test in the workspace; `--locked` fails instead of rewriting `uv.lock` |
-| `scripts/lanes` | Report every Claude Code session on this machine: state, failures, spend |
+| `scripts/lanes` | Report every Claude Code session on this machine: state, failures, spend; `--rates` lists every runtime's workers with output tokens per second where a documented source gives it |
 | `scripts/automation status` | Show every standing automation and whether it is healthy |
 | `scripts/survey-github report canon/github-practice.json` | Print what a measured sample of repositories converges on for pull requests and GitHub automation |
 | `scripts/bootstrap --check` | Show which toolchain pieces are installed, and whether the Claude Code CLI is behind its pin |

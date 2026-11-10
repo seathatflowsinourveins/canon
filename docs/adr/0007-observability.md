@@ -69,6 +69,36 @@ set in user or managed settings; they are ignored from project files. `home/otel
 block. Anthropic's monitoring guide is the reference stack and needs a container runtime, which this Mac
 does not have yet.
 
+**Tokens per second, from OpenTelemetry only (added 2026-11-10).** `scripts/lanes --rates [--window MIN]
+[--json]` prints one row per running worker of every runtime: lane, runtime, model, state, output tokens
+per second over the window (default 10 minutes), and spend where the runtime reports it. A runtime with no
+documented token source gets a row saying "not measured" and why; no figure is estimated.
+
+* The status line cannot give a rate. Its `context_window.total_output_tokens` is the output of the most
+  recent response only, and its updates are debounced, so samples of it miss responses. It still gives
+  the session's cost (`cost.total_cost_usd`, cumulative), which the manifest shows.
+* Claude Code: the `claude_code.api_request` event carries `session.id`, `model`, `output_tokens`,
+  `duration_ms` and `cost_usd` per request. TOK/S is the window's output tokens over the window's seconds;
+  GEN is output tokens over the durations of the requests that carry one. Claude Code rows are the
+  ledger's working and QUIET sessions, and its idle or unknown ones heard from within six hours. A subagent's requests carry an `agent_id`;
+  that they also carry the parent's `session.id`, and so count toward its row, is UNVERIFIED.
+* Codex CLI: `codex.sse_event` with `event.kind` `response.completed` carries `output_token_count`, and
+  `codex.turn_cost` carries `usage.estimated_usd`, both keyed by `conversation.id`. No documented field
+  links a conversation to a directory or process, so conversations and `codex` processes are separate rows.
+* Muse Code, Antigravity and DeepSeek Harness: no documented token telemetry was found, so their processes
+  are listed from the process table (`ps`, with `lsof` for the directory) and marked not measured.
+* Claude Code documents no file exporter (`otlp`, `prometheus`, `console`, `none`) and Codex only OTLP
+  (`otlp-http`, `otlp-grpc`, `none`), so the events need an OpenTelemetry Collector. The manifest reads
+  the Collector `file` exporter's output, JSON Lines of OTLP/JSON log requests, at
+  `~/.claude/canon/otel/logs.jsonl` (`CANON_OTLP_FILE` overrides it). It copies out only the attributes
+  named above; Codex also sends account fields, which are never read.
+* Not yet enabled. Three steps, all the owner's: adopt and install a Collector with the `file` exporter
+  through `adopt-upstream`; merge `home/otel-settings.example.json`'s `env` block (with
+  `OTEL_LOGS_EXPORTER` set to `otlp`) into `~/.claude/settings.json`, because Claude Code ignores these
+  variables in a project's settings and `home/` reaches the machine only through `scripts/bootstrap`; and
+  set `[otel] exporter` in `~/.codex/config.toml` to the Collector's OTLP endpoint. Until then every row
+  reads not measured, naming the missing file.
+
 **Gap, stated plainly:** no fleet or stall-detection tool has converged upstream. `scripts/lanes` is thin
 glue over documented hook payloads and is provisional; it is replaced when an upstream tool earns adoption.
 
@@ -81,7 +111,13 @@ glue over documented hook payloads and is provisional; it is replaced when an up
 
 ### Confirmation
 
-`scripts/lanes --selftest` replays a synthetic ledger and checks each flag fires.
+`scripts/lanes --selftest` replays a synthetic ledger and checks each flag fires. `scripts/test-lanes` runs `--rates`
+against fixture files (a ledger, a snapshot, an OTLP file shaped as both runtimes' events, and `ps` and
+`lsof` stubs). It checks the rate and spend arithmetic, that only Codex's `response.completed` events
+count, that a helper child process is not a second worker, that a session with no telemetry and a missing
+file each say why they are not measured, and that no attribute beyond the named ones reaches the output.
+On 2026-11-10 a run on this machine listed the open Claude Code sessions, every one not measured because
+no OTLP file exists yet, and no worker of another runtime was running.
 
 `ccusage` 20.0.48 was run on 2026-11-09 and reported the day's use across four models: 57.0M tokens, of
 which 54.9M were cache reads (about 97% of input, above the 80% bar in ADR 0006), and an estimated $37.36
@@ -126,5 +162,23 @@ Read 2026-11-09 (fetched; fetches are model-summarised).
   are supported. `PermissionDenied` is narrower than first written (auto mode only), and the ledger's field
   list was incomplete; both corrected. The monitoring guide's last change was 2025-07-29, so check it
   against the current telemetry docs before using it.
+* Rates manifest, read 2026-11-10. Statusline page fetched in full and searched: `total_output_tokens` is
+  "from the most recent API response"; updates are debounced at 300 ms. Monitoring page fetched in full:
+  the `claude_code.api_request` attributes above; exporter values; no file exporter.
+  https://learn.chatgpt.com/docs/config-file/config-advanced — `[otel]` is off by default, exporters
+  `none`, `otlp-http`, `otlp-grpc`; "token counts on response.completed". The attribute names
+  (`output_token_count`, `conversation.id`, `model`, `event.timestamp`, `usage.estimated_usd`) were read from
+  `codex-rs/otel/src/events/session_telemetry.rs` and `shared.rs` at the pinned `rust-v0.167.0`; the
+  shared fields include `user.email`.
+  https://opentelemetry.io/docs/specs/otel/protocol/file-exporter/ (status Development) and
+  https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/exporter/fileexporter —
+  JSON Lines of OTLP/JSON, the file exporter's default `format: json`. 64-bit integers arrive as decimal
+  strings (https://github.com/open-telemetry/opentelemetry-proto/blob/main/docs/specification.md), so
+  both forms are read.
+  Muse Code (https://dev.meta.ai/docs/muse-code), Antigravity (https://antigravity.google/docs/settings/)
+  and DeepSeek Harness (https://github.com/deepseek-ai/deepseek-harness, `docs/architecture.md`) document
+  no token telemetry on the pages read. The Antigravity and Muse figures that third parties and an
+  Antigravity issue describe (`agy --print` JSON `usage`, `muse usage`) are UNVERIFIED and not used. A
+  Collector adoption, and which distribution ships the `file` exporter, are UNVERIFIED and left open.
 * Restated 2026-11-10 against the headers of `scripts/lanes` and `home/.claude/canon/ledger.sh`: the
   ledger's time fields and file date, the session states and the limits.
