@@ -105,6 +105,39 @@ class AcceptThenCancel(Strategy):
             self.shutdown_system(f"Paper order ended with {name}")
 
 
+class AcceptModifyCancel(Strategy):
+    """A DAY limit buy of 1 AAPL at $1.00, modified to $1.01 once accepted, canceled once updated."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.events: list = []
+
+    def on_start(self) -> None:
+        order = self.order_factory.limit(
+            AAPL,
+            OrderSide.BUY,
+            Quantity.from_int(1),
+            Price.from_str("1.00"),
+            time_in_force=TimeInForce.DAY,
+        )
+        self.submit_order(order)
+
+    def on_order_event(self, event) -> None:
+        name = type(event).__name__
+        if name == "OrderInitialized":
+            return
+        self.events.append(event)
+        if name == "OrderAccepted":
+            self.modify_order(event.client_order_id, price=Price.from_str("1.01"))
+        elif name == "OrderUpdated":
+            self.cancel_order(event.client_order_id)
+        elif name in {"OrderCanceled", "OrderRejected", "OrderDenied", "OrderModifyRejected"}:
+            self.shutdown_system(f"Paper order ended with {name}")
+
+    def names(self) -> list[str]:
+        return [type(e).__name__ for e in self.events]
+
+
 async def run_hosted(node) -> None:
     async with asyncio.timeout(60):
         await node.run_async()
@@ -128,6 +161,73 @@ def paper_node() -> LiveNode:
         ),
         exec_factories={"ALPACA": AlpacaExecutionClientFactory},
     )
+
+
+def test_paper_limit_order_is_modified_through_a_node() -> None:
+    """One modify through a real node (ADR 0036): `OrderUpdated` arrives with Alpaca's `replaced`, under the
+    replacement's order ID and the new price, and the cancel after it reaches the replacement."""
+    with aapl_left_as_found() as cleaned:
+        node = paper_node()
+        strategy = AcceptModifyCancel()
+        node.add_strategy(strategy)
+        try:
+            asyncio.run(run_hosted(node))
+        finally:
+            node.dispose()
+
+    assert cleaned == {"orders": 0, "positions": 0}, cleaned
+    assert strategy.names() == [
+        "OrderSubmitted",
+        "OrderAccepted",
+        "OrderPendingUpdate",
+        "OrderUpdated",
+        "OrderPendingCancel",
+        "OrderCanceled",
+    ]
+    accepted, updated, canceled = (strategy.events[i] for i in (1, 3, 5))
+    assert updated.venue_order_id != accepted.venue_order_id
+    assert updated.price == Price.from_str("1.0100")
+    assert canceled.venue_order_id == updated.venue_order_id
+
+
+def test_paper_modify_limit_buy_tc_e30() -> None:
+    """TC-E30 ("Modify limit BUY price") through `ExecTester`, as the card configures it: the one-shot amend
+    moves the limit "one tick more passive". The adapter's tick is 0.0001 (ADR 0030), so above $1.00 that
+    price breaks Alpaca's sub-penny rule and the client denies the modify before Alpaca:
+    `OrderModifyRejected`, not `OrderUpdated`. The order is then canceled on stop."""
+    reasons: list[str] = []
+
+    def modify_rejected(orders: list) -> bool:
+        reasons[:] = [
+            str(e.reason)
+            for o in orders
+            for e in o.events()
+            if type(e).__name__ == "OrderModifyRejected"
+        ]
+        return bool(reasons)
+
+    with aapl_left_as_found() as cleaned:
+        events = run_exec_tester(
+            ExecTesterConfig(
+                instrument_id=AAPL,
+                client_id=ClientId("ALPACA"),
+                order_qty=Quantity.from_int(1),
+                enable_limit_buys=True,
+                enable_limit_sells=False,
+                tob_offset_ticks=TOB_OFFSET_TICKS,
+                limit_time_in_force=TimeInForce.DAY,
+                modify_orders_to_maintain_tob_offset=True,
+                trigger_limit_order_maintenance_once=True,
+            ),
+            count=1,
+            settle=modify_rejected,
+        )
+
+    assert cleaned == {"orders": 0, "positions": 0}, cleaned
+    (names,) = events.values()
+    assert "OrderModifyRejected" in names, names
+    assert any("has more than 2 decimals" in r for r in reasons), reasons
+    assert names[-1] == "OrderCanceled", names
 
 
 def paper_trading() -> TradingClient:
@@ -297,7 +397,10 @@ def test_paper_stop_buy_is_accepted_with_its_prices(row: str, order_type: OrderT
 
 
 def run_exec_tester(
-    config: ExecTesterConfig, count: int, check: Callable[[list], None] | None = None
+    config: ExecTesterConfig,
+    count: int,
+    check: Callable[[list], None] | None = None,
+    settle: Callable[[list], bool] | None = None,
 ) -> dict[str, list[str]]:
     """Run upstream's `ExecTester` on a node with the spec's setup until it has `count` orders accepted,
     pass them to `check` while they rest, then stop it (its stop cancels them), and return each of its
@@ -332,7 +435,10 @@ def run_exec_tester(
         try:
             while not task.done() and asyncio.get_running_loop().time() < deadline:
                 orders = cache.orders(instrument_id=AAPL, strategy_id=TESTER)
-                if len(orders) == count and all(o.status == OrderStatus.ACCEPTED for o in orders):
+                accepted = len(orders) == count and all(
+                    o.status == OrderStatus.ACCEPTED for o in orders
+                )
+                if accepted and (settle is None or settle(orders)):
                     if check is not None:
                         check(orders)
                     break

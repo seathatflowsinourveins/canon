@@ -362,6 +362,9 @@ class FakeOrdersClient(FakeTradingClient):
         self.execution_ids = True  # whether fill updates carry `execution_id`
         self.submit_delay = 0.0
         self.submitted: list[OrderRequest] = []
+        self.replace_script = "replaced"
+        self.replace_error: Exception | None = None
+        self.replace_requests: list[tuple[str, object]] = []
         self.cancels: list[str] = []
         self.order_queries: list[GetOrdersRequest | None] = []
         self.orders: list[dict] = []
@@ -439,6 +442,65 @@ class FakeOrdersClient(FakeTradingClient):
             placed.update(status="pending_cancel")
             raise self.cancel_error
         self._send("canceled", placed, status="canceled", canceled_at=datetime.now(UTC).isoformat())
+
+    def replace_order_by_id(self, order_id: object, order_data: object = None) -> Order:
+        """Answer as the paper observation of 2026-11-10 saw (ADR 0036): the replacement, status `new`,
+        with an Alpaca-made client order ID and `replaces`; then, by `replace_script`, the stream's
+        `replaced` carrying the old order with `replaced_by` ("replaced"), `order_replace_rejected` for the
+        old order ("reject"), or nothing ("silent", for `confirm_replace` to send later). A second replace
+        of a replaced order answers 422 "order already replaced", and one keeping a client order ID 422
+        "client_order_id must be unique", as observed. `replace_error` is raised instead of answering;
+        with `took_before_error`, the replace is taken first, as for a submit."""
+        self.replace_requests.append((str(order_id), order_data))
+        if self.replace_error is not None and not self.took_before_error:
+            raise self.replace_error
+        old = self._placed.get(str(order_id)) or next(
+            (raw for raw in self.orders if raw["id"] == str(order_id)), None
+        )
+        if old is None:
+            raise api_error(404, 40410000, "order not found")
+        if old["status"] == "replaced":
+            raise api_error(422, 42210000, "order already replaced")
+        if getattr(order_data, "client_order_id", None) is not None:
+            raise api_error(422, 40010001, "client_order_id must be unique")
+        now = datetime.now(UTC).isoformat()
+        new = {
+            **old,
+            "id": str(uuid.uuid4()),
+            "client_order_id": str(uuid.uuid4()),
+            "replaces": old["id"],
+            "replaced_by": None,
+            "status": "new",
+            "created_at": now,
+            "submitted_at": now,
+            "updated_at": now,
+        }
+        for field in ("qty", "limit_price", "stop_price"):
+            value = getattr(order_data, field, None)
+            if value is not None:
+                new[field] = str(value)
+        if self.replace_script == "reject":
+            self._send("order_replace_rejected", old)
+            raise api_error(422, 42210000, "replace rejected (stand-in)")
+        self._placed[new["id"]] = new
+        old.update(replaced_by=new["id"], replaced_at=now)
+        answer = Order(**new)
+        if self.replace_script == "replaced":
+            self._send("replaced", old, status="replaced")
+        else:
+            old.update(status="replaced")
+        if self.replace_error is not None:
+            raise self.replace_error
+        return answer
+
+    def confirm_replace(self, old_id: str) -> None:
+        """Send the `replaced` update for a replace answered under the "silent" script."""
+        old = self._placed[old_id]
+        self._send("replaced", old, status="replaced")
+
+    def update(self, order_id: str, event: str, qty: int | None = None, **status: str) -> None:
+        """Send one trade update for an order the stand-in holds, as Alpaca would."""
+        self._send(event, self._placed[order_id], qty, **status)
 
     def get_order_by_id(self, order_id: object) -> Order:
         for raw in [*self._placed.values(), *self.orders]:

@@ -9,122 +9,141 @@ review-by: 2026-12-10
 
 ## Context and Problem Statement
 
-`AlpacaExecutionClient` (ADR 0030) submits and cancels market and limit orders on paper. It does not
-cancel all, take stop orders, modify, or refresh its account after fills. NautilusTrader's adapter guide
-names the hooks, but not what each must do when Alpaca's endpoint differs from the command. What does
-each do here, and from which source? A section is added as each part is built; until then ADR 0030 and
-the package README describe that part.
+`AlpacaExecutionClient` (ADR 0030) submitted and canceled market and limit orders on paper, and did not
+cancel all, take stops, modify, or answer an account query. The adapter guide names the hooks, not what each
+must do where Alpaca's endpoint differs from the command. What does each do here, and from which source?
 
 ## Decision Drivers
 
-* ADR 0001, rule 3: each behaviour traces to the guide, to an upstream adapter at the pinned tag, or to
-  an Alpaca or alpaca-py page. Upstream's adapters are read for shape, not copied.
-* Paper only (ADR 0009); nothing here weakens the client's paper-only check.
-* What a page does not state is not guessed into code; it is `UNVERIFIED` and given a paper test.
+* ADR 0001, rule 3: each behaviour traces to the guide, an upstream adapter at the pin, or an Alpaca or
+  alpaca-py page; upstream is read for shape, not copied. Paper only (ADR 0009). What no page states is not
+  guessed into code: it is `UNVERIFIED` and gets a paper test.
 
 ## Considered Options
 
-Cancel-all: (1) Alpaca's "Delete All Orders", `DELETE /v2/orders`; (2) the node's open and in-flight
-orders for the command's instrument and side, each canceled by ID; (3) Alpaca's open orders for the
-symbol, listed with "Get All Orders" and each canceled by ID. Stop orders: send Alpaca's stop and stop-limit
-for what Alpaca takes, and deny the rest before Alpaca.
+Cancel-all: (1) Alpaca's "Delete All Orders"; (2) the node's open and in-flight orders for the command's
+instrument and side, each canceled by ID; (3) Alpaca's open orders for the symbol, from "Get All Orders",
+each canceled by ID. Stop orders: send what Alpaca's order page lists, deny the rest before Alpaca. Modify:
+(a) `OrderUpdated` from the PATCH answer, as Binance spot's HTTP fallback does; (b) `OrderUpdated` on
+Alpaca's `replaced`, with the replacement's values, as Binance spot's WebSocket path waits for the venue's
+stream; (c) not implemented, with a paper test to settle what the pages leave open.
 
 ## Decision Outcome
 
 ### Cancel-all: option 2
 
 Alpaca's endpoint "Attempts to cancel all open orders" of the account; `CancelAllOrders` names one
-instrument and maybe a side, so option 1 cancels what it does not name. At `v2.0.0rc8`, Kraken spot, whose
-venue cancel-all is account-wide too, "select[s] the matching open orders and cancel[s] them by explicit
-venue id", in-flight ones included ("the venue can have accepted an order the cache still records as
-`Submitted`"). Binance spot and Bybit select from the cache when the command names a side, their cancel-all
-having "no side parameter", and otherwise call their venue's cancel-all for that one symbol; Interactive
-Brokers selects from the cache. Coinbase alone lists the venue's orders (option 3). Betfair, and OKX with an
-opt-in, send wider venue cancels, neither account-wide. So `_cancel_all_orders` takes the cache's open and
-in-flight orders for the instrument and side, every strategy's (a strategy sends the command only with
-`strategy_only=False`), skips those already `PENDING_CANCEL` (Coinbase does too: a second cancel risks a
-rejection), and cancels each through `_cancel_order`'s path, one at a time, each re-read from the cache at
-its turn. A 422 gets `OrderCancelRejected`, the pinned policies' event for "Cancel, cancel-all, or batch
-cancel", unless Alpaca shows the order canceled or pending cancel (alpaca-py's own retry, ADR 0030). An
-unexpected error, such as an unparsable answer, is logged with no event, the policies' "unknown live
-outcome" for "parse failures after transmission"; either way the rest go on, this repo's choice, in a batch
-cancel too. `_batch_cancel_orders` keeps the guide's default, "ordered calls of the corresponding
-single-order hook": Alpaca has no cancel-by-list endpoint.
+instrument and maybe a side. Kraken spot, whose venue cancel-all is account-wide too, "select[s] the
+matching open orders and cancel[s] them by explicit venue id", in-flight ones included; Binance spot and
+Bybit select open orders from the cache for a sided command and call their venue's per-symbol cancel-all
+otherwise; Interactive Brokers always selects from the cache; Coinbase lists the venue's orders; Betfair,
+and OKX by opt-in, send wider cancels, neither account-wide. So the client cancels by ID, one at a time, the
+cache's open and in-flight orders for the instrument and side, every strategy's (the command comes only from
+`strategy_only=False`), each re-read at its turn and skipped if closed or `PENDING_CANCEL` (as Coinbase,
+since a second cancel risks a rejection). A 422 is `OrderCancelRejected` ("Cancel, cancel-all, or batch
+cancel") unless Alpaca shows the order canceled or pending cancel (alpaca-py's own retry, ADR 0030), or
+replaced, when the replacement is canceled; an unexpected error is logged with no event ("parse failures
+after transmission" leave the outcome unknown). That the rest go on, in a batch cancel too, is this repo's
+choice; `_batch_cancel_orders` keeps the guide's default: Alpaca has no cancel-by-list endpoint.
 
 ### Stop and stop-limit orders
 
-Alpaca's whole-share table gives stop and stop-limit orders `GTC` and `DAY` "Yes" and IOC, FOK, OPG and CLS
-"No"; its extended-hours table gives them "No" throughout; a stop is "elected on the consolidated print", a
-trade at or through the stop price not outside the NBBO; a stop price follows the limit price's sub-penny
-rule. So `_submit_order` sends alpaca-py's `StopOrderRequest` and `StopLimitOrderRequest`, `DAY` or `GTC`,
-never `extended_hours`, and denies before Alpaca another time in force, a sub-penny stop or limit price, and
-a trigger type other than `DEFAULT` ("the venue's default") or `LAST_PRICE` ("the last traded price"), as
-Kraken spot maps those two to its last-trade trigger and refuses what its venue has no trigger for. Alpaca
-documents no status or update for a stop's election, so no `OrderTriggered` is sent and an elected
-stop-limit stays `ACCEPTED`. A report carries the stop price as trigger price and trigger type `DEFAULT`,
-Alpaca's order having no trigger type field (Coinbase's adapter notes that a report without them makes the
-reconciler clear the local prices). Trailing stops stay denied: their stop price moves with Alpaca's
-high-water mark and no update reports it.
+Alpaca's whole-share table gives stop and stop-limit orders `GTC` and `DAY` "Yes" and the rest "No", its
+extended-hours table "No" throughout; a stop is "elected on the consolidated print", a trade at or through
+the stop price not outside the NBBO; a stop price follows the sub-penny rule. So the client sends
+`StopOrderRequest` and `StopLimitOrderRequest`, `DAY` or `GTC`, never `extended_hours`, and denies before
+Alpaca another time in force, a sub-penny stop or limit price, and a trigger type other than `DEFAULT` ("the
+venue's default") or `LAST_PRICE` ("the last traded price"), as Kraken spot maps those two to its last-trade
+trigger. Alpaca documents no status or update for a stop's election, so no `OrderTriggered` is sent. Reports
+carry the stop price as trigger price, and the node's trigger type, else `DEFAULT` (Coinbase's adapter notes
+a report without them makes the reconciler clear the local prices). Trailing stops stay denied: their stop
+price moves with Alpaca's high-water mark and no update reports it.
+
+### Modify: option (b)
+
+Alpaca's "Replace Order by ID" answers "The new Order object with the new order ID", says a success "does
+NOT guarantee the existing open order has been replaced", and gives the replacement's client order ID as "A
+unique identifier for the new order. Automatically generated if not sent." It leaves unstated which order
+`replaced` carries, whether the original ID may be kept, and any error status. A paper observation on
+2026-11-10, 3 of 3 runs, settled those: a kept ID is refused, 422 "client_order_id must be unique"; the
+answer has a new ID, an Alpaca-made client order ID and `replaces`; `replaced` carries the old order with
+`replaced_by`; a second replace of the old order is refused, 422 "order already replaced"; no replacement
+sent `new`. On that, the master orchestrator chose (b) under the owner's delegation of 2026-11-10.
+`_modify_order` sends no client order ID; `OrderUpdated` comes only with `replaced`, its values from the
+replacement as the answer or a read of `replaced_by` gives it, nothing if neither does. Updates and reports
+of a replacement are traced to the node's order through `replaces`, at most 16 links, from the orders
+already fetched first, cached, misses too, and walked again after a restart. A 422 is `OrderModifyRejected`
+unless Alpaca shows the order replaced as asked (alpaca-py's own retry); any other status leaves the outcome
+unknown. `order_replace_rejected` and the `rejected` of a replacement that has not taken over are
+`OrderModifyRejected` too. Denied before Alpaca: no venue order ID, a fractional quantity, a sub-penny
+price, a price the order type lacks.
 
 ### Consequences
 
-* Good: cancel-all cancels exactly what the command names; stops reach Alpaca only in forms its page lists.
+* Good: cancel-all cancels exactly what the command names; stops reach Alpaca only in forms its page lists;
+  `OrderUpdated` waits for Alpaca's own confirmation.
 * Bad: one HTTP call per cancel, one at a time; an order Alpaca holds that the node does not yet, or one
   placed after the cache was read, is not canceled. No `OrderTriggered`: an election shows only as a fill.
 
 ### Confirmation
 
-Paper, 2026-11-10, `mise run paper:test` (all passed): upstream's Execution Testing Spec rows through its
-`ExecTester` with the spec's node setup. TC-E41 ("Cancel all on stop"): a limit buy $50 below the bid and a
-stop buy $50 above the ask, both canceled by `CancelAllOrders` on stop. TC-E20 and TC-E22 ("StopMarket BUY",
-"StopLimit BUY"): accepted at the prices sent, as Alpaca holds them, and Alpaca's order reported back by the
-client with the same type and prices. TC-E40: the existing cancel test. Not run: TC-E41's sell, which from a
-flat account Alpaca refuses with 403 "cannot open a short sell while a long buy order is open" (observed);
-TC-E21 and TC-E23, since a sell stop from flat is a short sale; TC-E44. Not applicable: TC-E24 to TC-E27 (no
-such order type), TC-E42 and TC-E43 (no new hook). The card's `OrderPendingCancel` before `OrderCanceled`
-does not come for a cancel-all: the pinned `Strategy` sends the command without one, and the binding has no
-`generate_*` for it, as Binance spot emits `OrderCanceled` alone. Each test places nothing while the account
-holds an open AAPL order or position, and leaves it as found. These follow upstream's practice: the spec's
-rows through its tester, and offline stand-ins for the venue as alpaca-py's own tests mock its paper
-endpoints. `UNVERIFIED`: an elected stop and its fill (the market must move $50), what Alpaca's stream sends
-on election, and any sell stop or stop-limit, sent like a buy but shown by no paper run. The offline tests
-are listed in the package README.
+Paper, 2026-11-10, `mise run paper:test`, all passing: upstream's Execution Testing Spec rows through its
+`ExecTester` on the spec's node setup. TC-E41: a limit buy $50 below the bid and a stop buy $50 above the
+ask, canceled by `CancelAllOrders` on stop; its sell is left out, since from a flat account Alpaca refuses
+it, 403 "cannot open a short sell while a long buy order is open" (observed). The card's
+`OrderPendingCancel` does not come: the pinned `Strategy` sends the command without one and the binding
+cannot generate it, as Binance spot emits `OrderCanceled` alone. TC-E20 and TC-E22: stop and stop-limit buys
+accepted at the prices sent, as Alpaca holds them, and reported back the same. TC-E30: the tester amends
+"one tick more passive", 0.0001 here, so the client denies it as sub-penny, `OrderModifyRejected`: the row's
+pass criterion, `OrderUpdated`, fails by design, as the card's "different valid price" is not valid at
+Alpaca. TC-E40 is the existing cancel test. Modify through a node, 6 of 6 runs: $1.00 to $1.01,
+`OrderUpdated` under the replacement's ID and price, the cancel reaching the replacement;
+`test_paper_replace.py` asserts the four observed answers. Not run: sells (TC-E21, E23, E31, E33: a short
+sale from flat), TC-E32, E35 and E42 to E44 (no new hook), TC-E34 (offline only); not applicable: TC-E24 to
+E27 and E36. Each test places nothing while the account holds an AAPL order or position, and leaves it as
+found. This is upstream's practice: the spec's rows through its tester, and offline stand-ins as alpaca-py's
+own tests mock its paper endpoints; the offline tests are listed in the package README.
+
+`UNVERIFIED`, shown by no run: an elected stop and its fill, and what the stream sends on election; any sell
+stop; `order_replace_rejected`; `pending_replace`; a `new` for a replacement later than ~200 ms; a status on
+a replace other than 422; a modify of a partially filled order (what `qty` means then); a fill on the old
+order racing a replace, where the old order's fill applies as usual and the replacement's `rejected` becomes
+`OrderModifyRejected`, not `OrderRejected`.
 
 ## Evidence
 
-Read 2026-11-10. "raw": fetched with `curl` and read, not summarised. NautilusTrader files are at the pin,
-`d53849b216e2`.
+Read 2026-11-10; "raw": fetched with `curl` and read, not summarised. NautilusTrader files at the pin,
+`d53849b216e2`; alpaca-py 0.45.0 and NautilusTrader `v2.0.0rc8` as installed, read with `inspect`.
 
-* https://nautilustrader.io/docs/md/latest/developer_guide/python_adapters.md, order command hooks and the
-  batch default; the same at the pin but for two version lines (fetched, raw; diffed).
-* `docs/concepts/execution/policies.md`: failure events, "parse failures after transmission"; `latest`
-  adds `OrderCancelDenied` and `OrderModifyDenied`, absent from the pinned binding (fetched, raw; diffed).
-* `crates/adapters/`: `kraken/src/execution/spot.rs`, `binance/src/spot/execution.rs`,
-  `bybit/src/execution.rs`, `interactive_brokers/src/execution/core.rs`, `coinbase/src/execution.rs`,
-  `betfair/src/execution.rs`, `okx/src/execution.rs`, `okx/src/websocket/client.rs`: cancel-all, batch
-  cancel, Kraken's trigger mapping,
-  Coinbase's `OrderContext` (fetched, raw).
-* `crates/trading/src/strategy/mod.rs` (`cancel_all_orders`, `strategy_only`) and
-  `crates/testkit/src/testers/exec/strategy.rs` (`on_stop`) (fetched, raw).
-* `docs/concepts/orders/index.md` ("Trigger type"), `docs/concepts/orders/stop_market.md`, and
-  https://nautilustrader.io/docs/md/latest/developer_guide/spec_exec_testing.md, groups 3 to 5 (fetched, raw).
-* NautilusTrader `v2.0.0rc8` and alpaca-py 0.45.0 as installed: hook and `generate_*` signatures,
-  `CancelAllOrders`, `ClientCache.orders_open` and `orders_inflight`, `StopOrderRequest`,
-  `StopLimitOrderRequest` (read with `inspect`).
-* https://docs.alpaca.markets/us/reference/deleteallorders-1.md (account-wide, 207 per order),
-  `deleteorderbyorderid-1.md` (422 or 204), https://docs.alpaca.markets/us/llms.txt "Orders" (no
-  cancel-by-list) and https://docs.alpaca.markets/us/docs/orders-at-alpaca.md: stop and stop-limit orders,
-  their sub-penny rule, the whole-share and extended-hours tables, "Order Lifecycle", "Order Handling
-  Standards" (fetched, raw; tables read with markup stripped).
+* https://nautilustrader.io/docs/md/latest/developer_guide/python_adapters.md: the order hooks and the batch
+  default, as at the pin but two version lines (fetched, raw; diffed).
+  `docs/concepts/execution/policies.md`: the failure events, "parse failures after transmission"; `latest`
+  adds `OrderCancelDenied` and `OrderModifyDenied` (fetched, raw; diffed). `docs/concepts/orders/index.md`
+  and `stop_market.md`: the trigger types (fetched, raw).
+  https://nautilustrader.io/docs/md/latest/developer_guide/spec_exec_testing.md: groups 3 to 5, the TC-E30
+  and TC-E41 cards, `ExecTester`'s setup (fetched, raw).
+* `crates/adapters/` at the pin: cancel-all and batch cancel in `kraken/src/execution/spot.rs`,
+  `binance/src/spot/execution.rs`, `bybit/src/execution.rs`, `interactive_brokers/src/execution/core.rs`,
+  `coinbase/src/execution.rs`, `betfair/src/execution.rs`, `okx/src/execution.rs` and
+  `okx/src/websocket/client.rs`; Kraken's trigger mapping; Coinbase's `OrderContext`; Binance's
+  `modify_order`, both paths (fetched, raw). `crates/trading/src/strategy/mod.rs`: `strategy_only`;
+  `crates/testkit/src/testers/exec/strategy.rs`: `on_stop` (fetched, raw).
+* https://docs.alpaca.markets/us/: `reference/deleteallorders-1.md` (account-wide, 207 per order),
+  `reference/deleteorderbyorderid-1.md` (422 or 204), `reference/patchorderbyorderid-1.md` (the body, the
+  answer, no error status), `docs/orders-at-alpaca.md` (stop rules and the time-in-force tables, read with
+  markup stripped), `docs/websocket-streaming.md` (the events; none for an election), `llms.txt` "Orders"
+  (no cancel-by-list) (fetched, raw).
 * https://github.com/alpacahq/alpaca-py `v0.45.0`, `tests/trading/trading_client/test_order_routes.py`: the
   paper base URL mocked for orders and replaces (fetched, raw).
-* Paper runs, logs kept outside the repo: TC-E41 as written, the sell refused 241 times with the 403 above;
-  of the five runs that failed after it, two on the test's own code, one on connect timeouts to Alpaca (it
-  answered again at once), two refused to start on open AAPL orders already on the account; then all
-  passed.
+* Paper, 2026-11-10, logs kept outside the repo: the replace observation, 18:52 UTC, 3 runs through
+  alpaca-py with `raw_data=True`; TC-E41 as written, the sell refused 241 times; five failed runs, two on the
+  test's code, one on connect timeouts, two refusing to start on open orders on the account; then all passed.
 * NautilusTrader `RELEASES.md`: v2.0.0rc9, tagged 2026-11-10, adds `OrderCancelDenied` and
-  `OrderModifyDenied` (read by the second reader). The pin stays rc8 until it moves through `adopt-upstream`.
-* Second reader, 2026-11-10 (`evidence-verifier`), twice: the cancel-all decision stands. Corrected above:
-  "never wider than the command"; Binance spot and Bybit select from the cache only for a sided command; the
-  retry argument against option 1; the 422 exception; who skips `OrderPendingCancel`; sources for the
-  pending-cancel skip and for no cancel-by-list endpoint; option 3 added.
+  `OrderModifyDenied` (read by the second reader); the pin stays rc8 until it moves through
+  `adopt-upstream`.
+* Second reader (`evidence-verifier`), 2026-11-10, on cancel-all twice, stops once and modify once: the
+  decisions stand. Corrected above: "never wider than the command"; Binance spot and Bybit select from the
+  cache only for a sided command; the retry argument; the 422 exception; who skips `OrderPendingCancel`;
+  Kraken's trigger mapping; the run count; sources for the pending-cancel skip and no cancel-by-list; option
+  3 added; the documented client order ID; no source for a 403 on a replace; TC-E30's criterion; Binance's
+  two paths.
