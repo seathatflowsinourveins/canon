@@ -224,7 +224,8 @@ Each is stated in `execution.py`'s header, with its source.
   observed on paper and is asserted by `test_paper_replace.py`
   ([ADR 0042](../../docs/adr/0042-alpaca-adapter-modify.md)).
 * **Cancel-all** cancels the node's open and in-flight orders for the command's instrument, and side if
-  it names one, each by ID, one at a time, as a single cancel does, skipping one already pending cancel;
+  it names one, each by ID, one at a time, as a single cancel does; one already pending cancel is canceled
+  again, after the others, since its first cancel may have had no answer;
   a refused one gets `OrderCancelRejected`, and after a refusal or a failure the rest go on. Alpaca's "Delete All Orders" cancels every open order of the
   account, so it is not called. A strategy sends the command only with `strategy_only=False`, and it then
   covers every strategy's orders; with the default, the strategy cancels its own orders one by one
