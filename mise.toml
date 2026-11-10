@@ -39,8 +39,12 @@ for a in ALPACA_API_KEY ALPACA_SECRET_KEY; do
     echo "paper:store: $a is already in the login keychain; run: mise run paper:remove" >&2; exit 1
   fi
 done
+# Echo off before either prompt shows: a silent read turns it off only after its prompt, so a value typed
+# or pasted at once could show (observed with bash 3.2; ADR 0033). It is back on however the task ends.
+trap 'stty echo' EXIT; trap 'exit 130' INT TERM HUP; stty -echo
 read -rsp "Alpaca paper API key ID (hidden): " key; echo
 read -rsp "Alpaca paper secret key (hidden): " secret; echo
+stty echo
 if [ -z "$key" ] || [ -z "$secret" ]; then echo "paper:store: both values are needed; nothing stored" >&2; exit 1; fi
 # Alpaca: "Live keys with an AK... prefix, these prefixes are visual hints" (alpaca.markets/learn,
 # api-key-security-best-practices-for-alpaca-builders). A hint can refuse a key, never accept one.
@@ -54,8 +58,14 @@ case "$code" in
   401|403) echo "paper:store: refused. Alpaca's paper API answered $code: this is not a working paper pair (a live pair is refused there). Nothing stored." >&2; exit 1 ;;
   *) echo "paper:store: could not check the pair (Alpaca's paper API: $code). Nothing stored; try again." >&2; exit 1 ;;
 esac
-# -w last, its value on stdin twice (the prompt and the retype), so it is in no command line or file.
-store() { printf '%s\n%s\n' "$2" "$2" | /usr/bin/security add-generic-password -a "$1" -s "$svc" -l "Alpaca paper $1" -w >/dev/null 2>&1; }
+# Not `-w` last: on a terminal security prompts there and never reads a pipe (ADR 0033). `security -i` takes
+# commands on stdin and -X the value as hex (man security), so security parses only [0-9a-f] for it, and the
+# value is in no process's arguments and no file: printf is bash's own, and od reads the value on stdin.
+store() {
+  local hex
+  hex=$(printf '%s' "$2" | od -An -tx1 | tr -dc 0-9a-f)
+  printf 'add-generic-password -a %s -s %s -l Alpaca-paper-%s -X %s\n' "$1" "$svc" "$1" "$hex" | /usr/bin/security -i >/dev/null 2>&1
+}
 same() { [ "$(/usr/bin/security find-generic-password -s "$svc" -a "$1" -w 2>/dev/null)" = "$2" ]; }
 if store ALPACA_API_KEY "$key" && store ALPACA_SECRET_KEY "$secret" \
    && same ALPACA_API_KEY "$key" && same ALPACA_SECRET_KEY "$secret"; then

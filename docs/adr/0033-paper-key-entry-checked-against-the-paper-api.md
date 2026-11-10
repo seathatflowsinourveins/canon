@@ -38,9 +38,14 @@ A departure from the first design, from the trial:
 
 * **The prompt is the task's, not `security`'s.** With `-w` last, `security` prompts and stores at once,
   before the pair can be checked. So `paper:store` reads both with `read -s`, checks them, then gives each
-  to `security add-generic-password ... -w` on stdin, entry and retype. That stdin is read is observed,
-  not documented, and a single unmatched line stored an empty value with exit 0. So each item is read
-  back and compared, and on any difference both are deleted.
+  to `security -i` on stdin as one `add-generic-password -a <account> -s <service> -X <hex>` command:
+  `-i` takes commands on stdin and `-X` the value as hex, both documented. The value is in no process's
+  arguments (`printf` is bash's own; `od` reads it on stdin). `-w <value>` in that command would work
+  too, but `-i`'s quoting is not documented; with `-X` it parses only `[0-9a-f]`, one `od` more. Each
+  item is read back and compared, and on any difference both are deleted.
+* **Not `-w` on stdin.** The first build piped the value to `add-generic-password ... -w`. On a terminal
+  `security` prompts there and never reads the pipe, so from the owner's terminal it asked again and
+  stored nothing (Confirmation). It had been tried only with stdin not a terminal, where it reads stdin.
 
 ### Consequences
 
@@ -62,6 +67,29 @@ The trial, 2026-11-10, mise 2026.11.5 and macOS 27.2, with made-up values under 
   exited 1; a made-up key ID starting `AK` was refused before any request ("starts with AK"), exit 1.
 * UNVERIFIED: `paper:store` with a real paper pair (none was used); the code Alpaca's paper API gives a
   live pair.
+
+The second trial, 2026-11-10, after `paper:store` from the owner's terminal showed `security`'s prompts
+and stored nothing. Same versions, made-up values, throwaway services, on a pty made by a script:
+
+* The cause. `printf 'v\nv\n' | security add-generic-password ... -w` on a pty prompted there and waited;
+  a value typed at the pty was stored, not the piped one; two empty answers stored an empty value, exit 0.
+  Without a terminal it stored the piped value. The first build through `mise run`, a `curl` stand-in
+  answering 200: `security`'s two prompts twice despite `/dev/null`, "both items removed", exit 1.
+* The fix, run the same way: only the task's prompts and "stored" line, exit 0, both read back equal.
+  `security -i` wrote nothing to the pty; an item already there gave exit 45, bad hex 2, neither message
+  holding the value. The `AK`, empty-value and no-terminal refusals held. `paper:check`, `paper:remove`
+  and `paper:test`'s read gave no prompt on a pty. Shellcheck 0.11.0 passed. Every throwaway item was
+  deleted (`find-generic-password` exit 44). The owner then stored a real pair from a terminal with this
+  build on the first try; `paper:check` showed both items. That run predates the two review changes below.
+* `scripts/test-lanes` runs `paper:store`'s body from `mise.toml`, service swapped, on an `expect` pty
+  against the real `security` with a `curl` stand-in: stored and equal with no `security` prompt, refused
+  when present, nothing stored on 401, items deleted on exit. It skips, saying why, without
+  `/usr/bin/security` (the hosted runner), `expect`, a pty or a writable default keychain. It failed four
+  cases on the first build, none on the fix.
+* After review. Typed the instant its prompt appeared, a value was echoed in 5 of 30 runs of two `read
+  -s` (bash 3.2; why is UNVERIFIED). `paper:store` now turns echo off before either prompt and back on
+  however it ends: 0 of 30, and Ctrl-C at a prompt left echo on, exit 130. The items are labelled
+  `Alpaca-paper-<account>`, a label with no space, as `-i`'s quoting is not documented.
 
 ## Evidence
 
@@ -87,6 +115,15 @@ Read 2026-11-10.
   hints" sentence, and "The authoritative security boundary is the host environment itself" (found by the
   second reader; fetched, sentence read verbatim; the page gives no date).
 * `man curl` (8.7.1) — "Using @- makes curl read the header file from stdin" (read). The trial (run).
+* `man security` on this machine, read 2026-11-10 for the second trial — "If the -i or -p options are
+  provided, security will enter interactive mode and allow the user to enter multiple commands on
+  stdin"; `add-generic-password` `-X`: "Specify password data to be added as a hexadecimal string". It
+  says nothing of where `-w`'s prompt reads; the second trial showed the terminal (read; run).
+* 2026-11-10: the first build's `-w` on stdin stored nothing from a terminal; `paper:store` now uses
+  `security -i` with `-X`, and `scripts/test-lanes` runs it on a pty against the real `security`
+  (second trial above). `/code-review` (high) of that change: ten findings; five fixed (the echo race,
+  a probe with no time limit, the probe item unchecked, Tera delimiters unchecked, both items one label),
+  five left (the real keychain is the point of the case; the rest minor). All fixed above.
 * Reviews, 2026-11-10. `/code-review` (high): nine findings; five fixed (an empty item passing
   `paper:test`, no terminal, a network failure blamed on the pair, the service name unchecked, the README
   overstating who can read the item), the two permission rules recorded as open, two left as they are.
