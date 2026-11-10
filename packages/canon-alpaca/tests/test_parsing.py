@@ -71,6 +71,16 @@ def test_non_equity_asset_is_refused(alpaca) -> None:
         parse_equity(alpaca.asset(**{"class": "crypto", "symbol": "BTC/USD"}), TS_INIT)
 
 
+def test_inactive_asset_is_refused_naming_the_id(alpaca) -> None:
+    with pytest.raises(ValueError, match="AAPL.ALPACA is inactive, not active"):
+        parse_equity(alpaca.asset(status="inactive"), TS_INIT)
+
+
+def test_asset_not_tradable_on_alpaca_is_kept_for_its_data(alpaca) -> None:
+    equity = parse_equity(alpaca.asset(tradable=False), TS_INIT)
+    assert equity.info["tradable"] is False
+
+
 def test_bar_is_stamped_at_open_and_initialised_at_close(alpaca, equity) -> None:
     bar_type = BarType.from_str("AAPL.ALPACA-1-HOUR-LAST-EXTERNAL")
     bar = parse_bar(AlpacaBar("AAPL", alpaca.BAR_AAPL), bar_type, equity)
@@ -103,6 +113,43 @@ def test_quote_keeps_round_lot_sizes(alpaca, equity) -> None:
     assert tick.ask_size == Quantity.from_int(4)
     assert tick.ts_event == 1_614_009_105_335_689_000  # alpaca-py's datetime drops the last 322 ns
     assert tick.ts_init == TS_INIT
+
+
+@pytest.mark.parametrize(
+    ("changes", "side"),
+    [
+        ({"bp": 0.0, "bs": 0}, "bid"),
+        ({"ap": 0.0, "as": 0}, "ask"),
+        ({"bp": -1.0}, "bid"),
+    ],
+)
+def test_one_sided_quote_is_refused_naming_the_side(alpaca, equity, changes, side) -> None:
+    with pytest.raises(ValueError, match=f"has {side} price"):
+        parse_quote(alpaca.quote(**changes), equity, TS_INIT)
+
+
+def test_bar_price_finer_than_the_precision_is_refused(alpaca, equity) -> None:
+    bar_type = BarType.from_str("AAPL.ALPACA-1-MINUTE-LAST-EXTERNAL")
+    raw = {**alpaca.BAR_AAPL, "h": 178.26005}
+    with pytest.raises(
+        ValueError, match="high 178.26005 is not representable at price precision 4"
+    ):
+        parse_bar(AlpacaBar("AAPL", raw), bar_type, equity)
+
+
+def test_quote_price_finer_than_the_precision_is_refused(alpaca, equity) -> None:
+    with pytest.raises(ValueError, match="ask price 87.68001 is not representable"):
+        parse_quote(alpaca.quote(ap=87.68001), equity, TS_INIT)
+
+
+def test_trade_price_finer_than_the_precision_is_refused(alpaca, equity) -> None:
+    with pytest.raises(ValueError, match="trade price 126.55001 is not representable"):
+        parse_trade(alpaca.trade(p=126.55001), equity, TS_INIT)
+
+
+def test_sub_penny_price_at_the_precision_is_kept(alpaca, equity) -> None:
+    tick = parse_trade(alpaca.trade(p=0.1234), equity, TS_INIT)
+    assert tick.price == Price.from_str("0.1234")
 
 
 def test_trade_has_venue_id_and_no_aggressor(alpaca, equity) -> None:

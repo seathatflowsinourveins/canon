@@ -86,6 +86,51 @@ def test_load_ids_names_every_failure_and_keeps_the_rest(alpaca) -> None:
     assert [i.id for i in provider.list_all()] == [AAPL]
 
 
+def test_load_ids_attempts_every_id_after_a_network_error(alpaca) -> None:
+    client = alpaca.TradingClient()
+    # alpaca-py lets requests' network errors through; requests.RequestException derives from OSError.
+    client.errors["NOPE"] = ConnectionError("connection reset")
+    provider = AlpacaInstrumentProvider(assets_client=client)
+
+    with pytest.raises(RuntimeError, match="NOPE.ALPACA: connection reset"):
+        asyncio.run(provider.load_ids_async([InstrumentId.from_str("NOPE.ALPACA"), AAPL]))
+
+    assert client.symbol_requests == ["NOPE", "AAPL"]
+    assert [i.id for i in provider.list_all()] == [AAPL]
+
+
+def test_load_ids_refuses_an_asset_for_another_symbol(alpaca) -> None:
+    client = alpaca.TradingClient()
+    client.get_asset = lambda symbol: alpaca.asset(symbol="AAPLX")
+    provider = AlpacaInstrumentProvider(assets_client=client)
+
+    with pytest.raises(RuntimeError, match="AAPL.ALPACA: Alpaca returned asset 'AAPLX' for 'AAPL'"):
+        asyncio.run(provider.load_ids_async([AAPL]))
+    assert provider.list_all() == []
+
+
+def test_load_ids_refuses_an_inactive_asset(alpaca) -> None:
+    client = alpaca.TradingClient([{**alpaca.ASSET_AAPL, "status": "inactive"}])
+    provider = AlpacaInstrumentProvider(assets_client=client)
+
+    with pytest.raises(RuntimeError, match="AAPL.ALPACA: AAPL.ALPACA is inactive"):
+        asyncio.run(provider.load_ids_async([AAPL]))
+
+
+def test_load_all_refuses_a_status_filter_other_than_active(alpaca) -> None:
+    client = alpaca.TradingClient()
+    provider = AlpacaInstrumentProvider(assets_client=client)
+    with pytest.raises(ValueError, match="only active assets"):
+        asyncio.run(provider.load_all_async({"status": "inactive"}))
+    assert client.all_requests == []
+
+
+def test_filter_callable_is_refused_at_construction() -> None:
+    config = InstrumentProviderConfig(load_all=True, filter_callable="my_module:keep")
+    with pytest.raises(ValueError, match="filter_callable"):
+        AlpacaInstrumentProvider(config)
+
+
 def test_load_ids_refuses_other_venues(alpaca) -> None:
     client = alpaca.TradingClient()
     provider = AlpacaInstrumentProvider(assets_client=client)

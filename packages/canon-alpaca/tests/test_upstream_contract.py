@@ -60,3 +60,27 @@ def test_alpaca_trading_client_defaults_to_paper() -> None:
     from alpaca.trading.client import TradingClient
 
     assert inspect.signature(TradingClient.__init__).parameters["paper"].default is True
+
+
+def stock_data_stream():
+    """alpaca-py's real stream, built offline: it connects only once `run()` is called."""
+    from alpaca.data.live.stock import StockDataStream
+
+    return StockDataStream(api_key="offline-placeholder", secret_key="offline-placeholder")
+
+
+@pytest.mark.parametrize("make", ["real", "stand-in"])
+def test_stream_stand_in_matches_alpaca_py(make, alpaca) -> None:
+    """The conftest stand-in refuses and keeps what alpaca-py's `StockDataStream` does, before it runs."""
+    stream = stock_data_stream() if make == "real" else alpaca.Stream()
+
+    async def handler(_: object) -> None: ...
+
+    with pytest.raises(ValueError, match="coroutine"):
+        stream.subscribe_quotes(lambda _: None, "AAPL")
+    with pytest.raises(KeyError):
+        stream.unsubscribe_trades("AAPL")  # never subscribed
+    stream.subscribe_trades(handler, "AAPL")
+    stream.register_trade_cancels(handler)
+    stream.register_trade_corrections(handler)
+    stream.unsubscribe_trades("AAPL")

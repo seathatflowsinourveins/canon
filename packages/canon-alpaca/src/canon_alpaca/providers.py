@@ -5,6 +5,11 @@ guide, "Instrument providers"): override `load_all_async` and `load_ids_async`, 
 `add`, and leave `initialize` and the synchronous loaders to the base class. The data client sends the
 loaded instruments to the core.
 
+`InstrumentProviderConfig.filter_callable` is refused at construction: the Python `InstrumentProvider`
+base class in v2.0.0rc8 (`nautilus_trader/live/providers.py`) never reads it, and upstream's own Binance
+adapter refuses it in v2 ("Binance v2 does not support instrument filter_callable"), so there is no
+supported way to apply it.
+
 Venue side: alpaca-py 0.45.0 `TradingClient.get_all_assets(GetAssetsRequest)` and
 `TradingClient.get_asset(symbol)`, which call Alpaca's `/v2/assets` endpoints ("Get Assets" and "Get an
 Asset by ID or Symbol", https://docs.alpaca.markets/us/reference/get-v2-assets-1.md). `TradingClient` is
@@ -19,6 +24,8 @@ Known limits:
 * The assets endpoint carries no timestamp, so `ts_event` and `ts_init` are the time of the load.
 * alpaca-py's REST clients are synchronous, so each call runs in a worker thread (`asyncio.to_thread`)
   to keep the node's event loop free.
+* Only active assets are loaded (alpaca-py `Asset.status`); an inactive one is refused, and so is a
+  `status` filter other than `active`.
 """
 
 from __future__ import annotations
@@ -90,18 +97,28 @@ def assets_request(filters: dict | None) -> GetAssetsRequest:
         raise ValueError(
             f"Unsupported Alpaca asset filters {sorted(unknown)}; supported: {sorted(FILTER_KEYS)}",
         )
+    status = filters.get("status", AssetStatus.ACTIVE)
+    if status != AssetStatus.ACTIVE:
+        raise ValueError(f"Alpaca asset filter status={status!r}: only active assets are loaded")
     return GetAssetsRequest(
         asset_class=AssetClass.US_EQUITY,
-        status=filters.get("status", AssetStatus.ACTIVE),
+        status=status,
         exchange=filters.get("exchange"),
         attributes=filters.get("attributes"),
     )
 
 
 def parse_equity(asset: Asset, ts_init: int) -> Equity:
-    """Convert one Alpaca asset into a NautilusTrader `Equity` keyed on the Alpaca venue."""
+    """Convert one active Alpaca asset into a NautilusTrader `Equity` keyed on the Alpaca venue.
+
+    An asset that is not tradable on Alpaca (`tradable=False`) is accepted: this adapter serves market
+    data only, and a symbol's data does not depend on whether Alpaca lets the account trade it. The flag
+    is kept in `Equity.info`; an execution client must refuse orders for it.
+    """
     if asset.asset_class != AssetClass.US_EQUITY:
         raise ValueError(f"{asset.symbol} is {asset.asset_class.value}, not us_equity")
+    if asset.status != AssetStatus.ACTIVE:
+        raise ValueError(f"{asset.symbol}.{VENUE} is {asset.status.value}, not active")
     symbol = Symbol(asset.symbol)
     return Equity(
         instrument_id=InstrumentId(symbol, VENUE),
@@ -137,6 +154,11 @@ class AlpacaInstrumentProvider(InstrumentProvider):
         assets_client: AssetsClient | None = None,
     ) -> None:
         """Retain configuration only. The alpaca-py client is built on the first load."""
+        if config is not None and config.filter_callable is not None:
+            raise ValueError(
+                "AlpacaInstrumentProvider does not support InstrumentProviderConfig.filter_callable; "
+                "use load_ids, or load_all with filters",
+            )
         super().__init__(config)
         self._assets_client = assets_client
 
@@ -178,12 +200,18 @@ class AlpacaInstrumentProvider(InstrumentProvider):
         client = self._client()
         failures = []
         for instrument_id in instrument_ids:
+            symbol = instrument_id.symbol.value
             try:
-                asset = await asyncio.to_thread(client.get_asset, instrument_id.symbol.value)
+                asset = await asyncio.to_thread(client.get_asset, symbol)
                 if not isinstance(asset, Asset):
                     raise TypeError("alpaca-py returned raw asset data")
+                if asset.symbol != symbol:
+                    raise ValueError(f"Alpaca returned asset {asset.symbol!r} for {symbol!r}")
                 self.add(parse_equity(asset, time.time_ns()))
-            except (APIError, ValueError, TypeError) as e:
+            # alpaca-py turns HTTP error responses into APIError and lets the `requests` exceptions for
+            # network failures through (`RESTClient._one_request`); those derive from OSError
+            # (`requests.exceptions.RequestException(IOError)`). Validation errors are ValueErrors.
+            except (APIError, OSError, ValueError, TypeError) as e:
                 failures.append(f"{instrument_id}: {e}")
         if failures:
             raise RuntimeError(f"Could not load Alpaca instruments: {'; '.join(failures)}")
