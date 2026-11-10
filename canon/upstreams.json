@@ -533,10 +533,10 @@
       "id": "antigravity-cli",
       "field": "agent-harness",
       "repo": "google-antigravity/antigravity-cli",
-      "track": "tag:1.5.3",
+      "track": "tag:1.5.5",
       "role": "tool",
       "license": "UNVERIFIED (no licence file in the repository; GitHub reports none)",
-      "why": "Google's Antigravity CLI (agy), a review-only Orca worker from another model family (ADR 0045, under ADR 0043's terms). Installed machine-level by the owner at 1.5.3 (aqua:google-antigravity/antigravity-cli), not in mise.toml; check with agy --version. The installed binary reports 1.5.5: its background self-updater moves it outside the pin. Its troubleshooting page documents AGY_CLI_DISABLE_AUTO_UPDATE=true to turn that off; it is not set (ADR 0045).",
+      "why": "Google's Antigravity CLI (agy), a review-only Orca worker from another model family (ADR 0045, under ADR 0043's terms). Installed machine-level by the owner (aqua:google-antigravity/antigravity-cli), not in mise.toml; check with agy --version. Its background self-updater moved it from 1.5.3 to 1.5.5, and the pin followed after the release notes of 1.5.4 and 1.5.5 were read (Auto mode for agy acp, a swarm preview, fixes; nothing that changes a review-only reader). Its troubleshooting page documents AGY_CLI_DISABLE_AUTO_UPDATE=true, set in the shell profile, to stop the updater; scripts/bootstrap --install writes it to ~/.zshrc (ADR 0045).",
       "evidence": [
         "https://github.com/google-antigravity/antigravity-cli/releases",
         "https://raw.githubusercontent.com/google-antigravity/antigravity-cli/main/README.md",
@@ -555,6 +555,7 @@
       "why": "DeepSeek Harness (npm @deepseek-ai/dsh), the engine under dsh-tui, a review-only Orca worker from another model family (ADR 0045, under ADR 0043's terms). Every tag is a pre-release. Installed machine-level by the owner (npm:@deepseek-ai/dsh 0.2.1-rc.3, with pnpm for its profile), not in mise.toml; check with dsh --version. Seven community plugins and two of its own hook packages installed machine-level into the dsh-tui profile, chosen for workflow from a community list that is not a review: aegis 2.14.2 (GanyuanRan/Aegis at commit 0461c211e4d8, MIT), dsh-doublecheck 0.9.29 (PerryLink, Apache-2.0), dsh-advisor 0.6.4 (omdsh-dev, MIT), dsh-github-skills 0.2.1 (Starfie1d1272, Apache-2.0), dsh-llm-fallbacks 0.6.12 (omdsh-dev, MIT by its LICENSE file; npm gives none), dsh-memento 0.5.28 (PerryLink, Apache-2.0), dsh-tui-find 0.5.2 (xiaoxiaohaigui, MIT), and the hook packages @deepseek-ai/dsh-hooks-claude-code and @deepseek-ai/dsh-hook-protocol 0.2.1-rc.3 (deepseek-ai/deepseek-harness, MIT). Versions and licences from the profile's installed package files; none was read beyond them.",
       "evidence": [
         "https://github.com/deepseek-ai/deepseek-harness",
+        "https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/dsh-v0.2.1-rc.3/packages/session/session-log-deepseek/README.md",
         "https://registry.npmjs.org/@deepseek-ai/dsh",
         "https://registry.npmjs.org/dsh-doublecheck/0.9.29",
         "https://registry.npmjs.org/dsh-advisor/0.6.4",
@@ -575,11 +576,12 @@
       "track": "tag:v0.17.0",
       "role": "tool",
       "license": "MIT",
-      "why": "Community terminal interface for DeepSeek Harness, the program Orca launches for it (dsh-tui .) under agent id dsh (its CLI bundle); which versions Orca's fixtures used is UNVERIFIED; 0.17.0 follows dsh 0.2.1-rc.3 (ADR 0045). Installed machine-level by the owner (npm:@deepseek-harness-tui/dsh-tui 0.17.0), not in mise.toml; its profile lives in the user's home and its update command updates the profile and aligns the launcher, outside the pin. Its profiles send session logs to the configured base URL by default.",
+      "why": "Community terminal interface for DeepSeek Harness, the program Orca launches for it (dsh-tui .) under agent id dsh (its CLI bundle); which versions Orca's fixtures used is UNVERIFIED; 0.17.0 follows dsh 0.2.1-rc.3 (ADR 0045). Installed machine-level by the owner (npm:@deepseek-harness-tui/dsh-tui 0.17.0), not in mise.toml; its profile lives in the user's home and its update command updates the profile and aligns the launcher, outside the pin. Its profiles send session logs to the configured base URL by default (session-log-deepseek.enabled, true); its configuration page at v0.17.0 documents a user profile patch row that sets it false, which scripts/bootstrap --install adds to the dsh-tui profile with the dsh-memento row memento.enabled false (ADR 0045).",
       "evidence": [
         "https://github.com/ccch1mneyyy/dsh-TUI/releases",
         "https://raw.githubusercontent.com/ccch1mneyyy/dsh-TUI/v0.17.0/README.md",
         "https://raw.githubusercontent.com/ccch1mneyyy/dsh-TUI/main/README.md",
+        "https://raw.githubusercontent.com/ccch1mneyyy/dsh-TUI/v0.17.0/docs/configuration.en.md",
         "https://github.com/stablyai/orca/issues/38131",
         "https://github.com/stablyai/orca/issues/26594"
       ],

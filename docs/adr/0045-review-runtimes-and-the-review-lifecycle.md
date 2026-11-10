@@ -43,11 +43,17 @@ owner's delegation of 2026-11-10.
      one release, past its release-age guard on the owner's word: no lock pin; `mise upgrade` moves it.
    * *Antigravity* (Google, no licence file): `--sandbox`, `--mode plan`; keyring sign-in; Google
      collects interactions data unless opted out. Its self-updater moved it to 1.5.5 past the 1.5.3 pin;
-     `AGY_CLI_DISABLE_AUTO_UPDATE=true` stops that, the owner's to set.
+     the pin followed once 1.5.4's and 1.5.5's notes were read (Auto mode for `agy acp`, a `/swarm`
+     preview, hook-input fields, models, fixes; none changes a reader's terms; a brief starts no swarm).
+     Its docs set `AGY_CLI_DISABLE_AUTO_UPDATE=true` in the shell profile, so `scripts/bootstrap
+     --install` writes it to `~/.zshrc`.
    * *DeepSeek Harness* (MIT, pre-release only; agent id `dsh`, no entry in the map): API key in its own
      file (not read). Orca launches `dsh-tui .`, whose `/update` moves past the pin. Open Orca issues: a
      first prompt lost past 30 s (#38131), `git` failing in its terminals (#26594). Session logs go to
-     the configured base URL by default. Seven community plugins and two of its own hook packages, from
+     the configured base URL by default (`session-log-deepseek`); dsh-TUI documents a user-patch row
+     that turns this off, and `scripts/bootstrap --install` adds it, with dsh-memento's master switch
+     off (`memento`), to `profiles/dsh-tui/cordis.patch.yml`, keeping the owner's rows (rule 6). Seven
+     community plugins and two of its own hook packages, from
      a list that is not a review, run in its profile (registry entry `deepseek-harness`).
 3. **The review lifecycle.**
    1. A Claude lane builds the change, runs `/code-review` (and the `evidence-verifier` on a record),
@@ -65,23 +71,37 @@ owner's delegation of 2026-11-10.
       reproduce is recorded as such.
 4. **Which reviewer reads what**, from the trials (Confirmation): Codex reproduces by running; Muse reads
    widely and finds by reading; Antigravity runs tests and writes reproductions but is slowest;
-   DeepSeek Harness has shown nothing yet. The highest-risk paths get two families: Codex and Muse.
-   Antigravity stands in for either; DeepSeek Harness gets nothing until a trial reports. A Codex brief
+   DeepSeek Harness, on one trial, finds by running probes. The highest-risk paths get two families:
+   Codex and Muse. Antigravity stands in for either, and so may DeepSeek Harness, only while
+   `scripts/bootstrap --check` shows its review patch ok (rule 6). A Codex brief
    says an error unrelated to the change is not a failed check. This rests on a handful of reviews and
    is revisited at `review-by`.
-5. **The pins**: `muse-code` (`url`, no lock pin), `antigravity-cli` at `tag:1.5.3`, `deepseek-harness`
+5. **The pins**: `muse-code` (`url`, no lock pin), `antigravity-cli` (see below), `deepseek-harness`
    at `tag:dsh-v0.2.1-rc.3`, `dsh-tui` at `tag:v0.17.0`, and `pnpm` at `tag:v10.34.9` for `dsh-tui`'s
-   profile, the installed versions; each already has newer releases, which `outdated` reports. All are
+   profile, the installed versions; each already has newer releases, which `outdated` reports.
+   `antigravity-cli` was adopted at `tag:1.5.3` and moved to `tag:1.5.5`, the version its updater had
+   installed. All are
    machine-level, not in `mise.toml`, as ADR 0043 did for Codex. `canon/models.json`
    and ADR 0005 are unchanged: these are readers, not lanes.
+6. **DeepSeek Harness after its trial** (decided by the coordinator under the owner's delegation of
+   2026-11-10, from the trial in Confirmation): it reads under ADR 0043's terms, as rule 4 says, with two
+   conditions. Its profile's session-log upload is off, since every request otherwise carries the
+   session's prompts, code and tool results to the base URL. Its cross-session memory is off, not
+   scoped: ADR 0046 rule 2 keeps from a reviewer what it should not have seen, and dsh-memento both
+   injects a memory snapshot and recalls past sessions' history (`memory_recall`, 30 days by default);
+   the profile is shared by every launch and Orca's `dsh-tui .` takes no per-review overlay, so no
+   switch scopes it to one review. Until the owner runs `scripts/bootstrap --install` and `--check`
+   shows the patch ok, the coordinator starts no DeepSeek Harness review. Each review gets a new
+   workspace, as rule 1 says (the two trial attempts shared one), and its brief says to write the report
+   early, after a first attempt that stalled.
 
 ### Consequences
 
 * Good: three more families can read the riskiest code, and the review starts from the task graph rather
   than from memory. By the trial reports, Muse's and Codex's findings overlapped in three of nine.
 * Bad: each sign-in is in reach of an unsandboxed worker (ADR 0043). Antigravity updates itself past its
-  pin, Muse and `dsh-tui` on any update. Nine packages no one here read run inside DeepSeek Harness. More
-  readers, more claims for the owning lane to reproduce.
+  pin until `~/.zshrc` sets its switch, Muse and `dsh-tui` on any update. Nine packages no one here read run
+  inside DeepSeek Harness. More readers, more claims for the owning lane to reproduce.
 * Leaving: delete the entry and pin, drop the agent from `AGENTS.md`, `mise uninstall -g` the tool (the
   owner's); this record is then superseded.
 
@@ -98,10 +118,45 @@ workspace, left it unchanged and reported through Orca.
 * Antigravity (1.5.5) on commit `3a00f61`: ran the 64 offline execution-client tests, wrote in-memory
   `LiveNode` reproductions, reported ten findings it calls confirmed, in most of an hour, the longest of
   the four. How many are real or repeat others' is pending with the owning lane.
-* DeepSeek Harness: no report by the time of writing.
+* DeepSeek Harness (`dsh` 0.2.1-rc.3, `dsh-tui` 0.17.0) on commit `3a00f61`, the brief the other three had.
+  A first attempt stalled for about two hours after 27 tool calls with no output and was stopped. The retry,
+  briefed to write its report early, took about ten minutes by its session log. It ran the offline
+  execution-client tests, 74 by its report where Antigravity's gave 64 (not reconciled), after setting
+  `UV_CACHE_DIR` to a temporary folder (its sandbox refused uv's cache under `~/.cache`), wrote probes only
+  outside the workspace, and reported eight findings, six confirmed by running and two by reading. Against
+  the ten defects `evals/review/cases/order-modify.toml` confirms (one scorer, the coordinator; not a
+  benchmark run):
 
-UNVERIFIED: how Orca applies its bypass-flag map; whether a dependent task becomes ready when its
-dependency fails; whether a reviewer's environment carries any key; Orca's fixture versions for DSH.
+  | Defect | DSH |
+  |---|---|
+  | `filled-replacement-lost-when-replaced-missed` | found (finding 1) |
+  | `refused-replace-rejected-twice` | found (5; 7 says its test cannot tell the paths apart) |
+  | `replaced-applied-twice` | missed |
+  | `replacement-fill-before-replaced` | disputed, so missed (4 names `_apply` but a lost `replaced` and a cache-index error, not the old terms or a late update) |
+  | `late-cancel-of-replaced-order` | missed |
+  | `pending-replace-fails-startup` | missed |
+  | `replacement-moved-on-before-replaced` | missed |
+  | `second-modify-refusal-taken-for-retry` | found (2, after a restart rather than a second modify; same check) |
+  | `answers-kept-for-the-session` | found (8, by reading) |
+  | `rejected-replacement-after-fill-never-reached` | found (3; 6 says its test passes without it) |
+
+  Five of ten; a second reader's marks agreed on nine. It is not comparable with the others: those ten are
+  their own findings (the case's bias), and the retry was not shown to be independent. Both attempts ran in
+  one workspace folder, not a new one each, and its profile carried dsh-memento, whose `workspace` layer is
+  keyed by that folder and whose `memory_recall` can return the stalled attempt's session; memento's audit
+  table shows the retry's injected snapshot empty. The seven community plugins were added during that first
+  attempt. The brief did not forbid later history: the fix (`52ac69c`) was on `main` before the retry began,
+  and the case's defect list landed about seven minutes into it. Its findings name only `3a00f61`'s code.
+  Its session log went to the base URL by default (the repository is public; the report says no credential
+  was touched).
+
+UNVERIFIED: whether the DSH retry called `memory_recall` (its recall events are declared, not emitted) or
+read later commits; the first attempt's tool-call count and length (its log is compressed, not read);
+whether agy's background updater, started outside an interactive zsh, sees the `~/.zshrc` variable; whether
+a running session honours the two rows (`--dump-config` shows them composed); whether another of the nine
+packages reads past sessions; how Orca applies its bypass-flag map; whether a dependent task becomes ready
+when its dependency fails; whether a reviewer's environment carries any key; Orca's fixture versions for
+DSH.
 
 ## Evidence
 
@@ -117,13 +172,26 @@ Read 2026-11-10. `fetched`: downloaded and searched. "Lane": a model summarised 
   current release rather than a version history" (fetched).
 * https://github.com/google-antigravity/antigravity-cli — 1.5.3 (2026-11-07), 1.5.4, 1.5.5 (2026-11-10); no
   licence (API 404); README: "via the system keyring", data opt-out (`gh`, `curl`). → `099f43f0b0b7`
-  (resolved). https://antigravity.google/docs/cli/troubleshooting/ — a "self-updater that runs in the
-  background"; `AGY_CLI_DISABLE_AUTO_UPDATE` to `true` (lane); the name is in the binary (`strings`).
+  (resolved, the 1.5.3 pin). https://antigravity.google/docs/cli/troubleshooting/ — a "self-updater that
+  runs in the background"; `AGY_CLI_DISABLE_AUTO_UPDATE` to `true` "inside your shell profile (`~/.bashrc`
+  or `~/.zshrc`)" (lane); the name is in the binary (`strings`). Releases 1.5.4 and 1.5.5, notes read (`gh
+  release view`); `tag:1.5.5` → `3e9fbcc9773e` (resolved).
 * https://github.com/deepseek-ai/deepseek-harness — MIT; every release a pre-release (`gh`).
   `tag:dsh-v0.2.1-rc.3` → `1f81c047fc48` (resolved).
 * https://raw.githubusercontent.com/ccch1mneyyy/dsh-TUI/v0.17.0/README.md — MIT; `dsh-tui update` "update
   the profile and align the launcher"; the `main` README: "incremental Session logs to the configured
-  `baseURL`" (fetched). `tag:v0.17.0` → `103834cb1000` (resolved).
+  `baseURL`" (fetched). `tag:v0.17.0` → `103834cb1000` (resolved). Its `docs/configuration.en.md` at
+  `v0.17.0`: user configuration at `$DSH_HOME/profiles/dsh-tui/cordis.patch.yml`, applied last; "its
+  `config` block is replaced as a whole"; `session-log-deepseek.enabled` default `true`; "To stop API
+  request metadata, disable either field in the user profile patch" (fetched).
+* https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/dsh-v0.2.1-rc.3/packages/session/session-log-deepseek/README.md
+  — "`false` stops Session-log upload"; "Re-enabling resumes the unaccepted suffix, including events
+  recorded while disabled" (fetched). dsh-memento 0.5.28's README in the profile — "Override under the
+  `memento` row"; `enabled` "Master switch"; `memory_recall` "recent session-history matches"; store at
+  `$DSH_HOME/dsh-memento/memory.db` (read). `dsh --profile dsh-tui --dump-config` on a copy of the
+  profile, after `scripts/bootstrap`'s merge: both rows composed with `enabled: false` (run).
+* The DSH retry's report and its brief (read; not in this repository); `evals/review/cases/order-modify.toml`
+  (read); the session folder and memento's audit row for the retry (read by the second reader).
 * https://github.com/stablyai/orca/issues/38131, /26594 — open; "30 s submit retry budget", `git` fails in
   DSH terminals (titles, `gh`). https://www.onorca.dev/docs/agents/supported — Antigravity "local
   supervised workers"; bypass flags for "every other agent that exposes one", none named here (lane).
@@ -135,3 +203,6 @@ Read 2026-11-10. `fetched`: downloaded and searched. "Lane": a model summarised 
   https://github.com/pnpm/pnpm/releases/tag/v10.34.9 — MIT (`gh`); → `aa97047a81b4` (resolved).
 * Second reader, 2026-11-10 (`evidence-verifier`): it corrected the package count, the `/update` quote and
   the trial framing, and found Orca's flag map and the newer releases; all above.
+* Second reader, 2026-11-10, after the DSH trial (`evidence-verifier`): the configuration quotes held;
+  it re-marked one defect (six to five of ten), dated the case's defect list to during the retry, found
+  the shared workspace folder and the empty snapshot, and the pins sentence; all above.

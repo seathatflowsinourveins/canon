@@ -26,6 +26,13 @@
 # differing one gets a <name>.canon-proposed copy beside it. It replaces canon/ledger.sh and
 # canon/statusline.sh, keeping a differing previous copy beside each as <name>.replaced-<UTC time>. The
 # installed settings call the scripts in the config directory actually used.
+# --install also sets up the review-only workers (ADR 0045), each as its upstream documents: it adds
+# home/dsh/review.patch.yml's rows (session-log upload off, dsh-memento off) to the dsh-tui profile's user
+# patch, ${DSH_HOME:-~/.dsh}/profiles/dsh-tui/cordis.patch.yml, after the rows already there (dsh-TUI
+# v0.17.0 docs/configuration.en.md), and writes AGY_CLI_DISABLE_AUTO_UPDATE=true into ~/.zshrc, the shell
+# profile Antigravity's troubleshooting page names. A patch that already names either row, or is not a
+# YAML block sequence or [], is left alone with review.patch.yml.canon-proposed beside it to merge by hand;
+# an older canon block is replaced where it stands.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -135,6 +142,45 @@ paper_row() {
   else row "paper key pair" absent "no keychain item for:$miss; to enter the pair: mise run paper:store"; fi
 }
 
+# The review-only workers (ADR 0045). DeepSeek Harness reads its profile's user patch last, a YAML array
+# whose rows override a bundle's row by id, the config block replaced whole (dsh-TUI v0.17.0
+# docs/configuration.en.md, "Profiles and patch layers").
+DSH_PATCH_SRC="$ROOT/home/dsh/review.patch.yml"
+DSH_MARK_BEGIN='# canon bootstrap: review settings'
+DSH_MARK_END='# end canon bootstrap: review settings'
+dsh_profile_dir() { printf '%s/profiles/dsh-tui' "${DSH_HOME:-$HOME/.dsh}"; }
+# A row the user patch could already hold for one of these ids: block or flow style, quoted or not
+DSH_ID_RE='id:[[:space:]]*["'"'"']?(session-log-deepseek|memento)["'"'"']?([[:space:],}#]|$)'
+# dsh_block <file>: the canon block in a patch file, marker to end marker; dsh_outside <file>: every other line
+dsh_block() { awk -v b="$DSH_MARK_BEGIN" -v e="$DSH_MARK_END" 'index($0, b) == 1 && !on && !done { on = 1 } on { print } on && $0 == e { on = 0; done = 1 }' "$1"; }
+dsh_outside() { awk -v b="$DSH_MARK_BEGIN" -v e="$DSH_MARK_END" 'index($0, b) == 1 && !on && !done { on = 1; next } on && $0 == e { on = 0; done = 1; next } !on { print }' "$1"; }
+# dsh_state <file>: current (the block as home/dsh/review.patch.yml has it, no other row for its ids),
+# stale (an older canon block, no other row), conflict (a row for one of its ids outside the block), none
+dsh_state() {
+  [ -f "$1" ] || { echo none; return; }
+  if dsh_outside "$1" | grep -Eq "$DSH_ID_RE"; then echo conflict
+  elif ! grep -qF "$DSH_MARK_BEGIN" "$1"; then echo none
+  elif [ "$(dsh_block "$1")" = "$(cat "$DSH_PATCH_SRC")" ]; then echo current
+  else echo stale; fi
+}
+dsh_row() {
+  local dir dst; dir=$(dsh_profile_dir); dst="$dir/cordis.patch.yml"
+  if [ ! -d "$dir" ]; then row "dsh-tui review patch" absent "no dsh-tui profile at $dir"; return; fi
+  case "$(dsh_state "$dst")" in
+    current)  row "dsh-tui review patch" ok "session log and dsh-memento off in $dst" ;;
+    conflict) row "dsh-tui review patch" "NOT SET" "another row in $dst sets session-log-deepseek or memento; merge home/dsh/review.patch.yml by hand" ;;
+    *)        row "dsh-tui review patch" "NOT SET" "home/dsh/review.patch.yml's rows are not in $dst; run: scripts/bootstrap --install" ;;
+  esac
+}
+# The line Antigravity's troubleshooting page gives, in the shell profile it names
+AGY_RE='^[[:space:]]*export[[:space:]]+AGY_CLI_DISABLE_AUTO_UPDATE=true[[:space:]]*$'
+agy_row() {
+  if grep -Eq "$AGY_RE" "$HOME/.zshrc" 2>/dev/null; then row "agy self-updater" off "AGY_CLI_DISABLE_AUTO_UPDATE=true in ~/.zshrc"
+  elif grep -q 'AGY_CLI_DISABLE_AUTO_UPDATE' "$HOME/.zshrc" 2>/dev/null; then row "agy self-updater" "NOT SET" "$HOME/.zshrc names AGY_CLI_DISABLE_AUTO_UPDATE otherwise; make it: export AGY_CLI_DISABLE_AUTO_UPDATE=true"
+  elif command -v agy >/dev/null 2>&1; then row "agy self-updater" "NOT SET" "it moves agy past its pin; run: scripts/bootstrap --install"
+  else row "agy self-updater" absent "no agy on PATH"; fi
+}
+
 check() {
   local missing=0 v t pin
   note "Toolchain (ADR 0008):"
@@ -170,6 +216,9 @@ check() {
   if [ -f "$CLAUDE_HOME/CLAUDE.md" ]; then row "user CLAUDE.md" ok ""; else row "user CLAUDE.md" MISSING "run: scripts/bootstrap --user-config"; missing=1; fi
   note "Alpaca paper key pair (ADR 0029), optional:"
   paper_row
+  note "Review-only workers (ADR 0045), optional:"
+  dsh_row
+  agy_row
   return "$missing"
 }
 
@@ -231,6 +280,61 @@ install_toolchain() {
   fi
 }
 
+# install_reviewer_settings: the dsh-tui patch rows and the agy line in ~/.zshrc (ADR 0045). Every row and
+# line already there is kept; a patch it cannot extend safely gets a .canon-proposed copy instead.
+install_reviewer_settings() {
+  local dir dst body tmp="" bak rc="$HOME/.zshrc" state
+  dir=$(dsh_profile_dir); dst="$dir/cordis.patch.yml"
+  if [ ! -d "$dir" ]; then
+    note "No dsh-tui profile at $dir; review patch skipped."
+  else
+    state=$(dsh_state "$dst")
+    if [ "$state" = current ]; then
+      note "  unchanged  $dst (review rows present)"
+    else
+      tmp=$(mktemp)
+      case "$state" in
+        stale)  # replace the older canon block where it stands
+          awk -v b="$DSH_MARK_BEGIN" -v e="$DSH_MARK_END" -v src="$DSH_PATCH_SRC" '
+            index($0, b) == 1 && !on && !done { on = 1; while ((getline l < src) > 0) print l; next }
+            on && $0 == e { on = 0; done = 1; next } !on { print }' "$dst" > "$tmp" ;;
+        none)
+          body=""; [ -f "$dst" ] && body=$(grep -Ev '^[[:space:]]*(#|$)' "$dst" || true)
+          case "$body" in
+            ''|'[]') { if [ -f "$dst" ]; then grep -Ev '^[[:space:]]*\[\][[:space:]]*$' "$dst" || true; fi; cat "$DSH_PATCH_SRC"; } > "$tmp" ;;
+            '- '*|-) { cat "$dst"; [ -n "$(tail -c 1 "$dst")" ] && echo; cat "$DSH_PATCH_SRC"; } > "$tmp" ;;
+            *) rm -f "$tmp"; tmp="" ;;
+          esac ;;
+        *) rm -f "$tmp"; tmp="" ;;
+      esac
+      if [ -z "$tmp" ]; then
+        cp "$DSH_PATCH_SRC" "$dir/review.patch.yml.canon-proposed"
+        note "  EXISTS     $dst already sets one of these rows or is not a block list; wrote review.patch.yml.canon-proposed beside it. Merge by hand."
+      else
+        if [ -f "$dst" ]; then
+          bak="$dst.replaced-$(date -u +%Y%m%dT%H%M%SZ)"
+          cp -p "$dst" "$bak" || { rm -f "$tmp"; die "could not keep the previous $dst"; }
+          note "  kept       the previous cordis.patch.yml as $bak"
+        fi
+        cat "$tmp" > "$dst"; rm -f "$tmp"
+        note "  added      session log upload off and dsh-memento off to $dst; restart dsh-tui to apply"
+      fi
+    fi
+  fi
+  if grep -Eq "$AGY_RE" "$rc" 2>/dev/null; then
+    note "  unchanged  $rc already sets AGY_CLI_DISABLE_AUTO_UPDATE=true"
+  elif grep -q 'AGY_CLI_DISABLE_AUTO_UPDATE' "$rc" 2>/dev/null; then
+    note "  EXISTS     $rc names AGY_CLI_DISABLE_AUTO_UPDATE otherwise; left alone. Make it: export AGY_CLI_DISABLE_AUTO_UPDATE=true"
+  else
+    {
+      echo ''
+      echo "# Antigravity CLI: background self-updater off, so agy stays at its pin (docs/adr/0045)"
+      echo 'export AGY_CLI_DISABLE_AUTO_UPDATE=true'
+    } >> "$rc"
+    note "  added      AGY_CLI_DISABLE_AUTO_UPDATE=true to $rc (open a new terminal to pick it up)"
+  fi
+}
+
 # render_settings: home/.claude/settings.json with its ~/.claude and "$HOME"/.claude paths pointed at
 # CLAUDE_HOME when that is not the default
 render_settings() {
@@ -279,6 +383,7 @@ install_user_config() {
 case "${1:-}" in
   --check)        if check; then note "All present."; else note "Some pieces are missing or outdated (see above)."; exit 1; fi ;;
   --install)      install_toolchain
+                  install_reviewer_settings
                   [ "${2:-}" = "--with-user-config" ] && install_user_config
                   check || true ;;
   --user-config)  install_user_config ;;

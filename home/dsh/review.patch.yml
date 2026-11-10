@@ -1,0 +1,21 @@
+# canon bootstrap: review settings (docs/adr/0045-review-runtimes-and-the-review-lifecycle.md)
+# Rows scripts/bootstrap --install adds to the dsh-tui profile's user patch,
+# ${DSH_HOME:-~/.dsh}/profiles/dsh-tui/cordis.patch.yml, after any rows already there.
+# Restart dsh-tui after it changes; verify with: dsh-tui doctor, or dsh --profile dsh-tui --dump-config.
+#
+# Session-log upload off. dsh-TUI v0.17.0 docs/configuration.en.md, "Official request metadata and
+# feedback reporting": "To stop API request metadata, disable either field in the user profile patch".
+# DeepSeek Harness dsh-v0.2.1-rc.3 packages/session/session-log-deepseek/README.md: "`false` stops
+# Session-log upload"; "Re-enabling resumes the unaccepted suffix, including events recorded while
+# disabled", so this stays off.
+- id: session-log-deepseek
+  config:
+    enabled: false
+# Cross-session memory off. dsh-memento 0.5.28 README, Configuration: "Override under the `memento`
+# row"; `enabled` is the "Master switch; `false` removes the service, tools, snapshot, command, panel,
+# and answerer". The patch layer replaces a row's config as a whole (dsh-TUI configuration.en.md), so
+# nothing else of the row is kept, which is what off means here.
+- id: memento
+  config:
+    enabled: false
+# end canon bootstrap: review settings

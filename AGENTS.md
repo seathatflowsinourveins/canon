@@ -95,8 +95,8 @@ Orca is the cockpit (ADR 0018). From a session Orca started, its `orca-cli` and 
 be used within these limits (ADR 0021):
 
 * Workers that build, and handoffs, use `--agent claude`. A reviewer may be Codex (`--agent codex`),
-  Muse Code (`--agent muse`) or Antigravity (`--agent antigravity`); DeepSeek Harness (`dsh`) is adopted
-  but reads nothing until a trial of it reports (ADR 0043, ADR 0045).
+  Muse Code (`--agent muse`) or Antigravity (`--agent antigravity`); DeepSeek Harness (`--agent dsh`) may
+  stand in like Antigravity once `scripts/bootstrap --check` shows its review patch ok (ADR 0043, ADR 0045).
 * A reviewer reads a change and reports findings. It never edits, commits, pushes, lands, runs paper tests
   or reads a credential. Orca pre-fills a bypass flag for Codex, Muse and Antigravity, so they run with
   no sandbox and no approvals, and no `ask` rule prompts for any of them, so its task says findings
