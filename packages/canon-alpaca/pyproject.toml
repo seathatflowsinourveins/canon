@@ -4,7 +4,7 @@
 [project]
 name = "canon-alpaca"
 version = "0.1.0"
-description = "Out-of-tree NautilusTrader adapter for Alpaca, built on alpaca-py (data slice, no orders)"
+description = "Out-of-tree NautilusTrader adapter for Alpaca, built on alpaca-py (market data and paper orders)"
 readme = "README.md"
 requires-python = ">=3.14,<3.15"
 dependencies = [

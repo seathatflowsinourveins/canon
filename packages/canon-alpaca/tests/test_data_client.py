@@ -3,8 +3,8 @@
 The shape follows upstream's template tests (`python/tests/integration/test_python_adapter_template.py` at
 the pinned NautilusTrader commit): the node is built with the adapter's own factory, through both
 registration paths the adapter guide documents, a strategy drives it, and the node shuts itself down, on
-both the owned (`node.run()`) and hosted (`await node.run_async()`) launch modes. There is no fill test:
-this slice has no execution client.
+both the owned (`node.run()`) and hosted (`await node.run_async()`) launch modes. The fill test is in
+test_execution_client.py.
 
 The three alpaca-py constructors the adapter calls are replaced by recorders that hand out the stand-ins
 in conftest.py, so the real factory, `_connect` and credential lookup run. The environment holds

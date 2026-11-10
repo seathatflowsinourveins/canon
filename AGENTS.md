@@ -57,7 +57,7 @@ dependency, pattern and practice traces to a pinned upstream or a dated source. 
 | `pyproject.toml`, `uv.lock` | uv workspace root and its single lockfile |
 | `orca.yaml` | Worktree setup for the Orca cockpit: two keys (ADR 0018) |
 | `src/canon_trading/` | Strategies and node configuration |
-| `packages/canon-alpaca/` | The Alpaca adapter for NautilusTrader: a market-data client, no execution client yet; read its README first |
+| `packages/canon-alpaca/` | The Alpaca adapter for NautilusTrader: a market-data client and a paper-only execution client; read its README first |
 | `tests/`, `packages/*/tests/` | Tests, beside each package's `src/` |
 | `catalog/` | Local market data (`ParquetDataCatalog`); ignored by git |
 | `.claude/` | Claude Code settings, hooks, scoped rules, skills, subagents |

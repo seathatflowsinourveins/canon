@@ -6,6 +6,7 @@ below names the upstream document it is taken from; none is chosen freely.
 """
 
 from alpaca.data.enums import DataFeed
+from nautilus_trader.model import AccountId
 from nautilus_trader.model import Currency
 from nautilus_trader.model import Price
 from nautilus_trader.model import Venue
@@ -15,6 +16,13 @@ VENUE = Venue("ALPACA")
 
 USD = Currency.from_str("USD")
 """US equities on Alpaca are quoted in US dollars (Get Assets reference: class `us_equity`)."""
+
+ACCOUNT_ID = AccountId(f"{VENUE}-PAPER")
+"""The execution client's account, `ALPACA-PAPER`.
+
+NautilusTrader's `ExecutionClient` takes its account ID at construction (Python adapter guide, "Construct
+the client"), before Alpaca's account number can be read, so the ID is fixed; the number is kept in the
+account state's `info`. It names the paper account because no other is ever connected (ADR 0009)."""
 
 ENV_API_KEY = "ALPACA_API_KEY"
 ENV_SECRET_KEY = "ALPACA_SECRET_KEY"
