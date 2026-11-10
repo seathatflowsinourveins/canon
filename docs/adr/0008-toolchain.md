@@ -45,6 +45,8 @@ Notes:
 * Claude Code is the one tool allowed to auto-update. It follows the `stable` channel (about a week behind
   `latest`), which serves as a cooldown. The desktop app updates on its own schedule regardless. A newly
   launched model can need a CLI newer than `stable` serves.
+  ADR 0022 supersedes the Claude Code row above and this note in part: the CLI is installed at the
+  registry's pin and held at or above it.
 * Homebrew is not installed: it needs `sudo` and its formulae roll forward (UNVERIFIED: no source was read
   for this). Add it later if a tool needs it.
 * mise applies a `minimum_release_age` cooldown of 24 hours by default, so a release under a day old is

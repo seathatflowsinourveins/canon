@@ -8,7 +8,7 @@
 #
 # Usage: scripts/test-canon [pattern]   run only the sections whose name contains pattern
 #        (names: baseline, registry validation, resolve keeps pins, stale pin, check exits, refs, evidence,
-#        workflows, broken pipe, outdated, network down, mise requests, resolve lock, lint hook,
+#        workflows, broken pipe, outdated, network down, mise requests, claude pin, resolve lock, lint hook,
 #        watch and brief)
 # Prints one line per case. Exit 0 if every case passes, 1 otherwise. TEST_CANON_VERBOSE=1 shows the
 # output of the command under test for a failing case.
@@ -82,6 +82,7 @@ fresh() {
   cp -R "$SRC/docs/adr" "$T/docs/"
   cp -R "$SRC/.claude/hooks" "$T/.claude/"
   cp -R "$SRC/.github/workflows" "$T/.github/"
+  cp -R "$SRC/home" "$T/"
   cp "$SRC/mise.toml" "$SRC/mise.lock" "$SRC/uv.lock" "$T/"
   : > "$EXTRA"; fake_build
   cp "$SNAP" "$BEFORE"
@@ -456,6 +457,41 @@ sec_mise_requests() {
   check "a tool given its own table is refused"              has "$out" "its own [tools.<name>] table"
 }
 
+sec_claude_pin() {
+  fresh
+  local st="$T/home/.claude/settings.json" shape="claude-code must be tracked as a release tag of dotted numbers"
+  shape="$shape (tag:v<N>.<N>..., the shape scripts/bootstrap installs); found track"
+  # cc_track <track or "none">: set the claude-code track in the copy's registry and lock (so the lock agrees)
+  cc_track() {
+    if [ "$1" = none ]; then reg_edit '(.upstreams[] | select(.id == "claude-code")) |= del(.track)'
+    else reg_edit "(.upstreams[] | select(.id == \"claude-code\") | .track) = \"$1\""
+         lock_edit ".pins[\"claude-code\"].track = \"$1\""; fi
+  }
+  set_min() { jq "$1" "$st" > "$W/s.json" && mv "$W/s.json" "$st"; }   # set_min <jq filter>
+  cc_track tag:v3.4.5; set_min '.minimumVersion = "3.4.5"'
+  out=$(canon lint); rc=$?
+  check "a settings minimumVersion equal to the claude-code pin passes" test "$rc" -eq 0
+  set_min '.minimumVersion = "3.4.50"'
+  out=$(canon lint); rc=$?
+  check "a settings minimumVersion other than the pin fails lint" test "$rc" -ne 0
+  check "... naming both values" has "$out" "claude-code is 3.4.5 in the registry but home/.claude/settings.json has minimumVersion '3.4.50'"
+  set_min 'del(.minimumVersion)'
+  out=$(canon lint); rc=$?
+  check "a settings template with no minimumVersion fails lint" test "$rc" -ne 0
+  check "... saying it has none"                             has "$out" "has minimumVersion 'nothing'"
+  cc_track tag:v2.2.0-rc.1; set_min '.minimumVersion = "2.2.0-rc.1"'
+  out=$(canon lint); rc=$?
+  check "a pre-release claude-code pin fails lint, though the template matches it" test "$rc" -ne 0
+  check "... saying what shape is needed and naming the track" has "$out" "$shape 'tag:v2.2.0-rc.1'"
+  cc_track branch:main
+  out=$(canon lint)
+  check "a branch-tracked claude-code entry fails with the same message" has "$out" "$shape 'branch:main'"
+  check "... and not as a version"                           lacks "$out" "claude-code is branch:main"
+  cc_track none
+  out=$(canon lint)
+  check "a claude-code entry with no track fails with the same message" has "$out" "$shape 'nothing'"
+}
+
 sec_resolve_lock() {
   fresh
   mkdir "$T/canon/upstreams.lock.json.held"
@@ -559,7 +595,7 @@ sec_watch_and_brief() {
 # Each section runs in the background in its own work directory (W, T, EXTRA, FAKE_DIR, BEFORE), so the
 # sections can run at once. Their lines are printed in order once all have finished.
 SECTIONS="baseline registry_validation resolve_keeps_pins stale_pin check_exits refs evidence workflows broken_pipe
-          outdated network_down mise_requests resolve_lock lint_hook watch_and_brief"
+          outdated network_down mise_requests claude_pin resolve_lock lint_hook watch_and_brief"
 pids=""; ran=""
 for s in $SECTIONS; do
   name=${s//_/ }

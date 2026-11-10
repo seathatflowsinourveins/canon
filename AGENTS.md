@@ -43,7 +43,7 @@ dependency, pattern and practice traces to a pinned upstream or a dated source. 
 | `scripts/lanes` | Report every Claude Code session on this machine: state, failures, spend |
 | `scripts/automation status` | Show every standing automation and whether it is healthy |
 | `scripts/survey-github report canon/github-practice.json` | Print what a measured sample of repositories converges on for pull requests and GitHub automation |
-| `scripts/bootstrap --check` | Show which toolchain pieces are installed |
+| `scripts/bootstrap --check` | Show which toolchain pieces are installed, and whether the Claude Code CLI is behind its pin |
 
 ## Layout
 
@@ -91,6 +91,7 @@ dependency, pattern and practice traces to a pinned upstream or a dated source. 
 | 0019 | Review gate scope: every change carries a review note except a named few |
 | 0020 | Rule enforcement: no hook runs before a tool call; the merge gate and permission rules hold the rules |
 | 0021 | Orca's skills: used from sessions inside Orca, within written limits |
+| 0022 | Claude Code CLI: installed at the registry's pin and never below it |
 
 ## Automation
 

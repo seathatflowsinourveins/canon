@@ -5,16 +5,23 @@
 # Every installer below is the upstream's own documented method:
 #   Command Line Tools  xcode-select --install                       (Apple; needs a click, so not automated)
 #   mise                https://mise.jdx.dev/installing-mise.html     (https://mise.run, MISE_VERSION pins)
-#   Claude Code         https://code.claude.com/docs/en/setup.md      (https://claude.ai/install.sh, channel arg)
+#   Claude Code         https://code.claude.com/docs/en/setup.md      (https://claude.ai/install.sh, version arg:
+#                                                                      the claude-code pin in canon/upstreams.json)
 #
 # Usage:
 #   scripts/bootstrap --check                       show what is installed; changes nothing
-#   scripts/bootstrap --install [--with-user-config] install mise, the tools in mise.toml, Claude Code CLI
+#   scripts/bootstrap --install [--with-user-config] install mise, the tools in mise.toml, the pinned Claude Code CLI
+#                                                    (installed or upgraded when absent or below the pin)
 #   scripts/bootstrap --user-config                 install home/.claude/ into ~/.claude/ only
 # Nothing here uses sudo. mise is the one on PATH, else ~/.local/bin/mise; --install fetches it when there is
 # neither, and writes its absolute path into the ~/.zshrc activation line. --check probes tools with mise's
 # exec_auto_install setting off (MISE_EXEC_AUTO_INSTALL=false), so a missing tool is reported, not installed,
-# and labels mise OUTDATED unless its version is MISE_VERSION.
+# and labels mise OUTDATED unless its version is MISE_VERSION. It labels the claude CLI BEHIND when its version
+# is below the registry's claude-code pin, and UNKNOWN when its version or the pin cannot be read. The pin
+# must be tracked as tag:v<N>.<N>... (or tag:<N>.<N>...); scripts/canon lint refuses any other shape.
+# --install runs the vendor installer with the pinned version when the CLI is absent or below the pin, leaves
+# one at or above it alone, and then fails if the CLI's version is unreadable or still below the pin. The CLI
+# then follows the autoUpdatesChannel that home/.claude/settings.json sets, never below its minimumVersion.
 # CLAUDE_CONFIG_DIR replaces ~/.claude. --user-config never overwrites settings.json or CLAUDE.md there: a
 # differing one gets a <name>.canon-proposed copy beside it. It replaces canon/ledger.sh and
 # canon/statusline.sh, keeping a differing previous copy beside each as <name>.replaced-<UTC time>. The
@@ -23,7 +30,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 MISE_VERSION="v2026.11.5"      # canon/upstreams.json: mise
-CLAUDE_CHANNEL="stable"        # ADR 0008: the one tool allowed to auto-update, on the stable channel
+# Claude Code: the version is the registry's claude-code pin (claude_pin below), not a channel; later updates
+# follow home/.claude/settings.json (ADR 0008: the one tool allowed to auto-update)
 LOCAL_BIN="$HOME/.local/bin"
 CLAUDE_HOME="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 
@@ -32,6 +40,39 @@ die()  { printf 'bootstrap: ERROR: %s\n' "$*" >&2; exit 1; }
 row()  { printf '  %-24s %-9s %s\n' "$1" "$2" "$3"; }
 have_clt() { xcode-select -p >/dev/null 2>&1; }
 first_line() { awk 'NR == 1'; }   # reads all input, so no pipe is cut short under pipefail
+
+# dotted <text>: true when the text is a dotted version of digits only ("2.1.321")
+dotted() { printf '%s' "$1" | grep -Eqx '[0-9]+(\.[0-9]+)*'; }
+
+# ver_ge <a> <b>: true when dotted version a is at or above b, comparing each field as a number (a missing
+# field counts as 0, so 2.1 equals 2.1.0)
+ver_ge() {
+  local a="$1" b="$2" x y
+  while [ -n "$a" ] || [ -n "$b" ]; do
+    x=${a%%.*}; y=${b%%.*}
+    case "$a" in *.*) a=${a#*.} ;; *) a="" ;; esac
+    case "$b" in *.*) b=${b#*.} ;; *) b="" ;; esac
+    [ $((10#${x:-0})) -eq $((10#${y:-0})) ] && continue
+    [ $((10#${x:-0})) -gt $((10#${y:-0})) ]; return
+  done
+  return 0
+}
+
+# claude_pin: the claude-code version canon/upstreams.json pins ("tag:v2.1.321" -> 2.1.321); empty when jq,
+# the registry or the entry is missing, or the track is not tag:v<dotted version> or tag:<dotted version>
+# (scripts/canon lint holds the registry to the same shape)
+claude_pin() {
+  local t
+  t=$(jq -r '.upstreams[]? | select(.id == "claude-code") | .track // empty' "$ROOT/canon/upstreams.json" 2>/dev/null \
+      | first_line) || t=""
+  case "$t" in tag:*) t=${t#tag:}; t=${t#v} ;; *) return 0 ;; esac
+  if [ -n "$t" ] && dotted "$t"; then printf '%s' "$t"; fi
+}
+
+# have_claude: true when a claude CLI is in ~/.local/bin or on PATH
+have_claude() { [ -x "$LOCAL_BIN/claude" ] || command -v claude >/dev/null 2>&1; }
+# claude_version: the first line the CLI prints for --version, ~/.local/bin first; empty when it prints none
+claude_version() { ( "$LOCAL_BIN/claude" --version 2>/dev/null || claude --version 2>/dev/null ) | first_line; }
 
 # unquotable <path>: true when the path cannot be written inside double quotes in a shell command
 unquotable() { case "$1" in *[\"\$\`\\]*|*$'\n'*) return 0 ;; *) return 1 ;; esac; }
@@ -81,7 +122,7 @@ check_hooks() {
 }
 
 check() {
-  local missing=0 v t
+  local missing=0 v t pin
   note "Toolchain (ADR 0008):"
   if have_clt; then row "Command Line Tools" ok "$(xcode-select -p)"; else row "Command Line Tools" MISSING "run: xcode-select --install"; missing=1; fi
   # /usr/bin/git is a stub that opens an install dialog when the tools are absent, so only call it when they exist
@@ -102,8 +143,13 @@ check() {
     row mise MISSING "run: scripts/bootstrap --install"; missing=1
     for t in python uv node gh; do row "$t (mise)" MISSING "installed by mise"; done
   fi
-  if [ -x "$LOCAL_BIN/claude" ] || command -v claude >/dev/null 2>&1; then
-    row "claude CLI" ok "$( ( "$LOCAL_BIN/claude" --version 2>/dev/null || claude --version 2>/dev/null ) | first_line)"
+  if have_claude; then
+    v=$(claude_version)
+    t=${v%% *}; t=${t#v}; pin=$(claude_pin)
+    if [ -z "$pin" ]; then row "claude CLI" UNKNOWN "${v:-no version}; no readable claude-code pin in canon/upstreams.json"; missing=1
+    elif ! dotted "$t"; then row "claude CLI" UNKNOWN "cannot read a version from '${v:-nothing}'; pinned $pin (canon/upstreams.json)"; missing=1
+    elif ver_ge "$t" "$pin"; then row "claude CLI" ok "$t; pinned $pin"
+    else row "claude CLI" BEHIND "$t; pinned $pin (canon/upstreams.json); run: claude install $pin"; missing=1; fi
   else row "claude CLI" MISSING "run: scripts/bootstrap --install"; missing=1; fi
   note "Machine-level Claude Code config (ADR 0007), in $CLAUDE_HOME:"
   check_hooks || missing=1
@@ -136,11 +182,23 @@ install_toolchain() {
   unquotable "$MISE" && die "mise path $MISE holds a quote, \$, backquote, backslash or newline; not supported"
   note "Installing tools from mise.toml with $MISE ..."
   ( cd "$ROOT" && "$MISE" trust "$ROOT/mise.toml" && "$MISE" install ) || die "mise install failed"
-  if [ ! -x "$LOCAL_BIN/claude" ] && ! command -v claude >/dev/null 2>&1; then
-    note "Installing Claude Code CLI ($CLAUDE_CHANNEL channel) ..."
-    fetch_then_run https://claude.ai/install.sh bash "$CLAUDE_CHANNEL"
+  local pin v t; pin=$(claude_pin)
+  [ -n "$pin" ] || die "no readable claude-code pin (tag:v<dotted version>) in canon/upstreams.json"
+  if ! have_claude; then
+    note "Installing Claude Code CLI $pin (canon/upstreams.json: claude-code) ..."
+    fetch_then_run https://claude.ai/install.sh bash "$pin"
     [ -x "$LOCAL_BIN/claude" ] || die "Claude Code installer finished but $LOCAL_BIN/claude is not there"
+  else
+    v=$(claude_version); t=${v%% *}; t=${t#v}
+    if dotted "$t" && ! ver_ge "$t" "$pin"; then
+      note "Claude Code CLI $t is below the pin $pin; installing $pin (canon/upstreams.json: claude-code) ..."
+      fetch_then_run https://claude.ai/install.sh bash "$pin"
+    fi
   fi
+  v=$(claude_version); t=${v%% *}; t=${t#v}
+  dotted "$t" || die "cannot read a version from the Claude Code CLI ('${v:-nothing}'); pinned $pin. Run: claude install $pin"
+  ver_ge "$t" "$pin" || die "Claude Code CLI is $t, still below the pin $pin (canon/upstreams.json). Run: claude install $pin"
+  note "Claude Code CLI $t (pinned $pin)."
   local rc="$HOME/.zshrc"
   if ! grep -q 'canon bootstrap' "$rc" 2>/dev/null; then
     {
