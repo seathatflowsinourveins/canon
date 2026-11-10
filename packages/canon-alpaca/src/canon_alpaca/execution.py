@@ -22,9 +22,13 @@ is a cancel rejection. Fills come only from the stream's `fill` and `partial_fil
 
 Reconciliation (https://nautilustrader.io/docs/md/latest/concepts/execution/reconciliation.md): order status
 reports come from Alpaca's orders endpoint and position reports from its positions endpoint. There are no
-fill reports, because alpaca-py 0.45.0's `TradingClient` has no method for Alpaca's account activities
-(only its `BrokerClient` has one, and this slice does not call the endpoint through the generic `get`); for an order status report without fills the engine "Infers
-`OrderFilled` events for missing trade reports", at the report's average price.
+fill reports. Alpaca's Trading API documents the account activities endpoint, `GET /v2/account/activities`,
+with the paper server listed (https://docs.alpaca.markets/us/reference/getaccountactivities-2.md);
+alpaca-py 0.45.0's `TradingClient` has no method for it, and this slice does not call it through the
+generic `get` (ADR 0024). For an order status report without fills the engine "Infers `OrderFilled` events
+for missing trade reports", timed at the report's `ts_last` (`docs/concepts/execution/reconciliation.md`
+at the pinned commit; the `latest` page linked above adds "unless the client requires authoritative
+fills"). That page does not say what price an inferred fill carries (ADR 0024).
 
 Venue side, alpaca-py 0.45.0:
 
