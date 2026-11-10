@@ -1,9 +1,9 @@
 """The trial ledger (ADR 0035) recording real backtests, read back through a new `Study` object.
 
 No test here opens a network connection, reads a credential or downloads a file. Each test writes a
-`ParquetDataCatalog` and an Optuna SQLite study in pytest's temporary directory. The bars are built as
-`tests/test_backtest.py` builds them: the asset and bar payloads are Alpaca-shaped, go through the
-adapter's `parse_equity` and `parse_bar`, and are 40 daily bars on consecutive weekdays from Monday
+`ParquetDataCatalog` and an Optuna SQLite study in pytest's temporary directory. The bars come from the
+`alpaca_bars` fixture of `tests/conftest.py`: the asset and bar payloads are Alpaca-shaped, go through
+the adapter's `parse_equity` and `parse_bar`, and are 40 daily bars on consecutive weekdays from Monday
 2025-03-10, opening at midnight New York time. Closes climb 101 to 115, fall to 100, then climb to 110.
 
 On that series (worked in `tests/test_backtest.py`'s docstring) a 3-bar and an 8-bar average trade
@@ -19,10 +19,10 @@ catalog, unless a test says otherwise; `append_bars` adds 30 more, from 2025-05-
 from __future__ import annotations
 
 import subprocess
+import sys
 from contextlib import ExitStack
 from datetime import UTC
 from datetime import datetime
-from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 from typing import Any
@@ -30,13 +30,8 @@ from zoneinfo import ZoneInfo
 
 import optuna
 import pytest
-from alpaca.data.models import Bar as AlpacaBar
-from alpaca.trading.models import Asset
-from canon_alpaca.data import parse_bar
-from canon_alpaca.providers import parse_equity
 from nautilus_trader.model import BarType
 from nautilus_trader.model import Quantity
-from nautilus_trader.persistence import ParquetDataCatalog
 from optuna.exceptions import DuplicatedStudyError
 from optuna.trial import TrialState
 
@@ -66,6 +61,7 @@ from canon_trading.returns_matrix import daily_series
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
+    from conftest import AlpacaBars
     from nautilus_trader.model import Bar
 
 NEW_YORK = ZoneInfo("America/New_York")
@@ -74,25 +70,6 @@ MSFT_BAR_TYPE = BarType.from_str("MSFT.ALPACA-1-DAY-LAST-EXTERNAL")
 BALANCES = ["100000 USD"]
 START = "2025-03-10"
 END = "2025-05-04"
-CLOSES = [
-    *(float(c) for c in range(101, 116)),
-    *(float(c) for c in range(114, 99, -1)),
-    *(float(c) for c in range(101, 111)),
-]
-ASSET = {
-    "borrow_status": "easy_to_borrow",
-    "class": "us_equity",
-    "easy_to_borrow": True,
-    "exchange": "NASDAQ",
-    "fractionable": True,
-    "id": "b0b6dd9d-8b9b-48a9-ba46-b9d54906e415",
-    "marginable": True,
-    "name": "Apple Inc. Common Stock",
-    "shortable": True,
-    "status": "active",
-    "symbol": "AAPL",
-    "tradable": True,
-}
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
@@ -112,55 +89,13 @@ def new_study(
     )
 
 
-def write_bars(
-    path: Path,
-    closes: list[float],
-    *,
-    symbol: str = "AAPL",
-    first: datetime | None = None,
-    previous: float = 100.0,
-) -> list[Bar]:
-    """Write the symbol's instrument and `closes` as weekday daily bars from `first`; return them."""
-    path.mkdir(exist_ok=True)
-    catalog = ParquetDataCatalog(str(path))
-    instrument = parse_equity(Asset.model_validate({**ASSET, "symbol": symbol}), 0)
-    bar_type = BarType.from_str(f"{instrument.id}-1-DAY-LAST-EXTERNAL")
-    bars = []
-    day = first or datetime(2025, 3, 10, tzinfo=NEW_YORK)
-    for close in closes:
-        while day.weekday() >= 5:
-            day += timedelta(days=1)
-        payload = {
-            "t": day.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "o": previous,
-            "h": max(previous, close),
-            "l": min(previous, close),
-            "c": close,
-            "v": 1_000_000,
-            "n": 1_000,
-            "vw": close,
-        }
-        bars.append(parse_bar(AlpacaBar(symbol, payload), bar_type, instrument))
-        previous = close
-        day += timedelta(days=1)
-    catalog.write_instruments([instrument])
-    catalog.write_bars(bars)
-    return bars
-
-
-def write_catalog(path: Path, symbols: tuple[str, ...] = ("AAPL",)) -> list[Bar]:
-    """Write each symbol's instrument and the 40 bars to a new catalog; return the first's bars."""
-    written = [write_bars(path, CLOSES, symbol=symbol) for symbol in symbols]
-    return written[0]
-
-
 APPENDED = [110.0 + (i % 7) - 3 for i in range(30)]
 
 
-def append_bars(path: Path) -> list[Bar]:
+def append_bars(alpaca_bars: AlpacaBars, path: Path) -> list[Bar]:
     """30 more AAPL bars, from Monday 2025-05-05, the weekday after the last of the 40."""
-    return write_bars(
-        path, APPENDED, first=datetime(2025, 5, 5, tzinfo=NEW_YORK), previous=CLOSES[-1]
+    return alpaca_bars.write(
+        path, APPENDED, first=datetime(2025, 5, 5, tzinfo=NEW_YORK), previous=alpaca_bars.CLOSES[-1]
     )
 
 
@@ -183,8 +118,10 @@ def keys(study: optuna.Study) -> set[str]:
     return {trial.user_attrs["config_key"] for trial in study.trials}
 
 
-def test_a_trial_round_trips_through_the_sqlite_file(tmp_path: Path, stack: ExitStack) -> None:
-    bars = write_catalog(tmp_path / "catalog")
+def test_a_trial_round_trips_through_the_sqlite_file(
+    alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack
+) -> None:
+    bars = alpaca_bars.write(tmp_path / "catalog")
     study = new_study(stack, tmp_path, "round-trip")
 
     recorded = record_trial(study, tmp_path / "catalog", [strategy()], starting_balances=BALANCES)
@@ -224,10 +161,10 @@ def test_a_trial_round_trips_through_the_sqlite_file(tmp_path: Path, stack: Exit
 
 
 def test_the_recorded_series_is_the_shape_the_returns_matrix_accepts(
-    tmp_path: Path, stack: ExitStack
+    alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack
 ) -> None:
     """NautilusTrader's own daily series, on a real run, passes ADR 0010 step 2 and loses only zeros."""
-    write_catalog(tmp_path / "catalog")
+    alpaca_bars.write(tmp_path / "catalog")
     study = new_study(stack, tmp_path, "shape")
     record_trial(study, tmp_path / "catalog", [strategy()], starting_balances=BALANCES)
     [trial] = study.trials
@@ -241,8 +178,10 @@ def test_the_recorded_series_is_the_shape_the_returns_matrix_accepts(
     assert any(value != 0.0 for value in series)
 
 
-def test_a_failed_and_an_idle_trial_are_counted(tmp_path: Path, stack: ExitStack) -> None:
-    write_catalog(tmp_path / "catalog")
+def test_a_failed_and_an_idle_trial_are_counted(
+    alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack
+) -> None:
+    alpaca_bars.write(tmp_path / "catalog")
     study = new_study(stack, tmp_path, "outcomes")
 
     traded = record_trial(study, tmp_path / "catalog", [strategy()], starting_balances=BALANCES)
@@ -257,23 +196,24 @@ def test_a_failed_and_an_idle_trial_are_counted(tmp_path: Path, stack: ExitStack
             starting_balances=BALANCES,
         )
 
-    trials = stack.enter_context(open_study("outcomes", tmp_path / "trials.db")).trials
+    reopened = stack.enter_context(open_study("outcomes", tmp_path / "trials.db"))
+    trials = reopened.trials
     assert [(trial.state, trial.user_attrs[OUTCOME]) for trial in trials] == [
         (TrialState.COMPLETE, TRADED),
         (TrialState.FAIL, IDLE),
         (TrialState.FAIL, FAILED),
     ]
     assert traded.outcome == TRADED and idle.outcome == IDLE
-    assert len(keys(study)) == 3
+    assert len(keys(reopened)) == 3  # N, read back through a new Study object (ADR 0035)
     assert "trade_size 1.5 is finer than" in trials[2].user_attrs["error"]
     assert not idle.run.result.total_orders
     assert set(trials[1].user_attrs["returns_series"].values()) == {0.0}
 
 
 def test_a_call_refused_before_a_config_exists_is_not_a_trial(
-    tmp_path: Path, stack: ExitStack
+    alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack
 ) -> None:
-    write_catalog(tmp_path / "catalog")
+    alpaca_bars.write(tmp_path / "catalog")
     study = new_study(stack, tmp_path, "refused")
 
     with pytest.raises(LookupError, match="holds no MSFT"):
@@ -290,9 +230,9 @@ def test_a_call_refused_before_a_config_exists_is_not_a_trial(
 
 
 def test_the_same_config_twice_is_one_configuration_with_two_records(
-    tmp_path: Path, stack: ExitStack
+    alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack
 ) -> None:
-    write_catalog(tmp_path / "catalog")
+    alpaca_bars.write(tmp_path / "catalog")
     study = new_study(stack, tmp_path, "twice")
 
     first = record_trial(study, tmp_path / "catalog", [strategy()], starting_balances=BALANCES)
@@ -307,10 +247,10 @@ def test_the_same_config_twice_is_one_configuration_with_two_records(
 
 
 def test_the_catalog_path_does_not_change_the_key_or_the_digest(
-    tmp_path: Path, stack: ExitStack
+    alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack
 ) -> None:
-    write_catalog(tmp_path / "here")
-    write_catalog(tmp_path / "there")
+    alpaca_bars.write(tmp_path / "here")
+    alpaca_bars.write(tmp_path / "there")
     study = new_study(stack, tmp_path, "places")
 
     for place in ("here", "there"):
@@ -387,10 +327,10 @@ def test_a_callable_config_field_is_refused() -> None:
 
 
 def test_a_config_changed_between_records_is_hashed_as_it_ran(
-    tmp_path: Path, stack: ExitStack
+    alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack
 ) -> None:
     """The review's loop: one config object mutated between runs. Each record holds what it ran."""
-    write_catalog(tmp_path / "catalog")
+    alpaca_bars.write(tmp_path / "catalog")
     study = new_study(stack, tmp_path, "mutated")
     shared = strategy()
 
@@ -416,10 +356,10 @@ def test_a_config_changed_between_records_is_hashed_as_it_ran(
 
 
 def test_a_result_that_cannot_be_recorded_is_told_failed(
-    tmp_path: Path, stack: ExitStack, monkeypatch: pytest.MonkeyPatch
+    alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The run returned, but reading the bars it read raised: the record fails, and says why."""
-    write_catalog(tmp_path / "catalog")
+    alpaca_bars.write(tmp_path / "catalog")
     study = new_study(stack, tmp_path, "unrecorded")
 
     def unreadable(*_: object) -> list[Bar]:
@@ -518,9 +458,9 @@ def test_a_path_with_uri_characters_opens_that_file(tmp_path: Path, stack: ExitS
 
 
 def test_a_study_keeps_its_samples_and_moving_one_keeps_every_record(
-    tmp_path: Path, stack: ExitStack
+    alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack
 ) -> None:
-    write_catalog(tmp_path / "catalog")
+    alpaca_bars.write(tmp_path / "catalog")
     study = new_study(stack, tmp_path, "moved")
     record_trial(study, tmp_path / "catalog", [strategy()], starting_balances=BALANCES)
 
@@ -537,9 +477,9 @@ def test_a_study_keeps_its_samples_and_moving_one_keeps_every_record(
 
 
 def test_the_run_is_bounded_by_the_sample_and_its_end_is_included(
-    tmp_path: Path, stack: ExitStack
+    alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack
 ) -> None:
-    bars = write_catalog(tmp_path / "catalog")
+    bars = alpaca_bars.write(tmp_path / "catalog")
     study = new_study(stack, tmp_path, "bounded", start=START, end=END)
     move_sample(study, start=bars[5].ts_init, end=bars[29].ts_init)
 
@@ -556,17 +496,17 @@ def test_the_run_is_bounded_by_the_sample_and_its_end_is_included(
 
 
 def test_bars_added_after_the_sample_change_no_trial_on_it(
-    tmp_path: Path, stack: ExitStack
+    alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack
 ) -> None:
     """The review: after 30 bars were appended, a new trial was ranked on another range than the rest."""
-    write_catalog(tmp_path / "catalog")
+    alpaca_bars.write(tmp_path / "catalog")
     study = new_study(stack, tmp_path, "grown")
     record_trial(study, tmp_path / "catalog", [strategy()], starting_balances=BALANCES)
     record_trial(
         study, tmp_path / "catalog", [strategy(fast=2, slow=5)], starting_balances=BALANCES
     )
 
-    append_bars(tmp_path / "catalog")
+    append_bars(alpaca_bars, tmp_path / "catalog")
     record_trial(
         study, tmp_path / "catalog", [strategy(fast=4, slow=9)], starting_balances=BALANCES
     )
@@ -581,15 +521,15 @@ def test_bars_added_after_the_sample_change_no_trial_on_it(
 
 
 def test_a_moved_sample_needs_every_configuration_run_on_it(
-    tmp_path: Path, stack: ExitStack
+    alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack
 ) -> None:
     """N carries over; the ranking reads only the current sample and names what has not run on it."""
-    write_catalog(tmp_path / "catalog")
+    alpaca_bars.write(tmp_path / "catalog")
     study = new_study(stack, tmp_path, "rerun")
     configs = [strategy(), strategy(fast=2, slow=5), strategy(fast=4, slow=9)]
     for config in configs:
         record_trial(study, tmp_path / "catalog", [config], starting_balances=BALANCES)
-    append_bars(tmp_path / "catalog")
+    append_bars(alpaca_bars, tmp_path / "catalog")
     move_sample(study, start=START, end="2025-06-16")
     first = record_trial(study, tmp_path / "catalog", [configs[0]], starting_balances=BALANCES)
 
@@ -608,13 +548,13 @@ def test_a_moved_sample_needs_every_configuration_run_on_it(
 
 
 def test_a_corrected_catalog_disagrees_until_the_sample_is_moved(
-    tmp_path: Path, stack: ExitStack
+    alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack
 ) -> None:
     """Same range, other bars: the digest differs, the ranking stops, and a new sample clears it."""
-    write_catalog(tmp_path / "catalog")
-    corrected = list(CLOSES)
+    alpaca_bars.write(tmp_path / "catalog")
+    corrected = list(alpaca_bars.CLOSES)
     corrected[9] += 0.5
-    write_bars(tmp_path / "corrected", corrected)
+    alpaca_bars.write(tmp_path / "corrected", corrected)
     study = new_study(stack, tmp_path, "corrected")
     for place in ("catalog", "corrected"):
         record_trial(study, tmp_path / place, [strategy()], starting_balances=BALANCES)
@@ -633,13 +573,13 @@ def test_a_corrected_catalog_disagrees_until_the_sample_is_moved(
 
 
 def test_two_configurations_that_read_different_bars_on_one_sample_stop(
-    tmp_path: Path, stack: ExitStack
+    alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack
 ) -> None:
     """A catalog corrected in place between two configurations, with no sample moved."""
-    write_catalog(tmp_path / "catalog")
-    corrected = list(CLOSES)
+    alpaca_bars.write(tmp_path / "catalog")
+    corrected = list(alpaca_bars.CLOSES)
     corrected[9] += 0.5
-    write_bars(tmp_path / "corrected", corrected)
+    alpaca_bars.write(tmp_path / "corrected", corrected)
     study = new_study(stack, tmp_path, "read apart")
     first = record_trial(study, tmp_path / "catalog", [strategy()], starting_balances=BALANCES)
     second = record_trial(
@@ -655,10 +595,10 @@ def test_two_configurations_that_read_different_bars_on_one_sample_stop(
 
 
 def test_a_sample_the_catalog_does_not_reach_is_refused_before_a_trial(
-    tmp_path: Path, stack: ExitStack
+    alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack
 ) -> None:
     """A mistyped year would otherwise replay nothing and be recorded as an idle trial."""
-    write_catalog(tmp_path / "catalog")
+    alpaca_bars.write(tmp_path / "catalog")
     study = new_study(stack, tmp_path, "mistyped", start="2015-03-10", end="2015-05-04")
 
     with pytest.raises(LookupError, match="holds no AAPL.ALPACA-1-DAY-LAST-EXTERNAL bars from"):
@@ -669,10 +609,14 @@ def test_a_sample_the_catalog_does_not_reach_is_refused_before_a_trial(
 
 @pytest.mark.parametrize("failing", ["config_key", "outcome"])
 def test_an_error_after_the_trial_is_asked_for_is_told_failed(
-    tmp_path: Path, stack: ExitStack, monkeypatch: pytest.MonkeyPatch, failing: str
+    alpaca_bars: AlpacaBars,
+    tmp_path: Path,
+    stack: ExitStack,
+    monkeypatch: pytest.MonkeyPatch,
+    failing: str,
 ) -> None:
     """A locked store on the first write, or on the outcome, left the record RUNNING for good."""
-    write_catalog(tmp_path / "catalog")
+    alpaca_bars.write(tmp_path / "catalog")
     study = new_study(stack, tmp_path, "locked")
     real = optuna.trial.Trial.set_user_attr
 
@@ -691,9 +635,9 @@ def test_an_error_after_the_trial_is_asked_for_is_told_failed(
 
 
 def test_an_interrupt_during_the_run_is_told_failed(
-    tmp_path: Path, stack: ExitStack, monkeypatch: pytest.MonkeyPatch
+    alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    write_catalog(tmp_path / "catalog")
+    alpaca_bars.write(tmp_path / "catalog")
     study = new_study(stack, tmp_path, "interrupted")
 
     def interrupted(*_: object) -> None:
@@ -709,9 +653,9 @@ def test_an_interrupt_during_the_run_is_told_failed(
 
 
 def test_an_interrupt_just_after_the_tell_leaves_the_record_as_told(
-    tmp_path: Path, stack: ExitStack, monkeypatch: pytest.MonkeyPatch
+    alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    write_catalog(tmp_path / "catalog")
+    alpaca_bars.write(tmp_path / "catalog")
     study = new_study(stack, tmp_path, "late interrupt")
     real = optuna.Study.tell
 
@@ -743,10 +687,12 @@ def test_an_instant_at_utc_midnight_belongs_to_the_day_ending_there(ts: int, day
     assert session_day(ts) == day
 
 
-def test_daily_bars_stamped_at_utc_midnight_rank(tmp_path: Path, stack: ExitStack) -> None:
+def test_daily_bars_stamped_at_utc_midnight_rank(
+    alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack
+) -> None:
     """Bars opening at 00:00 UTC are stamped available at the next midnight; the review found their
     returns on days the ledger called closed, so every ranking of the study stopped."""
-    bars = write_bars(tmp_path / "catalog", CLOSES, first=datetime(2025, 3, 10, tzinfo=UTC))
+    bars = alpaca_bars.write(tmp_path / "catalog", first=datetime(2025, 3, 10, tzinfo=UTC))
     assert all(bar.ts_init % DAY_NS == 0 for bar in bars)
     study = new_study(stack, tmp_path, "midnight")
     for fast, slow in ((3, 8), (2, 5)):
@@ -761,6 +707,70 @@ def test_daily_bars_stamped_at_utc_midnight_rank(tmp_path: Path, stack: ExitStac
 
     assert (report.n, report.t) == (2, 40)
     assert report.first_day == "2025-03-10"
+
+
+def test_two_processes_creating_one_new_ledger_both_succeed(tmp_path: Path) -> None:
+    """Without the creation lock, 14 of 15 rounds crashed: "table studies already exists".
+
+    Each child imports first, then marks itself ready and waits for the other, so both reach the
+    creation together however long the imports take.
+    """
+    script = (
+        "import sys, time\n"
+        "from pathlib import Path\n"
+        "from canon_trading.ledger import create_ledger_study\n"
+        "here, name, other = Path(sys.argv[1]), sys.argv[2], sys.argv[3]\n"
+        "(here.parent / f'ready-{name}').touch()\n"
+        "deadline = time.monotonic() + 60\n"
+        "while not (here.parent / f'ready-{other}').exists() and time.monotonic() < deadline:\n"
+        "    time.sleep(0.001)\n"
+        "with create_ledger_study(name, start='2025-03-10', end='2025-05-04', path=here):\n"
+        "    pass\n"
+    )
+    for round_ in range(3):
+        path = tmp_path / f"round-{round_}" / "trials.db"
+        path.parent.mkdir()
+        runs = [
+            subprocess.Popen(
+                [sys.executable, "-c", script, str(path), f"s{n}", f"s{1 - n}"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            for n in range(2)
+        ]
+        results = [(run.communicate(timeout=120)[1], run.returncode) for run in runs]
+        assert [code for _, code in results] == [0, 0], [err[-300:] for err, _ in results]
+        assert sorted(optuna.get_all_study_names(f"sqlite:///{path}")) == ["s0", "s1"]
+
+
+def test_the_value_told_is_none_for_a_series_the_gate_rejects(
+    alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With five session days lost, returns fall on days with no bar: the gate refuses the series, so
+    the run is told no value, `FAIL` and still `traded`, not `COMPLETE` with a Sharpe ratio."""
+    alpaca_bars.write(tmp_path / "catalog")
+    study = new_study(stack, tmp_path, "refused value")
+    real = canon_trading.ledger.session_days
+    monkeypatch.setattr(canon_trading.ledger, "session_days", lambda bars: real(bars)[:-5])
+
+    record_trial(study, tmp_path / "catalog", [strategy()], starting_balances=BALANCES)
+
+    [trial] = study.trials
+    assert (trial.state, trial.user_attrs[OUTCOME], trial.value) == (TrialState.FAIL, TRADED, None)
+
+
+def test_the_ledger_folder_is_ignored_only_at_the_root() -> None:
+    root = Path(canon_trading.ledger.__file__).resolve().parents[2]
+
+    def ignored(path: str) -> bool:
+        return (
+            subprocess.run(["git", "check-ignore", "-q", path], cwd=root, check=False).returncode
+            == 0
+        )
+
+    assert ignored("ledger/trials.db")
+    assert not ignored("src/canon_trading/ledger/module.py")
 
 
 def _sharpe(values: list[float]) -> float:

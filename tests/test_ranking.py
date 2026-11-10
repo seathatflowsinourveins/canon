@@ -24,7 +24,9 @@ from __future__ import annotations
 import itertools
 import math
 import statistics
-from statistics import NormalDist
+import time
+from datetime import UTC
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 import optuna
@@ -41,18 +43,19 @@ from canon_trading.ledger import TRADED
 from canon_trading.ledger import create_ledger_study
 from canon_trading.ledger import mark_not_run
 from canon_trading.ledger import move_sample
+from canon_trading.ledger import open_study
 from canon_trading.ranking import THRESHOLD
 from canon_trading.ranking import RankingStopped
 from canon_trading.ranking import rank
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Iterator
     from pathlib import Path
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 DAY_0 = 1_741_651_200 * 1_000_000_000  # 2025-03-11T00:00:00Z
-EULER_MASCHERONI = 0.5772156649015329
 T = 30
 PATTERN = [0.01, -0.004, 0.006, 0.002, -0.003, 0.008, 0.004, -0.001, 0.005, 0.003]
 PICK = [PATTERN[i % 10] + 0.0001 * (i % 3) for i in range(T)]
@@ -113,24 +116,9 @@ def sharpe(values: list[float]) -> float:
     return statistics.fmean(values) / statistics.stdev(values)
 
 
-def worked_dsr(returns: list[float], trial_sharpes: list[float]) -> tuple[float, float]:
-    """SR₀ and the DSR by eqs. 1-2, without skfolio (see the module docstring)."""
-    mean = statistics.fmean(returns)
-    variance = statistics.fmean((value - mean) ** 2 for value in returns)
-    skewness = statistics.fmean((value - mean) ** 3 for value in returns) / variance**1.5
-    kurtosis = statistics.fmean((value - mean) ** 4 for value in returns) / variance**2
-    pick = sharpe(returns)
-    trials = len(trial_sharpes)
-    normal = NormalDist()
-    sr0 = statistics.stdev(trial_sharpes) * (
-        (1 - EULER_MASCHERONI) * normal.inv_cdf(1 - 1 / trials)
-        + EULER_MASCHERONI * normal.inv_cdf(1 - 1 / (trials * math.e))
-    )
-    spread = math.sqrt(1 - skewness * pick + (kurtosis - 1) / 4 * pick**2)
-    return sr0, normal.cdf((pick - sr0) * math.sqrt(len(returns) - 1) / spread)
-
-
-def test_the_worked_numbers_are_the_docstrings() -> None:
+def test_the_worked_numbers_are_the_docstrings(
+    worked_dsr: Callable[..., tuple[float, float]],
+) -> None:
     assert sharpe(PICK) == pytest.approx(0.69911, abs=5e-6)
     assert sharpe(SECOND) == pytest.approx(0.22556, abs=5e-6)
     assert sharpe(THIRD_CLOSE) == pytest.approx(0.22556, abs=5e-6)
@@ -141,7 +129,9 @@ def test_the_worked_numbers_are_the_docstrings() -> None:
     assert (sr0, dsr) == pytest.approx((0.59606, 0.69241), abs=5e-6)
 
 
-def test_a_pick_above_the_threshold_passes(study: optuna.Study) -> None:
+def test_a_pick_above_the_threshold_passes(
+    worked_dsr: Callable[..., tuple[float, float]], study: optuna.Study
+) -> None:
     write(study, "pick", PICK)
     write(study, "second", SECOND)
     write(study, "third", THIRD_CLOSE)
@@ -164,6 +154,10 @@ def test_a_pick_above_the_threshold_passes(study: optuna.Study) -> None:
     assert report.n_hat == pytest.approx(rho + (1 - rho) * 3, rel=1e-9)
     assert report.n_hat == pytest.approx(2.7755, abs=5e-5)
     assert report.dsr_at_n_hat is not None and report.dsr_at_n_hat > report.dsr
+    # Eqs. 1-2 by hand at N-hat: fails with a population deviation, half N-hat or no benchmark.
+    _, at_n_hat = worked_dsr(PICK, sharpes, report.n_hat)
+    assert report.dsr_at_n_hat == pytest.approx(at_n_hat, abs=1e-12)
+    assert report.dsr_at_n_hat == pytest.approx(0.99063, abs=5e-6)
     assert (report.first_day, report.last_day) == ("2025-03-11", "2025-04-09")
     assert (report.records, report.first_trial, report.last_trial) == (3, 0, 2)
     summary = report.summary()
@@ -171,7 +165,9 @@ def test_a_pick_above_the_threshold_passes(study: optuna.Study) -> None:
     assert "it passes at 0.95" in summary
 
 
-def test_a_pick_below_the_threshold_is_rejected(study: optuna.Study) -> None:
+def test_a_pick_below_the_threshold_is_rejected(
+    worked_dsr: Callable[..., tuple[float, float]], study: optuna.Study
+) -> None:
     write(study, "pick", PICK)
     write(study, "second", SECOND)
     write(study, "third", THIRD_WIDE)
@@ -362,7 +358,9 @@ def test_copies_that_differ_only_in_rounding_stop(study: optuna.Study, scale: fl
         rank(study)
 
 
-def test_bit_identical_columns_tied_at_the_top_are_one_pick(study: optuna.Study) -> None:
+def test_bit_identical_columns_tied_at_the_top_are_one_pick(
+    worked_dsr: Callable[..., tuple[float, float]], study: optuna.Study
+) -> None:
     """The review's 4x4 grid: (2,6) and (3,6) traded the same bars under two keys and stopped it."""
     first = write(study, "pick", PICK)
     twin = write(study, "twin", PICK)
@@ -636,3 +634,47 @@ def test_returns_equal_but_for_rounding_around_zero_are_one_pick(study: optuna.S
 
     assert {report.pick, *report.tied} == {"pick", "twin"}
     assert report.pick_trials == (first, twin)
+
+
+def test_a_dsr_that_is_not_finite_stops_naming_the_pick(
+    study: optuna.Study, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = write(study, "pick", PICK)
+    write(study, "second", SECOND)
+    monkeypatch.setattr(
+        "canon_trading.ranking.measures.deflated_sharpe_ratio", lambda *_: float("nan")
+    )
+
+    with pytest.raises(
+        RankingStopped, match=rf"skfolio gives DSR nan for the pick pick \(#{first}\)"
+    ):
+        rank(study)
+
+
+def test_the_recorded_range_is_utc_whatever_the_zone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Optuna returns a trial's start as naive local time, so the review saw three ranges in three
+    zones; the report gives one, in UTC, with its offset."""
+    before = datetime.now(UTC)
+    with create_ledger_study(
+        "times", start=DAY_0, end=DAY_0 + (T - 1) * DAY_NS, path=tmp_path / "trials.db"
+    ) as written:
+        write(written, "pick", PICK)
+        write(written, "second", SECOND)
+    after = datetime.now(UTC)
+    seen = set()
+    try:
+        for zone in ("Asia/Tokyo", "UTC", "America/New_York"):
+            monkeypatch.setenv("TZ", zone)
+            time.tzset()
+            with open_study("times", tmp_path / "trials.db") as reopened:
+                report = rank(reopened)
+            seen.add((report.first_recorded, report.last_recorded))
+    finally:
+        monkeypatch.undo()
+        time.tzset()
+
+    [(first, last)] = seen
+    assert first.endswith("+00:00") and last.endswith("+00:00")
+    assert before <= datetime.fromisoformat(first) <= datetime.fromisoformat(last) <= after

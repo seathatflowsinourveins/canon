@@ -48,19 +48,13 @@ The same pair run on two instruments with the same prices comes to the same figu
 
 from __future__ import annotations
 
-from datetime import UTC
 from datetime import datetime
-from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
 import pytest
-from alpaca.data.models import Bar as AlpacaBar
-from alpaca.trading.models import Asset
-from canon_alpaca.data import parse_bar
-from canon_alpaca.providers import parse_equity
 from nautilus_trader.backtest import BacktestEngine
 from nautilus_trader.config import BacktestEngineConfig
 from nautilus_trader.execution import MakerTakerFeeModel
@@ -75,16 +69,17 @@ from nautilus_trader.model import OrderStatus
 from nautilus_trader.model import OrderSubmitted
 from nautilus_trader.model import Quantity
 from nautilus_trader.model import Venue
-from nautilus_trader.persistence import ParquetDataCatalog
 
 from canon_trading.backtest import BacktestRun
+from canon_trading.backtest import backtest_run_config
 from canon_trading.backtest import run_backtest
+from canon_trading.backtest import run_backtest_config
 from canon_trading.ma_cross import MaCross
 from canon_trading.ma_cross import MaCrossConfig
 
 if TYPE_CHECKING:
+    from conftest import AlpacaBars
     from nautilus_trader.model import Bar
-    from nautilus_trader.model import Equity
 
 NEW_YORK = ZoneInfo("America/New_York")
 USD = Currency.from_str("USD")
@@ -92,27 +87,6 @@ BAR_TYPE = BarType.from_str("AAPL.ALPACA-1-DAY-LAST-EXTERNAL")
 MSFT_BAR_TYPE = BarType.from_str("MSFT.ALPACA-1-DAY-LAST-EXTERNAL")
 STARTING_BALANCE = Money(100_000, USD)
 TRADE_SIZE = Quantity.from_int(10)
-
-ASSET_AAPL = {
-    "borrow_status": "easy_to_borrow",
-    "class": "us_equity",
-    "easy_to_borrow": True,
-    "exchange": "NASDAQ",
-    "fractionable": True,
-    "id": "b0b6dd9d-8b9b-48a9-ba46-b9d54906e415",
-    "marginable": True,
-    "name": "Apple Inc. Common Stock",
-    "shortable": True,
-    "status": "active",
-    "symbol": "AAPL",
-    "tradable": True,
-}
-
-CLOSES = [
-    *(float(c) for c in range(101, 116)),  # bars 0 to 14: 101 up to 115
-    *(float(c) for c in range(114, 99, -1)),  # bars 15 to 29: 114 down to 100
-    *(float(c) for c in range(101, 111)),  # bars 30 to 39: 101 up to 110
-]
 
 # (side, index of the bar whose close filled it); see the module docstring for the working.
 EXPECTED_FILLS = [
@@ -143,58 +117,6 @@ class Recording(MaCross):
 
     def on_order_filled(self, event: OrderFilled) -> None:
         self.fills_seen.append(event)
-
-
-def equity(symbol: str = "AAPL") -> Equity:
-    return parse_equity(Asset.model_validate({**ASSET_AAPL, "symbol": symbol}), 0)
-
-
-def daily_bars(instrument: Equity) -> list[Bar]:
-    """The series in the module docstring, converted by the adapter from Alpaca-shaped payloads."""
-    symbol = instrument.id.symbol.value
-    bar_type = BarType.from_str(f"{instrument.id}-1-DAY-LAST-EXTERNAL")
-    bars = []
-    day = datetime(2025, 3, 10, tzinfo=NEW_YORK)
-    previous_close = 100.0
-    for close in CLOSES:
-        while day.weekday() >= 5:  # Saturday, Sunday
-            day += timedelta(days=1)
-        payload = {
-            "t": day.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "o": previous_close,
-            "h": max(previous_close, close),
-            "l": min(previous_close, close),
-            "c": close,
-            "v": 1_000_000,
-            "n": 1_000,
-            "vw": close,
-        }
-        bars.append(parse_bar(AlpacaBar(symbol, payload), bar_type, instrument))
-        previous_close = close
-        day += timedelta(days=1)
-    return bars
-
-
-def write_catalog(
-    path: Path,
-    *,
-    symbols: tuple[str, ...] = ("AAPL",),
-    instrument: bool = True,
-    bars: bool = True,
-) -> list[Bar]:
-    """Write each symbol's instrument and bars to a new catalog at `path`; return the first's bars."""
-    path.mkdir(exist_ok=True)  # the catalog does not create its own directory
-    catalog = ParquetDataCatalog(str(path))
-    written = []
-    for symbol in symbols:
-        listed = equity(symbol)
-        series = daily_bars(listed)
-        if instrument:
-            catalog.write_instruments([listed])
-        if bars:
-            catalog.write_bars(series)
-        written.append(series)
-    return written[0]
 
 
 def config(
@@ -239,16 +161,16 @@ def fills(orders: list, bars: list[Bar]) -> list[tuple[OrderSide, int]]:
         assert order.venue_order_id is not None
         assert order.filled_qty == TRADE_SIZE
         index = index_at[order.ts_last]
-        assert order.avg_px == Decimal(CLOSES[index])
+        assert order.avg_px == Decimal(float(bars[index].close))
         found.append((order.side, index))
     return found
 
 
-def test_the_fixture_is_what_the_docstring_says() -> None:
-    bars = daily_bars(equity())
+def test_the_fixture_is_what_the_docstring_says(alpaca_bars: AlpacaBars) -> None:
+    bars = alpaca_bars.daily(alpaca_bars.equity())
 
     assert len(bars) == 40
-    assert [float(bar.close) for bar in bars] == CLOSES
+    assert [float(bar.close) for bar in bars] == list(alpaca_bars.CLOSES)
     # Each bar is stamped at its New York midnight open, and exists from 24 hours later.
     first_open = datetime(2025, 3, 10, tzinfo=NEW_YORK)
     assert bars[0].ts_event == int(first_open.timestamp()) * 1_000_000_000
@@ -258,8 +180,8 @@ def test_the_fixture_is_what_the_docstring_says() -> None:
     assert opens[-1].date().isoformat() == "2025-05-02"
 
 
-def test_backtest_runs_end_to_end(tmp_path: Path) -> None:
-    bars = write_catalog(tmp_path)
+def test_backtest_runs_end_to_end(alpaca_bars: AlpacaBars, tmp_path: Path) -> None:
+    bars = alpaca_bars.write(tmp_path)
     recording = Recording(config())
 
     backtest = run(tmp_path, recording)
@@ -302,8 +224,10 @@ def test_backtest_runs_end_to_end(tmp_path: Path) -> None:
     assert balance == Money(100_090, USD)
 
 
-def test_two_strategies_each_trade_their_own_position(tmp_path: Path) -> None:
-    bars = write_catalog(tmp_path)
+def test_two_strategies_each_trade_their_own_position(
+    alpaca_bars: AlpacaBars, tmp_path: Path
+) -> None:
+    bars = alpaca_bars.write(tmp_path)
     first = MaCross(config(order_id_tag="A"))
     second = MaCross(config(fast=2, slow=12, order_id_tag="B"))
 
@@ -331,8 +255,10 @@ def test_two_strategies_each_trade_their_own_position(tmp_path: Path) -> None:
     assert backtest.account.balance_total(USD) == Money(100_140, USD)
 
 
-def test_strategies_on_two_instruments_both_run_to_the_end(tmp_path: Path) -> None:
-    bars = write_catalog(tmp_path, symbols=("AAPL", "MSFT"))
+def test_strategies_on_two_instruments_both_run_to_the_end(
+    alpaca_bars: AlpacaBars, tmp_path: Path
+) -> None:
+    bars = alpaca_bars.write(tmp_path, symbols=("AAPL", "MSFT"))
     aapl = MaCross(config(order_id_tag="A"))
     msft = MaCross(config(bar_type=MSFT_BAR_TYPE, fast=2, slow=12, order_id_tag="M"))
 
@@ -350,9 +276,9 @@ def test_strategies_on_two_instruments_both_run_to_the_end(tmp_path: Path) -> No
 
 
 def test_a_relative_catalog_path_is_taken_from_the_current_directory(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    alpaca_bars: AlpacaBars, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    write_catalog(tmp_path / "catalog")
+    alpaca_bars.write(tmp_path / "catalog")
     monkeypatch.chdir(tmp_path)
 
     backtest = run(Path("catalog"), MaCross(config()))
@@ -360,15 +286,30 @@ def test_a_relative_catalog_path_is_taken_from_the_current_directory(
     assert backtest.result.total_orders == 4
 
 
-def test_a_run_without_a_strategy_is_refused(tmp_path: Path) -> None:
-    write_catalog(tmp_path)
+def test_a_run_without_a_strategy_is_refused(alpaca_bars: AlpacaBars, tmp_path: Path) -> None:
+    alpaca_bars.write(tmp_path)
 
     with pytest.raises(ValueError, match="at least one strategy"):
         run(tmp_path)
 
 
-def test_a_catalog_without_the_bars_is_refused(tmp_path: Path) -> None:
-    write_catalog(tmp_path, bars=False)
+def test_a_run_config_run_without_a_strategy_is_refused(
+    alpaca_bars: AlpacaBars, tmp_path: Path
+) -> None:
+    """The node would replay the bars with nothing to trade them and return an empty result."""
+    alpaca_bars.write(tmp_path)
+    config = backtest_run_config(
+        tmp_path,
+        [MaCross(MaCrossConfig(bar_type=BAR_TYPE, trade_size=TRADE_SIZE))],
+        starting_balances=["100000 USD"],
+    )
+
+    with pytest.raises(ValueError, match="needs at least one strategy"):
+        run_backtest_config(config, [])
+
+
+def test_a_catalog_without_the_bars_is_refused(alpaca_bars: AlpacaBars, tmp_path: Path) -> None:
+    alpaca_bars.write(tmp_path, bars=False)
 
     with pytest.raises(LookupError, match="holds no AAPL.ALPACA-1-DAY-LAST-EXTERNAL bars"):
         run(tmp_path, MaCross(config()))
@@ -376,9 +317,9 @@ def test_a_catalog_without_the_bars_is_refused(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("lacking_first", [True, False])
 def test_a_strategy_whose_bars_the_catalog_lacks_is_refused(
-    tmp_path: Path, *, lacking_first: bool
+    alpaca_bars: AlpacaBars, tmp_path: Path, *, lacking_first: bool
 ) -> None:
-    write_catalog(tmp_path)
+    alpaca_bars.write(tmp_path)
     served = MaCross(config(order_id_tag="A"))
     lacking = MaCross(config(bar_type=MSFT_BAR_TYPE, order_id_tag="M"))
     strategies = [lacking, served] if lacking_first else [served, lacking]
@@ -388,16 +329,20 @@ def test_a_strategy_whose_bars_the_catalog_lacks_is_refused(
         run(tmp_path, *strategies)
 
 
-def test_two_bar_types_for_one_instrument_are_refused(tmp_path: Path) -> None:
-    write_catalog(tmp_path)
+def test_two_bar_types_for_one_instrument_are_refused(
+    alpaca_bars: AlpacaBars, tmp_path: Path
+) -> None:
+    alpaca_bars.write(tmp_path)
     hourly = BarType.from_str("AAPL.ALPACA-1-HOUR-LAST-EXTERNAL")
 
     with pytest.raises(ValueError, match=r"are two bar types for AAPL\.ALPACA"):
         run(tmp_path, MaCross(config()), MaCross(config(bar_type=hourly)))
 
 
-def test_a_catalog_without_the_instrument_fails_the_run(tmp_path: Path) -> None:
-    write_catalog(tmp_path, instrument=False)
+def test_a_catalog_without_the_instrument_fails_the_run(
+    alpaca_bars: AlpacaBars, tmp_path: Path
+) -> None:
+    alpaca_bars.write(tmp_path, instrument=False)
 
     # NautilusTrader's own refusal while it builds the engine, in its words at v2.0.0rc8. The entry
     # point lets it through instead of returning an empty result.
@@ -406,8 +351,10 @@ def test_a_catalog_without_the_instrument_fails_the_run(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("elsewhere_first", [True, False])
-def test_a_bar_type_on_another_venue_is_refused(tmp_path: Path, *, elsewhere_first: bool) -> None:
-    write_catalog(tmp_path)
+def test_a_bar_type_on_another_venue_is_refused(
+    alpaca_bars: AlpacaBars, tmp_path: Path, *, elsewhere_first: bool
+) -> None:
+    alpaca_bars.write(tmp_path)
     here = MaCross(config(order_id_tag="A"))
     elsewhere = MaCross(
         config(bar_type=BarType.from_str("AAPL.XNAS-1-DAY-LAST-EXTERNAL"), order_id_tag="X"),
@@ -439,8 +386,8 @@ def test_a_strategy_whose_instrument_is_not_in_the_cache_cannot_start() -> None:
         engine.dispose()
 
 
-def test_a_fractional_trade_size_cannot_start(tmp_path: Path) -> None:
-    write_catalog(tmp_path)
+def test_a_fractional_trade_size_cannot_start(alpaca_bars: AlpacaBars, tmp_path: Path) -> None:
+    alpaca_bars.write(tmp_path)
 
     with pytest.raises(RuntimeError, match=r"trade_size 1\.5 is finer than AAPL\.ALPACA allows"):
         run(tmp_path, MaCross(config(trade_size=Quantity.from_str("1.5"))))

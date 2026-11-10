@@ -156,8 +156,7 @@ def backtest_run_config(
     `end`); with none, it replays every bar the catalog holds. `canon_trading.ledger` passes its study's
     sample (ADR 0041). A catalog whose stored intervals of a bar type miss that range is refused too.
     """
-    if not strategies:
-        raise ValueError("run_backtest needs at least one strategy")
+    _require_strategies(strategies)
     bar_types: dict[str, str] = {}  # instrument ID to its one bar type, in the strategies' order
     for strategy in strategies:
         bar_type = str(strategy.bar_type)
@@ -211,7 +210,6 @@ def run_backtest(
     *,
     starting_balances: Sequence[str],
     logging: LoggerConfig | None = None,
-    run_config_id: str | None = None,
 ) -> BacktestRun:
     """Run `strategies` together, on one account, over their bars in the catalog at `catalog_path`.
 
@@ -235,17 +233,23 @@ def run_backtest(
         strategies,
         starting_balances=starting_balances,
         logging=logging,
-        run_config_id=run_config_id,
     )
     return run_backtest_config(config, strategies)
+
+
+def _require_strategies(strategies: Sequence[MaCross]) -> None:
+    if not strategies:
+        raise ValueError("run_backtest needs at least one strategy")
 
 
 def run_backtest_config(config: BacktestRunConfig, strategies: Sequence[MaCross]) -> BacktestRun:
     """Run `strategies` under `config`, a config `backtest_run_config` built, and dispose the node.
 
     `canon_trading.ledger` calls this with the config whose key it recorded, so the config hashed is
-    the config run.
+    the config run. No strategies is refused, as `backtest_run_config` refuses it: the node would run
+    the bars with nothing to trade them and return an empty result without an error.
     """
+    _require_strategies(strategies)
     node = BacktestNode([config])
     try:
         node.build()
