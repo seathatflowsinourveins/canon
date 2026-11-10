@@ -77,7 +77,7 @@ Not decided, or not verified:
 ### Confirmation
 
 `uv lock --check` shows the lock matches the manifests. `scripts/canon list` shows every direct dependency.
-`uv run pytest` runs the suite, including `packages/canon-alpaca/tests/test_upstream_contract.py`, which
+`uv run --locked pytest` runs the suite, including `packages/canon-alpaca/tests/test_upstream_contract.py`, which
 fails if a pin moves and upstream has renamed anything this repo's docs quote.
 
 At first install on 2026-11-09: 24 third-party packages installed from wheels with `--no-build`; the two

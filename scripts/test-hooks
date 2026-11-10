@@ -6,7 +6,8 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 GUARD="$ROOT/.claude/hooks/guard.sh"
 MARK="$ROOT/.claude/hooks/unattended-mark.sh"
-TMP=$(mktemp -d)
+TMP=$(mktemp -d) || { echo "test-hooks: could not create a temp folder" >&2; exit 1; }
+trap 'chmod -R u+w "$TMP" 2>/dev/null; rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/.canon/unattended"
 : > "$TMP/.canon/unattended/unattended-1"
 pass=0; fail=0
@@ -17,6 +18,8 @@ expect() {
   CLAUDE_PROJECT_DIR="$TMP" "$GUARD" <<<"$payload" >/dev/null 2>&1; got=$?
   if [ "$got" = "$want" ]; then pass=$((pass+1)); else fail=$((fail+1)); echo "  FAIL  $label (wanted exit $want, got $got)"; fi
 }
+# check <label> <command...>: passes when the command succeeds
+check() { local label="$1"; shift; if "$@"; then pass=$((pass+1)); else fail=$((fail+1)); echo "  FAIL  $label"; fi; }
 bash_call()  { jq -cn --arg s "$1" --arg c "$2" '{session_id:$s, hook_event_name:"PreToolUse", tool_name:"Bash", tool_input:{command:$c}}'; }
 write_call() { jq -cn --arg s "$1" --arg p "$2" --arg c "$3" '{session_id:$s, hook_event_name:"PreToolUse", tool_name:"Write", tool_input:{file_path:$p, content:$c}}'; }
 edit_call()  { jq -cn --arg s "$1" --arg p "$2" --arg c "$3" '{session_id:$s, hook_event_name:"PreToolUse", tool_name:"Edit", tool_input:{file_path:$p, old_string:"x", new_string:$c}}'; }
@@ -54,6 +57,266 @@ expect 0 "Write MCP config selecting paper"  "$(write_call $N /r/.mcp.json '{"en
 expect 0 "resolve in a normal session"       "$(bash_call $N 'scripts/canon resolve pytest')"
 expect 2 "input that is not JSON"            'this is not json'
 
+# --- the live-host and switch checks match what bash runs, not the raw text ---
+expect 2 "live host, quoted tail"            "$(bash_call $N 'curl https://api.alpaca."markets"/v2/account')"
+expect 2 "live host, quoted head"            "$(bash_call $N 'curl https://"api".alpaca.markets/v2/account')"
+expect 2 "live host in capitals"             "$(bash_call $N 'curl https://API.ALPACA.MARKETS/v2/account')"
+expect 2 "live host split by backslash-newline" "$(bash_call $N $'curl https://api.alpaca\\\n.markets/v2/account')"
+expect 2 "live host with stray backslashes"  "$(bash_call $N 'curl https://a\pi.alpaca.mar\kets/v2/account')"
+expect 2 "bare live host, no scheme"         "$(bash_call $N 'curl api.alpaca.markets/v2/account')"
+expect 2 "live host behind userinfo"         "$(bash_call $N 'curl https://k:s@api.alpaca.markets/v2/account')"
+expect 0 "paper host in capitals"            "$(bash_call $N 'curl https://PAPER-API.alpaca.markets/v2/account')"
+expect 0 "paper host behind userinfo"        "$(bash_call $N 'curl https://k:s@paper-api.alpaca.markets/v2/account')"
+expect 0 "docs host"                         "$(bash_call $N 'curl https://docs.alpaca.markets/llms.txt')"
+expect 2 "paper switch with empty quotes"    "$(bash_call $N "ALPACA_PAPER_TRADE=f''alse uvx alpaca-mcp-server")"
+expect 2 "live switch with split quotes"     "$(bash_call $N 'ALPACA_LIVE_TRADE="tr"ue alpaca order list')"
+expect 2 "WebFetch live host in capitals"    "$(fetch_call $N 'https://API.Alpaca.Markets/v2/orders')"
+expect 2 "WebFetch live host behind user@"   "$(fetch_call $N 'https://user@api.alpaca.markets/v2/orders')"
+expect 0 "WebFetch sandbox broker host"      "$(fetch_call $N 'https://broker-api.sandbox.alpaca.markets/v1/accounts')"
+
+# --- commit gate: every spelling git accepts for skipping the hook ---
+expect 2 "commit --no-\"\"verify"            "$(bash_call $N 'git commit --no-""verify -m x')"
+expect 2 "commit -nm"                        "$(bash_call $N 'git commit -nm x')"
+expect 2 "commit -an"                        "$(bash_call $N 'git commit -an -m x')"
+expect 2 "commit --no-veri"                  "$(bash_call $N 'git commit --no-veri -m x')"
+expect 2 "commit --no-verif"                 "$(bash_call $N 'git commit --no-verif -m x')"
+expect 2 "commit with quoted -n"             "$(bash_call $N 'git commit "-n" -m x')"
+expect 2 "commit -n after a heredoc message" "$(bash_call $N $'git commit -m "$(cat <<\'EOF\'\nsubject\nEOF\n)" -n')"
+# shellcheck disable=SC2016  # the unexpanded text is the payload under test
+expect 2 "commit with flags in a variable"   "$(bash_call $N 'git commit $FLAGS -m x')"
+expect 2 "-c core.hooksPath on a commit"     "$(bash_call $N 'git -c core.hooksPath=/dev/null commit -m x')"
+expect 2 "--config-env core.hooksPath"       "$(bash_call $N 'git --config-env=core.hooksPath=HP commit -m x')"
+expect 2 "GIT_CONFIG_* on a commit"          "$(bash_call $N 'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/dev/null git commit -m x')"
+expect 2 "commit -n inside bash -c"          "$(bash_call $N 'bash -c "git commit -n -m x"')"
+# shellcheck disable=SC2016  # the unexpanded text is the payload under test
+expect 2 "commit -n inside a substitution"   "$(bash_call $N 'echo "$(git commit -n -m x)"')"
+expect 0 "commit -am"                        "$(bash_call $N 'git commit -am x')"
+expect 0 "commit -sm"                        "$(bash_call $N 'git commit -sm x')"
+expect 0 "git -C dir commit"                 "$(bash_call $N 'git -C /tmp/r commit -m x')"
+expect 0 "commit message containing -n"      "$(bash_call $N 'git commit -m "handle the -n flag"')"
+expect 0 "commit message starting with -n"   "$(bash_call $N 'git commit -m "-n is refused"')"
+expect 0 "commit with a heredoc message"     "$(bash_call $N $'git commit -m "$(cat <<\'EOF\'\nsubject -n\n\nIt\'s plain.\nEOF\n)"')"
+
+# --- Python that leaves paper trading, in files and in shell commands ---
+expect 2 "Write .py with paper=False split over lines" "$(write_call $N /r/src/a.py $'c = TradingClient(k, s,\n    paper=\n    False)')"
+expect 2 "Edit .py with paper = False across a newline" "$(edit_call $N /r/src/a.py $'TradingClient(k, s, paper\n= False)')"
+expect 2 "python -c with paper=False"        "$(bash_call $N 'python -c "from alpaca.trading.client import TradingClient as T; T(k, s, paper=False)"')"
+expect 2 "heredoc writing paper=False"       "$(bash_call $N $'cat > src/a.py <<\'EOF\'\nc = TradingClient(k, s, paper=False)\nEOF')"
+expect 2 "shell command using TRADING_LIVE"  "$(bash_call $N 'python -c "print(BaseURL.TRADING_LIVE)"')"
+expect 0 "command mentioning paper=True"     "$(bash_call $N 'grep -rn "paper=True" src')"
+expect 0 "uv run --locked pytest"            "$(bash_call $N 'uv run --locked pytest')"
+
+# --- uv run must not re-lock ---
+expect 2 "uv run pytest"                     "$(bash_call $N 'uv run pytest')"
+expect 2 "uv run ruff"                       "$(bash_call $N 'uv run ruff check .')"
+expect 2 "uv run with a global option"       "$(bash_call $N 'uv --project packages/x run pytest')"
+expect 2 "uv run with --locked after the command" "$(bash_call $N 'uv run pytest --locked')"
+expect 2 "uv run after a chain"              "$(bash_call $N 'cd x && uv run pytest')"
+expect 0 "uv run --frozen ty check"          "$(bash_call $N 'uv run --frozen ty check')"
+expect 0 "mise exec uv run --locked ruff"    "$(bash_call $N 'mise exec -- uv run --locked ruff check .')"
+expect 0 "uv tool run is not a project run"  "$(bash_call $N 'uv tool run shellcheck x')"
+expect 0 "uv run --package x --locked"       "$(bash_call $N 'uv run --package canon-alpaca --locked pytest')"
+expect 0 "uv run --project x --locked"       "$(bash_call $N 'uv run --project x --locked pytest -q')"
+expect 2 "UV_LOCKED=1 is not --locked"       "$(bash_call $N 'UV_LOCKED=1 uv run pytest')"
+expect 2 "uv run --package x without --locked" "$(bash_call $N 'uv run --package canon-alpaca pytest')"
+
+# --- installs that go around uv.lock ---
+expect 2 "pip3 install"                      "$(bash_call $N 'pip3 install x')"
+expect 2 "pip3.14 install"                   "$(bash_call $N 'pip3.14 install x')"
+expect 2 "python -m pip install"             "$(bash_call $N 'python -m pip install x')"
+expect 2 "python3 -m pip install"            "$(bash_call $N 'python3 -m pip install x')"
+expect 2 "python3 -mpip install"             "$(bash_call $N 'python3 -mpip install x')"
+expect 2 "uv pip sync"                       "$(bash_call $N 'uv pip sync requirements.txt')"
+
+# --- git aliases, config and subcommands this hook cannot read ---
+expect 2 "-c alias to commit"                "$(bash_call $N 'git -c alias.ci=commit ci -n -m a')"
+expect 2 "-c shell alias running a commit"   "$(bash_call $N "git -c alias.x='!git commit -n -m y' x")"
+expect 2 "--config-env alias"                "$(bash_call $N 'git --config-env alias.ci=CI ci -n -m a')"
+expect 2 "--config-env=alias"                "$(bash_call $N 'git --config-env=alias.ci=CI ci -n -m a')"
+expect 2 "subcommand in \$'...'"             "$(bash_call $N "git \$'commit' -n -m b")"
+expect 2 "bash -c with \$'...' git text"     "$(bash_call $N "bash -c \$'git commit -n -m c'")"
+expect 2 "-c include.path on a commit"       "$(bash_call $N 'git -c include.path=/x commit -m y')"
+expect 2 "--config-env hooksPath, two words" "$(bash_call $N 'git --config-env core.hooksPath=X commit -m y')"
+expect 2 "-c attached hooksPath"             "$(bash_call $N 'git -ccore.hooksPath=/dev/null commit -m y')"
+# shellcheck disable=SC2016  # the unexpanded text is the payload under test
+expect 2 "commit -n after a backtick substitution" "$(bash_call $N 'echo `git rev-parse HEAD` && git commit -n -m y')"
+# shellcheck disable=SC2016  # the unexpanded text is the payload under test
+expect 2 "commit -n in a second backtick substitution" "$(bash_call $N 'echo `date` `git commit -n -m y`')"
+# shellcheck disable=SC2016  # the unexpanded text is the payload under test
+expect 2 "git -C \$(...) unquoted, then commit -n" "$(bash_call $N 'git -C $(pwd) commit -n -m y')"
+# shellcheck disable=SC2016  # the unexpanded text is the payload under test
+expect 0 "git -C \"\$(...)\" quoted, then commit" "$(bash_call $N 'git -C "$(pwd)" commit -m y')"
+expect 2 "git config sets core.hooksPath"    "$(bash_call $N 'git config core.hooksPath /dev/null')"
+expect 2 "git config --global hookspath"     "$(bash_call $N 'git config --global core.HooksPath /dev/null')"
+expect 2 "git config --system alias"         "$(bash_call $N 'git config --system alias.ci commit')"
+expect 2 "git config --file include.path"    "$(bash_call $N 'git config --file f include.path /x')"
+expect 2 "git config --local includeIf"      "$(bash_call $N 'git config --local includeIf.gitdir:/x/.path /y')"
+expect 2 "git config set alias"              "$(bash_call $N 'git config set --global alias.ci commit')"
+expect 0 "git config --get hooksPath"        "$(bash_call $N 'git config --get core.hooksPath')"
+expect 0 "git config --list"                 "$(bash_call $N 'git config --list')"
+expect 0 "git config sets another key"       "$(bash_call $N 'git config user.name x')"
+expect 0 "git config --global --get alias"   "$(bash_call $N 'git config --global --get alias.ci')"
+
+# --- messages: a refusal names git commit -F; message text is not matched ---
+# expect_msg <exit code> <label> <stderr pattern> <json payload>
+expect_msg() {
+  local want="$1" label="$2" pat="$3" payload="$4" got err
+  err=$(CLAUDE_PROJECT_DIR="$TMP" "$GUARD" <<<"$payload" 2>&1 >/dev/null); got=$?
+  if [ "$got" = "$want" ] && grep -qF -- "$pat" <<<"$err"; then pass=$((pass+1))
+  else fail=$((fail+1)); echo "  FAIL  $label (wanted exit $want and '$pat', got $got: $err)"; fi
+}
+expect_msg 2 "-n refusal names git commit -F" "git commit -F <file>" "$(bash_call $N 'git commit -m x -n')"
+expect_msg 2 "cluster refusal names git commit -F" "git commit -F <file>" "$(bash_call $N 'git commit -m x -a.')"
+long=$(printf 'x%.0s' $(seq 1 17000))
+expect_msg 2 "commit over 16 KB names git commit -F" "git commit -F <file>" "$(bash_call $N "git commit -m \"$long\"")"
+expect 0 "commit message naming the guarded text" "$(bash_call $N 'git commit -m "Refuse paper=False split across lines and api.alpaca.markets in quotes; uv run pytest now needs --locked"')"
+expect 0 "commit --message= naming paper=False" "$(bash_call $N 'git commit --message="paper=False is refused"')"
+expect 0 "heredoc message naming paper=False" "$(bash_call $N $'git commit -m "$(cat <<\'EOF\'\nRefuse paper=False and uv run pytest\nEOF\n)"')"
+expect 0 "commit -F - heredoc naming paper=False" "$(bash_call $N $'git commit -F - <<\'EOF\'\nRefuse paper=False and api.alpaca.markets\nEOF')"
+expect 0 "gh pr create title and body"       "$(bash_call $N 'gh pr create --title "uv run pytest needs --locked" --body "paper=False and url_override= are refused"')"
+expect 0 "gh pr edit -t and -b"              "$(bash_call $N 'gh pr edit 4 -t "paper=False" -b "api.alpaca.markets"')"
+expect 2 "live host after a commit message"  "$(bash_call $N 'git commit -m "x" && curl https://api.alpaca.markets/v2/account')"
+# shellcheck disable=SC2016  # the unexpanded text is the payload under test
+expect 2 "live host in a substituted message" "$(bash_call $N 'git commit -m "$(curl https://api.alpaca.markets/v2/account)"')"
+expect 2 "heredoc to a file, unquoted"       "$(bash_call $N $'cat > a.py <<EOF\nc = TradingClient(k, s, paper=False)\nEOF')"
+expect 2 "heredoc to a shell runs a commit"  "$(bash_call $N $'bash <<\'EOF\'\ngit commit -n -m x\nEOF')"
+
+# --- a single search command may name the guarded text ---
+expect 0 "grep for paper=False"              "$(bash_call $N 'grep -rn "paper=False" src')"
+expect 0 "grep for the live host"            "$(bash_call $N 'grep -n "api.alpaca.markets" .claude/hooks/guard.sh')"
+expect 0 "rg for url_override"               "$(bash_call $N 'rg "url_override" packages')"
+expect 0 "git grep for paper=False"          "$(bash_call $N 'git grep -n "paper=False"')"
+expect 2 "grep piped on"                     "$(bash_call $N 'grep -rn "paper=False" src | wc -l')"
+expect 2 "rg --pre with the live host"       "$(bash_call $N 'rg --pre ./x "api.alpaca.markets" src')"
+expect 2 "git grep -O with paper=False"      "$(bash_call $N 'git grep -O./x "paper=False"')"
+expect 2 "echo paper=False"                  "$(bash_call $N 'echo "paper=False"')"
+
+# --- URLs are read by URL rules ---
+expect 2 "percent-encoded live host letter"  "$(bash_call $N 'curl https://%61pi.alpaca.markets/v2/account')"
+expect 2 "percent-encoded live host dots"    "$(bash_call $N 'curl https://api%2Ealpaca%2Emarkets/v2/account')"
+expect 2 "live host with a trailing dot"     "$(bash_call $N 'curl https://api.alpaca.markets./v2/account')"
+expect 2 "WebFetch percent-encoded letter"   "$(fetch_call $N 'https://%61pi.alpaca.markets/v2/account')"
+expect 2 "WebFetch percent-encoded dots"     "$(fetch_call $N 'https://api%2Ealpaca%2Emarkets/v2/account')"
+expect 2 "WebFetch live host, trailing dot"  "$(fetch_call $N 'https://api.alpaca.markets./v2/account')"
+expect 2 "WebFetch URL with a backslash"     "$(fetch_call $N 'https://docs.alpaca.markets/a\b')"
+
+# --- the hook itself ---
+blocks=$(jq -r '[.hooks.PreToolUse[].hooks[] | select(.command | test("guard\\.sh")) | .onFailure] | all(. == "block")' "$ROOT/.claude/settings.json")
+check "guard.sh blocks the call when it fails" test "$blocks" = "true"
+# timed <label> <json payload>: passes when the hook decides within 2 seconds
+timed() {
+  local label="$1" payload="$2" t TIMEFORMAT=%R
+  t=$( { time CLAUDE_PROJECT_DIR="$TMP" "$GUARD" <<<"$payload" >/dev/null 2>&1; } 2>&1 )
+  if awk -v t="$t" 'BEGIN { exit !(t + 0 < 2) }'; then pass=$((pass+1)); else fail=$((fail+1)); echo "  FAIL  $label took ${t}s"; fi
+}
+lines=$(for k in $(seq 1 340); do printf 'line %s: run git status, then gh pr view "a b" | wc -l; done\n' "$k"; done)
+timed "20 KB Write payload"                  "$(write_call $N /r/src/a.py "$lines")"
+timed "20 KB Bash payload"                   "$(bash_call $N "$(printf 'cat > notes.txt <<%sEOF%s\n%s\nEOF' "'" "'" "$lines")")"
+timed "20 KB Bash payload, no here-document" "$(bash_call $N "echo \"$lines\"")"
+unlocked=$(jq -r '.permissions[][] | select(test("^Bash\\(uv run ")) | select(test("--(locked|frozen) ") | not)' "$ROOT/.claude/settings.json" | wc -l | tr -d ' ')
+check "settings allow uv run only with --locked" test "$unlocked" = "0"
+pyl=$(grep -E 'uv run' "$ROOT/.claude/hooks/py-lint.sh" | grep -cvE 'uv run --locked')
+check "py-lint calls uv run --locked"        test "$pyl" = "0"
+
+# --- unattended hosts are a subset of the WebFetch allow-list ---
+ghosts=$(sed -n "s/^UNATTENDED_HOSTS='\(.*\)'\$/\1/p" "$GUARD")
+shosts=$(jq -r '.permissions.allow[] | capture("^WebFetch\\(domain:(?<d>[^)]+)\\)$").d' "$ROOT/.claude/settings.json")
+check "guard lists unattended hosts"         test -n "$ghosts"
+extra=""
+for h in $ghosts; do grep -qxF "$h" <<<"$shosts" || extra="$extra $h"; done
+[ -z "$extra" ] || echo "  hosts in guard.sh but not in settings.json:$extra"
+check "unattended hosts are in the allow-list" test -z "$extra"
+
+# --- message text counts only when git, gh or scripts/land is the command word ---
+# shellcheck disable=SC2016  # the unexpanded text is the payload under test
+expect 2 "sh -c with git commit -m holding pip install" "$(bash_call $N 'sh -c "$3" git commit -m "pip install requests"')"
+# shellcheck disable=SC2016  # the unexpanded text is the payload under test
+expect 2 "sh -c with git commit -m holding the live host" "$(bash_call $N 'sh -c "$3" git commit -m "curl https://api.alpaca.markets/v2/account"')"
+# shellcheck disable=SC2016  # the unexpanded text is the payload under test
+expect 2 "sh -c with gh pr create -t holding the live host" "$(bash_call $N 'sh -c "$4" gh pr create -t "curl https://api.alpaca.markets/v2/orders"')"
+expect 2 "printf gh pr create -t live host into sh" "$(bash_call $N "printf '%s\\n' gh pr create -t \"curl https://api.alpaca.markets/v2/orders\" | tail -1 | sh")"
+expect 2 "printf gh pr create -t live switch into sh" "$(bash_call $N "printf '%s\\n' gh pr create -t \"ALPACA_LIVE_TRADE=true alpaca order list\" | tail -1 | sh")"
+expect 0 "assignment before git commit -m"   "$(bash_call $N 'GIT_AUTHOR_NAME=x git commit -m "paper=False is refused"')"
+expect 0 "scripts/land --reviewed naming guarded text" "$(bash_call $N 'scripts/land --reviewed "code-review: pip install and api.alpaca.markets now refused"')"
+expect 0 "scripts/land --body f --reviewed"  "$(bash_call $N 'scripts/land --body pr.md --reviewed "uv run pytest and paper=False checked"')"
+expect 0 "./scripts/land --reviewed="        "$(bash_call $N './scripts/land --reviewed="paper=False refused"')"
+expect 0 "git log --grep live host"          "$(bash_call $N 'git log --grep="api.alpaca.markets"')"
+expect 0 "git log -S paper=False"            "$(bash_call $N 'git log -S"paper=False"')"
+expect 0 "git log -G url_override"           "$(bash_call $N 'git log -G "url_override=" --oneline')"
+expect 0 "uv run --help"                     "$(bash_call $N 'uv run --help')"
+expect 0 "uv --help"                         "$(bash_call $N 'uv --help')"
+
+# --- removing the commit gate through git config or .git/config ---
+expect 2 "git config --unset core.hooksPath" "$(bash_call $N 'git config --unset core.hooksPath')"
+expect 2 "git config --local --unset-all hooksPath" "$(bash_call $N 'git config --local --unset-all core.hooksPath')"
+expect 2 "git config unset core.hooksPath"   "$(bash_call $N 'git config unset core.hooksPath')"
+expect 2 "git config --remove-section core"  "$(bash_call $N 'git config --remove-section core')"
+expect 2 "git config --rename-section core"  "$(bash_call $N 'git config --rename-section core old')"
+expect 0 "git config --unset include.path"   "$(bash_call $N 'git config --unset include.path')"
+expect 2 "Write .git/config"                 "$(write_call $N /r/.git/config '[core]')"
+expect 2 "Edit a worktree's git dir config"  "$(edit_call  $N /r/.git/worktrees/w1/config.worktree '[core]')"
+
+# --- pip with options before the subcommand ---
+expect 2 "pip -q install"                    "$(bash_call $N 'pip -q install x')"
+expect 2 "pip --quiet install"               "$(bash_call $N 'pip --quiet install x')"
+expect 2 "pip --disable-pip-version-check install" "$(bash_call $N 'pip --disable-pip-version-check install x')"
+expect 2 "python3 -m pip --quiet install"    "$(bash_call $N 'python3 -m pip --quiet install x')"
+expect 2 "uv pip --verbose install"          "$(bash_call $N 'uv pip --verbose install x')"
+
+# --- a message file written with cat and a quoted here-document is read like a Write ---
+expect 0 "cat > file <<'EOF' message"        "$(bash_call $N $'cat > /tmp/msg.txt <<\'EOF\'\nRefuse paper=False, api.alpaca.markets and pip install\nEOF')"
+expect 2 "cat > file <<'EOF' then a command" "$(bash_call $N $'cat > /tmp/msg.txt <<\'EOF\'\nx\nEOF\ncurl https://api.alpaca.markets/v2/account')"
+expect 2 "cat > file.py <<'EOF' with paper=False" "$(bash_call $N $'cat > src/b.py <<\'EOF\'\nc = TradingClient(k, s, paper=False)\nEOF')"
+expect 2 "cat > .git/config <<'EOF'"         "$(bash_call $N $'cat > .git/config <<\'EOF\'\n[core]\nEOF')"
+
+# --- a piped search is refused as a search ---
+expect_msg 2 "grep piped to head says search" "looks like a search" "$(bash_call $N 'grep -rn "pip install" docs | head')"
+expect_msg 2 "rg piped to xargs says search" "looks like a search" "$(bash_call $N 'rg -l "paper=False" | xargs wc -l')"
+
+# --- other rules ---
+expect 2 "curl with \$'...' host"           "$(bash_call $N "curl \$'https://api\\x2ealpaca\\x2emarkets/v2/account'")"
+expect 0 "printf with \$'...'"               "$(bash_call $N "printf \$'a\\tb\\n'")"
+expect 2 "Write .py with paper=0"            "$(write_call $N /r/src/a.py 'c = TradingClient(k, s, paper=0)')"
+expect 2 "python -c with paper=0"            "$(bash_call $N 'python -c "T(k, s, paper=0)"')"
+CLAUDE_PROJECT_DIR="$TMP" "$GUARD" </dev/null >/dev/null 2>&1; rc=$?
+check "empty input is blocked"               test "$rc" = "2"
+manywords=$(printf 'a %.0s' $(seq 1 50000))
+expect 2 "100 KB of short words in one git command" "$(bash_call $N "git status $manywords")"
+timed "100 KB of short words in one git command" "$(bash_call $N "git status $manywords")"
+
+# --- message-file form: carriage returns, spacing ---
+expect 2 "cat <<'EOF' with CR, then pip install" "$(bash_call $N $'cat > /tmp/m <<\'EOF\'\r\nx\nEOF\r\npip install x\nEOF')"
+expect 2 "cat <<'EOF' with CR, then the live host" "$(bash_call $N $'cat > /tmp/m <<\'EOF\'\r\nx\nEOF\r\ncurl https://api.alpaca.markets/v2/account\nEOF')"
+expect 2 "cat <<'EOF' with CR, then commit -n" "$(bash_call $N $'cat > /tmp/m <<\'EOF\'\r\nx\nEOF\r\ngit commit -n -m y\nEOF')"
+expect 0 "cat>f<<'EOF' without spaces"       "$(bash_call $N $'cat>/tmp/m<<\'EOF\'\nRefuse paper=False\nEOF')"
+expect 2 "cat <<-'EOF' is not the form"      "$(bash_call $N $'cat > /tmp/m <<-\'EOF\'\nRefuse paper=False\n\tEOF')"
+
+# --- pip inside a subshell or substitution ---
+expect 2 "(pip install x)"                   "$(bash_call $N '(pip install x)')"
+# shellcheck disable=SC2016  # the unexpanded text is the payload under test
+expect 2 "backtick pip install"              "$(bash_call $N 'echo `pip install x`')"
+# shellcheck disable=SC2016  # the unexpanded text is the payload under test
+expect 2 "\$(pip install x)"                 "$(bash_call $N 'echo $(pip install x)')"
+# shellcheck disable=SC2016  # the unexpanded text is the payload under test
+expect 2 "land --reviewed \"\$(pip install x)\"" "$(bash_call $N 'scripts/land --reviewed "$(pip install x)"')"
+expect 0 "pip install --help"                "$(bash_call $N 'pip install --help')"
+expect 0 "pip help install"                  "$(bash_call $N 'pip help install')"
+
+# --- other spellings of .git/config ---
+expect 2 "Write .GIT/config"                 "$(write_call $N /r/.GIT/config '[core]')"
+expect 2 "Edit .git//config"                 "$(edit_call  $N /r/.git//config '[core]')"
+expect 2 "cat > .GIT/config <<'EOF'"         "$(bash_call $N $'cat > .GIT/config <<\'EOF\'\n[core]\nEOF')"
+
+# --- plain wrappers keep message text as text ---
+expect 0 "env git commit -m"                 "$(bash_call $N 'env GIT_AUTHOR_NAME=x git commit -m "paper=False is refused"')"
+expect 0 "command git commit -m"             "$(bash_call $N 'command git commit -m "api.alpaca.markets is refused"')"
+expect 0 "mise exec -- git commit -m"        "$(bash_call $N 'mise exec -- git commit -m "uv run pytest needs --locked"')"
+expect 0 "mise exec -- gh pr create -t"      "$(bash_call $N 'mise exec -- gh pr create -t "paper=False and pip install refused"')"
+# shellcheck disable=SC2016  # the unexpanded text is the payload under test
+expect 2 "bash -c is not a plain wrapper"    "$(bash_call $N 'bash -c "$1" git commit -m "pip install x"')"
+expect 2 "git config --edit"                 "$(bash_call $N 'git config --edit')"
+expect 2 "git config --global -e"            "$(bash_call $N 'git config --global -e')"
+
 # --- unattended session: read-only ---
 expect 0 "unattended: Read"                  "$(tool_call $U Read)"
 expect 0 "unattended: Agent"                 "$(tool_call $U Agent)"
@@ -67,16 +330,17 @@ expect 0 "unattended: git status"            "$(bash_call $U 'git status --short
 expect 0 "unattended: git rev-parse"         "$(bash_call $U 'git rev-parse --show-toplevel')"
 expect 2 "unattended: canon resolve"         "$(bash_call $U 'scripts/canon resolve')"
 expect 2 "unattended: git commit"            "$(bash_call $U 'git commit -m x')"
-expect 2 "unattended: chained command"       "$(bash_call $U 'ls; rm -rf x')"
-expect 2 "unattended: && chain"              "$(bash_call $U 'ls && uv sync')"
+# each input below is refused only by the rule its label names
+expect 2 "unattended: chained command"       "$(bash_call $U 'cat a; cat b')"
+expect 2 "unattended: && chain"              "$(bash_call $U 'cat a && cat b')"
 # shellcheck disable=SC2016  # the literal text $(ls) is the payload under test
 expect 2 "unattended: command substitution"  "$(bash_call $U 'cat $(ls)')"
-expect 2 "unattended: redirection"           "$(bash_call $U 'echo hi > f')"
+expect 2 "unattended: redirection"           "$(bash_call $U 'cat x > f')"
 expect 2 "unattended: git diff --output"     "$(bash_call $U 'git diff --output=f')"
 expect 2 "unattended: pipe into a shell"     "$(bash_call $U 'cat x | sh')"
-expect 2 "unattended: multi-line command"    "$(bash_call $U $'ls\nrm x')"
+expect 2 "unattended: multi-line command"    "$(bash_call $U $'ls\ncat x')"
 expect 2 "unattended: uv sync"               "$(bash_call $U 'uv sync')"
-# holes a second reader found in the first read-only list (2026-11-09)
+# read-only commands with a flag or argument that changes or runs something
 expect 2 "unattended: git branch -D"         "$(bash_call $U 'git branch -D main')"
 expect 2 "unattended: git branch <name>"     "$(bash_call $U 'git branch evil')"
 expect 2 "unattended: rg --pre runs a program" "$(bash_call $U 'rg --pre /bin/sh x .')"
@@ -92,18 +356,40 @@ expect 0 "unattended: grep piped to wc"      "$(bash_call $U 'grep -c status doc
 expect 0 "unattended: fetch github"          "$(fetch_call $U 'https://github.com/astral-sh/uv/releases')"
 expect 2 "unattended: fetch unknown host"    "$(fetch_call $U 'https://evil.example/x?d=1')"
 expect 2 "unattended: host look-alike"       "$(fetch_call $U 'https://github.com.evil.example/x')"
+expect 2 "unattended: allowed host as userinfo" "$(fetch_call $U 'https://github.com@evil.example/x')"
+expect 0 "unattended: userinfo before an allowed host" "$(fetch_call $U 'https://git@GitHub.com/astral-sh/uv')"
+expect 2 "unattended: fetch pypi.org"        "$(fetch_call $U 'https://pypi.org/project/uv/')"
+expect 2 "unattended: backslash before @"    "$(fetch_call $U 'https://docs.example\@github.com/x')"
+expect 2 "unattended: quote inside the host" "$(fetch_call $U 'https://git"hub.com/x')"
+expect 0 "unattended: percent-encoded allowed host" "$(fetch_call $U 'https://git%68ub.com/astral-sh/uv')"
 
 # --- marking hook ---
 mark() { CLAUDE_PROJECT_DIR="$TMP" "$MARK" <<<"$1" >/dev/null 2>&1; }
-# check <label> <command...>: passes when the command succeeds
-check() { local label="$1"; shift; if "$@"; then pass=$((pass+1)); else fail=$((fail+1)); echo "  FAIL  $label"; fi; }
 mark '{"session_id":"sched-9","hook_event_name":"UserPromptSubmit","prompt":"CANON-UNATTENDED-RUN\nDo the refresh."}'
 check "sentinel prompt marks the session"        test -e "$TMP/.canon/unattended/sched-9"
 mark '{"session_id":"human-3","hook_event_name":"UserPromptSubmit","prompt":"please check the pins"}'
 check "ordinary prompt does not mark"            test ! -e "$TMP/.canon/unattended/human-3"
-mark '{"session_id":"../../etc/x","hook_event_name":"UserPromptSubmit","prompt":"CANON-UNATTENDED-RUN"}'
-marked=$(find "$TMP/.canon/unattended" -type f | wc -l | tr -d ' ')
-check "hostile session id writes nothing"        test "$marked" = "2"
+mark '{"session_id":"../hostile","hook_event_name":"UserPromptSubmit","prompt":"CANON-UNATTENDED-RUN"}'; rc=$?
+check "hostile session id writes nothing"        test ! -e "$TMP/.canon/hostile"
+check "hostile session id blocks the prompt"     test "$rc" = "2"
+# the mark cannot be written: the prompt is blocked with a message on stderr, nothing on stdout
+R2="$TMP/r2"; mkdir -p "$R2"; : > "$R2/.canon"
+markin() { CLAUDE_PROJECT_DIR="$1" "$MARK" <<<"$2" >"$TMP/mark.out" 2>"$TMP/mark.err"; }
+markin "$R2" '{"session_id":"sched-1","prompt":"CANON-UNATTENDED-RUN"}'; rc=$?
+check ".canon is a file: prompt blocked"         test "$rc" = "2"
+check ".canon is a file: reason on stderr"       test -s "$TMP/mark.err"
+check ".canon is a file: stdout empty"           test ! -s "$TMP/mark.out"
+markin "$R2" '{"session_id":"human-1","prompt":"please check the pins"}'; rc=$?
+check ".canon is a file: ordinary prompt runs"   test "$rc" = "0"
+R3="$TMP/r3"; mkdir -p "$R3/.canon/unattended"; chmod a-w "$R3/.canon/unattended"
+if [ -w "$R3/.canon/unattended" ]; then
+  fail=$((fail+1)); echo "  FAIL  cannot make a directory read-only here (running as root?), so the unwritable case was not tested"
+else
+  markin "$R3" '{"session_id":"sched-2","prompt":"CANON-UNATTENDED-RUN"}'; rc=$?
+  check "unwritable marker folder: prompt blocked" test "$rc" = "2"
+fi
+markin "$TMP" 'not json'; rc=$?
+check "marking hook input not JSON: blocked"     test "$rc" = "2"
 out=$(CLAUDE_PROJECT_DIR="$TMP" "$MARK" <<<'{"session_id":"sched-9","prompt":"CANON-UNATTENDED-RUN"}' 2>&1)
 check "marking hook prints nothing"              test -z "$out"
 expect 2 "newly marked session is read-only"     "$(edit_call sched-9 /r/README.md 'x')"

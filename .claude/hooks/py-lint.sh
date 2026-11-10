@@ -3,7 +3,8 @@
 # Contract: https://code.claude.com/docs/en/hooks.md — exit 2 shows stderr to Claude; the edit has
 # already happened, so this is feedback, not a block.
 # After a Python file is edited, runs the pinned ruff on that one file (lint, then format check), so
-# problems surface at the edit instead of at the commit gate. Other files are ignored.
+# problems surface at the edit instead of at the commit gate. Other files are ignored. Calls
+# uv run --locked, which fails instead of rewriting uv.lock when the lock is out of date.
 input=$(cat)
 command -v jq >/dev/null 2>&1 || { echo "py-lint hook: jq not found, so ruff did NOT run." >&2; exit 2; }
 file=$(jq -r '.tool_input.file_path? // empty' <<<"$input")
@@ -19,6 +20,6 @@ if ! out=$("$mise" exec -- uv run --locked ruff check "$file" 2>&1); then
   echo "ruff check failed on ${file#"$root"/}:" >&2; echo "$out" | tail -30 >&2; exit 2
 fi
 if ! out=$("$mise" exec -- uv run --locked ruff format --check "$file" 2>&1); then
-  echo "ruff format --check failed on ${file#"$root"/}. Run: uv run ruff format ${file#"$root"/}" >&2; exit 2
+  echo "ruff format --check failed on ${file#"$root"/}. Run: uv run --locked ruff format ${file#"$root"/}" >&2; exit 2
 fi
 exit 0
