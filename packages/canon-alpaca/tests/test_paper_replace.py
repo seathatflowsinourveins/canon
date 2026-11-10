@@ -1,6 +1,6 @@
 """Alpaca's replace on its paper Trading API, through alpaca-py directly: what the client's modify rests on.
 
-`AlpacaExecutionClient._modify_order` (ADR 0036) relies on what a paper observation of 2026-11-10 showed in 3
+`AlpacaExecutionClient._modify_order` (ADR 0042) relies on what a paper observation of 2026-11-10 showed in 3
 of 3 runs and Alpaca's pages do not state: "Replace Order by ID"
 (https://docs.alpaca.markets/us/reference/patchorderbyorderid-1.md) refuses a replacement that keeps the
 original `client_order_id` with 422 "client_order_id must be unique"; its answer is the replacement, with a

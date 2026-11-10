@@ -8,7 +8,7 @@ client sends market, limit, stop and stop-limit orders for US equities to Alpaca
 at a time or all of an instrument's at once, turns Alpaca's trade updates into order events and fills, and
 reports orders and positions for reconciliation at start-up. Its config refuses anything but paper
 trading. The offline tests pass, and the paper integration tests run with `mise run paper:test` (see
-[Tests](#tests)); what each has shown against Alpaca is in ADR 0030 and ADR 0036.
+[Tests](#tests));what each has shown against Alpaca is in ADR 0030, ADR 0036, ADR 0038 and ADR 0042.
 
 NautilusTrader has no official Alpaca adapter, and its maintainer has said one is not planned in the near
 term. The decision to build one, and the alternatives, are in
@@ -222,7 +222,7 @@ Each is stated in `execution.py`'s header, with its source.
   and a replacement's `rejected` are `OrderModifyRejected`; a modify without a venue order ID, to a
   fractional quantity or to a sub-penny price is denied before Alpaca. What Alpaca's pages leave open was
   observed on paper and is asserted by `test_paper_replace.py`
-  ([ADR 0036](../../docs/adr/0036-alpaca-adapter-order-management.md)).
+  ([ADR 0042](../../docs/adr/0042-alpaca-adapter-modify.md)).
 * **Cancel-all** cancels the node's open and in-flight orders for the command's instrument, and side if
   it names one, each by ID, one at a time, as a single cancel does, skipping one already pending cancel;
   a refused one gets `OrderCancelRejected`, and after a refusal or a failure the rest go on. Alpaca's "Delete All Orders" cancels every open order of the
@@ -374,7 +374,7 @@ tasks"): with none, a queued unsubscribe was discarded and logged as an error on
 | TC-E85 reconcile filled orders | Passed twice (`test_paper_fill_reports.py`, after fill reports were added, 14:53 and 15:43): a market buy of 2 filled outside the node is reconciled `FILLED`, one fill per trade update, each with that update's `execution_id` and price, once Alpaca lists every fill. A first run, started before Alpaca listed the second fill, failed (see "Fill activities can lag the stream"); another hung after the node failed to disconnect its execution client, cause UNVERIFIED. The engine's log also says "Generated inferred fill" for orders it was given fill reports for; which path that line names is UNVERIFIED |
 | TC-E02, E32, E33, E44, E84, E86, E87 | Not run: a short, cancel-replace, cancel of a canceled order, and reconciliation of a prior session's open orders and positions |
 | TC-E20, TC-E22 stop and stop-limit buy | Passed in `test_paper_execution.py` (ADR 0036): accepted at the prices sent, as Alpaca holds them, reported back the same, canceled on stop |
-| TC-E30 modify limit buy | Ends `OrderModifyRejected` before Alpaca, as designed: the tester's one-tick amend is sub-penny at the 0.0001 increment (`test_paper_execution.py`, ADR 0036); a modify by a cent through a node passes there |
+| TC-E30 modify limit buy | Ends `OrderModifyRejected` before Alpaca, as designed: the tester's one-tick amend is sub-penny at the 0.0001 increment (`test_paper_execution.py`, ADR 0042); a modify by a cent through a node passes there |
 | TC-E21, E23, E31, E33 to E35 | Not run: sells (a short from flat), cancel-replace, and a stop's trigger modified (offline only) |
 | TC-E03 to E05, E13 to E18, E24 to E27, E36, E43, E50 to E53, E60 to E63, E70, E71 | Not in this slice, or do not apply: IOC, FOK, quote quantity, GTD, if-touched orders, an adapter without modify, batch cancel, brackets, order flags |
 | TC-E74 to E78 | Ambiguous submit and cancel failures run offline only (`test_execution_client.py`); a modify with no definitive answer is logged and left to the stream or reconciliation, not tested; batch does not apply |
