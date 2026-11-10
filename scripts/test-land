@@ -167,10 +167,45 @@ t_dirty() { new_repo; change README.md; echo "more" >> "$W/README.md"; land
 t_behind() {
   new_repo; git -C "$W" switch -q -c side main; change uv.lock; git -C "$W" push -q origin side:main
   git -C "$W" switch -q topic; change README.md; land
-  [ "$rc" -ne 0 ] && has "does not contain the current main" && ! ci_ran && ! pushed topic
+  [ "$rc" -ne 0 ] && has "does not contain the current main and is not pushed yet; rebase it onto main first" \
+    && ! has "git merge" && ! ci_ran && ! pushed topic
+}
+t_behind_pushed() {
+  new_repo; change README.md; git -C "$W" push -q origin topic; local sent; sent=$(git -C "$W" rev-parse topic)
+  git -C "$W" switch -q -c side main; change uv.lock; git -C "$W" push -q origin side:main
+  git -C "$W" switch -q topic; land
+  [ "$rc" -ne 0 ] && has "already pushed to origin" && has "Merge main into it instead: git merge origin/main" \
+    && ! has "rebase it" && ! ci_ran && [ "$(git -C "$C/origin.git" rev-parse topic)" = "$sent" ]
 }
 case_ "a dirty working tree is refused"                     t_dirty
 case_ "a branch that does not contain main is refused"      t_behind
+t_behind_local() {
+  new_repo noremote; git -C "$W" switch -q main; change uv.lock; git -C "$W" switch -q topic; change README.md; land
+  [ "$rc" -ne 0 ] && has "does not contain the current main; rebase it onto main first: git rebase main" && ! ci_ran
+}
+t_behind_stale() {   # origin's topic is an earlier, unrelated branch of the same name
+  new_repo; git -C "$W" switch -q -c old main; change old.txt; git -C "$W" push -q origin old:topic
+  git -C "$W" switch -q -c side main; change uv.lock; git -C "$W" push -q origin side:main
+  git -C "$W" switch -q topic; change README.md; land
+  [ "$rc" -ne 0 ] && has "already has a topic with other history" && has "git branch -m" && ! has "git merge" && ! ci_ran
+}
+t_behind_suffix() {  # a remote branch whose name only ends in /topic is not this branch
+  new_repo; git -C "$W" push -q origin main:refs/heads/someone/topic
+  git -C "$W" switch -q -c side main; change uv.lock; git -C "$W" push -q origin side:main
+  git -C "$W" switch -q topic; change README.md; land
+  [ "$rc" -ne 0 ] && has "is not pushed yet; rebase it onto main first" && ! ci_ran
+}
+t_main_merged_in() { # a pushed branch with main merged in lands under its own subject and message
+  new_repo; change README.md "Say what the change does"; git -C "$W" push -q origin topic
+  git -C "$W" switch -q -c side main; change uv.lock; git -C "$W" push -q origin side:main
+  git -C "$W" switch -q topic; git -C "$W" fetch -q origin; git -C "$W" merge -q --no-edit origin/main; land
+  logged "Say what the change does" && ! logged "Merge remote-tracking branch"
+}
+case_ "a pushed branch behind main is told to merge main"   t_behind_pushed
+case_ "a branch behind main with no remote is told to rebase" t_behind_local
+case_ "a stale same-named remote branch is not 'pushed'"    t_behind_stale
+case_ "a remote x/topic does not count as topic pushed"     t_behind_suffix
+case_ "a merge of main stays out of the pull request text"  t_main_merged_in
 
 # --- addresses ---
 t_refused() {   # t_refused <where> <commit/body setup function>

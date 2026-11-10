@@ -1,11 +1,11 @@
 ---
-status: proposed
+status: accepted
 date: 2026-11-10
-decision-makers: coordinator (Claude); repo owner ratifies
+decision-makers: repo owner (by delegation, 2026-11-10); coordinator (Claude)
 review-by: 2026-12-10
 ---
 
-# Orca's agent-view plugin: on for now as the cockpit's own; the owner decides with the risk stated
+# Orca's agent-view plugin: left on as the cockpit's own, with the risk stated
 
 ## Context and Problem Statement
 
@@ -18,7 +18,7 @@ a hooks module, which Claude Code calls a mod: "code that runs with your permiss
 
 * The owner's word decides a tool that is cheap to leave (ADR 0018).
 * A third-party plugin is read before it runs with the agent's permissions (ADR 0004).
-* A push, a pin move and an install wait for the owner behind `ask` rules (ADR 0020).
+* A push, a full re-resolve, `uv sync` and a loose `uv add` wait for the owner behind `ask` rules (ADR 0028).
 
 ## Considered Options
 
@@ -30,9 +30,11 @@ a hooks module, which Claude Code calls a mod: "code that runs with your permiss
 
 ## Decision Outcome
 
-Proposed: **option 2**, until the owner chooses between it, option 3 and option 5 with the risk below in
-view. The plugin stays on meanwhile: only the owner can change the Orca setting. The owner's go-ahead to
-keep it predates that risk and does not ratify this record.
+Chosen: **option 2**. The plugin stays on. The owner was told the risk below (UNVERIFIED; see Evidence) and
+then left that day's open choices to the coordinator; the coordinator chose to keep it, because this version
+handles no tool call and leaving it is one setting: the first driver, not sources converging. Option 3 is the
+way out if a later version handles a tool call. Option 5 stays open to the owner: it needs an administrator's
+file on the machine.
 
 What the module does, read in full at Orca 1.4.255:
 
@@ -46,19 +48,17 @@ What the module does, read in full at Orca 1.4.255:
 * The app asks for a switch by typing that shortcut into the pane; the command then asks the app which
   agent, and shows that agent's transcript.
 * It reads `keybindings.json`, an endpoint file Orca names and six environment variables. It writes
-  nothing and starts no process.
+  nothing, starts no process and posts no subagent event. Orca itself writes a `ctrl+alt+g` binding and a
+  marker file into every Claude config folder it knows.
 
-It posts no subagent event. Orca itself writes a
-`ctrl+alt+g` binding into `keybindings.json`, and a marker file, in every Claude config folder it knows.
-
-The risk is not what this version does. Claude Code's docs say a setup with no managed settings and no
-Team or Enterprise login has no built-in guard, and there "the mod can approve a call that a deny rule
-refuses or a `PreToolUse` hook blocked" and "you aren't prompted when the mod approves a call that an ask
-rule ... would prompt for". This machine is that setup. A mod's own
-file, process and network calls are outside permission rules in every setup. Orca rewrites the plugin with
-the app, about once a day, and starts sessions with permissions bypassed (ADR 0018). So a later version of
-this module could approve a push that ADR 0020 leaves to an `ask` rule, or a read this repo denies. Orca's
-settings hooks cannot: an ask rule "still prompts even when the hook returned `"allow"`".
+The risk is not what this version does. Claude Code's docs say a setup with no managed settings and no Team or
+Enterprise login has no built-in guard, and there "the mod can approve a call that a deny rule refuses or a
+`PreToolUse` hook blocked" and "you aren't prompted when the mod approves a call that an ask rule ... would
+prompt for". This machine is that setup. A mod's own file, process and network calls are outside permission
+rules in every setup. Orca rewrites the plugin with the app, about once a day, and starts sessions with
+permissions bypassed (ADR 0018). So a later version of this module could approve a push that ADR 0020 leaves
+to an `ask` rule, or a read this repo denies. Orca's settings hooks cannot: an ask rule "still prompts even
+when the hook returned `"allow"`".
 
 1. **It is the cockpit's, not a session's.** No session installs, loads or enables a plugin (ADR 0021
    limit 6, read as the plugins Orca's guides offer a session).
@@ -77,8 +77,8 @@ read, and it is the owner's to create.
 ### Consequences
 
 * Good: a record says what runs in every Orca session, and what stands between a mod and an `ask` rule.
-* Bad: until the owner chooses, the `ask` rules of ADR 0020 hold in Orca sessions only for as long as the
-  loaded module handles no tool call. ADR 0018 and ADR 0021 call those rules what still prompts.
+* Bad: the `ask` rules of ADR 0020 hold in Orca sessions only for as long as the loaded module handles no tool
+  call. ADR 0018 and ADR 0021 call those rules what still prompts.
 
 ### Confirmation
 
@@ -122,6 +122,10 @@ Read 2026-11-10. `fetched`: downloaded whole with `curl` and read, not summarise
   and the domain `com.anthropic.claudecode` (`fetched`). Neither of the guard's two conditions holds on
   the machine this was read on (run there).
 * `~/.orca/agent-hooks/claude-hook.sh` — passes back an answer for `PreToolUse` only (read).
-* Second reader, 2026-11-10 (`evidence-verifier`): it found the guard's conditions decided for this
-  machine, the `deny` half of the risk, that Orca's hooks cannot answer an `ask` rule, the posts and
-  writes the first draft left out, and that no condition of ADR 0004 is met; it asked for `proposed`.
+* Second reader, 2026-11-10 (`evidence-verifier`): it found the guard's conditions decided for this machine,
+  the `deny` half of the risk, that Orca's hooks cannot answer an `ask` rule, the posts and writes the first
+  draft left out, and that no condition of ADR 0004 is met; it asked for `proposed`. The status changed to
+  `accepted` on the owner's delegation below; a second pass, the same day, had the sentence on the risk being
+  told labelled and the driver the choice rests on named.
+* The owner's delegation, 2026-11-10: "auto proceed with sota convergence you as master orchestrator", given
+  after this record's risk was reported to the owner (not re-observable; UNVERIFIED).

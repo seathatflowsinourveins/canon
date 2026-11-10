@@ -163,8 +163,24 @@ status=$(git status --porcelain) || die "could not read the working tree's statu
 git rev-parse --verify -q "$base" >/dev/null || die "there is no $base to land on"
 ahead=$(git rev-list --count "$base..$branch") || die "could not count the commits on $branch"
 [ "$ahead" -gt 0 ] || die "$branch has nothing that main lacks"
-git merge-base --is-ancestor "$base" "$branch" \
-  || die "$branch does not contain the current main; rebase it onto main first (for a pull request someone else opened, use --pr)"
+# A branch behind main: one never pushed is rebased; one already pushed (its pull request may be open) is
+# not, since pushing a rebased branch again needs a forced push. Merging main into it needs none, and the
+# squash merge still leaves one commit on main. The remote's branch counts as this one's only when it is an
+# ancestor of it; a same-named branch with other history (an earlier pull request's, say) does not.
+# `git ls-remote --exit-code` exits 2 when no ref matches; the full ref name keeps `x/<branch>` out.
+if ! git merge-base --is-ancestor "$base" "$branch"; then
+  behind="$branch does not contain the current main"
+  [ -n "$remote" ] || die "$behind; rebase it onto main first: git rebase $base"
+  pushed_ref=$(git ls-remote --exit-code --heads "$remote" "refs/heads/$branch" 2>/dev/null); lsrc=$?
+  pushed_sha=${pushed_ref%%[[:space:]]*}
+  case "$lsrc" in
+    0) git merge-base --is-ancestor "$pushed_sha" "$branch" 2>/dev/null \
+         || die "$behind, and $remote already has a $branch with other history (an earlier pull request's, or someone else's). Give this one a new name and rebase it: git branch -m <new-name>, then git rebase $base. For a pull request someone else opened, use --pr"
+       die "$behind, and it is already pushed to $remote, so a rebase could only be pushed with force. Merge main into it instead: git merge $base, then run this again (the squash merge still leaves one commit). For a pull request someone else opened, use --pr" ;;
+    2) die "$behind and is not pushed yet; rebase it onto main first: git rebase $base (for a pull request someone else opened, use --pr)" ;;
+    *) die "$behind, and whether it is already pushed to $remote could not be read. Not pushed: git rebase $base. Already pushed: git merge $base. Then run this again" ;;
+  esac
+fi
 
 # The checks below decide whether a change may merge. A model's review does not; what the gate asks is
 # that an independent review has run before the push (ADR 0017). The note is the lander's own statement,
@@ -243,13 +259,15 @@ fi
 # The pull request's title and description, which also become the squash commit's subject and message.
 # Title: that pull request's own title, else the last commit's subject. Description: --body; else, for
 # a --pr run, the pull request's own body; else the commits' own messages. A --pr run may have merged main
-# into the branch, so its last commit and messages are not the pull request's own text.
+# into the branch, so its last commit and messages are not the pull request's own text. Merge commits, such
+# as one that brought main into a pushed branch, are left out of the title and the description.
 if [ -n "$text_pr" ]; then
   title=$(gh pr view "$text_pr" --json title --jq .title) \
     || die "could not read the title of pull request $text_pr; nothing was landed"
   [ -n "$title" ] || die "pull request $text_pr has an empty title; nothing was landed"
 else
-  title=$(git log -1 --format=%s "$branch") || die "could not read the last commit on $branch"
+  title=$(git log -1 --no-merges --format=%s "$base..$branch") || die "could not read the last commit on $branch"
+  [ -n "$title" ] || die "$branch has no commit of its own beside merges, so there is no subject to land it under"
 fi
 pr_body="$BODY"
 if [ -z "$pr_body" ]; then
@@ -257,8 +275,9 @@ if [ -z "$pr_body" ]; then
   if [ -n "$INNER_PR" ]; then
     gh pr view "$INNER_PR" --json body --jq .body > "$pr_body" \
       || die "could not read the description of pull request $INNER_PR; nothing was landed"
-  elif [ "$ahead" -eq 1 ]; then git log -1 --format=%b "$branch" > "$pr_body"
-  else git log --reverse --format='* %s%n%n%b' "$base..$branch" > "$pr_body"; fi \
+  elif [ "$(git rev-list --count --no-merges "$base..$branch")" -eq 1 ]; then
+    git log -1 --no-merges --format=%b "$base..$branch" > "$pr_body"
+  else git log --reverse --no-merges --format='* %s%n%n%b' "$base..$branch" > "$pr_body"; fi \
     || die "could not read the commit messages on $branch"
 fi
 # A public repository shows everything pushed, and every piece of text this script posts, so nothing goes

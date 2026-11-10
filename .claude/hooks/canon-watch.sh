@@ -14,7 +14,7 @@
 # It costs no tokens and moves no pins. A run where `canon check` or `canon outdated` could not read every
 # upstream is recorded as not ok and retried after an hour, never reported as a pass. Stale pins are recorded
 # as `stale` (their ids) without marking the run not ok: every other pin was compared, and only a resolve,
-# which the owner approves, changes them. A dependency bot listing that fails is recorded as
+# reviewed before it lands (ADR 0028), changes them. A dependency bot listing that fails is recorded as
 # `bot_prs: null` without marking the run not ok, so it is tried again only at the next daily run.
 # Each tree (the main checkout or a worktree, which has its own canon/ and docs/adr/) compares its own
 # registry and keeps the result in its own .canon/watch.json. The record carries `registry`, a checksum of

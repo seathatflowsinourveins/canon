@@ -38,9 +38,9 @@ Chosen: **option 3**. `guard.sh`, `unattended-mark.sh` and their two registratio
 | Rule the guard held | Held now by |
 |---|---|
 | A commit passes the checks | The ruleset on `main` requires a pull request and the statuses `all required checks passed` from hosted CI and `signoff` from `scripts/land` (ADR 0014, ADR 0017). A commit made with the local gate skipped must still pass the same script on GitHub before it can merge |
-| Installs follow `uv.lock` | `scripts/ci` runs `uv lock --check` and hosted CI installs with `uv sync --locked` (ADR 0013). The settings pre-approve `uv run` only with `--locked`; `uv sync` and `uv add` ask the owner |
+| Installs follow `uv.lock` | `scripts/ci` runs `uv lock --check` and hosted CI installs with `uv sync --locked` (ADR 0013). The settings pre-approve `uv run` only with `--locked`; `uv sync` and `uv add` ask the owner (since ADR 0028, not an exactly pinned `uv add`) |
 | Paper trading only | Live credentials are kept off this machine, which ADR 0009 called "the real control", so a call to a live host fails at Alpaca. The execution client, written later that day, holds the paper-only check in its configuration: `AlpacaExecutionClientConfig` refuses `paper` other than `True` and any `url_override`, and the client builds alpaca-py's clients with `paper=True` whatever the config holds |
-| An unattended run only reports | The task's prompt. `ask` rules apply in every permission mode, so a push, a pin move and an install still wait for the owner; an edit or a commit in a bypass-mode run is held by the prompt alone |
+| An unattended run only reports | The task's prompt. `ask` rules apply in every permission mode, so a push, a pin move and an install still wait for the owner (since ADR 0028, not one pin or an exactly pinned `uv add`); an edit or a commit in a bypass-mode run is held by the prompt alone |
 
 The guard also refused these, and nothing refuses them now: `pip install` and `uv pip install`; `uv run`
 without `--locked` in a bypass-mode session; a Python edit that passes `paper=False` or `url_override`;

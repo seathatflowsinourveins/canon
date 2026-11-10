@@ -49,7 +49,7 @@ elif [ -f "$watch" ]; then
     + (if .ok then "" else "INCOMPLETE (" + (.errors | join("; ")) + "); " end)
     + (if ((.stale // []) | length) > 0
        then "LOCK STALE for " + (.stale | join(", ")) + ": the registry names another repo or track than the lock, so "
-            + "these pins were not compared with upstream. The fix is scripts/canon resolve <id> for each, which only the owner approves; "
+            + "these pins were not compared with upstream. The fix is scripts/canon resolve <id> for each, which runs without a prompt and lands only reviewed (ADR 0028); "
        else "" end)
     + ((.newer | length | tostring) + " newer release(s), "
        + (.advanced | length | tostring) + " tracked branch(es) with new commits, "
