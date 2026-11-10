@@ -36,8 +36,8 @@ Chosen: **option 3**, by the coordinator under the owner's delegation. It is the
 "paper only" for shell commands by the operating system and not by command text, which is what rule 5 kept
 the sandbox for, and in the trial it added no prompt to a bypass-mode session.
 
-**This record turns nothing on.** Turning it on is a separate change, after every worker of this run has
-settled, tried in one workspace first. It lands only if `scripts/ci` and `scripts/land` run to the end
+**This record turns nothing on.** Turning it on is a separate change, made when no other session is
+running, tried in one workspace first. It lands only if `scripts/ci` and `scripts/land` run to the end
 with it on, `scripts/land` as an excluded command, with no new prompt and no failure, each allowance and
 exclusion written down with its reason. If a lane stops or fails there, the change is dropped,
 Confirmation says so, and the state is option 1.
@@ -70,7 +70,7 @@ a Python edit and an MCP server switched to live stay as they are.
 
 Prompts. Under bypass the sandbox adds none; an `ask` rule still prompts, as now, being among the "Actions
 no mode auto-approves". With the retry off a command the allowances missed fails, hence the trial. ADR
-0028, written in the same run and not landed or read here (UNVERIFIED), would take the prompt off a single
+0028, written the same day and not landed or read here (UNVERIFIED), would take the prompt off a single
 pin move, an exactly pinned `uv add` and `uv sync --locked`; package code would then run unprompted, and
 the sandbox would keep its writes to the worktree, uv's cache and the temp folder.
 
@@ -97,19 +97,19 @@ sandbox admin-required: a repository's allowances are then ignored.
 
 ### Confirmation
 
-Trial, 2026-11-10: Claude Code 2.1.321, macOS, bypass mode, through an ignored file in the worker's own
-worktree, `.claude/settings.local.json`, created for it and deleted afterwards. It took effect in the
+Trial, 2026-11-10: Claude Code 2.1.321, macOS, bypass mode, through an ignored file in one worktree,
+`.claude/settings.local.json`, created for it and deleted afterwards. It took effect in the
 running session within seconds and no prompt appeared. `scripts/ci` failed 7 of 20 checks and skipped 5:
 bare `mktemp -d` used the macOS temp folder, not the sandbox's `$TMPDIR`, and uv could not write its cache.
 With both writable, `test-ci` still failed until `com.apple.sysmond` could be looked up; then all 20
 passed. `gh api` failed with `tls: failed to verify certificate: x509: OSStatus -26276`, as the docs warn
 it may, `gh auth status` failed too, and so `scripts/land --dry-run` stopped at "gh is not signed in or
-cannot reach GitHub"; a `gh` call listed in `excludedCommands` ran. The three logs are under
-`/private/tmp/claude-501/-Users-noeron-canon/ci-logs/` as `adr-0025-sandbox-trial-ci-*`; the second also
-holds one pytest failure that the third, with no code changed, does not.
+cannot reach GitHub"; a `gh` call listed in `excludedCommands` ran. The three logs were kept outside the
+repository, in the machine's temp folder; the second also holds one pytest failure that the third, with
+no code changed, does not.
 
 The change that turns it on must still try what this trial did not: a commit, `scripts/land` to the end as
-an excluded command, `uv sync`, a pin move, the `orca` command a worker reports with, and a paper test's
+an excluded command, `uv sync`, a pin move, the `orca` command a session reports with, and a paper test's
 stream through the proxy (all UNVERIFIED). It waits because a settings file reloads into running sessions.
 
 ## Evidence
@@ -138,11 +138,11 @@ Read 2026-11-10. `fetched`: downloaded whole with `curl` and read, not summarise
   session in Manual instead" (`fetched`; three sections read).
 * alpaca-py 0.45.0 as installed from `uv.lock`, `alpaca/common/enums.py`, `BaseURL` — the two live hosts,
   and `paper-api.alpaca.markets` for paper (read; the pin is `c42add7c0a70` in `canon/upstreams.lock.json`).
-* The trial — commands and exit codes in the worker's session, and the three logs. That session's process
-  arguments, its environment (no `ALPACA` variable), `claude auth status` (plan `max`), and no
+* The trial — commands and exit codes in the session that ran it, and the three logs. That session's
+  process arguments, its environment (no `ALPACA` variable), and no
   `/Library/Application Support/ClaudeCode/` (run). ADR 0009, 0018, 0020, 0023, the adapter's README, both
   settings files and `scripts/land` (read). ADR 0028 was not read: it had not landed.
-* The owner's words, 2026-11-10, as the coordinator relayed them to the worker: "auto proceed with sota
+* The owner's instructions, 2026-11-10 (reported to the author, not read first-hand): "auto proceed with sota
   convergence you as master orchestrator"; "high quality is the directive, research convergence
   convergenced is the evidance, proceed with sota evidances automatically as long as they are form sota
   sources, per our very harness rules"; and the driver, "make sure every lanes are seamless without
