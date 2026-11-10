@@ -67,7 +67,7 @@ custom Python clients; with it and Redis, `save_state` and "persist all executio
 | What fires | A second launchd user agent, `local.canon.paper-session`, installed, reported and removed by `scripts/automation` beside the lane watchdog; every 2100 s, not at load; a firing while the job still runs or the Mac sleeps is missed (launchd.plist(5)) | ADR 0011's launchd agent |
 | What runs | `~/.claude/canon/paper-session.sh` brings its own clone, `~/.claude/canon/paper-checkout`, to the `main` the origin has at that firing, detached, or fails the firing, then runs `mise run paper:session --session auto --minutes 25` there: one window, one node, one process, disposed, its records naming the commit. 25 minutes, with about two of start-up and stop, leaves the 300 s gap inside 35 | configure_live_trading: "run nodes as standalone Python scripts or services"; "One LiveNode per process"; actions/checkout's reuse of a directory (the runner's header) |
 | Which session | `auto` takes the regular session when Alpaca's clock says it is open (`is_open`, which is false on weekends and holidays), the extended one when `EXTENDED_READY` and it is open, and otherwise prints "nothing to run" and exits 0 | Alpaca's paper-trading skill: "always check the clock/calendar endpoint" |
-| A window that dies | It writes `latest.json` as `running` before the node is built and `ok` or `failed: <why>` after, the account check included; a refusal someone must look at (account not flat) is `refused: <why>`, while a skip that clears by itself (the gap, under 180 s of session left) exits 0 and keeps the last result. A `running` record past its `stale_after` (70 minutes) is a window that died | No upstream |
+| A window that dies | It writes `latest.json` as `running` before the node is built and `ok` or `failed: <why>` after, the account check included; a refusal someone must look at (account not flat) is `refused: <why>`, while a skip that clears by itself (the gap, under 360 s of session left) exits 0 and keeps the last result. A `running` record past its `stale_after` (70 minutes) is a window that died | No upstream |
 | Status | `scripts/automation status`'s `paper session` row: the last window, its result, age and leftovers; FAILED when the last firing exited non-zero (one that ended before Python wrote anything); STALE when no run, a window or not, wrote `last-firing.json` for two intervals | ADR 0011's status rows |
 
 Installing it is the owner's step: `scripts/automation install`. Whether the agent's `mise run` reads the
@@ -80,8 +80,10 @@ login keychain without a dialog is UNVERIFIED until its first firing. A firing w
   different aggregators from the same feed; a minute with no IEX trade has no live bar.
 * Bad: an answer later than the first live bar is dropped, and that window warms up on live bars.
 * Bad: one paper account still serves the windows and the paper tests; a test can lose the lock to a window
-  (ADR 0044). A window refused for an account that is not flat stays refused until someone clears it, and
-  a node that hangs on stop (ADR 0044's disconnect hang) shows as DIED while it still runs.
+  (ADR 0044). A window refused for an account that is not flat stays refused until someone clears it. A
+  node that hangs on stop (ADR 0044's disconnect hang) is waited for at most `STOP_TIMEOUT_SECS` (about
+  115 s); the window is then recorded failed, the account checked (at most `AFTER_STOP_SECS`, 60 s, and a
+  30 s settle, each Alpaca call within the adapter's timeouts), and the process ended (ADR 0044).
 
 ### Confirmation
 
@@ -96,7 +98,10 @@ On paper: UNVERIFIED until a regular window runs.
 The schedule, offline: `--session auto` picks the session from a stand-in clock and calendar and runs
 nothing on a Saturday; a refusal, a failure after start and a failed account check become the latest
 record, after `running`; a skip exits 0 and keeps the last result; every run writes its heartbeat
-(`tests/test_session_window.py`). `scripts/test-lanes` rehearses the install with `AUTOMATION_SKIP_LAUNCHD=1`
+(`tests/test_session_window.py`). After a second reader's review (2026-11-10), each first shown by a
+failing test there: a window that never ran (its node not built) no longer writes the gap marker, so a
+retry is not skipped as if one had ended; a refused window now updates the heartbeat. `scripts/test-lanes`
+rehearses the install with `AUTOMATION_SKIP_LAUNCHD=1`
 and a stub `launchctl`: the agent's arguments, interval, working folder, `RunAtLoad` and the interval
 arithmetic; the row for ok, running, died, a record's own `stale_after`, failed, refused, no record, a
 non-zero exit under an ok record, and three silent hours; the uninstall. Not installed on this machine.
@@ -145,3 +150,5 @@ Read 2026-11-10. "raw": fetched with `curl` and read whole. NautilusTrader files
   v2026.11.5 `docs/cli/trust.md` (`mise run` trusts its config; observed, `--untrust` undoes it); uv 0.13.7
   `docs/concepts/projects/sync.md` (`uv run` is inexact without `--exact`) (all fetched, raw); `man git-clean`
   (`-x` keeps `-e`) and `man launchd.plist` (`AbandonProcessGroup`) (read).
+* A second reader's review of `main` (2026-11-10): the gap marker after a window that never ran and the
+  heartbeat after a refusal, both reproduced offline and fixed (run).

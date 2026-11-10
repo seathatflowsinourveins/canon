@@ -53,7 +53,9 @@ upstream's built-in `EmaCross` under the risk engine's native limits; the paper 
 ([ADR 0037](docs/adr/0037-ema-cross-paper-run-under-native-risk-limits.md)). `SessionMaCross`
 (`session_ma_cross.py`) is `MaCross` guarded for live use, and `session_window.py` runs it for one bounded
 window on paper with a one-share cap inside the node
-([ADR 0044](docs/adr/0044-paper-session-windows-for-macross.md)).
+([ADR 0044](docs/adr/0044-paper-session-windows-for-macross.md)). The cap stops the node and sends no order:
+in a window `SessionMaCross` exits at market on stop and the window then closes what is left, while
+upstream's `EmaCross` does not flatten on stop, so its caller closes the position.
 
 It needs no network, no credentials and no downloaded data:
 

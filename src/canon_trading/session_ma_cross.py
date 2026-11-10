@@ -24,8 +24,10 @@ Two departures from `MaCross`, both for live use:
 * **Outside the regular session** (`extended_hours=True`, set by the run's configuration, never from the
   clock) every order is a marked DAY limit, priced `limit_offset` through the touch from the latest quote:
   a buy at the ask plus the offset, a sell at the bid minus it, rounded to the cent away from the market's
-  side. A limit not filled within `limit_timeout_secs` is canceled and its signal dropped, never chased.
-  With no quote yet the signal is dropped.
+  side. A limit not filled within `limit_timeout_secs` is canceled and its signal dropped, never chased:
+  a dropped entry is not sent again until the fast average has gone below the slow, nor a dropped close
+  until it has gone above (a bar with the two equal is no cross); the next cross takes its own. A short's
+  buy-back and the wind-down's close are not signals and are not held back. With no quote yet the signal is dropped for that bar.
 
 * **Closes are not reduce-only.** `MaCross` exits with `close_all_positions`, which sends a reduce-only
   market order (observed at v2.0.0rc8); the adapter denies reduce-only orders (ADR 0036), so that exit
@@ -63,6 +65,7 @@ from decimal import ROUND_CEILING
 from decimal import ROUND_FLOOR
 from decimal import Decimal
 from typing import TYPE_CHECKING
+from typing import Any
 
 from nautilus_trader.model import AggregationSource
 from nautilus_trader.model import BarType
@@ -170,6 +173,10 @@ class SessionMaCross(MaCross):
         self.winding_down = False
         self.dropped: list[str] = []
         """Why each dropped signal was dropped, for the run's report."""
+        self.dropped_side: OrderSide | None = None
+        """The side of the last signal limit dropped at its timeout, held until the opposite cross."""
+        self.signal_orders: set[str] = set()
+        """The client order IDs of limits sent on a cross (an entry, or a close on the cross below)."""
 
     def on_start(self) -> None:
         if (
@@ -270,10 +277,24 @@ class SessionMaCross(MaCross):
             return
         if not self.hydrated or not self.indicators_initialized():
             return
-        if self.fast.value > self.slow.value and not held:
-            self._enter()
-        elif self.fast.value < self.slow.value and held > 0:
-            self._close()
+        above, below = self.fast.value > self.slow.value, self.fast.value < self.slow.value
+        self._clear_dropped(above=above, below=below)
+        if above and not held and self.dropped_side != OrderSide.BUY:
+            self._signal(self._enter())
+        elif below and held > 0 and self.dropped_side != OrderSide.SELL:
+            self._signal(self._close())
+
+    def _clear_dropped(self, *, above: bool, below: bool) -> None:
+        """A dropped entry is held until the fast average is below the slow, a dropped close until it is
+        above: the opposite cross, not a bar on which the two are equal."""
+        if (self.dropped_side == OrderSide.BUY and below) or (
+            self.dropped_side == OrderSide.SELL and above
+        ):
+            self.dropped_side = None
+
+    def _signal(self, client_order_id: str | None) -> None:
+        if client_order_id is not None:
+            self.signal_orders.add(client_order_id)
 
     def on_stop(self) -> None:
         """Cancel this strategy's working orders; with none working, close its position.
@@ -305,29 +326,31 @@ class SessionMaCross(MaCross):
         else:
             self.market_exit()
 
-    def _enter(self) -> None:
+    def _enter(self) -> str | None:
+        """Send the entry; return the limit's client order ID, if one was sent."""
         if not self.extended_hours:
             self.submit_order(
                 self.order_factory.market(self.instrument_id, OrderSide.BUY, self.trade_size)
             )
-            return
-        self._limit(OrderSide.BUY, self.trade_size.as_decimal())
+            return None
+        return self._limit(OrderSide.BUY, self.trade_size.as_decimal())
 
-    def _close(self) -> None:
+    def _close(self) -> str | None:
+        """Close the signed position; return the limit's client order ID, if one was sent."""
         held = self.held()
         if not self.extended_hours:
             self.close_all_positions(
                 self.instrument_id, time_in_force=TimeInForce.DAY, reduce_only=False
             )
-            return
-        self._limit(OrderSide.SELL if held > 0 else OrderSide.BUY, abs(held))
+            return None
+        return self._limit(OrderSide.SELL if held > 0 else OrderSide.BUY, abs(held))
 
-    def _limit(self, side: OrderSide, quantity: Decimal) -> None:
+    def _limit(self, side: OrderSide, quantity: Decimal) -> str | None:
         quote = self.cache.quote(self.instrument_id)
         if quote is None:
             self.dropped.append(f"{side.name}: no quote yet")
             self.log.warning(f"{side.name} signal dropped: no quote for {self.instrument_id} yet")
-            return
+            return None
         price = through_the_touch(
             side, quote.bid_price.as_decimal(), quote.ask_price.as_decimal(), self.limit_offset
         )
@@ -346,15 +369,27 @@ class SessionMaCross(MaCross):
             self.clock.utc_now() + timedelta(seconds=self.limit_timeout_secs),
             self._on_limit_timeout,
         )
+        return order.client_order_id.value
+
+    def _order(self, client_order_id: ClientOrderId) -> Any | None:
+        """The cached order (`Cache.order` is typed `Any | None` at the pin): one seam, so a test can give
+        the timeout an order without a venue."""
+        return self.cache.order(client_order_id)
 
     def _on_limit_timeout(self, event: TimeEvent) -> None:
         """Cancel the limit if it is still open; if Alpaca has not acknowledged it yet, look again after
         another timeout rather than leave it unwatched."""
-        order = self.cache.order(ClientOrderId(event.name.removeprefix("limit-timeout-")))
-        if order is not None and not order.is_closed:
+        name = event.name.removeprefix("limit-timeout-")
+        order = self._order(ClientOrderId(name))
+        if order is None or order.is_closed:
+            self.signal_orders.discard(name)
+        else:
             client_order_id = order.client_order_id.value
             if order.is_open:
                 self.dropped.append(f"{order.side.name}: not filled in {self.limit_timeout_secs} s")
+                if client_order_id in self.signal_orders:  # not a short's buy-back or a wind-down
+                    self.dropped_side = order.side
+                self.signal_orders.discard(client_order_id)
                 self.log.warning(
                     f"{client_order_id} not filled in {self.limit_timeout_secs} s; canceled, "
                     "signal dropped"
