@@ -92,8 +92,8 @@ adapter is a uv workspace member of its own, kept apart from strategies as upstr
    with `paper=True`; denied types never reach Alpaca (package README, ADR 0036).
 4. Alpaca's trade updates stream becomes order events; each `fill` or `partial_fill` is an `OrderFilled`
    keyed by Alpaca's `execution_id` (package README, ADR 0024).
-5. At start-up the client reports orders and positions for reconciliation; fills are inferred, since
-   fill history is not read yet (package README, ADR 0024).
+5. At start-up the client reports orders, fills from Alpaca's fill activities, open positions, and each
+   loaded instrument without a position as flat, for reconciliation (package README, ADR 0024).
 
 ## Safety boundaries
 

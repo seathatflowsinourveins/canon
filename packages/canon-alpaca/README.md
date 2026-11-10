@@ -235,21 +235,36 @@ Each is stated in `execution.py`'s header, with its source.
   for a trade update or reconciliation to resolve. A cancel answered 204 waits for Alpaca's `canceled`
   update; one answered 422 is a cancel rejection unless Alpaca shows the order canceled or pending cancel
   (https://docs.alpaca.markets/us/reference/deleteorderbyorderid-1.md).
+* **Wash trades:** Alpaca refuses an order that could cross one of the account's own open orders on the
+  other side, with 403 "potential wash trade detected. use complex orders"; the strategy sees
+  `OrderSubmitted`, then `OrderRejected` with that reason (paper, 2026-11-10: a limit sell while the
+  account's market buy was still open, and a strategy's order against its own resting one; ADR 0037).
 * **Fills** come from the trade updates stream only, one per `fill` or `partial_fill` event, with the
   event's own `qty` and `price` (https://docs.alpaca.markets/us/docs/websocket-streaming.md). The trade ID
   is Alpaca's `execution_id`, which that page shows only in its example; a fill without one is logged and
   not applied. Prices are kept at the precision Alpaca sends (the example has seven decimals). Alpaca
   reports no commission and no liquidity side, so fills carry `None` and `NO_LIQUIDITY_SIDE`.
-* **No fill reports at start-up:** alpaca-py 0.45.0's `TradingClient` has no account activities call, so
-  NautilusTrader "Infers `OrderFilled` events for missing trade reports" and times each at the order
-  report's last update, not at the execution (`docs/concepts/execution/reconciliation.md` at the pinned
-  commit, "Fill reconciliation" and "Event ordering"; the `latest` page now adds "unless the client requires
-  authoritative fills"). That page does not say what price an inferred fill carries; one fill per order at
-  the average price is this repo's reading (UNVERIFIED). Alpaca documents `GET /v2/account/activities` for a
-  trading account, paper included, and alpaca-py's generic `get` can call it.
-  [ADR 0024](../../docs/adr/0024-alpaca-fill-history.md) accepts that route: on paper, each `FILL`
-  activity's `id` is `<date and time>::<execution_id>` of one trade update (`test_paper_fill_ids.py`), so a
-  fill report would carry the stream's trade ID. The fill reports are not written yet.
+* **Fill reports** come from Alpaca's `FILL` activities, `GET /v2/account/activities/FILL`, called through
+  alpaca-py's generic `get` since 0.45.0's `TradingClient` has no method for it
+  ([ADR 0024](../../docs/adr/0024-alpaca-fill-history.md)). One report per activity: the trade ID is the
+  UUID after `::` in its `id`, which on paper is the trade update's `execution_id` for the same fill
+  (`test_paper_fill_ids.py`), so a fill seen on the stream and in a report is one fill; the price exactly
+  as Alpaca writes it; the time its `transaction_time`; commission zero dollars (Alpaca's fill has none;
+  upstream's TC-E85 expects a zero from a stream that omits fees) and `NO_LIQUIDITY_SIDE`; no client order
+  ID (an activity has none). Alpaca returns activities newest first, at most 100 a page; the window and
+  the instrument are applied here, on `transaction_time` and `symbol`, since what Alpaca's `after` and
+  `until` compare for a fill is not documented and the endpoint has no symbol filter. Paging stops at the
+  first fill before the window, or after 10 pages (1,000 fills, twice the 500 orders the order reports
+  hold) with a warning. `sell_short` is a sell. A fill in a symbol with `/` (crypto), a fractional fill,
+  an `id` not in `::` form, or a value that cannot be read is skipped with a warning. If the history
+  cannot be read at all, the error is logged and no fill is reported, so the engine infers fills from the
+  order reports, as before fill reports.
+* **Fill activities can lag the stream:** on paper, a node started about a second after an order's last
+  fill found only the first of its two fills listed (2026-11-10). NautilusTrader then rebuilt the order as
+  partially filled and added a synthetic order for the missing share ("Adjusting fills ... with position
+  reports"). So when an order's newest listed fill still leaves shares to fill, the client reads the
+  order, and if Alpaca shows more filled than the listed fills add up to, that order's fills are not
+  reported and the engine infers them instead. How long the lag lasts is UNVERIFIED.
 * **Reports:** the orders submitted in the engine's window and every open order however old, since
   Alpaca's `after` and `until` filter on submission time; at most 500 orders per request, alpaca-py's
   documented maximum, newest first; a full page
@@ -257,7 +272,13 @@ Each is stated in `execution.py`'s header, with its source.
   this slice does not map fails start-up, and its reason is logged; so does an open order in anything but
   US equities, and a fractional position (`Equity` is whole-share only). A closed order of that kind is
   skipped with a warning. Positions in anything but US equities are not reported. Alpaca does not say whether a short
-  position's `qty` is negative, so the side comes from `side` and the size is its magnitude.
+  position's `qty` is negative, so the side comes from `side` and the size is its magnitude. Each loaded
+  instrument Alpaca lists no position in is reported flat: Alpaca's positions endpoint lists only open
+  positions, and NautilusTrader takes only "An explicit flat report" as evidence of flat. Without it,
+  fills inferred from part of the order history left an `EXTERNAL` position Alpaca did not hold. With
+  `load_all`, that is one flat report per US equity on each position report request. A flat report from
+  a read taken just before a fill lands is wrong for that moment; whether a running node's periodic
+  position check can act on that is UNVERIFIED.
 * **Account:** a NautilusTrader cash account whose USD balance is Alpaca's `cash`, all free, read at
   connect only; cash finer than a cent is reported to the cent, with a warning. Buying power, margin and
   shorting are not modelled; `equity`, `buying_power` and the
@@ -288,10 +309,11 @@ This package has all three for each client, offline, plus a paper test for each:
 | `test_provider.py` | Asset queries and filters, load by ID, failures named, other venues refused | None |
 | `test_data_client.py` | A real `LiveNode`: registration through config and builder, owned and hosted launch, bars, quotes and trades into strategy and cache, hourly and daily bar windows, `limit`, open-ended requests, concurrent and cancelled bar requests, request failures as `failure_reason`, unsubscribes that never subscribed or failed, late data for an unsubscribed symbol dropped, trade cancels and corrections logged, one-sided quotes dropped and counted, a stream ending by itself logged (and an abandoned one not), shutdown joining the stream thread or clearing state when it does not stop, stream handlers not keeping the client alive, paper and IEX client construction | None |
 | `test_paper_integration.py` | One asset and a week of daily bars from Alpaca's paper environment through a real node, from midday New York on a fixed trading day: the first bar must be the one that opened at that day's midnight, which Alpaca returns only because the adapter shifts the window | Paper only; skipped without `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` |
-| `test_execution_client.py` | A real `LiveNode` with both clients: registration through config and builder, owned and hosted launch, a market order that fills, partial fills, a limit order canceled, cancel-all by ID (side filter, a refused cancel, a failed cancel, nothing to cancel), rejections by HTTP status and by trade update, a cancel refused, stop and stop-limit orders sent with their prices, modify (`OrderUpdated` only on Alpaca's `replaced`, a fill on the replacement reaching the node's order with the client's map full and emptied, two replaces in a row, reports of a replacement under the node's ID, refusals, a refused repeat, `order_replace_rejected`, a rejected replacement, local denials, a stop's trigger price, a replacement that cannot be read), orders denied before Alpaca (type, time in force, stop trigger type, sub-penny limit and stop prices, not tradable), an unknown submit outcome left `SUBMITTED`, an update for an unknown order dropped, start-up reconciliation of an open order, a filled order, a position and open stop and stop-limit orders, an unmapped open order failing start-up, account state on connect, paper-only client construction, shutdown joining the trade stream thread; the config's paper-only refusals, and a node refusing a plain `ExecutionClientConfig`; HTTP timeouts (a local server that never answers: the call ends, the next is answered, the run ends; a connect timeout on the only attempt rejects a submit or cancel as not sent, a read timeout or a repeated attempt leaves it unknown) | None |
+| `test_execution_client.py` | A real `LiveNode` with both clients: registration through config and builder, owned and hosted launch, a market order that fills, partial fills, a limit order canceled, cancel-all by ID (side filter, a refused cancel, a failed cancel, nothing to cancel), rejections by HTTP status and by trade update, a cancel refused, stop and stop-limit orders sent with their prices, modify (`OrderUpdated` only on Alpaca's `replaced`, a fill on the replacement reaching the node's order with the client's map full and emptied, two replaces in a row, reports of a replacement under the node's ID, refusals, a refused repeat, `order_replace_rejected`, a rejected replacement, local denials, a stop's trigger price, a replacement that cannot be read), orders denied before Alpaca (type, time in force, stop trigger type, sub-penny limit and stop prices, not tradable), an unknown submit outcome left `SUBMITTED`, an update for an unknown order dropped, start-up fills from Alpaca's fill activities (trade IDs and prices, paging, the window, one order, an activity it cannot map skipped), start-up reconciliation of an open order, a filled order, a position and open stop and stop-limit orders, an unmapped open order failing start-up, account state on connect, paper-only client construction, shutdown joining the trade stream thread; the config's paper-only refusals, and a node refusing a plain `ExecutionClientConfig`; HTTP timeouts (a local server that never answers: the call ends, the next is answered, the run ends; a connect timeout on the only attempt rejects a submit or cancel as not sent, a read timeout or a repeated attempt leaves it unknown) | None |
 | `test_paper_execution.py` | DAY limit buys of 1 AAPL far below the market on Alpaca's paper Trading API through a real node: one submitted, accepted and canceled; upstream's `ExecTester` running rows of its Execution Testing Spec: TC-E41, a limit buy and a stop buy canceled by `CancelAllOrders` on stop, TC-E20 and TC-E22, a stop and a stop-limit buy accepted at the prices sent and reported back the same, and TC-E30, whose one-tick amend the client denies as sub-penny; and a $1.00 buy modified to $1.01 through a node, then canceled | Paper only; cancels every order it places; each places nothing and fails if the paper account already holds an open AAPL order or position; skipped without `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` |
 | `test_paper_fill_ids.py` | ADR 0024's test, with alpaca-py directly, not through a node: a market buy of 2 AAPL and a market sell of 2 on Alpaca's paper Trading API; every fill and partial fill update's `execution_id` must be the UUID after `::` in one of the order's `FILL` activity `id`s | Paper only; needs the regular session and skips outside it; stops if the account holds any open order or position; sells what it bought; skipped without `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` |
 | `test_paper_matrix.py` | Upstream's `DataTester` and `ExecTester` through a real node on Alpaca's paper environment: the rows in "Upstream's test matrices against paper" | Paper only; needs the regular session for the stream and fill rows; stops if the account holds any open order or position; cancels and closes what its node opened; skipped without `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` |
+| `test_paper_fill_reports.py` | TC-E85 with fill reports: a market buy of 2 AAPL with alpaca-py, its trade updates recorded; a node's start-up reconciliation must give the order one fill per update, with that update's `execution_id` and price | Paper only; needs the regular session and skips outside it; stops if the account holds any open order or position; sells what it bought; skipped without `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` |
 | `test_paper_replace.py` | Alpaca's replace through alpaca-py directly: a $1.00 buy replaced with $1.01; asserts what a paper observation showed and the modify rests on (a replacement may not keep the client order ID, the answer's new IDs and `replaces`, `replaced` carrying the old order with `replaced_by`, a second replace refused) | Paper only; needs the regular session; places nothing while the account holds an open AAPL order, cancels what it opened |
 | `test_upstream_contract.py` | The upstream names this README quotes still exist in the pinned packages; the execution hooks and `generate_order_filled` signature; alpaca-py's trading clients default to and target paper; the native config drops unknown keywords; the stream stand-ins refuse and keep what alpaca-py's `StockDataStream` and `TradingStream` do; alpaca-py's REST clients keep a `requests.Session` at `_session` and pass no timeout (ADR 0039) | None |
 
@@ -349,7 +371,8 @@ tasks"): with none, a queued unsubscribe was discarded and logged as an error on
 | TC-E72 unsupported order type, TC-E73 unsupported time in force | Passed: a market-if-touched order and an IOC limit are `DENIED` before Alpaca |
 | Venue rejection (no upstream row) | Passed: a market buy of 1,000,000 shares, refused by Alpaca (403 "insufficient buying power"), ends `REJECTED`; nothing opens |
 | TC-E83 unsubscribe on stop | Passed: the tester's quote and trade subscriptions are removed |
-| TC-E02, E32, E33, E44, E84 to E87 | Not run: a short, cancel-replace, cancel of a canceled order, and reconciliation of a prior session's orders and positions |
+| TC-E85 reconcile filled orders | Passed twice (`test_paper_fill_reports.py`, after fill reports were added, 14:53 and 15:43): a market buy of 2 filled outside the node is reconciled `FILLED`, one fill per trade update, each with that update's `execution_id` and price, once Alpaca lists every fill. A first run, started before Alpaca listed the second fill, failed (see "Fill activities can lag the stream"); another hung after the node failed to disconnect its execution client, cause UNVERIFIED. The engine's log also says "Generated inferred fill" for orders it was given fill reports for; which path that line names is UNVERIFIED |
+| TC-E02, E32, E33, E44, E84, E86, E87 | Not run: a short, cancel-replace, cancel of a canceled order, and reconciliation of a prior session's open orders and positions |
 | TC-E20, TC-E22 stop and stop-limit buy | Passed in `test_paper_execution.py` (ADR 0036): accepted at the prices sent, as Alpaca holds them, reported back the same, canceled on stop |
 | TC-E30 modify limit buy | Ends `OrderModifyRejected` before Alpaca, as designed: the tester's one-tick amend is sub-penny at the 0.0001 increment (`test_paper_execution.py`, ADR 0036); a modify by a cent through a node passes there |
 | TC-E21, E23, E31, E33 to E35 | Not run: sells (a short from flat), cancel-replace, and a stop's trigger modified (offline only) |
@@ -357,13 +380,15 @@ tasks"): with none, a queued unsubscribe was discarded and logged as an error on
 | TC-E74 to E78 | Ambiguous submit and cancel failures run offline only (`test_execution_client.py`); a modify with no definitive answer is logged and left to the stream or reconciliation, not tested; batch does not apply |
 | TC-E88, E89, TC-E90 to E101 | Do not apply: Alpaca reports no commission, and options are not supported |
 
-**Reconciliation finding (not fixed here).** Without a lookback, start-up reconciliation reads the shared
-paper account's last 500 orders and infers one fill for each filled one (ADR 0024). On 2026-11-10 those
-inferred fills netted to a short of 1 AAPL while Alpaca held no position and reported none, and the engine
-kept that short as an `EXTERNAL` position for the whole run. Alpaca's 500-order cap, and orders this slice
-skips (such as `replaced`), can leave a fill without its counterpart. Fill reports keyed by `execution_id`
-(ADR 0024), or a flat position report for an instrument with no position, would address it; neither is
-written.
+**Reconciliation finding, fixed.** Without a lookback, start-up reconciliation reads the shared paper
+account's last 500 orders and, with no fill reports, inferred one fill for each filled one. On 2026-11-10
+those inferred fills netted to a short of 1 AAPL, and in another run to a long of 10 SPY, while Alpaca held
+no position and reported none; the engine kept each as an `EXTERNAL` position (ADR 0037). Alpaca's
+500-order cap, and orders this slice skips (such as `replaced`), can leave a fill without its counterpart.
+Fill reports alone do not remove it, since the missing counterpart's fills belong to an order the node is
+not given; the explicit flat report for each loaded instrument without a position does
+(`test_execution_client.py`, with and without fill activities). On paper this waits for the next regular
+session (UNVERIFIED).
 
 ## Rules
 

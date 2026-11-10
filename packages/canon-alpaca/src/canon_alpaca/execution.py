@@ -47,20 +47,21 @@ adapter, whose venue cancel-all is account-wide too, selects and cancels by ID t
 (https://docs.alpaca.markets/us/docs/websocket-streaming.md).
 
 Reconciliation (https://nautilustrader.io/docs/md/latest/concepts/execution/reconciliation.md): order status
-reports come from Alpaca's orders endpoint and position reports from its positions endpoint. There are no
-fill reports. Alpaca's Trading API documents the account activities endpoint, `GET /v2/account/activities`,
-with the paper server listed (https://docs.alpaca.markets/us/reference/getaccountactivities-2.md);
-alpaca-py 0.45.0's `TradingClient` has no method for it, and this slice does not call it through the
-generic `get` (ADR 0024). For an order status report without fills the engine "Infers `OrderFilled` events
-for missing trade reports", timed at the report's `ts_last` (`docs/concepts/execution/reconciliation.md`
-at the pinned commit; the `latest` page linked above adds "unless the client requires authoritative
-fills"). That page does not say what price an inferred fill carries (ADR 0024).
+reports come from Alpaca's orders endpoint and position reports from its positions endpoint. Fill reports
+come from Alpaca's account activities of type `FILL`, `GET /v2/account/activities/FILL` with the paper
+server listed (https://docs.alpaca.markets/us/reference/getaccountactivitiesbyactivitytype-1.md), called
+through alpaca-py's generic `RESTClient.get` ("Performs a single GET request"), since 0.45.0's
+`TradingClient` has no method for it (ADR 0024). Each report's trade ID is the UUID after `::` in the
+activity's `id`, which a paper test matched to the stream's `execution_id` for every fill, so the engine's
+duplicate fill detection sees one fill once ("Duplicate fill detection", `docs/concepts/execution/index.md`
+at the pinned commit). With fill reports, the engine no longer "Infers `OrderFilled` events for missing
+trade reports" for orders whose fills Alpaca lists.
 
 Venue side, alpaca-py 0.45.0:
 
 * `TradingClient(api_key, secret_key, paper=True)` for `submit_order`, `cancel_order_by_id`,
-  `replace_order_by_id`, `get_order_by_id`, `get_order_by_client_id`, `get_orders`, `get_all_positions`
-  and `get_account`. The
+  `replace_order_by_id`, `get_order_by_id`, `get_order_by_client_id`, `get_orders`, `get_all_positions`,
+  `get_account` and `get` (fill activities only). The
   client is always built with `paper=True` and never with `url_override`, whatever the config holds; the
   config refuses both (`AlpacaExecutionClientConfig`). alpaca-py's REST client is synchronous, so each call
   runs in a worker thread, one at a time on its one `requests.Session`, as in `data.py`.
@@ -141,6 +142,7 @@ from __future__ import annotations
 import asyncio
 import re
 import threading
+from datetime import datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING
 from typing import Any
@@ -181,6 +183,7 @@ from nautilus_trader.model import AccountBalance
 from nautilus_trader.model import AccountType
 from nautilus_trader.model import ClientOrderId
 from nautilus_trader.model import Equity
+from nautilus_trader.model import FillReport
 from nautilus_trader.model import InstrumentId
 from nautilus_trader.model import LiquiditySide
 from nautilus_trader.model import Money
@@ -223,7 +226,6 @@ if TYPE_CHECKING:
     from nautilus_trader import live
     from nautilus_trader.common import Clock
     from nautilus_trader.live import ClientCache
-    from nautilus_trader.model import FillReport
     from nautilus_trader.model import TraderId
 
 PAPER_ONLY_RULE = "paper trading only: agents never place, modify or cancel live orders (AGENTS.md rule 8, ADR 0009)"
@@ -237,6 +239,21 @@ LIVE_HOSTS = frozenset(
     if host
 )
 """Alpaca's live trading hosts, from the pinned alpaca-py's `BaseURL` (`TRADING_LIVE`, `TRADING_STREAM_LIVE`)."""
+
+ACTIVITIES_PATH = "/account/activities/FILL"
+"""Alpaca's "Retrieve Account Activities of Specific Type" for fills, `GET /v2/account/activities/FILL`;
+alpaca-py's `RESTClient.get` adds the `/v2` (https://docs.alpaca.markets/us/reference/getaccountactivitiesbyactivitytype-1.md)."""
+
+ACTIVITIES_PAGE_SIZE = 100
+"""The reference's `page_size` maximum."""
+
+FILL_PAGES_LIMIT = 10
+"""Pages of fills read per report request before stopping with a warning: 1,000 fills, twice the 500 orders
+`ORDERS_PAGE_LIMIT` lets the order reports hold."""
+
+LAG_CHECK_NANOS = 60_000_000_000
+"""How recent an order's newest listed fill must be for the client to read the order and check that every
+fill is listed: on paper the activities lagged the stream by about a second (package README)."""
 
 ORDERS_PAGE_LIMIT = 500
 """The most orders one `get_orders` call returns: `GetOrdersRequest.limit` "Defaults to 50 and max is 500"."""
@@ -381,6 +398,8 @@ class OrdersClient(Protocol):
     def replace_order_by_id(
         self, order_id: UUID | str, order_data: ReplaceOrderRequest | None = None
     ) -> AlpacaOrder | RawData: ...
+
+    def get(self, path: str, data: dict | str | None = None) -> Any: ...
 
 
 type TradeUpdateHandler = Callable[[TradeUpdate | RawData], Awaitable[None]]
@@ -608,6 +627,48 @@ def order_status_report(
         return None
 
 
+def fill_time(activity: dict) -> int:
+    """An activity's `transaction_time`, "The time at which the execution occurred", in Unix nanoseconds."""
+    return dt_to_unix_nanos(datetime.fromisoformat(str(activity["transaction_time"])))
+
+
+def fill_report(activity: dict, ts_init: int) -> FillReport:
+    """A `FillReport` for one Alpaca `FILL` activity ("Retrieve Account Activities of Specific Type").
+
+    The trade ID is the UUID after `::` in the activity's `id`, which on paper is the trade update's
+    `execution_id` for the same fill (ADR 0024), so a fill seen on the stream and again here has one ID.
+    The price is kept exactly as Alpaca writes it. Alpaca's fill has no commission and no liquidity side:
+    the commission is zero dollars, which upstream's execution spec expects a stream that omits fees to
+    show ("TC-E85"), and the side `NO_LIQUIDITY_SIDE`, as on the stream. An activity has no client order
+    ID; the engine matches the report by `order_id`. Raises `ValueError` for one this slice cannot map.
+    """
+    activity_id = str(activity["id"])
+    _, sep, execution_id = activity_id.partition("::")
+    if not sep or not execution_id:
+        raise ValueError(f"id {activity_id} is not in `::` form")
+    side = {"buy": OrderSide.BUY, "sell": OrderSide.SELL, "sell_short": OrderSide.SELL}.get(
+        activity["side"]
+    )
+    if side is None:
+        raise ValueError(f"side {activity['side']}")
+    symbol = str(activity["symbol"])
+    if "/" in symbol:
+        raise ValueError(f"symbol {symbol} is not a US equity")
+    return FillReport(
+        account_id=ACCOUNT_ID,
+        instrument_id=InstrumentId(Symbol(symbol), VENUE),
+        venue_order_id=VenueOrderId(str(activity["order_id"])),
+        trade_id=TradeId(execution_id),
+        order_side=side,
+        last_qty=whole_quantity(activity["qty"], "fill quantity"),
+        last_px=Price.from_str(str(activity["price"])),
+        commission=Money(0, USD),
+        liquidity_side=LiquiditySide.NO_LIQUIDITY_SIDE,
+        ts_event=fill_time(activity),
+        ts_init=ts_init,
+    )
+
+
 def position_status_report(position: AlpacaPosition, ts_init: int) -> PositionStatusReport:
     """A `PositionStatusReport` for one Alpaca US equity position.
 
@@ -691,7 +752,6 @@ class AlpacaExecutionClient(ExecutionClient):
         self._updates: asyncio.Queue[TradeUpdate] = asyncio.Queue()
         self._consumer: asyncio.Task[object] | None = None
         self._applying = False
-        self._said_no_fill_reports = False
         self._log = Logger(type(self).__name__)
 
     # -- lifecycle ---------------------------------------------------------------------------------
@@ -708,7 +768,6 @@ class AlpacaExecutionClient(ExecutionClient):
     async def _connect_venue(self) -> None:
         self._owner_loop = self.loop
         self._stopping = False
-        self._said_no_fill_reports = False
         self._rest_lock = asyncio.Lock()
         if self._trading is None or self._stream is None:
             api_key, secret_key = credentials_from_env()
@@ -1464,13 +1523,7 @@ class AlpacaExecutionClient(ExecutionClient):
 
     @override
     async def _generate_fill_reports(self, command: live.GenerateFillReports) -> list[FillReport]:
-        if not self._said_no_fill_reports:
-            self._said_no_fill_reports = True
-            self._log.info(
-                "Alpaca fill history is not read (alpaca-py's TradingClient has no account activities "
-                "method); NautilusTrader infers fills from the order status reports",
-            )
-        return []
+        return await self._logged("fill reports", self._fill_reports(command))
 
     @override
     async def _generate_position_status_reports(
@@ -1561,6 +1614,124 @@ class AlpacaExecutionClient(ExecutionClient):
                 reports.append(report)
         return reports
 
+    async def _fill_reports(self, command: live.GenerateFillReports) -> list[FillReport]:
+        """One report per Alpaca `FILL` activity in the command's window, newest first from Alpaca, or
+        none if the history cannot be read.
+
+        The window and the instrument are applied here, on each activity's `transaction_time` and
+        `symbol`: what Alpaca's `after` and `until` compare for a fill is not documented (ADR 0024), and
+        the endpoint has no symbol filter. Alpaca returns activities newest first by default, so paging
+        stops at the first activity before the window's start, or after `FILL_PAGES_LIMIT` pages. If the
+        history cannot be read, the failure is logged and no fill is reported, so the engine infers fills
+        from the order reports as it did before fill reports existed. An order whose listed fills Alpaca
+        shows short of its filled quantity, as when the activities lag the stream, gets no reports
+        (`_complete`), so the engine infers its fills rather than taking a part of them.
+        """
+        try:
+            activities = await self._fill_activities(command)
+        except (APIError, OSError, TypeError, KeyError) as e:
+            self._log.error(
+                f"Alpaca fill history could not be read ({e!r}); fills are inferred from the order reports"
+            )
+            return []
+        ts_init = self.clock.timestamp_ns()
+        reports: list[FillReport] = []
+        for activity in activities:
+            try:
+                report = fill_report(activity, ts_init)
+            except (KeyError, TypeError, ValueError, ArithmeticError) as e:
+                name = activity.get("id") if isinstance(activity, dict) else repr(activity)
+                self._log.warning(f"Alpaca fill activity {name} is not reported: {e}")
+                continue
+            if command.start is not None and report.ts_event < command.start:
+                continue
+            if command.end is not None and report.ts_event > command.end:
+                continue
+            if command.instrument_id is not None and report.instrument_id != command.instrument_id:
+                continue
+            if (
+                command.venue_order_id is not None
+                and report.venue_order_id != command.venue_order_id
+            ):
+                continue
+            reports.append(report)
+        return await self._complete(reports, activities, ts_init)
+
+    async def _fill_activities(self, command: live.GenerateFillReports) -> list:
+        params: dict[str, str | int] = {"direction": "desc", "page_size": ACTIVITIES_PAGE_SIZE}
+        if command.venue_order_id is not None:
+            params["order_id"] = command.venue_order_id.value
+        activities: list = []
+        for _ in range(FILL_PAGES_LIMIT):
+            page = await self._call(self._venue().get, ACTIVITIES_PATH, params)
+            if not isinstance(page, list):
+                raise TypeError(f"Alpaca's activities endpoint answered {type(page).__name__}")
+            activities.extend(page)
+            try:
+                oldest = fill_time(page[-1]) if page else None
+            except KeyError, TypeError, ValueError:
+                oldest = (
+                    None  # an unreadable last row; paging goes on, and the row is skipped later
+                )
+            if len(page) < ACTIVITIES_PAGE_SIZE or (
+                command.start is not None and oldest is not None and oldest < command.start
+            ):
+                return activities
+            params["page_token"] = page[-1]["id"]
+        self._log.warning(
+            f"Alpaca fill history read to its limit of {FILL_PAGES_LIMIT} pages of {ACTIVITIES_PAGE_SIZE}; "
+            "older fills, if any, are not reported",
+        )
+        return activities
+
+    async def _complete(
+        self, reports: list[FillReport], activities: list, ts_init: int
+    ) -> list[FillReport]:
+        """Drop the reports of an order whose listed fills are not all of its fills, so the engine infers
+        that order's fills rather than taking a part of them (package README).
+
+        Two signs: the listed fills add up to less than the newest one's `cum_qty` ("The cumulative
+        quantity of shares involved in the execution"), as when the window or the page limit cut older
+        fills off; or the newest leaves shares to fill, is recent (`LAG_CHECK_NANOS`), and Alpaca's order
+        shows more filled than the listed fills, as when the activities lag the stream.
+        """
+        newest: dict[str, dict] = {}
+        for activity in activities:  # newest first
+            if isinstance(activity, dict) and activity.get("order_id") is not None:
+                newest.setdefault(str(activity["order_id"]), activity)
+        listed: dict[str, float] = {}
+        for report in reports:
+            key = report.venue_order_id.value
+            listed[key] = listed.get(key, 0.0) + report.last_qty.as_double()
+        partial: set[str] = set()
+        for order_id, qty in listed.items():
+            last = newest.get(order_id, {})
+            try:
+                cum = float(last.get("cum_qty") or 0)
+                leaves = float(last.get("leaves_qty") or 0)
+                recent = ts_init - fill_time(last) <= LAG_CHECK_NANOS
+            except KeyError, TypeError, ValueError:
+                partial.add(order_id)
+                continue
+            if qty < cum:
+                partial.add(order_id)
+                continue
+            if leaves <= 0 or not recent:
+                continue
+            try:
+                order = await self._call(self._venue().get_order_by_id, order_id)
+            except (APIError, OSError) as e:
+                self._log.warning(f"Alpaca order {order_id} not read to check its fills ({e!r})")
+                partial.add(order_id)
+                continue
+            if isinstance(order, AlpacaOrder) and float(order.filled_qty or 0) > qty:
+                partial.add(order_id)
+        for order_id in partial:
+            self._log.warning(
+                f"Alpaca lists only some fills of order {order_id}; its fills are left to the engine to infer",
+            )
+        return [r for r in reports if r.venue_order_id.value not in partial]
+
     async def _position_status_reports(
         self, command: live.GeneratePositionStatusReports
     ) -> list[PositionStatusReport]:
@@ -1581,6 +1752,26 @@ class AlpacaExecutionClient(ExecutionClient):
             report = position_status_report(position, ts_init)
             if command.instrument_id is None or report.instrument_id == command.instrument_id:
                 reports.append(report)
+        # Alpaca's "All Open Positions" lists the account's open positions, and "Once a position is closed,
+        # it will no longer be queryable" (https://docs.alpaca.markets/us/reference/getallopenpositions.md).
+        # NautilusTrader takes only "An explicit flat report" as evidence of flat ("Missing reports do not
+        # mean flat", reconciliation.md at the pinned commit), so each loaded instrument Alpaca lists no
+        # position in is reported flat; otherwise fills inferred from part of the order history can leave
+        # an external position Alpaca does not hold.
+        held = {report.instrument_id for report in reports}
+        for instrument in self._provider.list_all():
+            wanted = command.instrument_id is None or instrument.id == command.instrument_id
+            if wanted and instrument.id not in held:
+                reports.append(
+                    PositionStatusReport(
+                        account_id=ACCOUNT_ID,
+                        instrument_id=instrument.id,
+                        position_side=PositionSide.FLAT,
+                        quantity=Quantity(0, 0),
+                        ts_last=ts_init,
+                        ts_init=ts_init,
+                    )
+                )
         return reports
 
     async def _order_report(

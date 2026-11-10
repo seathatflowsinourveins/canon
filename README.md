@@ -193,7 +193,8 @@ here, community convergence, then anyone's recollection.
   Another showed that Alpaca's fill activities carry the trade updates' `execution_id`s (ADR 0024).
   Upstream's data and execution testers then ran through the adapter on paper: quotes, trades, bars,
   market and limit orders, fills, cancels and a rejection passed (see the package README). The full asset
-  list has not run against Alpaca, and fill history at start-up is not written.
+  list has not run against Alpaca. Fill history at start-up comes from Alpaca's fill activities (ADR
+  0024).
   See `packages/canon-alpaca/README.md`.
 * **Little market data in `catalog/`.** `load_bars` writes Alpaca's bars there (ADR 0040), and the only
   range anything here loads is the paper test's: AAPL's daily bars for the first quarter of 2025. A fresh
