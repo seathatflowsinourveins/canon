@@ -93,3 +93,10 @@ Read 2026-11-09 (fetched unless noted).
   version pinning with `bash -s <version>`; requires macOS 13 or later.
 * https://github.com/anthropics/claude-code — npm install marked deprecated in favour of the native
   installer.
+* https://www.python.org/downloads/release/python-31410/ — Python 3.14.10 (fetched 2026-11-10; resolved to
+  `b703b2c5e704`; second reader).
+* https://nodejs.org/en/blog/release/v24.22.2 — Node 24.22.2, an LTS line in maintenance since 2026-10-20
+  (fetched 2026-11-10; resolved to `f7f273a9bb64`; second reader).
+* https://github.com/cli/cli/releases/tag/v2.103.3 — gh 2.103.3 (fetched 2026-11-10; resolved to
+  `63837fb778d6`; second reader). These three were registered that day, and `scripts/canon lint` now fails
+  when `mise.toml` installs a tool that no registry entry names.

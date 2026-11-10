@@ -68,7 +68,7 @@ runs.
 | Path | Holds |
 |---|---|
 | `AGENTS.md`, `CLAUDE.md` | Instructions for agents; `CLAUDE.md` imports `AGENTS.md` |
-| `canon/upstreams.json` | The registry: 34 upstreams with role, licence, evidence, ADR |
+| `canon/upstreams.json` | The registry: 37 upstreams with role, licence, evidence, ADR |
 | `canon/upstreams.lock.json` | Resolved commit SHAs (generated) |
 | `canon/models.json` | Model routing by lane and the landscape snapshot behind it |
 | `docs/adr/` | Twenty decisions in MADR 4.0.0, each with Evidence and `review-by` |

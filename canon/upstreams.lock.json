@@ -144,6 +144,15 @@
       "sha": "de277ef139da42a7953b888c70c69e4c625caf35",
       "track": "branch:main"
     },
+    "gh": {
+      "default_branch": "trunk",
+      "default_sha": "18138654f3598ebe031ad7b661c903188f0f1dc9",
+      "ref": "refs/tags/v2.103.3",
+      "repo": "cli/cli",
+      "resolved_at": "2026-11-10T13:28:12Z",
+      "sha": "63837fb778d6a39f02be0ce76ff89f2bc8d74bdc",
+      "track": "tag:v2.103.3"
+    },
     "gh-signoff": {
       "default_branch": "main",
       "default_sha": "02e0cf9c11c9a1587784fec17c07b93fcb22ec24",
@@ -225,6 +234,15 @@
       "sha": "27a8e54e7ac3c57d6cbf8891f0283dfbaee97317",
       "track": "tag:v1.231.0"
     },
+    "node": {
+      "default_branch": "main",
+      "default_sha": "b1cd4519fd1e2da33645f6101079f856ab243146",
+      "ref": "refs/tags/v24.22.2",
+      "repo": "nodejs/node",
+      "resolved_at": "2026-11-10T13:28:07Z",
+      "sha": "f7f273a9bb6445f6f7fb6349105e7532972045fb",
+      "track": "tag:v24.22.2"
+    },
     "orca": {
       "default_branch": "main",
       "default_sha": "d1466f6017c4bb6006b77eb46f2fc0f461ef021e",
@@ -251,6 +269,15 @@
       "resolved_at": "2026-11-10T01:28:54Z",
       "sha": "ae1d0ff57b8bd4252da9ade7353523ac0ac73281",
       "track": "tag:9.2.0"
+    },
+    "python": {
+      "default_branch": "main",
+      "default_sha": "9d05428b29508873fb26832eea5d17e0e8de60df",
+      "ref": "refs/tags/v3.14.10",
+      "repo": "python/cpython",
+      "resolved_at": "2026-11-10T13:28:03Z",
+      "sha": "b703b2c5e704341d61e367b9b940b77ed11dded0",
+      "track": "tag:v3.14.10"
     },
     "ruff": {
       "default_branch": "main",
