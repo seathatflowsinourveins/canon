@@ -23,6 +23,32 @@
 #   abandoned (turn open, silent for six hours or more: the app was closed mid-turn) | ended |
 #   unknown (no turn boundary in the window, so whether a turn is open cannot be told; never flagged QUIET).
 # Known limit: a background subagent still working after its parent turn's Stop reads as idle.
+#
+# --rates [--window MIN] prints a manifest of every running worker of every runtime: lane, runtime, model,
+# state, output tokens per second over the last MIN minutes (default 10), and spend where the runtime
+# reports it. Every figure comes from a documented contract; a runtime without one is listed as
+# "not measured" with the reason, never estimated. Its inputs, besides the ledger and snapshots above:
+#   OTLP log file   ${CANON_OTLP_FILE:-~/.claude/canon/otel/logs.jsonl}, JSON Lines of OTLP/JSON
+#                   ExportLogsServiceRequest objects, as OpenTelemetry's file exporter and the Collector's
+#                   file exporter write them:
+#                   https://opentelemetry.io/docs/specs/otel/protocol/file-exporter/
+#                   https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/exporter/fileexporter
+#                   https://github.com/open-telemetry/opentelemetry-proto/blob/main/docs/specification.md (JSON)
+#     Claude Code   event api_request: session.id, model, output_tokens, duration_ms, cost_usd
+#                   https://code.claude.com/docs/en/monitoring-usage.md
+#     Codex CLI     event codex.sse_event with event.kind response.completed: conversation.id, model,
+#                   output_token_count; event codex.turn_cost: usage.estimated_usd (opt in via [otel];
+#                   https://learn.chatgpt.com/docs/config-file/config-advanced, attribute names read from
+#                   codex-rs/otel/src/events/session_telemetry.rs and shared.rs at the pinned tag)
+#                   Only these attributes are copied out; every other one (Codex sends account fields) is not.
+#   process table   ps(1) and lsof(1) for running codex, muse, agy and dsh processes and their directory.
+#                   Claude Code sessions come from the ledger, not from the process table.
+# TOK/S is the output tokens of the requests that finished in the window divided by the window's seconds.
+# GEN is output tokens over the requests' own durations, from the requests that carry one (Claude Code).
+# Claude Code rows are the ledger's sessions that are working or QUIET, or idle or unknown and heard from
+# within six hours (the abandoned threshold); a session closed without a SessionEnd shows until then.
+# A Codex conversation row means it reported events in the window, not that its process still runs.
+# Usage: scripts/lanes --rates [--window MIN] [--days N] [--json]
 set -euo pipefail
 
 CFG="${CANON_LEDGER_HOME:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}/canon}"
@@ -30,9 +56,11 @@ DAYS=2
 QUIET=15
 JSON=0
 SELFTEST=0
+RATES=0
+WINDOW=10
 usage() {
   [ -z "${1:-}" ] || echo "lanes: $1" >&2
-  echo "usage: scripts/lanes [--days N] [--quiet-min N] [--json] | --selftest" >&2
+  echo "usage: scripts/lanes [--days N] [--quiet-min N] [--json] | --rates [--window MIN] [--days N] [--json] | --selftest" >&2
   exit 2
 }
 while [ $# -gt 0 ]; do
@@ -40,13 +68,17 @@ while [ $# -gt 0 ]; do
     --days)      [ $# -ge 2 ] || usage "--days needs a value"; DAYS="$2"; shift 2 ;;
     --quiet-min) [ $# -ge 2 ] || usage "--quiet-min needs a value"; QUIET="$2"; shift 2 ;;
     --json)      JSON=1; shift ;;
+    --rates)     RATES=1; shift ;;
+    --window)    [ $# -ge 2 ] || usage "--window needs a value"; WINDOW="$2"; shift 2 ;;
     --selftest)  SELFTEST=1; shift ;;
     *) usage ;;
   esac
 done
 case "$DAYS" in ''|*[!0-9]*) usage "--days needs a whole number of 1 or more" ;; esac
 case "$QUIET" in ''|*[!0-9]*) usage "--quiet-min needs a whole number of 1 or more" ;; esac
-DAYS=$((10#$DAYS)); QUIET=$((10#$QUIET))
+case "$WINDOW" in ''|*[!0-9]*) usage "--window needs a whole number of 1 or more" ;; esac
+DAYS=$((10#$DAYS)); QUIET=$((10#$QUIET)); WINDOW=$((10#$WINDOW))
+[ "$WINDOW" -ge 1 ] || usage "--window needs a whole number of 1 or more"
 [ "$DAYS" -ge 1 ] || usage "--days needs a whole number of 1 or more"
 [ "$QUIET" -ge 1 ] || usage "--quiet-min needs a whole number of 1 or more"
 command -v jq >/dev/null 2>&1 || { echo "lanes: ERROR: jq not found" >&2; exit 1; }
@@ -203,6 +235,174 @@ print_report() {
   echo "$flagged of $(echo "$r" | jq '.sessions | length') session(s) flagged. MODEL, CTX and COST come from the status line and are '-' for sessions that never drew one."
 }
 
+# otlp_records <file>: one compact record per token-bearing event, {rt, sid, model, t, out, dur, cost},
+# or {"_bad":true} for a line that is not a JSON object. Nothing else is copied out of the file.
+otlp_records() {
+  jq -cR '
+    def av: if .stringValue != null then .stringValue elif .intValue != null then .intValue
+            elif .doubleValue != null then .doubleValue elif .boolValue != null then .boolValue else null end;
+    def num: if type == "number" then . elif type == "string" then (try tonumber catch null) else null end;
+    def iso: try (sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z") | fromdateiso8601) catch null;
+    (try fromjson catch null) as $o
+    | if ($o | type) != "object" then {_bad: true} else try (
+        $o.resourceLogs[]? | .scopeLogs[]? | .logRecords[]?
+        | ((.attributes // []) | map(select(.key | type == "string") | {key, value: (.value | av)}) | from_entries) as $a
+        | (($a["event.name"] // .body.stringValue? // "") | tostring) as $n
+        | (((.timeUnixNano // 0) | num) // 0) as $tn
+        | (((.observedTimeUnixNano // 0) | num) // 0) as $on
+        | (if $tn > 0 then $tn / 1e9
+           else ((if ($a["event.timestamp"] | type) == "string" then ($a["event.timestamp"] | iso) else null end)
+                 // (if $on > 0 then $on / 1e9 else null end)) end) as $t
+        | (if $n == "api_request" or $n == "claude_code.api_request" then
+             {rt: "claude-code", sid: $a["session.id"], out: ($a.output_tokens | num),
+              dur: ($a.duration_ms | num), cost: ($a.cost_usd | num)}
+           elif $n == "codex.sse_event" and $a["event.kind"] == "response.completed" then
+             {rt: "codex", sid: $a["conversation.id"], out: ($a.output_token_count | num), dur: null, cost: null}
+           elif $n == "codex.turn_cost" then
+             {rt: "codex", sid: $a["conversation.id"], out: 0, dur: null, cost: ($a["usage.estimated_usd"] | num)}
+           else empty end)
+        + {model: (if ($a.model | type) == "string" then $a.model else null end), t: $t}
+        | select((.sid | type) == "string" and .sid != "" and .t != null)
+      ) catch {_bad: true} end' "$1"
+}
+
+# proc_list: TSV pid, elapsed, runtime, directory for each top-level codex, muse, agy or dsh process.
+# The program is argv[0], or for node and bun the first argument that is not a flag. A process with an
+# ancestor of the same runtime is a helper of that worker and is left out. Known limit: any program named
+# muse, agy or dsh is taken for that runtime.
+proc_list() {
+  local pid et rt cwd
+  ps -axo pid=,ppid=,etime=,args= 2>/dev/null | awk '
+    function base(x) { sub(/.*\//, "", x); return x }
+    function rt(   n, k) { n = base($4)
+      if (n == "node" || n == "bun") { n = ""; for (k = 5; k <= NF; k++) if (substr($k, 1, 1) != "-") { n = base($k); break } }
+      if (n == "codex") return "codex"; if (n == "muse") return "muse-code"
+      if (n == "agy") return "antigravity"; if (n == "dsh" || n == "dsh-tui") return "deepseek-harness"
+      return "" }
+    { pid[NR] = $1; ppid[NR] = $2; et[NR] = $3; run[NR] = rt(); byp[$1] = run[NR]; par[$1] = $2 }
+    function helper(i,   p, d) { p = ppid[i]; for (d = 0; d < 64 && p != "" && p != "0"; d++) {
+        if (byp[p] == run[i]) return 1; p = par[p] } return 0 }
+    END { for (i = 1; i <= NR; i++) if (run[i] != "" && !helper(i)) print pid[i] "\t" et[i] "\t" run[i] }' \
+    | while IFS="$(printf '\t')" read -r pid et rt; do
+        cwd=$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)
+        printf '%s\t%s\t%s\t%s\n' "$pid" "$et" "$rt" "$cwd"
+      done
+}
+
+# rates_report -> one JSON object on stdout
+rates_report() {
+  local now otlp t base rc=0 present=false
+  now=$(date -u +%s)
+  otlp="${CANON_OTLP_FILE:-$CFG/otel/logs.jsonl}"
+  t=$(mktemp -d) || return 1
+  base=$(build_report 2>"$t/ledger.err") || rc=$?
+  if [ "$rc" = 4 ]; then base='{"sessions":[]}'; elif [ "$rc" != 0 ]; then cat "$t/ledger.err" >&2; rm -rf "$t"; return 1; fi
+  printf '%s' "$base" > "$t/base"
+  : > "$t/otlp"
+  if [ -f "$otlp" ]; then
+    present=true
+    otlp_records "$otlp" > "$t/otlp" || { rm -rf "$t"; echo "lanes: ERROR: could not read $otlp" >&2; return 1; }
+  fi
+  proc_list | jq -R 'split("\t") | {pid: .[0], etime: .[1], rt: .[2], cwd: (.[3] // "")}' | jq -s . > "$t/procs" \
+    || { rm -rf "$t"; echo "lanes: ERROR: could not list processes" >&2; return 1; }
+  jq -n --argjson now "$now" --argjson win "$WINDOW" --arg otlp "$otlp" --argjson present "$present" \
+     --argjson ledger "$([ "$rc" = 0 ] && echo true || echo false)" --rawfile ledger_err "$t/ledger.err" \
+     --argjson have_lsof "$(command -v lsof >/dev/null 2>&1 && echo true || echo false)" \
+     --slurpfile base "$t/base" --slurpfile rec "$t/otlp" --slurpfile procs "$t/procs" '
+    def r2: if . == null then null else ((. * 100) | round) / 100 end;
+    def r4: if . == null then null else ((. * 10000) | round) / 10000 end;
+    ($rec | map(select(._bad != true))) as $r
+    | ($now - $win * 60) as $from
+    | ($r | map(select(.t >= $from and .t <= $now + 60))) as $w
+    | ($r | map(select(.rt == "claude-code") | {key: .sid, value: true}) | from_entries) as $seen
+    | def measure($rt; $sid):
+        ($w | map(select(.rt == $rt and .sid == $sid))) as $m
+        | ($m | map(.out // 0) | add // 0) as $out
+        | ($m | map(select(.dur != null and .dur > 0))) as $timed
+        | ($timed | map(.dur) | add) as $dur
+        | {out_tokens: $out, tok_s: (($out / ($win * 60)) | r2),
+           gen_tok_s: (if $dur != null then ((($timed | map(.out // 0) | add) / ($dur / 1000)) | r2) else null end),
+           spend_window_usd: ($m | map(.cost // empty) | if length > 0 then add | r4 else null end),
+           measured: true, note: "", model_seen: ($m | map(.model // empty) | last)};
+      def unmeasured($why): {out_tokens: null, tok_s: null, gen_tok_s: null, spend_window_usd: null,
+                             measured: false, note: ("not measured: " + $why), model_seen: null};
+    ($r | map(select(.rt == "codex")) | length > 0) as $codex_otlp
+    | {
+        generated_at: ($now | todate),
+        window_min: $win,
+        otlp_file: $otlp,
+        otlp_file_present: $present,
+        otlp_unreadable_lines: ($rec | map(select(._bad == true)) | length),
+        ledger_present: $ledger,
+        ledger_note: ($ledger_err | sub("^lanes: "; "") | sub("\n+$"; "")),
+        warnings: [
+          ($procs[0] | map(select(.cwd == "")) | length) as $nocwd
+          | if $nocwd > 0 then "directory not read for \($nocwd) process(es)" + (if $have_lsof then " (lsof gave none: exited, or another user\u0027s)" else " (lsof not found)" end) else empty end
+        ],
+        workers: [
+          ( $base[0].sessions[]
+            | select(.state == "working" or .state == "QUIET"
+                     or ((.state == "idle" or .state == "unknown") and .quiet_min < 360))
+            | . as $s
+            | (if $present | not then unmeasured("no OTLP log file (ADR 0007 tier 3 not enabled)")
+               elif $seen[$s.sid] then measure("claude-code"; $s.sid)
+               else unmeasured("this session sent no api_request event to the OTLP file (telemetry not enabled for it)") end) as $m
+            | {lane: $s.lane, runtime: "claude-code", model: ($m.model_seen // $s.model), state: $s.state,
+               id: $s.sid, spend_session_usd: $s.cost_usd} + ($m | del(.model_seen)) ),
+          ( $w | map(select(.rt == "codex")) | group_by(.sid)[] | .[0].sid as $sid
+            | measure("codex"; $sid) as $m
+            | {lane: "-", runtime: "codex", model: $m.model_seen, state: "events in window", id: $sid, spend_session_usd: null}
+              + ($m | del(.model_seen))
+              + {note: "per conversation; no documented field names its directory or process"} ),
+          ( $procs[0][]
+            | {lane: (if .cwd == "" then "?" else (.cwd | split("/") | last) end), runtime: .rt, model: null,
+               state: ("running " + .etime), id: ("pid " + .pid), spend_session_usd: null}
+              + (if .rt == "codex" then
+                   (if $codex_otlp then unmeasured("tokens are reported per conversation; no documented field links a process to its conversation")
+                    else unmeasured("Codex sends no telemetry here: [otel] exporter is none by default, and it has only OTLP exporters") end)
+                 elif .rt == "muse-code" then unmeasured("Muse Code documents no token telemetry: its event log has no documented path or schema")
+                 elif .rt == "antigravity" then unmeasured("Antigravity documents no token telemetry for interactive sessions")
+                 else unmeasured("DeepSeek Harness documents no token telemetry") end | del(.model_seen)) )
+        ],
+        sources: [
+          {runtime: "claude-code", source: "OTLP api_request events (tok/s, spend); ledger and status line (lanes, state, session cost)",
+           url: "https://code.claude.com/docs/en/monitoring-usage.md"},
+          {runtime: "codex", source: "OTLP codex.sse_event response.completed and codex.turn_cost events; process table",
+           url: "https://learn.chatgpt.com/docs/config-file/config-advanced"},
+          {runtime: "muse-code", source: "process table only; no documented token source", url: "https://dev.meta.ai/docs/muse-code"},
+          {runtime: "antigravity", source: "process table only; no documented token source", url: "https://antigravity.google/docs/settings/"},
+          {runtime: "deepseek-harness", source: "process table only; no documented token source",
+           url: "https://github.com/deepseek-ai/deepseek-harness"}
+        ]
+      }' || { rm -rf "$t"; echo "lanes: ERROR: could not build the rates manifest" >&2; return 1; }
+  rm -rf "$t"
+}
+
+print_rates() {
+  local r="$1"
+  echo "$r" | jq -r '"Workers at " + .generated_at + ", output tokens over the last " + (.window_min | tostring) + " min"
+    + "  (OTLP file: " + .otlp_file + (if .otlp_file_present then "" else ", absent" end) + ")"'
+  echo "$r" | jq -r 'if .otlp_unreadable_lines > 0 then "WARNING: \(.otlp_unreadable_lines) unreadable OTLP line(s) skipped" else empty end,
+                     if .ledger_present then empty else "WARNING: no Claude Code session is listed: " + .ledger_note end,
+                     (.warnings[] | "WARNING: " + .)'
+  {
+    printf 'LANE\tRUNTIME\tMODEL\tSTATE\tTOK/S\tGEN\tOUT\tSPEND\tID\tNOTE\n'
+    echo "$r" | jq -r '
+      def usd: if . == null then null else "$" + (((. * 100) | round) / 100 | tostring) end;
+      .workers[] | [
+        .lane, .runtime, (.model // "-"), (.state | gsub(" "; "_")),
+        (.tok_s // "-" | tostring), (.gen_tok_s // "-" | tostring), (.out_tokens // "-" | tostring),
+        ([(.spend_window_usd | usd | if . then . + " win" else empty end),
+          (.spend_session_usd | usd | if . then . + " session" else empty end)] | if length > 0 then join(", ") else "-" end),
+        (.id | if startswith("pid ") then . else .[0:8] end),
+        (if .note == "" then "-" else .note end)
+      ] | @tsv'
+  } | column -t -s "$(printf '\t')"
+  echo
+  echo "Sources:"
+  echo "$r" | jq -r '.sources[] | "  " + .runtime + ": " + .source + "  " + .url'
+}
+
 selftest() {
   local tmp; tmp=$(mktemp -d)
   mkdir -p "$tmp/ledger" "$tmp/sessions"
@@ -328,5 +528,10 @@ selftest() {
 }
 
 if [ "$SELFTEST" = 1 ]; then selftest; exit $?; fi
+if [ "$RATES" = 1 ]; then
+  R=$(rates_report) || exit $?
+  if [ "$JSON" = 1 ]; then echo "$R"; else print_rates "$R"; fi
+  exit 0
+fi
 R=$(build_report) || exit $?
 if [ "$JSON" = 1 ]; then echo "$R"; else print_report "$R"; fi

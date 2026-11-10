@@ -38,6 +38,7 @@ previous copy of each.
 | `scripts/canon resolve` | Re-resolve pins and rewrite the lock |
 | `scripts/lanes` | State of every Claude Code session on this machine |
 | `scripts/lanes --selftest` | Prove the lane report's flags fire |
+| `scripts/lanes --rates` | Every running worker of every runtime, with output tokens per second or why not measured |
 | `scripts/automation status` | Every standing automation and whether it is healthy |
 | `scripts/survey-github report canon/github-practice.json` | What a measured sample of repositories converges on for pull requests and GitHub automation |
 
@@ -216,7 +217,8 @@ here, community convergence, then anyone's recollection.
   The first study on real bars, eight `MaCross` variants on SPY and QQQ daily bars, is pre-registered
   in ADR 0048 (`canon_trading.variant_study`) and has not run.
 * **No OpenTelemetry backend.** The local event ledger covers this machine; `home/otel-settings.example.json`
-  is ready for when a collector exists.
+  is ready for when a collector exists. Until one writes `~/.claude/canon/otel/logs.jsonl`,
+  `scripts/lanes --rates` lists every worker as not measured (ADR 0007).
 * **No eval of our own has run.** Model routing rests on external measurements (ADR 0005). A reviewer
   benchmark is defined, with its first cases, brief and procedure in `evals/review/` (ADR 0046); no
   reviewer has run it, and with ten confirmed defects, eight in one case, it can show only gross differences.

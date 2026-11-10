@@ -1,10 +1,11 @@
 #!/bin/bash
 # test-lanes — offline checks of the machine-level observability pieces around scripts/lanes:
-# home/.claude/canon/statusline.sh, home/.claude/canon/lanes-watch.sh, scripts/automation and
-# scripts/bootstrap. (scripts/lanes checks itself: scripts/lanes --selftest.)
+# home/.claude/canon/statusline.sh, home/.claude/canon/lanes-watch.sh, scripts/lanes --rates, scripts/automation
+# and scripts/bootstrap. (scripts/lanes checks itself: scripts/lanes --selftest.)
 # Inputs follow the documented payloads (https://code.claude.com/docs/en/hooks.md,
 # https://code.claude.com/docs/en/statusline.md). Every script runs as a copy in a temp folder, with HOME,
-# CLAUDE_CONFIG_DIR and CANON_LAUNCHAGENTS_DIR pointed there and stubs first on PATH for launchctl,
+# CLAUDE_CONFIG_DIR and CANON_LAUNCHAGENTS_DIR pointed there (the --rates cases run scripts/lanes in place, with
+# HOME and its inputs pointed there) and stubs first on PATH for launchctl,
 # osascript, mise, xcode-select, curl and claude, so nothing outside the temp folder is read or changed and
 # nothing reaches the network. The --install case for a missing CLI drops the claude stub from PATH and uses
 # a curl stub that serves an installer stub recording the version it was asked for. A case that needs a macOS-only tool is skipped with a line saying so.
@@ -100,6 +101,112 @@ cat "$LG"/canon/ledger/*.jsonl > "$TMP/lg.jsonl" 2>/dev/null
 check "ledger line has ts and a sub-second t of the same moment" \
       jqt "$TMP/lg.jsonl" '(.t | type) == "number" and (.t | floor) == (.ts | fromdateiso8601)'
 check "ledger records the SessionStart source"     jqt "$TMP/lg.jsonl" '.source == "compact"'
+
+# ---------- rates manifest (scripts/lanes --rates) ----------
+# Fixtures: a ledger and status-line snapshot, an OTLP JSON Lines file shaped as Claude Code's api_request and
+# Codex's codex.sse_event and codex.turn_cost events (https://code.claude.com/docs/en/monitoring-usage.md,
+# https://opentelemetry.io/docs/specs/otel/protocol/file-exporter/), and ps and lsof stubs for the process table.
+echo "rates manifest:"
+unset CANON_OTLP_FILE
+RD="$TMP/rates"; RB="$TMP/rates-bin"; mkdir -p "$RD/ledger" "$RD/sessions" "$RD/otel" "$RB"
+cat > "$RB/ps" <<'STUB'
+#!/bin/bash
+# ps stub: the process table, as ps -axo pid=,ppid=,etime=,args= prints it
+cat <<'T'
+  101     1    01:02:03 /opt/bin/codex --model x
+  102   101       05:00 /opt/bin/codex app-server
+  103     1       10:00 /usr/local/bin/node --no-warnings /opt/lib/bin/dsh-tui .
+  107   102       01:00 /bin/zsh -c codex exec
+  108   107       01:00 /opt/bin/codex exec
+  104     1       02:00 /opt/bin/muse
+  105     1       03:00 /opt/bin/agy
+  106     1       04:00 /usr/bin/other codex
+T
+STUB
+cat > "$RB/lsof" <<'STUB'
+#!/bin/bash
+# lsof stub: -a -p PID -d cwd -Fn -> the directory /w/proc-PID
+while [ $# -gt 0 ]; do [ "$1" = -p ] && pid="$2"; shift; done
+[ "$pid" = 105 ] && exit 1   # a process lsof cannot read
+printf 'p%s\nfcwd\nn/w/proc-%s\n' "$pid" "$pid"
+STUB
+chmod +x "$RB/ps" "$RB/lsof"
+rday=$(date -u +%Y-%m-%d)
+rts() { iso $((NOW - $1)); }   # rts <seconds ago> -> ISO 8601 UTC
+{
+  printf '{"ts":"%s","ev":"UserPromptSubmit","sid":"s-otel","cwd":"/w/otel"}\n' "$(rts 300)"
+  printf '{"ts":"%s","ev":"UserPromptSubmit","sid":"s-none","cwd":"/w/none"}\n' "$(rts 300)"
+  printf '{"ts":"%s","ev":"Stop","sid":"s-none","cwd":"/w/none"}\n' "$(rts 200)"
+  printf '{"ts":"%s","ev":"UserPromptSubmit","sid":"s-ended","cwd":"/w/ended"}\n' "$(rts 300)"
+  printf '{"ts":"%s","ev":"SessionEnd","sid":"s-ended","cwd":"/w/ended"}\n' "$(rts 100)"
+  printf '{"ts":"%s","ev":"Stop","sid":"s-old","cwd":"/w/old"}\n' "$(rts 25200)"
+} > "$RD/ledger/$rday.jsonl"
+echo '{"sid":"s-otel","model":"claude-opus-5-5","cost_usd":2.5}' > "$RD/sessions/s-otel.json"
+# rec <attributes json array> [timeUnixNano]: one OTLP/JSON logs request line
+rec() { jq -cn --argjson a "$1" --arg tn "${2:-}" \
+  '{resourceLogs: [{resource: {attributes: []}, scopeLogs: [{scope: {}, logRecords: [
+     ({attributes: $a} + (if $tn == "" then {} else {timeUnixNano: $tn} end))]}]}]}'; }
+s() { printf '{"key":"%s","value":{"stringValue":"%s"}}' "$1" "$2"; }
+n() { printf '{"key":"%s","value":{"%s":%s}}' "$1" "$2" "$3"; }
+{
+  # two Claude Code requests in the window, one by timeUnixNano and one by event.timestamp only: 1200 tokens over 6 s
+  rec "[$(s event.name api_request),$(s session.id s-otel),$(s model claude-opus-5-5),$(n output_tokens intValue '"600"'),$(n duration_ms doubleValue 2500),$(n cost_usd doubleValue 0.12)]" "$((NOW - 120))000000000"
+  rec "[$(s event.name api_request),$(s session.id s-otel),$(s event.timestamp "$(jq -nr --argjson t $((NOW - 60)) '$t | strftime("%Y-%m-%dT%H:%M:%S.123Z")')"),$(n output_tokens intValue 600),$(n duration_ms intValue '"3500"'),$(n cost_usd doubleValue 0.08)]"
+  # one outside the window
+  rec "[$(s event.name api_request),$(s session.id s-otel),$(n output_tokens intValue 9999),$(n duration_ms intValue 1)]" "$((NOW - 1800))000000000"
+  # Codex: a completed response (with an account field that must not be copied), another kind, and a turn cost
+  rec "[$(s event.name codex.sse_event),$(s event.kind response.completed),$(s conversation.id c-1),$(s model gpt-x),$(s user.email someone@example.com),$(s output_token_count 1200)]" "$((NOW - 90))000000000"
+  rec "[$(s event.name codex.sse_event),$(s event.kind response.output_text.delta),$(s conversation.id c-1),$(s output_token_count 777)]" "$((NOW - 80))000000000"
+  rec "[$(s event.name codex.turn_cost),$(s conversation.id c-1),$(n usage.estimated_usd doubleValue 0.05)]" "$((NOW - 70))000000000"
+  # an event.timestamp with an offset falls back to observedTimeUnixNano: 300 more tokens in the window
+  jq -cn --arg on "$((NOW - 30))000000000" '{resourceLogs: [{scopeLogs: [{logRecords: [{timeUnixNano: "0", observedTimeUnixNano: $on,
+     attributes: [{key: "event.name", value: {stringValue: "api_request"}}, {key: "session.id", value: {stringValue: "s-otel"}},
+                  {key: "event.timestamp", value: {stringValue: "2026-11-10T12:00:00.123+01:00"}},
+                  {key: "output_tokens", value: {intValue: "300"}}]}]}]}]}'
+  echo '{"resourceMetrics":[]}'
+  echo '{"resourceLogs": broken'
+  echo '{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"attributes":["x"]}]}]}]}'
+} > "$RD/otel/logs.jsonl"
+# runs scripts/lanes in place, with HOME and both inputs pointed into the temp folder
+rates() { PATH="$RB:$PATH" HOME="$RD" CLAUDE_CONFIG_DIR="$RD" CANON_LEDGER_HOME="$RD" \
+          CANON_OTLP_FILE="${CANON_OTLP_FILE:-$RD/otel/logs.jsonl}" "$ROOT/scripts/lanes" --rates "$@"; }
+rates --json > "$TMP/rates.json" 2>"$TMP/rates.err"; rc=$?
+check "rates manifest: exit 0"                     test "$rc" = 0
+w() { jqt "$TMP/rates.json" "$1"; }
+check "claude session with telemetry: 1500 tokens over 10 min is 2.5 tok/s; 1200 over 6 s of requests is 200 generating (one by observed time, no duration)" \
+      w '.workers[] | select(.id == "s-otel") | .tok_s == 2.5 and .gen_tok_s == 200 and .out_tokens == 1500 and .measured'
+check "... spend in the window and for the session" w '.workers[] | select(.id == "s-otel") | .spend_window_usd == 0.2 and .spend_session_usd == 2.5'
+check "... model from the events"                  w '.workers[] | select(.id == "s-otel") | .model == "claude-opus-5-5" and .lane == "otel"'
+check "claude session without telemetry: not measured, saying why" \
+      w '.workers[] | select(.id == "s-none") | (.measured | not) and .tok_s == null and (.note | test("sent no api_request"))'
+check "ended session left out"                     w '[.workers[] | select(.id == "s-ended")] | length == 0'
+check "idle session silent for seven hours left out" w '[.workers[] | select(.id == "s-old")] | length == 0'
+check "codex conversation: only response.completed counts, 2 tok/s, spend from turn_cost" \
+      w '.workers[] | select(.runtime == "codex" and .id == "c-1") | .tok_s == 2 and .out_tokens == 1200 and .spend_window_usd == 0.05 and .model == "gpt-x"'
+check "one codex process row; its helpers, direct or through a shell, are left out" \
+      w '[.workers[] | select(.runtime == "codex" and (.id | startswith("pid")))] | length == 1 and .[0].id == "pid 101" and .[0].lane == "proc-101"'
+check "... not measured, pointing at the conversation rows" w '.workers[] | select(.id == "pid 101") | .note | test("per conversation")'
+check "dsh-tui under node with a flag is a DeepSeek Harness worker" w '.workers[] | select(.id == "pid 103") | .runtime == "deepseek-harness" and (.measured | not)'
+check "muse and agy listed as not measured"        w '([.workers[] | select(.runtime == "muse-code" or .runtime == "antigravity") | select(.measured | not)] | length) == 2'
+check "an unrelated process naming codex in its arguments is left out" w '[.workers[] | select(.id == "pid 106")] | length == 0'
+check "a directory lsof cannot read: lane ?, and a warning" \
+      w '(.workers[] | select(.id == "pid 105") | .lane == "?") and (.warnings | any(test("directory not read for 1")))'
+check "corrupt and misshapen OTLP lines counted, metrics line not" w '.otlp_unreadable_lines == 2'
+check "no attribute beyond the named ones is copied out" eval '! grep -q "someone@example.com" "$TMP/rates.json"'
+check "every runtime names its source"             w '[.sources[].runtime] == ["claude-code","codex","muse-code","antigravity","deepseek-harness"]'
+rates > "$TMP/rates.out" 2>&1; rc=$?
+check "rates table prints, one line per worker"    eval '[ "$rc" = 0 ] && [ "$(grep -cE "^(otel|none|-|proc-[0-9]+|\?) " "$TMP/rates.out")" = 7 ]'
+CANON_OTLP_FILE="$RD/otel/absent.jsonl" rates --json > "$TMP/rates.json" 2>/dev/null; rc=$?
+check "no OTLP file: exit 0, every row not measured" w '.otlp_file_present == false and ([.workers[] | select(.measured)] | length == 0)'
+check "... the claude row names the missing file"  w '.workers[] | select(.id == "s-otel") | .note | test("no OTLP log file")'
+check "... the codex row says its exporter is off" w '.workers[] | select(.id == "pid 101") | .note | test("exporter is none")'
+mv "$RD/ledger" "$RD/ledger.off"
+rates --json > "$TMP/rates.json" 2>/dev/null; rc=$?
+check "no ledger: exit 0, processes still listed"  eval '[ "$rc" = 0 ] && jqt "$TMP/rates.json" ".ledger_present == false and ([.workers[] | select(.runtime == \"muse-code\")] | length == 1)"'
+check "... with the ledger's own hint"             w '.ledger_note | test("ledger is empty")'
+mv "$RD/ledger.off" "$RD/ledger"
+rc=0; rates --window 0 >/dev/null 2>&1 || rc=$?
+check "--window 0: usage error, exit 2"            test "$rc" = 2
 
 # ---------- status line ----------
 echo "status line:"
