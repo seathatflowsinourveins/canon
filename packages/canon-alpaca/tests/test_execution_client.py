@@ -1720,6 +1720,98 @@ def test_pending_replace_with_fills_is_reported_partly_filled(alpaca) -> None:
     assert report.order_status == OrderStatus.PARTIALLY_FILLED
 
 
+@pytest.mark.parametrize("client_order_id", ["", "\u8ba2\u5355-1"])
+def test_closed_order_with_a_client_id_nautilus_cannot_hold_is_skipped(
+    venue, alpaca, client_order_id
+) -> None:
+    # An order made outside the node (Alpaca's dashboard, say) with an empty or non-ASCII client order ID:
+    # a closed one is skipped with a warning; start-up reconciliation goes on.
+    venue.trading.orders = [
+        alpaca.alpaca_order(
+            id="3e1f7c2a-5b9d-4a6e-8c0f-1d2b3c4e5f60",
+            client_order_id=client_order_id,
+            status="canceled",
+        )
+    ]
+    node = build_node(trader(submit=False))
+
+    run(node)
+
+    assert node.cache.orders_open() == []
+
+
+def test_open_order_with_a_client_id_nautilus_cannot_hold_fails_startup_by_name(
+    venue, alpaca, capfd
+) -> None:
+    venue.trading.orders = [alpaca.alpaca_order(client_order_id="", status="new")]
+    node = build_node(trader(submit=False))
+
+    with pytest.raises(RuntimeError, match="Failed to get mass status"):
+        run(node)
+
+    assert f"Alpaca order {alpaca.ORDER_AAPL['id']} (AAPL) is open with invalid string" in logged(
+        capfd
+    )
+
+
+def test_replacement_of_an_order_with_an_unholdable_id_is_reported_under_its_own(
+    venue, alpaca
+) -> None:
+    # A dashboard order with a non-ASCII client order ID, replaced: the open replacement has an ID the node
+    # can hold and is reconciled under it; the trace stops at the unholdable original.
+    original = alpaca.alpaca_order(
+        id="6a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+        client_order_id="\u8ba2\u5355-1",
+        status="replaced",
+        replaced_by="7b2c3d4e-5f6a-4b7c-8d9e-0f1a2b3c4d5e",
+    )
+    replacement = alpaca.alpaca_order(
+        id="7b2c3d4e-5f6a-4b7c-8d9e-0f1a2b3c4d5e",
+        client_order_id="alpaca-made-1",
+        status="new",
+        replaces=original["id"],
+    )
+    venue.trading.orders = [original, replacement]
+    node = build_node(trader(submit=False))
+
+    run(node)
+
+    (working,) = node.cache.orders_open()
+    assert working.client_order_id == ClientOrderId("alpaca-made-1")
+
+
+def test_cancel_all_cancels_again_an_order_whose_cancel_had_no_answer(venue, alpaca) -> None:
+    # A cancel that got no answer leaves the order PENDING_CANCEL while it still works at Alpaca; a later
+    # cancel-all must send it again, as upstream's Kraken spot, Binance spot, Bybit and Interactive Brokers
+    # adapters include every open order.
+    venue.trading.script = "accept"
+    strategy = cancel_all(orders=[(OrderSide.BUY, "140.00")])
+    first_cancel: list = []
+
+    async def body(client) -> None:
+        async with asyncio.timeout(10):
+            while not strategy.accepted:
+                await asyncio.sleep(0.01)
+        await until_idle(client, venue)
+        venue.trading.cancel_error = ConnectionError(
+            "read timed out"
+        )  # the first cancel: no answer
+        client_order_id = strategy.placed[0]
+        strategy.cancel_order(client_order_id)
+        await until_idle(client, venue)
+        first_cancel.append(len(venue.trading.cancels))
+        venue.trading.cancel_error = None
+        await client._cancel_all_orders(SimpleNamespace(instrument_id=AAPL, order_side=None))
+        await until_idle(client, venue)
+
+    strategy.sent = True  # the strategy sends no cancel-all itself; the test does
+    run_with_client(body, strategy)
+
+    assert first_cancel == [1]
+    assert len(venue.trading.cancels) == 2, venue.trading.cancels
+    assert "OrderCanceled" in strategy.final().values()
+
+
 def test_update_for_an_order_the_node_does_not_hold_is_dropped(venue, alpaca, capfd) -> None:
     other = alpaca.alpaca_order(client_order_id="placed-elsewhere", status="new")
     venue.stream.send({"event": "new", "order": other, "timestamp": other["updated_at"]})

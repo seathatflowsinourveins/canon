@@ -116,8 +116,8 @@ Known limits:
   Its trade updates are mapped as any order's. A `day` order placed overnight stays active through the next
   trading day and "If unfilled, the order is canceled at 8:00 PM ET" (Alpaca's 24/5 page); which update
   that cancel sends is not documented.
-* Cancel-all sends one cancel per order, one at a time, in no specified order, skipping an order already
-  pending cancel; an order placed after the command was read from the cache is not canceled by it.
+* Cancel-all sends one cancel per order, one at a time, in no specified order, an order already pending
+  cancel included; an order placed after the command was read from the cache is not canceled by it.
 * A limit price at or above $1.00 with more than 2 decimals, or below $1.00 with more than 4, is denied
   here: Alpaca rejects it ("Sub-penny increments for limit orders", same page).
 * The account is a NautilusTrader cash account holding Alpaca's `cash` as its USD balance, all of it free,
@@ -589,6 +589,14 @@ def extended_hours_denial(order: Any) -> str | None:
     return None  # `_denial` has already refused a time in force other than `DAY` and `GTC`
 
 
+def holdable_id(value: str) -> ClientOrderId | None:
+    """A client order ID as NautilusTrader holds it, or None for one it refuses (empty or not ASCII)."""
+    try:
+        return ClientOrderId(value)
+    except ValueError:
+        return None
+
+
 def replaces_as_asked(replacement: AlpacaOrder, request: ReplaceOrderRequest, order: Any) -> bool:
     """Whether Alpaca's replacement has the terms the replace request asked for, a quantity the request
     leaves out being the node order's own: a request that omits a field asks to keep it."""
@@ -811,7 +819,7 @@ class AlpacaExecutionClient(ExecutionClient):
         self._finished: set[ClientOrderId] = set()
         # A replacement's Alpaca client order ID, mapped to the node's order it replaces: a cache of the
         # `replaces` chain, which is walked again when it misses (a new client after a restart).
-        self._replacements: dict[str, ClientOrderId] = {}
+        self._replacements: dict[str, ClientOrderId | None] = {}
         # PATCH answers by the replacement's order ID, read when Alpaca's `replaced` update arrives.
         self._answers: dict[str, AlpacaOrder] = {}
         # Replaces sent and not yet answered by an outcome, by the Alpaca order each one targeted: each
@@ -1053,6 +1061,10 @@ class AlpacaExecutionClient(ExecutionClient):
     async def _cancel_order(self, command: live.CancelOrder) -> None:
         await self._cancel_logged(command.client_order_id, command.venue_order_id)
 
+    def _pending_cancel(self, client_order_id: ClientOrderId) -> bool:
+        order = self.cache.order(client_order_id)
+        return order is not None and order.status == OrderStatus.PENDING_CANCEL
+
     async def _cancel_logged(
         self, client_order_id: ClientOrderId, venue_order_id: VenueOrderId | None
     ) -> None:
@@ -1074,8 +1086,9 @@ class AlpacaExecutionClient(ExecutionClient):
         Alpaca's "Delete All Orders" cancels every open order of the account, whatever its symbol, so it
         is not used: as upstream's Kraken spot adapter does for its account-wide cancel-all, the matching
         orders are taken from the cache and canceled by ID. In-flight orders are included because Alpaca
-        may hold an order the node still has as `SUBMITTED`. An order already `PENDING_CANCEL` has a cancel
-        in flight and is left to it. A strategy sends this command only with `strategy_only=False`, and
+        may hold an order the node still has as `SUBMITTED`. An order already `PENDING_CANCEL` is canceled
+        again, as Kraken spot, Binance spot, Bybit and Interactive Brokers select every open order: its first
+        cancel may have had no answer and the order may still work at Alpaca. A strategy sends this command only with `strategy_only=False`, and
         then means every strategy's orders, so none is filtered by strategy. A failure on one order is
         logged and the rest are still canceled.
         """
@@ -1086,11 +1099,12 @@ class AlpacaExecutionClient(ExecutionClient):
         if not selected:
             self._log.info(f"No open or in-flight {command.instrument_id} orders to cancel")
             return
-        for client_order_id in selected:
+        pending = [c for c in selected if self._pending_cancel(c)]
+        for client_order_id in [c for c in selected if c not in pending] + pending:
             # Read again at its turn: the cancels before it took an HTTP round trip each, in which this
             # order may have filled, closed or been sent a cancel of its own.
             order = self.cache.order(client_order_id)
-            if order is None or order.is_closed or order.status == OrderStatus.PENDING_CANCEL:
+            if order is None or order.is_closed:
                 continue
             await self._cancel_logged(client_order_id, order.venue_order_id)
 
@@ -1461,27 +1475,29 @@ class AlpacaExecutionClient(ExecutionClient):
         self, alpaca_order: AlpacaOrder, known: dict[str, AlpacaOrder] | None = None
     ) -> ClientOrderId | None:
         """The node's client order ID for an Alpaca order, or None if the node holds none."""
-        own = ClientOrderId(alpaca_order.client_order_id)
-        if self.cache.order(own) is not None:
+        own = holdable_id(alpaca_order.client_order_id)
+        if own is not None and self.cache.order(own) is not None:
             return own
         root = await self._root_id(alpaca_order, known)
-        return root if self.cache.order(root) is not None else None
+        return root if root is not None and self.cache.order(root) is not None else None
 
     async def _root_id(
         self, alpaca_order: AlpacaOrder, known: dict[str, AlpacaOrder] | None = None
-    ) -> ClientOrderId:
-        """The client order ID of the order an Alpaca order's `replaces` chain starts from.
+    ) -> ClientOrderId | None:
+        """The client order ID of the order an Alpaca order's `replaces` chain starts from, or None if it
+        has none NautilusTrader can hold.
 
         A replacement carries a client order ID Alpaca made (observed), so it is traced back through its
         `replaces` links, from the orders already fetched first, at most `MAX_REPLACE_CHAIN` of them.
         Every result is cached, a chain that ends without reaching the node's orders included, so an
         order traced before the node holds its original (the start-up window) resolves once it does, and
-        no chain is walked twice; the cache is rebuilt after a restart.
+        no chain is walked twice; the cache is rebuilt after a restart. A client order ID NautilusTrader
+        cannot hold (empty or not ASCII, as an order made outside the node can carry) ends the chain: the
+        trace stops at the order before it.
         """
-        cached = self._replacements.get(alpaca_order.client_order_id)
-        if cached is not None:
-            return cached
-        root = ClientOrderId(alpaca_order.client_order_id)
+        if alpaca_order.client_order_id in self._replacements:
+            return self._replacements[alpaca_order.client_order_id]
+        root = holdable_id(alpaca_order.client_order_id)
         replaces = alpaca_order.replaces
         for _ in range(MAX_REPLACE_CHAIN):
             if replaces is None:
@@ -1498,11 +1514,13 @@ class AlpacaExecutionClient(ExecutionClient):
                 raise TypeError(
                     "alpaca-py returned raw order data; the client must use raw_data=False"
                 )
-            mapped = self._replacements.get(prior.client_order_id)
-            if mapped is not None:
-                root = mapped
+            if prior.client_order_id in self._replacements:
+                root = self._replacements[prior.client_order_id] or root
                 break
-            root = ClientOrderId(prior.client_order_id)
+            prior_id = holdable_id(prior.client_order_id)
+            if prior_id is None:
+                break  # the order before cannot be held: the trace stops here
+            root = prior_id
             if self.cache.order(root) is not None:
                 break
             replaces = prior.replaces
@@ -2076,6 +2094,7 @@ class AlpacaExecutionClient(ExecutionClient):
         except (APIError, OSError) as e:
             self._log.warning(f"Alpaca order {order.id} is not reported: tracing it failed ({e!r})")
             return None
+
         # Reported under the chain's first client order ID, the node's, held or not: after a restart
         # the node's original order is created under its own ID.
         node_id = root

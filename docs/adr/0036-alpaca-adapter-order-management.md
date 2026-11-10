@@ -38,12 +38,15 @@ Bybit select open orders from the cache for a sided command and call their venue
 otherwise; Interactive Brokers always selects from the cache; Coinbase lists the venue's orders; Betfair,
 and OKX by opt-in, send wider cancels, neither account-wide. So the client cancels by ID, one at a time, the
 cache's open and in-flight orders for the instrument and side, every strategy's (the command comes only from
-`strategy_only=False`), each re-read at its turn and skipped if closed or `PENDING_CANCEL` (as Coinbase,
-since a second cancel risks a rejection). A 422 is `OrderCancelRejected` ("Cancel, cancel-all, or batch
-cancel") unless Alpaca shows the order canceled or pending cancel (alpaca-py's own retry, ADR 0030), or
-replaced, when the replacement is canceled; an unexpected error is logged with no event ("parse failures
-after transmission" leave the outcome unknown). That the rest go on, in a batch cancel too, is this repo's
-choice; `_batch_cancel_orders` keeps the guide's default: Alpaca has no cancel-by-list endpoint.
+`strategy_only=False`), each re-read at its turn and skipped if closed;one already `PENDING_CANCEL` is
+canceled again, after the others, since its first cancel may have had no answer: Kraken spot and Interactive
+Brokers select every open order of the instrument, and Binance spot and Bybit every open order of a sided
+command, with no status filter, where Coinbase alone filters it out. A 422 is `OrderCancelRejected`
+("Cancel, cancel-all, or batch cancel") unless Alpaca shows the order canceled or pending cancel
+(alpaca-py's own retry, ADR 0030), or replaced, when the replacement is canceled; an unexpected error is
+logged with no event ("parse failures after transmission" leave the outcome unknown). That the rest go on,
+in a batch cancel too, is this repo's choice; `_batch_cancel_orders` keeps the guide's default: Alpaca has
+no cancel-by-list endpoint.
 
 ### Stop and stop-limit orders
 
@@ -108,20 +111,22 @@ Read 2026-11-10; "raw": fetched with `curl` and read, not summarised. NautilusTr
   `docs/concepts/execution/policies.md`: the failure events, "parse failures after transmission"; `latest`
   adds `OrderCancelDenied` and `OrderModifyDenied` (fetched, raw; diffed). `docs/concepts/orders/index.md`
   and `stop_market.md`: the trigger types (fetched, raw).
-  https://nautilustrader.io/docs/md/latest/developer_guide/spec_exec_testing.md: groups 3 and 5, the
-  TC-E41 card, `ExecTester`'s setup (fetched, raw).
+  https://nautilustrader.io/docs/md/latest/developer_guide/spec_exec_testing.md: groups 3 and 5, the TC-E41
+  card, `ExecTester`'s setup (fetched, raw).
 * `crates/adapters/` at the pin: cancel-all and batch cancel in `kraken/src/execution/spot.rs`,
   `binance/src/spot/execution.rs`, `bybit/src/execution.rs`, `interactive_brokers/src/execution/core.rs`,
   `coinbase/src/execution.rs`, `betfair/src/execution.rs`, `okx/src/execution.rs` and
-  `okx/src/websocket/client.rs`; Kraken's trigger mapping; Coinbase's `OrderContext`; `query_account` and
-  the account fetch on connect in Kraken spot, Coinbase, Binance spot and Bybit (fetched, raw).
-  `crates/trading/src/strategy/mod.rs`: `strategy_only`; `crates/testkit/src/testers/exec/strategy.rs`:
-  `on_stop` (fetched, raw).
+  `okx/src/websocket/client.rs`; the open orders each selects for cancel-all (Kraken spot `orders_open` and
+  `orders_inflight`, Interactive Brokers `cancel_all_targets`, Binance spot and Bybit `orders_open` with the
+  side, none filtering by status; Coinbase's status filter without `PendingCancel`); Kraken's trigger
+  mapping; Coinbase's `OrderContext`; `query_account` and the account fetch on connect in Kraken spot,
+  Coinbase, Binance spot and Bybit (fetched, raw). `crates/trading/src/strategy/mod.rs`: `strategy_only`;
+  `crates/testkit/src/testers/exec/strategy.rs`: `on_stop` (fetched, raw).
 * https://docs.alpaca.markets/us/: `reference/deleteallorders-1.md` (account-wide, 207 per order),
-  `reference/deleteorderbyorderid-1.md` (422 or 204), `reference/patchorderbyorderid-1.md` (`replaced_by`, for
-  a cancel that meets a replaced order), `docs/orders-at-alpaca.md` (stop rules and the
-  time-in-force tables, read with markup stripped), `docs/websocket-streaming.md` (the events; none for an
-  election), `llms.txt` "Orders" (no cancel-by-list) (fetched, raw).
+  `reference/deleteorderbyorderid-1.md` (422 or 204), `reference/patchorderbyorderid-1.md` (`replaced_by`,
+  for a cancel that meets a replaced order), `docs/orders-at-alpaca.md` (stop rules and the time-in-force
+  tables, read with markup stripped), `docs/websocket-streaming.md` (the events; none for an election),
+  `llms.txt` "Orders" (no cancel-by-list) (fetched, raw).
 * https://github.com/alpacahq/alpaca-py `v0.45.0`, `tests/trading/trading_client/test_order_routes.py`: the
   paper base URL mocked for orders and replaces (fetched, raw).
 * Paper, 2026-11-10, logs kept outside the repo: TC-E41 as written, the sell refused 241 times; five runs
@@ -135,5 +140,12 @@ Read 2026-11-10; "raw": fetched with `curl` and read, not summarised. NautilusTr
   Corrected above: "never wider than the command"; Binance spot and Bybit select from the cache only for a
   sided command; the retry argument; the 422 exception; who skips `OrderPendingCancel`; Kraken's trigger
   mapping; the run count; sources for the pending-cancel skip and no cancel-by-list; option 3 added.
+* Benchmark reviews after landing, 2026-11-10: cancel-all skipped an order already `PENDING_CANCEL`, so one
+  whose cancel had no answer was never canceled again, and a closed order with a client order ID
+  NautilusTrader cannot hold (empty or not ASCII) aborted start-up reconciliation.Both reproduced with a
+  test and are fixed: the first follows the four upstream adapters that include such an order; for the
+  second, an ID NautilusTrader cannot hold ends a `replaces` trace, so a closed such order is skipped, a
+  valid replacement of one is reported under its own ID, and an open one fails start-up by name, as any open
+  order this slice cannot represent does (ADR 0030).
 * Modify, its option, outcome, paper rows, `UNVERIFIED` items and their evidence, moved to ADR 0042 on
   2026-11-10 with no change of decision; the source lines that support both are kept in each.
