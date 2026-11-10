@@ -1,0 +1,285 @@
+#!/bin/bash
+# canon — resolve, verify and lint the pinned-upstream registry.
+#
+# Contract implemented (nothing here is invented protocol):
+#   - Git smart-HTTP ref advertisement: GET <repo>.git/info/refs?service=git-upload-pack
+#     https://git-scm.com/docs/gitprotocol-http  (same data `git ls-remote` prints)
+#   - Registry: canon/upstreams.json   Lock: canon/upstreams.lock.json
+#
+# Depends only on curl + jq, which ship with macOS, so it runs before any toolchain install.
+# Fails loudly: any upstream that cannot be resolved is an error, never a silent skip.
+#
+# Usage: scripts/canon resolve [id] | check | outdated [--json] | lint | list | selftest
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+REG="$ROOT/canon/upstreams.json"
+LOCK="$ROOT/canon/upstreams.lock.json"
+ADR_DIR="$ROOT/docs/adr"
+
+die() { echo "canon: ERROR: $*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "missing required tool: $1"; }
+need curl; need jq
+[ -f "$REG" ] || die "registry not found: $REG"
+
+# refs_for <owner/repo>  -> lines of "<sha> <refname>" plus a "HEAD-> <branch>" line
+refs_for() {
+  local repo="$1" raw
+  raw=$(curl -fsSL --max-time 30 --retry 2 \
+        "https://github.com/$repo.git/info/refs?service=git-upload-pack" | LC_ALL=C tr '\0' '\n') \
+        || return 1
+  printf '%s\n' "$raw" | LC_ALL=C grep -a -o 'symref=HEAD:refs/heads/[^ ]*' | head -1 \
+    | sed 's|symref=HEAD:refs/heads/|HEAD-> |'
+  printf '%s\n' "$raw" | LC_ALL=C grep -a -E '^[0-9a-f]{44} refs/' | cut -c5-
+}
+
+# resolve_one <owner/repo> <track>  -> "<ref> <sha> <default_branch> <default_sha>"
+resolve_one() {
+  local repo="$1" track="$2" refs default ref sha dsha
+  refs=$(refs_for "$repo") || return 1
+  default=$(printf '%s\n' "$refs" | sed -n 's/^HEAD-> //p' | head -1)
+  [ -n "$default" ] || return 1
+  dsha=$(printf '%s\n' "$refs" | awk -v r="refs/heads/$default" '$2==r{print $1; exit}')
+  case "$track" in
+    default)   ref="refs/heads/$default" ;;
+    branch:*)  ref="refs/heads/${track#branch:}" ;;
+    tag:*)     ref="refs/tags/${track#tag:}" ;;
+    *)         return 2 ;;
+  esac
+  # annotated tags advertise a peeled "^{}" entry holding the commit; prefer it
+  sha=$(printf '%s\n' "$refs" | awk -v r="$ref^{}" '$2==r{print $1; exit}')
+  [ -n "$sha" ] || sha=$(printf '%s\n' "$refs" | awk -v r="$ref" '$2==r{print $1; exit}')
+  [ -n "$sha" ] || return 3
+  echo "$ref $sha $default $dsha"
+}
+
+# resolve            re-resolve every upstream and rewrite the whole lock
+# resolve <id>       resolve one upstream and merge it into the existing lock, leaving every other pin
+#                    exactly as it is. Use this to add or move a single pin (ADR 0001: pins move deliberately).
+cmd_resolve() {
+  local only="${1:-}" tmp n=0 fail=0 now top
+  now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  tmp=$(mktemp)
+  if [ -n "$only" ]; then
+    [ -f "$LOCK" ] || die "no lock file yet; run a full: scripts/canon resolve"
+    jq -e --arg id "$only" '.upstreams[] | select(.id == $id and .repo != null)' "$REG" >/dev/null \
+      || { rm -f "$tmp"; die "no upstream with id '$only' in the registry"; }
+    jq '.pins' "$LOCK" > "$tmp"
+    top=$(jq -r '.resolved_at' "$LOCK")
+  else
+    echo '{}' > "$tmp"
+    top="$now"
+  fi
+  while IFS=$'\t' read -r id repo track; do
+    [ -z "$only" ] || [ "$id" = "$only" ] || continue
+    n=$((n+1))
+    if out=$(resolve_one "$repo" "$track"); then
+      # shellcheck disable=SC2086  # splitting "ref sha branch sha" into positional parameters is intended
+      set -- $out
+      jq --arg id "$id" --arg repo "$repo" --arg track "$track" --arg ref "$1" --arg sha "$2" \
+         --arg def "$3" --arg dsha "$4" --arg at "$now" \
+         '.[$id] = {repo:$repo, track:$track, ref:$ref, sha:$sha, default_branch:$def, default_sha:$dsha, resolved_at:$at}' \
+         "$tmp" > "$tmp.n" && mv "$tmp.n" "$tmp"
+      printf '  ok    %-28s %s @ %s\n' "$id" "$1" "${2:0:12}"
+    else
+      fail=$((fail+1))
+      printf '  FAIL  %-28s %s (%s) could not be resolved\n' "$id" "$repo" "$track" >&2
+    fi
+  done < <(jq -r '.upstreams[] | select(.repo != null) | [.id, .repo, (.track // "default")] | @tsv' "$REG")
+  [ "$fail" -eq 0 ] || { rm -f "$tmp"; die "$fail of $n upstreams failed to resolve; lock NOT written"; }
+  jq -S --arg at "$top" '{schema:1, resolved_at:$at, pins:.}' "$tmp" > "$LOCK.tmp" && mv "$LOCK.tmp" "$LOCK"; rm -f "$tmp"
+  echo "canon: resolved $n upstream(s) -> ${LOCK#"$ROOT"/}"
+}
+
+cmd_check() {
+  [ -f "$LOCK" ] || die "no lock file; run: scripts/canon resolve"
+  # Two different things can change upstream, and only one is alarming:
+  #   RETAGGED  a release tag we pinned now points at a different commit. Tags are meant to be
+  #             immutable, so treat this as a supply-chain warning. Exit 3.
+  #   advanced  a branch we track has new commits. Normal. The lock still holds the old commit,
+  #             so nothing we use has changed; it only means there is something newer to review.
+  local retag=0 adv=0 fail=0 n=0
+  while IFS=$'\t' read -r id repo track; do
+    n=$((n+1))
+    locked=$(jq -r --arg id "$id" '.pins[$id].sha // empty' "$LOCK")
+    [ -n "$locked" ] || { fail=$((fail+1)); echo "  UNPINNED  $id (in registry, not in lock)"; continue; }
+    if out=$(resolve_one "$repo" "$track"); then
+      # shellcheck disable=SC2086  # splitting "ref sha branch sha" into positional parameters is intended
+      set -- $out
+      if [ "$2" = "$locked" ]; then
+        printf '  current   %s\n' "$id"
+      else
+        case "$track" in
+          tag:*) retag=$((retag+1)); printf '  RETAGGED  %-28s %s was %s, is now %s\n' "$id" "$1" "${locked:0:12}" "${2:0:12}" ;;
+          *)     adv=$((adv+1));     printf '  advanced  %-28s %s moved %s -> %s; pin holds\n' "$id" "$1" "${locked:0:12}" "${2:0:12}" ;;
+        esac
+      fi
+    else
+      fail=$((fail+1)); echo "  FAIL      $id ($repo $track) unreachable or ref gone" >&2
+    fi
+  done < <(jq -r '.upstreams[] | select(.repo != null) | [.id, .repo, (.track // "default")] | @tsv' "$REG")
+  echo "canon: $n checked, $retag retagged, $adv branch-tracked advanced, $fail failed"
+  [ "$fail" -eq 0 ] || exit 1
+  [ "$retag" -eq 0 ] || exit 3
+}
+
+cmd_lint() {
+  local err=0
+  # 1. registry shape: every entry carries the evidence an ADR needs
+  bad=$(jq -r '.upstreams[] | select((.id|not) or (.field|not) or (.role|not) or (.why|not)
+        or ((.evidence // []) | length == 0) or (.adr|not) or ((.repo|not) and (.url|not))) | .id // "<no id>"' "$REG")
+  # shellcheck disable=SC2001  # indenting every line of multi-line output; ${var//} cannot anchor each line
+  [ -z "$bad" ] || { err=1; echo "lint: registry entries missing id/field/role/why/evidence/adr/source:"; echo "$bad" | sed 's/^/    /'; }
+  dup=$(jq -r '[.upstreams[].id] | group_by(.) | map(select(length>1) | .[0]) | .[]' "$REG")
+  [ -z "$dup" ] || { err=1; echo "lint: duplicate ids: $dup"; }
+  # 2. lock: every repo entry pinned to a full 40-hex commit
+  if [ -f "$LOCK" ]; then
+    while read -r id; do
+      sha=$(jq -r --arg id "$id" '.pins[$id].sha // ""' "$LOCK")
+      echo "$sha" | grep -Eq '^[0-9a-f]{40}$' || { err=1; echo "lint: $id has no 40-hex pin in lock"; }
+    done < <(jq -r '.upstreams[] | select(.repo != null) | .id' "$REG")
+  else err=1; echo "lint: lock file missing"; fi
+  # 3. ADRs: each referenced ADR exists; each accepted ADR has status, evidence links and a review date
+  while read -r adr; do
+    ls "$ADR_DIR"/"$adr"-*.md >/dev/null 2>&1 || { err=1; echo "lint: registry references ADR $adr but docs/adr/$adr-*.md does not exist"; }
+  done < <(jq -r '[.upstreams[].adr] | unique | .[]' "$REG")
+  for f in "$ADR_DIR"/[0-9][0-9][0-9][0-9]-*.md; do
+    [ -f "$f" ] || continue
+    b=${f#"$ROOT"/}
+    grep -q '^status:' "$f"        || { err=1; echo "lint: $b missing front-matter 'status:'"; }
+    grep -q '^review-by:' "$f"     || { err=1; echo "lint: $b missing front-matter 'review-by:'"; }
+    grep -q '^## Evidence' "$f"    || { err=1; echo "lint: $b missing '## Evidence' section"; }
+    awk '/^## Evidence/{e=1;next} /^## /{e=0} e' "$f" | grep -q 'https\?://' \
+                                   || { err=1; echo "lint: $b Evidence section cites no URL"; }
+  done
+  # 4. One pin, declared once. The registry says which version is adopted; uv.lock, mise.toml, the
+  #    bootstrap and the workflow files are where it is installed. They must agree, so a version bumped
+  #    in one place (by hand or by a bot) fails here until the registry and its ADR are updated too.
+  local want have locked repo sha wf
+  while IFS=$'\t' read -r id track pypi misetool; do
+    want="${track#tag:}"; want="${want#v}"
+    if [ "$pypi" != "-" ] && [ -f "$ROOT/uv.lock" ]; then
+      have=$(awk -v n="$pypi" '$0 == "[[package]]" { cur = "" } $1 == "name" { gsub(/"/, "", $3); cur = $3 }
+                               $1 == "version" && cur == n { gsub(/"/, "", $3); print $3; exit }' "$ROOT/uv.lock")
+      [ "$have" = "$want" ] || { err=1; echo "lint: $id is $want in the registry but uv.lock has '${have:-nothing}' for $pypi"; }
+    fi
+    if [ "$misetool" != "-" ] && [ -f "$ROOT/mise.toml" ]; then
+      have=$(awk -F'"' -v n="$misetool" '$1 ~ "^" n " *= *$" { print $2; exit }' "$ROOT/mise.toml")
+      [ "$have" = "$want" ] || { err=1; echo "lint: $id is $want in the registry but mise.toml has '${have:-nothing}' for $misetool"; }
+    fi
+  done < <(jq -r '.upstreams[] | select((.track // "") | startswith("tag:")) | select(.pypi != null or .mise != null)
+                  | [.id, .track, (.pypi // "-"), (.mise // "-")] | @tsv' "$REG")
+  want=$(jq -r '.upstreams[] | select(.id == "mise") | .track' "$REG"); want="${want#tag:}"
+  if [ -n "$want" ]; then
+    grep -q "^MISE_VERSION=\"$want\"" "$ROOT/scripts/bootstrap" 2>/dev/null \
+      || { err=1; echo "lint: mise is $want in the registry but scripts/bootstrap sets a different MISE_VERSION"; }
+  fi
+  for wf in "$ROOT"/.github/workflows/*.yml; do
+    [ -f "$wf" ] || continue
+    if grep -nE '^[[:space:]]*-?[[:space:]]*uses:[[:space:]]*[^.#[:space:]][^@[:space:]]*@' "$wf" | grep -vE '@[0-9a-f]{40}([[:space:]]|$)' >/dev/null; then
+      err=1; echo "lint: ${wf#"$ROOT"/} references an action by tag or branch; pin it to a full commit SHA"
+    fi
+    while read -r repo sha; do
+      [ -n "$repo" ] || continue
+      locked=$(jq -r --arg r "$repo" --slurpfile lock "$LOCK" '[.upstreams[] | select(.repo == $r) | $lock[0].pins[.id].sha] | first // ""' "$REG")
+      if [ -z "$locked" ]; then err=1; echo "lint: ${wf#"$ROOT"/} uses $repo, which is not in the registry"
+      elif [ "$locked" != "$sha" ]; then err=1; echo "lint: ${wf#"$ROOT"/} pins $repo to ${sha:0:12} but the canon lock has ${locked:0:12}"; fi
+      if [ "$repo" = "jdx/mise-action" ] && [ -n "$want" ]; then
+        grep -qE "^[[:space:]]*version:[[:space:]]*\"?${want#v}\"?[[:space:]]*$" "$wf" \
+          || { err=1; echo "lint: ${wf#"$ROOT"/} installs a mise version other than the registry's ${want#v}"; }
+      fi
+    done < <(grep -oE 'uses:[[:space:]]*[^@[:space:]]+@[0-9a-f]{40}' "$wf" | sed -E 's/uses:[[:space:]]*//; s/@/ /')
+  done
+
+  if [ "$err" -eq 0 ]; then echo "canon: lint clean"; else exit 1; fi
+}
+
+# outdated: for every upstream tracked by release tag, is there a newer tag upstream?
+# Ordering is numeric on major.minor.patch; a tag with a suffix (rc, beta, ...) sorts below the same
+# version without one, so "v2.0.0" outranks "v2.0.0rc8". Only tags sharing the pinned tag's prefix are
+# compared ("v1.2.3" never competes with "tool-v9.9.9"). An entry's optional "line" (e.g. "v1.") holds it
+# to one release line. Exit 0 = report printed (see STATUS); 1 = an upstream could not be read.
+# The release rule, shared by `outdated` and `selftest`. Input: an array of tag names.
+# shellcheck disable=SC2016  # a jq program: $id, $pinned and the rest are jq variables, not shell ones
+OUTDATED_JQ='
+  def ver: (capture("^(?<p>[A-Za-z_-]*)(?<a>[0-9]+)(\\.(?<b>[0-9]+))?(\\.(?<c>[0-9]+))?(?<rest>.*)$") // null);
+  def key: ver as $v
+    | [($v.a | tonumber), (($v.b // "0") | tonumber), (($v.c // "0") | tonumber),
+       (if $v.rest == "" then 1 else 0 end), ($v.rest | [scan("[0-9]+")] | map(tonumber)), $v.rest];
+  ($pinned | ver) as $pv
+  | if $pv == null then {id: $id, role: $role, pinned: $pinned, status: "UNPARSEABLE", newest: null, newest_stable: null}
+    else
+      (map(select(. != "" and ver != null and ver.p == $pv.p and ($line == "" or startswith($line))))) as $c
+      | ($c | sort_by(key) | last) as $newest
+      | ($c | map(select(ver.rest == "")) | sort_by(key) | last) as $stable
+      # A stable pin is only outrun by a stable tag: dev, rc and beta tags are not releases to move to.
+      # A pre-release pin is outrun by any later tag, and a stable one is called out separately.
+      | {id: $id, role: $role, pinned: $pinned,
+         newest: (if $pv.rest == "" then $stable else $newest end), newest_stable: $stable,
+         status: (if $pv.rest != "" and $stable != null and ($stable | key) > ($pinned | key) then "STABLE-AVAILABLE"
+                  elif $pv.rest != "" and $newest != null and ($newest | key) > ($pinned | key) then "NEWER"
+                  elif $pv.rest == "" and $stable != null and ($stable | key) > ($pinned | key) then "NEWER"
+                  else "current" end)}
+    end'
+
+# selftest: the release rule on fixed tag sets. Offline.
+cmd_selftest() {
+  local fails=0 got
+  # judge <pinned> <line> <tags...> -> status
+  judge() { local pinned="$1" line="$2"; shift 2
+            printf '%s\n' "$@" | jq -R . | jq -sr --arg id t --arg role t --arg pinned "$pinned" --arg line "$line" "$OUTDATED_JQ | .status + \" \" + (.newest // \"-\")"; }
+  want() { # label, expected "status newest", actual
+    if [ "$2" = "$3" ]; then echo "  pass  $1"; else echo "  FAIL  $1 (wanted '$2', got '$3')"; fails=$((fails+1)); fi; }
+  got=$(judge 9.2.0 "" 9.1.0 9.2.0 10.0.0.dev0);                       want "stable pin ignores a dev tag above it"   "current 9.2.0" "$got"
+  got=$(judge 9.2.0 "" 9.2.0 9.2.1 10.0.0.dev0);                       want "stable pin sees a newer stable release"  "NEWER 9.2.1" "$got"
+  got=$(judge v2.0.0rc8 "" v1.231.0 v2.0.0rc8 v2.0.0rc10);             want "rc pin sees a later rc, rc10 after rc8"  "NEWER v2.0.0rc10" "$got"
+  got=$(judge v2.0.0rc8 "" v2.0.0rc8 v2.0.0rc9 v2.0.0);                want "rc pin reports a stable release"         "STABLE-AVAILABLE v2.0.0" "$got"
+  got=$(judge v1.231.0 "v1." v1.231.0 v2.0.0rc8 v2.0.0);               want "a release line holds an entry to v1"     "current v1.231.0" "$got"
+  got=$(judge v2026.11.5 "" v2026.11.5 vfox-v2026.12.0 nightly);       want "other tag prefixes are not compared"     "current v2026.11.5" "$got"
+  got=$(judge v9.9.9 "" v9.9.9 v10.0.0);                               want "10 sorts after 9"                        "NEWER v10.0.0" "$got"
+  if [ "$fails" -eq 0 ]; then echo "canon: selftest passed"; else echo "canon: selftest FAILED ($fails)"; exit 1; fi
+}
+
+cmd_outdated() {
+  local json=0 fail=0 n=0 tmp row refs tags
+  [ "${1:-}" = "--json" ] && json=1
+  tmp=$(mktemp); echo '[]' > "$tmp"
+  while IFS=$'\t' read -r id repo track role line; do
+    n=$((n+1))
+    [ "$line" = "-" ] && line=""
+    if refs=$(refs_for "$repo"); then
+      tags=$(printf '%s\n' "$refs" | awk '$2 ~ /^refs\/tags\// && $2 !~ /\^\{\}$/ { sub("refs/tags/", "", $2); print $2 }')
+      row=$(printf '%s\n' "$tags" | jq -R . \
+            | jq -s --arg id "$id" --arg role "$role" --arg pinned "${track#tag:}" --arg line "$line" "$OUTDATED_JQ")
+      jq --argjson row "$row" '. + [$row]' "$tmp" > "$tmp.n" && mv "$tmp.n" "$tmp"
+    else
+      fail=$((fail+1))
+      jq --arg id "$id" --arg role "$role" --arg pinned "${track#tag:}" \
+         '. + [{id: $id, role: $role, pinned: $pinned, status: "UNREACHABLE", newest: null, newest_stable: null}]' "$tmp" > "$tmp.n" && mv "$tmp.n" "$tmp"
+    fi
+  done < <(jq -r '.upstreams[] | select((.track // "") | startswith("tag:")) | [.id, .repo, .track, .role, (.line // "-")] | @tsv' "$REG")
+  if [ "$json" -eq 1 ]; then
+    jq -c . "$tmp"
+  else
+    jq -r '.[] | [.id, .role, .pinned, (.newest // "-"), .status] | @tsv' "$tmp" \
+      | awk -F'\t' 'BEGIN{printf "%-26s %-11s %-13s %-13s %s\n","ID","ROLE","PINNED","NEWEST","STATUS"} {printf "%-26s %-11s %-13s %-13s %s\n",$1,$2,$3,$4,$5}'
+    echo "canon: $n tag-tracked upstreams, $(jq '[.[] | select(.status == "NEWER" or .status == "STABLE-AVAILABLE")] | length' "$tmp") with a newer release, $fail unreachable"
+  fi
+  rm -f "$tmp"
+  [ "$fail" -eq 0 ] || exit 1
+}
+
+cmd_list() {
+  jq -r --slurpfile lock "$LOCK" '.upstreams[] | [.field, .id, .role, ($lock[0].pins[.id].sha // "-")[0:12], (.repo // .url)] | @tsv' "$REG" \
+    | sort | awk -F'\t' 'BEGIN{printf "%-22s %-28s %-11s %-13s %s\n","FIELD","ID","ROLE","PIN","SOURCE"} {printf "%-22s %-28s %-11s %-13s %s\n",$1,$2,$3,$4,$5}'
+}
+
+case "${1:-}" in
+  resolve) cmd_resolve "${2:-}" ;;
+  check)   cmd_check ;;
+  lint)    cmd_lint ;;
+  list)    cmd_list ;;
+  outdated) cmd_outdated "${2:-}" ;;
+  selftest) cmd_selftest ;;
+  *) echo "usage: scripts/canon {resolve [id]|check|outdated [--json]|lint|list|selftest}" >&2; exit 2 ;;
+esac

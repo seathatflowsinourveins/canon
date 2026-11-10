@@ -1,0 +1,199 @@
+#!/bin/bash
+# lanes — report every Claude Code session on this machine from the local event ledger (ADR 0007).
+#
+# Input contracts (nothing here parses session transcripts, whose format is documented as internal):
+#   ledger lines    written by home/.claude/canon/ledger.sh from documented hook payloads
+#                   https://code.claude.com/docs/en/hooks.md
+#   snapshots       written by home/.claude/canon/statusline.sh
+#                   https://code.claude.com/docs/en/statusline.md
+#
+# Usage: scripts/lanes [--days N] [--quiet-min N] [--json]
+#        scripts/lanes --selftest
+# Exit:  0 report printed; 4 ledger empty (hooks not installed, or no sessions yet); 1 selftest failed.
+# States: working | idle (turn finished) | QUIET (turn open, silent past the threshold) |
+#         abandoned (turn open, silent for six hours or more: the app was closed mid-turn) | ended.
+set -euo pipefail
+
+CFG="${CANON_LEDGER_HOME:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}/canon}"
+DAYS=2
+QUIET=15
+JSON=0
+SELFTEST=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --days)      DAYS="$2"; shift 2 ;;
+    --quiet-min) QUIET="$2"; shift 2 ;;
+    --json)      JSON=1; shift ;;
+    --selftest)  SELFTEST=1; shift ;;
+    *) echo "usage: scripts/lanes [--days N] [--quiet-min N] [--json] | --selftest" >&2; exit 2 ;;
+  esac
+done
+command -v jq >/dev/null 2>&1 || { echo "lanes: ERROR: jq not found" >&2; exit 1; }
+
+# build_report -> one JSON object on stdout
+build_report() {
+  local files snaps="[]"
+  files=$(find "$CFG/ledger" -maxdepth 1 -name "*.jsonl" 2>/dev/null | sort | tail -n "$DAYS")
+  if [ -z "$files" ]; then
+    echo "lanes: ledger is empty at $CFG/ledger. Install the machine-level hooks with: scripts/bootstrap --user-config" >&2
+    return 4
+  fi
+  if ls "$CFG"/sessions/*.json >/dev/null 2>&1; then
+    snaps=$(cat "$CFG"/sessions/*.json | jq -s 'map(select(.sid != null))')
+  fi
+  printf '%s\n' "$files" | while IFS= read -r f; do cat "$f"; done \
+  | jq -cR '. as $l | try ($l | fromjson) catch {"_bad": true}' \
+  | jq -s --argjson now "$(date -u +%s)" --argjson quiet "$QUIET" --argjson snaps "$snaps" '
+      def count(f): map(select(f)) | length;
+      def tally: group_by(.) | map({name: .[0], n: length}) | sort_by(-.n);
+      (map(select(._bad == true)) | length) as $bad
+      | map(select(._bad != true and .sid != null and .ts != null)) as $ev
+      | ($snaps | map({key: .sid, value: .}) | from_entries) as $snap
+      | {
+          generated_at: ($now | todate),
+          quiet_threshold_min: $quiet,
+          events: ($ev | length),
+          unreadable_lines: $bad,
+          sessions: (
+            $ev | group_by(.sid) | map(
+              sort_by(.ts) as $e
+              | ($e | last) as $last
+              | ((($now - ($last.ts | fromdateiso8601)) / 60) | floor) as $q
+              | ($e | count(.ev == "PostToolUse")) as $tools
+              | ($e | count(.ev == "PostToolUseFailure")) as $fail
+              | ($e | count(.ev == "StopFailure")) as $stopfail
+              | ($e | count(.ev == "PostModelSwitch")) as $switch
+              | ($e | count(.ev == "PermissionDenied")) as $denied
+              | ($e | count(.ev == "PreCompact")) as $compact
+              | (if $last.ev == "SessionEnd" then "ended"
+                 elif ($last.ev == "Stop" or $last.ev == "StopFailure" or $last.ev == "SessionStart") then "idle"
+                 elif $q >= 360 then "abandoned"
+                 elif $q >= $quiet then "QUIET"
+                 else "working" end) as $state
+              | $e[0].sid as $sid
+              | {
+                  sid: $sid,
+                  lane: ((($e | map(.cwd // empty) | last) // "?") | split("/") | last),
+                  state: $state,
+                  quiet_min: $q,
+                  prompts: ($e | count(.ev == "UserPromptSubmit")),
+                  tools: $tools,
+                  fail: $fail,
+                  denied: $denied,
+                  compactions: $compact,
+                  model_switches: $switch,
+                  subagents: ($e | count(.ev == "SubagentStart")),
+                  model: ($snap[$sid].model // null),
+                  ctx_pct: ($snap[$sid].ctx_pct // null),
+                  cost_usd: ($snap[$sid].cost_usd // null),
+                  flags: [
+                    (if $state == "QUIET" then "QUIET" else empty end),
+                    (if $fail >= 3 and ($fail / ($tools + $fail)) >= 0.2 then "failures" else empty end),
+                    (if $stopfail > 0 then "api-failure" else empty end),
+                    (if $switch > 0 then "model-switch" else empty end),
+                    (if $denied > 0 then "denied" else empty end),
+                    (if $compact >= 2 then "compactions" else empty end)
+                  ]
+                }
+            ) | sort_by((.flags | length) * -1, .quiet_min)
+          ),
+          mix: {
+            tools:     ($ev | map(select(.ev == "PostToolUse" and (.tool // "" | startswith("mcp__") | not)) | .tool // "?") | tally | .[0:8]),
+            mcp:       ($ev | map(select(.ev == "PostToolUse" and (.tool // "" | startswith("mcp__"))) | .tool) | tally | .[0:8]),
+            skills:    ($ev | map(select(.ev == "PostToolUse" and .skill != null) | .skill) | tally),
+            subagents: (($ev | map(select(.ev == "SubagentStart") | .agent // "?")) as $started
+                        | (if ($started | length) > 0 then $started
+                           else ($ev | map(select(.ev == "PostToolUse" and .subagent != null) | .subagent)) end)
+                        | tally)
+          }
+        }'
+}
+
+print_report() {
+  local r="$1"
+  echo "Lanes at $(echo "$r" | jq -r '.generated_at')  (events: $(echo "$r" | jq -r '.events'), quiet threshold: ${QUIET}m)"
+  local bad; bad=$(echo "$r" | jq -r '.unreadable_lines')
+  [ "$bad" = "0" ] || echo "WARNING: $bad unreadable ledger line(s) skipped"
+  {
+    printf 'LANE\tSTATE\tQUIET\tPROMPTS\tTOOLS\tFAIL\tSUBAGENTS\tMODEL\tCTX\tCOST\tFLAGS\tSESSION\n'
+    echo "$r" | jq -r '.sessions[] | [
+        .lane, .state, ((.quiet_min | tostring) + "m"), .prompts, .tools, .fail, .subagents,
+        (.model // "-"),
+        (if .ctx_pct != null then ((.ctx_pct | floor | tostring) + "%") else "-" end),
+        (if .cost_usd != null then ("$" + (((.cost_usd * 100) | round) / 100 | tostring)) else "-" end),
+        (if (.flags | length) > 0 then (.flags | join(",")) else "-" end),
+        .sid[0:8]
+      ] | @tsv'
+  } | column -t -s "$(printf '\t')"
+  echo
+  echo "$r" | jq -r '
+    def line(k): "  " + k + ": " + (if (.mix[k] | length) == 0 then "none recorded"
+                 else (.mix[k] | map(.name + " x" + (.n | tostring)) | join(", ")) end);
+    "Use over the window:", line("tools"), line("mcp"), line("skills"), line("subagents")'
+  local flagged; flagged=$(echo "$r" | jq '[.sessions[] | select((.flags | length) > 0)] | length')
+  echo
+  echo "$flagged of $(echo "$r" | jq '.sessions | length') session(s) flagged. MODEL, CTX and COST come from the status line and are '-' for sessions that never drew one."
+}
+
+# shellcheck disable=SC2129  # one line per synthetic event reads better than grouped redirects
+selftest() {
+  local tmp; tmp=$(mktemp -d)
+  mkdir -p "$tmp/ledger" "$tmp/sessions"
+  ago() { date -u -v-"$1"M +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "$1 minutes ago" +%Y-%m-%dT%H:%M:%SZ; }
+  local L="$tmp/ledger/selftest.jsonl"
+  # A: turn open, silent for 25 minutes -> QUIET
+  echo "{\"ts\":\"$(ago 30)\",\"ev\":\"UserPromptSubmit\",\"sid\":\"aaaaaaaa-1\",\"cwd\":\"/w/alpha\"}" >> "$L"
+  echo "{\"ts\":\"$(ago 25)\",\"ev\":\"PostToolUse\",\"sid\":\"aaaaaaaa-1\",\"cwd\":\"/w/alpha\",\"tool\":\"Bash\"}" >> "$L"
+  # B: many tool failures, then finished -> idle + failures
+  echo "{\"ts\":\"$(ago 12)\",\"ev\":\"UserPromptSubmit\",\"sid\":\"bbbbbbbb-2\",\"cwd\":\"/w/beta\"}" >> "$L"
+  for _ in 1 2 3 4; do echo "{\"ts\":\"$(ago 11)\",\"ev\":\"PostToolUseFailure\",\"sid\":\"bbbbbbbb-2\",\"cwd\":\"/w/beta\",\"tool\":\"Bash\"}" >> "$L"; done
+  for _ in 1 2; do echo "{\"ts\":\"$(ago 10)\",\"ev\":\"PostToolUse\",\"sid\":\"bbbbbbbb-2\",\"cwd\":\"/w/beta\",\"tool\":\"Read\"}" >> "$L"; done
+  echo "{\"ts\":\"$(ago 9)\",\"ev\":\"Stop\",\"sid\":\"bbbbbbbb-2\",\"cwd\":\"/w/beta\"}" >> "$L"
+  # C: model switch, denial, two compactions, API failure
+  echo "{\"ts\":\"$(ago 8)\",\"ev\":\"UserPromptSubmit\",\"sid\":\"cccccccc-3\",\"cwd\":\"/w/gamma\"}" >> "$L"
+  echo "{\"ts\":\"$(ago 7)\",\"ev\":\"PostModelSwitch\",\"sid\":\"cccccccc-3\",\"cwd\":\"/w/gamma\",\"from_model\":\"x\",\"to_model\":\"y\"}" >> "$L"
+  echo "{\"ts\":\"$(ago 7)\",\"ev\":\"PermissionDenied\",\"sid\":\"cccccccc-3\",\"cwd\":\"/w/gamma\",\"tool\":\"Bash\"}" >> "$L"
+  echo "{\"ts\":\"$(ago 6)\",\"ev\":\"PreCompact\",\"sid\":\"cccccccc-3\",\"cwd\":\"/w/gamma\"}" >> "$L"
+  echo "{\"ts\":\"$(ago 5)\",\"ev\":\"PreCompact\",\"sid\":\"cccccccc-3\",\"cwd\":\"/w/gamma\"}" >> "$L"
+  echo "{\"ts\":\"$(ago 4)\",\"ev\":\"StopFailure\",\"sid\":\"cccccccc-3\",\"cwd\":\"/w/gamma\"}" >> "$L"
+  # D: healthy and active, uses a skill, an MCP tool and a subagent
+  echo "{\"ts\":\"$(ago 2)\",\"ev\":\"UserPromptSubmit\",\"sid\":\"dddddddd-4\",\"cwd\":\"/w/delta\"}" >> "$L"
+  echo "{\"ts\":\"$(ago 1)\",\"ev\":\"PostToolUse\",\"sid\":\"dddddddd-4\",\"cwd\":\"/w/delta\",\"tool\":\"Skill\",\"skill\":\"lane-report\"}" >> "$L"
+  echo "{\"ts\":\"$(ago 1)\",\"ev\":\"PostToolUse\",\"sid\":\"dddddddd-4\",\"cwd\":\"/w/delta\",\"tool\":\"mcp__alpaca__get_account\"}" >> "$L"
+  echo "{\"ts\":\"$(ago 1)\",\"ev\":\"SubagentStart\",\"sid\":\"dddddddd-4\",\"cwd\":\"/w/delta\",\"agent\":\"upstream-scout\"}" >> "$L"
+  echo "{\"ts\":\"$(ago 0)\",\"ev\":\"PostToolUse\",\"sid\":\"dddddddd-4\",\"cwd\":\"/w/delta\",\"tool\":\"Edit\"}" >> "$L"
+  # E: turn left open seven hours ago (app closed mid-turn) -> abandoned, and not flagged QUIET
+  echo "{\"ts\":\"$(ago 420)\",\"ev\":\"UserPromptSubmit\",\"sid\":\"eeeeeeee-5\",\"cwd\":\"/w/epsilon\"}" >> "$L"
+  # one corrupt line must be counted, not crash the report
+  echo '{"ts": broken' >> "$L"
+  echo '{"sid":"dddddddd-4","model":"claude-opus-5-5","ctx_pct":23.4,"cost_usd":1.2345}' > "$tmp/sessions/dddddddd-4.json"
+
+  local r fails=0
+  r=$(CFG="$tmp" build_report)
+  check() { # name, jq boolean expression
+    if echo "$r" | jq -e "$2" >/dev/null 2>&1; then echo "  pass  $1"; else echo "  FAIL  $1"; fails=$((fails+1)); fi
+  }
+  check "five sessions found"            '.sessions | length == 5'
+  check "epsilon abandoned, not QUIET"   '.sessions[] | select(.lane=="epsilon") | .state=="abandoned" and (.flags | length == 0)'
+  check "corrupt line counted"           '.unreadable_lines == 1'
+  check "alpha is QUIET"                 '.sessions[] | select(.lane=="alpha") | .state=="QUIET" and (.flags | index("QUIET") != null)'
+  check "beta idle with failures flag"   '.sessions[] | select(.lane=="beta") | .state=="idle" and .fail==4 and (.flags | index("failures") != null)'
+  check "gamma model-switch flag"        '.sessions[] | select(.lane=="gamma") | .flags | index("model-switch") != null'
+  check "gamma denied flag"              '.sessions[] | select(.lane=="gamma") | .flags | index("denied") != null'
+  check "gamma compactions flag"         '.sessions[] | select(.lane=="gamma") | .flags | index("compactions") != null'
+  check "gamma api-failure flag"         '.sessions[] | select(.lane=="gamma") | .flags | index("api-failure") != null'
+  check "delta working, no flags"        '.sessions[] | select(.lane=="delta") | .state=="working" and (.flags | length == 0)'
+  check "delta snapshot joined"          '.sessions[] | select(.lane=="delta") | .model=="claude-opus-5-5" and .cost_usd==1.2345'
+  check "skill use tallied"              '.mix.skills | map(.name) | index("lane-report") != null'
+  check "MCP use tallied"                '.mix.mcp | map(.name) | index("mcp__alpaca__get_account") != null'
+  check "subagent use tallied"           '.mix.subagents | map(.name) | index("upstream-scout") != null'
+  echo
+  CFG="$tmp" print_report "$r"
+  rm -rf "$tmp"
+  echo
+  if [ "$fails" -eq 0 ]; then echo "lanes: selftest passed"; else echo "lanes: selftest FAILED ($fails)"; return 1; fi
+}
+
+if [ "$SELFTEST" = 1 ]; then selftest; exit $?; fi
+R=$(build_report) || exit $?
+if [ "$JSON" = 1 ]; then echo "$R"; else print_report "$R"; fi

@@ -1,0 +1,175 @@
+#!/bin/bash
+# automation — install, inspect and remove this repo's standing automation (docs/adr/0011-automation.md).
+#
+#   Layer                  Runs                              Mechanism (contract)
+#   commit gate            on every `git commit`             .githooks/pre-commit via core.hooksPath (githooks(5))
+#   landscape watch        once a day, at session start      .claude/hooks/canon-watch.sh, async SessionStart hook
+#   lane watchdog          every 10 minutes, Mac awake       launchd user agent (launchd.plist(5), launchctl(1))
+#   weekly refresh         weekly, desktop app open          Claude desktop scheduled task (created from a session)
+#
+# Usage: scripts/automation status | install | uninstall
+# `install` uses no sudo and touches: this clone's git config, ~/.claude/canon/, and one file in
+# ~/Library/LaunchAgents/. `uninstall` reverses exactly that and leaves the ledger and alert history alone.
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+CLAUDE_HOME="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+CANON_HOME="$CLAUDE_HOME/canon"
+LABEL="local.canon.lanes-watch"
+AGENTS_DIR="${CANON_LAUNCHAGENTS_DIR:-$HOME/Library/LaunchAgents}"   # override only for tests
+PLIST="$AGENTS_DIR/$LABEL.plist"
+DOMAIN="gui/$(id -u)"
+INTERVAL=600
+TASK_ID="canon-landscape-refresh"
+
+note() { printf '%s\n' "$*"; }
+row() { printf '  %-18s %-9s %s\n' "$1" "$2" "$3"; }
+
+write_plist() {
+  cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>$CANON_HOME/lanes-watch.sh</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>$INTERVAL</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>LowPriorityIO</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>$CANON_HOME/watch/lanes-watch.log</string>
+  <key>StandardErrorPath</key>
+  <string>$CANON_HOME/watch/lanes-watch.log</string>
+</dict>
+</plist>
+EOF
+}
+
+do_install() {
+  local ok=0
+  note "Commit gate:"
+  if git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+    git -C "$ROOT" config --local core.hooksPath .githooks && note "  core.hooksPath = .githooks (this clone only)"
+  else
+    note "  SKIPPED: $ROOT is not a git repository"; ok=1
+  fi
+
+  note "Lane watchdog:"
+  mkdir -p "$CANON_HOME/watch" "$AGENTS_DIR" || { note "  FAILED: cannot create directories"; return 1; }
+  /usr/bin/install -m 755 "$ROOT/scripts/lanes" "$CANON_HOME/lanes" && note "  installed  $CANON_HOME/lanes"
+  /usr/bin/install -m 755 "$ROOT/home/.claude/canon/lanes-watch.sh" "$CANON_HOME/lanes-watch.sh" && note "  installed  $CANON_HOME/lanes-watch.sh"
+  write_plist
+  if ! plutil -lint "$PLIST" >/dev/null; then note "  FAILED: generated plist is invalid"; return 1; fi
+  note "  wrote      $PLIST"
+  if [ "${AUTOMATION_SKIP_LAUNCHD:-0}" = "1" ]; then      # rehearsal: everything except loading the agent
+    note "  not loaded (AUTOMATION_SKIP_LAUNCHD=1)"
+    return "$ok"
+  fi
+  launchctl bootout "$DOMAIN/$LABEL" >/dev/null 2>&1    # replace a previous load, if any
+  if launchctl bootstrap "$DOMAIN" "$PLIST"; then
+    note "  loaded     $LABEL (every $((INTERVAL / 60)) minutes; first run now)"
+  else
+    note "  FAILED: launchctl bootstrap refused the agent"; ok=1
+  fi
+  note "Landing:"
+  if git -C "$ROOT" remote get-url origin >/dev/null 2>&1; then
+    # Let git use gh's sign-in for github.com in this repository only (what `gh auth setup-git` does
+    # globally), routed through mise so it survives a change of gh version.
+    git -C "$ROOT" config --local --replace-all credential.https://github.com.helper ""
+    # shellcheck disable=SC2016  # stored literally in git config; git's shell expands it when it runs
+    git -C "$ROOT" config --local --add credential.https://github.com.helper '!"$HOME/.local/bin/mise" exec -- gh auth git-credential'
+    note "  git uses gh's sign-in for github.com in this repository"
+  else
+    note "  no GitHub remote; scripts/land fast-forwards main locally"
+  fi
+  note "Landscape watch: registered in .claude/settings.json; nothing to install."
+  note "Weekly refresh: created from a Claude desktop session, not from this script."
+  return "$ok"
+}
+
+do_uninstall() {
+  if launchctl bootout "$DOMAIN/$LABEL" >/dev/null 2>&1; then note "  unloaded   $LABEL"; else note "  $LABEL was not loaded"; fi
+  if [ -f "$PLIST" ]; then rm -f "$PLIST" && note "  removed    $PLIST"; fi
+  for f in lanes lanes-watch.sh; do
+    if [ -f "$CANON_HOME/$f" ]; then rm -f "$CANON_HOME/$f" && note "  removed    $CANON_HOME/$f"; fi
+  done
+  if [ "$(git -C "$ROOT" config --local --get core.hooksPath 2>/dev/null)" = ".githooks" ]; then
+    git -C "$ROOT" config --local --unset core.hooksPath && note "  unset      core.hooksPath"
+  fi
+  if git -C "$ROOT" config --local --get-all credential.https://github.com.helper >/dev/null 2>&1; then
+    git -C "$ROOT" config --local --unset-all credential.https://github.com.helper && note "  unset      git sign-in helper for github.com (this repository only)"
+  fi
+  note "Left in place: $CANON_HOME/ledger, $CANON_HOME/watch (alert history) and the weekly scheduled task."
+  note "Remove the weekly task from the desktop app's Scheduled list."
+}
+
+do_status() {
+  local bad=0 v
+  note "Automation (ADR 0011):"
+
+  if [ "$(git -C "$ROOT" config --local --get core.hooksPath 2>/dev/null)" = ".githooks" ] && [ -x "$ROOT/.githooks/pre-commit" ]; then
+    row "commit gate" ok "git runs .githooks/pre-commit before every commit"
+  else row "commit gate" OFF "run: scripts/automation install"; bad=1; fi
+
+  if grep -q 'canon-watch.sh' "$ROOT/.claude/settings.json" 2>/dev/null && [ -x "$ROOT/.claude/hooks/canon-watch.sh" ]; then
+    if [ -f "$ROOT/.canon/watch.json" ]; then
+      v=$(jq -r '"last " + .checked_at + (if .ok then "" else " INCOMPLETE" end) + ": " + (.newer | length | tostring) + " newer, " + (.advanced | length | tostring) + " advanced, " + (.retagged | length | tostring) + " retagged"' "$ROOT/.canon/watch.json" 2>/dev/null)
+      row "landscape watch" ok "${v:-status file unreadable}"
+    else row "landscape watch" ok "registered; has not run yet (runs at the next session start in this repo)"; fi
+  else row "landscape watch" OFF "hook missing from .claude/settings.json"; bad=1; fi
+
+  if launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
+    v=$(launchctl print "$DOMAIN/$LABEL" 2>/dev/null | awk -F' = ' '/^\tstate/ { printf "%s  ", ($2 == "running" ? "running now" : "loaded, waiting for next run") } /^\truns|^\tlast exit code/ { gsub(/^\t/, "", $1); printf "%s=%s  ", $1, $2 }')
+    if [ -f "$CANON_HOME/watch/lanes-status.json" ]; then
+      v="$v| $(jq -r 'if .ok then "last check " + .checked_at + ": " + (.sessions | tostring) + " session(s), " + (.flagged_now | tostring) + " flagged, ledger " + (.ledger_kb | tostring) + " KB" else "LAST CHECK FAILED: " + .error end' "$CANON_HOME/watch/lanes-status.json" 2>/dev/null)"
+      jq -e '.ok' "$CANON_HOME/watch/lanes-status.json" >/dev/null 2>&1 || bad=1
+    fi
+    row "lane watchdog" ok "$v"
+  else row "lane watchdog" OFF "run: scripts/automation install"; bad=1; fi
+
+  if [ -f "$CLAUDE_HOME/scheduled-tasks/$TASK_ID/SKILL.md" ]; then
+    row "weekly refresh" ok "task file present at $CLAUDE_HOME/scheduled-tasks/$TASK_ID; whether it is still scheduled shows only in the desktop app"
+  else row "weekly refresh" OFF "not scheduled; ask Claude in the desktop app to schedule the landscape refresh"; bad=1; fi
+
+  local origin mise_bin="$HOME/.local/bin/mise"
+  command -v mise >/dev/null 2>&1 && mise_bin=$(command -v mise)
+  if origin=$(git -C "$ROOT" remote get-url origin 2>/dev/null); then
+    if (cd "$ROOT" && "$mise_bin" exec -- gh auth status >/dev/null 2>&1); then
+      row "landing" ok "scripts/land: pull request, local sign-off, squash merge ($origin)"
+    else row "landing" OFF "gh is not signed in, so scripts/land cannot reach $origin; run: gh auth login"; bad=1; fi
+  else
+    row "landing" ok "scripts/land: fast-forwards main locally (no GitHub remote)"
+  fi
+
+  if [ -f "$ROOT/.github/dependabot.yml" ] && [ -n "$origin" ]; then
+    v=$(jq -r 'if (has("bot_prs") | not) then "UNKNOWN\tconfig present; the last watch ran before the bot was added, so its pull requests are not listed yet"
+               elif ((.errors // []) | any(test("dependency bot"))) then "UNKNOWN\tconfig present; its pull requests could not be listed at the last watch"
+               else "ok\tconfig present; " + (.bot_prs | length | tostring) + " pull request(s) open at the last watch (" + .checked_at + ")" end' "$ROOT/.canon/watch.json" 2>/dev/null)
+    [ -n "$v" ] || v=$(printf 'UNKNOWN\tconfig present; .canon/watch.json is missing or unreadable, so open pull requests are not known')
+    row "dependency bot" "${v%%$'\t'*}" "${v#*$'\t'}"
+  elif [ -f "$ROOT/.github/dependabot.yml" ]; then
+    row "dependency bot" OFF "config present, but Dependabot needs a GitHub remote"
+  else row "dependency bot" OFF ".github/dependabot.yml is missing (ADR 0016)"; bad=1; fi
+
+  if [ -f "$CANON_HOME/watch/alerts.jsonl" ]; then
+    note "Recent alerts:"; tail -3 "$CANON_HOME/watch/alerts.jsonl" | jq -r '"  " + .at + "  " + .lane + ": " + .flag' 2>/dev/null
+  fi
+  return "$bad"
+}
+
+case "${1:-}" in
+  status)    do_status ;;
+  install)   do_install; rc=$?; echo; do_status; exit "$rc" ;;
+  uninstall) do_uninstall ;;
+  *) note "usage: scripts/automation status | install | uninstall"; exit 2 ;;
+esac

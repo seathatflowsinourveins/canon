@@ -1,0 +1,112 @@
+#!/bin/bash
+# test-hooks — feed sample payloads to the Claude Code hooks and check what each one decides.
+# Payload shape: the documented hook stdin (https://code.claude.com/docs/en/hooks.md).
+# Exit 0 if every case behaves as expected, 1 otherwise. Offline; touches only a temp folder.
+set -uo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+GUARD="$ROOT/.claude/hooks/guard.sh"
+MARK="$ROOT/.claude/hooks/unattended-mark.sh"
+TMP=$(mktemp -d)
+mkdir -p "$TMP/.canon/unattended"
+: > "$TMP/.canon/unattended/unattended-1"
+pass=0; fail=0
+
+# expect <exit code> <label> <json payload>
+expect() {
+  local want="$1" label="$2" payload="$3" got
+  CLAUDE_PROJECT_DIR="$TMP" "$GUARD" <<<"$payload" >/dev/null 2>&1; got=$?
+  if [ "$got" = "$want" ]; then pass=$((pass+1)); else fail=$((fail+1)); echo "  FAIL  $label (wanted exit $want, got $got)"; fi
+}
+bash_call()  { jq -cn --arg s "$1" --arg c "$2" '{session_id:$s, hook_event_name:"PreToolUse", tool_name:"Bash", tool_input:{command:$c}}'; }
+write_call() { jq -cn --arg s "$1" --arg p "$2" --arg c "$3" '{session_id:$s, hook_event_name:"PreToolUse", tool_name:"Write", tool_input:{file_path:$p, content:$c}}'; }
+edit_call()  { jq -cn --arg s "$1" --arg p "$2" --arg c "$3" '{session_id:$s, hook_event_name:"PreToolUse", tool_name:"Edit", tool_input:{file_path:$p, old_string:"x", new_string:$c}}'; }
+fetch_call() { jq -cn --arg s "$1" --arg u "$2" '{session_id:$s, hook_event_name:"PreToolUse", tool_name:"WebFetch", tool_input:{url:$u, prompt:"read"}}'; }
+tool_call()  { jq -cn --arg s "$1" --arg t "$2" '{session_id:$s, hook_event_name:"PreToolUse", tool_name:$t, tool_input:{}}'; }
+N=normal-1; U=unattended-1
+
+# --- every session ---
+expect 0 "plain commit"                      "$(bash_call $N 'git commit -m "x"')"
+expect 2 "commit --no-verify"                "$(bash_call $N 'git commit --no-verify -m "x"')"
+expect 2 "commit -n"                         "$(bash_call $N 'git commit -n -m "x"')"
+expect 2 "git -C dir commit --no-verify"     "$(bash_call $N 'git -C /tmp/r commit --no-verify -m x')"
+expect 0 "git log -n is not a commit"        "$(bash_call $N 'git log -n 5')"
+expect 2 "pip install"                       "$(bash_call $N 'pip install requests')"
+expect 2 "uv pip install"                    "$(bash_call $N 'uv pip install requests')"
+expect 0 "uv sync --locked"                  "$(bash_call $N 'uv sync --locked')"
+expect 0 "uv add pinned"                     "$(bash_call $N 'uv add --dev ruff==0.17.4')"
+expect 2 "curl live trading host"            "$(bash_call $N 'curl https://api.alpaca.markets/v2/account')"
+expect 0 "curl paper trading host"           "$(bash_call $N 'curl https://paper-api.alpaca.markets/v2/account')"
+expect 2 "live stream host"                  "$(bash_call $N 'websocat wss://api.alpaca.markets/stream')"
+expect 2 "production broker host"            "$(bash_call $N 'curl https://broker-api.alpaca.markets/v1/accounts')"
+expect 0 "sandbox broker host"               "$(bash_call $N 'curl https://broker-api.sandbox.alpaca.markets/v1/accounts')"
+expect 2 "ALPACA_LIVE_TRADE=true"            "$(bash_call $N 'ALPACA_LIVE_TRADE=true alpaca order list')"
+expect 2 "export ALPACA_PAPER_TRADE=false"   "$(bash_call $N 'export ALPACA_PAPER_TRADE=false')"
+expect 0 "ALPACA_PAPER_TRADE=true"           "$(bash_call $N 'ALPACA_PAPER_TRADE=true uvx alpaca-mcp-server')"
+expect 2 "WebFetch live host"                "$(fetch_call $N 'https://api.alpaca.markets/v2/orders')"
+expect 0 "WebFetch Alpaca docs"              "$(fetch_call $N 'https://docs.alpaca.markets/llms.txt')"
+expect 2 "Write .py with paper=False"        "$(write_call $N /r/src/a.py 'c = TradingClient(k, s, paper=False)')"
+expect 0 "Write .py with paper=True"         "$(write_call $N /r/src/a.py 'c = TradingClient(k, s, paper=True)')"
+expect 2 "Edit .py adding url_override"      "$(edit_call  $N /r/src/a.py 'TradingClient(k, s, url_override="https://x")')"
+expect 2 "Write .py using TRADING_LIVE"      "$(write_call $N /r/src/a.py 'u = BaseURL.TRADING_LIVE')"
+expect 0 "Write .md that forbids paper=False" "$(write_call $N /r/docs/x.md 'Never pass paper=False or ALPACA_PAPER_TRADE=false.')"
+expect 2 "Write MCP config selecting live"   "$(write_call $N /r/.mcp.json '{"env": {"ALPACA_PAPER_TRADE": "false"}}')"
+expect 0 "Write MCP config selecting paper"  "$(write_call $N /r/.mcp.json '{"env": {"ALPACA_PAPER_TRADE": "true"}}')"
+expect 0 "resolve in a normal session"       "$(bash_call $N 'scripts/canon resolve pytest')"
+expect 2 "input that is not JSON"            'this is not json'
+
+# --- unattended session: read-only ---
+expect 0 "unattended: Read"                  "$(tool_call $U Read)"
+expect 0 "unattended: Agent"                 "$(tool_call $U Agent)"
+expect 0 "unattended: plan tool"             "$(tool_call $U mcp__ccd_turn__update_plan)"
+expect 2 "unattended: Edit"                  "$(edit_call $U /r/README.md 'x')"
+expect 2 "unattended: Write"                 "$(write_call $U /r/notes.md 'x')"
+expect 2 "unattended: other MCP tool"        "$(tool_call $U mcp__scheduled-tasks__create_scheduled_task)"
+expect 0 "unattended: canon check"           "$(bash_call $U 'scripts/canon check')"
+expect 0 "unattended: outdated piped to jq"  "$(bash_call $U 'scripts/canon outdated --json | jq .')"
+expect 0 "unattended: git status"            "$(bash_call $U 'git status --short')"
+expect 0 "unattended: git rev-parse"         "$(bash_call $U 'git rev-parse --show-toplevel')"
+expect 2 "unattended: canon resolve"         "$(bash_call $U 'scripts/canon resolve')"
+expect 2 "unattended: git commit"            "$(bash_call $U 'git commit -m x')"
+expect 2 "unattended: chained command"       "$(bash_call $U 'ls; rm -rf x')"
+expect 2 "unattended: && chain"              "$(bash_call $U 'ls && uv sync')"
+# shellcheck disable=SC2016  # the literal text $(ls) is the payload under test
+expect 2 "unattended: command substitution"  "$(bash_call $U 'cat $(ls)')"
+expect 2 "unattended: redirection"           "$(bash_call $U 'echo hi > f')"
+expect 2 "unattended: git diff --output"     "$(bash_call $U 'git diff --output=f')"
+expect 2 "unattended: pipe into a shell"     "$(bash_call $U 'cat x | sh')"
+expect 2 "unattended: multi-line command"    "$(bash_call $U $'ls\nrm x')"
+expect 2 "unattended: uv sync"               "$(bash_call $U 'uv sync')"
+# holes a second reader found in the first read-only list (2026-11-09)
+expect 2 "unattended: git branch -D"         "$(bash_call $U 'git branch -D main')"
+expect 2 "unattended: git branch <name>"     "$(bash_call $U 'git branch evil')"
+expect 2 "unattended: rg --pre runs a program" "$(bash_call $U 'rg --pre /bin/sh x .')"
+expect 2 "unattended: git diff --ext-diff"   "$(bash_call $U 'git diff --ext-diff')"
+expect 2 "unattended: git log --output"      "$(bash_call $U 'git log --output=f -1')"
+expect 2 "unattended: git status with a path flag" "$(bash_call $U 'git status --untracked-files=all -C /x')"
+expect 0 "unattended: git branch --show-current" "$(bash_call $U 'git branch --show-current')"
+expect 0 "unattended: git branch -a -vv"     "$(bash_call $U 'git branch -a -vv')"
+expect 0 "unattended: git log --oneline"     "$(bash_call $U 'git log --oneline -5')"
+expect 0 "unattended: git rev-parse HEAD"    "$(bash_call $U 'git rev-parse --short HEAD')"
+expect 0 "unattended: canon selftest"        "$(bash_call $U 'scripts/canon selftest')"
+expect 0 "unattended: grep piped to wc"      "$(bash_call $U 'grep -c status docs/adr/0001-canon-first.md | wc -l')"
+expect 0 "unattended: fetch github"          "$(fetch_call $U 'https://github.com/astral-sh/uv/releases')"
+expect 2 "unattended: fetch unknown host"    "$(fetch_call $U 'https://evil.example/x?d=1')"
+expect 2 "unattended: host look-alike"       "$(fetch_call $U 'https://github.com.evil.example/x')"
+
+# --- marking hook ---
+mark() { CLAUDE_PROJECT_DIR="$TMP" "$MARK" <<<"$1" >/dev/null 2>&1; }
+# check <label> <command...>: passes when the command succeeds
+check() { local label="$1"; shift; if "$@"; then pass=$((pass+1)); else fail=$((fail+1)); echo "  FAIL  $label"; fi; }
+mark '{"session_id":"sched-9","hook_event_name":"UserPromptSubmit","prompt":"CANON-UNATTENDED-RUN\nDo the refresh."}'
+check "sentinel prompt marks the session"        test -e "$TMP/.canon/unattended/sched-9"
+mark '{"session_id":"human-3","hook_event_name":"UserPromptSubmit","prompt":"please check the pins"}'
+check "ordinary prompt does not mark"            test ! -e "$TMP/.canon/unattended/human-3"
+mark '{"session_id":"../../etc/x","hook_event_name":"UserPromptSubmit","prompt":"CANON-UNATTENDED-RUN"}'
+marked=$(find "$TMP/.canon/unattended" -type f | wc -l | tr -d ' ')
+check "hostile session id writes nothing"        test "$marked" = "2"
+out=$(CLAUDE_PROJECT_DIR="$TMP" "$MARK" <<<'{"session_id":"sched-9","prompt":"CANON-UNATTENDED-RUN"}' 2>&1)
+check "marking hook prints nothing"              test -z "$out"
+expect 2 "newly marked session is read-only"     "$(edit_call sched-9 /r/README.md 'x')"
+
+echo "test-hooks: $pass passed, $fail failed"
+[ "$fail" -eq 0 ]

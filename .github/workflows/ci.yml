@@ -1,0 +1,63 @@
+# CI for Canon (docs/adr/0013-quality-gates.md, docs/adr/0014-landing-workflow.md).
+# It runs scripts/ci, the same script the commit gate and scripts/land run.
+#
+# The ruleset on main requires this workflow's `all required checks passed` job, and the `signoff` status
+# that scripts/land posts after the same checks pass locally. Checked with actionlint.
+# Both actions are referenced by commit SHA; the SHAs are the ones canon/upstreams.lock.json records for
+# `actions-checkout` and `mise-action`, and `scripts/canon lint` fails if they stop matching.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # the secret scan reads the whole history
+          persist-credentials: false
+
+      # Installs exactly what mise.lock records (the action uses --locked when a lockfile is present),
+      # so CI runs the same uv, shellcheck, gitleaks and actionlint as the development machine.
+      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
+        with:
+          version: 2026.11.5
+          cache: false
+
+      - name: Install the locked Python environment
+        run: uv sync --locked
+
+      - name: Run every check
+        run: scripts/ci
+
+  # The one status check that branch rules require, so jobs can be added above without touching the
+  # repository's settings. Same shape as the `required-checks-passed` job in astral-sh/uv and astral-sh/ruff.
+  required-checks-passed:
+    name: all required checks passed
+    if: ${{ always() }}
+    needs: [check]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Fail unless every required job succeeded
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          failing=$(echo "$NEEDS_JSON" | jq -r 'to_entries[] | select(.value.result != "success") | "\(.key): \(.value.result)"')
+          if [ -n "$failing" ]; then
+            echo "$failing"
+            exit 1
+          fi

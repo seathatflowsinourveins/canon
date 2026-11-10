@@ -1,0 +1,38 @@
+# Dependency updates (docs/adr/0016-dependency-updates.md). Dependabot proposes; a session lands.
+# Option names are from GitHub's options reference:
+# https://docs.github.com/en/code-security/dependabot/working-with-dependabot/dependabot-options-reference
+version: 2
+updates:
+  # Packages that are in uv.lock only because a direct dependency needs them. The direct dependencies are
+  # registry pins and move through scripts/canon, so they are left out here. A pull request from this
+  # block changes uv.lock alone and lands once scripts/ci passes.
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    allow:
+      - dependency-type: "indirect"
+    # The workspace's own two packages are in uv.lock as editable entries; they are not on any index.
+    ignore:
+      - dependency-name: "canon-trading"
+      - dependency-name: "canon-alpaca"
+    groups:
+      uv-lock:
+        patterns:
+          - "*"
+
+  # The workflow's actions. Both are registry pins, so a pull request from this block is finished by
+  # moving the registry entry on the same branch; scripts/canon lint then checks Dependabot's commit SHA
+  # against the one scripts/canon resolve derives from the tag.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns:
+          - "*"

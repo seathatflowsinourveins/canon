@@ -1,0 +1,168 @@
+#!/bin/bash
+# land — take a branch to main once every check passes (docs/adr/0014-landing-workflow.md).
+#
+# The owner's standing instruction is that work lands without a manual merge step. This script is that
+# step for people, agents and schedulers alike:
+#
+#   with a GitHub remote and a signed-in gh:  push, open a pull request, post the local sign-off status
+#       that main requires, wait for the hosted checks it also requires, and squash-merge.
+#   without one:                              fast-forward main locally.
+#
+# Either way nothing lands unless scripts/ci passes on exactly what is committed, on a branch that
+# contains the current main.
+#
+# Usage: scripts/land [--body <file>] [--dry-run] [--pr <number>]
+#   --body <file>   pull request description (Summary / Test Plan / Evidence); default: the commit message
+#   --dry-run       run the checks and say what would happen; change nothing on GitHub or on main
+#   --pr <number>   land a pull request someone else opened, such as the dependency bot's (ADR 0016):
+#                   check it out in its own worktree, merge main into it if it is behind, then land it
+# gh flags used are from gh's own help: pr create --fill/--body-file, pr merge --auto --squash,
+# pr checks --required --json, pr checkout --worktree, pr view --json, api (commit statuses).
+set -uo pipefail
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "land: not inside a git repository" >&2; exit 1; }
+cd "$ROOT" || exit 1
+die()  { echo "land: $*" >&2; exit 1; }
+note() { echo "land: $*"; }
+USAGE="usage: scripts/land [--body <file>] [--dry-run] [--pr <number>]"
+
+BODY=""; DRY=0; PR=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --body)    BODY="${2:-}"; [ $# -ge 2 ] || die "$USAGE"; shift 2 ;;
+    --pr)      PR="${2:-}";   [ $# -ge 2 ] || die "$USAGE"; shift 2 ;;
+    --dry-run) DRY=1; shift ;;
+    *) die "$USAGE" ;;
+  esac
+done
+if [ -n "$BODY" ]; then
+  [ -f "$BODY" ] || die "body file not found: $BODY"
+  BODY="$(cd "$(dirname "$BODY")" && pwd)/$(basename "$BODY")"
+fi
+
+if command -v mise >/dev/null 2>&1; then MISE=$(command -v mise)
+elif [ -x "$HOME/.local/bin/mise" ]; then MISE="$HOME/.local/bin/mise"
+else die "mise not found. Run scripts/bootstrap --install."; fi
+gh() { "$MISE" exec -- gh "$@"; }
+
+remote=""
+if git remote get-url origin >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then remote=origin; fi
+# What a branch must contain before it lands: GitHub's main where there is a remote, the local one otherwise.
+base=main
+if [ -n "$remote" ]; then
+  git fetch -q origin main || die "could not fetch main from origin"
+  base=origin/main
+fi
+
+# --- a pull request someone else opened ---------------------------------------------------------------
+if [ -n "$PR" ]; then
+  case "$PR" in *[!0-9]*|'') die "--pr takes a pull request number" ;; esac
+  [ -n "$remote" ] || die "--pr needs a GitHub remote and a signed-in gh"
+  info=$(gh pr view "$PR" --json headRefName,state,url 2>/dev/null) || die "pull request $PR not found"
+  head=$(jq -r .headRefName <<<"$info")
+  [ "$DRY" -eq 1 ] || [ "$(jq -r .state <<<"$info")" = "OPEN" ] || die "pull request $PR is not open"
+  git show-ref --verify -q "refs/heads/$head" \
+    && die "a local branch named $head already exists, so pull request $PR is being worked on here; land it from its own checkout"
+  first=$(git worktree list --porcelain | sed -n '1s/^worktree //p')
+  wt="$(dirname "$first")/canon-worktrees/pr-$PR"
+  [ ! -e "$wt" ] || die "$wt already exists; remove it first: git worktree remove $wt"
+  mkdir -p "$(dirname "$wt")" || die "could not create $(dirname "$wt")"
+  gh pr checkout "$PR" --worktree "$wt" >/dev/null 2>&1 || die "could not check out pull request $PR into $wt"
+  (
+    cd "$wt" || exit 1
+    if ! git merge-base --is-ancestor "$base" HEAD; then
+      note "pull request $PR is behind main; merging main into it (the squash merge still leaves one commit)"
+      if ! git merge -q --no-edit "$base"; then
+        git merge --abort 2>/dev/null
+        echo "land: pull request $PR conflicts with main. Resolve it on $head, or close it so its author opens a fresh one." >&2
+        exit 1
+      fi
+    fi
+    args=()
+    [ -z "$BODY" ] || args+=(--body "$BODY")
+    [ "$DRY" -eq 0 ] || args+=(--dry-run)
+    "$SELF" ${args[@]+"${args[@]}"}
+  ); rc=$?
+  # The worktree and the local branch were made by this run; leave nothing behind either way.
+  git worktree remove --force "$wt" 2>/dev/null
+  git branch -q -D "$head" 2>/dev/null
+  if [ "$rc" -eq 0 ] && [ "$DRY" -eq 0 ] && [ -f "$first/.canon/watch.json" ]; then
+    # so the session brief stops listing it before the next daily watch
+    jq --argjson n "$PR" '.bot_prs = ((.bot_prs // []) | map(select(.number != $n)))' "$first/.canon/watch.json" \
+      > "$first/.canon/watch.json.tmp" && mv "$first/.canon/watch.json.tmp" "$first/.canon/watch.json"
+  fi
+  exit "$rc"
+fi
+
+# --- the current branch -------------------------------------------------------------------------------
+branch=$(git branch --show-current)
+[ -n "$branch" ] || die "HEAD is detached; check out the branch you want to land"
+[ "$branch" != "main" ] || die "you are on main; land a branch"
+[ -z "$(git status --porcelain)" ] || die "the working tree has uncommitted changes; commit them first, so the checks run on what will land"
+git rev-parse --verify -q "$base" >/dev/null || die "there is no $base to land on"
+ahead=$(git rev-list --count "$base..$branch")
+[ "$ahead" -gt 0 ] || die "$branch has nothing that main lacks"
+git merge-base --is-ancestor "$base" "$branch" \
+  || die "$branch does not contain the current main; rebase it onto main first (for a pull request someone else opened, use --pr)"
+
+note "$branch is $ahead commit(s) ahead of main. Running every check."
+"$ROOT/scripts/ci" || die "checks failed; nothing landed"
+
+if [ -z "$remote" ]; then
+  if [ "$DRY" -eq 1 ]; then note "dry run: would fast-forward main to $(git rev-parse --short HEAD) (no GitHub remote or gh not signed in)"; exit 0; fi
+  # Moves the main ref only. No checkout, so other sessions sharing the repository are not disturbed,
+  # and it refuses anything that is not a fast-forward. Git also refuses if main is checked out in
+  # another worktree; that has to be done there.
+  git fetch -q . "$branch:main" \
+    || die "main could not be fast-forwarded. If main is checked out in another worktree, run there: git merge --ff-only $branch"
+  note "landed locally: main is now $(git rev-parse --short main). (No GitHub remote or gh not signed in.)"
+  exit 0
+fi
+
+if [ "$DRY" -eq 1 ]; then note "dry run: would push $branch, open a pull request if there is none, sign off and squash-merge it"; exit 0; fi
+git push -q -u "$remote" "$branch" || die "push failed"
+sha=$(git rev-parse HEAD)
+if ! gh pr view "$branch" --json url >/dev/null 2>&1; then
+  if [ -n "$BODY" ]; then gh pr create --base main --head "$branch" --title "$(git log -1 --format=%s)" --body-file "$BODY" >/dev/null
+  else gh pr create --base main --head "$branch" --fill >/dev/null; fi || die "could not open the pull request"
+fi
+url=$(gh pr view "$branch" --json url --jq .url)
+
+# Local sign-off. scripts/ci has just passed on exactly this commit, so record that on GitHub as the
+# `signoff` commit status, which the ruleset on main requires. A status belongs to one commit, so a later
+# push needs its own sign-off. This is 37signals' local-CI practice (basecamp/gh-signoff) with the same
+# status name, done through GitHub's commit status API.
+gh api -X POST "repos/{owner}/{repo}/statuses/$sha" -f state=success -f context=signoff \
+   -f description="scripts/ci passed locally" >/dev/null || die "could not post the sign-off status for $url"
+
+# The ruleset also requires the hosted workflow's aggregating job, which runs the same script on GitHub's
+# runners. While that run is going, GitHub's auto-merge is switched on and this script waits for it, so
+# landing stays one command that ends with main updated.
+if gh pr merge "$branch" --squash >/dev/null 2>&1; then
+  :                                             # every requirement was already met, so it merged now
+elif gh pr merge "$branch" --auto --squash >/dev/null 2>&1; then
+  note "signed off; waiting for the hosted checks on $url"
+  waited=0; limit="${LAND_WAIT_SECONDS:-540}"
+  until [ "$(gh pr view "$branch" --json state --jq .state 2>/dev/null)" = "MERGED" ]; do
+    failed=$(gh pr checks "$branch" --required --json name,bucket \
+               --jq '[.[] | select(.bucket == "fail" or .bucket == "cancel") | .name] | join(", ")' 2>/dev/null)
+    [ -z "$failed" ] || die "a required check failed on $url: $failed. Push a fix to $branch and land again."
+    [ "$waited" -lt "$limit" ] \
+      || die "$url is not merged after ${limit}s. Auto-merge is on, so GitHub merges it when the checks pass; then run: git fetch origin main:main"
+    sleep 10; waited=$((waited + 10))
+  done
+else
+  die "signed off, but GitHub would neither merge nor enable auto-merge on $url"
+fi
+[ "$(gh pr view "$branch" --json state --jq .state)" = "MERGED" ] || die "GitHub accepted the merge but $url is not marked merged"
+
+# Bring the local main up to date. Git will not move a branch that is checked out in another worktree,
+# so in that case say where to do it; the landing itself is already done.
+if git fetch -q origin main:main 2>/dev/null; then
+  note "landed: $url is squash-merged; main is now $(git rev-parse --short main)."
+else
+  git fetch -q origin main || die "$url is merged, but origin could not be fetched to confirm main"
+  note "landed: $url is squash-merged; GitHub's main is now $(git rev-parse --short origin/main)."
+  note "main is checked out in another worktree; update it there with: git merge --ff-only origin/main"
+fi
+note "the next change starts from main, for example: git switch -c <name> main"

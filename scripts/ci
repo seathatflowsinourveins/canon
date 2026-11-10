@@ -1,0 +1,62 @@
+#!/bin/bash
+# ci — every check this repo has, in one place (docs/adr/0013-quality-gates.md).
+#
+# The commit gate (.githooks/pre-commit) and the GitHub workflow (.github/workflows/ci.yml) both run this
+# script, so a change is judged the same way on this Mac and in CI. Tools come from the pinned toolchain:
+# mise.toml + mise.lock for shellcheck, gitleaks, actionlint and uv; uv.lock for ruff, ty and pytest.
+#
+# Usage: scripts/ci            check everything; the secret scan covers the whole git history
+#        scripts/ci --staged   same, but the secret scan covers only what is staged (used by pre-commit)
+# A tool that is missing is a failure, never a skip. Exit 0 only if every check passes.
+set -uo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT" || exit 1
+STAGED=0; [ "${1:-}" = "--staged" ] && STAGED=1
+
+if command -v mise >/dev/null 2>&1; then MISE=$(command -v mise)
+elif [ -x "$HOME/.local/bin/mise" ]; then MISE="$HOME/.local/bin/mise"
+else echo "ci: FAIL: mise not found. Run scripts/bootstrap --install."; exit 1; fi
+tool() { "$MISE" exec -- "$@"; }          # run a tool at the version mise.lock records
+
+fail=0
+# run <label> <command...>
+run() {
+  local label="$1" out; shift
+  if out=$("$@" 2>&1); then printf '  ok    %s\n' "$label"
+  else printf '  FAIL  %s\n' "$label"; printf '%s\n' "$out" | sed 's/^/        /' | head -40; fail=1; fi
+}
+
+SHELL_FILES=()
+for f in scripts/* .claude/hooks/*.sh home/.claude/canon/* .githooks/*; do
+  [ -f "$f" ] && head -1 "$f" | grep -q '^#!.*sh' && SHELL_FILES+=("$f")
+done
+syntax() { local f rc=0; for f in "${SHELL_FILES[@]}"; do bash -n "$f" || rc=1; done; return "$rc"; }
+
+echo "Canon and harness:"
+run "canon registry, lock and ADRs"      scripts/canon lint
+run "release-rule self-test"             scripts/canon selftest
+run "shell syntax (${#SHELL_FILES[@]} files)"            syntax
+run "shellcheck"                         tool shellcheck "${SHELL_FILES[@]}"
+run "hook behaviour (guard, marking)"    scripts/test-hooks
+run "lane report self-test"              scripts/lanes --selftest
+run "practice survey self-test"          scripts/survey-github selftest
+
+echo "Python workspace:"
+run "uv.lock matches the manifests"      tool uv lock --check
+run "ruff lint"                          tool uv run --locked ruff check .
+run "ruff format"                        tool uv run --locked ruff format --check .
+run "ty type check"                      tool uv run --locked ty check
+run "pytest"                             tool uv run --locked pytest -q
+
+echo "Supply chain:"
+if compgen -G ".github/workflows/*.yml" >/dev/null; then
+  run "actionlint (workflow files)"      tool actionlint
+fi
+if [ "$STAGED" -eq 1 ]; then
+  run "gitleaks (staged changes)"        tool gitleaks git --pre-commit --staged --no-banner --redact
+else
+  run "gitleaks (git history)"           tool gitleaks git --no-banner --redact
+  run "gitleaks (working tree)"          tool gitleaks dir . --no-banner --redact
+fi
+
+if [ "$fail" -eq 0 ]; then echo "ci: all checks passed"; else echo "ci: FAILED"; exit 1; fi

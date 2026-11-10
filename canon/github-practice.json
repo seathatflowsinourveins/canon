@@ -1,0 +1,3185 @@
+{
+  "surveyed_at": "2026-11-10T03:23:00Z",
+  "repos": [
+    {
+      "repo": "astral-sh/uv",
+      "group": "canon upstream",
+      "default_branch": "main",
+      "stars": 91834,
+      "workflows": {
+        "count": 47,
+        "with_top_level_permissions": 44,
+        "with_any_permissions": 46,
+        "with_cancel_in_progress": 3,
+        "action_refs": 524,
+        "action_refs_sha_pinned": 524,
+        "checkouts": 147,
+        "persist_credentials_false": 146,
+        "merge_group_trigger": false,
+        "aggregating_job": true,
+        "workflow_lint": "zizmor",
+        "lockfile": false,
+        "agent_in_ci": [
+          "openai/codex-action"
+        ],
+        "housekeeping": []
+      },
+      "files": {
+        "hook_framework": null,
+        "dependency_bot": "renovate",
+        "release_cooldown": true,
+        "bot_automerge": false,
+        "pr_template": ".github/PULL_REQUEST_TEMPLATE.md",
+        "pr_template_headings": [
+          "Summary",
+          "Test Plan"
+        ],
+        "codeowners": false,
+        "agents_md": true,
+        "claude_md": false,
+        "copilot_instructions": false,
+        "ai_policy_file": false
+      },
+      "settings": {
+        "merge_commit": false,
+        "squash": true,
+        "rebase": true,
+        "auto_merge": true,
+        "delete_branch_on_merge": true
+      },
+      "history": {
+        "n": 100,
+        "merge_commit_pct": 0,
+        "via_pull_request_pct": 100,
+        "pr_suffix_pct": 100,
+        "conventional_pct": 0,
+        "ai_marker_pct": 4,
+        "ai_tools": [
+          {
+            "tool": "codex",
+            "commits": 4
+          }
+        ],
+        "signed_off_pct": 2
+      },
+      "pull_requests": {
+        "n": 100,
+        "human_authored": 52,
+        "bot_authored_pct": 48,
+        "bot_authors": [
+          {
+            "login": "renovate",
+            "n": 31
+          },
+          {
+            "login": "astral-automations-bot",
+            "n": 17
+          }
+        ],
+        "approved_pct": 40,
+        "self_merged_pct": 86,
+        "auto_merge_pct": 0,
+        "merge_queue_pct": 0,
+        "merged_by": [
+          {
+            "login": "charliermarsh",
+            "n": 33
+          },
+          {
+            "login": "EliteTK",
+            "n": 22
+          },
+          {
+            "login": "konstin",
+            "n": 14
+          }
+        ],
+        "merged_by_bot_pct": 9,
+        "median_hours_to_merge": 1.4,
+        "median_lines_changed": 80,
+        "median_commits": 1
+      },
+      "branch_rules": {
+        "approvals": 0,
+        "merge_methods": [
+          "rebase",
+          "squash"
+        ],
+        "merge_queue": false,
+        "required_checks": [
+          "all required jobs passed"
+        ],
+        "types": [
+          "deletion",
+          "non_fast_forward",
+          "pull_request",
+          "required_linear_history",
+          "required_status_checks"
+        ]
+      },
+      "classic_protection": {
+        "contexts": [],
+        "protected": true
+      }
+    },
+    {
+      "repo": "astral-sh/ruff",
+      "group": "canon upstream",
+      "default_branch": "main",
+      "stars": 51145,
+      "workflows": {
+        "count": 26,
+        "with_top_level_permissions": 23,
+        "with_any_permissions": 26,
+        "with_cancel_in_progress": 8,
+        "action_refs": 309,
+        "action_refs_sha_pinned": 303,
+        "checkouts": 73,
+        "persist_credentials_false": 73,
+        "merge_group_trigger": false,
+        "aggregating_job": true,
+        "workflow_lint": "zizmor+actionlint",
+        "lockfile": false,
+        "agent_in_ci": [],
+        "housekeeping": []
+      },
+      "files": {
+        "hook_framework": "pre-commit",
+        "dependency_bot": "renovate",
+        "release_cooldown": true,
+        "bot_automerge": false,
+        "pr_template": ".github/PULL_REQUEST_TEMPLATE.md",
+        "pr_template_headings": [
+          "Summary",
+          "Test Plan"
+        ],
+        "codeowners": true,
+        "agents_md": true,
+        "claude_md": true,
+        "copilot_instructions": false,
+        "ai_policy_file": false
+      },
+      "settings": {
+        "merge_commit": false,
+        "squash": true,
+        "rebase": true,
+        "auto_merge": true,
+        "delete_branch_on_merge": true
+      },
+      "history": {
+        "n": 100,
+        "merge_commit_pct": 0,
+        "via_pull_request_pct": 100,
+        "pr_suffix_pct": 100,
+        "conventional_pct": 0,
+        "ai_marker_pct": 15,
+        "ai_tools": [
+          {
+            "tool": "codex",
+            "commits": 15
+          }
+        ],
+        "signed_off_pct": 1
+      },
+      "pull_requests": {
+        "n": 100,
+        "human_authored": 99,
+        "bot_authored_pct": 1,
+        "bot_authors": [
+          {
+            "login": "astral-automations-bot",
+            "n": 1
+          }
+        ],
+        "approved_pct": 50,
+        "self_merged_pct": 79,
+        "auto_merge_pct": 0,
+        "merge_queue_pct": 0,
+        "merged_by": [
+          {
+            "login": "charliermarsh",
+            "n": 32
+          },
+          {
+            "login": "MichaReiser",
+            "n": 23
+          },
+          {
+            "login": "sharkdp",
+            "n": 11
+          }
+        ],
+        "merged_by_bot_pct": 0,
+        "median_hours_to_merge": 15.6,
+        "median_lines_changed": 116,
+        "median_commits": 1
+      },
+      "branch_rules": {
+        "approvals": 0,
+        "merge_methods": [
+          "rebase",
+          "squash"
+        ],
+        "merge_queue": false,
+        "required_checks": [],
+        "types": [
+          "deletion",
+          "non_fast_forward",
+          "pull_request",
+          "required_linear_history"
+        ]
+      },
+      "classic_protection": {
+        "contexts": [
+          "all required checks passed"
+        ],
+        "protected": true
+      }
+    },
+    {
+      "repo": "astral-sh/ty",
+      "group": "canon upstream",
+      "default_branch": "main",
+      "stars": 20051,
+      "workflows": {
+        "count": 14,
+        "with_top_level_permissions": 13,
+        "with_any_permissions": 14,
+        "with_cancel_in_progress": 3,
+        "action_refs": 172,
+        "action_refs_sha_pinned": 172,
+        "checkouts": 25,
+        "persist_credentials_false": 25,
+        "merge_group_trigger": false,
+        "aggregating_job": false,
+        "workflow_lint": "zizmor+actionlint",
+        "lockfile": false,
+        "agent_in_ci": [],
+        "housekeeping": []
+      },
+      "files": {
+        "hook_framework": "pre-commit",
+        "dependency_bot": "renovate",
+        "release_cooldown": false,
+        "bot_automerge": false,
+        "pr_template": ".github/PULL_REQUEST_TEMPLATE.md",
+        "pr_template_headings": [
+          "Summary",
+          "Test Plan"
+        ],
+        "codeowners": false,
+        "agents_md": true,
+        "claude_md": false,
+        "copilot_instructions": false,
+        "ai_policy_file": false
+      },
+      "settings": {
+        "merge_commit": false,
+        "squash": true,
+        "rebase": true,
+        "auto_merge": true,
+        "delete_branch_on_merge": true
+      },
+      "history": {
+        "n": 100,
+        "merge_commit_pct": 0,
+        "via_pull_request_pct": 100,
+        "pr_suffix_pct": 100,
+        "conventional_pct": 0,
+        "ai_marker_pct": 1,
+        "ai_tools": [
+          {
+            "tool": "codex",
+            "commits": 1
+          }
+        ],
+        "signed_off_pct": 1
+      },
+      "pull_requests": {
+        "n": 100,
+        "human_authored": 59,
+        "bot_authored_pct": 41,
+        "bot_authors": [
+          {
+            "login": "renovate",
+            "n": 23
+          },
+          {
+            "login": "astral-automations-bot",
+            "n": 17
+          },
+          {
+            "login": "dependabot",
+            "n": 1
+          }
+        ],
+        "approved_pct": 42,
+        "self_merged_pct": 81,
+        "auto_merge_pct": 0,
+        "merge_queue_pct": 0,
+        "merged_by": [
+          {
+            "login": "AlexWaygood",
+            "n": 32
+          },
+          {
+            "login": "MichaReiser",
+            "n": 15
+          },
+          {
+            "login": "sharkdp",
+            "n": 14
+          }
+        ],
+        "merged_by_bot_pct": 0,
+        "median_hours_to_merge": 0.8,
+        "median_lines_changed": 17,
+        "median_commits": 1
+      },
+      "branch_rules": {
+        "approvals": 0,
+        "merge_methods": [
+          "rebase",
+          "squash"
+        ],
+        "merge_queue": false,
+        "required_checks": [
+          "Check generated files unedited",
+          "mkdocs",
+          "plan",
+          "prek",
+          "python package"
+        ],
+        "types": [
+          "deletion",
+          "non_fast_forward",
+          "pull_request",
+          "required_linear_history",
+          "required_status_checks"
+        ]
+      },
+      "classic_protection": {
+        "contexts": [],
+        "protected": true
+      }
+    },
+    {
+      "repo": "nautechsystems/nautilus_trader",
+      "group": "canon upstream",
+      "default_branch": "develop",
+      "stars": 31418,
+      "workflows": {
+        "count": 12,
+        "with_top_level_permissions": 12,
+        "with_any_permissions": 12,
+        "with_cancel_in_progress": 1,
+        "action_refs": 201,
+        "action_refs_sha_pinned": 201,
+        "checkouts": 62,
+        "persist_credentials_false": 60,
+        "merge_group_trigger": false,
+        "aggregating_job": false,
+        "workflow_lint": "actionlint",
+        "lockfile": false,
+        "agent_in_ci": [],
+        "housekeeping": []
+      },
+      "files": {
+        "hook_framework": "pre-commit",
+        "dependency_bot": null,
+        "release_cooldown": false,
+        "bot_automerge": false,
+        "pr_template": ".github/pull_request_template.md",
+        "pr_template_headings": [
+          "Pull Request",
+          "Summary",
+          "Related issues/PRs",
+          "Type of change",
+          "Breaking change details (if applicable)",
+          "Documentation",
+          "Testing"
+        ],
+        "codeowners": true,
+        "agents_md": true,
+        "claude_md": true,
+        "copilot_instructions": false,
+        "ai_policy_file": true
+      },
+      "settings": {
+        "merge_commit": true,
+        "squash": true,
+        "rebase": true,
+        "auto_merge": false,
+        "delete_branch_on_merge": true
+      },
+      "history": {
+        "n": 100,
+        "merge_commit_pct": 0,
+        "via_pull_request_pct": 16,
+        "pr_suffix_pct": 16,
+        "conventional_pct": 0,
+        "ai_marker_pct": 0,
+        "ai_tools": [],
+        "signed_off_pct": 0
+      },
+      "pull_requests": {
+        "n": 16,
+        "human_authored": 16,
+        "bot_authored_pct": 0,
+        "bot_authors": [],
+        "approved_pct": 100,
+        "self_merged_pct": 0,
+        "auto_merge_pct": 0,
+        "merge_queue_pct": 0,
+        "merged_by": [
+          {
+            "login": "cjdsellers",
+            "n": 16
+          }
+        ],
+        "merged_by_bot_pct": 0,
+        "median_hours_to_merge": 41.8,
+        "median_lines_changed": 239,
+        "median_commits": 2
+      },
+      "branch_rules": {
+        "approvals": 1,
+        "merge_methods": [
+          "squash"
+        ],
+        "merge_queue": false,
+        "required_checks": [
+          "build - python 3.13 (ubuntu-22.04)",
+          "build - python 3.14 (ubuntu-22.04)",
+          "license/cla",
+          "pre-commit"
+        ],
+        "types": [
+          "creation",
+          "deletion",
+          "non_fast_forward",
+          "pull_request",
+          "required_signatures",
+          "required_status_checks"
+        ]
+      },
+      "classic_protection": {
+        "contexts": [],
+        "protected": true
+      }
+    },
+    {
+      "repo": "alpacahq/alpaca-py",
+      "group": "canon upstream",
+      "default_branch": "master",
+      "stars": 1591,
+      "workflows": {
+        "count": 3,
+        "with_top_level_permissions": 2,
+        "with_any_permissions": 3,
+        "with_cancel_in_progress": 0,
+        "action_refs": 11,
+        "action_refs_sha_pinned": 0,
+        "checkouts": 5,
+        "persist_credentials_false": 0,
+        "merge_group_trigger": false,
+        "aggregating_job": false,
+        "workflow_lint": null,
+        "lockfile": false,
+        "agent_in_ci": [],
+        "housekeeping": [
+          "actions/stale"
+        ]
+      },
+      "files": {
+        "hook_framework": "pre-commit",
+        "dependency_bot": "dependabot",
+        "release_cooldown": false,
+        "bot_automerge": false,
+        "pr_template": null,
+        "pr_template_headings": [],
+        "codeowners": true,
+        "agents_md": false,
+        "claude_md": false,
+        "copilot_instructions": false,
+        "ai_policy_file": false
+      },
+      "settings": {
+        "merge_commit": true,
+        "squash": true,
+        "rebase": false,
+        "auto_merge": false,
+        "delete_branch_on_merge": true
+      },
+      "history": {
+        "n": 100,
+        "merge_commit_pct": 0,
+        "via_pull_request_pct": 100,
+        "pr_suffix_pct": 100,
+        "conventional_pct": 60,
+        "ai_marker_pct": 30,
+        "ai_tools": [
+          {
+            "tool": "cursor",
+            "commits": 26
+          },
+          {
+            "tool": "claude",
+            "commits": 9
+          }
+        ],
+        "signed_off_pct": 46
+      },
+      "pull_requests": {
+        "n": 100,
+        "human_authored": 58,
+        "bot_authored_pct": 42,
+        "bot_authors": [
+          {
+            "login": "dependabot",
+            "n": 42
+          }
+        ],
+        "approved_pct": 100,
+        "self_merged_pct": 58,
+        "auto_merge_pct": 0,
+        "merge_queue_pct": 0,
+        "merged_by": [
+          {
+            "login": "carlostasada",
+            "n": 98
+          },
+          {
+            "login": "SpenserJ",
+            "n": 1
+          },
+          {
+            "login": "Vishesh-Gupta",
+            "n": 1
+          }
+        ],
+        "merged_by_bot_pct": 0,
+        "median_hours_to_merge": 29.9,
+        "median_lines_changed": 69,
+        "median_commits": 2
+      },
+      "branch_rules": {
+        "approvals": 1,
+        "merge_methods": [
+          "merge",
+          "rebase",
+          "squash"
+        ],
+        "merge_queue": false,
+        "required_checks": [],
+        "types": [
+          "deletion",
+          "non_fast_forward",
+          "pull_request",
+          "required_linear_history"
+        ]
+      },
+      "classic_protection": {
+        "contexts": [],
+        "protected": true
+      }
+    },
+    {
+      "repo": "pytest-dev/pytest",
+      "group": "canon upstream",
+      "default_branch": "main",
+      "stars": 14677,
+      "workflows": {
+        "count": 6,
+        "with_top_level_permissions": 5,
+        "with_any_permissions": 6,
+        "with_cancel_in_progress": 1,
+        "action_refs": 23,
+        "action_refs_sha_pinned": 23,
+        "checkouts": 8,
+        "persist_credentials_false": 6,
+        "merge_group_trigger": false,
+        "aggregating_job": true,
+        "workflow_lint": "zizmor",
+        "lockfile": false,
+        "agent_in_ci": [],
+        "housekeeping": [
+          "actions/stale"
+        ]
+      },
+      "files": {
+        "hook_framework": "pre-commit",
+        "dependency_bot": "dependabot",
+        "release_cooldown": true,
+        "bot_automerge": false,
+        "pr_template": ".github/PULL_REQUEST_TEMPLATE.md",
+        "pr_template_headings": [],
+        "codeowners": false,
+        "agents_md": false,
+        "claude_md": false,
+        "copilot_instructions": false,
+        "ai_policy_file": false
+      },
+      "settings": {
+        "merge_commit": true,
+        "squash": true,
+        "rebase": false,
+        "auto_merge": true,
+        "delete_branch_on_merge": true
+      },
+      "history": {
+        "n": 100,
+        "merge_commit_pct": 30,
+        "via_pull_request_pct": 99,
+        "pr_suffix_pct": 25,
+        "conventional_pct": 17,
+        "ai_marker_pct": 29,
+        "ai_tools": [
+          {
+            "tool": "claude",
+            "commits": 28
+          },
+          {
+            "tool": "codex",
+            "commits": 1
+          }
+        ],
+        "signed_off_pct": 8
+      },
+      "pull_requests": {
+        "n": 48,
+        "human_authored": 32,
+        "bot_authored_pct": 33,
+        "bot_authors": [
+          {
+            "login": "dependabot",
+            "n": 8
+          },
+          {
+            "login": "pre-commit-ci",
+            "n": 5
+          },
+          {
+            "login": "github-actions",
+            "n": 3
+          }
+        ],
+        "approved_pct": 96,
+        "self_merged_pct": 43,
+        "auto_merge_pct": 10,
+        "merge_queue_pct": 0,
+        "merged_by": [
+          {
+            "login": "RonnyPfannschmidt",
+            "n": 25
+          },
+          {
+            "login": "Pierre-Sassoulas",
+            "n": 15
+          },
+          {
+            "login": "bluetech",
+            "n": 6
+          }
+        ],
+        "merged_by_bot_pct": 0,
+        "median_hours_to_merge": 109.1,
+        "median_lines_changed": 50,
+        "median_commits": 2
+      },
+      "branch_rules": {
+        "approvals": 1,
+        "merge_methods": [
+          "merge",
+          "rebase",
+          "squash"
+        ],
+        "merge_queue": false,
+        "required_checks": [
+          "Changelog entry",
+          "check",
+          "docs/readthedocs.org:pytest",
+          "pre-commit.ci - pr"
+        ],
+        "types": [
+          "deletion",
+          "non_fast_forward",
+          "pull_request",
+          "required_status_checks"
+        ]
+      },
+      "classic_protection": {
+        "contexts": [],
+        "protected": true
+      }
+    },
+    {
+      "repo": "jdx/mise",
+      "group": "canon upstream",
+      "default_branch": "main",
+      "stars": 35987,
+      "workflows": {
+        "count": 37,
+        "with_top_level_permissions": 30,
+        "with_any_permissions": 37,
+        "with_cancel_in_progress": 16,
+        "action_refs": 165,
+        "action_refs_sha_pinned": 165,
+        "checkouts": 44,
+        "persist_credentials_false": 43,
+        "merge_group_trigger": false,
+        "aggregating_job": false,
+        "workflow_lint": null,
+        "lockfile": false,
+        "agent_in_ci": [],
+        "housekeeping": []
+      },
+      "files": {
+        "hook_framework": null,
+        "dependency_bot": "renovate",
+        "release_cooldown": true,
+        "bot_automerge": true,
+        "pr_template": null,
+        "pr_template_headings": [],
+        "codeowners": false,
+        "agents_md": true,
+        "claude_md": true,
+        "copilot_instructions": false,
+        "ai_policy_file": false
+      },
+      "settings": {
+        "merge_commit": false,
+        "squash": true,
+        "rebase": false,
+        "auto_merge": true,
+        "delete_branch_on_merge": true
+      },
+      "history": {
+        "n": 100,
+        "merge_commit_pct": 0,
+        "via_pull_request_pct": 99,
+        "pr_suffix_pct": 99,
+        "conventional_pct": 96,
+        "ai_marker_pct": 85,
+        "ai_tools": [
+          {
+            "tool": "claude",
+            "commits": 85
+          }
+        ],
+        "signed_off_pct": 0
+      },
+      "pull_requests": {
+        "n": 99,
+        "human_authored": 90,
+        "bot_authored_pct": 9,
+        "bot_authors": [
+          {
+            "login": "renovate",
+            "n": 9
+          }
+        ],
+        "approved_pct": 31,
+        "self_merged_pct": 97,
+        "auto_merge_pct": 0,
+        "merge_queue_pct": 0,
+        "merged_by": [
+          {
+            "login": "jdx",
+            "n": 88
+          },
+          {
+            "login": "renovate",
+            "n": 7
+          },
+          {
+            "login": "mise-en-dev",
+            "n": 4
+          }
+        ],
+        "merged_by_bot_pct": 7,
+        "median_hours_to_merge": 3.3,
+        "median_lines_changed": 118,
+        "median_commits": 4
+      },
+      "branch_rules": {
+        "approvals": 0,
+        "merge_methods": [
+          "squash"
+        ],
+        "merge_queue": false,
+        "required_checks": [
+          "registry-ci",
+          "release",
+          "release-window",
+          "test-ci"
+        ],
+        "types": [
+          "deletion",
+          "non_fast_forward",
+          "pull_request",
+          "required_status_checks"
+        ]
+      },
+      "classic_protection": {
+        "contexts": [],
+        "protected": true
+      }
+    },
+    {
+      "repo": "jdx/mise-action",
+      "group": "canon upstream",
+      "default_branch": "main",
+      "stars": 405,
+      "workflows": {
+        "count": 7,
+        "with_top_level_permissions": 5,
+        "with_any_permissions": 7,
+        "with_cancel_in_progress": 4,
+        "action_refs": 35,
+        "action_refs_sha_pinned": 35,
+        "checkouts": 22,
+        "persist_credentials_false": 22,
+        "merge_group_trigger": false,
+        "aggregating_job": true,
+        "workflow_lint": null,
+        "lockfile": false,
+        "agent_in_ci": [],
+        "housekeeping": []
+      },
+      "files": {
+        "hook_framework": "husky",
+        "dependency_bot": "renovate",
+        "release_cooldown": false,
+        "bot_automerge": false,
+        "pr_template": null,
+        "pr_template_headings": [],
+        "codeowners": true,
+        "agents_md": false,
+        "claude_md": true,
+        "copilot_instructions": false,
+        "ai_policy_file": false
+      },
+      "settings": {
+        "merge_commit": false,
+        "squash": true,
+        "rebase": false,
+        "auto_merge": true,
+        "delete_branch_on_merge": true
+      },
+      "history": {
+        "n": 100,
+        "merge_commit_pct": 0,
+        "via_pull_request_pct": 85,
+        "pr_suffix_pct": 86,
+        "conventional_pct": 97,
+        "ai_marker_pct": 41,
+        "ai_tools": [
+          {
+            "tool": "claude",
+            "commits": 41
+          }
+        ],
+        "signed_off_pct": 1
+      },
+      "pull_requests": {
+        "n": 85,
+        "human_authored": 56,
+        "bot_authored_pct": 34,
+        "bot_authors": [
+          {
+            "login": "renovate",
+            "n": 29
+          }
+        ],
+        "approved_pct": 30,
+        "self_merged_pct": 89,
+        "auto_merge_pct": 0,
+        "merge_queue_pct": 0,
+        "merged_by": [
+          {
+            "login": "jdx",
+            "n": 60
+          },
+          {
+            "login": "renovate",
+            "n": 25
+          }
+        ],
+        "merged_by_bot_pct": 29,
+        "median_hours_to_merge": 1,
+        "median_lines_changed": 52,
+        "median_commits": 2
+      },
+      "branch_rules": {
+        "approvals": null,
+        "merge_methods": [],
+        "merge_queue": false,
+        "required_checks": [],
+        "types": []
+      },
+      "classic_protection": {
+        "contexts": [
+          "final"
+        ],
+        "protected": true
+      }
+    },
+    {
+      "repo": "actions/checkout",
+      "group": "canon upstream",
+      "default_branch": "main",
+      "stars": 9009,
+      "workflows": {
+        "count": 7,
+        "with_top_level_permissions": 0,
+        "with_any_permissions": 3,
+        "with_cancel_in_progress": 0,
+        "action_refs": 21,
+        "action_refs_sha_pinned": 0,
+        "checkouts": 13,
+        "persist_credentials_false": 0,
+        "merge_group_trigger": false,
+        "aggregating_job": false,
+        "workflow_lint": null,
+        "lockfile": false,
+        "agent_in_ci": [],
+        "housekeeping": []
+      },
+      "files": {
+        "hook_framework": null,
+        "dependency_bot": "dependabot",
+        "release_cooldown": false,
+        "bot_automerge": false,
+        "pr_template": null,
+        "pr_template_headings": [],
+        "codeowners": true,
+        "agents_md": false,
+        "claude_md": false,
+        "copilot_instructions": false,
+        "ai_policy_file": false
+      },
+      "settings": {
+        "merge_commit": false,
+        "squash": true,
+        "rebase": false,
+        "auto_merge": false,
+        "delete_branch_on_merge": true
+      },
+      "history": {
+        "n": 100,
+        "merge_commit_pct": 0,
+        "via_pull_request_pct": 100,
+        "pr_suffix_pct": 100,
+        "conventional_pct": 2,
+        "ai_marker_pct": 4,
+        "ai_tools": [
+          {
+            "tool": "copilot",
+            "commits": 4
+          }
+        ],
+        "signed_off_pct": 31
+      },
+      "pull_requests": {
+        "n": 100,
+        "human_authored": 73,
+        "bot_authored_pct": 27,
+        "bot_authors": [
+          {
+            "login": "dependabot",
+            "n": 26
+          },
+          {
+            "login": "copilot-swe-agent",
+            "n": 1
+          }
+        ],
+        "approved_pct": 100,
+        "self_merged_pct": 76,
+        "auto_merge_pct": 0,
+        "merge_queue_pct": 0,
+        "merged_by": [
+          {
+            "login": "aiqiaoy",
+            "n": 22
+          },
+          {
+            "login": "cory-miller",
+            "n": 16
+          },
+          {
+            "login": "joshmgross",
+            "n": 16
+          }
+        ],
+        "merged_by_bot_pct": 0,
+        "median_hours_to_merge": 3.5,
+        "median_lines_changed": 19,
+        "median_commits": 2
+      },
+      "branch_rules": {
+        "approvals": 1,
+        "merge_methods": [
+          "merge",
+          "rebase",
+          "squash"
+        ],
+        "merge_queue": false,
+        "required_checks": [],
+        "types": [
+          "copilot_code_review",
+          "deletion",
+          "non_fast_forward",
+          "pull_request"
+        ]
+      },
+      "classic_protection": {
+        "contexts": [],
+        "protected": true
+      }
+    },
+    {
+      "repo": "koalaman/shellcheck",
+      "group": "canon upstream",
+      "default_branch": "master",
+      "stars": 40312,
+      "workflows": {
+        "count": 2,
+        "with_top_level_permissions": 1,
+        "with_any_permissions": 1,
+        "with_cancel_in_progress": 0,
+        "action_refs": 14,
+        "action_refs_sha_pinned": 0,
+        "checkouts": 5,
+        "persist_credentials_false": 0,
+        "merge_group_trigger": false,
+        "aggregating_job": false,
+        "workflow_lint": null,
+        "lockfile": false,
+        "agent_in_ci": [],
+        "housekeeping": []
+      },
+      "files": {
+        "hook_framework": null,
+        "dependency_bot": "dependabot",
+        "release_cooldown": false,
+        "bot_automerge": false,
+        "pr_template": null,
+        "pr_template_headings": [],
+        "codeowners": false,
+        "agents_md": false,
+        "claude_md": false,
+        "copilot_instructions": false,
+        "ai_policy_file": false
+      },
+      "settings": {
+        "merge_commit": true,
+        "squash": true,
+        "rebase": true,
+        "auto_merge": false,
+        "delete_branch_on_merge": false
+      },
+      "history": {
+        "n": 100,
+        "merge_commit_pct": 43,
+        "via_pull_request_pct": 84,
+        "pr_suffix_pct": 0,
+        "conventional_pct": 28,
+        "ai_marker_pct": 1,
+        "ai_tools": [
+          {
+            "tool": "claude",
+            "commits": 1
+          }
+        ],
+        "signed_off_pct": 13
+      },
+      "pull_requests": {
+        "n": 44,
+        "human_authored": 43,
+        "bot_authored_pct": 2,
+        "bot_authors": [
+          {
+            "login": "dependabot",
+            "n": 1
+          }
+        ],
+        "approved_pct": 27,
+        "self_merged_pct": 9,
+        "auto_merge_pct": 0,
+        "merge_queue_pct": 0,
+        "merged_by": [
+          {
+            "login": "koalaman",
+            "n": 35
+          },
+          {
+            "login": "e-kwsm",
+            "n": 8
+          },
+          {
+            "login": "brother",
+            "n": 1
+          }
+        ],
+        "merged_by_bot_pct": 0,
+        "median_hours_to_merge": 257.8,
+        "median_lines_changed": 6,
+        "median_commits": 1
+      },
+      "branch_rules": {
+        "approvals": null,
+        "merge_methods": [],
+        "merge_queue": false,
+        "required_checks": [],
+        "types": []
+      },
+      "classic_protection": {
+        "contexts": [],
+        "protected": false
+      }
+    },
+    {
+      "repo": "gitleaks/gitleaks",
+      "group": "canon upstream",
+      "default_branch": "master",
+      "stars": 30849,
+      "workflows": {
+        "count": 3,
+        "with_top_level_permissions": 0,
+        "with_any_permissions": 1,
+        "with_cancel_in_progress": 0,
+        "action_refs": 11,
+        "action_refs_sha_pinned": 11,
+        "checkouts": 3,
+        "persist_credentials_false": 0,
+        "merge_group_trigger": false,
+        "aggregating_job": false,
+        "workflow_lint": null,
+        "lockfile": false,
+        "agent_in_ci": [],
+        "housekeeping": []
+      },
+      "files": {
+        "hook_framework": null,
+        "dependency_bot": "dependabot",
+        "release_cooldown": false,
+        "bot_automerge": false,
+        "pr_template": ".github/PULL_REQUEST_TEMPLATE.md",
+        "pr_template_headings": [
+          "Description",
+          "Checklist"
+        ],
+        "codeowners": true,
+        "agents_md": false,
+        "claude_md": false,
+        "copilot_instructions": false,
+        "ai_policy_file": false
+      },
+      "settings": {
+        "merge_commit": true,
+        "squash": true,
+        "rebase": true,
+        "auto_merge": false,
+        "delete_branch_on_merge": true
+      },
+      "history": {
+        "n": 100,
+        "merge_commit_pct": 12,
+        "via_pull_request_pct": 82,
+        "pr_suffix_pct": 60,
+        "conventional_pct": 35,
+        "ai_marker_pct": 5,
+        "ai_tools": [
+          {
+            "tool": "cursor",
+            "commits": 5
+          }
+        ],
+        "signed_off_pct": 7
+      },
+      "pull_requests": {
+        "n": 69,
+        "human_authored": 62,
+        "bot_authored_pct": 10,
+        "bot_authors": [
+          {
+            "login": "dependabot",
+            "n": 7
+          }
+        ],
+        "approved_pct": 33,
+        "self_merged_pct": 19,
+        "auto_merge_pct": 0,
+        "merge_queue_pct": 0,
+        "merged_by": [
+          {
+            "login": "zricethezav",
+            "n": 60
+          },
+          {
+            "login": "bryanbeverly",
+            "n": 9
+          }
+        ],
+        "merged_by_bot_pct": 0,
+        "median_hours_to_merge": 37.2,
+        "median_lines_changed": 33,
+        "median_commits": 1
+      },
+      "branch_rules": {
+        "approvals": null,
+        "merge_methods": [],
+        "merge_queue": false,
+        "required_checks": [],
+        "types": []
+      },
+      "classic_protection": {
+        "contexts": [],
+        "protected": true
+      }
+    },
+    {
+      "repo": "rhysd/actionlint",
+      "group": "canon upstream",
+      "default_branch": "main",
+      "stars": 4407,
+      "workflows": {
+        "count": 6,
+        "with_top_level_permissions": 1,
+        "with_any_permissions": 3,
+        "with_cancel_in_progress": 0,
+        "action_refs": 37,
+        "action_refs_sha_pinned": 0,
+        "checkouts": 12,
+        "persist_credentials_false": 0,
+        "merge_group_trigger": false,
+        "aggregating_job": false,
+        "workflow_lint": "actionlint",
+        "lockfile": false,
+        "agent_in_ci": [],
+        "housekeeping": []
+      },
+      "files": {
+        "hook_framework": null,
+        "dependency_bot": "dependabot",
+        "release_cooldown": false,
+        "bot_automerge": false,
+        "pr_template": null,
+        "pr_template_headings": [],
+        "codeowners": false,
+        "agents_md": false,
+        "claude_md": false,
+        "copilot_instructions": false,
+        "ai_policy_file": false
+      },
+      "settings": {
+        "merge_commit": true,
+        "squash": true,
+        "rebase": true,
+        "auto_merge": false,
+        "delete_branch_on_merge": true
+      },
+      "history": {
+        "n": 100,
+        "merge_commit_pct": 23,
+        "via_pull_request_pct": 41,
+        "pr_suffix_pct": 1,
+        "conventional_pct": 0,
+        "ai_marker_pct": 0,
+        "ai_tools": [],
+        "signed_off_pct": 10
+      },
+      "pull_requests": {
+        "n": 20,
+        "human_authored": 10,
+        "bot_authored_pct": 50,
+        "bot_authors": [
+          {
+            "login": "dependabot",
+            "n": 10
+          }
+        ],
+        "approved_pct": 100,
+        "self_merged_pct": 0,
+        "auto_merge_pct": 0,
+        "merge_queue_pct": 0,
+        "merged_by": [
+          {
+            "login": "rhysd",
+            "n": 20
+          }
+        ],
+        "merged_by_bot_pct": 0,
+        "median_hours_to_merge": 101.5,
+        "median_lines_changed": 21,
+        "median_commits": 1
+      },
+      "branch_rules": {
+        "approvals": null,
+        "merge_methods": [],
+        "merge_queue": false,
+        "required_checks": [],
+        "types": []
+      },
+      "classic_protection": {
+        "contexts": [],
+        "protected": false
+      }
+    },
+    {
+      "repo": "ryoppippi/ccusage",
+      "group": "canon upstream",
+      "default_branch": "main",
+      "stars": 19384,
+      "workflows": {
+        "count": 11,
+        "with_top_level_permissions": 8,
+        "with_any_permissions": 11,
+        "with_cancel_in_progress": 1,
+        "action_refs": 56,
+        "action_refs_sha_pinned": 56,
+        "checkouts": 23,
+        "persist_credentials_false": 19,
+        "merge_group_trigger": false,
+        "aggregating_job": true,
+        "workflow_lint": "actionlint",
+        "lockfile": false,
+        "agent_in_ci": [],
+        "housekeeping": []
+      },
+      "files": {
+        "hook_framework": null,
+        "dependency_bot": "renovate",
+        "release_cooldown": true,
+        "bot_automerge": true,
+        "pr_template": null,
+        "pr_template_headings": [],
+        "codeowners": false,
+        "agents_md": true,
+        "claude_md": false,
+        "copilot_instructions": false,
+        "ai_policy_file": false
+      },
+      "settings": {
+        "merge_commit": false,
+        "squash": true,
+        "rebase": false,
+        "auto_merge": true,
+        "delete_branch_on_merge": true
+      },
+      "history": {
+        "n": 100,
+        "merge_commit_pct": 0,
+        "via_pull_request_pct": 45,
+        "pr_suffix_pct": 45,
+        "conventional_pct": 100,
+        "ai_marker_pct": 0,
+        "ai_tools": [],
+        "signed_off_pct": 0
+      },
+      "pull_requests": {
+        "n": 45,
+        "human_authored": 12,
+        "bot_authored_pct": 73,
+        "bot_authors": [
+          {
+            "login": "renovate",
+            "n": 28
+          },
+          {
+            "login": "github-actions",
+            "n": 5
+          }
+        ],
+        "approved_pct": 0,
+        "self_merged_pct": 100,
+        "auto_merge_pct": 0,
+        "merge_queue_pct": 0,
+        "merged_by": [
+          {
+            "login": "renovate",
+            "n": 26
+          },
+          {
+            "login": "ryoppippi",
+            "n": 19
+          }
+        ],
+        "merged_by_bot_pct": 57,
+        "median_hours_to_merge": 3.2,
+        "median_lines_changed": 449,
+        "median_commits": 5
+      },
+      "branch_rules": {
+        "approvals": null,
+        "merge_methods": [],
+        "merge_queue": false,
+        "required_checks": [],
+        "types": []
+      },
+      "classic_protection": {
+        "contexts": [],
+        "protected": false
+      }
+    },
+    {
+      "repo": "anthropics/claude-agent-sdk-python",
+      "group": "canon upstream",
+      "default_branch": "main",
+      "stars": 8508,
+      "workflows": {
+        "count": 13,
+        "with_top_level_permissions": 3,
+        "with_any_permissions": 10,
+        "with_cancel_in_progress": 0,
+        "action_refs": 45,
+        "action_refs_sha_pinned": 5,
+        "checkouts": 20,
+        "persist_credentials_false": 2,
+        "merge_group_trigger": false,
+        "aggregating_job": false,
+        "workflow_lint": null,
+        "lockfile": false,
+        "agent_in_ci": [
+          "anthropics/claude-code-action"
+        ],
+        "housekeeping": []
+      },
+      "files": {
+        "hook_framework": null,
+        "dependency_bot": null,
+        "release_cooldown": false,
+        "bot_automerge": false,
+        "pr_template": null,
+        "pr_template_headings": [],
+        "codeowners": false,
+        "agents_md": false,
+        "claude_md": true,
+        "copilot_instructions": false,
+        "ai_policy_file": false
+      },
+      "settings": {
+        "merge_commit": false,
+        "squash": true,
+        "rebase": false,
+        "auto_merge": true,
+        "delete_branch_on_merge": true
+      },
+      "history": {
+        "n": 100,
+        "merge_commit_pct": 0,
+        "via_pull_request_pct": 23,
+        "pr_suffix_pct": 23,
+        "conventional_pct": 99,
+        "ai_marker_pct": 17,
+        "ai_tools": [
+          {
+            "tool": "claude",
+            "commits": 17
+          }
+        ],
+        "signed_off_pct": 0
+      },
+      "pull_requests": {
+        "n": 23,
+        "human_authored": 23,
+        "bot_authored_pct": 0,
+        "bot_authors": [],
+        "approved_pct": 100,
+        "self_merged_pct": 91,
+        "auto_merge_pct": 0,
+        "merge_queue_pct": 0,
+        "merged_by": [
+          {
+            "login": "qing-ant",
+            "n": 21
+          },
+          {
+            "login": "ant-kurt",
+            "n": 1
+          },
+          {
+            "login": "sarahdeaton",
+            "n": 1
+          }
+        ],
+        "merged_by_bot_pct": 0,
+        "median_hours_to_merge": 5.5,
+        "median_lines_changed": 118,
+        "median_commits": 2
+      },
+      "branch_rules": {
+        "approvals": 1,
+        "merge_methods": [
+          "merge",
+          "rebase",
+          "squash"
+        ],
+        "merge_queue": false,
+        "required_checks": [],
+        "types": [
+          "deletion",
+          "non_fast_forward",
+          "pull_request",
+          "repository_visibility"
+        ]
+      },
+      "classic_protection": {
+        "contexts": [],
+        "protected": true
+      }
+    },
+    {
+      "repo": "anthropics/claude-code-action",
+      "group": "agent tool",
+      "default_branch": "main",
+      "stars": 9868,
+      "workflows": {
+        "count": 14,
+        "with_top_level_permissions": 9,
+        "with_any_permissions": 13,
+        "with_cancel_in_progress": 0,
+        "action_refs": 32,
+        "action_refs_sha_pinned": 20,
+        "checkouts": 25,
+        "persist_credentials_false": 0,
+        "merge_group_trigger": false,
+        "aggregating_job": false,
+        "workflow_lint": null,
+        "lockfile": false,
+        "agent_in_ci": [
+          "anthropics/claude-code-action",
+          "anthropics/claude-code-base-action"
+        ],
+        "housekeeping": []
+      },
+      "files": {
+        "hook_framework": null,
+        "dependency_bot": null,
+        "release_cooldown": false,
+        "bot_automerge": false,
+        "pr_template": null,
+        "pr_template_headings": [],
+        "codeowners": false,
+        "agents_md": false,
+        "claude_md": true,
+        "copilot_instructions": false,
+        "ai_policy_file": false
+      },
+      "settings": {
+        "merge_commit": false,
+        "squash": true,
+        "rebase": false,
+        "auto_merge": true,
+        "delete_branch_on_merge": true
+      },
+      "history": {
+        "n": 100,
+        "merge_commit_pct": 0,
+        "via_pull_request_pct": 24,
+        "pr_suffix_pct": 24,
+        "conventional_pct": 98,
+        "ai_marker_pct": 6,
+        "ai_tools": [
+          {
+            "tool": "claude",
+            "commits": 4
+          },
+          {
+            "tool": "cursor",
+            "commits": 2
+          }
+        ],
+        "signed_off_pct": 2
+      },
+      "pull_requests": {
+        "n": 24,
+        "human_authored": 24,
+        "bot_authored_pct": 0,
+        "bot_authors": [],
+        "approved_pct": 100,
+        "self_merged_pct": 20,
+        "auto_merge_pct": 0,
+        "merge_queue_pct": 0,
+        "merged_by": [
+          {
+            "login": "ashwin-ant",
+            "n": 18
+          },
+          {
+            "login": "mhegazy",
+            "n": 2
+          },
+          {
+            "login": "dylan-conway",
+            "n": 1
+          }
+        ],
+        "merged_by_bot_pct": 0,
+        "median_hours_to_merge": 112.9,
+        "median_lines_changed": 98,
+        "median_commits": 1
+      },
+      "branch_rules": {
+        "approvals": 1,
+        "merge_methods": [
+          "merge",
+          "rebase",
+          "squash"
+        ],
+        "merge_queue": false,
+        "required_checks": [],
+        "types": [
+          "deletion",
+          "non_fast_forward",
+          "pull_request",
+          "repository_visibility"
+        ]
+      },
+      "classic_protection": {
+        "contexts": [],
+        "protected": true
+      }
+    },
+    {
+      "repo": "openai/codex",
+      "group": "agent tool",
+      "default_branch": "main",
+      "stars": 134480,
+      "workflows": {
+        "count": 28,
+        "with_top_level_permissions": 6,
+        "with_any_permissions": 19,
+        "with_cancel_in_progress": 2,
+        "action_refs": 231,
+        "action_refs_sha_pinned": 231,
+        "checkouts": 65,
+        "persist_credentials_false": 65,
+        "merge_group_trigger": false,
+        "aggregating_job": true,
+        "workflow_lint": null,
+        "lockfile": false,
+        "agent_in_ci": [
+          "codex exec",
+          "openai/codex-action"
+        ],
+        "housekeeping": []
+      },
+      "files": {
+        "hook_framework": null,
+        "dependency_bot": "dependabot",
+        "release_cooldown": true,
+        "bot_automerge": false,
+        "pr_template": null,
+        "pr_template_headings": [],
+        "codeowners": true,
+        "agents_md": false,
+        "claude_md": false,
+        "copilot_instructions": false,
+        "ai_policy_file": false
+      },
+      "settings": {
+        "merge_commit": false,
+        "squash": true,
+        "rebase": false,
+        "auto_merge": true,
+        "delete_branch_on_merge": true
+      },
+      "history": {
+        "n": 100,
+        "merge_commit_pct": 0,
+        "via_pull_request_pct": 100,
+        "pr_suffix_pct": 100,
+        "conventional_pct": 0,
+        "ai_marker_pct": 0,
+        "ai_tools": [],
+        "signed_off_pct": 0
+      },
+      "pull_requests": {
+        "n": 100,
+        "human_authored": 0,
+        "bot_authored_pct": 100,
+        "bot_authors": [
+          {
+            "login": "copyberry",
+            "n": 100
+          }
+        ],
+        "approved_pct": null,
+        "self_merged_pct": null,
+        "auto_merge_pct": 0,
+        "merge_queue_pct": 0,
+        "merged_by": [
+          {
+            "login": "copyberry",
+            "n": 100
+          }
+        ],
+        "merged_by_bot_pct": 100,
+        "median_hours_to_merge": null,
+        "median_lines_changed": null,
+        "median_commits": null
+      },
+      "branch_rules": {
+        "approvals": 1,
+        "merge_methods": [
+          "squash"
+        ],
+        "merge_queue": false,
+        "required_checks": [
+          "CI required",
+          "cla"
+        ],
+        "types": [
+          "creation",
+          "deletion",
+          "non_fast_forward",
+          "pull_request",
+          "required_linear_history",
+          "required_status_checks",
+          "update"
+        ]
+      },
+      "classic_protection": {
+        "contexts": [],
+        "protected": true
+      }
+    },
+    {
+      "repo": "google-gemini/gemini-cli",
+      "group": "agent tool",
+      "default_branch": "main",
+      "stars": 108746,
+      "workflows": {
+        "count": 47,
+        "with_top_level_permissions": 19,
+        "with_any_permissions": 41,
+        "with_cancel_in_progress": 14,
+        "action_refs": 179,
+        "action_refs_sha_pinned": 179,
+        "checkouts": 60,
+        "persist_credentials_false": 59,
+        "merge_group_trigger": true,
+        "aggregating_job": false,
+        "workflow_lint": null,
+        "lockfile": false,
+        "agent_in_ci": [
+          "google-github-actions/run-gemini-cli"
+        ],
+        "housekeeping": []
+      },
+      "files": {
+        "hook_framework": "husky",
+        "dependency_bot": "dependabot",
+        "release_cooldown": true,
+        "bot_automerge": false,
+        "pr_template": ".github/pull_request_template.md",
+        "pr_template_headings": [
+          "Summary",
+          "Details",
+          "Related Issues",
+          "How to Validate",
+          "Pre-Merge Checklist"
+        ],
+        "codeowners": true,
+        "agents_md": false,
+        "claude_md": false,
+        "copilot_instructions": false,
+        "ai_policy_file": false
+      },
+      "settings": {
+        "merge_commit": false,
+        "squash": true,
+        "rebase": false,
+        "auto_merge": true,
+        "delete_branch_on_merge": true
+      },
+      "history": {
+        "n": 100,
+        "merge_commit_pct": 0,
+        "via_pull_request_pct": 100,
+        "pr_suffix_pct": 100,
+        "conventional_pct": 93,
+        "ai_marker_pct": 6,
+        "ai_tools": [
+          {
+            "tool": "gemini",
+            "commits": 6
+          }
+        ],
+        "signed_off_pct": 0
+      },
+      "pull_requests": {
+        "n": 100,
+        "human_authored": 100,
+        "bot_authored_pct": 0,
+        "bot_authors": [],
+        "approved_pct": 100,
+        "self_merged_pct": 3,
+        "auto_merge_pct": 79,
+        "merge_queue_pct": 100,
+        "merged_by": [
+          {
+            "login": "DavidAPierce",
+            "n": 97
+          },
+          {
+            "login": "gemini-cli-robot",
+            "n": 2
+          },
+          {
+            "login": "LyalinDotCom",
+            "n": 1
+          }
+        ],
+        "merged_by_bot_pct": 0,
+        "median_hours_to_merge": 20.3,
+        "median_lines_changed": 225,
+        "median_commits": 3
+      },
+      "branch_rules": {
+        "approvals": 1,
+        "merge_methods": [
+          "squash"
+        ],
+        "merge_queue": true,
+        "required_checks": [
+          "CI",
+          "E2E (Chained)",
+          "cla/google"
+        ],
+        "types": [
+          "deletion",
+          "merge_queue",
+          "non_fast_forward",
+          "pull_request",
+          "required_status_checks"
+        ]
+      },
+      "classic_protection": {
+        "contexts": [],
+        "protected": true
+      }
+    },
+    {
+      "repo": "sst/opencode",
+      "group": "agent tool",
+      "default_branch": "dev",
+      "stars": 225699,
+      "workflows": {
+        "count": 19,
+        "with_top_level_permissions": 14,
+        "with_any_permissions": 18,
+        "with_cancel_in_progress": 8,
+        "action_refs": 96,
+        "action_refs_sha_pinned": 96,
+        "checkouts": 29,
+        "persist_credentials_false": 6,
+        "merge_group_trigger": false,
+        "aggregating_job": false,
+        "workflow_lint": null,
+        "lockfile": false,
+        "agent_in_ci": [],
+        "housekeeping": []
+      },
+      "files": {
+        "hook_framework": "husky",
+        "dependency_bot": null,
+        "release_cooldown": false,
+        "bot_automerge": false,
+        "pr_template": ".github/pull_request_template.md",
+        "pr_template_headings": [
+          "Issue for this PR",
+          "Type of change",
+          "What does this PR do?",
+          "How did you verify your code works?",
+          "Visual",
+          "Screenshots / recordings",
+          "Checklist"
+        ],
+        "codeowners": true,
+        "agents_md": true,
+        "claude_md": false,
+        "copilot_instructions": false,
+        "ai_policy_file": false
+      },
+      "settings": {
+        "merge_commit": false,
+        "squash": true,
+        "rebase": false,
+        "auto_merge": true,
+        "delete_branch_on_merge": true
+      },
+      "history": {
+        "n": 100,
+        "merge_commit_pct": 0,
+        "via_pull_request_pct": 100,
+        "pr_suffix_pct": 100,
+        "conventional_pct": 98,
+        "ai_marker_pct": 0,
+        "ai_tools": [],
+        "signed_off_pct": 0
+      },
+      "pull_requests": {
+        "n": 100,
+        "human_authored": 91,
+        "bot_authored_pct": 9,
+        "bot_authors": [
+          {
+            "login": "opencode-agent",
+            "n": 9
+          }
+        ],
+        "approved_pct": 1,
+        "self_merged_pct": 91,
+        "auto_merge_pct": 0,
+        "merge_queue_pct": 0,
+        "merged_by": [
+          {
+            "login": "adamdotdevin",
+            "n": 28
+          },
+          {
+            "login": "rekram1-node",
+            "n": 28
+          },
+          {
+            "login": "Hona",
+            "n": 10
+          }
+        ],
+        "merged_by_bot_pct": 0,
+        "median_hours_to_merge": 1,
+        "median_lines_changed": 78,
+        "median_commits": 1
+      },
+      "branch_rules": {
+        "approvals": 0,
+        "merge_methods": [
+          "squash"
+        ],
+        "merge_queue": false,
+        "required_checks": [
+          "bot-scope",
+          "e2e (linux)",
+          "e2e (windows)",
+          "typecheck",
+          "unit (linux)",
+          "unit (windows)"
+        ],
+        "types": [
+          "deletion",
+          "pull_request",
+          "required_linear_history",
+          "required_status_checks"
+        ]
+      },
+      "classic_protection": {
+        "contexts": [],
+        "protected": true
+      }
+    },
+    {
+      "repo": "zed-industries/zed",
+      "group": "agent tool",
+      "default_branch": "main",
+      "stars": 94603,
+      "workflows": {
+        "count": 46,
+        "with_top_level_permissions": 46,
+        "with_any_permissions": 46,
+        "with_cancel_in_progress": 16,
+        "action_refs": 398,
+        "action_refs_sha_pinned": 398,
+        "checkouts": 105,
+        "persist_credentials_false": 1,
+        "merge_group_trigger": true,
+        "aggregating_job": false,
+        "workflow_lint": "zizmor+actionlint",
+        "lockfile": false,
+        "agent_in_ci": [],
+        "housekeeping": [
+          "actions/stale"
+        ]
+      },
+      "files": {
+        "hook_framework": null,
+        "dependency_bot": "renovate",
+        "release_cooldown": false,
+        "bot_automerge": false,
+        "pr_template": ".github/pull_request_template.md",
+        "pr_template_headings": [
+          "Summary",
+          "Testing",
+          "Self-review"
+        ],
+        "codeowners": false,
+        "agents_md": true,
+        "claude_md": true,
+        "copilot_instructions": false,
+        "ai_policy_file": false
+      },
+      "settings": {
+        "merge_commit": false,
+        "squash": true,
+        "rebase": false,
+        "auto_merge": true,
+        "delete_branch_on_merge": true
+      },
+      "history": {
+        "n": 100,
+        "merge_commit_pct": 0,
+        "via_pull_request_pct": 100,
+        "pr_suffix_pct": 100,
+        "conventional_pct": 3,
+        "ai_marker_pct": 9,
+        "ai_tools": [
+          {
+            "tool": "claude",
+            "commits": 5
+          },
+          {
+            "tool": "other",
+            "commits": 4
+          },
+          {
+            "tool": "codex",
+            "commits": 1
+          }
+        ],
+        "signed_off_pct": 1
+      },
+      "pull_requests": {
+        "n": 100,
+        "human_authored": 99,
+        "bot_authored_pct": 1,
+        "bot_authors": [
+          {
+            "login": "zed-zippy",
+            "n": 1
+          }
+        ],
+        "approved_pct": 94,
+        "self_merged_pct": 48,
+        "auto_merge_pct": 57,
+        "merge_queue_pct": 100,
+        "merged_by": [
+          {
+            "login": "SomeoneToIgnore",
+            "n": 20
+          },
+          {
+            "login": "osiewicz",
+            "n": 18
+          },
+          {
+            "login": "Anthony-Eid",
+            "n": 11
+          }
+        ],
+        "merged_by_bot_pct": 0,
+        "median_hours_to_merge": 30,
+        "median_lines_changed": 172,
+        "median_commits": 2
+      },
+      "branch_rules": {
+        "approvals": 0,
+        "merge_methods": [
+          "squash"
+        ],
+        "merge_queue": true,
+        "required_checks": [
+          "danger",
+          "tests_pass"
+        ],
+        "types": [
+          "deletion",
+          "merge_queue",
+          "non_fast_forward",
+          "pull_request",
+          "required_status_checks"
+        ]
+      },
+      "classic_protection": {
+        "contexts": [],
+        "protected": true
+      }
+    },
+    {
+      "repo": "python/cpython",
+      "group": "flagship",
+      "default_branch": "main",
+      "stars": 78142,
+      "workflows": {
+        "count": 23,
+        "with_top_level_permissions": 23,
+        "with_any_permissions": 23,
+        "with_cancel_in_progress": 8,
+        "action_refs": 73,
+        "action_refs_sha_pinned": 73,
+        "checkouts": 31,
+        "persist_credentials_false": 31,
+        "merge_group_trigger": false,
+        "aggregating_job": true,
+        "workflow_lint": "zizmor+actionlint",
+        "lockfile": false,
+        "agent_in_ci": [],
+        "housekeeping": [
+          "actions/stale"
+        ]
+      },
+      "files": {
+        "hook_framework": "pre-commit",
+        "dependency_bot": "dependabot",
+        "release_cooldown": true,
+        "bot_automerge": false,
+        "pr_template": ".github/PULL_REQUEST_TEMPLATE.md",
+        "pr_template_headings": [
+          "Pull Request title",
+          "Backport Pull Request title"
+        ],
+        "codeowners": true,
+        "agents_md": true,
+        "claude_md": false,
+        "copilot_instructions": false,
+        "ai_policy_file": false
+      },
+      "settings": {
+        "merge_commit": false,
+        "squash": true,
+        "rebase": false,
+        "auto_merge": true,
+        "delete_branch_on_merge": true
+      },
+      "history": {
+        "n": 100,
+        "merge_commit_pct": 0,
+        "via_pull_request_pct": 100,
+        "pr_suffix_pct": 96,
+        "conventional_pct": 1,
+        "ai_marker_pct": 8,
+        "ai_tools": [
+          {
+            "tool": "claude",
+            "commits": 8
+          }
+        ],
+        "signed_off_pct": 0
+      },
+      "pull_requests": {
+        "n": 100,
+        "human_authored": 100,
+        "bot_authored_pct": 0,
+        "bot_authors": [],
+        "approved_pct": 75,
+        "self_merged_pct": 48,
+        "auto_merge_pct": 0,
+        "merge_queue_pct": 0,
+        "merged_by": [
+          {
+            "login": "vstinner",
+            "n": 24
+          },
+          {
+            "login": "StanFromIreland",
+            "n": 14
+          },
+          {
+            "login": "cmaloney",
+            "n": 10
+          }
+        ],
+        "merged_by_bot_pct": 0,
+        "median_hours_to_merge": 48.7,
+        "median_lines_changed": 28,
+        "median_commits": 3
+      },
+      "branch_rules": {
+        "approvals": null,
+        "merge_methods": [],
+        "merge_queue": false,
+        "required_checks": [],
+        "types": []
+      },
+      "classic_protection": {
+        "contexts": [
+          "All required checks pass",
+          "bedevere/issue-number",
+          "bedevere/news",
+          "CLA Signing",
+          "DO-NOT-MERGE",
+          "Unresolved review",
+          "lint"
+        ],
+        "protected": true
+      }
+    },
+    {
+      "repo": "pydantic/pydantic",
+      "group": "flagship",
+      "default_branch": "main",
+      "stars": 29416,
+      "workflows": {
+        "count": 9,
+        "with_top_level_permissions": 8,
+        "with_any_permissions": 9,
+        "with_cancel_in_progress": 2,
+        "action_refs": 172,
+        "action_refs_sha_pinned": 172,
+        "checkouts": 65,
+        "persist_credentials_false": 65,
+        "merge_group_trigger": false,
+        "aggregating_job": true,
+        "workflow_lint": "zizmor",
+        "lockfile": false,
+        "agent_in_ci": [],
+        "housekeeping": []
+      },
+      "files": {
+        "hook_framework": "pre-commit",
+        "dependency_bot": "dependabot",
+        "release_cooldown": true,
+        "bot_automerge": false,
+        "pr_template": ".github/PULL_REQUEST_TEMPLATE.md",
+        "pr_template_headings": [
+          "Change Summary"
+        ],
+        "codeowners": false,
+        "agents_md": true,
+        "claude_md": false,
+        "copilot_instructions": false,
+        "ai_policy_file": false
+      },
+      "settings": {
+        "merge_commit": false,
+        "squash": true,
+        "rebase": false,
+        "auto_merge": true,
+        "delete_branch_on_merge": true
+      },
+      "history": {
+        "n": 100,
+        "merge_commit_pct": 0,
+        "via_pull_request_pct": 100,
+        "pr_suffix_pct": 100,
+        "conventional_pct": 0,
+        "ai_marker_pct": 0,
+        "ai_tools": [],
+        "signed_off_pct": 8
+      },
+      "pull_requests": {
+        "n": 100,
+        "human_authored": 91,
+        "bot_authored_pct": 9,
+        "bot_authors": [
+          {
+            "login": "dependabot",
+            "n": 8
+          },
+          {
+            "login": "github-actions",
+            "n": 1
+          }
+        ],
+        "approved_pct": 14,
+        "self_merged_pct": 74,
+        "auto_merge_pct": 0,
+        "merge_queue_pct": 0,
+        "merged_by": [
+          {
+            "login": "Viicos",
+            "n": 86
+          },
+          {
+            "login": "alexmojaki",
+            "n": 14
+          }
+        ],
+        "merged_by_bot_pct": 0,
+        "median_hours_to_merge": 1.1,
+        "median_lines_changed": 57,
+        "median_commits": 1
+      },
+      "branch_rules": {
+        "approvals": 0,
+        "merge_methods": [
+          "squash"
+        ],
+        "merge_queue": false,
+        "required_checks": [
+          "check"
+        ],
+        "types": [
+          "deletion",
+          "non_fast_forward",
+          "pull_request",
+          "repository_create",
+          "required_linear_history",
+          "required_status_checks"
+        ]
+      },
+      "classic_protection": {
+        "contexts": [
+          "check"
+        ],
+        "protected": true
+      }
+    },
+    {
+      "repo": "pola-rs/polars",
+      "group": "flagship",
+      "default_branch": "main",
+      "stars": 40296,
+      "workflows": {
+        "count": 20,
+        "with_top_level_permissions": 3,
+        "with_any_permissions": 6,
+        "with_cancel_in_progress": 10,
+        "action_refs": 119,
+        "action_refs_sha_pinned": 0,
+        "checkouts": 34,
+        "persist_credentials_false": 0,
+        "merge_group_trigger": false,
+        "aggregating_job": false,
+        "workflow_lint": null,
+        "lockfile": false,
+        "agent_in_ci": [],
+        "housekeeping": [
+          "release-drafter/release-drafter"
+        ]
+      },
+      "files": {
+        "hook_framework": null,
+        "dependency_bot": "dependabot",
+        "release_cooldown": false,
+        "bot_automerge": false,
+        "pr_template": ".github/pull_request_template.md",
+        "pr_template_headings": [],
+        "codeowners": true,
+        "agents_md": false,
+        "claude_md": false,
+        "copilot_instructions": false,
+        "ai_policy_file": true
+      },
+      "settings": {
+        "merge_commit": false,
+        "squash": true,
+        "rebase": false,
+        "auto_merge": false,
+        "delete_branch_on_merge": true
+      },
+      "history": {
+        "n": 100,
+        "merge_commit_pct": 0,
+        "via_pull_request_pct": 100,
+        "pr_suffix_pct": 100,
+        "conventional_pct": 100,
+        "ai_marker_pct": 13,
+        "ai_tools": [
+          {
+            "tool": "claude",
+            "commits": 13
+          },
+          {
+            "tool": "cursor",
+            "commits": 1
+          }
+        ],
+        "signed_off_pct": 0
+      },
+      "pull_requests": {
+        "n": 100,
+        "human_authored": 100,
+        "bot_authored_pct": 0,
+        "bot_authors": [],
+        "approved_pct": 33,
+        "self_merged_pct": 46,
+        "auto_merge_pct": 0,
+        "merge_queue_pct": 0,
+        "merged_by": [
+          {
+            "login": "ritchie46",
+            "n": 61
+          },
+          {
+            "login": "kdn36",
+            "n": 12
+          },
+          {
+            "login": "orlp",
+            "n": 12
+          }
+        ],
+        "merged_by_bot_pct": 0,
+        "median_hours_to_merge": 18.3,
+        "median_lines_changed": 155,
+        "median_commits": 2
+      },
+      "branch_rules": {
+        "approvals": null,
+        "merge_methods": [],
+        "merge_queue": false,
+        "required_checks": [],
+        "types": []
+      },
+      "classic_protection": {
+        "contexts": [],
+        "protected": true
+      }
+    },
+    {
+      "repo": "fastapi/fastapi",
+      "group": "flagship",
+      "default_branch": "master",
+      "stars": 104602,
+      "workflows": {
+        "count": 18,
+        "with_top_level_permissions": 18,
+        "with_any_permissions": 18,
+        "with_cancel_in_progress": 0,
+        "action_refs": 88,
+        "action_refs_sha_pinned": 88,
+        "checkouts": 23,
+        "persist_credentials_false": 22,
+        "merge_group_trigger": false,
+        "aggregating_job": true,
+        "workflow_lint": "zizmor",
+        "lockfile": false,
+        "agent_in_ci": [],
+        "housekeeping": []
+      },
+      "files": {
+        "hook_framework": "pre-commit",
+        "dependency_bot": "dependabot",
+        "release_cooldown": true,
+        "bot_automerge": false,
+        "pr_template": null,
+        "pr_template_headings": [],
+        "codeowners": false,
+        "agents_md": false,
+        "claude_md": false,
+        "copilot_instructions": false,
+        "ai_policy_file": false
+      },
+      "settings": {
+        "merge_commit": false,
+        "squash": true,
+        "rebase": false,
+        "auto_merge": true,
+        "delete_branch_on_merge": true
+      },
+      "history": {
+        "n": 100,
+        "merge_commit_pct": 0,
+        "via_pull_request_pct": 51,
+        "pr_suffix_pct": 51,
+        "conventional_pct": 0,
+        "ai_marker_pct": 0,
+        "ai_tools": [],
+        "signed_off_pct": 5
+      },
+      "pull_requests": {
+        "n": 51,
+        "human_authored": 30,
+        "bot_authored_pct": 41,
+        "bot_authors": [
+          {
+            "login": "pr-submit",
+            "n": 16
+          },
+          {
+            "login": "dependabot",
+            "n": 5
+          }
+        ],
+        "approved_pct": 3,
+        "self_merged_pct": 96,
+        "auto_merge_pct": 0,
+        "merge_queue_pct": 0,
+        "merged_by": [
+          {
+            "login": "tiangolo",
+            "n": 31
+          },
+          {
+            "login": "YuriiMotov",
+            "n": 20
+          }
+        ],
+        "merged_by_bot_pct": 0,
+        "median_hours_to_merge": 0.3,
+        "median_lines_changed": 16,
+        "median_commits": 2
+      },
+      "branch_rules": {
+        "approvals": 0,
+        "merge_methods": [
+          "squash"
+        ],
+        "merge_queue": false,
+        "required_checks": [
+          "docs-all-green",
+          "latest-changes/label",
+          "pre-commit-alls-green",
+          "test-alls-green",
+          "test-redistribute-alls-green"
+        ],
+        "types": [
+          "creation",
+          "deletion",
+          "non_fast_forward",
+          "pull_request",
+          "required_linear_history",
+          "required_status_checks"
+        ]
+      },
+      "classic_protection": {
+        "contexts": [],
+        "protected": true
+      }
+    },
+    {
+      "repo": "rust-lang/rust",
+      "group": "flagship",
+      "default_branch": "main",
+      "stars": 121708,
+      "workflows": {
+        "count": 3,
+        "with_top_level_permissions": 1,
+        "with_any_permissions": 3,
+        "with_cancel_in_progress": 1,
+        "action_refs": 9,
+        "action_refs_sha_pinned": 9,
+        "checkouts": 5,
+        "persist_credentials_false": 1,
+        "merge_group_trigger": false,
+        "aggregating_job": false,
+        "workflow_lint": null,
+        "lockfile": false,
+        "agent_in_ci": [],
+        "housekeeping": []
+      },
+      "files": {
+        "hook_framework": null,
+        "dependency_bot": "renovate",
+        "release_cooldown": false,
+        "bot_automerge": false,
+        "pr_template": ".github/pull_request_template.md",
+        "pr_template_headings": [],
+        "codeowners": false,
+        "agents_md": true,
+        "claude_md": false,
+        "copilot_instructions": false,
+        "ai_policy_file": false
+      },
+      "settings": {
+        "merge_commit": true,
+        "squash": false,
+        "rebase": false,
+        "auto_merge": false,
+        "delete_branch_on_merge": true
+      },
+      "history": {
+        "n": 100,
+        "merge_commit_pct": 54,
+        "via_pull_request_pct": 100,
+        "pr_suffix_pct": 0,
+        "conventional_pct": 3,
+        "ai_marker_pct": 0,
+        "ai_tools": [],
+        "signed_off_pct": 3
+      },
+      "pull_requests": {
+        "n": 26,
+        "human_authored": 26,
+        "bot_authored_pct": 0,
+        "bot_authors": [],
+        "approved_pct": 38,
+        "self_merged_pct": 0,
+        "auto_merge_pct": 0,
+        "merge_queue_pct": 0,
+        "merged_by": [
+          {
+            "login": "rust-bors",
+            "n": 26
+          }
+        ],
+        "merged_by_bot_pct": 100,
+        "median_hours_to_merge": 11.1,
+        "median_lines_changed": 106,
+        "median_commits": 2
+      },
+      "branch_rules": {
+        "approvals": 1,
+        "merge_methods": [
+          "merge",
+          "rebase",
+          "squash"
+        ],
+        "merge_queue": false,
+        "required_checks": [],
+        "types": [
+          "creation",
+          "deletion",
+          "non_fast_forward",
+          "pull_request",
+          "update"
+        ]
+      },
+      "classic_protection": {
+        "contexts": [],
+        "protected": true
+      }
+    },
+    {
+      "repo": "kubernetes/kubernetes",
+      "group": "flagship",
+      "default_branch": "master",
+      "stars": 128965,
+      "workflows": {
+        "count": 0,
+        "with_top_level_permissions": 0,
+        "with_any_permissions": 0,
+        "with_cancel_in_progress": 0,
+        "action_refs": 0,
+        "action_refs_sha_pinned": 0,
+        "checkouts": 0,
+        "persist_credentials_false": 0,
+        "merge_group_trigger": false,
+        "aggregating_job": false,
+        "workflow_lint": null,
+        "lockfile": false,
+        "agent_in_ci": [],
+        "housekeeping": []
+      },
+      "files": {
+        "hook_framework": null,
+        "dependency_bot": null,
+        "release_cooldown": false,
+        "bot_automerge": false,
+        "pr_template": ".github/PULL_REQUEST_TEMPLATE.md",
+        "pr_template_headings": [
+          "What type of PR is this?",
+          "What this PR does / why we need it",
+          "Which issue(s) this PR is related to",
+          "Special notes for your reviewer",
+          "Does this PR introduce a user-facing change?",
+          "AI usage disclosure"
+        ],
+        "codeowners": false,
+        "agents_md": true,
+        "claude_md": false,
+        "copilot_instructions": false,
+        "ai_policy_file": false
+      },
+      "settings": {
+        "merge_commit": true,
+        "squash": true,
+        "rebase": false,
+        "auto_merge": false,
+        "delete_branch_on_merge": false
+      },
+      "history": {
+        "n": 100,
+        "merge_commit_pct": 54,
+        "via_pull_request_pct": 100,
+        "pr_suffix_pct": 1,
+        "conventional_pct": 0,
+        "ai_marker_pct": 0,
+        "ai_tools": [],
+        "signed_off_pct": 5
+      },
+      "pull_requests": {
+        "n": 55,
+        "human_authored": 55,
+        "bot_authored_pct": 0,
+        "bot_authors": [],
+        "approved_pct": 29,
+        "self_merged_pct": 0,
+        "auto_merge_pct": 0,
+        "merge_queue_pct": 0,
+        "merged_by": [
+          {
+            "login": "kubernetes-prow",
+            "n": 55
+          }
+        ],
+        "merged_by_bot_pct": 100,
+        "median_hours_to_merge": 72.9,
+        "median_lines_changed": 87,
+        "median_commits": 1
+      },
+      "branch_rules": {
+        "approvals": null,
+        "merge_methods": [],
+        "merge_queue": false,
+        "required_checks": [],
+        "types": []
+      },
+      "classic_protection": {
+        "contexts": [
+          "pull-kubernetes-verify",
+          "pull-kubernetes-integration",
+          "pull-kubernetes-typecheck",
+          "pull-kubernetes-dependencies",
+          "pull-kubernetes-e2e-kind",
+          "pull-kubernetes-conformance-kind-ga-only-parallel",
+          "pull-kubernetes-unit",
+          "pull-kubernetes-node-e2e-containerd",
+          "EasyCLA",
+          "pull-kubernetes-e2e-gce",
+          "pull-kubernetes-cmd"
+        ],
+        "protected": true
+      }
+    },
+    {
+      "repo": "vitejs/vite",
+      "group": "flagship",
+      "default_branch": "main",
+      "stars": 83899,
+      "workflows": {
+        "count": 13,
+        "with_top_level_permissions": 7,
+        "with_any_permissions": 13,
+        "with_cancel_in_progress": 2,
+        "action_refs": 33,
+        "action_refs_sha_pinned": 33,
+        "checkouts": 10,
+        "persist_credentials_false": 10,
+        "merge_group_trigger": false,
+        "aggregating_job": false,
+        "workflow_lint": "zizmor",
+        "lockfile": false,
+        "agent_in_ci": [],
+        "housekeeping": []
+      },
+      "files": {
+        "hook_framework": null,
+        "dependency_bot": "renovate",
+        "release_cooldown": true,
+        "bot_automerge": false,
+        "pr_template": ".github/PULL_REQUEST_TEMPLATE.md",
+        "pr_template_headings": [],
+        "codeowners": false,
+        "agents_md": false,
+        "claude_md": false,
+        "copilot_instructions": true,
+        "ai_policy_file": false
+      },
+      "settings": {
+        "merge_commit": false,
+        "squash": true,
+        "rebase": false,
+        "auto_merge": true,
+        "delete_branch_on_merge": true
+      },
+      "history": {
+        "n": 100,
+        "merge_commit_pct": 0,
+        "via_pull_request_pct": 100,
+        "pr_suffix_pct": 100,
+        "conventional_pct": 91,
+        "ai_marker_pct": 2,
+        "ai_tools": [
+          {
+            "tool": "claude",
+            "commits": 2
+          }
+        ],
+        "signed_off_pct": 1
+      },
+      "pull_requests": {
+        "n": 100,
+        "human_authored": 80,
+        "bot_authored_pct": 20,
+        "bot_authors": [
+          {
+            "login": "renovate",
+            "n": 10
+          },
+          {
+            "login": "github-actions",
+            "n": 9
+          },
+          {
+            "login": "dependabot",
+            "n": 1
+          }
+        ],
+        "approved_pct": 62,
+        "self_merged_pct": 51,
+        "auto_merge_pct": 0,
+        "merge_queue_pct": 0,
+        "merged_by": [
+          {
+            "login": "sapphi-red",
+            "n": 91
+          },
+          {
+            "login": "h-a-n-a",
+            "n": 8
+          },
+          {
+            "login": "bluwy",
+            "n": 1
+          }
+        ],
+        "merged_by_bot_pct": 0,
+        "median_hours_to_merge": 29.3,
+        "median_lines_changed": 38,
+        "median_commits": 1
+      },
+      "branch_rules": {
+        "approvals": 1,
+        "merge_methods": [
+          "rebase",
+          "squash"
+        ],
+        "merge_queue": false,
+        "required_checks": [
+          "Build & Test Passed or Skipped",
+          "Lint: node-26, ubuntu-latest",
+          "Semantic Pull Request"
+        ],
+        "types": [
+          "deletion",
+          "non_fast_forward",
+          "pull_request",
+          "required_status_checks"
+        ]
+      },
+      "classic_protection": {
+        "contexts": [],
+        "protected": true
+      }
+    },
+    {
+      "repo": "denoland/deno",
+      "group": "flagship",
+      "default_branch": "main",
+      "stars": 108940,
+      "workflows": {
+        "count": 11,
+        "with_top_level_permissions": 1,
+        "with_any_permissions": 3,
+        "with_cancel_in_progress": 3,
+        "action_refs": 363,
+        "action_refs_sha_pinned": 363,
+        "checkouts": 48,
+        "persist_credentials_false": 0,
+        "merge_group_trigger": false,
+        "aggregating_job": true,
+        "workflow_lint": null,
+        "lockfile": false,
+        "agent_in_ci": [],
+        "housekeeping": []
+      },
+      "files": {
+        "hook_framework": null,
+        "dependency_bot": null,
+        "release_cooldown": false,
+        "bot_automerge": false,
+        "pr_template": ".github/PULL_REQUEST_TEMPLATE.md",
+        "pr_template_headings": [],
+        "codeowners": false,
+        "agents_md": false,
+        "claude_md": true,
+        "copilot_instructions": true,
+        "ai_policy_file": false
+      },
+      "settings": {
+        "merge_commit": false,
+        "squash": true,
+        "rebase": false,
+        "auto_merge": true,
+        "delete_branch_on_merge": true
+      },
+      "history": {
+        "n": 100,
+        "merge_commit_pct": 0,
+        "via_pull_request_pct": 100,
+        "pr_suffix_pct": 99,
+        "conventional_pct": 100,
+        "ai_marker_pct": 0,
+        "ai_tools": [],
+        "signed_off_pct": 3
+      },
+      "pull_requests": {
+        "n": 100,
+        "human_authored": 99,
+        "bot_authored_pct": 1,
+        "bot_authors": [
+          {
+            "login": "dependabot",
+            "n": 1
+          }
+        ],
+        "approved_pct": 37,
+        "self_merged_pct": 60,
+        "auto_merge_pct": 0,
+        "merge_queue_pct": 0,
+        "merged_by": [
+          {
+            "login": "bartlomieju",
+            "n": 80
+          },
+          {
+            "login": "crowlKats",
+            "n": 13
+          },
+          {
+            "login": "nathanwhit",
+            "n": 4
+          }
+        ],
+        "merged_by_bot_pct": 0,
+        "median_hours_to_merge": 43,
+        "median_lines_changed": 132,
+        "median_commits": 2
+      },
+      "branch_rules": {
+        "approvals": null,
+        "merge_methods": [],
+        "merge_queue": false,
+        "required_checks": [],
+        "types": []
+      },
+      "classic_protection": {
+        "contexts": [
+          "ci status"
+        ],
+        "protected": true
+      }
+    },
+    {
+      "repo": "ghostty-org/ghostty",
+      "group": "flagship",
+      "default_branch": "main",
+      "stars": 63939,
+      "workflows": {
+        "count": 17,
+        "with_top_level_permissions": 0,
+        "with_any_permissions": 2,
+        "with_cancel_in_progress": 2,
+        "action_refs": 385,
+        "action_refs_sha_pinned": 379,
+        "checkouts": 94,
+        "persist_credentials_false": 0,
+        "merge_group_trigger": false,
+        "aggregating_job": true,
+        "workflow_lint": null,
+        "lockfile": false,
+        "agent_in_ci": [],
+        "housekeeping": []
+      },
+      "files": {
+        "hook_framework": null,
+        "dependency_bot": "dependabot",
+        "release_cooldown": false,
+        "bot_automerge": false,
+        "pr_template": null,
+        "pr_template_headings": [],
+        "codeowners": true,
+        "agents_md": true,
+        "claude_md": false,
+        "copilot_instructions": false,
+        "ai_policy_file": true
+      },
+      "settings": {
+        "merge_commit": true,
+        "squash": true,
+        "rebase": true,
+        "auto_merge": true,
+        "delete_branch_on_merge": true
+      },
+      "history": {
+        "n": 100,
+        "merge_commit_pct": 30,
+        "via_pull_request_pct": 100,
+        "pr_suffix_pct": 31,
+        "conventional_pct": 16,
+        "ai_marker_pct": 0,
+        "ai_tools": [],
+        "signed_off_pct": 3
+      },
+      "pull_requests": {
+        "n": 31,
+        "human_authored": 26,
+        "bot_authored_pct": 16,
+        "bot_authors": [
+          {
+            "login": "ghostty-vouch",
+            "n": 3
+          },
+          {
+            "login": "dependabot",
+            "n": 1
+          },
+          {
+            "login": "github-actions",
+            "n": 1
+          }
+        ],
+        "approved_pct": 50,
+        "self_merged_pct": 42,
+        "auto_merge_pct": 19,
+        "merge_queue_pct": 0,
+        "merged_by": [
+          {
+            "login": "mitchellh",
+            "n": 24
+          },
+          {
+            "login": "ghostty-vouch",
+            "n": 3
+          },
+          {
+            "login": "jcollie",
+            "n": 2
+          }
+        ],
+        "merged_by_bot_pct": 9,
+        "median_hours_to_merge": 2.1,
+        "median_lines_changed": 43,
+        "median_commits": 1
+      },
+      "branch_rules": {
+        "approvals": 1,
+        "merge_methods": [
+          "merge",
+          "rebase",
+          "squash"
+        ],
+        "merge_queue": false,
+        "required_checks": [
+          "Required Checks: Nix",
+          "Required Checks: Test"
+        ],
+        "types": [
+          "deletion",
+          "non_fast_forward",
+          "pull_request",
+          "required_status_checks"
+        ]
+      },
+      "classic_protection": {
+        "contexts": [],
+        "protected": true
+      }
+    },
+    {
+      "repo": "biomejs/biome",
+      "group": "flagship",
+      "default_branch": "main",
+      "stars": 26075,
+      "workflows": {
+        "count": 25,
+        "with_top_level_permissions": 7,
+        "with_any_permissions": 17,
+        "with_cancel_in_progress": 6,
+        "action_refs": 206,
+        "action_refs_sha_pinned": 206,
+        "checkouts": 67,
+        "persist_credentials_false": 18,
+        "merge_group_trigger": true,
+        "aggregating_job": false,
+        "workflow_lint": null,
+        "lockfile": false,
+        "agent_in_ci": [],
+        "housekeeping": [
+          "actions/labeler"
+        ]
+      },
+      "files": {
+        "hook_framework": null,
+        "dependency_bot": "renovate",
+        "release_cooldown": true,
+        "bot_automerge": false,
+        "pr_template": ".github/PULL_REQUEST_TEMPLATE.md",
+        "pr_template_headings": [
+          "Summary",
+          "Test Plan",
+          "Docs"
+        ],
+        "codeowners": true,
+        "agents_md": true,
+        "claude_md": false,
+        "copilot_instructions": false,
+        "ai_policy_file": false
+      },
+      "settings": {
+        "merge_commit": true,
+        "squash": true,
+        "rebase": false,
+        "auto_merge": true,
+        "delete_branch_on_merge": true
+      },
+      "history": {
+        "n": 100,
+        "merge_commit_pct": 0,
+        "via_pull_request_pct": 100,
+        "pr_suffix_pct": 100,
+        "conventional_pct": 100,
+        "ai_marker_pct": 8,
+        "ai_tools": [
+          {
+            "tool": "claude",
+            "commits": 8
+          }
+        ],
+        "signed_off_pct": 0
+      },
+      "pull_requests": {
+        "n": 100,
+        "human_authored": 88,
+        "bot_authored_pct": 12,
+        "bot_authors": [
+          {
+            "login": "renovate",
+            "n": 10
+          },
+          {
+            "login": "github-actions",
+            "n": 2
+          }
+        ],
+        "approved_pct": 43,
+        "self_merged_pct": 84,
+        "auto_merge_pct": 0,
+        "merge_queue_pct": 0,
+        "merged_by": [
+          {
+            "login": "dyc3",
+            "n": 65
+          },
+          {
+            "login": "ematipico",
+            "n": 23
+          },
+          {
+            "login": "siketyan",
+            "n": 7
+          }
+        ],
+        "merged_by_bot_pct": 0,
+        "median_hours_to_merge": 74.6,
+        "median_lines_changed": 911,
+        "median_commits": 1
+      },
+      "branch_rules": {
+        "approvals": null,
+        "merge_methods": [],
+        "merge_queue": false,
+        "required_checks": [],
+        "types": []
+      },
+      "classic_protection": {
+        "contexts": [],
+        "protected": true
+      }
+    }
+  ]
+}

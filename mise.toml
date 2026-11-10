@@ -1,0 +1,19 @@
+# Pinned toolchain (docs/adr/0008-toolchain.md).
+# `mise install` resolves these requests and records exact versions, download URLs and checksums in mise.lock.
+# `mise install --locked` installs exactly what mise.lock records. Commit mise.lock.
+# Syntax source: https://mise.jdx.dev/dev-tools/mise-lock.html
+
+[settings]
+lockfile = true
+
+[tools]
+python = "3.14"   # the pinned NautilusTrader release ships wheels for 3.13 and 3.14 only
+uv = "0.13.7"     # canon/upstreams.json: uv
+node = "24"       # runtime for `npx ccusage@20.0.48`
+gh = "latest"     # GitHub CLI; the exact version is fixed in mise.lock at first install
+
+# Quality tools that are not Python packages (docs/adr/0013-quality-gates.md). ruff and ty are Python
+# packages and live in pyproject.toml's dev group instead, as NautilusTrader has them.
+shellcheck = "0.11.0"   # canon/upstreams.json: shellcheck
+gitleaks = "8.30.1"     # canon/upstreams.json: gitleaks
+actionlint = "1.7.12"   # canon/upstreams.json: actionlint

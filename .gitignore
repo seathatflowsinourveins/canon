@@ -1,0 +1,29 @@
+# credentials never enter the repo (ADR 0009)
+.env
+.env.*
+secrets/
+
+# local state written by the landscape watch hook
+.canon/
+
+# worktrees Claude Code creates for parallel sessions (https://code.claude.com/docs/en/worktrees.md)
+.claude/worktrees/
+
+# personal Claude Code overrides
+.claude/settings.local.json
+CLAUDE.local.md
+
+# local market data: the ParquetDataCatalog lives in catalog/ and is never committed
+catalog/*
+!catalog/README.md
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+dist/
+
+# macOS
+.DS_Store

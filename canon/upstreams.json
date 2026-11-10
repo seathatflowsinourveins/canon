@@ -1,0 +1,471 @@
+{
+  "schema": 1,
+  "about": "The canon: every upstream this repo is allowed to build on. Repos are pinned to a commit in upstreams.lock.json by `scripts/canon resolve`. Roles: foundation (we build on it), platform (we run on it), standard (we conform to it), tool (we run it), source (we install content from it), reference (we read it, never install it blind), watch (not adopted; tracked for convergence).",
+  "upstreams": [
+    {
+      "id": "claude-code",
+      "field": "agent-harness",
+      "repo": "anthropics/claude-code",
+      "track": "tag:v2.1.321",
+      "role": "platform",
+      "license": "UNVERIFIED (LICENSE.md not read)",
+      "why": "The agent harness itself; its docs define every config layer this repo uses.",
+      "evidence": [
+        "https://github.com/anthropics/claude-code/releases",
+        "https://code.claude.com/docs/en/memory"
+      ],
+      "adr": "0003"
+    },
+    {
+      "id": "claude-agent-sdk-python",
+      "field": "agent-harness",
+      "repo": "anthropics/claude-agent-sdk-python",
+      "track": "tag:v0.2.180",
+      "role": "foundation",
+      "license": "MIT",
+      "why": "Official library form of the Claude Code harness for headless runtime workers.",
+      "evidence": [
+        "https://github.com/anthropics/claude-agent-sdk-python"
+      ],
+      "adr": "0003"
+    },
+    {
+      "id": "anthropics-skills",
+      "field": "agent-harness",
+      "repo": "anthropics/skills",
+      "track": "default",
+      "role": "reference",
+      "license": "Mixed; Apache-2.0 on many skills",
+      "why": "Anthropic's example skills, skill template and spec; README labels them demonstration quality.",
+      "evidence": [
+        "https://github.com/anthropics/skills"
+      ],
+      "adr": "0003"
+    },
+    {
+      "id": "agentskills-spec",
+      "field": "agent-harness",
+      "repo": "agentskills/agentskills",
+      "track": "default",
+      "role": "standard",
+      "license": "UNVERIFIED",
+      "why": "The open Agent Skills (SKILL.md) standard adopted across agent clients.",
+      "evidence": [
+        "https://agentskills.io"
+      ],
+      "adr": "0003"
+    },
+    {
+      "id": "agents-md",
+      "field": "agent-harness",
+      "repo": "agentsmd/agents.md",
+      "track": "default",
+      "role": "standard",
+      "license": "UNVERIFIED",
+      "why": "Cross-tool agent instruction file, stewarded by the Agentic AI Foundation (Linux Foundation); Claude Code reads it via import.",
+      "evidence": [
+        "https://agents.md",
+        "https://code.claude.com/docs/en/memory"
+      ],
+      "adr": "0003"
+    },
+    {
+      "id": "claude-plugins-official",
+      "field": "agent-extensions",
+      "repo": "anthropics/claude-plugins-official",
+      "track": "default",
+      "role": "reference",
+      "license": "Apache-2.0",
+      "why": "Anthropic's plugin marketplace. Nothing is installed from it. It cannot be pinned as a whole, serves one SHA per plugin that Anthropic chooses, and auto-updates by default (ADR 0004).",
+      "evidence": [
+        "https://github.com/anthropics/claude-plugins-official"
+      ],
+      "adr": "0004"
+    },
+    {
+      "id": "superpowers",
+      "field": "agent-extensions",
+      "repo": "obra/superpowers",
+      "track": "tag:v7.0.2",
+      "role": "reference",
+      "license": "MIT",
+      "why": "Most-adopted community skills/workflow collection; listed in Anthropic's official marketplace. Read for patterns; not enabled without review.",
+      "evidence": [
+        "https://github.com/obra/superpowers"
+      ],
+      "adr": "0004"
+    },
+    {
+      "id": "spec-kit",
+      "field": "agent-extensions",
+      "repo": "github/spec-kit",
+      "track": "tag:v1.3.3",
+      "role": "watch",
+      "license": "MIT",
+      "why": "Leading spec-driven workflow by adoption, but the field has not converged (Spec Kit vs BMAD vs Superpowers).",
+      "evidence": [
+        "https://github.com/github/spec-kit",
+        "https://github.com/bmad-code-org/BMAD-METHOD"
+      ],
+      "adr": "0004"
+    },
+    {
+      "id": "madr",
+      "field": "decision-records",
+      "repo": "adr/madr",
+      "track": "tag:4.0.0",
+      "role": "standard",
+      "license": "MIT OR CC0-1.0",
+      "why": "De facto ADR format; 4.0.0 is the current release.",
+      "evidence": [
+        "https://adr.github.io/madr/",
+        "https://github.com/adr/madr/releases"
+      ],
+      "adr": "0002"
+    },
+    {
+      "id": "ossf-scorecard",
+      "field": "supply-chain",
+      "repo": "ossf/scorecard",
+      "track": "default",
+      "role": "standard",
+      "license": "Apache-2.0",
+      "why": "Defines the Pinned-Dependencies and Dependency-Update-Tool checks this repo's pinning rule follows.",
+      "evidence": [
+        "https://github.com/ossf/scorecard",
+        "https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions"
+      ],
+      "adr": "0001"
+    },
+    {
+      "id": "claude-code-monitoring-guide",
+      "field": "observability",
+      "repo": "anthropics/claude-code-monitoring-guide",
+      "track": "default",
+      "role": "reference",
+      "license": "UNVERIFIED (no licence file seen)",
+      "why": "Anthropic's reference OpenTelemetry collector + Prometheus + Grafana setup for Claude Code telemetry.",
+      "evidence": [
+        "https://github.com/anthropics/claude-code-monitoring-guide",
+        "https://code.claude.com/docs/en/monitoring-usage"
+      ],
+      "adr": "0007"
+    },
+    {
+      "id": "ccusage",
+      "field": "observability",
+      "repo": "ryoppippi/ccusage",
+      "track": "tag:v20.0.48",
+      "role": "tool",
+      "license": "MIT",
+      "why": "Most-adopted local token/cost reporter; reads Claude Code's own session logs, no backend needed.",
+      "evidence": [
+        "https://github.com/ryoppippi/ccusage"
+      ],
+      "adr": "0007"
+    },
+    {
+      "id": "mise",
+      "field": "toolchain",
+      "repo": "jdx/mise",
+      "track": "tag:v2026.11.5",
+      "role": "tool",
+      "license": "MIT",
+      "why": "Pinned, lockfile-backed tool versions installable without sudo.",
+      "evidence": [
+        "https://mise.jdx.dev/installing-mise.html",
+        "https://mise.jdx.dev/dev-tools/"
+      ],
+      "adr": "0008"
+    },
+    {
+      "id": "uv",
+      "field": "toolchain",
+      "repo": "astral-sh/uv",
+      "track": "tag:0.13.7",
+      "role": "tool",
+      "license": "Apache-2.0 OR MIT",
+      "why": "Python project/venv manager; the install path NautilusTrader itself recommends.",
+      "evidence": [
+        "https://docs.astral.sh/uv/getting-started/installation/",
+        "https://github.com/nautechsystems/nautilus_trader"
+      ],
+      "adr": "0008",
+      "mise": "uv"
+    },
+    {
+      "id": "nautilus-trader",
+      "field": "trading-runtime",
+      "repo": "nautechsystems/nautilus_trader",
+      "track": "tag:v2.0.0rc8",
+      "role": "foundation",
+      "license": "LGPL-3.0",
+      "why": "Backtest + live engine sharing one strategy codebase. v2 is the line upstream docs describe; still a release candidate.",
+      "evidence": [
+        "https://github.com/nautechsystems/nautilus_trader/releases",
+        "https://nautilustrader.io/docs/latest/concepts/live/",
+        "https://nautilustrader.io/docs/latest/concepts/backtesting/"
+      ],
+      "adr": "0009",
+      "pypi": "nautilus-trader"
+    },
+    {
+      "id": "nautilus-trader-v1",
+      "field": "trading-runtime",
+      "repo": "nautechsystems/nautilus_trader",
+      "track": "tag:v1.231.0",
+      "line": "v1.",
+      "role": "reference",
+      "license": "LGPL-3.0",
+      "why": "Last stable v1 release; v1 now receives critical security backports only (branch develop_v1). Fallback if v2 stable slips.",
+      "evidence": [
+        "https://github.com/nautechsystems/nautilus_trader/releases",
+        "https://github.com/nautechsystems/nautilus_trader"
+      ],
+      "adr": "0009"
+    },
+    {
+      "id": "alpaca-py",
+      "field": "trading-venue",
+      "repo": "alpacahq/alpaca-py",
+      "track": "tag:v0.45.0",
+      "role": "foundation",
+      "license": "Apache-2.0",
+      "why": "Alpaca's official Python SDK; the older alpaca-trade-api-python was archived on 2026-06-17.",
+      "evidence": [
+        "https://github.com/alpacahq/alpaca-py",
+        "https://github.com/alpacahq/alpaca-trade-api-python",
+        "https://docs.alpaca.markets/us/docs/sdks-and-tools.md"
+      ],
+      "adr": "0009",
+      "pypi": "alpaca-py"
+    },
+    {
+      "id": "alpaca-mcp-server",
+      "field": "trading-venue",
+      "repo": "alpacahq/alpaca-mcp-server",
+      "track": "tag:v2.4.1",
+      "role": "watch",
+      "license": "MIT",
+      "why": "Alpaca's official MCP server (v2 is a full rewrite). Not enabled: it selects live trading from one environment variable and its default toolset includes close-all and cancel-all.",
+      "evidence": [
+        "https://github.com/alpacahq/alpaca-mcp-server",
+        "https://docs.alpaca.markets/us/docs/trading-api-mcp.md"
+      ],
+      "adr": "0009"
+    },
+    {
+      "id": "alpaca-skills",
+      "field": "trading-venue",
+      "repo": "alpacahq/alpaca-skills",
+      "track": "default",
+      "role": "reference",
+      "license": "Apache-2.0",
+      "why": "Alpaca's official SKILL.md set. The four trading skills were read at this commit and none is enabled: unpinned installs, live switches by environment variable, safeguards that are instructions only (ADR 0004).",
+      "evidence": [
+        "https://github.com/alpacahq/alpaca-skills"
+      ],
+      "adr": "0009"
+    },
+    {
+      "id": "alpaca-agentic",
+      "field": "trading-venue",
+      "repo": "alpacahq/agentic",
+      "track": "default",
+      "role": "reference",
+      "license": "MIT",
+      "why": "Alpaca's official plugin marketplace for Claude Code, Cursor and Codex. Contents not read; not enabled.",
+      "evidence": [
+        "https://github.com/alpacahq/agentic"
+      ],
+      "adr": "0009"
+    },
+    {
+      "id": "alpaca-cli",
+      "field": "trading-venue",
+      "repo": "alpacahq/cli",
+      "track": "tag:v0.0.15",
+      "role": "watch",
+      "license": "Apache-2.0",
+      "why": "Official Go CLI for the Trading API, labelled Alpha Preview upstream; not adopted until it leaves alpha.",
+      "evidence": [
+        "https://github.com/alpacahq/cli",
+        "https://docs.alpaca.markets/us/docs/alpacas-cli.md"
+      ],
+      "adr": "0009"
+    },
+    {
+      "id": "nautilus-alpaca-jssyxd",
+      "field": "trading-venue",
+      "repo": "jssyxd/nautilus-alpaca",
+      "track": "default",
+      "role": "watch",
+      "license": "LGPL-3.0",
+      "why": "Community Alpaca adapter for NautilusTrader: 0 stars, no releases, unreviewed. Reference only.",
+      "evidence": [
+        "https://github.com/jssyxd/nautilus-alpaca",
+        "https://github.com/nautechsystems/nautilus_trader/issues/3374"
+      ],
+      "adr": "0009"
+    },
+    {
+      "id": "nautilus-alpaca-gmatrunich",
+      "field": "trading-venue",
+      "repo": "gmatrunich/nautilus-alpaca",
+      "track": "default",
+      "role": "watch",
+      "license": "Apache-2.0",
+      "why": "Community Alpaca adapter for NautilusTrader: 0 stars, self-described alpha, unreviewed. Reference only.",
+      "evidence": [
+        "https://github.com/gmatrunich/nautilus-alpaca",
+        "https://github.com/nautechsystems/nautilus_trader/issues/3374"
+      ],
+      "adr": "0009"
+    },
+    {
+      "id": "pytest",
+      "field": "testing",
+      "repo": "pytest-dev/pytest",
+      "track": "tag:9.2.0",
+      "role": "tool",
+      "license": "MIT",
+      "why": "Test runner. NautilusTrader's own testing guide prescribes pytest free functions and fixtures, and pytest's docs define the tests layout this repo uses.",
+      "evidence": [
+        "https://nautilustrader.io/docs/md/latest/developer_guide/testing.md",
+        "https://docs.pytest.org/en/stable/explanation/goodpractices.html"
+      ],
+      "adr": "0012",
+      "pypi": "pytest"
+    },
+    {
+      "id": "ruff",
+      "field": "quality",
+      "repo": "astral-sh/ruff",
+      "track": "tag:0.17.4",
+      "role": "tool",
+      "license": "MIT",
+      "why": "Python linter and formatter. NautilusTrader lints and formats with it, so adapter code matches upstream style.",
+      "evidence": [
+        "https://raw.githubusercontent.com/nautechsystems/nautilus_trader/develop/python/pyproject.toml",
+        "https://github.com/astral-sh/ruff/releases",
+        "https://docs.astral.sh/ruff/configuration/"
+      ],
+      "adr": "0013",
+      "pypi": "ruff"
+    },
+    {
+      "id": "ty",
+      "field": "quality",
+      "repo": "astral-sh/ty",
+      "track": "tag:0.0.100",
+      "role": "tool",
+      "license": "MIT",
+      "why": "Type checker. Beta upstream (0.0.x, no stable API) and the field is contested; chosen because it is the one type checker NautilusTrader runs at all, though only on its examples, and held to an exact pin.",
+      "evidence": [
+        "https://raw.githubusercontent.com/nautechsystems/nautilus_trader/develop/.pre-commit-config.yaml",
+        "https://github.com/astral-sh/ty",
+        "https://typing.python.org/en/latest/"
+      ],
+      "adr": "0013",
+      "pypi": "ty"
+    },
+    {
+      "id": "shellcheck",
+      "field": "quality",
+      "repo": "koalaman/shellcheck",
+      "track": "tag:v0.11.0",
+      "role": "tool",
+      "license": "GPL-3.0 (run as a tool, not linked)",
+      "why": "Static analysis for the shell scripts and hooks, which are most of this repo's own code and run machine-wide.",
+      "evidence": [
+        "https://raw.githubusercontent.com/nautechsystems/nautilus_trader/develop/.pre-commit-config.yaml"
+      ],
+      "adr": "0013",
+      "mise": "shellcheck"
+    },
+    {
+      "id": "gitleaks",
+      "field": "quality",
+      "repo": "gitleaks/gitleaks",
+      "track": "tag:v8.30.1",
+      "role": "tool",
+      "license": "MIT",
+      "why": "Secret scanner. A trading repo handles API keys; nothing with a credential may reach a commit.",
+      "evidence": [
+        "https://raw.githubusercontent.com/nautechsystems/nautilus_trader/develop/.pre-commit-config.yaml"
+      ],
+      "adr": "0013",
+      "mise": "gitleaks"
+    },
+    {
+      "id": "actionlint",
+      "field": "ci",
+      "repo": "rhysd/actionlint",
+      "track": "tag:v1.7.12",
+      "role": "tool",
+      "license": "MIT",
+      "why": "Checks GitHub Actions workflow files locally, which is the only check a workflow can get before the repo has a remote.",
+      "evidence": [
+        "https://raw.githubusercontent.com/nautechsystems/nautilus_trader/develop/.pre-commit-config.yaml"
+      ],
+      "adr": "0013",
+      "mise": "actionlint"
+    },
+    {
+      "id": "actions-checkout",
+      "field": "ci",
+      "repo": "actions/checkout",
+      "track": "tag:v7.0.1",
+      "role": "tool",
+      "license": "MIT",
+      "why": "Checks the repo out in CI. Referenced in the workflow by commit SHA.",
+      "evidence": [
+        "https://docs.astral.sh/uv/guides/integration/github/",
+        "https://docs.github.com/en/actions/security-for-github-actions/security-guides/security-hardening-for-github-actions"
+      ],
+      "adr": "0013"
+    },
+    {
+      "id": "mise-action",
+      "field": "ci",
+      "repo": "jdx/mise-action",
+      "track": "tag:v5.2.7",
+      "role": "tool",
+      "license": "MIT",
+      "why": "Installs in CI exactly the tools mise.lock records, so CI and this Mac run the same versions. Referenced in the workflow by commit SHA.",
+      "evidence": [
+        "https://mise.jdx.dev/continuous-integration.html",
+        "https://github.com/jdx/mise-action"
+      ],
+      "adr": "0013"
+    },
+    {
+      "id": "gh-signoff",
+      "field": "ci",
+      "repo": "basecamp/gh-signoff",
+      "track": "tag:v0.4.1",
+      "role": "reference",
+      "license": "MIT",
+      "why": "37signals' local-CI practice: run the checks on your own machine and mark the commit green with a `signoff` status. scripts/land follows the convention; the tool itself is not installed.",
+      "evidence": [
+        "https://raw.githubusercontent.com/basecamp/gh-signoff/main/README.md"
+      ],
+      "adr": "0014"
+    },
+    {
+      "id": "dependabot",
+      "field": "ci",
+      "repo": "dependabot/dependabot-core",
+      "track": "branch:main",
+      "role": "platform",
+      "license": "MIT",
+      "why": "GitHub's own dependency update service. It reads .github/dependabot.yml and opens pull requests for the indirect packages in uv.lock and for the workflow's actions. GitHub runs it at a version this repo cannot choose, so the pin records the source that was read, not a release.",
+      "evidence": [
+        "https://docs.github.com/en/code-security/dependabot/working-with-dependabot/dependabot-options-reference",
+        "https://docs.github.com/en/code-security/concepts/supply-chain-security/dependabot-on-actions",
+        "https://raw.githubusercontent.com/dependabot/dependabot-core/main/LICENSE"
+      ],
+      "adr": "0016"
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+# pytest configuration for the whole workspace.
+# Source: https://docs.pytest.org/en/stable/explanation/goodpractices.html
+#   - tests live outside application code, beside each package's src/
+#   - new projects use the importlib import mode, so test files in different packages may share a name
+[pytest]
+addopts = ["--import-mode=importlib"]
+testpaths = ["tests", "packages"]

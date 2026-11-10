@@ -1,0 +1,11 @@
+#!/bin/bash
+# git pre-commit hook. Contract: githooks(5) — a non-zero exit aborts the commit.
+# Enabled per clone with `git config core.hooksPath .githooks` (scripts/automation install does this).
+#
+# Runs scripts/ci, the same script CI runs, with the secret scan limited to what is staged. About five
+# seconds, offline. `git commit --no-verify` would skip it; .claude/hooks/guard.sh refuses that for agents.
+root=$(git rev-parse --show-toplevel) || exit 1
+if ! "$root/scripts/ci" --staged; then
+  echo "pre-commit: commit aborted. Fix what failed above."
+  exit 1
+fi

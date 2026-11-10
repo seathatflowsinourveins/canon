@@ -1,0 +1,184 @@
+{
+  "schema": 1,
+  "decided_by": "docs/adr/0005-model-routing.md",
+  "read_at": "2026-11-09",
+  "review_by": "2026-12-09",
+  "lanes": [
+    {
+      "lane": "orchestrator",
+      "use_for": "cross-lane planning, ADR decisions, long-horizon work",
+      "alias": "fable",
+      "model": "claude-fable-5-2",
+      "effort": "high"
+    },
+    {
+      "lane": "build",
+      "use_for": "implementing against a clear plan",
+      "alias": "opus",
+      "model": "claude-opus-5-5",
+      "effort": "medium",
+      "raise_to": "high"
+    },
+    {
+      "lane": "bulk-worker",
+      "use_for": "well-specified sub-tasks run in parallel",
+      "alias": "sonnet",
+      "model": "claude-sonnet-5-5",
+      "effort": "medium"
+    },
+    {
+      "lane": "scout",
+      "use_for": "read-heavy scouting and web research",
+      "alias": "sonnet",
+      "model": "claude-sonnet-5-5",
+      "effort": "default"
+    },
+    {
+      "lane": "mechanical",
+      "use_for": "checkable sub-tasks and high-volume runtime work; Batch API when unattended",
+      "alias": "haiku",
+      "model": "claude-haiku-5-5",
+      "effort": "default"
+    },
+    {
+      "lane": "verifier",
+      "use_for": "evidence verification and review",
+      "alias": "opus",
+      "model": "claude-opus-5-5",
+      "effort": "high"
+    }
+  ],
+  "prices_usd_per_mtok": {
+    "source": "https://platform.claude.com/docs/en/about-claude/models/overview.md",
+    "claude-fable-5-2": {
+      "input": 8.0,
+      "output": 40.0,
+      "cache_read_fraction_of_input": 0.025
+    },
+    "claude-opus-5-5": {
+      "input": 4.0,
+      "output": 20.0,
+      "cache_read_fraction_of_input": 0.05
+    },
+    "claude-sonnet-5-5": {
+      "input": 2.0,
+      "output": 10.0,
+      "cache_read_fraction_of_input": 0.05
+    },
+    "claude-haiku-5-5": {
+      "input": 0.1,
+      "output": 0.5,
+      "cache_read_fraction_of_input": 0.1,
+      "note": "prices are 'from'; above 100K-token prompts it is $0.50/$2.50 (https://platform.claude.com/docs/en/about-claude/pricing)"
+    }
+  },
+  "landscape_snapshot": {
+    "source": "https://artificialanalysis.ai/leaderboards/models",
+    "index": "Artificial Analysis Intelligence Index v5.0.1",
+    "caveat": "Cost is USD per benchmark task, not per token. Every row was re-checked against the page by a second reader on 2026-11-09. The index version label comes from the site's methodology pages.",
+    "rows": [
+      {
+        "model": "Claude Fable 5.2",
+        "effort": "max",
+        "index": 65,
+        "cost_per_task": 26.54
+      },
+      {
+        "model": "Claude Fable 5.2",
+        "effort": "high",
+        "index": 62,
+        "cost_per_task": 9.08
+      },
+      {
+        "model": "Gemini 4 Carbon",
+        "effort": "high",
+        "index": 60,
+        "cost_per_task": 7.76
+      },
+      {
+        "model": "Claude Opus 5.5",
+        "effort": "max",
+        "index": 59,
+        "cost_per_task": 10.04
+      },
+      {
+        "model": "Claude Opus 5.5",
+        "effort": "xhigh",
+        "index": 57,
+        "cost_per_task": 6.05
+      },
+      {
+        "model": "GPT-6 Astra",
+        "effort": "max",
+        "index": 57,
+        "cost_per_task": 6.24
+      },
+      {
+        "model": "Claude Fable 5.2",
+        "effort": "medium",
+        "index": 56,
+        "cost_per_task": 3.80
+      },
+      {
+        "model": "GPT-6.1 Sol",
+        "effort": "max",
+        "index": 55,
+        "cost_per_task": 1.27
+      },
+      {
+        "model": "Claude Sonnet 5.5",
+        "effort": "max",
+        "index": 55,
+        "cost_per_task": 10.02
+      },
+      {
+        "model": "Claude Fable 5.2",
+        "effort": "low",
+        "index": 54,
+        "cost_per_task": 3.10
+      },
+      {
+        "model": "Claude Opus 5.5",
+        "effort": "high",
+        "index": 52,
+        "cost_per_task": 3.46
+      },
+      {
+        "model": "GPT-6.1 Sol",
+        "effort": "xhigh",
+        "index": 52,
+        "cost_per_task": 0.76
+      },
+      {
+        "model": "Claude Opus 5.5",
+        "effort": "medium",
+        "index": 48,
+        "cost_per_task": 2.45
+      },
+      {
+        "model": "Kimi K3.1 Pro",
+        "effort": null,
+        "index": 46,
+        "cost_per_task": 3.68,
+        "open_weights": true
+      },
+      {
+        "model": "Claude Haiku 5.5",
+        "effort": "max",
+        "index": 36,
+        "cost_per_task": 0.41
+      }
+    ]
+  },
+  "not_adopted": [
+    {
+      "what": "advisor pairings",
+      "why": "for the current-generation pairs measured the gain was at the edge of noise or negative at about twice the cost; a weak executor can gain a lot, but no lane here is one"
+    },
+    {
+      "what": "second model provider for runtime workers",
+      "why": "no eval on our own tasks yet; adds a second SDK, cache namespace and failure modes"
+    }
+  ],
+  "aliases_valid_on": "Anthropic API; other providers resolve the aliases to older models"
+}

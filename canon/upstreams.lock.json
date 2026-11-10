@@ -1,0 +1,303 @@
+{
+  "pins": {
+    "actionlint": {
+      "default_branch": "main",
+      "default_sha": "011a6d15e749bb3f2d771eed9c7aa0e7e3e10ee7",
+      "ref": "refs/tags/v1.7.12",
+      "repo": "rhysd/actionlint",
+      "resolved_at": "2026-11-10T01:48:44Z",
+      "sha": "914e7df21a07ef503a81201c76d2b11c789d3fca",
+      "track": "tag:v1.7.12"
+    },
+    "actions-checkout": {
+      "default_branch": "main",
+      "default_sha": "f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a",
+      "ref": "refs/tags/v7.0.1",
+      "repo": "actions/checkout",
+      "resolved_at": "2026-11-10T01:48:44Z",
+      "sha": "3d3c42e5aac5ba805825da76410c181273ba90b1",
+      "track": "tag:v7.0.1"
+    },
+    "agents-md": {
+      "default_branch": "main",
+      "default_sha": "d001185d792eb6402a58e4cbef1c228b309ec25d",
+      "ref": "refs/heads/main",
+      "repo": "agentsmd/agents.md",
+      "resolved_at": "2026-11-10T00:34:46Z",
+      "sha": "d001185d792eb6402a58e4cbef1c228b309ec25d",
+      "track": "default"
+    },
+    "agentskills-spec": {
+      "default_branch": "main",
+      "default_sha": "83021e2be457a9b6679148719c1f6074f0ad975e",
+      "ref": "refs/heads/main",
+      "repo": "agentskills/agentskills",
+      "resolved_at": "2026-11-10T00:34:46Z",
+      "sha": "83021e2be457a9b6679148719c1f6074f0ad975e",
+      "track": "default"
+    },
+    "alpaca-agentic": {
+      "default_branch": "main",
+      "default_sha": "4dd2720ea1985df0dbb8cdac5b499eb1ed834c6a",
+      "ref": "refs/heads/main",
+      "repo": "alpacahq/agentic",
+      "resolved_at": "2026-11-10T00:34:46Z",
+      "sha": "4dd2720ea1985df0dbb8cdac5b499eb1ed834c6a",
+      "track": "default"
+    },
+    "alpaca-cli": {
+      "default_branch": "main",
+      "default_sha": "4f83692cd24e7fc043ec05c7255d3f23108d4c3e",
+      "ref": "refs/tags/v0.0.15",
+      "repo": "alpacahq/cli",
+      "resolved_at": "2026-11-10T00:34:46Z",
+      "sha": "4f83692cd24e7fc043ec05c7255d3f23108d4c3e",
+      "track": "tag:v0.0.15"
+    },
+    "alpaca-mcp-server": {
+      "default_branch": "main",
+      "default_sha": "63cc4278d87b31f3ed4efcfaa55624095c6d7be8",
+      "ref": "refs/tags/v2.4.1",
+      "repo": "alpacahq/alpaca-mcp-server",
+      "resolved_at": "2026-11-10T00:34:46Z",
+      "sha": "63cc4278d87b31f3ed4efcfaa55624095c6d7be8",
+      "track": "tag:v2.4.1"
+    },
+    "alpaca-py": {
+      "default_branch": "master",
+      "default_sha": "143ba85c599b5c9572051945dc26261ef103c8ae",
+      "ref": "refs/tags/v0.45.0",
+      "repo": "alpacahq/alpaca-py",
+      "resolved_at": "2026-11-10T00:34:46Z",
+      "sha": "c42add7c0a7026e2ead3ed64e76f4def2b99fda4",
+      "track": "tag:v0.45.0"
+    },
+    "alpaca-skills": {
+      "default_branch": "main",
+      "default_sha": "0e7c35163ae462730de1f4a0bfafceac82b7d59b",
+      "ref": "refs/heads/main",
+      "repo": "alpacahq/alpaca-skills",
+      "resolved_at": "2026-11-10T00:34:46Z",
+      "sha": "0e7c35163ae462730de1f4a0bfafceac82b7d59b",
+      "track": "default"
+    },
+    "anthropics-skills": {
+      "default_branch": "main",
+      "default_sha": "2c5958ecac7cee2b583967a2c4981d0f4a75c579",
+      "ref": "refs/heads/main",
+      "repo": "anthropics/skills",
+      "resolved_at": "2026-11-10T00:34:46Z",
+      "sha": "2c5958ecac7cee2b583967a2c4981d0f4a75c579",
+      "track": "default"
+    },
+    "ccusage": {
+      "default_branch": "main",
+      "default_sha": "c782234083efada49302b2421458b6f7b622ef43",
+      "ref": "refs/tags/v20.0.48",
+      "repo": "ryoppippi/ccusage",
+      "resolved_at": "2026-11-10T00:34:46Z",
+      "sha": "8995f3b7fd7110b8f37564f7d0468acc7a7d6b20",
+      "track": "tag:v20.0.48"
+    },
+    "claude-agent-sdk-python": {
+      "default_branch": "main",
+      "default_sha": "97102885fa5539f3d9459141807117477286dc8b",
+      "ref": "refs/tags/v0.2.180",
+      "repo": "anthropics/claude-agent-sdk-python",
+      "resolved_at": "2026-11-10T00:34:46Z",
+      "sha": "97102885fa5539f3d9459141807117477286dc8b",
+      "track": "tag:v0.2.180"
+    },
+    "claude-code": {
+      "default_branch": "main",
+      "default_sha": "e037be5b0d73edff583606435c9b539136ee76d5",
+      "ref": "refs/tags/v2.1.321",
+      "repo": "anthropics/claude-code",
+      "resolved_at": "2026-11-10T00:34:46Z",
+      "sha": "a4fcccc70a89df6607e66cc30682d551269d0680",
+      "track": "tag:v2.1.321"
+    },
+    "claude-code-monitoring-guide": {
+      "default_branch": "main",
+      "default_sha": "02777441f2a3fa38a187b57872ca9dc5e0411b48",
+      "ref": "refs/heads/main",
+      "repo": "anthropics/claude-code-monitoring-guide",
+      "resolved_at": "2026-11-10T00:34:46Z",
+      "sha": "02777441f2a3fa38a187b57872ca9dc5e0411b48",
+      "track": "default"
+    },
+    "claude-plugins-official": {
+      "default_branch": "main",
+      "default_sha": "ea686bae367e20a4092b2fd4327ffd299bb60f24",
+      "ref": "refs/heads/main",
+      "repo": "anthropics/claude-plugins-official",
+      "resolved_at": "2026-11-10T00:34:46Z",
+      "sha": "ea686bae367e20a4092b2fd4327ffd299bb60f24",
+      "track": "default"
+    },
+    "dependabot": {
+      "default_branch": "main",
+      "default_sha": "de277ef139da42a7953b888c70c69e4c625caf35",
+      "ref": "refs/heads/main",
+      "repo": "dependabot/dependabot-core",
+      "resolved_at": "2026-11-10T03:33:43Z",
+      "sha": "de277ef139da42a7953b888c70c69e4c625caf35",
+      "track": "branch:main"
+    },
+    "gh-signoff": {
+      "default_branch": "main",
+      "default_sha": "02e0cf9c11c9a1587784fec17c07b93fcb22ec24",
+      "ref": "refs/tags/v0.4.1",
+      "repo": "basecamp/gh-signoff",
+      "resolved_at": "2026-11-10T02:20:41Z",
+      "sha": "02e0cf9c11c9a1587784fec17c07b93fcb22ec24",
+      "track": "tag:v0.4.1"
+    },
+    "gitleaks": {
+      "default_branch": "master",
+      "default_sha": "5f6ec56cfa6f8c67648d863582c7ae2f206d5c1c",
+      "ref": "refs/tags/v8.30.1",
+      "repo": "gitleaks/gitleaks",
+      "resolved_at": "2026-11-10T01:48:44Z",
+      "sha": "83d9cd684c87d95d656c1458ef04895a7f1cbd8e",
+      "track": "tag:v8.30.1"
+    },
+    "madr": {
+      "default_branch": "develop",
+      "default_sha": "ba75bb1b20d42af5746b246ad348c202419ae681",
+      "ref": "refs/tags/4.0.0",
+      "repo": "adr/madr",
+      "resolved_at": "2026-11-10T00:34:46Z",
+      "sha": "2475fe1973f66a12aaf58a91d8fa7b42c0f5ea3d",
+      "track": "tag:4.0.0"
+    },
+    "mise": {
+      "default_branch": "main",
+      "default_sha": "3c22e49cf21cdc7b521511cab90b3c4a7ec91666",
+      "ref": "refs/tags/v2026.11.5",
+      "repo": "jdx/mise",
+      "resolved_at": "2026-11-10T00:34:46Z",
+      "sha": "32c96c4d51d3abe9af0c868eda63aabe77efddb0",
+      "track": "tag:v2026.11.5"
+    },
+    "mise-action": {
+      "default_branch": "main",
+      "default_sha": "72890a165a0745c24411e7a1b8477f956c4e8398",
+      "ref": "refs/tags/v5.2.7",
+      "repo": "jdx/mise-action",
+      "resolved_at": "2026-11-10T01:48:44Z",
+      "sha": "b44d12e7d0d8ee7461bb893e1b1993500433185b",
+      "track": "tag:v5.2.7"
+    },
+    "nautilus-alpaca-gmatrunich": {
+      "default_branch": "main",
+      "default_sha": "c899426ca2d67d3ee6a1775d165d4e3991264a72",
+      "ref": "refs/heads/main",
+      "repo": "gmatrunich/nautilus-alpaca",
+      "resolved_at": "2026-11-10T00:34:46Z",
+      "sha": "c899426ca2d67d3ee6a1775d165d4e3991264a72",
+      "track": "default"
+    },
+    "nautilus-alpaca-jssyxd": {
+      "default_branch": "main",
+      "default_sha": "50258a437689d9e4a75b77aa17d4d5db8a630dcc",
+      "ref": "refs/heads/main",
+      "repo": "jssyxd/nautilus-alpaca",
+      "resolved_at": "2026-11-10T00:34:46Z",
+      "sha": "50258a437689d9e4a75b77aa17d4d5db8a630dcc",
+      "track": "default"
+    },
+    "nautilus-trader": {
+      "default_branch": "develop",
+      "default_sha": "f47eb021fe46a8fec765f1ff7d0095a8b56d82c0",
+      "ref": "refs/tags/v2.0.0rc8",
+      "repo": "nautechsystems/nautilus_trader",
+      "resolved_at": "2026-11-10T00:34:46Z",
+      "sha": "d53849b216e20f2c122ca01b4dd0da377638b186",
+      "track": "tag:v2.0.0rc8"
+    },
+    "nautilus-trader-v1": {
+      "default_branch": "develop",
+      "default_sha": "f47eb021fe46a8fec765f1ff7d0095a8b56d82c0",
+      "ref": "refs/tags/v1.231.0",
+      "repo": "nautechsystems/nautilus_trader",
+      "resolved_at": "2026-11-10T00:34:46Z",
+      "sha": "27a8e54e7ac3c57d6cbf8891f0283dfbaee97317",
+      "track": "tag:v1.231.0"
+    },
+    "ossf-scorecard": {
+      "default_branch": "main",
+      "default_sha": "5a951604a5ff7d99b7222139ba522237c58228af",
+      "ref": "refs/heads/main",
+      "repo": "ossf/scorecard",
+      "resolved_at": "2026-11-10T00:34:46Z",
+      "sha": "5a951604a5ff7d99b7222139ba522237c58228af",
+      "track": "default"
+    },
+    "pytest": {
+      "default_branch": "main",
+      "default_sha": "e4378d56736ff3bbb317dd9d9de898419adf309d",
+      "ref": "refs/tags/9.2.0",
+      "repo": "pytest-dev/pytest",
+      "resolved_at": "2026-11-10T01:28:54Z",
+      "sha": "ae1d0ff57b8bd4252da9ade7353523ac0ac73281",
+      "track": "tag:9.2.0"
+    },
+    "ruff": {
+      "default_branch": "main",
+      "default_sha": "25c2129f4ef1f0048b36c329502f57ee64ba6f53",
+      "ref": "refs/tags/0.17.4",
+      "repo": "astral-sh/ruff",
+      "resolved_at": "2026-11-10T01:48:43Z",
+      "sha": "05cdc36a45a29e078c2af9358969d0f576408bef",
+      "track": "tag:0.17.4"
+    },
+    "shellcheck": {
+      "default_branch": "master",
+      "default_sha": "1046c00b61516a64f85a45e5fbdc69c6c1654eb5",
+      "ref": "refs/tags/v0.11.0",
+      "repo": "koalaman/shellcheck",
+      "resolved_at": "2026-11-10T01:48:44Z",
+      "sha": "aac0823e6b58f8a499e856e93738082691cbf212",
+      "track": "tag:v0.11.0"
+    },
+    "spec-kit": {
+      "default_branch": "main",
+      "default_sha": "0382d7a08d7d37b13f40cd3c385e40c394206113",
+      "ref": "refs/tags/v1.3.3",
+      "repo": "github/spec-kit",
+      "resolved_at": "2026-11-10T00:34:46Z",
+      "sha": "79cb423c37bb9394bab7a66063c27dfa80b72fba",
+      "track": "tag:v1.3.3"
+    },
+    "superpowers": {
+      "default_branch": "main",
+      "default_sha": "22f0b463e7a5e579904dd6211a520321035526f7",
+      "ref": "refs/tags/v7.0.2",
+      "repo": "obra/superpowers",
+      "resolved_at": "2026-11-10T00:34:46Z",
+      "sha": "22f0b463e7a5e579904dd6211a520321035526f7",
+      "track": "tag:v7.0.2"
+    },
+    "ty": {
+      "default_branch": "main",
+      "default_sha": "6c90fe0aff166318cf13fc18fd797f91a5d5d552",
+      "ref": "refs/tags/0.0.100",
+      "repo": "astral-sh/ty",
+      "resolved_at": "2026-11-10T01:48:44Z",
+      "sha": "6c90fe0aff166318cf13fc18fd797f91a5d5d552",
+      "track": "tag:0.0.100"
+    },
+    "uv": {
+      "default_branch": "main",
+      "default_sha": "e2b7d2e130265841e6a6423ce0236a479553d9c2",
+      "ref": "refs/tags/0.13.7",
+      "repo": "astral-sh/uv",
+      "resolved_at": "2026-11-10T00:34:46Z",
+      "sha": "316c827e058c16b71d5c507a20729c2995a7bcce",
+      "track": "tag:0.13.7"
+    }
+  },
+  "resolved_at": "2026-11-10T00:34:46Z",
+  "schema": 1
+}
