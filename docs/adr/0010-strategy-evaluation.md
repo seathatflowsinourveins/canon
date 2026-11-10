@@ -56,7 +56,7 @@ of trials.
 Who decided. Under the owner's delegation of 2026-11-10 (Evidence), the orchestrator chose the 0.95
 threshold, N as every trial in the ledger and the scope above; ADR 0031 holds the choice of skfolio. The
 probability of backtest overfitting (PBO) is a diagnostic outside this protocol: ADR 0027 holds it, and
-what each of the nine implementations that were read does.
+ADR 0032 what each of the nine implementations that were read does.
 
 Limits:
 

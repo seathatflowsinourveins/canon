@@ -29,6 +29,7 @@ code computes it?
 
 Proposed: **option 2**. The role is decided: a diagnostic. No PBO level passes or rejects a pick. The
 implementation is the open gap: nine were read and none is adopted, so a ranking report carries no PBO yet.
+ADR 0032 holds the nine, what each does, and what would close the gap.
 
 Why not a gate:
 
@@ -36,7 +37,8 @@ Why not a gate:
   backtest, scores 13%, and its pure-noise example 55% (§6). The rule would reject the valid one.
 * Its error bar, below 0.0045 for S = 16, is the formula for independent draws, applied to splits that
   share rows (§4). A high PBO can also arise among strategies that are all skilful (§5.2).
-* No package uses 0.05. Four flag above 0.5; ml4t-diagnostic labels bands at 0.10, 0.30 and 0.50.
+* No package uses 0.05 (ADR 0032's Evidence). Four flag above 0.5; ml4t-diagnostic labels bands at 0.10,
+  0.30 and 0.50.
 
 The statistic (Algorithm 2.3, §3.1). Take the T×N matrix of ADR 0010, step 2. Cut it into S = 16 equal row
 blocks. For each of the C(16,8) = 12,870 halvings, take the in-sample best and its out-of-sample rank r,
@@ -45,58 +47,26 @@ with N for the best; ω = r/(N+1), λ = ln(ω/(1−ω)), and PBO is the share of
 not say what to do with T mod S leftover rows or with tied ranks, and Definition 2.2 writes the boundary as
 strictly below the median where §3.1 integrates up to λ = 0.
 
-What each implementation does. "Unspecified" ties are ranked by `np.argsort`, whose default sort is not
-stable.
-
-| Package | Licence | Blocks when S does not divide T | Splits | Ties | Other |
-|---|---|---|---|---|---|
-| trialgate 0.6.0 | MIT | equal; drops the last rows, reports how many | all | against the pick | no dependencies; refuses non-finite input; returns no logits; declares Python 3.11–3.13 |
-| backtest-overfitting 1.1.1 | MIT | equal; drops the last rows silently | all | for the pick | numpy, scipy; one PyPI release |
-| RiskLabAI 3.2.0 | BSD-3-Clause | unequal | all | unspecified | 71 releases since 2022; declares Python 3.14; needs statsmodels, PyWavelets, joblib |
-| factor-qc 0.1.3 | MIT | unequal | all | for the pick | tolerates NaN: N can differ per split, and a split with no in-sample value is skipped |
-| cpz-quant 1.2.0 | Apache-2.0 | unequal | all | unspecified | an odd S becomes S+1; result rounded to 4 places |
-| alphaengine 2.0.3 | Apache-2.0 | unequal | all at its default S = 10; 2,000 of 12,870 at S = 16 unless asked | unspecified | result rounded to 4 places |
-| ml4t-diagnostic 0.2.0 | MIT | n/a | every halving of the caller's folds | unspecified | averages per-fold values instead of recomputing on joined rows; counts strictly below the median |
-| sharpebench 0.28.0 | MIT OR Apache-2.0 | unequal | all | against the pick | Rust; wheels for Linux x86-64 and Python 3.10–3.13 only |
-| pypbo `4d723f0` | AGPL-3.0 | equal; drops the first rows | all | average rank | not on PyPI, no tags; excluded by licence |
-
-Nothing is adopted, because the implementations have not converged and nothing waits on this:
-
-* The nine differ on leftover rows, ties, the split count and the boundary. No two were shown to agree.
-* **trialgate 0.6.0** is closest to the statistic as written above, but has one maintainer, five releases
-  since 2026-07-10, and does not declare Python 3.14.
-* **RiskLabAI 3.2.0** is the most established, in an organisation's repository. Its blocks are equal only
-  if the caller first trims T to a multiple of S, its tie order is unspecified, and it brings statsmodels
-  and PyWavelets for one function.
-* No adoption signal was verified for any of them. None is in the registry: an entry needs a resolved pin.
-
-What would close the gap, either of:
-
-* One candidate reproduces, in this repo's tests, a hand-computed S = 4 case and the §6 planted-signal
-  case: RiskLabAI with T trimmed, or trialgate once it declares Python 3.14 and has a longer history or
-  a second maintainer. It then goes through `adopt-upstream`.
-* The owner decides that Algorithm 2.3 is a documented contract we may implement (option 3). The same two
-  test cases apply, plus agreement with a read package on a shared matrix.
-
-Who decided. The role, and adopting nothing now, were chosen by the orchestrator on 2026-11-10 under the
-owner's delegation quoted in ADR 0010's Evidence.
+Who decided. The role was chosen by the orchestrator on 2026-11-10 under the owner's delegation quoted in
+ADR 0010's Evidence; ADR 0032 holds adopting nothing now.
 
 ### Consequences
 
-* Good: the role is settled, and the candidates are read at pinned source instead of listed from summaries.
+* Good: the role is settled.
 * Good: nothing waits on PBO. ADR 0010's protocol is complete without it.
-* Bad: a ranking report has no overfitting diagnostic until an implementation exists.
+* Bad: a ranking report has no overfitting diagnostic until an implementation exists (ADR 0032).
 
 ### Confirmation
 
-* No PBO package is in `pyproject.toml`, and none is imported.
-* When one is adopted, a test reproduces a hand-computed S = 4 case, and a ranking report states S and PBO
-  beside the DSR.
+* When an implementation is adopted, a ranking report states S and PBO beside the DSR.
+* What confirms that none is adopted yet, and the test an adoption needs, are in ADR 0032.
 
 ## Evidence
 
-Read 2026-11-10. Fetched means read in this session as raw text or source. No package below was installed
-or run.
+Read 2026-11-10. Fetched means read in this session as raw text or source. The lines on the nine
+packages, numpy's sort, skfolio, R's `pbo` and the scout's search moved to ADR 0032 when it was split from
+this record on 2026-11-10, with no change of decision; the paper line stays here and ADR 0032 points to
+it, and the second reader's line keeps only what concerns this record.
 
 * https://www.davidhbailey.com/dhbpapers/backtest-prob.pdf — the PBO paper, revised 2015-02, sha256 d8bfbada.
   Read in full as extracted text: Definition 2.2, Algorithm 2.3 and §§3–6. Fetched. Its figures were not
@@ -105,38 +75,11 @@ or run.
     set where it means the training set; §7 says "mean" where §3 says "median"; §6 gives one Sharpe ratio
     as both 1.27 and 1.3.
   * Not read: SSRN 2840838, or the version in *J. Computational Finance* 20(4), 2017.
-* Each package: the PyPI source archive of that version, with its sha256 checked against
-  `https://pypi.org/pypi/<name>/json`. The file read is byte-identical to the one at the repository's tag,
-  except factor-qc 0.1.3, whose repository has no such tag. Fetched.
-  * https://pypi.org/pypi/trialgate/json — sha256 8adcadbd; `src/trialgate/validation.py`; tag `v0.6.0` is
-    commit dfd175d of 0Smallcat0/trialgate. Its ten other modules were only searched for network and
-    subprocess calls; none found.
-  * https://pypi.org/pypi/backtest-overfitting/json — sha256 6b005dfe; `overfit.py`; tag `v1.1.1`, 8d19820.
-  * https://pypi.org/pypi/RiskLabAI/json — sha256 c498676a;
-    `src/RiskLabAI/backtest/probability_of_backtest_overfitting.py`; tag `v3.2.0`, 7d5aa11; 71 releases
-    since 2022-08-27.
-  * https://pypi.org/pypi/factor-qc/json — sha256 ca6773be; `src/factor_qc/stats.py`.
-  * https://pypi.org/pypi/cpz-quant/json — sha256 e65e6a71; `cpz_quant/certification/overfitting.py`; tag
-    `v1.2.0`, 7abc99b.
-  * https://pypi.org/pypi/alphaengine/json — sha256 83bcfc68; `src/alphaengine/core/validation.py`; tag
-    `v2.0.3`, 85c76c6; 31 releases since 2026-07-30.
-  * https://pypi.org/pypi/ml4t-diagnostic/json — sha256 f9325095; `evaluation/stats/backtest_overfitting.py`
-    and `evaluation/uncertainty.py` under `src/ml4t/diagnostic/`; tag `v0.2.0`, 19e7607; 46 releases since
-    2026-01-19.
-  * https://pypi.org/pypi/sharpebench/json — sha256 a351a1e4; `sharpebench-edge/src/pbo.rs`; the four
-    wheels are `manylinux` x86-64, cp310 to cp313.
-* https://raw.githubusercontent.com/esvhd/pypbo/4d723f06498267a2a6280cb9d7d5649348e961d1/pypbo/pbo.py and
-  `LICENSE` at that commit — AGPL-3.0. https://pypi.org/pypi/pypbo/json returns 404. Fetched.
-* https://numpy.org/doc/2.5/reference/generated/numpy.sort.html — the default `quicksort` is not stable.
-  Fetched.
-* skfolio 1.12.8, source archive — no PBO or CSCV in its source. Fetched, by search.
-* https://cran.r-project.org/web/packages/pbo/index.html — R `pbo` 1.3.5, 2022-05-26, MIT. Fetched. Its
-  source was not read.
-* An `upstream-scout` lane found three of the nine (RiskLabAI, backtest-overfitting, trialgate), and
-  reported that mlfinlab has none. Its star counts and its GitHub-only repositories were not checked:
-  UNVERIFIED.
 * https://www.mdpi.com/2227-9091/9/1/18 — Witzany, *Risks* 9(1):18 (2021), reported to find CSCV biased in
   both directions. Returned 403 today; read in a browser on 2026-11-09. UNVERIFIED this session.
-* Second reader, 2026-11-10 (`evidence-verifier`): the paper claims, checksums, tags and thresholds hold.
-  It corrected the tie column, the alphaengine, ml4t-diagnostic and factor-qc rows, and the claim that
-  every permissive candidate is new or small, which RiskLabAI and ml4t-diagnostic contradict.
+* Second reader, 2026-11-10 (`evidence-verifier`), the part that concerns this record: the paper claims and
+  thresholds hold.
+* The package sources behind "No package uses 0.05" are read in ADR 0032's Evidence.
+* Second reader of the split, 2026-11-10 (`evidence-verifier`): nothing of this record is missing from it
+  and ADR 0032 together. It corrected the pointer for the package thresholds, which are in ADR 0032's
+  Evidence, and kept the ranking report's line in Confirmation here.

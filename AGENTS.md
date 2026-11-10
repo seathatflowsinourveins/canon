@@ -102,6 +102,7 @@ dependency, pattern and practice traces to a pinned upstream or a dated source. 
 | 0029 | Alpaca paper keys: the login keychain, read by the `paper:test` mise task when it runs, checked against the paper API at entry |
 | 0030 | The Alpaca adapter: out of tree to upstream's guide on alpaca-py, its slices and what each test covers |
 | 0031 | Deflated Sharpe computation: eqs. 1–2 through skfolio, with the input it lets pass refused |
+| 0032 | Overfitting probability implementation (proposed): nine read, none adopted until one passes this repo's tests |
 
 ## Automation
 
