@@ -263,3 +263,38 @@ def test_the_paper_node_builds_without_connecting() -> None:
         assert not node.is_running
     finally:
         node.dispose()
+
+
+def test_the_paper_node_wires_its_limits_strategy_cap_and_reconciliation(monkeypatch) -> None:
+    """Review finding: the offline tests could not fail if the node stopped wiring its limits or strategy
+    in. Each piece is built through a module function the node must call; a spy on each records it."""
+    from canon_trading import paper_node
+
+    calls: list[str] = []
+    for name in ("risk_limits", "ema_cross_config", "exec_engine_config", "position_cap_config"):
+        real = getattr(paper_node, name)
+
+        def spy(*args, _real=real, _name=name, **kwargs):
+            calls.append(_name)
+            return _real(*args, **kwargs)
+
+        monkeypatch.setattr(paper_node, name, spy)
+    node = paper_node.ema_cross_paper_node(SPY)
+    node.dispose()
+    assert sorted(calls) == [
+        "ema_cross_config",
+        "exec_engine_config",
+        "position_cap_config",
+        "risk_limits",
+    ]
+
+
+def test_the_paper_node_scopes_start_up_reconciliation() -> None:
+    """Review finding: with the lookback unset, start-up reconciliation infers fills from the account's
+    old filled orders and holds a position Alpaca does not (ADR 0037). It is scoped to the symbol, as
+    upstream's Lighter tutorial scopes it, and to a minute of history, as the adapter's paper tests do."""
+    from canon_trading.paper_node import exec_engine_config
+
+    config = exec_engine_config(SPY)
+    assert config.reconciliation_instrument_ids == ["SPY.ALPACA"]
+    assert config.reconciliation_lookback_mins == 1

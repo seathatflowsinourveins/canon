@@ -16,8 +16,8 @@ the $1,000 cap; were the cap not applied it would rest about $250 above the mark
 test stops the node at the first of: an `EmaCross` order filled, `DEADLINE_SECS` gone, or the strategy's
 net position over one share, which fails the test, as does Alpaca holding more than one share at stop.
 `EmaCross` does not flatten on stop, so a filled order leaves one share, long or short, which the clean-up
-closes outside the node. In the regular session a fill is required; outside it the market order waits at
-Alpaca for the open, is canceled by the clean-up, and the run says the session was closed.
+closes outside the node. It needs the regular session and skips outside it: IEX then sends no quote for
+minutes, so nothing could be placed. A fill is required when the session is open at the start and the end.
 
 The account is left as it was found: the test places nothing, and fails, if the account holds an open SPY
 order or a SPY position; afterwards, whatever happened, it cancels every open SPY order and closes any SPY
@@ -250,7 +250,12 @@ def test_paper_ema_cross_trades_one_share_under_the_risk_limits() -> None:
             await task
             peak = max(peak, abs(net_position(cache)))
 
-    session_open = bool(getattr(paper_trading().get_clock(), "is_open", False))
+    open_at_start = bool(getattr(paper_trading().get_clock(), "is_open", False))
+    if not open_at_start:
+        # Outside the session IEX sends no quote for minutes (observed 2026-11-10 after the close), so
+        # neither the probe nor the strategy can place anything; the run needs the regular session.
+        node.dispose()
+        pytest.skip("the regular session is closed; the run needs IEX quotes and a fill")
     started = time.monotonic()
     with left_as_found() as found:
         try:
@@ -260,6 +265,13 @@ def test_paper_ema_cross_trades_one_share_under_the_risk_limits() -> None:
             events = {
                 o.client_order_id.value: [type(e).__name__ for e in o.events()] for o in orders
             }
+            # Positions the node holds that are not the strategy's: reconciliation's `EXTERNAL` ones
+            # included (review finding: the test read only the strategy's and Alpaca's).
+            others = [
+                f"{p.strategy_id} {p.signed_qty}"
+                for p in cache.positions_open(instrument_id=SPY)
+                if p.strategy_id != EMA_CROSS_ID
+            ]
             reasons = {
                 o.client_order_id.value: str(e.reason)
                 for o in cache.orders(instrument_id=SPY)
@@ -268,15 +280,21 @@ def test_paper_ema_cross_trades_one_share_under_the_risk_limits() -> None:
             }
         finally:
             node.dispose()
+    # A fill needs the regular session throughout the run; a run that straddles the open or the close
+    # does not require one (review finding: the session was read once, before the run).
+    session_open = open_at_start and bool(getattr(paper_trading().get_clock(), "is_open", False))
 
     reached = [cid for cid, names in events.items() if "OrderSubmitted" in names]
     fills = sum(names.count("OrderFilled") for names in events.values())
     print(
-        f"\nEmaCross paper run (regular session {'open' if session_open else 'closed'}): stopped by {stopped_by} after {seconds:.0f} s; "
+        f"\nEmaCross paper run (regular session {'open' if session_open else 'not open'}): "
+        f"stopped by {stopped_by} after {seconds:.0f} s; "
         f"{len(orders)} orders, {len(reached)} sent to Alpaca, {fills} fills, peak position {peak}; "
-        f"denials and rejections {reasons}; probe {probe.events}; account {found}; events {events}"
+        f"denials and rejections {reasons}; probe {probe.events}; account {found}; "
+        f"other positions {others}; events {events}"
     )
     assert peak <= 1 and abs(found.position_at_stop) <= 1, (stopped_by, found, events)
+    assert others == [], f"the node held positions Alpaca's account did not give it: {others}"
     # The cap the running node applies is the configured one, and it stops the order before Alpaca.
     assert probe.events == ["OrderDenied"], probe.events
     assert probe.denied_reason is not None
@@ -285,7 +303,7 @@ def test_paper_ema_cross_trades_one_share_under_the_risk_limits() -> None:
     # The run's budget lets one order reach Alpaca; the engine denies the rest for the rate.
     assert orders, f"EmaCross placed no order in {DEADLINE_SECS} s"
     assert len(reached) == 1, events
-    # A fill needs the regular session; outside it the market order waits at Alpaca and is canceled.
+    # A fill is required unless the session closed during the run.
     if session_open:
         assert stopped_by == "first fill" and fills == 1, (stopped_by, events)
     for cid, names in events.items():

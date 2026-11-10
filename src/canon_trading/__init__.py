@@ -14,6 +14,9 @@ packages/canon-alpaca.
 * `ranking` - `rank`, the pick and its deflated Sharpe ratio against 0.95 (ADR 0010, step 3; ADR 0031)
 * `paper_node` - `ema_cross_paper_node`, upstream's built-in `EmaCross` on a paper node under the risk
   engine's native limits (ADR 0037)
+* `session_ma_cross` - `SessionMaCross`, `MaCross` guarded for live use, limits outside the session
+* `position_cap` - `PositionCap`, a one-share cap on the net position, checked inside the node
+* `session_window` - one bounded window of `SessionMaCross` on paper, `mise run paper:session` (ADR 0044)
 
 Nothing here places live orders. See docs/adr/0009-trading-foundation.md.
 """

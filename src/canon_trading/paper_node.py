@@ -36,6 +36,7 @@ from canon_alpaca.factories import AlpacaExecutionClientFactory
 from nautilus_trader.common import Environment
 from nautilus_trader.config import DataClientConfig
 from nautilus_trader.config import InstrumentProviderConfig
+from nautilus_trader.config import LiveExecutionEngineConfig
 from nautilus_trader.live import LiveNode
 from nautilus_trader.live import LiveRiskEngineConfig
 from nautilus_trader.model import Quantity
@@ -43,7 +44,11 @@ from nautilus_trader.model import StrategyId
 from nautilus_trader.model import TraderId
 from nautilus_trader.trading import EmaCrossConfig
 
+from .position_cap import PositionCap
+from .position_cap import position_cap_config
+
 if TYPE_CHECKING:
+    from nautilus_trader.live import LiveNodeBuilder
     from nautilus_trader.model import InstrumentId
 
 MAX_ORDER_SUBMIT_RATE = "50/00:01:00"
@@ -61,6 +66,31 @@ TRADER_ID = TraderId("TESTER-001")
 TRADE_SIZE = Quantity.from_int(1)
 """One share an order (the paper-run rule)."""
 
+OPEN_CHECK_INTERVAL_SECS = 10.0
+POSITION_CHECK_INTERVAL_SECS = 60.0
+"""The native runtime checks, off by default, turned on at the slow end of upstream's recommended ranges
+("5-10s" and "30-60s", how_to/configure_live_trading): about six and one Alpaca calls a minute (ADR 0044)."""
+RECONCILIATION_LOOKBACK_MINS = 1
+"""A minute of order history at start-up, the value the adapter's own paper tests use
+(`packages/canon-alpaca/tests/test_paper_matrix.py`). Every run here starts only once it has checked the
+account flat in its symbol, so history can only mislead: left unset, as the docs' tip allows, the adapter
+is given everything and reconciliation infers fills from old filled orders into a position Alpaca does
+not hold (ADR 0037); and any window as long as a run (upstream's Lighter tutorial uses 60 minutes) can
+hold the last run's exit without its entry. Open orders and positions are reported however old."""
+
+
+def exec_engine_config(instrument_id: InstrumentId) -> LiveExecutionEngineConfig:
+    """The execution engine with its open-order and position checks against the venue turned on, and
+    start-up reconciliation scoped to the instrument, as upstream's Lighter tutorial scopes it to its
+    target, and to `RECONCILIATION_LOOKBACK_MINS` of history."""
+    return LiveExecutionEngineConfig(
+        reconciliation=True,
+        reconciliation_instrument_ids=[str(instrument_id)],
+        reconciliation_lookback_mins=RECONCILIATION_LOOKBACK_MINS,
+        open_check_interval_secs=OPEN_CHECK_INTERVAL_SECS,
+        position_check_interval_secs=POSITION_CHECK_INTERVAL_SECS,
+    )
+
 
 class RiskLimits(TypedDict):
     """The keywords `LiveRiskEngineConfig` and `nautilus_trader.risk.RiskEngineConfig` share."""
@@ -77,7 +107,7 @@ def risk_limits(
     """The risk engine's settings for a run on `instrument_id`, as keywords of either risk config class.
 
     `max_order_submit_rate` is the ceiling unless a run sets a tighter budget of its own, as the paper
-    test of `EmaCross` does (ADR 0037).
+    test of `EmaCross` does (ADR 0037). The notional cap is sized for SPY, the one symbol the runs trade.
 
     `LiveRiskEngineConfig` (the live node's) and `nautilus_trader.risk.RiskEngineConfig` (a backtest's)
     take the same keywords, so the offline proof of the throttle runs on exactly these values.
@@ -100,28 +130,25 @@ def ema_cross_config(instrument_id: InstrumentId) -> EmaCrossConfig:
     )
 
 
-def ema_cross_paper_node(
+def alpaca_paper_builder(
+    name: str,
     instrument_id: InstrumentId,
     *,
-    name: str = "CANON-EMA-CROSS-PAPER",
     trader_id: TraderId = TRADER_ID,
     max_order_submit_rate: str = MAX_ORDER_SUBMIT_RATE,
-) -> LiveNode:
-    """Build a paper node with the Alpaca data and execution clients and `EmaCross` on `instrument_id`.
-
-    The risk engine runs with `risk_limits` (with `max_order_submit_rate` in place of the ceiling when one
-    is given), reconciliation left at upstream's default (on), and the node is not
-    started: the caller runs it and owns its lifetime. The key pair is read from the environment by the
-    clients when they connect (ADR 0029).
-    """
+) -> LiveNodeBuilder:
+    """A builder with the Alpaca data and execution clients for `instrument_id`, `risk_limits`,
+    `exec_engine_config` and the timeouts every paper node here uses; the caller adds logging and builds.
+    The calls are the ones upstream's live examples make (`examples/live/sandbox/exec_tester.py`)."""
     provider = InstrumentProviderConfig(load_ids=[str(instrument_id)])
-    node = (
+    return (
         LiveNode.builder(name, trader_id, Environment.SANDBOX)
         .with_risk_engine_config(
             LiveRiskEngineConfig(
                 **risk_limits(instrument_id, max_order_submit_rate=max_order_submit_rate)
             )
         )
+        .with_exec_engine_config(exec_engine_config(instrument_id))
         .with_delay_post_stop_secs(5)
         .with_timeout_connection(20)
         .with_timeout_disconnection_secs(15)
@@ -133,7 +160,27 @@ def ema_cross_paper_node(
             AlpacaExecutionClientFactory,
             AlpacaExecutionClientConfig(instrument_provider=provider),
         )
-        .build()
     )
+
+
+def ema_cross_paper_node(
+    instrument_id: InstrumentId,
+    *,
+    name: str = "CANON-EMA-CROSS-PAPER",
+    trader_id: TraderId = TRADER_ID,
+    max_order_submit_rate: str = MAX_ORDER_SUBMIT_RATE,
+) -> LiveNode:
+    """Build a paper node with the Alpaca data and execution clients and `EmaCross` on `instrument_id`.
+
+    The risk engine runs with `risk_limits` (with `max_order_submit_rate` in place of the ceiling when one
+    is given), the execution engine with `exec_engine_config`, and `PositionCap` beside the strategy: no
+    native setting caps a position, and `EmaCross` stacks one when Alpaca refuses an opposite order (ADR
+    0037). The node is not started: the caller runs it and owns its lifetime. The key pair is read from the environment by the
+    clients when they connect (ADR 0029).
+    """
+    node = alpaca_paper_builder(
+        name, instrument_id, trader_id=trader_id, max_order_submit_rate=max_order_submit_rate
+    ).build()
     node.add_builtin_strategy(EMA_CROSS, ema_cross_config(instrument_id))
+    node.add_strategy(PositionCap(position_cap_config(instrument_id)))
     return node

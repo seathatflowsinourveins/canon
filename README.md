@@ -49,7 +49,10 @@ an account through NautilusTrader, not as a trading idea. `run_backtest` (`backt
 over their bars in a `ParquetDataCatalog` on a simulated Alpaca venue and returns the engine's own results.
 `ema_cross_paper_node` (`paper_node.py`) builds a live node on Alpaca's paper environment that runs
 upstream's built-in `EmaCross` under the risk engine's native limits; the paper test runs it for one order
-([ADR 0037](docs/adr/0037-ema-cross-paper-run-under-native-risk-limits.md)).
+([ADR 0037](docs/adr/0037-ema-cross-paper-run-under-native-risk-limits.md)). `SessionMaCross`
+(`session_ma_cross.py`) is `MaCross` guarded for live use, and `session_window.py` runs it for one bounded
+window on paper with a one-share cap inside the node
+([ADR 0044](docs/adr/0044-paper-session-windows-for-macross.md)).
 
 It needs no network, no credentials and no downloaded data:
 
@@ -110,6 +113,8 @@ mise run paper:remove   # deletes both items
 mise run paper:test     # runs the paper tests with the pair, one session at a time (they place DAY
                         # limit buys of 1 AAPL far below the market and cancel each one, and let
                         # EmaCross trade 1 SPY, then close it)
+mise run paper:session  # one SessionMaCross window, 30 minutes by default, under the same lock; it ends
+                        # flat or fails (--session extended outside the regular session)
 ```
 
 `paper:store` refuses a key ID starting with `AK`, Alpaca's hint for a live key, then sends the pair to
