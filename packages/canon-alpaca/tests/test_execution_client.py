@@ -120,6 +120,9 @@ class Trader(Strategy):
         self.trigger_price = "200.00"  # for stop and stop-limit orders
         self.trigger_type: TriggerType | None = None  # None leaves the factory's default
         self.post_only = False
+        self.params: dict | None = (
+            None  # the submit's params, as `Strategy.submit_order` takes them
+        )
         self.cancel_on: str | None = None  # the event name on which to cancel the order
         self.submit = True
         self.idle = False  # neither submits nor stops: the test stops the node
@@ -184,7 +187,7 @@ class Trader(Strategy):
                 trigger_price=Price.from_str(self.trigger_price),
             )
         self.client_order_id = order.client_order_id
-        self.submit_order(order)
+        self.submit_order(order, params=self.params)
 
     def on_order_event(self, event) -> None:
         # The cache is borrowed while order events are dispatched, so the order's end is read from them.
@@ -530,6 +533,59 @@ def test_stop_limit_order_is_sent_with_both_prices(venue) -> None:
     assert isinstance(request, StopLimitOrderRequest)
     assert (request.stop_price, request.limit_price) == (200.0, 200.5)
     assert request.time_in_force == AlpacaTimeInForce.DAY
+
+
+def test_extended_hours_limit_order_is_sent_eligible(venue) -> None:
+    strategy = trader(
+        order_type="limit", time_in_force=TimeInForce.DAY, params={"extended_hours": True}
+    )
+
+    run(build_node(strategy))
+
+    assert strategy.names() == ["OrderSubmitted", "OrderAccepted", "OrderFilled"]
+    (request,) = venue.trading.submitted
+    assert isinstance(request, LimitOrderRequest)
+    assert (request.extended_hours, request.time_in_force) == (True, AlpacaTimeInForce.DAY)
+
+
+def test_order_without_the_flag_is_not_sent_eligible(venue) -> None:
+    strategy = trader(order_type="limit", params={"extended_hours": False})
+
+    run(build_node(strategy))
+
+    (request,) = venue.trading.submitted
+    assert request.extended_hours is None
+
+
+@pytest.mark.parametrize(
+    ("options", "reason"),
+    [
+        ({"order_type": "market"}, "extended_hours is for limit orders only at Alpaca, not MARKET"),
+        (
+            {"order_type": "stop"},
+            "extended_hours is for limit orders only at Alpaca, not STOP_MARKET",
+        ),
+        (
+            {"order_type": "limit", "params": {"extended_hours": "yes"}},
+            "extended_hours must be true or false, got 'yes'",
+        ),
+        (
+            {"order_type": "limit", "params": {"outside_rth": True}},
+            "order params ['outside_rth'] are not taken; only 'extended_hours'",
+        ),
+    ],
+)
+def test_extended_hours_order_alpaca_rejects_is_denied_before_alpaca(
+    venue, options, reason
+) -> None:
+    options = {"params": {"extended_hours": True}, **options}
+    strategy = trader(**options)
+
+    run(build_node(strategy))
+
+    assert strategy.names() == ["OrderDenied"]
+    assert reason in strategy.events[0].reason
+    assert venue.trading.submitted == []
 
 
 def test_untradable_asset_is_denied(venue, alpaca) -> None:

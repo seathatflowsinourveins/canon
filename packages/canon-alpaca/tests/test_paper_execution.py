@@ -11,6 +11,9 @@ The first places a DAY limit buy of 1 AAPL at $1.00 and cancels it once Alpaca h
 run rows of upstream's Execution Testing Spec through upstream's `ExecTester` (ADR 0036): TC-E41, a limit
 buy $50 below the bid and a stop buy $50 above the ask, canceled by `CancelAllOrders` on stop; TC-E20 and
 TC-E22, a stop and a stop-limit buy $50 above the ask, accepted at the prices sent and canceled on stop.
+Two test extended hours (ADR 0038): a $1.00 buy marked eligible, accepted and canceled in any open session;
+and, in pre-market or after-hours only, a buy of 1 AAPL priced through the latest IEX ask (read from
+Alpaca's market data API), filled and sold back through the bid: that one trades a real paper share.
 The tester's rows need the regular session for quotes. Each test places nothing, and fails, if the paper
 account already holds an open AAPL order or an AAPL position, and afterwards cancels every open AAPL order
 and closes any AAPL position. Startup reconciliation reads the account's orders and positions first; an
@@ -19,18 +22,34 @@ open order there that this slice does not map fails the start.
 
 import asyncio
 import os
+import time
 from collections.abc import Callable
 from collections.abc import Generator
 from contextlib import contextmanager
+from datetime import UTC
+from datetime import date
+from datetime import datetime
+from datetime import time as dt_time
+from datetime import timedelta
 from decimal import Decimal
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pytest
 from alpaca.common.exceptions import APIError
+from alpaca.data.enums import DataFeed
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockLatestQuoteRequest
 from alpaca.trading.client import TradingClient
+from alpaca.trading.enums import OrderSide as AlpacaOrderSide
+from alpaca.trading.enums import PositionSide
 from alpaca.trading.enums import QueryOrderStatus
+from alpaca.trading.enums import TimeInForce as AlpacaTimeInForce
 from alpaca.trading.models import Order as AlpacaOrder
+from alpaca.trading.models import Position as AlpacaPosition
+from alpaca.trading.requests import GetCalendarRequest
 from alpaca.trading.requests import GetOrdersRequest
+from alpaca.trading.requests import LimitOrderRequest
 from canon_alpaca.constants import ACCOUNT_ID
 from canon_alpaca.constants import ENV_API_KEY
 from canon_alpaca.constants import ENV_SECRET_KEY
@@ -68,6 +87,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 AAPL = InstrumentId.from_str("AAPL.ALPACA")
+NEW_YORK = ZoneInfo("America/New_York")
 TESTER = StrategyId("ExecTester-000")
 """The tester's strategy ID; the cache also holds every AAPL order reconciliation loaded from the account."""
 TOB_OFFSET_TICKS = 500_000
@@ -136,6 +156,104 @@ class AcceptModifyCancel(Strategy):
 
     def names(self) -> list[str]:
         return [type(e).__name__ for e in self.events]
+
+
+class ExtendedHoursOrders(Strategy):
+    """Submit each `(side, price)` in `orders` in turn as a DAY limit order of 1 AAPL with
+    `params={"extended_hours": True}`, the next once the last has filled; or, with `cancel`, cancel each
+    once Alpaca accepts it. Stops when the last order ends, or on a rejection or denial."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.orders: list[tuple[OrderSide, str]] = []
+        self.cancel = False
+        self.events: list = []
+
+    def on_start(self) -> None:
+        self._next()
+
+    def _next(self) -> None:
+        if not self.orders:
+            self.shutdown_system("extended-hours orders done")
+            return
+        side, price = self.orders.pop(0)
+        order = self.order_factory.limit(
+            AAPL, side, Quantity.from_int(1), Price.from_str(price), time_in_force=TimeInForce.DAY
+        )
+        self.submit_order(order, params={"extended_hours": True})
+
+    def on_order_event(self, event) -> None:
+        name = type(event).__name__
+        if name == "OrderInitialized":
+            return
+        self.events.append(event)
+        if name == "OrderAccepted" and self.cancel:
+            self.cancel_order(event.client_order_id)
+        elif (name == "OrderCanceled" and self.cancel) or (
+            name == "OrderFilled" and not self.cancel
+        ):
+            self._next()
+        elif (
+            name in {"OrderCanceled", "OrderExpired", "OrderRejected", "OrderDenied"}
+            or name == "OrderCancelRejected"
+        ):
+            self.shutdown_system(f"extended-hours order ended with {name}")
+
+    def names(self) -> list[str]:
+        return [type(e).__name__ for e in self.events]
+
+
+def alpaca_session(trading: TradingClient, now: datetime | None = None) -> str:
+    """The session now, from Alpaca's own calendar (`GET /v2/calendar`): each trading date's
+    `session_open`, `open`, `close` and `session_close` give "pre-market", "regular" and "after-hours";
+    the 8 hours before a trading date's `session_open` are "overnight" (8:00pm-4:00am ET, "Extended Hours
+    Trading"; the overnight session follows the NYSE holiday calendar, Alpaca's 24/5 page); anything else is
+    "closed". Holidays and early closes come with the calendar."""
+    now = (now or datetime.now(UTC)).astimezone(NEW_YORK)
+    days = trading.get_calendar(
+        GetCalendarRequest(
+            start=(now - timedelta(days=1)).date(), end=(now + timedelta(days=5)).date()
+        )
+    )
+    assert isinstance(days, list)
+
+    def local(value: datetime) -> datetime:
+        return (
+            value.replace(tzinfo=NEW_YORK) if value.tzinfo is None else value.astimezone(NEW_YORK)
+        )
+
+    def at(day: date, hhmm: str | None, default: datetime) -> datetime:
+        # alpaca-py keeps `session_open` and `session_close` as "HHMM" strings for the trading date.
+        if not hhmm:
+            return default
+        return datetime.combine(day, dt_time(int(hhmm[:2]), int(hhmm[2:])), NEW_YORK)
+
+    for day in days:
+        opens, closes = local(day.open), local(day.close)
+        session_open = at(day.date, day.session_open, opens)
+        session_close = at(day.date, day.session_close, closes)
+        if session_open <= now < opens:
+            return "pre-market"
+        if opens <= now < closes:
+            return "regular"
+        if closes <= now < session_close:
+            return "after-hours"
+        if session_open - timedelta(hours=8) <= now < session_open:
+            return "overnight"
+    return "closed"
+
+
+def latest_iex_quote(max_age: timedelta) -> tuple[Decimal, Decimal] | None:
+    """The latest IEX bid and ask for AAPL, or None if either side is missing or older than `max_age`."""
+    quote = StockHistoricalDataClient(
+        api_key=os.environ[ENV_API_KEY], secret_key=os.environ[ENV_SECRET_KEY]
+    ).get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols="AAPL", feed=DataFeed.IEX))
+    assert isinstance(quote, dict)
+    q = quote["AAPL"]
+    bid, ask = Decimal(str(q.bid_price)), Decimal(str(q.ask_price))
+    if not (bid > 0 and ask > 0) or datetime.now(UTC) - q.timestamp > max_age:
+        return None
+    return bid, ask
 
 
 async def run_hosted(node) -> None:
@@ -230,6 +348,65 @@ def test_paper_modify_limit_buy_tc_e30() -> None:
     assert names[-1] == "OrderCanceled", names
 
 
+def test_paper_extended_hours_limit_order_rests_and_is_canceled() -> None:
+    """A DAY limit buy of 1 AAPL at $1.00 marked `extended_hours` (ADR 0038), through a node: accepted and
+    canceled, and Alpaca holds it as extended-hours eligible. Any session but a closed one."""
+    trading = paper_trading()
+    session = alpaca_session(trading)
+    if session == "closed":
+        pytest.skip("Alpaca's sessions are closed now")
+    with aapl_left_as_found() as cleaned:
+        node = paper_node()
+        strategy = ExtendedHoursOrders()
+        strategy.orders = [(OrderSide.BUY, "1.00")]
+        strategy.cancel = True
+        node.add_strategy(strategy)
+        try:
+            asyncio.run(run_hosted(node))
+        finally:
+            node.dispose()
+
+    assert cleaned == {"orders": 0, "positions": 0}, cleaned
+    assert strategy.names() == [
+        "OrderSubmitted",
+        "OrderAccepted",
+        "OrderPendingCancel",
+        "OrderCanceled",
+    ], (session, strategy.names())
+    held = trading.get_order_by_id(strategy.events[1].venue_order_id.value)
+    assert isinstance(held, AlpacaOrder)
+    assert held.extended_hours is True, session
+
+
+def test_paper_extended_hours_order_fills_and_is_closed() -> None:
+    """In pre-market or after-hours: a DAY limit buy of 1 AAPL marked `extended_hours`, priced 0.2% through
+    Alpaca's latest IEX ask so it fills, then a sale of that share priced 0.2% through the bid, both
+    through a node (ADR 0038). Skipped in other sessions; overnight quotes come from another feed."""
+    session = alpaca_session(paper_trading())
+    if session not in ("pre-market", "after-hours"):
+        pytest.skip(f"needs pre-market or after-hours; now {session}")
+    quote = latest_iex_quote(timedelta(seconds=60))
+    if quote is None:
+        pytest.skip("no two-sided IEX quote from the last minute")
+    bid, ask = quote
+    cent = Decimal("0.01")
+    buy = (ask * Decimal("1.002")).quantize(cent)
+    sell = (bid * Decimal("0.998")).quantize(cent)
+    with aapl_left_as_found() as cleaned:
+        node = paper_node()
+        strategy = ExtendedHoursOrders()
+        strategy.orders = [(OrderSide.BUY, str(buy)), (OrderSide.SELL, str(sell))]
+        node.add_strategy(strategy)
+        try:
+            asyncio.run(run_hosted(node))
+        finally:
+            node.dispose()
+
+    assert cleaned == {"orders": 0, "positions": 0}, (session, cleaned, strategy.names())
+    assert strategy.names().count("OrderFilled") >= 2, (session, strategy.names())
+    assert "OrderRejected" not in strategy.names() and "OrderDenied" not in strategy.names()
+
+
 def paper_trading() -> TradingClient:
     return TradingClient(
         api_key=os.environ[ENV_API_KEY], secret_key=os.environ[ENV_SECRET_KEY], paper=True
@@ -250,6 +427,40 @@ def holds_aapl(trading: TradingClient) -> bool:
             return False
         raise
     return True
+
+
+def wait_until(done: Callable[[], bool], what: str, seconds: float = 30.0) -> None:
+    deadline = time.monotonic() + seconds
+    while not done():
+        if time.monotonic() > deadline:
+            raise AssertionError(f"timed out after {seconds} s waiting for {what}")
+        time.sleep(0.5)
+
+
+def close_aapl(trading: TradingClient) -> None:
+    """Close the AAPL position: Alpaca's close (a market order) in the regular session; outside it, a
+    limit order marked `extended_hours`, priced 0.5% through the IEX quote, since a market order is held
+    for the next regular session ("Orders not designated for extended hours execution will be queued")."""
+    position = trading.get_open_position("AAPL")
+    assert isinstance(position, AlpacaPosition)
+    if alpaca_session(trading) == "regular":
+        trading.close_position("AAPL")
+        return
+    quote = latest_iex_quote(timedelta(minutes=5))
+    assert quote is not None, "no IEX quote to price the closing order with"
+    bid, ask = quote
+    long = position.side == PositionSide.LONG
+    price = (bid * Decimal("0.995") if long else ask * Decimal("1.005")).quantize(Decimal("0.01"))
+    trading.submit_order(
+        LimitOrderRequest(
+            symbol="AAPL",
+            qty=abs(float(position.qty)),
+            side=AlpacaOrderSide.SELL if long else AlpacaOrderSide.BUY,
+            time_in_force=AlpacaTimeInForce.DAY,
+            limit_price=float(price),
+            extended_hours=True,
+        )
+    )
 
 
 @contextmanager
@@ -278,9 +489,11 @@ def aapl_left_as_found() -> Generator[dict[str, int]]:
         for order in open_aapl_orders(trading):
             trading.cancel_order_by_id(order.id)
             cleaned["orders"] += 1
+        wait_until(lambda: not open_aapl_orders(trading), "the canceled orders to close")
         if holds_aapl(trading):
-            trading.close_position("AAPL")
             cleaned["positions"] += 1
+            close_aapl(trading)
+            wait_until(lambda: not holds_aapl(trading), "the AAPL position to close")
 
 
 def test_paper_limit_order_is_accepted_and_canceled() -> None:

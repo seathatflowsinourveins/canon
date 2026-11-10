@@ -201,7 +201,13 @@ Each is stated in `execution.py`'s header, with its source.
   when a stop is elected, so the client generates no `OrderTriggered`: an elected stop-limit stays
   `ACCEPTED` until it fills or ends. An open stop is reported with its stop price as trigger price and
   trigger type `DEFAULT` ([ADR 0036](../../docs/adr/0036-alpaca-adapter-order-management.md)). Denied orders never
-  reach Alpaca. Not implemented: order lists, queries, extended hours.
+  reach Alpaca. Not implemented: order lists, queries.
+* **Extended hours:** `submit_order(order, params={"extended_hours": True})`, the way upstream's adapters
+  take venue order flags, sends a limit order, `DAY` or `GTC`, eligible for pre-market, after-hours and
+  overnight; any other order so marked, an unknown params key and a non-boolean value are denied before
+  Alpaca, which rejects them ("Orders at Alpaca", "Extended Hours Trading"). The data client still streams
+  IEX only; overnight quotes come from Alpaca's `overnight` or `boats` feed, not used yet
+  ([ADR 0038](../../docs/adr/0038-alpaca-extended-hours.md)).
 * **Modify** replaces the order on Alpaca ("Replace Order by ID") and generates `OrderUpdated` only when
   Alpaca's stream sends `replaced` for it, with the replacement's ID, quantity and prices; a success answer
   alone does not, since Alpaca says it "does NOT guarantee" the replacement. The replacement gets a client
