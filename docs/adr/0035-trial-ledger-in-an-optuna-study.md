@@ -43,7 +43,7 @@ trial store that meets every driver. Leaving it is cheap, since every trial read
    outside a git checkout a path must be given. Opening never creates a file or study; creating one is
    its own call, with its sample (ADR 0041), under an exclusive `fcntl.flock` on `trials.db.lock`:
    two processes creating one new file raced in `create_all` and crashed in 14 of 15 rounds (measured
-   here). The lock guards first creation only. The name and the sample are two writes; a creation
+   here). The lock guards first creation and a sample's move (ADR 0041 term 5), not recording. The name and the sample are two writes; a creation
    interrupted between them is completed by the next creation of that name (ADR 0041 term 1). Recording stays on `RDBStorage`, not the
    `JournalFileBackend` the FAQ gives for parallel optimisation: sessions record trials now and then,
    not in a parallel search, and SQLite serialises those writes (3,100 recordings from 10 processes
@@ -74,7 +74,7 @@ trial store that meets every driver. Leaving it is cheap, since every trial read
    again as the same trial is this record's. Records are never overwritten or deleted. Per key, a
    `failed` or `RUNNING` record is resolved by a later record of that key that ran to the end (traded
    or idle); the earlier one stays. Every record of a key that ran to the end on one sample must carry
-   the same range, returns and data (ADR 0041), else the ranking stops and names them. A key is one
+   the same outcome, range, returns and data (ADR 0041), else the ranking stops and names them. A key is one
    column of the returns matrix.
 6. **What stops the ranking**, beside ADR 0031's and ADR 0041's: a study with no record; a key with no
    record that ran to the end; a `failed` or `RUNNING` record no later record of its key resolves;
@@ -107,6 +107,8 @@ Who decided. The orchestrator chose option 3 and the terms under the owner's del
 * A creation interrupted before its sample is completed by the next creation of its name, and a keyed
   failure with no sample number stops the ranking until a later record of its key resolves it
   (`tests/test_ledger.py`).
+* Records of one key that differ only in outcome stop the ranking in either order, and a report names
+  only the pick's records that ran (`tests/test_ranking.py`).
 
 ## Evidence
 
@@ -172,3 +174,7 @@ Read 2026-11-10. Fetched means read in this session as raw text or source; run m
   sample could be neither opened nor created again, and a keyed failure written before its sample
   number was left out of the ranking. Term 1 corrected here; the rest, and the sources, in ADR 0041's
   Evidence. No change of decision.
+* A third review of the gate, 2026-11-10, read only: records of one key differing only in outcome gave
+  an answer that hung on their order, and the report credited the pick with records that never ran.
+  Terms 1 and 5 corrected here, with the rest and the sources in ADR 0041's Evidence. No change of
+  decision.

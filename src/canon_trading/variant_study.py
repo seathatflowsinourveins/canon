@@ -64,8 +64,8 @@ from .ledger import trial_config
 from .ma_cross import MaCrossConfig
 from .ranking import RankingReport
 from .ranking import RankingStopped
-from .ranking import _known_sample
-from .ranking import _ran
+from .ranking import on_current_sample
+from .ranking import ran_to_the_end
 from .ranking import rank
 
 if TYPE_CHECKING:
@@ -129,8 +129,9 @@ def _to_record(study: optuna.Study, keys: Sequence[str]) -> list[str]:
     a key with no record on the sample, or whose latest record failed or is still `RUNNING`, is run
     again. Records are placed on samples as `rank` places them (ADR 0041 term 5): a keyed one with no
     sample number of the study's is on the current sample, unless it ran to the end, which `rank`
-    stops on as another writer's and which no re-run clears. The rule is the gate's, through its own
-    `_known_sample` and `_ran`; the gate exposes no public helper for it. The study is read once.
+    stops on as another writer's and which no re-run clears. The rule is the gate's own,
+    `canon_trading.ranking.on_current_sample` and `ran_to_the_end`, so it follows any change to it.
+    The study is read once.
     """
     sample = current_sample(study)
     known = {s.number for s in samples(study)}
@@ -139,15 +140,11 @@ def _to_record(study: optuna.Study, keys: Sequence[str]) -> list[str]:
         key = trial.user_attrs.get("config_key")
         if not isinstance(key, str) or key not in keys:
             continue
-        # As `rank` places it (ranking.py): a keyed record with no sample number of the study's is on
-        # the current sample unless it ran to the end, which `rank` stops on and never counts as a run.
-        if _known_sample(trial, known):
-            counted = trial.user_attrs["sample"] == sample.number
-        else:
-            counted = not _ran(trial)
-        if counted and (key not in latest or trial.number > latest[key].number):
+        if on_current_sample(trial, sample, known) and (
+            key not in latest or trial.number > latest[key].number
+        ):
             latest[key] = trial
-    return [key for key in keys if key not in latest or not _ran(latest[key])]
+    return [key for key in keys if key not in latest or not ran_to_the_end(latest[key])]
 
 
 @dataclass(frozen=True)

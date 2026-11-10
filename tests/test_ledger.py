@@ -23,6 +23,8 @@ import dataclasses
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from contextlib import ExitStack
 from datetime import UTC
 from datetime import datetime
@@ -580,7 +582,7 @@ def test_a_corrected_catalog_disagrees_until_the_sample_is_moved(
     )
 
     with pytest.raises(
-        RankingStopped, match="disagree on their range, returns, session days or data"
+        RankingStopped, match="disagree on their outcome, range, returns, session days or data"
     ):
         rank(study)
     move_sample(study, start=START, end=END)
@@ -984,3 +986,115 @@ def test_a_hole_no_load_can_fill_is_closed_by_consolidating_the_catalog(
     first, second = study.trials
     assert first.user_attrs["data_digest"] == second.user_attrs["data_digest"]
     assert holed.run.result.iterations == whole.run.result.iterations == 70
+
+
+# The third review of the gate, 2026-11-10: each test failed before its fix.
+
+
+def test_two_sample_moves_at_once_are_both_kept(
+    tmp_path: Path, stack: ExitStack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two handles on one study both returned sample 1, and only the last write survived."""
+    new_study(stack, tmp_path, "moving")
+    handles = [stack.enter_context(open_study("moving", tmp_path / "trials.db")) for _ in "ab"]
+    real = canon_trading.ledger.samples
+
+    def slow_first(study: optuna.Study) -> list[Sample]:
+        found = real(study)
+        if threading.current_thread().name == "first":
+            time.sleep(0.5)  # between reading the samples and writing the new list
+        return found
+
+    monkeypatch.setattr(canon_trading.ledger, "samples", slow_first)
+    moved: dict[str, Sample] = {}
+
+    def move(handle: optuna.Study, end: str) -> None:
+        moved[threading.current_thread().name] = move_sample(handle, start=START, end=end)
+
+    first = threading.Thread(target=move, args=(handles[0], "2025-06-15"), name="first")
+    second = threading.Thread(target=move, args=(handles[1], "2025-06-30"), name="second")
+    first.start()
+    time.sleep(0.1)
+    second.start()
+    first.join(10)
+    second.join(10)
+    monkeypatch.undo()
+
+    assert sorted(s.number for s in moved.values()) == [1, 2]
+    reopened = stack.enter_context(open_study("moving", tmp_path / "trials.db"))
+    assert [s.number for s in samples(reopened)] == [0, 1, 2]
+    assert set(samples(reopened)[1:]) == set(moved.values())
+
+
+def test_a_sample_is_moved_only_on_a_study_the_ledger_opened(tmp_path: Path) -> None:
+    """The move holds the ledger's lock, which only a study the ledger opened can name."""
+    url = f"sqlite:///{tmp_path / 'bare.db'}"
+    bare = optuna.create_study(study_name="bare", storage=url, direction="maximize")
+    bare.set_user_attr(SAMPLES, [{"number": 0, "start": utc_ns(START), "end": utc_ns(END)}])
+
+    with pytest.raises(ValueError, match="open_study"):
+        move_sample(bare, start=START, end="2025-06-15")
+    assert len(bare.user_attrs[SAMPLES]) == 1
+
+
+def test_a_catalog_swapped_between_the_check_and_the_replay_is_told_failed(
+    alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The coverage check read a 70-bar catalog, the node then read a 40-bar fragment swapped in,
+    and two configurations ranked over the 70-day sample at T = 40 (DSR 0.99853 in the review)."""
+    path = tmp_path / "catalog"
+    alpaca_bars.write(path)
+    append_bars(alpaca_bars, path)
+    study = new_study(stack, tmp_path, "swapped", end="2025-06-15")
+    real = canon_trading.ledger.run_backtest_config
+
+    def swap_then_run(*args: Any) -> object:
+        shutil.rmtree(path)
+        alpaca_bars.write(path)  # the first 40 bars, covering 2025-03-10 to 2025-05-04
+        return real(*args)
+
+    monkeypatch.setattr(canon_trading.ledger, "run_backtest_config", swap_then_run)
+    for config in (strategy(), strategy(fast=2, slow=5)):
+        with pytest.raises(RuntimeError, match="other bars than the coverage check read"):
+            record_trial(study, path, [config], starting_balances=BALANCES)
+        shutil.rmtree(path)
+        alpaca_bars.write(path)
+        append_bars(alpaca_bars, path)
+    monkeypatch.undo()
+
+    assert [(t.state, t.user_attrs[OUTCOME]) for t in study.trials] == [
+        (TrialState.FAIL, FAILED)
+    ] * 2
+    assert all("data_digest" not in t.user_attrs for t in study.trials)
+    with pytest.raises(RankingStopped, match="no record ran to the end"):
+        rank(study)
+    for config in (strategy(), strategy(fast=2, slow=5)):
+        record_trial(study, path, [config], starting_balances=BALANCES)
+    assert rank(study).t == 70
+
+
+def test_a_catalog_swapped_between_the_check_and_its_query_is_refused(
+    alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Swapped after the intervals were checked and before the bars were read, the fragment was both
+    what the check's query and the node read, so the two digests agreed (code review)."""
+    path = tmp_path / "catalog"
+    alpaca_bars.write(path)
+    append_bars(alpaca_bars, path)
+    study = new_study(stack, tmp_path, "swapped early", end="2025-06-15")
+    real = ParquetDataCatalog.query
+    swapped = []
+
+    def swap_then_query(self: ParquetDataCatalog, *args: Any, **kwargs: Any) -> object:
+        if not swapped:
+            swapped.append(True)
+            shutil.rmtree(path)
+            alpaca_bars.write(path)  # the first 40 bars only
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(ParquetDataCatalog, "query", swap_then_query)
+    with pytest.raises(LookupError, match="changed while it was checked"):
+        record_trial(study, path, [strategy()], starting_balances=BALANCES)
+    monkeypatch.undo()
+
+    assert study.trials == []

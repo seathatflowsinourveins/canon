@@ -21,13 +21,16 @@ reported: the passing case's mean correlation between trials is 0.11226, so N̂ 
 
 from __future__ import annotations
 
+import hashlib
 import itertools
 import math
+import re
 import statistics
 import time
 from datetime import UTC
 from datetime import datetime
 from typing import TYPE_CHECKING
+from typing import Any
 
 import optuna
 import pytest
@@ -41,6 +44,7 @@ from canon_trading.ledger import IDLE
 from canon_trading.ledger import OUTCOME
 from canon_trading.ledger import TRADED
 from canon_trading.ledger import create_ledger_study
+from canon_trading.ledger import current_sample
 from canon_trading.ledger import mark_not_run
 from canon_trading.ledger import move_sample
 from canon_trading.ledger import open_study
@@ -62,13 +66,14 @@ PICK = [PATTERN[i % 10] + 0.0001 * (i % 3) for i in range(T)]
 SECOND = [PATTERN[(i + 3) % 10] * 0.5 - 0.001 for i in range(T)]
 THIRD_CLOSE = [PATTERN[(i + 5) % 10] * 0.6 - 0.0012 for i in range(T)]
 THIRD_WIDE = [-PATTERN[(i + 5) % 10] * 0.8 for i in range(T)]
+# The sample's end, the midnight after its last day: its T session days are DAY_0 to DAY_0 + T - 1,
+# the way a real run books a sample that ends at a midnight (`canon_trading.ledger.session_day`).
+END = DAY_0 + T * DAY_NS
 
 
 @pytest.fixture
 def study(tmp_path: Path) -> Iterator[optuna.Study]:
-    with create_ledger_study(
-        "gate", start=DAY_0, end=DAY_0 + (T - 1) * DAY_NS, path=tmp_path / "trials.db"
-    ) as opened:
+    with create_ledger_study("gate", start=DAY_0, end=END, path=tmp_path / "trials.db") as opened:
         yield opened
 
 
@@ -83,8 +88,14 @@ def write(
     told_complete: bool = True,
     sample: object = 0,
     extra_session_days: int = 0,
+    attrs: dict[str, object] | None = None,
+    drop: tuple[str, ...] = (),
 ) -> int:
-    """Record one trial as the ledger does; `returns` start at day `first_day`."""
+    """Record one trial as the ledger does; `returns` start at day `first_day`.
+
+    The run's bounds are the current sample's, as `record_trial` writes them. `attrs` then replaces
+    attributes and `drop` leaves some out, for a record not in that shape.
+    """
     trial = study.ask()
     if key is not None:
         trial.set_user_attr("config_key", key)
@@ -97,15 +108,20 @@ def write(
     if not tell:
         return trial.number  # left RUNNING, as a run that never returned
     days = [DAY_0 + (first_day + n) * DAY_NS for n in range(len(returns or []))]
-    trial.set_user_attr("run_config_id", key)
-    trial.set_user_attr("backtest_start", days[0] if days else None)
-    trial.set_user_attr("backtest_end", days[-1] if days else None)
-    trial.set_user_attr(
-        "returns_series", {str(d): value for d, value in zip(days, returns or [], strict=True)}
-    )
     calendar = days + [days[-1] + n * DAY_NS for n in range(1, extra_session_days + 1)]
-    trial.set_user_attr("session_days", [str(d) for d in calendar])
-    trial.set_user_attr("data_digest", {f"bars of {key}": "digest"})
+    bounds = current_sample(study)
+    written: dict[str, object] = {
+        "run_config_id": key,
+        "backtest_start": bounds.start,
+        "backtest_end": bounds.end,
+        "returns_series": {str(d): value for d, value in zip(days, returns or [], strict=True)},
+        "session_days": [str(d) for d in calendar],
+        "data_digest": {f"bars of {key}": hashlib.sha256(str(key).encode()).hexdigest()},
+    }
+    written.update(attrs or {})
+    for name, value in written.items():
+        if name not in drop:
+            trial.set_user_attr(name, value)
     trial.set_user_attr(OUTCOME, outcome)
     if outcome == IDLE or not told_complete:
         study.tell(trial, state=TrialState.FAIL)
@@ -296,15 +312,15 @@ def test_two_records_of_one_configuration_that_disagree_stop(study: optuna.Study
 
 def test_a_rejected_series_stops(study: optuna.Study) -> None:
     write(study, "pick", PICK)
-    trial = study.ask()
-    trial.set_user_attr("config_key", "fallback")
-    trial.set_user_attr("sample", 0)
-    trial.set_user_attr(OUTCOME, TRADED)
-    trial.set_user_attr(
-        "returns_series", {str(DAY_0 + 3_600 * 10**9): 0.01, str(DAY_0 + DAY_NS): 0.02}
+    write(
+        study,
+        "fallback",
+        PICK,
+        attrs={
+            "returns_series": {str(DAY_0 + 3_600 * 10**9): 0.01, str(DAY_0 + DAY_NS): 0.02},
+            "session_days": [str(DAY_0), str(DAY_0 + DAY_NS)],
+        },
     )
-    trial.set_user_attr("session_days", [str(DAY_0), str(DAY_0 + DAY_NS)])
-    study.tell(trial, 0.0)
 
     with pytest.raises(
         RankingStopped, match="fallback: returns_series has keys off a UTC midnight"
@@ -467,16 +483,15 @@ def test_a_record_not_in_the_writers_shape_stops_naming_it(
 ) -> None:
     """Another writer's record raised a bare KeyError, ValueError or TypeError naming nothing."""
     write(study, "pick", PICK)
-    trial = study.ask()
-    trial.set_user_attr("config_key", "odd")
-    trial.set_user_attr("sample", 0)
-    if returns is not None:
-        trial.set_user_attr("returns_series", returns)
-    trial.set_user_attr("session_days", days)
-    trial.set_user_attr(OUTCOME, TRADED)
-    study.tell(trial, 0.0)
+    number = write(
+        study,
+        "odd",
+        PICK,
+        attrs={"returns_series": returns, "session_days": days},
+        drop=("returns_series",) if returns is None else (),
+    )
 
-    with pytest.raises(RankingStopped, match=rf"odd: [^\n]*{message}[^\n]*\(#{trial.number}\)"):
+    with pytest.raises(RankingStopped, match=rf"odd: [^\n]*{message}[^\n]*\(#{number}\)"):
         rank(study)
 
 
@@ -513,7 +528,7 @@ def test_a_configuration_not_run_on_the_current_sample_stops(study: optuna.Study
     write(study, "pick", PICK)
     write(study, "second", SECOND)
     old = write(study, "third", THIRD_CLOSE)
-    move_sample(study, start=DAY_0, end=DAY_0 + (T - 1) * DAY_NS)
+    move_sample(study, start=DAY_0, end=END)
     write(study, "pick", PICK, sample=1)
     write(study, "second", SECOND, sample=1)
 
@@ -620,7 +635,10 @@ def test_a_data_digest_not_in_the_writers_shape_stops_naming_it(study: optuna.St
         )
     )
 
-    with pytest.raises(RankingStopped, match=r"data_digest \{'BT': \['x'\]\} is not in the shape"):
+    with pytest.raises(
+        RankingStopped,
+        match=r"other: #\d+ \(traded\) is not in the shape[^\n]*data_digest \{'BT': \['x'\]\}",
+    ):
         rank(study)
 
 
@@ -659,9 +677,7 @@ def test_the_recorded_range_is_utc_whatever_the_zone(
     """Optuna returns a trial's start as naive local time, so the review saw three ranges in three
     zones; the report gives one, in UTC, with its offset."""
     before = datetime.now(UTC)
-    with create_ledger_study(
-        "times", start=DAY_0, end=DAY_0 + (T - 1) * DAY_NS, path=tmp_path / "trials.db"
-    ) as written:
+    with create_ledger_study("times", start=DAY_0, end=END, path=tmp_path / "trials.db") as written:
         write(written, "pick", PICK)
         write(written, "second", SECOND)
     after = datetime.now(UTC)
@@ -684,9 +700,9 @@ def test_the_recorded_range_is_utc_whatever_the_zone(
 
 def test_session_days_with_no_return_stop_and_are_named(study: optuna.Study) -> None:
     """A later review of 2026-11-10: three trials recording 31 session days with 30 returns each
-    ranked at T = 30, the missing day dropped from the calendar."""
+    ranked at T = 30, the missing day dropped from the calendar. Here 30 session days, 29 returns."""
     numbers = [
-        write(study, key, returns, extra_session_days=1)
+        write(study, key, returns[:-1], extra_session_days=1)
         for key, returns in (("pick", PICK), ("second", SECOND), ("third", THIRD_CLOSE))
     ]
 
@@ -695,7 +711,7 @@ def test_session_days_with_no_return_stop_and_are_named(study: optuna.Study) -> 
 
     message = str(stopped.value)
     for key, number in zip(("pick", "second", "third"), numbers, strict=True):
-        assert f"{key}: no return on 1 of its 31 session days" in message
+        assert f"{key}: no return on 1 of its 30 session days" in message
         assert f"(#{number})" in message
 
 
@@ -714,3 +730,104 @@ def test_a_record_that_ran_with_no_sample_number_of_the_study_stops(
     assert f"#{trial} (traded) ran with sample {number!r}, not a sample number" in str(
         stopped.value
     )
+
+
+# The third review of the gate, 2026-11-10: each test failed before its fix.
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        pytest.param(
+            {"first_day": -365},
+            "returns_series has a key on 2024-03-11, outside sample 0",
+            id="prior-year returns",
+        ),
+        pytest.param({"drop": ("backtest_start",)}, "backtest_start None", id="no start"),
+        pytest.param(
+            {"attrs": {"backtest_start": DAY_0 + DAY_NS}},
+            f"backtest_start {DAY_0 + DAY_NS}, not the start of sample 0",
+            id="other start",
+        ),
+        pytest.param({"drop": ("backtest_end",)}, "backtest_end None", id="no end"),
+        pytest.param(
+            {"attrs": {"backtest_end": END + 1}},
+            f"backtest_end {END + 1}, not within sample 0",
+            id="end past the sample",
+        ),
+        pytest.param({"attrs": {"data_digest": {}}}, "data_digest {}", id="empty digest"),
+        pytest.param(
+            {"attrs": {"data_digest": {"BT": ""}}}, "data_digest {'BT': ''}", id="empty hash"
+        ),
+        pytest.param(
+            {"attrs": {"run_config_id": "elsewhere"}},
+            "run_config_id 'elsewhere', not its config key",
+            id="other run id",
+        ),
+    ],
+)
+def test_a_record_that_ran_out_of_the_writers_shape_stops_naming_it(
+    study: optuna.Study, change: dict[str, Any], message: str
+) -> None:
+    """Three records of prior-year returns, missing run bounds or empty digests on the declared
+    sample passed at DSR 0.98849, the shape of the returns being all that was checked."""
+    numbers = [
+        write(study, key, returns, **change)
+        for key, returns in (("pick", PICK), ("second", SECOND), ("third", THIRD_CLOSE))
+    ]
+
+    with pytest.raises(RankingStopped) as stopped:
+        rank(study)
+
+    text = str(stopped.value)
+    for key, number in zip(("pick", "second", "third"), numbers, strict=True):
+        assert re.search(rf"{key}: #{number} [^\n]*{re.escape(message)}", text), text
+        assert "not in the shape record_trial writes" in text
+
+
+def test_a_keyless_record_told_a_value_cannot_be_marked_and_stops(study: optuna.Study) -> None:
+    """An Optuna writer told a result with none of the ledger's attributes; marking it dropped a
+    trial that ran from N, and the gate passed at N = 3 with four completed trials."""
+    write(study, "pick", PICK)
+    write(study, "second", SECOND)
+    write(study, "third", THIRD_CLOSE)
+    trial = study.ask()
+    study.tell(trial, 1.5)
+
+    with pytest.raises(ValueError, match="shows a run"):
+        mark_not_run(study, trial.number)
+    assert "not_run" not in study.user_attrs
+    with pytest.raises(RankingStopped, match=rf"#{trial.number} \(complete\)[^\n]*shows a run"):
+        rank(study)
+
+
+@pytest.mark.parametrize("idle_first", [False, True], ids=["traded first", "idle first"])
+def test_records_of_one_key_that_differ_in_outcome_stop_whatever_their_order(
+    study: optuna.Study, idle_first: bool
+) -> None:
+    """One key, a traded and an idle record alike in all else: the answer hung on record order."""
+    write(study, "second", SECOND)
+    write(study, "third", THIRD_CLOSE)
+    outcomes = [IDLE, TRADED] if idle_first else [TRADED, IDLE]
+    first, again = (write(study, "pick", PICK, outcome=outcome) for outcome in outcomes)
+
+    with pytest.raises(
+        RankingStopped,
+        match=rf"pick: records #{first} \({outcomes[0]}\), #{again} \({outcomes[1]}\) ran the "
+        r"same configuration[^\n]*disagree on their outcome",
+    ):
+        rank(study)
+
+
+def test_the_pick_s_trials_are_only_records_that_ran(study: optuna.Study) -> None:
+    """The report credited the pick with a failed record and one left running."""
+    failed = write(study, "pick", None, outcome=FAILED)
+    ran = write(study, "pick", PICK)
+    write(study, "second", SECOND)
+    write(study, "third", THIRD_CLOSE)
+
+    report = rank(study)
+
+    assert failed not in report.pick_trials
+    assert report.pick_trials == (ran,)
+    assert f"(trials {ran})" in report.summary()
