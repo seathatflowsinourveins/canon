@@ -39,7 +39,7 @@ Chosen: **option 3**. `guard.sh`, `unattended-mark.sh` and their two registratio
 |---|---|
 | A commit passes the checks | The ruleset on `main` requires a pull request and the statuses `all required checks passed` from hosted CI and `signoff` from `scripts/land` (ADR 0014, ADR 0017). A commit made with the local gate skipped must still pass the same script on GitHub before it can merge |
 | Installs follow `uv.lock` | `scripts/ci` runs `uv lock --check` and hosted CI installs with `uv sync --locked` (ADR 0013). The settings pre-approve `uv run` only with `--locked`; `uv sync` and `uv add` ask the owner |
-| Paper trading only | Live credentials are kept off this machine, which ADR 0009 called "the real control", so a call to a live host fails at Alpaca. The adapter has no execution client. When one is written, the paper-only check is written with it, in its configuration |
+| Paper trading only | Live credentials are kept off this machine, which ADR 0009 called "the real control", so a call to a live host fails at Alpaca. The execution client, written later that day, holds the paper-only check in its configuration: `AlpacaExecutionClientConfig` refuses `paper` other than `True` and any `url_override`, and the client builds alpaca-py's clients with `paper=True` whatever the config holds |
 | An unattended run only reports | The task's prompt. `ask` rules apply in every permission mode, so a push, a pin move and an install still wait for the owner; an edit or a commit in a bypass-mode run is held by the prompt alone |
 
 The guard also refused these, and nothing refuses them now: `pip install` and `uv pip install`; `uv run`
@@ -58,7 +58,10 @@ and the checks.
    command gets past it. A prompt is the owner's to answer; an agent does not route around one.
 5. **Watch: the sandbox.** Claude Code's docs name it for enforcement "that doesn't depend on the command
    text". It covers shell commands only. It is not adopted: with no live credentials there is nothing
-   for it to protect yet. Revisit when the execution client is written.
+   for it to protect yet. Revisit when the execution client is written. It was, on 2026-11-10 (pull
+   request 24), so the revisit is due and is the owner's to close. Its reason, no live credential on
+   this machine, was not re-checked for this note (UNVERIFIED). Paper credentials come next, for the
+   paper tests.
 
 Option 1 is what failed: `${CLAUDE_PROJECT_DIR}` is "the project root where the session started", so a
 session that starts in another folder has no hook file to run. Option 2 is how the guard ran before, and
@@ -116,6 +119,9 @@ the quoted sentences verbatim.
 * `scripts/ci` — `uv lock --check`; `.github/workflows/ci.yml` — `uv sync --locked`;
   `.claude/settings.json` — the `allow` and `ask` lists (read; second reader).
 * `packages/canon-alpaca/README.md` — "There is no execution client"; `execution.py`, "Not started" (read).
+  After pull request 24 (`12f19a0`), the same day: `AlpacaExecutionClientConfig.__init__` raises on
+  `paper` other than `True` and on any `url_override`; the client's header says it is "always built with
+  `paper=True` and never with `url_override`" (read; 175 tests passed and 2 paper tests were skipped).
 * `git show 3e280e6:.claude/hooks/guard.sh` — 749 lines, and its header for the list under the table;
   `scripts/test-hooks`, 260 cases there and 21 here (read, run; second reader).
 * The session of 2026-11-10 that lost its tools, and the owner's instruction to remove the hook — this

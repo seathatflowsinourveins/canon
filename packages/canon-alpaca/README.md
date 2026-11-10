@@ -113,7 +113,7 @@ Each is stated where it is implemented, with its source.
   Alpaca's order rule is price-dependent: at most 2 decimals at or above $1.00, 4 below. `Equity` takes one
   increment, so the finer one is used and market data is never rounded: a bar, quote or trade price
   finer than 0.0001 is refused, not rounded (`Instrument.make_price` would round it silently). The
-  instrument does not stop a sub-penny order at or above $1.00; the execution slice must.
+  instrument does not stop a sub-penny order at or above $1.00; the execution client denies one (below).
 * **Quotes need both sides.** A quote with a zero or negative bid or ask price is dropped, since a
   `QuoteTick` cannot hold a one-sided quote. Outside market hours and on thin names such quotes can be
   most of them, so the first per symbol is logged as a warning with the reason, then the running count
