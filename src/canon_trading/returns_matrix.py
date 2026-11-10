@@ -134,7 +134,8 @@ def session_sharpe(series: pd.Series) -> float:
     return float(_portfolio(series).sharpe_ratio)
 
 
-def _is_ns_text(value: object) -> bool:
+def is_ns_text(value: object) -> bool:
+    """Whether `value` is a whole number of nanoseconds as `record_trial` writes it, `str(int)`."""
     return (
         isinstance(value, str)
         and value.isascii()
@@ -161,7 +162,7 @@ def _check_shape(
         raise ReturnsRejected(f"{name}: returns_series is {type(returns).__name__}, not a mapping")
     if not isinstance(session_days, list):
         raise ReturnsRejected(f"{name}: session_days is {type(session_days).__name__}, not a list")
-    bad_key = next((key for key in returns if not _is_ns_text(key)), None)
+    bad_key = next((key for key in returns if not is_ns_text(key)), None)
     if bad_key is not None:
         raise ReturnsRejected(f"{name}: returns_series key {bad_key!r} is not nanoseconds as text")
     bad = next(
@@ -172,7 +173,7 @@ def _check_shape(
         raise ReturnsRejected(
             f"{name}: returns_series value {returns[bad]!r} on {bad} is not a number"
         )
-    bad_day = next((day for day in session_days if not _is_ns_text(day)), None)
+    bad_day = next((day for day in session_days if not is_ns_text(day)), None)
     if bad_day is not None:
         raise ReturnsRejected(f"{name}: session day {bad_day!r} is not nanoseconds as text")
     return returns, session_days

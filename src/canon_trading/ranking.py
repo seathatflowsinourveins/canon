@@ -25,9 +25,13 @@ pass undeflated. A return that is not finite is refused, for every trial, by
 It also stops on what ADR 0035 terms 5 and 6 and ADR 0041 add: a configuration with a failed or
 `RUNNING` record that no later record of it resolves (a record with a key and no sample number is
 read as on the current sample, unless it ran), an idle one, records of one configuration that
-disagree, one not run on the study's current sample, returns ADR 0010 step 2 rejects or a record not
-in the shape `record_trial` writes, records that read one bar type as different bars, trials that do not
-cover the same session days over the sample, and a record with no key not marked by `mark_not_run`.
+disagree (their outcome included), one not run on the study's current sample, returns ADR 0010 step 2
+rejects or a record not in the shape `record_trial` writes, records that read one bar type as
+different bars, trials that do not cover the same session days over the sample, and a record with no
+key not marked by `mark_not_run`. A record that ran on the current sample is in `record_trial`'s shape
+only if its run's bounds are the sample's, its `run_config_id` is its key, its digest names at least
+one bar type, each with a SHA-256 hex digest, and every return and session day falls on a UTC day of
+the sample (`canon_trading.ledger.session_day` of its two ends); Optuna validates no user attribute.
 Every such stop is gathered before one is raised. Configurations tied at the highest Sharpe ratio with
 the same returns are one pick; tied with other returns, they leave no single pick and stop it. N-hat
 below 1 is raised to 1, skfolio's least, and the DSR at N-hat is withheld when its benchmark is below
@@ -37,6 +41,7 @@ below 1 is raised to 1, skfolio's least, and the DSR at N-hat is withheld when i
 from __future__ import annotations
 
 import math
+import re
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC
@@ -54,8 +59,10 @@ from .ledger import current_sample
 from .ledger import has_key
 from .ledger import ran_something
 from .ledger import samples
+from .ledger import session_day
 from .returns_matrix import ReturnsRejected
 from .returns_matrix import daily_series
+from .returns_matrix import is_ns_text
 from .returns_matrix import returns_matrix
 from .returns_matrix import session_sharpe
 
@@ -67,6 +74,7 @@ if TYPE_CHECKING:
     from optuna.trial import FrozenTrial
 
 THRESHOLD = 0.95
+SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 
 
 class RankingStopped(Exception):
@@ -131,8 +139,11 @@ def _describe(trial: FrozenTrial) -> str:
     return f"#{trial.number} ({trial.user_attrs.get(OUTCOME, trial.state.name.lower())})"
 
 
-def _ran(trial: FrozenTrial) -> bool:
+def ran_to_the_end(trial: FrozenTrial) -> bool:
     """Whether the record ran to the end: finished, with outcome traded or idle (ADR 0035 term 5).
+
+    Public, with `on_current_sample`, so that a caller deciding which configurations to run again
+    (`canon_trading.variant_study`) applies the rule `rank` applies, and follows it if it changes.
 
     The ledger writes the outcome last, so a record that has one of those finished its run. A traded
     record told `FAIL` because its own Sharpe ratio is not finite ran to the end too; the gate stops
@@ -141,14 +152,23 @@ def _ran(trial: FrozenTrial) -> bool:
     return trial.state.is_finished() and trial.user_attrs.get(OUTCOME) in (TRADED, IDLE)
 
 
-def _known_sample(trial: FrozenTrial, known: set[int]) -> bool:
-    """Whether `trial` holds the number of one of the study's samples (ADR 0041 term 5).
+def on_current_sample(trial: FrozenTrial, sample: Sample, known: set[int]) -> bool:
+    """Whether `rank` reads `trial`, a record with a key, as on `sample`, the study's current one.
 
-    `rank` reads a record with a key and no such number as on the current sample if it did not run
-    to the end: it is what an error between the key's write and the sample's leaves, before any run,
-    and a later record of its key on the current sample resolves it; left out, its failure would not
-    count. One that ran to the end with no such number came from another writer, and stops.
+    `known` is the number of every sample the study has had. A record holding one of those numbers
+    is on the current sample if the number is `sample`'s. A record with a key and no such number is
+    read as on the current sample if it did not run to the end (ADR 0041 term 5): it is what an
+    error between the key's write and the sample's leaves, before any run, and a later record of its
+    key on the current sample resolves it; left out, its failure would not count. One that ran to the
+    end with no such number came from another writer: it is on no sample, and `rank` stops on it.
     """
+    if _known_sample(trial, known):
+        return trial.user_attrs["sample"] == sample.number
+    return not ran_to_the_end(trial)
+
+
+def _known_sample(trial: FrozenTrial, known: set[int]) -> bool:
+    """Whether `trial` holds the number of one of the study's samples (ADR 0041 term 5)."""
     number = trial.user_attrs.get("sample")
     return not isinstance(number, bool) and isinstance(number, int) and number in known
 
@@ -192,18 +212,21 @@ def rank(study: optuna.Study) -> RankingReport:
 
     chosen: dict[str, FrozenTrial] = {}
     on_sample: dict[str, list[FrozenTrial]] = {}
+    ran_on_sample: dict[
+        str, list[FrozenTrial]
+    ] = {}  # of those, the ones that ran, for what names them
     read: list[FrozenTrial] = []  # every record on the current sample that ran to the end
     for key, every in by_key.items():
         records = []
         for trial in every:
-            if not _known_sample(trial, known) and _ran(trial):
+            if on_current_sample(trial, sample, known):
+                records.append(trial)
+            elif not _known_sample(trial, known):  # so it ran to the end
                 stops.append(
                     f"#{trial.number} ({trial.user_attrs[OUTCOME]}) ran with sample "
                     f"{trial.user_attrs.get('sample')!r}, not a sample number of the study: not in "
                     "the shape record_trial writes (ADR 0041)",
                 )
-            elif not _known_sample(trial, known) or trial.user_attrs["sample"] == sample.number:
-                records.append(trial)
         if not records:
             stops.append(
                 f"{key}: tried ({', '.join(map(_describe, every))}) but not run on the current "
@@ -211,17 +234,26 @@ def rank(study: optuna.Study) -> RankingReport:
             )
             continue
         on_sample[key] = records
-        ran = [trial for trial in records if _ran(trial)]
-        read.extend(ran)
+        ran = [trial for trial in records if ran_to_the_end(trial)]
         if not ran:
             stops.append(
                 f"{key}: no record ran to the end ({', '.join(map(_describe, records))})",
             )
             continue
+        faulty = [(trial, faults) for trial in ran if (faults := _shape_faults(trial, sample))]
+        if faulty:
+            stops.extend(
+                f"{key}: {_describe(trial)} is not in the shape record_trial writes on "
+                f"{sample.describe()}: {'; '.join(faults)} (ADR 0041)"
+                for trial, faults in faulty
+            )
+            continue
+        read.extend(ran)
+        ran_on_sample[key] = ran
         unresolved = [
             trial
             for trial in records
-            if not _ran(trial) and not any(other.number > trial.number for other in ran)
+            if not ran_to_the_end(trial) and not any(other.number > trial.number for other in ran)
         ]
         if unresolved:
             stops.append(
@@ -230,16 +262,23 @@ def rank(study: optuna.Study) -> RankingReport:
             )
             continue
         first = ran[0]
-        keep = ("backtest_start", "backtest_end", "returns_series", "session_days", "data_digest")
+        keep = (
+            OUTCOME,
+            "backtest_start",
+            "backtest_end",
+            "returns_series",
+            "session_days",
+            "data_digest",
+        )
         differ = [
             t for t in ran[1:] if any(t.user_attrs.get(a) != first.user_attrs.get(a) for a in keep)
         ]
         if differ:
             stops.append(
                 f"{key}: records {', '.join(map(_describe, [first, *differ]))} ran the same "
-                f"configuration on {sample.describe()} and disagree on their range, returns, "
-                "session days or data; if the catalog or this code changed, move the sample and "
-                "run every configuration again (ADR 0041)",
+                f"configuration on {sample.describe()} and disagree on their outcome, range, "
+                "returns, session days or data; if the catalog or this code changed, move the "
+                "sample and run every configuration again (ADR 0041)",
             )
             continue
         if first.user_attrs[OUTCOME] == IDLE:
@@ -280,7 +319,7 @@ def rank(study: optuna.Study) -> RankingReport:
         raise RankingStopped(_stopped(study, n, stops))
 
     values = [sharpes[key] for key in matrix.columns]
-    everyone = "; ".join(_named(key, on_sample[key]) for key in matrix.columns)
+    everyone = "; ".join(_named(key, ran_on_sample[key]) for key in matrix.columns)
     v = float(measures.variance(values))
     if all(math.isclose(value, values[0]) for value in values):
         raise RankingStopped(
@@ -307,7 +346,7 @@ def rank(study: optuna.Study) -> RankingReport:
                 [
                     "share the highest Sharpe ratio within floating-point noise, with returns that "
                     "differ, so there is no one pick (ADR 0031): "
-                    + "; ".join(_named(key, on_sample[key]) for key in tied),
+                    + "; ".join(_named(key, ran_on_sample[key]) for key in tied),
                 ],
             ),
         )
@@ -316,7 +355,9 @@ def rank(study: optuna.Study) -> RankingReport:
     if not math.isfinite(dsr):
         raise RankingStopped(
             _stopped(
-                study, n, [f"skfolio gives DSR {dsr} for the pick {_named(pick, on_sample[pick])}"]
+                study,
+                n,
+                [f"skfolio gives DSR {dsr} for the pick {_named(pick, ran_on_sample[pick])}"],
             )
         )
 
@@ -344,7 +385,7 @@ def rank(study: optuna.Study) -> RankingReport:
         last_day=matrix.index[-1].date().isoformat(),
         pick=pick,
         tied=tuple(tied[1:]),
-        pick_trials=tuple(sorted(t.number for key in tied for t in on_sample[key])),
+        pick_trials=tuple(sorted(t.number for key in tied for t in ran_on_sample[key])),
         sharpe=sharpes[pick],
         dsr=dsr,
         passed=dsr >= THRESHOLD,
@@ -406,22 +447,69 @@ def _n_hat(
     return n_hat, dsr, ("; ".join(notes) + ".") if notes else None
 
 
-def _data_disagreements(read: list[FrozenTrial], sample: Sample) -> list[str]:
-    """One reason for each bar type that records on `sample` read as different bars (ADR 0041)."""
-    by_digest: dict[str, dict[str, list[FrozenTrial]]] = defaultdict(lambda: defaultdict(list))
-    malformed = []
-    for trial in read:
-        digests = trial.user_attrs.get("data_digest")
-        if not isinstance(digests, dict) or not all(
-            isinstance(b, str) and isinstance(d, str) for b, d in digests.items()
-        ):
-            malformed.append(
-                f"#{trial.number}: data_digest {digests!r} is not in the shape record_trial writes"
+def _shape_faults(trial: FrozenTrial, sample: Sample) -> list[str]:
+    """How `trial`, a record that ran on `sample`, differs from what `record_trial` writes there.
+
+    NautilusTrader sets a run's `backtest_start` to the start it was given and its `backtest_end` to
+    the engine's clock when the run ends, at or before the end it was given (`run_impl` and
+    `end_impl`, `crates/backtest/src/engine.rs` at the pinned commit), so the start must be the
+    sample's and the end within it. The returns' and session days' own form is `daily_series`'s to
+    refuse; here only their range.
+    """
+    attrs = trial.user_attrs
+    faults = []
+    start, end = attrs.get("backtest_start"), attrs.get("backtest_end")
+    if not (isinstance(start, int) and not isinstance(start, bool) and start == sample.start):
+        faults.append(f"backtest_start {start!r}, not the start of {sample.describe()}")
+    if not (
+        isinstance(end, int) and not isinstance(end, bool) and sample.start <= end <= sample.end
+    ):
+        faults.append(f"backtest_end {end!r}, not within {sample.describe()}")
+    if attrs.get("run_config_id") != attrs.get("config_key"):
+        faults.append(f"run_config_id {attrs.get('run_config_id')!r}, not its config key")
+    digests = attrs.get("data_digest")
+    if (
+        not isinstance(digests, dict)
+        or not digests
+        or not all(
+            isinstance(bar_type, str)
+            and bar_type
+            and isinstance(digest, str)
+            and SHA256_HEX.fullmatch(digest)
+            for bar_type, digest in digests.items()
+        )
+    ):
+        faults.append(f"data_digest {digests!r}")
+    low, high = session_day(sample.start), session_day(sample.end)
+    for values, what in (
+        (attrs.get("returns_series"), "returns_series has a key on"),
+        (attrs.get("session_days"), "session_days has"),
+    ):
+        days = values if isinstance(values, dict | list) else ()
+        outside = sorted(
+            int(day) for day in days if is_ns_text(day) and not low <= int(day) <= high
+        )
+        if outside:
+            faults.append(
+                f"{what} {_day(outside[0])}, outside {sample.describe()} ({len(outside)} in all)"
             )
-            continue
-        for bar_type, digest in digests.items():
+    return faults
+
+
+def _day(ns: int) -> str:
+    return datetime.fromtimestamp(ns // 1_000_000_000, UTC).date().isoformat()
+
+
+def _data_disagreements(read: list[FrozenTrial], sample: Sample) -> list[str]:
+    """One reason for each bar type that records on `sample` read as different bars (ADR 0041).
+
+    Every record in `read` has passed `_shape_faults`, so its digest is a mapping of texts.
+    """
+    by_digest: dict[str, dict[str, list[FrozenTrial]]] = defaultdict(lambda: defaultdict(list))
+    for trial in read:
+        for bar_type, digest in trial.user_attrs["data_digest"].items():
             by_digest[bar_type][digest].append(trial)
-    return malformed + [
+    return [
         f"{bar_type}: records on {sample.describe()} read different bars: "
         + "; ".join(
             f"{digest[:12]} by {', '.join(f'#{t.number}' for t in trials)}"

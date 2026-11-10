@@ -41,6 +41,12 @@ two processes crashed with "table studies already exists" (measured on this mach
 lock guards first creation only, not recording; Optuna's FAQ keeps `JournalFileBackend` for parallel
 optimisation, and ADR 0035 keeps `RDBStorage` on SQLite for the reasons it gives.
 
+The same lock serialises moving a study's sample (ADR 0041 term 5), which reads the `samples` list
+and writes it back: Optuna's `Study.set_user_attr` replaces a study attribute whole
+(`RDBStorage.set_study_user_attr`, 5.0.0) and offers no compare-and-set, so two moves without the lock
+both took the next number and one was lost. A move needs the ledger's file to name the lock, so it
+takes only a study `create_ledger_study` or `open_study` opened, which the module keeps a weak map of.
+
 A study is created in two writes, its name and then its sample, under the creation lock. A creation
 interrupted between them leaves a name with no sample and no trial. The next `create_ledger_study` of
 that name takes it through Optuna's `load_if_exists` and writes the sample, so nothing has to be
@@ -51,9 +57,12 @@ A session day (ADR 0035 term 3) is a UTC day on which a bar of the run became av
 a bar at exactly 00:00 UTC counting for the day ending there, as the daily series books it.
 `BacktestResult` has no such list. The session days and the data digest are taken from the bars the
 run read: those the engine's cache kept (`BacktestRun.bars`, from `Cache.bars`, with the run built by
-`backtest_run_config(keep_bars=True)` so the cache can keep every one), not a later read of the
-catalog, which may have changed after the replay. A run whose cache holds another number of bars than
-it replayed (`BacktestResult.iterations`), or a bar outside the sample, is told `FAIL`.
+`checked_run_config` so the cache can keep every one), not a later read of the catalog, which may have
+changed after the replay. A run whose cache holds another number of bars than it replayed
+(`BacktestResult.iterations`), or a bar outside the sample, is told `FAIL`. So is a run whose bars
+differ from those the coverage check read (`CheckedRunConfig.bars`): the node reads the catalog again
+from its path, and a catalog replaced between the check and the replay was never checked to cover the
+sample. The two are compared by their data digest, so the check and the run agree on one read.
 """
 
 from __future__ import annotations
@@ -64,6 +73,7 @@ import json
 import math
 import subprocess
 import traceback
+import weakref
 from contextlib import ExitStack
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -82,7 +92,7 @@ from optuna.trial import TrialState
 
 from .backtest import FEE_RATES
 from .backtest import VENUE_SETTINGS
-from .backtest import backtest_run_config
+from .backtest import checked_run_config
 from .backtest import run_backtest_config
 from .ma_cross import MaCross
 from .returns_matrix import DAY_NS
@@ -114,6 +124,10 @@ FAILED = "failed"
 SAMPLES = "samples"
 NOT_RUN = "not_run"
 STRATEGY_CLASS = f"{MaCross.__module__}:{MaCross.__qualname__}"
+
+
+# The ledger file of each study `create_ledger_study` or `open_study` opened, for its lock.
+_OPENED: weakref.WeakKeyDictionary[optuna.Study, Path] = weakref.WeakKeyDictionary()
 
 
 class LedgerNotFound(LookupError):
@@ -195,21 +209,32 @@ def create_ledger_study(
     path = _ledger(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with ExitStack() as opened:
-        with (path.parent / f"{path.name}.lock").open("a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            try:
-                storage = opened.enter_context(_storage(path, "rwc"))
-                study = optuna.create_study(
-                    study_name=name, storage=storage, direction="maximize", load_if_exists=True
+        with _ledger_lock(path):
+            storage = opened.enter_context(_storage(path, "rwc"))
+            study = optuna.create_study(
+                study_name=name, storage=storage, direction="maximize", load_if_exists=True
+            )
+            if not _left_by_an_interrupted_creation(study):
+                raise optuna.exceptions.DuplicatedStudyError(
+                    f"the ledger at {path} already holds study {name!r}; open_study opens it",
                 )
-                if not _left_by_an_interrupted_creation(study):
-                    raise optuna.exceptions.DuplicatedStudyError(
-                        f"the ledger at {path} already holds study {name!r}; open_study opens it",
-                    )
-                study.set_user_attr(SAMPLES, [_sample_attr(sample)])
-            finally:
-                fcntl.flock(lock, fcntl.LOCK_UN)
-        yield study
+            study.set_user_attr(SAMPLES, [_sample_attr(sample)])
+        _OPENED[study] = path
+        try:
+            yield study
+        finally:
+            _OPENED.pop(study, None)
+
+
+@contextmanager
+def _ledger_lock(path: Path) -> Generator[None]:
+    """The exclusive `flock` on `trials.db.lock` beside the ledger at `path` (module header)."""
+    with (path.parent / f"{path.name}.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
 
 
 def _left_by_an_interrupted_creation(study: optuna.Study) -> bool:
@@ -250,7 +275,11 @@ def open_study(name: str, path: Path | None = None) -> Generator[optuna.Study]:
                 "before the sample was written, and create_ledger_study completes it",
             )
         samples(study)
-        yield study
+        _OPENED[study] = path
+        try:
+            yield study
+        finally:
+            _OPENED.pop(study, None)
 
 
 @contextmanager
@@ -301,10 +330,21 @@ def move_sample(
 
     The same range again is a new sample too: that is how a corrected catalog is taken in. Every
     configuration the study has tried must then be run on the new sample before it can be ranked.
+    The samples are read and written under the ledger's lock (module header), so two moves at once
+    are both kept, numbered one after the other. A study not opened by `create_ledger_study` or
+    `open_study` raises `ValueError`: its lock cannot be named.
     """
-    history = samples(study)
-    sample = Sample(history[-1].number + 1, *_range(start, end))
-    study.set_user_attr(SAMPLES, [*map(_sample_attr, history), _sample_attr(sample)])
+    first, last = _range(start, end)
+    path = _OPENED.get(study)
+    if path is None:
+        raise ValueError(
+            f"study {study.study_name!r} was not opened by open_study or create_ledger_study, so "
+            "the ledger's lock cannot be held to move its sample; open it with open_study",
+        )
+    with _ledger_lock(path):
+        history = samples(study)
+        sample = Sample(history[-1].number + 1, first, last)
+        study.set_user_attr(SAMPLES, [*map(_sample_attr, history), _sample_attr(sample)])
     return sample
 
 
@@ -469,11 +509,12 @@ def record_trial(
 
     ADR 0035 terms 2 and 3 and ADR 0041. The key is computed from the configs first, and the strategies
     are built from them here, so what is hashed is what runs: a config changed afterwards changes
-    nothing. What `backtest_run_config` refuses, or a value with no stable text form, raises before
+    nothing. What `checked_run_config` refuses, or a value with no stable text form, raises before
     anything is recorded: such a call is not a trial. The trial is then asked for, so a run that never
     returns stays in the study as `RUNNING`. The run is bounded by the study's current sample and built
     with the key as its `id`; its session days and data digest are those of the bars the run read, as
-    the engine's cache kept them (module header). A run that raises, or whose result cannot be
+    the engine's cache kept them, and those must be the bars the coverage check read (module header).
+    A run that raises, or whose result cannot be
     recorded, is told `FAIL` with outcome `failed` and its error, and the exception passes through. A
     run with no filled order is told `FAIL` with outcome `idle`; any other `COMPLETE` with `traded`, or `FAIL`, still `traded`, if its
     Sharpe ratio is not finite. The outcome is written last, so a record that has one ran to the end.
@@ -489,7 +530,7 @@ def record_trial(
     built = [MaCross(strategy) for strategy in strategies]
     if config_key(trial_config(strategies, starting_balances=starting_balances)) != key:
         raise RuntimeError("a strategy config changed while its strategies were built")
-    run_config = backtest_run_config(
+    checked = checked_run_config(
         catalog_path,
         built,
         starting_balances=starting_balances,
@@ -497,8 +538,10 @@ def record_trial(
         run_config_id=key,
         start=sample.start,
         end=sample.end,
-        keep_bars=True,
     )
+    run_config = checked.config
+    checked_digest = data_digest(_in_order(checked.bars))
+    del checked  # only the digest is kept, so the checked bars are not held through the run
     bar_types = [str(bar_type) for data in run_config.data for bar_type in data.bar_types or ()]
     if bar_types != config["data"]["bar_types"]:
         raise RuntimeError(f"the run loads {bar_types}, not the bar types its key names")
@@ -512,10 +555,7 @@ def record_trial(
         run = run_backtest_config(run_config, built)
         result = run.result
         returns = {str(ns): value for ns, value in sorted(result.returns_series.items())}
-        # A total order: bars that tie on both times are taken in the order of their text (ADR 0041).
-        bars = sorted(
-            run.bars, key=lambda bar: (str(bar.bar_type), bar.ts_init, bar.ts_event, str(bar))
-        )
+        bars = _in_order(run.bars)
         if len(bars) != result.iterations:
             raise RuntimeError(
                 f"the engine's cache holds {len(bars)} bars and the run replayed "
@@ -528,13 +568,20 @@ def record_trial(
                 f"the run replayed {len(outside)} bars outside {sample.describe()}, the first "
                 f"at {_date(outside[0].ts_init)}",
             )
+        digest = data_digest(bars)
+        if digest != checked_digest:
+            raise RuntimeError(
+                f"the run read other bars than the coverage check read over {sample.describe()}: "
+                "the catalog changed between the check and the replay, so what the run read was "
+                "never checked to cover the sample (ADR 0041); record the trial again",
+            )
         days = session_days(bars)
         trial.set_user_attr("run_config_id", result.run_config_id)
         trial.set_user_attr("backtest_start", result.backtest_start)
         trial.set_user_attr("backtest_end", result.backtest_end)
         trial.set_user_attr("returns_series", returns)
         trial.set_user_attr("session_days", days)
-        trial.set_user_attr("data_digest", data_digest(bars))
+        trial.set_user_attr("data_digest", digest)
         traded = any(order.filled_qty.is_positive() for order in run.orders)
         sharpe = _session_sharpe(returns, days) if traded else math.nan
         outcome = TRADED if traded else IDLE
@@ -549,13 +596,20 @@ def record_trial(
     return RecordedTrial(number=trial.number, config_key=key, outcome=outcome, run=run)
 
 
+def _in_order(bars: Sequence[Bar]) -> list[Bar]:
+    """`bars` in a total order: bars that tie on both times by their text (ADR 0041 term 3)."""
+    return sorted(bars, key=lambda bar: (str(bar.bar_type), bar.ts_init, bar.ts_event, str(bar)))
+
+
 def mark_not_run(study: optuna.Study, number: int) -> None:
     """Record that trial `number` of `study`, a record with no config key, ran no backtest (ADR 0041).
 
     `record_trial` writes the key before it starts a run, so a record without one ran nothing: it is
     what a process killed between `ask` and that write leaves. The record is kept; a `RUNNING` one is
     told `FAIL`, through `Study.tell`, which takes a trial number. Its number joins the study user
-    attribute `not_run`, and the ranking leaves it out of N. A record that has a key is refused.
+    attribute `not_run`, and the ranking leaves it out of N. A record that has a key is refused, and
+    so is one that shows a run (`ran_something`), a result told by a writer other than `record_trial`
+    included: a trial of an unknown configuration, which nothing clears.
     Use it only on a record whose process is gone: a live one would have its run told `FAIL`.
     """
     found = [trial for trial in study.get_trials(deepcopy=False) if trial.number == number]
@@ -586,10 +640,21 @@ def has_key(trial: FrozenTrial) -> bool:
 
 
 def ran_something(trial: FrozenTrial) -> bool:
-    """Whether `trial` shows a run: an outcome of traded or idle, or returns or session days."""
+    """Whether `trial` shows a run: an outcome of traded or idle, returns or session days, or a result.
+
+    A result is what Optuna keeps of an evaluation (`optuna/trial/_state.py` and `_frozen.py` at
+    5.0.0): the state `COMPLETE` or `PRUNED`, a value told, or an intermediate value reported. A
+    writer that knows nothing of the ledger's attributes, such as `Study.optimize` or a bare `tell`,
+    leaves one; `record_trial` never leaves a keyless record with any of them.
+    """
     attrs = trial.user_attrs
     return (
-        attrs.get(OUTCOME) in (TRADED, IDLE) or "returns_series" in attrs or "session_days" in attrs
+        attrs.get(OUTCOME) in (TRADED, IDLE)
+        or "returns_series" in attrs
+        or "session_days" in attrs
+        or trial.state in (TrialState.COMPLETE, TrialState.PRUNED)
+        or trial.values is not None
+        or bool(trial.intermediate_values)
     )
 
 
