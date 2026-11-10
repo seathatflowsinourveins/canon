@@ -47,7 +47,8 @@ limits:
    start has none. Such a session does not start Orca either: `orca open` hands the app that session's
    environment (ADR 0018).
 2. **`--agent claude`, always.** The guides' examples start Codex and document no default; no other
-   runtime is adopted (ADR 0018 rule 5).
+   runtime is adopted (ADR 0018 rule 5). Superseded for review workers by ADR 0043: `--agent codex` for
+   a worker that reads a change and reports.
 3. **A worker that changes files gets its own workspace** (`--worktree new-top-level`). The caller's
    workspace is shared only for work that reads.
 4. **Nothing goes through an Orca terminal to get past a prompt.** A push, a pin move and an install stay
@@ -57,6 +58,7 @@ limits:
 5. **The repo's own lanes come first.** Research, record checks and code review stay subagents (ADR 0017).
    An Orca worker is for work that needs its own workspace or that the owner asks to watch, and it runs on
    the model `canon/models.json` gives that work, named with `--model` when Orca's default differs.
+   A Codex reviewer is an Orca worker, not a subagent, on Codex's own defaults: ADR 0043.
 6. **Not used:** remote servers and SSH placement, the browser and desktop control, plugins, automations,
    session search, and the other skills Orca bundles.
 
@@ -115,3 +117,4 @@ Read 2026-11-10.
 * Second reader, 2026-11-10 (`evidence-verifier`): every quote held. It corrected the claim of a default
   runtime, what Yolo covers and how often the guides change, had the exceptions to ADR 0004 and to ADR
   0018's driver stated in full, and supplied the model and review limits. All are made above.
+* ADR 0043, 2026-11-10 — supersedes limits 2 and 5 for review workers; a pointer line was added to each.

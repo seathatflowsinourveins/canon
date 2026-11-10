@@ -484,6 +484,22 @@
       "adr": "0018"
     },
     {
+      "id": "codex-cli",
+      "field": "agent-harness",
+      "repo": "openai/codex",
+      "track": "tag:rust-v0.167.0",
+      "role": "tool",
+      "license": "Apache-2.0",
+      "why": "OpenAI's Codex CLI, a second agent runtime from another model family, used only as an Orca worker that reads a change and reports findings: an additional reader beside /code-review that never edits, lands or blocks (ADR 0043). Installed machine-level by the owner (mise use -g codex@0.167.0, aqua:openai/codex), not in mise.toml; check with codex --version. Upstream tags about eight rust-vX.Y.Z-alpha.N pre-releases per stable release; scripts/canon outdated ignores them for this stable pin. rust-v0.167.1 was tagged 2026-11-10 with no release and is not adopted.",
+      "evidence": [
+        "https://github.com/openai/codex/releases",
+        "https://raw.githubusercontent.com/openai/codex/rust-v0.167.0/LICENSE",
+        "https://learn.chatgpt.com/docs/agent-approvals-security",
+        "https://www.onorca.dev/docs/agents/supported"
+      ],
+      "adr": "0043"
+    },
+    {
       "id": "python",
       "field": "toolchain",
       "repo": "python/cpython",

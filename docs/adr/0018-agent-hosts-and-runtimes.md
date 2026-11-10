@@ -34,7 +34,7 @@ runtime. What does the repository commit for it, and what holds a second runtime
 ## Decision Outcome
 
 Chosen: **option 2**. Orca is the cockpit and Claude Code stays the only runtime. Option 1 keeps working
-beside it; options 4 and 5 are not adopted.
+beside it; options 4 and 5 are not adopted. (The Codex CLI is since adopted as a reviewer: ADR 0043.)
 
 This record first asked whether a host's file had converged across public repositories, and left the
 request undone. That was the wrong test: a cockpit is a personal tool, as an editor is. Orca is chosen
@@ -58,6 +58,7 @@ because the owner named it, its licence is MIT, its source runs the installed `c
 5. **Claude Code is the only runtime adopted.** Anthropic: "In every approach the workers are Claude
    sessions. To involve a different tool, expose it to Claude as an MCP server." OpenAI has removed
    `codex mcp-server`, which leaves option 5 no documented route to Codex today.
+   Superseded by ADR 0043: the Codex CLI is adopted as an Orca worker that reads a change and reports.
 6. **A second runtime is adopted like any upstream**, when there is a job for it: its own worktree and
    branch, landing through rule 4 with the review ADR 0017 requires, and no credentials in its environment.
 7. **Not adopted: option 4.** Orca labels its orchestration commands "Experimental" and no other host
@@ -131,3 +132,5 @@ Read 2026-11-10. "Lane": a research subagent fetched and summarised the page. "S
 * Second reader, 2026-11-10: every quote held in each version. This one was changed that day from
   `proposed` with option 1, on the owner's correction that a host is a cockpit and not an alternative to
   Claude Code; the reader's corrections are made above.
+* ADR 0043, 2026-11-10 — supersedes rule 5 on the owner's instruction to use other runtimes as Orca
+  workers where that raises quality; pointer lines were added to rule 5 and to the outcome, and nothing else changed.
