@@ -79,7 +79,7 @@ dependency, pattern and practice traces to a pinned upstream or a dated source. 
 | 0007 | Observability: built-ins, local event ledger, OpenTelemetry later |
 | 0008 | Toolchain: Command Line Tools, mise, uv, native Claude Code |
 | 0009 | Trading foundation: NautilusTrader, alpaca-py, adapter per upstream guide |
-| 0010 | Strategy evaluation (proposed): variant comparison is an open gap |
+| 0010 | Strategy evaluation: every trial in a ledger, the pick's deflated Sharpe ratio at least 0.95, then paper |
 | 0011 | Automation: scripts run free and often; a model runs weekly on what they flag |
 | 0012 | Repository layout: a uv workspace with the adapter as its own package |
 | 0013 | Quality gates: one script, pinned tools, the same checks here and in CI |
@@ -96,6 +96,7 @@ dependency, pattern and practice traces to a pinned upstream or a dated source. 
 | 0024 | Fill history for the Alpaca adapter (proposed): Alpaca's activities endpoint through alpaca-py's `get`, held until a paper test settles the trade ID |
 | 0025 | Claude Code's sandbox: part of it adopted, subject to a trial that costs no lane a stop; nothing is on yet |
 | 0026 | The weekly model run: a desktop scheduled task, gated by scripts, that reports and does not decide |
+| 0027 | Overfitting probability (proposed): a diagnostic beside the Sharpe gate; no implementation adopted |
 
 ## Automation
 
