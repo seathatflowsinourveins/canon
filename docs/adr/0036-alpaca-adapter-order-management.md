@@ -138,6 +138,20 @@ Read 2026-11-10; "raw": fetched with `curl` and read, not summarised. NautilusTr
 * Paper, 2026-11-10, logs kept outside the repo: the replace observation, 18:52 UTC, 3 runs through
   alpaca-py with `raw_data=True`; TC-E41 as written, the sell refused 241 times; five failed runs, two on the
   test's code, one on connect timeouts, two refusing to start on open orders on the account; then all passed.
+* Second reader after landing, 2026-11-10: an independent review of the modify change found three
+  defects, each reproduced through the stand-in venue and a real node, and fixed with a regression test
+  each: a filled replacement whose `replaced` was missed went unreported, so its fill was lost; a replace
+  refused on the HTTP answer and on the stream gave two `OrderModifyRejected`; a `replaced` delivered
+  twice gave two `OrderUpdated` (whether Alpaca repeats it is UNVERIFIED). Two more independent reviews the
+  same day added: a trace missed in the start-up window kept for the session; a fill on a replacement
+  before its `replaced` applied to the old terms (an overfill dropped); a late cancel of the replaced order
+  closing the replacement; `pending_replace` failing start-up; a replacement replaced again before its
+  `replaced` was read; a refused second modify taken for a retry; answers kept for the session; a chain
+  past the limit walked again each time. Each reproduced and is fixed with a test, following upstream's
+  Binance spot `dispatch.rs` (`record_order_update`, `record_order_update_from_fill`,
+  `defer_replace_cancel`). Not fixed, UNVERIFIED: whether a replacement's `filled_qty` counts the fills of
+  the order it replaced. A rejected replacement after a fill now leaves the fill as the outcome, since
+  NautilusTrader drops a modify rejection for a filled order (observed).
 * NautilusTrader `RELEASES.md`: v2.0.0rc9, tagged 2026-11-10, adds `OrderCancelDenied` and
   `OrderModifyDenied` (read by the second reader); the pin stays rc8 until it moves through
   `adopt-upstream`.
