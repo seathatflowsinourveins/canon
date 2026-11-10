@@ -446,7 +446,8 @@ def test_the_regular_window_node_runs_upstreams_managed_stop(tmp_path) -> None:
         WindowConfig(log_dir=tmp_path), wind_down_at=at, log_name="r"
     )
     try:
-        assert s.manage_stop and not s.extended_hours
+        assert s.manage_stop and not s.extended_hours and s.warm_up
+        assert str(s.history_bar_type) == "SPY.ALPACA-1-MINUTE-LAST-EXTERNAL"
     finally:
         node.dispose()
 
@@ -563,7 +564,7 @@ def test_a_short_found_on_a_bar_is_closed_before_anything_else() -> None:
     s = strategy(extended_hours=True)
     probe = Probe(s, working=False, held=Decimal(-1))
     s.is_exiting = lambda: False
-    s.on_bar(cast(Bar, None))  # the bar itself is not read
+    s.on_bar(cast(Bar, SimpleNamespace(bar_type=None)))  # a bar of no subscribed type
     assert probe.sent == [("BUY", Decimal(1))]
 
 
@@ -576,3 +577,164 @@ def test_the_wind_down_waits_for_a_working_order_before_the_market_exit() -> Non
     s.market_exit = lambda: exits.append("market_exit")
     s._wind_down(cast(TimeEvent, None))  # the alert only times it
     assert probe.sent == [("cancel_all", (SPY,))] and exits == []
+
+
+LIVE = BarType.from_str("SPY.ALPACA-1-MINUTE-LAST-INTERNAL")
+HISTORY = BarType.from_str("SPY.ALPACA-1-MINUTE-LAST-EXTERNAL")
+
+
+class FirstBar(SessionMaCross):
+    """Records, at its first live bar, whether the averages were already initialized."""
+
+    def __init__(self, config: SessionMaCrossConfig) -> None:
+        super().__init__(config)
+        self.ready_at_first_bar: bool | None = None
+        self.live_bars = 0
+
+    def on_bar(self, bar) -> None:
+        if bar.bar_type == LIVE:
+            self.live_bars += 1
+            if self.ready_at_first_bar is None:
+                self.ready_at_first_bar = self.hydrated and self.indicators_initialized()
+        super().on_bar(bar)
+
+
+def warm_up_run(tmp_path, *, warm_up: bool) -> FirstBar:
+    """Thirty minutes of the adapter's EXTERNAL one-minute bars in a catalog, as `request_bars` would get
+    them, then twenty minutes of live trades every ten seconds, from which the data engine builds the
+    INTERNAL bars the window trades on."""
+    from nautilus_trader.config import DataCatalogConfig
+    from nautilus_trader.model import AggressorSide
+    from nautilus_trader.model import TradeId
+    from nautilus_trader.model import TradeTick
+    from nautilus_trader.persistence import ParquetDataCatalog
+
+    probe = engine()
+    instrument = probe.cache.instrument(SPY)
+    probe.dispose()
+    history = []
+    for i in range(30):
+        close = Price(750 + i / 100, 4)
+        history.append(
+            Bar(
+                HISTORY,
+                Price(750, 4),
+                Price(750.40, 4),
+                Price(749.95, 4),
+                close,
+                Quantity.from_int(1000),
+                T0 + i * MINUTE,
+                T0 + (i + 1) * MINUTE,
+            )
+        )
+    catalog = ParquetDataCatalog(str(tmp_path))
+    catalog.write_instruments([instrument])
+    catalog.write_bars(history)
+    eng = BacktestEngine(
+        BacktestEngineConfig(
+            trader_id=TraderId("TESTER-001"),
+            risk_engine=RiskEngineConfig(**risk_limits(SPY)),
+            catalogs=[DataCatalogConfig(path=str(tmp_path))],
+        )
+    )
+    eng.add_venue(
+        VENUE,
+        OmsType.NETTING,
+        AccountType.CASH,
+        [Money(100_000, USD)],
+        fee_model=MakerTakerFeeModel(maker_rate=Decimal(0), taker_rate=Decimal(0)),
+    )
+    eng.add_instrument(instrument)
+    start = T0 + 30 * MINUTE
+    eng.add_data(
+        [
+            TradeTick(
+                SPY,
+                Price(750.30 + (k % 3) / 100, 4),
+                Quantity.from_int(10),
+                AggressorSide.NO_AGGRESSOR,
+                TradeId(f"t{k}"),
+                start + k * 10_000_000_000,
+                start + k * 10_000_000_000,
+            )
+            for k in range(1, 121)
+        ]
+    )
+    s = FirstBar(
+        SessionMaCrossConfig(
+            bar_type=LIVE,
+            trade_size=Quantity.from_int(1),
+            fast_period=3,
+            slow_period=8,
+            warm_up=warm_up,
+            strategy_id=StrategyId("SessionMaCross-001"),
+            order_id_tag="001",
+        )
+    )
+    eng.add_strategy(s)
+    eng.run()
+    eng.dispose()
+    return s
+
+
+def test_the_warm_up_initializes_the_averages_before_the_first_live_bar(tmp_path) -> None:
+    """Upstream's pattern (concepts/strategies, "Handler example"): the averages are registered for the
+    adapter's EXTERNAL bars too, and the request's bars hydrate them before any live bar arrives."""
+    s = warm_up_run(tmp_path, warm_up=True)
+    assert s.history_bars == 30  # the whole hour asked for, which the averages keep the end of
+    assert s.history_dropped == 0
+    assert s.live_bars > 0 and s.ready_at_first_bar is True
+
+
+def test_without_the_warm_up_the_first_live_bar_finds_the_averages_cold(tmp_path) -> None:
+    s = warm_up_run(tmp_path, warm_up=False)
+    assert s.history_bars == 0
+    assert s.live_bars > 0 and s.ready_at_first_bar is False
+
+
+def unstarted(**changes: object) -> SessionMaCross:
+    s = strategy(bar_type=LIVE, warm_up=True, **changes)
+    s.hydrated, s.live_bars = False, 0
+    return s
+
+
+def history(count: int) -> list:
+    return [
+        Bar(
+            HISTORY,
+            Price(750, 4),
+            Price(751, 4),
+            Price(749, 4),
+            Price(750, 4),
+            Quantity.from_int(1),
+            T0 + i * MINUTE,
+            T0 + (i + 1) * MINUTE,
+        )
+        for i in range(count)
+    ]
+
+
+def test_a_warm_up_answer_after_a_live_bar_is_dropped_not_fed_after_it() -> None:
+    s = unstarted()
+    s.live_bars = 1  # a live bar has already reached the averages
+    s.on_historical_bars(history(13))
+    assert (s.history_bars, s.history_dropped, s.slow.count) == (0, 13, 0)
+
+
+def test_a_warm_up_answer_after_the_timeout_is_dropped() -> None:
+    s = unstarted()
+    s._on_history_timeout(cast(TimeEvent, None))
+    assert s.hydrated
+    s.on_historical_bars(history(13))
+    assert (s.history_bars, s.history_dropped) == (0, 13)
+
+
+def test_a_warm_up_answer_in_time_initializes_the_averages() -> None:
+    s = unstarted()
+    s.on_historical_bars(list(reversed(history(13))))  # fed oldest first whatever the order
+    assert s.history_bars == 13 and s.fast.initialized and s.slow.initialized
+
+
+def test_the_warm_up_needs_time_bars() -> None:
+    with pytest.raises(ValueError, match="needs time bars"):
+        strategy(bar_type=BarType.from_str("SPY.ALPACA-100-TICK-LAST-INTERNAL"), warm_up=True)

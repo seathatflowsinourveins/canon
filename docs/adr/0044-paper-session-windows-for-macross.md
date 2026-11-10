@@ -57,6 +57,8 @@ window (`EXTENDED_READY`) until one has passed on paper and the disconnect-hang 
 | A position over one share | `PositionCap`, a non-trading strategy in the node (a `DataActor` has no portfolio at the pin): the portfolio's net position every second, `shutdown_system` over one share | No upstream: no setting caps a position, and the trading state is not settable from Python |
 | A window's length and schedule | `minutes` (default 30, at most 60), clipped to the session's end, timed from Alpaca's clock; wind-down 120 s before; 300 s between windows; session and feed (IEX) from configuration; overnight refused until its data is observed | No upstream |
 
+What a window knows at start-up, what is lost between windows, and the averages' warm-up: ADR 0047.
+
 A window's node log and JSON report go to the per-user temporary folder, outside the repository. Windows
 trade SPY only: the $1,000 cap is sized for it. ADR 0037's `ema_cross_paper_node` gets the same
 execution-engine settings and the cap, through one builder, `paper_node.alpaca_paper_builder`.
@@ -73,7 +75,8 @@ a test queued behind a window outlasts it.
   paper account for session runs, as ADR 0010's last step already asks for separate accounts; that is the
   owner's to create.
 * Bad: the averages warm up on each window's own bars, 20 minutes of 30 at the defaults, so about 8
-  trade before the wind-down.
+  trade before the wind-down. ADR 0047 warms them from the adapter's bars instead (offline; on paper
+  UNVERIFIED; a late answer or a thin feed still leaves a window cold).
 * Bad: a window does not know half days; Alpaca's clock and calendar give its end.
 
 ### Confirmation
