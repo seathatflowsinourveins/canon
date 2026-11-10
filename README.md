@@ -139,10 +139,12 @@ Why it works this way, and what the keychain does not protect against:
 | Hosted watch (`canon check` on GitHub) | Once a day | No |
 | Landscape watch | Once a day, at session start | No |
 | Lane watchdog | Every 10 minutes while the Mac is awake | No |
+| Paper session | Every 35 minutes while the Mac is awake; a window only when Alpaca's clock says a session is open, on the `main` GitHub has then (ADR 0047) | No |
 | Weekly refresh | Weekly, when the desktop app is open | One session, short when nothing changed |
 | Dependency bot (Dependabot) | Weekly, on GitHub | Only when a session lands its pull request |
 
-`scripts/automation install` turns on the commit gate, the address check and the lane watchdog. The edit
+`scripts/automation install` turns on the commit gate, the address check, the lane watchdog and the paper
+session agent, whose runner keeps its own clone of `main` in `~/.claude/canon/`. The edit
 checks and the landscape watch are hooks in `.claude/settings.json`. The weekly refresh is a
 scheduled task in the Claude desktop app, and the dependency bot is `.github/dependabot.yml`, which GitHub
 runs.
@@ -173,7 +175,7 @@ runs.
 | `.claude/rules/` | Rules scoped to `canon/`, `docs/adr/` and trading code |
 | `.claude/skills/` | `adopt-upstream`, `new-adr`, `landscape-refresh`, `lane-report` |
 | `.claude/agents/` | `upstream-scout` (Sonnet), `evidence-verifier` (Opus) |
-| `home/` | Machine-level config: event ledger hook, status line, lane watchdog, user `CLAUDE.md` |
+| `home/` | Machine-level config: event ledger hook, status line, lane watchdog, paper session runner, user `CLAUDE.md` |
 | `mise.toml` | Pinned toolchain |
 
 ## How a decision gets made

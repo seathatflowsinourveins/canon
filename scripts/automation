@@ -10,10 +10,12 @@
 #   weekly refresh         weekly, desktop app open          Claude desktop scheduled task (created from a session)
 #
 # Usage: scripts/automation status | install | uninstall
-# `install` uses no sudo and touches: this clone's git config, ~/.claude/canon/, and one file in
-# ~/Library/LaunchAgents/. The agent's plist sets CLAUDE_CONFIG_DIR to the directory install used.
-# `uninstall` reverses exactly that, leaves the ledger and alert history alone, and exits non-zero naming
-# anything it could not remove.
+# `install` uses no sudo and touches: this clone's git config, ~/.claude/canon/ (the paper session's
+# runner and its clone of origin's main, ~/.claude/canon/paper-checkout, included), and two files in
+# ~/Library/LaunchAgents/. The watchdog's plist sets CLAUDE_CONFIG_DIR to the directory install used.
+# `uninstall` reverses exactly that, the trust `mise run` gave the clone's mise.toml included, leaves the
+# ledger, the alert history and the windows' records alone, and exits non-zero naming anything it could not
+# remove.
 # `status` exits non-zero when any row is not ok, including rows it could not check (UNKNOWN).
 #
 # Overrides: CLAUDE_CONFIG_DIR replaces ~/.claude; CANON_LAUNCHAGENTS_DIR replaces ~/Library/LaunchAgents
@@ -39,8 +41,13 @@ PAPER_MINUTES=25                                      # ...a 25-minute window: w
                                                       # the 300 s gap (session_window.GAP_SECS)
 PAPER_STALE=4200                                      # a record `running` after 70 minutes, if it gives none
 PAPER_SILENT=$((2 * PAPER_INTERVAL))                  # no firing for two intervals: the schedule has stopped
+PAPER_CHECKOUT="$CANON_HOME/paper-checkout"           # the clone each firing brings to origin's main
 PAPER_DIR="${CANON_PAPER_SESSION_DIR:-$(/usr/bin/getconf DARWIN_USER_TEMP_DIR 2>/dev/null)canon-paper-session}"
 STALE_DAYS=2
+# jq: a commit as status shows it, the first 12 of a full id plus what follows it ("with uncommitted
+# changes"), or the text a record gives in its place ("unknown: <why>")
+# shellcheck disable=SC2016  # jq program, not shell
+PAPER_COMMIT='def short: (. // "not recorded") as $c | if ($c | test("^[0-9a-f]{40}")) then $c[0:12] + $c[40:] else $c end; '
 
 note() { printf '%s\n' "$*"; }
 row() { printf '  %-18s %-9s %s\n' "$1" "$2" "$3"; }
@@ -103,16 +110,14 @@ write_plist() {
 EOF
 }
 
-# The session window agent runs `mise run paper:session --session auto` in this checkout: the task reads the
-# paper pair from the login keychain, takes the paper lock and runs one window, or prints "nothing to run"
-# when Alpaca's clock says no session is open (weekends and holidays included). Not run at load.
+# The session window agent runs ~/.claude/canon/paper-session.sh, which brings its own clone to the main the
+# origin has at that firing, or fails the firing, and runs `mise run paper:session --session auto` there:
+# the task reads the paper pair from the login keychain, takes the paper lock and runs one window, or prints
+# "nothing to run" when Alpaca's clock says no session is open (weekends and holidays included). Not run at
+# load. No checkout a person uses is read or written (ADR 0047).
+# write_paper_plist <mise> <origin url>
 write_paper_plist() {
-  local m; m=$(xml "$1")
-  # The agent runs in the repository's main checkout, not in the worktree install ran from, which a landed
-  # branch removes; that checkout must be on an up-to-date main.
-  local main_root
-  main_root=$(git -C "$ROOT" worktree list --porcelain 2>/dev/null | awk 'NR == 1 && $1 == "worktree" { print substr($0, 10) }')
-  [ -n "$main_root" ] || main_root="$ROOT"
+  local c; c=$(xml "$CANON_HOME")
   cat > "$PAPER_PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -122,16 +127,18 @@ write_paper_plist() {
   <string>$PAPER_LABEL</string>
   <key>ProgramArguments</key>
   <array>
-    <string>$m</string>
-    <string>run</string>
-    <string>paper:session</string>
+    <string>/bin/bash</string>
+    <string>$c/paper-session.sh</string>
+    <string>$(xml "$1")</string>
+    <string>$(xml "$PAPER_CHECKOUT")</string>
+    <string>$(xml "$2")</string>
     <string>--session</string>
     <string>auto</string>
     <string>--minutes</string>
     <string>$PAPER_MINUTES</string>
   </array>
   <key>WorkingDirectory</key>
-  <string>$(xml "$main_root")</string>
+  <string>$c</string>
   <key>StartInterval</key>
   <integer>$PAPER_INTERVAL</integer>
   <key>RunAtLoad</key>
@@ -139,9 +146,9 @@ write_paper_plist() {
   <key>ProcessType</key>
   <string>Background</string>
   <key>StandardOutPath</key>
-  <string>$(xml "$CANON_HOME")/watch/paper-session.log</string>
+  <string>$c/watch/paper-session.log</string>
   <key>StandardErrorPath</key>
-  <string>$(xml "$CANON_HOME")/watch/paper-session.log</string>
+  <string>$c/watch/paper-session.log</string>
 </dict>
 </plist>
 EOF
@@ -178,21 +185,34 @@ do_install() {
     fi
   fi
   note "Paper session:"
-  local paper_mise
+  local paper_mise paper_url out
   if ! paper_mise=$(find_mise 2>&1); then
     note "  FAILED: $paper_mise"; ok=1
-  elif ! write_paper_plist "$paper_mise" || ! plutil -lint "$PAPER_PLIST" >/dev/null; then
-    note "  FAILED: could not write a valid $PAPER_PLIST"; ok=1
+  elif ! paper_url=$(git -C "$ROOT" remote get-url origin 2>/dev/null) || [ -z "$paper_url" ]; then
+    note "  FAILED: no origin remote, so there is no main to fetch for the windows"; ok=1
+  elif ! /usr/bin/install -m 755 "$ROOT/home/.claude/canon/paper-session.sh" "$CANON_HOME/paper-session.sh"; then
+    note "  FAILED: could not install $CANON_HOME/paper-session.sh"; ok=1
   else
-    note "  wrote      $PAPER_PLIST"
-    if [ "${AUTOMATION_SKIP_LAUNCHD:-0}" = "1" ]; then
-      note "  not loaded (AUTOMATION_SKIP_LAUNCHD=1)"
+    note "  installed  $CANON_HOME/paper-session.sh"
+    # unload the old job first, so no firing runs in the clone while install moves it to origin's main
+    [ "${AUTOMATION_SKIP_LAUNCHD:-0}" = "1" ] || launchctl bootout "$DOMAIN/$PAPER_LABEL" >/dev/null 2>&1
+    if ! out=$(/bin/bash "$CANON_HOME/paper-session.sh" --checkout-only "$paper_mise" "$PAPER_CHECKOUT" "$paper_url" 2>&1); then
+      # no plist left behind for launchd to load at the next login, the old main-checkout one included
+      rm -f "$PAPER_PLIST"
+      note "  FAILED: ${out//$'\n'/; } (not loaded; $PAPER_PLIST removed)"; ok=1
     else
-      launchctl bootout "$DOMAIN/$PAPER_LABEL" >/dev/null 2>&1
-      if launchctl bootstrap "$DOMAIN" "$PAPER_PLIST"; then
-        note "  loaded     $PAPER_LABEL (every $((PAPER_INTERVAL / 60)) minutes; a window only when a session is open)"
+      note "  ${out#paper-session: }"
+      if ! write_paper_plist "$paper_mise" "$paper_url" || ! plutil -lint "$PAPER_PLIST" >/dev/null; then
+        note "  FAILED: could not write a valid $PAPER_PLIST"; ok=1
       else
-        note "  FAILED: launchctl bootstrap refused the agent"; ok=1
+        note "  wrote      $PAPER_PLIST"
+        if [ "${AUTOMATION_SKIP_LAUNCHD:-0}" = "1" ]; then
+          note "  not loaded (AUTOMATION_SKIP_LAUNCHD=1)"
+        elif launchctl bootstrap "$DOMAIN" "$PAPER_PLIST"; then
+          note "  loaded     $PAPER_LABEL (every $((PAPER_INTERVAL / 60)) minutes; a window only when a session is open)"
+        else
+          note "  FAILED: launchctl bootstrap refused the agent"; ok=1
+        fi
       fi
     fi
   fi
@@ -224,12 +244,32 @@ do_uninstall() {
   if launchctl bootout "$DOMAIN/$PAPER_LABEL" >/dev/null 2>&1; then note "  unloaded   $PAPER_LABEL"; else note "  $PAPER_LABEL was not loaded"; fi
   if launchctl print "$DOMAIN/$PAPER_LABEL" >/dev/null 2>&1; then note "  FAILED: $PAPER_LABEL is still loaded"; left="$left
   launchd job $PAPER_LABEL"; fi
-  for f in "$PLIST" "$PAPER_PLIST" "$CANON_HOME/lanes" "$CANON_HOME/lanes-watch.sh"; do
+  for f in "$PLIST" "$PAPER_PLIST" "$CANON_HOME/lanes" "$CANON_HOME/lanes-watch.sh" "$CANON_HOME/paper-session.sh"; do
     [ -e "$f" ] || continue
     if rm -f "$f" && [ ! -e "$f" ]; then note "  removed    $f"
     else note "  FAILED: could not remove $f"; left="$left
   $f"; fi
   done
+  if [ -e "$PAPER_CHECKOUT" ]; then
+    local m
+    # only the clone install made: its own git config marks it (home/.claude/canon/paper-session.sh)
+    if [ ! -d "$PAPER_CHECKOUT/.git" ] || [ "$(git -C "$PAPER_CHECKOUT" config --local --get canon.paperCheckout 2>/dev/null)" != true ]; then
+      note "  FAILED: $PAPER_CHECKOUT is not the clone install made; not touching it"; left="$left
+  $PAPER_CHECKOUT"
+    else
+      # `mise run` trusted the clone's mise.toml at its first firing (mise trust docs); that goes with it.
+      # mise refuses to untrust a path that is not there, and a clone with no mise.toml never ran mise.
+      if [ ! -e "$PAPER_CHECKOUT/mise.toml" ]; then :
+      elif ! m=$(find_mise 2>&1); then note "  FAILED: $m, so the clone's mise trust stays"; left="$left
+  mise trust of $PAPER_CHECKOUT/mise.toml"
+      elif "$m" trust --untrust "$PAPER_CHECKOUT/mise.toml" >/dev/null 2>&1; then note "  untrusted  $PAPER_CHECKOUT/mise.toml (mise)"
+      else note "  FAILED: mise could not untrust $PAPER_CHECKOUT/mise.toml"; left="$left
+  mise trust of $PAPER_CHECKOUT/mise.toml"; fi
+      if rm -rf "$PAPER_CHECKOUT" && [ ! -e "$PAPER_CHECKOUT" ]; then note "  removed    $PAPER_CHECKOUT"
+      else note "  FAILED: could not remove $PAPER_CHECKOUT"; left="$left
+  $PAPER_CHECKOUT"; fi
+    fi
+  fi
   if [ "$(git -C "$ROOT" config --local --get core.hooksPath 2>/dev/null)" = ".githooks" ]; then
     if git -C "$ROOT" config --local --unset core.hooksPath; then note "  unset      core.hooksPath"
     else note "  FAILED: could not unset core.hooksPath"; left="$left
@@ -310,13 +350,15 @@ do_status() {
     last=$(printf '%s\n' "$pr" | awk -F' = ' '/^\tlast exit code = / && s == "" { s = $2 } END { print s }')
     if [ -f "$PAPER_DIR/latest.json" ]; then
       # the window's own record decides; a `running` one past PAPER_STALE belongs to a window that died
-      v=$(jq -r --argjson now "$(date -u +%s)" --argjson stale "$PAPER_STALE" '
+      # shellcheck disable=SC2016  # jq program, not shell
+      v=$(jq -r --argjson now "$(date -u +%s)" --argjson stale "$PAPER_STALE" "$PAPER_COMMIT"'
             ((($now - (.started_epoch // 0)) / 60) | floor) as $m
             | (.result // "") as $r
             | (($r | startswith("running")) and ($m * 60) > (.stale_after // $stale)) as $died
             | (if $r == "ok" then "ok" elif $died then "DIED" elif ($r | startswith("running")) then "ok"
                elif ($r | startswith("refused")) then "REFUSED" else "FAILED" end) + "\t"
-              + "last window " + (.started // "?") + " (" + ($m | tostring) + " min ago, " + (.session // "?") + "): "
+              + "last window " + (.started // "?") + " (" + ($m | tostring) + " min ago, " + (.session // "?")
+              + ", commit " + (.commit | short) + "): "
               + (if $died then "still running after " + ($m | tostring)
                    + " min, so it died; the next window starts only once the account is flat" else $r end)
               + (if ((.left // []) | length) > 0 then "; left: " + ((.left // []) | join(", ")) else "" end)' \
@@ -334,10 +376,16 @@ do_status() {
     esac
     if [ -f "$PAPER_DIR/last-firing.json" ]; then
       local heard
-      heard=$(jq -r --argjson now "$(date -u +%s)" '(($now - (.at_epoch // 0)) | floor | tostring) + "\t" + (.outcome // "?")' "$PAPER_DIR/last-firing.json" 2>/dev/null)
+      # shellcheck disable=SC2016  # jq program, not shell
+      heard=$(jq -r --argjson now "$(date -u +%s)" "$PAPER_COMMIT"'(($now - (.at_epoch // 0)) | floor | tostring) + "\t"
+                    + (.outcome // "?") + (if (.commit // "") | test("^[0-9a-f]{40}") then " at " + (.commit | short) else "" end)' \
+              "$PAPER_DIR/last-firing.json" 2>/dev/null)
       if [ -n "$heard" ] && [ "${heard%%$'\t'*}" -gt "$PAPER_SILENT" ]; then
         v="STALE"$'\t'"no firing for $(( ${heard%%$'\t'*} / 60 )) min (the Mac asleep, or the job not running); last: ${heard#*$'\t'}"
       elif [ -n "$heard" ]; then
+        # a firing that failed before or outside a window (the fetch of main included) fails the row too
+        # (it outranks ok, and UNKNOWN: a schedule whose every firing fails has no window record at all)
+        case "${heard#*$'\t'}:${v%%$'\t'*}" in failed:*:ok) v="FAILED${v#ok}" ;; failed:*:UNKNOWN) v="FAILED${v#UNKNOWN}" ;; esac
         v="$v | last firing $(( ${heard%%$'\t'*} / 60 )) min ago: ${heard#*$'\t'}"
       fi
     fi
