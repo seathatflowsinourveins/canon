@@ -1,21 +1,30 @@
 """The trial ledger: every backtest meant as a trial, recorded as one trial of an Optuna study.
 
 Contract: ADR 0010, protocol step 1 ("Ledger every trial"), in the store and on the terms ADR 0035
-decides. Optuna 5.0.0, read 2026-11-10 at tag v5.0.0:
+decides, over the sample ADR 0041 fixes for each study. Optuna 5.0.0, read 2026-11-10 at tag v5.0.0:
 
-* `docs/source/faq.rst` ("save and resume studies"): `RDBStorage` on a local SQLite file, which
-  `open_study` builds; `optuna.create_study(..., load_if_exists=True)` reopens a study.
+* `docs/source/faq.rst` ("save and resume studies"): `RDBStorage` on a local SQLite file.
+  `optuna.create_study` without `load_if_exists` creates a study and raises `DuplicatedStudyError` for
+  a name already taken; `optuna.load_study` opens one and raises `KeyError` for a name not there.
+  `RDBStorage(..., skip_table_creation=True)` creates no tables in the file it opens.
 * `tutorial/20_recipes/009_ask_and_tell.py`, and `Study.ask` and `Study.tell` in
   `optuna/study/study.py`: a trial is asked for before the run and told its state after; `tell` takes
   a value for `COMPLETE` and none for `FAIL`. Under ask and tell nothing upstream marks a raised run
   `FAIL`, so `record_trial` tells it.
-* `Trial.set_user_attr` stores a JSON-serialisable value (`value_json` is `Text` in
-  `optuna/storages/_rdb/models.py`), and `Study.trials` returns every trial in every state.
+* `Trial.set_user_attr` and `Study.set_user_attr` store a JSON-serialisable value (`value_json` is
+  `Text` in `optuna/storages/_rdb/models.py`), and `Study.trials` returns every trial in every state.
+
+The SQLite file is opened through a URI filename (https://www.sqlite.org/uri.html): the path is
+percent-encoded, and `mode=rw` refuses a file that does not exist where `mode=rwc` creates it. The URI
+goes in SQLAlchemy's URL with `uri=true` (SQLAlchemy 2.1.8, `dialects/sqlite/pysqlite.py`, "URI
+Connections"); SQLAlchemy percent-decodes the database part of a URL (`engine/url.py`, `_parse_url`), so
+each `%` is encoded once more for it.
 
 NautilusTrader v2.0.0rc8 binds no config identity to Python: `BacktestRunConfig.id` defaults to a fresh
 UUID4 (`crates/backtest/src/config.rs` at the pinned commit) and the config cannot be serialised. So the
 identity is glue, ADR 0035 term 4: `config_key` is the SHA-256 of the canonical JSON of `trial_config`,
-read from the run config's own properties, and the run is built with it as its `id`.
+built from what this repo sets, and the run is built with it as its `id`. Nothing upstream identifies
+the data a run read either, so `data_digest` is glue too (ADR 0041).
 
 The value told for a run that traded is skfolio's `Portfolio.sharpe_ratio` (1.12.8,
 `portfolio/_base.py`) over the run's own series: mean over sample standard deviation, per session. It is
@@ -23,43 +32,51 @@ there for a later sampler; `canon_trading.ranking` does not read it.
 
 A session day (ADR 0035 term 3) is a UTC day on which a bar of the run became available, its `ts_init`,
 read with `ParquetDataCatalog.query` (the installed `nautilus_trader/persistence/__init__.pyi`) from the
-catalog the run read. `BacktestResult` has no such list.
+catalog the run read, over the study's sample. `BacktestResult` has no such list.
 """
 
 from __future__ import annotations
 
 import hashlib
-import inspect
 import json
 import math
+import subprocess
 import traceback
+from contextlib import ExitStack
 from contextlib import contextmanager
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING
 from typing import Any
+from urllib.parse import quote
 
 import optuna
+import pandas as pd
+from canon_alpaca.constants import VENUE
+from nautilus_trader.model import Money
 from nautilus_trader.model import NautilusDataType
 from nautilus_trader.persistence import ParquetDataCatalog
 from optuna.trial import TrialState
 from skfolio import Portfolio
 
+from .backtest import FEE_RATES
+from .backtest import VENUE_SETTINGS
 from .backtest import backtest_run_config
 from .backtest import run_backtest_config
+from .ma_cross import MaCross
 
 if TYPE_CHECKING:
     from collections.abc import Generator
     from collections.abc import Sequence
 
-    from nautilus_trader.config import BacktestRunConfig
     from nautilus_trader.config import LoggerConfig
+    from nautilus_trader.model import Bar
 
     from .backtest import BacktestRun
-    from .ma_cross import MaCross
+    from .ma_cross import MaCrossConfig
 
-LEDGER_PATH = Path("ledger") / "trials.db"
+LEDGER_FILE = Path("ledger") / "trials.db"
 DAY_NS = 86_400 * 1_000_000_000
 
 # The user attribute holding a trial's outcome, and its three values (ADR 0035 term 2).
@@ -68,101 +85,243 @@ TRADED = "traded"
 IDLE = "idle"
 FAILED = "failed"
 
-# Engine config properties left out of the key: logging changes no result, the instance ID is new for
-# every engine, and catalogs and streaming name places, not data (ADR 0035 term 4).
-_ENGINE_LEFT_OUT = ("catalogs", "instance_id", "logging", "streaming")
+# The study user attribute holding the study's samples, oldest first (ADR 0041).
+SAMPLES = "samples"
+STRATEGY_CLASS = f"{MaCross.__module__}:{MaCross.__qualname__}"
+
+
+class LedgerNotFound(LookupError):
+    """There is no ledger, or no such study in it, where one was asked for; nothing was created."""
+
+
+@dataclass(frozen=True)
+class Sample:
+    """A study's sample (ADR 0041): its sequence number and its range, UTC nanoseconds, both included."""
+
+    number: int
+    start: int
+    end: int
+
+    def describe(self) -> str:
+        return f"sample {self.number} ({_date(self.start)} to {_date(self.end)})"
+
+
+def default_ledger_path() -> Path:
+    """`ledger/trials.db` in the main checkout of the clone this module was loaded from (ADR 0035).
+
+    The main checkout is the directory holding the clone's common git directory
+    (`git rev-parse --path-format=absolute --git-common-dir`), so every worktree of the clone resolves
+    the same file, whatever the current directory. Outside a git checkout there is no default.
+    """
+    here = Path(__file__).resolve().parent
+    try:
+        common = subprocess.run(
+            ["git", "-C", str(here), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise LedgerNotFound(
+            f"{here} is not in a git checkout, so the ledger has no default location; pass its path",
+        ) from error
+    return Path(common).parent / LEDGER_FILE
+
+
+def _sqlite_url(path: Path, mode: str) -> str:
+    """The SQLAlchemy URL of the SQLite file at `path`, opened with `mode` (module header)."""
+    return f"sqlite:///file:{quote(str(path), safe='/').replace('%', '%25')}?mode={mode}&uri=true"
 
 
 @contextmanager
-def open_study(name: str, path: Path = LEDGER_PATH) -> Generator[optuna.Study]:
-    """Open the study `name` in the SQLite file at `path`, creating either if it does not exist.
-
-    A relative `path` is taken from the current directory. On leaving the `with` block the storage's
-    session is removed (`RDBStorage.remove_session`) and its SQLAlchemy engine disposed, so no SQLite
-    connection is left for the garbage collector.
-    """
-    path = Path(path).resolve()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    storage = optuna.storages.RDBStorage(f"sqlite:///{path}")
+def _storage(path: Path, mode: str) -> Generator[optuna.storages.RDBStorage]:
+    """The `RDBStorage` of `path`; on leaving, its session removed and its engine disposed."""
+    storage = optuna.storages.RDBStorage(_sqlite_url(path, mode), skip_table_creation=mode == "rw")
     try:
-        yield optuna.create_study(
-            study_name=name,
-            storage=storage,
-            direction="maximize",
-            load_if_exists=True,
-        )
+        yield storage
     finally:
         storage.remove_session()
         storage.engine.dispose()
 
 
+def _ledger(path: Path | None) -> Path:
+    return default_ledger_path() if path is None else Path(path).resolve()
+
+
+@contextmanager
+def create_ledger_study(
+    name: str,
+    *,
+    start: int | str | pd.Timestamp,
+    end: int | str | pd.Timestamp,
+    path: Path | None = None,
+) -> Generator[optuna.Study]:
+    """Create the study `name` over the sample [start, end] and open it; create the file if need be.
+
+    ADR 0041. A study of that name already in the file raises Optuna's `DuplicatedStudyError`. `start`
+    and `end` are UTC nanoseconds, or a date or time that `pandas.Timestamp` reads, taken as UTC when it
+    has no offset. Both are instants and both are included: a date with no time is its midnight, so an
+    `end` of `"2025-06-16"` leaves out a bar of that day stamped after 00:00. With no `path`, the ledger
+    is `default_ledger_path()`.
+    """
+    sample = Sample(0, *_range(start, end))
+    path = _ledger(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _storage(path, "rwc") as storage:
+        study = optuna.create_study(study_name=name, storage=storage, direction="maximize")
+        study.set_user_attr(SAMPLES, [_sample_attr(sample)])
+        yield study
+
+
+@contextmanager
+def open_study(name: str, path: Path | None = None) -> Generator[optuna.Study]:
+    """Open the study `name` in the ledger at `path`; never create a file, a table or a study.
+
+    With no `path`, the ledger is `default_ledger_path()`. A missing file or study raises
+    `LedgerNotFound`, and so do a file that is not an Optuna ledger and a study with no sample. On leaving the `with` block the storage's
+    session is removed (`RDBStorage.remove_session`) and its SQLAlchemy engine disposed, so no SQLite
+    connection is left for the garbage collector.
+    """
+    path = _ledger(path)
+    if not path.is_file():
+        raise LedgerNotFound(f"there is no ledger at {path}; create_ledger_study creates one")
+    with ExitStack() as opened:
+        try:
+            storage = opened.enter_context(_storage(path, "rw"))
+            study = optuna.load_study(study_name=name, storage=storage)
+        except KeyError:
+            raise LedgerNotFound(
+                f"the ledger at {path} holds no study {name!r}; create_ledger_study creates one",
+            ) from None
+        except optuna.exceptions.StorageInternalError as error:
+            raise LedgerNotFound(f"the file at {path} is not an Optuna ledger") from error
+        samples(study)
+        yield study
+
+
+def samples(study: optuna.Study) -> list[Sample]:
+    """Every sample `study` has had, oldest first; the last is the current one (ADR 0041)."""
+    stored = study.user_attrs.get(SAMPLES)
+    try:
+        found = [
+            Sample(int(s["number"]), int(s["start"]), int(s["end"]))
+            for s in (stored if isinstance(stored, list) else [])
+        ]
+    except TypeError, KeyError, ValueError:
+        found = []
+    if not found or [s.number for s in found] != list(range(len(found))):
+        raise LedgerNotFound(
+            f"study {study.study_name!r} has no sample in the form ADR 0041 gives: {stored!r}",
+        )
+    return found
+
+
+def current_sample(study: optuna.Study) -> Sample:
+    return samples(study)[-1]
+
+
+def move_sample(
+    study: optuna.Study, *, start: int | str | pd.Timestamp, end: int | str | pd.Timestamp
+) -> Sample:
+    """Give `study` a new current sample, numbered after the last; every record stays (ADR 0041).
+
+    The same range again is a new sample too: that is how a corrected catalog is taken in. Every
+    configuration the study has tried must then be run on the new sample before it can be ranked.
+    """
+    history = samples(study)
+    sample = Sample(history[-1].number + 1, *_range(start, end))
+    study.set_user_attr(SAMPLES, [*map(_sample_attr, history), _sample_attr(sample)])
+    return sample
+
+
+def _range(start: int | str | pd.Timestamp, end: int | str | pd.Timestamp) -> tuple[int, int]:
+    first, last = _ns(start), _ns(end)
+    if not first < last:
+        raise ValueError(f"a sample needs start < end, got {_date(first)} and {_date(last)}")
+    return first, last
+
+
+def _ns(value: int | str | pd.Timestamp) -> int:
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    stamp = pd.Timestamp(value)
+    stamp = stamp.tz_localize("UTC") if stamp.tzinfo is None else stamp.tz_convert("UTC")
+    return int(stamp.value)
+
+
+def _date(ns: int) -> str:
+    return pd.Timestamp(ns, unit="ns", tz="UTC").isoformat()
+
+
+def _sample_attr(sample: Sample) -> dict[str, int]:
+    return {"number": sample.number, "start": sample.start, "end": sample.end}
+
+
 def _canonical(value: object) -> Any:
-    """`value` in the canonical form of ADR 0035 term 4, or `TypeError` if it has no stable one."""
+    """`value` in the canonical form of ADR 0035 term 4, or `TypeError` if it has no stable one.
+
+    A `Decimal` is normalised (`0`, `0.00` and `0E-2` all give `0`). A `Quantity`, `Price` or `Money`
+    prints with its precision, which is not normalised away: an order size of `10.0` is refused by an
+    instrument that takes whole shares, where `10` runs, so the two are different configurations.
+    """
     if value is None or isinstance(value, bool | int | float | str):
         return value  # `json.dumps` writes a float by `repr` and refuses NaN and infinities
     if isinstance(value, Decimal):
-        return str(value)
+        text = format(value.normalize(), "f")
+        return "0" if text == "-0" else text
     if isinstance(value, list | tuple):
         return [_canonical(item) for item in value]
     if isinstance(value, dict):
-        return {str(_canonical(key)): _canonical(item) for key, item in value.items()}
+        canonical = {str(_canonical(key)): _canonical(item) for key, item in value.items()}
+        if len(canonical) != len(value):
+            raise TypeError(f"{value!r} has keys that share one text form")
+        return canonical
     if type(value).__module__.startswith("nautilus_trader") and not callable(value):
+        # Enums print by name (`NETTING`); value types and identifiers as themselves
+        # (`AAPL.ALPACA-1-DAY-LAST-EXTERNAL`). A Rust struct prints by `Debug`, braces included, and a
+        # class with no text form of its own as `<... object at 0x...>`, an address: both refused.
         text = str(value)
-        # Value types and identifiers print as themselves (`AAPL.ALPACA-1-DAY-LAST-EXTERNAL`, `10`), and
-        # enums by name (`NETTING`). A Rust struct prints by `Debug`, braces included, and a class with
-        # no text form of its own prints as `<... object at 0x...>`, an address.
         if "{" not in text and not text.startswith("<"):
-            return text
-        # The one struct accepted is the fee model with no per-instrument overrides: those are a map,
-        # and the order a map prints in is not stable.
-        if type(value).__name__ == "MakerTakerFeeModel" and "overrides: {}" in text:
             return text
     raise TypeError(f"{type(value).__name__} {value!r} has no stable text form for a config key")
 
 
-def _is_method(owner: type, name: str) -> bool:
-    """Whether `name` on `owner` is a method, as opposed to a field or a property."""
-    attribute = inspect.getattr_static(owner, name, None)
-    return isinstance(attribute, classmethod | staticmethod) or (
-        callable(attribute) and not isinstance(attribute, type)
-    )
+def trial_config(
+    strategies: Sequence[MaCrossConfig], *, starting_balances: Sequence[str]
+) -> dict[str, Any]:
+    """The object ADR 0035 term 4 hashes: what this repo sets for a run, normalised.
 
-
-def _properties(obj: object, *, left_out: Sequence[str] = ()) -> dict[str, Any]:
-    """Every public field and property of `obj`, its class's and its own, in canonical form.
-
-    Methods are skipped. A field or property whose value is callable has no stable text form and is
-    refused by `_canonical`, not skipped.
+    Each strategy's class and the fields its config sets (its own attributes; the base config's are
+    upstream defaults `MaCrossConfig` never passes on), the venue's name, `VENUE_SETTINGS`, `FEE_RATES`
+    and starting balances, and the bar types the run loads, one per instrument as
+    `backtest_run_config` derives them. No property upstream reflects is read, so a default that
+    changes with NautilusTrader's pin moves no key. The study's sample is not in it (ADR 0041).
     """
-    own = {name for name in getattr(obj, "__dict__", {}) if not name.startswith("_")}
-    names = {
-        name
-        for name in dir(type(obj))
-        if not name.startswith("_") and not _is_method(type(obj), name)
-    }
-    return {name: _canonical(getattr(obj, name)) for name in sorted((names | own) - set(left_out))}
-
-
-def trial_config(run_config: BacktestRunConfig, strategies: Sequence[MaCross]) -> dict[str, Any]:
-    """The object ADR 0035 term 4 hashes, read from `run_config` and each strategy's config.
-
-    `run_backtest` adds strategies and no actor or execution algorithm, so those are all it covers.
-    Each data config's catalog and the engine properties in `_ENGINE_LEFT_OUT` are left out.
-    """
+    bar_types = list(dict.fromkeys(str(config.bar_type) for config in strategies))
     return {
         "strategies": [
             {
-                "class": f"{type(strategy).__module__}:{type(strategy).__qualname__}",
-                "config": _properties(strategy.config),
+                "class": STRATEGY_CLASS,
+                "config": {
+                    name: _canonical(value)
+                    for name, value in sorted(vars(config).items())
+                    if not name.startswith("_")
+                },
             }
-            for strategy in strategies
+            for config in strategies
         ],
-        "venues": [_properties(venue) for venue in run_config.venues],
-        "data": [_properties(data, left_out=("catalog",)) for data in run_config.data],
-        "engine": _properties(run_config.engine, left_out=_ENGINE_LEFT_OUT),
-        "start": run_config.start,
-        "end": run_config.end,
-        "chunk_size": run_config.chunk_size,
+        "venue": {
+            "name": str(VENUE),
+            **{name: _canonical(value) for name, value in VENUE_SETTINGS.items()},
+            "fee_model": {
+                "class": "MakerTakerFeeModel",
+                **{name: _canonical(rate) for name, rate in FEE_RATES.items()},
+            },
+            "starting_balances": [
+                _canonical(Money.from_str(balance)) for balance in starting_balances
+            ],
+        },
+        "data": {"data_type": "Bar", "bar_types": bar_types},
     }
 
 
@@ -177,16 +336,42 @@ def config_key(config: dict[str, Any]) -> str:
     return hashlib.sha256(canonical_json(config).encode("utf-8")).hexdigest()
 
 
-def session_days(catalog_path: Path, bar_types: Sequence[str], start: int, end: int) -> list[str]:
-    """UTC days, as nanoseconds in text, on which a bar of `bar_types` became available in [start, end].
+def bars_read(catalog_path: Path, bar_types: Sequence[str], start: int, end: int) -> list[Bar]:
+    """The bars of `bar_types` in the catalog with `ts_init` in [start, end], in a stable order.
 
-    The catalog is asked for that range only (`ParquetDataCatalog.query`, `start` and `end`); the bars
-    it returns are checked against the range again by their `ts_init`.
+    The catalog is asked for that range only (`ParquetDataCatalog.query`, `start` and `end`, the bounds
+    the node is given); the bars it returns are checked against the range again by their `ts_init`.
     """
     catalog = ParquetDataCatalog(str(Path(catalog_path).resolve()))
     bars = catalog.query(NautilusDataType.Bar, identifiers=list(bar_types), start=start, end=end)
-    days = {bar.ts_init // DAY_NS * DAY_NS for bar in bars if start <= bar.ts_init <= end}
-    return [str(day) for day in sorted(days)]
+    kept = [bar for bar in bars if start <= bar.ts_init <= end]
+    return sorted(kept, key=lambda bar: (str(bar.bar_type), bar.ts_init, bar.ts_event))
+
+
+def session_days(bars: Sequence[Bar]) -> list[str]:
+    """The UTC days, as nanoseconds in text, on which one of `bars` became available (`ts_init`)."""
+    return [str(day) for day in sorted({bar.ts_init // DAY_NS * DAY_NS for bar in bars})]
+
+
+def data_digest(bars: Sequence[Bar]) -> dict[str, str]:
+    """ADR 0041's identity of the data a run read: for each bar type, a SHA-256 of its bars.
+
+    The digest of a bar type is that of the UTF-8 bytes of one line per bar, in `bars`' order,
+    `bar_type|open|high|low|close|volume|ts_event|ts_init`, the prices and the volume as NautilusTrader
+    prints them (their precision included), joined by `\\n`. It is taken from the bars themselves, not
+    from the catalog's files, so rewriting or consolidating files moves no digest. Kept per bar type, so
+    two trials on one sample that read one bar type can be checked to have read the same bars.
+    """
+    lines: dict[str, list[str]] = {}
+    for bar in bars:
+        lines.setdefault(str(bar.bar_type), []).append(
+            f"{bar.bar_type}|{bar.open}|{bar.high}|{bar.low}|{bar.close}|{bar.volume}|"
+            f"{bar.ts_event}|{bar.ts_init}",
+        )
+    return {
+        bar_type: hashlib.sha256("\n".join(found).encode("utf-8")).hexdigest()
+        for bar_type, found in sorted(lines.items())
+    }
 
 
 @dataclass(frozen=True)
@@ -202,54 +387,59 @@ class RecordedTrial:
 def record_trial(
     study: optuna.Study,
     catalog_path: Path,
-    strategies: Sequence[MaCross],
+    strategies: Sequence[MaCrossConfig],
     *,
     starting_balances: Sequence[str],
     logging: LoggerConfig | None = None,
 ) -> RecordedTrial:
-    """Run a backtest with these arguments, as `run_backtest` would, as one trial of `study`.
+    """Build a `MaCross` from each config and run them over the study's sample, as one trial.
 
-    ADR 0035 terms 2 and 3. The key is computed first. What `backtest_run_config` refuses, or a config
-    value with no stable text form, raises before anything is recorded: such a call is not a trial. The
-    trial is then asked for, so a run that never returns stays in the study as `RUNNING`. The run uses
-    the config the key was read from, built again with the key as its `id` and checked to give the same
-    key. A run that raises, or whose result cannot be recorded, is told `FAIL` with outcome `failed`
-    and its error, and the exception passes through. A run with no filled order is told `FAIL` with
-    outcome `idle`; any other `COMPLETE` with `traded`, or `FAIL`, still `traded`, if its Sharpe ratio
-    is not finite. The outcome is written last, so a record that has one ran to the end. Nothing is
-    overwritten: the same configuration again is a new record.
+    ADR 0035 terms 2 and 3 and ADR 0041. The key is computed from the configs first, and the strategies
+    are built from them here, so what is hashed is what runs: a config changed afterwards changes
+    nothing. What `backtest_run_config` refuses, or a value with no stable text form, raises before
+    anything is recorded: such a call is not a trial. The trial is then asked for, so a run that never
+    returns stays in the study as `RUNNING`. The run is bounded by the study's current sample and built
+    with the key as its `id`. A run that raises, or whose result cannot be recorded, is told `FAIL` with
+    outcome `failed` and its error, and the exception passes through. A run with no filled order is told
+    `FAIL` with outcome `idle`; any other `COMPLETE` with `traded`, or `FAIL`, still `traded`, if its
+    Sharpe ratio is not finite. The outcome is written last, so a record that has one ran to the end.
+    Nothing is overwritten: the same configuration again is a new record.
     """
-    config = trial_config(
-        backtest_run_config(catalog_path, strategies, starting_balances=starting_balances),
-        strategies,
-    )
+    sample = current_sample(study)
+    config = trial_config(strategies, starting_balances=starting_balances)
     key = config_key(config)
+    built = [MaCross(strategy) for strategy in strategies]
+    if config_key(trial_config(strategies, starting_balances=starting_balances)) != key:
+        raise RuntimeError("a strategy config changed while its strategies were built")
     run_config = backtest_run_config(
         catalog_path,
-        strategies,
+        built,
         starting_balances=starting_balances,
         logging=logging,
         run_config_id=key,
+        start=sample.start,
+        end=sample.end,
     )
-    if config_key(trial_config(run_config, strategies)) != key:
-        raise RuntimeError("the run config built with its key as id does not give that key")
+    bar_types = [str(bar_type) for data in run_config.data for bar_type in data.bar_types or ()]
+    if bar_types != config["data"]["bar_types"]:
+        raise RuntimeError(f"the run loads {bar_types}, not the bar types its key names")
 
     trial = study.ask()
     trial.set_user_attr("config", config)
     trial.set_user_attr("config_key", key)
+    trial.set_user_attr("sample", sample.number)
     try:
-        run = run_backtest_config(run_config, strategies)
+        run = run_backtest_config(run_config, built)
         result = run.result
         returns = {str(ns): value for ns, value in sorted(result.returns_series.items())}
-        bar_types = [str(bar_type) for data in run_config.data for bar_type in data.bar_types or ()]
-        days = session_days(
-            catalog_path, bar_types, result.backtest_start or 0, result.backtest_end or 0
-        )
+        bars = bars_read(catalog_path, bar_types, sample.start, sample.end)
+        days = session_days(bars)
         trial.set_user_attr("run_config_id", result.run_config_id)
         trial.set_user_attr("backtest_start", result.backtest_start)
         trial.set_user_attr("backtest_end", result.backtest_end)
         trial.set_user_attr("returns_series", returns)
         trial.set_user_attr("session_days", days)
+        trial.set_user_attr("data_digest", data_digest(bars))
         traded = any(order.filled_qty.is_positive() for order in run.orders)
         sharpe = _session_sharpe(returns, days) if traded else math.nan
         outcome = TRADED if traded else IDLE

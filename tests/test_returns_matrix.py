@@ -98,19 +98,30 @@ def test_any_other_shape_is_rejected(
         daily_series("t", returns, open_days)
 
 
-def test_the_matrix_is_trimmed_to_the_common_range() -> None:
-    """One trial covers days 0 to 6, the other 2 to 9: the common range is days 2 to 6, T = 5."""
+def test_a_trial_over_a_shorter_range_is_refused_not_trimmed() -> None:
+    """One trial covers days 0 to 6, the other 2 to 9: each lacks days the other has (ADR 0041)."""
     first = daily_series("a", entry({n: 0.01 * n for n in range(7)}), sessions(*range(7)))
     second = daily_series("b", entry({n: -0.01 * n for n in range(2, 10)}), sessions(*range(2, 10)))
+
+    with pytest.raises(ReturnsRejected) as rejected:
+        returns_matrix([first, second])
+
+    assert rejected.value.names == ("a", "b")
+    message = str(rejected.value)
+    assert "a: no return on 3 of the 10 session days of the sample, the first 2025-03-18" in message
+    assert "b: no return on 2 of the 10 session days of the sample, the first 2025-03-11" in message
+
+
+def test_series_on_the_same_days_make_the_matrix() -> None:
+    first = daily_series("a", entry({n: 0.01 * n for n in range(5)}), sessions(*range(5)))
+    second = daily_series("b", entry({n: -0.01 * n for n in range(5)}), sessions(*range(5)))
 
     matrix = returns_matrix([first, second])
 
     assert list(matrix.columns) == ["a", "b"]
     assert len(matrix) == 5
-    assert matrix.index[0].date() == date(2025, 3, 13)
-    assert matrix.index[-1].date() == date(2025, 3, 17)
-    assert list(matrix["a"]) == pytest.approx([0.02, 0.03, 0.04, 0.05, 0.06])
-    assert list(matrix["b"]) == pytest.approx([-0.02, -0.03, -0.04, -0.05, -0.06])
+    assert matrix.index[0].date() == date(2025, 3, 11)
+    assert list(matrix["b"]) == pytest.approx([0.0, -0.01, -0.02, -0.03, -0.04])
 
 
 def test_calendars_that_differ_inside_the_range_are_refused() -> None:
@@ -120,13 +131,17 @@ def test_calendars_that_differ_inside_the_range_are_refused() -> None:
         "b", entry({n: 0.0 if n == 3 else 0.02 for n in range(6)}), sessions(0, 1, 2, 4, 5)
     )
 
-    with pytest.raises(ReturnsRejected, match=r"b: no return on 2025-03-14"):
+    with pytest.raises(
+        ReturnsRejected, match=r"b: no return on 1 of the 6 session days[^\n]*2025-03-14"
+    ):
         returns_matrix([first, second])
 
 
-def test_ranges_that_do_not_overlap_are_refused() -> None:
+def test_ranges_that_do_not_overlap_are_refused_naming_both() -> None:
     first = daily_series("a", entry({0: 0.01, 1: 0.02}), sessions(0, 1))
     second = daily_series("b", entry({4: 0.01, 5: 0.02}), sessions(4, 5))
 
-    with pytest.raises(ReturnsRejected, match="no day in common"):
+    with pytest.raises(ReturnsRejected) as rejected:
         returns_matrix([first, second])
+
+    assert rejected.value.names == ("a", "b")

@@ -1,8 +1,10 @@
 """The returns matrix: one column per configuration, T common rows of daily portfolio returns.
 
 Contract: ADR 0010, protocol step 2. Accept a trial's `returns_series` only as the daily portfolio series
-with one key per UTC day, reject any other shape, drop the days the venue was closed, and trim every
-variant to a common range of T rows.
+with one key per UTC day, reject any other shape, and drop the days the venue was closed. Every trial
+runs over its study's sample and must have the same session days on it (ADR 0041, which supersedes
+step 2's trim to a common range): the matrix is refused, naming every trial that lacks a day another
+has, and never trimmed.
 
 The shape accepted is NautilusTrader's daily series (v2.0.0rc8, `crates/analysis/src/analyzer.rs` at the
 pinned commit, `calculate_daily_returns`): a return for every UTC day from the first to the last, keyed
@@ -23,9 +25,8 @@ Which upstream call does what:
   one-asset `Portfolio` with weight 1, whose returns are the series itself and whose dates come from
   the frame's index (`Series.to_frame`); `Population.returns_df` joins them on their dates, NaN where a
   trial has no row.
-* `DataFrame.loc[first:last]`: the common range, from the latest first day to the earliest last day.
-  `DataFrame.isna` finds a day one trial has and another lacks inside it; their calendars differ, and the
-  matrix is refused rather than trimmed further.
+* `DataFrame.isna`: a day one trial has and another lacks. The rows are the union of the trials' session
+  days, so a trial with a NaN did not cover the whole sample, and the matrix is refused.
 
 No statistic is computed here.
 """
@@ -48,7 +49,14 @@ if TYPE_CHECKING:
 
 
 class ReturnsRejected(ValueError):
-    """Returns that ADR 0010 step 2 does not accept; the message names the trial."""
+    """Returns that ADR 0010 step 2 or ADR 0041 does not accept; the message names every trial.
+
+    `names` holds the name of each series rejected, in the order the message gives them.
+    """
+
+    def __init__(self, message: str, names: Sequence[str] = ()) -> None:
+        super().__init__(message)
+        self.names = tuple(names)
 
 
 def daily_series(name: str, returns: Mapping[str, float], session_days: Sequence[str]) -> pd.Series:
@@ -98,28 +106,31 @@ def daily_series(name: str, returns: Mapping[str, float], session_days: Sequence
 
 
 def returns_matrix(series: Sequence[pd.Series]) -> pd.DataFrame:
-    """Join `series` on their dates through skfolio and trim them to their common range of T rows."""
+    """Join `series` on their dates through skfolio; refuse them unless every one has every date.
+
+    The T rows are the session days of the sample (ADR 0041). Each series that lacks one of them is
+    named, with how many it lacks and its first and last day, so one stop lists every such trial.
+    """
     names = [s.name for s in series]
     if not series or len(set(names)) != len(names):
         raise ValueError("returns_matrix takes one or more series with distinct names")
     population = Population(
         [Portfolio(X=s.to_frame(), weights=[1.0], name=str(s.name)) for s in series],
     )
-    joined = population.returns_df(use_tag_in_column_name=False)
-    first = max(s.index[0] for s in series)
-    last = min(s.index[-1] for s in series)
-    if first > last:
-        raise ReturnsRejected(
-            f"the trials have no day in common: the latest first day is {first.date()} and the "
-            f"earliest last day {last.date()}",
-        )
-    matrix = joined.loc[first:last]
+    matrix = population.returns_df(use_tag_in_column_name=False)
     missing = matrix.isna()
-    if missing.to_numpy().any():
-        column = missing.any().idxmax()
-        day = missing[column].idxmax()
+    short = [name for name in matrix.columns if missing[name].any()]
+    if short:
+        by_name = {s.name: s for s in series}
+        lines = [
+            f"{name}: no return on {int(missing[name].sum())} of the {len(matrix)} session days of "
+            f"the sample, the first {missing[name].idxmax().date()}; it covers "
+            f"{by_name[name].index[0].date()} to {by_name[name].index[-1].date()}"
+            for name in short
+        ]
         raise ReturnsRejected(
-            f"{column}: no return on {day.date()}, a session day of another trial in the common "
-            "range; their calendars differ",
+            "every trial must cover the same session days over the sample (ADR 0041):\n"
+            + "\n".join(lines),
+            names=short,
         )
     return matrix

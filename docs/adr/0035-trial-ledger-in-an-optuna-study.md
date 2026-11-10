@@ -38,8 +38,11 @@ trial store that meets every driver. Leaving it is cheap, since every trial read
 `Study.trials`; if Optuna fails here in use, option 5 replaces it.
 
 1. **Storage.** `RDBStorage` on SQLite, the local storage Optuna's FAQ gives for saving and resuming a
-   study; it keeps `JournalFileBackend` for parallel and NFS use. The file is `ledger/trials.db`, a
-   folder ignored by git like `catalog/`. A ranking reads one study.
+   study; it keeps `JournalFileBackend` for parallel and NFS use. The file is `ledger/trials.db` in the
+   main checkout, the folder holding the clone's common git directory, so every worktree shares it;
+   outside a git checkout a path must be given. Opening never creates a file or study; creating one is
+   its own call, with its sample (ADR 0041). The folder is ignored like `catalog/`. A ranking reads one
+   study.
 2. **Recording**, through ask and tell, the tutorial's way to apply Optuna to an existing problem. The
    key (term 4) is computed first; a call refused before a config exists is not a trial. The trial is
    then asked for, so a run that never returns stays as `RUNNING`. A run that raises is told `FAIL`
@@ -50,23 +53,22 @@ trial store that meets every driver. Leaving it is cheap, since every trial read
 3. **Entry.** User attributes `config`, `config_key`, `run_config_id`, `backtest_start`, `backtest_end`,
    `returns_series` (keyed by nanoseconds as text), and `session_days`, this record's addition: the UTC
    days on which a bar of the run arrived, read here from the catalog, since `BacktestResult` has none.
-   ADR 0010's `BacktestRunConfig` cannot be stored as an object, so `config` is its canonical form.
+   ADR 0010's `BacktestRunConfig` cannot be stored as an object, so `config` stands for it in the form
+   ADR 0041 term 4 gives; `sample` and `data_digest` are ADR 0041's too.
 4. **Identity.** `id` defaults to a fresh UUID4, and no config identity reaches Python. `config_key` is
    the SHA-256 hex digest of the UTF-8 bytes of `json.dumps(config, sort_keys=True,
    separators=(",", ":"), ensure_ascii=True, allow_nan=False)`, passed as `BacktestRunConfig(id=…)`.
-   `config` covers what `run_backtest` sets: each strategy's class (`module:Class`) and every public
-   config field (it adds no actor or execution algorithm); every public property of each venue config,
-   of each data config but its catalog, and of the engine config but its logging, instance ID,
-   catalogs and streaming, which name places, not data; and the run's `start`, `end` and `chunk_size`.
-   Floats are written by `repr`, enums by name, NautilusTrader types and decimals by `str()`; a value
-   with no stable text form is refused. Upstream hashes only a result
-   (`CanonicalBacktestResult::digest`, BLAKE3, not exposed); an exposed upstream hash replaces this.
-5. **N** is the number of distinct `config_key` values in the study, in every state, never filtered by
-   state. ADR 0010 counts trials; reading a configuration run again as the same trial is this record's.
-   Records are never overwritten or deleted. Per key, a `failed` or `RUNNING` record is resolved by a
-   later record of that key that ran to the end (traded or idle); the earlier one stays. Every record
-   of a key that ran to the end must carry the same range and returns, else the ranking stops and
-   names them. A key is one column of the returns matrix.
+   Superseded in part by ADR 0041 term 4: what `config` holds and how its values are written. Until
+   then it held every public property upstream reflects and the run's `start` and `end`. Upstream
+   hashes only a result (`CanonicalBacktestResult::digest`, BLAKE3, not exposed); an exposed upstream
+   hash replaces this.
+5. **N** is the number of distinct `config_key` values in the study, in every state and on every
+   sample (ADR 0041), never filtered by state. ADR 0010 counts trials; reading a configuration run
+   again as the same trial is this record's. Records are never overwritten or deleted. Per key, a
+   `failed` or `RUNNING` record is resolved by a later record of that key that ran to the end (traded
+   or idle); the earlier one stays. Every record of a key that ran to the end on one sample must carry
+   the same range, returns and data (ADR 0041), else the ranking stops and names them. A key is one
+   column of the returns matrix.
 6. **What stops the ranking**, beside ADR 0031's four conditions (every trial's Sharpe ratio and every
    return of the pick finite, N ≥ 2, V > 0): a key with no record that ran to the end; an idle key
    (ADR 0010's Limits); and a key whose returns ADR 0010 step 2 rejects. Each message names the trial.
@@ -128,5 +130,17 @@ Read 2026-11-10. Fetched means read in this session as raw text or source; run m
 * Second reader, 2026-11-10 (`evidence-verifier`), two passes: the sources hold. It corrected the key's
   fields, term 6's conditions, the FAIL claim, the unmarked readings of ADR 0010, the ignore rule, and a
   failed record that would have stopped the ranking for good, now resolved by a later run of its key.
+* Full review, 2026-11-10 (`/code-review`): the ledger's place hung on the current directory and
+  opening created what was missing; the key hashed text as typed and upstream's reflected defaults, was
+  read from a config that could change after the strategy was built, and held nothing of the data. Terms
+  1 and 5 corrected, terms 3 and 4 point to ADR 0041, which holds the key, the sample and the data.
+* Opening without creating, read 2026-11-10: `optuna.load_study` raises `KeyError` for a missing study
+  and `RDBStorage(skip_table_creation=True)` creates no table (Optuna 5.0.0, `study.py`,
+  `storages/_rdb/storage.py`, `bundled`); https://www.sqlite.org/uri.html gives `rw` beside `rwc`,
+  "read-write and created if it does not exist", and `%HH` escapes in the path (fetched; that `rw`
+  refuses a missing file is not stated there, and was run on seven paths); SQLAlchemy 2.1.8
+  percent-decodes a URL's database part (`engine/url.py`) and takes `uri=true` (`dialects/sqlite/
+  pysqlite.py`, `bundled`); `git rev-parse --git-common-dir` names the clone's git directory from any
+  worktree (run). Opening an empty file raised `StorageInternalError` and left it unchanged (run).
 * Code review, 2026-11-10 (`/code-review`): term 2 missed a traded run with no finite Sharpe ratio, and
   the value told used calendar days. Both corrected, with no change of decision.

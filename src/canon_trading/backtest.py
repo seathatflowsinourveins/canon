@@ -105,6 +105,16 @@ class BacktestRun:
     account: Any
 
 
+# The simulated venue's settings, as data: `simulated_alpaca_venue` builds the venue from them and
+# `canon_trading.ledger` keys a trial on them (ADR 0035 term 4), so the two cannot drift apart.
+VENUE_SETTINGS: dict[str, Any] = {
+    "oms_type": OmsType.NETTING,
+    "account_type": AccountType.CASH,
+    "book_type": BookType.L1_MBP,
+}
+FEE_RATES: dict[str, Decimal] = {"maker_rate": Decimal(0), "taker_rate": Decimal(0)}
+
+
 def simulated_alpaca_venue(starting_balances: Sequence[str]) -> BacktestVenueConfig:
     """Return the venue configuration described in this module's header.
 
@@ -112,11 +122,11 @@ def simulated_alpaca_venue(starting_balances: Sequence[str]) -> BacktestVenueCon
     """
     return BacktestVenueConfig(
         name=str(VENUE),
-        oms_type=OmsType.NETTING,
-        account_type=AccountType.CASH,
         starting_balances=list(starting_balances),
-        book_type=BookType.L1_MBP,
-        fee_model=MakerTakerFeeModel(maker_rate=Decimal(0), taker_rate=Decimal(0)),
+        fee_model=MakerTakerFeeModel(
+            maker_rate=FEE_RATES["maker_rate"], taker_rate=FEE_RATES["taker_rate"]
+        ),
+        **VENUE_SETTINGS,
     )
 
 
@@ -127,6 +137,8 @@ def backtest_run_config(
     starting_balances: Sequence[str],
     logging: LoggerConfig | None = None,
     run_config_id: str | None = None,
+    start: int | None = None,
+    end: int | None = None,
 ) -> BacktestRunConfig:
     """Check `strategies` against the catalog and build the run config `run_backtest` runs.
 
@@ -139,6 +151,10 @@ def backtest_run_config(
     `run_config_id` becomes the config's `id`; with none, NautilusTrader gives it a fresh UUID4
     (`crates/backtest/src/config.rs` at the pinned commit), so the same config built twice gets two ids.
     `canon_trading.ledger` passes the trial's config key here (ADR 0035).
+
+    `start` and `end`, UTC nanoseconds, bound the bars the node replays (`BacktestRunConfig.start` and
+    `end`); with none, it replays every bar the catalog holds. `canon_trading.ledger` passes its study's
+    sample (ADR 0041). A catalog whose stored intervals of a bar type miss that range is refused too.
     """
     if not strategies:
         raise ValueError("run_backtest needs at least one strategy")
@@ -160,8 +176,14 @@ def backtest_run_config(
     path = str(Path(catalog_path).resolve())
     catalog = ParquetDataCatalog(path)
     for bar_type in bar_types.values():
-        if not catalog.get_intervals(NautilusDataType.Bar, bar_type):
+        intervals = catalog.get_intervals(NautilusDataType.Bar, bar_type)
+        if not intervals:
             raise LookupError(f"The catalog at {path} holds no {bar_type} bars")
+        low, high = start if start is not None else -1, end if end is not None else 2**63
+        if not any(first <= high and last >= low for first, last in intervals):
+            raise LookupError(
+                f"The catalog at {path} holds no {bar_type} bars from {start} to {end}",
+            )
 
     return BacktestRunConfig(
         venues=[simulated_alpaca_venue(starting_balances)],
@@ -174,6 +196,8 @@ def backtest_run_config(
         ],
         engine=BacktestEngineConfig(logging=logging),
         id=run_config_id,
+        start=start,
+        end=end,
         # Off, a failed run is logged and left out of the results; on, it raises.
         raise_exception=True,
         # The engine's cache is emptied on disposal, so it is read first and disposed below.
@@ -203,7 +227,8 @@ def run_backtest(
     `logging` takes effect only in a process that has built none before, and a quiet setting given here
     also silences whatever is built afterwards.
 
-    A run meant as a trial goes through `canon_trading.ledger.record_trial`, which calls this.
+    A run meant as a trial goes through `canon_trading.ledger.record_trial`, which builds its run
+    config with `backtest_run_config` and runs it with `run_backtest_config`.
     """
     config = backtest_run_config(
         catalog_path,

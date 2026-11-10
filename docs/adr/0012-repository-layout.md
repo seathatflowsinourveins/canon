@@ -37,7 +37,7 @@ Chosen: **option 2**. It is the shape uv's workspace guide documents, and uv gen
 | `tests/`, `packages/*/tests/` | Tests beside each package's `src/` | pytest good practices |
 | `pytest.toml` | `importlib` import mode | pytest good practices |
 | `catalog/` | Local `ParquetDataCatalog`; ignored by git | NautilusTrader catalog guide |
-| `ledger/` | The trial ledger, an Optuna SQLite study; ignored by git | ADR 0035 |
+| `ledger/` | The trial ledger, an Optuna SQLite study; the main checkout's, shared by every worktree; ignored by git | ADR 0035 |
 | `canon/`, `docs/adr/`, `scripts/`, `home/`, `.claude/`, `.githooks/` | The harness | ADR 0003, ADR 0011 |
 
 On this Mac:
@@ -120,3 +120,5 @@ Read 2026-11-09.
   `nautilus-alpaca` stay free, hence `canon-alpaca` (fetched twice, ADR 0009).
 * 2026-11-10: `ledger/` added to the table under rule 2, for the trial ledger of ADR 0035 (an Optuna
   SQLite study written by `canon_trading.ledger`); ignored by git in `.gitignore`, as `catalog/` is.
+* 2026-11-10, after the full review found each worktree counting its own trials: the ledger is the main
+  checkout's `ledger/` only, which every worktree of the clone opens (ADR 0035 term 1).

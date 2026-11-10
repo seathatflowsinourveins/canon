@@ -3,7 +3,8 @@
 No test here runs a backtest, opens a network connection or reads a credential. Each writes trials to
 an Optuna SQLite study in pytest's temporary directory, in the form `canon_trading.ledger.record_trial`
 leaves them (the user attributes of ADR 0035 term 3); `tests/test_ledger.py` shows that form on real
-runs. Every day is a session day, from Tuesday 2025-03-11, so the matrix is the series as written.
+runs. Every day is a session day, from Tuesday 2025-03-11, so the matrix is the series as written. The
+study's sample (ADR 0041) is those T = 30 days.
 
 The two picks are worked here with the standard library, under the conventions ADR 0031 read in
 skfolio's source (sample standard deviation in each Sharpe ratio, population skewness and raw
@@ -29,13 +30,15 @@ from typing import TYPE_CHECKING
 import optuna
 import pytest
 from optuna.trial import TrialState
+from skfolio import Portfolio
 
 from canon_trading.ledger import DAY_NS
 from canon_trading.ledger import FAILED
 from canon_trading.ledger import IDLE
 from canon_trading.ledger import OUTCOME
 from canon_trading.ledger import TRADED
-from canon_trading.ledger import open_study
+from canon_trading.ledger import create_ledger_study
+from canon_trading.ledger import move_sample
 from canon_trading.ranking import THRESHOLD
 from canon_trading.ranking import RankingStopped
 from canon_trading.ranking import rank
@@ -58,7 +61,9 @@ THIRD_WIDE = [-PATTERN[(i + 5) % 10] * 0.8 for i in range(T)]
 
 @pytest.fixture
 def study(tmp_path: Path) -> Iterator[optuna.Study]:
-    with open_study("gate", tmp_path / "trials.db") as opened:
+    with create_ledger_study(
+        "gate", start=DAY_0, end=DAY_0 + (T - 1) * DAY_NS, path=tmp_path / "trials.db"
+    ) as opened:
         yield opened
 
 
@@ -71,11 +76,13 @@ def write(
     first_day: int = 0,
     tell: bool = True,
     told_complete: bool = True,
+    sample: int = 0,
 ) -> int:
     """Record one trial as the ledger does; `returns` start at day `first_day`."""
     trial = study.ask()
     if key is not None:
         trial.set_user_attr("config_key", key)
+        trial.set_user_attr("sample", sample)
     if outcome == FAILED:
         trial.set_user_attr(OUTCOME, FAILED)
         trial.set_user_attr("error", "RuntimeError: made up")
@@ -91,6 +98,7 @@ def write(
         "returns_series", {str(d): value for d, value in zip(days, returns or [], strict=True)}
     )
     trial.set_user_attr("session_days", [str(d) for d in days])
+    trial.set_user_attr("data_digest", {f"bars of {key}": "digest"})
     trial.set_user_attr(OUTCOME, outcome)
     if outcome == IDLE or not told_complete:
         study.tell(trial, state=TrialState.FAIL)
@@ -157,7 +165,7 @@ def test_a_pick_above_the_threshold_passes(study: optuna.Study) -> None:
     assert (report.first_day, report.last_day) == ("2025-03-11", "2025-04-09")
     assert (report.records, report.first_trial, report.last_trial) == (3, 0, 2)
     summary = report.summary()
-    assert "N = 3 configurations, T = 30 sessions" in summary
+    assert "N = 3 configurations over every sample, T = 30 sessions" in summary
     assert "it passes at 0.95" in summary
 
 
@@ -290,6 +298,7 @@ def test_a_rejected_series_stops(study: optuna.Study) -> None:
     write(study, "pick", PICK)
     trial = study.ask()
     trial.set_user_attr("config_key", "fallback")
+    trial.set_user_attr("sample", 0)
     trial.set_user_attr(OUTCOME, TRADED)
     trial.set_user_attr(
         "returns_series", {str(DAY_0 + 3_600 * 10**9): 0.01, str(DAY_0 + DAY_NS): 0.02}
@@ -307,7 +316,7 @@ def test_one_configuration_stops(study: optuna.Study) -> None:
     write(study, "pick", PICK)
     write(study, "pick", PICK)
 
-    with pytest.raises(RankingStopped, match="N = 1; the DSR needs N >= 2"):
+    with pytest.raises(RankingStopped, match=r"N = 1; the DSR needs N >= 2"):
         rank(study)
 
 
@@ -336,6 +345,21 @@ def test_no_spread_between_trials_stops(study: optuna.Study) -> None:
         rank(study)
 
 
+@pytest.mark.parametrize("scale", [0.97, 3.0, 1 / 7])
+def test_copies_that_differ_only_in_rounding_stop(study: optuna.Study, scale: float) -> None:
+    """The review: one configuration at two scales gave V = 1.1e-27 and passed undeflated."""
+    copy = [value * scale for value in PICK]
+    sharpes = {
+        float(Portfolio(X=[[v] for v in x], weights=[1.0]).sharpe_ratio) for x in (PICK, copy)
+    }
+    assert len(sharpes) == 2  # not bit-identical: an exact test of V = 0 would let this pass
+    write(study, "pick", PICK)
+    write(study, "copy", copy)
+
+    with pytest.raises(RankingStopped, match="within floating-point noise"):
+        rank(study)
+
+
 def test_a_shared_highest_sharpe_ratio_stops(study: optuna.Study) -> None:
     write(study, "pick", PICK)
     write(study, "copy", PICK)
@@ -355,3 +379,53 @@ def test_every_reason_is_named_at_once(study: optuna.Study) -> None:
 
     assert "broken: no record ran to the end" in str(stopped.value)
     assert "idle: never traded" in str(stopped.value)
+
+
+def test_a_trial_over_a_shorter_range_stops_and_is_named(study: optuna.Study) -> None:
+    """The review: one trial on 116 of 250 days set T = 116 for all and turned a rejection to a pass."""
+    write(study, "pick", PICK)
+    write(study, "second", SECOND)
+    short = write(study, "short", THIRD_WIDE[18:], first_day=18)
+
+    with pytest.raises(RankingStopped) as stopped:
+        rank(study)
+
+    message = str(stopped.value)
+    assert "every trial must cover the same session days over the sample" in message
+    assert "short: no return on 18 of the 30 session days of the sample, the first 2025-03-11" in (
+        message
+    )
+    assert f"short (#{short})" in message
+    assert "pick" not in message.split("Trials:")[1]
+
+
+def test_trials_with_no_day_in_common_are_each_named(study: optuna.Study) -> None:
+    early = write(study, "early", PICK[:10])
+    late = write(study, "late", SECOND[20:], first_day=20)
+
+    with pytest.raises(RankingStopped) as stopped:
+        rank(study)
+
+    assert f"early (#{early}), late (#{late})" in str(stopped.value)
+
+
+def test_a_configuration_not_run_on_the_current_sample_stops(study: optuna.Study) -> None:
+    """N counts every configuration the study tried; each must run on the current sample."""
+    write(study, "pick", PICK)
+    write(study, "second", SECOND)
+    old = write(study, "third", THIRD_CLOSE)
+    move_sample(study, start=DAY_0, end=DAY_0 + (T - 1) * DAY_NS)
+    write(study, "pick", PICK, sample=1)
+    write(study, "second", SECOND, sample=1)
+
+    with pytest.raises(
+        RankingStopped,
+        match=rf"\(N = 3\)[\s\S]*third: tried \(#{old} \(traded\)\) but not run on the current "
+        r"sample 1",
+    ):
+        rank(study)
+    write(study, "third", THIRD_CLOSE, sample=1)
+    report = rank(study)
+    assert (report.n, report.records, report.all_records) == (3, 3, 6)
+    assert report.pick_trials == (3,)
+    assert report.dsr == pytest.approx(0.98849, abs=5e-6)
