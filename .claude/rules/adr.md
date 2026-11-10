@@ -12,8 +12,9 @@ paths:
   `resolved` (to a SHA by `scripts/canon`), `bundled` (shipped with a pinned tool), or `UNVERIFIED`.
 * Cite only what was read this session. If a fetch was truncated or summarised, say so.
 * State where evidence disagrees with the request or with other evidence. Do not smooth it over.
-* Use `proposed` when upstream is silent or sources have not converged. A `proposed` ADR names the gap and
-  what would close it.
+* Use `proposed` when upstream is silent, or when sources have not converged on a choice that is hard to
+  reverse. A tool that is cheap to leave can be `accepted` on the owner's word, with what is untested
+  marked `UNVERIFIED` (ADR 0018). A `proposed` ADR names the gap and what would close it.
 * Do not rewrite an accepted ADR to change its decision. Write a new one and mark the old
   `superseded by ADR-NNNN`. Fixing a typo or refreshing evidence is fine.
 * Keep the decision (everything above Confirmation) under about 80 lines. Confirmation and Evidence add to

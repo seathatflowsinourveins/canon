@@ -466,6 +466,21 @@
         "https://raw.githubusercontent.com/dependabot/dependabot-core/main/LICENSE"
       ],
       "adr": "0016"
+    },
+    {
+      "id": "orca",
+      "field": "agent-harness",
+      "repo": "stablyai/orca",
+      "track": "branch:main",
+      "role": "tool",
+      "license": "MIT",
+      "why": "The cockpit Claude Code sessions run in: one git worktree and agent terminal per task, in one window. It starts the installed claude, so this repo's settings, hooks and instructions apply unchanged, and it reads orca.yaml for the worktree setup command. The app auto-updates by default on its stable channel, about a release a day, so this repo does not choose the version that runs; the entry follows main, and the docs it cites were read at v1.4.255.",
+      "evidence": [
+        "https://github.com/stablyai/orca/tree/v1.4.255/docs/site/content/docs",
+        "https://www.onorca.dev/docs/install",
+        "https://raw.githubusercontent.com/stablyai/orca/main/LICENSE"
+      ],
+      "adr": "0018"
     }
   ]
 }

@@ -1,0 +1,9 @@
+# Orca (https://github.com/stablyai/orca) reads this file from a new worktree.
+# Keys: docs/site/content/docs/model/orca-yaml.mdx in that repository, read at v1.4.255 (ADR 0018).
+# scripts.setup runs in the new worktree when setup is enabled in Orca and the command is approved there;
+# wait-for-setup starts the agent only after it has succeeded.
+# mise is looked for on PATH and then where scripts/bootstrap puts it.
+scripts:
+  setup: |
+    mise="$(command -v mise || echo "$HOME/.local/bin/mise")"; "$mise" exec -- uv sync --locked
+setupAgentStartupPolicy: wait-for-setup

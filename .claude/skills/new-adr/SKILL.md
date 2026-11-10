@@ -15,7 +15,8 @@ description: Create an architecture decision record in this repo's format (MADR 
 6. Where the evidence corrects the request or disagrees with itself, say so in the Decision Outcome.
 7. Set `review-by`: 30 days for models, prices or pre-release upstreams; 90 days otherwise.
 8. Set `status`: `accepted` when the evidence supports one option; `proposed` when upstream is silent or
-   sources have not converged.
+   sources have not converged on a choice that is hard to reverse. A tool that is cheap to leave can be
+   `accepted` on the owner's word, with what is untested marked `UNVERIFIED` (ADR 0018).
 9. If this replaces an earlier ADR, set that one's status to `superseded by ADR-NNNN` and leave its text.
 10. Add a row to the Decisions table in `AGENTS.md`.
 11. `scripts/canon lint` must pass. Run the `evidence-verifier` subagent on the new file and resolve what it

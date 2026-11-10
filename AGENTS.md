@@ -55,6 +55,7 @@ dependency, pattern and practice traces to a pinned upstream or a dated source. 
 | `canon/github-practice.json` | Measured pull request and automation practice of the repositories in `canon/github-practice.sample.json` |
 | `docs/adr/` | Decisions in MADR 4.0.0 with an Evidence section and `review-by` date |
 | `pyproject.toml`, `uv.lock` | uv workspace root and its single lockfile |
+| `orca.yaml` | Worktree setup for the Orca cockpit: two keys (ADR 0018) |
 | `src/canon_trading/` | Strategies and node configuration |
 | `packages/canon-alpaca/` | The Alpaca adapter for NautilusTrader: a market-data client, no execution client yet; read its README first |
 | `tests/`, `packages/*/tests/` | Tests, beside each package's `src/` |
@@ -86,7 +87,7 @@ dependency, pattern and practice traces to a pinned upstream or a dated source. 
 | 0015 | GitHub practice: what a measured sample converges on, and where this repo differs |
 | 0016 | Dependency updates: Dependabot proposes, a session lands |
 | 0017 | Merge gate: checks decide, an independent review comes first, a model never blocks |
-| 0018 | Agent hosts and other runtimes (proposed): no host has converged; one gate holds whatever runs |
+| 0018 | Agent hosts and other runtimes: Orca is the cockpit, Claude Code the only runtime; one gate holds whatever runs |
 | 0019 | Review gate scope: every change carries a review note except a named few |
 | 0020 | Rule enforcement: no hook runs before a tool call; the merge gate and permission rules hold the rules |
 
