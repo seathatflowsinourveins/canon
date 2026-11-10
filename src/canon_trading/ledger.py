@@ -31,8 +31,9 @@ The value told for a run that traded is skfolio's `Portfolio.sharpe_ratio` (1.12
 there for a later sampler; `canon_trading.ranking` does not read it.
 
 A session day (ADR 0035 term 3) is a UTC day on which a bar of the run became available, its `ts_init`,
-read with `ParquetDataCatalog.query` (the installed `nautilus_trader/persistence/__init__.pyi`) from the
-catalog the run read, over the study's sample. `BacktestResult` has no such list.
+a bar at exactly 00:00 UTC counting for the day ending there, as the daily series books it; read with
+`ParquetDataCatalog.query` (the installed `nautilus_trader/persistence/__init__.pyi`) from the catalog
+the run read, over the study's sample. `BacktestResult` has no such list.
 """
 
 from __future__ import annotations
@@ -72,6 +73,7 @@ if TYPE_CHECKING:
 
     from nautilus_trader.config import LoggerConfig
     from nautilus_trader.model import Bar
+    from optuna.trial import FrozenTrial
 
     from .backtest import BacktestRun
     from .ma_cross import MaCrossConfig
@@ -85,8 +87,10 @@ TRADED = "traded"
 IDLE = "idle"
 FAILED = "failed"
 
-# The study user attribute holding the study's samples, oldest first (ADR 0041).
+# The study user attributes holding the study's samples, oldest first, and the numbers of records
+# that ran no backtest (ADR 0041).
 SAMPLES = "samples"
+NOT_RUN = "not_run"
 STRATEGY_CLASS = f"{MaCross.__module__}:{MaCross.__qualname__}"
 
 
@@ -348,9 +352,20 @@ def bars_read(catalog_path: Path, bar_types: Sequence[str], start: int, end: int
     return sorted(kept, key=lambda bar: (str(bar.bar_type), bar.ts_init, bar.ts_event))
 
 
+def session_day(ts: int) -> int:
+    """The UTC day, its midnight in nanoseconds, that NautilusTrader's daily series books `ts` on.
+
+    The day that holds `ts`, except that an instant exactly at a UTC midnight belongs to the day ending
+    there: `snapshot_day_start` in `crates/analysis/src/analyzer.rs` at the pinned commit moves a
+    non-zero midnight back one day, and the series is built from those snapshots.
+    """
+    day = ts // DAY_NS * DAY_NS
+    return day - DAY_NS if ts == day and ts != 0 else day
+
+
 def session_days(bars: Sequence[Bar]) -> list[str]:
     """The UTC days, as nanoseconds in text, on which one of `bars` became available (`ts_init`)."""
-    return [str(day) for day in sorted({bar.ts_init // DAY_NS * DAY_NS for bar in bars})]
+    return [str(day) for day in sorted({session_day(bar.ts_init) for bar in bars})]
 
 
 def data_digest(bars: Sequence[Bar]) -> dict[str, str]:
@@ -403,7 +418,11 @@ def record_trial(
     outcome `failed` and its error, and the exception passes through. A run with no filled order is told
     `FAIL` with outcome `idle`; any other `COMPLETE` with `traded`, or `FAIL`, still `traded`, if its
     Sharpe ratio is not finite. The outcome is written last, so a record that has one ran to the end.
-    Nothing is overwritten: the same configuration again is a new record.
+    Every write after the trial is asked for, the outcome and the `tell` included, is inside the `try`
+    that tells a failure, so an error or `KeyboardInterrupt` there is told `FAIL` with its error. Only
+    a process killed outright, or a store that refuses the very first write, leaves a record with no
+    key; no backtest ran for it, and `mark_not_run` clears it (ADR 0041). Nothing is overwritten: the
+    same configuration again is a new record.
     """
     sample = current_sample(study)
     config = trial_config(strategies, starting_balances=starting_balances)
@@ -425,10 +444,11 @@ def record_trial(
         raise RuntimeError(f"the run loads {bar_types}, not the bar types its key names")
 
     trial = study.ask()
-    trial.set_user_attr("config", config)
-    trial.set_user_attr("config_key", key)
-    trial.set_user_attr("sample", sample.number)
     try:
+        # The key first, so the shortest stretch of a record has none; the run starts only after it.
+        trial.set_user_attr("config_key", key)
+        trial.set_user_attr("sample", sample.number)
+        trial.set_user_attr("config", config)
         run = run_backtest_config(run_config, built)
         result = run.result
         returns = {str(ns): value for ns, value in sorted(result.returns_series.items())}
@@ -443,19 +463,71 @@ def record_trial(
         traded = any(order.filled_qty.is_positive() for order in run.orders)
         sharpe = _session_sharpe(returns, days) if traded else math.nan
         outcome = TRADED if traded else IDLE
+        trial.set_user_attr(OUTCOME, outcome)
+        if math.isfinite(sharpe):
+            study.tell(trial, sharpe)
+        else:
+            study.tell(trial, state=TrialState.FAIL)
     except BaseException as error:
         _tell_failed(study, trial, error)
         raise
-    trial.set_user_attr(OUTCOME, outcome)
-    if math.isfinite(sharpe):
-        study.tell(trial, sharpe)
-    else:
-        study.tell(trial, state=TrialState.FAIL)
     return RecordedTrial(number=trial.number, config_key=key, outcome=outcome, run=run)
 
 
+def mark_not_run(study: optuna.Study, number: int) -> None:
+    """Record that trial `number` of `study`, a record with no config key, ran no backtest (ADR 0041).
+
+    `record_trial` writes the key before it starts a run, so a record without one ran nothing: it is
+    what a process killed between `ask` and that write leaves. The record is kept; a `RUNNING` one is
+    told `FAIL`, through `Study.tell`, which takes a trial number. Its number joins the study user
+    attribute `not_run`, and the ranking leaves it out of N. A record that has a key is refused.
+    Use it only on a record whose process is gone: a live one would have its run told `FAIL`.
+    """
+    found = [trial for trial in study.get_trials(deepcopy=False) if trial.number == number]
+    if not found:
+        raise LookupError(f"study {study.study_name!r} has no trial #{number}")
+    [trial] = found
+    if has_key(trial):
+        raise ValueError(
+            f"trial #{number} has config key {trial.user_attrs['config_key']}: it was tried, and only"
+            " a later record of that key resolves it",
+        )
+    if ran_something(trial):
+        raise ValueError(
+            f"trial #{number} has no config key but shows a run (outcome "
+            f"{trial.user_attrs.get(OUTCOME)!r}): it is a trial of an unknown configuration",
+        )
+    if not trial.state.is_finished():
+        study.tell(number, state=TrialState.FAIL)
+    marked = study.user_attrs.get(NOT_RUN, [])
+    if number not in marked:
+        study.set_user_attr(NOT_RUN, sorted([*marked, number]))
+
+
+def has_key(trial: FrozenTrial) -> bool:
+    """Whether `trial` holds a config key in the form `record_trial` writes, a non-empty text."""
+    key = trial.user_attrs.get("config_key")
+    return isinstance(key, str) and bool(key)
+
+
+def ran_something(trial: FrozenTrial) -> bool:
+    """Whether `trial` shows a run: an outcome of traded or idle, or returns or session days."""
+    attrs = trial.user_attrs
+    return (
+        attrs.get(OUTCOME) in (TRADED, IDLE) or "returns_series" in attrs or "session_days" in attrs
+    )
+
+
 def _tell_failed(study: optuna.Study, trial: optuna.Trial, error: BaseException) -> None:
-    """Tell `trial` `FAIL` with outcome `failed`; if that cannot be written, say so on `error`."""
+    """Tell `trial` `FAIL` with outcome `failed`; if that cannot be written, say so on `error`.
+
+    A trial already told, as when an interrupt lands just after its `tell`, is left as it is, and the
+    note says so.
+    """
+    [frozen] = [t for t in study.get_trials(deepcopy=False) if t.number == trial.number]
+    if frozen.state.is_finished():
+        error.add_note(f"trial #{trial.number} was already told {frozen.state.name}; left as it is")
+        return
     try:
         trial.set_user_attr("error", "".join(traceback.format_exception_only(error)).strip())
         trial.set_user_attr(OUTCOME, FAILED)

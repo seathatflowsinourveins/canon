@@ -49,6 +49,13 @@ SR₀ = √V·[(1−γ)Z⁻¹(1−1/N) + γZ⁻¹(1−1/(Ne))] and DSR = Z[(SR�
   here; no statistical source gives one, and whether it is enough is UNVERIFIED. With `abs_tol` 0 no
   nonzero value is close to 0, so ratios within rounding of 0 are not counted equal; their pick's DSR
   is then near 0.5, below the gate.
+* Two more stops. Keys tied at the highest Sharpe ratio under the same tolerance are one pick when
+  their returns are equal day by day under it, with `abs_tol` 1e-9 of the largest return so a 0 against
+  rounding counts as equal (each still counts in N, and they give one DSR); tied
+  keys whose returns differ leave no one pick and stop the ranking. A DSR skfolio gives as not finite
+  stops it too. Each stop names its keys and trial numbers. N̂ below 1 (ρ̂ rounding above 1, its
+  bound on p. 14) is raised to 1, skfolio's least; the DSR at N̂ is withheld when its benchmark is
+  below 0, and the report says why. Neither enters the gate.
 
 Who decided. Under the owner's delegation of 2026-11-10 (Evidence), the orchestrator chose skfolio.
 
@@ -113,6 +120,9 @@ checkout.
   scales gave V = 1.1e-27 and passed with an undeflated DSR of 0.9843. The tolerance above corrects it.
 * https://docs.python.org/3/library/math.html — `math.isclose(a, b, *, rel_tol=1e-09, abs_tol=0.0)`;
   the default "assures that the two values are the same within about 9 decimal digits". Fetched.
+* Full review, 2026-11-10 (`/code-review`): an exact tie between bit-identical columns stopped for good;
+  N̂ of 0.9999999999999998 reached skfolio and raised a bare `ValueError`; N̂ = 1.003 gave a "DSR at
+  N̂" above the undeflated value. The tie, DSR and N̂ terms above answer them.
 * Second reader of the split, 2026-11-10 (`evidence-verifier`): nothing of ADR 0010 is missing from the two
   records and every citation names the right one. It corrected a reference to a step 3 this record does
   not have, and the second reader's line above, which had named ADR 0010's option 2 and its PBO half.

@@ -24,9 +24,13 @@ pass undeflated. A return that is not finite is refused, for every trial, by
 `canon_trading.returns_matrix`.
 It also stops on what ADR 0035 terms 5 and 6 and ADR 0041 add: a configuration with a failed or
 `RUNNING` record that no later record of it resolves, an idle one, records of one configuration that
-disagree, one not run on the study's current sample, returns ADR 0010 step 2 rejects, and trials that
-do not cover the same session days over the sample. Two configurations sharing the highest Sharpe
-ratio leave no single pick, and stop it too.
+disagree, one not run on the study's current sample, returns ADR 0010 step 2 rejects or a record not in
+the shape `record_trial` writes, records that read one bar type as different bars, trials that do not
+cover the same session days over the sample, and a record with no key not marked by `mark_not_run`.
+Every such stop is gathered before one is raised. Configurations tied at the highest Sharpe ratio with
+the same returns are one pick; tied with other returns, they leave no single pick and stop it. N-hat
+below 1 is raised to 1, skfolio's least, and the DSR at N-hat is withheld when its benchmark is below
+0 (ADR 0031).
 """
 
 from __future__ import annotations
@@ -40,16 +44,22 @@ from skfolio import Portfolio
 from skfolio import measures
 
 from .ledger import IDLE
+from .ledger import NOT_RUN
 from .ledger import OUTCOME
 from .ledger import TRADED
 from .ledger import Sample
 from .ledger import current_sample
+from .ledger import has_key
+from .ledger import ran_something
 from .returns_matrix import ReturnsRejected
 from .returns_matrix import daily_series
 from .returns_matrix import returns_matrix
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     import optuna
+    import pandas as pd
     from optuna.trial import FrozenTrial
 
 THRESHOLD = 0.95
@@ -77,12 +87,14 @@ class RankingReport:
     first_day: str
     last_day: str
     pick: str
+    tied: tuple[str, ...]
     pick_trials: tuple[int, ...]
     sharpe: float
     dsr: float
     passed: bool
     n_hat: float | None
     dsr_at_n_hat: float | None
+    n_hat_note: str | None = None
 
     def summary(self) -> str:
         verdict = "passes" if self.passed else "is rejected"
@@ -97,16 +109,17 @@ class RankingReport:
                 f"{self.last_day}), V = {self.v:.6g}."
             ),
             (
-                f"Pick {self.pick} (trials {', '.join(map(str, self.pick_trials))}): Sharpe ratio "
+                f"Pick {self.pick}"
+                + (f", the same returns as {', '.join(self.tied)}" if self.tied else "")
+                + f" (trials {', '.join(map(str, self.pick_trials))}): Sharpe ratio "
                 f"{self.sharpe:.6g} per session, DSR {self.dsr:.4f}; it {verdict} at {THRESHOLD}."
             ),
         ]
-        if self.n_hat is None:
-            lines.append(f"N-hat not reported: T < N(N-1)/2 = {self.n * (self.n - 1) // 2}.")
-        else:
-            lines.append(
-                f"N-hat = {self.n_hat:.4g}, DSR at N-hat {self.dsr_at_n_hat:.4f} (not used in the gate).",
-            )
+        if self.n_hat is not None:
+            at = "" if self.dsr_at_n_hat is None else f", DSR at N-hat {self.dsr_at_n_hat:.4f}"
+            lines.append(f"N-hat = {self.n_hat:.4g}{at} (not used in the gate).")
+        if self.n_hat_note:
+            lines.append(self.n_hat_note)
         return "\n".join(lines)
 
 
@@ -124,30 +137,53 @@ def _ran(trial: FrozenTrial) -> bool:
     return trial.state.is_finished() and trial.user_attrs.get(OUTCOME) in (TRADED, IDLE)
 
 
+def _named(key: str, records: Sequence[FrozenTrial]) -> str:
+    return f"{key} ({', '.join(f'#{t.number}' for t in records)})"
+
+
 def rank(study: optuna.Study) -> RankingReport:
-    """Rank every trial of `study` and test the pick, or raise `RankingStopped` saying why not."""
+    """Rank every trial of `study` and test the pick, or raise `RankingStopped` saying why not.
+
+    Every stop a trial causes is gathered before any is raised, so one call names them all: each
+    configuration's records, the shape of its returns, the data it read, the session days it covers
+    and its Sharpe ratio. The stops of the study as a whole (N, V, a tie at the top, the DSR) need
+    every trial to have cleared those, and come after.
+    """
     trials = study.trials
     if not trials:
         raise RankingStopped(f"study {study.study_name!r} has no trials")
     sample = current_sample(study)
+    not_run = set(study.user_attrs.get(NOT_RUN, []))
     by_key: dict[str, list[FrozenTrial]] = defaultdict(list)
+    stops: list[str] = []
     for trial in trials:
-        by_key[trial.user_attrs.get("config_key") or f"no key, trial #{trial.number}"].append(trial)
+        if has_key(trial):
+            by_key[trial.user_attrs["config_key"]].append(trial)
+        elif ran_something(trial):
+            stops.append(
+                f"#{trial.number} ({trial.state.name.lower()}) has no config key in the form "
+                "record_trial writes but shows a run: a trial of an unknown configuration, which "
+                "another writer left and nothing clears (ADR 0041)",
+            )
+        elif trial.number not in not_run:
+            stops.append(
+                f"#{trial.number} ({trial.state.name.lower()}) has no config key, so it ran no "
+                f"backtest; if its process is gone, mark_not_run(study, {trial.number}) clears it "
+                "(ADR 0041)",
+            )
     n = len(by_key)
 
-    stops: list[str] = []
     chosen: dict[str, FrozenTrial] = {}
     on_sample: dict[str, list[FrozenTrial]] = {}
     read: list[FrozenTrial] = []  # every record on the current sample that ran to the end
     for key, every in by_key.items():
         records = [t for t in every if t.user_attrs.get("sample") == sample.number]
-        if not records and "config_key" in every[0].user_attrs:
+        if not records:
             stops.append(
                 f"{key}: tried ({', '.join(map(_describe, every))}) but not run on the current "
                 f"{sample.describe()}; run it on this sample (ADR 0041)",
             )
             continue
-        records = records or every
         on_sample[key] = records
         ran = [trial for trial in records if _ran(trial)]
         read.extend(ran)
@@ -176,7 +212,8 @@ def rank(study: optuna.Study) -> RankingReport:
             stops.append(
                 f"{key}: records {', '.join(map(_describe, [first, *differ]))} ran the same "
                 f"configuration on {sample.describe()} and disagree on their range, returns, "
-                "session days or data",
+                "session days or data; if the catalog or this code changed, move the sample and "
+                "run every configuration again (ADR 0041)",
             )
             continue
         if first.user_attrs[OUTCOME] == IDLE:
@@ -192,36 +229,35 @@ def rank(study: optuna.Study) -> RankingReport:
     for key, trial in chosen.items():
         try:
             series[key] = daily_series(
-                key,
-                trial.user_attrs["returns_series"],
-                trial.user_attrs.get("session_days", []),
+                key, trial.user_attrs.get("returns_series"), trial.user_attrs.get("session_days")
             )
         except ReturnsRejected as rejected:
             stops.append(f"{rejected} (#{trial.number})")
-    if stops:
-        raise RankingStopped(_stopped(study, n, stops))
-    if n < 2:
-        raise RankingStopped(_stopped(study, n, [f"N = {n}; the DSR needs N >= 2"]))
-
-    try:
-        matrix = returns_matrix(list(series.values()))
-    except ReturnsRejected as rejected:
-        named = ", ".join(f"{key} (#{chosen[key].number})" for key in rejected.names)
-        raise RankingStopped(_stopped(study, n, [f"{rejected}\nTrials: {named}"])) from rejected
+    matrix = None
+    if len(series) > 1:
+        try:
+            matrix = returns_matrix(list(series.values()))
+        except ReturnsRejected as rejected:
+            named = ", ".join(f"{key} (#{chosen[key].number})" for key in rejected.names)
+            stops.append(f"{rejected}\nTrials: {named}")
     sharpes = {
-        key: float(Portfolio(X=matrix[[key]], weights=[1.0], name=key).sharpe_ratio)
-        for key in matrix.columns
+        key: float(Portfolio(X=one.to_frame(), weights=[1.0], name=key).sharpe_ratio)
+        for key, one in series.items()
     }
-    not_finite = [key for key, sharpe in sharpes.items() if not math.isfinite(sharpe)]
-    if not_finite:
-        raise RankingStopped(
-            _stopped(
-                study,
-                n,
-                [f"{key}: Sharpe ratio {sharpes[key]} over the common range" for key in not_finite],
-            ),
+    stops.extend(
+        f"{key}: Sharpe ratio {sharpe} over the sample (#{chosen[key].number})"
+        for key, sharpe in sharpes.items()
+        if not math.isfinite(sharpe)
+    )
+    if n < 2:
+        stops.append(
+            f"N = {n}; the DSR needs N >= 2 ({'; '.join(_named(k, r) for k, r in by_key.items())})",
         )
-    values = list(sharpes.values())
+    if stops or matrix is None:
+        raise RankingStopped(_stopped(study, n, stops))
+
+    values = [sharpes[key] for key in matrix.columns]
+    everyone = "; ".join(_named(key, on_sample[key]) for key in matrix.columns)
     v = float(measures.variance(values))
     if all(math.isclose(value, values[0]) for value in values):
         raise RankingStopped(
@@ -231,36 +267,38 @@ def rank(study: optuna.Study) -> RankingReport:
                 [
                     (
                         f"V = {v}: every trial has the same Sharpe ratio, {values[0]!r}, within "
-                        "floating-point noise (math.isclose at its default rel_tol, 1e-9; ADR 0031)"
+                        "floating-point noise (math.isclose at its default rel_tol, 1e-9; "
+                        f"ADR 0031): {everyone}"
                     ),
                 ],
             ),
         )
     best = max(values)
-    picks = [key for key, sharpe in sharpes.items() if sharpe == best]
-    if len(picks) > 1:
+    tied = [key for key in matrix.columns if math.isclose(sharpes[key], best)]
+    pick = tied[0]
+    if any(not _same(matrix[pick], matrix[key]) for key in tied[1:]):
         raise RankingStopped(
-            _stopped(study, n, [f"{', '.join(picks)} share the highest Sharpe ratio"])
+            _stopped(
+                study,
+                n,
+                [
+                    "share the highest Sharpe ratio within floating-point noise, with returns that "
+                    "differ, so there is no one pick (ADR 0031): "
+                    + "; ".join(_named(key, on_sample[key]) for key in tied),
+                ],
+            ),
         )
-    [pick] = picks
     pick_returns = [float(value) for value in matrix[pick]]
     dsr = float(measures.deflated_sharpe_ratio(pick_returns, values))
     if not math.isfinite(dsr):
-        raise RankingStopped(_stopped(study, n, [f"{pick}: skfolio gives DSR {dsr}"]))
+        raise RankingStopped(
+            _stopped(
+                study, n, [f"skfolio gives DSR {dsr} for the pick {_named(pick, on_sample[pick])}"]
+            )
+        )
 
     t = len(matrix)
-    n_hat = dsr_at_n_hat = None
-    if t >= n * (n - 1) / 2:
-        correlations = measures.correlation(matrix.to_numpy())
-        pairs = [correlations[i][j] for i in range(n) for j in range(n) if i != j]
-        rho = sum(pairs) / len(pairs)
-        n_hat = float(rho + (1 - rho) * n)
-        benchmark = measures.expected_max_sharpe_ratio(
-            n_hat, float(measures.standard_deviation(values))
-        )
-        dsr_at_n_hat = float(
-            measures.probabilistic_sharpe_ratio(pick_returns, benchmark_sharpe_ratio=benchmark)
-        )
+    n_hat, dsr_at_n_hat, n_hat_note = _n_hat(matrix, values, pick_returns, n)
 
     current = sorted(
         (trial for records in on_sample.values() for trial in records), key=lambda t: t.number
@@ -282,23 +320,73 @@ def rank(study: optuna.Study) -> RankingReport:
         first_day=matrix.index[0].date().isoformat(),
         last_day=matrix.index[-1].date().isoformat(),
         pick=pick,
-        pick_trials=tuple(trial.number for trial in on_sample[pick]),
+        tied=tuple(tied[1:]),
+        pick_trials=tuple(sorted(t.number for key in tied for t in on_sample[key])),
         sharpe=sharpes[pick],
         dsr=dsr,
         passed=dsr >= THRESHOLD,
         n_hat=n_hat,
         dsr_at_n_hat=dsr_at_n_hat,
+        n_hat_note=n_hat_note,
     )
+
+
+def _same(a: pd.Series, b: pd.Series) -> bool:
+    """Whether two columns are equal day by day within the tolerance V uses (ADR 0031).
+
+    Each day's two returns must agree to `math.isclose`'s default `rel_tol` of the larger of them, or
+    of the largest return either column has, so a 0.0 against 1e-19 of rounding counts as equal.
+    """
+    scale = max(abs(float(x)) for x in (*a, *b))
+    return all(math.isclose(x, y, abs_tol=1e-9 * scale) for x, y in zip(a, b, strict=True))
+
+
+def _n_hat(
+    matrix: pd.DataFrame, values: list[float], pick_returns: list[float], n: int
+) -> tuple[float | None, float | None, str | None]:
+    """N-hat (eq. 9) and the DSR at it, or why either is not reported; never used in the gate."""
+    t = len(matrix)
+    if t < n * (n - 1) / 2:
+        return None, None, f"N-hat not reported: T < N(N-1)/2 = {n * (n - 1) // 2} (p. 15)."
+    correlations = measures.correlation(matrix.to_numpy())
+    pairs = [correlations[i][j] for i in range(n) for j in range(n) if i != j]
+    rho = sum(pairs) / len(pairs)
+    n_hat = float(rho + (1 - rho) * n)
+    notes = []
+    if n_hat < 1:
+        # rho rounds above 1, its bound (p. 14); skfolio takes N >= 1 only.
+        notes.append(f"N-hat {n_hat!r} raised to 1, the least skfolio takes (rho = {rho!r})")
+        n_hat = 1.0
+    benchmark = measures.expected_max_sharpe_ratio(
+        n_hat, float(measures.standard_deviation(values))
+    )
+    if benchmark < 0:
+        notes.append(
+            f"DSR at N-hat withheld: its benchmark SR0 = {benchmark:.6g} is below 0, where the "
+            "expected maximum of N-hat >= 1 trials of mean 0 cannot be; eq. 1's approximation "
+            "undershoots for N-hat this small",
+        )
+        return n_hat, None, "; ".join(notes) + "."
+    dsr = float(measures.probabilistic_sharpe_ratio(pick_returns, benchmark_sharpe_ratio=benchmark))
+    return n_hat, dsr, ("; ".join(notes) + ".") if notes else None
 
 
 def _data_disagreements(read: list[FrozenTrial], sample: Sample) -> list[str]:
     """One reason for each bar type that records on `sample` read as different bars (ADR 0041)."""
     by_digest: dict[str, dict[str, list[FrozenTrial]]] = defaultdict(lambda: defaultdict(list))
+    malformed = []
     for trial in read:
         digests = trial.user_attrs.get("data_digest")
-        for bar_type, digest in (digests if isinstance(digests, dict) else {}).items():
+        if not isinstance(digests, dict) or not all(
+            isinstance(b, str) and isinstance(d, str) for b, d in digests.items()
+        ):
+            malformed.append(
+                f"#{trial.number}: data_digest {digests!r} is not in the shape record_trial writes"
+            )
+            continue
+        for bar_type, digest in digests.items():
             by_digest[bar_type][digest].append(trial)
-    return [
+    return malformed + [
         f"{bar_type}: records on {sample.describe()} read different bars: "
         + "; ".join(
             f"{digest[:12]} by {', '.join(f'#{t.number}' for t in trials)}"

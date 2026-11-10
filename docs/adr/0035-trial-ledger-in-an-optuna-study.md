@@ -52,7 +52,8 @@ trial store that meets every driver. Leaving it is cheap, since every trial read
    not finite. Such a record ran to the end: no later record resolves it, and ADR 0031 stops the gate.
 3. **Entry.** User attributes `config`, `config_key`, `run_config_id`, `backtest_start`, `backtest_end`,
    `returns_series` (keyed by nanoseconds as text), and `session_days`, this record's addition: the UTC
-   days on which a bar of the run arrived, read here from the catalog, since `BacktestResult` has none.
+   days on which a bar of the run arrived (one at exactly 00:00 counts for the day ending there, as
+   NautilusTrader's daily series books it), read from the catalog, since `BacktestResult` has none.
    ADR 0010's `BacktestRunConfig` cannot be stored as an object, so `config` stands for it in the form
    ADR 0041 term 4 gives; `sample` and `data_digest` are ADR 0041's too.
 4. **Identity.** `id` defaults to a fresh UUID4, and no config identity reaches Python. `config_key` is
@@ -69,9 +70,11 @@ trial store that meets every driver. Leaving it is cheap, since every trial read
    or idle); the earlier one stays. Every record of a key that ran to the end on one sample must carry
    the same range, returns and data (ADR 0041), else the ranking stops and names them. A key is one
    column of the returns matrix.
-6. **What stops the ranking**, beside ADR 0031's four conditions (every trial's Sharpe ratio and every
-   return of the pick finite, N ≥ 2, V > 0): a key with no record that ran to the end; an idle key
-   (ADR 0010's Limits); and a key whose returns ADR 0010 step 2 rejects. Each message names the trial.
+6. **What stops the ranking**, beside ADR 0031's and ADR 0041's: a study with no record; a key with no
+   record that ran to the end; a `failed` or `RUNNING` record no later record of its key resolves;
+   records of one key that disagree (term 5); an idle key (ADR 0010's Limits); and returns ADR 0010
+   step 2 rejects, or a record not in the shape `record_trial` writes. Each message names the key and
+   trial; one ranking gathers every trial's stops before it raises.
    A configuration that can never run to the end stops the ranking for as long as that study is used.
    That is the strict reading: a tried configuration is a trial, and no source read gives it a value.
    Like the idle trial, it is undecided, not solved.
@@ -134,6 +137,10 @@ Read 2026-11-10. Fetched means read in this session as raw text or source; run m
   opening created what was missing; the key hashed text as typed and upstream's reflected defaults, was
   read from a config that could change after the strategy was built, and held nothing of the data. Terms
   1 and 5 corrected, terms 3 and 4 point to ADR 0041, which holds the key, the sample and the data.
+* Full review, 2026-11-10: a bar at exactly a UTC midnight fell on another day than its return; the
+  writes after `ask` sat outside the `try`; stops named no trial and came one stage at a time. Terms 3
+  and 6 corrected. `crates/analysis/src/analyzer.rs` at the pinned commit: `snapshot_day_start` moves a
+  non-zero midnight back one day. Fetched; a run of daily bars stamped at 00:00 UTC ranked T = 40.
 * Opening without creating, read 2026-11-10: `optuna.load_study` raises `KeyError` for a missing study
   and `RDBStorage(skip_table_creation=True)` creates no table (Optuna 5.0.0, `study.py`,
   `storages/_rdb/storage.py`, `bundled`); https://www.sqlite.org/uri.html gives `rw` beside `rwc`,
