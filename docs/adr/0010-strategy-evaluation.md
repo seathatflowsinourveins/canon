@@ -44,8 +44,9 @@ of trials.
 2. **Run each variant over the whole period**, one `BacktestNode` per variant, through
    `canon_trading.backtest.run_backtest`. Accept `BacktestResult.returns_series` only if it is the daily
    portfolio series, with one key per UTC day. Any other shape is the per-position fallback, and that run is
-   rejected. Drop days the venue was closed, and trim every variant to a common range of T rows.
-   `canon_trading.returns_matrix` does this through skfolio's `Population` and pandas.
+   rejected. Drop days the venue was closed. The trim to a common range of T rows is superseded by
+   ADR 0041: every variant runs over its study's sample and must cover the same session days, or the
+   ranking stops. `canon_trading.returns_matrix` does this through skfolio's `Population` and pandas.
 3. **DSR of the pick.** ADR 0031 holds how it is computed: eqs. 1–2, their conventions, skfolio, and the
    input that stops the ranking. `canon_trading.ranking.rank` applies it.
    * **Reject the pick below 0.95**, with N = all trials. The paper's N is the number of independent trials,
@@ -108,6 +109,8 @@ second reader's line support both records and are kept whole in each.
     fills. Fetched.
 * ADR 0004 — Alpaca's backtest skill has the agent write a script per run. Read there on 2026-11-09 at the
   pinned commit of `alpacahq/alpaca-skills`; not re-read: UNVERIFIED this session.
+* Full review, 2026-11-10 (`/code-review`): the trim let one short trial set T for every trial and turn a
+  rejection into a pass. Step 2's trim clause is superseded by ADR 0041; nothing else here changes.
 * Second reader (`evidence-verifier`). 2026-11-09: sent the PBO half back to `proposed`; it is now ADR
   0027. 2026-11-10: the equations, the example, the pins and the test hold; corrected how skfolio counts
   N, "maintainers", the release cadence and the idle-trial limit; could not check the delegation or

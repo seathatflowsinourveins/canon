@@ -1,6 +1,7 @@
 """The gate: rank the trials of a ledger study and test the pick's deflated Sharpe ratio at 0.95.
 
-Contract: ADR 0010, protocol step 3, computed as ADR 0031 decides, on the ledger of ADR 0035. skfolio
+Contract: ADR 0010, protocol step 3, computed as ADR 0031 decides, on the ledger of ADR 0035 over the
+sample of ADR 0041. skfolio
 1.12.8, read 2026-11-10 in the installed `measures/_measures.py` and `portfolio/_base.py`:
 
 * `Portfolio.sharpe_ratio` of a one-asset portfolio with weight 1: each trial's Sharpe ratio per
@@ -17,11 +18,15 @@ Contract: ADR 0010, protocol step 3, computed as ADR 0031 decides, on the ledger
 Nothing statistical is computed here; the mean of the off-diagonal correlations is eq. 9's own input.
 skfolio raises nothing on input that lets a pick pass more easily (ADR 0031), so the ranking stops,
 naming the trials, unless every trial's Sharpe ratio and every return of the pick is finite, N >= 2 and
-V > 0. A return that is not finite is refused, for every trial, by `canon_trading.returns_matrix`.
-It also stops on what ADR 0035 terms 5 and 6 add: a configuration with a failed or `RUNNING` record
-that no later record of it resolves, an idle one, records of one configuration that disagree, and
-returns ADR 0010 step 2 rejects. Two configurations sharing the highest Sharpe ratio leave no single
-pick, and stop it too.
+V > 0. V counts as 0 when every trial's Sharpe ratio equals the first's under `math.isclose` at its
+default tolerance (ADR 0031): copies of one configuration differ only in rounding, and would otherwise
+pass undeflated. A return that is not finite is refused, for every trial, by
+`canon_trading.returns_matrix`.
+It also stops on what ADR 0035 terms 5 and 6 and ADR 0041 add: a configuration with a failed or
+`RUNNING` record that no later record of it resolves, an idle one, records of one configuration that
+disagree, one not run on the study's current sample, returns ADR 0010 step 2 rejects, and trials that
+do not cover the same session days over the sample. Two configurations sharing the highest Sharpe
+ratio leave no single pick, and stop it too.
 """
 
 from __future__ import annotations
@@ -37,6 +42,8 @@ from skfolio import measures
 from .ledger import IDLE
 from .ledger import OUTCOME
 from .ledger import TRADED
+from .ledger import Sample
+from .ledger import current_sample
 from .returns_matrix import ReturnsRejected
 from .returns_matrix import daily_series
 from .returns_matrix import returns_matrix
@@ -57,7 +64,9 @@ class RankingReport:
     """What a ranking states (ADR 0010, Confirmation): N, T, V, the DSR and the ledger range read."""
 
     study: str
+    sample: str
     records: int
+    all_records: int
     first_trial: int
     last_trial: int
     first_recorded: str
@@ -79,11 +88,12 @@ class RankingReport:
         verdict = "passes" if self.passed else "is rejected"
         lines = [
             (
-                f"Study {self.study!r}: {self.records} records, trials {self.first_trial} to "
-                f"{self.last_trial}, recorded {self.first_recorded} to {self.last_recorded}."
+                f"Study {self.study!r}, {self.sample}: {self.records} records on it, trials "
+                f"{self.first_trial} to {self.last_trial}, recorded {self.first_recorded} to "
+                f"{self.last_recorded}; {self.all_records} records on every sample."
             ),
             (
-                f"N = {self.n} configurations, T = {self.t} sessions ({self.first_day} to "
+                f"N = {self.n} configurations over every sample, T = {self.t} sessions ({self.first_day} to "
                 f"{self.last_day}), V = {self.v:.6g}."
             ),
             (
@@ -119,6 +129,7 @@ def rank(study: optuna.Study) -> RankingReport:
     trials = study.trials
     if not trials:
         raise RankingStopped(f"study {study.study_name!r} has no trials")
+    sample = current_sample(study)
     by_key: dict[str, list[FrozenTrial]] = defaultdict(list)
     for trial in trials:
         by_key[trial.user_attrs.get("config_key") or f"no key, trial #{trial.number}"].append(trial)
@@ -126,8 +137,20 @@ def rank(study: optuna.Study) -> RankingReport:
 
     stops: list[str] = []
     chosen: dict[str, FrozenTrial] = {}
-    for key, records in by_key.items():
+    on_sample: dict[str, list[FrozenTrial]] = {}
+    read: list[FrozenTrial] = []  # every record on the current sample that ran to the end
+    for key, every in by_key.items():
+        records = [t for t in every if t.user_attrs.get("sample") == sample.number]
+        if not records and "config_key" in every[0].user_attrs:
+            stops.append(
+                f"{key}: tried ({', '.join(map(_describe, every))}) but not run on the current "
+                f"{sample.describe()}; run it on this sample (ADR 0041)",
+            )
+            continue
+        records = records or every
+        on_sample[key] = records
         ran = [trial for trial in records if _ran(trial)]
+        read.extend(ran)
         if not ran:
             stops.append(
                 f"{key}: no record ran to the end ({', '.join(map(_describe, records))})",
@@ -145,14 +168,15 @@ def rank(study: optuna.Study) -> RankingReport:
             )
             continue
         first = ran[0]
-        keep = ("backtest_start", "backtest_end", "returns_series")
+        keep = ("backtest_start", "backtest_end", "returns_series", "session_days", "data_digest")
         differ = [
             t for t in ran[1:] if any(t.user_attrs.get(a) != first.user_attrs.get(a) for a in keep)
         ]
         if differ:
             stops.append(
                 f"{key}: records {', '.join(map(_describe, [first, *differ]))} ran the same "
-                "configuration and disagree on their range or returns",
+                f"configuration on {sample.describe()} and disagree on their range, returns, "
+                "session days or data",
             )
             continue
         if first.user_attrs[OUTCOME] == IDLE:
@@ -163,6 +187,7 @@ def rank(study: optuna.Study) -> RankingReport:
             continue
         chosen[key] = first
 
+    stops.extend(_data_disagreements(read, sample))
     series = {}
     for key, trial in chosen.items():
         try:
@@ -181,7 +206,8 @@ def rank(study: optuna.Study) -> RankingReport:
     try:
         matrix = returns_matrix(list(series.values()))
     except ReturnsRejected as rejected:
-        raise RankingStopped(_stopped(study, n, [str(rejected)])) from rejected
+        named = ", ".join(f"{key} (#{chosen[key].number})" for key in rejected.names)
+        raise RankingStopped(_stopped(study, n, [f"{rejected}\nTrials: {named}"])) from rejected
     sharpes = {
         key: float(Portfolio(X=matrix[[key]], weights=[1.0], name=key).sharpe_ratio)
         for key in matrix.columns
@@ -197,9 +223,18 @@ def rank(study: optuna.Study) -> RankingReport:
         )
     values = list(sharpes.values())
     v = float(measures.variance(values))
-    if not v > 0:
+    if all(math.isclose(value, values[0]) for value in values):
         raise RankingStopped(
-            _stopped(study, n, [f"V = {v}: every trial has the same Sharpe ratio"])
+            _stopped(
+                study,
+                n,
+                [
+                    (
+                        f"V = {v}: every trial has the same Sharpe ratio, {values[0]!r}, within "
+                        "floating-point noise (math.isclose at its default rel_tol, 1e-9; ADR 0031)"
+                    ),
+                ],
+            ),
         )
     best = max(values)
     picks = [key for key, sharpe in sharpes.items() if sharpe == best]
@@ -227,11 +262,16 @@ def rank(study: optuna.Study) -> RankingReport:
             measures.probabilistic_sharpe_ratio(pick_returns, benchmark_sharpe_ratio=benchmark)
         )
 
-    numbers = [trial.number for trial in trials]
-    starts = sorted(trial.datetime_start for trial in trials if trial.datetime_start is not None)
+    current = sorted(
+        (trial for records in on_sample.values() for trial in records), key=lambda t: t.number
+    )
+    numbers = [trial.number for trial in current]
+    starts = sorted(trial.datetime_start for trial in current if trial.datetime_start is not None)
     return RankingReport(
         study=study.study_name,
-        records=len(trials),
+        sample=sample.describe(),
+        records=len(current),
+        all_records=len(trials),
         first_trial=min(numbers),
         last_trial=max(numbers),
         first_recorded=starts[0].isoformat() if starts else "unknown",
@@ -242,13 +282,32 @@ def rank(study: optuna.Study) -> RankingReport:
         first_day=matrix.index[0].date().isoformat(),
         last_day=matrix.index[-1].date().isoformat(),
         pick=pick,
-        pick_trials=tuple(trial.number for trial in by_key[pick]),
+        pick_trials=tuple(trial.number for trial in on_sample[pick]),
         sharpe=sharpes[pick],
         dsr=dsr,
         passed=dsr >= THRESHOLD,
         n_hat=n_hat,
         dsr_at_n_hat=dsr_at_n_hat,
     )
+
+
+def _data_disagreements(read: list[FrozenTrial], sample: Sample) -> list[str]:
+    """One reason for each bar type that records on `sample` read as different bars (ADR 0041)."""
+    by_digest: dict[str, dict[str, list[FrozenTrial]]] = defaultdict(lambda: defaultdict(list))
+    for trial in read:
+        digests = trial.user_attrs.get("data_digest")
+        for bar_type, digest in (digests if isinstance(digests, dict) else {}).items():
+            by_digest[bar_type][digest].append(trial)
+    return [
+        f"{bar_type}: records on {sample.describe()} read different bars: "
+        + "; ".join(
+            f"{digest[:12]} by {', '.join(f'#{t.number}' for t in trials)}"
+            for digest, trials in digests.items()
+        )
+        + "; move the sample and run every configuration again (ADR 0041)"
+        for bar_type, digests in sorted(by_digest.items())
+        if len(digests) > 1
+    ]
 
 
 def _stopped(study: optuna.Study, n: int, reasons: list[str]) -> str:

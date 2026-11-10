@@ -91,9 +91,11 @@ print(len(run.orders), "orders;", list(run.account.balances_total().values()))
 `run.position_snapshots` and `run.account` are the objects in the engine's cache. The simulated venue's
 settings and what it leaves out (slippage, latency, market hours, margin) are listed at the top of
 `backtest.py`. A result here shows that the plumbing works. Variants are ranked only by the protocol in
-[ADR 0010](docs/adr/0010-strategy-evaluation.md): `canon_trading.ledger.record_trial` runs a backtest as a
-trial of an Optuna study in `ledger/trials.db` ([ADR 0035](docs/adr/0035-trial-ledger-in-an-optuna-study.md)),
-and `canon_trading.ranking.rank` ranks a study's trials and tests the pick's deflated Sharpe ratio.
+[ADR 0010](docs/adr/0010-strategy-evaluation.md): `canon_trading.ledger.create_ledger_study` creates a study
+over a fixed sample in the main checkout's `ledger/trials.db`, which every worktree shares
+([ADR 0035](docs/adr/0035-trial-ledger-in-an-optuna-study.md), [ADR 0041](docs/adr/0041-trial-ledger-sample-and-data-identity.md));
+`record_trial` runs a backtest over that sample as one of its trials; `move_sample` takes in new data; and
+`canon_trading.ranking.rank` ranks a study's trials and tests the pick's deflated Sharpe ratio.
 
 ## Enter the Alpaca paper keys
 
@@ -159,7 +161,7 @@ runs.
 | `packages/canon-alpaca/` | The Alpaca adapter for NautilusTrader: a market-data client and a paper-only execution client |
 | `tests/`, `packages/*/tests/` | Tests beside each package's `src/` |
 | `catalog/` | Local market data, loaded by `canon_trading.bars_to_catalog`; ignored by git |
-| `ledger/` | The trial ledger, an Optuna SQLite study; ignored by git |
+| `ledger/` | The trial ledger, an Optuna SQLite study, used from the main checkout by every worktree; ignored by git |
 | `.claude/settings.json` | Permissions and hooks for this repo |
 | `orca.yaml` | The setup command Orca runs in a new worktree, once enabled and approved in the app |
 | `.claude/rules/` | Rules scoped to `canon/`, `docs/adr/` and trading code |

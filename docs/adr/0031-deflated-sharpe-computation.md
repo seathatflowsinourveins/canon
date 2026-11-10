@@ -43,7 +43,12 @@ SR₀ = √V·[(1−γ)Z⁻¹(1−1/N) + γZ⁻¹(1−1/(Ne))] and DSR = Z[(SR�
 * skfolio raises nothing on three inputs that make a pick pass more easily. It leaves a NaN trial
   Sharpe ratio out of N; it ignores a NaN in the pick's returns; and for one trial, or trials with
   equal Sharpe ratios, SR₀ is 0. So the ranking stops unless every trial's Sharpe ratio and every
-  return of the pick is finite, N ≥ 2 and V > 0.
+  return of the pick is finite, N ≥ 2 and V > 0. V counts as 0 when every trial's Sharpe ratio equals
+  the first's under `math.isclose` at its documented default (`rel_tol` 1e-9): copies of one
+  configuration differ only in rounding. That tolerance is a definition of floating-point noise chosen
+  here; no statistical source gives one, and whether it is enough is UNVERIFIED. With `abs_tol` 0 no
+  nonzero value is close to 0, so ratios within rounding of 0 are not counted equal; their pick's DSR
+  is then near 0.5, below the gate.
 
 Who decided. Under the owner's delegation of 2026-11-10 (Evidence), the orchestrator chose skfolio.
 
@@ -104,6 +109,10 @@ checkout.
 * Second reader (`evidence-verifier`), 2026-11-10, the part that concerns this record: the equations, the
   example, the pins and the test hold; corrected how skfolio counts N, "maintainers" and the release
   cadence; could not check the delegation.
+* Full review, 2026-11-10 (`/code-review`): V > 0 was an exact test, and one configuration at two
+  scales gave V = 1.1e-27 and passed with an undeflated DSR of 0.9843. The tolerance above corrects it.
+* https://docs.python.org/3/library/math.html — `math.isclose(a, b, *, rel_tol=1e-09, abs_tol=0.0)`;
+  the default "assures that the two values are the same within about 9 decimal digits". Fetched.
 * Second reader of the split, 2026-11-10 (`evidence-verifier`): nothing of ADR 0010 is missing from the two
   records and every citation names the right one. It corrected a reference to a step 3 this record does
   not have, and the second reader's line above, which had named ADR 0010's option 2 and its PBO half.
