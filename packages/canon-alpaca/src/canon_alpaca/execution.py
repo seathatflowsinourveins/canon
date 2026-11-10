@@ -1,4 +1,4 @@
-"""Execution client: market and limit orders for US equities on Alpaca's paper Trading API, and their events.
+"""Execution client: market, limit, stop and stop-limit orders for US equities on Alpaca's paper Trading API.
 
 Contract: `nautilus_trader.live.clients.ExecutionClient`, NautilusTrader v2.0.0rc8 (Python adapter guide,
 "Execution client hooks", https://nautilustrader.io/docs/md/latest/developer_guide/python_adapters.md). The
@@ -54,11 +54,22 @@ Venue side, alpaca-py 0.45.0:
 
 Known limits:
 
-* Market and limit orders only, `DAY` or `GTC` only, whole shares only, simple orders only. Alpaca marks
-  IOC, FOK, OPG and CLS for whole-share market and limit orders "Yes*", and "Please contact the sales team
-  for any TIF marked with a *" ("Orders at Alpaca", https://docs.alpaca.markets/us/docs/orders-at-alpaca.md),
-  so they are denied. Post-only, reduce-only, quote-quantity, display quantity, contingent orders and order
-  lists are denied or not implemented; so are modify, query and extended hours.
+* Market, limit, stop and stop-limit orders only, `DAY` or `GTC` only, whole shares only, simple orders
+  only. Alpaca marks IOC, FOK, OPG and CLS for whole-share market and limit orders "Yes*", and "Please
+  contact the sales team for any TIF marked with a *", and for stop and stop-limit orders "No" ("Orders at
+  Alpaca", https://docs.alpaca.markets/us/docs/orders-at-alpaca.md, "Order Types vs Supported Time in
+  Force"), so they are denied.
+* Stop and stop-limit orders: a stop "is elected on the consolidated print" (same page, "Order Handling
+  Standards"), the last trade, so only `DEFAULT` and `LAST_PRICE` trigger types are sent (both as Alpaca's
+  stop; Alpaca has no trigger type field), and any other is denied. Upstream's Kraken spot adapter maps
+  `DEFAULT` and `LAST_PRICE` to its last-trade trigger too, and refuses what its venue has no trigger for. Alpaca's extended hours table
+  gives stop and stop-limit orders "No" in every time in force; this client never sends
+  `extended_hours`. The stop price and a stop-limit's limit price follow the sub-penny rule ("Sub-penny
+  increments for stop orders"). Alpaca documents no status or trade update for a stop's election, so no
+  `OrderTriggered` is generated: an elected stop-limit stays `ACCEPTED` until it fills or ends. Trailing
+  stops stay denied: their stop price moves with Alpaca's high-water mark and no update reports it.
+* Post-only, reduce-only, quote-quantity, display quantity, contingent orders and order lists are denied
+  or not implemented; so are modify, query and extended hours.
 * Cancel-all sends one cancel per order, one at a time, in no specified order, skipping an order already
   pending cancel; an order placed after the command was read from the cache is not canceled by it.
 * A limit price at or above $1.00 with more than 2 decimals, or below $1.00 with more than 4, is denied
@@ -88,7 +99,8 @@ Known limits:
   once Alpaca shows it does not hold the order, and a cancel refused with 422 only once Alpaca shows the
   order neither canceled nor pending cancel. alpaca-py sets no HTTP timeout.
 * Start-up fails, by design, on an open order or position this slice cannot represent: a fractional
-  position, or an open order that is not a simple whole-share US equity market or limit order.
+  position, or an open order that is not a simple whole-share US equity market, limit, stop or stop-limit
+  order. An open stop is reported with its stop price as the trigger price and trigger type `DEFAULT`.
 * Timestamps lose sub-microsecond precision: alpaca-py parses them into `datetime`.
 """
 
@@ -124,6 +136,8 @@ from alpaca.trading.models import TradeUpdate
 from alpaca.trading.requests import GetOrdersRequest
 from alpaca.trading.requests import LimitOrderRequest
 from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.requests import StopLimitOrderRequest
+from alpaca.trading.requests import StopOrderRequest
 from alpaca.trading.stream import TradingStream
 from nautilus_trader.common import Logger
 from nautilus_trader.config import ExecutionClientConfig
@@ -149,6 +163,7 @@ from nautilus_trader.model import Quantity
 from nautilus_trader.model import Symbol
 from nautilus_trader.model import TimeInForce
 from nautilus_trader.model import TradeId
+from nautilus_trader.model import TriggerType
 from nautilus_trader.model import VenueOrderId
 
 from .constants import ACCOUNT_ID
@@ -206,13 +221,24 @@ ORDER_SIDES = {OrderSide.BUY: AlpacaOrderSide.BUY, OrderSide.SELL: AlpacaOrderSi
 ORDER_SIDES_FROM_ALPACA = {v: k for k, v in ORDER_SIDES.items()}
 
 TIMES_IN_FORCE = {TimeInForce.DAY: AlpacaTimeInForce.DAY, TimeInForce.GTC: AlpacaTimeInForce.GTC}
-"""The times in force Alpaca offers whole-share market and limit orders without a sales contact."""
+"""The times in force Alpaca offers whole-share market, limit, stop and stop-limit orders without a sales
+contact."""
 TIMES_IN_FORCE_FROM_ALPACA = {v: k for k, v in TIMES_IN_FORCE.items()}
 
 ORDER_TYPES_FROM_ALPACA = {
     AlpacaOrderType.MARKET: OrderType.MARKET,
     AlpacaOrderType.LIMIT: OrderType.LIMIT,
+    AlpacaOrderType.STOP: OrderType.STOP_MARKET,
+    AlpacaOrderType.STOP_LIMIT: OrderType.STOP_LIMIT,
 }
+
+ORDER_TYPES = frozenset(ORDER_TYPES_FROM_ALPACA.values())
+STOP_TYPES = frozenset({OrderType.STOP_MARKET, OrderType.STOP_LIMIT})
+LIMIT_PRICED = frozenset({OrderType.LIMIT, OrderType.STOP_LIMIT})
+
+STOP_TRIGGER_TYPES = frozenset({TriggerType.DEFAULT, TriggerType.LAST_PRICE})
+"""Alpaca elects a stop "on the consolidated print" ("Orders at Alpaca", "Order Handling Standards"): the
+last trade. `DEFAULT` is "the venue's default trigger type"; `LAST_PRICE` "Uses the last traded price"."""
 
 OPEN_STATUSES = {
     AlpacaOrderStatus.NEW: OrderStatus.ACCEPTED,
@@ -376,11 +402,19 @@ def whole_quantity(value: object, field: str) -> Quantity:
 
 
 def exact_report_price(value: object) -> Price:
-    """A price for a report, at the adapter's precision, refusing one that would need rounding."""
+    """A price for a report, at the adapter's precision, refusing a missing one and one that would need
+    rounding."""
+    if value is None:
+        raise ValueError("no price")
     amount = Decimal(str(value))
     if amount != amount.quantize(Decimal(1).scaleb(-PRICE_PRECISION)):
         raise ValueError(f"price {value} is finer than {PRICE_PRECISION} decimals")
     return Price(float(amount), PRICE_PRECISION)
+
+
+def wire_price(price: Price) -> float:
+    """A NautilusTrader price as alpaca-py's request classes take it: their price fields are floats."""
+    return float(Decimal(str(price)))
 
 
 def fill_price(value: float) -> Price:
@@ -388,13 +422,13 @@ def fill_price(value: float) -> Price:
     return Price.from_str(repr(float(value)))
 
 
-def sub_penny_denial(price: Price) -> str | None:
-    """Why Alpaca would reject this limit price, or None: 2 decimals at or above $1.00, 4 below."""
+def sub_penny_denial(price: Price, what: str = "limit price") -> str | None:
+    """Why Alpaca would reject this limit or stop price, or None: 2 decimals at or above $1.00, 4 below."""
     amount = Decimal(str(price))
     places = 2 if amount >= 1 else 4
     if amount != amount.quantize(Decimal(1).scaleb(-places)):
         return (
-            f"limit price {amount.normalize()} has more than {places} decimals, which Alpaca rejects "
+            f"{what} {amount.normalize()} has more than {places} decimals, which Alpaca rejects "
             f"for a price {'at or above' if amount >= 1 else 'below'} $1.00"
         )
     return None
@@ -407,11 +441,15 @@ def alpaca_side(order: AlpacaOrder) -> OrderSide:
     return side
 
 
-def order_status_report(order: AlpacaOrder, ts_init: int) -> OrderStatusReport | None:
+def order_status_report(
+    order: AlpacaOrder, ts_init: int, trigger_type: TriggerType | None = None
+) -> OrderStatusReport | None:
     """An `OrderStatusReport` for one Alpaca order, None for a closed one this slice does not map.
 
     An open order this slice does not map raises, so reconciliation fails rather than leaving a working
     order unknown to the node. `replaced` is skipped: the order replacing it is reported in its own right.
+    A stop's trigger type is `trigger_type` when the node holds the order, else `DEFAULT`: Alpaca's order
+    has no trigger type field.
     """
     status = order.status
     is_open = status not in CLOSED_STATUSES and status not in (AlpacaOrderStatus.REPLACED,)
@@ -452,7 +490,13 @@ def order_status_report(order: AlpacaOrder, ts_init: int) -> OrderStatusReport |
             ts_last=dt_to_unix_nanos(order.updated_at),
             ts_init=ts_init,
             client_order_id=ClientOrderId(order.client_order_id),
-            price=exact_report_price(order.limit_price) if order_type == OrderType.LIMIT else None,
+            price=exact_report_price(order.limit_price) if order_type in LIMIT_PRICED else None,
+            trigger_price=exact_report_price(order.stop_price)
+            if order_type in STOP_TYPES
+            else None,
+            trigger_type=(trigger_type or TriggerType.DEFAULT)
+            if order_type in STOP_TYPES
+            else None,
             avg_px=Decimal(str(order.filled_avg_price))
             if filled and order.filled_avg_price
             else None,
@@ -486,7 +530,8 @@ def position_status_report(position: AlpacaPosition, ts_init: int) -> PositionSt
 
 
 class AlpacaExecutionClient(ExecutionClient):
-    """Send market and limit orders for US equities to Alpaca's paper Trading API and report their events."""
+    """Send market, limit, stop and stop-limit orders for US equities to Alpaca's paper Trading API and
+    report their events."""
 
     def __init__(
         self,
@@ -810,8 +855,11 @@ class AlpacaExecutionClient(ExecutionClient):
             return f"{order.instrument_id} is not a loaded {VENUE} equity"
         if not instrument.info.get("tradable", False):
             return f"{order.instrument_id} is not tradable on Alpaca (asset tradable=false)"
-        if order.order_type not in (OrderType.MARKET, OrderType.LIMIT):
-            return f"order type {order.order_type.name} is not supported; market and limit only"
+        if order.order_type not in ORDER_TYPES:
+            return (
+                f"order type {order.order_type.name} is not supported; market, limit, stop and "
+                "stop-limit only"
+            )
         if order.time_in_force not in TIMES_IN_FORCE:
             return f"time in force {order.time_in_force.name} is not supported; DAY or GTC only"
         if order.is_quote_quantity:
@@ -828,7 +876,16 @@ class AlpacaExecutionClient(ExecutionClient):
             return f"quantity {order.quantity} is fractional; whole shares only"
         if len(order.client_order_id.value) > 128:
             return "client order ID is longer than Alpaca's 128 characters"
-        if order.order_type == OrderType.LIMIT:
+        if order.order_type in STOP_TYPES:
+            if order.trigger_type not in STOP_TRIGGER_TYPES:
+                return (
+                    f"trigger type {getattr(order.trigger_type, 'name', order.trigger_type)} is not "
+                    "offered: Alpaca elects a stop on the last trade (DEFAULT or LAST_PRICE)"
+                )
+            denial = sub_penny_denial(order.trigger_price, "stop price")
+            if denial is not None:
+                return denial
+        if order.order_type in LIMIT_PRICED:
             if order.is_post_only:
                 return "post-only is not supported"
             if order.display_qty is not None:
@@ -846,7 +903,15 @@ class AlpacaExecutionClient(ExecutionClient):
             "client_order_id": order.client_order_id.value,
         }
         if order.order_type == OrderType.LIMIT:
-            return LimitOrderRequest(**fields, limit_price=float(Decimal(str(order.price))))
+            return LimitOrderRequest(**fields, limit_price=wire_price(order.price))
+        if order.order_type == OrderType.STOP_MARKET:
+            return StopOrderRequest(**fields, stop_price=wire_price(order.trigger_price))
+        if order.order_type == OrderType.STOP_LIMIT:
+            return StopLimitOrderRequest(
+                **fields,
+                stop_price=wire_price(order.trigger_price),
+                limit_price=wire_price(order.price),
+            )
         return MarketOrderRequest(**fields)
 
     def _log_unknown_outcome(self, client_order_id: ClientOrderId, detail: str) -> None:
@@ -1090,7 +1155,13 @@ class AlpacaExecutionClient(ExecutionClient):
         return reports
 
     def _order_report(self, order: AlpacaOrder) -> OrderStatusReport | None:
-        report = order_status_report(order, self.clock.timestamp_ns())
+        # As upstream's Coinbase adapter patches a report from what the node sent: the trigger type
+        # the node's order holds, which Alpaca's order does not carry.
+        held = self.cache.order(ClientOrderId(order.client_order_id))
+        trigger_type = (
+            held.trigger_type if held is not None and held.order_type in STOP_TYPES else None
+        )
+        report = order_status_report(order, self.clock.timestamp_ns(), trigger_type)
         if report is None:
             self._log.warning(
                 f"Alpaca order {order.id} ({order.symbol}, {order.status.value}) is not reported: "

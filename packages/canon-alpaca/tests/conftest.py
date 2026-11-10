@@ -384,6 +384,7 @@ class FakeOrdersClient(FakeTradingClient):
             order_type=order_data.type.value,
             time_in_force=order_data.time_in_force.value,
             limit_price=str(getattr(order_data, "limit_price", None) or "") or None,
+            stop_price=str(getattr(order_data, "stop_price", None) or "") or None,
             created_at=now,
             submitted_at=now,
             updated_at=now,
