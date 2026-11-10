@@ -221,6 +221,8 @@ here, community convergence, then anyone's recollection.
 * **No OpenTelemetry backend.** The local event ledger covers this machine; `home/otel-settings.example.json`
   is ready for when a collector exists. Until one writes `~/.claude/canon/otel/logs.jsonl`,
   `scripts/lanes --rates` lists every worker as not measured (ADR 0007).
-* **No eval of our own has run.** Model routing rests on external measurements (ADR 0005). A reviewer
-  benchmark is defined, with its first cases, brief and procedure in `evals/review/` (ADR 0046); no
-  reviewer has run it, and with ten confirmed defects, eight in one case, it can show only gross differences.
+* **No model-routing eval of our own has run.** Model routing rests on external measurements (ADR 0005). A reviewer
+  benchmark is defined, with its cases, brief and procedure in `evals/review/` (ADR 0046); its first run
+  (2026-11-10) scored 10 confirmed defects, in `evals/review/runs/`. Its cases now hold 21, 10 in
+  `order-modify`, 9 in `trial-ledger-gate` and one each in two others, so with most bunched in two cases it
+  can show only gross differences.

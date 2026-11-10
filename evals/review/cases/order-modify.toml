@@ -1,10 +1,140 @@
 # A review case: the format is in evals/review/README.md and ADR 0046.
+# Ready with the defects that 52ac69c (#69) fixes, each with a regression test its message reports failing
+# before the fix. Left out: the rejected replacement reported after a restart (its test, the message says,
+# did not fail first); a long replace chain walked again each time, and the two tests the message's Test
+# Plan does not list (a replacement's `new` then rejected, `pending_replace` with fills), whose failure
+# before the fix it does not report; and a trace that found no node order kept for the session (its test
+# fails first), which the commit's message states as designed ("a chain that reaches no node order is
+# remembered"), so it is left out as a stated limit. Kept: a replacement read at `replaced` that has moved
+# on. The message's limit is a replacement that cannot be read ("If neither yields them, nothing is
+# generated"); this one is read, and the client raises instead of following it.
+#
+# `reported_by` names the runtime of a second reader (ADR 0043, ADR 0045) that reviewed this commit after
+# it landed, outside this benchmark and before its brief existed; not a benchmark run.
+#
+# Bias: every defect here was first reported by Codex, Muse or Antigravity, reviewing this commit after it
+# had passed a Claude /code-review at high effort (ADR 0042, ADR 0045). The case holds defects a Claude
+# review missed and those three found, so their found-rate on it is not comparable with other reviewers'.
 id = "order-modify"
-status = "pending"
+status = "ready"
 commit = "3a00f617fd20c97d647ee51f7c2c4091aac3a035"
 title = "Modify Alpaca orders by replace, updated only when Alpaca's stream confirms it (#55)"
 paths = ["packages/canon-alpaca/"]
-confirm = """
-Three defects were reproduced by running, first reported by a Codex reader (ADR 0043) (a filled replacement lost from reconciliation when replaced
-was missed, a refused modify rejected twice, a replaced update applied twice), and nine more claimed by
-reading. Each becomes a [[defects]] entry once a fix for it is on main with a test that fails before it."""
+
+[[defects]]
+id = "filled-replacement-lost-when-replaced-missed"
+location = "packages/canon-alpaca/src/canon_alpaca/execution.py: _order_report"
+summary = """
+When Alpaca's `replaced` update never reaches the client and the replacement then fills, reconciliation
+skips the replacement as one that closed without taking over (the node's order still names the old venue
+order), and skips the old order as `replaced`, so the node's order is never reported filled and its fill
+is lost."""
+match = "Says that when the `replaced` update is missed, a replacement that then fills is not reported for the node's order, so reconciliation loses its fill."
+reported_by = "Codex CLI on its defaults, a second reader of 3a00f61 after landing (ADR 0043)"
+fix = "52ac69cc96c28d0a88ade58fc1413a1c831d38fb"
+test = "packages/canon-alpaca/tests/test_execution_client.py::test_filled_replacement_is_reported_when_replaced_was_missed"
+
+[[defects]]
+id = "refused-replace-rejected-twice"
+location = "packages/canon-alpaca/src/canon_alpaca/execution.py: _replace_refused and _apply's order_replace_rejected branch"
+summary = """
+Alpaca can refuse a replace both on the HTTP answer and with an `order_replace_rejected` trade update. Each
+path generates `OrderModifyRejected`, so one modify is rejected twice."""
+match = "Says a replace refused on the HTTP answer and again by an `order_replace_rejected` trade update gives two `OrderModifyRejected` for one modify."
+reported_by = "Codex CLI on its defaults, a second reader of 3a00f61 after landing (ADR 0043)"
+fix = "52ac69cc96c28d0a88ade58fc1413a1c831d38fb"
+test = "packages/canon-alpaca/tests/test_execution_client.py::test_replace_rejected_twice_over_is_one_modify_rejection"
+
+[[defects]]
+id = "replaced-applied-twice"
+location = "packages/canon-alpaca/src/canon_alpaca/execution.py: _replaced"
+summary = """
+Nothing records that a replace was already applied: a `replaced` update delivered a second time reads the
+replacement again and generates a second `OrderUpdated`."""
+match = "Says a `replaced` update that arrives twice generates `OrderUpdated` twice."
+reported_by = "Codex CLI on its defaults, a second reader of 3a00f61 after landing (ADR 0043)"
+fix = "52ac69cc96c28d0a88ade58fc1413a1c831d38fb"
+test = "packages/canon-alpaca/tests/test_execution_client.py::test_replaced_delivered_twice_is_one_update"
+
+[[defects]]
+id = "replacement-fill-before-replaced"
+location = "packages/canon-alpaca/src/canon_alpaca/execution.py: _apply, a fill on the replacement"
+summary = """
+A fill on the replacement that arrives before Alpaca's `replaced` is applied to the node's order while it
+still has the old terms, so a fill larger than the old quantity is dropped as an overfill and the order
+never takes the replacement's terms first."""
+match = "Says a fill on the replacement that arrives before the `replaced` update is applied under the old order's terms, so a larger fill is dropped or the update comes after the fill."
+reported_by = "Muse Code and Antigravity CLI on their defaults, second readers of 3a00f61 after landing, in parallel; which was first is not known (ADR 0045)"
+fix = "52ac69cc96c28d0a88ade58fc1413a1c831d38fb"
+test = "packages/canon-alpaca/tests/test_execution_client.py::test_fill_on_a_replacement_before_its_replaced_applies_the_replacement_first"
+
+[[defects]]
+id = "late-cancel-of-replaced-order"
+location = "packages/canon-alpaca/src/canon_alpaca/execution.py: _apply, a canceled or expired update"
+summary = """
+A `canceled` (or `expired`) update for the old order that arrives after it was replaced is traced to the
+node's order and generates `OrderCanceled`, closing the node's order while its replacement still works on
+Alpaca."""
+match = "Says a cancel or expiry of the replaced (old) order arriving after the replace closes the node's order although the replacement is still working."
+reported_by = "Antigravity CLI on its defaults, a second reader of 3a00f61 after landing (ADR 0045)"
+fix = "52ac69cc96c28d0a88ade58fc1413a1c831d38fb"
+test = "packages/canon-alpaca/tests/test_execution_client.py::test_late_cancel_of_the_replaced_order_does_not_cancel_the_replacement"
+
+[[defects]]
+id = "pending-replace-fails-startup"
+location = "packages/canon-alpaca/src/canon_alpaca/execution.py: OPEN_STATUSES and order_status_report"
+summary = """
+`pending_replace` is in neither status map, so an open order that is mid-replace raises "is open with
+status pending_replace" and start-up reconciliation fails."""
+match = "Says an order in `pending_replace` is not mapped, so a report of it (start-up reconciliation) fails."
+reported_by = "Antigravity CLI on its defaults, a second reader of 3a00f61 after landing (ADR 0045)"
+fix = "52ac69cc96c28d0a88ade58fc1413a1c831d38fb"
+test = "packages/canon-alpaca/tests/test_execution_client.py::test_open_order_pending_replace_at_startup_is_reported"
+
+[[defects]]
+id = "replacement-moved-on-before-replaced"
+location = "packages/canon-alpaca/src/canon_alpaca/execution.py: _replaced, the replacement read from Alpaca"
+summary = """
+When the PATCH answer is not held, `replaced` reads the replacement from Alpaca. If that replacement is
+itself `pending_replace` or already replaced again, it is not an order the report maps, so no `OrderUpdated`
+is generated (an error is raised) and the node's order is not moved to the live order."""
+match = "Says that when the replacement read at `replaced` is itself pending replace or replaced again, the client generates no `OrderUpdated` (or raises) instead of following it to the live order."
+reported_by = "Muse Code and Antigravity CLI on their defaults, second readers of 3a00f61 after landing, in parallel; which was first is not known (ADR 0045)"
+fix = "52ac69cc96c28d0a88ade58fc1413a1c831d38fb"
+test = "packages/canon-alpaca/tests/test_execution_client.py::test_replaced_whose_replacement_has_moved_on_still_updates"
+
+[[defects]]
+id = "second-modify-refusal-taken-for-retry"
+location = "packages/canon-alpaca/src/canon_alpaca/execution.py: _replace_refused and replaces_as_asked"
+summary = """
+A second modify sent before the first's `replaced` is refused "order already replaced". The retry check
+compares only the terms the refused request set, so when the first replacement already holds them the
+refusal is taken for alpaca-py's retry of the first, and the second modify gets no `OrderModifyRejected`."""
+match = "Says the retry check compares only the terms the refused request set, so a refused second modify is taken for a retry of the first and is never rejected."
+reported_by = "Antigravity CLI on its defaults, a second reader of 3a00f61 after landing (ADR 0045)"
+fix = "52ac69cc96c28d0a88ade58fc1413a1c831d38fb"
+test = "packages/canon-alpaca/tests/test_execution_client.py::test_second_modify_refused_after_the_first_replaced_is_rejected"
+
+[[defects]]
+id = "answers-kept-for-the-session"
+location = "packages/canon-alpaca/src/canon_alpaca/execution.py: _modify_order, where the answer is kept"
+summary = """
+The PATCH answer is stored after the request returns. When the `replaced` update was applied first, the
+answer is stored after it and never removed, so answers build up for the whole session."""
+match = "Says a PATCH answer stored after its `replaced` was already applied is never removed, so answers accumulate (or a stale one is kept) for the session."
+reported_by = "Muse Code and Antigravity CLI on their defaults, second readers of 3a00f61 after landing, in parallel; which was first is not known (ADR 0045)"
+fix = "52ac69cc96c28d0a88ade58fc1413a1c831d38fb"
+test = "packages/canon-alpaca/tests/test_execution_client.py::test_answer_after_replaced_is_not_kept"
+
+[[defects]]
+id = "rejected-replacement-after-fill-never-reached"
+location = "packages/canon-alpaca/src/canon_alpaca/execution.py: _apply, the `_finished` check before the rejected-replacement branch"
+summary = """
+When the old order fills before Alpaca rejects its replacement, the fill puts the node's order in
+`_finished`, so `_apply` returns before the branch meant for this case (`rejected` on a replacement)
+runs: that branch can never fire, nothing says what became of the modify, and the test written for it
+passes without reaching it."""
+match = "Says that when the old order fills before the replacement is rejected, `_apply` returns at the finished check before the rejected-replacement branch, so that branch (or its test) never runs."
+reported_by = "Muse Code and Antigravity CLI on their defaults, second readers of 3a00f61 after landing, in parallel; which was first is not known (ADR 0045)"
+fix = "52ac69cc96c28d0a88ade58fc1413a1c831d38fb"
+test = "packages/canon-alpaca/tests/test_execution_client.py::test_rejected_replacement_after_the_old_order_filled_settles_the_modify"

@@ -136,7 +136,9 @@ daily bars (ADR 0048).
 * **Landing.** `scripts/land` runs the check and squash-merges the branch; a change outside a named few
   needs a review note, recorded as the `review` status (ADR 0014, ADR 0017, ADR 0019).
 * **Reviewer benchmark.** Past commits whose defects a fix and a failing test later confirmed, one brief
-  for every reviewer, found-or-missed scoring by two scorers (`evals/review/`, ADR 0046). Not yet run.
+  for every reviewer, found-or-missed scoring by two scorers (`evals/review/`, ADR 0046). First run
+  2026-11-10, scored in `evals/review/runs/2026-11-10-first/`; the cases hold 21 confirmed defects, 10 in
+  `order-modify`.
 * **Unasked.** The commit gate, the push address check, edit-time lint, a daily canon watch, a lane
   watchdog, a weekly model run and Dependabot (ADR 0011, ADR 0016, ADR 0026; `AGENTS.md`, "Automation").
   Once installed, a paper session window every 35 minutes, run from a clone each firing brings to
