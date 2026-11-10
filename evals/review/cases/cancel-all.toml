@@ -1,0 +1,8 @@
+# A review case: the format is in evals/review/README.md and ADR 0046.
+# Clean: no defect in what this commit changed has been confirmed. Every claim is unconfirmed until checked.
+id = "cancel-all"
+status = "ready"
+commit = "4afa6a7c62f0f186761a402cec9df5fb5374f78a"
+title = "Cancel all of an instrument's orders on Alpaca, one by ID, as upstream's adapters do (#51)"
+paths = ["packages/canon-alpaca/"]
+clean = true

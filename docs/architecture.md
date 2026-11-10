@@ -127,6 +127,8 @@ adapter is a uv workspace member of its own, kept apart from strategies as upstr
   GitHub (ADR 0013).
 * **Landing.** `scripts/land` runs the check and squash-merges the branch; a change outside a named few
   needs a review note, recorded as the `review` status (ADR 0014, ADR 0017, ADR 0019).
+* **Reviewer benchmark.** Past commits whose defects a fix and a failing test later confirmed, one brief
+  for every reviewer, found-or-missed scoring by two scorers (`evals/review/`, ADR 0046). Not yet run.
 * **Unasked.** The commit gate, the push address check, edit-time lint, a daily canon watch, a lane
   watchdog, a weekly model run and Dependabot (ADR 0011, ADR 0016, ADR 0026; `AGENTS.md`, "Automation").
   Models are routed by lane in `canon/models.json` (ADR 0005).
