@@ -123,7 +123,7 @@ check_hooks() {
 
 # paper_row: whether both Alpaca paper key items are in the login keychain (ADR 0029). It looks each item up
 # by service and account without -w or -g, so no value is read (man security: find-generic-password). An
-# absent pair is reported and never fails the check: only the two paper tests need it.
+# absent pair is reported and never fails the check: only the paper tests need it.
 PAPER_SERVICE="canon-alpaca-paper"   # the service mise.toml's paper tasks use
 paper_row() {
   local a miss=""

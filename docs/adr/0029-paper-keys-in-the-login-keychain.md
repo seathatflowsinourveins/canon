@@ -42,7 +42,7 @@ Chosen: **option 7**. Each value is a generic password item in the login keychai
 | `mise run paper:store` | Asks for both values at a hidden prompt, stores them only if Alpaca's paper API accepts the pair |
 | `mise run paper:check` | Says whether each item exists, looking it up without `-w` or `-g`, so no value is read |
 | `mise run paper:remove` | Deletes both items |
-| `mise run paper:test` | Runs the two paper tests; its `env` reads both items when the task starts |
+| `mise run paper:test` | Runs the paper tests under a lock; its `env` reads both items when the task starts |
 
 1. **Only `paper:test` puts the items in an environment** (`paper:store` reads them back once to confirm the
    write). mise renders a task's `env` when that task runs, and in the trial not for `mise env`, `mise exec`,
@@ -72,9 +72,9 @@ fnox, which is not in the registry. **Watch fnox** until mise's secrets leave ex
   reads a value with no dialog. "Agents never read a credential" stays an instruction. `-T ""` would make each
   read ask the owner: untested for a process with no window, and whether "Always Allow" puts `security` back
   on the item's list is UNVERIFIED.
-* Bad: an agent can run `paper:test`, which places and cancels one paper order: within ADR 0009. Open, the
-  owner's (`.claude/settings.json`): an `ask` rule for `mise run paper:test` and a `deny` rule for `security
-  find-generic-password`, text matchers that ADR 0020 calls fragile but that catch the usual form.
+* An agent may run `paper:test`, whose tests place paper orders and cancel each: within ADR 0009. The `ask`
+  rule for it that this left open is closed, not wanted (2026-11-10). Open, the owner's: a `deny` rule for
+  `security find-generic-password` (`.claude/settings.json`), a text matcher ADR 0020 calls fragile.
 * Once ADR 0025's sandbox is on, an agent's `paper:test` reads the keychain and reaches Alpaca from inside it,
   which is untried (UNVERIFIED); there `gh` failed on a certificate check. The owner's own terminal is outside
   the sandbox.
@@ -86,7 +86,7 @@ fnox, which is not in the registry. **Watch fnox** until mise's secrets leave ex
 `scripts/bootstrap --check` prints a `paper key pair` row, `ok` or `absent`, that never fails the check;
 `scripts/test-lanes` covers it with a `security` stub, asserts it never passes `-w` or `-g`, and fails if
 `mise.toml` names a keychain service other than the bootstrap's. `scripts/ci` passed with no item present, the
-two paper tests skipped. The four task bodies, written out with a bash shebang, passed shellcheck 0.11.0 (run
+paper tests (two at the time) skipped. The four task bodies, written out with a bash shebang, passed shellcheck 0.11.0 (run
 once, by hand).
 
 The trial, 2026-11-10, mise 2026.11.5 and macOS 27.2, with made-up values under a throwaway service:
@@ -106,8 +106,8 @@ The trial, 2026-11-10, mise 2026.11.5 and macOS 27.2, with made-up values under 
   `paper:remove` removed both (`find-generic-password` exit 44 each), a second said "was not there", and
   `paper:test` exited 1 naming the failed `security` call. After review: with two empty items, `paper:test`
   refused, "a keychain item is empty", exit 1.
-* UNVERIFIED: `paper:test` with a real paper pair (none was used); a keychain dialog after a macOS update or
-  an item moved between Macs.
+* UNVERIFIED in this trial: `paper:test` with a real paper pair (none was used; it has run with one since,
+  ADR 0030 and ADR 0036); a keychain dialog after a macOS update or an item moved between Macs.
 
 ## Evidence
 
@@ -117,6 +117,10 @@ https://raw.githubusercontent.com/jdx/mise/v2026.11.5/: `fetched`. The Alpaca an
 support both and are kept in each; the review line covers the record before the split, so "All fixed above"
 means the two together. The mise base URL gained its `https://` scheme so the lint finds it.
 
+* The owner's standing instruction, 2026-11-10: a paper run needs no ask, at any hour, as long as the tests
+  follow the practice of Alpaca's own repositories and NautilusTrader (how ADR 0036's do is stated there);
+  the `ask` rule above is closed on it.
+  `paper:test` now runs every `test_paper_*.py` under `lockf(1)` (read with `man lockf`) (ADR 0036).
 * `man security` on this machine — `-w`: "Put at end of command to be prompted (recommended)"; `-U`; `-T`; "By
   default, the application which creates an item is trusted to access its data without warning. You can remove
   this default access by explicitly specifying an empty app pathname: -T """; `find-generic-password` `-g` and

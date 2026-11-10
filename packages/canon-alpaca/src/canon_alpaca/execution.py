@@ -3,9 +3,11 @@
 Contract: `nautilus_trader.live.clients.ExecutionClient`, NautilusTrader v2.0.0rc8 (Python adapter guide,
 "Execution client hooks", https://nautilustrader.io/docs/md/latest/developer_guide/python_adapters.md). The
 client is constructed with the factory's name, config, cache, clock and trader ID and with a venue, account
-ID, account type and OMS type. It overrides `_submit_order` and `_cancel_order` and the four reconciliation
-hooks, emits account, order and fill events through the base class's `generate_*` methods, and leaves
-`_generate_mass_status` to the native composition of the bulk report hooks. Nothing is started in the
+ID, account type and OMS type. It overrides `_submit_order`, `_cancel_order`, `_cancel_all_orders` and the
+four reconciliation hooks, emits account, order and fill events through the base class's `generate_*`
+methods, and leaves `_batch_cancel_orders` to its default, "ordered calls of the corresponding
+single-order hook" (Alpaca has no endpoint that cancels a list of orders by ID), and `_generate_mass_status`
+to the native composition of the bulk report hooks. Nothing is started in the
 constructor; the alpaca-py clients are made in `_connect` and the stream thread is joined in `_disconnect`.
 Hooks not overridden here raise `NotImplementedError` from the base class.
 
@@ -16,7 +18,14 @@ status (403 or 422 on "Create an Order", https://docs.alpaca.markets/us/referenc
 rejected; a transport error or any other status leaves the outcome unknown and the order `SUBMITTED`, for
 the trade updates stream or reconciliation to resolve. A cancel answered 204 waits for Alpaca's `canceled`
 trade update; one answered 422 ("Delete Order by ID", https://docs.alpaca.markets/us/reference/deleteorderbyorderid-1.md)
-is a cancel rejection. Fills come only from the stream's `fill` and `partial_fill` events, whose `qty` and
+is a cancel rejection. Cancel-all cancels the node's open and in-flight orders for the command's instrument,
+and side if it names one, each by ID through the same path, so a refused one gets `OrderCancelRejected`
+("Cancel, cancel-all, or batch cancel": `OrderCancelRejected`, same policies page, at the pinned commit).
+Alpaca's "Delete All Orders" (https://docs.alpaca.markets/us/reference/deleteallorders-1.md) "Attempts to
+cancel all open orders" of the account, wider than the command, so it is not called; upstream's Kraken spot
+adapter, whose venue cancel-all is account-wide too, selects and cancels by ID the same way
+(`crates/adapters/kraken/src/execution/spot.rs` at the pinned commit). Fills come only from the stream's
+`fill` and `partial_fill` events, whose `qty` and
 `price` are "the number of shares" and "the price per share" for that fill event, not cumulative
 (https://docs.alpaca.markets/us/docs/websocket-streaming.md).
 
@@ -49,7 +58,9 @@ Known limits:
   IOC, FOK, OPG and CLS for whole-share market and limit orders "Yes*", and "Please contact the sales team
   for any TIF marked with a *" ("Orders at Alpaca", https://docs.alpaca.markets/us/docs/orders-at-alpaca.md),
   so they are denied. Post-only, reduce-only, quote-quantity, display quantity, contingent orders and order
-  lists are denied or not implemented; so are modify, cancel-all, query and extended hours.
+  lists are denied or not implemented; so are modify, query and extended hours.
+* Cancel-all sends one cancel per order, one at a time, in no specified order, skipping an order already
+  pending cancel; an order placed after the command was read from the cache is not canceled by it.
 * A limit price at or above $1.00 with more than 2 decimals, or below $1.00 with more than 4, is denied
   here: Alpaca rejects it ("Sub-penny increments for limit orders", same page).
 * The account is a NautilusTrader cash account holding Alpaca's `cash` as its USD balance, all of it free,
@@ -685,17 +696,62 @@ class AlpacaExecutionClient(ExecutionClient):
 
     @override
     async def _cancel_order(self, command: live.CancelOrder) -> None:
-        order = self.cache.order(command.client_order_id)
-        if order is None:
+        await self._cancel_logged(command.client_order_id, command.venue_order_id)
+
+    async def _cancel_logged(
+        self, client_order_id: ClientOrderId, venue_order_id: VenueOrderId | None
+    ) -> None:
+        try:
+            await self._cancel(client_order_id, venue_order_id)
+        except (ValueError, TypeError, RuntimeError) as e:
+            # `_cancel` handles Alpaca's answers itself; these are a raw or unparsable answer (pydantic's
+            # ValidationError is a ValueError) and a client not connected. Logged with no event, so a
+            # cancel-all or the default batch cancel goes on to the next order.
             self._log.error(
-                f"Cannot cancel {command.client_order_id}: the node holds no such order"
+                f"Alpaca cancel of {client_order_id} failed ({e!r}); the order is left as it is"
             )
+
+    @override
+    async def _cancel_all_orders(self, command: live.CancelAllOrders) -> None:
+        """Cancel, one at a time by ID, every open or in-flight order the node holds for the command's
+        instrument, and side if it names one.
+
+        Alpaca's "Delete All Orders" cancels every open order of the account, whatever its symbol, so it
+        is not used: as upstream's Kraken spot adapter does for its account-wide cancel-all, the matching
+        orders are taken from the cache and canceled by ID. In-flight orders are included because Alpaca
+        may hold an order the node still has as `SUBMITTED`. An order already `PENDING_CANCEL` has a cancel
+        in flight and is left to it. A strategy sends this command only with `strategy_only=False`, and
+        then means every strategy's orders, so none is filtered by strategy. A failure on one order is
+        logged and the rest are still canceled.
+        """
+        selected: dict[ClientOrderId, None] = {}
+        for found in (self.cache.orders_open, self.cache.orders_inflight):
+            for order in found(instrument_id=command.instrument_id, side=command.order_side):
+                selected.setdefault(order.client_order_id)
+        if not selected:
+            self._log.info(f"No open or in-flight {command.instrument_id} orders to cancel")
             return
-        venue_order_id = command.venue_order_id or order.venue_order_id
+        for client_order_id in selected:
+            # Read again at its turn: the cancels before it took an HTTP round trip each, in which this
+            # order may have filled, closed or been sent a cancel of its own.
+            order = self.cache.order(client_order_id)
+            if order is None or order.is_closed or order.status == OrderStatus.PENDING_CANCEL:
+                continue
+            await self._cancel_logged(client_order_id, order.venue_order_id)
+
+    async def _cancel(
+        self, client_order_id: ClientOrderId, venue_order_id: VenueOrderId | None
+    ) -> None:
+        """Cancel one order by Alpaca's order ID, looking it up by client order ID if the node has none."""
+        order = self.cache.order(client_order_id)
+        if order is None:
+            self._log.error(f"Cannot cancel {client_order_id}: the node holds no such order")
+            return
+        venue_order_id = venue_order_id or order.venue_order_id
         try:
             if venue_order_id is None:
                 found = await self._call(
-                    self._venue().get_order_by_client_id, command.client_order_id.value
+                    self._venue().get_order_by_client_id, client_order_id.value
                 )
                 if not isinstance(found, AlpacaOrder):
                     raise TypeError("alpaca-py returned raw order data")
@@ -706,13 +762,13 @@ class AlpacaExecutionClient(ExecutionClient):
                 await self._cancel_refused(order, venue_order_id, e)
                 return
             self._log.error(
-                f"Alpaca cancel for {command.client_order_id} got no definitive answer "
+                f"Alpaca cancel for {client_order_id} got no definitive answer "
                 f"(HTTP {e.status_code}: {api_error_text(e)}); the order is left as it is",
             )
             return
         except OSError as e:
             self._log.error(
-                f"Alpaca cancel for {command.client_order_id} got no answer ({e!r}); the order is left as it is",
+                f"Alpaca cancel for {client_order_id} got no answer ({e!r}); the order is left as it is",
             )
         # Answered 204: the cancel is confirmed by Alpaca's `canceled` trade update.
 

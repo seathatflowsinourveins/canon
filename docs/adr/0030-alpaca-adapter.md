@@ -88,6 +88,8 @@ strategy through a real node, and a DAY limit buy of 1 AAPL at $1.00 was accepte
 two "had not run" statements above no longer hold for those two paths. Still UNVERIFIED against Alpaca: the
 live quote and trade stream, `load_all` at full scale, a fill, a partial fill and a rejection.
 
+ADR 0036 records the order-management slice, one change at a time, starting with cancel-all.
+
 ## Evidence
 
 * Split from ADR 0009 on 2026-11-10 with no change of decision: the text above is ADR 0009's own, moved,

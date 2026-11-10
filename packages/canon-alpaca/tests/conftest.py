@@ -342,7 +342,9 @@ class FakeOrdersClient(FakeTradingClient):
     updates sent) first, as when alpaca-py's retry of a submit Alpaca had already taken is refused.
     `submit_delay` holds the answer back that many seconds after the updates are sent.
     `cancel_order_by_id` answers 204 and sends `canceled`, or raises `cancel_error`; with
-    `took_before_error`, it first marks the order `pending_cancel`, sending no update. With `execution_ids` false, fills carry no `execution_id`. `orders` and `positions` are what the reads return; `get_orders` applies
+    `took_before_error`, it first marks the order `pending_cancel`, sending no update; `refuse_cancel` refuses
+    the cancel of each order it returns an error for, and the others are canceled.
+    It cancels orders placed through it and orders in `orders`, as Alpaca holds both. With `execution_ids` false, fills carry no `execution_id`. `orders` and `positions` are what the reads return; `get_orders` applies
     the `status`, `symbols`, `after` and `until` filters the way alpaca-py's `GetOrdersRequest` documents
     them (`after` and `until` on the submission time).
     """
@@ -354,6 +356,8 @@ class FakeOrdersClient(FakeTradingClient):
         self.fill_price = FILL_UPDATE["price"]
         self.submit_error: Exception | None = None
         self.cancel_error: Exception | None = None
+        # Given Alpaca's order, the error its cancel is refused with, or None to cancel it.
+        self.refuse_cancel: Callable[[dict], Exception | None] | None = None
         self.took_before_error = False
         self.execution_ids = True  # whether fill updates carry `execution_id`
         self.submit_delay = 0.0
@@ -421,9 +425,14 @@ class FakeOrdersClient(FakeTradingClient):
         self.cancels.append(str(order_id))
         if self.cancel_error is not None and not self.took_before_error:
             raise self.cancel_error
-        placed = self._placed.get(str(order_id))
+        placed = self._placed.get(str(order_id)) or next(
+            (raw for raw in self.orders if raw["id"] == str(order_id)), None
+        )
         if placed is None:
             raise api_error(404, 40410000, "order not found")
+        refusal = self.refuse_cancel(placed) if self.refuse_cancel is not None else None
+        if refusal is not None:
+            raise refusal
         if self.cancel_error is not None:
             # Taken, and refused on the repeat: Alpaca's order is pending cancel; no update is sent.
             placed.update(status="pending_cancel")
