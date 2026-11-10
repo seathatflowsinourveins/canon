@@ -8,7 +8,8 @@ paths:
 
 * `canon/upstreams.json` is hand-edited; `canon/upstreams.lock.json` is written only by
   `scripts/canon resolve`.
-* Every entry needs `id`, `field`, `repo`, `track`, `role`, `license`, `why`, `evidence` (at least one URL you
+* Every entry needs `id`, `field`, `repo` and `track` (or `url` in place of both, for an upstream with no
+  public repository; it gets no lock pin), `role`, `license`, `why`, `evidence` (at least one URL you
   fetched this session) and `adr` (a four-digit ADR that exists).
 * `track` is `tag:<name>`, `branch:<name>` or `default`. Prefer a release tag for anything we install or run.
   Use `default` only for repos that publish no tags.

@@ -91,21 +91,28 @@ This is the same for every runtime, Claude Code or not: use no credentials, and 
 Orca is the cockpit (ADR 0018). From a session Orca started, its `orca-cli` and `orchestration` skills may
 be used within these limits (ADR 0021):
 
-* Workers and handoffs use `--agent claude`, except a Codex reviewer (ADR 0043).
-* A Codex reviewer (`--agent codex`) reads a change and reports findings. It never edits, commits, pushes,
-  lands, runs paper tests or reads a credential. Orca starts it with no sandbox and no approvals, and no
-  `ask` rule prompts for it, so its task says findings only. It gets a new worktree at the commit under
-  review, never the main checkout or another worker's workspace; afterwards the coordinator checks the
-  worktree has no change and no new commit, and removes it. It is an additional reader, never ADR 0017's
-  required review, and never blocks: the lane that owns the code reproduces a finding before acting on
-  it, and fixes forward. Only the coordinator starts one: after landing by default, before only for a
-  change it names; expected on the paths that get `/code-review` at high effort, optional elsewhere. It
-  runs on Codex's own defaults.
+* Workers that build, and handoffs, use `--agent claude`. A reviewer may be Codex (`--agent codex`),
+  Muse Code (`--agent muse`) or Antigravity (`--agent antigravity`); DeepSeek Harness (`dsh`) is adopted
+  but reads nothing until a trial of it reports (ADR 0043, ADR 0045).
+* A reviewer reads a change and reports findings. It never edits, commits, pushes, lands, runs paper tests
+  or reads a credential. Orca pre-fills a bypass flag for Codex, Muse and Antigravity, so they run with
+  no sandbox and no approvals, and no `ask` rule prompts for any of them, so its task says findings
+  only. It gets a new worktree at the commit under review, never the main checkout or another worker's
+  workspace; afterwards the coordinator checks the worktree has no change and no new commit, and
+  removes it. It is an additional reader, never ADR 0017's required review, and
+  never blocks: only the coordinator starts one, after landing unless it names the change, and no lane
+  waits on it. Its findings are claims the owning lane reproduces before changing anything. It runs on
+  its own defaults.
+* The review lifecycle (ADR 0045): a Claude lane builds, runs `/code-review` and lands. For a change on
+  the paths that get `/code-review` at high effort, the coordinator creates the review as a task that
+  depends on the build (`task-create --deps`) and starts it when `task-list --ready` shows it and the
+  change is on `main`: Codex and Muse there, Antigravity in place of either. The owning lane reproduces
+  each finding, by a failing test where one can show it, and fixes forward, crediting the second reader.
 * A worker that changes files gets its own workspace (`--worktree new-top-level`). Share yours only for
   work that reads.
 * Do not run through an Orca terminal what a prompt would have asked the owner, and do not answer another
   agent's permission prompt. A worker's change lands like any other: reviewed first, then `scripts/land`.
-* Research, record checks and code review stay subagents, apart from the Codex reviewer above. Use an
+* Research, record checks and code review stay subagents, apart from the reviewers above. Use an
   Orca worker when the work needs its own workspace or the owner asks to watch it, on the model
   `canon/models.json` gives that work (`--model`).
 * Not used: remote placement, the browser and desktop control, plugins, automations, session search, and
