@@ -49,6 +49,8 @@ Chosen: **option 7**. Each value is a generic password item in the login keychai
    `mise tasks` or an activated shell. Both values are marked `redact = true`, so the task's output shows
    `[redacted]`. With an item missing it exits 1, naming the `security` call that failed; with one empty,
    which would skip both tests and pass, it refuses.
+   This clause is superseded by ADR 0044 (2026-11-10): `paper:session` also reads the items into its own
+   `env`, the same way, and runs under the same lock.
 2. **The template is in tracked `mise.toml` and holds no value.** A new worktree has it, and is trusted
    through the main checkout. No `mise.local.toml`, global config or shell profile line.
 
@@ -117,6 +119,8 @@ https://raw.githubusercontent.com/jdx/mise/v2026.11.5/: `fetched`. The Alpaca an
 support both and are kept in each; the review line covers the record before the split, so "All fixed above"
 means the two together. The mise base URL gained its `https://` scheme so the lint finds it.
 
+* ADR 0044, 2026-11-10: supersedes clause 1, "Only `paper:test` puts the items in an environment"; the
+  rest of this record stands.
 * The owner's standing instruction, 2026-11-10: a paper run needs no ask, at any hour, as long as the tests
   follow the practice of Alpaca's own repositories and NautilusTrader (how ADR 0036's do is stated there);
   the `ask` rule above is closed on it.

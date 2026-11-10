@@ -85,7 +85,9 @@ adapter is a uv workspace member of its own, kept apart from strategies as upstr
 ## A paper run, from stream to fill
 
 1. A `LiveNode` gets the adapter's factories, both or the data one alone in its paper tests, or both through `ema_cross_paper_node`,
-   which adds upstream's `EmaCross` at one share an order (`paper_node.py`, `tests/test_paper_ema_cross.py`, ADR 0037).
+   which adds upstream's `EmaCross` at one share an order (`paper_node.py`, `tests/test_paper_ema_cross.py`, ADR 0037),
+   or through `session_window.window_node`, which adds `SessionMaCross` and the `PositionCap` with the
+   execution engine's open-order and position checks on (`session_window.py`, ADR 0044).
 2. On connect the provider loads `Equity` instruments from `/v2/assets`; the data client streams IEX
    quotes and trades and serves historical bars into the data engine (package README).
 3. A strategy's order passes the risk engine, then the execution engine sends it to Alpaca's paper API
@@ -103,8 +105,11 @@ adapter is a uv workspace member of its own, kept apart from strategies as upstr
   paper (package README, ADR 0009, ADR 0030). Agents never place, modify or cancel a live order, and
   the record keeps trading on paper at least until NautilusTrader v2.0.0 stable (ADR 0009).
 * **The key pair** is in the login keychain, service `canon-alpaca-paper`. Of this repo's commands only
-  `mise run paper:test` puts it in an environment, its own, under a lock (`mise.toml`, ADR 0029); it is
-  checked against the paper API before it is stored (ADR 0033).
+  `mise run paper:test` and `mise run paper:session` put it in an environment, each its own, under one
+  lock (`mise.toml`, ADR 0029, ADR 0044); it is checked against the paper API before it is stored (ADR 0033).
+* **A session window** holds a position of at most one share: `PositionCap` reads the portfolio every second
+  inside the node and shuts the system down over it; the window starts flat, ends flat or fails, and lasts
+  at most 60 minutes (ADR 0044).
 * **The risk engine** limits submits and modifies only; cancels and queries pass it. `ema_cross_paper_node`
   sets 50 submits and 25 modifies a minute, under Alpaca's working figure of 200 calls a minute, and
   $1,000 notional per order; its paper test allows one submit in five minutes (ADR 0037). The adapter's

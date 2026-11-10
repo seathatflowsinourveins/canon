@@ -110,6 +110,10 @@ account's sells is UNVERIFIED; it is the adapter's to resolve.
   $749.78; then the whole task, the adapter's six paper tests and this one: 7 passed. 15:53, after
   review: 4 orders, 3 denied for the rate, 1 filled; passed.
 
+After review (2026-11-10), ADR 0044 gives this node the position cap and the execution engine's scoped
+reconciliation and runtime checks; the paper test now skips outside the regular session and fails on any
+position the node holds that is not the strategy's.
+
 ## Evidence
 
 Read 2026-11-10. "raw": fetched with `curl` and read whole. NautilusTrader files at the pin, `d53849b216e2`.
