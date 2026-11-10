@@ -14,9 +14,13 @@ if ! command -v jq >/dev/null 2>&1; then
   echo "$now ledger: jq not found; event not recorded" >> "$base/ledger-errors.log"
   exit 0
 fi
-jq -c --arg ts "$now" '
-  {
-    ts: $ts,
+# ts is whole seconds (ISO 8601, UTC); t is the same moment in epoch seconds with milliseconds, so readers
+# can order events that land in the same second.
+jq -c '
+  now as $n
+  | {
+    ts: ($n | floor | todate),
+    t: (($n * 1000 | floor) / 1000),
     ev: .hook_event_name,
     sid: .session_id,
     cwd: .cwd,
