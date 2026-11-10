@@ -1,0 +1,8 @@
+# A review case: the format is in evals/review/README.md and ADR 0046.
+# Clean: no defect in what this commit changed has been confirmed. Every claim is unconfirmed until checked.
+id = "stop-orders"
+status = "ready"
+commit = "724246e85ed29d138cd1e5d3af7e2c3cc6d4840b"
+title = "Send stop and stop-limit orders to Alpaca in the forms its order page lists (#53)"
+paths = ["packages/canon-alpaca/"]
+clean = true

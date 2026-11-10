@@ -1,0 +1,9 @@
+# A review case: the format is in evals/review/README.md and ADR 0046.
+id = "ema-cross-paper-node"
+status = "pending"
+commit = "7ce55cc8ce76b368124961dbfd9abfa04272f9d2"
+title = "Run upstream's built-in EmaCross on Alpaca's paper environment under the risk engine's native limits (#56)"
+paths = ["src/canon_trading/", "tests/"]
+confirm = """
+Findings by reading on this commit and on the paper tester commit are not yet checked. Each becomes a [[defects]] entry once a fix for it is on main with a test that fails
+before it; if none is confirmed, the case may become clean only after its findings were checked."""

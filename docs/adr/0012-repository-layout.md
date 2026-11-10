@@ -38,6 +38,7 @@ Chosen: **option 2**. It is the shape uv's workspace guide documents, and uv gen
 | `pytest.toml` | `importlib` import mode | pytest good practices |
 | `catalog/` | Local `ParquetDataCatalog`; ignored by git | NautilusTrader catalog guide |
 | `ledger/` | The trial ledger, an Optuna SQLite study; the main checkout's, shared by every worktree; ignored by git | ADR 0035 |
+| `evals/review/` | The reviewer benchmark: cases, the brief, runs and score sheets | ADR 0046 |
 | `canon/`, `docs/adr/`, `scripts/`, `home/`, `.claude/`, `.githooks/` | The harness | ADR 0003, ADR 0011 |
 
 On this Mac:
@@ -122,3 +123,5 @@ Read 2026-11-09.
   SQLite study written by `canon_trading.ledger`); ignored by git in `.gitignore`, as `catalog/` is.
 * 2026-11-10, after the full review found each worktree counting its own trials: the ledger is the main
   checkout's `ledger/` only, which every worktree of the clone opens (ADR 0035 term 1).
+* 2026-11-10: `evals/review/` added to the table under rule 2, for the reviewer benchmark of ADR 0046
+  (case files checked by `tests/test_review_cases.py`).

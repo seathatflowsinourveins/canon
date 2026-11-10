@@ -1,0 +1,19 @@
+# A review case: the format is in evals/review/README.md and ADR 0046.
+id = "exec-client-first-slice"
+status = "ready"
+commit = "12f19a0b5eac6da29a15bf8512a99d0ba0e4ee35"
+title = "Add a paper-only execution client to the Alpaca adapter (#24)"
+paths = ["packages/canon-alpaca/"]
+
+[[defects]]
+id = "startup-reconciliation-race"
+location = "packages/canon-alpaca/tests/test_execution_client.py: run_with_client"
+summary = """
+The test helper hands the body the execution client as soon as it is connected, while the node's own
+startup reconciliation still queries the same client for order status reports. The two race for the
+client, so a test that reads the last recorded queries (the open-order window test) sometimes sees the
+node's query instead of its own and fails."""
+match = "Names the helper (or the window test) and says the node's startup reconciliation can run concurrently with the test body's calls on the same client."
+reported_by = "no review; it showed as a flaky test"
+fix = "05899f8468e859ed5023dd531d413fc68135d04a"
+test = "packages/canon-alpaca/tests/test_execution_client.py::test_open_order_placed_before_the_window_is_reported"

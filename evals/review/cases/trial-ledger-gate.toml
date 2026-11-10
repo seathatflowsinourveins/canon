@@ -1,0 +1,98 @@
+# A review case: the format is in evals/review/README.md and ADR 0046.
+# Ready with the defects the fix on main confirms; the review's other findings are not defects here.
+id = "trial-ledger-gate"
+status = "ready"
+commit = "e21935c1ada09318cdb92f929333b6295eca24c8"
+title = "Record backtests as trials, build the returns matrix and apply the deflated Sharpe gate (#49)"
+paths = ["src/canon_trading/", "tests/"]
+
+[[defects]]
+id = "ledger-path-per-directory"
+location = "src/canon_trading/ledger.py: open_study and its default path"
+summary = """
+The default ledger path is relative to the current directory and opening creates a missing file or
+study, so each worktree or directory counts its own N: a sweep split across two directories passes the
+gate that the whole sweep fails."""
+match = "Says the default ledger location depends on the working directory (or that open creates a new ledger silently), so trials can be split across ledgers and N undercounted."
+reported_by = "a full review of the commit"
+fix = "828c08273851530b38d5e797bf9abfe4b92b88f8"
+test = "tests/test_ledger.py::test_every_directory_resolves_the_one_ledger_of_the_clone"
+
+[[defects]]
+id = "common-range-trim"
+location = "src/canon_trading/returns_matrix.py: the trim to the common range"
+summary = """
+The matrix trims every trial to the range all trials share, so one short trial sets T for all and
+every Sharpe ratio is recomputed on that window; adding one short record can turn a rejected ledger
+into a pass without the report naming it."""
+match = "Says one trial with a shorter range shrinks the window (T) for every trial, changing the ranking or the gate's result."
+reported_by = "a full review of the commit"
+fix = "828c08273851530b38d5e797bf9abfe4b92b88f8"
+test = "tests/test_ranking.py::test_a_trial_over_a_shorter_range_stops_and_is_named"
+
+[[defects]]
+id = "key-ignores-the-data"
+location = "src/canon_trading/ledger.py: the config key"
+summary = """
+Nothing about the data a run read (catalog, range) is in the config key, so after bars are added new
+trials are ranked against stale ones, and re-running a configuration gives the same key with different
+returns, which stops the ranking for good."""
+match = "Says the key or the record omits the data range or catalog the run read, so trials over different data are compared as one configuration or disagree."
+reported_by = "a full review of the commit"
+fix = "828c08273851530b38d5e797bf9abfe4b92b88f8"
+test = "tests/test_ledger.py::test_bars_added_after_the_sample_change_no_trial_on_it"
+
+[[defects]]
+id = "variance-exact-zero-test"
+location = "src/canon_trading/ranking.py: the V > 0 stop"
+summary = """
+The stop for trials with equal Sharpe ratios tests V against exactly zero, so copies that differ only
+in the last bits pass with V near 1e-27 and an undeflated DSR."""
+match = "Says the zero-variance check is an exact float comparison, so near-identical Sharpe ratios slip past it."
+reported_by = "a full review of the commit"
+fix = "828c08273851530b38d5e797bf9abfe4b92b88f8"
+test = "tests/test_ranking.py::test_copies_that_differ_only_in_rounding_stop"
+
+[[defects]]
+id = "key-hashes-raw-text"
+location = "src/canon_trading/ledger.py: the config key's canonical form"
+summary = """
+The key hashes text as typed, so one configuration gets several keys: '100000 USD' and '100_000 USD'
+differ, and upstream's reflected defaults are hashed too; duplicates inflate N or stop the ranking."""
+match = "Says equivalent configurations (a balance spelled differently, or upstream defaults) hash to different keys."
+reported_by = "a full review of the commit"
+fix = "828c08273851530b38d5e797bf9abfe4b92b88f8"
+test = "tests/test_ledger.py::test_one_configuration_spelled_two_ways_has_one_key"
+
+[[defects]]
+id = "path-interpolated-into-url"
+location = "src/canon_trading/ledger.py: open_study, the sqlite URL"
+summary = """
+The path goes unescaped into 'sqlite:///{path}', so '?', '%XX' or braces in any component open a
+different file or raise."""
+match = "Says the path is put into the database URL without escaping, so special characters open another file or fail."
+reported_by = "a full review of the commit"
+fix = "828c08273851530b38d5e797bf9abfe4b92b88f8"
+test = "tests/test_ledger.py::test_a_path_with_uri_characters_opens_that_file"
+
+[[defects]]
+id = "key-read-from-mutable-config"
+location = "src/canon_trading/ledger.py: record_trial, where the key is read"
+summary = """
+The key is read from the strategy's live config, which MaCross copied at construction, so a config
+changed after the strategy was built is stored with values that did not run."""
+match = "Says the key is taken from a config that can change after the strategy copied it, so the record can describe a run that did not happen."
+reported_by = "a full review of the commit"
+fix = "828c08273851530b38d5e797bf9abfe4b92b88f8"
+test = "tests/test_ledger.py::test_a_config_changed_between_records_is_hashed_as_it_ran"
+
+[[defects]]
+id = "no-day-in-common-names-no-trial"
+location = "src/canon_trading/returns_matrix.py: the no-day-in-common rejection"
+summary = """
+The rejection for trials with no day in common names no trial, against the docstrings' promise that
+the message names every trial that stopped the ranking."""
+match = "Says the no-overlap rejection does not name the trials responsible."
+reported_by = "a full review of the commit"
+fix = "828c08273851530b38d5e797bf9abfe4b92b88f8"
+test = "tests/test_ranking.py::test_trials_with_no_day_in_common_are_each_named"

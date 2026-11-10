@@ -162,6 +162,7 @@ runs.
 | `tests/`, `packages/*/tests/` | Tests beside each package's `src/` |
 | `catalog/` | Local market data, loaded by `canon_trading.bars_to_catalog`; ignored by git |
 | `ledger/` | The trial ledger, an Optuna SQLite study, used from the main checkout by every worktree; ignored by git |
+| `evals/review/` | The reviewer benchmark: cases, the brief every reviewer gets, the procedure |
 | `.claude/settings.json` | Permissions and hooks for this repo |
 | `orca.yaml` | The setup command Orca runs in a new worktree, once enabled and approved in the app |
 | `.claude/rules/` | Rules scoped to `canon/`, `docs/adr/` and trading code |
@@ -206,4 +207,6 @@ here, community convergence, then anyone's recollection.
   The overfitting probability has no adopted implementation (ADR 0027 and ADR 0032 are `proposed`).
 * **No OpenTelemetry backend.** The local event ledger covers this machine; `home/otel-settings.example.json`
   is ready for when a collector exists.
-* **No eval of our own.** Model routing rests on external measurements until there is one (ADR 0005).
+* **No eval of our own has run.** Model routing rests on external measurements (ADR 0005). A reviewer
+  benchmark is defined, with its first cases, brief and procedure in `evals/review/` (ADR 0046); no
+  reviewer has run it, and with ten confirmed defects, eight in one case, it can show only gross differences.
