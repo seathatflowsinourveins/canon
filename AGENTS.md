@@ -44,7 +44,7 @@ dependency, pattern and practice traces to a pinned upstream or a dated source. 
 | `scripts/automation status` | Show every standing automation and whether it is healthy |
 | `scripts/survey-github report canon/github-practice.json` | Print what a measured sample of repositories converges on for pull requests and GitHub automation |
 | `scripts/bootstrap --check` | Show which toolchain pieces are installed, and whether the Claude Code CLI is behind its pin |
-| `mise run paper:store`, `paper:check`, `paper:remove`, `paper:test` | Enter the Alpaca paper key pair into the login keychain (the owner, in their own terminal), check it is there, remove it, run the two paper tests with it (ADR 0029) |
+| `mise run paper:store`, `paper:check`, `paper:remove`, `paper:test` | Enter the Alpaca paper key pair into the login keychain (the owner, in their own terminal), check it is there, remove it, run the two paper tests with it (ADR 0029, ADR 0033) |
 
 ## Layout
 
@@ -99,8 +99,9 @@ dependency, pattern and practice traces to a pinned upstream or a dated source. 
 | 0026 | The weekly model run: a desktop scheduled task, gated by scripts, that reports and does not decide |
 | 0027 | Overfitting probability (proposed): a diagnostic beside the Sharpe gate; no implementation adopted |
 | 0028 | Permission prompts: a lane's own steps run without one; what rewrites everything or leaves the checkout still asks |
-| 0029 | Alpaca paper keys: the login keychain, read by the `paper:test` mise task when it runs, checked against the paper API at entry |
+| 0029 | Alpaca paper keys: the login keychain, read by the `paper:test` mise task when it runs |
 | 0031 | Deflated Sharpe computation: eqs. 1–2 through skfolio, with the input it lets pass refused |
+| 0033 | Alpaca paper key entry: a hidden prompt in `paper:store`, the pair checked against the paper API before it is stored |
 
 ## Automation
 
