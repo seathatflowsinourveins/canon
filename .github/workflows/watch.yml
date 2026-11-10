@@ -1,0 +1,48 @@
+# Hosted landscape watch (docs/adr/0011-automation.md, docs/adr/0017-merge-gate.md).
+# Once a day it compares the canon with live upstream, so a re-pointed release tag is caught even when no
+# session has started on the development machine. scripts/canon needs only curl and jq, which the runner
+# image has, so no toolchain is installed. Checked with actionlint.
+name: watch
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: watch
+  cancel-in-progress: true
+
+jobs:
+  canon:
+    name: canon against upstream
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Exit 3 means a pinned release tag now points at a different commit; exit 1, an upstream that
+      # could not be read. Either fails the run, which is how the owner hears of it.
+      - name: Pins against live upstream
+        run: |
+          set +e
+          scripts/canon check > check.txt 2>&1
+          rc=$?
+          { echo '### scripts/canon check'; echo '```'; cat check.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          cat check.txt
+          exit "$rc"
+
+      - name: Newer releases
+        if: ${{ always() }}
+        run: |
+          set +e
+          scripts/canon outdated > outdated.txt 2>&1
+          rc=$?
+          { echo '### scripts/canon outdated'; echo '```'; cat outdated.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          cat outdated.txt
+          exit "$rc"

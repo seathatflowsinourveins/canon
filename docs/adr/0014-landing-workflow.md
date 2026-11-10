@@ -48,7 +48,7 @@ Chosen: **option 2**, through `scripts/land`.
    written for a later reader: no conversation history, discarded attempts or tool usage.
 8. **Titles:** a plain sentence. No Conventional Commits prefix and no PR number.
 9. **Review before landing code.** For a change under `src/` or `packages/`, run `/code-review` and resolve
-   what it finds. Documentation and ADR changes do not need it.
+   what it finds. Documentation and ADR changes do not need it. (ADR 0017 widens this.)
 
 Not adopted, with the reason:
 

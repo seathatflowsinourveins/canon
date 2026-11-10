@@ -1,5 +1,5 @@
 {
-  "surveyed_at": "2026-11-10T03:23:00Z",
+  "surveyed_at": "2026-11-10T04:55:40Z",
   "repos": [
     {
       "repo": "astral-sh/uv",
@@ -22,7 +22,43 @@
         "agent_in_ci": [
           "openai/codex-action"
         ],
-        "housekeeping": []
+        "agent_triggers": [
+          {
+            "event": "issue_comment",
+            "files": 1
+          },
+          {
+            "event": "issues",
+            "files": 1
+          },
+          {
+            "event": "pull_request",
+            "files": 1
+          },
+          {
+            "event": "push",
+            "files": 1
+          },
+          {
+            "event": "workflow_dispatch",
+            "files": 5
+          }
+        ],
+        "housekeeping": [],
+        "automation": {
+          "bot_automerge": false,
+          "path_filter": false,
+          "cache": true,
+          "timeouts": true,
+          "reusable": true,
+          "scheduled": true,
+          "pull_request_target": false,
+          "title_lint": false,
+          "release": true,
+          "coverage": false,
+          "benchmarks": true,
+          "matrix": true
+        }
       },
       "files": {
         "hook_framework": null,
@@ -141,7 +177,22 @@
         "workflow_lint": "zizmor+actionlint",
         "lockfile": false,
         "agent_in_ci": [],
-        "housekeeping": []
+        "agent_triggers": [],
+        "housekeeping": [],
+        "automation": {
+          "bot_automerge": false,
+          "path_filter": true,
+          "cache": true,
+          "timeouts": true,
+          "reusable": true,
+          "scheduled": true,
+          "pull_request_target": false,
+          "title_lint": false,
+          "release": true,
+          "coverage": false,
+          "benchmarks": true,
+          "matrix": true
+        }
       },
       "files": {
         "hook_framework": "pre-commit",
@@ -255,7 +306,22 @@
         "workflow_lint": "zizmor+actionlint",
         "lockfile": false,
         "agent_in_ci": [],
-        "housekeeping": []
+        "agent_triggers": [],
+        "housekeeping": [],
+        "automation": {
+          "bot_automerge": false,
+          "path_filter": true,
+          "cache": true,
+          "timeouts": true,
+          "reusable": true,
+          "scheduled": true,
+          "pull_request_target": false,
+          "title_lint": false,
+          "release": true,
+          "coverage": false,
+          "benchmarks": false,
+          "matrix": true
+        }
       },
       "files": {
         "hook_framework": "pre-commit",
@@ -367,7 +433,7 @@
       "repo": "nautechsystems/nautilus_trader",
       "group": "canon upstream",
       "default_branch": "develop",
-      "stars": 31418,
+      "stars": 31421,
       "workflows": {
         "count": 12,
         "with_top_level_permissions": 12,
@@ -379,10 +445,25 @@
         "persist_credentials_false": 60,
         "merge_group_trigger": false,
         "aggregating_job": false,
-        "workflow_lint": "actionlint",
+        "workflow_lint": "zizmor+actionlint",
         "lockfile": false,
         "agent_in_ci": [],
-        "housekeeping": []
+        "agent_triggers": [],
+        "housekeeping": [],
+        "automation": {
+          "bot_automerge": false,
+          "path_filter": true,
+          "cache": true,
+          "timeouts": true,
+          "reusable": true,
+          "scheduled": true,
+          "pull_request_target": false,
+          "title_lint": false,
+          "release": true,
+          "coverage": false,
+          "benchmarks": true,
+          "matrix": true
+        }
       },
       "files": {
         "hook_framework": "pre-commit",
@@ -487,9 +568,24 @@
         "workflow_lint": null,
         "lockfile": false,
         "agent_in_ci": [],
+        "agent_triggers": [],
         "housekeeping": [
           "actions/stale"
-        ]
+        ],
+        "automation": {
+          "bot_automerge": false,
+          "path_filter": false,
+          "cache": true,
+          "timeouts": false,
+          "reusable": false,
+          "scheduled": true,
+          "pull_request_target": false,
+          "title_lint": false,
+          "release": false,
+          "coverage": false,
+          "benchmarks": false,
+          "matrix": true
+        }
       },
       "files": {
         "hook_framework": "pre-commit",
@@ -603,9 +699,24 @@
         "workflow_lint": "zizmor",
         "lockfile": false,
         "agent_in_ci": [],
+        "agent_triggers": [],
         "housekeeping": [
           "actions/stale"
-        ]
+        ],
+        "automation": {
+          "bot_automerge": false,
+          "path_filter": false,
+          "cache": true,
+          "timeouts": true,
+          "reusable": false,
+          "scheduled": true,
+          "pull_request_target": false,
+          "title_lint": false,
+          "release": true,
+          "coverage": true,
+          "benchmarks": false,
+          "matrix": true
+        }
       },
       "files": {
         "hook_framework": "pre-commit",
@@ -732,7 +843,22 @@
         "workflow_lint": null,
         "lockfile": false,
         "agent_in_ci": [],
-        "housekeeping": []
+        "agent_triggers": [],
+        "housekeeping": [],
+        "automation": {
+          "bot_automerge": true,
+          "path_filter": true,
+          "cache": true,
+          "timeouts": true,
+          "reusable": true,
+          "scheduled": true,
+          "pull_request_target": true,
+          "title_lint": false,
+          "release": true,
+          "coverage": false,
+          "benchmarks": false,
+          "matrix": true
+        }
       },
       "files": {
         "hook_framework": null,
@@ -845,7 +971,22 @@
         "workflow_lint": null,
         "lockfile": false,
         "agent_in_ci": [],
-        "housekeeping": []
+        "agent_triggers": [],
+        "housekeeping": [],
+        "automation": {
+          "bot_automerge": true,
+          "path_filter": false,
+          "cache": false,
+          "timeouts": true,
+          "reusable": false,
+          "scheduled": true,
+          "pull_request_target": false,
+          "title_lint": false,
+          "release": true,
+          "coverage": false,
+          "benchmarks": false,
+          "matrix": true
+        }
       },
       "files": {
         "hook_framework": "husky",
@@ -944,7 +1085,22 @@
         "workflow_lint": null,
         "lockfile": false,
         "agent_in_ci": [],
-        "housekeeping": []
+        "agent_triggers": [],
+        "housekeeping": [],
+        "automation": {
+          "bot_automerge": false,
+          "path_filter": true,
+          "cache": false,
+          "timeouts": false,
+          "reusable": false,
+          "scheduled": true,
+          "pull_request_target": false,
+          "title_lint": false,
+          "release": false,
+          "coverage": false,
+          "benchmarks": false,
+          "matrix": true
+        }
       },
       "files": {
         "hook_framework": null,
@@ -1043,7 +1199,7 @@
       "repo": "koalaman/shellcheck",
       "group": "canon upstream",
       "default_branch": "master",
-      "stars": 40312,
+      "stars": 40313,
       "workflows": {
         "count": 2,
         "with_top_level_permissions": 1,
@@ -1058,7 +1214,22 @@
         "workflow_lint": null,
         "lockfile": false,
         "agent_in_ci": [],
-        "housekeeping": []
+        "agent_triggers": [],
+        "housekeeping": [],
+        "automation": {
+          "bot_automerge": false,
+          "path_filter": false,
+          "cache": false,
+          "timeouts": false,
+          "reusable": false,
+          "scheduled": true,
+          "pull_request_target": false,
+          "title_lint": false,
+          "release": false,
+          "coverage": false,
+          "benchmarks": false,
+          "matrix": true
+        }
       },
       "files": {
         "hook_framework": null,
@@ -1159,7 +1330,22 @@
         "workflow_lint": null,
         "lockfile": false,
         "agent_in_ci": [],
-        "housekeeping": []
+        "agent_triggers": [],
+        "housekeeping": [],
+        "automation": {
+          "bot_automerge": false,
+          "path_filter": false,
+          "cache": false,
+          "timeouts": false,
+          "reusable": false,
+          "scheduled": false,
+          "pull_request_target": false,
+          "title_lint": false,
+          "release": false,
+          "coverage": false,
+          "benchmarks": false,
+          "matrix": true
+        }
       },
       "files": {
         "hook_framework": null,
@@ -1244,7 +1430,7 @@
       "repo": "rhysd/actionlint",
       "group": "canon upstream",
       "default_branch": "main",
-      "stars": 4407,
+      "stars": 4408,
       "workflows": {
         "count": 6,
         "with_top_level_permissions": 1,
@@ -1259,7 +1445,22 @@
         "workflow_lint": "actionlint",
         "lockfile": false,
         "agent_in_ci": [],
-        "housekeeping": []
+        "agent_triggers": [],
+        "housekeeping": [],
+        "automation": {
+          "bot_automerge": false,
+          "path_filter": true,
+          "cache": true,
+          "timeouts": false,
+          "reusable": false,
+          "scheduled": true,
+          "pull_request_target": false,
+          "title_lint": false,
+          "release": true,
+          "coverage": true,
+          "benchmarks": false,
+          "matrix": true
+        }
       },
       "files": {
         "hook_framework": null,
@@ -1347,7 +1548,22 @@
         "workflow_lint": "actionlint",
         "lockfile": false,
         "agent_in_ci": [],
-        "housekeeping": []
+        "agent_triggers": [],
+        "housekeeping": [],
+        "automation": {
+          "bot_automerge": false,
+          "path_filter": true,
+          "cache": false,
+          "timeouts": true,
+          "reusable": false,
+          "scheduled": true,
+          "pull_request_target": true,
+          "title_lint": true,
+          "release": false,
+          "coverage": false,
+          "benchmarks": false,
+          "matrix": true
+        }
       },
       "files": {
         "hook_framework": null,
@@ -1372,25 +1588,25 @@
       "history": {
         "n": 100,
         "merge_commit_pct": 0,
-        "via_pull_request_pct": 45,
-        "pr_suffix_pct": 45,
+        "via_pull_request_pct": 44,
+        "pr_suffix_pct": 44,
         "conventional_pct": 100,
         "ai_marker_pct": 0,
         "ai_tools": [],
         "signed_off_pct": 0
       },
       "pull_requests": {
-        "n": 45,
-        "human_authored": 12,
-        "bot_authored_pct": 73,
+        "n": 44,
+        "human_authored": 11,
+        "bot_authored_pct": 75,
         "bot_authors": [
           {
             "login": "renovate",
-            "n": 28
+            "n": 29
           },
           {
             "login": "github-actions",
-            "n": 5
+            "n": 4
           }
         ],
         "approved_pct": 0,
@@ -1400,17 +1616,17 @@
         "merged_by": [
           {
             "login": "renovate",
-            "n": 26
+            "n": 27
           },
           {
             "login": "ryoppippi",
-            "n": 19
+            "n": 17
           }
         ],
-        "merged_by_bot_pct": 57,
-        "median_hours_to_merge": 3.2,
-        "median_lines_changed": 449,
-        "median_commits": 5
+        "merged_by_bot_pct": 61,
+        "median_hours_to_merge": 0.8,
+        "median_lines_changed": 301,
+        "median_commits": 4
       },
       "branch_rules": {
         "approvals": null,
@@ -1445,7 +1661,31 @@
         "agent_in_ci": [
           "anthropics/claude-code-action"
         ],
-        "housekeeping": []
+        "agent_triggers": [
+          {
+            "event": "issues",
+            "files": 1
+          },
+          {
+            "event": "pull_request",
+            "files": 1
+          }
+        ],
+        "housekeeping": [],
+        "automation": {
+          "bot_automerge": false,
+          "path_filter": true,
+          "cache": false,
+          "timeouts": true,
+          "reusable": true,
+          "scheduled": true,
+          "pull_request_target": false,
+          "title_lint": false,
+          "release": true,
+          "coverage": true,
+          "benchmarks": false,
+          "matrix": true
+        }
       },
       "files": {
         "hook_framework": null,
@@ -1553,7 +1793,51 @@
           "anthropics/claude-code-action",
           "anthropics/claude-code-base-action"
         ],
-        "housekeeping": []
+        "agent_triggers": [
+          {
+            "event": "issue_comment",
+            "files": 1
+          },
+          {
+            "event": "issues",
+            "files": 2
+          },
+          {
+            "event": "pull_request",
+            "files": 1
+          },
+          {
+            "event": "pull_request_review",
+            "files": 1
+          },
+          {
+            "event": "push",
+            "files": 1
+          },
+          {
+            "event": "workflow_dispatch",
+            "files": 2
+          },
+          {
+            "event": "workflow_run",
+            "files": 1
+          }
+        ],
+        "housekeeping": [],
+        "automation": {
+          "bot_automerge": false,
+          "path_filter": true,
+          "cache": false,
+          "timeouts": true,
+          "reusable": true,
+          "scheduled": false,
+          "pull_request_target": false,
+          "title_lint": false,
+          "release": true,
+          "coverage": false,
+          "benchmarks": false,
+          "matrix": false
+        }
       },
       "files": {
         "hook_framework": null,
@@ -1647,7 +1931,7 @@
       "repo": "openai/codex",
       "group": "agent tool",
       "default_branch": "main",
-      "stars": 134480,
+      "stars": 134521,
       "workflows": {
         "count": 28,
         "with_top_level_permissions": 6,
@@ -1665,7 +1949,27 @@
           "codex exec",
           "openai/codex-action"
         ],
-        "housekeeping": []
+        "agent_triggers": [
+          {
+            "event": "issues",
+            "files": 3
+          }
+        ],
+        "housekeeping": [],
+        "automation": {
+          "bot_automerge": false,
+          "path_filter": false,
+          "cache": true,
+          "timeouts": true,
+          "reusable": true,
+          "scheduled": true,
+          "pull_request_target": true,
+          "title_lint": false,
+          "release": true,
+          "coverage": false,
+          "benchmarks": false,
+          "matrix": true
+        }
       },
       "files": {
         "hook_framework": null,
@@ -1751,7 +2055,7 @@
       "repo": "google-gemini/gemini-cli",
       "group": "agent tool",
       "default_branch": "main",
-      "stars": 108746,
+      "stars": 108749,
       "workflows": {
         "count": 47,
         "with_top_level_permissions": 19,
@@ -1763,12 +2067,44 @@
         "persist_credentials_false": 59,
         "merge_group_trigger": true,
         "aggregating_job": false,
-        "workflow_lint": null,
+        "workflow_lint": "actionlint",
         "lockfile": false,
         "agent_in_ci": [
           "google-github-actions/run-gemini-cli"
         ],
-        "housekeeping": []
+        "agent_triggers": [
+          {
+            "event": "issue_comment",
+            "files": 2
+          },
+          {
+            "event": "issues",
+            "files": 2
+          },
+          {
+            "event": "schedule",
+            "files": 4
+          },
+          {
+            "event": "workflow_dispatch",
+            "files": 7
+          }
+        ],
+        "housekeeping": [],
+        "automation": {
+          "bot_automerge": false,
+          "path_filter": true,
+          "cache": true,
+          "timeouts": true,
+          "reusable": true,
+          "scheduled": true,
+          "pull_request_target": true,
+          "title_lint": false,
+          "release": false,
+          "coverage": false,
+          "benchmarks": false,
+          "matrix": true
+        }
       },
       "files": {
         "hook_framework": "husky",
@@ -1867,7 +2203,7 @@
       "repo": "sst/opencode",
       "group": "agent tool",
       "default_branch": "dev",
-      "stars": 225699,
+      "stars": 225711,
       "workflows": {
         "count": 19,
         "with_top_level_permissions": 14,
@@ -1882,7 +2218,22 @@
         "workflow_lint": null,
         "lockfile": false,
         "agent_in_ci": [],
-        "housekeeping": []
+        "agent_triggers": [],
+        "housekeeping": [],
+        "automation": {
+          "bot_automerge": false,
+          "path_filter": true,
+          "cache": true,
+          "timeouts": true,
+          "reusable": false,
+          "scheduled": true,
+          "pull_request_target": true,
+          "title_lint": false,
+          "release": true,
+          "coverage": false,
+          "benchmarks": false,
+          "matrix": true
+        }
       },
       "files": {
         "hook_framework": "husky",
@@ -1938,20 +2289,20 @@
         "merge_queue_pct": 0,
         "merged_by": [
           {
-            "login": "adamdotdevin",
-            "n": 28
-          },
-          {
             "login": "rekram1-node",
             "n": 28
           },
           {
+            "login": "adamdotdevin",
+            "n": 27
+          },
+          {
             "login": "Hona",
-            "n": 10
+            "n": 9
           }
         ],
         "merged_by_bot_pct": 0,
-        "median_hours_to_merge": 1,
+        "median_hours_to_merge": 0.9,
         "median_lines_changed": 78,
         "median_commits": 1
       },
@@ -1985,7 +2336,7 @@
       "repo": "zed-industries/zed",
       "group": "agent tool",
       "default_branch": "main",
-      "stars": 94603,
+      "stars": 94609,
       "workflows": {
         "count": 46,
         "with_top_level_permissions": 46,
@@ -2000,9 +2351,24 @@
         "workflow_lint": "zizmor+actionlint",
         "lockfile": false,
         "agent_in_ci": [],
+        "agent_triggers": [],
         "housekeeping": [
           "actions/stale"
-        ]
+        ],
+        "automation": {
+          "bot_automerge": true,
+          "path_filter": true,
+          "cache": true,
+          "timeouts": true,
+          "reusable": true,
+          "scheduled": true,
+          "pull_request_target": true,
+          "title_lint": false,
+          "release": false,
+          "coverage": false,
+          "benchmarks": false,
+          "matrix": true
+        }
       },
       "files": {
         "hook_framework": null,
@@ -2126,9 +2492,24 @@
         "workflow_lint": "zizmor+actionlint",
         "lockfile": false,
         "agent_in_ci": [],
+        "agent_triggers": [],
         "housekeeping": [
           "actions/stale"
-        ]
+        ],
+        "automation": {
+          "bot_automerge": false,
+          "path_filter": true,
+          "cache": true,
+          "timeouts": true,
+          "reusable": true,
+          "scheduled": true,
+          "pull_request_target": false,
+          "title_lint": false,
+          "release": false,
+          "coverage": false,
+          "benchmarks": false,
+          "matrix": true
+        }
       },
       "files": {
         "hook_framework": "pre-commit",
@@ -2220,7 +2601,7 @@
       "repo": "pydantic/pydantic",
       "group": "flagship",
       "default_branch": "main",
-      "stars": 29416,
+      "stars": 29418,
       "workflows": {
         "count": 9,
         "with_top_level_permissions": 8,
@@ -2235,7 +2616,22 @@
         "workflow_lint": "zizmor",
         "lockfile": false,
         "agent_in_ci": [],
-        "housekeeping": []
+        "agent_triggers": [],
+        "housekeeping": [],
+        "automation": {
+          "bot_automerge": false,
+          "path_filter": false,
+          "cache": true,
+          "timeouts": true,
+          "reusable": false,
+          "scheduled": true,
+          "pull_request_target": true,
+          "title_lint": false,
+          "release": true,
+          "coverage": false,
+          "benchmarks": true,
+          "matrix": true
+        }
       },
       "files": {
         "hook_framework": "pre-commit",
@@ -2346,9 +2742,24 @@
         "workflow_lint": null,
         "lockfile": false,
         "agent_in_ci": [],
+        "agent_triggers": [],
         "housekeeping": [
           "release-drafter/release-drafter"
-        ]
+        ],
+        "automation": {
+          "bot_automerge": false,
+          "path_filter": true,
+          "cache": true,
+          "timeouts": false,
+          "reusable": true,
+          "scheduled": false,
+          "pull_request_target": true,
+          "title_lint": false,
+          "release": true,
+          "coverage": true,
+          "benchmarks": false,
+          "matrix": true
+        }
       },
       "files": {
         "hook_framework": null,
@@ -2433,7 +2844,7 @@
       "repo": "fastapi/fastapi",
       "group": "flagship",
       "default_branch": "master",
-      "stars": 104602,
+      "stars": 104603,
       "workflows": {
         "count": 18,
         "with_top_level_permissions": 18,
@@ -2448,7 +2859,22 @@
         "workflow_lint": "zizmor",
         "lockfile": false,
         "agent_in_ci": [],
-        "housekeeping": []
+        "agent_triggers": [],
+        "housekeeping": [],
+        "automation": {
+          "bot_automerge": false,
+          "path_filter": true,
+          "cache": true,
+          "timeouts": true,
+          "reusable": false,
+          "scheduled": true,
+          "pull_request_target": true,
+          "title_lint": false,
+          "release": true,
+          "coverage": false,
+          "benchmarks": true,
+          "matrix": true
+        }
       },
       "files": {
         "hook_framework": "pre-commit",
@@ -2559,7 +2985,22 @@
         "workflow_lint": null,
         "lockfile": false,
         "agent_in_ci": [],
-        "housekeeping": []
+        "agent_triggers": [],
+        "housekeeping": [],
+        "automation": {
+          "bot_automerge": false,
+          "path_filter": false,
+          "cache": true,
+          "timeouts": true,
+          "reusable": false,
+          "scheduled": true,
+          "pull_request_target": false,
+          "title_lint": false,
+          "release": false,
+          "coverage": false,
+          "benchmarks": false,
+          "matrix": true
+        }
       },
       "files": {
         "hook_framework": null,
@@ -2592,23 +3033,23 @@
         "signed_off_pct": 3
       },
       "pull_requests": {
-        "n": 26,
-        "human_authored": 26,
+        "n": 29,
+        "human_authored": 29,
         "bot_authored_pct": 0,
         "bot_authors": [],
-        "approved_pct": 38,
+        "approved_pct": 41,
         "self_merged_pct": 0,
         "auto_merge_pct": 0,
         "merge_queue_pct": 0,
         "merged_by": [
           {
             "login": "rust-bors",
-            "n": 26
+            "n": 29
           }
         ],
         "merged_by_bot_pct": 100,
         "median_hours_to_merge": 11.1,
-        "median_lines_changed": 106,
+        "median_lines_changed": 41,
         "median_commits": 2
       },
       "branch_rules": {
@@ -2652,7 +3093,9 @@
         "workflow_lint": null,
         "lockfile": false,
         "agent_in_ci": [],
-        "housekeeping": []
+        "agent_triggers": [],
+        "housekeeping": [],
+        "automation": {}
       },
       "files": {
         "hook_framework": null,
@@ -2754,7 +3197,22 @@
         "workflow_lint": "zizmor",
         "lockfile": false,
         "agent_in_ci": [],
-        "housekeeping": []
+        "agent_triggers": [],
+        "housekeeping": [],
+        "automation": {
+          "bot_automerge": false,
+          "path_filter": true,
+          "cache": true,
+          "timeouts": true,
+          "reusable": false,
+          "scheduled": true,
+          "pull_request_target": true,
+          "title_lint": true,
+          "release": true,
+          "coverage": false,
+          "benchmarks": false,
+          "matrix": true
+        }
       },
       "files": {
         "hook_framework": null,
@@ -2809,8 +3267,8 @@
             "n": 1
           }
         ],
-        "approved_pct": 62,
-        "self_merged_pct": 51,
+        "approved_pct": 63,
+        "self_merged_pct": 50,
         "auto_merge_pct": 0,
         "merge_queue_pct": 0,
         "merged_by": [
@@ -2875,7 +3333,22 @@
         "workflow_lint": null,
         "lockfile": false,
         "agent_in_ci": [],
-        "housekeeping": []
+        "agent_triggers": [],
+        "housekeeping": [],
+        "automation": {
+          "bot_automerge": false,
+          "path_filter": false,
+          "cache": true,
+          "timeouts": true,
+          "reusable": false,
+          "scheduled": true,
+          "pull_request_target": false,
+          "title_lint": false,
+          "release": true,
+          "coverage": false,
+          "benchmarks": false,
+          "matrix": true
+        }
       },
       "files": {
         "hook_framework": null,
@@ -2958,7 +3431,7 @@
       "repo": "ghostty-org/ghostty",
       "group": "flagship",
       "default_branch": "main",
-      "stars": 63939,
+      "stars": 63942,
       "workflows": {
         "count": 17,
         "with_top_level_permissions": 0,
@@ -2973,7 +3446,22 @@
         "workflow_lint": null,
         "lockfile": false,
         "agent_in_ci": [],
-        "housekeeping": []
+        "agent_triggers": [],
+        "housekeeping": [],
+        "automation": {
+          "bot_automerge": false,
+          "path_filter": true,
+          "cache": true,
+          "timeouts": true,
+          "reusable": false,
+          "scheduled": true,
+          "pull_request_target": true,
+          "title_lint": false,
+          "release": true,
+          "coverage": false,
+          "benchmarks": false,
+          "matrix": true
+        }
       },
       "files": {
         "hook_framework": null,
@@ -2997,18 +3485,18 @@
       },
       "history": {
         "n": 100,
-        "merge_commit_pct": 30,
+        "merge_commit_pct": 31,
         "via_pull_request_pct": 100,
-        "pr_suffix_pct": 31,
-        "conventional_pct": 16,
+        "pr_suffix_pct": 32,
+        "conventional_pct": 18,
         "ai_marker_pct": 0,
         "ai_tools": [],
-        "signed_off_pct": 3
+        "signed_off_pct": 4
       },
       "pull_requests": {
-        "n": 31,
+        "n": 32,
         "human_authored": 26,
-        "bot_authored_pct": 16,
+        "bot_authored_pct": 18,
         "bot_authors": [
           {
             "login": "ghostty-vouch",
@@ -3016,7 +3504,7 @@
           },
           {
             "login": "dependabot",
-            "n": 1
+            "n": 2
           },
           {
             "login": "github-actions",
@@ -3025,12 +3513,12 @@
         ],
         "approved_pct": 50,
         "self_merged_pct": 42,
-        "auto_merge_pct": 19,
+        "auto_merge_pct": 18,
         "merge_queue_pct": 0,
         "merged_by": [
           {
             "login": "mitchellh",
-            "n": 24
+            "n": 25
           },
           {
             "login": "ghostty-vouch",
@@ -3086,12 +3574,27 @@
         "persist_credentials_false": 18,
         "merge_group_trigger": true,
         "aggregating_job": false,
-        "workflow_lint": null,
+        "workflow_lint": "zizmor",
         "lockfile": false,
         "agent_in_ci": [],
+        "agent_triggers": [],
         "housekeeping": [
           "actions/labeler"
-        ]
+        ],
+        "automation": {
+          "bot_automerge": false,
+          "path_filter": true,
+          "cache": true,
+          "timeouts": true,
+          "reusable": false,
+          "scheduled": true,
+          "pull_request_target": true,
+          "title_lint": true,
+          "release": true,
+          "coverage": false,
+          "benchmarks": true,
+          "matrix": true
+        }
       },
       "files": {
         "hook_framework": null,

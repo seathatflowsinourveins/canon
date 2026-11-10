@@ -131,6 +131,23 @@ def checks: ((.branch_rules.required_checks // []) + (.classic_protection.contex
   line("`merge_group` trigger present"; .workflows.merge_group_trigger; wf),
   line("A coding agent runs in a workflow"; (.workflows.agent_in_ci | length) > 0; wf),
   line("Labeler or stale bot workflow"; (.workflows.housekeeping | length) > 0; wf),
+  head("Automation in workflow files (repositories that have any)"),
+  line("`timeout-minutes` set somewhere"; .workflows.automation.timeouts == true; wf),
+  line("A `matrix:` in some workflow"; .workflows.automation.matrix == true; wf),
+  line("Caching by a known action or `cache:` input (a lower bound)"; .workflows.automation.cache == true; wf),
+  line("A scheduled (cron) workflow"; .workflows.automation.scheduled == true; wf),
+  line("A `workflow_call:` key (reusable workflows; a lower bound)"; .workflows.automation.reusable == true; wf),
+  line("Path filters or changed-file detection"; .workflows.automation.path_filter == true; wf),
+  line("Release automation by a known action or `gh release create` (a lower bound)"; .workflows.automation.release == true; wf),
+  line("`pull_request_target` used"; .workflows.automation.pull_request_target == true; wf),
+  line("Coverage upload"; .workflows.automation.coverage == true; wf),
+  line("Benchmarks in CI"; .workflows.automation.benchmarks == true; wf),
+  line("Auto-merge of pull requests, or Dependabot metadata, in a workflow (an upper bound)"; .workflows.automation.bot_automerge == true; wf),
+  line("Pull request title or commit message lint"; .workflows.automation.title_lint == true; wf),
+  line("A coding agent runs in a workflow"; (.workflows.agent_in_ci | length) > 0; wf),
+  line("- with an agent workflow triggered directly by a pull request event"; any(.workflows.agent_triggers[]?; .event | test("^pull_request")); wf),
+  line("- with one triggered by issues or comments"; any(.workflows.agent_triggers[]?; .event | test("^issue")); wf),
+  line("- with one triggered on a schedule or by another workflow"; any(.workflows.agent_triggers[]?; .event | test("schedule|workflow_run")); wf),
   head("Repository files"),
   line("Dependency update bot configured"; bot; true),
   line("- Renovate"; (.files.dependency_bot // "") | test("renovate"); true),
@@ -277,8 +294,37 @@ survey_one() {
   if [ "$n" -gt 0 ]; then
     agents=$(grep -ohE 'anthropics/claude-code(-base)?-action|openai/codex-action|google-github-actions/run-gemini-cli|google-gemini/gemini-cli-action|github(next)?/gh-aw|claude (-p|--print)|codex exec|gemini (-p|--prompt)|opencode (run|github)' "$d"/wf/* 2>/dev/null | sort -u | jq -R . | jq -sc .)
     housekeeping=$(grep -ohE 'actions/labeler|actions/stale|actions/first-interaction|release-drafter/release-drafter' "$d"/wf/* 2>/dev/null | sort -u | jq -R . | jq -sc .)
-    grep -hvE '^[[:space:]]*#' "$d"/wf/* 2>/dev/null | grep -q zizmor && lint="zizmor"
-    grep -hvE '^[[:space:]]*#' "$d"/wf/* 2>/dev/null | grep -q actionlint && lint="${lint:+$lint+}actionlint"
+    # Counted, not `grep -q`: closing the pipe early makes the first grep die of SIGPIPE, which pipefail
+    # then reports as no match.
+    [ "$(grep -hvE '^[[:space:]]*#' "$d"/wf/* 2>/dev/null | grep -c zizmor)" -gt 0 ] && lint="zizmor"
+    [ "$(grep -hvE '^[[:space:]]*#' "$d"/wf/* 2>/dev/null | grep -c actionlint)" -gt 0 ] && lint="${lint:+$lint+}actionlint"
+  fi
+  # Automation beyond build and test, as text patterns over the workflow files with comment lines removed.
+  local auto='{}' agent_triggers='[]' af
+  if [ "$n" -gt 0 ]; then
+    wf_has() { if [ "$(grep -hvE '^[[:space:]]*#' "$d"/wf/* 2>/dev/null | grep -cE -- "$1")" -gt 0 ]; then echo true; else echo false; fi; }
+    auto=$(jq -n \
+      --argjson bot_automerge "$(wf_has 'dependabot/fetch-metadata|gh pr merge[^|]*--auto|automerge-action|enable-pull-request-automerge|enablePullRequestAutoMerge')" \
+      --argjson path_filter   "$(wf_has 'dorny/paths-filter|tj-actions/changed-files|^[[:space:]]*paths(-ignore)?:')" \
+      --argjson cache         "$(wf_has 'actions/cache|enable-cache|rust-cache|sccache|cache:[[:space:]]*["'"'"']?(true|pip|npm|pnpm|yarn|poetry)')" \
+      --argjson timeouts      "$(wf_has 'timeout-minutes:')" \
+      --argjson reusable      "$(wf_has 'workflow_call:')" \
+      --argjson scheduled     "$(wf_has 'cron:')" \
+      --argjson pr_target     "$(wf_has 'pull_request_target')" \
+      --argjson title_lint    "$(wf_has 'action-semantic-pull-request|commitlint')" \
+      --argjson release       "$(wf_has 'release-please|release-plz|changesets/action|semantic-release|goreleaser|cargo-dist|gh-action-pypi-publish|action-gh-release|gh release create')" \
+      --argjson coverage      "$(wf_has 'codecov|coveralls')" \
+      --argjson benchmarks    "$(wf_has 'codspeed|bencher|github-action-benchmark')" \
+      --argjson matrix        "$(wf_has 'matrix:')" \
+      '{bot_automerge: $bot_automerge, path_filter: $path_filter, cache: $cache, timeouts: $timeouts, reusable: $reusable,
+        scheduled: $scheduled, pull_request_target: $pr_target, title_lint: $title_lint, release: $release,
+        coverage: $coverage, benchmarks: $benchmarks, matrix: $matrix}')
+    # Which events start the workflows that run a coding agent.
+    agent_triggers=$(for af in "$d"/wf/*; do
+        grep -qE 'anthropics/claude-code(-base)?-action|openai/codex-action|google-github-actions/run-gemini-cli|google-gemini/gemini-cli-action|github(next)?/gh-aw|claude (-p|--print)|codex exec|gemini (-p|--prompt)|opencode (run|github)' "$af" 2>/dev/null || continue
+        grep -oE '^[[:space:]]*(pull_request_target|pull_request|issue_comment|issues|schedule|workflow_run|workflow_dispatch|pull_request_review|push)[:[:space:]]*$' "$af" | tr -d ' :'
+      done | sort | uniq -c | awk '{printf "%s{\"event\":\"%s\",\"files\":%s}", (NR>1?",":""), $2, $1} END {print ""}' | sed 's/^/[/; s/$/]/')
+    jq -e . >/dev/null 2>&1 <<<"$agent_triggers" || agent_triggers='[]'
   fi
   has '^\.github/zizmor\.ya?ml$' && case "$lint" in *zizmor*) ;; *) lint="${lint:+$lint+}zizmor" ;; esac
   has '^\.github/actionlint\.ya?ml$' && case "$lint" in *actionlint*) ;; *) lint="${lint:+$lint+}actionlint" ;; esac
@@ -288,8 +334,8 @@ survey_one() {
   if has '^\.pre-commit-config\.ya?ml$'; then
     hooks="pre-commit"
     raw "$repo" "$branch" "$(grep -E '^\.pre-commit-config\.ya?ml$' "$d/paths.txt" | head -1)" > "$d/precommit.yml"
-    grep -vE '^[[:space:]]*#' "$d/precommit.yml" | grep -q zizmor && case "$lint" in *zizmor*) ;; *) lint="${lint:+$lint+}zizmor" ;; esac
-    grep -vE '^[[:space:]]*#' "$d/precommit.yml" | grep -q actionlint && case "$lint" in *actionlint*) ;; *) lint="${lint:+$lint+}actionlint" ;; esac
+    [ "$(grep -vE '^[[:space:]]*#' "$d/precommit.yml" | grep -c zizmor)" -gt 0 ] && case "$lint" in *zizmor*) ;; *) lint="${lint:+$lint+}zizmor" ;; esac
+    [ "$(grep -vE '^[[:space:]]*#' "$d/precommit.yml" | grep -c actionlint)" -gt 0 ] && case "$lint" in *actionlint*) ;; *) lint="${lint:+$lint+}actionlint" ;; esac
   fi
   has '^(\.)?lefthook\.(ya?ml|toml)$' && hooks="${hooks:+$hooks+}lefthook"
   grep -qx '\.husky' "$d/dirs.txt" && hooks="${hooks:+$hooks+}husky"
@@ -332,6 +378,7 @@ survey_one() {
         --argjson uses_total "$uses_total" --argjson uses_sha "$uses_sha" --argjson checkouts "$checkouts" \
         --argjson no_persist "$no_persist" --argjson merge_group "$merge_group" --argjson agg "$agg" \
         --argjson agents "$agents" --argjson housekeeping "$housekeeping" --arg lint "$lint" \
+        --argjson auto "$auto" --argjson agent_triggers "$agent_triggers" \
         --arg hooks "$hooks" --arg bot "$bot" --argjson cooldown "$cooldown" --argjson automerge "$automerge" \
         --arg tmpl "$tmpl" --argjson headings "$headings" \
         --argjson codeowners "$(has '^(\.github/|docs/)?CODEOWNERS$' && echo true || echo false)" \
@@ -346,7 +393,8 @@ survey_one() {
                    action_refs: $uses_total, action_refs_sha_pinned: $uses_sha,
                    checkouts: $checkouts, persist_credentials_false: $no_persist,
                    merge_group_trigger: ($merge_group == 1), aggregating_job: ($agg == 1),
-                   workflow_lint: ($lint | nn), lockfile: $lockfile, agent_in_ci: $agents, housekeeping: $housekeeping },
+                   workflow_lint: ($lint | nn), lockfile: $lockfile, agent_in_ci: $agents, agent_triggers: $agent_triggers,
+                   housekeeping: $housekeeping, automation: $auto },
       files: { hook_framework: ($hooks | nn), dependency_bot: ($bot | nn), release_cooldown: $cooldown,
                bot_automerge: $automerge, pr_template: ($tmpl | nn), pr_template_headings: $headings,
                codeowners: $codeowners, agents_md: $agents_md, claude_md: $claude_md,
