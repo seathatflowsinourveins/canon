@@ -24,6 +24,12 @@ Known limits:
 * The assets endpoint carries no timestamp, so `ts_event` and `ts_init` are the time of the load.
 * alpaca-py's REST clients are synchronous, so each call runs in a worker thread (`asyncio.to_thread`)
   to keep the node's event loop free.
+* alpaca-py 0.45.0 gives its requests no timeout and has no setting for one. Every alpaca-py REST client
+  this package builds gets one through `with_http_timeout` (ADR 0039): a transport adapter, requests' own
+  documented mechanism ("Transport Adapters"), mounted on the client's `requests.Session`, which alpaca-py
+  keeps in the private attribute `RESTClient._session`. That attribute is the one departure from alpaca-py's
+  public API; a public timeout option in alpaca-py replaces it. `test_upstream_contract.py` checks the
+  attribute at the pin, and a client without it is refused.
 * Only active assets are loaded (alpaca-py `Asset.status`); an inactive one is refused, and so is a
   `status` filter other than `active`.
 """
@@ -32,11 +38,13 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 import time
 from typing import TYPE_CHECKING
 from typing import Protocol
 from typing import override
 
+import requests
 from alpaca.common.exceptions import APIError
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import AssetClass
@@ -47,6 +55,7 @@ from nautilus_trader.live.providers import InstrumentProvider
 from nautilus_trader.model import Equity
 from nautilus_trader.model import InstrumentId
 from nautilus_trader.model import Symbol
+from requests.adapters import HTTPAdapter
 
 from .constants import ENV_API_KEY
 from .constants import ENV_SECRET_KEY
@@ -56,10 +65,127 @@ from .constants import USD
 from .constants import VENUE
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from uuid import UUID
 
     from alpaca.common.types import RawData
     from nautilus_trader.config import InstrumentProviderConfig
+
+CONNECT_TIMEOUT_SECS = 3.05
+"""requests' "Timeouts" (Advanced Usage): "It's a good practice to set connect timeouts to slightly larger
+than a multiple of 3, which is the default TCP packet retransmission window"; its example is
+`timeout=(3.05, 27)` (ADR 0039). It applies per address tried."""
+
+READ_TIMEOUT_SECS = 27.0
+"""The read timeout of the same example: the wait "between bytes sent from the server", not the whole
+response (ADR 0039)."""
+
+
+class TimeoutAdapter(HTTPAdapter):
+    """requests' `HTTPAdapter` with a default (connect, read) timeout for a request that passes none.
+
+    It counts the requests each thread sends, so `counted` can tell how many attempts one alpaca-py call
+    made: alpaca-py repeats a request answered 429 or 504 (`RESTClient._request`), and a 504 may have
+    reached Alpaca. The count is per thread, and a call runs on one thread, so no other call touches it.
+    """
+
+    def __init__(self, timeout: tuple[float, float]) -> None:
+        super().__init__()
+        self.timeout = timeout
+        self._local = threading.local()
+
+    @property
+    def sends(self) -> int:
+        """Requests sent on the calling thread since its last `reset`."""
+        return getattr(self._local, "sends", 0)
+
+    def reset(self) -> None:
+        self._local.sends = 0
+
+    def record_send(self) -> None:
+        self._local.sends = self.sends + 1
+
+    @override
+    def send(self, request, stream=False, timeout=None, verify=True, cert=None, proxies=None):
+        self.record_send()
+        return super().send(
+            request,
+            stream=stream,
+            timeout=self.timeout if timeout is None else timeout,
+            verify=verify,
+            cert=cert,
+            proxies=proxies,
+        )
+
+
+def session_of(client: object) -> requests.Session | None:
+    """The `requests.Session` an alpaca-py REST client keeps at `_session` (alpaca-py 0.45.0,
+    `RESTClient.__init__`), or None. The adapter's one use of that private attribute (ADR 0039)."""
+    session = getattr(client, "_session", None)
+    return session if isinstance(session, requests.Session) else None
+
+
+def with_http_timeout[C](client: C) -> C:
+    """Mount a `TimeoutAdapter` on an alpaca-py REST client's session, unless one is mounted, and return
+    the client.
+
+    Raises `TypeError` if the client holds no `requests.Session` at `_session`, so a client that would
+    run without a timeout does not start.
+    """
+    session = session_of(client)
+    if session is None:
+        raise TypeError(
+            f"{type(client).__name__} has no requests.Session at _session, where alpaca-py 0.45.0 keeps "
+            "it; refusing to run without an HTTP timeout (ADR 0039)",
+        )
+    if timeout_adapter(client) is None:
+        # alpaca-py's session holds requests' two default adapters; they are closed, not kept. A client
+        # passed in with an adapter of its own loses that adapter's settings (ADR 0039).
+        for old in {
+            id(a): a for a in (session.adapters.get(p) for p in ("https://", "http://")) if a
+        }.values():
+            old.close()
+        adapter = TimeoutAdapter((CONNECT_TIMEOUT_SECS, READ_TIMEOUT_SECS))
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+    return client
+
+
+def timeout_adapter(client: object) -> TimeoutAdapter | None:
+    """The `TimeoutAdapter` mounted on `client`'s session for HTTPS, or None."""
+    session = session_of(client)
+    adapter = session.adapters.get("https://") if session is not None else None
+    return adapter if isinstance(adapter, TimeoutAdapter) else None
+
+
+def counted[R](fn: Callable[..., R]) -> Callable[..., R]:
+    """`fn`, an alpaca-py client's bound method, with its attempts counted on the thread that runs it.
+
+    A failure leaves the count on the exception as `alpaca_sends`, read by `not_sent`; nothing shared is
+    read after the call. A function not bound to a client with a `TimeoutAdapter` is returned as is.
+    """
+    adapter = timeout_adapter(getattr(fn, "__self__", None))
+    if adapter is None:
+        return fn
+
+    def call(*args: object) -> R:
+        adapter.reset()
+        try:
+            return fn(*args)
+        except BaseException as e:
+            e.alpaca_sends = adapter.sends  # ty: ignore[missing-attribute] - read back by `not_sent`
+            raise
+
+    call.__name__ = getattr(fn, "__name__", "call")
+    return call
+
+
+def not_sent(error: BaseException) -> bool:
+    """Whether `error`, from a `counted` call, proves the call sent nothing: a connect timeout on its only
+    attempt. Any other failure, a read timeout included, may have reached Alpaca; so may, as far as this
+    can tell, a stall in the TLS handshake, which urllib3 raises as a read timeout."""
+    return isinstance(error, requests.ConnectTimeout) and getattr(error, "alpaca_sends", None) == 1
+
 
 FILTER_KEYS = frozenset({"status", "exchange", "attributes"})
 """`InstrumentProviderConfig.filters` keys passed to `GetAssetsRequest`. Its fourth field, `asset_class`,
@@ -166,7 +292,7 @@ class AlpacaInstrumentProvider(InstrumentProvider):
         if self._assets_client is None:
             api_key, secret_key = credentials_from_env()
             self._assets_client = TradingClient(api_key=api_key, secret_key=secret_key, paper=True)
-        return self._assets_client
+        return with_http_timeout(self._assets_client)  # a client passed in too (ADR 0039)
 
     @override
     async def load_all_async(self, filters: dict | None = None) -> None:

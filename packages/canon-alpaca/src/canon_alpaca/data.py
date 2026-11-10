@@ -62,8 +62,10 @@ Known limits:
   refused: it has no fixed interval to derive `ts_init` from.
 * A request's `limit` is passed to Alpaca as it is; Alpaca returns bars in ascending time from `start`.
 * alpaca-py sets no HTTP timeout and has no setting for one (`RESTClient._one_request` calls
-  `requests.Session.request` without `timeout`). A stalled response holds its worker thread, and every
-  bar request queued behind it, until the operating system ends the connection.
+  `requests.Session.request` without `timeout`). The historical client gets one, 3.05 s to connect and
+  27 s between bytes, from a transport adapter on alpaca-py's private `_session`
+  (`providers.with_http_timeout`, ADR 0039); a stalled request fails with a timeout. A request whose first
+  byte takes longer than 27 s fails too, and alpaca-py does not repeat it.
 * A trade tick already emitted cannot be withdrawn or corrected: a cancel or correction is only logged.
 * Prices must be representable at the instrument's precision; a finer price is refused, not rounded.
 * The feed is fixed to IEX (`constants.FEED`).
@@ -120,6 +122,7 @@ from .constants import FEED
 from .constants import VENUE
 from .providers import AlpacaInstrumentProvider
 from .providers import credentials_from_env
+from .providers import with_http_timeout
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable
@@ -451,6 +454,9 @@ class AlpacaDataClient(MarketDataClient):
                 self._historical = StockHistoricalDataClient(api_key=api_key, secret_key=secret_key)
             if self._stream is None:
                 self._stream = StockDataStream(api_key=api_key, secret_key=secret_key, feed=FEED)
+        with_http_timeout(
+            self._historical
+        )  # a client passed in too; refused without a session (ADR 0039)
         self._stream.register_trade_cancels(weak_coroutine(self._on_trade_cancel))
         self._stream.register_trade_corrections(weak_coroutine(self._on_trade_correction))
         await self._provider.initialize()
