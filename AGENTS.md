@@ -39,7 +39,7 @@ dependency, pattern and practice traces to a pinned upstream or a dated source. 
 | `scripts/canon outdated` | Show upstreams that have a newer release tag than the one pinned |
 | `scripts/canon resolve <id>` | Resolve one pin and merge it into the lock; without an id, re-resolve all (ask first) |
 | `uv sync` | Install exactly what `uv.lock` records into `.venv` |
-| `uv run --locked pytest` | Run every test in the workspace; the guard refuses `uv run` without `--locked` |
+| `uv run --locked pytest` | Run every test in the workspace; `--locked` fails instead of rewriting `uv.lock` |
 | `scripts/lanes` | Report every Claude Code session on this machine: state, failures, spend |
 | `scripts/automation status` | Show every standing automation and whether it is healthy |
 | `scripts/survey-github report canon/github-practice.json` | Print what a measured sample of repositories converges on for pull requests and GitHub automation |
@@ -88,6 +88,7 @@ dependency, pattern and practice traces to a pinned upstream or a dated source. 
 | 0017 | Merge gate: checks decide, an independent review comes first, a model never blocks |
 | 0018 | Agent hosts and other runtimes (proposed): no host has converged; one gate holds whatever runs |
 | 0019 | Review gate scope: every change carries a review note except a named few |
+| 0020 | Rule enforcement: no hook runs before a tool call; the merge gate and permission rules hold the rules |
 
 ## Automation
 
@@ -102,15 +103,15 @@ stalls or fails repeatedly. On Mondays a scheduled session runs the `landscape-r
 opens at most two grouped pull requests a week, for the indirect packages in `uv.lock` and for the
 workflow's actions; the session brief lists the open ones (ADR 0016).
 
-`.claude/hooks/guard.sh` checks every tool call before it runs. For every session it refuses a commit that
-skips the gate or changes git's hook settings, an install that bypasses `uv.lock` (a `uv run` without
-`--locked` included), and anything that points at live trading. For an
-unattended session it refuses everything except reading. If the guard refuses a call, do not look for
-another route: say what you wanted to do and why.
+No hook runs before a tool call (ADR 0020). The rules are held where they cannot be skipped: GitHub merges
+nothing that has not passed `scripts/ci` and does not carry the `signoff` status `scripts/land` posts,
+`scripts/ci` fails when `uv.lock` is out of date, and live credentials never enter this repo or an agent's
+context. `.claude/settings.json` pre-approves a short list of commands, `scripts/land` among them; a
+direct `git push`, a pin move, `uv sync` and `uv add` ask the owner first. If a prompt or a check stops you, do not look for another route: say what you wanted
+to do and why.
 
-The guard is a Claude Code hook. It runs in every Claude Code session here, whichever app or host starts
-it, and in no other agent runtime. If you are another runtime, the rules above bind you with nothing to
-stop a mistake: use no credentials, and leave landing to `scripts/land` (ADR 0018).
+This is the same for every runtime, Claude Code or not: use no credentials, and leave landing to
+`scripts/land` (ADR 0018).
 
 ## Landing
 
@@ -137,7 +138,7 @@ The owner's standing instruction (2026-11-09): work lands automatically once its
 4. Pull request text has `Summary`, `Test Plan` and `Evidence`, written for a later reader: no conversation
    history, discarded attempts or tool usage. Titles are a plain sentence, with no `feat:` style prefix.
 5. This covers work a session of the owner's produced. It does not cover creating a remote, changing a
-   repository's visibility, or anything the guard refuses; those still go to the owner.
+   repository's visibility, or anything a permission rule asks about; those still go to the owner.
 6. It also covers the dependency bot's pull requests (ADR 0016). When the session brief lists any, land
    them with `scripts/land --pr <n>`, which refuses a pull request from a fork, checks the pull request
    out in its own worktree, merges `main` into it if it is behind, lands it under its own title and

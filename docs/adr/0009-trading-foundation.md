@@ -71,6 +71,8 @@ host names come from the pinned `alpaca-py` (`alpaca.common.enums.BaseURL`) and 
 pinned `alpaca-skills`. `scripts/test-hooks` covers it. It checks text an agent sends, so it cannot stop
 code that builds a live URL at run time; keeping live credentials off this machine remains the real control.
 
+The paragraph above is superseded by ADR 0020 (2026-11-10): the guard is removed. Both safety rules stand.
+
 ### Consequences
 
 * Good: backtest and live parity on one engine; official sources at every foundation.

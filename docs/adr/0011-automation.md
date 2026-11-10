@@ -42,6 +42,8 @@ Chosen: **option 3**.
 | Weekly refresh | Mondays 09:09, desktop app open | Scheduled task `canon-landscape-refresh` running the `landscape-refresh` skill | One session | A report |
 | Unattended guard | Every tool call | `PreToolUse` hook `guard.sh` | None | Refuses the call |
 
+The `Unattended guard` row, the enforcement in rule 2 and the guard's consequence are superseded by ADR 0020.
+
 Rules:
 
 1. **Scripts gate the model.** The weekly run starts with `canon check`, `canon outdated` and the expired-ADR
