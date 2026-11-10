@@ -13,18 +13,23 @@
 # contains the current main, and a change that needs an independent review carries a note (ADR 0017).
 #
 # Usage: scripts/land [--body <file>] [--reviewed <note>] [--dry-run] [--pr <number>]
-#   --body <file>   pull request description (Summary / Test Plan / Evidence); default: the commit messages
+#   --body <file>   pull request description (Summary / Test Plan / Evidence); default: for --pr, the pull
+#                   request's own body, otherwise the commit messages
 #   --reviewed <note>  which independent review ran on this change and what came of it (ADR 0017). Needed
 #                   unless every changed path is on the NO_REVIEW list below
 #   --dry-run       run the checks and say what would happen; change nothing on GitHub or on main. Exits
 #                   non-zero if the change would be refused for a missing note
 #   --pr <number>   land a pull request someone else opened, such as the dependency bot's (ADR 0016):
-#                   check it out in its own worktree, merge main into it if it is behind, then land it
+#                   check it out in its own worktree, merge main into it if it is behind, then land it.
+#                   With --dry-run, a pull request that is no longer open is reported, and the run goes on
+# The title, which is also the squash commit's subject, is the pull request's own title for --pr, else an
+# open pull request's own title when there is one, else the last commit's subject. The squash subject
+# ends in "(#<number>)", which is added unless the title already ends with it.
 # Environment: LAND_WAIT_SECONDS (default 540) and LAND_POLL_SECONDS (default 10) bound the wait for the
 # merge. LAND_PR is set by --pr for the run inside the worktree.
 # gh flags used are from gh's own help (gh 2.103.3): auth status, pr create --title/--body-file,
 # pr merge --squash/--auto/--match-head-commit/--subject/--body-file, pr checks --required --json, pr checkout --worktree,
-# pr view --json, pr list --json, api (commit statuses).
+# pr view --json/--jq (title, body, state), pr list --json/--jq, api (commit statuses).
 set -uo pipefail
 SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 CHECK_ADDRESSES="$(dirname "$SELF")/check-addresses"
@@ -209,13 +214,50 @@ if [ ${#needs[@]} -gt 0 ] && [ -z "$REVIEWED" ]; then
 fi
 if [ ${#needs[@]} -eq 0 ]; then review_default="not needed: documentation or lockfile only"; fi
 
-# The pull request's title and description, which also become the squash commit's subject and message:
-# the last commit's subject, and --body or else the commits' own messages.
-title=$(git log -1 --format=%s "$branch") || die "could not read the last commit on $branch"
+# The open pull request for this branch, by number from here on. Looking it up by branch name alone would
+# also find an earlier, already merged pull request of a branch that had the same name.
+# `--head` takes a bare branch name, so a fork's pull request from a branch of the same name is left out
+# by its own flag.
+open_pr() { gh pr list --head "$branch" --base main --state open --json number,url,isCrossRepository \
+              --jq '[.[] | select(.isCrossRepository | not)][0] | select(. != null) | "\(.number) \(.url)"'; }
+existing=""
+if [ -n "$remote" ]; then
+  existing=$(open_pr) || die "could not list the pull requests for $branch"
+fi
+# The pull request whose title is used: for a --pr run, that pull request; otherwise the open one, if any.
+# A dry run on a pull request that is no longer open says so and goes on, as the --pr branch above lets it.
+text_pr=""
+if [ -n "$INNER_PR" ]; then
+  if [ -z "$existing" ]; then
+    [ "$DRY" -eq 1 ] || die "pull request $INNER_PR is not open for $branch; nothing was landed"
+    note "dry run: pull request $INNER_PR is not open, so a run without --dry-run stops here"
+  else
+    [ "${existing%% *}" = "$INNER_PR" ] \
+      || die "the open pull request for $branch is ${existing#* }, not pull request $INNER_PR; nothing was landed"
+  fi
+  text_pr="$INNER_PR"
+elif [ -n "$existing" ]; then
+  text_pr="${existing%% *}"
+fi
+
+# The pull request's title and description, which also become the squash commit's subject and message.
+# Title: that pull request's own title, else the last commit's subject. Description: --body; else, for
+# a --pr run, the pull request's own body; else the commits' own messages. A --pr run may have merged main
+# into the branch, so its last commit and messages are not the pull request's own text.
+if [ -n "$text_pr" ]; then
+  title=$(gh pr view "$text_pr" --json title --jq .title) \
+    || die "could not read the title of pull request $text_pr; nothing was landed"
+  [ -n "$title" ] || die "pull request $text_pr has an empty title; nothing was landed"
+else
+  title=$(git log -1 --format=%s "$branch") || die "could not read the last commit on $branch"
+fi
 pr_body="$BODY"
 if [ -z "$pr_body" ]; then
   pr_body="$tmpd/body"
-  if [ "$ahead" -eq 1 ]; then git log -1 --format=%b "$branch" > "$pr_body"
+  if [ -n "$INNER_PR" ]; then
+    gh pr view "$INNER_PR" --json body --jq .body > "$pr_body" \
+      || die "could not read the description of pull request $INNER_PR; nothing was landed"
+  elif [ "$ahead" -eq 1 ]; then git log -1 --format=%b "$branch" > "$pr_body"
   else git log --reverse --format='* %s%n%n%b' "$base..$branch" > "$pr_body"; fi \
     || die "could not read the commit messages on $branch"
 fi
@@ -255,20 +297,17 @@ fi
 [ "$DRY" -eq 0 ] || finish_dry "push $branch, open a pull request if there is none, record the review, sign off and squash-merge it"
 sha=$(git rev-parse HEAD)
 git push -q -u "$remote" "$branch" || die "push failed"
-# The open pull request for this branch, by number from here on. Looking it up by branch name alone would
-# also find an earlier, already merged pull request of a branch that had the same name.
-# `--head` takes a bare branch name, so a fork's pull request from a branch of the same name is left out
-# by its own flag.
-open_pr() { gh pr list --head "$branch" --base main --state open --json number,url,isCrossRepository \
-              --jq '[.[] | select(.isCrossRepository | not)][0] | select(. != null) | "\(.number) \(.url)"'; }
 found=$(open_pr) || die "could not list the pull requests for $branch"
 if [ -z "$found" ]; then
+  [ -z "$existing" ] || die "${existing#* } is no longer open; nothing was merged"
   gh pr create --base main --head "$branch" --title "$title" --body-file "$pr_body" >/dev/null \
     || die "could not open the pull request"
   found=$(open_pr) || die "could not list the pull requests for $branch"
 fi
 [ -n "$found" ] || die "no open pull request found for $branch"
 num=${found%% *}; url=${found#* }
+# The title checked above belongs to the pull request found before the push; a different one is not merged.
+[ -z "$existing" ] || [ "$num" = "${existing%% *}" ] || die "the open pull request for $branch is now $url, not ${existing#* }; nothing was merged"
 [ -z "$INNER_PR" ] || [ "$num" = "$INNER_PR" ] || die "the open pull request for $branch is $url, not pull request $INNER_PR"
 
 # Record the review first: `signoff` is the status the ruleset waits for, so nothing can merge before the
@@ -290,7 +329,9 @@ gh api -X POST "repos/{owner}/{repo}/statuses/$sha" -f state=success -f context=
 # reach main. If every requirement is already met the first one merges; otherwise auto-merge is switched
 # on. Either way this script waits until GitHub reports the pull request merged, so landing stays one
 # command that ends with main updated.
-merge=(--squash --match-head-commit "$sha" --subject "$title (#$num)" --body-file "$pr_body")
+subject="$title"
+case "$title" in *" (#$num)") ;; *) subject="$title (#$num)" ;; esac
+merge=(--squash --match-head-commit "$sha" --subject "$subject" --body-file "$pr_body")
 if err=$(gh pr merge "$num" "${merge[@]}" 2>&1 >/dev/null); then
   auto=0
 elif err_auto=$(gh pr merge "$num" --auto "${merge[@]}" 2>&1 >/dev/null); then
