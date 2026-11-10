@@ -108,7 +108,8 @@ back once to confirm the write); no file, shell, `mise env` or `scripts/ci` gets
 programs you run from reading it: any process of yours can, with `security find-generic-password -w`, and
 no dialog appears. To replace the pair, remove it and store it again.
 Why it works this way, and what the keychain does not protect against:
-[ADR 0029](docs/adr/0029-paper-keys-in-the-login-keychain.md).
+[ADR 0029](docs/adr/0029-paper-keys-in-the-login-keychain.md); how the pair is checked before it is stored:
+[ADR 0033](docs/adr/0033-paper-key-entry-checked-against-the-paper-api.md).
 
 ## What runs on its own
 
@@ -141,7 +142,7 @@ runs.
 | `canon/upstreams.json` | The registry: 38 upstreams with role, licence, evidence, ADR |
 | `canon/upstreams.lock.json` | Resolved commit SHAs (generated) |
 | `canon/models.json` | Model routing by lane and the landscape snapshot behind it |
-| `docs/adr/` | Thirty-two decisions in MADR 4.0.0, each with Evidence and `review-by` |
+| `docs/adr/` | Thirty-three decisions in MADR 4.0.0, each with Evidence and `review-by` |
 | `pyproject.toml`, `uv.lock` | uv workspace root; one lockfile for every package |
 | `src/canon_trading/` | Strategies and node configuration |
 | `packages/canon-alpaca/` | The Alpaca adapter for NautilusTrader: a market-data client and a paper-only execution client |
