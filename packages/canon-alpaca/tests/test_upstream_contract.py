@@ -186,6 +186,37 @@ def test_clients_built_as_the_adapter_builds_them_target_paper() -> None:
     assert stream._endpoint == BaseURL.TRADING_STREAM_PAPER
 
 
+def test_alpaca_py_rest_clients_keep_a_requests_session_where_the_timeout_is_mounted() -> None:
+    """ADR 0039: the HTTP timeout is a transport adapter mounted on `RESTClient._session`, a private
+    attribute of alpaca-py 0.45.0. A pin move that renames or replaces it fails here, not silently."""
+    import requests
+    from alpaca.common.rest import RESTClient
+    from alpaca.data.historical import StockHistoricalDataClient
+    from alpaca.trading.client import TradingClient
+    from canon_alpaca.providers import CONNECT_TIMEOUT_SECS
+    from canon_alpaca.providers import READ_TIMEOUT_SECS
+    from canon_alpaca.providers import TimeoutAdapter
+    from canon_alpaca.providers import with_http_timeout
+
+    key = secret = "offline-placeholder"
+    for client in (
+        TradingClient(api_key=key, secret_key=secret, paper=True),
+        StockHistoricalDataClient(api_key=key, secret_key=secret),
+    ):
+        assert isinstance(client, RESTClient)
+        assert isinstance(client._session, requests.Session)
+        with_http_timeout(client)
+        for prefix in ("https://", "http://"):
+            adapter = client._session.adapters[prefix]
+            assert isinstance(adapter, TimeoutAdapter)
+            assert adapter.timeout == (CONNECT_TIMEOUT_SECS, READ_TIMEOUT_SECS)
+    # alpaca-py sends every request through `self._session.request` and passes no timeout of its own.
+    source = inspect.getsource(RESTClient._one_request)
+    assert "self._session.request(method, url, **opts)" in source
+    assert "timeout" not in inspect.getsource(RESTClient._request)
+    assert "timeout" not in inspect.getsource(RESTClient._one_request)
+
+
 def test_live_hosts_are_alpaca_py_live_urls() -> None:
     from canon_alpaca.execution import LIVE_HOSTS
     from canon_alpaca.execution import names_live_host

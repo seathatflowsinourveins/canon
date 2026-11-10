@@ -51,6 +51,7 @@ from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pytest
+import requests
 from alpaca.common.exceptions import APIError
 from alpaca.data.models import BarSet
 from alpaca.data.models import Quote
@@ -65,6 +66,7 @@ from alpaca.trading.models import TradeAccount
 from alpaca.trading.models import TradeUpdate
 from alpaca.trading.requests import GetOrdersRequest
 from alpaca.trading.requests import OrderRequest
+from canon_alpaca.providers import timeout_adapter
 
 type Handler = Callable[[object], Awaitable[None]]
 type Message = Quote | Trade | TradeCancel | TradeCorrection
@@ -308,13 +310,26 @@ def hourly_bars(first_open: datetime, count: int) -> list[dict]:
 
 
 class FakeTradingClient:
-    """Stands in for `TradingClient`'s two asset reads."""
+    """Stands in for `TradingClient`'s two asset reads.
+
+    Like alpaca-py 0.45.0's `RESTClient`, it holds a `requests.Session` at `_session`, where the adapter
+    mounts its timeout adapter (ADR 0039). `_count_sends` counts one request sent through that adapter, or
+    `sends_per_call` of them, as when alpaca-py repeats a request answered 429 or 504 (`_count_sends`).
+    """
 
     def __init__(self, assets: list[dict] | None = None) -> None:
+        self._session = requests.Session()
+        self.sends_per_call = 1
         self.assets = assets if assets is not None else [ASSET_AAPL]
         self.errors: dict[str, Exception] = {}  # raised by get_asset for that symbol
         self.all_requests: list[object] = []
         self.symbol_requests: list[object] = []
+
+    def _count_sends(self) -> None:
+        adapter = timeout_adapter(self)
+        if adapter is not None:
+            for _ in range(self.sends_per_call):
+                adapter.record_send()
 
     def get_all_assets(self, filter: object = None) -> list[Asset]:
         self.all_requests.append(filter)
@@ -364,6 +379,7 @@ class FakeOrdersClient(FakeTradingClient):
         self.submitted: list[OrderRequest] = []
         self.replace_script = "replaced"
         self.replace_error: Exception | None = None
+        self.lookup_error: Exception | None = None  # raised by `get_order_by_client_id`
         self.replace_requests: list[tuple[str, object]] = []
         self.cancels: list[str] = []
         self.order_queries: list[GetOrdersRequest | None] = []
@@ -373,6 +389,7 @@ class FakeOrdersClient(FakeTradingClient):
         self._placed: dict[str, dict] = {}
 
     def submit_order(self, order_data: OrderRequest) -> Order:
+        self._count_sends()
         self.submitted.append(order_data)
         if self.submit_error is not None and not self.took_before_error:
             raise self.submit_error
@@ -426,6 +443,7 @@ class FakeOrdersClient(FakeTradingClient):
         self.stream.send(update)
 
     def cancel_order_by_id(self, order_id: object) -> None:
+        self._count_sends()
         self.cancels.append(str(order_id))
         if self.cancel_error is not None and not self.took_before_error:
             raise self.cancel_error
@@ -451,6 +469,7 @@ class FakeOrdersClient(FakeTradingClient):
         of a replaced order answers 422 "order already replaced", and one keeping a client order ID 422
         "client_order_id must be unique", as observed. `replace_error` is raised instead of answering;
         with `took_before_error`, the replace is taken first, as for a submit."""
+        self._count_sends()
         self.replace_requests.append((str(order_id), order_data))
         if self.replace_error is not None and not self.took_before_error:
             raise self.replace_error
@@ -509,6 +528,9 @@ class FakeOrdersClient(FakeTradingClient):
         raise api_error(404, 40410000, "order not found")
 
     def get_order_by_client_id(self, client_id: str) -> Order:
+        self._count_sends()
+        if self.lookup_error is not None:
+            raise self.lookup_error
         for raw in [*self._placed.values(), *self.orders]:
             if raw["client_order_id"] == client_id:
                 return Order(**raw)
@@ -611,6 +633,7 @@ class FakeHistoricalClient:
     """
 
     def __init__(self, bars: list[dict] | None = None, error: Exception | None = None) -> None:
+        self._session = requests.Session()  # where alpaca-py's RESTClient keeps it (ADR 0039)
         self.bars = bars if bars is not None else [BAR_AAPL]
         self.error = error
         self.requests: list[StockBarsRequest] = []
