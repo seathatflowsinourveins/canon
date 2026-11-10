@@ -15,7 +15,9 @@ imported until those exist.
 2. **Research.** Delegate to the `upstream-scout` subagent with the field and the questions. Give it the
    question, not your preferred answer. Independent fields can go to separate scouts in parallel.
 3. **Choose a role.** Official upstream for the job comes first, then the vendor's own tooling, then
-   community work. If sources have not converged, the role is `watch` and the ADR is `proposed`.
+   community work. If sources have not converged on something hard to reverse (a foundation, a format,
+   the merge workflow), the role is `watch` and the ADR is `proposed`. A tool that is cheap to leave can
+   be adopted on the owner's word, with what is untested marked `UNVERIFIED` (ADR 0018).
 4. **Skills and plugins.** Read every file before enabling: `SKILL.md`, scripts, hook definitions, MCP
    config. They run with the agent's permissions (ADR 0004).
 5. **Register.** Add the entry to `canon/upstreams.json` (fields are in `.claude/rules/canon.md`). Track a

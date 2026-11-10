@@ -68,16 +68,17 @@ runs.
 | Path | Holds |
 |---|---|
 | `AGENTS.md`, `CLAUDE.md` | Instructions for agents; `CLAUDE.md` imports `AGENTS.md` |
-| `canon/upstreams.json` | The registry: 33 upstreams with role, licence, evidence, ADR |
+| `canon/upstreams.json` | The registry: 34 upstreams with role, licence, evidence, ADR |
 | `canon/upstreams.lock.json` | Resolved commit SHAs (generated) |
 | `canon/models.json` | Model routing by lane and the landscape snapshot behind it |
-| `docs/adr/` | Nineteen decisions in MADR 4.0.0, each with Evidence and `review-by` |
+| `docs/adr/` | Twenty decisions in MADR 4.0.0, each with Evidence and `review-by` |
 | `pyproject.toml`, `uv.lock` | uv workspace root; one lockfile for every package |
 | `src/canon_trading/` | Strategies and node configuration |
 | `packages/canon-alpaca/` | The Alpaca adapter for NautilusTrader: a market-data client, no execution client yet |
 | `tests/`, `packages/*/tests/` | Tests beside each package's `src/` |
 | `catalog/` | Local market data; ignored by git |
 | `.claude/settings.json` | Permissions and hooks for this repo |
+| `orca.yaml` | The setup command Orca runs in a new worktree, once enabled and approved in the app |
 | `.claude/rules/` | Rules scoped to `canon/`, `docs/adr/` and trading code |
 | `.claude/skills/` | `adopt-upstream`, `new-adr`, `landscape-refresh`, `lane-report` |
 | `.claude/agents/` | `upstream-scout` (Sonnet), `evidence-verifier` (Opus) |

@@ -225,6 +225,15 @@
       "sha": "27a8e54e7ac3c57d6cbf8891f0283dfbaee97317",
       "track": "tag:v1.231.0"
     },
+    "orca": {
+      "default_branch": "main",
+      "default_sha": "d1466f6017c4bb6006b77eb46f2fc0f461ef021e",
+      "ref": "refs/heads/main",
+      "repo": "stablyai/orca",
+      "resolved_at": "2026-11-10T13:10:28Z",
+      "sha": "d1466f6017c4bb6006b77eb46f2fc0f461ef021e",
+      "track": "branch:main"
+    },
     "ossf-scorecard": {
       "default_branch": "main",
       "default_sha": "5a951604a5ff7d99b7222139ba522237c58228af",
