@@ -280,7 +280,9 @@ Each is stated in `execution.py`'s header, with its source.
   a read taken just before a fill lands is wrong for that moment; whether a running node's periodic
   position check can act on that is UNVERIFIED.
 * **Account:** a NautilusTrader cash account whose USD balance is Alpaca's `cash`, all free, read at
-  connect only; cash finer than a cent is reported to the cent, with a warning. Buying power, margin and
+  connect and whenever a strategy calls `query_account`; Alpaca's stream pushes no account update, so the
+  balance is as of the last read
+  ([ADR 0036](../../docs/adr/0036-alpaca-adapter-order-management.md)); cash finer than a cent is reported to the cent, with a warning. Buying power, margin and
   shorting are not modelled; `equity`, `buying_power` and the
   account number are kept in the account state's `info`.
 * **Stream:** alpaca-py does not expose the stream's `listening` acknowledgement, so updates sent before

@@ -58,11 +58,23 @@ carry the stop price as trigger price, and the node's trigger type, else `DEFAUL
 a report without them makes the reconciler clear the local prices). Trailing stops stay denied: their stop
 price moves with Alpaca's high-water mark and no update reports it.
 
+### Account query
+
+The client reported Alpaca's account at connect only. Alpaca's stream sends order updates, not account ones,
+and NautilusTrader creates an account from a reported state with fill-driven calculation off
+(`AccountAny::from_state_checked` at the pin), so the balance stayed as connect left it. Upstream's adapters
+for venues that push no balances, Kraken spot and Coinbase spot, fetch the account on connect and on
+`query_account`, as Binance spot and Bybit do on a query too; none refreshes after each fill. So
+`_query_account` reads Alpaca's account and reports it as at connect, and a failed read is logged and leaves
+the state as it was. Between reads the balance is stale: a strategy that needs it current queries it. This
+was the master orchestrator's choice under the owner's delegation of 2026-11-10, on that evidence.
+
 ### Consequences
 
 * Good: cancel-all cancels exactly what the command names; stops reach Alpaca only in forms its page lists.
-* Bad: one HTTP call per cancel, one at a time; an order Alpaca holds that the node does not yet, or one
-  placed after the cache was read, is not canceled. No `OrderTriggered`: an election shows only as a fill.
+* Bad: the account's balance is as of its last read; one HTTP call per cancel, one at a time; an order
+  Alpaca holds that the node does not yet, or one placed after the cache was read, is not canceled. No
+  `OrderTriggered`: an election shows only as a fill.
 
 ### Confirmation
 
@@ -78,6 +90,10 @@ TC-E24 to E27. The modify rows are ADR 0042's. Each test places nothing while th
 order or position, and leaves it as found. This is upstream's practice: the spec's rows through its tester,
 and offline stand-ins as alpaca-py's own tests mock its paper endpoints; the offline tests are listed in the
 package README.
+
+**Account query.** Offline: a strategy's `query_account` reaches the client and the node's balance takes
+Alpaca's new `cash`; a failed read is logged and changes nothing. Paper, 2026-11-10, `mise run paper:test`:
+a query through a node, the node's USD balance equal to Alpaca's `cash` as `get_account` gives it.
 
 `UNVERIFIED`, shown by no run: an elected stop and its fill, and what the stream sends on election; any sell
 stop.
@@ -97,22 +113,24 @@ Read 2026-11-10; "raw": fetched with `curl` and read, not summarised. NautilusTr
 * `crates/adapters/` at the pin: cancel-all and batch cancel in `kraken/src/execution/spot.rs`,
   `binance/src/spot/execution.rs`, `bybit/src/execution.rs`, `interactive_brokers/src/execution/core.rs`,
   `coinbase/src/execution.rs`, `betfair/src/execution.rs`, `okx/src/execution.rs` and
-  `okx/src/websocket/client.rs`; Kraken's trigger mapping; Coinbase's `OrderContext` (fetched, raw).
+  `okx/src/websocket/client.rs`; Kraken's trigger mapping; Coinbase's `OrderContext`; `query_account` and
+  the account fetch on connect in Kraken spot, Coinbase, Binance spot and Bybit (fetched, raw).
   `crates/trading/src/strategy/mod.rs`: `strategy_only`; `crates/testkit/src/testers/exec/strategy.rs`:
   `on_stop` (fetched, raw).
 * https://docs.alpaca.markets/us/: `reference/deleteallorders-1.md` (account-wide, 207 per order),
-`reference/deleteorderbyorderid-1.md` (422 or 204), `reference/patchorderbyorderid-1.md` (`replaced_by`, for
+  `reference/deleteorderbyorderid-1.md` (422 or 204), `reference/patchorderbyorderid-1.md` (`replaced_by`, for
   a cancel that meets a replaced order), `docs/orders-at-alpaca.md` (stop rules and the
   time-in-force tables, read with markup stripped), `docs/websocket-streaming.md` (the events; none for an
   election), `llms.txt` "Orders" (no cancel-by-list) (fetched, raw).
 * https://github.com/alpacahq/alpaca-py `v0.45.0`, `tests/trading/trading_client/test_order_routes.py`: the
   paper base URL mocked for orders and replaces (fetched, raw).
-* Paper, 2026-11-10, logs kept outside the repo: TC-E41 as written, the sell refused 241 times; five failed
-  runs, two on the test's code, one on connect timeouts, two refusing to start on open orders on the
-  account; then all passed.
+* Paper, 2026-11-10, logs kept outside the repo: TC-E41 as written, the sell refused 241 times; five runs
+  failed (test code, connect timeouts, open orders on the account); then all passed.
 * NautilusTrader `RELEASES.md`: v2.0.0rc9, tagged 2026-11-10, adds `OrderCancelDenied` and
   `OrderModifyDenied` (read by the second reader); the pin stays rc8 until it moves through
   `adopt-upstream`.
+* `crates/model/src/accounts/any.rs` (`from_state_checked`), `crates/portfolio/src/portfolio.rs`
+  (`calculate_account_state`) at the pin (fetched, raw).
 * Second reader (`evidence-verifier`), 2026-11-10, on cancel-all twice and stops once: the decisions stand.
   Corrected above: "never wider than the command"; Binance spot and Bybit select from the cache only for a
   sided command; the retry argument; the 422 exception; who skips `OrderPendingCancel`; Kraken's trigger
