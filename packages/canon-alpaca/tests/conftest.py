@@ -432,6 +432,7 @@ class FakeOrdersClient(FakeTradingClient):
         self.submit_delay = 0.0
         self.submitted: list[OrderRequest] = []
         self.replace_script = "replaced"
+        self.replace_delay = 0.0  # holds the replace answer back after `replaced` is sent
         self.replace_error: Exception | None = None
         self.lookup_error: Exception | None = None  # raised by `get_order_by_client_id`
         self.replace_requests: list[tuple[str, object]] = []
@@ -580,6 +581,7 @@ class FakeOrdersClient(FakeTradingClient):
             old.update(status="replaced")
         if self.replace_error is not None:
             raise self.replace_error
+        time_module.sleep(self.replace_delay)
         return answer
 
     def confirm_replace(self, old_id: str) -> None:
