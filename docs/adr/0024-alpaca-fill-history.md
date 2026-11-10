@@ -10,7 +10,7 @@ review-by: 2026-12-10
 ## Context and Problem Statement
 
 `AlpacaExecutionClient` returns no fill reports, so NautilusTrader infers the fills of every order it
-reconciles (ADR 0009, execution slice). The next slice is meant to report each execution. alpaca-py 0.45.0's
+reconciles (ADR 0030, execution slice). The next slice is meant to report each execution. alpaca-py 0.45.0's
 `TradingClient` has no call for Alpaca's account activities, and rule 3 of ADR 0001 allows only an upstream
 API called as documented. Where does per-execution history come from, and may the adapter use it yet?
 

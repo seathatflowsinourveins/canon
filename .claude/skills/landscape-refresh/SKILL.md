@@ -30,7 +30,7 @@ research for the sake of it.
   note, an issue) and say whether one exists.
 * **Newer release of a `foundation`, `platform` or `tool`:** read the release notes between the pinned tag
   and the new one. Note breaking changes, deprecations and security fixes. NautilusTrader v2.0.0 stable is
-  the one that reopens ADR 0009.
+  the one that reopens ADR 0009 and ADR 0030.
 * **Advanced branch of a `source`:** the skills or plugins there changed. Say that a re-read is due before
   re-pinning (ADR 0004); do not re-read everything now unless asked.
 * **`watch` entries:** only check whether their status changed: an official adapter, a leaving-alpha release,
