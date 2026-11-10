@@ -122,6 +122,17 @@ Limits found while building it, beyond the whole-share limit above:
 * NautilusTrader v2.0.0rc8 logs a failed custom-client connect as "connection failed", without the
   exception's message (observed). The client logs the reason itself.
 
+**Adapter, execution slice (2026-11-10, pull request 24).** `execution.py` now holds
+`AlpacaExecutionClient`, so the first slice's "There is no execution client" no longer holds: the adapter
+can place and cancel orders on Alpaca's paper Trading API. It sends market and limit orders for US
+equities, cancels them, turns trade updates into order events and fills, and reports orders and positions
+at start-up. `AlpacaExecutionClientConfig` refuses `paper` other than `True` and any `url_override`, and
+the client builds alpaca-py's clients with `paper=True` whatever the config holds. It denies a limit price
+with more than 2 decimals at or above $1.00, or more than 4 below, the rule the first slice left to it.
+The template's fill test now
+applies and runs offline, in `scripts/ci`. The one paper test, a limit order placed and canceled, has not
+run, so the client is UNVERIFIED against Alpaca. Its limits are in the package README.
+
 ## Evidence
 
 Read 2026-11-09 (fetched; fetches are model-summarised. Pins resolved by `scripts/canon`).
@@ -179,3 +190,9 @@ For the adapter's first slice, read 2026-11-09. These are raw markdown or source
 * alpaca-py 0.45.0 as installed: `common/rest.py` (credentials from arguments only),
   `data/live/websocket.py` (`run`, `stop`, `_subscribe`), `data/models/bars.py` (bar timestamp is the
   open).
+
+For the execution slice, read 2026-11-10:
+
+* `packages/canon-alpaca/src/canon_alpaca/execution.py` at `12f19a0` — the config's refusals, and
+  `TradingClient` and `TradingStream` built with `paper=True` and no other argument but the key pair
+  (read). `uv run --locked pytest`: 175 passed, 2 skipped, both paper tests (run).

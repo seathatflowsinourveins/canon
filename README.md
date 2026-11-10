@@ -119,7 +119,7 @@ runs.
 | `docs/adr/` | Twenty-two decisions in MADR 4.0.0, each with Evidence and `review-by` |
 | `pyproject.toml`, `uv.lock` | uv workspace root; one lockfile for every package |
 | `src/canon_trading/` | Strategies and node configuration |
-| `packages/canon-alpaca/` | The Alpaca adapter for NautilusTrader: a market-data client, no execution client yet |
+| `packages/canon-alpaca/` | The Alpaca adapter for NautilusTrader: a market-data client and a paper-only execution client |
 | `tests/`, `packages/*/tests/` | Tests beside each package's `src/` |
 | `catalog/` | Local market data; ignored by git |
 | `.claude/settings.json` | Permissions and hooks for this repo |
@@ -143,10 +143,12 @@ here, community convergence, then anyone's recollection.
 
 ## What is not here yet
 
-* **No execution.** NautilusTrader has no official Alpaca adapter; ADR 0009 decides to build one to
-  upstream's guide. The adapter's data client exists (US equities, historical bars, streamed quotes and
-  trades, from Alpaca's paper data), with offline tests; its paper integration test has not run yet, and
-  there is no execution client. See `packages/canon-alpaca/README.md`.
+* **Nothing proven against Alpaca.** NautilusTrader has no official Alpaca adapter; ADR 0009 decides to
+  build one to upstream's guide. The adapter has a data client (US equities, historical bars, streamed
+  quotes and trades, from Alpaca's paper data) and a first, paper-only execution client (market and limit
+  orders, cancels, fills from trade updates). Both pass their offline tests; neither of the two paper
+  tests has run yet, and modify, cancel-all, stop orders and fill history at start-up are not written.
+  See `packages/canon-alpaca/README.md`.
 * **No market data in `catalog/`.** The first backtest runs on bars generated in its test. Nothing here
   writes Alpaca's bars to the catalog yet.
 * **No accepted method for comparing strategy variants** (ADR 0010 is `proposed`).

@@ -51,5 +51,5 @@ https://docs.alpaca.markets/us/reference/get-v2-assets-1.md). For US equity orde
 2 decimals at or above $1.00 and 4 decimals below (https://docs.alpaca.markets/us/docs/orders-at-alpaca.md,
 "Sub-penny increments"). NautilusTrader's `Equity` takes one increment, and its precision must equal
 `price_precision`, so this slice uses the finer one: market data is never rounded, but the instrument does
-not by itself stop a sub-penny order price at or above $1.00. The execution slice must enforce that rule.
+not by itself stop a sub-penny order price at or above $1.00. The execution client denies such an order.
 """

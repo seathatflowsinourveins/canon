@@ -24,7 +24,7 @@ Where this differs from upstream's example, and why:
   opened it, while `close_all_positions` closes only this strategy's. With a second strategy in the
   same instrument the example's logic never entered while the other was long, and its exit closed
   nothing (observed at v2.0.0rc8, 2026-11-10). A position the account already held on a venue would be
-  expected to do the same (UNVERIFIED: there is no execution client to try it with).
+  expected to do the same (UNVERIFIED: not tried with the adapter's execution client).
 * `trade_size` is a `Quantity` and goes to the order factory unchanged. `Instrument.make_qty` rounds to
   the instrument's size precision without saying so (observed at v2.0.0rc8: `make_qty(Decimal("1.5"))`
   on an `Equity` gives 2), and `Equity` is whole-share only (concepts/instruments/equity). A size finer
