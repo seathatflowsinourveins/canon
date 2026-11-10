@@ -15,18 +15,23 @@ credentials.
 """
 
 import asyncio
+import socket
 import threading
+import time
 from collections.abc import Awaitable
 from collections.abc import Callable
 from datetime import UTC
 from datetime import datetime
 from decimal import Decimal
 from types import SimpleNamespace
+from typing import cast
 
 import canon_alpaca.data
 import canon_alpaca.execution
 import canon_alpaca.providers
 import pytest
+import requests
+from alpaca.common.rest import RESTClient
 from alpaca.trading.enums import OrderSide as AlpacaOrderSide
 from alpaca.trading.enums import QueryOrderStatus
 from alpaca.trading.enums import TimeInForce as AlpacaTimeInForce
@@ -42,6 +47,7 @@ from canon_alpaca.execution import AlpacaExecutionClient
 from canon_alpaca.execution import AlpacaExecutionClientConfig
 from canon_alpaca.factories import AlpacaDataClientFactory
 from canon_alpaca.factories import AlpacaExecutionClientFactory
+from canon_alpaca.providers import with_http_timeout
 from nautilus_trader.common import Environment
 from nautilus_trader.common import Logger
 from nautilus_trader.common import logging_sync_to_disk
@@ -558,6 +564,191 @@ def test_submit_without_an_answer_stays_submitted(venue, capfd) -> None:
     assert "stays SUBMITTED until a trade update or reconciliation resolves it" in logged(capfd)
 
 
+def test_submit_whose_connection_timed_out_on_its_only_attempt_is_rejected(venue) -> None:
+    # A connect timeout proves the request was not sent (ADR 0039), so the submit is proven unsuccessful.
+    venue.trading.submit_error = requests.ConnectTimeout("connect timed out")
+    strategy = trader(order_type="limit")
+
+    run(build_node(strategy))
+
+    assert strategy.names() == ["OrderSubmitted", "OrderRejected"]
+    assert strategy.events[-1].reason.startswith(
+        "not sent: Alpaca's API did not accept the connection"
+    )
+
+
+@pytest.mark.parametrize(
+    ("error", "sends"),
+    [
+        (requests.ReadTimeout("read timed out"), 1),  # sent; the answer did not come
+        (
+            requests.ConnectTimeout("connect timed out"),
+            2,
+        ),  # a repeat of a 504, which may have arrived
+    ],
+)
+def test_submit_that_may_have_reached_alpaca_stays_submitted(venue, capfd, error, sends) -> None:
+    venue.trading.submit_error = error
+    venue.trading.sends_per_call = sends
+    strategy = trader(order_type="limit")
+
+    async def body(client) -> None:
+        async with asyncio.timeout(10):
+            while not venue.trading.submitted:
+                await asyncio.sleep(0.01)
+        await until_idle(client, venue)
+
+    run_with_client(body, strategy)
+
+    assert strategy.names() == ["OrderSubmitted"]
+    assert "stays SUBMITTED until a trade update or reconciliation resolves it" in logged(capfd)
+
+
+def test_cancel_whose_connection_timed_out_is_a_cancel_rejection(venue) -> None:
+    venue.trading.script = "accept"
+    venue.trading.cancel_error = requests.ConnectTimeout("connect timed out")
+    strategy = trader(order_type="limit", cancel_on="OrderAccepted")
+    FINAL_EVENTS.add("OrderCancelRejected")
+    try:
+        run(build_node(strategy))
+    finally:
+        FINAL_EVENTS.discard("OrderCancelRejected")
+
+    assert strategy.names()[-1] == "OrderCancelRejected"
+    assert strategy.events[-1].reason.startswith(
+        "not sent: Alpaca's API did not accept the connection"
+    )
+
+
+def test_cancel_whose_lookup_connection_timed_out_is_a_cancel_rejection(venue) -> None:
+    # The order has no venue ID yet, so the cancel first looks it up; that lookup's connection times out,
+    # so neither the lookup nor the cancel reached Alpaca.
+    venue.trading.script = "silent"
+    venue.trading.lookup_error = requests.ConnectTimeout("connect timed out")
+    strategy = trader(order_type="limit", cancel_on="OrderSubmitted")
+    FINAL_EVENTS.add("OrderCancelRejected")
+    try:
+        run(build_node(strategy))
+    finally:
+        FINAL_EVENTS.discard("OrderCancelRejected")
+
+    assert strategy.names()[-1] == "OrderCancelRejected"
+    assert strategy.events[-1].reason.startswith(
+        "not sent: Alpaca's API did not accept the connection"
+    )
+    assert venue.trading.cancels == []
+
+
+def test_cancel_whose_answer_timed_out_leaves_the_order(venue, capfd) -> None:
+    venue.trading.script = "accept"
+    venue.trading.cancel_error = requests.ReadTimeout("read timed out")
+    strategy = trader(order_type="limit", cancel_on="OrderAccepted")
+
+    async def body(client) -> None:
+        async with asyncio.timeout(10):
+            while not venue.trading.cancels:
+                await asyncio.sleep(0.01)
+        await until_idle(client, venue)
+
+    run_with_client(body, strategy)
+
+    assert "OrderCancelRejected" not in strategy.names()
+    assert "got no answer" in logged(capfd)
+
+
+class SilentServer:
+    """A local HTTP server that accepts each connection and, for `/hang`, never answers."""
+
+    def __init__(self) -> None:
+        self.socket = socket.create_server(("127.0.0.1", 0))
+        self.socket.settimeout(0.1)  # so the accept loop sees `stopped`
+        self.port = self.socket.getsockname()[1]
+        self.stopped = threading.Event()
+        self.held: list[socket.socket] = []
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+        self.thread.start()
+
+    def _serve(self) -> None:
+        while not self.stopped.is_set():
+            try:
+                connection, _ = self.socket.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            connection.settimeout(None)
+            request = b""
+            while b"\r\n\r\n" not in request:  # the request line and headers, however they arrive
+                chunk = connection.recv(65536)
+                if not chunk:
+                    break
+                request += chunk
+            if b"/hang " in request:
+                self.held.append(connection)  # read, never answered
+                continue
+            connection.sendall(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n"
+                b"Connection: close\r\n\r\n{}"
+            )
+            connection.close()
+
+    def close(self) -> None:
+        self.stopped.set()
+        self.thread.join(5)
+        self.socket.close()
+        for connection in self.held:
+            connection.close()
+
+
+def test_a_request_alpaca_never_answers_ends_at_the_read_timeout_and_the_run_ends(
+    venue, monkeypatch
+) -> None:
+    # On paper a node stopped while a call hung failed to disconnect and its run never ended: alpaca-py
+    # sets no HTTP timeout. Here alpaca-py's own REST client, given the adapter's timeout (ADR 0039), asks
+    # a local server that never answers; the call ends at the read timeout, the next call is answered,
+    # and the node's run ends at once.
+    monkeypatch.setattr(canon_alpaca.providers, "CONNECT_TIMEOUT_SECS", 0.5)
+    monkeypatch.setattr(canon_alpaca.providers, "READ_TIMEOUT_SECS", 0.5)
+    server = SilentServer()
+    rest = with_http_timeout(
+        RESTClient(
+            base_url=f"http://127.0.0.1:{server.port}",
+            api_version="v2",
+            api_key=PLACEHOLDER,
+            secret_key=PLACEHOLDER,
+        )
+    )
+    outcomes: list[object] = []
+
+    async def body(client: AlpacaExecutionClient) -> None:
+        started = time.monotonic()
+        try:
+            await client._call(rest.get, "/hang")
+        except requests.ReadTimeout as e:
+            outcomes.append((type(e).__name__, time.monotonic() - started))
+        outcomes.append(await client._call(rest.get, "/ok"))
+
+    started = time.monotonic()
+    try:
+        run_with_client(body)
+        elapsed = time.monotonic() - started
+    finally:
+        server.close()
+
+    assert len(outcomes) == 2, outcomes
+    timed_out, waited = cast("tuple[str, float]", outcomes[0])
+    answer = outcomes[1]
+    assert timed_out == "ReadTimeout"
+    assert waited < 5
+    assert answer == {}
+    assert elapsed < 20, f"the node's run took {elapsed:.1f} s"  # it never ended before the timeout
+
+
+def test_a_client_without_a_requests_session_is_refused() -> None:
+    with pytest.raises(TypeError, match="refusing to run without an HTTP timeout"):
+        with_http_timeout(SimpleNamespace())
+
+
 def test_fill_without_an_execution_id_is_logged_not_applied(venue, capfd) -> None:
     venue.trading.execution_ids = False
     strategy = trader()
@@ -1000,6 +1191,28 @@ def test_modify_alpaca_refuses_is_modify_rejected(venue, alpaca) -> None:
     assert strategy.names()[-2:] == ["OrderPendingUpdate", "OrderModifyRejected"]
     reason = strategy.last("OrderModifyRejected").reason
     assert reason == "Alpaca refused the replace (422): order is not replaceable"
+
+
+def test_modify_whose_connection_timed_out_is_modify_rejected(venue) -> None:
+    venue.trading.script = "accept"
+    venue.trading.replace_error = requests.ConnectTimeout("connect timed out")
+    strategy = modifier()
+
+    run_modify(venue, strategy, lambda: "OrderModifyRejected" in strategy.names())
+
+    assert strategy.names()[-2:] == ["OrderPendingUpdate", "OrderModifyRejected"]
+    reason = strategy.last("OrderModifyRejected").reason
+    assert reason.startswith("not sent: Alpaca's API did not accept the connection")
+
+
+def test_modify_whose_answer_timed_out_is_not_rejected(venue) -> None:
+    venue.trading.script = "accept"
+    venue.trading.replace_error = requests.ReadTimeout("read timed out")
+    strategy = modifier()
+
+    run_modify(venue, strategy, lambda: bool(venue.trading.replace_requests))
+
+    assert "OrderModifyRejected" not in strategy.names()
 
 
 def test_refused_repeat_of_a_replace_alpaca_took_is_not_a_rejection(venue, alpaca, capfd) -> None:
