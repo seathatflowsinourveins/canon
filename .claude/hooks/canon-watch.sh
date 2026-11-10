@@ -53,7 +53,8 @@ else
   errors=$(jq -c '. + ["canon outdated could not read every upstream"]' <<<"$errors")
 fi
 
-# A gh that cannot answer is recorded as an error, never as "none open".
+# A gh that cannot answer is recorded as null, never as "none open". It does not mark the whole watch
+# as failed: the upstream comparison above succeeded and need not be repeated every hour.
 bot_prs='[]'
 if git -C "$root" remote get-url origin >/dev/null 2>&1; then
   mise_bin=$(command -v mise 2>/dev/null) || mise_bin="$HOME/.local/bin/mise"
@@ -62,7 +63,7 @@ if git -C "$root" remote get-url origin >/dev/null 2>&1; then
      && jq -e 'type == "array"' >/dev/null 2>&1 <<<"$prs"; then
     bot_prs=$(jq -c '[.[] | {number, title}]' <<<"$prs")
   else
-    errors=$(jq -c '. + ["the dependency bot'"'"'s pull requests could not be listed"]' <<<"$errors")
+    bot_prs=null      # not asked, which is different from none open; the brief and the status row say so
   fi
 fi
 

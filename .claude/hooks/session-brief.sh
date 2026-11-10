@@ -49,6 +49,7 @@ if [ -f "$watch" ]; then
               + (if .status == "STABLE-AVAILABLE" then " (stable now available)" else "" end)) | join("; "))
        else "" end)
     + (if ((.retagged | length) + (.newer | length)) > 0 then ". Use the landscape-refresh skill before moving any pin." else "." end)
+    + (if has("bot_prs") and .bot_prs == null then " The dependency bot'"'"'s pull requests could not be listed (is gh signed in?)." else "" end)
     + (if ((.bot_prs // []) | length) > 0
        then " Dependency pull requests open: " + (.bot_prs | map("#" + (.number | tostring)) | join(", ")) + ". Land them (AGENTS.md, Landing)."
        else "" end)

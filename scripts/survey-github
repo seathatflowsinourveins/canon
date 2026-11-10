@@ -23,7 +23,9 @@
 #   scripts/survey-github run <sample.json> <out.json>   sample: [{"repo": "owner/name", "group": "..."}]
 #   scripts/survey-github report <data.json>             print the convergence tables as markdown
 #   scripts/survey-github selftest                       check the summary arithmetic on fixed input
-# A repository that cannot be read is recorded with an error, never dropped.
+# A repository that cannot be read is recorded with an error, never dropped, and the command then exits
+# 2. If fewer than four in five can be read, the output file is left as it was, the rows go to
+# <out.json>.partial and the command exits 1.
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 if command -v mise >/dev/null 2>&1; then MISE=$(command -v mise); else MISE="$HOME/.local/bin/mise"; fi
@@ -322,7 +324,12 @@ survey_one() {
     # Which events start the workflows that run a coding agent.
     agent_triggers=$(for af in "$d"/wf/*; do
         grep -qE 'anthropics/claude-code(-base)?-action|openai/codex-action|google-github-actions/run-gemini-cli|google-gemini/gemini-cli-action|github(next)?/gh-aw|claude (-p|--print)|codex exec|gemini (-p|--prompt)|opencode (run|github)' "$af" 2>/dev/null || continue
-        grep -oE '^[[:space:]]*(pull_request_target|pull_request|issue_comment|issues|schedule|workflow_run|workflow_dispatch|pull_request_review|push)[:[:space:]]*$' "$af" | tr -d ' :'
+        # events as keys on their own lines, and events written inline after `on:`; once per file
+        { grep -oE '^[[:space:]]*(pull_request_target|pull_request_review_comment|pull_request_review|pull_request|issue_comment|issues|schedule|workflow_run|workflow_dispatch|push)[:[:space:]]*$' "$af" | tr -d ' :\t\r'
+          grep -E '^["'"'"']?on["'"'"']?:[[:space:]]*[^[:space:]#]' "$af" \
+            | grep -oE '(pull_request_target|pull_request_review_comment|pull_request_review|pull_request|issue_comment|issues|schedule|workflow_run|workflow_dispatch|push)([^A-Za-z_]|$)' \
+            | sed -E 's/[^A-Za-z_]+$//'
+        } | sort -u
       done | sort | uniq -c | awk '{printf "%s{\"event\":\"%s\",\"files\":%s}", (NR>1?",":""), $2, $1} END {print ""}' | sed 's/^/[/; s/$/]/')
     jq -e . >/dev/null 2>&1 <<<"$agent_triggers" || agent_triggers='[]'
   fi
@@ -416,9 +423,23 @@ do_run() {
     jq -e . >/dev/null 2>&1 <<<"$row" || row=$(fail_row "$repo" "$group" "survey failed")
     jq --argjson row "$row" '. + [$row]' "$TMP/out.json" > "$TMP/out.n" && mv "$TMP/out.n" "$TMP/out.json"
   done < <(jq -r '.[] | [.repo, .group] | @tsv' "$sample")
+  local read_ok
+  read_ok=$(jq '[.[] | select(.error == null)] | length' "$TMP/out.json")
+  if [ $((read_ok * 5)) -lt $((total * 4)) ]; then
+    # Fewer than four in five: a network or rate-limit failure, not a few renamed repositories. Keep what
+    # was there; the partial result goes beside it for whoever wants to see which ones failed.
+    jq --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{surveyed_at: $at, repos: .}' "$TMP/out.json" > "$out.partial"
+    rm -rf "$TMP"
+    echo "survey-github: only $read_ok of $total repositories could be read; $out is unchanged and the partial result is in $out.partial" >&2
+    exit 1
+  fi
   jq --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{surveyed_at: $at, repos: .}' "$TMP/out.json" > "$out"
-  echo "survey-github: wrote $out ($(jq '[.repos[] | select(.error == null)] | length' "$out") of $total read)" >&2
-  rm -rf "$TMP"
+  rm -rf "$TMP"; rm -f "$out.partial"
+  if [ "$read_ok" -lt "$total" ]; then
+    echo "survey-github: wrote $out, but $((total - read_ok)) of $total repositories could not be read; the report lists them under 'Not read'" >&2
+    exit 2
+  fi
+  echo "survey-github: wrote $out ($read_ok of $total read)" >&2
 }
 
 do_report() { jq -r "$REPORT_JQ" "${1:?usage: scripts/survey-github report <data.json>}"; }

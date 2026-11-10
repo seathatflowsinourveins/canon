@@ -31,8 +31,12 @@ jobs:
       - name: Pins against live upstream
         run: |
           set +e
-          scripts/canon check > check.txt 2>&1
-          rc=$?
+          for attempt in 1 2; do
+            scripts/canon check > check.txt 2>&1
+            rc=$?
+            if [ "$rc" -ne 1 ] || [ "$attempt" -eq 2 ]; then break; fi
+            sleep 60   # an upstream could not be read; try once more before failing the run
+          done
           { echo '### scripts/canon check'; echo '```'; cat check.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           cat check.txt
           exit "$rc"
