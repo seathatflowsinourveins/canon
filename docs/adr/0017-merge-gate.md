@@ -57,7 +57,8 @@ Rules:
 3. **The reviewer does not share the author's context.** Both reviewers start fresh. Effort follows
    ADR 0005. For a substantial change the owner may start `/code-review ultra`, which is billed.
 4. **One model family, for now.** A second vendor's reviewer needs a stored key, and no source measures
-   what it adds. `watch`.
+   what it adds. `watch`. Superseded by ADR 0043: a Codex worker reads named changes as an additional
+   reader that never blocks.
 5. **No agent in a workflow, for now.** The repositories that run one keep it advisory, limit who can
    start it and do most writing in a separate job. Here `scripts/land` merges as soon as the required
    checks pass, so a hosted review would report after the merge unless the gate waited for it, which
@@ -77,7 +78,7 @@ Rule 2's list of what needs a review and option 2's "where a defect costs most" 
 
 * Good: the gate stays about a minute, and review happens where it can still change the code.
 * Bad: the `review` note is the lander's own statement, like `signoff`. It shows that a review was
-  claimed, not what it read, and its depth is the author's choice. One model family reads its own work.
+  claimed, not what it read, and its depth is the author's choice. One model family reads its own work (ADR 0043 since adds a second).
   GitHub switches a schedule off after 60 days without activity in a public repository;
   `scripts/automation status` shows the hosted watch's last run so that is noticed.
 
@@ -127,3 +128,6 @@ Read 2026-11-10. "Lane" means a research subagent fetched the page and a model s
   review gate, that the two statuses were posted in an unsafe order, and that rule 5 and the "three
   readings" row said more than their sources. All are fixed above and in `scripts/land`.
 * Restated 2026-11-10 against `scripts/test-land` and a run of it: Confirmation.
+* ADR 0043, 2026-11-10 — supersedes rule 4: the second family's reviewer runs on the owner's own sign-in,
+  which Codex keeps in its own home or the OS credential store, not a key stored in this repository or a workflow; ADR 0043 states
+  that an unsandboxed worker can reach it. A pointer line was added to rule 4.

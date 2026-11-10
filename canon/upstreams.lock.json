@@ -135,6 +135,15 @@
       "sha": "ea686bae367e20a4092b2fd4327ffd299bb60f24",
       "track": "default"
     },
+    "codex-cli": {
+      "default_branch": "main",
+      "default_sha": "c9bbed2dae6aa1d3a0057001dec64d08e7882a9f",
+      "ref": "refs/tags/rust-v0.167.0",
+      "repo": "openai/codex",
+      "resolved_at": "2026-11-10T21:08:02Z",
+      "sha": "086ccc833bc9cf01024ad2dd6af7dbd421b6bf9a",
+      "track": "tag:rust-v0.167.0"
+    },
     "dependabot": {
       "default_branch": "main",
       "default_sha": "de277ef139da42a7953b888c70c69e4c625caf35",
