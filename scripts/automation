@@ -161,6 +161,20 @@ do_status() {
     row "dependency bot" OFF "config present, but Dependabot needs a GitHub remote"
   else row "dependency bot" OFF ".github/dependabot.yml is missing (ADR 0016)"; bad=1; fi
 
+  # GitHub switches a schedule off after 60 days without activity in a public repository.
+  if [ -f "$ROOT/.github/workflows/watch.yml" ] && [ -n "$origin" ]; then
+    # shellcheck disable=SC2016  # jq program, not shell
+    v=$( (cd "$ROOT" && "$mise_bin" exec -- gh run list --workflow watch.yml --limit 1 --json conclusion,createdAt \
+            --jq '.[0] | if . == null then "UNKNOWN\tno run yet; start one with: gh workflow run watch.yml"
+                         else (((now - (.createdAt | fromdateiso8601)) / 86400) | floor) as $d
+                              | if $d > 2 then "STALE\tlast run " + ($d | tostring) + " days ago; the schedule may be off: gh workflow enable watch.yml"
+                                elif .conclusion == "success" or .conclusion == null then "ok\tlast run " + .createdAt + ": " + (.conclusion // "running")
+                                else "FAILED\tlast run " + .createdAt + ": " + .conclusion + "; see: gh run list --workflow watch.yml" end end') 2>/dev/null)
+    [ -n "$v" ] || v=$(printf 'UNKNOWN\tthe last run could not be read from GitHub')
+    row "hosted watch" "${v%%$'\t'*}" "${v#*$'\t'}"
+    case "$v" in STALE*|FAILED*) bad=1 ;; esac
+  fi
+
   if [ -f "$CANON_HOME/watch/alerts.jsonl" ]; then
     note "Recent alerts:"; tail -3 "$CANON_HOME/watch/alerts.jsonl" | jq -r '"  " + .at + "  " + .lane + ": " + .flag' 2>/dev/null
   fi

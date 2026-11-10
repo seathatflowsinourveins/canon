@@ -35,6 +35,7 @@ Chosen: **option 3**.
 | Commit gate | Every `git commit` | `.githooks/pre-commit` through `core.hooksPath` | None | Aborts the commit |
 | Hosted CI | Every pull request and push to `main` | GitHub Actions running `scripts/ci` (ADR 0014) | None | A required check |
 | Edit lint | Every edit under `canon/`, `docs/adr/` | `PostToolUse` hook (ADR 0003) | None | Feedback to Claude |
+| Hosted watch | Once a day, on GitHub | Scheduled workflow; `canon check` + `canon outdated` (ADR 0017) | None | The run's summary; a failed run if a tag was re-pointed |
 | Landscape watch | Once a day, at session start | Async `SessionStart` hook; `canon check` + `canon outdated` | None | `.canon/watch.json`, printed at the next session start |
 | Lane watchdog | Every 10 minutes, Mac awake | launchd user agent running `lanes --json` | None | macOS notification, `alerts.jsonl`, status file |
 | Weekly refresh | Mondays 09:09, desktop app open | Scheduled task `canon-landscape-refresh` running the `landscape-refresh` skill | One session | A report |

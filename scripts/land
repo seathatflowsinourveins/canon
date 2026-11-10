@@ -11,8 +11,10 @@
 # Either way nothing lands unless scripts/ci passes on exactly what is committed, on a branch that
 # contains the current main.
 #
-# Usage: scripts/land [--body <file>] [--dry-run] [--pr <number>]
+# Usage: scripts/land [--body <file>] [--reviewed <note>] [--dry-run] [--pr <number>]
 #   --body <file>   pull request description (Summary / Test Plan / Evidence); default: the commit message
+#   --reviewed <note>  which independent review ran on this change and what came of it (ADR 0017). Needed
+#                   when the change touches code, a harness script, a workflow, or adds a decision record
 #   --dry-run       run the checks and say what would happen; change nothing on GitHub or on main
 #   --pr <number>   land a pull request someone else opened, such as the dependency bot's (ADR 0016):
 #                   check it out in its own worktree, merge main into it if it is behind, then land it
@@ -24,13 +26,17 @@ ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "land: not inside a 
 cd "$ROOT" || exit 1
 die()  { echo "land: $*" >&2; exit 1; }
 note() { echo "land: $*"; }
-USAGE="usage: scripts/land [--body <file>] [--dry-run] [--pr <number>]"
+USAGE="usage: scripts/land [--body <file>] [--reviewed <note>] [--dry-run] [--pr <number>]"
 
-BODY=""; DRY=0; PR=""
+BODY=""; DRY=0; PR=""; REVIEWED=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --body)    BODY="${2:-}"; [ $# -ge 2 ] || die "$USAGE"; shift 2 ;;
     --pr)      PR="${2:-}";   [ $# -ge 2 ] || die "$USAGE"; shift 2 ;;
+    --reviewed) [ $# -ge 2 ] || die "$USAGE"; REVIEWED="$2"
+                case "$REVIEWED" in --*) die "--reviewed needs a note, not another option" ;; esac
+                [ -n "${REVIEWED//[[:space:]]/}" ] || die "--reviewed needs a note: what ran and what came of it"
+                shift 2 ;;
     --dry-run) DRY=1; shift ;;
     *) die "$USAGE" ;;
   esac
@@ -80,6 +86,7 @@ if [ -n "$PR" ]; then
     fi
     args=()
     [ -z "$BODY" ] || args+=(--body "$BODY")
+    [ -z "$REVIEWED" ] || args+=(--reviewed "$REVIEWED")
     [ "$DRY" -eq 0 ] || args+=(--dry-run)
     "$SELF" ${args[@]+"${args[@]}"}
   ); rc=$?
@@ -104,6 +111,20 @@ ahead=$(git rev-list --count "$base..$branch")
 [ "$ahead" -gt 0 ] || die "$branch has nothing that main lacks"
 git merge-base --is-ancestor "$base" "$branch" \
   || die "$branch does not contain the current main; rebase it onto main first (for a pull request someone else opened, use --pr)"
+
+# The checks below decide whether a change may merge. A model's review does not; what the gate asks is
+# that an independent review has run where a defect costs most, before the push (ADR 0017). The note is
+# the lander's own statement, recorded on the commit as the `review` status.
+# The list covers code, harness scripts, workflows, and the files that wire or define the guard and the
+# reviewers themselves. Renames are listed as a delete plus an add, and names are printed unquoted, so
+# moving a file out of a reviewed path or naming it oddly does not slip past.
+REVIEW_PATHS='^(src/|packages/|scripts/|home/|\.claude/hooks/|\.claude/agents/|\.claude/settings\.json$|\.githooks/|\.github/workflows/)'
+changed() { git -c core.quotePath=false diff --name-only --no-renames "$@" "$base...$branch"; }
+touched=$(changed | grep -E "$REVIEW_PATHS" | head -4 | tr '\n' ' ' || true)
+new_adr=$(changed --diff-filter=A | grep -E '^docs/adr/[0-9]{4}-' | tr '\n' ' ' || true)
+if [ -n "$touched$new_adr" ] && [ -z "$REVIEWED" ]; then
+  die "this change touches ${touched}${new_adr}and needs an independent review first: /code-review for code, the evidence-verifier for a decision record. Resolve what it finds, then land with --reviewed \"<what ran and what came of it>\""
+fi
 
 # A public repository shows every commit's author and committer address, so only GitHub's noreply
 # addresses are pushed (ADR 0014).
@@ -134,6 +155,14 @@ if ! gh pr view "$branch" --json url >/dev/null 2>&1; then
   else gh pr create --base main --head "$branch" --fill >/dev/null; fi || die "could not open the pull request"
 fi
 url=$(gh pr view "$branch" --json url --jq .url)
+
+# Record the review first: `signoff` is the status the ruleset waits for, so nothing can merge before the
+# note is on the commit. A status description holds 140 characters; the note is cut to that as plain ASCII.
+if [ -n "$touched$new_adr" ]; then review_note="$REVIEWED"
+else review_note="${REVIEWED:-not needed: no code, harness script, workflow or new decision record}"; fi
+review_note=$(printf '%s' "$review_note" | LC_ALL=C tr -cd '\11\40-\176' | cut -c1-140)
+gh api -X POST "repos/{owner}/{repo}/statuses/$sha" -f state=success -f context=review \
+   -f description="$review_note" >/dev/null || die "could not record the review on $url"
 
 # Local sign-off. scripts/ci has just passed on exactly this commit, so record that on GitHub as the
 # `signoff` commit status, which the ruleset on main requires. A status belongs to one commit, so a later

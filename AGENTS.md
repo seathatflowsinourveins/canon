@@ -63,7 +63,7 @@ dependency, pattern and practice traces to a pinned upstream or a dated source. 
 | `home/` | Machine-level Claude Code config installed to `~/.claude/` by the bootstrap |
 | `scripts/` | `canon`, `ci`, `land`, `test-hooks`, `lanes`, `automation`, `bootstrap`, `survey-github` |
 | `.githooks/` | The pre-commit gate |
-| `.github/` | The pull request template, the Dependabot config and the CI workflow |
+| `.github/` | The pull request template, the Dependabot config, the CI workflow and the daily watch |
 
 ## Decisions
 
@@ -85,13 +85,15 @@ dependency, pattern and practice traces to a pinned upstream or a dated source. 
 | 0014 | Landing workflow: a branch, one check, a squash merge, no manual merge step |
 | 0015 | GitHub practice: what a measured sample converges on, and where this repo differs |
 | 0016 | Dependency updates: Dependabot proposes, a session lands |
+| 0017 | Merge gate: checks decide, an independent review comes first, a model never blocks |
 
 ## Automation
 
 These run without being asked (ADR 0011, ADR 0013). Every commit runs `scripts/ci` through
 `.githooks/pre-commit`. Every edit to a Python file runs ruff on it, and every edit under `canon/` or
 `docs/adr/` runs the canon lint. Once a day a session-start hook compares the canon with upstream and the
-next session start prints the result. A background watchdog raises a macOS notification when a session
+next session start prints the result; a scheduled workflow does the same comparison on GitHub every day.
+A background watchdog raises a macOS notification when a session
 stalls or fails repeatedly. On Mondays a scheduled session runs the `landscape-refresh` skill. Dependabot
 opens at most two grouped pull requests a week, for the indirect packages in `uv.lock` and for the
 workflow's actions; the session brief lists the open ones (ADR 0016).
@@ -111,7 +113,11 @@ The owner's standing instruction (2026-11-09): work lands automatically once its
 2. Commit, then run `scripts/land`. It runs `scripts/ci` on what is committed and lands the branch: on
    GitHub, a pull request that it signs off, waits for the hosted checks on and squash-merges; with no
    remote, a fast-forward of `main`. The same checks run on this machine and on GitHub's runners (ADR 0014).
-3. For a change under `src/` or `packages/`, run `/code-review` first and resolve what it finds.
+3. Before landing code (`src/`, `packages/`), a harness script, a workflow or a new decision record, have
+   an independent reviewer read it and resolve what it finds: `/code-review` for code, the
+   `evidence-verifier` for a record. Then land with `--reviewed "<what ran and what came of it>"`;
+   `scripts/land` refuses such a change without it and records the note on the commit as the `review`
+   status (ADR 0017). Other changes need no review.
 4. Pull request text has `Summary`, `Test Plan` and `Evidence`, written for a later reader: no conversation
    history, discarded attempts or tool usage. Titles are a plain sentence, with no `feat:` style prefix.
 5. This covers work a session of the owner's produced. It does not cover creating a remote, changing a
@@ -120,7 +126,7 @@ The owner's standing instruction (2026-11-09): work lands automatically once its
    them with `scripts/land --pr <n>`, which checks the pull request out in its own worktree and merges
    `main` into it if it is behind. A change to `uv.lock` alone lands on passing checks. One that moves a
    workflow action fails the canon lint until its registry entry moves on the same branch, through
-   `adopt-upstream`.
+   `adopt-upstream`, and then lands with a `--reviewed` note like any other workflow change.
 
 ## Reporting
 

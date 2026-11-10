@@ -47,6 +47,7 @@ It uses no `sudo` and overwrites nothing in `~/.claude`.
 | Hosted CI (`scripts/ci` on GitHub) | Every pull request and push to `main` | No |
 | Edit checks (canon lint, ruff) | Every matching edit by an agent | No |
 | Guard | Before every tool call by an agent | No |
+| Hosted watch (`canon check` on GitHub) | Once a day | No |
 | Landscape watch | Once a day, at session start | No |
 | Lane watchdog | Every 10 minutes while the Mac is awake | No |
 | Weekly refresh | Weekly, when the desktop app is open | One session, short when nothing changed |

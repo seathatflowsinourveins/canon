@@ -37,7 +37,7 @@ Converged, and in place here: a protected default branch (26/29, 19 through rule
 (22/29), commits arriving through pull requests (20/29), squash merge allowed (28/29, the only method at
 16), head branch deleted on merge (27/29), auto-merge switched on (20/29), actions pinned by commit SHA
 (21/28) and `cancel-in-progress` (20/28). Split, and in place here: token `permissions:` (18/28), a pull
-request template (17/29; `Summary` in 7, `Test Plan` in 4), AGENTS.md (14/29), a workflow linter (12/28) and
+request template (17/29; `Summary` in 7, `Test Plan` in 4), AGENTS.md (14/29), a workflow linter (14/28) and
 one aggregating job (11/28; written here, though `signoff` is the required check). Split, and absent
 here: CODEOWNERS (13/29), because there is one owner.
 
@@ -114,6 +114,8 @@ Read 2026-11-09. "Lane" means a research subagent fetched the page and a model s
 * https://github.blog/changelog/2026-10-28-github-actions-workflow-lockfiles-are-generally-available/ —
   `.github/workflows/actions.lock`; and …/2026-10-06-stacked-pull-requests-generally-available/ (fetched; lane).
 * Restated 2026-11-10, when hosted CI was switched on: the first two table rows and rules 1 to 3.
+  Re-measured the same day: the workflow-linter count was 12 through a counting error in the script; it
+  is 14. Every other count held.
 * https://code.claude.com/docs/en/github-actions.md — "review Claude's changes before merging"; the action
   "runs on GitHub-hosted runners" and bills Actions minutes plus tokens. No Claude Code page recommends a
   title convention, a description template or a merge method (fetched; lane).
