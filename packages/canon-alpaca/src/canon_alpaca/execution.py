@@ -3,13 +3,30 @@
 Contract: `nautilus_trader.live.clients.ExecutionClient`, NautilusTrader v2.0.0rc8 (Python adapter guide,
 "Execution client hooks", https://nautilustrader.io/docs/md/latest/developer_guide/python_adapters.md). The
 client is constructed with the factory's name, config, cache, clock and trader ID and with a venue, account
-ID, account type and OMS type. It overrides `_submit_order`, `_cancel_order`, `_cancel_all_orders` and the
-four reconciliation hooks, emits account, order and fill events through the base class's `generate_*`
+ID, account type and OMS type. It overrides `_submit_order`, `_modify_order`, `_cancel_order`,
+`_cancel_all_orders` and the four reconciliation hooks, emits account, order and fill events through the
+base class's `generate_*`
 methods, and leaves `_batch_cancel_orders` to its default, "ordered calls of the corresponding
 single-order hook" (Alpaca has no endpoint that cancels a list of orders by ID), and `_generate_mass_status`
-to the native composition of the bulk report hooks. Nothing is started in the
-constructor; the alpaca-py clients are made in `_connect` and the stream thread is joined in `_disconnect`.
-Hooks not overridden here raise `NotImplementedError` from the base class.
+to the native composition of the bulk report hooks. Nothing is started in the constructor; the alpaca-py
+clients and the task that applies trade updates in order are made in `_connect`, and the stream thread is
+joined and the task ended in `_disconnect`. Hooks not overridden here raise `NotImplementedError`.
+
+Modify (ADR 0036) rests on Alpaca's "Replace Order by ID"
+(https://docs.alpaca.markets/us/reference/patchorderbyorderid-1.md) and on a paper observation of
+2026-11-10, 3 of 3 runs, for what that page does not state. The PATCH answer is "The new Order object with
+the new order ID", but a success "does NOT guarantee the existing open order has been replaced", so
+`OrderUpdated` is generated only on the stream's `replaced` for the node's order, which carries the old
+order with `replaced_by` (observed), with the replacement's values from the answer or, failing that, from
+Alpaca; if neither yields them, nothing is generated and reconciliation settles the order. The replacement
+gets a client order ID Alpaca makes (one kept is refused, observed), so its updates and reports are traced
+back to the node's order through its `replaces` links, cached and walked again after a restart. A 422
+refusal is `OrderModifyRejected` unless Alpaca shows the order already replaced as asked (a second replace is
+refused "order already replaced", observed, as alpaca-py's own retry would be); `order_replace_rejected`
+and a replacement's `rejected` are `OrderModifyRejected` too, the second because Alpaca rejects the
+replacement when the old order fills first. Denied before Alpaca: no venue order ID, a fractional quantity
+and a sub-penny price; what only Alpaca knows (an order in `accepted` "cannot be replaced") is left to its
+answer.
 
 Order events follow NautilusTrader's execution policies ("Command outcomes",
 https://nautilustrader.io/docs/md/latest/concepts/execution/policies.md): an order this slice cannot send is
@@ -42,7 +59,8 @@ fills"). That page does not say what price an inferred fill carries (ADR 0024).
 Venue side, alpaca-py 0.45.0:
 
 * `TradingClient(api_key, secret_key, paper=True)` for `submit_order`, `cancel_order_by_id`,
-  `get_order_by_id`, `get_order_by_client_id`, `get_orders`, `get_all_positions` and `get_account`. The
+  `replace_order_by_id`, `get_order_by_id`, `get_order_by_client_id`, `get_orders`, `get_all_positions`
+  and `get_account`. The
   client is always built with `paper=True` and never with `url_override`, whatever the config holds; the
   config refuses both (`AlpacaExecutionClientConfig`). alpaca-py's REST client is synchronous, so each call
   runs in a worker thread, one at a time on its one `requests.Session`, as in `data.py`.
@@ -62,14 +80,15 @@ Known limits:
 * Stop and stop-limit orders: a stop "is elected on the consolidated print" (same page, "Order Handling
   Standards"), the last trade, so only `DEFAULT` and `LAST_PRICE` trigger types are sent (both as Alpaca's
   stop; Alpaca has no trigger type field), and any other is denied. Upstream's Kraken spot adapter maps
-  `DEFAULT` and `LAST_PRICE` to its last-trade trigger too, and refuses what its venue has no trigger for. Alpaca's extended hours table
+  `DEFAULT` and `LAST_PRICE` to its last-trade trigger too, and refuses what its venue has no trigger for.
+  Alpaca's extended hours table
   gives stop and stop-limit orders "No" in every time in force; this client never sends
   `extended_hours`. The stop price and a stop-limit's limit price follow the sub-penny rule ("Sub-penny
   increments for stop orders"). Alpaca documents no status or trade update for a stop's election, so no
   `OrderTriggered` is generated: an elected stop-limit stays `ACCEPTED` until it fills or ends. Trailing
   stops stay denied: their stop price moves with Alpaca's high-water mark and no update reports it.
 * Post-only, reduce-only, quote-quantity, display quantity, contingent orders and order lists are denied
-  or not implemented; so are modify, query and extended hours.
+  or not implemented; so are queries and extended hours.
 * Cancel-all sends one cancel per order, one at a time, in no specified order, skipping an order already
   pending cancel; an order placed after the command was read from the cache is not canceled by it.
 * A limit price at or above $1.00 with more than 2 decimals, or below $1.00 with more than 4, is denied
@@ -82,9 +101,9 @@ Known limits:
   define. A fill without one is not emitted; it is logged, and reconciliation can infer it later.
 * A fill price is kept exactly, at whatever precision Alpaca sends; the paper example has seven decimals.
 * Trade updates for orders this node does not hold are logged and dropped; reconciliation creates them.
-* An Alpaca order event this slice does not map (`pending_cancel`, `replaced`, `pending_replace`,
-  `order_replace_rejected`, `done_for_day`, `stopped`, `calculated`, `suspended`, `held`, `restated`) is
-  logged as a warning. NautilusTrader generates `OrderPendingCancel` itself when a cancel is sent.
+* An Alpaca order event this slice does not map (`pending_cancel`, `done_for_day`, `stopped`,
+  `calculated`, `suspended`, `held`, `restated`) is logged as a warning; `pending_replace` is ignored.
+  NautilusTrader generates `OrderPendingCancel` and `OrderPendingUpdate` itself when a command is sent.
 * The stream's subscription is not acknowledged through alpaca-py's interface, so trade updates sent before
   it is listening are missed; reconciliation's checks then resolve the order. If the stream ends by itself
   the client logs an error and does not restart it, as in `data.py`.
@@ -100,7 +119,8 @@ Known limits:
   order neither canceled nor pending cancel. alpaca-py sets no HTTP timeout.
 * Start-up fails, by design, on an open order or position this slice cannot represent: a fractional
   position, or an open order that is not a simple whole-share US equity market, limit, stop or stop-limit
-  order. An open stop is reported with its stop price as the trigger price and trigger type `DEFAULT`.
+  order. An open stop is reported with its stop price as the trigger price and the node's trigger type, else
+  `DEFAULT`.
 * Timestamps lose sub-microsecond precision: alpaca-py parses them into `datetime`.
 """
 
@@ -136,6 +156,7 @@ from alpaca.trading.models import TradeUpdate
 from alpaca.trading.requests import GetOrdersRequest
 from alpaca.trading.requests import LimitOrderRequest
 from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.requests import ReplaceOrderRequest
 from alpaca.trading.requests import StopLimitOrderRequest
 from alpaca.trading.requests import StopOrderRequest
 from alpaca.trading.stream import TradingStream
@@ -216,6 +237,13 @@ sufficient", 422 "Input parameters are not recognized". Any other failure leaves
 NOT_CANCELABLE = 422
 """"Delete Order by ID": "If the order is no longer cancelable, the request will be rejected with status
 422; otherwise accepted with return status 204"."""
+
+REPLACE_REFUSAL = 422
+"""The status a paper observation saw for a refused replace ("client_order_id must be unique", "order already
+replaced"); "Replace Order by ID" documents no error status, so any other leaves the outcome unknown."""
+
+MAX_REPLACE_CHAIN = 16
+"""The most `replaces` links followed back from an order the node does not hold to one it does."""
 
 ORDER_SIDES = {OrderSide.BUY: AlpacaOrderSide.BUY, OrderSide.SELL: AlpacaOrderSide.SELL}
 ORDER_SIDES_FROM_ALPACA = {v: k for k, v in ORDER_SIDES.items()}
@@ -335,6 +363,10 @@ class OrdersClient(Protocol):
 
     def get_account(self) -> TradeAccount | RawData: ...
 
+    def replace_order_by_id(
+        self, order_id: UUID | str, order_data: ReplaceOrderRequest | None = None
+    ) -> AlpacaOrder | RawData: ...
+
 
 type TradeUpdateHandler = Callable[[TradeUpdate | RawData], Awaitable[None]]
 
@@ -434,6 +466,19 @@ def sub_penny_denial(price: Price, what: str = "limit price") -> str | None:
     return None
 
 
+def replaces_as_asked(replacement: AlpacaOrder, request: ReplaceOrderRequest) -> bool:
+    """Whether Alpaca's replacement has every term the replace request set."""
+    pairs = (
+        (request.qty, replacement.qty),
+        (request.limit_price, replacement.limit_price),
+        (request.stop_price, replacement.stop_price),
+    )
+    return all(
+        asked is None or (held is not None and Decimal(str(held)) == Decimal(str(asked)))
+        for asked, held in pairs
+    )
+
+
 def alpaca_side(order: AlpacaOrder) -> OrderSide:
     side = ORDER_SIDES_FROM_ALPACA.get(order.side) if order.side is not None else None
     if side is None:
@@ -442,20 +487,24 @@ def alpaca_side(order: AlpacaOrder) -> OrderSide:
 
 
 def order_status_report(
-    order: AlpacaOrder, ts_init: int, trigger_type: TriggerType | None = None
+    order: AlpacaOrder,
+    ts_init: int,
+    trigger_type: TriggerType | None = None,
+    client_order_id: ClientOrderId | None = None,
 ) -> OrderStatusReport | None:
     """An `OrderStatusReport` for one Alpaca order, None for a closed one this slice does not map.
 
     An open order this slice does not map raises, so reconciliation fails rather than leaving a working
-    order unknown to the node. `replaced` is skipped: the order replacing it is reported in its own right.
-    A stop's trigger type is `trigger_type` when the node holds the order, else `DEFAULT`: Alpaca's order
-    has no trigger type field.
+    order unknown to the node. `replaced` is skipped: the order replacing it is reported in its own right,
+    under `client_order_id` when the client has traced it back to the node's order. A stop's trigger type
+    is `trigger_type` when the node holds the order, else `DEFAULT`: Alpaca's order has no trigger type
+    field.
     """
     status = order.status
     is_open = status not in CLOSED_STATUSES and status not in (AlpacaOrderStatus.REPLACED,)
     try:
         if status == AlpacaOrderStatus.REPLACED:
-            raise ValueError("status replaced: modify is not in this slice")
+            raise ValueError("status replaced: its replacement is reported instead")
         nautilus_status = OPEN_STATUSES.get(status) or CLOSED_STATUSES.get(status)
         if nautilus_status is None:
             raise ValueError(f"status {status.value}")
@@ -489,7 +538,7 @@ def order_status_report(
             ts_accepted=dt_to_unix_nanos(order.submitted_at),
             ts_last=dt_to_unix_nanos(order.updated_at),
             ts_init=ts_init,
-            client_order_id=ClientOrderId(order.client_order_id),
+            client_order_id=client_order_id or ClientOrderId(order.client_order_id),
             price=exact_report_price(order.limit_price) if order_type in LIMIT_PRICED else None,
             trigger_price=exact_report_price(order.stop_price)
             if order_type in STOP_TYPES
@@ -579,6 +628,17 @@ class AlpacaExecutionClient(ExecutionClient):
         # an acknowledgement is generated once and nothing is generated after the end.
         self._accepted: set[ClientOrderId] = set()
         self._finished: set[ClientOrderId] = set()
+        # A replacement's Alpaca client order ID, mapped to the node's order it replaces: a cache of the
+        # `replaces` chain, which is walked again when it misses (a new client after a restart).
+        self._replacements: dict[str, ClientOrderId] = {}
+        # PATCH answers by the replacement's order ID, read when Alpaca's `replaced` update arrives.
+        self._answers: dict[str, AlpacaOrder] = {}
+        # Alpaca client order IDs whose `replaces` chain reaches no order the node holds.
+        self._foreign: set[str] = set()
+        # Trade updates, applied in arrival order by one task on the node's loop.
+        self._updates: asyncio.Queue[TradeUpdate] = asyncio.Queue()
+        self._consumer: asyncio.Task[object] | None = None
+        self._applying = False
         self._said_no_fill_reports = False
         self._log = Logger(type(self).__name__)
 
@@ -608,6 +668,8 @@ class AlpacaExecutionClient(ExecutionClient):
         for instrument in self._provider.list_all():
             self._handle_instrument(instrument)
         await self._report_account()
+        self._updates = asyncio.Queue()
+        self._consumer = self.create_task(self._consume_updates(), "alpaca-trade-updates")
         self._stream.subscribe_trade_updates(weak_coroutine(self._on_trade_update))
         self._stream_thread = threading.Thread(
             target=run_trade_stream,
@@ -624,12 +686,19 @@ class AlpacaExecutionClient(ExecutionClient):
         if thread is not None and self._stream is not None:
             self._stream.stop()
             await asyncio.to_thread(thread.join, STREAM_JOIN_TIMEOUT_SECS)
+        consumer, self._consumer = self._consumer, None
+        if consumer is not None:
+            consumer.cancel()
+            await asyncio.gather(consumer, return_exceptions=True)
         # Cleared whether or not the thread stopped, so a later connect builds fresh clients.
         self._stream_thread = None
         self._stream = None
         self._trading = None
         self._accepted.clear()
         self._finished.clear()
+        self._replacements.clear()
+        self._answers.clear()
+        self._foreign.clear()
         if thread is not None and thread.is_alive():
             raise RuntimeError(
                 f"Alpaca trade updates thread did not stop within {STREAM_JOIN_TIMEOUT_SECS} s",
@@ -839,12 +908,144 @@ class AlpacaExecutionClient(ExecutionClient):
             AlpacaOrderStatus.PENDING_CANCEL,
         ):
             return
+        if (
+            isinstance(held, AlpacaOrder)
+            and held.status == AlpacaOrderStatus.REPLACED
+            and held.replaced_by is not None
+        ):
+            # The cancel named the order a replace has just replaced; cancel the replacement instead.
+            await self._cancel(order.client_order_id, VenueOrderId(str(held.replaced_by)))
+            return
         self.generate_order_cancel_rejected(
             order,
             venue_order_id,
             f"Alpaca refused the cancel ({error.status_code}): {api_error_text(error)}",
             self.clock.timestamp_ns(),
         )
+
+    @override
+    async def _modify_order(self, command: live.ModifyOrder) -> None:
+        """Replace the order on Alpaca ("Replace Order by ID", `TradingClient.replace_order_by_id`).
+
+        Alpaca answers with "The new Order object with the new order ID" and says a success "does NOT
+        guarantee the existing open order has been replaced". So `OrderUpdated` is not generated from the
+        answer: it comes with Alpaca's `replaced` trade update for the node's order, which carries the old
+        order with `replaced_by` (observed on paper, ADR 0036). The answer is kept for that update's values,
+        and the replacement's Alpaca client order ID is mapped to the node's order. Alpaca refuses a
+        replacement that keeps the original client order ID (observed), so none is sent.
+        """
+        order = self.cache.order(command.client_order_id)
+        if order is None:
+            self._log.error(
+                f"Cannot modify {command.client_order_id}: the node holds no such order"
+            )
+            return
+        venue_order_id = command.venue_order_id or order.venue_order_id
+        denial = self._modify_denial(order, command, venue_order_id)
+        if denial is not None or venue_order_id is None:
+            self.generate_order_modify_rejected(
+                order, venue_order_id, denial or "no venue order ID", self.clock.timestamp_ns()
+            )
+            return
+        request = ReplaceOrderRequest(
+            qty=int(command.quantity.as_double()) if command.quantity is not None else None,
+            # "Required if original order's `type` field was `limit` or `stop_limit`" (Replace Order by
+            # ID), so the current price is sent when the command does not change it.
+            limit_price=wire_price(command.price or order.price)
+            if order.order_type in LIMIT_PRICED
+            else None,
+            stop_price=wire_price(command.trigger_price or order.trigger_price)
+            if order.order_type in STOP_TYPES
+            else None,
+        )
+        try:
+            answer = await self._call(
+                self._venue().replace_order_by_id, venue_order_id.value, request
+            )
+        except APIError as e:
+            if e.status_code == REPLACE_REFUSAL:
+                await self._replace_refused(order, venue_order_id, request, e)
+                return
+            self._log_unknown_replace(order, f"HTTP {e.status_code}: {api_error_text(e)}")
+            return
+        except OSError as e:
+            self._log_unknown_replace(order, repr(e))
+            return
+        if not isinstance(answer, AlpacaOrder):
+            raise TypeError("alpaca-py returned raw order data; the client must use raw_data=False")
+        self._replacements[answer.client_order_id] = order.client_order_id
+        if order.client_order_id not in self._finished:
+            self._answers[str(answer.id)] = answer
+
+    async def _replace_refused(
+        self,
+        order: Any,
+        venue_order_id: VenueOrderId,
+        request: ReplaceOrderRequest,
+        error: APIError,
+    ) -> None:
+        """Reject a modify Alpaca refused, unless the refusal answered alpaca-py's own retry.
+
+        alpaca-py repeats a request answered 429 or 504, and a second replace of an order already replaced
+        is answered 422 "order already replaced" (observed). So the order is looked up: replaced by an
+        order with the terms this request asked for, the refusal answered the retry and the `replaced`
+        trade update brings `OrderUpdated`; replaced with other terms, it was another modify, and this one
+        is rejected; if a lookup fails, the outcome is unknown.
+        """
+        try:
+            held = await self._call(self._venue().get_order_by_id, venue_order_id.value)
+            replacement = (
+                await self._call(self._venue().get_order_by_id, str(held.replaced_by))
+                if isinstance(held, AlpacaOrder)
+                and held.status == AlpacaOrderStatus.REPLACED
+                and held.replaced_by is not None
+                else None
+            )
+        except (APIError, OSError) as e:
+            self._log_unknown_replace(
+                order, f"refused ({error.status_code}), then the lookup failed ({e!r})"
+            )
+            return
+        if isinstance(replacement, AlpacaOrder) and replaces_as_asked(replacement, request):
+            self._log.warning(
+                f"Alpaca refused a replace of {order.client_order_id} ({error.status_code}) but shows "
+                "the order replaced as asked: an earlier attempt reached it",
+            )
+            return
+        self.generate_order_modify_rejected(
+            order,
+            venue_order_id,
+            f"Alpaca refused the replace ({error.status_code}): {api_error_text(error)}",
+            self.clock.timestamp_ns(),
+        )
+
+    def _log_unknown_replace(self, order: Any, detail: str) -> None:
+        self._log.error(
+            f"Alpaca replace of {order.client_order_id} got no definitive answer ({detail}); a trade "
+            "update or reconciliation resolves it",
+        )
+
+    @staticmethod
+    def _modify_denial(
+        order: Any, command: live.ModifyOrder, venue_order_id: VenueOrderId | None
+    ) -> str | None:
+        """Why the client will not send this modify, or None: only what it can prove. What Alpaca alone
+        knows, such as an order in `accepted` that "cannot be replaced", is left to Alpaca's answer."""
+        if venue_order_id is None:
+            return "Alpaca has not acknowledged the order yet (no venue order ID to replace)"
+        if command.quantity is not None and not command.quantity.as_double().is_integer():
+            return f"quantity {command.quantity} is fractional; whole shares only"
+        if command.price is not None:
+            if order.order_type not in LIMIT_PRICED:
+                return f"a {order.order_type.name} order has no limit price to change"
+            denial = sub_penny_denial(command.price)
+            if denial is not None:
+                return denial
+        if command.trigger_price is not None:
+            if order.order_type not in STOP_TYPES:
+                return f"a {order.order_type.name} order has no stop price to change"
+            return sub_penny_denial(command.trigger_price, "stop price")
+        return None
 
     def _denial(self, order: Any) -> str | None:
         """Why this slice will not send the order, or None. Checked before anything reaches Alpaca."""
@@ -937,22 +1138,83 @@ class AlpacaExecutionClient(ExecutionClient):
         self._finished.add(order.client_order_id)
         self.generate_order_rejected(order, reason, ts_event, False)
 
-    def _apply_trade_update(self, update: TradeUpdate) -> None:
+    async def _consume_updates(self) -> None:
+        """Apply trade updates one at a time, in the order the stream delivered them: an update for a
+        replacement may need a lookup on Alpaca before it can be applied."""
+        while True:
+            update = await self._updates.get()
+            self._applying = True
+            try:
+                await self._apply_trade_update(update)
+            except Exception as e:  # noqa: BLE001 - one update's failure must not stop the rest
+                self._log.error(f"Alpaca trade update {update.event} could not be applied: {e!r}")
+            finally:
+                self._applying = False
+
+    async def _apply_trade_update(self, update: TradeUpdate) -> None:
         if self._stopping:
             return
         try:
-            self._apply(update)
-        except (ValueError, TypeError, RuntimeError) as e:
-            # On the loop's callback path nothing else reports it: name the update and keep the stream.
+            await self._apply(update)
+        except (ValueError, TypeError, RuntimeError, APIError, OSError) as e:
+            # Nothing else reports it: name the update and keep the stream.
             self._log.error(
                 f"Alpaca trade update {update.event} for {update.order.client_order_id} failed: {e!r}",
             )
 
-    def _apply(self, update: TradeUpdate) -> None:
+    async def _node_order_id(
+        self, alpaca_order: AlpacaOrder, known: dict[str, AlpacaOrder] | None = None
+    ) -> ClientOrderId | None:
+        """The node's client order ID for an Alpaca order, or None if the node holds none.
+
+        A replacement carries a client order ID Alpaca made (observed), so it is traced back through its
+        `replaces` links, at most `MAX_REPLACE_CHAIN` of them, to an order whose client order ID the node
+        holds; the result is cached, and the walk repeats after a restart, when the cache is empty.
+        """
+        own = ClientOrderId(alpaca_order.client_order_id)
+        if self.cache.order(own) is not None:
+            return own
+        mapped = self._replacements.get(alpaca_order.client_order_id)
+        if mapped is not None:
+            return mapped
+        if alpaca_order.client_order_id in self._foreign:
+            return None
+        replaces = alpaca_order.replaces
+        for _ in range(MAX_REPLACE_CHAIN):
+            if replaces is None:
+                self._foreign.add(alpaca_order.client_order_id)
+                return None
+            prior = (known or {}).get(str(replaces))
+            try:
+                if prior is None:
+                    prior = await self._call(self._venue().get_order_by_id, str(replaces))
+            except APIError as e:
+                if e.status_code == 404:
+                    self._foreign.add(alpaca_order.client_order_id)
+                    return None
+                raise
+            if not isinstance(prior, AlpacaOrder):
+                raise TypeError(
+                    "alpaca-py returned raw order data; the client must use raw_data=False"
+                )
+            node = self._replacements.get(prior.client_order_id)
+            if node is None and self.cache.order(ClientOrderId(prior.client_order_id)) is not None:
+                node = ClientOrderId(prior.client_order_id)
+            if node is not None:
+                self._replacements[alpaca_order.client_order_id] = node
+                return node
+            replaces = prior.replaces
+        self._log.warning(
+            f"Alpaca order {alpaca_order.id} has more than {MAX_REPLACE_CHAIN} replaces before an order "
+            "this node holds; it is treated as one the node does not hold",
+        )
+        return None
+
+    async def _apply(self, update: TradeUpdate) -> None:
         alpaca_order = update.order
-        client_order_id = ClientOrderId(alpaca_order.client_order_id)
-        order = self.cache.order(client_order_id)
-        if order is None:
+        client_order_id = await self._node_order_id(alpaca_order)
+        order = self.cache.order(client_order_id) if client_order_id is not None else None
+        if client_order_id is None or order is None:
             self._log.info(
                 f"Alpaca trade update {update.event} for order {alpaca_order.id} ({alpaca_order.symbol}), "
                 "which this node does not hold; reconciliation reports it",
@@ -963,6 +1225,31 @@ class AlpacaExecutionClient(ExecutionClient):
         event = getattr(update.event, "value", update.event)
         venue_order_id = VenueOrderId(str(alpaca_order.id))
         ts_event = dt_to_unix_nanos(update.timestamp)
+        is_replacement = alpaca_order.client_order_id != client_order_id.value
+        if event == "replaced":
+            await self._replaced(order, alpaca_order, ts_event)
+            return
+        if event == "order_replace_rejected":
+            for key in [
+                k for k, a in self._answers.items() if str(a.replaces) == str(alpaca_order.id)
+            ]:
+                del self._answers[key]
+            self.generate_order_modify_rejected(
+                order, venue_order_id, "Alpaca rejected the replace (trade update)", ts_event
+            )
+            return
+        if event == "pending_replace":
+            return  # NautilusTrader generates `OrderPendingUpdate` itself when a modify is sent
+        if event == "rejected" and is_replacement and order.venue_order_id != venue_order_id:
+            # Alpaca: if the old order "is filled before the replacing (new) order reaches the execution
+            # venue, the replacing (new) order is rejected". The node's order is the old one, filled.
+            self.generate_order_modify_rejected(
+                order,
+                venue_order_id,
+                f"Alpaca rejected the replacement order {alpaca_order.id} (trade update)",
+                ts_event,
+            )
+            return
         if event == "rejected":
             self._reject(
                 order,
@@ -989,6 +1276,49 @@ class AlpacaExecutionClient(ExecutionClient):
             self.generate_order_expired(order, venue_order_id, ts_event)
         if event in TERMINAL_EVENTS:
             self._finished.add(client_order_id)
+
+    async def _replaced(self, order: Any, old: AlpacaOrder, ts_event: int) -> None:
+        """Alpaca's `replaced` for the node's order: `OrderUpdated` with the replacement's values.
+
+        The update carries the old order, with `replaced_by` (observed). The replacement is the PATCH
+        answer if it is in, otherwise read from Alpaca; if neither yields it, nothing is generated and
+        reconciliation settles the order, so no value is invented.
+        """
+        if old.replaced_by is None:
+            self._log.error(
+                f"Alpaca replaced {old.id} without saying by which order; nothing applied"
+            )
+            return
+        replacement = self._answers.pop(str(old.replaced_by), None)
+        if replacement is None:
+            try:
+                replacement = await self._call(self._venue().get_order_by_id, str(old.replaced_by))
+            except (APIError, OSError) as e:
+                self._log.error(
+                    f"Alpaca replaced {order.client_order_id} by {old.replaced_by}, which could not be "
+                    f"read ({e!r}); no OrderUpdated, reconciliation settles it",
+                )
+                return
+        if not isinstance(replacement, AlpacaOrder):
+            raise TypeError("alpaca-py returned raw order data; the client must use raw_data=False")
+        self._replacements[replacement.client_order_id] = order.client_order_id
+        report = order_status_report(
+            replacement,
+            self.clock.timestamp_ns(),
+            order.trigger_type if order.order_type in STOP_TYPES else None,
+            order.client_order_id,
+        )
+        if report is None:
+            raise ValueError(f"replacement {replacement.id} is not an order this slice maps")
+        self.generate_order_updated(
+            order,
+            VenueOrderId(str(replacement.id)),
+            report.quantity,
+            report.price,
+            report.trigger_price,
+            None,
+            ts_event,
+        )
 
     def _fill(
         self, order: Any, update: TradeUpdate, venue_order_id: VenueOrderId, ts_event: int
@@ -1024,9 +1354,13 @@ class AlpacaExecutionClient(ExecutionClient):
             self._log.error(f"Alpaca trade updates stream ended while connected: {error!r}")
 
     async def _on_trade_update(self, update: TradeUpdate | RawData) -> None:
-        """On the stream's thread: hand the update to the node's loop."""
+        """On the stream's thread: hand the update to the node's loop, where it is queued in order."""
         if isinstance(update, TradeUpdate) and self._owner_loop is not None:
-            post(self._owner_loop, self._apply_trade_update, update)
+            post(self._owner_loop, self._enqueue_update, update)
+
+    def _enqueue_update(self, update: TradeUpdate) -> None:
+        if not self._stopping:
+            self._updates.put_nowait(update)
 
     # -- reconciliation reports --------------------------------------------------------------------
 
@@ -1085,9 +1419,18 @@ class AlpacaExecutionClient(ExecutionClient):
             if e.status_code == 404:
                 return None
             raise
+        for _ in range(MAX_REPLACE_CHAIN):
+            if not isinstance(found, AlpacaOrder):
+                raise TypeError(
+                    "alpaca-py returned raw order data; the client must use raw_data=False"
+                )
+            if found.status != AlpacaOrderStatus.REPLACED or found.replaced_by is None:
+                break
+            # The node's IDs can name an order since replaced; the live order is its replacement.
+            found = await self._call(self._venue().get_order_by_id, str(found.replaced_by))
         if not isinstance(found, AlpacaOrder):
             raise TypeError("alpaca-py returned raw order data; the client must use raw_data=False")
-        return self._order_report(found)
+        return await self._order_report(found)
 
     async def _order_status_reports(
         self, command: live.GenerateOrderStatusReports
@@ -1127,7 +1470,7 @@ class AlpacaExecutionClient(ExecutionClient):
             found.update((str(order.id), order) for order in orders)
         reports = []
         for order in found.values():
-            report = self._order_report(order)
+            report = await self._order_report(order, found)
             if report is not None:
                 reports.append(report)
         return reports
@@ -1154,14 +1497,40 @@ class AlpacaExecutionClient(ExecutionClient):
                 reports.append(report)
         return reports
 
-    def _order_report(self, order: AlpacaOrder) -> OrderStatusReport | None:
+    async def _order_report(
+        self, order: AlpacaOrder, known: dict[str, AlpacaOrder] | None = None
+    ) -> OrderStatusReport | None:
+        # A replacement is reported under the node's client order ID, traced through `replaces`; a
+        # replaced order is skipped by `order_status_report`, so it needs no lookup.
+        try:
+            node_id = (
+                await self._node_order_id(order, known)
+                if order.status != AlpacaOrderStatus.REPLACED
+                else None
+            )
+        except (APIError, OSError) as e:
+            self._log.warning(f"Alpaca order {order.id} is not reported: tracing it failed ({e!r})")
+            return None
+        held = self.cache.order(node_id) if node_id is not None else None
+        if (
+            held is not None
+            and node_id is not None
+            and node_id.value != order.client_order_id
+            and order.status in CLOSED_STATUSES
+            and held.venue_order_id != VenueOrderId(str(order.id))
+        ):
+            # A replacement that closed without taking over (rejected when the old order filled first):
+            # the node's order is reported by the order it still names.
+            return None
         # As upstream's Coinbase adapter patches a report from what the node sent: the trigger type
         # the node's order holds, which Alpaca's order does not carry.
-        held = self.cache.order(ClientOrderId(order.client_order_id))
         trigger_type = (
             held.trigger_type if held is not None and held.order_type in STOP_TYPES else None
         )
-        report = order_status_report(order, self.clock.timestamp_ns(), trigger_type)
+        renamed = (
+            node_id if node_id is not None and node_id.value != order.client_order_id else None
+        )
+        report = order_status_report(order, self.clock.timestamp_ns(), trigger_type, renamed)
         if report is None:
             self._log.warning(
                 f"Alpaca order {order.id} ({order.symbol}, {order.status.value}) is not reported: "
