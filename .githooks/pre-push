@@ -1,0 +1,38 @@
+#!/bin/bash
+# git pre-push hook. Contract: githooks(5), "pre-push" — called with the remote's name and location; stdin
+# has one line per ref, "<local-ref> SP <local-object-name> SP <remote-ref> SP <remote-object-name>"; a
+# non-zero exit aborts the push. Enabled per clone with `git config core.hooksPath .githooks`.
+#
+# Runs scripts/check-addresses on the commits each ref would add to the remote, because everything pushed
+# to this public repository can be read by anyone (docs/adr/0014-landing-workflow.md, rule 6).
+set -uo pipefail
+remote="${1:-}"
+root=$(git rev-parse --show-toplevel) || exit 1
+check="$root/scripts/check-addresses"
+[ -x "$check" ] || { echo "pre-push: $check is missing or not executable; push aborted" >&2; exit 1; }
+
+# Commits already on a named remote need not be read again. A remote given as a URL has no tracking refs,
+# so then everything reachable from what is pushed is read.
+known=()
+if [ -n "$remote" ] && git remote get-url "$remote" >/dev/null 2>&1; then known+=("--remotes=$remote"); fi
+
+rc=0
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ -n "${local_ref:-}" ] || continue
+  case "$local_sha" in *[!0]*) ;; *) continue ;; esac        # a deleted ref publishes nothing
+  args=("$local_sha" --not)
+  # An existing remote ref: only what is new since it. Its object may be missing here (someone pushed
+  # since the last fetch); then the remote's tracking refs are the boundary.
+  case "$remote_sha" in
+    *[!0]*) if git cat-file -e "$remote_sha^{commit}" 2>/dev/null; then args+=("$remote_sha"); fi ;;
+  esac
+  args+=(${known[@]+"${known[@]}"})
+  # git log reads an annotated tag as the commit it points to; the tag's own tagger and message are
+  # published too.
+  if [ "$(git cat-file -t "$local_sha" 2>/dev/null)" = "tag" ]; then args=(--tag "$local_sha" "${args[@]}"); fi
+  if ! "$check" "${args[@]}"; then
+    echo "pre-push: $local_ref was not pushed to ${remote_ref:-the remote} because of the address(es) above" >&2
+    rc=1
+  fi
+done
+exit "$rc"

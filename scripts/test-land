@@ -1,0 +1,397 @@
+#!/bin/bash
+# test-land — run scripts/land, scripts/check-addresses and .githooks/pre-push in throwaway repositories
+# and check what each one decides. Offline: `origin` is a local bare repository, scripts/ci is a stub, and a
+# fake `mise` first on PATH answers `mise exec -- gh ...` from canned files and logs every call.
+# Exit 0 if every case behaves as expected, 1 otherwise. Touches only a temp folder.
+set -uo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# A git hook that runs this exports variables naming its own repository; the cases need their own.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_PREFIX \
+      GIT_COMMON_DIR GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_AUTHOR_DATE GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL \
+      GIT_COMMITTER_DATE LAND_PR CHECK_ADDRESSES_STRICT
+for f in scripts/land scripts/check-addresses .githooks/pre-push; do
+  [ -x "$ROOT/$f" ] || { echo "test-land: $ROOT/$f is missing or not executable"; exit 1; }
+done
+TMP=$(mktemp -d) || { echo "test-land: could not create a temp folder"; exit 1; }
+trap 'rm -rf "$TMP"' EXIT
+
+export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$TMP/gitconfig"
+printf '[user]\n\tname = Test\n\temail = 1+test@users.noreply.github.com\n[commit]\n\tgpgsign = false\n[advice]\n\tdetachedHead = false\n' > "$GIT_CONFIG_GLOBAL"
+export LAND_POLL_SECONDS=0 LAND_WAIT_SECONDS=3
+mkdir -p "$TMP/bin"
+PATH="$TMP/bin:$PATH"; export PATH
+
+# The fake mise. Files in $FAKE: auth_rc, merge_rc, auto_rc (exit codes, default 0); pr_open (the line
+# `gh pr list --jq` would print); pr_info and pr_head (for --pr); views (one `gh pr view` answer per line,
+# "<state> <sha>", the last repeated; HEAD and OTHER stand for the current commit and another one); checks
+# (the failed required checks `gh pr checks --jq` would print).
+cat > "$TMP/bin/mise" <<'FAKE'
+#!/bin/bash
+[ "${1:-} ${2:-} ${3:-}" = "exec -- gh" ] || { echo "fake mise: unexpected call: $*" >&2; exit 99; }
+shift 3
+printf 'gh %s\n' "$*" >> "$FAKE/log"
+rc() { if [ -f "$FAKE/$1" ]; then cat "$FAKE/$1"; else echo 0; fi; }
+case "${1:-} ${2:-}" in
+  "auth status") exit "$(rc auth_rc)" ;;
+  "pr list")     [ ! -f "$FAKE/pr_open" ] || cat "$FAKE/pr_open" ;;
+  "pr create")   echo "7 https://github.example/o/r/pull/7" > "$FAKE/pr_open" ;;
+  "pr checks")   [ ! -f "$FAKE/checks" ] || cat "$FAKE/checks" ;;
+  "pr merge")    prev=""; for a in "$@"; do [ "$prev" != "--body-file" ] || cp "$a" "$FAKE/merge_body"; prev=$a; done
+                 case "$*" in
+                   *--auto*) r=$(rc auto_rc);  [ "$r" -eq 0 ] || echo "auto-merge refused by the fake" >&2 ;;
+                   *)        r=$(rc merge_rc); [ "$r" -eq 0 ] || echo "direct merge refused by the fake" >&2 ;;
+                 esac
+                 exit "$r" ;;
+  "pr checkout") b=$(cat "$FAKE/pr_head")
+                 git fetch -q origin "+refs/heads/$b:refs/heads/$b" && git worktree add -q "$5" "$b" ;;
+  "pr view")
+    case "$*" in *headRefName*) cat "$FAKE/pr_info"; exit 0 ;; esac
+    line=$(sed -n 1p "$FAKE/views")
+    if [ "$(wc -l < "$FAKE/views")" -gt 1 ]; then tail -n +2 "$FAKE/views" > "$FAKE/views.next" && mv "$FAKE/views.next" "$FAKE/views"; fi
+    line=${line/HEAD/$(git rev-parse HEAD)}
+    printf '%s\n' "${line/OTHER/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" ;;
+  "api -X")      ;;
+  *) echo "fake mise: unexpected gh call: $*" >&2; exit 98 ;;
+esac
+FAKE
+chmod +x "$TMP/bin/mise"
+
+# One template, copied for every case: work (on main, with the scripts under test and a scripts/ci stub
+# that records that it ran) and its bare origin.
+T="$TMP/template"
+mkdir -p "$T/work/scripts" "$T/work/docs/adr" "$T/work/src"
+{ git init -q -b main "$T/work" && git init -q --bare "$T/origin.git"; } || { echo "test-land: git init failed"; exit 1; }
+cp "$ROOT/scripts/land" "$ROOT/scripts/check-addresses" "$T/work/scripts/"
+# shellcheck disable=SC2016  # expanded by the stub, not here
+printf '%s\n' '#!/bin/bash' 'echo ran >> "$FAKE/ci"' > "$T/work/scripts/ci"; chmod +x "$T/work/scripts/ci"
+echo "readme" > "$T/work/README.md"; echo "# 0001 First" > "$T/work/docs/adr/0001-first.md"
+echo "lock" > "$T/work/uv.lock"; echo "x = 1" > "$T/work/src/a.py"
+{ git -C "$T/work" add -A && git -C "$T/work" commit -q -m "Start" \
+  && git -C "$T/work" push -q "$T/origin.git" main; } || { echo "test-land: template setup failed"; exit 1; }
+
+# new_repo [noremote]: a case folder C with work tree W on a new branch topic, and origin unless asked
+new_repo() {
+  C=$(mktemp -d "$TMP/case.XXXXXX"); W="$C/work"; FAKE="$C/fake"; export FAKE
+  mkdir -p "$FAKE"; : > "$FAKE/log"; echo "MERGED HEAD" > "$FAKE/views"
+  cp -R "$T/work" "$T/origin.git" "$C/"
+  if [ "${1:-}" != noremote ]; then
+    git -C "$W" remote add origin "$C/origin.git"
+  fi
+  git -C "$W" switch -q -c topic
+}
+# change <path> [<message>]: append a line to a file and commit it
+change() { mkdir -p "$(dirname "$W/$1")"; echo "line" >> "$W/$1"; git -C "$W" add -A && git -C "$W" commit -q -m "${2:-Change $1}"; }
+# land [args]: run scripts/land in W; sets rc and out
+land() { out=$(cd "$W" && scripts/land "$@" 2>&1); rc=$?; }
+has()     { case "$out" in *"$1"*) return 0 ;; *) return 1 ;; esac; }
+logged()  { grep -cF -- "$1" "$FAKE/log" >/dev/null; }
+ci_ran()  { [ -f "$FAKE/ci" ]; }
+pushed()  { git -C "$C/origin.git" rev-parse --verify -q "refs/heads/$1" >/dev/null; }
+
+# case_ <label> <function> [args]: the function returns 0 when the case behaves as expected. Cases run in
+# the background, eight at a time, each in its own folder; results are printed in order at the end.
+RESULTS="$TMP/results"; mkdir -p "$RESULTS"; ncase=0; out=""; rc=""
+case_() {
+  local label="$1" id; shift
+  ncase=$((ncase + 1)); id=$(printf '%03d' "$ncase")
+  (
+    if "$@" >/dev/null 2>&1; then printf '  ok    %s\n' "$label" > "$RESULTS/$id"
+    else { printf '  FAIL  %s\n' "$label"; printf '%s\n' "$out" | sed -n '1,6s/^/        /p'; } > "$RESULTS/$id"; fi
+  ) &
+  [ $((ncase % 8)) -ne 0 ] || wait
+}
+
+# --- gh and the local path ---
+t_signed_out() {
+  new_repo; change README.md; echo 1 > "$FAKE/auth_rc"
+  local before; before=$(git -C "$W" rev-parse main)
+  land; [ "$rc" -ne 0 ] && has "gh auth login" && [ "$(git -C "$W" rev-parse main)" = "$before" ] && ! ci_ran
+}
+t_inner_no_origin() {
+  new_repo noremote; change README.md
+  local before; before=$(git -C "$W" rev-parse main)
+  out=$(cd "$W" && LAND_PR=5 scripts/land 2>&1); rc=$?
+  [ "$rc" -ne 0 ] && [ "$(git -C "$W" rev-parse main)" = "$before" ] && ! ci_ran
+}
+t_local_note() {
+  new_repo noremote; change src/a.py
+  land --reviewed "code-review ran, nothing found"
+  [ "$rc" -eq 0 ] && has 'review note: "code-review ran, nothing found"' && has "not recorded anywhere" \
+    && [ "$(git -C "$W" rev-parse main)" = "$(git -C "$W" rev-parse topic)" ]
+}
+case_ "origin and gh signed out: refused, main not moved"  t_signed_out
+case_ "a --pr run with no origin: refused, main not moved"  t_inner_no_origin
+case_ "local path prints the review note it cannot record" t_local_note
+
+# --- review gate ---
+t_lands_without_note() {   # t_lands_without_note <path>
+  new_repo; change "$1"; land
+  [ "$rc" -eq 0 ] && logged "context=review -f description=not needed: documentation or lockfile only" && has "landed:"
+}
+t_needs_note() {           # t_needs_note <path>...
+  new_repo; local p; for p in "$@"; do change "$p"; done
+  land; [ "$rc" -ne 0 ] && has "needs an independent review" && ! pushed topic && ! ci_ran
+}
+t_new_adr()    { new_repo; echo "# 0002" > "$W/docs/adr/0002-new.md"; git -C "$W" add -A; git -C "$W" commit -q -m "Add"
+                 land; [ "$rc" -ne 0 ] && has "docs/adr/0002-new.md"; }
+t_rename_adr() { new_repo; git -C "$W" mv docs/adr/0001-first.md docs/adr/0002-first.md; git -C "$W" commit -q -m "Move"
+                 land; [ "$rc" -ne 0 ] && has "needs an independent review"; }
+t_unreadable() {
+  new_repo noremote; change README.md
+  local t; t=$(git -C "$W" rev-parse 'main^{tree}')
+  rm -f "$W/.git/objects/${t:0:2}/${t:2}"
+  land; [ "$rc" -ne 0 ] && has "review gate cannot be applied" && ! ci_ran
+}
+case_ "README.md alone lands without a note"               t_lands_without_note README.md
+case_ "a package README alone lands without a note"         t_lands_without_note packages/canon-alpaca/README.md
+case_ "uv.lock alone lands without a note"                  t_lands_without_note uv.lock
+case_ "an edit to an existing ADR lands without a note"     t_lands_without_note docs/adr/0001-first.md
+for p in AGENTS.md pyproject.toml tests/conftest.py .claude/skills/x/SKILL.md .claude/rules/x.md \
+         canon/upstreams.json mise.toml packages/a/b/README.md src/a.py; do
+  case_ "$p needs a note"                                   t_needs_note "$p"
+done
+case_ "README.md plus code needs a note"                    t_needs_note README.md src/a.py
+case_ "a new ADR needs a note"                              t_new_adr
+case_ "an ADR made by renaming needs a note"                t_rename_adr
+case_ "an unreadable file list stops the run"               t_unreadable
+t_dirty() { new_repo; change README.md; echo "more" >> "$W/README.md"; land
+            [ "$rc" -ne 0 ] && has "uncommitted changes" && ! ci_ran && ! pushed topic; }
+t_behind() {
+  new_repo; git -C "$W" switch -q -c side main; change uv.lock; git -C "$W" push -q origin side:main
+  git -C "$W" switch -q topic; change README.md; land
+  [ "$rc" -ne 0 ] && has "does not contain the current main" && ! ci_ran && ! pushed topic
+}
+case_ "a dirty working tree is refused"                     t_dirty
+case_ "a branch that does not contain main is refused"      t_behind
+
+# --- addresses ---
+t_refused() {   # t_refused <where> <commit/body setup function>
+  local where="$1"; shift
+  new_repo; "$@"
+  out=$(cd "$W" && CHECK_ADDRESSES_STRICT="${STRICT:-1}" scripts/land --reviewed "test" ${BODYARG:+--body "$BODYARG"} 2>&1); rc=$?
+  [ "$rc" -ne 0 ] && has "$where" && ! has "jane@" && ! pushed topic && ! ci_ran
+}
+# (the address below is written in two parts, so that this file itself passes the check)
+c_suffix()  { echo x > "$W/n.txt"; git -C "$W" add -A
+              git -C "$W" -c user.email="jane@example.com""@users.noreply.github.com" commit -q -m "Add"; }
+c_folded()  { echo x > "$W/n.txt"; git -C "$W" add -A
+              git -C "$W" commit -q -m "Add" -m "$(printf 'Co-authored-by: Jane Doe\n <jane@example.com>')"; }
+c_cc()      { echo x > "$W/n.txt"; git -C "$W" add -A; git -C "$W" commit -q -m "Add" -m "Cc: jane@example.com"; }
+c_bare()    { echo x > "$W/n.txt"; git -C "$W" add -A; git -C "$W" commit -q -m "Add" -m "Ask jane@example.com about it."; }
+c_file()    { echo "contact: jane@example.com" > "$W/notes.txt"; git -C "$W" add -A; git -C "$W" commit -q -m "Add notes"; }
+c_body()    { change README.md; BODYARG="$C/body.md"; printf '## Summary\nAsk jane@example.com.\n' > "$BODYARG"; }
+STRICT=0 case_ "an address hiding before a noreply suffix"  t_refused "users.noreply.github.com" c_suffix
+case_ "a trailer address folded onto the next line"         t_refused "message: an address at example.com" c_folded
+case_ "a Cc: trailer"                                       t_refused "message: an address at example.com" c_cc
+case_ "a bare address in the message body"                  t_refused "message: an address at example.com" c_bare
+case_ "an address in a committed file, named by path"       t_refused "file notes.txt: an address at example.com" c_file
+BODYARG="" case_ "an address in the --body file"            t_refused "body file" c_body
+BODYARG=""
+c_nul()     { printf 'x\000contact jane@example.com\n' > "$W/bin.dat"; git -C "$W" add -A; git -C "$W" commit -q -m "Add"; }
+c_nodiff()  { echo "*.dat -diff" > "$W/.gitattributes"; echo "contact jane@example.com" > "$W/notes.dat"
+              git -C "$W" add -A; git -C "$W" commit -q -m "Add"; }
+c_empty()   { : > "$W/jane@example.com"; git -C "$W" add -A; git -C "$W" commit -q -m "Add"; }
+c_binname() { mkdir -p "$W/jane@example.com"; printf 'x\000y\n' > "$W/jane@example.com/blob.bin"
+              git -C "$W" add -A; git -C "$W" commit -q -m "Add"; }
+case_ "an address in a file with a NUL byte"                t_refused "file bin.dat: an address at example.com" c_nul
+case_ "an address in a file marked -diff"                   t_refused "file notes.dat: an address at example.com" c_nodiff
+case_ "an empty file named after an address"                t_refused "file name <address>: an address at example.com" c_empty
+case_ "a binary file whose path holds an address"           t_refused "file name <address>/blob.bin" c_binname
+t_note_address() {
+  new_repo; change README.md
+  out=$(cd "$W" && CHECK_ADDRESSES_STRICT=1 scripts/land --reviewed "asked jane@example.com" 2>&1); rc=$?
+  [ "$rc" -ne 0 ] && has "review note: an address at example.com" && ! pushed topic && ! logged "statuses"
+}
+case_ "an address in the --reviewed note"                   t_note_address
+t_renamed_in_full() {
+  new_repo; c_file; git -C "$W" mv notes.txt moved.txt; git -C "$W" commit -q -m "Move"
+  out=$(cd "$W" && CHECK_ADDRESSES_STRICT=1 "$ROOT/scripts/check-addresses" HEAD~1..HEAD 2>&1); rc=$?
+  [ "$rc" -eq 1 ] && has "file moved.txt: an address at example.com"
+}
+case_ "a renamed file is read in full"                      t_renamed_in_full
+t_allowed() {
+  new_repo
+  cat > "$W/allowed.txt" <<'EOF'
+uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v5
+npx ccusage@20.0.48
+@dataclass
+pattern = r"[0-9]+\+[^<>]*@users\.noreply\.github\.com"
+49699333+dependabot[bot]@users.noreply.github.com and 41898282+github-actions[bot]@users.noreply.github.com
+url = git@github.com:example/repo.git
+support@github.com noreply@github.com jane@example.com ops@build.test a@b.invalid c@d.example e@host.localhost
+EOF
+  git -C "$W" add -A
+  git -C "$W" commit -q -m "Add allowed" -m "Co-Authored-By: Claude <noreply@anthropic.com>"
+  land --reviewed "test"; [ "$rc" -eq 0 ] && pushed topic
+}
+case_ "service, noreply and example addresses are allowed; package pins and patterns are not addresses" t_allowed
+# check_title <text>: run scripts/check-addresses on a title alone; sets rc and out
+check_title() { out=$("$ROOT/scripts/check-addresses" --title "$1" 2>&1); rc=$?; }
+t_two_at()   { check_title "ask jane@example.com""@build.test"; [ "$rc" -eq 1 ] && has "title: an address at build.test"; }
+t_no_input() { out=$(cd "$TMP" && "$ROOT/scripts/check-addresses" HEAD 2>&1); rc=$?; [ "$rc" -eq 2 ] && has "could not read"; }
+t_userinfo() {
+  check_title "curl https://key@api.alpaca.markets/v2 and https://user:pw@paper-api.alpaca.markets/v2" || :
+  [ "$rc" -eq 0 ] || return 1
+  out=$(CHECK_ADDRESSES_STRICT=1 "$ROOT/scripts/check-addresses" --title "https://jane@example.com/x" 2>&1); rc=$?
+  [ "$rc" -eq 0 ] || return 1
+  out=$(CHECK_ADDRESSES_STRICT=1 "$ROOT/scripts/check-addresses" --title "see jane@example.com" 2>&1); rc=$?
+  [ "$rc" -eq 1 ]
+}
+case_ "a URL's userinfo is not an address"                  t_userinfo
+case_ "a token with two @ is refused even at example domains" t_two_at
+case_ "check-addresses fails loudly when git cannot read the range" t_no_input
+
+# --- the pre-push hook ---
+hook_repo() {
+  new_repo; mkdir -p "$W/.githooks"; cp "$ROOT/.githooks/pre-push" "$W/.githooks/"
+  git -C "$W" add -A && git -C "$W" commit -q -m "Hook"
+}
+t_hook_new_branch() {
+  hook_repo; git -C "$W" config core.hooksPath .githooks; c_file
+  out=$(cd "$W" && CHECK_ADDRESSES_STRICT=1 git push -q origin topic 2>&1); rc=$?
+  [ "$rc" -ne 0 ] && has "file notes.txt" && ! has "jane@" && ! pushed topic
+}
+t_hook_clean_and_delete() {
+  hook_repo; git -C "$W" config core.hooksPath .githooks
+  (cd "$W" && CHECK_ADDRESSES_STRICT=1 git push -q origin topic) || return 1
+  pushed topic || return 1
+  (cd "$W" && CHECK_ADDRESSES_STRICT=1 git push -q origin :topic) || return 1
+  ! pushed topic
+}
+t_hook_range() {
+  hook_repo; c_file; git -C "$W" push -q origin topic || return 1    # pushed before the hook was enabled
+  git -C "$W" config core.hooksPath .githooks; change README.md
+  (cd "$W" && CHECK_ADDRESSES_STRICT=1 git push -q origin topic) || return 1
+  [ "$(git -C "$C/origin.git" rev-parse topic)" = "$(git -C "$W" rev-parse topic)" ]
+}
+t_hook_tag() {   # t_hook_tag <tagger email> <tag message>
+  hook_repo; git -C "$W" config core.hooksPath .githooks
+  git -C "$W" -c user.email="$1" tag -a v1 -m "$2"
+  out=$(cd "$W" && CHECK_ADDRESSES_STRICT=1 git push -q origin v1 2>&1); rc=$?
+  [ "$rc" -ne 0 ] && has "tag " && ! has "jane@" && ! git -C "$C/origin.git" rev-parse -q --verify refs/tags/v1 >/dev/null
+}
+case_ "pre-push refuses an annotated tag by its tagger"     t_hook_tag "jane@example.com" "Release"
+case_ "pre-push refuses an annotated tag by its message"    t_hook_tag "1+test@users.noreply.github.com" "Ask jane@example.com"
+case_ "pre-push refuses a new branch carrying an address"   t_hook_new_branch
+case_ "pre-push lets a clean branch and a deletion through" t_hook_clean_and_delete
+case_ "pre-push reads only the commits the remote lacks"    t_hook_range
+
+# --- pull requests someone else opened (--pr) ---
+# bot_pr <path> [<ci stub>]: branch bot on origin with one change (and its own scripts/ci, if given),
+# announced as open pull request 5
+bot_pr() {
+  new_repo; git -C "$W" switch -q -c bot main; change "$1"
+  if [ -n "${2:-}" ]; then printf '%s\n' "$2" > "$W/scripts/ci"; git -C "$W" commit -q -am "Stub"; fi
+  git -C "$W" push -q origin bot
+  git -C "$W" switch -q topic; git -C "$W" branch -q -D bot
+  echo bot > "$FAKE/pr_head"; echo "5 https://github.example/o/r/pull/5" > "$FAKE/pr_open"
+  echo '{"headRefName":"bot","state":"OPEN","url":"https://github.example/o/r/pull/5","isCrossRepository":false}' > "$FAKE/pr_info"
+}
+gone() { [ ! -e "$C/canon-worktrees/pr-5" ] && ! git -C "$W" show-ref --verify -q refs/heads/bot; }
+t_pr_lands() { bot_pr uv.lock; land --pr 5; [ "$rc" -eq 0 ] && logged "pr merge 5 --squash" && gone; }
+t_pr_message() {
+  bot_pr src/a.py; land --pr 5
+  [ "$rc" -ne 0 ] && has 'scripts/land --pr 5 --reviewed "' && gone
+}
+t_pr_interrupted() {
+  # the bot branch's scripts/ci stops the outer run with TERM, as an interrupt would
+  # shellcheck disable=SC2016  # expanded by the stub, not here
+  bot_pr uv.lock '#!/bin/bash
+for _ in $(seq 50); do [ -s "$FAKE/outer_pid" ] && break; sleep 0.1; done
+echo sent > "$FAKE/killed"; kill -TERM "$(cat "$FAKE/outer_pid")"; exit 1'
+  (cd "$W" && exec scripts/land --pr 5 --reviewed "test") >/dev/null 2>&1 &
+  echo $! > "$FAKE/outer_pid"; wait $! 2>/dev/null
+  [ -e "$FAKE/killed" ] || return 1
+  for _ in $(seq 50); do gone && return 0; sleep 0.1; done
+  return 1
+}
+t_pr_inner_stopped() {
+  # the stub stops the outer run, then succeeds, so an inner run that is not stopped would go on to merge
+  # shellcheck disable=SC2016  # expanded by the stub, not here
+  bot_pr uv.lock '#!/bin/bash
+for _ in $(seq 50); do [ -s "$FAKE/outer_pid" ] && break; sleep 0.1; done
+echo "$PPID" > "$FAKE/inner_pid"; echo sent > "$FAKE/killed"; kill -TERM "$(cat "$FAKE/outer_pid")"; sleep 1; exit 0'
+  (cd "$W" && exec scripts/land --pr 5 --reviewed "test") >/dev/null 2>&1 &
+  echo $! > "$FAKE/outer_pid"; wait $! 2>/dev/null
+  [ -e "$FAKE/killed" ] || return 1
+  # the outer run returns only once the inner one has stopped
+  ! kill -0 "$(cat "$FAKE/inner_pid")" 2>/dev/null || return 1
+  for _ in $(seq 50); do gone && break; sleep 0.1; done
+  sleep 0.5        # time for an inner run that was not stopped to reach GitHub
+  gone && ! logged "statuses" && ! logged "pr merge"
+}
+t_inner_message() {
+  new_repo; change src/a.py
+  out=$(cd "$W" && LAND_PR=5 scripts/land 2>&1); rc=$?
+  [ "$rc" -ne 0 ] && has 'scripts/land --pr 5 --reviewed "'
+}
+case_ "--pr lands a lockfile-only pull request and leaves nothing behind" t_pr_lands
+case_ "--pr refusal names --pr in the command to run"       t_pr_message
+case_ "a run inside --pr names --pr in the command to run"  t_inner_message
+case_ "an interrupted --pr run removes its worktree and branch" t_pr_interrupted
+case_ "an interrupted --pr run stops the run inside it"     t_pr_inner_stopped
+
+# --- dry run ---
+t_dry_missing_note() {
+  new_repo; change src/a.py; land --dry-run
+  [ "$rc" -ne 0 ] && ci_ran && has "would push" && has "needs an independent review" && ! pushed topic
+}
+case_ "--dry-run without a needed note still runs the checks, then fails" t_dry_missing_note
+
+# --- merging ---
+t_match_head() {
+  new_repo; change README.md; land
+  local sha; sha=$(git -C "$W" rev-parse topic)
+  [ "$rc" -eq 0 ] && logged "pr merge 7 --squash --match-head-commit $sha"
+}
+t_auto_match_head() {
+  new_repo; change README.md; echo 1 > "$FAKE/merge_rc"; land
+  local sha; sha=$(git -C "$W" rev-parse topic)
+  [ "$rc" -eq 0 ] && logged "pr merge 7 --auto --squash --match-head-commit $sha"
+}
+t_head_moved() {
+  new_repo; change README.md; echo 1 > "$FAKE/merge_rc"; echo "OPEN OTHER" > "$FAKE/views"; land
+  [ "$rc" -ne 0 ] && has "not the checked commit"
+}
+t_merge_then_wait() {
+  new_repo; change README.md; printf 'OPEN HEAD\nOPEN HEAD\nMERGED HEAD\n' > "$FAKE/views"; land
+  [ "$rc" -eq 0 ] && has "landed:"
+}
+t_merge_then_fail() {
+  new_repo; change README.md; echo "OPEN HEAD" > "$FAKE/views"; echo "all required checks passed" > "$FAKE/checks"; land
+  [ "$rc" -ne 0 ] && has "a required check failed"
+}
+case_ "the direct merge names the checked commit"           t_match_head
+case_ "auto-merge names the checked commit"                 t_auto_match_head
+case_ "a moved pull request head stops the wait"            t_head_moved
+case_ "a merge call that returns before merging is waited for" t_merge_then_wait
+case_ "a failed required check after a merge call stops the wait" t_merge_then_fail
+t_merge_text() {   # t_merge_text <merge_rc>: both merge calls carry the checked subject and message
+  new_repo; echo "line" >> "$W/README.md"; git -C "$W" commit -q -am "Reword the readme" -m "Details for the reader."
+  echo "$1" > "$FAKE/merge_rc"; land
+  [ "$rc" -eq 0 ] && logged "--subject Reword the readme (#7) --body-file" && grep -c "Details for the reader." "$FAKE/merge_body" >/dev/null
+}
+t_closed() {
+  new_repo; change README.md; echo 1 > "$FAKE/merge_rc"; echo "CLOSED HEAD" > "$FAKE/views"
+  LAND_WAIT_SECONDS=1000 land
+  [ "$rc" -ne 0 ] && has "closed without being merged"
+}
+t_merge_errors() {
+  new_repo; change README.md; echo 1 > "$FAKE/merge_rc"; echo 1 > "$FAKE/auto_rc"; land
+  [ "$rc" -ne 0 ] && has "direct merge refused by the fake" && has "auto-merge refused by the fake"
+}
+case_ "the direct merge gives the checked subject and message" t_merge_text 0
+case_ "auto-merge gives the checked subject and message"    t_merge_text 1
+case_ "a pull request closed while waiting stops the wait"  t_closed
+case_ "both merge calls' errors are shown when both fail"   t_merge_errors
+
+wait
+pass=0; fail=0
+for i in $(seq 1 "$ncase"); do
+  r="$RESULTS/$(printf '%03d' "$i")"
+  if [ ! -s "$r" ]; then echo "  FAIL  case $i left no result"; fail=$((fail + 1)); continue; fi
+  cat "$r"
+  case "$(sed -n 1p "$r")" in "  ok "*) pass=$((pass + 1)) ;; *) fail=$((fail + 1)) ;; esac
+done
+echo "test-land: $pass passed, $fail failed"
+[ "$fail" -eq 0 ]

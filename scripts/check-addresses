@@ -1,0 +1,137 @@
+#!/bin/bash
+# check-addresses — refuse to publish an email address that is not a known service or example address.
+#
+# The repository is public (docs/adr/0014-landing-workflow.md, rule 6), so everything pushed or put in a
+# pull request is readable by anyone. scripts/land runs this before it pushes, and .githooks/pre-push runs
+# it on every push (githooks(5), "pre-push").
+#
+# Usage: scripts/check-addresses [--title <text>]... [--note <text>] [--body <file>] [--tag <object>]...
+#                                [<revision>...]
+#   <revision>...    passed to `git log`, for example `origin/main..topic`, or `<sha> --not --remotes=origin`.
+#                    Every commit in the range is read: author and committer identities, the full message,
+#                    the file names of its diff (against its first parent) and its added lines, binary
+#                    files included (`git log --text`). Renames are read as a delete plus an add, so a
+#                    renamed file is read in full. UTF-16 file content is not read.
+#   --title <text>   a pull request title or other text that will be published
+#   --note <text>    the review note that scripts/land posts as a commit status
+#   --body <file>    a pull request description, which also becomes the squash commit's message
+#   --tag <object>   an annotated tag: its tagger and message (and those of any tag it points to)
+#
+# An address-like token is a run of letters, digits and ._%+-[]@ that holds an @ with something before
+# it, and whose last @ is followed by a domain ending in a label of two or more letters. A token right
+# after `scheme://` or `scheme://<user>:` is a URL's userinfo, not an address, and is skipped. So
+# `actions/checkout@<sha>`, `ccusage@20.0.48`, a decorator and an escaped pattern such as `@users\.noreply`
+# are not addresses, and an address with `@users.noreply.github.com` appended is judged as one token.
+# Allowed tokens have exactly one @ and are one of:
+#   noreply@github.com, noreply@anthropic.com, support@github.com, git@github.com (the SSH remote form)
+#   <digits>+<login>@users.noreply.github.com, the login optionally ending in [bot]
+#   anything at a reserved example domain (RFC 2606, RFC 6761): example.com, example.net, example.org and
+#   their subdomains, and any name ending in .example, .test, .invalid or .localhost
+# CHECK_ADDRESSES_STRICT=1 also refuses the reserved example domains; it only makes the check stricter, and
+# lets scripts/test-land use reserved domains for the addresses it expects to be refused.
+#
+# A refusal names where each address was found and its domain, never the address itself (an address in
+# a file name or path is shown as <address>).
+# Exit 0 when nothing is refused, 1 when something is, 2 when the input cannot be read.
+set -uo pipefail
+die() { echo "check-addresses: $*" >&2; exit 2; }
+USAGE="usage: scripts/check-addresses [--title <text>]... [--note <text>] [--body <file>] [--tag <object>]... [<revision>...]"
+
+titles=(); NOTE=""; BODY=""; tags=(); revs=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --title) [ $# -ge 2 ] || die "$USAGE"; titles+=("$2"); shift 2 ;;
+    --note)  [ $# -ge 2 ] || die "$USAGE"; NOTE="$2"; shift 2 ;;
+    --body)  [ $# -ge 2 ] || die "$USAGE"; BODY="$2"; shift 2 ;;
+    --tag)   [ $# -ge 2 ] || die "$USAGE"; tags+=("$2"); shift 2 ;;
+    --) shift; revs+=("$@"); break ;;
+    -h|--help) echo "$USAGE"; exit 0 ;;
+    *) revs+=("$1"); shift ;;
+  esac
+done
+[ ${#revs[@]} -gt 0 ] || [ ${#titles[@]} -gt 0 ] || [ -n "$NOTE" ] || [ -n "$BODY" ] || [ ${#tags[@]} -gt 0 ] \
+  || die "$USAGE"
+[ -z "$BODY" ] || [ -r "$BODY" ] || die "body file not readable: $BODY"
+
+TMP=$(mktemp -d) || die "could not create a temporary directory"
+trap 'rm -rf "$TMP"' EXIT
+raw="$TMP/raw"; stream="$TMP/stream"
+: > "$raw" || die "could not write to $TMP"
+
+# The stream is a sequence of sections, each opened by a line that starts with \001 and names its source.
+# Inside a commit's diff section, only file names and added lines are judged.
+{
+  for t in ${titles[@]+"${titles[@]}"}; do printf '\001T title\n%s\n' "$t"; done
+  [ -z "$NOTE" ] || printf '\001T review note\n%s\n' "$NOTE"
+  if [ -n "$BODY" ]; then printf '\001T body file %s\n' "$BODY"; cat "$BODY" || exit 1; printf '\n'; fi
+} >> "$raw" || die "could not read the body file $BODY"
+for obj in ${tags[@]+"${tags[@]}"}; do
+  # A tag can point to another tag; read each one down to the first object that is not a tag.
+  while [ "$(git cat-file -t "$obj" 2>/dev/null)" = "tag" ]; do
+    text=$(git cat-file tag "$obj") || die "could not read the tag $obj"
+    printf '\001T tag %s\n%s\n' "$(git rev-parse --short=12 "$obj")" "$text" >> "$raw" || die "could not write to $TMP"
+    obj=$(printf '%s\n' "$text" | sed -n '1s/^object //p')
+    [ -n "$obj" ] || die "could not read what a tag points to"
+  done
+done
+if [ ${#revs[@]} -gt 0 ]; then
+  git log --no-color --no-ext-diff --no-textconv --no-renames --text --diff-merges=first-parent -p -U0 \
+      --format='%x01C %H%n%x01I%n%an <%ae>%n%cn <%ce>%n%x01M%n%B%n%x01D' "${revs[@]}" >> "$raw" \
+    || die "could not read the commits in ${revs[*]}"
+fi
+# awk reads text lines; a NUL byte in a binary file becomes a space so that the rest of its line is read.
+LC_ALL=C tr '\000' ' ' < "$raw" > "$stream" || die "could not prepare what was read"
+
+LC_ALL=C awk -v strict="${CHECK_ADDRESSES_STRICT:-0}" '
+function allowed(t,   n, dom) {
+  n = gsub(/@/, "@", t)
+  if (n != 1) return 0
+  if (t == "noreply@github.com" || t == "noreply@anthropic.com" || t == "support@github.com" || t == "git@github.com") return 1
+  if (t ~ /^[0-9]+\+[a-z0-9-]+(\[bot\])?@users\.noreply\.github\.com$/) return 1
+  if (strict == "1") return 0
+  dom = t; sub(/^.*@/, "", dom)
+  if (dom ~ /(^|\.)example\.(com|net|org)$/) return 1
+  if (dom ~ /\.(example|test|invalid|localhost)$/) return 1
+  return 0
+}
+function mask(s) { gsub(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.@-]+/, "<address>", s); return s }
+function judge(s, where,   tok, t, dom, pre) {
+  while (match(s, /[][A-Za-z0-9._%+@-]*@[][A-Za-z0-9._%+@-]*/)) {
+    pre = substr(s, 1, RSTART - 1)
+    tok = substr(s, RSTART, RLENGTH); s = substr(s, RSTART + RLENGTH)
+    if (pre ~ /[A-Za-z][A-Za-z0-9+.-]*:\/\/([^\/@ ]*:)?$/) continue      # userinfo of a URL
+    t = tolower(tok)
+    sub(/^(\[|\.)+/, "", t); sub(/(\]|\.)+$/, "", t)
+    if (t !~ /^[^@]+@/) continue
+    dom = t; sub(/^.*@/, "", dom)
+    if (dom !~ /^[a-z0-9-]+(\.[a-z0-9-]+)*\.[a-z][a-z]+$/) continue
+    if (allowed(t)) continue
+    key = where SUBSEP dom
+    if (!(key in seen)) { seen[key] = 1; refused++; printf "check-addresses: %s: an address at %s\n", mask(where), dom > "/dev/stderr" }
+  }
+}
+/^\001T / { sect = "T"; where = substr($0, 4); next }
+/^\001C / { commit = substr($0, 4, 12); next }
+/^\001I$/ { sect = "I"; where = "commit " commit " author or committer identity"; next }
+/^\001M$/ { sect = "M"; where = "commit " commit " message"; next }
+/^\001D$/ { sect = "D"; inhdr = 0; file = ""; next }
+# The diff --git line names the file even when no +++ line follows (an empty or binary file).
+sect == "D" && /^diff --git / {
+  inhdr = 1; file = substr($0, 12); sub(/^a\//, "", file); sub(/ b\/.*$/, "", file)
+  judge(substr($0, 12), "commit " commit " file name " file)
+  next
+}
+sect == "D" && inhdr && /^\+\+\+ / {
+  if (substr($0, 5) != "/dev/null") { file = substr($0, 5); sub(/^b\//, "", file) }
+  next
+}
+sect == "D" && /^@@/ { inhdr = 0; next }
+sect == "D" && !inhdr && /^\+/ { judge(substr($0, 2), "commit " commit " file " file); next }
+sect == "D" { next }
+{ judge($0, where) }
+END {
+  if (refused > 0) {
+    printf "check-addresses: refused %d address(es). Only GitHub and Anthropic noreply addresses and reserved example domains may be published. Set git config user.email to a noreply address, reword or rewrite the commits, or edit the text, then try again.\n", refused > "/dev/stderr"
+    exit 1
+  }
+}' "$stream"

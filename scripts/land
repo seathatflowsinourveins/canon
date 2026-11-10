@@ -4,24 +4,30 @@
 # The owner's standing instruction is that work lands without a manual merge step. This script is that
 # step for people, agents and schedulers alike:
 #
-#   with a GitHub remote and a signed-in gh:  push, open a pull request, post the local sign-off status
-#       that main requires, wait for the hosted checks it also requires, and squash-merge.
-#   without one:                              fast-forward main locally.
+#   with an origin remote:  gh must be signed in. Check every address about to be published, push, open a
+#       pull request, post the `review` and `signoff` statuses that main requires, and wait for GitHub to
+#       squash-merge exactly the commit that was checked, with the title and description that were checked.
+#   with no origin remote:  fast-forward main locally.
 #
 # Either way nothing lands unless scripts/ci passes on exactly what is committed, on a branch that
-# contains the current main.
+# contains the current main, and a change that needs an independent review carries a note (ADR 0017).
 #
 # Usage: scripts/land [--body <file>] [--reviewed <note>] [--dry-run] [--pr <number>]
-#   --body <file>   pull request description (Summary / Test Plan / Evidence); default: the commit message
+#   --body <file>   pull request description (Summary / Test Plan / Evidence); default: the commit messages
 #   --reviewed <note>  which independent review ran on this change and what came of it (ADR 0017). Needed
-#                   when the change touches code, a harness script, a workflow, or adds a decision record
-#   --dry-run       run the checks and say what would happen; change nothing on GitHub or on main
+#                   unless every changed path is on the NO_REVIEW list below
+#   --dry-run       run the checks and say what would happen; change nothing on GitHub or on main. Exits
+#                   non-zero if the change would be refused for a missing note
 #   --pr <number>   land a pull request someone else opened, such as the dependency bot's (ADR 0016):
 #                   check it out in its own worktree, merge main into it if it is behind, then land it
-# gh flags used are from gh's own help: pr create --fill/--body-file, pr merge --auto --squash,
-# pr checks --required --json, pr checkout --worktree, pr view --json, api (commit statuses).
+# Environment: LAND_WAIT_SECONDS (default 540) and LAND_POLL_SECONDS (default 10) bound the wait for the
+# merge. LAND_PR is set by --pr for the run inside the worktree.
+# gh flags used are from gh's own help (gh 2.103.3): auth status, pr create --title/--body-file,
+# pr merge --squash/--auto/--match-head-commit/--subject/--body-file, pr checks --required --json, pr checkout --worktree,
+# pr view --json, pr list --json, api (commit statuses).
 set -uo pipefail
 SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+CHECK_ADDRESSES="$(dirname "$SELF")/check-addresses"
 ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "land: not inside a git repository" >&2; exit 1; }
 cd "$ROOT" || exit 1
 die()  { echo "land: $*" >&2; exit 1; }
@@ -46,14 +52,25 @@ if [ -n "$BODY" ]; then
   [ -f "$BODY" ] || die "body file not found: $BODY"
   BODY="$(cd "$(dirname "$BODY")" && pwd)/$(basename "$BODY")"
 fi
+# Set only by the --pr branch below, for the run inside the pull request's worktree.
+INNER_PR="${LAND_PR:-}"
+case "$INNER_PR" in *[!0-9]*) die "LAND_PR must be a pull request number" ;; esac
+[ -z "$INNER_PR" ] || [ -z "$PR" ] || die "--pr cannot be used inside a --pr run"
 
 if command -v mise >/dev/null 2>&1; then MISE=$(command -v mise)
 elif [ -x "$HOME/.local/bin/mise" ]; then MISE="$HOME/.local/bin/mise"
 else die "mise not found. Run scripts/bootstrap --install."; fi
 gh() { "$MISE" exec -- gh "$@"; }
 
+# The local path is for a repository with no origin at all. With an origin, landing goes through GitHub
+# or not at all, and a pull request's run never lands locally.
 remote=""
-if git remote get-url origin >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then remote=origin; fi
+if git remote get-url origin >/dev/null 2>&1; then
+  remote=origin
+  gh auth status >/dev/null 2>&1 \
+    || die "this repository has an origin remote, but gh is not signed in or cannot reach GitHub, so nothing was landed. Sign in with: mise exec -- gh auth login (check with: mise exec -- gh auth status), then run this again"
+fi
+[ -n "$remote" ] || [ -z "$INNER_PR" ] || die "pull request $INNER_PR has no origin remote to land through; nothing was landed"
 # What a branch must contain before it lands: GitHub's main where there is a remote, the local one otherwise.
 base=main
 if [ -n "$remote" ]; then
@@ -61,10 +78,25 @@ if [ -n "$remote" ]; then
   base=origin/main
 fi
 
+# Everything this run creates is removed when it ends, however it ends.
+tmpd=""; pr_wt=""; pr_branch=""
+cleanup() {
+  if [ -n "$pr_wt" ]; then
+    git -C "$ROOT" worktree remove --force "$pr_wt" 2>/dev/null || rm -rf "$pr_wt"
+    git -C "$ROOT" worktree prune 2>/dev/null
+    pr_wt=""
+  fi
+  if [ -n "$pr_branch" ]; then git -C "$ROOT" branch -q -D "$pr_branch" 2>/dev/null; pr_branch=""; fi
+  if [ -n "$tmpd" ]; then rm -rf "$tmpd"; tmpd=""; fi
+}
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
+
 # --- a pull request someone else opened ---------------------------------------------------------------
 if [ -n "$PR" ]; then
   case "$PR" in *[!0-9]*|'') die "--pr takes a pull request number" ;; esac
-  [ -n "$remote" ] || die "--pr needs a GitHub remote and a signed-in gh"
+  [ -n "$remote" ] || die "--pr needs an origin remote and a signed-in gh"
   info=$(gh pr view "$PR" --json headRefName,state,url,isCrossRepository 2>/dev/null) || die "pull request $PR not found"
   head=$(jq -r .headRefName <<<"$info")
   # A pull request from a fork has its branch elsewhere; landing it from here would publish its commits as
@@ -77,6 +109,9 @@ if [ -n "$PR" ]; then
   wt="$(dirname "$first")/canon-worktrees/pr-$PR"
   [ ! -e "$wt" ] || die "$wt already exists; remove it first: git worktree remove $wt"
   mkdir -p "$(dirname "$wt")" || die "could not create $(dirname "$wt")"
+  # Neither the worktree nor the branch existed a moment ago (checked above), so whatever is there once
+  # the checkout starts was made by this run, and the trap removes it even if the run is interrupted.
+  pr_wt="$wt"; pr_branch="$head"
   gh pr checkout "$PR" --worktree "$wt" >/dev/null 2>&1 || die "could not check out pull request $PR into $wt"
   (
     cd "$wt" || exit 1
@@ -92,11 +127,20 @@ if [ -n "$PR" ]; then
     [ -z "$BODY" ] || args+=(--body "$BODY")
     [ -z "$REVIEWED" ] || args+=(--reviewed "$REVIEWED")
     [ "$DRY" -eq 0 ] || args+=(--dry-run)
-    "$SELF" ${args[@]+"${args[@]}"}
-  ); rc=$?
-  # The worktree and the local branch were made by this run; leave nothing behind either way.
-  git worktree remove --force "$wt" 2>/dev/null
-  git branch -q -D "$head" 2>/dev/null
+    LAND_PR="$PR" exec "$SELF" ${args[@]+"${args[@]}"}
+  ) &
+  # The inner run is waited for in the background, so that an interrupt reaches this shell at once and is
+  # passed on as TERM (a background job ignores INT). The inner run's own trap then stops it before it
+  # pushes or merges anything further, and this one removes the worktree and branch.
+  inner=$!
+  # shellcheck disable=SC2329  # called from the traps below
+  stop_inner() { kill -TERM "$inner" 2>/dev/null; wait "$inner" 2>/dev/null; cleanup; exit "$1"; }
+  trap 'stop_inner 130' INT
+  trap 'stop_inner 143' TERM
+  wait "$inner"; rc=$?
+  trap 'cleanup; exit 130' INT
+  trap 'cleanup; exit 143' TERM
+  cleanup
   if [ "$rc" -eq 0 ] && [ "$DRY" -eq 0 ] && [ -f "$first/.canon/watch.json" ]; then
     # so the session brief stops listing it before the next daily watch
     jq --argjson n "$PR" 'if (.bot_prs | type) == "array" then .bot_prs |= map(select(.number != $n)) else . end' "$first/.canon/watch.json" \
@@ -109,62 +153,108 @@ fi
 branch=$(git branch --show-current)
 [ -n "$branch" ] || die "HEAD is detached; check out the branch you want to land"
 [ "$branch" != "main" ] || die "you are on main; land a branch"
-[ -z "$(git status --porcelain)" ] || die "the working tree has uncommitted changes; commit them first, so the checks run on what will land"
+status=$(git status --porcelain) || die "could not read the working tree's status"
+[ -z "$status" ] || die "the working tree has uncommitted changes; commit them first, so the checks run on what will land"
 git rev-parse --verify -q "$base" >/dev/null || die "there is no $base to land on"
-ahead=$(git rev-list --count "$base..$branch")
+ahead=$(git rev-list --count "$base..$branch") || die "could not count the commits on $branch"
 [ "$ahead" -gt 0 ] || die "$branch has nothing that main lacks"
 git merge-base --is-ancestor "$base" "$branch" \
   || die "$branch does not contain the current main; rebase it onto main first (for a pull request someone else opened, use --pr)"
 
 # The checks below decide whether a change may merge. A model's review does not; what the gate asks is
-# that an independent review has run where a defect costs most, before the push (ADR 0017). The note is
-# the lander's own statement, recorded on the commit as the `review` status.
-# The list covers code, harness scripts, workflows, and the files that wire or define the guard and the
-# reviewers themselves. Renames are listed as a delete plus an add, and names come NUL-separated, which
-# is the one form git never quotes, so moving a file out of a reviewed path or naming it oddly does not
-# slip past.
-REVIEW_PATHS='^(src/|packages/|scripts/|home/|\.claude/hooks/|\.claude/agents/|\.claude/settings\.json$|\.githooks/|\.github/workflows/)'
-changed() { git diff --name-only --no-renames -z "$@" "$base...$branch" | tr '\0' '\n'; }
-files=$(changed) || die "could not list what $branch changes, so the review gate cannot be applied"
-added=$(changed --diff-filter=A) || die "could not list what $branch adds, so the review gate cannot be applied"
-touched=$(printf '%s\n' "$files" | grep -E "$REVIEW_PATHS" | sed -n '1,4p' | tr '\n' ' ' || true)
-new_adr=$(printf '%s\n' "$added" | grep -E '^docs/adr/[0-9]{4}-' | tr '\n' ' ' || true)
-if [ -n "$touched$new_adr" ] && [ -z "$REVIEWED" ]; then
-  die "this change touches ${touched}${new_adr}and needs an independent review first: /code-review for code, the evidence-verifier for a decision record. Resolve what it finds, then land with --reviewed \"<what ran and what came of it>\""
+# that an independent review has run before the push (ADR 0017). The note is the lander's own statement,
+# recorded on the commit as the `review` status.
+# A note is needed unless EVERY changed path is on this list. Each entry is <statuses>:<pattern>, where the
+# statuses are git's A (added), M (modified), D (deleted), and * in a pattern does not cross a /.
+#   README.md, packages/*/README.md, catalog/README.md   documentation
+#   M:docs/adr/NNNN-*.md                                 an edit to an existing decision record (a new one,
+#                                                        or one made by renaming, needs the verifier)
+#   M:uv.lock                                            the dependency bot's lockfile-only pull request,
+#                                                        which lands on passing checks (ADR 0016 rule 1)
+NO_REVIEW='AMD:README.md AMD:packages/*/README.md AMD:catalog/README.md M:docs/adr/[0-9][0-9][0-9][0-9]-*.md M:uv.lock'
+# Renames are listed as a delete plus an add, and names come NUL-separated, which is the one form git never
+# quotes, so moving a file or naming it oddly does not slip past.
+no_review() {   # no_review <status> <path>: succeeds if the path is on the list with that status
+  local st="$1" path="$2" entry statuses pattern
+  for entry in $NO_REVIEW; do
+    statuses=${entry%%:*}; pattern=${entry#*:}
+    case "$statuses" in *"$st"*) ;; *) continue ;; esac
+    # shellcheck disable=SC2254  # the pattern is meant to match as a glob
+    case "$path" in $pattern) ;; *) continue ;; esac
+    [ "${path//[!\/]/}" = "${pattern//[!\/]/}" ] && return 0      # same depth, so * stayed in one directory
+  done
+  return 1
+}
+set -f      # the list's patterns must not expand against files in the working tree
+tmpd=$(mktemp -d) || die "could not create a temporary directory"
+git diff --name-status --no-renames -z "$base...$branch" > "$tmpd/changed" \
+  || die "could not list what $branch changes, so the review gate cannot be applied"
+needs=(); count=0
+while IFS= read -r -d '' st && IFS= read -r -d '' path; do
+  count=$((count + 1))
+  no_review "$st" "$path" || needs+=("$path")
+done < "$tmpd/changed"
+set +f
+[ "$count" -gt 0 ] || die "git listed no changed paths for $branch, so the review gate cannot be applied"
+missing_note=0
+if [ ${#needs[@]} -gt 0 ] && [ -z "$REVIEWED" ]; then
+  cmd="scripts/land"
+  [ -z "$INNER_PR" ] || cmd="$cmd --pr $INNER_PR"
+  [ -z "$BODY" ] || cmd="$cmd --body $(printf '%q' "$BODY")"
+  shown=$(printf '%s ' "${needs[@]:0:4}"); [ ${#needs[@]} -le 4 ] || shown="${shown}and $((${#needs[@]} - 4)) more "
+  msg="this change touches ${shown}and needs an independent review first: /code-review for code, the evidence-verifier for a decision record. Resolve what it finds, then land with: $cmd --reviewed \"<what ran and what came of it>\""
+  [ "$DRY" -eq 1 ] || die "$msg"
+  echo "land: dry run: $msg" >&2
+  missing_note=1
+fi
+if [ ${#needs[@]} -eq 0 ]; then review_default="not needed: documentation or lockfile only"; fi
+
+# The pull request's title and description, which also become the squash commit's subject and message:
+# the last commit's subject, and --body or else the commits' own messages.
+title=$(git log -1 --format=%s "$branch") || die "could not read the last commit on $branch"
+pr_body="$BODY"
+if [ -z "$pr_body" ]; then
+  pr_body="$tmpd/body"
+  if [ "$ahead" -eq 1 ]; then git log -1 --format=%b "$branch" > "$pr_body"
+  else git log --reverse --format='* %s%n%n%b' "$base..$branch" > "$pr_body"; fi \
+    || die "could not read the commit messages on $branch"
+fi
+# A public repository shows everything pushed, and every piece of text this script posts, so nothing goes
+# out that carries a personal address (ADR 0014).
+review_note="${REVIEWED:-${review_default:-}}"
+if [ -n "$remote" ]; then
+  [ -x "$CHECK_ADDRESSES" ] || die "$CHECK_ADDRESSES is missing, so the addresses cannot be checked"
+  "$CHECK_ADDRESSES" --title "$title" --title "$branch" --note "${review_note:-none}" --body "$pr_body" "$base..$branch" \
+    || die "nothing was pushed: what $branch would publish carries an address that may not be public (see above)"
 fi
 
-# A public repository shows every commit's author and committer address, so only GitHub's noreply
-# addresses are pushed (ADR 0014).
-if [ -n "$remote" ]; then
-  idents=$(git log --format='%ae%n%ce' "$base..$branch") || die "could not read the commits on $branch"
-  exposed=$(printf '%s\n' "$idents" | grep -vcE '(@users\.noreply\.github\.com|^noreply@github\.com)$' || true)
-  [ "$exposed" -eq 0 ] || die "$exposed author or committer address(es) on $branch are not GitHub noreply addresses. Set git config user.email to your noreply address and recommit."
-  # Trailers such as Co-authored-by carry addresses too. GitHub's and Anthropic's noreply addresses, and
-  # GitHub's support address that its bots sign with, are fine; anything else is refused.
-  messages=$(git log --format=%B "$base..$branch") || die "could not read the commit messages on $branch"
-  # Each address on a trailer line is judged by itself, so one noreply address cannot cover for another.
-  exposed=$(printf '%s\n' "$messages" | grep -iE '^[[:space:]]*[A-Za-z-]+-by:' | grep -oE '<[^<>]*@[^<>]*>' \
-              | grep -vcE '^<([^<>]*@users\.noreply\.github\.com|noreply@github\.com|noreply@anthropic\.com|support@github\.com)>$' || true)
-  [ "$exposed" -eq 0 ] || die "$exposed address(es) in commit message trailers on $branch are not noreply addresses. Reword the commit."
-fi
+# finish <what would happen>: the end of a dry run
+finish_dry() {
+  note "dry run: would $1"
+  if [ "$missing_note" -eq 1 ]; then echo "land: dry run: refused for now, because the change needs --reviewed" >&2; exit 1; fi
+  exit 0
+}
 
 note "$branch is $ahead commit(s) ahead of main. Running every check."
 "$ROOT/scripts/ci" || die "checks failed; nothing landed"
 
 if [ -z "$remote" ]; then
-  if [ "$DRY" -eq 1 ]; then note "dry run: would fast-forward main to $(git rev-parse --short HEAD) (no GitHub remote or gh not signed in)"; exit 0; fi
+  [ "$DRY" -eq 0 ] || finish_dry "fast-forward main to $(git rev-parse --short HEAD) (no origin remote)"
   # Moves the main ref only. No checkout, so other sessions sharing the repository are not disturbed,
   # and it refuses anything that is not a fast-forward. Git also refuses if main is checked out in
   # another worktree; that has to be done there.
   git fetch -q . "$branch:main" \
     || die "main could not be fast-forwarded. If main is checked out in another worktree, run there: git merge --ff-only $branch"
-  note "landed locally: main is now $(git rev-parse --short main). (No GitHub remote or gh not signed in.)"
+  note "landed locally: main is now $(git rev-parse --short main). (No origin remote.)"
+  if [ -n "$REVIEWED" ]; then
+    note "review note: \"$REVIEWED\". It is not recorded anywhere, because there is no remote to post it to."
+  fi
   exit 0
 fi
 
-if [ "$DRY" -eq 1 ]; then note "dry run: would push $branch, open a pull request if there is none, sign off and squash-merge it"; exit 0; fi
-git push -q -u "$remote" "$branch" || die "push failed"
+[ "$DRY" -eq 0 ] || finish_dry "push $branch, open a pull request if there is none, record the review, sign off and squash-merge it"
 sha=$(git rev-parse HEAD)
+git push -q -u "$remote" "$branch" || die "push failed"
 # The open pull request for this branch, by number from here on. Looking it up by branch name alone would
 # also find an earlier, already merged pull request of a branch that had the same name.
 # `--head` takes a bare branch name, so a fork's pull request from a branch of the same name is left out
@@ -173,16 +263,17 @@ open_pr() { gh pr list --head "$branch" --base main --state open --json number,u
               --jq '[.[] | select(.isCrossRepository | not)][0] | select(. != null) | "\(.number) \(.url)"'; }
 found=$(open_pr) || die "could not list the pull requests for $branch"
 if [ -z "$found" ]; then
-  if [ -n "$BODY" ]; then gh pr create --base main --head "$branch" --title "$(git log -1 --format=%s)" --body-file "$BODY" >/dev/null
-  else gh pr create --base main --head "$branch" --fill >/dev/null; fi || die "could not open the pull request"
+  gh pr create --base main --head "$branch" --title "$title" --body-file "$pr_body" >/dev/null \
+    || die "could not open the pull request"
   found=$(open_pr) || die "could not list the pull requests for $branch"
 fi
 [ -n "$found" ] || die "no open pull request found for $branch"
 num=${found%% *}; url=${found#* }
+[ -z "$INNER_PR" ] || [ "$num" = "$INNER_PR" ] || die "the open pull request for $branch is $url, not pull request $INNER_PR"
 
 # Record the review first: `signoff` is the status the ruleset waits for, so nothing can merge before the
 # note is on the commit. (A status description holds 140 characters; the note was cut to that when read.)
-review_note="${REVIEWED:-not needed: no code, harness script, workflow or new decision record}"
+[ -n "$review_note" ] || die "no review note to record on $url"
 gh api -X POST "repos/{owner}/{repo}/statuses/$sha" -f state=success -f context=review \
    -f description="$review_note" >/dev/null || die "could not record the review on $url"
 
@@ -194,25 +285,36 @@ gh api -X POST "repos/{owner}/{repo}/statuses/$sha" -f state=success -f context=
    -f description="scripts/ci passed locally" >/dev/null || die "could not post the sign-off status for $url"
 
 # The ruleset also requires the hosted workflow's aggregating job, which runs the same script on GitHub's
-# runners. While that run is going, GitHub's auto-merge is switched on and this script waits for it, so
-# landing stays one command that ends with main updated.
-if gh pr merge "$num" --squash >/dev/null 2>&1; then
-  :                                             # every requirement was already met, so it merged now
-elif gh pr merge "$num" --auto --squash >/dev/null 2>&1; then
-  note "signed off; waiting for the hosted checks on $url"
-  waited=0; limit="${LAND_WAIT_SECONDS:-540}"
-  until [ "$(gh pr view "$num" --json state --jq .state 2>/dev/null)" = "MERGED" ]; do
-    failed=$(gh pr checks "$num" --required --json name,bucket \
-               --jq '[.[] | select(.bucket == "fail" or .bucket == "cancel") | .name] | join(", ")' 2>/dev/null)
-    [ -z "$failed" ] || die "a required check failed on $url: $failed. Push a fix to $branch and land again."
-    [ "$waited" -lt "$limit" ] \
-      || die "$url is not merged after ${limit}s. Auto-merge is on, so GitHub merges it when the checks pass; then run: git fetch origin main:main"
-    sleep 10; waited=$((waited + 10))
-  done
+# runners. Both merge calls name the commit that was checked, so GitHub refuses to merge anything else,
+# and give the squash commit the subject and message checked above, so text edited on GitHub does not
+# reach main. If every requirement is already met the first one merges; otherwise auto-merge is switched
+# on. Either way this script waits until GitHub reports the pull request merged, so landing stays one
+# command that ends with main updated.
+merge=(--squash --match-head-commit "$sha" --subject "$title (#$num)" --body-file "$pr_body")
+if err=$(gh pr merge "$num" "${merge[@]}" 2>&1 >/dev/null); then
+  auto=0
+elif err_auto=$(gh pr merge "$num" --auto "${merge[@]}" 2>&1 >/dev/null); then
+  auto=1; note "signed off; waiting for the hosted checks on $url"
 else
-  die "signed off, but GitHub would neither merge nor enable auto-merge on $url"
+  die "signed off, but GitHub would neither merge nor enable auto-merge on $url. It said: ${err:-nothing} / ${err_auto:-nothing}"
 fi
-[ "$(gh pr view "$num" --json state --jq .state)" = "MERGED" ] || die "GitHub accepted the merge but $url is not marked merged"
+waited=0; limit="${LAND_WAIT_SECONDS:-540}"; poll="${LAND_POLL_SECONDS:-10}"
+while :; do
+  view=$(gh pr view "$num" --json state,headRefOid --jq '"\(.state) \(.headRefOid)"' 2>/dev/null) || view=""
+  state=${view%% *}; headsha=${view#* }
+  [ "$state" != "MERGED" ] || break
+  [ "$state" != "CLOSED" ] || die "$url was closed without being merged; nothing landed"
+  [ -z "$view" ] || [ "$headsha" = "$sha" ] \
+    || die "the head of $url is now ${headsha:0:12}, not the checked commit ${sha:0:12}; nothing else is merged. Land again from the new head."
+  failed=$(gh pr checks "$num" --required --json name,bucket \
+             --jq '[.[] | select(.bucket == "fail" or .bucket == "cancel") | .name] | join(", ")' 2>/dev/null)
+  [ -z "$failed" ] || die "a required check failed on $url: $failed. Push a fix to $branch and land again."
+  if [ "$waited" -ge "$limit" ]; then
+    [ "$auto" -eq 1 ] && die "$url is not merged after ${limit}s. Auto-merge is on, so GitHub merges it when the checks pass; then run: git fetch origin main:main"
+    die "GitHub accepted the merge of $url but has not marked it merged after ${limit}s; look at the pull request"
+  fi
+  sleep "$poll"; waited=$((waited + (poll > 0 ? poll : 1)))
+done
 
 # Bring the local main up to date. Git will not move a branch that is checked out in another worktree,
 # so in that case say where to do it; the landing itself is already done.
