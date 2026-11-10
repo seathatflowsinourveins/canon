@@ -111,5 +111,5 @@ run = '''
 # file, as lockf(1) advises when processes contend). The lock is in the per-user temporary folder, which is
 # the same for every process of the user whatever $TMPDIR a session sets.
 /usr/bin/lockf -k -t 900 "$(/usr/bin/getconf DARWIN_USER_TEMP_DIR)canon-paper-test.lock" \
-  uv run --locked pytest -rs packages/canon-alpaca/tests/test_paper_*.py
+  uv run --locked pytest -rs packages/canon-alpaca/tests/test_paper_*.py tests/test_paper_*.py
 '''

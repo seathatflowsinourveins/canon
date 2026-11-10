@@ -47,6 +47,9 @@ previous copy of each.
 while a fast moving average of bar closes is above a slow one. It is there to move bars, orders, fills and
 an account through NautilusTrader, not as a trading idea. `run_backtest` (`backtest.py`) runs strategies
 over their bars in a `ParquetDataCatalog` on a simulated Alpaca venue and returns the engine's own results.
+`ema_cross_paper_node` (`paper_node.py`) builds a live node on Alpaca's paper environment that runs
+upstream's built-in `EmaCross` under the risk engine's native limits; the paper test runs it for one order
+([ADR 0037](docs/adr/0037-ema-cross-paper-run-under-native-risk-limits.md)).
 
 It needs no network, no credentials and no downloaded data:
 
@@ -99,7 +102,8 @@ mise run paper:store    # asks for the key ID and the secret at a hidden prompt;
 mise run paper:check    # says whether both keychain items exist; prints neither value
 mise run paper:remove   # deletes both items
 mise run paper:test     # runs the paper tests with the pair, one session at a time (they place DAY
-                        # limit buys of 1 AAPL far below the market and cancel each one)
+                        # limit buys of 1 AAPL far below the market and cancel each one, and let
+                        # EmaCross trade 1 SPY, then close it)
 ```
 
 `paper:store` refuses a key ID starting with `AK`, Alpaca's hint for a live key, then sends the pair to
@@ -144,7 +148,7 @@ runs.
 | `canon/upstreams.json` | The registry: 40 upstreams with role, licence, evidence, ADR |
 | `canon/upstreams.lock.json` | Resolved commit SHAs (generated) |
 | `canon/models.json` | Model routing by lane and the landscape snapshot behind it |
-| `docs/adr/` | Thirty-five decisions in MADR 4.0.0, each with Evidence and `review-by` |
+| `docs/adr/` | Thirty-six decisions in MADR 4.0.0, each with Evidence and `review-by` |
 | `pyproject.toml`, `uv.lock` | uv workspace root; one lockfile for every package |
 | `src/canon_trading/` | Strategies and node configuration |
 | `packages/canon-alpaca/` | The Alpaca adapter for NautilusTrader: a market-data client and a paper-only execution client |

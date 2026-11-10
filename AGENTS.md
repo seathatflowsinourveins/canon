@@ -107,6 +107,7 @@ dependency, pattern and practice traces to a pinned upstream or a dated source. 
 | 0033 | Alpaca paper key entry: a hidden prompt in `paper:store`, the pair checked against the paper API before it is stored |
 | 0035 | Trial ledger: an Optuna study in a local SQLite file, one trial per backtest |
 | 0036 | The Alpaca adapter's order management: each hook built as upstream's own adapters build it |
+| 0037 | A paper run of upstream's `EmaCross` through the adapter: risk limits under Alpaca's 200 calls a minute, one order a run |
 
 ## Automation
 

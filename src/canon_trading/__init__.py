@@ -10,6 +10,8 @@ packages/canon-alpaca.
 * `ledger` - `record_trial`, a run meant as a trial recorded in an Optuna study (ADR 0035)
 * `returns_matrix` - the daily returns of the ledger's trials on a common range (ADR 0010, step 2)
 * `ranking` - `rank`, the pick and its deflated Sharpe ratio against 0.95 (ADR 0010, step 3; ADR 0031)
+* `paper_node` - `ema_cross_paper_node`, upstream's built-in `EmaCross` on a paper node under the risk
+  engine's native limits (ADR 0037)
 
 Nothing here places live orders. See docs/adr/0009-trading-foundation.md.
 """
