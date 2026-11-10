@@ -14,8 +14,11 @@ Alignment with Alpaca's own position is the execution engine's position check, `
 result, with no second client and no keys of its own.
 
 Over `max_position` in either direction it logs an error naming the quantity and calls
-`shutdown_system`, which stops the node; the strategies' `on_stop` then flatten. It also trips on a position
-that reconciliation inferred and the venue does not hold, failing closed. The first check runs at start.
+`shutdown_system`, which stops the node. The cap sends no order, and flattens only through the strategies'
+own stop: `SessionMaCross` in a session window runs upstream's market exit (`manage_stop`) and the window
+then checks the account and closes what is left; upstream's `EmaCross` does not flatten on stop, so its
+caller closes the position (`paper_node.ema_cross_paper_node`). It also trips on a position that
+reconciliation inferred and the venue does not hold, failing closed. The first check runs at start.
 """
 
 from __future__ import annotations

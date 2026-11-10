@@ -19,6 +19,7 @@ from types import SimpleNamespace
 from typing import cast
 
 import pytest
+from alpaca.common.exceptions import APIError
 from alpaca.trading.client import TradingClient
 from alpaca.trading.models import Calendar
 from alpaca.trading.models import Clock
@@ -504,6 +505,10 @@ class Holding:
         self.canceling = False
         self.qty = 1
         self.calls: list[str] = []
+        self.is_open = True
+
+    def get_clock(self) -> Clock:
+        return clock(datetime(2026, 11, 10, 15, 0, tzinfo=NEW_YORK), is_open=self.is_open)
 
     def get_orders(self, filter=None) -> list:
         if self.canceling:
@@ -549,6 +554,7 @@ def test_outside_the_session_the_orders_are_canceled_and_the_position_reported(
     monkeypatch.setattr(session_window, "POLL_SECS", 0.0)
     monkeypatch.setattr(session_window, "position_qty", lambda t, s: Decimal(t.qty))
     account = Holding()
+    account.is_open = False  # outside the regular session
     report = session_window.WindowReport("extended", "SPY", started="t")
     left = session_window._flatten_after_stop(
         cast(TradingClient, account), WindowConfig(session="extended"), report
@@ -849,9 +855,7 @@ def test_a_window_whose_account_check_fails_is_recorded_failed_not_ok(
     cap = SimpleNamespace(checks=1, peak=Decimal(0), tripped=None)
     monkeypatch.setattr(session_window, "paper_trading", lambda: Account())
     monkeypatch.setattr(session_window, "window_node", lambda config, **kw: (Ran(), s, cap))
-    monkeypatch.setattr(
-        session_window, "asyncio", SimpleNamespace(run=lambda coroutine: coroutine.close())
-    )
+    monkeypatch.setattr(session_window, "_run_node", lambda node, ends: None)
 
     def unreachable(trading, config, report):
         raise RuntimeError("Alpaca answered 503")
@@ -885,3 +889,511 @@ def test_every_run_leaves_a_heartbeat_even_with_nothing_to_run(monkeypatch, tmp_
     assert session_window.main(["--session", "auto", "--log-dir", str(tmp_path)]) == 0
     heard = json.loads((tmp_path / "last-firing.json").read_text())
     assert heard["outcome"].startswith("nothing to run") and heard["commit"] == "d" * 40
+
+
+# Review findings on the session windows (a second reader, 2026-11-10): each shown here before its fix.
+
+
+def test_the_stop_is_bounded_from_the_nodes_own_bounds_inside_a_record_going_stale() -> None:
+    """The window's wait for the stop is the market exit at its longest, the node's own stop bounds and
+    one Alpaca request; with the account check after it, a window still ends before `stale_after`."""
+    assert session_window.STOP_TIMEOUT_SECS == pytest.approx(60 + 5 + 15 + 5 + 3.05 + 27)
+    longest = (
+        session_window.MAX_MINUTES * 60
+        + session_window.STOP_TIMEOUT_SECS
+        + session_window.AFTER_STOP_SECS
+        + 30  # the last settle
+    )
+    assert longest < session_window.STALE_RUNNING_SECS
+
+
+def test_a_stop_that_timed_out_ends_the_process_after_its_record(monkeypatch, tmp_path) -> None:
+    import os
+
+    def timed_out(config, **kwargs):
+        session_window._ABANDONED.append(("runner", "task"))
+        raise session_window.StopTimedOut("the node did not stop within 115 s")
+
+    exits: list[int] = []
+
+    def exit_now(code: int) -> None:
+        exits.append(code)
+        raise SystemExit(code)
+
+    monkeypatch.setattr(session_window, "_ABANDONED", [])
+    monkeypatch.setattr(session_window, "run_window", timed_out)
+    monkeypatch.setattr(os, "_exit", exit_now)
+    with pytest.raises(SystemExit):
+        session_window.main(["--log-dir", str(tmp_path)])
+    assert exits == [1]
+    heard = json.loads((tmp_path / "last-firing.json").read_text())
+    assert heard["outcome"].startswith("failed: StopTimedOut")
+
+
+class Hung:
+    """A node whose stop never ends: `run_async` waits forever and absorbs a cancel, as upstream's hosted
+    run does while its shutdown runs ("cancelling the awaiting task requests the same graceful shutdown,
+    waits for it to finish", `crates/live/src/python/node.rs` at the pin)."""
+
+    cache = SimpleNamespace(orders=lambda **kwargs: [])
+
+    def __init__(self) -> None:
+        self.stops = 0
+        self.disposed = False
+
+    def handle(self):
+        return SimpleNamespace(stop=self._stop)
+
+    def _stop(self) -> None:
+        self.stops += 1
+
+    async def run_async(self) -> None:
+        import asyncio
+
+        while True:
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                continue
+
+    def dispose(self) -> None:
+        self.disposed = True
+
+
+def ran_node(node) -> tuple:
+    s = SimpleNamespace(dropped=[], history_bars=0, history_dropped=0)
+    cap = SimpleNamespace(checks=1, peak=Decimal(0), tripped=None)
+    return node, s, cap
+
+
+def test_a_stop_that_hangs_is_bounded_recorded_failed_and_the_account_still_checked(
+    monkeypatch, tmp_path
+) -> None:
+    """Finding 1: after the stop, the window waited on the node with no limit."""
+    import threading
+
+    node = Hung()
+    checked: list[str] = []
+    monkeypatch.setattr(session_window, "_ABANDONED", [])
+    monkeypatch.setattr(session_window, "STOP_TIMEOUT_SECS", 0.2)
+    monkeypatch.setattr(session_window, "paper_trading", lambda: Account())
+    monkeypatch.setattr(session_window, "window_node", lambda config, **kw: ran_node(node))
+    monkeypatch.setattr(
+        session_window,
+        "_flatten_after_stop",
+        lambda trading, config, report: checked.append("checked") or [],
+    )
+    raised: list[BaseException] = []
+
+    def window() -> None:  # the stand-in clock is in the past, so the window's end has come
+        try:
+            session_window.run_window(WindowConfig(log_dir=tmp_path))
+        except BaseException as e:  # noqa: BLE001 - the test reads what was raised
+            raised.append(e)
+
+    thread = threading.Thread(target=window, daemon=True)
+    thread.start()
+    thread.join(10)
+    assert not thread.is_alive(), "the window still waits on a node whose stop hangs"
+    assert node.stops == 1 and checked == ["checked"]
+    assert raised and isinstance(raised[0], session_window.StopTimedOut)
+    assert not node.disposed  # its task still owns it
+    latest = json.loads((tmp_path / "latest.json").read_text())
+    assert latest["result"].startswith("failed: StopTimedOut: the node did not stop within 0.2 s")
+
+
+class FakeTime:
+    """`time` with a monotonic clock that only moves when the code sleeps."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+    def time(self) -> float:
+        import time
+
+        return time.time()
+
+
+class Clearing(Holding):
+    """`Holding`, whose cancel lands only `after` seconds of `FakeTime`, past one settle's 30 s; the
+    clock is open unless the test closes it; a close that would queue (session closed) stays open."""
+
+    def __init__(self, fake: FakeTime, *, after: float = 40.0, is_open: bool = True) -> None:
+        super().__init__()
+        self.fake = fake
+        self.after = after
+        self.canceled_at: float | None = None
+        self.is_open = is_open
+        self.queue_closes = False
+
+    def get_orders(self, filter=None) -> list:
+        if self.canceled_at is not None and self.fake.now - self.canceled_at >= self.after:
+            self.orders = [o for o in self.orders if o.id != "o-1"]
+        return list(self.orders)
+
+    def cancel_order_by_id(self, order_id) -> None:
+        self.calls.append(f"cancel {order_id}")
+        if order_id == "o-1":
+            self.canceled_at = self.fake.now
+        else:
+            self.orders = [o for o in self.orders if o.id != order_id]
+
+    def close_position(self, symbol) -> None:
+        from alpaca.common.exceptions import APIError
+
+        if any(o.id == "o-1" for o in self.orders):
+            self.calls.append("close refused")
+            raise APIError('{"code": 40310000, "message": "insufficient qty available"}')
+        self.calls.append(f"close {symbol}")
+        if self.queue_closes:  # a DAY market order after the close waits for the next session
+            self.orders.append(SimpleNamespace(id="c-1", client_order_id="close-1"))
+            self.is_open = False
+        else:
+            self.qty = 0
+
+
+@pytest.fixture
+def fake_time(monkeypatch) -> FakeTime:
+    fake = FakeTime()
+    monkeypatch.setattr(session_window, "time", fake)
+    monkeypatch.setattr(session_window, "position_qty", lambda t, s: Decimal(t.qty))
+    return fake
+
+
+def test_a_close_refused_while_a_cancel_clears_is_tried_again(fake_time) -> None:
+    """Finding 2: the market close was tried once; Alpaca's 403 while the cancel cleared ended it."""
+    account = Clearing(fake_time, after=40.0)
+    report = session_window.WindowReport("regular", "SPY", started="t")
+    left = session_window._flatten_after_stop(cast(TradingClient, account), WindowConfig(), report)
+    assert left == [] and report.closed_after_stop
+    assert account.calls[-1] == "close SPY"
+
+
+def test_no_market_close_is_sent_once_alpacas_clock_says_the_session_closed(fake_time) -> None:
+    """Finding 2: a regular window's close after 16:00 would only queue for the next session."""
+    account = Clearing(fake_time, after=0.0, is_open=False)
+    report = session_window.WindowReport("regular", "SPY", started="t")
+    left = session_window._flatten_after_stop(cast(TradingClient, account), WindowConfig(), report)
+    assert "close SPY" not in account.calls and not report.closed_after_stop
+    assert left == ["position of 1 SPY"]
+
+
+def test_a_close_that_would_only_queue_is_canceled(fake_time) -> None:
+    """Finding 2: a close sent as the session closed queued, and nothing canceled it."""
+    account = Clearing(fake_time, after=0.0)
+    account.queue_closes = True
+    report = session_window.WindowReport("regular", "SPY", started="t")
+    left = session_window._flatten_after_stop(cast(TradingClient, account), WindowConfig(), report)
+    assert account.calls[-1] == "cancel c-1"
+    assert left == ["position of 1 SPY"]
+
+
+def test_the_cap_stops_the_node_and_leaves_a_non_flattening_strategys_position(monkeypatch) -> None:
+    """Finding 3: the cap's header said the strategies then flatten. It sends no order of its own, and a
+    strategy that does not flatten on stop (upstream's `EmaCross`, like `BuysTwo` here) leaves its
+    position; the caller closes it (the paper test's `left_as_found`, the window's account check)."""
+    monkeypatch.setattr(PositionCap, "shutdown_system", lambda self, reason=None: None)
+    eng = engine()
+    cap = PositionCap(position_cap_config(SPY))
+    eng.add_data(market(5))
+    eng.add_strategy(BuysTwo())
+    eng.add_strategy(cap)
+    eng.run()
+    held = eng.cache.positions_open(instrument_id=SPY)
+    capped = eng.cache.orders(strategy_id=cap.strategy_id)
+    eng.dispose()
+    assert cap.tripped and not capped
+    assert [p.signed_qty for p in held] == [2]
+    from canon_trading import position_cap
+
+    assert "then flatten" not in (position_cap.__doc__ or "")
+
+
+def test_a_window_that_never_ran_leaves_no_gap_marker(monkeypatch, tmp_path) -> None:
+    """Finding 4: a build failure wrote the gap marker, so a retry was skipped for 300 s."""
+
+    def broken(config, **kwargs):
+        raise RuntimeError("build boom")
+
+    monkeypatch.setattr(session_window, "paper_trading", lambda: Account())
+    monkeypatch.setattr(session_window, "window_node", broken)
+    with pytest.raises(RuntimeError, match="build boom"):
+        session_window.run_window(WindowConfig(log_dir=tmp_path))
+    assert not (tmp_path / "last-window-end").exists()
+    with pytest.raises(RuntimeError, match="build boom"):  # the retry runs, not skipped
+        session_window.run_window(WindowConfig(log_dir=tmp_path))
+
+
+class Regimes(Recording):
+    """`Recording`, noting at each bar whether the fast average is above the slow, and the bar each
+    submit came on."""
+
+    def __init__(self, config: SessionMaCrossConfig) -> None:
+        super().__init__(config)
+        self.above: list[bool] = []
+        self.sent_at: list[int] = []
+
+    def on_bar(self, bar) -> None:
+        if self.indicators_initialized():
+            self.above.append(self.fast.value > self.slow.value)
+        else:
+            self.above.append(False)
+        super().on_bar(bar)
+
+    def submit_order(self, order, position_id=None, client_id=None, params=None) -> None:
+        self.sent_at.append(len(self.above) - 1)
+        super().submit_order(order, position_id=position_id, client_id=client_id, params=params)
+
+
+def test_a_dropped_entry_is_not_chased_until_the_signal_changes(monkeypatch) -> None:
+    """Finding 5: a timed-out entry was sent again on the next bar while the cross held."""
+
+    def passive(side, bid, ask, offset):
+        return (bid - 1 if side == OrderSide.BUY else ask + 1).quantize(Decimal("0.01"))
+
+    monkeypatch.setattr(session_ma_cross, "through_the_touch", passive)
+    eng = engine()
+    s = Regimes(
+        SessionMaCrossConfig(
+            bar_type=BARS,
+            trade_size=Quantity.from_int(1),
+            fast_period=3,
+            slow_period=8,
+            extended_hours=True,
+            limit_timeout_secs=90,
+            strategy_id=StrategyId("SessionMaCross-001"),
+            order_id_tag="001",
+        )
+    )
+    run(eng, s)
+    eng.dispose()
+    assert len(s.sent_at) >= 2
+    for earlier, later in pairwise(s.sent_at):
+        assert not all(s.above[earlier : later + 1]), (
+            f"a second entry at bar {later} while the cross from bar {earlier} still held"
+        )
+
+
+def test_a_refused_window_updates_the_heartbeat(monkeypatch, tmp_path) -> None:
+    """Finding 6: the heartbeat still read 'a regular window' after a refusal."""
+    held = SimpleNamespace(client_order_id="someone-elses")
+    monkeypatch.setattr(session_window, "paper_trading", lambda: Account(orders=[held]))
+    assert session_window.main(["--log-dir", str(tmp_path)]) == 1
+    heard = json.loads((tmp_path / "last-firing.json").read_text())
+    assert heard["outcome"].startswith("refused: the paper account is not flat")
+
+
+# Code review of the fixes above (2026-11-10): each shown here before its fix.
+
+
+def test_an_abandoned_stop_ends_the_process_whatever_error_reaches_main(monkeypatch, tmp_path):
+    """The account check after a timed-out stop can raise in its place; the process still ends."""
+    import os
+
+    def timed_out_then_unreachable(config, **kwargs):
+        session_window._ABANDONED.append(("runner", "task"))
+        raise APIError('{"code": 50010000, "message": "internal server error"}')
+
+    exits: list[int] = []
+
+    def exit_now(code: int) -> None:
+        exits.append(code)
+        raise SystemExit(code)
+
+    monkeypatch.setattr(session_window, "_ABANDONED", [])
+    monkeypatch.setattr(session_window, "run_window", timed_out_then_unreachable)
+    monkeypatch.setattr(os, "_exit", exit_now)
+    with pytest.raises(SystemExit):
+        session_window.main(["--log-dir", str(tmp_path)])
+    assert exits == [1]
+
+
+INTERRUPTED = """
+import asyncio, signal, threading, time
+from datetime import UTC, datetime
+from canon_trading import session_window
+
+class Hung:
+    stops = 0
+    def handle(self):
+        return self
+    def stop(self):
+        Hung.stops += 1
+    async def run_async(self):
+        while True:
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                continue
+
+session_window.STOP_TIMEOUT_SECS = 0.3
+signal.signal(signal.SIGINT, signal.default_int_handler)  # as in a terminal; a script may inherit SIG_IGN
+main = threading.main_thread().ident  # a terminal Ctrl-C reaches the main thread
+threading.Timer(0.1, signal.pthread_kill, (main, signal.SIGINT)).start()
+import sys
+ends = datetime(2100, 1, 1, tzinfo=UTC) if sys.argv[1] == "running" else datetime.now(UTC)
+session_window.STOP_TIMEOUT_SECS = 0.3 if sys.argv[1] == "running" else 30
+try:
+    session_window._run_node(Hung(), ends)
+except KeyboardInterrupt:
+    print("interrupted", Hung.stops, len(session_window._ABANDONED), flush=True)
+"""
+
+
+@pytest.mark.parametrize("when", ["running", "stopping"])
+def test_an_interrupt_during_a_hung_stop_abandons_the_node_and_does_not_wait(when: str) -> None:
+    """Ctrl-C while the stop hangs: closing the runner would cancel the node's task and wait for it. Run in
+    a child process, where `asyncio.Runner` handles SIGINT on the main thread and a hang is killed."""
+    import subprocess
+    import sys
+
+    try:
+        child = subprocess.run(
+            [sys.executable, "-c", INTERRUPTED, when],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail("the interrupted window still waits on a node whose stop hangs")
+    assert "interrupted 1 1" in child.stdout, child.stderr[-2000:]
+
+
+def test_a_window_ends_early_enough_for_its_account_check_inside_the_session() -> None:
+    """A window clipped to the session's end still checks the account, after a stop at its bound, while
+    the market close can be sent."""
+    assert session_window.END_MARGIN_SECS >= (
+        session_window.STOP_TIMEOUT_SECS + session_window.AFTER_STOP_SECS
+    )
+
+
+class Timeouts(SessionMaCross):
+    """Calls `_on_limit_timeout` for an order given by the test, with the cancel recorded."""
+
+    def __init__(self, config: SessionMaCrossConfig) -> None:
+        super().__init__(config)
+        self.test_order = None
+        self.canceled: list[str] = []
+
+    def _order(self, client_order_id):
+        return self.test_order
+
+    def cancel_order(self, client_order_id, client_id=None, params=None) -> None:
+        self.canceled.append(str(client_order_id))
+
+
+def timed_out(side: OrderSide, client_order_id: str = "O-1"):
+    from nautilus_trader.model import ClientOrderId
+
+    return SimpleNamespace(
+        is_closed=False, is_open=True, side=side, client_order_id=ClientOrderId(client_order_id)
+    )
+
+
+def unstarted_timeouts(order) -> Timeouts:
+    s = Timeouts(
+        SessionMaCrossConfig(
+            bar_type=BARS,
+            trade_size=Quantity.from_int(1),
+            fast_period=3,
+            slow_period=8,
+            extended_hours=True,
+            strategy_id=StrategyId("SessionMaCross-001"),
+            order_id_tag="001",
+        )
+    )
+    s.test_order = order
+    return s
+
+
+def test_a_short_buy_back_that_times_out_does_not_hold_back_an_entry() -> None:
+    s = unstarted_timeouts(timed_out(OrderSide.BUY))
+    s._on_limit_timeout(cast(TimeEvent, SimpleNamespace(name="limit-timeout-O-1")))
+    assert s.canceled == ["O-1"] and s.dropped_side is None
+
+
+def test_a_dropped_entry_is_held_through_a_bar_with_equal_averages() -> None:
+    s = unstarted_timeouts(timed_out(OrderSide.BUY))
+    s.signal_orders.add("O-1")
+    s._on_limit_timeout(cast(TimeEvent, SimpleNamespace(name="limit-timeout-O-1")))
+    assert s.dropped_side == OrderSide.BUY
+    s._clear_dropped(above=False, below=False)  # fast == slow: no cross yet
+    assert s.dropped_side == OrderSide.BUY
+    s._clear_dropped(above=False, below=True)
+    assert s.dropped_side is None
+
+
+# Second code review (2026-11-10): each shown here before its fix.
+
+
+def test_the_windows_own_alpaca_client_has_the_adapters_http_timeout(monkeypatch) -> None:
+    """The account check after an abandoned stop must not wait on a request forever (ADR 0039)."""
+    from canon_alpaca.providers import session_of
+
+    monkeypatch.setenv("ALPACA_API_KEY", "PKTEST")
+    monkeypatch.setenv("ALPACA_SECRET_KEY", "secret")
+    session = session_of(session_window.paper_trading())
+    assert session is not None
+    adapter = session.get_adapter("https://paper-api.alpaca.markets")
+    assert type(adapter).__name__ == "TimeoutAdapter"
+
+
+def test_the_end_margin_leaves_room_beyond_the_stop_and_the_check() -> None:
+    """A minute beyond the stop's bound and the check's: the calls before the check's own deadline, and
+    skew between Alpaca's clock and this host's."""
+    assert session_window.END_MARGIN_SECS >= (
+        session_window.STOP_TIMEOUT_SECS + session_window.AFTER_STOP_SECS + 60
+    )
+
+
+def test_an_error_after_an_abandoned_stop_is_printed_and_heard_before_the_exit(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    import os
+
+    def abandoned_then_broken(config, **kwargs):
+        session_window._ABANDONED.append(("runner", "task"))
+        raise AssertionError("an unexpected answer")
+
+    monkeypatch.setattr(session_window, "_ABANDONED", [])
+    monkeypatch.setattr(session_window, "run_window", abandoned_then_broken)
+    monkeypatch.setattr(os, "_exit", lambda code: (_ for _ in ()).throw(SystemExit(code)))
+    with pytest.raises(SystemExit):
+        session_window.main(["--log-dir", str(tmp_path)])
+    assert "AssertionError: an unexpected answer" in capsys.readouterr().err
+    heard = json.loads((tmp_path / "last-firing.json").read_text())
+    assert heard["outcome"].startswith("failed: AssertionError")
+
+
+def test_a_node_is_disposed_unless_its_own_run_was_abandoned(monkeypatch, tmp_path) -> None:
+    """An earlier abandonment in the process does not keep a later node from being disposed."""
+
+    class Ran:
+        cache = SimpleNamespace(orders=lambda **kwargs: [])
+        disposed = False
+
+        def dispose(self) -> None:
+            Ran.disposed = True
+
+    s = SimpleNamespace(dropped=[], history_bars=0, history_dropped=0)
+    cap = SimpleNamespace(checks=1, peak=Decimal(0), tripped=None)
+    monkeypatch.setattr(session_window, "_ABANDONED", [("an earlier runner", "task")])
+    monkeypatch.setattr(session_window, "paper_trading", lambda: Account())
+    monkeypatch.setattr(session_window, "window_node", lambda config, **kw: (Ran(), s, cap))
+    monkeypatch.setattr(session_window, "_run_node", lambda node, ends: None)
+    session_window.run_window(WindowConfig(log_dir=tmp_path))
+    assert Ran.disposed
+
+
+def test_a_signal_limit_is_forgotten_once_its_timeout_has_run() -> None:
+    s = unstarted_timeouts(timed_out(OrderSide.BUY))
+    s.signal_orders.add("O-1")
+    s._on_limit_timeout(cast(TimeEvent, SimpleNamespace(name="limit-timeout-O-1")))
+    assert s.signal_orders == set()

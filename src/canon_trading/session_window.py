@@ -12,16 +12,27 @@ Contract: NautilusTrader v2.0.0rc8's `LiveNode.builder`, `LiveExecutionEngineCon
   venue's position reports and aligns it.
 * https://nautilustrader.io/docs/md/latest/concepts/logging.md: `FileWriterConfig.directory` and `file_name`.
 * https://docs.alpaca.markets/us/docs/orders-at-alpaca.md, "Extended Hours Trading": pre-market 4:00am to
-  9:30am and after-hours 4:00pm to 8:00pm ET, Monday to Friday; overnight 8:00pm to 4:00am.
+  9:30am and after-hours 4:00pm to 8:00pm ET, Monday to Friday; overnight 8:00pm to 4:00am; "Orders not
+  eligible for extended hours submitted after 4:00pm ET will be queued up for release the next trading day".
+* `crates/live/src/node/mod.rs` and `python/node.rs` at the pin (`d53849b216e2`): the node bounds each
+  stage of its own stop (`delay_post_stop`, `timeout_disconnection`, `timeout_shutdown`), logs the one that
+  ran out and goes on; cancelling the task awaiting `run_async` "requests the same graceful shutdown, waits
+  for it to finish", so neither a cancel nor `asyncio.run`'s exit can end a stop that hangs.
 
 What one window is (one node, one process): the configured session and feed, checked against Alpaca's
 clock and calendar before anything starts; the paper account holding no open order and no position in the
 symbol; at least `GAP_SECS` since the last window ended; then the node runs for `minutes` (default 30, at
 most 60), clipped to the session's end. The strategy winds down `FLATTEN_SECS` before the end, the node
-stops, and the account is checked: no open order, no position. In the regular session a position still
-held is closed at market through alpaca-py; outside it the window fails and names it, since a market close
-would only queue for the next session. The run's node log and a JSON report go to `log_dir`, outside the
-repository. Overnight is refused: what the feeds deliver then is not yet observed.
+stops, and the account is checked: no open order, no position. The wait for the stop is bounded by
+`STOP_TIMEOUT_SECS`, the node's own stop bounds summed; past it the window is recorded failed, the
+account is still checked, and `main` ends the process (`os._exit`), since the node's task can be neither
+awaited nor cancelled. A position still held once the cancels have landed is closed at market through
+alpaca-py while Alpaca's clock, read when the close is sent, says the regular session is open, and tried
+again each poll while Alpaca refuses it, as upstream's market exit closes again once nothing works, for
+at most `AFTER_STOP_SECS`. Otherwise the window fails and names it, and an order still open with the
+session closed (a close that would only queue for the next session) is canceled. The run's node log and a
+JSON report go to `log_dir`, outside the repository. Overnight is refused: what the feeds deliver then is
+not yet observed.
 
 Paper only: the execution client is `canon_alpaca`'s, whose config refuses anything but paper trading, and
 the alpaca-py client here is built with `paper=True`. The key pair comes from the environment, which
@@ -39,6 +50,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 from dataclasses import asdict
 from dataclasses import dataclass
 from dataclasses import field
@@ -62,6 +74,9 @@ from canon_alpaca.constants import ENV_API_KEY
 from canon_alpaca.constants import ENV_SECRET_KEY
 from canon_alpaca.constants import FEED
 from canon_alpaca.constants import VENUE
+from canon_alpaca.providers import CONNECT_TIMEOUT_SECS
+from canon_alpaca.providers import READ_TIMEOUT_SECS
+from canon_alpaca.providers import with_http_timeout
 from nautilus_trader.common import LogLevel
 from nautilus_trader.config import FileWriterConfig
 from nautilus_trader.config import LoggerConfig
@@ -72,6 +87,9 @@ from nautilus_trader.model import Quantity
 from nautilus_trader.model import StrategyId
 from nautilus_trader.model import TimeInForce
 
+from .paper_node import DELAY_POST_STOP_SECS
+from .paper_node import TIMEOUT_DISCONNECTION_SECS
+from .paper_node import TIMEOUT_SHUTDOWN_SECS
 from .paper_node import alpaca_paper_builder
 from .position_cap import PositionCap
 from .position_cap import position_cap_config
@@ -89,8 +107,10 @@ GAP_SECS = 300
 """Between one window's end and the next one's start, so paper tests waiting for the lock get it."""
 FLATTEN_SECS = 120
 """The strategy winds down this long before the window ends."""
-END_MARGIN_SECS = 60
-"""A window ends at least this long before its session does."""
+END_MARGIN_SECS = 240
+"""A window ends at least this long before its session does: a stop at its bound (`STOP_TIMEOUT_SECS`) and
+the account check after it (`AFTER_STOP_SECS`) still find the session open, when a market close executes,
+with a minute for the calls before the check's deadline and skew between Alpaca's clock and this host's."""
 STRATEGY_ID = StrategyId("SessionMaCross-001")
 STALE_RUNNING_SECS = 70 * 60
 """A record still `running` this long after it started is a window that died (60 minutes at most, plus
@@ -100,12 +120,27 @@ EXTENDED_READY = False
 a reviewed change turns this on once an extended window has passed on paper and the adapter's
 disconnect-hang fix is on `main` (ADR 0044)."""
 POLL_SECS = 2.0
-"""Between account reads after the stop: two calls each, well inside Alpaca's 200 calls a minute."""
+"""Between account reads after the stop: at most three calls each, well inside Alpaca's 200 a minute."""
 COMMIT_ENV = "CANON_COMMIT"
 """Set by the scheduled runner, `home/.claude/canon/paper-session.sh`, to the `origin/main` commit it checked
 out for this firing (ADR 0047)."""
 SOURCE_ROOT = Path(__file__).resolve().parents[2]
 """The checkout this module runs from."""
+MARKET_EXIT_INTERVAL_MS = 1000
+MARKET_EXIT_MAX_ATTEMPTS = 60
+STOP_TIMEOUT_SECS = (
+    MARKET_EXIT_INTERVAL_MS * MARKET_EXIT_MAX_ATTEMPTS / 1000
+    + DELAY_POST_STOP_SECS
+    + TIMEOUT_DISCONNECTION_SECS
+    + TIMEOUT_SHUTDOWN_SECS
+    + CONNECT_TIMEOUT_SECS
+    + READ_TIMEOUT_SECS
+)
+"""How long the window waits for the node to stop (about 115 s): the strategy's market exit at its longest,
+the node's own stop bounds (`paper_node`), and one Alpaca request at the adapter's timeouts (ADR 0039),
+which a call in flight at the disconnect can outlast it by."""
+AFTER_STOP_SECS = 60
+"""How long the account check after the stop works at clearing the account before it reports."""
 
 
 def default_log_dir() -> Path:
@@ -255,8 +290,8 @@ def window_node(
             manage_stop=not extended,
             market_exit_reduce_only=False,
             market_exit_time_in_force=TimeInForce.DAY,
-            market_exit_interval_ms=1000,
-            market_exit_max_attempts=60,
+            market_exit_interval_ms=MARKET_EXIT_INTERVAL_MS,
+            market_exit_max_attempts=MARKET_EXIT_MAX_ATTEMPTS,
         )
     )
     cap = PositionCap(position_cap_config(config.instrument_id))
@@ -300,6 +335,16 @@ class WindowRefused(RuntimeError):
     open when one was named). Nothing was placed. Recorded as the latest result; the run exits 1."""
 
 
+class StopTimedOut(RuntimeError):
+    """The node did not stop within `STOP_TIMEOUT_SECS`. Recorded as failed after the account check;
+    `main` then ends the process, since the node's task still runs and nothing can end it (module header)."""
+
+
+_ABANDONED: list = []
+"""A runner and the node's task left running after a stop timed out, held so neither is collected (the
+hosted run would then drive its shutdown inline, `python/node.rs`) before `main` ends the process."""
+
+
 class WindowSkipped(RuntimeError):
     """The window did not start, for a reason that clears by itself (inside the gap after the last window,
     too little of the session left). Nothing was placed. Not recorded as a result; the run exits 0."""
@@ -341,8 +386,12 @@ def session_now(trading: TradingClient) -> tuple[AlpacaClock, AlpacaCalendar | N
 
 
 def paper_trading() -> TradingClient:
-    return TradingClient(
-        api_key=os.environ[ENV_API_KEY], secret_key=os.environ[ENV_SECRET_KEY], paper=True
+    """alpaca-py's paper client with the adapter's HTTP timeout mounted (ADR 0039): alpaca-py sends no
+    timeout, and the account check after an abandoned stop must not wait on a request for ever."""
+    return with_http_timeout(
+        TradingClient(
+            api_key=os.environ[ENV_API_KEY], secret_key=os.environ[ENV_SECRET_KEY], paper=True
+        )
     )
 
 
@@ -408,14 +457,17 @@ def run_window(
         config.log_dir, report
     )  # `running`: a window killed from here on leaves this behind
     started = time.monotonic()
+    abandoned_before = len(_ABANDONED)
     failure: BaseException | None = None
+    ran = False  # whether the node was run: only then is the gap marker written
     try:
         node, strategy, cap = window_node(
             config, wind_down_at=ends - timedelta(seconds=FLATTEN_SECS), log_name=f"window-{stamp}"
         )
         cache = node.cache
         try:
-            asyncio.run(_run_until(node, ends))
+            ran = True
+            _run_node(node, ends)
         finally:
             try:
                 report.seconds = round(time.monotonic() - started, 1)
@@ -426,7 +478,8 @@ def run_window(
                 report.cap_checks, report.cap_peak = cap.checks, str(cap.peak)
                 report.cap_tripped = cap.tripped
             finally:
-                node.dispose()
+                if len(_ABANDONED) == abandoned_before:  # else its abandoned task still owns it
+                    node.dispose()
     except BaseException as e:
         failure = e
         raise
@@ -439,7 +492,8 @@ def run_window(
             raise
         finally:
             report.ended = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-            marker.write_text(str(time.time()))
+            if ran:
+                marker.write_text(str(time.time()))
             if failure is not None:
                 report.result = f"failed: {type(failure).__name__}: {failure}"
             elif report.left:
@@ -458,30 +512,57 @@ def run_window(
 
 def _flatten_after_stop(trading: TradingClient, config: WindowConfig, report: WindowReport) -> list:
     """What the account holds in the symbol after the stop. Every open order in it is canceled, in any
-    session, and the cancels are waited for, since a held order keeps its shares from a close (Alpaca
-    answers 403). In the regular session a position is then closed at market; outside it a market close
-    would only queue, so it is reported. A failed step is recorded and the next still runs."""
-    left = leftovers(trading, config.symbol)
+    session. Then, each `POLL_SECS` for at most `AFTER_STOP_SECS`: once no order is open (a held order
+    keeps its shares from a close, which Alpaca refuses with a 403), a position still held is closed at
+    market if Alpaca's clock says the regular session is open at that moment, and closed again on the next
+    poll if Alpaca refused it; with the session closed it is left and reported. Last, an order still open
+    with the session closed (a close that would only queue for the next session) is canceled. A failed
+    step is recorded and the next still runs."""
+    symbol = config.symbol
+    left = leftovers(trading, symbol)
     if not left:
         return left
-    for order in open_orders(trading, config.symbol):
+    _cancel(trading, open_orders(trading, symbol), report)
+    deadline = time.monotonic() + AFTER_STOP_SECS
+    while True:
+        working = open_orders(trading, symbol)
+        held = position_qty(trading, symbol)
+        if not working and not held:
+            break
+        if not working:
+            if not _regular_session_open(trading):
+                report.errors.append(
+                    "not closing the position: Alpaca's clock says the regular session is closed, "
+                    "so a market close would only queue"
+                )
+                break
+            try:
+                trading.close_position(symbol)
+                report.closed_after_stop = True
+            except APIError as e:
+                if (error := f"closing the position: {e}") not in report.errors:
+                    report.errors.append(error)
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(POLL_SECS)
+    if (working := open_orders(trading, symbol)) and not _regular_session_open(trading):
+        _cancel(trading, working, report)
+        _settle(lambda: not open_orders(trading, symbol))
+    return leftovers(trading, symbol)
+
+
+def _regular_session_open(trading: TradingClient) -> bool:
+    clock = trading.get_clock()
+    assert isinstance(clock, AlpacaClock)
+    return bool(clock.is_open)
+
+
+def _cancel(trading: TradingClient, orders: list, report: WindowReport) -> None:
+    for order in orders:
         try:
             trading.cancel_order_by_id(order.id)
         except APIError as e:  # it filled or ended meanwhile
             report.errors.append(f"canceling {order.client_order_id}: {e}")
-    _settle(lambda: not open_orders(trading, config.symbol))
-    if config.session == "regular" and position_qty(trading, config.symbol):
-        try:
-            trading.close_position(config.symbol)
-            report.closed_after_stop = True
-        except APIError as e:
-            report.errors.append(f"closing the position: {e}")
-        _settle(
-            lambda: (
-                not position_qty(trading, config.symbol) and not open_orders(trading, config.symbol)
-            ),
-        )
-    return leftovers(trading, config.symbol)
 
 
 def _settle(done, seconds: float = 30) -> None:
@@ -491,14 +572,45 @@ def _settle(done, seconds: float = 30) -> None:
         time.sleep(POLL_SECS)
 
 
-async def _run_until(node: LiveNode, ends: datetime) -> None:
+def _run_node(node: LiveNode, ends: datetime) -> None:
+    """`asyncio.run(_run_until(node, ends))`, except after a stop past `STOP_TIMEOUT_SECS`: closing the
+    loop then would cancel the node's task and wait for the same stop, so the loop and the task are left
+    (`_ABANDONED`) and `StopTimedOut` raised."""
+    runner = asyncio.Runner()
+    started: list[asyncio.Task] = []
+    try:
+        stuck = runner.run(_run_until(node, ends, started))
+    except BaseException:
+        if started and not started[0].done():  # interrupted (Ctrl-C) while the stop still runs
+            _ABANDONED.append((runner, started[0]))
+        else:
+            runner.close()
+        raise
+    if stuck is None:
+        runner.close()
+        return
+    _ABANDONED.append((runner, stuck))
+    raise StopTimedOut(
+        f"the node did not stop within {STOP_TIMEOUT_SECS:g} s of the window's end; left running"
+    )
+
+
+async def _run_until(node: LiveNode, ends: datetime, started: list) -> asyncio.Task | None:
+    """Run the node until `ends`, stop it, and wait at most `STOP_TIMEOUT_SECS` for the stop, as the node
+    bounds each stage of its own; return the node's task if it is still running then, else None. The
+    task is also put in `started`, for the caller to see after an interrupt."""
     task = asyncio.ensure_future(node.run_async())
+    started.append(task)
     try:
         await asyncio.wait({task}, timeout=max(0.0, (ends - datetime.now(UTC)).total_seconds()))
     finally:
         if not task.done():
             node.handle().stop()
-        await task
+        await asyncio.wait({task}, timeout=STOP_TIMEOUT_SECS)
+    if not task.done():
+        return task
+    task.result()  # the node's own error, if it ended with one
+    return None
 
 
 def _fill(report: WindowReport, cache) -> None:
@@ -530,12 +642,43 @@ def resolve_session(clock: AlpacaClock, calendar: AlpacaCalendar | None) -> tupl
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    """`_main`, and after a stop that timed out or was interrupted (`_ABANDONED`), whatever error then
+    reached here, the process ended with `os._exit` once the record is written: the node's task would
+    otherwise hold the interpreter's exit (module header)."""
+    code = 1
+    try:
+        code = _main(argv)
+    except BaseException as e:
+        if not _ABANDONED:
+            raise
+        traceback.print_exc()  # `os._exit` below would discard it
+        try:
+            write_heartbeat(_log_dir(argv), f"failed: {type(e).__name__}: {e}")
+        except OSError:
+            pass
+    finally:
+        if _ABANDONED:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(code or 1)
+    return code
+
+
+def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="One SessionMaCross window on Alpaca paper")
     parser.add_argument("--session", choices=(*SESSIONS, "auto"), default="regular")
     parser.add_argument("--minutes", type=int, default=DEFAULT_MINUTES)
     parser.add_argument("--symbol", default="SPY")
     parser.add_argument("--log-dir", type=Path, default=default_log_dir())
-    args = parser.parse_args(argv)
+    return parser
+
+
+def _log_dir(argv: Sequence[str] | None) -> Path:
+    return _parser().parse_args(argv).log_dir
+
+
+def _main(argv: Sequence[str] | None) -> int:
+    args = _parser().parse_args(argv)
     session = args.session
     try:
         trading = market = None
@@ -558,7 +701,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"paper:session: skipped: {e}")
         return 0
     except WindowRefused as e:
-        args.log_dir.mkdir(parents=True, exist_ok=True)
+        write_heartbeat(args.log_dir, f"refused: {e}")
         write_record(
             args.log_dir,
             {

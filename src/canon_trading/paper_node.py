@@ -70,6 +70,15 @@ OPEN_CHECK_INTERVAL_SECS = 10.0
 POSITION_CHECK_INTERVAL_SECS = 60.0
 """The native runtime checks, off by default, turned on at the slow end of upstream's recommended ranges
 ("5-10s" and "30-60s", how_to/configure_live_trading): about six and one Alpaca calls a minute (ADR 0044)."""
+DELAY_POST_STOP_SECS = 5
+TIMEOUT_CONNECTION_SECS = 20
+TIMEOUT_DISCONNECTION_SECS = 15
+TIMEOUT_SHUTDOWN_SECS = 5
+"""The node's own shutdown bounds (`crates/live/src/node/config.rs` at the pin): residual events after the
+trader stops, the clients' disconnect, then pending tasks; `with_delay_shutdown_secs` sets
+`timeout_shutdown` (`node/builder.rs`), here at its default. A session window bounds its wait on the stop
+from these (`session_window.STOP_TIMEOUT_SECS`)."""
+
 RECONCILIATION_LOOKBACK_MINS = 1
 """A minute of order history at start-up, the value the adapter's own paper tests use
 (`packages/canon-alpaca/tests/test_paper_matrix.py`). Every run here starts only once it has checked the
@@ -149,9 +158,10 @@ def alpaca_paper_builder(
             )
         )
         .with_exec_engine_config(exec_engine_config(instrument_id))
-        .with_delay_post_stop_secs(5)
-        .with_timeout_connection(20)
-        .with_timeout_disconnection_secs(15)
+        .with_delay_post_stop_secs(DELAY_POST_STOP_SECS)
+        .with_timeout_connection(TIMEOUT_CONNECTION_SECS)
+        .with_timeout_disconnection_secs(TIMEOUT_DISCONNECTION_SECS)
+        .with_delay_shutdown_secs(TIMEOUT_SHUTDOWN_SECS)
         .add_data_client(
             "ALPACA", AlpacaDataClientFactory, DataClientConfig(instrument_provider=provider)
         )
@@ -175,8 +185,11 @@ def ema_cross_paper_node(
     The risk engine runs with `risk_limits` (with `max_order_submit_rate` in place of the ceiling when one
     is given), the execution engine with `exec_engine_config`, and `PositionCap` beside the strategy: no
     native setting caps a position, and `EmaCross` stacks one when Alpaca refuses an opposite order (ADR
-    0037). The node is not started: the caller runs it and owns its lifetime. The key pair is read from the environment by the
-    clients when they connect (ADR 0029).
+    0037). When the cap trips it stops the node and nothing flattens: `EmaCross` does not on stop, and its
+    config at the pin exposes neither `manage_stop` nor the market-exit keys, whose default exit is
+    reduce-only, which the adapter denies (ADR 0036). The caller closes what is left, as the paper test's
+    `left_as_found` does. The node is not started: the caller runs it and owns its lifetime. The key pair
+    is read from the environment by the clients when they connect (ADR 0029).
     """
     node = alpaca_paper_builder(
         name, instrument_id, trader_id=trader_id, max_order_submit_rate=max_order_submit_rate
