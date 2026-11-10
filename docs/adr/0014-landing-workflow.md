@@ -43,6 +43,7 @@ Chosen: **option 2**, through `scripts/land`.
    the push. The hosted workflow runs it again on a clean machine, and `scripts/land` waits for that run
    before it merges.
 6. **The repository is public.** GitHub's standard hosted runners are free for public repositories.
+   Commits carry GitHub noreply addresses, and `scripts/land` refuses to push any other.
 7. **Pull request text:** `Summary` and `Test Plan`, plus `Evidence` for what the change rests on. It is
    written for a later reader: no conversation history, discarded attempts or tool usage.
 8. **Titles:** a plain sentence. No Conventional Commits prefix and no PR number.
@@ -75,7 +76,9 @@ must follow its rule instead.
 ### Confirmation
 
 `scripts/land --dry-run` runs the checks and says what would happen. `scripts/land` has landed every
-change since 2026-11-09, first by fast-forward with no remote and then through pull requests.
+change since 2026-11-09, first by fast-forward with no remote and then through pull requests. The
+hosted workflow's first run, on 2026-11-10, passed all fifteen checks on a GitHub runner in 22 seconds,
+and the change that recorded this waited for its hosted check before it merged.
 
 ## Evidence
 

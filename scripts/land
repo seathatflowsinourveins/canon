@@ -105,6 +105,13 @@ ahead=$(git rev-list --count "$base..$branch")
 git merge-base --is-ancestor "$base" "$branch" \
   || die "$branch does not contain the current main; rebase it onto main first (for a pull request someone else opened, use --pr)"
 
+# A public repository shows every commit's author and committer address, so only GitHub's noreply
+# addresses are pushed (ADR 0014).
+if [ -n "$remote" ]; then
+  exposed=$(git log --format='%ae%n%ce' "$base..$branch" | grep -vcE '(@users\.noreply\.github\.com|^noreply@github\.com)$' || true)
+  [ "$exposed" -eq 0 ] || die "$exposed author or committer address(es) on $branch are not GitHub noreply addresses. Set git config user.email to your noreply address and recommit."
+fi
+
 note "$branch is $ahead commit(s) ahead of main. Running every check."
 "$ROOT/scripts/ci" || die "checks failed; nothing landed"
 
