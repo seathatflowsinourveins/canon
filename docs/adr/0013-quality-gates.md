@@ -34,7 +34,7 @@ add a second pinning mechanism. Option 1 is where the upstreams converge and is 
 | Registry, lock, ADR evidence; release rule | `scripts/canon lint`, `selftest` | this repo |
 | Shell syntax and static analysis | shellcheck 0.11.0 | `mise.lock` |
 | Lane report; practice survey | `scripts/lanes --selftest`, `scripts/survey-github selftest` | this repo |
-| Each tracked executable `scripts/test-*`: hook registration (21 cases), the checks themselves (56), landing and the address check (66), watchdog, automation and bootstrap (48), the registry script and its hooks (144) | `test-hooks`, `test-ci`, `test-land`, `test-lanes`, `test-canon` | this repo |
+| Each tracked executable `scripts/test-*`: hook registration (21 cases), the checks themselves (56), landing and the address check (66), watchdog, automation and bootstrap (48), the registry script and its hooks (147) | `test-hooks`, `test-ci`, `test-land`, `test-lanes`, `test-canon` | this repo |
 | Lockfile current | `uv lock --check` | uv 0.13.7 |
 | Python lint and format | ruff 0.17.4 | `uv.lock` |
 | Python types | ty 0.0.100 | `uv.lock` |

@@ -481,6 +481,56 @@
         "https://raw.githubusercontent.com/stablyai/orca/main/LICENSE"
       ],
       "adr": "0018"
+    },
+    {
+      "id": "python",
+      "field": "toolchain",
+      "repo": "python/cpython",
+      "track": "tag:v3.14.10",
+      "line": "v3.14.",
+      "role": "tool",
+      "license": "PSF-2.0 (LICENSE at v3.14.10, which also carries the earlier BeOpen, CNRI and CWI agreements; documentation code examples are dual-licensed PSF-2.0 or 0BSD)",
+      "why": "The interpreter the workspace runs on; mise.toml requests the 3.14 line, the newest the pinned NautilusTrader release ships wheels for, and mise.lock fixes the exact release.",
+      "evidence": [
+        "https://www.python.org/downloads/release/python-31410/",
+        "https://raw.githubusercontent.com/python/cpython/v3.14.10/LICENSE",
+        "https://pypi.org/project/nautilus-trader/2.0.0rc8/#files"
+      ],
+      "adr": "0008",
+      "mise": "python"
+    },
+    {
+      "id": "node",
+      "field": "toolchain",
+      "repo": "nodejs/node",
+      "track": "tag:v24.22.2",
+      "line": "v24.",
+      "role": "tool",
+      "license": "MIT (LICENSE at v24.22.2, which also carries the licences of bundled dependencies)",
+      "why": "JavaScript runtime for `npx ccusage`; mise.toml requests the 24 line, an LTS line in maintenance since 2026-10-20, and mise.lock fixes the exact release.",
+      "evidence": [
+        "https://nodejs.org/en/blog/release/v24.22.2",
+        "https://nodejs.org/dist/index.json",
+        "https://raw.githubusercontent.com/nodejs/node/v24.22.2/LICENSE"
+      ],
+      "adr": "0008",
+      "mise": "node"
+    },
+    {
+      "id": "gh",
+      "field": "toolchain",
+      "repo": "cli/cli",
+      "track": "tag:v2.103.3",
+      "role": "tool",
+      "license": "MIT",
+      "why": "GitHub CLI, called by scripts/land, scripts/automation, scripts/survey-github and the landscape watch hook; mise.toml requests latest and mise.lock fixes the exact release.",
+      "evidence": [
+        "https://github.com/cli/cli/releases/tag/v2.103.3",
+        "https://raw.githubusercontent.com/cli/cli/v2.103.3/LICENSE",
+        "https://cli.github.com/"
+      ],
+      "adr": "0008",
+      "mise": "gh"
     }
   ]
 }

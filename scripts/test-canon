@@ -429,6 +429,11 @@ sec_network_down() {
 
 sec_mise_requests() {
   fresh
+  # start without the two entries this section adds, so the cases do not depend on what the registry holds
+  reg_edit '.upstreams |= map(select(.id != "gh" and .id != "python"))'
+  jq 'del(.pins.gh, .pins.python)' "$T/canon/upstreams.lock.json" > "$W/l.json" && mv "$W/l.json" "$T/canon/upstreams.lock.json"
+  out=$(canon lint)
+  check "a mise.toml tool with no registry entry fails lint" has "$out" "mise.toml installs 'gh'"
   reg_edit '.upstreams += [{id: "gh", field: "toolchain", repo: "cli/cli", track: "tag:v2.103.3", role: "tool",
     license: "MIT", why: "test", evidence: ["https://example.org/"], adr: "0008", mise: "gh"},
     {id: "python", field: "toolchain", repo: "python/cpython", track: "tag:v3.14.10", line: "v3.14.", role: "tool",
@@ -443,6 +448,12 @@ sec_mise_requests() {
     "$T/mise.lock" > "$W/m" && mv "$W/m" "$T/mise.lock"
   out=$(canon lint)
   check "a line request fails when mise.lock has another release" has "$out" "mise.lock records '3.14.11' for python"
+  reg_edit '(.upstreams[] | select(.id == "gh")) |= del(.mise)'
+  out=$(canon lint)
+  check "an entry that drops its mise field leaves the tool unnamed" has "$out" "mise.toml installs 'gh'"
+  printf '\n[tools.deno]\nversion = "2"\n' >> "$T/mise.toml"
+  out=$(canon lint)
+  check "a tool given its own table is refused"              has "$out" "its own [tools.<name>] table"
 }
 
 sec_resolve_lock() {

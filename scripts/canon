@@ -305,7 +305,7 @@ cmd_lint() {
   #    in one place (by hand or by a bot) fails here until the registry and its ADR are updated too.
   #    A mise.toml request that is a release line ("3.14") or "latest" is compared through the exact
   #    version mise.lock records for it.
-  local want have locked repo wf b tools kind rest mv
+  local want have locked repo wf b tools kind rest mv known name
   tools=""
   [ -f "$ROOT/mise.toml" ] && tools=$(mise_tools)
   rows=$(reg_rows '.upstreams[] | select((.track // "") | startswith("tag:")) | select(.pypi != null or .mise != null)
@@ -331,6 +331,19 @@ cmd_lint() {
       fi
     fi
   done <<<"$rows"
+  # mise_tools reads one line per tool under [tools]; a tool given its own table would go unchecked.
+  if [ -f "$ROOT/mise.toml" ] && grep -qE '^[[:space:]]*\[[[:space:]]*tools[[:space:]]*\.' "$ROOT/mise.toml"; then
+    err=1; echo "lint: mise.toml gives a tool its own [tools.<name>] table; write it as one line under [tools] so it is checked"
+  fi
+  # Every tool mise.toml asks for is an adopted upstream: some registry entry names it in its "mise" field.
+  if [ -n "$tools" ]; then
+    known=$(reg_rows '.upstreams[] | select(.mise != null) | .mise')
+    while IFS=$'\t' read -r name rest; do
+      [ -n "$name" ] || continue
+      printf '%s\n' "$known" | grep -qxF -- "$name" \
+        || { err=1; echo "lint: mise.toml installs '$name', which no registry entry names in a \"mise\" field"; }
+    done <<<"$tools"
+  fi
   want=$(reg_rows '.upstreams[] | select(.id == "mise") | .track'); want="${want#tag:}"
   if [ -n "$want" ]; then
     grep -q "^MISE_VERSION=\"$want\"" "$ROOT/scripts/bootstrap" 2>/dev/null \

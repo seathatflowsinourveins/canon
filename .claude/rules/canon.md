@@ -14,6 +14,9 @@ paths:
   Use `default` only for repos that publish no tags.
 * Optional `line` (for example `"v1."`) holds an entry to one release line, so `scripts/canon outdated`
   ignores tags outside it.
+* Optional `mise` (the tool's key in `mise.toml`) and `pypi` (the package's name in `uv.lock`) say where an
+  entry's version is installed. `scripts/canon lint` compares them with the entry, and fails when
+  `mise.toml` installs a tool that no entry names.
 * Roles: `foundation`, `platform`, `standard`, `tool`, `source`, `reference`, `watch`. A `watch` entry is not
   adopted; do not install or import it.
 * Write `UNVERIFIED` in `license` rather than guessing.
