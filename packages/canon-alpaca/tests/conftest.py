@@ -12,11 +12,22 @@ alpaca-py's own models, so the adapter's conversions are tested against what alp
   directly, so the tests do not import msgpack (not in `canon/upstreams.json`).
 * trade cancel and trade correction: the same page, schema examples, read 2026-11-10. The symbol is
   changed to AAPL and the timestamp written as `to_datetime()` gives it.
+* order: "Create an Order", response example `EquityOrderResponse`
+  (https://docs.alpaca.markets/us/reference/postorder.md), read 2026-11-10
+* trade update: "Websocket Streaming", the `trade_updates` example
+  (https://docs.alpaca.markets/us/docs/websocket-streaming.md), read 2026-11-10. Its order is a crypto
+  sell; here the update's fields (`execution_id`, `price`, `timestamp`) are kept and the order is the
+  equity order above, moved through the statuses the event implies.
+* account: "Get Account", response example (https://docs.alpaca.markets/us/reference/getaccount-1.md)
+* position: "All Open Positions", the second schema example, AAPL
+  (https://docs.alpaca.markets/us/reference/getallopenpositions.md)
 
 The stand-ins implement only the methods the adapter calls, with alpaca-py 0.45.0's signatures, and are as
 strict as alpaca-py where the adapter depends on it: the bars stand-in filters the way Alpaca's bars
-endpoint documents, and the stream stand-in checks handlers and unsubscribes the way
-`alpaca/data/live/websocket.py` does. No test here opens a network connection or reads a credential.
+endpoint documents, the stream stand-in checks handlers and unsubscribes the way
+`alpaca/data/live/websocket.py` does, the orders stand-in answers with the statuses "Create an Order" and
+"Delete Order by ID" document, and the trade stream stand-in casts its messages the way
+`alpaca/trading/stream.py` does. No test here opens a network connection or reads a credential.
 """
 
 from __future__ import annotations
@@ -24,8 +35,12 @@ from __future__ import annotations
 import asyncio
 import gc
 import inspect
+import json
+import queue
 import threading
+import time as time_module
 import traceback
+import uuid
 from collections.abc import Awaitable
 from collections.abc import Callable
 from datetime import UTC
@@ -44,6 +59,12 @@ from alpaca.data.models import TradeCancel
 from alpaca.data.models import TradeCorrection
 from alpaca.data.requests import StockBarsRequest
 from alpaca.trading.models import Asset
+from alpaca.trading.models import Order
+from alpaca.trading.models import Position
+from alpaca.trading.models import TradeAccount
+from alpaca.trading.models import TradeUpdate
+from alpaca.trading.requests import GetOrdersRequest
+from alpaca.trading.requests import OrderRequest
 
 type Handler = Callable[[object], Awaitable[None]]
 type Message = Quote | Trade | TradeCancel | TradeCorrection
@@ -133,6 +154,129 @@ TRADE_CORRECTION_AAPL = {
 }
 
 
+ORDER_AAPL = {
+    "asset_class": "us_equity",
+    "asset_id": "b0b6dd9d-8b9b-48a9-ba46-b9d54906e415",
+    "canceled_at": None,
+    "client_order_id": "5680c4bc-9ac1-4a12-a44c-df427ba53032",
+    "created_at": "2023-12-12T22:31:24.668464435Z",
+    "expired_at": None,
+    "extended_hours": False,
+    "failed_at": None,
+    "filled_at": None,
+    "filled_avg_price": None,
+    "filled_qty": "0",
+    "hwm": None,
+    "id": "7b08df51-c1ac-453c-99f9-323a5f075f0d",
+    "legs": None,
+    "limit_price": "150",
+    "notional": None,
+    "order_class": "",
+    "order_type": "limit",
+    "qty": "2",
+    "replaced_at": None,
+    "replaced_by": None,
+    "replaces": None,
+    "side": "buy",
+    "source": None,
+    "status": "accepted",
+    "stop_price": None,
+    "submitted_at": "2023-12-12T22:31:24.577215743Z",
+    "subtag": None,
+    "symbol": "AAPL",
+    "time_in_force": "gtc",
+    "trail_percent": None,
+    "trail_price": None,
+    "type": "limit",
+    "updated_at": "2023-12-12T22:31:24.668464435Z",
+}
+
+FILL_UPDATE = {
+    "event": "fill",
+    "execution_id": "2f63ea93-423d-4169-b3f6-3fdafc10c418",
+    "position_qty": "0",
+    "price": "105.8988475",
+    "qty": "1790.86",
+    "timestamp": "2022-04-19T17:45:05.024916716Z",
+}
+
+ACCOUNT = {
+    "account_blocked": False,
+    "account_number": "PALPACA_123",
+    "accrued_fees": "0",
+    "admin_configurations": {},
+    "balance_asof": "2023-09-27",
+    "buying_power": "245432.61",
+    "cash": "122086.5",
+    "created_at": "2023-01-01T18:20:20.272275Z",
+    "crypto_status": "ACTIVE",
+    "crypto_tier": 1,
+    "currency": "USD",
+    "effective_buying_power": "245432.61",
+    "equity": "123346.11",
+    "id": "1d9eed04-be39-4e01-9b84-a48ac5bbafcf",
+    "initial_margin": "629.8",
+    "intraday_adjustments": "0",
+    "last_equity": "122011.09751111286868",
+    "last_maintenance_margin": "480.73",
+    "long_market_value": "1259.61",
+    "maintenance_margin": "377.88",
+    "multiplier": "2",
+    "non_marginable_buying_power": "122086.5",
+    "options_buying_power": "122716.305",
+    "options_trading_level": 2,
+    "pending_reg_taf_fees": "0",
+    "pending_transfer_in": "0",
+    "portfolio_value": "123346.11",
+    "position_market_value": "1259.61",
+    "regt_buying_power": "245432.61",
+    "short_market_value": "0",
+    "shorting_enabled": True,
+    "sma": "123369.74",
+    "status": "ACTIVE",
+    "trade_suspended_by_user": False,
+    "trading_blocked": False,
+    "transfers_blocked": False,
+    "user_configurations": None,
+}
+
+POSITION_AAPL = {
+    "asset_class": "us_equity",
+    "asset_id": "b0b6dd9d-8b9b-48a9-ba46-b9d54906e415",
+    "asset_marginable": False,
+    "avg_entry_price": "174.78",
+    "change_today": "-0.0018326556325525",
+    "cost_basis": "349.56",
+    "current_price": "174.29",
+    "exchange": "NASDAQ",
+    "lastday_price": "174.61",
+    "market_value": "348.58",
+    "qty": "2",
+    "qty_available": "2",
+    "side": "long",
+    "symbol": "AAPL",
+    "unrealized_intraday_pl": "-0.98",
+    "unrealized_intraday_plpc": "-0.0028035244307129",
+    "unrealized_pl": "-0.98",
+    "unrealized_plpc": "-0.0028035244307129",
+}
+
+CLOSED_ORDER_STATUSES = {"filled", "canceled", "expired", "rejected", "replaced"}
+
+
+def alpaca_order(**changes: object) -> dict:
+    """A copy of the docs' equity order with `changes` applied."""
+    return {**ORDER_AAPL, **changes}
+
+
+def api_error(status: int, code: int, message: str) -> APIError:
+    """An `APIError` as alpaca-py raises it: Alpaca's JSON body, and the HTTP error carrying the status."""
+    response = SimpleNamespace(status_code=status)
+    return APIError(
+        json.dumps({"code": code, "message": message}), SimpleNamespace(response=response)
+    )
+
+
 def asset(**changes: object) -> Asset:
     return Asset.model_validate({**ASSET_AAPL, **changes})
 
@@ -184,6 +328,205 @@ class FakeTradingClient:
             if a["symbol"] == symbol_or_asset_id:
                 return Asset.model_validate(a)
         raise APIError('{"code": 40410000, "message": "asset not found"}')
+
+
+class FakeOrdersClient(FakeTradingClient):
+    """Stands in for `TradingClient`: the asset reads, and the order, position and account calls.
+
+    `submit_order` answers as "Create an Order" documents: the new order, status `accepted`, or an
+    `APIError` with status 403 or 422. It then sends the order's trade updates to `stream`, as set by
+    `script`: "accept" (`new`), "fill" (`new`, then one `fill` for the whole quantity), "partial" (`new`,
+    a `partial_fill` of 1, then a `fill` for the rest), "reject" (`new`, then `rejected`), or "silent"
+    (nothing).
+    `submit_error` is raised instead of answering; with `took_before_error`, the order is taken (and its
+    updates sent) first, as when alpaca-py's retry of a submit Alpaca had already taken is refused.
+    `submit_delay` holds the answer back that many seconds after the updates are sent.
+    `cancel_order_by_id` answers 204 and sends `canceled`, or raises `cancel_error`; with
+    `took_before_error`, it first marks the order `pending_cancel`, sending no update. With `execution_ids` false, fills carry no `execution_id`. `orders` and `positions` are what the reads return; `get_orders` applies
+    the `status`, `symbols`, `after` and `until` filters the way alpaca-py's `GetOrdersRequest` documents
+    them (`after` and `until` on the submission time).
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.stream: FakeTradeStream | None = None
+        self.script = "fill"
+        self.fill_price = FILL_UPDATE["price"]
+        self.submit_error: Exception | None = None
+        self.cancel_error: Exception | None = None
+        self.took_before_error = False
+        self.execution_ids = True  # whether fill updates carry `execution_id`
+        self.submit_delay = 0.0
+        self.submitted: list[OrderRequest] = []
+        self.cancels: list[str] = []
+        self.order_queries: list[GetOrdersRequest | None] = []
+        self.orders: list[dict] = []
+        self.positions: list[dict] = []
+        self.account = dict(ACCOUNT)
+        self._placed: dict[str, dict] = {}
+
+    def submit_order(self, order_data: OrderRequest) -> Order:
+        self.submitted.append(order_data)
+        if self.submit_error is not None and not self.took_before_error:
+            raise self.submit_error
+        now = datetime.now(UTC).isoformat()
+        placed = alpaca_order(
+            id=str(uuid.uuid4()),
+            client_order_id=order_data.client_order_id,
+            symbol=order_data.symbol,
+            qty=str(int(order_data.qty or 0)),
+            side=order_data.side.value if order_data.side else None,
+            type=order_data.type.value,
+            order_type=order_data.type.value,
+            time_in_force=order_data.time_in_force.value,
+            limit_price=str(getattr(order_data, "limit_price", None) or "") or None,
+            created_at=now,
+            submitted_at=now,
+            updated_at=now,
+        )
+        self._placed[placed["id"]] = placed
+        answer = Order(**placed)  # the REST answer is the order as submitted, before any update
+        qty = int(placed["qty"])
+        if self.script in ("accept", "fill", "partial"):
+            self._send("new", placed, status="new")
+        if self.script == "fill":
+            self._send("fill", placed, qty, status="filled", filled_qty=str(qty))
+        elif self.script == "partial":
+            self._send("partial_fill", placed, 1, status="partially_filled", filled_qty="1")
+            self._send("fill", placed, qty - 1, status="filled", filled_qty=str(qty))
+        elif self.script == "reject":
+            self._send("new", placed, status="new")
+            self._send("rejected", placed, status="rejected")
+        if self.submit_error is not None:
+            raise self.submit_error
+        time_module.sleep(self.submit_delay)
+        return answer
+
+    def _send(self, event: str, placed: dict, qty: int | None = None, **status: str) -> None:
+        placed.update(status, updated_at=datetime.now(UTC).isoformat())
+        update: dict[str, object] = {
+            "event": event,
+            "order": dict(placed),
+            "timestamp": datetime.now(UTC).isoformat(),
+        }
+        if qty is not None:
+            update.update(price=self.fill_price, qty=str(qty), position_qty=str(qty))
+            if self.execution_ids:
+                update["execution_id"] = str(uuid.uuid4())
+            placed["filled_avg_price"] = self.fill_price
+        assert self.stream is not None, "no trade stream to send to"
+        self.stream.send(update)
+
+    def cancel_order_by_id(self, order_id: object) -> None:
+        self.cancels.append(str(order_id))
+        if self.cancel_error is not None and not self.took_before_error:
+            raise self.cancel_error
+        placed = self._placed.get(str(order_id))
+        if placed is None:
+            raise api_error(404, 40410000, "order not found")
+        if self.cancel_error is not None:
+            # Taken, and refused on the repeat: Alpaca's order is pending cancel; no update is sent.
+            placed.update(status="pending_cancel")
+            raise self.cancel_error
+        self._send("canceled", placed, status="canceled", canceled_at=datetime.now(UTC).isoformat())
+
+    def get_order_by_id(self, order_id: object) -> Order:
+        for raw in [*self._placed.values(), *self.orders]:
+            if raw["id"] == str(order_id):
+                return Order(**raw)
+        raise api_error(404, 40410000, "order not found")
+
+    def get_order_by_client_id(self, client_id: str) -> Order:
+        for raw in [*self._placed.values(), *self.orders]:
+            if raw["client_order_id"] == client_id:
+                return Order(**raw)
+        raise api_error(404, 40410000, "order not found")
+
+    def get_orders(self, filter: GetOrdersRequest | None = None) -> list[Order]:
+        self.order_queries.append(filter)
+        status = filter.status.value if filter is not None and filter.status else "open"
+        symbols = filter.symbols if filter is not None else None
+        selected = []
+        for raw in self.orders:
+            closed = raw["status"] in CLOSED_ORDER_STATUSES
+            if (status == "open" and closed) or (status == "closed" and not closed):
+                continue
+            if symbols and raw["symbol"] not in symbols:
+                continue
+            order = Order(**raw)
+            # "after"/"until": only orders "submitted after" / "submitted until" (GetOrdersRequest).
+            if (
+                filter is not None
+                and filter.after is not None
+                and order.submitted_at <= filter.after
+            ):
+                continue
+            if (
+                filter is not None
+                and filter.until is not None
+                and order.submitted_at > filter.until
+            ):
+                continue
+            selected.append(order)
+        return selected
+
+    def get_all_positions(self) -> list[Position]:
+        return [Position(**p) for p in self.positions]
+
+    def get_account(self) -> TradeAccount:
+        return TradeAccount.model_validate(self.account)
+
+
+class FakeTradeStream:
+    """Stands in for `TradingStream`: `run()` blocks on its own asyncio loop until `stop()`.
+
+    As in alpaca-py 0.45.0: `subscribe_trade_updates` refuses a handler that is not a coroutine function
+    and, before `run()`, only records it; each message sent is cast with `TradeUpdate(**data)` and awaited
+    on the stream's loop. `send` may be called from any thread; messages sent before `run()` wait for it.
+    With `ignores_stop`, `run()` keeps going after `stop()` until `release` is set.
+    """
+
+    def __init__(self) -> None:
+        self.handler: Handler | None = None
+        self.ignores_stop = False
+        self.release = threading.Event()
+        self.run_threads: list[str] = []
+        self.running = threading.Event()
+        self.stopped = threading.Event()
+        self.finished = threading.Event()
+        self._messages: queue.Queue[dict] = queue.Queue()
+
+    def subscribe_trade_updates(self, handler: Handler) -> None:
+        if not inspect.iscoroutinefunction(handler):
+            raise ValueError("handler must be a coroutine function")
+        assert not self.running.is_set(), (
+            "alpaca-py blocks a subscribe on the running stream's loop"
+        )
+        self.handler = handler
+
+    def send(self, data: dict) -> None:
+        self._messages.put(data)
+
+    def run(self) -> None:
+        self.run_threads.append(threading.current_thread().name)
+        self.running.set()
+        try:
+            asyncio.run(self._serve())
+        finally:
+            self.running.clear()
+            self.finished.set()
+
+    def stop(self) -> None:
+        self.stopped.set()
+
+    async def _serve(self) -> None:
+        while not self.stopped.is_set() or (self.ignores_stop and not self.release.is_set()):
+            try:
+                data = await asyncio.to_thread(self._messages.get, True, 0.05)
+            except queue.Empty:
+                continue
+            if self.handler is not None:
+                await self.handler(TradeUpdate(**data))
 
 
 class FakeHistoricalClient:
@@ -403,7 +746,14 @@ def alpaca() -> SimpleNamespace:
         trade_correction=trade_correction,
         hourly_bars=hourly_bars,
         bars_opening=bars_opening,
+        ORDER_AAPL=ORDER_AAPL,
+        POSITION_AAPL=POSITION_AAPL,
+        FILL_UPDATE=FILL_UPDATE,
+        alpaca_order=alpaca_order,
+        api_error=api_error,
         TradingClient=FakeTradingClient,
+        OrdersClient=FakeOrdersClient,
+        TradeStream=FakeTradeStream,
         HistoricalClient=FakeHistoricalClient,
         Stream=FakeStream,
     )

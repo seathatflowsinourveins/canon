@@ -2,11 +2,13 @@
 
 An out-of-tree NautilusTrader adapter for Alpaca, built on `alpaca-py`.
 
-**Status: first slice, data only.** It loads US equities as instruments, serves historical bars on request
-and streams quotes and trades, all against Alpaca's paper data. There is no execution client: nothing in
-this package places, modifies or cancels an order. The offline tests pass; the paper integration test has
-not run yet (see [Tests](#tests)). Nothing should depend on the adapter until that test and the execution
-slice exist.
+**Status: data slice and first execution slice, paper only.** It loads US equities as instruments, serves
+historical bars on request and streams quotes and trades, all against Alpaca's paper data. Its execution
+client sends market and limit orders for US equities to Alpaca's **paper** Trading API, cancels them,
+turns Alpaca's trade updates into order events and fills, and reports orders and positions for
+reconciliation at start-up. Its config refuses anything but paper trading. The offline tests pass; the two
+paper integration tests have not run yet (see [Tests](#tests)). Nothing should depend on the adapter until
+they have.
 
 NautilusTrader has no official Alpaca adapter, and its maintainer has said one is not planned in the near
 term. The decision to build one, and the alternatives, are in
@@ -22,8 +24,8 @@ Follows upstream's adapter template, `examples/live/_template/` at the pinned Na
 | `constants.py` | Venue identity (`ALPACA`), credential variable names, feed, price increment, each with its source | Built |
 | `providers.py` | `AlpacaInstrumentProvider`: US equities from Alpaca's `/v2/assets` as `Equity` instruments | Built |
 | `data.py` | `AlpacaDataClient` (`MarketDataClient`): `_request_bars`, `_subscribe_quotes`, `_subscribe_trades` and their unsubscribes | Built |
-| `factories.py` | `AlpacaDataClientFactory` | Built (data only) |
-| `execution.py` | Account state, reconciliation, order execution hooks | Not started |
+| `factories.py` | `AlpacaDataClientFactory`, `AlpacaExecutionClientFactory` | Built |
+| `execution.py` | `AlpacaExecutionClient` (`ExecutionClient`): account state on connect, `_submit_order` and `_cancel_order` for market and limit orders, trade updates as order events and fills, order and position status reports; `AlpacaExecutionClientConfig`, which refuses anything but paper trading | Built (first slice) |
 
 The template is LGPL-3.0; copying from it is a licensing decision for the owner, so it was read for shape
 only and this package's code is written against the documented interface.
@@ -44,6 +46,28 @@ data_clients = {
 data_factories = {"ALPACA": AlpacaDataClientFactory}
 ```
 
+Register the execution client the same way, with its own config class:
+
+```python
+from canon_alpaca.execution import AlpacaExecutionClientConfig
+from canon_alpaca.factories import AlpacaExecutionClientFactory
+
+exec_clients = {
+    "ALPACA": AlpacaExecutionClientConfig(
+        instrument_provider=InstrumentProviderConfig(load_ids=["AAPL.ALPACA"]),
+    ),
+}
+exec_factories = {"ALPACA": AlpacaExecutionClientFactory}
+```
+
+`AlpacaExecutionClientConfig` refuses `paper` other than `True`, any `url_override`, any other keyword, and
+any value naming Alpaca's live host (`api.alpaca.markets`, from alpaca-py's `BaseURL`), with an error that
+names the rule: paper trading only, AGENTS.md rule 8 and ADR 0009. NautilusTrader's own
+`ExecutionClientConfig` drops unknown keywords silently, so the client refuses any other config class.
+Whatever the config holds, the client builds alpaca-py's `TradingClient` and `TradingStream` with
+`paper=True` and nothing else. The risk engine denies a market order while it has no price for the
+instrument, so run the data client on the same node.
+
 `load_all=True` loads every active US equity instead; its `filters` may set `exchange` or `attributes`
 (the `GetAssetsRequest` fields), and `status` only to `active`. `filter_callable` is refused when the
 provider is built: NautilusTrader v2's Python `InstrumentProvider` never applies it, and upstream's own
@@ -62,8 +86,12 @@ From upstream's Python adapter guide (`developer_guide/python_adapters`):
 * Provide `DataClientFactory` and `ExecutionClientFactory` subclasses. `create(*, name, config, cache, clock)`
   returns the client synchronously; execution factories also receive `trader_id`.
 * Name classes `Alpaca<Role>`: `AlpacaDataClient`, `AlpacaDataClientConfig`, `AlpacaDataClientFactory`, and
-  the same for execution. No `Live` prefix. This slice has no adapter config fields, so it uses a plain
-  `DataClientConfig` and there is no `AlpacaDataClientConfig` yet.
+  the same for execution. No `Live` prefix. The data client has no adapter config fields, so it uses a plain
+  `DataClientConfig` and there is no `AlpacaDataClientConfig` yet. `AlpacaExecutionClientConfig` has none
+  either; it exists to refuse what is not paper trading.
+* Execution clients take `trader_id`, `venue`, `account_id`, `account_type` and `oms_type` at
+  construction, implement the four reconciliation hooks, and emit events through `generate_*`. Here the
+  account is `ALPACA-PAPER`, a `CASH` account with `NETTING` positions.
 * Keep constructors free of tasks and network resources. Schedule background work with `self.create_task`
   and close resources in `_disconnect`. Here the alpaca-py clients are built in `_connect`; the stream
   thread starts on the first subscription and is stopped and joined in `_disconnect`.
@@ -156,11 +184,61 @@ Each is stated where it is implemented, with its source.
   failed. `load_all` fails as a whole if alpaca-py cannot parse any one asset record (its models validate
   the full list).
 
+## Known limits of the execution slice
+
+Each is stated in `execution.py`'s header, with its source.
+
+* **Order types:** market and limit, `DAY` or `GTC`, whole shares, simple orders. Alpaca marks IOC, FOK,
+  OPG and CLS for whole-share market and limit orders "Yes*", "contact the sales team"
+  (https://docs.alpaca.markets/us/docs/orders-at-alpaca.md, "Order Types vs Supported Time in Force"), so
+  they are denied. So are stop, stop-limit, trailing, post-only, reduce-only, quote-quantity and display
+  quantity orders, a limit price at or above $1.00 with more than 2 decimals or below $1.00 with more than
+  4 (the same page, "Sub-penny increments"), and an asset Alpaca marks not tradable. Denied orders never
+  reach Alpaca. Not implemented: modify, cancel-all, order lists, queries, extended hours.
+* **Outcomes:** a 403 or 422 from "Create an Order" (https://docs.alpaca.markets/us/reference/postorder.md)
+  rejects the order once Alpaca confirms it does not hold it (see Retries); any other failure leaves it `SUBMITTED`, an unknown outcome under NautilusTrader's
+  policies (https://nautilustrader.io/docs/md/latest/concepts/execution/policies.md, "Command outcomes"),
+  for a trade update or reconciliation to resolve. A cancel answered 204 waits for Alpaca's `canceled`
+  update; one answered 422 is a cancel rejection unless Alpaca shows the order canceled or pending cancel
+  (https://docs.alpaca.markets/us/reference/deleteorderbyorderid-1.md).
+* **Fills** come from the trade updates stream only, one per `fill` or `partial_fill` event, with the
+  event's own `qty` and `price` (https://docs.alpaca.markets/us/docs/websocket-streaming.md). The trade ID
+  is Alpaca's `execution_id`, which that page shows only in its example; a fill without one is logged and
+  not applied. Prices are kept at the precision Alpaca sends (the example has seven decimals). Alpaca
+  reports no commission and no liquidity side, so fills carry `None` and `NO_LIQUIDITY_SIDE`.
+* **No fill reports at start-up:** alpaca-py 0.45.0's `TradingClient` has no account activities call, so
+  NautilusTrader infers each reported order's fills from its filled quantity and average price
+  (https://nautilustrader.io/docs/md/latest/concepts/execution/reconciliation.md, "Fill reconciliation"),
+  one fill per order at the average price.
+* **Reports:** the orders submitted in the engine's window and every open order however old, since
+  Alpaca's `after` and `until` filter on submission time; at most 500 orders per request, alpaca-py's
+  documented maximum, newest first; a full page
+  is logged as possibly truncated. An open order with a type, side, class, status, quantity or time in force
+  this slice does not map fails start-up, and its reason is logged; so does an open order in anything but
+  US equities, and a fractional position (`Equity` is whole-share only). A closed order of that kind is
+  skipped with a warning. Positions in anything but US equities are not reported. Alpaca does not say whether a short
+  position's `qty` is negative, so the side comes from `side` and the size is its magnitude.
+* **Account:** a NautilusTrader cash account whose USD balance is Alpaca's `cash`, all free, read at
+  connect only; cash finer than a cent is reported to the cent, with a warning. Buying power, margin and
+  shorting are not modelled; `equity`, `buying_power` and the
+  account number are kept in the account state's `info`.
+* **Stream:** alpaca-py does not expose the stream's `listening` acknowledgement, so updates sent before
+  it is listening are missed and reconciliation resolves those orders. Updates for orders the node does
+  not hold are logged and dropped. Events this slice does not map (`replaced`, `done_for_day`, `stopped`,
+  `suspended` and the rest) are logged as warnings. As with the data stream, there is no restart, and
+  shutdown waits `STREAM_JOIN_TIMEOUT_SECS`.
+* **Retries:** alpaca-py retries a request answered 429 or 504 up to three times, a submit or cancel
+  included (`RESTClient._request`), and cannot be told not to. A repeated submit carries the same
+  `client_order_id`; what Alpaca answers it is not documented on the pages read (UNVERIFIED). So before a
+  403 or 422 rejects an order, the client asks Alpaca for it by client order ID and accepts it if Alpaca
+  holds it; before a 422 rejects a cancel, it asks for the order and generates nothing if Alpaca shows it
+  canceled or pending cancel. There is no HTTP timeout, as for the data client.
+
 ## Tests
 
 `tests/` beside `src/`, run with pytest in `importlib` import mode from the repo root (`uv run --locked pytest`).
 Upstream's template is covered by integration tests for factory registration, a market fill and shutdown.
-This slice has the two that apply to a data client, offline, plus a paper test:
+This package has all three for each client, offline, plus a paper test for each:
 
 | File | Covers | Network |
 |---|---|---|
@@ -168,12 +246,15 @@ This slice has the two that apply to a data client, offline, plus a paper test:
 | `test_provider.py` | Asset queries and filters, load by ID, failures named, other venues refused | None |
 | `test_data_client.py` | A real `LiveNode`: registration through config and builder, owned and hosted launch, bars, quotes and trades into strategy and cache, hourly and daily bar windows, `limit`, open-ended requests, concurrent and cancelled bar requests, request failures as `failure_reason`, unsubscribes that never subscribed or failed, late data for an unsubscribed symbol dropped, trade cancels and corrections logged, one-sided quotes dropped and counted, a stream ending by itself logged (and an abandoned one not), shutdown joining the stream thread or clearing state when it does not stop, stream handlers not keeping the client alive, paper and IEX client construction | None |
 | `test_paper_integration.py` | One asset and a week of daily bars from Alpaca's paper environment through a real node, from midday New York on a fixed trading day: the first bar must be the one that opened at that day's midnight, which Alpaca returns only because the adapter shifts the window | Paper only; skipped without `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` |
-| `test_upstream_contract.py` | The upstream names this README quotes still exist in the pinned packages; the stream stand-in refuses and keeps what alpaca-py's `StockDataStream` does | None |
+| `test_execution_client.py` | A real `LiveNode` with both clients: registration through config and builder, owned and hosted launch, a market order that fills, partial fills, a limit order canceled, rejections by HTTP status and by trade update, a cancel refused, orders denied before Alpaca (type, time in force, sub-penny, not tradable), an unknown submit outcome left `SUBMITTED`, an update for an unknown order dropped, start-up reconciliation of an open order, a filled order and a position, an unmapped open order failing start-up, account state on connect, paper-only client construction, shutdown joining the trade stream thread; the config's paper-only refusals, and a node refusing a plain `ExecutionClientConfig` | None |
+| `test_paper_execution.py` | A DAY limit buy of 1 AAPL at $1.00 on Alpaca's paper Trading API through a real node: submitted, accepted, canceled | Paper only; places and cancels one paper order; skipped without `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` |
+| `test_upstream_contract.py` | The upstream names this README quotes still exist in the pinned packages; the execution hooks and `generate_order_filled` signature; alpaca-py's trading clients default to and target paper; the native config drops unknown keywords; the stream stand-ins refuse and keep what alpaca-py's `StockDataStream` and `TradingStream` do | None |
 
 The offline tests use payloads hand-built from the examples in Alpaca's docs (sources in `tests/conftest.py`)
-and stand-ins for the three alpaca-py clients. Not yet tested against Alpaca: the live quote and trade
-stream, and the asset list at `load_all` scale.
+and stand-ins for the alpaca-py clients. Not yet tested against Alpaca: the live quote and trade stream,
+the asset list at `load_all` scale, and everything in the execution client (its paper test has not run).
 
 ## Rules
 
-Paper credentials and paper endpoints only. See `.claude/rules/trading-safety.md`.
+Paper credentials and paper endpoints only. See `.claude/rules/trading-safety.md`. The execution client
+holds this rule in code: see `AlpacaExecutionClientConfig` above.
