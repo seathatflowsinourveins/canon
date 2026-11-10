@@ -21,14 +21,16 @@ scripts/bootstrap --install --with-user-config
 ```
 
 It installs mise, the tools in `mise.toml`, the Claude Code CLI, and the machine-level config in `home/`.
-It uses no `sudo` and overwrites nothing in `~/.claude`.
+It uses no `sudo`. It never overwrites `settings.json` or `CLAUDE.md` in `~/.claude`: a differing one gets a
+`.canon-proposed` copy beside it. It replaces the ledger and status-line scripts and keeps a differing
+previous copy of each.
 
 ## Everyday commands
 
 | Command | Does |
 |---|---|
 | `scripts/canon list` | Every upstream, its role and pinned commit |
-| `scripts/ci` | Every check in one run: registry, shell, hooks, lockfile, ruff, ty, pytest, workflow, secrets |
+| `scripts/ci` | Every check in one run: registry, shell, self-tests and `scripts/test-*`, lockfile, ruff, ty, pytest, workflow, secrets |
 | `scripts/land` | Land the current branch on `main` once every check passes |
 | `scripts/canon lint` | Registry, lock and ADRs have the required evidence (offline) |
 | `scripts/canon check` | Compare pins with live upstream; warns if a release tag was re-pointed |
@@ -44,6 +46,7 @@ It uses no `sudo` and overwrites nothing in `~/.claude`.
 | Layer | Runs | Costs tokens |
 |---|---|---|
 | Commit gate (`scripts/ci`) | Every `git commit` | No |
+| Address check (`scripts/check-addresses`) | Every `git push` | No |
 | Hosted CI (`scripts/ci` on GitHub) | Every pull request and push to `main` | No |
 | Edit checks (canon lint, ruff) | Every matching edit by an agent | No |
 | Guard | Before every tool call by an agent | No |
@@ -53,9 +56,10 @@ It uses no `sudo` and overwrites nothing in `~/.claude`.
 | Weekly refresh | Weekly, when the desktop app is open | One session, short when nothing changed |
 | Dependency bot (Dependabot) | Weekly, on GitHub | Only when a session lands its pull request |
 
-`scripts/automation install` turns on the commit gate and the lane watchdog. The edit checks, the guard and
-the landscape watch are hooks in `.claude/settings.json`. The weekly refresh is a scheduled task in the
-Claude desktop app, and the dependency bot is `.github/dependabot.yml`, which GitHub runs.
+`scripts/automation install` turns on the commit gate, the address check and the lane watchdog. The edit
+checks, the guard and the landscape watch are hooks in `.claude/settings.json`. The weekly refresh is a
+scheduled task in the Claude desktop app, and the dependency bot is `.github/dependabot.yml`, which GitHub
+runs.
 `scripts/automation uninstall` reverses the install. The reasoning is in [ADR 0011](docs/adr/0011-automation.md).
 
 `scripts/canon` and `scripts/lanes` need only `curl` and `jq`, which ship with macOS.
@@ -65,20 +69,20 @@ Claude desktop app, and the dependency bot is `.github/dependabot.yml`, which Gi
 | Path | Holds |
 |---|---|
 | `AGENTS.md`, `CLAUDE.md` | Instructions for agents; `CLAUDE.md` imports `AGENTS.md` |
-| `canon/upstreams.json` | The registry: 31 upstreams with role, licence, evidence, ADR |
+| `canon/upstreams.json` | The registry: 33 upstreams with role, licence, evidence, ADR |
 | `canon/upstreams.lock.json` | Resolved commit SHAs (generated) |
 | `canon/models.json` | Model routing by lane and the landscape snapshot behind it |
-| `docs/adr/` | Fourteen decisions in MADR 4.0.0, each with Evidence and `review-by` |
+| `docs/adr/` | Nineteen decisions in MADR 4.0.0, each with Evidence and `review-by` |
 | `pyproject.toml`, `uv.lock` | uv workspace root; one lockfile for every package |
 | `src/canon_trading/` | Strategies and node configuration |
-| `packages/canon-alpaca/` | The Alpaca adapter for NautilusTrader (not started) |
+| `packages/canon-alpaca/` | The Alpaca adapter for NautilusTrader: a market-data client, no execution client yet |
 | `tests/`, `packages/*/tests/` | Tests beside each package's `src/` |
 | `catalog/` | Local market data; ignored by git |
 | `.claude/settings.json` | Permissions and hooks for this repo |
 | `.claude/rules/` | Rules scoped to `canon/`, `docs/adr/` and trading code |
 | `.claude/skills/` | `adopt-upstream`, `new-adr`, `landscape-refresh`, `lane-report` |
 | `.claude/agents/` | `upstream-scout` (Sonnet), `evidence-verifier` (Opus) |
-| `home/` | Machine-level config: event ledger hook, status line, user `CLAUDE.md` |
+| `home/` | Machine-level config: event ledger hook, status line, lane watchdog, user `CLAUDE.md` |
 | `mise.toml` | Pinned toolchain |
 
 ## How a decision gets made
@@ -94,10 +98,10 @@ here, community convergence, then anyone's recollection.
 
 ## What is not here yet
 
-* **No trading code.** NautilusTrader has no official Alpaca adapter; ADR 0009 decides to build one to
-  upstream's guide. The workspace and the adapter's package exist (ADR 0012) and `uv sync` then
-  `uv run pytest` passes, but the adapter itself has not been started. The tests so far only confirm that
-  the packages import and that the upstream interface matches what the docs here quote.
+* **No execution.** NautilusTrader has no official Alpaca adapter; ADR 0009 decides to build one to
+  upstream's guide. The adapter's data client exists (US equities, historical bars, streamed quotes and
+  trades, from Alpaca's paper data), with offline tests; its paper integration test has not run yet, and
+  there is no execution client. See `packages/canon-alpaca/README.md`.
 * **No accepted method for comparing strategy variants** (ADR 0010 is `proposed`).
 * **No OpenTelemetry backend.** The local event ledger covers this machine; `home/otel-settings.example.json`
   is ready for when a collector exists.

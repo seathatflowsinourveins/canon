@@ -34,27 +34,33 @@ Chosen: **option 4**.
 **Tier 2, local ledger, installed machine-wide from `home/`.**
 
 * `~/.claude/canon/ledger.sh` is registered as an `async` command hook. It appends one line per hook event to
-  `~/.claude/canon/ledger/YYYY-MM-DD.jsonl`: time, event, session, directory, agent type, tool name, skill
-  name, subagent type, permission mode, effort, and the event's source, reason or trigger. No prompts,
-  inputs or outputs.
+  `~/.claude/canon/ledger/YYYY-MM-DD.jsonl`, named by UTC date: time (`ts` in whole seconds, `t` in epoch
+  seconds with milliseconds), event, session, directory, agent type, tool name, skill name, subagent type,
+  permission mode, effort, `from_model` and `to_model` when the payload has them, and the event's source,
+  reason or trigger. No prompts, inputs or outputs.
 * `~/.claude/canon/statusline.sh` shows model, effort, context use and cost, saves the latest snapshot per
   session, and writes a ledger line when the model changes inside a session.
-* `scripts/lanes` reads the ledger and reports per session: state, minutes quiet, tool calls, failures,
-  permission denials, compactions, model switches, and the tool, MCP, skill and subagent mix.
+* `scripts/lanes` reads the ledger files of the last N UTC dates and reports per session: state, minutes
+  quiet, tool calls, failures, permission denials, compactions, model switches, and the tool, MCP, skill
+  and subagent mix. The state comes from the last turn boundary (`UserPromptSubmit` against `Stop`,
+  `StopFailure`, or a `SessionStart` not written by a compaction): working, idle, QUIET, abandoned (open
+  and silent six hours or more), ended, or unknown when the window holds no boundary. Events are ordered
+  by `t`, else `ts`; a line without a valid session and time is counted as unreadable and skipped.
 * `ccusage` (pinned) gives token and cost history from Claude Code's own logs.
 
 What the report can detect:
 
 | Concern | Signal |
 |---|---|
-| Stall | Turn opened (`UserPromptSubmit`) with no `Stop` and no event for N minutes |
+| Stall | Last turn boundary is an open turn, with no event for N minutes (QUIET) |
 | Hidden errors | `PostToolUseFailure` count and rate; `StopFailure` (rate limit, overloaded, billing) |
 | Silent fallback | Model change inside a session, seen by the status line |
 | Blocked lane | `PermissionDenied`, which fires only when auto mode denies a call, not in other modes |
 | Context pressure | `PreCompact` count; context percentage in the snapshot |
 | Skill, MCP, subagent use | `Skill` tool calls, `mcp__*` tool names, `SubagentStart` |
 
-A long single tool call looks the same as a stall, so "quiet" is a prompt to look, not a verdict.
+A long single tool call looks the same as a stall, so "quiet" is a prompt to look, not a verdict. A
+background subagent still working after its parent turn's `Stop` reads as idle.
 
 **Tier 3, OpenTelemetry, deferred.** Claude Code exports metrics and events natively. The variables must be
 set in user or managed settings; they are ignored from project files. `home/otel-settings.example.json` holds the
@@ -115,3 +121,5 @@ Read 2026-11-09 (fetched; fetches are model-summarised).
   are supported. `PermissionDenied` is narrower than first written (auto mode only), and the ledger's field
   list was incomplete; both corrected. The monitoring guide's last change was 2025-07-29, so check it
   against the current telemetry docs before using it.
+* Restated 2026-11-10 against the headers of `scripts/lanes` and `home/.claude/canon/ledger.sh`: the
+  ledger's time fields and file date, the session states and the limits.
