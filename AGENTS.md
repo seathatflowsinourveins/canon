@@ -86,6 +86,7 @@ dependency, pattern and practice traces to a pinned upstream or a dated source. 
 | 0015 | GitHub practice: what a measured sample converges on, and where this repo differs |
 | 0016 | Dependency updates: Dependabot proposes, a session lands |
 | 0017 | Merge gate: checks decide, an independent review comes first, a model never blocks |
+| 0018 | Agent hosts and other runtimes (proposed): no host has converged; one gate holds whatever runs |
 
 ## Automation
 
@@ -102,6 +103,10 @@ workflow's actions; the session brief lists the open ones (ADR 0016).
 skips the gate, an install that bypasses `uv.lock`, and anything that points at live trading. For an
 unattended session it refuses everything except reading. If the guard refuses a call, do not look for
 another route: say what you wanted to do and why.
+
+The guard is a Claude Code hook. It runs in every Claude Code session here, whichever app or host starts
+it, and in no other agent runtime. If you are another runtime, the rules above bind you with nothing to
+stop a mistake: use no credentials, and leave landing to `scripts/land` (ADR 0018).
 
 ## Landing
 
