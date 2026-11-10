@@ -8,6 +8,8 @@
 # osascript, mise, xcode-select, curl and claude, so nothing outside the temp folder is read or changed and
 # nothing reaches the network. The --install case for a missing CLI drops the claude stub from PATH and uses
 # a curl stub that serves an installer stub recording the version it was asked for. A case that needs a macOS-only tool is skipped with a line saying so.
+# One exception: the paper:store case writes to the real login keychain, under a throwaway service only, and
+# deletes what it wrote on exit (ADR 0033).
 # Exit 0 if every case behaves as expected, 1 otherwise.
 # shellcheck disable=SC2016  # stub bodies and eval'd checks are single-quoted so they expand when they run
 set -uo pipefail
@@ -82,6 +84,7 @@ EOF
 chmod +x "$B"/*
 export STUB="$TMP/stub"; mkdir -p "$STUB"
 export PATH="$B:$PATH"
+REAL_HOME="$HOME"   # the paper:store case needs the user's own login keychain, which security finds through HOME
 export HOME="$TMP/home"; mkdir -p "$HOME"
 unset CLAUDE_CONFIG_DIR CANON_LEDGER_HOME AUTOMATION_SKIP_LAUNCHD CANON_LAUNCHAGENTS_DIR
 PINNED=$(sed -n 's/^MISE_VERSION="v\([^"]*\)".*/\1/p' "$ROOT/scripts/bootstrap")
@@ -286,6 +289,95 @@ paper_names() { grep -oE '(-s |svc=)[A-Za-z0-9"$_-]+' "$ROOT/mise.toml" | sed -E
 psvc=$(sed -n 's/^PAPER_SERVICE="\([^"]*\)".*/\1/p' "$ROOT/scripts/bootstrap")
 check "mise.toml's paper tasks name only bootstrap's keychain service" \
       eval '[ -n "$psvc" ] && [ "$(paper_names | wc -l | tr -d " ")" -ge 5 ] && ! paper_names | grep -vxF "$psvc" | grep -q .'
+
+# ---------- paper:store on a terminal, against the real security ----------
+# The stub above cannot see how Apple's security behaves on a terminal (ADR 0033: with -w last it prompts on
+# the terminal and never reads a pipe). So paper:store's own body, taken from mise.toml with only the
+# service changed to a throwaway one, runs on a pseudo-terminal made by expect, typed a made-up pair, with a
+# curl stand-in first on PATH answering for Alpaca's paper API. It writes to the real login keychain under
+# that throwaway service only, and the EXIT trap deletes those items however the run ends.
+echo "paper:store on a terminal:"
+tsvc="canon-test-lanes-throwaway-$$-$RANDOM"
+pstore_body=$(awk -v q="'''" '/^\[tasks\."paper:store"\]$/ {t=1; next} t && $0 == "run = " q {b=1; next} b && $0 == q {exit} b' "$ROOT/mise.toml")
+body=${pstore_body/"svc=$psvc"/"svc=$tsvc"}
+pkey=PKMADEUPMADEUPMADEUP; psecret=madeupsecretmadeupsecretmadeupsecret   # made-up; never a real pair
+paper_cleanup() {
+  local a
+  for a in ALPACA_API_KEY ALPACA_SECRET_KEY probe; do
+    HOME="$REAL_HOME" /usr/bin/security delete-generic-password -s "$tsvc" -a "$a" >/dev/null 2>&1
+  done
+}
+pabsent() { local a; for a in ALPACA_API_KEY ALPACA_SECRET_KEY ${1:+"$1"}; do
+  HOME="$REAL_HOME" /usr/bin/security find-generic-password -s "$tsvc" -a "$a" >/dev/null 2>&1; [ $? = 44 ] || return 1; done; }
+pread() { HOME="$REAL_HOME" /usr/bin/security find-generic-password -s "$tsvc" -a "$1" -w 2>/dev/null; }
+if [ ! -x /usr/bin/security ]; then skip "paper:store on a terminal" "no /usr/bin/security here (macOS only)"
+elif [ ! -x /usr/bin/expect ]; then skip "paper:store on a terminal" "no /usr/bin/expect to make a pseudo-terminal"
+elif ! /usr/bin/expect -c 'spawn -noecho true; expect eof' >/dev/null 2>&1; then
+  skip "paper:store on a terminal" "expect could not open a pseudo-terminal here"
+elif ! HOME="$REAL_HOME" /usr/bin/security default-keychain >/dev/null 2>&1; then
+  skip "paper:store on a terminal" "no default keychain for this user"
+elif [ -z "$psvc" ] || [ "$tsvc" = "$psvc" ] || [[ "$body" == *"$psvc"* ]] || [[ "$body" != *"svc=$tsvc"* ]]; then
+  t_fail "paper:store's body found in mise.toml, its service swapped for a throwaway one"
+elif [[ "$body" == *"{{"* || "$body" == *"{%"* || "$body" == *"{#"* ]]; then
+  t_fail "paper:store's body holds no Tera delimiter, so mise runs it as written (ADR 0029)"
+else
+  trap 'paper_cleanup; rm -rf "$TMP"' EXIT
+  trap 'exit 1' INT TERM HUP
+  # a locked keychain can wait on an unlock dialog, so the probe gets 10 s and is then stopped
+  HOME="$REAL_HOME" /usr/bin/security add-generic-password -a probe -s "$tsvc" -X 00 >/dev/null 2>&1 & ppid_=$!
+  for _ in $(seq 100); do kill -0 "$ppid_" 2>/dev/null || break; sleep 0.1; done
+  if kill -0 "$ppid_" 2>/dev/null; then kill "$ppid_" 2>/dev/null; wait "$ppid_" 2>/dev/null; prc=timeout
+  else wait "$ppid_"; prc=$?; fi
+  if [ "$prc" != 0 ]; then
+    skip "paper:store on a terminal" "the login keychain took no new item within 10 s (locked, or no access: $prc)"
+  else
+    paper_cleanup
+    PB="$TMP/paper-bin"; mkdir -p "$PB"
+    # curl stand-in: takes the headers on stdin as curl -H @- would, prints the status code in $STUB/curl-code
+    printf '#!/bin/bash\ncat > /dev/null\ncat "$STUB/curl-code"\n' > "$PB/curl"; chmod +x "$PB/curl"
+    cat > "$TMP/pstore.exp" <<'EOF'
+# Type the made-up pair at paper:store's two hidden prompts; exit 97 if security prompts on the terminal.
+set timeout 30
+proc finish {} { lassign [wait] pid sid oserr value; exit $value }
+spawn -noecho bash -c $env(PSTORE_BODY)
+expect {
+  "key ID (hidden): " { send -- "$env(PSTORE_KEY)\r" }
+  timeout { puts "\n<<no key prompt>>"; exit 98 }
+  eof { finish }
+}
+expect {
+  "secret key (hidden): " { send -- "$env(PSTORE_SECRET)\r" }
+  timeout { puts "\n<<no secret prompt>>"; exit 98 }
+  eof { finish }
+}
+expect {
+  -re "password data for new item|retype password" { puts "\n<<security prompted on the terminal>>"; exit 97 }
+  timeout { puts "\n<<no end>>"; exit 98 }
+  eof { finish }
+}
+EOF
+    pstore() {
+      echo "$1" > "$STUB/curl-code"
+      PATH="$PB:$PATH" HOME="$REAL_HOME" PSTORE_BODY="$body" PSTORE_KEY="$pkey" PSTORE_SECRET="$psecret" \
+        /usr/bin/expect -f "$TMP/pstore.exp" > "$TMP/pstore.out" 2>&1
+    }
+    pstore 200; rc=$?
+    check "paper:store, the paper API answering 200: exit 0, saying it stored the pair" \
+          eval '[ "$rc" = 0 ] && grep -q "stored ALPACA_API_KEY and ALPACA_SECRET_KEY" "$TMP/pstore.out"'
+    check "... no prompt of security's on the terminal" eval '! grep -Eq "password data for new item|retype password|security prompted" "$TMP/pstore.out"'
+    check "... both items read back equal to what was typed" \
+          eval '[ "$(pread ALPACA_API_KEY)" = "$pkey" ] && [ "$(pread ALPACA_SECRET_KEY)" = "$psecret" ]'
+    check "... neither value on the terminal" eval '! grep -qF -e "$pkey" -e "$psecret" "$TMP/pstore.out"'
+    pstore 200; rc=$?
+    check "paper:store with the items there: refused, exit 1" eval '[ "$rc" = 1 ] && grep -q "already in the login keychain" "$TMP/pstore.out"'
+    paper_cleanup
+    pstore 401; rc=$?
+    check "paper:store, the paper API answering 401: exit 1, nothing stored" \
+          eval '[ "$rc" = 1 ] && grep -q "answered 401" "$TMP/pstore.out" && pabsent'
+  fi
+  paper_cleanup
+  check "throwaway keychain items gone, the probe too" pabsent probe
+fi
 
 mkdir -p "$C/canon"; echo "# previous" > "$C/canon/ledger.sh"
 CLAUDE_CONFIG_DIR="$C" bs --user-config; rc=$?
