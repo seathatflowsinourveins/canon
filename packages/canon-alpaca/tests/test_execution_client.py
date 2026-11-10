@@ -111,12 +111,14 @@ class Trader(Strategy):
         self.cancel_on: str | None = None  # the event name on which to cancel the order
         self.submit = True
         self.idle = False  # neither submits nor stops: the test stops the node
+        self.started = False  # set in on_start, after the node's startup reconciliation
         self.events: list = []
         self.client_order_id: ClientOrderId | None = None
         self.stopped_for: str | None = None
         self.filled = 0.0
 
     def on_start(self) -> None:
+        self.started = True
         if self.idle:
             return
         if not self.submit:
@@ -246,13 +248,21 @@ def run(node: LiveNode, launch: str = "hosted") -> None:
 
 
 def run_with_client(
-    body: Callable[[AlpacaExecutionClient], Awaitable[None]], strategy: Strategy | None = None
+    body: Callable[[AlpacaExecutionClient], Awaitable[None]], strategy: Trader | None = None
 ) -> None:
-    """Run a hosted node, await `body` with its connected execution client, then stop the node.
+    """Run a hosted node, await `body` with its connected execution client once the node has started its
+    strategy, then stop the node.
 
-    The default strategy is idle; with another, `body` can wait for what the strategy set off.
+    The node connects the client and then runs its own startup reconciliation, which asks the client for
+    order, fill and position reports; `body` would race it. A strategy's `on_start` comes after that
+    reconciliation: the reconciliation page at the pinned NautilusTrader commit
+    (`docs/concepts/execution/reconciliation.md`, "Startup reconciliation" and "Startup position
+    validation") has a failed startup stop "before actor or strategy `on_start`", and the order is
+    observed in these tests. The default strategy is idle; with another, `body` can wait for what the
+    strategy set off.
     """
     clients: list[AlpacaExecutionClient] = []
+    strategy = strategy or trader(idle=True)
 
     class Capturing(AlpacaExecutionClientFactory):
         @staticmethod
@@ -261,13 +271,15 @@ def run_with_client(
             clients.append(client)
             return client
 
-    node = build_node(strategy or trader(idle=True), exec_factory=Capturing)
+    node = build_node(strategy, exec_factory=Capturing)
 
     async def main() -> None:
         async with asyncio.timeout(15):
             task = asyncio.ensure_future(node.run_async())
             try:
-                while not (task.done() or (clients and clients[0].is_connected)):
+                while not (
+                    task.done() or (clients and clients[0].is_connected and strategy.started)
+                ):
                     await asyncio.sleep(0.005)
                 if task.done():
                     task.result()
@@ -546,21 +558,29 @@ def test_startup_reconciliation_reports_orders_and_positions(venue, alpaca) -> N
 def test_open_order_placed_before_the_window_is_reported(venue, alpaca) -> None:
     venue.trading.orders = [alpaca.alpaca_order()]  # open, submitted on 2023-12-12
     reports: list = []
+    queries: list = []
+    start = datetime(2024, 1, 1, tzinfo=UTC)
     window = SimpleNamespace(  # the fields the hook reads from a GenerateOrderStatusReports command
         open_only=False,
         instrument_id=None,
-        start=dt_to_unix_nanos(datetime(2024, 1, 1, tzinfo=UTC)),
+        start=dt_to_unix_nanos(start),
         end=None,
     )
 
     async def body(client) -> None:
+        # The node's startup reconciliation has made its own order query by now (see run_with_client).
+        # Its default config lists no orders after that: open_check_interval_secs and
+        # position_check_interval_secs are None, and the in-flight check has no order to look at. Only
+        # the queries this call makes are taken.
+        before = len(venue.trading.order_queries)
         reports.extend(await client._generate_order_status_reports(window))
+        queries.extend(venue.trading.order_queries[before:])
 
     run_with_client(body)
 
-    windowed, open_now = venue.trading.order_queries[-2:]
-    assert (windowed.status, open_now.status) == (QueryOrderStatus.ALL, QueryOrderStatus.OPEN)
-    assert open_now.after is None
+    windowed, open_now = queries
+    assert (windowed.status, windowed.after) == (QueryOrderStatus.ALL, start)
+    assert (open_now.status, open_now.after, open_now.until) == (QueryOrderStatus.OPEN, None, None)
     assert [r.venue_order_id.value for r in reports] == [alpaca.ORDER_AAPL["id"]]
 
 
