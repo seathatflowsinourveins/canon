@@ -1,28 +1,29 @@
-"""Integration tests against Alpaca's paper Trading API: limit orders far below the market, through a real
-node, accepted and then canceled, one by `CancelOrder` and two by one `CancelAllOrders`.
+"""Integration tests against Alpaca's paper Trading API through a real node: limit and stop buys far from
+the market, accepted and then canceled.
 
-It runs only when a paper key pair is in the environment, under the names in `canon_alpaca.constants`
-(`ALPACA_API_KEY`, `ALPACA_SECRET_KEY`). Otherwise pytest reports it as skipped with that reason. Never
-write the keys to a file.
+They run only when a paper key pair is in the environment, under the names in `canon_alpaca.constants`
+(`ALPACA_API_KEY`, `ALPACA_SECRET_KEY`); otherwise pytest reports them skipped with that reason. Never write
+the keys to a file. Run them with `mise run paper:test`, which holds the paper account's lock.
 
-What it calls: Alpaca's paper Trading API and its trade updates stream, through `TradingClient(paper=True)`
+What they call: Alpaca's paper Trading API and its trade updates stream, through `TradingClient(paper=True)`
 and `TradingStream(paper=True)` ("Paper Trading", https://docs.alpaca.markets/us/docs/paper-trading.md).
-The first places one paper order: a DAY limit buy of 1 AAPL at $1.00, a price far below the market, so it
-is not expected to fill, and cancels it once Alpaca has accepted it. The second is TC-E41 of upstream's
-Execution Testing Spec, driven by upstream's `ExecTester`: a limit buy $50 below the best bid, canceled by
-`CancelAllOrders` on stop (ADR 0036). That command reaches every AAPL order
-the node holds, so the test places nothing, and fails, if the paper account already holds an open AAPL
-order; it needs the regular session for quotes, and in a `finally` cancels any order of its own left open. Startup reconciliation reads the paper
-account's orders and positions first; an open order there that this slice does not map fails the start.
-Whether Alpaca accepts a limit price this far from the market, and how it treats a DAY order outside
-market hours, are UNVERIFIED until this runs; Alpaca documents that a DAY order submitted after the
-close "is queued and submitted the following trading day" (alpaca-py `TimeInForce`).
+The first places a DAY limit buy of 1 AAPL at $1.00 and cancels it once Alpaca has accepted it. The others
+run rows of upstream's Execution Testing Spec through upstream's `ExecTester` (ADR 0036): TC-E41, a limit
+buy $50 below the bid and a stop buy $50 above the ask, canceled by `CancelAllOrders` on stop; TC-E20 and
+TC-E22, a stop and a stop-limit buy $50 above the ask, accepted at the prices sent and canceled on stop.
+The tester's rows need the regular session for quotes. Each test places nothing, and fails, if the paper
+account already holds an open AAPL order or an AAPL position, and afterwards cancels every open AAPL order
+and closes any AAPL position. Startup reconciliation reads the account's orders and positions first; an
+open order there that this slice does not map fails the start.
 """
 
 import asyncio
 import os
+from collections.abc import Callable
 from collections.abc import Generator
 from contextlib import contextmanager
+from decimal import Decimal
+from typing import Any
 
 import pytest
 from alpaca.common.exceptions import APIError
@@ -34,6 +35,7 @@ from canon_alpaca.constants import ACCOUNT_ID
 from canon_alpaca.constants import ENV_API_KEY
 from canon_alpaca.constants import ENV_SECRET_KEY
 from canon_alpaca.execution import AlpacaExecutionClientConfig
+from canon_alpaca.execution import order_status_report
 from canon_alpaca.factories import AlpacaDataClientFactory
 from canon_alpaca.factories import AlpacaExecutionClientFactory
 from nautilus_trader.common import Environment
@@ -47,11 +49,13 @@ from nautilus_trader.model import ClientId
 from nautilus_trader.model import InstrumentId
 from nautilus_trader.model import OrderSide
 from nautilus_trader.model import OrderStatus
+from nautilus_trader.model import OrderType
 from nautilus_trader.model import Price
 from nautilus_trader.model import Quantity
 from nautilus_trader.model import StrategyId
 from nautilus_trader.model import TimeInForce
 from nautilus_trader.model import TraderId
+from nautilus_trader.model import TriggerType
 from nautilus_trader.testkit import ExecTesterConfig
 from nautilus_trader.trading import Strategy
 
@@ -69,6 +73,8 @@ TESTER = StrategyId("ExecTester-000")
 TOB_OFFSET_TICKS = 500_000
 """$50 at the adapter's 0.0001 increment: far from the market, so nothing fills; the spec's default, 500
 ticks, would be five cents."""
+STOP_LIMIT_OFFSET_TICKS = 500
+"""Five cents between a stop-limit's trigger and its limit."""
 
 
 class AcceptThenCancel(Strategy):
@@ -207,7 +213,8 @@ def test_paper_cancel_all_on_stop_tc_e41() -> None:
     `crates/testkit/src/testers/exec/strategy.rs` at the pinned commit), which the client cancels order by
         order. Pass: each order ends `OrderCanceled`, and nothing was left for the cleanup. The row's limit
     sell is left out: from a flat account Alpaca refuses it, 403 "cannot open a short sell while a long
-    buy order is open" (observed 2026-11-10), and the tester resubmits it on every quote."""
+    buy order is open" (observed 2026-11-10), and the tester resubmits it on every quote. A stop buy
+    `TOB_OFFSET_TICKS` above the ask is the second order instead."""
     with aapl_left_as_found() as cleaned:
         events = run_exec_tester(
             ExecTesterConfig(
@@ -216,14 +223,18 @@ def test_paper_cancel_all_on_stop_tc_e41() -> None:
                 order_qty=Quantity.from_int(1),
                 enable_limit_buys=True,
                 enable_limit_sells=False,  # see the docstring
+                enable_stop_buys=True,  # the second order, in place of the sell
+                stop_order_type=OrderType.STOP_MARKET,
+                stop_offset_ticks=TOB_OFFSET_TICKS,
+                stop_time_in_force=TimeInForce.DAY,
                 tob_offset_ticks=TOB_OFFSET_TICKS,
                 limit_time_in_force=TimeInForce.DAY,
             ),
-            count=1,
+            count=2,
         )
 
     assert cleaned == {"orders": 0, "positions": 0}, cleaned
-    assert len(events) == 1, events
+    assert len(events) == 2, events
     # The card's sequence is `OrderPendingCancel` then `OrderCanceled`; for `CancelAllOrders` the engine
     # emits no `OrderPendingCancel` (observed) and the binding has no method for a client to, so the last
     # event is checked.
@@ -231,9 +242,66 @@ def test_paper_cancel_all_on_stop_tc_e41() -> None:
         assert names[-1] == "OrderCanceled", names
 
 
-def run_exec_tester(config: ExecTesterConfig, count: int) -> dict[str, list[str]]:
-    """Run upstream's `ExecTester` on a node with the spec's setup until it has `orders` orders accepted,
-    then stop it (its stop cancels them), and return each of its orders' event names."""
+@pytest.mark.parametrize(
+    ("row", "order_type"),
+    [("TC-E20", OrderType.STOP_MARKET), ("TC-E22", OrderType.STOP_LIMIT)],
+)
+def test_paper_stop_buy_is_accepted_with_its_prices(row: str, order_type: OrderType) -> None:
+    """TC-E20 ("StopMarket BUY") and TC-E22 ("StopLimit BUY") of upstream's Execution Testing Spec, through
+    `ExecTester`: a stop buy `TOB_OFFSET_TICKS` above the ask (a stop-limit's limit 5 cents above its
+    trigger), which must not trigger. Pass: accepted with the trigger and limit prices the node sent, as
+    Alpaca holds them; the client's report of Alpaca's order (what reconciliation reads) has the same
+    type, prices and trigger type `DEFAULT`; then canceled on stop. A trigger and fill need the market to
+    move $50 and are not tested (the card: "may not happen during the test")."""
+    trading = paper_trading()
+    seen: list[tuple[Any, AlpacaOrder]] = []
+
+    def check(orders: list) -> None:
+        for order in orders:
+            held = trading.get_order_by_client_id(order.client_order_id.value)
+            assert isinstance(held, AlpacaOrder)
+            seen.append((order, held))
+
+    with aapl_left_as_found() as cleaned:
+        events = run_exec_tester(
+            ExecTesterConfig(
+                instrument_id=AAPL,
+                client_id=ClientId("ALPACA"),
+                order_qty=Quantity.from_int(1),
+                enable_limit_buys=False,
+                enable_limit_sells=False,
+                enable_stop_buys=True,
+                enable_stop_sells=False,
+                stop_order_type=order_type,
+                stop_offset_ticks=TOB_OFFSET_TICKS,
+                stop_limit_offset_ticks=STOP_LIMIT_OFFSET_TICKS,
+                stop_time_in_force=TimeInForce.DAY,
+            ),
+            count=1,
+            check=check,
+        )
+
+    assert cleaned == {"orders": 0, "positions": 0}, (row, cleaned)
+    assert len(events) == 1, (row, events)
+    ((order, held),) = seen
+    assert Decimal(str(held.stop_price)) == Decimal(str(order.trigger_price)), row
+    report = order_status_report(held, 0)
+    assert report is not None
+    assert (report.order_type, report.trigger_type) == (order_type, TriggerType.DEFAULT), row
+    assert report.trigger_price == order.trigger_price, row
+    if order_type == OrderType.STOP_LIMIT:
+        assert Decimal(str(held.limit_price)) == Decimal(str(order.price)), row
+        assert report.price == order.price, row
+    for names in events.values():
+        assert names[-1] == "OrderCanceled", (row, names)
+
+
+def run_exec_tester(
+    config: ExecTesterConfig, count: int, check: Callable[[list], None] | None = None
+) -> dict[str, list[str]]:
+    """Run upstream's `ExecTester` on a node with the spec's setup until it has `count` orders accepted,
+    pass them to `check` while they rest, then stop it (its stop cancels them), and return each of its
+    orders' event names."""
     provider = InstrumentProviderConfig(load_ids=[str(AAPL)])
     node = (
         LiveNode.builder("CANON-ALPACA-PAPER-TESTER", TraderId("TESTER-001"), Environment.SANDBOX)
@@ -265,6 +333,8 @@ def run_exec_tester(config: ExecTesterConfig, count: int) -> dict[str, list[str]
             while not task.done() and asyncio.get_running_loop().time() < deadline:
                 orders = cache.orders(instrument_id=AAPL, strategy_id=TESTER)
                 if len(orders) == count and all(o.status == OrderStatus.ACCEPTED for o in orders):
+                    if check is not None:
+                        check(orders)
                     break
                 await asyncio.sleep(0.25)
         finally:

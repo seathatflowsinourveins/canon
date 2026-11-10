@@ -32,6 +32,8 @@ from alpaca.trading.enums import QueryOrderStatus
 from alpaca.trading.enums import TimeInForce as AlpacaTimeInForce
 from alpaca.trading.requests import LimitOrderRequest
 from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.requests import StopLimitOrderRequest
+from alpaca.trading.requests import StopOrderRequest
 from canon_alpaca.constants import ACCOUNT_ID
 from canon_alpaca.constants import ENV_API_KEY
 from canon_alpaca.constants import ENV_SECRET_KEY
@@ -51,10 +53,13 @@ from nautilus_trader.model import ClientOrderId
 from nautilus_trader.model import InstrumentId
 from nautilus_trader.model import OrderSide
 from nautilus_trader.model import OrderStatus
+from nautilus_trader.model import OrderType
 from nautilus_trader.model import Price
 from nautilus_trader.model import Quantity
 from nautilus_trader.model import TimeInForce
 from nautilus_trader.model import TraderId
+from nautilus_trader.model import TrailingOffsetType
+from nautilus_trader.model import TriggerType
 from nautilus_trader.trading import Strategy
 
 AAPL = InstrumentId.from_str("AAPL.ALPACA")
@@ -111,6 +116,9 @@ class Trader(Strategy):
         self.quantity = 2
         self.price = "150.00"
         self.time_in_force = TimeInForce.GTC
+        self.trigger_price = "200.00"  # for stop and stop-limit orders
+        self.trigger_type: TriggerType | None = None  # None leaves the factory's default
+        self.post_only = False
         self.cancel_on: str | None = None  # the event name on which to cancel the order
         self.submit = True
         self.idle = False  # neither submits nor stops: the test stops the node
@@ -145,9 +153,34 @@ class Trader(Strategy):
                 Price.from_str(self.price),
                 time_in_force=self.time_in_force,
             )
-        else:
+        elif self.order_type == "stop":
             order = factory.stop_market(
-                AAPL, self.side, Quantity.from_int(self.quantity), Price.from_str(self.price)
+                AAPL,
+                self.side,
+                Quantity.from_int(self.quantity),
+                Price.from_str(self.trigger_price),
+                trigger_type=self.trigger_type,
+                time_in_force=self.time_in_force,
+            )
+        elif self.order_type == "stop_limit":
+            order = factory.stop_limit(
+                AAPL,
+                self.side,
+                Quantity.from_int(self.quantity),
+                Price.from_str(self.price),
+                Price.from_str(self.trigger_price),
+                trigger_type=self.trigger_type,
+                time_in_force=self.time_in_force,
+                post_only=self.post_only,
+            )
+        else:
+            order = factory.trailing_stop_market(
+                AAPL,
+                self.side,
+                Quantity.from_int(self.quantity),
+                trailing_offset=Decimal("1.00"),
+                trailing_offset_type=TrailingOffsetType.PRICE,
+                trigger_price=Price.from_str(self.trigger_price),
             )
         self.client_order_id = order.client_order_id
         self.submit_order(order)
@@ -412,8 +445,34 @@ def test_partial_fills_are_reported_per_fill(venue) -> None:
 @pytest.mark.parametrize(
     ("options", "reason"),
     [
-        ({"order_type": "stop", "price": "200.00"}, "order type STOP_MARKET is not supported"),
+        ({"order_type": "trailing"}, "order type TRAILING_STOP_MARKET is not supported"),
         ({"time_in_force": TimeInForce.IOC}, "time in force IOC is not supported"),
+        (
+            {"order_type": "stop", "time_in_force": TimeInForce.FOK},
+            "time in force FOK is not supported",
+        ),
+        (
+            {"order_type": "stop", "trigger_type": TriggerType.BID_ASK},
+            "trigger type BID_ASK is not offered: Alpaca elects a stop on the last trade",
+        ),
+        (
+            {"order_type": "stop", "trigger_type": TriggerType.MARK_PRICE},
+            "trigger type MARK_PRICE is not offered",
+        ),
+        ({"order_type": "stop", "trigger_price": "200.125"}, "stop price 200.125 has more than 2"),
+        (
+            {
+                "order_type": "stop_limit",
+                "price": "200.50",
+                "trigger_price": "200.00",
+                "post_only": True,
+            },
+            "post-only is not supported",
+        ),
+        (
+            {"order_type": "stop_limit", "price": "201.001", "trigger_price": "200.00"},
+            "limit price 201.001 has more than 2 decimals",
+        ),
         (
             {"order_type": "limit", "price": "150.123"},
             "limit price 150.123 has more than 2 decimals",
@@ -428,6 +487,43 @@ def test_unsupported_order_is_denied_before_alpaca(venue, options, reason) -> No
     assert strategy.names() == ["OrderDenied"]
     assert reason in strategy.events[0].reason
     assert venue.trading.submitted == []
+
+
+@pytest.mark.parametrize("trigger_type", [None, TriggerType.DEFAULT, TriggerType.LAST_PRICE])
+def test_stop_order_is_sent_with_its_stop_price_and_fills(venue, trigger_type) -> None:
+    strategy = trader(order_type="stop", trigger_price="200.00", trigger_type=trigger_type)
+
+    run(build_node(strategy))
+
+    assert strategy.names() == ["OrderSubmitted", "OrderAccepted", "OrderFilled"]
+    (request,) = venue.trading.submitted
+    assert isinstance(request, StopOrderRequest)
+    assert (request.stop_price, request.time_in_force) == (200.0, AlpacaTimeInForce.GTC)
+    assert request.extended_hours is None  # never sent: Alpaca takes no stop in extended hours
+
+
+def test_stop_limit_order_is_sent_with_both_prices(venue) -> None:
+    venue.trading.script = "accept"
+    strategy = trader(
+        order_type="stop_limit",
+        price="200.50",
+        trigger_price="200.00",
+        time_in_force=TimeInForce.DAY,
+        cancel_on="OrderAccepted",
+    )
+
+    run(build_node(strategy))
+
+    assert strategy.names() == [
+        "OrderSubmitted",
+        "OrderAccepted",
+        "OrderPendingCancel",
+        "OrderCanceled",
+    ]
+    (request,) = venue.trading.submitted
+    assert isinstance(request, StopLimitOrderRequest)
+    assert (request.stop_price, request.limit_price) == (200.0, 200.5)
+    assert request.time_in_force == AlpacaTimeInForce.DAY
 
 
 def test_untradable_asset_is_denied(venue, alpaca) -> None:
@@ -760,13 +856,48 @@ def test_open_order_placed_before_the_window_is_reported(venue, alpaca) -> None:
 
 
 def test_open_order_outside_this_slice_fails_startup(venue, alpaca, capfd) -> None:
-    venue.trading.orders = [alpaca.alpaca_order(type="stop", order_type="stop", stop_price="140")]
+    venue.trading.orders = [
+        alpaca.alpaca_order(
+            type="trailing_stop", order_type="trailing_stop", trail_price="1", limit_price=None
+        )
+    ]
     node = build_node(trader(submit=False))
 
     with pytest.raises(Exception):  # noqa: B017 - the node's own startup failure type
         run(node)
 
-    assert "is open with order type stop" in logged(capfd)
+    assert "is open with order type trailing_stop" in logged(capfd)
+
+
+def test_startup_reconciliation_reports_open_stop_orders(venue, alpaca) -> None:
+    stop = alpaca.alpaca_order(
+        id="5d1f3c2a-0b7e-4c8f-9a6d-2e4b8c1f7a90",
+        client_order_id="stop-before-start",
+        type="stop",
+        order_type="stop",
+        limit_price=None,
+        stop_price="140.5",
+    )
+    stop_limit = alpaca.alpaca_order(
+        id="8a2e6f4b-3c1d-4e9a-b7f0-6d5c4b3a2918",
+        client_order_id="stop-limit-before-start",
+        type="stop_limit",
+        order_type="stop_limit",
+        limit_price="141",
+        stop_price="140.5",
+    )
+    venue.trading.orders = [stop, stop_limit]
+    node = build_node(trader(submit=False))
+
+    run(node)
+
+    working = {o.venue_order_id.value: o for o in node.cache.orders_open()}
+    assert working[stop["id"]].order_type == OrderType.STOP_MARKET
+    assert working[stop["id"]].trigger_price == Price.from_str("140.5000")
+    assert working[stop["id"]].trigger_type == TriggerType.DEFAULT
+    assert working[stop_limit["id"]].order_type == OrderType.STOP_LIMIT
+    assert working[stop_limit["id"]].price == Price.from_str("141.0000")
+    assert working[stop_limit["id"]].trigger_price == Price.from_str("140.5000")
 
 
 def test_account_state_is_reported_on_connect(venue) -> None:
