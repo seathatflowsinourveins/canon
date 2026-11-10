@@ -1,11 +1,11 @@
 ---
-status: proposed
+status: accepted
 date: 2026-11-10
-decision-makers: master orchestrator (Claude); repo owner ratifies
+decision-makers: master orchestrator (Claude), applying this record's rule under the owner's delegation
 review-by: 2026-12-10
 ---
 
-# Fill history for the Alpaca adapter: the activities endpoint through alpaca-py's `get`, held for a paper test
+# Fill history for the Alpaca adapter: activities through alpaca-py's `get`, keyed by `execution_id`
 
 ## Context and Problem Statement
 
@@ -24,8 +24,10 @@ API called as documented. Where does per-execution history come from, and may th
 
 ## Decision Outcome
 
-Proposed: **option 2, behind one paper test. Option 1 stands until that test passes, and option 3 replaces
-option 2 when a release carries the call.** Not accepted: the trade ID it needs is `UNVERIFIED`.
+Accepted: **option 2, with `execution_id` as the trade ID on both paths, kept behind its paper test.
+Option 3 replaces option 2 when a release carries the call.** The paper test below matched every time on
+2026-11-10 (Confirmation), which is this record's own rule for accepting it, applied under the owner's
+delegation of that day. Until the slice is built, option 1 stands.
 
 **The endpoint.** Alpaca's Trading API reference documents `GET /v2/account/activities`, and a by-type
 form, with the paper server listed. Parameters: `activity_types`, `category`, `order_id`, `date`, `until`,
@@ -40,9 +42,9 @@ reference caps `page_size` at 100. The guide lists `TRANS` and `MISC` as activit
 and `until` on when an activity was created, and says `created_at` is "Null for trading activities", so
 what they compare for a fill is unstated. The adapter would follow the reference.
 
-**The identity question is open.** The client's trade ID is the stream's `execution_id`, which Alpaca shows
-only in examples, as a bare UUID. An activity's `id` is "Always in `::` format"; alpaca-py's docstring calls
-its halves a date string and a UUID. No Trading API page says that UUID is the `execution_id`. Alpaca's
+**The identity question, as the documents leave it.** The client's trade ID is the stream's
+`execution_id`, which Alpaca shows only in examples, as a bare UUID. An activity's `id` is "Always in
+`::` format"; alpaca-py's docstring calls its halves a date string and a UUID. No Trading API page says that UUID is the `execution_id`. Alpaca's
 Broker guide, for Broker endpoints only, points both ways: its field tables map the REST `id` ("Renamed.")
 and the trade events' `execution_id` ("Renamed. Same value (execution UUID).") to one `ref_id`, yet it also
 says "No common stable ID across SSE and REST". A match is plausible, not documented. NautilusTrader's
@@ -51,11 +53,11 @@ a fill taken from the stream and again from a report under another ID counts twi
 quantity; elsewhere it is rejected as an overfill (`allow_overfills` defaults to false), unless it is a
 standalone reconciliation fill, which "may raise quantity first".
 
-**The test that settles it** (`UNVERIFIED`; it needs a paper key pair): place a paper order that fills, in
-parts if possible; record each fill update's `execution_id`; read the order's `FILL` activities; compare
-every `id`, and the UUID after `::`, with them. A match every time: accept this record with `execution_id`
-as the trade ID on both paths, and keep the test, since the match is observed, not documented. No match:
-option 2 has no shared ID and is dropped.
+**The test that settles it** (`packages/canon-alpaca/tests/test_paper_fill_ids.py`): place a paper order
+that fills, in parts if possible; record each fill update's `execution_id`; read the order's `FILL`
+activities; compare every `id`, and the UUID after `::`, with them. A match every time: accept this record
+with `execution_id` as the trade ID on both paths, and keep the test, since the match is observed, not
+documented. No match: option 2 has no shared ID and is dropped. The result is under Confirmation.
 
 **Each option against rule 3.**
 
@@ -64,13 +66,14 @@ option 2 has no shared ID and is dropped.
    page does not say what price an inferred fill carries.
 2. *The generic `get`.* The endpoint meets it. The method meets it on one reading: `RESTClient.get` is
    public in the pinned source, has a docstring ("Performs a single GET request") and is what every wrapped
-   `TradingClient` read calls, but alpaca-py's README and docs never mention it. Accepting this record
-   ratifies counting that as documented. The adapter would own the query, paging and parsing: 0.45.0's
+   `TradingClient` read calls, but alpaca-py's README and docs never mention it. This record, accepted,
+   counts that as documented. The adapter would own the query, paging and parsing: 0.45.0's
    `TradeActivity` requires an `account_id`, which the Trading reference's fill does not have.
-3. *Waiting* meets it fully, at no known date. No release is newer than v0.45.0. Pull request 845 adds the
-   call as `self.get("/account/activities", params)`: open since 2026-10-25, four reviewers requested, no
-   review. Pull requests 324 and 646 for it closed unmerged. Draft 906, opened 2026-11-10 by an author with
-   commits on `master`, adds the call and the events stream, among 18 open `release-0.50.0` pull requests.
+3. *Waiting* meets it fully, at no known date. No release is newer than v0.45.0. Pull request 845 added
+   the call as `self.get("/account/activities", params)`; it was closed unmerged on 2026-11-10 by the
+   author of draft 906, who wrote that 906 supersedes it. Pull requests 324 and 646 for it closed
+   unmerged. Draft 906, opened 2026-11-10 by an author with commits on `master`, adds the call and the
+   events stream, among 18 open `release-0.50.0` pull requests.
 4. *Asking* is no code and the owner's to do. Issues 232 (open since 2023-01-09) and 595 ask for the call;
    their comments hold no maintainer reply.
 5. *The events stream* is documented, paper server listed, and its `ref_id` is, for trades, "the
@@ -80,15 +83,29 @@ option 2 has no shared ID and is dropped.
 
 ### Consequences
 
-* Good: nothing is built on an unverified identity; the route and its one gate are named.
-* Bad: fills stay inferred until the test runs; option 2 is code a later alpaca-py release makes redundant.
+* Good: a fill from the stream and the same fill from a report would carry one trade ID, so the engine
+  would not count it twice; the identity rests on a kept paper test.
+* Bad: the match is observed on paper, not documented, and a live account is not tested (ADR 0009); option 2
+  is code a later alpaca-py release makes redundant.
 
 ### Confirmation
 
-`scripts/canon lint` checks this record. When the slice is built, `execution.py`'s header names Alpaca's
-reference page and `RESTClient.get`, and the paper test above gates the fill reports. `scripts/canon
-outdated` reports a newer alpaca-py tag; read its notes for the call before moving the pin. Open, and the
-owner's: a paper key pair for the test, the reading of rule 3 in option 2, and any question to upstream.
+**Result of the paper test, 2026-11-10.** Six runs, each a market buy of 2 AAPL and a market sell of 2,
+so twelve orders and twenty fills, eight of the orders in two parts. Every activity was one fill update:
+its `id` was `<17 digits>::<that update's execution_id>`, never the bare UUID, with the same `qty`,
+`price` and `type` (`fill` or `partial_fill`), and its `transaction_time` the update's `timestamp` or 1 µs
+later. The 17 digits read as that time in New York, truncated to the millisecond. Alpaca's paper page says
+partial fills come "10% of the time"; eight of twelve orders here is far above that, and no page read
+explains the difference.
+
+`scripts/canon lint` checks this record. `mise run paper:test` runs the paper test with every other paper
+test (alone: add `-s -k test_paper_fill_activity_ids`); it skips outside the regular session. A run
+without a match reopens this record. When the slice is built, `execution.py`'s header names
+Alpaca's reference page and `RESTClient.get`, and its fill reports take the trade ID from the UUID after
+`::`. `scripts/canon
+outdated` reports a newer alpaca-py tag; read its notes for the call before moving the pin. Still
+UNVERIFIED: the paging limits and the `after`/`until` filters for fills. Open, and the owner's: any
+question to upstream.
 
 ## Evidence
 
@@ -127,4 +144,20 @@ Read 2026-11-10. "raw" means the page's markdown or source fetched with `curl` a
 * Second reader, 2026-11-10 (`evidence-verifier`): the claims hold against raw reads and `proposed` follows.
   Corrected above: the Broker guide's field tables, left out of the first draft; the overfill exception;
   where "may change" and "date string" come from.
-* Not run: any call to Alpaca. The identity of the two IDs, the paging limits and the filters are UNVERIFIED.
+* `test_paper_fill_ids.py` through `mise run paper:test`, 2026-11-10, New York time: three runs at 13:52
+  and 13:53, one at 14:16 once the test also compared `qty`, `price` and `type`, one at 14:19 and one at
+  14:24 after review changes to the test; each passed, with the observations above, printed by the test
+  (run). A run at 14:19 stopped on a defect in the test before any fill, its buy canceled unfilled, and
+  compared nothing. Before each run the test found no open order and no position; each run's orders
+  filled and netted to zero shares.
+* https://docs.alpaca.markets/us/reference/getaccountactivitiesbyactivitytype-1.md — the `order_id` filter,
+  "Useful for retrieving the fills that make up a completely filled order" (fetched, raw; 2026-11-10).
+* https://docs.alpaca.markets/us/docs/paper-trading.md — paper orders "receive partial fills for a random
+  size 10% of the time"; eight of twelve orders here filled in parts (fetched, raw; 2026-11-10).
+* https://github.com/alpacahq/alpaca-py/pull/845 through the GitHub API, 2026-11-10: closed unmerged at
+  16:52 UTC, and the closing comment (fetched, raw).
+* Second reader of the acceptance, 2026-11-10 (`evidence-verifier`): the match and the rule hold against
+  the run logs. Corrected above: the time to 1 µs, "truncated", the partial-fill rate set against Alpaca's
+  10%, pull request 845's state, the command that runs the test, "would" in Consequences, and the rule-3
+  reading no longer listed as open.
+* Not run: the paging limits and the `after`/`until` filters, which stay UNVERIFIED.

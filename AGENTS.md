@@ -95,7 +95,7 @@ dependency, pattern and practice traces to a pinned upstream or a dated source. 
 | 0021 | Orca's skills: used from sessions inside Orca, within written limits |
 | 0022 | Claude Code CLI: installed at the registry's pin and never below it |
 | 0023 | Orca's agent-view plugin: left on as the cockpit's own, with the risk stated |
-| 0024 | Fill history for the Alpaca adapter (proposed): Alpaca's activities endpoint through alpaca-py's `get`, held until a paper test settles the trade ID |
+| 0024 | Fill history for the Alpaca adapter: Alpaca's activities endpoint through alpaca-py's `get`, keyed by `execution_id`, which a paper test matched |
 | 0025 | Claude Code's sandbox: part of it adopted, subject to a trial that costs no lane a stop; nothing is on yet |
 | 0026 | The weekly model run: a desktop scheduled task, gated by scripts, that reports and does not decide |
 | 0027 | Overfitting probability (proposed): a diagnostic beside the Sharpe gate; no implementation adopted |

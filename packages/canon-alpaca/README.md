@@ -220,9 +220,10 @@ Each is stated in `execution.py`'s header, with its source.
   commit, "Fill reconciliation" and "Event ordering"; the `latest` page now adds "unless the client requires
   authoritative fills"). That page does not say what price an inferred fill carries; one fill per order at
   the average price is this repo's reading (UNVERIFIED). Alpaca documents `GET /v2/account/activities` for a
-  trading account, paper included, and alpaca-py's generic `get` could call it. Whether it may, and the
-  paper test of the trade ID that must come first, are in
-  [ADR 0024](../../docs/adr/0024-alpaca-fill-history.md) (proposed).
+  trading account, paper included, and alpaca-py's generic `get` can call it.
+  [ADR 0024](../../docs/adr/0024-alpaca-fill-history.md) accepts that route: on paper, each `FILL`
+  activity's `id` is `<date and time>::<execution_id>` of one trade update (`test_paper_fill_ids.py`), so a
+  fill report would carry the stream's trade ID. The fill reports are not written yet.
 * **Reports:** the orders submitted in the engine's window and every open order however old, since
   Alpaca's `after` and `until` filter on submission time; at most 500 orders per request, alpaca-py's
   documented maximum, newest first; a full page
@@ -261,6 +262,7 @@ This package has all three for each client, offline, plus a paper test for each:
 | `test_paper_integration.py` | One asset and a week of daily bars from Alpaca's paper environment through a real node, from midday New York on a fixed trading day: the first bar must be the one that opened at that day's midnight, which Alpaca returns only because the adapter shifts the window | Paper only; skipped without `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` |
 | `test_execution_client.py` | A real `LiveNode` with both clients: registration through config and builder, owned and hosted launch, a market order that fills, partial fills, a limit order canceled, cancel-all by ID (side filter, a refused cancel, a failed cancel, nothing to cancel), rejections by HTTP status and by trade update, a cancel refused, orders denied before Alpaca (type, time in force, sub-penny, not tradable), an unknown submit outcome left `SUBMITTED`, an update for an unknown order dropped, start-up reconciliation of an open order, a filled order and a position, an unmapped open order failing start-up, account state on connect, paper-only client construction, shutdown joining the trade stream thread; the config's paper-only refusals, and a node refusing a plain `ExecutionClientConfig` | None |
 | `test_paper_execution.py` | DAY limit buys of 1 AAPL far below the market on Alpaca's paper Trading API through a real node: one submitted, accepted and canceled; upstream's `ExecTester` running TC-E41 of its Execution Testing Spec, a limit buy canceled by `CancelAllOrders` on stop | Paper only; cancels every order it places; the TC-E41 test places nothing and fails if the paper account already holds an open AAPL order; skipped without `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` |
+| `test_paper_fill_ids.py` | ADR 0024's test, with alpaca-py directly, not through a node: a market buy of 2 AAPL and a market sell of 2 on Alpaca's paper Trading API; every fill and partial fill update's `execution_id` must be the UUID after `::` in one of the order's `FILL` activity `id`s | Paper only; needs the regular session and skips outside it; stops if the account holds any open order or position; sells what it bought; skipped without `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` |
 | `test_upstream_contract.py` | The upstream names this README quotes still exist in the pinned packages; the execution hooks and `generate_order_filled` signature; alpaca-py's trading clients default to and target paper; the native config drops unknown keywords; the stream stand-ins refuse and keep what alpaca-py's `StockDataStream` and `TradingStream` do | None |
 
 The offline tests use payloads hand-built from the examples in Alpaca's docs (sources in `tests/conftest.py`)
@@ -270,7 +272,9 @@ whether the pair is there (root `README.md`, "Enter the Alpaca paper keys"). The
 2026-11-10 (ADR 0030); the TC-E41 test is ADR 0036's.
 Not yet tested against Alpaca: the live quote and trade stream, the asset list at `load_all` scale, and in
 the execution client everything but a limit order accepted and canceled: no fill, partial fill or rejection
-has come from Alpaca.
+has come from Alpaca through the adapter. Fills and partial fills have come from Alpaca outside it, in
+`test_paper_fill_ids.py` (six runs passed on 2026-11-10, ADR 0024); `mise run paper:test` runs it, and
+`mise run paper:test -s -k test_paper_fill_activity_ids` runs it alone.
 
 ## Rules
 
