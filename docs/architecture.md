@@ -94,8 +94,8 @@ adapter is a uv workspace member of its own, kept apart from strategies as upstr
    with `paper=True`; denied types never reach Alpaca (package README, ADR 0036).
 4. Alpaca's trade updates stream becomes order events; each `fill` or `partial_fill` is an `OrderFilled`
    keyed by Alpaca's `execution_id` (package README, ADR 0024).
-5. At start-up the client reports orders and positions for reconciliation; fills are inferred, since
-   fill history is not read yet (package README, ADR 0024).
+5. At start-up the client reports orders, fills from Alpaca's fill activities, open positions, and each
+   loaded instrument without a position as flat, for reconciliation (package README, ADR 0024).
 
 ## Safety boundaries
 
@@ -132,6 +132,8 @@ adapter is a uv workspace member of its own, kept apart from strategies as upstr
   GitHub (ADR 0013).
 * **Landing.** `scripts/land` runs the check and squash-merges the branch; a change outside a named few
   needs a review note, recorded as the `review` status (ADR 0014, ADR 0017, ADR 0019).
+* **Reviewer benchmark.** Past commits whose defects a fix and a failing test later confirmed, one brief
+  for every reviewer, found-or-missed scoring by two scorers (`evals/review/`, ADR 0046). Not yet run.
 * **Unasked.** The commit gate, the push address check, edit-time lint, a daily canon watch, a lane
   watchdog, a weekly model run and Dependabot (ADR 0011, ADR 0016, ADR 0026; `AGENTS.md`, "Automation").
   Models are routed by lane in `canon/models.json` (ADR 0005).

@@ -100,9 +100,10 @@ explains the difference.
 
 `scripts/canon lint` checks this record. `mise run paper:test` runs the paper test with every other paper
 test (alone: add `-s -k test_paper_fill_activity_ids`); it skips outside the regular session. A run
-without a match reopens this record. When the slice is built, `execution.py`'s header names
-Alpaca's reference page and `RESTClient.get`, and its fill reports take the trade ID from the UUID after
-`::`. `scripts/canon
+without a match reopens this record. The slice is built (2026-11-10): `execution.py`'s header names
+Alpaca's reference page and `RESTClient.get`, its fill reports take the trade ID from the UUID after `::`,
+and `test_paper_fill_reports.py` checks on paper that start-up reconciliation gives a filled order the
+stream's trade IDs and prices. `scripts/canon
 outdated` reports a newer alpaca-py tag; read its notes for the call before moving the pin. Still
 UNVERIFIED: the paging limits and the `after`/`until` filters for fills. Open, and the owner's: any
 question to upstream.

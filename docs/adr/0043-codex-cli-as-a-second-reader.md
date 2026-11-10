@@ -70,6 +70,8 @@ different in F1" from a fresh same-model one, finding partly different errors. N
 documents cross-family review; GitHub's Copilot preview runs several providers' models with no accuracy
 figure (ADR 0017). So option 3 is not taken; option 4 needs a record of its own.
 
+ADR 0045 holds Muse Code, Antigravity and DeepSeek Harness to these terms and sets the review lifecycle.
+
 Supersedes ADR 0018 rule 5 ("Claude Code is the only runtime adopted"), ADR 0021 limits 2 and 5 for
 review workers, and ADR 0017 rule 4 ("One model family, for now"), whose reasons were a stored key and
 that no source measured what a second reviewer adds.
@@ -139,3 +141,4 @@ page and a model summarised it. "Second reader": the `evidence-verifier`, the sa
   mentions review by another family (lane; second reader). No project guide requiring it was found (lane).
 * Second reader, 2026-11-10: it corrected the supersede list, rule 4's reasons, the alpha and release
   counts and the reading of both preprints, and had the departure from ADR 0018 rule 6 stated; all above.
+* ADR 0045, 2026-11-10: three more review runtimes under these terms, and the review lifecycle.
