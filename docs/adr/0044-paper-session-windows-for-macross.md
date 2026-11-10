@@ -51,7 +51,7 @@ window (`EXTENDED_READY`) until one has passed on paper and the disconnect-hang 
 | Start-up reconciliation | Scoped to the symbol and one minute of history: every run starts only once it has found the account flat, so history can only mislead, and 60 minutes could hold the last window's exit without its entry; open orders and positions are reported however old | The Lighter tutorial's `reconciliation_instrument_ids`; the minute is the adapter's own paper tests' (the tutorial uses 60; the docs' tip leaves it unset) |
 | The node | `LiveNode.builder(...)`, `with_risk_engine_config`, `with_exec_engine_config`, `with_delay_post_stop_secs(5)` | `examples/live/sandbox/exec_tester.py`, the Lighter tutorial |
 | Exit at wind-down and stop, in the session | `market_exit()`, and `manage_stop=True` so `stop()` runs it; `market_exit_reduce_only=False`, `market_exit_time_in_force=DAY` | concepts/strategies, "Market exit" |
-| Start flat, confirm flat | Refuse to start unless flat in the symbol; after the node stops, read Alpaca and fail naming what is left (in the session, close at market first) | The Lighter tutorial: "Start with a flat target position", "confirm that no orders or positions from the run remain" |
+| Start flat, confirm flat | Refuse to start unless flat in the symbol; after the node stops, read Alpaca and fail naming what is left (first, while Alpaca's clock says the session is open, close at market, again while refused; cancel a close that would only queue) | The Lighter tutorial: "Start with a flat target position", "confirm that no orders or positions from the run remain" |
 | The session | Alpaca's clock and calendar before anything is placed | Alpaca's paper-trading skill: "always check the clock/calendar endpoint" |
 | Bars | One-minute `INTERNAL` bars the data engine builds from trades; the adapter streams none | The data engine's bar aggregation |
 | A position over one share | `PositionCap`, a non-trading strategy in the node (a `DataActor` has no portfolio at the pin): the portfolio's net position every second, `shutdown_system` over one share | No upstream: no setting caps a position, and the trading state is not settable from Python |
@@ -91,6 +91,20 @@ trips at two shares and holds at one over 3,000 checks; the runtime checks and t
 are set; the window refuses an extended session while `EXTENDED_READY` is off, overnight, the regular
 session when closed, a non-trading day, a SIP feed, over 60 minutes, an account not flat and a start
 inside the gap.
+
+A second reader's review (2026-11-10), each fix first shown by a failing test in the same file: the wait
+for the node's stop had no bound (now `STOP_TIMEOUT_SECS`, about 115 s, the node's own stop bounds and one
+request summed; past it the window is recorded failed, the account still checked, and the process ended);
+the market close after the stop was tried once and keyed on the configured session (now retried each poll
+for at most 60 s once the cancels land, sent only while Alpaca's clock says the session is open, and an
+order left open after the close is canceled); `PositionCap`'s header said the strategies then flatten,
+which upstream's `EmaCross` does not (header and README corrected; the cap sends no order); a limit dropped
+at its timeout was sent again on the next bar (now not until the opposite cross). Code review (`/code-review`,
+high) of those fixes: the process exit keyed on the error type, a Ctrl-C during a hung stop waiting on it, a
+60 s end margin shorter than the stop and the check (now 240 s), a short's buy-back or an equal bar moving
+the dropped signal; then the window's own Alpaca client without the adapter's HTTP timeout, an error after
+an abandoned stop exiting unprinted, and disposal keyed on any abandonment; each shown by a failing test
+and fixed.
 
 On paper, 2026-11-10, after the close: a regular window refused, "the regular session is closed". An
 extended window started at 16:12 New York, before the adapter's extended-hours change was on `main`,
@@ -143,3 +157,10 @@ Read 2026-11-10. "raw": fetched with `curl` and read whole. NautilusTrader files
   at stop or wind-down, a short counted as held, start-up eating the wind-down, an unwritten report;
   all fixed above. Second reader (`evidence-verifier`), 2026-11-10: corrected the cap's timing, the node
   log, "only a strategy" and the position check's retries; all applied.
+* `crates/live/src/node/{mod,config,builder}.rs` and `crates/live/src/python/node.rs` at the pin: the
+  node's stop bounds and their defaults, `with_delay_shutdown_secs` setting `timeout_shutdown`, and
+  `run_async`'s cancel waiting for the same shutdown; `crates/trading/src/examples/strategies/ema_cross/`
+  and `crates/trading/src/strategy/config.rs`: `EmaCross` unsubscribes on stop and nothing more, its base
+  config exposes no `manage_stop`, and a market exit is reduce-only by default (fetched, raw).
+* A second reader's review of `main` (2026-11-10), six findings, all reproduced offline and fixed here and
+  in ADR 0047 (run).

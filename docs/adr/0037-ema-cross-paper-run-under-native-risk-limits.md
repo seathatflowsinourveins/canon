@@ -112,7 +112,10 @@ account's sells is UNVERIFIED; it is the adapter's to resolve.
 
 After review (2026-11-10), ADR 0044 gives this node the position cap and the execution engine's scoped
 reconciliation and runtime checks; the paper test now skips outside the regular session and fails on any
-position the node holds that is not the strategy's.
+position the node holds that is not the strategy's. When the cap trips it stops the node and nothing
+flattens: `EmaCross` does not on stop and its config exposes no exit setting, so the position stays at
+Alpaca for the caller to close, as the paper test's clean-up does (offline in
+`tests/test_session_window.py`, after a second reader's review, 2026-11-10).
 
 ## Evidence
 
@@ -138,6 +141,8 @@ Read 2026-11-10. "raw": fetched with `curl` and read whole. NautilusTrader files
 * https://docs.alpaca.markets/us/docs/trading-api-mcp.md (updated 2026-10-06): "rate limits per
   account" (fetched, raw).
 * The offline tests and the paper runs (run).
+* `crates/trading/src/examples/strategies/ema_cross/{config,strategy}.rs` at the pin: `on_stop` only
+  unsubscribes; the Python config takes no base exit settings (fetched, raw).
 * Second reader (`evidence-verifier`), 2026-11-10: corrected the option list (the testers), option 3's
   reasons, the in-flight cap, the fill times and "per account"; found the reconciled phantom position and
   the MCP page. All applied above. It noted v2.0.0rc9 is tagged, with no change to these claims found.

@@ -38,6 +38,7 @@ previous copy of each.
 | `scripts/canon resolve` | Re-resolve pins and rewrite the lock |
 | `scripts/lanes` | State of every Claude Code session on this machine |
 | `scripts/lanes --selftest` | Prove the lane report's flags fire |
+| `scripts/lanes --rates` | Every running worker of every runtime, with output tokens per second or why not measured |
 | `scripts/automation status` | Every standing automation and whether it is healthy |
 | `scripts/survey-github report canon/github-practice.json` | What a measured sample of repositories converges on for pull requests and GitHub automation |
 
@@ -52,7 +53,9 @@ upstream's built-in `EmaCross` under the risk engine's native limits; the paper 
 ([ADR 0037](docs/adr/0037-ema-cross-paper-run-under-native-risk-limits.md)). `SessionMaCross`
 (`session_ma_cross.py`) is `MaCross` guarded for live use, and `session_window.py` runs it for one bounded
 window on paper with a one-share cap inside the node
-([ADR 0044](docs/adr/0044-paper-session-windows-for-macross.md)).
+([ADR 0044](docs/adr/0044-paper-session-windows-for-macross.md)). The cap stops the node and sends no order:
+in a window `SessionMaCross` exits at market on stop and the window then closes what is left, while
+upstream's `EmaCross` does not flatten on stop, so its caller closes the position.
 
 It needs no network, no credentials and no downloaded data:
 
@@ -216,7 +219,8 @@ here, community convergence, then anyone's recollection.
   The first study on real bars, eight `MaCross` variants on SPY and QQQ daily bars, is pre-registered
   in ADR 0048 (`canon_trading.variant_study`) and has not run.
 * **No OpenTelemetry backend.** The local event ledger covers this machine; `home/otel-settings.example.json`
-  is ready for when a collector exists.
+  is ready for when a collector exists. Until one writes `~/.claude/canon/otel/logs.jsonl`,
+  `scripts/lanes --rates` lists every worker as not measured (ADR 0007).
 * **No model-routing eval of our own has run.** Model routing rests on external measurements (ADR 0005). A reviewer
   benchmark is defined, with its cases, brief and procedure in `evals/review/` (ADR 0046); its first run
   (2026-11-10) scored 10 confirmed defects, in `evals/review/runs/`. Its cases now hold 21, 10 in
