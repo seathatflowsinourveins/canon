@@ -59,9 +59,10 @@ and the checks.
 5. **Watch: the sandbox.** Claude Code's docs name it for enforcement "that doesn't depend on the command
    text". It covers shell commands only. It is not adopted: with no live credentials there is nothing
    for it to protect yet. Revisit when the execution client is written. It was, on 2026-11-10 (pull
-   request 24), so the revisit is due and is the owner's to close. Its reason, no live credential on
-   this machine, was not re-checked for this note (UNVERIFIED). Paper credentials come next, for the
-   paper tests.
+   request 24), and ADR 0025 closed the revisit the same day: part of the sandbox is adopted, subject
+   to a trial that costs no lane a stop, and nothing is turned on until that trial passes. Its reason,
+   no live credential on this machine, was not re-checked for this note (UNVERIFIED). Paper credentials
+   come next, for the paper tests.
 
 Option 1 is what failed: `${CLAUDE_PROJECT_DIR}` is "the project root where the session started", so a
 session that starts in another folder has no hook file to run. Option 2 is how the guard ran before, and
