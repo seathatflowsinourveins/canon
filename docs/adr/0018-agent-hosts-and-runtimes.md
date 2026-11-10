@@ -11,8 +11,8 @@ review-by: 2026-12-10
 
 The owner asked (2026-11-10) to run Claude Code inside Orca, a desktop app that gives each task its own git
 worktree and agent terminal, and to orchestrate more than one agent runtime. Sessions here run in the
-worktrees Claude Code creates, and the guard that enforces this repo's rules is a Claude Code hook. Which
-host, what does the repository commit for it, and what holds a runtime the guard cannot see?
+worktrees Claude Code creates. Which host, what does the repository commit for it, and what holds a
+second runtime to this repo's rules?
 
 ## Decision Drivers
 
@@ -53,9 +53,8 @@ What holds today, whichever host starts a session:
 
 1. **The repository needs no host file.** A new worktree outside it passes `scripts/ci` with no setup
    step, so the optional setup script that Orca, Conductor and Paradev offer is not needed.
-2. **The guard holds in every permission mode.** Claude Code's docs: a `PreToolUse` hook that denies
-   "blocks the tool even in `bypassPermissions` mode or with `--dangerously-skip-permissions`". A host's
-   permission presets change how often a session asks, not what the guard refuses.
+2. **No rule depends on the host.** Nothing runs before a tool call (ADR 0020). The merge gate and the
+   absence of live credentials hold whichever app starts a session.
 3. **Landing is `scripts/land` and nothing else.** A host's commit, push and pull request controls are
    not a landing path: the ruleset on `main` requires the `signoff` status that `scripts/land` posts for
    the commit it has checked (ADR 0014, ADR 0017).
@@ -63,8 +62,8 @@ What holds today, whichever host starts a session:
    sessions. To involve a different tool, expose it to Claude as an MCP server." OpenAI has removed
    `codex mcp-server`, which leaves option 5 no documented route to Codex today.
 5. **A second runtime is adopted like any upstream**, when there is a job for it. It reads `AGENTS.md`,
-   works in its own worktree and branch, and lands through rule 3 with the review ADR 0017 requires. The
-   guard does not see it, so its environment carries no credentials, paper ones included.
+   works in its own worktree and branch, and lands through rule 3 with the review ADR 0017 requires. This
+   repo's permission rules do not reach it, so its environment carries no credentials, paper ones included.
 6. **Not adopted: option 4.** Orca labels its orchestration commands "Experimental" and no other host
    documents a handoff. Runtimes meet at a branch and a pull request.
 
@@ -87,12 +86,12 @@ the registry as a `tool` pinned at the release read here, with an `orca.yaml` of
 
 Tested 2026-11-10: `git worktree add` into a directory outside the repository, then `scripts/ci` there
 with no setup: every check passed. The setup command above ran under `env -i` with only `HOME` and a
-minimal `PATH`, built `.venv` and left the tree clean. That the guard loads in a host's worktree follows
-from two statements: Claude Code "reads the shared `.claude/settings.json` from the session's primary
-working directory", and Orca "launches it with the worktree as the working directory". A session started
-that way has not been run: UNVERIFIED end to end. First-run checks once a host is installed: the session
-brief prints; a commit that skips the gate is refused; `scripts/land --dry-run` works from the host's
-worktree; `scripts/bootstrap --check` still passes.
+minimal `PATH`, built `.venv` and left the tree clean. That this repo's settings and hooks load in a
+host's worktree follows from two statements: Claude Code "reads the shared `.claude/settings.json` from
+the session's primary working directory", and Orca "launches it with the worktree as the working
+directory". A session started that way has not been run: UNVERIFIED end to end. First-run checks once a
+host is installed: the session brief prints; `scripts/land --dry-run` works from the host's worktree;
+`scripts/bootstrap --check` still passes.
 
 ## Evidence
 
@@ -123,7 +122,6 @@ the `evidence-verifier` re-read the source the same day.
 * https://github.com/stravu/crystal — "deprecated and replaced by Nimbalyst", February 2026 (lane;
   second reader).
 * https://code.claude.com/docs/en/agents.md — the sentence in rule 4 (lane; second reader).
-* https://code.claude.com/docs/en/hooks-guide.md — the sentence in rule 2 (lane; second reader).
 * https://code.claude.com/docs/en/settings.md — the sentence in Confirmation (second reader).
 * https://learn.chatgpt.com/docs/mcp-server — "The `codex mcp-server` command and the standalone
   `codex-mcp-server` binary have been removed."; its replacement "isn't an MCP server" (lane; second reader).
@@ -131,3 +129,5 @@ the `evidence-verifier` re-read the source the same day.
   else written as `*.canon-proposed`; `--check` looks for `canon/ledger.sh` and `canon/statusline.sh` (read).
 * Second reader, 2026-11-10: every quote held. It corrected three table rows, the telemetry switches and
   the wording of rules 1 and 3, and showed that the settings sentence is documented. All are fixed above.
+* Changed 2026-11-10 with ADR 0020: the context, rules 2 and 5 and the first-run checks no longer rest on
+  a guard hook. A second reader the same day had rule 2 cut to what its sources support.

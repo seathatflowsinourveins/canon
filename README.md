@@ -49,7 +49,6 @@ previous copy of each.
 | Address check (`scripts/check-addresses`) | Every `git push` | No |
 | Hosted CI (`scripts/ci` on GitHub) | Every pull request and push to `main` | No |
 | Edit checks (canon lint, ruff) | Every matching edit by an agent | No |
-| Guard | Before every tool call by an agent | No |
 | Hosted watch (`canon check` on GitHub) | Once a day | No |
 | Landscape watch | Once a day, at session start | No |
 | Lane watchdog | Every 10 minutes while the Mac is awake | No |
@@ -57,7 +56,7 @@ previous copy of each.
 | Dependency bot (Dependabot) | Weekly, on GitHub | Only when a session lands its pull request |
 
 `scripts/automation install` turns on the commit gate, the address check and the lane watchdog. The edit
-checks, the guard and the landscape watch are hooks in `.claude/settings.json`. The weekly refresh is a
+checks and the landscape watch are hooks in `.claude/settings.json`. The weekly refresh is a
 scheduled task in the Claude desktop app, and the dependency bot is `.github/dependabot.yml`, which GitHub
 runs.
 `scripts/automation uninstall` reverses the install. The reasoning is in [ADR 0011](docs/adr/0011-automation.md).
