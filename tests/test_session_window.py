@@ -7,6 +7,7 @@ session and account checks run against hand-built alpaca-py `Clock` and `Calenda
 for the paper `TradingClient`; the times are New York's.
 """
 
+import json
 import math
 from datetime import UTC
 from datetime import datetime
@@ -738,3 +739,112 @@ def test_a_warm_up_answer_in_time_initializes_the_averages() -> None:
 def test_the_warm_up_needs_time_bars() -> None:
     with pytest.raises(ValueError, match="needs time bars"):
         strategy(bar_type=BarType.from_str("SPY.ALPACA-100-TICK-LAST-INTERNAL"), warm_up=True)
+
+
+@pytest.mark.parametrize(
+    ("at", "is_open", "ready", "expected"),
+    [
+        (datetime(2026, 11, 10, 11, 0), True, False, "regular"),
+        (datetime(2026, 11, 10, 17, 0), False, False, None),
+        (datetime(2026, 11, 10, 17, 0), False, True, "extended"),
+        (datetime(2026, 11, 10, 21, 0), False, True, None),  # overnight is not run
+    ],
+)
+def test_auto_takes_the_session_alpacas_clock_says_is_open(
+    monkeypatch, at, is_open, ready, expected
+):
+    monkeypatch.setattr(session_window, "EXTENDED_READY", ready)
+    found, why = session_window.resolve_session(
+        clock(at.replace(tzinfo=NEW_YORK), is_open=is_open), CALENDAR
+    )
+    assert found == expected and why
+
+
+def test_auto_outside_every_session_runs_nothing_and_exits_0(monkeypatch, tmp_path, capsys) -> None:
+    class Closed(Account):
+        def get_clock(self) -> Clock:
+            return clock(datetime(2026, 11, 10, 17, 0, tzinfo=NEW_YORK), is_open=False)
+
+    monkeypatch.setattr(session_window, "paper_trading", lambda: Closed())
+    assert session_window.main(["--session", "auto", "--log-dir", str(tmp_path)]) == 0
+    assert "nothing to run" in capsys.readouterr().out
+    assert not (tmp_path / "latest.json").exists()
+
+
+def test_a_refused_window_is_the_latest_record(monkeypatch, tmp_path) -> None:
+    held = SimpleNamespace(client_order_id="someone-elses")
+    monkeypatch.setattr(session_window, "paper_trading", lambda: Account(orders=[held]))
+    assert session_window.main(["--log-dir", str(tmp_path)]) == 1
+    latest = json.loads((tmp_path / "latest.json").read_text())
+    assert latest["result"].startswith("refused: the paper account is not flat")
+
+
+def test_a_window_that_fails_after_it_started_records_failed(monkeypatch, tmp_path) -> None:
+    """The `running` record is written before the node is built; a failure then turns it into `failed`,
+    and the account is still checked."""
+    seen: list[str] = []
+
+    def broken(config, **kwargs):
+        seen.append(json.loads((tmp_path / "latest.json").read_text())["result"])
+        raise RuntimeError("the node could not be built")
+
+    monkeypatch.setattr(session_window, "paper_trading", lambda: Account())
+    monkeypatch.setattr(session_window, "window_node", broken)
+    with pytest.raises(RuntimeError, match="could not be built"):
+        session_window.run_window(WindowConfig(log_dir=tmp_path))
+    latest = json.loads((tmp_path / "latest.json").read_text())
+    assert seen == ["running"]
+    assert latest["result"] == "failed: RuntimeError: the node could not be built"
+    assert latest["left"] == [] and (tmp_path / f"window-{latest['started']}.json").exists()
+
+
+def test_a_window_whose_account_check_fails_is_recorded_failed_not_ok(
+    monkeypatch, tmp_path
+) -> None:
+    """Review finding: an error checking the account after a clean run was recorded `ok`."""
+
+    class Ran:
+        cache = SimpleNamespace(orders=lambda **kwargs: [])
+
+        def dispose(self) -> None:
+            pass
+
+    s = SimpleNamespace(dropped=[], history_bars=0, history_dropped=0)
+    cap = SimpleNamespace(checks=1, peak=Decimal(0), tripped=None)
+    monkeypatch.setattr(session_window, "paper_trading", lambda: Account())
+    monkeypatch.setattr(session_window, "window_node", lambda config, **kw: (Ran(), s, cap))
+    monkeypatch.setattr(
+        session_window, "asyncio", SimpleNamespace(run=lambda coroutine: coroutine.close())
+    )
+
+    def unreachable(trading, config, report):
+        raise RuntimeError("Alpaca answered 503")
+
+    monkeypatch.setattr(session_window, "_flatten_after_stop", unreachable)
+    with pytest.raises(RuntimeError, match="503"):
+        session_window.run_window(WindowConfig(log_dir=tmp_path))
+    latest = json.loads((tmp_path / "latest.json").read_text())
+    assert latest["result"] == "failed: RuntimeError: Alpaca answered 503"
+
+
+def test_a_window_inside_the_gap_is_skipped_exit_0_and_the_last_result_kept(tmp_path, capsys):
+    (tmp_path / "last-window-end").write_text("1")
+    (tmp_path / "latest.json").write_text('{"result": "ok"}')
+    assert session_window.main(["--log-dir", str(tmp_path)]) == 0
+    assert "skipped: the last window ended under 300 s ago" in capsys.readouterr().out
+    assert json.loads((tmp_path / "latest.json").read_text()) == {"result": "ok"}
+    heard = json.loads((tmp_path / "last-firing.json").read_text())
+    assert heard["outcome"].startswith("skipped:")
+
+
+def test_every_run_leaves_a_heartbeat_even_with_nothing_to_run(monkeypatch, tmp_path) -> None:
+    class Closed(Account):
+        def get_clock(self) -> Clock:
+            return clock(
+                datetime(2026, 11, 14, 11, 0, tzinfo=NEW_YORK), is_open=False
+            )  # a Saturday
+
+    monkeypatch.setattr(session_window, "paper_trading", lambda: Closed())
+    assert session_window.main(["--session", "auto", "--log-dir", str(tmp_path)]) == 0
+    heard = json.loads((tmp_path / "last-firing.json").read_text())
+    assert heard["outcome"].startswith("nothing to run")
