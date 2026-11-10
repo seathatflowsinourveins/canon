@@ -243,6 +243,15 @@
       "sha": "f7f273a9bb6445f6f7fb6349105e7532972045fb",
       "track": "tag:v24.22.2"
     },
+    "optuna": {
+      "default_branch": "master",
+      "default_sha": "0886f6f1364d74e1abe4f70dab1fe89ec9a8e260",
+      "ref": "refs/tags/v5.0.0",
+      "repo": "optuna/optuna",
+      "resolved_at": "2026-11-10T18:25:43Z",
+      "sha": "01ddd17ab9f36c3d2817aed9afe376e1cb047d35",
+      "track": "tag:v5.0.0"
+    },
     "orca": {
       "default_branch": "main",
       "default_sha": "d1466f6017c4bb6006b77eb46f2fc0f461ef021e",

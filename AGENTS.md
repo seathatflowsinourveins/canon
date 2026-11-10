@@ -104,6 +104,7 @@ dependency, pattern and practice traces to a pinned upstream or a dated source. 
 | 0031 | Deflated Sharpe computation: eqs. 1–2 through skfolio, with the input it lets pass refused |
 | 0032 | Overfitting probability implementation (proposed): nine read, none adopted until one passes this repo's tests |
 | 0033 | Alpaca paper key entry: a hidden prompt in `paper:store`, the pair checked against the paper API before it is stored |
+| 0035 | Trial ledger: an Optuna study in a local SQLite file, one trial per backtest |
 
 ## Automation
 

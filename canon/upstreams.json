@@ -548,6 +548,23 @@
       ],
       "adr": "0031",
       "pypi": "skfolio"
+    },
+    {
+      "id": "optuna",
+      "field": "strategy-evaluation",
+      "repo": "optuna/optuna",
+      "track": "tag:v5.0.0",
+      "role": "tool",
+      "license": "MIT",
+      "why": "Holds the trial ledger ADR 0010 asks for (ADR 0035): a study in a local SQLite file through RDBStorage, one trial per backtest through ask and tell. A trial is asked for before its run and told FAIL by this repo's code if the run raises; Study.trials returns every state, so N is read back; user attributes hold each trial's config and daily returns.",
+      "evidence": [
+        "https://pypi.org/pypi/optuna/json",
+        "https://raw.githubusercontent.com/optuna/optuna/v5.0.0/optuna/study/_optimize.py",
+        "https://raw.githubusercontent.com/optuna/optuna/v5.0.0/docs/source/faq.rst",
+        "https://github.com/optuna/optuna/releases/tag/v5.0.0"
+      ],
+      "adr": "0035",
+      "pypi": "optuna"
     }
   ]
 }
