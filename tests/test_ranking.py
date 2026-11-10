@@ -531,8 +531,9 @@ def test_a_configuration_not_run_on_the_current_sample_stops(study: optuna.Study
 
 
 def test_affine_copies_report_n_hat_at_one_instead_of_raising(study: optuna.Study) -> None:
-    """Perfectly correlated trials: rho rounds to 1.0000000000000002 and N-hat to 0.9999999999999998,
-    which skfolio refused with a bare ValueError after the gate's DSR was computed."""
+    """Perfectly correlated trials: on macOS arm64 rho rounded to 1.0000000000000002 and N-hat to
+    0.9999999999999998, which skfolio refused with a bare ValueError after the gate's DSR was
+    computed. How rho rounds depends on the platform's arithmetic, so the next test fixes it."""
     write(study, "pick", PICK)
     affine = [value * 0.5 + 0.001 for value in PICK]
     write(study, "affine", affine)
@@ -540,10 +541,29 @@ def test_affine_copies_report_n_hat_at_one_instead_of_raising(study: optuna.Stud
     report = rank(study)
 
     assert report.pick == "affine"
-    assert report.n_hat == 1.0
-    assert report.n_hat_note is not None and "raised to 1" in report.n_hat_note
+    assert report.n_hat == pytest.approx(1.0, abs=1e-12)
+    assert report.n_hat is not None and report.n_hat >= 1.0
     assert report.dsr_at_n_hat is not None
     assert report.dsr_at_n_hat <= measures.probabilistic_sharpe_ratio(affine, 0.0) + 1e-12
+
+
+def test_a_mean_correlation_above_one_raises_n_hat_to_one(
+    study: optuna.Study, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write(study, "pick", PICK)
+    write(study, "affine", [value * 0.5 + 0.001 for value in PICK])
+    above_one = 1.0000000000000002
+    monkeypatch.setattr(
+        "canon_trading.ranking.measures.correlation",
+        lambda _: [[1.0, above_one], [above_one, 1.0]],
+    )
+
+    report = rank(study)
+
+    assert report.n_hat == 1.0
+    assert report.n_hat_note is not None
+    assert "N-hat 0.9999999999999998 raised to 1" in report.n_hat_note
+    assert report.n_hat_note in report.summary()
 
 
 def test_dsr_at_a_small_n_hat_is_withheld_not_inflated(study: optuna.Study) -> None:
