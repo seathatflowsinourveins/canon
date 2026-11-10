@@ -100,6 +100,7 @@ dependency, pattern and practice traces to a pinned upstream or a dated source. 
 | 0027 | Overfitting probability (proposed): a diagnostic beside the Sharpe gate; no implementation adopted |
 | 0028 | Permission prompts: a lane's own steps run without one; what rewrites everything or leaves the checkout still asks |
 | 0029 | Alpaca paper keys: the login keychain, read by the `paper:test` mise task when it runs, checked against the paper API at entry |
+| 0031 | Deflated Sharpe computation: eqs. 1–2 through skfolio, with the input it lets pass refused |
 
 ## Automation
 
