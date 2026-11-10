@@ -102,7 +102,9 @@ arithmetic; the row for ok, running, died, a record's own `stale_after`, failed,
 non-zero exit under an ok record, and three silent hours; the uninstall. Not installed on this machine.
 The same test fires the runner at a stand-in origin: each firing runs its newest `main`, detached, with
 `CANON_COMMIT` and a kept `.venv`; a failed fetch runs nothing and fails the row; uninstall removes runner,
-clone and its mise trust. On GitHub: a fresh clone 0.5 s, its environment 6.6 s, a kept one 0.4 s.
+clone and its mise trust. On GitHub: a fresh clone 0.5 s, its environment 6.6 s, a kept one 0.4 s. One
+firing from GitHub's `main`, run with no environment but `HOME`, read the pair, found no session open and
+recorded its commit; it first failed until the runner exported `PATH`, which mise's `exec()` needs (observed).
 
 ## Evidence
 
