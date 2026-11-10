@@ -498,7 +498,9 @@ do_status() {
       label=FAILED; v="$v; its binary $obin is gone (the otelcol pin moved?); run: scripts/bootstrap --install, then scripts/automation install"
     fi
     if [ -f "$lf" ]; then
-      if mt=$(stat -f %m "$lf" 2>/dev/null) && [ -n "$mt" ]; then
+      # the file's mtime: GNU stat -c %Y, else BSD stat -f %m (stat(1) on each)
+      mt=$(stat -c %Y "$lf" 2>/dev/null || stat -f %m "$lf" 2>/dev/null) || mt=""
+      if [ -n "$mt" ] && [ -z "${mt//[0-9]/}" ]; then
         v="$v | $lf last written $(( ($(date -u +%s) - mt) / 60 )) min ago"
       else v="$v | $lf present, its age unreadable"; fi
     else
