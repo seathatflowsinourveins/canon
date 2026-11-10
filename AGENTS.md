@@ -61,6 +61,7 @@ dependency, pattern and practice traces to a pinned upstream or a dated source. 
 | `packages/canon-alpaca/` | The Alpaca adapter for NautilusTrader: a market-data client and a paper-only execution client; read its README first |
 | `tests/`, `packages/*/tests/` | Tests, beside each package's `src/` |
 | `catalog/` | Local market data (`ParquetDataCatalog`); ignored by git |
+| `ledger/` | The trial ledger: an Optuna study in `ledger/trials.db` (ADR 0035); ignored by git |
 | `.claude/` | Claude Code settings, hooks, scoped rules, skills, subagents |
 | `home/` | Machine-level Claude Code config installed to `~/.claude/` by the bootstrap |
 | `scripts/` | `canon`, `ci`, `land`, `check-addresses`, `lanes`, `automation`, `bootstrap`, `survey-github`, and the test scripts `test-canon`, `test-ci`, `test-hooks`, `test-land`, `test-lanes` |

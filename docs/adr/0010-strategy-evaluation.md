@@ -39,13 +39,15 @@ of trials.
 1. **Ledger every trial**: its config, data range and returns. N is counted from the ledger and never typed
    (DSR p. 3). An optimiser search counts every configuration it tried. An entry holds NautilusTrader's
    `BacktestRunConfig` with its `id`, and the `BacktestResult` fields `run_config_id`, `backtest_start`,
-   `backtest_end` and `returns_series`. The code that writes it is not written yet.
+   `backtest_end` and `returns_series`. `canon_trading.ledger.record_trial` writes it, in the store and
+   on the terms of ADR 0035.
 2. **Run each variant over the whole period**, one `BacktestNode` per variant, through
    `canon_trading.backtest.run_backtest`. Accept `BacktestResult.returns_series` only if it is the daily
    portfolio series, with one key per UTC day. Any other shape is the per-position fallback, and that run is
    rejected. Drop days the venue was closed, and trim every variant to a common range of T rows.
+   `canon_trading.returns_matrix` does this through skfolio's `Population` and pandas.
 3. **DSR of the pick.** ADR 0031 holds how it is computed: eqs. 1–2, their conventions, skfolio, and the
-   input that stops the ranking.
+   input that stops the ranking. `canon_trading.ranking.rank` applies it.
    * **Reject the pick below 0.95**, with N = all trials. The paper's N is the number of independent trials,
      and counting dependent ones overstates SR₀ (App. A.3), so this is the strict reading.
    * Report N̂ = ρ̂ + (1−ρ̂)N (eq. 9) only when T ≥ N(N−1)/2 (p. 15). N̂ never replaces N in the gate.
@@ -69,14 +71,15 @@ Limits:
 
 ### Consequences
 
-* Bad: the ledger and the code that builds the returns and applies the gate are not written. Until they
-  are, backtests are reported, not ranked.
+* Bad: an idle trial stops every ranking of its study (Limits), and so does a configuration that never
+  runs to the end (ADR 0035).
 * The consequences of computing the gate with skfolio are in ADR 0031.
 
 ### Confirmation
 
 * The test of the gate's implementation against the paper's example is in ADR 0031.
-* A ranking report states N, T, V, the DSR, and the range of the ledger it read.
+* A ranking report states N, T, V, the DSR, and the range of the ledger it read: `RankingReport`,
+  checked in `tests/test_ranking.py` with a passing and a failing pick worked without skfolio.
 
 ## Evidence
 

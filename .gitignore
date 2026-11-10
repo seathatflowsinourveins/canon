@@ -17,6 +17,9 @@ CLAUDE.local.md
 catalog/*
 !catalog/README.md
 
+# the trial ledger: an Optuna SQLite study in ledger/ (ADR 0035), never committed
+ledger/
+
 # Python
 .venv/
 __pycache__/

@@ -1,7 +1,7 @@
 """The deflated Sharpe ratio that gates a ranking (ADR 0010), checked against the paper's own example.
 
 No test here opens a network connection, reads a credential or runs a backtest. This file tests skfolio,
-pinned in `pyproject.toml`, not code of this repo: the code that ranks variants is not written yet. The
+pinned in `pyproject.toml`, not code of this repo; `tests/test_ranking.py` tests the code that ranks. The
 three functions ADR 0031 names are `measures.expected_max_sharpe_ratio`,
 `measures.probabilistic_sharpe_ratio` and `measures.deflated_sharpe_ratio`. They implement equations 1
 and 2 of Bailey and López de Prado, "The Deflated Sharpe Ratio" (2014),

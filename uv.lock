@@ -77,6 +77,7 @@ dependencies = [
     { name = "canon-alpaca" },
     { name = "nautilus-trader" },
     { name = "optuna" },
+    { name = "pandas" },
     { name = "skfolio" },
 ]
 
@@ -92,6 +93,7 @@ requires-dist = [
     { name = "canon-alpaca", editable = "packages/canon-alpaca" },
     { name = "nautilus-trader", specifier = "==2.0.0rc8" },
     { name = "optuna", specifier = "==5.0.0" },
+    { name = "pandas", specifier = "==3.1.1" },
     { name = "skfolio", specifier = "==1.12.8" },
 ]
 

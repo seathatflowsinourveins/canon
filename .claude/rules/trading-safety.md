@@ -25,6 +25,6 @@ paths:
 * Market data goes in `catalog/` and is never committed.
 * Add a dependency with `uv add`, pinned exactly, after it is in `canon/upstreams.json`.
 * Rank backtest variants only by ADR 0010's protocol: every trial in the ledger, and the pick's deflated
-  Sharpe ratio at 0.95 or above. The ledger is not written yet, so until it is, report results and do not
-  rank them.
+  Sharpe ratio at 0.95 or above, through `canon_trading.ranking.rank` on trials recorded by
+  `canon_trading.ledger.record_trial` (ADR 0035).
 * This is engineering work, not investment advice. Do not recommend trades, positions or strategies to hold.
