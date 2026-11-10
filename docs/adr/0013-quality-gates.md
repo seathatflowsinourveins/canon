@@ -33,7 +33,8 @@ add a second pinning mechanism. Option 1 is where the upstreams converge and is 
 |---|---|---|
 | Registry, lock, ADR evidence; release rule | `scripts/canon lint`, `selftest` | this repo |
 | Shell syntax and static analysis | shellcheck 0.11.0 | `mise.lock` |
-| Hook behaviour (56 cases); lane report | `scripts/test-hooks`, `scripts/lanes --selftest` | this repo |
+| Lane report; practice survey | `scripts/lanes --selftest`, `scripts/survey-github selftest` | this repo |
+| Each tracked executable `scripts/test-*`: hooks (68 cases), the checks themselves (56), landing and the address check (58), watchdog, automation and bootstrap (43) | `test-hooks`, `test-ci`, `test-land`, `test-lanes` | this repo |
 | Lockfile current | `uv lock --check` | uv 0.13.7 |
 | Python lint and format | ruff 0.17.4 | `uv.lock` |
 | Python types | ty 0.0.100 | `uv.lock` |
@@ -43,7 +44,8 @@ add a second pinning mechanism. Option 1 is where the upstreams converge and is 
 
 Rules:
 
-1. **One entry point.** `.githooks/pre-commit` runs `scripts/ci --staged`; the workflow runs `scripts/ci`.
+1. **One entry point.** `.githooks/pre-commit` runs `scripts/ci --staged`; the workflow and `scripts/land`
+   run `scripts/ci`.
 2. **A missing tool is a failure**, never a skipped check.
 3. **Ruff:** its default rules plus import sorting. Line length 100 and single-line imports follow
    NautilusTrader's own config, so adapter code reads like upstream. (NautilusTrader itself selects every
@@ -70,13 +72,15 @@ Not adopted, with the reason:
 
 ### Consequences
 
-* Good: about five seconds, offline; shellcheck's first run found 20 style findings in this repo's scripts,
-  all fixed or marked with a reason.
+* Good: about seven to nine seconds, offline; shellcheck's first run found 20 style findings in this repo's
+  scripts, all fixed or marked with a reason.
 * Bad: actionlint does not check an action's inputs when the action is referenced by SHA, so those four inputs were checked by hand against each `action.yml`.
 
 ### Confirmation
 
-`scripts/ci` prints one line per check and exits non-zero on any failure.
+`scripts/ci` prints one line per check in a fixed order, with any skip lines under it, and exits non-zero
+on any failure; a missing tool, or a tracked `scripts/test-*` that is not executable, fails by name.
+`scripts/test-ci` holds that behaviour on a copy of the tree with a fake toolchain.
 
 ## Evidence
 
@@ -104,5 +108,7 @@ Read 2026-11-09 (fetched by a research lane unless noted; fetches are model-summ
   shellcheck findings was observed once by the orchestrator and cannot be re-checked.
 * `action.yml` of both actions at the pinned SHAs — declares `fetch-depth`, `persist-credentials`, `version`
   and `cache` (read by the orchestrator).
+* Restated 2026-11-10 against `scripts/ci`, a run of it and of each `scripts/test-*`: the check table,
+  rule 1, the run time (three runs of `scripts/ci` on macOS) and Confirmation.
 * Licences read from each repo's licence file at the pinned tag (by the orchestrator): MIT for ruff, ty,
   gitleaks, actionlint, checkout and mise-action; GPL for shellcheck, which is run as a tool, not linked.

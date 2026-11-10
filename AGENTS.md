@@ -33,7 +33,7 @@ dependency, pattern and practice traces to a pinned upstream or a dated source. 
 |---|---|
 | `scripts/canon list` | Show every upstream, its role and pinned commit |
 | `scripts/canon lint` | Check registry, lock and ADRs for required evidence (offline) |
-| `scripts/ci` | Run every check: registry, shell, hooks, lockfile, ruff, ty, pytest, workflow, secrets |
+| `scripts/ci` | Run every check: registry, shell, self-tests and `scripts/test-*`, lockfile, ruff, ty, pytest, workflow, secrets |
 | `scripts/land` | Land the current branch on `main` once every check passes; no manual merge step. `--pr <n>` lands a pull request the dependency bot opened |
 | `scripts/canon check` | Compare pins with live upstream; exit 3 if a pinned release tag was re-pointed |
 | `scripts/canon outdated` | Show upstreams that have a newer release tag than the one pinned |
@@ -56,13 +56,13 @@ dependency, pattern and practice traces to a pinned upstream or a dated source. 
 | `docs/adr/` | Decisions in MADR 4.0.0 with an Evidence section and `review-by` date |
 | `pyproject.toml`, `uv.lock` | uv workspace root and its single lockfile |
 | `src/canon_trading/` | Strategies and node configuration |
-| `packages/canon-alpaca/` | The Alpaca adapter for NautilusTrader (not started); read its README first |
+| `packages/canon-alpaca/` | The Alpaca adapter for NautilusTrader: a market-data client, no execution client yet; read its README first |
 | `tests/`, `packages/*/tests/` | Tests, beside each package's `src/` |
 | `catalog/` | Local market data (`ParquetDataCatalog`); ignored by git |
 | `.claude/` | Claude Code settings, hooks, scoped rules, skills, subagents |
 | `home/` | Machine-level Claude Code config installed to `~/.claude/` by the bootstrap |
-| `scripts/` | `canon`, `ci`, `land`, `test-hooks`, `lanes`, `automation`, `bootstrap`, `survey-github` |
-| `.githooks/` | The pre-commit gate |
+| `scripts/` | `canon`, `ci`, `land`, `check-addresses`, `lanes`, `automation`, `bootstrap`, `survey-github`, and the test scripts `test-ci`, `test-hooks`, `test-land`, `test-lanes` |
+| `.githooks/` | The pre-commit gate and the pre-push address check |
 | `.github/` | The pull request template, the Dependabot config, the CI workflow and the daily watch |
 
 ## Decisions
@@ -87,11 +87,14 @@ dependency, pattern and practice traces to a pinned upstream or a dated source. 
 | 0016 | Dependency updates: Dependabot proposes, a session lands |
 | 0017 | Merge gate: checks decide, an independent review comes first, a model never blocks |
 | 0018 | Agent hosts and other runtimes (proposed): no host has converged; one gate holds whatever runs |
+| 0019 | Review gate scope: every change carries a review note except a named few |
 
 ## Automation
 
 These run without being asked (ADR 0011, ADR 0013). Every commit runs `scripts/ci` through
-`.githooks/pre-commit`. Every edit to a Python file runs ruff on it, and every edit under `canon/` or
+`.githooks/pre-commit`. Every push runs `scripts/check-addresses` through `.githooks/pre-push`, which
+refuses an email address that is not a known service or example address in what the push would publish.
+Every edit to a Python file runs ruff on it, and every edit under `canon/` or
 `docs/adr/` runs the canon lint. Once a day a session-start hook compares the canon with upstream and the
 next session start prints the result; a scheduled workflow does the same comparison on GitHub every day.
 A background watchdog raises a macOS notification when a session
@@ -115,21 +118,29 @@ The owner's standing instruction (2026-11-09): work lands automatically once its
 
 1. One branch per change. A session that runs in parallel with another works in its own git worktree;
    two sessions never write in one checkout.
-2. Commit, then run `scripts/land`. It runs `scripts/ci` on what is committed and lands the branch: on
-   GitHub, a pull request that it signs off, waits for the hosted checks on and squash-merges; with no
-   remote, a fast-forward of `main`. The same checks run on this machine and on GitHub's runners (ADR 0014).
-3. Before landing code (`src/`, `packages/`), a harness script, a workflow or a new decision record, have
-   an independent reviewer read it and resolve what it finds: `/code-review` for code, the
-   `evidence-verifier` for a record. Then land with `--reviewed "<what ran and what came of it>"`;
-   `scripts/land` refuses such a change without it and records the note on the commit as the `review`
-   status (ADR 0017). Other changes need no review.
+2. Commit, then run `scripts/land`. It runs `scripts/ci` on what is committed, on a branch that contains
+   the current `main`, and lands the branch. With an `origin` remote, `gh` must be signed in, or it stops
+   and lands nothing; it checks every address it would publish, pushes, opens a pull request, posts the
+   `review` and `signoff` statuses, and waits up to nine minutes (`LAND_WAIT_SECONDS`, default 540) for
+   GitHub to squash-merge exactly the checked commit with the checked subject and message. If auto-merge
+   is on when the wait runs out, it stops and GitHub merges once the checks pass. With no `origin` remote
+   it fast-forwards the local `main`. The same checks run on this machine and on GitHub's runners
+   (ADR 0014).
+3. Every change needs an independent review before it lands, unless every path it changes is
+   `README.md`, `packages/*/README.md`, `catalog/README.md`, an edit to an existing
+   `docs/adr/NNNN-*.md` or an edit to `uv.lock`; a new or renamed record needs one. `/code-review` reads
+   code, the `evidence-verifier` reads a record. Resolve what it finds, then land with
+   `--reviewed "<what ran and what came of it>"`; `scripts/land` refuses such a change without it and
+   records the note on the commit as the `review` status. With no `origin` remote the note is printed and
+   not recorded anywhere (ADR 0017, ADR 0019).
 4. Pull request text has `Summary`, `Test Plan` and `Evidence`, written for a later reader: no conversation
    history, discarded attempts or tool usage. Titles are a plain sentence, with no `feat:` style prefix.
 5. This covers work a session of the owner's produced. It does not cover creating a remote, changing a
    repository's visibility, or anything the guard refuses; those still go to the owner.
 6. It also covers the dependency bot's pull requests (ADR 0016). When the session brief lists any, land
-   them with `scripts/land --pr <n>`, which checks the pull request out in its own worktree and merges
-   `main` into it if it is behind. A change to `uv.lock` alone lands on passing checks. One that moves a
+   them with `scripts/land --pr <n>`, which refuses a pull request from a fork, checks the pull request
+   out in its own worktree, merges `main` into it if it is behind, lands it under its own title and
+   description, and removes the worktree and branch. An edit to `uv.lock` alone lands on passing checks, with no note. One that moves a
    workflow action fails the canon lint until its registry entry moves on the same branch, through
    `adopt-upstream`, and then lands with a `--reviewed` note like any other workflow change.
 

@@ -33,11 +33,12 @@ Chosen: **option 3**.
 | Layer | Runs | Mechanism | Tokens | Result goes to |
 |---|---|---|---|---|
 | Commit gate | Every `git commit` | `.githooks/pre-commit` through `core.hooksPath` | None | Aborts the commit |
+| Address check | Every `git push` | `.githooks/pre-push` running `scripts/check-addresses`, through `core.hooksPath` | None | Aborts the push |
 | Hosted CI | Every pull request and push to `main` | GitHub Actions running `scripts/ci` (ADR 0014) | None | A required check |
 | Edit lint | Every edit under `canon/`, `docs/adr/` | `PostToolUse` hook (ADR 0003) | None | Feedback to Claude |
 | Hosted watch | Once a day, on GitHub | Scheduled workflow; `canon check` + `canon outdated` (ADR 0017) | None | The run's summary; a failed run if a tag was re-pointed |
 | Landscape watch | Once a day, at session start | Async `SessionStart` hook; `canon check` + `canon outdated` | None | `.canon/watch.json`, printed at the next session start |
-| Lane watchdog | Every 10 minutes, Mac awake | launchd user agent running `lanes --json` | None | macOS notification, `alerts.jsonl`, status file |
+| Lane watchdog | Every 10 minutes, Mac awake | launchd user agent running `lanes --json`, given the install's `CLAUDE_CONFIG_DIR` | None | macOS notification, `alerts.jsonl`, status file |
 | Weekly refresh | Mondays 09:09, desktop app open | Scheduled task `canon-landscape-refresh` running the `landscape-refresh` skill | One session | A report |
 | Unattended guard | Every tool call | `PreToolUse` hook `guard.sh` | None | Refuses the call |
 
@@ -57,8 +58,9 @@ Rules:
 3. **No hook wakes the model on its own.** `asyncRewake` is not used: on exit code 2 it starts a turn even
    when the session is idle.
 4. **Automation never deletes data.** The watchdog reports the ledger's size; pruning is a manual act.
-5. **One view, one off switch.** `scripts/automation status` shows every layer; `scripts/automation uninstall`
-   removes what `install` added.
+5. **One view, one off switch.** `scripts/automation status` shows every layer and exits non-zero when any
+   row is not ok, UNKNOWN included, except the dependency bot's OFF row when there is no GitHub remote;
+   `scripts/automation uninstall` removes what `install` added and exits non-zero naming what it could not.
 
 `scripts/canon check` separates two upstream changes: **RETAGGED** (a pinned release tag now points at a
 different commit; a supply-chain warning, exit 3) and **advanced** (a tracked branch has new commits; normal).
@@ -76,12 +78,10 @@ Deferred, with the reason:
 * Bad: nothing runs while the Mac sleeps, and the weekly task needs the desktop app open (it catches up once
   on next launch). Notification delivery from the background agent is unproven until a real alert fires;
   the status file records whether each one was delivered.
-* "Scripts gate the model" is this repo's inference from the cost guidance. The Claude Code docs do not
-  state it as a recommendation.
+* "Scripts gate the model" is this repo's inference from the cost guidance, not a recommendation in the docs.
 * The guard reads the text of a call. It holds a cooperative or confused agent; it is not a sandbox. Its
-  first read-only list let through four commands that could change or run something; a second reader found
-  them and they are fixed and tested. Claude Code's docs say hook edits reach a running session, yet a guard
-  added mid-session did not act in the session that added it. The cause is not established.
+  first read-only list let through four commands that could change or run something. The docs say hook
+  edits reach a running session, yet a guard added mid-session did not act there; the cause is unknown.
 * The weekly task has no hard cap on turns or spend. A desktop task exposes a model and a permission mode,
   not a budget; only its prompt tells it to stop.
 
@@ -92,17 +92,15 @@ a simulated re-pointed tag gives RETAGGED and exit 3; the watch skips inside 24 
 once per session and flag, and treats a hostile directory name as text.
 
 Weekly task, first run 2026-11-09 (started by hand, bypass mode): 80 seconds, 19 tool calls, marked
-unattended by the hook, report delivered. It called a pytest development tag a newer release; that was the
-release rule's fault, now fixed and covered by `scripts/canon selftest`. Guard self-test the same day, in
-a fresh unattended session (task `canon-guard-probe`, default mode): the read-only command ran and both
-attempted writes were refused, with neither file created. Blocking under bypass mode itself was not
-separately provoked; the docs say hooks run in every mode, and the marking hook did fire in the bypass run.
+unattended by the hook, report delivered; it called a pytest development tag a newer release, a fault of
+the release rule that `scripts/canon selftest` covers. Guard self-test the same day, in a fresh unattended
+session (task `canon-guard-probe`, default mode): the read-only command ran and both attempted writes were
+refused, with neither file created. Blocking under bypass mode was not provoked; the marking hook fired there.
 
-Installed 2026-11-09. launchd reports the watchdog loaded, one run, exit code 0. In a throwaway copy of the
-repo, git refused a commit with an evidence-free ADR and one with a broken script, then accepted a clean one.
-The first real install crashed: the script's own `install` function shadowed the system command and
-recursed. It loaded nothing, was fixed, and the installer gained a rehearsal mode
-(`AUTOMATION_SKIP_LAUNCHD=1`) that was run before the second attempt.
+Installed 2026-11-09: launchd reports the watchdog loaded, one run, exit code 0. In a throwaway copy, git
+refused a commit with an evidence-free ADR and one with a broken script, and accepted a clean one. The
+first install crashed (a function shadowed the system `install`) and loaded nothing; the rehearsal mode
+`AUTOMATION_SKIP_LAUNCHD=1`, every step except the launchctl calls, ran before the second.
 
 ## Evidence
 
@@ -125,6 +123,8 @@ Read 2026-11-09 (fetched; fetches are model-summarised).
   Four statements were false and are corrected: that there was no remote, that the guard's list was
   read-only, that the docs say hooks run in every mode, and that uninstall reversed everything install
   added. The status command's weekly row now says it can see only the task file.
+* Restated 2026-11-10 against `scripts/automation` and `.githooks/pre-push`: rule 5, the commit gate,
+  address check and watchdog rows, the rehearsal mode, and wording in Consequences and Confirmation.
 * https://code.claude.com/docs/en/hooks.md — `async: true` runs in the background and cannot block; an async
   `SessionStart` hook is allowed; `asyncRewake` wakes Claude on exit code 2 even when idle.
 * https://git-scm.com/docs/githooks — a non-zero exit from `pre-commit` aborts the commit; and

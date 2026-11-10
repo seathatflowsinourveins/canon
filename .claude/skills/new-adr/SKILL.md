@@ -18,7 +18,7 @@ description: Create an architecture decision record in this repo's format (MADR 
    sources have not converged.
 9. If this replaces an earlier ADR, set that one's status to `superseded by ADR-NNNN` and leave its text.
 10. Add a row to the Decisions table in `AGENTS.md`.
-11. `scripts/canon lint` must pass. For a decision other work will build on, run the `evidence-verifier`
-    subagent on the new file.
+11. `scripts/canon lint` must pass. Run the `evidence-verifier` subagent on the new file and resolve what it
+    finds: a new record does not land without it (ADR 0017; step 3 of "Landing" in `AGENTS.md`).
 
 The format rules are in `.claude/rules/adr.md`.

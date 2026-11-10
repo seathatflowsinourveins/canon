@@ -71,6 +71,8 @@ Rules:
    19/28), because nothing is released. A workflow that merges bot pull requests is rare (at most 3/28);
    ADR 0016 stands, and a Dependabot change to a workflow now lands with a note like any other.
 
+Rule 2's list of what needs a review and option 2's "where a defect costs most" are superseded by ADR 0019.
+
 ### Consequences
 
 * Good: the gate stays about a minute, and review happens where it can still change the code.
@@ -81,11 +83,9 @@ Rules:
 
 ### Confirmation
 
-`scripts/land` was run in a throwaway repository: a documentation change and an edit to an existing record
-land without a note; new code, a new record, a file moved out of a reviewed path, a record made by
-renaming, an oddly named script and the hook wiring are refused without one; a blank note or another
-option in its place is refused. This change touches `scripts/` and adds a record, so it could only land
-with a note. The watch can be started by hand with `gh workflow run watch.yml`.
+`scripts/test-land` holds the gate's behaviour, offline against throwaway repositories and a stub `gh`; the
+paths it covers are in ADR 0019. `scripts/land` refuses a blank note or another option in its place. The
+watch can be started by hand with `gh workflow run watch.yml`.
 
 ## Evidence
 
@@ -126,3 +126,4 @@ Read 2026-11-10. "Lane" means a research subagent fetched the page and a model s
   phrase was on its page. It found that renames, oddly named files and the hook wiring got past the
   review gate, that the two statuses were posted in an unsafe order, and that rule 5 and the "three
   readings" row said more than their sources. All are fixed above and in `scripts/land`.
+* Restated 2026-11-10 against `scripts/test-land` and a run of it: Confirmation.
