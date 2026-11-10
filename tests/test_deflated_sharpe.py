@@ -40,7 +40,6 @@ code that applies the gate has to refuse that input itself.
 import math
 import statistics
 from collections.abc import Callable
-from statistics import NormalDist
 
 import pytest
 from skfolio import measures
@@ -50,7 +49,6 @@ OBSERVATIONS_PER_YEAR = 250
 SHARPE = 2.5 / math.sqrt(OBSERVATIONS_PER_YEAR)
 TRIAL_SHARPE_STD = math.sqrt(0.5 / OBSERVATIONS_PER_YEAR)
 THRESHOLD = 0.95
-EULER_MASCHERONI = 0.5772156649015329
 
 # The paper prints four decimals.
 PRINTED = 5e-5
@@ -92,29 +90,6 @@ def _deflated(returns: list[float], trial_sharpes: list[float]) -> float:
     return float(measures.deflated_sharpe_ratio(returns, trial_sharpes))
 
 
-def _equations_one_and_two(returns: list[float], trial_sharpes: list[float]) -> float:
-    """Equations 1 and 2 without skfolio, under the conventions read in its source.
-
-    Those are the sample standard deviation in both Sharpe ratios, population skewness and kurtosis, and
-    √(T-1). This catches a change in skfolio's arithmetic. It cannot show the conventions are the
-    paper's; the printed values do that, to four decimals.
-    """
-    observations = len(returns)
-    mean = statistics.fmean(returns)
-    variance = statistics.fmean((value - mean) ** 2 for value in returns)
-    skewness = statistics.fmean((value - mean) ** 3 for value in returns) / variance**1.5
-    kurtosis = statistics.fmean((value - mean) ** 4 for value in returns) / variance**2
-    sharpe = mean / statistics.stdev(returns)
-    trials = len(trial_sharpes)
-    normal = NormalDist()
-    expected_maximum = statistics.stdev(trial_sharpes) * (
-        (1 - EULER_MASCHERONI) * normal.inv_cdf(1 - 1 / trials)
-        + EULER_MASCHERONI * normal.inv_cdf(1 - 1 / (trials * math.e))
-    )
-    spread = math.sqrt(1 - skewness * sharpe + (kurtosis - 1) / 4 * sharpe**2)
-    return normal.cdf((sharpe - expected_maximum) * math.sqrt(observations - 1) / spread)
-
-
 def test_the_series_carry_the_moments_of_the_example() -> None:
     skewed = _skewed_returns()
     normal = _normal_returns()
@@ -153,7 +128,11 @@ def test_the_expected_maximum_sharpe_ratio_is_the_papers() -> None:
     ],
 )
 def test_the_deflated_sharpe_ratio_is_the_papers(
-    make_returns: Callable[[], list[float]], trials: int, printed: float, passes: bool
+    worked_dsr: Callable[..., tuple[float, float]],
+    make_returns: Callable[[], list[float]],
+    trials: int,
+    printed: float,
+    passes: bool,
 ) -> None:
     returns = make_returns()
     sharpes = _trial_sharpes(trials)
@@ -162,7 +141,7 @@ def test_the_deflated_sharpe_ratio_is_the_papers(
 
     assert deflated == pytest.approx(printed, abs=PRINTED)
     assert (deflated >= THRESHOLD) is passes
-    assert deflated == pytest.approx(_equations_one_and_two(returns, sharpes), abs=1e-9)
+    assert deflated == pytest.approx(worked_dsr(returns, sharpes)[1], abs=1e-9)
 
 
 @pytest.mark.parametrize(

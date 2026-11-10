@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from datetime import date
 
+import pandas as pd
 import pytest
 
 from canon_trading.ledger import DAY_NS
@@ -145,3 +146,15 @@ def test_ranges_that_do_not_overlap_are_refused_naming_both() -> None:
         returns_matrix([first, second])
 
     assert rejected.value.names == ("a", "b")
+
+
+def test_a_return_that_is_not_finite_is_refused_when_called_directly() -> None:
+    """skfolio's `Portfolio` turns a NaN into 0.0; the matrix would hold a return nobody earned."""
+    index = pd.to_datetime([day(n) for n in range(3)], unit="ns", utc=True)
+    first = pd.Series([0.01, float("nan"), 0.02], index=index, name="a")
+    second = pd.Series([0.01, 0.0, 0.02], index=index, name="b")
+
+    with pytest.raises(ReturnsRejected, match="a: a return that is not finite") as rejected:
+        returns_matrix([first, second])
+
+    assert rejected.value.names == ("a",)
