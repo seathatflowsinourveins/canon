@@ -111,3 +111,17 @@ match = "Names the test (or its N-hat assertion) and says it only checks that th
 reported_by = "claude-opus-high, in the reviewer benchmark run 2026-11-10-first"
 fix = "6e6fed784711cee45c2ad0cbba8c1167e86b23d1"
 test = "tests/test_ranking.py::test_a_pick_above_the_threshold_passes"
+
+# Added after the run 2026-11-10-first, which scored this case without it; it counts from the next
+# scoring (triage: runs/2026-11-10-first/triage.md).
+[[defects]]
+id = "session-day-without-return-dropped"
+location = "src/canon_trading/returns_matrix.py: daily_series"
+summary = """
+daily_series refuses a gap between return keys but never checks that every session day has a return,
+so a session day before the first key or after the last is dropped: that trial ranks with fewer days
+than it had sessions, and its Sharpe ratio, T and the DSR leave those sessions out."""
+match = "Names daily_series and says a session day with no return in returns_series is dropped instead of refused, so that trial's series holds fewer days than its sessions."
+reported_by = "muse and antigravity, in the reviewer benchmark run 2026-11-10-first"
+fix = "ba44c251b9e19e28130c065d1ae88b48c1b1c95b"
+test = "tests/test_returns_matrix.py::test_a_session_day_with_no_return_is_refused"
