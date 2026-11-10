@@ -207,9 +207,14 @@ Each is stated in `execution.py`'s header, with its source.
   not applied. Prices are kept at the precision Alpaca sends (the example has seven decimals). Alpaca
   reports no commission and no liquidity side, so fills carry `None` and `NO_LIQUIDITY_SIDE`.
 * **No fill reports at start-up:** alpaca-py 0.45.0's `TradingClient` has no account activities call, so
-  NautilusTrader infers each reported order's fills from its filled quantity and average price
-  (https://nautilustrader.io/docs/md/latest/concepts/execution/reconciliation.md, "Fill reconciliation"),
-  one fill per order at the average price.
+  NautilusTrader "Infers `OrderFilled` events for missing trade reports" and times each at the order
+  report's last update, not at the execution (`docs/concepts/execution/reconciliation.md` at the pinned
+  commit, "Fill reconciliation" and "Event ordering"; the `latest` page now adds "unless the client requires
+  authoritative fills"). That page does not say what price an inferred fill carries; one fill per order at
+  the average price is this repo's reading (UNVERIFIED). Alpaca documents `GET /v2/account/activities` for a
+  trading account, paper included, and alpaca-py's generic `get` could call it. Whether it may, and the
+  paper test of the trade ID that must come first, are in
+  [ADR 0024](../../docs/adr/0024-alpaca-fill-history.md) (proposed).
 * **Reports:** the orders submitted in the engine's window and every open order however old, since
   Alpaca's `after` and `until` filter on submission time; at most 500 orders per request, alpaca-py's
   documented maximum, newest first; a full page
