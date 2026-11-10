@@ -121,7 +121,9 @@ run = '''
 # lock as a test does and holds it for the window, at most 60 minutes plus start-up, shutdown and the
 # account check, about a minute more; the window flattens and checks the account before it ends. Arguments
 # go to `python -m canon_trading.session_window` (--session regular|extended, --minutes, --symbol). Its log
-# and report are in the per-user temporary folder, outside the repository.
+# and report are in the per-user temporary folder, outside the repository. Run by the scheduled runner
+# (CANON_COMMIT set), `--exact` makes its clone's kept .venv exactly uv.lock, as `uv sync` would; a run by
+# hand leaves the worktree's .venv as it is (uv run's inexact default; ADR 0047).
 [tasks."paper:session"]
 description = "Run one bounded SessionMaCross window on the paper account under the paper lock"
 env.ALPACA_API_KEY = { value = "{{ exec(command='/usr/bin/security find-generic-password -s canon-alpaca-paper -a ALPACA_API_KEY -w') }}", redact = true }
@@ -130,5 +132,5 @@ run = '''
 [ -n "$ALPACA_API_KEY" ] && [ -n "$ALPACA_SECRET_KEY" ] || { echo "paper:session: a keychain item is empty; run: mise run paper:remove, then mise run paper:store" >&2; exit 1; }
 tmp="$(/usr/bin/getconf DARWIN_USER_TEMP_DIR)"
 /usr/bin/lockf -k -t 900 "${tmp}canon-paper-test.lock" \
-  uv run --locked python -m canon_trading.session_window --log-dir "${tmp}canon-paper-session"
+  uv run --locked ${CANON_COMMIT:+--exact} python -m canon_trading.session_window --log-dir "${tmp}canon-paper-session"
 '''

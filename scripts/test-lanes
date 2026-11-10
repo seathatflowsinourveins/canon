@@ -39,7 +39,7 @@ B="$TMP/bin"; mkdir -p "$B"
 cat > "$B/mise" <<'EOF'
 #!/bin/bash
 # mise stub: version from $STUB/mise-version; exec logs MISE_EXEC_AUTO_INSTALL and fakes the tools
-echo "mise $* | exec_auto_install=${MISE_EXEC_AUTO_INSTALL:-unset}" >> "$STUB/mise.log"
+echo "mise $* | exec_auto_install=${MISE_EXEC_AUTO_INSTALL:-unset} | pwd=$PWD | commit=${CANON_COMMIT:-}" >> "$STUB/mise.log"
 case "${1:-}" in
   --version) cat "$STUB/mise-version"; exit 0 ;;
   trust|install) exit 0 ;;
@@ -149,7 +149,7 @@ R="$TMP/repo"; AH="$TMP/auto-home"
 mkdir -p "$R/scripts" "$R/.githooks" "$R/.claude/hooks" "$R/.github/workflows" "$R/.canon" "$R/home/.claude/canon" \
          "$AH/scheduled-tasks/canon-landscape-refresh" "$AH/canon/watch"
 cp "$ROOT/scripts/automation" "$ROOT/scripts/lanes" "$R/scripts/"
-cp "$ROOT/home/.claude/canon/lanes-watch.sh" "$R/home/.claude/canon/"
+cp "$ROOT/home/.claude/canon/lanes-watch.sh" "$ROOT/home/.claude/canon/paper-session.sh" "$R/home/.claude/canon/"
 printf '#!/bin/bash\nexit 0\n' > "$R/.githooks/pre-commit"; cp "$R/.githooks/pre-commit" "$R/.claude/hooks/canon-watch.sh"
 chmod +x "$R/.githooks/pre-commit" "$R/.claude/hooks/canon-watch.sh"
 echo '{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"canon-watch.sh"}]}]}}' > "$R/.claude/settings.json"
@@ -167,9 +167,12 @@ runs() { jq -n --arg at "$(iso "$NOW")" --arg s "$1" "[{createdAt: \$at, status:
 printf '\tstate = not running\n\truns = 3\n\tlast exit code = 0\n' > "$STUB/launchctl-print"
 PD="$TMP/paper-session"; mkdir -p "$PD"
 paper() { # paper <result> <age in seconds>: the session windows' latest record
-  jq -n --arg r "$1" --argjson e $((NOW - $2)) '{session: "regular", result: $r, started: "20261111T143500Z", started_epoch: $e, left: []}' > "$PD/latest.json"
+  jq -n --arg r "$1" --argjson e $((NOW - $2)) --arg c "$(printf 'a%.0s' {1..40})" \
+    '{session: "regular", result: $r, started: "20261111T143500Z", started_epoch: $e, left: [], commit: $c}' > "$PD/latest.json"
 }
-heartbeat() { jq -n --argjson e $((NOW - $1)) '{at_epoch: $e, outcome: "a regular window"}' > "$PD/last-firing.json"; }
+heartbeat() { # heartbeat <age in seconds> [outcome]
+  jq -n --argjson e $((NOW - $1)) --arg o "${2:-a regular window}" '{at_epoch: $e, outcome: $o, commit: "b123456789abcdef0123456789abcdef01234567"}' > "$PD/last-firing.json"
+}
 paper ok 600; heartbeat 60
 status() { CLAUDE_CONFIG_DIR="$AH" CANON_PAPER_SESSION_DIR="$PD" "$R/scripts/automation" status > "$TMP/status.out" 2>&1; }
 watchjson 60 true; runs completed '{conclusion: "success"}'
@@ -205,6 +208,16 @@ runs completed '{conclusion: "failure"}'; status; rc=$?
 check "hosted run failed: FAILED, exit 1"         eval 'rowis "$TMP/status.out" "hosted watch" FAILED && [ "$rc" != 0 ]'
 runs completed '{conclusion: "success"}'
 check "paper session ok: its row shows the last window" eval 'rowis "$TMP/status.out" "paper session" ok && grep -q "last window 20261111T143500Z" "$TMP/status.out"'
+check "... the commit it ran, and the last firing's"   eval 'grep -q "regular, commit aaaaaaaaaaaa): ok" "$TMP/status.out" && grep -q "a regular window at b123456789ab |" "$TMP/status.out"'
+jq 'del(.commit)' "$PD/latest.json" > "$PD/l" && mv "$PD/l" "$PD/latest.json"; status
+check "a record without a commit says so"         grep -q "commit not recorded)" "$TMP/status.out"
+heartbeat 60 "failed: could not fetch main from https://github.com/example/repo.git: no answer"; status; rc=$?
+check "a firing that could not fetch main: FAILED, exit 1, naming why" \
+      eval 'rowis "$TMP/status.out" "paper session" FAILED && [ "$rc" != 0 ] && grep -q "could not fetch main" "$TMP/status.out"'
+mv "$PD/latest.json" "$PD/kept.json"; status
+check "... FAILED too when no window has a record yet" rowis "$TMP/status.out" "paper session" FAILED
+mv "$PD/kept.json" "$PD/latest.json"
+heartbeat 60
 paper running 600; status; rc=$?
 check "paper window running for 10 minutes: ok"   eval 'rowis "$TMP/status.out" "paper session" ok && [ "$rc" = 0 ]'
 paper running $((75 * 60)); status; rc=$?
@@ -225,6 +238,17 @@ paper running 600; jq '.stale_after = 300' "$PD/latest.json" > "$PD/l" && mv "$P
 check "a record's own stale_after decides when it died" rowis "$TMP/status.out" "paper session" DIED
 paper ok 600
 
+# the paper session's origin: a local bare repository standing in for the example GitHub URL, through
+# git's url.<base>.insteadOf in the temp HOME's own git config (git-config(1)), so nothing reaches the network
+export GIT_CONFIG_GLOBAL="$HOME/.gitconfig"   # the temp HOME's, whatever the caller set
+O="$TMP/origin.git"; OW="$TMP/origin-work"
+git init -q --bare -b main "$O" && git init -q -b main "$OW"
+printf '.venv/\ncatalog/*\n' > "$OW/.gitignore"; : > "$OW/mise.toml"; echo 1 > "$OW/tracked"
+ocommit() { git -C "$OW" add -A && git -C "$OW" -c user.name=t -c user.email=t@example.com commit -qm "$1" && git -C "$OW" push -q "$O" HEAD:main; }
+ocommit first
+git config --global "url.$O.insteadOf" https://github.com/example/repo.git
+OURL=$(git -C "$R" remote get-url origin)
+CK="$AH/canon/paper-checkout"
 if command -v plutil >/dev/null 2>&1; then
   : > "$STUB/launchctl.log"
   inst() { CLAUDE_CONFIG_DIR="$AH" CANON_LAUNCHAGENTS_DIR="$TMP/agents" AUTOMATION_SKIP_LAUNCHD=1 "$R/scripts/automation" install > "$TMP/install.out" 2>&1; }
@@ -246,31 +270,95 @@ if command -v plutil >/dev/null 2>&1; then
   fi
   PP="$TMP/agents/local.canon.paper-session.plist"
   pargs=""
-  for i in 0 1 2 3 4 5 6; do pargs="$pargs|$(plutil -extract "ProgramArguments.$i" raw -o - "$PP" 2>/dev/null)"; done
-  check "rehearsal writes the paper session agent: mise run paper:session --session auto --minutes 25" \
-        test "$pargs" = "|$B/mise|run|paper:session|--session|auto|--minutes|25"
+  for i in 0 1 2 3 4 5 6 7 8 9; do pargs="$pargs|$(plutil -extract "ProgramArguments.$i" raw -o - "$PP" 2>/dev/null)"; done
+  check "rehearsal writes the paper session agent: the runner, its clone and origin, --session auto --minutes 25" \
+        test "$pargs" = "|/bin/bash|$AH/canon/paper-session.sh|$B/mise|$CK|$OURL|--session|auto|--minutes|25|"
+  check "... the runner installed beside the watchdog" cmp -s "$ROOT/home/.claude/canon/paper-session.sh" "$AH/canon/paper-session.sh"
+  check "... and its clone at origin's main, detached, marked as made by it" \
+        eval '[ "$(git -C "$CK" rev-parse HEAD)" = "$(git -C "$O" rev-parse main)" ] && ! git -C "$CK" symbolic-ref -q HEAD >/dev/null && [ "$(git -C "$CK" config canon.paperCheckout)" = true ]'
   # a window, about two minutes of start-up and stop, and session_window.GAP_SECS must fit one interval
   check "... a 25-minute window, two minutes of start and stop, and the 300 s gap fit 35 minutes" \
         test $((2100 - 25 * 60 - 120)) -ge 300
-  pwd_r=$(cd "$R" && pwd -P)  # git reports the physical path
   check "... every 35 minutes"                    test "$(plutil -extract StartInterval raw -o - "$PP")" = 2100
-  check "... from this checkout"                  test "$(plutil -extract WorkingDirectory raw -o - "$PP")" = "$pwd_r"
+  check "... from the automation folder, not a checkout" test "$(plutil -extract WorkingDirectory raw -o - "$PP")" = "$AH/canon"
   check "... not at load"                         test "$(plutil -extract RunAtLoad raw -o - "$PP")" = false
   check "agent environment points the watchdog at the installed directory" \
         eval '[ "$pe" = "$AH" ] && jqt "$AH/canon/watch/lanes-status.json" "has(\"checked_at\")"'
+  mv "$O" "$O.away"; inst; rc=$?
+  check "an install whose clone cannot fetch main fails and leaves no paper plist for launchd to load" \
+        eval '[ "$rc" != 0 ] && [ ! -e "$PP" ] && grep -q "could not fetch main" "$TMP/install.out"'
+  mv "$O.away" "$O"
   rm "$R/scripts/lanes"; inst; rc=$?
   check "failed copy makes install exit 1"        eval '[ "$rc" != 0 ] && grep -q "FAILED: could not install" "$TMP/install.out"'
 else
   skip "automation install rehearsal" "needs plutil, which is macOS-only"
 fi
 
+# ---------- paper session firing ----------
+# the runner as the agent runs it: no environment but HOME (launchd gives it HOME), the mise stub logging
+# what it was asked to run, from where and at which commit
+echo "paper session firing:"
+FK="$TMP/fire-checkout"; FD="$TMP/fire-records"
+fire() { env -i HOME="$HOME" STUB="$STUB" GIT_CONFIG_GLOBAL="$GIT_CONFIG_GLOBAL" CANON_PAPER_SESSION_DIR="$FD" \
+           /bin/bash "$ROOT/home/.claude/canon/paper-session.sh" "$@" > "$TMP/fire.out" 2>&1; }
+ran() { grep "run paper:session" "$STUB/mise.log" | tail -1; }
+: > "$STUB/mise.log"
+fire "$B/mise" "$FK" "$OURL" --session auto --minutes 25; rc=$?
+want=$(git -C "$O" rev-parse main)
+check "first firing clones origin's main and runs the window there: exit 0" \
+      eval '[ "$rc" = 0 ] && [ "$(git -C "$FK" rev-parse HEAD)" = "$want" ]'
+check "... mise run paper:session --session auto --minutes 25, in the clone, CANON_COMMIT the commit" \
+      eval 'ran | grep -qF "mise run paper:session --session auto --minutes 25 |" && ran | grep -qF "| pwd=$(cd "$FK" && pwd) | commit=$want"'
+echo 2 > "$OW/tracked"; ocommit second; want=$(git -C "$O" rev-parse main)
+mkdir -p "$FK/.venv" "$FK/catalog"; : > "$FK/.venv/kept"; : > "$FK/catalog/bars"; : > "$FK/untracked"; echo local > "$FK/tracked"
+fire "$B/mise" "$FK" "$OURL" --session auto; rc=$?
+check "the next firing runs the main origin has now"  eval '[ "$rc" = 0 ] && ran | grep -qF "commit=$want" && [ "$(cat "$FK/tracked")" = 2 ]'
+check "... detached, keeping .venv and nothing else untracked" \
+      eval '! git -C "$FK" symbolic-ref -q HEAD >/dev/null && [ -e "$FK/.venv/kept" ] && [ ! -e "$FK/catalog/bars" ] && [ ! -e "$FK/untracked" ]'
+lines=$(grep -c "run paper:session" "$STUB/mise.log")
+mv "$O" "$O.away"; echo 3 > "$OW/tracked"
+fire "$B/mise" "$FK" "$OURL" --session auto; rc=$?
+check "a failed fetch fails the firing: exit 1, nothing run, the clone where it was" \
+      eval '[ "$rc" = 1 ] && [ "$(grep -c "run paper:session" "$STUB/mise.log")" = "$lines" ] && [ "$(git -C "$FK" rev-parse HEAD)" = "$want" ]'
+check "... and says so in last-firing.json, which status reads" \
+      jqt "$FD/last-firing.json" '(.outcome | startswith("failed: could not fetch main from")) and .commit == "none: nothing ran"'
+mv "$O.away" "$O"
+git -C "$FK" remote set-url origin "$TMP/elsewhere.git"
+fire "$B/mise" "$FK" "$OURL" --session auto; rc=$?
+check "a clone with another origin is made again from the right one" \
+      eval '[ "$rc" = 0 ] && [ "$(git -C "$FK" remote get-url origin)" = "$OURL" ] && ran | grep -qF "commit=$want"'
+mkdir -p "$TMP/someones"; echo mine > "$TMP/someones/file"
+# shellcheck disable=SC2034  # read by the eval'd checks
+lines=$(grep -c "run paper:session" "$STUB/mise.log")
+fire "$B/mise" "$TMP/someones" "$OURL" --session auto; rc=$?
+check "a folder the runner did not make is never emptied: exit 1, its file kept, nothing run" \
+      eval '[ "$rc" = 1 ] && [ "$(cat "$TMP/someones/file")" = mine ] && [ "$(grep -c "run paper:session" "$STUB/mise.log")" = "$lines" ]'
+git clone -q "$OURL" "$TMP/persons"; echo work > "$TMP/persons/untracked"; echo edit > "$TMP/persons/tracked"
+fire "$B/mise" "$TMP/persons" "$OURL" --session auto; rc=$?
+check "... nor a person's clone of the same origin: its edits and files kept" \
+      eval '[ "$rc" = 1 ] && [ "$(cat "$TMP/persons/untracked")" = work ] && [ "$(cat "$TMP/persons/tracked")" = edit ] && git -C "$TMP/persons" symbolic-ref -q HEAD >/dev/null'
+fire "$B/mise" "$FK" "git@github.com:example/repo.git" --session auto; rc=$?
+check "an origin that is not https is refused: exit 1, nothing run" \
+      eval '[ "$rc" = 1 ] && grep -q "must be an https URL" "$TMP/fire.out" && [ "$(grep -c "run paper:session" "$STUB/mise.log")" = "$lines" ]'
+fire --checkout-only "$B/mise" "$FK" "$OURL"; rc=$?
+check "--checkout-only checks out and runs nothing" \
+      eval '[ "$rc" = 0 ] && [ "$(grep -c "run paper:session" "$STUB/mise.log")" = "$lines" ] && grep -q "is at origin/main $want" "$TMP/fire.out"'
+
 UH="$TMP/un-home"; UA="$TMP/un-agents"
 uninst() { CLAUDE_CONFIG_DIR="$UH" CANON_LAUNCHAGENTS_DIR="$UA" "$R/scripts/automation" uninstall > "$TMP/uninstall.out" 2>&1; }
 mkdir -p "$UH/canon" "$UA"; : > "$UH/canon/lanes"; : > "$UH/canon/lanes-watch.sh"; : > "$UA/local.canon.lanes-watch.plist"
-: > "$UA/local.canon.paper-session.plist"
-printf '\tstate = not running\n' > "$STUB/launchctl-print"; rm -f "$STUB/bootout-fails"
+: > "$UA/local.canon.paper-session.plist"; : > "$UH/canon/paper-session.sh"
+fire --checkout-only "$B/mise" "$UH/canon/paper-checkout" "$OURL"
+printf '\tstate = not running\n' > "$STUB/launchctl-print"; rm -f "$STUB/bootout-fails"; : > "$STUB/mise.log"
 uninst; rc=$?
 check "uninstall removes everything: exit 0"      eval '[ "$rc" = 0 ] && [ ! -e "$UH/canon/lanes" ] && [ ! -e "$UA/local.canon.lanes-watch.plist" ] && [ ! -e "$UA/local.canon.paper-session.plist" ]'
+check "... the paper runner, its clone, and the trust mise gave the clone's mise.toml" \
+      eval '[ ! -e "$UH/canon/paper-session.sh" ] && [ ! -e "$UH/canon/paper-checkout" ] && grep -qF "mise trust --untrust $UH/canon/paper-checkout/mise.toml" "$STUB/mise.log"'
+mkdir -p "$UH/canon/paper-checkout"; echo mine > "$UH/canon/paper-checkout/file"; : > "$STUB/mise.log"
+uninst; rc=$?
+check "a paper-checkout install did not make is kept, named and its mise trust untouched: exit 1" \
+      eval '[ "$rc" != 0 ] && [ -e "$UH/canon/paper-checkout/file" ] && grep -q "is not the clone install made" "$TMP/uninstall.out" && ! grep -q "trust --untrust" "$STUB/mise.log"'
+rm -rf "$UH/canon/paper-checkout"
 if [ "$(id -u)" = 0 ]; then
   skip "uninstall that leaves things" "a read-only directory does not stop root"
 else

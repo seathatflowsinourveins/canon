@@ -9,6 +9,8 @@ for the paper `TradingClient`; the times are New York's.
 
 import json
 import math
+import os
+import subprocess
 from datetime import UTC
 from datetime import datetime
 from decimal import Decimal
@@ -774,9 +776,41 @@ def test_auto_outside_every_session_runs_nothing_and_exits_0(monkeypatch, tmp_pa
 def test_a_refused_window_is_the_latest_record(monkeypatch, tmp_path) -> None:
     held = SimpleNamespace(client_order_id="someone-elses")
     monkeypatch.setattr(session_window, "paper_trading", lambda: Account(orders=[held]))
+    monkeypatch.setenv(session_window.COMMIT_ENV, "a" * 40)
     assert session_window.main(["--log-dir", str(tmp_path)]) == 1
     latest = json.loads((tmp_path / "latest.json").read_text())
     assert latest["result"].startswith("refused: the paper account is not flat")
+    assert latest["commit"] == "a" * 40
+
+
+def test_the_commit_comes_from_the_runner_else_from_git_else_says_unknown(
+    monkeypatch, tmp_path
+) -> None:
+    """ADR 0047: every record names the code that ran; the field is never left out or empty."""
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    monkeypatch.setenv(
+        "GIT_CONFIG_GLOBAL", os.devnull
+    )  # no signing, hooks or template of the caller's
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    repo = tmp_path / "checkout"
+    git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.com"]
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    (repo / "f").write_text("1")
+    subprocess.run([*git, "add", "f"], check=True)
+    subprocess.run([*git, "commit", "-qm", "c"], check=True)
+    head = subprocess.run(
+        [*git, "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+    monkeypatch.delenv(session_window.COMMIT_ENV, raising=False)
+    assert session_window.running_commit(repo) == head
+    (repo / "f").write_text("2")
+    assert session_window.running_commit(repo) == head  # read once a process
+    session_window._checkout_commit.cache_clear()
+    assert session_window.running_commit(repo) == f"{head} with uncommitted changes"
+    (tmp_path / "plain").mkdir()
+    assert session_window.running_commit(tmp_path / "plain").startswith("unknown: ")
+    monkeypatch.setenv(session_window.COMMIT_ENV, "b" * 40)
+    assert session_window.running_commit(tmp_path / "plain") == "b" * 40
 
 
 def test_a_window_that_fails_after_it_started_records_failed(monkeypatch, tmp_path) -> None:
@@ -785,15 +819,17 @@ def test_a_window_that_fails_after_it_started_records_failed(monkeypatch, tmp_pa
     seen: list[str] = []
 
     def broken(config, **kwargs):
-        seen.append(json.loads((tmp_path / "latest.json").read_text())["result"])
+        running = json.loads((tmp_path / "latest.json").read_text())
+        seen.extend((running["result"], running["commit"]))
         raise RuntimeError("the node could not be built")
 
     monkeypatch.setattr(session_window, "paper_trading", lambda: Account())
     monkeypatch.setattr(session_window, "window_node", broken)
+    monkeypatch.setenv(session_window.COMMIT_ENV, "c" * 40)
     with pytest.raises(RuntimeError, match="could not be built"):
         session_window.run_window(WindowConfig(log_dir=tmp_path))
     latest = json.loads((tmp_path / "latest.json").read_text())
-    assert seen == ["running"]
+    assert seen == ["running", "c" * 40] and latest["commit"] == "c" * 40
     assert latest["result"] == "failed: RuntimeError: the node could not be built"
     assert latest["left"] == [] and (tmp_path / f"window-{latest['started']}.json").exists()
 
@@ -845,6 +881,7 @@ def test_every_run_leaves_a_heartbeat_even_with_nothing_to_run(monkeypatch, tmp_
             )  # a Saturday
 
     monkeypatch.setattr(session_window, "paper_trading", lambda: Closed())
+    monkeypatch.setenv(session_window.COMMIT_ENV, "d" * 40)
     assert session_window.main(["--session", "auto", "--log-dir", str(tmp_path)]) == 0
     heard = json.loads((tmp_path / "last-firing.json").read_text())
-    assert heard["outcome"].startswith("nothing to run")
+    assert heard["outcome"].startswith("nothing to run") and heard["commit"] == "d" * 40

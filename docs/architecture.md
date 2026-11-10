@@ -136,4 +136,6 @@ adapter is a uv workspace member of its own, kept apart from strategies as upstr
   for every reviewer, found-or-missed scoring by two scorers (`evals/review/`, ADR 0046). Not yet run.
 * **Unasked.** The commit gate, the push address check, edit-time lint, a daily canon watch, a lane
   watchdog, a weekly model run and Dependabot (ADR 0011, ADR 0016, ADR 0026; `AGENTS.md`, "Automation").
+  Once installed, a paper session window every 35 minutes, run from a clone each firing brings to
+  GitHub's `main` first, never from a checkout a person uses (ADR 0047).
   Models are routed by lane in `canon/models.json` (ADR 0005).

@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import functools
 import json
 import os
 import subprocess
@@ -100,6 +101,11 @@ a reviewed change turns this on once an extended window has passed on paper and 
 disconnect-hang fix is on `main` (ADR 0044)."""
 POLL_SECS = 2.0
 """Between account reads after the stop: two calls each, well inside Alpaca's 200 calls a minute."""
+COMMIT_ENV = "CANON_COMMIT"
+"""Set by the scheduled runner, `home/.claude/canon/paper-session.sh`, to the `origin/main` commit it checked
+out for this firing (ADR 0047)."""
+SOURCE_ROOT = Path(__file__).resolve().parents[2]
+"""The checkout this module runs from."""
 
 
 def default_log_dir() -> Path:
@@ -112,6 +118,34 @@ def default_log_dir() -> Path:
     except OSError, subprocess.CalledProcessError:
         found = tempfile.gettempdir()
     return Path(found) / "canon-paper-session"
+
+
+def running_commit(root: Path = SOURCE_ROOT) -> str:
+    """The commit this run's code is at, for its records: `CANON_COMMIT` when the scheduled runner set it,
+    else `git rev-parse HEAD` of `root`, marked when a tracked file differs from it, else `unknown: <why>`.
+    Never empty, so a record always says which code ran or that it could not tell. Read from git once a
+    process, so every record of one run names the same code."""
+    if found := os.environ.get(COMMIT_ENV, "").strip():
+        return found
+    return _checkout_commit(root)
+
+
+@functools.cache
+def _checkout_commit(root: Path) -> str:
+    try:
+        head, changed = (
+            subprocess.run(
+                ["git", "-C", str(root), *args],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=10,
+            ).stdout.strip()
+            for args in (["rev-parse", "--verify", "HEAD"], ["status", "--porcelain", "-uno"])
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        return f"unknown: {type(e).__name__}: {e}"
+    return f"{head} with uncommitted changes" if changed else head
 
 
 @dataclass(frozen=True)
@@ -257,6 +291,8 @@ class WindowReport:
     `stale_after` seconds belongs to a window that died; `scripts/automation status` reads both."""
     started_epoch: float = field(default_factory=time.time)
     stale_after: int = STALE_RUNNING_SECS
+    commit: str = field(default_factory=running_commit)
+    """The code this window runs (`running_commit`), in the `running` record and the result alike."""
 
 
 class WindowRefused(RuntimeError):
@@ -291,7 +327,7 @@ def write_heartbeat(log_dir: Path, outcome: str) -> None:
     log_dir.mkdir(parents=True, exist_ok=True)
     _write_atomically(
         log_dir / "last-firing.json",
-        json.dumps({"at_epoch": time.time(), "outcome": outcome}),
+        json.dumps({"at_epoch": time.time(), "outcome": outcome, "commit": running_commit()}),
     )
 
 
@@ -531,6 +567,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "started_epoch": time.time(),
                 "started": datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ"),
                 "stale_after": STALE_RUNNING_SECS,
+                "commit": running_commit(),
             },
         )
         print(f"paper:session: {e}", file=sys.stderr)
