@@ -44,7 +44,6 @@ from skfolio import Portfolio
 from .ledger import DAY_NS
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
     from collections.abc import Sequence
 
 
@@ -59,12 +58,15 @@ class ReturnsRejected(ValueError):
         self.names = tuple(names)
 
 
-def daily_series(name: str, returns: Mapping[str, float], session_days: Sequence[str]) -> pd.Series:
+def daily_series(name: str, returns: object, session_days: object) -> pd.Series:
     """One trial's daily portfolio returns on its session days, indexed by UTC date, named `name`.
 
     `returns` is a ledger entry's `returns_series` (nanoseconds as text to a return) and `session_days`
-    its `session_days`.
+    its `session_days`, in the shape `canon_trading.ledger.record_trial` writes them: each key and day
+    the decimal text of a whole number, as `str(int)` gives it, and each return a number. Anything
+    else came from another writer and is refused, naming `name`.
     """
+    returns, session_days = _check_shape(name, returns, session_days)
     if not returns:
         raise ReturnsRejected(f"{name}: returns_series is empty")
     keys = sorted(int(key) for key in returns)
@@ -103,6 +105,50 @@ def daily_series(name: str, returns: Mapping[str, float], session_days: Sequence
         index=pd.to_datetime(kept, unit="ns", utc=True),
         name=name,
     )
+
+
+def _is_ns_text(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and value.isascii()
+        and value.removeprefix("-").isdecimal()
+        and str(int(value)) == value
+    )
+
+
+def _is_number(value: object) -> bool:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return False
+    try:
+        float(value)
+    except OverflowError:
+        return False
+    return True
+
+
+def _check_shape(
+    name: str, returns: object, session_days: object
+) -> tuple[dict[str, float], list[str]]:
+    """Refuse `returns` and `session_days` unless they are in the shape `record_trial` writes."""
+    if not isinstance(returns, dict):
+        raise ReturnsRejected(f"{name}: returns_series is {type(returns).__name__}, not a mapping")
+    if not isinstance(session_days, list):
+        raise ReturnsRejected(f"{name}: session_days is {type(session_days).__name__}, not a list")
+    bad_key = next((key for key in returns if not _is_ns_text(key)), None)
+    if bad_key is not None:
+        raise ReturnsRejected(f"{name}: returns_series key {bad_key!r} is not nanoseconds as text")
+    bad = next(
+        (key for key, value in returns.items() if not _is_number(value)),
+        None,
+    )
+    if bad is not None:
+        raise ReturnsRejected(
+            f"{name}: returns_series value {returns[bad]!r} on {bad} is not a number"
+        )
+    bad_day = next((day for day in session_days if not _is_ns_text(day)), None)
+    if bad_day is not None:
+        raise ReturnsRejected(f"{name}: session day {bad_day!r} is not nanoseconds as text")
+    return returns, session_days
 
 
 def returns_matrix(series: Sequence[pd.Series]) -> pd.DataFrame:

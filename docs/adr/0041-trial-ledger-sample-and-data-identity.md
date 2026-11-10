@@ -65,6 +65,27 @@ with what was tried.
    same range again is a new sample, the way a corrected catalog is taken in. No record is overwritten or
    deleted. The ranking reads only records on the current sample, and stops, naming it, on a key with no
    record there: every configuration the study tried is run again before a ranking.
+6. **A record with no key ran no backtest.** `record_trial` writes the key before the run starts, so a
+   record without one is what a process killed between `ask` and that write leaves. The ranking stops,
+   naming it, until `mark_not_run(study, number)` clears it: a `RUNNING` one is told `FAIL`, its number
+   joins the study user attribute `not_run`, and it is kept and not counted in N. A record with a key
+   is refused, since only a later record of its key resolves it; so is a keyless record that shows a
+   run (an outcome, returns or session days), a trial of an unknown configuration, which stops for good.
+
+Local, no upstream. The ranking's own glue, where the upstreams read say nothing:
+
+* `not_run` (term 6): Optuna 5.0.0 has states, not a "ran nothing" mark, and its `fail_stale_trials`
+  only tells a stale trial `FAIL`; the DSR paper counts trials and says nothing of a record with none.
+* A tie at the top: keys within `math.isclose` of the best Sharpe ratio with equal returns day by day
+  are one pick; tied keys with other returns stop. The paper's pick is "the" highest; skfolio takes
+  one series and says nothing of ties.
+* The DSR at N̂ is withheld when its benchmark is below 0. skfolio 1.12.8's
+  `expected_max_sharpe_ratio` returns a negative benchmark for 1 < N̂ < about 1.28 without comment;
+  the expected maximum of N̂ ≥ 1 trials of mean 0 is not below 0.
+* A returns record not in `record_trial`'s shape is refused, naming its trial: Optuna stores user
+  attributes as any JSON and validates none.
+* One ranking gathers every trial's stops before it raises, and the study's (N, V, the tie, the DSR)
+  after: no upstream ranks a ledger, so the order is this repo's.
 
 Who decided. The orchestrator chose option 2 and its terms under the owner's delegation of
 2026-11-10 (ADR 0010's Evidence).
@@ -89,7 +110,8 @@ Who decided. The orchestrator chose option 2 and its terms under the owner's del
   each configuration not run on it and ranks T = 70 once all are; a corrected catalog disagrees until
   the sample moves.
 * `tests/test_ranking.py` and `tests/test_returns_matrix.py`: a trial over a shorter range, and trials
-  with no day in common, stop the ranking naming each; N counts keys across samples.
+  with no day in common, stop the ranking naming each; N counts keys across samples; a keyless record
+  stops until marked, then N leaves it out, and marking a record with a key is refused.
 
 ## Evidence
 
@@ -106,8 +128,9 @@ package; run, executed in this checkout.
   the PBO paper, February 2015 revision, p. 11: the T×N matrix must have "the same number of rows for each
   column, where observations are synchronous for every row across the N trials". Term 2 rests on this.
   Fetched by the same scout.
-* Optuna 5.0.0 in `.venv`, `optuna/study/study.py`: `Study.set_user_attr` keeps study-level JSON;
-  `create_study` without `load_if_exists` raises `DuplicatedStudyError`. `bundled`.
+* Optuna 5.0.0 in `.venv`, `optuna/study/study.py`: `Study.tell` takes a `Trial` or a trial number, so
+  a `RUNNING` record left by a dead process can be told `FAIL` from another; `Study.set_user_attr`
+  keeps study-level JSON; `create_study` without `load_if_exists` raises `DuplicatedStudyError`. `bundled`.
 * nautilus-trader 2.0.0rc8 in `.venv`, `backtest/__init__.pyi`: `BacktestRunConfig(start, end)`;
   `persistence/__init__.pyi`: `ParquetDataCatalog.query(start, end)`, no content hash. `bundled`. A run
   with `start` and `end` on two bars' `ts_init` replayed both (`iterations` 25 of 25). Run.

@@ -31,6 +31,7 @@ import optuna
 import pytest
 from optuna.trial import TrialState
 from skfolio import Portfolio
+from skfolio import measures
 
 from canon_trading.ledger import DAY_NS
 from canon_trading.ledger import FAILED
@@ -38,6 +39,7 @@ from canon_trading.ledger import IDLE
 from canon_trading.ledger import OUTCOME
 from canon_trading.ledger import TRADED
 from canon_trading.ledger import create_ledger_study
+from canon_trading.ledger import mark_not_run
 from canon_trading.ledger import move_sample
 from canon_trading.ranking import THRESHOLD
 from canon_trading.ranking import RankingStopped
@@ -316,7 +318,7 @@ def test_one_configuration_stops(study: optuna.Study) -> None:
     write(study, "pick", PICK)
     write(study, "pick", PICK)
 
-    with pytest.raises(RankingStopped, match=r"N = 1; the DSR needs N >= 2"):
+    with pytest.raises(RankingStopped, match=r"N = 1; the DSR needs N >= 2 \(pick \(#0, #1\)\)"):
         rank(study)
 
 
@@ -360,25 +362,122 @@ def test_copies_that_differ_only_in_rounding_stop(study: optuna.Study, scale: fl
         rank(study)
 
 
-def test_a_shared_highest_sharpe_ratio_stops(study: optuna.Study) -> None:
-    write(study, "pick", PICK)
-    write(study, "copy", PICK)
+def test_bit_identical_columns_tied_at_the_top_are_one_pick(study: optuna.Study) -> None:
+    """The review's 4x4 grid: (2,6) and (3,6) traded the same bars under two keys and stopped it."""
+    first = write(study, "pick", PICK)
+    twin = write(study, "twin", PICK)
     write(study, "second", SECOND)
 
-    with pytest.raises(RankingStopped, match="pick, copy share the highest Sharpe ratio"):
-        rank(study)
+    report = rank(study)
+
+    assert (report.n, report.pick, report.tied, report.pick_trials) == (
+        3,
+        "pick",
+        ("twin",),
+        (first, twin),
+    )
+    sr0_dsr = worked_dsr(PICK, [sharpe(PICK), sharpe(PICK), sharpe(SECOND)])
+    assert report.dsr == pytest.approx(sr0_dsr[1], abs=1e-12)
+    assert "Pick pick, the same returns as twin" in report.summary()
 
 
-def test_every_reason_is_named_at_once(study: optuna.Study) -> None:
-    write(study, "pick", PICK)
-    write(study, "broken", None, outcome=FAILED)
-    write(study, "idle", [0.0] * T, outcome=IDLE)
+def test_a_tie_at_the_top_with_different_returns_stops(study: optuna.Study) -> None:
+    """The pick's returns in reverse order: the same Sharpe ratio, other returns, no one pick."""
+    first = write(study, "pick", PICK)
+    other = write(study, "reversed", PICK[::-1])
+    write(study, "second", SECOND)
 
     with pytest.raises(RankingStopped) as stopped:
         rank(study)
 
-    assert "broken: no record ran to the end" in str(stopped.value)
-    assert "idle: never traded" in str(stopped.value)
+    message = str(stopped.value)
+    assert "share the highest Sharpe ratio within floating-point noise" in message
+    assert f"pick (#{first}); reversed (#{other})" in message
+
+
+@pytest.mark.filterwarnings("ignore:invalid value encountered in scalar divide:RuntimeWarning")
+def test_every_reason_is_named_at_once(study: optuna.Study) -> None:
+    """The review needed three calls for a failed key, a flat key and one on a disjoint range."""
+    write(study, "pick", PICK)
+    broken = write(study, "broken", None, outcome=FAILED)
+    idle = write(study, "idle", [0.0] * T, outcome=IDLE)
+    flat = write(study, "flat", [0.0] * T)
+    short = write(study, "short", SECOND[20:], first_day=20)
+    keyless = write(study, None, None, tell=False)
+
+    with pytest.raises(RankingStopped) as stopped:
+        rank(study)
+
+    message = str(stopped.value)
+    assert f"broken: no record ran to the end (#{broken} (failed))" in message
+    assert f"idle: never traded (#{idle} (idle))" in message
+    assert f"flat: Sharpe ratio nan over the sample (#{flat})" in message
+    assert f"short (#{short})" in message
+    assert f"#{keyless} (running) has no config key" in message
+
+
+def test_a_record_with_no_key_stops_until_marked_not_run(study: optuna.Study) -> None:
+    """A process killed between ask and the key's write: no backtest ran, and N must not count it."""
+    write(study, "pick", PICK)
+    write(study, "second", SECOND)
+    keyless = write(study, None, None, tell=False)
+
+    with pytest.raises(RankingStopped, match=rf"mark_not_run\(study, {keyless}\) clears it"):
+        rank(study)
+    mark_not_run(study, keyless)
+
+    report = rank(study)
+    assert report.n == 2
+    [trial] = [t for t in study.trials if t.number == keyless]
+    assert trial.state == TrialState.FAIL
+    assert study.user_attrs["not_run"] == [keyless]
+
+
+def test_a_record_with_a_key_cannot_be_marked_not_run(study: optuna.Study) -> None:
+    write(study, "pick", PICK)
+    crashed = write(study, "crashed", None, tell=False)
+
+    with pytest.raises(ValueError, match="only a later record of that key resolves it"):
+        mark_not_run(study, crashed)
+    with pytest.raises(LookupError, match="no trial #99"):
+        mark_not_run(study, 99)
+
+    assert "not_run" not in study.user_attrs
+    assert [t.state for t in study.trials][-1] == TrialState.RUNNING
+
+
+@pytest.mark.parametrize(
+    ("returns", "days", "message"),
+    [
+        pytest.param({f"0{DAY_0}": 0.01}, [str(DAY_0)], "key '0", id="leading zero"),
+        pytest.param({f"+{DAY_0}": 0.01}, [str(DAY_0)], r"key '\+", id="plus sign"),
+        pytest.param({"2025-03-11": 0.01}, [str(DAY_0)], "key '2025-03-11'", id="date key"),
+        pytest.param({str(DAY_0): "0.01"}, [str(DAY_0)], "value '0.01'", id="text return"),
+        pytest.param({str(DAY_0): None}, [str(DAY_0)], "value None", id="null return"),
+        pytest.param({str(DAY_0): 0.01}, None, "session_days is NoneType", id="null days"),
+        pytest.param({str(DAY_0): 0.01}, ["2025-03-11"], "session day '2025-03-11'", id="date day"),
+        pytest.param(None, [str(DAY_0)], "returns_series is NoneType", id="no returns"),
+        pytest.param({"--5": 0.01}, [str(DAY_0)], "key '--5'", id="two minus signs"),
+        pytest.param({"\u00b2": 0.01}, [str(DAY_0)], "key '\u00b2'", id="superscript digit"),
+        pytest.param({str(DAY_0): 10**400}, [str(DAY_0)], "is not a number", id="huge integer"),
+    ],
+)
+def test_a_record_not_in_the_writers_shape_stops_naming_it(
+    study: optuna.Study, returns: object, days: object, message: str
+) -> None:
+    """Another writer's record raised a bare KeyError, ValueError or TypeError naming nothing."""
+    write(study, "pick", PICK)
+    trial = study.ask()
+    trial.set_user_attr("config_key", "odd")
+    trial.set_user_attr("sample", 0)
+    if returns is not None:
+        trial.set_user_attr("returns_series", returns)
+    trial.set_user_attr("session_days", days)
+    trial.set_user_attr(OUTCOME, TRADED)
+    study.tell(trial, 0.0)
+
+    with pytest.raises(RankingStopped, match=rf"odd: [^\n]*{message}[^\n]*\(#{trial.number}\)"):
+        rank(study)
 
 
 def test_a_trial_over_a_shorter_range_stops_and_is_named(study: optuna.Study) -> None:
@@ -429,3 +528,111 @@ def test_a_configuration_not_run_on_the_current_sample_stops(study: optuna.Study
     assert (report.n, report.records, report.all_records) == (3, 3, 6)
     assert report.pick_trials == (3,)
     assert report.dsr == pytest.approx(0.98849, abs=5e-6)
+
+
+def test_affine_copies_report_n_hat_at_one_instead_of_raising(study: optuna.Study) -> None:
+    """Perfectly correlated trials: on macOS arm64 rho rounded to 1.0000000000000002 and N-hat to
+    0.9999999999999998, which skfolio refused with a bare ValueError after the gate's DSR was
+    computed. How rho rounds depends on the platform's arithmetic, so the next test fixes it."""
+    write(study, "pick", PICK)
+    affine = [value * 0.5 + 0.001 for value in PICK]
+    write(study, "affine", affine)
+
+    report = rank(study)
+
+    assert report.pick == "affine"
+    assert report.n_hat == pytest.approx(1.0, abs=1e-12)
+    assert report.n_hat is not None and report.n_hat >= 1.0
+    # Just above 1, the benchmark falls below 0 and the DSR at N-hat is withheld; at 1 it is the PSR.
+    undeflated = measures.probabilistic_sharpe_ratio(affine, 0.0)
+    assert report.dsr_at_n_hat is None or report.dsr_at_n_hat <= undeflated + 1e-12
+
+
+def test_a_mean_correlation_above_one_raises_n_hat_to_one(
+    study: optuna.Study, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write(study, "pick", PICK)
+    write(study, "affine", [value * 0.5 + 0.001 for value in PICK])
+    above_one = 1.0000000000000002
+    monkeypatch.setattr(
+        "canon_trading.ranking.measures.correlation",
+        lambda _: [[1.0, above_one], [above_one, 1.0]],
+    )
+
+    report = rank(study)
+
+    assert report.n_hat == 1.0
+    assert report.n_hat_note is not None
+    assert "N-hat 0.9999999999999998 raised to 1" in report.n_hat_note
+    assert report.n_hat_note in report.summary()
+
+
+def test_dsr_at_a_small_n_hat_is_withheld_not_inflated(study: optuna.Study) -> None:
+    """N-hat 1.003 gave a benchmark below 0 and a "DSR at N-hat" above the undeflated value."""
+    write(study, "pick", PICK)
+    write(study, "near", [v * 0.9 + 0.0002 * math.sin(i) for i, v in enumerate(PICK)])
+    write(study, "third", [v * 0.8 + 0.0003 * math.cos(i) for i, v in enumerate(PICK)])
+
+    report = rank(study)
+
+    assert report.n_hat is not None and 1 < report.n_hat < 1.28
+    assert report.dsr_at_n_hat is None
+    assert report.n_hat_note is not None and "withheld: its benchmark SR0" in report.n_hat_note
+    assert report.n_hat_note in report.summary()
+
+
+def test_an_empty_key_is_keyless_and_mark_not_run_clears_it(study: optuna.Study) -> None:
+    write(study, "pick", PICK)
+    write(study, "second", SECOND)
+    trial = study.ask()
+    trial.set_user_attr("config_key", "")
+
+    with pytest.raises(RankingStopped, match=rf"mark_not_run\(study, {trial.number}\)"):
+        rank(study)
+    mark_not_run(study, trial.number)
+    assert rank(study).n == 2
+
+
+def test_a_keyless_record_that_ran_cannot_be_marked_and_stops(study: optuna.Study) -> None:
+    """Marking it would drop a trial that ran from N, and a smaller N inflates the DSR."""
+    write(study, "pick", PICK)
+    write(study, "second", SECOND)
+    trial = study.ask()
+    trial.set_user_attr("returns_series", {str(DAY_0): 0.01})
+    trial.set_user_attr(OUTCOME, TRADED)
+    study.tell(trial, 0.0)
+
+    with pytest.raises(ValueError, match="shows a run"):
+        mark_not_run(study, trial.number)
+    with pytest.raises(RankingStopped, match=rf"#{trial.number} \(complete\)[^\n]*shows a run"):
+        rank(study)
+
+
+def test_a_data_digest_not_in_the_writers_shape_stops_naming_it(study: optuna.Study) -> None:
+    write(study, "pick", PICK)
+    odd = write(study, "odd", SECOND)
+    [trial] = [t for t in study.trials if t.number == odd]
+    study.add_trial(
+        optuna.trial.create_trial(
+            state=TrialState.COMPLETE,
+            value=0.0,
+            user_attrs={**trial.user_attrs, "config_key": "other", "data_digest": {"BT": ["x"]}},
+        )
+    )
+
+    with pytest.raises(RankingStopped, match=r"data_digest \{'BT': \['x'\]\} is not in the shape"):
+        rank(study)
+
+
+def test_returns_equal_but_for_rounding_around_zero_are_one_pick(study: optuna.Study) -> None:
+    """One day's return is 0.0 in one column and 1e-19 in its twin: the same returns, one pick."""
+    base = [0.0 if i == 5 else value for i, value in enumerate(PICK)]
+    twin_returns = [1e-19 if i == 5 else value for i, value in enumerate(base)]
+    first = write(study, "pick", base)
+    twin = write(study, "twin", twin_returns)
+    write(study, "second", SECOND)
+
+    report = rank(study)
+
+    assert {report.pick, *report.tied} == {"pick", "twin"}
+    assert report.pick_trials == (first, twin)

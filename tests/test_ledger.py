@@ -25,6 +25,7 @@ from datetime import datetime
 from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import optuna
@@ -55,6 +56,7 @@ from canon_trading.ledger import move_sample
 from canon_trading.ledger import open_study
 from canon_trading.ledger import record_trial
 from canon_trading.ledger import samples
+from canon_trading.ledger import session_day
 from canon_trading.ledger import trial_config
 from canon_trading.ma_cross import MaCrossConfig
 from canon_trading.ranking import RankingStopped
@@ -663,6 +665,102 @@ def test_a_sample_the_catalog_does_not_reach_is_refused_before_a_trial(
         record_trial(study, tmp_path / "catalog", [strategy()], starting_balances=BALANCES)
 
     assert study.trials == []
+
+
+@pytest.mark.parametrize("failing", ["config_key", "outcome"])
+def test_an_error_after_the_trial_is_asked_for_is_told_failed(
+    tmp_path: Path, stack: ExitStack, monkeypatch: pytest.MonkeyPatch, failing: str
+) -> None:
+    """A locked store on the first write, or on the outcome, left the record RUNNING for good."""
+    write_catalog(tmp_path / "catalog")
+    study = new_study(stack, tmp_path, "locked")
+    real = optuna.trial.Trial.set_user_attr
+
+    def locked(trial: optuna.trial.Trial, key: str, value: object) -> None:
+        if key == failing and value != FAILED:
+            raise OSError("database is locked")
+        real(trial, key, value)
+
+    monkeypatch.setattr(optuna.trial.Trial, "set_user_attr", locked)
+    with pytest.raises(OSError, match="database is locked"):
+        record_trial(study, tmp_path / "catalog", [strategy()], starting_balances=BALANCES)
+
+    [trial] = study.trials
+    assert (trial.state, trial.user_attrs[OUTCOME]) == (TrialState.FAIL, FAILED)
+    assert trial.user_attrs["error"] == "OSError: database is locked"
+
+
+def test_an_interrupt_during_the_run_is_told_failed(
+    tmp_path: Path, stack: ExitStack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_catalog(tmp_path / "catalog")
+    study = new_study(stack, tmp_path, "interrupted")
+
+    def interrupted(*_: object) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("canon_trading.ledger.run_backtest_config", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        record_trial(study, tmp_path / "catalog", [strategy()], starting_balances=BALANCES)
+
+    [trial] = study.trials
+    assert (trial.state, trial.user_attrs[OUTCOME]) == (TrialState.FAIL, FAILED)
+    assert "config_key" in trial.user_attrs
+
+
+def test_an_interrupt_just_after_the_tell_leaves_the_record_as_told(
+    tmp_path: Path, stack: ExitStack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_catalog(tmp_path / "catalog")
+    study = new_study(stack, tmp_path, "late interrupt")
+    real = optuna.Study.tell
+
+    def tell_then_interrupt(self: optuna.Study, *args: Any, **kwargs: Any) -> object:
+        real(self, *args, **kwargs)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(optuna.Study, "tell", tell_then_interrupt)
+    with pytest.raises(KeyboardInterrupt) as interrupted:
+        record_trial(study, tmp_path / "catalog", [strategy()], starting_balances=BALANCES)
+
+    [trial] = study.trials
+    assert (trial.state, trial.user_attrs[OUTCOME]) == (TrialState.COMPLETE, TRADED)
+    assert interrupted.value.__notes__ == [
+        f"trial #{trial.number} was already told COMPLETE; left as it is"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("ts", "day"),
+    [
+        pytest.param(DAY_NS * 20_160, DAY_NS * 20_159, id="exactly midnight"),
+        pytest.param(DAY_NS * 20_160 + 1, DAY_NS * 20_160, id="just after"),
+        pytest.param(DAY_NS * 20_161 - 1, DAY_NS * 20_160, id="just before the next"),
+        pytest.param(0, 0, id="the epoch"),
+    ],
+)
+def test_an_instant_at_utc_midnight_belongs_to_the_day_ending_there(ts: int, day: int) -> None:
+    assert session_day(ts) == day
+
+
+def test_daily_bars_stamped_at_utc_midnight_rank(tmp_path: Path, stack: ExitStack) -> None:
+    """Bars opening at 00:00 UTC are stamped available at the next midnight; the review found their
+    returns on days the ledger called closed, so every ranking of the study stopped."""
+    bars = write_bars(tmp_path / "catalog", CLOSES, first=datetime(2025, 3, 10, tzinfo=UTC))
+    assert all(bar.ts_init % DAY_NS == 0 for bar in bars)
+    study = new_study(stack, tmp_path, "midnight")
+    for fast, slow in ((3, 8), (2, 5)):
+        record_trial(
+            study,
+            tmp_path / "catalog",
+            [strategy(fast=fast, slow=slow)],
+            starting_balances=BALANCES,
+        )
+
+    report = rank(study)
+
+    assert (report.n, report.t) == (2, 40)
+    assert report.first_day == "2025-03-10"
 
 
 def _sharpe(values: list[float]) -> float:
