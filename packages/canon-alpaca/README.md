@@ -158,7 +158,7 @@ Each is stated where it is implemented, with its source.
 
 ## Tests
 
-`tests/` beside `src/`, run with pytest in `importlib` import mode from the repo root (`uv run pytest`).
+`tests/` beside `src/`, run with pytest in `importlib` import mode from the repo root (`uv run --locked pytest`).
 Upstream's template is covered by integration tests for factory registration, a market fill and shutdown.
 This slice has the two that apply to a data client, offline, plus a paper test:
 

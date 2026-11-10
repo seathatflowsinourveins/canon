@@ -16,12 +16,15 @@
       "Bash(scripts/ci --staged)",
       "Bash(./scripts/ci)",
       "Bash(scripts/test-hooks)",
+      "Bash(scripts/test-ci)",
+      "Bash(scripts/test-land)",
+      "Bash(scripts/test-lanes)",
       "Bash(scripts/canon selftest)",
       "Bash(uv lock --check)",
-      "Bash(uv run ruff *)",
-      "Bash(uv run ty check)",
-      "Bash(uv run pytest)",
-      "Bash(uv run pytest *)",
+      "Bash(uv run --locked ruff *)",
+      "Bash(uv run --locked ty check)",
+      "Bash(uv run --locked pytest)",
+      "Bash(uv run --locked pytest *)",
       "Bash(scripts/automation status)",
       "Bash(./scripts/automation status)",
       "Bash(scripts/lanes)",
@@ -74,7 +77,8 @@
             "type": "command",
             "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/guard.sh",
             "args": [],
-            "timeout": 10
+            "timeout": 10,
+            "onFailure": "block"
           }
         ]
       }

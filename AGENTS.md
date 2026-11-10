@@ -39,7 +39,7 @@ dependency, pattern and practice traces to a pinned upstream or a dated source. 
 | `scripts/canon outdated` | Show upstreams that have a newer release tag than the one pinned |
 | `scripts/canon resolve <id>` | Resolve one pin and merge it into the lock; without an id, re-resolve all (ask first) |
 | `uv sync` | Install exactly what `uv.lock` records into `.venv` |
-| `uv run pytest` | Run every test in the workspace |
+| `uv run --locked pytest` | Run every test in the workspace; the guard refuses `uv run` without `--locked` |
 | `scripts/lanes` | Report every Claude Code session on this machine: state, failures, spend |
 | `scripts/automation status` | Show every standing automation and whether it is healthy |
 | `scripts/survey-github report canon/github-practice.json` | Print what a measured sample of repositories converges on for pull requests and GitHub automation |
@@ -103,7 +103,8 @@ opens at most two grouped pull requests a week, for the indirect packages in `uv
 workflow's actions; the session brief lists the open ones (ADR 0016).
 
 `.claude/hooks/guard.sh` checks every tool call before it runs. For every session it refuses a commit that
-skips the gate, an install that bypasses `uv.lock`, and anything that points at live trading. For an
+skips the gate or changes git's hook settings, an install that bypasses `uv.lock` (a `uv run` without
+`--locked` included), and anything that points at live trading. For an
 unattended session it refuses everything except reading. If the guard refuses a call, do not look for
 another route: say what you wanted to do and why.
 
