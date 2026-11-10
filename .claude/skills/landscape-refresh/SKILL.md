@@ -14,11 +14,14 @@ Run these before reading anything on the web:
 
 1. `scripts/canon check`. `RETAGGED` means a pinned release tag now points at a different commit: a
    supply-chain warning. `advanced` means a tracked branch has new commits: normal. A failure to reach an
-   upstream is a finding; report it.
+   upstream (exit 1) is a finding; report it. `STALE` (exit 4) means the registry names another repo or
+   track than the lock, so that pin was not compared; report the ids and the fix, `scripts/canon resolve
+   <id>`, which only the owner approves.
 2. `scripts/canon outdated`. `NEWER` and `STABLE-AVAILABLE` rows are the upstreams with something to read.
 3. ADRs whose `review-by` is before today (the session-start lines name them).
 
-**If nothing is retagged, nothing is newer and no ADR has expired, say so in three lines and stop.** Do not
+**If `scripts/canon check` exited 0, nothing is newer and no ADR has expired, say so in three lines and
+stop.** Any other exit (1, 3 or 4) is a finding to report, never the "all current" case. Do not
 research for the sake of it.
 
 ## 2. Read only what the gate flagged

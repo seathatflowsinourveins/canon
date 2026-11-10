@@ -19,6 +19,7 @@
       "Bash(scripts/test-ci)",
       "Bash(scripts/test-land)",
       "Bash(scripts/test-lanes)",
+      "Bash(scripts/test-canon)",
       "Bash(scripts/canon selftest)",
       "Bash(uv lock --check)",
       "Bash(uv run --locked ruff *)",

@@ -1,0 +1,578 @@
+#!/bin/bash
+# test-canon — offline tests for scripts/canon and the canon hooks (canon-lint.sh, canon-watch.sh,
+# session-brief.sh). Each section works on a copy of the tree in a temp directory, with a fake `curl` first
+# on PATH that answers the Git smart-HTTP ref advertisement (https://git-scm.com/docs/gitprotocol-http) in
+# the shape refs_for reads. Its answers are prepared files, built once from a snapshot of the lock and
+# rebuilt when a section adds extra refs. Hooks get the documented stdin JSON
+# (https://code.claude.com/docs/en/hooks.md) with CLAUDE_PROJECT_DIR set. Sections run concurrently.
+#
+# Usage: scripts/test-canon [pattern]   run only the sections whose name contains pattern
+#        (names: baseline, registry validation, resolve keeps pins, stale pin, check exits, refs, evidence,
+#        workflows, broken pipe, outdated, network down, mise requests, resolve lock, lint hook,
+#        watch and brief)
+# Prints one line per case. Exit 0 if every case passes, 1 otherwise. TEST_CANON_VERBOSE=1 shows the
+# output of the command under test for a failing case.
+set -uo pipefail
+# A git hook runs with GIT_DIR, GIT_INDEX_FILE and similar set for the repository being committed to.
+# Clear every repository-local variable so git commands here act on the temp trees.
+while IFS= read -r v; do [ -n "$v" ] && unset "$v"; done <<<"$(git rev-parse --local-env-vars 2>/dev/null)"
+ONLY="${1:-}"
+SRC="$(cd "$(dirname "$0")/.." && pwd)"
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/canon-test-canon.XXXXXX") || exit 1
+TMP=$(cd "$TMP" && pwd -P)
+trap 'rm -rf "$TMP"' EXIT
+T="$TMP/canon"            # the tree under test sits in a directory named canon, as a checkout can
+SNAP="$TMP/lock.snap"
+EXTRA="$TMP/extra.tsv"    # extra refs the fake serves: "<repo>\t<ref>\t<sha>", listed before the lock's
+FAKE_DIR="$TMP/fake"
+cp "$SRC/canon/upstreams.lock.json" "$SNAP"
+mkdir -p "$TMP/bin"
+# The fake prints the prepared answer for the repo in the URL. FAKE_FAIL makes every fetch fail, as curl -f
+# does on an HTTP error. FAKE_PAD=<owner/repo> appends the padding file to that repo's answer.
+cat > "$TMP/bin/curl" <<'EOF'
+#!/bin/bash
+url=""; for a in "$@"; do url="$a"; done
+[ -z "${FAKE_FAIL:-}" ] || exit 22
+repo=${url#https://github.com/}; repo=${repo%%.git/info/refs*}
+f="$FAKE_DIR/${repo//\//__}"
+[ -f "$f" ] || exit 22
+cat "$f"
+[ "${FAKE_PAD:-}" != "$repo" ] || cat "$FAKE_DIR/pad"
+EOF
+chmod +x "$TMP/bin/curl"
+export PATH="$TMP/bin:$PATH" FAKE_DIR
+SHA_A=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+SHA_B=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+
+# fake_build: write one answer file per repo from the snapshot and $EXTRA, and the padding file. The padding
+# is 3000 tag lines (about 300 KB, past any pipe buffer) that each carry a symref token, so a reader that
+# stops at the first match leaves its writer with output it cannot deliver.
+fake_build() {
+  rm -rf "$FAKE_DIR"
+  if [ ! -s "$EXTRA" ] && [ -d "$TMP/fake.plain" ]; then cp -R "$TMP/fake.plain" "$FAKE_DIR"; return; fi
+  mkdir -p "$FAKE_DIR"
+  { jq -r '.pins[] | [.repo, "1", .default_branch] | @tsv' "$SNAP"
+    awk -F'\t' '{ print $1 "\t1\tmain" }' "$EXTRA"
+    awk -F'\t' '{ print $1 "\t2\t003f" $3 " " $2 }' "$EXTRA"
+    jq -r '.pins[] | [.repo, "3", "003f\(.default_sha) refs/heads/\(.default_branch)"], [.repo, "3", "003f\(.sha) \(.ref)"] | @tsv' "$SNAP"
+  } | awk -F'\t' -v d="$FAKE_DIR" '{ r = $1; gsub("/", "__", r); f = d "/" r
+        if ($2 == 1) { if (!(r in h)) { h[r] = 1
+            print "001e# service=git-upload-pack" > f
+            printf "0000%040d HEAD multi_ack symref=HEAD:refs/heads/%s agent=fake\n", 0, $3 > f } }
+        else print $3 > f }'
+  cp "$TMP/pad" "$FAKE_DIR/pad"
+}
+awk 'BEGIN { for (i = 0; i < 3000; i++) printf "003f%040d refs/tags/zz-0.0.%d symref=HEAD:refs/heads/main\n", 0, i }' \
+  > "$TMP/pad"
+: > "$EXTRA"; fake_build; cp -R "$FAKE_DIR" "$TMP/fake.plain"
+
+pass=0; fail=0; out=""
+# check <label> <command...>: passes when the command succeeds
+check() { local label="$1"; shift
+  if "$@"; then pass=$((pass+1)); echo "  pass  $label"
+  else fail=$((fail+1)); echo "  FAIL  $label"
+       [ -z "${TEST_CANON_VERBOSE:-}" ] || printf '%s\n' "$out" | awk 'NR <= 12 { print "        " $0 }'; fi; }
+has()   { case "$1" in *"$2"*) return 0 ;; esac; return 1; }   # has <text> <needle>
+lacks() { ! has "$1" "$2"; }
+same()  { cmp -s "$1" "$2"; }
+
+fresh() {
+  rm -rf "$T" "$W/wt" "$W/other" "$W/plain" "$W/link"; mkdir -p "$T/docs" "$T/.claude" "$T/.github"
+  cp -R "$SRC/scripts" "$SRC/canon" "$T/"
+  cp -R "$SRC/docs/adr" "$T/docs/"
+  cp -R "$SRC/.claude/hooks" "$T/.claude/"
+  cp -R "$SRC/.github/workflows" "$T/.github/"
+  cp "$SRC/mise.toml" "$SRC/mise.lock" "$SRC/uv.lock" "$T/"
+  : > "$EXTRA"; fake_build
+  cp "$SNAP" "$BEFORE"
+  unset FAKE_PAD FAKE_FAIL
+}
+BEFORE="$TMP/lock.before"   # the copy's lock as the section started, for "left as it was" cases
+# trim <id...>: keep only these entries in the copy's registry and lock, so a section that fetches every
+# upstream fetches a few
+trim() {
+  local k; k=$(printf '%s\n' "$@" | jq -R . | jq -sc .)
+  jq --argjson k "$k" '.upstreams |= map(select(.id as $i | $k | index($i)))' "$T/canon/upstreams.json" > "$W/r.json" \
+    && mv "$W/r.json" "$T/canon/upstreams.json"
+  jq --argjson k "$k" '.pins |= with_entries(select(.key as $i | $k | index($i)))' "$T/canon/upstreams.lock.json" > "$W/l.json" \
+    && mv "$W/l.json" "$T/canon/upstreams.lock.json"
+  cp "$T/canon/upstreams.lock.json" "$BEFORE"
+}
+TRIM=(superpowers madr dependabot nautilus-trader nautilus-trader-v1 mise mise-action actions-checkout)
+canon() { "$T/scripts/canon" "$@" 2>&1; }
+reg_edit() { jq "$1" "$T/canon/upstreams.json" > "$W/r.json" && mv "$W/r.json" "$T/canon/upstreams.json"; }
+gitq() { git -c user.name=test -c user.email=test@example.invalid -c core.hooksPath=/dev/null \
+             -c commit.gpgsign=false "$@"; }
+git_tree() { gitq -C "$1" init -q && gitq -C "$1" add -A && gitq -C "$1" commit -q -m fixture; }
+locked_sha() { jq -r --arg id "$1" '.pins[$id].sha' "$SNAP"; }
+lock_edit() { jq "$1" "$T/canon/upstreams.lock.json" > "$W/l.json" && mv "$W/l.json" "$T/canon/upstreams.lock.json"; }
+# fake_drop <owner/repo> <ref>: remove that ref's line from the repo's prepared answer, as if deleted upstream
+fake_drop() { local f="$FAKE_DIR/${1//\//__}"; awk -v r="$2" '$2 != r' "$f" > "$f.n" && mv "$f.n" "$f"; }
+# fp_of <tree>: the checksum canon-watch.sh records for that tree's registry and lock
+fp_of() { cat "$1/canon/upstreams.json" "$1/canon/upstreams.lock.json" | cksum | awk '{ print $1 "-" $2 }'; }
+
+sec_baseline() {
+  fresh
+  out=$(canon lint); rc=$?
+  check "lint is clean on an unchanged copy"                 test "$rc" -eq 0
+  out=$(canon check); rc=$?
+  check "check is current on an unchanged copy"              test "$rc" -eq 0
+}
+
+sec_registry_validation() {
+  fresh
+  printf '{ "upstreams": [ \n' > "$T/canon/upstreams.json"
+  out=$(canon resolve); rc=$?
+  check "resolve refuses an unparseable registry"            test "$rc" -ne 0
+  check "... and leaves the lock as it was"                  same "$T/canon/upstreams.lock.json" "$BEFORE"
+  out=$(canon check); rc=$?
+  check "check refuses an unparseable registry"              test "$rc" -ne 0
+  out=$(canon outdated --json); rc=$?
+  check "outdated --json refuses an unparseable registry"    test "$rc" -ne 0
+  echo '{"schema": 1}' > "$T/canon/upstreams.json"
+  out=$(canon resolve); rc=$?
+  check "resolve refuses a registry with no upstreams array" test "$rc" -ne 0
+  check "... and leaves the lock as it was"                  same "$T/canon/upstreams.lock.json" "$BEFORE"
+  fresh
+  reg_edit '.upstreams |= (map({key: .id, value: .}) | from_entries)'
+  out=$(canon check); rc=$?
+  check "check refuses upstreams given as an object"         test "$rc" -ne 0
+  out=$(canon lint); rc=$?
+  check "lint refuses upstreams given as an object"          test "$rc" -ne 0
+  echo '{"schema": 1, "upstreams": []}' > "$T/canon/upstreams.json"
+  out=$(canon check); rc=$?
+  check "check refuses an empty registry"                    test "$rc" -ne 0
+  fresh; trim "${TRIM[@]}"
+  reg_edit '.upstreams += ["not an entry"]'
+  out=$(canon check); rc=$?
+  check "check refuses an entry that is not an object"       test "$rc" -ne 0
+  check "... saying the registry must hold objects"          has "$out" "array of objects"
+  fresh; trim "${TRIM[@]}"
+  reg_edit '(.upstreams[] | select(.id == "superpowers") | .repo) = {}'
+  out=$(canon check); rc=$?
+  check "check stops when the registry rows cannot be read"  test "$rc" -ne 0
+  check "... saying so"                                      has "$out" "could not read the registry and canon/upstreams.lock.json together"
+  out=$(canon outdated); rc=$?
+  check "outdated stops when the registry rows cannot be read" test "$rc" -ne 0
+  check "... saying so"                                      has "$out" "could not read the registry with"
+}
+
+sec_resolve_keeps_pins() {
+  fresh; trim "${TRIM[@]}"
+  reg_edit 'del(.upstreams[] | select(.id == "superpowers"))'
+  out=$(canon resolve); rc=$?
+  check "full resolve refuses to drop a pin"                 test "$rc" -ne 0
+  check "... and leaves the lock as it was"                  same "$T/canon/upstreams.lock.json" "$BEFORE"
+  out=$(canon resolve --prune); rc=$?
+  check "resolve --prune writes the smaller lock"            test "$rc" -eq 0
+  check "... without the removed pin"                        test "$(jq '.pins | has("superpowers")' "$T/canon/upstreams.lock.json")" = "false"
+  fresh; trim "${TRIM[@]}"
+  reg_edit '(.upstreams[] | select(.id == "superpowers") | .id) = "superpowers-renamed"'
+  out=$(canon resolve); rc=$?
+  check "full resolve refuses a rename that drops a pin"     test "$rc" -ne 0
+  check "... naming the dropped id"                          has "$out" "drop the pins for: superpowers;"
+  check "... and leaves the lock as it was"                  same "$T/canon/upstreams.lock.json" "$BEFORE"
+}
+
+sec_stale_pin() {
+  fresh; trim "${TRIM[@]}"
+  reg_edit '(.upstreams[] | select(.id == "superpowers") | .track) = "tag:v7.0.3"'
+  printf 'obra/superpowers\trefs/tags/v7.0.3\t%s\n' "$SHA_A" > "$EXTRA"; fake_build
+  out=$(canon lint); rc=$?
+  check "lint fails when lock and registry tracks differ"    test "$rc" -ne 0
+  check "... naming the id and the resolve to run"           has "$out" "run: scripts/canon resolve superpowers"
+  out=$(canon check); rc=$?
+  check "check exits 4 for a stale pin"                      test "$rc" -eq 4
+  check "... reporting it STALE"                             has "$out" "STALE"
+  check "... not RETAGGED"                                   lacks "$out" "RETAGGED"
+  fresh; trim "${TRIM[@]}"
+  reg_edit '(.upstreams[] | select(.id == "superpowers") | .repo) = "obra/superpowers-fork"'
+  out=$(canon check); rc=$?
+  check "check exits 4 when only the repo changed"           test "$rc" -eq 4
+  check "... reporting it STALE"                             has "$out" "STALE     superpowers"
+  out=$(canon lint); rc=$?
+  check "lint fails when only the repo changed"              test "$rc" -ne 0
+  check "... naming the resolve to run"                      has "$out" "run: scripts/canon resolve superpowers"
+  fresh; trim "${TRIM[@]}"
+  reg_edit '.upstreams += [(.upstreams[] | select(.id == "madr") | .id = "madr-twin")]'
+  out=$(canon check); rc=$?
+  check "check fails on an entry with no pin"                test "$rc" -eq 1
+  check "... reporting it UNPINNED"                          has "$out" "UNPINNED  madr-twin"
+  fresh; trim "${TRIM[@]}"
+  lock_edit '.pins.superpowers.sha = "abc"'
+  out=$(canon lint); rc=$?
+  check "lint fails on a pin that is not 40 hex"             test "$rc" -ne 0
+  check "... naming it"                                      has "$out" "superpowers has no 40-hex pin"
+}
+
+# Exit codes when several findings apply: 1 (unreadable), then 3 (retagged), then 4 (stale). A line the
+# fake lists before the lock's wins, as the first line for a ref does upstream.
+sec_check_exits() {
+  fresh; trim "${TRIM[@]}"
+  printf 'adr/madr\trefs/tags/4.0.0\t%s\n' "$SHA_A" > "$EXTRA"; fake_build
+  out=$(canon check); rc=$?
+  check "a tag listed twice is read from its first line"     test "$rc" -eq 3
+  check "... reporting it RETAGGED"                          has "$out" "RETAGGED  madr"
+  reg_edit '(.upstreams[] | select(.id == "superpowers") | .track) = "tag:v7.0.3"'
+  out=$(canon check); rc=$?
+  check "retagged and stale: exit 3"                         test "$rc" -eq 3
+  rm -f "$FAKE_DIR/jdx__mise"
+  out=$(canon check); rc=$?
+  check "unreadable, retagged and stale: exit 1"             test "$rc" -eq 1
+  : > "$EXTRA"; fake_build; rm -f "$FAKE_DIR/jdx__mise"
+  out=$(canon check); rc=$?
+  check "unreadable and stale: exit 1"                       test "$rc" -eq 1
+}
+
+sec_refs() {
+  fresh; trim "${TRIM[@]}"
+  printf 'adr/madr\trefs/tags/4.0.0\t%s\n' "${SHA_A:0:39}" > "$EXTRA"; fake_build
+  out=$(canon check); rc=$?
+  check "a ref line with a 39-hex sha is not read"           test "$rc" -eq 0
+  check "... so the pin stays current"                       has "$out" "current   madr"
+  fresh; trim "${TRIM[@]}"
+  fake_drop adr/madr refs/tags/4.0.0
+  out=$(canon check); rc=$?
+  check "a pinned tag deleted upstream fails the check"      test "$rc" -eq 1
+  check "... as a ref gone, not RETAGGED"                    has "$out" "madr (adr/madr tag:4.0.0) unreachable or ref gone"
+  fresh; trim "${TRIM[@]}"
+  fake_drop adr/madr refs/heads/develop
+  out=$(canon check); rc=$?
+  check "a default branch with no ref line fails the check"  test "$rc" -eq 1
+  out=$(canon resolve madr); rc=$?
+  check "... and resolve"                                    test "$rc" -ne 0
+  check "... leaving the lock as it was"                     same "$T/canon/upstreams.lock.json" "$BEFORE"
+  # an annotated tag: the tag name points at the tag object and "^{}" at the commit
+  fresh; trim "${TRIM[@]}"
+  reg_edit '(.upstreams[] | select(.id == "superpowers") | .track) = "tag:v7.0.3"'
+  printf 'obra/superpowers\trefs/tags/v7.0.3\t%s\nobra/superpowers\trefs/tags/v7.0.3^{}\t%s\n' "$SHA_B" "$SHA_A" > "$EXTRA"; fake_build
+  out=$(canon resolve superpowers); rc=$?
+  check "resolve pins an annotated tag"                      test "$rc" -eq 0
+  check "... to the commit, not the tag object"              test "$(jq -r '.pins.superpowers | .ref + " " + .sha' "$T/canon/upstreams.lock.json")" = "refs/tags/v7.0.3 $SHA_A"
+  # an id listed twice is refused by `resolve <id>`
+  fresh; trim "${TRIM[@]}"
+  reg_edit '.upstreams += [(.upstreams[] | select(.id == "madr"))]'
+  out=$(canon resolve madr); rc=$?
+  check "resolve <id> refuses an id listed twice"            test "$rc" -ne 0
+  check "... saying so"                                      has "$out" "resolved 2 entries for id 'madr'; lock NOT written"
+  check "... and leaves the lock as it was"                  same "$T/canon/upstreams.lock.json" "$BEFORE"
+}
+
+sec_evidence() {
+  fresh
+  { printf -- '---\nstatus: accepted\nreview-by: 2099-01-01\n---\n\n# Big\n\n## Evidence\n\n* https://example.org/source\n'
+    awk 'BEGIN { for (i = 0; i < 20000; i++) printf "* note %d, a line of text that makes the section long\n", i }'
+  } > "$T/docs/adr/0999-big.md"
+  out=$(canon lint); rc=$?
+  check "a long Evidence section with a URL passes"          test "$rc" -eq 0
+  printf -- '---\nstatus: accepted\nreview-by: 2099-01-01\n---\n\n## Evidence\n\n* no link here\n\n## Other\n\nhttps://example.org/\n' \
+    > "$T/docs/adr/0998-none.md"
+  out=$(canon lint)
+  check "an Evidence section with no URL fails"              has "$out" "0998-none.md Evidence section cites no URL"
+  rm -f "$T/docs/adr/0998-none.md" "$T/docs/adr/0999-big.md"
+  E='## Evidence\n\n* https://example.org/\n'
+  adr() { printf '%b' "$2" > "$T/docs/adr/$1.md"; }
+  adr 0990-nostatus   "---\nreview-by: 2099-01-01\n---\n\n$E"
+  adr 0991-noreview   "---\nstatus: accepted\n---\n\n$E"
+  adr 0992-noheading  "---\nstatus: accepted\nreview-by: 2099-01-01\n---\n\nhttps://example.org/\n"
+  adr 0993-fenced     "---\nstatus: accepted\nreview-by: 2099-01-01\n---\n\n\0140\0140\0140\n$E\0140\0140\0140\n"
+  adr 0994-innerhead  "---\nstatus: accepted\nreview-by: 2099-01-01\n---\n\n## Evidence\n\n\0140\0140\0140\n## not a heading\n\0140\0140\0140\n\n* https://example.org/\n"
+  adr 0995-less       "---\nstatus: accepted\nreview-by: 2099-01-01\n---\n\n## Evidenceless\n\n* https://example.org/\n"
+  adr 0996-bodyreview "---\nstatus: accepted\n---\n\nreview-by: 2099-01-01\n\n$E"
+  adr 0987-bodystatus "---\nreview-by: 2099-01-01\n---\n\nstatus: accepted\n\n$E"
+  adr 0997-crlf       "---\r\nstatus: accepted\r\nreview-by: 2099-01-01\r\n---\r\n\r\n## Evidence\r\n\r\n* https://example.org/\r\n"
+  : > "$T/docs/adr/0989-empty.md"
+  out=$(canon lint); rc=$?
+  check "lint fails on these ADRs"                           test "$rc" -eq 1
+  check "a missing status is reported"                       has "$out" "0990-nostatus.md missing front-matter 'status:'"
+  check "a missing review-by is reported"                    has "$out" "0991-noreview.md missing front-matter 'review-by:'"
+  check "a missing Evidence heading is reported"             has "$out" "0992-noheading.md missing '## Evidence' section"
+  check "an Evidence heading inside a fence is not one"      has "$out" "0993-fenced.md missing '## Evidence' section"
+  check "a heading inside a fence does not end Evidence"     lacks "$out" "0994-innerhead.md"
+  check "## Evidenceless is not the Evidence heading"        has "$out" "0995-less.md missing '## Evidence' section"
+  check "review-by: in the body does not count"              has "$out" "0996-bodyreview.md missing front-matter 'review-by:'"
+  check "status: in the body does not count"                 has "$out" "0987-bodystatus.md missing front-matter 'status:'"
+  check "an ADR with CRLF line endings passes"               lacks "$out" "0997-crlf.md"
+  check "an empty ADR is reported"                           has "$out" "0989-empty.md is empty"
+  rm -f "$T"/docs/adr/09[89]*.md
+  # an unreadable ADR is one lint error, and the later sections still run
+  adr 0988-locked "---\nstatus: accepted\nreview-by: 2099-01-01\n---\n\n$E"; chmod 000 "$T/docs/adr/0988-locked.md"
+  printf 'on: push\njobs:\n  a:\n    runs-on: ubuntu-24.04\n    steps:\n      - uses: actions/checkout@v4\n' > "$T/.github/workflows/extra.yml"
+  out=$(canon lint); rc=$?
+  check "an unreadable ADR fails lint with exit 1"           test "$rc" -eq 1
+  check "... naming it"                                      has "$out" "0988-locked.md is not readable"
+  check "... and the workflow section still runs"            has "$out" "lint: .github/workflows/extra.yml line"
+  chmod 644 "$T/docs/adr/0988-locked.md"
+}
+
+sec_workflows() {
+  CO=$(locked_sha actions-checkout); MA=$(locked_sha mise-action)
+  MV=$(jq -r '.upstreams[] | select(.id == "mise") | .track' "$SRC/canon/upstreams.json"); MV=${MV#tag:v}
+  HEAD_YAML="on: push
+jobs:
+  a:
+    runs-on: ubuntu-24.04
+    steps:"
+  fresh
+  wf_case() { # wf_case <label> <file name> <steps> <want: pass|fail>
+    printf '%s\n%s\n' "$HEAD_YAML" "$3" > "$T/.github/workflows/$2"
+    out=$(canon lint); local rc=$?
+    rm -f "$T/.github/workflows/$2"
+    if [ "$4" = pass ]; then check "$1" test "$rc" -eq 0; else check "$1" test "$rc" -ne 0; fi
+  }
+  wf_case "a .yaml workflow is checked" extra.yaml "      - uses: actions/checkout@v4" fail
+  wf_case "a flow-style step fails" extra.yml "      - {uses: actions/checkout@v4}" fail
+  wf_case "a quoted uses key fails" extra.yml "      - \"uses\": actions/checkout@$CO" fail
+  wf_case "a folded uses value fails" extra.yml "      - uses: >-
+          actions/checkout@v4" fail
+  wf_case "the mise version is read from the mise-action step" extra.yml "      - uses: jdx/mise-action@$MA # v5
+        with:
+          version: 2000.1.1
+      - uses: actions/checkout@$CO
+        with:
+          version: $MV" fail
+  wf_case "strict block-style steps pass" extra.yaml "      # a comment that uses the word uses
+      - uses: actions/checkout@$CO # v7
+      - name: mise
+        uses: jdx/mise-action@$MA
+        with:
+          version: \"$MV\"
+      - uses: ./.github/actions/local
+      - uses: docker://alpine:3.20" pass
+  wf_case "the word uses outside a key passes" extra.yml "      - name: Check what the workflow uses
+        run: echo ok # uses nothing" pass
+  wf_case "an action pinned to another commit than the lock fails" extra.yml "      - uses: actions/checkout@$MA" fail
+  wf_case "a mise-action step with no with.version fails" extra.yml "      - uses: jdx/mise-action@$MA" fail
+  wf_case "uses inside a run block is text, not a key" extra.yml "      - run: |
+          echo 'a, uses: b'
+          cat <<EOT
+
+          uses: c
+          EOT
+        shell: bash
+      - uses: actions/checkout@$CO" pass
+  wf_case "a step after a run block is still checked" extra.yml "      - run: >-
+          echo uses: b
+      - uses: actions/checkout@v4" fail
+  wf_case "a comment that ends like a block scalar hides nothing" extra.yml "      - uses: actions/checkout@$CO
+  second: # one item per line, format: |
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4" fail
+  wf_case "a block scalar with a trailing comment is still skipped" extra.yml "      - run: | # prints text
+          echo uses: b
+      - uses: actions/checkout@$CO" pass
+  wf_case "a uses key with no space after the colon fails" extra.yml "      - uses:docker://alpine:3.20" fail
+  wf_case "a 39-hex commit is not read as a pin" extra.yml "      - uses: actions/checkout@${CO:0:39}" fail
+  check "... it is reported as not block-style"              has "$out" "write each action as a block-style"
+  printf 'name: >-\n  Watch\n%s\n      - uses: actions/checkout@v4\n' "$HEAD_YAML" > "$T/.github/workflows/extra.yml"
+  out=$(canon lint); rc=$?; rm -f "$T/.github/workflows/extra.yml"
+  check "a block scalar ends at the next key at its indent"  test "$rc" -ne 0
+}
+
+sec_broken_pipe() {
+  # SIGPIPE is ignored in the parent before the command starts, as on a CI runner, so a writer whose
+  # reader stopped early gets EPIPE and reports it instead of being killed quietly.
+  fresh; trim "${TRIM[@]}"
+  n=$(jq '[.upstreams[] | select(.repo != null)] | length' "$T/canon/upstreams.json")
+  export FAKE_PAD=obra/superpowers
+  out=$(trap '' PIPE; "$T/scripts/canon" check 2>&1); rc=$?
+  check "check with SIGPIPE ignored and a long ref list exits 0" test "$rc" -eq 0
+  check "... with every upstream current"                    has "$out" "canon: $n checked, 0 retagged, 0 branch-tracked advanced, 0 stale, 0 failed"
+  check "... and no broken pipe reported"                    lacks "$out" "roken pipe"
+  out=$(trap '' PIPE; "$T/scripts/canon" outdated --json 2>&1); rc=$?
+  check "outdated --json with SIGPIPE ignored exits 0"       test "$rc" -eq 0
+  check "... with superpowers current"                       test "$(jq -r '.[] | select(.id == "superpowers") | .status' <<<"$out" 2>/dev/null)" = "current"
+  out=$(trap '' PIPE; "$T/scripts/canon" resolve superpowers 2>&1); rc=$?
+  check "resolve with SIGPIPE ignored exits 0"               test "$rc" -eq 0
+  check "... pinning the same commit"                        test "$(jq -r '.pins.superpowers | .sha + " " + .default_sha' "$T/canon/upstreams.lock.json")" \
+                                                                = "$(jq -r '.pins.superpowers | .sha + " " + .default_sha' "$SNAP")"
+  check "... and no broken pipe reported"                    lacks "$out" "roken pipe"
+  unset FAKE_PAD
+}
+
+sec_outdated() {
+  fresh; trim "${TRIM[@]}"
+  printf 'nautechsystems/nautilus_trader\trefs/tags/v2.0.0\t%s\nnautechsystems/nautilus_trader\trefs/tags/v2.1.0rc1\t%s\n' \
+    "$SHA_A" "$SHA_B" > "$EXTRA"; fake_build
+  out=$(canon outdated); rc=$?
+  row=$(printf '%s\n' "$out" | awk '$1 == "nautilus-trader"')
+  check "the table names the stable release for STABLE-AVAILABLE" has "$row" "v2.0.0 "
+  check "... with that status"                               has "$row" "STABLE-AVAILABLE"
+  check "... not the later pre-release"                      lacks "$row" "v2.1.0rc1"
+}
+
+sec_network_down() {
+  fresh; trim "${TRIM[@]}"
+  export FAKE_FAIL=1
+  out=$(canon check); rc=$?
+  check "check fails when upstream cannot be read"           test "$rc" -eq 1
+  out=$(canon outdated); rc=$?
+  check "outdated fails when upstream cannot be read"        test "$rc" -ne 0
+  check "... with UNREACHABLE rows"                          has "$out" "UNREACHABLE"
+  out=$("$T/scripts/canon" outdated --json 2>/dev/null); rc=$?
+  check "outdated --json fails when upstream cannot be read" test "$rc" -ne 0
+  check "... with every row UNREACHABLE"                     test "$(jq '(length > 0) and all(.[]; .status == "UNREACHABLE")' <<<"$out" 2>/dev/null)" = "true"
+  out=$(canon resolve superpowers); rc=$?
+  check "resolve <id> fails when upstream cannot be read"    test "$rc" -ne 0
+  check "... saying the lock is not written"                 has "$out" "lock NOT written"
+  check "... and leaves the lock as it was"                  same "$T/canon/upstreams.lock.json" "$BEFORE"
+  out=$(canon resolve); rc=$?
+  check "a full resolve fails when upstream cannot be read"  test "$rc" -ne 0
+  check "... and leaves the lock as it was"                  same "$T/canon/upstreams.lock.json" "$BEFORE"
+  git_tree "$T"
+  jq -cn --arg c "$T" '{hook_event_name:"SessionStart", cwd:$c}' \
+    | CLAUDE_PROJECT_DIR="$T" "$T/.claude/hooks/canon-watch.sh" >/dev/null 2>&1
+  check "the watch records ok:false"                         test "$(jq -r '.ok' "$T/.canon/watch.json" 2>/dev/null)" = "false"
+  unset FAKE_FAIL
+}
+
+sec_mise_requests() {
+  fresh
+  reg_edit '.upstreams += [{id: "gh", field: "toolchain", repo: "cli/cli", track: "tag:v2.103.3", role: "tool",
+    license: "MIT", why: "test", evidence: ["https://example.org/"], adr: "0008", mise: "gh"},
+    {id: "python", field: "toolchain", repo: "python/cpython", track: "tag:v3.14.10", line: "v3.14.", role: "tool",
+    license: "PSF-2.0", why: "test", evidence: ["https://example.org/"], adr: "0008", mise: "python"}]'
+  printf 'cli/cli\trefs/heads/main\t%s\ncli/cli\trefs/tags/v2.103.3\t%s\npython/cpython\trefs/heads/main\t%s\npython/cpython\trefs/tags/v3.14.10\t%s\n' \
+    "$SHA_A" "$SHA_A" "$SHA_A" "$SHA_A" > "$EXTRA"; fake_build
+  out=$(canon resolve gh && canon resolve python); rc=$?
+  check "resolve <id> adds a new pin"                        test "$rc" -eq 0
+  out=$(canon lint); rc=$?
+  check "a latest and a line request match through mise.lock" test "$rc" -eq 0
+  awk '/^\[\[tools\.python\]\]/ { p = 1 } p && $1 == "version" { $0 = "version = \"3.14.11\""; p = 0 } { print }' \
+    "$T/mise.lock" > "$W/m" && mv "$W/m" "$T/mise.lock"
+  out=$(canon lint)
+  check "a line request fails when mise.lock has another release" has "$out" "mise.lock records '3.14.11' for python"
+}
+
+sec_resolve_lock() {
+  fresh
+  mkdir "$T/canon/upstreams.lock.json.held"
+  out=$(canon resolve superpowers); rc=$?
+  check "resolve refuses while another holds the lock"       test "$rc" -ne 0
+  check "... saying so"                                      has "$out" "holds canon/upstreams.lock.json.held"
+  check "... and leaves the lock as it was"                  same "$T/canon/upstreams.lock.json" "$BEFORE"
+  rmdir "$T/canon/upstreams.lock.json.held"
+  mkdir "$T/canon/upstreams.lock.json.tmp"
+  out=$(canon resolve superpowers); rc=$?
+  check "a leftover upstreams.lock.json.tmp does not block"  test "$rc" -eq 0
+  check "... and the lock is written"                        test "$(jq -r '.pins.superpowers.resolved_at' "$T/canon/upstreams.lock.json")" != \
+                                                                  "$(jq -r '.pins.superpowers.resolved_at' "$SNAP")"
+  left=$(find "$T/canon" -name 'upstreams.lock.json.*' ! -name 'upstreams.lock.json.tmp' | wc -l | tr -d ' ')
+  check "resolve leaves no lock directory or temp file"      test "$left" = "0"
+}
+
+sec_lint_hook() {
+  fresh; git_tree "$T"
+  reg_edit '(.upstreams[] | select(.id == "superpowers") | .track) = "tag:v7.0.3"'
+  lint_hook() { local h="$T/.claude/hooks/canon-lint.sh"; [ -x "$h" ] || h="$W/plain/.claude/hooks/canon-lint.sh"
+    out=$(jq -cn --arg p "$1" '{hook_event_name:"PostToolUse", tool_name:"Edit", tool_input:{file_path:$p}}' \
+          | CLAUDE_PROJECT_DIR="$2" "$h" 2>&1); }
+  lint_hook "$T/README.md" "$T"; rc=$?
+  check "an edit outside canon/ in a tree named canon is not linted" test "$rc" -eq 0
+  lint_hook "$T/canon/upstreams.json" "$T"; rc=$?
+  check "an edit under canon/ is linted"                     test "$rc" -eq 2
+  lint_hook "$T/docs/adr/0001-canon-first.md" "$T"; rc=$?
+  check "an edit under docs/adr/ is linted"                  test "$rc" -eq 2
+  mkdir -p "$W/other/docs/adr"; echo x > "$W/other/docs/adr/0001-x.md"; git_tree "$W/other"
+  lint_hook "$W/other/docs/adr/0001-x.md" "$T"; rc=$?
+  check "an edit in another repository's docs/adr/ is left alone" test "$rc" -eq 0
+  rm -rf "$T/.git"; mv "$T" "$W/plain"; ln -s "$W/plain" "$W/link"
+  lint_hook "$W/link/canon/upstreams.json" "$W/plain"; rc=$?
+  check "outside git, an edit through a symlinked path is linted" test "$rc" -eq 2
+  rm -f "$W/link"; mv "$W/plain" "$T"
+}
+
+sec_watch_and_brief() {
+  fresh; trim "${TRIM[@]}"; git_tree "$T"
+  gitq -C "$T" worktree add -q -b wt-test "$W/wt" 2>/dev/null
+  mkdir -p "$T/.canon"
+  jq -n --arg fp "$(fp_of "$T")" '{checked_at: "2026-11-10T06:00:00Z", checked_at_epoch: 0, registry: $fp, ok: true,
+     retagged: [], advanced: [], stale: [], bot_prs: [], errors: [],
+     newer: [{id: "nt", role: "foundation", pinned: "v2.0.0rc8", status: "STABLE-AVAILABLE",
+              newest: "v2.1.0rc1", newest_stable: "v2.0.0"}]}' > "$T/.canon/watch.json"
+  brief() { jq -cn --arg c "$1" '{hook_event_name:"SessionStart", cwd:$c}' \
+    | CLAUDE_PROJECT_DIR="$1" "$T/.claude/hooks/session-brief.sh" 2>&1; }
+  watch() { jq -cn --arg c "$1" '{hook_event_name:"SessionStart", cwd:$c}' \
+    | CLAUDE_PROJECT_DIR="$1" "$1/.claude/hooks/canon-watch.sh" >/dev/null 2>&1; }
+  out=$(brief "$T")
+  check "the brief names the stable release for STABLE-AVAILABLE" has "$out" "v2.0.0 (stable now available)"
+  check "... not the later pre-release"                      lacks "$out" "v2.1.0rc1"
+  out=$(brief "$W/wt")
+  check "a worktree's brief does not show the main checkout's watch" lacks "$out" "landscape watch 2026-11-10"
+  jq '.registry = "1-1"' "$T/.canon/watch.json" > "$W/w.json" && mv "$W/w.json" "$T/.canon/watch.json"
+  out=$(brief "$T")
+  check "a result for another registry is not shown"         lacks "$out" "newer release"
+  check "... and the brief says why"                         has "$out" "was for another registry or lock"
+  watch "$T"
+  check "... and the watch runs again at once"               test "$(jq -r '.registry' "$T/.canon/watch.json")" = "$(fp_of "$T")"
+  # a worktree with a stale pin keeps its own result, and the main checkout's is untouched
+  rm -f "$T/.canon/watch.json"
+  (cd "$W/wt" && jq '(.upstreams[] | select(.id == "superpowers") | .track) = "tag:v7.0.1"' canon/upstreams.json > r.json \
+     && mv r.json canon/upstreams.json)
+  watch "$W/wt"
+  check "a worktree's watch writes its own watch.json"       test -f "$W/wt/.canon/watch.json"
+  check "... and none in the main checkout"                  test ! -e "$T/.canon/watch.json"
+  check "... recording the stale pin"                        test "$(jq -c '.stale' "$W/wt/.canon/watch.json" 2>/dev/null)" = '["superpowers"]'
+  check "... as a complete run"                              test "$(jq -r '.ok' "$W/wt/.canon/watch.json" 2>/dev/null)" = "true"
+  out=$(brief "$W/wt")
+  check "the worktree's brief names the stale pin"           has "$out" "LOCK STALE for superpowers"
+  check "... and the fix"                                    has "$out" "scripts/canon resolve <id>"
+  check "... not as an incomplete run"                       lacks "$out" "INCOMPLETE"
+  out=$(brief "$T")
+  check "the main checkout's brief does not show it"         lacks "$out" "superpowers"
+  # a run with a stale pin is not repeated within the day: with upstream unreachable, a rerun would record ok:false
+  jq --argjson e "$(( $(date -u +%s) - 7200 ))" '.checked_at_epoch = $e' "$W/wt/.canon/watch.json" > "$W/w.json" \
+    && mv "$W/w.json" "$W/wt/.canon/watch.json"
+  FAKE_FAIL=1 watch "$W/wt"
+  check "a stale pin does not make the watch run again within the day" test "$(jq -r '.ok' "$W/wt/.canon/watch.json")" = "true"
+  # a pin the release rule cannot rank is carried into the watch and the brief
+  (cd "$W/wt" && jq '(.upstreams[] | select(.id == "superpowers") | .track) = "tag:v7.0.2.1"' canon/upstreams.json > r.json \
+     && mv r.json canon/upstreams.json)
+  printf 'obra/superpowers\trefs/tags/v7.0.2.1\t%s\n' "$SHA_A" > "$EXTRA"; fake_build
+  out=$("$W/wt/scripts/canon" resolve superpowers 2>&1); rc=$?
+  check "a four-part pin can be resolved"                    test "$rc" -eq 0
+  watch "$W/wt"
+  check "a changed registry makes the watch run again"       test "$(jq -c '.stale' "$W/wt/.canon/watch.json" 2>/dev/null)" = '[]'
+  check "the watch records an unparseable pin"               test "$(jq -c '.unparseable' "$W/wt/.canon/watch.json" 2>/dev/null)" = '[{"id":"superpowers","pinned":"v7.0.2.1"}]'
+  out=$(brief "$W/wt")
+  check "the brief reports it"                               has "$out" "1 pin(s) the release rule cannot rank"
+  # the brief reads status and review-by from the front matter only, and ignores CRLF line endings
+  printf -- '---\r\nstatus: proposed\r\nreview-by: 2099-01-01\r\n---\r\n' > "$T/docs/adr/0997-crlf.md"
+  printf -- '---\nstatus: accepted\n---\n\nreview-by: 2000-01-01\n' > "$T/docs/adr/0996-body.md"
+  out=$(brief "$T")
+  check "the brief lists a CRLF ADR that is proposed"        has "$(printf "%s\n" "$out" | grep "still proposed")" " 0997"
+  check "the brief ignores a review-by in the body"          lacks "$out" "0996"
+}
+
+# Each section runs in the background in its own work directory (W, T, EXTRA, FAKE_DIR, BEFORE), so the
+# sections can run at once. Their lines are printed in order once all have finished.
+SECTIONS="baseline registry_validation resolve_keeps_pins stale_pin check_exits refs evidence workflows broken_pipe
+          outdated network_down mise_requests resolve_lock lint_hook watch_and_brief"
+pids=""; ran=""
+for s in $SECTIONS; do
+  name=${s//_/ }
+  [ -z "$ONLY" ] || has "$name" "$ONLY" || continue
+  ran="$ran $s"
+  (
+    W="$TMP/run.$s"; mkdir -p "$W"
+    T="$W/canon"; EXTRA="$W/extra.tsv"; FAKE_DIR="$W/fake"; BEFORE="$W/lock.before"; export FAKE_DIR
+    pass=0; fail=0
+    "sec_$s"
+    echo "#counts $pass $fail"
+  ) > "$TMP/out.$s" 2>&1 &
+  pids="$pids $!"
+done
+for p in $pids; do wait "$p"; done
+pass=0; fail=0
+for s in $ran; do
+  counts=""
+  while IFS= read -r line; do
+    case "$line" in "#counts "*) counts=${line#"#counts "} ;; *) printf '%s\n' "$line" ;; esac
+  done < "$TMP/out.$s"
+  if [ -z "$counts" ]; then fail=$((fail+1)); echo "  FAIL  section ${s//_/ } did not finish"; continue; fi
+  read -r p f <<<"$counts"; pass=$((pass+p)); fail=$((fail+f))
+done
+[ -n "$ran" ] || { echo "test-canon: no section matches '$ONLY'"; exit 1; }
+echo "test-canon: $pass passed, $fail failed"
+[ "$fail" -eq 0 ]

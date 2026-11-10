@@ -137,9 +137,12 @@ echo '{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"canon-wat
 : > "$R/.github/dependabot.yml"; : > "$R/.github/workflows/watch.yml"; : > "$AH/scheduled-tasks/canon-landscape-refresh/SKILL.md"
 git -C "$R" init -q && git -C "$R" config core.hooksPath .githooks && git -C "$R" remote add origin https://github.com/example/repo.git
 jq -n --arg at "$(iso "$NOW")" '{checked_at: $at, ok: true, sessions: 1, flagged_now: 0, ledger_kb: 1}' > "$AH/canon/watch/lanes-status.json"
+mkdir -p "$R/canon"; echo '{"upstreams": []}' > "$R/canon/upstreams.json"; echo '{"pins": {}}' > "$R/canon/upstreams.lock.json"
+# the checksum canon-watch.sh records for the tree's registry and lock
+FP=$(cat "$R/canon/upstreams.json" "$R/canon/upstreams.lock.json" | cksum | awk '{ print $1 "-" $2 }')
 watchjson() { # watchjson <age in seconds> <ok> [extra jq]
-  jq -n --arg at "$(iso $((NOW - $1)))" --argjson e $((NOW - $1)) --argjson ok "$2" \
-    "{checked_at: \$at, checked_at_epoch: \$e, ok: \$ok, newer: [], advanced: [], retagged: [], bot_prs: [], errors: []} ${3:-}" > "$R/.canon/watch.json"
+  jq -n --arg at "$(iso $((NOW - $1)))" --argjson e $((NOW - $1)) --argjson ok "$2" --arg fp "$FP" \
+    "{checked_at: \$at, checked_at_epoch: \$e, registry: \$fp, ok: \$ok, newer: [], advanced: [], retagged: [], stale: [], bot_prs: [], errors: []} ${3:-}" > "$R/.canon/watch.json"
 }
 runs() { jq -n --arg at "$(iso "$NOW")" --arg s "$1" "[{createdAt: \$at, status: \$s} + $2]" > "$STUB/gh-runs.json"; }
 printf '\tstate = not running\n\truns = 3\n\tlast exit code = 0\n' > "$STUB/launchctl-print"
@@ -151,6 +154,13 @@ watchjson 60 false; status; rc=$?
 check "landscape watch not ok: INCOMPLETE, exit 1" eval 'rowis "$TMP/status.out" "landscape watch" INCOMPLETE && [ "$rc" != 0 ]'
 watchjson $((5 * 86400)) true; status; rc=$?
 check "landscape watch days old: STALE, exit 1"   eval 'rowis "$TMP/status.out" "landscape watch" STALE && [ "$rc" != 0 ]'
+watchjson 60 true '| .stale = ["superpowers"]'; status; rc=$?
+check "stale lock: STALE-LOCK, exit 1"            eval 'rowis "$TMP/status.out" "landscape watch" STALE-LOCK && [ "$rc" != 0 ]'
+check "... naming the id and the resolve to run"  grep -q 'stale for superpowers.*scripts/canon resolve superpowers' "$TMP/status.out"
+check "... not as an incomplete run"              eval '! grep -q "could not check everything" "$TMP/status.out"'
+watchjson 60 true '| .registry = "1-1"'; status; rc=$?
+check "a result for another registry: UNKNOWN"    eval 'rowis "$TMP/status.out" "landscape watch" UNKNOWN && [ "$rc" != 0 ]'
+check "... and its counts are not shown"          eval '! grep -q "0 newer" "$TMP/status.out"'
 watchjson 60 true '| del(.bot_prs)'; status; rc=$?
 check "UNKNOWN row makes status exit 1"           eval 'rowis "$TMP/status.out" "dependency bot" UNKNOWN && [ "$rc" != 0 ]'
 watchjson 60 true

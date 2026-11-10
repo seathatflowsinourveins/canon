@@ -170,7 +170,7 @@ do_uninstall() {
 }
 
 do_status() {
-  local bad=0 v
+  local bad=0 v fp
   note "Automation (ADR 0011):"
 
   if [ "$(git -C "$ROOT" config --local --get core.hooksPath 2>/dev/null)" = ".githooks" ] && [ -x "$ROOT/.githooks/pre-commit" ]; then
@@ -178,16 +178,28 @@ do_status() {
   else row "commit gate" OFF "run: scripts/automation install"; bad=1; fi
 
   if grep -q 'canon-watch.sh' "$ROOT/.claude/settings.json" 2>/dev/null && [ -x "$ROOT/.claude/hooks/canon-watch.sh" ]; then
-    if [ -f "$ROOT/.canon/watch.json" ]; then
-      # not ok when the last run was incomplete, or older than STALE_DAYS (no session has started here since)
+    # the checksum .claude/hooks/canon-watch.sh records: a result is shown only for the registry and lock
+    # this tree has now
+    fp=$(cat "$ROOT/canon/upstreams.json" "$ROOT/canon/upstreams.lock.json" 2>/dev/null | cksum | awk '{ print $1 "-" $2 }')
+    if [ -f "$ROOT/.canon/watch.json" ] && [ "$(jq -r '.registry // ""' "$ROOT/.canon/watch.json" 2>/dev/null)" != "$fp" ]; then
+      check_row "landscape watch" UNKNOWN "the last result was for another registry or lock than this tree has now; it runs again at the next session start here"
+    elif [ -f "$ROOT/.canon/watch.json" ]; then
+      # not ok when the last run was incomplete, when the lock is stale for some pin (a resolve the owner
+      # approves fixes it), or when it is older than STALE_DAYS (no session has started here since)
       v=$(jq -r --argjson now "$(date -u +%s)" --argjson stale "$STALE_DAYS" '
             (((($now - (.checked_at_epoch // (.checked_at | fromdateiso8601))) / 86400) | floor)) as $d
-            | (if .ok != true then "INCOMPLETE" elif $d > $stale then "STALE" else "ok" end) + "\t"
+            | ((.stale // []) | length > 0) as $sl
+            | (if .ok != true then "INCOMPLETE" elif $sl then "STALE-LOCK" elif $d > $stale then "STALE" else "ok" end) + "\t"
               + "last " + .checked_at + " (" + ($d | tostring) + " day(s) ago): "
               + (.newer | length | tostring) + " newer, " + (.advanced | length | tostring) + " advanced, "
               + (.retagged | length | tostring) + " retagged"
-              + (if .ok != true then "; the run could not check everything, see .canon/watch.json"
-                 elif $d > $stale then "; it runs at session start in this repo" else "" end)' \
+              + (if .ok != true then "; the run could not check everything: " + ((.errors // []) | join("; "))
+                 else "" end)
+              + (if $sl then "; the lock is stale for " + (.stale | join(", "))
+                   + ", so those pins were not compared; fix: " + (.stale | map("scripts/canon resolve " + .) | join(", "))
+                   + " (only the owner approves a resolve)"
+                 else "" end)
+              + (if .ok == true and ($sl | not) and $d > $stale then "; it runs at session start in this repo" else "" end)' \
           "$ROOT/.canon/watch.json" 2>/dev/null)
       [ -n "$v" ] || v=$(printf 'UNKNOWN\t.canon/watch.json is unreadable')
       check_row "landscape watch" "${v%%$'\t'*}" "${v#*$'\t'}"
