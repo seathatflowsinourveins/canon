@@ -53,6 +53,7 @@ limits:
 4. **Nothing goes through an Orca terminal to get past a prompt.** A push, a pin move and an install stay
    the owner's, and an agent does not answer another agent's permission prompt. A worker's change lands
    like any other: the review ADR 0017 requires, then `scripts/land`.
+   ADR 0028 has since taken one pin move and an exactly pinned `uv add` off the prompts.
 5. **The repo's own lanes come first.** Research, record checks and code review stay subagents (ADR 0017).
    An Orca worker is for work that needs its own workspace or that the owner asks to watch, and it runs on
    the model `canon/models.json` gives that work, named with `--model` when Orca's default differs.
