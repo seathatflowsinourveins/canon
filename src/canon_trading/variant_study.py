@@ -59,10 +59,12 @@ from .ledger import current_sample
 from .ledger import default_ledger_path
 from .ledger import open_study
 from .ledger import record_trial
+from .ledger import samples
 from .ledger import trial_config
 from .ma_cross import MaCrossConfig
 from .ranking import RankingReport
 from .ranking import RankingStopped
+from .ranking import _known_sample
 from .ranking import _ran
 from .ranking import rank
 
@@ -125,16 +127,25 @@ def _to_record(study: optuna.Study, keys: Sequence[str]) -> list[str]:
     A key is resolved for the gate when every record that did not run to the end has a later one that
     did (ADR 0035 term 5, `canon_trading.ranking`), which holds exactly when its latest record ran. So
     a key with no record on the sample, or whose latest record failed or is still `RUNNING`, is run
-    again. The study is read once.
+    again. Records are placed on samples as `rank` places them (ADR 0041 term 5): a keyed one with no
+    sample number of the study's is on the current sample, unless it ran to the end, which `rank`
+    stops on as another writer's and which no re-run clears. The rule is the gate's, through its own
+    `_known_sample` and `_ran`; the gate exposes no public helper for it. The study is read once.
     """
     sample = current_sample(study)
+    known = {s.number for s in samples(study)}
     latest: dict[str, optuna.trial.FrozenTrial] = {}
     for trial in study.get_trials(deepcopy=False):
         key = trial.user_attrs.get("config_key")
         if not isinstance(key, str) or key not in keys:
             continue
-        on_sample = trial.user_attrs.get("sample") == sample.number
-        if on_sample and (key not in latest or trial.number > latest[key].number):
+        # As `rank` places it (ranking.py): a keyed record with no sample number of the study's is on
+        # the current sample unless it ran to the end, which `rank` stops on and never counts as a run.
+        if _known_sample(trial, known):
+            counted = trial.user_attrs["sample"] == sample.number
+        else:
+            counted = not _ran(trial)
+        if counted and (key not in latest or trial.number > latest[key].number):
             latest[key] = trial
     return [key for key in keys if key not in latest or not _ran(latest[key])]
 

@@ -212,12 +212,12 @@ here, community convergence, then anyone's recollection.
   SPY's and QQQ's from 2020-07-27 to 2025-12-31 for ADR 0048's study. A fresh clone has none until those
   tests run. Bars are raw and from the IEX feed, the only feed and adjustment
   the adapter requests.
-* **No ranking of real strategies yet.** The ledger (ADR 0035), the returns matrix and the gate (ADR 0010,
-  ADR 0031) are written and tested on generated bars and series. A trial that never traded, or a
-  configuration that never runs to the end, stops a ranking: what value it should count as is undecided.
-  The overfitting probability has no adopted implementation (ADR 0027 and ADR 0032 are `proposed`).
-  The first study on real bars, eight `MaCross` variants on SPY and QQQ daily bars, is pre-registered
-  in ADR 0048 (`canon_trading.variant_study`) and has not run.
+* **No strategy upstream ships has been ranked yet.** The one study on real bars ranked eight variants
+  of the repo's `MaCross` on SPY and QQQ daily bars (ADR 0048, `canon_trading.variant_study`): no
+  variant passed the gate. Upstream's built-in `EmaCross` reads quotes, which the catalog does not
+  hold. A trial that never traded, or a configuration that never runs to the end, stops a ranking:
+  what value it should count as is undecided. The overfitting probability has no adopted
+  implementation (ADR 0027 and ADR 0032 are `proposed`).
 * **No OpenTelemetry backend.** The local event ledger covers this machine; `home/otel-settings.example.json`
   is ready for when a collector exists. Until one writes `~/.claude/canon/otel/logs.jsonl`,
   `scripts/lanes --rates` lists every worker as not measured (ADR 0007).

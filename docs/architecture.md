@@ -82,6 +82,9 @@ adapter is a uv workspace member of its own, kept apart from strategies as upstr
 5. `rank` picks the highest Sharpe ratio and rejects it below a DSR of 0.95; it stops on any input
    ADR 0031, ADR 0035 and ADR 0041 refuse (`ranking.py`).
 
+`variant_study.py` runs steps 3 to 5 for one pre-registered plan, eight `MaCross` variants on Alpaca's
+daily bars (ADR 0048).
+
 ## A paper run, from stream to fill
 
 1. A `LiveNode` gets the adapter's factories, both or the data one alone in its paper tests, or both through `ema_cross_paper_node`,
