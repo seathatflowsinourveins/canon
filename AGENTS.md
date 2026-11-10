@@ -90,6 +90,7 @@ dependency, pattern and practice traces to a pinned upstream or a dated source. 
 | 0018 | Agent hosts and other runtimes: Orca is the cockpit, Claude Code the only runtime; one gate holds whatever runs |
 | 0019 | Review gate scope: every change carries a review note except a named few |
 | 0020 | Rule enforcement: no hook runs before a tool call; the merge gate and permission rules hold the rules |
+| 0021 | Orca's skills: used from sessions inside Orca, within written limits |
 
 ## Automation
 
@@ -113,6 +114,22 @@ to do and why.
 
 This is the same for every runtime, Claude Code or not: use no credentials, and leave landing to
 `scripts/land` (ADR 0018).
+
+## Orca
+
+Orca is the cockpit (ADR 0018). From a session Orca started, its `orca-cli` and `orchestration` skills may
+be used within these limits (ADR 0021):
+
+* Workers and handoffs use `--agent claude`. No other runtime is adopted.
+* A worker that changes files gets its own workspace (`--worktree new-top-level`). Share yours only for
+  work that reads.
+* Do not run through an Orca terminal what a prompt would have asked the owner, and do not answer another
+  agent's permission prompt. A worker's change lands like any other: reviewed first, then `scripts/land`.
+* Research, record checks and code review stay subagents. Use an Orca worker when the work needs its own
+  workspace or the owner asks to watch it, on the model `canon/models.json` gives that work (`--model`).
+* Not used: remote placement, the browser and desktop control, plugins, automations, session search, and
+  Orca's other bundled skills.
+* Do not start Orca from a session (`orca open`): the app would inherit that session's environment.
 
 ## Landing
 

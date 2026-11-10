@@ -474,7 +474,7 @@
       "track": "branch:main",
       "role": "tool",
       "license": "MIT",
-      "why": "The cockpit Claude Code sessions run in: one git worktree and agent terminal per task, in one window. It starts the installed claude, so this repo's settings, hooks and instructions apply unchanged, and it reads orca.yaml for the worktree setup command. The app auto-updates by default on its stable channel, about a release a day, so this repo does not choose the version that runs; the entry follows main, and the docs it cites were read at v1.4.255.",
+      "why": "The cockpit Claude Code sessions run in: one git worktree and agent terminal per task, in one window. It starts the installed claude, so this repo's settings, hooks and instructions apply unchanged, and it reads orca.yaml for the worktree setup command. The app auto-updates by default on its stable channel, about a release a day, so this repo does not choose the version that runs; the entry follows main, and the docs it cites were read at v1.4.255. Its bundled skills orca-cli and orchestration are used within the limits of ADR 0021.",
       "evidence": [
         "https://github.com/stablyai/orca/tree/v1.4.255/docs/site/content/docs",
         "https://www.onorca.dev/docs/install",
