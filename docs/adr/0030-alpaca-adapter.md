@@ -82,6 +82,12 @@ decimals at or above $1.00, or more than 4 below, the rule the first slice left 
 test now applies and runs offline, in `scripts/ci`. The one paper test, a limit order placed and canceled, has
 not run, so the client is UNVERIFIED against Alpaca. Its limits are in the package README.
 
+**Against Alpaca's paper environment (2026-11-10).** With a paper key pair in the login keychain (ADR 0029),
+`mise run paper:test` ran both paper tests and both passed: one asset and a week of daily bars reached a
+strategy through a real node, and a DAY limit buy of 1 AAPL at $1.00 was accepted and then canceled. So the
+two "had not run" statements above no longer hold for those two paths. Still UNVERIFIED against Alpaca: the
+live quote and trade stream, `load_all` at full scale, a fill, a partial fill and a rejection.
+
 ## Evidence
 
 * Split from ADR 0009 on 2026-11-10 with no change of decision: the text above is ADR 0009's own, moved,
@@ -131,3 +137,5 @@ For the execution slice, read 2026-11-10:
 * `packages/canon-alpaca/src/canon_alpaca/execution.py` at `12f19a0` — the config's refusals, and
   `TradingClient` and `TradingStream` built with `paper=True` and no other argument but the key pair
   (read). `uv run --locked pytest`: 175 passed, 2 skipped, both paper tests (run).
+* `mise run paper:test` on `main` at `c87ea07`, 2026-11-10, during the regular session — 2 passed;
+  the output held neither key (run).

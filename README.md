@@ -169,11 +169,13 @@ here, community convergence, then anyone's recollection.
 
 ## What is not here yet
 
-* **Nothing proven against Alpaca.** NautilusTrader has no official Alpaca adapter; ADR 0009 decides to
+* **Little proven against Alpaca.** NautilusTrader has no official Alpaca adapter; ADR 0009 decides to
   build one to upstream's guide. The adapter has a data client (US equities, historical bars, streamed
   quotes and trades, from Alpaca's paper data) and a first, paper-only execution client (market and limit
-  orders, cancels, fills from trade updates). Both pass their offline tests; neither of the two paper
-  tests has run yet, and modify, cancel-all, stop orders and fill history at start-up are not written.
+  orders, cancels, fills from trade updates). Both pass their offline tests, and the two paper tests
+  passed on 2026-11-10: daily bars through a real node, and a limit order accepted and canceled (ADR
+  0030). A fill, the live quote and trade stream and the full asset list have not run against Alpaca, and
+  modify, cancel-all, stop orders and fill history at start-up are not written.
   See `packages/canon-alpaca/README.md`.
 * **No market data in `catalog/`.** The first backtest runs on bars generated in its test. Nothing here
   writes Alpaca's bars to the catalog yet.
