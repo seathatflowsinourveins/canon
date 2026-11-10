@@ -91,6 +91,9 @@ FLATTEN_SECS = 120
 END_MARGIN_SECS = 60
 """A window ends at least this long before its session does."""
 STRATEGY_ID = StrategyId("SessionMaCross-001")
+STALE_RUNNING_SECS = 70 * 60
+"""A record still `running` this long after it started is a window that died (60 minutes at most, plus
+start-up, shutdown and the account check)."""
 EXTENDED_READY = False
 """Whether extended windows may run. The adapter sends `extended_hours` from the submit params (ADR 0038);
 a reviewed change turns this on once an extended window has passed on paper and the adapter's
@@ -249,6 +252,56 @@ class WindowReport:
     errors: list[str] = field(default_factory=list)
     warm_up_bars: int = 0
     warm_up_dropped: int = 0
+    result: str = "running"
+    """`running` while the window runs, then `ok` or `failed: <why>`. A record still `running` after
+    `stale_after` seconds belongs to a window that died; `scripts/automation status` reads both."""
+    started_epoch: float = field(default_factory=time.time)
+    stale_after: int = STALE_RUNNING_SECS
+
+
+class WindowRefused(RuntimeError):
+    """The window did not start, for a reason someone must look at (the account not flat, the session not
+    open when one was named). Nothing was placed. Recorded as the latest result; the run exits 1."""
+
+
+class WindowSkipped(RuntimeError):
+    """The window did not start, for a reason that clears by itself (inside the gap after the last window,
+    too little of the session left). Nothing was placed. Not recorded as a result; the run exits 0."""
+
+
+def _write_atomically(path: Path, body: str) -> None:
+    """Replace `path` whole (`os.replace`), so a reader or a kill never sees half a record."""
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(body)
+    os.replace(temporary, path)
+
+
+def write_record(log_dir: Path, report: WindowReport | dict) -> None:
+    """Write `latest.json`, the one record `scripts/automation status` reads, and, for a window that ran,
+    its own `window-<stamp>.json`."""
+    body = json.dumps(asdict(report) if isinstance(report, WindowReport) else report, indent=2)
+    if isinstance(report, WindowReport):
+        _write_atomically(log_dir / f"window-{report.started}.json", body)
+    _write_atomically(log_dir / "latest.json", body)
+
+
+def write_heartbeat(log_dir: Path, outcome: str) -> None:
+    """Write `last-firing.json` on every run, a window or not: status reads its age to tell a schedule
+    that has stopped firing from one with nothing to run."""
+    log_dir.mkdir(parents=True, exist_ok=True)
+    _write_atomically(
+        log_dir / "last-firing.json",
+        json.dumps({"at_epoch": time.time(), "outcome": outcome}),
+    )
+
+
+def session_now(trading: TradingClient) -> tuple[AlpacaClock, AlpacaCalendar | None]:
+    """Alpaca's clock and today's calendar day (New York), read once per run."""
+    clock = trading.get_clock()
+    assert isinstance(clock, AlpacaClock)
+    today = clock.timestamp.astimezone(NEW_YORK).date()
+    days = trading.get_calendar(GetCalendarRequest(start=today, end=today))
+    return clock, days[0] if isinstance(days, list) and days else None
 
 
 def paper_trading() -> TradingClient:
@@ -283,34 +336,43 @@ def leftovers(trading: TradingClient, symbol: str) -> list[str]:
     return left
 
 
-def run_window(config: WindowConfig) -> WindowReport:
-    """Run one window as the module header describes; raise if it cannot start or is not left flat."""
+def run_window(
+    config: WindowConfig,
+    *,
+    trading: TradingClient | None = None,
+    market: tuple[AlpacaClock, AlpacaCalendar | None] | None = None,
+) -> WindowReport:
+    """Run one window as the module header describes; raise if it cannot start or is not left flat.
+    `trading` and `market` (the clock and calendar) are read here unless the caller already has them."""
     config.log_dir.mkdir(parents=True, exist_ok=True)
     marker = config.log_dir / "last-window-end"
     # Dated by when it was written, so a marker cut short by a kill still counts.
     if marker.exists() and time.time() - marker.stat().st_mtime < GAP_SECS:
-        raise RuntimeError(f"the last window ended under {GAP_SECS} s ago; waiting is the caller's")
-    trading = paper_trading()
-    clock = trading.get_clock()
-    assert isinstance(clock, AlpacaClock)
-    today = clock.timestamp.astimezone(NEW_YORK).date()
-    days = trading.get_calendar(GetCalendarRequest(start=today, end=today))
-    calendar = days[0] if isinstance(days, list) and days else None
-    end_of_session = session_end(config, clock, calendar)
+        raise WindowSkipped(f"the last window ended under {GAP_SECS} s ago")
+    trading = trading or paper_trading()
+    clock, calendar = market or session_now(trading)
+    try:
+        end_of_session = session_end(config, clock, calendar)
+    except RuntimeError as e:
+        raise WindowRefused(str(e)) from e
     if left := leftovers(trading, config.symbol):
-        raise RuntimeError(
+        raise WindowRefused(
             f"the paper account is not flat in {config.symbol}; not starting: {left}"
         )
 
     now = clock.timestamp.astimezone(NEW_YORK)
     seconds = min(config.minutes * 60, (end_of_session - now).total_seconds() - END_MARGIN_SECS)
     if seconds <= FLATTEN_SECS + 1:
-        raise RuntimeError(f"under {FLATTEN_SECS + END_MARGIN_SECS} s left in the session")
+        raise WindowSkipped(f"under {FLATTEN_SECS + END_MARGIN_SECS} s left in the session")
     # Absolute times, taken from Alpaca's clock: start-up eats into the window, not into the wind-down.
     ends = clock.timestamp.astimezone(UTC) + timedelta(seconds=seconds)
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     report = WindowReport(config.session, config.symbol, started=stamp)
+    write_record(
+        config.log_dir, report
+    )  # `running`: a window killed from here on leaves this behind
     started = time.monotonic()
+    failure: BaseException | None = None
     try:
         node, strategy, cap = window_node(
             config, wind_down_at=ends - timedelta(seconds=FLATTEN_SECS), log_name=f"window-{stamp}"
@@ -329,15 +391,28 @@ def run_window(config: WindowConfig) -> WindowReport:
                 report.cap_tripped = cap.tripped
             finally:
                 node.dispose()
+    except BaseException as e:
+        failure = e
+        raise
     finally:
         try:
             report.left = _flatten_after_stop(trading, config, report)
+        except BaseException as e:  # the account could not be checked: never recorded as ok
+            failure = failure or e
+            report.errors.append(f"checking the account after the stop: {type(e).__name__}: {e}")
+            raise
         finally:
             report.ended = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
             marker.write_text(str(time.time()))
-            (config.log_dir / f"window-{stamp}.json").write_text(
-                json.dumps(asdict(report), indent=2)
-            )
+            if failure is not None:
+                report.result = f"failed: {type(failure).__name__}: {failure}"
+            elif report.left:
+                report.result = f"failed: not left flat: {report.left}"
+            elif report.cap_tripped:
+                report.result = f"failed: {report.cap_tripped}"
+            else:
+                report.result = "ok"
+            write_record(config.log_dir, report)
     if report.left:
         raise RuntimeError(f"the paper account was not left flat in {config.symbol}: {report.left}")
     if report.cap_tripped:
@@ -400,19 +475,68 @@ def _fill(report: WindowReport, cache) -> None:
                 report.denials[order.client_order_id.value] = str(event.reason)
 
 
+def resolve_session(clock: AlpacaClock, calendar: AlpacaCalendar | None) -> tuple[str | None, str]:
+    """The session `--session auto` runs, from Alpaca's clock and calendar, or None and why not: the
+    regular session when the clock says it is open; else the extended one, if `EXTENDED_READY` and it is
+    open now; else nothing. The schedule fires on a timer and leaves this choice to Alpaca's clock."""
+    if clock.is_open:
+        return "regular", "Alpaca's clock says the regular session is open"
+    if not EXTENDED_READY:
+        return (
+            None,
+            "the regular session is closed and extended windows are not on (EXTENDED_READY)",
+        )
+    try:
+        session_end(WindowConfig(session="extended"), clock, calendar)
+    except RuntimeError as e:
+        return None, str(e)
+    return "extended", "outside the regular session, inside pre-market or after-hours"
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="One SessionMaCross window on Alpaca paper")
-    parser.add_argument("--session", choices=SESSIONS, default="regular")
+    parser.add_argument("--session", choices=(*SESSIONS, "auto"), default="regular")
     parser.add_argument("--minutes", type=int, default=DEFAULT_MINUTES)
     parser.add_argument("--symbol", default="SPY")
     parser.add_argument("--log-dir", type=Path, default=default_log_dir())
     args = parser.parse_args(argv)
+    session = args.session
     try:
+        trading = market = None
+        if session == "auto":
+            trading = paper_trading()
+            market = session_now(trading)
+            resolved, why = resolve_session(*market)
+            if resolved is None:
+                write_heartbeat(args.log_dir, f"nothing to run: {why}")
+                print(f"paper:session: nothing to run: {why}")
+                return 0
+            session = resolved
         config = WindowConfig(
-            symbol=args.symbol, session=args.session, minutes=args.minutes, log_dir=args.log_dir
+            symbol=args.symbol, session=session, minutes=args.minutes, log_dir=args.log_dir
         )
-        report = run_window(config)
+        write_heartbeat(args.log_dir, f"a {session} window")
+        report = run_window(config, trading=trading, market=market)
+    except WindowSkipped as e:
+        write_heartbeat(args.log_dir, f"skipped: {e}")
+        print(f"paper:session: skipped: {e}")
+        return 0
+    except WindowRefused as e:
+        args.log_dir.mkdir(parents=True, exist_ok=True)
+        write_record(
+            args.log_dir,
+            {
+                "session": session,
+                "result": f"refused: {e}",
+                "started_epoch": time.time(),
+                "started": datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ"),
+                "stale_after": STALE_RUNNING_SECS,
+            },
+        )
+        print(f"paper:session: {e}", file=sys.stderr)
+        return 1
     except (RuntimeError, ValueError, KeyError, APIError) as e:  # KeyError: no key pair in the env
+        write_heartbeat(args.log_dir, f"failed: {type(e).__name__}: {e}")
         print(f"paper:session: {e}", file=sys.stderr)
         return 1
     print(json.dumps(asdict(report), indent=2))
