@@ -22,8 +22,10 @@ mkdir -p "$TMP/bin"
 PATH="$TMP/bin:$PATH"; export PATH
 
 # The fake mise. Files in $FAKE: auth_rc, merge_rc, auto_rc (exit codes, default 0); pr_open (the line
-# `gh pr list --jq` would print); pr_info and pr_head (for --pr); views (one `gh pr view` answer per line,
-# "<state> <sha>", the last repeated; HEAD and OTHER stand for the current commit and another one); checks
+# `gh pr list --jq` would print); pr_info and pr_head (for --pr); pr_title and pr_body (what
+# `gh pr view --json title|body --jq` prints; that call fails when the file is missing); views (one
+# `gh pr view` answer per line, "<state> <sha>", the last repeated; HEAD and OTHER stand for the current
+# commit and another one); checks
 # (the failed required checks `gh pr checks --jq` would print).
 cat > "$TMP/bin/mise" <<'FAKE'
 #!/bin/bash
@@ -46,6 +48,12 @@ case "${1:-} ${2:-}" in
                  git fetch -q origin "+refs/heads/$b:refs/heads/$b" && git worktree add -q "$5" "$b" ;;
   "pr view")
     case "$*" in *headRefName*) cat "$FAKE/pr_info"; exit 0 ;; esac
+    for f in title body; do
+      case "$*" in *"--json $f "*)
+        [ -f "$FAKE/pr_$f" ] || { echo "fake: no pull request $f" >&2; exit 1; }
+        cat "$FAKE/pr_$f"; exit 0 ;;
+      esac
+    done
     line=$(sed -n 1p "$FAKE/views")
     if [ "$(wc -l < "$FAKE/views")" -gt 1 ]; then tail -n +2 "$FAKE/views" > "$FAKE/views.next" && mv "$FAKE/views.next" "$FAKE/views"; fi
     line=${line/HEAD/$(git rev-parse HEAD)}
@@ -286,7 +294,11 @@ bot_pr() {
   git -C "$W" switch -q topic; git -C "$W" branch -q -D bot
   echo bot > "$FAKE/pr_head"; echo "5 https://github.example/o/r/pull/5" > "$FAKE/pr_open"
   echo '{"headRefName":"bot","state":"OPEN","url":"https://github.example/o/r/pull/5","isCrossRepository":false}' > "$FAKE/pr_info"
+  echo "Bump the lockfile" > "$FAKE/pr_title"; printf 'Bumps the lockfile.\n\nRelease notes here.\n' > "$FAKE/pr_body"
 }
+# main_moves: origin's main gains a commit that the bot branch lacks
+main_moves() { git -C "$W" switch -q -c side main; change README.md "Move main"; git -C "$W" push -q origin side:main
+               git -C "$W" switch -q topic; }
 gone() { [ ! -e "$C/canon-worktrees/pr-5" ] && ! git -C "$W" show-ref --verify -q refs/heads/bot; }
 t_pr_lands() { bot_pr uv.lock; land --pr 5; [ "$rc" -eq 0 ] && logged "pr merge 5 --squash" && gone; }
 t_pr_message() {
@@ -325,7 +337,46 @@ t_inner_message() {
   out=$(cd "$W" && LAND_PR=5 scripts/land 2>&1); rc=$?
   [ "$rc" -ne 0 ] && has 'scripts/land --pr 5 --reviewed "'
 }
+t_pr_behind_text() {
+  bot_pr uv.lock; main_moves; land --pr 5
+  [ "$rc" -eq 0 ] && has "is behind main" && logged "--subject Bump the lockfile (#5) --body-file" \
+    && grep -c "Release notes here." "$FAKE/merge_body" >/dev/null && ! grep -c "Merge" "$FAKE/merge_body" >/dev/null && gone
+}
+t_pr_refused_text() {   # t_pr_refused_text <title|body> <what check-addresses names>
+  bot_pr uv.lock; main_moves
+  echo "Ask jane@example.com about it" > "$FAKE/pr_$1"
+  out=$(cd "$W" && CHECK_ADDRESSES_STRICT=1 scripts/land --pr 5 2>&1); rc=$?
+  [ "$rc" -ne 0 ] && has "$2" && ! has "jane@" && ! logged "statuses" && ! logged "pr merge" && gone
+}
+t_pr_view_fails() {     # t_pr_view_fails <title|body>
+  bot_pr uv.lock; main_moves; rm -f "$FAKE/pr_$1"; land --pr 5
+  [ "$rc" -ne 0 ] && has "could not read the" && ! logged "statuses" && ! logged "pr merge" && gone
+}
+t_existing_title() {
+  new_repo; change README.md "Commit subject"; echo "7 https://github.example/o/r/pull/7" > "$FAKE/pr_open"
+  echo "Title on GitHub" > "$FAKE/pr_title"; land
+  [ "$rc" -eq 0 ] && logged "--subject Title on GitHub (#7) --body-file" && ! logged "pr create"
+}
+t_pr_dry_closed() {
+  bot_pr uv.lock; rm -f "$FAKE/pr_open"
+  echo '{"headRefName":"bot","state":"MERGED","url":"https://github.example/o/r/pull/5","isCrossRepository":false}' > "$FAKE/pr_info"
+  land --pr 5 --dry-run
+  [ "$rc" -eq 0 ] && has "pull request 5 is not open" && has "dry run: would push" && ! has "is , not" \
+    && ! logged "statuses" && gone
+}
+t_pr_numbered_title() {
+  bot_pr uv.lock; echo "Bump the lockfile (#5)" > "$FAKE/pr_title"; land --pr 5
+  [ "$rc" -eq 0 ] && logged "--subject Bump the lockfile (#5) --body-file" && ! logged "(#5) (#5)"
+}
 case_ "--pr lands a lockfile-only pull request and leaves nothing behind" t_pr_lands
+case_ "--pr --dry-run on a pull request no longer open reports it and goes on" t_pr_dry_closed
+case_ "a title that already ends in its number does not get it twice" t_pr_numbered_title
+case_ "--pr behind main lands with the pull request's title and body" t_pr_behind_text
+case_ "--pr with an address in the pull request's title stops before any status" t_pr_refused_text title "title: an address at example.com"
+case_ "--pr with an address in the pull request's body stops before any status" t_pr_refused_text body "body file"
+case_ "--pr stops when the pull request's title cannot be read" t_pr_view_fails title
+case_ "--pr stops when the pull request's body cannot be read" t_pr_view_fails body
+case_ "an existing pull request keeps its own title"        t_existing_title
 case_ "--pr refusal names --pr in the command to run"       t_pr_message
 case_ "a run inside --pr names --pr in the command to run"  t_inner_message
 case_ "an interrupted --pr run removes its worktree and branch" t_pr_interrupted
