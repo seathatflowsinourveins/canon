@@ -45,4 +45,5 @@ ADR 0009 keeps trading on paper at least until NautilusTrader v2.0.0 stable, a c
 * **A deny rule for reading the keychain** with `security find-generic-password`, left to the owner
   (ADR 0029).
 * **An OpenTelemetry backend** (ADR 0007) and **an eval of this repo's own** for model routing
-  (ADR 0005).
+  (ADR 0005). For reviewers, the benchmark's cases and procedure are in `evals/review/` (ADR 0046); it
+  has not run, and its pending cases wait on fixes reaching `main`.

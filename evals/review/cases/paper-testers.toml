@@ -1,0 +1,9 @@
+# A review case: the format is in evals/review/README.md and ADR 0046.
+id = "paper-testers"
+status = "pending"
+commit = "273ff522fca13c0eda447652542916193179b8a1"
+title = "Run NautilusTrader's data and execution testers against Alpaca's paper environment (#54)"
+paths = ["packages/canon-alpaca/tests/"]
+confirm = """
+As for ema-cross-paper-node: findings by reading are not yet checked. Each becomes a [[defects]] entry once
+a fix for it is on main with a test that fails before it."""

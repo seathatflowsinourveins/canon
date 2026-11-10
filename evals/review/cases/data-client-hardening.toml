@@ -1,0 +1,18 @@
+# A review case: the format is in evals/review/README.md and ADR 0046.
+id = "data-client-hardening"
+status = "ready"
+commit = "f364348445fb1be2ba6ca09a3d4b6e934d08dc5d"
+title = "Harden the Alpaca data adapter's bar windows, stream lifecycle and data checks (#7)"
+paths = ["packages/canon-alpaca/"]
+
+[[defects]]
+id = "log-capture-before-writer-flush"
+location = "packages/canon-alpaca/tests/test_data_client.py: logged"
+summary = """
+NautilusTrader's logger writes on its own thread. The helper reads pytest's captured output right after
+the run, while the writer thread can still hold the last lines (the per-symbol summary logged in
+_disconnect), so tests that assert on those lines fail now and then."""
+match = "Names the helper (or a test asserting on captured log text) and says the log is written asynchronously, so lines logged at disconnect may not be captured yet when it is read."
+reported_by = "no review; it showed as a flaky test"
+fix = "2669c8645852c3d4e46dda75ff02bf6c16b30602"
+test = "packages/canon-alpaca/tests/test_data_client.py::test_logged_waits_for_lines_still_queued_after_a_run"

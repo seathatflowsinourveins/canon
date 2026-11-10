@@ -1,0 +1,10 @@
+# A review case: the format is in evals/review/README.md and ADR 0046.
+id = "order-modify"
+status = "pending"
+commit = "3a00f617fd20c97d647ee51f7c2c4091aac3a035"
+title = "Modify Alpaca orders by replace, updated only when Alpaca's stream confirms it (#55)"
+paths = ["packages/canon-alpaca/"]
+confirm = """
+Three defects were reproduced by running, first reported by a Codex reader (ADR 0043) (a filled replacement lost from reconciliation when replaced
+was missed, a refused modify rejected twice, a replaced update applied twice), and nine more claimed by
+reading. Each becomes a [[defects]] entry once a fix for it is on main with a test that fails before it."""
