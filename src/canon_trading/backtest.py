@@ -35,9 +35,16 @@ before it (observed), so each call here builds its own and writes nothing.
 
 The engine's cache keeps the bars a run replayed, up to `CacheConfig.bar_capacity` of each bar type
 (10,000 by default; a run of 40 bars kept 10 at a capacity of 10 and 40 at 100, observed at v2.0.0rc8).
-With `keep_bars`, the capacity is raised to the count of each bar type's bars in the range, read from
+`checked_run_config` raises the capacity to the count of each bar type's bars in the range, read from
 the catalog after every other check, never below upstream's default, so `BacktestRun.bars` can hold
-every bar the run read. `BacktestResult.iterations` counts one per data item the engine processed
+every bar the run read. Those bars are read by `ParquetDataCatalog.query` on the same catalog object
+that passed the coverage check, and returned with the config. Each call reads the directory again, so
+the intervals the check read are read again after the query, and a catalog that changed between the
+two is refused. The node reads the catalog again from its path when it runs, so a catalog replaced
+after the check is caught only by comparing what the run read with the bars returned
+(`canon_trading.ledger` does, ADR 0041 term 1). What is left is a catalog changed and restored around
+each of those reads in turn, three swaps timed to the reads; nothing short of copying the catalog
+closes that, and no upstream call reads a catalog's intervals and bars as one. `BacktestResult.iterations` counts one per data item the engine processed
 (`iteration += 1` in `run_impl`, `crates/backtest/src/engine.rs` at the pinned commit), so on a run of
 bars only it is the number of bars replayed; `canon_trading.ledger` checks the cache against it.
 
@@ -115,6 +122,20 @@ if TYPE_CHECKING:
 
 
 @dataclass(frozen=True)
+class CheckedRunConfig:
+    """A run config bounded by a range, and the bars of that range the coverage check's catalog held.
+
+    `bars` is what `ParquetDataCatalog.query` returned for each bar type over the range, on the
+    catalog object whose `get_missing_intervals_for_request` found nothing missing (this module's
+    header). The run reads the catalog again when it starts; a run that read other bars read a
+    catalog this check did not cover.
+    """
+
+    config: BacktestRunConfig
+    bars: list[Bar]
+
+
+@dataclass(frozen=True)
 class BacktestRun:
     """What one run left behind, as the engine's own objects, read before the node was disposed.
 
@@ -122,7 +143,7 @@ class BacktestRun:
     its positions in their final state, `position_snapshots` the earlier round trips of positions that
     reopened, and `account` the simulated venue's account. `bars` is what the cache keeps of each bar
     type the run loaded (`Cache.bars`), in the order the cache gives them; every bar replayed, if the
-    run was built with `keep_bars` and the catalog did not grow in between. Nothing here is computed by
+    run was built by `checked_run_config` and the catalog did not change in between. Nothing here is computed by
     this repo.
     """
 
@@ -168,7 +189,6 @@ def backtest_run_config(
     run_config_id: str | None = None,
     start: int | None = None,
     end: int | None = None,
-    keep_bars: bool = False,
 ) -> BacktestRunConfig:
     """Check `strategies` against the catalog and build the run config `run_backtest` runs.
 
@@ -187,9 +207,59 @@ def backtest_run_config(
     sample (ADR 0041). A catalog that does not cover the whole range for a bar type is refused too,
     naming what is missing (this module's header); with one bound given, the other is the catalog's.
 
-    With `keep_bars`, the engine's cache is sized to keep every bar of the range (this module's
-    header); without it, the cache keeps upstream's default.
+    The engine's cache keeps upstream's default; `checked_run_config` sizes it to keep every bar.
     """
+    return _run_config(
+        catalog_path,
+        strategies,
+        starting_balances=starting_balances,
+        logging=logging,
+        run_config_id=run_config_id,
+        start=start,
+        end=end,
+        keep_bars=False,
+    ).config
+
+
+def checked_run_config(
+    catalog_path: Path,
+    strategies: Sequence[MaCross],
+    *,
+    starting_balances: Sequence[str],
+    logging: LoggerConfig | None = None,
+    run_config_id: str,
+    start: int,
+    end: int,
+) -> CheckedRunConfig:
+    """`backtest_run_config` over [start, end], with the bars the coverage check's catalog held.
+
+    The engine's cache is sized to keep every bar of the range, and the bars are those
+    `ParquetDataCatalog.query` returned on the catalog object the coverage check read (this module's
+    header). `canon_trading.ledger` records a trial with it.
+    """
+    return _run_config(
+        catalog_path,
+        strategies,
+        starting_balances=starting_balances,
+        logging=logging,
+        run_config_id=run_config_id,
+        start=start,
+        end=end,
+        keep_bars=True,
+    )
+
+
+def _run_config(
+    catalog_path: Path,
+    strategies: Sequence[MaCross],
+    *,
+    starting_balances: Sequence[str],
+    logging: LoggerConfig | None,
+    run_config_id: str | None,
+    start: int | None,
+    end: int | None,
+    keep_bars: bool,
+) -> CheckedRunConfig:
     _require_strategies(strategies)
     bar_types: dict[str, str] = {}  # instrument ID to its one bar type, in the strategies' order
     for strategy in strategies:
@@ -208,8 +278,9 @@ def backtest_run_config(
             )
     path = str(Path(catalog_path).resolve())
     catalog = ParquetDataCatalog(path)
+    covered: dict[str, list[tuple[int, int]]] = {}
     for bar_type in bar_types.values():
-        intervals = catalog.get_intervals(NautilusDataType.Bar, bar_type)
+        intervals = covered[bar_type] = catalog.get_intervals(NautilusDataType.Bar, bar_type)
         if not intervals:
             raise LookupError(f"The catalog at {path} holds no {bar_type} bars")
         if start is None and end is None:
@@ -231,14 +302,27 @@ def backtest_run_config(
                 "the catalog's files around it (ParquetDataCatalog.consolidate_data) records it",
             )
     cache = None
+    checked: list[Bar] = []
     if keep_bars:
-        counts = [
-            len(catalog.query(NautilusDataType.Bar, identifiers=[bar_type], start=start, end=end))
+        queried = [
+            catalog.query(NautilusDataType.Bar, identifiers=[bar_type], start=start, end=end)
             for bar_type in bar_types.values()
         ]
+        checked = [bar for bars in queried for bar in bars]
+        counts = [len(bars) for bars in queried]
+        changed = [
+            bar_type
+            for bar_type, intervals in covered.items()
+            if catalog.get_intervals(NautilusDataType.Bar, bar_type) != intervals
+        ]
+        if changed:
+            raise LookupError(
+                f"The catalog at {path} changed while it was checked: the intervals of "
+                f"{', '.join(changed)} differ before and after its bars were read; check it again",
+            )
         cache = CacheConfig(bar_capacity=max([*counts, CacheConfig().bar_capacity]))
 
-    return BacktestRunConfig(
+    config = BacktestRunConfig(
         venues=[simulated_alpaca_venue(starting_balances)],
         data=[
             BacktestDataConfig(
@@ -256,6 +340,7 @@ def backtest_run_config(
         # The engine's cache is emptied on disposal, so it is read first and disposed below.
         dispose_on_completion=False,
     )
+    return CheckedRunConfig(config=config, bars=checked)
 
 
 def run_backtest(
