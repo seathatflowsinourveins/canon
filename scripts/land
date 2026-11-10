@@ -35,7 +35,8 @@ while [ $# -gt 0 ]; do
     --pr)      PR="${2:-}";   [ $# -ge 2 ] || die "$USAGE"; shift 2 ;;
     --reviewed) [ $# -ge 2 ] || die "$USAGE"; REVIEWED="$2"
                 case "$REVIEWED" in --*) die "--reviewed needs a note, not another option" ;; esac
-                [ -n "${REVIEWED//[[:space:]]/}" ] || die "--reviewed needs a note: what ran and what came of it"
+                REVIEWED=$(printf '%s' "$REVIEWED" | LC_ALL=C tr -cd '\11\40-\176' | cut -c1-140)
+                [ -n "${REVIEWED//[[:space:]]/}" ] || die "--reviewed needs a note in plain ASCII: what ran and what came of it"
                 shift 2 ;;
     --dry-run) DRY=1; shift ;;
     *) die "$USAGE" ;;
@@ -64,8 +65,11 @@ fi
 if [ -n "$PR" ]; then
   case "$PR" in *[!0-9]*|'') die "--pr takes a pull request number" ;; esac
   [ -n "$remote" ] || die "--pr needs a GitHub remote and a signed-in gh"
-  info=$(gh pr view "$PR" --json headRefName,state,url 2>/dev/null) || die "pull request $PR not found"
+  info=$(gh pr view "$PR" --json headRefName,state,url,isCrossRepository 2>/dev/null) || die "pull request $PR not found"
   head=$(jq -r .headRefName <<<"$info")
+  # A pull request from a fork has its branch elsewhere; landing it from here would publish its commits as
+  # a branch of this repository. That needs a person, not this script.
+  [ "$(jq -r .isCrossRepository <<<"$info")" = "false" ] || die "pull request $PR comes from a fork; --pr lands only branches of this repository"
   [ "$DRY" -eq 1 ] || [ "$(jq -r .state <<<"$info")" = "OPEN" ] || die "pull request $PR is not open"
   git show-ref --verify -q "refs/heads/$head" \
     && die "a local branch named $head already exists, so pull request $PR is being worked on here; land it from its own checkout"
@@ -95,7 +99,7 @@ if [ -n "$PR" ]; then
   git branch -q -D "$head" 2>/dev/null
   if [ "$rc" -eq 0 ] && [ "$DRY" -eq 0 ] && [ -f "$first/.canon/watch.json" ]; then
     # so the session brief stops listing it before the next daily watch
-    jq --argjson n "$PR" '.bot_prs = ((.bot_prs // []) | map(select(.number != $n)))' "$first/.canon/watch.json" \
+    jq --argjson n "$PR" 'if (.bot_prs | type) == "array" then .bot_prs |= map(select(.number != $n)) else . end' "$first/.canon/watch.json" \
       > "$first/.canon/watch.json.tmp" && mv "$first/.canon/watch.json.tmp" "$first/.canon/watch.json"
   fi
   exit "$rc"
@@ -116,12 +120,15 @@ git merge-base --is-ancestor "$base" "$branch" \
 # that an independent review has run where a defect costs most, before the push (ADR 0017). The note is
 # the lander's own statement, recorded on the commit as the `review` status.
 # The list covers code, harness scripts, workflows, and the files that wire or define the guard and the
-# reviewers themselves. Renames are listed as a delete plus an add, and names are printed unquoted, so
-# moving a file out of a reviewed path or naming it oddly does not slip past.
+# reviewers themselves. Renames are listed as a delete plus an add, and names come NUL-separated, which
+# is the one form git never quotes, so moving a file out of a reviewed path or naming it oddly does not
+# slip past.
 REVIEW_PATHS='^(src/|packages/|scripts/|home/|\.claude/hooks/|\.claude/agents/|\.claude/settings\.json$|\.githooks/|\.github/workflows/)'
-changed() { git -c core.quotePath=false diff --name-only --no-renames "$@" "$base...$branch"; }
-touched=$(changed | grep -E "$REVIEW_PATHS" | head -4 | tr '\n' ' ' || true)
-new_adr=$(changed --diff-filter=A | grep -E '^docs/adr/[0-9]{4}-' | tr '\n' ' ' || true)
+changed() { git diff --name-only --no-renames -z "$@" "$base...$branch" | tr '\0' '\n'; }
+files=$(changed) || die "could not list what $branch changes, so the review gate cannot be applied"
+added=$(changed --diff-filter=A) || die "could not list what $branch adds, so the review gate cannot be applied"
+touched=$(printf '%s\n' "$files" | grep -E "$REVIEW_PATHS" | sed -n '1,4p' | tr '\n' ' ' || true)
+new_adr=$(printf '%s\n' "$added" | grep -E '^docs/adr/[0-9]{4}-' | tr '\n' ' ' || true)
 if [ -n "$touched$new_adr" ] && [ -z "$REVIEWED" ]; then
   die "this change touches ${touched}${new_adr}and needs an independent review first: /code-review for code, the evidence-verifier for a decision record. Resolve what it finds, then land with --reviewed \"<what ran and what came of it>\""
 fi
@@ -129,8 +136,16 @@ fi
 # A public repository shows every commit's author and committer address, so only GitHub's noreply
 # addresses are pushed (ADR 0014).
 if [ -n "$remote" ]; then
-  exposed=$(git log --format='%ae%n%ce' "$base..$branch" | grep -vcE '(@users\.noreply\.github\.com|^noreply@github\.com)$' || true)
+  idents=$(git log --format='%ae%n%ce' "$base..$branch") || die "could not read the commits on $branch"
+  exposed=$(printf '%s\n' "$idents" | grep -vcE '(@users\.noreply\.github\.com|^noreply@github\.com)$' || true)
   [ "$exposed" -eq 0 ] || die "$exposed author or committer address(es) on $branch are not GitHub noreply addresses. Set git config user.email to your noreply address and recommit."
+  # Trailers such as Co-authored-by carry addresses too. GitHub's and Anthropic's noreply addresses, and
+  # GitHub's support address that its bots sign with, are fine; anything else is refused.
+  messages=$(git log --format=%B "$base..$branch") || die "could not read the commit messages on $branch"
+  # Each address on a trailer line is judged by itself, so one noreply address cannot cover for another.
+  exposed=$(printf '%s\n' "$messages" | grep -iE '^[[:space:]]*[A-Za-z-]+-by:' | grep -oE '<[^<>]*@[^<>]*>' \
+              | grep -vcE '^<([^<>]*@users\.noreply\.github\.com|noreply@github\.com|noreply@anthropic\.com|support@github\.com)>$' || true)
+  [ "$exposed" -eq 0 ] || die "$exposed address(es) in commit message trailers on $branch are not noreply addresses. Reword the commit."
 fi
 
 note "$branch is $ahead commit(s) ahead of main. Running every check."
@@ -150,17 +165,24 @@ fi
 if [ "$DRY" -eq 1 ]; then note "dry run: would push $branch, open a pull request if there is none, sign off and squash-merge it"; exit 0; fi
 git push -q -u "$remote" "$branch" || die "push failed"
 sha=$(git rev-parse HEAD)
-if ! gh pr view "$branch" --json url >/dev/null 2>&1; then
+# The open pull request for this branch, by number from here on. Looking it up by branch name alone would
+# also find an earlier, already merged pull request of a branch that had the same name.
+# `--head` takes a bare branch name, so a fork's pull request from a branch of the same name is left out
+# by its own flag.
+open_pr() { gh pr list --head "$branch" --base main --state open --json number,url,isCrossRepository \
+              --jq '[.[] | select(.isCrossRepository | not)][0] | select(. != null) | "\(.number) \(.url)"'; }
+found=$(open_pr) || die "could not list the pull requests for $branch"
+if [ -z "$found" ]; then
   if [ -n "$BODY" ]; then gh pr create --base main --head "$branch" --title "$(git log -1 --format=%s)" --body-file "$BODY" >/dev/null
   else gh pr create --base main --head "$branch" --fill >/dev/null; fi || die "could not open the pull request"
+  found=$(open_pr) || die "could not list the pull requests for $branch"
 fi
-url=$(gh pr view "$branch" --json url --jq .url)
+[ -n "$found" ] || die "no open pull request found for $branch"
+num=${found%% *}; url=${found#* }
 
 # Record the review first: `signoff` is the status the ruleset waits for, so nothing can merge before the
-# note is on the commit. A status description holds 140 characters; the note is cut to that as plain ASCII.
-if [ -n "$touched$new_adr" ]; then review_note="$REVIEWED"
-else review_note="${REVIEWED:-not needed: no code, harness script, workflow or new decision record}"; fi
-review_note=$(printf '%s' "$review_note" | LC_ALL=C tr -cd '\11\40-\176' | cut -c1-140)
+# note is on the commit. (A status description holds 140 characters; the note was cut to that when read.)
+review_note="${REVIEWED:-not needed: no code, harness script, workflow or new decision record}"
 gh api -X POST "repos/{owner}/{repo}/statuses/$sha" -f state=success -f context=review \
    -f description="$review_note" >/dev/null || die "could not record the review on $url"
 
@@ -174,13 +196,13 @@ gh api -X POST "repos/{owner}/{repo}/statuses/$sha" -f state=success -f context=
 # The ruleset also requires the hosted workflow's aggregating job, which runs the same script on GitHub's
 # runners. While that run is going, GitHub's auto-merge is switched on and this script waits for it, so
 # landing stays one command that ends with main updated.
-if gh pr merge "$branch" --squash >/dev/null 2>&1; then
+if gh pr merge "$num" --squash >/dev/null 2>&1; then
   :                                             # every requirement was already met, so it merged now
-elif gh pr merge "$branch" --auto --squash >/dev/null 2>&1; then
+elif gh pr merge "$num" --auto --squash >/dev/null 2>&1; then
   note "signed off; waiting for the hosted checks on $url"
   waited=0; limit="${LAND_WAIT_SECONDS:-540}"
-  until [ "$(gh pr view "$branch" --json state --jq .state 2>/dev/null)" = "MERGED" ]; do
-    failed=$(gh pr checks "$branch" --required --json name,bucket \
+  until [ "$(gh pr view "$num" --json state --jq .state 2>/dev/null)" = "MERGED" ]; do
+    failed=$(gh pr checks "$num" --required --json name,bucket \
                --jq '[.[] | select(.bucket == "fail" or .bucket == "cancel") | .name] | join(", ")' 2>/dev/null)
     [ -z "$failed" ] || die "a required check failed on $url: $failed. Push a fix to $branch and land again."
     [ "$waited" -lt "$limit" ] \
@@ -190,7 +212,7 @@ elif gh pr merge "$branch" --auto --squash >/dev/null 2>&1; then
 else
   die "signed off, but GitHub would neither merge nor enable auto-merge on $url"
 fi
-[ "$(gh pr view "$branch" --json state --jq .state)" = "MERGED" ] || die "GitHub accepted the merge but $url is not marked merged"
+[ "$(gh pr view "$num" --json state --jq .state)" = "MERGED" ] || die "GitHub accepted the merge but $url is not marked merged"
 
 # Bring the local main up to date. Git will not move a branch that is checked out in another worktree,
 # so in that case say where to do it; the landing itself is already done.

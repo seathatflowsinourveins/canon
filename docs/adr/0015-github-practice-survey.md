@@ -45,7 +45,7 @@ here: CODEOWNERS (13/29), because there is one owner.
 |---|---|---|---|
 | CI on GitHub Actions | 28/29 | converged | yes (rule 2) |
 | Dependency update bot (Dependabot 13, Renovate 10) | 23/29 | converged | yes (ADR 0016) |
-| Approving review on half or more of human pull requests | 13/28 | split | **no** (rule 5) |
+| Approving review on half or more of human pull requests | 12/28 | split | **no** (rule 5) |
 | Conventional Commits on 80% or more of subjects (10% or fewer at 13) | 11/29 | split | no (ADR 0014) |
 | An AI co-author trailer in the last 100 commits (Claude's at 12) | 18/29 | split | yes (ADR 0014) |
 | A bot account performs half or more of the merges | 4/29 | rare | no (rule 4) |
@@ -115,7 +115,8 @@ Read 2026-11-09. "Lane" means a research subagent fetched the page and a model s
   `.github/workflows/actions.lock`; and …/2026-10-06-stacked-pull-requests-generally-available/ (fetched; lane).
 * Restated 2026-11-10, when hosted CI was switched on: the first two table rows and rules 1 to 3.
   Re-measured the same day: the workflow-linter count was 12 through a counting error in the script; it
-  is 14. Every other count held.
+  is 14. The approving-review row moved from 13 to 12 as one repository's last 100 commits changed.
+  Every other count held.
 * https://code.claude.com/docs/en/github-actions.md — "review Claude's changes before merging"; the action
   "runs on GitHub-hosted runners" and bills Actions minutes plus tokens. No Claude Code page recommends a
   title convention, a description template or a merge method (fetched; lane).

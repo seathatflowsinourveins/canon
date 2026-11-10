@@ -153,7 +153,7 @@ do_status() {
 
   if [ -f "$ROOT/.github/dependabot.yml" ] && [ -n "$origin" ]; then
     v=$(jq -r 'if (has("bot_prs") | not) then "UNKNOWN\tconfig present; the last watch ran before the bot was added, so its pull requests are not listed yet"
-               elif ((.errors // []) | any(test("dependency bot"))) then "UNKNOWN\tconfig present; its pull requests could not be listed at the last watch"
+               elif .bot_prs == null then "UNKNOWN\tconfig present; its pull requests could not be listed at the last watch"
                else "ok\tconfig present; " + (.bot_prs | length | tostring) + " pull request(s) open at the last watch (" + .checked_at + ")" end' "$ROOT/.canon/watch.json" 2>/dev/null)
     [ -n "$v" ] || v=$(printf 'UNKNOWN\tconfig present; .canon/watch.json is missing or unreadable, so open pull requests are not known')
     row "dependency bot" "${v%%$'\t'*}" "${v#*$'\t'}"

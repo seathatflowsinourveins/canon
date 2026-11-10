@@ -1,11 +1,11 @@
 {
-  "surveyed_at": "2026-11-10T04:55:40Z",
+  "surveyed_at": "2026-11-10T06:07:15Z",
   "repos": [
     {
       "repo": "astral-sh/uv",
       "group": "canon upstream",
       "default_branch": "main",
-      "stars": 91834,
+      "stars": 91836,
       "workflows": {
         "count": 47,
         "with_top_level_permissions": 44,
@@ -162,7 +162,7 @@
       "repo": "astral-sh/ruff",
       "group": "canon upstream",
       "default_branch": "main",
-      "stars": 51145,
+      "stars": 51146,
       "workflows": {
         "count": 26,
         "with_top_level_permissions": 23,
@@ -433,7 +433,7 @@
       "repo": "nautechsystems/nautilus_trader",
       "group": "canon upstream",
       "default_branch": "develop",
-      "stars": 31421,
+      "stars": 31423,
       "workflows": {
         "count": 12,
         "with_top_level_permissions": 12,
@@ -828,7 +828,7 @@
       "repo": "jdx/mise",
       "group": "canon upstream",
       "default_branch": "main",
-      "stars": 35987,
+      "stars": 35988,
       "workflows": {
         "count": 37,
         "with_top_level_permissions": 30,
@@ -1070,7 +1070,7 @@
       "repo": "actions/checkout",
       "group": "canon upstream",
       "default_branch": "main",
-      "stars": 9009,
+      "stars": 9008,
       "workflows": {
         "count": 7,
         "with_top_level_permissions": 0,
@@ -1811,6 +1811,10 @@
             "files": 1
           },
           {
+            "event": "pull_request_review_comment",
+            "files": 1
+          },
+          {
             "event": "push",
             "files": 1
           },
@@ -1931,7 +1935,7 @@
       "repo": "openai/codex",
       "group": "agent tool",
       "default_branch": "main",
-      "stars": 134521,
+      "stars": 134554,
       "workflows": {
         "count": 28,
         "with_top_level_permissions": 6,
@@ -2055,7 +2059,7 @@
       "repo": "google-gemini/gemini-cli",
       "group": "agent tool",
       "default_branch": "main",
-      "stars": 108749,
+      "stars": 108748,
       "workflows": {
         "count": 47,
         "with_top_level_permissions": 19,
@@ -2203,7 +2207,7 @@
       "repo": "sst/opencode",
       "group": "agent tool",
       "default_branch": "dev",
-      "stars": 225711,
+      "stars": 225721,
       "workflows": {
         "count": 19,
         "with_top_level_permissions": 14,
@@ -2268,7 +2272,7 @@
         "merge_commit_pct": 0,
         "via_pull_request_pct": 100,
         "pr_suffix_pct": 100,
-        "conventional_pct": 98,
+        "conventional_pct": 97,
         "ai_marker_pct": 0,
         "ai_tools": [],
         "signed_off_pct": 0
@@ -2284,26 +2288,26 @@
           }
         ],
         "approved_pct": 1,
-        "self_merged_pct": 91,
+        "self_merged_pct": 94,
         "auto_merge_pct": 0,
         "merge_queue_pct": 0,
         "merged_by": [
           {
             "login": "rekram1-node",
-            "n": 28
+            "n": 29
           },
           {
             "login": "adamdotdevin",
-            "n": 27
+            "n": 25
           },
           {
-            "login": "Hona",
+            "login": "Tarquinen",
             "n": 9
           }
         ],
         "merged_by_bot_pct": 0,
-        "median_hours_to_merge": 0.9,
-        "median_lines_changed": 78,
+        "median_hours_to_merge": 0.8,
+        "median_lines_changed": 69,
         "median_commits": 1
       },
       "branch_rules": {
@@ -2336,7 +2340,7 @@
       "repo": "zed-industries/zed",
       "group": "agent tool",
       "default_branch": "main",
-      "stars": 94609,
+      "stars": 94614,
       "workflows": {
         "count": 46,
         "with_top_level_permissions": 46,
@@ -2477,7 +2481,7 @@
       "repo": "python/cpython",
       "group": "flagship",
       "default_branch": "main",
-      "stars": 78142,
+      "stars": 78143,
       "workflows": {
         "count": 23,
         "with_top_level_permissions": 23,
@@ -2844,7 +2848,7 @@
       "repo": "fastapi/fastapi",
       "group": "flagship",
       "default_branch": "master",
-      "stars": 104603,
+      "stars": 104604,
       "workflows": {
         "count": 18,
         "with_top_level_permissions": 18,
@@ -2970,7 +2974,7 @@
       "repo": "rust-lang/rust",
       "group": "flagship",
       "default_branch": "main",
-      "stars": 121708,
+      "stars": 121710,
       "workflows": {
         "count": 3,
         "with_top_level_permissions": 1,
@@ -3033,18 +3037,18 @@
         "signed_off_pct": 3
       },
       "pull_requests": {
-        "n": 29,
-        "human_authored": 29,
+        "n": 28,
+        "human_authored": 28,
         "bot_authored_pct": 0,
         "bot_authors": [],
-        "approved_pct": 41,
+        "approved_pct": 39,
         "self_merged_pct": 0,
         "auto_merge_pct": 0,
         "merge_queue_pct": 0,
         "merged_by": [
           {
             "login": "rust-bors",
-            "n": 29
+            "n": 28
           }
         ],
         "merged_by_bot_pct": 100,
@@ -3078,7 +3082,7 @@
       "repo": "kubernetes/kubernetes",
       "group": "flagship",
       "default_branch": "master",
-      "stars": 128965,
+      "stars": 128967,
       "workflows": {
         "count": 0,
         "with_top_level_permissions": 0,
@@ -3126,32 +3130,32 @@
       },
       "history": {
         "n": 100,
-        "merge_commit_pct": 54,
+        "merge_commit_pct": 55,
         "via_pull_request_pct": 100,
         "pr_suffix_pct": 1,
         "conventional_pct": 0,
         "ai_marker_pct": 0,
         "ai_tools": [],
-        "signed_off_pct": 5
+        "signed_off_pct": 3
       },
       "pull_requests": {
-        "n": 55,
-        "human_authored": 55,
+        "n": 56,
+        "human_authored": 56,
         "bot_authored_pct": 0,
         "bot_authors": [],
-        "approved_pct": 29,
+        "approved_pct": 28,
         "self_merged_pct": 0,
         "auto_merge_pct": 0,
         "merge_queue_pct": 0,
         "merged_by": [
           {
             "login": "kubernetes-prow",
-            "n": 55
+            "n": 56
           }
         ],
         "merged_by_bot_pct": 100,
         "median_hours_to_merge": 72.9,
-        "median_lines_changed": 87,
+        "median_lines_changed": 90,
         "median_commits": 1
       },
       "branch_rules": {
@@ -3182,7 +3186,7 @@
       "repo": "vitejs/vite",
       "group": "flagship",
       "default_branch": "main",
-      "stars": 83899,
+      "stars": 83900,
       "workflows": {
         "count": 13,
         "with_top_level_permissions": 7,
@@ -3431,7 +3435,7 @@
       "repo": "ghostty-org/ghostty",
       "group": "flagship",
       "default_branch": "main",
-      "stars": 63942,
+      "stars": 63944,
       "workflows": {
         "count": 17,
         "with_top_level_permissions": 0,
@@ -3485,18 +3489,18 @@
       },
       "history": {
         "n": 100,
-        "merge_commit_pct": 31,
+        "merge_commit_pct": 30,
         "via_pull_request_pct": 100,
-        "pr_suffix_pct": 32,
+        "pr_suffix_pct": 31,
         "conventional_pct": 18,
         "ai_marker_pct": 0,
         "ai_tools": [],
         "signed_off_pct": 4
       },
       "pull_requests": {
-        "n": 32,
-        "human_authored": 26,
-        "bot_authored_pct": 18,
+        "n": 31,
+        "human_authored": 25,
+        "bot_authored_pct": 19,
         "bot_authors": [
           {
             "login": "ghostty-vouch",
@@ -3511,14 +3515,14 @@
             "n": 1
           }
         ],
-        "approved_pct": 50,
-        "self_merged_pct": 42,
-        "auto_merge_pct": 18,
+        "approved_pct": 44,
+        "self_merged_pct": 48,
+        "auto_merge_pct": 12,
         "merge_queue_pct": 0,
         "merged_by": [
           {
             "login": "mitchellh",
-            "n": 25
+            "n": 24
           },
           {
             "login": "ghostty-vouch",
@@ -3530,8 +3534,8 @@
           }
         ],
         "merged_by_bot_pct": 9,
-        "median_hours_to_merge": 2.1,
-        "median_lines_changed": 43,
+        "median_hours_to_merge": 0.8,
+        "median_lines_changed": 78,
         "median_commits": 1
       },
       "branch_rules": {
@@ -3562,7 +3566,7 @@
       "repo": "biomejs/biome",
       "group": "flagship",
       "default_branch": "main",
-      "stars": 26075,
+      "stars": 26076,
       "workflows": {
         "count": 25,
         "with_top_level_permissions": 7,
