@@ -123,7 +123,7 @@ POLL_SECS = 2.0
 """Between account reads after the stop: at most three calls each, well inside Alpaca's 200 a minute."""
 COMMIT_ENV = "CANON_COMMIT"
 """Set by the scheduled runner, `home/.claude/canon/paper-session.sh`, to the `origin/main` commit it checked
-out for this firing (ADR 0047)."""
+out for this firing (ADR 0050)."""
 SOURCE_ROOT = Path(__file__).resolve().parents[2]
 """The checkout this module runs from."""
 MARKET_EXIT_INTERVAL_MS = 1000

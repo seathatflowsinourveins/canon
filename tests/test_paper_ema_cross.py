@@ -1,5 +1,5 @@
 """Upstream's built-in `EmaCross` trading one share of SPY in real time on Alpaca's paper environment, under the
-risk limits of `canon_trading.paper_node` (ADR 0037).
+risk limits of `canon_trading.paper_node` (ADR 0037, ADR 0049).
 
 It runs only when a paper key pair is in the environment (`ALPACA_API_KEY`, `ALPACA_SECRET_KEY`); otherwise
 pytest reports it skipped with that reason. Run it with `mise run paper:test`, which holds the paper
@@ -75,7 +75,7 @@ RUN_SUBMIT_RATE = "1/00:05:00"
 most one share (ADR 0037). Upstream's `EmaCross` has no position check and assumes its orders alternate;
 the first run without this budget built a 4-share short in under two seconds."""
 PROBE_PRICE = Price.from_str(f"{MAX_NOTIONAL_PER_ORDER_USD + Decimal('0.01')}")
-"""One cent over the cap for one share. The cap is sized for SPY near $750 (ADR 0037): one share passes,
+"""One cent over the cap for one share. The cap is sized for SPY near $750 (ADR 0049): one share passes,
 two do not, and the probe rests far above the market."""
 
 

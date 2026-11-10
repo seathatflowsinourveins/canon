@@ -72,7 +72,7 @@ next session start prints the result; a scheduled workflow does the same compari
 A background watchdog raises a macOS notification when a session
 stalls or fails repeatedly. Once the owner installs it, a second agent runs a paper session window every
 35 minutes when Alpaca's clock says a session is open, and `scripts/automation status` shows its last
-result (ADR 0047). On Mondays a scheduled session runs the `landscape-refresh` skill. Dependabot
+result (ADR 0050). On Mondays a scheduled session runs the `landscape-refresh` skill. Dependabot
 opens at most two grouped pull requests a week, for the indirect packages in `uv.lock` and for the
 workflow's actions; the session brief lists the open ones (ADR 0016).
 

@@ -2,7 +2,7 @@
 
 Contract: NautilusTrader v2.0.0rc8's `LiveNode.builder`, `LiveNode.add_builtin_strategy` and
 `LiveRiskEngineConfig`, and the strategy `EmaCross` configured by `nautilus_trader.trading.EmaCrossConfig`.
-Read 2026-11-10 (ADR 0037):
+Read 2026-11-10 (ADR 0037, ADR 0049):
 
 * https://nautilustrader.io/docs/md/latest/how_to/configure_live_trading.md: register data and execution
   clients with `LiveNode.builder(...)`; the continuous reconciliation settings and their defaults.
@@ -18,7 +18,7 @@ Read 2026-11-10 (ADR 0037):
   `"limit/HH:MM:SS"`, default `100/00:00:01` for both; a submit over the limit is denied with reason
   `RATE_LIMIT_EXCEEDED`, a modify over it is rejected with "Exceeded MAX_ORDER_MODIFY_RATE".
 
-The numbers and why each was chosen are ADR 0037's. This is an end-to-end check of the stack on paper,
+The numbers and why each was chosen are ADR 0049's. This is an end-to-end check of the stack on paper,
 not a strategy evaluation; ADR 0010 governs that, and nothing here ranks or recommends a strategy.
 
 Paper only: the execution client is `canon_alpaca`'s, whose config refuses anything but paper trading.
@@ -52,11 +52,11 @@ if TYPE_CHECKING:
     from nautilus_trader.model import InstrumentId
 
 MAX_ORDER_SUBMIT_RATE = "50/00:01:00"
-"""At most 50 submits in any minute: a quarter of Alpaca's 200 calls a minute (ADR 0037)."""
+"""At most 50 submits in any minute: a quarter of Alpaca's 200 calls a minute (ADR 0049)."""
 MAX_ORDER_MODIFY_RATE = "25/00:01:00"
-"""At most 25 modifies in any minute (ADR 0037)."""
+"""At most 25 modifies in any minute (ADR 0049)."""
 MAX_NOTIONAL_PER_ORDER_USD = Decimal(1000)
-"""Per order, in the instrument's quote currency. Sized for SPY near $750 (ADR 0037): one share passes, two
+"""Per order, in the instrument's quote currency. Sized for SPY near $750 (ADR 0049): one share passes, two
 do not. For a symbol priced far from that it caps nothing useful, or denies every order."""
 
 EMA_CROSS = "EmaCross"
