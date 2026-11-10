@@ -84,7 +84,8 @@ refused, with neither file created. Blocking under bypass mode was not provoked;
   except the title, the Context, the Considered Options, the `Chosen` line, the line introducing the
   rules, and the first two Consequences bullets, which shorten ADR 0011's first two; the lines below keep
   their original dates and how each was checked. Every line below except the permissions and settings
-  one supports both records and is kept whole in each.
+  one supports both records and is kept whole in each; the 2026-11-10 restatement line keeps only the
+  part that concerns this record.
 
 Read 2026-11-09 (fetched; fetches are model-summarised).
 
@@ -105,5 +106,4 @@ Read 2026-11-09 (fetched; fetches are model-summarised).
   Four statements were false and are corrected: that there was no remote, that the guard's list was
   read-only, that the docs say hooks run in every mode, and that uninstall reversed everything install
   added. The status command's weekly row now says it can see only the task file.
-* Restated 2026-11-10 against `scripts/automation` and `.githooks/pre-push`: rule 5, the commit gate,
-  address check and watchdog rows, the rehearsal mode, and wording in Consequences and Confirmation.
+* Restated 2026-11-10: wording in Consequences and Confirmation.
