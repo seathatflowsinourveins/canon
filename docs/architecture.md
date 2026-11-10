@@ -56,7 +56,7 @@ flowchart LR
 | Venue | Alpaca's paper Trading API, its market data (IEX feed) and its two streams | Alpaca's docs; `alpaca-py` v0.45.0 | none here | ADR 0009 |
 | Adapter | Instrument provider, data client, execution client, factories, in upstream's five modules | `alpaca-py` v0.45.0; `requests` v2.34.2, for the HTTP timeout alpaca-py does not set; NautilusTrader's adapter guide and template (template at v2.0.0rc8) | `packages/canon-alpaca/` | ADR 0009, 0012, 0024, 0030, 0036, 0038, 0039, 0042 |
 | Engine | The node: data, risk and execution engines, cache, portfolio; `BacktestNode` for backtests, `LiveNode` for paper | NautilusTrader v2.0.0rc8 | upstream | ADR 0009 |
-| Strategies and node configuration | `MaCross` and `run_backtest` on a simulated `ALPACA` venue; `ema_cross_paper_node`, a paper `LiveNode` running upstream's built-in `EmaCross` under risk limits | NautilusTrader v2.0.0rc8 | `src/canon_trading/` | ADR 0009, 0012, 0037 |
+| Strategies and node configuration | `MaCross` and `run_backtest` on a simulated `ALPACA` venue; `ema_cross_paper_node`, a paper `LiveNode` running upstream's built-in `EmaCross` under risk limits | NautilusTrader v2.0.0rc8 | `src/canon_trading/` | ADR 0009, 0012, 0037, 0049 |
 | Local data | `ParquetDataCatalog` of bars and instruments, ignored by git, filled from Alpaca by `load_bars` | NautilusTrader v2.0.0rc8 | `catalog/`, `canon_trading/bars_to_catalog.py` | ADR 0012, 0040 |
 | Trial ledger | One Optuna trial per backtest, in a SQLite study over a fixed sample, in the main checkout and shared by every worktree, ignored by git | Optuna v5.0.0 | `canon_trading/ledger.py`, `ledger/` | ADR 0010, 0035, 0041 |
 | Returns matrix | T daily rows, the session days every trial covers over the sample, one column per configuration | pandas v3.1.1; skfolio v1.12.8 `Population` | `canon_trading/returns_matrix.py` | ADR 0010, 0041 |
@@ -115,7 +115,7 @@ daily bars (ADR 0048).
   at most 60 minutes (ADR 0044).
 * **The risk engine** limits submits and modifies only; cancels and queries pass it. `ema_cross_paper_node`
   sets 50 submits and 25 modifies a minute, under Alpaca's working figure of 200 calls a minute, and
-  $1,000 notional per order; its paper test allows one submit in five minutes (ADR 0037). The adapter's
+  $1,000 notional per order; its paper test allows one submit in five minutes (ADR 0037, ADR 0049). The adapter's
   tester nodes turn the engine off (`LiveRiskEngineConfig(bypass=True)` in `test_paper_matrix.py` and
   `test_paper_execution.py`); a node that sets no limits has upstream's defaults, 100 a second each and
   no notional limit (the pinned package's `RiskEngineConfig`). Where the engine is on, a market order
@@ -142,5 +142,5 @@ daily bars (ADR 0048).
 * **Unasked.** The commit gate, the push address check, edit-time lint, a daily canon watch, a lane
   watchdog, a weekly model run and Dependabot (ADR 0011, ADR 0016, ADR 0026; `AGENTS.md`, "Automation").
   Once installed, a paper session window every 35 minutes, run from a clone each firing brings to
-  GitHub's `main` first, never from a checkout a person uses (ADR 0047).
+  GitHub's `main` first, never from a checkout a person uses (ADR 0050).
   Models are routed by lane in `canon/models.json` (ADR 0005).

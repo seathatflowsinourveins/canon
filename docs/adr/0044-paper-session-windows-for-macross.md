@@ -46,7 +46,7 @@ window (`EXTENDED_READY`) until one has passed on paper and the disconnect-hang 
 
 | Part | Setting or code | Upstream it follows |
 |---|---|---|
-| Order size and rate | ADR 0037's `risk_limits`: $1,000 per order, 50 submits and 25 modifies a minute | `LiveRiskEngineConfig` (ADR 0037) |
+| Order size and rate | ADR 0049's `risk_limits`: $1,000 per order, 50 submits and 25 modifies a minute | `LiveRiskEngineConfig` (ADR 0049) |
 | Orders and position in step with Alpaca | `open_check_interval_secs=10`, `position_check_interval_secs=60`, both off by default; the position check aligns to the adapter's position reports until `position_check_retries` (3) run out | configure_live_trading, "Continuous reconciliation": "5-10s", "30-60s" |
 | Start-up reconciliation | Scoped to the symbol and one minute of history: every run starts only once it has found the account flat, so history can only mislead, and 60 minutes could hold the last window's exit without its entry; open orders and positions are reported however old | The Lighter tutorial's `reconciliation_instrument_ids`; the minute is the adapter's own paper tests' (the tutorial uses 60; the docs' tip leaves it unset) |
 | The node | `LiveNode.builder(...)`, `with_risk_engine_config`, `with_exec_engine_config`, `with_delay_post_stop_secs(5)` | `examples/live/sandbox/exec_tester.py`, the Lighter tutorial |
@@ -151,7 +151,7 @@ Read 2026-11-10. "raw": fetched with `curl` and read whole. NautilusTrader files
   paper test blind to other positions and reading the session once. The flat cap stays SPY's; windows
   refuse other symbols.
   The adapter's three (no HTTP timeout, no stream restart, two matrix rows unasserted) are its own.
-* ADR 0037: `EmaCross` on Alpaca, the risk limits, the phantom reconciled position (read).
+* ADR 0037: `EmaCross` on Alpaca, the risk limits (now ADR 0049), the phantom reconciled position (read).
 * The offline tests and the two paper starts above (run).
 * Code review (`/code-review`, high), 2026-11-10: the naive calendar times, the ignored params, a second exit
   at stop or wind-down, a short counted as held, start-up eating the wind-down, an unwritten report;
@@ -163,4 +163,4 @@ Read 2026-11-10. "raw": fetched with `curl` and read whole. NautilusTrader files
   and `crates/trading/src/strategy/config.rs`: `EmaCross` unsubscribes on stop and nothing more, its base
   config exposes no `manage_stop`, and a market exit is reduce-only by default (fetched, raw).
 * A second reader's review of `main` (2026-11-10), six findings, all reproduced offline and fixed here and
-  in ADR 0047 (run).
+  in ADR 0047, since moved to ADR 0050 (run).

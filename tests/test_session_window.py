@@ -792,7 +792,7 @@ def test_a_refused_window_is_the_latest_record(monkeypatch, tmp_path) -> None:
 def test_the_commit_comes_from_the_runner_else_from_git_else_says_unknown(
     monkeypatch, tmp_path
 ) -> None:
-    """ADR 0047: every record names the code that ran; the field is never left out or empty."""
+    """ADR 0050: every record names the code that ran; the field is never left out or empty."""
     monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
     monkeypatch.setenv(
         "GIT_CONFIG_GLOBAL", os.devnull

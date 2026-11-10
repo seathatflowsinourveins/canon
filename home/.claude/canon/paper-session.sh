@@ -1,6 +1,6 @@
 #!/bin/bash
 # Paper session firing. Run by the launchd user agent local.canon.paper-session every 35 minutes while the
-# Mac is awake (launchd.plist(5), StartInterval); installed and removed by scripts/automation (ADR 0047).
+# Mac is awake (launchd.plist(5), StartInterval); installed and removed by scripts/automation (ADR 0050).
 #
 # Usage: paper-session.sh <mise> <checkout> <origin url> [paper:session arguments...]
 #        paper-session.sh --checkout-only <mise> <checkout> <origin url>

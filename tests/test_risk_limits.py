@@ -1,4 +1,5 @@
-"""The risk limits of `canon_trading.paper_node`, proved offline on upstream's simulated venue (ADR 0037).
+"""The risk limits of `canon_trading.paper_node`, proved offline on upstream's simulated venue
+(ADR 0037, ADR 0049).
 
 No test here opens a network connection or reads a credential. The venue is NautilusTrader's own
 `BacktestEngine` with a simulated `ALPACA` venue, a cash account with $100,000 and no fees, the settings of

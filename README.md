@@ -50,7 +50,8 @@ an account through NautilusTrader, not as a trading idea. `run_backtest` (`backt
 over their bars in a `ParquetDataCatalog` on a simulated Alpaca venue and returns the engine's own results.
 `ema_cross_paper_node` (`paper_node.py`) builds a live node on Alpaca's paper environment that runs
 upstream's built-in `EmaCross` under the risk engine's native limits; the paper test runs it for one order
-([ADR 0037](docs/adr/0037-ema-cross-paper-run-under-native-risk-limits.md)). `SessionMaCross`
+([ADR 0037](docs/adr/0037-ema-cross-paper-run-under-native-risk-limits.md); the limits are
+[ADR 0049](docs/adr/0049-paper-node-risk-limits-within-alpacas-rate-limit.md)). `SessionMaCross`
 (`session_ma_cross.py`) is `MaCross` guarded for live use, and `session_window.py` runs it for one bounded
 window on paper with a one-share cap inside the node
 ([ADR 0044](docs/adr/0044-paper-session-windows-for-macross.md)). The cap stops the node and sends no order:
@@ -142,7 +143,7 @@ Why it works this way, and what the keychain does not protect against:
 | Hosted watch (`canon check` on GitHub) | Once a day | No |
 | Landscape watch | Once a day, at session start | No |
 | Lane watchdog | Every 10 minutes while the Mac is awake | No |
-| Paper session | Every 35 minutes while the Mac is awake; a window only when Alpaca's clock says a session is open, on the `main` GitHub has then (ADR 0047) | No |
+| Paper session | Every 35 minutes while the Mac is awake; a window only when Alpaca's clock says a session is open, on the `main` GitHub has then (ADR 0050) | No |
 | Weekly refresh | Weekly, when the desktop app is open | One session, short when nothing changed |
 | Dependency bot (Dependabot) | Weekly, on GitHub | Only when a session lands its pull request |
 

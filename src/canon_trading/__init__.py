@@ -15,7 +15,7 @@ packages/canon-alpaca.
 * `variant_study` - the step 7 study: eight `MaCross` variants on daily bars, recorded and ranked
   (ADR 0048)
 * `paper_node` - `ema_cross_paper_node`, upstream's built-in `EmaCross` on a paper node under the risk
-  engine's native limits (ADR 0037)
+  engine's native limits (ADR 0037, ADR 0049)
 * `session_ma_cross` - `SessionMaCross`, `MaCross` guarded for live use, limits outside the session
 * `position_cap` - `PositionCap`, a one-share cap on the net position, checked inside the node
 * `session_window` - one bounded window of `SessionMaCross` on paper, `mise run paper:session` (ADR 0044)
