@@ -92,6 +92,7 @@ dependency, pattern and practice traces to a pinned upstream or a dated source. 
 | 0020 | Rule enforcement: no hook runs before a tool call; the merge gate and permission rules hold the rules |
 | 0021 | Orca's skills: used from sessions inside Orca, within written limits |
 | 0022 | Claude Code CLI: installed at the registry's pin and never below it |
+| 0023 | Orca's agent-view plugin (proposed): on for now; what a plugin's hooks may approve on this machine |
 
 ## Automation
 
@@ -129,7 +130,8 @@ be used within these limits (ADR 0021):
 * Research, record checks and code review stay subagents. Use an Orca worker when the work needs its own
   workspace or the owner asks to watch it, on the model `canon/models.json` gives that work (`--model`).
 * Not used: remote placement, the browser and desktop control, plugins, automations, session search, and
-  Orca's other bundled skills.
+  Orca's other bundled skills. Orca loads one plugin of its own into each session, `orca-agent-view`
+  (ADR 0023); a session installs, loads or enables none.
 * Do not start Orca from a session (`orca open`): the app would inherit that session's environment.
 
 ## Landing
