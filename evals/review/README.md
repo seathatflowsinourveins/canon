@@ -87,6 +87,7 @@ test) becomes a `[[defects]]` entry and counts from the next scoring on.
 ## Reading a score
 
 With n confirmed defects, a found-rate p has a standard error of about √(p(1−p)/n). At the 10
-defects confirmed so far, 8 of them in one case, a difference between two reviewers below about 40
-points of found-rate is noise; at about 20 it would be about 30, and defects bunched in one case widen
-both (ADR 0046).
+defects of the first run (`runs/2026-11-10-first/`), 8 of them in one case, a difference between two
+reviewers below about 40 points of found-rate is noise. With the 21 the cases hold now (10 in
+`order-modify`, 9 in `trial-ledger-gate`), it is about 30 for the whole set, and defects bunched in a few
+cases widen both (ADR 0046).

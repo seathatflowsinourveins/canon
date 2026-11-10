@@ -58,8 +58,8 @@ score could come from the prompt rather than the reviewer; it is possible later 
 6. **Runs.** One per reviewer per case by default; the procedure takes a `runs` count. A sheet from
    single runs says it measures no variance between runs (Anthropic recommends several trials).
 7. **What the set can show.** For n defects, taken as independent, a found-rate p has a standard error
-   of about √(p(1−p)/n). Today 10 defects are confirmed, in three cases, 8 of them in one: at p = 0.5 that is about ±31 points per reviewer at 95% and, unpaired, about ±44
-   on a difference; about 20 defects would give ±22 and ±31. Pairing narrows that only as far as the
+   of about √(p(1−p)/n). The first run scored 10 defects, in three cases, 8 of them in one: at p = 0.5 that is about ±31 points per reviewer at 95% and, unpaired, about ±44
+   on a difference; the 21 confirmed now (10 in `order-modify`, 9 in `trial-ledger-gate`) give about ±22 and ±31. Pairing narrows that only as far as the
    reviewers' results correlate; defects bunched in one case widen it (clustering tripled the standard
    error on one of the paper's sets, DROP). The paper's worked example needs about 1,000 questions for 3
    points, paired, at 80% power, on parameters it calls fictional. **A dozen cases rank nothing
@@ -73,8 +73,9 @@ First cases: `exec-client-first-slice` (`12f19a0`: a startup-reconciliation race
 in `05899f8`), `data-client-hardening` (`f364348`: a log read before the writer thread flushed, fixed in
 `2669c86`), `trial-ledger-gate` (`e21935c`: eight defects the gate fix `828c082` confirms with its
 regression tests; the review's other findings stay unconfirmed), and two clean ones, `cancel-all`
-(`4afa6a7`) and `stop-orders` (`724246e`). Pending, their fixes not on `main`: `order-modify`
-(`3a00f61`), `ema-cross-paper-node` (`7ce55cc`), `paper-testers` (`273ff52`). The missing HTTP timeout
+(`4afa6a7`) and `stop-orders` (`724246e`). Ready since the first run: `order-modify` (`3a00f61`: ten
+defects `52ac69c` confirms). Pending, their fixes not on `main`: `ema-cross-paper-node` (`7ce55cc`),
+`paper-testers` (`273ff52`). The missing HTTP timeout
 fixed in `5575460` is in no case, because each case commit's own module header states it as a limit.
 
 ### Consequences
@@ -83,15 +84,18 @@ fixed in `5575460` is in no case, because each case commit's own module header s
   two scorers.
 * Bad: a clean case means none was confirmed, not that none exists; the brief, not the checkout, hides
   later history; few cases, so most differences are noise.
-* Bad: the defects come from reviews. The modify defects are a Codex reader's own findings (ADR 0043's
-  trial), which favours that reviewer by construction; the sheet scores a reviewer's own finds apart.
+* Bad: the defects come from reviews. The modify defects are the findings of second readers on Codex,
+  Muse and Antigravity (ADR 0043, ADR 0045), which favours those reviewers by construction; the sheet
+  scores a reviewer's own finds apart.
 
 ### Confirmation
 
 `tests/test_review_cases.py`, in `scripts/ci`, fails unless every case is well formed and each fix
 exists, follows its case's commit, is on `HEAD`'s history, and changes and defines the named test. A
-score sheet under `evals/review/runs/` follows `evals/review/README.md`. UNVERIFIED: no reviewer has run
-a case under this brief; the Codex trial of ADR 0043 read `3a00f61` before it existed.
+score sheet under `evals/review/runs/` follows `evals/review/README.md`. The first run,
+`runs/2026-11-10-first/`, gave four reviewers the five ready cases once each: 20 of 20 reports, found
+1, 1, 2 and 1 of 10, two scorers agreeing on 40 of 40 marks; it ranks none. The second readers of
+`3a00f61` read it before the brief existed.
 
 A second reader checked this record on 2026-11-10 (`evidence-verifier`).
 
@@ -129,5 +133,7 @@ Read 2026-11-10, by a research subagent that fetched each page and summarised it
 * Second reader, 2026-11-10 (`evidence-verifier`): the benchmark descriptions held; it corrected the
   clustering, sample-size and c-CRAB statements, the Anthropic quote and the Context, and had the
   scorers' and the defects' sources stated as limits; all above.
+* 2026-11-10, after the first run: the case count, the modify defects' sources and the Confirmation now
+  state the run (`evals/review/runs/2026-11-10-first/scores.md`) and `order-modify` made ready.
 * Not found first-hand: Cohen's kappa or McNemar's test used for review scoring, and Defects4J,
   BugsInPy or SWE-bench used as a review benchmark (UNVERIFIED).

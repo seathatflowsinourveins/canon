@@ -96,3 +96,18 @@ match = "Says the no-overlap rejection does not name the trials responsible."
 reported_by = "a full review of the commit"
 fix = "828c08273851530b38d5e797bf9abfe4b92b88f8"
 test = "tests/test_ranking.py::test_trials_with_no_day_in_common_are_each_named"
+
+# Added after the run 2026-11-10-first, which scored this case without it; it counts from the next scoring.
+# A defect in a test: the fix replaces the assertion, so "failing without the fix" is read as the fixed
+# test failing on the wrong computations the old assertion accepted, which 6e6fed7's message reports.
+[[defects]]
+id = "n-hat-dsr-test-cannot-fail"
+location = "tests/test_ranking.py: test_a_pick_above_the_threshold_passes, its N-hat assertion"
+summary = """
+The only check on the DSR at N-hat asserts that it exceeds the DSR. Any benchmark below SR0 satisfies
+that, so computing it with a population deviation, with half of N-hat or with no benchmark still
+passes; the value the report prints is never checked against one worked by hand."""
+match = "Names the test (or its N-hat assertion) and says it only checks that the DSR at N-hat exceeds the DSR, so a wrong computation of the DSR at N-hat still passes."
+reported_by = "claude-opus-high, in the reviewer benchmark run 2026-11-10-first"
+fix = "6e6fed784711cee45c2ad0cbba8c1167e86b23d1"
+test = "tests/test_ranking.py::test_a_pick_above_the_threshold_passes"
