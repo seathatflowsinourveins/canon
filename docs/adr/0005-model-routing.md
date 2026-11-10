@@ -77,7 +77,14 @@ unchanged.
 ### Confirmation
 
 Subagent frontmatter pins `model` and `effort`. The status line records a model change inside a session to
-the event ledger, and `scripts/lanes` flags that session.
+the event ledger, and `scripts/lanes` flags that session. The machine settings pin the `fable` alias with
+`env.ANTHROPIC_DEFAULT_FABLE_MODEL` = `claude-fable-5-2`. `scripts/bootstrap --check` compares every
+`ANTHROPIC_DEFAULT_<ALIAS>_MODEL` in the installed and template settings with `canon/models.json` and labels
+an absent pin MISSING, a different one MISMATCH and an unreadable table UNKNOWN; it labels MISMATCH a
+top-level `model` that `canon/models.json` does not name. `scripts/test-lanes` fails when the template's pin
+differs from the table, so the two move together. It was reported, not reproduced here (`UNVERIFIED`),
+that Claude Code 2.1.321's `/model` picker labelled its Fable row "Fable 5.1" and saved that model, with no
+Fable override or allowlist set; why is not known.
 
 ## Evidence
 
@@ -94,7 +101,10 @@ Read 2026-11-09.
   as first written and is restated above; rows 1 and 3 of the table and rules 4 and 6 gained their limits.
 * https://code.claude.com/docs/en/model-config.md — aliases `opus`, `sonnet`, `haiku`, `fable` and what they
   resolve to; Claude Code's effort default is `medium` on Fable 5.2 and the 5.5 models, and `high` on Opus 5,
-  Fable 5 and Fable 5.1 (fetched).
+  Fable 5 and Fable 5.1 (fetched). Read again 2026-11-10: "Unless you set
+  `ANTHROPIC_DEFAULT_FABLE_MODEL`, the `fable` alias resolves to Fable 5 in Claude apps gateway sessions and
+  to Fable 5.2 everywhere else"; "To pin to a specific version, use the full model name ... or set the
+  corresponding environment variable"; the page's own example sets one in a settings file's `env` (fetched).
 * https://code.claude.com/docs/en/costs.md — `model: haiku` for simple subagents (fetched). The same page
   says to use Sonnet by default, which conflicts with the platform docs' Opus 5.5 starting point; this ADR
   follows the platform docs because they carry the measurements.

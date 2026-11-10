@@ -25,7 +25,10 @@
 # CLAUDE_CONFIG_DIR replaces ~/.claude. --user-config never overwrites settings.json or CLAUDE.md there: a
 # differing one gets a <name>.canon-proposed copy beside it. It replaces canon/ledger.sh and
 # canon/statusline.sh, keeping a differing previous copy beside each as <name>.replaced-<UTC time>. The
-# installed settings call the scripts in the config directory actually used.
+# installed settings call the scripts in the config directory actually used. --check also compares every
+# env.ANTHROPIC_DEFAULT_<ALIAS>_MODEL the installed settings.json sets, and each one home/.claude/settings.json
+# sets, with the model canon/models.json gives that alias (ADR 0005), and labels a difference MISMATCH, as it
+# does a top-level "model" there that canon/models.json does not name.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -121,6 +124,60 @@ check_hooks() {
   return "$rc"
 }
 
+# check_model_pins: the model aliases the installed settings pin through env.ANTHROPIC_DEFAULT_<ALIAS>_MODEL
+# (https://code.claude.com/docs/en/model-config.md: unless that variable is set, an alias resolves to the
+# provider's recommended version, which moves; "to pin to a specific version ... set the corresponding
+# environment variable"). The expected ID for each alias comes from canon/models.json (ADR 0005). Every such
+# key home/.claude/settings.json sets must be in the installed file, and every such key the installed file
+# sets must name the ID canon/models.json gives its alias. The installed top-level "model", when set, must be
+# an alias or a model canon/models.json names: a full ID outside it (the /model picker can save one) bypasses
+# the alias pins. --user-config never overwrites an existing settings.json, so this is how drift is seen.
+# Only that one file is read; the shell environment and other settings scopes are not.
+check_model_pins() {
+  local s="$CLAUDE_HOME/settings.json" m="$ROOT/canon/models.json" t="$ROOT/home/.claude/settings.json"
+  local rc=0 out alias key live want state
+  if ! jq -e '[.lanes[]? | select((.alias | type) == "string" and (.model | type) == "string")] | length > 0' "$m" >/dev/null 2>&1; then
+    row "model alias pins" UNKNOWN "no readable lanes with alias and model in canon/models.json"; return 1
+  fi
+  if ! jq -e '(.env // {}) | type == "object" and any(keys[]; test("^ANTHROPIC_DEFAULT_.+_MODEL$"))' "$t" >/dev/null 2>&1; then
+    row "model alias pins" UNKNOWN "home/.claude/settings.json is unreadable or pins no alias in env"; return 1
+  fi
+  if [ ! -f "$s" ] || ! jq -e 'type == "object"' "$s" >/dev/null 2>&1; then
+    row "model alias pins" MISSING "no readable $s; run: scripts/bootstrap --user-config"; return 1
+  fi
+  # fields are joined with US (0x1f), not a tab: read collapses empty fields between whitespace separators
+  if ! out=$(jq -rn --slurpfile t "$t" --slurpfile l "$s" --slurpfile m "$m" '
+    def pins: (.env // {}) | if type == "object" then with_entries(select(.key | test("^ANTHROPIC_DEFAULT_.+_MODEL$"))) else {} end;
+    ($m[0].lanes | map(select((.alias | type) == "string" and (.model | type) == "string"))) as $lanes
+    | ($lanes | group_by(.alias) | map({key: .[0].alias, value: (map(.model) | unique)}) | from_entries) as $want
+    | ($t[0] | pins) as $tp | ($l[0] | pins) as $lp
+    | ((($tp + $lp) | keys[]) as $k
+       | ($k | ltrimstr("ANTHROPIC_DEFAULT_") | rtrimstr("_MODEL") | ascii_downcase) as $a
+       | ($want[$a] // []) as $w
+       | ($lp[$k] | if . == null then "" else tostring end) as $v
+       | [$a + " alias", $k, $v, ($w | join(",")),
+          (if ($w | length) != 1 then "unknown" elif $lp[$k] == null then "missing" elif $v == $w[0] then "ok" else "mismatch" end)]),
+      (if $l[0] | has("model") then
+         ($l[0].model | tostring) as $v
+         | ["default model", "model", $v, "",
+            (if any($lanes[]; .alias == $v or .model == $v) then "named" else "outside" end)]
+       else empty end)
+    | map(gsub("[\u0000-\u001f]"; "?")) | join("\u001f")'); then
+    row "model alias pins" UNKNOWN "jq could not compare $s with canon/models.json"; return 1
+  fi
+  while IFS=$'\x1f' read -r alias key live want state; do
+    case "$state" in
+      ok)       row "$alias" ok "$key=$live (canon/models.json)" ;;
+      named)    row "$alias" ok "$live (an alias or model canon/models.json names)" ;;
+      outside)  row "$alias" MISMATCH "$s sets model to $live, which canon/models.json does not name; set an alias it lists"; rc=1 ;;
+      missing)  row "$alias" MISSING "$s sets no env.$key; set it to $want (canon/models.json), as home/.claude/settings.json does"; rc=1 ;;
+      unknown)  row "$alias" MISMATCH "${live:+$key=$live, but }canon/models.json gives no single model for alias ${alias% alias}"; rc=1 ;;
+      *)        row "$alias" MISMATCH "$key=$live; canon/models.json gives $want. Set env.$key to $want in $s"; rc=1 ;;
+    esac
+  done <<< "$out"
+  return "$rc"
+}
+
 # paper_row: whether both Alpaca paper key items are in the login keychain (ADR 0029). It looks each item up
 # by service and account without -w or -g, so no value is read (man security: find-generic-password). An
 # absent pair is reported and never fails the check: only the paper tests need it.
@@ -167,6 +224,7 @@ check() {
   else row "claude CLI" MISSING "run: scripts/bootstrap --install"; missing=1; fi
   note "Machine-level Claude Code config (ADR 0007), in $CLAUDE_HOME:"
   check_hooks || missing=1
+  check_model_pins || missing=1
   if [ -f "$CLAUDE_HOME/CLAUDE.md" ]; then row "user CLAUDE.md" ok ""; else row "user CLAUDE.md" MISSING "run: scripts/bootstrap --user-config"; missing=1; fi
   note "Alpaca paper key pair (ADR 0029), optional:"
   paper_row
