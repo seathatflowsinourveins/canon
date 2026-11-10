@@ -516,6 +516,90 @@
       "adr": "0043"
     },
     {
+      "id": "muse-code",
+      "field": "agent-harness",
+      "url": "https://dev.meta.ai/docs/muse-code",
+      "role": "tool",
+      "license": "UNVERIFIED (proprietary; Meta's pages read state no licence or terms)",
+      "why": "Meta's Muse Code CLI, a review-only Orca worker from another model family (ADR 0045, under ADR 0043's terms). No public repository, so no lock pin: version 1.4.15-R8339.1, installed machine-level by the owner through mise's muse tool (requested as latest), which reads Meta's muse-stable channel, a channel that publishes only the current release, so the next mise upgrade moves it; not in mise.toml; check with muse --version. Approval and an OS sandbox are on by default, a Read-only profile exists, and --yolo turns approval and sandbox off.",
+      "evidence": [
+        "https://dev.meta.ai/docs/muse-code",
+        "https://dev.meta.ai/docs/muse-code/permissions",
+        "https://raw.githubusercontent.com/jdx/mise/main/registry/muse.toml"
+      ],
+      "adr": "0045"
+    },
+    {
+      "id": "antigravity-cli",
+      "field": "agent-harness",
+      "repo": "google-antigravity/antigravity-cli",
+      "track": "tag:1.5.3",
+      "role": "tool",
+      "license": "UNVERIFIED (no licence file in the repository; GitHub reports none)",
+      "why": "Google's Antigravity CLI (agy), a review-only Orca worker from another model family (ADR 0045, under ADR 0043's terms). Installed machine-level by the owner at 1.5.3 (aqua:google-antigravity/antigravity-cli), not in mise.toml; check with agy --version. The installed binary reports 1.5.5: its background self-updater moves it outside the pin. Its troubleshooting page documents AGY_CLI_DISABLE_AUTO_UPDATE=true to turn that off; it is not set (ADR 0045).",
+      "evidence": [
+        "https://github.com/google-antigravity/antigravity-cli/releases",
+        "https://raw.githubusercontent.com/google-antigravity/antigravity-cli/main/README.md",
+        "https://www.onorca.dev/docs/agents/supported",
+        "https://antigravity.google/docs/cli/troubleshooting/"
+      ],
+      "adr": "0045"
+    },
+    {
+      "id": "deepseek-harness",
+      "field": "agent-harness",
+      "repo": "deepseek-ai/deepseek-harness",
+      "track": "tag:dsh-v0.2.1-rc.3",
+      "role": "tool",
+      "license": "MIT",
+      "why": "DeepSeek Harness (npm @deepseek-ai/dsh), the engine under dsh-tui, a review-only Orca worker from another model family (ADR 0045, under ADR 0043's terms). Every tag is a pre-release. Installed machine-level by the owner (npm:@deepseek-ai/dsh 0.2.1-rc.3, with pnpm for its profile), not in mise.toml; check with dsh --version. Seven community plugins and two of its own hook packages installed machine-level into the dsh-tui profile, chosen for workflow from a community list that is not a review: aegis 2.14.2 (GanyuanRan/Aegis at commit 0461c211e4d8, MIT), dsh-doublecheck 0.9.29 (PerryLink, Apache-2.0), dsh-advisor 0.6.4 (omdsh-dev, MIT), dsh-github-skills 0.2.1 (Starfie1d1272, Apache-2.0), dsh-llm-fallbacks 0.6.12 (omdsh-dev, MIT by its LICENSE file; npm gives none), dsh-memento 0.5.28 (PerryLink, Apache-2.0), dsh-tui-find 0.5.2 (xiaoxiaohaigui, MIT), and the hook packages @deepseek-ai/dsh-hooks-claude-code and @deepseek-ai/dsh-hook-protocol 0.2.1-rc.3 (deepseek-ai/deepseek-harness, MIT). Versions and licences from the profile's installed package files; none was read beyond them.",
+      "evidence": [
+        "https://github.com/deepseek-ai/deepseek-harness",
+        "https://registry.npmjs.org/@deepseek-ai/dsh",
+        "https://registry.npmjs.org/dsh-doublecheck/0.9.29",
+        "https://registry.npmjs.org/dsh-advisor/0.6.4",
+        "https://registry.npmjs.org/dsh-github-skills/0.2.1",
+        "https://registry.npmjs.org/dsh-llm-fallbacks/0.6.12",
+        "https://registry.npmjs.org/dsh-memento/0.5.28",
+        "https://registry.npmjs.org/dsh-tui-find/0.5.2",
+        "https://github.com/GanyuanRan/Aegis",
+        "https://registry.npmjs.org/@deepseek-ai/dsh-hooks-claude-code/0.2.1-rc.3",
+        "https://registry.npmjs.org/@deepseek-ai/dsh-hook-protocol/0.2.1-rc.3"
+      ],
+      "adr": "0045"
+    },
+    {
+      "id": "dsh-tui",
+      "field": "agent-harness",
+      "repo": "ccch1mneyyy/dsh-TUI",
+      "track": "tag:v0.17.0",
+      "role": "tool",
+      "license": "MIT",
+      "why": "Community terminal interface for DeepSeek Harness, the program Orca launches for it (dsh-tui .) under agent id dsh (its CLI bundle); which versions Orca's fixtures used is UNVERIFIED; 0.17.0 follows dsh 0.2.1-rc.3 (ADR 0045). Installed machine-level by the owner (npm:@deepseek-harness-tui/dsh-tui 0.17.0), not in mise.toml; its profile lives in the user's home and its update command updates the profile and aligns the launcher, outside the pin. Its profiles send session logs to the configured base URL by default.",
+      "evidence": [
+        "https://github.com/ccch1mneyyy/dsh-TUI/releases",
+        "https://raw.githubusercontent.com/ccch1mneyyy/dsh-TUI/v0.17.0/README.md",
+        "https://raw.githubusercontent.com/ccch1mneyyy/dsh-TUI/main/README.md",
+        "https://github.com/stablyai/orca/issues/38131",
+        "https://github.com/stablyai/orca/issues/26594"
+      ],
+      "adr": "0045"
+    },
+    {
+      "id": "pnpm",
+      "field": "toolchain",
+      "repo": "pnpm/pnpm",
+      "track": "tag:v10.34.9",
+      "role": "tool",
+      "license": "MIT",
+      "why": "Package manager dsh-tui needs to build and update its profile (ADR 0045). Installed machine-level by the owner (mise pnpm 10.34.9), not in mise.toml; check with pnpm --version. It runs on the machine-level mise node, 24.22.2 by mise ls -g; the node entry is this repo's own request, which the same release meets.",
+      "evidence": [
+        "https://github.com/pnpm/pnpm/releases/tag/v10.34.9",
+        "https://raw.githubusercontent.com/ccch1mneyyy/dsh-TUI/main/README.md"
+      ],
+      "adr": "0045"
+    },
+    {
       "id": "python",
       "field": "toolchain",
       "repo": "python/cpython",

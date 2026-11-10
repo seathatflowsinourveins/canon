@@ -90,6 +90,15 @@
       "sha": "2c5958ecac7cee2b583967a2c4981d0f4a75c579",
       "track": "default"
     },
+    "antigravity-cli": {
+      "default_branch": "main",
+      "default_sha": "3e9fbcc9773e46659f2d21b7ede1ba5906e71eb8",
+      "ref": "refs/tags/1.5.3",
+      "repo": "google-antigravity/antigravity-cli",
+      "resolved_at": "2026-11-10T21:34:01Z",
+      "sha": "099f43f0b0b7a9ffe17b549d80aac1f1ff6e2bb5",
+      "track": "tag:1.5.3"
+    },
     "ccusage": {
       "default_branch": "main",
       "default_sha": "c782234083efada49302b2421458b6f7b622ef43",
@@ -144,6 +153,15 @@
       "sha": "086ccc833bc9cf01024ad2dd6af7dbd421b6bf9a",
       "track": "tag:rust-v0.167.0"
     },
+    "deepseek-harness": {
+      "default_branch": "master",
+      "default_sha": "fcc0ad462172522aaf5c93a7b2e01f6b9f0b0159",
+      "ref": "refs/tags/dsh-v0.2.1-rc.3",
+      "repo": "deepseek-ai/deepseek-harness",
+      "resolved_at": "2026-11-10T21:34:03Z",
+      "sha": "1f81c047fc48fa190a683e469daa699857e9afe8",
+      "track": "tag:dsh-v0.2.1-rc.3"
+    },
     "dependabot": {
       "default_branch": "main",
       "default_sha": "de277ef139da42a7953b888c70c69e4c625caf35",
@@ -152,6 +170,15 @@
       "resolved_at": "2026-11-10T03:33:43Z",
       "sha": "de277ef139da42a7953b888c70c69e4c625caf35",
       "track": "branch:main"
+    },
+    "dsh-tui": {
+      "default_branch": "main",
+      "default_sha": "de73c6f3e5fa8c5b98b7fc87907395f5832c8aa3",
+      "ref": "refs/tags/v0.17.0",
+      "repo": "ccch1mneyyy/dsh-TUI",
+      "resolved_at": "2026-11-10T21:34:03Z",
+      "sha": "103834cb1000a84569a71646fec7162f18a058c8",
+      "track": "tag:v0.17.0"
     },
     "gh": {
       "default_branch": "trunk",
@@ -287,6 +314,15 @@
       "resolved_at": "2026-11-10T18:41:24Z",
       "sha": "3dcc6fbbbebc5e85dd3e83fe49b382ca7735cae1",
       "track": "tag:v3.1.1"
+    },
+    "pnpm": {
+      "default_branch": "main",
+      "default_sha": "3ec9a44cda892f46bcab1ebd52ab12293d1cdbc6",
+      "ref": "refs/tags/v10.34.9",
+      "repo": "pnpm/pnpm",
+      "resolved_at": "2026-11-10T21:34:03Z",
+      "sha": "aa97047a81b4a7ed41f9a2f5479555ed7f7685b6",
+      "track": "tag:v10.34.9"
     },
     "pytest": {
       "default_branch": "main",
