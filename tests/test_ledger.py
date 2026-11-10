@@ -13,11 +13,14 @@ trade size of 1.5 shares fails the strategy's start, because an equity is whole-
 Each bar is stamped available 24 hours after its open, at 04:00 UTC the next day (the adapter's
 `parse_bar`), so the 40 session days are the UTC days Tuesday to Saturday of each week, from
 2025-03-11 to 2025-05-03. Each study's sample (ADR 0041) is 2025-03-10 to 2025-05-04, every bar of the
-catalog, unless a test says otherwise; `append_bars` adds 30 more, from 2025-05-05.
+catalog, unless a test says otherwise; `append_bars` adds 30 more, from 2025-05-05, and the catalog
+then covers 2025-03-10 to 2025-06-15.
 """
 
 from __future__ import annotations
 
+import dataclasses
+import shutil
 import subprocess
 import sys
 from contextlib import ExitStack
@@ -31,7 +34,9 @@ from zoneinfo import ZoneInfo
 import optuna
 import pytest
 from nautilus_trader.model import BarType
+from nautilus_trader.model import NautilusDataType
 from nautilus_trader.model import Quantity
+from nautilus_trader.persistence import ParquetDataCatalog
 from optuna.exceptions import DuplicatedStudyError
 from optuna.trial import TrialState
 
@@ -40,12 +45,15 @@ from canon_trading.ledger import DAY_NS
 from canon_trading.ledger import FAILED
 from canon_trading.ledger import IDLE
 from canon_trading.ledger import OUTCOME
+from canon_trading.ledger import SAMPLES
 from canon_trading.ledger import TRADED
 from canon_trading.ledger import LedgerNotFound
+from canon_trading.ledger import Sample
 from canon_trading.ledger import canonical_json
 from canon_trading.ledger import config_key
 from canon_trading.ledger import create_ledger_study
 from canon_trading.ledger import current_sample
+from canon_trading.ledger import data_digest
 from canon_trading.ledger import default_ledger_path
 from canon_trading.ledger import move_sample
 from canon_trading.ledger import open_study
@@ -95,8 +103,16 @@ APPENDED = [110.0 + (i % 7) - 3 for i in range(30)]
 def append_bars(alpaca_bars: AlpacaBars, path: Path) -> list[Bar]:
     """30 more AAPL bars, from Monday 2025-05-05, the weekday after the last of the 40."""
     return alpaca_bars.write(
-        path, APPENDED, first=datetime(2025, 5, 5, tzinfo=NEW_YORK), previous=alpaca_bars.CLOSES[-1]
+        path,
+        APPENDED,
+        first=datetime(2025, 5, 5, tzinfo=NEW_YORK),
+        previous=alpaca_bars.CLOSES[-1],
+        covered_from=utc_ns(END) + 1,  # the next load asks from where the last one ended
     )
+
+
+def utc_ns(text: str) -> int:
+    return int(datetime.fromisoformat(text).replace(tzinfo=UTC).timestamp()) * 1_000_000_000
 
 
 def strategy(
@@ -358,14 +374,15 @@ def test_a_config_changed_between_records_is_hashed_as_it_ran(
 def test_a_result_that_cannot_be_recorded_is_told_failed(
     alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The run returned, but reading the bars it read raised: the record fails, and says why."""
+    """The run returned, but reading the days of the bars it read raised: the record fails, and says
+    why."""
     alpaca_bars.write(tmp_path / "catalog")
     study = new_study(stack, tmp_path, "unrecorded")
 
-    def unreadable(*_: object) -> list[Bar]:
+    def unreadable(*_: object) -> list[str]:
         raise OSError("catalog went away")
 
-    monkeypatch.setattr("canon_trading.ledger.bars_read", unreadable)
+    monkeypatch.setattr("canon_trading.ledger.session_days", unreadable)
     with pytest.raises(OSError, match="catalog went away"):
         record_trial(study, tmp_path / "catalog", [strategy()], starting_balances=BALANCES)
 
@@ -464,8 +481,8 @@ def test_a_study_keeps_its_samples_and_moving_one_keeps_every_record(
     study = new_study(stack, tmp_path, "moved")
     record_trial(study, tmp_path / "catalog", [strategy()], starting_balances=BALANCES)
 
-    later = move_sample(study, start=START, end="2025-06-16")
-    again = move_sample(study, start=START, end="2025-06-16")
+    later = move_sample(study, start=START, end="2025-06-15")
+    again = move_sample(study, start=START, end="2025-06-15")
 
     reopened = stack.enter_context(open_study("moved", tmp_path / "trials.db"))
     assert [s.number for s in samples(reopened)] == [0, 1, 2]
@@ -530,7 +547,7 @@ def test_a_moved_sample_needs_every_configuration_run_on_it(
     for config in configs:
         record_trial(study, tmp_path / "catalog", [config], starting_balances=BALANCES)
     append_bars(alpaca_bars, tmp_path / "catalog")
-    move_sample(study, start=START, end="2025-06-16")
+    move_sample(study, start=START, end="2025-06-15")
     first = record_trial(study, tmp_path / "catalog", [configs[0]], starting_balances=BALANCES)
 
     with pytest.raises(RankingStopped) as stopped:
@@ -544,7 +561,7 @@ def test_a_moved_sample_needs_every_configuration_run_on_it(
         record_trial(study, tmp_path / "catalog", [config], starting_balances=BALANCES)
     report = rank(study)
     assert (report.n, report.t, report.records, report.all_records) == (3, 70, 3, 6)
-    assert "sample 1 (2025-03-10T00:00:00+00:00 to 2025-06-16T00:00:00+00:00)" in report.summary()
+    assert "sample 1 (2025-03-10T00:00:00+00:00 to 2025-06-15T00:00:00+00:00)" in report.summary()
 
 
 def test_a_corrected_catalog_disagrees_until_the_sample_is_moved(
@@ -601,7 +618,7 @@ def test_a_sample_the_catalog_does_not_reach_is_refused_before_a_trial(
     alpaca_bars.write(tmp_path / "catalog")
     study = new_study(stack, tmp_path, "mistyped", start="2015-03-10", end="2015-05-04")
 
-    with pytest.raises(LookupError, match="holds no AAPL.ALPACA-1-DAY-LAST-EXTERNAL bars from"):
+    with pytest.raises(LookupError, match="does not cover the sample: missing 2015-03-10"):
         record_trial(study, tmp_path / "catalog", [strategy()], starting_balances=BALANCES)
 
     assert study.trials == []
@@ -778,3 +795,192 @@ def _sharpe(values: list[float]) -> float:
     import statistics
 
     return statistics.fmean(values) / statistics.stdev(values)
+
+
+# A later review of the gate, 2026-11-10: each test failed before its fix.
+
+
+def test_the_digest_is_of_the_bars_the_run_read_not_a_later_catalog(
+    alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The catalog replaced between the replay and the hash gave the old run the new bars' digest, so
+    two runs on different bars agreed and the gate ranked them (DSR 0.95144 in the review)."""
+    original = alpaca_bars.write(tmp_path / "catalog")
+    corrected = list(alpaca_bars.CLOSES)
+    corrected[9] += 0.5
+    study = new_study(stack, tmp_path, "replaced")
+    real = canon_trading.ledger.run_backtest_config
+
+    def run_then_replace(*args: Any) -> object:
+        run = real(*args)
+        shutil.rmtree(tmp_path / "catalog")
+        alpaca_bars.write(tmp_path / "catalog", corrected)
+        return run
+
+    monkeypatch.setattr(canon_trading.ledger, "run_backtest_config", run_then_replace)
+    record_trial(study, tmp_path / "catalog", [strategy()], starting_balances=BALANCES)
+    monkeypatch.undo()
+    record_trial(
+        study, tmp_path / "catalog", [strategy(fast=2, slow=5)], starting_balances=BALANCES
+    )
+
+    first, second = study.trials
+    assert first.user_attrs["data_digest"] == data_digest(original)
+    assert second.user_attrs["data_digest"] != first.user_attrs["data_digest"]
+    with pytest.raises(RankingStopped, match="read different bars"):
+        rank(study)
+
+
+@pytest.mark.parametrize(
+    ("start", "end", "missing"),
+    [
+        pytest.param(START, "2026-05-04", "2025-05-04", id="bars end a year early"),
+        pytest.param("2024-03-10", END, "2024-03-10", id="bars start a year late"),
+    ],
+)
+def test_a_sample_the_catalog_covers_in_part_is_refused_naming_the_gap(
+    alpaca_bars: AlpacaBars,
+    tmp_path: Path,
+    stack: ExitStack,
+    start: str,
+    end: str,
+    missing: str,
+) -> None:
+    """Any overlap was accepted: on a sample to May 2026 with bars to May 2025, two configurations
+    ranked on the 40 days they shared (DSR 0.98118 in the review)."""
+    alpaca_bars.write(tmp_path / "catalog")
+    study = new_study(stack, tmp_path, "in part", start=start, end=end)
+
+    with pytest.raises(LookupError, match=rf"does not cover the sample: missing {missing}"):
+        record_trial(study, tmp_path / "catalog", [strategy()], starting_balances=BALANCES)
+
+    assert study.trials == []
+
+
+def test_a_keyed_failure_before_its_sample_is_written_stops_the_ranking(
+    alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An error on the sample write left #2 failed with a key and no sample; the ranking left it out
+    and passed on #0 and #1. A later record of its key resolves it."""
+    alpaca_bars.write(tmp_path / "catalog")
+    study = new_study(stack, tmp_path, "no sample")
+    record_trial(study, tmp_path / "catalog", [strategy()], starting_balances=BALANCES)
+    record_trial(
+        study, tmp_path / "catalog", [strategy(fast=2, slow=5)], starting_balances=BALANCES
+    )
+    real = optuna.trial.Trial.set_user_attr
+
+    def locked(trial: optuna.trial.Trial, key: str, value: object) -> None:
+        if key == "sample":
+            raise OSError("database is locked")
+        real(trial, key, value)
+
+    monkeypatch.setattr(optuna.trial.Trial, "set_user_attr", locked)
+    with pytest.raises(OSError, match="database is locked"):
+        record_trial(study, tmp_path / "catalog", [strategy()], starting_balances=BALANCES)
+    monkeypatch.undo()
+
+    failed = study.trials[2]
+    assert "sample" not in failed.user_attrs and failed.state == TrialState.FAIL
+    with pytest.raises(RankingStopped, match=r"no later record ran to the end after #2 \(failed\)"):
+        rank(study)
+    record_trial(study, tmp_path / "catalog", [strategy()], starting_balances=BALANCES)
+    assert rank(study).n == 2
+
+
+def test_a_creation_interrupted_before_its_sample_is_completed_by_the_next(
+    tmp_path: Path, stack: ExitStack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The name was committed before its sample: open refused it as having no sample, and creation
+    as a duplicate, so nothing short of editing the file could recover it."""
+    real = optuna.Study.set_user_attr
+
+    def interrupted(study: optuna.Study, key: str, value: object) -> None:
+        if key == SAMPLES:
+            raise KeyboardInterrupt
+        real(study, key, value)
+
+    monkeypatch.setattr(optuna.Study, "set_user_attr", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        new_study(stack, tmp_path, "half made")
+    monkeypatch.undo()
+
+    with pytest.raises(LedgerNotFound, match="create_ledger_study completes it"):
+        stack.enter_context(open_study("half made", tmp_path / "trials.db"))
+    study = new_study(stack, tmp_path, "half made")
+    assert current_sample(study) == Sample(0, utc_ns(START), utc_ns(END))
+    reopened = stack.enter_context(open_study("half made", tmp_path / "trials.db"))
+    assert samples(reopened) == [current_sample(study)]
+    with pytest.raises(DuplicatedStudyError):
+        new_study(stack, tmp_path, "half made")
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        pytest.param(
+            "drop", "the engine's cache holds 39 bars and the run replayed 40", id="one short"
+        ),
+        pytest.param("outside", "the run replayed 1 bars outside sample 0", id="one outside"),
+    ],
+)
+def test_bars_the_cache_does_not_account_for_are_told_failed(
+    alpaca_bars: AlpacaBars,
+    tmp_path: Path,
+    stack: ExitStack,
+    monkeypatch: pytest.MonkeyPatch,
+    change: str,
+    message: str,
+) -> None:
+    """The digest is only of the bars the run read if the cache holds every one, and only those."""
+    alpaca_bars.write(tmp_path / "catalog")
+    study = new_study(stack, tmp_path, "unaccounted")
+    real = canon_trading.ledger.run_backtest_config
+    stray = alpaca_bars.daily(
+        alpaca_bars.equity(), [1.0], first=datetime(2024, 3, 11, tzinfo=NEW_YORK)
+    )
+
+    def changed(*args: Any) -> object:
+        run = real(*args)
+        bars = run.bars[1:] if change == "drop" else [*run.bars[1:], *stray]
+        return dataclasses.replace(run, bars=bars)
+
+    monkeypatch.setattr(canon_trading.ledger, "run_backtest_config", changed)
+    with pytest.raises(RuntimeError, match=message):
+        record_trial(study, tmp_path / "catalog", [strategy()], starting_balances=BALANCES)
+
+    [trial] = study.trials
+    assert (trial.state, trial.user_attrs[OUTCOME]) == (TrialState.FAIL, FAILED)
+    assert "data_digest" not in trial.user_attrs
+
+
+def test_a_hole_no_load_can_fill_is_closed_by_consolidating_the_catalog(
+    alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack
+) -> None:
+    """A weekend between two loads has no bar, so no load records it; upstream's consolidation does."""
+    path = tmp_path / "catalog"
+    alpaca_bars.write(path)  # covers to Sunday 2025-05-04 00:00 UTC
+    append_bars(alpaca_bars, path)
+    ParquetDataCatalog(str(path)).consolidate_data(NautilusDataType.Bar, str(BAR_TYPE))
+    alpaca_bars.write(tmp_path / "holed")
+    alpaca_bars.write(
+        tmp_path / "holed",
+        APPENDED,
+        first=datetime(2025, 5, 5, tzinfo=NEW_YORK),
+        previous=alpaca_bars.CLOSES[-1],
+    )  # covers from Monday 2025-05-05 00:00 UTC: Sunday is a hole
+    study = new_study(stack, tmp_path, "holed", end="2025-06-15")
+
+    with pytest.raises(
+        LookupError, match="missing 2025-05-04T00:00:00.000000001.*consolidate_data"
+    ):
+        record_trial(study, tmp_path / "holed", [strategy()], starting_balances=BALANCES)
+    ParquetDataCatalog(str(tmp_path / "holed")).consolidate_data(
+        NautilusDataType.Bar, str(BAR_TYPE)
+    )
+    holed = record_trial(study, tmp_path / "holed", [strategy()], starting_balances=BALANCES)
+    whole = record_trial(study, path, [strategy()], starting_balances=BALANCES)
+
+    first, second = study.trials
+    assert first.user_attrs["data_digest"] == second.user_attrs["data_digest"]
+    assert holed.run.result.iterations == whole.run.result.iterations == 70

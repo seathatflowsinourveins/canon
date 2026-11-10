@@ -38,17 +38,31 @@ with what was tried.
 1. **Sample.** A study is created with one: a range [start, end] in UTC nanoseconds, both ends included,
    and a sequence number from 0, kept as the study user attribute `samples`, oldest first
    (`canon_trading.ledger.create_ledger_study`). A date with no time is its midnight. A sample the
-   catalog's stored bars do not reach is refused before a trial is asked for. `record_trial` runs every trial with
-   `BacktestRunConfig(start, end)` set to the current sample, and records its number as `sample`.
+   catalog does not cover in full is refused before a trial is asked for, naming each missing part:
+   what NautilusTrader's `ParquetDataCatalog.get_missing_intervals_for_request` reports missing, the
+   check its own historical requests use. A catalog covers the window a load asked for
+   (`canon_trading.bars_to_catalog`), or, for bars written without one, their first to last `ts_init`.
+   A stretch no load can record, such as a weekend between two loads, is closed by upstream's
+   `ParquetDataCatalog.consolidate_data`, which merges the files around it. It marks any hole
+   covered, so it is used only on a stretch a load showed to have no bar. `record_trial` runs every trial with `BacktestRunConfig(start, end)` set to the current sample, and
+   records its number as `sample`. A creation interrupted between the study's name and its sample is
+   completed by the next `create_ledger_study` of that name, through Optuna's `load_if_exists`; a
+   study that has a sample or a trial is a duplicate.
 2. **The whole sample.** Every trial the ranking reads must have the same session days over the sample.
    A trial that lacks one stops the ranking, named with its number, how many days it lacks and the days
    it covers; nothing is trimmed. This supersedes the clause of ADR 0010 step 2 that trims every variant
-   to a common range. Different instruments may share a study when their session days agree.
+   to a common range. A session day with no return in a trial's own series stops it too, and is never
+   dropped from the calendar. Different instruments may share a study when their session days agree.
 3. **Data identity.** A trial's data is its sample and `data_digest`: for each bar type the run read,
    the SHA-256 hex digest of the UTF-8 bytes of one line per bar,
    `bar_type|open|high|low|close|volume|ts_event|ts_init`, each field as NautilusTrader prints it, the
-   bars sorted by `ts_init` and `ts_event`, the lines joined by `\n`. The bars are those of the run's bar types with `ts_init` in the sample, read
-   with the same `ParquetDataCatalog.query` that gives the session days. Nothing upstream identifies data,
+   bars sorted by `ts_init` and `ts_event`, then by their text, the lines joined by `\n`. The bars, and the session days,
+   are those the run read, as the engine's cache kept them (`Cache.bars`), not a later read of the
+   catalog. The cache's `CacheConfig.bar_capacity` is raised to the count of the sample's bars in the
+   catalog, read after every other check. A run whose cache holds another number of bars than it
+   replayed (`BacktestResult.iterations`, one per data item at the pinned commit), or a bar outside
+   the sample, is told `FAIL`.
+   Nothing upstream identifies data,
    so this is local glue like the config key. It is taken from the bars, not the catalog's file layout, so
    a writer that adds, rewrites or consolidates files moves no digest unless a bar of the range changes.
    Records of one key on one sample that differ in range, returns, session days or digest disagree and
@@ -64,7 +78,10 @@ with what was tried.
 5. **Moving the sample.** `move_sample(study, start, end)` appends a sample numbered after the last; the
    same range again is a new sample, the way a corrected catalog is taken in. No record is overwritten or
    deleted. The ranking reads only records on the current sample, and stops, naming it, on a key with no
-   record there: every configuration the study tried is run again before a ranking.
+   record there: every configuration the study tried is run again before a ranking. A record with a key
+   and no sample number of the study's is read as on the current sample, so its failure stops the
+   ranking until a later record of its key resolves it. One that ran to the end with no such number
+   came from another writer and stops the ranking, named.
 6. **A record with no key ran no backtest.** `record_trial` writes the key before the run starts, so a
    record without one is what a process killed between `ask` and that write leaves. The ranking stops,
    naming it, until `mark_not_run(study, number)` clears it: a `RUNNING` one is told `FAIL`, its number
@@ -86,6 +103,13 @@ Local, no upstream. The ranking's own glue, where the upstreams read say nothing
   attributes as any JSON and validates none.
 * One ranking gathers every trial's stops before it raises, and the study's (N, V, the tie, the DSR)
   after: no upstream ranks a ledger, so the order is this repo's.
+* A record with a key and no sample number is read as on the current sample (term 5): Optuna writes
+  one user attribute at a time, and an error between the key and the sample leaves such a record.
+* A study with no sample, no trial and the ledger's direction is completed, not refused (term 1): the
+  mechanism is Optuna's `load_if_exists`, and reading such a study as a leftover of an interrupted
+  creation is this repo's, sound because every creator holds the creation lock.
+* The cache's bar capacity is sized from a count of the catalog's bars before the run (term 3);
+  upstream's default keeps 10,000 bars of a type.
 
 Who decided. The orchestrator chose option 2 and its terms under the owner's delegation of
 2026-11-10 (ADR 0010's Evidence).
@@ -100,6 +124,15 @@ Who decided. The orchestrator chose option 2 and its terms under the owner's del
   to a range it covers.
 * Bad: moving the sample reads and rewrites the `samples` list; two sessions moving one study at
   once can lose one move. Moving a study's sample is one session's act.
+* Bad: a sample must lie inside what the catalog recorded. Bars written without a window cover only
+  their first to last `ts_init`, and a stretch with no bar between two loads is never recorded;
+  `record_trial` refuses the sample, naming it, and consolidating the catalog's files closes it.
+  Consolidating over a stretch never loaded would hide a real gap; nothing here can tell the two apart.
+* Known limit: the engine's cache holds every bar of the sample for the length of a run, so memory
+  grows with the bar count. That is small for daily bars (a study of about 1,400 daily bars per
+  instrument), but a sample of minute bars over years needs its memory checked before it is recorded.
+* Bad: a catalog that grows inside the sample between the count and the replay leaves a failed
+  record of that configuration, which a later record of it resolves.
 * Bad: the digest is local glue, and a NautilusTrader pin that prints a field differently moves it; the
   records then disagree and the sample must be moved.
 
@@ -112,6 +145,16 @@ Who decided. The orchestrator chose option 2 and its terms under the owner's del
 * `tests/test_ranking.py` and `tests/test_returns_matrix.py`: a trial over a shorter range, and trials
   with no day in common, stop the ranking naming each; N counts keys across samples; a keyless record
   stops until marked, then N leaves it out, and marking a record with a key is refused.
+* The second review's cases, each a test that failed before its fix: the catalog replaced between the
+  replay and the digest (`test_the_digest_is_of_the_bars_the_run_read_not_a_later_catalog`); a
+  sample the catalog covers in part, at either end
+  (`test_a_sample_the_catalog_covers_in_part_is_refused_naming_the_gap`); an error on the sample write
+  (`test_a_keyed_failure_before_its_sample_is_written_stops_the_ranking`); a creation interrupted
+  before its sample (`test_a_creation_interrupted_before_its_sample_is_completed_by_the_next`); and
+  session days with no return (`test_a_session_day_with_no_return_is_refused`,
+  `test_session_days_with_no_return_stop_and_are_named`). With them: a cache short of a bar, or
+  holding one outside the sample, is told `FAIL`; a hole closed by `consolidate_data` records the
+  same digest as a catalog loaded whole; a record that ran with no sample number of the study stops.
 
 ## Evidence
 
@@ -137,3 +180,21 @@ package; run, executed in this checkout.
 * The full review of 2026-11-10 of the ledger, the returns matrix and the gate (`/code-review`): one short
   trial set T for every trial, and new bars left a study on two ranges with a stop nothing cleared. The
   choices above answer those findings; the owner's delegation is ADR 0010's Evidence line.
+* A second review of the gate, 2026-11-10, read only, each finding reproduced on a temporary catalog or
+  study: the digest was a read of the catalog after the replay, so a catalog replaced in between gave
+  the old run the new bars' digest and mixed inputs passed (DSR 0.95144); any overlap of the catalog
+  with the sample was accepted, and two configurations passed on a 40-day fragment of a year's sample
+  (DSR 0.98118); a keyed failure with no sample number was left out and the ranking passed; a
+  creation interrupted before its sample could be neither opened nor created again; session days with
+  no return were dropped, and three 31-day calendars passed at T = 30. Terms 1, 2, 3 and 5 corrected,
+  with no change of decision. Sources: nautilus-trader 2.0.0rc8 in `.venv`,
+  `persistence/__init__.pyi` (`get_missing_intervals_for_request`, `write_bars(start, end)`) and
+  `common/__init__.pyi` (`CacheConfig.bar_capacity`, `Cache.bars`), `bundled`; a fresh catalog reported
+  nothing missing over two adjacent recorded windows, and an object asked again after its own write
+  answered from before it; a run of 40 bars kept 10 at a capacity of 10 and 40 at 100, with the same
+  orders. Run. Optuna 5.0.0 `study/study.py`, `create_study`: the study and its direction are one
+  `create_new_study` write, and `load_if_exists` returns the study holding a taken name. `bundled`.
+  https://raw.githubusercontent.com/nautechsystems/nautilus_trader/d53849b216e20f2c122ca01b4dd0da377638b186/crates/backtest/src/engine.rs
+  — `self.iteration += 1` once per data item in `run_impl`'s loop, copied to `BacktestResult.iterations`
+  by `get_result`. Fetched. `ParquetDataCatalog.consolidate_data` closed a stretch between two files
+  with no bar (run).
