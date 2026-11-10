@@ -39,24 +39,14 @@ Chosen: **option 3**.
 | Hosted watch | Once a day, on GitHub | Scheduled workflow; `canon check` + `canon outdated` (ADR 0017) | None | The run's summary; a failed run if a tag was re-pointed or the lock is stale |
 | Landscape watch | Once a day, at session start | Async `SessionStart` hook; `canon check` + `canon outdated` | None | `.canon/watch.json`, printed at the next session start |
 | Lane watchdog | Every 10 minutes, Mac awake | launchd user agent running `lanes --json`, given the install's `CLAUDE_CONFIG_DIR` | None | macOS notification, `alerts.jsonl`, status file |
-| Weekly refresh | Mondays 09:09, desktop app open | Scheduled task `canon-landscape-refresh` running the `landscape-refresh` skill | One session | A report |
-| Unattended guard | Every tool call | `PreToolUse` hook `guard.sh` | None | Refuses the call |
+| Weekly refresh | Mondays 09:09, desktop app open | Scheduled task `canon-landscape-refresh` running the `landscape-refresh` skill (ADR 0026) | One session | A report |
 
-The `Unattended guard` row, the enforcement in rule 2 and the guard's consequence are superseded by ADR 0020.
+How the weekly model run is started and bounded is ADR 0026: its mechanism, rules 1 and 2, the
+`Unattended guard` row and what was deferred. The `Unattended guard` row, the enforcement in rule 2 and
+the guard's consequence are superseded by ADR 0020. Rules 3 to 5 stay here.
 
 Rules:
 
-1. **Scripts gate the model.** The weekly run starts with `canon check`, `canon outdated` and the expired-ADR
-   list. If all three are clean it reports that in three lines and stops.
-2. **Unattended runs report; they do not decide.** They never move a pin, change an ADR's status, commit,
-   push, or touch anything outside the repo. The owner or orchestrator approves the report. This is
-   enforced, not only asked. A scheduled task's prompt starts with a marker; a `UserPromptSubmit` hook
-   records that session as unattended; `guard.sh` then refuses every edit, every fetch outside a list of
-   documentation hosts, and every shell command outside a short list of read-only forms. The weekly task
-   was saved in bypass-permissions mode, where nothing else would ask. Claude Code's docs say a
-   `PreToolUse` hook runs before the permission prompt and that exit 2 blocks before permission rules are
-   evaluated. That this holds in bypass mode is this repo's inference, backed by the marking hook firing in
-   a bypass run; the docs do not say "every mode".
 3. **No hook wakes the model on its own.** `asyncRewake` is not used: on exit code 2 it starts a turn even
    when the session is idle.
 4. **Automation never deletes data.** The watchdog reports the ledger's size; pruning is a manual act.
@@ -68,25 +58,13 @@ Rules:
 different commit; a supply-chain warning, exit 3) and **advanced** (a tracked branch has new commits; normal).
 **STALE** (exit 4) is this repository's own state: the lock no longer matches the registry until it is resolved.
 
-Deferred, with the reason:
-
-* **Cloud scheduled tasks** (formerly routines). A research preview that clones the repo on every run; not
-  needed while the desktop task covers the weekly refresh.
-* **Headless `claude -p` under launchd.** The CLI is not signed in, and it would need `--permission-mode
-  dontAsk` and `--max-budget-usd` set.
-
 ### Consequences
 
 * Good: the frequent jobs cost nothing; the one model run is bounded and usually short.
 * Bad: nothing runs while the Mac sleeps, and the weekly task needs the desktop app open (it catches up once
   on next launch). Notification delivery from the background agent is unproven until a real alert fires;
   the status file records whether each one was delivered.
-* "Scripts gate the model" is this repo's inference from the cost guidance, not a recommendation in the docs.
-* The guard reads the text of a call. It holds a cooperative or confused agent; it is not a sandbox. Its
-  first read-only list let through four commands that could change or run something. The docs say hook
-  edits reach a running session, yet a guard added mid-session did not act there; the cause is unknown.
-* The weekly task has no hard cap on turns or spend. A desktop task exposes a model and a permission mode,
-  not a budget; only its prompt tells it to stop.
+* The consequences of the weekly run and of the guard are in ADR 0026.
 
 ### Confirmation
 
@@ -94,11 +72,7 @@ Deferred, with the reason:
 a simulated re-pointed tag gives RETAGGED and exit 3; the watch skips inside 24 hours; the watchdog alerts
 once per session and flag, and treats a hostile directory name as text.
 
-Weekly task, first run 2026-11-09 (started by hand, bypass mode): 80 seconds, 19 tool calls, marked
-unattended by the hook, report delivered; it called a pytest development tag a newer release, a fault of
-the release rule that `scripts/canon selftest` covers. Guard self-test the same day, in a fresh unattended
-session (task `canon-guard-probe`, default mode): the read-only command ran and both attempted writes were
-refused, with neither file created. Blocking under bypass mode was not provoked; the marking hook fired there.
+The weekly task's first run and the guard self-test are in ADR 0026.
 
 Installed 2026-11-09: launchd reports the watchdog loaded, one run, exit code 0. In a throwaway copy, git
 refused a commit with an evidence-free ADR and one with a broken script, and accepted a clean one. The
@@ -107,7 +81,9 @@ first install crashed (a function shadowed the system `install`) and loaded noth
 
 ## Evidence
 
-Read 2026-11-09 (fetched; fetches are model-summarised).
+Read 2026-11-09 (fetched; fetches are model-summarised). The permissions and settings line moved to ADR
+0026 when it was split from this record on 2026-11-10, with no change of decision; the lines below that
+support both records are kept in each.
 
 * https://code.claude.com/docs/en/desktop-scheduled-tasks.md — runs locally in a chosen folder; app must be
   running and the Mac awake; one catch-up run for a missed time within 7 days; each run is a fresh session;
@@ -119,9 +95,6 @@ Read 2026-11-09 (fetched; fetches are model-summarised).
   how it checks its work, what it may touch, what stops it, who approves.
 * https://code.claude.com/docs/en/headless.md — `--permission-mode` and `--max-budget-usd`; `--max-turns`
   is on the best-practices page.
-* https://code.claude.com/docs/en/permissions.md — `PreToolUse` hooks run before the permission prompt, and
-  exit 2 blocks before permission rules are evaluated; https://code.claude.com/docs/en/settings.md — edits
-  to `hooks` reach a running session without a restart (both read by the second reader).
 * Second reader, 2026-11-09 (`evidence-verifier`): the scheduling, hook and launchd facts are supported.
   Four statements were false and are corrected: that there was no remote, that the guard's list was
   read-only, that the docs say hooks run in every mode, and that uninstall reversed everything install

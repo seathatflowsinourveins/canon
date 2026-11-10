@@ -11,7 +11,7 @@ review-by: 2027-02-08
 
 A `PreToolUse` hook, `guard.sh`, read the text of every tool call and refused four kinds of thing: a
 commit that skipped the commit gate, an install that went around `uv.lock`, anything that named live
-trading, and any write in a session marked unattended (ADR 0009, ADR 0011). On 2026-11-10 it was set to
+trading, and any write in a session marked unattended (ADR 0009, ADR 0026). On 2026-11-10 it was set to
 block the call when the hook itself failed. A session that had started in another folder then lost every
 tool, the edit that would have repaired it included, until the owner changed the settings by hand. Before
 that setting the same session had worked with the guard not running. The owner asked for the hook to be
@@ -70,8 +70,8 @@ Option 4 is two things. Its sandbox half is rule 5. Its `deny` half would be a s
 docs call Bash patterns that constrain arguments "fragile" and pair them with the sandbox "when the
 restriction must hold".
 
-Supersedes ADR 0009's enforcement paragraph, and in ADR 0011 the `Unattended guard` row, the enforcement
-in rule 2 and the guard's consequence. The rest of both stands.
+Supersedes ADR 0009's enforcement paragraph, and in ADR 0026 (split from ADR 0011) the `Unattended guard`
+row, the enforcement in rule 2 and the guard's consequence. The rest of both stands.
 
 ### Consequences
 
@@ -79,7 +79,7 @@ in rule 2 and the guard's consequence. The rest of both stands.
   session is held the same way whichever app, host or runtime starts it (ADR 0018).
 * Bad: a mistaken command is no longer refused before it runs. An `ask` rule, the checks, or Alpaca
   rejecting paper keys on a live host catch what they cover; the list under the table is covered by none.
-* Bad: "Unattended runs report; they do not decide" (ADR 0011 rule 2) is enforced only for a push, a pin
+* Bad: "Unattended runs report; they do not decide" (ADR 0026 rule 2) is enforced only for a push, a pin
   move and an install. The weekly task's prompt asks for the rest.
 * Bad: rule 1 is tested on this repository's settings only. A plugin's hooks module can run before a
   tool call and, where Claude Code's built-in guard is not loaded, as on this machine, approve what a
@@ -91,7 +91,7 @@ in rule 2 and the guard's consequence. The rest of both stands.
 cause of the lock-out was read from that session, which cannot be re-run: the folder it started in holds
 three hook files and no `guard.sh`; every call returned `hook error ... blocking because onFailure is
 "block"`; the same hook, run by hand with the project directory set to this repository, exited 0. ADR 0011
-had already recorded "a guard added mid-session did not act there; the cause is unknown". The weekly
+(that text is now in ADR 0026) had already recorded "a guard added mid-session did not act there; the cause is unknown". The weekly
 task's prompt no longer names the guard, and the manual guard self-test task is deleted. Not tested: an
 unattended run since.
 

@@ -57,7 +57,7 @@ Rules:
 4. **Landing.** The daily watch lists the bot's open pull requests and the session brief prints them. An
    attended session lands each with `scripts/land --pr <n>`: its own worktree, `main` merged in if the
    branch is behind, then the usual checks, sign-off and squash merge. An unattended session only reports
-   them (ADR 0011).
+   them (ADR 0026).
 5. **The bot never merges.** Bot-side automerge is rare in the sample (2 of 23) and this repo's merge needs
    the `signoff` status, which only a run of `scripts/ci` posts.
 
