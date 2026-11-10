@@ -16,8 +16,13 @@
 #   * File checks are pattern matches on text, not a YAML parse. Lines that are only a comment are
 #     ignored; a comment after code on the same line is ignored only when triggers are read.
 #   * Workflow triggers are read from the top-level `on:` key only: one event per line at the first
-#     indent (a key or a `- item`), an inline event name, or a flow list or mapping that closes on the
-#     `on:` line. A workflow whose triggers cannot be read that way is named in the row's `partial` list.
+#     indent (a key or a `- item`, also `- item` at column 0), an inline event name, or a flow list or
+#     mapping that closes on the `on:` line. A workflow whose triggers cannot be read that way, or that
+#     names none, is named in the row's `partial` list.
+#   * A `uses:` line inside a multi-line `run:` string is counted as an action reference, and a commit
+#     SHA written in upper case is not counted as a pin.
+#   * A repository with a workflow file that could not be read still counts where what was read
+#     already shows a practice; it is left out where the missing file could change the answer.
 #   * History is the last 100 commits reachable from the default branch and the pull requests they
 #     arrived through. For a busy repository that is a few days; for a quiet one, months.
 #   * Bypass lists, organisation-level settings and anything behind write access are not visible.
@@ -33,10 +38,12 @@
 # and the report leaves it out of every row that needs what is missing.
 # Exit codes of `run`:
 #   0  written; every repository read in full
-#   1  not written: gh is not signed in, the sample cannot be read, or fewer than four in five
-#      repositories could be read (the rows then go to <out.json>.partial and <out.json> is left as it was)
+#   1  not written: gh is not signed in, the sample cannot be read, <out.json> cannot be written, or
+#      fewer than four in five repositories could be read (the rows then go to <out.json>.partial);
+#      an existing <out.json> is left as it was
 #   2  usage error
 #   3  written, but some repositories could not be read or were read in part
+# `report` exits 1 when the data file cannot be read or is not survey data, and 2 on a usage error.
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 if command -v mise >/dev/null 2>&1; then MISE=$(command -v mise); else MISE="$HOME/.local/bin/mise"; fi
@@ -48,6 +55,16 @@ fail_row() { jq -n --arg r "$1" --arg g "$2" --arg e "$3" '{repo: $r, group: $g,
 unread() { partial="${partial}$1"$'\n'; }                  # adds to the caller's `partial` list
 list_json() { printf '%s' "$1" | jq -Rnc '[inputs | select(length > 0)]'; }
 usage() { echo "usage: scripts/survey-github run <sample.json> <out.json> | report <data.json> | selftest" >&2; exit 2; }
+# put <file>: writes stdin to <file> through a temporary file beside it, so a failed write leaves an
+# existing <file> as it was. A <file> that exists but is not writable is not replaced.
+put() {
+  local dest="$1" tmp
+  if [ -e "$dest" ] && [ ! -w "$dest" ]; then echo "survey-github: $dest is not writable" >&2; cat >/dev/null; return 1; fi
+  tmp=$(mktemp "$(dirname "$dest")/.survey-github.XXXXXX" 2>/dev/null) \
+    || { echo "survey-github: cannot write in the directory of $dest" >&2; cat >/dev/null; return 1; }
+  if cat > "$tmp" && chmod 644 "$tmp" && mv "$tmp" "$dest"; then return 0; fi
+  rm -f "$tmp"; echo "survey-github: writing $dest failed" >&2; return 1
+}
 
 # A coding agent started from a workflow: a known action, or a CLI in its non-interactive form.
 AGENT_RE='anthropics/claude-code(-base)?-action|openai/codex-action|google-github-actions/run-gemini-cli|google-gemini/gemini-cli-action|github(next)?/gh-aw|claude (-p|--print)|codex exec|gemini (-p|--prompt)|opencode (run|github)'
@@ -114,7 +131,9 @@ def ai_tools: [ (if test("noreply@anthropic\\.com|Generated with \\[?Claude Code
 # Prints the convergence tables. "converged" is two thirds or more of the repositories the row applies to;
 # "rare" is one fifth or fewer; anything between is "split". Each practice is judged once per repository
 # as x (yes), . (no), - (does not apply) or ? (needs something that could not be read); a summary row
-# counts x over x and ., and the per-repository table prints the same judgement.
+# counts x over x and ., and the per-repository table prints the same judgement. `judge` gives ? whenever
+# something needed is missing; `seen`, for practices that need to appear only once, keeps a yes that
+# what was read already shows and gives ? only in place of a no.
 # shellcheck disable=SC2016  # jq program, not shell
 REPORT_JQ='
 def med: map(select(. != null)) | if length == 0 then null else (sort | .[(length / 2 | floor)]) end;
@@ -122,9 +141,10 @@ def verdict(a; b): if b == 0 then "no data" elif a * 3 >= b * 2 then "converged"
 def share(a; b): if (b // 0) == 0 then null else (a * 100 / b | floor) end;
 def unread($deps): any((.partial // [])[]; . as $p | any($deps[]; . as $d | $p == $d or ($p | startswith($d + ":"))));
 def judge(f; g; $deps): if unread($deps) then "?" elif g then (if f then "x" else "." end) else "-" end;
+def seen(f; g; $deps): if g and f then "x" elif unread($deps) then "?" elif g then "." else "-" end;
 def known(g; $deps): judge(true; g; $deps) == "x";
 def cell: if . == "-" then "." else . end;
-def wf: .workflows.count > 0;
+def wf: (.workflows.files_listed // .workflows.count) > 0;
 def bot: .files.dependency_bot != null;
 def prs: (.pull_requests.n // 0) >= 10;
 def humanprs: (.pull_requests.human_authored // 0) >= 10;
@@ -132,10 +152,11 @@ def checks: ((.branch_rules.required_checks // []) + (.classic_protection.contex
 def ruleset: ((.branch_rules.types // []) | length) > 0;
 def perm_declared: judge(.workflows.with_any_permissions * 5 >= .workflows.count * 4; wf; ["workflow"]);
 def sha_pinned:    judge(.workflows.action_refs > 0 and .workflows.action_refs_sha_pinned * 10 >= .workflows.action_refs * 9; wf; ["workflow"]);
-def cancels:       judge(.workflows.with_cancel_in_progress > 0; wf; ["workflow"]);
-def aggregates:    judge(.workflows.aggregating_job; wf; ["workflow"]);
-def lints:         judge(.workflows.workflow_lint != null; wf; ["workflow", "precommit"]);
-def agent_ci:      judge((.workflows.agent_in_ci | length) > 0; wf; ["workflow"]);
+def cancels:       seen(.workflows.with_cancel_in_progress > 0; wf; ["workflow"]);
+def aggregates:    seen(.workflows.aggregating_job; wf; ["workflow"]);
+def lints:         seen(.workflows.workflow_lint != null; wf; ["workflow", "precommit"]);
+def agent_ci:      seen((.workflows.agent_in_ci | length) > 0; wf; ["workflow"]);
+def auto($k; $deps): seen(.workflows.automation[$k] == true; wf; $deps);
 def template:      judge(.files.pr_template != null; true; ["docs-tree"]);
 def codeowners:    judge(.files.codeowners; true; ["docs-tree"]);
 def agents_md:     judge(.files.agents_md; true; []);
@@ -162,34 +183,34 @@ def automerged:    judge((.pull_requests.auto_merge_pct // 0) >= 20; prs; ["hist
     | "Commits read per repository: 100 at \(($all | length) - ($short | length)) of \($all | length)"
       + (if ($short | length) > 0 then "; fewer at " + ($short | map("\(.repo) (\(.history.n))") | join(", ")) else "" end) + "." ),
   head("Workflow files (repositories that have any)"),
-  line("Has GitHub Actions workflows"; judge(wf; true; ["workflow"])),
+  line("Has GitHub Actions workflows"; judge(wf; true; [])),
   line("`permissions:` declared in 80% or more of workflow files, at either level"; perm_declared),
   line("- at workflow level in 80% or more"; judge(.workflows.with_top_level_permissions * 5 >= .workflows.count * 4; wf; ["workflow"])),
   line("External actions pinned by commit SHA (90% or more of references)"; sha_pinned),
-  line("Workflow lockfile `.github/workflows/actions.lock`"; judge(.workflows.lockfile == true; wf; ["workflow"])),
+  line("Workflow lockfile `.github/workflows/actions.lock`"; judge(.workflows.lockfile == true; wf; [])),
   line("`cancel-in-progress` in at least one workflow"; cancels),
   line("`persist-credentials: false` on half or more of checkouts"; judge(.workflows.checkouts > 0 and .workflows.persist_credentials_false * 2 >= .workflows.checkouts; wf; ["workflow"])),
   line("One job that aggregates the others (alls-green or `needs.*.result`)"; aggregates),
   line("Workflow linter in CI or hooks (zizmor or actionlint)"; lints),
-  line("`merge_group` trigger present"; judge(.workflows.merge_group_trigger; wf; ["workflow"])),
-  line("Labeler or stale bot workflow"; judge((.workflows.housekeeping | length) > 0; wf; ["workflow"])),
+  line("`merge_group` trigger present"; seen(.workflows.merge_group_trigger; wf; ["workflow", "triggers"])),
+  line("Labeler or stale bot workflow"; seen((.workflows.housekeeping | length) > 0; wf; ["workflow"])),
   head("Automation in workflow files (repositories that have any)"),
-  line("`timeout-minutes` set somewhere"; judge(.workflows.automation.timeouts == true; wf; ["workflow"])),
-  line("A `matrix:` in some workflow"; judge(.workflows.automation.matrix == true; wf; ["workflow"])),
-  line("Caching by a known action or `cache:` input (a lower bound)"; judge(.workflows.automation.cache == true; wf; ["workflow"])),
-  line("A scheduled (cron) workflow"; judge(.workflows.automation.scheduled == true; wf; ["workflow"])),
-  line("A `workflow_call:` key (reusable workflows; a lower bound)"; judge(.workflows.automation.reusable == true; wf; ["workflow"])),
-  line("Path filters or changed-file detection"; judge(.workflows.automation.path_filter == true; wf; ["workflow"])),
-  line("Release automation by a known action or `gh release create` (a lower bound)"; judge(.workflows.automation.release == true; wf; ["workflow"])),
-  line("`pull_request_target` used"; judge(.workflows.automation.pull_request_target == true; wf; ["workflow"])),
-  line("Coverage upload"; judge(.workflows.automation.coverage == true; wf; ["workflow"])),
-  line("Benchmarks in CI"; judge(.workflows.automation.benchmarks == true; wf; ["workflow"])),
-  line("Auto-merge of pull requests, or Dependabot metadata, in a workflow (an upper bound)"; judge(.workflows.automation.bot_automerge == true; wf; ["workflow"])),
-  line("Pull request title or commit message lint"; judge(.workflows.automation.title_lint == true; wf; ["workflow"])),
+  line("`timeout-minutes` set somewhere"; auto("timeouts"; ["workflow"])),
+  line("A `matrix:` in some workflow"; auto("matrix"; ["workflow"])),
+  line("Caching by a known action or `cache:` input (a lower bound)"; auto("cache"; ["workflow"])),
+  line("A scheduled (cron) workflow"; auto("scheduled"; ["workflow"])),
+  line("A `workflow_call` trigger (reusable workflows)"; auto("reusable"; ["workflow", "triggers"])),
+  line("Path filters or changed-file detection"; auto("path_filter"; ["workflow"])),
+  line("Release automation by a known action or `gh release create` (a lower bound)"; auto("release"; ["workflow"])),
+  line("`pull_request_target` used"; auto("pull_request_target"; ["workflow", "triggers"])),
+  line("Coverage upload"; auto("coverage"; ["workflow"])),
+  line("Benchmarks in CI"; auto("benchmarks"; ["workflow"])),
+  line("Auto-merge of pull requests, or Dependabot metadata, in a workflow (an upper bound)"; auto("bot_automerge"; ["workflow"])),
+  line("Pull request title or commit message lint"; auto("title_lint"; ["workflow"])),
   line("A coding agent runs in a workflow"; agent_ci),
-  line("- with an agent workflow triggered directly by a pull request event"; judge(any(.workflows.agent_triggers[]?; .event | test("^pull_request")); wf; ["workflow", "triggers", "agent-triggers"])),
-  line("- with one triggered by issues or comments"; judge(any(.workflows.agent_triggers[]?; .event | test("^issue")); wf; ["workflow", "triggers", "agent-triggers"])),
-  line("- with one triggered on a schedule or by another workflow"; judge(any(.workflows.agent_triggers[]?; .event | test("schedule|workflow_run")); wf; ["workflow", "triggers", "agent-triggers"])),
+  line("- with an agent workflow triggered directly by a pull request event"; seen(any(.workflows.agent_triggers[]?; .event | test("^pull_request")); wf; ["workflow", "triggers", "agent-triggers"])),
+  line("- with one triggered by issues or comments"; seen(any(.workflows.agent_triggers[]?; .event | test("^issue")); wf; ["workflow", "triggers", "agent-triggers"])),
+  line("- with one triggered on a schedule or by another workflow"; seen(any(.workflows.agent_triggers[]?; .event | test("schedule|workflow_run")); wf; ["workflow", "triggers", "agent-triggers"])),
   head("Repository files"),
   line("Dependency update bot configured"; judge(bot; true; [])),
   line("- Renovate"; judge((.files.dependency_bot // "") | test("renovate"); true; [])),
@@ -228,7 +249,7 @@ def automerged:    judge((.pull_requests.auto_merge_pct // 0) >= 20; prs; ["hist
   line("- through rulesets"; judge(ruleset; true; ["rules"])),
   line("At least one required status check"; judge((checks | length) > 0; true; ["rules", "branch"])),
   line("One or two required checks in total"; judge((checks | length) <= 2; (checks | length) > 0; ["rules", "branch"])),
-  line("An aggregating job, where a required check is visible"; judge(.workflows.aggregating_job; (checks | length) > 0; ["rules", "branch", "workflow"])),
+  line("An aggregating job, where a required check is visible"; seen(.workflows.aggregating_job; (checks | length) > 0; ["rules", "branch", "workflow"])),
   line("Ruleset requires linear history"; judge((.branch_rules.types // []) | index("required_linear_history") != null; ruleset; ["rules"])),
   line("Ruleset requires one or more approvals"; judge((.branch_rules.approvals // 0) >= 1; ruleset; ["rules"])),
   line("Ruleset allows squash only"; judge((.branch_rules.merge_methods // []) == ["squash"]; ruleset; ["rules"])),
@@ -266,8 +287,8 @@ def automerged:    judge((.pull_requests.auto_merge_pct // 0) >= 20; prs; ["hist
   ( [.repos[] | select(.error != null)] | if length > 0 then "", "Not read: " + (map("\(.repo) (\(.error))") | join(", ")) else empty end )'
 
 # on_events <workflow file>: prints the events named by the workflow's top-level `on:` key, one per line.
-# Fails when there is no such key, a flow list or mapping does not close on its line, or a name is not
-# a plain word.
+# Fails when there is no such key, it names no event, a flow list or mapping does not close on its line,
+# or a name is not a plain word.
 on_events() {
   # shellcheck disable=SC2016  # awk program, not shell
   awk -v q="'" '
@@ -277,7 +298,7 @@ on_events() {
       if (length(s) >= 2 && (c == "\"" || c == q) && substr(s, length(s), 1) == c) s = substr(s, 2, length(s) - 2)
       return s
     }
-    function emit(t) { t = unq(trim(t)); if (t ~ /^[A-Za-z_]+$/) print t; else bad = 1 }
+    function emit(t) { t = unq(trim(t)); if (t ~ /^[A-Za-z_]+$/) { print t; events++ } else bad = 1 }
     function item(t, ismap) { if (ismap) sub(/:.*$/, "", t); if (trim(t) != "") emit(t) }
     function flow(s, ismap,   i, c, depth, tok) {
       depth = 0; tok = ""
@@ -290,10 +311,12 @@ on_events() {
       }
       if (depth != 0) bad = 1
     }
-    BEGIN { onre = "^[\"" q "]?on[\"" q "]?:"; inon = 0; found = 0; bad = 0; ind = -1 }
+    BEGIN { onre = "^[\"" q "]?on[\"" q "]?:"; inon = 0; found = 0; bad = 0; ind = -1; events = 0 }
     { line = $0; sub(/\r$/, "", line) }
     line ~ /^[ \t]*#/ || line ~ /^[ \t]*$/ { next }
     { sub(/[ \t]+#.*$/, "", line) }
+    # A block sequence may start at column 0, directly under `on:`.
+    inon && ind <= 0 && line ~ /^-[ \t]/ { ind = 0; emit(substr(line, 2)); next }
     inon && line ~ /^[^ \t]/ { inon = 0 }
     inon {
       match(line, /^[ \t]*/)
@@ -312,7 +335,7 @@ on_events() {
       else if (v ~ /^\{/) flow(v, 1)
       else emit(v)
     }
-    END { if (!found || bad) exit 1 }
+    END { if (!found || bad || events == 0) exit 1 }
   ' "$1"
 }
 
@@ -325,30 +348,39 @@ linters_in() {
 }
 
 # measure_workflows <dir>: the workflow facts of a directory of workflow files, as one JSON object. Every
-# pattern is matched on lines that are not comments. A `partial` list names the agent workflows whose
-# triggers could not be read.
+# pattern is matched on lines that are not comments. A `partial` list names the files that are empty and
+# the files whose triggers could not be read.
 measure_workflows() {
   local dir="$1" nc f g n=0 with_perm=0 any_perm=0 with_cancel=0 uses_total=0 uses_sha=0 checkouts=0 no_persist=0
-  local merge_group=false agg=false partial=""
+  local agg=false partial="" ev events="" agent_events=""
   local ext='^[[:space:]]*-?[[:space:]]*uses:[[:space:]]*["'"'"']?[A-Za-z0-9_.-]+/[^@[:space:]]+@'
+  local qf='["'"'"']?false["'"'"']?'
   nc=$(mktemp -d) || return 1
   for f in "$dir"/*; do
-    [ -s "$f" ] || continue
+    [ -e "$f" ] || continue
+    [ -s "$f" ] || { unread "workflow:$(basename "$f")"; continue; }
     g="$nc/$(basename "$f")"
     code "$f" > "$g"
     n=$((n+1))
     [ "$(count '^permissions:' "$g")" -gt 0 ] && with_perm=$((with_perm+1))
     [ "$(count '^[[:space:]]*permissions:' "$g")" -gt 0 ] && any_perm=$((any_perm+1))
-    [ "$(grep -E 'cancel-in-progress:' "$g" | grep -vcE 'cancel-in-progress:[[:space:]]*false[[:space:]]*(#.*)?$')" -gt 0 ] && with_cancel=$((with_cancel+1))
+    # Each `cancel-in-progress:` value, in block or flow form; any value but false, quoted or not, cancels.
+    [ "$(grep -oE 'cancel-in-progress:[[:space:]]*[^],}#[:space:]]+' "$g" | grep -vcE ":[[:space:]]*${qf}\$")" -gt 0 ] && with_cancel=$((with_cancel+1))
     uses_total=$((uses_total + $(count "$ext" "$g")))
     uses_sha=$((uses_sha + $(count "${ext}[0-9a-f]{40}" "$g")))
     checkouts=$((checkouts + $(count 'uses:[[:space:]]*["'"'"']?actions/checkout@' "$g")))
-    no_persist=$((no_persist + $(count 'persist-credentials:[[:space:]]*false' "$g")))
-    [ "$(count '(^|[^A-Za-z_])merge_group([^A-Za-z_]|$)' "$g")" -gt 0 ] && merge_group=true
+    no_persist=$((no_persist + $(count "persist-credentials:[[:space:]]*${qf}([^A-Za-z0-9_-]|\$)" "$g")))
     if grep -qE 're-actors/alls-green' "$g" || { grep -qE 'always\(\)' "$g" && grep -qE 'needs\.\*\.result|toJSON\(needs\)' "$g"; }; then agg=true; fi
+    # The events that start this workflow, once each.
+    if ev=$(on_events "$g"); then
+      ev=$(printf '%s\n' "$ev" | sort -u)
+      events="${events}${ev}"$'\n'
+      [ "$(grep -cE -- "$AGENT_RE" "$g")" -gt 0 ] && agent_events="${agent_events}${ev}"$'\n'
+    else unread "triggers:$(basename "$g")"; fi
   done
+  on() { if [ "$(printf '%s' "$events" | grep -cx -- "$1")" -gt 0 ]; then echo true; else echo false; fi; }
 
-  local agents='[]' housekeeping='[]' auto='{}' triggers='[]' linters='{"zizmor": false, "actionlint": false}' events="" af ev
+  local agents='[]' housekeeping='[]' auto='{}' triggers='[]' linters='{"zizmor": false, "actionlint": false}'
   if [ "$n" -gt 0 ]; then
     agents=$(grep -ohE -- "$AGENT_RE" "$nc"/* | sort -u | jq -R . | jq -sc .)
     housekeeping=$(grep -ohE 'actions/labeler|actions/stale|actions/first-interaction|release-drafter/release-drafter' "$nc"/* | sort -u | jq -R . | jq -sc .)
@@ -360,9 +392,9 @@ measure_workflows() {
       --argjson path_filter   "$(wf_has 'dorny/paths-filter|tj-actions/changed-files|^[[:space:]]*paths(-ignore)?:')" \
       --argjson cache         "$(wf_has 'actions/cache|enable-cache|rust-cache|sccache|cache:[[:space:]]*["'"'"']?(true|pip|npm|pnpm|yarn|poetry)')" \
       --argjson timeouts      "$(wf_has 'timeout-minutes:')" \
-      --argjson reusable      "$(wf_has 'workflow_call:')" \
+      --argjson reusable      "$(on workflow_call)" \
       --argjson scheduled     "$(wf_has 'cron:')" \
-      --argjson pr_target     "$(wf_has 'pull_request_target')" \
+      --argjson pr_target     "$(on pull_request_target)" \
       --argjson title_lint    "$(wf_has 'action-semantic-pull-request|commitlint')" \
       --argjson release       "$(wf_has 'release-please|release-plz|changesets/action|semantic-release|goreleaser|cargo-dist|gh-action-pypi-publish|action-gh-release|gh release create')" \
       --argjson coverage      "$(wf_has 'codecov|coveralls')" \
@@ -371,19 +403,14 @@ measure_workflows() {
       '{bot_automerge: $bot_automerge, path_filter: $path_filter, cache: $cache, timeouts: $timeouts, reusable: $reusable,
         scheduled: $scheduled, pull_request_target: $pr_target, title_lint: $title_lint, release: $release,
         coverage: $coverage, benchmarks: $benchmarks, matrix: $matrix}')
-    # Which events start the workflows that run a coding agent; each event once per file.
-    for af in "$nc"/*; do
-      [ "$(grep -cE -- "$AGENT_RE" "$af")" -gt 0 ] || continue
-      if ev=$(on_events "$af"); then events="${events}$(printf '%s\n' "$ev" | sort -u)"$'\n'
-      else unread "triggers:$(basename "$af")"; fi
-    done
-    triggers=$(printf '%s' "$events" | jq -Rnc '[inputs | select(length > 0)] | group_by(.) | map({event: .[0], files: length})') \
+    # Which events start the workflows that run a coding agent, counted in files.
+    triggers=$(printf '%s' "$agent_events" | jq -Rnc '[inputs | select(length > 0)] | group_by(.) | map({event: .[0], files: length})') \
       || { triggers=null; unread agent-triggers; }
   fi
   rm -rf "$nc"
   jq -nc --argjson n "$n" --argjson with_perm "$with_perm" --argjson any_perm "$any_perm" --argjson with_cancel "$with_cancel" \
         --argjson uses_total "$uses_total" --argjson uses_sha "$uses_sha" --argjson checkouts "$checkouts" \
-        --argjson no_persist "$no_persist" --argjson merge_group "$merge_group" --argjson agg "$agg" \
+        --argjson no_persist "$no_persist" --argjson merge_group "$(on merge_group)" --argjson agg "$agg" \
         --argjson agents "$agents" --argjson housekeeping "$housekeeping" --argjson auto "$auto" \
         --argjson triggers "$triggers" --argjson linters "$linters" --argjson partial "$(list_json "$partial")" '
     { count: $n, with_top_level_permissions: $with_perm, with_any_permissions: $any_perm, with_cancel_in_progress: $with_cancel,
@@ -448,6 +475,7 @@ survey_one() {
     raw "$repo" "$branch" "$wf" > "$f" || { rm -f "$f"; unread "workflow:$(basename "$wf")"; }
   done < <(grep -E '^\.github/workflows/[^/]+\.ya?ml$' "$d/paths.txt")
   wfm=$(measure_workflows "$d/wf") || { fail_row "$repo" "$group" "workflows not measured"; return; }
+  wfm=$(jq -c --argjson listed "$(grep -cE '^\.github/workflows/[^/]+\.ya?ml$' "$d/paths.txt")" '. + {files_listed: $listed}' <<<"$wfm")
 
   # --- repository files ------------------------------------------------------------------------------
   local hooks="" bot="" cooldown=false automerge=false tmpl="" headings="[]" dep ren pc lint_pc='{}' lint_cfg linters
@@ -545,12 +573,19 @@ do_run() {
   if [ $((read_ok * 5)) -lt $((total * 4)) ]; then
     # Fewer than four in five: a network or rate-limit failure, not a few renamed repositories. Keep what
     # was there; the partial result goes beside it for whoever wants to see which ones failed.
-    jq --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{surveyed_at: $at, repos: .}' "$TMP/out.json" > "$out.partial"
+    if jq --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{surveyed_at: $at, repos: .}' "$TMP/out.json" | put "$out.partial"; then
+      echo "survey-github: only $read_ok of $total repositories could be read; $out is unchanged and the partial result is in $out.partial" >&2
+    else
+      echo "survey-github: only $read_ok of $total repositories could be read; $out is unchanged and the partial result could not be written" >&2
+    fi
     rm -rf "$TMP"
-    echo "survey-github: only $read_ok of $total repositories could be read; $out is unchanged and the partial result is in $out.partial" >&2
     exit 1
   fi
-  jq --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{surveyed_at: $at, repos: .}' "$TMP/out.json" > "$out"
+  if ! jq --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{surveyed_at: $at, repos: .}' "$TMP/out.json" | put "$out"; then
+    rm -rf "$TMP"
+    echo "survey-github: $out was not written" >&2
+    exit 1
+  fi
   rm -rf "$TMP"; rm -f "$out.partial"
   if [ "$read_ok" -lt "$total" ] || [ "$partly" -gt 0 ]; then
     echo "survey-github: wrote $out, but $((total - read_ok)) of $total repositories could not be read and $partly were read in part; the report lists them under 'Not read' and 'Partly read'" >&2
@@ -559,7 +594,11 @@ do_run() {
   echo "survey-github: wrote $out ($read_ok of $total read)" >&2
 }
 
-do_report() { [ $# -eq 1 ] || usage; jq -r "$REPORT_JQ" "$1"; }
+do_report() {
+  [ $# -eq 1 ] || usage
+  if [ ! -f "$1" ] || [ ! -r "$1" ]; then echo "survey-github: cannot read $1" >&2; exit 1; fi
+  jq -r "$REPORT_JQ" "$1" || { echo "survey-github: $1 is not survey data that can be reported" >&2; exit 1; }
+}
 
 # Offline fixtures, known answers: the history summary, the report's counting, the workflow measurement
 # on small workflow files, and a whole survey against stand-ins for `gh` and the raw file fetch.
@@ -601,16 +640,19 @@ do_selftest() {
       {repo: "b/b", group: "flagship", workflows: {count: 1, with_top_level_permissions: 0, with_any_permissions: 0, with_cancel_in_progress: 0, action_refs: 4, action_refs_sha_pinned: 0, checkouts: 1, persist_credentials_false: 0, merge_group_trigger: false, aggregating_job: false, workflow_lint: null, agent_in_ci: [], housekeeping: []}, files: {dependency_bot: null, release_cooldown: false, bot_automerge: false, pr_template: null, pr_template_headings: [], codeowners: false, agents_md: false, claude_md: false, hook_framework: null}, settings: {squash: true, merge_commit: true, rebase: true, auto_merge: false, delete_branch_on_merge: false}, history: {n: 50, merge_commit_pct: 40, via_pull_request_pct: 60, pr_suffix_pct: 0, conventional_pct: 90, ai_marker_pct: 0, signed_off_pct: 0}, pull_requests: {n: 40, human_authored: 0, merged_by_bot_pct: 100, approved_pct: null, self_merged_pct: null, auto_merge_pct: 50}, branch_rules: {types: []}, classic_protection: {protected: false, contexts: []}},
       {repo: "c/c", group: "flagship", workflows: {count: 0, with_top_level_permissions: 0, with_any_permissions: 0, with_cancel_in_progress: 0, action_refs: 0, action_refs_sha_pinned: 0, checkouts: 0, persist_credentials_false: 0, merge_group_trigger: false, aggregating_job: false, workflow_lint: "zizmor", agent_in_ci: [], housekeeping: []}, files: {dependency_bot: null, release_cooldown: false, bot_automerge: false, pr_template: null, pr_template_headings: [], codeowners: false, agents_md: false, claude_md: false, hook_framework: "pre-commit"}, settings: null, history: {n: 0}, pull_requests: {n: 0}, branch_rules: {types: []}, classic_protection: {protected: null, contexts: []}},
       {repo: "d/d", group: "flagship", error: "repository not readable"},
-      {repo: "e/e", group: "flagship", partial: ["workflow:x.yml", "rules"], workflows: {count: 1, with_top_level_permissions: 0, with_any_permissions: 0, with_cancel_in_progress: 0, action_refs: 2, action_refs_sha_pinned: 0, checkouts: 1, persist_credentials_false: 0, merge_group_trigger: false, aggregating_job: false, workflow_lint: null, agent_in_ci: [], housekeeping: []}, files: {dependency_bot: null, release_cooldown: false, bot_automerge: false, pr_template: null, pr_template_headings: [], codeowners: false, agents_md: false, claude_md: false, hook_framework: null}, settings: {squash: true, merge_commit: true, rebase: true, auto_merge: false, delete_branch_on_merge: false}, history: {n: 100, merge_commit_pct: 10, via_pull_request_pct: 0, pr_suffix_pct: 0, conventional_pct: 0, ai_marker_pct: 0, signed_off_pct: 0}, pull_requests: {n: 0, human_authored: 0}, branch_rules: null, classic_protection: {protected: false, contexts: []}}]}' | jq -r "$REPORT_JQ")
+      {repo: "e/e", group: "flagship", partial: ["workflow:x.yml", "rules"], workflows: {count: 1, files_listed: 2, with_top_level_permissions: 0, with_any_permissions: 0, with_cancel_in_progress: 1, action_refs: 2, action_refs_sha_pinned: 0, checkouts: 1, persist_credentials_false: 0, merge_group_trigger: false, aggregating_job: false, workflow_lint: null, agent_in_ci: [], housekeeping: []}, files: {dependency_bot: null, release_cooldown: false, bot_automerge: false, pr_template: null, pr_template_headings: [], codeowners: false, agents_md: false, claude_md: false, hook_framework: null}, settings: {squash: true, merge_commit: true, rebase: true, auto_merge: false, delete_branch_on_merge: false}, history: {n: 100, merge_commit_pct: 10, via_pull_request_pct: 0, pr_suffix_pct: 0, conventional_pct: 0, ai_marker_pct: 0, signed_off_pct: 0}, pull_requests: {n: 0, human_authored: 0}, branch_rules: null, classic_protection: {protected: false, contexts: []}},
+      {repo: "f/f", group: "flagship", partial: ["workflow:y.yml"], workflows: {count: 0, files_listed: 1, with_top_level_permissions: 0, with_any_permissions: 0, with_cancel_in_progress: 0, action_refs: 0, action_refs_sha_pinned: 0, checkouts: 0, persist_credentials_false: 0, merge_group_trigger: false, aggregating_job: false, workflow_lint: null, agent_in_ci: [], housekeeping: []}, files: {dependency_bot: null, release_cooldown: false, bot_automerge: false, pr_template: null, pr_template_headings: [], codeowners: false, agents_md: false, claude_md: false, hook_framework: null}, settings: {squash: true, merge_commit: true, rebase: true, auto_merge: false, delete_branch_on_merge: false}, history: {n: 100, merge_commit_pct: 10, via_pull_request_pct: 0, pr_suffix_pct: 0, conventional_pct: 0, ai_marker_pct: 0, signed_off_pct: 0}, pull_requests: {n: 0, human_authored: 0}, branch_rules: {types: []}, classic_protection: {protected: false, contexts: []}}]}' | jq -r "$REPORT_JQ")
   expect "an unreadable repository is reported, not dropped"  "$(grep -c '^Not read: d/d' <<<"$got")" 1
   expect "workflow rows count only repositories with workflows read in full" "$(grep -F 'External actions pinned by commit SHA' <<<"$got" | cut -d'|' -f3-5 | tr -d ' ')" "1/2|1/1|split"
-  expect "two of three is converged"                    "$(grep -F '| Has GitHub Actions workflows' <<<"$got" | cut -d'|' -f5 | tr -d ' ')" "converged"
-  expect "none of four is rare"                         "$(grep -F '| CODEOWNERS' <<<"$got" | cut -d'|' -f3,5 | tr -d ' ')" "0/4|rare"
+  expect "workflows listed in the tree count although one was not read" "$(grep -F '| Has GitHub Actions workflows' <<<"$got" | cut -d'|' -f3,5 | tr -d ' ')" "4/5|converged"
+  expect "a yes seen in the workflows read counts"      "$(grep -F "in at least one workflow" <<<"$got" | cut -d'|' -f3 | tr -d ' ')" "2/3"
+  expect "a no is left out when a workflow was not read" "$(grep -F '| One job that aggregates' <<<"$got" | cut -d'|' -f3 | tr -d ' ')" "1/2"
+  expect "none of five is rare"                         "$(grep -F '| CODEOWNERS' <<<"$got" | cut -d'|' -f3,5 | tr -d ' ')" "0/5|rare"
   expect "human rows leave out a repository with no human pull requests" "$(grep -F 'Approving review on half' <<<"$got" | cut -d'|' -f3 | tr -d ' ')" "1/1"
   expect "bot-merge row keeps that repository"          "$(grep -F 'A bot account performed' <<<"$got" | cut -d'|' -f3 | tr -d ' ')" "1/2"
   expect "a short history is named, not hidden"         "$(grep -c 'fewer at b/b (50), c/c (0)' <<<"$got")" 1
-  expect "a partly read repository is named with what it lacks" "$(grep -c '^Partly read.*: e/e (workflow:x.yml, rules)\.$' <<<"$got")" 1
-  expect "unread rules leave a repository out of protection rows" "$(grep -F '| Protected by a ruleset' <<<"$got" | cut -d'|' -f3 | tr -d ' ')" "1/3"
+  expect "a partly read repository is named with what it lacks" "$(grep -c '^Partly read.*: e/e (workflow:x.yml, rules); f/f (workflow:y.yml)\.$' <<<"$got")" 1
+  expect "unread rules leave a repository out of protection rows" "$(grep -F '| Protected by a ruleset' <<<"$got" | cut -d'|' -f3 | tr -d ' ')" "1/4"
   expect "a partly read repository is marked ? where it lacks data" "$(grep -F '| e/e |' <<<"$got" | cut -d'|' -f4,20 | tr -d ' ')" "?|?"
   expect "the coding-agent row is printed once"         "$(grep -cF '| A coding agent runs in a workflow |' <<<"$got")" 1
   expect "the coding-agent row is in the automation table" "$(sed -n '/^### Automation/,/^### Repository files/p' <<<"$got" | grep -cF '| A coding agent runs in a workflow |')" 1
@@ -696,8 +738,100 @@ EOF
   expect "inline name, inline list and flow mapping triggers are read" "$(jq -c '[.agent_triggers[] | select(.event | test("^(pull_request|pull_request_review|schedule|workflow_run)$"))]' <<<"$m")" \
     '[{"event":"pull_request","files":1},{"event":"pull_request_review","files":1},{"event":"schedule","files":2},{"event":"workflow_run","files":1}]'
   expect "a fully read directory has nothing partial"   "$(jq -c .partial <<<"$m")" '[]'
+  : > "$FX/wf2/empty.yml"
   m=$(measure_workflows "$FX/wf2")
-  expect "an agent workflow without readable triggers is recorded" "$(jq -c '[.partial, .agent_triggers]' <<<"$m")" '[["triggers:noon.yml"],[]]'
+  expect "an agent workflow without readable triggers is recorded" "$(jq -c '[.partial[] | select(startswith("triggers:"))], .agent_triggers' <<<"$m" | tr -d '\n')" '["triggers:noon.yml"][]'
+  expect "an empty workflow file is recorded as not read" "$(jq -c '[.partial[] | select(startswith("workflow:"))]' <<<"$m")" '["workflow:empty.yml"]'
+
+  # Triggers in the forms that are read, and in two that name no event.
+  mkdir -p "$FX/on"
+  printf 'on:\n- push\n- pull_request\njobs:\n  push:\n    runs-on: x\n' > "$FX/on/seq0.yml"
+  printf 'on:\njobs:\n  a:\n    runs-on: x\n' > "$FX/on/bare.yml"
+  printf 'on: []\njobs:\n  a:\n    runs-on: x\n' > "$FX/on/emptylist.yml"
+  expect "a block sequence at column 0 under on: is read" "$(on_events "$FX/on/seq0.yml" | tr '\n' ' ')" "push pull_request "
+  on_events "$FX/on/bare.yml" >/dev/null; rc=$?
+  expect "an on: key with nothing under it is not read as no triggers" "$rc" 1
+  on_events "$FX/on/emptylist.yml" >/dev/null; rc=$?
+  expect "an empty on: list is not read as no triggers" "$rc" 1
+
+  # One fixture per measured practice, and one where each appears only in comment lines.
+  mkdir -p "$FX/wf3" "$FX/wf4"
+  cat > "$FX/wf3/a.yml" <<'EOF'
+on: [merge_group, workflow_call]
+permissions:
+  contents: read
+concurrency: {group: a, cancel-in-progress: false}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@0123456789abcdef0123456789abcdef01234567
+        with:
+          persist-credentials: "false"
+      - uses: actions/setup-python@v5
+  all:
+    if: always()
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo '${{ toJSON(needs) }}'
+EOF
+  cat > "$FX/wf3/b.yml" <<'EOF'
+on:
+  pull_request_target:
+concurrency:
+  group: b
+  cancel-in-progress: "false"
+jobs:
+  t:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - run: make
+EOF
+  cat > "$FX/wf3/c.yml" <<'EOF'
+on:
+- push
+concurrency:
+  group: c
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+jobs:
+  t:
+    runs-on: ubuntu-latest
+    steps:
+      - run: make
+EOF
+  cat > "$FX/wf4/d.yml" <<'EOF'
+on: push
+# on: [merge_group, workflow_call, pull_request_target]
+# permissions: {}
+# concurrency: {group: d, cancel-in-progress: true}
+jobs:
+  t:
+    if: github.event_name != 'merge_group' && github.event_name != 'pull_request_target'
+    runs-on: ubuntu-latest
+    steps:
+      # - uses: actions/checkout@0123456789abcdef0123456789abcdef01234567
+      #   with:
+      #     persist-credentials: false
+      # - uses: re-actors/alls-green@v1
+      # if: always() && contains(needs.*.result, 'failure')
+      - run: make
+EOF
+  m=$(measure_workflows "$FX/wf3")
+  expect "cancel-in-progress false, in flow form or quoted, does not cancel" "$(jq .with_cancel_in_progress <<<"$m")" 1
+  expect "actions pinned by SHA are told from tag references" "$(jq -c '[.action_refs, .action_refs_sha_pinned]' <<<"$m")" '[2,1]'
+  expect "top-level permissions are told from none"     "$(jq -c '[.with_top_level_permissions, .with_any_permissions]' <<<"$m")" '[1,2]'
+  expect "an always() job reading needs aggregates"     "$(jq .aggregating_job <<<"$m")" true
+  expect "persist-credentials false is counted, quoted too" "$(jq -c '[.checkouts, .persist_credentials_false]' <<<"$m")" '[1,1]'
+  expect "merge_group, workflow_call and pull_request_target are read as triggers" \
+    "$(jq -c '[.merge_group_trigger, .automation.reusable, .automation.pull_request_target]' <<<"$m")" '[true,true,true]'
+  expect "practice fixtures are read in full"            "$(jq -c .partial <<<"$m")" '[]'
+  m=$(measure_workflows "$FX/wf4")
+  expect "comments and if: expressions are not practices" \
+    "$(jq -c '[.with_top_level_permissions, .with_cancel_in_progress, .action_refs, .checkouts, .persist_credentials_false, .aggregating_job, .merge_group_trigger, .automation.reusable, .automation.pull_request_target]' <<<"$m")" \
+    '[0,0,0,0,0,false,false,false,false]'
 
   # --- a whole survey against stand-ins for gh and the raw fetch ----------------------------------------
   # gh: answers `api <path>` from $FX/api/<path with / ? = as _>.json and fails when there is no such file.
@@ -749,6 +883,10 @@ EOF
   expect "fields nothing reads are not requested"       "$(grep -cE 'full_name|author \{ name \}' "$FX/gh.log")" 0
   r=$(survey_one t/full flagship 2>/dev/null)
   expect "a repository read in full has nothing partial" "$(jq -c .partial <<<"$r")" '[]'
+  mv "$FX/api/graphql.json" "$FX/api/graphql.json.off"
+  r=$(survey_one t/full flagship 2>/dev/null)
+  mv "$FX/api/graphql.json.off" "$FX/api/graphql.json"
+  expect "history that could not be read is recorded"   "$(jq -c '[.partial, .history.n]' <<<"$r")" '[["history"],0]'
 
   # --- exit codes of run ------------------------------------------------------------------------------
   sample() { jq -nc '$ARGS.positional | map({repo: ., group: "g"})' --args "$@" > "$FX/sample.json"; }
@@ -762,6 +900,17 @@ EOF
   expect "run exits 3 when one in five cannot be read"  "$rc:$(jq '.repos | length' "$FX/out.json")" "3:5"
   sample t/full t/gone; rm -f "$FX/out.json"; ( do_run "$FX/sample.json" "$FX/out.json" ) 2>/dev/null; rc=$?
   expect "run exits 1 and writes nothing when too few can be read" "$rc:$([ -f "$FX/out.json" ] && echo written || echo absent)" "1:absent"
+  sample t/full; ( do_run "$FX/sample.json" "$FX/missing/out.json" ) 2>/dev/null; rc=$?
+  expect "run exits 1 when the output directory does not exist" "$rc" 1
+  printf 'kept\n' > "$FX/out.json"; chmod 444 "$FX/out.json"; ( do_run "$FX/sample.json" "$FX/out.json" ) 2>/dev/null; rc=$?
+  expect "run exits 1 and keeps a file it cannot write" "$rc:$(cat "$FX/out.json")" "1:kept"
+  chmod 644 "$FX/out.json"
+
+  # --- exit codes of report ---------------------------------------------------------------------------
+  ( do_report "$FX/no-such.json" ) 2>/dev/null; rc=$?
+  expect "report on a missing file exits 1"             "$rc" 1
+  printf 'not json\n' > "$FX/bad.json"; ( do_report "$FX/bad.json" ) >/dev/null 2>&1; rc=$?
+  expect "report on a file that is not survey data exits 1" "$rc" 1
 
   [ "$fails" -eq 0 ] || { echo "survey-github selftest: $fails failed" >&2; return 1; }
   echo "survey-github selftest: all passed"
