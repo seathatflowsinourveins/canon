@@ -58,6 +58,8 @@ unpinned (`go install …@latest`, `brew install`, `uvx alpaca-mcp-server`); the
 live trading through an environment variable; every safeguard is an instruction rather than an enforced
 limit; and the backtest skill has the agent hand-write a script per run instead of using NautilusTrader.
 
+ADR 0021 makes an exception to the four conditions above for the two skills that Orca installs.
+
 ### Consequences
 
 * Good: upstream skills are usable without inheriting an unreviewed supply chain.

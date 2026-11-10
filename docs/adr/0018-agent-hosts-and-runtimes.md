@@ -61,7 +61,7 @@ because the owner named it, its licence is MIT, its source runs the installed `c
 6. **A second runtime is adopted like any upstream**, when there is a job for it: its own worktree and
    branch, landing through rule 4 with the review ADR 0017 requires, and no credentials in its environment.
 7. **Not adopted: option 4.** Orca labels its orchestration commands "Experimental" and no other host
-   documents a handoff. Runtimes meet at a branch and a pull request.
+   documents a handoff. Runtimes meet at a branch and a pull request. Superseded in part by ADR 0021.
 
 ### Consequences
 
@@ -77,7 +77,7 @@ because the owner named it, its licence is MIT, its source runs the installed `c
   fails without one. `scripts/land` is unaffected; it calls `gh` through `mise exec` inside the checkout.
 * On a machine, Orca also sends anonymous usage events until Settings → Privacy turns them off. Two
   skills, `orca-cli` and `orchestration`, were installed for every session seconds after the app started,
-  which its docs put down to its default agent setup; neither is read or adopted here yet (ADR 0004). What
+  which its docs put down to its default agent setup; they are used within the limits of ADR 0021. What
   wrote `skipDangerousModePermissionPrompt` into the user's settings is UNVERIFIED.
 
 ### Confirmation
