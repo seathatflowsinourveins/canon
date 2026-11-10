@@ -696,6 +696,61 @@
       ],
       "adr": "0010",
       "pypi": "pandas"
+    },
+    {
+      "id": "openviking",
+      "field": "agent-extensions",
+      "repo": "volcengine/OpenViking",
+      "track": "tag:v0.5.4",
+      "role": "watch",
+      "license": "AGPL-3.0 (core; crates/ov_cli and examples Apache-2.0, the Microsoft Agent Framework adapter MIT)",
+      "why": "Context database for agents (memory, resources, skills) with documented Claude Code, Codex and DeepSeek Harness integrations. Watched, not adopted (ADR 0051): by default its Codex and DSH plugins capture turns and tool results and recall memory across sessions and other workspaces, which would carry one review into the next; pre-1.0, with six migration items in v0.5.4; its server calls an embedding and a VLM provider. Its own benchmarks are conversational memory and tau2-bench, not code review. Its DSH plugin is verified to DSH 0.2.1-rc.3.",
+      "evidence": [
+        "https://github.com/volcengine/OpenViking",
+        "https://github.com/volcengine/OpenViking/releases/tag/v0.5.4",
+        "https://docs.openviking.ai/en/agent-integrations/04-codex",
+        "https://docs.openviking.ai/en/agent-integrations/17-dsh"
+      ],
+      "adr": "0051"
+    },
+    {
+      "id": "weknora",
+      "field": "agent-extensions",
+      "repo": "Tencent/WeKnora",
+      "track": "tag:v0.9.0",
+      "role": "watch",
+      "license": "MIT (by its LICENSE and README; GitHub reports NOASSERTION)",
+      "why": "Document knowledge base and RAG framework (PDF, Word, Office, Markdown and more; GitLab among its sync sources) with a built-in MCP server, its own cross-session memory, and a DeepSeek Harness plugin with read-only tools. Watched, not adopted (ADR 0051): built for documents, not a code repository; the standard install is Docker Compose with PostgreSQL and Redis, with a Lite single binary on SQLite; no measurement of what it adds to code review.",
+      "evidence": [
+        "https://github.com/Tencent/WeKnora"
+      ],
+      "adr": "0051"
+    },
+    {
+      "id": "serena",
+      "field": "agent-extensions",
+      "repo": "oraios/serena",
+      "track": "tag:v2.1.0",
+      "role": "watch",
+      "license": "GPL-3.0-or-later (the application; SolidLSP MIT; by its README, GitHub reports NOASSERTION)",
+      "why": "MCP toolkit for symbol-level code retrieval and editing through language servers; lists Claude Code, Codex and Gemini CLI as clients. Watched, not adopted (ADR 0051): no measurement of what it adds on a repository this size, and its cross-session memory system, which can be disabled, would have to be off for a review.",
+      "evidence": [
+        "https://github.com/oraios/serena"
+      ],
+      "adr": "0051"
+    },
+    {
+      "id": "context7",
+      "field": "agent-extensions",
+      "repo": "upstash/context7",
+      "track": "tag:mcpb-v4.6.0",
+      "role": "watch",
+      "license": "MIT (the MCP server; the API backend is private)",
+      "why": "MCP server and CLI serving current library documentation to an agent. Watched, not adopted (ADR 0051): every query goes to a hosted service whose backend is private, while AGENTS.md already points agents at the upstreams' own llms.txt (a reviewer under the benchmark brief has no network). Tracked by its mcpb-v tag, which points at the same commit as @upstash/context7-mcp@4.6.0, a tag the release rule cannot rank.",
+      "evidence": [
+        "https://github.com/upstash/context7"
+      ],
+      "adr": "0051"
     }
   ]
 }
