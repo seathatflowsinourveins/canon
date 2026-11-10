@@ -62,9 +62,13 @@ strategy through a real `BacktestNode`, and checks what came out: every bar deli
 at known closes, two round trips, and 100,000 USD ending as 100,090. The arithmetic is worked by hand at
 the top of the test file.
 
-To run over a catalog of your own, it must hold the bars and the definition of their instrument, written
-as the test writes them (`canon_alpaca.providers.parse_equity`, `canon_alpaca.data.parse_bar`, then
-`write_instruments` and `write_bars`). Nothing in this repo fills `catalog/` from Alpaca yet.
+To run over Alpaca's bars, load them into `catalog/` first with
+`canon_trading.bars_to_catalog.load_bars(bar_type, start, end)`: it requests the bars through the adapter's
+data client with NautilusTrader's catalog write-back, writes the instrument's definition, and fetches only
+what the catalog does not already cover (ADR 0040). It needs the paper key pair, so it runs inside
+`mise run paper:test` (`mise run paper:test -k bars_to_catalog` for that test alone);
+`tests/test_paper_bars_to_catalog.py` loads AAPL's daily bars for the first quarter
+of 2025 that way and runs the backtest below on them.
 
 ```python
 from pathlib import Path
@@ -154,7 +158,7 @@ runs.
 | `src/canon_trading/` | Strategies and node configuration |
 | `packages/canon-alpaca/` | The Alpaca adapter for NautilusTrader: a market-data client and a paper-only execution client |
 | `tests/`, `packages/*/tests/` | Tests beside each package's `src/` |
-| `catalog/` | Local market data; ignored by git |
+| `catalog/` | Local market data, loaded by `canon_trading.bars_to_catalog`; ignored by git |
 | `ledger/` | The trial ledger, an Optuna SQLite study; ignored by git |
 | `.claude/settings.json` | Permissions and hooks for this repo |
 | `orca.yaml` | The setup command Orca runs in a new worktree, once enabled and approved in the app |
@@ -188,8 +192,10 @@ here, community convergence, then anyone's recollection.
   market and limit orders, fills, cancels and a rejection passed (see the package README). The full asset
   list has not run against Alpaca, and fill history at start-up is not written.
   See `packages/canon-alpaca/README.md`.
-* **No market data in `catalog/`.** The first backtest runs on bars generated in its test. Nothing here
-  writes Alpaca's bars to the catalog yet.
+* **Little market data in `catalog/`.** `load_bars` writes Alpaca's bars there (ADR 0040), and the only
+  range anything here loads is the paper test's: AAPL's daily bars for the first quarter of 2025. A fresh
+  clone has none until that test runs. Bars are raw and from the IEX feed, the only feed and adjustment
+  the adapter requests.
 * **No ranking of real strategies yet.** The ledger (ADR 0035), the returns matrix and the gate (ADR 0010,
   ADR 0031) are written and tested on generated bars and series. A trial that never traded, or a
   configuration that never runs to the end, stops a ranking: what value it should count as is undecided.

@@ -42,6 +42,7 @@ flowchart LR
   strat -- orders --> re --> ee --> ec
   ec -- order events, fills --> ee --> cache --> pf
   de -- bars, quotes --> strat
+  dc -- bars by write-back --> catalog
   catalog -- bars, instruments --> bt --> node
   led -- runs --> bt
   pn -. configures .-> node
@@ -56,7 +57,7 @@ flowchart LR
 | Adapter | Instrument provider, data client, execution client, factories, in upstream's five modules | `alpaca-py` v0.45.0; NautilusTrader's adapter guide and template (template at v2.0.0rc8) | `packages/canon-alpaca/` | ADR 0009, 0012, 0024, 0030, 0036 |
 | Engine | The node: data, risk and execution engines, cache, portfolio; `BacktestNode` for backtests, `LiveNode` for paper | NautilusTrader v2.0.0rc8 | upstream | ADR 0009 |
 | Strategies and node configuration | `MaCross` and `run_backtest` on a simulated `ALPACA` venue; `ema_cross_paper_node`, a paper `LiveNode` running upstream's built-in `EmaCross` under risk limits | NautilusTrader v2.0.0rc8 | `src/canon_trading/` | ADR 0009, 0012, 0037 |
-| Local data | `ParquetDataCatalog` of bars and instruments, ignored by git | NautilusTrader v2.0.0rc8 | `catalog/` | ADR 0012 |
+| Local data | `ParquetDataCatalog` of bars and instruments, ignored by git, filled from Alpaca by `load_bars` | NautilusTrader v2.0.0rc8 | `catalog/`, `canon_trading/bars_to_catalog.py` | ADR 0012, 0040 |
 | Trial ledger | One Optuna trial per backtest, in a local SQLite study, ignored by git | Optuna v5.0.0 | `canon_trading/ledger.py`, `ledger/` | ADR 0010, 0035 |
 | Returns matrix | T common daily rows, one column per configuration | pandas v3.1.1; skfolio v1.12.8 `Population` | `canon_trading/returns_matrix.py` | ADR 0010 |
 | Gate | The pick's deflated Sharpe ratio against 0.95, N = every trial | skfolio v1.12.8 | `canon_trading/ranking.py` | ADR 0010, 0031 |
@@ -68,8 +69,8 @@ adapter is a uv workspace member of its own, kept apart from strategies as upstr
 
 ## A backtest, from catalog to gate
 
-1. Bars and their instrument are in a catalog, written as `tests/test_backtest.py` writes them
-   (`parse_equity`, `parse_bar`, `write_instruments`, `write_bars`); nothing fills `catalog/` from Alpaca yet (`README.md`).
+1. Bars and their instrument are in a catalog: from Alpaca through `load_bars`, a `LiveNode` request with
+   the catalog's write-back (ADR 0040), or generated, as `tests/test_backtest.py` writes them.
 2. `run_backtest` builds one `BacktestNode` per run on a simulated `ALPACA` venue: `NETTING`, `CASH`,
    `L1_MBP` bar execution, a zero-rate fee model; no slippage, latency or market-hours model (`backtest.py`).
 3. `record_trial` asks the study for a trial, runs it, and tells it `COMPLETE` (traded) or `FAIL` (failed,
