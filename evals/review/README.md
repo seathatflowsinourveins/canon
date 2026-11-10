@@ -83,11 +83,12 @@ measures no variance between runs.
 
 Later, someone may check unconfirmed findings; one that is confirmed (a fix on `main` with a failing
 test) becomes a `[[defects]]` entry and counts from the next scoring on.
+The first run's unconfirmed findings are triaged in [`runs/2026-11-10-first/triage.md`](runs/2026-11-10-first/triage.md).
 
 ## Reading a score
 
 With n confirmed defects, a found-rate p has a standard error of about √(p(1−p)/n). At the 10
 defects of the first run (`runs/2026-11-10-first/`), 8 of them in one case, a difference between two
-reviewers below about 40 points of found-rate is noise. With the 21 the cases hold now (10 in
-`order-modify`, 9 in `trial-ledger-gate`), it is about 30 for the whole set, and defects bunched in a few
+reviewers below about 40 points of found-rate is noise. With the 23 the cases hold now (10 in
+`order-modify`, 10 in `trial-ledger-gate`), it is about 30 for the whole set, and defects bunched in a few
 cases widen both (ADR 0046).
