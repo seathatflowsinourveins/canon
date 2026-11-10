@@ -141,7 +141,7 @@ runs.
 | `canon/upstreams.json` | The registry: 38 upstreams with role, licence, evidence, ADR |
 | `canon/upstreams.lock.json` | Resolved commit SHAs (generated) |
 | `canon/models.json` | Model routing by lane and the landscape snapshot behind it |
-| `docs/adr/` | Twenty-nine decisions in MADR 4.0.0, each with Evidence and `review-by` |
+| `docs/adr/` | Thirty decisions in MADR 4.0.0, each with Evidence and `review-by` |
 | `pyproject.toml`, `uv.lock` | uv workspace root; one lockfile for every package |
 | `src/canon_trading/` | Strategies and node configuration |
 | `packages/canon-alpaca/` | The Alpaca adapter for NautilusTrader: a market-data client and a paper-only execution client |
@@ -177,7 +177,7 @@ here, community convergence, then anyone's recollection.
 * **No market data in `catalog/`.** The first backtest runs on bars generated in its test. Nothing here
   writes Alpaca's bars to the catalog yet.
 * **No code that ranks strategy variants.** The method is decided (ADR 0010): every trial in a ledger, then
-  the pick's deflated Sharpe ratio at 0.95 or above, computed by skfolio and tested against the paper's
+  the pick's deflated Sharpe ratio at 0.95 or above, computed by skfolio (ADR 0031) and tested against the paper's
   example. The ledger is not written, and the overfitting probability has no adopted implementation
   (ADR 0027 is `proposed`).
 * **No OpenTelemetry backend.** The local event ledger covers this machine; `home/otel-settings.example.json`

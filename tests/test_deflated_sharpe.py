@@ -2,7 +2,7 @@
 
 No test here opens a network connection, reads a credential or runs a backtest. This file tests skfolio,
 pinned in `pyproject.toml`, not code of this repo: the code that ranks variants is not written yet. The
-three functions ADR 0010 names are `measures.expected_max_sharpe_ratio`,
+three functions ADR 0031 names are `measures.expected_max_sharpe_ratio`,
 `measures.probabilistic_sharpe_ratio` and `measures.deflated_sharpe_ratio`. They implement equations 1
 and 2 of Bailey and López de Prado, "The Deflated Sharpe Ratio" (2014),
 https://www.davidhbailey.com/dhbpapers/deflated-sharpe.pdf. Four more, `measures.mean`,
@@ -32,7 +32,7 @@ is run on a made-up series that carries the moments:
   two and 125 each of the others, with c chosen below.
 * The trial Sharpe ratios alternate between two values, scaled to the sample variance the paper states.
 
-Every number passed to skfolio is per observation, as ADR 0010 requires. The last four tests show what
+Every number passed to skfolio is per observation, as ADR 0031 requires. The last four tests show what
 skfolio does with input the protocol forbids. In each it returns a number and raises nothing, so the
 code that applies the gate has to refuse that input itself.
 """
@@ -187,7 +187,7 @@ def test_each_further_trial_raises_the_hurdle(
 
 
 def test_the_two_step_route_gives_the_same_result() -> None:
-    """ADR 0010 reports an adjusted trial count through the two functions `deflated_sharpe_ratio` wraps."""
+    """ADR 0010 reports an adjusted trial count through the two functions `deflated_sharpe_ratio` wraps (ADR 0031)."""
     returns = _skewed_returns()
     sharpes = _trial_sharpes(46)
 
