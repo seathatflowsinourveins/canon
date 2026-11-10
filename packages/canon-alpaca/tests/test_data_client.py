@@ -40,6 +40,8 @@ from canon_alpaca.constants import ENV_SECRET_KEY
 from canon_alpaca.data import AlpacaDataClient
 from canon_alpaca.factories import AlpacaDataClientFactory
 from nautilus_trader.common import Environment
+from nautilus_trader.common import Logger
+from nautilus_trader.common import logging_sync_to_disk
 from nautilus_trader.config import DataClientConfig
 from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.config import LiveNodeConfig
@@ -65,6 +67,7 @@ WEEK = timedelta(weeks=1)
 NEW_YORK = ZoneInfo("America/New_York")
 TRADER = TraderId("TESTER-001")
 PLACEHOLDER = "offline-placeholder"
+LOG_PROBE_LINES = 20_000
 
 
 @pytest.fixture
@@ -179,7 +182,17 @@ def dispose_nodes():
 
 
 def logged(capfd) -> str:
-    """Everything the node logged, whichever of stdout and stderr each level goes to."""
+    """Everything the node logged, whichever of stdout and stderr each level goes to.
+
+    The node's logger writes on its own thread, fed by a channel, so a line logged just before the node
+    stopped, such as a summary from `_disconnect`, can still be queued when the run returns.
+    `logging_sync_to_disk` queues a sync behind every line already sent and blocks until the writer thread
+    has flushed stdout and stderr and acknowledged it (`crates/common/src/logging/logger.rs` at
+    NautilusTrader v2.0.0rc8, `d53849b2`, `LogEvent::Sync`; its doc speaks only of file logs, the code flushes both
+    streams first). `Logger.flush` and `logger_flush` only queue a flush and do not wait. It returns at once
+    when the logger is not running; `test_logged_waits_for_lines_still_queued_after_a_run` fails if so.
+    """
+    logging_sync_to_disk()
     captured = capfd.readouterr()
     return captured.out + captured.err
 
@@ -678,6 +691,17 @@ def test_one_sided_quote_count_restarts_after_resubscribing(venue, alpaca, capfd
     log = logged(capfd)
     assert log.count("Dropped one-sided Alpaca quote: AAPL.ALPACA quote at") == 2
     assert "Dropped 1 one-sided Alpaca quotes for AAPL since subscribing" in log
+
+
+def test_logged_waits_for_lines_still_queued_after_a_run(venue, capfd) -> None:
+    # More lines than the writer thread drains before `readouterr` would run, queued after a node run, as
+    # the tests above read the log: the last is captured only if `logged` waits for the writer thread.
+    run_with_client(lambda client: asyncio.sleep(0))
+    probe = Logger("LogProbe")
+    for i in range(LOG_PROBE_LINES):
+        probe.info(f"probe line {i}")
+
+    assert f"probe line {LOG_PROBE_LINES - 1}" in logged(capfd)
 
 
 def test_quote_for_a_symbol_not_subscribed_is_dropped(venue, alpaca) -> None:
