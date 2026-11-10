@@ -12,7 +12,10 @@
 # registered in ~/.claude/settings.json.
 # CLAUDE_CONFIG_DIR replaces ~/.claude. CANON_WATCH_NO_NOTIFY=1 keeps the alert file and skips the notification.
 # It runs no model, costs no tokens, and never deletes anything.
-PATH=/usr/bin:/bin:/usr/sbin:/sbin
+# exported: under an empty environment bash keeps an assigned PATH to itself and a child gets no PATH; the
+# lanes report, a bash script, then fell back to bash's compiled-in /usr/gnu/bin:/usr/local/bin:/bin:/usr/bin:.
+# (observed with env -i and /bin/bash 3.2, 2026-11-10); bash(1), ENVIRONMENT and the export builtin
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
 cfg="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 base="$cfg/canon"
 w="$base/watch"
