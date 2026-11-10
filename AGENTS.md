@@ -93,7 +93,7 @@ dependency, pattern and practice traces to a pinned upstream or a dated source. 
 | 0020 | Rule enforcement: no hook runs before a tool call; the merge gate and permission rules hold the rules |
 | 0021 | Orca's skills: used from sessions inside Orca, within written limits |
 | 0022 | Claude Code CLI: installed at the registry's pin and never below it |
-| 0023 | Orca's agent-view plugin (proposed): on for now; what a plugin's hooks may approve on this machine |
+| 0023 | Orca's agent-view plugin: left on as the cockpit's own, with the risk stated |
 | 0024 | Fill history for the Alpaca adapter (proposed): Alpaca's activities endpoint through alpaca-py's `get`, held until a paper test settles the trade ID |
 | 0025 | Claude Code's sandbox: part of it adopted, subject to a trial that costs no lane a stop; nothing is on yet |
 | 0026 | The weekly model run: a desktop scheduled task, gated by scripts, that reports and does not decide |
@@ -152,7 +152,8 @@ The owner's standing instruction (2026-11-09): work lands automatically once its
 1. One branch per change. A session that runs in parallel with another works in its own git worktree;
    two sessions never write in one checkout.
 2. Commit, then run `scripts/land`. It runs `scripts/ci` on what is committed, on a branch that contains
-   the current `main`, and lands the branch. With an `origin` remote, `gh` must be signed in, or it stops
+   the current `main`, and lands the branch. A branch behind `main` is rebased if it was never pushed;
+   once pushed, `origin/main` is merged into it instead, since a rebase could only be pushed with force. With an `origin` remote, `gh` must be signed in, or it stops
    and lands nothing; it checks every address it would publish, pushes, opens a pull request, posts the
    `review` and `signoff` statuses, and waits up to nine minutes (`LAND_WAIT_SECONDS`, default 540) for
    GitHub to squash-merge exactly the checked commit with the checked subject and message. If auto-merge

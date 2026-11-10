@@ -197,7 +197,7 @@ do_status() {
                  else "" end)
               + (if $sl then "; the lock is stale for " + (.stale | join(", "))
                    + ", so those pins were not compared; fix: " + (.stale | map("scripts/canon resolve " + .) | join(", "))
-                   + " (only the owner approves a resolve)"
+                   + " (it runs without a prompt and lands only reviewed; ADR 0028)"
                  else "" end)
               + (if .ok == true and ($sl | not) and $d > $stale then "; it runs at session start in this repo" else "" end)' \
           "$ROOT/.canon/watch.json" 2>/dev/null)

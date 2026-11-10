@@ -70,9 +70,10 @@ a Python edit and an MCP server switched to live stay as they are.
 
 Prompts. Under bypass the sandbox adds none; an `ask` rule still prompts, as now, being among the "Actions
 no mode auto-approves". With the retry off a command the allowances missed fails, hence the trial. ADR
-0028, written the same day and not landed or read here (UNVERIFIED), would take the prompt off a single
-pin move, an exactly pinned `uv add` and `uv sync --locked`; package code would then run unprompted, and
-the sandbox would keep its writes to the worktree, uv's cache and the temp folder.
+0028 takes the prompt off a single pin move and an exactly pinned `uv add`. `uv sync --locked` still
+asks: an `ask` rule wins over any `allow` rule, so no rule can ask for `uv sync` and spare `--locked`.
+Package code an exactly pinned `uv add` installs then runs unprompted, and the sandbox would keep its
+writes to the worktree, uv's cache and the temp folder.
 
 * **Option 1** is the state until the trial passes, and after it if it fails.
 * **Option 2**: not chosen. Under bypass it needs `strictAllowlist`, which a repository's file cannot
@@ -151,3 +152,5 @@ Read 2026-11-10. `fetched`: downloaded whole with `curl` and read, not summarise
   corrected the second run's account and the cause of the `gh` failure, narrowed two table rows and option
   2, added auto mode, `credentials.envVars` and `--settings`, marked ADR 0028 and the managed file's reach
   UNVERIFIED, and supplied the missing item of ADR 0020's list and what lets a session leave option 3.
+* ADR 0028, read 2026-11-10 after it landed: it leaves `uv sync --locked` asking. The sentence on prompts
+  above is corrected to say so (read).

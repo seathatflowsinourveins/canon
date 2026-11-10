@@ -59,7 +59,7 @@ live trading through an environment variable; every safeguard is an instruction 
 limit; and the backtest skill has the agent hand-write a script per run instead of using NautilusTrader.
 
 ADR 0021 makes an exception to the four conditions above for the two skills that Orca installs. ADR 0023
-proposes one for the plugin Orca loads into each session, which meets none of them.
+makes one for the plugin Orca loads into each session, which meets none of them.
 
 ### Consequences
 
