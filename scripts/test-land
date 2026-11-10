@@ -12,7 +12,9 @@ unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OB
 for f in scripts/land scripts/check-addresses .githooks/pre-push; do
   [ -x "$ROOT/$f" ] || { echo "test-land: $ROOT/$f is missing or not executable"; exit 1; }
 done
-TMP=$(mktemp -d) || { echo "test-land: could not create a temp folder"; exit 1; }
+# An explicit template, as in test-lanes: a TMPDIR that does not exist stops here.
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/canon-test-land.XXXXXX") \
+  || { echo "test-land: could not create a temp folder under ${TMPDIR:-/tmp}; nothing was written" >&2; exit 1; }
 trap 'rm -rf "$TMP"' EXIT
 
 export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$TMP/gitconfig"
@@ -79,7 +81,8 @@ echo "lock" > "$T/work/uv.lock"; echo "x = 1" > "$T/work/src/a.py"
 
 # new_repo [noremote]: a case folder C with work tree W on a new branch topic, and origin unless asked
 new_repo() {
-  C=$(mktemp -d "$TMP/case.XXXXXX"); W="$C/work"; FAKE="$C/fake"; export FAKE
+  C=$(mktemp -d "$TMP/case.XXXXXX") || { echo "test-land: could not create a case folder under $TMP" >&2; exit 1; }
+  W="$C/work"; FAKE="$C/fake"; export FAKE
   mkdir -p "$FAKE"; : > "$FAKE/log"; echo "MERGED HEAD" > "$FAKE/views"
   cp -R "$T/work" "$T/origin.git" "$C/"
   if [ "${1:-}" != noremote ]; then
@@ -103,7 +106,8 @@ case_() {
   local label="$1" id; shift
   ncase=$((ncase + 1)); id=$(printf '%03d' "$ncase")
   (
-    if "$@" >/dev/null 2>&1; then printf '  ok    %s\n' "$label" > "$RESULTS/$id"
+    # stderr is kept: a case that exits before writing its result (new_repo's stop) shows why below
+    if "$@" >/dev/null 2>"$RESULTS/$id.err"; then printf '  ok    %s\n' "$label" > "$RESULTS/$id"
     else { printf '  FAIL  %s\n' "$label"; printf '%s\n' "$out" | sed -n '1,6s/^/        /p'; } > "$RESULTS/$id"; fi
   ) &
   [ $((ncase % 8)) -ne 0 ] || wait
@@ -475,7 +479,10 @@ wait
 pass=0; fail=0
 for i in $(seq 1 "$ncase"); do
   r="$RESULTS/$(printf '%03d' "$i")"
-  if [ ! -s "$r" ]; then echo "  FAIL  case $i left no result"; fail=$((fail + 1)); continue; fi
+  if [ ! -s "$r" ]; then
+    echo "  FAIL  case $i left no result"; sed -n '1,6s/^/        /p' "$r.err" 2>/dev/null
+    fail=$((fail + 1)); continue
+  fi
   cat "$r"
   case "$(sed -n 1p "$r")" in "  ok "*) pass=$((pass + 1)) ;; *) fail=$((fail + 1)) ;; esac
 done

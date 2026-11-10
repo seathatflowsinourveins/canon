@@ -15,7 +15,10 @@ set -uo pipefail
 # shellcheck disable=SC2046  # one variable name per word
 unset $(git rev-parse --local-env-vars)
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-TMP=$(mktemp -d)
+# An explicit template: macOS's mktemp -d without one skips a TMPDIR that does not exist and uses another
+# folder (observed), so a missing TMPDIR stops here instead.
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/canon-test-lanes.XXXXXX") \
+  || { echo "test-lanes: could not create a temp folder under ${TMPDIR:-/tmp}; nothing was written" >&2; exit 1; }
 trap 'rm -rf "$TMP"' EXIT
 pass=0; fail=0; skipped=0
 
