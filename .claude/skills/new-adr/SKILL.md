@@ -18,7 +18,9 @@ description: Create an architecture decision record in this repo's format (MADR 
    sources have not converged on a choice that is hard to reverse. A tool that is cheap to leave can be
    `accepted` on the owner's word, with what is untested marked `UNVERIFIED` (ADR 0018).
 9. If this replaces an earlier ADR, set that one's status to `superseded by ADR-NNNN` and leave its text.
-10. Add a row to the Decisions table in `AGENTS.md`.
+10. Make the title line say what the record decides, and for a `proposed` one what is still open: `AGENTS.md`
+    lists no records, so the title is what a reader scans. If the record changes how the system fits
+    together or what comes next, update `docs/architecture.md` or `docs/roadmap.md` in the same change.
 11. `scripts/canon lint` must pass. Run the `evidence-verifier` subagent on the new file and resolve what it
     finds: a new record does not land without it (ADR 0017; step 3 of "Landing" in `AGENTS.md`).
 
