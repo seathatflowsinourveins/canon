@@ -22,8 +22,10 @@ imported until those exist.
    config. They run with the agent's permissions (ADR 0004).
 5. **Register.** Add the entry to `canon/upstreams.json` (fields are in `.claude/rules/canon.md`). Track a
    release tag where one exists.
-6. **Resolve.** `scripts/canon resolve <id>` pins that one entry and leaves every other pin as it is. It
-   asks for permission; that is intended. A Python dependency is then added with `uv add`, pinned exactly.
+6. **Resolve.** `scripts/canon resolve <id>` pins that one entry and leaves every other pin as it is. A
+   Python dependency is then added with `uv add name==version`, pinned exactly. Both run without a
+   prompt; the lint, `scripts/ci` and the review before landing hold them (ADR 0028). Without an id, or with
+   a range, a URL, an upgrade flag or another index, they ask the owner.
 7. **Decide in writing.** Add to the relevant ADR or create one with the `new-adr` skill.
 8. **Second reader.** For `foundation`, `platform` and `source` roles, run the `evidence-verifier` subagent on
    the ADR and fix what it finds.

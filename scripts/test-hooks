@@ -39,5 +39,149 @@ check "settings allow uv run only with --locked" test "$unlocked" = "0"
 pyl=$(grep -E 'uv run' "$ROOT/.claude/hooks/py-lint.sh" | grep -cvE 'uv run --locked')
 check "py-lint calls uv run --locked"        test "$pyl" = "0"
 
+# --- which command forms prompt (ADR 0028) ---
+# The Bash rule matching of https://code.claude.com/docs/en/permissions.md, as far as these rules use it:
+# deny, then ask, then allow, the first match deciding; `*` matches any text, spaces included; a rule's
+# one trailing ` *` (or `:*`) also matches the bare command; `mise exec` is not a wrapper Claude Code
+# strips, so a rule names it. Not emulated: compound commands (an ask rule applies when any subcommand
+# matches), stripped wrappers and environment assignments. Ask rules apply in every permission mode;
+# allow rules are what keeps a command from prompting outside bypassPermissions.
+# shellcheck disable=SC2016  # a jq program; its $names are jq's, not the shell's
+MATCH='
+  def esc: gsub("(?<c>[.^$|?+()\\[\\]{}\\\\])"; "\\\(.c)");
+  def rx: (if endswith(":*") then .[:-2] + " *" else . end) as $p
+    | if ($p | endswith(" *")) and ([$p | match("\\*"; "g")] | length) == 1
+      then "^" + ($p[:-2] | esc) + "( .*)?$"
+      else "^" + ($p | split("*") | map(esc) | join(".*")) + "$" end;
+  def bash: [.[]? | strings | select(startswith("Bash(") and endswith(")")) | .[5:-1]];
+  def hit($cmd): any(.[]; . as $s | $cmd | test($s | rx));
+  def decide($cmd): .permissions as $p
+    | if ($p.deny | bash | hit($cmd)) then "deny" elif ($p.ask | bash | hit($cmd)) then "ask"
+      elif ($p.allow | bash | hit($cmd)) then "allow" else "none" end;'
+decide()    { jq -r --arg c "$1" "$MATCH decide(\$c)" "$SETTINGS"; }
+prompts()   { test "$(decide "$1")" = ask; }     # an ask rule: prompts in every mode
+runs()      { test "$(decide "$1")" = allow; }   # allowed and no ask rule: prompts in no mode
+unlisted()  { test "$(decide "$1")" = none; }    # prompts in Manual mode, runs in bypassPermissions
+rule_hits() { test "$(jq -n -r --arg r "$1" --arg c "$2" "$MATCH [\$r] | bash | hit(\$c)")" = "$3"; }
+
+# The matcher reproduces the docs' own table of wildcard patterns.
+while IFS='|' read -r rule cmd want; do
+  check "matcher: Bash($rule) on '$cmd' is $want"  rule_hits "Bash($rule)" "$cmd" "$want"
+done <<'EOF'
+npm run build|npm run build|true
+npm run build|npm run build --watch|false
+npm run *|npm run|true
+npm run *|npm install|false
+git log * main|git log --oneline main|true
+git log * main|git log main|false
+ls *|ls|true
+ls *|lsof|false
+ls*|lsof|true
+* --help *|npm --help x|true
+* --help *|npm --help|false
+ls:*|ls -la|true
+EOF
+
+# What a lane runs when it follows adopt-upstream as written: no prompt in any mode.
+while IFS= read -r cmd; do check "runs without a prompt: $cmd" runs "$cmd"; done <<'EOF'
+scripts/canon resolve alpaca-py
+./scripts/canon resolve alpaca-py
+uv add httpx==0.27.2
+uv add --package canon-alpaca httpx==0.27.2
+uv add httpx==0.27.2 idna==3.10
+mise exec -- uv add httpx==0.27.2
+mise exec -- uv add --package canon-alpaca httpx==0.27.2
+uv add httpx==0.27.2 --no-sync
+uv add httpx==0.27.2 2>&1
+EOF
+
+# No id (or an empty one) re-resolves every pin. A range, a URL, an upgrade, another index or another
+# project is not one exact pin in this checkout. uv lock --upgrade rewrites every pin. uv sync without
+# --locked can rewrite uv.lock, and no rule can carve --locked out of it (ask beats allow), so every
+# uv sync prompts and a lane syncs with `uv run --locked`. The rest reach outside the checkout.
+while IFS= read -r cmd; do check "prompts: $cmd" prompts "$cmd"; done <<'EOF'
+scripts/canon resolve
+scripts/canon resolve --prune
+scripts/canon resolve ''
+scripts/canon resolve '' alpaca-py
+scripts/canon resolve ""
+scripts/canon resolve "$id"
+scripts/canon resolve $id
+./scripts/canon resolve
+./scripts/canon resolve --prune
+./scripts/canon resolve ''
+./scripts/canon resolve '' alpaca-py
+./scripts/canon resolve ""
+./scripts/canon resolve "$id"
+./scripts/canon resolve $id
+uv add 'httpx>=0.27'
+uv add 'httpx<1'
+uv add 'httpx~=0.27'
+uv add 'httpx!=0.27.0'
+uv add 'pkg @ ../pkg'
+uv add httpx==0.27.2 git+https://example.com/pkg
+uv add -ihttps://example.com/simple httpx==0.27.2
+uv add httpx==0.27.2 --upgrade
+uv add -U httpx==0.27.2
+uv add -P idna httpx==0.27.2
+uv add --upgrade-group dev httpx==0.27.2
+uv add --index ./index httpx==0.27.2
+uv add --default-index ./index httpx==0.27.2
+uv add -i ./index httpx==0.27.2
+uv add --find-links ./wheels httpx==0.27.2
+uv add -f ./wheels httpx==0.27.2
+uv add --project ../other httpx==0.27.2
+uv add --directory ../other httpx==0.27.2
+uv add httpx==0.27.2 -r requirements.txt
+uv add httpx==0.27.2 --requirements requirements.txt
+uv add httpx==0.27.2 'idna>=3'
+mise exec -- uv add 'httpx>=0.27'
+mise exec -- uv add 'httpx<1'
+mise exec -- uv add 'httpx~=0.27'
+mise exec -- uv add 'httpx!=0.27.0'
+mise exec -- uv add 'pkg @ ../pkg'
+mise exec -- uv add httpx==0.27.2 git+https://example.com/pkg
+mise exec -- uv add -ihttps://example.com/simple httpx==0.27.2
+mise exec -- uv add httpx==0.27.2 --upgrade
+mise exec -- uv add -U httpx==0.27.2
+mise exec -- uv add -P idna httpx==0.27.2
+mise exec -- uv add --upgrade-group dev httpx==0.27.2
+mise exec -- uv add --index ./index httpx==0.27.2
+mise exec -- uv add --default-index ./index httpx==0.27.2
+mise exec -- uv add -i ./index httpx==0.27.2
+mise exec -- uv add --find-links ./wheels httpx==0.27.2
+mise exec -- uv add -f ./wheels httpx==0.27.2
+mise exec -- uv add --project ../other httpx==0.27.2
+mise exec -- uv add --directory ../other httpx==0.27.2
+mise exec -- uv add httpx==0.27.2 -r requirements.txt
+mise exec -- uv add httpx==0.27.2 --requirements requirements.txt
+uv lock --upgrade
+uv lock -U
+uv lock --upgrade-package idna
+mise exec -- uv lock --upgrade
+mise exec -- uv lock -U
+uv sync
+uv sync --upgrade
+uv sync --locked
+mise exec -- uv sync
+mise exec -- uv sync --locked
+scripts/bootstrap --install
+scripts/bootstrap --install --with-user-config
+./scripts/bootstrap --install
+scripts/automation install
+./scripts/automation install
+scripts/automation uninstall
+./scripts/automation uninstall
+git push
+git push origin main
+EOF
+
+# A bare name is neither pinned nor matchable: Manual mode asks, as for any command not allowed.
+while IFS= read -r cmd; do check "neither allowed nor asked: $cmd" unlisted "$cmd"; done <<'EOF'
+uv add httpx
+mise exec -- uv add httpx
+uv lock
+EOF
+
 echo "test-hooks: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

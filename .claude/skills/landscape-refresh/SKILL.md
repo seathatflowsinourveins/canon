@@ -16,7 +16,7 @@ Run these before reading anything on the web:
    supply-chain warning. `advanced` means a tracked branch has new commits: normal. A failure to reach an
    upstream (exit 1) is a finding; report it. `STALE` (exit 4) means the registry names another repo or
    track than the lock, so that pin was not compared; report the ids and the fix, `scripts/canon resolve
-   <id>`, which only the owner approves.
+   <id>`, which this skill does not run: the report waits for approval (below).
 2. `scripts/canon outdated`. `NEWER` and `STABLE-AVAILABLE` rows are the upstreams with something to read.
 3. ADRs whose `review-by` is before today (the session-start lines name them).
 

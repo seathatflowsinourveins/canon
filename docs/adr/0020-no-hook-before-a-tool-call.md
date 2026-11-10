@@ -56,6 +56,7 @@ and the checks.
 4. **`ask` rules catch the usual form of a push, a pin move and an install**, in every permission mode.
    The docs say such a rule "isn't a security boundary around the program": another spelling of the
    command gets past it. A prompt is the owner's to answer; an agent does not route around one.
+   Superseded in part by ADR 0028: one pin move and an exactly pinned `uv add` no longer ask.
 5. **Watch: the sandbox.** Claude Code's docs name it for enforcement "that doesn't depend on the command
    text". It covers shell commands only. It is not adopted: with no live credentials there is nothing
    for it to protect yet. Revisit when the execution client is written. It was, on 2026-11-10 (pull

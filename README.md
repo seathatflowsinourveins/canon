@@ -118,7 +118,7 @@ runs.
 | `canon/upstreams.json` | The registry: 38 upstreams with role, licence, evidence, ADR |
 | `canon/upstreams.lock.json` | Resolved commit SHAs (generated) |
 | `canon/models.json` | Model routing by lane and the landscape snapshot behind it |
-| `docs/adr/` | Twenty-seven decisions in MADR 4.0.0, each with Evidence and `review-by` |
+| `docs/adr/` | Twenty-eight decisions in MADR 4.0.0, each with Evidence and `review-by` |
 | `pyproject.toml`, `uv.lock` | uv workspace root; one lockfile for every package |
 | `src/canon_trading/` | Strategies and node configuration |
 | `packages/canon-alpaca/` | The Alpaca adapter for NautilusTrader: a market-data client and a paper-only execution client |

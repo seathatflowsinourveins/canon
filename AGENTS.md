@@ -97,6 +97,7 @@ dependency, pattern and practice traces to a pinned upstream or a dated source. 
 | 0025 | Claude Code's sandbox: part of it adopted, subject to a trial that costs no lane a stop; nothing is on yet |
 | 0026 | The weekly model run: a desktop scheduled task, gated by scripts, that reports and does not decide |
 | 0027 | Overfitting probability (proposed): a diagnostic beside the Sharpe gate; no implementation adopted |
+| 0028 | Permission prompts: a lane's own steps run without one; what rewrites everything or leaves the checkout still asks |
 
 ## Automation
 
@@ -114,9 +115,12 @@ workflow's actions; the session brief lists the open ones (ADR 0016).
 No hook runs before a tool call (ADR 0020). The rules are held where they cannot be skipped: GitHub merges
 nothing that has not passed `scripts/ci` and does not carry the `signoff` status `scripts/land` posts,
 `scripts/ci` fails when `uv.lock` is out of date, and live credentials never enter this repo or an agent's
-context. `.claude/settings.json` pre-approves a short list of commands, `scripts/land` among them; a
-direct `git push`, a pin move, `uv sync` and `uv add` ask the owner first. If a prompt or a check stops you, do not look for another route: say what you wanted
-to do and why.
+context. `.claude/settings.json` pre-approves a short list of commands, among them `scripts/land`,
+`scripts/canon resolve <id>` for one pin and `uv add name==version` pinned exactly, so a lane following a
+skill is not stopped. What rewrites everything or reaches outside the checkout asks the owner first:
+`scripts/canon resolve` with no id, every `uv sync` (a lane syncs with `uv run --locked`), `uv add` with a
+range, a URL or an upgrade flag, the installers, and a direct `git push` (ADR 0028). If a prompt or a check
+stops you, do not look for another route: say what you wanted to do and why.
 
 This is the same for every runtime, Claude Code or not: use no credentials, and leave landing to
 `scripts/land` (ADR 0018).
