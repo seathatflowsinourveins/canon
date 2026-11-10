@@ -86,7 +86,7 @@ def test_closed_days_are_dropped() -> None:
         ),
         pytest.param(
             entry({0: 0.0, 1: 0.0}),
-            sessions(5),
+            sessions(),
             "no return falls on a session day",
             id="no-session-day",
         ),
@@ -158,3 +158,14 @@ def test_a_return_that_is_not_finite_is_refused_when_called_directly() -> None:
         returns_matrix([first, second])
 
     assert rejected.value.names == ("a",)
+
+
+def test_a_session_day_with_no_return_is_refused() -> None:
+    """A later review of 2026-11-10: a session day missing from the returns was dropped from the
+    calendar, so three trials recording 31 session days and 30 returns ranked at T = 30."""
+    returns = entry({n: 0.001 * (n + 1) for n in range(30)})
+
+    with pytest.raises(
+        ReturnsRejected, match="a: no return on 1 of its 31 session days, the first 2025-04-10"
+    ):
+        daily_series("a", returns, sessions(*range(31)))

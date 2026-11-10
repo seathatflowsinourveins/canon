@@ -81,7 +81,8 @@ def write(
     first_day: int = 0,
     tell: bool = True,
     told_complete: bool = True,
-    sample: int = 0,
+    sample: object = 0,
+    extra_session_days: int = 0,
 ) -> int:
     """Record one trial as the ledger does; `returns` start at day `first_day`."""
     trial = study.ask()
@@ -102,7 +103,8 @@ def write(
     trial.set_user_attr(
         "returns_series", {str(d): value for d, value in zip(days, returns or [], strict=True)}
     )
-    trial.set_user_attr("session_days", [str(d) for d in days])
+    calendar = days + [days[-1] + n * DAY_NS for n in range(1, extra_session_days + 1)]
+    trial.set_user_attr("session_days", [str(d) for d in calendar])
     trial.set_user_attr("data_digest", {f"bars of {key}": "digest"})
     trial.set_user_attr(OUTCOME, outcome)
     if outcome == IDLE or not told_complete:
@@ -678,3 +680,37 @@ def test_the_recorded_range_is_utc_whatever_the_zone(
     [(first, last)] = seen
     assert first.endswith("+00:00") and last.endswith("+00:00")
     assert before <= datetime.fromisoformat(first) <= datetime.fromisoformat(last) <= after
+
+
+def test_session_days_with_no_return_stop_and_are_named(study: optuna.Study) -> None:
+    """A later review of 2026-11-10: three trials recording 31 session days with 30 returns each
+    ranked at T = 30, the missing day dropped from the calendar."""
+    numbers = [
+        write(study, key, returns, extra_session_days=1)
+        for key, returns in (("pick", PICK), ("second", SECOND), ("third", THIRD_CLOSE))
+    ]
+
+    with pytest.raises(RankingStopped) as stopped:
+        rank(study)
+
+    message = str(stopped.value)
+    for key, number in zip(("pick", "second", "third"), numbers, strict=True):
+        assert f"{key}: no return on 1 of its 31 session days" in message
+        assert f"(#{number})" in message
+
+
+@pytest.mark.parametrize("number", [7, "0", True], ids=["unknown", "text", "bool"])
+def test_a_record_that_ran_with_no_sample_number_of_the_study_stops(
+    study: optuna.Study, number: object
+) -> None:
+    """Read as on the current sample only if it did not run: one that ran came from another writer."""
+    trial = write(study, "pick", PICK, sample=number)
+    write(study, "second", SECOND)
+    write(study, "third", THIRD_CLOSE)
+
+    with pytest.raises(RankingStopped) as stopped:
+        rank(study)
+
+    assert f"#{trial} (traded) ran with sample {number!r}, not a sample number" in str(
+        stopped.value
+    )
