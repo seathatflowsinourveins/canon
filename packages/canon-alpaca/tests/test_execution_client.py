@@ -18,12 +18,15 @@ import asyncio
 import socket
 import threading
 import time
+import uuid
 from collections.abc import Awaitable
 from collections.abc import Callable
 from datetime import UTC
 from datetime import datetime
+from datetime import timedelta
 from decimal import Decimal
 from types import SimpleNamespace
+from typing import Any
 from typing import cast
 
 import canon_alpaca.data
@@ -43,8 +46,10 @@ from alpaca.trading.requests import StopOrderRequest
 from canon_alpaca.constants import ACCOUNT_ID
 from canon_alpaca.constants import ENV_API_KEY
 from canon_alpaca.constants import ENV_SECRET_KEY
+from canon_alpaca.constants import USD
 from canon_alpaca.execution import AlpacaExecutionClient
 from canon_alpaca.execution import AlpacaExecutionClientConfig
+from canon_alpaca.execution import fill_report
 from canon_alpaca.factories import AlpacaDataClientFactory
 from canon_alpaca.factories import AlpacaExecutionClientFactory
 from canon_alpaca.providers import with_http_timeout
@@ -58,6 +63,8 @@ from nautilus_trader.core.datetime import dt_to_unix_nanos
 from nautilus_trader.live import LiveNode
 from nautilus_trader.model import ClientOrderId
 from nautilus_trader.model import InstrumentId
+from nautilus_trader.model import LiquiditySide
+from nautilus_trader.model import Money
 from nautilus_trader.model import OrderSide
 from nautilus_trader.model import OrderStatus
 from nautilus_trader.model import OrderType
@@ -67,6 +74,7 @@ from nautilus_trader.model import TimeInForce
 from nautilus_trader.model import TraderId
 from nautilus_trader.model import TrailingOffsetType
 from nautilus_trader.model import TriggerType
+from nautilus_trader.model import VenueOrderId
 from nautilus_trader.trading import Strategy
 
 AAPL = InstrumentId.from_str("AAPL.ALPACA")
@@ -1409,6 +1417,329 @@ def test_startup_reconciliation_reports_orders_and_positions(venue, alpaca) -> N
     (position,) = node.cache.positions_open()
     assert position.quantity == Quantity.from_int(2)
     assert Decimal(str(position.avg_px_open)) == Decimal("174.78")
+
+
+def test_startup_reconciliation_takes_fills_from_alpacas_fill_activities(venue, alpaca) -> None:
+    # A market buy of 2 filled before start in two parts, at prices other than its average: the fills come
+    # from Alpaca's FILL activities, each with the UUID after `::` as its trade ID (ADR 0024), not inferred.
+    filled = alpaca.alpaca_order(
+        id="0d5e6a3b-6f3c-4c1e-9d3e-1a2b3c4d5e6f",
+        client_order_id="filled-before-start",
+        type="market",
+        order_type="market",
+        limit_price=None,
+        status="filled",
+        filled_qty="2",
+        filled_avg_price="174.78",
+    )
+    first = datetime(2026, 11, 10, 18, 52, 26, 415_106, tzinfo=UTC)
+    second = datetime(2026, 11, 10, 18, 52, 28, 283_360, tzinfo=UTC)
+    venue.trading.orders = [filled]
+    venue.trading.positions = [alpaca.POSITION_AAPL]  # long 2
+    venue.trading.activities = [
+        alpaca.fill_activity(
+            filled, "d7c568d4-4cf3-4326-8362-8dd41d44da80", 1, "174.7", first, "partial_fill", 1, 1
+        ),
+        alpaca.fill_activity(
+            filled, "d83ed35d-fb7a-4b11-a888-0a5ba5298620", 1, "174.86", second, cum_qty=2
+        ),
+    ]
+    node = build_node(trader(submit=False))
+
+    run(node)
+
+    order = node.cache.order(ClientOrderId("filled-before-start"))
+    assert order is not None
+    assert order.status == OrderStatus.FILLED
+    fills = [e for e in order.events() if type(e).__name__ == "OrderFilled"]
+    assert [f.trade_id.value for f in fills] == [
+        "d7c568d4-4cf3-4326-8362-8dd41d44da80",
+        "d83ed35d-fb7a-4b11-a888-0a5ba5298620",
+    ]
+    assert [f.last_px for f in fills] == [Price.from_str("174.7"), Price.from_str("174.86")]
+    assert [f.ts_event for f in fills] == [dt_to_unix_nanos(first), dt_to_unix_nanos(second)]
+    assert venue.trading.activity_requests[0]["direction"] == "desc"
+
+
+@pytest.mark.parametrize("with_fill_activities", [False, True])
+def test_older_filled_orders_and_no_position_at_alpaca_end_start_up_flat(
+    venue, alpaca, with_fill_activities
+) -> None:
+    # Seen on paper: a filled buy whose closing sell is older than Alpaca's page of orders netted to a long
+    # Alpaca did not hold, kept as an EXTERNAL position. Fill reports alone do not remove it, since the
+    # sell's fills belong to an order the node is not given; the explicit flat report does.
+    at = datetime(2026, 11, 10, 15, 0, tzinfo=UTC)
+    bought = alpaca.alpaca_order(
+        id="0d5e6a3b-6f3c-4c1e-9d3e-1a2b3c4d5e6f",
+        client_order_id="older-buy",
+        type="market",
+        order_type="market",
+        limit_price=None,
+        status="filled",
+        qty="10",
+        filled_qty="10",
+        filled_avg_price="174.78",
+    )
+    sold = alpaca.alpaca_order(
+        id="1d5e6a3b-6f3c-4c1e-9d3e-1a2b3c4d5e6f",
+        client_order_id="older-sell",
+        side="sell",
+        type="market",
+        order_type="market",
+        limit_price=None,
+        status="filled",
+        qty="10",
+        filled_qty="10",
+        filled_avg_price="175",
+    )
+    venue.trading.orders = [bought]  # the sell is older than Alpaca's page of orders
+    venue.trading.positions = []
+    if with_fill_activities:
+        venue.trading.activities = [
+            alpaca.fill_activity(bought, str(uuid.UUID(int=1)), 10, "174.78", at),
+            alpaca.fill_activity(sold, str(uuid.UUID(int=2)), 10, "175", at + timedelta(minutes=1)),
+        ]
+    node = build_node(trader(submit=False))
+
+    run(node)
+
+    assert node.cache.positions_open() == []
+    order = node.cache.order(ClientOrderId("older-buy"))
+    assert order is not None and order.status == OrderStatus.FILLED
+
+
+def test_fills_alpaca_has_not_all_listed_are_left_to_the_engine(venue, alpaca) -> None:
+    # Seen on paper: a node started a second after the last fill found only the first of two listed.
+    filled = alpaca.alpaca_order(
+        id="0d5e6a3b-6f3c-4c1e-9d3e-1a2b3c4d5e6f",
+        client_order_id="filled-before-start",
+        type="market",
+        order_type="market",
+        limit_price=None,
+        status="filled",
+        filled_qty="2",
+        filled_avg_price="174.78",
+    )
+    a_second_ago = datetime.now(UTC) - timedelta(seconds=1)
+    first = alpaca.fill_activity(
+        filled,
+        str(uuid.UUID(int=1)),
+        1,
+        "174.7",
+        a_second_ago,
+        "partial_fill",
+        cum_qty=1,
+        leaves_qty=1,
+    )
+    venue.trading.orders = [filled]
+    venue.trading.positions = [alpaca.POSITION_AAPL]  # long 2
+    venue.trading.activities = [first]
+    node = build_node(trader(submit=False))
+
+    run(node)
+
+    order = node.cache.order(ClientOrderId("filled-before-start"))
+    assert order is not None and order.status == OrderStatus.FILLED
+    fills = [e for e in order.events() if type(e).__name__ == "OrderFilled"]
+    assert str(uuid.UUID(int=1)) not in [f.trade_id.value for f in fills]
+    assert sum(f.last_qty.as_double() for f in fills) == 2
+
+
+def test_fill_history_that_cannot_be_read_leaves_fills_inferred(venue, alpaca, capfd) -> None:
+    filled = alpaca.alpaca_order(
+        client_order_id="filled-before-start",
+        type="market",
+        order_type="market",
+        limit_price=None,
+        status="filled",
+        filled_qty="2",
+        filled_avg_price="174.78",
+    )
+    venue.trading.orders = [filled]
+    venue.trading.positions = [alpaca.POSITION_AAPL]
+    venue.trading.activities_error = alpaca.api_error(500, 50010000, "internal server error")
+    node = build_node(trader(submit=False))
+
+    run(node)
+
+    order = node.cache.order(ClientOrderId("filled-before-start"))
+    assert order is not None and order.status == OrderStatus.FILLED
+    assert "fills are inferred from the order reports" in logged(capfd)
+
+
+@pytest.mark.parametrize("change", [{"price": None}, {"qty": "not a number"}])
+def test_fill_reports_skip_an_activity_with_a_value_they_cannot_read(venue, alpaca, change) -> None:
+    order = alpaca.alpaca_order(status="filled", filled_qty="2")
+    at = datetime(2026, 11, 10, 15, 0, tzinfo=UTC)
+    venue.trading.activities = [
+        alpaca.fill_activity(order, str(uuid.UUID(int=1)), 1, "174.7", at),
+        {**alpaca.fill_activity(order, str(uuid.UUID(int=2)), 1, "174.8", at), **change},
+    ]
+    reports: list = []
+
+    async def body(client: AlpacaExecutionClient) -> None:
+        reports.extend(await client._fill_reports(fills_command()))
+
+    run_with_client(body)
+
+    assert [r.trade_id.value for r in reports] == [str(uuid.UUID(int=1))]
+
+
+def test_fill_report_maps_a_short_sale_to_a_sell(alpaca) -> None:
+    assert (
+        fill_report({**alpaca.FILL_ACTIVITY, "side": "sell_short"}, 0).order_side == OrderSide.SELL
+    )
+
+
+def test_an_order_whose_older_fills_fall_before_the_window_gets_no_fill_reports(
+    venue, alpaca
+) -> None:
+    order = alpaca.alpaca_order(status="filled", filled_qty="2")
+    at = datetime(2026, 11, 10, 15, 0, tzinfo=UTC)
+    venue.trading.activities = [
+        alpaca.fill_activity(order, str(uuid.UUID(int=1)), 1, "174.7", at, "partial_fill", 1, 1),
+        alpaca.fill_activity(
+            order, str(uuid.UUID(int=2)), 1, "174.8", at + timedelta(minutes=2), cum_qty=2
+        ),
+    ]
+    window_start = dt_to_unix_nanos(
+        at + timedelta(minutes=1)
+    )  # only the second fill is in the window
+    reports: list = []
+
+    async def body(client: AlpacaExecutionClient) -> None:
+        reports.extend(await client._fill_reports(fills_command(start=window_start)))
+
+    run_with_client(body)
+
+    assert reports == []  # its cum_qty, 2, shows a fill the window left out
+
+
+def test_fill_reports_for_one_order_keep_only_that_orders_fills(venue, alpaca) -> None:
+    mine = alpaca.alpaca_order(
+        id="0d5e6a3b-6f3c-4c1e-9d3e-1a2b3c4d5e6f", status="filled", filled_qty="1"
+    )
+    other = alpaca.alpaca_order(
+        id="1d5e6a3b-6f3c-4c1e-9d3e-1a2b3c4d5e6f", status="filled", filled_qty="1"
+    )
+    at = datetime(2026, 11, 10, 15, 0, tzinfo=UTC)
+    venue.trading.activities = [
+        alpaca.fill_activity(mine, str(uuid.UUID(int=1)), 1, "174.7", at),
+        alpaca.fill_activity(other, str(uuid.UUID(int=2)), 1, "174.8", at),
+    ]
+    venue.trading.ignores_order_filter = True  # as if Alpaca ignored `order_id`
+    reports: list = []
+
+    async def body(client: AlpacaExecutionClient) -> None:
+        command = fills_command(venue_order_id=VenueOrderId(mine["id"]))
+        reports.extend(await client._fill_reports(command))
+
+    run_with_client(body)
+
+    assert [r.trade_id.value for r in reports] == [str(uuid.UUID(int=1))]
+
+
+def test_fill_report_maps_the_docs_fill_activity(alpaca) -> None:
+    report = fill_report(alpaca.FILL_ACTIVITY, 7)
+
+    assert report.trade_id.value == "2d7be4ff-d1f3-43e9-856a-0f5cf5c5088e"
+    assert report.venue_order_id.value == "b5abe576-6a8a-49f3-a353-46b72c1ccae9"
+    assert report.instrument_id == InstrumentId.from_str("AAPL.ALPACA")
+    assert report.order_side == OrderSide.BUY
+    assert report.last_qty == Quantity.from_int(2)
+    assert report.last_px == Price.from_str("174.78")
+    assert report.commission == Money(0, USD)
+    assert report.liquidity_side == LiquiditySide.NO_LIQUIDITY_SIDE
+    assert report.ts_event == dt_to_unix_nanos(datetime(2022, 2, 2, 18, 55, 9, 981_482, tzinfo=UTC))
+    assert report.ts_init == 7
+    assert report.account_id == ACCOUNT_ID
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"id": "2d7be4ff-d1f3-43e9-856a-0f5cf5c5088e"},  # no `::`
+        {"side": "short"},
+        {"symbol": "BTC/USD"},
+        {"qty": "0.5"},
+    ],
+)
+def test_fill_report_refuses_an_activity_this_slice_cannot_map(alpaca, change) -> None:
+    with pytest.raises(ValueError):
+        fill_report({**alpaca.FILL_ACTIVITY, **change}, 0)
+
+
+def fills_command(**fields: object) -> Any:
+    """What `_fill_reports` reads of a `GenerateFillReports`, which Python cannot construct."""
+    return SimpleNamespace(
+        **({"venue_order_id": None, "instrument_id": None, "start": None, "end": None} | fields)
+    )
+
+
+def many_fills(alpaca, count: int) -> list[dict]:
+    order = alpaca.alpaca_order(status="filled", filled_qty=str(count))
+    start = datetime(2026, 11, 10, 15, 0, tzinfo=UTC)
+    return [
+        alpaca.fill_activity(
+            order, str(uuid.UUID(int=i)), 1, "174.78", start + timedelta(seconds=i)
+        )
+        for i in range(count)
+    ]
+
+
+def test_fill_reports_page_through_alpacas_activities(venue, alpaca) -> None:
+    venue.trading.activities = many_fills(alpaca, 150)
+    reports: list = []
+
+    async def body(client: AlpacaExecutionClient) -> None:
+        venue.trading.activity_requests.clear()
+        reports.extend(await client._fill_reports(fills_command()))
+
+    run_with_client(body)
+
+    assert len(reports) == 150
+    first, second = venue.trading.activity_requests
+    assert first == {"direction": "desc", "page_size": 100}
+    assert second["page_token"].endswith(str(uuid.UUID(int=50)))  # the 100th, newest first
+
+
+def test_fill_reports_stop_paging_before_the_window(venue, alpaca) -> None:
+    venue.trading.activities = many_fills(alpaca, 150)
+    window_start = dt_to_unix_nanos(datetime(2026, 11, 10, 15, 2, 0, tzinfo=UTC))  # the newest 30
+    reports: list = []
+
+    async def body(client: AlpacaExecutionClient) -> None:
+        venue.trading.activity_requests.clear()
+        reports.extend(await client._fill_reports(fills_command(start=window_start)))
+
+    run_with_client(body)
+
+    assert len(reports) == 30
+    assert len(venue.trading.activity_requests) == 1
+
+
+def test_fill_reports_ask_alpaca_for_one_order_and_skip_what_they_cannot_map(venue, alpaca) -> None:
+    order = alpaca.alpaca_order(status="filled", filled_qty="2")
+    at = datetime(2026, 11, 10, 15, 0, tzinfo=UTC)
+    venue.trading.activities = [
+        alpaca.fill_activity(order, "d7c568d4-4cf3-4326-8362-8dd41d44da80", 1, "174.7", at),
+        {
+            **alpaca.fill_activity(order, "d83ed35d-fb7a-4b11-a888-0a5ba5298620", 1, "174.8", at),
+            "qty": "0.5",
+        },
+    ]
+    reports: list = []
+
+    async def body(client: AlpacaExecutionClient) -> None:
+        venue.trading.activity_requests.clear()
+        reports.extend(
+            await client._fill_reports(fills_command(venue_order_id=VenueOrderId(order["id"])))
+        )
+
+    run_with_client(body)
+
+    assert [r.trade_id.value for r in reports] == ["d7c568d4-4cf3-4326-8362-8dd41d44da80"]
+    assert venue.trading.activity_requests[0]["order_id"] == order["id"]
 
 
 def test_open_order_placed_before_the_window_is_reported(venue, alpaca) -> None:

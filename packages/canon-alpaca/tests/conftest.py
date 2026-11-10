@@ -18,6 +18,9 @@ alpaca-py's own models, so the adapter's conversions are tested against what alp
   (https://docs.alpaca.markets/us/docs/websocket-streaming.md), read 2026-11-10. Its order is a crypto
   sell; here the update's fields (`execution_id`, `price`, `timestamp`) are kept and the order is the
   equity order above, moved through the statuses the event implies.
+* fill activity: "Retrieve Account Activities of Specific Type", the `TradingActivities` example
+  (https://docs.alpaca.markets/us/reference/getaccountactivitiesbyactivitytype-1.md), read 2026-11-10; its
+  `id` written as paper writes it (ADR 0024)
 * account: "Get Account", response example (https://docs.alpaca.markets/us/reference/getaccount-1.md)
 * position: "All Open Positions", the second schema example, AAPL
   (https://docs.alpaca.markets/us/reference/getallopenpositions.md)
@@ -266,6 +269,52 @@ POSITION_AAPL = {
 CLOSED_ORDER_STATUSES = {"filled", "canceled", "expired", "rejected", "replaced"}
 
 
+FILL_ACTIVITY = {
+    "activity_type": "FILL",
+    "cum_qty": "2",
+    "id": "20220202135509981::2d7be4ff-d1f3-43e9-856a-0f5cf5c5088e",
+    "leaves_qty": "0",
+    "order_id": "b5abe576-6a8a-49f3-a353-46b72c1ccae9",
+    "order_status": "filled",
+    "price": "174.78",
+    "qty": "2",
+    "side": "buy",
+    "symbol": "AAPL",
+    "transaction_time": "2022-02-02T18:55:09.981482Z",
+    "type": "fill",
+}
+"""The `TradingActivities` example of "Retrieve Account Activities of Specific Type"
+(https://docs.alpaca.markets/us/reference/getaccountactivitiesbyactivitytype-1.md), read 2026-11-10."""
+
+
+def fill_activity(
+    order: dict,
+    execution_id: str,
+    qty: int,
+    price: str,
+    at: datetime,
+    kind: str = "fill",
+    cum_qty: int | None = None,
+    leaves_qty: int = 0,
+) -> dict:
+    """The docs' fill activity for one fill of `order`, its `id` as paper writes it (ADR 0024); `cum_qty`
+    is `qty` unless given."""
+    stamp = at.astimezone(NEW_YORK).strftime("%Y%m%d%H%M%S%f")[:17]
+    return {
+        **FILL_ACTIVITY,
+        "id": f"{stamp}::{execution_id}",
+        "order_id": order["id"],
+        "price": price,
+        "qty": str(qty),
+        "side": order["side"],
+        "symbol": order["symbol"],
+        "transaction_time": at.astimezone(UTC).isoformat().replace("+00:00", "Z"),
+        "type": kind,
+        "cum_qty": str(qty if cum_qty is None else cum_qty),
+        "leaves_qty": str(leaves_qty),
+    }
+
+
 def alpaca_order(**changes: object) -> dict:
     """A copy of the docs' equity order with `changes` applied."""
     return {**ORDER_AAPL, **changes}
@@ -362,6 +411,11 @@ class FakeOrdersClient(FakeTradingClient):
     It cancels orders placed through it and orders in `orders`, as Alpaca holds both. With `execution_ids` false, fills carry no `execution_id`. `orders` and `positions` are what the reads return; `get_orders` applies
     the `status`, `symbols`, `after` and `until` filters the way alpaca-py's `GetOrdersRequest` documents
     them (`after` and `until` on the submission time).
+    `get` answers `/account/activities/FILL` as "Retrieve Account Activities of Specific Type" documents
+    it: `activities`, filtered by `order_id`, ordered by `direction` (newest first by default), at most
+    `page_size` (100 by default), after the activity whose `id` is `page_token`. Each fill this stand-in
+    sends with an `execution_id` is added there, its `id` that fill's New York time to the millisecond,
+    `::`, and the `execution_id`, as paper showed (ADR 0024). `activity_requests` records every call.
     """
 
     def __init__(self) -> None:
@@ -385,6 +439,10 @@ class FakeOrdersClient(FakeTradingClient):
         self.order_queries: list[GetOrdersRequest | None] = []
         self.orders: list[dict] = []
         self.positions: list[dict] = []
+        self.activities: list[dict] = []
+        self.activity_requests: list[dict] = []
+        self.activities_error: Exception | None = None  # raised by `get`
+        self.ignores_order_filter = False  # answer every order's fills, whatever `order_id` asks
         self.account = dict(ACCOUNT)
         self._placed: dict[str, dict] = {}
 
@@ -438,6 +496,18 @@ class FakeOrdersClient(FakeTradingClient):
             update.update(price=self.fill_price, qty=str(qty), position_qty=str(qty))
             if self.execution_ids:
                 update["execution_id"] = str(uuid.uuid4())
+                self.activities.append(
+                    fill_activity(
+                        placed,
+                        str(update["execution_id"]),
+                        qty,
+                        str(self.fill_price),
+                        datetime.fromisoformat(str(update["timestamp"])),
+                        event,
+                        cum_qty=int(placed.get("filled_qty") or qty),
+                        leaves_qty=int(placed["qty"]) - int(placed.get("filled_qty") or qty),
+                    )
+                )
             placed["filled_avg_price"] = self.fill_price
         assert self.stream is not None, "no trade stream to send to"
         self.stream.send(update)
@@ -569,6 +639,30 @@ class FakeOrdersClient(FakeTradingClient):
 
     def get_account(self) -> TradeAccount:
         return TradeAccount.model_validate(self.account)
+
+    def get(self, path: str, data: dict | None = None) -> list[dict]:
+        if self.activities_error is not None:
+            raise self.activities_error
+        assert path == "/account/activities/FILL", (
+            f"the stand-in answers only fill activities: {path}"
+        )
+        params = dict(data or {})
+        self.activity_requests.append(params)
+        selected = [
+            a
+            for a in self.activities
+            if self.ignores_order_filter
+            or "order_id" not in params
+            or a["order_id"] == params["order_id"]
+        ]
+        selected.sort(
+            key=lambda a: datetime.fromisoformat(a["transaction_time"]),
+            reverse=params.get("direction", "desc") == "desc",
+        )
+        if "page_token" in params:
+            ids = [a["id"] for a in selected]
+            selected = selected[ids.index(params["page_token"]) + 1 :]
+        return [dict(a) for a in selected[: int(params.get("page_size", 100))]]
 
 
 class FakeTradeStream:
@@ -844,6 +938,8 @@ def alpaca() -> SimpleNamespace:
         ORDER_AAPL=ORDER_AAPL,
         POSITION_AAPL=POSITION_AAPL,
         FILL_UPDATE=FILL_UPDATE,
+        FILL_ACTIVITY=FILL_ACTIVITY,
+        fill_activity=fill_activity,
         alpaca_order=alpaca_order,
         api_error=api_error,
         TradingClient=FakeTradingClient,
