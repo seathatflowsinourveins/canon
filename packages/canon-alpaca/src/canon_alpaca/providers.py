@@ -126,8 +126,9 @@ def session_of(client: object) -> requests.Session | None:
 
 
 def with_http_timeout[C](client: C) -> C:
-    """Mount a `TimeoutAdapter` on an alpaca-py REST client's session, unless one is mounted, and return
-    the client.
+    """Mount a `TimeoutAdapter` with this package's (connect, read) timeout on an alpaca-py REST client's
+    session for both `https://` and `http://`, unless that one adapter is already mounted on both, and
+    return the client. A `TimeoutAdapter` with another timeout, or on one scheme only, is replaced.
 
     Raises `TypeError` if the client holds no `requests.Session` at `_session`, so a client that would
     run without a timeout does not start.
@@ -138,14 +139,20 @@ def with_http_timeout[C](client: C) -> C:
             f"{type(client).__name__} has no requests.Session at _session, where alpaca-py 0.45.0 keeps "
             "it; refusing to run without an HTTP timeout (ADR 0039)",
         )
-    if timeout_adapter(client) is None:
+    timeout = (CONNECT_TIMEOUT_SECS, READ_TIMEOUT_SECS)
+    mounted = timeout_adapter(client)
+    if (
+        mounted is None
+        or mounted.timeout != timeout
+        or session.adapters.get("http://") is not mounted
+    ):
         # alpaca-py's session holds requests' two default adapters; they are closed, not kept. A client
         # passed in with an adapter of its own loses that adapter's settings (ADR 0039).
         for old in {
             id(a): a for a in (session.adapters.get(p) for p in ("https://", "http://")) if a
         }.values():
             old.close()
-        adapter = TimeoutAdapter((CONNECT_TIMEOUT_SECS, READ_TIMEOUT_SECS))
+        adapter = TimeoutAdapter(timeout)
         session.mount("https://", adapter)
         session.mount("http://", adapter)
     return client

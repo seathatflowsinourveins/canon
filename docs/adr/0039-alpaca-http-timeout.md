@@ -84,7 +84,18 @@ holding a `requests.Session` at `_session`, or `_request` or `_one_request` star
 move to alpaca-py's).
 `test_execution_client.py` runs alpaca-py's `RESTClient` against a local server that never answers: the
 call ends at the read timeout, the next is answered, and the node's run ends; without the adapter that test
-hangs. It also covers each outcome above. On paper, the execution rows of `test_paper_matrix.py` run with
+hangs. It also covers each outcome above. `with_http_timeout` mounts the package's adapter on both `https://` and
+`http://` unless that one adapter, at (3.05, 27), is already on both, so a client passed in with a
+`TimeoutAdapter` at another timeout, or on HTTPS only, gets the package's; the same test file covers it.
+The paper hang, read again from its log on 2026-11-10: the node's disconnect failed 144 s after it began,
+its 15 s wait for the engines ended about 7.5 minutes later, and the process lived on after the node was
+disposed, while the test's own alpaca-py client, with no timeout, did its clean-up. Not reproduced
+offline: a trade stream that ignores its stop gives the same two log lines within the configured bounds.
+Two waits in the adapter had no bound of their own and now have one, each with an offline test that
+fails without it: the disconnect waited for a stream thread through a worker of the loop's default
+executor, where every alpaca-py call also runs, and for the cancelled trade-update task with no limit.
+Each paper test's own alpaca-py client now has this adapter's timeout. What delayed the node's
+disconnect on paper stays UNVERIFIED. On paper, the execution rows of `test_paper_matrix.py` run with
 the adapter at the next regular session (UNVERIFIED until then). Before moving the alpaca-py pin, read its
 notes for a timeout option and for `RESTClient`.
 
@@ -116,6 +127,17 @@ Read 2026-11-10.
   disconnecting clients: Failed to disconnect execution clients: ALPACA" two and a half minutes after the
   stop, then "Timed out (15s) waiting for engines to disconnect"; the process's elapsed time when killed,
   47 minutes (`ps`); its cause is consistent with a request that never answered, not proven (run).
+* The paper run's log, read again 2026-11-10: "Disconnecting clients..." at 19:55:11.5 UTC, "Error
+  disconnecting clients: Failed to disconnect execution clients: ALPACA" at 19:57:36.0, "Timed out (15s)
+  waiting for engines to disconnect" at 20:05:12.9, then the node disposed and no further line until the
+  task was killed (exit 143) (read). Offline, a trade stream that ignores `stop` with a 2 s join gives the
+  same two errors at 2 s and 5 s (run).
+* https://raw.githubusercontent.com/nautechsystems/nautilus_trader/d53849b216e20f2c122ca01b4dd0da377638b186/crates/live/src/task.rs
+  (`TaskGroup::finish_shutdown`, "Drains the closed generation within graceful and forced bounds") and
+  `crates/adapters/coinbase/src/execution.rs` at the same commit (`finish_shutdown(Duration::from_secs(1),
+  Duration::from_secs(2))` in its disconnect) (fetched, raw).
+* alpaca-py 0.45.0 as installed, `trading/stream.py`: `stop()` "never blocks"; `_auth` awaits
+  `self._ws.recv()` with no timeout, under websockets' `ping_interval` 10 and `ping_timeout` 180 (read).
 * Second reader, 2026-11-10 (`evidence-verifier`): the sources hold. Corrected above: a race in the first
   send count, now per call; the search result #211; the disconnect claim, now UNVERIFIED; the hang's cause
   and duration; where the connect-timeout inference comes from; what the contract test checks.

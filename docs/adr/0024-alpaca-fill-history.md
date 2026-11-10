@@ -103,7 +103,18 @@ test (alone: add `-s -k test_paper_fill_activity_ids`); it skips outside the reg
 without a match reopens this record. The slice is built (2026-11-10): `execution.py`'s header names
 Alpaca's reference page and `RESTClient.get`, its fill reports take the trade ID from the UUID after `::`,
 and `test_paper_fill_reports.py` checks on paper that start-up reconciliation gives a filled order the
-stream's trade IDs and prices. `scripts/canon
+stream's trade IDs and prices. An order's reports are kept only when they can be shown to be all
+its fills, whatever their age: its newest activity leaves nothing to fill (`leaves_qty` 0) and they add
+up to its `cum_qty`, or else Alpaca's order shows no more `filled_qty` than they add up to. Otherwise,
+and when the history cannot be read (a body that is not JSON or a model alpaca-py cannot build
+included), that order's reports, or all of them, are dropped with a warning and the engine infers the
+fills; a full page whose last activity has no `id` ends the read there. This replaces a one-minute age
+limit on the order check, which no Alpaca page and no observation here supports (the one lag seen on
+paper was about a second). It costs, for the orders whose newest listed fill leaves shares to fill or
+lacks either field, one order request for one such order, and for more one read of the account's
+newest 500 orders plus one request per order not among them. Upstream's OKX and Kraken spot
+adapters mark the mass status incomplete instead; NautilusTrader's Python `ExecutionMassStatus` at the
+pin has no setter for that, so dropping the fills is a departure from them. `test_execution_client.py` covers each case. `scripts/canon
 outdated` reports a newer alpaca-py tag; read its notes for the call before moving the pin. Still
 UNVERIFIED: the paging limits and the `after`/`until` filters for fills. Open, and the owner's: any
 question to upstream.
@@ -162,3 +173,15 @@ Read 2026-11-10. "raw" means the page's markdown or source fetched with `curl` a
   10%, pull request 845's state, the command that runs the test, "would" in Consequences, and the rule-3
   reading no longer listed as open.
 * Not run: the paging limits and the `after`/`until` filters, which stay UNVERIFIED.
+* The completeness rule, 2026-11-10: alpaca-py 0.45.0 as installed, `RESTClient._one_request` returns
+  `response.json()` for a 200; requests 2.34.2's `JSONDecodeError` subclasses `OSError` and `ValueError`,
+  and pydantic-core's `ValidationError`, which alpaca-py's models raise, subclasses `ValueError` (run).
+  https://raw.githubusercontent.com/nautechsystems/nautilus_trader/d53849b216e20f2c122ca01b4dd0da377638b186/docs/concepts/execution/reconciliation.md,
+  "Mass-status history contract" ("An adapter can still return authoritative active orders and position
+  reports when a historical source fails. It marks the mass status incomplete"), and at the same commit
+  `crates/adapters/okx/src/execution.rs` and `crates/adapters/kraken/src/execution/spot.rs`, whose mass
+  status calls `set_report_window(start, complete)` (fetched, raw). The installed rc8's Python
+  `ExecutionMassStatus` exposes `reports_complete` with no setter and is built from
+  `(client_id, account_id, venue, ts_init, report_id=None)` (run). The reference's `cum_qty`,
+  `leaves_qty` ("The quantity of shares remaining to be filled") and `page_token` descriptions, from the
+  page above.

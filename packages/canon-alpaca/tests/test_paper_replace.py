@@ -38,6 +38,7 @@ from alpaca.trading.requests import ReplaceOrderRequest
 from alpaca.trading.stream import TradingStream
 from canon_alpaca.constants import ENV_API_KEY
 from canon_alpaca.constants import ENV_SECRET_KEY
+from canon_alpaca.providers import with_http_timeout
 
 pytestmark = pytest.mark.skipif(
     not (os.environ.get(ENV_API_KEY) and os.environ.get(ENV_SECRET_KEY)),
@@ -163,7 +164,9 @@ def cancel_open(trading: TradingClient, ids: list[str]) -> None:
 
 def test_paper_replace_answers_as_observed() -> None:
     api_key, secret_key = os.environ[ENV_API_KEY], os.environ[ENV_SECRET_KEY]
-    trading = TradingClient(api_key=api_key, secret_key=secret_key, paper=True, raw_data=True)
+    trading = with_http_timeout(
+        TradingClient(api_key=api_key, secret_key=secret_key, paper=True, raw_data=True)
+    )
     held = trading.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[SYMBOL]))
     assert held == [], f"the paper account already holds {len(held)} open {SYMBOL} order(s)"
 

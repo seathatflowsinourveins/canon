@@ -10,7 +10,10 @@ methods, and leaves `_batch_cancel_orders` to its default, "ordered calls of the
 single-order hook" (Alpaca has no endpoint that cancels a list of orders by ID), and `_generate_mass_status`
 to the native composition of the bulk report hooks. Nothing is started in the constructor; the alpaca-py
 clients and the task that applies trade updates in order are made in `_connect`, and the stream thread is
-joined and the task ended in `_disconnect`. Hooks not overridden here raise `NotImplementedError`.
+joined and the task ended in `_disconnect`, each wait bounded by a deadline on the node's loop
+(`data.join_within`, `TASK_GRACE_SECS` and `TASK_ABORT_SECS`), as upstream's Coinbase adapter bounds its
+task drain at disconnect; a wait that runs out fails the disconnect, logged with its reason. Hooks not overridden here
+raise `NotImplementedError`.
 
 Modify (ADR 0042) rests on Alpaca's "Replace Order by ID"
 (https://docs.alpaca.markets/us/reference/patchorderbyorderid-1.md) and on a paper observation of
@@ -64,7 +67,14 @@ through alpaca-py's generic `RESTClient.get` ("Performs a single GET request"), 
 activity's `id`, which a paper test matched to the stream's `execution_id` for every fill, so the engine's
 duplicate fill detection sees one fill once ("Duplicate fill detection", `docs/concepts/execution/index.md`
 at the pinned commit). With fill reports, the engine no longer "Infers `OrderFilled` events for missing
-trade reports" for orders whose fills Alpaca lists.
+trade reports" for orders whose fills Alpaca lists. An order's reports are kept only when its activities,
+or failing that its order (`filled_qty`), show they are all its fills; otherwise, and when the history
+cannot be read at all, none are, with a warning, and the engine infers them as before. Upstream's OKX
+and Kraken spot adapters (`crates/adapters/okx/src/execution.rs`, `kraken/src/execution/spot.rs` at the
+pinned commit) instead track whether their fill history is complete and mark the mass status so
+(`set_report_window`; reconciliation.md: an adapter "marks the mass status incomplete to record the
+missing history"). NautilusTrader's Python `ExecutionMassStatus` at the pin has no setter for
+`reports_complete`, so this client drops the fills it cannot show complete: a departure (ADR 0024).
 
 Venue side, alpaca-py 0.45.0:
 
@@ -216,6 +226,8 @@ from .constants import PRICE_PRECISION
 from .constants import USD
 from .constants import VENUE
 from .data import STREAM_JOIN_TIMEOUT_SECS
+from .data import join_within
+from .data import logged_failure
 from .data import post
 from .data import weak_callback
 from .data import weak_coroutine
@@ -260,12 +272,17 @@ FILL_PAGES_LIMIT = 10
 """Pages of fills read per report request before stopping with a warning: 1,000 fills, twice the 500 orders
 `ORDERS_PAGE_LIMIT` lets the order reports hold."""
 
-LAG_CHECK_NANOS = 60_000_000_000
-"""How recent an order's newest listed fill must be for the client to read the order and check that every
-fill is listed: on paper the activities lagged the stream by about a second (package README)."""
-
 ORDERS_PAGE_LIMIT = 500
 """The most orders one `get_orders` call returns: `GetOrdersRequest.limit` "Defaults to 50 and max is 500"."""
+
+TASK_GRACE_SECS = 1.0
+"""How long `_disconnect` lets an update being applied finish before it cancels the task applying them;
+then it waits `TASK_ABORT_SECS` for the task to end. The graceful and forced bounds of upstream's Coinbase
+adapter's task drain at disconnect (`crates/adapters/coinbase/src/execution.rs`,
+`finish_shutdown(Duration::from_secs(1), Duration::from_secs(2))`, at the pinned commit)."""
+
+TASK_ABORT_SECS = 2.0
+"""See `TASK_GRACE_SECS`."""
 
 REASON_MAX_CHARS = 200
 """Venue text in a rejection reason is cut to this length; NautilusTrader's policies ask adapters to "bound
@@ -442,6 +459,25 @@ def run_trade_stream(
         post(loop, on_exit, (stream, e))
         raise
     post(loop, on_exit, (stream, None))
+
+
+async def drain(consumer: asyncio.Task, idle: asyncio.Event) -> None:
+    """Let the update `consumer` is applying finish, for at most `TASK_GRACE_SECS`, then cancel it and wait
+    at most `TASK_ABORT_SECS` for it to end: the graceful and forced bounds of upstream's
+    `TaskGroup::finish_shutdown`."""
+    if not consumer.done():
+        try:
+            await asyncio.wait_for(idle.wait(), TASK_GRACE_SECS)
+        except TimeoutError:
+            pass
+    consumer.cancel()
+    await asyncio.wait({consumer}, timeout=TASK_ABORT_SECS)
+
+
+def retrieved(task: asyncio.Task) -> None:
+    """Read a finished task's outcome, so an error it ended with is not left "never retrieved"."""
+    if not task.cancelled():
+        task.exception()
 
 
 def release_after[R](
@@ -643,6 +679,18 @@ def order_status_report(
         return None
 
 
+def share_count(value: object) -> Decimal | None:
+    """`value`, a quantity Alpaca sends as a string, as a finite, non-negative number of shares, or None
+    if absent or unreadable."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        quantity = Decimal(str(value))
+    except ArithmeticError:
+        return None
+    return quantity if quantity.is_finite() and quantity >= 0 else None
+
+
 def fill_time(activity: dict) -> int:
     """An activity's `transaction_time`, "The time at which the execution occurred", in Unix nanoseconds."""
     return dt_to_unix_nanos(datetime.fromisoformat(str(activity["transaction_time"])))
@@ -773,19 +821,17 @@ class AlpacaExecutionClient(ExecutionClient):
         # Trade updates, applied in arrival order by one task on the node's loop.
         self._updates: asyncio.Queue[TradeUpdate] = asyncio.Queue()
         self._consumer: asyncio.Task[object] | None = None
-        self._applying = False
+        # Set while that task is not applying an update; a new one with each connect, so a task left
+        # over from an earlier connect sets only its own.
+        self._idle = asyncio.Event()
+        self._idle.set()
         self._log = Logger(type(self).__name__)
 
     # -- lifecycle ---------------------------------------------------------------------------------
 
     @override
     async def _connect(self) -> None:
-        # As in data.py: NautilusTrader logs a failed connect without its message, so it is logged here.
-        try:
-            await self._connect_venue()
-        except Exception as e:
-            self._log.error(f"Alpaca execution client failed to connect: {e}")
-            raise
+        await logged_failure(self._log, "execution client failed to connect", self._connect_venue())
 
     async def _connect_venue(self) -> None:
         self._owner_loop = self.loop
@@ -805,7 +851,12 @@ class AlpacaExecutionClient(ExecutionClient):
             self._handle_instrument(instrument)
         await self._report_account()
         self._updates = asyncio.Queue()
-        self._consumer = self.create_task(self._consume_updates(), "alpaca-trade-updates")
+        self._idle = asyncio.Event()
+        self._idle.set()
+        self._consumer = self.create_task(
+            self._consume_updates(self._updates, self._idle), "alpaca-trade-updates"
+        )
+        self._consumer.add_done_callback(retrieved)
         self._stream.subscribe_trade_updates(weak_coroutine(self._on_trade_update))
         self._stream_thread = threading.Thread(
             target=run_trade_stream,
@@ -817,15 +868,29 @@ class AlpacaExecutionClient(ExecutionClient):
 
     @override
     async def _disconnect(self) -> None:
+        await logged_failure(
+            self._log, "execution client failed to disconnect", self._disconnect_venue()
+        )
+
+    async def _disconnect_venue(self) -> None:
         self._stopping = True
         thread = self._stream_thread
         if thread is not None and self._stream is not None:
             self._stream.stop()
-            await asyncio.to_thread(thread.join, STREAM_JOIN_TIMEOUT_SECS)
+        # The thread's join and the task's drain run together, so the client's own worst case is the longer
+        # of the join and the drain (`TASK_GRACE_SECS` plus `TASK_ABORT_SECS`). Updates that still arrive
+        # are dropped while stopping (`_enqueue_update`).
         consumer, self._consumer = self._consumer, None
+        queue, idle = self._updates, self._idle
+        waits: list[Awaitable[object]] = []
+        if thread is not None:
+            waits.append(join_within(thread, STREAM_JOIN_TIMEOUT_SECS))
         if consumer is not None:
-            consumer.cancel()
-            await asyncio.gather(consumer, return_exceptions=True)
+            waits.append(drain(consumer, idle))
+        await asyncio.gather(*waits)
+        consumer_ended = consumer is None or consumer.done()
+        while not queue.empty():  # so a task that outlived its cancel finds nothing left to apply
+            queue.get_nowait()
         # Cleared whether or not the thread stopped, so a later connect builds fresh clients.
         self._stream_thread = None
         self._stream = None
@@ -840,6 +905,11 @@ class AlpacaExecutionClient(ExecutionClient):
         if thread is not None and thread.is_alive():
             raise RuntimeError(
                 f"Alpaca trade updates thread did not stop within {STREAM_JOIN_TIMEOUT_SECS} s",
+            )
+        if not consumer_ended:
+            raise RuntimeError(
+                "Alpaca trade updates task did not end within "
+                f"{TASK_GRACE_SECS + TASK_ABORT_SECS} s of the disconnect",
             )
 
     async def _report_account(self) -> None:
@@ -1338,18 +1408,21 @@ class AlpacaExecutionClient(ExecutionClient):
         self._finish(order.client_order_id)
         self.generate_order_rejected(order, reason, ts_event, False)
 
-    async def _consume_updates(self) -> None:
+    async def _consume_updates(
+        self, updates: asyncio.Queue[TradeUpdate], idle: asyncio.Event
+    ) -> None:
         """Apply trade updates one at a time, in the order the stream delivered them: an update for a
-        replacement may need a lookup on Alpaca before it can be applied."""
+        replacement may need a lookup on Alpaca before it can be applied. The queue and the event are
+        this connect's own, so a task left after a disconnect reads no new queue and marks no new event."""
         while True:
-            update = await self._updates.get()
-            self._applying = True
+            update = await updates.get()
+            idle.clear()
             try:
                 await self._apply_trade_update(update)
             except Exception as e:  # noqa: BLE001 - one update's failure must not stop the rest
                 self._log.error(f"Alpaca trade update {update.event} could not be applied: {e!r}")
             finally:
-                self._applying = False
+                idle.set()
 
     async def _apply_trade_update(self, update: TradeUpdate) -> None:
         if self._stopping:
@@ -1664,32 +1737,29 @@ class AlpacaExecutionClient(ExecutionClient):
     async def _generate_order_status_report(
         self, command: live.GenerateOrderStatusReport
     ) -> OrderStatusReport | None:
-        return await self._logged("order status report", self._order_status_report(command))
+        return await logged_failure(
+            self._log, "order status report failed", self._order_status_report(command)
+        )
 
     @override
     async def _generate_order_status_reports(
         self, command: live.GenerateOrderStatusReports
     ) -> list[OrderStatusReport]:
-        return await self._logged("order status reports", self._order_status_reports(command))
+        return await logged_failure(
+            self._log, "order status reports failed", self._order_status_reports(command)
+        )
 
     @override
     async def _generate_fill_reports(self, command: live.GenerateFillReports) -> list[FillReport]:
-        return await self._logged("fill reports", self._fill_reports(command))
+        return await logged_failure(self._log, "fill reports failed", self._fill_reports(command))
 
     @override
     async def _generate_position_status_reports(
         self, command: live.GeneratePositionStatusReports
     ) -> list[PositionStatusReport]:
-        return await self._logged("position status reports", self._position_status_reports(command))
-
-    async def _logged[R](self, what: str, reports: Awaitable[R]) -> R:
-        """Await `reports`, logging why they failed: NautilusTrader v2.0.0rc8 logs a failed report request
-        as "Failed to get mass status" without the exception's message (observed)."""
-        try:
-            return await reports
-        except Exception as e:
-            self._log.error(f"Alpaca {what} failed: {e}")
-            raise
+        return await logged_failure(
+            self._log, "position status reports failed", self._position_status_reports(command)
+        )
 
     async def _order_status_report(
         self, command: live.GenerateOrderStatusReport
@@ -1774,13 +1844,14 @@ class AlpacaExecutionClient(ExecutionClient):
         the endpoint has no symbol filter. Alpaca returns activities newest first by default, so paging
         stops at the first activity before the window's start, or after `FILL_PAGES_LIMIT` pages. If the
         history cannot be read, the failure is logged and no fill is reported, so the engine infers fills
-        from the order reports as it did before fill reports existed. An order whose listed fills Alpaca
-        shows short of its filled quantity, as when the activities lag the stream, gets no reports
-        (`_complete`), so the engine infers its fills rather than taking a part of them.
+        from the order reports as it did before fill reports existed; a body that is not JSON, or not a
+        list, counts as unread. An order whose listed fills cannot be shown to be all its fills, as when
+        the activities lag the stream, gets no reports (`_complete`), so the engine infers its fills
+        rather than taking a part of them.
         """
         try:
             activities = await self._fill_activities(command)
-        except (APIError, OSError, TypeError, KeyError) as e:
+        except (APIError, OSError, TypeError, KeyError, ValueError) as e:
             self._log.error(
                 f"Alpaca fill history could not be read ({e!r}); fills are inferred from the order reports"
             )
@@ -1806,7 +1877,7 @@ class AlpacaExecutionClient(ExecutionClient):
             ):
                 continue
             reports.append(report)
-        return await self._complete(reports, activities, ts_init)
+        return await self._complete(reports, activities)
 
     async def _fill_activities(self, command: live.GenerateFillReports) -> list:
         params: dict[str, str | int] = {"direction": "desc", "page_size": ACTIVITIES_PAGE_SIZE}
@@ -1828,60 +1899,104 @@ class AlpacaExecutionClient(ExecutionClient):
                 command.start is not None and oldest is not None and oldest < command.start
             ):
                 return activities
-            params["page_token"] = page[-1]["id"]
+            token = page[-1].get("id") if isinstance(page[-1], dict) else None
+            if not isinstance(token, str) or not token:
+                # The reference's `page_token` is "the ID of the end of your current page of results";
+                # without it the read cannot go on. What was read is kept, and `_complete` drops an
+                # order whose older fills this leaves out.
+                self._log.warning(
+                    "Alpaca fill history stopped at an activity with no readable `id`; older fills, if "
+                    "any, are not reported",
+                )
+                return activities
+            params["page_token"] = token
         self._log.warning(
             f"Alpaca fill history read to its limit of {FILL_PAGES_LIMIT} pages of {ACTIVITIES_PAGE_SIZE}; "
             "older fills, if any, are not reported",
         )
         return activities
 
-    async def _complete(
-        self, reports: list[FillReport], activities: list, ts_init: int
-    ) -> list[FillReport]:
-        """Drop the reports of an order whose listed fills are not all of its fills, so the engine infers
-        that order's fills rather than taking a part of them (package README).
+    async def _complete(self, reports: list[FillReport], activities: list) -> list[FillReport]:
+        """Drop the reports of an order whose listed fills cannot be shown to be all of its fills, so the
+        engine infers that order's fills rather than taking a part of them (package README).
 
-        Two signs: the listed fills add up to less than the newest one's `cum_qty` ("The cumulative
-        quantity of shares involved in the execution"), as when the window or the page limit cut older
-        fills off; or the newest leaves shares to fill, is recent (`LAG_CHECK_NANOS`), and Alpaca's order
-        shows more filled than the listed fills, as when the activities lag the stream.
+        An order's listed fills are all of them when its newest activity leaves nothing to fill
+        (`leaves_qty` 0, "The quantity of shares remaining to be filled") and they add up to that
+        activity's `cum_qty` ("The cumulative quantity of shares involved in the execution"). Short of
+        `cum_qty`, as when the window or the page limit cut older fills off, they are not. Otherwise
+        (shares left to fill, either field absent or unreadable) Alpaca's order is read and they are all
+        of them only when its `filled_qty` is no more than they add up to, whatever the fills' age: the
+        activities can lag the stream by an amount no page states. An order that cannot be read, or that
+        alpaca-py cannot build, keeps no reports. The cost is in `_filled_quantities`.
         """
         newest: dict[str, dict] = {}
         for activity in activities:  # newest first
             if isinstance(activity, dict) and activity.get("order_id") is not None:
                 newest.setdefault(str(activity["order_id"]), activity)
-        listed: dict[str, float] = {}
+        listed: dict[str, Decimal] = {}
         for report in reports:
             key = report.venue_order_id.value
-            listed[key] = listed.get(key, 0.0) + report.last_qty.as_double()
+            listed[key] = listed.get(key, Decimal(0)) + report.last_qty.as_decimal()
         partial: set[str] = set()
+        to_check: list[str] = []
         for order_id, qty in listed.items():
             last = newest.get(order_id, {})
-            try:
-                cum = float(last.get("cum_qty") or 0)
-                leaves = float(last.get("leaves_qty") or 0)
-                recent = ts_init - fill_time(last) <= LAG_CHECK_NANOS
-            except KeyError, TypeError, ValueError:
+            cum = share_count(last.get("cum_qty"))
+            leaves = share_count(last.get("leaves_qty"))
+            if cum is not None and qty < cum:
                 partial.add(order_id)
-                continue
-            if qty < cum:
-                partial.add(order_id)
-                continue
-            if leaves <= 0 or not recent:
-                continue
-            try:
-                order = await self._call(self._venue().get_order_by_id, order_id)
-            except (APIError, OSError) as e:
-                self._log.warning(f"Alpaca order {order_id} not read to check its fills ({e!r})")
-                partial.add(order_id)
-                continue
-            if isinstance(order, AlpacaOrder) and float(order.filled_qty or 0) > qty:
+            elif cum is None or leaves != 0:
+                to_check.append(order_id)
+        filled = await self._filled_quantities(to_check)
+        for order_id in to_check:
+            shown = filled.get(order_id)
+            if shown is None or shown > listed[order_id]:
                 partial.add(order_id)
         for order_id in partial:
             self._log.warning(
-                f"Alpaca lists only some fills of order {order_id}; its fills are left to the engine to infer",
+                f"Alpaca lists only some fills of order {order_id}, or they cannot be shown to be all of "
+                "them; its fills are left to the engine to infer",
             )
         return [r for r in reports if r.venue_order_id.value not in partial]
+
+    async def _filled_quantities(self, order_ids: list[str]) -> dict[str, Decimal | None]:
+        """Each order's `filled_qty` from Alpaca, None where it cannot be read.
+
+        One order costs one `get_order_by_id`. More cost one `get_orders` ("Get All Orders",
+        `GetOrdersRequest`) for the account's newest `ORDERS_PAGE_LIMIT` orders of any status, with no
+        symbol or time bound (an activity's symbol is not documented to be its order's), and one `get_order_by_id` for each order not among them, one at a time; if
+        none is among them, that is one request more than reading each.
+        """
+        found: dict[str, Decimal | None] = {}
+        wanted = set(order_ids)
+        if len(wanted) > 1:
+            try:
+                orders = await self._call(
+                    self._venue().get_orders,
+                    GetOrdersRequest(status=QueryOrderStatus.ALL, limit=ORDERS_PAGE_LIMIT),
+                )
+                if not isinstance(orders, list):
+                    raise TypeError(f"Alpaca's orders endpoint answered {type(orders).__name__}")
+                for order in orders:
+                    if isinstance(order, AlpacaOrder) and str(order.id) in wanted:
+                        found[str(order.id)] = share_count(order.filled_qty)
+            except (APIError, OSError, TypeError, ValueError) as e:
+                self._log.warning(f"Alpaca orders not read to check fills ({e!r}); reading each")
+        for order_id in order_ids:
+            if order_id in found:
+                continue
+            try:
+                order = await self._call(self._venue().get_order_by_id, order_id)
+            except (APIError, OSError, TypeError, ValueError) as e:
+                # alpaca-py builds `Order(**answer)`: an empty or non-object body is a TypeError, a
+                # value its model refuses a pydantic `ValidationError`, which is a `ValueError`.
+                self._log.warning(f"Alpaca order {order_id} not read to check its fills ({e!r})")
+                found[order_id] = None
+                continue
+            found[order_id] = (
+                share_count(order.filled_qty) if isinstance(order, AlpacaOrder) else None
+            )
+        return found
 
     async def _position_status_reports(
         self, command: live.GeneratePositionStatusReports

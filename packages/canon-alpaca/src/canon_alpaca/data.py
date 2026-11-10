@@ -136,6 +136,9 @@ if TYPE_CHECKING:
     from nautilus_trader.config import DataClientConfig
     from nautilus_trader.live import ClientCache
 
+JOIN_POLL_SECS = 0.05
+"""How often `join_within` looks whether a stream thread has ended."""
+
 STREAM_JOIN_TIMEOUT_SECS = 10.0
 """How long `_disconnect` waits for the stream thread to return from `run()`.
 
@@ -248,6 +251,36 @@ def release_after(
 
 
 type StreamExit = tuple[QuoteTradeStream, BaseException | None]
+
+
+async def logged_failure[R](log: Logger, what: str, step: Awaitable[R]) -> R:
+    """Await `step`, logging what failed and why before the error propagates: NautilusTrader v2.0.0rc8
+    logs a failed connect as "connection failed", a failed disconnect as "Failed to disconnect" and a
+    failed report request as "Failed to get mass status", each without the exception's message
+    (observed)."""
+    try:
+        return await step
+    except Exception as e:
+        log.error(f"Alpaca {what}: {e}")
+        raise
+
+
+async def join_within(thread: threading.Thread, timeout: float) -> bool:
+    """Wait on the calling loop until `thread` has ended or `timeout` seconds have passed, and return
+    whether it ended.
+
+    Polled every `JOIN_POLL_SECS` rather than `Thread.join` in `asyncio.to_thread`, which needs a free
+    worker of the loop's default executor, where every alpaca-py call also runs: with each worker held
+    by a call that has not come back, that wait would not start, and its timeout would not run.
+    NautilusTrader's own adapters bound each wait at shutdown by a deadline in the same way
+    (`TaskGroup::finish_shutdown` in `crates/live/src/task.rs` at the pinned commit, which the Coinbase
+    adapter's disconnect calls).
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while thread.is_alive() and loop.time() < deadline:
+        await asyncio.sleep(min(JOIN_POLL_SECS, max(0.0, deadline - loop.time())))
+    return not thread.is_alive()
 
 
 def run_stream(
@@ -436,13 +469,7 @@ class AlpacaDataClient(MarketDataClient):
 
     @override
     async def _connect(self) -> None:
-        # NautilusTrader v2.0.0rc8 logs a failed connect as "connection failed" without the exception's
-        # message (observed), so the reason is logged here before it propagates.
-        try:
-            await self._connect_venue()
-        except Exception as e:
-            self._log.error(f"Alpaca data client failed to connect: {e}")
-            raise
+        await logged_failure(self._log, "data client failed to connect", self._connect_venue())
 
     async def _connect_venue(self) -> None:
         self._owner_loop = self.loop
@@ -465,11 +492,16 @@ class AlpacaDataClient(MarketDataClient):
 
     @override
     async def _disconnect(self) -> None:
+        await logged_failure(
+            self._log, "data client failed to disconnect", self._disconnect_stream()
+        )
+
+    async def _disconnect_stream(self) -> None:
         self._stopping = True
         thread = self._stream_thread
         if thread is not None and self._stream is not None:
             self._stream.stop()
-            await asyncio.to_thread(thread.join, STREAM_JOIN_TIMEOUT_SECS)
+            await join_within(thread, STREAM_JOIN_TIMEOUT_SECS)
         # Cleared whether or not the thread stopped, so a later connect builds a fresh stream.
         self._stream_thread = None
         self._stream = None

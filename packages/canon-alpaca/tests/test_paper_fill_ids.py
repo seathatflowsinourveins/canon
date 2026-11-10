@@ -53,6 +53,7 @@ from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.stream import TradingStream
 from canon_alpaca.constants import ENV_API_KEY
 from canon_alpaca.constants import ENV_SECRET_KEY
+from canon_alpaca.providers import with_http_timeout
 
 pytestmark = pytest.mark.skipif(
     not (os.environ.get(ENV_API_KEY) and os.environ.get(ENV_SECRET_KEY)),
@@ -227,7 +228,11 @@ def compare(observation: dict) -> None:
 
 
 def test_paper_fill_activity_ids_carry_the_execution_ids() -> None:
-    client = TradingClient(os.environ[ENV_API_KEY], os.environ[ENV_SECRET_KEY], paper=True)
+    client = (
+        with_http_timeout(  # so no request of the test's own can hold the paper lock (ADR 0039)
+            TradingClient(os.environ[ENV_API_KEY], os.environ[ENV_SECRET_KEY], paper=True)
+        )
+    )
 
     clock = client.get_clock()
     assert isinstance(clock, Clock), f"Alpaca answered {clock!r} for its clock"
