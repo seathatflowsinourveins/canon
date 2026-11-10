@@ -100,11 +100,16 @@ done
 '''
 
 [tasks."paper:test"]
-description = "Run the two paper tests with the key pair read from the login keychain for this task only"
+description = "Run every paper test with the key pair read from the login keychain for this task only"
 env.ALPACA_API_KEY = { value = "{{ exec(command='/usr/bin/security find-generic-password -s canon-alpaca-paper -a ALPACA_API_KEY -w') }}", redact = true }
 env.ALPACA_SECRET_KEY = { value = "{{ exec(command='/usr/bin/security find-generic-password -s canon-alpaca-paper -a ALPACA_SECRET_KEY -w') }}", redact = true }
-# An empty value would make both tests skip and the task pass, so it is refused first.
+# An empty value would make every paper test skip and the task pass, so it is refused first.
 run = '''
 [ -n "$ALPACA_API_KEY" ] && [ -n "$ALPACA_SECRET_KEY" ] || { echo "paper:test: a keychain item is empty; run: mise run paper:remove, then mise run paper:store" >&2; exit 1; }
-uv run --locked pytest -rs packages/canon-alpaca/tests/test_paper_integration.py packages/canon-alpaca/tests/test_paper_execution.py
+# One paper account serves every session on this machine, so the run holds an exclusive lock throughout
+# and a second run waits for it, at most 900 s, then fails without placing anything (lockf(1); -k keeps the
+# file, as lockf(1) advises when processes contend). The lock is in the per-user temporary folder, which is
+# the same for every process of the user whatever $TMPDIR a session sets.
+/usr/bin/lockf -k -t 900 "$(/usr/bin/getconf DARWIN_USER_TEMP_DIR)canon-paper-test.lock" \
+  uv run --locked pytest -rs packages/canon-alpaca/tests/test_paper_*.py
 '''

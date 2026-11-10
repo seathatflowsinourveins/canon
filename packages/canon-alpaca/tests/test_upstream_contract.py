@@ -35,6 +35,7 @@ QUOTED = [
     ("nautilus_trader.model", "PositionStatusReport"),
     ("nautilus_trader.live", "SubmitOrder"),
     ("nautilus_trader.live", "CancelOrder"),
+    ("nautilus_trader.live", "CancelAllOrders"),
     ("nautilus_trader.live", "GenerateOrderStatusReport"),
     ("nautilus_trader.live", "GenerateOrderStatusReports"),
     ("nautilus_trader.live", "GenerateFillReports"),
@@ -44,6 +45,8 @@ QUOTED = [
 EXECUTION_HOOKS = [
     "_submit_order",
     "_cancel_order",
+    "_cancel_all_orders",
+    "_batch_cancel_orders",
     "_generate_order_status_report",
     "_generate_order_status_reports",
     "_generate_fill_reports",
@@ -77,6 +80,35 @@ def test_execution_hook_exists(hook: str) -> None:
     from nautilus_trader.live.clients import ExecutionClient
 
     assert inspect.iscoroutinefunction(getattr(ExecutionClient, hook))
+
+
+def test_cancel_all_reads_what_the_client_uses() -> None:
+    """`_cancel_all_orders` reads the command's instrument and side and selects with the cache's `side=`."""
+    from nautilus_trader.live import CancelAllOrders
+    from nautilus_trader.live import ClientCache
+
+    assert {"instrument_id", "order_side"} <= set(dir(CancelAllOrders))
+    for method in (ClientCache.orders_open, ClientCache.orders_inflight):
+        assert {"instrument_id", "side"} <= set(inspect.signature(method).parameters)
+
+
+def test_batch_cancel_default_calls_the_single_cancel_hook_in_order() -> None:
+    """The guide's default, kept by the client: "ordered calls of the corresponding single-order hook"."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from nautilus_trader.live.clients import ExecutionClient
+
+    called: list[object] = []
+
+    class Recorder:
+        async def _cancel_order(self, cancel: object) -> None:
+            called.append(cancel)
+
+    batch = SimpleNamespace(cancels=["first", "second", "third"])
+    asyncio.run(ExecutionClient._batch_cancel_orders(Recorder(), batch))  # ty: ignore[invalid-argument-type]
+
+    assert called == ["first", "second", "third"]
 
 
 def test_execution_client_constructor_takes_the_documented_identity() -> None:

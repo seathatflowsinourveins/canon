@@ -44,7 +44,7 @@ dependency, pattern and practice traces to a pinned upstream or a dated source. 
 | `scripts/automation status` | Show every standing automation and whether it is healthy |
 | `scripts/survey-github report canon/github-practice.json` | Print what a measured sample of repositories converges on for pull requests and GitHub automation |
 | `scripts/bootstrap --check` | Show which toolchain pieces are installed, and whether the Claude Code CLI is behind its pin |
-| `mise run paper:store`, `paper:check`, `paper:remove`, `paper:test` | Enter the Alpaca paper key pair into the login keychain (the owner, in their own terminal), check it is there, remove it, run the two paper tests with it (ADR 0029, ADR 0033) |
+| `mise run paper:store`, `paper:check`, `paper:remove`, `paper:test` | Enter the Alpaca paper key pair into the login keychain (the owner, in their own terminal), check it is there, remove it, run the paper tests with it under a lock, one session at a time (ADR 0029, ADR 0033) |
 
 ## Layout
 
@@ -106,6 +106,7 @@ dependency, pattern and practice traces to a pinned upstream or a dated source. 
 | 0032 | Overfitting probability implementation (proposed): nine read, none adopted until one passes this repo's tests |
 | 0033 | Alpaca paper key entry: a hidden prompt in `paper:store`, the pair checked against the paper API before it is stored |
 | 0035 | Trial ledger: an Optuna study in a local SQLite file, one trial per backtest |
+| 0036 | The Alpaca adapter's order management: each hook built as upstream's own adapters build it |
 
 ## Automation
 

@@ -40,6 +40,8 @@ from canon_alpaca.execution import AlpacaExecutionClientConfig
 from canon_alpaca.factories import AlpacaDataClientFactory
 from canon_alpaca.factories import AlpacaExecutionClientFactory
 from nautilus_trader.common import Environment
+from nautilus_trader.common import Logger
+from nautilus_trader.common import logging_sync_to_disk
 from nautilus_trader.config import DataClientConfig
 from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.config import LiveNodeConfig
@@ -59,6 +61,7 @@ AAPL = InstrumentId.from_str("AAPL.ALPACA")
 TRADER = TraderId("TESTER-001")
 FINAL_EVENTS = {"OrderDenied", "OrderRejected", "OrderCanceled", "OrderExpired"}
 PLACEHOLDER = "offline-placeholder"
+LOG_PROBE_LINES = 20_000
 
 
 @pytest.fixture
@@ -248,7 +251,8 @@ def run(node: LiveNode, launch: str = "hosted") -> None:
 
 
 def run_with_client(
-    body: Callable[[AlpacaExecutionClient], Awaitable[None]], strategy: Trader | None = None
+    body: Callable[[AlpacaExecutionClient], Awaitable[None]],
+    strategy: Trader | CancelAll | None = None,
 ) -> None:
     """Run a hosted node, await `body` with its connected execution client once the node has started its
     strategy, then stop the node.
@@ -305,8 +309,28 @@ async def until_idle(client: AlpacaExecutionClient, venue: SimpleNamespace) -> N
 
 
 def logged(capfd) -> str:
+    """Everything the node logged, whichever of stdout and stderr each level goes to.
+
+    The node's logger writes on its own thread, fed by a channel, so a line logged just before the node
+    stopped can still be queued when the run returns. `logging_sync_to_disk` queues a sync behind every
+    line already sent and blocks until the writer thread has flushed stdout and stderr and acknowledged it
+    (`crates/common/src/logging/logger.rs` at NautilusTrader v2.0.0rc8, `d53849b2`, `LogEvent::Sync`), as
+    `test_data_client.py`'s `logged` does; `Logger.flush` only queues a flush. It returns at once when the
+    logger is not running; `test_logged_waits_for_lines_still_queued_after_a_run` fails if so.
+    """
+    logging_sync_to_disk()
     captured = capfd.readouterr()
     return captured.out + captured.err
+
+
+def test_logged_waits_for_lines_still_queued_after_a_run(venue, capfd) -> None:
+    # As in test_data_client.py: lines queued after a node run are captured only if `logged` waits.
+    run_with_client(lambda client: asyncio.sleep(0))
+    probe = Logger("LogProbe")
+    for i in range(LOG_PROBE_LINES):
+        probe.info(f"probe line {i}")
+
+    assert f"probe line {LOG_PROBE_LINES - 1}" in logged(capfd)
 
 
 @pytest.mark.parametrize("launch", ["owned", "hosted"])
@@ -512,6 +536,157 @@ def test_cancel_refused_by_alpaca_is_a_cancel_rejection(venue, alpaca) -> None:
 
     assert strategy.names()[-1] == "OrderCancelRejected"
     assert strategy.events[-1].reason == "Alpaca refused the cancel (422): order is not cancelable"
+
+
+class CancelAll(Strategy):
+    """Place one limit order per entry in `orders` on the first quote and, once Alpaca has accepted all of
+    them, send one `CancelAllOrders` for AAPL (`strategy_only=False`, the form that reaches the client)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.orders: list[tuple[OrderSide, str]] = []
+        self.side: OrderSide | None = None  # the cancel-all's order side, None for both
+        self.started = False
+        self.placed: list[ClientOrderId] = []
+        self.accepted: set[ClientOrderId] = set()
+        self.sent = False
+        self.events: list = []
+
+    def on_start(self) -> None:
+        self.started = True
+        self.subscribe_quotes(AAPL)
+
+    def on_quote(self, quote) -> None:
+        if self.placed:
+            return
+        for side, price in self.orders:
+            order = self.order_factory.limit(
+                AAPL, side, Quantity.from_int(1), Price.from_str(price)
+            )
+            self.placed.append(order.client_order_id)
+            self.submit_order(order)
+
+    def on_order_event(self, event) -> None:
+        name = type(event).__name__
+        if name == "OrderInitialized":
+            return
+        self.events.append(event)
+        if name == "OrderAccepted":
+            self.accepted.add(event.client_order_id)
+        if not self.sent and self.placed and self.accepted >= set(self.placed):
+            self.sent = True
+            self.cancel_all_orders(AAPL, order_side=self.side, strategy_only=False)
+
+    def final(self) -> dict[str, str]:
+        """Each order's last event, by client order ID."""
+        return {e.client_order_id.value: type(e).__name__ for e in self.events}
+
+
+def cancel_all(**options: object) -> CancelAll:
+    strategy = CancelAll()
+    for name, value in options.items():
+        assert hasattr(strategy, name), name
+        setattr(strategy, name, value)
+    return strategy
+
+
+def run_until(strategy: CancelAll, done: Callable[[], bool], venue: SimpleNamespace) -> None:
+    async def body(client) -> None:
+        async with asyncio.timeout(10):
+            while not done():
+                await asyncio.sleep(0.01)
+        await until_idle(client, venue)
+
+    run_with_client(body, strategy)
+
+
+def test_cancel_all_cancels_each_open_order_of_the_instrument_by_id(venue, alpaca) -> None:
+    # One order the node reconciled at start-up, placed before it by no strategy of this node, and two
+    # this strategy places: all three are AAPL's, so all three are canceled, each by its own ID.
+    venue.trading.script = "accept"
+    venue.trading.orders = [alpaca.alpaca_order(status="new")]  # GTC limit buy of 2 at 150
+    venue.trading.positions = [alpaca.POSITION_AAPL]  # long 2, so the sell is not a short
+    strategy = cancel_all(orders=[(OrderSide.BUY, "140.00"), (OrderSide.SELL, "190.00")])
+    external = alpaca.ORDER_AAPL["client_order_id"]
+
+    run_until(
+        strategy,
+        lambda: (
+            len(venue.trading.cancels) == 3
+            and len([n for n in strategy.final().values() if n == "OrderCanceled"]) == 2
+        ),
+        venue,
+    )
+
+    placed = {c.value for c in strategy.placed}
+    assert {k: v for k, v in strategy.final().items() if k in placed} == dict.fromkeys(
+        placed, "OrderCanceled"
+    )
+    accepted = {
+        e.client_order_id.value: e.venue_order_id.value
+        for e in strategy.events
+        if type(e).__name__ == "OrderAccepted"
+    }
+    assert sorted(venue.trading.cancels) == sorted([*accepted.values(), alpaca.ORDER_AAPL["id"]])
+    assert venue.trading.get_order_by_client_id(external).status.value == "canceled"
+
+
+def test_cancel_all_with_a_side_cancels_only_that_side(venue, alpaca) -> None:
+    venue.trading.script = "accept"
+    venue.trading.positions = [alpaca.POSITION_AAPL]
+    strategy = cancel_all(
+        orders=[(OrderSide.BUY, "140.00"), (OrderSide.SELL, "190.00")], side=OrderSide.BUY
+    )
+
+    run_until(strategy, lambda: "OrderCanceled" in strategy.final().values(), venue)
+
+    buy, sell = (c.value for c in strategy.placed)
+    assert strategy.final() == {buy: "OrderCanceled", sell: "OrderAccepted"}
+    assert len(venue.trading.cancels) == 1
+
+
+def test_cancel_all_rejects_the_cancel_alpaca_refuses_and_cancels_the_rest(venue, alpaca) -> None:
+    venue.trading.script = "accept"
+    refusal = alpaca.api_error(422, 42210000, "order is not cancelable")
+    venue.trading.refuse_cancel = lambda order: refusal if order["limit_price"] == "140.0" else None
+    strategy = cancel_all(orders=[(OrderSide.BUY, "140.00"), (OrderSide.BUY, "141.00")])
+
+    run_until(
+        strategy,
+        lambda: sorted(strategy.final().values()) == ["OrderCancelRejected", "OrderCanceled"],
+        venue,
+    )
+
+    first, second = (c.value for c in strategy.placed)
+    assert strategy.final() == {first: "OrderCancelRejected", second: "OrderCanceled"}
+    rejection = next(e for e in strategy.events if type(e).__name__ == "OrderCancelRejected")
+    assert rejection.reason == "Alpaca refused the cancel (422): order is not cancelable"
+    assert len(venue.trading.cancels) == 2
+
+
+def test_cancel_all_goes_on_after_an_unexpected_failure(venue, capfd) -> None:
+    # An answer alpaca-py cannot parse raises a ValueError (pydantic's ValidationError is one).
+    venue.trading.script = "accept"
+    broken = ValueError("unparsable answer")
+    venue.trading.refuse_cancel = lambda order: broken if order["limit_price"] == "140.0" else None
+    strategy = cancel_all(orders=[(OrderSide.BUY, "140.00"), (OrderSide.BUY, "141.00")])
+
+    run_until(strategy, lambda: "OrderCanceled" in strategy.final().values(), venue)
+
+    first, second = (c.value for c in strategy.placed)
+    assert strategy.final() == {first: "OrderAccepted", second: "OrderCanceled"}
+    assert f"Alpaca cancel of {first} failed (ValueError('unparsable answer'))" in logged(capfd)
+
+
+def test_cancel_all_with_no_matching_order_sends_nothing(venue, capfd) -> None:
+    async def body(client) -> None:
+        # On the node's loop, where the command queue runs the hook; the cache holds no AAPL order.
+        await client._cancel_all_orders(SimpleNamespace(instrument_id=AAPL, order_side=None))
+
+    run_with_client(body)
+
+    assert venue.trading.cancels == []
+    assert "No open or in-flight AAPL.ALPACA orders to cancel" in logged(capfd)
 
 
 def test_update_for_an_order_the_node_does_not_hold_is_dropped(venue, alpaca, capfd) -> None:

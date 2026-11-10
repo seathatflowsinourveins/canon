@@ -16,7 +16,14 @@ paths:
 * Never place, modify or cancel a live order. Never read, print, log or commit a credential.
 * Credentials come from the environment. `.env` files are denied to agents by `.claude/settings.json`.
   The paper pair is in the login keychain and reaches only `mise run paper:test` (ADR 0029). Never run
-  `security find-generic-password` with `-w` or `-g` on it, and run `paper:test` only when the owner asks.
+  `security find-generic-password` with `-w` or `-g` on it, and never put a key value in a file, a command
+  line or output.
+* A paper run needs no ask, at any hour, as long as the paper tests follow the practice of Alpaca's own
+  repositories and NautilusTrader (the owner's standing instruction, 2026-11-10; for the adapter that is
+  upstream's Execution Testing Spec and its `ExecTester` where a row covers the case, ADR 0036): run
+  `mise run paper:test`, which holds the paper account's lock for the whole run. Never live. Every paper
+  test places nothing if the account holds an open order it could touch, and cancels what it opened and
+  closes any position it opened, in a `finally`.
 * NautilusTrader is pinned to a v2 release candidate in `pyproject.toml` and `uv.lock`. Install with
   `uv sync`, never a bare `pip install`, which gives v1 and does not match the docs. Read
   `https://nautilustrader.io/docs/llms.txt` for the page you need before writing against an API.
