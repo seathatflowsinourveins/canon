@@ -9,11 +9,10 @@ review-by: 2026-12-10
 
 ## Context and Problem Statement
 
-The owner asked (2026-11-10) to run Claude Code inside Orca, a desktop app that gives each task its own git
-worktree and agent terminal, and to orchestrate more than one agent runtime. A host of this kind is a
-cockpit: it starts the installed `claude` in a worktree and shows many sessions side by side. It is not a
-second runtime. What does the repository commit for the cockpit, and what holds a second runtime to this
-repo's rules?
+The owner asked (2026-11-10) to run Claude Code inside Orca, a desktop app that gives each task its own
+git worktree and agent terminal, and to orchestrate more than one agent runtime. Such a host is a cockpit:
+it starts the installed `claude` in a worktree and shows many sessions side by side. It is not a second
+runtime. What does the repository commit for it, and what holds a second runtime to this repo's rules?
 
 ## Decision Drivers
 
@@ -45,58 +44,58 @@ because the owner named it, its licence is MIT, its source runs the installed `c
    its stable channel, about a release a day, so no pin here would say what is installed. The pages cited
    are the same at v1.4.255 and at the pinned commit.
 2. **`orca.yaml` holds two documented keys.** `scripts.setup` runs `uv sync --locked` through mise in a
-   new worktree, when setup is enabled in Orca and the command approved there.
-   `setupAgentStartupPolicy: wait-for-setup` starts the agent only after setup has succeeded. The
-   repository works without the file: a new worktree passes `scripts/ci` with no setup step.
-3. **This repository's rules do not depend on the host.** It registers no hook before a tool call
-   (ADR 0020), and the merge gate and the absence of live credentials hold whichever app starts a
-   session. Orca adds hooks of its own to the user's settings, one of them before every tool call. Each
-   hands the event to the local app and exits 0; the one before a tool call prints back the app's answer
-   when there is one. Outside Orca they return at once. Its "Agent status hooks" setting removes them.
+   new worktree, when setup is enabled in Orca and the command approved there. `setupAgentStartupPolicy:
+   wait-for-setup` starts the agent only after setup has succeeded. The repository works without the file:
+   `scripts/ci` passes in a worktree with no setup step.
+3. **This repository's rules do not depend on the host.** It registers no hook before a tool call (ADR
+   0020); the merge gate and the absence of live credentials hold whichever app starts a session. Orca
+   adds hooks of its own to the user's settings, one before every tool call: each hands the event to the
+   local app and exits 0, and that one prints back the app's answer when there is one. Its "Agent status
+   hooks" setting removes them.
 4. **Landing is `scripts/land` and nothing else.** A host's commit, push and pull request controls are
    not a landing path: the ruleset on `main` requires the `signoff` status that `scripts/land` posts for
    the commit it has checked (ADR 0014, ADR 0017).
 5. **Claude Code is the only runtime adopted.** Anthropic: "In every approach the workers are Claude
    sessions. To involve a different tool, expose it to Claude as an MCP server." OpenAI has removed
    `codex mcp-server`, which leaves option 5 no documented route to Codex today.
-6. **A second runtime is adopted like any upstream**, when there is a job for it. It reads `AGENTS.md`,
-   works in its own worktree and branch, lands through rule 4 with the review ADR 0017 requires, and its
-   environment carries no credentials, paper ones included.
+6. **A second runtime is adopted like any upstream**, when there is a job for it: its own worktree and
+   branch, landing through rule 4 with the review ADR 0017 requires, and no credentials in its environment.
 7. **Not adopted: option 4.** Orca labels its orchestration commands "Experimental" and no other host
    documents a handoff. Runtimes meet at a branch and a pull request.
 
 ### Consequences
 
 * Good: one window shows every session, each in its own worktree with its environment built.
-* Orca starts Claude Code with `--dangerously-skip-permissions`, its "Yolo" launch, unless Settings →
-  Agents → Agent Permissions is switched to Manual or the agent's own launch arguments are edited. Under
-  Yolo the `ask` rules still prompt, among a few other things (ADR 0020).
+* Orca starts Claude Code with `--dangerously-skip-permissions`, its "Yolo" launch, unless Agent
+  Permissions in its settings is switched to Manual or the agent's launch arguments are edited. Under Yolo
+  the `ask` rules still prompt (ADR 0020).
 * Leaving Orca means deleting `orca.yaml`, the registry entry and its pin, and the rows that name them in
   `AGENTS.md` and `README.md`. Its hooks stay in the user's settings until its setting removes them.
-* Bad: no pin says what runs, so no changelog is read before the app changes. 1,199 `bug` issues are open.
-* Orca's GitHub panel reports the GitHub CLI as missing: `gh` is a mise tool of this repository, not a
-  global one. `scripts/land` calls it through `mise exec` inside the checkout, where it resolves.
-* On a machine, Orca also marks each worktree trusted in Claude Code's global config, leaves an existing
-  status line alone, and sends anonymous usage events until Settings → Privacy turns them off. After the
-  first run the user's settings also held `skipDangerousModePermissionPrompt`; what wrote it is UNVERIFIED.
+* Bad: no pin says what runs, so no changelog is read before the app changes.
+* Orca's GitHub panel reports the GitHub CLI as missing until `gh` has a default outside this repository
+  (`mise use -g gh@<version>`): Orca takes its PATH from an interactive login shell, where the mise shim
+  fails without one. `scripts/land` is unaffected; it calls `gh` through `mise exec` inside the checkout.
+* On a machine, Orca also sends anonymous usage events until Settings → Privacy turns them off. Two
+  skills, `orca-cli` and `orchestration`, were installed for every session seconds after the app started,
+  which its docs put down to its default agent setup; neither is read or adopted here yet (ADR 0004). What
+  wrote `skipDangerousModePermissionPrompt` into the user's settings is UNVERIFIED.
 
 ### Confirmation
 
-First run, 2026-11-10: Orca 1.4.255 and Claude Code 2.1.311, driven through `orca worktree create
---agent claude --setup inherit`. Orca made the worktree under `~/orca/workspaces/canon/` on a branch from
+First run, 2026-11-10: Orca 1.4.255 and Claude Code 2.1.311, driven through `orca worktree create --agent
+claude --setup inherit`. Orca made the worktree under `~/orca/workspaces/canon/` on a branch from
 `origin/main`, ran the setup command (the repository's policy in Orca was `run-by-default`), started the
-agent only after "Setup finished", and marked the worktree trusted. The session wrote that tree's own `.canon/watch.json` and
-quoted its brief, "canon: 37 upstreams pinned". `scripts/ci` passed there, `scripts/land --dry-run` ran
-there, and `scripts/bootstrap --check` passed afterwards: Orca's hooks sit beside the ledger's and the
-status line is untouched. Outside Orca one call of its hook took 0.01 seconds. A first attempt opened Orca
-from an agent session's shell; the app and the agents it started then carried that session's
-environment. Open Orca from the Dock. UNVERIFIED: landing a real change from an Orca worktree, the app's
-answer to a tool call in Manual mode, and whether the app asks before it runs the setup command.
+agent only after "Setup finished", and marked the worktree trusted. The session wrote that tree's own
+`.canon/watch.json` and quoted its brief, "canon: 37 upstreams pinned". `scripts/ci` passed there,
+`scripts/land --dry-run` ran there, and `scripts/bootstrap --check` passed afterwards: Orca's hooks sit
+beside the ledger's and the status line is untouched. A first attempt opened Orca from an agent session's
+shell; the app and the agents it started then carried that session's environment. Open Orca from the Dock.
+UNVERIFIED: landing a real change from an Orca worktree, the app's answer to a tool call in Manual mode,
+and whether the app asks before it runs the setup command.
 
 ## Evidence
 
-Read 2026-11-10. "Lane": a research subagent fetched the page and a model summarised it. "Second reader":
-the `evidence-verifier` re-read the source the same day.
+Read 2026-11-10. "Lane": a research subagent fetched and summarised the page. "Second reader": the verifier.
 
 * https://github.com/stablyai/orca/tree/v1.4.255/docs/site/content/docs — tag object `63ba9c6212d1`,
   published 2026-11-09, MIT. `model/orca-yaml.mdx`: the two keys, "All keys are optional"; setup "Runs in
@@ -106,25 +105,27 @@ the `evidence-verifier` re-read the source the same day.
   worktree of that repo", and the status-hooks setting. `telemetry.mdx`: the switches (fetched; second
   reader). `model/agents-sessions.mdx`: Orca launches "Claude with `--dangerously-skip-permissions`";
   `agents/supported.mdx`: "Settings → Agents → Agent Permissions" switches "between **Yolo** and
-  **Manual** launches"; `cli/reference.mdx`: the `worktree create` flags (fetched).
-* https://github.com/stablyai/orca/tree/main/src — `shared/agent-launch/catalog/tui-agent-config.ts`
-  runs `claude`; `main/claude/hook-settings.ts`, `statusline-install.ts` and
-  `claude-folder-trust-file.ts` write the files named above; `claude-managed-hook-events.ts` installs
-  `PreToolUse` and `PermissionRequest` hooks with matcher `*` (lane; second reader).
-* https://www.onorca.dev/docs/install — "Orca auto-updates by default, tracking the stable channel";
-  `orca-macos-arm64.dmg` (second reader). GitHub releases: 24 stable ones from 2026-10-17 to 2026-11-09.
-* https://github.com/stablyai/orca/issues?q=is%3Aissue+is%3Aopen+label%3Abug — 1,199 (second reader).
-* https://code.claude.com/docs/en/agents.md — the sentence in rule 5 (lane; second reader).
-* https://learn.chatgpt.com/docs/mcp-server — "The `codex mcp-server` command and the standalone
-  `codex-mcp-server` binary have been removed."; its replacement "isn't an MCP server" (lane; second reader).
+  **Manual** launches"; `cli/reference.mdx`: the `worktree create` flags; `cli/skills.mdx`: "Default agent
+  setup usually installs `orca-cli`, `orca-computer-use`, and `orchestration`" (fetched; second reader).
+* https://github.com/stablyai/orca/tree/main/src — `tui-agent-config.ts` runs `claude`; `hook-settings.ts`
+  and `claude-folder-trust-file.ts` write the hooks and the trust entry; `claude-managed-hook-events.ts`
+  installs `PreToolUse` and `PermissionRequest` hooks with matcher `*` (lane; second reader). At v1.4.255,
+  `startup/shell-path-probe.ts` asks the shell for its PATH with `-ilc` (fetched; second reader).
+* https://www.onorca.dev/docs/install — "Orca auto-updates by default, tracking the stable channel"
+  (second reader). GitHub releases: 24 stable ones from 2026-10-17 to 2026-11-09.
+* https://code.claude.com/docs/en/agents.md — the sentence in rule 5;
+  https://learn.chatgpt.com/docs/mcp-server — `codex mcp-server` and its standalone binary "have been
+  removed", its replacement "isn't an MCP server" (lane; second reader).
 * The first run on the owner's machine — the process list, the agent terminal read through `orca terminal
-  read`, the event ledger, the worktree, and `~/.claude/settings.json` before and after: sixteen hook
-  entries added, `PreToolUse` and `PermissionRequest` among those with matcher `*`, a 10-second timeout
-  and no `onFailure`; the script they call posts to `127.0.0.1` or spools the event, and every path
-  through it ends in `exit 0` (read, run; second reader for the files and the ledger).
-* `mise.toml` here, no global mise config, and `gh --version` from a clean interactive shell: it failed in
-  the home folder and ran in the checkout; `scripts/land` — `"$MISE" exec -- gh` (run, read; second reader).
+  read`, the event ledger, the worktree, and the user's settings before and after: sixteen hook entries
+  added (`PreToolUse` and `PermissionRequest` among those with matcher `*`), each with a 10-second timeout
+  and no `onFailure`; their script posts to `127.0.0.1` or spools the event and always ends in `exit 0`
+  (read, run; second reader).
+* `mise.toml` here and `gh --version` from a clean interactive shell: with no global mise config it failed
+  in the home folder ("No version is set for shim: gh") and ran in the checkout; after `mise use -g` it
+  ran in both. `scripts/land` — `"$MISE" exec -- gh`. The two skill folders under `~/.agents/skills/`,
+  linked from `~/.claude/skills/`, are dated eight seconds after the app's start (run, read; second
+  reader). UNVERIFIED: that the panel then finds `gh`.
 * Second reader, 2026-11-10: every quote held in each version. This one was changed that day from
-  `proposed` with option 1, on the owner's correction that a host is a cockpit for Claude Code and not an
-  alternative to it. Its corrections, on Orca's own hooks, the branch pin, when setup runs, what Yolo
-  still asks, and how `gh` is reached, are made above.
+  `proposed` with option 1, on the owner's correction that a host is a cockpit and not an alternative to
+  Claude Code; the reader's corrections are made above.
