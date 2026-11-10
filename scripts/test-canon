@@ -449,6 +449,22 @@ sec_mise_requests() {
     "$T/mise.lock" > "$W/m" && mv "$W/m" "$T/mise.lock"
   out=$(canon lint)
   check "a line request fails when mise.lock has another release" has "$out" "mise.lock records '3.14.11' for python"
+  # a tool with backend options is one inline table (mise's github: backend docs); its version is the pin
+  awk '/^\[\[tools\.python\]\]/ { p = 1 } p && $1 == "version" { $0 = "version = \"3.14.10\""; p = 0 } { print }' \
+    "$T/mise.lock" > "$W/m" && mv "$W/m" "$T/mise.lock"
+  reg_edit '.upstreams += [{id: "otc", field: "observability", repo: "o/c", track: "tag:v0.9.0", role: "tool",
+    license: "MIT", why: "test", evidence: ["https://example.org/"], adr: "0007", mise: "github:o/c"}]'
+  lock_edit '.pins.otc = {repo: "o/c", track: "tag:v0.9.0", ref: "refs/tags/v0.9.0", sha: "'"$SHA_A"'"}'
+  printf '"github:o/c" = { version = "0.9.0", matching = "c_", bin = "c" }\n' > "$W/tool"
+  awk -v l="$(cat "$W/tool")" '{ print } /^\[tools\]/ { print l }' "$T/mise.toml" > "$W/m" && mv "$W/m" "$T/mise.toml"
+  out=$(canon lint)
+  check "an inline-table request is read by its version"     lacks "$out" "for github:o/c"
+  sed 's/version = "0.9.0", matching/version = "0.8.0", matching/' "$T/mise.toml" > "$W/m" && mv "$W/m" "$T/mise.toml"
+  out=$(canon lint)
+  check "... and fails when that version is not the pin"    has "$out" "mise.toml has '0.8.0' for github:o/c"
+  sed 's/{ version = "0.8.0", matching/{ matching/' "$T/mise.toml" > "$W/m" && mv "$W/m" "$T/mise.toml"
+  out=$(canon lint)
+  check "... and an inline table with no version fails"     has "$out" "{ matching = \"c_\", bin = \"c\" }' for github:o/c"
   reg_edit '(.upstreams[] | select(.id == "gh")) |= del(.mise)'
   out=$(canon lint)
   check "an entry that drops its mise field leaves the tool unnamed" has "$out" "mise.toml installs 'gh'"

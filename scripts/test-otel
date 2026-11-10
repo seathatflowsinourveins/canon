@@ -1,0 +1,107 @@
+#!/bin/bash
+# test-otel — runs the pinned OpenTelemetry Collector (canon/upstreams.json: otelcol) with the repository's
+# own config, home/.claude/canon/otel/config.yaml, on two free ports of 127.0.0.1 and a temp folder, sends it
+# one OTLP/JSON log request over OTLP/HTTP (the fixture client: curl, POST /v1/logs, as the OTLP receiver
+# documents: https://github.com/open-telemetry/opentelemetry-collector/blob/v0.165.0/receiver/otlpreceiver/README.md),
+# and checks what the file exporter wrote (ADR 0007, tier 3):
+#   * the three events scripts/lanes --rates reads are kept, with the attributes it reads;
+#   * nothing else is: no codex.tool_result (whose arguments and output Codex always logs), no prompt event,
+#     no .delta event, no resource attribute, no user.* field;
+#   * scripts/lanes --rates reads the written line and gives the Codex conversation its tokens per second;
+#   * the Collector listens on 127.0.0.1 only, and opens no port of its own (internal metrics off).
+# otelcol comes from the mise toolchain (scripts/ci puts it on PATH); without it the test fails, naming the fix.
+# Exit 0 if every case behaves as expected, 1 otherwise.
+# shellcheck disable=SC2016  # eval'd checks are single-quoted so they expand when they run
+set -uo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/canon-test-otel.XXXXXX") \
+  || { echo "test-otel: could not create a temp folder under ${TMPDIR:-/tmp}" >&2; exit 1; }
+PID=""
+# shellcheck disable=SC2329  # run by the EXIT trap
+cleanup() { [ -z "$PID" ] || { kill "$PID" 2>/dev/null; wait "$PID" 2>/dev/null; }; rm -rf "$TMP"; }
+trap cleanup EXIT
+pass=0; fail=0; skipped=0
+t_pass() { pass=$((pass+1)); echo "  pass  $1"; }
+t_fail() { fail=$((fail+1)); echo "  FAIL  $1"; }
+skip()   { skipped=$((skipped+1)); echo "  skip  $1 ($2)"; }
+check()  { local label="$1"; shift; if "$@"; then t_pass "$label"; else t_fail "$label"; fi; }
+finish() { echo "test-otel: $pass passed, $fail failed, $skipped skipped"; [ "$fail" -eq 0 ]; exit; }
+
+echo "otel collector:"
+OTELCOL=$(command -v otelcol) || OTELCOL=""
+if [ -z "$OTELCOL" ]; then
+  t_fail "otelcol is on PATH (it comes from mise.toml; run: scripts/bootstrap --install)"; finish
+fi
+# free_port: a port of 127.0.0.1 nothing listens on now, from the OS (bind to port 0)
+free_port() { python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()'; }
+if ! GP=$(free_port) || ! HP=$(free_port); then t_fail "two free ports of 127.0.0.1"; finish; fi
+OUT="$TMP/otel"; mkdir -p "$OUT"
+export CANON_OTEL_DIR="$OUT" CANON_OTEL_GRPC_PORT="$GP" CANON_OTEL_HTTP_PORT="$HP"
+CFG="$ROOT/home/.claude/canon/otel/config.yaml"
+check "otelcol validate accepts the config" "$OTELCOL" validate --config "$CFG"
+"$OTELCOL" --config "$CFG" > "$TMP/otelcol.log" 2>&1 & PID=$!
+up=0
+for _ in $(seq 100); do
+  if curl -s -o /dev/null --max-time 1 "http://127.0.0.1:$HP/v1/logs"; then up=1; break; fi
+  kill -0 "$PID" 2>/dev/null || break; sleep 0.1
+done
+if [ "$up" != 1 ]; then t_fail "the Collector starts and answers on 127.0.0.1:$HP"; sed 's/^/        /' "$TMP/otelcol.log"; finish; fi
+t_pass "the Collector starts and answers on 127.0.0.1:$HP"
+
+if command -v lsof >/dev/null 2>&1; then
+  lsof -nP -a -p "$PID" -iTCP -sTCP:LISTEN 2>/dev/null | awk 'NR > 1 { print $9 }' | sort > "$TMP/listen"
+  printf '127.0.0.1:%s\n127.0.0.1:%s\n' "$GP" "$HP" | sort > "$TMP/want"
+  check "it listens on the two OTLP ports of 127.0.0.1 and nothing else" cmp -s "$TMP/listen" "$TMP/want"
+else skip "listeners" "no lsof here"; fi
+
+# The request: Claude Code's api_request (event.name attribute, body the name, as Claude Code sends it) and a
+# Claude Code user_prompt; Codex's response.completed, a .delta event, codex.turn_cost and codex.tool_result
+# with arguments and output; account fields on the resource and on the records. Shapes:
+# https://code.claude.com/docs/en/monitoring-usage.md and codex-rs/otel at the pinned tag.
+NS="$(date -u +%s)000000000"
+kv() { printf '{"key":"%s","value":{"%s":%s}}' "$1" "$2" "$3"; }
+s() { kv "$1" stringValue "\"$2\""; }
+rec() { local b="$1"; shift; local IFS=,; printf '{"timeUnixNano":"%s","body":{"stringValue":"%s"},"attributes":[%s]}' "$NS" "$b" "$*"; }
+cat > "$TMP/req.json" <<EOF
+{"resourceLogs":[{"resource":{"attributes":[$(s service.name codex),$(s user.email someone@example.com),$(s host.name a-mac)]},
+"scopeLogs":[{"scope":{"name":"fixture"},"logRecords":[
+$(rec api_request "$(s event.name api_request)" "$(s session.id sess-1)" "$(s model m1)" "$(kv output_tokens intValue '"600"')" "$(kv duration_ms intValue '"3000"')" "$(kv cost_usd doubleValue 0.01)" "$(s user.email someone@example.com)" "$(s user.account_uuid acct-1)" "$(s organization.id org-1)"),
+$(rec user_prompt "$(s event.name user_prompt)" "$(s session.id sess-1)" "$(s prompt SECRET-PROMPT)" "$(kv prompt_length intValue '"13"')"),
+$(rec "" "$(s event.name codex.sse_event)" "$(s event.kind response.completed)" "$(s conversation.id conv-1)" "$(s model m2)" "$(kv output_token_count intValue '"1200"')" "$(s user.email someone@example.com)" "$(s user.account_id acct-2)"),
+$(rec "" "$(s event.name codex.sse_event)" "$(s event.kind response.output_text.delta)" "$(s conversation.id conv-1)" "$(s delta SECRET-DELTA)"),
+$(rec "" "$(s event.name codex.turn_cost)" "$(s conversation.id conv-1)" "$(kv usage.estimated_usd doubleValue 0.02)"),
+$(rec "SECRET-BODY" "$(s event.name codex.tool_result)" "$(s conversation.id conv-1)" "$(s arguments 'cat SECRET-ARGUMENTS')" "$(s output SECRET-OUTPUT)")
+]}]}]}
+EOF
+code=$(curl -s -o "$TMP/resp" -w '%{http_code}' --max-time 10 -H 'Content-Type: application/json' \
+       --data-binary @"$TMP/req.json" "http://127.0.0.1:$HP/v1/logs")
+check "the Collector accepts the request (HTTP 200)" test "$code" = 200
+F="$OUT/logs.jsonl"
+for _ in $(seq 50); do [ -s "$F" ] && break; sleep 0.1; done
+check "the file exporter wrote logs.jsonl"          test -s "$F"
+
+# records: one line per kept record, "<event.name>|<sorted attribute keys>"
+jq -r '.resourceLogs[].scopeLogs[].logRecords[] | ((.attributes | map(select(.key == "event.name"))[0].value.stringValue) + "|" + (.attributes | map(.key) | sort | join(",")))' \
+  "$F" 2>/dev/null | sort > "$TMP/kept"
+cat > "$TMP/want" <<'EOF'
+api_request|cost_usd,duration_ms,event.name,model,output_tokens,session.id
+codex.sse_event|conversation.id,event.kind,event.name,model,output_token_count
+codex.turn_cost|conversation.id,event.name,usage.estimated_usd
+EOF
+check "only api_request, response.completed and codex.turn_cost are kept, with only the attributes lanes reads" \
+      cmp -s "$TMP/kept" "$TMP/want"
+check "no tool arguments, output, prompt, delta or body text reaches the file" \
+      eval '! grep -q "SECRET" "$F"'
+check "no email, account, organisation or host field reaches the file" \
+      eval '! grep -Eq "example\.com|acct-|org-1|a-mac|user\.|organization\." "$F"'
+check "no resource attribute is kept" \
+      eval '[ "$(jq "[.resourceLogs[].resource.attributes // [] | length] | add" "$F")" = 0 ]'
+
+# scripts/lanes --rates reads the line: conv-1's 1200 output tokens over a 10-minute window are 2 tok/s
+lanes_home="$TMP/lanes"; mkdir -p "$lanes_home/canon/ledger"
+CLAUDE_CONFIG_DIR="$lanes_home" CANON_OTLP_FILE="$F" "$ROOT/scripts/lanes" --rates --json > "$TMP/rates.json" 2>"$TMP/rates.err"
+check "scripts/lanes --rates reads the exported line: conv-1 at 2 tok/s, spend 0.02" \
+      eval 'jq -e "[.workers[] | select(.runtime == \"codex\" and .id == \"conv-1\")] | length == 1 and (.[0] | .measured and .tok_s == 2 and .spend_window_usd == 0.02 and .model == \"m2\")" "$TMP/rates.json" >/dev/null'
+grep -Eqi "error|warn" "$TMP/otelcol.log" && { echo "        otelcol log:"; sed 's/^/        /' "$TMP/otelcol.log"; }
+check "the Collector logged no warning or error"    eval '! grep -Eqi "\\b(warn|error)\\b" "$TMP/otelcol.log"'
+finish

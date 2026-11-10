@@ -1,0 +1,68 @@
+# OpenTelemetry Collector config for scripts/lanes --rates (docs/adr/0007-observability.md, tier 3).
+# Run by the launchd agent scripts/automation installs: otelcol --config <this file>, with the core
+# distribution pinned in canon/upstreams.json (otelcol, v0.165.0). Every key is from these docs at the pin:
+#   receiver   https://github.com/open-telemetry/opentelemetry-collector/blob/v0.165.0/receiver/otlpreceiver/README.md
+#   filter     https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/v0.165.0/processor/filterprocessor/README.md
+#   transform  https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/v0.165.0/processor/transformprocessor/README.md
+#   file       https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/v0.165.0/exporter/fileexporter/README.md
+#   service    https://opentelemetry.io/docs/collector/configuration/ and
+#              https://opentelemetry.io/docs/collector/internal-telemetry/
+#   ${env:NAME:-default}  https://opentelemetry.io/docs/collector/configuration/#environment-variables
+# CANON_OTEL_DIR (the folder for logs.jsonl) is set by the agent; the two ports may be overridden for a
+# rehearsal. The host is fixed at 127.0.0.1, so nothing listens beyond this Mac.
+#
+# Only names and counts reach the file (ADR 0007): the filter keeps the three events scripts/lanes reads,
+# and the transform keeps only the attributes it reads and drops every resource attribute. The guard is
+# here because Codex at rust-v0.167.0 logs every codex.tool_result with the tool's full arguments and an
+# output preview, with no setting to switch the arguments off, and its events carry user.email.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 127.0.0.1:${env:CANON_OTEL_GRPC_PORT:-4317}
+      http:
+        endpoint: 127.0.0.1:${env:CANON_OTEL_HTTP_PORT:-4318}
+
+processors:
+  # Drop every log record that matches; this keeps Claude Code's api_request (named by the event.name
+  # attribute, or by the body when a record has no such attribute) and Codex's codex.sse_event
+  # response.completed and codex.turn_cost.
+  filter/lanes:
+    error_mode: ignore
+    log_conditions:
+      - >-
+        not (log.attributes["event.name"] == "api_request"
+        or log.attributes["event.name"] == "claude_code.api_request"
+        or (log.attributes["event.name"] == nil and (log.body == "api_request" or log.body == "claude_code.api_request"))
+        or (log.attributes["event.name"] == "codex.sse_event" and log.attributes["event.kind"] == "response.completed")
+        or log.attributes["event.name"] == "codex.turn_cost")
+  transform/lanes:
+    error_mode: ignore
+    log_statements:
+      - keep_keys(resource.attributes, [])
+      - keep_keys(scope.attributes, [])
+      - keep_keys(log.attributes, ["event.name", "event.timestamp", "event.kind", "session.id", "model", "output_tokens", "duration_ms", "cost_usd", "conversation.id", "output_token_count", "usage.estimated_usd"])
+      - set(log.body, log.attributes["event.name"]) where log.attributes["event.name"] != nil
+      - set(log.body, "") where log.attributes["event.name"] == nil and log.body != "api_request" and log.body != "claude_code.api_request"
+
+exporters:
+  file/lanes:
+    path: ${env:CANON_OTEL_DIR}/logs.jsonl
+    format: json
+    rotation:
+      max_megabytes: 10
+      max_days: 7
+      max_backups: 3
+
+service:
+  telemetry:
+    logs:
+      level: warn       # the agent's log file holds warnings and errors only
+    metrics:
+      level: none       # no internal metrics, so no listener of the Collector's own
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [filter/lanes, transform/lanes]
+      exporters: [file/lanes]

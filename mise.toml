@@ -18,6 +18,13 @@ shellcheck = "0.11.0"   # canon/upstreams.json: shellcheck
 gitleaks = "8.30.1"     # canon/upstreams.json: gitleaks
 actionlint = "1.7.12"   # canon/upstreams.json: actionlint
 
+# The OpenTelemetry Collector, core distribution (docs/adr/0007-observability.md, tier 3). Neither the mise nor
+# the aqua registry has it, so it comes from its GitHub releases through mise's github: backend; each release
+# ships several distributions per platform, and `matching` keeps the core one's archives (otelcol_<version>_
+# <os>_<arch>.tar.gz), as https://mise.jdx.dev/dev-tools/backends/github.html advises for a release that ships
+# several tools. canon/upstreams.json: otelcol
+"github:open-telemetry/opentelemetry-collector-releases" = { version = "0.165.0", matching = "otelcol_", bin = "otelcol" }
+
 # The Alpaca paper key pair (docs/adr/0029-paper-keys-in-the-login-keychain.md). Both values live in the
 # macOS login keychain, one generic password item each, service "canon-alpaca-paper", account = the variable
 # name. They are read only when `mise run paper:test` starts, into that task's own `env`, which mise renders

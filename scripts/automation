@@ -7,14 +7,18 @@
 #   lane watchdog          every 10 minutes, Mac awake       launchd user agent (launchd.plist(5), launchctl(1))
 #   paper session          every 35 minutes, Mac awake       launchd user agent running one window, if Alpaca's
 #                                                            clock says a session is open (ADR 0050)
+#   OTLP collector         always, Mac awake                 launchd user agent running the pinned otelcol on
+#                                                            127.0.0.1, writing ~/.claude/canon/otel/logs.jsonl
+#                                                            for scripts/lanes --rates (ADR 0007)
 #   weekly refresh         weekly, desktop app open          Claude desktop scheduled task (created from a session)
 #
 # Usage: scripts/automation status | install | uninstall
 # `install` uses no sudo and touches: this clone's git config, ~/.claude/canon/ (the paper session's
-# runner and its clone of origin's main, ~/.claude/canon/paper-checkout, included), and two files in
-# ~/Library/LaunchAgents/. The watchdog's plist sets CLAUDE_CONFIG_DIR to the directory install used.
+# runner and its clone of origin's main, ~/.claude/canon/paper-checkout, and the collector's config,
+# ~/.claude/canon/otel/config.yaml, included), and three files in ~/Library/LaunchAgents/. The collector is
+# the otelcol mise installed for this clone (`scripts/bootstrap --install`), named by its absolute path. The watchdog's plist sets CLAUDE_CONFIG_DIR to the directory install used.
 # `uninstall` reverses exactly that, the trust `mise run` gave the clone's mise.toml included, leaves the
-# ledger, the alert history and the windows' records alone, and exits non-zero naming anything it could not
+# ledger, the alert history, the windows' records and the collector's logs.jsonl alone, and exits non-zero naming anything it could not
 # remove.
 # `status` exits non-zero when any row is not ok, including rows it could not check (UNKNOWN).
 #
@@ -44,6 +48,9 @@ PAPER_SILENT=$((2 * PAPER_INTERVAL))                  # no firing for two interv
 PAPER_CHECKOUT="$CANON_HOME/paper-checkout"           # the clone each firing brings to origin's main
 PAPER_DIR="${CANON_PAPER_SESSION_DIR:-$(/usr/bin/getconf DARWIN_USER_TEMP_DIR 2>/dev/null)canon-paper-session}"
 STALE_DAYS=2
+OTEL_LABEL="local.canon.otel-collector"
+OTEL_PLIST="$AGENTS_DIR/$OTEL_LABEL.plist"
+OTEL_DIR="$CANON_HOME/otel"                           # config.yaml and the logs.jsonl scripts/lanes reads
 # jq: a commit as status shows it, the first 12 of a full id plus what follows it ("with uncommitted
 # changes"), or the text a record gives in its place ("unknown: <why>")
 # shellcheck disable=SC2016  # jq program, not shell
@@ -154,6 +161,81 @@ write_paper_plist() {
 EOF
 }
 
+# The collector agent runs otelcol with the config from home/.claude/canon/otel/, kept alive by launchd
+# (launchd.plist(5) KeepAlive, RunAtLoad); CANON_OTEL_DIR tells the config where to write logs.jsonl.
+# write_otel_plist <otelcol path>
+write_otel_plist() {
+  local c; c=$(xml "$CANON_HOME")
+  cat > "$OTEL_PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$OTEL_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$(xml "$1")</string>
+    <string>--config</string>
+    <string>$(xml "$OTEL_DIR")/config.yaml</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CANON_OTEL_DIR</key>
+    <string>$(xml "$OTEL_DIR")</string>
+  </dict>
+  <key>WorkingDirectory</key>
+  <string>$(xml "$OTEL_DIR")</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>$c/watch/otel-collector.log</string>
+  <key>StandardErrorPath</key>
+  <string>$c/watch/otel-collector.log</string>
+</dict>
+</plist>
+EOF
+}
+
+# install_otel: installs the collector's config and agent; returns 1 naming what failed. The config is
+# validated before it replaces the installed one, so a refused config never reaches a running agent; on a
+# failure before the plist is written, an agent loaded by an earlier install is left as it was, and says so.
+# The plist names the versioned binary mise installed, so a move of the otelcol pin needs this install again
+# (status says FAILED when that binary is gone).
+install_otel() {
+  local m bin out src="$ROOT/home/.claude/canon/otel/config.yaml" prev=""
+  [ -e "$OTEL_PLIST" ] && prev=" (an agent from an earlier install is left as it was)"
+  if ! m=$(find_mise 2>&1); then note "  FAILED: $m$prev"; return 1; fi
+  if ! bin=$(cd "$ROOT" && "$m" which otelcol 2>/dev/null) || [ -z "$bin" ] || [ ! -x "$bin" ]; then
+    note "  FAILED: mise has no otelcol installed for this clone; run: scripts/bootstrap --install$prev"; return 1
+  fi
+  mkdir -p "$OTEL_DIR" || { note "  FAILED: cannot create $OTEL_DIR$prev"; return 1; }
+  if ! out=$(CANON_OTEL_DIR="$OTEL_DIR" "$bin" validate --config "$src" 2>&1); then
+    note "  FAILED: otelcol validate refused the config: ${out//$'\n'/; }$prev"; return 1
+  fi
+  if ! /usr/bin/install -m 644 "$src" "$OTEL_DIR/config.yaml"; then
+    note "  FAILED: could not install $OTEL_DIR/config.yaml$prev"; return 1
+  fi
+  note "  installed  $OTEL_DIR/config.yaml"
+  # the collector's own log, which launchd only appends to, starts again with each install
+  : > "$CANON_HOME/watch/otel-collector.log" 2>/dev/null || true
+  if ! write_otel_plist "$bin" || ! plutil -lint "$OTEL_PLIST" >/dev/null; then
+    note "  FAILED: could not write a valid $OTEL_PLIST"; return 1
+  fi
+  note "  wrote      $OTEL_PLIST ($bin)"
+  if [ "${AUTOMATION_SKIP_LAUNCHD:-0}" = "1" ]; then note "  not loaded (AUTOMATION_SKIP_LAUNCHD=1)"; return 0; fi
+  launchctl bootout "$DOMAIN/$OTEL_LABEL" >/dev/null 2>&1   # replace a previous load, if any
+  if launchctl bootstrap "$DOMAIN" "$OTEL_PLIST"; then
+    note "  loaded     $OTEL_LABEL (kept running; OTLP on 127.0.0.1:4317 and :4318, writing $OTEL_DIR/logs.jsonl)"
+  else
+    note "  FAILED: launchctl bootstrap refused the agent"; return 1
+  fi
+}
+
 do_install() {
   local ok=0
   note "Commit gate:"
@@ -216,6 +298,8 @@ do_install() {
       fi
     fi
   fi
+  note "OTLP collector:"
+  install_otel || ok=1
   note "Landing:"
   local mise_bin
   if ! git -C "$ROOT" remote get-url origin >/dev/null 2>&1; then
@@ -244,7 +328,11 @@ do_uninstall() {
   if launchctl bootout "$DOMAIN/$PAPER_LABEL" >/dev/null 2>&1; then note "  unloaded   $PAPER_LABEL"; else note "  $PAPER_LABEL was not loaded"; fi
   if launchctl print "$DOMAIN/$PAPER_LABEL" >/dev/null 2>&1; then note "  FAILED: $PAPER_LABEL is still loaded"; left="$left
   launchd job $PAPER_LABEL"; fi
-  for f in "$PLIST" "$PAPER_PLIST" "$CANON_HOME/lanes" "$CANON_HOME/lanes-watch.sh" "$CANON_HOME/paper-session.sh"; do
+  if launchctl bootout "$DOMAIN/$OTEL_LABEL" >/dev/null 2>&1; then note "  unloaded   $OTEL_LABEL"; else note "  $OTEL_LABEL was not loaded"; fi
+  if launchctl print "$DOMAIN/$OTEL_LABEL" >/dev/null 2>&1; then note "  FAILED: $OTEL_LABEL is still loaded"; left="$left
+  launchd job $OTEL_LABEL"; fi
+  for f in "$PLIST" "$PAPER_PLIST" "$OTEL_PLIST" "$CANON_HOME/lanes" "$CANON_HOME/lanes-watch.sh" "$CANON_HOME/paper-session.sh" \
+           "$OTEL_DIR/config.yaml"; do
     [ -e "$f" ] || continue
     if rm -f "$f" && [ ! -e "$f" ]; then note "  removed    $f"
     else note "  FAILED: could not remove $f"; left="$left
@@ -282,7 +370,7 @@ do_uninstall() {
   credential.https://github.com.helper in $ROOT"; fi
   fi
   note "Left in place: $CANON_HOME/ledger, $CANON_HOME/watch (alert history), the session windows' records"
-  note "in $PAPER_DIR and the weekly scheduled task."
+  note "in $PAPER_DIR, $OTEL_DIR/logs.jsonl (and its rotated copies) and the weekly scheduled task."
   note "Remove the weekly task from the desktop app's Scheduled list."
   if [ -n "$left" ]; then note "uninstall: not removed:$left"; return 1; fi
 }
@@ -392,6 +480,32 @@ do_status() {
     v="$v | last exit code=${last:-?}; log $CANON_HOME/watch/paper-session.log"
     check_row "paper session" "${v%%$'\t'*}" "${v#*$'\t'}"
   else check_row "paper session" OFF "run: scripts/automation install"; fi
+
+  # The collector: launchd must show it running (KeepAlive restarts it); the file's age is shown, not judged,
+  # since a quiet hour with no session writes nothing.
+  if pr=$(launchctl print "$DOMAIN/$OTEL_LABEL" 2>/dev/null); then
+    state=$(printf '%s\n' "$pr" | awk -F' = ' '/^\tstate = / && s == "" { s = $2 } END { print s }')
+    last=$(printf '%s\n' "$pr" | awk -F' = ' '/^\tlast exit code = / && s == "" { s = $2 } END { print s }')
+    local lf="$OTEL_DIR/logs.jsonl" mt obin
+    # the binary the agent runs: a move of the pin, or a mise prune, can remove it
+    obin=$(plutil -extract ProgramArguments.0 raw -o - "$OTEL_PLIST" 2>/dev/null) || obin=""
+    case "$state" in
+      running) label=ok; v="running" ;;
+      '') label=UNKNOWN; v="launchctl shows no state" ;;
+      *) label=FAILED; v="state=$state, last exit code=${last:-?}; see $CANON_HOME/watch/otel-collector.log" ;;
+    esac
+    if [ -n "$obin" ] && [ ! -x "$obin" ]; then
+      label=FAILED; v="$v; its binary $obin is gone (the otelcol pin moved?); run: scripts/bootstrap --install, then scripts/automation install"
+    fi
+    if [ -f "$lf" ]; then
+      if mt=$(stat -f %m "$lf" 2>/dev/null) && [ -n "$mt" ]; then
+        v="$v | $lf last written $(( ($(date -u +%s) - mt) / 60 )) min ago"
+      else v="$v | $lf present, its age unreadable"; fi
+    else
+      v="$v | no $lf yet: no session has sent an event (settings: scripts/bootstrap --user-config)"
+    fi
+    check_row "otlp collector" "$label" "$v"
+  else check_row "otlp collector" OFF "run: scripts/automation install"; fi
 
   if [ -f "$CLAUDE_HOME/scheduled-tasks/$TASK_ID/SKILL.md" ]; then
     row "weekly refresh" ok "task file present at $CLAUDE_HOME/scheduled-tasks/$TASK_ID; whether it is still scheduled shows only in the desktop app"

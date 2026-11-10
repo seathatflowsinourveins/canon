@@ -182,14 +182,19 @@ cmd_check() {
   [ "$stale" -eq 0 ] || exit 4
 }
 
-# mise_tools  -> "<name>\t<request>" for each key of mise.toml's [tools] table
+# mise_tools  -> "<name>\t<request>" for each key of mise.toml's [tools] table. The request is a string
+# ("3.14") or the `version` of a one-line inline table ({ version = "0.165.0", matching = "x" }), the form
+# mise documents for a tool with backend options (https://mise.jdx.dev/dev-tools/backends/github.html); a
+# table with no `version` gives the whole table, which matches no pin.
 mise_tools() {
   awk '/^[[:space:]]*\[/ { t = ($0 ~ /^[[:space:]]*\[tools\][[:space:]]*(#.*)?$/); next }
        t && /^[[:space:]]*[^#[:space:]]/ && index($0, "=") > 0 {
          k = substr($0, 1, index($0, "=") - 1); v = substr($0, index($0, "=") + 1)
          sub(/^[[:space:]]+/, "", k); sub(/[[:space:]]+$/, "", k); gsub(/"/, "", k)
          sub(/^[[:space:]]+/, "", v)
-         if (v ~ /^"/) { v = substr(v, 2); sub(/".*$/, "", v) } else { sub(/[[:space:]]+#.*$/, "", v); sub(/[[:space:]]+$/, "", v) }
+         if (v ~ /^\{/ && match(v, /[{,][[:space:]]*version[[:space:]]*=[[:space:]]*"[^"]*"/)) {
+           v = substr(v, RSTART, RLENGTH); sub(/^[^"]*"/, "", v); sub(/"$/, "", v)
+         } else if (v ~ /^"/) { v = substr(v, 2); sub(/".*$/, "", v) } else { sub(/[[:space:]]+#.*$/, "", v); sub(/[[:space:]]+$/, "", v) }
          print k "\t" v }' "$ROOT/mise.toml"
 }
 

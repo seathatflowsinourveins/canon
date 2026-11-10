@@ -166,6 +166,24 @@
       "adr": "0007"
     },
     {
+      "id": "otelcol",
+      "field": "observability",
+      "repo": "open-telemetry/opentelemetry-collector-releases",
+      "track": "tag:v0.165.0",
+      "role": "tool",
+      "license": "Apache-2.0",
+      "why": "The OpenTelemetry Collector's core distribution (otelcol), which ships the OTLP receiver, the file exporter and the filter and transform processors (distributions/otelcol/manifest.yaml). It receives Claude Code's and Codex's OTLP log events on 127.0.0.1 only, keeps the three event types and the attributes scripts/lanes --rates reads, and writes them to ~/.claude/canon/otel/logs.jsonl with rotation. Installed by mise's github: backend (no mise or aqua registry entry exists), run as a launchd user agent by scripts/automation.",
+      "evidence": [
+        "https://github.com/open-telemetry/opentelemetry-collector-releases/releases/tag/v0.165.0",
+        "https://raw.githubusercontent.com/open-telemetry/opentelemetry-collector-releases/v0.165.0/distributions/otelcol/manifest.yaml",
+        "https://raw.githubusercontent.com/open-telemetry/opentelemetry-collector-contrib/v0.165.0/exporter/fileexporter/README.md",
+        "https://raw.githubusercontent.com/open-telemetry/opentelemetry-collector/v0.165.0/receiver/otlpreceiver/README.md",
+        "https://mise.jdx.dev/dev-tools/backends/github.html"
+      ],
+      "adr": "0007",
+      "mise": "github:open-telemetry/opentelemetry-collector-releases"
+    },
+    {
       "id": "mise",
       "field": "toolchain",
       "repo": "jdx/mise",

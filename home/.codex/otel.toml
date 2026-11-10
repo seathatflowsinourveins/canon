@@ -1,0 +1,13 @@
+# Codex CLI log export to the local OpenTelemetry Collector (docs/adr/0007-observability.md, tier 3).
+# scripts/bootstrap --user-config appends this table to ${CODEX_HOME:-~/.codex}/config.toml when that file has
+# no [otel] table of its own, and changes nothing else in it. Keys: the [otel] section of
+# https://learn.chatgpt.com/docs/config-file/config-advanced and OtelConfigToml in codex-rs/config/src/types.rs
+# at the pinned rust-v0.167.0 (otel is ignored in a project's .codex/config.toml). The exporter has the shape of
+# the page's otlp-http example; the endpoint is the Collector's OTLP/HTTP logs path on 127.0.0.1.
+# Content stays off: user prompts redacted (log_user_prompt, the default), and the per-token .delta events
+# not sent (log_sse_deltas; completion events still are). Codex has no setting for tool arguments, so the
+# Collector's filter drops codex.tool_result before anything is written.
+[otel]
+exporter = { otlp-http = { endpoint = "http://127.0.0.1:4318/v1/logs", protocol = "binary" } }
+log_user_prompt = false
+log_sse_deltas = false

@@ -306,6 +306,15 @@
       "sha": "5a951604a5ff7d99b7222139ba522237c58228af",
       "track": "default"
     },
+    "otelcol": {
+      "default_branch": "main",
+      "default_sha": "c0c9b046d85f98e4d78f1e2aa1d6fe20268793c5",
+      "ref": "refs/tags/v0.165.0",
+      "repo": "open-telemetry/opentelemetry-collector-releases",
+      "resolved_at": "2026-11-10T23:20:26Z",
+      "sha": "b9425f263115f328bc3bd4e65b825101b499f144",
+      "track": "tag:v0.165.0"
+    },
     "pandas": {
       "default_branch": "main",
       "default_sha": "3714db9d3631ae081cd1b4e8510ce37a663d88dd",
