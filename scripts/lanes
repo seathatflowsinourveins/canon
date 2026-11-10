@@ -263,10 +263,12 @@ selftest() {
   } >> "$tmp/ledger/$today.jsonl"
   # L1, L2: a prompt and its Stop in the same second, written Stop first -> idle, with and without t
   local lts lt; lts=$(ago 20); lt=$(jq -nr --arg ts "$lts" '$ts | fromdateiso8601')
-  printf '{"ts":"%s","t":%s.9,"ev":"Stop","sid":"llllllll-11","cwd":"/w/lambda1"}\n' "$lts" "$lt" >> "$tmp/ledger/${lts:0:10}.jsonl"
-  printf '{"ts":"%s","t":%s.1,"ev":"UserPromptSubmit","sid":"llllllll-11","cwd":"/w/lambda1"}\n' "$lts" "$lt" >> "$tmp/ledger/${lts:0:10}.jsonl"
-  ev 20 Stop             llllllll-12 /w/lambda2
-  ev 20 UserPromptSubmit llllllll-12 /w/lambda2
+  {
+    printf '{"ts":"%s","t":%s.9,"ev":"Stop","sid":"llllllll-11","cwd":"/w/lambda1"}\n' "$lts" "$lt"
+    printf '{"ts":"%s","t":%s.1,"ev":"UserPromptSubmit","sid":"llllllll-11","cwd":"/w/lambda1"}\n' "$lts" "$lt"
+    printf '{"ts":"%s","ev":"Stop","sid":"llllllll-12","cwd":"/w/lambda2"}\n' "$lts"
+    printf '{"ts":"%s","ev":"UserPromptSubmit","sid":"llllllll-12","cwd":"/w/lambda2"}\n' "$lts"
+  } >> "$tmp/ledger/${lts:0:10}.jsonl"
   # M: only a late PreCompact in the window (its prompt is in an older file) -> unknown, not QUIET
   ev 30 PreCompact       mmmmmmmm-13 /w/mu '"trigger":"auto"'
   # one corrupt line must be counted, not crash the report
@@ -301,7 +303,8 @@ selftest() {
   check "zeta idle after late PreCompact and SubagentStop" '.sessions[] | select(.lane=="zeta") | .state=="idle" and (.flags | length == 0)'
   check "empty cwd keeps the lane name"  '[.sessions[] | select(.sid=="gggggggg-7") | .lane] == ["eta"]'
   check "five-day-old session left out"  '[.sessions[] | select(.lane=="theta")] | length == 0'
-  check "period covers yesterday to today" ".period.to == \"$(date -u +%Y-%m-%d)\" and .period.days == 2 and .period.from != .period.to"
+  # $today was read before the report was built; the second date covers a run that crosses UTC midnight
+  check "period covers yesterday to today" "(.period.to == \"$today\" or .period.to == \"$(date -u +%Y-%m-%d)\") and .period.days == 2 and .period.from != .period.to"
   check "--days 7 includes it"           '[.sessions[] | select(.lane=="theta")] | length == 1' "$rwide"
   check "skill use tallied"              '.mix.skills | map(.name) | index("lane-report") != null'
   check "MCP use tallied"                '.mix.mcp | map(.name) | index("mcp__alpaca__get_account") != null'
