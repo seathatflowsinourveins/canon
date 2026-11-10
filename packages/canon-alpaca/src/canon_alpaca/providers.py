@@ -18,7 +18,7 @@ module calls nothing on it but the two asset reads.
 
 Known limits:
 
-* NautilusTrader's `Equity` is whole-share only (nautilus_trader issue 5462, ADR 0009). Alpaca's
+* NautilusTrader's `Equity` is whole-share only (nautilus_trader issue 5462, ADR 0030). Alpaca's
   `fractionable` flag is kept in `Equity.info`, but a fractional position cannot be represented.
 * One price increment for every equity: see `constants.PRICE_INCREMENT`.
 * The assets endpoint carries no timestamp, so `ts_event` and `ts_init` are the time of the load.

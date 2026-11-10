@@ -109,7 +109,7 @@ Known limits of custom Python clients upstream: no Redis or PostgreSQL cache bac
 
 Each is stated where it is implemented, with its source.
 
-* **Whole shares only.** NautilusTrader's `Equity` cannot hold a fractional quantity (ADR 0009). Alpaca's
+* **Whole shares only.** NautilusTrader's `Equity` cannot hold a fractional quantity (ADR 0030). Alpaca's
   `fractionable` flag is kept in `Equity.info`; a fractional size in market data is refused, not rounded.
 * **One price increment, 0.0001.** Alpaca's assets endpoint gives no price increment for US equities, and
   Alpaca's order rule is price-dependent: at most 2 decimals at or above $1.00, 4 below. `Equity` takes one

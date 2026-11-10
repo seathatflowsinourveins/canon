@@ -43,7 +43,7 @@ exclusion written down with its reason. If a lane stops or fails there, the chan
 Confirmation says so, and the state is option 1.
 
 What has changed since ADR 0020, each checked. The adapter places and cancels orders, on paper only: its
-config refuses anything else and the client is built with `paper=True` (ADR 0009). Paper keys come next;
+config refuses anything else and the client is built with `paper=True` (ADR 0030). Paper keys come next;
 none is in this session's environment, and that no live key is on the machine is still UNVERIFIED. Every
 Orca session runs with `--dangerously-skip-permissions` (ADR 0018). With no built-in guard, as here, a mod
 can approve what an `ask` rule would prompt for (ADR 0023). In such a session, from the docs and a trial:
