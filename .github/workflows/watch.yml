@@ -26,8 +26,10 @@ jobs:
         with:
           persist-credentials: false
 
-      # Exit 3 means a pinned release tag now points at a different commit; exit 1, an upstream that
-      # could not be read. Either fails the run, which is how the owner hears of it.
+      # Exit 3 means a pinned release tag now points at a different commit; exit 4, a pin whose repo or
+      # track differs from the registry (the lock is stale; `scripts/canon resolve <id>` fixes it); exit 1,
+      # an upstream that could not be read, which alone is tried once more. Any of them fails the run,
+      # which is how the owner hears of it.
       - name: Pins against live upstream
         run: |
           set +e

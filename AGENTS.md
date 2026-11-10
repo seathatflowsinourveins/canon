@@ -35,7 +35,7 @@ dependency, pattern and practice traces to a pinned upstream or a dated source. 
 | `scripts/canon lint` | Check registry, lock and ADRs for required evidence (offline) |
 | `scripts/ci` | Run every check: registry, shell, self-tests and `scripts/test-*`, lockfile, ruff, ty, pytest, workflow, secrets |
 | `scripts/land` | Land the current branch on `main` once every check passes; no manual merge step. `--pr <n>` lands a pull request the dependency bot opened |
-| `scripts/canon check` | Compare pins with live upstream; exit 3 if a pinned release tag was re-pointed |
+| `scripts/canon check` | Compare pins with live upstream; exit 3 if a pinned release tag was re-pointed, 4 if the lock is stale against the registry |
 | `scripts/canon outdated` | Show upstreams that have a newer release tag than the one pinned |
 | `scripts/canon resolve <id>` | Resolve one pin and merge it into the lock; without an id, re-resolve all (ask first) |
 | `uv sync` | Install exactly what `uv.lock` records into `.venv` |
@@ -62,7 +62,7 @@ dependency, pattern and practice traces to a pinned upstream or a dated source. 
 | `catalog/` | Local market data (`ParquetDataCatalog`); ignored by git |
 | `.claude/` | Claude Code settings, hooks, scoped rules, skills, subagents |
 | `home/` | Machine-level Claude Code config installed to `~/.claude/` by the bootstrap |
-| `scripts/` | `canon`, `ci`, `land`, `check-addresses`, `lanes`, `automation`, `bootstrap`, `survey-github`, and the test scripts `test-ci`, `test-hooks`, `test-land`, `test-lanes` |
+| `scripts/` | `canon`, `ci`, `land`, `check-addresses`, `lanes`, `automation`, `bootstrap`, `survey-github`, and the test scripts `test-canon`, `test-ci`, `test-hooks`, `test-land`, `test-lanes` |
 | `.githooks/` | The pre-commit gate and the pre-push address check |
 | `.github/` | The pull request template, the Dependabot config, the CI workflow and the daily watch |
 

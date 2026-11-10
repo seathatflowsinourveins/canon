@@ -6,10 +6,14 @@
 #     https://git-scm.com/docs/gitprotocol-http  (same data `git ls-remote` prints)
 #   - Registry: canon/upstreams.json   Lock: canon/upstreams.lock.json
 #
-# Depends only on curl + jq, which ship with macOS, so it runs before any toolchain install.
+# Needs curl and jq, plus awk, grep, sed, tr, cut, sort, ls, mktemp and date, all of which ship with macOS
+# and Ubuntu, so it runs before any toolchain install. Bash 3.2 or later.
 # Fails loudly: any upstream that cannot be resolved is an error, never a silent skip.
 #
-# Usage: scripts/canon resolve [id] | check | outdated [--json] | lint | list | selftest
+# Usage: scripts/canon resolve [id|--prune] | check | outdated [--json] | lint | list | selftest
+# Exit codes: 0 ok; 1 an error, a lint failure, or (check, outdated) an upstream that could not be read or
+# a registry entry with no pin; 2 usage; 3 (check) a pinned release tag now points at another commit;
+# 4 (check) a pin whose repo or track differs from the registry, so it needs `resolve <id>`.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -19,58 +23,94 @@ ADR_DIR="$ROOT/docs/adr"
 
 die() { echo "canon: ERROR: $*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "missing required tool: $1"; }
-need curl; need jq
+need curl; need jq; need awk
 [ -f "$REG" ] || die "registry not found: $REG"
+# Every command reads the registry, so it is validated once here: a registry that does not parse, or does
+# not hold a non-empty array of entries, stops the command instead of reading as an empty list.
+jq -e '(.upstreams | type == "array") and (.upstreams | length > 0) and all(.upstreams[]; type == "object")' \
+     "$REG" >/dev/null 2>&1 \
+  || die "registry ${REG#"$ROOT"/} does not parse as JSON with a non-empty 'upstreams' array of objects"
+
+# reg_rows <jq filter>  -> the filter's raw output over the registry; stops the script if jq fails
+reg_rows() { jq -r "$1" "$REG" || die "could not read the registry with: $1"; }
+REPO_ROWS='.upstreams[] | select(.repo != null) | [.id, .repo, (.track // "default")] | @tsv'
+# pin_rows  -> "<id> <repo> <track> <locked sha> <locked repo> <locked track>" (tab-separated) for every
+# registry entry with a repo; a value the lock lacks is "-", so no field is empty.
+pin_rows() {
+  jq -r --slurpfile lock "$LOCK" '.upstreams[] | select(.repo != null) | ($lock[0].pins[.id] // {}) as $p
+    | [.id, .repo, (.track // "default"), ($p.sha // "-"), ($p.repo // "-"), ($p.track // "-")] | @tsv' "$REG" \
+    || die "could not read the registry and ${LOCK#"$ROOT"/} together"
+}
 
 # refs_for <owner/repo>  -> lines of "<sha> <refname>" plus a "HEAD-> <branch>" line
+# Every filter below reads its input to the end: where SIGPIPE is ignored, a reader that stops early
+# makes the writer fail with a broken pipe.
 refs_for() {
   local repo="$1" raw
   raw=$(curl -fsSL --max-time 30 --retry 2 \
         "https://github.com/$repo.git/info/refs?service=git-upload-pack" | LC_ALL=C tr '\0' '\n') \
         || return 1
-  printf '%s\n' "$raw" | LC_ALL=C grep -a -o 'symref=HEAD:refs/heads/[^ ]*' | head -1 \
-    | sed 's|symref=HEAD:refs/heads/|HEAD-> |'
-  printf '%s\n' "$raw" | LC_ALL=C grep -a -E '^[0-9a-f]{44} refs/' | cut -c5-
+  # A ref line is a 4-hex pkt-line length, a 40-hex sha, a space and the ref name.
+  printf '%s\n' "$raw" | LC_ALL=C awk '
+      !f && match($0, /symref=HEAD:refs\/heads\/[^ ]*/) {
+        f = 1; s = substr($0, RSTART, RLENGTH); sub(/^symref=HEAD:refs\/heads\//, "", s); print "HEAD-> " s }
+      $0 ~ /^[0-9a-f]+ refs\// && index($0, " ") == 45 { print substr($0, 5) }'
 }
 
 # resolve_one <owner/repo> <track>  -> "<ref> <sha> <default_branch> <default_sha>"
 resolve_one() {
-  local repo="$1" track="$2" refs default ref sha dsha
+  local repo="$1" track="$2" refs ref out
   refs=$(refs_for "$repo") || return 1
-  default=$(printf '%s\n' "$refs" | sed -n 's/^HEAD-> //p' | head -1)
-  [ -n "$default" ] || return 1
-  dsha=$(printf '%s\n' "$refs" | awk -v r="refs/heads/$default" '$2==r{print $1; exit}')
   case "$track" in
-    default)   ref="refs/heads/$default" ;;
+    default)   ref="" ;;
     branch:*)  ref="refs/heads/${track#branch:}" ;;
     tag:*)     ref="refs/tags/${track#tag:}" ;;
     *)         return 2 ;;
   esac
-  # annotated tags advertise a peeled "^{}" entry holding the commit; prefer it
-  sha=$(printf '%s\n' "$refs" | awk -v r="$ref^{}" '$2==r{print $1; exit}')
-  [ -n "$sha" ] || sha=$(printf '%s\n' "$refs" | awk -v r="$ref" '$2==r{print $1; exit}')
-  [ -n "$sha" ] || return 3
-  echo "$ref $sha $default $dsha"
+  # One pass: the default branch, its commit, and the commit for ref (for an annotated tag, the peeled
+  # "^{}" entry, which holds the commit). The first line for each name wins.
+  out=$(printf '%s\n' "$refs" | awk -v want="$ref" '
+      !d && sub(/^HEAD-> /, "") { d = 1; def = $0; next }
+      { if (!($2 in sha)) sha[$2] = $1 }
+      END { if (def == "") exit 1
+            r = (want == "" ? "refs/heads/" def : want)
+            s = sha[r "^{}"]; if (s == "") s = sha[r]
+            ds = sha["refs/heads/" def]
+            if (s == "" || ds == "") exit 1
+            print r, s, def, ds }') || return 3
+  echo "$out"
 }
 
-# resolve            re-resolve every upstream and rewrite the whole lock
+# resolve            re-resolve every upstream and rewrite the whole lock. It refuses to write a lock with
+#                    fewer pins than the current one, so an entry removed from the registry keeps its pin
+#                    until a full resolve is run with --prune.
 # resolve <id>       resolve one upstream and merge it into the existing lock, leaving every other pin
 #                    exactly as it is. Use this to add or move a single pin (ADR 0001: pins move deliberately).
+# The read-modify-write of the lock holds the directory <lock>.held, so two runs never interleave.
 cmd_resolve() {
-  local only="${1:-}" tmp n=0 fail=0 now top
+  local only="${1:-}" prune=0 tmp new out n=0 fail=0 now top dropped rows
+  [ "$only" = "--prune" ] && { only=""; prune=1; }
   now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  tmp=$(mktemp)
+  HELD="$LOCK.held"
+  mkdir "$HELD" 2>/dev/null \
+    || die "another scripts/canon resolve holds ${HELD#"$ROOT"/}; wait for it to finish, or remove that directory if no resolve is running"
+  TMPS=()
+  trap 'for f in ${TMPS[@]+"${TMPS[@]}"}; do rm -f "$f"; done; rmdir "$HELD" 2>/dev/null' EXIT
+  tmp=$(mktemp "$LOCK.XXXXXX"); TMPS+=("$tmp" "$tmp.n")
+  new=$(mktemp "$LOCK.XXXXXX"); TMPS+=("$new")
   if [ -n "$only" ]; then
     [ -f "$LOCK" ] || die "no lock file yet; run a full: scripts/canon resolve"
     jq -e --arg id "$only" '.upstreams[] | select(.id == $id and .repo != null)' "$REG" >/dev/null \
-      || { rm -f "$tmp"; die "no upstream with id '$only' in the registry"; }
-    jq '.pins' "$LOCK" > "$tmp"
+      || die "no upstream with id '$only' in the registry"
+    jq '.pins' "$LOCK" > "$tmp" || die "could not read ${LOCK#"$ROOT"/}"
     top=$(jq -r '.resolved_at' "$LOCK")
   else
     echo '{}' > "$tmp"
     top="$now"
   fi
+  rows=$(reg_rows "$REPO_ROWS")
   while IFS=$'\t' read -r id repo track; do
+    [ -n "$id" ] || continue
     [ -z "$only" ] || [ "$id" = "$only" ] || continue
     n=$((n+1))
     if out=$(resolve_one "$repo" "$track"); then
@@ -85,9 +125,17 @@ cmd_resolve() {
       fail=$((fail+1))
       printf '  FAIL  %-28s %s (%s) could not be resolved\n' "$id" "$repo" "$track" >&2
     fi
-  done < <(jq -r '.upstreams[] | select(.repo != null) | [.id, .repo, (.track // "default")] | @tsv' "$REG")
-  [ "$fail" -eq 0 ] || { rm -f "$tmp"; die "$fail of $n upstreams failed to resolve; lock NOT written"; }
-  jq -S --arg at "$top" '{schema:1, resolved_at:$at, pins:.}' "$tmp" > "$LOCK.tmp" && mv "$LOCK.tmp" "$LOCK"; rm -f "$tmp"
+  done <<<"$rows"
+  [ "$fail" -eq 0 ] || die "$fail of $n upstreams failed to resolve; lock NOT written"
+  [ -z "$only" ] || [ "$n" -eq 1 ] || die "resolved $n entries for id '$only'; lock NOT written"
+  jq -S --arg at "$top" '{schema:1, resolved_at:$at, pins:.}' "$tmp" > "$new" || die "could not build the lock; lock NOT written"
+  if [ -f "$LOCK" ] && [ "$prune" -eq 0 ]; then
+    dropped=$(jq -r --slurpfile new "$new" '(.pins | keys) - ($new[0].pins | keys) | join(", ")' "$LOCK") \
+      || die "could not compare the new lock with ${LOCK#"$ROOT"/}; lock NOT written"
+    [ -z "$dropped" ] \
+      || die "the new lock would drop the pins for: $dropped; lock NOT written. If those entries were removed or renamed in the registry on purpose, run: scripts/canon resolve --prune"
+  fi
+  mv "$new" "$LOCK"
   echo "canon: resolved $n upstream(s) -> ${LOCK#"$ROOT"/}"
 }
 
@@ -98,11 +146,21 @@ cmd_check() {
   #             immutable, so treat this as a supply-chain warning. Exit 3.
   #   advanced  a branch we track has new commits. Normal. The lock still holds the old commit,
   #             so nothing we use has changed; it only means there is something newer to review.
-  local retag=0 adv=0 fail=0 n=0
-  while IFS=$'\t' read -r id repo track; do
+  # A pin whose repo or track differs from the registry is STALE: the registry moved and the lock was not
+  # re-resolved. It is not compared with upstream, and it fails the check with exit 4, which is not retried
+  # the way an unreachable upstream (exit 1) is. Precedence when several apply: 1, then 3, then 4.
+  local retag=0 adv=0 fail=0 stale=0 n=0 rows locked lrepo ltrack
+  rows=$(pin_rows)
+  while IFS=$'\t' read -r id repo track locked lrepo ltrack; do
+    [ -n "$id" ] || continue
     n=$((n+1))
-    locked=$(jq -r --arg id "$id" '.pins[$id].sha // empty' "$LOCK")
-    [ -n "$locked" ] || { fail=$((fail+1)); echo "  UNPINNED  $id (in registry, not in lock)"; continue; }
+    [ "$locked" != "-" ] || { fail=$((fail+1)); echo "  UNPINNED  $id (in registry, not in lock)"; continue; }
+    if [ "$lrepo" != "$repo" ] || [ "$ltrack" != "$track" ]; then
+      stale=$((stale+1))
+      printf '  STALE     %-28s lock has %s %s, registry has %s %s; run: scripts/canon resolve %s\n' \
+        "$id" "$lrepo" "$ltrack" "$repo" "$track" "$id"
+      continue
+    fi
     if out=$(resolve_one "$repo" "$track"); then
       # shellcheck disable=SC2086  # splitting "ref sha branch sha" into positional parameters is intended
       set -- $out
@@ -117,10 +175,75 @@ cmd_check() {
     else
       fail=$((fail+1)); echo "  FAIL      $id ($repo $track) unreachable or ref gone" >&2
     fi
-  done < <(jq -r '.upstreams[] | select(.repo != null) | [.id, .repo, (.track // "default")] | @tsv' "$REG")
-  echo "canon: $n checked, $retag retagged, $adv branch-tracked advanced, $fail failed"
+  done <<<"$rows"
+  echo "canon: $n checked, $retag retagged, $adv branch-tracked advanced, $stale stale, $fail failed"
   [ "$fail" -eq 0 ] || exit 1
   [ "$retag" -eq 0 ] || exit 3
+  [ "$stale" -eq 0 ] || exit 4
+}
+
+# mise_tools  -> "<name>\t<request>" for each key of mise.toml's [tools] table
+mise_tools() {
+  awk '/^[[:space:]]*\[/ { t = ($0 ~ /^[[:space:]]*\[tools\][[:space:]]*(#.*)?$/); next }
+       t && /^[[:space:]]*[^#[:space:]]/ && index($0, "=") > 0 {
+         k = substr($0, 1, index($0, "=") - 1); v = substr($0, index($0, "=") + 1)
+         sub(/^[[:space:]]+/, "", k); sub(/[[:space:]]+$/, "", k); gsub(/"/, "", k)
+         sub(/^[[:space:]]+/, "", v)
+         if (v ~ /^"/) { v = substr(v, 2); sub(/".*$/, "", v) } else { sub(/[[:space:]]+#.*$/, "", v); sub(/[[:space:]]+$/, "", v) }
+         print k "\t" v }' "$ROOT/mise.toml"
+}
+
+# mise_locked <name>  -> the version mise.lock records for that tool (the first entry)
+mise_locked() {
+  awk -v n="$1" '/^\[\[tools\./ { cur = $0; sub(/^\[\[tools\./, "", cur); sub(/\]\].*$/, "", cur); gsub(/"/, "", cur); next }
+                 /^\[/ { cur = ""; next }
+                 !f && cur == n && $1 == "version" { v = $3; gsub(/"/, "", v); print v; f = 1 }' "$ROOT/mise.lock"
+}
+
+# workflow_uses <file>  -> one line per line of the file that has `uses` as a mapping key: at the start of
+# the line's content (after an optional "- ", quoted or not), or after "{" or "," as a flow-style key.
+#   "USE\t<owner/repo>\t<sha>" for an action pinned to a full commit in block style,
+#   "LOCAL" for a ./ or $/ reference or a docker:// image, and "BAD\t<line no>: <text>" for anything else
+#   (flow style, a quoted key, a quoted or folded value, a tag or a branch).
+# The lines of a block scalar (the body of a `run: |` or any other key ending in | or >) are text, not keys,
+# and are skipped: a body line is blank or indented further than the key that opened it.
+workflow_uses() {
+  awk 'BEGIN { blk = -1 }
+       blk >= 0 { match($0, /^ */); if ($0 ~ /^[[:space:]]*$/ || RLENGTH > blk) next; blk = -1 }
+       /^[[:space:]]*#/ { next }
+       { t = $0; if (match(t, /[[:space:]]+#.*$/)) t = substr(t, 1, RSTART - 1)   # a comment is not a value
+         if (t ~ /:[[:space:]]+[|>][-+0-9]*[[:space:]]*$/) { match($0, /^ *(- +)*/); blk = RLENGTH } }
+       { s = $0; sub(/^[[:space:]]*/, "", s)
+         if (s ~ /^- /) { s = substr(s, 3); sub(/^[[:space:]]*/, "", s) }
+         if (s !~ /^["\047]?uses["\047]?[[:space:]]*:/ && $0 !~ /[{,][[:space:]]*["\047]?uses["\047]?[[:space:]]*:/) next
+         if (s !~ /^uses:[[:space:]]/) { print "BAD\t" FNR ": " $0; next }
+         v = s; sub(/^uses:[[:space:]]*/, "", v)
+         if (match(v, /[[:space:]]+#/)) v = substr(v, 1, RSTART - 1)
+         sub(/[[:space:]]+$/, "", v)
+         if (v ~ /^(\.|\$)\/[^[:space:]]*$/ || v ~ /^docker:\/\/[^[:space:]]+$/) { print "LOCAL"; next }
+         if (v ~ /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.\/-]+@[0-9a-f]+$/ && length(v) - index(v, "@") == 40) {
+           r = substr(v, 1, index(v, "@") - 1); sha = substr(v, index(v, "@") + 1)
+           split(r, p, "/"); print "USE\t" p[1] "/" p[2] "\t" sha; next }
+         print "BAD\t" FNR ": " $0 }' "$1"
+}
+
+# mise_action_versions <file>  -> the with.version of each step that uses jdx/mise-action ("-" if none)
+mise_action_versions() {
+  awk 'function flush() { if (m) print (ver == "" ? "-" : ver); m = 0; ver = ""; wi = -1 }
+       BEGIN { step = -1; wi = -1 }
+       /^[[:space:]]*(#|$)/ { next }
+       { match($0, /^ */); i = RLENGTH; s = substr($0, i + 1)
+         if (step >= 0 && i <= step) { flush(); step = -1 }
+         if (s ~ /^- / && step < 0) {
+           flush(); step = i; s = substr(s, 3); i = i + 2
+           match(s, /^ */); i = i + RLENGTH; s = substr(s, RLENGTH + 1) }
+         if (step < 0) next
+         if (wi >= 0 && i <= wi) wi = -1
+         if (s ~ /^uses:[[:space:]]+jdx\/mise-action@/) m = 1
+         if (s ~ /^with:[[:space:]]*$/) { wi = i; next }
+         if (wi >= 0 && i > wi && s ~ /^version:/) {
+           v = s; sub(/^version:[[:space:]]*/, "", v); sub(/[[:space:]]+#.*$/, "", v); gsub(/["\047]/, "", v); ver = v } }
+       END { flush() }' "$1"
 }
 
 cmd_lint() {
@@ -132,80 +255,136 @@ cmd_lint() {
   [ -z "$bad" ] || { err=1; echo "lint: registry entries missing id/field/role/why/evidence/adr/source:"; echo "$bad" | sed 's/^/    /'; }
   dup=$(jq -r '[.upstreams[].id] | group_by(.) | map(select(length>1) | .[0]) | .[]' "$REG")
   [ -z "$dup" ] || { err=1; echo "lint: duplicate ids: $dup"; }
-  # 2. lock: every repo entry pinned to a full 40-hex commit
+  # 2. lock: every repo entry pinned to a full 40-hex commit, resolved from the repo and track the
+  #    registry now names
+  local rows sha lrepo ltrack
   if [ -f "$LOCK" ]; then
-    while read -r id; do
-      sha=$(jq -r --arg id "$id" '.pins[$id].sha // ""' "$LOCK")
-      echo "$sha" | grep -Eq '^[0-9a-f]{40}$' || { err=1; echo "lint: $id has no 40-hex pin in lock"; }
-    done < <(jq -r '.upstreams[] | select(.repo != null) | .id' "$REG")
+    rows=$(pin_rows)
+    while IFS=$'\t' read -r id repo track sha lrepo ltrack; do
+      [ -n "$id" ] || continue
+      if ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then err=1; echo "lint: $id has no 40-hex pin in lock"
+      elif [ "$lrepo" != "$repo" ] || [ "$ltrack" != "$track" ]; then
+        err=1; echo "lint: $id is $repo $track in the registry but the lock has $lrepo $ltrack; run: scripts/canon resolve $id"
+      fi
+    done <<<"$rows"
   else err=1; echo "lint: lock file missing"; fi
   # 3. ADRs: each referenced ADR exists; each accepted ADR has status, evidence links and a review date
+  rows=$(reg_rows '[.upstreams[].adr] | unique | .[]')
   while read -r adr; do
+    [ -n "$adr" ] || continue
     ls "$ADR_DIR"/"$adr"-*.md >/dev/null 2>&1 || { err=1; echo "lint: registry references ADR $adr but docs/adr/$adr-*.md does not exist"; }
-  done < <(jq -r '[.upstreams[].adr] | unique | .[]' "$REG")
+  done <<<"$rows"
+  local adrs=() adr_out
   for f in "$ADR_DIR"/[0-9][0-9][0-9][0-9]-*.md; do
     [ -f "$f" ] || continue
-    b=${f#"$ROOT"/}
-    grep -q '^status:' "$f"        || { err=1; echo "lint: $b missing front-matter 'status:'"; }
-    grep -q '^review-by:' "$f"     || { err=1; echo "lint: $b missing front-matter 'review-by:'"; }
-    grep -q '^## Evidence' "$f"    || { err=1; echo "lint: $b missing '## Evidence' section"; }
-    awk '/^## Evidence/{e=1;next} /^## /{e=0} e' "$f" | grep -q 'https\?://' \
-                                   || { err=1; echo "lint: $b Evidence section cites no URL"; }
+    if [ ! -r "$f" ]; then err=1; echo "lint: ${f#"$ROOT"/} is not readable"
+    elif [ -s "$f" ]; then adrs+=("$f"); else err=1; echo "lint: ${f#"$ROOT"/} is empty"; fi
   done
+  if [ "${#adrs[@]}" -gt 0 ]; then
+    # One awk over every ADR; a file's checks are reported when the next file starts and at the end.
+    # status: and review-by: count only inside the front matter (the --- lines that open the file). The
+    # Evidence heading is the exact line "## Evidence"; a heading inside a ``` or ~~~ fence is not one.
+    # [[:space:]] also takes the \r of a CRLF line.
+    adr_out=$(awk -v root="$ROOT/" '
+        function report() { if (b == "") return
+          if (!st) print "lint: " b " missing front-matter '\''status:'\''"
+          if (!rb) print "lint: " b " missing front-matter '\''review-by:'\''"
+          if (!ev) print "lint: " b " missing '\''## Evidence'\'' section"
+          if (!u)  print "lint: " b " Evidence section cites no URL" }
+        FNR == 1 { report(); b = FILENAME; if (index(b, root) == 1) b = substr(b, length(root) + 1)
+                   st = rb = ev = e = u = fc = 0; fm = ($0 ~ /^---[[:space:]]*$/); if (fm) next }
+        fm && /^---[[:space:]]*$/ { fm = 0; next }
+        fm && /^status:/ { st = 1 } fm && /^review-by:/ { rb = 1 }
+        /^[[:space:]]*(```|~~~)/ { fc = !fc }
+        !fc && /^## Evidence[[:space:]]*$/ { ev = 1; e = 1; next } !fc && /^## / { e = 0 } e && /https?:\/\// { u = 1 }
+        END { report() }' "${adrs[@]}") || { err=1; adr_out="lint: could not read every ADR${adr_out:+$'\n'$adr_out}"; }
+    [ -z "$adr_out" ] || { err=1; echo "$adr_out"; }
+  fi
   # 4. One pin, declared once. The registry says which version is adopted; uv.lock, mise.toml, the
   #    bootstrap and the workflow files are where it is installed. They must agree, so a version bumped
   #    in one place (by hand or by a bot) fails here until the registry and its ADR are updated too.
-  local want have locked repo sha wf
+  #    A mise.toml request that is a release line ("3.14") or "latest" is compared through the exact
+  #    version mise.lock records for it.
+  local want have locked repo wf b tools kind rest mv
+  tools=""
+  [ -f "$ROOT/mise.toml" ] && tools=$(mise_tools)
+  rows=$(reg_rows '.upstreams[] | select((.track // "") | startswith("tag:")) | select(.pypi != null or .mise != null)
+                   | [.id, .track, (.pypi // "-"), (.mise // "-")] | @tsv')
   while IFS=$'\t' read -r id track pypi misetool; do
+    [ -n "$id" ] || continue
     want="${track#tag:}"; want="${want#v}"
     if [ "$pypi" != "-" ] && [ -f "$ROOT/uv.lock" ]; then
       have=$(awk -v n="$pypi" '$0 == "[[package]]" { cur = "" } $1 == "name" { gsub(/"/, "", $3); cur = $3 }
-                               $1 == "version" && cur == n { gsub(/"/, "", $3); print $3; exit }' "$ROOT/uv.lock")
+                               !f && $1 == "version" && cur == n { gsub(/"/, "", $3); print $3; f = 1 }' "$ROOT/uv.lock")
       [ "$have" = "$want" ] || { err=1; echo "lint: $id is $want in the registry but uv.lock has '${have:-nothing}' for $pypi"; }
     fi
     if [ "$misetool" != "-" ] && [ -f "$ROOT/mise.toml" ]; then
-      have=$(awk -F'"' -v n="$misetool" '$1 ~ "^" n " *= *$" { print $2; exit }' "$ROOT/mise.toml")
-      [ "$have" = "$want" ] || { err=1; echo "lint: $id is $want in the registry but mise.toml has '${have:-nothing}' for $misetool"; }
+      have=$(printf '%s\n' "$tools" | awk -F'\t' -v n="$misetool" '!f && $1 == n { f = 1; print $2 }')
+      if [ "$have" = "$want" ]; then :
+      elif [ "$have" = "latest" ] || { [ -n "$have" ] && [ "${want#"$have".}" != "$want" ]; }; then
+        locked=""
+        [ -f "$ROOT/mise.lock" ] && locked=$(mise_locked "$misetool")
+        [ "$locked" = "$want" ] \
+          || { err=1; echo "lint: $id is $want in the registry; mise.toml asks for '$have' and mise.lock records '${locked:-nothing}' for $misetool"; }
+      else
+        err=1; echo "lint: $id is $want in the registry but mise.toml has '${have:-nothing}' for $misetool"
+      fi
     fi
-  done < <(jq -r '.upstreams[] | select((.track // "") | startswith("tag:")) | select(.pypi != null or .mise != null)
-                  | [.id, .track, (.pypi // "-"), (.mise // "-")] | @tsv' "$REG")
-  want=$(jq -r '.upstreams[] | select(.id == "mise") | .track' "$REG"); want="${want#tag:}"
+  done <<<"$rows"
+  want=$(reg_rows '.upstreams[] | select(.id == "mise") | .track'); want="${want#tag:}"
   if [ -n "$want" ]; then
     grep -q "^MISE_VERSION=\"$want\"" "$ROOT/scripts/bootstrap" 2>/dev/null \
       || { err=1; echo "lint: mise is $want in the registry but scripts/bootstrap sets a different MISE_VERSION"; }
   fi
-  for wf in "$ROOT"/.github/workflows/*.yml; do
+  # Workflows: every line that mentions `uses` must be a block-style step key whose value is an action at a
+  # full commit (an optional trailing comment allowed), a ./ or $/ reference, or a docker:// image.
+  for wf in "$ROOT"/.github/workflows/*.yml "$ROOT"/.github/workflows/*.yaml; do
     [ -f "$wf" ] || continue
-    if grep -nE '^[[:space:]]*-?[[:space:]]*uses:[[:space:]]*[^.#[:space:]][^@[:space:]]*@' "$wf" | grep -vE '@[0-9a-f]{40}([[:space:]]|$)' >/dev/null; then
-      err=1; echo "lint: ${wf#"$ROOT"/} references an action by tag or branch; pin it to a full commit SHA"
+    b=${wf#"$ROOT"/}
+    while IFS=$'\t' read -r kind repo rest; do
+      case "$kind" in
+        BAD) err=1; echo "lint: $b line $repo${rest:+ $rest}"
+             echo "      write each action as a block-style 'uses: owner/repo@<40-hex commit>' line" ;;
+        USE)
+          locked=$(jq -r --arg r "$repo" --slurpfile lock "$LOCK" '[.upstreams[] | select(.repo == $r) | $lock[0].pins[.id].sha] | first // ""' "$REG")
+          if [ -z "$locked" ]; then err=1; echo "lint: $b uses $repo, which is not in the registry"
+          elif [ "$locked" != "$rest" ]; then err=1; echo "lint: $b pins $repo to ${rest:0:12} but the canon lock has ${locked:0:12}"; fi ;;
+      esac
+    done <<<"$(workflow_uses "$wf")"
+    if [ -n "$want" ]; then
+      mv=$(mise_action_versions "$wf")
+      while read -r v; do
+        [ -n "$v" ] || continue
+        if [ "$v" = "-" ]; then err=1; echo "lint: $b has a jdx/mise-action step with no block-style with.version"
+        elif [ "$v" != "${want#v}" ]; then err=1; echo "lint: $b installs mise '$v' in its jdx/mise-action step, not the registry's ${want#v}"; fi
+      done <<<"$mv"
     fi
-    while read -r repo sha; do
-      [ -n "$repo" ] || continue
-      locked=$(jq -r --arg r "$repo" --slurpfile lock "$LOCK" '[.upstreams[] | select(.repo == $r) | $lock[0].pins[.id].sha] | first // ""' "$REG")
-      if [ -z "$locked" ]; then err=1; echo "lint: ${wf#"$ROOT"/} uses $repo, which is not in the registry"
-      elif [ "$locked" != "$sha" ]; then err=1; echo "lint: ${wf#"$ROOT"/} pins $repo to ${sha:0:12} but the canon lock has ${locked:0:12}"; fi
-      if [ "$repo" = "jdx/mise-action" ] && [ -n "$want" ]; then
-        grep -qE "^[[:space:]]*version:[[:space:]]*\"?${want#v}\"?[[:space:]]*$" "$wf" \
-          || { err=1; echo "lint: ${wf#"$ROOT"/} installs a mise version other than the registry's ${want#v}"; }
-      fi
-    done < <(grep -oE 'uses:[[:space:]]*[^@[:space:]]+@[0-9a-f]{40}' "$wf" | sed -E 's/uses:[[:space:]]*//; s/@/ /')
   done
 
   if [ "$err" -eq 0 ]; then echo "canon: lint clean"; else exit 1; fi
 }
 
 # outdated: for every upstream tracked by release tag, is there a newer tag upstream?
-# Ordering is numeric on major.minor.patch; a tag with a suffix (rc, beta, ...) sorts below the same
-# version without one, so "v2.0.0" outranks "v2.0.0rc8". Only tags sharing the pinned tag's prefix are
-# compared ("v1.2.3" never competes with "tool-v9.9.9"). An entry's optional "line" (e.g. "v1.") holds it
+# Ordering is numeric on major.minor.patch, then by release stage: dev, alpha (a), beta (b), rc, then the
+# final release, then by the number after the stage label. So "v2.0.0b12" < "v2.0.0rc8" < "v2.0.0rc10" <
+# "v2.0.0". A suffix that is none of these stages ("v1.2.3.post1", "v1.2.3-x99") is unparseable: such a
+# pin is reported UNPARSEABLE and such a tag is not compared. Only tags sharing the pinned tag's prefix are
+# compared ("v1.2.3" never competes with "tool-v9.9.9"). A four-part tag ("v0.65.2.1") and a tag whose
+# prefix differs from the pin's are not ranked either: such a pin is UNPARSEABLE, and the landscape watch
+# reports it so that a pin the rule cannot follow is still seen. An entry's optional "line" (e.g. "v1.") holds it
 # to one release line. Exit 0 = report printed (see STATUS); 1 = an upstream could not be read.
 # The release rule, shared by `outdated` and `selftest`. Input: an array of tag names.
 # shellcheck disable=SC2016  # a jq program: $id, $pinned and the rest are jq variables, not shell ones
 OUTDATED_JQ='
-  def ver: (capture("^(?<p>[A-Za-z_-]*)(?<a>[0-9]+)(\\.(?<b>[0-9]+))?(\\.(?<c>[0-9]+))?(?<rest>.*)$") // null);
+  def stage: if . == "" then [4, 0]
+    else (capture("^[-._]?(?<s>dev|alpha|a|beta|b|rc)[-._]?(?<n>[0-9]*)$") // null) as $m
+      | if $m == null then null
+        else [({"dev": 0, "alpha": 1, "a": 1, "beta": 2, "b": 2, "rc": 3}[$m.s]),
+              (if $m.n == "" then 0 else ($m.n | tonumber) end)] end end;
+  def ver: (capture("^(?<p>[A-Za-z_-]*)(?<a>[0-9]+)(\\.(?<b>[0-9]+))?(\\.(?<c>[0-9]+))?(?<rest>.*)$") // null)
+    | if . == null or (.rest | stage) == null then null else . end;
   def key: ver as $v
-    | [($v.a | tonumber), (($v.b // "0") | tonumber), (($v.c // "0") | tonumber),
-       (if $v.rest == "" then 1 else 0 end), ($v.rest | [scan("[0-9]+")] | map(tonumber)), $v.rest];
+    | [($v.a | tonumber), (($v.b // "0") | tonumber), (($v.c // "0") | tonumber)] + ($v.rest | stage);
   ($pinned | ver) as $pv
   | if $pv == null then {id: $id, role: $role, pinned: $pinned, status: "UNPARSEABLE", newest: null, newest_stable: null}
     else
@@ -237,14 +416,24 @@ cmd_selftest() {
   got=$(judge v1.231.0 "v1." v1.231.0 v2.0.0rc8 v2.0.0);               want "a release line holds an entry to v1"     "current v1.231.0" "$got"
   got=$(judge v2026.11.5 "" v2026.11.5 vfox-v2026.12.0 nightly);       want "other tag prefixes are not compared"     "current v2026.11.5" "$got"
   got=$(judge v9.9.9 "" v9.9.9 v10.0.0);                               want "10 sorts after 9"                        "NEWER v10.0.0" "$got"
+  got=$(judge v2.0.0rc8 "" v2.0.0rc8 v2.0.0b12);                       want "beta 12 ranks below rc 8"                "current v2.0.0rc8" "$got"
+  got=$(judge v2.0.0rc8 "" v2.0.0rc8 v2.0.0.dev20251015);              want "a dev tag ranks below rc 8"              "current v2.0.0rc8" "$got"
+  got=$(judge v2.0.0b12 "" v2.0.0b12 v2.0.0rc8);                       want "beta pin sees a later rc"                "NEWER v2.0.0rc8" "$got"
+  got=$(judge v1.0.0-alpha.2 "" v1.0.0-alpha.2 v1.0.0-beta.1);         want "alpha 2 ranks below beta 1"              "NEWER v1.0.0-beta.1" "$got"
+  got=$(judge v1.0.0-beta.1 "" v1.0.0-alpha.2 v1.0.0-beta.1);          want "beta 1 pin ignores alpha 2"              "current v1.0.0-beta.1" "$got"
+  got=$(judge v2.0.0rc8 "" v2.0.0rc8 v2.0.0-x99);                      want "an unknown suffix is not ranked"         "current v2.0.0rc8" "$got"
+  got=$(judge v1.2.3.post1 "" v1.2.3.post1 v1.2.4);                    want "an unknown pinned suffix is unparseable" "UNPARSEABLE -" "$got"
+  got=$(judge v0.65.2.1 "" v0.65.2 v0.65.2.1 v0.65.3);                 want "a four-part pin is unparseable"          "UNPARSEABLE -" "$got"
   if [ "$fails" -eq 0 ]; then echo "canon: selftest passed"; else echo "canon: selftest FAILED ($fails)"; exit 1; fi
 }
 
 cmd_outdated() {
-  local json=0 fail=0 n=0 tmp row refs tags
+  local json=0 fail=0 n=0 tmp row refs tags rows
   [ "${1:-}" = "--json" ] && json=1
+  rows=$(reg_rows '.upstreams[] | select((.track // "") | startswith("tag:")) | [.id, .repo, .track, .role, (.line // "-")] | @tsv')
   tmp=$(mktemp); echo '[]' > "$tmp"
   while IFS=$'\t' read -r id repo track role line; do
+    [ -n "$id" ] || continue
     n=$((n+1))
     [ "$line" = "-" ] && line=""
     if refs=$(refs_for "$repo"); then
@@ -257,11 +446,12 @@ cmd_outdated() {
       jq --arg id "$id" --arg role "$role" --arg pinned "${track#tag:}" \
          '. + [{id: $id, role: $role, pinned: $pinned, status: "UNREACHABLE", newest: null, newest_stable: null}]' "$tmp" > "$tmp.n" && mv "$tmp.n" "$tmp"
     fi
-  done < <(jq -r '.upstreams[] | select((.track // "") | startswith("tag:")) | [.id, .repo, .track, .role, (.line // "-")] | @tsv' "$REG")
+  done <<<"$rows"
   if [ "$json" -eq 1 ]; then
     jq -c . "$tmp"
   else
-    jq -r '.[] | [.id, .role, .pinned, (.newest // "-"), .status] | @tsv' "$tmp" \
+    jq -r '.[] | [.id, .role, .pinned,
+                  ((if .status == "STABLE-AVAILABLE" then .newest_stable else .newest end) // "-"), .status] | @tsv' "$tmp" \
       | awk -F'\t' 'BEGIN{printf "%-26s %-11s %-13s %-13s %s\n","ID","ROLE","PINNED","NEWEST","STATUS"} {printf "%-26s %-11s %-13s %-13s %s\n",$1,$2,$3,$4,$5}'
     echo "canon: $n tag-tracked upstreams, $(jq '[.[] | select(.status == "NEWER" or .status == "STABLE-AVAILABLE")] | length' "$tmp") with a newer release, $fail unreachable"
   fi
@@ -281,5 +471,5 @@ case "${1:-}" in
   list)    cmd_list ;;
   outdated) cmd_outdated "${2:-}" ;;
   selftest) cmd_selftest ;;
-  *) echo "usage: scripts/canon {resolve [id]|check|outdated [--json]|lint|list|selftest}" >&2; exit 2 ;;
+  *) echo "usage: scripts/canon {resolve [id|--prune]|check|outdated [--json]|lint|list|selftest}" >&2; exit 2 ;;
 esac
