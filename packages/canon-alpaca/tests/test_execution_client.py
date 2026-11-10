@@ -15,6 +15,7 @@ credentials.
 """
 
 import asyncio
+import concurrent.futures
 import socket
 import threading
 import time
@@ -38,6 +39,7 @@ from alpaca.common.rest import RESTClient
 from alpaca.trading.enums import OrderSide as AlpacaOrderSide
 from alpaca.trading.enums import QueryOrderStatus
 from alpaca.trading.enums import TimeInForce as AlpacaTimeInForce
+from alpaca.trading.models import Order as AlpacaOrder
 from alpaca.trading.requests import LimitOrderRequest
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.requests import ReplaceOrderRequest
@@ -52,6 +54,7 @@ from canon_alpaca.execution import AlpacaExecutionClientConfig
 from canon_alpaca.execution import fill_report
 from canon_alpaca.factories import AlpacaDataClientFactory
 from canon_alpaca.factories import AlpacaExecutionClientFactory
+from canon_alpaca.providers import TimeoutAdapter
 from canon_alpaca.providers import with_http_timeout
 from nautilus_trader.common import Environment
 from nautilus_trader.common import Logger
@@ -357,7 +360,7 @@ async def until_idle(client: AlpacaExecutionClient, venue: SimpleNamespace) -> N
             client._rest_lock.locked()
             or not venue.stream._messages.empty()
             or not client._updates.empty()
-            or client._applying
+            or not client._idle.is_set()
         ):
             await asyncio.sleep(0.01)
         for _ in range(
@@ -723,7 +726,8 @@ def test_cancel_whose_answer_timed_out_leaves_the_order(venue, capfd) -> None:
 
 
 class SilentServer:
-    """A local HTTP server that accepts each connection and, for `/hang`, never answers."""
+    """A local HTTP server that accepts each connection and, for `/hang`, never answers; Alpaca's fill
+    activities path it answers 200 with a body that is not JSON, as an intermediary's error page might."""
 
     def __init__(self) -> None:
         self.socket = socket.create_server(("127.0.0.1", 0))
@@ -751,6 +755,13 @@ class SilentServer:
                 request += chunk
             if b"/hang " in request:
                 self.held.append(connection)  # read, never answered
+                continue
+            if b"/account/activities/FILL" in request:
+                connection.sendall(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 13\r\n"
+                    b"Connection: close\r\n\r\n<html></html>"
+                )
+                connection.close()
                 continue
             connection.sendall(
                 b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n"
@@ -808,6 +819,63 @@ def test_a_request_alpaca_never_answers_ends_at_the_read_timeout_and_the_run_end
     assert waited < 5
     assert answer == {}
     assert elapsed < 20, f"the node's run took {elapsed:.1f} s"  # it never ended before the timeout
+
+
+def test_fill_history_answered_with_a_body_that_is_not_json_leaves_fills_inferred(
+    venue, capfd
+) -> None:
+    # alpaca-py's `get` returns `response.json()` for a 200; requests raises its `JSONDecodeError`,
+    # which is both an `OSError` and a `ValueError`, so the history counts as unread.
+    server = SilentServer()
+    rest = with_http_timeout(
+        RESTClient(
+            base_url=f"http://127.0.0.1:{server.port}",
+            api_version="v2",
+            api_key=PLACEHOLDER,
+            secret_key=PLACEHOLDER,
+        )
+    )
+    reports: list[object] = []
+
+    async def body(client: AlpacaExecutionClient) -> None:
+        trading = client._trading
+        client._trading = rest  # ty: ignore[invalid-assignment] - `get` is all the fill history uses
+        try:
+            reports.append(await client._fill_reports(fills_command()))
+        finally:
+            client._trading = trading
+
+    try:
+        run_with_client(body)
+    finally:
+        server.close()
+
+    assert reports == [[]]
+    assert "fills are inferred from the order reports" in logged(capfd)
+
+
+def test_with_http_timeout_mounts_its_own_timeout_on_both_schemes() -> None:
+    # A session holding this package's adapter with another timeout, or on HTTPS only, gets the
+    # (3.05, 27) adapter on both schemes (ADR 0039); one already holding it keeps the same adapter.
+    session = requests.Session()
+    session.mount("https://", TimeoutAdapter((999.0, 999.0)))
+    client = with_http_timeout(SimpleNamespace(_session=session))
+    expected = (
+        canon_alpaca.providers.CONNECT_TIMEOUT_SECS,
+        canon_alpaca.providers.READ_TIMEOUT_SECS,
+    )
+    adapter = session.adapters["https://"]
+    assert isinstance(adapter, TimeoutAdapter) and adapter.timeout == expected
+    assert session.adapters["http://"] is adapter
+
+    with_http_timeout(client)
+    assert session.adapters["https://"] is adapter and session.adapters["http://"] is adapter
+
+    session = requests.Session()
+    session.mount("https://", TimeoutAdapter(expected))
+    with_http_timeout(SimpleNamespace(_session=session))
+    assert isinstance(session.adapters["http://"], TimeoutAdapter)
+    assert session.adapters["http://"] is session.adapters["https://"]
 
 
 def test_a_client_without_a_requests_session_is_refused() -> None:
@@ -1782,29 +1850,47 @@ def test_older_filled_orders_and_no_position_at_alpaca_end_start_up_flat(
     assert order is not None and order.status == OrderStatus.FILLED
 
 
-def test_fills_alpaca_has_not_all_listed_are_left_to_the_engine(venue, alpaca) -> None:
-    # Seen on paper: a node started a second after the last fill found only the first of two listed.
-    filled = alpaca.alpaca_order(
-        id="0d5e6a3b-6f3c-4c1e-9d3e-1a2b3c4d5e6f",
-        client_order_id="filled-before-start",
-        type="market",
-        order_type="market",
-        limit_price=None,
-        status="filled",
-        filled_qty="2",
-        filled_avg_price="174.78",
-    )
-    a_second_ago = datetime.now(UTC) - timedelta(seconds=1)
+FILLED_TWO = {
+    "id": "0d5e6a3b-6f3c-4c1e-9d3e-1a2b3c4d5e6f",
+    "client_order_id": "filled-before-start",
+    "type": "market",
+    "order_type": "market",
+    "limit_price": None,
+    "status": "filled",
+    "filled_qty": "2",
+    "filled_avg_price": "174.78",
+}
+"""A market buy of 2, filled before start, as Alpaca's order endpoint shows it."""
+
+
+@pytest.mark.parametrize(
+    ("age", "fields"),
+    [
+        (timedelta(seconds=1), {}),  # seen on paper: a node started a second after the last fill
+        (timedelta(seconds=120), {}),  # a lag longer than a minute
+        (timedelta(days=1), {}),
+        (timedelta(seconds=1), {"cum_qty": None, "leaves_qty": None}),  # the two fields absent
+    ],
+    ids=["1s", "120s", "1d", "no-cum-or-leaves"],
+)
+def test_fills_alpaca_has_not_all_listed_are_left_to_the_engine(venue, alpaca, age, fields) -> None:
+    # Only the first of two fills is listed; Alpaca's order shows both. Whatever the listed fill's age,
+    # and whether or not it carries `cum_qty` and `leaves_qty`, its report is dropped and the engine
+    # infers the order's fills, rather than taking one listed fill and inferring the rest.
+    filled = alpaca.alpaca_order(**FILLED_TWO)
     first = alpaca.fill_activity(
         filled,
         str(uuid.UUID(int=1)),
         1,
         "174.7",
-        a_second_ago,
+        datetime.now(UTC) - age,
         "partial_fill",
         cum_qty=1,
         leaves_qty=1,
     )
+    for name, value in fields.items():
+        if value is None:
+            del first[name]
     venue.trading.orders = [filled]
     venue.trading.positions = [alpaca.POSITION_AAPL]  # long 2
     venue.trading.activities = [first]
@@ -1817,6 +1903,210 @@ def test_fills_alpaca_has_not_all_listed_are_left_to_the_engine(venue, alpaca) -
     fills = [e for e in order.events() if type(e).__name__ == "OrderFilled"]
     assert str(uuid.UUID(int=1)) not in [f.trade_id.value for f in fills]
     assert sum(f.last_qty.as_double() for f in fills) == 2
+
+
+def test_an_order_whose_listed_fills_alpaca_shows_as_all_its_fills_keeps_them(
+    venue, alpaca
+) -> None:
+    # Filled 1 of 2 and then canceled, a day ago: its one fill leaves a share, and Alpaca's order shows 1
+    # filled, so the listed fill is all of them and is reported.
+    order = alpaca.alpaca_order(
+        **{**FILLED_TWO, "status": "canceled", "filled_qty": "1", "filled_avg_price": "174.7"}
+    )
+    venue.trading.orders = [order]
+    venue.trading.activities = [
+        alpaca.fill_activity(
+            order,
+            str(uuid.UUID(int=1)),
+            1,
+            "174.7",
+            datetime.now(UTC) - timedelta(days=1),
+            "partial_fill",
+            cum_qty=1,
+            leaves_qty=1,
+        )
+    ]
+    reports: list = []
+    lookups: list[object] = []
+
+    async def body(client: AlpacaExecutionClient) -> None:
+        get_order_by_id = venue.trading.get_order_by_id
+
+        def counted_lookup(order_id: object):
+            lookups.append(order_id)
+            return get_order_by_id(order_id)
+
+        venue.trading.get_order_by_id = counted_lookup
+        reports.extend(await client._fill_reports(fills_command()))
+
+    run_with_client(body)
+
+    assert [r.trade_id.value for r in reports] == [str(uuid.UUID(int=1))]
+    assert lookups == [order["id"]]
+
+
+def test_an_order_whose_last_fill_is_listed_costs_no_order_lookup(venue, alpaca) -> None:
+    # The cost of the completeness check: an order whose newest listed fill leaves nothing to fill, and
+    # whose listed fills add up to its `cum_qty`, is shown complete by the activities alone.
+    filled = alpaca.alpaca_order(**FILLED_TWO)
+    at = datetime.now(UTC) - timedelta(days=1)
+    venue.trading.activities = [
+        alpaca.fill_activity(
+            filled, str(uuid.UUID(int=1)), 1, "174.7", at, "partial_fill", cum_qty=1, leaves_qty=1
+        ),
+        alpaca.fill_activity(
+            filled, str(uuid.UUID(int=2)), 1, "174.86", at + timedelta(seconds=2), cum_qty=2
+        ),
+    ]
+    reports: list = []
+
+    async def body(client: AlpacaExecutionClient) -> None:
+        def no_lookup(order_id: object):
+            raise AssertionError(f"looked up {order_id}")
+
+        venue.trading.get_order_by_id = no_lookup
+        reports.extend(await client._fill_reports(fills_command()))
+
+    run_with_client(body)
+
+    assert [r.trade_id.value for r in reports] == [str(uuid.UUID(int=2)), str(uuid.UUID(int=1))]
+
+
+def test_several_orders_to_check_are_read_in_one_request(venue, alpaca) -> None:
+    # Two orders, each filled 1 of 2 and then canceled: their fills are checked against Alpaca's newest
+    # orders in one `get_orders`, not one `get_order_by_id` each.
+    at = datetime(2026, 11, 9, 15, 0, tzinfo=UTC)
+    orders = [
+        alpaca.alpaca_order(
+            **{
+                **FILLED_TWO,
+                "status": "canceled",
+                "filled_qty": "1",
+                "id": str(uuid.UUID(int=100 + i)),
+                "client_order_id": f"canceled-{i}",
+            }
+        )
+        for i in range(2)
+    ]
+    venue.trading.orders = orders
+    venue.trading.activities = [
+        alpaca.fill_activity(order, str(uuid.UUID(int=i + 1)), 1, "174.7", at, "partial_fill", 1, 1)
+        for i, order in enumerate(orders)
+    ]
+    reports: list = []
+
+    async def body(client: AlpacaExecutionClient) -> None:
+        def no_lookup(order_id: object):
+            raise AssertionError(f"looked up {order_id}")
+
+        venue.trading.get_order_by_id = no_lookup
+        venue.trading.order_queries.clear()
+        reports.extend(await client._fill_reports(fills_command()))
+
+    run_with_client(body)
+
+    assert sorted(r.trade_id.value for r in reports) == [
+        str(uuid.UUID(int=1)),
+        str(uuid.UUID(int=2)),
+    ]
+    (query,) = venue.trading.order_queries
+    assert query.status == QueryOrderStatus.ALL
+    assert query.symbols is None
+
+
+@pytest.mark.parametrize("listing", ["fails", "misses-one"])
+def test_orders_the_batch_read_does_not_give_are_read_one_by_one(venue, alpaca, listing) -> None:
+    at = datetime(2026, 11, 9, 15, 0, tzinfo=UTC)
+    orders = [
+        alpaca.alpaca_order(
+            **{
+                **FILLED_TWO,
+                "status": "canceled",
+                "filled_qty": "1",
+                "id": str(uuid.UUID(int=100 + i)),
+                "client_order_id": f"canceled-{i}",
+            }
+        )
+        for i in range(2)
+    ]
+    venue.trading.orders = orders
+    venue.trading.activities = [
+        alpaca.fill_activity(order, str(uuid.UUID(int=i + 1)), 1, "174.7", at, "partial_fill", 1, 1)
+        for i, order in enumerate(orders)
+    ]
+    reports: list = []
+    lookups: list[str] = []
+
+    async def body(client: AlpacaExecutionClient) -> None:
+        get_order_by_id = venue.trading.get_order_by_id
+
+        def counted_lookup(order_id: object):
+            lookups.append(str(order_id))
+            return get_order_by_id(order_id)
+
+        def listed(filter: object = None) -> list:
+            if listing == "fails":
+                raise requests.ReadTimeout("read timed out")
+            return [AlpacaOrder(**orders[0])]
+
+        venue.trading.get_order_by_id = counted_lookup
+        venue.trading.get_orders = listed
+        reports.extend(await client._fill_reports(fills_command()))
+
+    run_with_client(body)
+
+    assert sorted(r.trade_id.value for r in reports) == [
+        str(uuid.UUID(int=1)),
+        str(uuid.UUID(int=2)),
+    ]
+    expected = [o["id"] for o in orders] if listing == "fails" else [orders[1]["id"]]
+    assert lookups == expected
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        {"status": "a status alpaca-py does not know"},  # pydantic's ValidationError, a ValueError
+        None,  # an empty body: alpaca-py returns None and builds `Order(**None)`, a TypeError
+    ],
+    ids=["unknown-value", "empty-body"],
+)
+def test_an_order_alpaca_answers_in_a_shape_alpaca_py_refuses_leaves_fills_inferred(
+    venue, alpaca, capfd, answer
+) -> None:
+    # alpaca-py's `get_order_by_id` returns `Order(**response)`: an order Alpaca answers in a shape
+    # 0.45.0 cannot build must not fail start-up from the fill check.
+    filled = alpaca.alpaca_order(**FILLED_TWO)
+    venue.trading.orders = [filled]
+    venue.trading.positions = [alpaca.POSITION_AAPL]  # long 2
+    venue.trading.activities = [
+        alpaca.fill_activity(
+            filled,
+            str(uuid.UUID(int=1)),
+            1,
+            "174.7",
+            datetime.now(UTC) - timedelta(seconds=1),
+            "partial_fill",
+            cum_qty=1,
+            leaves_qty=1,
+        )
+    ]
+
+    def unreadable(order_id: object):
+        if answer is None:
+            return AlpacaOrder(**cast("dict", answer))
+        return AlpacaOrder(**{**filled, **answer})
+
+    venue.trading.get_order_by_id = unreadable
+    node = build_node(trader(submit=False))
+
+    run(node)
+
+    order = node.cache.order(ClientOrderId("filled-before-start"))
+    assert order is not None and order.status == OrderStatus.FILLED
+    fills = [e for e in order.events() if type(e).__name__ == "OrderFilled"]
+    assert str(uuid.UUID(int=1)) not in [f.trade_id.value for f in fills]
+    assert "not read to check its fills" in logged(capfd)
 
 
 def test_fill_history_that_cannot_be_read_leaves_fills_inferred(venue, alpaca, capfd) -> None:
@@ -1975,6 +2265,37 @@ def test_fill_reports_page_through_alpacas_activities(venue, alpaca) -> None:
     first, second = venue.trading.activity_requests
     assert first == {"direction": "desc", "page_size": 100}
     assert second["page_token"].endswith(str(uuid.UUID(int=50)))  # the 100th, newest first
+
+
+def test_a_full_page_whose_last_activity_has_no_id_keeps_the_pages_fills(
+    venue, alpaca, capfd
+) -> None:
+    # Paging needs the last activity's `id` as `page_token`; without it the read stops, and the page's
+    # readable fills are still reported. 150 orders, one fill each, newest first.
+    start = datetime(2026, 11, 10, 15, 0, tzinfo=UTC)
+    activities = []
+    for i in range(150):
+        order = alpaca.alpaca_order(
+            id=str(uuid.UUID(int=1000 + i)), status="filled", filled_qty="1"
+        )
+        activities.append(
+            alpaca.fill_activity(
+                order, str(uuid.UUID(int=i)), 1, "174.78", start + timedelta(seconds=i)
+            )
+        )
+    del activities[50]["id"]  # the 100th newest, the last of the first page
+    venue.trading.activities = activities
+    reports: list = []
+
+    async def body(client: AlpacaExecutionClient) -> None:
+        venue.trading.activity_requests.clear()
+        reports.extend(await client._fill_reports(fills_command()))
+
+    run_with_client(body)
+
+    assert len(reports) == 99
+    assert len(venue.trading.activity_requests) == 1
+    assert "older fills, if any, are not reported" in logged(capfd)
 
 
 def test_fill_reports_stop_paging_before_the_window(venue, alpaca) -> None:
@@ -2190,6 +2511,129 @@ def test_shutdown_stops_and_joins_the_trade_stream_thread(venue) -> None:
     assert venue.stream.stopped.is_set()
     alive = [t.name for t in threading.enumerate() if t.name in venue.stream.run_threads]
     assert alive == []
+
+
+def timed_stop(
+    prepare: Callable[[AlpacaExecutionClient], None],
+) -> tuple[float, BaseException | None]:
+    """Start a hosted node, call `prepare` with its connected execution client, stop the node, and return
+    how long its run took to end after the stop, and what the run raised."""
+    clients: list[AlpacaExecutionClient] = []
+
+    class Capturing(AlpacaExecutionClientFactory):
+        @staticmethod
+        def create(**kwargs):
+            client = AlpacaExecutionClientFactory.create(**kwargs)
+            clients.append(client)
+            return client
+
+    node = build_node(trader(idle=True), exec_factory=Capturing)
+    outcome: list[tuple[float, BaseException | None]] = []
+
+    async def main() -> None:
+        task = asyncio.ensure_future(node.run_async())
+        handle = node.handle()
+        async with asyncio.timeout(10):
+            while not handle.is_running:
+                await asyncio.sleep(0.01)
+        prepare(clients[0])
+        handle.stop()
+        stopped = time.monotonic()
+        try:
+            await task
+            raised = None
+        except RuntimeError as e:  # how a hosted run reports a failed disconnect
+            raised = e
+        outcome.append((time.monotonic() - stopped, raised))
+
+    asyncio.run(main())
+    return outcome[0]
+
+
+def test_a_trade_update_task_that_does_not_end_when_cancelled_does_not_hold_the_disconnect(
+    venue, monkeypatch, capfd
+) -> None:
+    # The disconnect lets the task applying trade updates finish, then cancels it and waits for it; both
+    # waits are bounded, as NautilusTrader's own adapters bound their task drains
+    # (`TaskGroup::finish_shutdown`).
+    monkeypatch.setattr(canon_alpaca.execution, "TASK_ABORT_SECS", 0.2)
+    released = threading.Event()
+    timer = threading.Timer(8, released.set)
+
+    def prepare(client: AlpacaExecutionClient) -> None:
+        async def stubborn() -> None:
+            while not released.is_set():
+                try:
+                    await asyncio.sleep(0.05)
+                except asyncio.CancelledError:
+                    continue  # stands for an update whose application does not end at once
+
+        assert client._consumer is not None
+        client._consumer.cancel()
+        # On the loop directly: a task made with the client's `create_task` is also drained by
+        # NautilusTrader's own disconnect, within the node's `timeout_disconnection_secs`.
+        client._consumer = asyncio.get_running_loop().create_task(stubborn())
+        timer.start()
+
+    try:
+        took, raised = timed_stop(prepare)
+    finally:
+        released.set()
+        timer.cancel()
+
+    # The client gives up after its bound and says why; the node then waits out its own
+    # `timeout_disconnection_secs` (5 s here) for the engine, as it does for any failed disconnect.
+    # Unbounded, the client's wait held the disconnect until the node's timeout cut it off instead.
+    assert raised is not None and str(raised).startswith("Failed to disconnect execution clients")
+    assert "trade updates task did not end within 1.2 s of the disconnect" in logged(capfd)
+    assert took < 7, f"the run ended {took:.1f} s after the stop"
+
+
+@pytest.mark.parametrize(("apply_secs", "finished"), [(0.3, True), (5.0, False)])
+def test_an_update_being_applied_at_disconnect_gets_a_grace_period(
+    venue, monkeypatch, apply_secs, finished
+) -> None:
+    # Upstream's drain: the update being applied may finish within the grace bound (1 s here, as
+    # upstream's Coinbase adapter); past it, the task is cancelled.
+    outcome: list[str] = []
+
+    def prepare(client: AlpacaExecutionClient) -> None:
+        async def apply(update: object) -> None:
+            try:
+                await asyncio.sleep(apply_secs)
+                outcome.append("finished")
+            except asyncio.CancelledError:
+                outcome.append("cancelled")
+                raise
+
+        monkeypatch.setattr(client, "_apply_trade_update", apply)
+        client._updates.put_nowait(cast("Any", SimpleNamespace(event="fill")))
+
+    took, raised = timed_stop(prepare)
+
+    assert outcome == (["finished"] if finished else ["cancelled"])
+    assert raised is None
+    assert took < 4, f"the run ended {took:.1f} s after the stop"
+
+
+def test_a_busy_default_executor_does_not_hold_the_disconnect(venue) -> None:
+    # Every alpaca-py call runs in the node loop's default executor; a disconnect that needed a worker of
+    # its own to wait for the stream thread would wait for the executor first.
+    released = threading.Event()
+
+    def prepare(client: AlpacaExecutionClient) -> None:
+        loop = client._owner_loop
+        assert loop is not None
+        loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(max_workers=1))
+        loop.run_in_executor(None, released.wait, 8)  # a call that has not come back
+
+    try:
+        took, raised = timed_stop(prepare)
+    finally:
+        released.set()
+
+    assert raised is None
+    assert took < 4, f"the run ended {took:.1f} s after the stop"
 
 
 # -- the paper-only check, without a node ------------------------------------------------------------

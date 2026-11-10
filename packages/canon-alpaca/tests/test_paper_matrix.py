@@ -46,6 +46,7 @@ from canon_alpaca.constants import ENV_SECRET_KEY
 from canon_alpaca.execution import AlpacaExecutionClientConfig
 from canon_alpaca.factories import AlpacaDataClientFactory
 from canon_alpaca.factories import AlpacaExecutionClientFactory
+from canon_alpaca.providers import with_http_timeout
 from nautilus_trader.common import Environment
 from nautilus_trader.config import DataClientConfig
 from nautilus_trader.config import InstrumentProviderConfig
@@ -84,7 +85,9 @@ DONE = {"filled", "canceled", "expired", "rejected", "replaced"}
 
 
 def trading_client() -> TradingClient:
-    return TradingClient(os.environ[ENV_API_KEY], os.environ[ENV_SECRET_KEY], paper=True)
+    return with_http_timeout(
+        TradingClient(os.environ[ENV_API_KEY], os.environ[ENV_SECRET_KEY], paper=True)
+    )
 
 
 def require_session(client: TradingClient) -> None:

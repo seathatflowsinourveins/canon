@@ -60,6 +60,7 @@ from canon_alpaca.execution import AlpacaExecutionClientConfig
 from canon_alpaca.execution import order_status_report
 from canon_alpaca.factories import AlpacaDataClientFactory
 from canon_alpaca.factories import AlpacaExecutionClientFactory
+from canon_alpaca.providers import with_http_timeout
 from nautilus_trader.common import Environment
 from nautilus_trader.config import DataClientConfig
 from nautilus_trader.config import InstrumentProviderConfig
@@ -248,8 +249,10 @@ def alpaca_session(trading: TradingClient, now: datetime | None = None) -> str:
 
 def latest_iex_quote(max_age: timedelta) -> tuple[Decimal, Decimal] | None:
     """The latest IEX bid and ask for AAPL, or None if either side is missing or older than `max_age`."""
-    quote = StockHistoricalDataClient(
-        api_key=os.environ[ENV_API_KEY], secret_key=os.environ[ENV_SECRET_KEY]
+    quote = with_http_timeout(
+        StockHistoricalDataClient(
+            api_key=os.environ[ENV_API_KEY], secret_key=os.environ[ENV_SECRET_KEY]
+        )
     ).get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols="AAPL", feed=DataFeed.IEX))
     assert isinstance(quote, dict)
     q = quote["AAPL"]
@@ -476,8 +479,10 @@ def run_account_query() -> None:
 
 
 def paper_trading() -> TradingClient:
-    return TradingClient(
-        api_key=os.environ[ENV_API_KEY], secret_key=os.environ[ENV_SECRET_KEY], paper=True
+    return with_http_timeout(
+        TradingClient(
+            api_key=os.environ[ENV_API_KEY], secret_key=os.environ[ENV_SECRET_KEY], paper=True
+        )
     )
 
 

@@ -42,6 +42,7 @@ from canon_alpaca.constants import ENV_API_KEY
 from canon_alpaca.constants import ENV_SECRET_KEY
 from canon_alpaca.execution import AlpacaExecutionClientConfig
 from canon_alpaca.factories import AlpacaExecutionClientFactory
+from canon_alpaca.providers import with_http_timeout
 from nautilus_trader.common import Environment
 from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.live import LiveExecutionEngineConfig
@@ -160,7 +161,11 @@ def reconciled_fills(venue_order_id: str) -> tuple[OrderStatus | None, list]:
 
 
 def test_paper_startup_reconciliation_reports_alpacas_fills() -> None:
-    client = TradingClient(os.environ[ENV_API_KEY], os.environ[ENV_SECRET_KEY], paper=True)
+    client = (
+        with_http_timeout(  # so no request of the test's own can hold the paper lock (ADR 0039)
+            TradingClient(os.environ[ENV_API_KEY], os.environ[ENV_SECRET_KEY], paper=True)
+        )
+    )
     clock = client.get_clock()
     assert isinstance(clock, Clock), f"Alpaca answered {clock!r} for its clock"
     if not clock.is_open or clock.next_close - clock.timestamp < timedelta(minutes=10):
