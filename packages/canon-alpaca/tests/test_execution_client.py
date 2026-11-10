@@ -61,6 +61,8 @@ from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.config import LiveNodeConfig
 from nautilus_trader.core.datetime import dt_to_unix_nanos
 from nautilus_trader.live import LiveNode
+from nautilus_trader.model import AccountId
+from nautilus_trader.model import ClientId
 from nautilus_trader.model import ClientOrderId
 from nautilus_trader.model import InstrumentId
 from nautilus_trader.model import LiquiditySide
@@ -2098,6 +2100,78 @@ def test_account_state_is_reported_on_connect(venue) -> None:
     balance = account.balance()
     assert str(balance.total) == "122086.50 USD"
     assert str(balance.free) == "122086.50 USD"
+
+
+def test_query_account_reports_alpacas_account_again(venue) -> None:
+    # Alpaca's stream pushes no account update: a strategy's query reads the account and reports it.
+    strategy = trader(idle=True)
+    balances: list[str] = []
+
+    async def body(client) -> None:
+        venue.trading.account = {**venue.trading.account, "cash": "100000"}
+        strategy.query_account(ACCOUNT_ID, ClientId("ALPACA"))
+
+        def total() -> str:
+            account = client.cache.account(ACCOUNT_ID)
+            assert account is not None
+            return str(account.balance().total)
+
+        async with asyncio.timeout(10):
+            while total() != "100000.00 USD":
+                await asyncio.sleep(0.01)
+        balances.append(total())
+
+    run_with_client(body, strategy)
+
+    assert balances == ["100000.00 USD"]
+
+
+@pytest.mark.parametrize(
+    ("failure", "logged_as"),
+    [
+        (ConnectionError("connection reset"), "ConnectionError('connection reset')"),
+        (None, "InvalidOperation"),  # an unparsable `cash`
+    ],
+)
+def test_failed_account_query_leaves_the_state_as_it_was(venue, capfd, failure, logged_as) -> None:
+    strategy = trader(idle=True)
+    seen: list = []
+
+    async def body(client) -> None:
+        def state() -> tuple[str, int]:
+            account = client.cache.account(ACCOUNT_ID)
+            assert account is not None
+            return str(account.balance().total), len(account.events)
+
+        before = state()
+        if failure is not None:
+
+            def refuse() -> None:
+                raise failure
+
+            venue.trading.get_account = refuse
+        else:
+            venue.trading.account = {**venue.trading.account, "cash": "not a number"}
+        strategy.query_account(ACCOUNT_ID, ClientId("ALPACA"))
+        await until_idle(client, venue)
+        seen.append((before, state()))
+
+    run_with_client(body, strategy)
+
+    ((before, after),) = seen
+    assert after == before
+    text = logged(capfd)
+    assert "Alpaca account query failed:" in text
+    assert logged_as in text
+
+
+def test_query_for_another_account_is_refused(venue, capfd) -> None:
+    async def body(client) -> None:
+        await client._query_account(SimpleNamespace(account_id=AccountId("OTHER-001")))
+
+    run_with_client(body)
+
+    assert "Account query for OTHER-001: this client holds ALPACA-PAPER only" in logged(capfd)
 
 
 def test_alpaca_trading_clients_are_built_for_paper(venue) -> None:

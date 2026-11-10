@@ -3,7 +3,7 @@
 Contract: `nautilus_trader.live.clients.ExecutionClient`, NautilusTrader v2.0.0rc8 (Python adapter guide,
 "Execution client hooks", https://nautilustrader.io/docs/md/latest/developer_guide/python_adapters.md). The
 client is constructed with the factory's name, config, cache, clock and trader ID and with a venue, account
-ID, account type and OMS type. It overrides `_submit_order`, `_modify_order`, `_cancel_order`,
+ID, account type and OMS type. It overrides `_submit_order`, `_modify_order`, `_cancel_order`, `_query_account`,
 `_cancel_all_orders` and the four reconciliation hooks, emits account, order and fill events through the
 base class's `generate_*`
 methods, and leaves `_batch_cancel_orders` to its default, "ordered calls of the corresponding
@@ -111,7 +111,11 @@ Known limits:
 * A limit price at or above $1.00 with more than 2 decimals, or below $1.00 with more than 4, is denied
   here: Alpaca rejects it ("Sub-penny increments for limit orders", same page).
 * The account is a NautilusTrader cash account holding Alpaca's `cash` as its USD balance, all of it free,
-  read at connect only; cash finer than a cent is reported to the cent with a warning. Buying power, margin and shorting are not modelled.
+  read at connect and on `QueryAccount` (a strategy's `query_account`), as upstream's Kraken spot,
+  Coinbase, Binance spot and Bybit adapters fetch their venue's account on a query; Alpaca's stream pushes
+  no account update, and NautilusTrader keeps a reported cash account's balance as reported
+  (`calculate_account_state` off), so the balance is stale between reads (ADR 0036). Cash finer than a
+  cent is reported to the cent with a warning. Buying power, margin and shorting are not modelled.
 * No commission: Alpaca's trade updates carry none, so fills pass `None` and NautilusTrader's own fallback
   applies. No liquidity side: Alpaca reports none, so fills are `NO_LIQUIDITY_SIDE`.
 * A fill's trade ID is Alpaca's `execution_id`, which the stream page shows in its example but does not
@@ -840,6 +844,24 @@ class AlpacaExecutionClient(ExecutionClient):
         if thread is not None and thread.is_alive():
             raise RuntimeError(
                 f"Alpaca trade updates thread did not stop within {STREAM_JOIN_TIMEOUT_SECS} s",
+            )
+
+    @override
+    async def _query_account(self, command: live.QueryAccount) -> None:
+        """Read Alpaca's account and report its state, as at connect (Python adapter guide, "Query":
+        `_query_account`). A query for an account this client does not hold is refused with a log line."""
+        if command.account_id is not None and command.account_id != ACCOUNT_ID:
+            self._log.error(
+                f"Account query for {command.account_id}: this client holds {ACCOUNT_ID} only; nothing read"
+            )
+            return
+        try:
+            await self._report_account()
+        except (APIError, OSError, ValueError, TypeError, RuntimeError, ArithmeticError) as e:
+            # A failed read, a raw or unparsable answer (an unparsable `cash` is a decimal error), or a
+            # client not connected: the state is left as it was.
+            self._log.error(
+                f"Alpaca account query failed: {e!r}; the account state is left as it was"
             )
 
     async def _report_account(self) -> None:

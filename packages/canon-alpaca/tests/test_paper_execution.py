@@ -49,6 +49,7 @@ from alpaca.trading.enums import QueryOrderStatus
 from alpaca.trading.enums import TimeInForce as AlpacaTimeInForce
 from alpaca.trading.models import Order as AlpacaOrder
 from alpaca.trading.models import Position as AlpacaPosition
+from alpaca.trading.models import TradeAccount
 from alpaca.trading.requests import GetCalendarRequest
 from alpaca.trading.requests import GetOrdersRequest
 from alpaca.trading.requests import LimitOrderRequest
@@ -407,6 +408,71 @@ def test_paper_extended_hours_order_fills_and_is_closed() -> None:
     assert cleaned == {"orders": 0, "positions": 0}, (session, cleaned, strategy.names())
     assert strategy.names().count("OrderFilled") >= 2, (session, strategy.names())
     assert "OrderRejected" not in strategy.names() and "OrderDenied" not in strategy.names()
+
+
+def test_paper_account_query_matches_alpacas_cash() -> None:
+    """A strategy's `query_account` through a node (ADR 0036): the client reads Alpaca's account again and the
+    node's USD balance is Alpaca's `cash` to the cent, as `get_account` gives it directly while the node runs.
+    Places nothing, and runs only while the account holds no AAPL order or position, as the others do."""
+    with aapl_left_as_found() as cleaned:
+        run_account_query()
+    assert cleaned == {"orders": 0, "positions": 0}, cleaned
+
+
+def run_account_query() -> None:
+
+    class Idle(Strategy):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = False
+
+        def on_start(self) -> None:
+            self.started = True
+
+    node = paper_node()
+    strategy = Idle()
+    node.add_strategy(strategy)
+    cache = node.cache
+    totals: list[str] = []
+    cash: list[Decimal] = []
+
+    def node_account() -> Any:
+        held = cache.account(ACCOUNT_ID)
+        assert held is not None, "the node holds no ALPACA-PAPER account"
+        return held
+
+    async def main() -> None:
+        task = asyncio.ensure_future(node.run_async())
+
+        async def until(done: Callable[[], bool]) -> None:
+            while not done():
+                if task.done():
+                    task.result()  # the node's own error, if it stopped with one
+                    raise AssertionError("the node stopped before the account query was answered")
+                await asyncio.sleep(0.1)
+
+        try:
+            async with asyncio.timeout(60):
+                await until(lambda: strategy.started)
+                before = len(node_account().events)
+                strategy.query_account(ACCOUNT_ID, ClientId("ALPACA"))
+                await until(lambda: len(node_account().events) > before)
+                totals.append(str(node_account().balance().total))
+                # Alpaca's account, read directly while the node still runs.
+                direct = await asyncio.to_thread(paper_trading().get_account)
+                assert isinstance(direct, TradeAccount)
+                cash.append(Decimal(str(direct.cash)).quantize(Decimal("0.01")))
+        finally:
+            if not task.done():
+                node.handle().stop()
+            await asyncio.wait_for(asyncio.shield(task), 45)  # the node's stop is bounded too
+
+    try:
+        asyncio.run(main())
+    finally:
+        node.dispose()
+
+    assert totals == [f"{cash[0]} USD"], (totals, cash)
 
 
 def paper_trading() -> TradingClient:
