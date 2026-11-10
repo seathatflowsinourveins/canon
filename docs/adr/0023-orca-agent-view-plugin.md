@@ -48,13 +48,13 @@ What the module does, read in full at Orca 1.4.255:
 * It reads `keybindings.json`, an endpoint file Orca names and six environment variables. It writes
   nothing and starts no process.
 
-The handover to this session said the module posts subagent events; it posts none. Orca itself writes a
+It posts no subagent event. Orca itself writes a
 `ctrl+alt+g` binding into `keybindings.json`, and a marker file, in every Claude config folder it knows.
 
 The risk is not what this version does. Claude Code's docs say a setup with no managed settings and no
 Team or Enterprise login has no built-in guard, and there "the mod can approve a call that a deny rule
 refuses or a `PreToolUse` hook blocked" and "you aren't prompted when the mod approves a call that an ask
-rule ... would prompt for". This machine is that setup: no managed settings, and a Max plan. A mod's own
+rule ... would prompt for". This machine is that setup. A mod's own
 file, process and network calls are outside permission rules in every setup. Orca rewrites the plugin with
 the app, about once a day, and starts sessions with permissions bypassed (ADR 0018). So a later version of
 this module could approve a push that ADR 0020 leaves to an `ask` rule, or a read this repo denies. Orca's
@@ -119,8 +119,8 @@ Read 2026-11-10. `fetched`: downloaded whole with `curl` and read, not summarise
   `managed-mcp.json` file or "`/login` credentials for a Team or Enterprise plan"; permission rules do
   not apply to "a mod's `$.fs` and `$.process` calls" (`fetched`).
 * https://code.claude.com/docs/en/managed-settings.md — macOS: `/Library/Application Support/ClaudeCode/`
-  and the domain `com.anthropic.claudecode` (`fetched`). Neither exists here; `claude auth status` gives
-  the plan as `max` (run on this machine).
+  and the domain `com.anthropic.claudecode` (`fetched`). Neither of the guard's two conditions holds on
+  the machine this was read on (run there).
 * `~/.orca/agent-hooks/claude-hook.sh` — passes back an answer for `PreToolUse` only (read).
 * Second reader, 2026-11-10 (`evidence-verifier`): it found the guard's conditions decided for this
   machine, the `deny` half of the risk, that Orca's hooks cannot answer an `ask` rule, the posts and
