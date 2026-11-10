@@ -30,6 +30,8 @@ use, hidden errors, silent fallbacks. Which data sources and tools?
 Chosen: **option 4**.
 
 **Tier 1, built in, no setup.** `/usage` (spend and cache hit rate), `/context`, `/insights`, `/doctor`.
+The settings template also sets `showThinkingSummaries`, so a session's reasoning can be read with
+`Ctrl+O` (added 2026-11-10 at the owner's request; it changes what is shown, not what is generated).
 
 **Tier 2, local ledger, installed machine-wide from `home/`.**
 
@@ -112,6 +114,9 @@ Read 2026-11-09 (fetched; fetches are model-summarised).
 * https://code.claude.com/docs/en/settings.md — telemetry export variables are ignored from project and
   local settings files.
 * https://code.claude.com/docs/en/costs.md — `/usage` reports prompt-cache hit rate.
+* https://code.claude.com/docs/en/settings-reference.md — `showThinkingSummaries`: default `false`, when
+  "the Anthropic API redacts thinking blocks"; `true` gives "full thinking summaries when you expand
+  thinking with `Ctrl+O`"; "Redaction changes only what you see" (fetched 2026-11-10, not summarised).
 * https://github.com/anthropics/claude-code-monitoring-guide — collector, Prometheus and Grafana reference
   (resolved to `02777441f2a3`).
 * https://github.com/ryoppippi/ccusage — MIT, v20.0.48 (resolved to `8995f3b7fd71`).
