@@ -43,7 +43,7 @@ Chosen: **option 3**.
 
 How the weekly model run is started and bounded is ADR 0026: its mechanism, rules 1 and 2, the
 `Unattended guard` row and what was deferred. The `Unattended guard` row, the enforcement in rule 2 and
-the guard's consequence are superseded by ADR 0020. Rules 3 to 5 stay here.
+the guard's consequence are there, and ADR 0020 supersedes them there. Rules 3 to 5 stay here.
 
 Rules:
 
@@ -83,7 +83,8 @@ first install crashed (a function shadowed the system `install`) and loaded noth
 
 Read 2026-11-09 (fetched; fetches are model-summarised). The permissions and settings line moved to ADR
 0026 when it was split from this record on 2026-11-10, with no change of decision; the lines below that
-support both records are kept in each.
+support both records are kept in each, and the 2026-11-10 restatement line names here only what this
+record holds.
 
 * https://code.claude.com/docs/en/desktop-scheduled-tasks.md — runs locally in a chosen folder; app must be
   running and the Mac awake; one catch-up run for a missed time within 7 days; each run is a fresh session;
@@ -100,7 +101,7 @@ support both records are kept in each.
   read-only, that the docs say hooks run in every mode, and that uninstall reversed everything install
   added. The status command's weekly row now says it can see only the task file.
 * Restated 2026-11-10 against `scripts/automation` and `.githooks/pre-push`: rule 5, the commit gate,
-  address check and watchdog rows, the rehearsal mode, and wording in Consequences and Confirmation.
+  address check and watchdog rows, the rehearsal mode, and wording in Confirmation.
 * https://code.claude.com/docs/en/hooks.md — `async: true` runs in the background and cannot block; an async
   `SessionStart` hook is allowed; `asyncRewake` wakes Claude on exit code 2 even when idle.
 * https://git-scm.com/docs/githooks — a non-zero exit from `pre-commit` aborts the commit; and
