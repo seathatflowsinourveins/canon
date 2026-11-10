@@ -306,6 +306,15 @@
       "sha": "b703b2c5e704341d61e367b9b940b77ed11dded0",
       "track": "tag:v3.14.10"
     },
+    "requests": {
+      "default_branch": "main",
+      "default_sha": "3c7baaa05ab4aa49cc819ce3a819d260de19c157",
+      "ref": "refs/tags/v2.34.2",
+      "repo": "psf/requests",
+      "resolved_at": "2026-11-10T21:03:36Z",
+      "sha": "6e83187b8feb273ed4c6cdab5efd8d54901dfab3",
+      "track": "tag:v2.34.2"
+    },
     "ruff": {
       "default_branch": "main",
       "default_sha": "25c2129f4ef1f0048b36c329502f57ee64ba6f53",

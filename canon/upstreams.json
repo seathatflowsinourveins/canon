@@ -242,6 +242,22 @@
       "pypi": "alpaca-py"
     },
     {
+      "id": "requests",
+      "field": "http-client",
+      "repo": "psf/requests",
+      "track": "tag:v2.34.2",
+      "role": "foundation",
+      "license": "Apache-2.0",
+      "why": "The HTTP library alpaca-py's REST clients use; already installed as alpaca-py's dependency, now imported directly by the Alpaca adapter for a transport adapter that gives every request a default timeout, which alpaca-py does not set (ADR 0039). The version is the one uv.lock already held.",
+      "evidence": [
+        "https://github.com/psf/requests",
+        "https://raw.githubusercontent.com/psf/requests/v2.34.2/docs/user/advanced.rst",
+        "https://raw.githubusercontent.com/psf/requests/v2.34.2/docs/user/quickstart.rst"
+      ],
+      "adr": "0039",
+      "pypi": "requests"
+    },
+    {
       "id": "alpaca-mcp-server",
       "field": "trading-venue",
       "repo": "alpacahq/alpaca-mcp-server",

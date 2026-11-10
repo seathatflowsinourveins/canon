@@ -61,12 +61,14 @@ source = { editable = "packages/canon-alpaca" }
 dependencies = [
     { name = "alpaca-py" },
     { name = "nautilus-trader" },
+    { name = "requests" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "alpaca-py", specifier = "==0.45.0" },
     { name = "nautilus-trader", specifier = "==2.0.0rc8" },
+    { name = "requests", specifier = "==2.34.2" },
 ]
 
 [[package]]

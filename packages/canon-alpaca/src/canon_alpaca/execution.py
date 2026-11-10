@@ -116,7 +116,12 @@ Known limits:
   cancel included, and the client cannot turn that off. What Alpaca answers a repeated `client_order_id`
   is not documented on the pages read (UNVERIFIED), so a submit refused with 403 or 422 is rejected only
   once Alpaca shows it does not hold the order, and a cancel refused with 422 only once Alpaca shows the
-  order neither canceled nor pending cancel. alpaca-py sets no HTTP timeout.
+  order neither canceled nor pending cancel.
+* alpaca-py sets no HTTP timeout; the client's `TradingClient` gets one, (3.05, 27) s, from a transport
+  adapter on alpaca-py's private `_session` (`providers.with_http_timeout`, ADR 0039). A connect timeout
+  on a call's only attempt proves nothing was sent, so a submit is rejected, a modify modify-rejected and
+  a cancel cancel-rejected, each "not sent" (NautilusTrader's policies, "Command outcomes"); any other
+  timeout is an unknown outcome, as above.
 * Start-up fails, by design, on an open order or position this slice cannot represent: a fractional
   position, or an open order that is not a simple whole-share US equity market, limit, stop or stop-limit
   order. An open stop is reported with its stop price as the trigger price and the node's trigger type, else
@@ -196,7 +201,10 @@ from .data import post
 from .data import weak_callback
 from .data import weak_coroutine
 from .providers import AlpacaInstrumentProvider
+from .providers import counted
 from .providers import credentials_from_env
+from .providers import not_sent
+from .providers import with_http_timeout
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable
@@ -409,6 +417,11 @@ def release_after[R](
             loop.call_soon_threadsafe(lock.release)
         except RuntimeError:
             pass  # the loop is closed, and the lock with it
+
+
+def not_sent_reason(error: BaseException) -> str:
+    """The reason for a command a connect timeout proves was never sent (ADR 0039)."""
+    return f"not sent: Alpaca's API did not accept the connection ({bounded(repr(error))})"
 
 
 def bounded(text: str) -> str:
@@ -664,6 +677,9 @@ class AlpacaExecutionClient(ExecutionClient):
                 self._trading = TradingClient(api_key=api_key, secret_key=secret_key, paper=True)
             if self._stream is None:
                 self._stream = TradingStream(api_key=api_key, secret_key=secret_key, paper=True)
+        with_http_timeout(
+            self._trading
+        )  # a client passed in too; refused without a session (ADR 0039)
         await self._provider.initialize()
         for instrument in self._provider.list_all():
             self._handle_instrument(instrument)
@@ -755,6 +771,14 @@ class AlpacaExecutionClient(ExecutionClient):
             )
             return
         except OSError as e:
+            if not_sent(e):
+                # A connect timeout on the call's only attempt: nothing reached Alpaca (ADR 0039).
+                self._reject(
+                    order,
+                    not_sent_reason(e),
+                    self.clock.timestamp_ns(),
+                )
+                return
             self._log_unknown_outcome(order.client_order_id, repr(e))
             return
         if not isinstance(placed, AlpacaOrder):
@@ -881,6 +905,15 @@ class AlpacaExecutionClient(ExecutionClient):
             )
             return
         except OSError as e:
+            if not_sent(e):
+                # A connect timeout on the cancel's only attempt: it never reached Alpaca (ADR 0039).
+                self.generate_order_cancel_rejected(
+                    order,
+                    venue_order_id,
+                    not_sent_reason(e),
+                    self.clock.timestamp_ns(),
+                )
+                return
             self._log.error(
                 f"Alpaca cancel for {client_order_id} got no answer ({e!r}); the order is left as it is",
             )
@@ -969,6 +1002,15 @@ class AlpacaExecutionClient(ExecutionClient):
             self._log_unknown_replace(order, f"HTTP {e.status_code}: {api_error_text(e)}")
             return
         except OSError as e:
+            if not_sent(e):
+                # A connect timeout on the replace's only attempt: it never reached Alpaca (ADR 0039).
+                self.generate_order_modify_rejected(
+                    order,
+                    venue_order_id,
+                    not_sent_reason(e),
+                    self.clock.timestamp_ns(),
+                )
+                return
             self._log_unknown_replace(order, repr(e))
             return
         if not isinstance(answer, AlpacaOrder):
@@ -1556,7 +1598,9 @@ class AlpacaExecutionClient(ExecutionClient):
         lock = self._rest_lock
         await lock.acquire()
         try:
-            call = asyncio.ensure_future(asyncio.to_thread(release_after, loop, lock, fn, *args))
+            call = asyncio.ensure_future(
+                asyncio.to_thread(release_after, loop, lock, counted(fn), *args)
+            )
         except BaseException:
             lock.release()
             raise
