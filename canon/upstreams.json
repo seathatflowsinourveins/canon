@@ -9,10 +9,11 @@
       "track": "tag:v2.1.321",
       "role": "platform",
       "license": "UNVERIFIED (LICENSE.md not read)",
-      "why": "The agent harness itself; its docs define every config layer this repo uses.",
+      "why": "The agent harness itself; its docs define every config layer this repo uses. The terminal CLI is installed at this pin and held at or above it (ADR 0022).",
       "evidence": [
         "https://github.com/anthropics/claude-code/releases",
-        "https://code.claude.com/docs/en/memory"
+        "https://code.claude.com/docs/en/memory",
+        "https://code.claude.com/docs/en/setup"
       ],
       "adr": "0003"
     },

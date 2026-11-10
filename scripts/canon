@@ -301,11 +301,12 @@ cmd_lint() {
     [ -z "$adr_out" ] || { err=1; echo "$adr_out"; }
   fi
   # 4. One pin, declared once. The registry says which version is adopted; uv.lock, mise.toml, the
-  #    bootstrap and the workflow files are where it is installed. They must agree, so a version bumped
+  #    bootstrap, the workflow files and the minimumVersion of the Claude Code settings template
+  #    (home/.claude/settings.json) are where it is installed. They must agree, so a version bumped
   #    in one place (by hand or by a bot) fails here until the registry and its ADR are updated too.
   #    A mise.toml request that is a release line ("3.14") or "latest" is compared through the exact
   #    version mise.lock records for it.
-  local want have locked repo wf b tools kind rest mv known name
+  local want have locked repo wf b tools kind rest mv known name ccpin ccmin
   tools=""
   [ -f "$ROOT/mise.toml" ] && tools=$(mise_tools)
   rows=$(reg_rows '.upstreams[] | select((.track // "") | startswith("tag:")) | select(.pypi != null or .mise != null)
@@ -348,6 +349,22 @@ cmd_lint() {
   if [ -n "$want" ]; then
     grep -q "^MISE_VERSION=\"$want\"" "$ROOT/scripts/bootstrap" 2>/dev/null \
       || { err=1; echo "lint: mise is $want in the registry but scripts/bootstrap sets a different MISE_VERSION"; }
+  fi
+  # The claude-code pin is the version scripts/bootstrap installs and the settings template's minimumVersion,
+  # so it must have the one shape the bootstrap reads: a release tag of dotted numbers (tag:v2.1.321).
+  ccpin=""
+  if [ "$(reg_rows '[.upstreams[] | select(.id == "claude-code")] | length')" != 0 ]; then
+    ccpin=$(reg_rows '[.upstreams[] | select(.id == "claude-code") | .track // "" | tostring] | first')
+    if [[ "$ccpin" =~ ^tag:v?[0-9]+(\.[0-9]+)*$ ]]; then ccpin="${ccpin#tag:}"; ccpin="${ccpin#v}"
+    else
+      err=1; echo "lint: claude-code must be tracked as a release tag of dotted numbers (tag:v<N>.<N>..., the shape scripts/bootstrap installs); found track '${ccpin:-nothing}'"
+      ccpin=""
+    fi
+  fi
+  if [ -n "$ccpin" ] && [ -f "$ROOT/home/.claude/settings.json" ]; then
+    ccmin=$(jq -r '.minimumVersion // "" | tostring' "$ROOT/home/.claude/settings.json" 2>/dev/null) || ccmin="(unreadable)"
+    [ "$ccmin" = "$ccpin" ] \
+      || { err=1; echo "lint: claude-code is $ccpin in the registry but home/.claude/settings.json has minimumVersion '${ccmin:-nothing}'"; }
   fi
   # Workflows: every line that mentions `uses` must be a block-style step key whose value is an action at a
   # full commit (an optional trailing comment allowed), a ./ or $/ reference, or a docker:// image.

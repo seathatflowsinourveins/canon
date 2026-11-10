@@ -66,6 +66,9 @@ defect-search runs also show Fable 5.2 alone scoring 1.6 to 5.9 points above Opu
 2.4 times the cost. The sources disagree because the workloads differ, which is why the table is a starting
 point.
 
+ADR 0022 adds a machine default, `fable`, for a session started with no model named. The lanes above are
+unchanged.
+
 ### Consequences
 
 * Good: caches survive; lanes are cheap where output is checkable; the table has an expiry date.

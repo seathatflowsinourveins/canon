@@ -6,7 +6,8 @@
 # https://code.claude.com/docs/en/statusline.md). Every script runs as a copy in a temp folder, with HOME,
 # CLAUDE_CONFIG_DIR and CANON_LAUNCHAGENTS_DIR pointed there and stubs first on PATH for launchctl,
 # osascript, mise, xcode-select, curl and claude, so nothing outside the temp folder is read or changed and
-# nothing reaches the network. A case that needs a macOS-only tool is skipped with a line saying so.
+# nothing reaches the network. The --install case for a missing CLI drops the claude stub from PATH and uses
+# a curl stub that serves an installer stub recording the version it was asked for. A case that needs a macOS-only tool is skipped with a line saying so.
 # Exit 0 if every case behaves as expected, 1 otherwise.
 # shellcheck disable=SC2016  # stub bodies and eval'd checks are single-quoted so they expand when they run
 set -uo pipefail
@@ -64,7 +65,7 @@ EOF
 printf '#!/bin/bash\necho "osascript $*" >> "$STUB/osascript.log"\n' > "$B/osascript"
 printf '#!/bin/bash\n[ "${1:-}" = -p ] && echo /Library/Developer/CommandLineTools\nexit 0\n' > "$B/xcode-select"
 printf '#!/bin/bash\n[ "${1:-}" = --version ] && { echo "curl stub"; exit 0; }\necho "curl stub: no network in tests" >&2\nexit 1\n' > "$B/curl"
-printf '#!/bin/bash\necho "claude stub"\n' > "$B/claude"
+printf '#!/bin/bash\ncat "$STUB/claude-version"\n' > "$B/claude"   # claude stub: --version from $STUB/claude-version
 chmod +x "$B"/*
 export STUB="$TMP/stub"; mkdir -p "$STUB"
 export PATH="$B:$PATH"
@@ -72,6 +73,8 @@ export HOME="$TMP/home"; mkdir -p "$HOME"
 unset CLAUDE_CONFIG_DIR CANON_LEDGER_HOME AUTOMATION_SKIP_LAUNCHD CANON_LAUNCHAGENTS_DIR
 PINNED=$(sed -n 's/^MISE_VERSION="v\([^"]*\)".*/\1/p' "$ROOT/scripts/bootstrap")
 echo "$PINNED macos-arm64 (stub)" > "$STUB/mise-version"
+CCPIN="2.1.321"   # the claude-code pin the bootstrap fixture's registry sets, whatever the real one is
+echo "$CCPIN (Claude Code)" > "$STUB/claude-version"
 
 # ---------- event ledger ----------
 echo "event ledger:"
@@ -226,7 +229,8 @@ fi
 
 # ---------- bootstrap ----------
 echo "bootstrap:"
-BS="$TMP/bs"; mkdir -p "$BS/scripts"; cp "$ROOT/scripts/bootstrap" "$BS/scripts/"; cp -R "$ROOT/home" "$BS/home"; : > "$BS/mise.toml"
+BS="$TMP/bs"; mkdir -p "$BS/scripts" "$BS/canon"; cp "$ROOT/scripts/bootstrap" "$BS/scripts/"; cp -R "$ROOT/home" "$BS/home"; : > "$BS/mise.toml"
+jq -n --arg t "tag:v$CCPIN" '{upstreams: [{id: "claude-code", track: $t}]}' > "$BS/canon/upstreams.json"
 bs() { "$BS/scripts/bootstrap" "$@" > "$TMP/bs.out" 2>&1; }
 C="$TMP/cfg dir"
 : > "$STUB/mise.log"
@@ -235,7 +239,21 @@ check "check probes tools with exec_auto_install off" eval 'grep "exec --" "$STU
 check "pinned mise version: ok"                   rowis "$TMP/bs.out" mise ok
 echo "2026.1.1 macos-arm64 (stub)" > "$STUB/mise-version"; bs --check; rc=$?
 check "other mise version: OUTDATED, exit 1"      eval 'rowis "$TMP/bs.out" mise OUTDATED && [ "$rc" != 0 ]'
-echo "$PINNED macos-arm64 (stub)" > "$STUB/mise-version"
+echo "$PINNED macos-arm64 (stub)" > "$STUB/mise-version"; bs --check
+check "claude CLI at the pin: ok, showing both"   eval 'rowis "$TMP/bs.out" "claude CLI" ok && grep -q "claude CLI .*$CCPIN; pinned $CCPIN" "$TMP/bs.out"'
+echo "9999.0.0 (Claude Code)" > "$STUB/claude-version"; bs --check
+check "claude CLI above the pin (9999.0.0): ok"   eval 'rowis "$TMP/bs.out" "claude CLI" ok && grep -q "claude CLI .*pinned $CCPIN" "$TMP/bs.out"'
+echo "2.2.0 (Claude Code)" > "$STUB/claude-version"; bs --check
+check "claude CLI above the pin with a lower last field (2.2.0): ok" rowis "$TMP/bs.out" "claude CLI" ok
+echo "0.0.1 (Claude Code)" > "$STUB/claude-version"; bs --check; rc=$?
+check "claude CLI below the pin (0.0.1): BEHIND, exit 1" eval 'rowis "$TMP/bs.out" "claude CLI" BEHIND && [ "$rc" != 0 ]'
+check "... with the fix: claude install <pin>"    grep -q "run: claude install $CCPIN\$" "$TMP/bs.out"
+echo "2.1.99 (Claude Code)" > "$STUB/claude-version"; bs --check; rc=$?
+check "claude CLI below the pin as numbers, above it as text (2.1.99): BEHIND" \
+      eval 'rowis "$TMP/bs.out" "claude CLI" BEHIND && [ "$rc" != 0 ]'
+echo "Claude Code (dev build)" > "$STUB/claude-version"; bs --check; rc=$?
+check "claude CLI version unparseable: UNKNOWN, exit 1" eval 'rowis "$TMP/bs.out" "claude CLI" UNKNOWN && [ "$rc" != 0 ]'
+echo "$CCPIN (Claude Code)" > "$STUB/claude-version"
 
 mkdir -p "$C/canon"; echo "# previous" > "$C/canon/ledger.sh"
 CLAUDE_CONFIG_DIR="$C" bs --user-config; rc=$?
@@ -264,6 +282,53 @@ bs --install; rc=$?
 want=$(printf 'eval "$("%s" activate zsh)"' "$B/mise")
 check "install writes the mise it used into ~/.zshrc" eval '[ "$rc" = 0 ] && grep -qxF "$want" "$HOME/.zshrc"'
 check "install ran mise install with that mise"   grep -q '^mise install' "$STUB/mise.log"
+
+check "install with a claude CLI at the pin runs no installer" eval '[ "$rc" = 0 ] && grep -q "Claude Code CLI $CCPIN (pinned $CCPIN)" "$TMP/bs.out"'
+
+# --install with no claude on PATH: a curl stub serves an installer stub that records its arguments and puts
+# a claude in ~/.local/bin that reports $STUB/installed-version, so nothing is downloaded
+B3="$TMP/bin-noclaude"; mkdir -p "$B3"
+for f in "$B"/*; do [ "${f##*/}" = claude ] || cp "$f" "$B3/"; done
+cat > "$B3/curl" <<'EOF'
+#!/bin/bash
+out=""; url=""
+while [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift ;; https://*) url="$1" ;; esac; shift; done
+echo "curl $url" >> "$STUB/curl.log"
+[ -n "$out" ] || exit 1
+cat > "$out" <<'INST'
+#!/bin/bash
+echo "installer $*" >> "$STUB/installer.log"
+mkdir -p "$HOME/.local/bin"
+printf '#!/bin/bash\ncat "%s/installed-version"\n' "$STUB" > "$HOME/.local/bin/claude"; chmod +x "$HOME/.local/bin/claude"
+INST
+EOF
+chmod +x "$B3/curl"
+P3="$B3"; IFS=: read -r -a dirs <<<"$PATH"
+for d in "${dirs[@]}"; do [ "$d" = "$B" ] || [ -x "$d/claude" ] || P3="$P3:$d"; done
+# inst_cli <version the installed CLI reports, or "none"> <version the installer leaves>: run --install
+inst_cli() {
+  rm -f "$HOME/.local/bin/claude"; : > "$STUB/curl.log"; : > "$STUB/installer.log"
+  if [ "$1" != none ]; then
+    mkdir -p "$HOME/.local/bin"
+    printf '#!/bin/bash\necho "%s (Claude Code)"\n' "$1" > "$HOME/.local/bin/claude"; chmod +x "$HOME/.local/bin/claude"
+  fi
+  echo "$2 (Claude Code)" > "$STUB/installed-version"
+  PATH="$P3" bs --install
+}
+inst_cli none "$CCPIN"; rc=$?
+check "install with no CLI fetches the Claude Code installer" eval '[ "$rc" = 0 ] && grep -qxF "curl https://claude.ai/install.sh" "$STUB/curl.log"'
+check "... and runs it for the registry's claude-code pin" grep -qxF "installer $CCPIN" "$STUB/installer.log"
+inst_cli 0.0.1 "$CCPIN"; rc=$?
+check "install with a CLI below the pin runs the installer for the pin" eval '[ "$rc" = 0 ] && grep -qxF "installer $CCPIN" "$STUB/installer.log"'
+inst_cli 0.0.1 0.0.1; rc=$?
+check "install that leaves the CLI below the pin: exit 1, saying so" \
+      eval '[ "$rc" != 0 ] && grep -q "Claude Code CLI is 0.0.1, still below the pin $CCPIN" "$TMP/bs.out"'
+inst_cli none "dev build"; rc=$?
+check "install that leaves an unreadable version: exit 1, saying so" \
+      eval '[ "$rc" != 0 ] && grep -q "cannot read a version from the Claude Code CLI" "$TMP/bs.out"'
+inst_cli 9999.0.0 0.0.1; rc=$?
+check "install with a CLI above the pin runs no installer" eval '[ "$rc" = 0 ] && [ ! -s "$STUB/installer.log" ]'
+rm -f "$HOME/.local/bin/claude"
 
 echo "test-lanes: $pass passed, $fail failed, $skipped skipped"
 [ "$fail" -eq 0 ]
