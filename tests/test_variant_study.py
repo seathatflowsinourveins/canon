@@ -180,8 +180,9 @@ def test_nothing_is_created_unless_asked(alpaca_bars: AlpacaBars, tmp_path: Path
         run_study(tmp_path / "catalog", name="s", ledger_path=tmp_path / "t.db", create=True)
 
 
+@pytest.mark.parametrize("with_sample", [True, False], ids=["sample written", "key only"])
 def test_a_key_whose_latest_record_did_not_run_is_run_again(
-    alpaca_bars: AlpacaBars, tmp_path: Path
+    alpaca_bars: AlpacaBars, tmp_path: Path, with_sample: bool
 ) -> None:
     write_both(alpaca_bars, tmp_path / "catalog")
     configs = grid(periods=SHORT)
@@ -197,10 +198,12 @@ def test_a_key_whose_latest_record_did_not_run_is_run_again(
     )
     key = key_of(configs[0])
     with open_study("s", ledger) as study:
-        # What a pass killed during its run leaves: a later record of the key, still RUNNING.
+        # What a pass killed during its run leaves: a later record of the key, still RUNNING, with
+        # its sample number, or killed between the key's write and the sample's, without it.
         left = study.ask()
         left.set_user_attr("config_key", key)
-        left.set_user_attr("sample", 0)
+        if with_sample:
+            left.set_user_attr("sample", 0)
         with pytest.raises(RankingStopped, match=f"{key}: no later record ran to the end"):
             rank(study)
 
@@ -273,3 +276,30 @@ def test_a_run_that_raises_is_recorded_failed_and_the_pass_goes_on(
     assert "engine error" in recorded.failed[0]
     assert isinstance(outcome, RankingStopped)
     assert f"{key_of(configs[0])}: no record ran to the end" in str(outcome)
+
+
+def test_a_completed_record_with_no_sample_number_is_not_a_run_of_its_key(
+    alpaca_bars: AlpacaBars, tmp_path: Path
+) -> None:
+    write_both(alpaca_bars, tmp_path / "catalog")
+    configs = grid(symbols=("SPY",), periods=SHORT)
+    ledger = tmp_path / "trials.db"
+    with create_ledger_study(
+        "s", start=START.isoformat(), end=END.isoformat(), path=ledger
+    ) as study:
+        # Another writer's record: the first key, told COMPLETE and traded, with no sample number.
+        stray = study.ask()
+        stray.set_user_attr("config_key", key_of(configs[0]))
+        stray.set_user_attr(OUTCOME, TRADED)
+        study.tell(stray, 0.1)
+
+    recorded, outcome = run_study(
+        tmp_path / "catalog", name="s", ledger_path=ledger, configs=configs, start=START, end=END
+    )
+
+    # As `rank` reads it, the stray is no run of the key, so the pass runs the key; `rank` still
+    # stops on the stray, which no run clears.
+    assert recorded is not None
+    assert len(recorded.recorded) == 2
+    assert isinstance(outcome, RankingStopped)
+    assert "not a sample number of the study" in str(outcome)
