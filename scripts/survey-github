@@ -13,7 +13,11 @@
 #   raw.githubusercontent.com                   file contents
 #
 # Limits, stated so the numbers are not over-read:
-#   * File checks are pattern matches on text, not a YAML parse.
+#   * File checks are pattern matches on text, not a YAML parse. Lines that are only a comment are
+#     ignored; a comment after code on the same line is ignored only when triggers are read.
+#   * Workflow triggers are read from the top-level `on:` key only: one event per line at the first
+#     indent (a key or a `- item`), an inline event name, or a flow list or mapping that closes on the
+#     `on:` line. A workflow whose triggers cannot be read that way is named in the row's `partial` list.
 #   * History is the last 100 commits reachable from the default branch and the pull requests they
 #     arrived through. For a busy repository that is a few days; for a quiet one, months.
 #   * Bypass lists, organisation-level settings and anything behind write access are not visible.
@@ -22,24 +26,38 @@
 # Usage:
 #   scripts/survey-github run <sample.json> <out.json>   sample: [{"repo": "owner/name", "group": "..."}]
 #   scripts/survey-github report <data.json>             print the convergence tables as markdown
-#   scripts/survey-github selftest                       check the summary arithmetic on fixed input
-# A repository that cannot be read is recorded with an error, never dropped, and the command then exits
-# 2. If fewer than four in five can be read, the output file is left as it was, the rows go to
-# <out.json>.partial and the command exits 1.
+#   scripts/survey-github selftest                       check the measurements and the summary on fixed input
+# A repository that cannot be read is recorded with an error, never dropped. One that is read except for
+# some files or calls lists what was missing in its `partial` field (workflow:<file>, docs-tree,
+# precommit, renovate, dependabot, template, history, rules, branch, triggers:<file>, agent-triggers),
+# and the report leaves it out of every row that needs what is missing.
+# Exit codes of `run`:
+#   0  written; every repository read in full
+#   1  not written: gh is not signed in, the sample cannot be read, or fewer than four in five
+#      repositories could be read (the rows then go to <out.json>.partial and <out.json> is left as it was)
+#   2  usage error
+#   3  written, but some repositories could not be read or were read in part
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 if command -v mise >/dev/null 2>&1; then MISE=$(command -v mise); else MISE="$HOME/.local/bin/mise"; fi
 gh() { (cd "$ROOT" && "$MISE" exec -- gh "$@"); }
 raw() { curl -fsSL --max-time 30 "https://raw.githubusercontent.com/$1/$2/$3" 2>/dev/null; }
 count() { grep -cE -- "$1" "$2" 2>/dev/null || true; }
+code() { grep -hvE '^[[:space:]]*#' "$@" 2>/dev/null; }   # the lines of the files that are not comments
 fail_row() { jq -n --arg r "$1" --arg g "$2" --arg e "$3" '{repo: $r, group: $g, error: $e}'; }
+unread() { partial="${partial}$1"$'\n'; }                  # adds to the caller's `partial` list
+list_json() { printf '%s' "$1" | jq -Rnc '[inputs | select(length > 0)]'; }
+usage() { echo "usage: scripts/survey-github run <sample.json> <out.json> | report <data.json> | selftest" >&2; exit 2; }
+
+# A coding agent started from a workflow: a known action, or a CLI in its non-interactive form.
+AGENT_RE='anthropics/claude-code(-base)?-action|openai/codex-action|google-github-actions/run-gemini-cli|google-gemini/gemini-cli-action|github(next)?/gh-aw|claude (-p|--print)|codex exec|gemini (-p|--prompt)|opencode (run|github)'
 
 # shellcheck disable=SC2016  # GraphQL variables, not shell
 HISTORY_QUERY='
 query($owner: String!, $name: String!, $n: Int!, $after: String) { repository(owner: $owner, name: $name) {
   mergeCommitAllowed squashMergeAllowed rebaseMergeAllowed autoMergeAllowed deleteBranchOnMerge
   defaultBranchRef { target { ... on Commit { history(first: $n, after: $after) { pageInfo { hasNextPage endCursor } nodes {
-    message parents { totalCount } author { name }
+    message parents { totalCount }
     associatedPullRequests(first: 1) { nodes {
       number merged createdAt mergedAt additions deletions
       author { __typename login } mergedBy { __typename login }
@@ -94,117 +112,139 @@ def ai_tools: [ (if test("noreply@anthropic\\.com|Generated with \\[?Claude Code
       median_commits:       ([$human[] | .commits.totalCount] | med) } }'
 
 # Prints the convergence tables. "converged" is two thirds or more of the repositories the row applies to;
-# "rare" is one fifth or fewer; anything between is "split".
+# "rare" is one fifth or fewer; anything between is "split". Each practice is judged once per repository
+# as x (yes), . (no), - (does not apply) or ? (needs something that could not be read); a summary row
+# counts x over x and ., and the per-repository table prints the same judgement.
 # shellcheck disable=SC2016  # jq program, not shell
 REPORT_JQ='
 def med: map(select(. != null)) | if length == 0 then null else (sort | .[(length / 2 | floor)]) end;
 def verdict(a; b): if b == 0 then "no data" elif a * 3 >= b * 2 then "converged" elif a * 5 <= b then "rare" else "split" end;
-def mark(f): if f then "x" else "." end;
 def share(a; b): if (b // 0) == 0 then null else (a * 100 / b | floor) end;
+def unread($deps): any((.partial // [])[]; . as $p | any($deps[]; . as $d | $p == $d or ($p | startswith($d + ":"))));
+def judge(f; g; $deps): if unread($deps) then "?" elif g then (if f then "x" else "." end) else "-" end;
+def known(g; $deps): judge(true; g; $deps) == "x";
+def cell: if . == "-" then "." else . end;
 def wf: .workflows.count > 0;
 def bot: .files.dependency_bot != null;
 def prs: (.pull_requests.n // 0) >= 10;
 def humanprs: (.pull_requests.human_authored // 0) >= 10;
 def checks: ((.branch_rules.required_checks // []) + (.classic_protection.contexts // [])) | unique;
+def ruleset: ((.branch_rules.types // []) | length) > 0;
+def perm_declared: judge(.workflows.with_any_permissions * 5 >= .workflows.count * 4; wf; ["workflow"]);
+def sha_pinned:    judge(.workflows.action_refs > 0 and .workflows.action_refs_sha_pinned * 10 >= .workflows.action_refs * 9; wf; ["workflow"]);
+def cancels:       judge(.workflows.with_cancel_in_progress > 0; wf; ["workflow"]);
+def aggregates:    judge(.workflows.aggregating_job; wf; ["workflow"]);
+def lints:         judge(.workflows.workflow_lint != null; wf; ["workflow", "precommit"]);
+def agent_ci:      judge((.workflows.agent_in_ci | length) > 0; wf; ["workflow"]);
+def template:      judge(.files.pr_template != null; true; ["docs-tree"]);
+def codeowners:    judge(.files.codeowners; true; ["docs-tree"]);
+def agents_md:     judge(.files.agents_md; true; []);
+def squash_only:   judge(.settings.squash == true and .settings.merge_commit == false and .settings.rebase == false; .settings != null; ["history"]);
+def linear:        judge(.history.merge_commit_pct == 0; .history.n > 0; ["history"]);
+def reviewed:      judge((.pull_requests.approved_pct // 0) >= 50; humanprs; ["history"]);
+def automerged:    judge((.pull_requests.auto_merge_pct // 0) >= 20; prs; ["history"]);
 [.repos[] | select(.error == null)] as $all
 | ($all | map(select(.group == "canon upstream"))) as $canon
-| def line($label; f; g):
-    ($all | map(select(g))) as $A | ($canon | map(select(g))) as $C
-    | ($A | map(select(f)) | length) as $a | ($C | map(select(f)) | length) as $c
-    | "| \($label) | \($a)/\($A | length) | \($c)/\($C | length) | \(verdict($a; $A | length)) |";
+| ($all | map(select((.partial // []) | length > 0))) as $partly
+| def tally($rows; j): ($rows | map(j)) as $v | [($v | map(select(. == "x")) | length), ($v | map(select(. == "x" or . == ".")) | length)];
+  def line($label; j):
+    tally($all; j) as [$a, $n] | tally($canon; j) as [$c, $m]
+    | "| \($label) | \($a)/\($n) | \($c)/\($m) | \(verdict($a; $n)) |";
   def head($title): "", "### \($title)", "", "| Practice | All | Canon upstreams | Verdict |", "|---|---|---|---|";
   "## GitHub practice survey, \(.surveyed_at[0:10])",
   "",
   "\($all | length) repositories read (\($canon | length) are upstreams this repo pins); \([.repos[] | select(.error != null)] | length) could not be read.",
+  ( if ($partly | length) > 0
+    then "Partly read, so left out of the rows that need what is missing: " + ($partly | map("\(.repo) (\(.partial | join(", ")))") | join("; ")) + "."
+    else empty end ),
   "Verdict: converged = two thirds or more of the repositories a row applies to; rare = one fifth or fewer; split = between.",
   ( ($all | map(select(.history.n < 100))) as $short
     | "Commits read per repository: 100 at \(($all | length) - ($short | length)) of \($all | length)"
       + (if ($short | length) > 0 then "; fewer at " + ($short | map("\(.repo) (\(.history.n))") | join(", ")) else "" end) + "." ),
   head("Workflow files (repositories that have any)"),
-  line("Has GitHub Actions workflows"; wf; true),
-  line("`permissions:` declared in 80% or more of workflow files, at either level"; .workflows.with_any_permissions * 5 >= .workflows.count * 4; wf),
-  line("- at workflow level in 80% or more"; .workflows.with_top_level_permissions * 5 >= .workflows.count * 4; wf),
-  line("External actions pinned by commit SHA (90% or more of references)"; .workflows.action_refs > 0 and .workflows.action_refs_sha_pinned * 10 >= .workflows.action_refs * 9; wf),
-  line("Workflow lockfile `.github/workflows/actions.lock`"; .workflows.lockfile == true; wf),
-  line("`cancel-in-progress` in at least one workflow"; .workflows.with_cancel_in_progress > 0; wf),
-  line("`persist-credentials: false` on half or more of checkouts"; .workflows.checkouts > 0 and .workflows.persist_credentials_false * 2 >= .workflows.checkouts; wf),
-  line("One job that aggregates the others (alls-green or `needs.*.result`)"; .workflows.aggregating_job; wf),
-  line("Workflow linter in CI or hooks (zizmor or actionlint)"; .workflows.workflow_lint != null; wf),
-  line("`merge_group` trigger present"; .workflows.merge_group_trigger; wf),
-  line("A coding agent runs in a workflow"; (.workflows.agent_in_ci | length) > 0; wf),
-  line("Labeler or stale bot workflow"; (.workflows.housekeeping | length) > 0; wf),
+  line("Has GitHub Actions workflows"; judge(wf; true; ["workflow"])),
+  line("`permissions:` declared in 80% or more of workflow files, at either level"; perm_declared),
+  line("- at workflow level in 80% or more"; judge(.workflows.with_top_level_permissions * 5 >= .workflows.count * 4; wf; ["workflow"])),
+  line("External actions pinned by commit SHA (90% or more of references)"; sha_pinned),
+  line("Workflow lockfile `.github/workflows/actions.lock`"; judge(.workflows.lockfile == true; wf; ["workflow"])),
+  line("`cancel-in-progress` in at least one workflow"; cancels),
+  line("`persist-credentials: false` on half or more of checkouts"; judge(.workflows.checkouts > 0 and .workflows.persist_credentials_false * 2 >= .workflows.checkouts; wf; ["workflow"])),
+  line("One job that aggregates the others (alls-green or `needs.*.result`)"; aggregates),
+  line("Workflow linter in CI or hooks (zizmor or actionlint)"; lints),
+  line("`merge_group` trigger present"; judge(.workflows.merge_group_trigger; wf; ["workflow"])),
+  line("Labeler or stale bot workflow"; judge((.workflows.housekeeping | length) > 0; wf; ["workflow"])),
   head("Automation in workflow files (repositories that have any)"),
-  line("`timeout-minutes` set somewhere"; .workflows.automation.timeouts == true; wf),
-  line("A `matrix:` in some workflow"; .workflows.automation.matrix == true; wf),
-  line("Caching by a known action or `cache:` input (a lower bound)"; .workflows.automation.cache == true; wf),
-  line("A scheduled (cron) workflow"; .workflows.automation.scheduled == true; wf),
-  line("A `workflow_call:` key (reusable workflows; a lower bound)"; .workflows.automation.reusable == true; wf),
-  line("Path filters or changed-file detection"; .workflows.automation.path_filter == true; wf),
-  line("Release automation by a known action or `gh release create` (a lower bound)"; .workflows.automation.release == true; wf),
-  line("`pull_request_target` used"; .workflows.automation.pull_request_target == true; wf),
-  line("Coverage upload"; .workflows.automation.coverage == true; wf),
-  line("Benchmarks in CI"; .workflows.automation.benchmarks == true; wf),
-  line("Auto-merge of pull requests, or Dependabot metadata, in a workflow (an upper bound)"; .workflows.automation.bot_automerge == true; wf),
-  line("Pull request title or commit message lint"; .workflows.automation.title_lint == true; wf),
-  line("A coding agent runs in a workflow"; (.workflows.agent_in_ci | length) > 0; wf),
-  line("- with an agent workflow triggered directly by a pull request event"; any(.workflows.agent_triggers[]?; .event | test("^pull_request")); wf),
-  line("- with one triggered by issues or comments"; any(.workflows.agent_triggers[]?; .event | test("^issue")); wf),
-  line("- with one triggered on a schedule or by another workflow"; any(.workflows.agent_triggers[]?; .event | test("schedule|workflow_run")); wf),
+  line("`timeout-minutes` set somewhere"; judge(.workflows.automation.timeouts == true; wf; ["workflow"])),
+  line("A `matrix:` in some workflow"; judge(.workflows.automation.matrix == true; wf; ["workflow"])),
+  line("Caching by a known action or `cache:` input (a lower bound)"; judge(.workflows.automation.cache == true; wf; ["workflow"])),
+  line("A scheduled (cron) workflow"; judge(.workflows.automation.scheduled == true; wf; ["workflow"])),
+  line("A `workflow_call:` key (reusable workflows; a lower bound)"; judge(.workflows.automation.reusable == true; wf; ["workflow"])),
+  line("Path filters or changed-file detection"; judge(.workflows.automation.path_filter == true; wf; ["workflow"])),
+  line("Release automation by a known action or `gh release create` (a lower bound)"; judge(.workflows.automation.release == true; wf; ["workflow"])),
+  line("`pull_request_target` used"; judge(.workflows.automation.pull_request_target == true; wf; ["workflow"])),
+  line("Coverage upload"; judge(.workflows.automation.coverage == true; wf; ["workflow"])),
+  line("Benchmarks in CI"; judge(.workflows.automation.benchmarks == true; wf; ["workflow"])),
+  line("Auto-merge of pull requests, or Dependabot metadata, in a workflow (an upper bound)"; judge(.workflows.automation.bot_automerge == true; wf; ["workflow"])),
+  line("Pull request title or commit message lint"; judge(.workflows.automation.title_lint == true; wf; ["workflow"])),
+  line("A coding agent runs in a workflow"; agent_ci),
+  line("- with an agent workflow triggered directly by a pull request event"; judge(any(.workflows.agent_triggers[]?; .event | test("^pull_request")); wf; ["workflow", "triggers", "agent-triggers"])),
+  line("- with one triggered by issues or comments"; judge(any(.workflows.agent_triggers[]?; .event | test("^issue")); wf; ["workflow", "triggers", "agent-triggers"])),
+  line("- with one triggered on a schedule or by another workflow"; judge(any(.workflows.agent_triggers[]?; .event | test("schedule|workflow_run")); wf; ["workflow", "triggers", "agent-triggers"])),
   head("Repository files"),
-  line("Dependency update bot configured"; bot; true),
-  line("- Renovate"; (.files.dependency_bot // "") | test("renovate"); true),
-  line("- Dependabot"; (.files.dependency_bot // "") | test("dependabot"); true),
-  line("Bot config sets a release cooldown"; .files.release_cooldown; bot),
-  line("Bot config mentions automerge"; .files.bot_automerge; bot),
-  line("Pull request template"; .files.pr_template != null; true),
-  line("CODEOWNERS"; .files.codeowners; true),
-  line("AGENTS.md at the root"; .files.agents_md; true),
-  line("CLAUDE.md at the root"; .files.claude_md; true),
-  line("Hook framework config (pre-commit, lefthook, husky)"; .files.hook_framework != null; true),
+  line("Dependency update bot configured"; judge(bot; true; [])),
+  line("- Renovate"; judge((.files.dependency_bot // "") | test("renovate"); true; [])),
+  line("- Dependabot"; judge((.files.dependency_bot // "") | test("dependabot"); true; [])),
+  line("Bot config sets a release cooldown"; judge(.files.release_cooldown; bot; ["renovate", "dependabot"])),
+  line("Bot config mentions automerge"; judge(.files.bot_automerge; bot; ["renovate"])),
+  line("Pull request template"; template),
+  line("CODEOWNERS"; codeowners),
+  line("AGENTS.md at the root"; agents_md),
+  line("CLAUDE.md at the root"; judge(.files.claude_md; true; [])),
+  line("Hook framework config (pre-commit, lefthook, husky)"; judge(.files.hook_framework != null; true; [])),
   head("Merge settings"),
-  line("Squash merge allowed"; .settings.squash == true; .settings != null),
-  line("Merge commits allowed"; .settings.merge_commit == true; .settings != null),
-  line("Rebase merge allowed"; .settings.rebase == true; .settings != null),
-  line("Squash is the only method allowed"; .settings.squash == true and .settings.merge_commit == false and .settings.rebase == false; .settings != null),
-  line("Auto-merge allowed"; .settings.auto_merge == true; .settings != null),
-  line("Head branch deleted on merge"; .settings.delete_branch_on_merge == true; .settings != null),
+  line("Squash merge allowed"; judge(.settings.squash == true; .settings != null; ["history"])),
+  line("Merge commits allowed"; judge(.settings.merge_commit == true; .settings != null; ["history"])),
+  line("Rebase merge allowed"; judge(.settings.rebase == true; .settings != null; ["history"])),
+  line("Squash is the only method allowed"; squash_only),
+  line("Auto-merge allowed"; judge(.settings.auto_merge == true; .settings != null; ["history"])),
+  line("Head branch deleted on merge"; judge(.settings.delete_branch_on_merge == true; .settings != null; ["history"])),
   head("Last 100 commits on the default branch"),
-  line("95% or more arrived through a pull request"; (.history.via_pull_request_pct // 0) >= 95; .history.n > 0),
-  line("No merge commits (linear history)"; .history.merge_commit_pct == 0; .history.n > 0),
-  line("Squash-style subjects: 80% or more end in `(#N)`"; (.history.pr_suffix_pct // 0) >= 80; .history.n > 0),
-  line("Conventional Commits prefix on 80% or more"; (.history.conventional_pct // 0) >= 80; .history.n > 0),
-  line("Conventional Commits prefix on 10% or fewer"; (.history.conventional_pct // 0) <= 10; .history.n > 0),
-  line("An AI co-author trailer or footer in at least one commit"; (.history.ai_marker_pct // 0) > 0; .history.n > 0),
-  line("`Signed-off-by` on 80% or more"; (.history.signed_off_pct // 0) >= 80; .history.n > 0),
+  line("95% or more arrived through a pull request"; judge((.history.via_pull_request_pct // 0) >= 95; .history.n > 0; ["history"])),
+  line("No merge commits (linear history)"; linear),
+  line("Squash-style subjects: 80% or more end in `(#N)`"; judge((.history.pr_suffix_pct // 0) >= 80; .history.n > 0; ["history"])),
+  line("Conventional Commits prefix on 80% or more"; judge((.history.conventional_pct // 0) >= 80; .history.n > 0; ["history"])),
+  line("Conventional Commits prefix on 10% or fewer"; judge((.history.conventional_pct // 0) <= 10; .history.n > 0; ["history"])),
+  line("An AI co-author trailer or footer in at least one commit"; judge((.history.ai_marker_pct // 0) > 0; .history.n > 0; ["history"])),
+  line("`Signed-off-by` on 80% or more"; judge((.history.signed_off_pct // 0) >= 80; .history.n > 0; ["history"])),
   head("Pull requests behind those commits (repositories with ten or more; human rows need ten human-authored)"),
-  line("Approving review on half or more of human-authored pull requests"; (.pull_requests.approved_pct // 0) >= 50; humanprs),
-  line("Author merged their own pull request in half or more of human-authored ones"; (.pull_requests.self_merged_pct // 0) >= 50; humanprs),
-  line("A bot account performed half or more of the merges"; (.pull_requests.merged_by_bot_pct // 0) >= 50; prs),
-  line("Auto-merge was enabled on a fifth or more"; (.pull_requests.auto_merge_pct // 0) >= 20; prs),
-  line("Merge queue used on any"; (.pull_requests.merge_queue_pct // 0) > 0; prs),
-  line("A fifth or more authored by bots"; (.pull_requests.bot_authored_pct // 0) >= 20; prs),
+  line("Approving review on half or more of human-authored pull requests"; reviewed),
+  line("Author merged their own pull request in half or more of human-authored ones"; judge((.pull_requests.self_merged_pct // 0) >= 50; humanprs; ["history"])),
+  line("A bot account performed half or more of the merges"; judge((.pull_requests.merged_by_bot_pct // 0) >= 50; prs; ["history"])),
+  line("Auto-merge was enabled on a fifth or more"; automerged),
+  line("Merge queue used on any"; judge((.pull_requests.merge_queue_pct // 0) > 0; prs; ["history"])),
+  line("A fifth or more authored by bots"; judge((.pull_requests.bot_authored_pct // 0) >= 20; prs; ["history"])),
   head("Default-branch protection a reader can see"),
-  line("Protected by a ruleset or classic protection"; ((.branch_rules.types // []) | length) > 0 or .classic_protection.protected == true; true),
-  line("- through rulesets"; ((.branch_rules.types // []) | length) > 0; true),
-  line("At least one required status check"; (checks | length) > 0; true),
-  line("One or two required checks in total"; (checks | length) >= 1 and (checks | length) <= 2; (checks | length) > 0),
-  line("An aggregating job, where a required check is visible"; .workflows.aggregating_job; (checks | length) > 0),
-  line("Ruleset requires linear history"; (.branch_rules.types // []) | index("required_linear_history") != null; ((.branch_rules.types // []) | length) > 0),
-  line("Ruleset requires one or more approvals"; (.branch_rules.approvals // 0) >= 1; ((.branch_rules.types // []) | length) > 0),
-  line("Ruleset allows squash only"; (.branch_rules.merge_methods // []) == ["squash"]; ((.branch_rules.types // []) | length) > 0),
-  line("Ruleset has a merge queue rule"; .branch_rules.merge_queue == true; ((.branch_rules.types // []) | length) > 0),
+  line("Protected by a ruleset or classic protection"; judge(ruleset or .classic_protection.protected == true; true; ["rules", "branch"])),
+  line("- through rulesets"; judge(ruleset; true; ["rules"])),
+  line("At least one required status check"; judge((checks | length) > 0; true; ["rules", "branch"])),
+  line("One or two required checks in total"; judge((checks | length) <= 2; (checks | length) > 0; ["rules", "branch"])),
+  line("An aggregating job, where a required check is visible"; judge(.workflows.aggregating_job; (checks | length) > 0; ["rules", "branch", "workflow"])),
+  line("Ruleset requires linear history"; judge((.branch_rules.types // []) | index("required_linear_history") != null; ruleset; ["rules"])),
+  line("Ruleset requires one or more approvals"; judge((.branch_rules.approvals // 0) >= 1; ruleset; ["rules"])),
+  line("Ruleset allows squash only"; judge((.branch_rules.merge_methods // []) == ["squash"]; ruleset; ["rules"])),
+  line("Ruleset has a merge queue rule"; judge(.branch_rules.merge_queue == true; ruleset; ["rules"])),
   "",
   "### Medians across repositories",
   "",
   "| Measure | Median | Range |",
   "|---|---|---|",
-  ( [ ["Share of external action references pinned by SHA (%)", [$all[] | select(wf) | share(.workflows.action_refs_sha_pinned; .workflows.action_refs)]],
-      ["Hours from opening to merge, human-authored", [$all[] | select(humanprs) | .pull_requests.median_hours_to_merge]],
-      ["Lines changed per human-authored pull request", [$all[] | select(humanprs) | .pull_requests.median_lines_changed]],
-      ["Commits per human-authored pull request", [$all[] | select(humanprs) | .pull_requests.median_commits]],
-      ["Pull requests authored by bots (%)", [$all[] | select(prs) | .pull_requests.bot_authored_pct]],
-      ["Human-authored pull requests with an approving review (%)", [$all[] | select(humanprs) | .pull_requests.approved_pct]],
-      ["Required status checks, where any are visible", [$all[] | (checks | length) | select(. > 0)]] ][]
+  ( [ ["Share of external action references pinned by SHA (%)", [$all[] | select(known(wf; ["workflow"])) | share(.workflows.action_refs_sha_pinned; .workflows.action_refs)]],
+      ["Hours from opening to merge, human-authored", [$all[] | select(known(humanprs; ["history"])) | .pull_requests.median_hours_to_merge]],
+      ["Lines changed per human-authored pull request", [$all[] | select(known(humanprs; ["history"])) | .pull_requests.median_lines_changed]],
+      ["Commits per human-authored pull request", [$all[] | select(known(humanprs; ["history"])) | .pull_requests.median_commits]],
+      ["Pull requests authored by bots (%)", [$all[] | select(known(prs; ["history"])) | .pull_requests.bot_authored_pct]],
+      ["Human-authored pull requests with an approving review (%)", [$all[] | select(known(humanprs; ["history"])) | .pull_requests.approved_pct]],
+      ["Required status checks, where any are visible", [$all[] | select(known(true; ["rules", "branch"])) | (checks | length) | select(. > 0)]] ][]
     | .[1] as $v | ($v | map(select(. != null))) as $w
     | "| \(.[0]) | \($v | med) | \($w | min) to \($w | max) (n=\($w | length)) |" ),
   "",
@@ -217,94 +257,104 @@ def checks: ((.branch_rules.required_checks // []) + (.classic_protection.contex
   "",
   "Columns: P workflow permissions, S SHA pins, C cancel-in-progress, A aggregating job, L workflow lint, G agent in CI,",
   "B dependency bot, T PR template, O CODEOWNERS, M AGENTS.md, Q squash-only setting, H linear history, R review norm, U auto-merge used.",
+  "Each mark is the judgement its summary row counts: x yes, . no or does not apply, ? not read.",
   "",
   "| Repository | Group | P | S | C | A | L | G | B | T | O | M | Q | H | R | U | via PR % | conv. % | checks |",
   "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
   ( $all[]
-    | "| \(.repo) | \(.group) | \(mark(wf and .workflows.with_any_permissions * 5 >= .workflows.count * 4)) | \(mark(.workflows.action_refs > 0 and .workflows.action_refs_sha_pinned * 10 >= .workflows.action_refs * 9)) | \(mark(.workflows.with_cancel_in_progress > 0)) | \(mark(.workflows.aggregating_job)) | \(mark(.workflows.workflow_lint != null)) | \(mark((.workflows.agent_in_ci | length) > 0)) | \(.files.dependency_bot // "." | .[0:3]) | \(mark(.files.pr_template != null)) | \(mark(.files.codeowners)) | \(mark(.files.agents_md)) | \(mark(.settings.squash == true and .settings.merge_commit == false and .settings.rebase == false)) | \(mark(.history.merge_commit_pct == 0)) | \(mark((.pull_requests.approved_pct // 0) >= 50)) | \(mark((.pull_requests.auto_merge_pct // 0) >= 20)) | \(.history.via_pull_request_pct // "-") | \(.history.conventional_pct // "-") | \(checks | length) |" ),
+    | "| \(.repo) | \(.group) | \(perm_declared | cell) | \(sha_pinned | cell) | \(cancels | cell) | \(aggregates | cell) | \(lints | cell) | \(agent_ci | cell) | \(.files.dependency_bot // "." | .[0:3]) | \(template | cell) | \(codeowners | cell) | \(agents_md | cell) | \(squash_only | cell) | \(linear | cell) | \(reviewed | cell) | \(automerged | cell) | \(.history.via_pull_request_pct // "-") | \(.history.conventional_pct // "-") | \(if unread(["rules", "branch"]) then "?" else (checks | length) end) |" ),
   ( [.repos[] | select(.error != null)] | if length > 0 then "", "Not read: " + (map("\(.repo) (\(.error))") | join(", ")) else empty end )'
 
-# fetch_history <repo> <dir>: writes <dir>/history.json, one GraphQL answer holding the newest 100 commits.
-# GitHub times out on 100 commits with their pull requests for large repositories, so they are read in
-# pages of 50, or of 25 if a page of 50 fails. A repository whose pages all fail is recorded as an error.
-fetch_history() {
-  local repo="$1" d="$2" size cursor i ok page
-  for size in 50 25; do
-    rm -f "$d"/page.*.json; cursor=""; i=0; ok=1
-    while [ $((i * size)) -lt 100 ]; do
-      i=$((i+1)); page="$d/page.$i.json"
-      if [ -n "$cursor" ]; then
-        gh api graphql -f query="$HISTORY_QUERY" -f owner="${repo%%/*}" -f name="${repo##*/}" -F n="$size" -f after="$cursor" > "$page" 2>/dev/null || { ok=0; break; }
-      else
-        gh api graphql -f query="$HISTORY_QUERY" -f owner="${repo%%/*}" -f name="${repo##*/}" -F n="$size" > "$page" 2>/dev/null || { ok=0; break; }
-      fi
-      [ "$(jq -r '.data.repository.defaultBranchRef.target.history.pageInfo.hasNextPage' "$page")" = "true" ] || break
-      cursor=$(jq -r '.data.repository.defaultBranchRef.target.history.pageInfo.endCursor' "$page")
-    done
-    if [ "$ok" -eq 1 ]; then
-      jq -s '(map(.data.repository.defaultBranchRef.target.history.nodes // []) | add | .[0:100]) as $nodes
-             | .[0] | .data.repository.defaultBranchRef.target.history.nodes = $nodes' "$d"/page.*.json > "$d/history.json" && return 0
-    fi
-    echo "survey-github: $repo: reading history in pages of $size failed" >&2
-  done
-  return 1
+# on_events <workflow file>: prints the events named by the workflow's top-level `on:` key, one per line.
+# Fails when there is no such key, a flow list or mapping does not close on its line, or a name is not
+# a plain word.
+on_events() {
+  # shellcheck disable=SC2016  # awk program, not shell
+  awk -v q="'" '
+    function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+    function unq(s,   c) {
+      c = substr(s, 1, 1)
+      if (length(s) >= 2 && (c == "\"" || c == q) && substr(s, length(s), 1) == c) s = substr(s, 2, length(s) - 2)
+      return s
+    }
+    function emit(t) { t = unq(trim(t)); if (t ~ /^[A-Za-z_]+$/) print t; else bad = 1 }
+    function item(t, ismap) { if (ismap) sub(/:.*$/, "", t); if (trim(t) != "") emit(t) }
+    function flow(s, ismap,   i, c, depth, tok) {
+      depth = 0; tok = ""
+      for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (c == "[" || c == "{") { depth++; continue }
+        if (c == "]" || c == "}") { depth--; if (depth == 0) { item(tok, ismap); tok = "" }; continue }
+        if (depth == 1 && c == ",") { item(tok, ismap); tok = ""; continue }
+        if (depth == 1) tok = tok c
+      }
+      if (depth != 0) bad = 1
+    }
+    BEGIN { onre = "^[\"" q "]?on[\"" q "]?:"; inon = 0; found = 0; bad = 0; ind = -1 }
+    { line = $0; sub(/\r$/, "", line) }
+    line ~ /^[ \t]*#/ || line ~ /^[ \t]*$/ { next }
+    { sub(/[ \t]+#.*$/, "", line) }
+    inon && line ~ /^[^ \t]/ { inon = 0 }
+    inon {
+      match(line, /^[ \t]*/)
+      if (ind < 0) ind = RLENGTH
+      if (RLENGTH != ind) next
+      s = trim(line)
+      if (s ~ /^-[ \t]/) emit(substr(s, 2))
+      else if (s ~ /:/) { sub(/:.*$/, "", s); emit(s) }
+      else bad = 1
+      next
+    }
+    line ~ onre {
+      found = 1; v = line; sub(onre, "", v); v = trim(v)
+      if (v == "") { inon = 1; ind = -1 }
+      else if (v ~ /^\[/) flow(v, 0)
+      else if (v ~ /^\{/) flow(v, 1)
+      else emit(v)
+    }
+    END { if (!found || bad) exit 1 }
+  ' "$1"
 }
 
-survey_one() {
-  local repo="$1" group="$2" d="$TMP/${1//\//__}" meta branch root sha
-  mkdir -p "$d/wf"
-  meta=$(gh api "repos/$repo" --jq '{default_branch, stars: .stargazers_count, full_name}' 2>/dev/null) \
-    || { fail_row "$repo" "$group" "repository not readable"; return; }
-  branch=$(jq -r .default_branch <<<"$meta")
+# linters_in <file>...: which workflow linters the files name, outside comment lines.
+linters_in() {
+  local z a
+  z=$(code "$@" | grep -c zizmor); a=$(code "$@" | grep -c actionlint)
+  jq -nc --argjson z "$([ "${z:-0}" -gt 0 ] && echo true || echo false)" --argjson a "$([ "${a:-0}" -gt 0 ] && echo true || echo false)" \
+    '{zizmor: $z, actionlint: $a}'
+}
 
-  # --- files: the root, everything under .github, and the top of docs --------------------------------
-  root=$(gh api "repos/$repo/git/trees/$branch" --jq '.tree' 2>/dev/null) \
-    || { fail_row "$repo" "$group" "tree not readable"; return; }
-  jq -r '.[] | select(.type == "blob") | .path' <<<"$root" > "$d/paths.txt"
-  jq -r '.[] | select(.type == "tree") | .path' <<<"$root" > "$d/dirs.txt"
-  sha=$(jq -r '.[] | select(.path == ".github" and .type == "tree") | .sha' <<<"$root")
-  if [ -n "$sha" ]; then
-    gh api "repos/$repo/git/trees/$sha?recursive=1" --jq '.tree[] | select(.type == "blob") | ".github/" + .path' >> "$d/paths.txt" 2>/dev/null \
-      || { fail_row "$repo" "$group" ".github not readable"; return; }
-  fi
-  sha=$(jq -r '.[] | select(.path == "docs" and .type == "tree") | .sha' <<<"$root")
-  if [ -n "$sha" ]; then
-    gh api "repos/$repo/git/trees/$sha" --jq '.tree[] | select(.type == "blob") | "docs/" + .path' >> "$d/paths.txt" 2>/dev/null || true
-  fi
-  has() { grep -qiE -- "$1" "$d/paths.txt"; }
-
-  # --- workflows -------------------------------------------------------------------------------------
-  local n=0 with_perm=0 any_perm=0 with_cancel=0 uses_total=0 uses_sha=0 checkouts=0 no_persist=0 merge_group=0 agg=0 wf f
+# measure_workflows <dir>: the workflow facts of a directory of workflow files, as one JSON object. Every
+# pattern is matched on lines that are not comments. A `partial` list names the agent workflows whose
+# triggers could not be read.
+measure_workflows() {
+  local dir="$1" nc f g n=0 with_perm=0 any_perm=0 with_cancel=0 uses_total=0 uses_sha=0 checkouts=0 no_persist=0
+  local merge_group=false agg=false partial=""
   local ext='^[[:space:]]*-?[[:space:]]*uses:[[:space:]]*["'"'"']?[A-Za-z0-9_.-]+/[^@[:space:]]+@'
-  while IFS= read -r wf; do
-    f="$d/wf/$(basename "$wf")"
-    raw "$repo" "$branch" "$wf" > "$f" || continue
+  nc=$(mktemp -d) || return 1
+  for f in "$dir"/*; do
     [ -s "$f" ] || continue
+    g="$nc/$(basename "$f")"
+    code "$f" > "$g"
     n=$((n+1))
-    [ "$(count '^permissions:' "$f")" -gt 0 ] && with_perm=$((with_perm+1))
-    [ "$(count '^[[:space:]]*permissions:' "$f")" -gt 0 ] && any_perm=$((any_perm+1))
-    [ "$(grep -E 'cancel-in-progress:' "$f" | grep -vcE 'cancel-in-progress:[[:space:]]*false[[:space:]]*(#.*)?$')" -gt 0 ] && with_cancel=$((with_cancel+1))
-    uses_total=$((uses_total + $(count "$ext" "$f")))
-    uses_sha=$((uses_sha + $(count "${ext}[0-9a-f]{40}" "$f")))
-    checkouts=$((checkouts + $(count 'uses:[[:space:]]*["'"'"']?actions/checkout@' "$f")))
-    no_persist=$((no_persist + $(count 'persist-credentials:[[:space:]]*false' "$f")))
-    [ "$(count '(^|[^A-Za-z_])merge_group([^A-Za-z_]|$)' "$f")" -gt 0 ] && merge_group=1
-    if grep -qE 're-actors/alls-green' "$f" || { grep -qE 'always\(\)' "$f" && grep -qE 'needs\.\*\.result|toJSON\(needs\)' "$f"; }; then agg=1; fi
-  done < <(grep -E '^\.github/workflows/[^/]+\.ya?ml$' "$d/paths.txt")
+    [ "$(count '^permissions:' "$g")" -gt 0 ] && with_perm=$((with_perm+1))
+    [ "$(count '^[[:space:]]*permissions:' "$g")" -gt 0 ] && any_perm=$((any_perm+1))
+    [ "$(grep -E 'cancel-in-progress:' "$g" | grep -vcE 'cancel-in-progress:[[:space:]]*false[[:space:]]*(#.*)?$')" -gt 0 ] && with_cancel=$((with_cancel+1))
+    uses_total=$((uses_total + $(count "$ext" "$g")))
+    uses_sha=$((uses_sha + $(count "${ext}[0-9a-f]{40}" "$g")))
+    checkouts=$((checkouts + $(count 'uses:[[:space:]]*["'"'"']?actions/checkout@' "$g")))
+    no_persist=$((no_persist + $(count 'persist-credentials:[[:space:]]*false' "$g")))
+    [ "$(count '(^|[^A-Za-z_])merge_group([^A-Za-z_]|$)' "$g")" -gt 0 ] && merge_group=true
+    if grep -qE 're-actors/alls-green' "$g" || { grep -qE 'always\(\)' "$g" && grep -qE 'needs\.\*\.result|toJSON\(needs\)' "$g"; }; then agg=true; fi
+  done
 
-  local agents="[]" housekeeping="[]" lint=""
+  local agents='[]' housekeeping='[]' auto='{}' triggers='[]' linters='{"zizmor": false, "actionlint": false}' events="" af ev
   if [ "$n" -gt 0 ]; then
-    agents=$(grep -ohE 'anthropics/claude-code(-base)?-action|openai/codex-action|google-github-actions/run-gemini-cli|google-gemini/gemini-cli-action|github(next)?/gh-aw|claude (-p|--print)|codex exec|gemini (-p|--prompt)|opencode (run|github)' "$d"/wf/* 2>/dev/null | sort -u | jq -R . | jq -sc .)
-    housekeeping=$(grep -ohE 'actions/labeler|actions/stale|actions/first-interaction|release-drafter/release-drafter' "$d"/wf/* 2>/dev/null | sort -u | jq -R . | jq -sc .)
-    # Counted, not `grep -q`: closing the pipe early makes the first grep die of SIGPIPE, which pipefail
-    # then reports as no match.
-    [ "$(grep -hvE '^[[:space:]]*#' "$d"/wf/* 2>/dev/null | grep -c zizmor)" -gt 0 ] && lint="zizmor"
-    [ "$(grep -hvE '^[[:space:]]*#' "$d"/wf/* 2>/dev/null | grep -c actionlint)" -gt 0 ] && lint="${lint:+$lint+}actionlint"
-  fi
-  # Automation beyond build and test, as text patterns over the workflow files with comment lines removed.
-  local auto='{}' agent_triggers='[]' af
-  if [ "$n" -gt 0 ]; then
-    wf_has() { if [ "$(grep -hvE '^[[:space:]]*#' "$d"/wf/* 2>/dev/null | grep -cE -- "$1")" -gt 0 ]; then echo true; else echo false; fi; }
+    agents=$(grep -ohE -- "$AGENT_RE" "$nc"/* | sort -u | jq -R . | jq -sc .)
+    housekeeping=$(grep -ohE 'actions/labeler|actions/stale|actions/first-interaction|release-drafter/release-drafter' "$nc"/* | sort -u | jq -R . | jq -sc .)
+    linters=$(linters_in "$nc"/*)
+    # Automation beyond build and test.
+    wf_has() { if [ "$(cat "$nc"/* | grep -cE -- "$1")" -gt 0 ]; then echo true; else echo false; fi; }
     auto=$(jq -n \
       --argjson bot_automerge "$(wf_has 'dependabot/fetch-metadata|gh pr merge[^|]*--auto|automerge-action|enable-pull-request-automerge|enablePullRequestAutoMerge')" \
       --argjson path_filter   "$(wf_has 'dorny/paths-filter|tj-actions/changed-files|^[[:space:]]*paths(-ignore)?:')" \
@@ -321,51 +371,125 @@ survey_one() {
       '{bot_automerge: $bot_automerge, path_filter: $path_filter, cache: $cache, timeouts: $timeouts, reusable: $reusable,
         scheduled: $scheduled, pull_request_target: $pr_target, title_lint: $title_lint, release: $release,
         coverage: $coverage, benchmarks: $benchmarks, matrix: $matrix}')
-    # Which events start the workflows that run a coding agent.
-    agent_triggers=$(for af in "$d"/wf/*; do
-        grep -qE 'anthropics/claude-code(-base)?-action|openai/codex-action|google-github-actions/run-gemini-cli|google-gemini/gemini-cli-action|github(next)?/gh-aw|claude (-p|--print)|codex exec|gemini (-p|--prompt)|opencode (run|github)' "$af" 2>/dev/null || continue
-        # events as keys on their own lines, and events written inline after `on:`; once per file
-        { grep -oE '^[[:space:]]*(pull_request_target|pull_request_review_comment|pull_request_review|pull_request|issue_comment|issues|schedule|workflow_run|workflow_dispatch|push)[:[:space:]]*$' "$af" | tr -d ' :\t\r'
-          grep -E '^["'"'"']?on["'"'"']?:[[:space:]]*[^[:space:]#]' "$af" \
-            | grep -oE '(pull_request_target|pull_request_review_comment|pull_request_review|pull_request|issue_comment|issues|schedule|workflow_run|workflow_dispatch|push)([^A-Za-z_]|$)' \
-            | sed -E 's/[^A-Za-z_]+$//'
-        } | sort -u
-      done | sort | uniq -c | awk '{printf "%s{\"event\":\"%s\",\"files\":%s}", (NR>1?",":""), $2, $1} END {print ""}' | sed 's/^/[/; s/$/]/')
-    jq -e . >/dev/null 2>&1 <<<"$agent_triggers" || agent_triggers='[]'
+    # Which events start the workflows that run a coding agent; each event once per file.
+    for af in "$nc"/*; do
+      [ "$(grep -cE -- "$AGENT_RE" "$af")" -gt 0 ] || continue
+      if ev=$(on_events "$af"); then events="${events}$(printf '%s\n' "$ev" | sort -u)"$'\n'
+      else unread "triggers:$(basename "$af")"; fi
+    done
+    triggers=$(printf '%s' "$events" | jq -Rnc '[inputs | select(length > 0)] | group_by(.) | map({event: .[0], files: length})') \
+      || { triggers=null; unread agent-triggers; }
   fi
-  has '^\.github/zizmor\.ya?ml$' && case "$lint" in *zizmor*) ;; *) lint="${lint:+$lint+}zizmor" ;; esac
-  has '^\.github/actionlint\.ya?ml$' && case "$lint" in *actionlint*) ;; *) lint="${lint:+$lint+}actionlint" ;; esac
+  rm -rf "$nc"
+  jq -nc --argjson n "$n" --argjson with_perm "$with_perm" --argjson any_perm "$any_perm" --argjson with_cancel "$with_cancel" \
+        --argjson uses_total "$uses_total" --argjson uses_sha "$uses_sha" --argjson checkouts "$checkouts" \
+        --argjson no_persist "$no_persist" --argjson merge_group "$merge_group" --argjson agg "$agg" \
+        --argjson agents "$agents" --argjson housekeeping "$housekeeping" --argjson auto "$auto" \
+        --argjson triggers "$triggers" --argjson linters "$linters" --argjson partial "$(list_json "$partial")" '
+    { count: $n, with_top_level_permissions: $with_perm, with_any_permissions: $any_perm, with_cancel_in_progress: $with_cancel,
+      action_refs: $uses_total, action_refs_sha_pinned: $uses_sha, checkouts: $checkouts, persist_credentials_false: $no_persist,
+      merge_group_trigger: $merge_group, aggregating_job: $agg, agent_in_ci: $agents, agent_triggers: $triggers,
+      housekeeping: $housekeeping, automation: $auto, linters: $linters, partial: $partial }'
+}
+
+# fetch_history <repo> <dir>: writes <dir>/history.json, one GraphQL answer holding the newest 100 commits.
+# GitHub times out on 100 commits with their pull requests for large repositories, so they are read in
+# pages of 50, or of 25 if a page of 50 fails. A repository whose pages all fail is recorded as partial.
+fetch_history() {
+  local repo="$1" d="$2" size cursor i ok page
+  for size in 50 25; do
+    rm -f "$d"/page.*.json; cursor=""; i=0; ok=1
+    while [ $((i * size)) -lt 100 ]; do
+      i=$((i+1)); page="$d/page.$i.json"
+      set -- -f query="$HISTORY_QUERY" -f owner="${repo%%/*}" -f name="${repo##*/}" -F n="$size"
+      [ -n "$cursor" ] && set -- "$@" -f after="$cursor"
+      gh api graphql "$@" > "$page" 2>/dev/null || { ok=0; break; }
+      [ "$(jq -r '.data.repository.defaultBranchRef.target.history.pageInfo.hasNextPage' "$page")" = "true" ] || break
+      cursor=$(jq -r '.data.repository.defaultBranchRef.target.history.pageInfo.endCursor' "$page")
+    done
+    if [ "$ok" -eq 1 ]; then
+      jq -s '(map(.data.repository.defaultBranchRef.target.history.nodes // []) | add | .[0:100]) as $nodes
+             | .[0] | .data.repository.defaultBranchRef.target.history.nodes = $nodes' "$d"/page.*.json > "$d/history.json" && return 0
+    fi
+    echo "survey-github: $repo: reading history in pages of $size failed" >&2
+  done
+  return 1
+}
+
+survey_one() {
+  local repo="$1" group="$2" d="$TMP/${1//\//__}" meta branch root sha partial=""
+  mkdir -p "$d/wf"
+  meta=$(gh api "repos/$repo" --jq '{default_branch, stars: .stargazers_count}' 2>/dev/null) \
+    || { fail_row "$repo" "$group" "repository not readable"; return; }
+  branch=$(jq -r .default_branch <<<"$meta")
+
+  # --- files: the root, everything under .github, and the top of docs --------------------------------
+  root=$(gh api "repos/$repo/git/trees/$branch" --jq '.tree' 2>/dev/null) \
+    || { fail_row "$repo" "$group" "tree not readable"; return; }
+  jq -r '.[] | select(.type == "blob") | .path' <<<"$root" > "$d/paths.txt"
+  jq -r '.[] | select(.type == "tree") | .path' <<<"$root" > "$d/dirs.txt"
+  sha=$(jq -r '.[] | select(.path == ".github" and .type == "tree") | .sha' <<<"$root")
+  if [ -n "$sha" ]; then
+    gh api "repos/$repo/git/trees/$sha?recursive=1" --jq '.tree[] | select(.type == "blob") | ".github/" + .path' >> "$d/paths.txt" 2>/dev/null \
+      || { fail_row "$repo" "$group" ".github not readable"; return; }
+  fi
+  sha=$(jq -r '.[] | select(.path == "docs" and .type == "tree") | .sha' <<<"$root")
+  if [ -n "$sha" ]; then
+    gh api "repos/$repo/git/trees/$sha" --jq '.tree[] | select(.type == "blob") | "docs/" + .path' >> "$d/paths.txt" 2>/dev/null \
+      || unread docs-tree
+  fi
+  has() { grep -qiE -- "$1" "$d/paths.txt"; }
+  flag() { if has "$1"; then echo true; else echo false; fi; }
+
+  # --- workflows -------------------------------------------------------------------------------------
+  local wf f wfm
+  while IFS= read -r wf; do
+    f="$d/wf/$(basename "$wf")"
+    raw "$repo" "$branch" "$wf" > "$f" || { rm -f "$f"; unread "workflow:$(basename "$wf")"; }
+  done < <(grep -E '^\.github/workflows/[^/]+\.ya?ml$' "$d/paths.txt")
+  wfm=$(measure_workflows "$d/wf") || { fail_row "$repo" "$group" "workflows not measured"; return; }
 
   # --- repository files ------------------------------------------------------------------------------
-  local hooks="" bot="" cooldown=false automerge=false tmpl="" headings="[]" dep ren
-  if has '^\.pre-commit-config\.ya?ml$'; then
+  local hooks="" bot="" cooldown=false automerge=false tmpl="" headings="[]" dep ren pc lint_pc='{}' lint_cfg linters
+  lint_cfg=$(jq -nc --argjson z "$(flag '^\.github/zizmor\.ya?ml$')" --argjson a "$(flag '^\.github/actionlint\.ya?ml$')" '{zizmor: $z, actionlint: $a}')
+  pc=$(grep -m1 -E '^\.pre-commit-config\.ya?ml$' "$d/paths.txt")
+  if [ -n "$pc" ]; then
     hooks="pre-commit"
-    raw "$repo" "$branch" "$(grep -E '^\.pre-commit-config\.ya?ml$' "$d/paths.txt" | head -1)" > "$d/precommit.yml"
-    [ "$(grep -vE '^[[:space:]]*#' "$d/precommit.yml" | grep -c zizmor)" -gt 0 ] && case "$lint" in *zizmor*) ;; *) lint="${lint:+$lint+}zizmor" ;; esac
-    [ "$(grep -vE '^[[:space:]]*#' "$d/precommit.yml" | grep -c actionlint)" -gt 0 ] && case "$lint" in *actionlint*) ;; *) lint="${lint:+$lint+}actionlint" ;; esac
+    if raw "$repo" "$branch" "$pc" > "$d/precommit.yml"; then lint_pc=$(linters_in "$d/precommit.yml"); else unread precommit; fi
   fi
+  linters=$(printf '%s\n' "$(jq -c .linters <<<"$wfm")" "$lint_pc" "$lint_cfg" \
+    | jq -sc '{zizmor: any(.[]; .zizmor == true), actionlint: any(.[]; .actionlint == true)}')
   has '^(\.)?lefthook\.(ya?ml|toml)$' && hooks="${hooks:+$hooks+}lefthook"
   grep -qx '\.husky' "$d/dirs.txt" && hooks="${hooks:+$hooks+}husky"
-  dep=$(grep -E '^\.github/dependabot\.ya?ml$' "$d/paths.txt" | head -1)
-  ren=$(grep -E '^(\.github/)?(renovate\.json5?|\.renovaterc(\.json5?)?)$' "$d/paths.txt" | head -1)
+  dep=$(grep -m1 -E '^\.github/dependabot\.ya?ml$' "$d/paths.txt")
+  ren=$(grep -m1 -E '^(\.github/)?(renovate\.json5?|\.renovaterc(\.json5?)?)$' "$d/paths.txt")
   if [ -n "$ren" ]; then
-    bot="renovate"; raw "$repo" "$branch" "$ren" > "$d/renovate.txt"
-    grep -qiE 'minimumReleaseAge' "$d/renovate.txt" && cooldown=true
-    grep -qiE 'automerge' "$d/renovate.txt" && automerge=true
+    bot="renovate"
+    if raw "$repo" "$branch" "$ren" > "$d/renovate.txt"; then
+      grep -qiE 'minimumReleaseAge' "$d/renovate.txt" && cooldown=true
+      grep -qiE 'automerge' "$d/renovate.txt" && automerge=true
+    else unread renovate; fi
   fi
   if [ -n "$dep" ]; then
-    bot="${bot:+$bot+}dependabot"; raw "$repo" "$branch" "$dep" > "$d/dependabot.txt"
-    grep -qiE 'cooldown' "$d/dependabot.txt" && cooldown=true
+    bot="${bot:+$bot+}dependabot"
+    if raw "$repo" "$branch" "$dep" > "$d/dependabot.txt"; then
+      grep -qiE 'cooldown' "$d/dependabot.txt" && cooldown=true
+    else unread dependabot; fi
   fi
-  tmpl=$(grep -iE '^(\.github/|docs/)?pull_request_template(\.md|/)' "$d/paths.txt" | head -1)
+  tmpl=$(grep -m1 -iE '^(\.github/|docs/)?pull_request_template(\.md|/)' "$d/paths.txt")
   if [ -n "$tmpl" ]; then
-    headings=$(raw "$repo" "$branch" "$tmpl" | grep -E '^#{1,4} ' | sed -E 's/^#+ +//; s/[[:space:]:]+$//' | head -12 | jq -R . | jq -sc .)
+    if raw "$repo" "$branch" "$tmpl" > "$d/template.md"; then
+      headings=$(grep -E '^#{1,4} ' "$d/template.md" | sed -E 's/^#+ +//; s/[[:space:]:]+$//' | jq -R . | jq -sc '.[0:12]')
+    else unread template; fi
   fi
 
   # --- merge settings, last 100 commits and the pull requests behind them ------------------------------
   local hist=""
   if fetch_history "$repo" "$d"; then hist=$(jq -c "$HISTORY_JQ" "$d/history.json" 2>/dev/null) || hist=""; fi
-  [ -n "$hist" ] || hist='{"settings": null, "history": {"n": 0, "error": "history not readable"}, "pull_requests": {"n": 0, "human_authored": 0}}'
+  if [ -z "$hist" ]; then
+    unread history
+    hist='{"settings": null, "history": {"n": 0, "error": "history not readable"}, "pull_requests": {"n": 0, "human_authored": 0}}'
+  fi
 
   # --- protection of the default branch, as a reader sees it --------------------------------------------
   local rules classic
@@ -375,47 +499,40 @@ survey_one() {
       approvals: ([.[] | select(.type == "pull_request") | .parameters.required_approving_review_count] | max),
       merge_methods: ([.[] | select(.type == "pull_request") | .parameters.allowed_merge_methods[]?] | unique),
       merge_queue: (any(.[]; .type == "merge_queue"))
-    }' 2>/dev/null) || rules='{"types": [], "error": "rules not readable"}'
+    }' 2>/dev/null) || { rules=null; unread rules; }
   classic=$(gh api "repos/$repo/branches/$branch" --jq '{protected, contexts: (.protection.required_status_checks.contexts // [])}' 2>/dev/null) \
-    || classic='{"protected": null, "contexts": [], "error": "branch not readable"}'
+    || { classic=null; unread branch; }
 
   jq -n --arg repo "$repo" --arg group "$group" --argjson meta "$meta" --argjson hist "$hist" \
-        --argjson rules "$rules" --argjson classic "$classic" \
-        --argjson n "$n" --argjson with_perm "$with_perm" --argjson any_perm "$any_perm" --argjson with_cancel "$with_cancel" \
-        --argjson uses_total "$uses_total" --argjson uses_sha "$uses_sha" --argjson checkouts "$checkouts" \
-        --argjson no_persist "$no_persist" --argjson merge_group "$merge_group" --argjson agg "$agg" \
-        --argjson agents "$agents" --argjson housekeeping "$housekeeping" --arg lint "$lint" \
-        --argjson auto "$auto" --argjson agent_triggers "$agent_triggers" \
+        --argjson rules "$rules" --argjson classic "$classic" --argjson wfm "$wfm" --argjson linters "$linters" \
         --arg hooks "$hooks" --arg bot "$bot" --argjson cooldown "$cooldown" --argjson automerge "$automerge" \
-        --arg tmpl "$tmpl" --argjson headings "$headings" \
-        --argjson codeowners "$(has '^(\.github/|docs/)?CODEOWNERS$' && echo true || echo false)" \
+        --arg tmpl "$tmpl" --argjson headings "$headings" --argjson partial "$(list_json "$partial")" \
+        --argjson codeowners "$(flag '^(\.github/|docs/)?CODEOWNERS$')" \
         --argjson agents_md "$(grep -qx 'AGENTS\.md' "$d/paths.txt" && echo true || echo false)" \
         --argjson claude_md "$(grep -qx 'CLAUDE\.md' "$d/paths.txt" && echo true || echo false)" \
-        --argjson copilot "$(has '^\.github/copilot-instructions\.md$' && echo true || echo false)" \
-        --argjson lockfile "$(has '^\.github/workflows/actions\.lock$' && echo true || echo false)" \
-        --argjson ai_policy "$(has '(^|/)(AI[_-]?(USAGE[_-]?)?POLICY|GENERATIVE[_-]?AI)[^/]*\.md$' && echo true || echo false)" '
+        --argjson copilot "$(flag '^\.github/copilot-instructions\.md$')" \
+        --argjson lockfile "$(flag '^\.github/workflows/actions\.lock$')" \
+        --argjson ai_policy "$(flag '(^|/)(AI[_-]?(USAGE[_-]?)?POLICY|GENERATIVE[_-]?AI)[^/]*\.md$')" '
     def nn: if . == "" then null else . end;
     { repo: $repo, group: $group, default_branch: $meta.default_branch, stars: $meta.stars,
-      workflows: { count: $n, with_top_level_permissions: $with_perm, with_any_permissions: $any_perm, with_cancel_in_progress: $with_cancel,
-                   action_refs: $uses_total, action_refs_sha_pinned: $uses_sha,
-                   checkouts: $checkouts, persist_credentials_false: $no_persist,
-                   merge_group_trigger: ($merge_group == 1), aggregating_job: ($agg == 1),
-                   workflow_lint: ($lint | nn), lockfile: $lockfile, agent_in_ci: $agents, agent_triggers: $agent_triggers,
-                   housekeeping: $housekeeping, automation: $auto },
+      workflows: (($wfm | del(.linters, .partial)) + { workflow_linters: $linters, lockfile: $lockfile,
+                   workflow_lint: ([if $linters.zizmor then "zizmor" else empty end, if $linters.actionlint then "actionlint" else empty end]
+                                   | join("+") | nn) }),
       files: { hook_framework: ($hooks | nn), dependency_bot: ($bot | nn), release_cooldown: $cooldown,
                bot_automerge: $automerge, pr_template: ($tmpl | nn), pr_template_headings: $headings,
                codeowners: $codeowners, agents_md: $agents_md, claude_md: $claude_md,
                copilot_instructions: $copilot, ai_policy_file: $ai_policy },
       settings: $hist.settings, history: $hist.history, pull_requests: $hist.pull_requests,
-      branch_rules: $rules, classic_protection: $classic }'
+      branch_rules: $rules, classic_protection: $classic, partial: ($partial + $wfm.partial) }'
 }
 
 do_run() {
-  local sample="${1:?usage: scripts/survey-github run <sample.json> <out.json>}" out="${2:?usage: scripts/survey-github run <sample.json> <out.json>}"
+  [ $# -eq 2 ] || usage
+  local sample="$1" out="$2"
   gh auth status >/dev/null 2>&1 || { echo "survey-github: gh is not signed in" >&2; exit 1; }
-  TMP=$(mktemp -d)
-  local total i=0 repo group row
+  local total i=0 repo group row read_ok partly
   total=$(jq 'length' "$sample") || exit 1
+  TMP=$(mktemp -d) || exit 1
   echo '[]' > "$TMP/out.json"
   while IFS=$'\t' read -r repo group; do
     i=$((i+1)); printf 'survey-github: %2d/%d  %s\n' "$i" "$total" "$repo" >&2
@@ -423,8 +540,8 @@ do_run() {
     jq -e . >/dev/null 2>&1 <<<"$row" || row=$(fail_row "$repo" "$group" "survey failed")
     jq --argjson row "$row" '. + [$row]' "$TMP/out.json" > "$TMP/out.n" && mv "$TMP/out.n" "$TMP/out.json"
   done < <(jq -r '.[] | [.repo, .group] | @tsv' "$sample")
-  local read_ok
   read_ok=$(jq '[.[] | select(.error == null)] | length' "$TMP/out.json")
+  partly=$(jq '[.[] | select(.error == null and ((.partial // []) | length) > 0)] | length' "$TMP/out.json")
   if [ $((read_ok * 5)) -lt $((total * 4)) ]; then
     # Fewer than four in five: a network or rate-limit failure, not a few renamed repositories. Keep what
     # was there; the partial result goes beside it for whoever wants to see which ones failed.
@@ -435,28 +552,33 @@ do_run() {
   fi
   jq --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{surveyed_at: $at, repos: .}' "$TMP/out.json" > "$out"
   rm -rf "$TMP"; rm -f "$out.partial"
-  if [ "$read_ok" -lt "$total" ]; then
-    echo "survey-github: wrote $out, but $((total - read_ok)) of $total repositories could not be read; the report lists them under 'Not read'" >&2
-    exit 2
+  if [ "$read_ok" -lt "$total" ] || [ "$partly" -gt 0 ]; then
+    echo "survey-github: wrote $out, but $((total - read_ok)) of $total repositories could not be read and $partly were read in part; the report lists them under 'Not read' and 'Partly read'" >&2
+    exit 3
   fi
   echo "survey-github: wrote $out ($read_ok of $total read)" >&2
 }
 
-do_report() { jq -r "$REPORT_JQ" "${1:?usage: scripts/survey-github report <data.json>}"; }
+do_report() { [ $# -eq 1 ] || usage; jq -r "$REPORT_JQ" "$1"; }
 
-# Fixed input, known answers: four commits, three pull requests (one by a bot), then the report's counting.
+# Offline fixtures, known answers: the history summary, the report's counting, the workflow measurement
+# on small workflow files, and a whole survey against stand-ins for `gh` and the raw file fetch.
 do_selftest() {
-  local fails=0 got h
+  local fails=0 got h m r rc
+  FX=$(mktemp -d) || return 1
+  trap 'rm -rf "$FX"' EXIT
   expect() { if [ "$2" = "$3" ]; then echo "  ok    $1"; else echo "  FAIL  $1: expected $3, got $2"; fails=$((fails+1)); fi; }
+
+  # --- history summary --------------------------------------------------------------------------------
   pr() { printf '{"number": %s, "merged": true, "createdAt": "2026-11-01T00:00:00Z", "mergedAt": "%s", "additions": %s, "deletions": 0, "author": {"__typename": "%s", "login": "%s"}, "mergedBy": {"__typename": "%s", "login": "%s"}, "commits": {"totalCount": 1}, "approvals": {"totalCount": %s}, "autoEnabled": {"filteredCount": %s}, "queued": {"filteredCount": 0}}' "$@"; }
   h=$(jq -n --argjson a "$(pr 1 2026-11-01T02:00:00Z 10 User ann User ann 0 0)" --argjson b "$(pr 2 2026-11-01T06:00:00Z 30 User bob User ann 1 1)" \
             --argjson c "$(pr 3 2026-11-01T01:00:00Z 2 Bot renovate Bot renovate 0 1)" '
     {data: {repository: {mergeCommitAllowed: false, squashMergeAllowed: true, rebaseMergeAllowed: false, autoMergeAllowed: true, deleteBranchOnMerge: true,
       defaultBranchRef: {target: {history: {nodes: [
-        {message: "Add a thing (#1)", parents: {totalCount: 1}, author: {name: "ann"}, associatedPullRequests: {nodes: [$a]}},
-        {message: "fix: a bug (#2)\n\nCo-authored-by: Claude <noreply@anthropic.com>", parents: {totalCount: 1}, author: {name: "bob"}, associatedPullRequests: {nodes: [$b]}},
-        {message: "Update dependency x (#3)", parents: {totalCount: 1}, author: {name: "renovate[bot]"}, associatedPullRequests: {nodes: [$c]}},
-        {message: "Merge branch main", parents: {totalCount: 2}, author: {name: "ann"}, associatedPullRequests: {nodes: []}}
+        {message: "Add a thing (#1)", parents: {totalCount: 1}, associatedPullRequests: {nodes: [$a]}},
+        {message: "fix: a bug (#2)\n\nCo-authored-by: Claude <noreply@anthropic.com>", parents: {totalCount: 1}, associatedPullRequests: {nodes: [$b]}},
+        {message: "Update dependency x (#3)", parents: {totalCount: 1}, associatedPullRequests: {nodes: [$c]}},
+        {message: "Merge branch main", parents: {totalCount: 2}, associatedPullRequests: {nodes: []}}
       ]}}}}}}' | jq -c "$HISTORY_JQ")
   expect "pull requests are counted once each"          "$(jq '.pull_requests.n' <<<"$h")" 3
   expect "three of four commits came through one"       "$(jq '.history.via_pull_request_pct' <<<"$h")" 75
@@ -472,18 +594,175 @@ do_selftest() {
   expect "one merge in three was by a bot account"      "$(jq '.pull_requests.merged_by_bot_pct' <<<"$h")" 33
   expect "median hours is the upper middle of two"      "$(jq '.pull_requests.median_hours_to_merge' <<<"$h")" 6
   expect "squash-only settings are carried through"     "$(jq -c '[.settings.squash, .settings.merge_commit, .settings.rebase]' <<<"$h")" "[true,false,false]"
+
+  # --- report -----------------------------------------------------------------------------------------
   got=$(jq -n '{surveyed_at: "2026-11-09T00:00:00Z", repos: [
-      {repo: "a/a", group: "canon upstream", workflows: {count: 2, with_top_level_permissions: 2, with_any_permissions: 2, with_cancel_in_progress: 1, action_refs: 10, action_refs_sha_pinned: 10, checkouts: 2, persist_credentials_false: 2, merge_group_trigger: false, aggregating_job: true, workflow_lint: "zizmor", agent_in_ci: [], housekeeping: []}, files: {dependency_bot: "renovate", release_cooldown: true, bot_automerge: false, pr_template: "x", pr_template_headings: ["Summary"], codeowners: false, agents_md: true, claude_md: false, hook_framework: null}, settings: {squash: true, merge_commit: false, rebase: false, auto_merge: true, delete_branch_on_merge: true}, history: {n: 100, merge_commit_pct: 0, via_pull_request_pct: 100, pr_suffix_pct: 100, conventional_pct: 0, ai_marker_pct: 0, signed_off_pct: 0}, pull_requests: {n: 50, human_authored: 30, merged_by_bot_pct: 0, approved_pct: 80, self_merged_pct: 60, auto_merge_pct: 30, merge_queue_pct: 0, bot_authored_pct: 40, median_hours_to_merge: 3, median_lines_changed: 40, median_commits: 1}, branch_rules: {types: ["pull_request"], required_checks: ["all"], approvals: 0, merge_queue: false}, classic_protection: {protected: true, contexts: []}},
-      {repo: "b/b", group: "flagship", workflows: {count: 1, with_top_level_permissions: 0, with_any_permissions: 0, with_cancel_in_progress: 0, action_refs: 4, action_refs_sha_pinned: 0, checkouts: 1, persist_credentials_false: 0, merge_group_trigger: false, aggregating_job: false, workflow_lint: null, agent_in_ci: [], housekeeping: []}, files: {dependency_bot: null, release_cooldown: false, bot_automerge: false, pr_template: null, pr_template_headings: [], codeowners: false, agents_md: false, claude_md: false, hook_framework: null}, settings: {squash: true, merge_commit: true, rebase: true, auto_merge: false, delete_branch_on_merge: false}, history: {n: 50, merge_commit_pct: 40, via_pull_request_pct: 60, pr_suffix_pct: 0, conventional_pct: 90, ai_marker_pct: 0, signed_off_pct: 0}, pull_requests: {n: 40, human_authored: 0, merged_by_bot_pct: 100, approved_pct: null, self_merged_pct: null}, branch_rules: {types: []}, classic_protection: {protected: false, contexts: []}},
-      {repo: "c/c", group: "flagship", workflows: {count: 0, with_top_level_permissions: 0, with_any_permissions: 0, with_cancel_in_progress: 0, action_refs: 0, action_refs_sha_pinned: 0, checkouts: 0, persist_credentials_false: 0, merge_group_trigger: false, aggregating_job: false, workflow_lint: null, agent_in_ci: [], housekeeping: []}, files: {dependency_bot: null, release_cooldown: false, bot_automerge: false, pr_template: null, pr_template_headings: [], codeowners: false, agents_md: false, claude_md: false, hook_framework: null}, settings: null, history: {n: 0}, pull_requests: {n: 0}, branch_rules: {types: []}, classic_protection: {protected: null, contexts: []}},
-      {repo: "d/d", group: "flagship", error: "repository not readable"}]}' | jq -r "$REPORT_JQ")
+      {repo: "a/a", group: "canon upstream", workflows: {count: 2, with_top_level_permissions: 2, with_any_permissions: 2, with_cancel_in_progress: 1, action_refs: 10, action_refs_sha_pinned: 10, checkouts: 2, persist_credentials_false: 2, merge_group_trigger: false, aggregating_job: true, workflow_lint: "zizmor", agent_in_ci: ["codex exec"], housekeeping: []}, files: {dependency_bot: "renovate", release_cooldown: true, bot_automerge: false, pr_template: "x", pr_template_headings: ["Summary"], codeowners: false, agents_md: true, claude_md: false, hook_framework: null}, settings: {squash: true, merge_commit: false, rebase: false, auto_merge: true, delete_branch_on_merge: true}, history: {n: 100, merge_commit_pct: 0, via_pull_request_pct: 100, pr_suffix_pct: 100, conventional_pct: 0, ai_marker_pct: 0, signed_off_pct: 0}, pull_requests: {n: 50, human_authored: 30, merged_by_bot_pct: 0, approved_pct: 80, self_merged_pct: 60, auto_merge_pct: 30, merge_queue_pct: 0, bot_authored_pct: 40, median_hours_to_merge: 3, median_lines_changed: 40, median_commits: 1}, branch_rules: {types: ["pull_request"], required_checks: ["all"], approvals: 0, merge_queue: false}, classic_protection: {protected: true, contexts: []}},
+      {repo: "b/b", group: "flagship", workflows: {count: 1, with_top_level_permissions: 0, with_any_permissions: 0, with_cancel_in_progress: 0, action_refs: 4, action_refs_sha_pinned: 0, checkouts: 1, persist_credentials_false: 0, merge_group_trigger: false, aggregating_job: false, workflow_lint: null, agent_in_ci: [], housekeeping: []}, files: {dependency_bot: null, release_cooldown: false, bot_automerge: false, pr_template: null, pr_template_headings: [], codeowners: false, agents_md: false, claude_md: false, hook_framework: null}, settings: {squash: true, merge_commit: true, rebase: true, auto_merge: false, delete_branch_on_merge: false}, history: {n: 50, merge_commit_pct: 40, via_pull_request_pct: 60, pr_suffix_pct: 0, conventional_pct: 90, ai_marker_pct: 0, signed_off_pct: 0}, pull_requests: {n: 40, human_authored: 0, merged_by_bot_pct: 100, approved_pct: null, self_merged_pct: null, auto_merge_pct: 50}, branch_rules: {types: []}, classic_protection: {protected: false, contexts: []}},
+      {repo: "c/c", group: "flagship", workflows: {count: 0, with_top_level_permissions: 0, with_any_permissions: 0, with_cancel_in_progress: 0, action_refs: 0, action_refs_sha_pinned: 0, checkouts: 0, persist_credentials_false: 0, merge_group_trigger: false, aggregating_job: false, workflow_lint: "zizmor", agent_in_ci: [], housekeeping: []}, files: {dependency_bot: null, release_cooldown: false, bot_automerge: false, pr_template: null, pr_template_headings: [], codeowners: false, agents_md: false, claude_md: false, hook_framework: "pre-commit"}, settings: null, history: {n: 0}, pull_requests: {n: 0}, branch_rules: {types: []}, classic_protection: {protected: null, contexts: []}},
+      {repo: "d/d", group: "flagship", error: "repository not readable"},
+      {repo: "e/e", group: "flagship", partial: ["workflow:x.yml", "rules"], workflows: {count: 1, with_top_level_permissions: 0, with_any_permissions: 0, with_cancel_in_progress: 0, action_refs: 2, action_refs_sha_pinned: 0, checkouts: 1, persist_credentials_false: 0, merge_group_trigger: false, aggregating_job: false, workflow_lint: null, agent_in_ci: [], housekeeping: []}, files: {dependency_bot: null, release_cooldown: false, bot_automerge: false, pr_template: null, pr_template_headings: [], codeowners: false, agents_md: false, claude_md: false, hook_framework: null}, settings: {squash: true, merge_commit: true, rebase: true, auto_merge: false, delete_branch_on_merge: false}, history: {n: 100, merge_commit_pct: 10, via_pull_request_pct: 0, pr_suffix_pct: 0, conventional_pct: 0, ai_marker_pct: 0, signed_off_pct: 0}, pull_requests: {n: 0, human_authored: 0}, branch_rules: null, classic_protection: {protected: false, contexts: []}}]}' | jq -r "$REPORT_JQ")
   expect "an unreadable repository is reported, not dropped"  "$(grep -c '^Not read: d/d' <<<"$got")" 1
-  expect "workflow rows count only repositories with workflows" "$(grep -F 'External actions pinned by commit SHA' <<<"$got" | cut -d'|' -f3-5 | tr -d ' ')" "1/2|1/1|split"
+  expect "workflow rows count only repositories with workflows read in full" "$(grep -F 'External actions pinned by commit SHA' <<<"$got" | cut -d'|' -f3-5 | tr -d ' ')" "1/2|1/1|split"
   expect "two of three is converged"                    "$(grep -F '| Has GitHub Actions workflows' <<<"$got" | cut -d'|' -f5 | tr -d ' ')" "converged"
-  expect "none of three is rare"                        "$(grep -F '| CODEOWNERS' <<<"$got" | cut -d'|' -f5 | tr -d ' ')" "rare"
+  expect "none of four is rare"                         "$(grep -F '| CODEOWNERS' <<<"$got" | cut -d'|' -f3,5 | tr -d ' ')" "0/4|rare"
   expect "human rows leave out a repository with no human pull requests" "$(grep -F 'Approving review on half' <<<"$got" | cut -d'|' -f3 | tr -d ' ')" "1/1"
   expect "bot-merge row keeps that repository"          "$(grep -F 'A bot account performed' <<<"$got" | cut -d'|' -f3 | tr -d ' ')" "1/2"
   expect "a short history is named, not hidden"         "$(grep -c 'fewer at b/b (50), c/c (0)' <<<"$got")" 1
+  expect "a partly read repository is named with what it lacks" "$(grep -c '^Partly read.*: e/e (workflow:x.yml, rules)\.$' <<<"$got")" 1
+  expect "unread rules leave a repository out of protection rows" "$(grep -F '| Protected by a ruleset' <<<"$got" | cut -d'|' -f3 | tr -d ' ')" "1/3"
+  expect "a partly read repository is marked ? where it lacks data" "$(grep -F '| e/e |' <<<"$got" | cut -d'|' -f4,20 | tr -d ' ')" "?|?"
+  expect "the coding-agent row is printed once"         "$(grep -cF '| A coding agent runs in a workflow |' <<<"$got")" 1
+  expect "the coding-agent row is in the automation table" "$(sed -n '/^### Automation/,/^### Repository files/p' <<<"$got" | grep -cF '| A coding agent runs in a workflow |')" 1
+  local col label x n bad=""
+  # shellcheck disable=SC2016  # backticks are part of the row labels
+  for col in '4:`permissions:` declared in 80%' '5:External actions pinned' '6:`cancel-in-progress` in at least' '7:One job that aggregates' \
+             '8:Workflow linter in CI' '9:A coding agent runs in a workflow |' '11:Pull request template |' '12:CODEOWNERS |' \
+             '13:AGENTS.md at the root' '14:Squash is the only method' '15:No merge commits' '16:Approving review on half' '17:Auto-merge was enabled'; do
+    label="${col#*:}"
+    x=$(sed -n '/^### Per repository/,$p' <<<"$got" | grep -E '^\| [a-z]/[a-z] \|' | cut -d'|' -f"${col%%:*}" | grep -c x)
+    n=$(grep -F "| $label" <<<"$got" | cut -d'|' -f3 | cut -d/ -f1 | tr -d ' ')
+    [ "$x" = "$n" ] || bad="$bad ${col%%:*}"
+  done
+  expect "each per-repository column agrees with its summary row" "${bad:-none}" "none"
+
+  # --- workflow measurement ---------------------------------------------------------------------------
+  mkdir -p "$FX/wf" "$FX/wf2"
+  cat > "$FX/wf/commented.yml" <<'EOF'
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # - uses: actions/checkout@v4
+      # - uses: openai/codex-action@v1
+      - run: make
+EOF
+  cat > "$FX/wf/agent.yml" <<'EOF'
+name: agent
+"on":
+  pull_request_target:   # labelled pull requests only
+  issue_comment: {types: [created]}
+  workflow_dispatch:
+    inputs:
+      push:
+        type: string
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: anthropics/claude-code-action@v1
+EOF
+  cat > "$FX/wf/inline.yml" <<'EOF'
+on: pull_request   # every pull request
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - run: codex exec "review"
+EOF
+  cat > "$FX/wf/list.yml" <<'EOF'
+on: [pull_request_review, schedule]   # nightly too
+jobs:
+  answer:
+    runs-on: ubuntu-latest
+    steps:
+      - run: opencode run "answer"
+EOF
+  cat > "$FX/wf/flowmap.yml" <<'EOF'
+on: {schedule: [{cron: "0 3 * * *"}], workflow_run: {workflows: [ci], types: [completed]}}
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    steps:
+      - run: gemini -p "triage"
+EOF
+  cat > "$FX/wf2/noon.yml" <<'EOF'
+name: no trigger key
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - run: claude -p "hello"
+EOF
+  m=$(measure_workflows "$FX/wf")
+  expect "five workflow files are measured"             "$(jq .count <<<"$m")" 5
+  expect "a commented-out agent step is not an agent"   "$(jq -c .agent_in_ci <<<"$m")" '["anthropics/claude-code-action","codex exec","gemini -p","opencode run"]'
+  expect "a commented-out checkout is not counted"      "$(jq .checkouts <<<"$m")" 1
+  expect "a trigger key followed by a comment is read"  "$(jq '[.agent_triggers[].event] | index("pull_request_target") != null' <<<"$m")" true
+  expect "a trigger with a flow mapping value is read"  "$(jq '[.agent_triggers[].event] | index("issue_comment") != null' <<<"$m")" true
+  expect "a job or input named after an event is not a trigger" "$(jq '[.agent_triggers[].event] | index("push") == null' <<<"$m")" true
+  expect "inline name, inline list and flow mapping triggers are read" "$(jq -c '[.agent_triggers[] | select(.event | test("^(pull_request|pull_request_review|schedule|workflow_run)$"))]' <<<"$m")" \
+    '[{"event":"pull_request","files":1},{"event":"pull_request_review","files":1},{"event":"schedule","files":2},{"event":"workflow_run","files":1}]'
+  expect "a fully read directory has nothing partial"   "$(jq -c .partial <<<"$m")" '[]'
+  m=$(measure_workflows "$FX/wf2")
+  expect "an agent workflow without readable triggers is recorded" "$(jq -c '[.partial, .agent_triggers]' <<<"$m")" '[["triggers:noon.yml"],[]]'
+
+  # --- a whole survey against stand-ins for gh and the raw fetch ----------------------------------------
+  # gh: answers `api <path>` from $FX/api/<path with / ? = as _>.json and fails when there is no such file.
+  gh() {
+    printf '%s\n' "$*" >> "$FX/gh.log"
+    [ "$1" = auth ] && return 0
+    local path="$2" filter="." after=""; shift 2
+    while [ $# -gt 0 ]; do
+      case "$1" in --jq) filter="$2"; shift 2 ;; -f) case "$2" in after=*) after="${2#after=}" ;; esac; shift 2 ;; *) shift ;; esac
+    done
+    [ "$path" = graphql ] && path="graphql${after:+.$after}"
+    path=$(printf '%s' "$path" | tr '/?=' '___')
+    [ -f "$FX/api/$path.json" ] || return 1
+    jq -r "$filter" "$FX/api/$path.json"
+  }
+  raw() { cat "$FX/raw/$3" 2>/dev/null; }
+  mkdir -p "$FX/api" "$FX/raw/.github/workflows" "$FX/tmp"
+  printf '%s' '{"default_branch": "main", "stargazers_count": 1, "full_name": "x"}' > "$FX/api/repos_t_part.json"
+  cp "$FX/api/repos_t_part.json" "$FX/api/repos_t_full.json"
+  printf '%s' '{"tree": [{"path": ".github", "type": "tree", "sha": "g1"}, {"path": "docs", "type": "tree", "sha": "d1"},
+    {"path": "renovate.json", "type": "blob"}, {"path": ".pre-commit-config.yaml", "type": "blob"}]}' > "$FX/api/repos_t_part_git_trees_main.json"
+  printf '%s' '{"tree": [{"path": "workflows/ci.yml", "type": "blob"}, {"path": "workflows/gone.yml", "type": "blob"},
+    {"path": "dependabot.yml", "type": "blob"}, {"path": "pull_request_template.md", "type": "blob"}]}' > "$FX/api/repos_t_part_git_trees_g1_recursive_1.json"
+  printf '%s' '{"protected": true, "protection": {"required_status_checks": {"contexts": ["ci"]}}}' > "$FX/api/repos_t_part_branches_main.json"
+  printf '%s' '{"tree": [{"path": "README.md", "type": "blob"}]}' > "$FX/api/repos_t_full_git_trees_main.json"
+  printf '%s' '[]' > "$FX/api/repos_t_full_rules_branches_main.json"
+  printf '%s' '{"protected": false}' > "$FX/api/repos_t_full_branches_main.json"
+  page() { printf '{"data": {"repository": {"mergeCommitAllowed": false, "squashMergeAllowed": true, "rebaseMergeAllowed": false, "autoMergeAllowed": true, "deleteBranchOnMerge": true, "defaultBranchRef": {"target": {"history": {"pageInfo": {"hasNextPage": %s, "endCursor": "%s"}, "nodes": [{"message": "%s", "parents": {"totalCount": 1}, "associatedPullRequests": {"nodes": []}}]}}}}}}' "$@"; }
+  page true c1 'Add a (#1)' > "$FX/api/graphql.json"
+  page false c2 'Add b' > "$FX/api/graphql.c1.json"
+  cat > "$FX/raw/.github/workflows/ci.yml" <<'EOF'
+on: [push]
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - run: actionlint
+EOF
+  printf 'repos:\n  - hooks:\n      - id: zizmor\n' > "$FX/raw/.pre-commit-config.yaml"
+  printf 'version: 2\nupdates:\n  - cooldown:\n      default-days: 7\n' > "$FX/raw/.github/dependabot.yml"
+  TMP="$FX/tmp"
+  r=$(survey_one t/part flagship 2>/dev/null)
+  expect "what could not be read is listed on the row"  "$(jq -c '.partial | sort' <<<"$r")" '["docs-tree","renovate","rules","template","workflow:gone.yml"]'
+  expect "a workflow that could not be read is not measured" "$(jq .workflows.count <<<"$r")" 1
+  expect "unread rules are stored as not read, not as none" "$(jq -c '[.branch_rules, .classic_protection.contexts]' <<<"$r")" '[null,["ci"]]'
+  expect "linters from every source give one value in a fixed order" "$(jq -c '[.workflows.workflow_lint, .workflows.workflow_linters]' <<<"$r")" \
+    '["zizmor+actionlint",{"zizmor":true,"actionlint":true}]'
+  expect "the history cursor reaches the second page"   "$(jq -c '[.history.n, .history.pr_suffix_pct]' <<<"$r")" '[2,50]'
+  expect "fields nothing reads are not requested"       "$(grep -cE 'full_name|author \{ name \}' "$FX/gh.log")" 0
+  r=$(survey_one t/full flagship 2>/dev/null)
+  expect "a repository read in full has nothing partial" "$(jq -c .partial <<<"$r")" '[]'
+
+  # --- exit codes of run ------------------------------------------------------------------------------
+  sample() { jq -nc '$ARGS.positional | map({repo: ., group: "g"})' --args "$@" > "$FX/sample.json"; }
+  ( do_run ) 2>/dev/null; rc=$?
+  expect "run without arguments is a usage error"       "$rc" 2
+  sample t/full; ( do_run "$FX/sample.json" "$FX/out.json" ) 2>/dev/null; rc=$?
+  expect "run exits 0 when every repository is read in full" "$rc:$(jq '.repos | length' "$FX/out.json")" "0:1"
+  sample t/part; rm -f "$FX/out.json"; ( do_run "$FX/sample.json" "$FX/out.json" ) 2>/dev/null; rc=$?
+  expect "run exits 3 when a repository is read in part" "$rc:$(jq '.repos | length' "$FX/out.json")" "3:1"
+  sample t/full t/full t/full t/full t/gone; rm -f "$FX/out.json"; ( do_run "$FX/sample.json" "$FX/out.json" ) 2>/dev/null; rc=$?
+  expect "run exits 3 when one in five cannot be read"  "$rc:$(jq '.repos | length' "$FX/out.json")" "3:5"
+  sample t/full t/gone; rm -f "$FX/out.json"; ( do_run "$FX/sample.json" "$FX/out.json" ) 2>/dev/null; rc=$?
+  expect "run exits 1 and writes nothing when too few can be read" "$rc:$([ -f "$FX/out.json" ] && echo written || echo absent)" "1:absent"
+
   [ "$fails" -eq 0 ] || { echo "survey-github selftest: $fails failed" >&2; return 1; }
   echo "survey-github selftest: all passed"
 }
@@ -492,5 +771,5 @@ case "${1:-}" in
   run)      shift; do_run "$@" ;;
   report)   shift; do_report "$@" ;;
   selftest) do_selftest ;;
-  *) echo "usage: scripts/survey-github run <sample.json> <out.json> | report <data.json> | selftest" >&2; exit 2 ;;
+  *) usage ;;
 esac
