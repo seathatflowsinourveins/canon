@@ -270,6 +270,15 @@
       "sha": "5a951604a5ff7d99b7222139ba522237c58228af",
       "track": "default"
     },
+    "pandas": {
+      "default_branch": "main",
+      "default_sha": "3714db9d3631ae081cd1b4e8510ce37a663d88dd",
+      "ref": "refs/tags/v3.1.1",
+      "repo": "pandas-dev/pandas",
+      "resolved_at": "2026-11-10T18:41:24Z",
+      "sha": "3dcc6fbbbebc5e85dd3e83fe49b382ca7735cae1",
+      "track": "tag:v3.1.1"
+    },
     "pytest": {
       "default_branch": "main",
       "default_sha": "e4378d56736ff3bbb317dd9d9de898419adf309d",

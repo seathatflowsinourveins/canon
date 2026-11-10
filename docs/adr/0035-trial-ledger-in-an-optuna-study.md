@@ -39,13 +39,14 @@ trial store that meets every driver. Leaving it is cheap, since every trial read
 
 1. **Storage.** `RDBStorage` on SQLite, the local storage Optuna's FAQ gives for saving and resuming a
    study; it keeps `JournalFileBackend` for parallel and NFS use. The file is `ledger/trials.db`, a
-   folder to be git-ignored like `catalog/` by the code that writes it. A ranking reads one study.
+   folder ignored by git like `catalog/`. A ranking reads one study.
 2. **Recording**, through ask and tell, the tutorial's way to apply Optuna to an existing problem. The
    key (term 4) is computed first; a call refused before a config exists is not a trial. The trial is
    then asked for, so a run that never returns stays as `RUNNING`. A run that raises is told `FAIL`
    by this repo's code, with user attribute `outcome` = `failed`; one with no filled order `FAIL` with
-   `idle`; any other `COMPLETE` with `traded`, and the value told is skfolio's per-session Sharpe
-   ratio of its own series, for a later sampler; the gate does not read it.
+   `idle`; any other `COMPLETE` with `traded` and skfolio's per-session Sharpe ratio over its session
+   days (for a later sampler; the gate does not read it), or `FAIL`, still `traded`, if that ratio is
+   not finite. Such a record ran to the end: no later record resolves it, and ADR 0031 stops the gate.
 3. **Entry.** User attributes `config`, `config_key`, `run_config_id`, `backtest_start`, `backtest_end`,
    `returns_series` (keyed by nanoseconds as text), and `session_days`, this record's addition: the UTC
    days on which a bar of the run arrived, read here from the catalog, since `BacktestResult` has none.
@@ -124,8 +125,8 @@ Read 2026-11-10. Fetched means read in this session as raw text or source; run m
 * Reported by an `upstream-scout` search and not opened, so UNVERIFIED: MLflow marks a run `FAILED`
   inside `start_run` and is moving its file store to SQLite; backtesting.py keeps `optimize` results in
   memory; DVC, Aim and Sacred; other DSR and PBO projects take arrays or CSV files and own no store.
-* Second reader, 2026-11-10 (`evidence-verifier`): the sources hold. It corrected the key, which left out
-  data, engine and run fields; term 6, which named one of ADR 0031's four conditions; the FAIL claim,
-  true of `optimize` only; the unmarked readings of ADR 0010's entry and N; and a failed or crashed
-  record that would have stopped the ranking for good, now resolved by a later run of its key. On a
-  second pass it corrected the ignore rule, the engine's paths in the key, and two broad phrasings.
+* Second reader, 2026-11-10 (`evidence-verifier`), two passes: the sources hold. It corrected the key's
+  fields, term 6's conditions, the FAIL claim, the unmarked readings of ADR 0010, the ignore rule, and a
+  failed record that would have stopped the ranking for good, now resolved by a later run of its key.
+* Code review, 2026-11-10 (`/code-review`): term 2 missed a traded run with no finite Sharpe ratio, and
+  the value told used calendar days. Both corrected, with no change of decision.

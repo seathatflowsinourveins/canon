@@ -565,6 +565,21 @@
       ],
       "adr": "0035",
       "pypi": "optuna"
+    },
+    {
+      "id": "pandas",
+      "field": "strategy-evaluation",
+      "repo": "pandas-dev/pandas",
+      "track": "tag:v3.1.1",
+      "role": "tool",
+      "license": "BSD-3-Clause",
+      "why": "Carries the dates of the returns matrix (ADR 0010 step 2): skfolio's Portfolio reads observation dates only from a DataFrame, and Population.returns_df joins them. Used to index each trial's series, drop closed days and trim to the common range; no statistic is computed with it.",
+      "evidence": [
+        "https://pypi.org/pypi/pandas/json",
+        "https://raw.githubusercontent.com/pandas-dev/pandas/v3.1.1/doc/source/whatsnew/v3.1.1.rst"
+      ],
+      "adr": "0010",
+      "pypi": "pandas"
     }
   ]
 }

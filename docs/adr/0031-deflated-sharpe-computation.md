@@ -67,7 +67,8 @@ Who decided. Under the owner's delegation of 2026-11-10 (Evidence), the orchestr
   It also works eqs. 1–2 without skfolio, under the conventions read in skfolio's source, and gets the
   same values. And it pins what skfolio does with input ADR 0010's protocol forbids: the three cases above,
   and annualised trial Sharpe ratios beside daily returns, which send a passing pick below 0.01.
-* The test covers skfolio, not this repo: the code that applies the gate does not exist yet.
+* That test covers skfolio. The code that applies the gate, `canon_trading.ranking`, is tested in
+  `tests/test_ranking.py`: each refusal above, and a passing and a failing pick worked without skfolio.
 
 ## Evidence
 

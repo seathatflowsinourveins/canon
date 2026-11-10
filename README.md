@@ -84,8 +84,9 @@ print(len(run.orders), "orders;", list(run.account.balances_total().values()))
 `run.position_snapshots` and `run.account` are the objects in the engine's cache. The simulated venue's
 settings and what it leaves out (slippage, latency, market hours, margin) are listed at the top of
 `backtest.py`. A result here shows that the plumbing works. Variants are ranked only by the protocol in
-[ADR 0010](docs/adr/0010-strategy-evaluation.md), and the trial ledger it needs is not written yet. Until
-it is, a result may be reported, but not ranked against another.
+[ADR 0010](docs/adr/0010-strategy-evaluation.md): `canon_trading.ledger.record_trial` runs a backtest as a
+trial of an Optuna study in `ledger/trials.db` ([ADR 0035](docs/adr/0035-trial-ledger-in-an-optuna-study.md)),
+and `canon_trading.ranking.rank` ranks a study's trials and tests the pick's deflated Sharpe ratio.
 
 ## Enter the Alpaca paper keys
 
@@ -139,7 +140,7 @@ runs.
 | Path | Holds |
 |---|---|
 | `AGENTS.md`, `CLAUDE.md` | Instructions for agents; `CLAUDE.md` imports `AGENTS.md` |
-| `canon/upstreams.json` | The registry: 39 upstreams with role, licence, evidence, ADR |
+| `canon/upstreams.json` | The registry: 40 upstreams with role, licence, evidence, ADR |
 | `canon/upstreams.lock.json` | Resolved commit SHAs (generated) |
 | `canon/models.json` | Model routing by lane and the landscape snapshot behind it |
 | `docs/adr/` | Thirty-four decisions in MADR 4.0.0, each with Evidence and `review-by` |
@@ -148,6 +149,7 @@ runs.
 | `packages/canon-alpaca/` | The Alpaca adapter for NautilusTrader: a market-data client and a paper-only execution client |
 | `tests/`, `packages/*/tests/` | Tests beside each package's `src/` |
 | `catalog/` | Local market data; ignored by git |
+| `ledger/` | The trial ledger, an Optuna SQLite study; ignored by git |
 | `.claude/settings.json` | Permissions and hooks for this repo |
 | `orca.yaml` | The setup command Orca runs in a new worktree, once enabled and approved in the app |
 | `.claude/rules/` | Rules scoped to `canon/`, `docs/adr/` and trading code |
@@ -179,10 +181,10 @@ here, community convergence, then anyone's recollection.
   See `packages/canon-alpaca/README.md`.
 * **No market data in `catalog/`.** The first backtest runs on bars generated in its test. Nothing here
   writes Alpaca's bars to the catalog yet.
-* **No code that ranks strategy variants.** The method is decided (ADR 0010): every trial in a ledger, then
-  the pick's deflated Sharpe ratio at 0.95 or above, computed by skfolio (ADR 0031) and tested against the paper's
-  example. The ledger is not written, and the overfitting probability has no adopted implementation
-  (ADR 0027 and ADR 0032 are `proposed`).
+* **No ranking of real strategies yet.** The ledger (ADR 0035), the returns matrix and the gate (ADR 0010,
+  ADR 0031) are written and tested on generated bars and series. A trial that never traded, or a
+  configuration that never runs to the end, stops a ranking: what value it should count as is undecided.
+  The overfitting probability has no adopted implementation (ADR 0027 and ADR 0032 are `proposed`).
 * **No OpenTelemetry backend.** The local event ledger covers this machine; `home/otel-settings.example.json`
   is ready for when a collector exists.
 * **No eval of our own.** Model routing rests on external measurements until there is one (ADR 0005).

@@ -50,8 +50,8 @@ Known limits:
 * No slippage, latency, partial-fill or market-hours model is configured.
 * A `NETTING` position that reopens keeps its ID; each earlier round trip is a snapshot (observed at
   v2.0.0rc8), which is why `BacktestRun` carries both lists.
-* Runs are not compared here. Variants are ranked only by ADR 0010's protocol, and the trial ledger it
-  needs is not written yet, so until it is a result is reported and not ranked.
+* Runs are not compared here. A run meant as a trial is recorded by `canon_trading.ledger` (ADR 0035),
+  and variants are ranked only by `canon_trading.ranking`, ADR 0010's protocol.
 * The catalog path is made absolute before use. Upstream's guides build it from `Path.cwd()`; given a
   relative path, the node's catalog query fails at v2.0.0rc8 with "No suitable object store found for
   file://catalog/..." (observed 2026-11-10), although `ParquetDataCatalog` itself reads and writes one.
@@ -120,31 +120,25 @@ def simulated_alpaca_venue(starting_balances: Sequence[str]) -> BacktestVenueCon
     )
 
 
-def run_backtest(
+def backtest_run_config(
     catalog_path: Path,
     strategies: Sequence[MaCross],
     *,
     starting_balances: Sequence[str],
     logging: LoggerConfig | None = None,
-) -> BacktestRun:
-    """Run `strategies` together, on one account, over their bars in the catalog at `catalog_path`.
+    run_config_id: str | None = None,
+) -> BacktestRunConfig:
+    """Check `strategies` against the catalog and build the run config `run_backtest` runs.
 
     The bars replayed are the ones the strategies subscribe to, read from each strategy's `bar_type`, so
     no strategy can be left waiting for bars the run never loads. Strategies may share a bar type; two
-    different bar types for one instrument are refused (see this module's known limits). The parameter
-    is typed for `MaCross`, the one strategy there is.
+    different bar types for one instrument are refused (see this module's known limits). A catalog
+    missing the bars of any strategy is refused before anything is built, because the engine would
+    otherwise finish that strategy's run empty without an error.
 
-    The catalog must hold those bars and the definition of each instrument; a relative `catalog_path` is
-    taken from the current directory. A catalog missing the bars of any strategy is refused before
-    anything is built, because the engine would otherwise finish that strategy's run empty without an
-    error. Every other failure (no instrument definition, a strategy that cannot start, an engine error)
-    is raised by NautilusTrader and passes through.
-
-    `logging` goes to the engine unchanged; with none, the engine logs at its own defaults. The logging
-    subsystem is process-global (concepts/logging, "LogGuard"), and at v2.0.0rc8 the configuration of the
-    first engine or node built in a process stays in force for every later one (observed 2026-11-10). So
-    `logging` takes effect only in a process that has built none before, and a quiet setting given here
-    also silences whatever is built afterwards.
+    `run_config_id` becomes the config's `id`; with none, NautilusTrader gives it a fresh UUID4
+    (`crates/backtest/src/config.rs` at the pinned commit), so the same config built twice gets two ids.
+    `canon_trading.ledger` passes the trial's config key here (ADR 0035).
     """
     if not strategies:
         raise ValueError("run_backtest needs at least one strategy")
@@ -169,7 +163,7 @@ def run_backtest(
         if not catalog.get_intervals(NautilusDataType.Bar, bar_type):
             raise LookupError(f"The catalog at {path} holds no {bar_type} bars")
 
-    config = BacktestRunConfig(
+    return BacktestRunConfig(
         venues=[simulated_alpaca_venue(starting_balances)],
         data=[
             BacktestDataConfig(
@@ -179,11 +173,54 @@ def run_backtest(
             ),
         ],
         engine=BacktestEngineConfig(logging=logging),
+        id=run_config_id,
         # Off, a failed run is logged and left out of the results; on, it raises.
         raise_exception=True,
         # The engine's cache is emptied on disposal, so it is read first and disposed below.
         dispose_on_completion=False,
     )
+
+
+def run_backtest(
+    catalog_path: Path,
+    strategies: Sequence[MaCross],
+    *,
+    starting_balances: Sequence[str],
+    logging: LoggerConfig | None = None,
+    run_config_id: str | None = None,
+) -> BacktestRun:
+    """Run `strategies` together, on one account, over their bars in the catalog at `catalog_path`.
+
+    The run config is `backtest_run_config`'s, with the same arguments, and what it refuses is refused
+    here. The parameter is typed for `MaCross`, the one strategy there is. The catalog must hold the
+    bars and the definition of each instrument; a relative `catalog_path` is taken from the current
+    directory. Every other failure (no instrument definition, a strategy that cannot start, an engine
+    error) is raised by NautilusTrader and passes through.
+
+    `logging` goes to the engine unchanged; with none, the engine logs at its own defaults. The logging
+    subsystem is process-global (concepts/logging, "LogGuard"), and at v2.0.0rc8 the configuration of the
+    first engine or node built in a process stays in force for every later one (observed 2026-11-10). So
+    `logging` takes effect only in a process that has built none before, and a quiet setting given here
+    also silences whatever is built afterwards.
+
+    A run meant as a trial goes through `canon_trading.ledger.record_trial`, which calls this.
+    """
+    config = backtest_run_config(
+        catalog_path,
+        strategies,
+        starting_balances=starting_balances,
+        logging=logging,
+        run_config_id=run_config_id,
+    )
+    return run_backtest_config(config, strategies)
+
+
+def run_backtest_config(config: BacktestRunConfig, strategies: Sequence[MaCross]) -> BacktestRun:
+    """Run `strategies` under `config`, a config `backtest_run_config` built, and dispose the node.
+
+    `canon_trading.ledger` calls this with the config whose key it recorded, so the config hashed is
+    the config run.
+    """
     node = BacktestNode([config])
     try:
         node.build()

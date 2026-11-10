@@ -37,6 +37,7 @@ Chosen: **option 2**. It is the shape uv's workspace guide documents, and uv gen
 | `tests/`, `packages/*/tests/` | Tests beside each package's `src/` | pytest good practices |
 | `pytest.toml` | `importlib` import mode | pytest good practices |
 | `catalog/` | Local `ParquetDataCatalog`; ignored by git | NautilusTrader catalog guide |
+| `ledger/` | The trial ledger, an Optuna SQLite study; ignored by git | ADR 0035 |
 | `canon/`, `docs/adr/`, `scripts/`, `home/`, `.claude/`, `.githooks/` | The harness | ADR 0003, ADR 0011 |
 
 On this Mac:
@@ -117,3 +118,5 @@ Read 2026-11-09.
   orchestrator).
 * https://github.com/nautechsystems/nautilus_trader/issues/3374 — the maintainer asked that the name
   `nautilus-alpaca` stay free, hence `canon-alpaca` (fetched twice, ADR 0009).
+* 2026-11-10: `ledger/` added to the table under rule 2, for the trial ledger of ADR 0035 (an Optuna
+  SQLite study written by `canon_trading.ledger`); ignored by git in `.gitignore`, as `catalog/` is.
