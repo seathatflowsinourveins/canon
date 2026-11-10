@@ -90,7 +90,9 @@ Rules:
 
 ### Confirmation
 
-`scripts/survey-github selftest` runs in `scripts/ci`: 21 cases on fixed input. Two surprising rows were
+`scripts/survey-github selftest` runs in `scripts/ci`: 67 cases on fixed input. The data file is from the
+run of 2026-11-10, which reads triggers from each workflow's `on:` block and names what it could not
+read: two repositories were partly read and are left out of the trigger rows. Two surprising rows were
 re-derived through a different endpoint and agreed: of the 12 newest commits, 1 at NautilusTrader and 5 at
 claude-agent-sdk-python had a merged pull request, against 16% and 23% of 100. The survey was run three
 times. The first run cut long commit subjects short and missed job-level `permissions:`. The second read
