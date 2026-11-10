@@ -260,8 +260,10 @@ This package has all three for each client, offline, plus a paper test for each:
 The offline tests use payloads hand-built from the examples in Alpaca's docs (sources in `tests/conftest.py`)
 and stand-ins for the alpaca-py clients. To run the two paper tests, enter the pair once with
 `mise run paper:store` and then run `mise run paper:test` from the repo root; `mise run paper:check` says
-whether the pair is there (root `README.md`, "Enter the Alpaca paper keys"). Not yet tested against Alpaca: the live quote and trade stream,
-the asset list at `load_all` scale, and everything in the execution client (its paper test has not run).
+whether the pair is there (root `README.md`, "Enter the Alpaca paper keys"). Both passed on 2026-11-10 (ADR 0030).
+Not yet tested against Alpaca: the live quote and trade stream, the asset list at `load_all` scale, and in
+the execution client everything but a limit order accepted and canceled: no fill, partial fill or rejection
+has come from Alpaca.
 
 ## Rules
 
