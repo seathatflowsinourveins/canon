@@ -121,6 +121,20 @@ check_hooks() {
   return "$rc"
 }
 
+# paper_row: whether both Alpaca paper key items are in the login keychain (ADR 0029). It looks each item up
+# by service and account without -w or -g, so no value is read (man security: find-generic-password). An
+# absent pair is reported and never fails the check: only the two paper tests need it.
+PAPER_SERVICE="canon-alpaca-paper"   # the service mise.toml's paper tasks use
+paper_row() {
+  local a miss=""
+  if ! command -v security >/dev/null 2>&1; then row "paper key pair" absent "no security command here (macOS only)"; return 0; fi
+  for a in ALPACA_API_KEY ALPACA_SECRET_KEY; do
+    security find-generic-password -s "$PAPER_SERVICE" -a "$a" >/dev/null 2>&1 || miss="$miss $a"
+  done
+  if [ -z "$miss" ]; then row "paper key pair" ok "login keychain, service $PAPER_SERVICE"
+  else row "paper key pair" absent "no keychain item for:$miss; to enter the pair: mise run paper:store"; fi
+}
+
 check() {
   local missing=0 v t pin
   note "Toolchain (ADR 0008):"
@@ -154,6 +168,8 @@ check() {
   note "Machine-level Claude Code config (ADR 0007), in $CLAUDE_HOME:"
   check_hooks || missing=1
   if [ -f "$CLAUDE_HOME/CLAUDE.md" ]; then row "user CLAUDE.md" ok ""; else row "user CLAUDE.md" MISSING "run: scripts/bootstrap --user-config"; missing=1; fi
+  note "Alpaca paper key pair (ADR 0029), optional:"
+  paper_row
   return "$missing"
 }
 

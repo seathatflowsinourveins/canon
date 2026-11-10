@@ -87,6 +87,29 @@ settings and what it leaves out (slippage, latency, market hours, margin) are li
 [ADR 0010](docs/adr/0010-strategy-evaluation.md), and the trial ledger it needs is not written yet. Until
 it is, a result may be reported, but not ranked against another.
 
+## Enter the Alpaca paper keys
+
+The two paper tests in `packages/canon-alpaca/tests/` run against Alpaca's paper environment and are
+skipped until a paper key pair is in `ALPACA_API_KEY` and `ALPACA_SECRET_KEY`. On a Mac, enter the pair
+once, from this checkout, in your own terminal:
+
+```bash
+mise run paper:store    # asks for the key ID and the secret at a hidden prompt; stores only a paper pair
+mise run paper:check    # says whether both keychain items exist; prints neither value
+mise run paper:remove   # deletes both items
+mise run paper:test     # runs the two paper tests with the pair (places and cancels one paper order)
+```
+
+`paper:store` refuses a key ID starting with `AK`, Alpaca's hint for a live key, then sends the pair to
+Alpaca's paper API (`GET /v2/account`) and stores nothing unless it is accepted there; a live pair is
+refused there. Each value then sits in the login keychain, service `canon-alpaca-paper`. Of this repo's
+commands, only `paper:test` puts it in an environment, its own, when it starts (`paper:store` reads it
+back once to confirm the write); no file, shell, `mise env` or `scripts/ci` gets it. The keychain does not stop other
+programs you run from reading it: any process of yours can, with `security find-generic-password -w`, and
+no dialog appears. To replace the pair, remove it and store it again.
+Why it works this way, and what the keychain does not protect against:
+[ADR 0029](docs/adr/0029-paper-keys-in-the-login-keychain.md).
+
 ## What runs on its own
 
 | Layer | Runs | Costs tokens |
@@ -118,7 +141,7 @@ runs.
 | `canon/upstreams.json` | The registry: 38 upstreams with role, licence, evidence, ADR |
 | `canon/upstreams.lock.json` | Resolved commit SHAs (generated) |
 | `canon/models.json` | Model routing by lane and the landscape snapshot behind it |
-| `docs/adr/` | Twenty-seven decisions in MADR 4.0.0, each with Evidence and `review-by` |
+| `docs/adr/` | Twenty-eight decisions in MADR 4.0.0, each with Evidence and `review-by` |
 | `pyproject.toml`, `uv.lock` | uv workspace root; one lockfile for every package |
 | `src/canon_trading/` | Strategies and node configuration |
 | `packages/canon-alpaca/` | The Alpaca adapter for NautilusTrader: a market-data client and a paper-only execution client |

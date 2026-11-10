@@ -15,6 +15,8 @@ paths:
   pass `paper=False` or `url_override`.
 * Never place, modify or cancel a live order. Never read, print, log or commit a credential.
 * Credentials come from the environment. `.env` files are denied to agents by `.claude/settings.json`.
+  The paper pair is in the login keychain and reaches only `mise run paper:test` (ADR 0029). Never run
+  `security find-generic-password` with `-w` or `-g` on it, and run `paper:test` only when the owner asks.
 * NautilusTrader is pinned to a v2 release candidate in `pyproject.toml` and `uv.lock`. Install with
   `uv sync`, never a bare `pip install`, which gives v1 and does not match the docs. Read
   `https://nautilustrader.io/docs/llms.txt` for the page you need before writing against an API.
