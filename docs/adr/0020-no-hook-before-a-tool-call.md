@@ -81,6 +81,9 @@ in rule 2 and the guard's consequence. The rest of both stands.
   rejecting paper keys on a live host catch what they cover; the list under the table is covered by none.
 * Bad: "Unattended runs report; they do not decide" (ADR 0011 rule 2) is enforced only for a push, a pin
   move and an install. The weekly task's prompt asks for the rest.
+* Bad: rule 1 is tested on this repository's settings only. A plugin's hooks module can run before a
+  tool call and, where Claude Code's built-in guard is not loaded, as on this machine, approve what a
+  `deny` or `ask` rule would stop. The one Orca loads handles no tool call. Sources: ADR 0023.
 
 ### Confirmation
 

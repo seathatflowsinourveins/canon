@@ -78,7 +78,9 @@ because the owner named it, its licence is MIT, its source runs the installed `c
 * On a machine, Orca also sends anonymous usage events until Settings → Privacy turns them off. Two
   skills, `orca-cli` and `orchestration`, were installed for every session seconds after the app started,
   which its docs put down to its default agent setup; they are used within the limits of ADR 0021. What
-  wrote `skipDangerousModePermissionPrompt` into the user's settings is UNVERIFIED.
+  wrote `skipDangerousModePermissionPrompt` into the user's settings is UNVERIFIED. Orca also loads a
+  plugin of its own, `orca-agent-view`, into each terminal session: ADR 0023, which also says when an
+  `ask` rule does not prompt.
 
 ### Confirmation
 
