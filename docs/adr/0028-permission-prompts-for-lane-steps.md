@@ -89,7 +89,7 @@ to be freed here; it is not (above).
 
 ### Confirmation
 
-`scripts/test-hooks` checks 440 command forms: 21 run unprompted, 338 ask, 67 are neither, 13 are
+`scripts/test-hooks` checks 447 command forms: 28 run unprompted (21 until the addition of 2026-11-11 below), 338 ask, 67 are neither, 13 are
 spellings no rule matches and 1 is a bundled flag the `allow` rule takes (below). Its matcher follows the
 docs' wildcard rules, in 12 cases: 11 from six rows of their table, one from the `:*` note. Deleting any
 `ask` rule fails the test, as does deleting any `allow` rule for a one-pin resolve, a pinned `uv add` or
@@ -253,6 +253,33 @@ No permission rule changes. The prompts that remain each guard a step that shoul
 
 A rule cannot tell main's checkout from a worker's (`*` only, see above), so both meet the same prompt.
 
+### Addition of 2026-11-11: reading a pin's source runs without a prompt
+
+`scripts/canon src`, the command rule 1 names for reading an upstream at the pin, is pre-approved in
+`.claude/settings.json`: `scripts/canon src` and `./scripts/canon src`, with or without an id, and the
+`mise exec --` forms. A lane in `bypassPermissions` already ran it, since no `ask` rule matches; the rules
+are for a session or subagent in another mode, which would stall on the prompt.
+
+This is a stated exception to the driver above that what reaches outside the checkout still asks. The
+command reaches GitHub and writes outside the checkout, but only a cache that is read-only once written
+(`~/.cache/canon/upstream-src/<id>@<commit>`), at the commit the lock records, verified against the lock
+before and after the fetch; nothing there is built, installed, imported or run. It rewrites no pin, no
+lock and no file of the checkout. Without an id it fetches every git pin in the registry (55 on this
+date), a few hundred megabytes at depth 1: that form is allowed too, because the result is the same cache
+and gating it would need the two dozen `ask` rules a one-pin `resolve` has, for no state worth guarding
+(ADR 0074).
+
+Limits. `CANON_SRC_DIR` and `CANON_SRC_BASE`, which `scripts/test-canon` sets, redirect the destination
+and the remote; a session that exports either runs the same pre-approved command against them. An
+absolute-path spelling matches no rule and prompts outside `bypassPermissions`, as it does for every
+other command here. How Claude Code's own matcher treats the new rules was not run (UNVERIFIED);
+`scripts/test-hooks` asserts them with the matcher this record's Confirmation describes: it passes 500
+checks where it passed 493, the seven new ones being the forms above.
+
+Who decided: the owner's standing instruction of 2026-11-11 is to proceed with reversible automation that
+serves a recorded rule and report it; the lead asked the owner about this command and holds the answer
+first-hand (not re-observable: UNVERIFIED for a later reader). Removing the six rules reverses it.
+
 ## Evidence
 
 Read 2026-11-10. `fetched`: downloaded whole with `curl` and read, not summarised.
@@ -326,3 +353,9 @@ Read 2026-11-10. `fetched`: downloaded whole with `curl` and read, not summarise
 * https://docs.astral.sh/uv/reference/cli/ — the `uv add` flags, among them `-U`/`--upgrade`,
   `-P`/`--upgrade-package`, `--index`, `--index-url`/`-i`, `--default-index`, `--extra-index-url` and
   `--index-strategy` (fetched 2026-11-10; uv 0.13.7 here).
+* Added 2026-11-11, for the addition of that date: `scripts/canon`, `cmd_src` and `src_one` (read): with
+  an id it fetches that pin, with none or an empty one every pin with a repository; the destination is
+  `${CANON_SRC_DIR:-~/.cache/canon/upstream-src}`, made read-only after the checkout, and a folder that
+  exists is kept only if its commit is the lock's. `jq` over `canon/upstreams.json`: 55 entries with a
+  repository. `scripts/test-hooks`, run: every form in its "runs without a prompt" list is allowed and
+  matched by no `ask` rule.
