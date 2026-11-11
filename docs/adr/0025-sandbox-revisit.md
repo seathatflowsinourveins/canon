@@ -113,6 +113,60 @@ The change that turns it on must still try what this trial did not: a commit, `s
 an excluded command, `uv sync`, a pin move, the `orca` command a session reports with, and a paper test's
 stream through the proxy (all UNVERIFIED). It waits because a settings file reloads into running sessions.
 
+From 2026-11-11, ADR 0034 decides the sandbox for the other runtimes, from the trial below; this record's
+decision for Claude Code is unchanged.
+
+Trial of the other runtimes, 2026-11-11, macOS 27.2: Codex 0.167.0, Muse Code 1.4.15, Antigravity 1.5.5,
+DeepSeek Harness 0.2.1-rc.3 with dsh-TUI 0.17.0. Each CLI ran non-interactively, with no credential, in a
+throwaway clone at `5df7c9f` under the home folder, outside every temp folder, with `core.hooksPath` set
+and one worktree per runtime, as the cockpit makes them. Each got its own `TMPDIR` and a `.venv` built
+beforehand. A throwaway home was not used: each runtime keeps its sign-in in its own home. The model ran
+a probe script that tries a write to the root of `/private/tmp` (a harmless name standing in for
+`mise.toml`), `git config --unset core.hooksPath` from the worktree, which writes the main clone's
+`.git/config`, and writes to the workspace, `$HOME` and `~/.cache/uv`, the network, and `uv run
+--locked`. Codex's probes ran through `codex sandbox -P`; the others' through the model.
+
+| Runtime and mode | `/private/tmp` | shared `.git/config` | workspace | `$HOME`, `~/.cache/uv` | network | `uv run` |
+|---|---|---|---|---|---|---|
+| Codex `:read-only` | refused | refused | refused | refused | refused | refused (uv's cache) |
+| Codex reader: `:read-only`, own `:tmpdir` write, `auth.json` denied | refused | refused | refused | refused | refused | ran, `UV_CACHE_DIR` in `TMPDIR` |
+| Codex builder: `:workspace`, `:slash_tmp` read | refused | refused | written; its `.git` refused | refused | refused | ran |
+| Muse `--approval-mode never`, network `restricted` | written | written | written, `.git` too | refused | refused | ran |
+| Muse, the same in a plain clone | written | own `.git/config` written; another clone's refused | written | refused | refused | — |
+| Antigravity `--sandbox`, `proceed-in-sandbox` | written | refused (not mounted) | refused | `$HOME` refused, `~/.cache/uv` written | refused | refused (mise not mounted) |
+| Antigravity, with the grants and denials in ADR 0034's Confirmation | refused | refused | written with a `write_file` grant | refused | refused | ran |
+
+The Muse `:read-only` profile (`--permission-profile :read-only`) and the DeepSeek Harness `read-only`
+mode (`dsh-tui run --profile dsh-tui --permission-mode read-only` with `home/dsh/review.patch.yml`)
+each ran the one-command probe for ten minutes with no output and were stopped by their deadlines. The
+`headless` profile could not sign in: the key is the `dsh-tui` profile's, and was not copied. A dummy
+item in a throwaway keychain file was read outside Codex's sandbox and not inside it, though `securityd`
+answered there too. Two results disagree with the vendor's docs: Muse's say `.git` stays read-only in the
+workspace, and Antigravity's that sandboxed commands "can write to your workspace"; the table is what
+ran.
+
+Whole tasks under the chosen forms, with no prompt possible. **Codex reader**
+(`codex exec --ignore-user-config --disable hooks --ephemeral`, the reader profile, `approval_policy =
+"never"`, `gpt-6.1-sol` at `max`) on the replace-chain review brief. The first run ended after a minute
+with no prompt. Codex's hosted web tool returned `Internal Error` for the adapter guide the brief cites,
+though the page answers 200 here, and the reader stopped under rule 5, so the second run read the guide
+from a saved copy. In 14 minutes it ran 65 commands, one refused (a zsh here-document's temp file under `/tmp`, which it
+wrote with its patch tool instead), and wrote nothing in the checkout. It
+wrote six findings, each reproduced in its temp folder, before it was stopped unfinished when the trial
+was cut short. **Codex builder** on the build-eval case
+`cancel-again-and-unholdable-id`: 9 minutes, no prompt, no refusal it could not work around. The four
+named tests (five cases) passed, `ruff`, `ruff format` and `ty` passed, and the change was left uncommitted. Of the
+offline suite, 494 passed and 3 failed. Two failed because the sandbox refused `socket.create_server(("127.0.0.1",
+0))` (`Errno 1`). One failed because the worker put its own `TMPDIR` inside the checkout, so a test that
+expects a temp folder outside git did not get one. The worker named all three. **Antigravity** reader
+and builder, print mode, the forms above: the reader ran 15 commands and wrote only in its temp folder;
+the builder ran 28 and edited the tree. Neither asked to leave the sandbox or met a prompt; 5 and 9 of
+their commands carried a "sandbox errors that may or may not be related" notice, and both were stopped
+after about 15 minutes, before writing a report, when the trial was cut short. Muse and DeepSeek Harness ran no whole task, since
+neither has a form ADR 0034 adopts with both properties shown. Afterwards the main clone's
+`core.hooksPath` was `.githooks`, every change Muse made was put back, and the clone was removed; this
+checkout and the real main checkout showed no change.
+
 ## Evidence
 
 Read 2026-11-10. `fetched`: downloaded whole with `curl` and read, not summarised.
@@ -152,5 +206,12 @@ Read 2026-11-10. `fetched`: downloaded whole with `curl` and read, not summarise
   corrected the second run's account and the cause of the `gh` failure, narrowed two table rows and option
   2, added auto mode, `credentials.envVars` and `--settings`, marked ADR 0028 and the managed file's reach
   UNVERIFIED, and supplied the missing item of ADR 0020's list and what lets a session leave option 3.
+* The 2026-11-11 trial — the Muse (worktree), Antigravity and DeepSeek Harness probe outputs, each
+  whole task's event stream and the Codex reports, copied to a session folder outside the repository
+  before the clone was removed. The three Codex rows, the Muse plain-clone row and the Muse
+  `:read-only` stall were printed in the session that ran them and not kept (run).
+* Second reader of the 2026-11-11 trial (`evidence-verifier`, 2026-11-11): it found the Codex reader's
+  refused command, Antigravity's sandbox notices, the four tests and which probe outputs were kept;
+  corrected above.
 * ADR 0028, read 2026-11-10 after it landed: it leaves `uv sync --locked` asking. The sentence on prompts
   above is corrected to say so (read).

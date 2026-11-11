@@ -143,3 +143,5 @@ page and a model summarised it. "Second reader": the `evidence-verifier`, the sa
   counts and the reading of both preprints, and had the departure from ADR 0018 rule 6 stated; all above.
 * ADR 0045, 2026-11-10: three more review runtimes under these terms, and the review lifecycle.
 * ADR 0045 rule 7, 2026-11-10: Codex reads on a named model and effort; rule 5 above is superseded by it.
+* ADR 0034, 2026-11-11: Codex starts in its own sandbox (`:workspace`, `/tmp` read-only) with
+  `approval_policy = "never"` once the owner sets its launch arguments; rule 2 holds until then.
