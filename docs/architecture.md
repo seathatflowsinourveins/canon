@@ -146,6 +146,10 @@ daily bars (ADR 0048).
   that keeps or retires a runtime, model, effort and configuration that builds here, not a gate: an
   adopted runtime other than Claude Code builds in its own workspace, and a Claude lane or the
   coordinator reviews and lands its change (ADR 0058).
+* **Gateway.** OmniRoute on 127.0.0.1 for GPT and other non-Anthropic runtimes, installed on request from
+  mise's `gateway` environment and started on demand by `mise -E gateway run omniroute:serve`; never a
+  Claude credential, account or model, and Claude Code keeps its own login. Its storage key is in the
+  login keychain, which, as for the paper pair, any process of this user can read; `scripts/bootstrap --check` fails on an Anthropic connection (ADR 0056).
 * **Context layers.** None adopted: the runtimes read `AGENTS.md` and take MCP servers, none configured;
   OpenViking, WeKnora, Serena and Context7 are watched until a reviewer trial on the benchmark shows a
   gain (ADR 0051).
