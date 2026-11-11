@@ -14,6 +14,9 @@
 #   test scripts  every tracked executable scripts/test-*, each as its own check, in name order
 #   workflows     actionlint on .github/workflows/*.yml and *.yaml; a skip line when there are none
 #   pytest        skipped tests are listed under the `ok pytest` line with their reasons
+#   skipped cases a test script's skipped cases are listed under its `ok` line, and counted and named again
+#                 in one line before the last (on GitHub also as a warning annotation), so a green run
+#                 does not read as a check of them
 #   mise configs  before anything runs: a config mise loads from a folder above the checkout (anything but
 #                 the checkout's, the global one and /etc/mise) stops the run, naming the file
 #
@@ -141,13 +144,15 @@ head_line() { n=$((n+1)); KIND[n]="head"; TEXT[n]="$1"; NOTE[n]=""; }
 skip_line() { n=$((n+1)); KIND[n]="skip"; TEXT[n]="$1"; NOTE[n]=""; }
 # job [--skips] [--git-env] <label> <command...>: start a check in the background, without git's local
 # variables unless --git-env is given. On success, --skips lists pytest's SKIPPED lines and --notes the
-# `  skip  ` lines a test script prints, so a skip inside a check stays visible.
+# `  skip  ` lines a test script prints, and the `<name>: skip (` line of a script that skips as a whole
+# (test-maintenance off macOS), so a skip inside a check stays visible.
+NOTES='^  skip  |^[a-z][a-z-]*: skip \('
 job() {
   local note="" keep=0
   while :; do
     case "$1" in
       --skips) note='^SKIPPED'; shift ;;
-      --notes) note='^  skip  '; shift ;;
+      --notes) note=$NOTES; shift ;;
       --git-env) keep=1; shift ;;
       *) break ;;
     esac
@@ -318,6 +323,7 @@ failing() {
 }
 
 fail=0
+SKIPPED=()   # "<test script>: <case>" for every case a passing test script skipped
 i=1
 while [ "$i" -le "$n" ]; do
   case "${KIND[i]}" in
@@ -330,6 +336,13 @@ while [ "$i" -le "$n" ]; do
         if [ -n "${NOTE[i]}" ]; then
           grep -E "${NOTE[i]}" "$WORK/$i.out" >"$WORK/$i.skips"
           indent "$WORK/$i.skips"
+          if [ "${NOTE[i]}" = "$NOTES" ]; then
+            # the case's name is what precedes its reason: "  skip  <case> (<why>)"; a name holds no " ("
+            while IFS= read -r l; do
+              case "$l" in "  skip  "*) c=${l#  skip  }; c=${c%% (*} ;; *) c="every case" ;; esac
+              SKIPPED+=("${TEXT[i]}: $c")
+            done <"$WORK/$i.skips"
+          fi
         fi
       else
         printf '  FAIL  %s\n' "${TEXT[i]}"
@@ -341,4 +354,16 @@ while [ "$i" -le "$n" ]; do
   i=$((i+1))
 done
 
+# Every skipped self-test case once more, counted and named in one line, and on GitHub as a warning annotation
+# (workflow commands, "Setting a warning message"), so the hosted Ubuntu run's skips are not quiet lines in a
+# long log: there, the macOS-only cases are run by the workflow's macOS job instead (ADR 0082).
+if [ "${#SKIPPED[@]}" -gt 0 ]; then
+  list=$(printf '; %s' "${SKIPPED[@]}"); list=${list#; }
+  if [ "${GITHUB_ACTIONS:-}" = true ]; then
+    # a workflow command's data escapes %, CR and LF (actions/toolkit, command.ts: escapeData)
+    data=${list//%/%25}; data=${data//$'\r'/%0D}; data=${data//$'\n'/%0A}
+    echo "::warning title=${#SKIPPED[@]} self-test case(s) skipped::not checked on this runner: $data"
+  fi
+  echo "ci: ${#SKIPPED[@]} self-test case(s) skipped, so NOT CHECKED here: $list"
+fi
 if [ "$fail" -eq 0 ]; then echo "ci: all checks passed"; else echo "ci: FAILED"; exit 1; fi

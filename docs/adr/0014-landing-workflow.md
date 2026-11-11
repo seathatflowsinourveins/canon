@@ -128,3 +128,5 @@ Read 2026-11-09. "Read by the orchestrator" means the raw file was fetched and r
 * `gh` 2.103.3's own help for `pr create`, `pr merge`, `pr checks`, `repo edit` and `api` — the flags the
   script uses (read by the orchestrator).
 * Restated 2026-11-10 against `scripts/land` and `scripts/check-addresses`: rules 2, 3, 6 and 9.
+* 2026-11-11: the self-test cases the Ubuntu job skips also run on a hosted macOS runner, in a job that
+  reports and is not yet required; ADR 0082 records it.

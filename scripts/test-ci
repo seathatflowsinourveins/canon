@@ -196,6 +196,22 @@ check "a test script's skip line shows under ok"   line_after '^  ok    test-not
 check "its other output does not"                  test "$(printf '%s\n' "$OUT" | grep -c 'other output')" = 0
 }
 
+# --- skipped self-test cases: a script that skips as a whole shows under its ok line, and one line before the
+# verdict counts and names every skipped case, on GitHub also as a warning annotation ---
+case_skipsum() {
+fresh skipsum
+printf '#!/bin/bash\necho "  skip  case x (no lockf here (macOS only))"\necho "  skip  case y (no nc)"\nexit 0\n' >"$C/scripts/test-note"
+printf '#!/bin/bash\necho "test-whole: skip (no /usr/bin/lockf here; macOS only)"\nexit 0\n' >"$C/scripts/test-whole"
+chmod +x "$C/scripts/test-note" "$C/scripts/test-whole"
+gitq -C "$C" add -A; gitq -C "$C" commit -q -m skips
+GITHUB_ACTIONS=true runci
+check "a script that skips as a whole: its line under ok" line_after '^  ok    test-whole$' '^        test-whole: skip [(]no /usr/bin/lockf'
+check "one line before the verdict counts and names every skipped case" \
+      line_after '^ci: 3 self-test case[(]s[)] skipped, so NOT CHECKED here: test-note: case x; test-note: case y; test-whole: every case$' '^ci: all checks passed$'
+check "... and on GitHub as a warning annotation" has '^::warning title=3 self-test case\(s\) skipped::not checked on this runner: test-note: case x; '
+check "... and the run still passes"               test "$RC" = 0
+}
+
 # --- a check that dies before recording its exit status fails ---
 case_died() {
 fresh died
@@ -384,7 +400,7 @@ check "nor a quoted inner FAIL"                    test "$(printf '%s\n' "$OUT" 
 }
 
 # Every case above works in its own copy, so they run concurrently; their output prints in this order.
-CASES="yaml noflows shell staged untracked tests testdir testgone notes died symlink deleted deleted2 lockfail hookenv parallel order missing pathorder strayconfig longfail"
+CASES="yaml noflows shell staged untracked tests testdir testgone notes skipsum died symlink deleted deleted2 lockfail hookenv parallel order missing pathorder strayconfig longfail"
 for c in $CASES; do ( "case_$c" ) >"$TMP/out.$c" 2>&1 & done
 wait
 for c in $CASES; do cat "$TMP/out.$c"; done

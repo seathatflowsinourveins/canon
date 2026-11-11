@@ -10,7 +10,10 @@
 # nothing reaches the network. The --install case for a missing CLI drops the claude stub from PATH and uses
 # a curl stub that serves an installer stub recording the version it was asked for. A case that needs a macOS-only tool is skipped with a line saying so.
 # One exception: the paper:store case writes to the real login keychain, under throwaway services only, and
-# deletes what it wrote on exit (ADR 0033).
+# deletes what it wrote on exit (ADR 0033); with CANON_TEST_NO_KEYCHAIN set it is skipped by name instead, so a
+# hosted runner gets no keychain item.
+# With CANON_TEST_ALLOWED_SKIPS set (case names separated by ";", empty for none), a case that would be skipped
+# and is not named there fails instead: the hosted macOS job exists to run the macOS-only cases (ADR 0082).
 # Exit 0 if every case behaves as expected, 1 otherwise.
 # shellcheck disable=SC2016  # stub bodies and eval'd checks are single-quoted so they expand when they run
 set -uo pipefail
@@ -24,6 +27,8 @@ TMP=$(mktemp -d "${TMPDIR:-/tmp}/canon-test-lanes.XXXXXX") \
   || { echo "test-lanes: could not create a temp folder under ${TMPDIR:-/tmp}; nothing was written" >&2; exit 1; }
 trap 'rm -rf "$TMP"' EXIT
 pass=0; fail=0; skipped=0; skips=""
+STRICT_SKIPS=${CANON_TEST_ALLOWED_SKIPS+1}; ALLOWED_SKIPS=";${CANON_TEST_ALLOWED_SKIPS-};"
+NO_KEYCHAIN=${CANON_TEST_NO_KEYCHAIN:-}
 # No git command here may find a repository above the temp folder, this clone's included: install and
 # uninstall set and unset core.hooksPath and the credential helper of the repository they run from (a second
 # reader's probe, run in place, unset this clone's), so a temp repository that is not there must fail, not
@@ -66,7 +71,13 @@ PATH="$TMP/python:$PATH"
 
 t_pass() { pass=$((pass+1)); echo "  pass  $1"; }
 t_fail() { fail=$((fail+1)); echo "  FAIL  $1"; }
-skip()   { skipped=$((skipped+1)); skips="$skips; $1"; echo "  skip  $1 ($2)"; }
+# skip <case> <why>: the case checked nothing here; under CANON_TEST_ALLOWED_SKIPS one not named there fails.
+# A case name holds no " (", which scripts/ci reads as the start of the reason.
+skip()   {
+  [[ "$1" != *" ("* ]] || { t_fail "skip case name holds \" (\": $1"; return; }
+  if [ -n "$STRICT_SKIPS" ] && [[ "$ALLOWED_SKIPS" != *";$1;"* ]]; then t_fail "$1 must run here, and was skipped ($2)"; return; fi
+  skipped=$((skipped+1)); skips="$skips; $1"; echo "  skip  $1 ($2)"
+}
 # check <label> <command...>: passes when the command succeeds
 check()  { local label="$1"; shift; if "$@"; then t_pass "$label"; else t_fail "$label"; fi; }
 jqt()    { jq -e "$2" "$1" >/dev/null 2>&1; }                 # jqt <file> <jq boolean>
@@ -2011,7 +2022,8 @@ pabsent() { local a s; for s in "$tsvc" "$tsvc-windows"; do for a in ALPACA_API_
 pabsentw() { local a; for a in ALPACA_API_KEY ALPACA_SECRET_KEY; do
   HOME="$REAL_HOME" /usr/bin/security find-generic-password -s "$tsvc-windows" -a "$a" >/dev/null 2>&1; [ $? = 44 ] || return 1; done; }
 pread() { HOME="$REAL_HOME" /usr/bin/security find-generic-password -s "${2:-$tsvc}" -a "$1" -w 2>/dev/null; }
-if [ ! -x /usr/bin/security ]; then skip "paper:store on a terminal" "no /usr/bin/security here (macOS only)"
+if [ -n "$NO_KEYCHAIN" ]; then skip "paper:store on a terminal" "CANON_TEST_NO_KEYCHAIN is set: no keychain item is written here"
+elif [ ! -x /usr/bin/security ]; then skip "paper:store on a terminal" "no /usr/bin/security here (macOS only)"
 elif [ ! -x /usr/bin/expect ]; then skip "paper:store on a terminal" "no /usr/bin/expect to make a pseudo-terminal"
 elif ! /usr/bin/expect -c 'spawn -noecho true; expect eof' >/dev/null 2>&1; then
   skip "paper:store on a terminal" "expect could not open a pseudo-terminal here"
@@ -2523,13 +2535,13 @@ rm -f "$HOME/.local/bin/claude"
 
 check "this clone's own git config is as the run found it (core.hooksPath, the github.com credential helper)" \
       eval '[ "$(real_git core.hooksPath)" = "$REAL_HOOKS" ] && [ "$(real_git credential.https://github.com.helper)" = "$REAL_HELPER" ]'
-echo "test-lanes: $pass passed, $fail failed, $skipped skipped"
-# A skipped case checked nothing (GitHub's Ubuntu runner has no lockf(1), plutil or launchd, so the runner, the
-# paper lock's deadline and the install rehearsal run only on a Mac; ADR 0050): said last, and on GitHub as a
-# warning annotation (workflow commands, "Setting a warning message"), so a green run does not read as a
-# check of them.
+# A skipped case checked nothing (GitHub's Ubuntu runner has no lockf(1), plutil or a usable expect, so the
+# runner, the paper lock's deadline and the install rehearsal run on a Mac: this one and the hosted macOS job,
+# ADR 0082): one line, last, with the count and the names, so a green run does not read as a check of them.
+# scripts/ci repeats the names in a line of its own before its verdict.
 if [ "$skipped" -gt 0 ]; then
-  echo "test-lanes: NOT CHECKED here (skipped):${skips#;}"
-  [ "${GITHUB_ACTIONS:-}" != true ] || echo "::warning title=test-lanes skipped $skipped case(s)::not checked on this runner:${skips#;}"
+  echo "test-lanes: $pass passed, $fail failed, $skipped skipped, so NOT CHECKED here:${skips#;}"
+else
+  echo "test-lanes: $pass passed, $fail failed, 0 skipped"
 fi
 [ "$fail" -eq 0 ]
