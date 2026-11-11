@@ -198,6 +198,23 @@ Where they differ in a way a script here depends on:
   "strayconfig"), and a self-test that runs mise in a temp folder bounds it there with
   `MISE_CEILING_PATHS`. Nothing guards the paper session runner, which runs mise in its clone under
   `~/.claude/canon`: a config there, in `~/.claude` or in `~` reaches its window.
+* **A git checkout above a temp folder.** git looks for a repository in every folder above the one it runs
+  in, unless `GIT_CEILING_DIRECTORIES` stops it (git(1)). The test that a folder outside every checkout has
+  no default ledger found the enclosing worktree when pytest's `--basetemp` was put inside one; it now
+  plants a checkout above its folder and bounds git at the folder (`tests/test_ledger.py`, with a control
+  showing the planted checkout is found unbounded). No route here sets a basetemp inside a checkout by
+  default: every runtime's `TMPDIR` is the per-user temporary folder, and the build eval makes its trees
+  with `tempfile`. A `--basetemp`, or a `TMPDIR` or `PYTEST_DEBUG_TEMPROOT` pointing into a checkout, would.
+* **Permission rules.** Every Orca-started Claude worker runs with `--dangerously-skip-permissions`; Claude
+  Code still prompts for "Tools matched by an explicit ask rule" in that mode, and a PreToolUse hook's
+  "allow" does not override one (Claude Code's permission-modes and permissions pages). A rule matches the
+  command text after Claude Code strips `timeout`, `time`, `nice`, `nohup`, `stdbuf`, `command`, `builtin`
+  and leading assignments; it "isn't a security boundary around the program": the same program by absolute
+  path, inside `bash -c`, behind `mise x` or `mise exec` without `--`, or `git -C . push` is not matched
+  (same page). An exact pin whose package name holds `-U`, `-P` or `-index` matches an ask rule and
+  prompts. Orca's `orca-agent-view` plugin registers only interface, session and command events; Orca's
+  own hook in the user settings answers `PermissionRequest` with no decision and relays the Orca app's
+  answer to `PreToolUse`, bounded at 8 s.
 * **The Claude config folder.** Sessions, the lane watchdog and `scripts/lanes` each read
   `${CLAUDE_CONFIG_DIR:-~/.claude}`; the watchdog's is fixed at install. They agree while Orca's profile
   pointer is empty; nothing checks that they still agree.

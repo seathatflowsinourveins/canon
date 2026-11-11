@@ -437,13 +437,36 @@ def test_every_directory_resolves_the_one_ledger_of_the_clone(
     assert found == {Path(common).parent / "ledger" / "trials.db"}
 
 
+def _outside_below_a_planted_checkout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A folder with a git checkout planted above it, standing in for one that holds pytest's basetemp
+    (a run with --basetemp inside a worktree found that worktree's repository)."""
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True, capture_output=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    monkeypatch.setattr(canon_trading.ledger, "__file__", str(outside / "ledger.py"))
+    return outside
+
+
 def test_outside_a_git_checkout_there_is_no_default_ledger(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(canon_trading.ledger, "__file__", str(tmp_path / "ledger.py"))
+    """git does not look above a GIT_CEILING_DIRECTORIES folder for a repository (git(1)), so the folder is
+    outside every checkout wherever the temp folder is, a checkout planted above it included."""
+    _outside_below_a_planted_checkout(tmp_path, monkeypatch)
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.resolve()))
 
     with pytest.raises(LedgerNotFound, match="not in a git checkout"):
         default_ledger_path()
+
+
+def test_the_planted_checkout_is_found_when_nothing_bounds_git(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The control: without the ceiling, the checkout planted above the folder is the one found."""
+    _outside_below_a_planted_checkout(tmp_path, monkeypatch)
+    monkeypatch.delenv("GIT_CEILING_DIRECTORIES", raising=False)
+
+    assert default_ledger_path() == tmp_path.resolve() / "ledger" / "trials.db"
 
 
 def test_reading_a_missing_ledger_creates_nothing(tmp_path: Path) -> None:

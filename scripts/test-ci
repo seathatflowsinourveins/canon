@@ -362,8 +362,29 @@ check "mise config ls failing fails the run"     test "$RC" = 1
 check "... saying so"                             has "mise config ls --json. failed"
 }
 
+# --- a failing check whose output is longer than 40 lines still names its failing case ---
+case_longfail() {
+fresh longfail
+# shellcheck disable=SC2016  # expanded by the test script, not here
+{ printf '#!/bin/bash\necho "  FAIL  a case in the first forty"\n'
+  printf 'for i in $(seq 49); do echo "  ok    case $i"; done\n'
+  printf 'echo "  pass  a label that says FAILED, exit 1"\necho "          FAIL  quoted inner output"\n'
+  printf 'echo "  FAIL  the case past line forty"\necho "ERROR tests/x.py::t - an import failed"\n'
+  printf 'for i in $(seq 31); do echo "FAILED tests/y.py::t$i"; done\nexit 1\n'; } >"$C/scripts/test-long"
+chmod +x "$C/scripts/test-long"
+gitq -C "$C" add -A; gitq -C "$C" commit -q -m long
+runci
+check "a failing case past the first 40 lines is shown" line_after '^  FAIL  test-long$' '^          FAIL  the case past line forty$'
+check "... and pytest's ERROR line"                has '^        ERROR tests/x\.py::t - an import failed$'
+check "... thirty at most, the rest counted"       has '^        \.\.\. 3 more failure lines$'
+check "... then the first 40 lines"                has '^        --- its first 40 lines:$'
+check "a failure line in the first 40 is shown once" test "$(printf '%s\n' "$OUT" | grep -c 'a case in the first forty')" = 1
+check "a passing label holding FAILED is not a failure line" test "$(printf '%s\n' "$OUT" | grep -c 'a label that says FAILED')" = 0
+check "nor a quoted inner FAIL"                    test "$(printf '%s\n' "$OUT" | grep -c 'quoted inner output')" = 0
+}
+
 # Every case above works in its own copy, so they run concurrently; their output prints in this order.
-CASES="yaml noflows shell staged untracked tests testdir testgone notes died symlink deleted deleted2 lockfail hookenv parallel order missing pathorder strayconfig"
+CASES="yaml noflows shell staged untracked tests testdir testgone notes died symlink deleted deleted2 lockfail hookenv parallel order missing pathorder strayconfig longfail"
 for c in $CASES; do ( "case_$c" ) >"$TMP/out.$c" 2>&1 & done
 wait
 for c in $CASES; do cat "$TMP/out.$c"; done
