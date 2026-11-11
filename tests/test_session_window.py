@@ -861,7 +861,7 @@ def test_a_window_whose_account_check_fails_is_recorded_failed_not_ok(
     monkeypatch.setattr(session_window, "window_node", lambda config, **kw: (Ran(), s, cap))
     monkeypatch.setattr(session_window, "_run_node", lambda node, ends: None)
 
-    def unreachable(trading, config, report):
+    def unreachable(trading, config, report, **kwargs):
         raise RuntimeError("Alpaca answered 503")
 
     monkeypatch.setattr(session_window, "_flatten_after_stop", unreachable)
@@ -1000,7 +1000,7 @@ def test_a_stop_that_hangs_is_bounded_recorded_failed_and_the_account_still_chec
     monkeypatch.setattr(
         session_window,
         "_flatten_after_stop",
-        lambda trading, config, report: checked.append("checked") or [],
+        lambda trading, config, report, **kwargs: checked.append("checked") or [],
     )
     raised: list[BaseException] = []
 
@@ -1072,7 +1072,11 @@ class Clearing(Holding):
             raise APIError('{"code": 40310000, "message": "insufficient qty available"}')
         self.calls.append(f"close {symbol}")
         if self.queue_closes:  # a DAY market order after the close waits for the next session
-            self.orders.append(SimpleNamespace(id="c-1", client_order_id="close-1"))
+            self.orders.append(
+                SimpleNamespace(
+                    id="c-1", client_order_id="close-1", side="sell", qty="1", type="market"
+                )
+            )
             self.is_open = False
         else:
             self.qty = 0
@@ -1737,7 +1741,11 @@ class Unanswered(Holding):
 
     def close_position(self, symbol):
         self.calls.append(f"close {symbol}")
-        self.orders = [SimpleNamespace(id="c-1", client_order_id="alpaca-made-1")]
+        self.orders = [
+            SimpleNamespace(
+                id="c-1", client_order_id="alpaca-made-1", side="sell", qty="1", type="market"
+            )
+        ]
         raise requests.ReadTimeout("read timed out")
 
 
@@ -2089,3 +2097,267 @@ def test_a_worker_call_left_after_a_clean_stop_is_bounded(monkeypatch) -> None:
         assert len(session_window._ABANDONED) == 1
     finally:
         release.set()
+
+
+# An independent review of the account check (2026-11-10): each shown here before its fix.
+
+
+def test_a_node_order_with_no_answer_is_in_doubt() -> None:
+    """An order the adapter sent and heard nothing back for (`_log_unknown_outcome`) stays submitted."""
+    orders = {
+        "lost": ["OrderInitialized", "OrderSubmitted"],
+        "taken": ["OrderInitialized", "OrderSubmitted", "OrderAccepted"],
+        "refused": ["OrderInitialized", "OrderSubmitted", "OrderRejected"],
+        "denied": ["OrderInitialized", "OrderDenied"],
+        "filled": ["OrderInitialized", "OrderSubmitted", "OrderFilled"],
+    }
+    assert session_window.in_doubt(orders) == ["lost"]
+
+
+class LateAccept(Holding):
+    """A flat account where the node's submit `entry-late` timed out but reaches Alpaca `polls` lookups
+    later, as an open buy."""
+
+    def __init__(self, polls: int) -> None:
+        super().__init__()
+        self.orders, self.qty = [], 0
+        self.polls = polls
+
+    def get_order_by_client_id(self, client_id):
+        self.calls.append(f"lookup {client_id}")
+        if self.polls:
+            self.polls -= 1
+            raise APIError(
+                '{"code": 40410000, "message": "order not found"}',
+                SimpleNamespace(response=SimpleNamespace(status_code=404)),
+            )
+        canceled = "cancel n-1" in self.calls
+        if not canceled and not any(o.id == "n-1" for o in self.orders):
+            self.orders.append(SimpleNamespace(id="n-1", client_order_id=client_id))
+        status = "canceled" if canceled else "accepted"
+        return SimpleNamespace(id="n-1", client_order_id=client_id, status=status)
+
+    def get_orders(self, filter=None) -> list:
+        return list(self.orders)
+
+    def cancel_order_by_id(self, order_id) -> None:
+        self.calls.append(f"cancel {order_id}")
+        self.orders = [o for o in self.orders if o.id != order_id]
+
+
+def test_a_flat_reading_with_a_node_order_in_doubt_is_not_flat(fake_time) -> None:
+    """The check read no open order and no position and recorded ok, while a submit whose answer was
+    lost could still be taken by Alpaca after it: a live buy outside the check."""
+    account = LateAccept(polls=2)
+    report = session_window.WindowReport("regular", "SPY", started="t")
+    left = session_window._flatten_after_stop(
+        cast(TradingClient, account), WindowConfig(), report, in_doubt=["entry-late"]
+    )
+    assert "cancel n-1" in account.calls and left == []
+
+
+def test_a_node_order_never_found_is_left_named(fake_time) -> None:
+    account = LateAccept(polls=10_000)
+    report = session_window.WindowReport("regular", "SPY", started="t")
+    left = session_window._flatten_after_stop(
+        cast(TradingClient, account), WindowConfig(), report, in_doubt=["entry-late"]
+    )
+    assert left == ["order entry-late: sent with no answer, not found at Alpaca"]
+
+
+class LostCloseAndLateBuy(Holding):
+    """One share held and no order open; the check's close is placed but its answer times out, and the
+    node's late buy appears with it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.orders = []
+        self.polls = 3
+
+    def get_orders(self, filter=None) -> list:
+        if any(o.id == "c-1" for o in self.orders):
+            if self.polls:
+                self.polls -= 1
+            else:  # the close fills
+                self.orders, self.qty = [o for o in self.orders if o.id != "c-1"], 0
+        return list(self.orders)
+
+    def cancel_order_by_id(self, order_id) -> None:
+        self.calls.append(f"cancel {order_id}")
+        self.orders = [o for o in self.orders if o.id != order_id]
+
+    def close_position(self, symbol):
+        self.calls.append(f"close {symbol}")
+        self.orders = [
+            SimpleNamespace(
+                id="n-1", client_order_id="entry-late", side="buy", qty="1", type="market"
+            ),
+            SimpleNamespace(
+                id="c-1", client_order_id="alpaca-1", side="sell", qty="1", type="market"
+            ),
+        ]
+        raise requests.ReadTimeout("read timed out")
+
+
+def test_a_late_order_seen_after_a_lost_close_is_not_taken_for_the_close(fake_time) -> None:
+    """Every order first seen after a close attempt was taken for the check's own close, so a late buy
+    of the node's was left working; the close is now the order matching its side, size and type."""
+    account = LostCloseAndLateBuy()
+    report = session_window.WindowReport("regular", "SPY", started="t")
+    left = session_window._flatten_after_stop(cast(TradingClient, account), WindowConfig(), report)
+    assert account.calls == ["close SPY", "cancel n-1"] and left == []
+
+
+def test_the_window_hands_the_nodes_orders_in_doubt_to_the_check(monkeypatch, tmp_path) -> None:
+    class OrderInitialized: ...
+
+    class OrderSubmitted: ...
+
+    lost = SimpleNamespace(
+        client_order_id=SimpleNamespace(value="entry-late"),
+        events=lambda: [OrderInitialized(), OrderSubmitted()],
+    )
+
+    class Ran:
+        cache = SimpleNamespace(orders=lambda **kwargs: [lost])
+
+        def dispose(self) -> None: ...
+
+    s = SimpleNamespace(dropped=[], history_bars=0, history_dropped=0)
+    cap = SimpleNamespace(checks=1, peak=Decimal(0), tripped=None)
+    handed: list = []
+    monkeypatch.setattr(session_window, "_ABANDONED", [])
+    monkeypatch.setattr(session_window, "paper_trading", lambda: Account())
+    monkeypatch.setattr(session_window, "window_node", lambda config, **kw: (Ran(), s, cap))
+    monkeypatch.setattr(session_window, "_run_node", lambda node, ends: None)
+    monkeypatch.setattr(
+        session_window,
+        "_flatten_after_stop",
+        lambda trading, config, report, **kw: handed.append(kw["in_doubt"]) or [],
+    )
+    session_window.run_window(WindowConfig(log_dir=tmp_path))
+    assert handed == [["entry-late"]]
+
+
+class LostCloseNothingPlaced(Holding):
+    """One share held; the first close's answer is lost and nothing was placed, then a foreign buy
+    appears; the second close is answered and fills."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.orders = []
+        self.closes = 0
+
+    def get_orders(self, filter=None) -> list:
+        return list(self.orders)
+
+    def cancel_order_by_id(self, order_id) -> None:
+        self.calls.append(f"cancel {order_id}")
+        self.orders = [o for o in self.orders if o.id != order_id]
+
+    def close_position(self, symbol):
+        self.calls.append(f"close {symbol}")
+        self.closes += 1
+        if self.closes == 1:
+            self.orders = [
+                SimpleNamespace(
+                    id="n-1", client_order_id="entry-late", side="buy", qty="1", type="market"
+                )
+            ]
+            raise requests.ReadTimeout("read timed out")
+        self.qty = 0
+        return SimpleNamespace(id="c-2")
+
+
+def test_a_foreign_order_after_a_lost_close_that_placed_nothing_is_canceled(fake_time) -> None:
+    account = LostCloseNothingPlaced()
+    report = session_window.WindowReport("regular", "SPY", started="t")
+    left = session_window._flatten_after_stop(cast(TradingClient, account), WindowConfig(), report)
+    assert account.calls == ["close SPY", "cancel n-1", "close SPY"] and left == []
+
+
+class Unlisted(Holding):
+    """Flat by the listing and the position, while the lookup of the node's order in doubt finds it
+    accepted (the two endpoints not yet agreeing); its lookup fails first with a 500."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.orders, self.qty = [], 0
+        self.lookups = 0
+        self.canceled = False
+
+    def get_order_by_client_id(self, client_id):
+        self.lookups += 1
+        if self.lookups == 1:
+            raise APIError('{"code": 50000000, "message": "internal server error"}')
+        status = "canceled" if self.canceled else "accepted"
+        return SimpleNamespace(id="n-1", client_order_id=client_id, status=status)
+
+    def get_orders(self, filter=None) -> list:
+        return []
+
+    def cancel_order_by_id(self, order_id) -> None:
+        self.calls.append(f"cancel {order_id}")
+        self.canceled = True
+
+
+def test_an_order_found_by_its_lookup_but_not_listed_is_canceled_not_taken_as_flat(
+    fake_time,
+) -> None:
+    account = Unlisted()
+    report = session_window.WindowReport("regular", "SPY", started="t")
+    left = session_window._flatten_after_stop(
+        cast(TradingClient, account), WindowConfig(), report, in_doubt=["entry-late"]
+    )
+    assert account.calls == ["cancel n-1"] and left == []
+    assert any("looking up entry-late" in e for e in report.errors)
+
+
+class RefusedThenLateSell(Holding):
+    """One share held; the close is refused with Alpaca's 403 (nothing placed), and then the node's late
+    market sell of one share appears; the second close, once it has gone, fills."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.orders = []
+        self.closes = 0
+
+    def get_orders(self, filter=None) -> list:
+        return list(self.orders)
+
+    def cancel_order_by_id(self, order_id) -> None:
+        self.calls.append(f"cancel {order_id}")
+        self.orders = [o for o in self.orders if o.id != order_id]
+
+    def close_position(self, symbol):
+        self.closes += 1
+        if self.closes == 1:
+            self.calls.append("close refused")
+            self.orders = [
+                SimpleNamespace(
+                    id="n-1", client_order_id="exit-late", side="sell", qty="1", type="market"
+                )
+            ]
+            raise APIError(
+                '{"code": 40310000, "message": "insufficient qty available"}',
+                SimpleNamespace(response=SimpleNamespace(status_code=403)),
+            )
+        self.calls.append(f"close {symbol}")
+        self.qty = 0
+        return SimpleNamespace(id="c-2")
+
+
+def test_a_refused_close_is_not_a_lost_one(fake_time) -> None:
+    """A close Alpaca refused placed nothing, so a matching order seen after it is not the check's."""
+    account = RefusedThenLateSell()
+    report = session_window.WindowReport("regular", "SPY", started="t")
+    left = session_window._flatten_after_stop(cast(TradingClient, account), WindowConfig(), report)
+    assert account.calls == ["close refused", "cancel n-1", "close SPY"] and left == []
+
+
+def test_an_order_with_no_quantity_is_no_close() -> None:
+    notional = SimpleNamespace(side="sell", qty=None, type="market")
+    assert not session_window._matches_close(notional, Decimal(1))
+    assert session_window._matches_close(
+        SimpleNamespace(side="sell", qty="1", type="market"), Decimal(1)
+    )

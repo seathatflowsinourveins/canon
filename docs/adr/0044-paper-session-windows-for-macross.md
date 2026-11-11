@@ -168,6 +168,25 @@ heartbeat whose own write failure hid the run's error, the delay set by a second
 then the runner is left as after an abandoned stop); each fixed, the first two and the last covered by a
 new test.
 
+An independent review of the check as landed (2026-11-10), each fix first shown by a failing test in the
+same file:
+
+* A node order whose submit answer was lost (the adapter logs an unknown outcome and leaves it submitted)
+  could be taken by Alpaca after the check read the account flat, a live order after an `ok` record: each
+  such order is now looked up by its client order ID each poll, the account is not flat while one is not
+  found, and one never found is named in what is left, so the window is recorded failed.
+* After a close attempt every order first seen was taken for the check's own close, so a late order of
+  the node's was left working: the close is the order `close_position` returns, or, when that answer is
+  lost, the first new market order on the close's side for the held quantity; any other is canceled.
+
+Code review (`/code-review`, high) of those two: a failed lookup skipped the whole poll, an order the
+lookup found but the listing did not yet show was taken as flat, a close Alpaca refused (403, 422) was
+taken as one whose answer was lost, the orders in doubt were read before the abandoned node's last calls
+had ended, a notional order's empty quantity ended the check, and the order's deprecated `order_type`
+was read; each fixed, the first three and the fifth covered by a new test. That Alpaca answers 404 for a
+client order ID it does not hold, as the adapter's lookup also reads it, is UNVERIFIED against its
+documentation.
+
 On paper, 2026-11-10, after the close: a regular window refused, "the regular session is closed". An
 extended window started at 16:12 New York, before the adapter's extended-hours change was on `main`,
 against the condition for extended runs; the gate above now refuses that. The cap stopped it at its first
@@ -241,3 +260,9 @@ Read 2026-11-10. "raw": fetched with `curl` and read whole. NautilusTrader files
   a market exit, then stops the strategy once flat or once `market_exit_max_attempts` is reached".
 * A third second reader's review of the window (2026-11-10): four findings beyond the six, reproduced
   offline and fixed above (run).
+* alpaca-py 0.45.0 in `.venv`, `trading/client.py`: `close_position` returns "The order that was placed to
+  close the position"; `get_order_by_client_id` returns an order by its client order ID (`bundled`).
+  `packages/canon-alpaca/src/canon_alpaca/execution.py`, `_submit_order`: a submit whose answer is lost
+  is logged as an unknown outcome and left submitted (read).
+* An independent review of the check as landed (2026-11-10): two findings, reproduced offline and fixed
+  above (run).
