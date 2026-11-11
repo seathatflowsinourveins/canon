@@ -26,7 +26,8 @@ Two departures from `MaCross`, both for live use:
   a buy at the ask plus the offset, a sell at the bid minus it, rounded to the cent away from the market's
   side. A limit not filled within `limit_timeout_secs` is canceled and its signal dropped, never chased:
   a dropped entry is not sent again until the fast average has gone below the slow, nor a dropped close
-  until it has gone above (a bar with the two equal is no cross); the next cross takes its own. A short's
+  until it has gone above (a bar with the two equal is no cross), seen on any bar, the dropped limit's
+  cancel still pending or not; the next cross takes its own. A short's
   buy-back and the wind-down's close are not signals and are not held back. With no quote yet the signal is dropped for that bar.
 
 * **Closes are not reduce-only.** `MaCross` exits with `close_all_positions`, which sends a reduce-only
@@ -265,6 +266,11 @@ class SessionMaCross(MaCross):
     def on_bar(self, bar: Bar) -> None:
         if bar.bar_type == self.bar_type:
             self.live_bars += 1  # the averages have already taken this bar
+        decides = self.hydrated and self.indicators_initialized()
+        above = below = False
+        if decides:  # an opposite cross clears a dropped signal on any bar, an order working or not
+            above, below = self.fast.value > self.slow.value, self.fast.value < self.slow.value
+            self._clear_dropped(above=above, below=below)
         if self.working() or self.is_exiting():
             return
         held = self.held()
@@ -275,10 +281,8 @@ class SessionMaCross(MaCross):
         if held < 0:  # it never sells short; a short is closed at once
             self._close()
             return
-        if not self.hydrated or not self.indicators_initialized():
+        if not decides:
             return
-        above, below = self.fast.value > self.slow.value, self.fast.value < self.slow.value
-        self._clear_dropped(above=above, below=below)
         if above and not held and self.dropped_side != OrderSide.BUY:
             self._signal(self._enter())
         elif below and held > 0 and self.dropped_side != OrderSide.SELL:
