@@ -1363,9 +1363,14 @@ for how in fails says-nothing says-relative; do
   check "status, a getconf that $how: the paper row UNKNOWN, saying so, its last exit code shown" \
         eval 'rowis "$TMP/status.out" "paper session" UNKNOWN && grep -q "loaded, last exit code=0, but the per-user temporary folder is not known" "$TMP/status.out"'
 done
-# install's check of the origin writes no records, so it needs no records folder
-env -i HOME="$GC/home" CANON_GETCONF="$GC/fails" /bin/bash "$ROOT/home/.claude/canon/paper-session.sh" --checkout-only "$B/mise" "$GC/checkout" "$OURL" > "$GC/out" 2>&1; rc=$?
-check "... but --checkout-only, which writes no records, still runs: exit 0" eval '[ "$rc" = 0 ] && [ -d "$GC/checkout/.git" ]'
+# install's check of the origin writes no records, so it needs no records folder (the runner itself needs
+# lockf(1) and timeout(1) at /usr/bin, as the firing cases above do)
+if [ ! -x /usr/bin/lockf ] || [ ! -x /usr/bin/timeout ]; then
+  skip "--checkout-only with no per-user temporary folder" "no /usr/bin/lockf or /usr/bin/timeout here (macOS only)"
+else
+  env -i HOME="$GC/home" CANON_GETCONF="$GC/fails" /bin/bash "$ROOT/home/.claude/canon/paper-session.sh" --checkout-only "$B/mise" "$GC/checkout" "$OURL" > "$GC/out" 2>&1; rc=$?
+  check "... but --checkout-only, which writes no records, still runs: exit 0" eval '[ "$rc" = 0 ] && [ -d "$GC/checkout/.git" ]'
+fi
 
 # ---------- paper:check, paper:remove and paper:store's rollback, against a stand-in security ----------
 # Each task's own body from mise.toml, /usr/bin/security swapped for a stand-in that answers each verb and
