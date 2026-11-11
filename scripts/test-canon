@@ -9,7 +9,7 @@
 # Usage: scripts/test-canon [pattern]   run only the sections whose name contains pattern
 #        (names: baseline, registry validation, resolve keeps pins, stale pin, check exits, refs, evidence,
 #        workflows, broken pipe, outdated, network down, mise requests, claude pin, resolve lock, lint hook,
-#        watch and brief, brief toolchain)
+#        watch and brief, brief toolchain, src)
 # Prints one line per case. Exit 0 if every case passes, 1 otherwise. TEST_CANON_VERBOSE=1 shows the
 # output of the command under test for a failing case.
 set -uo pipefail
@@ -521,6 +521,48 @@ sec_pipe_readers() {
         eval '[ "$(wc -l <<<"$out" | tr -d " ")" = 4 ]'
 }
 
+sec_src() {
+  # fails_with <needle...>: the last command failed and its output has every needle
+  # shellcheck disable=SC2329  # run by check, as an argument
+  fails_with() { [ "$rc" -ne 0 ] || return 1; local n; for n in "$@"; do has "$out" "$n" || return 1; done; }
+  fresh
+  trim superpowers madr
+  local rid=madr rrepo remote="$W/remote" work="$W/work" sha dir="$W/srcdir" p
+  rrepo=$(jq -r --arg i "$rid" '.upstreams[] | select(.id == $i) | .repo' "$T/canon/upstreams.json")
+  mkdir -p "$remote/${rrepo%/*}" "$work"
+  gitq -C "$work" init -q && echo one > "$work/f" && gitq -C "$work" add f && gitq -C "$work" commit -q -m one
+  sha=$(git -C "$work" rev-parse HEAD)
+  gitq clone -q --bare "$work" "$remote/$rrepo.git"
+  git -C "$remote/$rrepo.git" config uploadpack.allowAnySHA1InWant true
+  lock_edit ".pins[\"$rid\"].sha = \"$sha\""
+  export CANON_SRC_DIR="$dir" CANON_SRC_BASE="file://$remote"
+  p="$dir/$rid@${sha:0:12}"
+  out=$(canon src "$rid"); rc=$?
+  check "src fetches the locked commit and prints the path"  test "$rc" -eq 0 -a "$out" = "$p"
+  check "... at that commit"                                 test "$(git -C "$p" rev-parse HEAD)" = "$sha"
+  check "... read-only"                                      test ! -w "$p/f"
+  check "... and leaves no temporary folder"                 test "$(find "$dir" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" = 1
+  rm -rf "$remote"
+  out=$(canon src "$rid"); rc=$?
+  check "src keeps a present, matching folder with no network" test "$rc" -eq 0 -a "$out" = "$p"
+  lock_edit ".pins[\"$rid\"].sha = \"dddddddddddddddddddddddddddddddddddddddd\""
+  out=$(canon src "$rid"); rc=$?
+  check "src names an id whose fetch fails" fails_with "src $rid: could not fetch"
+  check "... and leaves no partial folder" test "$(find "$dir" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" = 1
+  # present but mismatched: the folder name carries the locked prefix, its HEAD is another commit
+  lock_edit ".pins[\"$rid\"].sha = \"${sha:0:12}eeeeeeeeeeeeeeeeeeeeeeeeeeee\""
+  out=$(canon src "$rid"); rc=$?
+  check "src fails by name on a present folder whose HEAD is not the lock" fails_with "src $rid: " "lock records ${sha:0:12}eeee"
+  check "... and changes nothing"                            test "$(git -C "$p" rev-parse HEAD)" = "$sha"
+  out=$(canon src no-such-id); rc=$?
+  check "src fails on an unknown id"                         fails_with "no upstream with id"
+  lock_edit ".pins[\"$rid\"].repo = \"other/repo\""
+  out=$(canon src "$rid"); rc=$?
+  check "src fails on a lock whose repo is not the registry's, naming resolve" fails_with "run scripts/canon resolve $rid"
+  chmod -R u+w "$dir" 2>/dev/null
+  unset CANON_SRC_DIR CANON_SRC_BASE
+}
+
 sec_claude_pin() {
   fresh
   local st="$T/home/.claude/settings.json" shape="claude-code must be tracked as a release tag of dotted numbers"
@@ -700,7 +742,7 @@ sec_brief_toolchain() {
 # Each section runs in the background in its own work directory (W, T, EXTRA, FAKE_DIR, BEFORE), so the
 # sections can run at once. Their lines are printed in order once all have finished.
 SECTIONS="baseline registry_validation resolve_keeps_pins stale_pin check_exits refs evidence workflows broken_pipe
-          outdated network_down mise_requests claude_pin resolve_lock lint_hook watch_and_brief brief_toolchain pipe_readers"
+          outdated network_down mise_requests claude_pin resolve_lock lint_hook watch_and_brief brief_toolchain pipe_readers src"
 pids=""; ran=""
 for s in $SECTIONS; do
   name=${s//_/ }
