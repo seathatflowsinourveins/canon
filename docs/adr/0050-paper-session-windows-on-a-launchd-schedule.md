@@ -248,8 +248,11 @@ and with no lock, so a firing that skips keeps what a run from a terminal left; 
 exit, which the task still returns, the records again and each `window-*.log` of 1 MB or less, with account
 B's lock still held so that a log is copied whole. Each copy is held to 20 s; one that fails is said on
 stderr and changes no exit code; status and the windows keep reading the temporary folder. Run under mise in
-`scripts/test-lanes` with a stand-in window; on a real window UNVERIFIED until the first one after this
-change. Limits: nothing prunes the kept folder; a log over 1 MB is left out and not named, and the log of a
+`scripts/test-lanes` with a stand-in window. On this machine the first firing after the change, at 21:57:47
+UTC on 2026-11-11 with the schedule turned to `mover`, read the switch, took the lock and ended with nothing
+to run outside the regular session; afterwards the kept folder held all 23 records of the temporary folder,
+the one of that day's last run by hand identical byte for byte, and 21 of its 22 logs, the one left out
+being 5.4 MB. A window that trades is UNVERIFIED until the first regular session. Limits: nothing prunes the kept folder; a log over 1 MB is left out and not named, and the log of a
 window run from a terminal waits for the next window's end; the heartbeats and `last-window-end` are not
 copied; the kept folder takes the temporary folder's mode and time at each copy; and the folder follows the
 caller's `CLAUDE_CONFIG_DIR`, which the paper agent is not given, so a run by hand under another config
