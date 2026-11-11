@@ -158,7 +158,11 @@ exit 0, both items in the login keychain; `mise run paper:check` exit 0, account
   beside its reads of B's pair; `session_window` writes `account`, `windows` or `tests` and any other value
   as `unknown`, and the
   paper session row of `scripts/automation status` shows it, `not recorded` for an older record
-  (`tests/test_session_window.py`, `scripts/test-lanes`; run).
+  (`tests/test_session_window.py`, `scripts/test-lanes`; run). On paper, 2026-11-11, at f4a0016, this
+  change's code before it was rebased onto a `main` that had changed none of its files: `mise run paper:session --session auto --minutes 5` on
+  account B, 09:13:37 to 09:18:45 UTC, recorded `account: windows`; nothing placed and nothing left open.
+  The window itself failed, since IEX delivered no SPY quote or trade in 307 s of the early pre-market
+  (run).
 * Option 3's comparison of account IDs is still not built.
 
 ## Evidence
