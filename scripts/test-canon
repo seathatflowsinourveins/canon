@@ -613,6 +613,18 @@ sec_watch_and_brief() {
   check "... not the later pre-release"                      lacks "$out" "v2.1.0rc1"
   out=$(brief "$W/wt")
   check "a worktree's brief does not show the main checkout's watch" lacks "$out" "landscape watch 2026-11-10"
+  # the hosted watch's drift issue (ADR 0064): named when open, said when it could not be read, silent when none
+  out=$(brief "$T")
+  check "a watch from before the drift issue says nothing of it"   lacks "$out" "drift issue"
+  jq '.drift_issue = [{number: 12, title: "Canon drift"}]' "$T/.canon/watch.json" > "$W/w.json" && mv "$W/w.json" "$T/.canon/watch.json"
+  out=$(brief "$T")
+  check "the brief names the open drift issue"               has "$out" "Drift is tracked in #12"
+  jq '.drift_issue = null' "$T/.canon/watch.json" > "$W/w.json" && mv "$W/w.json" "$T/.canon/watch.json"
+  out=$(brief "$T")
+  check "a drift issue that could not be read is said, not taken as none" has "$out" "drift issue could not be read"
+  jq '.drift_issue = []' "$T/.canon/watch.json" > "$W/w.json" && mv "$W/w.json" "$T/.canon/watch.json"
+  out=$(brief "$T")
+  check "no open drift issue adds nothing"                   lacks "$out" "rift"
   jq '.registry = "1-1"' "$T/.canon/watch.json" > "$W/w.json" && mv "$W/w.json" "$T/.canon/watch.json"
   out=$(brief "$T")
   check "a result for another registry is not shown"         lacks "$out" "newer release"

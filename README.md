@@ -142,7 +142,7 @@ Why it works this way, and what the keychain does not protect against:
 | Address check (`scripts/check-addresses`) | Every `git push` | No |
 | Hosted CI (`scripts/ci` on GitHub) | Every pull request and push to `main` | No |
 | Edit checks (canon lint, ruff) | Every matching edit by an agent | No |
-| Hosted watch (`canon check` on GitHub) | Once a day | No |
+| Hosted watch (`canon check` on GitHub) | Once a day; keeps one locked `canon-drift` issue in step with what has drifted (ADR 0064) | No |
 | Landscape watch | Once a day, at session start | No |
 | Lane watchdog | Every 10 minutes while the Mac is awake | No |
 | Paper session | Every 35 minutes while the Mac is awake; a window only when Alpaca's clock says a session is open, on the `main` GitHub has then (ADR 0050) | No |

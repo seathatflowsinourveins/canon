@@ -68,7 +68,8 @@ These run without being asked (ADR 0011, ADR 0013, ADR 0026). Every commit runs 
 refuses an email address that is not a known service or example address in what the push would publish.
 Every edit to a Python file runs ruff on it, and every edit under `canon/` or
 `docs/adr/` runs the canon lint. Once a day a session-start hook compares the canon with upstream and the
-next session start prints the result; a scheduled workflow does the same comparison on GitHub every day.
+next session start prints the result; a scheduled workflow does the same comparison on GitHub every day
+and keeps one locked `canon-drift` issue in step with what has drifted, which the brief names (ADR 0064).
 A background watchdog raises a macOS notification when a session
 stalls or fails repeatedly. A local OpenTelemetry Collector on 127.0.0.1 keeps the token events `scripts/lanes --rates` reads (ADR 0007). Once the owner installs it, a second agent runs a paper session window every
 35 minutes when Alpaca's clock says a session is open, and `scripts/automation status` shows its last

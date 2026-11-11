@@ -1,7 +1,12 @@
-# Hosted landscape watch (docs/adr/0011-automation.md, docs/adr/0017-merge-gate.md).
+# Hosted landscape watch (docs/adr/0011-automation.md, docs/adr/0017-merge-gate.md,
+# docs/adr/0064-compounding-github-automation.md).
 # Once a day it compares the canon with live upstream, so a re-pointed release tag is caught even when no
-# session has started on the development machine. scripts/canon needs only curl and jq, which the runner
-# image has, so no toolchain is installed. Checked with actionlint.
+# session has started on the development machine, and writes one drift list (newer releases, a retag, a
+# stale lock, records past their review-by date) to the run's summary with scripts/drift. A second job keeps
+# one locked issue, labelled canon-drift, in step with that list and with the first job's result, so drift
+# and a failed watch reach the owner and the session brief as one tracked item. scripts/canon and
+# scripts/drift need only curl, jq and gh, which the runner image has, so no toolchain is installed.
+# Checked with actionlint.
 name: watch
 
 on:
@@ -21,6 +26,9 @@ jobs:
     name: canon against upstream
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    outputs:
+      list: ${{ steps.drift.outputs.list }}
+      markdown: ${{ steps.drift.outputs.markdown }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -39,16 +47,64 @@ jobs:
             if [ "$rc" -ne 1 ] || [ "$attempt" -eq 2 ]; then break; fi
             sleep 60   # an upstream could not be read; try once more before failing the run
           done
+          echo "$rc" > check.rc
           { echo '### scripts/canon check'; echo '```'; cat check.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           cat check.txt
           exit "$rc"
 
+      # Exit 1 means an upstream could not be read, which fails the run as before; the list below is then
+      # marked INCOMPLETE.
       - name: Newer releases
         if: ${{ always() }}
         run: |
           set +e
-          scripts/canon outdated > outdated.txt 2>&1
+          scripts/canon outdated --json > outdated.json
           rc=$?
-          { echo '### scripts/canon outdated'; echo '```'; cat outdated.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
-          cat outdated.txt
+          echo "$rc" > outdated.rc
+          jq -r '.[] | [.id, .pinned, ((if .status == "STABLE-AVAILABLE" then .newest_stable else .newest end) // "-"), .status] | @tsv' outdated.json
           exit "$rc"
+
+      # The drift list. Drift is work to track, not a failure: this step fails only if the list cannot be
+      # written. A missing input (a step above that did not finish) is named in the list, never left out.
+      # Both forms go to the next job as outputs, in GitHub's multiline form with a random delimiter.
+      - name: Drift list
+        id: drift
+        if: ${{ always() }}
+        run: |
+          scripts/drift report --check check.txt --check-rc "$(cat check.rc 2>/dev/null)" \
+            --outdated outdated.json --outdated-rc "$(cat outdated.rc 2>/dev/null)" --json drift.json > drift.md
+          cat drift.md >> "$GITHUB_STEP_SUMMARY"
+          cat drift.md
+          eof="DRIFT_$(od -An -N16 -tx1 /dev/urandom | tr -dc 0-9a-f)"
+          { echo "list<<$eof"; cat drift.json; echo "$eof"; echo "markdown<<$eof"; cat drift.md; echo "$eof"; } >> "$GITHUB_OUTPUT"
+
+  # The one job that writes, so the only one with issues: write; the job-level block replaces the
+  # workflow's, so contents: read is repeated for the checkout. It runs when the first job failed, since a
+  # failed watch is itself tracked, but not when the run was cancelled (a newer run in the concurrency
+  # group replaces it, and writes the issue itself); and only on main, so a run started on a branch never
+  # rewrites the issue. A refused write fails this job by name, with the owner's step when issues are off.
+  issue:
+    name: drift issue
+    needs: [canon]
+    if: ${{ !cancelled() && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Keep the drift issue in step
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DRIFT_LIST: ${{ needs.canon.outputs.list }}
+          DRIFT_MARKDOWN: ${{ needs.canon.outputs.markdown }}
+          WATCH_RESULT: ${{ needs.canon.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          printf '%s\n' "$DRIFT_LIST" > drift.json
+          printf '%s\n' "$DRIFT_MARKDOWN" > drift.md
+          scripts/drift issue --list drift.json --markdown drift.md --watch-result "$WATCH_RESULT" --run-url "$RUN_URL"

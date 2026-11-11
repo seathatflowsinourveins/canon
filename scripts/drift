@@ -1,0 +1,291 @@
+#!/bin/bash
+# drift — one list of what the canon has drifted from, and the one issue that tracks it
+# (docs/adr/0064-compounding-github-automation.md).
+#
+#   scripts/drift report --check <file> --check-rc <n> --outdated <file> --outdated-rc <n> [--json <out>]
+#   scripts/drift issue --list <drift.json> --markdown <drift.md> --watch-result <result> [--run-url <url>]
+#
+# report: reads what the hosted watch (.github/workflows/watch.yml) already produced, and the decision
+# records' front matter in this tree; it fetches nothing itself:
+#   --check      the combined output of `scripts/canon check` (its RETAGGED, STALE, UNPINNED and FAIL lines)
+#   --check-rc   its exit code (0 clean, 1 an upstream unread, 3 retagged, 4 stale; scripts/canon cmd_check)
+#   --outdated   the output of `scripts/canon outdated --json` (an array of {id, pinned, newest,
+#                newest_stable, status}; status NEWER, STABLE-AVAILABLE, UNPARSEABLE, UNREACHABLE, current)
+#   --outdated-rc its exit code (1 when an upstream could not be read)
+#   docs/adr/NNNN-*.md  `review-by:` before today is past review (AGENTS.md rule 7); `status: proposed` is an
+#                open gap. Read from the front matter only, as .claude/hooks/session-brief.sh reads it.
+# It prints the list as GitHub-flavoured markdown (for $GITHUB_STEP_SUMMARY, the form GitHub documents for a
+# job summary) and, with --json, writes the same list as JSON. The JSON's `complete` is false when either
+# input says an upstream could not be read, or an input is missing or unreadable: such a list is never a
+# clean one, and its markdown says so first (AGENTS.md rule 5). Exit 0 when the list was written, whatever it
+# holds; 2 on a usage error. Drift is work to track, not a failure: the watch's own steps fail the run for
+# what ADR 0011 makes a failure (a retag, a stale lock, an upstream unread), and this script does not.
+# DRIFT_TODAY (YYYY-MM-DD) replaces today's UTC date, for scripts/test-drift.
+#
+# issue: keeps one open issue, labelled `canon-drift` and opened by the workflow's own token, in step with the
+# list, through GitHub's REST API with `gh api` (preinstalled on GitHub-hosted runners and authenticated by
+# GH_TOKEN, as GitHub's "Using GitHub CLI in workflows" documents; the repository is $GITHUB_REPOSITORY, a
+# default variable of every run). The endpoints are GitHub's: the GraphQL Repository fields hasIssuesEnabled
+# and issueCreationPolicy, read first, so nothing is written unless issues are on and only collaborators may
+# open one; then list repository issues (labels, state, creator), create, update and lock an issue, create a
+# comment, get and create a label.
+#   something to track (an item, an incomplete list, or a watch whose result is not `success`):
+#     no open issue: create it and lock it, so only people with write access can comment;
+#     one open:      rewrite its body; post a comment only when the list changed, so a subscriber hears of a
+#                    change and not of every day the list is the same; lock it again if it was unlocked;
+#     more than one: keep the oldest, close the others as duplicates of it.
+#   nothing to track: close the open issue with a comment; with none open, do nothing.
+# Exit 0 when the issue is in step; 1 when GitHub refused or could not be reached, with the reason and, when
+# issues are off, the owner's step (rule 5: a scheduled job that cannot write its issue fails by name).
+set -uo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+LABEL=canon-drift
+TITLE="Canon drift"
+BODY_MAX=60000      # GitHub caps an issue body at 65,536 characters; the list is cut, never the footer
+
+usage() {
+  echo "usage: scripts/drift report --check <file> --check-rc <n> --outdated <file> --outdated-rc <n> [--json <out>]" >&2
+  echo "       scripts/drift issue --list <drift.json> --markdown <drift.md> --watch-result <result> [--run-url <url>]" >&2
+  exit 2
+}
+command -v jq >/dev/null 2>&1 || { echo "drift: jq is needed" >&2; exit 1; }
+
+cmd_issue() {
+  local list="" md="" result="" run_url="" repo="${GITHUB_REPOSITORY:-}"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --list)         [ $# -ge 2 ] || usage; list="$2"; shift 2 ;;
+      --markdown)     [ $# -ge 2 ] || usage; md="$2"; shift 2 ;;
+      --watch-result) [ $# -ge 2 ] || usage; result="$2"; shift 2 ;;
+      --run-url)      [ $# -ge 2 ] || usage; run_url="$2"; shift 2 ;;
+      *) usage ;;
+    esac
+  done
+  [ -n "$list" ] && [ -n "$md" ] && [ -n "$result" ] || usage
+  die() { echo "drift issue: $*" >&2; exit 1; }
+  [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "GITHUB_REPOSITORY is not owner/name: '$repo'"
+  command -v gh >/dev/null 2>&1 || die "gh is not installed"
+  # A list that is missing or unreadable is itself something to track, never a reason to close the issue.
+  local js
+  if ! js=$(jq -ce 'select(type == "object" and has("items") and has("complete"))' "$list" 2>/dev/null); then
+    js='{"complete": false, "items": 0, "problems": ["the drift list was not written"]}'
+  fi
+  local items complete track digest
+  items=$(jq -r '.items' <<<"$js"); complete=$(jq -r '.complete' <<<"$js")
+  track=false
+  if [ "$items" != 0 ] || [ "$complete" != true ] || [ "$result" != success ]; then track=true; fi
+  # what the list says, not the day it was said: a changed digest is what earns a comment
+  digest=$(jq -c --arg r "$result" '{retagged, stale, unread, newer, unparseable, expired, problems, complete, watch: $r}' <<<"$js" \
+           | cksum | awk '{ print $1 "-" $2 }')
+
+  local tmp err open
+  tmp=$(mktemp) || die "mktemp failed"; err="$tmp.err"
+  # shellcheck disable=SC2064  # expand now: the trap removes these files; the script ends with this command
+  trap "rm -f '$tmp' '$err'" EXIT
+  # The bound comes first (ADR 0064): Issues on, and issue creation limited to collaborators. GitHub's
+  # GraphQL Repository type has hasIssuesEnabled and issueCreationPolicy (ALL or COLLABORATORS_ONLY); its
+  # REST repository has no field for the second. Nothing is written past a bound that is off or unread.
+  local step="the owner's step (ADR 0064): gh repo edit --enable-issues, then Settings > General > Features > Issues > Issue permissions: Collaborators only"
+  local bound
+  # shellcheck disable=SC2016  # GraphQL variables, not the shell's
+  bound=$(gh api graphql -f query='query($o: String!, $n: String!) { repository(owner: $o, name: $n) { hasIssuesEnabled issueCreationPolicy } }' \
+            -f o="${repo%%/*}" -f n="${repo#*/}" --jq '.data.repository | "\(.hasIssuesEnabled) \(.issueCreationPolicy)"' 2>"$err") \
+    || die "could not read whether issues are on and who may open one: $(cat "$err") $bound"
+  case "$bound" in
+    "true COLLABORATORS_ONLY") ;;
+    "false "*) die "issues are switched off on $repo, so the drift list has nowhere to go; $step" ;;
+    "true ALL") die "anyone may open an issue on $repo, so the bound this job writes under is off; nothing was written; $step" ;;
+    *) die "GitHub answered '$bound' for whether issues are on and who may open one; nothing was written" ;;
+  esac
+  # stderr is kept apart, so a notice gh prints on a call that worked never spoils the JSON
+  if ! open=$(gh api -X GET "repos/$repo/issues" -f labels="$LABEL" -f state=open -f creator='github-actions[bot]' -f per_page=100 2>"$err"); then
+    local said
+    said="$(cat "$err") $open"
+    case "$said" in
+      *[Dd]isabled*) die "issues are switched off on $repo, so the drift list has nowhere to go; $step. GitHub said: $said" ;;
+    esac
+    die "could not list the open drift issue: $said"
+  fi
+  jq -e 'type == "array"' >/dev/null 2>&1 <<<"$open" || die "GitHub's issue list is not a JSON array: $open"
+  local numbers keep
+  numbers=$(jq -r '[.[] | select(.pull_request | not) | .number] | sort | .[]' <<<"$open")
+  keep=$(head -n 1 <<<"$numbers")
+
+  if [ "$track" = false ]; then
+    if [ -z "$keep" ]; then echo "drift issue: nothing to track and no issue open"; return 0; fi
+    local n
+    for n in $numbers; do
+      gh api -X POST "repos/$repo/issues/$n/comments" -f body="Nothing has drifted as of $(jq -r '.date // "today"' <<<"$js")${run_url:+ ($run_url)}; closing. The hosted watch opens a new issue when something drifts again." >/dev/null \
+        || die "could not comment on #$n"
+      gh api -X PATCH "repos/$repo/issues/$n" -f state=closed -f state_reason=completed >/dev/null || die "could not close #$n"
+      echo "drift issue: closed #$n (nothing to track)"
+    done
+    return 0
+  fi
+
+  {
+    # a file the workflow wrote from an empty output holds only a newline: that is no list either
+    if [ -r "$md" ] && grep -q '[^[:space:]]' "$md"; then head -c "$BODY_MAX" "$md"; else echo "**INCOMPLETE.** The drift list's markdown was not written."; fi
+    [ "$(wc -c < "$md" 2>/dev/null || echo 0)" -le "$BODY_MAX" ] || printf '\n\n(The list was cut at %s characters; the run summary has all of it.)\n' "$BODY_MAX"
+    [ "$result" = success ] || printf '\n**The watch run did not succeed (%s).** A retag, a stale lock or an upstream that could not be read fails it (ADR 0011); see the run.\n' "$result"
+    printf '\n---\nThe hosted watch rewrites this issue each day (ADR 0064) and closes it when nothing has drifted. A lane can be started from it.'
+    [ -z "$run_url" ] || printf ' Last run: %s' "$run_url"
+    printf '\n\n<!-- drift-digest: %s -->\n' "$digest"
+  } > "$tmp"
+
+  if [ -z "$keep" ]; then
+    gh api "repos/$repo/labels/$LABEL" >/dev/null 2>&1 \
+      || gh api -X POST "repos/$repo/labels" -f name="$LABEL" -f color=d93f0b \
+           -f description="What the canon has drifted from; kept by the hosted watch (ADR 0064)" >/dev/null \
+      || die "could not create the $LABEL label"
+    local made
+    made=$(gh api -X POST "repos/$repo/issues" -f title="$TITLE" -F body="@$tmp" -f "labels[]=$LABEL" --jq .number 2>"$err") \
+      || die "could not open the drift issue: $(cat "$err") $made"
+    [[ "$made" =~ ^[0-9]+$ ]] || die "GitHub did not return an issue number: $made"
+    gh api -X PUT "repos/$repo/issues/$made/lock" >/dev/null || die "opened #$made but could not lock it"
+    echo "drift issue: opened and locked #$made ($items item(s))"
+    return 0
+  fi
+
+  local old locked n
+  old=$(jq -r --argjson k "$keep" '.[] | select(.number == $k) | .body // ""' <<<"$open" | sed -n 's/^<!-- drift-digest: \(.*\) -->$/\1/p' | tail -n 1)
+  locked=$(jq -r --argjson k "$keep" '.[] | select(.number == $k) | .locked' <<<"$open")
+  gh api -X PATCH "repos/$repo/issues/$keep" -F body="@$tmp" >/dev/null || die "could not update #$keep"
+  if [ "$locked" != true ]; then
+    gh api -X PUT "repos/$repo/issues/$keep/lock" >/dev/null || die "updated #$keep but could not lock it"
+  fi
+  if [ "$old" != "$digest" ]; then
+    gh api -X POST "repos/$repo/issues/$keep/comments" \
+      -f body="The list changed: $items item(s)$([ "$complete" = true ] || printf ', INCOMPLETE')$([ "$result" = success ] || printf ', the watch run did not succeed (%s)' "$result").${run_url:+ $run_url}" >/dev/null \
+      || die "updated #$keep but could not comment on it"
+    echo "drift issue: updated #$keep, the list changed ($items item(s))"
+  else
+    echo "drift issue: updated #$keep, the list is unchanged"
+  fi
+  for n in $(tail -n +2 <<<"$numbers"); do
+    gh api -X POST "repos/$repo/issues/$n/comments" -f body="Duplicate of #$keep, which the hosted watch keeps." >/dev/null || die "could not comment on #$n"
+    gh api -X PATCH "repos/$repo/issues/$n" -f state=closed -f state_reason=not_planned >/dev/null || die "could not close #$n"
+    echo "drift issue: closed #$n as a duplicate of #$keep"
+  done
+  return 0
+}
+
+case "${1:-}" in
+  report) shift ;;
+  issue)  shift; cmd_issue "$@"; exit $? ;;
+  *) usage ;;
+esac
+check="" check_rc="" outdated="" outdated_rc="" json_out=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --check)       [ $# -ge 2 ] || usage; check="$2"; shift 2 ;;
+    --check-rc)    [ $# -ge 2 ] || usage; check_rc="$2"; shift 2 ;;
+    --outdated)    [ $# -ge 2 ] || usage; outdated="$2"; shift 2 ;;
+    --outdated-rc) [ $# -ge 2 ] || usage; outdated_rc="$2"; shift 2 ;;
+    --json)        [ $# -ge 2 ] || usage; json_out="$2"; shift 2 ;;
+    *) usage ;;
+  esac
+done
+[ -n "$check" ] && [ -n "$outdated" ] || usage
+today="${DRIFT_TODAY:-$(date -u +%Y-%m-%d)}"
+[[ "$today" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || { echo "drift: DRIFT_TODAY must be YYYY-MM-DD" >&2; exit 2; }
+
+problems='[]'
+add_problem() { problems=$(jq -c --arg p "$1" '. + [$p]' <<<"$problems"); }
+
+# --- scripts/canon check: the first word of a line names its kind (cmd_check's printf formats) ---
+retagged='[]' stale='[]' unread='[]'
+if [ -r "$check" ]; then
+  # RETAGGED  <id>  <tag> was <sha>, is now <sha>
+  retagged=$(awk '$1 == "RETAGGED" { id = $2; $1 = ""; $2 = ""; sub(/^ +/, ""); print id "\t" $0 }' "$check" \
+             | jq -Rc 'split("\t") | {id: .[0], detail: .[1]}' | jq -sc .)
+  stale=$(awk '$1 == "STALE" { print $2 }' "$check" | jq -R . | jq -sc .)
+  # FAIL      <id> (<repo> <track>) unreachable or ref gone; UNPINNED  <id> (in registry, not in lock)
+  unread=$(awk '$1 == "FAIL" || $1 == "UNPINNED" { print $2 }' "$check" | jq -R . | jq -sc .)
+else
+  add_problem "the output of scripts/canon check is missing"
+fi
+case "$check_rc" in
+  0|3|4) ;;
+  1) add_problem "scripts/canon check could not read every upstream (exit 1)" ;;
+  '') add_problem "the exit code of scripts/canon check is missing" ;;
+  *) add_problem "scripts/canon check exited $check_rc" ;;
+esac
+
+# --- scripts/canon outdated --json ---
+newer='[]' unparseable='[]'
+if [ -r "$outdated" ] && jq -e 'type == "array"' "$outdated" >/dev/null 2>&1; then
+  newer=$(jq -c '[.[] | select(.status == "NEWER" or .status == "STABLE-AVAILABLE")
+                  | {id, pinned, status, newest: (if .status == "STABLE-AVAILABLE" then .newest_stable else .newest end)}]' "$outdated")
+  unparseable=$(jq -c '[.[] | select(.status == "UNPARSEABLE") | {id, pinned}]' "$outdated")
+  unread=$(jq -c --argjson u "$unread" '$u + [.[] | select(.status == "UNREACHABLE") | .id] | unique' "$outdated")
+else
+  add_problem "the output of scripts/canon outdated --json is missing or not a JSON array"
+fi
+case "$outdated_rc" in
+  0) ;;
+  1) add_problem "scripts/canon outdated could not read every upstream (exit 1)" ;;
+  '') add_problem "the exit code of scripts/canon outdated is missing" ;;
+  *) add_problem "scripts/canon outdated exited $outdated_rc" ;;
+esac
+
+# --- decision records: front matter only; a CRLF line ending is ignored (as session-brief.sh reads them) ---
+expired='[]' proposed='[]'
+for f in "$ROOT"/docs/adr/[0-9][0-9][0-9][0-9]-*.md; do
+  [ -f "$f" ] || continue
+  n=$(basename "$f" | cut -c1-4)
+  row=$(awk '{ sub(/\r$/, "") }
+             NR == 1 { if ($0 !~ /^---[[:space:]]*$/) exit; fm = 1; next }
+             fm && /^---[[:space:]]*$/ { fm = 0; next }
+             fm && !b && sub(/^review-by: */, "") { b = $0 }
+             fm && !s && sub(/^status: */, "") { s = $0 }
+             !fm && !t && sub(/^# +/, "") { t = $0 }
+             END { print b "\037" s "\037" t }' "$f")
+  # \037 (unit separator), not a tab: IFS folds runs of a whitespace separator, so an empty review-by
+  # would shift the status into its place
+  IFS=$'\037' read -r by st title <<<"$row"
+  # ISO dates compare correctly as strings
+  if [ -n "$by" ] && [ "$by" \< "$today" ]; then
+    expired=$(jq -c --arg n "$n" --arg by "$by" --arg t "$title" '. + [{adr: $n, review_by: $by, title: $t}]' <<<"$expired")
+  fi
+  if [ "$st" = proposed ]; then
+    proposed=$(jq -c --arg n "$n" --arg t "$title" '. + [{adr: $n, title: $t}]' <<<"$proposed")
+  fi
+done
+
+list=$(jq -n --arg today "$today" --argjson problems "$problems" --argjson retagged "$retagged" \
+          --argjson stale "$stale" --argjson unread "$unread" --argjson newer "$newer" \
+          --argjson unparseable "$unparseable" --argjson expired "$expired" --argjson proposed "$proposed" \
+  '{date: $today, complete: ($problems | length == 0), problems: $problems, retagged: $retagged, stale: $stale,
+    unread: $unread, newer: $newer, unparseable: $unparseable, expired: $expired, proposed: $proposed,
+    items: ([$retagged, $stale, $unread, $newer, $unparseable, $expired] | map(length) | add)}')
+if [ -n "$json_out" ]; then
+  printf '%s\n' "$list" > "$json_out" || { echo "drift: cannot write $json_out" >&2; exit 1; }
+fi
+
+# shellcheck disable=SC2016  # a jq program; its backticks are markdown, not command substitution
+jq -r '
+  def section($title; $rows): if ($rows | length) > 0 then ["", "### " + $title, ""] + $rows else [] end;
+  def section($title; $intro; $rows): if ($rows | length) > 0 then section($title; [$intro, ""] + $rows) else [] end;
+  (["## Canon drift, " + .date, ""]
+   + (if .complete then [] else
+        ["**INCOMPLETE.** This list is not the whole picture: " + (.problems | join("; ")) + "."] end)
+   + (if .complete and .items == 0 then ["Nothing has drifted: every pin is current and every record is within its review date."]
+      else [(.items | tostring) + " item(s) to act on."] end)
+   + section("Retagged: a pinned release tag now points at another commit";
+       "A supply-chain warning: do not re-resolve until it is explained (ADR 0011).";
+       (.retagged | map("- `" + .id + "` " + .detail)))
+   + section("Lock stale: the registry names another repo or track than the lock";
+       .stale | map("- `" + . + "`: `scripts/canon resolve " + . + "`, reviewed before it lands (ADR 0028)"))
+   + section("Could not be read"; .unread | map("- `" + . + "`"))
+   + section("Newer releases"; "Read the changelog and move each through the `adopt-upstream` skill.";
+       (.newer | map("- `" + .id + "` " + .pinned + " -> " + (.newest // "?")
+                        + (if .status == "STABLE-AVAILABLE" then " (a stable release, past a pre-release pin)" else "" end))))
+   + section("Pins the release rule cannot rank, so no newer release is reported for them";
+       .unparseable | map("- `" + .id + "` " + .pinned))
+   + section("Records past their review-by date";
+       "Re-verify each before relying on it (AGENTS.md rule 7; the `landscape-refresh` skill).";
+       (.expired | map("- ADR " + .adr + " (review by " + .review_by + "): " + .title)))
+   + section("Records still proposed (open gaps, for reference)";
+       .proposed | map("- ADR " + .adr + ": " + .title))
+  ) | .[]' <<<"$list"
