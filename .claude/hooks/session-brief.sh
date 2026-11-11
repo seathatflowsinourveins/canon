@@ -72,6 +72,11 @@ elif [ -f "$watch" ]; then
     + (if ((.bot_prs // []) | length) > 0
        then " Dependency pull requests open: " + (.bot_prs | map("#" + (.number | tostring)) | join(", ")) + ". Land them (AGENTS.md, Landing)."
        else "" end)
+    + (if has("drift_issue") and .drift_issue == null then " The hosted watch'"'"'s drift issue could not be read (issues off, or gh not signed in)." else "" end)
+    + (if ((.drift_issue // []) | length) > 0
+       then " Drift is tracked in " + (.drift_issue | map("#" + (.number | tostring)) | join(", "))
+            + ", which the hosted watch rewrites each day (ADR 0064); a lane can start from it."
+       else "" end)
   ' "$watch" 2>/dev/null || echo "landscape watch: .canon/watch.json is unreadable."
 else
   echo "landscape watch: no result yet; the first check runs in the background now."

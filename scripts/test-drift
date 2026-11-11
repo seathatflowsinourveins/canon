@@ -1,0 +1,246 @@
+#!/bin/bash
+# test-drift — check scripts/drift, the hosted watch's drift list (docs/adr/0064-compounding-github-automation.md).
+# Offline: runs scripts/drift on fixed inputs in a copy of the script with fixture records under a temporary
+# docs/adr/, and compares its JSON and markdown with what each case expects. Exit 0 if every case holds.
+set -uo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+command -v jq >/dev/null 2>&1 || { echo "test-drift: jq is needed" >&2; exit 1; }
+pass=0; fail=0
+check() { local label="$1"; shift; if "$@"; then pass=$((pass+1)); else fail=$((fail+1)); echo "  FAIL  $label"; fi; }
+eq() { [ "$1" = "$2" ] || { echo "    wanted: $2" >&2; echo "    got:    $1" >&2; return 1; }; }
+has() { grep -qF -- "$2" <<<"$1" || { echo "    missing: $2" >&2; return 1; }; }
+lacks() { ! grep -qF -- "$2" <<<"$1" || { echo "    unexpected: $2" >&2; return 1; }; }
+
+T=$(mktemp -d) || exit 1
+trap 'rm -rf "${T:?}"' EXIT
+mkdir -p "$T/repo/scripts" "$T/repo/docs/adr"
+cp "$ROOT/scripts/drift" "$T/repo/scripts/drift"
+D="$T/repo/scripts/drift"
+
+adr() { # adr <file> <status> <review-by> <title> [line ending]
+  local e="${5:-}"
+  printf -- "---%s\nstatus: %s%s\ndate: 2026-11-01%s\nreview-by: %s%s\n---%s\n\n# %s%s\n\nreview-by: 2000-01-01 in the body is not front matter%s\n" \
+    "$e" "$2" "$e" "$e" "$3" "$e" "$e" "$4" "$e" "$e" > "$T/repo/docs/adr/$1"
+}
+adr 0001-old.md accepted 2026-11-09 "An accepted record past review"
+adr 0002-due-today.md accepted 2026-11-10 "A record due today is not past review"
+adr 0003-gap.md proposed 2027-01-01 "An open gap"
+adr 0004-crlf.md proposed 2026-10-01 "A CRLF record" $'\r'
+printf '# No front matter\n\nreview-by: 2000-01-01\n' > "$T/repo/docs/adr/0005-no-front-matter.md"
+printf -- '---\nstatus: proposed\ndate: 2026-11-01\n---\n\n# A proposed record with no review-by\n' > "$T/repo/docs/adr/0006-no-review-by.md"
+printf 'not a record\n' > "$T/repo/docs/adr/template.md"
+
+clean_check='  current   a
+  advanced  b                            refs/heads/main moved 111111111111 -> 222222222222; pin holds
+canon: 2 checked, 0 retagged, 1 branch-tracked advanced, 0 stale, 0 failed'
+clean_outdated='[{"id":"a","role":"tool","pinned":"v1.0.0","newest":"v1.0.0","newest_stable":"v1.0.0","status":"current"}]'
+
+run() { # run <check text> <check rc> <outdated text> <outdated rc>  -> sets md, js, rc
+  printf '%s\n' "$1" > "$T/check.txt"; printf '%s\n' "$3" > "$T/outdated.json"
+  md=$(DRIFT_TODAY=2026-11-10 "$D" report --check "$T/check.txt" --check-rc "$2" \
+         --outdated "$T/outdated.json" --outdated-rc "$4" --json "$T/drift.json" 2>"$T/err"); rc=$?
+  js=$(cat "$T/drift.json" 2>/dev/null)
+}
+
+# --- records only: review-by before today is past review, today is not; body lines are not front matter ---
+run "$clean_check" 0 "$clean_outdated" 0
+check "a clean run exits 0"                          eq "$rc" 0
+check "the list is complete"                         eq "$(jq -r .complete <<<"$js")" true
+check "past review: only the record due before today, and the CRLF one" \
+                                                     eq "$(jq -c '[.expired[].adr]' <<<"$js")" '["0001","0004"]'
+check "a CRLF record's date and title are read"      eq "$(jq -r '.expired[1] | .review_by + "|" + .title' <<<"$js")" "2026-10-01|A CRLF record"
+check "proposed records are listed apart, one with no review-by too" \
+                                                     eq "$(jq -c '[.proposed[].adr]' <<<"$js")" '["0003","0004","0006"]'
+check "proposed records are not counted as items"    eq "$(jq -r .items <<<"$js")" 2
+check "an advanced branch is not drift"              eq "$(jq -c '[.retagged, .stale, .unread, .newer] | add' <<<"$js")" '[]'
+check "markdown names the past-review records"       has "$md" "- ADR 0001 (review by 2026-11-09): An accepted record past review"
+check "markdown has no INCOMPLETE line"              lacks "$md" "INCOMPLETE"
+check "markdown counts the items"                    has "$md" "2 item(s) to act on."
+check "a kind with nothing in it has no heading"     lacks "$md" "### Retagged"
+check "nor its intro line"                           lacks "$md" "adopt-upstream"
+
+# --- every kind of upstream drift ---
+drift_check='  current   a
+  RETAGGED  c                            v2.0.0 was 333333333333, is now 444444444444
+  STALE     d                            lock has x/d tag:v1, registry has y/d tag:v1; run: scripts/canon resolve d
+canon: 3 checked, 1 retagged, 0 branch-tracked advanced, 1 stale, 0 failed'
+drift_outdated='[{"id":"e","role":"tool","pinned":"v1.0.0","newest":"v1.1.0","newest_stable":"v1.1.0","status":"NEWER"},
+ {"id":"f","role":"tool","pinned":"v2.0.0rc8","newest":"v2.0.0rc9","newest_stable":"v2.0.0","status":"STABLE-AVAILABLE"},
+ {"id":"g","role":"tool","pinned":"v1.2.3.post1","newest":null,"newest_stable":null,"status":"UNPARSEABLE"},
+ {"id":"h","role":"tool","pinned":"v3","newest":"v3","newest_stable":"v3","status":"current"}]'
+run "$drift_check" 3 "$drift_outdated" 0
+check "a retag is listed with its detail"            eq "$(jq -c '.retagged' <<<"$js")" '[{"id":"c","detail":"v2.0.0 was 333333333333, is now 444444444444"}]'
+check "a stale pin is listed"                        eq "$(jq -c '.stale' <<<"$js")" '["d"]'
+check "newer: NEWER and STABLE-AVAILABLE, the stable one by its stable tag" \
+                                                     eq "$(jq -c '[.newer[] | .id + " " + .newest]' <<<"$js")" '["e v1.1.0","f v2.0.0"]'
+check "an unrankable pin is listed"                  eq "$(jq -c '.unparseable' <<<"$js")" '[{"id":"g","pinned":"v1.2.3.post1"}]'
+check "exit 3 from check is a complete list"         eq "$(jq -r .complete <<<"$js")" true
+check "items count every kind but proposed"          eq "$(jq -r .items <<<"$js")" 7
+check "drift does not fail the script"               eq "$rc" 0
+check "markdown warns about the retag first"         eq "$(grep -m1 '^### ' <<<"$md")" "### Retagged: a pinned release tag now points at another commit"
+# shellcheck disable=SC2016  # markdown backticks, not command substitution
+check "markdown gives the resolve for a stale pin"   has "$md" '`scripts/canon resolve d`'
+# shellcheck disable=SC2016  # markdown backticks, not command substitution
+check "markdown marks a stable past a pre-release"   has "$md" '- `f` v2.0.0rc8 -> v2.0.0 (a stable release, past a pre-release pin)'
+
+# --- an upstream that could not be read is never a clean list (rule 5) ---
+unread_check='  current   a
+  FAIL      z (x/z tag:v1) unreachable or ref gone
+canon: 2 checked, 0 retagged, 0 branch-tracked advanced, 0 stale, 1 failed'
+unread_outdated='[{"id":"y","role":"tool","pinned":"v1","newest":null,"newest_stable":null,"status":"UNREACHABLE"}]'
+run "$unread_check" 1 "$unread_outdated" 1
+check "an unread upstream makes the list incomplete" eq "$(jq -r .complete <<<"$js")" false
+check "both unread upstreams are listed"             eq "$(jq -c '.unread' <<<"$js")" '["y","z"]'
+check "both exit codes are named as problems"        eq "$(jq -r '.problems | length' <<<"$js")" 2
+check "markdown opens with INCOMPLETE"               eq "$(sed -n 3p <<<"$md")" "**INCOMPLETE.** This list is not the whole picture: scripts/canon check could not read every upstream (exit 1); scripts/canon outdated could not read every upstream (exit 1)."
+
+# --- missing or broken inputs ---
+printf 'no json\n' > "$T/outdated.json"
+md=$(DRIFT_TODAY=2026-11-10 "$D" report --check "$T/nowhere.txt" --check-rc "" --outdated "$T/outdated.json" --outdated-rc 0 --json "$T/drift.json"); rc=$?
+js=$(cat "$T/drift.json")
+check "missing inputs still write a list"            eq "$rc" 0
+check "missing inputs make it incomplete"            eq "$(jq -r .complete <<<"$js")" false
+check "each missing input is named"                  eq "$(jq -r '.problems | length' <<<"$js")" 3
+check "an incomplete list with no items does not say nothing drifted" lacks "$md" "Nothing has drifted"
+
+# --- a clean tree with nothing past review ---
+rm -f "$T/repo/docs/adr/0001-old.md" "$T/repo/docs/adr/0004-crlf.md"
+run "$clean_check" 0 "$clean_outdated" 0
+check "nothing to act on says so"                    has "$md" "Nothing has drifted: every pin is current and every record is within its review date."
+check "and counts no items"                          eq "$(jq -r .items <<<"$js")" 0
+
+# --- issue: one locked issue kept in step with the list, through a stub gh that records every call ---
+# The stub answers the REST paths scripts/drift calls (GitHub's issues, comments, lock and labels endpoints)
+# from files under $STUB, and keeps each body it is sent.
+export STUB="$T/stub"; mkdir -p "$STUB/bin"
+cat > "$STUB/bin/gh" <<'GH'
+#!/bin/bash
+S="${STUB:?}"; printf '%s\n' "$*" >> "$S/calls"
+[ "$1" = api ] || exit 9; shift
+method=GET path="" body="" jqf=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -X) method="$2"; shift 2 ;;
+    -f|-F) case "$2" in body=@*) body="${2#body=@}" ;; body=*) printf '%s\n' "${2#body=}" > "$S/inline" ; body="$S/inline" ;; esac; shift 2 ;;
+    --jq) jqf="$2"; shift 2 ;;
+    *) path="$1"; shift ;;
+  esac
+done
+case "$method $path" in
+  "GET graphql"|"POST graphql")
+    if [ -f "$S/disabled" ]; then echo 'false ALL'; else cat "$S/policy" 2>/dev/null || echo 'true COLLABORATORS_ONLY'; fi ;;
+  "GET repos/o/r/issues")
+    [ ! -f "$S/warn" ] || echo 'A new release of gh is available' >&2
+    if [ -f "$S/disabled" ]; then echo '{"message":"Issues are disabled for this repo","status":"410"}'; echo 'gh: Issues are disabled for this repo (HTTP 410)' >&2; exit 1; fi
+    cat "$S/open.json" ;;
+  "GET repos/o/r/labels/canon-drift") [ -f "$S/label" ] || { echo 'gh: Not Found (HTTP 404)' >&2; exit 1; } ;;
+  "POST repos/o/r/labels") touch "$S/label" ;;
+  "POST repos/o/r/issues") cp "$body" "$S/created"; [ "$jqf" = .number ] && echo 7 ;;
+  "PATCH repos/o/r/issues/"*) n="${path##*/}"; if [ -n "$body" ]; then cp "$body" "$S/patched.$n"; else echo "$n" >> "$S/closed"; fi ;;
+  "PUT repos/o/r/issues/"*/lock) n="${path%/lock}"; echo "${n##*/}" >> "$S/locked" ;;
+  "POST repos/o/r/issues/"*/comments) n="${path%/comments}"; { echo "#${n##*/}"; cat "$body"; } >> "$S/comments" ;;
+  *) echo "stub gh: unexpected $method $path" >&2; exit 9 ;;
+esac
+GH
+chmod +x "$STUB/bin/gh"
+reset_stub() { rm -f "$STUB"/calls "$STUB"/created "$STUB"/patched.* "$STUB"/closed "$STUB"/locked "$STUB"/comments "$STUB"/disabled "$STUB"/inline "$STUB"/warn "$STUB"/policy; echo "${1:-[]}" > "$STUB/open.json"; }
+issue() { # issue <result> [list file] -> sets out, rc
+  out=$(PATH="$STUB/bin:$PATH" GITHUB_REPOSITORY=o/r "$D" issue --list "${2:-$T/drift.json}" --markdown "$T/drift.md" \
+          --watch-result "$1" --run-url https://example.invalid/run/1 2>&1); rc=$?
+}
+calls() { cat "$STUB/calls" 2>/dev/null; }
+
+adr 0001-old.md accepted 2026-11-09 "An accepted record past review"
+run "$drift_check" 3 "$drift_outdated" 0
+printf '%s\n' "$md" > "$T/drift.md"
+reset_stub
+issue failure
+check "issue: a first list opens an issue"           eq "$rc" 0
+check "issue: it is created once, with the label"    eq "$(grep -c 'repos/o/r/issues -f title=Canon drift' <<<"$(calls)")" 1
+check "issue: the label is made when missing"        test -f "$STUB/label"
+check "issue: the new issue is locked"               eq "$(cat "$STUB/locked" 2>/dev/null)" 7
+check "issue: its body is the list"                  has "$(cat "$STUB/created")" "### Retagged: a pinned release tag now points at another commit"
+check "issue: its body says the run failed"          has "$(cat "$STUB/created")" "**The watch run did not succeed (failure).**"
+check "issue: its body links the run"                has "$(cat "$STUB/created")" "Last run: https://example.invalid/run/1"
+check "issue: only the workflow's own issues are read" has "$(calls)" "creator=github-actions[bot]"
+first_body=$(cat "$STUB/created")
+
+open_issue() { # open_issue <number> <locked> <body>
+  jq -nc --argjson n "$1" --argjson l "$2" --arg b "$3" '[{number: $n, locked: $l, body: $b}, {number: 99, pull_request: {}, body: ""}]'; }
+reset_stub "$(open_issue 3 true "$first_body")"
+issue failure
+check "issue: the same list again updates the body"  test -f "$STUB/patched.3"
+check "issue: and posts no comment"                  test ! -f "$STUB/comments"
+check "issue: and does not lock a locked issue again" test ! -f "$STUB/locked"
+check "issue: a pull request in the list is never touched" lacks "$(calls)" "issues/99"
+
+reset_stub "$(open_issue 3 false "old body <!-- drift-digest: 1-2 -->")"
+issue success
+check "issue: a changed list comments once"          eq "$(grep -c '^#3$' "$STUB/comments" 2>/dev/null)" 1
+check "issue: the comment counts the items"          has "$(cat "$STUB/comments" 2>/dev/null)" "The list changed: $(jq -r .items "$T/drift.json") item(s)."
+check "issue: an unlocked issue is locked again"     eq "$(cat "$STUB/locked" 2>/dev/null)" 3
+check "issue: nothing new is opened"                 lacks "$(calls)" "-f title="
+
+reset_stub "$(jq -c '. + [{number: 5, locked: true, body: ""}]' <<<"$(open_issue 3 true "$first_body")")"
+issue failure
+check "issue: of two open, the oldest is kept"       test -f "$STUB/patched.3"
+check "issue: and the other closed as a duplicate"   eq "$(cat "$STUB/closed" 2>/dev/null)" 5
+check "issue: the duplicate is told which to follow" has "$(cat "$STUB/comments" 2>/dev/null)" "Duplicate of #3"
+
+rm -f "$T/repo/docs/adr/0001-old.md"
+run "$clean_check" 0 "$clean_outdated" 0
+printf '%s\n' "$md" > "$T/drift.md"
+reset_stub "$(open_issue 3 true "$first_body")"
+issue success
+check "issue: nothing to track closes the open issue" eq "$(cat "$STUB/closed" 2>/dev/null)" 3
+check "issue: with a comment saying why"             has "$(cat "$STUB/comments" 2>/dev/null)" "Nothing has drifted as of 2026-11-10"
+check "issue: and its body is left as it was"        test ! -f "$STUB/patched.3"
+reset_stub
+issue success
+check "issue: nothing to track and none open only reads (the bound, the list)" eq "$(calls | wc -l | tr -d ' ')" 2
+reset_stub
+issue failure
+check "issue: a clean list from a failed run is tracked" test -f "$STUB/created"
+reset_stub "$(open_issue 3 true "$first_body")"
+issue success "$T/nowhere.json"
+check "issue: a missing list is tracked, never closed" test -f "$STUB/patched.3"
+check "issue: and the comment says INCOMPLETE"       has "$(cat "$STUB/comments" 2>/dev/null)" "INCOMPLETE"
+
+reset_stub; touch "$STUB/warn"
+issue failure
+check "issue: a notice gh prints on stderr does not spoil a listing that worked" eq "$rc" 0
+cp "$T/drift.md" "$T/drift.md.keep"; printf '\n' > "$T/drift.md"
+reset_stub
+issue failure
+check "issue: a markdown file that holds only a newline is said to be missing" \
+                                                     has "$(cat "$STUB/created")" "**INCOMPLETE.** The drift list's markdown was not written."
+mv "$T/drift.md.keep" "$T/drift.md"
+
+reset_stub; touch "$STUB/disabled"
+issue failure
+check "issue: issues off fails"                      eq "$rc" 1
+check "issue: and names the owner's step"            has "$out" "gh repo edit --enable-issues, then Settings > General > Features > Issues > Issue permissions: Collaborators only"
+check "issue: and writes nothing"                    eq "$(calls | grep -c -e '-X POST' -e '-X PATCH' -e '-X PUT')" 0
+reset_stub; echo 'true ALL' > "$STUB/policy"
+issue failure
+check "issue: creation open to anyone fails"         eq "$rc" 1
+check "issue: and says the bound is off"             has "$out" "the bound this job writes under is off; nothing was written"
+check "issue: and writes nothing either"             test ! -f "$STUB/created"
+first_call=$(sed -n 1p "$STUB/calls")
+check "issue: the bound is read before the issue list" eq "${first_call:0:11}" "api graphql"
+reset_stub; echo 'true null' > "$STUB/policy"
+issue failure
+check "issue: an answer it does not know fails"      eq "$rc" 1
+out=$(PATH="$STUB/bin:$PATH" GITHUB_REPOSITORY='o/r;x' "$D" issue --list "$T/drift.json" --markdown "$T/drift.md" --watch-result success 2>&1); rc=$?
+check "issue: a malformed GITHUB_REPOSITORY is refused" eq "$rc" 1
+
+# --- usage ---
+DRIFT_TODAY=2026-11-10 "$D" report --check "$T/check.txt" >/dev/null 2>&1; rc=$?
+check "a missing argument is a usage error"          eq "$rc" 2
+DRIFT_TODAY=11/10/2026 "$D" report --check "$T/check.txt" --check-rc 0 --outdated "$T/outdated.json" --outdated-rc 0 >/dev/null 2>&1; rc=$?
+check "a malformed DRIFT_TODAY is refused"           eq "$rc" 2
+"$D" >/dev/null 2>&1; rc=$?
+check "no subcommand is a usage error"               eq "$rc" 2
+
+echo "test-drift: $pass passed, $fail failed"
+[ "$fail" -eq 0 ]

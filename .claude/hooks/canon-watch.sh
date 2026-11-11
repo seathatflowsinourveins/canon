@@ -10,6 +10,9 @@
 #   scripts/canon outdated   a newer release tag than the one pinned
 #   gh pr list --app dependabot   the dependency bot's open pull requests (ADR 0016), where there is a
 #                            GitHub remote; flags are from gh's own help
+#   gh api .../issues        the open drift issue the hosted watch keeps (ADR 0064): GitHub's list
+#                            repository issues endpoint, label canon-drift, opened by github-actions[bot],
+#                            the same query scripts/drift makes; recorded as `drift_issue`
 # and writes .canon/watch.json. .claude/hooks/session-brief.sh prints that result at the next session start.
 # It costs no tokens and moves no pins. A run where `canon check` or `canon outdated` could not read every
 # upstream is recorded as not ok and retried after an hour, never reported as a pass. Stale pins are recorded
@@ -68,9 +71,12 @@ fi
 
 # A gh that cannot answer is recorded as null, never as "none open". It does not mark the whole watch
 # as failed: the upstream comparison above succeeded and need not be repeated every hour.
+# Both GitHub questions below need a GitHub remote and gh through mise.
+has_origin=false
+git -C "$root" remote get-url origin >/dev/null 2>&1 && has_origin=true
+mise_bin=$(command -v mise 2>/dev/null) || mise_bin="$HOME/.local/bin/mise"
 bot_prs='[]'
-if git -C "$root" remote get-url origin >/dev/null 2>&1; then
-  mise_bin=$(command -v mise 2>/dev/null) || mise_bin="$HOME/.local/bin/mise"
+if [ "$has_origin" = true ]; then
   # perl's alarm bounds the call at 60 seconds; macOS ships perl and has no timeout command.
   if prs=$(cd "$root" && perl -e 'alarm 60; exec @ARGV' "$mise_bin" exec -- gh pr list --app dependabot --state open --json number,title 2>/dev/null) \
      && jq -e 'type == "array"' >/dev/null 2>&1 <<<"$prs"; then
@@ -80,11 +86,25 @@ if git -C "$root" remote get-url origin >/dev/null 2>&1; then
   fi
 fi
 
+# The drift issue, asked the same way and with the same rule: a gh that cannot answer (issues off included)
+# is null, never "none open".
+drift_issue='[]'
+if [ "$has_origin" = true ]; then
+  # shellcheck disable=SC2016  # {owner}/{repo} is gh's placeholder for the current repository, not the shell's
+  if di=$(cd "$root" && perl -e 'alarm 60; exec @ARGV' "$mise_bin" exec -- gh api -X GET 'repos/{owner}/{repo}/issues' \
+            -f labels=canon-drift -f state=open -f creator='github-actions[bot]' 2>/dev/null) \
+     && jq -e 'type == "array"' >/dev/null 2>&1 <<<"$di"; then
+    drift_issue=$(jq -c '[.[] | select(.pull_request | not) | {number, title, html_url, updated_at}]' <<<"$di")
+  else
+    drift_issue=null
+  fi
+fi
+
 jq -n --argjson epoch "$now" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
       --argjson retagged "$retagged" --argjson advanced "$advanced" --argjson newer "$newer" \
-      --argjson unparseable "$unparseable" --argjson bot_prs "$bot_prs" --argjson errors "$errors" \
+      --argjson unparseable "$unparseable" --argjson bot_prs "$bot_prs" --argjson drift_issue "$drift_issue" --argjson errors "$errors" \
       --argjson stale "$stale" --arg registry "$fp" \
       '{checked_at: $at, checked_at_epoch: $epoch, registry: $registry, ok: ($errors | length == 0),
         retagged: $retagged, advanced: $advanced, stale: $stale, newer: $newer, unparseable: $unparseable,
-        bot_prs: $bot_prs, errors: $errors}' > "$out.tmp" && mv "$out.tmp" "$out"
+        bot_prs: $bot_prs, drift_issue: $drift_issue, errors: $errors}' > "$out.tmp" && mv "$out.tmp" "$out"
 exit 0
