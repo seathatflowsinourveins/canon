@@ -124,6 +124,10 @@ means the two together. The mise base URL gained its `https://` scheme so the li
 * ADR 0069, 2026-11-10: amends this record with a second paper account, B, service
   `canon-alpaca-paper-windows`; `paper:store`, `paper:check` and `paper:remove` take the account (`tests`,
   this record's, by default, or `windows`). The rest of this record stands for account A.
+* ADR 0069, 2026-11-11: `paper:session` now reads account B's items, service `canon-alpaca-paper-windows`,
+  under B's own lock, `canon-paper-windows.lock`, so the note under clause 1 that it reads these items under
+  the same lock no longer holds; `paper:test` and `paper:data` (ADR 0070) read this record's items into
+  an environment.
 * The owner's standing instruction, 2026-11-10: a paper run needs no ask, at any hour, as long as the tests
   follow the practice of Alpaca's own repositories and NautilusTrader (how ADR 0036's do is stated there);
   the `ask` rule above is closed on it.
