@@ -198,6 +198,15 @@
       "sha": "de277ef139da42a7953b888c70c69e4c625caf35",
       "track": "branch:main"
     },
+    "dsh-ci-context": {
+      "default_branch": "main",
+      "default_sha": "7d814e3def47e257de0aa4b12e2d57572eb63d6a",
+      "ref": "refs/tags/v0.1.1",
+      "repo": "lucas-ward/dsh-ci-context",
+      "resolved_at": "2026-11-11T22:11:23Z",
+      "sha": "7d814e3def47e257de0aa4b12e2d57572eb63d6a",
+      "track": "tag:v0.1.1"
+    },
     "dsh-tui": {
       "default_branch": "main",
       "default_sha": "de73c6f3e5fa8c5b98b7fc87907395f5832c8aa3",
