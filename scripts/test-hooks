@@ -44,8 +44,10 @@ check "py-lint calls uv run --locked"        test "$pyl" = "0"
 # deny, then ask, then allow, the first match deciding; `*` matches any text, spaces included; a rule's
 # one trailing ` *` (or `:*`) also matches the bare command; `mise exec` is not a wrapper Claude Code
 # strips, so a rule names it. Not emulated: compound commands (an ask rule applies when any subcommand
-# matches), stripped wrappers and environment assignments. Ask rules apply in every permission mode;
-# allow rules are what keeps a command from prompting outside bypassPermissions.
+# matches), stripped wrappers and environment assignments. A redirection is matched here as text, so
+# this matcher matches fewer commands than Claude Code, which still prompted for an exact rule's command
+# with `2>&1` or `> file` after it (ADR 0028, Confirmation). Ask rules apply in every permission mode; allow rules are
+# what keeps a command from prompting outside bypassPermissions.
 # shellcheck disable=SC2016  # a jq program; its $names are jq's, not the shell's
 MATCH='
   def esc: gsub("(?<c>[.^$|?+()\\[\\]{}\\\\])"; "\\\(.c)");
@@ -93,6 +95,12 @@ mise exec -- uv add httpx==0.27.2
 mise exec -- uv add --package canon-alpaca httpx==0.27.2
 uv add httpx==0.27.2 --no-sync
 uv add httpx==0.27.2 2>&1
+scripts/land
+./scripts/land
+scripts/land --reviewed "code-review medium: no findings"
+./scripts/land --reviewed "code-review medium: no findings"
+scripts/land --pr 5
+./scripts/land --pr 5
 EOF
 
 # No id (or an empty one) re-resolves every pin. A range, a URL, an upgrade, another index or another
@@ -114,6 +122,18 @@ scripts/canon resolve $id
 ./scripts/canon resolve ""
 ./scripts/canon resolve "$id"
 ./scripts/canon resolve $id
+mise exec -- scripts/canon resolve
+mise exec -- scripts/canon resolve --prune
+mise exec -- scripts/canon resolve ''
+mise exec -- scripts/canon resolve ""
+mise exec -- scripts/canon resolve "$id"
+mise exec -- scripts/canon resolve $id
+mise exec -- ./scripts/canon resolve
+mise exec -- ./scripts/canon resolve --prune
+mise exec -- ./scripts/canon resolve ''
+mise exec -- ./scripts/canon resolve ""
+mise exec -- ./scripts/canon resolve "$id"
+mise exec -- ./scripts/canon resolve $id
 uv add 'httpx>=0.27'
 uv add 'httpx<1'
 uv add 'httpx~=0.27'
@@ -168,12 +188,28 @@ mise exec -- uv sync --locked
 scripts/bootstrap --install
 scripts/bootstrap --install --with-user-config
 ./scripts/bootstrap --install
+scripts/bootstrap --user-config
+./scripts/bootstrap --user-config
+mise exec -- scripts/bootstrap --install
+mise exec -- scripts/bootstrap --install --with-user-config
+mise exec -- ./scripts/bootstrap --install
+mise exec -- scripts/bootstrap --user-config
+mise exec -- ./scripts/bootstrap --user-config
 scripts/automation install
 ./scripts/automation install
 scripts/automation uninstall
 ./scripts/automation uninstall
+scripts/automation install now
+scripts/automation install 2>&1
+./scripts/automation uninstall 2>&1
+mise exec -- scripts/automation install
+mise exec -- ./scripts/automation install
+mise exec -- scripts/automation uninstall
+mise exec -- ./scripts/automation uninstall
 git push
 git push origin main
+mise exec -- git push
+mise exec -- git push origin main
 EOF
 
 # A bare name is neither pinned nor matchable: Manual mode asks, as for any command not allowed.
@@ -181,6 +217,15 @@ while IFS= read -r cmd; do check "neither allowed nor asked: $cmd" unlisted "$cm
 uv add httpx
 mise exec -- uv add httpx
 uv lock
+mise exec -- scripts/canon resolve alpaca-py
+EOF
+
+# Stated limits (ADR 0028): a rule matches the command as written, so another spelling of the same
+# program gets past every rule here, and bypassPermissions runs it unasked. Listed so a change is seen.
+while IFS= read -r cmd; do check "a spelling no rule matches: $cmd" unlisted "$cmd"; done <<'EOF'
+mise x -- git push origin main
+sh -c 'scripts/automation install'
+git -C . push origin main
 EOF
 
 echo "test-hooks: $pass passed, $fail failed"
