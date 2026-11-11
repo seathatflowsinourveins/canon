@@ -61,8 +61,9 @@ judged through it:
   terms ("waiting to be replaced").
 
 What a replacement's `qty` and `filled_qty`, and its fill activities' `cum_qty`, count once the order before it
-had fills is not on Alpaca's pages (UNVERIFIED): the two readings are `FilledReading`, the one in force is
-`FILLED_READING`, and `chain_filled` and `chain_quantity` are the only places the accounting turns on it.
+had fills is not on Alpaca's pages; on paper, overnight, 2 of 2 runs (ADR 0042), they counted the whole
+chain: `FILLED_READING` is that reading, `CHAIN`, and `chain_filled` and `chain_quantity` are the only places
+the accounting turns on it; the regular session is UNVERIFIED.
 
 Order events follow NautilusTrader's execution policies ("Command outcomes",
 https://nautilustrader.io/docs/md/latest/concepts/execution/policies.md): an order this slice cannot send is
@@ -108,8 +109,8 @@ A fill Alpaca lists under an order since replaced is reported on the order that 
 order reports carry under the node's client order ID, as the stream applies a fill on a superseded order
 to the node's order. The chain's fills are judged together, every order of it read (`_replaced_fills`):
 kept when the live order's `filled_qty`, and its newest listed activity's `cum_qty`, show they are all of
-them under `FILLED_READING`; under the reading in force, when they show the live order counts only its own,
-its own fills are kept and the earlier ones left to the engine (UNVERIFIED, ADR 0042).
+them under `FILLED_READING`, the reading observed on paper (ADR 0042); when they show it counts only its
+own, which paper did not show, its own fills are kept and the earlier ones left to the engine.
 
 Venue side, alpaca-py 0.45.0:
 
@@ -681,8 +682,9 @@ def replaces_as_asked(replacement: AlpacaOrder, request: ReplaceOrderRequest, or
 
 class FilledReading(Enum):
     """What Alpaca's `qty` and `filled_qty` on a replacement, and the `cum_qty` and `leaves_qty` of its
-    fill activities, count once the order it replaced had fills. Alpaca's pages do not say (UNVERIFIED,
-    ADR 0042); both readings are written here and tested, and `FILLED_READING` names the one in force."""
+    fill activities, count once the order it replaced had fills. Alpaca's pages do not say; paper showed
+    `CHAIN` overnight (ADR 0042), and the regular session is UNVERIFIED. Both readings are written here
+    and tested, and `FILLED_READING` names the one in force."""
 
     CHAIN = "chain"
     """The replacement carries the order on: its `qty` is the order's and its `filled_qty` counts every fill
@@ -694,8 +696,10 @@ class FilledReading(Enum):
 
 
 FILLED_READING = FilledReading.CHAIN
-"""The reading in force, UNVERIFIED: the one this client has used since modify was built (ADR 0042), until a
-paper observation of a partly filled order replaced and then filled settles it."""
+"""The reading in force, observed on paper (ADR 0042, 2026-11-10 New York, overnight, 2 of 2 runs): a
+partly filled order replaced and then filled showed the replacement's `qty` as the order's, its `filled_qty`
+and its activity's `cum_qty` counting the fills before it, and `leaves_qty` as what is left of the order.
+Whether the regular session answers the same is UNVERIFIED; `OWN` stays written down and tested for it."""
 
 
 def chain_filled(own: Decimal, earlier: Decimal) -> Decimal:
@@ -2811,8 +2815,8 @@ class AlpacaExecutionClient(ExecutionClient):
         spot keeps a cancel-replace's superseded venue order IDs bound to the node's order
         (`OrderBinding`'s `superseded`, `record_order_update_from_fill`,
         `crates/adapters/binance/src/common/dispatch.rs` at the pinned commit). So it is reported on the
-        live order, when that is consistent with the live order's report. Whether a replacement's
-        `filled_qty` counts the fills before it is UNVERIFIED (ADR 0042), so:
+        live order, when that is consistent with the live order's report. Under
+        `FILLED_READING`, `CHAIN`, observed on paper overnight (ADR 0042):
 
         * if the live order lists fills of its own, its newest activity's `cum_qty` must equal its
           `filled_qty` (nothing on it unlisted, read either way); then its own fills adding up to

@@ -68,11 +68,29 @@ run: TC-E31 and TC-E33 (a short sale from flat), TC-E32 and TC-E35 (no new hook)
 applicable: TC-E36. The offline tests stand in for the venue as alpaca-py's own tests mock its paper
 endpoints, and are listed in the package README.
 
-`UNVERIFIED`, shown by no run: `order_replace_rejected`; `pending_replace`; a `new` for a replacement later
-than ~200 ms; a status on a replace other than 422; a modify of a partially filled order (what `qty`,
-`filled_qty` and the activities' `cum_qty` count then: the client holds both readings, `FilledReading`, and
-uses the one it always has, that a replacement carries the order on); a fill on the old order racing a replace, where the old order's fill applies as usual and the
-replacement's `rejected` becomes `OrderModifyRejected`, not `OrderRejected`.
+Paper, overnight, 2026-11-10 New York (about 22:30 to 23:00), extended-hours DAY limit buys through
+alpaca-py with `raw_data=True`, logs kept outside the repo:
+
+* A partly filled order replaced and then filled, 2 of 2 runs (NVDA, 20 shares; 18 and 16 filled first):
+  the answer was the replacement `partially_filled`, `qty` 20, `filled_qty` 18 (16), `replaces` the old
+  order; the old order read `replaced` with its `filled_qty` and `replaced_by`; the replacement's `fill`
+  carried its own `qty` (2, 4) and the order's `filled_qty` 20; the activities' `cum_qty` were 18 (16) and
+  20, `leaves_qty` 2 (4) and 0. So a replacement carries the order on: `FilledReading.CHAIN`, the reading
+  the client has used, is in force as observed.
+* 9 of 9 replaces: no `pending_new` or `new` for the replacement; after the old order's `replaced`, its
+  first update was its last (`canceled` or `fill`).
+* A PATCH on a submit answered `pending_new`, 3 of 3: accepted, answered `new`, the old order `replaced`.
+* The stream's `replaced` against a read showing `replaced`, 7 samples: within 3 ms of it.
+* A replace with the order's own terms: 422 "order parameters are not changed". A node does not send one:
+  NautilusTrader's `Strategy` refuses to create the `ModifyOrder` ("quantity, price, and trigger were
+  either None or the same as existing values", observed offline).
+* A second replace of a replaced order: 422 "order already replaced", 7 of 7.
+
+`UNVERIFIED`, shown by no run: `order_replace_rejected`; `pending_replace` (never seen in 9 replaces); a
+status on a replace other than 422; whether the regular session counts a partly filled replacement as
+overnight did; a PATCH on a submit in the regular session; a fill on the old order racing a replace,
+where the old order's fill applies as usual and the replacement's `rejected` becomes `OrderModifyRejected`,
+not `OrderRejected`.
 
 ## Evidence
 
@@ -152,4 +170,9 @@ Read 2026-11-10; "raw": fetched with `curl` and read, not summarised. NautilusTr
   `begin_replace`, `reject_replace`, `restore_order`, `cleanup_terminal`), with a fill applied once per
   trade ID. Not taken from upstream: Binance's binding holds one current and its superseded venue IDs,
   where here a replacement not yet adopted is held too, since Alpaca's replacement can be rejected after
-  `replaced`. Still UNVERIFIED: what a replacement's quantities count (the seam above).
+  `replaced`. What a replacement's quantities count was then UNVERIFIED; the next line records what
+  paper showed.
+* Paper, overnight, 2026-11-10 New York: a partly filled order's replacement carries the order's `qty`
+  and fills (2 of 2 runs), so the reading in force is the one observed; the Confirmation above is
+  corrected, and the earlier `UNVERIFIED` items on a partially filled modify and a late `new` are closed
+  by it, for the overnight session.
