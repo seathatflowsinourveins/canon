@@ -17,6 +17,7 @@ thread that does not stop.
 
 import asyncio
 import concurrent.futures
+import functools
 import gc
 import logging
 import re
@@ -58,6 +59,7 @@ from nautilus_trader.live import LiveNode
 from nautilus_trader.model import BarType
 from nautilus_trader.model import Equity
 from nautilus_trader.model import InstrumentId
+from nautilus_trader.model import MarketStatusAction
 from nautilus_trader.model import NautilusDataType
 from nautilus_trader.model import Price
 from nautilus_trader.model import TradeId
@@ -1613,8 +1615,11 @@ def test_the_engine_passes_on_only_the_first_subscription_to_an_instrument(venue
 
 
 def stream_call_name(fn: object) -> str:
-    """The alpaca-py stream method a submitted worker call makes, through the partials around it."""
+    """The alpaca-py stream method a submitted worker call makes first, through the partials around it
+    and `call_each`, which makes one call per channel."""
     target = (getattr(fn, "args", ()) or (None,))[0]
+    if isinstance(target, functools.partial) and target.func is canon_alpaca.data.call_each:
+        target = target.args[0][0]
     target = getattr(target, "func", target)
     return getattr(target, "__name__", "")
 
@@ -2715,7 +2720,7 @@ def test_a_stream_mute_past_the_limit_is_stopped_and_named(venue, capfd) -> None
     log = logged(capfd)
     (line,) = [line for line in log.splitlines() if "went mute" in line and "[ERROR]" in line][:1]
     # What a session window reads as its stream's error: a line that begins with the feed.
-    assert "Alpaca stream on feed iex went mute: no quote or trade for" in line
+    assert "Alpaca stream on feed iex went mute: no market data for" in line
     assert "stream_mute_limit_secs" in line
     assert "ended by itself" not in log
 
@@ -2957,3 +2962,223 @@ def test_unsubscribing_quotes_logs_the_quote_count_and_leaves_the_trade_count(
     log = logged(capfd)
     assert len(stream_lines(log, "dropped 1 AAPL quotes")) == 1  # at the unsubscribe, not again
     assert len(stream_lines(log, "rounded 2 AAPL trade prices")) == 1  # at disconnect only
+
+
+# -- whole-market minute bars and trading statuses on the stream (ADR 0090) -----------------------------
+
+MINUTE = BarType.from_str("AAPL.ALPACA-1-MINUTE-LAST-EXTERNAL")
+MSFT = InstrumentId.from_str("MSFT.ALPACA")
+MSFT_MINUTE = BarType.from_str("MSFT.ALPACA-1-MINUTE-LAST-EXTERNAL")
+
+
+class Watcher(Strategy):
+    """Subscribe bars and statuses as configured, and record what arrives."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.bar_types: list[BarType] = []
+        self.status_ids: list[InstrumentId] = []
+        self.params: dict | None = None
+        self.seen_bars: list = []
+        self.seen_statuses: list = []
+
+    def on_start(self) -> None:
+        if self.bar_types:
+            self.subscribe_bars(self.bar_types, params=self.params)
+        if self.status_ids:
+            self.subscribe_instrument_status(self.status_ids, params=self.params)
+
+    def on_bar(self, bar) -> None:
+        self.seen_bars.append(bar)
+
+    def on_instrument_status(self, status) -> None:
+        self.seen_statuses.append(status)
+
+
+def watcher(**options: object) -> Watcher:
+    strategy = Watcher()
+    for name, value in options.items():
+        assert hasattr(strategy, name), name
+        setattr(strategy, name, value)
+    return strategy
+
+
+@pytest.fixture
+def market(venue, alpaca, monkeypatch) -> SimpleNamespace:
+    """alpaca-py's real stream on an in-memory socket, with AAPL and MSFT both loaded."""
+    stream, socket = alpaca.memory_stream(monkeypatch)
+    monkeypatch.setattr(canon_alpaca.data, "StockDataStream", lambda **_: stream)
+    msft = {**alpaca.ASSET_AAPL, "symbol": "MSFT", "id": "4ce9353c-66d1-46c2-898f-fce867ab0247"}
+    venue.trading.assets = [alpaca.ASSET_AAPL, msft]
+    config = AlpacaDataClientConfig(
+        instrument_provider=InstrumentProviderConfig(load_ids=["AAPL.ALPACA", "MSFT.ALPACA"])
+    )
+    return SimpleNamespace(stream=stream, socket=socket, config=config)
+
+
+def test_a_minute_bar_subscription_hands_the_engine_the_streamed_bar(market, alpaca) -> None:
+    strategy = watcher(bar_types=[MINUTE])
+
+    async def body(client) -> None:
+        await wait_until(lambda: market.socket.held("bars") == {"AAPL"})
+        market.socket.deliver(alpaca.wire_bar())
+        await wait_until(lambda: strategy.seen_bars)
+
+    run_with_client(body, strategy, config=market.config)
+
+    (bar,) = strategy.seen_bars
+    assert bar.bar_type == MINUTE
+    assert str(bar.open) == "178.2600" and str(bar.close) == "178.2100"
+    assert bar.ts_event == dt_to_unix_nanos(datetime(2022, 1, 3, 9, tzinfo=UTC))  # at its open
+
+
+def test_a_wildcard_bar_subscription_sends_star_and_hands_on_only_listed_symbols(
+    market, alpaca
+) -> None:
+    strategy = watcher(bar_types=[MINUTE], params={"wildcard": True})
+
+    async def body(client) -> None:
+        await wait_until(lambda: market.socket.held("bars") == {"*"})
+        market.socket.deliver(alpaca.wire_bar(symbol="MSFT"), alpaca.wire_bar(symbol="ZZZZ"))
+        market.socket.deliver(alpaca.wire_bar())
+        await wait_until(lambda: strategy.seen_bars)
+        await asyncio.sleep(0.1)
+
+    cache = run_with_client(body, strategy, config=market.config)
+
+    assert [b.bar_type for b in strategy.seen_bars] == [MINUTE]
+    assert not cache.has_bars(MSFT_MINUTE)  # loaded, but not listed: nobody subscribed to it
+
+
+def test_a_bar_type_the_stream_does_not_carry_is_refused_by_name(market, capfd) -> None:
+    hourly = BarType.from_str("AAPL.ALPACA-1-HOUR-LAST-EXTERNAL")
+    strategy = watcher(bar_types=[hourly])
+
+    async def body(client) -> None:
+        await asyncio.sleep(0.2)
+
+    run_with_client(body, strategy, config=market.config)
+
+    assert market.socket.held("bars") == set()
+    log = logged(capfd)
+    assert "Cannot subscribe: AAPL.ALPACA-1-HOUR-LAST-EXTERNAL" in log
+    assert "1-MINUTE-LAST-EXTERNAL" in log
+
+
+@pytest.mark.parametrize("asked", [False, True])
+def test_updated_bars_are_handed_on_only_when_asked(market, alpaca, asked) -> None:
+    strategy = watcher(bar_types=[MINUTE], params={"updated_bars": True} if asked else None)
+
+    async def body(client) -> None:
+        await wait_until(lambda: market.socket.held("bars") == {"AAPL"})
+        assert market.socket.held("updatedBars") == ({"AAPL"} if asked else set())
+        market.socket.deliver(alpaca.wire_bar())
+        await wait_until(lambda: strategy.seen_bars)
+        market.socket.deliver(alpaca.wire_bar("u", c=178.3, h=178.3))
+        if asked:
+            await wait_until(lambda: len(strategy.seen_bars) == 2)
+        else:
+            await asyncio.sleep(0.1)
+
+    run_with_client(body, strategy, config=market.config)
+
+    closes = [str(b.close) for b in strategy.seen_bars]
+    assert closes == (["178.2100", "178.3000"] if asked else ["178.2100"])
+
+
+@pytest.mark.parametrize(
+    ("code", "action", "trading", "quoting", "restricted"),
+    [
+        ("2", MarketStatusAction.HALT, False, None, None),
+        ("H", MarketStatusAction.HALT, False, None, None),
+        ("P", MarketStatusAction.PAUSE, False, None, None),
+        ("3", MarketStatusAction.TRADING, True, None, None),
+        ("T", MarketStatusAction.TRADING, True, None, None),
+        ("Q", MarketStatusAction.QUOTING, False, True, None),
+        ("5", MarketStatusAction.NEW_PRICE_INDICATION, None, None, None),
+        ("E", MarketStatusAction.SHORT_SELL_RESTRICTION_CHANGE, None, None, True),
+        ("7", MarketStatusAction.NONE, None, None, None),
+        ("F", MarketStatusAction.NONE, None, None, None),
+    ],
+)
+def test_each_alpaca_status_code_becomes_an_instrument_status(
+    market, alpaca, code, action, trading, quoting, restricted
+) -> None:
+    strategy = watcher(status_ids=[AAPL])
+
+    async def body(client) -> None:
+        await wait_until(lambda: market.socket.held("statuses") == {"AAPL"})
+        market.socket.deliver(alpaca.wire_status(code, "T1"))
+        await wait_until(lambda: strategy.seen_statuses)
+
+    run_with_client(body, strategy, config=market.config)
+
+    (status,) = strategy.seen_statuses
+    assert status.instrument_id == AAPL
+    assert status.action == action
+    assert (status.is_trading, status.is_quoting, status.is_short_sell_restricted) == (
+        trading,
+        quoting,
+        restricted,
+    )
+    assert status.trading_event == f"{code} status {code}"
+    assert status.reason == "T1 reason T1"
+    assert status.ts_event == dt_to_unix_nanos(datetime(2022, 1, 3, 15, 30, tzinfo=UTC))
+
+
+def test_a_wildcard_status_subscription_hands_on_only_listed_symbols(market, alpaca) -> None:
+    strategy = watcher(status_ids=[AAPL], params={"wildcard": True})
+
+    async def body(client) -> None:
+        await wait_until(lambda: market.socket.held("statuses") == {"*"})
+        market.socket.deliver(alpaca.wire_status("H", symbol="MSFT"))
+        market.socket.deliver(alpaca.wire_status("H"))
+        await wait_until(lambda: strategy.seen_statuses)
+        await asyncio.sleep(0.1)
+
+    run_with_client(body, strategy, config=market.config)
+
+    assert [s.instrument_id for s in strategy.seen_statuses] == [AAPL]
+
+
+def test_unsubscribing_the_last_listed_symbol_unsubscribes_the_wildcard(market) -> None:
+    strategy = watcher(bar_types=[MINUTE, MSFT_MINUTE], params={"wildcard": True})
+
+    async def body(client) -> None:
+        await wait_until(lambda: market.socket.held("bars") == {"*"})
+        strategy.unsubscribe_bars(MINUTE, params={"wildcard": True})
+        await asyncio.sleep(0.1)
+        assert market.socket.held("bars") == {"*"}  # MSFT is still listed
+        strategy.unsubscribe_bars(MSFT_MINUTE, params={"wildcard": True})
+        await wait_until(lambda: market.socket.held("bars") == set())
+
+    run_with_client(body, strategy, config=market.config)
+
+
+def test_a_reconnect_sends_the_wildcard_again(market, alpaca, monkeypatch) -> None:
+    market.stream._reconnect_min_backoff = 0.01  # alpaca-py waits 0.5 to 1 s first; shortened here
+
+    def build(**kwargs: object) -> object:
+        market.stream._data_timeout = kwargs["data_timeout"]
+        return market.stream
+
+    monkeypatch.setattr(canon_alpaca.data, "StockDataStream", build)
+    strategy = watcher(bar_types=[MINUTE], status_ids=[AAPL], params={"wildcard": True})
+
+    def sent(channel: str) -> list:
+        return [
+            m[channel] for m in market.socket.sent if m["action"] == "subscribe" and channel in m
+        ]
+
+    async def body(client) -> None:
+        await wait_until(lambda: market.socket.held("statuses") == {"*"})
+        await wait_until(lambda: len(sent("bars")) >= 3)  # a reconnect replays both maps
+
+    config = AlpacaDataClientConfig(
+        instrument_provider=market.config.instrument_provider,
+        stream_data_timeout_secs=0.1,
+        stream_mute_limit_secs=None,
+    )
+    run_with_client(body, strategy, config=config)
+
+    assert all(symbols == ["*"] for symbols in sent("bars"))

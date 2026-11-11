@@ -138,8 +138,8 @@ the longest silence seen on a feed that then delivered (513 s: `iex` with QQQ al
 2026-11-11, one trade and no quote in 600 s); a window's parts are far busier (SPY on `iex` in the regular
 session, hundreds of quotes a minute; on `boats` overnight, 1,552 to 3,700 quotes a window, ADR 0044). Its
 reconnect reaches the log as a warning naming the feed, so a quiet feed fails nothing. As alpaca-py
-reconnects without end, the client counts the silence too: no quote or trade for
-`stream_mute_limit_secs` (3,600 s by default, and longer than the data timeout) while it holds a
+reconnects without end, the client counts the silence too: no market data (a quote or trade, and
+since ADR 0090 a bar or status) for `stream_mute_limit_secs` (3,600 s by default, and longer than the data timeout) while it holds a
 subscription, and it stops the stream, logs an error beginning "Alpaca stream on feed <feed> went mute",
 which a session window reads as its stream's error, and refuses later subscriptions until it reconnects,
 the same say-so as a stream that ended, and as upstream's Databento feed handler gives up reconnecting

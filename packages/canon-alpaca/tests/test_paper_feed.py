@@ -24,6 +24,14 @@ Upstream's `DataTester` cannot be used for TC-D71 here: v2.0.0rc8's Python `Data
   quote that fine, naming it (ADR 0055). It fails when no trade arrives or the client drops a trade; it
   reports how many prices were rounded, which a quiet minute may leave at none.
 
+* `test_paper_wildcard_bars_and_statuses_reach_the_strategy_for_listed_symbols` (ADR 0090): minute bars
+  and trading statuses for `SYMBOLS` with `params={"feed": "sip", "wildcard": True}`. Alpaca must confirm
+  `"*"` on both channels; minute bars reach the strategy for listed symbols only, each the stream's one
+  bar type. It runs `WILDCARD_SECS`, two minute marks at least, while sip is in session (between the
+  day's session open and close on Alpaca's calendar). It fails when Alpaca does not confirm `"*"`, no bar
+  arrives, or a bar arrives for a symbol not listed; it reports the bars per minute, the symbols seen and
+  each status received, which a calm market may leave at none.
+
 No paper test shows a feed refused: on 2026-11-10 at 20:46 New York the paper pair authenticated on
 `v2/sip` too, although "Paper Trading" (https://docs.alpaca.markets/us/docs/paper-trading.md) entitles a
 Paper Only account to IEX alone (ADR 0055). A refusal is tested offline only.
@@ -37,6 +45,7 @@ import asyncio
 import logging
 import os
 import time
+from collections import Counter
 from collections.abc import Callable
 from datetime import UTC
 from datetime import date
@@ -60,6 +69,7 @@ from nautilus_trader.config import DataClientConfig
 from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.config import LiveNodeConfig
 from nautilus_trader.live import LiveNode
+from nautilus_trader.model import BarType
 from nautilus_trader.model import InstrumentId
 from nautilus_trader.model import TraderId
 from nautilus_trader.trading import Strategy
@@ -311,3 +321,93 @@ def test_paper_sip_trade_prices_are_kept_at_four_decimals_and_named_when_rounded
     assert strategy.trades, f"no AAPL trade from sip in {SIP_SECS} s of the regular session"
     assert not dropped, dropped
     assert all(t.price.precision == 4 for t in strategy.trades)
+
+
+SYMBOLS = ("SPY", "QQQ", "AAPL", "MSFT", "NVDA", "TSLA", "AMD", "AMZN")
+WILDCARD_SECS = 150
+"""How long the test runs: two minute marks at least, so each listed symbol has a chance to trade."""
+PARAMS = {"feed": "sip", "wildcard": True}
+
+
+class Market(Strategy):
+    """Subscribe minute bars and statuses for `SYMBOLS` by wildcard, and record what arrives."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.bars: list = []
+        self.statuses: list = []
+
+    def on_start(self) -> None:
+        ids = [InstrumentId.from_str(f"{s}.ALPACA") for s in SYMBOLS]
+        bar_types = [BarType.from_str(f"{i}-1-MINUTE-LAST-EXTERNAL") for i in ids]
+        self.subscribe_bars(bar_types, params=PARAMS)
+        self.subscribe_instrument_status(ids, params=PARAMS)
+
+    def on_bar(self, bar) -> None:
+        self.bars.append(bar)
+
+    def on_instrument_status(self, status) -> None:
+        self.statuses.append(status)
+
+
+def sip_in_session() -> bool:
+    """Whether sip is in session now, between the day's `session_open` and `session_close` on Alpaca's
+    calendar (pre-market open to after-hours close, New York time)."""
+    trading = with_http_timeout(
+        TradingClient(os.environ[ENV_API_KEY], os.environ[ENV_SECRET_KEY], paper=True)
+    )
+    now = datetime.now(UTC).astimezone(NEW_YORK)
+    days = trading.get_calendar(GetCalendarRequest(start=now.date(), end=now.date()))
+    assert isinstance(days, list)
+    if not days or not (days[0].session_open and days[0].session_close):
+        return False
+    return days[0].session_open <= now.strftime("%H%M") < days[0].session_close
+
+
+def test_paper_wildcard_bars_and_statuses_reach_the_strategy_for_listed_symbols(stream_log) -> None:
+    if not sip_in_session():
+        pytest.skip("sip is not in session (Alpaca's calendar: no session open now)")
+    strategy = Market()
+    node = LiveNode.build(
+        "CANON-ALPACA-PAPER-WILDCARD",
+        LiveNodeConfig(
+            environment=Environment.SANDBOX,
+            trader_id=TraderId("TESTER-001"),
+            timeout_connection_secs=20,
+            timeout_disconnection_secs=15,
+            delay_post_stop_secs=2,
+            data_clients={
+                "ALPACA": DataClientConfig(
+                    instrument_provider=InstrumentProviderConfig(
+                        load_ids=[f"{s}.ALPACA" for s in SYMBOLS]
+                    ),
+                ),
+            },
+        ),
+        data_factories={"ALPACA": AlpacaDataClientFactory},
+    )
+    node.add_strategy(strategy)
+    started = datetime.now(UTC)
+
+    run_for(node, WILDCARD_SECS)
+
+    assert f"connected to {STREAM_HOST}/v2/sip" in stream_log.lines, stream_log.lines
+    confirmed = [line for line in stream_log.lines if line.startswith("subscribed to")]
+    print(f"PAPER-WILDCARD confirmed={confirmed}")
+    assert any("bars: ['*']" in line and "statuses: ['*']" in line for line in confirmed), confirmed
+    per_minute = Counter(
+        datetime.fromtimestamp(b.ts_event / 1e9, UTC).strftime("%H:%M") for b in strategy.bars
+    )
+    seen = sorted({b.bar_type.instrument_id.symbol.value for b in strategy.bars})
+    print(
+        f"PAPER-WILDCARD from={started:%H:%M:%S}Z secs={WILDCARD_SECS} bars={len(strategy.bars)} "
+        f"per_minute={dict(sorted(per_minute.items()))} symbols_seen={seen} "
+        f"statuses={len(strategy.statuses)}"
+    )
+    for status in strategy.statuses:
+        print(f"PAPER-WILDCARD status {status}")
+    assert strategy.bars, f"no minute bar for {SYMBOLS} in {WILDCARD_SECS} s of sip's session"
+    assert set(seen) <= set(SYMBOLS), seen
+    assert all(str(b.bar_type).endswith("-1-MINUTE-LAST-EXTERNAL") for b in strategy.bars)
+    assert all(b.ts_init > b.ts_event for b in strategy.bars)  # stamped at its open, arrived after
+    assert datetime.now(UTC) - started < timedelta(seconds=WILDCARD_SECS + 120)
