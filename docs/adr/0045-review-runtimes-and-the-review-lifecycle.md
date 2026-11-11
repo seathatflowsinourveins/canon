@@ -279,3 +279,6 @@ Read 2026-11-10. `fetched`: downloaded and searched. "Lane": a model summarised 
 * Second reader, 2026-11-10, after the DSH trial (`evidence-verifier`): the configuration quotes held;
   it re-marked one defect (six to five of ten), dated the case's defect list to during the retry, found
   the shared workspace folder and the empty snapshot, and the pins sentence; all above.
+* ADR 0034, 2026-11-11: Muse moves from `--yolo` to `--disable-approval --sandbox-network restricted`
+  once the owner sets it, a sandbox that still leaves `/tmp` and the repository's git storage writable;
+  Antigravity and DeepSeek Harness keep rule 2's posture.

@@ -109,3 +109,5 @@ Read 2026-11-10.
   off"; `cron_mode`; "the messaging gateway"; its denylist "does not sandbox a hostile or compromised
   agent" (fetched). Its memory across sessions: the same report (lane).
 * No published terms or entry bar for giving an agent write access to a repository were found (lane).
+* ADR 0034, 2026-11-11: a Codex build worker runs in `:workspace`, where `.git` is read-only, so it
+  leaves its change uncommitted and the lane that checks it commits it; rule 2 is changed so for Codex.
