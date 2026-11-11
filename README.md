@@ -120,16 +120,25 @@ mise run paper:remove   # deletes both items
 mise run paper:test     # runs the paper tests with the pair, one session at a time (they place DAY
                         # limit buys of 1 AAPL far below the market and cancel each one, and let
                         # EmaCross trade 1 SPY, then close it)
-mise run paper:session  # one SessionMaCross window, 30 minutes by default, under the same lock; it ends
+mise run paper:store windows    # the same three for account B, the session windows' account
+mise run paper:session  # one SessionMaCross window on account B, 30 minutes by default; it ends
                         # flat or fails (--session extended outside the regular session; --strategy
                         # EmaCross runs upstream's built-in instead, in the regular session only)
 ```
 
+There are two paper accounts ([ADR 0069](docs/adr/0069-two-paper-accounts.md)): account A, the default,
+whose pair only `paper:test` reads, and account B (`windows`), whose pair only `paper:session` and its
+schedule read. Each account has its own lock, so a test and a window do not wait for each other; the two
+accounts share the login's market-data stream (one connection per endpoint, ADR 0069), so a paper test that streams and a window take turns on
+a third lock.
+
 `paper:store` refuses a key ID starting with `AK`, Alpaca's hint for a live key, then sends the pair to
 Alpaca's paper API (`GET /v2/account`) and stores nothing unless it is accepted there; a live pair is
-refused there. Each value then sits in the login keychain, service `canon-alpaca-paper`. Of this repo's
-commands, only `paper:test` puts it in an environment, its own, when it starts (`paper:store` reads it
-back once to confirm the write); no file, shell, `mise env` or `scripts/ci` gets it. The keychain does not stop other
+refused there. Each value then sits in the login keychain, service `canon-alpaca-paper` for account A and
+`canon-alpaca-paper-windows` for account B. Of this repo's commands, only `paper:test` (A) and
+`paper:session` (B) put a pair in an environment, each its own, when it starts (`paper:store` reads it
+back once to confirm the write, and reads the other account's key ID to refuse the same pair twice); no
+file, shell, `mise env` or `scripts/ci` gets it. The keychain does not stop other
 programs you run from reading it: any process of yours can, with `security find-generic-password -w`, and
 no dialog appears. To replace the pair, remove it and store it again.
 Why it works this way, and what the keychain does not protect against:

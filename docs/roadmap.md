@@ -35,8 +35,8 @@ ADR 0009 keeps trading on paper at least until NautilusTrader v2.0.0 stable, a c
 * **A trial that never traded, or a configuration that never runs to the end**, stops every ranking of
   its study; what value it should count as is undecided (ADR 0010, ADR 0054).
 * **One paper account or several.** ADR 0010 step 4 runs the pick and the incumbent on separate paper
-  accounts; one paper account serves every session on this machine today (`mise.toml`, `paper:test`,
-  `paper:session`), and a second one for session runs is the owner's to create (ADR 0044). ADR 0068
+  accounts; today account A serves the paper tests and account B the session windows, each under its own
+  lock (`mise.toml`, ADR 0069); no account is set aside yet for step 4's pick or its incumbent. ADR 0068
   (`proposed`) lays out the lanes that run upstream's strategies around the clock (a backtest queue, the
   sandbox on live data, paper windows) and why one stream per login bounds them; ADR 0070 the sandbox and
   a data-only task that cannot trade.

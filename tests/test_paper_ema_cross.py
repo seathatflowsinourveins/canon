@@ -58,13 +58,17 @@ from canon_trading.paper_node import EMA_CROSS_ID
 from canon_trading.paper_node import MAX_NOTIONAL_PER_ORDER_USD
 from canon_trading.paper_node import ema_cross_paper_node
 
-pytestmark = pytest.mark.skipif(
-    not (os.environ.get(ENV_API_KEY) and os.environ.get(ENV_SECRET_KEY)),
-    reason=(
-        f"Alpaca paper credentials not in the environment: set {ENV_API_KEY} and {ENV_SECRET_KEY} "
-        "to run this integration test"
+pytestmark = [
+    pytest.mark.skipif(
+        not (os.environ.get(ENV_API_KEY) and os.environ.get(ENV_SECRET_KEY)),
+        reason=(
+            f"Alpaca paper credentials not in the environment: set {ENV_API_KEY} and {ENV_SECRET_KEY} "
+            "to run this integration test"
+        ),
     ),
-)
+    # each test opens a market-data stream, so it holds the login's stream lock (conftest.py, ADR 0069)
+    pytest.mark.alpaca_stream,
+]
 
 SPY = InstrumentId.from_str("SPY.ALPACA")
 SYMBOL = "SPY"

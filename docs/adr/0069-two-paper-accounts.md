@@ -72,7 +72,8 @@ names, the adapter and `canon_alpaca` stay as they are. B's items are labelled `
    value. **What it does not build yet:** no task puts account B's pair in an environment; the only read
    of it is `paper:store`'s comparison of B's key ID when A's pair is stored. `paper:test` and
    `paper:session` both still read A under one lock. A later change moves `paper:session` and its
-   schedule to B and adds the locks in clause 3; until then account B sits unused.
+   schedule to B and adds the locks in clause 3; until then account B sits unused. (Built 2026-11-11:
+   Confirmation, "The reading side".)
 
 This amends ADR 0029, whose tasks act on one service, and, once a window reads B, ADR 0044's "Sharing the
 account" and ADR 0050's schedule. Each of the three points here.
@@ -86,7 +87,7 @@ account" and ADR 0050's schedule. Each of the three points here.
   request limit (UNVERIFIED for paper, clause 3).
 * Bad: the refusal catches the same pair entered for both accounts. It does not catch two different pairs
   of one account: neither the keychain nor the paper API check here says which account a pair reaches.
-* Bad: two runs that each open a stream still contend for the login's one stream, which the stream lock
+* Bad: two runs that each open a stream still contend for the login's stream (one connection per endpoint, UNVERIFIED for a second paper account, clause 3), which the stream lock
   orders.
 
 ### Confirmation
@@ -109,6 +110,44 @@ attribute `0x00000007` (macOS 27.2).
 
 The owner's step: `mise run paper:store windows`, then `mise run paper:check windows`.
 
+Account B's pair was stored on 2026-11-11 and checked again the same day: `mise run paper:check windows`
+exit 0, both items in the login keychain; `mise run paper:check` exit 0, account A's items intact;
+`scripts/bootstrap --check` shows both rows ok, `paper key pair` and `paper key pair (windows)` (run).
+
+**The reading side, built 2026-11-11.**
+
+* `paper:session`, by hand and from ADR 0050's schedule, reads only account B's pair (service
+  `canon-alpaca-paper-windows`); `paper:test` reads only account A's. Neither reads the other's.
+* The locks of clause 3. `paper:test` holds `canon-paper-test.lock` for its run. `paper:session` holds
+  `canon-paper-windows.lock`, then, after uv's sync, `canon-alpaca-stream.lock`, on descriptor 7, since the
+  runner's checkout lock is 8. Both waits come out of its one 900 s wait, so ADR 0050's deadline sum is
+  unchanged. A paper test takes the stream lock per test, not per run: a lock for the whole run would make
+  every test wait for every window, since both stream. A paper test module that builds a data client or a
+  stream carries the `alpaca_stream` marker. Its fixture, one block in both conftests, takes the stream lock
+  with `fcntl.flock` for that test, at the path `paper:test` names (`CANON_ALPACA_STREAM_LOCK`). The wait
+  blocks in flock(2), as lockf(1)'s does, under an interval timer, at most 3900 s and never past the point
+  where 900 s would be left before `paper:test`'s deadline, which it also exports. The lock is let go only
+  once every stream the test started has returned from `run()`, waited for up to 60 s; a stream still
+  running then fails the test, and the lock is kept until the run ends. A paper test without the marker
+  that starts an alpaca-py market-data stream is stopped in `DataStream.run`, before it connects, and fails. The stream lock is always taken last, after
+  an account's lock or alone, so no run waits for an account's lock while it holds the stream. What each
+  run waits for is ADR 0050's arithmetic.
+* The no-ask rule for paper runs covers both accounts, each under its own lock. The owner decided on
+  2026-11-11 that paper end-to-end runs on either account, at any hour, started by a lane, a coordinator or
+  the scheduled agent, need no ask; live trading is untouched (`.claude/rules/trading-safety.md`).
+* `scripts/test-lanes`: each task's service and lock read from `mise.toml`. Under the real mise, with one
+  lock folder, a stand-in window holds B's lock and the stream lock, and a stand-in test on A meanwhile
+  runs at once and is told the stream lock's path. A window whose stream lock is held waits its
+  (shortened) wait and fails, with no window started and B's lock free. Against the tasks as they were,
+  8 cases fail (run). `tests/test_session_window.py`: the two conftests' blocks are equal, and their wait
+  is paper:test's and `PAPER_LOCK_WAIT_SECS`. Every paper module that streams is marked. The fixture's
+  lock gives up at its bound while lockf(1) holds the file, and lockf cannot take it while the fixture
+  holds it. An unmarked stream is stopped in `run()`. The wait stops before the deadline's room, and a
+  stream is tracked until its `run()` returns (run).
+* On paper, UNVERIFIED until it has run: that a firing reads B's keychain items with no dialog, and that a
+  window on B and a paper test on A run at the same time.
+* Option 3's comparison of account IDs is still not built.
+
 ## Evidence
 
 Read 2026-11-10.
@@ -130,6 +169,11 @@ Read 2026-11-10.
 * https://docs.alpaca.markets/us/reference/getaccount-1.md — `GET /v2/account` returns the account's `id`
   and `account_number` (fetched by the second reader; option 3).
 * ADR 0029, ADR 0033, ADR 0044 and ADR 0050, for the tasks, the lock and the schedule this builds on.
+* `man lockf` on this machine: "BSD-style locking is used, as described in flock(2)" (read). A Python
+  `fcntl.flock` on the file and lockf(1) exclude each other both ways, lockf exiting 75 while Python holds
+  it (run, 2026-11-11).
+* alpaca-py 0.45.0 in `.venv`, `alpaca/data/live/`: `StockDataStream`, `CryptoDataStream`,
+  `OptionDataStream` and `NewsDataStream` subclass `DataStream`, and only `DataStream` defines `run` (read).
 * Reviews, 2026-11-10. `/code-review` (high): nine findings, seven fixed (the real-mise cases' environment
   and copy; the other key ID read before the prompts, bounded; the help; `paper:check`'s exit 3 for a bad
   name; the key-ID claim), two left: the README's paper section, for the change that moves

@@ -36,14 +36,19 @@ actionlint = "1.7.12"   # canon/upstreams.json: actionlint
 # `windows`, account B, service "canon-alpaca-paper-windows", the same two item names. paper:store, paper:check
 # and paper:remove take the account as an argument, `tests` when none is given; mise refuses any other name
 # before the script starts (the `usage` spec's `choices`, https://mise.jdx.dev/tasks/task-arguments.html,
-# tried with mise 2026.11.5), and each script's `case` refuses it again. No task reads account B's pair yet.
+# tried with mise 2026.11.5), and each script's `case` refuses it again. paper:test reads account A's pair and
+# paper:session, by hand or from the schedule, account B's; neither reads the other's. Each account has its own
+# lock, canon-paper-test.lock for A and canon-paper-windows.lock for B, so a test and a window do not wait for
+# each other, and the login's market-data stream (one connection per endpoint, which for a second paper
+# account is UNVERIFIED, ADR 0069) has a third, canon-alpaca-stream.lock, taken last by
+# whatever opens a stream: a window after its sync, and each paper test that streams, from its fixture.
 
 [tasks."paper:store"]
 description = "Enter an Alpaca paper account's key pair at a hidden prompt; store it only if Alpaca's paper API accepts it"
 interactive = true
 shell = "bash -c"
 usage = '''
-arg "[account]" help="tests: account A, the default; windows: account B (ADR 0069), which no task reads yet" default="tests" {
+arg "[account]" help="tests: account A, the default, which paper:test reads; windows: account B, which paper:session reads (ADR 0069)" default="tests" {
   choices "tests" "windows"
 }
 '''
@@ -132,7 +137,7 @@ fi
 description = "Say whether both keychain items of a paper account exist, without reading either value"
 shell = "bash -c"
 usage = '''
-arg "[account]" help="tests: account A, the default; windows: account B (ADR 0069), which no task reads yet" default="tests" {
+arg "[account]" help="tests: account A, the default, which paper:test reads; windows: account B, which paper:session reads (ADR 0069)" default="tests" {
   choices "tests" "windows"
 }
 '''
@@ -160,7 +165,7 @@ exit "$missing"
 description = "Delete both keychain items of a paper account"
 shell = "bash -c"
 usage = '''
-arg "[account]" help="tests: account A, the default; windows: account B (ADR 0069), which no task reads yet" default="tests" {
+arg "[account]" help="tests: account A, the default, which paper:test reads; windows: account B, which paper:session reads (ADR 0069)" default="tests" {
   choices "tests" "windows"
 }
 '''
@@ -209,29 +214,36 @@ exit "$failed"
 # dialog no one sees would hold the firing.
 [tasks."paper:test"]
 description = "Run every paper test with the key pair read from the login keychain for this task only"
-# its 3900 s wait for the lock, then 55 minutes for tests that take about five (observed); deadline 60 s inside
+# its 3900 s wait for account A's lock, then 55 minutes for tests that take about five (observed); deadline 60 s
+# inside. A streaming test may also wait for the stream lock, at most until 900 s are left before the deadline
+# (ADR 0050)
 timeout = "2h"
 env.ALPACA_API_KEY = { value = "{{ exec(command='/usr/bin/timeout 30 /usr/bin/security find-generic-password -s canon-alpaca-paper -a ALPACA_API_KEY -w') }}", redact = true }
 env.ALPACA_SECRET_KEY = { value = "{{ exec(command='/usr/bin/timeout 30 /usr/bin/security find-generic-password -s canon-alpaca-paper -a ALPACA_SECRET_KEY -w') }}", redact = true }
 # An empty value would make every paper test skip and the task pass, so it is refused first.
 run = '''
 deadline=7140
+lockwait=3900
 start=$(/bin/date +%s)
-[ -n "$ALPACA_API_KEY" ] && [ -n "$ALPACA_SECRET_KEY" ] || { echo "paper:test: a keychain item is empty; run: mise run paper:remove, then mise run paper:store" >&2; exit 1; }
-# One paper account serves every session on this machine, so the run holds an exclusive lock throughout
-# and a second run waits for it, at most 3900 s, then fails without placing anything (lockf(1); the file is
-# kept, as a descriptor implies and lockf(1) advises when processes contend). 3900 s outlasts one
-# `paper:session` window that runs as it should, which holds the same lock for its window and its bounded
-# end (session_window.LONGEST_WINDOW_SECS, ADR 0044); a window that hangs holds it until its deadline, longer
-# than this wait, and a test can still lose the race to the next window. The lock is in the per-user
-# temporary folder, which is the same for every process of the user whatever $TMPDIR a session sets.
+[ -n "$ALPACA_API_KEY" ] && [ -n "$ALPACA_SECRET_KEY" ] || { echo "paper:test: a keychain item of account A is empty; run: mise run paper:remove, then mise run paper:store" >&2; exit 1; }
+# Account A serves the paper tests and nothing else (ADR 0069), so the run holds account A's lock throughout
+# and a second run waits for it, at most `lockwait` seconds, then fails without placing anything (lockf(1);
+# the file is kept, as a descriptor implies and lockf(1) advises when processes contend). No window takes
+# this lock: windows run on account B under its own. What a test still shares with a window is the login's
+# market-data stream: each paper test that opens one (the `alpaca_stream` marker) takes the stream lock
+# named below from its fixture, waiting as long as this wait, which outlasts one window that runs as it
+# should (session_window.LONGEST_WINDOW_SECS, ADR 0050). The locks are in the per-user temporary folder,
+# which is the same for every process of the user whatever $TMPDIR a session sets.
 # Descriptor 9 and the deadline: the note above this task.
 # the folder's name, or a stop: none would leave a lock file of this run's own, beside no other run's
 # (scripts/test-lanes, "per-user temporary folder")
 tmp="$(/usr/bin/getconf DARWIN_USER_TEMP_DIR)" || tmp=""
 case "$tmp" in /*/) ;; *) echo "paper:test: the per-user temporary folder is not known (DARWIN_USER_TEMP_DIR gave '$tmp'), so there is no paper lock to take; nothing was placed" >&2; exit 1 ;; esac
 exec 9>>"${tmp}canon-paper-test.lock"
-/usr/bin/lockf -t 3900 9 || { echo "paper:test: the paper lock stayed held for 3900 s; nothing was placed" >&2; exit 1; }
+/usr/bin/lockf -t "$lockwait" 9 || { echo "paper:test: account A's lock stayed held for $lockwait s; nothing was placed" >&2; exit 1; }
+# the stream lock's path, and the deadline's epoch second, so a streaming test waits for the lock only while
+# TEST_ROOM_SECS would be left (the conftests' stream-lock block)
+export CANON_ALPACA_STREAM_LOCK="${tmp}canon-alpaca-stream.lock" CANON_PAPER_TEST_DEADLINE=$((start + deadline))
 # bounded <secs> <command...>: the command under timeout(1) -s KILL, in the process group timeout leads, with
 # its whole group killed on a stop and once it ends (the note above paper:test)
 bounded() {
@@ -257,9 +269,12 @@ tests
 '''
 
 # One window of the session run (docs/adr/0044-paper-session-windows-for-macross.md, which supersedes ADR
-# 0029's "only paper:test" clause: this task, too, reads the pair into its own env). It waits for the paper
-# lock as a test does and holds it for the window, at most `session_window.LONGEST_WINDOW_SECS` plus start-up
-# and the bounded end; the window flattens and checks the account before it ends. Arguments go to
+# 0029's "only paper:test" clause: this task, too, reads a pair into its own env), on paper account B, service
+# canon-alpaca-paper-windows, and no other (ADR 0069). It waits for account B's lock, which only another window
+# takes, and holds it for the window; then, after uv's sync, for the login's market-data stream lock, which a
+# paper test that streams on account A also takes; the two waits share `lockwait`. It holds both for the window,
+# at most `session_window.LONGEST_WINDOW_SECS` plus start-up and the bounded end; the window flattens and
+# checks the account before it ends. Arguments go to
 # `python -m canon_trading.session_window` (--session regular|extended|auto, --strategy SessionMaCross|EmaCross,
 # SessionMaCross by default and EmaCross in regular windows only, --minutes, --symbol). Its log and
 # report are in the per-user temporary folder, outside the repository, canon-paper-session/, with the gap
@@ -269,26 +284,35 @@ tests
 # by the scheduled runner (CANON_COMMIT set), `--exact` makes its clone's kept .venv exactly uv.lock, as
 # `uv sync` would; a run by hand leaves the worktree's .venv as it is (uv run's inexact default; ADR 0050).
 [tasks."paper:session"]
-description = "Run one bounded strategy window (SessionMaCross unless --strategy EmaCross) on the paper account under the paper lock"
-# deadline: its 900 s wait for the lock, the start-up (uv's sync, held to `sync`, then the imports before the
+description = "Run one bounded strategy window (SessionMaCross unless --strategy EmaCross) on paper account B under its lock and the stream lock"
+# deadline: its 900 s wait for the two locks, the start-up (uv's sync, held to `sync`, then the imports before the
 # first clock read), the window's longest and its bounded end (the arithmetic is ADR 0050's, and
 # tests/test_session_window.py holds it); a window stopped there is recorded `running` and so shows as died, and the next one starts only
 # once the account is flat. Descriptor 9 and the deadline: the note above paper:test.
 timeout = "105m"
-env.ALPACA_API_KEY = { value = "{{ exec(command='/usr/bin/timeout 30 /usr/bin/security find-generic-password -s canon-alpaca-paper -a ALPACA_API_KEY -w') }}", redact = true }
-env.ALPACA_SECRET_KEY = { value = "{{ exec(command='/usr/bin/timeout 30 /usr/bin/security find-generic-password -s canon-alpaca-paper -a ALPACA_SECRET_KEY -w') }}", redact = true }
+env.ALPACA_API_KEY = { value = "{{ exec(command='/usr/bin/timeout 30 /usr/bin/security find-generic-password -s canon-alpaca-paper-windows -a ALPACA_API_KEY -w') }}", redact = true }
+env.ALPACA_SECRET_KEY = { value = "{{ exec(command='/usr/bin/timeout 30 /usr/bin/security find-generic-password -s canon-alpaca-paper-windows -a ALPACA_SECRET_KEY -w') }}", redact = true }
 run = '''
 deadline=6240
 sync=600
+lockwait=900
 start=$(/bin/date +%s)
-[ -n "$ALPACA_API_KEY" ] && [ -n "$ALPACA_SECRET_KEY" ] || { echo "paper:session: a keychain item is empty; run: mise run paper:remove, then mise run paper:store" >&2; exit 1; }
+[ -n "$ALPACA_API_KEY" ] && [ -n "$ALPACA_SECRET_KEY" ] || { echo "paper:session: a keychain item of account B is empty; run: mise run paper:remove windows, then mise run paper:store windows" >&2; exit 1; }
 tmp="$(/usr/bin/getconf DARWIN_USER_TEMP_DIR)" || tmp=""
 case "$tmp" in /*/) ;; *) echo "paper:session: the per-user temporary folder is not known (DARWIN_USER_TEMP_DIR gave '$tmp'), so there is no paper lock or log folder; nothing was placed" >&2; exit 1 ;; esac
 # a run the runner started (CANON_COMMIT) is the schedule's unless the runner itself says by hand, so a
 # runner installed before CANON_PAPER_SCHEDULED existed still writes the records status reads
 [ "${CANON_PAPER_SCHEDULED:-}" = 1 ] || [ -n "${CANON_COMMIT:-}" ] || export CANON_PAPER_BY_HAND=1
-exec 9>>"${tmp}canon-paper-test.lock"
-/usr/bin/lockf -t 900 9 || { echo "paper:session: the paper lock stayed held for 900 s; nothing was placed" >&2; exit 1; }
+exec 9>>"${tmp}canon-paper-windows.lock"
+/usr/bin/lockf -t "$lockwait" 9 || { echo "paper:session: account B's lock stayed held for $lockwait s; nothing was placed" >&2; exit 1; }
+waited=$(( $(/bin/date +%s) - start ))
+# stream: the login's market-data stream lock (ADR 0069), on descriptor 7 (the runner's checkout lock is 8),
+# for what is left of `lockwait`; taken after uv's sync, so a window holds it only while its process runs
+stream() {
+  s=$((lockwait - waited)); [ "$s" -ge 0 ] || s=0
+  exec 7>>"${tmp}canon-alpaca-stream.lock"
+  /usr/bin/lockf -t "$s" 7 || { echo "paper:session: the market-data stream lock stayed held ($lockwait s for both locks); nothing was placed" >&2; exit 1; }
+}
 # bounded <secs> <command...>: the command under timeout(1) -s KILL, in the process group timeout leads, with
 # its whole group killed on a stop and once it ends (the note above paper:test)
 bounded() {
@@ -307,12 +331,19 @@ bounded() {
 window() {
   left=$((deadline - ($(/bin/date +%s) - start)))
   [ "$left" -gt 0 ] || { echo "paper:session: no time left before the deadline" >&2; exit 1; }
-  [ ! -t 0 ] || exec uv run --locked ${CANON_COMMIT:+--exact} python -m canon_trading.session_window --log-dir "${tmp}canon-paper-session" "$@"
+  # from a terminal, too, uv's sync runs before the stream lock is taken, so the lock is held only while the
+  # window's process runs
+  if [ -t 0 ]; then
+    uv run --locked ${CANON_COMMIT:+--exact} /usr/bin/true || exit 1
+    stream
+    exec uv run --locked ${CANON_COMMIT:+--exact} python -m canon_trading.session_window --log-dir "${tmp}canon-paper-session" "$@"
+  fi
   # the start-up, held to `sync`: uv makes the environment uv.lock's before it runs a command (uv docs, `uv
   # run`), here /usr/bin/true, so the window's own `uv run` finds it in step
   b=$sync; [ "$left" -ge "$sync" ] || b=$left
   bounded "$b" uv run --locked ${CANON_COMMIT:+--exact} /usr/bin/true \
     || { echo "paper:session: the start-up (uv making the environment uv.lock's) failed or took over $b s; no window was started" >&2; exit 1; }
+  stream
   left=$((deadline - ($(/bin/date +%s) - start)))
   [ "$left" -gt 0 ] || { echo "paper:session: no time left before the deadline" >&2; exit 1; }
   bounded "$left" uv run --locked ${CANON_COMMIT:+--exact} python -m canon_trading.session_window --log-dir "${tmp}canon-paper-session" "$@"

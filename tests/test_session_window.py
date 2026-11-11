@@ -12,6 +12,8 @@ import math
 import os
 import re
 import subprocess
+import sys
+import time
 import tomllib
 from dataclasses import dataclass
 from dataclasses import field
@@ -1536,7 +1538,7 @@ def _paper_task(name: str) -> tuple[int, int, int]:
     timeout = task["timeout"]
     secs = int(timeout[:-1]) * {"s": 1, "m": 60, "h": 3600}[timeout[-1]]
     deadline = re.search(r"^deadline=(\d+)$", task["run"], re.MULTILINE)
-    wait = re.search(r"lockf -t (\d+) 9", task["run"])
+    wait = re.search(r"^lockwait=(\d+)$", task["run"], re.MULTILINE)
     assert deadline is not None and wait is not None
     return secs, int(deadline.group(1)), int(wait.group(1))
 
@@ -1578,10 +1580,11 @@ def test_the_paper_session_deadline_covers_its_lock_wait_start_window_and_bounde
         + session_window.SKEW_SECS
     )
     assert deadline >= wait + start + after_start
-    # the other way round: a window that runs as it should, from the lock to its end, fits a paper test's wait
+    # the other way round: a window that runs as it should, from the stream lock to its end, fits a paper
+    # test's wait for that lock, which is as long as its wait for account A's (ADR 0069, ADR 0050)
     test_timeout, test_deadline, test_wait = _paper_task("paper:test")
     assert (
-        session_window.START_UP_SECS + after_start
+        session_window.START_UP_SECS + after_start + session_window.SKEW_SECS
         <= test_wait
         == session_window.PAPER_LOCK_WAIT_SECS
     )
@@ -1590,6 +1593,165 @@ def test_the_paper_session_deadline_covers_its_lock_wait_start_window_and_bounde
     assert session_window.STALE_RUNNING_SECS >= (
         session_window.LONGEST_WINDOW_SECS + session_window.AFTER_END_SECS
     )
+
+
+# The login's market-data stream lock (ADR 0069): one block in both conftests, which a paper test that streams
+# takes from its fixture, and a window from paper:session's body, after account B's lock.
+CONFTESTS = ("tests/conftest.py", "packages/canon-alpaca/tests/conftest.py")
+STREAMING = re.compile(
+    r"subscribe_quotes|subscribe_trades|subscribe_bars|DataStream|ExecTester|DataTester"
+    r"|ema_cross_paper_node|window_node"
+)
+
+
+def _stream_block(text: str) -> str:
+    start = text.index("# --- The login's market-data stream lock (ADR 0069).")
+    return text[start : text.index("# --- End of the stream lock block. ---", start)]
+
+
+def _conftest() -> Any:
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "stream_lock_conftest", session_window.SOURCE_ROOT / CONFTESTS[0]
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_both_conftests_hold_one_stream_lock_block_whose_wait_is_the_paper_tests() -> None:
+    """The two conftests carry the same block, and its wait is paper:test's wait for account A's lock and
+    `session_window.PAPER_LOCK_WAIT_SECS`, the bound a window that runs as it should fits."""
+    blocks = [_stream_block((session_window.SOURCE_ROOT / c).read_text()) for c in CONFTESTS]
+    assert blocks[0] == blocks[1]
+    _, _, test_wait = _paper_task("paper:test")
+    assert f"\nSTREAM_LOCK_WAIT_SECS = {test_wait}\n" in blocks[0]
+    assert test_wait == session_window.PAPER_LOCK_WAIT_SECS
+
+
+def test_every_paper_test_module_that_streams_is_marked_to_hold_the_stream_lock() -> None:
+    """A paper module that subscribes to market data, through a strategy, upstream's testers or a node builder
+    that adds one, or builds a stream carries the `alpaca_stream` marker, so each of its tests takes the
+    stream lock. A data client alone opens no stream (it builds one at its first subscription), and the
+    fixture fails any unmarked test that starts one on paper."""
+    root = session_window.SOURCE_ROOT
+    paper = sorted(
+        [*root.glob("tests/test_paper_*.py"), *root.glob("packages/*/tests/test_paper_*.py")]
+    )
+    streaming = [p for p in paper if STREAMING.search(p.read_text())]
+    assert len(streaming) >= 5
+    unmarked = [p.name for p in streaming if "pytest.mark.alpaca_stream" not in p.read_text()]
+    assert unmarked == []
+
+
+def test_the_stream_lock_waits_for_another_holder_and_gives_up_at_its_bound(tmp_path: Path) -> None:
+    """Held by another process (lockf(1), as paper:session takes it, or, where there is none, a Python
+    flock): the fixture's call gives up after its wait; once free it takes the lock, which lockf then cannot
+    take, until the descriptor is closed."""
+    conftest = _conftest()
+    lock = tmp_path / "canon-alpaca-stream.lock"
+    if Path("/usr/bin/lockf").exists():
+        holder = subprocess.Popen(["/usr/bin/lockf", "-k", str(lock), "sleep", "30"])
+    else:  # GitHub's Ubuntu runner has no lockf(1)
+        hold = "import fcntl,os,sys,time; fd=os.open(sys.argv[1],os.O_WRONLY|os.O_CREAT); fcntl.flock(fd,fcntl.LOCK_EX); time.sleep(30)"
+        holder = subprocess.Popen([sys.executable, "-c", hold, str(lock)])
+    try:
+        for _ in range(100):
+            fd = conftest.take_stream_lock(str(lock), 0)
+            if fd is None:
+                break
+            os.close(fd)
+            time.sleep(0.05)
+        else:
+            pytest.fail("the holder never took the lock")
+        started = datetime.now(UTC)
+        assert conftest.take_stream_lock(str(lock), 1.5) is None
+        assert (datetime.now(UTC) - started).total_seconds() >= 1.5
+    finally:
+        holder.kill()
+        holder.wait()
+    fd = conftest.take_stream_lock(str(lock), 5)
+    assert fd is not None
+    try:
+        if Path("/usr/bin/lockf").exists():
+            took = subprocess.run(
+                ["/usr/bin/lockf", "-k", "-t", "0", str(lock), "true"], check=False
+            )
+            assert took.returncode != 0
+    finally:
+        os.close(fd)
+    if Path("/usr/bin/lockf").exists():
+        took = subprocess.run(["/usr/bin/lockf", "-k", "-t", "0", str(lock), "true"], check=False)
+        assert took.returncode == 0
+
+
+def test_a_paper_test_not_marked_cannot_start_a_market_data_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without the marker, alpaca-py's stream is stopped in `run()`, before it connects, and named for the
+    fixture to fail the test with."""
+    from alpaca.data.live.stock import StockDataStream
+
+    started = _conftest().refuse_streams(monkeypatch)
+    stream = StockDataStream("PKMADEUPMADEUP", "made-up")
+    with pytest.raises(RuntimeError, match="not marked alpaca_stream"):
+        stream.run()
+    assert started == ["StockDataStream"]
+
+
+def test_a_streaming_test_waits_for_the_lock_only_while_room_before_the_deadline_is_left(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second reader's finding (/code-review, 2026-11-11): a test could wait 3900 s for account A's lock and
+    then 3900 s for the stream lock, past paper:test's deadline, which kills it part way through, its cleanup
+    unrun. The wait now stops `TEST_ROOM_SECS` before the deadline paper:test exports, and with none named
+    the test fails before it places anything."""
+    conftest = _conftest()
+    room, most = conftest.TEST_ROOM_SECS, conftest.STREAM_LOCK_WAIT_SECS
+    monkeypatch.setenv(conftest.DEADLINE_ENV, "100000")
+    assert conftest.stream_wait_secs(100000 - room - most - 10) == most
+    assert conftest.stream_wait_secs(100000 - room - 600) == 600
+    assert conftest.stream_wait_secs(100000 - room + 1) < 0
+    monkeypatch.delenv(conftest.DEADLINE_ENV)
+    with pytest.raises(pytest.fail.Exception, match="CANON_PAPER_TEST_DEADLINE is not set"):
+        conftest.stream_wait_secs(0)
+    # and paper:test exports it, its deadline from its start
+    run = tomllib.loads((session_window.SOURCE_ROOT / "mise.toml").read_text())["tasks"][
+        "paper:test"
+    ]["run"]
+    assert "CANON_PAPER_TEST_DEADLINE=$((start + deadline))" in run
+
+
+def test_the_stream_lock_follows_the_tests_streams_until_each_has_ended(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second reader's finding (/code-review, 2026-11-11): the lock went at the test's teardown while a stream
+    thread that outlived its node's stop could still be connected. Each stream a marked test starts is now
+    tracked to the end of its `run()`, which the teardown waits for before it lets the lock go."""
+    import threading
+
+    from alpaca.data.live.stock import StockDataStream
+
+    release = threading.Event()
+    monkeypatch.setattr(
+        "alpaca.data.live.websocket.DataStream.run", lambda stream: release.wait(10)
+    )
+    ended = _conftest().track_streams(monkeypatch)
+    stream = StockDataStream("PKMADEUPMADEUP", "made-up")
+    thread = threading.Thread(target=stream.run)
+    thread.start()
+    try:
+        for _ in range(100):
+            if ended:
+                break
+            time.sleep(0.01)
+        assert len(ended) == 1 and not ended[0].wait(0.2)
+    finally:
+        release.set()
+        thread.join(5)
+    assert ended[0].is_set()
 
 
 # Review findings on the session windows (a second reader, 2026-11-10): each shown here before its fix.
@@ -2228,7 +2390,7 @@ def test_the_post_end_bound_fits_the_end_margin_the_stale_record_and_the_paper_l
     assert w.END_MARGIN_SECS >= last_close + 60
     assert w.LONGEST_WINDOW_SECS + w.SKEW_SECS + after_end < w.STALE_RUNNING_SECS
     tasks = tomllib.loads((Path(__file__).parents[1] / "mise.toml").read_text())["tasks"]
-    found = re.search(r"lockf (?:-k )?-t (\d+)", tasks["paper:test"]["run"])
+    found = re.search(r"^lockwait=(\d+)$", tasks["paper:test"]["run"], re.MULTILINE)
     assert found is not None and int(found.group(1)) == w.PAPER_LOCK_WAIT_SECS
     longest = (
         w.START_UP_SECS + w.ADAPTER_CALL_SECS + w.LONGEST_WINDOW_SECS + w.SKEW_SECS + after_end
@@ -2236,7 +2398,7 @@ def test_the_post_end_bound_fits_the_end_margin_the_stale_record_and_the_paper_l
     assert longest <= w.PAPER_LOCK_WAIT_SECS
     # and inside `paper:session`'s own deadline, which counts its wait for the lock
     session = tasks["paper:session"]
-    waits = re.search(r"lockf (?:-k )?-t (\d+)", session["run"])
+    waits = re.search(r"^lockwait=(\d+)$", session["run"], re.MULTILINE)
     deadline = re.fullmatch(r"(\d+)m", session["timeout"])
     assert waits is not None and deadline is not None
     assert int(waits.group(1)) + longest <= int(deadline.group(1)) * 60
