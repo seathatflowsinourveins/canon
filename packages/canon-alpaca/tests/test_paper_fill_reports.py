@@ -6,6 +6,10 @@ It runs only when a paper key pair is in the environment, under the names in `ca
 otherwise pytest reports it as skipped with that reason. It needs the regular session, since a market
 order fills only then, and skips with that reason outside it. Never write the keys to a file.
 
+Run it after 09:35 New York. At the open on 2026-11-11 Alpaca paper did not make a 2-share market order
+final within 60 s in the first three minutes, and the test failed there with the account left flat; a run
+at 09:33 passed. The 60 s wait is not lengthened to cover the open.
+
 What it does, on Alpaca's paper Trading API only (`paper=True` throughout): with alpaca-py, outside any
 node, a DAY market buy of 2 AAPL (two shares, so Alpaca may fill it in parts), recording every `fill` and
 `partial_fill` trade update's `execution_id` and price from `TradingStream`. Then a node with the

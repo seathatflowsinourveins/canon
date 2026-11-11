@@ -60,6 +60,10 @@ shares under any other ID are inferred: a stream fill under an ID not yet seen i
 on any order of the chain, while any are unmatched, and otherwise is a fill of its own. Alpaca's
 cumulative `filled_qty` on the update only narrows that.
 
+**Added 2026-11-11: superseded by ADR 0075.** The share matching in the term above is replaced: a fill is
+known by Alpaca's trade ID alone, and the engine is never left to infer a fill for an order the node
+holds, since the first review round on the matching found it failing six ways (ADR 0075).
+
 ### Consequences
 
 * Good: `OrderUpdated` waits for Alpaca's own confirmation.
@@ -112,7 +116,10 @@ and the report's fill again from the stream, interleaved (PARTIALLY_FILLED 3 wit
 reported by Codex). The code review of the rule added three, each failing on a rule that judged by
 quantity alone: a stream fill after a fill report for a later share, a `partial_fill` whose order shows the
 count before the fill, and a late fill of an order since replaced that a report had shown; and a third
-round one more, a stream fill matched to an inferred share delivered again after a reconnect. A known limit
+round one more, a stream fill matched to an inferred share delivered again after a reconnect. (Corrected
+2026-11-11, by a second reader, Antigravity: the healing described next does not hold under the paper
+node's settings. With open orders only in the open-order check, a closed order is not read again, and the
+position check books the missing share to an `EXTERNAL` order; ADR 0075 replaces the model.) A known limit
 stays: an inferred share whose stream update never comes is taken for the order's next fill under a new
 ID unless its `filled_qty` shows it is past what the node applied. Read at the pin (`check_open_orders`,
 `reconcile_open_order_reports`, `reconcile_order_report`): while Alpaca shows the order open, the
@@ -224,3 +231,6 @@ Read 2026-11-10; "raw": fetched with `curl` and read, not summarised. NautilusTr
   Confirmation (fetched, raw, 2026-11-11). https://docs.alpaca.markets/us/docs/websocket-streaming.md: its
   `fill` examples carry the order with `filled_qty` equal to the filled shares; no `partial_fill` example
   (fetched, raw).
+* Corrected 2026-11-11, by a second reader (Antigravity, round 1 on the fill-identity model): the healing
+  of a lost update the Confirmation described does not hold with the open-order check reading open orders
+  only, as on the paper node; reproduced on a real `LiveNode` and replaced by ADR 0075.
