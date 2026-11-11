@@ -1,0 +1,138 @@
+#!/bin/bash
+# test-prune — run `scripts/lanes prune` in throwaway repositories and check what it removes and keeps, and why.
+# Offline: a fake `mise` first on PATH answers `mise exec -- gh pr list --state all --head <branch> --json ...`
+# from canned files, and a fake `orca` implements `orca worktree rm --worktree path:<p>` with `git worktree
+# remove` (which refuses a dirty tree, as Orca's does without --force). The rule under test is the one in the
+# header of scripts/lanes. Exit 0 if every case behaves as expected, 1 otherwise. Touches only a temp folder.
+set -uo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_PREFIX \
+      GIT_COMMON_DIR GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_AUTHOR_DATE GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL \
+      GIT_COMMITTER_DATE
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/canon-test-prune.XXXXXX") \
+  || { echo "test-prune: could not create a temp folder under ${TMPDIR:-/tmp}; nothing was written" >&2; exit 1; }
+trap 'rm -rf "$TMP"' EXIT
+TMP=$(cd "$TMP" && pwd -P)   # git prints real paths; /var is a link to /private/var on macOS
+GIT_CEILING_DIRECTORIES=$(cd "$TMP/.." && pwd -P); export GIT_CEILING_DIRECTORIES
+export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$TMP/gitconfig" PRUNE_RETRY_SLEEP=0
+printf '[user]\n\tname = Test\n\temail = 1+test@users.noreply.github.com\n[commit]\n\tgpgsign = false\n[init]\n\tdefaultBranch = main\n[maintenance]\n\tauto = false\n[gc]\n\tauto = 0\n' > "$GIT_CONFIG_GLOBAL"
+mkdir -p "$TMP/bin" "$TMP/fake"
+export FAKE="$TMP/fake" PATH="$TMP/bin:$PATH"
+# fake mise: pr_<branch> holds the JSON array gh would print; a missing file prints []; gh_fail makes it exit 1
+cat > "$TMP/bin/mise" <<'FAKE_MISE'
+#!/bin/bash
+[ "${1:-} ${2:-} ${3:-}" = "exec -- gh" ] || { echo "fake mise: unexpected call: $*" >&2; exit 99; }
+shift 3
+[ ! -f "$FAKE/gh_fail" ] || { echo "HTTP 502" >&2; exit 1; }
+[ "${1:-} ${2:-}" = "pr list" ] || { echo "fake gh: unexpected call: $*" >&2; exit 99; }
+head=""; prev=""; for a in "$@"; do [ "$prev" != "--head" ] || head=$a; prev=$a; done
+printf '%s\n' "$head" >> "$FAKE/queried"
+if [ -f "$FAKE/pr_$head" ]; then cat "$FAKE/pr_$head"; else echo '[]'; fi
+FAKE_MISE
+cat > "$TMP/bin/orca" <<'FAKE_ORCA'
+#!/bin/bash
+[ "${1:-} ${2:-} ${3:-}" = "worktree rm --worktree" ] || { echo "fake orca: unexpected call: $*" >&2; exit 99; }
+p="${4#path:}"
+echo "$p" >> "$FAKE/orca_log"
+git -C "$MAIN" worktree remove "$p"
+FAKE_ORCA
+chmod +x "$TMP/bin/mise" "$TMP/bin/orca"
+
+pass=0; fail=0
+ok()  { pass=$((pass + 1)); echo "ok   $1"; }
+bad() { fail=$((fail + 1)); echo "FAIL $1"; }
+check() { local name=$1; shift; if "$@"; then ok "$name"; else bad "$name"; fi; }
+
+ORIGIN="$TMP/origin.git"; MAIN="$TMP/main"; export MAIN
+git init -q --bare "$ORIGIN"
+git init -q "$MAIN"
+git -C "$MAIN" remote add origin "$ORIGIN"
+printf "catalog/\nledger/\n" > "$MAIN/.gitignore"; echo base > "$MAIN/f"; git -C "$MAIN" add f .gitignore; git -C "$MAIN" commit -q -m base
+git -C "$MAIN" push -q origin main 2>/dev/null
+mkdir "$TMP/wt"
+# a lane: worktree with a branch and one commit; $1 name
+lane() { git -C "$MAIN" worktree add -q -b "$1" "$TMP/wt/$1" && echo "$1" > "$TMP/wt/$1/$1.txt" \
+         && git -C "$TMP/wt/$1" add . && git -C "$TMP/wt/$1" commit -q -m "$1"; }
+tip() { git -C "$MAIN" rev-parse "refs/heads/$1"; }
+pr() { printf '[{"number":1,"state":"%s","headRefOid":"%s"}]\n' "$2" "$3" > "$FAKE/pr_$1"; }
+
+lane merged-clean;   pr merged-clean MERGED "$(tip merged-clean)"
+lane merged-dirty;   pr merged-dirty MERGED "$(tip merged-dirty)"; echo x > "$TMP/wt/merged-dirty/untracked"
+lane no-pr
+lane has-data;       pr has-data MERGED "$(tip has-data)"; mkdir "$TMP/wt/has-data/catalog"; echo d > "$TMP/wt/has-data/catalog/bars.parquet"
+lane open-pr;        pr open-pr OPEN "$(tip open-pr)"
+lane ahead;          pr ahead MERGED "$(tip ahead)"; echo more > "$TMP/wt/ahead/more"; git -C "$TMP/wt/ahead" add .; git -C "$TMP/wt/ahead" commit -q -m more
+lane glob-lane;      pr glob-lane MERGED "$(tip glob-lane)"
+lane protected-lane; pr protected-lane MERGED "$(tip protected-lane)"
+lane keepbranch;     pr keepbranch MERGED "$(tip keepbranch)"
+lane closed-pr;      pr closed-pr CLOSED "$(tip closed-pr)"
+lane locked-lane;    pr locked-lane MERGED "$(tip locked-lane)"; git -C "$MAIN" worktree lock "$TMP/wt/locked-lane"
+git -C "$MAIN" worktree add -q --detach "$TMP/wt/detached"
+git -C "$MAIN" worktree add -q "$TMP/wt/wt-main" -b reading-branch; pr reading-branch MERGED "$(tip reading-branch)"
+# an ancestor of main, merged by a pull request recording an older head (a rebase-style merge)
+git -C "$MAIN" branch ancestor-branch; pr ancestor-branch MERGED "0000000000000000000000000000000000000000"
+# branches with no worktree
+git -C "$MAIN" branch branch-merged;   pr branch-merged MERGED "$(tip branch-merged)"
+git -C "$MAIN" branch branch-protected; pr branch-protected MERGED "$(tip branch-protected)"
+git -C "$MAIN" branch branch-none
+printf '# open lanes\nprotected-lane\nbranch-protected\nglob-*\n\n' > "$TMP/protect"
+# a branch that is merged and clean but is the one the main checkout runs in: the main checkout is never touched
+pr main MERGED "$(tip main)"
+
+run() { (cd "$MAIN" && "$ROOT/scripts/lanes" prune "$@" 2>&1); }
+
+BEFORE_WT=$(git -C "$MAIN" worktree list | wc -l | tr -d ' '); BEFORE_BR=$(git -C "$MAIN" branch | wc -l | tr -d ' ')
+OUT=$(run --protect "$TMP/protect"); printf '%s\n' "${OUT//"$TMP"/TMP}"
+has() { grep -qF -e "$1" <<<"$OUT"; }
+check "dry run: output present" test -n "$OUT"
+check "dry run: merged clean worktree would be removed" has "remove  $TMP/wt/merged-clean merged-clean"
+check "dry run: merged branch with no worktree would be removed" has "remove  (branch only) branch-merged"
+check "dry run: ancestor of main with a merged pull request would be removed" has "remove  (branch only) ancestor-branch"
+check "dry run: dirty tree kept" has "wt/merged-dirty merged-dirty: dirty tree"
+check "dry run: ignored local data kept" has "wt/has-data has-data: local data in catalog/ or ledger/"
+check "dry run: no pull request kept" has "wt/no-pr no-pr: no merged pull request"
+check "dry run: closed pull request kept" has "wt/closed-pr closed-pr: no merged pull request"
+check "dry run: open pull request kept" has "wt/open-pr open-pr: open pull request"
+check "dry run: commits beyond the merged head kept" has "wt/ahead ahead: commits beyond the merged head"
+check "dry run: protected worktree kept" has "wt/protected-lane protected-lane: protected (open lane)"
+check "dry run: pattern entry protects a worktree" has "wt/glob-lane glob-lane: protected (open lane)"
+check "dry run: protected branch kept" has "(branch only) branch-protected: protected (open lane)"
+check "dry run: locked worktree kept" has "wt/locked-lane locked-lane: locked"
+check "dry run: detached worktree kept" has "wt/detached -: detached HEAD, no branch"
+check "dry run: wt-main kept" has "wt/wt-main reading-branch: reading or paper checkout"
+check "dry run: main checkout kept" has "$MAIN main: main checkout"
+check "dry run: branch without a pull request kept" has "(branch only) branch-none: no merged pull request"
+check "dry run: summary counts" has "lanes prune: 4 removable, 14 kept"
+check "dry run: nothing changed" test "$(git -C "$MAIN" worktree list | wc -l | tr -d ' ')/$(git -C "$MAIN" branch | wc -l | tr -d ' ')" = "$BEFORE_WT/$BEFORE_BR"
+check "dry run: orca never called" test ! -e "$FAKE/orca_log"
+
+OUT=$(run --apply --protect "$TMP/protect"); printf '%s\n' "${OUT//"$TMP"/TMP}"
+check "apply: merged clean worktree removed" test ! -e "$TMP/wt/merged-clean"
+check "apply: its branch deleted" test -z "$(git -C "$MAIN" branch --list merged-clean)"
+check "apply: branch-only branches deleted" test -z "$(git -C "$MAIN" branch --list branch-merged ancestor-branch)"
+check "apply: removal went through orca" grep -qF "$TMP/wt/merged-clean" "$FAKE/orca_log"
+check "apply: nothing else went through orca" test "$(wc -l < "$FAKE/orca_log" | tr -d ' ')" = 2
+for b in glob-lane has-data merged-dirty no-pr open-pr ahead protected-lane branch-protected branch-none closed-pr locked-lane; do
+  check "apply: $b kept" test -n "$(git -C "$MAIN" branch --list "$b")"
+done
+check "apply: dirty tree still has its file" test -f "$TMP/wt/merged-dirty/untracked"
+check "apply: main checkout intact" test -d "$MAIN/.git"
+check "apply: summary" grep -qF "lanes prune: 4 removed" <<<"$OUT"
+
+# gh unavailable: stop, remove nothing
+: > "$FAKE/gh_fail"
+git -C "$MAIN" branch late-merged; pr late-merged MERGED "$(tip late-merged)"
+OUT=$(run --apply --protect "$TMP/protect"); rc=$?
+check "gh failure: exit 1, says so" test "$rc" = 1
+check "gh failure: nothing removed" test -n "$(git -C "$MAIN" branch --list late-merged)"
+rm -f "$FAKE/gh_fail"
+# a protect file that is named but missing is an error, not silence
+OUT=$(run --protect "$TMP/absent"); rc=$?
+check "missing protect file: exit 1" test "$rc" = 1
+# run from a linked worktree: that worktree is kept
+lane inside; pr inside MERGED "$(tip inside)"
+OUT=$(cd "$TMP/wt/inside" && "$ROOT/scripts/lanes" prune --protect "$TMP/protect" 2>&1)
+check "run inside a worktree: it is kept" grep -qF "inside: the worktree this ran in" <<<"$OUT"
+
+echo "test-prune: $pass passed, $fail failed"
+[ "$fail" = 0 ]

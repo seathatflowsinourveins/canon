@@ -61,7 +61,189 @@
 # within six hours (the abandoned threshold); a session closed without a SessionEnd shows until then.
 # A Codex conversation row means it reported events in the window, not that its process still runs.
 # Usage: scripts/lanes --rates [--window MIN] [--days N] [--json]
+# Usage: scripts/lanes prune [--apply] [--protect FILE]   (removes landed lanes; described above its code)
 set -euo pipefail
+
+# ---- prune: remove the worktrees and local branches of landed lanes (the owner's instruction of 2026-11-11:
+# a lane's workspace is removed once its change is on main and its tree is clean) ---------------------------
+# Contracts: `git worktree list --porcelain`, `git for-each-ref`, `git merge-base --is-ancestor`, `git status
+# --porcelain` and `git branch -D` (https://git-scm.com/docs/git-worktree, git-for-each-ref, git-merge-base,
+# git-status, git-branch); `gh pr list --state all --head <branch> --json number,state,headRefOid`
+# (https://cli.github.com/manual/gh_pr_list), run as `mise exec -- gh`; removal through Orca's own CLI,
+# `orca worktree rm --worktree path:<path>`, which refuses a dirty tree and keeps the branch.
+# A worktree and its branch are removable only when ALL hold: GitHub records a MERGED pull request for the head
+# branch; the tree is clean (`git status --porcelain`, untracked files included, ignored files not, except
+# that files under catalog/ or ledger/, which git ignores and which cannot be fetched again, count as dirty); the branch
+# tip is that merged pull request's head commit, or an ancestor of main (origin/main or local main). Squash
+# merges never make the tip an ancestor, so GitHub's own record decides, not a merge test.
+# Known limits: a new lane that reuses the branch name of a merged one and has no commit yet is an ancestor of main
+# and reads as landed; ignored files other than under catalog/ and ledger/ are not looked for.
+# Never removed, whatever GitHub says: the main checkout (first entry of the worktree list), the worktree the
+# command runs in, a worktree named paper-checkout or wt-main, a locked worktree, a detached one, the branch
+# main, and anything in the protect file. Protect file: --protect FILE, else $CANON_PRUNE_PROTECT, else
+# ${CLAUDE_CONFIG_DIR:-~/.claude}/canon/prune-protect (absent is fine: nothing extra protected). One entry per
+# line: a worktree folder name, an absolute path or a branch name, each possibly a shell pattern such as review-*; blank lines and #-lines are ignored. It
+# lists the open lanes; it is read from that file and not from Orca's open dispatches, which a script cannot
+# list (only a coordinator can).
+# Usage: scripts/lanes prune [--apply] [--protect FILE]
+# Dry run unless --apply. Exit 0 done (also when nothing is removable); 1 a check or a removal failed (gh
+# unavailable stops before anything is removed); 2 usage error.
+prune_usage() {
+  [ -z "${1:-}" ] || echo "lanes prune: $1" >&2
+  echo "usage: scripts/lanes prune [--apply] [--protect FILE]" >&2
+  exit 2
+}
+prune_main() {
+  local apply=0 pfile="${CANON_PRUNE_PROTECT:-}" explicit=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --apply)   apply=1; shift ;;
+      --protect) [ $# -ge 2 ] || prune_usage "--protect needs a file"; pfile="$2"; explicit=1; shift 2 ;;
+      *) prune_usage "unknown argument: $1" ;;
+    esac
+  done
+  command -v jq >/dev/null 2>&1 || { echo "lanes prune: ERROR: jq not found" >&2; return 1; }
+  git rev-parse --git-dir >/dev/null 2>&1 || { echo "lanes prune: ERROR: not inside a git repository" >&2; return 1; }
+  [ -n "$pfile" ] || pfile="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/canon/prune-protect"
+  if [ ! -r "$pfile" ]; then
+    { [ "$explicit" = 0 ] && [ -z "${CANON_PRUNE_PROTECT:-}" ]; } \
+      || { echo "lanes prune: ERROR: protect file not found: $pfile" >&2; return 1; }
+    pfile=""
+  fi
+  local protect="" here main_ref wt_list rc=0
+  [ -z "$pfile" ] || protect=$(sed -e 's/[[:space:]]*$//' -e 's/^[[:space:]]*//' -e '/^#/d' -e '/^$/d' "$pfile")
+  here=$(git rev-parse --show-toplevel) || return 1
+  main_ref=""
+  for r in refs/remotes/origin/main refs/heads/main; do
+    git rev-parse -q --verify "$r" >/dev/null 2>&1 && main_ref="$main_ref $r"
+  done
+  [ -n "$main_ref" ] || { echo "lanes prune: ERROR: no main or origin/main to compare against" >&2; return 1; }
+  wt_list=$(git worktree list --porcelain) || return 1
+
+  # an entry matches a name as a shell pattern, so review-* protects every worktree named that way
+  is_protected() { local e; while IFS= read -r e; do [ -n "$e" ] || continue
+    # shellcheck disable=SC2254  # the entry is meant to be a pattern
+    case "$1" in $e) return 0 ;; esac; done <<EOF_P
+$protect
+EOF_P
+    return 1; }
+  local n_rm=0 n_keep=0 kept_reasons="" plan
+  plan=$(mktemp) || return 1
+  # shellcheck disable=SC2064  # the paths are fixed now on purpose
+  trap "rm -f '$plan' '$plan.out'" RETURN
+  # one line per candidate: <kind> <path|-> <branch> <verdict>; verdict is "remove" or "keep: <reason>"
+  local path="" head="" branch="" detached=0 locked=0 prunable=0 first=1 main_path="" line
+  prune_flush() {
+    [ -n "$path" ] || return 0
+    local verdict=""
+    if [ "$first" = 1 ]; then main_path="$path"; first=0; verdict="keep: main checkout"; fi
+    if [ -z "$verdict" ]; then
+      if [ "$path" = "$here" ]; then verdict="keep: the worktree this ran in"
+      elif [ "$(basename "$path")" = paper-checkout ] || [ "$(basename "$path")" = wt-main ]; then
+        verdict="keep: reading or paper checkout"
+      elif is_protected "$(basename "$path")" || is_protected "$path" || { [ -n "$branch" ] && is_protected "$branch"; }; then
+        verdict="keep: protected (open lane)"
+      elif [ "$locked" = 1 ]; then verdict="keep: locked"
+      elif [ "$prunable" = 1 ] || [ ! -d "$path" ]; then verdict="keep: directory missing (git worktree prune)"
+      elif [ "$branch" = main ]; then verdict="keep: the branch main"
+      elif [ "$detached" = 1 ] || [ -z "$branch" ]; then verdict="keep: detached HEAD, no branch"
+      elif [ -n "$(git -C "$path" status --porcelain 2>/dev/null)" ]; then verdict="keep: dirty tree"
+      elif data=$(find "$path" \( -name .git -o -name .venv -o -name node_modules \) -prune -o -type f \( -path '*/catalog/*' -o -path '*/ledger/*' \) ! -name README.md -print 2>/dev/null) && [ -n "$data" ]; then
+        verdict="keep: local data in catalog/ or ledger/ (ignored by git)"
+      fi
+    fi
+    printf 'wt\t%s\t%s\t%s\n' "$path" "${branch:--}" "${verdict:-check}" >> "$plan"
+    path=""; head=""; branch=""; detached=0; locked=0; prunable=0
+  }
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      "worktree "*) prune_flush; path="${line#worktree }" ;;
+      "HEAD "*)     head="${line#HEAD }" ;;
+      "branch "*)   branch="${line#branch refs/heads/}" ;;
+      detached)     detached=1 ;;
+      locked*)      locked=1 ;;
+      prunable*)    prunable=1 ;;
+    esac
+  done <<EOF_WT
+$wt_list
+EOF_WT
+  prune_flush
+  : "$head"
+  # branches without a worktree
+  local b v r try why data wt_branches
+  wt_branches=$(awk -F'\t' '$3 != "-" {print $3}' "$plan")
+  while IFS= read -r b; do
+    [ -n "$b" ] || continue
+    grep -qxF -e "$b" <<<"$wt_branches" && continue
+    if [ "$b" = main ]; then v="keep: main"
+    elif is_protected "$b"; then v="keep: protected (open lane)"
+    else v="check"; fi
+    printf 'br\t-\t%s\t%s\n' "$b" "$v" >> "$plan"
+  done < <(git for-each-ref --format='%(refname:short)' refs/heads)
+
+  # GitHub's record, for what survived the local checks
+  local out="$plan.out" kind p br v tip prs merged_heads open ancestor
+  : > "$out"
+  # shellcheck disable=SC2094  # $plan is read here and only removed on the error returns inside
+  while IFS=$'\t' read -r kind p br v; do
+    if [ "$v" = check ]; then
+      tip=$(git rev-parse -q --verify "refs/heads/$br") || { v="keep: branch missing"; printf '%s\t%s\t%s\t%s\n' "$kind" "$p" "$br" "$v" >> "$out"; continue; }
+      # up to three tries: GitHub's API answers an occasional 502
+      try=0; prs=""
+      while [ "$try" -lt 3 ]; do
+        prs=$(mise exec -- gh pr list --state all --head "$br" --json number,state,headRefOid --limit 50) && break
+        try=$((try + 1)); prs=""; [ "$try" -ge 3 ] || sleep "${PRUNE_RETRY_SLEEP:-2}"
+      done
+      if [ -z "$prs" ]; then
+        echo "lanes prune: ERROR: gh pr list failed for $br; nothing was removed" >&2
+        rm -f "$plan" "$out"; return 1
+      fi
+      open=$(printf '%s' "$prs" | jq -r '[.[] | select(.state == "OPEN")] | length')
+      merged_heads=$(printf '%s' "$prs" | jq -r '.[] | select(.state == "MERGED") | .headRefOid')
+      ancestor=0
+      for r in $main_ref; do git merge-base --is-ancestor "$tip" "$r" 2>/dev/null && ancestor=1; done
+      if [ "$open" != 0 ]; then v="keep: open pull request"
+      elif [ -z "$merged_heads" ]; then v="keep: no merged pull request"
+      elif grep -qxF "$tip" <<<"$merged_heads" || [ "$ancestor" = 1 ]; then v="remove"
+      else v="keep: commits beyond the merged head"; fi
+    fi
+    printf '%s\t%s\t%s\t%s\n' "$kind" "$p" "$br" "$v" >> "$out"
+  done < "$plan"
+
+  local orca_bin=""
+  if [ "$apply" = 1 ] && grep -q $'\tremove$' "$out"; then
+    if command -v orca >/dev/null 2>&1; then orca_bin=orca
+    elif [ -x /Applications/Orca.app/Contents/Resources/bin/orca ]; then orca_bin=/Applications/Orca.app/Contents/Resources/bin/orca
+    else echo "lanes prune: ERROR: orca CLI not found; nothing was removed" >&2; rm -f "$plan" "$out"; return 1; fi
+  fi
+  [ "$apply" = 1 ] && echo "lanes prune: applying" || echo "lanes prune: dry run (nothing is changed; --apply removes)"
+  while IFS=$'\t' read -r kind p br v; do
+    if [ "$v" = remove ]; then
+      if [ "$apply" = 1 ]; then
+        if [ "$kind" = wt ] && ! why=$("$orca_bin" worktree rm --worktree "path:$p" 2>&1); then
+          echo "FAILED  $p ($br): orca worktree rm: ${why%%$'\n'*}"; rc=1; continue
+        fi
+        if [ "$kind" = wt ] && [ -e "$p" ]; then echo "FAILED  $p ($br): folder still there"; rc=1; continue; fi
+        if ! git -C "$main_path" branch -D "$br" >/dev/null 2>&1; then
+          echo "FAILED  $br: git branch -D"; rc=1; continue
+        fi
+        echo "removed $([ "$kind" = wt ] && echo "$p " || true)$br"
+      else
+        echo "remove  $([ "$kind" = wt ] && echo "$p " || echo "(branch only) ")$br"
+      fi
+      n_rm=$((n_rm + 1))
+    else
+      echo "keep    $([ "$kind" = wt ] && echo "$p " || echo "(branch only) ")$br: ${v#keep: }"
+      n_keep=$((n_keep + 1)); kept_reasons="$kept_reasons
+${v#keep: }"
+    fi
+  done < "$out"
+  echo "lanes prune: $n_rm $([ "$apply" = 1 ] && echo removed || echo removable), $n_keep kept"
+  printf '%s\n' "$kept_reasons" | sed '/^$/d' | sort | uniq -c | sed 's/^ *\([0-9]*\) \(.*\)/  \1  \2/'
+  rm -f "$plan" "$out"
+  return "$rc"
+}
+if [ "${1:-}" = prune ]; then shift; prune_main "$@"; exit $?; fi
 
 CFG="${CANON_LEDGER_HOME:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}/canon}"
 DAYS=2
