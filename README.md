@@ -101,7 +101,8 @@ settings and what it leaves out (slippage, latency, market hours, margin) are li
 [ADR 0010](docs/adr/0010-strategy-evaluation.md): `canon_trading.ledger.create_ledger_study` creates a study
 over a fixed sample in the main checkout's `ledger/trials.db`, which every worktree shares
 ([ADR 0035](docs/adr/0035-trial-ledger-in-an-optuna-study.md), [ADR 0041](docs/adr/0041-trial-ledger-sample-and-data-identity.md));
-`record_trial` runs a backtest over that sample as one of its trials; `move_sample` takes in new data; and
+`record_trial` runs a backtest over that sample as one of its trials, under a key of its configuration
+and a digest of the bars it read ([ADR 0053](docs/adr/0053-trial-identity-data-digest-and-config-key.md)); `move_sample` takes in new data; and
 `canon_trading.ranking.rank` ranks a study's trials and tests the pick's deflated Sharpe ratio.
 
 ## Enter the Alpaca paper keys

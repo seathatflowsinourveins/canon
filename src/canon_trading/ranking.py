@@ -22,7 +22,7 @@ V > 0. V counts as 0 when every trial's Sharpe ratio equals the first's under `m
 default tolerance (ADR 0031): copies of one configuration differ only in rounding, and would otherwise
 pass undeflated. A return that is not finite is refused, for every trial, by
 `canon_trading.returns_matrix`.
-It also stops on what ADR 0035 terms 5 and 6 and ADR 0041 add: a configuration with a failed or
+It also stops on what ADR 0035 terms 5 and 6, ADR 0041 and ADR 0053 add: a configuration with a failed or
 `RUNNING` record that no later record of it resolves (a record with a key and no sample number is
 read as on the current sample, unless it ran), an idle one, records of one configuration that
 disagree (their outcome included), one not run on the study's current sample, returns ADR 0010 step 2
@@ -200,13 +200,13 @@ def rank(study: optuna.Study) -> RankingReport:
             stops.append(
                 f"#{trial.number} ({trial.state.name.lower()}) has no config key in the form "
                 "record_trial writes but shows a run: a trial of an unknown configuration, which "
-                "another writer left and nothing clears (ADR 0041)",
+                "another writer left and nothing clears (ADR 0053)",
             )
         elif trial.number not in not_run:
             stops.append(
                 f"#{trial.number} ({trial.state.name.lower()}) has no config key, so it ran no "
                 f"backtest; if its process is gone, mark_not_run(study, {trial.number}) clears it "
-                "(ADR 0041)",
+                "(ADR 0053)",
             )
     n = len(by_key)
 
@@ -244,7 +244,7 @@ def rank(study: optuna.Study) -> RankingReport:
         if faulty:
             stops.extend(
                 f"{key}: {_describe(trial)} is not in the shape record_trial writes on "
-                f"{sample.describe()}: {'; '.join(faults)} (ADR 0041)"
+                f"{sample.describe()}: {'; '.join(faults)} (ADR 0041, ADR 0053)"
                 for trial, faults in faulty
             )
             continue
@@ -278,7 +278,7 @@ def rank(study: optuna.Study) -> RankingReport:
                 f"{key}: records {', '.join(map(_describe, [first, *differ]))} ran the same "
                 f"configuration on {sample.describe()} and disagree on their outcome, range, "
                 "returns, session days or data; if the catalog or this code changed, move the "
-                "sample and run every configuration again (ADR 0041)",
+                "sample and run every configuration again (ADR 0041, ADR 0053)",
             )
             continue
         if first.user_attrs[OUTCOME] == IDLE:
@@ -501,7 +501,7 @@ def _day(ns: int) -> str:
 
 
 def _data_disagreements(read: list[FrozenTrial], sample: Sample) -> list[str]:
-    """One reason for each bar type that records on `sample` read as different bars (ADR 0041).
+    """One reason for each bar type that records on `sample` read as different bars (ADR 0053 term 1).
 
     Every record in `read` has passed `_shape_faults`, so its digest is a mapping of texts.
     """
@@ -515,7 +515,7 @@ def _data_disagreements(read: list[FrozenTrial], sample: Sample) -> list[str]:
             f"{digest[:12]} by {', '.join(f'#{t.number}' for t in trials)}"
             for digest, trials in digests.items()
         )
-        + "; move the sample and run every configuration again (ADR 0041)"
+        + "; move the sample and run every configuration again (ADR 0053)"
         for bar_type, digests in sorted(by_digest.items())
         if len(digests) > 1
     ]
