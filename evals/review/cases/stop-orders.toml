@@ -1,8 +1,22 @@
 # A review case: the format is in evals/review/README.md and ADR 0046.
-# Clean: no defect in what this commit changed has been confirmed. Every claim is unconfirmed until checked.
+# Clean when the run 2026-11-10-first scored it; the defect below was confirmed after that run and counts
+# from the next scoring (triage: runs/2026-11-10-first/triage.md).
 id = "stop-orders"
 status = "ready"
 commit = "724246e85ed29d138cd1e5d3af7e2c3cc6d4840b"
 title = "Send stop and stop-limit orders to Alpaca in the forms its order page lists (#53)"
 paths = ["packages/canon-alpaca/"]
-clean = true
+
+[[defects]]
+id = "unholdable-client-id-aborts-startup"
+location = "packages/canon-alpaca/src/canon_alpaca/execution.py: AlpacaExecutionClient._order_report"
+summary = """
+To patch in the trigger type, the report looks the order up in the cache by
+ClientOrderId(order.client_order_id), outside order_status_report's except ValueError. NautilusTrader
+refuses an empty or non-ASCII ID, which an order made outside the node can carry, so a closed order
+like that, skipped with a warning before this commit, now raises out of the mass status and aborts
+start-up reconciliation."""
+match = "Names _order_report (or its ClientOrderId cache lookup) and says a client order ID NautilusTrader refuses (empty or non-ASCII) now raises outside order_status_report's handling, so a closed such order fails the mass status or start-up instead of being skipped."
+reported_by = "claude-opus-high and antigravity, in the reviewer benchmark run 2026-11-10-first"
+fix = "f8505c422855d8543d4d7eef931125de6760a3d0"
+test = "packages/canon-alpaca/tests/test_execution_client.py::test_closed_order_with_a_client_id_nautilus_cannot_hold_is_skipped"

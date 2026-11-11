@@ -93,11 +93,11 @@
     "antigravity-cli": {
       "default_branch": "main",
       "default_sha": "3e9fbcc9773e46659f2d21b7ede1ba5906e71eb8",
-      "ref": "refs/tags/1.5.3",
+      "ref": "refs/tags/1.5.5",
       "repo": "google-antigravity/antigravity-cli",
-      "resolved_at": "2026-11-10T21:34:01Z",
-      "sha": "099f43f0b0b7a9ffe17b549d80aac1f1ff6e2bb5",
-      "track": "tag:1.5.3"
+      "resolved_at": "2026-11-10T23:35:43Z",
+      "sha": "3e9fbcc9773e46659f2d21b7ede1ba5906e71eb8",
+      "track": "tag:1.5.5"
     },
     "ccusage": {
       "default_branch": "main",
@@ -152,6 +152,15 @@
       "resolved_at": "2026-11-10T21:08:02Z",
       "sha": "086ccc833bc9cf01024ad2dd6af7dbd421b6bf9a",
       "track": "tag:rust-v0.167.0"
+    },
+    "context7": {
+      "default_branch": "master",
+      "default_sha": "c5e34a01799bce82534eb0ed74bb16b025d75f47",
+      "ref": "refs/tags/mcpb-v4.6.0",
+      "repo": "upstash/context7",
+      "resolved_at": "2026-11-10T23:33:35Z",
+      "sha": "6e68ffcbad0e23cf4fa8c11795ce9e551aeef19b",
+      "track": "tag:mcpb-v4.6.0"
     },
     "deepseek-harness": {
       "default_branch": "master",
@@ -279,6 +288,15 @@
       "sha": "f7f273a9bb6445f6f7fb6349105e7532972045fb",
       "track": "tag:v24.22.2"
     },
+    "openviking": {
+      "default_branch": "main",
+      "default_sha": "7be89c23d21c438ce39aadf8d7939ef6f56a4b74",
+      "ref": "refs/tags/v0.5.4",
+      "repo": "volcengine/OpenViking",
+      "resolved_at": "2026-11-10T23:33:34Z",
+      "sha": "9dfa9017a8c61abefcd239fe98fdba094a2de7f3",
+      "track": "tag:v0.5.4"
+    },
     "optuna": {
       "default_branch": "master",
       "default_sha": "0886f6f1364d74e1abe4f70dab1fe89ec9a8e260",
@@ -369,6 +387,15 @@
       "sha": "05cdc36a45a29e078c2af9358969d0f576408bef",
       "track": "tag:0.17.4"
     },
+    "serena": {
+      "default_branch": "main",
+      "default_sha": "6e5c3776d4e67befaab7c290bc29b0279c98d1ed",
+      "ref": "refs/tags/v2.1.0",
+      "repo": "oraios/serena",
+      "resolved_at": "2026-11-10T23:33:35Z",
+      "sha": "5e4f5cd173c7ff3eed37ee3f1de6c266b937c5dc",
+      "track": "tag:v2.1.0"
+    },
     "shellcheck": {
       "default_branch": "master",
       "default_sha": "1046c00b61516a64f85a45e5fbdc69c6c1654eb5",
@@ -422,6 +449,15 @@
       "resolved_at": "2026-11-10T00:34:46Z",
       "sha": "316c827e058c16b71d5c507a20729c2995a7bcce",
       "track": "tag:0.13.7"
+    },
+    "weknora": {
+      "default_branch": "main",
+      "default_sha": "cbdcebabf48c5ee2d6868b370326aa8341703f62",
+      "ref": "refs/tags/v0.9.0",
+      "repo": "Tencent/WeKnora",
+      "resolved_at": "2026-11-10T23:33:34Z",
+      "sha": "f17ee8a8da901bd658a4cb25f40b5fd41adbfdd7",
+      "track": "tag:v0.9.0"
     }
   },
   "resolved_at": "2026-11-10T00:34:46Z",
