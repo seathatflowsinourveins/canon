@@ -16,6 +16,7 @@ credentials.
 
 import asyncio
 import concurrent.futures
+import contextvars
 import socket
 import threading
 import time
@@ -6642,15 +6643,41 @@ def test_a_chain_walk_cut_short_on_one_read_is_walked_again(venue, alpaca, monke
         )
     ]
     reads: list[str] = []
+    failed: list[str] = []
+    # The injected failure is scoped to the open-order check's own chain walk: a read is marked only
+    # while `_open_order_fills` walks a chain (`_chain_ids` within it), and the first marked read of the
+    # middle order fails. Start-up's order and fill report requests run concurrently and other paths read
+    # that order too, so a count of every read would fail whichever path came second. The markers are
+    # context variables: `_call` starts each read in a task (`asyncio.ensure_future`), which copies the
+    # context, and `asyncio.to_thread` copies it on to the worker thread.
+    checking = contextvars.ContextVar("checking", default=False)
+    walking = contextvars.ContextVar("walking", default=False)
+    check, walk = AlpacaExecutionClient._open_order_fills, AlpacaExecutionClient._chain_ids
+
+    async def marked_check(self, command, chain):
+        token = checking.set(True)
+        try:
+            return await check(self, command, chain)
+        finally:
+            checking.reset(token)
+
+    async def marked_walk(self, venue_order_id):
+        token = walking.set(True)
+        try:
+            return await walk(self, venue_order_id)
+        finally:
+            walking.reset(token)
 
     def once(order_id: str) -> Exception | None:
-        # The order report's own trace reads the middle order first; the check's walk reads it second.
-        if order_id == middle["id"]:
+        if order_id == middle["id"] and checking.get() and walking.get():
             reads.append(order_id)
-            if len(reads) == 2:
+            if len(reads) == 1:
+                failed.append(order_id)
                 return OSError("connection reset")
         return None
 
+    monkeypatch.setattr(AlpacaExecutionClient, "_open_order_fills", marked_check)
+    monkeypatch.setattr(AlpacaExecutionClient, "_chain_ids", marked_walk)
     venue.trading.order_lookup_error = once
     node = build_node(trader(submit=False), exec_engine=SHORT_WINDOW)
 
@@ -6658,6 +6685,8 @@ def test_a_chain_walk_cut_short_on_one_read_is_walked_again(venue, alpaca, monke
 
     (order,) = [o for o in node.cache.orders() if o.client_order_id.value == "outside-2"]
     assert trade_ids(order) == [str(uuid.UUID(int=81))]
+    # The check's walk was cut short once, and walked again.
+    assert failed == [middle["id"]] and len(reads) >= 2, (failed, reads)
 
 
 # -- the code review of the record -------------------------------------------------------------------
