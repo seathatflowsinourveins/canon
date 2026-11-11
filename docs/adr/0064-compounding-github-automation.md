@@ -98,7 +98,12 @@ Not built, with the reason:
 `scripts/test-drift` holds the list and the issue's lifecycle offline, against a stub `gh` (72 cases).
 `scripts/test-canon` holds the brief's four `drift_issue` cases. Run by hand on this machine on
 2026-11-10, the session-start watch recorded `drift_issue: []` from GitHub after Issues were turned on.
-The workflow passes actionlint. The first hosted run's outcome is recorded here once it has run.
+The workflow passes actionlint. First hosted runs, 2026-11-11, started by hand on `main`, with issue
+creation limited to collaborators: the job's `GITHUB_TOKEN` read `issueCreationPolicy`, then opened issue
+#136 as `github-actions[bot]`, labelled and locked, with 8 items; the second run rewrote its body, said
+"the list is unchanged" and posted no comment. Both runs succeeded. So the default token may read the
+bound and open an issue under it, and the UNVERIFIED point under Consequences is settled for this
+repository.
 
 ## Evidence
 
