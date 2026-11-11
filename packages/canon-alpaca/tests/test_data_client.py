@@ -16,6 +16,7 @@ thread that does not stop.
 """
 
 import asyncio
+import concurrent.futures
 import gc
 import logging
 import re
@@ -2001,3 +2002,140 @@ def test_a_window_inverted_in_the_past_is_still_sent(venue) -> None:
     run_with_client(body)
 
     assert len(venue.historical.requests) == 1
+
+
+# -- a subscribe made while alpaca-py connects (Codex) ----------------------------------------------------
+
+
+@pytest.mark.parametrize("make", ["real", "stand-in"])
+def test_a_subscription_lost_while_the_stream_connects_is_sent_on_its_first_message(
+    venue, alpaca, monkeypatch, make
+) -> None:
+    # alpaca-py 0.45.0 sends its handler maps when it connects and only then counts as running, so a
+    # subscribe made between the two is never sent. The client sends its subscriptions again once the
+    # stream's first quote or trade shows it is running.
+    if make == "real":
+        stream, socket = alpaca.memory_stream(monkeypatch)
+        gate, held, wire = threading.Event(), socket.holding, lambda: socket.wire
+        socket.gate = gate
+        running = lambda: stream._running
+    else:
+        stream = venue.stream
+        stream.trades = []
+        gate = stream.snapshot_gate = threading.Event()
+        held, wire, running = stream.snapshot_taken, lambda: stream.wire, stream.running.is_set
+    monkeypatch.setattr(canon_alpaca.data, "StockDataStream", lambda **_: stream)
+
+    async def body(client) -> None:
+        try:
+            await client._subscribe_quotes(command(AAPL))
+            await wait_until(held.is_set)
+            await client._subscribe_trades(command(AAPL))  # in the window: recorded, not sent
+        finally:
+            gate.set()
+        await wait_until(running)
+        if make == "real":
+            await asyncio.sleep(0.2)
+            assert wire()["trades"] == set()  # quiet: nothing has arrived, so nothing is resent yet
+            socket.deliver(alpaca.wire_quote())
+        await wait_until(lambda: wire()["trades"] == {"AAPL"})
+
+    cache = run_with_client(body)
+
+    assert cache.quote(AAPL) is not None
+
+
+def test_a_stream_with_one_subscription_sends_nothing_again(venue) -> None:
+    # The subscribe that starts the run is always sent: alpaca-py waits for it before connecting.
+    strategy = consumer(want_trades=False, bar_type=None)
+
+    run(build_node(strategy), "hosted")
+
+    assert len(strategy.seen_quotes) == 1
+    assert venue.stream.subscribes_sent == 0
+
+
+def test_a_failed_resend_is_logged_and_tried_again_on_the_next_message(
+    venue, alpaca, capfd
+) -> None:
+    stream = venue.stream
+    gate = stream.snapshot_gate = threading.Event()
+
+    async def body(client) -> None:
+        try:
+            await client._subscribe_quotes(command(AAPL))
+            await wait_until(stream.snapshot_taken.is_set)
+            await client._subscribe_trades(command(AAPL))  # in the window
+            stream.send_error = ConnectionError("send failed")  # the first resend's send fails
+        finally:
+            gate.set()
+        await wait_until(lambda: client._resend_tries == 1 and not client._stream_heard)
+        assert stream.wire["trades"] == set()
+        stream.send_error = None
+        handler = stream.quote_handlers["AAPL"]
+        await asyncio.to_thread(asyncio.run, handler(alpaca.quote()))  # the next message
+        await wait_until(lambda: stream.wire["trades"] == {"AAPL"})
+        await asyncio.to_thread(asyncio.run, handler(alpaca.quote()))  # sent: nothing more to do
+        await asyncio.sleep(0.05)
+        assert client._resend_tries == 2
+        assert stream.subscribes_sent == 1
+
+    run_with_client(body)
+
+    log = logged(capfd)
+    assert log.count("Alpaca stream: sending the subscriptions again failed: send failed") == 1
+    assert "the next message tries again (2 left)" in log
+
+
+def test_a_stream_call_waiting_through_a_reconnect_takes_the_new_connects_lock(venue) -> None:
+    # The code review: a call that waited on the old connect's lock must not then run on the new
+    # connect's stream outside its lock.
+    async def body(client) -> None:
+        old = client._stream_calls
+        await old.acquire()  # as a call stuck in the old connect's stream
+        waiting = asyncio.ensure_future(client._subscribe_quotes(command(AAPL)))
+        await asyncio.sleep(0.05)
+        await client._disconnect()
+        await client._connect()
+        new = client._stream_calls
+        assert new is not old
+        await new.acquire()  # a call in the new connect
+        old.release()
+        await asyncio.sleep(0.1)
+        assert venue.stream.quote_handlers == {}  # still waiting, now on the new connect's lock
+        new.release()
+        await asyncio.wait_for(waiting, 2)
+        assert list(venue.stream.quote_handlers) == ["AAPL"]
+
+    run_with_client(body)
+
+
+class InlineStreamExecutor(ThreadPoolExecutor):
+    """A default executor that runs a stream subscribe or unsubscribe call at once and hands back its
+    finished future, as when a worker returns before `run_in_executor` has chained the future
+    (CPython 3.14 `futures._chain_future` then copies the state at once). The node's other work runs
+    in threads as usual."""
+
+    def submit(self, fn, /, *args, **kwargs):
+        if not stream_call_name(fn).startswith(("subscribe_", "unsubscribe_")):
+            return super().submit(fn, *args, **kwargs)
+        future: concurrent.futures.Future = concurrent.futures.Future()
+        try:
+            future.set_result(fn(*args, **kwargs))
+        except BaseException as e:  # noqa: BLE001 - handed to the caller, as a worker would
+            future.set_exception(e)
+        return future
+
+
+def test_a_stream_call_that_returns_at_once_is_recorded_before_its_hook_returns(venue) -> None:
+    # Under load, `test_an_unsubscribe_reads_its_feed_as_a_subscription_does` found the hook back
+    # before the unsubscribe was recorded: a call already done when the hook awaited it.
+    async def body(client) -> None:
+        await client._subscribe_quotes(command(AAPL))
+        assert list(client._quote_symbols) == ["AAPL"]
+        await wait_until(venue.stream.running.is_set)
+        await client._unsubscribe_quotes(command(AAPL))
+        assert not client._quote_symbols  # recorded by the time the hook returns
+        assert not client._stream_calls.locked()
+
+    run_with_client(body, executor=InlineStreamExecutor())
