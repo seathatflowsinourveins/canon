@@ -36,6 +36,8 @@ from typing import Any
 import numpy as np
 import optuna
 import pytest
+from nautilus_trader.model import BarType
+from nautilus_trader.model import Quantity
 from optuna.trial import TrialState
 from skfolio import Portfolio
 from skfolio import measures
@@ -54,6 +56,7 @@ from canon_trading.ledger import mark_not_run
 from canon_trading.ledger import move_sample
 from canon_trading.ledger import open_study
 from canon_trading.ledger import told_sharpe
+from canon_trading.ma_cross import MaCrossConfig
 from canon_trading.ranking import SHA256_HEX
 from canon_trading.ranking import THRESHOLD
 from canon_trading.ranking import RankingReport
@@ -63,6 +66,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterator
     from pathlib import Path
+
+    from conftest import AlpacaBars
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
@@ -205,6 +210,16 @@ def write(
     else:
         study.tell(trial, value)
     return trial.number
+
+
+def ma_cross_config() -> MaCrossConfig:
+    """A configuration `record_trial` can check against `conftest.AlpacaBars`' catalog."""
+    return MaCrossConfig(
+        bar_type=BarType.from_str("AAPL.ALPACA-1-DAY-LAST-EXTERNAL"),
+        trade_size=Quantity.from_int(10),
+        fast_period=3,
+        slow_period=8,
+    )
 
 
 def sharpe(values: list[float]) -> float:
@@ -1590,3 +1605,142 @@ def test_no_remedy_is_named_while_the_retired_list_is_not_in_its_form(study: opt
     with pytest.raises(RankingStopped, match=r"study user attribute retired is 'none'") as stopped:
         rank(study)
     assert "retire_queued(study" not in str(stopped.value)
+
+
+# The gate round after the retirement of queued records (ADR 0054 term 7, ADR 0073): each test failed
+# before its change, or on the mutation of the guard it names.
+
+
+def test_a_raced_queued_record_whose_read_back_is_refused_stops_and_is_retired(
+    study: optuna.Study, tmp_path: Path, alpaca_bars: AlpacaBars, stated_n: Callable[..., int]
+) -> None:
+    """Codex, gate round after #160: another writer's keyed record, queued between `record_trial`'s
+    check and its `ask` with no system attribute, was taken by `ask`, and a refused read of it then
+    told it `FAIL` with a generic error, the other writer's outcome kept. That erased the only sign it
+    was taken from the queue, and the gate passed on its returns at N = 3, DSR 0.9885, with no
+    backtest run. A trial `ask` gave that cannot be read back may be such a record, so it now carries
+    `record_trial`'s queue note: the ranking stops on it naming `retire_queued`, which retires it."""
+    write(study, "second", SECOND)
+    write(study, "third", THIRD_CLOSE)
+    with create_ledger_study("shape", start=DAY_0, end=END, path=tmp_path / "shape.db") as shape:
+        write(shape, "pick", PICK)
+        foreign = dict(shape.trials[0].user_attrs)
+    alpaca_bars.write(tmp_path / "catalog")
+    real_ask = optuna.Study.ask
+    raced: list[int] = []
+
+    def queued_then_asked(self: optuna.Study, *args: Any, **kwargs: Any) -> optuna.trial.Trial:
+        self.add_trial(optuna.trial.create_trial(state=TrialState.WAITING, user_attrs=foreign))
+        raced.append(self.trials[-1].number)
+        return real_ask(self, *args, **kwargs)
+
+    def unread(*_: object) -> None:
+        raise optuna.exceptions.StorageInternalError("the store refused the read")
+
+    def never(*_: object) -> None:
+        raise AssertionError("no backtest starts on a trial that was not read back")
+
+    with pytest.MonkeyPatch.context() as patched:
+        patched.setattr(optuna.Study, "ask", queued_then_asked)
+        patched.setattr(canon_trading.ledger, "_asked", unread)
+        patched.setattr(canon_trading.ledger, "run_backtest_config", never)
+        with pytest.raises(optuna.exceptions.StorageInternalError, match="refused the read") as err:
+            canon_trading.ledger.record_trial(
+                study, tmp_path / "catalog", [ma_cross_config()], starting_balances=["100000 USD"]
+            )
+
+    [number] = raced
+    assert f"trial #{number}, asked by record_trial, could not be read back" in "\n".join(
+        err.value.__notes__
+    )
+    taken = study.trials[number]
+    assert (taken.state, taken.user_attrs["error"], taken.user_attrs[OUTCOME]) == (
+        TrialState.FAIL,
+        canon_trading.ledger.TAKEN_FROM_QUEUE,
+        TRADED,
+    )
+    with pytest.raises(
+        RankingStopped,
+        match=rf"\(N = 3\)[\s\S]*pick: #{number} \(traded\) was taken from Optuna's queue[^\n]*"
+        rf"retire_queued\(study, {number}\) retires it",
+    ):
+        rank(study)
+    before = stated_n(study)
+
+    canon_trading.ledger.retire_queued(study, number)
+
+    assert study.user_attrs["retired"] == [number]
+    with pytest.raises(RankingStopped, match=r"\(N = 3\)[\s\S]*pick: tried only in"):
+        rank(study)
+    assert before == 3
+
+
+@pytest.mark.parametrize(
+    "note", [canon_trading.ledger.TAKEN_FROM_QUEUE, canon_trading.ledger.RETIRED_NOTE]
+)
+def test_a_record_with_either_queue_note_not_in_the_retired_list_stops(
+    study: optuna.Study, note: str
+) -> None:
+    """Muse, gate round after #160: no test failed with `RETIRED_NOTE` dropped from the ranking's
+    queue notes, and the gate then passed at DSR 0.9885 on a taken record left out of the `retired`
+    list, read as a run of its key. Either note stops it, naming `retire_queued`."""
+    write(study, "second", SECOND)
+    write(study, "third", THIRD_CLOSE)
+    number = write(study, "pick", PICK, told_complete=False, attrs={"error": note})
+
+    with pytest.raises(
+        RankingStopped,
+        match=rf"pick: #{number} \(traded\) was taken from Optuna's queue[^\n]*"
+        rf"retire_queued\(study, {number}\)",
+    ):
+        rank(study)
+
+
+def test_a_failed_record_with_an_outcome_the_writer_never_writes_stops_for_good(
+    study: optuna.Study,
+) -> None:
+    """Muse, gate round after #160: no test failed with the check of a keyed record's outcome
+    removed, and a `FAIL` record of the pick's key with outcome `done` was then read as a failure
+    the later pick resolves, and the gate passed at DSR 0.9885. It stops for good."""
+    foreign = study.ask()
+    foreign.set_user_attr("config_key", key_of("pick"))
+    foreign.set_user_attr("sample", 0)
+    foreign.set_user_attr(OUTCOME, "done")
+    study.tell(foreign, state=TrialState.FAIL)
+    write(study, "pick", PICK)
+    write(study, "second", SECOND)
+    write(study, "third", THIRD_CLOSE)
+
+    with pytest.raises(
+        RankingStopped,
+        match=rf"pick: #{foreign.number} [^\n]*has outcome 'done', not one record_trial writes",
+    ):
+        rank(study)
+
+
+@pytest.mark.parametrize(
+    "shown",
+    [
+        {"returns_series": {str(DAY_0): 0.01}},
+        {"session_days": [str(DAY_0)]},
+    ],
+    ids=["returns only", "session days only"],
+)
+def test_a_keyless_record_holding_only_returns_or_session_days_shows_a_run(
+    study: optuna.Study, shown: dict[str, object]
+) -> None:
+    """Muse, gate round after #160: no test failed with returns and session days dropped from what
+    shows a run on a keyless record (ADR 0053 term 3), and such a record was then marked not run,
+    cleared, and the gate passed at DSR 0.9885 without it in N. It cannot be marked, and stops."""
+    write(study, "pick", PICK)
+    write(study, "second", SECOND)
+    write(study, "third", THIRD_CLOSE)
+    keyless = study.ask()
+    for name, value in shown.items():
+        keyless.set_user_attr(name, value)
+    study.tell(keyless, state=TrialState.FAIL)
+
+    with pytest.raises(ValueError, match="shows a run"):
+        mark_not_run(study, keyless.number)
+    with pytest.raises(RankingStopped, match=rf"#{keyless.number} \(fail\)[^\n]*shows a run"):
+        rank(study)
