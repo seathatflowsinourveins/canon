@@ -38,12 +38,15 @@ answer has a new ID, an Alpaca-made client order ID and `replaces`; `replaced` c
 `replaced_by`; a second replace of the old order is refused, 422 "order already replaced"; no replacement
 sent `new`. On that, the master orchestrator chose (b) under the owner's delegation of 2026-11-10.
 `_modify_order` sends no client order ID; `OrderUpdated` comes only with `replaced`, its values from the
-replacement as the answer or a read of `replaced_by` gives it, nothing if neither does. Updates and reports
-of a replacement are traced to the node's order through `replaces`, at most 16 links, from the orders
-already fetched first, cached, misses too, and walked again after a restart. A 422 is `OrderModifyRejected`
-unless Alpaca shows the order replaced as asked (alpaca-py's own retry); any other status leaves the outcome
-unknown. `order_replace_rejected` and the `rejected` of a replacement that has not taken over are
-`OrderModifyRejected` too. Denied before Alpaca: no venue order ID, a fractional quantity, a sub-penny
+replacement as the answer or a read of `replaced_by` gives it, nothing if neither does. Each node order's
+replace chain is one record, as Binance spot's `OrderBinding`: built from the node's cache, it holds the
+Alpaca orders the order has been, the one it is on and the replaces pending, and every update and report
+is judged through it. A replacement is the node's by the record or the cache, else by a walk of `replaces`
+of at most 16 reads. A 422 is `OrderModifyRejected` unless Alpaca shows the order replaced as asked
+(alpaca-py's own retry); any other status leaves the outcome unknown. `order_replace_rejected` and the
+`rejected` of a replacement that has not taken over are `OrderModifyRejected` too. One that took over
+(the order it replaces shows replaced by it) ends the order: rejected, or canceled once partly filled, as
+Binance spot's `reject_replace` emits `OrderCanceled`. Denied before Alpaca: no venue order ID, a fractional quantity, a sub-penny
 price, a price the order type lacks.
 
 ### Consequences
@@ -66,8 +69,9 @@ applicable: TC-E36. The offline tests stand in for the venue as alpaca-py's own 
 endpoints, and are listed in the package README.
 
 `UNVERIFIED`, shown by no run: `order_replace_rejected`; `pending_replace`; a `new` for a replacement later
-than ~200 ms; a status on a replace other than 422; a modify of a partially filled order (what `qty` means
-then); a fill on the old order racing a replace, where the old order's fill applies as usual and the
+than ~200 ms; a status on a replace other than 422; a modify of a partially filled order (what `qty`,
+`filled_qty` and the activities' `cum_qty` count then: the client holds both readings, `FilledReading`, and
+uses the one it always has, that a replacement carries the order on); a fill on the old order racing a replace, where the old order's fill applies as usual and the
 replacement's `rejected` becomes `OrderModifyRejected`, not `OrderRejected`.
 
 ## Evidence
@@ -136,3 +140,16 @@ Read 2026-11-10; "raw": fetched with `curl` and read, not summarised. NautilusTr
   holds whichever way a replacement's `filled_qty` counts (UNVERIFIED), as Binance spot keeps a superseded
   order bound to the node's (`record_order_update_from_fill`); a rejected replacement Alpaca shows as
   having replaced the old order, or the node holds, took over; a 404 on a replacement is no report.
+* Second readers of the modify work, 2026-11-10 (three independent reviews after #99, #107 and #117): a
+  partly filled order whose replacement was rejected after taking over was left open, as NautilusTrader
+  drops `OrderRejected` for it, and was reported rejected without its fill; a late rejection of a
+  replacement a later replace had left behind ended the working order; fills across two replaces were
+  all dropped; after a reconnect a fill on a replacement needed a read of the order before it, and a late
+  cancel of the replaced order canceled the node's; a 404 or the 16th link ended a trace at the wrong
+  order. Each reproduced with a failing test. The text above is corrected: the point fixes are replaced
+  by one record per node order, after Binance spot (`crates/adapters/binance/src/common/dispatch.rs` at
+  the pin, read raw: `OrderBinding`, `record_order_update`, `record_order_update_from_fill`,
+  `begin_replace`, `reject_replace`, `restore_order`, `cleanup_terminal`), with a fill applied once per
+  trade ID. Not taken from upstream: Binance's binding holds one current and its superseded venue IDs,
+  where here a replacement not yet adopted is held too, since Alpaca's replacement can be rejected after
+  `replaced`. Still UNVERIFIED: what a replacement's quantities count (the seam above).
