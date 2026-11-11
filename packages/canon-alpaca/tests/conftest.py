@@ -405,10 +405,11 @@ class FakeOrdersClient(FakeTradingClient):
     `submit_error` is raised instead of answering; with `took_before_error`, the order is taken (and its
     updates sent) first, as when alpaca-py's retry of a submit Alpaca had already taken is refused.
     `submit_delay` holds the answer back that many seconds after the updates are sent.
-    `cancel_order_by_id` answers 204 and sends `canceled`, or raises `cancel_error`; with
+    `cancel_order_by_id` answers 204 and sends `canceled` (for an order already canceled, 204 and no
+    update, as paper answered a second cancel), or raises `cancel_error`; with
     `took_before_error`, it first marks the order `pending_cancel`, sending no update; `refuse_cancel` refuses
     the cancel of each order it returns an error for, and the others are canceled.
-    It cancels orders placed through it and orders in `orders`, as Alpaca holds both. With `execution_ids` false, fills carry no `execution_id`. `orders` and `positions` are what the reads return; `get_orders` applies
+    It cancels orders placed through it and orders in `orders`, as Alpaca holds both. With `execution_ids` false, fills carry no `execution_id`. `orders` and `positions` are what the reads return, with the orders placed through it; `get_orders` applies
     the `status`, `symbols`, `after` and `until` filters the way alpaca-py's `GetOrdersRequest` documents
     them (`after` and `until` on the submission time).
     `get` answers `/account/activities/FILL` as "Retrieve Account Activities of Specific Type" documents
@@ -528,6 +529,8 @@ class FakeOrdersClient(FakeTradingClient):
         refusal = self.refuse_cancel(placed) if self.refuse_cancel is not None else None
         if refusal is not None:
             raise refusal
+        if placed["status"] == "canceled" and self.cancel_error is None:
+            return  # a second cancel: 204 and no update, as paper answered it (TC-E44, ADR 0036)
         if self.cancel_error is not None:
             # Taken, and refused on the repeat: Alpaca's order is pending cancel; no update is sent.
             placed.update(status="pending_cancel")
@@ -618,7 +621,7 @@ class FakeOrdersClient(FakeTradingClient):
         status = filter.status.value if filter is not None and filter.status else "open"
         symbols = filter.symbols if filter is not None else None
         selected = []
-        for raw in self.orders:
+        for raw in [*self._placed.values(), *self.orders]:  # as `get_order_by_id` sees them
             closed = raw["status"] in CLOSED_ORDER_STATUSES
             if (status == "open" and closed) or (status == "closed" and not closed):
                 continue

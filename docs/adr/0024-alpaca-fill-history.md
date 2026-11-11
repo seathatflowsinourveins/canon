@@ -206,3 +206,6 @@ Read 2026-11-10. "raw" means the page's markdown or source fetched with `curl` a
 * A second reader after landing, 2026-11-10: two tests built two one-share fills of a two-share order,
   both `cum_qty` 1 and `leaves_qty` 0, which Alpaca cannot list, and asserted the partial reports this
   record's completeness rule drops. Corrected to fills as Alpaca lists them (`cum_qty` 1 then 2).
+* A second reader after landing, 2026-11-10: fill reports asked for one order filtered by its ID before
+  the replace chain was assembled, so a chain the bulk request reports in full gave none. Reproduced with
+  a test and fixed: a request for one order reads its whole chain and keeps what is reported on it.

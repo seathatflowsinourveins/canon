@@ -100,9 +100,10 @@ a query through a node, the node's USD balance equal to Alpaca's `cash` as `get_
 
 TC-E44, venue side, through alpaca-py (2026-11-10, after hours, `mise run paper:test`, twice): a second
 cancel of a canceled $1.00 buy was answered 204, not 422, and the order still read `canceled`, the
-card's idempotent result. So an order Alpaca canceled while the stream was down is canceled from its
-read only when Alpaca answers 422, as its page documents; on a 204 it waits for NautilusTrader's
-in-flight check.
+card's idempotent result, which disagrees with the page's 422. So an order Alpaca canceled while the
+stream was down is canceled from its read only when Alpaca answers 422; on a 204 NautilusTrader's
+in-flight check sends `QueryOrder`, which the client now answers, and the engine cancels the order from
+Alpaca's read, at Alpaca's time (offline).
 
 `UNVERIFIED`, shown by no run: what the regular session answers a second cancel; an elected stop and its fill, and what the stream sends on election; any sell
 stop.
@@ -165,3 +166,13 @@ Read 2026-11-10; "raw": fetched with `curl` and read, not summarised. NautilusTr
 * A second reader after landing, 2026-11-10: the lookups after a 422 on a submit, cancel or replace took
   only transport errors, so a body alpaca-py cannot build ended the hook without its unknown-outcome log.
   Reproduced with a test each and fixed: they take `ValueError` and `TypeError` too, as the fill check does.
+* The reviewer benchmark's triage and second readers of the modify work, 2026-11-10: `_query_order` was
+  not implemented, so the in-flight check resolved a `SUBMITTED` order locally as rejected (on paper, one
+  Alpaca then accepted) and a cancel answered 204 never read Alpaca; outcomes found after an `await`
+  could end an order twice; an acknowledgement during a pending cancel was never generated; a refused
+  submit Alpaca held rejected or closed was accepted; a stop-market's display quantity was sent. Each
+  reproduced with a failing test and fixed: `QueryOrder` is answered with the order's status report, as
+  `query_order` does in `crates/adapters/{binance/src/spot,bybit/src,coinbase/src,kraken/src/execution/spot,okx/src}`
+  at the pin, for `check_inflight_orders` and `check_open_order_queries` in
+  `crates/live/src/execution/manager.rs` (fetched, raw); the order state machine
+  (`crates/model/src/orders/mod.rs`, fetched, raw) gives the transitions used.

@@ -166,3 +166,11 @@ For the execution slice, read 2026-11-10:
   closes only what `_connect` creates (`docs/developer_guide/python_adapters.md` at the pin, "Bind
   resources at startup", "Disconnect and drain tasks", fetched, raw); and the call's outcome is read when
   it ends (asyncio's `shield` leaves the inner task running).
+* The reviewer benchmark's triage, 2026-11-10: a fractional position in another symbol failed a report
+  asked for one; a position in an instrument not loaded failed start-up ("instrument missing from cache",
+  observed); a non-numeric value raised `InvalidOperation` past the closed-order skip; an order replaced
+  between the open and the windowed read was reported twice. Each reproduced with a test and fixed:
+  positions are read for the instrument asked and only for loaded instruments, as Coinbase's
+  `generate_order_status_report` keeps to its bootstrapped instruments (`crates/adapters/coinbase/src/
+  execution.rs` at the pin, fetched, raw); a value that is not a number is a `ValueError`; a working copy
+  whose replacement is in the reads is not reported.

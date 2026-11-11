@@ -127,3 +127,12 @@ Read 2026-11-10; "raw": fetched with `curl` and read, not summarised. NautilusTr
   `replaced` or its own first update, so its rejection ends the order; and a rejected replacement whose
   old order Alpaca shows replaced is reported. A rejected replacement whose old order filled first still
   leaves the old order's report.
+* Second readers of the modify work, 2026-11-10: a fill on the replaced order arriving after the
+  replacement's `fill` was dropped; a replacement's `rejected` before `replaced` left the order on a
+  rejected replacement's terms; a replacement replaced again before it was read could not be adopted; a
+  rejected replacement the node held was not reported when its prior could not be read; a modify to a
+  quantity of 0 had no outcome; a 404 on a replacement failed the report. Each reproduced with a failing
+  test and fixed: the order ends when the client's own count of its fills reaches its quantity, which
+  holds whichever way a replacement's `filled_qty` counts (UNVERIFIED), as Binance spot keeps a superseded
+  order bound to the node's (`record_order_update_from_fill`); a rejected replacement Alpaca shows as
+  having replaced the old order, or the node holds, took over; a 404 on a replacement is no report.
