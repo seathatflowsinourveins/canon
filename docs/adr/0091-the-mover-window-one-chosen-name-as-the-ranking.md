@@ -65,11 +65,27 @@ does not need in order to be tested.
   on the second paper account (ADR 0069), where this strategy had not run when this was written.
 
 **The replay before paper** (`tests/test_mover_day.py`, `tests/test_paper_mover_day.py`) runs the
-strategy on one recorded day with a window's rows: minute bars on SIP, the feed a node's bars are built
-from, and quotes on IEX, the one feed the adapter's quote request serves (ADR 0066). Its limits: IEX's
-top of book is not the national best bid and offer, which on 2026-11-11 decided the result, below; and
-its check that a trigger never falls looks inside one order, not across a sell made again (a second
-reader's finding; the strategy's own test does look across).
+strategy on one recorded day with a window's notional, move and entry-count rows: minute bars on SIP,
+the feed a node's bars are built
+from, and quotes on IEX, the one feed the adapter's quote request serves (ADR 0066). Its data limit:
+IEX's top of book is not the national best bid and offer, which on 2026-11-11 decided the result, below.
+
+**Update, 2026-11-11:** the replay's `stage_one` added the check across remade sells that Muse's sixth finding called
+for, comparing recorded triggers within the same holding and resetting after flat.
+The evidence is
+`tests/test_mover_day.py::test_stage_one_checks_a_remade_sells_trigger_until_the_position_is_flat`:
+the lower remake failed before the fix; lower, equal, higher and new-entry cases pass after it.
+
+**Follow-up, 2026-11-11 (Antigravity findings 1 to 4):** the original check used the released limit's
+new initialization timestamp and sampled after each step. It now uses `init_event.ts_init`, which the
+pinned emulator preserves when transforming an order, and reads the cached order's initialization and
+update events instead of timer samples. The real-engine tests in `tests/test_mover_day.py` cover an
+immediate-fill release, two holdings, a lower remake after a partial entry fill, a sub-second trigger
+peak before a remake, and a seeded stop released during submit; the offline checks live there, outside
+the paper module. The replay still covers one instrument. It explicitly passes `max_shares=None`,
+overridable through `replay`'s changes, and adds no `PositionCap`: unlike the window it has no starting
+entry ask from which to derive the share bound. That sizing difference remains an open question; no
+replacement cap policy is chosen here.
 
 ### Consequences
 
