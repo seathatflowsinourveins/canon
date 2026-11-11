@@ -32,7 +32,7 @@ set, to what, and how is it checked? How the runtimes update themselves is ADR 0
 Chosen: **option 2**.
 
 1. **No alias is pinned.** An alias "point[s] to the recommended version for your provider and update[s]
-   over time"; a pin names one ID and does not follow it. The owner's words point to following, so the
+   over time"; a pin names one ID and does not follow it. The owner's instruction points to following, so the
    template pins nothing, replacing ADR 0005's fable pin. A lane's model in `canon/models.json` is what
    its alias resolved to on `read_at`.
 2. **An allowlist hides the legacy row.** The picker's Fable row was not the `fable` alias but an extra
@@ -118,8 +118,21 @@ against a temporary HOME.
 
 UNVERIFIED: why the server offers `claude-fable-5-1[1m]` (the 2.1.321 changelog moves saved 5.1 picks to
 `fable` and offers `/model claude-fable-5-1` "to switch back"; Fable models have the 1M window "by
-default"); the picker once these keys are in user settings rather than `--settings`; whether this
-account may use Muse Wonder or Wonder Full; whether Orca's per-agent arguments can carry a model.
+default"); whether this account may use Muse Wonder or Wonder Full; whether Orca's per-agent arguments
+can carry a model.
+
+The picker with these keys in user settings, closed on 2026-11-11: the owner observed, in a new session on
+Claude Code 2.1.322 with the allowlist and the picker row in user settings, that `/model` shows Default,
+Opus, Sonnet, Haiku and "Fable 5.2 · Custom model (claude-fable-5-2)", and no Fable 5.1 row (the owner's
+observation, reported to this record's author, not re-run).
+
+Applied on 2026-11-11, at the owner's request, from the main checkout at commit 229110a:
+`scripts/bootstrap --user-config` added `availableModels`, `modelPicker` and the `latest` channel, retired
+the `fable` alias pin, set Codex's model and effort and Antigravity's default model, and kept a copy of
+each file it changed; `scripts/bootstrap --install` removed the Antigravity no-update line; `claude update`
+moved the CLI from 2.1.321 to 2.1.322. `scripts/bootstrap --check` ended "All present". A request for
+`claude-fable-5-1` then started and billed on `claude-opus-5-5`, confirming the allowlist and the vendor's
+fallback.
 
 ## Evidence
 

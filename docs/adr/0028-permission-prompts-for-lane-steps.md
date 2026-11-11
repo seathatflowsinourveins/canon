@@ -12,9 +12,9 @@ review-by: 2027-02-08
 ADR 0020 rule 4 put `ask` rules in front of a pin move, an install, a push and the two installers, and
 called each prompt the owner's to answer. An `ask` rule prompts in every permission mode, and the
 sessions here run in parallel, mostly with no one watching. A worker adopting a library through the
-`adopt-upstream` skill, as decided, stopped at such a prompt and waited for a person. The owner's
-instruction, 2026-11-10: "make sure every lanes are seamless without consistant premission frictions",
-after "please proceed with the sota landscape clean resolution automatically". Which prompts stay?
+`adopt-upstream` skill, as decided, stopped at such a prompt and waited for a person. The owner
+decided on 2026-11-10 that every lane runs seamlessly, without repeated permission prompts, after asking
+that the state-of-the-art landscape resolution proceed automatically. Which prompts stay?
 
 ## Decision Drivers
 

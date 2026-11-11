@@ -88,6 +88,11 @@ runs; whether Codex's startup check installs or only reports (Orca's code says i
 "installs and exits"; OpenAI's docs do not say); whether `DISABLE_AUTOUPDATER=0` counts as off (the check
 counts any non-empty value).
 
+Applied on 2026-11-11, at the owner's request, from the main checkout at commit 229110a, together with ADR
+0059's settings: `scripts/bootstrap --user-config` set the `latest` channel and `scripts/bootstrap
+--install` removed the Antigravity no-update line; `claude update` moved the CLI from 2.1.321 to 2.1.322;
+`scripts/bootstrap --check` ended "All present".
+
 ## Evidence
 
 Read 2026-11-10. `fetched`: downloaded and searched here; `run`: a command run here.
