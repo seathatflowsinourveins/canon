@@ -77,6 +77,10 @@ is named in what is left.
   whoever placed it, so until the check is limited to the window's own lineage (client order IDs, as
   `src/canon_trading/custody.py` names them), nobody places an order by hand in a symbol a window is
   trading. `mise run paper:account <tests|windows>` shows each open order as ours or foreign.
+* Neutral (2026-11-11): what a window leaves of ours (a node killed before its check ran) is closed by hand
+  with `mise run paper:close <tests|windows>`, under the account's lock: it cancels and closes only what our
+  lineage wrote and the quantity our orders opened, one attempt each, and freezes and names a symbol with
+  anything else in it. Its closes carry `canon-close-hand-`, of the lineage this check's closes carry.
 
 ### Confirmation
 

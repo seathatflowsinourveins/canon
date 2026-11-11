@@ -6,11 +6,13 @@ models, validated from made-up payloads; the task's shell body runs with a stand
 
 import os
 import re
+import signal
 import subprocess
 import tomllib
 from collections import deque
 from datetime import UTC
 from datetime import datetime
+from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,10 +21,16 @@ from typing import cast
 from uuid import uuid4
 
 import pytest
+import requests
+from alpaca.common.exceptions import APIError
+from alpaca.data.models import Quote
 from alpaca.trading.models import AccountConfiguration
+from alpaca.trading.models import Calendar
+from alpaca.trading.models import Clock
 from alpaca.trading.models import Order
 from alpaca.trading.models import Position
 from alpaca.trading.models import TradeAccount
+from alpaca.trading.requests import LimitOrderRequest
 from alpaca.trading.requests import MarketOrderRequest
 
 from canon_trading import custody
@@ -38,6 +46,7 @@ OURS = [
     "O-20261111-150428-001-001-3",
     "O-20261111-150428-001-001-1234",
     "canon-close-20261111T150424Z-1-6168c4fe",  # the account check's close (ADR 0060)
+    "canon-close-hand-20261111T150424Z-2-0123abcd",  # the close-only form's
 ]
 FOREIGN = [
     str(uuid4()),  # what Alpaca generates when no ID is sent (the dashboard, another tool)
@@ -49,7 +58,7 @@ FOREIGN = [
     "O-20261111-165400-001-001-1 ",
     "canon-close-",  # the prefix alone
     "canon-close-manual",  # the prefix, typed by anyone
-    "canon-close-hand-20261111T150424Z-1-6168c4fe",  # a form no code writes
+    "canon-close-start-20261111T150424Z-1-6168c4fe",  # a form no code writes yet
     "canon-close-20261111T150424Z-1-6168C4FE",
     "O-\u0662\u0660\u0662\u0666\u0661\u0661\u0661\u0661-165400-001-001-1",  # digits, but not ASCII
     "canon-resend-0001",
@@ -172,7 +181,7 @@ class Paper:
         self.calls.append(("get_all_positions", None))
         return self.positions
 
-    def get_orders(self, filter=None):
+    def get_orders(self, filter: Any = None):
         self.calls.append(("get_orders", filter))
         return self.orders
 
@@ -394,3 +403,563 @@ def test_a_listing_with_something_other_than_orders_is_a_named_read_failure(
     assert (
         "the open orders answered something other than a list of Order" in capsys.readouterr().err
     )
+
+
+# ---------------------------------------------------------------------------------------------------------
+# The close-only form, against a stand-in for Alpaca's paper Trading API and its latest quote
+
+
+REGULAR = datetime(2026, 11, 11, 15, 0, tzinfo=UTC)  # 10:00 New York, a Wednesday
+AFTER_HOURS = datetime(2026, 11, 11, 22, 0, tzinfo=UTC)  # 17:00 New York
+SATURDAY = datetime(2026, 11, 14, 15, 0, tzinfo=UTC)
+NODE_BUY = "O-20261111-145000-001-001-1"
+
+
+class Venue(Paper):
+    """Alpaca's paper Trading API as far as the form uses it: orders kept as alpaca-py `Order` models, a
+    position per symbol, the clock and calendar for `now`. A market sell fills at the next lookup; a limit
+    sells fills only if `limits_fill`. A cancel of an open order ends it; of an ended one, 422."""
+
+    def __init__(self, now: datetime, *, limits_fill: bool = False, **kw) -> None:
+        super().__init__(**kw)
+        self.now = now
+        self.limits_fill = limits_fill
+        self.held: dict[str, Decimal] = {}
+        self.history: list[Order] = []
+        self.sent: list[Any] = []
+        self.canceled: list[str] = []
+        self.submit_fails: BaseException | None = None
+        self._retry = 3  # alpaca-py's `RESTClient._retry`, which `send_once` sets to 0
+
+    # what the account holds
+    def hold(self, symbol: str, qty: int | str, client_order_id: str | None = NODE_BUY) -> None:
+        """A position of `qty` that `client_order_id`'s filled buy opened (None: nobody's in the
+        lookback)."""
+        self.held[symbol] = self.held.get(symbol, Decimal(0)) + Decimal(str(qty))
+        if client_order_id is not None:
+            self.history.append(
+                _order(
+                    client_order_id=client_order_id,
+                    symbol=symbol,
+                    qty=str(qty),
+                    filled_qty=str(qty),
+                    status="filled",
+                    type="market",
+                    limit_price=None,
+                    submitted_at=(self.now - timedelta(minutes=10)).isoformat(),
+                )
+            )
+
+    def open(self, **fields: Any) -> Order:
+        order = _order(**fields)
+        self.history.append(order)
+        return order
+
+    def get_all_positions(self):
+        self.calls.append(("get_all_positions", None))
+        return [
+            _position(symbol=s, qty=str(abs(q)), side="long" if q > 0 else "short")
+            for s, q in self.held.items()
+            if q
+        ]
+
+    def get_orders(self, filter: Any = None):
+        self.calls.append(("get_orders", filter))
+        status = filter.status.value if filter is not None and filter.status else "open"
+        found = [
+            o
+            for o in self.history
+            if (status == "all" or _value(o.status) not in session_window.TERMINAL)
+            and (not filter.symbols or o.symbol in filter.symbols)
+            and (filter.after is None or o.submitted_at > filter.after)
+        ]
+        return found[: filter.limit or 50]
+
+    def get_clock(self):
+        return Clock.model_validate(
+            {
+                "timestamp": self.now.isoformat(),
+                "is_open": time_open(self.now),
+                "next_open": "2026-11-12T14:30:00Z",
+                "next_close": "2026-11-11T21:00:00Z",
+            }
+        )
+
+    def get_calendar(self, filters=None):
+        return [
+            Calendar.model_validate(
+                {
+                    "date": "2026-11-11",
+                    "open": "09:30",
+                    "close": "16:00",
+                    "session_open": "0400",
+                    "session_close": "2000",
+                    "settlement_date": "2026-11-12",
+                }
+            ),
+            Calendar.model_validate(
+                {
+                    "date": "2026-11-12",
+                    "open": "09:30",
+                    "close": "16:00",
+                    "session_open": "0400",
+                    "session_close": "2000",
+                    "settlement_date": "2026-11-13",
+                }
+            ),
+        ]
+
+    def submit_order(self, request):
+        self.sent.append(request)
+        if self.submit_fails is not None:
+            raise self.submit_fails
+        order = _order(
+            client_order_id=request.client_order_id,
+            symbol=request.symbol,
+            qty=str(int(request.qty)),
+            side=request.side.value,
+            type=request.type.value,
+            limit_price=None
+            if getattr(request, "limit_price", None) is None
+            else str(request.limit_price),
+            extended_hours=bool(getattr(request, "extended_hours", False)),
+            status="accepted",
+            submitted_at=self.now.isoformat(),
+        )
+        self.history.append(order)
+        return order
+
+    def _fill(self, order: Order) -> Order:
+        if _value(order.status) in session_window.TERMINAL:
+            return order
+        fills = _value(order.type) == "market" or self.limits_fill
+        if not fills or _value(order.side) != "sell":
+            return order
+        filled = order.model_copy(update={"status": "filled", "filled_qty": order.qty})
+        self.history[self.history.index(order)] = filled
+        self.held[str(order.symbol)] -= Decimal(str(order.qty))
+        return filled
+
+    def get_order_by_client_id(self, client_id):
+        for order in self.history:
+            if order.client_order_id == client_id:
+                return self._fill(order)
+        raise APIError('{"code": 40410000, "message": "order not found"}', _status(404))
+
+    def cancel_order_by_id(self, order_id):
+        for i, order in enumerate(self.history):
+            if str(order.id) == str(order_id):
+                if _value(order.status) in session_window.TERMINAL:
+                    raise APIError('{"code": 42210000, "message": "not cancelable"}', _status(422))
+                self.history[i] = order.model_copy(update={"status": "canceled"})
+                self.canceled.append(order.client_order_id)
+                return
+        raise APIError('{"code": 40410000, "message": "order not found"}', _status(404))
+
+
+def _status(code: int):
+    return SimpleNamespace(response=SimpleNamespace(status_code=code))
+
+
+def _value(field):
+    return str(getattr(field, "value", field))
+
+
+def time_open(now: datetime) -> bool:
+    return now == REGULAR
+
+
+class Quotes:
+    """alpaca-py's `StockHistoricalDataClient.get_stock_latest_quote`, answering one quote per symbol."""
+
+    def __init__(self, bid="1.20", ask="1.24") -> None:
+        self.bid, self.ask = bid, ask
+        self.asked: list = []
+
+    def get_stock_latest_quote(self, request):
+        self.asked.append(request)
+        return {
+            request.symbol_or_symbols: Quote(
+                request.symbol_or_symbols,
+                {"t": "2026-11-11T21:59:58Z", "bp": self.bid, "ap": self.ask, "bs": 1, "as": 1},
+            )
+        }
+
+
+class Clocks:
+    """`sleep` that moves `monotonic` on, so a wait of 60 s takes no time."""
+
+    def __init__(self) -> None:
+        self.t = 0.0
+
+    def sleep(self, secs: float) -> None:
+        self.t += secs
+
+    def monotonic(self) -> float:
+        return self.t
+
+
+def close(venue: Venue, data: Any = None):
+    clocks = Clocks()
+    return custody.close_ours(
+        cast(Any, venue),
+        data if data is not None else Quotes(),
+        sleep=clocks.sleep,
+        monotonic=clocks.monotonic,
+        now=lambda: venue.now,
+    )
+
+
+def test_in_the_regular_session_ours_is_closed_at_market_and_the_account_left_flat() -> None:
+    venue = Venue(REGULAR)
+    venue.hold("SPY", 1)
+    report = close(venue)
+    (sent,) = venue.sent
+    assert isinstance(sent, MarketOrderRequest)
+    assert (sent.symbol, sent.qty, _value(sent.side), _value(sent.time_in_force)) == (
+        "SPY",
+        1,
+        "sell",
+        "day",
+    )
+    assert sent.client_order_id.startswith(custody.HAND_CLOSE_PREFIX)
+    assert custody.lineage(sent.client_order_id) == custody.OURS
+    assert report.part == "regular"
+    assert report.found == ["position of 1 SPY (ours opened 1)"]
+    assert report.flat and not report.frozen and venue.held["SPY"] == 0
+    assert "last shown: filled, filled 1" in report.closes[sent.client_order_id]
+
+
+def test_a_foreign_open_order_freezes_its_symbol_and_is_never_touched() -> None:
+    venue = Venue(REGULAR)
+    venue.hold("SPY", 1)
+    foreign = venue.open(client_order_id=FOREIGN[0], symbol="SPY", side="sell")
+    ours = venue.open(client_order_id="O-20261111-145500-001-001-2", symbol="SPY", side="buy")
+    report = close(venue)
+    assert venue.sent == []  # no close in a frozen symbol
+    assert venue.canceled == [ours.client_order_id]  # ours canceled, the foreign one never
+    assert report.frozen["SPY"] == ["open a foreign order: sell 1 SPY limit, new"]
+    assert FOREIGN[0] not in "\n".join(report.lines())
+    assert report.left == []  # a frozen symbol's position is reported frozen, never as ours
+    assert report.flat and report.frozen
+    assert any(
+        o.client_order_id == foreign.client_order_id and _value(o.status) == "new"
+        for o in venue.history
+    )
+
+
+def test_a_quantity_ours_did_not_open_freezes_the_symbol() -> None:
+    venue = Venue(REGULAR)
+    venue.hold("SPY", 1)
+    venue.hold("SPY", 2, client_order_id=FOREIGN[0])  # the owner's buy beside ours
+    venue.hold("AAPL", 5, client_order_id=None)  # held from before the lookback, by nobody we know
+    report = close(venue)
+    assert venue.sent == [] and venue.canceled == []
+    assert report.frozen == {
+        "AAPL": ["5 AAPL held, but our orders opened 0 in the last 1 day, 0:00:00"],
+        "SPY": ["3 SPY held, but our orders opened 1 in the last 1 day, 0:00:00"],
+    }
+
+
+def test_a_short_is_never_bought_back() -> None:
+    venue = Venue(REGULAR)
+    venue.hold("SPY", -1, client_order_id=None)
+    report = close(venue)
+    assert venue.sent == []
+    assert report.frozen["SPY"] == ["a short of 1 SPY: never bought back here"]
+    listed = [f for name, f in venue.calls if name == "get_orders"]
+    assert all(_value(f.status) == "open" for f in listed)  # a frozen symbol's history is not read
+
+
+def test_a_full_listing_of_the_symbols_orders_freezes_it() -> None:
+    venue = Venue(REGULAR)
+    venue.hold("SPY", 1)
+    for n in range(2, custody.ORDERS_PAGE_LIMIT + 1):
+        venue.history.append(
+            _order(client_order_id=f"O-20261111-145000-001-001-{n}", status="canceled")
+        )
+    report = close(venue)
+    assert venue.sent == []
+    assert "the quantity ours opened is not established" in report.frozen["SPY"][0]
+
+
+def test_outside_the_regular_session_a_marked_limit_through_the_touch_is_canceled_after_60_s() -> (
+    None
+):
+    venue = Venue(AFTER_HOURS)
+    venue.hold("SPY", 1)
+    quotes = Quotes(bid="760.10", ask="760.20")
+    report = close(venue, quotes)
+    (sent,) = venue.sent
+    assert isinstance(sent, LimitOrderRequest)
+    assert (sent.limit_price, sent.extended_hours, _value(sent.time_in_force)) == (
+        760.05,
+        True,
+        "day",
+    )
+    (asked,) = quotes.asked
+    assert (asked.symbol_or_symbols, _value(asked.feed)) == ("SPY", "sip")  # after-hours' feed
+    log = report.closes[sent.client_order_id]
+    assert log[0] == (
+        "sent: sell 1 SPY limit 760.05, DAY, extended hours "
+        "(sip quote at 21:59:58 UTC, bid 760.1, ask 760.2)"
+    )
+    assert "canceled after 60 s" in log and venue.canceled == [sent.client_order_id]
+    assert report.left == ["position of 1 SPY (ours opened 1)"]  # not flat, by name
+
+
+def test_outside_the_regular_session_a_limit_that_fills_leaves_the_account_flat() -> None:
+    venue = Venue(AFTER_HOURS, limits_fill=True)
+    venue.hold("SPY", 1)
+    report = close(venue)
+    assert report.flat and venue.canceled == []
+
+
+def test_no_bid_sends_no_close_and_says_why() -> None:
+    venue = Venue(AFTER_HOURS)
+    venue.hold("SPY", 1)
+    report = close(venue, Quotes(bid="0", ask="0"))
+    assert venue.sent == []
+    assert report.errors == ["SPY: no price for the close: ValueError"]
+    assert not report.flat
+
+
+def test_our_open_order_is_canceled_and_confirmed_ended_before_the_close() -> None:
+    venue = Venue(REGULAR)
+    venue.hold("SPY", 1)
+    exit_order = venue.open(client_order_id="O-20261111-145500-001-001-2", side="sell")
+    report = close(venue)
+    assert venue.canceled[0] == exit_order.client_order_id
+    assert report.canceled == [exit_order.client_order_id]
+    assert len(venue.sent) == 1 and report.flat
+
+
+def test_a_close_whose_answer_is_lost_is_looked_up_never_sent_again() -> None:
+    venue = Venue(REGULAR)
+    venue.hold("SPY", 1)
+    venue.submit_fails = requests.ReadTimeout("read timed out")
+    report = close(venue)
+    assert len(venue.sent) == 1  # one attempt
+    (log,) = report.closes.values()
+    assert log[1] == "no answer: ReadTimeout"
+    assert "not found 60 s after it was sent" in log
+    assert report.unfound == list(report.closes)  # it may yet appear, so it is named
+    assert any(line.startswith("unfound: ") for line in report.lines())
+    assert not report.flat
+
+
+def test_a_close_alpaca_refuses_is_named_not_placed() -> None:
+    venue = Venue(REGULAR)
+    venue.hold("SPY", 1)
+    venue.submit_fails = APIError('{"code": 40310000, "message": "insufficient qty"}', _status(403))
+    report = close(venue)
+    (log,) = report.closes.values()
+    assert log[1] == "not placed: APIError (HTTP 403)"
+    assert report.left == ["position of 1 SPY (ours opened 1)"]
+
+
+def test_with_no_session_open_nothing_is_sent_and_ours_is_left_by_name() -> None:
+    venue = Venue(SATURDAY)
+    venue.hold("SPY", 1)
+    report = close(venue)
+    assert venue.sent == [] and report.part == ""
+    (error,) = report.errors
+    assert error.startswith("SPY: no session part is open (2026-11-14 is not a trading day")
+    assert error.endswith("), so no close was sent")
+    assert report.left == ["position of 1 SPY (ours opened 1)"]
+
+
+@pytest.mark.parametrize(
+    ("setup", "code"),
+    [("flat", 0), ("ours", 0), ("frozen", 2), ("left", 1)],
+)
+def test_the_close_task_exits_by_what_is_left(setup, code, capsys) -> None:
+    venue = Venue(REGULAR if setup != "left" else SATURDAY)
+    if setup in ("ours", "left"):
+        venue.hold("SPY", 1)
+    if setup == "frozen":
+        venue.hold("AAPL", 5, client_order_id=None)
+    clocks = Clocks()
+    assert (
+        custody.close_task(
+            cast(Any, venue),
+            Quotes(),
+            sleep=clocks.sleep,
+            monotonic=clocks.monotonic,
+            now=lambda: venue.now,
+        )
+        == code
+    )
+    out = capsys.readouterr().out
+    assert out.splitlines()[-1].startswith("left: ")
+
+
+def test_the_close_task_takes_the_accounts_lock_and_reads_its_pair_only() -> None:
+    task = tomllib.loads((ROOT / "mise.toml").read_text())["tasks"]["paper:close"]
+    run = task["run"]
+    assert 'choices "tests" "windows"' in task["usage"]
+    assert "tests) svc=canon-alpaca-paper; lock=canon-paper-test.lock ;;" in run
+    assert "windows) svc=canon-alpaca-paper-windows; lock=canon-paper-windows.lock ;;" in run
+    assert "close_task" in run and 'lock_wait 9 "$lockwait" ||' in run
+    tasks = tomllib.loads((ROOT / "mise.toml").read_text())["tasks"]
+    block = re.compile(r"^lock_wait\(\) \{\n.*?^\}$", re.MULTILINE | re.DOTALL)
+    found, want = block.search(run), block.search(tasks["paper:test"]["run"])
+    # paper:test's text, which scripts/test-lanes holds the other paper tasks to
+    assert found and want and found.group(0) == want.group(0)
+    assert not re.search(r"/usr/bin/lockf -t [^0 ]", run)  # lockf's descriptor form busy-loops
+    assert "CANON_ALPACA_DATA_ONLY" not in run
+    assert not re.search(r"\b(echo|printf)\b[^\n]*\$ALPACA_", run)
+
+
+def test_a_failure_part_way_cancels_the_close_it_sent_and_is_never_flat() -> None:
+    venue = Venue(AFTER_HOURS)
+    venue.hold("SPY", 1)
+    looked_up = venue.get_order_by_client_id
+    lookups = []
+
+    def lookup_fails_once(client_id):
+        lookups.append(client_id)
+        if len(lookups) == 1:
+            raise KeyError("a bug in the poll")
+        return looked_up(client_id)
+
+    venue.get_order_by_client_id = lookup_fails_once
+    report = close(venue, Quotes(bid="760.10", ask="760.20"))
+    (sent,) = venue.sent
+    assert venue.canceled == [sent.client_order_id]  # not left working
+    assert report.failed == "KeyError part way through"
+    assert "canceled after the failure" in report.closes[sent.client_order_id]
+    assert report.left == ["position of 1 SPY (ours opened 1)"] and not report.flat
+    assert "failed: KeyError part way through" in report.lines()
+
+
+def test_only_the_cancels_and_the_submit_are_sent_once_and_the_reads_keep_their_retries(
+    monkeypatch,
+) -> None:
+    venue = Venue(REGULAR)
+    venue.hold("SPY", 1)
+    venue.open(client_order_id="O-20261111-145500-001-001-2", side="sell")
+    seen: list[tuple[str, int]] = []
+    monkeypatch.setattr(session_window, "send_once", lambda t: setattr(t, "_retry", 0))
+    for name in ("get_all_positions", "get_orders", "submit_order", "cancel_order_by_id"):
+        call = getattr(venue, name)
+
+        def spy(*args, _name=name, _call=call):
+            seen.append((_name, venue._retry))
+            return _call(*args)
+
+        setattr(venue, name, spy)
+    close(venue)
+    assert {r for name, r in seen if name.startswith("get_")} == {3}
+    assert {r for name, r in seen if name in ("submit_order", "cancel_order_by_id")} == {0}
+    assert venue._retry == 3
+
+
+def test_the_part_is_read_again_after_the_cancel_wait() -> None:
+    venue = Venue(REGULAR)
+    venue.hold("SPY", 1)
+    venue.open(client_order_id="O-20261111-145500-001-001-2", side="sell")
+    cancel = venue.cancel_order_by_id
+
+    def cancel_then_the_bell(order_id):
+        cancel(order_id)
+        venue.now = AFTER_HOURS  # the regular session ended while the cancel was waited on
+
+    venue.cancel_order_by_id = cancel_then_the_bell
+    report = close(venue)
+    (sent,) = venue.sent
+    assert isinstance(sent, LimitOrderRequest) and sent.extended_hours
+    assert report.part == "after-hours"
+
+
+def test_a_read_that_fails_is_named_and_the_run_is_never_flat() -> None:
+    venue = Venue(REGULAR)
+    venue.hold("SPY", 1)
+
+    def positions_fail():
+        raise APIError('{"code": 50010000, "message": "internal"}', _status(500))
+
+    venue.get_all_positions = positions_fail
+    report = close(venue)
+    assert venue.sent == []
+    assert report.failed == "the positions failed: APIError (HTTP 500) part way through"
+    assert report.left == ["unknown: the account could not be read at the end"]
+    assert not report.flat
+
+
+def test_on_an_account_that_may_short_no_long_is_ours_to_close() -> None:
+    venue = Venue(REGULAR, no_shorting=False)
+    venue.hold("SPY", 1)
+    report = close(venue)
+    assert venue.sent == []
+    assert report.frozen["SPY"][0].startswith("the account is not long-only (no_shorting is false)")
+
+
+def test_a_sigterm_part_way_cancels_the_close_it_sent(capsys) -> None:
+    venue = Venue(AFTER_HOURS)
+    venue.hold("SPY", 1)
+    clocks = Clocks()
+
+    def sleep(secs: float) -> None:
+        clocks.sleep(secs)
+        if venue.sent:  # the close is working: the task's timeout sends TERM, then another
+            signal.raise_signal(signal.SIGTERM)
+
+    before = signal.getsignal(signal.SIGTERM)
+    code = custody.close_task(
+        cast(Any, venue),
+        Quotes(bid="760.10", ask="760.20"),
+        sleep=sleep,
+        monotonic=clocks.monotonic,
+        now=lambda: venue.now,
+    )
+    assert code == 1
+    (sent,) = venue.sent
+    assert venue.canceled == [sent.client_order_id]
+    out = capsys.readouterr().out
+    assert "failed: Stopped part way through" in out
+    assert "canceled after the failure" in out
+    assert signal.getsignal(signal.SIGTERM) == before
+
+
+def test_a_close_that_ends_just_before_its_cancel_is_not_named_a_failed_cancel() -> None:
+    venue = Venue(AFTER_HOURS)
+    venue.hold("SPY", 1)
+    cancel = venue.cancel_order_by_id
+
+    def fills_first(order_id):
+        venue.limits_fill = True  # it fills between the last poll and the cancel
+        for order in venue.history:
+            if str(order.id) == str(order_id):
+                venue._fill(order)
+        cancel(order_id)
+
+    venue.cancel_order_by_id = fills_first
+    report = close(venue, Quotes(bid="760.10", ask="760.20"))
+    (log,) = report.closes.values()
+    assert "cancel refused (HTTP 422): it had ended; last shown below" in log
+    assert log[-1] == "last shown: filled, filled 1"
+    assert report.flat
+
+
+def test_the_data_client_is_built_once_for_the_run() -> None:
+    venue = Venue(AFTER_HOURS, limits_fill=True)
+    venue.hold("SPY", 1)
+    venue.hold("QQQ", 2, client_order_id="O-20261111-145000-001-001-9")
+    built: list[Quotes] = []
+
+    def factory() -> Quotes:
+        built.append(Quotes())
+        return built[-1]
+
+    report = close(venue, factory)
+    assert len(venue.sent) == 2 and report.flat
+    assert len(built) == 1
+
+
+def test_a_foreign_order_by_notional_is_named_by_its_notional() -> None:
+    venue = Venue(REGULAR)
+    venue.hold("SPY", 1)
+    venue.open(client_order_id=FOREIGN[0], symbol="SPY", side="buy", qty=None, notional="100")
+    report = close(venue)
+    assert report.frozen["SPY"] == ["open a foreign order: buy notional 100 SPY limit, new"]
