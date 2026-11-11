@@ -395,12 +395,15 @@ telemetry_rows() {
 # environment's version is installed; `omniroute --version` alone takes OmniRoute's fast path, which prints
 # package.json's version before any .env is read (bin/omniroute.mjs). Not installed is absent and passes; an
 # installed one whose version cannot be read is UNKNOWN and fails, never "absent".
-# omniroute_row: no Anthropic or Claude connection. It reads the provider_connections table OmniRoute's
-# `providers list` reads (bin/cli/provider-store.mjs) with Apple's sqlite3, the SQL on stdin after `PRAGMA
-# query_only=1`, so nothing is written (OmniRoute's own CLI would open the database for writing, run its
-# schema steps and read a .env from the folder it starts in). It selects provider, name and default model,
-# never a key or token column. A connection whose provider, name or default model says Anthropic or Claude
-# fails the check; so does a table that cannot be read, which would otherwise pass for none.
+# omniroute_row: no Anthropic or Claude connection, API-key connections only, and every API key no-log
+# (ADR 0056). It reads the provider_connections table OmniRoute's `providers list` reads
+# (bin/cli/provider-store.mjs) and the api_keys table (src/lib/db/apiKeys.ts) with Apple's sqlite3, the SQL on
+# stdin after `PRAGMA query_only=1`, so nothing is written (OmniRoute's own CLI would open the database for
+# writing, run its schema steps and read a .env from the folder it starts in). It selects provider, name,
+# display name, e-mail, default model, auth type and, for a key, its name and no_log flag, never a key or
+# token column. A connection whose provider, labels or default model says Anthropic or Claude fails the
+# check, as does one whose auth type is not apikey (a sign-in), an unrevoked key that is not no-log, and
+# tables that cannot be read, which would otherwise pass for none.
 OMNIROUTE_DATA="$HOME/.omniroute"   # the folder mise.gateway.toml's omniroute:serve sets as DATA_DIR
 OMNIROUTE_ANTHROPIC_RE='anthropic|claude'   # provider ids anthropic, claude, claude-web, anthropic-compatible-*
 SQLITE3="${CANON_SQLITE3:-/usr/bin/sqlite3}"
@@ -417,21 +420,25 @@ omniroute_version_row() {
     row "omniroute" UNKNOWN "installed, but omniroute --version gave '${v:-nothing}'"; return 1
   fi
   if [ -z "$pin" ]; then row "omniroute" UNKNOWN "$v; no omniroute pin in canon/upstreams.json"; return 1; fi
-  if [ "$v" = "$pin" ]; then row "omniroute" ok "$v; pinned $pin"
+  if [ "$v" = "$pin" ]; then row "omniroute" ok "$v; pinned $pin; the package on disk, not a configured or running gateway"
   else row "omniroute" OTHER "$v installed; pinned $pin (canon/upstreams.json); run: mise -E gateway install --locked npm:omniroute"; return 1; fi
 }
 omniroute_row() {
   local db="$OMNIROUTE_DATA/storage.sqlite" out ids bad
   if [ ! -e "$db" ]; then row "omniroute providers" absent "no gateway data in $OMNIROUTE_DATA"; return 0; fi
   if ! out=$(printf '%s\n' 'PRAGMA query_only=1;' '.mode json' \
-               "SELECT provider, coalesce(name, display_name, email, '') AS name, coalesce(default_model, '') AS default_model FROM provider_connections;" \
+               "SELECT 'connection' AS kind, provider, coalesce(name, '') || ' ' || coalesce(display_name, '') || ' ' || coalesce(email, '') AS name, coalesce(default_model, '') AS default_model, coalesce(auth_type, '') AS auth_type, 1 AS no_log FROM provider_connections UNION ALL SELECT 'key', '', name, '', '', coalesce(no_log, 0) FROM api_keys WHERE revoked_at IS NULL;" \
              | "$SQLITE3" -bail "$db" 2>/dev/null) \
-     || ! ids=$(jq -rs 'add // [] | map(.provider) | unique | join(" ")' <<<"$out" 2>/dev/null); then
+     || ! ids=$(jq -rs 'add // [] | map(select(.kind == "connection") | .provider) | unique | join(" ")' <<<"$out" 2>/dev/null); then
     row "omniroute providers" UNKNOWN "could not read the connections in $db"; return 1
   fi
-  bad=$(jq -rs --arg re "$OMNIROUTE_ANTHROPIC_RE" 'add // [] | map(select((.provider + " " + .name + " " + .default_model) | test($re; "i")) | .provider) | unique | join(" ")' <<<"$out")
+  bad=$(jq -rs --arg re "$OMNIROUTE_ANTHROPIC_RE" 'add // [] | map(select(.kind == "connection" and ((.provider + " " + .name + " " + .default_model) | test($re; "i"))) | .provider) | unique | join(" ")' <<<"$out")
   if [ -n "$bad" ]; then row "omniroute providers" FAILED "Anthropic or Claude connection(s): $bad; remove them in the dashboard, Claude stays native (ADR 0056)"; return 1; fi
-  row "omniroute providers" ok "${ids:-no connections}; none Anthropic"
+  bad=$(jq -rs 'add // [] | map(select(.kind == "connection" and .auth_type != "apikey") | "\(.provider) (\(.auth_type))") | unique | join(" ")' <<<"$out")
+  if [ -n "$bad" ]; then row "omniroute providers" FAILED "not API-key connection(s): $bad; API keys only, never a sign-in (ADR 0056): remove them in the dashboard"; return 1; fi
+  bad=$(jq -rs 'add // [] | map(select(.kind == "key" and (.no_log | tostring) != "1") | .name) | unique | join(", ")' <<<"$out")
+  if [ -n "$bad" ]; then row "omniroute providers" FAILED "API key(s) that log request bodies: $bad; revoke them and mint one with omniroute:setup (ADR 0056)"; return 1; fi
+  row "omniroute providers" ok "${ids:-no connections}; none Anthropic, API keys only, every key no-log"
 }
 
 # The review-only workers (ADR 0045). DeepSeek Harness reads its profile's user patch last, a YAML array

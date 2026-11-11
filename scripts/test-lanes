@@ -1327,22 +1327,29 @@ check "omniroute installed whose version cannot be read: UNKNOWN, exit 1, never 
       eval 'rowis "$TMP/bs.out" "omniroute" UNKNOWN && [ "$rc" != 0 ]'
 echo 3.8.53 > "$STUB/omniroute-version"
 mkdir -p "$OD"; : > "$OD/storage.sqlite"
-printf '%s\n' '[{"provider":"openai","name":"OpenAI","default_model":""},' '{"provider":"deepseek","name":"DeepSeek","default_model":"deepseek-chat"}]' > "$STUB/omniroute-rows"
+printf '%s\n' '[{"kind":"connection","provider":"openai","name":"OpenAI","default_model":"","auth_type":"apikey","no_log":1},' '{"kind":"connection","provider":"deepseek","name":"DeepSeek","default_model":"deepseek-chat","auth_type":"apikey","no_log":1},' '{"kind":"key","provider":"","name":"canon","default_model":"","auth_type":"","no_log":1}]' > "$STUB/omniroute-rows"
 : > "$STUB/sqlite.log"; bs --check; rc=$?
 check "omniroute row with OpenAI and DeepSeek only: ok, naming them" \
       eval 'rowis "$TMP/bs.out" "omniroute providers" ok && grep -q "deepseek openai; none Anthropic" "$TMP/bs.out" && [ "$rc" = "$rc_none" ]'
 check "... read with query_only first, selecting no key or token column" \
-      eval 'grep -qxF "sqlite3 -bail $OD/storage.sqlite" "$STUB/sqlite.log" && [ "$(sed -n 2p "$STUB/sqlite.log")" = "PRAGMA query_only=1;" ] && ! grep -Eq "api_key|access_token|refresh_token|id_token|provider_specific_data" "$STUB/sqlite.log"'
+      eval 'grep -qxF "sqlite3 -bail $OD/storage.sqlite" "$STUB/sqlite.log" && [ "$(sed -n 2p "$STUB/sqlite.log")" = "PRAGMA query_only=1;" ] && ! grep -Eq "(^|[^a-z_])api_key([^a-z_s]|\$)|key_hash|access_token|refresh_token|id_token|provider_specific_data" "$STUB/sqlite.log"'
 : > "$STUB/omniroute-rows"; bs --check
 check "omniroute row with an empty table: ok, no connections" \
       eval 'rowis "$TMP/bs.out" "omniroute providers" ok && grep -q "no connections; none Anthropic" "$TMP/bs.out"'
 for p in '"provider":"anthropic","name":"Anthropic","default_model":""' '"provider":"claude","name":"Claude Code","default_model":""' \
          '"provider":"anthropic-compatible-x","name":"Mine","default_model":""' '"provider":"openai-compatible-y","name":"Claude via a relay","default_model":""' \
          '"provider":"openrouter","name":"OpenRouter","default_model":"anthropic/claude-sonnet"'; do
-  echo "[{\"provider\":\"openai\",\"name\":\"OpenAI\",\"default_model\":\"\"},{$p}]" > "$STUB/omniroute-rows"
+  echo "[{\"kind\":\"connection\",\"provider\":\"openai\",\"name\":\"OpenAI\",\"default_model\":\"\",\"auth_type\":\"apikey\"},{\"kind\":\"connection\",\"auth_type\":\"apikey\",$p}]" > "$STUB/omniroute-rows"
   bs --check; rc=$?
   check "omniroute row with $p: FAILED, exit 1" eval 'rowis "$TMP/bs.out" "omniroute providers" FAILED && [ "$rc" != 0 ]'
 done
+# API keys only, never a sign-in, and every key no-log (ADR 0056)
+echo '[{"kind":"connection","provider":"codex","name":"Codex ","default_model":"","auth_type":"oauth","no_log":1}]' > "$STUB/omniroute-rows"; bs --check; rc=$?
+check "omniroute row with a sign-in (oauth) connection: FAILED, naming it, exit 1" \
+      eval 'rowis "$TMP/bs.out" "omniroute providers" FAILED && grep -q "codex (oauth)" "$TMP/bs.out" && [ "$rc" != 0 ]'
+echo '[{"kind":"connection","provider":"openai","name":"OpenAI","default_model":"","auth_type":"apikey","no_log":1},{"kind":"key","provider":"","name":"made in the dashboard","default_model":"","auth_type":"","no_log":0}]' > "$STUB/omniroute-rows"; bs --check; rc=$?
+check "omniroute row with an API key that logs bodies: FAILED, naming it, exit 1" \
+      eval 'rowis "$TMP/bs.out" "omniroute providers" FAILED && grep -q "made in the dashboard" "$TMP/bs.out" && [ "$rc" != 0 ]'
 echo 'not json' > "$STUB/omniroute-rows"; bs --check; rc=$?
 check "omniroute table read that is not JSON: UNKNOWN, exit 1, never a silent none" \
       eval 'rowis "$TMP/bs.out" "omniroute providers" UNKNOWN && [ "$rc" != 0 ]'
@@ -1586,6 +1593,223 @@ else
   mrun paper:remove windows extra; rc=$?
   check "mise run paper:remove windows extra: refused, nothing deleted" eval '[ "$rc" != 0 ] && [ ! -s "$KC/log" ]'
   rm -f "$KC"/find-*
+fi
+
+# ---------- the OmniRoute gateway tasks, against stand-ins (ADR 0056) ----------
+# Each task's own body from mise.gateway.toml, with /usr/bin/security swapped for a stand-in (exit status per
+# verb and account in $GW/<find|add|delete>-<account>, 44 by default; `add` keeps the value, which `find -w`
+# prints back) and, except where the real curl is the point, /usr/bin/curl swapped for a stand-in gateway
+# (answers per path in $GW/api/<name>, every request logged), and an omniroute stand-in that records the
+# environment and arguments it was started with. No gateway is installed or started and no keychain is read.
+# Claims of second readers (Codex, Antigravity) and the review: curl's proxy settings and curlrc could send a
+# key elsewhere or write it to a trace file; a caller's ports, host or other variables could reach the
+# gateway; a REQUIRE_API_KEY override stored in its database turns the key off whatever the environment says.
+echo "gateway tasks:"
+GW="$TMP/gw"; mkdir -p "$GW/bin" "$GW/home" "$GW/api"
+cat > "$GW/security" <<'EOF'
+#!/bin/bash
+echo "security $*" >> "$GW/log"
+case "${1:-}" in
+  find-generic-password) v=find ;;
+  delete-generic-password) v=delete ;;
+  -i) read -r _ _ acct _ _ _ _ _ hex; cat > /dev/null; echo "security -i: add $acct" >> "$GW/log"
+      rc=$(cat "$GW/add-$acct" 2>/dev/null || echo 0)
+      [ "$rc" = 0 ] && { printf '%b' "$(printf '%s' "$hex" | sed 's/../\\x&/g')" > "$GW/val-$acct"; echo 0 > "$GW/find-$acct"; }
+      exit "$rc" ;;
+  *) exit 1 ;;
+esac
+w=0; while [ $# -gt 0 ]; do [ "$1" = -a ] && acct="$2"; [ "$1" = -w ] && w=1; shift; done
+rc=$(cat "$GW/$v-${acct:-}" 2>/dev/null || echo 44)
+[ "$v" = delete ] && [ "$rc" = 0 ] && rm -f "$GW/val-$acct" "$GW/find-$acct"
+[ "$rc" = 0 ] && [ "$w" = 1 ] && { cat "$GW/val-$acct" 2>/dev/null || echo "made-up-$acct"; }
+exit "$rc"
+EOF
+# The stand-in gateway: logs the arguments and the input of each request; answers from $GW/api/<name>, a
+# body line and a status line, where <name> is the path's last part (chat for the inference probe, which
+# answers 400 to the key $GW/minted names and 401 to any other unless $GW/api/chat says otherwise).
+cat > "$GW/curl" <<'EOF'
+#!/bin/bash
+echo "curl $*" >> "$GW/curl.log"; in=$(cat); printf '%s\n' "$in" >> "$GW/curl.in"
+url="${*: -1}"; name=${url##*/}; [ "$name" = completions ] && name=chat
+w=0; for a in "$@"; do [ "$a" = "-o" ] && w=1; done
+if [ -f "$GW/api/$name" ]; then body=$(sed -n 1p "$GW/api/$name"); code=$(sed -n 2p "$GW/api/$name")
+elif [ "$name" = chat ]; then body=""; if [ -s "$GW/minted" ] && grep -qF "$(cat "$GW/minted")" <<<"$in"; then code=400; else code=401; fi
+else body=""; code=404; fi
+if [ "$w" = 1 ]; then printf '%s' "$code"; else printf '%s\n%s' "$body" "$code"; fi
+EOF
+# serve starts it under env -i, so the folder it writes to is written into it here
+printf '#!/bin/bash\nGW=%q\n' "$GW" > "$GW/bin/omniroute"
+cat >> "$GW/bin/omniroute" <<'EOF'
+{ echo "args=$*"; for v in API_PORT DASHBOARD_PORT API_HOST OMNIROUTE_SERVER_HOST REQUIRE_API_KEY OMNIROUTE_DISABLE_CLI_TOKEN \
+    STORAGE_ENCRYPTION_KEY INITIAL_PASSWORD NODE_OPTIONS HTTPS_PROXY NODE_EXTRA_CA_CERTS PORT CLOUD_URL; do echo "$v=${!v-<unset>}"; done; } > "$GW/omniroute.env"
+EOF
+chmod +x "$GW/security" "$GW/curl" "$GW/bin/omniroute"
+export GW
+gw_body() { # gw_body <task> [real-curl]: its run body from mise.gateway.toml with the stand-ins swapped in
+  local body; body=$(awk -v q="'''" -v hdr="[tasks.\"$1\"]" '$0 == hdr {t=1; next} /^\[/ {t=0} t && $0 == "run = " q {b=1; next} b && $0 == q {exit} b' "$ROOT/mise.gateway.toml")
+  body=${body//\/usr\/bin\/security/$GW/security}
+  [ "${2:-}" = real-curl ] || body=${body//\/usr\/bin\/curl/$GW/curl}
+  printf '%s' "$body"
+}
+gw_run() { # gw_run <task> [VAR=value ...]: the body with HOME in the temp folder; output in $GW/out
+  local t="$1" body; shift; body=$(gw_body "$t")
+  [ -n "$body" ] || { echo "no body" > "$GW/out"; return 99; }
+  rm -f "$GW/omniroute.env"; : > "$GW/log"; : > "$GW/curl.log"; : > "$GW/curl.in"
+  env HOME="$GW/home" PATH="$GW/bin:$PATH" "$@" bash -c "$body" > "$GW/out" 2>&1
+}
+gw_reset() { rm -f "$GW"/find-* "$GW"/add-* "$GW"/delete-* "$GW"/val-* "$GW"/api/* "$GW/minted"; }
+
+# omniroute:store: no prompt; the key made, stored, read back; refused over a database or a failed check
+gw_reset; gw_run omniroute:store; rc=$?
+check "omniroute:store: no prompt, the storage key stored and read back, never shown, exit 0" \
+      eval '[ "$rc" = 0 ] && grep -q "security -i: add STORAGE_ENCRYPTION_KEY" "$GW/log" && [ -s "$GW/val-STORAGE_ENCRYPTION_KEY" ] && ! grep -qF "$(cat "$GW/val-STORAGE_ENCRYPTION_KEY")" "$GW/out"'
+gw_reset; echo 36 > "$GW/find-STORAGE_ENCRYPTION_KEY"; gw_run omniroute:store; rc=$?
+check "... a check security cannot answer (exit 36): refused, nothing added or deleted, exit 1" \
+      eval '[ "$rc" = 1 ] && grep -q "security exit 36" "$GW/out" && ! grep -Eq "security (-i|delete)" "$GW/log"'
+gw_reset; echo 1 > "$GW/add-STORAGE_ENCRYPTION_KEY"; echo 36 > "$GW/delete-STORAGE_ENCRYPTION_KEY"; gw_run omniroute:store; rc=$?
+check "... storing failed and its removal refused: said, not 'nothing kept', exit 1" \
+      eval '[ "$rc" = 1 ] && grep -q "removing what was stored failed too (security exit 36)" "$GW/out" && ! grep -q "nothing kept" "$GW/out"'
+gw_reset
+# omniroute:remove and omniroute:check: an error is never read as absent or removed
+echo 0 > "$GW/delete-STORAGE_ENCRYPTION_KEY"; echo 36 > "$GW/delete-OMNIROUTE_API_KEY"; gw_run omniroute:remove; rc=$?
+check "omniroute:remove, a deletion refused (exit 36): said, not 'was not there', exit 1" \
+      eval '[ "$rc" = 1 ] && grep -q "OMNIROUTE_API_KEY: could not be removed (security exit 36)" "$GW/out" && grep -q "STORAGE_ENCRYPTION_KEY: removed" "$GW/out"'
+gw_reset; echo 0 > "$GW/find-STORAGE_ENCRYPTION_KEY"; echo 36 > "$GW/find-OMNIROUTE_API_KEY"; gw_run omniroute:check; rc=$?
+check "omniroute:check, an item security cannot check: said, not absent, exit 2" \
+      eval '[ "$rc" = 2 ] && grep -q "OMNIROUTE_API_KEY: could not be checked (security exit 36)" "$GW/out"'
+gw_reset; echo 0 > "$GW/find-STORAGE_ENCRYPTION_KEY"; echo 0 > "$GW/find-OMNIROUTE_API_KEY"; gw_run omniroute:check; rc=$?
+check "... both there, the gateway answering a made-up key 401: running, key required, exit 0" \
+      eval '[ "$rc" = 0 ] && grep -q "its API key required" "$GW/out"'
+printf '\n200\n' > "$GW/api/chat"; gw_run omniroute:check; rc=$?
+check "... the gateway answering a made-up key 200: its key not required, exit 2" \
+      eval '[ "$rc" = 2 ] && grep -q "its API key is not required" "$GW/out"'
+gw_reset
+
+# omniroute:serve: only what it needs reaches the gateway
+echo 0 > "$GW/find-STORAGE_ENCRYPTION_KEY"; echo made-up-storage-key > "$GW/val-STORAGE_ENCRYPTION_KEY"
+gw_run omniroute:serve API_HOST=0.0.0.0 API_PORT=20129 DASHBOARD_PORT=20130 PORT=3000 NODE_OPTIONS=--inspect=0.0.0.0:9229 \
+       HTTPS_PROXY=http://127.0.0.1:9 NODE_EXTRA_CA_CERTS=/x.pem CLOUD_URL=https://cloud.example INITIAL_PASSWORD=x; rc=$?
+check "omniroute:serve, a caller's host, ports, NODE_OPTIONS, proxy, CA, Cloud URL and password: none reach the gateway" \
+      eval '[ "$rc" = 0 ] && grep -qx "API_PORT=20128" "$GW/omniroute.env" && grep -qx "DASHBOARD_PORT=20128" "$GW/omniroute.env" && grep -qx "API_HOST=127.0.0.1" "$GW/omniroute.env" && grep -qx "OMNIROUTE_SERVER_HOST=127.0.0.1" "$GW/omniroute.env" && [ "$(grep -cE "^(NODE_OPTIONS|HTTPS_PROXY|NODE_EXTRA_CA_CERTS|PORT|CLOUD_URL|INITIAL_PASSWORD)=<unset>$" "$GW/omniroute.env")" = 6 ]'
+check "... the storage key from the keychain, the API key required, the CLI token off, --port 20128 and --no-tray" \
+      eval 'grep -qx "STORAGE_ENCRYPTION_KEY=made-up-storage-key" "$GW/omniroute.env" && grep -qx "REQUIRE_API_KEY=true" "$GW/omniroute.env" && grep -qx "OMNIROUTE_DISABLE_CLI_TOKEN=true" "$GW/omniroute.env" && grep -q "^args=serve .*--no-tray" "$GW/omniroute.env" && grep -q "^args=serve .*--port 20128" "$GW/omniroute.env"'
+echo 36 > "$GW/find-STORAGE_ENCRYPTION_KEY"; gw_run omniroute:serve; rc=$?
+check "... a storage key security cannot read (exit 36): not started, not called absent, exit 1" \
+      eval '[ "$rc" = 1 ] && [ ! -e "$GW/omniroute.env" ] && grep -q "could not read the storage key" "$GW/out"'
+echo 0 > "$GW/find-STORAGE_ENCRYPTION_KEY"
+# A stored override, in OmniRoute's own key_value table (src/lib/db/featureFlags.ts at the pin), needs a
+# sqlite3 to make the stand-in database.
+if [ ! -x /usr/bin/sqlite3 ]; then
+  skip "omniroute:serve and stored overrides" "no /usr/bin/sqlite3 here"
+else
+  gdb="$GW/home/.omniroute/storage.sqlite"; mkdir -p "$GW/home/.omniroute"
+  gw_db() { rm -f "$gdb"; /usr/bin/sqlite3 "$gdb" "CREATE TABLE key_value (namespace TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (namespace, key)); $1"; }
+  gw_db "INSERT INTO key_value VALUES ('feature_flags','REQUIRE_API_KEY','false');"; gw_run omniroute:serve; rc=$?
+  check "omniroute:serve, a stored REQUIRE_API_KEY override of false: refused, the gateway not started, exit 1" \
+        eval '[ "$rc" = 1 ] && [ ! -e "$GW/omniroute.env" ] && grep -q "REQUIRE_API_KEY override" "$GW/out"'
+  gw_db "INSERT INTO key_value VALUES ('feature_flags','REQUIRE_API_KEY','true' || char(10) || 'x');"; gw_run omniroute:serve; rc=$?
+  check "... one with a newline in it, which OmniRoute reads as off: refused" eval '[ "$rc" = 1 ] && [ ! -e "$GW/omniroute.env" ]'
+  gw_db "INSERT INTO key_value VALUES ('feature_flags','REQUIRE_API_KEY',' TRUE '); INSERT INTO key_value VALUES ('settings','requireLogin','false');"; gw_run omniroute:serve; rc=$?
+  check "... ' TRUE ' (on, as OmniRoute reads it), and the login off by design: started" \
+        eval '[ "$rc" = 0 ] && [ -e "$GW/omniroute.env" ]'
+  gw_db ""; gw_run omniroute:serve; rc=$?
+  check "... no override stored: started" eval '[ "$rc" = 0 ] && [ -e "$GW/omniroute.env" ]'
+  rm -f "$gdb"; echo "not a database" > "$gdb"; gw_run omniroute:serve; rc=$?
+  check "... a database that cannot be read: refused, never read as no override, naming the way out, exit 1" \
+        eval '[ "$rc" = 1 ] && [ ! -e "$GW/omniroute.env" ] && grep -q "move that folder away" "$GW/out"'
+  rm -f "$gdb"
+fi
+gw_reset
+
+# omniroute:setup: login off, a no-log key minted into the keychain, nothing typed or shown
+printf '%s\n%s\n' '{"success":true}' 200 > "$GW/api/require-login"
+printf '%s\n%s\n' '{"key":"omr-made-by-stub-0123","id":"k1","noLog":true}' 201 > "$GW/api/keys"
+echo omr-made-by-stub-0123 > "$GW/minted"
+gw_run omniroute:setup; rc=$?
+check "omniroute:setup: login off, a key minted with noLog, stored and read back, accepted, exit 0" \
+      eval '[ "$rc" = 0 ] && grep -q "require-login" "$GW/curl.log" && grep -qF "\"requireLogin\": false" "$GW/curl.in" && grep -qF "\"noLog\": true" "$GW/curl.in" && [ "$(cat "$GW/val-OMNIROUTE_API_KEY" 2>/dev/null)" = omr-made-by-stub-0123 ]'
+check "... the key in no output and on no curl command line" \
+      eval '! grep -q omr-made-by-stub "$GW/out" && ! grep -q omr-made-by-stub "$GW/curl.log"'
+check "... every request is curl -q --noproxy to 127.0.0.1:20128" \
+      eval '[ -s "$GW/curl.log" ] && [ -z "$(grep -v "^curl -q --noproxy \* .*http://127.0.0.1:20128/" "$GW/curl.log")" ]'
+gw_run omniroute:setup; rc=$?
+check "... run again with the key there: none minted, exit 0" \
+      eval '[ "$rc" = 0 ] && grep -q "already in the login keychain" "$GW/out" && ! grep -q "/api/keys" "$GW/curl.log"'
+echo stale-key-from-an-old-database > "$GW/val-OMNIROUTE_API_KEY"; gw_run omniroute:setup; rc=$?
+check "... a stored key this gateway refuses (401): said, none minted, exit 1" \
+      eval '[ "$rc" = 1 ] && grep -q "not accepted by this gateway" "$GW/out" && ! grep -q "/api/keys" "$GW/curl.log" && ! grep -q stale-key "$GW/out"'
+gw_reset; printf '\n200\n' > "$GW/api/chat"; gw_run omniroute:setup; rc=$?
+check "omniroute:setup, a gateway that accepts a made-up key: refused before anything changes, exit 1" \
+      eval '[ "$rc" = 1 ] && ! grep -Eq "require-login|/api/keys" "$GW/curl.log"'
+gw_reset; printf '%s\n%s\n' '{"success":true}' 200 > "$GW/api/require-login"; echo 36 > "$GW/find-OMNIROUTE_API_KEY"
+gw_run omniroute:setup; rc=$?
+check "... the keychain check failing (exit 36): none minted, exit 1" \
+      eval '[ "$rc" = 1 ] && grep -q "security exit 36" "$GW/out" && ! grep -q "/api/keys" "$GW/curl.log"'
+gw_reset; printf '%s\n%s\n' '{"success":true}' 200 > "$GW/api/require-login"
+printf '%s\n%s\n' '{"key":"omr-made-by-stub-0123","id":"k1","noLog":false}' 201 > "$GW/api/keys"; printf '%s\n%s\n' '{}' 200 > "$GW/api/k1"
+gw_run omniroute:setup; rc=$?
+check "... a key the gateway does not confirm as no-log: revoked, none stored, exit 1" \
+      eval '[ "$rc" = 1 ] && grep -q "^curl .*-X DELETE .*/api/keys/k1" "$GW/curl.log" && ! grep -q "security -i" "$GW/log"'
+gw_reset
+
+# the real curl: a caller's proxy pointed at a stand-in that answers 200 to anything and a curlrc that writes
+# a trace; with no gateway on 20128, nothing may reach either and nothing changes. Skipped when anything
+# answers on 20128, so that a gateway running on this machine is never reached by setup's real body.
+if /usr/bin/curl -q --noproxy '*' -s -o /dev/null --max-time 2 http://127.0.0.1:20128/ 2>/dev/null; then
+  skip "omniroute:setup with the real curl" "something answers on 127.0.0.1:20128"
+else
+mkdir -p "$GW/curlhome"; printf 'trace-ascii = "%s"\n' "$GW/trace" > "$GW/curlhome/.curlrc"
+cat > "$GW/proxy.py" <<'EOF'
+import http.server, sys
+class H(http.server.BaseHTTPRequestHandler):
+    def answer(self):
+        with open(sys.argv[2], "a") as f: f.write(self.requestline + "\n" + str(self.headers))
+        self.send_response(200); self.end_headers()
+    do_GET = do_POST = answer
+    def log_message(self, *a): pass
+s = http.server.HTTPServer(("127.0.0.1", 0), H)
+open(sys.argv[1], "w").write(str(s.server_address[1])); s.serve_forever()
+EOF
+: > "$GW/proxy.log"; "$TOML_PY" -I "$GW/proxy.py" "$GW/proxy.port" "$GW/proxy.log" & ppid=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s "$GW/proxy.port" ] && break; sleep 0.3; done
+pp="http://127.0.0.1:$(cat "$GW/proxy.port" 2>/dev/null)"
+sbody=$(gw_body omniroute:setup real-curl); rm -f "$GW/trace"; : > "$GW/log"
+env HOME="$GW/home" CURL_HOME="$GW/curlhome" http_proxy="$pp" HTTP_PROXY="$pp" ALL_PROXY="$pp" all_proxy="$pp" NO_PROXY= no_proxy= \
+  bash -c "$sbody" > "$GW/out" 2>&1; rc=$?
+kill "$ppid" 2>/dev/null; wait "$ppid" 2>/dev/null
+check "omniroute:setup with the real curl, a caller's proxy and a curlrc trace: neither reached, nothing changed, exit 1" \
+      eval '[ "$rc" = 1 ] && [ -s "$GW/proxy.port" ] && [ ! -s "$GW/proxy.log" ] && [ ! -e "$GW/trace" ] && ! grep -q "security -i" "$GW/log"'
+fi
+
+# omniroute:provider: Anthropic refused before any prompt; a key typed on a pseudo-terminal goes on curl's input
+gw_run omniroute:provider usage_provider=anthropic; rc=$?
+check "omniroute:provider anthropic: refused before any prompt, nothing sent, exit 1" \
+      eval '[ "$rc" = 1 ] && grep -q "never routed" "$GW/out" && [ ! -s "$GW/curl.log" ]'
+if [ ! -x /usr/bin/expect ] || ! /usr/bin/expect -c 'spawn -noecho true; expect eof' >/dev/null 2>&1; then
+  skip "omniroute:provider on a terminal" "no /usr/bin/expect that can open a pseudo-terminal here"
+else
+  cat > "$GW/prov.exp" <<'EOF'
+set timeout 20
+proc finish {} { lassign [wait] pid sid oserr value; exit $value }
+spawn -noecho bash -c $env(GW_BODY)
+expect {
+  "(hidden): " { send -- "sk-MADEUPPROVIDERKEY\r" }
+  timeout { puts "\n<<no prompt>>"; exit 98 }
+  eof { finish }
+}
+expect {
+  timeout { puts "\n<<no end>>"; exit 98 }
+  eof { finish }
+}
+EOF
+  gw_reset; printf '%s\n%s\n' '{"connection":{"id":"c1"}}' 201 > "$GW/api/providers"; printf '%s\n%s\n' '{"valid":true,"error":null}' 200 > "$GW/api/test"
+  : > "$GW/curl.log"; : > "$GW/curl.in"
+  env HOME="$GW/home" usage_provider=openai GW_BODY="$(gw_body omniroute:provider)" /usr/bin/expect -f "$GW/prov.exp" > "$GW/out" 2>&1; rc=$?
+  check "omniroute:provider openai: the key on curl's input as apiKey, tested valid, exit 0" \
+        eval '[ "$rc" = 0 ] && grep -qF "\"apiKey\":\"sk-MADEUPPROVIDERKEY\"" "$GW/curl.in" && grep -qF "\"provider\":\"openai\"" "$GW/curl.in" && grep -q "/api/providers/c1/test" "$GW/curl.log"'
+  check "... the key on no command line and not on the terminal after the prompt, the spend-limit advice shown" \
+        eval '! grep -q MADEUPPROVIDERKEY "$GW/curl.log" && [ "$(grep -c MADEUPPROVIDERKEY "$GW/out")" = 0 ] && grep -q "spend limit" "$GW/out"'
+  gw_reset
 fi
 
 # ---------- paper:store on a terminal, against the real security ----------

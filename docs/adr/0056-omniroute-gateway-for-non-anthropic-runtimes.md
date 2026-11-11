@@ -9,8 +9,9 @@ review-by: 2026-12-10
 
 ## Context and Problem Statement
 
-The owner wants more GPT-powered and other runtimes, reached through one local gateway, OmniRoute, with one
-rule (2026-11-10): "we dont route anthropic, only gpt and others ... claude stay native". OmniRoute will hold
+The owner wants more GPT-powered and other runtimes, reached through one local gateway, OmniRoute, and
+decided on 2026-11-10 that it carries GPT and other providers only, never Anthropic: Claude stays native.
+OmniRoute will hold
 provider credentials. How is it pinned, installed, run and configured, and what holds the rule?
 
 ## Decision Drivers
@@ -42,14 +43,15 @@ Chosen: **option 2**, on the owner's instruction.
    identity, headers, field order) and "There is no raw or transparent mode for this path"; the request
    for one (#13893) was closed "not planned" on 2026-10-10. A second issue,
    opened by the maintainer from two relayed reports, has Team/Max accounts banned about a minute after
-   connecting. `scripts/bootstrap --check` fails when a connection's provider, name or default model says
-   Anthropic or Claude: it reads the `provider_connections` table OmniRoute's `providers list` reads, with
+   connecting. `scripts/bootstrap --check` fails when a connection's provider, labels or default model says
+   Anthropic or Claude, when a connection is not an API key, and when an API key is not no-log: it reads the
+   `provider_connections` table OmniRoute's `providers list` reads and `api_keys`, with
    Apple's `sqlite3` under `PRAGMA query_only`, selecting no key column (OmniRoute's CLI would open the
    database for writing and read a `.env` from its working folder). A Claude model reached otherwise (a
    combo, an alias, Bedrock or Vertex) is held by this rule, not by the check.
 2. **The pin, installed only on request**: `omniroute` `tag:v3.8.53` (`191dce8d534c`), `npm:omniroute` in
    mise's `gateway` config environment, `mise.gateway.toml`, locked with its dependency graph in
-   `mise.gateway.lock` and `.mise/locks/mise.gateway/`; the owner installs it with `mise -E gateway install
+   `mise.gateway.lock` and `.mise/locks/mise.gateway/`; it is installed with `mise -E gateway install
    --locked npm:omniroute`. A plain `mise install`, `scripts/bootstrap --install` and hosted CI read only
    `mise.toml`, so none installs it (ADR 0043's reason for keeping Codex out of `mise.toml`). The lint reads
    `mise.toml` alone, so the entry has no `mise` field; `scripts/test-lanes` holds the environment's version
@@ -60,29 +62,49 @@ Chosen: **option 2**, on the owner's instruction.
    maintainer's 2FA approval, later releases do not (the publish workflow's new default). Two versions are
    exempted by name: 3.8.53, its provenance read, and the dependency `@pierre/theme@1.1.0`, whose new
    publisher gave none. mise's guide says to exempt "After reviewing such a dependency" (tarball,
-   publisher); that one was not reviewed further, a departure stated here. 3.8.53 is also the first
-   release built from the renamed repository, under a new trusted-publisher configuration; the
-   organisation was created 2026-08-25 and lists no public members; npm's maintainer is unchanged.
-3. **Its settings, fixed in `mise -E gateway run omniroute:serve`** (sources in Evidence), which its `.env` loading
-   never overrides: `OMNIROUTE_SERVER_HOST=127.0.0.1`, `REQUIRE_API_KEY=true`, `ENABLE_REQUEST_LOGS=false`,
+   publisher); that one was not reviewed further, a departure stated here. 3.8.53 is the first release
+   built after the repository moved: it is the same repository and the same maintainer, transferred to a
+   new organisation, `cheaper-inference`, created 2026-08-25, whose members are not public. GitHub redirects
+   `diegosouzapw/OmniRoute` there with the same repository id, not a fork; the same account made every
+   release from 3.8.49 to 3.8.53; npm's maintainer is unchanged; no statement by the project on the move was
+   found. 3.8.50, the last release with the approval, was not chosen: it lacks 3.8.51's and 3.8.52's
+   authentication and credential-export fixes, and provenance is intact on every release.
+3. **Its settings, fixed in `mise -E gateway run omniroute:serve`** (sources in Evidence), which clears every
+   exported variable but a few before it starts it, so nothing of the caller's environment (a proxy, `NODE_OPTIONS`, a CA
+   bundle, a port) reaches it, and which its `.env` loading never overrides: `OMNIROUTE_SERVER_HOST` and
+   `API_HOST` at 127.0.0.1, one port (`--port 20128`, `API_PORT` and `DASHBOARD_PORT` equal: ports that
+   differ start a second, API-only listener, `apiBridgeServer.ts`), `--no-tray`, `REQUIRE_API_KEY=true`,
+   `OMNIROUTE_DISABLE_CLI_TOKEN=true`, `ENABLE_REQUEST_LOGS=false`,
    both update-check switches, `ARENA_ELO_SYNC_ENABLED=false`, `OPENROUTER_PROVIDER_STATS_ENABLED=false`,
    Cloud Sync unset (`cloudSync.ts` reads "off" as off, but the start-up check in `runtimeEnv.ts` refuses
    any value that is not an http URL), no package `.env` (with `CHANGEME`) read,
-   and a key file in the data folder stops the start. The storage key, which encrypts each stored credential
-   (AES-256-GCM), is made by `omniroute:store` and read from the login keychain into that task alone; the
-   dashboard password, typed there at a hidden prompt, is passed only while no database exists, so a fresh
-   start has no setup window. The interception feature needs a sudo password typed in its dashboard to touch
-   the trust store; nothing here starts it.
+   and a key file in the data folder stops the start. OmniRoute applies a `REQUIRE_API_KEY` override stored
+   in its database over the environment, with no setting to reverse that (`featureFlags.ts`), so the task
+   refuses to start on one that turns it off. Nothing is typed but the provider's key: `omniroute:store`
+   makes the storage key (AES-256-GCM over each stored credential) with openssl into the login keychain, and
+   serve reads it into the gateway alone; with the gateway running, `omniroute:setup` turns the dashboard
+   login off through OmniRoute's own skip-password route and mints the gateway's API key with `noLog`
+   through `POST /api/keys`, straight into the keychain. The owner decided on 2026-11-11 that the dashboard
+   opens without a password; the cost: any local process or account on this machine can open the dashboard
+   and export the stored provider keys (`operatorCredential.ts`, login off). Every task reaches the gateway
+   with `/usr/bin/curl -q --noproxy '*'` (no curlrc, no proxy), and asks whether the key is required with a
+   made-up key on an inference route, since `GET /v1/models` follows the login, not `REQUIRE_API_KEY`
+   (`docs/reference/ENVIRONMENT.md`). The interception feature needs a sudo password typed in its dashboard
+   to touch the trust store; nothing here starts it.
 4. **Started on demand, not as an agent.** OmniRoute's macOS `autostart` writes a LaunchAgent that runs
    `serve` with no environment, so its settings and key would come from a file. `scripts/automation` is not
    changed.
 5. **Codex reaches it by Codex's own provider configuration**, `mise -E gateway run omniroute:codex`: `-c` overrides
    (`model_provider`, `base_url`, `wire_api = "responses"`), so `~/.codex/config.toml` is untouched, and the
-   gateway's key through Codex's documented `auth.command`, which runs `security` and reads the key from its
-   stdout. OmniRoute's own guide uses `env_key` instead; a command keeps the key out of every environment.
+   gateway's key (the one `omniroute:setup` minted) through Codex's documented `auth.command`, which runs
+   `security` and reads the key from its stdout. OmniRoute's own guide uses `env_key` instead; a command
+   keeps the key out of every environment and every file.
    A Codex Orca starts takes the same `-c` arguments in that agent's Orca settings (UNVERIFIED).
-6. **Which provider credential goes in is the owner's choice and step**, through OmniRoute's dashboard. For
-   an OpenAI API key: OpenAI calls API keys "the recommended default for automation" and for "programmatic
+6. **Provider API keys only, never a sign-in, entered by the owner** (decided 2026-11-11) at
+   `omniroute:provider <id>`'s hidden prompt, which registers it through `POST /api/providers` (an API-key
+   connection always) and tests it; a key made for the gateway alone with a spend limit at the provider is
+   cheap to revoke. An OAuth login would also open a listener on every interface while it waits
+   (`src/lib/oauth/utils/server.ts`, hard-coded). For an OpenAI API key: OpenAI calls API keys "the recommended default for automation" and for "programmatic
    Codex CLI workflows", billed at API rates; the maintainer rates API-key providers "Low risk". For a
    ChatGPT or Codex subscription login: the maintainer rates it "Higher risk", "technically outside the
    intended use case", and "For casual/personal use, OAuth providers like Codex are generally fine if you
@@ -90,7 +112,7 @@ Chosen: **option 2**, on the owner's instruction.
    maintainer answers there is "always a higher risk of bans". OpenAI's auth page has Codex sign in "with
    ChatGPT or an API key" behind "an LLM proxy server" (`requires_openai_auth`), and says nothing of a
    third-party gateway holding the ChatGPT login; OpenAI's Terms of Use could not be read (403).
-   This record gives no legal opinion and makes no choice.
+   This record gives no legal opinion.
 7. **What a runtime started through it may do is unchanged**: what that runtime's own records allow, reading
    and reporting under ADR 0043 and ADR 0045 and building under ADR 0058's terms. The gateway grants
    nothing of its own.
@@ -107,9 +129,22 @@ measure that keeps or retires it, whichever provider its model comes from.
   is the project's claim; no independent review was found. At start-up it asks the npm registry and
   GitHub's API for the latest versions of the CLIs it imitates (`claudeCodeClient.ts`, `codexClient.ts`,
   `geminiCliClient.ts` and others); per-CLI version overrides exist, untested as a way to stop that. Call
-  metadata stays in its database (its clean-up logs 90 days), request bodies too unless the API key is made
-  with no-log; app logs in `~/.omniroute/logs/application/` (50 MB a file, 20 files, 7 days). Releases are
+  metadata stays in its database (its clean-up logs 90 days); app logs in `~/.omniroute/logs/application/` (50 MB a file, 20 files, 7 days). Releases are
   large (1,162 commits in 3.8.53) and no longer carry the maintainer's approval.
+* Known limits, from two further readers (Codex, Antigravity, 2026-11-10) and the review of the fixes,
+  read against the pin on 2026-11-11. With no setting to close them: a `REQUIRE_API_KEY` override made while
+  the gateway runs applies within seconds, and serve refuses it only at the next start; an OAuth login
+  listens on `0.0.0.0` (rule 6 keeps sign-ins out). Closed by settings above: the loopback CLI token's
+  export route (`OMNIROUTE_DISABLE_CLI_TOKEN`), though with login off any local caller has that reach anyway,
+  and a process of this user could write its own password hash into the unencrypted database; prompt and
+  response bodies under `call_logs/`, which `ENABLE_REQUEST_LOGS` does not govern, kept out by a no-log key
+  only (`docs/security/COMPLIANCE.md`; minted so, and checked). The storage key is in the server's
+  environment; `ps eww` from another process of the same user did not show a made-up variable on macOS
+  27.2 (run). In the wrapper: the provider check does not read `provider_nodes` base URLs or Claude-only
+  gateway providers; the version row reads any failure of `mise where` (an untrusted worktree, another
+  version installed) as absent; a gateway task run with the package absent lets mise install it unlocked
+  (`task.run_auto_install`); a caller's `MISE_ENV=gateway` reaches `scripts/bootstrap --install` and
+  `scripts/ci`.
 * Leaving: delete the entry, the pin, `mise.gateway.toml`, `mise.gateway.lock`, `.mise/locks/mise.gateway/`,
   the bootstrap rows and the lines in `AGENTS.md`, `README.md` and `docs/architecture.md`; `mise -E gateway
   run omniroute:remove`; delete `~/.omniroute` (the owner's).
@@ -150,8 +185,8 @@ UNVERIFIED: anything with a provider credential (the second trial below); what e
 asks for; that the telemetry claim holds with providers connected; a connection shorter than the sampling
 interval; Codex through Orca; the call-log retention a key without no-log gets.
 
-The second trial, the owner's, after `omniroute:store`, `omniroute:serve`, a provider key in the dashboard
-and a no-log API key there stored by `omniroute:store-key`: in a new empty folder, `mise -E gateway
+The second trial, after `omniroute:store`, `omniroute:serve`, `omniroute:setup` and the owner's
+`omniroute:provider <id>`: in a new empty folder, `mise -E gateway
 run omniroute:codex -- exec --ephemeral --skip-git-repo-check -s read-only "Reply with the word ok"` from the
 checkout. Look at: the answer; `scripts/bootstrap --check` (`omniroute providers` ok, no Anthropic); `lsof
 -nP -i -a -p <server pid>` during the request (loopback and the provider's own host only); the dashboard's
@@ -238,10 +273,47 @@ clone of the tag unless named otherwise (`read`).
   page's proxy line, the Anthropic and maintainer quotes, the mise review wording, the sampling rate and
   the trial's settings, and found the untried per-CLI overrides, `runtimeEnv.ts`, `secrets.ts`, #13893 and
   the organisation's age; all above.
-* Installation held, 2026-11-11: rule 2's install step is not to be run, and the owner installs nothing of
-  OmniRoute, until three questions have answers. Why npm's provenance names `diegosouzapw/OmniRoute` for
-  3.8.51 and `cheaper-inference/OmniRoute` for 3.8.53 (a transfer, a fork or a new owner); which pin, 3.8.50
-  (the last with npm's staged-publish approver) or a newer one under exemptions; and whether a documented
-  setting closes what two further readers (Codex, Antigravity) found in OmniRoute itself after landing: a
-  loopback CLI token that can export decrypted provider credentials, and prompt and response bodies written
-  under `call_logs/` although `ENABLE_REQUEST_LOGS=false` (read, not yet reproduced).
+* Installation decided, 2026-11-11: the owner decided to install OmniRoute as the management gateway for
+  future runtimes, SDKs and actions, knowing of the repository's transfer, on 3.8.53 with its two
+  exemptions (rule 2). It had been held earlier that day until the transfer, the pin and the readers'
+  findings had answers; those are rule 2, rule 3 and Consequences. The package from the no-credential trial
+  is on disk, so the bootstrap's `omniroute` row reads ok, and says it reports the package, not a
+  configured or running gateway.
+* https://api.github.com/repos/diegosouzapw/OmniRoute and https://github.com/diegosouzapw/OmniRoute: 301 to
+  repository 1157102282 and to `cheaper-inference/OmniRoute`; that repository: created 2026-02-13, not a
+  fork; https://api.github.com/orgs/cheaper-inference: created 2026-08-25, no public members; the releases
+  `v3.8.49` to `v3.8.53`: each made by `diegosouzapw`; a search of its README, CHANGELOG, issues and
+  discussions for a statement on the move found none (fetched through `gh`, 2026-11-11).
+  https://registry.npmjs.org/omniroute and its attestations: `_npmUser` the GitHub Actions OIDC publisher
+  for 3.8.49 to 3.8.53, the approver present for 3.8.49 and 3.8.50 only, provenance naming
+  `diegosouzapw/OmniRoute` up to 3.8.52 and `cheaper-inference/OmniRoute` for 3.8.53 (fetched). CHANGELOG at
+  the tag: 3.8.51's security items and 3.8.52's GHSA fixes, among them credential export and require-login
+  made operator-only and an authentication bypass through uppercase paths (read).
+* OmniRoute at `tag:v3.8.53` (`191dce8d534c`), cloned at the tag and read 2026-11-11:
+  `src/lib/apiBridgeServer.ts` (a second listener on `API_HOST`, default loopback, whenever `API_PORT` and
+  `DASHBOARD_PORT` differ), `src/lib/runtime/ports.ts`, `bin/cli/commands/serve.mjs` (its ports, `--port`,
+  `--no-tray` and the saved tray preference), `src/shared/utils/featureFlags.ts` ("DB override >
+  process.env"), `requireApiKeyValue.mjs`, `src/shared/utils/apiAuth.ts`, `src/lib/db/featureFlags.ts` and
+  `settings.ts` (the `key_value` rows), `src/lib/auth/managementPassword.ts`,
+  `src/lib/middleware/cliTokenAuth.ts`, `src/server/authz/peerContext.ts`, `docs/security/CLI_TOKEN.md`,
+  `src/app/api/settings/export-json/route.ts`, `src/lib/usage/callLogs.ts`, `src/lib/compliance/noLog.ts`,
+  `open-sse/handlers/chatCore.ts`, `docs/security/COMPLIANCE.md`, `src/lib/oauth/utils/server.ts` (read).
+* curl(1): `-q` "If used as the first parameter on the command line, the curlrc config file is not read or
+  used"; `--noproxy` with "*" "effectively disables the proxy" (bundled).
+* The setup and provider routes at the pin (read 2026-11-11): `src/app/api/settings/require-login/route.ts`
+  (no password yet: the write is allowed; loopback is exempt in `apiAuth.ts`), `src/app/api/keys/route.ts`
+  (201 with `key`, `noLog` honoured) and `keys/[id]/route.ts` (`DELETE`), `src/app/api/providers/route.ts`
+  (`authType: "apikey"`, `isActive: false` until tested), `providers/[id]/test/route.ts` (`valid`),
+  `src/lib/api/operatorCredential.ts` (`open_instance` with login off), `docs/reference/ENVIRONMENT.md`
+  ("This flag does not gate `GET /v1/models`").
+* `scripts/test-lanes`, the gateway task cases, 2026-11-11: on the first fixes, seven of ten failed on the
+  tasks as they were (ports and API_HOST inherited, stored overrides started, the store-key probe through a
+  caller's proxy); with the tasks as they are now, every case passes, among them the real curl under a
+  caller's proxy and curlrc reaching neither, a key minted no-log and read back, and the provider key on
+  curl's input alone (run).
+* Second reader (`evidence-verifier`), 2026-11-11, on the first fixes: it upheld them, and corrected the CLI
+  token line (the setting closes one route, not a same-user process, which can write the unencrypted
+  database), the five-second override lag and the test line's causes; all above. `/code-review` (high),
+  2026-11-11: the made-up key had gone to `GET /v1/models`, which `REQUIRE_API_KEY` does not gate; the
+  caller's `NODE_OPTIONS`, proxy and CA reached the gateway; keychain errors read as absent; a newline
+  could pass the override check; curl from `PATH`; and smaller ones: all fixed above.
