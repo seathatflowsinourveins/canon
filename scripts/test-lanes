@@ -1682,21 +1682,29 @@ EOF
   drun() { : > "$KC/log"; rm -f "$DT/ran"; (cd "$DT" && env -i HOME="$HOME" KC="$KC" MISE_CEILING_PATHS="$MTP" MISE_TRUSTED_CONFIG_PATHS="$DT" PATH="$DT/bin:/usr/bin:/bin" "$LMISE" run paper:data "$@") > "$DT/out" 2>&1 < /dev/null; }
   check "the paper:data test folder holds that task alone, its locks moved and its stream wait shortened" \
         eval '[ "$(grep -c "^\[tasks\." "$DT/mise.toml")" = 1 ] && ! grep -q getconf "$DT/mise.toml" && grep -q "^lockwait=2$" "$DT/mise.toml" && grep -q "^env.CANON_ALPACA_DATA_ONLY = \"1\"$" "$DT/mise.toml"'
-  drun sandbox --minutes 3; rc=$?
-  check "mise run paper:data sandbox --minutes 3: account A's pair only, the sandbox node with data-only set, under the stream lock" \
-        eval '[ "$rc" = 0 ] && grep -qx "args: run --locked python -m canon_trading.sandbox_node --minutes 3" "$DT/ran" && grep -qx "data-only: 1" "$DT/ran" && grep -qx "stream lock held: 75" "$DT/ran" && [ "$(grep -c "^security find-generic-password -s canon-alpaca-paper -a ALPACA_.* -w$" "$KC/log")" = 2 ] && ! grep -q "$WS" "$KC/log"'
+  # the run itself takes the stream lock with lockf(1) and bounds uv with timeout(1), at /usr/bin as macOS
+  # has them, so those two cases skip where they are absent (GitHub's Ubuntu), as the window's cases do
+  if [ ! -x /usr/bin/lockf ] || [ ! -x /usr/bin/timeout ]; then
+    skip "mise run paper:data sandbox, its stream lock taken and held" "no /usr/bin/lockf or /usr/bin/timeout here (macOS only)"
+  else
+    drun sandbox --minutes 3; rc=$?
+    check "mise run paper:data sandbox --minutes 3: account A's pair only, the sandbox node with data-only set, under the stream lock" \
+          eval '[ "$rc" = 0 ] && grep -qx "args: run --locked python -m canon_trading.sandbox_node --minutes 3" "$DT/ran" && grep -qx "data-only: 1" "$DT/ran" && grep -qx "stream lock held: 75" "$DT/ran" && [ "$(grep -c "^security find-generic-password -s canon-alpaca-paper -a ALPACA_.* -w$" "$KC/log")" = 2 ] && ! grep -q "$WS" "$KC/log"'
+  fi
   drun quotes; rc=$?
   check "mise run paper:data quotes: refused, not built yet (ADR 0066), nothing run" \
         eval '[ "$rc" = 1 ] && grep -q "not built yet (ADR 0066); nothing was run" "$DT/out" && [ ! -e "$DT/ran" ]'
   drun pytest; rc=$?
   check "mise run paper:data pytest: a module not on the list is refused by mise before the script runs" \
         eval '[ "$rc" != 0 ] && grep -q "Invalid choice for arg module: pytest" "$DT/out" && [ ! -e "$DT/ran" ] && [ ! -s "$KC/log" ]'
-  /usr/bin/lockf -k "$DT/locks/canon-alpaca-stream.lock" sleep 30 & hp=$!
-  for _ in $(seq 50); do /usr/bin/lockf -k -t 0 "$DT/locks/canon-alpaca-stream.lock" true 2>/dev/null || break; sleep 0.1; done
-  drun sandbox; rc=$?
-  kill "$hp" 2>/dev/null; wait "$hp" 2>/dev/null
-  check "mise run paper:data sandbox while another run holds the stream lock: waits its 2 s, fails, nothing run" \
-        eval '[ "$rc" = 1 ] && grep -q "stream lock stayed held for 2 s; nothing was run" "$DT/out" && [ ! -e "$DT/ran" ]'
+  if [ -x /usr/bin/lockf ] && [ -x /usr/bin/timeout ]; then
+    /usr/bin/lockf -k "$DT/locks/canon-alpaca-stream.lock" sleep 30 & hp=$!
+    for _ in $(seq 50); do /usr/bin/lockf -k -t 0 "$DT/locks/canon-alpaca-stream.lock" true 2>/dev/null || break; sleep 0.1; done
+    drun sandbox; rc=$?
+    kill "$hp" 2>/dev/null; wait "$hp" 2>/dev/null
+    check "mise run paper:data sandbox while another run holds the stream lock: waits its 2 s, fails, nothing run" \
+          eval '[ "$rc" = 1 ] && grep -q "stream lock stayed held for 2 s; nothing was run" "$DT/out" && [ ! -e "$DT/ran" ]'
+  fi
   rm -f "$KC"/read-* "$KC"/value-*
 fi
 
