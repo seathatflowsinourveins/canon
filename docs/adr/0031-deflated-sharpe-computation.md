@@ -97,8 +97,9 @@ checkout.
 * https://www.davidhbailey.com/dhbpapers/deflated-sharpe.pdf — the DSR paper, version of 2014-07-31, sha256
   ca4a1e83. Read: eqs. 1 and 2, the example on pp. 9–10, pp. 3, 6 and 14–15, where the paper writes M for
   all trials. Fetched; the equations read from page images.
-* The owner, 2026-11-10: "auto proceed with sota convergence you as master orchestrator". The choices under
-  "Who decided" were made under that sentence by the orchestrator, not by the owner item by item.
+* The owner decided on 2026-11-10 that the orchestrator proceeds automatically on state-of-the-art
+  convergence, leaving the open choices to it. The choices under "Who decided" were made under that delegation by the
+  orchestrator, not by the owner item by item.
 * https://pypi.org/pypi/skfolio/json — 1.12.8, released 2026-11-08, is the latest of 130 releases; BSD
   3-Clause; `requires-python >=3.10`, with a Python 3.14 classifier. Fetched.
 * https://raw.githubusercontent.com/skfolio/skfolio/433991778607285ecd274942e89029190c45e44c/src/skfolio/measures/_measures.py

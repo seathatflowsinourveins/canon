@@ -66,7 +66,7 @@ Rules:
    most once a day and only when a session starts. Nothing watches the packages in `uv.lock` beyond the
    five direct ones the registry names. Adoption was its own change through `adopt-upstream`
    (ADR 0016): Dependabot, for indirect packages and actions only, which leaves exact pins with the canon.
-4. **"Always auto-merge" is the owner's instruction, not a practice the sample supports.** A bot account
+4. **Merging automatically once checks pass is the owner's instruction, not a practice the sample supports.** A bot account
    performs most merges at four repositories (Rust, Kubernetes, codex, ccusage), and two more (gemini-cli,
    zed) merge through a queue with an approval on 100% and 94% of pull requests. In the rest a person
    presses merge. This repo merges on checks alone because the owner said so (ADR 0014).
