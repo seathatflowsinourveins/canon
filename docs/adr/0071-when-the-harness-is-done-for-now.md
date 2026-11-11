@@ -122,6 +122,9 @@ set to block when it failed left a session with no tool, and the owner wants non
 documentation, with no end-to-end trial of each runtime; check 5 counts the trading paths only; gaps 7 to
 10 stay optional.
 
+*Amended 2026-11-11 by ADR 0078:* gap 3's handover is the coordinator's Orca Run and git, not a file in
+the repository; recurring duties run from launchd, the desktop scheduler or the hosted workflow.
+
 ### Consequences
 
 * Good: the harness has a finish line made of checks, and the lanes have a cap after it.

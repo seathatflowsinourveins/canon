@@ -180,6 +180,9 @@ locally on the data client's live data; nothing in `src/` builds one yet (ADR 00
   from it, so what lands under `home/` and in the installers reaches the machine at its next round,
   with main's gate as the control (ADR 0065).
   Models are routed by lane in `canon/models.json` (ADR 0005).
+* **Coordination.** No recurring duty runs on a session's timer; the queue, the lanes and what waits on
+  the lead or the owner are the coordinator's Orca Run, outside the repository, and what has landed is in
+  git (ADR 0078).
 
 ## Where code runs, and what it has
 
