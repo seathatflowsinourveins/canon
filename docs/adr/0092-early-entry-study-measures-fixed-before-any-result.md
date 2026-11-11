@@ -82,9 +82,10 @@ in every arm.
 **The method.** The owner supplies a fixed list of mover days, kept outside the repository; this record
 names neither its contents nor its origin, and its SHA-256 is entered under Confirmation when it
 arrives. Its dates are split in order: the earliest 70% are development, the rest a holdout. Skfolio's
-`WalkForward` with an expanding training set splits the development dates into five blocks; in each of
-four folds the arm with the largest share of names entered not late on the earlier blocks (ties to the
-larger median share ahead, then to the arm listed first) is judged on the next block. The arm chosen on
+`WalkForward` with an expanding training set walks the development dates in blocks of a fifth of them,
+rounded down (four folds where the count divides by five); in each fold the arm with the largest share
+of names entered not late on the earlier blocks (ties to the larger median share ahead, then to the arm
+listed first) is judged on the next block. The arm chosen on
 all development days is replayed on the holdout once; a second opening is refused. Nothing is tuned on
 the holdout. Until the list arrives, the code is built and tested on generated bars and the day's tape.
 

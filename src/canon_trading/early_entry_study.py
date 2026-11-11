@@ -43,12 +43,15 @@ the request budget and the free slot are not modelled; the after-hours session i
 
 Run: `python -m canon_trading.early_entry_study --catalog <a SIP root> --day 2026-11-11 --symbols A,B`
 prints one section a name and a summary, as Markdown. `--half-spread-bps PRE REG` adds the outcomes at
-cost and at twice it; `--from HH:MM` replays a window that starts watching then.
+cost and at twice it; `--from HH:MM` replays a window that starts watching then; `--arms` adds every arm.
+`--days-file <list> --sha256 <hex>` runs the walk-forward over the list's development dates, and
+`--open-holdout` then replays the chosen arm on the holdout, once.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import statistics
 import sys
 from dataclasses import dataclass
@@ -63,9 +66,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
+import pandas as pd
 from canon_alpaca.constants import VENUE
 from nautilus_trader.model import NautilusDataType
 from nautilus_trader.persistence import ParquetDataCatalog
+from skfolio.model_selection import WalkForward
 
 from .movers_stream import normal
 
@@ -91,6 +96,11 @@ CHASE_CAP = 0.02
 LATE = 0.5
 """An entry after this share of the day's move is late (ADR 0092)."""
 MINUTE_NS = 60 * 1_000_000_000
+DEVELOPMENT_SHARE = 0.7
+"""The earliest share of the list's dates that is development; the rest is the holdout (ADR 0092)."""
+BLOCKS = 5
+"""A walk-forward block is one in this many of the development dates, rounded down."""
+HOLDOUT_MARK = ".holdout-opened"
 
 
 @dataclass(frozen=True)
@@ -478,6 +488,122 @@ def replay(day: Day, rows: Rows, costs: Costs = GROSS, *, start: int = PART_STAR
     return replace(base, refusals=tuple(refusals))
 
 
+# --- the list of mover days, the split and the walk-forward (ADR 0092, "The method") ----------------
+
+
+def read_days(path: Path, sha256: str) -> list[tuple[date, str]]:
+    """The list of mover days at `path`, one `YYYY-MM-DD,SYMBOL` a line (`#` starts a comment), refused
+    unless its bytes hash to `sha256`, or if a line is not of that form or is there twice."""
+    data = path.read_bytes()
+    digest = hashlib.sha256(data).hexdigest()
+    if digest != sha256.lower():
+        raise ValueError(
+            f"the list's SHA-256 is {digest}, not the one given: it is not the list registered"
+        )
+    listed: list[tuple[date, str]] = []
+    for number, line in enumerate(data.decode("utf-8").splitlines(), 1):
+        text = line.split("#", 1)[0].strip()
+        if not text:
+            continue
+        day, comma, symbol = (part.strip() for part in text.partition(","))
+        if not comma or not symbol:
+            raise ValueError(f"line {number} of the list is not YYYY-MM-DD,SYMBOL")
+        try:
+            entry = (date.fromisoformat(day), symbol.upper())
+        except ValueError:
+            raise ValueError(f"line {number} of the list is not YYYY-MM-DD,SYMBOL") from None
+        if entry in listed:
+            raise ValueError(f"line {number} of the list repeats an earlier line")
+        listed.append(entry)
+    return listed
+
+
+def split_dates(dates: Iterable[date]) -> tuple[list[date], list[date]]:
+    """The list's dates in order, cut into development (the earliest `DEVELOPMENT_SHARE`, rounded down)
+    and the later holdout. Refused if development is short of one date a block."""
+    unique = sorted(set(dates))
+    cut = int(len(unique) * DEVELOPMENT_SHARE)
+    if cut < BLOCKS or cut == len(unique):
+        raise ValueError(
+            f"{len(unique)} dates leave {cut} for development, where the walk-forward needs {BLOCKS} "
+            "and the holdout at least one"
+        )
+    return unique[:cut], unique[cut:]
+
+
+def folds(development: Sequence[date]) -> list[tuple[list[date], list[date]]]:
+    """Skfolio's `WalkForward` over the development dates: blocks of a fifth of them, rounded down, the
+    training set growing from the first block, each fold's test block the one after its training set.
+    That is four folds where the count divides by five and more where it does not; dates past the last
+    whole block are judged by no fold."""
+    block = len(development) // BLOCKS
+    splitter = WalkForward(test_size=block, train_size=block, expand_train=True)
+    return [
+        ([development[i] for i in train], [development[i] for i in test])
+        for train, test in splitter.split(pd.DataFrame(index=pd.DatetimeIndex(development)))
+    ]
+
+
+def early_share(runs: Sequence[Replay]) -> tuple[float, float]:
+    """The choice's objective: the share of the names replayed (missing ones left out) entered not
+    late, then the median share of the move still ahead at entry (zero with no entry)."""
+    held = [r for r in runs if r.day.missing is None]
+    if not held:
+        return (0.0, 0.0)
+    ahead = [r.ahead for r in held if r.ahead is not None]
+    return (
+        sum(not r.late for r in held) / len(held),
+        statistics.median(ahead) if ahead else 0.0,
+    )
+
+
+def choose(days: Sequence[Day], costs: Costs = GROSS) -> str:
+    """The arm with the largest `early_share` on `days`; a tie goes to the arm listed first."""
+    best, best_score = "", (-1.0, -1.0)
+    for name, rows in ARMS.items():
+        score = early_share([replay(day, rows, costs) for day in days])
+        if score > best_score:
+            best, best_score = name, score
+    return best
+
+
+@dataclass(frozen=True)
+class Fold:
+    """One walk-forward fold: the arm chosen on `chosen_on` dates and its replays on the `judged` dates."""
+
+    chosen_on: tuple[date, ...]
+    judged: tuple[date, ...]
+    arm: str
+    runs: tuple[Replay, ...]
+
+
+def walk_forward(
+    days: Sequence[Day], development: Sequence[date], costs: Costs = GROSS
+) -> list[Fold]:
+    """For each fold of `folds`, choose the arm on the earlier dates' names and replay it on the next
+    block's. An arm is never judged on a date it was chosen on."""
+    out = []
+    for train, test in folds(development):
+        arm = choose([d for d in days if d.day in train], costs)
+        runs = tuple(replay(d, ARMS[arm], costs) for d in days if d.day in test)
+        out.append(Fold(tuple(train), tuple(test), arm, runs))
+    return out
+
+
+def open_holdout(list_path: Path) -> Path:
+    """Mark the holdout of the list at `list_path` as opened, in a file beside it, and refuse a second
+    opening: the marker is created exclusively, so it cannot be made twice."""
+    marker = list_path.with_name(list_path.name + HOLDOUT_MARK)
+    try:
+        with marker.open("x", encoding="utf-8") as out:
+            out.write(f"opened {datetime.now(UTC).isoformat()}\n")
+    except FileExistsError:
+        raise PermissionError(
+            f"the holdout was already opened ({marker.name} exists beside the list): it is opened once"
+        ) from None
+    return marker
+
+
 # --- reading the catalog ---------------------------------------------------------------------------
 
 
@@ -692,18 +818,124 @@ def summary(runs: Sequence[Replay]) -> list[str]:
     return lines
 
 
+def arms_table(days: Sequence[Day], costs: Costs, start: int = PART_START) -> list[str]:
+    """Each arm of ADR 0092 over `days`, one line an arm: the shadow arms beside the registered rows."""
+    lines = [
+        "| arm | entered | late or never | median lead, min | median share ahead | mean managed | mean hold |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for name, rows in ARMS.items():
+        runs = [replay(day, rows, costs, start=start) for day in days]
+        held = [r for r in runs if r.day.missing is None]
+        leads = [r.lead for r in held if r.lead is not None]
+        ahead = [r.ahead for r in held if r.ahead is not None]
+        managed = [r.managed for r in held if r.managed is not None]
+        hold = [r.hold for r in held if r.hold is not None]
+        lines.append(
+            f"| {name} | {len(managed)} of {len(held)} | {sum(r.late for r in held)} | "
+            f"{statistics.median(leads) if leads else '-'} | "
+            f"{pct(statistics.median(ahead)) if ahead else '-'} | "
+            f"{pct(statistics.fmean(managed)) if managed else '-'} | "
+            f"{pct(statistics.fmean(hold)) if hold else '-'} |"
+        )
+    return lines
+
+
+def name_arms(day: Day, costs: Costs, start: int = PART_START) -> list[str]:
+    """One name's day under each arm: when it was listed and entered, and what the entry came to."""
+    lines = [
+        "| arm | listed | entry | at | lead, min | move done | still ahead | managed | hold |",
+        "|---|---|---|---|---|---|---|---|---|",
+    ]
+    for name, rows in ARMS.items():
+        run = replay(day, rows, costs, start=start)
+        lines.append(
+            f"| {name} | {clock(run.listed)} | {clock(run.entry_minute)} | "
+            f"{'-' if run.entry is None else f'{run.entry:.4f}'} | "
+            f"{'-' if run.lead is None else run.lead} | {pct(run.done_at_entry)} | {pct(run.ahead)} | "
+            f"{pct(run.managed)} | {pct(run.hold)} |"
+        )
+    return lines
+
+
 def _clock_arg(text: str) -> int:
     at = time.fromisoformat(text)
     return at.hour * 60 + at.minute
 
 
+def _one_day(args: argparse.Namespace, costs: Costs | None) -> int:
+    print(
+        f"## Early entry on {args.day}: registered rows, "
+        + (
+            "gross only (no spread given)"
+            if costs is None
+            else f"half-spread {args.half_spread_bps} bps"
+        )
+        + " (DIAGNOSTIC: changes no row)\n"
+    )
+    days = [load_day(args.catalog, s.strip().upper(), args.day) for s in args.symbols.split(",")]
+    for day in days:
+        print("\n".join(section(day, REGISTERED, costs, args.start)))
+        if args.arms and day.missing is None:
+            print("\n".join(name_arms(day, costs or GROSS, args.start)) + "\n")
+    priced = [] if costs is None else [("costs x1", costs), ("costs x2", costs.times(2))]
+    for label, cost in (("gross", GROSS), *priced):
+        runs = [replay(day, REGISTERED, cost, start=args.start) for day in days]
+        print(f"**Summary, {label}**\n\n" + "\n".join(summary(runs)) + "\n")
+        if args.arms:
+            print("\n".join(arms_table(days, cost, args.start)) + "\n")
+    return 0
+
+
+def _listed_days(args: argparse.Namespace, costs: Costs | None) -> int:
+    """The walk-forward over the list's development dates; with `--open-holdout`, the one holdout run."""
+    listed = read_days(args.days_file, args.sha256)
+    development, holdout = split_dates(d for d, _ in listed)
+    cost = costs or GROSS
+    print(
+        f"## Early-entry walk-forward (DIAGNOSTIC: changes no row): {len(listed)} name-days on "
+        f"{len(development) + len(holdout)} dates, {len(development)} development, {len(holdout)} "
+        f"holdout; {'gross' if costs is None else f'half-spread {args.half_spread_bps} bps'}\n"
+    )
+    days = [load_day(args.catalog, s, d) for d, s in listed if d in development]
+    for number, fold in enumerate(walk_forward(days, development, cost), 1):
+        print(
+            f"**Fold {number}**: chosen on {len(fold.chosen_on)} dates, judged on "
+            f"{len(fold.judged)} later dates: `{fold.arm}`\n\n"
+            + "\n".join(summary(fold.runs))
+            + "\n"
+        )
+    chosen = choose(days, cost)
+    print(
+        f"**Chosen on all development dates**: `{chosen}`\n\n" + "\n".join(arms_table(days, cost))
+    )
+    if args.open_holdout:
+        marker = open_holdout(args.days_file)
+        held_out = [load_day(args.catalog, s, d) for d, s in listed if d in holdout]
+        runs = [replay(day, ARMS[chosen], cost) for day in held_out]
+        print(
+            f"\n**Holdout, opened once ({marker.name} written beside the list)**: `{chosen}`\n\n"
+            + "\n".join(summary(runs))
+        )
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        prog="python -m canon_trading.early_entry_study", description=__doc__.split("\n\n")[0]
+        prog="python -m canon_trading.early_entry_study",
+        description=(__doc__ or "").split("\n\n")[0],
     )
     parser.add_argument("--catalog", type=Path, required=True, help="a catalog root of one feed")
-    parser.add_argument("--day", type=date.fromisoformat, required=True)
-    parser.add_argument("--symbols", required=True, help="comma-separated")
+    parser.add_argument("--day", type=date.fromisoformat, help="one day, with --symbols")
+    parser.add_argument("--symbols", help="comma-separated")
+    parser.add_argument(
+        "--arms", action="store_true", help="add each arm of ADR 0092 to a day's report"
+    )
+    parser.add_argument("--days-file", type=Path, help="the list of mover days, with --sha256")
+    parser.add_argument("--sha256", help="the list's registered SHA-256")
+    parser.add_argument(
+        "--open-holdout", action="store_true", help="replay the chosen arm on the holdout, once"
+    )
     parser.add_argument(
         "--half-spread-bps",
         type=float,
@@ -718,38 +950,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=_clock_arg,
         default=PART_START,
         metavar="HH:MM",
-        help="the minute the strategy starts watching (default 04:00)",
+        help="the minute the strategy starts watching (default 04:00), for one day",
     )
     args = parser.parse_args(argv)
+    one_day = args.day is not None and bool(args.symbols)
+    a_list = args.days_file is not None and bool(args.sha256)
+    if one_day == a_list or (a_list and (args.day or args.symbols or args.arms)):
+        parser.error("give --day with --symbols, or --days-file with --sha256, and not both")
+    if args.open_holdout and not a_list:
+        parser.error("--open-holdout goes with --days-file")
     if not PART_START <= args.start < WINDOW_END:
         parser.error("--from must be from 04:00 to before 16:00")
     costs = None
     if args.half_spread_bps is not None:
+        if min(args.half_spread_bps) < 0:
+            parser.error("--half-spread-bps must not be negative")
         costs = Costs(*(bps / 10_000 for bps in args.half_spread_bps))
-    print(
-        f"## Early entry on {args.day}: registered rows, "
-        + (
-            "gross only (no spread given)"
-            if costs is None
-            else f"half-spread {args.half_spread_bps} bps"
-        )
-        + " (DIAGNOSTIC: changes no row)\n"
-    )
-    for label, cost in (
-        ("gross", GROSS),
-        ("costs x1", costs),
-        ("costs x2", costs and costs.times(2)),
-    ):
-        if cost is None:
-            continue
-        runs = []
-        for symbol in args.symbols.split(","):
-            day = load_day(args.catalog, symbol.strip().upper(), args.day)
-            runs.append(replay(day, REGISTERED, cost, start=args.start))
-            if label == "gross":
-                print("\n".join(section(day, REGISTERED, costs, args.start)))
-        print(f"**Summary, {label}**\n\n" + "\n".join(summary(runs)) + "\n")
-    return 0
+    return _listed_days(args, costs) if a_list else _one_day(args, costs)
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ Offline. The catalog tests write Alpaca-shaped minute bars through the adapter's
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import replace
 from datetime import UTC
 from datetime import date
@@ -302,3 +303,113 @@ def test_the_arms_are_the_fifteen_the_record_registers() -> None:
     for rows in study.ARMS.values():
         assert rows.max_move is None  # the no-chase cap from the reference is off in every arm
         replay_day(a_day(RISE), rows)
+
+
+# --- the list, the split and the walk-forward ------------------------------------------------------
+
+DATES = [date(2026, 9, 1) + timedelta(days=i) for i in range(10)]
+SLOW = [
+    RISE[0],
+    *bars(OPEN + 1, [10.4, 10.5, 10.5, 10.6, 10.6, 10.7, 10.7, 10.8, 10.9], first=10.1),
+]
+"""Listed, but never three rises in a row: only an arm with a shorter run enters it."""
+
+
+def on(day: date, today: list[Minute]) -> Day:
+    return Day("TEST", day, tuple(today), QUIET, 10.0)
+
+
+def write_list(path: Path, lines: list[str]) -> str:
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_the_list_is_refused_unless_it_is_the_one_registered(tmp_path: Path) -> None:
+    path = tmp_path / "days.csv"
+    digest = write_list(path, ["# a comment", "2026-09-01,test", "2026-09-02, OTHER  # late"])
+    assert study.read_days(path, digest) == [(DATES[0], "TEST"), (DATES[1], "OTHER")]
+    with pytest.raises(ValueError, match="not the list registered"):
+        study.read_days(path, "0" * 64)
+    for bad, why in (
+        ("2026-09-01", "line 1"),
+        ("yesterday,TEST", "line 1"),
+        ("2026-09-01,TEST\n2026-09-01,test", "repeats"),
+    ):
+        with pytest.raises(ValueError, match=why):
+            study.read_days(path, write_list(path, [bad]))
+
+
+def test_the_dates_split_in_order_and_the_folds_never_judge_a_date_they_chose_on() -> None:
+    development, holdout = study.split_dates(reversed([*DATES, DATES[0]]))
+    assert (development, holdout) == (DATES[:7], DATES[7:])
+    with pytest.raises(ValueError, match="walk-forward needs 5"):
+        study.split_dates(DATES[:7])
+    folds = study.folds(DATES)
+    assert [(len(train), test) for train, test in folds] == [
+        (2, DATES[2:4]),
+        (4, DATES[4:6]),
+        (6, DATES[6:8]),
+        (8, DATES[8:10]),
+    ]
+    assert all(max(train) < min(test) for train, test in folds)
+
+
+def test_an_arm_is_chosen_on_earlier_dates_and_judged_on_later_ones() -> None:
+    days = [on(d, SLOW) for d in DATES]
+    quiet = on(DATES[0], bars(OPEN, [10.1, 10.2]))  # never listed under any arm
+    assert study.choose([quiet]) == "registered"  # every arm ties: the first listed
+    assert study.choose(days[:2]) == "run-1"
+    assert study.early_share([replay_day(d, REGISTERED) for d in days]) == (0.0, 0.0)
+    walked = study.walk_forward(days, DATES)
+    assert [fold.arm for fold in walked] == ["run-1"] * 4
+    assert [fold.judged for fold in walked] == [tuple(test) for _, test in study.folds(DATES)]
+    assert all(run.entry is not None for fold in walked for run in fold.runs)
+
+
+def test_the_holdout_opens_once(tmp_path: Path) -> None:
+    path = tmp_path / "days.csv"
+    path.write_text("2026-09-01,TEST\n", encoding="utf-8")
+    marker = study.open_holdout(path)
+    assert marker.name == "days.csv.holdout-opened" and marker.exists()
+    with pytest.raises(PermissionError, match="opened once"):
+        study.open_holdout(path)
+
+
+def test_the_command_walks_the_list_forward_and_opens_the_holdout_only_when_asked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = tmp_path / "days.csv"
+    digest = write_list(path, [f"{d},TEST" for d in DATES])
+    loaded: list[date] = []
+
+    def load(catalog: Path, symbol: str, day: date) -> Day:
+        loaded.append(day)
+        return on(day, SLOW)
+
+    monkeypatch.setattr(study, "load_day", load)
+    argv = ["--catalog", str(tmp_path), "--days-file", str(path), "--sha256", digest]
+    assert study.main(argv) == 0
+    out = capsys.readouterr().out
+    assert "10 name-days on 10 dates, 7 development, 3 holdout; gross" in out
+    assert out.count("**Fold ") == 6  # seven dates, blocks of one: each later date is judged
+    assert "**Chosen on all development dates**: `run-1`" in out
+    assert "Holdout" not in out and loaded == DATES[:7]  # the holdout's days are not even read
+    assert study.main([*argv, "--open-holdout"]) == 0
+    assert "**Holdout, opened once" in capsys.readouterr().out
+    with pytest.raises(PermissionError):
+        study.main([*argv, "--open-holdout"])
+    for wrong in (["--day", "2026-09-01"], ["--day", "2026-09-01", "--symbols", "A", *argv[2:]]):
+        with pytest.raises(SystemExit):
+            study.main(["--catalog", str(tmp_path), *wrong])
+
+
+def test_every_arm_is_printed_for_a_name_and_for_the_day(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(study, "load_day", lambda catalog, symbol, day: on(day, SLOW))
+    argv = ["--catalog", str(tmp_path), "--day", "2026-09-01", "--symbols", "TEST", "--arms"]
+    assert study.main(argv) == 0
+    out = capsys.readouterr().out
+    assert "| run-1 | 09:32 | 09:33 | 10.5000 | 1 |" in out
+    assert "| registered | 09:32 | - | - | - |" in out
+    assert "| run-1 | 1 of 1 | " in out
