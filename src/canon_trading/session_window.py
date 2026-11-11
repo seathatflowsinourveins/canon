@@ -18,11 +18,18 @@ Contract: NautilusTrader v2.0.0rc8's `LiveNode.builder`, `LiveExecutionEngineCon
   stage of its own stop (`delay_post_stop`, `timeout_disconnection`, `timeout_shutdown`), logs the one that
   ran out and goes on; cancelling the task awaiting `run_async` "requests the same graceful shutdown, waits
   for it to finish", so neither a cancel nor `asyncio.run`'s exit can end a stop that hangs.
+* alpaca-py 0.45.0, `common/rest.py` (`RESTClient._request`, `_one_request`) and `common/constants.py`: a
+  request answered 429 or 504 is sent again, `DEFAULT_RETRY_ATTEMPTS` (3) times, `DEFAULT_RETRY_WAIT_SECONDS`
+  (3) apart; `TradingClient` does not pass `retry_attempts` on, and the constructor ignores anything under 1.
+* Python's `asyncio`: `loop.set_default_executor` takes a `ThreadPoolExecutor`, which `asyncio.to_thread`
+  then runs its calls in; `concurrent.futures`: `Executor.shutdown(wait=False, cancel_futures=True)`
+  cancels what has not started and refuses new work, and `wait(..., timeout=...)`.
 
 What one window is (one node, one process): the configured session and feed, checked against Alpaca's
 clock and calendar before anything starts; the paper account holding no open order and no position in the
 symbol; at least `GAP_SECS` since the last window ended; then the node runs for `minutes` (default 30, at
-most 60), clipped to the session's end. The strategy winds down `FLATTEN_SECS` before the end, the node
+most 60), clipped to the session's end and to `LONGEST_WINDOW_SECS` (about 56 minutes, so a paper test
+waiting for the lock outlasts the window and its bounded end), the record saying so when it is. The strategy winds down `FLATTEN_SECS` before the end, the node
 stops, and the account is checked: no open order, no position. The wait for the stop is bounded by
 `STOP_TIMEOUT_SECS`, the node's own stop bounds summed; past it the window is recorded failed, the
 account is still checked, and `main` ends the process (`os._exit`), since the node's task can be neither
@@ -30,7 +37,16 @@ awaited nor cancelled. A position still held once the cancels have landed is clo
 alpaca-py while Alpaca's clock, read when the close is sent, says the regular session is open, and tried
 again each poll while Alpaca refuses it, as upstream's market exit closes again once nothing works, for
 at most `AFTER_STOP_SECS`. Otherwise the window fails and names it, and an order still open with the
-session closed (a close that would only queue for the next session) is canceled. The run's node log and a
+session closed (a close that would only queue for the next session) is canceled.
+
+Two departures from upstream bound that check. In it, the window's alpaca-py client sends each request once
+(`_retry = 0`, the attribute `RESTClient` keeps its retry count in; the constructor cannot set 0): alpaca-py
+would repeat a 429 or 504 for up to `ADAPTER_CALL_SECS`, outside the check's deadline and after its reading
+of Alpaca's clock, so a market close could go out after the session closed. The check repeats each step
+itself, every poll, under one deadline that no call starts after. And the node's loop runs its worker
+calls in an executor of the window's own (`Calls`): after an abandoned stop no new call can start in it,
+and the check waits, at most `ADAPTER_CALL_SECS`, for the ones the adapter left running (its `_call` is
+shielded), so an order one of them sends is in the account before the check reads it. The run's node log and a
 JSON report go to `log_dir`, outside the repository. Overnight is refused: what the feeds deliver then is
 not yet observed.
 
@@ -45,12 +61,16 @@ import argparse
 import asyncio
 import functools
 import json
+import math
 import os
 import subprocess
 import sys
 import tempfile
 import time
 import traceback
+from concurrent.futures import Future
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import wait
 from dataclasses import asdict
 from dataclasses import dataclass
 from dataclasses import field
@@ -62,7 +82,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
+from alpaca.common.constants import DEFAULT_RETRY_ATTEMPTS
+from alpaca.common.constants import DEFAULT_RETRY_WAIT_SECONDS
 from alpaca.common.exceptions import APIError
+from alpaca.common.rest import RESTClient
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import QueryOrderStatus
 from alpaca.trading.models import Calendar as AlpacaCalendar
@@ -97,6 +120,7 @@ from .session_ma_cross import SessionMaCross
 from .session_ma_cross import SessionMaCrossConfig
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Sequence
 
 NEW_YORK = ZoneInfo("America/New_York")
@@ -107,10 +131,6 @@ GAP_SECS = 300
 """Between one window's end and the next one's start, so paper tests waiting for the lock get it."""
 FLATTEN_SECS = 120
 """The strategy winds down this long before the window ends."""
-END_MARGIN_SECS = 240
-"""A window ends at least this long before its session does: a stop at its bound (`STOP_TIMEOUT_SECS`) and
-the account check after it (`AFTER_STOP_SECS`) still find the session open, when a market close executes,
-with a minute for the calls before the check's deadline and skew between Alpaca's clock and this host's."""
 STRATEGY_ID = StrategyId("SessionMaCross-001")
 STALE_RUNNING_SECS = 70 * 60
 """A record still `running` this long after it started is a window that died (60 minutes at most, plus
@@ -120,7 +140,8 @@ EXTENDED_READY = False
 a reviewed change turns this on once an extended window has passed on paper and the adapter's
 disconnect-hang fix is on `main` (ADR 0044)."""
 POLL_SECS = 2.0
-"""Between account reads after the stop: at most three calls each, well inside Alpaca's 200 a minute."""
+"""Between account reads after the stop: two reads, then a cancel for each open order or a clock read and a
+close, well inside Alpaca's 200 a minute for the one or two orders a window has."""
 COMMIT_ENV = "CANON_COMMIT"
 """Set by the scheduled runner, `home/.claude/canon/paper-session.sh`, to the `origin/main` commit it checked
 out for this firing (ADR 0050)."""
@@ -128,9 +149,15 @@ SOURCE_ROOT = Path(__file__).resolve().parents[2]
 """The checkout this module runs from."""
 MARKET_EXIT_INTERVAL_MS = 1000
 MARKET_EXIT_MAX_ATTEMPTS = 60
+MANAGED_DELAY_POST_STOP_SECS = math.ceil(
+    MARKET_EXIT_INTERVAL_MS * MARKET_EXIT_MAX_ATTEMPTS / 1000 + DELAY_POST_STOP_SECS
+)
+"""A regular window's `delay_post_stop` (65 s): after the trader's stop the node processes events, the
+managed stop's market exit among them, only for this long before it disconnects its clients
+(`LiveNode::stop`, `process_runner_for`, `crates/live/src/node/mod.rs` at the pin); so the market exit at its
+longest and the residual 5 s (`paper_node`). The strategy stops once its exit ends (`finalize_market_exit`)."""
 STOP_TIMEOUT_SECS = (
-    MARKET_EXIT_INTERVAL_MS * MARKET_EXIT_MAX_ATTEMPTS / 1000
-    + DELAY_POST_STOP_SECS
+    MANAGED_DELAY_POST_STOP_SECS
     + TIMEOUT_DISCONNECTION_SECS
     + TIMEOUT_SHUTDOWN_SECS
     + CONNECT_TIMEOUT_SECS
@@ -140,7 +167,40 @@ STOP_TIMEOUT_SECS = (
 the node's own stop bounds (`paper_node`), and one Alpaca request at the adapter's timeouts (ADR 0039),
 which a call in flight at the disconnect can outlast it by."""
 AFTER_STOP_SECS = 60
-"""How long the account check after the stop works at clearing the account before it reports."""
+"""How long the account check after the stop works at clearing the account: no call starts after it but a
+last reading, so the check ends within this and three requests (`REQUEST_SECS`): the one in flight, and
+the last reading's two."""
+REQUEST_SECS = CONNECT_TIMEOUT_SECS + READ_TIMEOUT_SECS
+"""One request at the adapter's timeouts (ADR 0039), sent once, as the account check sends it. The two
+timeouts' sum, not a wall-clock bound: the connect timeout applies per address tried and the read timeout
+between bytes (ADR 0039), so a host resolving several addresses, or a response trickling in, can take
+longer."""
+ADAPTER_CALL_SECS = (
+    DEFAULT_RETRY_ATTEMPTS + 1
+) * REQUEST_SECS + DEFAULT_RETRY_ATTEMPTS * DEFAULT_RETRY_WAIT_SECONDS
+"""One adapter REST call at its longest (about 129 s): alpaca-py's first request and its retries, each at
+the adapter's timeouts, and the waits between them. A stream call the node runs in a worker thread has no
+such bound; one still running after this is recorded and the check goes on."""
+LAST_CLOSE_SECS = STOP_TIMEOUT_SECS + ADAPTER_CALL_SECS + AFTER_STOP_SECS + REQUEST_SECS
+"""From a window's end until the account check's last market close is sent, at most (about 334 s): the
+stop at its bound, the node's last worker calls, and the check's deadline with the clock read in flight."""
+AFTER_END_SECS = LAST_CLOSE_SECS + 2 * REQUEST_SECS
+"""From a window's end until its process is done with Alpaca, at most (about 394 s): to the last close, then
+that call and the check's last reading."""
+END_MARGIN_SECS = math.ceil(LAST_CLOSE_SECS + 60)
+"""A window ends at least this long before its session does, so the account check's last market close is
+sent while the session is open, with a minute for skew between Alpaca's clock and this host's."""
+PAPER_LOCK_WAIT_SECS = 3900
+"""How long `mise run paper:test` waits for the paper lock (`lockf -t` in `mise.toml`; a test reads it
+there, so the two cannot drift)."""
+START_UP_SECS = 30
+"""The process's start before Alpaca's clock is first read (`uv run`, the imports)."""
+LONGEST_WINDOW_SECS = math.floor(
+    PAPER_LOCK_WAIT_SECS - START_UP_SECS - ADAPTER_CALL_SECS - AFTER_END_SECS
+)
+"""The longest a window runs (about 56 minutes): a paper test queued behind it gets the lock within its
+wait, after the start-up, the first clock read (with alpaca-py's retries, `ADAPTER_CALL_SECS`), the window
+and its bounded end (`AFTER_END_SECS`)."""
 
 
 def default_log_dir() -> Path:
@@ -266,7 +326,12 @@ def window_node(
     it runs (returned too: the node does not hand its Python strategies back)."""
     extended = config.session == "extended"
     node = (
-        alpaca_paper_builder("CANON-PAPER-SESSION", config.instrument_id)
+        alpaca_paper_builder(
+            "CANON-PAPER-SESSION",
+            config.instrument_id,
+            # the managed stop's market exit runs inside the post-stop delay
+            delay_post_stop_secs=DELAY_POST_STOP_SECS if extended else MANAGED_DELAY_POST_STOP_SECS,
+        )
         .with_logging(
             LoggerConfig(
                 fileout_level=LogLevel.INFO,  # file output is off unless a level is given
@@ -309,6 +374,11 @@ class WindowReport:
     started: str
     ended: str = ""
     seconds: float = 0.0
+    planned_seconds: float = 0.0
+    """From Alpaca's clock at the start to the window's end, the wind-down included; the stop and the
+    account check come after it (`AFTER_END_SECS` at most)."""
+    shortened: str = ""
+    """Why the window runs shorter than the minutes asked for, if it does."""
     orders: dict[str, list[str]] = field(default_factory=dict)
     fills: int = 0
     denials: dict[str, str] = field(default_factory=dict)
@@ -341,8 +411,9 @@ class StopTimedOut(RuntimeError):
 
 
 _ABANDONED: list = []
-"""A runner and the node's task left running after a stop timed out, held so neither is collected (the
-hosted run would then drive its shutdown inline, `python/node.rs`) before `main` ends the process."""
+"""A runner, the node's task and its worker calls (`Calls`) left after a stop timed out, held so neither
+the runner nor the task is collected (the hosted run would then drive its shutdown inline,
+`python/node.rs`) before `main` ends the process."""
 
 
 class WindowSkipped(RuntimeError):
@@ -404,6 +475,14 @@ def paper_trading() -> TradingClient:
     )
 
 
+def send_once(trading: TradingClient) -> None:
+    """Make alpaca-py send each of `trading`'s requests once (module header): `RESTClient._request` then
+    raises a 429 or 504 as an `APIError` instead of repeating it outside the account check's deadline.
+    The start-up reads keep alpaca-py's retries; a stand-in client is left as it is."""
+    if isinstance(trading, RESTClient):
+        trading._retry = 0
+
+
 def open_orders(trading: TradingClient, symbol: str) -> list:
     orders = trading.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol]))
     assert isinstance(orders, list)
@@ -424,10 +503,34 @@ def position_qty(trading: TradingClient, symbol: str) -> Decimal:
 
 
 def leftovers(trading: TradingClient, symbol: str) -> list[str]:
-    left = [f"open order {o.client_order_id}" for o in open_orders(trading, symbol)]
-    if qty := position_qty(trading, symbol):
+    return described(open_orders(trading, symbol), position_qty(trading, symbol), symbol)
+
+
+def described(orders: list, qty: Decimal, symbol: str) -> list[str]:
+    """What is left, as a window's record names it: each open order, then the position."""
+    left = [f"open order {o.client_order_id}" for o in orders]
+    if qty:
         left.append(f"position of {qty} {symbol}")
     return left
+
+
+def window_seconds(minutes: int, session_left: float) -> tuple[float, str]:
+    """How long a window of `minutes` runs with `session_left` seconds of its session to go, and why it
+    is shorter, if it is: it ends `END_MARGIN_SECS` before the session does, and runs at most
+    `LONGEST_WINDOW_SECS`, so it and its bounded end fit a paper test's wait for the lock."""
+    asked = minutes * 60
+    by_session = session_left - END_MARGIN_SECS
+    seconds = min(asked, LONGEST_WINDOW_SECS, by_session)
+    if seconds >= asked:
+        return seconds, ""
+    if seconds == by_session:
+        why = f"ends {END_MARGIN_SECS} s before the session does"
+    else:
+        why = (
+            f"at most {LONGEST_WINDOW_SECS} s, so it and its bounded end fit the paper lock's "
+            f"{PAPER_LOCK_WAIT_SECS} s wait"
+        )
+    return seconds, f"shortened from {minutes} minutes to {seconds:.0f} s: {why}"
 
 
 def run_window(
@@ -455,13 +558,15 @@ def run_window(
         )
 
     now = clock.timestamp.astimezone(NEW_YORK)
-    seconds = min(config.minutes * 60, (end_of_session - now).total_seconds() - END_MARGIN_SECS)
+    seconds, shortened = window_seconds(config.minutes, (end_of_session - now).total_seconds())
     if seconds <= FLATTEN_SECS + 1:
         raise WindowSkipped(f"under {FLATTEN_SECS + END_MARGIN_SECS} s left in the session")
     # Absolute times, taken from Alpaca's clock: start-up eats into the window, not into the wind-down.
     ends = clock.timestamp.astimezone(UTC) + timedelta(seconds=seconds)
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    report = WindowReport(config.session, config.symbol, started=stamp)
+    report = WindowReport(
+        config.session, config.symbol, started=stamp, planned_seconds=seconds, shortened=shortened
+    )
     write_record(
         config.log_dir, report
     )  # `running`: a window killed from here on leaves this behind
@@ -494,6 +599,7 @@ def run_window(
         raise
     finally:
         try:
+            _wait_for_calls(_ABANDONED[abandoned_before:], report)
             report.left = _flatten_after_stop(trading, config, report)
         except BaseException as e:  # the account could not be checked: never recorded as ok
             failure = failure or e
@@ -520,44 +626,100 @@ def run_window(
 
 
 def _flatten_after_stop(trading: TradingClient, config: WindowConfig, report: WindowReport) -> list:
-    """What the account holds in the symbol after the stop. Every open order in it is canceled, in any
-    session. Then, each `POLL_SECS` for at most `AFTER_STOP_SECS`: once no order is open (a held order
-    keeps its shares from a close, which Alpaca refuses with a 403), a position still held is closed at
-    market if Alpaca's clock says the regular session is open at that moment, and closed again on the next
-    poll if Alpaca refused it; with the session closed it is left and reported. Last, an order still open
-    with the session closed (a close that would only queue for the next session) is canceled. A failed
-    step is recorded and the next still runs."""
+    """What the account holds in the symbol after the stop, once the check has worked at clearing it.
+
+    Each `POLL_SECS` until `AFTER_STOP_SECS` have gone, no call starting after that: read the open orders
+    and the position, and if both are clear, stop. An open order the check did not send is canceled, on
+    every poll until it is gone, in any session; with one open no close is sent (a held order keeps its
+    shares from a close, which Alpaca refuses with a 403). With none open, a position still held is closed
+    at market if Alpaca's clock, read just before, says the regular session is open, and closed again on
+    a later poll while it is still held; with the session closed it is left and reported. A close the check
+    sent is left to fill while the session is open, and canceled once it is closed (it would only queue for
+    the next session). A failed call (Alpaca's `APIError`, or an `OSError`, which requests' errors are, the
+    adapter's timeouts included) is recorded once and the rest of the poll is skipped, or, for one cancel,
+    the next order's cancel
+    goes on. An order first seen after a close was attempted is the check's own, whether or not that
+    call answered. The result is a reading taken after the check's last cancel or close (one more read,
+    past the deadline, if the last poll sent one); if no reading succeeded, `RuntimeError`."""
     symbol = config.symbol
-    left = leftovers(trading, symbol)
-    if not left:
-        return left
-    _cancel(trading, open_orders(trading, symbol), report)
+    send_once(trading)
     deadline = time.monotonic() + AFTER_STOP_SECS
+
+    def call[R](fn: Callable[..., R], *args: object) -> R:
+        if time.monotonic() >= deadline:
+            raise _OutOfTime
+        return fn(*args)
+
+    known: set[str] = set()
+    sent: set[str] = set()
+    closing = (
+        False  # whether a close has been attempted: an order first seen after it is the check's
+    )
+    seen: list[str] | None = None
+    acted = False  # whether a cancel or close was attempted after the last reading
+    last_error = ""
     while True:
-        working = open_orders(trading, symbol)
-        held = position_qty(trading, symbol)
-        if not working and not held:
-            break
-        if not working:
-            if not _regular_session_open(trading):
-                report.errors.append(
+        try:
+            working = call(open_orders, trading, symbol)
+            held = call(position_qty, trading, symbol)
+            for order in working:
+                if (order_id := str(order.id)) not in known:
+                    known.add(order_id)
+                    if closing:
+                        sent.add(order_id)
+            seen, acted = described(working, held, symbol), False
+            if not seen:
+                return seen
+            if others := [o for o in working if str(o.id) not in sent]:
+                for order in others:
+                    acted = True
+                    try:
+                        call(trading.cancel_order_by_id, order.id)
+                    except (APIError, OSError) as e:  # it filled or ended meanwhile
+                        _note(report, f"canceling {order.client_order_id}: {e}")
+            elif working:  # only closes this check sent
+                if not call(_regular_session_open, trading):
+                    for order in working:
+                        acted = True
+                        call(trading.cancel_order_by_id, order.id)
+            elif call(_regular_session_open, trading):
+                closing = acted = True
+                call(trading.close_position, symbol)
+                report.closed_after_stop = True
+            else:
+                _note(
+                    report,
                     "not closing the position: Alpaca's clock says the regular session is closed, "
-                    "so a market close would only queue"
+                    "so a market close would only queue",
                 )
                 break
-            try:
-                trading.close_position(symbol)
-                report.closed_after_stop = True
-            except APIError as e:
-                if (error := f"closing the position: {e}") not in report.errors:
-                    report.errors.append(error)
+        except _OutOfTime:
+            break
+        except (APIError, OSError) as e:
+            last_error = f"{type(e).__name__}: {e}"
+            _note(report, f"checking the account after the stop: {last_error}")
         if time.monotonic() >= deadline:
             break
         time.sleep(POLL_SECS)
-    if (working := open_orders(trading, symbol)) and not _regular_session_open(trading):
-        _cancel(trading, working, report)
-        _settle(lambda: not open_orders(trading, symbol))
-    return leftovers(trading, symbol)
+    if seen is None:
+        raise RuntimeError(
+            f"the account could not be read in {AFTER_STOP_SECS} s after the stop: {last_error}"
+        )
+    if acted:  # the last reading came before a cancel or close: read once more
+        try:
+            seen = leftovers(trading, symbol)
+        except (APIError, OSError) as e:
+            _note(report, f"reading the account after the last step: {type(e).__name__}: {e}")
+    return seen
+
+
+class _OutOfTime(Exception):
+    """The account check's deadline has passed: no call starts after it."""
+
+
+def _note(report: WindowReport, error: str) -> None:
+    if error not in report.errors:
+        report.errors.append(error)
 
 
 def _regular_session_open(trading: TradingClient) -> bool:
@@ -566,19 +728,32 @@ def _regular_session_open(trading: TradingClient) -> bool:
     return bool(clock.is_open)
 
 
-def _cancel(trading: TradingClient, orders: list, report: WindowReport) -> None:
-    for order in orders:
-        try:
-            trading.cancel_order_by_id(order.id)
-        except APIError as e:  # it filled or ended meanwhile
-            report.errors.append(f"canceling {order.client_order_id}: {e}")
+class Calls(ThreadPoolExecutor):
+    """The node's loop's default executor, which `asyncio.to_thread` runs the adapter's REST calls in,
+    keeping each call's future so the window can wait for those still running after an abandoned stop."""
+
+    def __init__(self) -> None:
+        super().__init__(thread_name_prefix="canon-window-call")
+        self.futures: set[Future] = set()
+
+    def submit(self, fn, /, *args, **kwargs) -> Future:
+        future = super().submit(fn, *args, **kwargs)
+        self.futures.add(future)
+        future.add_done_callback(self.futures.discard)
+        return future
+
+    def running(self) -> set[Future]:
+        return {f for f in list(self.futures) if not f.done()}
 
 
-def _settle(done, seconds: float = 30) -> None:
-    """Poll `done` every `POLL_SECS` until it is true or `seconds` have gone."""
-    deadline = time.monotonic() + seconds
-    while time.monotonic() < deadline and not done():
-        time.sleep(POLL_SECS)
+def _wait_for_calls(abandoned: list, report: WindowReport) -> None:
+    """Wait, at most `ADAPTER_CALL_SECS`, for the worker calls an abandoned node left running, so an
+    order one of them sends is in the account before the check reads it; record any still running."""
+    running = set().union(*(calls.running() for _, _, calls in abandoned))
+    if running and (still := wait(running, timeout=ADAPTER_CALL_SECS).not_done):
+        report.errors.append(
+            f"{len(still)} call(s) of the abandoned node still running after {ADAPTER_CALL_SECS:g} s"
+        )
 
 
 def _run_node(node: LiveNode, ends: datetime) -> None:
@@ -586,19 +761,29 @@ def _run_node(node: LiveNode, ends: datetime) -> None:
     loop then would cancel the node's task and wait for the same stop, so the loop and the task are left
     (`_ABANDONED`) and `StopTimedOut` raised."""
     runner = asyncio.Runner()
+    calls = Calls()
+    runner.get_loop().set_default_executor(calls)
     started: list[asyncio.Task] = []
     try:
         stuck = runner.run(_run_until(node, ends, started))
     except BaseException:
         if started and not started[0].done():  # interrupted (Ctrl-C) while the stop still runs
-            _ABANDONED.append((runner, started[0]))
+            _abandon(runner, started[0], calls)
         else:
             runner.close()
         raise
     if stuck is None:
-        runner.close()
-        return
-    _ABANDONED.append((runner, stuck))
+        # `Runner.close` waits up to 300 s for the executor's calls (`THREAD_JOIN_TIMEOUT`): wait for them
+        # at most `ADAPTER_CALL_SECS` first, and leave the runner if one still runs
+        calls.shutdown(wait=False, cancel_futures=True)
+        if not wait(calls.running(), timeout=ADAPTER_CALL_SECS).not_done:
+            runner.close()
+            return
+        _ABANDONED.append((runner, started[0], calls))
+        raise StopTimedOut(
+            f"a worker call of the node still ran {ADAPTER_CALL_SECS:g} s after it stopped; left running"
+        )
+    _abandon(runner, stuck, calls)
     raise StopTimedOut(
         f"the node did not stop within {STOP_TIMEOUT_SECS:g} s of the window's end; left running"
     )
@@ -620,6 +805,12 @@ async def _run_until(node: LiveNode, ends: datetime, started: list) -> asyncio.T
         return task
     task.result()  # the node's own error, if it ended with one
     return None
+
+
+def _abandon(runner: asyncio.Runner, task: asyncio.Task, calls: Calls) -> None:
+    """Leave the runner and the node's task (`_ABANDONED`), with no new worker call able to start."""
+    calls.shutdown(wait=False, cancel_futures=True)
+    _ABANDONED.append((runner, task, calls))
 
 
 def _fill(report: WindowReport, cache) -> None:
@@ -686,6 +877,15 @@ def _log_dir(argv: Sequence[str] | None) -> Path:
     return _parser().parse_args(argv).log_dir
 
 
+def _heard_failed(log_dir: Path, error: BaseException) -> None:
+    """The heartbeat for a failed run; a heartbeat that cannot be written (the error may be the log
+    directory's own) is said on stderr, so the run's own error and exit code stand."""
+    try:
+        write_heartbeat(log_dir, f"failed: {type(error).__name__}: {error}")
+    except OSError as e:
+        print(f"paper:session: the heartbeat could not be written: {e}", file=sys.stderr)
+
+
 def _main(argv: Sequence[str] | None) -> int:
     args = _parser().parse_args(argv)
     session = args.session
@@ -724,10 +924,14 @@ def _main(argv: Sequence[str] | None) -> int:
         )
         print(f"paper:session: {e}", file=sys.stderr)
         return 1
-    except (RuntimeError, ValueError, KeyError, APIError) as e:  # KeyError: no key pair in the env
-        write_heartbeat(args.log_dir, f"failed: {type(e).__name__}: {e}")
+    # KeyError: no key pair in the env; OSError: the HTTP layer's errors, the adapter's timeouts among them
+    except (RuntimeError, ValueError, KeyError, APIError, OSError) as e:
         print(f"paper:session: {e}", file=sys.stderr)
+        _heard_failed(args.log_dir, e)
         return 1
+    except Exception as e:  # anything else: heard as failed, then raised with its traceback
+        _heard_failed(args.log_dir, e)
+        raise
     print(json.dumps(asdict(report), indent=2))
     return 0
 

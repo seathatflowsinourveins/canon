@@ -435,6 +435,8 @@ class FakeOrdersClient(FakeTradingClient):
         self.replace_delay = 0.0  # holds the replace answer back after `replaced` is sent
         self.replace_error: Exception | None = None
         self.lookup_error: Exception | None = None  # raised by `get_order_by_client_id`
+        # Given an order ID, the error `get_order_by_id` raises for it, or None to answer.
+        self.order_lookup_error: Callable[[str], Exception | None] | None = None
         self.replace_requests: list[tuple[str, object]] = []
         self.cancels: list[str] = []
         self.order_queries: list[GetOrdersRequest | None] = []
@@ -594,6 +596,9 @@ class FakeOrdersClient(FakeTradingClient):
         self._send(event, self._placed[order_id], qty, **status)
 
     def get_order_by_id(self, order_id: object) -> Order:
+        refusal = self.order_lookup_error(str(order_id)) if self.order_lookup_error else None
+        if refusal is not None:
+            raise refusal
         for raw in [*self._placed.values(), *self.orders]:
             if raw["id"] == str(order_id):
                 return Order(**raw)
@@ -634,7 +639,11 @@ class FakeOrdersClient(FakeTradingClient):
             ):
                 continue
             selected.append(order)
-        return selected
+        # "Defaults to desc", on the submission time; "limit": "Defaults to 50 and max is 500"
+        # ("Get All Orders", https://docs.alpaca.markets/us/reference/getallorders-1.md).
+        selected.sort(key=lambda order: order.submitted_at, reverse=True)
+        limit = filter.limit if filter is not None and filter.limit is not None else 50
+        return selected[:limit]
 
     def get_all_positions(self) -> list[Position]:
         return [Position(**p) for p in self.positions]

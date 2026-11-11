@@ -1,7 +1,7 @@
 """The trial ledger: every backtest meant as a trial, recorded as one trial of an Optuna study.
 
 Contract: ADR 0010, protocol step 1 ("Ledger every trial"), in the store and on the terms ADR 0035
-decides, over the sample ADR 0041 fixes for each study. Optuna 5.0.0, read 2026-11-10 at tag v5.0.0:
+and ADR 0054 decide, over the sample ADR 0041 fixes for each study. Optuna 5.0.0, read 2026-11-10 at tag v5.0.0:
 
 * `docs/source/faq.rst` ("save and resume studies"): `RDBStorage` on a local SQLite file.
   `optuna.create_study` without `load_if_exists` creates a study and raises `DuplicatedStudyError` for
@@ -25,7 +25,7 @@ each `%` is encoded once more for it.
 
 NautilusTrader v2.0.0rc8 binds no config identity to Python: `BacktestRunConfig.id` defaults to a fresh
 UUID4 (`crates/backtest/src/config.rs` at the pinned commit) and the config cannot be serialised. So the
-identity is glue, ADR 0035 term 4: `config_key` is the SHA-256 of the canonical JSON of `trial_config`,
+identity is glue, ADR 0054 term 4: `config_key` is the SHA-256 of the canonical JSON of `trial_config`,
 built from what this repo sets, and the run is built with it as its `id`. Nothing upstream identifies
 the data a run read either, so `data_digest` is glue too (ADR 0053).
 
@@ -380,7 +380,7 @@ def _sample_attr(sample: Sample) -> dict[str, int]:
 
 
 def _canonical(value: object) -> Any:
-    """`value` in the canonical form of ADR 0035 term 4, or `TypeError` if it has no stable one.
+    """`value` in the canonical form of ADR 0054 term 4, or `TypeError` if it has no stable one.
 
     A `Decimal` is normalised (`0`, `0.00` and `0E-2` all give `0`). A `Quantity`, `Price` or `Money`
     prints with its precision, which is not normalised away: an order size of `10.0` is refused by an
@@ -423,7 +423,7 @@ def _canonical(value: object) -> Any:
 def trial_config(
     strategies: Sequence[MaCrossConfig], *, starting_balances: Sequence[str]
 ) -> dict[str, Any]:
-    """The object ADR 0035 term 4 hashes: what this repo sets for a run, normalised.
+    """The object ADR 0054 term 4 hashes: what this repo sets for a run, normalised.
 
     Each strategy's class and the fields its config sets (its own attributes; the base config's are
     upstream defaults `MaCrossConfig` never passes on), the venue's name, `VENUE_SETTINGS`, `FEE_RATES`
@@ -621,7 +621,7 @@ def _own_trial(study: optuna.Study) -> optuna.Trial:
 
     `Study.ask` takes the oldest `WAITING` trial before it creates one (`Study._pop_waiting_trial_id`,
     Optuna 5.0.0), and such a trial holds another writer's parameters and attributes, and a number
-    below records already made, where the ranking reads a higher number as a later record (ADR 0035
+    below records already made, where the ranking reads a higher number as a later record (ADR 0054
     term 5). A taken one is told `FAIL` at once, with no key and no outcome, so it shows no run and
     `mark_not_run` clears it, and the next is asked for. A trial is taken from the queue if it was
     `WAITING` before `ask`, or if it holds anything a trial `ask` creates does not: a user or system

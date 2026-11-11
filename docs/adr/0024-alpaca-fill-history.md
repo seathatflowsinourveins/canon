@@ -185,3 +185,10 @@ Read 2026-11-10. "raw" means the page's markdown or source fetched with `curl` a
   `(client_id, account_id, venue, ts_init, report_id=None)` (run). The reference's `cum_qty`,
   `leaves_qty` ("The quantity of shares remaining to be filled") and `page_token` descriptions, from the
   page above.
+* A second reader after landing, 2026-11-10: an activity listed twice counted twice toward its order's
+  `cum_qty`, so a repeat could hide a missing fill, and was reported twice. Reproduced with a test and
+  fixed: one fill per trade ID, as NautilusTrader's order "enforces one quantity-bearing fill per
+  `trade_id`" ("Duplicate fill detection", `docs/concepts/execution/index.md` at the pin, fetched, raw);
+  one trade ID with two quantities or prices leaves the order's fills to the engine. Alpaca's pages
+  neither promise nor rule out a repeated row, paging by `page_token`, "the ID of the end of your current
+  page" (`docs/account-activities.md`, fetched, raw): UNVERIFIED.

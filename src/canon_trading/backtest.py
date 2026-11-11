@@ -156,7 +156,7 @@ class BacktestRun:
 
 
 # The simulated venue's settings, as data: `simulated_alpaca_venue` builds the venue from them and
-# `canon_trading.ledger` keys a trial on them (ADR 0035 term 4), so the two cannot drift apart.
+# `canon_trading.ledger` keys a trial on them (ADR 0054 term 4), so the two cannot drift apart.
 VENUE_SETTINGS: dict[str, Any] = {
     "oms_type": OmsType.NETTING,
     "account_type": AccountType.CASH,
@@ -200,7 +200,7 @@ def backtest_run_config(
 
     `run_config_id` becomes the config's `id`; with none, NautilusTrader gives it a fresh UUID4
     (`crates/backtest/src/config.rs` at the pinned commit), so the same config built twice gets two ids.
-    `canon_trading.ledger` passes the trial's config key here (ADR 0035).
+    `canon_trading.ledger` passes the trial's config key here (ADR 0054 term 4).
 
     `start` and `end`, UTC nanoseconds, bound the bars the node replays (`BacktestRunConfig.start` and
     `end`); with none, it replays every bar the catalog holds. `canon_trading.ledger` passes its study's

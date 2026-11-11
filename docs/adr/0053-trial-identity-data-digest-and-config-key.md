@@ -44,9 +44,9 @@ grows with the data and not with what was tried. Terms 1, 2 and 3 below were ADR
    so this is local glue like the config key. It is taken from the bars, not the catalog's file layout, so
    a writer that adds, rewrites or consolidates files moves no digest unless a bar of the range changes.
    Records of one key on one sample that differ in range, returns, session days or digest disagree and
-   stop the ranking (ADR 0035 term 5), and so do any two records on one sample that read one bar type
+   stop the ranking (ADR 0054 term 5), and so do any two records on one sample that read one bar type
    as different bars, whatever their keys.
-2. **The key is the configuration.** This term supersedes what ADR 0035 term 4 said `config` holds,
+2. **The key is the configuration.** This term supersedes what ADR 0035 term 4 (now ADR 0054 term 4) said `config` holds,
    which was every property upstream reflects and the run's range. `config` now holds what this repo
    sets: each strategy's class (`module:Class`) and its config's own fields, the venue's name,
    settings, fee rates and starting balances, and the bar types; not the sample. The strategies are
@@ -140,7 +140,7 @@ package; run, executed in this checkout.
   corrected, with no change of decision; the review's other findings are ADR 0041's. Source: Optuna
   5.0.0 `trial/_state.py`, `COMPLETE` and `PRUNED`. `bundled`.
 * ADR 0041 as it stood on `main` before 2026-11-10's split: terms 3, 4 and 6, their glue, consequences,
-  tests and evidence, moved here with no change of decision (read).
+  tests and evidence, moved here with no change of decision (run: `git show` of the record on `main`).
 * Second reader (`evidence-verifier`), 2026-11-10: the sources and the moved text hold; it corrected
   option 2, which had been worded as ADR 0041's option 2, and a pointer left on ADR 0041 in
   `ranking.py`. Code review (`/code-review`, medium) of the split, the same day: the tests credited

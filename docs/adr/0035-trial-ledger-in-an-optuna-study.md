@@ -12,7 +12,8 @@ review-by: 2026-12-10
 ADR 0010 ranks strategy variants on every trial in a ledger. It says what an entry holds (the
 `BacktestRunConfig` with its `id`, and `run_config_id`, `backtest_start`, `backtest_end` and
 `returns_series`) and that N is counted from the ledger, never typed. Where are entries kept, and what
-writes them?
+writes them? How the key is hashed, N counted and the ranking stopped is ADR 0054, split from this
+record on 2026-11-10.
 
 ## Decision Drivers
 
@@ -62,28 +63,9 @@ trial store that meets every driver. Leaving it is cheap, since every trial read
    NautilusTrader's daily series books it), read from the catalog, since `BacktestResult` has none.
    ADR 0010's `BacktestRunConfig` cannot be stored as an object, so `config` stands for it in the form
    ADR 0053 term 2 gives; `sample` is ADR 0041's and `data_digest` ADR 0053's.
-4. **Identity.** `id` defaults to a fresh UUID4, and no config identity reaches Python. `config_key` is
-   the SHA-256 hex digest of the UTF-8 bytes of `json.dumps(config, sort_keys=True,
-   separators=(",", ":"), ensure_ascii=True, allow_nan=False)`, passed as `BacktestRunConfig(id=…)`.
-   Superseded in part by ADR 0053 term 2: what `config` holds and how its values are written. Until
-   then it held every public property upstream reflects and the run's `start` and `end`. Upstream
-   hashes only a result (`CanonicalBacktestResult::digest`, BLAKE3, not exposed); an exposed upstream
-   hash replaces this.
-5. **N** is the number of distinct `config_key` values in the study, in every state and on every
-   sample (ADR 0041), never filtered by state. ADR 0010 counts trials; reading a configuration run
-   again as the same trial is this record's. Records are never overwritten or deleted. Per key, a
-   `failed` or `RUNNING` record is resolved by a later record of that key that ran to the end (traded
-   or idle); the earlier one stays. Every record of a key that ran to the end on one sample must carry
-   the same outcome, range, returns and data (ADR 0053), else the ranking stops and names them. A key is one
-   column of the returns matrix.
-6. **What stops the ranking**, beside ADR 0031's, ADR 0041's and ADR 0053's: a study with no record; a key with no
-   record that ran to the end; a `failed` or `RUNNING` record no later record of its key resolves;
-   records of one key that disagree (term 5); an idle key (ADR 0010's Limits); and returns ADR 0010
-   step 2 rejects, or a record not in the shape `record_trial` writes. Each message names the key and
-   trial; one ranking gathers every trial's stops before it raises.
-   A configuration that can never run to the end stops the ranking for as long as that study is used.
-   That is the strict reading: a tried configuration is a trial, and no source read gives it a value.
-   Like the idle trial, it is undecided, not solved.
+4. **Identity.** ADR 0054 term 4: `config_key`, the SHA-256 of the canonical JSON of `config`.
+5. **N.** ADR 0054 term 5: the number of distinct keys, on every sample.
+6. **What stops the ranking.** ADR 0054 term 6.
 
 Who decided. The orchestrator chose option 3 and the terms under the owner's delegation of 2026-11-10
 (ADR 0010's Evidence).
@@ -91,8 +73,7 @@ Who decided. The orchestrator chose option 3 and the terms under the owner's del
 ### Consequences
 
 * Good: the ledger is upstream code called as documented, and N is read from it.
-* Bad: Optuna adds eight packages to `uv.lock`, and the config key is local glue.
-* Bad: a configuration that fails every time, or never trades, blocks the study's ranking.
+* Bad: Optuna adds eight packages to `uv.lock`, and the config key is local glue (ADR 0054).
 * Known limit: Optuna returns a trial's start as naive local time; the report converts it to UTC in
   the zone the process reads in, taking the earlier instant in the hour a fall-back repeats. A study
   object kept open while its process changes zone mixes zones.
@@ -101,19 +82,14 @@ Who decided. The orchestrator chose option 3 and the terms under the owner's del
 
 ### Confirmation
 
-* Tests record a trial that traded, one that failed and one that never traded, and one configuration
-  twice, then read N back through a new `Study` object; runs differing in one input get different keys.
-* A ranking report names the study.
-* A creation interrupted before its sample is completed by the next creation of its name, and a keyed
-  failure with no sample number stops the ranking until a later record of its key resolves it
+* Tests record a trial that traded, one that failed and one that never traded, and read them back
+  through a new `Study` object (`tests/test_ledger.py`).
+* A creation interrupted before its sample is completed by the next creation of its name
   (`tests/test_ledger.py`).
-* Records of one key that differ only in outcome stop the ranking in either order, and a report names
-  only the pick's records that ran (`tests/test_ranking.py`).
-* A keyed record in a state and outcome `record_trial` never leaves stops for good, and no later
-  record resolves it (`test_a_keyed_record_with_a_result_and_no_outcome_stops_for_good`,
-  `test_a_record_that_ran_in_a_state_the_writer_never_tells_stops`); a trial queued in Optuna is
-  never recorded in (`test_a_trial_is_recorded_in_its_own_trial_not_one_from_optuna_s_queue`). Each
-  failed before its fix.
+* N, the keys and the ranking's stops: ADR 0054's Confirmation.
+* A trial queued in Optuna is never recorded in: `record_trial` tells it `FAIL`, keyless, and asks again
+  (`test_a_trial_is_recorded_in_its_own_trial_not_one_from_optuna_s_queue`,
+  `test_a_waiting_trial_added_with_attributes_is_not_recorded_in`), tests that failed before their fix.
 
 ## Evidence
 
@@ -185,14 +161,12 @@ Read 2026-11-10. Fetched means read in this session as raw text or source; run m
   decision.
 * ADR 0041's key and data identity, and part of the reviews' sources cited above, moved to ADR 0053 on
   2026-11-10, with no change of decision; terms 3 to 6 point to ADR 0053 for them.
-* A fourth review of the gate, 2026-11-10, read only, by a second reader: a keyed `COMPLETE` record
-  with a value and no outcome was read as a failure, so a later traded record of its key passed and
-  the completed one was never checked. Term 5 resolves a record cut short as `record_trial` leaves
-  one, `RUNNING`, or `FAIL` with outcome `failed` or none; the ranking now stops for good on a keyed
-  record in any state and outcome `record_trial` never leaves, a result (`COMPLETE`, `PRUNED`, a
-  value or an intermediate value; Optuna 5.0.0 `trial/_state.py`, `bundled`) or a suggested
-  parameter among them. Its code review added that `Study.ask` takes the oldest queued `WAITING`
-  trial before it creates one (`study/study.py`, `bundled`), numbered below records already made,
-  where term 5 reads a higher number as later: `record_trial` now runs only in a trial `ask`
-  created, and tells a taken one `FAIL`, keyless. Each reproduced as a failing test. No change of
-  decision.
+* Terms 4 to 6, the key, N and what stops the ranking, with their consequences, tests and evidence,
+  moved to ADR 0054 on 2026-11-10, with no change of decision; the Evidence lines that support both
+  records are kept in both.
+* A fourth review of the gate, 2026-11-10, read only, by a second reader, with its code review:
+  `Study.ask` takes the oldest queued `WAITING` trial before it creates one (Optuna 5.0.0
+  `study/study.py`, `_pop_waiting_trial_id`, `bundled`), so a record could be written into another
+  writer's trial, with its attributes, at a number below records already made, where ADR 0054 term 5
+  reads a higher number as later. Term 2's recording now asks for a trial `ask` created; a taken one is
+  told `FAIL` with no key. Reproduced as a failing test. No change of decision.

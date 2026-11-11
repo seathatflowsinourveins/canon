@@ -103,7 +103,8 @@ over a fixed sample in the main checkout's `ledger/trials.db`, which every workt
 ([ADR 0035](docs/adr/0035-trial-ledger-in-an-optuna-study.md), [ADR 0041](docs/adr/0041-trial-ledger-sample-and-data-identity.md));
 `record_trial` runs a backtest over that sample as one of its trials, under a key of its configuration
 and a digest of the bars it read ([ADR 0053](docs/adr/0053-trial-identity-data-digest-and-config-key.md)); `move_sample` takes in new data; and
-`canon_trading.ranking.rank` ranks a study's trials and tests the pick's deflated Sharpe ratio.
+`canon_trading.ranking.rank` ranks a study's trials, N counted from their keys
+([ADR 0054](docs/adr/0054-trial-ledger-key-count-and-stops.md)), and tests the pick's deflated Sharpe ratio.
 
 ## Enter the Alpaca paper keys
 
@@ -217,7 +218,7 @@ here, community convergence, then anyone's recollection.
   the adapter requests.
 * **No strategy upstream ships has been ranked yet.** The one study on real bars ranked eight variants
   of the repo's `MaCross` on SPY and QQQ daily bars (ADR 0048, `canon_trading.variant_study`): no
-  variant passed the gate. Upstream's built-in `EmaCross` reads quotes, which the catalog does not
+  variant passed the gate (ADR 0052). Upstream's built-in `EmaCross` reads quotes, which the catalog does not
   hold. A trial that never traded, or a configuration that never runs to the end, stops a ranking:
   what value it should count as is undecided. The overfitting probability has no adopted
   implementation (ADR 0027 and ADR 0032 are `proposed`).
