@@ -28,6 +28,7 @@
 # Usage: scripts/ci            check everything; the secret scan covers the whole git history
 #        scripts/ci --staged   same, but the secret scan covers only what is staged (used by pre-commit)
 # A tool that is missing is a failure, never a skip. Exit 0 only if every check passes.
+# Slots: one of CANON_CI_SLOTS (default 3) machine-wide slots is held for the whole run (take_slot, below).
 # CANON_TEST_CI=1 (set by scripts/test-ci) skips scripts/test-ci itself, with a skip line.
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -107,7 +108,9 @@ tool() {
 }
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/canon-ci.XXXXXX") || { echo "ci: FAIL: mktemp failed."; exit 1; }
-trap 'rm -rf "$WORK"' EXIT
+SLOT_DIR=""
+# Removing SLOT_DIR is what releases the slot at once (see take_slot).
+trap 'rm -rf "$WORK"; [ -z "$SLOT_DIR" ] || rm -rf "${SLOT_DIR:?}"' EXIT
 
 # On INT or TERM, stop every background check and the processes it started, then exit 128 + signal.
 # Background jobs of a non-interactive shell ignore SIGINT, so Ctrl-C reaches them only through this.
@@ -123,6 +126,54 @@ stop_jobs() {
 }
 trap 'stop_jobs; echo "ci: interrupted"; exit 130' INT
 trap 'stop_jobs; echo "ci: terminated"; exit 143' TERM
+
+# One of CANON_CI_SLOTS (default 3) machine-wide slots, taken before the first check and held until this
+# script exits, so parallel lanes cannot drive the machine's load past what the self-tests tolerate. Each
+# slot is a lock file ${TMPDIR:-/tmp}/canon-ci-slot.N held with the operating system's own tool: macOS
+# lockf(1) or, where lockf is absent (GitHub's ubuntu-24.04 runner), util-linux flock(1); `man lockf`,
+# `man flock`. Neither offers N slots (searched: both lock one file), so N single-slot locks are tried in
+# turn. The lock is held by a live process, never by a file's existence: a helper runs under the tool and
+# ends when this script's process or SLOT_DIR is gone, so a killed run frees its slot within a second and a
+# leftover file blocks nobody. CANON_CI_SLOT_HELD (exported once a slot is held; scripts/test-ci sets it)
+# makes a nested run skip the wait. Both tools exit 75 for "busy" (lockf -t 0, flock -E 75).
+slot_try() { # slot_try <file>: take it, or return 1 when busy
+  local f="$1"
+  rm -f "$SLOT_DIR/held" "$SLOT_DIR/done"
+  # shellcheck disable=SC2016  # the helper's own shell expands these
+  local hold='touch "$1/held"; while kill -0 "$2" 2>/dev/null && [ -d "$1" ]; do sleep 0.2; done'
+  # started from a subshell of a subshell, so it is no job of this shell: the `wait`s below and in stop_jobs
+  # would otherwise wait for the helper, which ends only when this script does
+  ( (
+    if command -v lockf >/dev/null 2>&1; then lockf -k -s -t 0 "$f" sh -c "$hold" sh "$SLOT_DIR" "$$"
+    else flock -n -E 75 "$f" sh -c "$hold" sh "$SLOT_DIR" "$$"; fi
+    echo "$?" >"$SLOT_DIR/done"
+  ) </dev/null >/dev/null 2>&1 & )
+  local t=0 rc
+  while [ ! -e "$SLOT_DIR/held" ] && [ ! -s "$SLOT_DIR/done" ]; do
+    t=$((t + 1)); [ "$t" -le 400 ] || { echo "ci: FAIL: the slot helper for $f did not report in 20 s."; exit 1; }
+    sleep 0.05
+  done
+  [ -e "$SLOT_DIR/held" ] && return 0
+  rc=$(cat "$SLOT_DIR/done")
+  # 75 is "busy"; any other status is a real failure (an unwritable lock file, say), never a wait
+  [ "$rc" = 75 ] || { echo "ci: FAIL: could not lock $f (status $rc)."; exit 1; }
+  return 1
+}
+take_slot() {
+  local n="${CANON_CI_SLOTS:-3}" i announced=0
+  case "$n" in ''|*[!0-9]*|0*) echo "ci: FAIL: CANON_CI_SLOTS must be a positive number without leading zeros, not '$n'."; exit 1 ;; esac
+  command -v lockf >/dev/null 2>&1 || command -v flock >/dev/null 2>&1 \
+    || { echo "ci: FAIL: neither lockf nor flock found; one is needed to take a slot."; exit 1; }
+  SLOT_DIR=$(mktemp -d "${TMPDIR:-/tmp}/canon-ci-held.XXXXXX") || { echo "ci: FAIL: mktemp failed."; exit 1; }
+  while :; do
+    for ((i = 1; i <= n; i++)); do
+      if slot_try "${TMPDIR:-/tmp}/canon-ci-slot.$i"; then CANON_CI_SLOT_HELD=$i; export CANON_CI_SLOT_HELD; return 0; fi
+    done
+    [ "$announced" = 1 ] || { echo "ci: waiting for a slot"; announced=1; }
+    sleep 0.5
+  done
+}
+[ -n "${CANON_CI_SLOT_HELD:-}" ] || take_slot
 
 # Run from a git hook, this script inherits GIT_DIR, GIT_INDEX_FILE and the other repository-local
 # variables that `git rev-parse --local-env-vars` lists. With them set, a check that builds a scratch

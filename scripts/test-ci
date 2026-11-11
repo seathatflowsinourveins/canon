@@ -10,6 +10,9 @@
 set -uo pipefail
 if [ -n "${CANON_TEST_CI:-}" ]; then echo "test-ci: already running inside scripts/test-ci"; exit 1; fi
 export CANON_TEST_CI=1
+# scripts/ci takes one of three machine-wide slots unless CANON_CI_SLOT_HELD is set; every case but the slot
+# cases runs without waiting for one, as a nested run does. case_slots unsets it for its own runs.
+export CANON_CI_SLOT_HELD=1
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # A git hook runs with GIT_DIR, GIT_INDEX_FILE and similar set for the repository being committed to.
 # Clear every repository-local variable (git rev-parse --local-env-vars) so git commands in the copies
@@ -399,8 +402,73 @@ check "a passing label holding FAILED is not a failure line" test "$(printf '%s\
 check "nor a quoted inner FAIL"                    test "$(printf '%s\n' "$OUT" | grep -c 'quoted inner output')" = 0
 }
 
+# --- scripts/ci waits for a machine-wide slot (lockf(1) on macOS, flock(1) where lockf is absent) ---
+# The waits are event-based: the stand-in holder signals with a file, and releases when another file appears.
+case_slots() {
+fresh slots
+local S="$C.slots" W; mkdir -p "$S" "$C.tmp"
+# holder <n>: run a process that holds slot <n> until $S/release exists, as the tool scripts/ci uses does
+# shellcheck disable=SC2016  # the holder's own shell expands these
+holder() {
+  local hold='touch "$1/held"; while [ ! -e "$1/release" ]; do sleep 0.05; done'
+  if command -v lockf >/dev/null 2>&1; then lockf -k -s -t 0 "$C.tmp/canon-ci-slot.$1" sh -c "$hold" sh "$S" &
+  else flock -n -E 75 "$C.tmp/canon-ci-slot.$1" sh -c "$hold" sh "$S" & fi
+  HOLDER=$!
+}
+# the slot is held by a live stand-in: a run waits, says so once, and starts no check
+HOLDER=""; holder 1
+for _ in $(seq 400); do [ -e "$S/held" ] && break; sleep 0.05; done
+: >"$C.uv.log"
+(cd "$C" && env -u CANON_CI_SLOT_HELD CANON_CI_SLOTS=1 PATH="$FAKE:$PATH" TOOLS="$TMP/tools" UV_LOG="$C.uv.log" TMPDIR="$C.tmp" \
+   scripts/ci >"$C.out" 2>&1) &
+W=$!
+for _ in $(seq 400); do grep -q '^ci: waiting for a slot$' "$C.out" 2>/dev/null && break; sleep 0.05; done
+OUT=$(cat "$C.out")
+check "a busy slot prints the waiting line"        has '^ci: waiting for a slot$'
+check "... and starts no check"                    test ! -s "$C.uv.log"
+# the stand-in releases: the run carries on and passes
+: >"$S/release"; wait "$HOLDER" 2>/dev/null; wait "$W"; RC=$?
+OUT=$(cat "$C.out")
+check "after the release the run passes"           test "$RC" = 0
+check "... having printed the waiting line once"   test "$(printf '%s\n' "$OUT" | grep -c '^ci: waiting for a slot$')" = 1
+check "... and having started its checks"          test -s "$C.uv.log"
+# slot_free: the slot can be taken now (the helper scripts/ci left behind ends within a fraction of a second)
+# shellcheck disable=SC2329  # called by check, below
+slot_free() {
+  local _ f="$C.tmp/canon-ci-slot.1"
+  for _ in $(seq 400); do
+    if command -v lockf >/dev/null 2>&1; then lockf -k -s -t 0 "$f" true 2>/dev/null && return 0
+    else flock -n "$f" true && return 0; fi
+    sleep 0.05
+  done
+  return 1
+}
+check "the slot is free again afterwards"          slot_free
+# a lock file left by a process that died blocks nobody (and a free slot prints no waiting line)
+rm -f "$S/held" "$S/release"; : >"$C.tmp/canon-ci-slot.1"
+(cd "$C" && env -u CANON_CI_SLOT_HELD CANON_CI_SLOTS=1 PATH="$FAKE:$PATH" TOOLS="$TMP/tools" UV_LOG="$C.uv.log" TMPDIR="$C.tmp" \
+   scripts/ci >"$C.out" 2>&1); RC=$?; OUT=$(cat "$C.out")
+check "a leftover lock file does not block"        test "$RC" = 0
+check "... and prints no waiting line"             test "$(printf '%s\n' "$OUT" | grep -c 'waiting for a slot')" = 0
+# a holder killed with SIGKILL frees its slot
+holder 1
+for _ in $(seq 400); do [ -e "$S/held" ] && break; sleep 0.05; done
+pkill -KILL -P "$HOLDER" 2>/dev/null; kill -KILL "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
+(cd "$C" && env -u CANON_CI_SLOT_HELD CANON_CI_SLOTS=1 PATH="$FAKE:$PATH" TOOLS="$TMP/tools" UV_LOG="$C.uv.log" TMPDIR="$C.tmp" \
+   scripts/ci >"$C.out" 2>&1); RC=$?; OUT=$(cat "$C.out")
+check "a killed holder does not block"             test "$RC" = 0
+check "... and prints no waiting line"             test "$(printf '%s\n' "$OUT" | grep -c 'waiting for a slot')" = 0
+# a run that already holds a slot (CANON_CI_SLOT_HELD set) does not wait, even with every slot taken
+rm -f "$S/held" "$S/release"; holder 1
+for _ in $(seq 400); do [ -e "$S/held" ] && break; sleep 0.05; done
+(cd "$C" && env CANON_CI_SLOTS=1 PATH="$FAKE:$PATH" TOOLS="$TMP/tools" UV_LOG="$C.uv.log" TMPDIR="$C.tmp" \
+   scripts/ci >"$C.out" 2>&1); RC=$?; OUT=$(cat "$C.out")
+check "a nested run skips the wait"                test "$RC" = 0
+: >"$S/release"; wait "$HOLDER" 2>/dev/null
+}
+
 # Every case above works in its own copy, so they run concurrently; their output prints in this order.
-CASES="yaml noflows shell staged untracked tests testdir testgone notes skipsum died symlink deleted deleted2 lockfail hookenv parallel order missing pathorder strayconfig longfail"
+CASES="yaml noflows shell staged untracked tests testdir testgone notes skipsum died symlink deleted deleted2 lockfail hookenv parallel order missing pathorder strayconfig longfail slots"
 for c in $CASES; do ( "case_$c" ) >"$TMP/out.$c" 2>&1 & done
 wait
 for c in $CASES; do cat "$TMP/out.$c"; done

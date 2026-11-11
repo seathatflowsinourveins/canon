@@ -5,6 +5,17 @@
 # Runs scripts/ci, the same script CI runs, with the secret scan limited to what is staged. About eight
 # seconds, offline. `git commit --no-verify` would skip it here; GitHub runs the same script before anything
 # merges, so a skipped commit still cannot land (ADR 0020).
+#
+# A commit in the primary checkout is refused: the maintenance agent keeps that checkout on main and
+# fast-forwards it (ADR 0065), and work belongs in a worktree. The primary checkout is git's own fact: the
+# worktree whose git dir is the common dir (git-worktree(1)); a linked worktree's git dir is not. A
+# fast-forward is not a commit, so it runs no pre-commit hook.
+gitdir=$(git rev-parse --path-format=absolute --git-dir) || exit 1
+common=$(git rev-parse --path-format=absolute --git-common-dir) || exit 1
+if [ "$gitdir" = "$common" ]; then
+  echo "pre-commit: this is the primary checkout, which stays on main; work in a worktree (git worktree add) and commit there."
+  exit 1
+fi
 root=$(git rev-parse --show-toplevel) || exit 1
 if ! "$root/scripts/ci" --staged; then
   echo "pre-commit: commit aborted. Fix what failed above."
