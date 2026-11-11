@@ -50,6 +50,7 @@ esac
 cmd="$1"; shift
 if [ "$cmd" = gh ]; then
   case "$1 $2" in
+    "--version ") echo "gh 1.0 (stub)"; exit 0 ;;
     "auth status") exit "$(cat "$STUB/gh-auth-rc" 2>/dev/null || echo 0)" ;;
     "run list")
       expr=""; while [ $# -gt 0 ]; do [ "$1" = "--jq" ] && expr="$2"; [ "$1" = "--json" ] && echo "fields $2" >> "$STUB/gh.log"; shift; done
@@ -620,6 +621,7 @@ fi
 echo "bootstrap:"
 BS="$TMP/bs"; mkdir -p "$BS/scripts" "$BS/canon"; cp "$ROOT/scripts/bootstrap" "$BS/scripts/"; cp -R "$ROOT/home" "$BS/home"; : > "$BS/mise.toml"
 jq -n --arg t "tag:v$CCPIN" '{upstreams: [{id: "claude-code", track: $t}]}' > "$BS/canon/upstreams.json"
+cp "$ROOT/canon/models.json" "$BS/canon/models.json"   # the real lane table: the template's pins are held to it
 bs() { "$BS/scripts/bootstrap" "$@" > "$TMP/bs.out" 2>&1; }
 C="$TMP/cfg dir"
 : > "$STUB/mise.log"
@@ -770,6 +772,64 @@ check "check finds the hooks where they are called" eval 'rowis "$TMP/bs.out" "e
 C2="$TMP/cfg2"; mkdir -p "$C2/canon"; cp "$ROOT/home/.claude/canon/"*.sh "$C2/canon/"; cp "$ROOT/home/.claude/settings.json" "$C2/settings.json"
 CLAUDE_CONFIG_DIR="$C2" bs --check
 check "check rejects hooks that call another directory" eval 'rowis "$TMP/bs.out" "event ledger hooks" MISSING && rowis "$TMP/bs.out" "status line" MISSING'
+
+# model alias pins (ADR 0005; https://code.claude.com/docs/en/model-config.md): the expected IDs come from
+# canon/models.json, the keys that must be there from home/.claude/settings.json
+# shellcheck disable=SC2034  # read by the eval'd checks below
+fable_id=$(jq -r '[.lanes[] | select(.alias == "fable") | .model] | unique | .[0]' "$ROOT/canon/models.json")
+check "the template pins the fable alias to canon/models.json's fable model" \
+      eval '[ -n "$fable_id" ] && [ "$(jq -r ".env.ANTHROPIC_DEFAULT_FABLE_MODEL" "$ROOT/home/.claude/settings.json")" = "$fable_id" ]'
+CLAUDE_CONFIG_DIR="$C" bs --check
+check "installed settings pin fable as canon/models.json does: ok" \
+      eval 'rowis "$TMP/bs.out" "fable alias" ok && grep -q "ANTHROPIC_DEFAULT_FABLE_MODEL=$fable_id" "$TMP/bs.out"'
+C3="$TMP/cfg3"; mkdir -p "$C3/canon"; cp "$C/canon/"*.sh "$C3/canon/"; cp "$C/CLAUDE.md" "$C3/"
+pin_settings() { jq "$1" "$C/settings.json" > "$C3/settings.json"; CLAUDE_CONFIG_DIR="$C3" bs --check; }
+pin_settings '.'; rc=$?
+check "... and the whole check passes: exit 0"     test "$rc" = 0
+pin_settings '.env.ANTHROPIC_DEFAULT_FABLE_MODEL = "claude-fable-5-1"'; rc=$?
+check "fable pinned to another model: MISMATCH naming the expected one, exit 1" \
+      eval 'rowis "$TMP/bs.out" "fable alias" MISMATCH && grep -q "canon/models.json gives $fable_id" "$TMP/bs.out" && [ "$rc" != 0 ]'
+pin_settings 'del(.env)'; rc=$?
+check "installed settings without the fable pin: MISSING, exit 1" \
+      eval 'rowis "$TMP/bs.out" "fable alias" MISSING && grep -q "sets no env.ANTHROPIC_DEFAULT_FABLE_MODEL; set it to $fable_id" "$TMP/bs.out" && [ "$rc" != 0 ]'
+pin_settings '.env = "x"'; rc=$?
+check "env that is not an object: fable MISSING, exit 1" eval 'rowis "$TMP/bs.out" "fable alias" MISSING && [ "$rc" != 0 ]'
+opus_id=$(jq -r '[.lanes[] | select(.alias == "opus") | .model] | unique | .[0]' "$ROOT/canon/models.json")
+jq --arg o "$opus_id" '.env.ANTHROPIC_DEFAULT_OPUS_MODEL = $o' "$C/settings.json" > "$C3/settings.json"; CLAUDE_CONFIG_DIR="$C3" bs --check; rc=$?
+check "another alias pinned as canon/models.json says: its own row ok, exit 0" \
+      eval 'rowis "$TMP/bs.out" "opus alias" ok && rowis "$TMP/bs.out" "fable alias" ok && [ "$rc" = 0 ]'
+pin_settings '.env.ANTHROPIC_DEFAULT_SONNET_MODEL = "claude-sonnet-4-5"'; rc=$?
+check "another alias pinned to another model: MISMATCH, exit 1" eval 'rowis "$TMP/bs.out" "sonnet alias" MISMATCH && [ "$rc" != 0 ]'
+pin_settings '.env.ANTHROPIC_DEFAULT_WIDGET_MODEL = "claude-widget-1"'; rc=$?
+check "an alias canon/models.json does not know: MISMATCH, exit 1" \
+      eval 'rowis "$TMP/bs.out" "widget alias" MISMATCH && grep -q "gives no single model for alias widget" "$TMP/bs.out" && [ "$rc" != 0 ]'
+pin_settings '.env.ANTHROPIC_DEFAULT_MODEL = "opus"'; rc=$?
+check "ANTHROPIC_DEFAULT_MODEL is not an alias pin: no row of its own, exit 0" \
+      eval '! grep -q "^  default alias" "$TMP/bs.out" && ! grep -q "^  alias" "$TMP/bs.out" && [ "$rc" = 0 ]'
+cp "$BS/canon/models.json" "$TMP/models.keep"
+jq '(.lanes[] | select(.alias == "fable") | .model) = "claude-fable-9"' "$TMP/models.keep" > "$BS/canon/models.json"
+pin_settings '.'; rc=$?
+check "a model moved in canon/models.json: the check follows it (MISMATCH, expects the new ID)" \
+      eval 'rowis "$TMP/bs.out" "fable alias" MISMATCH && grep -q "canon/models.json gives claude-fable-9" "$TMP/bs.out" && [ "$rc" != 0 ]'
+echo '{' > "$BS/canon/models.json"; pin_settings '.'; rc=$?
+check "canon/models.json unreadable: UNKNOWN, exit 1" eval 'rowis "$TMP/bs.out" "model alias pins" UNKNOWN && [ "$rc" != 0 ]'
+cp "$TMP/models.keep" "$BS/canon/models.json"
+pin_settings '.model = "claude-fable-5-1"'; rc=$?
+check "a default model canon/models.json does not name: MISMATCH, exit 1" \
+      eval 'rowis "$TMP/bs.out" "default model" MISMATCH && grep -q "sets model to claude-fable-5-1" "$TMP/bs.out" && [ "$rc" != 0 ]'
+jq --arg f "$fable_id" '.model = $f' "$C/settings.json" > "$C3/settings.json"; CLAUDE_CONFIG_DIR="$C3" bs --check; rc=$?
+check "a default model canon/models.json names, as an ID: ok, exit 0" eval 'rowis "$TMP/bs.out" "default model" ok && [ "$rc" = 0 ]'
+pin_settings 'del(.model)'; rc=$?
+check "no default model: no row for it, exit 0"   eval '! grep -q "^  default model" "$TMP/bs.out" && [ "$rc" = 0 ]'
+cp "$BS/home/.claude/settings.json" "$TMP/template.keep"
+jq '.env.ANTHROPIC_DEFAULT_WIDGET_MODEL = "claude-widget-1"' "$TMP/template.keep" > "$BS/home/.claude/settings.json"
+pin_settings '.'; rc=$?
+check "the template pins an alias canon/models.json does not know: MISMATCH, not an empty fix" \
+      eval 'rowis "$TMP/bs.out" "widget alias" MISMATCH && ! grep -q "set it to  " "$TMP/bs.out" && [ "$rc" != 0 ]'
+jq 'del(.env)' "$TMP/template.keep" > "$BS/home/.claude/settings.json"; pin_settings '.'; rc=$?
+check "a template that pins no alias: UNKNOWN, exit 1, not a silent pass" \
+      eval 'rowis "$TMP/bs.out" "model alias pins" UNKNOWN && [ "$rc" != 0 ]'
+cp "$TMP/template.keep" "$BS/home/.claude/settings.json"
 CLAUDE_CONFIG_DIR="$TMP/bad\$dir" bs --user-config; rc=$?
 check "unquotable config directory refused"       eval '[ "$rc" != 0 ] && [ ! -e "$TMP/bad\$dir" ]'
 
