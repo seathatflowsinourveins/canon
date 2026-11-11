@@ -33,6 +33,11 @@ to end, in which lane, what bounds how many run at once, and in what order can i
 Chosen: **option 3**. Option 1 runs no quote-driven strategy at night and holds the one account; option 2
 leaves the sandbox unused (ADR 0070). The review-by date is the 23/5 week's target (below).
 
+**Pointer, 2026-11-11.** The owner decided on 2026-11-11 that strategy work concerns extreme movers
+only. ADR 0083, accepted on that date, records what follows from it and supersedes this record's
+direction (which strategies run). The three lanes, their bounds and the steps already landed (1, 3 and
+5 of the plan) stand; step 2's quote study (ADR 0077) is held unrun.
+
 **The candidates** (`crates/trading/src/examples/strategies` at the pin). All five are reachable from
 Python: `add_builtin_strategy` took each type name and refused an unknown one (run). The adapter carries
 market, limit, stop and stop-limit, DAY or GTC, whole shares; it denies reduce-only, post-only, IOC,
@@ -234,3 +239,5 @@ Read 2026-11-10. Fetched means read in this session as raw text or source; run m
   also found that `EmaCross` keeps its side unflipped when `submit_order` itself returns an error
   (`ema_cross/strategy.rs`), so "a refused order leaves its side flipped" holds for a refusal after
   the submit returns; applied in the Confirmation.
+* Pointer, 2026-11-11: the dated paragraph under the Decision Outcome, added with ADR 0083. No other text
+  of this record changed.
