@@ -140,6 +140,9 @@ locally on the data client's live data; nothing in `src/` builds one yet (ADR 00
   GitHub (ADR 0013).
 * **Landing.** `scripts/land` runs the check and squash-merges the branch; a change outside a named few
   needs a review note, recorded as the `review` status (ADR 0014, ADR 0017, ADR 0019).
+  A path leaves the review loop after two rounds with no finding that changes behaviour (ADR 0073);
+  harness work is capped to one maintenance lane once ADR 0071's six checks hold; how a runtime is
+  enhanced is proposed (ADR 0072).
 * **Reviewer benchmark.** Past commits whose defects a fix and a failing test later confirmed, one brief
   for every reviewer, found-or-missed scoring by two scorers (`evals/review/`, ADR 0046). First run
   2026-11-10, scored in `evals/review/runs/2026-11-10-first/`; the cases hold 23 confirmed defects, 10 in
