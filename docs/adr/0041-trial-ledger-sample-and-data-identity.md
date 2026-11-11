@@ -58,7 +58,7 @@ with what was tried.
    to a common range. A session day with no return in a trial's own series stops it too, and is never
    dropped from the calendar. Different instruments may share a study when their session days agree.
 3. **Data identity.** ADR 0053 term 1: the sample and a digest of the bars the run read.
-4. **The key is the configuration.** ADR 0053 term 2, which supersedes what ADR 0035 term 4 said
+4. **The key is the configuration.** ADR 0053 term 2, which supersedes what ADR 0035 term 4 (now ADR 0054 term 4) said
    `config` holds.
 5. **Moving the sample.** `move_sample(study, start, end)` appends a sample numbered after the last; the
    same range again is a new sample, the way a corrected catalog is taken in. A move reads and writes the

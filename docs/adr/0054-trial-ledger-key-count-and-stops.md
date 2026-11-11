@@ -1,0 +1,119 @@
+---
+status: accepted
+date: 2026-11-10
+decision-makers: repo owner by delegation; master orchestrator (Claude)
+review-by: 2026-12-10
+---
+
+# Reading the trial ledger: a hash of the config as the key, N as the count of keys, and what stops the ranking
+
+## Context and Problem Statement
+
+ADR 0035 keeps every backtest as a trial in an Optuna study, and ADR 0010 ranks the variants on every
+trial in it, with N counted from the ledger, never typed. How is a trial's configuration identified, how
+is N counted, and what stops the ranking from reading the study? Split from ADR 0035 on 2026-11-10, with
+no change of decision.
+
+## Decision Drivers
+
+* Every trial is kept, one that raised or never traded included, whatever the run does.
+* N is read back from the store, and a later session can open the store from a file.
+* ADR 0001: glue, not invention.
+
+## Considered Options
+
+These terms were decided with the store, ADR 0035's option 3 (an Optuna study), and weighed no options
+of their own; ADR 0035's Considered Options are the record's.
+
+## Decision Outcome
+
+Chosen with ADR 0035's option 3, split from it on 2026-11-10 with no change of decision. The terms keep
+ADR 0035's numbers, 4 to 6; terms 1 to 3 (storage, recording, entry) are ADR 0035's.
+
+4. **Identity.** `id` defaults to a fresh UUID4, and no config identity reaches Python. `config_key` is
+   the SHA-256 hex digest of the UTF-8 bytes of `json.dumps(config, sort_keys=True,
+   separators=(",", ":"), ensure_ascii=True, allow_nan=False)`, passed as `BacktestRunConfig(id=…)`.
+   Superseded in part by ADR 0053 term 2: what `config` holds and how its values are written. Until
+   then it held every public property upstream reflects and the run's `start` and `end`. Upstream
+   hashes only a result (`CanonicalBacktestResult::digest`, BLAKE3, not exposed); an exposed upstream
+   hash replaces this.
+5. **N** is the number of distinct `config_key` values in the study, in every state and on every
+   sample (ADR 0041), never filtered by state. ADR 0010 counts trials; reading a configuration run
+   again as the same trial is this record's. Records are never overwritten or deleted. Per key, a
+   `failed` or `RUNNING` record is resolved by a later record of that key that ran to the end (traded
+   or idle); the earlier one stays. Every record of a key that ran to the end on one sample must carry
+   the same outcome, range, returns and data (ADR 0053), else the ranking stops and names them. A key is one
+   column of the returns matrix.
+6. **What stops the ranking**, beside ADR 0031's, ADR 0041's and ADR 0053's: a study with no record; a key with no
+   record that ran to the end; a `failed` or `RUNNING` record no later record of its key resolves;
+   records of one key that disagree (term 5); an idle key (ADR 0010's Limits); and returns ADR 0010
+   step 2 rejects, or a record not in the shape `record_trial` writes. Each message names the key and
+   trial; one ranking gathers every trial's stops before it raises.
+   A configuration that can never run to the end stops the ranking for as long as that study is used.
+   That is the strict reading: a tried configuration is a trial, and no source read gives it a value.
+   Like the idle trial, it is undecided, not solved.
+
+Who decided. The orchestrator chose option 3 and the terms under the owner's delegation of 2026-11-10
+(ADR 0010's Evidence).
+
+### Consequences
+
+* Good: N is read from the ledger, never typed.
+* Bad: the config key is local glue.
+* Bad: a configuration that fails every time, or never trades, blocks the study's ranking.
+
+### Confirmation
+
+* Tests read N back through a new `Study` object after recording three configurations, and record one
+  configuration twice as one key with two records; runs differing in one input get different keys
+  (`tests/test_ledger.py`).
+* A ranking report names the study (`RankingReport.study`, `ranking.py`, read); no test asserts it.
+* A keyed failure with no sample number stops the ranking until a later record of its key resolves it
+  (`tests/test_ledger.py`).
+* Records of one key that differ only in outcome stop the ranking in either order, and a report names
+  only the pick's records that ran (`tests/test_ranking.py`).
+
+## Evidence
+
+Read 2026-11-10. Fetched means read in this session as raw text or source; run means executed here. The
+lines below are ADR 0035's, kept in both records where they support both; three are reworded to read
+from this record (which term was corrected where, and that the key and data moved on to ADR 0053).
+Term numbers are ADR 0035's.
+
+* https://raw.githubusercontent.com/nautechsystems/nautilus_trader/d53849b216e20f2c122ca01b4dd0da377638b186/crates/backtest/src/config.rs
+  — `BacktestRunConfig` derives `Debug, Clone`, `id` defaults to `UUID4::new()`, and no config is
+  hashed; `…/result.rs` and `…/python/result.rs`, the canonical result's BLAKE3 `digest` and Python
+  getters only. Fetched. In `.venv` the config is not picklable and two equal configs are unequal. Run.
+  `BacktestEngineConfig.streaming` is in the stub; its writer's files were not read: UNVERIFIED.
+* https://raw.githubusercontent.com/optuna/optuna/v5.0.0/optuna/study/_optimize.py — under `optimize`
+  an exception sets `FAIL`; under ask and tell nothing does, so this repo's code tells it.
+  `…/study/_tell.py`, a NaN told with no state is `FAIL`; `…/study/study.py`, `trials` returns every
+  state; `…/storages/_rdb/models.py`, `value_json` is `Text`. Fetched; `v5.0.0` resolved to `01ddd17ab9f3`.
+* Second reader, 2026-11-10 (`evidence-verifier`), two passes: the sources hold. It corrected the key's
+  fields, term 6's conditions, the FAIL claim, the unmarked readings of ADR 0010, the ignore rule, and a
+  failed record that would have stopped the ranking for good, now resolved by a later run of its key.
+* Full review, 2026-11-10 (`/code-review`): the ledger's place hung on the current directory and
+  opening created what was missing; the key hashed text as typed and upstream's reflected defaults, was
+  read from a config that could change after the strategy was built, and held nothing of the data. Terms
+  1 and 5 corrected, terms 3 and 4 point to ADR 0041, which holds the key, the sample and the data (the key and the
+  data since moved to ADR 0053).
+* Full review, 2026-11-10: a bar at exactly a UTC midnight fell on another day than its return; the
+  writes after `ask` sat outside the `try`; stops named no trial and came one stage at a time. Terms 3
+  and 6 corrected. `crates/analysis/src/analyzer.rs` at the pinned commit: `snapshot_day_start` moves a
+  non-zero midnight back one day. Fetched; a run of daily bars stamped at 00:00 UTC ranked T = 40.
+* A second review of the gate, 2026-11-10, read only: a creation interrupted between the name and the
+  sample could be neither opened nor created again, and a keyed failure written before its sample
+  number was left out of the ranking. Term 1 corrected in ADR 0035; the rest, and the sources, in ADR 0041's
+  Evidence. No change of decision.
+* A third review of the gate, 2026-11-10, read only: records of one key differing only in outcome gave
+  an answer that hung on their order, and the report credited the pick with records that never ran.
+  Terms 1 and 5 corrected, with the rest and the sources in ADR 0041's Evidence. No change of
+  decision.
+* ADR 0041's key and data identity, and part of the reviews' sources cited above, moved to ADR 0053 on
+  2026-11-10, with no change of decision; terms 3 to 6 point to ADR 0053 for them.
+* ADR 0035 as it stood on `main` before 2026-11-10's split: terms 4 to 6, their consequences, tests and
+  evidence, moved here with no change of decision (run: `git show` of the record on `main`).
+* Second reader (`evidence-verifier`), 2026-11-10: the sources and the moved terms hold; it corrected
+  the first Confirmation line, which had joined two tests' halves, this section's preamble and its
+  labels. Code review (`/code-review`, medium) of the split, the same day: references left on ADR 0035
+  for N, the key and the stops; corrected.

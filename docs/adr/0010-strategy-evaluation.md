@@ -40,7 +40,7 @@ of trials.
    (DSR p. 3). An optimiser search counts every configuration it tried. An entry holds NautilusTrader's
    `BacktestRunConfig` with its `id`, and the `BacktestResult` fields `run_config_id`, `backtest_start`,
    `backtest_end` and `returns_series`. `canon_trading.ledger.record_trial` writes it, in the store and
-   on the terms of ADR 0035.
+   on the terms of ADR 0035 and ADR 0054.
 2. **Run each variant over the whole period**, one `BacktestNode` per variant, through
    `canon_trading.backtest.run_backtest`. Accept `BacktestResult.returns_series` only if it is the daily
    portfolio series, with one key per UTC day. Any other shape is the per-position fallback, and that run is
@@ -73,7 +73,7 @@ Limits:
 ### Consequences
 
 * Bad: an idle trial stops every ranking of its study (Limits), and so does a configuration that never
-  runs to the end (ADR 0035).
+  runs to the end (ADR 0054).
 * The consequences of computing the gate with skfolio are in ADR 0031.
 
 ### Confirmation

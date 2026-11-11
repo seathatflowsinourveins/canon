@@ -24,7 +24,7 @@ ranking read no credential and call nothing outside the process.
 Run `python -m canon_trading.variant_study --create` once to create the study with its sample, then
 `python -m canon_trading.variant_study` to record and rank. A pass records every configuration of the
 grid whose latest record on the current sample did not run to the end, the same rule the gate uses to
-resolve a key (ADR 0035 term 5), then ranks and prints the report or the stop. `--rank-only` ranks
+resolve a key (ADR 0054 term 5), then ranks and prints the report or the stop. `--rank-only` ranks
 without recording. A pass holds an exclusive `fcntl.flock` (the standard library's, as
 `canon_trading.ledger` takes for creation) on a lock file beside the ledger, named for the study, so a
 second pass on the same study is refused rather than run beside it. The catalog defaults to the
@@ -125,7 +125,7 @@ def _to_record(study: optuna.Study, keys: Sequence[str]) -> list[str]:
     """The keys among `keys` whose latest record on the current sample did not run to the end.
 
     A key is resolved for the gate when every record that did not run to the end has a later one that
-    did (ADR 0035 term 5, `canon_trading.ranking`), which holds exactly when its latest record ran. So
+    did (ADR 0054 term 5, `canon_trading.ranking`), which holds exactly when its latest record ran. So
     a key with no record on the sample, or whose latest record failed or is still `RUNNING`, is run
     again. Records are placed on samples as `rank` places them (ADR 0041 term 5): a keyed one with no
     sample number of the study's is on the current sample, unless it ran to the end, which `rank`

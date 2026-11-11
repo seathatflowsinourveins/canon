@@ -222,7 +222,7 @@ def test_a_failed_and_an_idle_trial_are_counted(
         (TrialState.FAIL, FAILED),
     ]
     assert traded.outcome == TRADED and idle.outcome == IDLE
-    assert len(keys(reopened)) == 3  # N, read back through a new Study object (ADR 0035)
+    assert len(keys(reopened)) == 3  # N, read back through a new Study object (ADR 0054 term 5)
     assert "trade_size 1.5 is finer than" in trials[2].user_attrs["error"]
     assert not idle.run.result.total_orders
     assert set(trials[1].user_attrs["returns_series"].values()) == {0.0}

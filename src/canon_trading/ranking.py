@@ -1,7 +1,7 @@
 """The gate: rank the trials of a ledger study and test the pick's deflated Sharpe ratio at 0.95.
 
-Contract: ADR 0010, protocol step 3, computed as ADR 0031 decides, on the ledger of ADR 0035 over the
-sample of ADR 0041. skfolio
+Contract: ADR 0010, protocol step 3, computed as ADR 0031 decides, on the ledger of ADR 0035 and ADR 0054
+over the sample of ADR 0041. skfolio
 1.12.8, read 2026-11-10 in the installed `measures/_measures.py` and `portfolio/_base.py`:
 
 * `Portfolio.sharpe_ratio` of a one-asset portfolio with weight 1: each trial's Sharpe ratio per
@@ -22,7 +22,7 @@ V > 0. V counts as 0 when every trial's Sharpe ratio equals the first's under `m
 default tolerance (ADR 0031): copies of one configuration differ only in rounding, and would otherwise
 pass undeflated. A return that is not finite is refused, for every trial, by
 `canon_trading.returns_matrix`.
-It also stops on what ADR 0035 terms 5 and 6, ADR 0041 and ADR 0053 add: a configuration with a failed or
+It also stops on what ADR 0054 terms 5 and 6, ADR 0041 and ADR 0053 add: a configuration with a failed or
 `RUNNING` record that no later record of it resolves (a record with a key and no sample number is
 read as on the current sample, unless it ran), an idle one, records of one configuration that
 disagree (their outcome included), one not run on the study's current sample, returns ADR 0010 step 2
@@ -140,7 +140,7 @@ def _describe(trial: FrozenTrial) -> str:
 
 
 def ran_to_the_end(trial: FrozenTrial) -> bool:
-    """Whether the record ran to the end: finished, with outcome traded or idle (ADR 0035 term 5).
+    """Whether the record ran to the end: finished, with outcome traded or idle (ADR 0054 term 5).
 
     Public, with `on_current_sample`, so that a caller deciding which configurations to run again
     (`canon_trading.variant_study`) applies the rule `rank` applies, and follows it if it changes.
