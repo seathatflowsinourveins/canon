@@ -146,6 +146,13 @@ one or two orders a window has."""
 COMMIT_ENV = "CANON_COMMIT"
 """Set by the scheduled runner, `home/.claude/canon/paper-session.sh`, to the `origin/main` commit it checked
 out for this firing (ADR 0050)."""
+BY_HAND_ENV = "CANON_PAPER_BY_HAND"
+"""`1` in a run of `mise run paper:session` the schedule did not start (`mise.toml`): its records go to
+`by-hand/` in the log folder, which `scripts/automation status` does not read; the gap marker and the
+node's logs stay in the log folder, so the gap still separates every window (ADR 0050)."""
+SCHEDULED_ENV = "CANON_PAPER_SCHEDULED"
+"""`1` only in a run the schedule started: the launchd agent's plist sets it (launchd.plist(5),
+EnvironmentVariables), so a run of the runner or the task by hand does not have it (ADR 0050)."""
 SOURCE_ROOT = Path(__file__).resolve().parents[2]
 """The checkout this module runs from."""
 MARKET_EXIT_INTERVAL_MS = 1000
@@ -426,15 +433,30 @@ class WindowSkipped(RuntimeError):
 
 
 def _write_atomically(path: Path, body: str) -> None:
-    """Replace `path` whole (`os.replace`), so a reader or a kill never sees half a record."""
-    temporary = path.with_name(f".{path.name}.tmp")
-    temporary.write_text(body)
-    os.replace(temporary, path)
+    """Replace `path` whole (`os.replace`), so a reader or a kill never sees half a record, through a
+    temporary file of this writer's own (`tempfile.mkstemp`), so two writers never share one."""
+    fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    try:
+        with os.fdopen(fd, "w") as out:
+            out.write(body)
+        os.replace(temporary, path)
+    except BaseException:
+        Path(temporary).unlink(missing_ok=True)
+        raise
+
+
+def records_dir(log_dir: Path) -> Path:
+    """Where this run's records go: `log_dir`, or its `by-hand/` for a run by hand (`BY_HAND_ENV`)."""
+    if os.environ.get(BY_HAND_ENV, "") == "1":
+        log_dir = log_dir / "by-hand"
+        log_dir.mkdir(parents=True, exist_ok=True)
+    return log_dir
 
 
 def write_record(log_dir: Path, report: WindowReport | dict) -> None:
     """Write `latest.json`, the one record `scripts/automation status` reads, and, for a window that ran,
-    its own `window-<stamp>.json`."""
+    its own `window-<stamp>.json`, in `records_dir`."""
+    log_dir = records_dir(log_dir)
     body = json.dumps(asdict(report) if isinstance(report, WindowReport) else report, indent=2)
     if isinstance(report, WindowReport):
         _write_atomically(log_dir / f"window-{report.started}.json", body)
@@ -443,18 +465,23 @@ def write_record(log_dir: Path, report: WindowReport | dict) -> None:
 
 def write_heartbeat(log_dir: Path, outcome: str) -> None:
     """Write `last-firing.json` on every run, a window or not, a run by hand included: status shows its
-    outcome, and `scheduled` says whether the scheduled runner started it (`CANON_COMMIT` set). Whether the
-    schedule still fires, status reads from the runner's own stamp, `scheduled-firing.json`, which no run
-    by hand writes (ADR 0050)."""
+    outcome, and `scheduled` says whether the schedule started it (`SCHEDULED_ENV`, or the runner's
+    `COMMIT_ENV` without `BY_HAND_ENV`, as a runner installed before `SCHEDULED_ENV` sets it). Whether the schedule
+    still fires, status reads from the runner's own stamp, `scheduled-firing.json`, which no run by hand
+    writes; a run by hand writes to its own folder (`mise.toml`, paper:session; ADR 0050)."""
     log_dir.mkdir(parents=True, exist_ok=True)
     _write_atomically(
-        log_dir / "last-firing.json",
+        records_dir(log_dir) / "last-firing.json",
         json.dumps(
             {
                 "at_epoch": time.time(),
                 "outcome": outcome,
                 "commit": running_commit(),
-                "scheduled": bool(os.environ.get(COMMIT_ENV, "").strip()),
+                "scheduled": os.environ.get(SCHEDULED_ENV, "") == "1"
+                or (
+                    bool(os.environ.get(COMMIT_ENV, "").strip())
+                    and os.environ.get(BY_HAND_ENV, "") != "1"
+                ),
             }
         ),
     )

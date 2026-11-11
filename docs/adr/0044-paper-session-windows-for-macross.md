@@ -77,8 +77,8 @@ and its record says so (`shortened`). The timeouts' sums are not wall-clock boun
 applies per address tried, the read timeout between bytes, ADR 0039). A window also ends `END_MARGIN_SECS`
 (395 s) before its session: the check's last market close goes out at most about 334 s after the end
 (`LAST_CLOSE_SECS`), and a minute covers skew between Alpaca's clock and the host's, so it is sent while
-the session is open. The same sum with `paper:session`'s 900 s wait for the lock fits its 85-minute
-deadline. A test reads the 3900, the 900 and the 85 minutes from `mise.toml`.
+the session is open. The same sum with `paper:session`'s 900 s wait for the lock fits its 105-minute
+deadline. A test reads the 3900, the 900 and the 105 minutes from `mise.toml`.
 
 ### Consequences
 
@@ -226,6 +226,8 @@ the next open, and extended windows once the extended-hours change and the disco
 
 Read 2026-11-10. "raw": fetched with `curl` and read whole. NautilusTrader files at the pin, `d53849b216e2`.
 
+* 2026-11-10: `paper:session`'s deadline moved from 85 to 105 minutes, so the start before the node and the
+  window's bounded end both fit before the lock's owner is killed (ADR 0050, a second reader's review) (run).
 * https://nautilustrader.io/docs/md/latest/how_to/configure_live_trading.md, "Continuous reconciliation":
   the two intervals, off by default, and their recommended ranges (fetched, raw).
 * https://nautilustrader.io/docs/md/latest/concepts/execution/reconciliation.md, "Position reconciliation",
