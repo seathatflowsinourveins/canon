@@ -45,12 +45,35 @@ login keychain without a dialog is UNVERIFIED until its first firing. A firing w
 
 * Good: once installed, a window starts every 35 minutes while the Mac is awake and a session is open, with
   no one starting it, each on the newest `main`; extended sessions only once `EXTENDED_READY` is on.
-* Bad: one paper account still serves the windows and the paper tests; a test can lose the lock to a window
-  (ADR 0044). A window refused for an account that is not flat stays refused until someone clears it. A
-  node that hangs on stop (ADR 0044's disconnect hang) is waited for at most `STOP_TIMEOUT_SECS` (about
-  115 s); the window is then recorded failed, the node's last worker calls waited for (at most about
-  129 s), the account checked (polls start for `AFTER_STOP_SECS`, 60 s, and the last runs on), and the
-  process ended (ADR 0044).
+* Since 2026-11-11 the windows run on paper account B and the paper tests on account A, each under its
+  own lock, and both take a stream lock last, since Alpaca allows a user one market-data stream connection
+  per endpoint on many subscriptions, which for a second paper account of one login is UNVERIFIED
+  (ADR 0069). What each waits for:
+  * A paper test waits up to 3900 s for account A's lock, which only another `paper:test` run holds (a
+    full run about five minutes, observed; one that hangs, to its 7140 s deadline). A test in a module that
+    streams (the `alpaca_stream` marker) then waits up to 3900 s for the stream lock, and never past the
+    point where less than 900 s (`TEST_ROOM_SECS`) would be left before that deadline. A window holds that
+    lock from after uv's sync to its bounded end: `START_UP_SECS` (30), the first clock read with retries
+    (`ADAPTER_CALL_SECS`, 129), the window (`LONGEST_WINDOW_SECS`, 2955, or 1500 for a scheduled 25
+    minutes), `SKEW_SECS` (60) and `AFTER_END_SECS` (725). That is 3899 s at the longest and about 2444 s
+    for a scheduled window, so the test's wait outlasts one window that runs as it should. A test that
+    does not stream waits for no window.
+  * A window waits for account B's lock, which only another window holds (one by hand, or a firing:
+    launchd skips a firing while one runs). It then waits for the stream lock, which a streaming paper
+    test holds for that test alone (a whole paper run took about five minutes, observed; how long one
+    test takes is UNVERIFIED). Both waits share the one 900 s wait in the deadline
+    below, so its sum is unchanged; past it, the window places nothing.
+  * No run holds the stream lock while it waits for an account's lock, so the three locks cannot deadlock.
+* Bad: each streaming test waits for the stream lock on its own, so the waits of one run add up across its
+  streaming tests; once only 900 s would be left before `paper:test`'s deadline, a test that finds the lock
+  held fails placing nothing, and the tests after it may fail the same way. The tests before it may already
+  have placed and cleaned up their orders. A test that takes longer than 900 s once it has the lock can
+  still be killed at the deadline, its cleanup unrun, as any run killed there. From a terminal only mise's
+  7200 s `timeout` ends the run, and the fixture still counts its room from the task's 7140 s. A window refused for an account that is not flat stays refused until
+  someone clears it. A node that hangs on stop (ADR 0044's disconnect hang) is waited for at most
+  `STOP_TIMEOUT_SECS` (about 115 s). The window is then recorded failed, the node's last worker calls
+  waited for (at most about 129 s), the account checked (polls start for `AFTER_STOP_SECS`, 60 s, and the
+  last runs on; ADR 0060), and the process ended.
 * Bad: the clone's kept `.venv` is trusted local state, as a person's checkout's is: `--exact` removes
   extraneous packages but not other files (a loose `.pth` still ran, observed), and uv documents no check
   of files outside its packages. Nothing else is kept: the clone, its `.git` and worktree are new each firing.
@@ -61,12 +84,13 @@ login keychain without a dialog is UNVERIFIED until its first firing. A firing w
   lock wait (900), a start-up allowance (600: uv's sync after a uv.lock change measured 8 s from an empty
   cache, 464 MB), four Alpaca calls before the node at their longest with alpaca-py's retries (4 x
   `ADAPTER_CALL_SECS`, 517), a host clock behind Alpaca's (`SKEW_SECS`, 60), the longest window
-  (`LONGEST_WINDOW_SECS`, 2955) and its bounded end (`AFTER_END_SECS`, 725): 5757, 483 s spare; a test
+  (`LONGEST_WINDOW_SECS`, 2955) and its bounded end (`AFTER_END_SECS`, 725), with the imports after the
+  sync (`START_UP_SECS`, 30): 5787, 453 s spare; a test
   reads those bounds from `session_window`. From a
   person's terminal uv runs as before, with mise's `timeout` as the deadline: through timeout(1) one Ctrl-C
-  reached Python twice (observed), which could cut a flatten short. A window run as it should holds the lock under
-  paper:test's 3900 s wait (ADR 0044); one that hangs holds it to the deadline, past the 70 minutes after
-  which status calls it died, and a queued test fails placing nothing. `timeout` is `/usr/bin/timeout`,
+  reached Python twice (observed), which could cut a flatten short. A window run as it should holds the stream lock under
+  a streaming paper test's 3900 s wait (above); one that hangs holds it to the deadline, past the 70 minutes
+  after which status calls it died, and a queued streaming test fails placing nothing. `timeout` is `/usr/bin/timeout`,
   Apple's (signed `com.apple.timeout`, on the sealed system volume of macOS 27.2); which macOS first
   shipped it is UNVERIFIED, and where it is absent the runner, the watchdog and the paper tasks fail.
 
@@ -146,7 +170,7 @@ or `tests/test_session_window.py`, or by a probe under mise 2026.11.5:
   time and outcome reads UNKNOWN;
 * own finding: mise appends a task's arguments to its script's last line (observed), so from a terminal
   `--session` and `-k` were dropped; that line now calls the function that runs uv.
-The account check's uncounted lookups (orders in doubt, a lost close's search) stay ADR 0044's; the deadline
+The account check's lookups (orders in doubt, a lost close's search) stay ADR 0060's; the deadline
 test reads `session_window`'s bounds, so it fails once they outgrow the deadline. GitHub's Ubuntu runner has
 no lockf(1), plutil or launchd: the runner, the deadline under mise and the install rehearsal run only on a
 Mac, and a run that skips them says so last and as a warning annotation. flock(1) is another call, not a stand-in.
@@ -155,8 +179,10 @@ Mac, and a run that skips them says so last and as a warning annotation. flock(1
 
 Read 2026-11-10. "raw": fetched with `curl` and read whole.
 
-* ADR 0069, 2026-11-10: a second paper account, B, for the windows; the schedule moves to it once
-  `paper:session` reads B's pair. Until then this record stands as written.
+* ADR 0069, 2026-11-10: a second paper account, B, for the windows. Since 2026-11-11 `paper:session`, and
+  so the schedule, reads B's pair only, under B's lock and the stream lock (`mise.toml`;
+  `scripts/test-lanes` and `tests/test_session_window.py`, run). The waits above are taken from
+  `session_window`'s bounds (run).
 * https://nautilustrader.io/docs/md/latest/how_to/configure_live_trading.md: "run nodes as standalone
   Python scripts or services"; "One LiveNode per process" (fetched, raw).
 * `scripts/automation` and ADR 0011: the launchd agent, its install, status and uninstall (read).
@@ -220,5 +246,7 @@ Read 2026-11-10. "raw": fetched with `curl` and read whole.
   message" (fetched).
 * Second reader (`evidence-verifier`), 2026-11-10, on this split: added the skill and clock lines, marked
   the weekend reading `UNVERIFIED`, narrowed the Good consequence and corrected the install line.
-* 2026-11-10: the deadline's sum follows ADR 0044's recounted account check (`LONGEST_WINDOW_SECS` 3076 to
+* 2026-11-10: the deadline's sum follows the recounted account check (then in ADR 0044, now ADR 0060) (`LONGEST_WINDOW_SECS` 3076 to
   2955, `AFTER_END_SECS` 605 to 725; the two move together, so the sum is 5757 where it was 5758) (run).
+* 2026-11-11: the sum written here now counts `START_UP_SECS` (30), as the deadline test always has: 5787,
+  453 s spare (`evidence-verifier`, run).

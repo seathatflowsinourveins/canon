@@ -1045,14 +1045,27 @@ num() { sed -n "s/^$1=\([0-9]*\).*/\1/p" "$2" | awk 'NR == 1'; }   # num <NAME> 
 # shellcheck disable=SC2034  # read by the eval'd checks
 for t in paper:session paper:test; do
   to=$(secs "$(task_part "$t" timeout)")
-  w=$(task_part "$t" run | grep -oE 'lockf( -[a-z]+)* -t [0-9]+' | grep -oE '[0-9]+$' | awk 'NR == 1')
+  w=$(task_part "$t" run | sed -n 's/^lockwait=\([0-9]*\)$/\1/p' | awk 'NR == 1')
   dl=$(task_part "$t" run | sed -n 's/^deadline=\([0-9]*\)$/\1/p' | awk 'NR == 1')
   check "$t: uv runs under timeout -s KILL at its deadline (${dl:-none} s), 60 s inside its mise timeout (${to} s), above its lock wait (${w:-none} s), unless from a terminal" \
-        eval '[ -n "$w" ] && [ -n "$dl" ] && [ "$dl" = $((to - 60)) ] && [ "$dl" -gt "$w" ] && grep -qE "^  bounded \"\\\$left\" uv run " <<<"$(task_part "$t" run)" && grep -qE "^  /usr/bin/timeout -s KILL \"\\\$b\" \"\\\$@\" & g=\\\$!\$" <<<"$(task_part "$t" run)" && grep -qE "^  \[ ! -t 0 \] \|\| exec uv run " <<<"$(task_part "$t" run)"'
+        eval '[ -n "$w" ] && [ -n "$dl" ] && [ "$dl" = $((to - 60)) ] && [ "$dl" -gt "$w" ] && grep -qE "^  bounded \"\\\$left\" uv run " <<<"$(task_part "$t" run)" && grep -qE "^  /usr/bin/timeout -s KILL \"\\\$b\" \"\\\$@\" & g=\\\$!\$" <<<"$(task_part "$t" run)" && grep -qE "^(  \[ ! -t 0 \] \|\| |    )exec uv run " <<<"$(task_part "$t" run)"'
   envs=$(task_env "$t")
   check "$t: each keychain read runs under timeout(1), at most 30 s" \
         eval '[ "$(grep -c "exec(command=" <<<"$envs")" = 2 ] && [ "$(grep -cE "exec\(command=.\/usr\/bin\/timeout (30|[12][0-9]|[1-9]) \/usr\/bin\/security " <<<"$envs")" = 2 ]'
 done
+# Two accounts (ADR 0069): each task reads one account's pair and takes that account's lock, and only
+# paper:session takes the stream lock in its body (a paper test takes it from its fixture, told where by the
+# task); the services and lock names are read from the bodies and env lines as mise.toml has them
+# shellcheck disable=SC2034  # read by the eval'd checks
+{ se=$(task_env paper:session); te=$(task_env paper:test); sb=$(task_part paper:session run); tb=$(task_part paper:test run); }
+check "paper:session reads account B's pair only (service canon-alpaca-paper-windows) and paper:test account A's only" \
+      eval '[ "$(grep -c -- "-s canon-alpaca-paper-windows -a ALPACA_" <<<"$se")" = 2 ] && ! grep -q -- "-s canon-alpaca-paper -a" <<<"$se" && [ "$(grep -c -- "-s canon-alpaca-paper -a ALPACA_" <<<"$te")" = 2 ] && ! grep -q -- "canon-alpaca-paper-windows" <<<"$te"'
+check "... each takes its own account's lock: paper:session canon-paper-windows.lock, paper:test canon-paper-test.lock" \
+      eval 'grep -qF "exec 9>>\"\${tmp}canon-paper-windows.lock\"" <<<"$sb" && ! grep -q canon-paper-test.lock <<<"$sb" && grep -qF "exec 9>>\"\${tmp}canon-paper-test.lock\"" <<<"$tb" && ! grep -q canon-paper-windows.lock <<<"$tb"'
+# shellcheck disable=SC2034  # read by the eval'd check
+term=$(sed -n '/^  if \[ -t 0 \]; then$/,/^  fi$/p' <<<"$sb" | sed -n '2,4p' | cut -c1-14 | tr '\n' '|')
+check "... paper:session takes the stream lock on descriptor 7 after uv's sync, from a terminal too, and paper:test names it and its deadline to its tests" \
+      eval '[ "$term" = "    uv run --l|    stream|    exec uv ru|" ] && grep -qF "export CANON_ALPACA_STREAM_LOCK=\"\${tmp}canon-alpaca-stream.lock\" CANON_PAPER_TEST_DEADLINE=\$((start + deadline))" <<<"$tb" && grep -qF "exec 7>>\"\${tmp}canon-alpaca-stream.lock\"" <<<"$sb" && grep -qx "  stream" <<<"$sb" && ! grep -q "exec 7>>" <<<"$tb"'
 RUNNER="$ROOT/home/.claude/canon/paper-session.sh"
 check "paper:session's timeout is scripts/automation's PAPER_DEADLINE and the runner's TASK_SECS" \
       eval '[ "$(num PAPER_DEADLINE "$ROOT/scripts/automation")" = "$(secs "$(task_part paper:session timeout)")" ] && [ "$(num TASK_SECS "$RUNNER")" = "$(num PAPER_DEADLINE "$ROOT/scripts/automation")" ]'
@@ -1117,13 +1130,16 @@ else
   # owner <task> <folder> <deadline> [sync]: <folder>/mise.toml with one task, owner, whose body is <task>'s
   # from mise.toml with its lock folder moved into <folder>, its deadline (and paper:session's start-up bound,
   # sync) shortened; fails when the body cannot be found or moved
+  # [lockdir] puts the locks in another folder, so two owners can share them, and [lockwait] shortens the wait
   owner() {
-    local body moved
+    local body moved ld=${5:-$2} ed
     body=$(task_part "$1" run)
-    moved=${body//"$getconf"/"$2/"}
-    # shellcheck disable=SC2001  # whole lines, anchored
-    moved=$(sed -e "s/^deadline=[0-9]*\$/deadline=$3/" -e "s/^sync=[0-9]*\$/sync=${4:-1}/" <<<"$moved")
-    if [ -z "$body" ] || [[ "$moved" == *getconf* ]] || [[ "$moved" != *"$2/"* ]] || [[ "$moved" == *"{{"* ]] || [[ "$moved" != *"deadline=$3"* ]]; then
+    moved=${body//"$getconf"/"$ld/"}
+    ed=(-e "s/^deadline=[0-9]*\$/deadline=$3/" -e "s/^sync=[0-9]*\$/sync=${4:-1}/")
+    [ -z "${6:-}" ] || ed+=(-e "s/^lockwait=[0-9]*\$/lockwait=$6/")
+    moved=$(sed "${ed[@]}" <<<"$moved")
+    if [ -z "$body" ] || [[ "$moved" == *getconf* ]] || [[ "$moved" != *"$ld/"* ]] || [[ "$moved" == *"{{"* ]] || [[ "$moved" != *"deadline=$3"* ]] \
+       || { [ -n "${6:-}" ] && [[ "$moved" != *"lockwait=$6"* ]]; }; then
       return 1
     fi
     { printf '[tasks.owner]\ntimeout = "%ss"\nenv.ALPACA_API_KEY = "stand-in"\nenv.ALPACA_SECRET_KEY = "stand-in"\n' "$(( $3 + 30 ))"
@@ -1158,6 +1174,7 @@ EOF
   }
   # shellcheck disable=SC2034  # held, orc, up, free and took are read by the eval'd checks
   for t in paper:session paper:test; do
+    alock=canon-paper-test.lock; [ "$t" = paper:test ] || alock=canon-paper-windows.lock   # each account's own (ADR 0069)
     for how in "uv ignores SIGTERM" "uv keeps SIGTERM's default"; do
       LD="$TMP/deadline-${t#paper:}-${how%% *}${how##* }"; mkdir -p "$LD"
       if ! owner "$t" "$LD" 6; then
@@ -1167,11 +1184,11 @@ EOF
       standin "$LD" "$trapline"
       (cd "$LD" && env -i HOME="$HOME" MISE_CEILING_PATHS="$TMPP" LD="$LD" PATH="$LD/bin:/usr/bin:/bin" "$LMISE" run owner > "$LD/out" 2>&1) & op=$!
       ready "$LD" "$op"
-      /usr/bin/lockf -k -t 0 "$LD/canon-paper-test.lock" true 2>/dev/null; held=$?
+      /usr/bin/lockf -k -t 0 "$LD/$alock" true 2>/dev/null; held=$?
       wait "$op"; orc=$?
       sleep 1   # anything still alive now outlived the deadline
       up=$(left_up "$LD")
-      /usr/bin/lockf -k -t 0 "$LD/canon-paper-test.lock" true 2>/dev/null; free=$?
+      /usr/bin/lockf -k -t 0 "$LD/$alock" true 2>/dev/null; free=$?
       check "$t, $how: a second run cannot take the lock while it runs" eval '[ -s "$LD/child.pid" ] && [ "$held" != 0 ]'
       check "... the deadline stops it and fails the task"      test "$orc" != 0
       check "... nothing it started is left running (left:${up:- none})" test -z "$up"
@@ -1193,7 +1210,7 @@ EOF
       wait "$op"; orc=$?
       for _ in $(seq 50); do [ -z "$(left_up "$LD")" ] && break; sleep 0.1; done
       took=$(( $(date +%s) - s0 )); up=$(left_up "$LD")
-      /usr/bin/lockf -k -t 0 "$LD/canon-paper-test.lock" true 2>/dev/null; free=$?
+      /usr/bin/lockf -k -t 0 "$LD/$alock" true 2>/dev/null; free=$?
       check "$t, a SIGTERM to $to before the deadline: the task fails, nothing it started is left (left:${up:- none}), the lock free, in ${took} s" \
             eval '[ -s "$LD/child.pid" ] && [ "$orc" != 0 ] && [ -z "$up" ] && [ "$free" = 0 ] && [ "$took" -lt 30 ]'
       reap "$LD"
@@ -1208,12 +1225,58 @@ EOF
     s0=$(date +%s)
     (cd "$LD" && exec env -i HOME="$HOME" MISE_CEILING_PATHS="$TMPP" PATH="$LD/bin:/usr/bin:/bin" "$LMISE" run owner > "$LD/out" 2>&1); orc=$?
     took=$(( $(date +%s) - s0 ))
-    /usr/bin/lockf -k -t 0 "$LD/canon-paper-test.lock" true 2>/dev/null; free=$?
+    /usr/bin/lockf -k -t 0 "$LD/canon-paper-windows.lock" true 2>/dev/null; free=$?
     check "paper:session, a start-up that hangs: the task fails at its start-up bound (${took} s of a 40 s deadline), no window started, the lock free" \
           eval '[ "$orc" != 0 ] && [ "$took" -lt 35 ] && [ -s "$LD/sync.pid" ] && ! kill -0 "$(cat "$LD/sync.pid")" 2>/dev/null && [ ! -e "$LD/uv.pid" ] && [ "$free" = 0 ] && grep -q "start-up" "$LD/out"'
     reap "$LD"
   else
     t_fail "paper:session's body has a start-up bound, sync=, that the test can shorten"
+  fi
+  # Two accounts, two locks (ADR 0069), run under mise with both bodies sharing one lock folder: a window that
+  # runs holds account B's lock and the stream lock, and a paper test on account A runs meanwhile, at once
+  AB="$TMP/two-accounts"; mkdir -p "$AB/locks" "$AB/s" "$AB/t" "$AB/w"
+  if owner paper:session "$AB/s" 40 1 "$AB/locks" && owner paper:test "$AB/t" 40 1 "$AB/locks" && owner paper:session "$AB/w" 40 1 "$AB/locks" 3; then
+    standin "$AB/s" ""
+    (cd "$AB/s" && exec env -i HOME="$HOME" MISE_CEILING_PATHS="$TMPP" PATH="$AB/s/bin:/usr/bin:/bin" "$LMISE" run owner > "$AB/s/out" 2>&1) & op=$!
+    ready "$AB/s" "$op"
+    # shellcheck disable=SC2034  # read by the eval'd checks
+    { /usr/bin/lockf -k -t 0 "$AB/locks/canon-paper-windows.lock" true 2>/dev/null; bheld=$?; }
+    # shellcheck disable=SC2034  # read by the eval'd checks
+    { /usr/bin/lockf -k -t 0 "$AB/locks/canon-alpaca-stream.lock" true 2>/dev/null; sheld=$?; }
+    # shellcheck disable=SC2034  # read by the eval'd checks
+    { /usr/bin/lockf -k -t 0 "$AB/locks/canon-paper-test.lock" true 2>/dev/null; afree=$?; }
+    mkdir -p "$AB/t/bin"
+    printf '#!/bin/bash\nprintf %%s "$CANON_ALPACA_STREAM_LOCK" > "%s/stream-env"\n' "$AB/t" > "$AB/t/bin/uv"; chmod +x "$AB/t/bin/uv"
+    s0=$(date +%s)
+    # shellcheck disable=SC2034  # read by the eval'd checks
+    (cd "$AB/t" && exec env -i HOME="$HOME" MISE_CEILING_PATHS="$TMPP" PATH="$AB/t/bin:/usr/bin:/bin" "$LMISE" run owner > "$AB/t/out" 2>&1)
+    # shellcheck disable=SC2034  # read by the eval'd checks
+    trc=$?
+    took=$(( $(date +%s) - s0 ))
+    check "a window on account B, running: it holds B's lock and the stream lock, and A's lock is free" \
+          eval '[ -s "$AB/s/child.pid" ] && [ "$bheld" != 0 ] && [ "$sheld" != 0 ] && [ "$afree" = 0 ]'
+    check "... a paper test on account A runs meanwhile at once (${took} s) and is told where the stream lock is" \
+          eval '[ "$trc" = 0 ] && [ "$took" -lt 20 ] && [ "$(cat "$AB/t/stream-env" 2>/dev/null)" = "$AB/locks/canon-alpaca-stream.lock" ]'
+    kill -TERM "$op" 2>/dev/null; wait "$op" 2>/dev/null; reap "$AB/s"
+    # a window waits for the stream lock a streaming paper test holds, inside its one wait, and past it fails
+    # with no window started and account B's lock free
+    /usr/bin/lockf -k "$AB/locks/canon-alpaca-stream.lock" sleep 30 & hp=$!
+    for _ in $(seq 50); do /usr/bin/lockf -k -t 0 "$AB/locks/canon-alpaca-stream.lock" true 2>/dev/null || break; sleep 0.1; done
+    standin "$AB/w" ""
+    s0=$(date +%s)
+    # shellcheck disable=SC2034  # read by the eval'd checks
+    (cd "$AB/w" && exec env -i HOME="$HOME" MISE_CEILING_PATHS="$TMPP" PATH="$AB/w/bin:/usr/bin:/bin" "$LMISE" run owner > "$AB/w/out" 2>&1)
+    # shellcheck disable=SC2034  # read by the eval'd checks
+    wrc=$?
+    took=$(( $(date +%s) - s0 ))
+    # shellcheck disable=SC2034  # read by the eval'd checks
+    { /usr/bin/lockf -k -t 0 "$AB/locks/canon-paper-windows.lock" true 2>/dev/null; bfree=$?; }
+    kill "$hp" 2>/dev/null; wait "$hp" 2>/dev/null
+    check "a window while a paper test holds the stream lock: it waits its 3 s, fails with no window started (${took} s), B's lock free" \
+          eval '[ "$wrc" != 0 ] && [ "$took" -lt 20 ] && [ ! -e "$AB/w/uv.pid" ] && [ "$bfree" = 0 ] && grep -q "stream lock stayed held" "$AB/w/out"'
+    reap "$AB/w"
+  else
+    t_fail "paper:session's and paper:test's bodies found, their locks moved into one folder and the wait shortened"
   fi
   # a keychain read that waits (at a dialog no one sees): the task's env, rendered before its timeout starts,
   # ends at the read's own bound, and the body never runs
