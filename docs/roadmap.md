@@ -68,5 +68,5 @@ arrangement with Alpaca, and outside what agents decide.
   first run is scored there, its cases hold 23 confirmed defects (10 in `order-modify`, 10 in
   `trial-ledger-gate`), and its pending
   cases wait on fixes reaching `main`. For builders, the eval's cases, brief and harness are in
-  `evals/build/` (ADR 0057); its first trial, which also sets the bar's levels, has not run, and how the
-  cockpit starts a worker in a tree that is not a worktree is not yet known.
+  `evals/build/` (ADR 0057); its first trial's three waves are scored there; the reference failed the bar,
+  so no level is set yet, and what changes before a new trial is open (ADR 0079).
