@@ -9,8 +9,8 @@ review-by: 2026-12-09
 
 ## Context and Problem Statement
 
-The owner asked for "suitable models for suitable tasks", from Claude Code sessions down to runtime workers,
-using the latest models. Which model and effort does each lane use, and how is that kept current?
+The owner required each task to run on a model suited to it, from Claude Code sessions down to runtime
+workers, using the latest models. Which model and effort does each lane use, and how is that kept current?
 
 ## Decision Drivers
 
@@ -53,7 +53,7 @@ Rules:
    models' overall). The build row of the table has two raises. `raise_to` names an effort on the same
    model, for a hard change. `raise_model_to` names a lane, `orchestrator`, whose model and effort the
    session takes instead; it names the lane, not a model, so the two cannot drift apart. Limiting the
-   raise to design-heavy work is this record's narrowing of the owner's words: a decision record, or a
+   raise to design-heavy work is this record's narrowing of the owner's instruction: a decision record, or a
    state machine on which review rounds keep finding the same family of defect. That is the case in
    hand. On Opus 5.5, modify by replace took two changes (#55, #69) and two more that fixed replace
    defects among others (#99, #107); a session window's account check took four (#97, #105, #110, #114)
@@ -143,7 +143,7 @@ Read 2026-11-09.
   repository's history: the subjects and `Co-Authored-By` trailers of the ten commits (read, `git log`).
 * Second reader of rule 7, 2026-11-10 (`evidence-verifier`): the quotation and the trailers held, and
   nothing that reads the table breaks. It regrouped the ten changes by what each fixed, and had the
-  guide's effort sweep, the unrecorded effort and the narrowing of the owner's words stated; all above.
+  guide's effort sweep, the unrecorded effort and the narrowing of the owner's instruction stated; all above.
 * 2026-11-10, with ADR 0059: the machine default, the alias pins and the picker settings above, and the
   table's `claude_code` and `runtimes` sections; the evidence is in that record.
 * Cost-optimisation guide bundled with Claude Code 2.1.321 (`claude-api` skill, `shared/cost-optimization.md`)

@@ -92,8 +92,9 @@ second reader's line support both records and are kept whole in each.
 * https://www.davidhbailey.com/dhbpapers/deflated-sharpe.pdf — the DSR paper, version of 2014-07-31, sha256
   ca4a1e83. Read: eqs. 1 and 2, the example on pp. 9–10, pp. 3, 6 and 14–15, where the paper writes M for
   all trials. Fetched; the equations read from page images.
-* The owner, 2026-11-10: "auto proceed with sota convergence you as master orchestrator". The choices under
-  "Who decided" were made under that sentence by the orchestrator, not by the owner item by item.
+* The owner decided on 2026-11-10 that the orchestrator proceeds automatically on state-of-the-art
+  convergence, leaving the open choices to it. The choices under "Who decided" were made under that delegation by the
+  orchestrator, not by the owner item by item.
 * https://github.com/nautechsystems/nautilus_trader/discussions/912 — limx0, December 2022: optimisation is
   "explicitly left out"; walk-forward "probably won't feature in the core codebase". Fetched.
 * nautilus-trader 2.0.0rc8 in `.venv`, `backtest/__init__.pyi` — `BacktestRunConfig.id`, and

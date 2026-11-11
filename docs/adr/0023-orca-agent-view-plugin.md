@@ -127,5 +127,6 @@ Read 2026-11-10. `fetched`: downloaded whole with `curl` and read, not summarise
   draft left out, and that no condition of ADR 0004 is met; it asked for `proposed`. The status changed to
   `accepted` on the owner's delegation below; a second pass, the same day, had the sentence on the risk being
   told labelled and the driver the choice rests on named.
-* The owner's delegation, 2026-11-10: "auto proceed with sota convergence you as master orchestrator", given
+* The owner's delegation, 2026-11-10: the coordinator proceeds automatically on state-of-the-art convergence,
+  leaving the open choices to it. It was given
   after this record's risk was reported to the owner (not re-observable; UNVERIFIED).
