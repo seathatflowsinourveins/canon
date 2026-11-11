@@ -1,0 +1,64 @@
+
+
+def test_second_modify_refused_while_first_replaced_lands(venue) -> None:
+    venue.trading.script = "accept"
+    venue.trading.replace_script = "silent"
+    strategy = modifier(field="quantity", prices=["5"])
+    seen: list = []
+
+    async def second(client) -> None:
+        cached = client.cache.order(strategy.client_order_id)
+        command = SimpleNamespace(
+            client_order_id=strategy.client_order_id,
+            venue_order_id=cached.venue_order_id,
+            quantity=None,
+            price=Price.from_str("151.00"),
+            trigger_price=None,
+        )
+        orig = venue.trading.get_order_by_id
+
+        def slow(order_id):
+            time.sleep(0.5)
+            return orig(order_id)
+
+        venue.trading.get_order_by_id = slow
+        task = asyncio.ensure_future(client._modify_order(command))
+        await asyncio.sleep(0.1)
+        venue.trading.confirm_replace(placed_order(venue, 0)["id"])
+        await task
+        await until_idle(client, venue)
+        seen.extend(strategy.names())
+
+    run_modify(venue, strategy, lambda: bool(venue.trading.replace_requests), second)
+
+    print("EVENTS", seen)
+    assert len(venue.trading.replace_requests) == 2
+    assert "OrderUpdated" in seen
+    assert "OrderModifyRejected" in seen, seen
+
+
+def test_two_modifies_both_refused_in_flight(venue, alpaca) -> None:
+    venue.trading.script = "accept"
+    strategy = modifier(prices=[])
+
+    async def both(client) -> None:
+        venue.trading.replace_error = alpaca.api_error(422, 42210000, "order cannot be replaced")
+        cached = client.cache.order(strategy.client_order_id)
+        commands = [
+            SimpleNamespace(
+                client_order_id=strategy.client_order_id,
+                venue_order_id=cached.venue_order_id,
+                quantity=None,
+                price=Price.from_str(p),
+                trigger_price=None,
+            )
+            for p in ("151.00", "152.00")
+        ]
+        await asyncio.gather(*(client._modify_order(c) for c in commands))
+        await until_idle(client, venue)
+
+    run_modify(venue, strategy, lambda: "OrderAccepted" in strategy.names(), both)
+
+    print("EVENTS", strategy.names())
+    assert len(venue.trading.replace_requests) == 2
+    assert strategy.names().count("OrderModifyRejected") == 2, strategy.names()
