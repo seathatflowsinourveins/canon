@@ -685,6 +685,18 @@ Through the adapter, `test_paper_matrix.py` runs upstream's test matrices (below
 Alpaca: the asset list at `load_all` scale, and a partial fill through the adapter (each tester order is
 one share).
 
+A limit, not reproduced: on 2026-11-11, under a machine load of about 60, one full run spun for 22 minutes
+in `test_execution_client.py` near `test_a_report_whose_replacement_alpaca_does_not_find_is_none`. The
+report path under that test is bounded: the replace chain walk by `MAX_REPLACE_CHAIN`, alpaca-py's
+retries by `DEFAULT_RETRY_ATTEMPTS`, each read by the package's HTTP timeout (ADR 0039), and every test's
+run by `run_with_client`'s 15 s timeout. The one wait the harness leaves unbounded is the node's own end
+after that timeout fires and the node is stopped (`await task`); a stop sent while the node starts is
+kept, not lost (`test_handle_stop_blocks_running_transition` in `crates/live/src/node/mod.rs` at the
+pin), and whether every stop ends the run in bounded time is UNVERIFIED.
+Rerun with the test and its neighbours at a load of about 27, under `-o faulthandler_timeout=120` (which
+dumps every thread's stack if a test outlives it), it passed in 3 s. If it spins again, that dump names
+the wait.
+
 ### Upstream's test matrices against paper
 
 NautilusTrader's Data Testing Spec and Execution Testing Spec
