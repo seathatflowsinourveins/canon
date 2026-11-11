@@ -76,11 +76,13 @@ and the check waits, at most `ADAPTER_CALL_SECS`, for the ones the adapter left 
 shielded), so an order one of them sends is in the account before the check reads it. The run's node log and a
 JSON report go to `log_dir`, outside the repository.
 
-An extended window runs in pre-market, after-hours or the overnight session, which Alpaca's 24/5 page
+An extended window runs in pre-market or the overnight session, and after-hours once a feed has been seen
+to deliver there on paper (`SESSION_FEEDS`; until then such a window is skipped, naming the observation).
+The overnight session is the one Alpaca's 24/5 page
 (https://docs.alpaca.markets/us/docs/245-trading-for-trading-api.md) puts from 8:00 PM to 4:00 AM ET "on
 the evening before the trade date", following the NYSE holiday calendar, with its data on `boats` or
 `overnight` and its eligible assets marked `overnight_tradable` in the Assets API: so an overnight window
-runs only before a trade date on Alpaca's calendar, streams `boats` (`FEEDS`, ADR 0055), and starts only on
+runs only before a trade date on Alpaca's calendar, streams `boats` (`SESSION_FEEDS`, ADR 0055), and starts only on
 an asset so marked and not `overnight_halted`. What reached the strategy (quotes, trades, live bars) and
 the adapter's own lines about its stream, from the node's log, go in the record; a stream that delivered
 nothing, or that the adapter logged an error for, fails the window, since the adapter reports a refused
@@ -178,13 +180,44 @@ SESSIONS = ("regular", "extended")
 OVERNIGHT_STARTS = dt_time(20, 0)
 """The overnight session's start in New York, "8:00 PM - 4:00 AM ET", on the evening before its trade date
 (Alpaca's 24/5 page); its end is the trade date's `session_open`."""
-FEEDS = {"overnight": DataFeed.BOATS.value}
-"""The feed a window streams and warms up on in each part of a session; IEX (`FEED`) in any other. The
-overnight session's quotes, trades and bars reached a node on `boats` on paper, and `overnight` streams
-quotes only (ADR 0055); `boats` both streams and serves bars (`STREAM_FEEDS`, `BARS_FEEDS`), as the
-strategy needs of its one feed. Named in the subscriptions' and the bars request's params,
-`{"feed": ...}` (ADR 0055); one not served fails loudly, never another. Not configurable: the part
-decides."""
+
+
+@dataclass(frozen=True)
+class SessionFeed:
+    """The feed a window streams and warms up on in one part of a session, or None for none, and what
+    paper has shown of a feed delivering there."""
+
+    feed: str | None
+    observed: str
+
+
+SESSION_FEEDS = {
+    "regular": SessionFeed(
+        FEED.value,
+        "IEX quotes, trades and bars reached a node in the regular session on paper, in upstream's data "
+        "tester, 13:59 to 14:44 New York, 2026-11-10 (the adapter's README)",
+    ),
+    "pre-market": SessionFeed(
+        FEED.value, "not yet probed on paper; its first windows are the probe"
+    ),
+    "after-hours": SessionFeed(
+        None,
+        "probed on paper and no stream delivered: iex, overnight and boats each sent no quote or trade "
+        "in 45 s on four symbols at 16:46 New York, 2026-11-10, though IEX's REST bars showed trades after "
+        "the close; one short probe, not proof (ADR 0055)",
+    ),
+    "overnight": SessionFeed(
+        DataFeed.BOATS.value,
+        "boats delivered quotes, trades and bars overnight on paper, 2026-11-10 (ADR 0055, ADR 0044)",
+    ),
+}
+"""Per part of a session, the feed a window uses and what paper has shown of it (ADR 0044). `boats` both
+streams and serves bars (`STREAM_FEEDS`, `BARS_FEEDS`), as the strategy needs of its one feed; `overnight`
+streams quotes only (ADR 0055). A part where the feeds were probed on paper and none delivered has no feed
+and is skipped, naming the probe, as the lead decided on 2026-11-11, so the schedule does not fail every
+evening by design; a part not yet probed runs, and its windows are the probe; inside a part with a feed, a
+window that receives nothing still fails (`_data_failure`). The feed is named in the subscriptions' and the bars
+request's params, `{"feed": ...}` (ADR 0055); one not served fails loudly, never another."""
 DEFAULT_MINUTES = 30
 MAX_MINUTES = 60
 GAP_SECS = 300
@@ -196,7 +229,8 @@ STALE_RUNNING_SECS = 70 * 60
 """A record still `running` this long after it started is a window that died (60 minutes at most, plus
 start-up, shutdown and the account check)."""
 EXTENDED_READY = True
-"""Whether extended windows may run: pre-market, after-hours and overnight. The adapter sends
+"""Whether extended windows may run: pre-market, after-hours and overnight, each where `SESSION_FEEDS` gives
+it a feed (after-hours has none, so it is skipped). The adapter sends
 `extended_hours` from the submit params (ADR 0038), its disconnect is bounded (ADR 0039), and an overnight
 window passed on paper before this was turned on (ADR 0044, Confirmation)."""
 POLL_SECS = 2.5
@@ -463,8 +497,13 @@ def session_part(
 
 
 def window_feed(part: str) -> str:
-    """The feed a window on `part` of its session streams and warms up on (`FEEDS`), else IEX."""
-    return FEEDS.get(part, FEED.value)
+    """The feed a window on `part` of its session streams and warms up on (`SESSION_FEEDS`), or
+    `WindowSkipped` for a part no feed has been seen to serve on paper, naming what was observed."""
+    if (found := SESSION_FEEDS.get(part)) is None:
+        raise RuntimeError(f"no feed is set for the {part!r} part of a session (SESSION_FEEDS)")
+    if found.feed is None:
+        raise WindowSkipped(f"no {part} window: {found.observed}")
+    return found.feed
 
 
 def window_node(
@@ -591,8 +630,10 @@ the runner nor the task is collected (the hosted run would then drive its shutdo
 
 
 class WindowSkipped(RuntimeError):
-    """The window did not start, for a reason that clears by itself (inside the gap after the last window,
-    too little of the session left). Nothing was placed. Not recorded as a result; the run exits 0."""
+    """The window did not start, for a reason no one need act on: one that clears by itself (inside the gap
+    after the last window, too little of the session left), or a part of a session with no feed
+    (`SESSION_FEEDS`), which recurs each day until its row changes. Nothing was placed. Not recorded as a
+    result; the run exits 0."""
 
 
 def _write_atomically(path: Path, body: str) -> None:
@@ -761,8 +802,8 @@ def run_window(
         end_of_session, part = session_part(config.session, clock, calendar)
     except RuntimeError as e:
         raise WindowRefused(str(e)) from e
-    overnight = overnight_eligibility(trading, config.symbol) if part == "overnight" else ""
     feed = window_feed(part)
+    overnight = overnight_eligibility(trading, config.symbol) if part == "overnight" else ""
     if left := leftovers(trading, config.symbol):
         raise WindowRefused(
             f"the paper account is not flat in {config.symbol}; not starting: {left}"
@@ -1491,7 +1532,8 @@ def resolve_session(
         )
     try:
         _, part = session_part("extended", clock, calendar)
-    except RuntimeError as e:
+        window_feed(part)
+    except RuntimeError as e:  # `WindowSkipped` among them: a part with no feed (`SESSION_FEEDS`)
         return None, str(e)
     return "extended", f"outside the regular session, in its {part} part"
 

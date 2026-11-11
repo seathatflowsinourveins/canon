@@ -41,7 +41,8 @@ order is a DAY limit $0.05 (five $0.01 ticks, since extended hours carry "less l
 touch, sent with `params={"extended_hours": True}`; one not filled in 30 s is canceled and its signal
 dropped, never chased. The adapter sends that flag (ADR 0038). An extended window runs in pre-market,
 after-hours or the overnight session (`EXTENDED_READY`, on once an overnight window passed on paper;
-Confirmation), on the feed of the session's part (Each part).
+Confirmation), on the feed of the session's part, and skips a part no feed has been seen to serve on
+paper (Sessions, feeds and what paper has shown).
 
 **Each part, and the upstream it follows:**
 
@@ -58,9 +59,26 @@ Confirmation), on the feed of the session's part (Each part).
 | A position over one share | `PositionCap`, a non-trading strategy in the node (a `DataActor` has no portfolio at the pin): the portfolio's net position every second, `shutdown_system` over one share | No upstream: no setting caps a position, and the trading state is not settable from Python |
 | A window's length and schedule | `minutes` (default 30, at most 60), clipped to the session's end and to `LONGEST_WINDOW_SECS` (Sharing the account), timed from Alpaca's clock; wind-down 120 s before; 300 s between windows; the session from configuration | No upstream |
 | The extended session's parts | Pre-market and after-hours from the calendar day's `session_open` and `session_close`, refused when either is absent; overnight from 20:00 on the evening before a trade date on Alpaca's calendar to that date's `session_open`, so none before a weekend or holiday | Alpaca's 24/5 page: 8:00 PM - 4:00 AM ET, "on the evening before the trade date", "follows the NYSE holiday calendar" |
-| The feed | `boats` overnight, IEX otherwise, the part deciding (both stream and serve bars; which plan entitles this paper pair to real-time `boats` is UNVERIFIED, ADR 0055), named in the strategy's quote and trade subscriptions, made before its bars, and its warm-up request | ADR 0055: params `{"feed": ...}`; the data engine hands the client an instrument's first subscription |
+| The feed | `boats` overnight, IEX in the regular session and pre-market, none after-hours (below), the part deciding (both stream and serve bars; which plan entitles this paper pair to real-time `boats` is UNVERIFIED, ADR 0055), named in the strategy's quote and trade subscriptions, made before its bars, and its warm-up request | ADR 0055: params `{"feed": ...}`; the data engine hands the client an instrument's first subscription |
 | Overnight eligibility | An overnight window starts only on an asset Alpaca marks `overnight_tradable` and not `overnight_halted`, read raw (alpaca-py 0.45.0's `Asset` has no such field), as a boolean (the 24/5 page's "boolean attributes") or a value of `attributes` (the asset reference; what paper showed), else refused by name | Alpaca's 24/5 page: "Assets tradable in the overnight session can be identified via the `overnight_tradable` attribute" |
 | Data in the record | The quotes, trades and live bars that reached the strategy, and the adapter's own stream lines from the node's log; failed when the stream delivered no quote and no trade, or the adapter logged a stream error; a quiet market (quotes, no bar) is ok | No upstream: the adapter reports a refused or ended stream only in the log (ADR 0055) |
+
+**Sessions, feeds and what paper has shown** (`session_window.SESSION_FEEDS`), and what each firing of the
+schedule (ADR 0050, `--session auto`) does in each, New York time. A part where the feeds were probed on
+paper and none delivered has no feed and is skipped, naming the probe and its date, as the lead decided on
+2026-11-11, so the schedule does not fail every evening by design; a part not yet probed runs, and its
+windows are the probe that decides its row; inside a part with a feed, a window that receives no quote and
+no trade fails (Data in the record). With no feed, `--session auto` says "nothing to run" and
+`--session extended` "skipped"; both exit 0 and keep the last result. No window can probe after-hours
+again until its row changes: a probe outside a window, as ADR 0055's was, would.
+
+| Part | Feed | Seen delivering on paper | A firing |
+|---|---|---|---|
+| Regular, while Alpaca's clock says open | IEX | Yes: upstream's data tester, 13:59 to 14:44, 2026-11-10 (the adapter's README) | Runs a window, market orders, ending `END_MARGIN_SECS` before the close |
+| Pre-market, the day's `session_open` to the regular open | IEX | Not yet probed | Runs a window, marked limits |
+| After-hours, the regular close to the day's `session_close` | None | Probed, none delivered: `iex`, `overnight` and `boats` streams each sent no quote or trade in 45 s on four symbols at 16:46, 2026-11-10, though IEX's REST bars showed trades after the close; one short probe, not proof (ADR 0055) | Skips, naming that observation |
+| Overnight, 20:00 on the evening before a trade date to its `session_open` | `boats` | Yes, 2026-11-10 (Confirmation) | Runs a window, marked limits, on an asset `overnight_tradable` and not `overnight_halted` |
+| Friday 20:00 to Sunday 20:00, a holiday and the evening before it | None | | Nothing to run |
 
 What a window knows at start-up, what is lost between windows, and the averages' warm-up: ADR 0047. The
 engine's memory purge (`purge_closed_orders_interval_mins` and the rest, configure_live_trading, "Memory
@@ -249,6 +267,10 @@ Read 2026-11-10. "raw": fetched with `curl` and read whole. NautilusTrader files
 
 * ADR 0069, 2026-11-10: a second paper account, B, for session windows. It amends "Sharing the account"
   once `paper:session` reads B's pair, with a lock of its own; until then this record stands as written.
+* 2026-11-11: the lead decided that a part of a session no feed has been seen to serve on paper is skipped
+  by name, with the observation and its date, rather than run to fail; after-hours is such a part, on ADR
+  0055's observation of 2026-11-10 (read). Offline, `tests/test_session_window.py`: an after-hours firing
+  exits 0, builds no node, keeps the last result and says so in its heartbeat (run).
 * 2026-11-11, the second reader (`evidence-verifier`) of the split: corrected here the refusals listed in
   Confirmation (no SIP refusal remains), the data plan behind `boats` marked UNVERIFIED, the two forms of
   the overnight attributes stated, the marking of the overnight orders read from the code, what of the
