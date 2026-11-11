@@ -25,12 +25,13 @@
 # install time becomes your default for auto-updates", so it is set, not left to the installer), never below
 # the template's minimumVersion (ADR 0065: the pin is a floor; --check calls a CLI ahead of it ok and names
 # the version it saw).
-# CLAUDE_CONFIG_DIR replaces ~/.claude. --user-config never overwrites settings.json or CLAUDE.md there: a
+# CLAUDE_CONFIG_DIR replaces ~/.claude. --user-config never overwrites settings.json, CLAUDE.md or
+# claude-hud.json (Claude HUD's settings, ADR 0023) there: a
 # differing one gets a <name>.canon-proposed copy beside it. It does add to an existing settings.json the
 # telemetry variables (CLAUDE_CODE_ENABLE_TELEMETRY, OTEL_*) of home/.claude/settings.json's env block that
 # it lacks (ADR 0007, tier 3; Claude Code reads them only from user or managed settings,
 # https://code.claude.com/docs/en/monitoring-usage.md), and the keys it lacks of CANON_KEYS (model,
-# availableModels and modelPicker, ADR 0059; autoUpdatesChannel, ADR 0065). It replaces two values an
+# availableModels and modelPicker, ADR 0059; autoUpdatesChannel, ADR 0065; autoCompactWindow, ADR 0059). It replaces two values an
 # earlier template set (RETIRED: autoUpdatesChannel "stable", ADR 0065; env.ANTHROPIC_DEFAULT_FABLE_MODEL
 # "claude-fable-5-2", ADR 0059), keeping a copy of the previous file; a value the owner set otherwise is
 # left alone and named. It
@@ -46,7 +47,7 @@
 # installed settings.json's model keys with the template's, labels any env.ANTHROPIC_DEFAULT_<ALIAS>_MODEL
 # there PINNED (it stops the alias following the vendor; ADR 0059) or MISMATCH (another model than
 # canon/models.json's), a top-level "model" outside canon/models.json MISMATCH, and reports the update channel
-# in effect from the settings and this environment.
+# and the auto-compact window in effect from the settings and this environment.
 # --install also sets up the review-only workers (ADR 0045), each as its upstream documents: it adds
 # home/dsh/review.patch.yml's rows (session-log upload off, dsh-memento off) to the dsh-tui profile's user
 # patch, ${DSH_HOME:-~/.dsh}/profiles/dsh-tui/cordis.patch.yml, after the rows already there (dsh-TUI
@@ -73,7 +74,7 @@ TELEMETRY_RE='^(CLAUDE_CODE_ENABLE_TELEMETRY$|OTEL_)'
 # set that those records retire: --user-config removes one only while it still holds exactly that value, and
 # a key of CANON_KEYS removed so is then added from the template. The earlier template's "model": "fable" is
 # not among them: it is also the orchestrator lane's alias, which an owner may choose, so --check names it
-CANON_KEYS='["model", "availableModels", "modelPicker", "autoUpdatesChannel"]'
+CANON_KEYS='["model", "availableModels", "modelPicker", "autoUpdatesChannel", "autoCompactWindow"]'
 RETIRED='[{"path": ["autoUpdatesChannel"], "value": "stable"}, {"path": ["env", "ANTHROPIC_DEFAULT_FABLE_MODEL"], "value": "claude-fable-5-2"}]'
 # the variables that turn Claude Code's background updates off (https://code.claude.com/docs/en/env-vars.md)
 UPDATE_OFF_VARS="DISABLE_AUTOUPDATER DISABLE_UPDATES CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
@@ -295,6 +296,33 @@ update_row() {
     stable)    row "update channel" MISMATCH "$s follows stable, about a week behind latest (ADR 0065 follows latest); run: scripts/bootstrap --user-config$envnote"; return 1 ;;
     *)         row "update channel" MISMATCH "$s sets autoUpdatesChannel to '$ch', which the docs do not name$envnote"; return 1 ;;
   esac
+}
+
+# compact_row: the auto-compact window the installed settings set, against the template's (ADR 0059: canon's
+# choice, not a documented recommendation). https://code.claude.com/docs/en/settings-reference.md: top-level
+# autoCompactWindow, 100000 to 1000000, any settings file; a model's modelSettings.<model>.autoCompactWindow
+# (what /autocompact writes) wins for that model, and --autocompact and CLAUDE_CODE_AUTO_COMPACT_WINDOW win for a
+# session (https://code.claude.com/docs/en/model-config.md). Those overrides are named without failing.
+compact_row() {
+  local s="$CLAUDE_HOME/settings.json" want have per envv over=""
+  want=$(jq -r '.autoCompactWindow // empty | tostring' "$ROOT/home/.claude/settings.json" 2>/dev/null)
+  if [ ! -f "$s" ] || ! jq -e 'type == "object"' "$s" >/dev/null 2>&1; then
+    row "auto-compact window" MISSING "no readable $s; run: scripts/bootstrap --user-config"; return 1
+  fi
+  have=$(jq -r '.autoCompactWindow // empty | tostring' "$s")
+  per=$(jq -r '(.modelSettings // {}) | if type == "object" then to_entries | map(select((.value | type) == "object"
+          and .value.autoCompactWindow != null) | "\(.key) \(.value.autoCompactWindow)") | join(", ") else "" end' "$s" 2>/dev/null)
+  envv=$(jq -r '(.env // {}) | if type == "object" then .CLAUDE_CODE_AUTO_COMPACT_WINDOW // "" | tostring else "" end' "$s" 2>/dev/null)
+  [ -z "$per" ] || over="$over; per model (modelSettings, /autocompact): $per"
+  [ -z "$envv" ] || over="$over; $s sets CLAUDE_CODE_AUTO_COMPACT_WINDOW=$envv, which wins"
+  [ -z "${CLAUDE_CODE_AUTO_COMPACT_WINDOW:-}" ] || over="$over; this environment sets CLAUDE_CODE_AUTO_COMPACT_WINDOW=$CLAUDE_CODE_AUTO_COMPACT_WINDOW, which wins"
+  # Claude HUD measures its context bar against its own copy of the window (claude-hud.json, ADR 0007)
+  local hud; hud=$(jq -r '.display.autoCompactWindow // empty | tostring' "$CLAUDE_HOME/claude-hud.json" 2>/dev/null)
+  [ -z "$hud" ] || [ "$hud" = "${have:-$want}" ] || over="$over; claude-hud.json measures the context bar against $hud, not ${have:-$want}"
+  if [ -z "$want" ]; then row "auto-compact window" UNKNOWN "home/.claude/settings.json sets no autoCompactWindow"; return 1
+  elif [ "$have" = "$want" ]; then row "auto-compact window" ok "$have tokens, as home/.claude/settings.json sets it$over"
+  elif [ -z "$have" ]; then row "auto-compact window" "NOT SET" "$s sets no autoCompactWindow, so the model's default applies (about 967K for a 1M window); run: scripts/bootstrap --user-config$over"; return 1
+  else row "auto-compact window" OWNER "$s sets $have; home/.claude/settings.json sets $want (ADR 0059); left as the owner set it$over"; fi
 }
 
 # paper_row <row> <service> <store command>: whether both Alpaca paper key items of one account are in the
@@ -612,6 +640,7 @@ check() {
   check_hooks || missing=1
   check_model_settings || missing=1
   update_row || missing=1
+  compact_row || missing=1
   if [ -f "$CLAUDE_HOME/CLAUDE.md" ]; then row "user CLAUDE.md" ok ""; else row "user CLAUDE.md" MISSING "run: scripts/bootstrap --user-config"; missing=1; fi
   telemetry_rows || missing=1
   note "Alpaca paper key pairs (ADR 0029, ADR 0069), optional:"
@@ -921,7 +950,8 @@ install_user_config() {
   tmp=$(mktemp)
   render_settings > "$tmp" || { rm -f "$tmp"; die "could not render settings.json for $CLAUDE_HOME"; }
   install_telemetry "$tmp" || pending=1
-  for f in settings.json CLAUDE.md; do
+  # claude-hud.json: Claude HUD's settings, read beside settings.json (ADR 0023)
+  for f in settings.json CLAUDE.md claude-hud.json; do
     local from="$src/$f"; [ "$f" = settings.json ] && from="$tmp"
     if [ ! -e "$CLAUDE_HOME/$f" ]; then
       cp "$from" "$CLAUDE_HOME/$f"; note "  installed  $CLAUDE_HOME/$f"

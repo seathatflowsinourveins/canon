@@ -542,8 +542,11 @@ check "a launchctl print that never answers: each agent's row UNKNOWN, saying so
       eval '[ "$rc" != 0 ] && [ "$took" -lt 30 ] && rowis "$TMP/status.out" "lane watchdog" UNKNOWN && rowis "$TMP/status.out" "paper session" UNKNOWN && rowis "$TMP/status.out" "otlp collector" UNKNOWN && grep -q "launchctl did not answer within 1 s" "$TMP/status.out"'
 heartbeat 60
 git -C "$R" remote set-url origin "https://someone:s3cr3t-t0ken@example.com/example/repo@v2?q=1"; status
-check "the landing row names the origin by host and path, an @ in the path kept, its user information never" \
-      eval 'grep -q "squash merge (example.com/example/repo@v2)" "$TMP/status.out" && ! grep -q s3cr3t "$TMP/status.out"'
+check "the landing row names the origin by host and repository, an @ in the name kept, its owner and user information never" \
+      eval 'grep -q "squash merge (example.com, repository repo@v2)" "$TMP/status.out" && ! grep -q "s3cr3t\|example/repo" "$TMP/status.out"'
+git -C "$R" remote set-url origin git@github.com:exampleowner/repo.git; status
+check "an SSH remote's landing row names the host and repository, not the owner" \
+      eval 'grep -q "squash merge (github.com, repository repo.git)" "$TMP/status.out" && ! grep -q exampleowner "$TMP/status.out"'
 git -C "$R" remote set-url origin https://github.com/example/repo.git
 printf '\tstate = not running\n\truns = 3\n\tlast exit code = 1\n' > "$STUB/launchctl-print"; status; rc=$?
 check "an ok record, but the last firing exited 1: FAILED" eval 'rowis "$TMP/status.out" "paper session" FAILED && [ "$rc" != 0 ]'

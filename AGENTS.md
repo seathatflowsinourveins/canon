@@ -140,9 +140,10 @@ be used within these limits (ADR 0021):
 * Research, record checks and code review stay subagents, apart from the reviewers above. Use an
   Orca worker when the work needs its own workspace or the owner asks to watch it, on the model
   `canon/models.json` gives that work (`--model`).
-* Not used: remote placement, the browser and desktop control, plugins, automations, session search, and
-  Orca's other bundled skills. Orca loads one plugin of its own into each session, `orca-agent-view`
-  (ADR 0023); a session installs, loads or enables none.
+* Not used: remote placement, the browser and desktop control, Orca's plugins, automations, session search,
+  and Orca's other bundled skills. Orca loads one plugin of its own into each session, `orca-agent-view`
+  (ADR 0023). The one other plugin is Claude HUD, the status line's renderer, which the lead or the owner
+  installs (ADR 0023's exception); a session installs, loads or enables none, and never runs its `/hud` install.
 * Do not start Orca from a session (`orca open`): the app would inherit that session's environment.
 
 ## Landing

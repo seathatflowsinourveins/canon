@@ -184,6 +184,24 @@
       "mise": "github:open-telemetry/opentelemetry-collector-releases"
     },
     {
+      "id": "claude-hud",
+      "field": "observability",
+      "repo": "jarrodwatts/claude-hud",
+      "track": "tag:v0.15.0",
+      "role": "tool",
+      "license": "MIT",
+      "why": "The status-line renderer, a Claude Code plugin (Node 22.18 or later; mise pins 24). home/.claude/canon/statusline.sh stays the configured command: it does canon's writes, then runs the newest installed version's hud.mjs from the marketplace user settings enable (the plugin's own launcher would run the newest copy from any marketplace) and shows its lines, with terminal hyperlinks removed and e-mail addresses, the repository owner and the home user name scrubbed; with the plugin absent or failing it shows canon's own line. Its logic runs under Node's permission model with an import fence that refuses network modules (fence.mjs, hud.mjs); git's status read runs with protocol.allow=never and every git call with GIT_NO_LAZY_FETCH. It writes its own data folder and, on each render, heartbeat.json with the status-line input (mode 600) under ~/.claude/plugins/claude-hud/. It reads the status-line input, the transcript, ~/.claude.json's oauthAccount (shown only by showAuth/showAuthUser, both off in canon's claude-hud.json), CLAUDE.md, rules and settings. The plugin brings one skill, /hud, whose install step rewrites statusLine and is not to be run here. v0.15.0 is the newest tag; later release commits (0.15.3) are untagged.",
+      "evidence": [
+        "https://github.com/jarrodwatts/claude-hud",
+        "https://github.com/jarrodwatts/claude-hud/releases",
+        "https://raw.githubusercontent.com/jarrodwatts/claude-hud/v0.15.0/src/config.ts",
+        "https://raw.githubusercontent.com/jarrodwatts/claude-hud/v0.15.0/src/schema.ts",
+        "https://raw.githubusercontent.com/jarrodwatts/claude-hud/v0.15.0/fence.mjs",
+        "https://code.claude.com/docs/en/discover-plugins.md"
+      ],
+      "adr": "0023"
+    },
+    {
       "id": "mise",
       "field": "toolchain",
       "repo": "jdx/mise",

@@ -1,0 +1,223 @@
+#!/bin/bash
+# test-usage — offline checks of the subscription usage reading: home/.claude/canon/statusline.sh writes the
+# status-line input's rate_limits.five_hour and .seven_day to canon/rate-limits/<session>.json, and
+# scripts/lanes prints the newest reading of each window as its Usage row (ADR 0007). Inputs follow the
+# documented status-line JSON (https://code.claude.com/docs/en/statusline.md: used_percentage 0 to 100,
+# resets_at in epoch seconds, each window possibly absent; cost.total_cost_usd cumulative). Both scripts run
+# with CLAUDE_CONFIG_DIR pointed at a temp folder, so nothing outside it is read or changed. Cases: both
+# windows, an idle re-render, several sessions, one window absent, a stale reading, a window past its reset,
+# out-of-range windows, no reading, and malformed input and files; in every input case the status line exits 0
+# and prints what it printed before the usage reading was added.
+# Exit 0 if every case behaves as expected, 1 otherwise.
+# shellcheck disable=SC2016,SC2034  # checks are single-quoted and read their variables when check evals them
+set -uo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/canon-test-usage.XXXXXX") \
+  || { echo "test-usage: could not create a temp folder under ${TMPDIR:-/tmp}; nothing was written" >&2; exit 1; }
+trap 'rm -rf "$TMP"' EXIT
+command -v jq >/dev/null 2>&1 || { echo "test-usage: jq not found" >&2; exit 1; }
+pass=0; fail=0
+ok()  { pass=$((pass + 1)); echo "  ok    $1"; }
+bad() { fail=$((fail + 1)); echo "  FAIL  $1"; }
+check() { if eval "$2"; then ok "$1"; else bad "$1"; fi; }
+
+CFG="$TMP/config"
+DIR="$CFG/canon/rate-limits"
+FILE="$DIR/s1.json"
+NOW=$(date -u +%s)
+R5=$((NOW + 3600)); R7=$((NOW + 3 * 86400))
+# status line: the line it prints and its exit code; stderr kept apart
+sl() { printf '%s' "$1" | CLAUDE_CONFIG_DIR="$CFG" "$ROOT/home/.claude/canon/statusline.sh" 2>"$TMP/sl.err"; echo "rc=$?"; }
+# lanes, with its ledger in a second folder, as CANON_LEDGER_HOME moves it: the readings must still be found
+LEDGER="$TMP/ledger-home"
+lanes() { CLAUDE_CONFIG_DIR="$CFG" CANON_LEDGER_HOME="$LEDGER" "$ROOT/scripts/lanes" "$@" 2>"$TMP/lanes.err"; }
+row() { lanes | grep "^Usage:"; }
+# one ledger line, so the report path that prints the row runs
+mkdir -p "$LEDGER/ledger"
+printf '{"ts":"%s","ev":"UserPromptSubmit","sid":"s1","cwd":"/w/proj"}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  > "$LEDGER/ledger/$(date -u +%Y-%m-%d).jsonl"
+# session <id> <cost>: the session fields of a status-line input
+session() { printf '"session_id":"%s","cwd":"/secret/path/proj","workspace":{"current_dir":"/secret/path/proj"},"model":{"id":"claude-opus-5-5","display_name":"Opus"},"effort":{"level":"medium"},"context_window":{"used_percentage":12.7},"cost":{"total_cost_usd":%s}' "$1" "$2"; }
+# input <id> <cost> <five_hour JSON or empty> <seven_day JSON or empty>
+input() {
+  local r="" w
+  [ -z "$3" ] || r="\"five_hour\":$3"
+  [ -z "$4" ] || { w="\"seven_day\":$4"; r="${r:+$r,}$w"; }
+  printf '{%s,"rate_limits":{%s}}' "$(session "$1" "$2")" "$r"
+}
+win() { printf '{"used_percentage":%s,"resets_at":%s}' "$1" "$2"; }
+# age <file> <minutes>: make a stored reading that many minutes old
+age() { jq -c --argjson t "$((NOW - $2 * 60))" '.t = $t' "$1" > "$TMP/f" && mv "$TMP/f" "$1"; }
+SHOWN="Opus · medium · ctx 12% · \$1.23 · proj
+rc=0"
+
+echo "both windows present"
+out=$(sl "{$(session s1 1.234),\"rate_limits\":{\"five_hour\":$(win 23.5 $R5),\"seven_day\":$(win 41.2 $R7),\"spend_limit\":{\"used_percentage\":5,\"resets_at\":$R7,\"used_usd\":9}}}")
+check "status line prints what it printed before" '[ "$out" = "$SHOWN" ] && [ ! -s "$TMP/sl.err" ]'
+check "the session's file holds only the two windows and the time" \
+  'jq -e --argjson r5 $R5 --argjson r7 $R7 --argjson now $NOW "keys == [\"rate_limits\",\"t\"] and .t >= \$now
+     and .rate_limits == {five_hour: {used_percentage: 23.5, resets_at: \$r5}, seven_day: {used_percentage: 41.2, resets_at: \$r7}}" "$FILE" >/dev/null'
+check "no path, model or spend in the file" '! grep -q "secret\|opus\|Opus\|used_usd\|spend\|1.234" "$FILE"'
+check "no temporary file left beside it" '[ "$(ls -A "$DIR" | grep -c tmp)" = 0 ]'
+r=$(row)
+check "lanes shows both percentages, resets and ages" \
+  'case "$r" in "Usage: 7-day 41.2% (resets "*" UTC, read 0 min ago), 5-hour 23.5% (resets "*" UTC, read 0 min ago); stale after 30 min") true ;; *) false ;; esac'
+check "lanes finds the readings where the status line wrote them, with CANON_LEDGER_HOME elsewhere" '[ -n "$r" ] && [ ! -e "$LEDGER/rate-limits" ]'
+check "lanes names the source and that it has no per-model window" \
+  '[ "$(lanes | grep "^  source:")" = "  source: rate_limits in the status-line input (https://code.claude.com/docs/en/statusline.md), which has no per-model window; the Agent SDK documents usage rows a model can scope (SDKUsageReport, experimental) and per-model limit events (RateLimitEvent), not read here" ]'
+check "lanes --json carries the numbers" \
+  'lanes --json | jq -e ".usage.readable and .usage.seven_day.used_pct == 41.2 and .usage.five_hour.used_pct == 23.5" >/dev/null'
+
+echo "an input without rate_limits keeps the reading"
+before=$(cat "$FILE")
+out=$(sl "{$(session s1 1.234)}")
+check "status line unchanged" '[ "$out" = "$SHOWN" ]'
+check "reading kept" '[ "$(cat "$FILE")" = "$before" ]'
+
+echo "an idle re-render"
+age "$FILE" 20
+before=$(cat "$FILE")
+sl "$(input s1 1.234 "$(win 23.5 $R5)" "$(win 41.2 $R7)")" >/dev/null
+check "the same numbers and the same cost leave the reading and its age alone" \
+  '[ "$(cat "$FILE")" = "$before" ] && case "$(row)" in *"41.2% (resets "*", read 2"[01]" min ago)"*) true ;; *) false ;; esac'
+sl "$(input s1 1.5 "$(win 23.5 $R5)" "$(win 41.2 $R7)")" >/dev/null
+check "a new response (the cost moved) with the same numbers refreshes the age" \
+  'case "$(row)" in "Usage: 7-day 41.2% (resets "*", read 0 min ago)"*) true ;; *) false ;; esac'
+
+echo "several sessions"
+sl "$(input s2 0.5 "$(win 10 $R5)" "$(win 20 $R7)")" >/dev/null
+age "$DIR/s2.json" 25; age "$FILE" 20
+sl "$(input s2 0.5 "$(win 10 $R5)" "$(win 20 $R7)")" >/dev/null
+check "an idle session's older reading does not displace a newer one" \
+  'case "$(row)" in "Usage: 7-day 41.2% (resets "*", read 2"[01]" min ago), 5-hour 23.5% "*) true ;; *) false ;; esac'
+sl "$(input s3 0.1 "" "$(win 45 $R7)")" >/dev/null
+check "a session with one window shows it and keeps the others' reading of the other window" \
+  'case "$(row)" in "Usage: 7-day 45% (resets "*", read 0 min ago), 5-hour 23.5% (resets "*", read 2"[01]" min ago)"*) true ;; *) false ;; esac'
+check "each session wrote its own file" '[ -f "$DIR/s2.json" ] && [ -f "$DIR/s3.json" ] && jq -e ".rate_limits | keys == [\"seven_day\"]" "$DIR/s3.json" >/dev/null'
+
+echo "a stale reading"
+for f in "$DIR"/*.json; do age "$f" 40; done
+r=$(row)
+check "not reported, with its age and the threshold, and no number" \
+  '[ "$r" = "Usage: 7-day not reported: last read 40 min ago, older than 30 min, 5-hour not reported: last read 40 min ago, older than 30 min; stale after 30 min" ] || case "$r" in *"last read 41 min ago"*) ! printf "%s" "$r" | grep "%" >/dev/null ;; *) false ;; esac'
+check "lanes --json shows no number for it" \
+  'lanes --json | jq -e ".usage.seven_day.used_pct == null and .usage.five_hour.used_pct == null and .usage.seven_day.age_min >= 40" >/dev/null'
+age "$DIR/s3.json" 20
+check "20 minutes old is still current" 'case "$(row)" in "Usage: 7-day 45% "*", read 2"[01]" min ago), 5-hour not reported: last read"*) true ;; *) false ;; esac'
+
+echo "a window past its reset"
+rm -f "$DIR"/*.json
+printf '{"rate_limits":{"five_hour":{"used_percentage":99,"resets_at":%s}},"t":%s}\n' "$((NOW - 5))" "$NOW" > "$FILE"
+check "the reset window is not reported and its number not shown" \
+  'case "$(row)" in *99*) false ;; *"5-hour not reported: the window reset at"*) true ;; *) false ;; esac'
+
+echo "out-of-range windows"
+rm -f "$DIR"/*.json
+for w in "$(win 5 1000000000000000000)" "$(win 5 $((R7 * 1000)))" "$(win 5 $((NOW - 60)))" "$(win 4120 $R7)" "$(win -1 $R7)" \
+         '{"used_percentage":"41","resets_at":1}' '{"used_percentage":4}' '"x"'; do
+  out=$(sl "$(input s1 1.234 "" "$w")")
+  check "status line unchanged and nothing written for seven_day $w" '[ "$out" = "$SHOWN" ] && [ ! -e "$FILE" ]'
+done
+printf '{"rate_limits":{"seven_day":{"used_percentage":5,"resets_at":1e18}},"t":%s}\n' "$NOW" > "$FILE"
+lanes > "$TMP/huge"; rc=$?
+check "a stored resets_at too large for a date does not stop lanes" '[ "$rc" = 0 ] && grep -q "^Usage: 7-day not reported: no reading of this window" "$TMP/huge"'
+rm -f "$FILE"
+
+echo "malformed input"
+mkdir -p "$DIR"; sl "$(input s1 3 "" "$(win 7 $R7)")" >/dev/null
+good=$(cat "$FILE")
+for in_ in 'not json at all' '' '[1,2]' '{"rate_limits":"x"}' "{$(session s1 3),\"rate_limits\":\"x\"}" \
+           "{$(session s1 3),\"rate_limits\":{\"five_hour\":\"x\",\"seven_day\":null}}" \
+           "{\"session_id\":\"../s1\",\"rate_limits\":{\"seven_day\":$(win 9 $R7)}}"; do
+  out=$(sl "$in_")
+  check "status line exits 0 and prints a line (none for empty input, as before) for: ${in_:-<empty>}" \
+    '[ "${out##*rc=}" = 0 ] && if [ -z "$in_" ]; then [ "$out" = "rc=0" ]; else [ "$(printf "%s\n" "$out" | sed -n 1p)" != "rc=0" ]; fi'
+  check "reading untouched by: ${in_:-<empty>}" '[ "$(cat "$FILE")" = "$good" ] && [ "$(ls "$DIR")" = "s1.json" ] && [ ! -e "$CFG/canon/s1.json" ]'
+done
+check "non-JSON input prints what it printed before" \
+  '[ "$(sl "not json at all")" = "status line: could not parse input
+rc=0" ]'
+printf 'garbage' > "$FILE"
+sl "$(input s1 4 "" "$(win 8 $R7)")" >/dev/null
+check "a corrupt file of the session's is replaced by its next reading" 'jq -e ".rate_limits.seven_day.used_percentage == 8" "$FILE" >/dev/null'
+out=$(printf "%s" "$(input s1 1.234 "" "$(win 1 $R7)")" | CLAUDE_CONFIG_DIR=/dev/null/x "$ROOT/home/.claude/canon/statusline.sh" 2>/dev/null; echo "rc=$?")
+check "a config dir that cannot be written does not fail the status line" '[ "$out" = "$SHOWN" ]'
+
+echo "the renderer"
+STUBS="$TMP/stubs"; mkdir -p "$STUBS"
+# a stub renderer: records its input, prints a line with a hyperlink, an address, the owner and the home user
+cat > "$STUBS/hud" <<STUB
+#!/bin/bash
+cat > "$STUBS/hud.in"
+printf '\033]8;;https://github.com/exampleowner/repo/tree/exampleowner/x\033\\\\exampleowner/x\033]8;;\033\\\\ me@example.com %s\nline two\n' "\${HOME##*/}"
+STUB
+printf '#!/bin/bash\nexit 1\n' > "$STUBS/fails"; printf '#!/bin/bash\ncat >/dev/null\n' > "$STUBS/silent"
+printf '#!/bin/bash\ncat >/dev/null; echo "[claude-hud] needs Node 22.18 or later. Type /hud to fix it."\n' > "$STUBS/ownerror"
+chmod +x "$STUBS"/*
+OWNER_IN="{$(session s9 1.234),\"workspace\":{\"current_dir\":\"/secret/path/proj\",\"repo\":{\"host\":\"github.com\",\"owner\":\"exampleowner\",\"name\":\"repo\"}}}"
+out=$(printf '%s' "$OWNER_IN" | HOME=/Users/exampleuser CLAUDE_CONFIG_DIR="$CFG" CANON_STATUSLINE_RENDERER="$STUBS/hud" "$ROOT/home/.claude/canon/statusline.sh" 2>/dev/null; echo "rc=$?")
+check "the renderer's lines are shown, scrubbed of links, addresses, the owner and the home user" \
+  '[ "$out" = "~/x <email> ~
+line two
+rc=0" ]'
+out=$(printf '%s' "{$(session s9 1.234),\"workspace\":{\"current_dir\":\"/w/devtools\",\"repo\":{\"owner\":\"dev\"}}}" | HOME=/Users/dev CLAUDE_CONFIG_DIR="$CFG" "$ROOT/home/.claude/canon/statusline.sh" 2>/dev/null)
+check "the owner and the home user are scrubbed as whole words, not inside another word" '[ "$out" = "Opus · medium · ctx 12% · \$1.23 · devtools" ]'
+check "the renderer is given the model id as its display name" 'jq -e ".model.display_name == \"claude-opus-5-5\" and .model.id == \"claude-opus-5-5\"" "$STUBS/hud.in" >/dev/null'
+check "the writes still happen with a renderer" '[ -f "$CFG/canon/sessions/s9.json" ]'
+for r in fails silent ownerror missing; do
+  out=$(printf '%s' "{$(session s9 1.234)}" | CLAUDE_CONFIG_DIR="$CFG" CANON_STATUSLINE_RENDERER="$STUBS/$r" "$ROOT/home/.claude/canon/statusline.sh" 2>/dev/null; echo "rc=$?")
+  check "a renderer that is $r: canon's line, marked" '[ "$out" = "Opus · medium · ctx 12% · \$1.23 · proj (hud failed)
+rc=0" ]'
+done
+out=$(printf '%s' "{$(session s9 1.234),\"cwd\":\"/w/exampleuser-x\",\"workspace\":{\"current_dir\":\"/w/me@example.com\"}}" | HOME=/Users/exampleuser CLAUDE_CONFIG_DIR="$CFG" "$ROOT/home/.claude/canon/statusline.sh" 2>/dev/null; echo "rc=$?")
+check "canon's own line is scrubbed too" '[ "$out" = "Opus · medium · ctx 12% · \$1.23 · <email>
+rc=0" ]'
+# the HUD found in the plugin cache, run with the node on PATH
+# 0.15.0 and 0.9.0 in the enabled marketplace (0.15.0 is newer by number, older by text), and a newer copy
+# under another marketplace that settings do not enable
+HUDC="$CFG/plugins/cache/claude-hud/claude-hud/0.15.0"
+mkdir -p "$HUDC" "$CFG/plugins/cache/claude-hud/claude-hud/0.9.0" "$CFG/plugins/cache/other/claude-hud/9.0.0" "$STUBS/bin"
+: > "$HUDC/hud.mjs"; : > "$CFG/plugins/cache/claude-hud/claude-hud/0.9.0/hud.mjs"; : > "$CFG/plugins/cache/other/claude-hud/9.0.0/hud.mjs"
+out=$(printf '%s' "{$(session s9 1.234)}" | PATH="$STUBS/bin:$PATH" CLAUDE_CONFIG_DIR="$CFG" "$ROOT/home/.claude/canon/statusline.sh" 2>/dev/null; echo "rc=$?")
+check "a HUD in the cache that settings do not enable is not run" '[ "$out" = "$SHOWN" ]'
+printf '{"enabledPlugins":{"claude-hud@claude-hud":true}}\n' > "$CFG/settings.json"
+printf '#!/bin/bash\n[ "$1" = "%s" ] && { cat >/dev/null; echo "hud line"; }\n' "$HUDC/hud.mjs" > "$STUBS/bin/node"; chmod +x "$STUBS/bin/node"
+out=$(printf '%s' "{$(session s9 1.234)}" | PATH="$STUBS/bin:$PATH" CLAUDE_CONFIG_DIR="$CFG" "$ROOT/home/.claude/canon/statusline.sh" 2>/dev/null; echo "rc=$?")
+check "the enabled marketplace's newest HUD by number is run with node, not another marketplace's" '[ "$out" = "hud line
+rc=0" ]'
+printf '#!/bin/bash\nexit 3\n' > "$STUBS/bin/node"
+out=$(printf '%s' "{$(session s9 1.234)}" | PATH="$STUBS/bin:$PATH" CLAUDE_CONFIG_DIR="$CFG" "$ROOT/home/.claude/canon/statusline.sh" 2>/dev/null; echo "rc=$?")
+check "an installed HUD that fails: canon's line, marked" '[ "$out" = "Opus · medium · ctx 12% · \$1.23 · proj (hud failed)
+rc=0" ]'
+rm -rf "${CFG:?}/plugins" "${CFG:?}/settings.json"
+
+echo "malformed and missing readings"
+printf 'garbage' > "$DIR/bad.json"
+check "an unreadable file is skipped and counted" \
+  'case "$(row)" in "Usage: 7-day 8% "*"; stale after 30 min (1 unreadable reading file(s) skipped)") true ;; *) false ;; esac'
+for content in 'garbage' '{"rate_limits":"x","t":1}' '[]' '{"rate_limits":{}}{"rate_limits":{}}' "{\"rate_limits\":{},\"t\":$((NOW + 3600))}"; do
+  rm -f "$DIR"/*.json; printf '%s' "$content" > "$FILE"
+  check "unreadable reading not reported: $content" \
+    'case "$(row)" in "Usage: not reported: no readable reading in $DIR; stale after 30 min (1 unreadable"*) true ;; *) false ;; esac'
+done
+rm -rf "${DIR:?}"
+out=$(HOME="$TMP" lanes; HOME="$TMP" lanes --json)
+check "a path under HOME is printed as ~, in the text and the JSON" \
+  'case "$out" in *"$TMP"*) false ;; *"no reading in ~/config/canon/rate-limits"*"\"dir\": \"~/config/canon/rate-limits\""*) true ;; *) false ;; esac'
+out=$(HOME="$TMP/con" lanes --json)
+check "a sibling of the home folder is not shortened" '[ "$(printf "%s" "$out" | jq -r .usage.dir)" = "$DIR" ]'
+printf '{"ts":"%s","ev":"UserPromptSubmit","sid":"s-home","cwd":"%s"}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$TMP" \
+  >> "$LEDGER/ledger/$(date -u +%Y-%m-%d).jsonl"
+check "a session started in the home folder is lane ~, not the user name" \
+  'HOME="$TMP" lanes --json | jq -e "[.sessions[] | select(.sid == \"s-home\")] | length == 1 and .[0].lane == \"~\"" >/dev/null'
+check "no reading: not reported" 'case "$(row)" in "Usage: not reported: no reading in $DIR "*) true ;; *) false ;; esac'
+rm -rf "${LEDGER:?}/ledger"
+lanes > "$TMP/noledger"; rc=$?
+check "with no ledger the row still prints and the exit stays 4" '[ "$rc" = 4 ] && grep -q "^Usage: not reported" "$TMP/noledger"'
+lanes --json > "$TMP/noledger.json"; rc=$?
+check "with no ledger --json still gives the reading and the exit stays 4" \
+  '[ "$rc" = 4 ] && jq -e ".usage.readable == false" "$TMP/noledger.json" >/dev/null'
+
+echo
+echo "test-usage: $pass passed, $fail failed"
+[ "$fail" -eq 0 ]

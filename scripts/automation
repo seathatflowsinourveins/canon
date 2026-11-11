@@ -151,7 +151,12 @@ load() {
   if [ "$rc" != 0 ]; then unload_note "$1" "$rc"; return 1; fi
   boot "$1" "$2" "$3"
 }
-row() { printf '  %-18s %-9s %s\n' "$1" "$2" "$3"; }
+# what a row says shows no home folder path: the owner pastes this output, so $HOME reads as ~
+# (only the home folder itself or a path under it, not a sibling such as $HOME-old; the patterns go through
+# variables, as bash 3.2 mishandles a quoted "/" or an escaped ~ inline)
+# shellcheck disable=SC2088  # a literal ~ is the point
+row() { local m="$3" p1="$HOME/" r1="~/" p3="$HOME " r3="~ "; m=${m//"$p1"/$r1}; m=${m//"$p3"/$r3}; [[ "$m" != *"$HOME" ]] || m="${m%"$HOME"}~"
+  printf '  %-18s %-9s %s\n' "$1" "$2" "$m"; }
 # check_row <name> <label> <text>: prints the row and counts any label but ok as unhealthy
 check_row() { row "$1" "$2" "$3"; [ "$2" = ok ] || bad=1; }
 # paper_worse <label>: the paper row's label becomes <label> when that is worse than the one it has ($lab)
@@ -181,6 +186,10 @@ host_path() {
   local u=$1 a; [[ "$u" == *://* ]] && u=${u#*://}
   a=${u%%/*}; u=${a##*@}${u#"$a"}; printf '%s' "${u%%[?#]*}"
 }
+
+# repo_label <url>: the host and the repository's name, without its owner, which is an account name
+# (an SSH remote, host:owner/name, and a trailing / are read too)
+repo_label() { local v; v=$(host_path "$1"); v=${v%/}; printf '%s, repository %s' "${v%%[:/]*}" "${v##*[:/]}"; }
 
 xml() { local s=${1//&/\&amp;}; s=${s//</\&lt;}; printf '%s' "${s//>/\&gt;}"; }
 
@@ -736,8 +745,8 @@ do_status() {
     if [ -z "$mise_bin" ]; then
       check_row "landing" UNKNOWN "cannot ask gh whether it is signed in: $mise_err"
     elif (cd "$ROOT" && "$mise_bin" exec -- gh auth status >/dev/null 2>&1); then
-      row "landing" ok "scripts/land: pull request, local sign-off, squash merge ($(host_path "$origin"))"
-    else row "landing" OFF "gh is not signed in, so scripts/land cannot reach $(host_path "$origin"); run: gh auth login"; bad=1; fi
+      row "landing" ok "scripts/land: pull request, local sign-off, squash merge ($(repo_label "$origin"))"
+    else row "landing" OFF "gh is not signed in, so scripts/land cannot reach $(repo_label "$origin"); run: gh auth login"; bad=1; fi
   else
     row "landing" ok "scripts/land: fast-forwards main locally (no GitHub remote)"
   fi
