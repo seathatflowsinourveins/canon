@@ -1,0 +1,8 @@
+off
+# The paper schedule's switch (ADR 0050). The first line is the value; the rest is this note.
+#   off    a scheduled firing skips by name and places nothing
+#   mover  a scheduled firing runs only with --mover among its arguments, and is refused by name without
+# `mise run paper:session` reads it at every scheduled firing, from the main that firing cloned, before it
+# takes a lock; a run by hand does not read it. `scripts/automation status` shows each firing's outcome.
+# The first line is the value and nothing else: any other first line, or no file, fails every scheduled
+# firing by name. `mover` goes with a plist that carries --mover (scripts/automation), in one change.
