@@ -4,16 +4,14 @@
   "minimumVersion": "2.1.321",
   "model": "fable",
   "env": {
-    "ANTHROPIC_DEFAULT_FABLE_MODEL": "claude-fable-5-2"
-  },
-  "showThinkingSummaries": true,
-  "env": {
+    "ANTHROPIC_DEFAULT_FABLE_MODEL": "claude-fable-5-2",
     "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
     "OTEL_LOGS_EXPORTER": "otlp",
     "OTEL_METRICS_EXPORTER": "none",
     "OTEL_EXPORTER_OTLP_PROTOCOL": "grpc",
     "OTEL_EXPORTER_OTLP_ENDPOINT": "http://127.0.0.1:4317"
   },
+  "showThinkingSummaries": true,
   "statusLine": {
     "type": "command",
     "command": "~/.claude/canon/statusline.sh"

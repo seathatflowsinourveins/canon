@@ -839,6 +839,8 @@ printf 'model = "o3"\n\n[profiles.fast]\nmodel = "x"' > "$CX"   # no newline at 
 CLAUDE_CONFIG_DIR="$C3" bs --user-config
 check "an existing settings.json gets the missing telemetry variables, keeping its own" \
       jqt "$C3/settings.json" '.model == "mine" and .env.MY_VAR == "1" and .env.CLAUDE_CODE_ENABLE_TELEMETRY == "1" and .env.OTEL_LOGS_EXPORTER == "otlp"'
+check "... and only those: the template's fable pin is not added" \
+      eval 'jqt "$ROOT/home/.claude/settings.json" ".env | has(\"ANTHROPIC_DEFAULT_FABLE_MODEL\")" && jqt "$C3/settings.json" ".env | has(\"ANTHROPIC_DEFAULT_FABLE_MODEL\") | not"'
 check "... leaves a value the owner set, and names it" \
       eval 'jqt "$C3/settings.json" ".env.OTEL_METRICS_EXPORTER == \"otlp\"" && grep -q "sets OTEL_METRICS_EXPORTER to another value" "$TMP/bs.out"'
 check "... keeping the previous file beside it" \
@@ -861,9 +863,30 @@ check "a Codex config with its own otel table is left as it is, and named" \
 CLAUDE_CONFIG_DIR="$C3" bs --check
 check "... and check calls it OWNER"              rowis "$TMP/bs.out" "codex telemetry" OWNER
 rm -rf "$HOME/.codex"
+# JSON keeps the last of two equal keys, so a second "env" (or any repeated key) drops the first silently;
+# two changes that each add one merge without a textual conflict. Every tracked JSON file is held to it.
+check "no tracked JSON file repeats a key at any level" \
+      eval 'git -C "$ROOT" ls-files -z "*.json" | (cd "$ROOT" && xargs -0 python3 -I -c "import json, sys
+def pairs(p):
+    ks = [k for k, _ in p]
+    d = sorted({k for k in ks if ks.count(k) > 1})
+    if d: raise ValueError(\"repeated key: \" + \", \".join(d))
+    return dict(p)
+bad = 0
+for f in sys.argv[1:]:
+    try: json.load(open(f), object_pairs_hook=pairs)
+    except ValueError as e: print(\"        \" + f + \": \" + str(e)); bad = 1
+sys.exit(bad)")'
+# a settings.json with no env at all (a render from before either block) gets the telemetry variables
+mkdir -p "$HOME/.claude"; jq 'del(.env)' "$ROOT/home/.claude/settings.json" > "$HOME/.claude/settings.json"
+bs --user-config
+check "a settings.json with no env gets the telemetry variables and no alias pin" \
+      jqt "$HOME/.claude/settings.json" '.env.OTEL_LOGS_EXPORTER == "otlp" and (.env | has("ANTHROPIC_DEFAULT_FABLE_MODEL") | not)'
+rm -rf "$HOME/.claude"
 # a settings.json that is canon's previous render: after the merge it is canon's file byte for byte
 mkdir -p "$HOME/.claude"
-awk '/^  "env": \{/ { e = 1 } !e { print } e && /^  \},/ { e = 0 }' "$ROOT/home/.claude/settings.json" > "$HOME/.claude/settings.json"
+jq '.env |= with_entries(select(.key | test("^(CLAUDE_CODE_ENABLE_TELEMETRY$|OTEL_)") | not))' \
+  "$ROOT/home/.claude/settings.json" > "$HOME/.claude/settings.json"
 bs --user-config
 check "the previous render plus the merge is the new render: no copy to merge by hand" \
       eval 'cmp -s "$HOME/.claude/settings.json" "$ROOT/home/.claude/settings.json" && [ ! -e "$HOME/.claude/settings.json.canon-proposed" ]'
