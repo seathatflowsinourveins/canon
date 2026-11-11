@@ -312,6 +312,10 @@ BY_HAND_ENV = "CANON_PAPER_BY_HAND"
 """`1` in a run of `mise run paper:session` the schedule did not start (`mise.toml`): its records go to
 `by-hand/` in the log folder, which `scripts/automation status` does not read; the gap marker and the
 node's logs stay in the log folder, so the gap still separates every window (ADR 0050)."""
+ACCOUNT_ENV = "CANON_PAPER_ACCOUNT"
+"""The paper account a run's task read the pair of, by the name `paper:check` gives it: `windows` (account B),
+set by `paper:session` beside its reads of B's pair (`mise.toml`; ADR 0069). A name, never a key."""
+PAPER_ACCOUNTS = ("windows", "tests")
 SCHEDULED_ENV = "CANON_PAPER_SCHEDULED"
 """`1` only in a run the schedule started: the launchd agent's plist sets it (launchd.plist(5),
 EnvironmentVariables), so a run of the runner or the task by hand does not have it (ADR 0050)."""
@@ -415,6 +419,13 @@ def default_log_dir() -> Path:
             "folder for the records is not known; pass --log-dir"
         )
     return Path(found) / "canon-paper-session"
+
+
+def paper_account() -> str:
+    """The paper account a record names: `ACCOUNT_ENV` when it is one of `PAPER_ACCOUNTS`, else `unknown`.
+    Any other value is not echoed, so nothing the variable held by mistake reaches a record."""
+    name = os.environ.get(ACCOUNT_ENV, "")
+    return name if name in PAPER_ACCOUNTS else "unknown"
 
 
 def running_commit(root: Path = SOURCE_ROOT) -> str:
@@ -745,6 +756,8 @@ class WindowReport:
     stale_after: int = STALE_RUNNING_SECS
     commit: str = field(default_factory=running_commit)
     """The code this window runs (`running_commit`), in the `running` record and the result alike."""
+    account: str = field(default_factory=paper_account)
+    """The paper account the window ran on (`paper_account`), in the `running` record and the result alike."""
 
 
 class WindowRefused(RuntimeError):
@@ -1786,6 +1799,7 @@ def _main(args: argparse.Namespace) -> int:
                     "started": datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ"),
                     "stale_after": STALE_RUNNING_SECS,
                     "commit": running_commit(),
+                    "account": paper_account(),
                 },
             )
         except OSError as written:

@@ -418,7 +418,7 @@ printf '\tstate = not running\n\truns = 3\n\tlast exit code = 0\n' > "$STUB/laun
 PD="$TMP/paper-session"; mkdir -p "$PD"
 paper() { # paper <result> <age in seconds>: the session windows' latest record
   jq -n --arg r "$1" --argjson e $((NOW - $2)) --arg c "$(printf 'a%.0s' {1..40})" \
-    '{session: "regular", result: $r, started: "20261111T143500Z", started_epoch: $e, left: [], commit: $c}' > "$PD/latest.json"
+    '{session: "regular", account: "windows", result: $r, started: "20261111T143500Z", started_epoch: $e, left: [], commit: $c}' > "$PD/latest.json"
 }
 heartbeat() { # heartbeat <age in seconds> [outcome] [scheduled: true|false]: what the last run wrote
   jq -n --argjson e $((NOW - $1)) --arg o "${2:-a regular window}" --argjson s "${3:-true}" \
@@ -468,7 +468,10 @@ runs completed '{conclusion: "failure"}'; status; rc=$?
 check "hosted run failed: FAILED, exit 1"         eval 'rowis "$TMP/status.out" "hosted watch" FAILED && [ "$rc" != 0 ]'
 runs completed '{conclusion: "success"}'
 check "paper session ok: its row shows the last window and its strategy" eval 'rowis "$TMP/status.out" "paper session" ok && grep -q "last window 20261111T143500Z of SessionMaCross (" "$TMP/status.out"'
-check "... the commit it ran, and the last firing's"   eval 'grep -q "regular, commit aaaaaaaaaaaa): ok" "$TMP/status.out" && grep -q "a regular window at b123456789ab |" "$TMP/status.out"'
+check "... the account and commit it ran, and the last firing's" eval 'grep -q "regular, account windows, commit aaaaaaaaaaaa): ok" "$TMP/status.out" && grep -q "a regular window at b123456789ab |" "$TMP/status.out"'
+jq 'del(.account)' "$PD/latest.json" > "$PD/l" && mv "$PD/l" "$PD/latest.json"; status
+check "a record without an account says so"       grep -q "regular, account not recorded, commit aaaaaaaaaaaa): ok" "$TMP/status.out"
+jq '.account = "windows"' "$PD/latest.json" > "$PD/l" && mv "$PD/l" "$PD/latest.json"
 jq 'del(.commit)' "$PD/latest.json" > "$PD/l" && mv "$PD/l" "$PD/latest.json"; status
 check "a record without a commit says so"         grep -q "commit not recorded)" "$TMP/status.out"
 jq '.strategy = "EmaCross"' "$PD/latest.json" > "$PD/l" && mv "$PD/l" "$PD/latest.json"; status
