@@ -56,8 +56,10 @@ MAX_ORDER_SUBMIT_RATE = "50/00:01:00"
 MAX_ORDER_MODIFY_RATE = "25/00:01:00"
 """At most 25 modifies in any minute (ADR 0049)."""
 MAX_NOTIONAL_PER_ORDER_USD = Decimal(1000)
-"""Per order, in the instrument's quote currency. Sized for SPY near $750 (ADR 0049): one share passes, two
-do not. For a symbol priced far from that it caps nothing useful, or denies every order."""
+"""Per order, in the instrument's quote currency (ADR 0049), first sized for SPY near $750: one share passes,
+two do not. A session window runs on any symbol whose one share fits it, read from the latest sip trade
+before the node is built (`session_window.one_share_fits`); on a cheaper symbol it bounds an order at more
+than one share's worth."""
 
 EMA_CROSS = "EmaCross"
 """The type name `add_builtin_strategy` takes."""
@@ -117,7 +119,8 @@ def risk_limits(
     """The risk engine's settings for a run on `instrument_id`, as keywords of either risk config class.
 
     `max_order_submit_rate` is the ceiling unless a run sets a tighter budget of its own, as the paper
-    test of `EmaCross` does (ADR 0037). The notional cap is sized for SPY, the one symbol the runs trade.
+    test of `EmaCross` does (ADR 0037). The notional cap is one value for any symbol, which a
+    window checks one share against before it starts (`session_window.one_share_fits`).
 
     `LiveRiskEngineConfig` (the live node's) and `nautilus_trader.risk.RiskEngineConfig` (a backtest's)
     take the same keywords, so the offline proof of the throttle runs on exactly these values.
