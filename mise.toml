@@ -544,3 +544,32 @@ lock_wait() {
 }
 exec /usr/bin/timeout -s KILL 600 uv run --locked python -c 'import sys; from canon_trading.session_window import long_only_task; raise SystemExit(long_only_task(sys.argv[1]))' "$usage_action"
 '''
+
+# A read of one paper account (src/canon_trading/custody.py): equity, cash and buying power, each position,
+# each open order with whether its client order ID is of our nodes' lineage or foreign, and `no_shorting`. GET
+# only: the task and the module set data-only mode (CANON_ALPACA_DATA_ONLY=1, ADR 0070), so the client refuses
+# every other method before sending. `tests` reads account A's pair and `windows` account B's (ADR 0069), as
+# paper:long-only does, into this task's environment only; neither value is printed, and no account number or
+# order ID is. It reads only, so it takes no lock and runs beside a window or a paper test.
+[tasks."paper:account"]
+description = "Print one paper account: balances, positions, open orders with their lineage, and no_shorting (GET only)"
+shell = "bash -c"
+timeout = "10m"
+usage = '''
+arg "<account>" help="tests: account A, which paper:test reads; windows: account B, which paper:session reads (ADR 0069)" {
+  choices "tests" "windows"
+}
+'''
+run = '''
+case "${usage_account:-}" in
+  tests) svc=canon-alpaca-paper ;;
+  windows) svc=canon-alpaca-paper-windows ;;
+  *) echo "paper:account: no paper account named '${usage_account:-}'; the names are tests and windows; nothing was read" >&2; exit 3 ;;
+esac
+ALPACA_API_KEY="$(/usr/bin/timeout 30 /usr/bin/security find-generic-password -s "$svc" -a ALPACA_API_KEY -w)" || ALPACA_API_KEY=""
+ALPACA_SECRET_KEY="$(/usr/bin/timeout 30 /usr/bin/security find-generic-password -s "$svc" -a ALPACA_SECRET_KEY -w)" || ALPACA_SECRET_KEY=""
+[ -n "$ALPACA_API_KEY" ] && [ -n "$ALPACA_SECRET_KEY" ] || { echo "paper:account: account ${usage_account}'s pair is not in the login keychain (mise run paper:check ${usage_account}); nothing was read" >&2; exit 1; }
+export ALPACA_API_KEY ALPACA_SECRET_KEY CANON_PAPER_ACCOUNT="$usage_account" CANON_ALPACA_DATA_ONLY=1
+echo "account: $usage_account"
+exec /usr/bin/timeout -s KILL 300 uv run --locked python -c 'from canon_trading.custody import account_task; raise SystemExit(account_task())'
+'''

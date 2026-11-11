@@ -16,11 +16,15 @@ paths:
 * Never place, modify or cancel a live order. Never read, print, log or commit a credential.
 * Credentials come from the environment. `.env` files are denied to agents by `.claude/settings.json`.
   Account A's paper pair is in the login keychain and reaches only `mise run paper:test` (ADR 0029),
-  `mise run paper:data` in data-only mode (ADR 0070) and `mise run paper:long-only tests`;
+  `mise run paper:data` in data-only mode (ADR 0070), `mise run paper:long-only tests` and
+  `mise run paper:account tests`;
   account B's, stored beside it with `paper:store windows`, reaches only `mise run paper:session`, by hand
-  or from the scheduled agent (ADR 0044, ADR 0050, ADR 0069), and `mise run paper:long-only windows`.
+  or from the scheduled agent (ADR 0044, ADR 0050, ADR 0069), `mise run paper:long-only windows` and
+  `mise run paper:account windows`.
   No task reads both pairs. `paper:long-only <account> <check|on|off>` reads, or sets, Alpaca's long-only
-  setting and prints only its value. Never run
+  setting and prints only its value; `paper:account <account>` reads, GET only, and prints the account's
+  balances, positions, open orders with their lineage (ours or foreign) and `no_shorting`, never an account
+  number or order ID. Never run
   `security find-generic-password` with `-w` or `-g` on either pair, and never put a key value in a file, a command
   line or output.
 * A paper run needs no ask, at any hour, as long as the paper tests follow the practice of Alpaca's own
