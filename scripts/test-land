@@ -18,7 +18,11 @@ TMP=$(mktemp -d "${TMPDIR:-/tmp}/canon-test-land.XXXXXX") \
 trap 'rm -rf "$TMP"' EXIT
 
 export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL="$TMP/gitconfig"
-printf '[user]\n\tname = Test\n\temail = 1+test@users.noreply.github.com\n[commit]\n\tgpgsign = false\n[advice]\n\tdetachedHead = false\n' > "$GIT_CONFIG_GLOBAL"
+# No automatic maintenance: git commit, fetch and merge otherwise start `git maintenance run --auto
+# --detach` (seen with GIT_TRACE), a background git that can outlive the command in a case's repository
+# (git-config(1): maintenance.auto; gc.auto = 0 turns off gc --auto). That it caused a hosted failure is
+# UNVERIFIED; this takes it out of the cases, so a failure that remains is not that.
+printf '[user]\n\tname = Test\n\temail = 1+test@users.noreply.github.com\n[commit]\n\tgpgsign = false\n[advice]\n\tdetachedHead = false\n[maintenance]\n\tauto = false\n[gc]\n\tauto = 0\n' > "$GIT_CONFIG_GLOBAL"
 export LAND_POLL_SECONDS=0 LAND_WAIT_SECONDS=3
 mkdir -p "$TMP/bin"
 PATH="$TMP/bin:$PATH"; export PATH
@@ -101,14 +105,26 @@ pushed()  { git -C "$C/origin.git" rev-parse --verify -q "refs/heads/$1" >/dev/n
 
 # case_ <label> <function> [args]: the function returns 0 when the case behaves as expected. Cases run in
 # the background, eight at a time, each in its own folder; results are printed in order at the end.
-RESULTS="$TMP/results"; mkdir -p "$RESULTS"; ncase=0; out=""; rc=""
+# A failing case's FAIL line itself says why: the check that failed (a case sets `why`), the exit code
+# of what it ran (land, check-addresses or git push),
+# its last line of output and the last gh call, since scripts/ci shows a long check's FAIL lines but not
+# the indented lines under them.
+RESULTS="$TMP/results"; mkdir -p "$RESULTS"; ncase=0; out=""; rc=""; why=""
+oneline() { tr '\n\t' '  ' | sed 's/ *$//' | cut -c1-"$1"; }
 case_() {
   local label="$1" id; shift
   ncase=$((ncase + 1)); id=$(printf '%03d' "$ncase")
   (
     # stderr is kept: a case that exits before writing its result (new_repo's stop) shows why below
     if "$@" >/dev/null 2>"$RESULTS/$id.err"; then printf '  ok    %s\n' "$label" > "$RESULTS/$id"
-    else { printf '  FAIL  %s\n' "$label"; printf '%s\n' "$out" | sed -n '1,6s/^/        /p'; } > "$RESULTS/$id"; fi
+    else
+      last=$(printf '%s\n' "$out" | sed '/^[[:space:]]*$/d' | tail -n 1 | oneline 200)
+      call=$( { [ -n "${FAKE:-}" ] && tail -n 1 "$FAKE/log" 2>/dev/null; } | oneline 120)
+      err=$(sed '/^[[:space:]]*$/d' "$RESULTS/$id.err" 2>/dev/null | tail -n 1 | oneline 120)
+      { printf '  FAIL  %s [%s; exit %s; last line: %s; last gh call: %s%s]\n' "$label" "${why:-a check failed}" \
+          "${rc:-none}" "${last:-none}" "${call:-none}" "${err:+; stderr: $err}"
+        printf '%s\n' "$out" | sed -n '1,6s/^/        /p'; } > "$RESULTS/$id"
+    fi
   ) &
   [ $((ncase % 8)) -ne 0 ] || wait
 }
@@ -371,22 +387,23 @@ case_ "pre-push reads only the commits the remote lacks"    t_hook_range
 # --- pull requests someone else opened (--pr) ---
 # bot_pr <path> [<ci stub>]: branch bot on origin with one change (and its own scripts/ci, if given),
 # announced as open pull request 5
-bot_pr() {
-  new_repo; git -C "$W" switch -q -c bot main; change "$1"
-  if [ -n "${2:-}" ]; then printf '%s\n' "$2" > "$W/scripts/ci"; git -C "$W" commit -q -am "Stub"; fi
-  git -C "$W" push -q origin bot
-  git -C "$W" switch -q topic; git -C "$W" branch -q -D bot
+bot_pr() {   # fails, naming why, if a git step fails; every caller stops then (`bot_pr ... || return 1`)
+  why="setting up the bot branch failed"
+  new_repo; git -C "$W" switch -q -c bot main && change "$1" || return 1
+  if [ -n "${2:-}" ]; then { printf '%s\n' "$2" > "$W/scripts/ci" && git -C "$W" commit -q -am "Stub"; } || return 1; fi
+  { git -C "$W" push -q origin bot && git -C "$W" switch -q topic && git -C "$W" branch -q -D bot; } || return 1
+  why=""
   echo bot > "$FAKE/pr_head"; echo "5 https://github.example/o/r/pull/5" > "$FAKE/pr_open"
   echo '{"headRefName":"bot","state":"OPEN","url":"https://github.example/o/r/pull/5","isCrossRepository":false}' > "$FAKE/pr_info"
   echo "Bump the lockfile" > "$FAKE/pr_title"; printf 'Bumps the lockfile.\n\nRelease notes here.\n' > "$FAKE/pr_body"
 }
 # main_moves: origin's main gains a commit that the bot branch lacks
-main_moves() { git -C "$W" switch -q -c side main; change README.md "Move main"; git -C "$W" push -q origin side:main
-               git -C "$W" switch -q topic; }
+main_moves() { why="moving main failed"; git -C "$W" switch -q -c side main && change README.md "Move main" && git -C "$W" push -q origin side:main \
+                 && git -C "$W" switch -q topic && why=""; }
 gone() { [ ! -e "$C/canon-worktrees/pr-5" ] && ! git -C "$W" show-ref --verify -q refs/heads/bot; }
-t_pr_lands() { bot_pr uv.lock; land --pr 5; [ "$rc" -eq 0 ] && logged "pr merge 5 --squash" && gone; }
+t_pr_lands() { bot_pr uv.lock || return 1; land --pr 5; [ "$rc" -eq 0 ] && logged "pr merge 5 --squash" && gone; }
 t_pr_message() {
-  bot_pr src/a.py; land --pr 5
+  bot_pr src/a.py || return 1; land --pr 5
   [ "$rc" -ne 0 ] && has 'scripts/land --pr 5 --reviewed "' && gone
 }
 t_pr_interrupted() {
@@ -394,7 +411,7 @@ t_pr_interrupted() {
   # shellcheck disable=SC2016  # expanded by the stub, not here
   bot_pr uv.lock '#!/bin/bash
 for _ in $(seq 50); do [ -s "$FAKE/outer_pid" ] && break; sleep 0.1; done
-echo sent > "$FAKE/killed"; kill -TERM "$(cat "$FAKE/outer_pid")"; exit 1'
+echo sent > "$FAKE/killed"; kill -TERM "$(cat "$FAKE/outer_pid")"; exit 1' || return 1
   (cd "$W" && exec scripts/land --pr 5 --reviewed "test") >/dev/null 2>&1 &
   echo $! > "$FAKE/outer_pid"; wait $! 2>/dev/null
   [ -e "$FAKE/killed" ] || return 1
@@ -406,7 +423,7 @@ t_pr_inner_stopped() {
   # shellcheck disable=SC2016  # expanded by the stub, not here
   bot_pr uv.lock '#!/bin/bash
 for _ in $(seq 50); do [ -s "$FAKE/outer_pid" ] && break; sleep 0.1; done
-echo "$PPID" > "$FAKE/inner_pid"; echo sent > "$FAKE/killed"; kill -TERM "$(cat "$FAKE/outer_pid")"; sleep 1; exit 0'
+echo "$PPID" > "$FAKE/inner_pid"; echo sent > "$FAKE/killed"; kill -TERM "$(cat "$FAKE/outer_pid")"; sleep 1; exit 0' || return 1
   (cd "$W" && exec scripts/land --pr 5 --reviewed "test") >/dev/null 2>&1 &
   echo $! > "$FAKE/outer_pid"; wait $! 2>/dev/null
   [ -e "$FAKE/killed" ] || return 1
@@ -422,19 +439,32 @@ t_inner_message() {
   [ "$rc" -ne 0 ] && has 'scripts/land --pr 5 --reviewed "'
 }
 t_pr_behind_text() {
-  bot_pr uv.lock; main_moves; land --pr 5
+  bot_pr uv.lock || return 1; main_moves || return 1; land --pr 5
   [ "$rc" -eq 0 ] && has "is behind main" && logged "--subject Bump the lockfile (#5) --body-file" \
     && grep -c "Release notes here." "$FAKE/merge_body" >/dev/null && ! grep -c "Merge" "$FAKE/merge_body" >/dev/null && gone
 }
 t_pr_refused_text() {   # t_pr_refused_text <title|body> <what check-addresses names>
-  bot_pr uv.lock; main_moves
+  bot_pr uv.lock || return 1; main_moves || return 1
   echo "Ask jane@example.com about it" > "$FAKE/pr_$1"
   out=$(cd "$W" && CHECK_ADDRESSES_STRICT=1 scripts/land --pr 5 2>&1); rc=$?
   [ "$rc" -ne 0 ] && has "$2" && ! has "jane@" && ! logged "statuses" && ! logged "pr merge" && gone
 }
-t_pr_view_fails() {     # t_pr_view_fails <title|body>
-  bot_pr uv.lock; main_moves; rm -f "$FAKE/pr_$1"; land --pr 5
-  [ "$rc" -ne 0 ] && has "could not read the" && ! logged "statuses" && ! logged "pr merge" && gone
+# left_behind: what of the --pr run's worktree and branch is still there, and git's worktree list, for a
+# failure line
+left_behind() {
+  [ ! -e "$C/canon-worktrees/pr-5" ] || printf 'the worktree folder; '
+  ! git -C "$W" show-ref --verify -q refs/heads/bot || printf 'branch bot; '
+  printf 'git worktree list: %s' "$(git -C "$W" worktree list 2>&1 | oneline 200)"
+}
+t_pr_view_fails() {     # t_pr_view_fails <title|body>: each check names itself on the FAIL line
+  bot_pr uv.lock || return 1
+  main_moves || return 1
+  rm -f "$FAKE/pr_$1"; land --pr 5
+  [ "$rc" -ne 0 ] || { why="land exited 0"; return 1; }
+  has "could not read the" || { why="land did not say it could not read the $1"; return 1; }
+  ! logged "statuses" || { why="a status was posted"; return 1; }
+  ! logged "pr merge" || { why="a merge was called"; return 1; }
+  gone || { why="left behind: $(left_behind)"; return 1; }
 }
 t_existing_title() {
   new_repo; change README.md "Commit subject"; echo "7 https://github.example/o/r/pull/7" > "$FAKE/pr_open"
@@ -442,14 +472,14 @@ t_existing_title() {
   [ "$rc" -eq 0 ] && logged "--subject Title on GitHub (#7) --body-file" && ! logged "pr create"
 }
 t_pr_dry_closed() {
-  bot_pr uv.lock; rm -f "$FAKE/pr_open"
+  bot_pr uv.lock || return 1; rm -f "$FAKE/pr_open"
   echo '{"headRefName":"bot","state":"MERGED","url":"https://github.example/o/r/pull/5","isCrossRepository":false}' > "$FAKE/pr_info"
   land --pr 5 --dry-run
   [ "$rc" -eq 0 ] && has "pull request 5 is not open" && has "dry run: would push" && ! has "is , not" \
     && ! logged "statuses" && gone
 }
 t_pr_numbered_title() {
-  bot_pr uv.lock; echo "Bump the lockfile (#5)" > "$FAKE/pr_title"; land --pr 5
+  bot_pr uv.lock || return 1; echo "Bump the lockfile (#5)" > "$FAKE/pr_title"; land --pr 5
   [ "$rc" -eq 0 ] && logged "--subject Bump the lockfile (#5) --body-file" && ! logged "(#5) (#5)"
 }
 case_ "--pr lands a lockfile-only pull request and leaves nothing behind" t_pr_lands
