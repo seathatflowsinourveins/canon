@@ -43,7 +43,7 @@ so, with `./scripts/` or `mise exec --` in front.
 | `uv add` with `>=`, `<`, `~=`, `!=`, `@`, `://`, an upgrade flag, an index, `--find-links`, a requirements file, `--project` or `--directory` | asks | not one exact pin in this checkout, or moves other pins |
 | `uv lock` with `--upgrade` or `-U` | asks | rewrites every pin |
 | every `uv sync`, `--locked` included | asks | can rewrite `uv.lock`; see below |
-| `scripts/bootstrap --install` or `--user-config`, `scripts/automation install`/`uninstall`, `git push` | asks | reach outside the checkout; landing is `scripts/land` |
+| `scripts/bootstrap --install` or `--user-config`, `scripts/automation install`/`uninstall`, `git push`, a direct `gh` write (Confirmation) | asks | reach outside the checkout or publish; landing is `scripts/land` |
 
 Where the rules differ from what was decided:
 
@@ -54,7 +54,10 @@ Where the rules differ from what was decided:
 * **Not every unpinned `uv add` asks.** A bare name holds nothing to match: alone it is neither allowed
   nor asked (Manual mode prompts, bypass mode runs it), and next to an exact pin, as `uv add a==1 b`, it
   is allowed; so is a local path. A strict `>` is not matched, since `*>*` would match `2>&1`, nor
-  `==1.*`, since `*` is always a wildcard. `*-U*` also asks for a name such as `Flask-UUID`.
+  `==1.*`, since `*` is always a wildcard. `-U` and `-P` ask only as their own word, so a name such as
+  `types-PyYAML` or `Flask-UUID` is allowed, and so are `-qU` and `-qP`, a flag bundled after another;
+  `-r`, `-i` and `-f` ask only with a space before their value, and `--requirement` and
+  `-c`/`--constraints` match no rule, so beside an exact pin each of those is allowed.
 * **Stricter than before:** the `mise exec --` forms (`mise exec` is not a wrapper Claude Code strips, so
   `mise exec -- uv sync` matched no rule), `uv lock --upgrade` and the extra `uv add` flags now ask.
   `uv lock -P name`, which moves one pin, matches nothing, as before.
@@ -82,19 +85,21 @@ to be freed here; it is not (above).
   so a mod "can approve a call that a deny rule refuses", with no prompt "when the mod approves a call
   that an ask rule ... would prompt for". The `ask` rules hold in Orca sessions only while Orca's plugin
   handles no tool call. This record does not change that.
-* Bad: 82 `ask` rules where there were 14. Each is asserted.
+* Bad: 302 `ask` rules where there were 14. Each is asserted.
 
 ### Confirmation
 
-`scripts/test-hooks` checks 124 command forms: 15 run unprompted, 102 ask, 4 are neither and 3 are
-spellings no rule matches (below). Its matcher follows the docs' wildcard rules, in 12 cases: 11 from six
-rows of their table, one from the `:*` note. Deleting any `ask` rule fails the test, as does deleting any
-`allow` rule for a one-pin resolve, a pinned `uv add` or `scripts/land` but the bare `Bash(scripts/land)`
-pair, which `Bash(scripts/land *)` covers. The settings as they were fail 28 cases: 25 for want of the
-rules for `scripts/bootstrap --user-config` and the `mise exec --` forms of a full resolve, the
-installers and the push, 3 for want of the ` *` on `scripts/automation install`/`uninstall`. A running
-session reloads `permissions` on save, from its own primary working directory, so a lane gets these rules
-once its worktree holds them.
+`scripts/test-hooks` checks 440 command forms: 21 run unprompted, 338 ask, 67 are neither, 13 are
+spellings no rule matches and 1 is a bundled flag the `allow` rule takes (below). Its matcher follows the
+docs' wildcard rules, in 12 cases: 11 from six rows of their table, one from the `:*` note. Deleting any
+`ask` rule fails the test, as does deleting any `allow` rule for a one-pin resolve, a pinned `uv add` or
+`scripts/land` but the bare `Bash(scripts/land)` pair, which `Bash(scripts/land *)` covers. The settings
+before the `gh` rules fail 229 cases: 222 `gh` forms, 6 exact pins whose name holds `-U`, `-P` or
+`-index`, and `uv lock -P Flask-UUID` (below); before the previous change's rules, 28 under that change's
+test: 25 for want of the rules for `scripts/bootstrap --user-config` and the `mise exec --` forms of a
+full resolve, the installers and the push, 3 for want of the ` *` on `scripts/automation
+install`/`uninstall`. A running session reloads `permissions` on save, from its own primary working
+directory, so a lane gets these rules once its worktree holds them.
 
 The real matcher, 2026-11-10: Claude Code 2.1.321, `claude -p` in a temporary git folder with stub
 scripts and a local bare remote, `--setting-sources local` and a `--settings` file holding only the rules
@@ -123,9 +128,87 @@ written.
   ran with no prompt (the `mise exec -- uv add` runs then stopped at mise, with no `uv` set in that
   folder); in `default` an unlisted `scripts/automation bogus` was refused.
 
+Direct `gh` writes publish, as a push does, so they ask, bare and under `mise exec --` (2026-11-10): `gh
+pr` merge, create, close, review, comment, edit, ready, reopen, lock, unlock, revert and update-branch;
+`gh issue` create, close, lock, comment, edit, reopen, delete, transfer, pin, unpin, unlock and develop,
+`artifact` create, edit and delete; `gh repo` edit, create, delete, archive, unarchive, rename, fork and
+sync, `deploy-key` add and delete, `autolink` create and delete; `gh release` create, edit, delete,
+delete-asset and upload; `gh label` create, edit, delete and clone; `gh secret` and `gh variable` set and
+delete; `gh workflow` run, enable and disable; `gh run` rerun, cancel and delete; `gh gist` create, edit,
+delete and rename; `gh cache delete`; the built-in aliases of these (`new` for create in `pr`, `issue`,
+`repo`, `autolink`, `release` and `gist`, `remove` for delete in `secret` and `variable`); and `gh api`
+with `-X` or `--method` naming a method that starts with P or D in either case, written `-X M`, `-XM`,
+`-X=M`, `--method M` or `--method=M`: gh upper-cases the method, so this covers POST, PUT, PATCH and
+DELETE in any case. So do `gh alias set` and `import` (an alias is a way round every rule), `gh extension
+install` and `upgrade`, also as `extensions` and `ext` (they download and run code, as the installers do),
+`gh auth login`, `logout`, `refresh` and `setup-git` (they change credential state), and `gh auth token`
+and `gh auth status` with `-t` or `--show-token`, which print the GitHub token into an agent's context,
+against AGENTS.md's "use no credentials" (ADR 0018). Bare `gh auth status`, which `scripts/land` and lanes
+use to check the sign-in, does not ask. The reads of those groups (list, view, get, download, checks,
+diff) match none. `gh issue develop --list`, a read, asks with its group, as does a `GET` whose field
+value holds `-X P` or the like, and `gh auth status --template`. Runs with the same setup, and an empty gh
+config folder so that nothing that ran could reach GitHub:
+
+* Under the `gh` rules alone, in `bypassPermissions`, one command for each rule that only it matches, but
+  for nine whose siblings ran (`gh extensions install`, `gh ext upgrade`, `gh auth logout`, `gh auth
+  setup-git` and five `mise exec --` forms of the same kind), and three with `2>&1`, `> /dev/null` or `cd
+  . &&`: each was refused, in three runs as the rules were added and a fourth for the eight lowercase `gh
+  api` forms. Under the settings before them, `gh pr merge`, `gh api -X POST`, `mise exec -- gh release
+  create` and `gh label create` ran and stopped at gh's sign-in.
+* Quotes: `-X 'POST'`, `-X "POST"`, `-X ''POST`, `--method 'delete'`, `-X='PATCH'`, a quoted
+  method under `mise exec --` and `gh 'pr' merge` were refused: Claude Code matched them as the shell
+  reads them, which the docs do not state. This test's matcher reads quotes as text.
+* Not caught, run: `gh run view` and `list`, `gh pr view`, `list`, `checks` and `diff`, `gh api` with no
+  method and with `-X GET`, `--method GET` and `-X get`, `gh issue list` and `view`, `gh auth status`
+  bare, with `--json hosts` and with `-a`, `gh release list` and `view`, `gh label`, `secret`,
+  `variable`, `workflow`, `cache`, `gist`, `alias` and `extension list`, `gh variable get` and `gh repo
+  view`, with `mise exec --` before eight of them, ran with no prompt.
+* `scripts/land` itself, in a throwaway git repository with no remote and a stub `scripts/ci`, under the
+  whole `permissions` object: bare (refused for want of a note), `--reviewed "..."` (landed locally) and
+  `--pr 5` (refused: no origin) ran with no prompt in `default` and `bypassPermissions`, and
+  `./scripts/land --reviewed` and `--pr` in `default`. A script that runs `mise exec -- gh pr merge`
+  inside ran with no prompt: a rule reads the command Claude writes, not what it starts. No script here
+  calls `gh auth token`.
+* Stated limits, run: `gh api` with `-f`, `-F` or `--input` and no method POSTs, and no rule tells it from
+  `gh api -X GET ... -f` or `gh api graphql -f query=...`, which `scripts/drift` runs as reads; an `allow`
+  cannot carve them out (above). A flag before the subcommand, `gh -R o/r pr merge 1` or `gh pr -R o/r
+  merge 1` (gh parsed both, given `pr view` in a shell), a bundled shorthand, `gh api -iX POST` or `gh
+  auth status -at`, `mise x -- gh` and `sh -c 'gh ...'` ran too, as would an alias already set. A rule
+  with text before `gh`, such as `Bash(*gh *pr merge*)`, would reach some of these and ask for any command
+  that holds the words, a commit message included; not taken. The groups not named above that write
+  (`discussion`, `project`, `codespace`, `ssh-key`, `gpg-key`, `skill`, `agent-task` and others) have no
+  rule, nor do `gh issue artifact new`, `gh auth switch` and the hidden `gh auth git-credential`, which
+  prints the token to git as its credential helper (so does `git credential fill`), and `gh copilot`,
+  which runs the Copilot CLI.
+
+The ask rules are a convenience against accidents, not a security boundary: the stated limits above get
+past them.
+
+Considered and not taken (2026-11-10): a guard inside the scripts that publish or install, refusing a
+run that is not the owner's. A TTY check or an owner variable would change the installers for the owner
+and for the self-tests; any variable a test can set, a lane can set; the owner decided on 2026-11-10
+that nothing in the workflow blocks by failing (ADR 0020: "Workflow and quality come before added layers
+of defence"); and the ask rules are there to stop an accident. The spellings they cannot hold
+are recorded here, for a lane's brief to name as forbidden, and AGENTS.md says that a lane stopped by a
+prompt does not look for another route.
+
+Flags and names (2026-11-10). `*-U*`, `*-P*` and `*-index*` asked for an exact pin whose name holds the
+text: `uv add types-PyYAML==6.0.12`, its `mise exec --` form, `Flask-UUID==0.2` and
+`sphinx-index-plugin==1.0` were refused under the settings as they were, in `default`, while
+`httpx==0.27.2` ran. A flag is its own word and a name cannot start with `-`, so `-U` and `-P` now ask
+first or after a space (`uv add -U*`, `uv add * -U*`, the same for `-P` and for `uv lock -U`), and the
+index rules name the long flags (`--index`, which covers `--index-url` and `--index-strategy`,
+`--default-index` and `--extra-index`). Run in `default` under the whole `permissions` object: those four
+pins, `--package` before one and two such pins under `mise exec --` ran with no prompt; `-U` and `-P idna`
+after the pin, `-Pidna`, `--extra-index-url` and `--index-strategy` were refused. Under the uv rules
+alone, in `bypassPermissions`: `-U` and `-P` first, `--index`, `--default-index`, `uv lock -U` and `uv
+lock --offline -U` were refused; `uv lock -P Flask-UUID` ran, as did `uv add -qU httpx==0.27.2` (and `-qP`
+would), a stated limit: a short flag bundled after another is not its own word, so that upgrade is allowed
+and runs unasked.
+
 Still UNVERIFIED: the real `uv add`, `uv sync`, `uv lock` and `scripts/canon resolve` forms not named
-here (stubs and an absent `pyproject.toml` stood in for the commands), quoting, and an Orca session, where
-its plugin can approve a call (above).
+here (stubs and an absent `pyproject.toml` stood in for the commands), quoting beyond the forms above, and
+an Orca session, where its plugin can approve a call (above).
 
 ## Evidence
 
@@ -140,7 +223,14 @@ Read 2026-11-10. `fetched`: downloaded whole with `curl` and read, not summarise
   workspace trust dialog"; the two sentences on a mod without managed settings (fetched). Re-read
   2026-11-10: "A Bash rule matches the command text Claude writes, after Claude Code splits compound
   commands and strips wrappers"; on redirects, "A rule such as `Bash(git commit *)` allows the command,
-  not the target" (fetched).
+  not the target" (fetched). Re-read 2026-11-10: "A deny or ask rule matches past any leading
+  assignment"; the page says nothing of quotes in rule matching (fetched).
+* https://github.com/cli/cli at `v2.103.3`, the `gh` pinned here — `pkg/cmd/api/api.go`: `--method`/`-X`
+  defaults to `GET`, and `method = "POST"` when the method was not passed and there are fields or an
+  input file; `pkg/cmd/api/http.go`: `http.NewRequest(strings.ToUpper(method), ...)` (fetched). `gh api
+  --help`: "The default HTTP request method is `GET` normally and `POST` if any parameters were added",
+  and the subcommands of each group from `gh help` (read, gh 2.103.3). `pkg/cmd/auth/status/status.go`:
+  `-t`/`--show-token` "Display the auth token", and the token is left out otherwise (fetched).
 * https://code.claude.com/docs/en/cli-reference.md — `--setting-sources`, `--settings` and
   `--permission-mode`; https://code.claude.com/docs/en/headless.md — "the final result message lists them
   in `permission_denials`" (fetched). The `claude -p` runs above (run).
@@ -161,10 +251,10 @@ Read 2026-11-10. `fetched`: downloaded whole with `curl` and read, not summarise
   saved in bypass-permissions mode") (read). `scripts/test-hooks` and the deletion run (run).
 * The owner's instruction, as given to this session on 2026-11-10, and the worker session that stopped
   at the prompt — not re-observable (UNVERIFIED).
-* Independent code review, 2026-11-10 (run): it found an empty id followed by a word, the short and
-  index flags, `uv lock --upgrade` and the redirect `*>*` caught; a second pass, `-r`. Second reader, the same day
-  (`evidence-verifier`): every quotation held; it corrected what `uv run --locked` is allowed for and the
-  count of the docs' table, named the unstated gaps (a URL without `@`, `uv lock -P`, `Flask-UUID`, a
+* Independent code review, 2026-11-10 (run): it found an empty id followed by a word, the short and index
+  flags, `uv lock --upgrade` and the redirect `*>*` caught; a second pass, `-r`. Second reader, the same
+  day (`evidence-verifier`): every quotation held; it corrected what `uv run --locked` is allowed for and
+  the count of the docs' table, named the unstated gaps (a URL without `@`, `uv lock -P`, `Flask-UUID`, a
   command substitution), and asked for the weekly run's consequence and ADR 0025's status. All are fixed
   above or stated where a rule cannot express them.
 * Second reader's sweep, 2026-11-10 (run, with this test's matcher): `scripts/bootstrap --user-config`,
@@ -177,4 +267,19 @@ Read 2026-11-10. `fetched`: downloaded whole with `curl` and read, not summarise
   rule, `mise exec --` before the bootstrap forms and `uninstall` under the bare rules) were made and
   ran unasked; the attribution is fixed above. Code review, the same day (run): it found the `mise exec
   --` form of a full resolve unasked, now asked, and named `gh` writing to GitHub with no rule, which
-  this record does not decide and leaves open.
+  this record then left open; the `gh` rules above close it.
+* `gh` rules, 2026-11-10: that they ask, and that no guard goes inside the scripts, was the coordinator's
+  decision under this record's rule for what publishes. Code review (high, run): it found the built-in
+  aliases, `gh issue artifact`, `gh api -iX`, `gh alias set`, `gh extension install`, the `gh auth` token
+  and sign-in commands and the AGENTS.md sentence unaddressed, and the brief sentence unsupported; each is
+  a rule, a stated limit or a correction above. Second reader (`evidence-verifier`, the same day): the
+  counts, the gh source and the docs quotes held; it found eight lowercase `gh api` rules with no command
+  only they matched, a quote claim resting on a form that holds `-X P` as text, a read list and the ADR
+  0020 reason wider than the runs and the record, and the same gaps; all are fixed above. Its second pass
+  found the 229 failures misattributed, `issue artifact new`, `auth switch` and `auth git-credential`
+  uncovered, `--requirement`, `-c` and attached values unstated, the ADR 0009 and ADR 0020 citations and
+  the AGENTS.md sentence too wide, and three run claims wider than the runs; each is corrected or stated
+  above, with no rule added. A later reading of the rules found `types-PyYAML==6.0.12` asked for (above).
+* https://docs.astral.sh/uv/reference/cli/ — the `uv add` flags, among them `-U`/`--upgrade`,
+  `-P`/`--upgrade-package`, `--index`, `--index-url`/`-i`, `--default-index`, `--extra-index-url` and
+  `--index-strategy` (fetched 2026-11-10; uv 0.13.7 here).

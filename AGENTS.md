@@ -84,8 +84,9 @@ context. `.claude/settings.json` pre-approves a short list of commands, among th
 `scripts/canon resolve <id>` for one pin and `uv add name==version` pinned exactly, so a lane following a
 skill is not stopped. What rewrites everything or reaches outside the checkout asks the owner first:
 `scripts/canon resolve` with no id, every `uv sync` (a lane syncs with `uv run --locked`), `uv add` with a
-range, a URL or an upgrade flag, the installers, and a direct `git push` (ADR 0028). If a prompt or a check
-stops you, do not look for another route: say what you wanted to do and why.
+range, a URL or an upgrade flag, the installers, a direct `git push`, and a direct `gh` write of the
+kinds ADR 0028 lists. If a prompt or a check stops you, do not look for another route: say what you
+wanted to do and why.
 
 This is the same for every runtime, Claude Code or not: use no credentials, and leave landing to
 `scripts/land` (ADR 0018).
