@@ -889,6 +889,21 @@ def test_every_run_leaves_a_heartbeat_even_with_nothing_to_run(monkeypatch, tmp_
     assert session_window.main(["--session", "auto", "--log-dir", str(tmp_path)]) == 0
     heard = json.loads((tmp_path / "last-firing.json").read_text())
     assert heard["outcome"].startswith("nothing to run") and heard["commit"] == "d" * 40
+    assert heard["scheduled"] is True
+
+
+def test_a_heartbeat_says_whether_the_scheduled_runner_started_the_run(
+    monkeypatch, tmp_path
+) -> None:
+    """A second reader's review: a window run by hand wrote the same heartbeat as a scheduled firing, so
+    status could not tell the schedule had stopped. The runner stamps its own firings; the heartbeat says
+    which kind of run wrote it, so status can name a run by hand."""
+    monkeypatch.delenv(session_window.COMMIT_ENV, raising=False)
+    session_window.write_heartbeat(tmp_path, "a regular window")
+    assert json.loads((tmp_path / "last-firing.json").read_text())["scheduled"] is False
+    monkeypatch.setenv(session_window.COMMIT_ENV, "e" * 40)
+    session_window.write_heartbeat(tmp_path, "a regular window")
+    assert json.loads((tmp_path / "last-firing.json").read_text())["scheduled"] is True
 
 
 # Review findings on the session windows (a second reader, 2026-11-10): each shown here before its fix.

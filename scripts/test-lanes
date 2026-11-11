@@ -281,10 +281,14 @@ paper() { # paper <result> <age in seconds>: the session windows' latest record
   jq -n --arg r "$1" --argjson e $((NOW - $2)) --arg c "$(printf 'a%.0s' {1..40})" \
     '{session: "regular", result: $r, started: "20261111T143500Z", started_epoch: $e, left: [], commit: $c}' > "$PD/latest.json"
 }
-heartbeat() { # heartbeat <age in seconds> [outcome]
-  jq -n --argjson e $((NOW - $1)) --arg o "${2:-a regular window}" '{at_epoch: $e, outcome: $o, commit: "b123456789abcdef0123456789abcdef01234567"}' > "$PD/last-firing.json"
+heartbeat() { # heartbeat <age in seconds> [outcome] [scheduled: true|false]: what the last run wrote
+  jq -n --argjson e $((NOW - $1)) --arg o "${2:-a regular window}" --argjson s "${3:-true}" \
+    '{at_epoch: $e, outcome: $o, commit: "b123456789abcdef0123456789abcdef01234567", scheduled: $s}' > "$PD/last-firing.json"
 }
-paper ok 600; heartbeat 60
+fired() { # fired <age in seconds>: the stamp the runner writes as each scheduled firing starts
+  jq -n --argjson e $((NOW - $1)) '{at_epoch: $e}' > "$PD/scheduled-firing.json"
+}
+paper ok 600; heartbeat 60; fired 60
 status() { CLAUDE_CONFIG_DIR="$AH" CANON_PAPER_SESSION_DIR="$PD" "$R/scripts/automation" status > "$TMP/status.out" 2>&1; }
 watchjson 60 true; runs completed '{conclusion: "success"}'
 status; rc=$?
@@ -339,9 +343,35 @@ paper "refused: the paper account is not flat in SPY" 600; status; rc=$?
 check "paper window refused: REFUSED, exit 1"     eval 'rowis "$TMP/status.out" "paper session" REFUSED && [ "$rc" != 0 ]'
 rm -f "$PD/latest.json"; status; rc=$?
 check "no paper window yet: UNKNOWN, exit 1"      eval 'rowis "$TMP/status.out" "paper session" UNKNOWN && [ "$rc" != 0 ]'
-paper ok 600; heartbeat $((3 * 3600)); status; rc=$?
+paper ok 600; fired $((3 * 3600)); heartbeat $((3 * 3600)); status; rc=$?
 check "no firing for three hours: STALE, exit 1"  eval 'rowis "$TMP/status.out" "paper session" STALE && [ "$rc" != 0 ]'
+heartbeat 60 "a regular window" false; status; rc=$?
+check "... STALE still when a window run by hand has just written the heartbeat" \
+      eval 'rowis "$TMP/status.out" "paper session" STALE && [ "$rc" != 0 ] && grep -q "by hand" "$TMP/status.out"'
+rm -f "$PD/last-firing.json"; status; rc=$?
+check "... and STALE with no heartbeat at all"   eval 'rowis "$TMP/status.out" "paper session" STALE && [ "$rc" != 0 ]'
+fired 6000; heartbeat 6000; status; rc=$?
+check "a stamp 100 minutes old (a firing held to its deadline, launchd missing intervals meanwhile): not STALE" \
+      eval 'rowis "$TMP/status.out" "paper session" ok && [ "$rc" = 0 ]'
+rm -f "$PD/scheduled-firing.json"; heartbeat 60; status; rc=$?
+check "no scheduled firing recorded: UNKNOWN, exit 1, whatever the heartbeat says" \
+      eval 'rowis "$TMP/status.out" "paper session" UNKNOWN && [ "$rc" != 0 ]'
+check "... naming an installed runner that differs from this tree's, which writes no stamp" \
+      grep -q "installed runner differs from this tree's: run scripts/automation install" "$TMP/status.out"
+echo '{' > "$PD/scheduled-firing.json"; status; rc=$?
+check "an unreadable firing stamp: UNKNOWN, exit 1" eval 'rowis "$TMP/status.out" "paper session" UNKNOWN && [ "$rc" != 0 ]'
+fired 60; echo 'not json' > "$PD/last-firing.json"; status; rc=$?
+check "an unreadable heartbeat: UNKNOWN, exit 1"  eval 'rowis "$TMP/status.out" "paper session" UNKNOWN && [ "$rc" != 0 ]'
+heartbeat 60; status; rc=$?
+check "fresh stamp and heartbeat again: ok"       eval 'rowis "$TMP/status.out" "paper session" ok && [ "$rc" = 0 ]'
+heartbeat -1; status; rc=$?
+check "a heartbeat written within the same second (a negative whole age): ok" \
+      eval 'rowis "$TMP/status.out" "paper session" ok && [ "$rc" = 0 ]'
 heartbeat 60
+git -C "$R" remote set-url origin "https://someone:s3cr3t-t0ken@example.com/example/repo@v2?q=1"; status
+check "the landing row names the origin by host and path, an @ in the path kept, its user information never" \
+      eval 'grep -q "squash merge (example.com/example/repo@v2)" "$TMP/status.out" && ! grep -q s3cr3t "$TMP/status.out"'
+git -C "$R" remote set-url origin https://github.com/example/repo.git
 printf '\tstate = not running\n\truns = 3\n\tlast exit code = 1\n' > "$STUB/launchctl-print"; status; rc=$?
 check "an ok record, but the last firing exited 1: FAILED" eval 'rowis "$TMP/status.out" "paper session" FAILED && [ "$rc" != 0 ]'
 printf '\tstate = not running\n\truns = 3\n\tlast exit code = 0\n' > "$STUB/launchctl-print"
@@ -395,6 +425,10 @@ if command -v plutil >/dev/null 2>&1; then
   check "... not at load"                         test "$(plutil -extract RunAtLoad raw -o - "$PP")" = false
   check "agent environment points the watchdog at the installed directory" \
         eval '[ "$pe" = "$AH" ] && jqt "$AH/canon/watch/lanes-status.json" "has(\"checked_at\")"'
+  git -C "$R" remote set-url origin "https://someone:s3cr3t-t0ken@example.com/example/repo.git"; inst; rc=$?
+  check "an origin URL carrying credentials is refused at install: exit 1, no paper plist, the secret never printed" \
+        eval '[ "$rc" != 0 ] && [ ! -e "$PP" ] && grep -q "carries credentials" "$TMP/install.out" && ! grep -q "s3cr3t" "$TMP/install.out"'
+  git -C "$R" remote set-url origin "$OURL"
   mv "$O" "$O.away"; inst; rc=$?
   check "an install whose clone cannot fetch main fails and leaves no paper plist for launchd to load" \
         eval '[ "$rc" != 0 ] && [ ! -e "$PP" ] && grep -q "could not fetch main" "$TMP/install.out"'
@@ -422,12 +456,27 @@ check "... mise run paper:session --session auto --minutes 25, in the clone, CAN
       eval 'ran | grep -qF "mise run paper:session --session auto --minutes 25 |" && ran | grep -qF "| pwd=$(cd "$FK" && pwd) | commit=$want |"'
 check "... with PATH exported, which mise's exec() templates need to start a shell" \
       eval 'ran | grep -qE "\| path=/usr/bin:/bin:/usr/sbin:/sbin\$"'
+check "... and stamps the firing's start, which status reads to tell a schedule gone silent" \
+      jqt "$FD/scheduled-firing.json" '(.at_epoch | type) == "number" and (now - .at_epoch) < 120'
 echo 2 > "$OW/tracked"; ocommit second; want=$(git -C "$O" rev-parse main)
 mkdir -p "$FK/.venv" "$FK/catalog"; : > "$FK/.venv/kept"; : > "$FK/catalog/bars"; : > "$FK/untracked"; echo local > "$FK/tracked"
+# state left in the clone's .git: a hook git would run at checkout and a local branch; neither may act or
+# stay in the next firing
+printf '#!/bin/sh\necho ran > "%s"\n' "$TMP/hook-ran" > "$FK/.git/hooks/post-checkout"; chmod +x "$FK/.git/hooks/post-checkout"
+git -C "$FK" branch -q planted; git -C "$FK" branch -q origin/main; rm -f "$TMP/hook-ran"
 fire "$B/mise" "$FK" "$OURL" --session auto; rc=$?
 check "the next firing runs the main origin has now"  eval '[ "$rc" = 0 ] && ran | grep -qF "commit=$want" && [ "$(cat "$FK/tracked")" = 2 ]'
 check "... detached, keeping .venv and nothing else untracked" \
       eval '! git -C "$FK" symbolic-ref -q HEAD >/dev/null && [ -e "$FK/.venv/kept" ] && [ ! -e "$FK/catalog/bars" ] && [ ! -e "$FK/untracked" ]'
+check "... running no hook the clone holds (core.hooksPath=/dev/null, git-config(1))" test ! -e "$TMP/hook-ran"
+check "... and no local branch, one named like a remote one included (actions/checkout deletes refs/heads/*)" \
+      eval '[ -z "$(git -C "$FK" for-each-ref refs/heads)" ] && ! grep -q "recreating" "$TMP/fire.out"'
+# a local config setting that runs a command (core.fsmonitor, git-config(1)), which git status would run
+printf '#!/bin/sh\necho ran > "%s"\n' "$TMP/fsmonitor-ran" > "$TMP/fsmonitor"; chmod +x "$TMP/fsmonitor"
+git -C "$FK" config core.fsmonitor "$TMP/fsmonitor"; rm -f "$TMP/fsmonitor-ran"
+fire "$B/mise" "$FK" "$OURL" --session auto; rc=$?
+check "a clone with local config the runner did not write is made again: it runs no command that config names" \
+      eval '[ "$rc" = 0 ] && ran | grep -qF "commit=$want" && [ ! -e "$TMP/fsmonitor-ran" ] && [ -z "$(git -C "$FK" config --local --get core.fsmonitor)" ]'
 lines=$(grep -c "run paper:session" "$STUB/mise.log")
 mv "$O" "$O.away"; echo 3 > "$OW/tracked"
 fire "$B/mise" "$FK" "$OURL" --session auto; rc=$?
@@ -435,6 +484,11 @@ check "a failed fetch fails the firing: exit 1, nothing run, the clone where it 
       eval '[ "$rc" = 1 ] && [ "$(grep -c "run paper:session" "$STUB/mise.log")" = "$lines" ] && [ "$(git -C "$FK" rev-parse HEAD)" = "$want" ]'
 check "... and says so in last-firing.json, which status reads" \
       jqt "$FD/last-firing.json" '(.outcome | startswith("failed: could not fetch main from")) and .commit == "none: nothing ran"'
+# an https origin nothing answers on this machine (port 9, refused at once): the message names its host and
+# path, not its scheme, query or fragment (git's own message follows; git strips user information itself)
+fire "$B/mise" "$TMP/fire-refused" "https://127.0.0.1:9/example/repo.git?q=1#f" --session auto; rc=$?
+check "... naming an https origin by host and path only" \
+      eval '[ "$rc" = 1 ] && jqt "$FD/last-firing.json" ".outcome | startswith(\"failed: could not fetch main from 127.0.0.1:9/example/repo.git: \")"'
 mv "$O.away" "$O"
 git -C "$FK" remote set-url origin "$TMP/elsewhere.git"
 fire "$B/mise" "$FK" "$OURL" --session auto; rc=$?
@@ -453,9 +507,17 @@ check "... nor a person's clone of the same origin: its edits and files kept" \
 fire "$B/mise" "$FK" "git@github.com:example/repo.git" --session auto; rc=$?
 check "an origin that is not https is refused: exit 1, nothing run" \
       eval '[ "$rc" = 1 ] && grep -q "must be an https URL" "$TMP/fire.out" && [ "$(grep -c "run paper:session" "$STUB/mise.log")" = "$lines" ]'
+for cred in "https://someone:s3cr3t-t0ken@example.com/example/repo.git" "https://s3cr3t-t0ken@example.com/example/repo.git" \
+            "x-access-token:s3cr3t-t0ken@example.com:example/repo.git"; do
+  rm -f "$FD/last-firing.json"; fire "$B/mise" "$FK" "$cred" --session auto; rc=$?
+  check "an origin with credentials in it (${cred%%@*}@...) is refused: exit 1, nothing run, the secret in no output or record" \
+        eval '[ "$rc" = 1 ] && grep -Eq "carries credentials|must be an https URL" "$TMP/fire.out" && ! grep -rq "s3cr3t" "$TMP/fire.out" "$FD" "$FK/.git/config" && [ "$(grep -c "run paper:session" "$STUB/mise.log")" = "$lines" ]'
+done
+rm -f "$FD/scheduled-firing.json"
 fire --checkout-only "$B/mise" "$FK" "$OURL"; rc=$?
 check "--checkout-only checks out and runs nothing" \
       eval '[ "$rc" = 0 ] && [ "$(grep -c "run paper:session" "$STUB/mise.log")" = "$lines" ] && grep -q "is at origin/main $want" "$TMP/fire.out"'
+check "... and stamps no scheduled firing"        test ! -e "$FD/scheduled-firing.json"
 
 UH="$TMP/un-home"; UA="$TMP/un-agents"
 uninst() { CLAUDE_CONFIG_DIR="$UH" CANON_LAUNCHAGENTS_DIR="$UA" "$R/scripts/automation" uninstall > "$TMP/uninstall.out" 2>&1; }
@@ -481,6 +543,77 @@ else
   chmod 755 "$UH/canon"; rm -f "$STUB/bootout-fails"
   check "uninstall that leaves things: exit 1, names them" \
         eval '[ "$rc" != 0 ] && grep -q "not removed" "$TMP/uninstall.out" && grep -q "$UH/canon/lanes" "$TMP/uninstall.out" && grep -q "local.canon.lanes-watch" "$TMP/uninstall.out"'
+fi
+
+# ---------- the paper lock's owner has a deadline ----------
+# Each paper task waits for the paper lock, then holds it while uv and Python run. A process that hangs there
+# must neither keep the lock for good nor outlive it, or the next run would trade beside it. mise's per-task
+# `timeout` stops a task's processes with SIGTERM, then SIGKILL 5 s later (mise docs, tasks/task-configuration,
+# "timeout"). Checked statically: each paper task declares one above its own lock wait, paper:session's above
+# that wait plus the window's ceiling (session_window.STALE_RUNNING_SECS). Then each task's own body, from
+# mise.toml with only its lock folder moved into $TMP, runs under the real mise with a 2 s timeout and a uv
+# stand-in that ignores SIGTERM and starts a child that ignores it too: a second run cannot take the lock while
+# it runs, and once mise has stopped it nothing it started is left and the lock is free.
+echo "paper lock deadline:"
+task_part() { # task_part <task> <key>|run: a mise.toml task's `key = "value"`, or its run body
+  awk -v q="'''" -v hdr="[tasks.\"$1\"]" -v want="$2" '
+    inb { if ($0 == q) { inb = 0; if (s && want == "run") exit; next } if (s && want == "run") print; next }
+    $0 == "run = " q { inb = 1; next }
+    /^\[/ { s = ($0 == hdr); next }
+    s && want != "run" && index($0, want " = ") == 1 { v = substr($0, length(want) + 4); gsub(/"/, "", v); print v; exit }' "$ROOT/mise.toml"
+}
+secs() { case "$1" in *h) echo $(( ${1%h} * 3600 )) ;; *m) echo $(( ${1%m} * 60 )) ;; *s) echo "${1%s}" ;; *) echo 0 ;; esac; }
+ceiling=$(( $(sed -n 's/^STALE_RUNNING_SECS = \([0-9 *]*\)$/\1/p' "$ROOT/src/canon_trading/session_window.py") + 0 ))
+# shellcheck disable=SC2034  # need is read by the eval'd check
+for t in paper:session paper:test; do
+  to=$(secs "$(task_part "$t" timeout)")
+  w=$(task_part "$t" run | grep -oE 'lockf( -[a-z]+)* -t [0-9]+' | grep -oE '[0-9]+$' | head -1)
+  need=$(( ${w:-0} + 1 )); extra=""
+  if [ "$t" = paper:session ]; then need=$(( ${w:-0} + ceiling )); extra=" plus the window's ceiling (${ceiling} s)"; fi
+  check "$t declares a mise timeout (${to} s) above its lock wait (${w:-none} s)$extra" \
+        eval '[ -n "$w" ] && [ "$ceiling" -gt 0 ] && [ "$to" -ge "$need" ]'
+done
+check "scripts/automation's PAPER_DEADLINE is paper:session's timeout, which its silent-schedule bound counts" \
+      test "$(sed -n 's/^PAPER_DEADLINE=\([0-9]*\).*/\1/p' "$ROOT/scripts/automation")" = "$(secs "$(task_part paper:session timeout)")"
+LMISE=$(PATH="${PATH#"$B:"}" command -v mise 2>/dev/null) || LMISE=""
+[ -n "$LMISE" ] || [ ! -x "$REAL_HOME/.local/bin/mise" ] || LMISE="$REAL_HOME/.local/bin/mise"
+if [ ! -x /usr/bin/lockf ] || [ ! -x /usr/bin/getconf ]; then
+  skip "paper lock deadline, run under mise" "no /usr/bin/lockf here (macOS only)"
+elif [ -z "$LMISE" ]; then
+  skip "paper lock deadline, run under mise" "no mise outside the stubs"
+else
+  getconf='$(/usr/bin/getconf DARWIN_USER_TEMP_DIR)'   # in a variable: a / in an inline pattern ends it
+  # shellcheck disable=SC2034  # held and orc are read by the eval'd checks
+  for t in paper:session paper:test; do
+    LD="$TMP/deadline-${t#paper:}"; mkdir -p "$LD/bin"
+    body=$(task_part "$t" run)
+    moved=${body//"$getconf"/"$LD/"}
+    if [ -z "$body" ] || [[ "$moved" == *getconf* ]] || [[ "$moved" != *"$LD/"* ]] || [[ "$moved" == *"{{"* ]]; then
+      t_fail "$t's body found in mise.toml, its lock folder moved into the test's"; continue
+    fi
+    cat > "$LD/bin/uv" <<'EOF'
+#!/bin/bash
+# a uv that hangs: it ignores SIGTERM, and so does the child it starts
+trap '' TERM
+echo $$ > "$LD/uv.pid"
+/bin/bash -c 'trap "" TERM; echo $$ > "$LD/child.pid"; sleep 60' &
+wait
+EOF
+    chmod +x "$LD/bin/uv"
+    { printf '[tasks.owner]\ntimeout = "2s"\nenv.ALPACA_API_KEY = "stand-in"\nenv.ALPACA_SECRET_KEY = "stand-in"\n'
+      printf "run = '''\n%s\n'''\n" "$moved"; } > "$LD/mise.toml"
+    (cd "$LD" && env -i HOME="$HOME" LD="$LD" PATH="$LD/bin:/usr/bin:/bin" "$LMISE" run owner > "$LD/out" 2>&1) & op=$!
+    for _ in $(seq 100); do [ -s "$LD/child.pid" ] && break; sleep 0.1; done
+    /usr/bin/lockf -k -t 0 "$LD/canon-paper-test.lock" true 2>/dev/null; held=$?
+    wait "$op"; orc=$?
+    up=""; for f in uv.pid child.pid; do [ -s "$LD/$f" ] && kill -0 "$(cat "$LD/$f")" 2>/dev/null && up="$up ${f%.pid}"; done
+    /usr/bin/lockf -k -t 0 "$LD/canon-paper-test.lock" true 2>/dev/null; free=$?
+    check "$t, its owner hung: a second run cannot take the lock meanwhile" eval '[ -s "$LD/child.pid" ] && [ "$held" != 0 ]'
+    check "... mise stops it at the timeout and fails the task"              eval '[ "$orc" != 0 ] && grep -q "timed out" "$LD/out"'
+    check "... nothing it started is left running (left:${up:- none})"     test -z "$up"
+    check "... and the lock is free for the next run"                         test "$free" = 0
+    for f in uv.pid child.pid; do [ -s "$LD/$f" ] && kill -KILL "$(cat "$LD/$f")" 2>/dev/null; done
+  done
 fi
 
 # ---------- bootstrap ----------

@@ -40,7 +40,10 @@ PAPER_MINUTES=25                                      # ...a 25-minute window: w
                                                       # account check it ends before the next firing less
                                                       # the 300 s gap (session_window.GAP_SECS)
 PAPER_STALE=4200                                      # a record `running` after 70 minutes, if it gives none
-PAPER_SILENT=$((2 * PAPER_INTERVAL))                  # no firing for two intervals: the schedule has stopped
+PAPER_DEADLINE=5100                                   # mise.toml's paper:session timeout, 85 minutes
+# launchd misses every interval while a firing runs (launchd.plist(5)), so the next firing starts at most one
+# interval after the longest firing ends; with no stamp for longer, and 300 s more, the schedule has stopped
+PAPER_SILENT=$((PAPER_DEADLINE + PAPER_INTERVAL + 300))
 PAPER_CHECKOUT="$CANON_HOME/paper-checkout"           # the clone each firing brings to origin's main
 PAPER_DIR="${CANON_PAPER_SESSION_DIR:-$(/usr/bin/getconf DARWIN_USER_TEMP_DIR 2>/dev/null)canon-paper-session}"
 STALE_DAYS=2
@@ -68,6 +71,13 @@ find_mise() {
   fi
   case "$m" in *[\"\$\`\\]*) echo "mise path $m holds a quote, \$, backquote or backslash; not supported" >&2; return 1 ;; esac
   printf '%s\n' "$m"
+}
+
+# host_path <url>: the URL as a message names it: scheme, user information (RFC 3986 section 3.2.1: before
+# an @ in the authority, the part before the first /), query and fragment dropped
+host_path() {
+  local u=$1 a; [[ "$u" == *://* ]] && u=${u#*://}
+  a=${u%%/*}; u=${a##*@}${u#"$a"}; printf '%s' "${u%%[?#]*}"
 }
 
 xml() { local s=${1//&/\&amp;}; s=${s//</\&lt;}; printf '%s' "${s//>/\&gt;}"; }
@@ -368,26 +378,45 @@ do_status() {
       v=$(printf 'UNKNOWN\tno window has run yet (records in %s)' "$PAPER_DIR")
     fi
     # Two failures the record cannot show: a firing that ended before Python wrote anything (an empty
-    # keychain item, a lock wait run out), and a schedule that has stopped firing (every run, a window or
-    # "nothing to run", writes last-firing.json).
+    # keychain item, a lock wait run out), and a schedule that has stopped firing. The runner stamps each
+    # firing's start in scheduled-firing.json, which a window run by hand never writes; with no stamp, an
+    # unreadable one or one older than two intervals the row is not ok, whatever last-firing.json says.
     case "$last" in
       0|''|*[!0-9-]*) ;;
       *) [ "${v%%$'\t'*}" != ok ] || v="FAILED${v#ok}; the last firing exited $last" ;;
     esac
+    local heard fired o
     if [ -f "$PAPER_DIR/last-firing.json" ]; then
-      local heard
       # shellcheck disable=SC2016  # jq program, not shell
       heard=$(jq -r --argjson now "$(date -u +%s)" "$PAPER_COMMIT"'(($now - (.at_epoch // 0)) | floor | tostring) + "\t"
+                    + (if .scheduled == false then "by hand: " else "" end)
                     + (.outcome // "?") + (if (.commit // "") | test("^[0-9a-f]{40}") then " at " + (.commit | short) else "" end)' \
               "$PAPER_DIR/last-firing.json" 2>/dev/null)
-      if [ -n "$heard" ] && [ "${heard%%$'\t'*}" -gt "$PAPER_SILENT" ]; then
-        v="STALE"$'\t'"no firing for $(( ${heard%%$'\t'*} / 60 )) min (the Mac asleep, or the job not running); last: ${heard#*$'\t'}"
-      elif [ -n "$heard" ]; then
-        # a firing that failed before or outside a window (the fetch of main included) fails the row too
+      if [[ "$heard" =~ ^-?[0-9]+$'\t' ]]; then   # negative within a second: at_epoch has a fraction
+        # a run that failed before or outside a window (the fetch of main included) fails the row too
         # (it outranks ok, and UNKNOWN: a schedule whose every firing fails has no window record at all)
-        case "${heard#*$'\t'}:${v%%$'\t'*}" in failed:*:ok) v="FAILED${v#ok}" ;; failed:*:UNKNOWN) v="FAILED${v#UNKNOWN}" ;; esac
-        v="$v | last firing $(( ${heard%%$'\t'*} / 60 )) min ago: ${heard#*$'\t'}"
+        o=${heard#*$'\t'}
+        case "${o#by hand: }:${v%%$'\t'*}" in failed:*:ok) v="FAILED${v#ok}" ;; failed:*:UNKNOWN) v="FAILED${v#UNKNOWN}" ;; esac
+        v="$v | last run $(( ${heard%%$'\t'*} / 60 )) min ago: ${heard#*$'\t'}"
+      else
+        [ "${v%%$'\t'*}" != ok ] || v="UNKNOWN${v#ok}"
+        v="$v | $PAPER_DIR/last-firing.json is unreadable"
       fi
+    fi
+    fired=$(jq -r --argjson now "$(date -u +%s)" '($now - .at_epoch) | floor' "$PAPER_DIR/scheduled-firing.json" 2>/dev/null)
+    if [ ! -f "$PAPER_DIR/scheduled-firing.json" ]; then
+      [ "${v%%$'\t'*}" != ok ] || v="UNKNOWN${v#ok}"
+      v="$v | no scheduled firing recorded yet (the first comes $((PAPER_INTERVAL / 60)) min after install)"
+      # a runner installed before the stamp existed never writes one
+      cmp -s "$ROOT/home/.claude/canon/paper-session.sh" "$CANON_HOME/paper-session.sh" \
+        || v="$v; the installed runner differs from this tree's: run scripts/automation install"
+    elif ! [[ "$fired" =~ ^-?[0-9]+$ ]]; then
+      [ "${v%%$'\t'*}" != ok ] || v="UNKNOWN${v#ok}"
+      v="$v | $PAPER_DIR/scheduled-firing.json is unreadable, so whether the schedule fires is not known"
+    elif [ "$fired" -gt "$PAPER_SILENT" ]; then
+      v="STALE"$'\t'"no scheduled firing for $((fired / 60)) min (the Mac asleep, or the job not running) | ${v#*$'\t'}"
+    else
+      v="$v | last scheduled firing $((fired / 60)) min ago"
     fi
     v="$v | last exit code=${last:-?}; log $CANON_HOME/watch/paper-session.log"
     check_row "paper session" "${v%%$'\t'*}" "${v#*$'\t'}"
@@ -403,8 +432,8 @@ do_status() {
     if [ -z "$mise_bin" ]; then
       check_row "landing" UNKNOWN "cannot ask gh whether it is signed in: $mise_err"
     elif (cd "$ROOT" && "$mise_bin" exec -- gh auth status >/dev/null 2>&1); then
-      row "landing" ok "scripts/land: pull request, local sign-off, squash merge ($origin)"
-    else row "landing" OFF "gh is not signed in, so scripts/land cannot reach $origin; run: gh auth login"; bad=1; fi
+      row "landing" ok "scripts/land: pull request, local sign-off, squash merge ($(host_path "$origin"))"
+    else row "landing" OFF "gh is not signed in, so scripts/land cannot reach $(host_path "$origin"); run: gh auth login"; bad=1; fi
   else
     row "landing" ok "scripts/land: fast-forwards main locally (no GitHub remote)"
   fi

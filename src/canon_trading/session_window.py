@@ -367,12 +367,21 @@ def write_record(log_dir: Path, report: WindowReport | dict) -> None:
 
 
 def write_heartbeat(log_dir: Path, outcome: str) -> None:
-    """Write `last-firing.json` on every run, a window or not: status reads its age to tell a schedule
-    that has stopped firing from one with nothing to run."""
+    """Write `last-firing.json` on every run, a window or not, a run by hand included: status shows its
+    outcome, and `scheduled` says whether the scheduled runner started it (`CANON_COMMIT` set). Whether the
+    schedule still fires, status reads from the runner's own stamp, `scheduled-firing.json`, which no run
+    by hand writes (ADR 0050)."""
     log_dir.mkdir(parents=True, exist_ok=True)
     _write_atomically(
         log_dir / "last-firing.json",
-        json.dumps({"at_epoch": time.time(), "outcome": outcome, "commit": running_commit()}),
+        json.dumps(
+            {
+                "at_epoch": time.time(),
+                "outcome": outcome,
+                "commit": running_commit(),
+                "scheduled": bool(os.environ.get(COMMIT_ENV, "").strip()),
+            }
+        ),
     )
 
 
