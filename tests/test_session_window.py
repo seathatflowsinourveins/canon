@@ -5796,3 +5796,26 @@ def test_a_symbol_without_a_bar_in_every_minute_of_the_sample_is_not_ranked() ->
     assert pick.record["sample"]["symbols"] == 1
     assert pick.record["sample"]["elapsed_minutes"] == 2
     assert pick.record["sample"]["incomplete"] == 1
+
+
+def test_a_first_minute_no_bar_was_received_for_does_not_leave_every_symbol_out() -> None:
+    """Code review, 2026-11-11: the sample starts in the last second of a minute (or on a host clock behind
+    Alpaca's), so that minute's bars went out before the subscription and no symbol has one. The sample's
+    minutes are those from the first minute a bar was received for, not the host's minute at the start."""
+    names = {"LLL": NAMES["LLL"], "EEE": NAMES["EEE"]}
+    stream = SampleStream(names, later={"LLL": [1], "EEE": [1]})
+    pick = session_window.stream_mover(
+        cast(TradingClient, Assets()),
+        cast(Any, stream),
+        cast(Any, Data(names)),
+        cast(Any, Screener(names)),
+        cast(Any, Actions()),
+        date(2026, 11, 9),
+        minutes=2,
+        clock=lambda: AT.timestamp() - 1,
+        sleep=stream.wait,
+    )
+    assert sorted(r["symbol"] for r in pick.record["ranked"]) == ["EEE", "LLL"]
+    assert pick.record["sample"]["elapsed_minutes"] == 2
+    assert pick.record["sample"]["incomplete"] == 0
+    assert pick.record["sample"]["from"] == AT.astimezone(UTC).isoformat()

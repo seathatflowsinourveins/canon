@@ -1440,8 +1440,9 @@ def sample_stream(
     """The whole market's sip minute bars (`subscribe_bars(handler, "*")`, run in a thread ended by
     `stop()`, as `movers_stream.run` streams them) from the current clock minute for `minutes` minutes:
     each symbol's last close, its dollar volume since the sample's first minute (`movers_stream.Tape`),
-    that minute's start, the minutes with bars, the message counts, and how many symbols were left out
-    for lacking a bar in one of those minutes; or `StreamSampleFailed`."""
+    the start of the first minute a bar was received for, the minutes with bars from it, the message
+    counts, and how many symbols were left out for lacking a bar in one of those minutes; or
+    `StreamSampleFailed`."""
     start = clock()
     window = minute_start(start)
     tape = Tape(window_start=window)
@@ -1492,7 +1493,10 @@ def sample_stream(
     ):  # a reconnect drops minutes of bars: a partial sample ranks nothing
         raise StreamSampleFailed(f"the sample's stream logged {logged}")
     counts, close, dvol, latest = tape.minute()
-    elapsed = 0 if latest is None else int((latest - window) // 60) + 1
+    # The sample's minutes start at the first a bar was received for: the host's minute at the start may
+    # have closed before the subscription, so that no symbol has its bar (code review, 2026-11-11).
+    first = min((m for minutes_seen in seen.values() for m in minutes_seen), default=window)
+    elapsed = 0 if latest is None else int((latest - first) // 60) + 1
     if elapsed < 1 or not dvol:
         raise StreamSampleFailed(f"the sample saw no bar in its {minutes} minute(s): {counts}")
     # a symbol is ranked only on a bar in every minute of the sample (Muse's finding 4, 2026-11-11)
@@ -1501,7 +1505,7 @@ def sample_stream(
     for s in incomplete:
         close.pop(s, None)
         dvol.pop(s, None)
-    return close, dvol, datetime.fromtimestamp(window, UTC), elapsed, counts, len(incomplete)
+    return close, dvol, datetime.fromtimestamp(first, UTC), elapsed, counts, len(incomplete)
 
 
 def stream_mover(
