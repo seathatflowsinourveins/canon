@@ -36,9 +36,12 @@ do they run on GitHub, and does that run hold a landing?
 Chosen: **option 2**. Option 3 repeats eight minutes of checks that already run on Ubuntu, to gain the
 same two scripts.
 
-1. **A job `macOS self-tests` on `macos-26`.** That label is the arm64 standard runner. It is a version
-   label, not `macos-latest`, so the OS version moves only when the workflow does, as the runner-images
-   README advises; the image itself is updated weekly. The job installs the same mise toolchain with the
+1. **A job `macOS self-tests` on `xcode-27`, macOS 27.** The scripts call `/usr/bin/timeout`, which
+   macOS 26 does not have (Confirmation). `xcode-27` is the one hosted label on macOS 27: a standard
+   arm64 runner in GitHub's table, a preview in the runner-images README. It is a version label, not
+   `macos-latest`, so the OS version moves only when the workflow does, as the README advises; the image
+   itself is updated weekly. When a generally available macOS 27 label exists, the job moves to it.
+   actionlint does not list `xcode-27` yet, so `.github/actionlint.yaml` names it until it does. The job installs the same mise toolchain with the
    same pinned actions as `checks`, then runs `scripts/test-lanes` and `scripts/test-maintenance` and
    nothing else. `launchctl` is a stand-in on PATH in both scripts, so nothing is loaded into launchd.
 2. **Nothing it exists to run may skip.** A first step names any of the `/usr/bin` tools the cases need
@@ -52,8 +55,9 @@ same two scripts.
    that list as a warning annotation.
 4. **Reporting first, then required.** The job is not among the `needs` of `all required checks
    passed`, the one job the ruleset requires, so it does not hold a landing; a failure is fixed forward.
-   Once it has passed on three landings, it joins those `needs`. That is a workflow change and needs no
-   repository setting. Its duration and queue time decide whether it fits inside `scripts/land`'s wait:
+   Once a generally available macOS 27 label exists and the job has passed on three landings there, it
+   joins those `needs`; passes on the preview image do not count. That is a workflow change and needs no
+   repository setting, and it goes to the lead for a read when it is due. Its duration and queue time decide whether it fits inside `scripts/land`'s wait:
    on 2026-11-11 the `checks` job took from 6 m 35 s to 8 m 10 s over its 31 successful runs.
 5. **One landing never cancels the run of the one before.** The concurrency group is the pull request's
    head branch, else the run id, as GitHub's concurrency docs give it for cancelling on pull requests
@@ -68,7 +72,9 @@ same two scripts.
 * Good: the paper runner's lock and deadlines and the plists are checked on a clean macOS machine on
   every pull request and landing, and a skipped case is named, never silent.
 * Bad: until the job is required, a macOS-only regression can land and is caught only by its run, after
-  the merge. The first runs are slower than this Mac, which ran the two scripts in 167 s and 54 s.
+  the merge.
+* Bad: a preview image may change or be withdrawn without the notice a GA label gets; the job then fails
+  by name and is moved, which is why it does not gate yet.
 * Bad: should the repository become private, each macOS minute would be billed at $0.062. That would be
   the owner's decision, and this record would be re-read first.
 
@@ -76,15 +82,19 @@ same two scripts.
 
 The workflow runs the job on every pull request and push to `main`, and actionlint checks it.
 `scripts/test-ci` ("skipsum") shows the `scripts/ci` summary line, its annotation, and the line a
-script that skips as a whole leaves. The first hosted runs' duration, queue time and tool list are
-added here once they have run.
+script that skips as a whole leaves.
 
-UNVERIFIED until the first hosted run: that `macos-26` has at `/usr/bin` each tool the job's first step
-lists (`lockf`, `timeout`, `plutil`, `expect`, `getconf`, `jq`, `nc`, `sqlite3`, `security`; macOS 27
-on this Mac has them all, the image readme lists none by path, and no Apple page found says which
-release first shipped `timeout`), that its `expect` opens a pseudo-terminal, and that the `mise`
+The first hosted run, on `macos-26` (run 43060210319, 2026-11-11, on the pull request that added the
+job): queued 3 s, ran 1 m 38 s. The image, `macos-26-arm64` 20261102.0473.1, macOS 26.7.2 with bash
+3.2.57, has at `/usr/bin` every tool the first step lists but `timeout`. The job failed as designed: the
+first step named `/usr/bin/timeout`; `scripts/test-lanes` passed 305 cases and failed 113, the ones that
+need `timeout`; `scripts/test-maintenance` skipped as a whole and its step failed on it. On the same run
+the Ubuntu job's `scripts/ci` named its eleven skipped self-test cases in one line. Hence `xcode-27`.
+
+UNVERIFIED until its first run: that `xcode-27` has `/usr/bin/timeout` and the other listed tools (macOS
+27 on this Mac has them all), that its `expect` opens a pseudo-terminal, and that the `mise`
 mise-action puts on PATH is the one the cases "run under mise" find. Whatever is missing fails the job
-by name.
+by name. Its duration and queue time are added here once it has run.
 
 ## Evidence
 
@@ -108,6 +118,19 @@ Read 2026-11-11. "Fetched" means the raw page was fetched with `curl` (docs.gith
   specific OS version in the yaml file"; "All macOS 14 images retired from GitHub Actions on November 2,
   2026"; "We support (at maximum) 2 GA images and 1 beta image at a time". No retirement date is
   announced for `macos-26` or `ubuntu-24.04` (fetched).
+* https://raw.githubusercontent.com/actions/runner-images/main/README.md, read again 2026-11-11 — "Xcode 27
+  [preview] | arm64 | `xcode-27` or `xcode-27-xlarge`" (fetched).
+* https://raw.githubusercontent.com/actions/runner-images/main/images/macos/xcode-27-arm64-Readme.md —
+  "OS Version: macOS 27.0.1 (26A434)", "Image Version: 20261104.0337.1", "Bash 3.2.57(1)-release"
+  (fetched).
+* The github-hosted-runners page above lists `xcode-27` in the macOS arm64 row of "Standard
+  GitHub-hosted runners for public repositories", whose use there "is free and unlimited" (fetched).
+* The first hosted run's job log, 2026-11-11 (`gh api .../actions/jobs/<id>/logs`, read).
+* https://raw.githubusercontent.com/rhysd/actionlint/main/docs/config.md — `self-hosted-runner`: "Label
+  names added to your self-hosted runners as list of pattern" (fetched). actionlint 1.7.12, the pinned
+  and latest release, and its `main` branch's `rule_runner_label.go` list `macos-26` but not `xcode-27`
+  (fetched), so `.github/actionlint.yaml` names `xcode-27` under that key. It goes once actionlint lists
+  the label.
 * https://raw.githubusercontent.com/actions/runner-images/main/images/macos/macos-26-arm64-Readme.md —
   "OS Version: macOS 26.7.2 (25G332)", "Image Version: 20261102.0473.1", "Bash 3.2.57(1)-release",
   "jq 1.8.2". It lists none of `lockf`, `timeout`, `plutil` or `expect`, so the job's first step checks

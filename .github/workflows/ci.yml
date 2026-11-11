@@ -53,12 +53,14 @@ jobs:
   # plutil(1). No credential, no paper run, no keychain item (CANON_TEST_NO_KEYCHAIN skips, by name, the one
   # case that writes to the login keychain), and launchctl is a stand-in in both scripts, so nothing is loaded
   # into launchd. CANON_TEST_ALLOWED_SKIPS makes any other skipped case of test-lanes a failure, and the
-  # test-maintenance step fails unless its last line reports cases passed. A version label, not macos-latest,
-  # so the OS version moves only when this line does (the image itself is updated weekly). Not yet among required-checks-passed's needs: it reports and does not block
-  # until it has passed on three landings (ADR 0082).
+  # test-maintenance step fails unless its last line reports cases passed. macOS 27, which has /usr/bin/timeout
+  # (macos-26 has not): xcode-27 is the one hosted macOS 27 label, a standard runner and a preview image. A
+  # version label, not macos-latest, so the OS version moves only when this line does (the image itself is
+  # updated weekly). Not among required-checks-passed's needs: it reports and does not block until a GA
+  # macOS 27 label exists and it has passed on three landings there (ADR 0082).
   macos:
     name: macOS self-tests
-    runs-on: macos-26
+    runs-on: xcode-27
     timeout-minutes: 20
     defaults:
       run:
