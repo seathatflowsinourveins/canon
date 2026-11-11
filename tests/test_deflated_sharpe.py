@@ -25,9 +25,9 @@ is run on a made-up series that carries the moments:
 * Skewness -3 with kurtosis 10 lies on the boundary kurtosis = skewness² + 1, which only a
   distribution with two values reaches. With 1250 observations the nearest split is 105 of one value
   and 1145 of the other, which has skewness -2.9994 and kurtosis 9.9965. skfolio's own test of this
-  example uses the same series (`tests/test_measures/test_measures.py` at v1.12.8). On it the first two
-  results are 0.900405 and 0.950508, where the paper's exact moments give 0.900397 and 0.950502: the
-  same four printed decimals.
+  example uses the same series (`tests/test_measures/test_measures.py`, the same at v1.12.8 and
+  v1.12.9). On it the first two results are 0.900405 and 0.950508, where the paper's exact
+  moments give 0.900397 and 0.950502: the same four printed decimals.
 * Skewness 0 with kurtosis 3 is met exactly by four values, +1, -1, +c and -c, 500 each of the first
   two and 125 each of the others, with c chosen below.
 * The trial Sharpe ratios alternate between two values, scaled to the sample variance the paper states.

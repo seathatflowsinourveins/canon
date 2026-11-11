@@ -36,7 +36,7 @@ SR₀ = √V·[(1−γ)Z⁻¹(1−1/N) + γZ⁻¹(1−1/(Ne))] and DSR = Z[(SR�
 * The gate, at 0.95 with N = all trials, and the report of N̂ are ADR 0010's, step 3.
 * Do not take Sharpe, skewness or kurtosis from NautilusTrader. Its default Sharpe is annualised, its
   skewness is bias-corrected, and its kurtosis is excess.
-* Implementation: **skfolio v1.12.8**, `measures.deflated_sharpe_ratio(returns, trial_sharpe_ratios)`.
+* Implementation: **skfolio v1.12.9**, `measures.deflated_sharpe_ratio(returns, trial_sharpe_ratios)`.
   It takes the pick's return series and every trial's Sharpe ratio, takes N from that array, and uses
   the sample standard deviation. For N̂, call `expected_max_sharpe_ratio` and then
   `probabilistic_sharpe_ratio`.
@@ -110,6 +110,19 @@ checkout.
   `.github/workflows/ci.yml` tests Python 3.10 to 3.14 on Linux, and 3.14 on macOS and Windows. Fetched.
 * `uv add skfolio==1.12.8` on Python 3.14.10, macOS arm64 — installed skfolio and 13 dependencies from
   wheels. `uv run --locked pytest tests/test_deflated_sharpe.py`: 12 passed. Run.
+* Moved to v1.12.9, 2026-11-10. https://github.com/skfolio/skfolio/releases/tag/v1.12.9 lists two
+  prior-model fixes (EntropyPooling, BlackLitterman) and type-check rules updated for ty 0.0.100. The compare
+  v1.12.8...v1.12.9 changes 20 files. `measures/` and `population/` are not among them, and
+  `portfolio/_base.py`, `portfolio/_portfolio.py` and `utils/stats.py` change only in `ty: ignore`
+  comments. Read with `gh api`. `measures/_measures.py` has the same sha256 (761cbbe3) at tag `v1.12.8`
+  (`433991778607`), at tag `v1.12.9` (`772109053763`) and in the installed wheel. Fetched. At
+  https://pypi.org/pypi/skfolio/1.12.9/json, `requires-python` is `>=3.10` and there is one
+  `py3-none-any` wheel. Fetched. `uv add skfolio==1.12.9`, then
+  `uv run --locked pytest tests/test_deflated_sharpe.py tests/test_ledger.py tests/test_returns_matrix.py
+  tests/test_ranking.py tests/test_variant_study.py`: 230 passed. Run.
+* Second reader of the move, 2026-11-10 (`evidence-verifier`): every claim of the move holds. It
+  corrected the release-note wording above: the notes update type-check rules, and the rule rename shows
+  only in the compare's `pyproject.toml`.
 * Read on 2026-11-09 and checked again by the second reader on 2026-11-10:
   * nautilus-trader 2.0.0rc8 in `.venv`, on a known series: `SharpeRatio()` is mean/std(ddof 1)·√252,
     skewness is bias-corrected and kurtosis is excess. `bundled`, run.

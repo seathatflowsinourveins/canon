@@ -18,13 +18,14 @@ is refused rather than dropped. A session day with no return in the series is re
 dropped: the series has a key for every UTC day from the first to the last, and a session day it lacks
 is a day of the run the series does not describe. A return that is not finite is refused too: ADR 0031
 requires every return of the pick to be finite, and skfolio's `Portfolio` does not raise on one, it
-turns a NaN into 0.0 (observed at 1.12.8), so `returns_matrix` refuses one in any series it is given as well.
+turns a NaN into 0.0 (observed at 1.12.8 and 1.12.9), so `returns_matrix` refuses one in any series
+it is given as well.
 
 Which upstream call does what:
 
 * `pandas.to_datetime(..., unit="ns", utc=True)` and `pandas.Series`: each trial's session returns,
   indexed by UTC date. Closed days are dropped before the series is built, by keeping only session days.
-* skfolio 1.12.8 (`portfolio/_portfolio.py`, `population/_population.py`): each series becomes a
+* skfolio 1.12.9 (`portfolio/_portfolio.py`, `population/_population.py`): each series becomes a
   one-asset `Portfolio` with weight 1, whose returns are the series itself and whose dates come from
   the frame's index (`Series.to_frame`); `Population.returns_df` joins them on their dates, NaN where a
   trial has no row.

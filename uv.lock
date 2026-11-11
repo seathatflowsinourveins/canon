@@ -96,7 +96,7 @@ requires-dist = [
     { name = "nautilus-trader", specifier = "==2.0.0rc8" },
     { name = "optuna", specifier = "==5.0.0" },
     { name = "pandas", specifier = "==3.1.1" },
-    { name = "skfolio", specifier = "==1.12.8" },
+    { name = "skfolio", specifier = "==1.12.9" },
 ]
 
 [package.metadata.requires-dev]
@@ -780,7 +780,7 @@ wheels = [
 
 [[package]]
 name = "skfolio"
-version = "1.12.8"
+version = "1.12.9"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "clarabel" },
@@ -791,9 +791,9 @@ dependencies = [
     { name = "scikit-learn" },
     { name = "scipy" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/ba/ae/9eee4209d3ab5b5f766040f2e1a6b7210a50ebbbe898691aa631fd8aa750/skfolio-1.12.8.tar.gz", hash = "sha256:3f479188c9626027673b020110a4df660a372d6ee16a88b8bc4ea49075f5b8d4", size = 1259720, upload-time = "2026-11-08T22:44:19.759Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/94/74/4f91f16259c4c4a74cbd013a21dd0fbb3a2541e947f7392dfd40e7c355b4/skfolio-1.12.9.tar.gz", hash = "sha256:5b102c22dea2fec3ef15eaec31d8e945384611db8e76b4200904d10dc320a025", size = 1260102, upload-time = "2026-11-10T21:35:03.306Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/bc/0e/41bd51269dee72eb30c67d1227ecb7e89b4600180354f453749135147a9c/skfolio-1.12.8-py3-none-any.whl", hash = "sha256:32b1b260994dc70ab55ac078156c4f877836f718ac5772a557da4398d16c4ff5", size = 1478038, upload-time = "2026-11-08T22:44:17.657Z" },
+    { url = "https://files.pythonhosted.org/packages/77/02/0b27fc61cde6c4cf6052a15bbcec31ea3ffbdfe7b8b20bbee91a2948f43e/skfolio-1.12.9-py3-none-any.whl", hash = "sha256:269039d14c0903ecbb05442a314152e6a1321d1743fcbd11c11dfdd1e8d48077", size = 1478193, upload-time = "2026-11-10T21:35:00.977Z" },
 ]
 
 [[package]]
