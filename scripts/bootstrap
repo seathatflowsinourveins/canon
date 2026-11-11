@@ -23,7 +23,14 @@
 # one at or above it alone, and then fails if the CLI's version is unreadable or still below the pin. The CLI
 # then follows the autoUpdatesChannel that home/.claude/settings.json sets, never below its minimumVersion.
 # CLAUDE_CONFIG_DIR replaces ~/.claude. --user-config never overwrites settings.json or CLAUDE.md there: a
-# differing one gets a <name>.canon-proposed copy beside it. It replaces canon/ledger.sh and
+# differing one gets a <name>.canon-proposed copy beside it. It does add to an existing settings.json the
+# telemetry variables of home/.claude/settings.json's env block that it lacks (ADR 0007, tier 3; Claude Code
+# reads them only from user or managed settings, https://code.claude.com/docs/en/monitoring-usage.md),
+# keeping a copy of the previous file, and leaves alone, naming it, one the owner set to another value. It
+# appends home/.codex/otel.toml to ${CODEX_HOME:-~/.codex}/config.toml when that file has no otel table of its
+# own and its folder exists, keeping a copy of the previous file and changing nothing else in it; an otel
+# table that is not canon's is left alone and named (Codex: CODEX_HOME, codex-rs/utils/home-dir at the
+# pinned tag). It replaces canon/ledger.sh and
 # canon/statusline.sh, keeping a differing previous copy beside each as <name>.replaced-<UTC time>. The
 # installed settings call the scripts in the config directory actually used. --check also compares every
 # env.ANTHROPIC_DEFAULT_<ALIAS>_MODEL the installed settings.json sets, and each one home/.claude/settings.json
@@ -44,6 +51,7 @@ MISE_VERSION="v2026.11.5"      # canon/upstreams.json: mise
 # follow home/.claude/settings.json (ADR 0008: the one tool allowed to auto-update)
 LOCAL_BIN="$HOME/.local/bin"
 CLAUDE_HOME="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+CODEX_DIR="${CODEX_HOME:-$HOME/.codex}"
 
 note()  { printf '%s\n' "$*"; }
 die()  { printf 'bootstrap: ERROR: %s\n' "$*" >&2; exit 1; }
@@ -199,6 +207,45 @@ paper_row() {
   else row "paper key pair" absent "no keychain item for:$miss; to enter the pair: mise run paper:store"; fi
 }
 
+# codex_otel_state <config.toml>: "canon" when every line of home/.codex/otel.toml's table is a line of the
+# file, "other" when it sets otel some other way ([otel], [otel.x], otel = or otel.x =), else "none"
+codex_otel_state() {
+  local l all=1
+  [ -f "$1" ] || { echo none; return; }
+  while IFS= read -r l; do
+    grep -qxF -- "$l" "$1" || { all=0; break; }
+  done < <(grep -v -e '^#' -e '^$' "$ROOT/home/.codex/otel.toml")
+  if [ "$all" = 1 ]; then
+    echo canon
+  elif grep -Eq '^[[:space:]]*(\[[[:space:]]*"?otel"?[[:space:]]*[].]|"?otel"?[[:space:]]*[.=])' "$1"; then
+    echo other
+  else echo none; fi
+}
+
+# telemetry_rows: whether the user settings carry every telemetry variable home/.claude/settings.json sets,
+# with its value, and whether Codex's config has canon's [otel] table
+telemetry_rows() {
+  local s="$CLAUDE_HOME/settings.json" miss differ rc=0
+  # shellcheck disable=SC2016  # jq programs, not shell
+  if ! jq -e 'type == "object" and ((.env // {}) | type == "object")' "$s" >/dev/null 2>&1 \
+     || ! miss=$(jq -r --slurpfile w "$ROOT/home/.claude/settings.json" \
+                   '(.env // {}) as $e | [($w[0].env // {}) | to_entries[] | select($e[.key] == null) | .key] | join(" ")' "$s") \
+     || ! differ=$(jq -r --slurpfile w "$ROOT/home/.claude/settings.json" \
+                   '(.env // {}) as $e | [($w[0].env // {}) | to_entries[] | select($e[.key] != null and $e[.key] != .value) | .key] | join(" ")' "$s"); then
+    row "telemetry settings" MISSING "no readable $s with an object env; run: scripts/bootstrap --user-config"; rc=1
+  elif [ -n "$miss" ]; then
+    row "telemetry settings" MISSING "$s lacks: $miss; run: scripts/bootstrap --user-config"; rc=1
+  elif [ -n "$differ" ]; then
+    row "telemetry settings" OWNER "$s sets $differ to another value than canon's (left as the owner set it)"
+  else row "telemetry settings" ok "OTLP logs to the local collector (ADR 0007)"; fi
+  case "$(codex_otel_state "$CODEX_DIR/config.toml")" in
+    canon) row "codex telemetry" ok "$CODEX_DIR/config.toml has canon's [otel] table" ;;
+    other) row "codex telemetry" OWNER "$CODEX_DIR/config.toml sets otel itself; canon's table is in home/.codex/otel.toml" ;;
+    *)     row "codex telemetry" absent "no canon [otel] table in $CODEX_DIR/config.toml; run: scripts/bootstrap --user-config" ;;
+  esac
+  return "$rc"
+}
+
 # The review-only workers (ADR 0045). DeepSeek Harness reads its profile's user patch last, a YAML array
 # whose rows override a bundle's row by id, the config block replaced whole (dsh-TUI v0.17.0
 # docs/configuration.en.md, "Profiles and patch layers").
@@ -272,6 +319,7 @@ check() {
   check_hooks || missing=1
   check_model_pins || missing=1
   if [ -f "$CLAUDE_HOME/CLAUDE.md" ]; then row "user CLAUDE.md" ok ""; else row "user CLAUDE.md" MISSING "run: scripts/bootstrap --user-config"; missing=1; fi
+  telemetry_rows || missing=1
   note "Alpaca paper key pair (ADR 0029), optional:"
   paper_row
   note "Review-only workers (ADR 0045), optional:"
@@ -403,6 +451,65 @@ render_settings() {
     (.statusLine.command |= place) | (.hooks[][].hooks[].command |= place)' "$ROOT/home/.claude/settings.json"
 }
 
+# keep_copy <file>: copies the file beside itself as <file>.replaced-<UTC time> and says so
+keep_copy() {
+  local bak; bak="$1.replaced-$(date -u +%Y%m%dT%H%M%SZ)"
+  cp -p "$1" "$bak" || die "could not keep the previous $1"
+  note "  kept       the previous $(basename "$1") as $bak"
+}
+
+# install_telemetry <rendered settings.json>: the OTLP settings of ADR 0007 tier 3, for Claude Code and
+# Codex. An existing settings.json gets the telemetry variables it lacks; when that leaves it the same JSON
+# as the rendered canon settings, it takes the rendered file's bytes, so the copy step after finds it
+# unchanged. A value the owner set otherwise, and an otel setting of Codex's that is not canon's, are left
+# alone and named, as the owner's choice. Codex's config is written only when its folder exists (Codex
+# installed). Returns 1 only when settings.json cannot be read as settings.
+install_telemetry() {
+  local s="$CLAUDE_HOME/settings.json" add differ tmp c="$CODEX_DIR/config.toml" rc=0
+  if [ ! -e "$s" ]; then :   # the copy step installs the rendered file, env block included
+  elif ! jq -e 'type == "object" and ((.env // {}) | type == "object")' "$s" >/dev/null 2>&1; then
+    note "  EXISTS     $s is not a JSON object with an object env; telemetry settings not added"; rc=1
+  else
+    # shellcheck disable=SC2016  # jq program, not shell
+    add=$(jq -c --slurpfile w "$1" '. as $in | ($w[0].env // {}) | with_entries(select(($in.env // {})[.key] == null))' "$s") \
+      || die "could not read the env of $s"
+    # shellcheck disable=SC2016  # jq program, not shell
+    differ=$(jq -r --slurpfile w "$1" \
+               '(.env // {}) as $e | ($w[0].env // {}) | to_entries | map(select($e[.key] != null and $e[.key] != .value) | .key) | join(" ")' "$s") \
+      || die "could not read the env of $s"
+    if [ "$add" != "{}" ]; then
+      tmp=$(mktemp)
+      jq --argjson a "$add" '.env = ((.env // {}) + $a)' "$s" > "$tmp" || { rm -f "$tmp"; die "could not add the telemetry settings to $s"; }
+      [ "$(jq -S . "$tmp")" != "$(jq -S . "$1")" ] || cat "$1" > "$tmp"
+      keep_copy "$s"
+      cat "$tmp" > "$s"; rm -f "$tmp"
+      note "  added      $(jq -r 'keys | join(", ")' <<<"$add") to the env of $s"
+    else
+      note "  unchanged  telemetry settings in $s"
+    fi
+    [ -z "$differ" ] || note "  KEPT       $s sets $differ to another value than canon's; left as the owner set it"
+  fi
+  if [ ! -d "$CODEX_DIR" ]; then
+    note "  skipped    Codex telemetry: no $CODEX_DIR (Codex not installed); run --user-config again after installing it"
+    return "$rc"
+  fi
+  case "$(codex_otel_state "$c")" in
+    canon) note "  unchanged  [otel] in $c" ;;
+    other) note "  KEPT       $c sets otel itself; left as the owner set it. Canon's table: $ROOT/home/.codex/otel.toml" ;;
+    *)
+      if [ -s "$c" ]; then
+        keep_copy "$c"
+        [ -z "$(tail -c 1 "$c")" ] || printf '\n' >> "$c"
+        printf '\n' >> "$c"
+      fi
+      { echo "# canon: OTLP log export to the local collector (home/.codex/otel.toml, docs/adr/0007-observability.md)"
+        grep -v -e '^#' -e '^$' "$ROOT/home/.codex/otel.toml"; } >> "$c" || die "could not write $c"
+      note "  added      [otel] to $c"
+      ;;
+  esac
+  return "$rc"
+}
+
 install_user_config() {
   local src="$ROOT/home/.claude" pending=0 f dst bak tmp
   case "$CLAUDE_HOME" in /*) ;; *) die "CLAUDE_CONFIG_DIR must be an absolute path (got: $CLAUDE_HOME)" ;; esac
@@ -422,6 +529,7 @@ install_user_config() {
   done
   tmp=$(mktemp)
   render_settings > "$tmp" || { rm -f "$tmp"; die "could not render settings.json for $CLAUDE_HOME"; }
+  install_telemetry "$tmp" || pending=1
   for f in settings.json CLAUDE.md; do
     local from="$src/$f"; [ "$f" = settings.json ] && from="$tmp"
     if [ ! -e "$CLAUDE_HOME/$f" ]; then

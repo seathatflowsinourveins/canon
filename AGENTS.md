@@ -70,7 +70,7 @@ Every edit to a Python file runs ruff on it, and every edit under `canon/` or
 `docs/adr/` runs the canon lint. Once a day a session-start hook compares the canon with upstream and the
 next session start prints the result; a scheduled workflow does the same comparison on GitHub every day.
 A background watchdog raises a macOS notification when a session
-stalls or fails repeatedly. Once the owner installs it, a second agent runs a paper session window every
+stalls or fails repeatedly. A local OpenTelemetry Collector on 127.0.0.1 keeps the token events `scripts/lanes --rates` reads (ADR 0007). Once the owner installs it, a second agent runs a paper session window every
 35 minutes when Alpaca's clock says a session is open, and `scripts/automation status` shows its last
 result (ADR 0050). On Mondays a scheduled session runs the `landscape-refresh` skill. Dependabot
 opens at most two grouped pull requests a week, for the indirect packages in `uv.lock` and for the

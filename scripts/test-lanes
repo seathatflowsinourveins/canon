@@ -44,6 +44,7 @@ echo "mise $* | exec_auto_install=${MISE_EXEC_AUTO_INSTALL:-unset} | pwd=$PWD | 
 case "${1:-}" in
   --version) cat "$STUB/mise-version"; exit 0 ;;
   trust|install) exit 0 ;;
+  which) [ -x "$STUB/otelcol" ] && echo "$STUB/otelcol"; exit 0 ;;   # mise which: the otelcol stub, if any
   exec) shift; [ "${1:-}" = "--" ] && shift ;;
   *) exit 0 ;;
 esac
@@ -64,8 +65,10 @@ cat > "$B/launchctl" <<'EOF'
 #!/bin/bash
 echo "launchctl $*" >> "$STUB/launchctl.log"
 case "${1:-}" in
-  print) [ -f "$STUB/launchctl-print" ] || exit 113; cat "$STUB/launchctl-print" ;;
-  bootout) [ -f "$STUB/bootout-fails" ] && exit 5; rm -f "$STUB/launchctl-print" ;;
+  # one label's own answer first ($STUB/launchctl-print-<label>), else the shared one
+  print) f="$STUB/launchctl-print-${2##*/}"; [ -f "$f" ] || f="$STUB/launchctl-print"
+         [ -f "$f" ] || exit 113; cat "$f" ;;
+  bootout) [ -f "$STUB/bootout-fails" ] && exit 5; rm -f "$STUB/launchctl-print" "$STUB/launchctl-print-${2##*/}" ;;
 esac
 exit 0
 EOF
@@ -88,7 +91,7 @@ export STUB="$TMP/stub"; mkdir -p "$STUB"
 export PATH="$B:$PATH"
 REAL_HOME="$HOME"   # the paper:store case needs the user's own login keychain, which security finds through HOME
 export HOME="$TMP/home"; mkdir -p "$HOME"
-unset CLAUDE_CONFIG_DIR CANON_LEDGER_HOME AUTOMATION_SKIP_LAUNCHD CANON_LAUNCHAGENTS_DIR
+unset CLAUDE_CONFIG_DIR CANON_LEDGER_HOME AUTOMATION_SKIP_LAUNCHD CANON_LAUNCHAGENTS_DIR CODEX_HOME
 PINNED=$(sed -n 's/^MISE_VERSION="v\([^"]*\)".*/\1/p' "$ROOT/scripts/bootstrap")
 echo "$PINNED macos-arm64 (stub)" > "$STUB/mise-version"
 CCPIN="2.1.321"   # the claude-code pin the bootstrap fixture's registry sets, whatever the real one is
@@ -262,6 +265,17 @@ mkdir -p "$R/scripts" "$R/.githooks" "$R/.claude/hooks" "$R/.github/workflows" "
          "$AH/scheduled-tasks/canon-landscape-refresh" "$AH/canon/watch"
 cp "$ROOT/scripts/automation" "$ROOT/scripts/lanes" "$R/scripts/"
 cp "$ROOT/home/.claude/canon/lanes-watch.sh" "$ROOT/home/.claude/canon/paper-session.sh" "$R/home/.claude/canon/"
+cp -R "$ROOT/home/.claude/canon/otel" "$R/home/.claude/canon/"
+# otelcol stub: logs its arguments and CANON_OTEL_DIR; validate fails when $STUB/otelcol-refuses exists
+cat > "$STUB/otelcol" <<'EOF'
+#!/bin/bash
+echo "otelcol $* | dir=${CANON_OTEL_DIR:-unset}" >> "$STUB/otelcol.log"
+[ "${1:-}" = validate ] && [ -f "$STUB/otelcol-refuses" ] && { echo "invalid config stub"; exit 1; }
+exit 0
+EOF
+chmod +x "$STUB/otelcol"
+OTL="$STUB/launchctl-print-local.canon.otel-collector"   # what launchctl print says of the collector agent
+printf '\tstate = running\n' > "$OTL"
 printf '#!/bin/bash\nexit 0\n' > "$R/.githooks/pre-commit"; cp "$R/.githooks/pre-commit" "$R/.claude/hooks/canon-watch.sh"
 chmod +x "$R/.githooks/pre-commit" "$R/.claude/hooks/canon-watch.sh"
 echo '{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"canon-watch.sh"}]}]}}' > "$R/.claude/settings.json"
@@ -379,6 +393,29 @@ printf '\tstate = not running\n\truns = 3\n\tlast exit code = 0\n' > "$STUB/laun
 paper running 600; jq '.stale_after = 300' "$PD/latest.json" > "$PD/l" && mv "$PD/l" "$PD/latest.json"; status
 check "a record's own stale_after decides when it died" rowis "$TMP/status.out" "paper session" DIED
 paper ok 600
+printf '\tstate = running\n' > "$OTL"; rm -f "$AH/canon/otel/logs.jsonl"; status; rc=$?
+check "collector running, no file yet: ok, saying no session has sent an event" \
+      eval 'rowis "$TMP/status.out" "otlp collector" ok && [ "$rc" = 0 ] && grep -q "no session has sent an event" "$TMP/status.out"'
+mkdir -p "$AH/canon/otel"; : > "$AH/canon/otel/logs.jsonl"; status
+check "... and the file's age once there is one"  grep -q "logs.jsonl last written 0 min ago" "$TMP/status.out"
+if command -v plutil >/dev/null 2>&1; then
+  # the agent's plist names a binary that is no longer there (a pin moved, a mise prune)
+  mkdir -p "$HOME/Library/LaunchAgents"; GP="$HOME/Library/LaunchAgents/local.canon.otel-collector.plist"
+  printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict><key>ProgramArguments</key><array><string>%s</string></array></dict></plist>\n' \
+    "$TMP/gone/otelcol" > "$GP"
+  status; rc=$?
+  check "collector running a binary that is gone: FAILED, naming the reinstall" \
+        eval 'rowis "$TMP/status.out" "otlp collector" FAILED && [ "$rc" != 0 ] && grep -q "otelcol is gone" "$TMP/status.out"'
+  rm -f "$GP"
+else
+  skip "collector binary gone" "needs plutil, which is macOS-only"
+fi
+printf '\tstate = not running\n\tlast exit code = 1\n' > "$OTL"; status; rc=$?
+check "collector not running: FAILED, exit 1"     eval 'rowis "$TMP/status.out" "otlp collector" FAILED && [ "$rc" != 0 ]'
+rm -f "$OTL"; mv "$STUB/launchctl-print" "$STUB/kept-print"; status; rc=$?   # nothing loaded at all
+check "collector not loaded: OFF, exit 1"         eval 'rowis "$TMP/status.out" "otlp collector" OFF && [ "$rc" != 0 ]'
+mv "$STUB/kept-print" "$STUB/launchctl-print"
+printf '\tstate = running\n' > "$OTL"
 
 # the paper session's origin: a local bare repository standing in for the example GitHub URL, through
 # git's url.<base>.insteadOf in the temp HOME's own git config (git-config(1)), so nothing reaches the network
@@ -424,6 +461,25 @@ if command -v plutil >/dev/null 2>&1; then
   check "... every 35 minutes"                    test "$(plutil -extract StartInterval raw -o - "$PP")" = 2100
   check "... from the automation folder, not a checkout" test "$(plutil -extract WorkingDirectory raw -o - "$PP")" = "$AH/canon"
   check "... not at load"                         test "$(plutil -extract RunAtLoad raw -o - "$PP")" = false
+  OP="$TMP/agents/local.canon.otel-collector.plist"
+  oargs=""
+  for i in 0 1 2 3; do oargs="$oargs|$(plutil -extract "ProgramArguments.$i" raw -o - "$OP" 2>/dev/null)"; done
+  check "rehearsal writes the collector agent: the otelcol mise names, --config the installed config" \
+        test "$oargs" = "|$STUB/otelcol|--config|$AH/canon/otel/config.yaml|"
+  check "... the config installed from home/"      cmp -s "$ROOT/home/.claude/canon/otel/config.yaml" "$AH/canon/otel/config.yaml"
+  check "... validated first, with the folder it writes to" \
+        grep -qE "^otelcol validate --config /.*/repo/home/\.claude/canon/otel/config\.yaml \| dir=$AH/canon/otel\$" "$STUB/otelcol.log"
+  check "... CANON_OTEL_DIR set, kept alive and started at load" \
+        eval '[ "$(plutil -extract EnvironmentVariables.CANON_OTEL_DIR raw -o - "$OP")" = "$AH/canon/otel" ] && [ "$(plutil -extract KeepAlive raw -o - "$OP")" = true ] && [ "$(plutil -extract RunAtLoad raw -o - "$OP")" = true ]'
+  echo "# installed before" > "$AH/canon/otel/config.yaml"
+  : > "$STUB/otelcol-refuses"; rm -f "$OP"; inst; rc=$?
+  check "a config otelcol refuses fails install and writes no collector agent" \
+        eval '[ "$rc" != 0 ] && [ ! -e "$OP" ] && grep -q "otelcol validate refused the config: invalid config stub" "$TMP/install.out"'
+  check "... and leaves the installed config as it was" test "$(cat "$AH/canon/otel/config.yaml")" = "# installed before"
+  rm -f "$STUB/otelcol-refuses"; chmod -x "$STUB/otelcol"; inst; rc=$?
+  check "no otelcol from mise fails install, naming bootstrap" \
+        eval '[ "$rc" != 0 ] && [ ! -e "$OP" ] && grep -q "no otelcol installed for this clone; run: scripts/bootstrap --install" "$TMP/install.out"'
+  chmod +x "$STUB/otelcol"
   check "agent environment points the watchdog at the installed directory" \
         eval '[ "$pe" = "$AH" ] && jqt "$AH/canon/watch/lanes-status.json" "has(\"checked_at\")"'
   git -C "$R" remote set-url origin "https://someone:s3cr3t-t0ken@example.com/example/repo.git"; inst; rc=$?
@@ -522,12 +578,16 @@ check "... and stamps no scheduled firing"        test ! -e "$FD/scheduled-firin
 
 UH="$TMP/un-home"; UA="$TMP/un-agents"
 uninst() { CLAUDE_CONFIG_DIR="$UH" CANON_LAUNCHAGENTS_DIR="$UA" "$R/scripts/automation" uninstall > "$TMP/uninstall.out" 2>&1; }
-mkdir -p "$UH/canon" "$UA"; : > "$UH/canon/lanes"; : > "$UH/canon/lanes-watch.sh"; : > "$UA/local.canon.lanes-watch.plist"
+mkdir -p "$UH/canon/otel" "$UA"; : > "$UH/canon/lanes"; : > "$UH/canon/lanes-watch.sh"; : > "$UA/local.canon.lanes-watch.plist"
+: > "$UA/local.canon.otel-collector.plist"; : > "$UH/canon/otel/config.yaml"; : > "$UH/canon/otel/logs.jsonl"
 : > "$UA/local.canon.paper-session.plist"; : > "$UH/canon/paper-session.sh"
 fire --checkout-only "$B/mise" "$UH/canon/paper-checkout" "$OURL"
 printf '\tstate = not running\n' > "$STUB/launchctl-print"; rm -f "$STUB/bootout-fails"; : > "$STUB/mise.log"
 uninst; rc=$?
 check "uninstall removes everything: exit 0"      eval '[ "$rc" = 0 ] && [ ! -e "$UH/canon/lanes" ] && [ ! -e "$UA/local.canon.lanes-watch.plist" ] && [ ! -e "$UA/local.canon.paper-session.plist" ]'
+check "... the collector agent and its config, keeping the events it wrote" \
+      eval '[ ! -e "$UA/local.canon.otel-collector.plist" ] && [ ! -e "$UH/canon/otel/config.yaml" ] && [ -e "$UH/canon/otel/logs.jsonl" ]'
+check "... and unloads the collector"             grep -q "bootout gui/[0-9]*/local.canon.otel-collector" "$STUB/launchctl.log"
 check "... the paper runner, its clone, and the trust mise gave the clone's mise.toml" \
       eval '[ ! -e "$UH/canon/paper-session.sh" ] && [ ! -e "$UH/canon/paper-checkout" ] && grep -qF "mise trust --untrust $UH/canon/paper-checkout/mise.toml" "$STUB/mise.log"'
 mkdir -p "$UH/canon/paper-checkout"; echo mine > "$UH/canon/paper-checkout/file"; : > "$STUB/mise.log"
@@ -757,10 +817,59 @@ fi
 mkdir -p "$C/canon"; echo "# previous" > "$C/canon/ledger.sh"
 CLAUDE_CONFIG_DIR="$C" bs --user-config; rc=$?
 check "user-config into a directory with a space: exit 0" test "$rc" = 0
+check "no Codex folder: Codex telemetry skipped, nothing created" \
+      eval '[ ! -e "$HOME/.codex" ] && grep -q "skipped    Codex telemetry: no $HOME/.codex" "$TMP/bs.out"'
 bak=$(find "$C/canon" -name 'ledger.sh.replaced-*'); bak=${bak%%$'\n'*}
 check "differing ledger.sh kept beside the new one" eval '[ -n "$bak" ] && [ "$(cat "$bak")" = "# previous" ] && cmp -s "$C/canon/ledger.sh" "$ROOT/home/.claude/canon/ledger.sh" && grep -q "kept" "$TMP/bs.out"'
+mkdir -p "$HOME/.codex"
 CLAUDE_CONFIG_DIR="$C" bs --user-config
 check "identical scripts are not backed up again" test "$(find "$C/canon" -name '*.replaced-*' | wc -l | tr -d ' ')" = 1
+# telemetry (ADR 0007 tier 3): the env block reaches the user settings, and canon's [otel] table Codex's config
+check "a new settings.json carries the telemetry env, content logging unset" \
+      jqt "$C/settings.json" '.env.CLAUDE_CODE_ENABLE_TELEMETRY == "1" and .env.OTEL_LOGS_EXPORTER == "otlp" and .env.OTEL_EXPORTER_OTLP_ENDPOINT == "http://127.0.0.1:4317" and ([.env | keys[] | select(startswith("OTEL_LOG_"))] | length) == 0'
+CX="$HOME/.codex/config.toml"
+check "... and a new Codex config gets canon's [otel] table" \
+      eval 'grep -qxF "[otel]" "$CX" && grep -qF "otlp-http = { endpoint = \"http://127.0.0.1:4318/v1/logs\"" "$CX" && grep -qxF "log_user_prompt = false" "$CX"'
+CLAUDE_CONFIG_DIR="$C" bs --check
+check "check: telemetry settings and codex telemetry ok" \
+      eval 'rowis "$TMP/bs.out" "telemetry settings" ok && rowis "$TMP/bs.out" "codex telemetry" ok'
+C3="$TMP/cfg3"; mkdir -p "$C3"
+echo '{"model":"mine","env":{"MY_VAR":"1","OTEL_METRICS_EXPORTER":"otlp"}}' > "$C3/settings.json"
+printf 'model = "o3"\n\n[profiles.fast]\nmodel = "x"' > "$CX"   # no newline at the end, as an editor may leave it
+CLAUDE_CONFIG_DIR="$C3" bs --user-config
+check "an existing settings.json gets the missing telemetry variables, keeping its own" \
+      jqt "$C3/settings.json" '.model == "mine" and .env.MY_VAR == "1" and .env.CLAUDE_CODE_ENABLE_TELEMETRY == "1" and .env.OTEL_LOGS_EXPORTER == "otlp"'
+check "... leaves a value the owner set, and names it" \
+      eval 'jqt "$C3/settings.json" ".env.OTEL_METRICS_EXPORTER == \"otlp\"" && grep -q "sets OTEL_METRICS_EXPORTER to another value" "$TMP/bs.out"'
+check "... keeping the previous file beside it" \
+      eval 'f=$(find "$C3" -name "settings.json.replaced-*" | head -1); [ -n "$f" ] && jqt "$f" ".env | has(\"OTEL_LOGS_EXPORTER\") | not"'
+check "an existing Codex config gets the table appended, its own lines kept" \
+      eval 'grep -qxF "model = \"o3\"" "$CX" && grep -qxF "model = \"x\"" "$CX" && grep -qxF "[otel]" "$CX" && [ -n "$(find "$HOME/.codex" -name "config.toml.replaced-*")" ]'
+check "... on a line of its own after the last one"  grep -qxF '[profiles.fast]' "$CX"
+CLAUDE_CONFIG_DIR="$C3" bs --user-config
+check "a second run adds nothing again"           eval '[ "$(grep -c "^\[otel\]" "$CX")" = 1 ] && grep -q "unchanged  \[otel\]" "$TMP/bs.out"'
+CLAUDE_CONFIG_DIR="$C3" bs --check
+check "check names the owner's differing value, without failing on it" \
+      eval 'rowis "$TMP/bs.out" "telemetry settings" OWNER && grep -q "sets OTEL_METRICS_EXPORTER to another value" "$TMP/bs.out"'
+echo '{"env":[]}' > "$C3/settings.json"; CLAUDE_CONFIG_DIR="$C3" bs --user-config; rc=$?
+check "an env that is not an object: named, the run finishes" \
+      eval 'grep -q "not a JSON object with an object env" "$TMP/bs.out" && grep -q "New Claude Code sessions" "$TMP/bs.out"'
+printf '[otel]\nexporter = "none"\n' > "$CX"; cp "$CX" "$TMP/cx.before"
+CLAUDE_CONFIG_DIR="$C3" bs --user-config
+check "a Codex config with its own otel table is left as it is, and named" \
+      eval 'cmp -s "$CX" "$TMP/cx.before" && grep -q "sets otel itself; left as the owner set it" "$TMP/bs.out"'
+CLAUDE_CONFIG_DIR="$C3" bs --check
+check "... and check calls it OWNER"              rowis "$TMP/bs.out" "codex telemetry" OWNER
+rm -rf "$HOME/.codex"
+# a settings.json that is canon's previous render: after the merge it is canon's file byte for byte
+mkdir -p "$HOME/.claude"
+awk '/^  "env": \{/ { e = 1 } !e { print } e && /^  \},/ { e = 0 }' "$ROOT/home/.claude/settings.json" > "$HOME/.claude/settings.json"
+bs --user-config
+check "the previous render plus the merge is the new render: no copy to merge by hand" \
+      eval 'cmp -s "$HOME/.claude/settings.json" "$ROOT/home/.claude/settings.json" && [ ! -e "$HOME/.claude/settings.json.canon-proposed" ]'
+bs --user-config
+check "... and a second run finds it unchanged"   grep -q "unchanged  $HOME/.claude/settings.json" "$TMP/bs.out"
+rm -rf "$HOME/.claude"
 cmd=$(jq -r '.hooks.SessionStart[0].hooks[0].command' "$C/settings.json")
 echo '{"hook_event_name":"SessionStart","session_id":"t1","cwd":"/w/x"}' | CLAUDE_CONFIG_DIR="$C" sh -c "$cmd"
 check "installed hook command runs the installed ledger.sh" eval 'cat "$C"/canon/ledger/*.jsonl 2>/dev/null | jq -e "select(.sid == \"t1\")" >/dev/null'

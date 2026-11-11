@@ -145,11 +145,12 @@ Why it works this way, and what the keychain does not protect against:
 | Landscape watch | Once a day, at session start | No |
 | Lane watchdog | Every 10 minutes while the Mac is awake | No |
 | Paper session | Every 35 minutes while the Mac is awake; a window only when Alpaca's clock says a session is open, on the `main` GitHub has then (ADR 0050) | No |
+| OTLP collector | Always, while the Mac is awake: the pinned OpenTelemetry Collector on 127.0.0.1, writing the events `scripts/lanes --rates` reads (ADR 0007) | No |
 | Weekly refresh | Weekly, when the desktop app is open | One session, short when nothing changed |
 | Dependency bot (Dependabot) | Weekly, on GitHub | Only when a session lands its pull request |
 
-`scripts/automation install` turns on the commit gate, the address check, the lane watchdog and the paper
-session agent, whose runner keeps its own clone of `main` in `~/.claude/canon/`. The edit
+`scripts/automation install` turns on the commit gate, the address check, the lane watchdog, the paper
+session agent, whose runner keeps its own clone of `main` in `~/.claude/canon/`, and the OTLP collector. The edit
 checks and the landscape watch are hooks in `.claude/settings.json`. The weekly refresh is a
 scheduled task in the Claude desktop app, and the dependency bot is `.github/dependabot.yml`, which GitHub
 runs.
@@ -180,7 +181,7 @@ runs.
 | `.claude/rules/` | Rules scoped to `canon/`, `docs/adr/` and trading code |
 | `.claude/skills/` | `adopt-upstream`, `new-adr`, `landscape-refresh`, `lane-report` |
 | `.claude/agents/` | `upstream-scout` (Sonnet), `evidence-verifier` (Opus) |
-| `home/` | Machine-level config: event ledger hook, status line, lane watchdog, paper session runner, user `CLAUDE.md` |
+| `home/` | Machine-level config: event ledger hook, status line, lane watchdog, paper session runner, OTLP collector config, Claude Code and Codex telemetry settings, user `CLAUDE.md` |
 | `mise.toml` | Pinned toolchain |
 
 ## How a decision gets made
@@ -220,9 +221,11 @@ here, community convergence, then anyone's recollection.
   hold. A trial that never traded, or a configuration that never runs to the end, stops a ranking:
   what value it should count as is undecided. The overfitting probability has no adopted
   implementation (ADR 0027 and ADR 0032 are `proposed`).
-* **No OpenTelemetry backend.** The local event ledger covers this machine; `home/otel-settings.example.json`
-  is ready for when a collector exists. Until one writes `~/.claude/canon/otel/logs.jsonl`,
-  `scripts/lanes --rates` lists every worker as not measured (ADR 0007).
+* **Tokens per second for Claude Code and Codex only.** A local OpenTelemetry Collector keeps their token
+  events, names and counts only, in `~/.claude/canon/otel/logs.jsonl` once `scripts/bootstrap
+  --user-config` has set their telemetry and `scripts/automation install` has started it. Muse Code,
+  Antigravity and DeepSeek Harness document no token telemetry, so `scripts/lanes --rates` lists them as
+  not measured, and there are no dashboards (ADR 0007).
 * **No model-routing eval of our own has run.** Model routing rests on external measurements (ADR 0005). A reviewer
   benchmark is defined, with its cases, brief and procedure in `evals/review/` (ADR 0046); its first run
   (2026-11-10) scored 10 confirmed defects, in `evals/review/runs/`. Its cases now hold 23, 10 in
