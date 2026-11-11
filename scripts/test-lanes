@@ -1063,6 +1063,27 @@ else
   # uv that ran, and the four lock checks failed, load or none. mise searches no higher than MISE_CEILING_PATHS
   # (mise settings, ceiling_paths), here the temp folder, physical, as mise sees its working folder.
   TMPP=$(cd "$TMP" && pwd -P)
+  # The ceiling holds: in a folder of its own, a config planted above a run reaches mise with the ceiling at the
+  # temp folder (which also keeps out anything above the temp folder, a stray config included), and not with
+  # the ceiling between it and the run. Each run must exit 0 and print its exports, so a mise that failed
+  # cannot pass as one that held.
+  CP="$TMP/ceiling-probe"; mkdir -p "$CP/c/run"; CPP=$(cd "$CP" && pwd -P)
+  printf '[env]\nCANON_PLANTED = "reached"\n' > "$CP/mise.toml"
+  planted() { (cd "$CP/c/run" && env -i HOME="$HOME" MISE_TRUSTED_CONFIG_PATHS="$CPP" MISE_CEILING_PATHS="$1" \
+                 PATH="/usr/bin:/bin" "$LMISE" env -s bash 2>&1); }
+  # without, wrc, with and hrc are read by the eval'd checks
+  # shellcheck disable=SC2034
+  without=$(planted "$TMPP")
+  # shellcheck disable=SC2034
+  wrc=$?
+  # shellcheck disable=SC2034
+  with=$(planted "$CPP/c")
+  # shellcheck disable=SC2034
+  hrc=$?
+  check "a config above a run's folder reaches mise when the ceiling is above it (so the next check can fail)" \
+        eval '[ "$wrc" = 0 ] && grep -q "^export PATH=" <<<"$without" && grep -q "CANON_PLANTED=.\{0,1\}reached" <<<"$without"'
+  check "... and not with MISE_CEILING_PATHS between it and the run, mise running as it should" \
+        eval '[ "$hrc" = 0 ] && grep -q "^export PATH=" <<<"$with" && ! grep -q CANON_PLANTED <<<"$with"'
   # owner <task> <folder> <deadline> [sync]: <folder>/mise.toml with one task, owner, whose body is <task>'s
   # from mise.toml with its lock folder moved into <folder>, its deadline (and paper:session's start-up bound,
   # sync) shortened; fails when the body cannot be found or moved
