@@ -78,6 +78,9 @@ was the master orchestrator's choice under the owner's delegation of 2026-11-10,
 * Bad: the account's balance is as of its last read; one HTTP call per cancel, one at a time; an order
   Alpaca holds that the node does not yet, or one placed after the cache was read, is not canceled. No
   `OrderTriggered`: an election shows only as a fill.
+* Known limit: Alpaca's algorithmic and direct-market order types (DMA gateway, VWAP, TWAP) exist only on its
+  Elite Smart Router route, not on standard retail routing (https://docs.alpaca.markets/us/docs/alpaca-elite-smart-router,
+  fetched, summarised); they are not implemented or planned in the adapter.
 
 ### Confirmation
 
@@ -147,6 +150,9 @@ Read 2026-11-10; "raw": fetched with `curl` and read, not summarised. NautilusTr
   `adopt-upstream`.
 * `crates/model/src/accounts/any.rs` (`from_state_checked`), `crates/portfolio/src/portfolio.rs`
   (`calculate_account_state`) at the pin (fetched, raw).
+* https://docs.alpaca.markets/us/docs/alpaca-elite-smart-router, read 2026-11-11 (fetched, summarised, not
+  raw): "DMA Gateway, VWAP, and TWAP can only be accessed if users are on the Elite Smart Router as part of
+  the Alpaca Elite Program"; https://docs.alpaca.markets/us/docs/orders-at-alpaca lists none of them.
 * Second reader (`evidence-verifier`), 2026-11-10, on cancel-all twice and stops once: the decisions stand.
   Corrected above: "never wider than the command"; Binance spot and Bybit select from the cache only for a
   sided command; the retry argument; the 422 exception; who skips `OrderPendingCancel`; Kraken's trigger

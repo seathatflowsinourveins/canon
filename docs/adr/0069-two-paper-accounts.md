@@ -66,7 +66,12 @@ names, the adapter and `canon_alpaca` stay as they are. B's items are labelled `
    account, "200 requests per minute, per account" (a support page that does not name paper accounts, so
    for paper UNVERIFIED). The stream limit belongs to the user: "in many subscriptions (or without one)
    this limit is 1". So two paper accounts of one login share one stream (read from "from a user"; no
-   page states it for a second paper account, so this is UNVERIFIED).
+   page states it for a second paper account, so this is UNVERIFIED). Alpaca support states that paper
+   accounts are not eligible for the increased API rate (private correspondence, read 2026-11-11; not
+   publicly documented), so paper work is sized for the standard 200 a minute. Alpaca staff forum posts say the
+   200 is "per account (ie each paper and live account is separate)"
+   (https://forum.alpaca.markets/t/what-constitutes-an-api-call/16502, 2025-03-24); that is a forum
+   statement, not documentation, so the per-account question stays UNVERIFIED.
 4. **What this change builds:** storing, checking and removing B's pair, and an optional
    `paper key pair (windows)` row in `scripts/bootstrap --check` that shows present or absent and never a
    value. **What it does not build yet:** no task puts account B's pair in an environment; the only read
@@ -173,6 +178,11 @@ Read 2026-11-10.
   resetting them"; "Open New Paper Account"; "generate new API keys for any newly created account"
   (fetched).
 * https://alpaca.markets/support/usage-limit-api-calls — "200 requests per minute, per account" (fetched).
+* https://alpaca.markets/elite — lists API call limits of "200 calls / minute" and "1000 calls / minute"
+  by routing tier: 200 under commission-free, 1000 under the Elite Smart Router (fetched, summarised, not
+  raw). No public page found
+  says whether paper accounts get the higher rate; that rests on Alpaca support, private correspondence,
+  read 2026-11-11, and is not publicly documented.
 * https://docs.alpaca.markets/us/docs/streaming-market-data.md — "The number of connections to a single
   endpoint from a user is limited based on the user's subscription, but in many subscriptions (or without
   one) this limit is 1"; "only 1 active stream connection"; `connection limit exceeded` (fetched).

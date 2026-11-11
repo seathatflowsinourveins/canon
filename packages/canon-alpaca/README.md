@@ -131,6 +131,9 @@ Known limits of custom Python clients upstream: no Redis or PostgreSQL cache bac
 
 Each is stated where it is implemented, with its source.
 
+* **No algorithmic or direct-market order types.** Alpaca offers DMA, VWAP and TWAP orders only on its
+  Elite Smart Router route; the adapter does not implement them and none is planned (ADR 0036).
+
 * **Whole shares only.** NautilusTrader's `Equity` cannot hold a fractional quantity (ADR 0030). Alpaca's
   `fractionable` flag is kept in `Equity.info`; a fractional size in market data is refused, not rounded.
 * **One price increment, 0.0001.** Alpaca's assets endpoint gives no price increment for US equities, and

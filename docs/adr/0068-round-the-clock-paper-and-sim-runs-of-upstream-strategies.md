@@ -46,6 +46,11 @@ contingent orders, and has no options (`canon_alpaca.execution`).
 | `HurstVpinDirectional` | value bars, quotes, trades with an aggressor side | IOC market entries, reduce-only IOC closes | no: IOC and reduce-only denied; Alpaca's trades carry no aggressor side (`NO_AGGRESSOR`), so VPIN never warms and it never enters |
 | `DeltaNeutralVol` | option Greeks and quotes | option limits, hedge market orders | no: no options |
 
+Upstream's TWAP execution algorithm (`TwapAlgorithm`, NautilusTrader's execution-algorithms page) is
+NautilusTrader's own client-side algorithm, which splits a primary order into smaller spawned orders. It is
+a different thing from Alpaca's TWAP order type, which only the Elite Smart Router route offers (ADR 0036);
+the two are not to be conflated.
+
 **Orders in flight**, each candidate read against it at the pin, since `MaCross` checks its position but
 not its working orders and so sends a second order under delay (`session_ma_cross.py`'s guard exists for
 that). `EmaCross` has no guard: it sends one order on each change of `fast > slow`, so a delay adds no
@@ -170,6 +175,8 @@ Read 2026-11-10. Fetched means read in this session as raw text or source; run m
   — the five `strategy.rs` and READMEs, as tabled. Fetched (raw, at the commit).
 * `…/examples/backtest/fx_market_maker_gbpusd_bars.py` at the commit — `GridMarketMaker` on quotes. Fetched.
   The sandbox's sources are ADR 0070's.
+* https://nautilustrader.io/docs/md/latest/concepts/execution/algorithms.md — `TwapAlgorithm`, an
+  `ExecutionAlgorithm` that spreads a primary order across intervals. Fetched 2026-11-11.
 * https://nautilustrader.io/docs/md/latest/concepts/backtesting/apis-and-runs.md — one node per run; `reset`
   and `clear_strategies`. Fetched by the second reader.
 * NautilusTrader v2.0.0rc9 release notes (published 2026-11-10) — the sandbox open-order and GTD fixes.
