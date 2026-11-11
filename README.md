@@ -218,7 +218,7 @@ here, community convergence, then anyone's recollection.
   the adapter requests.
 * **No strategy upstream ships has been ranked yet.** The one study on real bars ranked eight variants
   of the repo's `MaCross` on SPY and QQQ daily bars (ADR 0048, `canon_trading.variant_study`): no
-  variant passed the gate. Upstream's built-in `EmaCross` reads quotes, which the catalog does not
+  variant passed the gate (ADR 0052). Upstream's built-in `EmaCross` reads quotes, which the catalog does not
   hold. A trial that never traded, or a configuration that never runs to the end, stops a ranking:
   what value it should count as is undecided. The overfitting probability has no adopted
   implementation (ADR 0027 and ADR 0032 are `proposed`).
