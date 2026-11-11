@@ -180,6 +180,33 @@ stream delivered there, which held for 04:13 to 04:58 (ADR 0044). The same day a
 was served 525 `sip` one-minute bars over REST, from the prior day's 15:35 to its start, and streamed
 18,388 SPY quotes and 1,571 trades (ADR 0044, its pre-market row).
 
+Prices finer than the instrument's precision (2026-11-11). The consolidated tape carries trade and bar
+prices finer than the adapter's four decimals (the study's loader met a SPY bar high of 747.086488), and
+sub-dollar names often do. Until this date the client refused them: a live trade or quote was dropped with
+an error line per print that no session window read, and a bars or quotes request holding one failed
+whole. Now a trade or bar price is rounded half to even, as upstream rounds a venue's value
+(`Instrument.make_price`; the Deribit and Bybit parsers' `Price::from_decimal_dp`): 747.086488 becomes
+747.0865 and 0.12345 becomes 0.1234. Each rounding is named on the stream (the first per symbol, the count
+at each power of ten, the total at unsubscribe or disconnect) as a warning beginning `Alpaca stream on
+feed `, which a session window keeps and does not fail on, and per bars request in one warning. A quote
+that fine is dropped and counted the same way, not rounded, since a lit book quotes at the tick; a quotes
+request drops it and keeps the rest. A price that is not a finite number, or a positive one that
+rounds to zero, is still refused. This corrects
+ADR 0030's "market data is never rounded". Offline, written failing first (`test_parsing.py`,
+`test_data_client.py`): 747.086488, 0.12345, 0.98765 and two midpoints rounded half to even; a live trade
+rounded and counted while the stream goes on; a live quote dropped and named; a bars request answered
+with the bar rounded; a quotes request keeping the rest; each kind's count logged at its own powers
+of ten, and a quote unsubscribe logging only the quotes' total; a price rounding to zero refused. `UNVERIFIED`: how often a sip quote is finer than
+four decimals (none seen); the rounding on a live sip stream. Paper, account A, 2026-11-11, under
+`mise run paper:test`, exit 0 each: at 10:20 New York `sip` streamed 2,297 AAPL trades and 1,387 quotes in
+60 s through a node, none dropped and none finer than four decimals, so none rounded; at 10:28, with the
+node's log shown to be captured, 2,036 trades, 1,002 quotes, none rounded; at 10:30 a request for three
+days of AAPL one-minute `sip` bars was answered with 2,001 bars, none rounded. At 11:20
+(`test_paper_sip_bars.py`) SPY `sip` bars, one-minute over three days and daily over a year, were answered
+with 2,264 and 251 bars, none finer than four decimals; at 11:27 a one-off request for SPY `sip`
+one-minute bars from 2025-11-28 to 2026-01-01 was answered with 20,146 bars, none rounded. So no paper run has yet met a print the client
+rounds: where the study's 747.086488 came from (an adjusted bar, or another window) is `UNVERIFIED`.
+
 `UNVERIFIED`: why the paper pair is served `boats` and `sip`; a second stream on another feed; a refused
 feed's server message on paper (none tried was refused; 409 is documented); `sip` in after-hours, which
 no stream has been probed for on it.
@@ -253,5 +280,15 @@ Read 2026-11-10; "raw": fetched with `curl` and read, not summarised.
   New York, a read-only probe under `paper:test`: `sip` 180 s then `iex` 600 s on SPY and QQQ; `iex` QQQ
   one trade at 08:34:39 and no quote, `iex` SPY 245 to 1,104 quotes per five minutes, `sip` hundreds of
   quotes a minute on each (counts kept outside the repository; ran).
+* 2026-11-11, prices finer than the precision: NautilusTrader at the pin, read in the local copy,
+  https://github.com/nautechsystems/nautilus_trader/blob/d53849b216e20f2c122ca01b4dd0da377638b186/crates/model/src/instruments/mod.rs
+  (`try_make_price_from_decimal` lines 372-377, `MidpointNearestEven`; `try_make_price` 391-395, from the
+  float's decimal string; `try_normalize_price` 410, refusing a price off the grid, not in the Python
+  bindings, searched), `crates/model/src/types/price.rs` (`from_decimal_dp` 508-519, "banker's
+  rounding"), `crates/adapters/deribit/src/websocket/parse.rs` (`parse_trade_msg` line 86, quotes 508-509
+  and 541-542, chart bars 741: `Price::from_decimal_dp(.., instrument.price_precision())`) and
+  `crates/adapters/bybit/src/common/parse.rs` (`parse_trade_tick` 912, `parse_kline_bar` 1049-1052,
+  `parse_price_with_precision` 1361-1369). Offline at the pin, `Equity.make_price` at precision 4:
+  747.086488 to 747.0865, 1.00025 to 1.0002, 1.00015 to 1.0002, 0.12345 to 0.1234 (ran).
 * Second reader, 2026-11-10 (`evidence-verifier`): B stands; corrected above: Databento's refusal cited
   from source, the data hooks' sentence quoted, the after-hours claim narrowed, the per-endpoint limit.

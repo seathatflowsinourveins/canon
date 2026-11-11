@@ -60,7 +60,9 @@ Limits found while building it, beyond the whole-share limit above:
 
 * Alpaca's assets endpoint documents `price_increment` for crypto only. Alpaca's US equity order rule is
   price-dependent: at most 2 decimals at or above $1.00, 4 below. `Equity` takes one increment, whose
-  precision must equal `price_precision`. The adapter uses 0.0001, so market data is never rounded. That
+  precision must equal `price_precision`. The adapter uses 0.0001. (Corrected 2026-11-11: a trade or bar
+  price finer than 0.0001 is rounded as upstream rounds and named, and such a quote dropped; ADR 0055,
+  "Prices finer than the instrument's precision".) That
   leaves the $1.00 rule to the execution slice. The owner should ratify this choice.
 * Alpaca's stream schema gives quote sizes in round lots, with no lot size to convert by. They pass through
   unconverted.
