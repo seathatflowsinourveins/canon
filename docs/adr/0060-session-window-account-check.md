@@ -73,6 +73,10 @@ is named in what is left.
   with nothing held does not stop it.
 * Bad: what Alpaca answers a lookup of an ID it does not hold, and how soon a submitted order shows in a
   lookup or a listing, are not documented (UNVERIFIED, Evidence).
+* Bad (2026-11-11): the check cancels every open order in the window's symbol that is not its own close,
+  whoever placed it, so until the check is limited to the window's own lineage (client order IDs, as
+  `src/canon_trading/custody.py` names them), nobody places an order by hand in a symbol a window is
+  trading. `mise run paper:account <tests|windows>` shows each open order as ours or foreign.
 
 ### Confirmation
 

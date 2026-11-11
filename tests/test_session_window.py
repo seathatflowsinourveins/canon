@@ -5111,6 +5111,10 @@ class Name:
     name: str = "Example Inc. Common Stock"
     action: str = ""
     """A corporate action type Alpaca lists for it since the last session, if any."""
+    ask: float | None = None
+    """Its latest sip quote's ask, if the snapshot has one."""
+    partial: float | None = None
+    """The close of a bar for the minute still in progress at `AT`, if Alpaca serves one."""
 
 
 NAMES = {
@@ -5168,6 +5172,9 @@ class Data:
                 latest_trade=SimpleNamespace(
                     price=n.price, timestamp=AT - timedelta(seconds=n.trade_age)
                 ),
+                latest_quote=None
+                if n.ask is None
+                else SimpleNamespace(ask_price=n.ask, bid_price=0),
             )
             for s in request_params.symbol_or_symbols
             if (n := self.names.get(s)) is not None
@@ -5181,6 +5188,7 @@ class Data:
         if start.astimezone(NEW_YORK).date() == TODAY:  # today's, from the open
             bars = {
                 s: [raw_bar(start + timedelta(minutes=1), n.close, n.volume)]
+                + ([] if n.partial is None else [raw_bar(AT, n.partial, 1)])
                 for s, n in self.names.items()
                 if s in request_params.symbol_or_symbols
             }
@@ -5523,10 +5531,14 @@ class SampleStream:
     `names` one minute bar at `AT`, decoded as `raw_data=True` gives it, then blocks until `stop`, or
     raises `fail` once the bars are sent."""
 
-    def __init__(self, names: dict[str, Name] | None = None, fail: str = "") -> None:
+    def __init__(
+        self, names: dict[str, Name] | None = None, fail: str = "", later: dict | None = None
+    ) -> None:
         import threading
 
         self.names = NAMES if names is None else names
+        self.later = later or {}
+        """More bars, by symbol: how many minutes after `AT` each comes."""
         self.fail = fail
         self.fed, self.stopped = threading.Event(), threading.Event()
         self.subscribed: list = []
@@ -5541,6 +5553,11 @@ class SampleStream:
         assert self.handler is not None
         for s, n in self.names.items():
             asyncio.run(self.handler({"S": s, "t": AT, "c": n.close, "v": n.volume}))
+        for s, minutes in self.later.items():
+            n = self.names[s]
+            for m in minutes:
+                at = AT + timedelta(minutes=m)
+                asyncio.run(self.handler({"S": s, "t": at, "c": n.close, "v": n.volume}))
         self.fed.set()
         if self.fail:
             raise RuntimeError(self.fail)
@@ -5693,3 +5710,112 @@ def test_a_failure_of_both_sources_refuses_the_window_naming_each(monkeypatch) -
         session_window.WindowRefused, match=r"no stream in tests.*500 from the screener"
     ):
         session_window.choose_mover(cast(TradingClient, Assets()), AT, opens, date(2026, 11, 9))
+
+
+def test_one_share_must_fit_the_cap_at_the_price_of_the_order_sent() -> None:
+    """Muse's finding 1 (2026-11-11): the risk engine prices a limit at its limit price, and a mover's
+    entry is `SessionMaCross`'s limit through the touch (`through_the_touch`: the ask plus
+    `LIMIT_OFFSET`), so the cap is checked at that price, not the last trade's: last 999 with an ask of
+    1005 would send 1005.05, and every entry would be denied."""
+    names = {"HHH": Name(500.0, 999.0, 10, 999.0, ask=1005.0), "LLL": NAMES["LLL"]}
+    opens = datetime(2026, 11, 10, 9, 30, tzinfo=NEW_YORK)
+    pick = session_window.select_mover(
+        cast(TradingClient, Assets()),
+        cast(Any, Data(names)),
+        cast(Any, Screener(names)),
+        cast(Any, Actions()),
+        AT,
+        opens,
+        date(2026, 11, 9),
+    )
+    assert pick.symbol == "LLL" and pick.entry == Decimal("1.55")
+    assert "1005.05" in pick.record["passed_over"]["HHH"]
+    assert pick.record["entry_limit"] == "1.55"
+
+
+def test_the_fallback_ranks_on_completed_minutes_only() -> None:
+    """Muse's finding 2 (2026-11-11): a bar for the minute still in progress is not the close the move
+    is measured on, since `minute_dollars` leaves that minute out of the dollar volume."""
+    names = {"LLL": Name(1.0, 1.5, 1200, 1.5, partial=3.0)}
+    opens = datetime(2026, 11, 10, 9, 30, tzinfo=NEW_YORK)
+    pick = session_window.select_mover(
+        cast(TradingClient, Assets()),
+        cast(Any, Data(names)),
+        cast(Any, Screener(names)),
+        cast(Any, Actions()),
+        AT,
+        opens,
+        date(2026, 11, 9),
+    )
+    assert pick.record["inputs"]["close"] == pytest.approx(1.5)
+    assert pick.record["inputs"]["move"] == pytest.approx(0.5)
+
+
+def test_the_stream_paths_freshness_is_measured_on_alpacas_clock() -> None:
+    """Muse's finding 3 (2026-11-11): the trade-age proxy is read against Alpaca's clock moved on by the
+    process's monotonic time (`now`), not the host's clock, which may be off by up to `SKEW_SECS`: trades 35
+    s old by the host are 135 s old by Alpaca's clock here, so every name is passed over as halted."""
+    stream = SampleStream()
+    venue = AT + timedelta(seconds=130)
+    with pytest.raises(
+        session_window.WindowRefused, match=r"LLL: its latest sip trade is 135 s old"
+    ):
+        session_window.stream_mover(
+            cast(TradingClient, Assets()),
+            cast(Any, stream),
+            cast(Any, Data()),
+            cast(Any, Screener()),
+            cast(Any, Actions()),
+            date(2026, 11, 9),
+            minutes=1,
+            clock=lambda: AT.timestamp() + 30,
+            sleep=stream.wait,
+            now=lambda: venue,
+        )
+
+
+def test_a_symbol_without_a_bar_in_every_minute_of_the_sample_is_not_ranked() -> None:
+    """Muse's finding 4 (2026-11-11): the sample's minutes are counted per symbol, so a name that traded in
+    its first minute only is not ranked on a dollar volume the others earned over the whole sample."""
+    names = {"LLL": NAMES["LLL"], "EEE": NAMES["EEE"]}
+    stream = SampleStream(names, later={"EEE": [1]})
+    pick = session_window.stream_mover(
+        cast(TradingClient, Assets()),
+        cast(Any, stream),
+        cast(Any, Data(names)),
+        cast(Any, Screener(names)),
+        cast(Any, Actions()),
+        date(2026, 11, 9),
+        minutes=2,
+        clock=lambda: AT.timestamp() + 30,
+        sleep=stream.wait,
+    )
+    assert pick.symbol == "EEE"
+    assert [r["symbol"] for r in pick.record["ranked"]] == ["EEE"]
+    # left out of the closes too, so none of the reads after the sample is spent on it
+    assert pick.record["sample"]["symbols"] == 1
+    assert pick.record["sample"]["elapsed_minutes"] == 2
+    assert pick.record["sample"]["incomplete"] == 1
+
+
+def test_a_first_minute_no_bar_was_received_for_does_not_leave_every_symbol_out() -> None:
+    """Code review, 2026-11-11: the sample starts in the last second of a minute (or on a host clock behind
+    Alpaca's), so that minute's bars went out before the subscription and no symbol has one. The sample's
+    minutes are those from the first minute a bar was received for, not the host's minute at the start."""
+    names = {"LLL": NAMES["LLL"], "EEE": NAMES["EEE"]}
+    stream = SampleStream(names, later={"LLL": [1], "EEE": [1]})
+    pick = session_window.stream_mover(
+        cast(TradingClient, Assets()),
+        cast(Any, stream),
+        cast(Any, Data(names)),
+        cast(Any, Screener(names)),
+        cast(Any, Actions()),
+        date(2026, 11, 9),
+        minutes=2,
+        clock=lambda: AT.timestamp() - 1,
+        sleep=stream.wait,
+    )
+    assert sorted(r["symbol"] for r in pick.record["ranked"]) == ["EEE", "LLL"]
+    assert pick.record["sample"]["elapsed_minutes"] == 2
+    assert pick.record["sample"]["incomplete"] == 0
+    assert pick.record["sample"]["from"] == AT.astimezone(UTC).isoformat()

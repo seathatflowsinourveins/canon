@@ -56,8 +56,9 @@ dependency, pattern and practice traces to a pinned upstream or a dated source. 
 | `scripts/survey-github report canon/github-practice.json` | Print what a measured sample of repositories converges on for pull requests and GitHub automation |
 | `scripts/bootstrap --check` | Show which toolchain pieces are installed, and whether the Claude Code CLI is behind its pin |
 | `scripts/manifest` | Join the toolchain, runtime defaults, standing automations and pinned upstreams; `--json` emits the same report as one object, with unavailable values and source failures named |
-| `mise run paper:store`, `paper:check`, `paper:remove`, `paper:test` | Enter the Alpaca paper key pair into the login keychain (the owner, in their own terminal), check it is there, remove it, run the paper tests with it under a lock, one session at a time (ADR 0029, ADR 0033); `paper:store`, `paper:check` and `paper:remove` take `windows` for account B's pair, which no task puts in an environment yet (ADR 0069) |
+| `mise run paper:store`, `paper:check`, `paper:remove`, `paper:test` | Enter the Alpaca paper key pair into the login keychain (the owner, in their own terminal), check it is there, remove it, run the paper tests with it under a lock, one session at a time (ADR 0029, ADR 0033); `paper:store`, `paper:check` and `paper:remove` take `windows` for account B's pair, which `paper:session`, `paper:long-only windows` and `paper:account windows` read (ADR 0069) |
 | `mise run paper:session` | Run one bounded `SessionMaCross` window (`--session regular\|extended`, `--minutes`, at most 60) on paper account B under its own lock and the stream lock; it starts flat, ends flat or fails, and logs outside the repository (ADR 0044, ADR 0069) |
+| `mise run paper:account tests\|windows` | Print one paper account, GET only: equity, cash, buying power, each position, each open order with whether its client order ID is of our nodes' lineage or foreign, and `no_shorting`; no account number or order ID (`src/canon_trading/custody.py`) |
 | `mise run paper:data sandbox` | Run the sandbox node (`--minutes`, at most 60): NautilusTrader's sandbox execution client on Alpaca's live data with account A's pair, every request but GET refused and no Alpaca execution client; `quotes` is listed and refused until it is built (ADR 0070) |
 
 ## Layout
@@ -85,8 +86,8 @@ next session start prints the result; a scheduled workflow does the same compari
 and keeps one locked `canon-drift` issue in step with what has drifted, which the brief names (ADR 0064).
 A background watchdog raises a macOS notification when a session
 stalls or fails repeatedly. A local OpenTelemetry Collector on 127.0.0.1 keeps the token events `scripts/lanes --rates` reads (ADR 0007). Once the owner installs it, a second agent runs a paper session window every
-35 minutes when Alpaca's clock says a session is open, and `scripts/automation status` shows its last
-result (ADR 0050). A maintenance agent keeps this machine on main by itself (ADR 0065). Every 30
+35 minutes when Alpaca's clock says a session is open and `canon/paper-schedule` on main says to, and
+`scripts/automation status` shows its last result (ADR 0050). A maintenance agent keeps this machine on main by itself (ADR 0065). Every 30
 minutes, unless a paper run holds its lock, it fast-forwards the main checkout and runs the installer
 for whatever differs from main: `scripts/automation install` or `scripts/bootstrap --user-config`. Once
 a day it runs `claude update` and `agy update`. The same install keeps the OmniRoute gateway running,

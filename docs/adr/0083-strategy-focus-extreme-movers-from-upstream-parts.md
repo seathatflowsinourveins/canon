@@ -188,7 +188,9 @@ landed steps stand, and it carries a dated pointer. ADR 0077's quote study is he
   only; the statuses channel (`ap:…/live/stock.py:135`) is not used, since Alpaca's page does not say a
   subscription is sent the current status, so not-halted is approximated by a latest sip trade at most
   120 s old (UNCALIBRATED, a proxy with no upstream behind it). No price floor. The
-  SPY-only refusal is now "one share must fit the cap" for any symbol, from the latest sip trade
+  SPY-only refusal is now "one share must fit the cap" for any symbol: for a mover at the entry limit it
+  would send (the snapshot's ask through the touch, since the risk engine prices a limit at its limit;
+  corrected on a second reader's finding, 2026-11-11), otherwise at the latest sip trade
   (`get_stock_latest_trade`); the instrument loads through NautilusTrader's
   `InstrumentProviderConfig(load_ids=...)`; the start check and the check after the stop read the whole
   account (`get_orders` with no symbol, `get_all_positions`) and act on the window's symbol only. The
@@ -200,6 +202,10 @@ landed steps stand, and it carries a dated pointer. ADR 0077's quote study is he
   sip bars do not have (25 against 9; by count, the bars were not kept). For a mover's averages and
   ranking Alpaca's bars are the right ones; a mover node sets it false, as upstream's data testing spec
   does (`nt:docs/developer_guide/spec_data_testing.md:42`). Not changed in the bridge.
+  The same reader's other findings, fixed the same day: the fallback ranks on completed minutes only, the
+  stream path measures trade age on Alpaca's clock, and a symbol is ranked on the sample only with a bar
+  in every one of its minutes. Recorded, not fixed: a close the account check sends has its status in the
+  record and not its fill price, and an order denied before Alpaca accepted it has no submit delay.
 
 ## Evidence
 
@@ -258,3 +264,6 @@ the commit `canon/upstreams.lock.json` records.
   this repository; where a term had two readings, the practice's is the one kept. Re-read the same day
   against the owner's evidence rule: no result of the practice's own research is stated, and each of
   its terms without a source here is marked UNCALIBRATED.
+* Second reader of the mover window's code, 2026-11-11: the cap was checked at the last trade, not at
+  the entry limit the risk engine prices (`nt:crates/risk/src/engine/mod.rs`, `order_price`), plus three
+  ranking findings and one record gap. Applied in the mover window's dated line (Confirmation).

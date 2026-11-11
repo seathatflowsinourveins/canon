@@ -217,6 +217,28 @@ test reads `session_window`'s bounds, so it fails once they outgrow the deadline
 no lockf(1), plutil or launchd: the runner, the deadline under mise and the install rehearsal run only on a
 Mac, and a run that skips them says so last and as a warning annotation. flock(1) is another call, not a stand-in.
 
+**The schedule's switch (2026-11-11).** The owner directed on 2026-11-11 that the SPY window leaves paper, and
+the schedule had no switch short of an uninstall. launchd's own (`launchctl disable`, the plist's `Disabled`
+key) is state on the machine, which only an install or a person changes, and the maintenance agent defers the
+paper runner and plist while a window holds account B's lock (ADR 0065), so a switch that has to be installed
+cannot be relied on while a window runs. The switch is therefore a tracked value: the first line of
+`canon/paper-schedule`, which `paper:session` reads at every scheduled firing, from the main that firing has
+just cloned, before it takes a lock. `off`: the firing skips by name, exit 0, heartbeat `skipped: ...`.
+`mover`: it runs only with `--mover` among its arguments, and one without, from a plist installed before
+main's, is refused by name. Any other first line, or no file, fails the firing by name. A run by hand does
+not read it, and `scripts/automation status` shows a schedule that is off as each firing's own heartbeat. A
+landing on main therefore turns the schedule at the next firing with nothing to install. Main's value is
+`off` from this change, until the change that gives the schedule a mover window sets it, together with a
+plist that carries `--mover` (a check holds the two together). Run under mise in `scripts/test-lanes`,
+account B's lock held by another process: each of the three outcomes takes no lock and starts nothing.
+Run once by hand with the schedule's mark set, from the change's own tree at 17:58:45 UTC on 2026-11-11,
+while a window held account B's lock: `skipped` by name within a second, exit 0, the heartbeat written. A
+firing launchd itself starts is UNVERIFIED until the first one after the landing.
+Limits: mise renders the task's env before its body, so a skipped firing still reads account B's pair into
+its own environment, which only a check in the installed runner would spare; while the schedule is off the
+row keeps the label of the last window's record; and a skip's heartbeat names no commit, so a record still
+`running` reads as died only once it is stale, as after a runner's own failure.
+
 ## Evidence
 
 Read 2026-11-10. "raw": fetched with `curl` and read whole.
@@ -228,6 +250,14 @@ Read 2026-11-10. "raw": fetched with `curl` and read whole.
 * https://nautilustrader.io/docs/md/latest/how_to/configure_live_trading.md: "run nodes as standalone
   Python scripts or services"; "One LiveNode per process" (fetched, raw).
 * `scripts/automation` and ADR 0011: the launchd agent, its install, status and uninstall (read).
+* 2026-11-11, for the schedule's switch: `man launchctl` on this machine, `enable | disable`: "Once a
+  service is disabled, it cannot be loaded in the specified domain until it is once again enabled. This
+  state persists across boots"; `man launchd.plist`, `Disabled`: "this state is kept externally" (bundled).
+  https://mise.jdx.dev/tasks/task-configuration.html: a task's `skip_if` is a command, and "If it exits 0,
+  mise skips the task"; the page lists no key that fails or refuses a task on a condition (fetched
+  2026-11-11 through a summarising fetch, not read whole). Not used: a firing must also be refused or
+  failed by name with exit 1. `home/.claude/canon/maintenance.sh`: a round that finds account B's lock held
+  runs `install --defer-paper` and leaves the paper part to the session boundary (read).
 * `man launchd.plist` on this machine: `StartInterval` "causes the job to be started every N seconds",
   a firing while the Mac sleeps "will be missed", and "If the job is running during an interval firing,
   that interval firing will likewise be missed"; `RunAtLoad` defaults to false; `WorkingDirectory` (read).

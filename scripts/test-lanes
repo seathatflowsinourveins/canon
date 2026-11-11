@@ -463,6 +463,18 @@ status() { CLAUDE_CONFIG_DIR="$AH" CANON_PAPER_SESSION_DIR="$PD" CANON_LAUNCHCTL
 watchjson 60 true; runs completed '{conclusion: "success"}'
 status; rc=$?
 check "all healthy: exit 0"                       test "$rc" = 0
+# The schedule's switch (canon/paper-schedule on main, which paper:session reads at every scheduled firing): a
+# schedule that is off is in the paper row as the firing's own heartbeat, and the row stays ok. That heartbeat
+# names no commit ("none: nothing ran", as the task writes it: it held no lock), so a window still running by
+# its record is not read as died for it.
+skipped() { jq -n --argjson e $(( $(date -u +%s) - 60 )) '{at_epoch: $e, outcome: "skipped: the schedule is off (canon/paper-schedule); nothing was placed", commit: "none: nothing ran", scheduled: true}' > "$PD/last-firing.json"; }
+skipped; status; rc=$?
+check "the schedule switched off: the paper row says so by name, from the firing's heartbeat, and stays ok, exit 0" \
+      eval 'rowis "$TMP/status.out" "paper session" ok && [ "$rc" = 0 ] && grep -q "paper session .*last run 1 min ago: skipped: the schedule is off (canon/paper-schedule)" "$TMP/status.out"'
+paper running 600; skipped; status; rc=$?
+check "... and a skipped firing after a window still running does not make that window one that died" \
+      eval 'rowis "$TMP/status.out" "paper session" ok && [ "$rc" = 0 ]'
+paper ok 600; heartbeat 60
 watchjson 60 false; status; rc=$?
 check "landscape watch not ok: INCOMPLETE, exit 1" eval 'rowis "$TMP/status.out" "landscape watch" INCOMPLETE && [ "$rc" != 0 ]'
 watchjson $((5 * 86400)) true; status; rc=$?
@@ -1152,6 +1164,13 @@ bt=$(task_part paper:test run | sed -n '/^bounded() {/,/^}/p')
 # shellcheck disable=SC2034  # read by the eval'd check
 bs=$(task_part paper:session run | sed -n '/^bounded() {/,/^}/p')
 check "paper:session and paper:test run uv through one and the same bounded()" eval '[ -n "$bt" ] && [ "$bt" = "$bs" ]'
+# read as the task reads it (`read -r`, the first line whole), so a value that would fail every firing, one with
+# a comment or a carriage return after it included, does not pass the checks
+swv=""; if [ -f "$ROOT/canon/paper-schedule" ]; then read -r swv < "$ROOT/canon/paper-schedule" || :; fi
+check "canon/paper-schedule's first line is a value paper:session knows, off or mover (it is: '$swv')" \
+      eval 'case "$swv" in off|mover) true ;; *) false ;; esac'
+check "... and it is mover only in a tree whose plist gives the firing --mover (scripts/automation, write_paper_plist)" \
+      eval '[ "$swv" != mover ] || sed -n "/^write_paper_plist() {/,/^}/p" "$ROOT/scripts/automation" | grep -cF "<string>--mover</string>" >/dev/null'
 # Waiting for a paper lock must not spin: macOS lockf(1) in its descriptor form (`lockf -t <secs> <fd>`) busy-loops
 # while it waits (measured: about 71% of a core after 6 s). Every task that waits takes the lock through one
 # lock_wait() (a non-blocking try and a one-second sleep), the same text in each, and no task calls the
@@ -1343,6 +1362,64 @@ EOF
   else
     t_fail "paper:session's body has a start-up bound, sync=, that the test can shorten"
   fi
+  # The schedule's switch (ADR 0050, 2026-11-11): the first line of canon/paper-schedule in the tree the task
+  # runs from, `off` or `mover`. A run the schedule started reads it before it takes account B's lock: off, it
+  # skips by name, exit 0; mover, it goes on only with --mover among its arguments and is otherwise refused by
+  # name; anything else fails by name. Each writes the heartbeat status reads and starts nothing. A run by hand
+  # does not read it. Before the switch, every one of these firings waited for B's lock, here held by another.
+  # sched <name> <value, or - for no file> <held|free> <scheduled|by-hand> [arguments...]: one run in its own
+  # folder, with B's lock held by another process or free, and a uv that only notes how it was called; sets
+  # SD (the folder), src (the exit code) and took
+  sched() {
+    local n=$1 v=$2 lock=$3 mark=CANON_PAPER_SCHEDULED=1 hp=""; [ "$4" = scheduled ] || mark=CANON_NOT_SCHEDULED=1; shift 4
+    SD="$TMP/schedule-$n"; mkdir -p "$SD/bin" "$SD/canon"
+    owner paper:session "$SD" 40 1 "$SD" 2 || { src=owner; took=0; return 0; }
+    # NOKEYS: both keychain items empty, as mise renders a missing one
+    [ -z "${NOKEYS:-}" ] || sed -i.bak 's/= "stand-in"$/= ""/' "$SD/mise.toml"
+    [ "$v" = - ] || printf '%s\n# a note under the value\n' "$v" > "$SD/canon/paper-schedule"
+    printf '#!/bin/bash\nprintf "%%s\\n" "$*" >> "%s/uv-ran"\n' "$SD" > "$SD/bin/uv"; chmod +x "$SD/bin/uv"
+    if [ "$lock" = held ]; then
+      /usr/bin/lockf -k "$SD/canon-paper-windows.lock" sleep 60 & hp=$!
+      for _ in $(seq 50); do /usr/bin/lockf -k -t 0 "$SD/canon-paper-windows.lock" true 2>/dev/null || break; sleep 0.1; done
+    fi
+    s0=$(date +%s)
+    # shellcheck disable=SC2034  # read by the eval'd checks
+    { (cd "$SD" && exec env -i HOME="$HOME" MISE_CEILING_PATHS="$TMPP" PATH="$SD/bin:/usr/bin:/bin" "$mark" "$LMISE" run owner "$@" > "$SD/out" 2>&1); src=$?; }
+    took=$(( $(date +%s) - s0 ))
+    [ -z "$hp" ] || { kill "$hp" 2>/dev/null; wait "$hp" 2>/dev/null; }
+  }
+  # beat <jq test>: the heartbeat the run left, a scheduled one that names no commit (no lock was held)
+  beat() { jq -e "(.at_epoch | type) == \"number\" and .scheduled == true and (.commit | startswith(\"none\")) and ($1)" "$SD/canon-paper-session/last-firing.json" >/dev/null 2>&1; }
+  sched off off held scheduled --session auto --minutes 25
+  check "a scheduled firing while the schedule is off: skipped by name, exit 0, at once (${took} s), B's lock (held by another) not waited for, nothing started" \
+        eval '[ "$src" = 0 ] && [ "$took" -lt 20 ] && [ ! -e "$SD/uv-ran" ] && grep -q "^paper:session: skipped: the schedule is off (canon/paper-schedule)" "$SD/out" && ! grep -q "lock stayed held" "$SD/out"'
+  check "... and its heartbeat says so"           beat '.outcome | startswith("skipped: the schedule is off (canon/paper-schedule)")'
+  NOKEYS=1 sched off-no-keys off held scheduled --session auto --minutes 25
+  check "... skipped the same with both keychain items empty: the switch is read before the pair is looked at" \
+        eval '[ "$src" = 0 ] && grep -q "^paper:session: skipped: the schedule is off" "$SD/out" && ! grep -q "keychain item" "$SD/out" && grep -q "^env.ALPACA_API_KEY = \"\"$" "$SD/mise.toml"'
+  NOKEYS=1 sched mover-no-keys mover free scheduled --mover --minutes 25
+  check "... and a firing that would run still fails on an empty keychain item, before any lock, nothing started" \
+        eval '[ "$src" = 1 ] && [ ! -e "$SD/uv-ran" ] && grep -q "a keychain item of account B is empty" "$SD/out" && [ ! -e "$SD/canon-paper-windows.lock" ]'
+  mkdir -p "$TMP/schedule-beat-dir/canon-paper-session/last-firing.json"
+  sched beat-dir off held scheduled --session auto --minutes 25
+  check "a skip whose heartbeat cannot be written (a directory of its name): skipped still, exit 0, saying so, nothing moved into the directory" \
+        eval '[ "$src" = 0 ] && grep -q "the heartbeat could not be written" "$SD/out" && [ -z "$(ls -A "$SD/canon-paper-session/last-firing.json")" ]'
+  sched by-hand off free by-hand --session regular --minutes 25
+  check "a run by hand while the schedule is off: it runs, the switch not read" \
+        eval '[ "$src" = 0 ] && grep -q "canon_trading.session_window .*--session regular --minutes 25" "$SD/uv-ran" && [ ! -e "$SD/canon-paper-session/last-firing.json" ]'
+  sched mover-without mover held scheduled --session auto --minutes 25
+  check "a scheduled firing without --mover while the schedule is the mover's (a plist older than main): refused by name, exit 1, nothing started" \
+        eval '[ "$src" = 1 ] && [ "$took" -lt 20 ] && [ ! -e "$SD/uv-ran" ] && grep -q "^paper:session: refused: the schedule is the mover.s (canon/paper-schedule) and this firing carries no --mover" "$SD/out"'
+  check "... and its heartbeat says so"           beat '.outcome | startswith("refused: the schedule is the mover")'
+  sched mover-with mover free scheduled --mover --minutes 25
+  check "a scheduled firing with --mover while the schedule is the mover's: it runs, its arguments reaching the window" \
+        eval '[ "$src" = 0 ] && grep -q "canon_trading.session_window .*--mover --minutes 25" "$SD/uv-ran"'
+  for sw in on -; do
+    sched "unknown$sw" "$sw" held scheduled --mover --minutes 25
+    check "a scheduled firing with $([ "$sw" = - ] && echo "no canon/paper-schedule" || echo "a switch that is neither off nor mover ($sw)"): failed by name, exit 1, nothing started, --mover or not" \
+          eval '[ "$src" = 1 ] && [ "$took" -lt 20 ] && [ ! -e "$SD/uv-ran" ] && grep -q "^paper:session: failed: canon/paper-schedule.s first line is neither off nor mover" "$SD/out"'
+    check "... and its heartbeat says so"         beat '.outcome | startswith("failed: canon/paper-schedule")'
+  done
   # Two accounts, two locks (ADR 0069), run under mise with both bodies sharing one lock folder: a window that
   # runs holds account B's lock and the stream lock, and a paper test on account A runs meanwhile, at once
   AB="$TMP/two-accounts"; mkdir -p "$AB/locks" "$AB/s" "$AB/t" "$AB/w" "$AB/b"
