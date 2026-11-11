@@ -48,7 +48,9 @@ the variables that switch Alpaca's CLI or MCP server to live; a fetch of a live 
 `.git/config`. The trading ones fail at Alpaca for want of live credentials. The rest are left to review
 and the checks.
 
-1. **No hook runs before a tool call.** `scripts/test-hooks` fails if a `PreToolUse` hook is registered.
+1. **No hook of this repository's runs before a tool call.** `scripts/test-hooks` fails if a `PreToolUse`
+   hook is registered in its settings. The cockpit's own hooks in the user's settings are not this
+   repository's (Consequences).
 2. **No hook stops a session by failing.** None sets `onFailure` to `block`. The hooks that remain give
    feedback after an edit or print at session start; they never decide whether work goes on.
 3. **Every registered hook file exists, and every hook file is registered.** `scripts/test-hooks` checks
@@ -86,6 +88,21 @@ row, the enforcement in rule 2 and the guard's consequence. The rest of both sta
 * Bad: rule 1 is tested on this repository's settings only. A plugin's hooks module can run before a
   tool call and, where Claude Code's built-in guard is not loaded, as on this machine, approve what a
   `deny` or `ask` rule would stop. The one Orca loads handles no tool call. Sources: ADR 0023.
+* Bad: Orca writes hooks of its own into the user's settings, `PreToolUse` and `PermissionRequest` among
+  them, each with matcher `*` and a 10 s timeout, so they run in every Claude Code session on this machine,
+  not only in Orca's. The script exits at once without the port, token and pane key, from the environment
+  or the file `ORCA_AGENT_HOOK_ENDPOINT` names (that desktop sessions lack them is UNVERIFIED). Its
+  `PreToolUse` script posts the call to the Orca app and prints back any `PreToolUse` answer, so the app
+  can deny a call, force a prompt, rewrite its input, or approve one no `ask` or `deny` rule matches; an
+  `allow` does not override an `ask` rule. That the app answers only when one of its plugins returns a
+  decision is UNVERIFIED. Measured per tool call: 0.08 s with no Orca variables, 0.09 s with the app down,
+  8.09 s on every call with the app accepting and silent (and up to 1.5 s more for each later event of the
+  call); each let the call through. The documented switch, `orca agent hooks off` or Settings → Agents →
+  Agent status hooks, removes "the Orca-managed hooks that report working / waiting / done", the agent
+  view's status with them; that it removes the `PreToolUse` one is not stated (UNVERIFIED), and no
+  documented setting limits them to Orca's sessions. They stay on (ADR 0018). If lanes take seconds per
+  tool call across the board, suspect the Orca app hanging first and restart it; only then consider the
+  switch.
 
 ### Confirmation
 
@@ -132,6 +149,18 @@ the quoted sentences verbatim.
 * The session of 2026-11-10 that lost its tools, and the owner's instruction to remove the hook — this
   repository's own history that day; not re-observable.
 * What the desktop app's scheduled tasks do with a call that would prompt: not fetched, UNVERIFIED.
+* Second reader, 2026-11-10, correction: rule 1 holds for this repository's hooks only. Read:
+  `~/.claude/settings.json` (Orca's `PreToolUse` and `PermissionRequest` entries, matcher `*`, timeout 10)
+  and `~/.orca/agent-hooks/claude-hook.sh` (`curl --max-time 8` to the app for `PreToolUse`; `{}` for
+  `PermissionRequest`; an early exit without `ORCA_AGENT_HOOK_PORT`, `ORCA_AGENT_HOOK_TOKEN` and
+  `ORCA_PANE_KEY`, or with `CLAUDE_JOB_DIR`). Run: that command with stand-in variables, 0.08 s with none,
+  0.09 s against a closed port, 8.09 s against a listener that never answers. Fetched:
+  https://code.claude.com/docs/en/permissions.md, "PreToolUse hook decisions don't bypass permission
+  rules"; https://www.onorca.dev/docs/agents/hooks-memory, "Agent status hooks", and Orca pull request
+  37303, "Every failure lets the call through", merged 2026-11-02 as `7989c05`, an ancestor of `v1.4.255`
+  (fetched; second reader); https://code.claude.com/docs/en/permissions.md, a hook "can deny the tool
+  call, force a prompt, or skip the prompt to let the call proceed". Desktop sessions read the same settings (their transcripts are in
+  `~/.claude/projects`); that their environment lacks Orca's variables is UNVERIFIED (not readable).
 * Second reader, 2026-11-10: every quote held. It corrected what a bypass-mode session still asks, the
   wording of rule 4 and of the first table row, the reason for leaving option 4, and the scope of ADR
   0009's phrase, and it supplied the list of refusals that nothing holds now. All are fixed above.

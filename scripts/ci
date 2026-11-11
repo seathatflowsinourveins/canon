@@ -302,6 +302,21 @@ indent() {
     END { if (max > 0 && NR > max) printf "        ... %d more lines\n", NR - max }' "$1"
 }
 
+# failing <file>: a failing check's output, its first 40 lines; when it is longer, the failure lines after
+# them first, so a failing case past the first 40 lines is named and not cut off (a hosted test-land failure
+# showed none of its cases). A failure line starts with FAIL, FAILED or ERROR as its status word, at most two
+# spaces in, as the self-tests and pytest's summary print them; a passing case whose label holds FAILED, or a
+# self-test's quoted inner output (indented further), is not one.
+failing() {
+  awk 'NR <= 40 { head[NR] = $0; next }
+       /^ ? ?(FAIL|FAILED|ERROR)( |$)/ { if (c < 30) bad[++c] = $0; else more++ }
+       END { for (i = 1; i <= c; i++) print "        " bad[i]
+             if (more > 0) printf "        ... %d more failure lines\n", more
+             if (c > 0) print "        --- its first 40 lines:"
+             for (i = 1; i <= NR && i <= 40; i++) print "        " head[i]
+             if (NR > 40) printf "        ... %d more lines\n", NR - 40 }' "$1"
+}
+
 fail=0
 i=1
 while [ "$i" -le "$n" ]; do
@@ -319,7 +334,7 @@ while [ "$i" -le "$n" ]; do
       else
         printf '  FAIL  %s\n' "${TEXT[i]}"
         [ -s "$WORK/$i.rc" ] || echo "        the check stopped without recording an exit status"
-        [ -f "$WORK/$i.out" ] && indent "$WORK/$i.out" 40
+        [ -f "$WORK/$i.out" ] && failing "$WORK/$i.out"
         fail=1
       fi ;;
   esac

@@ -50,8 +50,14 @@ because the owner named it, its licence is MIT, its source runs the installed `c
 3. **This repository's rules do not depend on the host.** It registers no hook before a tool call (ADR
    0020); the merge gate and the absence of live credentials hold whichever app starts a session. Orca
    adds hooks of its own to the user's settings, one before every tool call: each hands the event to the
-   local app and exits 0, and that one prints back the app's answer when there is one. Its "Agent status
-   hooks" setting removes them.
+   local app and exits 0, and that one prints back the app's answer when there is one, which can deny,
+   rewrite or approve the call (an `allow` does not override an `ask` rule). They run in every session that
+   reads the user's settings, and a call waits 8 s when the app is up and does not answer (measured; ADR
+   0020). Its "Agent status hooks" setting, or `orca agent hooks off`, removes its status hooks (whether
+   the `PreToolUse` one too is not stated). They stay on: every case tried
+   lets the call through, the ordinary cost is about a tenth of a second a call, and the switch would
+   also remove the agent view this cockpit was adopted for (ADR 0023). A lane slow on every call means
+   the app is hanging: restart it before anything else.
 4. **Landing is `scripts/land` and nothing else.** A host's commit, push and pull request controls are
    not a landing path: the ruleset on `main` requires the `signoff` status that `scripts/land` posts for
    the commit it has checked (ADR 0014, ADR 0017).
@@ -124,6 +130,9 @@ Read 2026-11-10. "Lane": a research subagent fetched and summarised the page. "S
   added (`PreToolUse` and `PermissionRequest` among those with matcher `*`), each with a 10-second timeout
   and no `onFailure`; their script posts to `127.0.0.1` or spools the event and always ends in `exit 0`
   (read, run; second reader).
+* Second reader, 2026-11-10, correction: rule 3 said the hooks hand the event over and exit 0, which
+  left out that the `PreToolUse` answer can deny a call and that a slow app costs each call up to 8 s.
+  Read and run as in ADR 0020's Evidence (the hook script, its 8 s `curl` bound, the stand-in timings).
 * `mise.toml` here and `gh --version` from a clean interactive shell: with no global mise config it failed
   in the home folder ("No version is set for shim: gh") and ran in the checkout; after `mise use -g` it
   ran in both. `scripts/land` — `"$MISE" exec -- gh`. The two skill folders under `~/.agents/skills/`,
