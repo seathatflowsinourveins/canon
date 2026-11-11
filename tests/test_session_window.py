@@ -20,6 +20,7 @@ from datetime import datetime
 from datetime import timedelta
 from decimal import Decimal
 from itertools import pairwise
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from typing import cast
@@ -78,7 +79,7 @@ from canon_trading.session_ma_cross import SessionMaCrossConfig
 from canon_trading.session_ma_cross import through_the_touch
 from canon_trading.session_window import NEW_YORK
 from canon_trading.session_window import WindowConfig
-from canon_trading.session_window import session_end
+from canon_trading.session_window import session_part
 
 
 def insufficient() -> APIError:
@@ -354,6 +355,7 @@ def test_the_cap_config_keeps_its_base_fields() -> None:
         pytest.param({"limit_offset": 0.05}, "limit_offset", id="float offset"),
         pytest.param({"wind_down_at": "2025-11-10T21:00Z"}, "wind_down_at", id="text time"),
         pytest.param({"fast_period": 3.0}, "fast_period", id="float period"),
+        pytest.param({"feed": b"boats"}, "feed", id="bytes feed"),
     ],
 )
 def test_the_config_refuses_a_setting_of_another_type(changes: dict, named: str) -> None:
@@ -400,7 +402,6 @@ def test_the_native_runtime_checks_are_turned_on() -> None:
     [
         ({"session": "overnight"}, "session"),
         ({"symbol": "AAPL"}, "sized for SPY"),
-        ({"feed": "sip"}, "iex"),
         ({"minutes": 61}, "minutes"),
         ({"minutes": 2}, "wind-down"),
     ],
@@ -416,8 +417,8 @@ def extended(monkeypatch):
     monkeypatch.setattr(session_window, "EXTENDED_READY", True)
 
 
-def test_an_extended_window_is_refused_until_one_has_passed_on_paper() -> None:
-    assert session_window.EXTENDED_READY is False
+def test_an_extended_window_is_refused_while_extended_windows_are_off(monkeypatch) -> None:
+    monkeypatch.setattr(session_window, "EXTENDED_READY", False)
     with pytest.raises(ValueError, match="waits until one has passed on paper"):
         WindowConfig(session="extended")
 
@@ -446,10 +447,10 @@ CALENDAR = Calendar(
 
 def test_a_regular_window_ends_with_the_session() -> None:
     at = datetime(2026, 11, 10, 15, 0, tzinfo=NEW_YORK)
-    end = session_end("regular", clock(at, is_open=True), CALENDAR)
+    end = session_part("regular", clock(at, is_open=True), CALENDAR)[0]
     assert end == datetime(2026, 11, 10, 16, 0, tzinfo=NEW_YORK)
     with pytest.raises(RuntimeError, match="regular session is closed"):
-        session_end("regular", clock(at, is_open=False), CALENDAR)
+        session_part("regular", clock(at, is_open=False), CALENDAR)[0]
 
 
 @pytest.mark.parametrize(
@@ -460,14 +461,14 @@ def test_an_extended_window_ends_with_pre_market_or_after_hours(
     hour, minute, end, extended
 ) -> None:
     at = datetime(2026, 11, 10, hour, minute, tzinfo=NEW_YORK)
-    found = session_end("extended", clock(at, is_open=False), CALENDAR)
+    found = session_part("extended", clock(at, is_open=False), CALENDAR)[0]
     assert found == end.replace(tzinfo=NEW_YORK)
 
 
 @pytest.mark.parametrize(
     ("at", "is_open", "message"),
     [
-        (datetime(2026, 11, 10, 21, 0), False, "overnight is not run"),
+        (datetime(2026, 11, 10, 21, 0), False, "outside pre-market, after-hours and the overnight"),
         (datetime(2026, 11, 10, 11, 0), True, "regular session is open"),
         (datetime(2026, 11, 11, 5, 0), False, "not a trading day"),
     ],
@@ -476,7 +477,7 @@ def test_an_extended_window_refuses_overnight_the_session_and_other_days(
     at, is_open, message, extended
 ):
     with pytest.raises(RuntimeError, match=message):
-        session_end("extended", clock(at.replace(tzinfo=NEW_YORK), is_open=is_open), CALENDAR)
+        session_part("extended", clock(at.replace(tzinfo=NEW_YORK), is_open=is_open), CALENDAR)[0]
 
 
 @pytest.mark.parametrize("hour", [5, 17])
@@ -496,7 +497,195 @@ def test_an_extended_window_is_refused_when_the_calendar_omits_its_session_bound
     calendar = Calendar(date="2026-11-10", open="09:30", close="16:00", **bounds)
     at = datetime(2026, 11, 10, hour, 0, tzinfo=NEW_YORK)
     with pytest.raises(RuntimeError, match=f"no {' or '.join(missing)},"):
-        session_end("extended", clock(at, is_open=False), calendar)
+        session_part("extended", clock(at, is_open=False), calendar)[0]
+
+
+def day(on: str, **changes: object) -> Calendar:
+    """A trading day on Alpaca's calendar, the regular session 09:30-16:00 and the extended 04:00-20:00."""
+    fields: dict = {
+        "date": on,
+        "open": "09:30",
+        "close": "16:00",
+        "session_open": "0400",
+        "session_close": "2000",
+    }
+    fields.update(changes)
+    return Calendar(**fields)
+
+
+@pytest.mark.parametrize(
+    ("at", "days", "end", "part"),
+    [
+        # Tuesday after 20:00: the overnight session of Wednesday's trade date
+        (
+            datetime(2026, 11, 10, 21, 0),
+            ["2026-11-10", "2026-11-11"],
+            datetime(2026, 11, 11, 4, 0),
+            "overnight",
+        ),
+        # Wednesday before 04:00, the same session
+        (
+            datetime(2026, 11, 11, 2, 0),
+            ["2026-11-11", "2026-11-12"],
+            datetime(2026, 11, 11, 4, 0),
+            "overnight",
+        ),
+        # Sunday evening opens Monday's overnight session
+        (datetime(2026, 11, 15, 20, 30), ["2026-11-16"], datetime(2026, 11, 16, 4, 0), "overnight"),
+        (
+            datetime(2026, 11, 10, 5, 0),
+            ["2026-11-10", "2026-11-11"],
+            datetime(2026, 11, 10, 9, 30),
+            "pre-market",
+        ),
+        (
+            datetime(2026, 11, 10, 17, 0),
+            ["2026-11-10", "2026-11-11"],
+            datetime(2026, 11, 10, 20, 0),
+            "after-hours",
+        ),
+    ],
+)
+def test_an_extended_window_runs_in_pre_market_after_hours_and_overnight(
+    at, days, end, part
+) -> None:
+    """Alpaca's 24/5 page: overnight 8:00 PM - 4:00 AM ET, "on the evening before the trade date",
+    Sunday to Friday, following the NYSE holiday calendar; it ends as the trade date's pre-market opens."""
+    found = session_window.session_part(
+        "extended", clock(at.replace(tzinfo=NEW_YORK), is_open=False), [day(d) for d in days]
+    )
+    assert found == (end.replace(tzinfo=NEW_YORK), part)
+
+
+@pytest.mark.parametrize(
+    ("at", "days", "message"),
+    [
+        # Friday evening: Saturday is no trade date, so no overnight session
+        (
+            datetime(2026, 11, 13, 21, 0),
+            ["2026-11-13"],
+            "outside pre-market, after-hours and the overnight",
+        ),
+        # the evening before a holiday: no overnight session either
+        (
+            datetime(2026, 11, 25, 21, 0),
+            ["2026-11-25"],
+            "outside pre-market, after-hours and the overnight",
+        ),
+        (datetime(2026, 11, 14, 12, 0), [], "not a trading day"),
+    ],
+)
+def test_no_overnight_session_runs_before_a_day_that_is_not_a_trade_date(at, days, message) -> None:
+    with pytest.raises(RuntimeError, match=message):
+        session_window.session_part(
+            "extended", clock(at.replace(tzinfo=NEW_YORK), is_open=False), [day(d) for d in days]
+        )
+
+
+def test_an_overnight_window_needs_its_trade_dates_session_open() -> None:
+    """The overnight session ends as the trade date's pre-market opens; a day without `session_open`
+    gives it no end."""
+    with pytest.raises(RuntimeError, match="2026-11-11 gives no session_open"):
+        session_window.session_part(
+            "extended",
+            clock(datetime(2026, 11, 10, 21, 0, tzinfo=NEW_YORK), is_open=False),
+            [day("2026-11-10"), day("2026-11-11", session_open=None)],
+        )
+
+
+def test_auto_takes_the_overnight_session_when_extended_windows_are_on(monkeypatch) -> None:
+    monkeypatch.setattr(session_window, "EXTENDED_READY", True)
+    found, why = session_window.resolve_session(
+        clock(datetime(2026, 11, 10, 21, 0, tzinfo=NEW_YORK), is_open=False),
+        [day("2026-11-10"), day("2026-11-11")],
+    )
+    assert (found, why) == ("extended", "outside the regular session, in its overnight part")
+
+
+@pytest.mark.parametrize(
+    ("part", "expected"),
+    [("overnight", "boats"), ("after-hours", "iex"), ("pre-market", "iex"), ("regular", "iex")],
+)
+def test_a_window_streams_boats_overnight_and_iex_otherwise(part, expected) -> None:
+    """ADR 0055: on paper `boats` delivered the overnight session's quotes, trades and bars."""
+    assert session_window.window_feed(part) == expected
+
+
+def test_an_overnight_window_needs_only_its_trade_dates_session_open() -> None:
+    """Review finding: a trade date without `session_close`, or today without its bounds, refused the
+    overnight session, whose end is the trade date's `session_open` alone."""
+    found = session_window.session_part(
+        "extended",
+        clock(datetime(2026, 11, 10, 21, 0, tzinfo=NEW_YORK), is_open=False),
+        [day("2026-11-10", session_close=None), day("2026-11-11", session_close=None)],
+    )
+    assert found == (datetime(2026, 11, 11, 4, 0, tzinfo=NEW_YORK), "overnight")
+
+
+class Subscribing(Recording):
+    """`Recording` that also keeps each subscription and the warm-up request, with its params, in order."""
+
+    def __init__(self, config: SessionMaCrossConfig) -> None:
+        super().__init__(config)
+        self.calls: list[tuple[str, dict | None]] = []
+
+    def subscribe_quotes(self, instrument_id, client_id=None, params=None) -> None:
+        self.calls.append(("quotes", params))
+        super().subscribe_quotes(instrument_id, client_id=client_id, params=params)
+
+    def subscribe_trades(self, instrument_id, client_id=None, params=None) -> None:
+        self.calls.append(("trades", params))
+        super().subscribe_trades(instrument_id, client_id=client_id, params=params)
+
+    def subscribe_bars(self, bar_type, client_id=None, params=None) -> None:
+        self.calls.append(("bars", params))
+        super().subscribe_bars(bar_type, client_id=client_id, params=params)
+
+
+@pytest.mark.parametrize(("feed", "params"), [("boats", {"feed": "boats"}), (None, None)])
+def test_the_strategy_names_its_feed_in_quotes_and_trades_before_its_bars(feed, params) -> None:
+    """The data engine hands the client only an instrument's first subscription (ADR 0055), so quotes
+    and trades go first, on the feed; the bars built from those trades follow. Every quote is counted."""
+    eng = engine()
+    s = Subscribing(
+        SessionMaCrossConfig(
+            bar_type=BARS,
+            trade_size=Quantity.from_int(1),
+            fast_period=3,
+            slow_period=8,
+            feed=feed,
+            strategy_id=StrategyId("SessionMaCross-001"),
+            order_id_tag="001",
+        )
+    )
+    run(eng, s)
+    eng.dispose()
+    assert s.calls[:3] == [("quotes", params), ("trades", params), ("bars", None)]
+    assert s.quotes == 60 and s.trades == 0  # the invented market has a quote a minute and no trade
+
+
+def test_a_strategy_whose_instrument_is_missing_subscribes_nothing() -> None:
+    """Review finding: quotes and trades went out before `MaCross`'s instrument check, so the client's one
+    stream could start for a strategy that never ran."""
+    eng = engine()
+    s = Subscribing(
+        SessionMaCrossConfig(
+            bar_type=BarType.from_str("QQQ.ALPACA-1-MINUTE-LAST-INTERNAL"),
+            trade_size=Quantity.from_int(1),
+            fast_period=3,
+            slow_period=8,
+            feed="boats",
+            warm_up=True,
+            strategy_id=StrategyId("SessionMaCross-001"),
+            order_id_tag="001",
+        )
+    )
+    s.request_bars = lambda *a, **k: pytest.fail("bars were requested")
+    eng.add_strategy(s)
+    with pytest.raises(RuntimeError, match="not in the cache"):
+        s.on_start()
+    eng.dispose()
+    assert s.calls == []
 
 
 def getconf_failing(monkeypatch, error: BaseException | str) -> None:
@@ -624,10 +813,11 @@ def test_a_window_waits_out_the_gap_after_the_last_one(tmp_path) -> None:
 def test_the_regular_window_node_runs_upstreams_managed_stop(tmp_path) -> None:
     at = datetime(2026, 11, 10, 21, 30, tzinfo=UTC)
     node, s, _ = session_window.window_node(
-        WindowConfig(log_dir=tmp_path), wind_down_at=at, log_name="r"
+        WindowConfig(log_dir=tmp_path), wind_down_at=at, log_name="r", feed="iex"
     )
     try:
         assert s.manage_stop and not s.extended_hours and s.warm_up
+        assert s.feed_params == {"feed": "iex"}
         assert str(s.history_bar_type) == "SPY.ALPACA-1-MINUTE-LAST-EXTERNAL"
     finally:
         node.dispose()
@@ -636,10 +826,14 @@ def test_the_regular_window_node_runs_upstreams_managed_stop(tmp_path) -> None:
 def test_the_extended_window_node_builds_without_connecting(tmp_path, extended) -> None:
     at = datetime(2026, 11, 10, 21, 30, tzinfo=UTC)
     node, s, cap = session_window.window_node(
-        WindowConfig(session="extended", log_dir=tmp_path), wind_down_at=at, log_name="t"
+        WindowConfig(session="extended", log_dir=tmp_path),
+        wind_down_at=at,
+        log_name="t",
+        feed="boats",
     )
     try:
         assert s.extended_hours and not s.manage_stop and s.wind_down_at == at
+        assert s.feed_params == {"feed": "boats"}
         assert cap.max_position == 1
         assert str(s.bar_type) == "SPY.ALPACA-1-MINUTE-LAST-INTERNAL"
         assert not node.is_running
@@ -880,8 +1074,8 @@ def test_auto_takes_the_session_alpacas_clock_says_is_open(
 
 def test_auto_outside_every_session_runs_nothing_and_exits_0(monkeypatch, tmp_path, capsys) -> None:
     class Closed(Account):
-        def get_clock(self) -> Clock:
-            return clock(datetime(2026, 11, 10, 17, 0, tzinfo=NEW_YORK), is_open=False)
+        def get_clock(self) -> Clock:  # a Saturday
+            return clock(datetime(2026, 11, 14, 17, 0, tzinfo=NEW_YORK), is_open=False)
 
     monkeypatch.setattr(session_window, "paper_trading", lambda: Closed())
     assert session_window.main(["--session", "auto", "--log-dir", str(tmp_path)]) == 0
@@ -961,7 +1155,9 @@ def test_a_window_whose_account_check_fails_is_recorded_failed_not_ok(
         def dispose(self) -> None:
             pass
 
-    s = SimpleNamespace(dropped=[], history_bars=0, history_dropped=0)
+    s = SimpleNamespace(
+        dropped=[], history_bars=0, history_dropped=0, quotes=1, trades=1, live_bars=0
+    )
     cap = SimpleNamespace(checks=1, peak=Decimal(0), tripped=None)
     monkeypatch.setattr(session_window, "paper_trading", lambda: Account())
     monkeypatch.setattr(session_window, "window_node", lambda config, **kw: (Ran(), s, cap))
@@ -975,6 +1171,215 @@ def test_a_window_whose_account_check_fails_is_recorded_failed_not_ok(
         session_window.run_window(WindowConfig(log_dir=tmp_path))
     latest = json.loads((tmp_path / "latest.json").read_text())
     assert latest["result"] == "failed: RuntimeError: Alpaca answered 503"
+
+
+def quiet_window(monkeypatch, tmp_path, *, quotes, trades, live_bars=0, log=(), account=None):
+    """A window whose node runs at once, its strategy having seen `quotes`, `trades` and `live_bars`, and
+    its node log holding the lines `log`; returns the report or the error, and the latest record."""
+
+    class Ran:
+        cache = SimpleNamespace(orders=lambda **kwargs: [])
+
+        def dispose(self) -> None:
+            pass
+
+    s = SimpleNamespace(
+        dropped=[],
+        history_bars=0,
+        history_dropped=0,
+        quotes=quotes,
+        trades=trades,
+        live_bars=live_bars,
+    )
+    cap = SimpleNamespace(checks=1, peak=Decimal(0), tripped=None)
+    seen: dict = {}
+
+    def node(config, **kw):
+        seen.update(kw)
+        (config.log_dir / f"{kw['log_name']}.log").write_text("\n".join(log))
+        return Ran(), s, cap
+
+    monkeypatch.setattr(session_window, "paper_trading", lambda: account or Account())
+    monkeypatch.setattr(session_window, "window_node", node)
+    monkeypatch.setattr(session_window, "_run_node", lambda node, ends: None)
+    monkeypatch.setattr(session_window, "_flatten_after_stop", lambda *a, **k: [])
+    try:
+        outcome: Any = session_window.run_window(WindowConfig(log_dir=tmp_path))
+    except RuntimeError as e:
+        outcome = e
+    return outcome, json.loads((tmp_path / "latest.json").read_text()), seen
+
+
+def test_a_quiet_market_with_quotes_and_no_bar_is_ok_and_shows_it(monkeypatch, tmp_path) -> None:
+    """A symbol that trades nothing, overnight say, gives no bar; quotes show the stream delivered, so
+    the window is ok, its record saying how much arrived."""
+    _, latest, seen = quiet_window(monkeypatch, tmp_path, quotes=40, trades=0)
+    assert latest["result"] == "ok"
+    assert (latest["quotes"], latest["trades"], latest["live_bars"]) == (40, 0, 0)
+    assert (latest["part"], latest["feed"], seen["feed"]) == ("regular", "iex", "iex")
+    assert latest["stream"] == [] and latest["errors"] == []
+
+
+def test_a_window_whose_stream_delivered_nothing_is_failed(monkeypatch, tmp_path) -> None:
+    """alpaca-py retries a stream that never connects with warnings only, so nothing arrives: the
+    record and the result say so, not a quiet market."""
+    never = [
+        (
+            "2026-11-11T03:00:01.000000000Z [WARN] CANON-PAPER-SESSION.AlpacaDataClient: Alpaca stream "
+            "on feed iex: error during websocket communication: server rejected WebSocket connection"
+        )
+    ]
+    error, latest, _ = quiet_window(monkeypatch, tmp_path, quotes=0, trades=0, log=never)
+    assert isinstance(error, RuntimeError) and "without market data" in str(error)
+    assert latest["result"].startswith("failed: no market data: the iex stream delivered no quote")
+    assert latest["stream"] == [never[0]]
+
+
+def test_a_window_whose_stream_ended_by_itself_is_failed_though_data_came(monkeypatch, tmp_path):
+    ended = [
+        "2026-11-11T03:00:01.000000000Z [INFO] CANON-PAPER-SESSION.AlpacaDataClient: connected",
+        (
+            "2026-11-11T03:10:01.000000000Z [ERROR] CANON-PAPER-SESSION.AlpacaDataClient: Alpaca stream "
+            "on feed iex ended by itself while subscribed (None); this client does not restart it"
+        ),
+    ]
+    error, latest, _ = quiet_window(monkeypatch, tmp_path, quotes=500, trades=20, log=ended)
+    assert isinstance(error, RuntimeError)
+    assert latest["result"].startswith("failed: the iex data stream reported an error: ")
+    assert latest["stream"] == [ended[1]]
+
+
+def test_a_refused_subscription_fails_the_window_though_quotes_came(monkeypatch, tmp_path) -> None:
+    """Review finding: a trade subscription the adapter refused (another feed than its stream's) left
+    quotes flowing and no bar, read as a quiet market."""
+    refused = [
+        (
+            "2026-11-11T03:00:01.000000000Z [ERROR] CANON-PAPER-SESSION.AlpacaDataClient: Cannot "
+            "subscribe: this client runs one stream, on feed boats from its first subscription"
+        )
+    ]
+    _, latest, _ = quiet_window(monkeypatch, tmp_path, quotes=50, trades=0, log=refused)
+    assert latest["result"].startswith("failed: the iex data stream reported an error: ")
+    assert latest["stream"] == refused
+
+
+def test_a_warning_that_quotes_an_error_does_not_fail_the_window(monkeypatch, tmp_path) -> None:
+    """Review finding: the level is the log line's own field, not any "[ERROR]" in its message."""
+    warned = [
+        (
+            "2026-11-11T03:00:01.000000000Z [WARN] CANON-PAPER-SESSION.AlpacaDataClient: Alpaca stream "
+            "on feed iex: server said [ERROR] slow consumer, reconnecting"
+        )
+    ]
+    _, latest, _ = quiet_window(monkeypatch, tmp_path, quotes=50, trades=3, log=warned)
+    assert latest["result"] == "ok" and latest["stream"] == warned
+
+
+def test_an_unread_node_log_is_noted_not_taken_for_a_quiet_stream(monkeypatch, tmp_path) -> None:
+    class Ran:
+        cache = SimpleNamespace(orders=lambda **kwargs: [])
+
+        def dispose(self) -> None:
+            pass
+
+    s = SimpleNamespace(
+        dropped=[], history_bars=0, history_dropped=0, quotes=5, trades=5, live_bars=1
+    )
+    monkeypatch.setattr(session_window, "paper_trading", lambda: Account())
+    monkeypatch.setattr(
+        session_window,
+        "window_node",
+        lambda config, **kw: (Ran(), s, SimpleNamespace(checks=1, peak=Decimal(0), tripped=None)),
+    )
+    monkeypatch.setattr(session_window, "_run_node", lambda node, ends: None)
+    monkeypatch.setattr(session_window, "_flatten_after_stop", lambda *a, **k: [])
+    report = session_window.run_window(WindowConfig(log_dir=tmp_path))
+    assert any("reading the node log" in e for e in report.errors)
+
+
+class Overnight(Account):
+    """The stand-in at 21:00 New York on a Tuesday, with Wednesday on the calendar and SPY's asset."""
+
+    def __init__(self, asset: dict | str) -> None:
+        super().__init__()
+        self.asset = asset
+
+    def get_clock(self) -> Clock:
+        return clock(datetime(2026, 11, 10, 21, 0, tzinfo=NEW_YORK), is_open=False)
+
+    def get_calendar(self, filters=None) -> list[Calendar]:
+        return [day("2026-11-10"), day("2026-11-11")]
+
+    def get(self, path, data=None, **kwargs):
+        assert path == "/assets/SPY"
+        if self.asset == "APIError":
+            raise APIError(
+                '{"code": 50010000, "message": "internal server error"}',
+                SimpleNamespace(response=SimpleNamespace(status_code=500)),
+            )
+        return self.asset
+
+
+@pytest.mark.parametrize(
+    ("asset", "message"),
+    [
+        ({"symbol": "SPY", "attributes": []}, "SPY is not overnight_tradable"),
+        ({"symbol": "SPY", "overnight_tradable": False}, "SPY is not overnight_tradable"),
+        (
+            {"symbol": "SPY", "overnight_tradable": True, "overnight_halted": True},
+            "overnight_halted",
+        ),
+        (
+            {"symbol": "SPY", "attributes": ["overnight_tradable", "overnight_halted"]},
+            "overnight_halted",
+        ),
+        ("APIError", "SPY could not be read"),
+    ],
+)
+def test_an_overnight_window_is_refused_on_an_asset_alpaca_does_not_trade_overnight(
+    monkeypatch, tmp_path, extended, asset, message
+) -> None:
+    """Alpaca's 24/5 page: eligibility is the asset's `overnight_tradable`, with `overnight_halted` for
+    one halted; a window refuses by name rather than place an order and learn from a rejection."""
+    monkeypatch.setattr(session_window, "paper_trading", lambda: Overnight(asset))
+    monkeypatch.setattr(
+        session_window, "window_node", lambda *a, **k: pytest.fail("a node was built")
+    )
+    with pytest.raises(session_window.WindowRefused, match=message):
+        session_window.run_window(WindowConfig(session="extended", log_dir=tmp_path))
+
+
+@pytest.mark.parametrize(
+    "asset",
+    [
+        {"symbol": "SPY", "overnight_tradable": True},
+        {"symbol": "SPY", "attributes": ["overnight_tradable"]},
+    ],
+)
+def test_an_overnight_window_streams_boats(monkeypatch, tmp_path, extended, asset) -> None:
+    class Ran:
+        cache = SimpleNamespace(orders=lambda **kwargs: [])
+
+        def dispose(self) -> None:
+            pass
+
+    s = SimpleNamespace(
+        dropped=[], history_bars=0, history_dropped=0, quotes=3, trades=0, live_bars=0
+    )
+    seen: dict = {}
+    monkeypatch.setattr(session_window, "paper_trading", lambda: Overnight(asset))
+    monkeypatch.setattr(
+        session_window,
+        "window_node",
+        lambda config, **kw: (
+            seen.update(kw) or (Ran(), s, SimpleNamespace(checks=1, peak=Decimal(0), tripped=None))
+        ),
+    )
+    monkeypatch.setattr(session_window, "_run_node", lambda node, ends: None)
+    monkeypatch.setattr(session_window, "_flatten_after_stop", lambda *a, **k: [])
+    report = session_window.run_window(WindowConfig(session="extended", log_dir=tmp_path))
+    assert (report.part, report.feed, seen["feed"]) == ("overnight", "boats", "boats")
+    assert report.overnight == "overnight_tradable" and report.result == "ok"
 
 
 def test_a_window_inside_the_gap_is_skipped_exit_0_and_the_last_result_kept(tmp_path, capsys):
@@ -1198,7 +1603,9 @@ class Hung:
 
 
 def ran_node(node) -> tuple:
-    s = SimpleNamespace(dropped=[], history_bars=0, history_dropped=0)
+    s = SimpleNamespace(
+        dropped=[], history_bars=0, history_dropped=0, quotes=1, trades=1, live_bars=0
+    )
     cap = SimpleNamespace(checks=1, peak=Decimal(0), tripped=None)
     return node, s, cap
 
@@ -1545,7 +1952,9 @@ def test_a_node_is_disposed_unless_its_own_run_was_abandoned(monkeypatch, tmp_pa
         def dispose(self) -> None:
             Ran.disposed = True
 
-    s = SimpleNamespace(dropped=[], history_bars=0, history_dropped=0)
+    s = SimpleNamespace(
+        dropped=[], history_bars=0, history_dropped=0, quotes=1, trades=1, live_bars=0
+    )
     cap = SimpleNamespace(checks=1, peak=Decimal(0), tripped=None)
     monkeypatch.setattr(session_window, "_ABANDONED", [("an earlier runner", "task")])
     monkeypatch.setattr(session_window, "paper_trading", lambda: Account())
@@ -1748,7 +2157,6 @@ def test_the_post_end_bound_fits_the_end_margin_the_stale_record_and_the_paper_l
     the longest window and all of that."""
     import re
     import tomllib
-    from pathlib import Path
 
     w = session_window
     before = w.STOP_TIMEOUT_SECS + w.ADAPTER_CALL_SECS + w.AFTER_STOP_SECS
@@ -1824,7 +2232,7 @@ def test_a_managed_stop_has_the_post_stop_delay_its_market_exit_needs(
     monkeypatch.setattr(session_window, "alpaca_paper_builder", builder)
     at = datetime(2026, 11, 10, 21, 30, tzinfo=UTC)
     _, s, _ = session_window.window_node(
-        WindowConfig(log_dir=tmp_path), wind_down_at=at, log_name="r"
+        WindowConfig(log_dir=tmp_path), wind_down_at=at, log_name="r", feed="iex"
     )
     assert s.manage_stop
     delays = [args[0] for name, args in built[-1].calls if name == "with_delay_post_stop_secs"]
@@ -2055,7 +2463,9 @@ def test_the_window_hands_the_nodes_orders_in_doubt_to_the_check(monkeypatch, tm
 
         def dispose(self) -> None: ...
 
-    s = SimpleNamespace(dropped=[], history_bars=0, history_dropped=0)
+    s = SimpleNamespace(
+        dropped=[], history_bars=0, history_dropped=0, quotes=1, trades=1, live_bars=0
+    )
     cap = SimpleNamespace(checks=1, peak=Decimal(0), tripped=None)
     handed: list = []
     monkeypatch.setattr(session_window, "_ABANDONED", [])
@@ -2088,7 +2498,9 @@ def test_the_orders_in_doubt_are_read_before_the_node_is_disposed(monkeypatch, t
         def dispose(self) -> None:
             held.clear()  # as the live kernel's disposal clears the cache
 
-    s = SimpleNamespace(dropped=[], history_bars=0, history_dropped=0)
+    s = SimpleNamespace(
+        dropped=[], history_bars=0, history_dropped=0, quotes=1, trades=1, live_bars=0
+    )
     cap = SimpleNamespace(checks=1, peak=Decimal(0), tripped=None)
     handed: list = []
     monkeypatch.setattr(session_window, "_ABANDONED", [])
@@ -2259,7 +2671,7 @@ class Flat:
 
 session_window.ADAPTER_CALL_SECS = 0.3
 session_window.paper_trading = lambda: Flat()
-s = SimpleNamespace(dropped=[], history_bars=0, history_dropped=0)
+s = SimpleNamespace(dropped=[], history_bars=0, history_dropped=0, quotes=1, trades=1, live_bars=0)
 cap = SimpleNamespace(checks=1, peak=Decimal(0), tripped=None)
 session_window.window_node = lambda config, **kw: (Clean(), s, cap)
 session_window.window_seconds = lambda minutes, left: (130.0, "")

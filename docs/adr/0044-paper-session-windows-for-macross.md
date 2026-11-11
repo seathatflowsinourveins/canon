@@ -39,8 +39,9 @@ in `MaCross` now, since recorded backtests ran its code; before any gated varian
 last step), the backtested and the live strategy must be one code path. Outside the regular session every
 order is a DAY limit $0.05 (five $0.01 ticks, since extended hours carry "less liquidity") through the
 touch, sent with `params={"extended_hours": True}`; one not filled in 30 s is canceled and its signal
-dropped, never chased. The adapter sends that flag (ADR 0038); `WindowConfig` still refuses an extended
-window (`EXTENDED_READY`) until one has passed on paper and the disconnect-hang fix is on `main`.
+dropped, never chased. The adapter sends that flag (ADR 0038). An extended window runs in pre-market,
+after-hours or the overnight session (`EXTENDED_READY`, on once an overnight window passed on paper;
+Confirmation), on the feed of the session's part (Each part).
 
 **Each part, and the upstream it follows:**
 
@@ -55,9 +56,16 @@ window (`EXTENDED_READY`) until one has passed on paper and the disconnect-hang 
 | The session | Alpaca's clock and calendar before anything is placed | Alpaca's paper-trading skill: "always check the clock/calendar endpoint" |
 | Bars | One-minute `INTERNAL` bars the data engine builds from trades; the adapter streams none | The data engine's bar aggregation |
 | A position over one share | `PositionCap`, a non-trading strategy in the node (a `DataActor` has no portfolio at the pin): the portfolio's net position every second, `shutdown_system` over one share | No upstream: no setting caps a position, and the trading state is not settable from Python |
-| A window's length and schedule | `minutes` (default 30, at most 60), clipped to the session's end and to `LONGEST_WINDOW_SECS` (Sharing the account), timed from Alpaca's clock; wind-down 120 s before; 300 s between windows; session and feed (IEX) from configuration; overnight refused until its data is observed | No upstream |
+| A window's length and schedule | `minutes` (default 30, at most 60), clipped to the session's end and to `LONGEST_WINDOW_SECS` (Sharing the account), timed from Alpaca's clock; wind-down 120 s before; 300 s between windows; the session from configuration | No upstream |
+| The extended session's parts | Pre-market and after-hours from the calendar day's `session_open` and `session_close`, refused when either is absent; overnight from 20:00 on the evening before a trade date on Alpaca's calendar to that date's `session_open`, so none before a weekend or holiday | Alpaca's 24/5 page: 8:00 PM - 4:00 AM ET, "on the evening before the trade date", "follows the NYSE holiday calendar" |
+| The feed | `boats` overnight, IEX otherwise, or `--feed` (IEX or `boats`, the feeds that both stream and serve bars), named in the strategy's quote and trade subscriptions, made before its bars, and its warm-up request | ADR 0055: params `{"feed": ...}`; the data engine hands the client an instrument's first subscription |
+| Overnight eligibility | An overnight window starts only on an asset Alpaca marks `overnight_tradable` and not `overnight_halted`, read raw (alpaca-py 0.45.0's `Asset` has no such field), else refused by name | Alpaca's 24/5 page: "Assets tradable in the overnight session can be identified via the `overnight_tradable` attribute" |
+| Data in the record | The quotes, trades and live bars that reached the strategy, and the adapter's own stream lines from the node's log; failed when the stream delivered no quote and no trade, or the adapter logged a stream error; a quiet market (quotes, no bar) is ok | No upstream: the adapter reports a refused or ended stream only in the log (ADR 0055) |
 
-What a window knows at start-up, what is lost between windows, and the averages' warm-up: ADR 0047.
+What a window knows at start-up, what is lost between windows, and the averages' warm-up: ADR 0047. The
+engine's memory purge (`purge_closed_orders_interval_mins` and the rest, configure_live_trading, "Memory
+management", off by default, for "long-running or HFT sessions") is not set: its recommended buffer, 60
+minutes, outlasts a window, and the record reads the window's closed orders from the cache.
 
 A window's node log and JSON report go to the per-user temporary folder, outside the repository. Windows
 trade SPY only: the $1,000 cap is sized for it. ADR 0037's `ema_cross_paper_node` gets the same
@@ -110,6 +118,21 @@ the close is sent only in a poll that has read no order working and no such requ
 * Bad: a paper test can lose the race for the lock to the next window. What replaces the sharing is a second
   paper account for session runs, as ADR 0010's last step already asks for separate accounts; that is the
   owner's to create.
+* Bad: with extended windows on, the schedule (ADR 0050) fires a 25-minute window every 35 minutes from
+  04:00 to 20:00 on a trading day and through the overnight session before one, so from Sunday 20:00 to
+  Friday 20:00 except the evening before a holiday. A window holds the paper lock for its 1,500 s, the
+  start-up before it and the stop and check after it: the overnight window above recorded 906 s for its
+  planned 900, its start-up not counted (`START_UP_SECS` allows 30; UNVERIFIED), and a window whose stop
+  or check runs to its bound holds it up to `AFTER_END_SECS` (725 s) longer. So the lock is held about
+  26 of every 35 minutes, and is free for about 9. A `paper:test` that queues at a random moment waits about 10 minutes on average and about 27 at most
+  (37 at the bounds), inside its 3,900 s wait; its output shows nothing until the lock is taken, and past
+  3,900 s it prints "paper:test: the paper lock stayed held for 3900 s; nothing was placed" and exits 1.
+  A test or a window by hand that holds the lock past the next firing's 900 s wait makes that firing
+  give up: `paper:session` prints "the paper lock stayed held for 900 s; nothing was placed" to the
+  runner's log and exits 1, before Python runs, so neither `latest.json` nor `last-firing.json` changes,
+  and `scripts/automation status` shows the paper session FAILED, "the last firing exited 1", until a
+  later firing runs. So a paper test of over about 15 minutes, started in the 9-minute gap, costs the
+  next window.
 * Bad: the averages warm up on each window's own bars, 20 minutes of 30 at the defaults, so about 8
   trade before the wind-down. ADR 0047 warms them from the adapter's bars instead (offline; on paper
   UNVERIFIED; a late answer or a thin feed still leaves a window cold).
@@ -124,8 +147,8 @@ upstream's market exit; outside it every order is a marked DAY limit through the
 canceled at its timeout with its signal dropped and no second order meanwhile, and the wind-down closes
 with a marked limit; a stop while an order works sends no second exit; a short is bought back; the cap
 trips at two shares and holds at one over 3,000 checks; the runtime checks and the scoped reconciliation
-are set; the window refuses an extended session while `EXTENDED_READY` is off, overnight, the regular
-session when closed, a non-trading day, a calendar day without `session_open` or `session_close`, a SIP
+are set; the window refuses an extended session while `EXTENDED_READY` is off, outside pre-market,
+after-hours and an overnight session before a trade date, the regular session when closed, a non-trading day, a calendar day without `session_open` or `session_close`, a SIP
 feed, over 60 minutes, an account not flat and a start inside the gap; on macOS, a run with no
 `--log-dir` whose `getconf DARWIN_USER_TEMP_DIR` gives no absolute folder, and a relative `--log-dir`,
 are refused before Alpaca is read.
@@ -183,7 +206,7 @@ A third second reader's review (2026-11-10), each fix first shown by a failing t
   again (refused at the pin); the node's in-flight check (which queries it, and the adapter answers
   `QueryOrder`), its open-order check and the window's account check, which cancels in any session, are
   what clear it. Extended
-  windows, the only ones that send these limits, stay off (`EXTENDED_READY`).
+  windows, the only ones that send these limits, were then off (`EXTENDED_READY`).
 * A close that filled in part and timed out held the dropped side, so the shares left stayed open for the
   rest of the cross: a limit that filled in part, by its timeout or while its cancel was on its way, now
   drops nothing.
@@ -331,6 +354,28 @@ UNVERIFIED on paper until a window runs. While a phantom remains, a window stops
 the next open, and extended windows once the extended-hours change and the disconnect-hang fix are on
 `main`.
 
+On paper, 2026-11-10, in the overnight session, `mise run paper:session --session extended --minutes 15`,
+by hand, 23:00:53 to 23:15:58 New York, exit 0: the account flat at the start; SPY `overnight_tradable`,
+read from its asset's `attributes`; the part `overnight`, the feed `boats`; the warm-up gave 26 `boats` bars
+and initialized the averages; 3,700 quotes, 120 trades and 14 live bars reached the strategy, with no
+stream line from the adapter. A cross sent a marked DAY limit buy of 1 SPY at 754.58, accepted and
+filled at 754.53; the wind-down's marked DAY limit sell at 754.37 filled at 754.42; the record `ok`, nothing
+left, no close after the stop, the cap's peak one share. Two 10-minute windows the same night, the second
+on the code as landed (after the code review below and a rebase): 23:23:46 to 23:33:55, 25 warm-up bars,
+2,710 quotes, 25 trades, 9 live bars, a cross's buy filled at 754.39 and the cross back's sell at 754.42;
+23:39:35 to 23:49:41, 25 warm-up bars, 1,552 quotes, 38 trades, 9 live bars, a buy filled at 754.64 and
+the wind-down's sell at 754.64; each `ok`, exit 0, nothing left, no stream line. `EXTENDED_READY` was turned
+on with them; no pre-market or after-hours window has run on paper.
+
+Code review (`/code-review`, high) of the extended windows: ten findings, each fixed: the market tuple's
+type; the node's log read before its writer had flushed (now after `logging_sync_to_disk`); the record
+claiming a paper run not yet written; a refused subscription ("Cannot subscribe") read as a quiet market;
+the level matched anywhere in a line (now the line's own field); an overnight session refused for a bound
+it does not need; an unreadable asset failing rather than refusing; a `--feed` that could name a feed the
+part does not serve (removed: the part decides); subscriptions sent before `MaCross`'s instrument check;
+and leftovers (a stale refusal message, a function with no caller, two ways to say no feed). The last seven
+are covered by a test.
+
 ## Evidence
 
 Read 2026-11-10. "raw": fetched with `curl` and read whole. NautilusTrader files at the pin, `d53849b216e2`.
@@ -456,6 +501,19 @@ Read 2026-11-10. "raw": fetched with `curl` and read whole. NautilusTrader files
   `paper:session` passes when its own `getconf` prints nothing; its lock file has the same gap). The window's code no longer matches a close by its
   quantity, so the third claim, an unreadable `qty` taken for no close, no longer applies. Corrected: the
   adapter answers `QueryOrder` (ADR 0036), so the in-flight check queries a limit left pending cancel (run).
+* https://docs.alpaca.markets/us/docs/245-trading-for-trading-api.md: the overnight session's hours "on the
+  evening before the trade date", the NYSE holiday calendar, the `boats` and `overnight` feeds,
+  `overnight_tradable` and `overnight_halted` (fetched, raw, read whole).
+  https://docs.alpaca.markets/us/reference/get-v2-assets-symbol_or_asset_id.md: the two as values of
+  `attributes` (fetched, raw); on paper SPY's asset carried `overnight_tradable` there.
+* https://nautilustrader.io/docs/md/latest/how_to/configure_live_trading.md, "Memory management": the
+  purge settings, off by default, a 60-minute buffer recommended (fetched, raw).
+  https://nautilustrader.io/docs/md/latest/concepts/logging.md: `FileWriterConfig.file_name`, plain text
+  with a `.log` extension (fetched, raw). nautilus-trader 2.0.0rc8 in `.venv`: `Strategy.on_quote`,
+  `on_trade`, `subscribe_quotes` and `subscribe_trades` with `params`, `logging_sync_to_disk` (`bundled`).
+  alpaca-py 0.45.0 in `.venv`: `RESTClient.get`, the call `get_asset` makes; `Asset` without
+  `overnight_tradable` (`bundled`).
+* The overnight paper window above (run).
 * Code review (`/code-review`, high), 2026-11-10, of the account check as one set: ten findings, eight
   reproduced against the tests' stand-in and fixed above, one (a second record of the check's own
   closes) removed, one (this record's length) left open (run).

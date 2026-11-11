@@ -54,7 +54,13 @@ One departure: the averages are registered for the live bar type only, and `on_h
 history to them, oldest first, only while no live bar has reached them; a later answer (after a live bar,
 or after `WARM_UP_TIMEOUT_SECS`) is dropped and counted, so older bars never follow newer ones. Decisions
 wait until the request completes or times out (`hydrated`). The live bars stay the `INTERNAL` ones built
-from trades; both come from the IEX feed.
+from trades.
+
+**Feed** (`feed`). The quote and trade subscriptions and the warm-up request name it in their params,
+`{"feed": ...}`, Alpaca's own parameter name, as the adapter takes it (ADR 0055); with none they name
+none and the adapter streams IEX. Quotes and trades are subscribed before the bars, since the data engine
+hands the client only an instrument's first subscription, so the trades the bars are built from come on
+the same feed. Each quote and trade that arrives is counted (`quotes`, `trades`) for the run's report.
 
 Known limit: the strategy does not know the session calendar (the run checks it before it starts).
 """
@@ -125,6 +131,7 @@ class SessionMaCrossConfig(MaCrossConfig):
         limit_timeout_secs: int = LIMIT_TIMEOUT_SECS,
         wind_down_at: datetime | None = None,
         warm_up: bool = False,
+        feed: str | None = None,
         **kwargs: object,
     ) -> None:
         super().__init__(
@@ -142,6 +149,7 @@ class SessionMaCrossConfig(MaCrossConfig):
                 "limit_timeout_secs": limit_timeout_secs,
                 "wind_down_at": wind_down_at,
                 "warm_up": warm_up,
+                "feed": feed,
             },
             {
                 "extended_hours": bool,
@@ -149,6 +157,7 @@ class SessionMaCrossConfig(MaCrossConfig):
                 "limit_timeout_secs": int,
                 "wind_down_at": (datetime, NoneType),
                 "warm_up": bool,
+                "feed": (str, NoneType),
             },
         )
         if limit_offset < 0 or limit_offset != limit_offset.quantize(CENT):
@@ -166,6 +175,7 @@ class SessionMaCrossConfig(MaCrossConfig):
         if warm_up and not bar_type.spec.is_time_aggregated():
             raise ValueError(f"warm_up needs time bars to size its request, got {bar_type}")
         self.warm_up = warm_up
+        self.feed = feed
 
 
 def through_the_touch(side: OrderSide, bid: Decimal, ask: Decimal, offset: Decimal) -> Decimal:
@@ -186,6 +196,11 @@ class SessionMaCross(MaCross):
         self.wind_down_at = config.wind_down_at
         self.manage_stop = config.manage_stop
         self.warm_up = config.warm_up
+        self.feed_params = {"feed": config.feed} if config.feed else None
+        """The params naming the feed in each subscription and the warm-up request (ADR 0055)."""
+        self.quotes = 0
+        self.trades = 0
+        """The quotes and trades that reached the strategy, for the run's report."""
         self.history_bar_type = BarType(
             self.bar_type.instrument_id, self.bar_type.spec, AggregationSource.EXTERNAL
         )
@@ -205,6 +220,10 @@ class SessionMaCross(MaCross):
         """The client order IDs of limits canceled at their timeout and not yet closed."""
 
     def on_start(self) -> None:
+        instrument = self.cache.instrument(self.instrument_id)
+        if instrument is None or self.trade_size.precision > instrument.size_precision:
+            super().on_start()  # `MaCross`'s own checks raise, before anything is requested
+            return
         if (
             self.warm_up
         ):  # requested before the live subscription, as upstream's handler example does
@@ -216,19 +235,29 @@ class SessionMaCross(MaCross):
                 self.history_bar_type,
                 start=self.clock.utc_now() - self._warm_up_span(),
                 callback=self._on_history,
+                params=self.feed_params,
             )
             self.clock.set_time_alert(
                 WARM_UP_ALERT,
                 self.clock.utc_now() + timedelta(seconds=WARM_UP_TIMEOUT_SECS),
                 self._on_history_timeout,
             )
+        # Quotes and trades first, on the feed: the data engine hands the client only an instrument's
+        # first subscription (ADR 0055), so the trades the bars are built from come on this feed too.
+        # Quotes price the limits outside the session, and both show the stream delivered (the report).
+        self.subscribe_quotes(self.instrument_id, params=self.feed_params)
+        self.subscribe_trades(self.instrument_id, params=self.feed_params)
         super().on_start()
-        if self.extended_hours:
-            self.subscribe_quotes(self.instrument_id)
         if self.wind_down_at is not None:
             self.clock.set_time_alert(
                 "wind-down", self.wind_down_at, self._wind_down, allow_past=True
             )
+
+    def on_quote(self, quote) -> None:
+        self.quotes += 1
+
+    def on_trade(self, trade) -> None:
+        self.trades += 1
 
     def _warm_up_span(self) -> timedelta:
         """`WARM_UP_SPAN`, or `slow_period` plus `WARM_UP_SPARE_BARS` bars if that is longer."""
