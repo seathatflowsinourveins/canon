@@ -79,6 +79,7 @@ from .ledger import has_key
 from .ledger import open_study
 from .ledger import origin
 from .ledger import record_trial
+from .ledger import refuse_a_moved_sample
 from .ledger import retired_numbers
 from .ledger import samples
 from .ledger import trial_config
@@ -142,8 +143,14 @@ def key_of(config: MaCrossConfig, starting_balances: Sequence[str] = STARTING_BA
     return config_key(trial_config([config], starting_balances=starting_balances))
 
 
-def _to_record(study: optuna.Study, keys: Sequence[str]) -> list[str]:
+def _to_record(
+    study: optuna.Study, keys: Sequence[str], on_sample: Sample | None = None
+) -> list[str]:
     """The keys among `keys` whose latest record on the current sample did not run to the end.
+
+    A study whose current sample is no longer `on_sample`, the one its caller checked against its
+    plan, is refused first, as `record_trial` refuses it (`refuse_a_moved_sample`): read on the moved
+    sample, a key run there would be skipped though it never ran on the sample checked.
 
     A key is resolved for the gate when every record that did not run to the end has a later one that
     did (ADR 0054 term 5, `canon_trading.ranking`), which holds exactly when its latest record ran. So
@@ -161,6 +168,7 @@ def _to_record(study: optuna.Study, keys: Sequence[str]) -> list[str]:
     """
     history = samples(study)  # one read, as `rank` takes it
     sample = history[-1]
+    refuse_a_moved_sample(study, sample, on_sample)
     known = {s.number for s in history}
     retired = retired_numbers(study)
     latest: dict[str, optuna.trial.FrozenTrial] = {}
@@ -233,10 +241,12 @@ def record_grid(
     catalog changed mid-pass leaves records that read different bars, which stop it too (ADR 0053
     term 1). Anything that leaves no failure told (a refusal before a trial exists, a failure that
     could not be written, a defect here) stops the pass. So does a study whose sample is no longer
-    `on_sample`, the one the pass checked against its plan: `record_trial` refuses it before a trial.
+    `on_sample`, the one the pass checked against its plan: refused before any key is read
+    (`_to_record`), before each trial by `record_trial`, and after each attempt, whether its run
+    raised or not, naming both samples.
     """
     keys = [key_of(config, starting_balances) for config in configs]
-    pending = set(_to_record(study, keys))
+    pending = set(_to_record(study, keys, on_sample))
     quiet = LoggerConfig(stdout_level=LogLevel.ERROR)
     recorded, skipped, failed = [], [], []
     for config, key in zip(configs, keys, strict=True):
@@ -257,8 +267,11 @@ def record_grid(
             if not _told_failed(study, key, before):
                 raise
             failed.append(f"{describe(config)}: {error!r}")
-            continue
-        recorded.append(trial.number)
+        else:
+            recorded.append(trial.number)
+        # After every attempt, raised or not: a sample moved while it ran stops the pass by name,
+        # whatever that run left, as a later `record_trial` would refuse it before its trial.
+        refuse_a_moved_sample(study, current_sample(study), on_sample)
     return Recorded(tuple(recorded), tuple(skipped), tuple(failed))
 
 

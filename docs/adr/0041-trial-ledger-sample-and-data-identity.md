@@ -159,6 +159,21 @@ Who decided. The orchestrator chose option 2 and its terms under the owner's del
   `test_a_ranking_of_a_sample_moved_beneath_the_pass_is_refused`), and from the code review of that
   fix, a stop on the moved sample is refused too
   (`test_a_stop_on_a_sample_moved_beneath_the_pass_is_refused`).
+* The gate's sixth outside round, 2026-11-11, tests that failed before their fix
+  (`tests/test_ranking.py`, `tests/test_variant_study.py`): records that stop 10 days before the
+  sample's end, without its last session day, which every run `record_trial` records holds, stop
+  the ranking (`test_a_record_that_lacks_the_sample_s_last_session_day_stops`), where they passed as
+  the whole sample; records with a return on the account's registration day, the day before a
+  00:00 UTC start, stop it (`test_returns_on_the_registration_day_before_a_midnight_start_stop`);
+  and the study's pass refuses a moved sample before reading which keys to run, where it skipped
+  every key already run on the moved sample and returned
+  (`test_a_pass_on_a_moved_sample_with_nothing_to_record_is_refused`), and after a run that raised
+  on a sample moved beneath it (`test_a_failed_run_on_a_sample_moved_beneath_it_stops_the_pass`)
+  or one that ran to the end (`test_a_run_recorded_on_a_sample_moved_beneath_it_stops_the_pass`, from
+  the code review of that fix). A record made before term 1 refused a sample with no bar on its
+  last session day may lack that day; it now stops the ranking, and moving the sample to one that
+  ends on its last bar's day and running every configuration again is the remedy, as for any
+  record not in the writer's shape.
 
 ## Evidence
 

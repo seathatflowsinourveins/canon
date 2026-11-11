@@ -218,3 +218,30 @@ def test_returns_whose_squares_overflow_are_refused() -> None:
 
     with pytest.raises(ReturnsRejected, match="a: the sum of the squares of its returns is inf"):
         daily_series("a", returns, sessions(0, 1, 2))
+
+
+@pytest.mark.parametrize(
+    "days",
+    [
+        pytest.param(sessions(2, 1, 0), id="reversed"),
+        pytest.param(sessions(0, 1, 1, 2), id="a day twice"),
+    ],
+)
+def test_session_days_out_of_record_trial_s_order_are_refused(days: list[str]) -> None:
+    """A sixth-round reader (Antigravity): `record_trial` writes each session day once, in order, and
+    a list reversed or holding a day twice was read as a set and passed."""
+    returns = entry({0: 0.01, 1: -0.02, 2: 0.03})
+
+    with pytest.raises(ReturnsRejected, match=r"a: session day .* follows .*, not after it"):
+        daily_series("a", returns, days)
+
+
+def test_returns_whose_moments_underflow_are_refused() -> None:
+    """A sixth-round reader (Antigravity): returns of about 1e-81 apart passed every check, and their
+    fourth central moment rounded to 0.0, so skfolio's kurtosis read 0, below the least any series
+    has, and a pick that is rejected at its own scale passed at 0.95."""
+    pattern = [1.24, -1.24] * 14 + [1.45, -1.45]
+    returns = entry({n: (0.88 + x) * 1e-81 for n, x in enumerate(pattern)})
+
+    with pytest.raises(ReturnsRejected, match=r"a: .* below float64's smallest normal"):
+        daily_series("a", returns, sessions(*range(30)))

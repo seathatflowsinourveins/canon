@@ -39,8 +39,10 @@ different bars or one instrument as different definitions, trials that do not co
 key not marked by `mark_not_run`. A record that ran on the current sample is in `record_trial`'s shape
 only if its run's bounds are the sample's, its `run_config_id` is its key, its digest names exactly
 the bar types its config loads and the instruments they name, each with a SHA-256 hex digest, and every return and session day falls on a UTC day of
-the sample (`canon_trading.ledger.session_day` of its two ends) no later than the session day of the
-run's own end, and a value told is the per-session Sharpe ratio of its returns; Optuna validates no
+the sample (after the account's registration day, `canon_trading.ledger.registration_day` of its
+start, to `canon_trading.ledger.session_day` of its end) no later than the session day of the run's
+own end, its session days include the sample's last (`record_trial` refuses a sample whose last
+session day holds no bar), and a value told is the per-session Sharpe ratio of its returns; Optuna validates no
 user attribute. A record with a key that did not run to the end
 is a failure a later record resolves only if it is one `record_trial` leaves: one that shows a
 result Optuna keeps (`COMPLETE`, `PRUNED`, a value or an intermediate value), or an outcome
@@ -93,11 +95,13 @@ from .ledger import data_bar_types
 from .ledger import has_key
 from .ledger import is_not_run_list
 from .ledger import origin
+from .ledger import registration_day
 from .ledger import samples
 from .ledger import session_day
 from .ledger import shows_an_evaluation
 from .ledger import taken_untold
 from .ledger import told_sharpe
+from .returns_matrix import DAY_NS
 from .returns_matrix import ReturnsRejected
 from .returns_matrix import daily_series
 from .returns_matrix import is_ns_text
@@ -752,8 +756,18 @@ def _shape_faults(trial: FrozenTrial, sample: Sample) -> list[str]:
             f"data_digest names {sorted(digests)}, not the bar types it loads and their "
             f"instruments, {sorted({*loaded, *named})}"
         )
-    low, high = session_day(sample.start), session_day(sample.end)
+    # The first day a run books a return on is the one after the account's registration, which
+    # holds none; before a midnight start that is the start's own day, not `session_day`'s day
+    # before it (`record_trial` refuses a bar on the registration's day).
+    low, high = registration_day(sample.start) + DAY_NS, session_day(sample.end)
     ran_until = session_day(end) if end_ok else high
+    held = attrs.get("session_days")
+    if isinstance(held, list) and str(high) not in held:
+        # `record_trial` refuses a sample whose last session day holds no bar, so its run books it.
+        faults.append(
+            f"session_days lacks {_day(high)}, the session day of the end of {sample.describe()}, "
+            "which every run record_trial records there books"
+        )
     for values, what in (
         (attrs.get("returns_series"), "returns_series has a key on"),
         (attrs.get("session_days"), "session_days has"),

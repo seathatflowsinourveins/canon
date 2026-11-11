@@ -780,3 +780,79 @@ def test_a_stop_on_a_sample_moved_beneath_the_pass_is_refused(
             end=END,
             create=True,
         )
+
+
+def test_a_pass_on_a_moved_sample_with_nothing_to_record_is_refused(
+    alpaca_bars: AlpacaBars, tmp_path: Path
+) -> None:
+    """A sixth-round reader (Antigravity): with every configuration already run on the moved sample,
+    `record_grid` skipped them all and returned, though none had run on the sample its caller
+    checked; `record_trial`, which refuses the move, was never called."""
+    alpaca_bars.write(tmp_path / "catalog", symbols=("SPY",))
+    ledger = tmp_path / "trials.db"
+    configs = grid(symbols=("SPY",), periods=SHORT[:1])
+    with create_ledger_study(
+        "s", start=START.isoformat(), end=END.isoformat(), path=ledger
+    ) as study:
+        checked = canon_trading.ledger.current_sample(study)
+    _move(ledger, "s")
+    with open_study("s", ledger) as study:
+        record_grid(study, tmp_path / "catalog", configs)
+
+        with pytest.raises(
+            ValueError, match=r"moved to sample 1 .*after the pass checked sample 0"
+        ):
+            record_grid(study, tmp_path / "catalog", configs, on_sample=checked)
+
+
+def test_a_failed_run_on_a_sample_moved_beneath_it_stops_the_pass(
+    alpaca_bars: AlpacaBars, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same reader: a run whose failure was told, on a study moved while it ran, was noted
+    among the failures and the pass returned, for the last configuration of its plan. The pass now
+    stops naming the move, and the failure stays told."""
+    alpaca_bars.write(tmp_path / "catalog", symbols=("SPY",))
+    ledger = tmp_path / "trials.db"
+    configs = grid(symbols=("SPY",), periods=SHORT[:1])
+
+    def moved_then_raises(config: BacktestRunConfig, strategies: Sequence[MaCross]) -> BacktestRun:
+        _move(ledger, "s")
+        raise RuntimeError("engine error")
+
+    with create_ledger_study(
+        "s", start=START.isoformat(), end=END.isoformat(), path=ledger
+    ) as study:
+        checked = canon_trading.ledger.current_sample(study)
+        monkeypatch.setattr(canon_trading.ledger, "run_backtest_config", moved_then_raises)
+        with pytest.raises(
+            ValueError, match=r"moved to sample 1 .*after the pass checked sample 0"
+        ):
+            record_grid(study, tmp_path / "catalog", configs, on_sample=checked)
+        [trial] = study.get_trials()
+        assert trial.state == TrialState.FAIL
+
+
+def test_a_run_recorded_on_a_sample_moved_beneath_it_stops_the_pass(
+    alpaca_bars: AlpacaBars, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """From the code review of that fix: a last run that succeeds while the sample moves returned as
+    though the pass finished on the sample it checked."""
+    alpaca_bars.write(tmp_path / "catalog", symbols=("SPY",))
+    ledger = tmp_path / "trials.db"
+    configs = grid(symbols=("SPY",), periods=SHORT[:1])
+    real = canon_trading.ledger.run_backtest_config
+
+    def moved_then_runs(config: BacktestRunConfig, strategies: Sequence[MaCross]) -> BacktestRun:
+        _move(ledger, "s")
+        return real(config, strategies)
+
+    with create_ledger_study(
+        "s", start=START.isoformat(), end=END.isoformat(), path=ledger
+    ) as study:
+        checked = canon_trading.ledger.current_sample(study)
+        monkeypatch.setattr(canon_trading.ledger, "run_backtest_config", moved_then_runs)
+        with pytest.raises(
+            ValueError, match=r"moved to sample 1 .*after the pass checked sample 0"
+        ):
+            record_grid(study, tmp_path / "catalog", configs, on_sample=checked)
+        assert [t.user_attrs["sample"] for t in study.get_trials()] == [0]
