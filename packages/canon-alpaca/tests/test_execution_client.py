@@ -7407,3 +7407,480 @@ def test_an_outside_order_pending_replace_has_its_fills_reported_on_the_order_re
 
     ((named, fills),) = reports
     assert fills == [pending["id"]] and pending["id"] in named, (named, fills)
+
+
+# -- the replace chain's item, closed by ADR 0075's rules: its readers' reproductions, kept as guards -----
+
+
+@pytest.mark.parametrize("end", ["canceled", "expired"])
+def test_an_end_showing_fills_not_yet_applied_waits_for_them(venue, end) -> None:
+    # Found by an independent reader (Codex, finding 3, on the replace chain's record), closed by ADR
+    # 0075's end after its fills and kept as a guard: a `canceled` or `expired` whose order showed a
+    # fill the stream had not delivered yet ended the node's order at once, so the late fill was dropped:
+    # closed with 0 filled while Alpaca had filled 1. NautilusTrader holds a terminal report with
+    # unaccounted fills back ("waiting for fill reports", `reconcile_order_report` at the pin).
+    venue.trading.script = "accept"
+    strategy = trader(order_type="limit")
+    strategy.stopped_for = "held open"
+    held: list = []
+
+    async def body(client) -> None:
+        await until_named(strategy, "OrderAccepted")
+        await until_idle(client, venue)
+        placed = placed_order(venue)
+        late = venue.trading.update(
+            placed["id"],
+            "partial_fill",
+            1,
+            deliver=False,
+            status="partially_filled",
+            filled_qty="1",
+        )
+        venue.trading.update(placed["id"], end, status=end, filled_qty="1")
+        await settled(client, venue)
+        venue.stream.send(late)
+        await settled(client, venue)
+        cached = client.cache.order(strategy.client_order_id)
+        held.append((cached.status, cached.filled_qty.as_double()))
+
+    run_with_client(body, strategy)
+
+    expected = OrderStatus.CANCELED if end == "canceled" else OrderStatus.EXPIRED
+    assert held == [(expected, 1.0)], strategy.names()
+    assert strategy.names()[-2:] == [
+        "OrderFilled",
+        "OrderCanceled" if end == "canceled" else "OrderExpired",
+    ]
+
+
+def test_a_late_fill_of_a_middle_replacement_after_a_reconnect_does_not_move_the_order_back(
+    venue,
+) -> None:
+    # Found by an independent reader (Codex, finding 2, on the replace chain's record), closed by ADR
+    # 0075's rule that an order the record has moved past is never adopted, and kept as a guard: A was
+    # replaced by B and B by C, the first PATCH
+    # answer was lost, so the node held only A and C. After a reconnect the record knew nothing of B, a
+    # delayed fill on B was taken as proof B was working, the node's order moved back from C to B at B's
+    # older price, and C's own `canceled` was then ignored. An Alpaca order the order now working replaces,
+    # directly or through others, is one the node's order has left.
+    from alpaca.trading.requests import ReplaceOrderRequest
+
+    venue.trading.script = "accept"
+    venue.trading.replace_error = requests.ReadTimeout("read timed out")
+    venue.trading.took_before_error = True
+    venue.trading.replace_script = "silent"
+    strategy = modifier()
+    seen: list = []
+
+    async def body(client) -> None:
+        await until_idle(client, venue)
+        async with asyncio.timeout(10):
+            while len(venue.trading._placed) < 2:
+                await asyncio.sleep(0.01)
+        old = placed_order(venue, 0)
+        middle = placed_order(venue, 1)
+        middle.update(filled_qty="1", filled_avg_price="150", status="partially_filled")
+        delayed = {
+            "event": "partial_fill",
+            "order": dict(middle),
+            "timestamp": datetime.now(UTC).isoformat(),
+            "qty": "1",
+            "price": "150",
+            "execution_id": str(uuid.uuid4()),
+        }
+        venue.trading.replace_error = None
+        venue.trading.replace_order_by_id(middle["id"], ReplaceOrderRequest(limit_price=151.0))
+        final = placed_order(venue, 2)
+        venue.trading.confirm_replace(old["id"])
+        await settled(client, venue)
+        assert client.cache.order(strategy.client_order_id).venue_order_id.value == final["id"]
+        await reconnect(client, venue)
+        venue.stream.send(delayed)
+        await settled(client, venue)
+        after = client.cache.order(strategy.client_order_id)
+        venue.trading.update(final["id"], "canceled", status="canceled")
+        await settled(client, venue)
+        ended = client.cache.order(strategy.client_order_id)
+        seen.append(
+            (after.venue_order_id.value == final["id"], ended.status, ended.filled_qty.as_double())
+        )
+
+    run_with_client(body, strategy)
+
+    assert seen == [(True, OrderStatus.CANCELED, 1.0)], strategy.names()
+
+
+@pytest.mark.parametrize("activity", ["listed", "lagging"])
+def test_a_replacements_cancel_before_a_late_fill_on_the_order_it_replaced_keeps_the_fill(
+    venue, monkeypatch, activity
+) -> None:
+    # Found by an independent reader (Antigravity, round 1 on the fill-identity model, finding 6): an
+    # order replaced after a fill whose stream update was late, then the replacement's `canceled`,
+    # showing the chain's fill, before that update: the cancel ended the node's order with 0 filled and
+    # the late fill was dropped. ADR 0075's end after its fills brings it from the activities first, or
+    # waits for the late update while they lag.
+    monkeypatch.setattr(canon_alpaca.execution, "FILL_READ_RETRY_SECS", 1.0)
+    venue.trading.script = "accept"
+    strategy = modifier()
+    held: list = []
+
+    async def body(client) -> None:
+        async with asyncio.timeout(10):
+            while "OrderUpdated" not in strategy.names():
+                await asyncio.sleep(0.01)
+        await settled(client, venue)
+        first, second = placed_order(venue, 0), placed_order(venue, 1)
+        late = venue.trading.update(
+            first["id"], "partial_fill", 1, deliver=False, status="replaced", filled_qty="1"
+        )
+        if activity == "lagging":
+            venue.trading.activities.pop()
+        second.update(filled_qty="1")
+        venue.trading.update(second["id"], "canceled", status="canceled", filled_qty="1")
+        await settled(client, venue)
+        venue.stream.send(late)
+        await settled(client, venue)
+        cached = client.cache.order(strategy.client_order_id)
+        held.append((cached.status, cached.filled_qty.as_double(), trade_ids(cached)))
+        held.append(late["execution_id"])
+
+    run_with_client(body, strategy)
+
+    (status, filled, trades), execution_id = held
+    assert (status, filled, trades) == (OrderStatus.CANCELED, 1.0, [execution_id]), strategy.names()
+    assert strategy.names()[-2:] == ["OrderFilled", "OrderCanceled"], strategy.names()
+
+
+# -- Codex, outside round 2 on ADR 0075 (at 1c3d671) ------------------------------------------------
+
+
+def test_a_query_bringing_a_raised_replacements_fill_adopts_its_quantity_first(venue) -> None:
+    # Found by an independent reader (Codex, outside round 2 on ADR 0075, finding 1): a modify raised the
+    # quantity from 2 to 4, the `replaced` and the replacement's 2-share fill were lost, and a
+    # `QueryOrder` on the original brought the fill by its trade ID against the old quantity: FILLED 2 of
+    # 2 while Alpaca works 2 more. Upstream applies a quantity amendment before recovered fills
+    # (`crates/execution/src/reconciliation/orders.rs:45`, `crates/live/src/execution/manager.rs:4522`).
+    venue.trading.script = "accept"
+    venue.trading.replace_script = "silent"
+    strategy = modifier(field="quantity", prices=["4"])
+    held: list = []
+
+    async def body(client) -> None:
+        old = placed_order(venue, 0)
+        new = placed_order(venue, 1)
+        lost = venue.trading.update(
+            new["id"], "partial_fill", 2, deliver=False, status="partially_filled", filled_qty="2"
+        )
+        await query(client, strategy, old)
+        await settled(client, venue)
+        cached = client.cache.order(strategy.client_order_id)
+        held.append(
+            (
+                cached.status,
+                cached.quantity.as_double(),
+                cached.filled_qty.as_double(),
+                trade_ids(cached),
+            )
+        )
+        held.append(lost["execution_id"])
+
+    run_modify(venue, strategy, lambda: bool(venue.trading.replace_requests), body)
+
+    (status, quantity, filled, trades), execution_id = held
+    assert (status, quantity, filled, trades) == (
+        OrderStatus.PARTIALLY_FILLED,
+        4.0,
+        2.0,
+        [execution_id],
+    ), strategy.names()
+
+
+def test_a_replaced_read_finding_the_replacement_canceled_with_a_lost_fill_ends_the_order(
+    venue, alpaca, monkeypatch
+) -> None:
+    # Found by an independent reader (Codex, outside round 2 on ADR 0075, finding 2): the PATCH answer,
+    # the replacement's fill and its `canceled` were lost; `replaced` came, its read showed the
+    # replacement canceled with 1 filled, and the client waited for the replacement's own updates, which
+    # never came. Under the paper node's checks, which read open orders only, the order stayed
+    # PARTIALLY_FILLED. The end after its fills now covers it.
+    monkeypatch.setattr(canon_alpaca.execution, "FILL_READ_RETRY_SECS", 0.05)
+    venue.trading.script = "accept"
+    venue.trading.replace_script = "silent"
+    venue.trading.replace_error = requests.ReadTimeout("lost replacement answer")
+    venue.trading.took_before_error = True
+    strategy = modifier()
+    held: list = []
+
+    async def body(client) -> None:
+        async with asyncio.timeout(10):
+            while not venue.trading.replace_requests:
+                await asyncio.sleep(0.01)
+        await until_idle(client, venue)
+        old, new = placed_order(venue, 0), placed_order(venue, 1)
+        lost = venue.trading.update(
+            new["id"], "partial_fill", 1, deliver=False, status="partially_filled", filled_qty="1"
+        )
+        venue.trading.update(
+            new["id"],
+            "canceled",
+            deliver=False,
+            status="canceled",
+            canceled_at=datetime.now(UTC).isoformat(),
+        )
+        venue.trading.positions[:] = [{**alpaca.POSITION_AAPL, "qty": "1", "qty_available": "1"}]
+        venue.trading.confirm_replace(old["id"])
+        await settled(client, venue)
+        await asyncio.sleep(1.5)
+        await settled(client, venue)
+        cached = client.cache.order(strategy.client_order_id)
+        held.append((cached.status, cached.filled_qty.as_double(), trade_ids(cached)))
+        held.append(lost["execution_id"])
+
+    run_with_client(body, strategy, exec_engine=PAPER_CHECKS)
+
+    (status, filled, trades), execution_id = held
+    assert (status, filled, trades) == (OrderStatus.CANCELED, 1.0, [execution_id]), strategy.names()
+
+
+def test_a_stale_terminal_report_does_not_end_an_order_whose_end_waits_for_more_fills(
+    venue, monkeypatch
+) -> None:
+    # Found by an independent reader (Codex, outside round 2 on ADR 0075, finding 3): a `canceled`
+    # showing 2 filled waited for its second fill's activity; an older canceled snapshot showing 1 then
+    # reached the engine, which closed the order at 1, and the second fill, listed within the reads, was
+    # lost without the run-out error. Whether Alpaca sends such copies is UNVERIFIED; a report showing no
+    # more than an end already waiting is held back, and the client ends the order itself.
+    monkeypatch.setattr(canon_alpaca.execution, "FILL_READ_RETRY_SECS", 0.5)
+    venue.trading.script = "accept"
+    strategy = trader(order_type="limit", quantity=3)
+    strategy.stopped_for = "held open"
+    held: list = []
+
+    async def body(client) -> None:
+        await until_named(strategy, "OrderAccepted")
+        await until_idle(client, venue)
+        placed = placed_order(venue)
+        first = venue.trading.update(
+            placed["id"],
+            "partial_fill",
+            1,
+            deliver=False,
+            status="partially_filled",
+            filled_qty="1",
+        )
+        stale = dict(placed, status="canceled", canceled_at=datetime.now(UTC).isoformat())
+        second = venue.trading.update(
+            placed["id"],
+            "partial_fill",
+            1,
+            deliver=False,
+            status="partially_filled",
+            filled_qty="2",
+        )
+        second_activity = venue.trading.activities.pop()
+        venue.trading.update(
+            placed["id"], "canceled", status="canceled", canceled_at=datetime.now(UTC).isoformat()
+        )
+        await settled(client, venue)
+        report = await client._order_report(AlpacaOrder(**stale))
+        assert report is not None
+        settled_report = await client._settled_report(report)
+        if settled_report is not None:
+            client._handle_report(settled_report)
+        await settled(client, venue)
+        venue.trading.activities.append(second_activity)
+        await asyncio.sleep(0.8)
+        await settled(client, venue)
+        cached = client.cache.order(strategy.client_order_id)
+        held.append((cached.status, cached.filled_qty.as_double(), sorted(trade_ids(cached))))
+        held.append(sorted([first["execution_id"], second["execution_id"]]))
+
+    run_with_client(body, strategy)
+
+    (status, filled, trades), both = held
+    assert (status, filled, trades) == (OrderStatus.CANCELED, 2.0, both), strategy.names()
+
+
+@pytest.mark.parametrize("cancel", [False, True], ids=["fill", "then-cancel"])
+def test_a_fill_on_an_order_whose_chain_cannot_be_read_waits_rather_than_moving_the_order(
+    venue, alpaca, monkeypatch, cancel
+) -> None:
+    # Found by an independent reader (Muse, outside round 2 on ADR 0075): a fill on the middle order of
+    # an outside chain of three, whose first order's read failed, was taken as on an order ahead and
+    # adopted: the node's order moved back to the middle order, and the working order's `canceled` left
+    # it PARTIALLY_FILLED. An order that cannot be placed in the chain is neither adopted nor counted
+    # behind; its fill waits for the later reads, which place it and bring the fill by its trade ID.
+    monkeypatch.setattr(canon_alpaca.execution, "FILL_READ_RETRY_SECS", 0.2)
+    first_id, middle_id, working_id = MIDDLE_CHAIN
+    first = alpaca.alpaca_order(
+        id=first_id,
+        client_order_id="outside-mid2",
+        qty="3",
+        status="replaced",
+        replaced_by=middle_id,
+    )
+    middle = alpaca.alpaca_order(
+        id=middle_id,
+        client_order_id="alpaca-made-31",
+        qty="3",
+        status="replaced",
+        replaces=first_id,
+        replaced_by=working_id,
+    )
+    working = alpaca.alpaca_order(
+        id=working_id, client_order_id="alpaca-made-32", qty="3", status="new", replaces=middle_id
+    )
+    venue.trading.orders = [first, middle, working]
+    node_order = ClientOrderId("outside-mid2")
+    held: list = []
+
+    async def body(client) -> None:
+        reads = {"first": 0}
+
+        def second_read_fails(order_id: str) -> Exception | None:
+            if order_id == first_id:
+                reads["first"] += 1
+                if reads["first"] == 2:
+                    return OSError("connection reset by peer")
+            return None
+
+        venue.trading.order_lookup_error = second_read_fails
+        execution_id = str(uuid.UUID(int=82))
+        shown = {**middle, "status": "partially_filled", "replaced_by": None, "filled_qty": "1"}
+        middle["filled_qty"] = "1"
+        working.update(filled_qty="1", status="partially_filled")
+        venue.trading.activities.append(
+            alpaca.fill_activity(
+                middle, execution_id, 1, "150", datetime.now(UTC), "partial_fill", 1, 2
+            )
+        )
+        venue.stream.send(
+            {
+                "event": "partial_fill",
+                "order": shown,
+                "timestamp": datetime.now(UTC).isoformat(),
+                "price": "150",
+                "qty": "1",
+                "position_qty": "1",
+                "execution_id": execution_id,
+            }
+        )
+        await settled(client, venue)
+        await asyncio.sleep(0.6)  # the later reads
+        await settled(client, venue)
+        cached = client.cache.order(node_order)
+        held.append((cached.venue_order_id.value, cached.filled_qty.as_double(), trade_ids(cached)))
+        if cancel:
+            working.update(status="canceled")
+            venue.stream.send(
+                {
+                    "event": "canceled",
+                    "order": dict(working),
+                    "timestamp": datetime.now(UTC).isoformat(),
+                }
+            )
+            await settled(client, venue)
+            held.append(client.cache.order(node_order).status)
+        held.append(execution_id)
+
+    run_with_client(body)
+
+    if cancel:
+        (venue_id, filled, trades), status, execution_id = held
+        assert status == OrderStatus.CANCELED, held
+    else:
+        (venue_id, filled, trades), execution_id = held
+    assert (venue_id, filled, trades) == (working_id, 1.0, [execution_id]), held
+
+
+def test_a_catch_up_on_the_working_order_places_a_raised_replacements_fills_first(venue) -> None:
+    # The code review of round 2's model: the catch-up placed only the order its read was asked for, and
+    # counted the listed fills of every order of the chain. A catch-up on the original order listing a
+    # quantity-raising replacement's fill counted it against the old quantity: FILLED 2 of 2 while
+    # Alpaca works 2 more. Each order whose fills are counted is placed first.
+    venue.trading.script = "accept"
+    venue.trading.replace_script = "silent"
+    strategy = modifier(field="quantity", prices=["4"])
+    held: list = []
+
+    async def body(client) -> None:
+        old, new = placed_order(venue, 0), placed_order(venue, 1)
+        lost = venue.trading.update(
+            new["id"], "partial_fill", 2, deliver=False, status="partially_filled", filled_qty="2"
+        )
+        order = client.cache.order(strategy.client_order_id)
+        await client._catch_up(order, client._record(order), Decimal(2), VenueOrderId(old["id"]))
+        await settled(client, venue)
+        cached = client.cache.order(strategy.client_order_id)
+        held.append(
+            (
+                cached.status,
+                cached.quantity.as_double(),
+                cached.filled_qty.as_double(),
+                trade_ids(cached),
+            )
+        )
+        held.append(lost["execution_id"])
+
+    run_modify(venue, strategy, lambda: bool(venue.trading.replace_requests), body)
+
+    (status, quantity, filled, trades), execution_id = held
+    assert (status, quantity, filled, trades) == (
+        OrderStatus.PARTIALLY_FILLED,
+        4.0,
+        2.0,
+        [execution_id],
+    ), strategy.names()
+
+
+def test_an_older_canceled_report_held_back_while_fills_are_caught_up_still_ends_the_order(
+    venue, monkeypatch
+) -> None:
+    # The code review of round 2's model: a canceled report showing fewer fills than the client was
+    # catching up to was held back, with no end waiting, so nothing ended the order once the fills came,
+    # and the paper node's checks never ask for a closed order again. The held report's end now waits on
+    # the record, and the client sends it after the fills.
+    monkeypatch.setattr(canon_alpaca.execution, "FILL_READ_RETRY_SECS", 0.5)
+    venue.trading.script = "accept"
+    strategy = trader(order_type="limit", quantity=3)
+    strategy.stopped_for = "held open"
+    held: list = []
+
+    async def body(client) -> None:
+        await until_named(strategy, "OrderAccepted")
+        await until_idle(client, venue)
+        placed = placed_order(venue)
+        first = venue.trading.update(
+            placed["id"],
+            "partial_fill",
+            1,
+            deliver=False,
+            status="partially_filled",
+            filled_qty="1",
+        )
+        stale = dict(placed, status="canceled", canceled_at=datetime.now(UTC).isoformat())
+        second = venue.trading.update(
+            placed["id"],
+            "partial_fill",
+            1,
+            deliver=False,
+            status="partially_filled",
+            filled_qty="2",
+        )
+        second_activity = venue.trading.activities.pop()
+        venue.stream.send({**first, "order": {**first["order"], "filled_qty": "2"}})
+        await settled(client, venue)
+        report = await client._order_report(AlpacaOrder(**stale))
+        assert report is not None
+        assert await client._settled_report(report) is None
+        venue.trading.activities.append(second_activity)
+        await asyncio.sleep(1.2)
+        await settled(client, venue)
+        cached = client.cache.order(strategy.client_order_id)
+        held.append((cached.status, cached.filled_qty.as_double(), sorted(trade_ids(cached))))
+        held.append(sorted([first["execution_id"], second["execution_id"]]))
+
+    run_with_client(body, strategy)
+
+    (status, filled, trades), both = held
+    assert (status, filled, trades) == (OrderStatus.CANCELED, 2.0, both), strategy.names()

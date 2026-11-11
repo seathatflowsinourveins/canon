@@ -510,7 +510,11 @@ Each is stated in `execution.py`'s header, with its source.
   own wait between attempts of a read; the count a choice, since Alpaca states no lag), and then the
   order is left with an error; an update showing more while they wait gives them their reads again. A fill on an Alpaca order of the chain the node's order never held is
   applied under the order it is on now, as NautilusTrader's `reconcile_fill_report` does, so it cannot
-  move the order back to an order Alpaca replaced; an order Alpaca shows replaced is never adopted. A
+  move the order back to an order Alpaca replaced; an order Alpaca shows replaced is never adopted. Before
+  a fill on an order the record is not on counts, the order is placed in the replace chain: behind, its
+  fill counts on the order now working; ahead, it is adopted first, so its quantity applies before its
+  fills, as upstream amends before recovered fills; unplaceable (a link unreadable), the fill waits for the
+  later reads. A
   `canceled` or `expired` update or report showing more filled than the node holds brings the missing
   fills first and then ends the order, waiting with the later reads while the activities lag; after
   them it ends with what the node holds, with an error. At start-up there is no exit to inference for
