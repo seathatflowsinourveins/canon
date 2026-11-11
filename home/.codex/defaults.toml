@@ -1,10 +1,23 @@
-# Codex CLI's native default model and reasoning effort (docs/adr/0059-native-defaults-for-every-runtime.md).
-# scripts/bootstrap --user-config writes each key below that ${CODEX_HOME:-~/.codex}/config.toml lacks at the
-# top of that file, where TOML keeps keys that belong to no table, and changes nothing else in it; a key the
-# file already sets to another value is left as it is and named. Keys: `model` ("Model to use (e.g.,
-# gpt-6.1-sol)") and `model_reasoning_effort` ("Reasoning effort advertised by the selected model"),
-# https://learn.chatgpt.com/docs/config-file/config-reference. The values are the ones ADR 0045 rule 7 starts
-# every Codex review with (`--model gpt-6.1-sol --effort max`), so a session started with no flags runs the
-# same; canon/models.json's runtimes section names them and scripts/test-lanes holds the two together.
+# Codex CLI's native default model and reasoning effort (docs/adr/0059-native-defaults-for-every-runtime.md),
+# and the permissions profile every Codex worker runs under (docs/adr/0034-each-runtime-in-its-own-sandbox.md).
+# scripts/bootstrap --user-config writes each setting below that ${CODEX_HOME:-~/.codex}/config.toml lacks at
+# the top of that file, where TOML keeps keys that belong to no table, and changes nothing else in it; a
+# setting the file already has with another value is left as it is and named. A setting is a top-level key,
+# or one entry of a top-level table (permissions.canon-worker is one setting, written as an inline table).
+# Keys, https://learn.chatgpt.com/docs/config-file/config-reference: `model` ("Model to use (e.g.,
+# gpt-6.1-sol)") and `model_reasoning_effort` ("Reasoning effort advertised by the selected model"). The
+# values are the ones ADR 0045 rule 7 starts every Codex review with (`--model gpt-6.1-sol --effort max`), so a
+# session started with no flags runs the same; canon/models.json's runtimes section names them and
+# scripts/test-lanes holds the two together.
 model = "gpt-6.1-sol"
 model_reasoning_effort = "max"
+# ADR 0034 rule 1 (https://learn.chatgpt.com/docs/permissions): `approval_policy = "never"` (a refused command
+# fails and the model carries on), and a profile that extends the built-in `:workspace` with the `/tmp` folder
+# read-only (`:slash_tmp`) and Codex's sign-in file denied, made the default with `default_permissions`.
+# Profiles "do not compose with the older sandbox settings": a `sandbox_mode` in any loaded config, or a
+# `--sandbox` or bypass flag at launch, wins over them (scripts/bootstrap --check names the first).
+approval_policy = "never"
+default_permissions = "canon-worker"
+permissions.canon-worker.extends = ":workspace"
+permissions.canon-worker.filesystem.":slash_tmp" = "read"
+permissions.canon-worker.filesystem."~/.codex/auth.json" = "deny"

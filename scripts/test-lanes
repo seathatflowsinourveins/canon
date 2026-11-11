@@ -2175,7 +2175,7 @@ check "an existing Codex config gets the table appended, its own lines kept" \
 check "... on a line of its own after the last one"  grep -qxF '[profiles.fast]' "$CX"
 # Codex's default model and effort (ADR 0059): the key it lacks goes at the top, one it sets is the owner's
 check "... the default effort it lacked written at its top, its own model kept and named" \
-      eval 'tomlis "$CX" "d[\"model_reasoning_effort\"] == \"max\" and d[\"model\"] == \"o3\" and d[\"profiles\"][\"fast\"][\"model\"] == \"x\"" && grep -q "added      model_reasoning_effort to $CX" "$TMP/bs.out" && grep -q "KEPT       $CX sets model to another value" "$TMP/bs.out"'
+      eval 'tomlis "$CX" "d[\"model_reasoning_effort\"] == \"max\" and d[\"model\"] == \"o3\" and d[\"profiles\"][\"fast\"][\"model\"] == \"x\"" && grep -q "added      model_reasoning_effort, approval_policy, default_permissions, permissions.canon-worker to $CX" "$TMP/bs.out" && grep -q "KEPT       $CX sets model to another value" "$TMP/bs.out"'
 check "... with each step's copy of the file kept under its own name" \
       test "$(find "$HOME/.codex" -name "config.toml.replaced-*" | wc -l | tr -d ' ')" = 2
 CLAUDE_CONFIG_DIR="$C3" bs --user-config
@@ -2195,7 +2195,8 @@ CLAUDE_CONFIG_DIR="$C3" bs --check
 check "... and check calls it OWNER"              rowis "$TMP/bs.out" "codex telemetry" OWNER
 # Codex's config is read as TOML (claims of a second reader, 2026-11-10): a quoted key is the owner's otel
 # table, and an [otel] line inside a multi-line string is no table at all
-printf "model = \"o3\"\nmodel_reasoning_effort = \"low\"\n['otel']\nexporter = 'none'\n" > "$CX"; cp "$CX" "$TMP/cx.before"
+printf "%s\nmodel = \"o3\"\nmodel_reasoning_effort = \"low\"\n['otel']\nexporter = 'none'\n" "$(grep -e '^approval_policy' -e '^default_permissions' -e '^permissions' "$ROOT/home/.codex/defaults.toml")" > "$CX"
+cp "$CX" "$TMP/cx.before"   # the worker profile already set, so only otel is in question
 CLAUDE_CONFIG_DIR="$C3" bs --user-config
 check "a quoted ['otel'] table is the owner's: left as it is, still valid TOML" \
       eval 'cmp -s "$CX" "$TMP/cx.before" && tomlis "$CX" "d[\"otel\"] == {\"exporter\": \"none\"}" && grep -q "sets otel itself" "$TMP/bs.out"'
@@ -2489,7 +2490,53 @@ else
         eval 'rowis "$TMP/bs.out" "codex defaults" UNKNOWN && grep -q "config.toml cannot be read" "$TMP/bs.out"'
 fi
 check "home/.codex/defaults.toml holds what canon/models.json gives Codex" \
-      eval 'tomlis "$ROOT/home/.codex/defaults.toml" "d == {\"model\": \"$(jq -r ".runtimes[] | select(.runtime == \"codex\") | .model" "$ROOT/canon/models.json")\", \"model_reasoning_effort\": \"$(jq -r ".runtimes[] | select(.runtime == \"codex\") | .effort" "$ROOT/canon/models.json")\"}"'
+      eval 'tomlis "$ROOT/home/.codex/defaults.toml" "{k: d[k] for k in (\"model\", \"model_reasoning_effort\")} == {\"model\": \"$(jq -r ".runtimes[] | select(.runtime == \"codex\") | .model" "$ROOT/canon/models.json")\", \"model_reasoning_effort\": \"$(jq -r ".runtimes[] | select(.runtime == \"codex\") | .effort" "$ROOT/canon/models.json")\"}"'
+# ADR 0034's worker profile: the template holds it, --user-config adds it to a config that lacks it, leaving
+# the owner's other keys and permission profiles alone, and a second run changes nothing
+check "home/.codex/defaults.toml holds ADR 0034's worker profile, made the default, with approvals never" \
+      tomlis "$ROOT/home/.codex/defaults.toml" 'd["approval_policy"] == "never" and d["default_permissions"] == "canon-worker" and d["permissions"] == {"canon-worker": {"extends": ":workspace", "filesystem": {":slash_tmp": "read", "~/.codex/auth.json": "deny"}}}'
+rm -f "$HOME/.codex/config.toml.replaced-"*
+printf '%s\n' "$(grep -e '^model' "$ROOT/home/.codex/defaults.toml")" > "$CX"
+printf 'web_search = "cached"\n\n[permissions.mine]\nextends = ":read-only"\n\n[otel]\nexporter = "none"\n' >> "$CX"
+cp "$CX" "$TMP/cx.before"
+CLAUDE_CONFIG_DIR="$C" bs --check
+check "a config without the profile: codex permissions NOT SET, naming what it lacks" \
+      eval 'rowis "$TMP/bs.out" "codex permissions" "NOT SET" && grep -q "lacks approval_policy, default_permissions, permissions.canon-worker" "$TMP/bs.out" && rowis "$TMP/bs.out" "codex defaults" ok'
+CLAUDE_CONFIG_DIR="$C" bs --user-config
+check "user-config adds the profile, approvals never and the default to a config that lacks them" \
+      eval 'tomlis "$CX" "d[\"approval_policy\"] == \"never\" and d[\"default_permissions\"] == \"canon-worker\" and d[\"permissions\"][\"canon-worker\"] == {\"extends\": \":workspace\", \"filesystem\": {\":slash_tmp\": \"read\", \"~/.codex/auth.json\": \"deny\"}}" && grep -q "added      approval_policy, default_permissions, permissions.canon-worker to $CX" "$TMP/bs.out"'
+check "... leaving the owner's unrelated keys and profiles as they were, a copy kept" \
+      eval 'tomlis "$CX" "d[\"web_search\"] == \"cached\" and d[\"permissions\"][\"mine\"] == {\"extends\": \":read-only\"} and d[\"otel\"] == {\"exporter\": \"none\"}" && grep -qxF "$(head -1 "$TMP/cx.before")" "$CX" && [ "$(head -1 "$CX")" != "$(head -1 "$TMP/cx.before")" ] && f=$(find "$HOME/.codex" -name "config.toml.replaced-*" | awk "NR == 1") && cmp -s "$f" "$TMP/cx.before"'
+cp "$CX" "$TMP/cx.after"
+CLAUDE_CONFIG_DIR="$C" bs --user-config
+check "... and a second run changes nothing"       eval 'cmp -s "$CX" "$TMP/cx.after" && grep -q "unchanged  Codex defaults in $CX" "$TMP/bs.out"'
+CLAUDE_CONFIG_DIR="$C" bs --check
+check "check reads the profile present and the default: codex permissions ok" \
+      eval 'rowis "$TMP/bs.out" "codex permissions" ok && rowis "$TMP/bs.out" "codex defaults" ok'
+{ echo 'sandbox_mode = "workspace-write"'; cat "$TMP/cx.after"; } > "$CX"; CLAUDE_CONFIG_DIR="$C" bs --check
+check "a sandbox_mode beside the profile: OWNER, saying Codex uses it instead" \
+      eval 'rowis "$TMP/bs.out" "codex permissions" OWNER && grep -q "sets sandbox_mode, which Codex uses instead of default_permissions" "$TMP/bs.out"'
+{ echo 'default_permissions = ":workspace"'; grep -v '^default_permissions' "$TMP/cx.after"; } > "$CX"; cp "$CX" "$TMP/cx.before"
+CLAUDE_CONFIG_DIR="$C" bs --user-config
+check "another default profile is the owner's: left as it is, and named" \
+      eval 'cmp -s "$CX" "$TMP/cx.before" && grep -q "KEPT       $CX sets default_permissions to another value" "$TMP/bs.out"'
+CLAUDE_CONFIG_DIR="$C" bs --check
+check "... and check calls it OWNER"               rowis "$TMP/bs.out" "codex permissions" OWNER
+printf '%s\n[otel]\nexporter = "none"\n[permissions]\nmine = { extends = ":read-only" }\n' "$(grep -e '^model' "$ROOT/home/.codex/defaults.toml")" > "$CX"; cp "$CX" "$TMP/cx.before"
+CLAUDE_CONFIG_DIR="$C" bs --user-config; rc=$?
+check "a [permissions] table the dotted key cannot join: the top-level keys written, the profile named, the run fails" \
+      eval '[ "$rc" != 0 ] && tomlis "$CX" "d[\"approval_policy\"] == \"never\" and d[\"default_permissions\"] == \"canon-worker\" and d[\"permissions\"] == {\"mine\": {\"extends\": \":read-only\"}}" && grep -q "FAILED     permissions.canon-worker cannot be written at the top of $CX" "$TMP/bs.out"'
+printf '%s\nprofile = "x"\nprofiles = "x"\n' "$CXDEF" > "$CX"; CLAUDE_CONFIG_DIR="$C" bs --check
+check "a profiles key that is not a table is read, not called a missing python" \
+      eval 'rowis "$TMP/bs.out" "codex permissions" ok && ! grep -q "no python3 with tomllib" "$TMP/bs.out"'
+# Codex keeps its sign-in file in CODEX_HOME, so the profile denies the one there (an Orca-started Codex has its own)
+OH="$TMP/other codex home"; mkdir -p "$OH"; printf '[otel]\nexporter = "none"\n' > "$OH/config.toml"
+CODEX_HOME="$OH" CLAUDE_CONFIG_DIR="$C" bs --user-config
+check "with CODEX_HOME set, the profile denies the sign-in file in it" \
+      eval 'tomlis "$OH/config.toml" "d[\"permissions\"][\"canon-worker\"][\"filesystem\"] == {\":slash_tmp\": \"read\", \"$OH/auth.json\": \"deny\"}"'
+CODEX_HOME="$OH" CLAUDE_CONFIG_DIR="$C" bs --check
+check "... and check reads that as the profile: ok"  rowis "$TMP/bs.out" "codex permissions" ok
+rm -rf "${OH:?}"
 rm -rf "$HOME/.codex"
 CLAUDE_CONFIG_DIR="$TMP/bad\$dir" bs --user-config; rc=$?
 check "unquotable config directory refused"       eval '[ "$rc" != 0 ] && [ ! -e "$TMP/bad\$dir" ]'

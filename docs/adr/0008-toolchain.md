@@ -75,6 +75,10 @@ point `mise.lock` held four tools across 28 platform targets, each with a URL an
 The `stable` channel gave CLI 2.1.311, while the desktop app runs 2.1.321, the version the canon pins and
 whose docs ADR 0003 cites. Not verified: that every setting under `.claude/` behaves the same on 2.1.311.
 
+Upgraded 2026-11-11 from the main checkout at `4efc962`: `mise self-update --yes --no-plugins 2026.11.6`
+reported "Updated mise to 2026.11.6", and `mise --version` reads 2026.11.6. `scripts/bootstrap --check` then
+read mise ok 2026.11.6, claude CLI ok 2.1.322 (pinned 2.1.322), Codex defaults ok, and "All present".
+
 ## Evidence
 
 Read 2026-11-09 (fetched unless noted).

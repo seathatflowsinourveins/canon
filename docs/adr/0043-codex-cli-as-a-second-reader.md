@@ -101,6 +101,10 @@ Rule 3 follows from it. UNVERIFIED: a review in a new worktree, a change it is a
 update, a larger diff, a read-only sandbox through Orca, `--model`, and whether `read-only` blocks network.
 One trial is one data point.
 
+Codex update, 2026-11-11, from the main checkout at `4efc962`: `mise use -g codex@0.167.1` set the global
+config, and `codex --version` reads codex-cli 0.167.1; `scripts/bootstrap --check` read Codex defaults ok.
+Codex workers started from 10:04 New York time that day run 0.167.1.
+
 ## Evidence
 
 Read 2026-11-10. `fetched`: downloaded and searched, not summarised. "Lane": a research subagent fetched the
