@@ -25,6 +25,9 @@ the package README's known limits and `execution.py`; steps 5 to 7 from `README.
 Live trading. No record plans it. Agents work on paper only, and going live is a human action;
 ADR 0009 keeps trading on paper at least until NautilusTrader v2.0.0 stable, a condition, not a plan.
 
+The routing plan, order-type access and rate limits on a live account are the account holder's
+arrangement with Alpaca, and outside what agents decide.
+
 ## Open questions
 
 * **When the harness is done for now.** Six checks end harness growth; once they hold, one lane does its
