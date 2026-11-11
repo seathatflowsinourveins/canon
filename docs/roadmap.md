@@ -33,7 +33,10 @@ ADR 0009 keeps trading on paper at least until NautilusTrader v2.0.0 stable, a c
   its study; what value it should count as is undecided (ADR 0010, ADR 0054).
 * **One paper account or several.** ADR 0010 step 4 runs the pick and the incumbent on separate paper
   accounts; one paper account serves every session on this machine today (`mise.toml`, `paper:test`,
-  `paper:session`), and a second one for session runs is the owner's to create (ADR 0044).
+  `paper:session`), and a second one for session runs is the owner's to create (ADR 0044). ADR 0068
+  (`proposed`) lays out the lanes that run upstream's strategies around the clock (a backtest queue, the
+  sandbox on live data, paper windows) and why one stream per login bounds them; ADR 0070 the sandbox and
+  a data-only task that cannot trade.
 * **Reconciliation on a shared account.** Inferred fills from the last 500 orders once netted to a
   position Alpaca did not hold; the client now reports each loaded instrument without a position as flat,
   which removes it offline, and on paper this waits for a regular session (package README; ADR 0024).
