@@ -129,8 +129,9 @@ from optuna.trial import TrialState
 
 from .backtest import FEE_RATES
 from .backtest import VENUE_SETTINGS
+from .backtest import built_backtest
 from .backtest import checked_run_config
-from .backtest import run_backtest_config
+from .backtest import run_built
 from .ma_cross import BASE_FIELDS
 from .ma_cross import MaCross
 from .ma_cross import MaCrossConfig
@@ -151,6 +152,7 @@ if TYPE_CHECKING:
     from optuna.trial import FrozenTrial
 
     from .backtest import BacktestRun
+    from .backtest import BuiltBacktest
 
 LEDGER_FILE = Path("ledger") / "trials.db"
 
@@ -918,15 +920,20 @@ def _record(
     """`record_trial`'s attempt, under the study's write lock; `asked` takes its trial's number."""
     sample = current_sample(study)
     refuse_a_moved_sample(study, sample, on_sample)
-    config = trial_config(strategies, starting_balances=starting_balances)
+    # The configuration is frozen here, once: the configs and the balances as tuples, and one
+    # strategy built from each config. The key, the run config and the node are all made from
+    # these, so a sequence its caller changes afterwards changes neither the key nor the run.
+    configs = tuple(strategies)
+    balances = tuple(starting_balances)
+    config = trial_config(configs, starting_balances=balances)
     key = config_key(config)
-    built = [MaCross(strategy) for strategy in strategies]
-    if config_key(trial_config(strategies, starting_balances=starting_balances)) != key:
+    built = [MaCross(strategy) for strategy in configs]
+    if config_key(trial_config(configs, starting_balances=balances)) != key:
         raise RuntimeError("a strategy config changed while its strategies were built")
     checked = checked_run_config(
         catalog_path,
         built,
-        starting_balances=starting_balances,
+        starting_balances=balances,
         logging=logging,
         run_config_id=key,
         start=sample.start,
@@ -941,6 +948,39 @@ def _record(
     checked_digest = bars_digest(_in_order(checked.bars), bar_types)
     del checked  # only the digest is kept, so the checked bars are not held through the run
 
+    # The build is the check (ADR 0054 term 7): the node is built from the frozen configuration and
+    # its strategies added before a trial is asked for, so a configuration upstream refuses leaves
+    # no record, and the node run in the trial is that one. It is disposed however this is left.
+    with built_backtest(run_config, built) as node:
+        return _run_as_a_trial(
+            study,
+            node,
+            sample=sample,
+            key=key,
+            config=config,
+            bar_types=bar_types,
+            checked_digest=checked_digest,
+            asked=asked,
+        )
+
+
+def _run_as_a_trial(
+    study: optuna.Study,
+    node: BuiltBacktest,
+    *,
+    sample: Sample,
+    key: str,
+    config: dict[str, Any],
+    bar_types: list[str],
+    checked_digest: dict[str, str],
+    asked: list[int],
+) -> RecordedTrial:
+    """Ask for the attempt's trial, run `node` in it, write what the run left and tell it.
+
+    `node` is the node built from the configuration `key` hashes (`_record`), over `sample`, whose
+    bars the coverage check read with digest `checked_digest`. Everything after the trial is asked
+    for is inside the `try` that tells a failure (`record_trial`).
+    """
     trial = _own_trial(study)
     asked.append(trial.number)
     try:
@@ -948,7 +988,7 @@ def _record(
         trial.set_user_attr("config_key", key)
         trial.set_user_attr("sample", sample.number)
         trial.set_user_attr("config", config)
-        run = run_backtest_config(run_config, built)
+        run = run_built(node)
         result = run.result
         returns = {str(ns): value for ns, value in sorted(result.returns_series.items())}
         bars = _in_order(run.bars)

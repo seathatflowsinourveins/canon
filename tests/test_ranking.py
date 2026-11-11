@@ -1986,7 +1986,7 @@ def test_a_raced_queued_record_whose_read_back_is_refused_stops_and_is_retired(
     with pytest.MonkeyPatch.context() as patched:
         patched.setattr(optuna.Study, "ask", queued_then_asked)
         patched.setattr(canon_trading.ledger, "_asked", unread)
-        patched.setattr(canon_trading.ledger, "run_backtest_config", never)
+        patched.setattr(canon_trading.ledger, "run_built", never)
         with pytest.raises(optuna.exceptions.StorageInternalError, match="refused the read") as err:
             canon_trading.ledger.record_trial(
                 study, tmp_path / "catalog", [ma_cross_config()], starting_balances=["100000 USD"]

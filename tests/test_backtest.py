@@ -71,10 +71,13 @@ from nautilus_trader.model import OrderSubmitted
 from nautilus_trader.model import Quantity
 from nautilus_trader.model import Venue
 
+import canon_trading.backtest
 from canon_trading.backtest import BacktestRun
 from canon_trading.backtest import backtest_run_config
+from canon_trading.backtest import built_backtest
 from canon_trading.backtest import run_backtest
 from canon_trading.backtest import run_backtest_config
+from canon_trading.backtest import run_built
 from canon_trading.ma_cross import MaCross
 from canon_trading.ma_cross import MaCrossConfig
 
@@ -440,3 +443,71 @@ def test_one_bound_past_the_catalog_is_refused(
         backtest_run_config(
             tmp_path, [MaCross(config())], starting_balances=["100000 USD"], start=start, end=end
         )
+
+
+# The gate's seventh round, 2026-11-11 (ADR 0073): the run is two steps, the build and the run of
+# what was built, so `canon_trading.ledger` can ask for its trial between them.
+
+
+def test_a_node_built_then_run_is_the_whole_run_and_is_disposed_on_leaving(
+    alpaca_bars: AlpacaBars, tmp_path: Path
+) -> None:
+    """`built_backtest` builds the node and adds the strategies and `run_built` runs that node:
+    together they are `run_backtest_config`, and the node is disposed once the block is left, where
+    upstream refuses to run it again."""
+    alpaca_bars.write(tmp_path)
+    whole = run(tmp_path, MaCross(config()))
+    strategies = [MaCross(config())]
+    run_config = backtest_run_config(
+        tmp_path, strategies, starting_balances=[str(STARTING_BALANCE)]
+    )
+
+    with built_backtest(run_config, strategies) as built:
+        assert built.config is run_config
+        split = run_built(built)
+
+    assert split.result.returns_series == whole.result.returns_series
+    assert len(split.orders) == len(whole.orders) > 0
+    assert split.bars == whole.bars
+    with pytest.raises(RuntimeError, match="has been disposed"):
+        built.node.run()
+
+
+@pytest.mark.parametrize(
+    "refused", ["no starting balance", "one strategy ID twice", "no definition", "an error inside"]
+)
+def test_what_upstream_refuses_of_a_configuration_is_refused_by_the_build(
+    alpaca_bars: AlpacaBars, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refused: str
+) -> None:
+    """Antigravity, gate round 7: each of these was raised by `run_backtest_config`, which the ledger
+    called after it had asked for its trial. Upstream refuses each while the node is built or a
+    strategy is added, before any bar is read, so the build alone is the check; nothing here lists
+    what upstream refuses. The node is disposed whichever way the block is left."""
+    alpaca_bars.write(tmp_path, symbols=("AAPL", "MSFT"), instrument=refused != "no definition")
+    strategies, balances, message = [MaCross(config())], [str(STARTING_BALANCE)], "inside"
+    if refused == "no starting balance":
+        balances, message = [], "starting_balances must not be empty"
+    if refused == "one strategy ID twice":
+        strategies = [
+            MaCross(config(order_id_tag="SAME")),
+            MaCross(config(bar_type=MSFT_BAR_TYPE, order_id_tag="SAME")),
+        ]
+        message = "MaCross-SAME is already registered"
+    if refused == "no definition":
+        message = r"No instruments found in catalog.*AAPL\.ALPACA"
+    run_config = backtest_run_config(tmp_path, strategies, starting_balances=balances)
+    real = canon_trading.backtest.BacktestNode
+    nodes: list[Any] = []
+
+    def kept(configs: Any) -> Any:
+        nodes.append(real(configs))
+        return nodes[-1]
+
+    monkeypatch.setattr(canon_trading.backtest, "BacktestNode", kept)
+    with pytest.raises(RuntimeError, match=message), built_backtest(run_config, strategies):
+        assert refused == "an error inside", "the node was built"
+        raise RuntimeError("an error inside the block")
+
+    [node] = nodes
+    with pytest.raises(RuntimeError, match="has been disposed"):
+        node.run()

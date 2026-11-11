@@ -88,6 +88,7 @@ Known limits:
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -112,6 +113,7 @@ from nautilus_trader.model import OmsType
 from nautilus_trader.persistence import ParquetDataCatalog
 
 if TYPE_CHECKING:
+    from collections.abc import Generator
     from collections.abc import Sequence
 
     from nautilus_trader.backtest import BacktestResult
@@ -370,7 +372,8 @@ def run_backtest(
     also silences whatever is built afterwards.
 
     A run meant as a trial goes through `canon_trading.ledger.record_trial`, which builds its run
-    config with `backtest_run_config` and runs it with `run_backtest_config`.
+    config with `checked_run_config`, its node with `built_backtest` and runs that node with
+    `run_built`.
     """
     config = backtest_run_config(
         catalog_path,
@@ -390,12 +393,33 @@ def _require_strategies(strategies: Sequence[MaCross]) -> None:
         raise ValueError("run_backtest needs at least one strategy")
 
 
-def run_backtest_config(config: BacktestRunConfig, strategies: Sequence[MaCross]) -> BacktestRun:
-    """Run `strategies` under `config`, a config `backtest_run_config` built, and dispose the node.
+@dataclass(frozen=True)
+class BuiltBacktest:
+    """A node built for one run config, its strategies added, and not yet run (`built_backtest`)."""
 
-    `canon_trading.ledger` calls this with the config whose key it recorded, so the config hashed is
-    the config run. No strategies is refused, as `backtest_run_config` refuses it: the node would run
-    the bars with nothing to trade them and return an empty result without an error.
+    node: BacktestNode
+    config: BacktestRunConfig
+
+
+@contextmanager
+def built_backtest(
+    config: BacktestRunConfig, strategies: Sequence[MaCross]
+) -> Generator[BuiltBacktest]:
+    """Build the node of `config`, a config `backtest_run_config` built, and add `strategies` to it;
+    dispose of the node on leaving the block, however it is left.
+
+    The build is the check of a configuration: `BacktestNode.build` creates the engine, adds the
+    venues and loads the instruments from the catalog (its docstring, and
+    `crates/backtest/src/node.rs` at the pinned commit), and `add_strategy` registers each strategy,
+    so what upstream refuses of a venue, an instrument or a strategy is refused here, by upstream,
+    before any bar is read: no starting balance, no definition of an instrument in the catalog, a
+    strategy ID given twice (observed at v2.0.0rc8, 2026-11-11). Nothing here lists what upstream
+    refuses. No strategies is refused, as `backtest_run_config` refuses it: the node would run the
+    bars with nothing to trade them and return an empty result without an error.
+
+    `canon_trading.ledger` builds a trial's node with this before it asks for the trial, and runs
+    exactly that node after (`run_built`), so the configuration checked is the one run. A node runs
+    once: disposed, it can be neither run nor built again.
     """
     _require_strategies(strategies)
     node = BacktestNode([config])
@@ -403,25 +427,43 @@ def run_backtest_config(config: BacktestRunConfig, strategies: Sequence[MaCross]
         node.build()
         for strategy in strategies:
             node.add_strategy(config.id, strategy)
-        [result] = node.run()
-        cache = node.get_engine_cache(config.id)
-        return BacktestRun(
-            result=result,
-            orders=cache.orders(),
-            positions=cache.positions(),
-            position_snapshots=cache.position_snapshots(),
-            account=cache.account_for_venue(VENUE),
-            bars=[
-                bar
-                for data in config.data
-                for bar_type in data.bar_types or ()
-                for bar in cache.bars(BarType.from_str(str(bar_type))) or []
-            ],
-            instruments=[
-                cache.instrument(BarType.from_str(str(bar_type)).instrument_id)
-                for data in config.data
-                for bar_type in data.bar_types or ()
-            ],
-        )
+        yield BuiltBacktest(node=node, config=config)
     finally:
         node.dispose()
+
+
+def run_built(built: BuiltBacktest) -> BacktestRun:
+    """Run the node `built_backtest` built and read the run from its engine's cache.
+
+    `BacktestNode.run` loads the data from the catalog and runs the engine (its docstring); the
+    cache is read here, before the node is disposed, since disposal empties it.
+    """
+    node, config = built.node, built.config
+    [result] = node.run()
+    cache = node.get_engine_cache(config.id)
+    return BacktestRun(
+        result=result,
+        orders=cache.orders(),
+        positions=cache.positions(),
+        position_snapshots=cache.position_snapshots(),
+        account=cache.account_for_venue(VENUE),
+        bars=[
+            bar
+            for data in config.data
+            for bar_type in data.bar_types or ()
+            for bar in cache.bars(BarType.from_str(str(bar_type))) or []
+        ],
+        instruments=[
+            cache.instrument(BarType.from_str(str(bar_type)).instrument_id)
+            for data in config.data
+            for bar_type in data.bar_types or ()
+        ],
+    )
+
+
+def run_backtest_config(config: BacktestRunConfig, strategies: Sequence[MaCross]) -> BacktestRun:
+    """Run `strategies` under `config`, a config `backtest_run_config` built, and dispose the node:
+    `built_backtest`, then `run_built`, the two steps `canon_trading.ledger` takes either side of
+    asking for its trial."""
+    with built_backtest(config, strategies) as built:
+        return run_built(built)

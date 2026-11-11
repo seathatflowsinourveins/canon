@@ -247,9 +247,11 @@ def record_grid(
     none is a refusal, whatever another caller recorded meanwhile. So does a study whose sample is no longer
     `on_sample`, the one the pass checked against its plan: refused before any key is read
     (`_to_record`), before each trial by `record_trial`, and after each attempt, whether its run
-    raised or not, naming both samples.
+    raised or not, naming both samples. A plan that names one configuration twice is refused before
+    any of that (`_refuse_a_repeated_key`).
     """
     keys = [key_of(config, starting_balances) for config in configs]
+    _refuse_a_repeated_key(configs, keys)
     pending = set(_to_record(study, keys, on_sample))
     quiet = LoggerConfig(stdout_level=LogLevel.ERROR)
     recorded, skipped, failed = [], [], []
@@ -277,6 +279,23 @@ def record_grid(
         # whatever that run left, as a later `record_trial` would refuse it before its trial.
         refuse_a_moved_sample(study, current_sample(study), on_sample)
     return Recorded(tuple(recorded), tuple(skipped), tuple(failed))
+
+
+def _refuse_a_repeated_key(configs: Sequence[MaCrossConfig], keys: Sequence[str]) -> None:
+    """Refuse a plan that names one configuration twice, by name and key, before any trial.
+
+    The keys left to record are read once, before the first trial, so a key given twice would run
+    twice in one pass: two records of one configuration where the plan is one trial each, and a
+    repeat that failed would leave the key unresolved though its first run ended.
+    """
+    seen: set[str] = set()
+    for config, key in zip(configs, keys, strict=True):
+        if key in seen:
+            raise ValueError(
+                f"the pass names {describe(config)} twice (config key {key}); a pass records each "
+                "configuration once, so give each once",
+            )
+        seen.add(key)
 
 
 def describe(config: MaCrossConfig) -> str:

@@ -52,6 +52,7 @@ from nautilus_trader.persistence import ParquetDataCatalog
 from optuna.exceptions import DuplicatedStudyError
 from optuna.trial import TrialState
 
+import canon_trading.backtest
 import canon_trading.ledger
 from canon_trading.ledger import DAY_NS
 from canon_trading.ledger import FAILED
@@ -717,7 +718,7 @@ def test_an_interrupt_during_the_run_is_told_failed(
     def interrupted(*_: object) -> None:
         raise KeyboardInterrupt
 
-    monkeypatch.setattr("canon_trading.ledger.run_backtest_config", interrupted)
+    monkeypatch.setattr("canon_trading.ledger.run_built", interrupted)
     with pytest.raises(KeyboardInterrupt):
         record_trial(study, tmp_path / "catalog", [strategy()], starting_balances=BALANCES)
 
@@ -943,7 +944,7 @@ def test_the_digest_is_of_the_bars_the_run_read_not_a_later_catalog(
     corrected = list(alpaca_bars.CLOSES)
     corrected[9] += 0.5
     study = new_study(stack, tmp_path, "replaced")
-    real = canon_trading.ledger.run_backtest_config
+    real = canon_trading.ledger.run_built
 
     def run_then_replace(*args: Any) -> object:
         run = real(*args)
@@ -951,7 +952,7 @@ def test_the_digest_is_of_the_bars_the_run_read_not_a_later_catalog(
         alpaca_bars.write(tmp_path / "catalog", corrected)
         return run
 
-    monkeypatch.setattr(canon_trading.ledger, "run_backtest_config", run_then_replace)
+    monkeypatch.setattr(canon_trading.ledger, "run_built", run_then_replace)
     record_trial(study, tmp_path / "catalog", [strategy()], starting_balances=BALANCES)
     monkeypatch.undo()
     record_trial(
@@ -1071,7 +1072,7 @@ def test_bars_the_cache_does_not_account_for_are_told_failed(
     """The digest is only of the bars the run read if the cache holds every one, and only those."""
     alpaca_bars.write(tmp_path / "catalog")
     study = new_study(stack, tmp_path, "unaccounted")
-    real = canon_trading.ledger.run_backtest_config
+    real = canon_trading.ledger.run_built
     stray = alpaca_bars.daily(
         alpaca_bars.equity(), [1.0], first=datetime(2024, 3, 11, tzinfo=NEW_YORK)
     )
@@ -1081,7 +1082,7 @@ def test_bars_the_cache_does_not_account_for_are_told_failed(
         bars = run.bars[1:] if change == "drop" else [*run.bars[1:], *stray]
         return dataclasses.replace(run, bars=bars)
 
-    monkeypatch.setattr(canon_trading.ledger, "run_backtest_config", changed)
+    monkeypatch.setattr(canon_trading.ledger, "run_built", changed)
     with pytest.raises(RuntimeError, match=message):
         record_trial(study, tmp_path / "catalog", [strategy()], starting_balances=BALANCES)
 
@@ -1161,7 +1162,7 @@ def test_two_sample_moves_at_once_are_both_kept(
 
 
 def test_a_sample_is_moved_only_on_a_study_the_ledger_opened(tmp_path: Path) -> None:
-    """The move holds the ledger's lock, which only a study the ledger opened can name."""
+    """The move holds the study's write lock, which only a study the ledger opened can name."""
     url = f"sqlite:///{tmp_path / 'bare.db'}"
     bare = optuna.create_study(study_name="bare", storage=url, direction="maximize")
     bare.set_user_attr(SAMPLES, [{"number": 0, "start": utc_ns(START), "end": utc_ns(END)}])
@@ -1180,14 +1181,14 @@ def test_a_catalog_swapped_between_the_check_and_the_replay_is_told_failed(
     alpaca_bars.write(path)
     append_bars(alpaca_bars, path)
     study = new_study(stack, tmp_path, "swapped", end="2025-06-15")
-    real = canon_trading.ledger.run_backtest_config
+    real = canon_trading.ledger.run_built
 
     def swap_then_run(*args: Any) -> object:
         shutil.rmtree(path)
         alpaca_bars.write(path)  # the first 40 bars, covering 2025-03-10 to 2025-05-04
         return real(*args)
 
-    monkeypatch.setattr(canon_trading.ledger, "run_backtest_config", swap_then_run)
+    monkeypatch.setattr(canon_trading.ledger, "run_built", swap_then_run)
     for config in (strategy(), strategy(fast=2, slow=5)):
         with pytest.raises(RuntimeError, match="other bars than the coverage check read"):
             record_trial(study, path, [config], starting_balances=BALANCES)
@@ -1318,7 +1319,7 @@ def test_a_failure_whose_record_cannot_be_read_still_raises_the_run_s_error(
         calls.append(1)
         engine_error()
 
-    monkeypatch.setattr(canon_trading.ledger, "run_backtest_config", run_then_lock)
+    monkeypatch.setattr(canon_trading.ledger, "run_built", run_then_lock)
     monkeypatch.setattr(optuna.Study, "get_trials", locked_after_the_run)
     with pytest.raises(RuntimeError, match="engine error") as raised:
         record_trial(study, tmp_path / "catalog", [strategy()], starting_balances=BALANCES)
@@ -1628,7 +1629,9 @@ def test_a_catalog_with_two_definitions_of_one_instrument_does_not_run(
     alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack
 ) -> None:
     """The cache's definition is the one the run traded against only if a run reads one: the node
-    refuses a catalog that holds two definitions of an instrument, so no run read another first."""
+    refuses a catalog that holds two definitions of an instrument, so no run read another first.
+    It refuses while it is built, which is before a trial is asked for (2026-11-11), so nothing is
+    recorded."""
     alpaca_bars.write(tmp_path / "catalog", instrument=False)
     listed = alpaca_bars.equity()
     limited = Equity(
@@ -1648,8 +1651,7 @@ def test_a_catalog_with_two_definitions_of_one_instrument_does_not_run(
 
     with pytest.raises(RuntimeError, match="already registered with a different definition"):
         record_trial(study, tmp_path / "catalog", [strategy()], starting_balances=BALANCES)
-    [trial] = study.trials
-    assert (trial.state, trial.user_attrs[OUTCOME]) == (TrialState.FAIL, FAILED)
+    assert study.get_trials() == []
 
 
 @pytest.mark.parametrize(
@@ -2011,7 +2013,7 @@ def test_a_retirement_cut_short_reads_as_retired_never_as_a_run(
     stated_n: Callable[[optuna.Study], int],
     how: str,
 ) -> None:
-    """`retire_queued` writes the study's list under the ledger's lock before it takes the record, so
+    """`retire_queued` writes the study's list under the study's write lock before it takes the record, so
     a process stopped between the two, or a note the store refuses, leaves a record read as retired:
     left `WAITING`, `record_trial` takes it and goes on; left `FAIL` with the other writer's outcome
     and no note, it is not read as a run of its key."""
@@ -2141,7 +2143,7 @@ def test_a_keyed_trial_queued_after_the_check_names_itself_when_nothing_can_be_w
 def test_a_trial_retired_between_record_trial_s_note_and_its_tell_lets_record_trial_go_on(
     alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Second review: `record_trial` takes a raced keyed trial outside the ledger's lock, and one
+    """Second review: `record_trial` took a raced keyed trial outside the ledger's lock, and one
     retired between its note and its `tell` was told `FAIL` first, so that `tell` raised and
     `record_trial` stopped. The `tell` now skips a trial already finished, and the run goes on."""
     alpaca_bars.write(tmp_path / "catalog")
@@ -2440,7 +2442,7 @@ def test_a_sample_move_waits_for_a_record_being_written(
     monkeypatch: pytest.MonkeyPatch,
     before: str,
 ) -> None:
-    """Codex, gate round 7, the interleaving family (#172 and #177 each patched a member of it):
+    """Codex, gate round 7, the interleaving family (#172 and #177 each answered a member of it):
     `move_sample` held the ledger's lock, which `record_trial` never took, so another caller's move
     landed between a record's first read of the study and its last write. Each named writer now
     holds the study's write lock, `record_trial` from its first read (the sample) to its last write
@@ -2765,3 +2767,144 @@ def test_a_raised_record_names_the_trial_it_asked_for_or_none(
     assert asked_for(again.value) is None
     assert asked_for(RuntimeError("raised elsewhere")) is None
     assert [t.number for t in study.get_trials()] == [0, 1]
+
+
+# The gate's seventh round, 2026-11-11 (ADR 0073), the configuration family: the configuration is
+# frozen once and the build is its check. Each test that names a reader failed before its change.
+
+
+@pytest.mark.parametrize("refused", ["no starting balance", "one strategy ID twice"])
+def test_a_configuration_the_node_refuses_to_build_is_refused_before_a_trial(
+    alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack, refused: str
+) -> None:
+    """Antigravity, gate round 7: a configuration upstream refuses when the node is built, no
+    starting balance or one strategy ID given to two strategies, raised after the trial was asked
+    for. That left a keyed `FAIL` no later record could resolve, since the configuration can never
+    run: N rose by one and the study was stopped for good. The node is now built, and its
+    strategies added, before a trial is asked for, so the refusal writes nothing."""
+    alpaca_bars.write(tmp_path / "catalog")
+    alpaca_bars.write(tmp_path / "catalog", symbols=("MSFT",))
+    study = new_study(stack, tmp_path, "refused at build")
+    record_each(study, tmp_path / "catalog", (3, 8), (2, 5))
+    before = rank(study)
+    configs, balances, message = {
+        "no starting balance": ([strategy(fast=4, slow=9)], [], "starting_balances must not be"),
+        "one strategy ID twice": (
+            [tagged(BAR_TYPE, "SAME"), tagged(MSFT_BAR_TYPE, "SAME")],
+            BALANCES,
+            "MaCross-SAME is already registered",
+        ),
+    }[refused]
+
+    with pytest.raises(RuntimeError, match=message) as error:
+        record_trial(study, tmp_path / "catalog", configs, starting_balances=balances)
+
+    assert canon_trading.ledger.trial_asked_for(error.value) is None
+    assert len(study.get_trials()) == 2
+    assert rank(study) == before
+
+
+def test_a_balance_changed_after_the_key_does_not_reach_the_run(
+    alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex, gate round 7: the key was taken from the caller's list of starting balances and the
+    venue was built from the same list later, so a list changed in between ran 200,000 USD under
+    the key of 100,000 USD, and two configurations counted as one. The balances are now copied
+    once, when the attempt starts, and the key and the venue are both made from that copy."""
+    alpaca_bars.write(tmp_path / "catalog")
+    controls = {}
+    for balance in ("100000 USD", "200000 USD"):
+        control = new_study(stack, tmp_path, f"control {balance}")
+        record_trial(control, tmp_path / "catalog", [strategy()], starting_balances=[balance])
+        [controls[balance]] = control.trials
+    study = new_study(stack, tmp_path, "changed")
+    balances = ["100000 USD"]
+    real = canon_trading.ledger.checked_run_config
+
+    def changed_then_checked(*args: Any, **kwargs: Any) -> object:
+        balances[0] = "200000 USD"
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(canon_trading.ledger, "checked_run_config", changed_then_checked)
+    recorded = record_trial(study, tmp_path / "catalog", [strategy()], starting_balances=balances)
+
+    [trial] = study.trials
+    kept, other = controls["100000 USD"], controls["200000 USD"]
+    assert balances == ["200000 USD"]
+    assert kept.user_attrs["returns_series"] != other.user_attrs["returns_series"]
+    assert recorded.config_key == kept.user_attrs["config_key"] != other.user_attrs["config_key"]
+    assert trial.user_attrs["config"] == kept.user_attrs["config"]
+    assert trial.user_attrs["returns_series"] == kept.user_attrs["returns_series"]
+
+
+@pytest.mark.parametrize("ends", ["refused at build", "refused at ask", "run raises", "recorded"])
+def test_the_node_is_disposed_however_the_attempt_ends(
+    alpaca_bars: AlpacaBars,
+    tmp_path: Path,
+    stack: ExitStack,
+    monkeypatch: pytest.MonkeyPatch,
+    ends: str,
+) -> None:
+    """The node is built before the trial is asked for and run after, so it is held across the
+    ask: each way out of the attempt disposes of it, and each attempt builds exactly one."""
+    alpaca_bars.write(tmp_path / "catalog")
+    study = new_study(stack, tmp_path, "disposed")
+    real = canon_trading.backtest.BacktestNode
+    made: list[Any] = []
+    disposed: list[Any] = []
+
+    class Watched:
+        def __init__(self, configs: Any) -> None:
+            self.node = real(configs)
+            made.append(self)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self.node, name)
+
+        def dispose(self) -> None:
+            disposed.append(self)
+            self.node.dispose()
+
+    monkeypatch.setattr(canon_trading.backtest, "BacktestNode", Watched)
+    balances, config, error = BALANCES, strategy(), None
+    if ends == "refused at build":
+        balances, error = [], pytest.raises(RuntimeError, match="starting_balances")
+    if ends == "refused at ask":
+        foreign_queued(study, strategy(fast=2, slow=5))
+        error = pytest.raises(ValueError, match="retire_queued")
+    if ends == "run raises":
+        config = strategy(size=Quantity.from_str("1.5"))
+        error = pytest.raises(RuntimeError, match=r"trade_size 1\.5 is finer than")
+
+    with error if error is not None else ExitStack():
+        record_trial(study, tmp_path / "catalog", [config], starting_balances=balances)
+
+    assert len(made) == 1
+    assert disposed == made
+    with pytest.raises(RuntimeError, match="disposed"):
+        made[0].node.run()
+    states = [(t.state, t.user_attrs.get(OUTCOME)) for t in study.get_trials()]
+    assert (
+        states
+        == {
+            "refused at build": [],
+            "refused at ask": [(TrialState.WAITING, TRADED)],
+            "run raises": [(TrialState.FAIL, FAILED)],
+            "recorded": [(TrialState.COMPLETE, TRADED)],
+        }[ends]
+    )
+
+
+def test_a_catalog_without_the_instrument_is_refused_before_a_trial(
+    alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack
+) -> None:
+    """The node loads each instrument's definition when it is built (`BacktestNode.build`), so a
+    catalog holding the bars and no definition is refused by upstream before a trial is asked for,
+    where it was a failed trial of its key."""
+    alpaca_bars.write(tmp_path / "catalog", instrument=False)
+    study = new_study(stack, tmp_path, "no definition")
+
+    with pytest.raises(RuntimeError, match="No instruments found in catalog"):
+        record_trial(study, tmp_path / "catalog", [strategy()], starting_balances=BALANCES)
+
+    assert study.get_trials() == []
