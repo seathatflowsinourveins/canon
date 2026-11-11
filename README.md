@@ -144,16 +144,19 @@ config environment (`mise.gateway.toml`, locked in `mise.gateway.lock`). On a Ma
 
 ```bash
 mise -E gateway install --locked npm:omniroute   # the pinned release, exactly the locked dependency graph
-mise -E gateway run omniroute:store      # makes its storage key, asks for a dashboard password; both to the keychain
+mise -E gateway run omniroute:store      # makes its storage key into the keychain; nothing typed or shown
 mise -E gateway run omniroute:serve      # the gateway on 127.0.0.1:20128 with ADR 0056's settings, until Ctrl-C
-mise -E gateway run omniroute:store-key  # after making a no-log API key in its dashboard: asks for it, checks it, stores it
+mise -E gateway run omniroute:setup      # with it running: dashboard login off, a no-log API key minted into the keychain
+mise -E gateway run omniroute:provider openai  # yours: a provider's API key at a hidden prompt, registered in the gateway
 mise -E gateway run omniroute:codex      # Codex with its provider set to the gateway; arguments go to codex
-mise -E gateway run omniroute:check      # says which keychain items exist; prints none
+mise -E gateway run omniroute:check      # which keychain items exist (prints none), and whether the gateway requires its key
 mise -E gateway run omniroute:remove     # deletes them; without the storage key its stored credentials are lost
 ```
 
-A provider key goes in through the dashboard at `http://127.0.0.1:20128`, by you. `scripts/bootstrap
---check` shows the installed version against the pin, and fails if a connection there says Anthropic or Claude.
+The provider key is the one thing you type: API keys only, never Anthropic or a sign-in, best one made for
+this gateway alone with a spend limit. The dashboard at `http://127.0.0.1:20128` opens without a login.
+`scripts/bootstrap --check` shows the installed version against the pin, and fails if a connection there
+says Anthropic or Claude, is not an API key, or an API key logs request bodies.
 
 ## What runs on its own
 
