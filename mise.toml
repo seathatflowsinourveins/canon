@@ -275,8 +275,9 @@ tests
 # paper test that streams on account A also takes; the two waits share `lockwait`. It holds both for the window,
 # at most `session_window.LONGEST_WINDOW_SECS` plus start-up and the bounded end; the window flattens and
 # checks the account before it ends. Arguments go to
-# `python -m canon_trading.session_window` (--session regular|extended|auto, --strategy SessionMaCross|EmaCross,
-# SessionMaCross by default and EmaCross in regular windows only, --minutes, --symbol). Its log and
+# `python -m canon_trading.session_window` (--session regular|extended|auto, --strategy SessionMaCross, the
+# default; EmaCross is refused by name for selling while flat, --minutes, --symbol). A window starts only on an
+# account Alpaca holds long-only (paper:long-only). Its log and
 # report are in the per-user temporary folder, outside the repository, canon-paper-session/, with the gap
 # marker every run reads. Its records (latest.json, window-*.json, last-firing.json) are there for the
 # scheduled runner's run (CANON_PAPER_SCHEDULED=1, or CANON_COMMIT), which `scripts/automation status` reads,
@@ -284,7 +285,7 @@ tests
 # by the scheduled runner (CANON_COMMIT set), `--exact` makes its clone's kept .venv exactly uv.lock, as
 # `uv sync` would; a run by hand leaves the worktree's .venv as it is (uv run's inexact default; ADR 0050).
 [tasks."paper:session"]
-description = "Run one bounded strategy window (SessionMaCross unless --strategy EmaCross) on paper account B under its lock and the stream lock"
+description = "Run one bounded SessionMaCross window on paper account B, which Alpaca holds long-only, under its lock and the stream lock"
 # deadline: its 900 s wait for the two locks, the start-up (uv's sync, held to `sync`, then the imports before the
 # first clock read), the window's longest and its bounded end (the arithmetic is ADR 0050's, and
 # tests/test_session_window.py holds it); a window stopped there is recorded `running` and so shows as died, and the next one starts only
@@ -422,4 +423,46 @@ data() {
   bounded "$left" uv run --locked python -m "$module" --minutes "${usage_minutes:-10}"
 }
 data
+'''
+
+# Alpaca's long-only account setting on one paper account (`no_shorting`, "If true, account becomes long-only
+# mode": https://docs.alpaca.markets/us/reference/patchaccountconfig-1.md; alpaca-py 0.45.0's
+# `get_account_configurations` and `set_account_configurations`). A window never opens a short, and its start
+# check refuses an account that allows shorting (session_window, "Long-only"). The owner approved on 2026-11-11
+# setting it on both paper accounts and reversing it, if ever, by the same call (`off`). `tests` reads account
+# A's pair, as paper:test does, and `windows` account B's, as paper:session does (ADR 0069), into this task's
+# environment only; neither value is printed. `check` reads only and prints the setting's value. `on` and `off`
+# first take that account's lock, so no paper run is mid-way, waiting at most `lockwait` seconds, then run under
+# timeout(1) -s KILL. Run from main only (ADR 0028): the setting is a change to the account.
+[tasks."paper:long-only"]
+description = "Print, or set on or off, Alpaca's long-only setting (no_shorting) on one paper account"
+shell = "bash -c"
+timeout = "30m"
+usage = '''
+arg "<account>" help="tests: account A, which paper:test reads; windows: account B, which paper:session reads (ADR 0069)" {
+  choices "tests" "windows"
+}
+arg "<action>" help="check: print the setting; on: make the account long-only; off: reverse it by the same call" {
+  choices "check" "on" "off"
+}
+'''
+run = '''
+lockwait=900
+case "${usage_account:-}" in
+  tests) svc=canon-alpaca-paper; lock=canon-paper-test.lock ;;
+  windows) svc=canon-alpaca-paper-windows; lock=canon-paper-windows.lock ;;
+  *) echo "paper:long-only: no paper account named '${usage_account:-}'; the names are tests and windows; nothing was read" >&2; exit 3 ;;
+esac
+case "${usage_action:-}" in check|on|off) ;; *) echo "paper:long-only: the action is check, on or off, not '${usage_action:-}'; nothing was read" >&2; exit 3 ;; esac
+ALPACA_API_KEY="$(/usr/bin/timeout 30 /usr/bin/security find-generic-password -s "$svc" -a ALPACA_API_KEY -w)" || ALPACA_API_KEY=""
+ALPACA_SECRET_KEY="$(/usr/bin/timeout 30 /usr/bin/security find-generic-password -s "$svc" -a ALPACA_SECRET_KEY -w)" || ALPACA_SECRET_KEY=""
+[ -n "$ALPACA_API_KEY" ] && [ -n "$ALPACA_SECRET_KEY" ] || { echo "paper:long-only: account ${usage_account}'s pair is not in the login keychain (mise run paper:check ${usage_account}); nothing was read" >&2; exit 1; }
+export ALPACA_API_KEY ALPACA_SECRET_KEY CANON_PAPER_ACCOUNT="$usage_account"
+[ "$usage_action" = check ] || {
+  tmp="$(/usr/bin/getconf DARWIN_USER_TEMP_DIR)" || tmp=""
+  case "$tmp" in /*/) ;; *) echo "paper:long-only: the per-user temporary folder is not known, so there is no paper lock to take; nothing was changed" >&2; exit 1 ;; esac
+  exec 9>>"${tmp}${lock}"
+  /usr/bin/lockf -t "$lockwait" 9 || { echo "paper:long-only: account ${usage_account}'s lock stayed held for $lockwait s; nothing was changed" >&2; exit 1; }
+}
+exec /usr/bin/timeout -s KILL 600 uv run --locked python -c 'import sys; from canon_trading.session_window import long_only_task; raise SystemExit(long_only_task(sys.argv[1]))' "$usage_action"
 '''
