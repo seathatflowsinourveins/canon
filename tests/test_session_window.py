@@ -15,6 +15,7 @@ import subprocess
 import tomllib
 from datetime import UTC
 from datetime import datetime
+from datetime import timedelta
 from decimal import Decimal
 from itertools import pairwise
 from types import SimpleNamespace
@@ -1408,14 +1409,6 @@ def test_an_interrupt_during_a_hung_stop_abandons_the_node_and_does_not_wait(whe
     assert "interrupted 1 1" in child.stdout, child.stderr[-2000:]
 
 
-def test_a_window_ends_early_enough_for_its_account_check_inside_the_session() -> None:
-    """A window clipped to the session's end still checks the account, after a stop at its bound, while
-    the market close can be sent."""
-    assert session_window.END_MARGIN_SECS >= (
-        session_window.STOP_TIMEOUT_SECS + session_window.AFTER_STOP_SECS
-    )
-
-
 class Timeouts(SessionMaCross):
     """Calls `_on_limit_timeout` for an order given by the test, with the cancel recorded."""
 
@@ -1494,14 +1487,6 @@ def test_the_windows_own_alpaca_client_has_the_adapters_http_timeout(monkeypatch
     assert session is not None
     adapter = session.get_adapter("https://paper-api.alpaca.markets")
     assert type(adapter).__name__ == "TimeoutAdapter"
-
-
-def test_the_end_margin_leaves_room_beyond_the_stop_and_the_check() -> None:
-    """A minute beyond the stop's bound and the check's: the calls before the check's own deadline, and
-    skew between Alpaca's clock and this host's."""
-    assert session_window.END_MARGIN_SECS >= (
-        session_window.STOP_TIMEOUT_SECS + session_window.AFTER_STOP_SECS + 60
-    )
 
 
 def test_an_error_after_an_abandoned_stop_is_printed_and_heard_before_the_exit(
@@ -1592,10 +1577,9 @@ def test_the_account_check_ends_within_its_bound_however_slow_alpaca_is(fake_tim
     report = session_window.WindowReport("regular", "SPY", started="t")
     left = session_window._flatten_after_stop(cast(TradingClient, account), WindowConfig(), report)
     w = session_window
-    assert (
-        fake_time.now <= w.AFTER_STOP_SECS + 3 * w.REQUEST_SECS
-    )  # a call in flight, a last reading
-    assert [name for at, name in account.calls if at >= w.AFTER_STOP_SECS] in ([], ["orders"])
+    # the poll begun before the deadline, then the last reading and a cancel of what it shows
+    assert fake_time.now <= w.AFTER_END_SECS - w.STOP_TIMEOUT_SECS - w.ADAPTER_CALL_SECS
+    assert all(at < w.AFTER_STOP_SECS for at, name in account.calls if name in {"clock", "close"})
     assert left == ["open order entry-1", "position of 1 SPY"]
 
 
@@ -2018,15 +2002,19 @@ def test_the_post_end_bound_fits_the_end_margin_the_stale_record_and_the_paper_l
     from pathlib import Path
 
     w = session_window
-    last_close = w.STOP_TIMEOUT_SECS + w.ADAPTER_CALL_SECS + w.AFTER_STOP_SECS + w.REQUEST_SECS
-    after_end = last_close + 2 * w.REQUEST_SECS  # the close in flight, then one more reading
+    before = w.STOP_TIMEOUT_SECS + w.ADAPTER_CALL_SECS + w.AFTER_STOP_SECS
+    last_close = before + 3 * w.REQUEST_SECS  # the poll's two reads and its clock read
+    # that poll at its longest (two reads, the clock, a cancel of each order), then the same again
+    after_end = before + 2 * (2 + 1 + w.FINAL_CANCELS) * w.REQUEST_SECS
     assert after_end == w.AFTER_END_SECS
     assert w.END_MARGIN_SECS >= last_close + 60
-    assert w.MAX_MINUTES * 60 + after_end < w.STALE_RUNNING_SECS
+    assert w.LONGEST_WINDOW_SECS + w.SKEW_SECS + after_end < w.STALE_RUNNING_SECS
     tasks = tomllib.loads((Path(__file__).parents[1] / "mise.toml").read_text())["tasks"]
     found = re.search(r"lockf (?:-k )?-t (\d+)", tasks["paper:test"]["run"])
     assert found is not None and int(found.group(1)) == w.PAPER_LOCK_WAIT_SECS
-    longest = w.START_UP_SECS + w.ADAPTER_CALL_SECS + w.LONGEST_WINDOW_SECS + after_end
+    longest = (
+        w.START_UP_SECS + w.ADAPTER_CALL_SECS + w.LONGEST_WINDOW_SECS + w.SKEW_SECS + after_end
+    )
     assert longest <= w.PAPER_LOCK_WAIT_SECS
     # and inside `paper:session`'s own deadline, which counts its wait for the lock
     session = tasks["paper:session"]
@@ -2037,10 +2025,10 @@ def test_the_post_end_bound_fits_the_end_margin_the_stale_record_and_the_paper_l
 
 
 def test_a_window_is_shortened_to_fit_the_lock_wait_and_says_so() -> None:
-    """A window of the 60 minutes `--minutes` allows runs `LONGEST_WINDOW_SECS` (about 56 minutes), and
+    """A window of the 60 minutes `--minutes` allows runs `LONGEST_WINDOW_SECS` (about 51 minutes), and
     its record says why; one the session clips says that instead; a scheduled 30 is not shortened."""
     w = session_window
-    assert 55 * 60 < w.LONGEST_WINDOW_SECS < 60 * 60
+    assert 50 * 60 < w.LONGEST_WINDOW_SECS < 60 * 60
     seconds, why = w.window_seconds(60, session_left=4 * 3600)
     assert seconds == w.LONGEST_WINDOW_SECS
     assert why.startswith("shortened from 60 minutes") and "3900 s wait" in why
@@ -2870,3 +2858,399 @@ def test_a_late_node_sell_after_a_filled_lost_close_is_canceled(fake_time) -> No
         cast(TradingClient, account), WindowConfig(), report, node_ids=["exit-late"]
     )
     assert "cancel n-2" in account.calls and left == []
+
+
+# Four further independent reviews of the check (2026-11-10): each shown here before its fix.
+
+
+class SlowRefusing(Slow):
+    """`Slow`, holding one share and no order: every close is refused, so the check closes again on each
+    poll until its deadline."""
+
+    def get_orders(self, filter=None) -> list:
+        self._took("orders")
+        return []
+
+
+def test_the_last_close_and_the_whole_check_are_inside_the_counted_bounds(fake_time) -> None:
+    """The end margin's and the lock's arithmetic were asserted from the constants' own definitions, which
+    cannot fail; here they are measured against a check whose every call takes a full request."""
+    w = session_window
+    account = SlowRefusing(fake_time, per_call=w.REQUEST_SECS)
+    report = w.WindowReport("regular", "SPY", started="t")
+    w._flatten_after_stop(cast(TradingClient, account), WindowConfig(), report)
+    after_calls = w.STOP_TIMEOUT_SECS + w.ADAPTER_CALL_SECS  # before the check starts
+    closes = [at for at, name in account.calls if name == "close"]
+    assert closes and after_calls + max(closes) <= w.LAST_CLOSE_SECS
+    assert w.END_MARGIN_SECS >= w.LAST_CLOSE_SECS + 60
+    assert after_calls + fake_time.now <= w.AFTER_END_SECS
+
+
+class SlowReads(Holding):
+    """One share held and no order; each read takes `per_read` seconds of `FakeTime`, the close answers at
+    once and fills."""
+
+    def __init__(self, fake: FakeTime, per_read: float) -> None:
+        super().__init__()
+        self.orders = []
+        self.fake = fake
+        self.per_read = per_read
+
+    def get_clock(self) -> Clock:
+        self.fake.now += self.per_read
+        return super().get_clock()
+
+    def get_orders(self, filter=None) -> list:
+        self.fake.now += self.per_read
+        return []
+
+    def close_position(self, symbol):
+        self.calls.append(f"close {symbol}")
+        self.qty = 0
+        return SimpleNamespace(id="c-1")
+
+
+def test_three_slow_reads_do_not_starve_the_close(monkeypatch, fake_time) -> None:
+    """Reads of orders, position and clock at 21 s each used the 60 s up before the first close."""
+    monkeypatch.setattr(
+        session_window,
+        "position_qty",
+        lambda t, s: setattr(fake_time, "now", fake_time.now + 21) or Decimal(t.qty),
+    )
+    account = SlowReads(fake_time, per_read=21)
+    report = session_window.WindowReport("regular", "SPY", started="t")
+    left = session_window._flatten_after_stop(cast(TradingClient, account), WindowConfig(), report)
+    assert account.calls == ["close SPY"] and report.closed_after_stop
+    assert left == []
+
+
+class QueuedLate(Holding):
+    """One share held, no order; the check's close is taken in its last poll just as the session closes,
+    and queues as a DAY order; nothing after that is read before the deadline but the final reading."""
+
+    def __init__(self, fake: FakeTime) -> None:
+        super().__init__()
+        self.orders = []
+        self.fake = fake
+
+    def get_orders(self, filter=None) -> list:
+        return list(self.orders)
+
+    def cancel_order_by_id(self, order_id) -> None:
+        self.calls.append(f"cancel {order_id}")
+        self.orders = [o for o in self.orders if o.id != order_id]
+
+    def close_position(self, symbol):
+        if self.fake.now < session_window.AFTER_STOP_SECS - 3:
+            self.calls.append("close refused")
+            raise APIError(
+                '{"code": 40310000, "message": "insufficient qty available"}',
+                SimpleNamespace(response=SimpleNamespace(status_code=403)),
+            )
+        self.calls.append(f"close {symbol}")
+        self.orders = [SimpleNamespace(id="c-1", client_order_id="close-1")]
+        self.is_open = False
+        self.fake.now += 2  # past the deadline
+        return SimpleNamespace(id="c-1")
+
+
+def test_an_order_first_seen_in_the_final_reading_is_canceled(fake_time) -> None:
+    """The reading after the deadline was never acted on: a close that queued as the session closed,
+    first seen there, was left working after the process exited."""
+    account = QueuedLate(fake_time)
+    report = session_window.WindowReport("regular", "SPY", started="t")
+    left = session_window._flatten_after_stop(cast(TradingClient, account), WindowConfig(), report)
+    assert account.calls[-1] == "cancel c-1" and account.orders == []
+    assert left == ["open order close-1", "position of 1 SPY"]
+
+
+def test_a_window_whose_start_up_reads_ran_into_its_end_is_skipped(
+    monkeypatch, fake_time, tmp_path
+):
+    """The time left was judged from Alpaca's clock before the calendar and flatness reads; reads that took
+    longer than what was left built and ran a node after its planned end, and could record ok."""
+
+    class SlowFlat(Account):
+        qty = 0
+
+        def get_orders(self, filter=None) -> list:
+            fake_time.now += 150
+            return []
+
+    # 100 s of window left after the end margin and the wind-down, then 150 s of reads
+    left = session_window.END_MARGIN_SECS + session_window.FLATTEN_SECS + 100
+    closes = datetime(2026, 11, 10, 16, 0, tzinfo=NEW_YORK)
+    near_close = clock(closes - timedelta(seconds=left), is_open=True)
+    monkeypatch.setattr(
+        session_window, "window_node", lambda *a, **k: pytest.fail("a node was built")
+    )
+    with pytest.raises(session_window.WindowSkipped, match="start-up"):
+        session_window.run_window(
+            WindowConfig(log_dir=tmp_path),
+            trading=cast(TradingClient, SlowFlat()),
+            market=(near_close, CALENDAR),
+        )
+
+
+def test_the_reads_after_the_clock_are_inside_the_window_not_after_it(
+    monkeypatch, tmp_path
+) -> None:
+    """The window's end is Alpaca's clock reading plus its length, an absolute time the node runs to:
+    the reads after the clock eat into the window, and the lock's arithmetic counts only the first."""
+    w = session_window
+    handed: list = []
+    monkeypatch.setattr(w, "_ABANDONED", [])
+    monkeypatch.setattr(w, "window_node", lambda config, **kw: ran_node(Hung()))
+    monkeypatch.setattr(w, "_run_node", lambda node, ends: handed.append(ends))
+    monkeypatch.setattr(w, "_flatten_after_stop", lambda *a, **k: [])
+    at = datetime(2026, 11, 10, 10, 0, tzinfo=NEW_YORK)
+    w.run_window(
+        WindowConfig(log_dir=tmp_path, minutes=60),
+        trading=cast(TradingClient, Account()),
+        market=(clock(at, is_open=True), CALENDAR),
+    )
+    assert handed == [at.astimezone(UTC) + timedelta(seconds=w.LONGEST_WINDOW_SECS)]
+
+
+def test_a_refusal_whose_records_cannot_be_written_still_says_why(monkeypatch, tmp_path, capsys):
+    """A heartbeat or record that could not be written (the log folder gone) replaced the run's own
+    error, so nothing named the refusal."""
+    heartbeat = session_window.write_heartbeat
+
+    def unwritable(log_dir, outcome):
+        if outcome.startswith("refused"):
+            raise PermissionError("read-only file system")
+        heartbeat(log_dir, outcome)
+
+    def refused(config, **kwargs):
+        raise session_window.WindowRefused("the paper account is not flat in SPY")
+
+    monkeypatch.setattr(session_window, "write_heartbeat", unwritable)
+    monkeypatch.setattr(session_window, "run_window", refused)
+    assert session_window.main(["--log-dir", str(tmp_path)]) == 1
+    err = capsys.readouterr().err
+    assert "not flat in SPY" in err and "could not be written" in err
+
+
+def test_the_wait_for_a_worker_call_is_paid_once() -> None:
+    """A clean stop with a worker still running waited `ADAPTER_CALL_SECS`, then the check waited for the
+    same call again."""
+    import threading
+
+    release = threading.Event()
+    calls = session_window.Calls()
+    calls.submit(release.wait, 30)
+    try:
+        calls.until = None
+        session_window.ADAPTER_CALL_SECS, saved = 0.2, session_window.ADAPTER_CALL_SECS
+        try:
+            import time
+
+            started = time.monotonic()
+            assert calls.settle()  # the first wait, about 0.2 s
+            assert calls.settle()  # the second ends at once
+            assert time.monotonic() - started < 0.35
+        finally:
+            session_window.ADAPTER_CALL_SECS = saved
+    finally:
+        release.set()
+
+
+def test_a_node_that_ends_with_its_own_error_does_not_wait_300_s_on_a_worker(monkeypatch) -> None:
+    import threading
+    import time
+
+    release = threading.Event()
+
+    class Broken:
+        async def run_async(self) -> None:
+            import asyncio
+
+            asyncio.ensure_future(asyncio.to_thread(release.wait, 30))
+            await asyncio.sleep(0.05)
+            raise RuntimeError("the node failed")
+
+        def handle(self):
+            return SimpleNamespace(stop=lambda: None)
+
+    monkeypatch.setattr(session_window, "_ABANDONED", [])
+    monkeypatch.setattr(session_window, "ADAPTER_CALL_SECS", 0.2)
+    started = time.monotonic()
+    try:
+        with pytest.raises(RuntimeError, match="the node failed"):
+            session_window._run_node(cast(Any, Broken()), datetime(2100, 1, 1, tzinfo=UTC))
+        assert time.monotonic() - started < 5 and len(session_window._ABANDONED) == 1
+    finally:
+        release.set()
+
+
+BLOCKED_WORKER = """
+import asyncio, json, sys, threading
+from datetime import UTC, datetime
+from decimal import Decimal
+from types import SimpleNamespace
+from canon_trading import session_window
+
+class Clean:
+    cache = SimpleNamespace(orders=lambda **kwargs: [])
+    async def run_async(self):
+        asyncio.ensure_future(asyncio.to_thread(threading.Event().wait))  # blocks for ever
+        await asyncio.sleep(0.05)
+    def handle(self):
+        return SimpleNamespace(stop=lambda: None)
+    def dispose(self):
+        pass
+
+class Flat:
+    def get_clock(self):
+        from alpaca.trading.models import Clock
+        return Clock(timestamp=datetime.now(UTC), is_open=True,
+                     next_open=datetime(2100, 1, 1, tzinfo=UTC), next_close=datetime(2100, 1, 1, tzinfo=UTC))
+    def get_calendar(self, filters=None):
+        return []
+    def get_orders(self, filter=None):
+        return []
+    def get_open_position(self, symbol):
+        from alpaca.common.exceptions import APIError
+        raise APIError('{"code": 40410000}', SimpleNamespace(response=SimpleNamespace(status_code=404)))
+
+session_window.ADAPTER_CALL_SECS = 0.3
+session_window.paper_trading = lambda: Flat()
+s = SimpleNamespace(dropped=[], history_bars=0, history_dropped=0)
+cap = SimpleNamespace(checks=1, peak=Decimal(0), tripped=None)
+session_window.window_node = lambda config, **kw: (Clean(), s, cap)
+session_window.window_seconds = lambda minutes, left: (130.0, "")
+session_window.FLATTEN_SECS = 1
+real = session_window._run_node
+session_window._run_node = lambda node, ends: real(node, datetime.now(UTC))
+code = session_window.main(["--session", "regular", "--log-dir", sys.argv[1]])
+print("not reached", code)
+"""
+
+
+def test_a_blocked_worker_after_a_clean_stop_ends_the_process_recorded_failed(tmp_path) -> None:
+    """A worker thread blocked for ever after a clean stop held the interpreter's exit, and the paper
+    lock with it, until mise's deadline; the process now ends with the window recorded failed."""
+    import subprocess
+    import sys
+
+    try:
+        child = subprocess.run(
+            [sys.executable, "-c", BLOCKED_WORKER, str(tmp_path)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail("the process still waits on a blocked worker after a clean stop")
+    assert child.returncode == 1 and "not reached" not in child.stdout, child.stderr[-2000:]
+    latest = json.loads((tmp_path / "latest.json").read_text())
+    assert latest["result"].startswith("failed: StopTimedOut: a worker call of the node still ran")
+
+
+def test_an_order_in_doubt_done_for_the_day_is_canceled_as_working(fake_time) -> None:
+    """`done_for_day` can still be updated and canceled (orders-at-alpaca, "Order Lifecycle"): the check
+    cancels it, and it is terminal once canceled."""
+
+    class DoneForDay(Holding):
+        def __init__(self) -> None:
+            super().__init__()
+            self.orders, self.qty = [], 0
+            self.status = "done_for_day"
+
+        def get_order_by_client_id(self, client_id):
+            return SimpleNamespace(id="n-1", client_order_id=client_id, status=self.status)
+
+        def get_orders(self, filter=None) -> list:
+            return []
+
+        def cancel_order_by_id(self, order_id) -> None:
+            self.calls.append(f"cancel {order_id}")
+            self.status = "canceled"
+
+    account = DoneForDay()
+    report = session_window.WindowReport("regular", "SPY", started="t")
+    left = session_window._flatten_after_stop(
+        cast(TradingClient, account), WindowConfig(), report, in_doubt=["entry-1"]
+    )
+    assert account.calls == ["cancel n-1"] and left == []
+
+
+class CloseInTheLastPoll(Holding):
+    """One share held; the check's close is answered in its last poll and is still open (unfilled) in the
+    reading after the deadline, with the session open."""
+
+    def __init__(self, fake: FakeTime) -> None:
+        super().__init__()
+        self.orders = []
+        self.fake = fake
+
+    def get_orders(self, filter=None) -> list:
+        return list(self.orders)
+
+    def cancel_order_by_id(self, order_id) -> None:
+        self.calls.append(f"cancel {order_id}")
+        self.orders = [o for o in self.orders if o.id != order_id]
+
+    def close_position(self, symbol):
+        if self.fake.now < session_window.AFTER_STOP_SECS - 3:
+            raise insufficient()
+        self.calls.append(f"close {symbol}")
+        self.orders = [SimpleNamespace(id="c-1", client_order_id="alpaca-1")]
+        self.fake.now += 2
+        return SimpleNamespace(id="c-1")
+
+
+def test_the_checks_own_close_seen_last_is_left_to_fill_in_the_session(fake_time) -> None:
+    account = CloseInTheLastPoll(fake_time)
+    report = session_window.WindowReport("regular", "SPY", started="t")
+    session_window._flatten_after_stop(cast(TradingClient, account), WindowConfig(), report)
+    assert "close SPY" in account.calls and "cancel c-1" not in account.calls
+
+
+def test_the_auto_paths_clock_read_counts_in_the_time_left(
+    monkeypatch, fake_time, tmp_path
+) -> None:
+    """With `--session auto` the clock is read in `_main`; the calendar read after it took time the
+    window's own measure did not see."""
+
+    class FlatAccount(Account):
+        qty = 0
+
+    left = session_window.END_MARGIN_SECS + session_window.FLATTEN_SECS + 100
+    closes = datetime(2026, 11, 10, 16, 0, tzinfo=NEW_YORK)
+    market = (clock(closes - timedelta(seconds=left), is_open=True), CALENDAR)
+
+    def slow_session_now(trading):
+        fake_time.now += 150  # the calendar read with alpaca-py's retries
+        return market
+
+    monkeypatch.setattr(session_window, "paper_trading", lambda: FlatAccount())
+    monkeypatch.setattr(session_window, "session_now", slow_session_now)
+    monkeypatch.setattr(
+        session_window, "window_node", lambda *a, **k: pytest.fail("a node was built")
+    )
+    assert session_window.main(["--session", "auto", "--log-dir", str(tmp_path)]) == 0
+    heard = json.loads((tmp_path / "last-firing.json").read_text())
+    assert heard["outcome"].startswith("skipped: the start-up reads")
+
+
+def test_a_refusal_is_recorded_though_its_heartbeat_cannot_be_written(
+    monkeypatch, tmp_path
+) -> None:
+    heartbeat = session_window.write_heartbeat
+
+    def unwritable(log_dir, outcome):
+        if outcome.startswith("refused"):
+            raise PermissionError("read-only file")
+        heartbeat(log_dir, outcome)
+
+    def refused(config, **kwargs):
+        raise session_window.WindowRefused("the paper account is not flat in SPY")
+
+    monkeypatch.setattr(session_window, "write_heartbeat", unwritable)
+    monkeypatch.setattr(session_window, "run_window", refused)
+    assert session_window.main(["--log-dir", str(tmp_path)]) == 1
+    latest = json.loads((tmp_path / "latest.json").read_text())
+    assert latest["result"].startswith("refused: the paper account is not flat")
