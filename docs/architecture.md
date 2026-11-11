@@ -137,8 +137,8 @@ daily bars (ADR 0048).
   needs a review note, recorded as the `review` status (ADR 0014, ADR 0017, ADR 0019).
 * **Reviewer benchmark.** Past commits whose defects a fix and a failing test later confirmed, one brief
   for every reviewer, found-or-missed scoring by two scorers (`evals/review/`, ADR 0046). First run
-  2026-11-10, scored in `evals/review/runs/2026-11-10-first/`; the cases hold 21 confirmed defects, 10 in
-  `order-modify`.
+  2026-11-10, scored in `evals/review/runs/2026-11-10-first/`; the cases hold 23 confirmed defects, 10 in
+  `order-modify` and 10 in `trial-ledger-gate`.
 * **Context layers.** None adopted: the runtimes read `AGENTS.md` and take MCP servers, none configured;
   OpenViking, WeKnora, Serena and Context7 are watched until a reviewer trial on the benchmark shows a
   gain (ADR 0051).
