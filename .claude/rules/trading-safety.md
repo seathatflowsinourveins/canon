@@ -21,6 +21,8 @@ paths:
   account B's, stored beside it with `paper:store windows`, reaches only `mise run paper:session`, by hand
   or from the scheduled agent (ADR 0044, ADR 0050, ADR 0069), `mise run paper:long-only windows`,
   `mise run paper:account windows` and `mise run paper:close windows`.
+  `mise run paper:history <tests|windows>` reads either one, GET only in data-only mode, a historical
+  load that neither trades nor streams (ADR 0093).
   No task reads both pairs. `paper:long-only <account> <check|on|off>` reads, or sets, Alpaca's long-only
   setting and prints only its value; `paper:account <account>` reads, GET only, and prints the account's
   balances, positions, open orders with their lineage (ours or foreign) and `no_shorting`, never an account

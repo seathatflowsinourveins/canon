@@ -61,6 +61,7 @@ dependency, pattern and practice traces to a pinned upstream or a dated source. 
 | `mise run paper:account tests\|windows` | Print one paper account, GET only: equity, cash, buying power, each position, each open order with whether its client order ID is of our nodes' lineage or foreign, and `no_shorting`; no account number or order ID (`src/canon_trading/custody.py`) |
 | `mise run paper:close tests\|windows` | By hand, under the account's lock: cancel each open order of our nodes' lineage and close, one attempt each, the long our orders opened (a DAY market sell in the regular session, else a DAY limit marked extended hours through the latest quote, canceled after 60 s); a symbol with a foreign order, a short or a quantity ours did not open is frozen and named, and nothing in it but our own open orders is touched; exit 0 flat, 1 something of ours left, 2 only frozen symbols (`src/canon_trading/custody.py`) |
 | `mise run paper:data sandbox` | Run the sandbox node (`--minutes`, at most 60): NautilusTrader's sandbox execution client on Alpaca's live data with account A's pair, every request but GET refused and no Alpaca execution client; `quotes` is listed and refused until it is built (ADR 0070) |
+| `mise run paper:history <tests\|windows>` | Load historical `sip` minute and day bars for `--symbols` or `--symbols-file` over a bounded `--start`/`--end` into a catalog root (`--catalog`, default `catalog/`), with one account's pair, GET only, paced by ADR 0093's row, no lock; a 429 or a refused feed stops it by name (ADR 0093) |
 
 ## Layout
 

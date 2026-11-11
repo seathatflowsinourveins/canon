@@ -563,6 +563,49 @@ data() {
 data "$@"
 '''
 
+# The historical bars load (docs/adr/0093-paper-history-a-paced-get-only-bars-load.md): one paper account's
+# pair, `tests` (A, as paper:test reads it) or `windows` (B, as paper:session reads it), into this task's
+# environment only; neither value is printed. A GET-only history load neither trades nor streams, so either
+# account's pair may serve it (ADR 0093, the decision of 2026-11-11). It runs canon_trading.history_load in
+# data-only mode (ADR 0070): every request but GET is refused before it is sent. It places nothing and opens
+# no stream, so it takes no account's lock and no stream lock. The module paces its GETs by ADR 0093's
+# row, stops by name at a 429, names `sip` on every request and never falls back to another feed. The run is
+# held to `deadline` seconds by timeout(1) -s KILL. Trades are refused until the adapter can request them.
+[tasks."paper:history"]
+description = "Load historical sip bars for listed symbols into a catalog root with one paper account's pair, GET only, paced"
+shell = "bash -c"
+timeout = "6h"
+usage = '''
+arg "<account>" help="tests: account A's pair; windows: account B's pair (ADR 0069, ADR 0093)" {
+  choices "tests" "windows"
+}
+flag "--symbols <symbols>" help="symbols, comma-separated (or --symbols-file)"
+flag "--symbols-file <file>" help="a file of symbols, one a line"
+flag "--start <start>" help="ISO 8601 with a time zone; required"
+flag "--end <end>" help="ISO 8601 with a time zone; required, at least 15 minutes (1-MINUTE) or a day (1-DAY) before now"
+flag "--bars <bars>" help="1-MINUTE, 1-DAY or both, comma-separated" default="1-MINUTE,1-DAY"
+flag "--catalog <root>" help="the catalog root; never under ledger/" default="catalog"
+flag "--data <kind>" help="bars; trades is not built yet (ADR 0093)" default="bars" {
+  choices "bars" "trades"
+}
+'''
+run = '''
+deadline=21000
+case "${usage_account:-}" in
+  tests) svc=canon-alpaca-paper ;;
+  windows) svc=canon-alpaca-paper-windows ;;
+  *) echo "paper:history: no paper account named '${usage_account:-}'; the names are tests and windows; nothing was read" >&2; exit 3 ;;
+esac
+set -- --start "${usage_start:-}" --end "${usage_end:-}" --bars "${usage_bars:-1-MINUTE,1-DAY}" --catalog "${usage_catalog:-catalog}" --data "${usage_data:-bars}"
+[ -z "${usage_symbols:-}" ] || set -- "$@" --symbols "$usage_symbols"
+[ -z "${usage_symbols_file:-}" ] || set -- "$@" --symbols-file "$usage_symbols_file"
+ALPACA_API_KEY="$(/usr/bin/timeout 30 /usr/bin/security find-generic-password -s "$svc" -a ALPACA_API_KEY -w)" || ALPACA_API_KEY=""
+ALPACA_SECRET_KEY="$(/usr/bin/timeout 30 /usr/bin/security find-generic-password -s "$svc" -a ALPACA_SECRET_KEY -w)" || ALPACA_SECRET_KEY=""
+[ -n "$ALPACA_API_KEY" ] && [ -n "$ALPACA_SECRET_KEY" ] || { echo "paper:history: account ${usage_account}'s pair is not in the login keychain (mise run paper:check ${usage_account}); nothing was read" >&2; exit 1; }
+export ALPACA_API_KEY ALPACA_SECRET_KEY CANON_ALPACA_DATA_ONLY=1
+exec /usr/bin/timeout -s KILL "$deadline" uv run --locked python -m canon_trading.history_load "$@"
+'''
+
 # Alpaca's long-only account setting on one paper account (`no_shorting`, "If true, account becomes long-only
 # mode": https://docs.alpaca.markets/us/reference/patchaccountconfig-1.md; alpaca-py 0.45.0's
 # `get_account_configurations` and `set_account_configurations`). A window never opens a short, and its start

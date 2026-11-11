@@ -27,6 +27,7 @@ import pytest
 from alpaca.data.enums import DataFeed
 from canon_alpaca.constants import ENV_API_KEY
 from canon_alpaca.constants import ENV_SECRET_KEY
+from canon_alpaca.providers import parse_equity
 from nautilus_trader.core.datetime import dt_to_unix_nanos
 from nautilus_trader.model import BarType
 from nautilus_trader.model import Equity
@@ -287,3 +288,15 @@ def test_a_feed_given_as_alpaca_s_enum_is_named_by_its_value_and_a_damaged_feed_
     (tmp_path / FEED_FILE).write_text("", encoding="ascii")
     with pytest.raises(ValueError, match="alpaca-feed names '', not one of .*damaged"):
         load_bars(HOURLY, FIRST_OPEN, FIRST_OPEN + 2 * HOUR, tmp_path, feed="sip")
+
+
+def test_a_root_holding_only_instrument_definitions_holds_no_feed_yet(venue, tmp_path: Path) -> None:
+    """The asset list load writes definitions alone (`data/equity/`); they are no feed's data, so the first
+    bars load into that root names its feed, `sip` included."""
+    ParquetDataCatalog(str(tmp_path)).write_instruments(
+        [parse_equity(standins.asset(symbol="MSFT"), 0)]
+    )
+
+    assert catalog_feed(tmp_path) is None
+    load_bars(HOURLY, FIRST_OPEN, FIRST_OPEN + 5 * HOUR, tmp_path, feed="sip")
+    assert catalog_feed(tmp_path) == "sip"
