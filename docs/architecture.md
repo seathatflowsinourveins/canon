@@ -101,6 +101,10 @@ daily bars (ADR 0048).
 5. At start-up the client reports orders, fills from Alpaca's fill activities, open positions, and each
    loaded instrument without a position as flat, for reconciliation (package README, ADR 0024).
 
+A node can take NautilusTrader's sandbox execution client in place of the Alpaca one, matching orders
+locally on the data client's live data; nothing in `src/` builds one yet (ADR 0070; the lanes: ADR 0068,
+`proposed`).
+
 ## Safety boundaries
 
 * **Paper only.** `AlpacaExecutionClientConfig` refuses `paper` other than `True`, any `url_override`
