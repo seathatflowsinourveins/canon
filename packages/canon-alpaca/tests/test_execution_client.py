@@ -5271,3 +5271,49 @@ def test_under_the_own_reading_a_chain_with_an_unlisted_middle_fill_is_left_to_t
     run_with_client(body)
 
     assert reports == []
+
+
+# -- what paper showed of a replace (ADR 0042, 2026-11-10 New York, overnight) ----------------------
+
+
+def test_a_partly_filled_order_replaced_as_paper_shows_it_ends_filled_on_the_stream(venue) -> None:
+    # Paper, 2 of 2 runs: one share of a buy of 2 fills, the order is replaced, and the answer is the
+    # replacement `partially_filled`, with the order's `qty` and the fill before it; Alpaca then sends
+    # `replaced` for the old order and the replacement's `fill`, with no `new` before it, its order's
+    # `filled_qty` the chain's. The node's order keeps its quantity and ends filled with 2.
+    venue.trading.script = "accept"
+    venue.trading.replace_script = "silent"
+    strategy = modifier(prices=[])  # the test sends the modify, after the fill
+    held: list = []
+
+    async def partly_filled_replaced_filled(client) -> None:
+        old = placed_order(venue, 0)
+        venue.trading.update(
+            old["id"], "partial_fill", 1, status="partially_filled", filled_qty="1"
+        )
+        await until_named(strategy, "OrderFilled")
+        await settled(client, venue)
+        cached = client.cache.order(strategy.client_order_id)
+        await client._modify_order(
+            SimpleNamespace(
+                client_order_id=strategy.client_order_id,
+                venue_order_id=cached.venue_order_id,
+                quantity=None,
+                price=Price.from_str("150.50"),
+                trigger_price=None,
+            )
+        )
+        new = placed_order(venue, 1)
+        held.append((new["status"], new["qty"], new["filled_qty"]))  # the answer, as paper gave it
+        venue.trading.confirm_replace(old["id"])
+        venue.trading.update(new["id"], "fill", 1, status="filled", filled_qty="2")
+        await settled(client, venue)
+        cached = client.cache.order(strategy.client_order_id)
+        held.append((cached.status, cached.quantity.as_double(), cached.filled_qty.as_double()))
+
+    run_modify(
+        venue, strategy, lambda: "OrderAccepted" in strategy.names(), partly_filled_replaced_filled
+    )
+
+    assert held == [("partially_filled", "2", "1"), (OrderStatus.FILLED, 2.0, 2.0)]
+    assert strategy.names()[-2:] == ["OrderUpdated", "OrderFilled"], strategy.names()
