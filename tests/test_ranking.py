@@ -38,6 +38,7 @@ import optuna
 import pytest
 from nautilus_trader.model import BarType
 from nautilus_trader.model import Quantity
+from optuna.study import StudyDirection
 from optuna.trial import TrialState
 from skfolio import Portfolio
 from skfolio import measures
@@ -157,6 +158,7 @@ def write(
     extra_session_days: int = 0,
     attrs: dict[str, object] | None = None,
     drop: tuple[str, ...] = (),
+    also: tuple[float, ...] = (),
 ) -> int:
     """Record one trial of the configuration `label` as the ledger does; `returns` start at day `first_day`.
 
@@ -164,6 +166,7 @@ def write(
     as `label` in what `rank` says, and the run's bounds are the current sample's, as `record_trial`
     writes them. `attrs` then replaces attributes and `drop` leaves some out, for a record not in that
     shape; a `config_key` in `attrs` replaces the key, for a record whose config is not its key's.
+    `also` adds values to the one told, for a study with more than one objective.
     """
     key = None if label is None else key_of(label)
     stored = (attrs or {}).get("config")
@@ -208,7 +211,7 @@ def write(
     if outcome == IDLE or not told_complete or not math.isfinite(value):
         study.tell(trial, state=TrialState.FAIL)  # as `record_trial` tells a ratio not finite
     else:
-        study.tell(trial, value)
+        study.tell(trial, [value, *also] if also else value)
     return trial.number
 
 
@@ -567,7 +570,7 @@ def test_a_record_with_a_key_cannot_be_marked_not_run(study: optuna.Study) -> No
         pytest.param(None, [str(DAY_0)], "returns_series is NoneType", id="no returns"),
         pytest.param({"--5": 0.01}, [str(DAY_0)], "key '--5'", id="two minus signs"),
         pytest.param({"\u00b2": 0.01}, [str(DAY_0)], "key '\u00b2'", id="superscript digit"),
-        pytest.param({str(DAY_0): 10**400}, [str(DAY_0)], "is not a number", id="huge integer"),
+        pytest.param({str(DAY_0): 10**400}, [str(DAY_0)], "is not a float", id="huge integer"),
     ],
 )
 def test_a_record_not_in_the_writers_shape_stops_naming_it(
@@ -1884,4 +1887,236 @@ def test_a_marked_waiting_record_told_fail_with_the_retirement_s_note_still_stop
     study.tell(taken, state=TrialState.FAIL)
 
     with pytest.raises(RankingStopped, match=rf"#{number} \(fail\) [^\n]*after its mark"):
+        rank(study)
+
+
+@pytest.mark.parametrize(
+    "directions",
+    [[StudyDirection.MAXIMIZE, StudyDirection.MAXIMIZE], [StudyDirection.MINIMIZE]],
+    ids=["two objectives", "minimized"],
+)
+def test_a_study_not_of_the_ledger_s_one_maximized_objective_is_refused_by_name(
+    tmp_path: Path, directions: list[StudyDirection]
+) -> None:
+    """Codex, gate round 4: a study of two objectives, with the ledger's sample, opened, and the
+    three passing records each told `[its Sharpe ratio, 123.0]`, ranked at N = 3, DSR 0.988485, as
+    the one-objective study does. `record_trial` tells one value, the Sharpe ratio, so a record told
+    two is another writer's, and a study of other directions than `create_ledger_study`'s one
+    `MAXIMIZE` is no ledger study: `open_study` refuses it before any run, and the ranking of one
+    opened another way stops naming it and each record told two values."""
+    path = tmp_path / "trials.db"
+    made = optuna.create_study(
+        study_name="other", storage=f"sqlite:///{path}", directions=directions
+    )
+    sample = canon_trading.ledger.Sample(0, DAY_0, END)
+    made.set_user_attr(canon_trading.ledger.SAMPLES, [canon_trading.ledger._sample_attr(sample)])
+    also = (123.0,) if len(directions) > 1 else ()
+    numbers = [
+        write(made, label, returns, also=also)
+        for label, returns in (("pick", PICK), ("second", SECOND), ("third", THIRD_CLOSE))
+    ]
+
+    refused = pytest.raises(
+        canon_trading.ledger.LedgerNotFound, match="not the ledger's one objective"
+    )
+    with refused, open_study("other", path):
+        pass
+    with pytest.raises(RankingStopped) as stopped:
+        rank(made)
+
+    message = str(stopped.value)
+    named = ", ".join(d.name for d in directions)
+    assert f"has {len(directions)} objectives ({named}), where a ledger study has one" in message
+    for label, number in zip(("pick", "second", "third"), numbers, strict=True):
+        assert bool(re.search(rf"{label}: #{number} [^\n]*was told 2 values", message)) is bool(
+            also
+        )
+
+
+def test_a_record_told_more_than_one_value_is_another_writers() -> None:
+    """Codex, gate round 4: the ledger's rule read a record told two values as `record_trial`'s
+    own, keyed or not, so `mark_not_run` would clear a keyless one and the pass read a keyed one."""
+    told = optuna.trial.create_trial(
+        values=[0.5, 123.0], user_attrs={"config_key": key_of("pick"), "sample": 0}
+    )
+    keyless = optuna.trial.create_trial(values=[0.5, 123.0])
+
+    for trial in (told, keyless):
+        reading = canon_trading.ledger.origin(trial)
+        assert reading.origin is canon_trading.ledger.Origin.FOREIGN
+        assert "was told 2 values" in reading.why
+
+
+@pytest.mark.parametrize("with_queue", [True, False], ids=["queued", "asked"])
+def test_a_keyless_record_with_the_retirement_s_note_is_another_writers(
+    study: optuna.Study, with_queue: bool
+) -> None:
+    """Antigravity, gate round 4: a keyless record another writer started and told `FAIL` with
+    `retire_queued`'s note, unmarked, was read as taken from the queue here, so `mark_not_run`
+    cleared it and the gate passed at N = 3, DSR 0.98849. `retire_queued` takes only a keyed
+    record, so its note on a keyless one is another writer's, and nothing clears it."""
+    write(study, "pick", PICK)
+    write(study, "second", SECOND)
+    write(study, "third", THIRD_CLOSE)
+    if with_queue:
+        study.enqueue_trial({"fast": 6}, user_attrs={"strategy": "custom"})
+    taken = study.ask()
+    if not with_queue:
+        taken.set_user_attr("config_key", "")
+        taken.set_user_attr("strategy", "custom")
+    taken.set_user_attr("error", canon_trading.ledger.RETIRED_NOTE)
+    study.tell(taken, state=TrialState.FAIL)
+    [frozen] = [t for t in study.trials if t.number == taken.number]
+
+    assert canon_trading.ledger.origin(frozen).origin is canon_trading.ledger.Origin.FOREIGN
+    with pytest.raises(RankingStopped, match=rf"#{taken.number} \(fail\) [^\n]*nothing clears it"):
+        rank(study)
+    with pytest.raises(ValueError, match="retire_queued's note"):
+        mark_not_run(study, taken.number)
+    assert "not_run" not in study.user_attrs
+
+
+def test_a_marked_waiting_record_taken_whose_tell_was_refused_is_finished_by_its_mark(
+    study: optuna.Study,
+) -> None:
+    """Antigravity, gate round 4: a keyless record marked while `WAITING`, then taken from Optuna's
+    queue by `record_trial`, which wrote its note and whose `tell` the store refused, stayed
+    `RUNNING`: the gate stopped on it for good and `mark_not_run` refused it, where an unmarked one
+    left so is told `FAIL` by its mark. The mark now finishes the take, and clears it."""
+    write(study, "pick", PICK)
+    write(study, "second", SECOND)
+    write(study, "third", THIRD_CLOSE)
+    study.enqueue_trial({})
+    [number] = [t.number for t in study.trials if t.state == TrialState.WAITING]
+    mark_not_run(study, number)
+    taken = study.ask()  # what `record_trial` does, its `tell` then refused
+    taken.set_user_attr("error", canon_trading.ledger.TAKEN_FROM_QUEUE)
+
+    stop = rf"#{number} \(running\) [^\n]*mark_not_run\(study, {number}\) tells it FAIL"
+    with pytest.raises(RankingStopped, match=stop):
+        rank(study)
+    mark_not_run(study, number)
+
+    assert study.trials[number].state == TrialState.FAIL
+    assert study.user_attrs["not_run_waiting"] == [number]
+    report = rank(study)
+    assert (report.n, report.passed) == (3, True)
+
+
+SCALE = 1e158  # each return about 1e155: finite, its square past float64's largest, about 1.8e308
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        pytest.param(
+            {"pick": PICK, "second": SECOND, "third": [x * SCALE for x in THIRD_WIDE]},
+            id="a rejected study passed",
+        ),
+        pytest.param(
+            {
+                "super": [(0.02 + 0.005 * (-1) ** i) * SCALE for i in range(T)],
+                "pick": PICK,
+                "second": SECOND,
+            },
+            id="the winner inverted",
+        ),
+        pytest.param(
+            {
+                "pick": PICK,
+                "second": [x * SCALE for x in SECOND],
+                "third": [x * SCALE + 1e155 for x in THIRD_CLOSE],
+            },
+            id="N-hat raised ValueError",
+        ),
+    ],
+)
+def test_returns_whose_squares_overflow_stop_by_name(
+    study: optuna.Study, case: dict[str, list[float]]
+) -> None:
+    """Antigravity, gate round 4: finite returns whose squares pass float64's largest made skfolio's
+    standard deviation infinite and the Sharpe ratio 0.0, so a study rejected at DSR 0.69241 passed
+    at 0.97295, a pick of Sharpe ratio 3.93 lost to one of 0.699, and two such trials raised a bare
+    ValueError from N-hat. The series is refused where it enters the gate, naming it."""
+    big = [label for label, returns in case.items() if max(map(abs, returns)) > 1e150]
+    numbers = {label: write(study, label, returns) for label, returns in case.items()}
+
+    with pytest.raises(RankingStopped) as stopped:
+        rank(study)
+
+    message = str(stopped.value)
+    for label in big:
+        assert re.search(
+            rf"{label}: the sum of the squares of its returns is inf[^\n]*\(#{numbers[label]}\)",
+            message,
+        )
+
+
+@pytest.mark.parametrize("bool_first", [True, False], ids=["bool first", "bool second"])
+def test_every_record_of_a_key_has_its_returns_checked_whatever_their_order(
+    study: optuna.Study, bool_first: bool
+) -> None:
+    """Antigravity, gate round 4: two records of one key on the sample, one holding `False` for a
+    day's 0.0, compared equal under Python's `==`, and only the first was read by `daily_series`:
+    the gate stopped with the `False` record first and passed with it second. Every record that ran
+    is now read the same way, so the gate stops either way, naming the record."""
+    write(study, "second", SECOND)
+    write(study, "third", THIRD_CLOSE)
+    zeroed = [0.0, *PICK[1:]]
+    written = {str(DAY_0 + n * DAY_NS): value for n, value in enumerate(zeroed)}
+    with_bool = {**written, str(DAY_0): False}
+    order = [with_bool, written] if bool_first else [written, with_bool]
+    numbers = [
+        write(
+            study,
+            "pick",
+            zeroed,
+            attrs={"returns_series": returns},
+            told_complete=returns is written,
+        )
+        for returns in order
+    ]
+    flagged = numbers[0] if bool_first else numbers[1]
+
+    with pytest.raises(
+        RankingStopped,
+        match=rf"pick: returns_series value False on {DAY_0} is not a float[^\n]*\(#{flagged}\)",
+    ):
+        rank(study)
+
+
+def test_a_return_refused_still_lets_its_key_s_disagreement_be_named(study: optuna.Study) -> None:
+    """Code review of round 4's fix: with every record of a key read, a rejected return hid the
+    key's other stops, so one call no longer named them all. Both are named now."""
+    write(study, "second", SECOND)
+    write(study, "third", THIRD_CLOSE)
+    write(study, "pick", PICK)
+    odd = write(
+        study, "pick", PICK, attrs={"returns_series": {str(DAY_0): True}}, told_complete=False
+    )
+    write(
+        study, "pick", PICK, attrs={"data_digest": {**digest_of("pick"), bars_of("pick"): "0" * 64}}
+    )
+
+    with pytest.raises(RankingStopped) as stopped:
+        rank(study)
+
+    message = str(stopped.value)
+    assert f"pick: returns_series value True on {DAY_0} is not a float" in message
+    assert f"(#{odd})" in message
+    assert "ran the same configuration" in message
+
+
+def test_returns_whose_fourth_central_moment_overflows_stop_by_name(study: optuna.Study) -> None:
+    """Code review of round 4's fix: returns of about 1e80 have finite squares but a fourth central
+    moment past float64's largest, and the gate stopped only on skfolio's DSR of NaN, naming no
+    series. The series is refused where it enters the gate, naming it."""
+    number = write(study, "pick", [x * 1e80 for x in PICK])
+    write(study, "second", SECOND)
+    write(study, "third", THIRD_CLOSE)
+
+    with pytest.raises(
+        RankingStopped,
+        match=rf"pick: skfolio's variance [^\n]*fourth central moment inf[^\n]*\(#{number}\)",
+    ):
         rank(study)

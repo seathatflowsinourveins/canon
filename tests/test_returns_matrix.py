@@ -192,3 +192,29 @@ def test_series_named_by_numbers_that_cover_other_days_are_refused_by_name() -> 
     with pytest.raises(ReturnsRejected, match="1: no return on 1 of the 3 session days") as refused:
         returns_matrix([short, full.rename(2)])
     assert refused.value.names == ("1",)
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        pytest.param(False, "value False on [0-9]+ is not a float", id="bool"),
+        pytest.param(1, "value 1 on [0-9]+ is not a float", id="int"),
+        pytest.param(float("nan"), "return nan on 2025-03-11 is not finite", id="nan"),
+    ],
+)
+def test_a_return_that_is_not_a_finite_float_is_refused(value: object, message: str) -> None:
+    """Antigravity, gate round 4: `record_trial` writes each return as a float, and a `bool` read
+    as equal to 0.0 or 1.0 by another check went through."""
+    returns = {**entry({0: 0.01, 1: 0.02, 2: 0.03}), str(day(0)): value}
+
+    with pytest.raises(ReturnsRejected, match=f"a: [^\n]*{message}"):
+        daily_series("a", returns, sessions(0, 1, 2))
+
+
+def test_returns_whose_squares_overflow_are_refused() -> None:
+    """Antigravity, gate round 4: each return finite, about 1e155, their squares past float64's
+    largest, so skfolio's Sharpe ratio of them read 0.0 rather than failing."""
+    returns = entry({0: 1e155, 1: -2e155, 2: 3e155})
+
+    with pytest.raises(ReturnsRejected, match="a: the sum of the squares of its returns is inf"):
+        daily_series("a", returns, sessions(0, 1, 2))

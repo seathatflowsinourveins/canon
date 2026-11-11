@@ -21,6 +21,21 @@ requires every return of the pick to be finite, and skfolio's `Portfolio` does n
 turns a NaN into 0.0 (observed at 1.12.8 and 1.12.9), so `returns_matrix` refuses one in any series
 it is given as well.
 
+Every return of a ledger record is checked once, where it enters the gate (`daily_series`,
+`_check_returns`): it must be a float, as `record_trial` writes each one (NautilusTrader's `f64`, a
+`float` through JSON), never a `bool` or an `int`, which Python's `==` reads as equal to 0.0 or 1.0;
+it must be finite; the sum of the squares of the series must be finite; and so must the two moments
+of it that skfolio divides by or raises to the fourth power, `measures.variance` and
+`measures.fourth_central_moment`, computed by skfolio itself so that the check rounds as the gate
+does. skfolio's Sharpe ratio is the mean over the sample standard deviation
+(`measures.standard_deviation`, the square root of `measures.variance`, NumPy's `nanvar` with
+`ddof=1`, read in the installed 1.12.9), which squares each deviation in float64: with returns of
+about 1.34e154 or more, each finite, the squares overflow to infinity and the ratio reads 0.0 rather
+than failing (run at 1.12.9, 2026-11-11). The DSR's kurtosis takes the fourth central moment, which
+overflows from returns of about 1e77, and skfolio then gives a DSR of NaN; refused here, the series
+is named instead. `returns_matrix` keeps its own refusal of a return that is not finite, for a series
+given to it directly.
+
 Which upstream call does what:
 
 * `pandas.to_datetime(..., unit="ns", utc=True)` and `pandas.Series`: each trial's session returns,
@@ -32,7 +47,7 @@ Which upstream call does what:
 * `DataFrame.isna`: a day one trial has and another lacks. The rows are the union of the trials' session
   days, so a trial with a NaN did not cover the whole sample, and the matrix is refused.
 
-No statistic is computed here.
+No statistic is computed here; the two moments `_check_returns` takes only refuse a series.
 """
 
 from __future__ import annotations
@@ -45,6 +60,7 @@ import numpy as np
 import pandas as pd
 from skfolio import Population
 from skfolio import Portfolio
+from skfolio import measures
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -88,19 +104,13 @@ def daily_series(name: str, returns: object, session_days: object) -> pd.Series:
             f"{name}: returns_series skips from {gaps[0][0]} to {gaps[0][1]}; the daily portfolio "
             "series has one key for every UTC day",
         )
-    not_finite = [key for key in keys if not math.isfinite(returns[str(key)])]
-    if not_finite:
-        day = not_finite[0]
-        raise ReturnsRejected(
-            f"{name}: return {returns[str(day)]} on "
-            f"{pd.to_datetime(day, unit='ns', utc=True).date()} is not finite",
-        )
+    by_day = _check_returns(name, returns, keys)
     open_days = {int(day) for day in session_days}
-    moved_while_closed = [key for key in keys if key not in open_days and returns[str(key)] != 0.0]
+    moved_while_closed = [key for key in keys if key not in open_days and by_day[key] != 0.0]
     if moved_while_closed:
         day = moved_while_closed[0]
         raise ReturnsRejected(
-            f"{name}: return {returns[str(day)]} on {pd.to_datetime(day, unit='ns', utc=True).date()}, "
+            f"{name}: return {by_day[day]} on {pd.to_datetime(day, unit='ns', utc=True).date()}, "
             "a day with no bar of the run",
         )
     unreturned = sorted(open_days.difference(keys))
@@ -114,7 +124,7 @@ def daily_series(name: str, returns: object, session_days: object) -> pd.Series:
     if not kept:
         raise ReturnsRejected(f"{name}: no return falls on a session day")
     return pd.Series(
-        [float(returns[str(key)]) for key in kept],
+        [by_day[key] for key in kept],
         index=pd.to_datetime(kept, unit="ns", utc=True),
         name=name,
     )
@@ -158,20 +168,50 @@ def is_ns_text(value: object) -> bool:
     )
 
 
-def _is_number(value: object) -> bool:
-    if isinstance(value, bool) or not isinstance(value, int | float):
-        return False
-    try:
-        float(value)
-    except OverflowError:
-        return False
-    return True
+def _check_returns(name: str, returns: dict[str, object], keys: list[int]) -> dict[int, float]:
+    """Each of `returns` by its day, keyed at `keys` in order; refused unless each is a finite float
+    and the sum of their squares is finite (module header): the one check of every return that
+    enters the gate."""
+    checked: dict[int, float] = {}
+    for key in keys:
+        value = returns[str(key)]
+        # A float, as `record_trial` writes each return; `bool` is an `int`, never a `float`.
+        if not isinstance(value, float):
+            raise ReturnsRejected(
+                f"{name}: returns_series value {value!r} on {key} is not a float, as record_trial "
+                "writes each return"
+            )
+        if not math.isfinite(value):
+            raise ReturnsRejected(
+                f"{name}: return {value} on {pd.to_datetime(key, unit='ns', utc=True).date()} is "
+                "not finite",
+            )
+        checked[key] = value
+    squares = sum(value * value for value in checked.values())
+    if not math.isfinite(squares):
+        raise ReturnsRejected(
+            f"{name}: the sum of the squares of its returns is {squares}, past float64's largest, "
+            "so the standard deviation its Sharpe ratio divides by overflows (ADR 0031)",
+        )
+    if len(checked) > 1:  # skfolio's sample variance needs two returns
+        values = np.fromiter(checked.values(), dtype=float)
+        with np.errstate(over="ignore", invalid="ignore"):
+            spread = float(measures.variance(values))
+            fourth = float(measures.fourth_central_moment(values))
+        if not (math.isfinite(spread) and math.isfinite(fourth)):
+            raise ReturnsRejected(
+                f"{name}: skfolio's variance of its returns is {spread} and their fourth central "
+                f"moment {fourth}, one past float64's largest, so its Sharpe ratio or the DSR's "
+                "kurtosis overflows (ADR 0031)",
+            )
+    return checked
 
 
 def _check_shape(
     name: str, returns: object, session_days: object
-) -> tuple[dict[str, float], list[str]]:
-    """Refuse `returns` and `session_days` unless they are in the shape `record_trial` writes."""
+) -> tuple[dict[str, object], list[str]]:
+    """Refuse `returns` and `session_days` unless they are in the shape `record_trial` writes; each
+    return is `_check_returns`'s."""
     if not isinstance(returns, dict):
         raise ReturnsRejected(f"{name}: returns_series is {type(returns).__name__}, not a mapping")
     if not isinstance(session_days, list):
@@ -179,11 +219,6 @@ def _check_shape(
     bad_key = next((key for key in returns if not is_ns_text(key)), _MISSING)
     if bad_key is not _MISSING:
         raise ReturnsRejected(f"{name}: returns_series key {bad_key!r} is not nanoseconds as text")
-    bad = next((key for key, value in returns.items() if not _is_number(value)), _MISSING)
-    if bad is not _MISSING:
-        raise ReturnsRejected(
-            f"{name}: returns_series value {returns[bad]!r} on {bad} is not a number"
-        )
     # A sentinel no JSON value can be: a JSON null in the list is a day this refuses.
     bad_day = next((day for day in session_days if not is_ns_text(day)), _MISSING)
     if bad_day is not _MISSING:

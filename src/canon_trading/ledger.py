@@ -298,7 +298,8 @@ def open_study(name: str, path: Path | None = None) -> Generator[optuna.Study]:
     """Open the study `name` in the ledger at `path`; never create a file, a table or a study.
 
     With no `path`, the ledger is `default_ledger_path()`. A missing file or study raises
-    `LedgerNotFound`, and so do a file that is not an Optuna ledger and a study with no sample. On leaving the `with` block the storage's
+    `LedgerNotFound`, and so do a file that is not an Optuna ledger, a study with no sample and a
+    study whose directions are not the ledger's, one objective maximized. On leaving the `with` block the storage's
     session is removed (`RDBStorage.remove_session`) and its SQLAlchemy engine disposed, so no SQLite
     connection is left for the garbage collector.
     """
@@ -322,6 +323,13 @@ def open_study(name: str, path: Path | None = None) -> Generator[optuna.Study]:
                 "before the sample was written, and create_ledger_study completes it",
             )
         samples(study)
+        if study.directions != [StudyDirection.MAXIMIZE]:
+            # `create_ledger_study` makes one objective, maximized: `record_trial` tells one value.
+            raise LedgerNotFound(
+                f"study {name!r} in the ledger at {path} has directions "
+                f"{[d.name for d in study.directions]}, not the ledger's one objective, MAXIMIZE, "
+                "the Sharpe ratio record_trial tells",
+            )
         _OPENED[study] = path
         try:
             yield study
@@ -1055,12 +1063,16 @@ def retired_numbers(study: optuna.Study) -> set[int]:
 
 
 def carries_a_queue_note(trial: FrozenTrial) -> bool:
-    """Whether `trial` was taken from Optuna's queue with a note this module writes, by `record_trial`
-    (`TAKEN_FROM_QUEUE`) or `retire_queued` (`RETIRED_NOTE`), and is `FAIL` or, its `tell` refused,
-    still `RUNNING`: the states that taking it leaves."""
+    """Whether `trial` was taken from Optuna's queue with a note this module writes on such a record,
+    and is `FAIL` or, its `tell` refused, still `RUNNING`: the states that taking it leaves.
+
+    `record_trial` writes `TAKEN_FROM_QUEUE` on any trial it takes, and `retire_queued` writes
+    `RETIRED_NOTE` only on the keyed record it retires (it refuses a keyless one), so a keyless record
+    carries this module's note only if it is `TAKEN_FROM_QUEUE`."""
+    notes = QUEUE_NOTES if has_key(trial) else (TAKEN_FROM_QUEUE,)
     return (
         trial.state in (TrialState.FAIL, TrialState.RUNNING)
-        and trial.user_attrs.get("error") in QUEUE_NOTES
+        and trial.user_attrs.get("error") in notes
     )
 
 
@@ -1109,13 +1121,17 @@ def origin(trial: FrozenTrial) -> Reading:
     intermediate value and writes no system attribute. This module takes another writer's queued
     trial only through `Study.ask`, and writes on it at once its note (`carries_a_queue_note`), so
     a taken trial holds that writer's attributes beside the note and ran nothing here. Read in this
-    order, by key, state, note and attributes:
+    order, by values, key, state, note and attributes:
 
+    * a record told more than one value is `FOREIGN`: `record_trial` tells one, the Sharpe ratio, on
+      a study of one objective (`canon_trading.ranking` stops on a study of more);
     * a record with no key in the form `record_trial` writes that shows a run (`ran_something`) is
       `FOREIGN`: a trial of an unknown configuration, whatever else it holds;
     * a `WAITING` one is `QUEUED`: another writer queued it, and nothing has started it;
-    * one `FAIL` or `RUNNING` with a queue note is `TAKEN`;
-    * one with a queue note in another state, a system attribute (`Study.enqueue_trial` writes
+    * one `FAIL` or `RUNNING` with a queue note this module writes on it is `TAKEN`: either note on
+      a keyed record, only `record_trial`'s on a keyless one (`carries_a_queue_note`);
+    * one with a queue note in another state, or `retire_queued`'s on a keyless record, which it
+      never takes, a system attribute (`Study.enqueue_trial` writes
       `fixed_params` on every trial it queues), a user attribute `record_trial` does not write on such
       a record, a parameter or an intermediate value is `FOREIGN`: another writer started, told or
       wrote it, outside the queue's take, so it may have run anything;
@@ -1140,6 +1156,12 @@ def origin(trial: FrozenTrial) -> Reading:
     """
     attrs = trial.user_attrs
     keyed = has_key(trial)
+    if trial.values is not None and len(trial.values) != 1:
+        return Reading(
+            Origin.FOREIGN,
+            f"was told {len(trial.values)} values, {trial.values!r}, where record_trial tells one, "
+            "the Sharpe ratio",
+        )
     if not keyed and ran_something(trial):
         return Reading(Origin.FOREIGN, "shows a run, a trial of an unknown configuration")
     if trial.state == TrialState.WAITING:
@@ -1153,6 +1175,12 @@ def origin(trial: FrozenTrial) -> Reading:
             Origin.TAKEN,
             "was taken from Optuna's queue, another writer's queued trial that never ran here and "
             "that no record_trial keys",
+        )
+    if not keyed and attrs.get("error") == RETIRED_NOTE:
+        return Reading(
+            Origin.FOREIGN,
+            "carries retire_queued's note with no config key, though retire_queued takes only a "
+            "keyed record",
         )
     if attrs.get("error") in QUEUE_NOTES:
         return Reading(
@@ -1328,8 +1356,10 @@ def mark_not_run(study: optuna.Study, number: int) -> None:
     supposed to be directly accessed by library users" (`storages/_base.py`). Its number joins
     `not_run_waiting` instead, kept apart because an `ask` may still start it: the ranking leaves it out
     of N only while it is `WAITING`, or once `record_trial` took it from the queue and ran nothing in
-    it (`_own_trial`). One another writer started after its mark may have run anything, so the ranking
-    stops on it and it cannot be marked again. A record that has a key is refused, and so is one
+    it (`_own_trial`). One `record_trial` took whose `tell` was refused, left `RUNNING` with its note
+    (`taken_untold`), is told `FAIL` here, as an unmarked one is, and its mark then clears it. One
+    another writer started after its mark may have run anything, so the ranking stops on it and it
+    cannot be marked again. A record that has a key is refused, and so is one
     `origin` reads as another writer's outside the queue (`FOREIGN`): one that shows a run
     (`ran_something`), a result told by a writer other than `record_trial` included, a trial of an
     unknown configuration; and one another writer started, told or wrote on, which may have run
@@ -1355,6 +1385,10 @@ def mark_not_run(study: optuna.Study, number: int) -> None:
                     "form mark_not_run writes; another writer left it",
                 )
         if number in lists[NOT_RUN_WAITING]:
+            if taken_untold(trial):
+                # `skip_if_finished`: the taker's own `tell` may land first, to the same end.
+                study.tell(number, state=TrialState.FAIL, skip_if_finished=True)
+                return
             if not cleared_while_waiting(trial):
                 raise ValueError(
                     f"trial #{number} was marked not run while WAITING and "
@@ -1381,15 +1415,22 @@ def cleared_while_waiting(trial: FrozenTrial) -> bool:
 
     It is if it is still `WAITING`, or if `record_trial` took it from Optuna's queue and told it
     `FAIL` at once, its error that note and no run shown: `origin` reads it `QUEUED` or, `FAIL`,
-    `TAKEN` with `record_trial`'s note (`retire_queued` never takes a keyless record, so
-    its note on one is another writer's). Anything else is a start or a write by another writer
-    after the mark (`after_its_mark`).
+    `TAKEN`, which on a keyless record is `record_trial`'s note alone (`carries_a_queue_note`). One so
+    taken and left `RUNNING`, its `tell` refused, is `taken_untold`, which `mark_not_run` finishes.
+    Anything else is a start or a write by another writer after the mark (`after_its_mark`).
     """
     reading = origin(trial).origin
-    return reading is Origin.QUEUED or (
-        reading is Origin.TAKEN
-        and trial.state == TrialState.FAIL
-        and trial.user_attrs.get("error") == TAKEN_FROM_QUEUE
+    return reading is Origin.QUEUED or (reading is Origin.TAKEN and trial.state == TrialState.FAIL)
+
+
+def taken_untold(trial: FrozenTrial) -> bool:
+    """Whether `trial`, a keyless record, was taken from Optuna's queue with `TAKEN_FROM_QUEUE`, by
+    `record_trial` or by `retire_queued` on its way to a retired trial, and left `RUNNING`, its `tell`
+    refused (`_tell_taken`): it ran nothing, and `mark_not_run` tells it `FAIL`, marked or not."""
+    return (
+        not has_key(trial)
+        and trial.state == TrialState.RUNNING
+        and origin(trial).origin is Origin.TAKEN
     )
 
 
