@@ -54,7 +54,7 @@ Each configuration is one trial: one `MaCross` on one instrument. `--create` cre
 holding a lock on it, records through `record_trial` each configuration whose latest record on the
 sample did not run to the end (the gate's rule for resolving a key), goes on past a run that raised,
 stops on any other error, and ranks. A configuration that never trades is a trial and stops the
-ranking (ADR 0010, Limits); a record with no key is cleared only by `mark_not_run` (ADR 0041 term 6).
+ranking (ADR 0010, Limits); a record with no key is cleared only by `mark_not_run` (ADR 0053 term 3).
 
 **The sample's start moved before any trial.** The plan's start was 2020-01-02. The first load of that
 window found the IEX daily bars of both symbols begin on 2020-07-27: 1,366 bars each, on the same days,
@@ -142,7 +142,7 @@ recommendation either.
   every version records all eight keys, so that change touches no trial. The bars each trial read
   are identified by their data digests: SPY
   `a0b82593e1401adbd875b142f24c414ad77e3ffa92c6c690bcaff5a02a09ad09`, QQQ
-  `e2e493377d3614bbc3373867b0e789bc353b6322bb032757c3730b1d4457db40` (ADR 0041 term 3).
+  `e2e493377d3614bbc3373867b0e789bc353b6322bb032757c3730b1d4457db40` (ADR 0053 term 1).
 
 ## Evidence
 

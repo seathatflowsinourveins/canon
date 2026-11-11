@@ -58,7 +58,7 @@ flowchart LR
 | Engine | The node: data, risk and execution engines, cache, portfolio; `BacktestNode` for backtests, `LiveNode` for paper | NautilusTrader v2.0.0rc8 | upstream | ADR 0009 |
 | Strategies and node configuration | `MaCross` and `run_backtest` on a simulated `ALPACA` venue; `ema_cross_paper_node`, a paper `LiveNode` running upstream's built-in `EmaCross` under risk limits | NautilusTrader v2.0.0rc8 | `src/canon_trading/` | ADR 0009, 0012, 0037, 0049 |
 | Local data | `ParquetDataCatalog` of bars and instruments, ignored by git, filled from Alpaca by `load_bars` | NautilusTrader v2.0.0rc8 | `catalog/`, `canon_trading/bars_to_catalog.py` | ADR 0012, 0040 |
-| Trial ledger | One Optuna trial per backtest, in a SQLite study over a fixed sample, in the main checkout and shared by every worktree, ignored by git | Optuna v5.0.0 | `canon_trading/ledger.py`, `ledger/` | ADR 0010, 0035, 0041 |
+| Trial ledger | One Optuna trial per backtest, in a SQLite study over a fixed sample, in the main checkout and shared by every worktree, ignored by git | Optuna v5.0.0 | `canon_trading/ledger.py`, `ledger/` | ADR 0010, 0035, 0041, 0053 |
 | Returns matrix | T daily rows, the session days every trial covers over the sample, one column per configuration | pandas v3.1.1; skfolio v1.12.8 `Population` | `canon_trading/returns_matrix.py` | ADR 0010, 0041 |
 | Gate | The pick's deflated Sharpe ratio against 0.95, N = every trial | skfolio v1.12.8 | `canon_trading/ranking.py` | ADR 0010, 0031 |
 
@@ -75,12 +75,12 @@ adapter is a uv workspace member of its own, kept apart from strategies as upstr
    `L1_MBP` bar execution, a zero-rate fee model; no slippage, latency or market-hours model (`backtest.py`).
 3. `record_trial` asks the study for a trial, runs it over the study's sample, and tells it `COMPLETE`
    (traded) or `FAIL` (failed, idle, or traded with a Sharpe ratio that is not finite), with its config
-   key, sample, range, daily returns, session days and data digest (`ledger.py`, ADR 0035, ADR 0041).
+   key, sample, range, daily returns, session days and data digest (`ledger.py`, ADR 0035, ADR 0041, ADR 0053).
 4. `returns_matrix` keeps only daily series and drops closed days; a trial that does not cover every
    session day of the sample stops the ranking, with nothing trimmed, through skfolio's `Population`
    and pandas (`returns_matrix.py`, ADR 0010 step 2, ADR 0041).
 5. `rank` picks the highest Sharpe ratio and rejects it below a DSR of 0.95; it stops on any input
-   ADR 0031, ADR 0035 and ADR 0041 refuse (`ranking.py`).
+   ADR 0031, ADR 0035, ADR 0041 and ADR 0053 refuse (`ranking.py`).
 
 `variant_study.py` runs steps 3 to 5 for one pre-registered plan, eight `MaCross` variants on Alpaca's
 daily bars (ADR 0048).

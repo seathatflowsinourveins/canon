@@ -27,7 +27,7 @@ NautilusTrader v2.0.0rc8 binds no config identity to Python: `BacktestRunConfig.
 UUID4 (`crates/backtest/src/config.rs` at the pinned commit) and the config cannot be serialised. So the
 identity is glue, ADR 0035 term 4: `config_key` is the SHA-256 of the canonical JSON of `trial_config`,
 built from what this repo sets, and the run is built with it as its `id`. Nothing upstream identifies
-the data a run read either, so `data_digest` is glue too (ADR 0041).
+the data a run read either, so `data_digest` is glue too (ADR 0053).
 
 The value told for a run that traded is skfolio's `Portfolio.sharpe_ratio` (1.12.8,
 `portfolio/_base.py`) over the run's own series as `canon_trading.returns_matrix.daily_series` accepts
@@ -120,7 +120,7 @@ IDLE = "idle"
 FAILED = "failed"
 
 # The study user attributes holding the study's samples, oldest first, and the numbers of records
-# that ran no backtest (ADR 0041).
+# that ran no backtest (ADR 0041, ADR 0053 term 3).
 SAMPLES = "samples"
 NOT_RUN = "not_run"
 STRATEGY_CLASS = f"{MaCross.__module__}:{MaCross.__qualname__}"
@@ -409,7 +409,7 @@ def trial_config(
     upstream defaults `MaCrossConfig` never passes on), the venue's name, `VENUE_SETTINGS`, `FEE_RATES`
     and starting balances, and the bar types the run loads, one per instrument as
     `backtest_run_config` derives them. No property upstream reflects is read, so a default that
-    changes with NautilusTrader's pin moves no key. The study's sample is not in it (ADR 0041).
+    changes with NautilusTrader's pin moves no key. The study's sample is not in it (ADR 0053 term 2).
     """
     bar_types = list(dict.fromkeys(str(config.bar_type) for config in strategies))
     return {
@@ -467,7 +467,7 @@ def session_days(bars: Sequence[Bar]) -> list[str]:
 
 
 def data_digest(bars: Sequence[Bar]) -> dict[str, str]:
-    """ADR 0041's identity of the data a run read: for each bar type, a SHA-256 of its bars.
+    """ADR 0053's identity of the data a run read: for each bar type, a SHA-256 of its bars.
 
     The digest of a bar type is that of the UTF-8 bytes of one line per bar, in `bars`' order,
     `bar_type|open|high|low|close|volume|ts_event|ts_init`, the prices and the volume as NautilusTrader
@@ -507,9 +507,9 @@ def record_trial(
 ) -> RecordedTrial:
     """Build a `MaCross` from each config and run them over the study's sample, as one trial.
 
-    ADR 0035 terms 2 and 3 and ADR 0041. The key is computed from the configs first, and the strategies
-    are built from them here, so what is hashed is what runs: a config changed afterwards changes
-    nothing. What `checked_run_config` refuses, or a value with no stable text form, raises before
+    ADR 0035 terms 2 and 3, ADR 0041 and ADR 0053. The key is computed from the configs first, and
+    the strategies are built from them here, so what is hashed is what runs: a config changed
+    afterwards changes nothing. What `checked_run_config` refuses, or a value with no stable text form, raises before
     anything is recorded: such a call is not a trial. The trial is then asked for, so a run that never
     returns stays in the study as `RUNNING`. The run is bounded by the study's current sample and built
     with the key as its `id`; its session days and data digest are those of the bars the run read, as
@@ -521,7 +521,7 @@ def record_trial(
     Every write after the trial is asked for, the outcome and the `tell` included, is inside the `try`
     that tells a failure, so an error or `KeyboardInterrupt` there is told `FAIL` with its error. Only
     a process killed outright, or a store that refuses the very first write, leaves a record with no
-    key; no backtest ran for it, and `mark_not_run` clears it (ADR 0041). Nothing is overwritten: the
+    key; no backtest ran for it, and `mark_not_run` clears it (ADR 0053 term 3). Nothing is overwritten: the
     same configuration again is a new record.
     """
     sample = current_sample(study)
@@ -559,7 +559,7 @@ def record_trial(
         if len(bars) != result.iterations:
             raise RuntimeError(
                 f"the engine's cache holds {len(bars)} bars and the run replayed "
-                f"{result.iterations}, so the data it read cannot be identified (ADR 0041); the "
+                f"{result.iterations}, so the data it read cannot be identified (ADR 0053); the "
                 "catalog may have grown between the count and the replay: record the trial again",
             )
         outside = [bar for bar in bars if not sample.start <= bar.ts_init <= sample.end]
@@ -597,12 +597,12 @@ def record_trial(
 
 
 def _in_order(bars: Sequence[Bar]) -> list[Bar]:
-    """`bars` in a total order: bars that tie on both times by their text (ADR 0041 term 3)."""
+    """`bars` in a total order: bars that tie on both times by their text (ADR 0053 term 1)."""
     return sorted(bars, key=lambda bar: (str(bar.bar_type), bar.ts_init, bar.ts_event, str(bar)))
 
 
 def mark_not_run(study: optuna.Study, number: int) -> None:
-    """Record that trial `number` of `study`, a record with no config key, ran no backtest (ADR 0041).
+    """Record that trial `number` of `study`, a record with no config key, ran no backtest (ADR 0053 term 3).
 
     `record_trial` writes the key before it starts a run, so a record without one ran nothing: it is
     what a process killed between `ask` and that write leaves. The record is kept; a `RUNNING` one is

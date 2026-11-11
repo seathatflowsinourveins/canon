@@ -117,7 +117,7 @@ def grid(
 
 
 def key_of(config: MaCrossConfig, starting_balances: Sequence[str] = STARTING_BALANCES) -> str:
-    """The ledger's config key of a one-strategy trial of `config` (ADR 0041 term 4)."""
+    """The ledger's config key of a one-strategy trial of `config` (ADR 0053 term 2)."""
     return config_key(trial_config([config], starting_balances=starting_balances))
 
 

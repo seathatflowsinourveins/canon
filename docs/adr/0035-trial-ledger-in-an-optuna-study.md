@@ -61,11 +61,11 @@ trial store that meets every driver. Leaving it is cheap, since every trial read
    days on which a bar of the run arrived (one at exactly 00:00 counts for the day ending there, as
    NautilusTrader's daily series books it), read from the catalog, since `BacktestResult` has none.
    ADR 0010's `BacktestRunConfig` cannot be stored as an object, so `config` stands for it in the form
-   ADR 0041 term 4 gives; `sample` and `data_digest` are ADR 0041's too.
+   ADR 0053 term 2 gives; `sample` is ADR 0041's and `data_digest` ADR 0053's.
 4. **Identity.** `id` defaults to a fresh UUID4, and no config identity reaches Python. `config_key` is
    the SHA-256 hex digest of the UTF-8 bytes of `json.dumps(config, sort_keys=True,
    separators=(",", ":"), ensure_ascii=True, allow_nan=False)`, passed as `BacktestRunConfig(id=…)`.
-   Superseded in part by ADR 0041 term 4: what `config` holds and how its values are written. Until
+   Superseded in part by ADR 0053 term 2: what `config` holds and how its values are written. Until
    then it held every public property upstream reflects and the run's `start` and `end`. Upstream
    hashes only a result (`CanonicalBacktestResult::digest`, BLAKE3, not exposed); an exposed upstream
    hash replaces this.
@@ -74,9 +74,9 @@ trial store that meets every driver. Leaving it is cheap, since every trial read
    again as the same trial is this record's. Records are never overwritten or deleted. Per key, a
    `failed` or `RUNNING` record is resolved by a later record of that key that ran to the end (traded
    or idle); the earlier one stays. Every record of a key that ran to the end on one sample must carry
-   the same outcome, range, returns and data (ADR 0041), else the ranking stops and names them. A key is one
+   the same outcome, range, returns and data (ADR 0053), else the ranking stops and names them. A key is one
    column of the returns matrix.
-6. **What stops the ranking**, beside ADR 0031's and ADR 0041's: a study with no record; a key with no
+6. **What stops the ranking**, beside ADR 0031's, ADR 0041's and ADR 0053's: a study with no record; a key with no
    record that ran to the end; a `failed` or `RUNNING` record no later record of its key resolves;
    records of one key that disagree (term 5); an idle key (ADR 0010's Limits); and returns ADR 0010
    step 2 rejects, or a record not in the shape `record_trial` writes. Each message names the key and
@@ -178,3 +178,5 @@ Read 2026-11-10. Fetched means read in this session as raw text or source; run m
   an answer that hung on their order, and the report credited the pick with records that never ran.
   Terms 1 and 5 corrected here, with the rest and the sources in ADR 0041's Evidence. No change of
   decision.
+* ADR 0041's key and data identity, and part of the reviews' sources cited above, moved to ADR 0053 on
+  2026-11-10, with no change of decision; terms 3 to 6 point to ADR 0053 for them.
