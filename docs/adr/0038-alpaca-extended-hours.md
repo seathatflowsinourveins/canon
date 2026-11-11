@@ -51,8 +51,9 @@ pre-market 4:00am-9:30am, after-hours 4:00pm-8:00pm; the overnight session follo
 calendar. Only `limit`, `day` or `gtc`, overnight. A `day` order placed overnight "will remain active
 through the regular and after-hours sessions of the upcoming trading day. If unfilled, the order is canceled
 at 8:00 PM ET"; an order not marked eligible is "queued for the next trading session". Assets tradable
-overnight carry `overnight_tradable`, which alpaca-py 0.45.0's `Asset` model drops; a raw read of the assets
-endpoint could show it, and none is built, so an order in an ineligible symbol goes to Alpaca as any other.
+overnight carry `overnight_tradable`; on paper it is an entry of the asset's `attributes` list, which
+alpaca-py 0.45.0's `Asset` model keeps, not a field of its own. The client does not read it, so an order in
+an ineligible symbol goes to Alpaca as any other.
 
 ### Data: option (C)
 
@@ -69,7 +70,8 @@ delegation of 2026-11-10: this record lands the execution part, and the data cli
 ### Consequences
 
 * Good: an order trades outside the regular session only when its strategy asks, in the form Alpaca takes.
-* Bad: no market data overnight through the node yet; the client does not check `overnight_tradable`.
+* Bad: the client does not check `overnight_tradable`. Of the overnight feeds, only `boats` has been seen
+  reaching a node (ADR 0055).
 
 ### Confirmation
 
@@ -88,11 +90,11 @@ The data part is decided in [ADR 0055](0055-alpaca-data-feed-named-in-params.md)
 0038's option (B), the feed named in a subscription's params, one stream per client; on paper that
 night `boats` quotes reached a strategy through a node in the overnight session.
 
-`UNVERIFIED`: an eligible order in pre-market and overnight (only after-hours ran); a modify of an eligible
+`UNVERIFIED`: an eligible order in pre-market (after-hours and overnight ran); a modify of an eligible
 order (whether the replacement keeps `extended_hours`); why the `boats` stream and latest quote answered a
 paper pair whose plan the page does not say includes it; a `day` order across
 8:00 PM ET and the update its cancel sends; an order in a symbol not `overnight_tradable`; what the
-`overnight` and `boats` streams deliver in the overnight session, and how late.
+`overnight` stream delivers through a node in the overnight session, and how late either feed is.
 
 ## Evidence
 
@@ -116,6 +118,13 @@ Read 2026-11-10; "raw": fetched with `curl` and read, not summarised.
   with `session_open` and `session_close` (bundled with the pinned packages; read).
 * Paper, 2026-11-10, logs kept outside the repo: the feed probe at 15:59 ET (a temporary test, not kept);
   the two extended-hours tests at 16:02 ET and again at 16:16 ET (ran).
+* Paper, overnight, 23:20 ET on 2026-11-10, log kept outside the repo:
+  `mise run paper:test -- -v -s -rfEsxX -k test_paper_overnight_limit_fills_against_boats_and_is_closed`
+  (`test_paper_overnight_fill.py`, exit 0, 1 passed): AAPL's asset `attributes` held `overnight_tradable`
+  (the test skips otherwise); a DAY limit buy of 1 AAPL marked eligible, priced 0.2% through the ask of the
+  `boats` quote the node received (347.30/347.90), filled at 347.74; its sale, priced 0.2% through the bid,
+  filled at 347.30; Alpaca held both `filled` with `extended_hours` true, and the account held no AAPL order
+  or position before or after (ran).
 * Second reader, 2026-11-10 (`evidence-verifier`): the decision stands. Corrected above: what checking
   `overnight_tradable` would take; an unsourced consequence; refusing unknown keys as this repo's choice;
   why params and not tags; the `boats` plan question.
