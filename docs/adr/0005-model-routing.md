@@ -31,7 +31,7 @@ Chosen: **option 3**. The table lives in `canon/models.json`.
 | Lane | Model | Effort | Basis |
 |---|---|---|---|
 | Orchestrator: cross-lane planning, ADR decisions, long-horizon work | `fable` (`claude-fable-5-2`) | high | Vendor: step up to Fable 5.2 for demanding reasoning and long-horizon work, or when Opus 5.5 at higher effort still falls short |
-| Default build session: implementing against a clear plan | `opus` (`claude-opus-5-5`) | medium; high for hard changes | Vendor "start here" model at its default effort |
+| Default build session: implementing against a clear plan | `opus` (`claude-opus-5-5`) | medium; high for hard changes; the orchestrator's model for design-heavy work (rule 7) | Vendor "start here" model at its default effort |
 | Bulk, well-specified sub-tasks run in parallel | `sonnet` (`claude-sonnet-5-5`) | medium | Opus orchestrator with Sonnet 5.5 subagents matched Opus alone at `medium` for 31% less (defect search); 1.9 points below Opus alone at `high` |
 | Read-heavy scouting and web research | `sonnet` | default | Judgement needed to weigh sources |
 | Mechanical, checkable sub-tasks; high-volume runtime work | `haiku` (`claude-haiku-5-5`) | default | Vendor: Haiku 5.5 first for high-volume work with checkable outputs; Batch API (50% off) when nobody is waiting |
@@ -48,6 +48,25 @@ Rules:
 5. **Re-check at every model release**; this ADR expires in 30 days regardless.
 6. **The aliases are for the Anthropic API.** `opus`, `sonnet`, `haiku` and `fable` resolve to the models
    above there. On Bedrock, Foundry and other providers they resolve to older models; use full IDs there.
+7. **A build session may be raised to the orchestrator lane's model** (the owner's instruction,
+   2026-11-10: Claude workers may also run on that model, its use kept about level with the other
+   models' overall). The build row of the table has two raises. `raise_to` names an effort on the same
+   model, for a hard change. `raise_model_to` names a lane, `orchestrator`, whose model and effort the
+   session takes instead; it names the lane, not a model, so the two cannot drift apart. Limiting the
+   raise to design-heavy work is this record's narrowing of the owner's words: a decision record, or a
+   state machine on which review rounds keep finding the same family of defect. That is the case in
+   hand. On Opus 5.5, modify by replace took two changes (#55, #69) and two more that fixed replace
+   defects among others (#99, #107); a session window's account check took four (#97, #105, #110, #114)
+   after two on its stop and close (#83, #101). Each landed after its review, and each but the last of
+   its group was followed by another fixing defects of the same kind.
+   The evidence supports less than the instruction. The vendor names the step, to Fable 5.2 "for
+   demanding reasoning and long-horizon agentic work, or when your evals on Claude Opus 5.5 at higher
+   effort still fall short", but after an effort sweep: on its SWE-bench Pro subset Opus 5.5 at `xhigh`
+   was level with Fable 5.2 at `high` for a little over half the cost. No eval of ours shows a
+   shortfall, the effort those ten changes were built at was not recorded, and whether the raise ends
+   such rounds is not measured. So rule 2 still comes first, a raise in effort before a raise in model;
+   the model is picked when the session starts (rule 1); and the raise stays occasional, as the owner's
+   condition asks.
 
 Not adopted:
 
@@ -76,7 +95,9 @@ unchanged.
 
 ### Confirmation
 
-Subagent frontmatter pins `model` and `effort`. The status line records a model change inside a session to
+Subagent frontmatter pins `model` and `effort`. A raised build session (rule 7) is started with the
+orchestrator lane's model by its full ID, and `scripts/lanes` shows the model of each session that drew
+a status line; nothing yet measures the owner's condition on use. The status line records a model change inside a session to
 the event ledger, and `scripts/lanes` flags that session. The machine settings pin the `fable` alias with
 `env.ANTHROPIC_DEFAULT_FABLE_MODEL` = `claude-fable-5-2`. `scripts/bootstrap --check` compares every
 `ANTHROPIC_DEFAULT_<ALIAS>_MODEL` in the installed and template settings with `canon/models.json` and labels
@@ -111,5 +132,13 @@ Read 2026-11-09.
 * https://artificialanalysis.ai/leaderboards/models — Intelligence Index snapshot; every figure quoted here
   and in `canon/models.json` was re-checked against the page by the second reader. The version label
   (v5.0.1) comes from Artificial Analysis's methodology pages, not the leaderboard page.
+* Rule 7, 2026-11-10. The owner's instruction of that day, as rule 7 gives it. The cost guide above, read
+  again that day: "Use Claude Fable 5.2 for demanding reasoning and long-horizon agentic work, or when
+  your evals on Claude Opus 5.5 at higher effort still fall short"; Opus 5.5 "at `xhigh` 96.5% for $0.75
+  USD, level with Fable 5.2 at `high` for a little over half the cost" (fetched, searched in full). This
+  repository's history: the subjects and `Co-Authored-By` trailers of the ten commits (read, `git log`).
+* Second reader of rule 7, 2026-11-10 (`evidence-verifier`): the quotation and the trailers held, and
+  nothing that reads the table breaks. It regrouped the ten changes by what each fixed, and had the
+  guide's effort sweep, the unrecorded effort and the narrowing of the owner's words stated; all above.
 * Cost-optimisation guide bundled with Claude Code 2.1.321 (`claude-api` skill, `shared/cost-optimization.md`)
   — model selection comes after every lever that does not lower the intelligence ceiling (bundled).
