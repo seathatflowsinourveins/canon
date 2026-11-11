@@ -5,6 +5,10 @@ otherwise pytest reports it as skipped with that reason. It needs the regular se
 order fills only then, and skips with that reason when Alpaca's clock says the market is closed or
 closes within ten minutes. Never write the keys to a file.
 
+Run it after 09:35 New York. At the open on 2026-11-11 Alpaca paper did not make a 2-share market order
+final within 60 s in the first three minutes, and the test failed there with the account left flat; a run
+at 09:33 passed. The 60 s wait is not lengthened to cover the open.
+
 What it calls, all on Alpaca's paper Trading API through alpaca-py 0.45.0 with `paper=True`:
 
 * `TradingStream.subscribe_trade_updates`, for each `fill` and `partial_fill` update's `execution_id`
