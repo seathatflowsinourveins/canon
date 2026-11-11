@@ -66,7 +66,8 @@ have_clt() { xcode-select -p >/dev/null 2>&1; }
 first_line() { awk 'NR == 1'; }   # reads all input, so no pipe is cut short under pipefail
 
 # dotted <text>: true when the text is a dotted version of digits only ("2.1.321")
-dotted() { printf '%s' "$1" | grep -Eqx '[0-9]+(\.[0-9]+)*'; }
+# (a here-string, not a pipe: under pipefail a writer that grep -q stops reading could fail the test)
+dotted() { grep -Eqx '[0-9]+(\.[0-9]+)*' <<<"$1"; }
 
 # ver_ge <a> <b>: true when dotted version a is at or above b, comparing each field as a number (a missing
 # field counts as 0, so 2.1 equals 2.1.0)
@@ -266,10 +267,15 @@ DSH_ID_RE='id:[[:space:]]*["'"'"']?(session-log-deepseek|memento)["'"'"']?([[:sp
 dsh_block() { awk -v b="$DSH_MARK_BEGIN" -v e="$DSH_MARK_END" 'index($0, b) == 1 && !on && !done { on = 1 } on { print } on && $0 == e { on = 0; done = 1 }' "$1"; }
 dsh_outside() { awk -v b="$DSH_MARK_BEGIN" -v e="$DSH_MARK_END" 'index($0, b) == 1 && !on && !done { on = 1; next } on && $0 == e { on = 0; done = 1; next } !on { print }' "$1"; }
 # dsh_state <file>: current (the block as home/dsh/review.patch.yml has it, no other row for its ids),
-# stale (an older canon block, no other row), conflict (a row for one of its ids outside the block), none
+# stale (an older canon block, no other row), conflict (a row for one of its ids outside the block), none,
+# unreadable (the file is there but cannot be read, so nothing about it is known)
 dsh_state() {
+  local outside
   [ -f "$1" ] || { echo none; return; }
-  if dsh_outside "$1" | grep -Eq "$DSH_ID_RE"; then echo conflict
+  # the lines are read whole before grep sees them: piped, an early match stops grep reading, and under
+  # pipefail the awk it cut off (SIGPIPE, exit 141) would make a conflict read as no conflict
+  outside=$(dsh_outside "$1" 2>/dev/null) || { echo unreadable; return; }
+  if grep -Eq "$DSH_ID_RE" <<<"$outside"; then echo conflict
   elif ! grep -qF "$DSH_MARK_BEGIN" "$1"; then echo none
   elif [ "$(dsh_block "$1")" = "$(cat "$DSH_PATCH_SRC")" ]; then echo current
   else echo stale; fi
@@ -280,6 +286,7 @@ dsh_row() {
   case "$(dsh_state "$dst")" in
     current)  row "dsh-tui review patch" ok "session log and dsh-memento off in $dst" ;;
     conflict) row "dsh-tui review patch" "NOT SET" "another row in $dst sets session-log-deepseek or memento; merge home/dsh/review.patch.yml by hand" ;;
+    unreadable) row "dsh-tui review patch" UNKNOWN "$dst cannot be read" ;;
     *)        row "dsh-tui review patch" "NOT SET" "home/dsh/review.patch.yml's rows are not in $dst; run: scripts/bootstrap --install" ;;
   esac
 }

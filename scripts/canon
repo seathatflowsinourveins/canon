@@ -346,7 +346,9 @@ cmd_lint() {
     known=$(reg_rows '.upstreams[] | select(.mise != null) | .mise')
     while IFS=$'\t' read -r name rest; do
       [ -n "$name" ] || continue
-      printf '%s\n' "$known" | grep -qxF -- "$name" \
+      # a here-string, not a pipe: grep -q stops reading at its first match, and under pipefail a writer
+      # cut off by SIGPIPE (exit 141) would fail the test though grep matched
+      grep -qxF -- "$name" <<<"$known" \
         || { err=1; echo "lint: mise.toml installs '$name', which no registry entry names in a \"mise\" field"; }
     done <<<"$tools"
   fi
