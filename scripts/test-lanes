@@ -1270,7 +1270,8 @@ else
        || { [ -n "${6:-}" ] && [[ "$moved" != *"lockwait=$6"* ]]; }; then
       return 1
     fi
-    { printf '[tasks.owner]\ntimeout = "%ss"\nenv.ALPACA_API_KEY = "stand-in"\nenv.ALPACA_SECRET_KEY = "stand-in"\n' "$(( $3 + 30 ))"
+    # CLAUDE_CONFIG_DIR: where paper:session keeps its window records, so no run here writes under the real one
+    { printf '[tasks.owner]\ntimeout = "%ss"\nenv.ALPACA_API_KEY = "stand-in"\nenv.ALPACA_SECRET_KEY = "stand-in"\nenv.CLAUDE_CONFIG_DIR = "%s/config"\n' "$(( $3 + 30 ))" "$2"
       printf "run = '''\n%s\n'''\n" "$moved"; } > "$2/mise.toml"
   }
   # standin <folder> <trap line> [hang]: a uv that hangs, with a child that ignores SIGTERM; the start-up step
@@ -1377,14 +1378,15 @@ EOF
     # NOKEYS: both keychain items empty, as mise renders a missing one
     [ -z "${NOKEYS:-}" ] || sed -i.bak 's/= "stand-in"$/= ""/' "$SD/mise.toml"
     [ "$v" = - ] || printf '%s\n# a note under the value\n' "$v" > "$SD/canon/paper-schedule"
-    printf '#!/bin/bash\nprintf "%%s\\n" "$*" >> "%s/uv-ran"\n' "$SD" > "$SD/bin/uv"; chmod +x "$SD/bin/uv"
+    printf '#!/bin/bash\nprintf "%%s\\n" "$*" >> "%s/uv-ran"\n%s\n' "$SD" "${SUV:-}" > "$SD/bin/uv"; chmod +x "$SD/bin/uv"
     if [ "$lock" = held ]; then
       /usr/bin/lockf -k "$SD/canon-paper-windows.lock" sleep 60 & hp=$!
       for _ in $(seq 50); do /usr/bin/lockf -k -t 0 "$SD/canon-paper-windows.lock" true 2>/dev/null || break; sleep 0.1; done
     fi
     s0=$(date +%s)
+    # stdin from /dev/null: the task's path for a run with no terminal, wherever these self-tests are run from
     # shellcheck disable=SC2034  # read by the eval'd checks
-    { (cd "$SD" && exec env -i HOME="$HOME" MISE_CEILING_PATHS="$TMPP" PATH="$SD/bin:/usr/bin:/bin" "$mark" "$LMISE" run owner "$@" > "$SD/out" 2>&1); src=$?; }
+    { (cd "$SD" && exec env -i HOME="$HOME" MISE_CEILING_PATHS="$TMPP" PATH="$SD/bin:/usr/bin:/bin" "$mark" "$LMISE" run owner "$@" > "$SD/out" 2>&1 < /dev/null); src=$?; }
     took=$(( $(date +%s) - s0 ))
     [ -z "$hp" ] || { kill "$hp" 2>/dev/null; wait "$hp" 2>/dev/null; }
   }
@@ -1420,6 +1422,39 @@ EOF
           eval '[ "$src" = 1 ] && [ "$took" -lt 20 ] && [ ! -e "$SD/uv-ran" ] && grep -q "^paper:session: failed: canon/paper-schedule.s first line is neither off nor mover" "$SD/out"'
     check "... and its heartbeat says so"         beat '.outcome | startswith("failed: canon/paper-schedule")'
   done
+  # The records kept (2026-11-11): the window's records and logs are written under the temp folder, which a
+  # restart empties, so paper:session copies them into <config>/canon/watch/windows/ with macOS's rsync: the
+  # records at every run's start, before the switch is read, and records and logs after a window, whatever its
+  # exit, which the task still returns. SUV is the
+  # stand-in window: it notes whether an earlier record was already kept when it started, writes a record, a
+  # record by hand, a log, a record and a log over 1 MB and a heartbeat, and ends 3.
+  # shellcheck disable=SC2016  # the stand-in's own text, expanded when it runs
+  win='case "$*" in *" /usr/bin/true") exit 0 ;; esac
+while [ $# -gt 0 ]; do [ "$1" != --log-dir ] || d=$2; shift; done
+[ ! -e "$CLAUDE_CONFIG_DIR/canon/watch/windows/window-0.json" ] || echo yes > "$d/../kept-at-start"
+mkdir -p "$d/by-hand"; echo r > "$d/window-1.json"; echo h > "$d/by-hand/window-2.json"; echo l > "$d/window-1.log"; echo f > "$d/last-firing.json"
+dd if=/dev/zero of="$d/window-3.json" bs=1024 count=1100 2>/dev/null; dd if=/dev/zero of="$d/window-3.log" bs=1024 count=1100 2>/dev/null
+exit 3'
+  mkdir -p "$TMP/schedule-keep/canon-paper-session"; echo o > "$TMP/schedule-keep/canon-paper-session/window-0.json"
+  SUV=$win sched keep - free by-hand --session regular --minutes 25
+  # shellcheck disable=SC2034  # read by the eval'd checks
+  KW="$SD/config/canon/watch/windows"
+  check "a window's records are kept outside the temp folder: its record, the one by hand and its log, and a record whatever its size" \
+        eval '[ "$(cat "$KW/window-1.json")" = r ] && [ "$(cat "$KW/by-hand/window-2.json")" = h ] && [ "$(cat "$KW/window-1.log")" = l ] && [ "$(wc -c < "$KW/window-3.json")" -gt 1048576 ]'
+  check "... a log over 1 MB and the heartbeat are not, and the task's exit code is the window's (3)" \
+        eval '[ "$src" = 3 ] && [ ! -e "$KW/window-3.log" ] && [ ! -e "$KW/last-firing.json" ] && [ -s "$SD/canon-paper-session/window-3.log" ]'
+  check "... and what an earlier run left was kept before the window started" eval '[ -e "$SD/kept-at-start" ] && [ "$(cat "$KW/window-0.json")" = o ]'
+  mkdir -p "$TMP/schedule-keep-off/canon-paper-session/window-0.json.d" "$TMP/schedule-keep-off/canon-paper-session/by-hand"
+  echo o > "$TMP/schedule-keep-off/canon-paper-session/by-hand/window-0.json"; echo l > "$TMP/schedule-keep-off/canon-paper-session/window-0.log"
+  sched keep-off off held scheduled --session auto --minutes 25
+  check "a firing that skips (the schedule off) still keeps the records earlier runs left, and no log: a log is kept at a window's end only" \
+        eval '[ "$src" = 0 ] && [ "$(cat "$SD/config/canon/watch/windows/by-hand/window-0.json")" = o ] && [ ! -e "$SD/config/canon/watch/windows/window-0.log" ] && [ ! -e "$SD/config/canon/watch/windows/window-0.json.d" ]'
+  mkdir -p "$TMP/schedule-keep-fail"; echo "a file where the config folder would be" > "$TMP/schedule-keep-fail/config"
+  SUV=$win sched keep-fail - free by-hand --session regular --minutes 25
+  check "records that cannot be kept (no folder can be made): said by name, the exit code still the window's, the records where they were" \
+        eval '[ "$src" = 3 ] && grep -q "^paper:session: the window records could not be copied to $SD/config/canon/watch/windows" "$SD/out" && [ -s "$SD/canon-paper-session/window-1.json" ]'
+  check "from a terminal the window is still exec'd, so a signal reaches uv and the window as before the copy" \
+        eval 'grep -Eq "^    exec uv run --locked .* python -m canon_trading\.session_window " <<<"$(task_part paper:session run)"'
   # Two accounts, two locks (ADR 0069), run under mise with both bodies sharing one lock folder: a window that
   # runs holds account B's lock and the stream lock, and a paper test on account A runs meanwhile, at once
   AB="$TMP/two-accounts"; mkdir -p "$AB/locks" "$AB/s" "$AB/t" "$AB/w" "$AB/b"

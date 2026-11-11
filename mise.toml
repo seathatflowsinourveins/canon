@@ -408,9 +408,30 @@ bounded() {
   trap - TERM HUP INT
   return "$rc"
 }
+# kept [logs]: copy the window records out of the temp folder, which a restart empties, into
+# <config>/canon/watch/windows/, beside the runner's log (CLAUDE_CONFIG_DIR, else ~/.claude, as scripts/automation
+# names it): every window-*.json here and in by-hand/. With `logs`, each window-*.log of 1 MB or less too: only
+# at a window's end, with account B's lock still held, so a log is copied once it is whole. The tool is macOS's
+# /usr/bin/rsync (openrsync; `man rsync` here: -a, --include, --exclude, --max-size), which copies only what is
+# not there yet or has changed, so a run that ended before its copy is caught by the next; each call is held to
+# 20 s. The patterns are anchored to those two levels. A copy that fails is said on stderr
+# and changes no exit code; nothing here is read by status or by a window.
+kept() {
+  k="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/canon/watch/windows"
+  [ -d "${tmp}canon-paper-session" ] || return 0
+  { /bin/mkdir -p "$k" \
+    && /usr/bin/timeout 20 /usr/bin/rsync -a --include='/window-*.json' --include='/by-hand/' --include='/by-hand/window-*.json' --exclude='*' "${tmp}canon-paper-session/" "$k/"; } \
+    || echo "paper:session: the window records could not be copied to $k; they are still in ${tmp}canon-paper-session" >&2
+  [ "${1:-}" = logs ] || return 0
+  /usr/bin/timeout 20 /usr/bin/rsync -a --max-size=1m --include='/window-*.log' --exclude='*' "${tmp}canon-paper-session/" "$k/" \
+    || echo "paper:session: the window logs could not be copied to $k; they are still in ${tmp}canon-paper-session" >&2
+}
 window() {
   # the switch first, then the pair and account B's lock: here, not above, because the task's arguments reach
   # only the function the script's last line calls (the note above paper:test)
+  # the records earlier runs left and never copied (one from a terminal, one stopped before its end): before the
+  # switch and with no lock, so a firing that skips keeps them too
+  kept
   scheduled "$@"
   [ -n "$ALPACA_API_KEY" ] && [ -n "$ALPACA_SECRET_KEY" ] || { echo "paper:session: a keychain item of account B is empty; run: mise run paper:remove windows, then mise run paper:store windows" >&2; exit 1; }
   exec 9>>"${tmp}canon-paper-windows.lock"
@@ -419,7 +440,7 @@ window() {
   left=$((deadline - ($(/bin/date +%s) - start)))
   [ "$left" -gt 0 ] || { echo "paper:session: no time left before the deadline" >&2; exit 1; }
   # from a terminal, too, uv's sync runs before the stream lock is taken, so the lock is held only while the
-  # window's process runs
+  # window's process runs; exec, so a signal reaches uv as it always did, and the next run's start copies its records
   if [ -t 0 ]; then
     uv run --locked ${CANON_COMMIT:+--exact} /usr/bin/true || exit 1
     stream
@@ -433,7 +454,10 @@ window() {
   stream
   left=$((deadline - ($(/bin/date +%s) - start)))
   [ "$left" -gt 0 ] || { echo "paper:session: no time left before the deadline" >&2; exit 1; }
-  bounded "$left" uv run --locked ${CANON_COMMIT:+--exact} python -m canon_trading.session_window --log-dir "${tmp}canon-paper-session" "$@"
+  wrc=0
+  bounded "$left" uv run --locked ${CANON_COMMIT:+--exact} python -m canon_trading.session_window --log-dir "${tmp}canon-paper-session" "$@" || wrc=$?
+  kept logs
+  exit "$wrc"
 }
 window
 '''

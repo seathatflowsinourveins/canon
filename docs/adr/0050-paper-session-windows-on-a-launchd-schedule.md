@@ -238,6 +238,22 @@ Limits: mise renders the task's env before its body, so a skipped firing still r
 its own environment, which only a check in the installed runner would spare; while the schedule is off the
 row keeps the label of the last window's record; and a skip's heartbeat names no commit, so a record still
 `running` reads as died only once it is stale, as after a runner's own failure.
+The first firing launchd started after the landing, at 20:52:21 UTC on 2026-11-11 from the main of that
+minute, skipped by name with its heartbeat written; the installed plist was still the one without `--mover`.
+**The records kept (2026-11-11).** A window's records and logs are written only under the per-user temporary
+folder, which a restart empties (whether the system also clears it while running is UNVERIFIED). `paper:session`
+therefore copies them with macOS's `/usr/bin/rsync` into `<config>/canon/watch/windows/`, beside the runner's
+log. Every `window-*.json`, by hand or scheduled, is copied at each run's start, before the switch is read
+and with no lock, so a firing that skips keeps what a run from a terminal left; after a window, whatever its
+exit, which the task still returns, the records again and each `window-*.log` of 1 MB or less, with account
+B's lock still held so that a log is copied whole. Each copy is held to 20 s; one that fails is said on
+stderr and changes no exit code; status and the windows keep reading the temporary folder. Run under mise in
+`scripts/test-lanes` with a stand-in window; on a real window UNVERIFIED until the first one after this
+change. Limits: nothing prunes the kept folder; a log over 1 MB is left out and not named, and the log of a
+window run from a terminal waits for the next window's end; the heartbeats and `last-window-end` are not
+copied; the kept folder takes the temporary folder's mode and time at each copy; and the folder follows the
+caller's `CLAUDE_CONFIG_DIR`, which the paper agent is not given, so a run by hand under another config
+directory keeps its records apart from the schedule's.
 
 ## Evidence
 
@@ -250,6 +266,12 @@ Read 2026-11-10. "raw": fetched with `curl` and read whole.
 * https://nautilustrader.io/docs/md/latest/how_to/configure_live_trading.md: "run nodes as standalone
   Python scripts or services"; "One LiveNode per process" (fetched, raw).
 * `scripts/automation` and ADR 0011: the launchd agent, its install, status and uninstall (read).
+* 2026-11-11, for the records kept: `man rsync` on this machine, where `/usr/bin/rsync` is openrsync
+  ("protocol version 29", "rsync version 2.6.9 compatible"): `-a`, `--include`, `--exclude` and `--max-size`
+  (read, `bundled`); the two calls run on a scratch folder: a 1.1 MB log left out, a record of that size
+  and a log of exactly 1 MiB copied, other files left (run). `/code-review` at medium found that a log
+  copied while it grows keeps its short copy once it passes the bound, which is why logs are copied only
+  at a window's end.
 * 2026-11-11, for the schedule's switch: `man launchctl` on this machine, `enable | disable`: "Once a
   service is disabled, it cannot be loaded in the specified domain until it is once again enabled. This
   state persists across boots"; `man launchd.plist`, `Disabled`: "this state is kept externally" (bundled).
