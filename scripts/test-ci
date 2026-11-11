@@ -31,6 +31,10 @@ case "$*" in
   "env -s bash") if [ -n "${FAKE_MISE_KEEP:-}" ]; then printf 'export PATH=%q\n' "$PATH"
                  else printf 'export PATH=%q\n' "$TOOLS:$PATH"; fi ;;
   "env --paths") printf '%s\n' "$TOOLS" ;;
+  # the config files in use: the checkout's, plus FAKE_MISE_STRAY when a case plants one; FAKE_MISE_LS_FAIL fails
+  "config ls --json") [ -z "${FAKE_MISE_LS_FAIL:-}" ] || { echo "config ls broke" >&2; exit 1; }
+                     jq -cn --arg c "$(pwd -P)/mise.toml" --arg s "${FAKE_MISE_STRAY:-}" \
+                       '[{path: $c}] + (if $s == "" then [] else [{path: $s}] end)' ;;
   *) echo "fake mise: unexpected arguments: $*" >&2; exit 2 ;;
 esac
 EOF
@@ -326,8 +330,40 @@ check "the uv it checked for is the one it ran"    test "$(grep -c '^lock --chec
 check "so the run passes"                          test "$RC" = 0
 }
 
+# --- a mise config above the checkout is named and refused, before any check runs ---
+case_strayconfig() {
+fresh strayconfig
+mkdir -p "$C.above"; printf '[tools]\npython = "3.9"\n' >"$C.above/mise.toml"
+export FAKE_MISE_STRAY="$C.above/mise.toml"
+runci
+check "a config mise loads from above the checkout fails the run" test "$RC" = 1
+check "... naming the file"                        has "^  $C.above/mise.toml\$"
+check "... and the opt-out"                        has 'MISE_CEILING_PATHS'
+check "... before any check runs"                  test "$(grep -c '' "$C.uv.log")" = 0
+# the global config, in each place it can be: MISE_CONFIG_DIR (with a trailing /), XDG_CONFIG_HOME, ~/.config
+G="$C.global"; mkdir -p "$G/mise"
+FAKE_MISE_STRAY="$G/mise/config.toml"; MISE_CONFIG_DIR="$G/mise/"; export MISE_CONFIG_DIR
+runci; unset MISE_CONFIG_DIR
+check "the global config under MISE_CONFIG_DIR is not a stray one" test "$RC" = 0
+XDG_CONFIG_HOME="$G"; export XDG_CONFIG_HOME
+runci; unset XDG_CONFIG_HOME
+check "... nor under XDG_CONFIG_HOME"              test "$RC" = 0
+mkdir -p "$G/home/.config/mise"; FAKE_MISE_STRAY="$G/home/.config/mise/config.toml"
+HOME="$G/home" runci
+check "... nor in ~/.config/mise"                  test "$RC" = 0
+FAKE_MISE_STRAY="$G/dotfiles/mise.toml"; MISE_GLOBAL_CONFIG_FILE="$FAKE_MISE_STRAY"; export MISE_GLOBAL_CONFIG_FILE
+runci; unset MISE_GLOBAL_CONFIG_FILE
+check "... nor the file MISE_GLOBAL_CONFIG_FILE names" test "$RC" = 0
+FAKE_MISE_STRAY="/etc/mise/config.toml"; runci
+check "... and /etc/mise is not either"            test "$RC" = 0
+unset FAKE_MISE_STRAY
+export FAKE_MISE_LS_FAIL=1; runci; unset FAKE_MISE_LS_FAIL
+check "mise config ls failing fails the run"     test "$RC" = 1
+check "... saying so"                             has "mise config ls --json. failed"
+}
+
 # Every case above works in its own copy, so they run concurrently; their output prints in this order.
-CASES="yaml noflows shell staged untracked tests testdir testgone notes died symlink deleted deleted2 lockfail hookenv parallel order missing pathorder"
+CASES="yaml noflows shell staged untracked tests testdir testgone notes died symlink deleted deleted2 lockfail hookenv parallel order missing pathorder strayconfig"
 for c in $CASES; do ( "case_$c" ) >"$TMP/out.$c" 2>&1 & done
 wait
 for c in $CASES; do cat "$TMP/out.$c"; done

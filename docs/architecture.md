@@ -181,6 +181,15 @@ Where they differ in a way a script here depends on:
   toolchain"). `scripts/test-lanes` and `scripts/bootstrap` find a Python with `tomllib` themselves.
 * **macOS-only tools.** The hosted runner has no `plutil`, `lockf`, `timeout` at `/usr/bin` or `security`;
   `scripts/test-lanes` skips those cases there and says so, so they run only on this Mac's commit gate.
+* **mise configs above the working folder.** mise reads a config in every folder from the root down to
+  the one it runs in, unless `MISE_CEILING_PATHS` stops it (mise's `ceiling_paths` setting). A reviewer
+  that wrote a copy of `mise.toml` into `/tmp` changed every mise run under `/tmp`, so the self-tests that
+  build their own config in a temp folder there no longer ran with only that config. Two guards, each
+  for its own folders: `scripts/ci` stops, naming the file, when `mise config ls` lists a config above the
+  checkout (anything but the checkout's, the global one and `/etc/mise`; `scripts/test-ci`,
+  "strayconfig"), and a self-test that runs mise in a temp folder bounds it there with
+  `MISE_CEILING_PATHS`. Nothing guards the paper session runner, which runs mise in its clone under
+  `~/.claude/canon`: a config there, in `~/.claude` or in `~` reaches its window.
 * **The Claude config folder.** Sessions, the lane watchdog and `scripts/lanes` each read
   `${CLAUDE_CONFIG_DIR:-~/.claude}`; the watchdog's is fixed at install. They agree while Orca's profile
   pointer is empty; nothing checks that they still agree.
