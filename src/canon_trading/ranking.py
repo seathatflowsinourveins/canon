@@ -45,7 +45,11 @@ result Optuna keeps (`COMPLETE`, `PRUNED`, a value or an intermediate value), or
 only while it is in a state the mark leaves: `FAIL` for one in `not_run`, and for one marked while
 `WAITING` (`not_run_waiting`) `WAITING`, or `FAIL` with the note `record_trial` writes on a trial it
 takes from Optuna's queue and runs nothing in; started by another writer after its mark, it stops
-for good. The samples are read once, so the current sample and the numbers known agree.
+for good. A keyed record `canon_trading.ledger.retire_queued` retired, another writer's queued
+trial, is never read, and its key stays counted in N; a key tried only in such records stops until
+`record_trial` runs it on the current sample. The stops on another writer's queued keyed record,
+`WAITING` or taken from Optuna's queue, name `retire_queued` (ADR 0054, 2026-11-10).
+The samples are read once, so the current sample and the numbers known agree.
 Every such stop is gathered before one is raised. Configurations tied at the highest Sharpe ratio with
 the same returns are one pick; tied with other returns, they leave no single pick and stop it. N-hat
 below 1 is raised to 1, skfolio's least, and the DSR at N-hat is withheld when its benchmark is below
@@ -72,9 +76,12 @@ from .ledger import NOT_RUN
 from .ledger import NOT_RUN_WAITING
 from .ledger import OUTCOME
 from .ledger import RAN
+from .ledger import RETIRED
+from .ledger import RETIRED_NOTE
 from .ledger import TAKEN_FROM_QUEUE
 from .ledger import TRADED
 from .ledger import Sample
+from .ledger import carries_a_queue_note
 from .ledger import cleared_while_waiting
 from .ledger import config_key
 from .ledger import has_key
@@ -233,14 +240,21 @@ def _not_the_writers(trial: FrozenTrial) -> str | None:
         return f"has outcome {outcome!r}, not one record_trial writes"
     if trial.intermediate_values or trial.distributions:
         return "holds an intermediate value or a parameter, which record_trial never writes"
-    if trial.user_attrs.get("error") == TAKEN_FROM_QUEUE:
-        return "was taken from Optuna's queue by record_trial, which keys no trial it takes"
+    if trial.user_attrs.get("error") in (TAKEN_FROM_QUEUE, RETIRED_NOTE):
+        return (
+            "was taken from Optuna's queue, another writer's queued trial that never ran here "
+            "and that no record_trial keys"
+        )
+    if state == TrialState.WAITING:
+        # Before the system attributes: `Study.enqueue_trial` writes `fixed_params` on what it queues.
+        return (
+            "is WAITING, queued with a key by another writer, which record_trial never leaves and "
+            "refuses to start beside"
+        )
     if trial.system_attrs:
         return (
             f"holds system attributes {sorted(trial.system_attrs)}, which record_trial never writes"
         )
-    if state == TrialState.WAITING:
-        return "is WAITING, queued with a key, which record_trial never leaves"
     if outcome in RAN:
         if (state, outcome, trial.values is not None) in _RAN_AS_TOLD:
             return None
@@ -248,6 +262,14 @@ def _not_the_writers(trial: FrozenTrial) -> str | None:
     if shows_an_evaluation(trial):
         return "shows a result Optuna keeps but no outcome record_trial writes for one"
     return None
+
+
+def _remedy(trial: FrozenTrial) -> str:
+    """The remedy for another writer's record, if it is one `retire_queued` takes: a queued keyed
+    record, `WAITING` or taken from Optuna's queue with its note (ADR 0054 term 7)."""
+    if trial.state == TrialState.WAITING or carries_a_queue_note(trial):
+        return f"; retire_queued(study, {trial.number}) retires it, its key still counted in N"
+    return ""
 
 
 def _config_fault(trial: FrozenTrial, key: str) -> str | None:
@@ -319,18 +341,26 @@ def rank(study: optuna.Study) -> RankingReport:
     by_key: dict[str, list[FrozenTrial]] = defaultdict(list)
     stops: list[str] = []
     marks: dict[str, set[int]] = {}
-    for name in (NOT_RUN, NOT_RUN_WAITING):
+    malformed: set[str] = set()  # the lists not in their form, whose remedies cannot be taken
+    for name in (NOT_RUN, NOT_RUN_WAITING, RETIRED):
         marked = study.user_attrs.get(name, [])
         if is_not_run_list(marked):
             marks[name] = set(marked)
         else:
             marks[name] = set()
+            malformed.add(name)
             stops.append(
                 f"study user attribute {name} is {marked!r}, not a list of trial numbers in the "
-                "form mark_not_run writes, so no record is read as marked by it (ADR 0053)",
+                "form mark_not_run and retire_queued write, so no record is read as marked by it "
+                "(ADR 0053, ADR 0054)",
             )
+    # Another writer's queued records `retire_queued` retired, by key: none is read, and each key
+    # stays counted in N (ADR 0054, 2026-11-10).
+    retired: dict[str, list[FrozenTrial]] = defaultdict(list)
     for trial in trials:
-        if has_key(trial):
+        if has_key(trial) and trial.number in marks[RETIRED]:
+            retired[trial.user_attrs["config_key"]].append(trial)
+        elif has_key(trial):
             by_key[trial.user_attrs["config_key"]].append(trial)
         elif ran_something(trial):
             stops.append(
@@ -353,7 +383,19 @@ def rank(study: optuna.Study) -> RankingReport:
                 f"backtest; if its process is gone, mark_not_run(study, {trial.number}) clears it "
                 "(ADR 0053)",
             )
-    n = len(by_key)
+    counted = {
+        key: [*by_key.get(key, []), *retired.get(key, [])]
+        for key in dict.fromkeys([*by_key, *retired])
+    }
+    n = len(counted)
+    stops.extend(
+        f"{key}: tried only in another writer's queued "
+        f"{'trials' if len(records) > 1 else 'trial'} {', '.join(f'#{t.number}' for t in records)}, "
+        f"retired, which never ran here and is not read; its key stays counted in N, so record_trial "
+        f"of its configuration on the current {sample.describe()} runs it (ADR 0054)"
+        for key, records in retired.items()
+        if key not in by_key
+    )
 
     chosen: dict[str, FrozenTrial] = {}
     on_sample: dict[str, list[FrozenTrial]] = {}
@@ -376,7 +418,8 @@ def rank(study: optuna.Study) -> RankingReport:
             # The key's records are not all the writer's of one configuration, so none is read.
             stops.extend(
                 f"{key}: {_describe(trial)} {why}: not in the shape record_trial writes, so "
-                "another writer left it, and no later record resolves it (ADR 0054)"
+                f"another writer left it, and no later record resolves it"
+                f"{_remedy(trial) if RETIRED not in malformed else ''} (ADR 0054)"
                 for trial, why in foreign
             )
             continue
@@ -476,7 +519,7 @@ def rank(study: optuna.Study) -> RankingReport:
     )
     if n < 2:
         stops.append(
-            f"N = {n}; the DSR needs N >= 2 ({'; '.join(_named(k, r) for k, r in by_key.items())})",
+            f"N = {n}; the DSR needs N >= 2 ({'; '.join(_named(k, r) for k, r in counted.items())})",
         )
     if stops or matrix is None:
         raise RankingStopped(_stopped(study, n, stops))

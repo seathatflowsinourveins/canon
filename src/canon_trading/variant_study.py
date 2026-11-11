@@ -73,6 +73,7 @@ from .ledger import default_ledger_path
 from .ledger import has_key
 from .ledger import open_study
 from .ledger import record_trial
+from .ledger import retired_numbers
 from .ledger import samples
 from .ledger import trial_config
 from .ma_cross import MaCrossConfig
@@ -146,15 +147,19 @@ def _to_record(study: optuna.Study, keys: Sequence[str]) -> list[str]:
     sample number of the study's is on the current sample, unless it ran to the end, which `rank`
     stops on as another writer's and which no re-run clears. The rule is the gate's own,
     `canon_trading.ranking.on_current_sample` and `ran_to_the_end`, so it follows any change to it.
-    The study is read once.
+    A retired record (`canon_trading.ledger.retire_queued`) is another writer's, which `rank` never
+    reads, so it is no run of its key either; a `retired` list not in its form raises
+    `ValueError` (`retired_numbers`), a refusal before any trial, which stops the pass. The study is
+    read once.
     """
     history = samples(study)  # one read, as `rank` takes it
     sample = history[-1]
     known = {s.number for s in history}
+    retired = retired_numbers(study)
     latest: dict[str, optuna.trial.FrozenTrial] = {}
     for trial in study.get_trials(deepcopy=False):
         key = trial.user_attrs.get("config_key")
-        if not isinstance(key, str) or key not in keys:
+        if not isinstance(key, str) or key not in keys or trial.number in retired:
             continue
         if on_current_sample(trial, sample, known) and (
             key not in latest or trial.number > latest[key].number

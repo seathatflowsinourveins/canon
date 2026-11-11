@@ -527,3 +527,40 @@ def test_a_study_name_with_a_slash_takes_its_pass_lock(
     assert [path.name for path in tmp_path.glob("*.pass.lock")] == [
         "trials.db.exp%2Fstep7.pass.lock"
     ]
+
+
+def test_a_key_whose_only_record_on_the_sample_is_retired_is_run(
+    alpaca_bars: AlpacaBars, tmp_path: Path
+) -> None:
+    """A retired record (ADR 0054, 2026-11-10), another writer's that `rank` never reads, was read by
+    the pass as a run of its key, so the key was skipped and the ranking stopped on it for good; it
+    is now run. The test failed before its change."""
+    write_both(alpaca_bars, tmp_path / "catalog")
+    configs = grid(symbols=("SPY",), periods=SHORT)
+    ledger = tmp_path / "trials.db"
+    with create_ledger_study(
+        "s", start=START.isoformat(), end=END.isoformat(), path=ledger
+    ) as study:
+        # Another writer's queued record of the first key, taken by `record_trial` as the code did
+        # before it refused: told FAIL with the note, its outcome the other writer's.
+        study.add_trial(
+            optuna.trial.create_trial(
+                state=TrialState.FAIL,
+                user_attrs={
+                    "config_key": key_of(configs[0]),
+                    "sample": 0,
+                    OUTCOME: TRADED,
+                    "error": canon_trading.ledger.TAKEN_FROM_QUEUE,
+                },
+            )
+        )
+        canon_trading.ledger.retire_queued(study, 0)
+
+    recorded, report = run_study(
+        tmp_path / "catalog", name="s", ledger_path=ledger, configs=configs, start=START, end=END
+    )
+
+    assert recorded is not None
+    assert (len(recorded.recorded), recorded.skipped) == (2, ())
+    assert isinstance(report, RankingReport), report
+    assert report.n == 2
