@@ -117,6 +117,7 @@ def write(
         "returns_series": {str(d): value for d, value in zip(days, returns or [], strict=True)},
         "session_days": [str(d) for d in calendar],
         "data_digest": {f"bars of {key}": hashlib.sha256(str(key).encode()).hexdigest()},
+        "config": {"data": {"data_type": "Bar", "bar_types": [f"bars of {key}"]}},
     }
     written.update(attrs or {})
     for name, value in written.items():
@@ -1035,3 +1036,40 @@ def test_a_not_run_list_not_in_the_writers_shape_stops(study: optuna.Study, mark
     assert f"#{keyless} (running) has no config key" in text
     with pytest.raises(ValueError, match="not a list of trial numbers"):
         mark_not_run(study, second.number)
+
+
+def test_a_digest_that_lacks_a_bar_type_the_run_loads_stops(study: optuna.Study) -> None:
+    """A run that read no bar of a bar type left it out of the digest, where two trials then agreed
+    on bars one of them never read."""
+    write(study, "pick", PICK)
+    write(study, "second", SECOND)
+    number = write(
+        study,
+        "third",
+        THIRD_CLOSE,
+        attrs={"config": {"data": {"data_type": "Bar", "bar_types": ["bars of third", "MSFT"]}}},
+    )
+
+    with pytest.raises(
+        RankingStopped, match=rf"third: #{number} [^\n]*data_digest names \['bars of third'\], not"
+    ):
+        rank(study)
+
+
+@pytest.mark.parametrize("config", [None, {"data": {"bar_types": "bars"}}], ids=["none", "odd"])
+def test_a_record_that_ran_with_no_config_in_the_writers_form_stops(
+    study: optuna.Study, config: object
+) -> None:
+    """Without the bar types it loads, a digest could not be checked to name them all."""
+    write(study, "pick", PICK)
+    write(study, "second", SECOND)
+    number = write(
+        study,
+        "third",
+        THIRD_CLOSE,
+        attrs={"config": config},
+        drop=("config",) if config is None else (),
+    )
+
+    with pytest.raises(RankingStopped, match=rf"third: #{number} [^\n]*config [^\n]*bar types"):
+        rank(study)

@@ -71,7 +71,9 @@ from __future__ import annotations
 
 import enum
 import fcntl
+import functools
 import hashlib
+import inspect
 import json
 import math
 import subprocess
@@ -89,6 +91,7 @@ from urllib.parse import quote
 import optuna
 import pandas as pd
 from canon_alpaca.constants import VENUE
+from nautilus_trader.config import StrategyConfig
 from nautilus_trader.model import Money
 from optuna.study import StudyDirection
 from optuna.trial import TrialState
@@ -99,6 +102,7 @@ from .backtest import checked_run_config
 from .backtest import run_backtest_config
 from .ma_cross import MaCross
 from .returns_matrix import DAY_NS
+from .returns_matrix import NS_RANGE
 from .returns_matrix import ReturnsRejected
 from .returns_matrix import daily_series
 from .returns_matrix import session_sharpe
@@ -308,13 +312,25 @@ def _creation_settled(path: Path) -> Generator[None]:
 def samples(study: optuna.Study) -> list[Sample]:
     """Every sample `study` has had, oldest first; the last is the current one (ADR 0041)."""
     stored = study.user_attrs.get(SAMPLES)
-    try:
-        found = [
-            Sample(int(s["number"]), int(s["start"]), int(s["end"]))
-            for s in (stored if isinstance(stored, list) else [])
-        ]
-    except TypeError, KeyError, ValueError:
-        found = []
+    found = []
+    for entry in stored if isinstance(stored, list) else [None]:
+        fields = (
+            [entry.get("number"), entry.get("start"), entry.get("end")]
+            if isinstance(entry, dict)
+            else [None]
+        )
+        # Each an `int` as `_sample_attr` writes it, never a `bool`, over a range `_range` accepts.
+        match fields:
+            case [int() as number, int() as start, int() as end] if (
+                not any(isinstance(v, bool) for v in fields)
+                and start in NS_RANGE
+                and end in NS_RANGE
+                and start < end
+            ):
+                found.append(Sample(number, start, end))
+            case _:
+                found = []
+                break
     if not found or [s.number for s in found] != list(range(len(found))):
         raise LedgerNotFound(
             f"study {study.study_name!r} has no sample in the form ADR 0041 gives: {stored!r}",
@@ -357,7 +373,17 @@ def _opened_ledger(study: optuna.Study, to: str) -> Path:
 
 
 def _range(start: int | str | pd.Timestamp, end: int | str | pd.Timestamp) -> tuple[int, int]:
+    """A sample's two ends in UTC nanoseconds, each one a timestamp holds, the first before the last.
+
+    NautilusTrader's `UnixNanos` wraps a `u64` and a pandas `Timestamp` holds at most 2**63 - 1, so a
+    bound outside `NS_RANGE` is refused before it is written: every later read of it would crash.
+    """
     first, last = _ns(start), _ns(end)
+    outside = [bound for bound in (first, last) if bound not in NS_RANGE]
+    if outside:
+        raise ValueError(
+            f"a sample's bounds are nanoseconds from 0 to 2**63 - 1, got {outside[0]}",
+        )
     if not first < last:
         raise ValueError(f"a sample needs start < end, got {_date(first)} and {_date(last)}")
     return first, last
@@ -366,9 +392,14 @@ def _range(start: int | str | pd.Timestamp, end: int | str | pd.Timestamp) -> tu
 def _ns(value: int | str | pd.Timestamp) -> int:
     if isinstance(value, int) and not isinstance(value, bool):
         return value
-    stamp = pd.Timestamp(value)
-    stamp = stamp.tz_localize("UTC") if stamp.tzinfo is None else stamp.tz_convert("UTC")
-    return int(stamp.value)
+    try:
+        stamp = pd.Timestamp(value)
+        stamp = stamp.tz_localize("UTC") if stamp.tzinfo is None else stamp.tz_convert("UTC")
+        return int(stamp.value)
+    except (OverflowError, pd.errors.OutOfBoundsDatetime) as error:
+        # pandas 3 keeps an instant before 1677-09-21 or after 2262-04-11 in microseconds, and gives
+        # no nanoseconds for it.
+        raise ValueError(f"{value!r} is no instant pandas holds in nanoseconds: {error}") from error
 
 
 def _date(ns: int) -> str:
@@ -425,22 +456,20 @@ def trial_config(
 ) -> dict[str, Any]:
     """The object ADR 0054 term 4 hashes: what this repo sets for a run, normalised.
 
-    Each strategy's class and the fields its config sets (its own attributes; the base config's are
-    upstream defaults `MaCrossConfig` never passes on), the venue's name, `VENUE_SETTINGS`, `FEE_RATES`
-    and starting balances, and the bar types the run loads, one per instrument as
-    `backtest_run_config` derives them. No property upstream reflects is read, so a default that
-    changes with NautilusTrader's pin moves no key. The study's sample is not in it (ADR 0053 term 2).
+    Each strategy's class and the fields its config sets (`_strategy_fields`: its own attributes, and
+    each base `StrategyConfig` field away from its pinned default, which `MaCrossConfig` passes on to
+    the engine), the venue's name, `VENUE_SETTINGS`, `FEE_RATES` and starting balances, and the bar
+    types the run loads, one per instrument as `backtest_run_config` derives them. A base field at its
+    default is left out, so a default config's key is what it was; a pin that changes a default moves
+    the key of a config holding that field at either value (ADR 0053 term 2). The study's sample is
+    not in it.
     """
     bar_types = list(dict.fromkeys(str(config.bar_type) for config in strategies))
     return {
         "strategies": [
             {
                 "class": STRATEGY_CLASS,
-                "config": {
-                    name: _canonical(value)
-                    for name, value in sorted(vars(config).items())
-                    if not name.startswith("_")
-                },
+                "config": _strategy_fields(config),
             }
             for config in strategies
         ],
@@ -457,6 +486,54 @@ def trial_config(
         },
         "data": {"data_type": "Bar", "bar_types": bar_types},
     }
+
+
+def base_config_defaults() -> dict[str, Any]:
+    """A copy of `_base_config_defaults()`, read once per process: the pin does not change in one."""
+    return dict(_base_config_defaults())
+
+
+@functools.cache
+def _base_config_defaults() -> dict[str, Any]:
+    """Each field of NautilusTrader's `StrategyConfig`, canonical, at its default at the pinned release.
+
+    The fields are read from the class by reflection when called, its data descriptors
+    (`inspect.getmembers(StrategyConfig, inspect.isgetsetdescriptor)`: the pyo3 getters of a Rust
+    struct), so a field upstream adds is in the key's reach without a change here.
+    """
+    default = StrategyConfig()
+    return {
+        name: _field(name, getattr(default, name))
+        for name, _ in inspect.getmembers(StrategyConfig, inspect.isgetsetdescriptor)
+    }
+
+
+def _strategy_fields(config: MaCrossConfig) -> dict[str, Any]:
+    """A strategy config's fields as the key holds them (ADR 0053 term 2).
+
+    Its own fields, and each base `StrategyConfig` field whose value is not its default at the pin
+    (`base_config_defaults`): such a value was set here and reaches the engine, as `order_id_tag`
+    does. A base field at its default is left out, so a default config's key is what it was before
+    base fields were read, and an upstream default moves no key of a config that keeps it.
+    """
+    fields = {
+        name: _field(name, value)
+        for name, value in vars(config).items()
+        if not name.startswith("_")
+    }
+    for name, default in _base_config_defaults().items():
+        value = _field(name, getattr(config, name))
+        if value != default:  # a base field is a read-only pyo3 getter, never in `vars(config)`
+            fields[name] = value
+    return dict(sorted(fields.items()))
+
+
+def _field(name: str, value: object) -> Any:
+    """`_canonical(value)`, or `TypeError` naming the field whose value has no stable text form."""
+    try:
+        return _canonical(value)
+    except TypeError as error:
+        raise TypeError(f"field {name!r}: {error}") from None
 
 
 def canonical_json(config: dict[str, Any]) -> str:
@@ -486,8 +563,12 @@ def session_days(bars: Sequence[Bar]) -> list[str]:
     return [str(day) for day in sorted({session_day(bar.ts_init) for bar in bars})]
 
 
-def data_digest(bars: Sequence[Bar]) -> dict[str, str]:
+def data_digest(bars: Sequence[Bar], bar_types: Sequence[str]) -> dict[str, str]:
     """ADR 0053's identity of the data a run read: for each bar type, a SHA-256 of its bars.
+
+    Each of `bar_types`, the bar types the run loads, has an entry even with no bar in `bars`, the
+    digest of no lines: the run read that bar type and found nothing, which another run that found
+    bars there must disagree with.
 
     The digest of a bar type is that of the UTF-8 bytes of one line per bar, in `bars`' order,
     `bar_type|open|high|low|close|volume|ts_event|ts_init`, the prices and the volume as NautilusTrader
@@ -495,7 +576,7 @@ def data_digest(bars: Sequence[Bar]) -> dict[str, str]:
     from the catalog's files, so rewriting or consolidating files moves no digest. Kept per bar type, so
     two trials on one sample that read one bar type can be checked to have read the same bars.
     """
-    lines: dict[str, list[str]] = {}
+    lines: dict[str, list[str]] = {bar_type: [] for bar_type in bar_types}
     for bar in bars:
         lines.setdefault(str(bar.bar_type), []).append(
             f"{bar.bar_type}|{bar.open}|{bar.high}|{bar.low}|{bar.close}|{bar.volume}|"
@@ -560,11 +641,11 @@ def record_trial(
         end=sample.end,
     )
     run_config = checked.config
-    checked_digest = data_digest(_in_order(checked.bars))
-    del checked  # only the digest is kept, so the checked bars are not held through the run
     bar_types = [str(bar_type) for data in run_config.data for bar_type in data.bar_types or ()]
     if bar_types != config["data"]["bar_types"]:
         raise RuntimeError(f"the run loads {bar_types}, not the bar types its key names")
+    checked_digest = data_digest(_in_order(checked.bars), bar_types)
+    del checked  # only the digest is kept, so the checked bars are not held through the run
 
     trial = _own_trial(study)
     try:
@@ -588,7 +669,7 @@ def record_trial(
                 f"the run replayed {len(outside)} bars outside {sample.describe()}, the first "
                 f"at {_date(outside[0].ts_init)}",
             )
-        digest = data_digest(bars)
+        digest = data_digest(bars, bar_types)
         if digest != checked_digest:
             raise RuntimeError(
                 f"the run read other bars than the coverage check read over {sample.describe()}: "

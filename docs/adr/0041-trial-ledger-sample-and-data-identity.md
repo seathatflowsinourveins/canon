@@ -136,6 +136,9 @@ Who decided. The orchestrator chose option 2 and its terms under the owner's del
   run's own end (`test_returns_after_the_run_s_end_stop`); a null, a 31-digit, a 5,000-digit, a negative
   and a past-64-bit session day (`test_a_session_day_that_crashed_the_ranking_stops_naming_it`); series
   named `1` and `"1"` (`test_names_distinct_only_by_type_are_refused`).
+* The fourth review's second part: a sample no nanosecond timestamp holds is refused on write
+  (`test_a_sample_no_timestamp_holds_is_refused`), and a stored sample not in the writer's form on read
+  (`test_a_stored_sample_not_in_the_writers_form_is_refused`), tests that failed before their fix.
 
 ## Evidence
 
@@ -203,3 +206,9 @@ package; run, executed in this checkout.
   the current sample and the sample numbers in two reads, now one. Kept as a known limit: a ranking
   answers for the sample current when it read the study, and a move after that read is first seen by the
   next one. No change of decision.
+* A fourth review of the gate, second part, 2026-11-10, read only, by a second reader: a sample ending
+  at 10**20 ns was written and every later read crashed in pandas, a date before 1677-09-21 or after
+  2262-04-11 raised a bare `OverflowError`, and `samples()` took a stored sample with a `bool` field or
+  a start after its end. Term 1's range is now checked on write against what NautilusTrader's
+  `UnixNanos` (a `u64`) and pandas (at most 2**63 - 1) both hold, and on read for that and for the form
+  `create_ledger_study` writes. Reproduced as failing tests. No change of decision.

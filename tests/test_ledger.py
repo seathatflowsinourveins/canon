@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import dataclasses
 import enum
+import hashlib
 import math
 import shutil
 import subprocess
@@ -840,7 +841,7 @@ def test_the_digest_is_of_the_bars_the_run_read_not_a_later_catalog(
     )
 
     first, second = study.trials
-    assert first.user_attrs["data_digest"] == data_digest(original)
+    assert first.user_attrs["data_digest"] == data_digest(original, [str(BAR_TYPE)])
     assert second.user_attrs["data_digest"] != first.user_attrs["data_digest"]
     with pytest.raises(RankingStopped, match="read different bars"):
         rank(study)
@@ -1250,3 +1251,157 @@ def test_a_waiting_trial_added_with_attributes_is_not_recorded_in(
     added, own = study.trials
     assert recorded.number == own.number == 1
     assert added.state == TrialState.FAIL and "config_key" not in added.user_attrs
+
+
+# The fourth review of the gate, second part, 2026-11-10: each test failed before its fix.
+
+EMPTY_DIGEST = hashlib.sha256(b"").hexdigest()
+# Every config key of the step 7 study (ADR 0048) and of this module's default configuration, as
+# they were before the key took in base `StrategyConfig` fields: a default config's key must not move.
+STEP_7_KEYS = (
+    "5725676d4cedee320a72f9a10600074bf76fcb0ade7ab7fcc21d722771e8241d",
+    "a437779d65601e16bb9ccfb46e9cfc2a9c26c49477063a31cdec742742c28297",
+    "ace41039b4144caa9dec8308a98aa64d89aabd2af3a5812c0c8e8c10eee0e127",
+    "c816426ebdc1e811981e5014ed3e4b9ba0d4fe12369aaad03d95a7e5bc845aaa",
+    "aaa1fe2872e2b5b4295c5179ea412b3daeb422ade2a7297a6c6a455df1c07a54",
+    "e4829d149e404bb99706d47411dd7ec61ad8040e0fa676169ef594a24b43ec18",
+    "17d11aa5d362d137a4e61dc00c884edec1dc8210a1dd67189965dcc1e881845f",
+    "6829078a18d0c165f9c49e4755459311d8a60f602970771118d5abbb143a9d42",
+)
+DEFAULT_CONFIG_SHA256 = "b78e0df8b2441340cab424695d300ab08a2fcd66a58ccb6185bbfdb48da99436"
+
+
+def tagged(bar_type: BarType, tag: str) -> MaCrossConfig:
+    """`strategy()`'s configuration on `bar_type` with `order_id_tag`, which two in one run need."""
+    return MaCrossConfig(
+        bar_type=bar_type,
+        trade_size=Quantity.from_int(10),
+        fast_period=3,
+        slow_period=8,
+        order_id_tag=tag,
+    )
+
+
+def test_a_bar_type_with_no_bar_in_the_sample_is_in_the_digest(
+    alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack
+) -> None:
+    """A bar type the catalog covers with no bar in the sample was left out of the digest, so a
+    trial on 0 of its bars and one on 40 agreed; alone, its run wrote `data_digest = {}`."""
+    alpaca_bars.write(tmp_path / "catalog")
+    alpaca_bars.write(
+        tmp_path / "catalog",
+        symbols=("MSFT",),
+        first=datetime(2025, 6, 2, tzinfo=NEW_YORK),
+        covered_from=utc_ns(START),
+    )
+    study = new_study(stack, tmp_path, "empty bar type")
+
+    recorded = record_trial(
+        study,
+        tmp_path / "catalog",
+        [tagged(BAR_TYPE, "A"), tagged(MSFT_BAR_TYPE, "M")],
+        starting_balances=BALANCES,
+    )
+
+    [trial] = study.trials
+    assert recorded.outcome == TRADED
+    assert set(trial.user_attrs["data_digest"]) == {str(BAR_TYPE), str(MSFT_BAR_TYPE)}
+    assert trial.user_attrs["data_digest"][str(MSFT_BAR_TYPE)] == EMPTY_DIGEST
+
+
+def test_data_digest_names_every_bar_type_the_run_loads() -> None:
+    assert data_digest([], [str(MSFT_BAR_TYPE)]) == {str(MSFT_BAR_TYPE): EMPTY_DIGEST}
+
+
+def test_a_base_strategy_config_field_set_away_from_its_default_is_in_the_key() -> None:
+    """`order_id_tag` reaches the engine and was left out of the key: two configurations shared one."""
+    keys = [
+        config_key(trial_config([tagged(BAR_TYPE, tag)], starting_balances=BALANCES))
+        for tag in ("A", "B")
+    ]
+
+    assert keys[0] != keys[1]
+    assert (
+        config_key(trial_config([strategy()], starting_balances=BALANCES)) == DEFAULT_CONFIG_SHA256
+    )
+
+
+def test_the_keys_of_default_configs_are_as_they_were() -> None:
+    """Taking in base fields set away from their defaults moves no key of a default config."""
+    from canon_trading.variant_study import grid
+    from canon_trading.variant_study import key_of
+
+    assert tuple(key_of(config) for config in grid()) == STEP_7_KEYS
+    assert (
+        config_key(trial_config([strategy()], starting_balances=BALANCES)) == DEFAULT_CONFIG_SHA256
+    )
+
+
+def test_the_base_defaults_the_key_is_taken_against_are_the_pinned_ones() -> None:
+    """The key leaves out a base field at its default at the pinned NautilusTrader. A pin that changes
+    a default moves the key of a config that sets that field to either value: this fails on such a
+    pin, and the move must say which keys change (ADR 0053 term 2)."""
+    assert canon_trading.ledger.base_config_defaults() == {
+        "external_order_instrument_ids": None,
+        "log_commands": True,
+        "log_events": True,
+        "log_rejected_due_post_only_as_warning": True,
+        "manage_contingent_orders": False,
+        "manage_gtd_expiry": False,
+        "manage_stop": False,
+        "market_exit_interval_ms": 100,
+        "market_exit_max_attempts": 100,
+        "market_exit_reduce_only": True,
+        "market_exit_time_in_force": "GTC",
+        "oms_type": None,
+        "order_id_tag": None,
+        "strategy_id": None,
+        "use_hyphens_in_client_order_ids": True,
+        "use_uuid_client_order_ids": False,
+    }
+
+
+def test_a_field_with_no_stable_text_form_is_named() -> None:
+    config = strategy()
+    setattr(config, "extra", object())  # noqa: B010, a field the class does not declare
+
+    with pytest.raises(TypeError, match="field 'extra'"):
+        trial_config([config], starting_balances=BALANCES)
+
+
+@pytest.mark.parametrize(
+    ("start", "end"),
+    [
+        pytest.param(0, 10**20, id="end past 2**63"),
+        pytest.param(-5, 10, id="negative start"),
+        pytest.param("1600-01-01", "1600-01-02", id="before pandas' first instant"),
+    ],
+)
+def test_a_sample_no_timestamp_holds_is_refused(
+    tmp_path: Path, start: int | str, end: int | str
+) -> None:
+    """Such a sample was written, and every later read of it crashed in pandas."""
+    with (
+        pytest.raises(ValueError, match="nanoseconds"),
+        create_ledger_study("s", start=start, end=end, path=tmp_path / "trials.db"),
+    ):
+        pass
+
+
+@pytest.mark.parametrize(
+    "stored",
+    [
+        pytest.param([{"number": False, "start": 0, "end": 10}], id="bool number"),
+        pytest.param([{"number": 0, "start": 500, "end": 100}], id="start after end"),
+        pytest.param([{"number": 0, "start": True, "end": 100}], id="bool start"),
+        pytest.param([{"number": 0, "start": 0, "end": 10**20}], id="end past 2**63"),
+    ],
+)
+def test_a_stored_sample_not_in_the_writers_form_is_refused(
+    tmp_path: Path, stack: ExitStack, stored: object
+) -> None:
+    study = new_study(stack, tmp_path, "odd sample")
+    study.set_user_attr(SAMPLES, stored)
+
+    with pytest.raises(LedgerNotFound, match="no sample in the form"):
+        samples(study)
