@@ -915,7 +915,7 @@ class WindowReport:
     """For a mover window, its choice (`stream_mover`, or `select_mover` as the fallback): the source,
     the symbol, its rank inputs, the names ranked and passed over with why, and the screener's list as
     Alpaca gave it."""
-    requests: list[dict[str, Any]] = field(default_factory=list)
+    requests_by_api: list[dict[str, Any]] = field(default_factory=list)
     """What the process sent to Alpaca's REST APIs by the window's end, per account and API, as the
     adapter counts it (`canon_alpaca.providers.request_counts`); the account is a number, never a key."""
     fill_prices: dict[str, list[str]] = field(default_factory=dict)
@@ -952,7 +952,7 @@ class WindowSkipped(RuntimeError):
     result; the run exits 0."""
 
 
-def _write_atomically(path: Path, body: str) -> None:
+def write_atomically(path: Path, body: str) -> None:
     """Replace `path` whole (`os.replace`), so a reader or a kill never sees half a record, through a
     temporary file of this writer's own (`tempfile.mkstemp`), so two writers never share one."""
     fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
@@ -979,8 +979,8 @@ def write_record(log_dir: Path, report: WindowReport | dict) -> None:
     log_dir = records_dir(log_dir)
     body = json.dumps(asdict(report) if isinstance(report, WindowReport) else report, indent=2)
     if isinstance(report, WindowReport):
-        _write_atomically(log_dir / f"window-{report.started}.json", body)
-    _write_atomically(log_dir / "latest.json", body)
+        write_atomically(log_dir / f"window-{report.started}.json", body)
+    write_atomically(log_dir / "latest.json", body)
 
 
 def write_heartbeat(log_dir: Path, outcome: str) -> None:
@@ -990,7 +990,7 @@ def write_heartbeat(log_dir: Path, outcome: str) -> None:
     still fires, status reads from the runner's own stamp, `scheduled-firing.json`, which no run by hand
     writes; a run by hand writes to its own folder (`mise.toml`, paper:session; ADR 0050)."""
     log_dir.mkdir(parents=True, exist_ok=True)
-    _write_atomically(
+    write_atomically(
         records_dir(log_dir) / "last-firing.json",
         json.dumps(
             {
@@ -1176,8 +1176,10 @@ STREAM_SOURCE = "stream"
 SAMPLE_MINUTES = 3
 """Clock minutes of bars the stream sample ranks on (UNCALIBRATED; the lead's 2026-11-11 direction: two or
 three). The sample's time counts against the window, as every start-up read does."""
-BAR_GRACE_SECS = 5.0
-"""How long after a minute ends the sample waits for that minute's bars (UNCALIBRATED)."""
+BAR_GRACE_SECS = 10.0
+"""How long after a minute ends the sample waits for that minute's bars (UNCALIBRATED). A symbol whose
+last-minute bar comes later is left out of the ranking, as one missing a minute is (a limit: which names a
+late delivery drops depends on the order Alpaca sends them in)."""
 SAMPLE_STOP_SECS = 15.0
 """How long the sample's stream thread may take to end after `stop()` (`movers_stream.STOP_SECS`)."""
 REFRESH_PASSES = 4
@@ -1197,7 +1199,7 @@ class MoverPick:
     symbol: str
     price: Decimal
     record: dict[str, Any]
-    entry: Decimal = Decimal(0)
+    entry: Decimal
     """The entry limit one share would be sent at (`entry_limit`), which the cap is checked against."""
 
 
@@ -1299,9 +1301,9 @@ def select_mover(
         raise TypeError("alpaca-py returned raw bar data; the client must use raw_data=False")
     close: dict[str, float] = {}
     dvol: dict[str, float] = {}
+    # completed minutes only, the ones `minute_dollars` counts (Muse's finding 2, 2026-11-11)
+    done = regular_open + timedelta(minutes=elapsed)
     for symbol in symbols:
-        # completed minutes only, the ones `minute_dollars` counts (Muse's finding 2, 2026-11-11)
-        done = regular_open + timedelta(minutes=elapsed)
         if found := [b for b in bars.data.get(symbol, []) if b.timestamp < done]:
             close[symbol] = max(found, key=lambda b: b.timestamp).close
             dvol[symbol] = sum(minute_dollars(found, regular_open, elapsed))
@@ -1434,11 +1436,12 @@ def sample_stream(
     *,
     clock: Callable[[], float] = time.time,
     sleep: Callable[[float], None] = time.sleep,
-) -> tuple[dict[str, float], dict[str, float], datetime, int, dict[str, int]]:
+) -> tuple[dict[str, float], dict[str, float], datetime, int, dict[str, int], int]:
     """The whole market's sip minute bars (`subscribe_bars(handler, "*")`, run in a thread ended by
     `stop()`, as `movers_stream.run` streams them) from the current clock minute for `minutes` minutes:
     each symbol's last close, its dollar volume since the sample's first minute (`movers_stream.Tape`),
-    that minute's start, the minutes with bars, and the message counts; or `StreamSampleFailed`."""
+    that minute's start, the minutes with bars, the message counts, and how many symbols were left out
+    for lacking a bar in one of those minutes; or `StreamSampleFailed`."""
     start = clock()
     window = minute_start(start)
     tape = Tape(window_start=window)
@@ -1457,7 +1460,10 @@ def sample_stream(
 
     async def on_bar(msg: dict) -> None:  # on the stream's thread: the GIL guards `seen`'s updates
         t, symbol = epoch_seconds(msg.get("t")), msg.get("S")
-        if isinstance(symbol, str) and t is not None and t >= window:
+        complete = (
+            msg.get("c") is not None and msg.get("v") is not None
+        )  # as `Tape.on_bar` reads it
+        if isinstance(symbol, str) and t is not None and t >= window and complete:
             seen.setdefault(symbol, set()).add(minute_start(t))
         await tape.on_bar(msg)
 
@@ -1490,11 +1496,12 @@ def sample_stream(
     if elapsed < 1 or not dvol:
         raise StreamSampleFailed(f"the sample saw no bar in its {minutes} minute(s): {counts}")
     # a symbol is ranked only on a bar in every minute of the sample (Muse's finding 4, 2026-11-11)
-    incomplete = [s for s in dvol if len(seen.get(s, ())) < elapsed]
+    # and is left out of the closes too, so it takes none of `refresh`'s reads (second review, 2026-11-11)
+    incomplete = [s for s in close if len(seen.get(s, ())) < elapsed]
     for s in incomplete:
-        del dvol[s]
-    counts["incomplete"] = len(incomplete)
-    return close, dvol, datetime.fromtimestamp(window, UTC), elapsed, counts
+        close.pop(s, None)
+        dvol.pop(s, None)
+    return close, dvol, datetime.fromtimestamp(window, UTC), elapsed, counts, len(incomplete)
 
 
 def stream_mover(
@@ -1515,7 +1522,7 @@ def stream_mover(
     `sample_stream`'s; references and normals are `movers_stream.refresh`'s reads (`REFRESH_PASSES`), the
     score `movers_stream.rank`'s (UNCALIBRATED, ADR 0083 gap 1), over the sample's own clock minutes. Alpaca's
     gainers are read once beside it, for the record only."""
-    close, dvol, window_start, elapsed, counts = sample_stream(
+    close, dvol, window_start, elapsed, counts, incomplete = sample_stream(
         stream, minutes, clock=clock, sleep=sleep
     )
     reads = Reads()
@@ -1535,7 +1542,7 @@ def stream_mover(
             "from": window_start.isoformat(),
             "minutes": minutes,
             "elapsed_minutes": elapsed,
-            "incomplete": counts.pop("incomplete", 0),
+            "incomplete": incomplete,
             "messages": counts,
             "symbols": len(close),
             "references_known": sum(1 for v in reads.references.values() if v is not None),
@@ -1569,6 +1576,10 @@ def choose_mover(
     (`MOVER_SOURCE`), and the record says why (`stream_failed`). `at` is Alpaca's clock at the start; the
     fallback's is moved on by the time the sample took."""
     began = time.monotonic()
+
+    def alpaca_now() -> datetime:
+        return at + timedelta(seconds=time.monotonic() - began)
+
     data, screener, actions = window_data(), window_screener(), window_actions()
     try:
         return stream_mover(
@@ -1578,13 +1589,12 @@ def choose_mover(
             screener,
             actions,
             since,
-            now=lambda: at + timedelta(seconds=time.monotonic() - began),
+            now=alpaca_now,
         )
     except (StreamSampleFailed, WindowRefused, *FAILED) as e:
         failed = f"{type(e).__name__}: {e}"
-    now = at + timedelta(seconds=time.monotonic() - began)
     try:
-        pick = select_mover(trading, data, screener, actions, now, regular_open, since)
+        pick = select_mover(trading, data, screener, actions, alpaca_now(), regular_open, since)
     except FAILED as e:
         raise WindowRefused(
             f"no mover: the stream sample failed ({failed}), then Alpaca's movers did: "
@@ -1749,7 +1759,7 @@ def run_window(
             raise
         finally:
             report.ended = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-            report.requests = [
+            report.requests_by_api = [
                 {
                     "account": c.account,
                     "api": c.api,

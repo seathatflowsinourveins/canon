@@ -5753,23 +5753,25 @@ def test_the_fallback_ranks_on_completed_minutes_only() -> None:
 
 def test_the_stream_paths_freshness_is_measured_on_alpacas_clock() -> None:
     """Muse's finding 3 (2026-11-11): the trade-age proxy is read against Alpaca's clock moved on by the
-    process's monotonic time (`now`), not the host's clock, which may be off by up to `SKEW_SECS`."""
+    process's monotonic time (`now`), not the host's clock, which may be off by up to `SKEW_SECS`: trades 35
+    s old by the host are 135 s old by Alpaca's clock here, so every name is passed over as halted."""
     stream = SampleStream()
-    venue = AT + timedelta(seconds=100)
-    pick = session_window.stream_mover(
-        cast(TradingClient, Assets()),
-        cast(Any, stream),
-        cast(Any, Data()),
-        cast(Any, Screener()),
-        cast(Any, Actions()),
-        date(2026, 11, 9),
-        minutes=1,
-        clock=lambda: AT.timestamp() + 30,
-        sleep=stream.wait,
-        now=lambda: venue,
-    )
-    assert pick.record["at"] == venue.isoformat()
-    assert pick.record["last_trade_at"] == (AT - timedelta(seconds=5)).isoformat()
+    venue = AT + timedelta(seconds=130)
+    with pytest.raises(
+        session_window.WindowRefused, match=r"LLL: its latest sip trade is 135 s old"
+    ):
+        session_window.stream_mover(
+            cast(TradingClient, Assets()),
+            cast(Any, stream),
+            cast(Any, Data()),
+            cast(Any, Screener()),
+            cast(Any, Actions()),
+            date(2026, 11, 9),
+            minutes=1,
+            clock=lambda: AT.timestamp() + 30,
+            sleep=stream.wait,
+            now=lambda: venue,
+        )
 
 
 def test_a_symbol_without_a_bar_in_every_minute_of_the_sample_is_not_ranked() -> None:
@@ -5790,5 +5792,7 @@ def test_a_symbol_without_a_bar_in_every_minute_of_the_sample_is_not_ranked() ->
     )
     assert pick.symbol == "EEE"
     assert [r["symbol"] for r in pick.record["ranked"]] == ["EEE"]
+    # left out of the closes too, so none of the reads after the sample is spent on it
+    assert pick.record["sample"]["symbols"] == 1
     assert pick.record["sample"]["elapsed_minutes"] == 2
     assert pick.record["sample"]["incomplete"] == 1
