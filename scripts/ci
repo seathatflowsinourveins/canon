@@ -4,7 +4,8 @@
 # The commit gate (.githooks/pre-commit), scripts/land and the GitHub workflow (.github/workflows/ci.yml)
 # all run this script, so a change is judged the same way on this Mac and in CI. Tools come from the pinned
 # toolchain: mise.toml + mise.lock for shellcheck, gitleaks, actionlint and uv; uv.lock for ruff, ty and
-# pytest. PATH is set once from `mise env`; a tool counts as present only if it is in a directory mise
+# pytest. PATH is set once from `mise env`, with the directories mise manages first whatever order the
+# caller's PATH had (toolchain_first, below); a tool counts as present only if it is in a directory mise
 # manages, so a missing tool fails its check by name.
 #
 # What is checked:
@@ -37,6 +38,28 @@ else echo "ci: FAIL: mise not found. Run scripts/bootstrap --install."; exit 1; 
 if ! MISE_ENV_SH=$("$MISE" env -s bash); then echo "ci: FAIL: \`mise env -s bash\` failed."; exit 1; fi
 if ! MISE_PATHS=$("$MISE" env --paths); then echo "ci: FAIL: \`mise env --paths\` failed."; exit 1; fi
 eval "$MISE_ENV_SH"
+# Then the directories mise manages go first on PATH, in mise's order, and each later copy of one is dropped.
+# With `mise activate`, "mise adds each selected tool's bin directory to the front of PATH"
+# (https://mise.jdx.dev/dev-tools/shims.html),
+# and so does mise-action on GitHub, but `mise env` leaves a directory the caller's PATH already lists where
+# it is (observed with mise 2026.11.5). An agent that Orca starts after a workspace's setup runs under
+# `bash -lc`, whose /etc/profile runs macOS's path_helper, which moves /usr/bin and the other system
+# directories ahead of the mise ones zsh had put first; every check then ran /usr/bin/python3 (3.9) as
+# `python3`, and a tool found under a mise directory by has_tool could be run from an earlier one.
+# `mise env --paths` lists the global config's tools too, as an activated shell has them first.
+toolchain_first() {
+  local d p new="" nl=$'\n'
+  local -a parts
+  while IFS= read -r d; do [ -n "$d" ] && new="${new:+$new:}$d"; done <<<"$MISE_PATHS"
+  [ -n "$new" ] || return 0
+  IFS=: read -r -a parts <<<"$PATH"
+  for p in ${parts[@]+"${parts[@]}"}; do
+    case "$nl$MISE_PATHS$nl" in *"$nl$p$nl"*) [ -n "$p" ] && continue ;; esac
+    new="$new:$p"
+  done
+  PATH=$new; export PATH
+}
+toolchain_first
 # has_tool <name>: true if <name> is an executable in a directory mise manages
 has_tool() {
   local d

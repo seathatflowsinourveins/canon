@@ -9,7 +9,7 @@
 # Usage: scripts/test-canon [pattern]   run only the sections whose name contains pattern
 #        (names: baseline, registry validation, resolve keeps pins, stale pin, check exits, refs, evidence,
 #        workflows, broken pipe, outdated, network down, mise requests, claude pin, resolve lock, lint hook,
-#        watch and brief)
+#        watch and brief, brief toolchain)
 # Prints one line per case. Exit 0 if every case passes, 1 otherwise. TEST_CANON_VERBOSE=1 shows the
 # output of the command under test for a failing case.
 set -uo pipefail
@@ -602,8 +602,10 @@ sec_watch_and_brief() {
      retagged: [], advanced: [], stale: [], bot_prs: [], errors: [],
      newer: [{id: "nt", role: "foundation", pinned: "v2.0.0rc8", status: "STABLE-AVAILABLE",
               newest: "v2.1.0rc1", newest_stable: "v2.0.0"}]}' > "$T/.canon/watch.json"
+  # a fake mise that names the python3 the hook finds, so these cases never ask the machine's mise
+  mkdir -p "$W/m"; printf '#!/bin/bash\ncommand -v python3\n' > "$W/m/mise"; chmod +x "$W/m/mise"
   brief() { jq -cn --arg c "$1" '{hook_event_name:"SessionStart", cwd:$c}' \
-    | CLAUDE_PROJECT_DIR="$1" "$T/.claude/hooks/session-brief.sh" 2>&1; }
+    | PATH="$W/m:$PATH" CLAUDE_PROJECT_DIR="$1" "$T/.claude/hooks/session-brief.sh" 2>&1; }
   watch() { jq -cn --arg c "$1" '{hook_event_name:"SessionStart", cwd:$c}' \
     | CLAUDE_PROJECT_DIR="$1" "$1/.claude/hooks/canon-watch.sh" >/dev/null 2>&1; }
   out=$(brief "$T")
@@ -656,10 +658,37 @@ sec_watch_and_brief() {
   check "the brief ignores a review-by in the body"          lacks "$out" "0996"
 }
 
+# The brief's toolchain line: said only when a bare python3 here is not the one `mise which python3` names.
+sec_brief_toolchain() {
+  fresh
+  mkdir -p "$W/sys" "$W/tool" "$W/m"
+  printf '#!/bin/bash\nexit 0\n' > "$W/sys/python3"; printf '#!/bin/bash\nexit 0\n' > "$W/tool/python3"
+  # the fake mise answers `which python3` with $MISE_PY, or fails when it is empty
+  # shellcheck disable=SC2016  # expanded by the fake, not here
+  printf '#!/bin/bash\n[ "$*" = "which python3" ] && [ -n "$MISE_PY" ] && { echo "$MISE_PY"; exit 0; }\nexit 1\n' > "$W/m/mise"
+  chmod +x "$W/sys/python3" "$W/tool/python3" "$W/m/mise"
+  tbrief() { jq -cn --arg c "$T" '{hook_event_name:"SessionStart", cwd:$c}' \
+    | PATH="$W/m:$1:$PATH" MISE_PY="$2" CLAUDE_PROJECT_DIR="$T" "$T/.claude/hooks/session-brief.sh" 2>&1; }
+  out=$(tbrief "$W/sys:$W/tool" "$W/tool/python3")
+  check "a system python3 first on PATH is named, with the toolchain's" has "$out" "python3 on this session's PATH is $W/sys/python3, not the toolchain's $W/tool/python3"
+  check "... and what to do"                                 has "$out" "mise exec -- python3"
+  out=$(tbrief "$W/tool:$W/sys" "$W/tool/python3")
+  check "the toolchain's python3 first: no toolchain line"   lacks "$out" "toolchain:"
+  check "... and the brief is otherwise whole"               has "$out" "upstreams pinned"
+  out=$(tbrief "$W/sys" "")
+  check "mise giving no answer is said, not passed over"     has "$out" "gave no answer here"
+  ln -s "$W/tool/python3" "$W/venv-python3"; mkdir -p "$W/venv"; ln -s "$W/venv-python3" "$W/venv/python3"
+  out=$(tbrief "$W/venv:$W/sys" "$W/tool/python3")
+  check "a python3 that links to the toolchain's is the toolchain's" lacks "$out" "toolchain:"
+  out=$(jq -cn --arg c "$T" '{hook_event_name:"SessionStart", cwd:$c}' \
+    | HOME="$W/nohome" PATH="$W/sys:/usr/bin:/bin" CLAUDE_PROJECT_DIR="$T" "$T/.claude/hooks/session-brief.sh" 2>&1)
+  check "no mise at all is said, with the fix"               has "$out" "mise not found on PATH or at ~/.local/bin/mise; run scripts/bootstrap --install"
+}
+
 # Each section runs in the background in its own work directory (W, T, EXTRA, FAKE_DIR, BEFORE), so the
 # sections can run at once. Their lines are printed in order once all have finished.
 SECTIONS="baseline registry_validation resolve_keeps_pins stale_pin check_exits refs evidence workflows broken_pipe
-          outdated network_down mise_requests claude_pin resolve_lock lint_hook watch_and_brief pipe_readers"
+          outdated network_down mise_requests claude_pin resolve_lock lint_hook watch_and_brief brief_toolchain pipe_readers"
 pids=""; ran=""
 for s in $SECTIONS; do
   name=${s//_/ }
