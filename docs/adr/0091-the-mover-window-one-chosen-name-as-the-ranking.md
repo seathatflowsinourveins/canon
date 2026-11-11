@@ -83,6 +83,20 @@ top of book is not the national best bid and offer. On 2026-11-11 that decided t
   filling after its sale had released, and it was sent at an ask of 0.3857 against a bid near 0.28.
   Both were fixed with failing tests first (ADR 0088). Rerun, exit 0: seven rising runs, each refused
   because IEX's bid was under the planned stop; no entry, no fill.
+* **Window 1**, 2026-11-11, 13:20:49 to 14:04:06 New York, paper account A, the regular session; from
+  the strategy's first commit with uncommitted changes (their diff's SHA-256 begins `9b7991ed`), before
+  the fixes it led to. The name was CENN, from the stream sample: up 128.3% from a close of 0.1227, a
+  dollar-volume ratio of 1,031; GOVX and SLXN ranked above it and were passed over, for a reverse
+  split and for no fresh trade. No rising run of three closes came for 37 minutes. At 13:58:00 a DAY
+  limit to buy 1,686 at the ask, 0.2141, was accepted in 20 ms and filled in six parts in ten seconds,
+  358.24 dollars. The emulated trailing stop-limit was released at 13:59:05 at a bid of 0.2085, as a
+  limit Alpaca accepted in 23 ms; 1,044 filled at 0.2084, and the 642 left were re-priced by a cancel
+  and a new limit and filled by 13:59:16. Result: 349.12 dollars back, 9.11 lost, 2.54% under holding
+  flat. The window ended `ok` and flat without its account check closing anything: 307 trading-API
+  requests, at most 15 in 60 seconds, no 429. What it showed, each fixed since (ADR 0088): every
+  further fill of the entry remade the trailing sell a second later and from a lower trigger (0.2058
+  down to 0.2039); the log said nothing of the 37 minutes; the record's notes were empty. Its record
+  is `window-20261111T182049Z.json`, kept outside the repository.
 
 ## Evidence
 

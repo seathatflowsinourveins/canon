@@ -795,13 +795,17 @@ class Mover(Strategy):
             else:
                 self._trail(slot, held, now)
         elif order.is_emulated:
-            # No order is modified. A trailing sell that no longer covers what is held is canceled;
-            # the next step finds it closed and makes one for all of it, from the trigger this one
-            # had reached.
+            # No order is modified. A trailing sell that no longer covers what is held is canceled,
+            # and one for all of it is made from the trigger this one had reached.
             if order.quantity.as_decimal() != held and not order.is_pending_cancel:
                 if order.trigger_price is not None:
                     slot.trail_trigger = order.trigger_price.as_decimal()
                 self.cancel_order(order.client_order_id)
+                # The emulator cancels its own order before the call returns, so the cancel is seen
+                # terminal here and the new sell follows in this step, not a second later.
+                canceled = self._order(slot.protect_id)
+                if canceled is not None and canceled.is_closed:
+                    self._trail(slot, held, now)
         elif slot.exiting:
             self._chase(slot, order, held, now, slot.floor)
 

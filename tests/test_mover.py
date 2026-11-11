@@ -753,8 +753,12 @@ def test_a_partly_filled_entry_is_protected_for_what_is_held_without_a_modify() 
     orders = run(eng, s, ranker(rank((AAA, "0.25"))), data)
     trailing = [o for o in orders if o.order_type.name == "TRAILING_STOP_LIMIT"]
     sizes = [o.quantity.as_decimal() for o in trailing]
+    gap = trailing[1].ts_init - trailing[0].ts_last
     eng.dispose()
     assert sizes == [Decimal(1), Decimal(3)]
+    # the emulator confirms its own cancel at once, so the new sell is made in the same step: the first
+    # paper window had a second between the two, four times (ADR 0091)
+    assert gap == 0
 
 
 def test_a_release_that_is_refused_keeps_the_chase_floor_of_its_first_price() -> None:

@@ -99,7 +99,14 @@ replay computes them).
 
 * Good: one class from one slot to several; each order path is an upstream call.
 * Bad: a gap through both the trigger and the limit leaves a resting sale, chased only to its floor.
-* Bad: a partly filled entry is protected from the next step, a second later, not at once.
+* Bad: a partly filled entry is protected from the next step, a second later, not at once. Each further
+  fill cancels the trailing sell and makes one for all that is held in the same step, since the
+  emulator confirms its own cancel before the call returns; a change of quantity in place would be a
+  `modify_order` call, which the rule above bars.
+* Bad: the protection lives in the node's emulator, not at the broker. If the node dies inside a
+  window nothing sells: the position stays until the window's own account check, if its process still
+  runs, the next window's start check, which refuses to start while the account is not flat and names
+  what is left, or a person. The requirement's backstop, a wide stop held by the broker, is not built.
 * Bad: nothing bounds the time without a working sale when a replacement is refused again and again;
   `is_closed` after a reconciliation cancel is not proof of a venue cancel (ADR 0075); the market exit
   at the wind-down does not wait for cancels to be terminal; with the `LAST_PRICE` trigger a sub-penny
@@ -113,8 +120,9 @@ replay computes them).
   during cancellation" (a test here shows the trailing sell canceled no later than the exit's order);
   `FixedRiskSizer` "exceeding risk and quantity limits"; `Portfolio` reservations "remaining locked after
   rejected LIT and trailing stop limit orders", which sizing reads through the free balance.
-* On paper: ADR 0091 holds each window. UNVERIFIED until one shows it: the emulated trailing stop-limit
-  on Alpaca's paper venue, the mark travelling on a release, and the size under paper's fills.
+* On paper: ADR 0091 holds each window. Its first, 2026-11-11, showed the limit entry filled in
+  parts, the emulated trailing stop-limit released as a limit Alpaca accepted, and a cancel-then-place
+  re-price. UNVERIFIED still: the mark travelling on a release outside the session.
 
 ## Evidence
 
