@@ -20,7 +20,9 @@ TMP=$(mktemp -d "${TMPDIR:-/tmp}/canon-test-maintenance.XXXXXX") \
   || { echo "test-maintenance: could not create a temp folder under ${TMPDIR:-/tmp}" >&2; exit 1; }
 TMP=$(cd "$TMP" && pwd)   # TMPDIR ends in a slash; the scripts name paths as pwd(1) gives them
 HOLDERS=""
-cleanup() { local p; for p in $HOLDERS; do kill "$p" 2>/dev/null; done; rm -rf "${TMP:?}"; }
+# the boundary waiters the rounds started are process groups of their own (maintenance.sh, set -m)
+cleanup() { local p; for p in $HOLDERS; do kill "$p" 2>/dev/null; done
+  while read -r p; do kill -- "-$p" 2>/dev/null; done < <(cat "$TMP/waiters" 2>/dev/null); rm -rf "${TMP:?}"; }
 trap cleanup EXIT
 GIT_CEILING_DIRECTORIES=$(cd "$TMP/.." && pwd -P); export GIT_CEILING_DIRECTORIES
 pass=0; fail=0
@@ -42,10 +44,23 @@ cat > "$B/getconf" <<EOF
 echo "$LT"
 EOF
 # mise: logs; `which agy` names the agy stand-in when there is one; `where npm:omniroute` says installed when
-# $STUB/omniroute-installed exists; `which otelcol` names the otelcol stand-in
+# $STUB/omniroute-installed exists; `which otelcol` names the otelcol stand-in. Its version is
+# $STUB/mise-version's, which `self-update <version>` replaces; mise's global config is $STUB/global/<tool>,
+# one file a tool holding its version, which `ls --global --json <tool>` reads (the array mise 2026.11.5
+# prints, observed) and `use --global --yes <tool>@<version>` writes; $STUB/<command>-rc fails either
 cat > "$B/mise" <<'EOF'
 #!/bin/bash
 echo "mise $* | env=${MISE_ENV:-}" >> "$STUB/mise.log"
+gf() { printf '%s/global/%s' "$STUB" "$(printf '%s' "$1" | tr '/:@' '___')"; }
+case "$1" in
+  --version) cat "$STUB/mise-version" 2>/dev/null || echo "2026.11.5 macos-arm64 (2026-11-09)"; exit 0 ;;
+  self-update) [ ! -f "$STUB/self-update-rc" ] || { echo "mise ERROR stand-in self-update failed" >&2; exit "$(cat "$STUB/self-update-rc")"; }
+               echo "${!#} macos-arm64 (stand-in)" > "$STUB/mise-version"; exit 0 ;;
+  ls) f=$(gf "${!#}"); if [ -f "$f" ]; then v=$(cat "$f"); printf '[{"version":"%s","requested_version":"%s","installed":true,"active":true}]\n' "$v" "$v"
+      else echo '[]'; fi; exit 0 ;;
+  use) a=${!#}; [ ! -f "$STUB/use-rc" ] || { echo "mise ERROR stand-in could not install $a" >&2; exit "$(cat "$STUB/use-rc")"; }
+       mkdir -p "$STUB/global"; echo "${a##*@}" > "$(gf "${a%@*}")"; exit 0 ;;
+esac
 case "$1 ${2:-}" in
   "which agy") [ -x "$STUB/agy" ] && { echo "$STUB/agy"; exit 0; }; exit 1 ;;
   "which otelcol") echo "$STUB/otelcol"; exit 0 ;;
@@ -119,6 +134,7 @@ case "$1" in
     done
     d="gui/$(id -u)"
     for l in local.canon.maintenance local.canon.lanes-watch local.canon.paper-session local.canon.otel-collector local.canon.omniroute; do
+      [ "${2:-}" != --defer-paper ] || [ "$l" != local.canon.paper-session ] || continue
       launchctl bootout "$d/$l" 2>/dev/null
       sleep "$(cat "$STUB/install-secs" 2>/dev/null || echo 0)"
       launchctl bootstrap "$d" "$HOME/Library/LaunchAgents/$l.plist"
@@ -137,6 +153,15 @@ cat "$STUB/bootstrap-out" 2>/dev/null
 exit "$(cat "$STUB/bootstrap-rc" 2>/dev/null || echo 0)"
 EOF
 chmod +x "$OW/scripts/automation" "$OW/scripts/bootstrap"; echo 1 > "$OW/tracked"
+# main's registry: the pins (d) reads, as canon/upstreams.json gives them; oreg <id> <track> moves one
+mkdir -p "$OW/canon"
+jq -n '{upstreams: [{id: "mise", track: "tag:v2026.11.5"}, {id: "codex-cli", track: "tag:rust-v0.167.0"},
+        {id: "pnpm", track: "tag:v10.34.9"}, {id: "deepseek-harness", track: "tag:dsh-v0.2.1-rc.3"},
+        {id: "dsh-tui", track: "tag:v0.17.0"}]}' > "$OW/canon/upstreams.json"
+oreg() { jq --arg id "$1" --arg t "$2" '(.upstreams[] | select(.id == $id) | .track) = $t' "$OW/canon/upstreams.json" > "$OW/canon/u.t" && mv "$OW/canon/u.t" "$OW/canon/upstreams.json"; }
+# mise's global config as on this machine: every tool at main's pin
+mkdir -p "$STUB/global"; echo 0.167.0 > "$STUB/global/codex"; echo 10.34.9 > "$STUB/global/pnpm"
+echo 0.2.1-rc.3 > "$STUB/global/npm__deepseek-ai_dsh"; echo 0.17.0 > "$STUB/global/npm__deepseek-harness-tui_dsh-tui"
 ocommit() { git -C "$OW" add -A && git -C "$OW" -c user.name=t -c user.email=t@example.com commit -qm "$1" && git -C "$OW" push -q "$O" HEAD:main; }
 ocommit first
 git clone -q "$O" "$R"
@@ -151,12 +176,14 @@ round() {
   set -m
   env -i HOME="$H" CLAUDE_CONFIG_DIR="$AH" STUB="$STUB" CANON_GETCONF="$B/getconf" \
       CANON_MAINTENANCE_FETCH_SECS="${FETCH_SECS:-30}" CANON_MAINTENANCE_STEP_SECS="${STEP_SECS:-30}" \
-      CANON_MAINTENANCE_UPDATE_SECS="${UPDATE_SECS:-30}" \
+      CANON_MAINTENANCE_UPDATE_SECS="${UPDATE_SECS:-30}" CANON_MAINTENANCE_BOUNDARY_SECS="${BOUNDARY_SECS:-47}" \
+      CANON_MAINTENANCE_BOUNDARY_ROUND_SECS=10 \
       /bin/bash "$ROOT/home/.claude/canon/maintenance.sh" "$R" "$B/mise" >> "$TMP/round.out" 2>&1 &
   local p=$!
   set +m
   echo "$p" > "$STUB/pgid-local.canon.maintenance"
   wait "$p"; RC=$?; ROUNDPG=$p; export RC ROUNDPG
+  sed -n 's/.*a waiter waits for the windows. lock as process \([0-9]*\)$/\1/p' "$TMP/round.out" >> "$TMP/waiters"
   kill -KILL -- "-$p" 2>/dev/null
   rm -f "$STUB/pgid-local.canon.maintenance"
   return 0
@@ -179,8 +206,10 @@ check "... nothing differed: no installer ran, the record says ok and nothing in
 check "... each step logged" eval 'grep -q "(a) fast-forwarded" "$TMP/round.out" && grep -q "(b) compare" "$TMP/round.out" && grep -q "(c) runtime updates" "$TMP/round.out"'
 check "... the daily updates ran: claude update and agy update, nothing else" \
       eval '[ "$(cat "$STUB/updates.log")" = "$(printf "claude update\nagy update")" ] && jqt "$MU" ".results == [\"claude: claude: updated (stand-in)\", \"agy: agy: updated (stand-in)\"]"'
-check "... Codex, Muse Code, DeepSeek Harness and dsh-tui left alone, said once in the log" \
-      eval '! grep -Eiq "codex|dsh|muse" "$STUB/mise.log" "$STUB/updates.log" && [ "$(grep -c "Codex, Muse Code, DeepSeek Harness and dsh-tui are not updated here" "$TMP/round.out")" = 1 ]'
+check "... Codex, Muse Code, DeepSeek Harness and dsh-tui not updated by (c), said once in the log" \
+      eval '! grep -Eiq "codex|dsh|muse" "$STUB/updates.log" && [ "$(grep -c "Codex, Muse Code, DeepSeek Harness and dsh-tui are not updated here" "$TMP/round.out")" = 1 ]'
+check "... (d): mise and its global tools already at main's pins: nothing updated, each named" \
+      eval '! grep -Eq "^mise (use|self-update)" "$STUB/mise.log" && jqt "$MS" ".pins == [\"mise: at 2026.11.5\", \"codex: at 0.167.0\", \"pnpm: at 10.34.9\", \"npm:@deepseek-ai/dsh: at 0.2.1-rc.3\", \"npm:@deepseek-harness-tui/dsh-tui: at 0.17.0\"]"'
 
 logs_clear; round
 check "nothing differs, at origin/main: no installer, no update within the day" \
@@ -263,28 +292,67 @@ rm -f "$STUB/install-secs"; for l in local.canon.maintenance local.canon.lanes-w
 logs_clear; round; settled
 check "... retried at the next round, at the same origin/main" eval 'grep -q "^automation install" "$STUB/installers.log" && jqt "$MS" ".install.state == \"done\""'
 echo 3d > "$OW/tracked"; ocommit window-meanwhile; echo "${LT}canon-paper-windows.lock" > "$STUB/differs-takes-lock"; logs_clear; round
-check "a window that took the paper lock during the compare: the install not started, the next round installs" \
-      eval '! grep -q "^automation install" "$STUB/installers.log" && jqt "$MS" "(.note | test(\"automation install not started: the windows. lock was taken \\\\(canon-paper-windows.lock is held: a paper window runs\\\\)\")) and .install == null"'
+settled
+check "a window that took its lock during the compare: the install runs at once without the paper section, nothing deferred" \
+      eval 'grep -q "^automation install --defer-paper " "$STUB/installers.log" && grep -q "^install finished" "$STUB/installers.log" && jqt "$MS" ".install.state == \"done\" and .deferred == null"'
 rm -f "$STUB/differs-takes-lock"; sleep 4; logs_clear; round; settled
-check "... and it does" grep -q "^automation install" "$STUB/installers.log"
+check "... and the same differences are not installed again once the window has ended" \
+      eval '! grep -q "^automation install" "$STUB/installers.log" && jqt "$MS" "(.failed | map(test(\"^automation install not repeated\")) | any)"'
 echo 3e > "$OW/tracked"; ocommit test-meanwhile; echo "${LT}canon-paper-test.lock" > "$STUB/differs-takes-lock"; logs_clear; round; settled
 check "a paper test that took its lock during the compare: the install runs all the same, since it touches nothing account A uses" \
       eval 'grep -q "^install finished" "$STUB/installers.log" && grep -qx "install: paper-test lock held" "$STUB/installers.log" && jqt "$MS" ".install.state == \"done\""'
 rm -f "$STUB/differs-takes-lock"; sleep 4
 rm -f "$STUB/differs-out" "$STUB/differs-rc"; round
 
-# the paper lock held, a window's (account B) or a paper test's (account A): nothing at all this round
+# a window runs (account B's lock held): only the paper section waits, for the session boundary
+BF="$W/maintenance-boundary.json"
+# waiting_waiters: how many of the boundary waiters this test's rounds started are alive; no_waiter: none
+# is, polled for up to 5 s (one that has run its round is ending)
+waiting_waiters() { local p n=0; while read -r p; do ! kill -0 "$p" 2>/dev/null || n=$((n + 1)); done < <(cat "$TMP/waiters" 2>/dev/null); echo "$n"; }
+no_waiter() { local i; for i in $(seq 1 50); do [ "$(waiting_waiters)" = 0 ] && return 0; sleep 0.1; done; return 1; }
+# boundary_is <state>: maintenance-boundary.json says it, polled for up to 30 s
+boundary_is() { local i; for i in $(seq 1 60); do jqt "$BF" ".state == \"$1\"" && return 0; sleep 0.5; done; return 1; }
+for l in local.canon.maintenance local.canon.lanes-watch local.canon.paper-session local.canon.otel-collector local.canon.omniroute; do echo running > "$STUB/loaded/$l"; done
+PDIFF="automation: $AH/canon/paper-session.sh differs from home/.claude/canon/paper-session.sh"
+printf '%s\nautomation: %s/Library/LaunchAgents/local.canon.lanes-watch.plist differs from what install writes\n' "$PDIFF" "$H" > "$STUB/differs-out"; echo 1 > "$STUB/differs-rc"
 echo 4 > "$OW/tracked"; ocommit fourth
+/usr/bin/lockf -k "${LT}canon-paper-windows.lock" sleep 60 & HOLDERS="$HOLDERS $!"; hp=$!; sleep 0.5
+logs_clear; round; settled
+check "a window's lock held: the main checkout still moves to origin/main" \
+      eval '[ "$RC" = 0 ] && head_is_origin && jqt "$MS" "(.ff | startswith(\"fast-forwarded \")) and .outcome == \"ok\""'
+check "... the other agents are installed at once, the paper section left out (install --defer-paper)" \
+      eval 'grep -q "^automation install --defer-paper " "$STUB/installers.log" && grep -q "^install finished" "$STUB/installers.log" && ! grep -q "bootout.*local.canon.paper-session" "$STUB/launchctl.log" && jqt "$MS" ".install.state == \"done\" and .tried.found == [\"automation: $H/Library/LaunchAgents/local.canon.lanes-watch.plist differs from what install writes\"]"'
+check "... the paper checkout deferred to the session boundary, so named in the record" \
+      jqt "$MS" '.deferred.what == "the paper checkout" and (.note | test("deferred to the session boundary: the paper checkout"))'
+check "... one waiter waits for the windows' lock" eval 'jqt "$BF" ".state == \"waiting\"" && [ "$(waiting_waiters)" = 1 ]'
+since=$(jq -r '.deferred.since' "$MS")
+printf '%s\n' "$PDIFF" > "$STUB/differs-out"; logs_clear; round
+check "a second round while the window runs: no second waiter, no install, the first deferral's time kept" \
+      eval 'grep -q "a boundary waiter is already waiting; none added" "$TMP/round.out" && [ "$(waiting_waiters)" = 1 ] && ! grep -q "^automation install" "$STUB/installers.log" && jqt "$MS" ".deferred.since == \"$since\""'
+logs_clear; kill "$hp" 2>/dev/null; wait "$hp" 2>/dev/null
+boundary_is ran; settled
+check "the window's lock goes free: the waiter's round installs the whole, paper section included, holding that lock" \
+      eval 'grep -q "^automation install | " "$STUB/installers.log" && grep -qx "install: paper-windows lock held" "$STUB/installers.log" && jqt "$MS" ".at_boundary == true and .deferred == null and .install.state == \"done\""'
+check "... it skips the daily updates and the pins, which the next round runs, and leaves no waiter" \
+      eval '[ ! -s "$STUB/updates.log" ] && jqt "$MS" ".pins == []" && no_waiter'
+check "... and the windows' lock is let go once its install ends" freed "${LT}canon-paper-windows.lock"
+echo 4b > "$OW/tracked"; ocommit fourth-b
 /usr/bin/lockf -k "${LT}canon-paper-windows.lock" sleep 30 & HOLDERS="$HOLDERS $!"; hp=$!; sleep 0.5
-logs_clear; round
-check "a window's lock held: the round is skipped, ok, with nothing fetched, compared, installed or updated" \
-      eval '[ "$RC" = 0 ] && ! head_is_origin && [ ! -s "$STUB/installers.log" ] && [ ! -s "$STUB/updates.log" ] && jqt "$MS" ".outcome == \"waited\" and (.ff | test(\"paper lock is held\"))"'
-check "... and the last change is kept" jqt "$MS" '.last_change.installed == ["automation install"] or .last_change.failed != null'
+logs_clear; BOUNDARY_SECS=2 round
+boundary_is "timed out"
+check "a waiter whose bound passes with the window's lock still held: timed out, by name" \
+      eval 'jqt "$BF" ".why == \"the windows'"'"' lock stayed held for 2 s\"" && jqt "$MS" ".deferred != null" && no_waiter'
 kill "$hp" 2>/dev/null; wait "$hp" 2>/dev/null
+logs_clear; round; settled
+check "... and the next round with no window installs the whole, clearing the deferral" \
+      eval 'grep -q "^automation install | " "$STUB/installers.log" && jqt "$MS" ".deferred == null and .at_boundary == false"'
+rm -f "$STUB/differs-out" "$STUB/differs-rc"; round
+# a paper test's lock, or the stream's with no window: those runs may run from the checkout, so nothing
+echo 4c > "$OW/tracked"; ocommit fourth-c
 for hl in "canon-paper-test.lock:a paper test" "canon-alpaca-stream.lock:a run on the market-data stream"; do
   /usr/bin/lockf -k "${LT}${hl%%:*}" sleep 30 & HOLDERS="$HOLDERS $!"; hp=$!; sleep 0.5
   logs_clear; round; export HL="${hl%%:*} is held: ${hl#*:}"
-  check "${hl%%:*} held (${hl#*:}): the round is skipped the same way, naming it" \
+  check "${hl%%:*} held (${hl#*:}): the round does nothing, naming it" \
         eval '[ "$RC" = 0 ] && ! head_is_origin && [ ! -s "$STUB/installers.log" ] && [ ! -s "$STUB/updates.log" ] && jqt "$MS" ".outcome == \"waited\" and (.ff | test(\"paper lock is held\")) and (.ff | contains(env.HL))"'
   kill "$hp" 2>/dev/null; wait "$hp" 2>/dev/null
 done
@@ -325,15 +393,33 @@ check "... agy not installed: said, not a failure" eval 'jqt "$MU" ".results[1] 
 mv "$STUB/agy.away" "$STUB/agy"
 jq '.at_epoch -= 86401' "$MU" > "$MU.t" && mv "$MU.t" "$MU"; echo "${LT}canon-paper-windows.lock" > "$STUB/claude-takes-lock"
 echo 5 > "$OW/tracked"; ocommit fifth; logs_clear; round
-check "the updates run with the paper lock let go; a window that took it meanwhile ends the round there" \
-      eval '[ "$RC" = 0 ] && grep -q "^claude update" "$STUB/updates.log" && ! head_is_origin && [ ! -s "$STUB/installers.log" ] && jqt "$MS" ".outcome == \"waited\" and (.ff | test(\"during the updates\"))"'
+check "the updates run with the paper lock let go; a window that took its lock meanwhile does not hold the checkout back" \
+      eval '[ "$RC" = 0 ] && grep -q "^claude update" "$STUB/updates.log" && head_is_origin && jqt "$MS" ".outcome == \"ok\" and .deferred == null"'
 rm -f "$STUB/claude-takes-lock"; sleep 4; round
-check "... and the next round goes on" head_is_origin
 jq '.at_epoch -= 86401' "$MU" > "$MU.t" && mv "$MU.t" "$MU"; echo "${LT}canon-paper-test.lock" > "$STUB/claude-takes-lock"
 echo 6 > "$OW/tracked"; ocommit sixth; logs_clear; round
 check "... and so does a paper test that took its lock meanwhile, before the fast-forward" \
       eval '[ "$RC" = 0 ] && ! head_is_origin && [ ! -s "$STUB/installers.log" ] && jqt "$MS" ".outcome == \"waited\" and (.ff | test(\"during the updates \\\\(canon-paper-test.lock is held\"))"'
 rm -f "$STUB/claude-takes-lock"; sleep 4; round
+
+# (d) the exact pins main's registry records
+oreg codex-cli tag:rust-v0.167.1; oreg mise tag:v2026.11.6; echo 7 > "$OW/tracked"; ocommit pins-moved; logs_clear; round
+check "pins: codex's pin moved on main: brought to it with mise use --global, from HOME" \
+      eval 'grep -q "^mise use --global --yes codex@0.167.1 " "$STUB/mise.log" && [ "$(cat "$STUB/global/codex")" = 0.167.1 ] && jqt "$MS" "(.pins | index(\"codex: 0.167.0 -> 0.167.1\")) != null and .outcome == \"ok\""'
+check "... and mise's own pin: mise self-update to that version, plugins left alone" \
+      eval 'grep -q "^mise self-update --yes --no-plugins 2026.11.6 " "$STUB/mise.log" && jqt "$MS" "(.pins | index(\"mise: 2026.11.5 -> 2026.11.6\")) != null"'
+check "... the tools already at their pins left alone" eval '[ "$(grep -c "^mise use " "$STUB/mise.log")" = 1 ]'
+logs_clear; round
+check "... and the next round, at the pins, updates nothing" eval '! grep -Eq "^mise (use|self-update)" "$STUB/mise.log" && jqt "$MS" ".pins[0:2] == [\"mise: at 2026.11.6\", \"codex: at 0.167.1\"]"'
+oreg pnpm tag:v10.35.0; echo 8 > "$OW/tracked"; ocommit pnpm-moved; echo 1 > "$STUB/use-rc"; logs_clear; round
+check "an update that fails: FAILED by name, with mise's message" \
+      eval 'jqt "$MS" ".outcome == \"failed\" and (.failed | index(\"pin pnpm: mise use pnpm@10.35.0 exited 1: mise ERROR stand-in could not install pnpm@10.35.0\")) != null"'
+rm -f "$STUB/use-rc"; echo 1 > "$STUB/self-update-rc"; oreg mise tag:v2026.11.7; echo 9 > "$OW/tracked"; ocommit mise-moved; logs_clear; round
+check "... a self-update that fails: FAILED by name" jqt "$MS" '(.failed | map(test("^pin mise: self-update to 2026.11.7 exited 1")) | any)'
+rm -f "$STUB/self-update-rc"; rm -f "$STUB/global/npm__deepseek-harness-tui_dsh-tui"; logs_clear; round
+check "... a tool not in mise's global config is not installed, only said" \
+      eval '! grep -q "^mise use --global --yes npm:@deepseek-harness-tui" "$STUB/mise.log" && jqt "$MS" "(.pins | index(\"npm:@deepseek-harness-tui/dsh-tui: not in mise'"'"'s global config; left alone\")) != null and .outcome == \"ok\""'
+echo 0.17.0 > "$STUB/global/npm__deepseek-harness-tui_dsh-tui"
 
 # ---------- scripts/automation: the plists, differs and the rows ----------
 echo "scripts/automation:"
@@ -424,6 +510,24 @@ rec '| .outcome = "skipped" | .ff = "skipped: the checkout is on other, not main
 check "... the checkout not on main: SKIPPED, saying why" eval 'rowis "$TMP/stat.out" maintenance SKIPPED && grep -q "the checkout is on other, not main" "$TMP/stat.out"'
 rec '| .outcome = "waited" | .ff = "not run: the paper lock is held" | .last_change = {at: "earlier", found: ["automation: y"], installed: ["automation install"], failed: []}'; astat
 check "... the paper lock held: ok, with the last change shown" eval 'rowis "$TMP/stat.out" maintenance ok && grep -q "last change earlier: installed automation install" "$TMP/stat.out"'
+BF="$W/maintenance-boundary.json"
+bfile() { jq -n --arg at "$at" --argjson e "$now" "{state: \"waiting\", at: \$at, at_epoch: \$e, since: \$at, since_epoch: \$e, bound: 32400, why: \"\"} $1" > "$BF"; }
+rec '| .deferred = {since: $at, since_epoch: $e, what: "the paper checkout"} | .note = "deferred to the session boundary: the paper checkout"'; bfile ''; astat
+check "... the paper checkout deferred while a window runs: ok, saying so and that a waiter waits" \
+      eval 'rowis "$TMP/stat.out" maintenance ok && grep -q "deferred to the session boundary: the paper checkout (since $at); a waiter waits for the windows lock" "$TMP/stat.out" && ! grep -qi skipped "$TMP/stat.out"'
+rec '| .deferred = {since: "earlier", since_epoch: ($e - 32401), what: "the paper checkout"}'; astat
+check "... deferred for more than a whole session: FAILED, saying so" \
+      eval 'rowis "$TMP/stat.out" maintenance FAILED && grep -q "deferred to the session boundary: the paper checkout (since earlier); FAILED: deferred for more than one whole session" "$TMP/stat.out"'
+rec '| .deferred = {since: $at, since_epoch: $e, what: "the paper checkout"}'; bfile '| .state = "timed out" | .why = "the windows'"'"' lock stayed held for 32400 s"'; astat
+check "... a waiter that reached its nine-hour bound: FAILED, by name" \
+      eval 'rowis "$TMP/stat.out" maintenance FAILED && grep -q "FAILED: the boundary waiter timed out at $at: the windows. lock stayed held for 32400 s" "$TMP/stat.out"'
+bfile '| .since_epoch = ($e - 33100)'; astat
+check "... a waiter that has stopped reporting: FAILED" eval 'rowis "$TMP/stat.out" maintenance FAILED && grep -q "the boundary waiter started .* has not reported" "$TMP/stat.out"'
+rm -f "$BF"
+rec '| .pins = ["mise: at 2026.11.5", "codex: at 0.167.0"]'; astat
+check "... the pins, all at main's: ok, with their versions" eval 'rowis "$TMP/stat.out" maintenance ok && grep -q "pins at main.s registry: mise 2026.11.5, codex 0.167.0" "$TMP/stat.out"'
+rec '| .pins = ["mise: at 2026.11.5", "codex: 0.167.0 -> 0.167.1"]'; astat
+check "... a pin moved: named" grep -q "pins: codex: 0.167.0 -> 0.167.1" "$TMP/stat.out"
 rec '| .install = {state: "started", at_epoch: ($e - 2000)}'; astat
 check "... a reinstall that never reported: FAILED" eval 'rowis "$TMP/stat.out" maintenance FAILED && grep -q "the reinstall it started has not reported" "$TMP/stat.out"'
 rec '| .at_epoch = ($e - 20000)'; astat

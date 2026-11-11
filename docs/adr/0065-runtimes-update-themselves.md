@@ -200,6 +200,37 @@ UNVERIFIED until the first rounds on this machine:
   update` replaces the copy mise runs (above);
 * the first round itself.
 
+**2026-11-11, later: a window defers only what it runs from.** The owner required on 2026-11-11 that the
+machine follow main by itself. Once a session's run is in progress through every weekday, step 1 would
+have stopped the agent from Sunday evening to Friday evening. So a held windows' lock now defers only
+what a running window depends on: the paper section of `scripts/automation install`, which covers the
+runner, its plist, its agent and the clone the runner makes anew at each firing. The rest of the round
+runs at once: the fast-forward, the settings step, `install --defer-paper` for the other agents, the
+updates and the pins below. A paper test's lock, or the stream's held with no window running, still ends
+the round, since those runs may run from the main checkout. The deferred part waits for the session
+boundary, the moment the window's lock goes free. Alpaca's clock and calendar end each run at its
+session's end, but this agent reads no secret and cannot read them itself. A round that defers starts
+one detached waiter, which holds its own lock so a second is never added. The waiter waits on the
+windows' lock (lockf(1) `-t`) for at most nine hours: the overnight session's eight and one more. With
+that lock held, it runs a round that installs the whole and lets the lock go when the install ends, so
+the next session's run starts from the clone its runner makes then. The status row reads "deferred to
+the session boundary: the paper checkout". It reads FAILED once the deferral is older than nine hours,
+or when the waiter timed out or stopped reporting. **(d) The exact pins.** At origin/main, each round
+also brings mise (`mise self-update --yes --no-plugins <version>`) and the tools in mise's global config
+with an exact registry pin (codex, pnpm, DeepSeek Harness, dsh-tui) to the versions
+`canon/upstreams.json` records (`mise use --global --yes <tool>@<version>`). A tool already at its pin
+is left alone, and so is one the global config does not name. `scripts/bootstrap --check` gains a
+`codex version` row. Limits: a window started by hand from the main checkout is not told apart from
+the scheduled one. Confirmed offline by `scripts/test-maintenance` with the stand-ins:
+
+* a held windows' lock still moves the main checkout and installs the rest;
+* a second round adds no second waiter;
+* the waiter's round installs the whole once the lock frees, and a waiter past its bound is named;
+* a pin that moved is applied, one already met changes nothing, and a failed update is FAILED by name.
+
+UNVERIFIED until it runs here: that `mise self-update` replaces the binary while a window's mise runs
+from it without disturbing that window.
+
 ## Evidence
 
 Read 2026-11-10. `fetched`: downloaded and searched here; `run`: a command run here.
@@ -238,4 +269,15 @@ Read 2026-11-10. `fetched`: downloaded and searched here; `run`: a command run h
   * bash(1) `set -m`: "Background processes run in a separate process group" (read).
   * lockf(1) `-t`; git-merge(1) `--ff-only`; git-config(1) `remote.<name>.uploadpack`, which the test
     uses for a fetch that hangs (read).
+  * `scripts/test-maintenance` (run).
+* 2026-11-11, later addition, read and run 2026-11-11:
+  * lockf(1) (`man lockf`), read: the form `lockf [-s] [-t seconds] fd`; "-t seconds Specifies a
+    timeout for waiting for the lock"; a timed-out wait exited 75 (EX_TEMPFAIL), run here.
+  * `mise help self-update` (mise 2026.11.5, bundled): "[VERSION] Update to a specific version";
+    `--yes`, `--no-plugins`. mise's src/cli/self_update.rs strips a leading `v` (fetched, at main, not
+    the tag).
+  * `mise help use` (bundled): `-g, --global` "Write to the global config"; `mise help ls`: `--global`,
+    `--json`; `mise ls -g --json codex` printed an array with `requested_version` and `installed` (run).
+  * session_window.py `OVERNIGHT_STARTS` (20:00) and the overnight session's end at 04:00 New York,
+    which the nine-hour bound follows (read).
   * `scripts/test-maintenance` (run).
