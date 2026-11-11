@@ -149,8 +149,11 @@ exit 0, both items in the login keychain; `mise run paper:check` exit 0, account
   `mise run paper:test -- -v -rs -k "flat_reconciliation or quotes_write_back"` on account A, exit 0, 4
   passed, neither waiting for the other (run); the test ran from a checkout at 93f23c0 whose working tree
   was not compared with it (UNVERIFIED). The account state the window logged differed from account A's
-  (compared in the two logs; the values are not recorded). Still
-  UNVERIFIED: that a scheduled firing reads B's keychain items with no dialog; none had run on B by then.
+  (compared in the two logs; the values are not recorded). The
+  first scheduled firing on B, 2026-11-11 at `main`'s e7b5d5c: the runner started at 07:48:37 UTC and the
+  window ran from 07:50:35 to 08:15:40, result `ok`, 2 fills, nothing left open, so the task's keychain
+  reads of B's items, each bounded to 30 s, finished with no dialog waiting (the runner's log and the
+  window's record, read).
 * Option 3's comparison of account IDs is still not built.
 
 ## Evidence

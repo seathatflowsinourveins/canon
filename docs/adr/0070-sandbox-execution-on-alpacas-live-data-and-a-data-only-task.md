@@ -136,8 +136,13 @@ asked, and whether a `data`-only token reads `/v2/assets` is UNVERIFIED.
   * `mise run paper:data sandbox --minutes 3`, 2026-11-11, 07:47:28 to 07:50:34 UTC, exit 0: every engine
     client connected, the account was the sandbox's (`ALPACA-SANDBOX-001`), no request was refused, and the
     tester placed no order, since a built-in streams IEX, which carries nothing overnight (ADR 0055).
-    That run was on a working tree before the review's fixes; the run on the commit that landed is the
-    next bullet. Fills on this task wait for a run in the regular session (UNVERIFIED until then).
+    That run was on a working tree before the review's fixes; the run on this change's code is the
+    next bullet.
+  * `mise run paper:data sandbox --minutes 3` at the branch's ea7c1fa, whose code `main` took unchanged,
+    2026-11-11: started 08:09:12 UTC and waited on the stream lock, which a scheduled window held until
+    08:15:40; the node started at 08:15:41 and stopped at 08:18:46, exit 0, every engine client connected on
+    the sandbox's account (`ALPACA-SANDBOX-001`), no order placed (IEX, overnight), nothing left open, and
+    no request refused (run). Fills on this task wait for a run in the regular session (UNVERIFIED until then).
   * A limit of term 3's check: it reads each client's session once, at the connect or the fetch, so a
     session an alpaca-py client replaced after that, which alpaca-py 0.45.0 never does (its one `_session`
     assignment is in `RESTClient.__init__`), would not be checked again.
