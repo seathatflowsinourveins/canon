@@ -91,6 +91,24 @@ ADR 0035's numbers, 4 to 6; terms 1 to 3 (storage, recording, entry) are ADR 003
    `retire_queued` could put a record of `record_trial`'s in the list, which hides it from every check
    but not its key from N; like the queue, the ledger's writers are this repository's own sessions, so
    this is stated, not defended against.
+   **One model of who wrote a record** (2026-11-11; ADR 0073 rule 4, the queued record's family found
+   in a second round). It is decided in one place, `canon_trading.ledger.origin`, which `record_trial`,
+   `retire_queued`, `mark_not_run`, the ranking and the study's pass all read. By key, state, note and
+   attributes, in that order: a keyless record that shows a run is another writer's; a `WAITING` one
+   is queued; one `FAIL` or `RUNNING` with a queue note was taken from the queue here and ran nothing;
+   one with a queue note in another state, a system attribute, a user attribute `record_trial` does
+   not write (on a keyless record, any but its error), a parameter or an intermediate value was
+   started, told or written by another writer outside the queue's take, and may have run anything;
+   anything else is `record_trial`'s own. When: a keyless record leaves N only by its mark, and only
+   while it is in the state the mark leaves (`FAIL` in `not_run`; in `not_run_waiting`, `WAITING`, or
+   `FAIL` once taken here). One another writer started is cleared by nothing, a mark made before
+   included, so `mark_not_run` refuses it and the ranking stops on it for good. Only a keyed record
+   of `record_trial`'s own is read by the pass as its written failure. This narrows ADR 0053 term 3:
+   a keyless record ran no backtest only if it is `record_trial`'s own or one taken here. A trial
+   number given to `mark_not_run` or `retire_queued` is an `int`, never a `bool` or a float. Named
+   limit: a keyless queued trial taken here whose note the store refuses holds `fixed_params` and no
+   note, so it reads as another writer's and stops the study for good, the strict side; the error
+   raised says so.
 
 Who decided. The orchestrator chose option 3 and the terms under the owner's delegation of 2026-11-10
 (ADR 0010's Evidence). Term 7 was decided by the orchestrator under the same delegation, 2026-11-10, over a
@@ -185,7 +203,26 @@ study, a larger mechanism than one foreign record needs.
   never writes on a `FAIL` record
   (`test_a_failed_record_with_an_outcome_the_writer_never_writes_stops_for_good`), and a keyless
   record holding only returns or only session days
-  (`test_a_keyless_record_holding_only_returns_or_session_days_shows_a_run`).
+  (`test_a_keyless_record_holding_only_returns_or_session_days_shows_a_run`). From the gate's second
+  round after term 7, tests that failed before the one model: a keyless record another writer queued
+  and started, or wrote an empty key, a key not text or an attribute of its own on, is not cleared,
+  under a mark made before either (`test_a_keyless_record_another_writer_started_is_not_cleared`,
+  which replaces `test_an_empty_key_is_keyless_and_mark_not_run_clears_it`, whose reading it
+  reverses); a trial number that is a `bool` or a float is refused before anything is written
+  (`test_a_trial_number_that_is_not_an_int_is_refused`); a raced queued record of the pass's key is
+  no failure the pass goes on from, with a second keyed record waiting or the read back refused
+  (`tests/test_variant_study.py::test_a_raced_queued_record_of_the_key_is_not_a_failure_the_pass_goes_on_from`).
+  A keyless queued record `record_trial` took is still cleared
+  (`test_a_keyless_queued_record_record_trial_took_is_still_cleared`), which passed before too. From
+  the code review of the model, tests that failed before their fix: a keyless queued trial taken
+  without its note names the stop for good
+  (`test_a_keyless_queued_trial_taken_without_its_note_says_it_stops_for_good`); a marked `WAITING`
+  record written on after its mark is named as such
+  (`test_a_marked_waiting_record_written_on_after_its_mark_is_named_as_such`); a marked record taken
+  with the retirement's note still stops
+  (`test_a_marked_waiting_record_told_fail_with_the_retirement_s_note_still_stops`); and the pass runs
+  a key whose record was taken from the queue
+  (`tests/test_variant_study.py::test_a_record_taken_from_the_queue_is_no_run_the_pass_skips_its_key_for`).
 * The trial count is per study (term 5): nothing in the code stops a new study of the same
   configurations from starting at N = 0, and no record carries an earlier study's keys into it. What
   holds that line is pre-registering every study in a record before its first run, as ADR 0048 does
@@ -330,3 +367,26 @@ Term numbers are ADR 0035's.
   unread case, two docstrings, and a test that faked the race by its check rather than at `ask`.
   Not changed: one helper for both notes on a refused note, and one test helper each file keeps.
   Confirmation lists the tests. No change of decision.
+* Gate's second round after term 7, 2026-11-11 (ADR 0073), two outside readers of the gate as
+  checked out at #172. The first (Codex) found nothing that changes behaviour. The second
+  (Antigravity) reproduced three findings, each now a test that failed first (Confirmation). High: a
+  keyless record another writer queued (`Study.enqueue_trial`'s `fixed_params`) or wrote attributes
+  on, then started and told `FAIL` before any mark, was cleared by `mark_not_run` as `record_trial`'s
+  own record lost before its key, and the gate passed at N = 3, DSR 0.9974. High: `mark_not_run` and
+  `retire_queued` took `False`, `True` or `0.0` as a trial number (`0 == False == 0.0`) and wrote it
+  into lists every reader refuses, which un-marked or un-retired the records before it and stopped
+  the study's ranking and recording for good. Medium: the study's pass read a raced queued record of
+  its key, taken with the queue's note, as `record_trial`'s written failure, and went on from an
+  error that left none. The first is the queued record's family, found in a second round, so it is
+  redesigned as one model (term 7) rather than patched; the third is read through that model too.
+  Optuna 5.0.0's `FrozenTrial` keeps `user_attrs`, `system_attrs`, `distributions` and
+  `intermediate_values`, and `Study.enqueue_trial` writes `fixed_params` (run, in the installed
+  package). No change of decision.
+  Code review of the model (`/code-review`, high): nine findings. Fixed, each shown by a test that
+  failed first: a keyless queued trial taken without its note stopped the study for good with no
+  word of it in the error; a marked `WAITING` record written on was said to have been started; the
+  rule had widened a marked record's clearing to the retirement's note; the pass skipped a key whose
+  record was taken from the queue, where the gate stops on it. Fixed with no test: a check that
+  could never fail, the queue notes held in two places, and `origin`'s word on the one reading it
+  leaves to `ask`. A NumPy integer stays refused as a trial number, its error naming `int()`. Not
+  changed: `origin` read twice for one record's remedy, which changes nothing read.

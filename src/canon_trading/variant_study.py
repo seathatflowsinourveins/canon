@@ -66,12 +66,14 @@ from .ledger import FAILED
 from .ledger import OUTCOME
 from .ledger import RAN
 from .ledger import LedgerNotFound
+from .ledger import Origin
 from .ledger import config_key
 from .ledger import create_ledger_study
 from .ledger import current_sample
 from .ledger import default_ledger_path
 from .ledger import has_key
 from .ledger import open_study
+from .ledger import origin
 from .ledger import record_trial
 from .ledger import retired_numbers
 from .ledger import samples
@@ -148,7 +150,8 @@ def _to_record(study: optuna.Study, keys: Sequence[str]) -> list[str]:
     stops on as another writer's and which no re-run clears. The rule is the gate's own,
     `canon_trading.ranking.on_current_sample` and `ran_to_the_end`, so it follows any change to it.
     A retired record (`canon_trading.ledger.retire_queued`) is another writer's, which `rank` never
-    reads, so it is no run of its key either; a `retired` list not in its form raises
+    reads, so it is no run of its key either, and so is any record the ledger's one rule reads as
+    another writer's (`canon_trading.ledger.origin`), on which `rank` stops; a `retired` list not in its form raises
     `ValueError` (`retired_numbers`), a refusal before any trial, which stops the pass. The study is
     read once.
     """
@@ -161,6 +164,8 @@ def _to_record(study: optuna.Study, keys: Sequence[str]) -> list[str]:
         key = trial.user_attrs.get("config_key")
         if not isinstance(key, str) or key not in keys or trial.number in retired:
             continue
+        if origin(trial).origin is not Origin.WRITER:
+            continue  # another writer's, which `rank` never reads as a run of its key
         if on_current_sample(trial, sample, known) and (
             key not in latest or trial.number > latest[key].number
         ):
@@ -187,11 +192,15 @@ def _told_failed(study: optuna.Study, key: str, before: int) -> bool:
     its error written: every result is there, and the gate reads it as the run it was
     (`canon_trading.ranking.ran_to_the_end`), so it is a written failure as well. Any other record
     still `RUNNING`, or one with no error written, is a failure that could not be told, and stops the
-    pass.
+    pass. So does a record of `key` another writer queued, taken from Optuna's queue with its note
+    in `record_trial`'s race (ADR 0054 term 7): it holds that writer's outcome and no failure of
+    `record_trial`'s, so only a record the ledger's one rule reads as `record_trial`'s own counts
+    (`canon_trading.ledger.origin`).
     """
     return any(
         trial.number >= before
         and trial.user_attrs.get("config_key") == key
+        and origin(trial).origin is Origin.WRITER
         and "error" in trial.user_attrs
         and (
             (trial.state == TrialState.FAIL and trial.user_attrs.get(OUTCOME) in (FAILED, *RAN))

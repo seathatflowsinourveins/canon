@@ -23,6 +23,7 @@ from optuna.exceptions import DuplicatedStudyError
 from optuna.trial import TrialState
 
 import canon_trading.ledger
+import canon_trading.variant_study
 from canon_trading.ledger import IDLE
 from canon_trading.ledger import OUTCOME
 from canon_trading.ledger import TRADED
@@ -42,6 +43,7 @@ from canon_trading.variant_study import describe
 from canon_trading.variant_study import grid
 from canon_trading.variant_study import key_of
 from canon_trading.variant_study import legend
+from canon_trading.variant_study import record_grid
 from canon_trading.variant_study import run_study
 
 if TYPE_CHECKING:
@@ -564,3 +566,78 @@ def test_a_key_whose_only_record_on_the_sample_is_retired_is_run(
     assert (len(recorded.recorded), recorded.skipped) == (2, ())
     assert isinstance(report, RankingReport), report
     assert report.n == 2
+
+
+@pytest.mark.parametrize("how", ["a second keyed record waits", "the read back is refused"])
+def test_a_raced_queued_record_of_the_key_is_not_a_failure_the_pass_goes_on_from(
+    alpaca_bars: AlpacaBars, tmp_path: Path, how: str
+) -> None:
+    """Antigravity, gate round after #172: another writer's record of the pass's key, queued after
+    `record_trial`'s check of the queue (ADR 0054 term 7's race), was taken with the queue's note
+    and its writer's outcome kept. When `record_trial` then raised before any run of its own (the
+    next queued keyed record refused, or the read of the trial `ask` gave refused), the pass read
+    that record as `record_trial`'s written failure, put the error among its failures and went on.
+    A record taken from the queue is no failure of `record_trial`'s, so the pass now stops."""
+    alpaca_bars.write(tmp_path / "catalog", symbols=("SPY",))
+    [config] = grid(symbols=("SPY",), periods=SHORT[:1])
+    real_check = canon_trading.ledger._refuse_a_keyed_queue
+    raced: list[int] = []
+
+    def queued_after_the_check(study: optuna.Study, waiting: Any) -> set[int]:
+        retired = real_check(study, waiting)
+        if not raced:
+            for key in (key_of(config), "f" * 64)[: 2 if how.startswith("a second") else 1]:
+                study.add_trial(
+                    optuna.trial.create_trial(
+                        state=TrialState.WAITING,
+                        user_attrs={"config_key": key, "sample": 0, OUTCOME: TRADED},
+                    )
+                )
+                raced.append(study.trials[-1].number)
+        return retired
+
+    def unread(*_: object) -> None:
+        raise optuna.exceptions.StorageInternalError("the store refused the read")
+
+    error = ValueError if how.startswith("a second") else optuna.exceptions.StorageInternalError
+    with (
+        create_ledger_study(
+            "s", start=START.isoformat(), end=END.isoformat(), path=tmp_path / "trials.db"
+        ) as study,
+        pytest.MonkeyPatch.context() as patched,
+    ):
+        patched.setattr(canon_trading.ledger, "_refuse_a_keyed_queue", queued_after_the_check)
+        if how == "the read back is refused":
+            patched.setattr(canon_trading.ledger, "_asked", unread)
+        with pytest.raises(error):
+            record_grid(study, tmp_path / "catalog", [config])
+        taken = study.trials[raced[0]]
+        assert (taken.state, taken.user_attrs["error"]) == (
+            TrialState.FAIL,
+            canon_trading.ledger.TAKEN_FROM_QUEUE,
+        )
+
+
+def test_a_record_taken_from_the_queue_is_no_run_the_pass_skips_its_key_for(
+    tmp_path: Path,
+) -> None:
+    """Code review of the one model: the pass read another writer's queued record of a key, taken
+    from Optuna's queue with its writer's outcome, as a run of that key, and skipped the key that the
+    gate stops on; only a record the ledger reads as `record_trial`'s own is a run of its key."""
+    [config] = grid(symbols=("SPY",), periods=SHORT[:1])
+    key = key_of(config)
+    with create_ledger_study(
+        "s", start=START.isoformat(), end=END.isoformat(), path=tmp_path / "trials.db"
+    ) as study:
+        study.add_trial(
+            optuna.trial.create_trial(
+                state=TrialState.FAIL,
+                user_attrs={
+                    "config_key": key,
+                    "sample": 0,
+                    OUTCOME: TRADED,
+                    "error": canon_trading.ledger.TAKEN_FROM_QUEUE,
+                },
+            )
+        )
+        assert canon_trading.variant_study._to_record(study, [key]) == [key]
