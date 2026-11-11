@@ -416,12 +416,12 @@
     },
     "spec-kit": {
       "default_branch": "main",
-      "default_sha": "0382d7a08d7d37b13f40cd3c385e40c394206113",
-      "ref": "refs/tags/v1.3.3",
+      "default_sha": "f29319d550d1f05404f7184b92e995600ca2293f",
+      "ref": "refs/tags/v1.4.0",
       "repo": "github/spec-kit",
-      "resolved_at": "2026-11-10T00:34:46Z",
-      "sha": "79cb423c37bb9394bab7a66063c27dfa80b72fba",
-      "track": "tag:v1.3.3"
+      "resolved_at": "2026-11-11T01:04:59Z",
+      "sha": "0019fa14d12f45edabc2cc3176c9168a68bd0f97",
+      "track": "tag:v1.4.0"
     },
     "superpowers": {
       "default_branch": "main",

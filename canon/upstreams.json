@@ -100,7 +100,7 @@
       "id": "spec-kit",
       "field": "agent-extensions",
       "repo": "github/spec-kit",
-      "track": "tag:v1.3.3",
+      "track": "tag:v1.4.0",
       "role": "watch",
       "license": "MIT",
       "why": "Leading spec-driven workflow by adoption, but the field has not converged (Spec Kit vs BMAD vs Superpowers).",
