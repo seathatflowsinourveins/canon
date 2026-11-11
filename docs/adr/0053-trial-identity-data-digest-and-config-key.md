@@ -48,11 +48,19 @@ grows with the data and not with what was tried. Terms 1, 2 and 3 below were ADR
    as different bars, whatever their keys.
 2. **The key is the configuration.** This term supersedes what ADR 0035 term 4 (now ADR 0054 term 4) said `config` holds,
    which was every property upstream reflects and the run's range. `config` now holds what this repo
-   sets: each strategy's class (`module:Class`) and its config's own fields, the venue's name,
+   sets: each strategy's class (`module:Class`), its config's own fields and each field of
+   NautilusTrader's `StrategyConfig` it holds at another value than the default at the pinned release
+   (read from the class by reflection, so a field upstream adds is not missed), the venue's name,
    settings, fee rates and starting balances, and the bar types; not the sample. The strategies are
    built from the configs after the key is taken. Floats are written by `repr`, enums by name, decimals
    normalised, balances as `Money` prints them, other NautilusTrader types by `str()`; a value with no
-   stable text form is refused. N is the number of distinct keys over every record, on every sample.
+   stable text form is refused, naming its field. N is the number of distinct keys over every record,
+   on every sample. Known limit: the defaults are those of the pinned NautilusTrader, so a pin that
+   changes one moves the key of every config that holds that field at its old or new default; a pin
+   move compares `canon_trading.ledger.base_config_defaults()` before and after, which
+   `tests/test_ledger.py` pins, and names the keys that move. Such a pin also changes how a config
+   that keeps the default runs, under the same key, as any change of upstream behaviour does; its
+   records then disagree on one sample (ADR 0054 term 5), and the sample is moved.
 3. **A record with no key ran no backtest.** `record_trial` writes the key before the run starts, so a
    record without one is what a process killed between `ask` and that write leaves. The ranking stops,
    naming it, until `mark_not_run(study, number)` clears it: a `RUNNING` one is told `FAIL`, its number
@@ -103,6 +111,16 @@ Who decided. The orchestrator chose option 2 and its terms under the owner's del
   (`test_a_value_keyed_by_what_it_is_not_is_refused`). A store that refuses the key's write leaves a
   `FAIL` record with no outcome, which `mark_not_run` clears
   (`test_an_error_after_the_trial_is_asked_for_is_told_failed`).
+* The fourth review's second part, each a test that failed before its fix: a bar type the catalog covers
+  with no bar in the sample is in the digest
+  (`test_a_bar_type_with_no_bar_in_the_sample_is_in_the_digest`), and a digest that lacks a bar type the
+  run loads stops the ranking (`test_a_digest_that_lacks_a_bar_type_the_run_loads_stops`); a base
+  `StrategyConfig` field set away from its default is in the key
+  (`test_a_base_strategy_config_field_set_away_from_its_default_is_in_the_key`), a field with no stable
+  text form is named (`test_a_field_with_no_stable_text_form_is_named`), and the pinned defaults are
+  pinned (`test_the_base_defaults_the_key_is_taken_against_are_the_pinned_ones`). The eight keys of the
+  step 7 study and the tests' default key are byte for byte as before
+  (`test_the_keys_of_default_configs_are_as_they_were`, which passes before and after).
 
 ## Evidence
 
@@ -160,3 +178,18 @@ package; run, executed in this checkout.
   keyless record in the shape `record_trial` wrote before this change on a refused key write (an error
   and outcome `failed`) now shows a run and stops for good; the shared ledger held no keyless record
   when the third review's fixes landed.
+* A fourth review of the gate, second part, 2026-11-10, read only, by a second reader, each finding
+  reproduced here as a failing test: a bar type the catalog covered with no bar in the sample was left
+  out of `data_digest`, so a trial that read 0 of its bars and one that read 40 agreed and passed (DSR
+  0.9987 in the reader's run; the failing test here is the digest itself), and a run of that bar type
+  alone wrote `data_digest = {}`; term 1's "each bar type the run read" now includes one read with no
+  bar, at the digest of no lines. `trial_config` hashed only `vars(config)`, so a base field
+  `MaCrossConfig` passes to the engine, `order_id_tag` among them, was left out and two configurations
+  shared a key. A second reader corrected term 2 on 2026-11-10: a base field set away from its pinned
+  default is something this repo set, so the key holds it; a default config's key does not move. Source:
+  nautilus-trader 2.0.0rc8 in `.venv`, `nautilus_trader.trading.StrategyConfig`, whose 16 fields are
+  pyo3 getset descriptors, listed with `inspect.getmembers(StrategyConfig, inspect.isgetsetdescriptor)`
+  (run); reflection rather than a list written here, so a field a later pin adds is compared too. Its
+  code review added that a record with no `config` in the writer's form skipped the bar-type check, now
+  a stop. Records already in the shared ledger are not affected: each step 7 trial read one bar type
+  with 1,366 bars (ADR 0052) and holds no base field away from its default.

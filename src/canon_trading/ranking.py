@@ -540,6 +540,13 @@ def _shape_faults(trial: FrozenTrial, sample: Sample) -> list[str]:
         )
     ):
         faults.append(f"data_digest {digests!r}")
+    elif (loaded := _loaded_bar_types(attrs.get("config"))) is None:
+        faults.append(
+            f"config {attrs.get('config')!r} names no bar types in the form record_trial writes"
+        )
+    elif set(digests) != set(loaded):
+        # `record_trial` digests every bar type the run loads, one with no bar included.
+        faults.append(f"data_digest names {sorted(digests)}, not the bar types it loads, {loaded}")
     low, high = session_day(sample.start), session_day(sample.end)
     ran_until = session_day(end) if end_ok else high
     for values, what in (
@@ -560,6 +567,15 @@ def _shape_faults(trial: FrozenTrial, sample: Sample) -> list[str]:
         if after:
             faults.append(f"{what} {_day(after[0])}, after its backtest_end ({len(after)} in all)")
     return faults
+
+
+def _loaded_bar_types(config: object) -> list[str] | None:
+    """The bar types a record's `config` says its run loads, or `None` if it says none in that form."""
+    data = config.get("data") if isinstance(config, dict) else None
+    bar_types = data.get("bar_types") if isinstance(data, dict) else None
+    if isinstance(bar_types, list) and all(isinstance(b, str) for b in bar_types):
+        return bar_types
+    return None
 
 
 def _day(ns: int) -> str:

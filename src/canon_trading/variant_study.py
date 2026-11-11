@@ -188,9 +188,13 @@ def record_grid(
 ) -> Recorded:
     """Record each configuration `_to_record` names, one trial each, in the plan's order.
 
-    A run that raises is recorded by `record_trial` as `failed`; the pass notes it and goes on, so every
-    configuration of the plan is tried. Anything else that raises (a refusal before a trial exists, a
-    ledger that cannot be written, a defect here) stops the pass: it is not one configuration's run.
+    A trial `record_trial` told `FAIL`, `failed`, is noted and the pass goes on, so every configuration
+    of the plan is tried: a run that raised, and also a result it could not record or bars that
+    differ from those its check read, once the failure itself was written. That is safe for the gate:
+    the ranking stops on the key until a later record of it runs to the end (ADR 0054 term 5), and a
+    catalog changed mid-pass leaves records that read different bars, which stop it too (ADR 0053
+    term 1). Anything that leaves no failure told (a refusal before a trial exists, a failure that
+    could not be written, a defect here) stops the pass.
     """
     keys = [key_of(config, starting_balances) for config in configs]
     pending = set(_to_record(study, keys))
