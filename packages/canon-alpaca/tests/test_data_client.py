@@ -2621,6 +2621,84 @@ def test_alpaca_py_reconnects_a_mute_stream_and_sends_its_subscriptions_again(
     assert "[ERROR]" not in lines[0]  # a reconnect is a warning: a quiet feed fails nothing
 
 
+def test_a_subscribe_made_before_a_late_reconnect_warning_is_sent_on_the_next_message(
+    venue, alpaca, monkeypatch
+) -> None:
+    # Found by a second reader of the change: the node loop may run a subscribe hook after alpaca-py has
+    # dropped a mute connection and before the relayed warning reaches the loop. The hook still sees the
+    # old connection heard from, so marks nothing, and alpaca-py records the subscribe without sending it
+    # while it reconnects (`_subscribe` sends only while `_running`). The warning, processed later, must
+    # still have the next message send the client's subscriptions again.
+    stream, socket = alpaca.memory_stream(monkeypatch)  # alpaca-py's own backoff, 0.5 to 1 s
+
+    def build(**kwargs: object) -> object:
+        stream._data_timeout = kwargs["data_timeout"]
+        return stream
+
+    monkeypatch.setattr(canon_alpaca.data, "StockDataStream", build)
+    gate = threading.Event()
+
+    async def body(client) -> None:
+        await client._subscribe_quotes(command(AAPL))
+        socket.deliver(alpaca.wire_quote())
+        await wait_until(lambda: client._stream_heard)
+        socket.gate = gate
+        try:
+            # Blocking this loop stands in for a busy node: the reconnect's first send is held after
+            # alpaca-py snapshotted its maps, with `_running` still false, and the warning that came
+            # before it waits behind this coroutine.
+            assert socket.holding.wait(5), "alpaca-py did not reconnect"
+            # No second reconnect, whose replay of every handler map would send the trades by itself
+            # (`_consume` reads `_data_timeout` on each pass); set while the reconnect is held.
+            stream._data_timeout = None
+            assert client._stream_heard
+            await client._subscribe_trades(command(AAPL))
+        finally:
+            gate.set()
+        await wait_until(lambda: stream._running)
+        assert "AAPL" in stream._handlers["trades"]
+        assert socket.wire["trades"] == set()  # the subscribe was recorded and not sent
+        socket.deliver(alpaca.wire_quote())
+        await wait_until(lambda: socket.wire["trades"] == {"AAPL"})
+
+    config = data_config(stream_data_timeout_secs=0.2, stream_mute_limit_secs=None)
+    run_with_client(body, config=config)
+
+
+def test_a_resend_planned_before_a_reconnect_warning_leaves_the_next_connection_owed_one(
+    venue, alpaca
+) -> None:
+    # Found by the change's code review: a resend still waiting for the call ahead of it when alpaca-py
+    # drops the connection may reach alpaca-py while it reconnects, recorded and not sent. Finishing it
+    # must not clear what the reconnect warning marked.
+    stream = venue.stream
+    stream.trades = []
+
+    async def body(client) -> None:
+        await client._subscribe_quotes(command(AAPL))
+        await wait_until(lambda: client._stream_heard)
+        await client._stream_calls.acquire()  # as a subscribe still inside alpaca-py
+        try:
+            client._stream_heard, client._resend_needed = False, True  # as after a lost subscribe
+            handler = stream.quote_handlers["AAPL"]
+            await asyncio.to_thread(
+                asyncio.run, handler(alpaca.quote())
+            )  # plans the resend; it waits
+            await wait_until(lambda: client._resend_tries == 1)
+            assert client._stream_thread is not None
+            warning = "no data received on stock data stream for 900.0s, reconnecting"
+            client._on_stream_log((client._stream_thread.name, "iex", logging.WARNING, warning))
+        finally:
+            client._stream_calls.release()
+        await wait_until(
+            lambda: stream.subscribes_sent == 1
+        )  # the resend planned before the warning
+        await asyncio.sleep(0.05)
+        assert client._resend_needed  # the next connection's first message sends them again
+
+    run_with_client(body)
+
+
 def test_a_stream_mute_past_the_limit_is_stopped_and_named(venue, capfd) -> None:
     venue.stream.quotes, venue.stream.trades = [], []  # connected, subscribed, and sending nothing
 

@@ -963,6 +963,7 @@ class AlpacaDataClient(MarketDataClient):
         # alpaca-py may not have sent it (`_resend_subscriptions`).
         self._resend_needed = False
         self._resend_tries = 0  # resends tried on this run (`RESEND_TRIES`)
+        self._reconnects = 0  # alpaca-py's own reconnects, by their warnings (`_on_stream_log`)
         # alpaca-py's `data_timeout` for a stream the client builds, and the mute limit (`_check_mute`).
         self._data_timeout, self._mute_limit = stream_bounds(config)
         self._last_heard = 0.0  # the loop time of this run's start or its last quote or trade
@@ -1708,7 +1709,8 @@ class AlpacaDataClient(MarketDataClient):
 
     def _heard(self) -> None:
         """A message has arrived from the stream's current run. Once per run, if a subscribe was
-        recorded after the run started and before this, send the client's subscriptions again
+        recorded after the run started and before this, or alpaca-py's reconnect warning arrived while
+        subscriptions were held (`_on_stream_log`), send the client's subscriptions again
         (`_resend_subscriptions`). A resend that fails, or cannot be scheduled, is logged and tried
         again on the next message, `RESEND_TRIES` times in all; the message itself is handled either
         way."""
@@ -1720,7 +1722,7 @@ class AlpacaDataClient(MarketDataClient):
         if not self._resend_needed or self._resend_tries >= RESEND_TRIES:
             return
         self._resend_tries += 1
-        resend = self._resend_subscriptions(self._stream)
+        resend = self._resend_subscriptions(self._stream, self._reconnects)
         try:
             self.create_task(resend, name="alpaca-stream-resend")
         except Exception as e:  # noqa: BLE001 - logged; the message is still handled
@@ -1739,7 +1741,7 @@ class AlpacaDataClient(MarketDataClient):
         self._log.error(f"Alpaca stream: sending the subscriptions again {why}; {then}")
         self._stream_heard = False
 
-    async def _resend_subscriptions(self, stream: QuoteTradeStream | None) -> None:
+    async def _resend_subscriptions(self, stream: QuoteTradeStream | None, reconnects: int) -> None:
         """Send the client's subscriptions once more on `stream`, now that it is known to be running.
 
         alpaca-py 0.45.0's `_drive_run` sends its handler maps when it connects and only then sets
@@ -1754,14 +1756,17 @@ class AlpacaDataClient(MarketDataClient):
         It narrows the window rather than closing it: nothing arrives to trigger it while every sent
         subscription is quiet; the same window opens at each reconnect alpaca-py makes by itself, which
         the client sees by its warning and covers the same way (`_on_stream_log`); and an unsubscribe lost in it, which alpaca-py does not send either, is not
-        undone by a subscribe. Only `stream`, the one heard from, is resubscribed, on its own connect."""
+        undone by a subscribe. Only `stream`, the one heard from, is resubscribed, on its own connect,
+        and the mark is cleared only if alpaca-py has not reconnected since the resend was planned
+        (`reconnects`): one that waited for the call ahead of it may have reached alpaca-py while it
+        reconnected, recorded and not sent."""
         try:
             await self._one_stream_call(lambda: self._resend_plan(stream))
         except Exception as e:  # noqa: BLE001 - background work: logged, as the guide logs hook failures
             if stream is self._stream:
                 self._resend_failed(f"failed: {e}")
         else:
-            if stream is self._stream:
+            if stream is self._stream and reconnects == self._reconnects:
                 self._resend_needed = False
 
     def _resend_plan(self, stream: QuoteTradeStream | None) -> StreamCall | None:
@@ -1882,9 +1887,15 @@ class AlpacaDataClient(MarketDataClient):
             # alpaca-py is about to connect again, and a subscribe made before that connection counts as
             # running is recorded and not sent, as at its start: until the next message, a subscribe is
             # marked to be sent again (`_resend_subscriptions`). Its backoff, at least 0.5 s, comes
-            # between this line and the connect.
+            # between this line and the connect. This line reaches the node's loop later than alpaca-py
+            # wrote it, so a subscribe the loop ran first saw the old connection heard from and marked
+            # nothing, while alpaca-py recorded it unsent; every held subscription is marked here, at
+            # the cost of one subscribe of a symbol already held after each reconnect.
             self._stream_heard = False
             self._resend_tries = 0
+            self._reconnects += 1
+            if self._quote_symbols or self._trade_symbols:
+                self._resend_needed = True
         line = f"Alpaca stream on feed {feed} ({thread}): {message}"
         if level >= logging.ERROR:
             self._log.error(line)
