@@ -77,6 +77,22 @@ Alpaca's trade ID, so the engine's own deduplication works on every source.
   update or a read of it, is never adopted: a fill on a replacement the record has not adopted adopts it
   only when its `replaces` links reach the order the record is on, so a modify's replacement takes its
   quantity before its fills count, and an order the record has moved past keeps the record where it is.
+* **Added 2026-11-11, after outside round 2: the replace chain, one model.** Before a fill on an Alpaca
+  order the record is not on counts, from the stream, a report or the client's read of the activities,
+  that order is placed in the chain: behind the order the record is on (its fill counts under that order;
+  nothing is adopted) or ahead of it (adopted first, so its quantity and price apply before its fills, as
+  upstream emits a quantity amendment before recovered fills: `generate_reconciliation_order_events`,
+  `crates/execution/src/reconciliation/orders.rs:45-53`, and `reconcile_order_with_fills`,
+  `crates/live/src/execution/manager.rs:4522`, at the pin). An order that cannot be placed, a link
+  unreadable or the chain too long, is neither: its fill waits for the later reads, which place it, and
+  past them the run-out rule ends the wait with an error. A replacement a read finds already closed with
+  fills the node lacks ends the order after those fills, as any end does. And an order's filled total
+  never goes down: a terminal report showing fewer fills than the node holds or waits for is an older
+  snapshot, held back while the end it shows waits on the record, the client ending the order after the
+  fills. The engine keeps that rule for its own cached total, ignoring a "fill decrease" without void
+  evidence though still applying the end (`has_material_fill_decrease`, `reconcile_fill_decrease_terminal`,
+  `crates/execution/src/reconciliation/orders.rs:117-125, 206-240` at the pin); holding the end until the
+  fills come is this adapter's own.
 
 Option 2 was not taken: `reconcile_order_with_fills` at the pin still infers the rest of a continuous
 report's filled quantity after its fills, so it removes none of the lag cases, and NautilusTrader's
@@ -122,6 +138,14 @@ stream", which Alpaca's do.
   trade ID, inferring only what they leave short (`manager.rs` at the pin, the external order's events);
   only the form "Generated inferred fill for <id>: qty=" is an inference the cache keeps. Seen on paper on
   2026-11-11, the order holding Alpaca's trade ID alone.
+* Neutral (added 2026-11-11, outside round 2): the client's own count overlaps upstream's
+  `reconcile_fill_report` (a trade ID the order holds, a venue order ID it never held) and its catch-up
+  overlaps `reconcile_order_with_fills` (fills sorted and applied by trade ID, amendments first). The
+  overlap is kept on purpose: at the pin that path still infers a continuous report's residue, which this
+  record exists to prevent, and the client's count also covers fills generated and not yet applied.
+* Bad (added 2026-11-11): a fill on an order not yet placed in the chain is not applied from its stream
+  update; the activities bring it once the order is placed, and when the order stays unplaceable or the
+  activities do not list it within the reads, the run-out error ends the wait without it.
 * Bad: an open order outside the node that fills between the engine's start-up reads of the order
   reports and of the fill reports, which run concurrently, can have that fill inferred, and its stream
   update then counts it again. The window is the time between the two reads.
@@ -210,6 +234,26 @@ Finding 6 (a replacement's end before a fill on the order it replaced) is the re
 fixed on its own branch after this one. Observed while building: a report returned to the engine was
 reconciled before the fills generated just before it, and the engine inferred a fill; so a report waits
 for the node's cached order.
+
+**Added 2026-11-11: outside round 2 on this record (at 1c3d671), one family, fixed as the replace chain's
+one model above, each failing on 1c3d671's code and passing after.** Codex 1: a query bringing a raised
+replacement's fill ended the order FILLED on the old quantity. Codex 2: a `replaced` read finding the
+replacement canceled with a lost fill left the order PARTIALLY_FILLED under the paper node's checks.
+Codex 3: an older canceled snapshot closed the order short of an end already waiting (whether Alpaca sends
+such copies is UNVERIFIED; a paper probe is asked). Muse: a fill on the middle order of a chain whose first
+order could not be read moved the node's order back to the middle order, and its cancel left it open. Round
+2 was not clean. The code review of the model, high: 9 findings, 7 fixed, two of them with failing tests (a catch-up
+on the working order counting a raised replacement's fills before placing it; a held canceled report with
+no end waiting never ending the order), the others in code (a re-check after the reads, no adoption of a
+rejected or left-behind replacement, the behind order marked, no chain walk in update handling); 1 recorded
+as a limit (the unplaced order's stream fill); 1 in tests (strict patches).
+
+**Added 2026-11-11: finding 6 and the replace chain's item, closed by this record's rules.** A
+replacement's `canceled` before a late fill on the order it replaced, the fill listed and lagging, ended
+the order with 0 filled before this record landed and keeps the fill under its trade ID after it (the end
+after its fills). The replace chain's own branch, for Codex's findings 2 and 3 on that record, is not
+landed: its two reproductions pass on this record's code (an order the record has moved past is never
+adopted; the end after its fills) and are kept as guards beside finding 6's test.
 
 ## Evidence
 
