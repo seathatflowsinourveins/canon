@@ -1,7 +1,7 @@
 ---
-status: proposed
+status: accepted
 date: 2026-11-11
-decision-makers: master orchestrator (Claude); repo owner ratifies
+decision-makers: the owner (ratified 2026-11-11); master orchestrator (Claude), for the record, under the owner's delegation (ADR 0074)
 review-by: 2026-12-11
 ---
 
