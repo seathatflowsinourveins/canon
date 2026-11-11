@@ -688,16 +688,84 @@ def test_dsr_at_a_small_n_hat_is_withheld_not_inflated(study: optuna.Study) -> N
     assert report.n_hat_note in report.summary()
 
 
-def test_an_empty_key_is_keyless_and_mark_not_run_clears_it(study: optuna.Study) -> None:
+@pytest.mark.parametrize(
+    "how", ["queued and started", "an empty key", "a key not text", "an attribute of its own"]
+)
+def test_a_keyless_record_another_writer_started_is_not_cleared(
+    study: optuna.Study, how: str
+) -> None:
+    """Antigravity, gate round after #172: a keyless record another writer queued
+    (`Study.enqueue_trial`, which writes `fixed_params`) or wrote attributes on, then started and
+    told `FAIL` before any mark, was read as `record_trial`'s own record lost before its key:
+    `mark_not_run` cleared it, it left N, and the gate passed at N = 3, DSR 0.9974, though it may have
+    run anything. `record_trial` writes nothing on a keyless record but its error, so such a record is
+    another writer's, and nothing clears it; a mark the code before wrote clears it no more."""
     write(study, "pick", PICK)
     write(study, "second", SECOND)
-    trial = study.ask()
-    trial.set_user_attr("config_key", "")
+    write(study, "third", THIRD_CLOSE)
+    if how == "queued and started":
+        study.enqueue_trial({"fast": 6, "slow": 11})
+    other = study.ask()
+    if how == "an empty key":
+        other.set_user_attr("config_key", "")
+    elif how == "a key not text":
+        other.set_user_attr("config_key", 123)
+    elif how == "an attribute of its own":
+        other.set_user_attr("strategy", "custom_ma_6_11")
+    study.tell(other, state=TrialState.FAIL)
+    number = other.number
+    stop = rf"#{number} \(fail\) [^\n]*another writer's record, which may have run anything"
 
-    with pytest.raises(RankingStopped, match=rf"mark_not_run\(study, {trial.number}\)"):
+    with pytest.raises(RankingStopped, match=stop) as stopped:
         rank(study)
-    mark_not_run(study, trial.number)
-    assert rank(study).n == 2
+    [line] = [line for line in str(stopped.value).splitlines() if f"#{number} " in line]
+    assert "mark_not_run" not in line
+    with pytest.raises(ValueError, match="another writer's record, which may have run anything"):
+        mark_not_run(study, number)
+    assert "not_run" not in study.user_attrs
+
+    study.set_user_attr("not_run", [number])  # as `mark_not_run` wrote it before this fix
+    with pytest.raises(RankingStopped, match=stop):
+        rank(study)
+
+
+def test_a_keyless_queued_record_record_trial_took_is_still_cleared(study: optuna.Study) -> None:
+    """The other side of the rule above: a keyless queued record `record_trial` took from the queue
+    holds the other writer's attributes beside its note, and ran nothing here, so `mark_not_run`
+    still clears it."""
+    write(study, "pick", PICK)
+    write(study, "second", SECOND)
+    write(study, "third", THIRD_CLOSE)
+    study.enqueue_trial({"fast": 6}, user_attrs={"strategy": "custom"})
+    taken = study.ask()
+    taken.set_user_attr("error", canon_trading.ledger.TAKEN_FROM_QUEUE)
+    study.tell(taken, state=TrialState.FAIL)
+
+    mark_not_run(study, taken.number)
+
+    assert study.user_attrs["not_run"] == [taken.number]
+    assert rank(study).n == 3
+
+
+@pytest.mark.parametrize("number", [False, True, 0.0, 1.0])
+def test_a_trial_number_that_is_not_an_int_is_refused(study: optuna.Study, number: Any) -> None:
+    """Antigravity, gate round after #172: `False == 0 == 0.0`, so `mark_not_run` and `retire_queued`
+    found trial #0 or #1 by a `bool` or a float and wrote it into their lists as given; every reader
+    refuses such a list, so a later `retired` list of `[0, True]` read neither as retired, the
+    ranking stopped for good and `record_trial` was locked out. Both now refuse the number first."""
+    study.enqueue_trial({}, user_attrs={"config_key": key_of("pick"), "sample": 0})
+    study.enqueue_trial({}, user_attrs={"config_key": key_of("second"), "sample": 0})
+
+    with pytest.raises(TypeError, match="a trial number is an int"):
+        canon_trading.ledger.retire_queued(study, number)
+    with pytest.raises(TypeError, match="a trial number is an int"):
+        mark_not_run(study, number)
+
+    assert not {"retired", "not_run", "not_run_waiting"} & set(study.user_attrs)
+    assert [t.state for t in study.trials] == [TrialState.WAITING, TrialState.WAITING]
+    canon_trading.ledger.retire_queued(study, 0)
+    canon_trading.ledger.retire_queued(study, 1)
+    assert study.user_attrs["retired"] == [0, 1]
 
 
 def test_a_keyless_record_that_ran_cannot_be_marked_and_stops(study: optuna.Study) -> None:
@@ -1743,4 +1811,77 @@ def test_a_keyless_record_holding_only_returns_or_session_days_shows_a_run(
     with pytest.raises(ValueError, match="shows a run"):
         mark_not_run(study, keyless.number)
     with pytest.raises(RankingStopped, match=rf"#{keyless.number} \(fail\)[^\n]*shows a run"):
+        rank(study)
+
+
+def test_a_keyless_queued_trial_taken_without_its_note_says_it_stops_for_good(
+    study: optuna.Study, tmp_path: Path, alpaca_bars: AlpacaBars
+) -> None:
+    """Code review of the one model: a keyless queued trial `record_trial` took, whose note the store
+    refused, holds `Study.enqueue_trial`'s `fixed_params` and no note, so the ledger's rule reads it as
+    another writer's started record, which nothing clears: the strict side, but the error raised did
+    not say so. It now names the trial and the stop."""
+    write(study, "pick", PICK)
+    write(study, "second", SECOND)
+    write(study, "third", THIRD_CLOSE)
+    study.enqueue_trial({})
+    [number] = [t.number for t in study.trials if t.state == TrialState.WAITING]
+    alpaca_bars.write(tmp_path / "catalog")
+    real_set = optuna.trial.Trial.set_user_attr
+
+    def refused_note(self: optuna.trial.Trial, key: str, value: Any) -> None:
+        if key == "error" and value == canon_trading.ledger.TAKEN_FROM_QUEUE:
+            raise optuna.exceptions.StorageInternalError("the store refused the note")
+        real_set(self, key, value)
+
+    with pytest.MonkeyPatch.context() as patched:
+        patched.setattr(optuna.trial.Trial, "set_user_attr", refused_note)
+        with pytest.raises(optuna.exceptions.StorageInternalError, match="refused the note") as err:
+            canon_trading.ledger.record_trial(
+                study, tmp_path / "catalog", [ma_cross_config()], starting_balances=["100000 USD"]
+            )
+
+    assert f"trial #{number}, queued by another writer with no config key, was taken without" in (
+        "\n".join(err.value.__notes__)
+    )
+    assert study.trials[number].state == TrialState.FAIL
+    with pytest.raises(RankingStopped, match=rf"#{number} \(fail\) [^\n]*nothing clears it"):
+        rank(study)
+
+
+def test_a_marked_waiting_record_written_on_after_its_mark_is_named_as_such(
+    study: optuna.Study,
+) -> None:
+    """Code review of the one model: a keyless record marked while `WAITING`, then given an outcome by
+    another writer while still `WAITING`, was said to have been started after its mark."""
+    write(study, "pick", PICK)
+    write(study, "second", SECOND)
+    study.enqueue_trial({})
+    [waiting] = [t for t in study.trials if t.state == TrialState.WAITING]
+    mark_not_run(study, waiting.number)
+    study._storage.set_trial_user_attr(waiting._trial_id, OUTCOME, TRADED)
+
+    stop = rf"#{waiting.number} \(waiting\) [^\n]*written on by another writer after its mark"
+    with pytest.raises(RankingStopped, match=stop):
+        rank(study)
+    with pytest.raises(ValueError, match="written on by another writer after its mark"):
+        mark_not_run(study, waiting.number)
+
+
+def test_a_marked_waiting_record_told_fail_with_the_retirement_s_note_still_stops(
+    study: optuna.Study,
+) -> None:
+    """Code review of the one model: a keyless record marked while `WAITING` is cleared once taken
+    only with the note `record_trial` writes on what it takes; `retire_queued` never takes a keyless
+    one, so its note there is another writer's, and the record stops as before the model."""
+    write(study, "pick", PICK)
+    write(study, "second", SECOND)
+    study.enqueue_trial({})
+    [number] = [t.number for t in study.trials if t.state == TrialState.WAITING]
+    mark_not_run(study, number)
+    taken = study.ask()
+    taken.set_user_attr("error", canon_trading.ledger.RETIRED_NOTE)
+    study.tell(taken, state=TrialState.FAIL)
+
+    with pytest.raises(RankingStopped, match=rf"#{number} \(fail\) [^\n]*after its mark"):
         rank(study)

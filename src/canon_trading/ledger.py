@@ -76,6 +76,12 @@ Either made `record_trial` tell its own run `FAIL`.
 Another writer's keyed trial waiting in Optuna's queue is refused before `ask`, and
 `retire_queued` retires it, or one `record_trial` took before it refused, through Optuna's public
 `Study.ask`, `Trial.set_user_attr`, `Study.tell` and `Study.set_user_attr` (ADR 0054, 2026-11-10).
+Who wrote a record, `record_trial` or another writer, and whether another writer's was queued, taken
+from the queue here or started outside it, is decided in one place, `origin`, by key, state, note and
+attributes; `record_trial`, `retire_queued`, `mark_not_run`, the ranking and the study's pass all read
+it (ADR 0054 term 7, 2026-11-11). The attributes it compares are those Optuna 5.0.0 keeps on a
+`FrozenTrial` (`trial/_frozen.py`): `user_attrs`, `system_attrs`, `distributions` and
+`intermediate_values`.
 """
 
 from __future__ import annotations
@@ -159,6 +165,8 @@ RETIRED_NOTE = (
     "another writer's queued trial, retired by retire_queued: it never ran here, and its key stays "
     "counted in N"
 )
+# The two notes this module writes on a trial it takes from Optuna's queue (`carries_a_queue_note`).
+QUEUE_NOTES = (TAKEN_FROM_QUEUE, RETIRED_NOTE)
 STRATEGY_CLASS = f"{MaCross.__module__}:{MaCross.__qualname__}"
 # The fields of NautilusTrader's `Currency` (its constructor and `Debug` at the pinned commit), each
 # held for every currency an instrument holds (`instrument_digest`).
@@ -948,10 +956,25 @@ def _tell_unread(study: optuna.Study, trial: optuna.Trial, error: BaseException,
 
 
 def _untold(frozen: FrozenTrial, retired: set[int]) -> str | None:
-    """What a refused note leaves on another writer's keyed trial taken from the queue, not retired:
-    the note added to the store's error (ADR 0054 term 7's named limit); for any other, nothing."""
-    if not has_key(frozen) or frozen.number in retired:
+    """What a refused note leaves on another writer's trial taken from the queue: the note added to
+    the store's error, or nothing for a retired one, which the list already holds.
+
+    A keyed one, not retired, may read as a run of its key (ADR 0054 term 7's named limit). A keyless
+    one holding what `record_trial` never writes on such a record (`Study.enqueue_trial`'s
+    `fixed_params`, another writer's attributes) reads, with no note, as another writer's started
+    record (`origin`): it stops the ranking for good, the strict side, and nothing clears it. A
+    keyless one holding nothing reads as `record_trial`'s own, which `mark_not_run` clears.
+    """
+    if frozen.number in retired:
         return None
+    if not has_key(frozen):
+        if origin(frozen).origin is not Origin.FOREIGN:
+            return None
+        return (
+            f"trial #{frozen.number}, queued by another writer with no config key, was taken without "
+            "its note, so it reads as another writer's started record: it stops the ranking for "
+            "good, and mark_not_run does not clear it (ADR 0054 term 7)"
+        )
     return (
         f"trial #{frozen.number}, queued by another writer with config key "
         f"{frozen.user_attrs['config_key']}, was taken without its note, so the ranking may read it "
@@ -1004,6 +1027,7 @@ def _refuse_a_keyed_queue(study: optuna.Study, waiting: Sequence[FrozenTrial]) -
     """Refuse to `ask` while another writer's keyed trial, not retired, waits in Optuna's queue;
     otherwise give the numbers retired (`retired_numbers`, which refuses a list not in its form)."""
     retired = retired_numbers(study)
+    # Every one of `waiting` is `WAITING`, which `origin` reads as `QUEUED` by its state alone.
     keyed = [t for t in waiting if has_key(t) and t.number not in retired]
     if keyed:
         first = keyed[0]
@@ -1034,13 +1058,145 @@ def carries_a_queue_note(trial: FrozenTrial) -> bool:
     """Whether `trial` was taken from Optuna's queue with a note this module writes, by `record_trial`
     (`TAKEN_FROM_QUEUE`) or `retire_queued` (`RETIRED_NOTE`), and is `FAIL` or, its `tell` refused,
     still `RUNNING`: the states that taking it leaves."""
-    return trial.state in (TrialState.FAIL, TrialState.RUNNING) and trial.user_attrs.get(
-        "error"
-    ) in (TAKEN_FROM_QUEUE, RETIRED_NOTE)
+    return (
+        trial.state in (TrialState.FAIL, TrialState.RUNNING)
+        and trial.user_attrs.get("error") in QUEUE_NOTES
+    )
+
+
+# Every user attribute `record_trial` writes on a record (ADR 0035 term 3, ADR 0053): on one with no
+# key, only its error, since the key is its first write.
+WRITTEN = frozenset(
+    {
+        "config_key",
+        "sample",
+        "config",
+        "run_config_id",
+        "backtest_start",
+        "backtest_end",
+        "returns_series",
+        "session_days",
+        "data_digest",
+        OUTCOME,
+        "error",
+    }
+)
+WRITTEN_KEYLESS = frozenset({"error"})
+
+
+class Origin(enum.Enum):
+    """Who wrote a record, as `origin` reads it (ADR 0054 term 7)."""
+
+    WRITER = "record_trial's own"
+    QUEUED = "another writer's, waiting in Optuna's queue"
+    TAKEN = "another writer's, taken from Optuna's queue here with its note"
+    FOREIGN = "another writer's, started, told or written outside the queue"
+
+
+@dataclass(frozen=True)
+class Reading:
+    """A record's `Origin`, and for any other than `record_trial`'s own, why."""
+
+    origin: Origin
+    why: str = ""
+
+
+def origin(trial: FrozenTrial) -> Reading:
+    """Who wrote `trial`: the one rule every reader of the ledger applies (ADR 0054 term 7).
+
+    `record_trial` asks for its own trial, writes its key first and then only the attributes in
+    `WRITTEN` (on a record with no key, only its error), and suggests no parameter, reports no
+    intermediate value and writes no system attribute. This module takes another writer's queued
+    trial only through `Study.ask`, and writes on it at once its note (`carries_a_queue_note`), so
+    a taken trial holds that writer's attributes beside the note and ran nothing here. Read in this
+    order, by key, state, note and attributes:
+
+    * a record with no key in the form `record_trial` writes that shows a run (`ran_something`) is
+      `FOREIGN`: a trial of an unknown configuration, whatever else it holds;
+    * a `WAITING` one is `QUEUED`: another writer queued it, and nothing has started it;
+    * one `FAIL` or `RUNNING` with a queue note is `TAKEN`;
+    * one with a queue note in another state, a system attribute (`Study.enqueue_trial` writes
+      `fixed_params` on every trial it queues), a user attribute `record_trial` does not write on such
+      a record, a parameter or an intermediate value is `FOREIGN`: another writer started, told or
+      wrote it, outside the queue's take, so it may have run anything;
+    * anything else is `WRITER`, `record_trial`'s own: for a keyed one, `canon_trading.ranking`
+      then checks its state, outcome and results against what `record_trial` leaves; a keyless one is
+      what a process killed before the key's write leaves, and ran nothing.
+
+    What each reader does with it: `record_trial` refuses to `ask` beside a keyed `QUEUED` record not
+    retired (`_own_trial`); `retire_queued` retires a keyed `QUEUED` or `TAKEN` record and nothing
+    else; `mark_not_run` marks a keyless `WRITER`, `QUEUED` or `TAKEN` record and refuses a `FOREIGN`
+    one, and the ranking clears a marked one only while it is in the state its mark leaves
+    (`cleared_while_waiting`), and stops on a `FOREIGN` one, keyed or not, for good; the study's pass
+    reads only a keyed `WRITER` record as `record_trial`'s written failure
+    (`canon_trading.variant_study`). A record another writer made in `record_trial`'s exact form,
+    with no system attribute, reads as `WRITER`: nothing on it tells the two apart, and the ledger's
+    writers are this repository's own sessions (term 7's named limits).
+
+    One question is asked apart, at `ask` and of the trial `ask` just gave: whether it was taken from
+    the queue (`_from_the_queue`). There a trial `ask` created holds nothing at all, so anything on
+    it, even an error alone, means it was queued with it; the note then written makes it `TAKEN`
+    here, or, refused, leaves what `_untold` names.
+    """
+    attrs = trial.user_attrs
+    keyed = has_key(trial)
+    if not keyed and ran_something(trial):
+        return Reading(Origin.FOREIGN, "shows a run, a trial of an unknown configuration")
+    if trial.state == TrialState.WAITING:
+        return Reading(
+            Origin.QUEUED,
+            "is WAITING, queued by another writer, which record_trial never leaves and refuses to "
+            "start beside",
+        )
+    if carries_a_queue_note(trial):
+        return Reading(
+            Origin.TAKEN,
+            "was taken from Optuna's queue, another writer's queued trial that never ran here and "
+            "that no record_trial keys",
+        )
+    if attrs.get("error") in QUEUE_NOTES:
+        return Reading(
+            Origin.FOREIGN,
+            f"was taken from Optuna's queue and is {trial.state.name}, which taking a trial never "
+            "leaves",
+        )
+    if trial.system_attrs:
+        return Reading(
+            Origin.FOREIGN,
+            f"holds system attributes {sorted(trial.system_attrs)}, which record_trial never writes",
+        )
+    if not keyed and "config_key" in attrs:
+        return Reading(
+            Origin.FOREIGN,
+            f"holds config key {attrs['config_key']!r}, not a non-empty text as record_trial writes",
+        )
+    extra = set(attrs) - (WRITTEN if keyed else WRITTEN_KEYLESS)
+    if extra:
+        return Reading(
+            Origin.FOREIGN,
+            f"holds user attributes {sorted(extra)}, which record_trial never writes"
+            + ("" if keyed else " on a record before its key"),
+        )
+    if trial.intermediate_values or trial.distributions:
+        return Reading(
+            Origin.FOREIGN,
+            "holds an intermediate value or a parameter, which record_trial never writes",
+        )
+    return Reading(Origin.WRITER)
 
 
 def _trial_numbered(study: optuna.Study, number: int) -> FrozenTrial:
-    """Trial `number` of `study`, or `LookupError`."""
+    """Trial `number` of `study`, or `LookupError`; `TypeError` for a number that is not an `int`.
+
+    Optuna numbers trials with `int`s, and `False == 0 == 0.0`: a `bool` or a float would find trial
+    #0 or #1, and a list it then joined would hold it as given, a list every reader refuses
+    (`is_not_run_list`).
+    """
+    if not isinstance(number, int) or isinstance(number, bool):
+        raise TypeError(
+            f"a trial number is an int, not {type(number).__name__} {number!r}; pass int(number) "
+            "for an integer of another type"
+        )
     found = [trial for trial in study.get_trials(deepcopy=False) if trial.number == number]
     if not found:
         raise LookupError(f"study {study.study_name!r} has no trial #{number}")
@@ -1070,9 +1226,10 @@ def retire_queued(study: optuna.Study, number: int) -> None:
     the ranking reads as retired and never as a run; `record_trial` takes one left `WAITING`. The
     record's other contents are not read.
 
-    A keyless record is refused (`mark_not_run` clears one), and so is any other keyed record: a
-    record `record_trial` wrote is a trial of its key, and only a later record of that key resolves
-    it. Everything is read and written under the ledger's lock (module header); a study not opened by
+    Both kinds are as `origin` reads them, `QUEUED` and `TAKEN`. A keyless record is refused
+    (`mark_not_run` clears one), and so is any other keyed record: a record `record_trial` wrote is a
+    trial of its key, and only a later record of that key resolves it. A number that is not an `int`
+    is refused before anything is read (`_trial_numbered`). Everything is read and written under the ledger's lock (module header); a study not opened by
     `create_ledger_study` or `open_study` raises `ValueError`. Retire a `RUNNING` record only once the
     process that took it is gone, as with `mark_not_run`: `record_trial` takes a trial outside the lock,
     and one retired between its note and its `tell` is told `FAIL` here first, which that `tell` then
@@ -1090,7 +1247,8 @@ def retire_queued(study: optuna.Study, number: int) -> None:
                 f"trial #{number} is retired already ({trial.state.name}); it is not read as a run "
                 "and its key stays counted in N",
             )
-        if trial.state == TrialState.WAITING:
+        reading = origin(trial).origin
+        if reading is Origin.QUEUED:
             older = [
                 t.number
                 for t in study.get_trials(deepcopy=False, states=(TrialState.WAITING,))
@@ -1101,7 +1259,7 @@ def retire_queued(study: optuna.Study, number: int) -> None:
                     f"trial #{older[0]}, keyed and queued before #{number}, would be taken from "
                     f"Optuna's queue first; retire #{older[0]} first",
                 )
-        elif not carries_a_queue_note(trial):
+        elif reading is not Origin.TAKEN:
             raise ValueError(
                 f"trial #{number} ({trial.state.name}) is not another writer's queued record, "
                 "WAITING or taken from Optuna's queue with its note: a record record_trial wrote is "
@@ -1171,9 +1329,12 @@ def mark_not_run(study: optuna.Study, number: int) -> None:
     `not_run_waiting` instead, kept apart because an `ask` may still start it: the ranking leaves it out
     of N only while it is `WAITING`, or once `record_trial` took it from the queue and ran nothing in
     it (`_own_trial`). One another writer started after its mark may have run anything, so the ranking
-    stops on it and it cannot be marked again. A record that has a key is refused, and so is one that
-    shows a run (`ran_something`), a result told by a writer other than `record_trial` included: a
-    trial of an unknown configuration, which nothing clears.
+    stops on it and it cannot be marked again. A record that has a key is refused, and so is one
+    `origin` reads as another writer's outside the queue (`FOREIGN`): one that shows a run
+    (`ran_something`), a result told by a writer other than `record_trial` included, a trial of an
+    unknown configuration; and one another writer started, told or wrote on, which may have run
+    anything (a system attribute such as `Study.enqueue_trial`'s `fixed_params`, or a user attribute
+    `record_trial` never writes before its key). Nothing clears either.
     The check, the `tell` and the lists are read and written under the ledger's lock (module header),
     so two marks at once are both kept; a study not opened by `create_ledger_study` or `open_study`
     raises `ValueError`. Use it only on a record whose process is gone: a live one would have its run
@@ -1186,11 +1347,6 @@ def mark_not_run(study: optuna.Study, number: int) -> None:
                 f"trial #{number} has config key {trial.user_attrs['config_key']}: it was tried, and"
                 " only a later record of that key resolves it",
             )
-        if ran_something(trial):
-            raise ValueError(
-                f"trial #{number} has no config key but shows a run (outcome "
-                f"{trial.user_attrs.get(OUTCOME)!r}): it is a trial of an unknown configuration",
-            )
         lists = {name: study.user_attrs.get(name, []) for name in (NOT_RUN, NOT_RUN_WAITING)}
         for name, marked in lists.items():
             if not is_not_run_list(marked):
@@ -1201,11 +1357,19 @@ def mark_not_run(study: optuna.Study, number: int) -> None:
         if number in lists[NOT_RUN_WAITING]:
             if not cleared_while_waiting(trial):
                 raise ValueError(
-                    f"trial #{number} was marked not run while WAITING and started after its mark "
-                    f"({trial.state.name}), so it may have run anything; it is not marked again",
+                    f"trial #{number} was marked not run while WAITING and "
+                    f"{after_its_mark(trial)} ({trial.state.name}), so it may have run anything; it "
+                    "is not marked again",
                 )
             return
-        name = NOT_RUN_WAITING if trial.state == TrialState.WAITING else NOT_RUN
+        reading = origin(trial)
+        if reading.origin is Origin.FOREIGN:
+            raise ValueError(
+                f"trial #{number} has no config key in the form record_trial writes but "
+                f"{reading.why} (outcome {trial.user_attrs.get(OUTCOME)!r}): another writer's "
+                "record, which may have run anything, so it is not cleared",
+            )
+        name = NOT_RUN_WAITING if reading.origin is Origin.QUEUED else NOT_RUN
         if trial.state == TrialState.RUNNING:
             study.tell(number, state=TrialState.FAIL)
         if number not in lists[name]:
@@ -1216,14 +1380,24 @@ def cleared_while_waiting(trial: FrozenTrial) -> bool:
     """Whether `trial`, marked not run while `WAITING`, is still in a state that mark clears.
 
     It is if it is still `WAITING`, or if `record_trial` took it from Optuna's queue and told it
-    `FAIL` at once, its error that note and no run shown (`_own_trial`, `ran_something`); any other
-    state is a start by another writer after the mark.
+    `FAIL` at once, its error that note and no run shown: `origin` reads it `QUEUED` or, `FAIL`,
+    `TAKEN` with `record_trial`'s note (`retire_queued` never takes a keyless record, so
+    its note on one is another writer's). Anything else is a start or a write by another writer
+    after the mark (`after_its_mark`).
     """
-    return trial.state == TrialState.WAITING or (
-        trial.state == TrialState.FAIL
+    reading = origin(trial).origin
+    return reading is Origin.QUEUED or (
+        reading is Origin.TAKEN
+        and trial.state == TrialState.FAIL
         and trial.user_attrs.get("error") == TAKEN_FROM_QUEUE
-        and not ran_something(trial)
     )
+
+
+def after_its_mark(trial: FrozenTrial) -> str:
+    """What another writer did to `trial`, marked while `WAITING`, that its mark no longer clears."""
+    if trial.state == TrialState.WAITING:
+        return "was written on by another writer after its mark"
+    return "started after its mark"
 
 
 def is_not_run_list(marked: object) -> bool:

@@ -45,7 +45,9 @@ result Optuna keeps (`COMPLETE`, `PRUNED`, a value or an intermediate value), or
 only while it is in a state the mark leaves: `FAIL` for one in `not_run`, and for one marked while
 `WAITING` (`not_run_waiting`) `WAITING`, or `FAIL` with the note `record_trial` writes on a trial it
 takes from Optuna's queue and runs nothing in; started by another writer after its mark, it stops
-for good. A keyed record `canon_trading.ledger.retire_queued` retired, another writer's queued
+for good. Who wrote a record is read by the ledger's one rule, `canon_trading.ledger.origin`: a
+keyless record another writer started, told or wrote on (a system attribute, a user attribute
+`record_trial` never writes before its key) stops for good, marked or not. A keyed record `canon_trading.ledger.retire_queued` retired, another writer's queued
 trial, is never read, and its key stays counted in N; a key tried only in such records stops until
 `record_trial` runs it on the current sample. The stops on another writer's queued keyed record,
 `WAITING` or taken from Optuna's queue, name `retire_queued` (ADR 0054, 2026-11-10).
@@ -77,16 +79,15 @@ from .ledger import NOT_RUN_WAITING
 from .ledger import OUTCOME
 from .ledger import RAN
 from .ledger import RETIRED
-from .ledger import RETIRED_NOTE
-from .ledger import TAKEN_FROM_QUEUE
 from .ledger import TRADED
+from .ledger import Origin
 from .ledger import Sample
-from .ledger import carries_a_queue_note
+from .ledger import after_its_mark
 from .ledger import cleared_while_waiting
 from .ledger import config_key
 from .ledger import has_key
 from .ledger import is_not_run_list
-from .ledger import ran_something
+from .ledger import origin
 from .ledger import samples
 from .ledger import session_day
 from .ledger import shows_an_evaluation
@@ -226,35 +227,21 @@ def _not_the_writers(trial: FrozenTrial) -> str | None:
 
     `record_trial` leaves a record that ran to the end `COMPLETE`, `traded`, with a value, or `FAIL` or
     `RUNNING` (a `tell` that failed after the outcome), `traded` or `idle`, with none; one cut short
-    `RUNNING` or `FAIL`, `failed` or with no outcome. It suggests no parameter, reports no
-    intermediate value, writes no system attribute and never keys a trial it did not ask for
-    (`canon_trading.ledger._own_trial`), so a keyed `WAITING` record, queued by another writer
-    (`Study.enqueue_trial`, which writes `fixed_params`), is another writer's. Anything else
-    was told by another writer: read as a failure it would be resolved by a later record and drop out
+    `RUNNING` or `FAIL`, `failed` or with no outcome. Who wrote the record is read first, by the
+    ledger's one rule (`canon_trading.ledger.origin`): a queued record, one taken from the queue, and
+    one another writer started, told or wrote on (a system attribute, a parameter, an intermediate
+    value or a user attribute `record_trial` never writes) are another writer's. Anything else
+    in no state and outcome `record_trial` leaves was told by another writer: read as a failure it would be resolved by a later record and drop out
     of every check, and read as a run it would enter the matrix unchecked. `rank` reads every keyed
     record with this, on every sample, so a move of the sample clears none.
     """
+    reading = origin(trial)
+    if reading.origin is not Origin.WRITER:
+        return reading.why
     outcome = trial.user_attrs.get(OUTCOME)
     state = trial.state
     if outcome not in (None, FAILED, TRADED, IDLE):
         return f"has outcome {outcome!r}, not one record_trial writes"
-    if trial.intermediate_values or trial.distributions:
-        return "holds an intermediate value or a parameter, which record_trial never writes"
-    if trial.user_attrs.get("error") in (TAKEN_FROM_QUEUE, RETIRED_NOTE):
-        return (
-            "was taken from Optuna's queue, another writer's queued trial that never ran here "
-            "and that no record_trial keys"
-        )
-    if state == TrialState.WAITING:
-        # Before the system attributes: `Study.enqueue_trial` writes `fixed_params` on what it queues.
-        return (
-            "is WAITING, queued with a key by another writer, which record_trial never leaves and "
-            "refuses to start beside"
-        )
-    if trial.system_attrs:
-        return (
-            f"holds system attributes {sorted(trial.system_attrs)}, which record_trial never writes"
-        )
     if outcome in RAN:
         if (state, outcome, trial.values is not None) in _RAN_AS_TOLD:
             return None
@@ -266,8 +253,8 @@ def _not_the_writers(trial: FrozenTrial) -> str | None:
 
 def _remedy(trial: FrozenTrial) -> str:
     """The remedy for another writer's record, if it is one `retire_queued` takes: a queued keyed
-    record, `WAITING` or taken from Optuna's queue with its note (ADR 0054 term 7)."""
-    if trial.state == TrialState.WAITING or carries_a_queue_note(trial):
+    record, `WAITING` or taken from Optuna's queue with its note (`origin`, ADR 0054 term 7)."""
+    if origin(trial).origin in (Origin.QUEUED, Origin.TAKEN):
         return f"; retire_queued(study, {trial.number}) retires it, its key still counted in N"
     return ""
 
@@ -362,20 +349,22 @@ def rank(study: optuna.Study) -> RankingReport:
             retired[trial.user_attrs["config_key"]].append(trial)
         elif has_key(trial):
             by_key[trial.user_attrs["config_key"]].append(trial)
-        elif ran_something(trial):
-            stops.append(
-                f"#{trial.number} ({trial.state.name.lower()}) has no config key in the form "
-                "record_trial writes but shows a run: a trial of an unknown configuration, which "
-                "another writer left and nothing clears (ADR 0053)",
-            )
         elif trial.number in marks[NOT_RUN_WAITING]:
+            # Read before `origin`, so a record started after its mark is named as such.
             if not cleared_while_waiting(trial):
                 stops.append(
                     f"#{trial.number} ({trial.state.name.lower()}) was marked not run while "
-                    "WAITING and started after its mark, not as record_trial takes a queued trial "
+                    f"WAITING and {after_its_mark(trial)}, not as record_trial takes a queued trial "
                     "(told FAIL with its note), so it may have run anything; nothing clears it "
                     "(ADR 0053)",
                 )
+        elif (reading := origin(trial)).origin is Origin.FOREIGN:
+            # Marked or not: a mark the code before wrote on such a record clears nothing.
+            stops.append(
+                f"#{trial.number} ({trial.state.name.lower()}) has no config key in the form "
+                f"record_trial writes but {reading.why}: another writer's record, which may have "
+                "run anything, and nothing clears it (ADR 0053, ADR 0054)",
+            )
         elif trial.number not in marks[NOT_RUN] or trial.state != TrialState.FAIL:
             # `mark_not_run` leaves every record it puts in `not_run` `FAIL`.
             stops.append(
