@@ -60,6 +60,8 @@ ADR 0010's Evidence; ADR 0032 holds adopting nothing now.
 
 * When an implementation is adopted, a ranking report states S and PBO beside the DSR.
 * What confirms that none is adopted yet, and the test an adoption needs, are in ADR 0032.
+* Re-read 2026-11-10 against skfolio 1.12.9: the role holds and nothing in skfolio changes it. Its
+  `CombinatorialPurgedCV` splits rows but computes no PBO; ADR 0032 has the detail.
 
 ## Evidence
 
@@ -75,11 +77,20 @@ it, and the second reader's line keeps only what concerns this record.
     set where it means the training set; §7 says "mean" where §3 says "median"; §6 gives one Sharpe ratio
     as both 1.27 and 1.3.
   * Not read: SSRN 2840838, or the version in *J. Computational Finance* 20(4), 2017.
-* https://www.mdpi.com/2227-9091/9/1/18 — Witzany, *Risks* 9(1):18 (2021), reported to find CSCV biased in
-  both directions. Returned 403 today; read in a browser on 2026-11-09. UNVERIFIED this session.
+* https://www.mdpi.com/2227-9091/9/1/18 — Witzany, *Risks* 9(1):18 (2021). MDPI returns 403; the
+  published version was read 2026-11-10 at
+  https://www.econstor.eu/bitstream/10419/258108/1/risks-09-00018-v3.pdf. Fetched. Its Conclusions find
+  CSCV biased both ways: negatively when every strategy's mean return is near zero, overoptimistic when one
+  stands well above the others.
 * Second reader, 2026-11-10 (`evidence-verifier`), the part that concerns this record: the paper claims and
   thresholds hold.
 * The package sources behind "No package uses 0.05" are read in ADR 0032's Evidence.
+* skfolio 1.12.9 at the pinned commit 7721090 (tag `v1.12.9`), GitHub source archive, sha256 848e1fee.
+  Fetched 2026-11-10. `src/skfolio/model_selection/_combinatorial.py` is its only splitter over time
+  blocks, and nothing in the tree names PBO, CSCV or an overfitting probability. Settles none of the
+  open points above (leftover rows, ties, the boundary). The details are in ADR 0032's Evidence.
+* Second reader of the skfolio re-read, 2026-11-10 (`evidence-verifier`): the paper's claims and slips hold
+  on a fresh extraction (sha256 d8bfbada). It read Witzany at EconStor and narrowed the skfolio wording.
 * Second reader of the split, 2026-11-10 (`evidence-verifier`): nothing of this record is missing from it
   and ADR 0032 together. It corrected the pointer for the package thresholds, which are in ADR 0032's
   Evidence, and kept the ranking report's line in Confirmation here.

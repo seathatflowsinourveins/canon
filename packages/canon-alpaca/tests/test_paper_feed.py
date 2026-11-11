@@ -1,14 +1,20 @@
 """Paper tests of the data feed a subscription names in its params (ADR 0055), through a real node.
 
-Shaped on the Data Testing Spec's TC-D20 (subscribe quotes) and TC-D71 (adapter-specific subscribe params,
-https://nautilustrader.io/docs/md/latest/developer_guide/spec_data_testing.md). Upstream's `DataTester`
-cannot be used for TC-D71 here: v2.0.0rc8's Python `DataTesterConfig` takes no `subscribe_params`
-(`TypeError` when given one), so a small strategy subscribes instead.
+Shaped on the Data Testing Spec's TC-D20 (subscribe quotes), TC-D30 (subscribe trades) and TC-D71
+(adapter-specific subscribe params, https://nautilustrader.io/docs/md/latest/developer_guide/spec_data_testing.md).
+Upstream's `DataTester` cannot be used for TC-D71 here: v2.0.0rc8's Python `DataTesterConfig` takes no
+`subscribe_params` (`TypeError` when given one), so a small strategy subscribes instead.
 
-* `test_paper_boats_quotes_reach_the_strategy`: `subscribe_quotes(AAPL, params={"feed": "boats"})`; the
-  node's stream is alpaca-py's on `v1beta1/boats` and quotes reach the strategy. Overnight only (8:00pm
-  to 4:00am New York, from Alpaca's calendar): the probe of 2026-11-10 saw `boats` send nothing outside
-  it. That the paper pair is served `boats` at all is an observation, not an entitlement (ADR 0055).
+* `test_paper_boats_quotes_reach_the_strategy`: `subscribe_quotes(AAPL, params={"feed": "boats"})` and
+  `subscribe_trades` with the same params (TC-D30, subscribe trades); the node's stream is alpaca-py's on
+  `v1beta1/boats`, and quotes and trades reach the strategy. It runs until both have arrived, at most
+  `BOATS_WAIT_SECS`: boats trades are sparse overnight (at 23:21 New York on 2026-11-10, 24 AAPL quotes
+  and one trade in a run of 54 s, the node's start-up included). With quotes and no trade in that time it
+  skips, naming the counts: a quiet market, not a defect, once Alpaca has confirmed the trade
+  subscription. It fails when no quote arrives, the subscription is not confirmed, or the boats stream logs a
+  warning or an error (a reconnect, a refusal). Overnight only
+  (8:00pm to 4:00am New York, from Alpaca's calendar): the probe of 2026-11-10 saw `boats` send nothing
+  outside it. That the paper pair is served `boats` at all is an observation, not an entitlement (ADR 0055).
 * `test_paper_default_feed_is_iex`: a subscription with no params; the stream is on `v2/iex`, as before.
   Any hour: it checks where the stream authenticated, not that IEX sent anything.
 
@@ -24,6 +30,8 @@ which holds the paper lock. The stream's endpoint is read from alpaca-py's own l
 import asyncio
 import logging
 import os
+import time
+from collections.abc import Callable
 from datetime import UTC
 from datetime import date
 from datetime import datetime
@@ -60,6 +68,8 @@ AAPL = InstrumentId.from_str("AAPL.ALPACA")
 NEW_YORK = ZoneInfo("America/New_York")
 STREAM_HOST = "wss://stream.data.alpaca.markets"
 START_TIMEOUT_SECS = 60
+BOATS_WAIT_SECS = 120
+"""How long the boats test waits for both a quote and a trade."""
 
 
 def overnight_now() -> bool:
@@ -88,29 +98,52 @@ def overnight_now() -> bool:
 
 
 class Quotes(Strategy):
-    """Subscribe to AAPL quotes with the given params and keep what arrives (TC-D20's shape)."""
+    """Subscribe to AAPL quotes with the given params, and trades too with `with_trades`, and keep what
+    arrives (TC-D20's and TC-D30's shape)."""
 
     def __init__(self) -> None:
         super().__init__()
         self.params: dict | None = None
+        self.with_trades = False
         self.quotes: list = []
+        self.trades: list = []
+        self.subscribed_at: float | None = None
+        self.first_trade_at: float | None = None
 
     def on_start(self) -> None:
+        self.subscribed_at = time.monotonic()
         self.subscribe_quotes(AAPL, params=self.params)
+        if self.with_trades:
+            self.subscribe_trades(AAPL, params=self.params)
 
     def on_quote(self, quote) -> None:
         self.quotes.append(quote)
 
+    def on_trade(self, trade) -> None:
+        if self.first_trade_at is None:
+            self.first_trade_at = time.monotonic()
+        self.trades.append(trade)
+
 
 class StreamLog(logging.Handler):
-    """alpaca-py's stream log lines, as `logging` records them."""
+    """alpaca-py's stream log lines, as `logging` records them, each with the thread that logged it."""
 
     def __init__(self) -> None:
         super().__init__(logging.INFO)
-        self.lines: list[str] = []
+        self.records: list[tuple[str, int, str]] = []
 
     def emit(self, record: logging.LogRecord) -> None:
-        self.lines.append(record.getMessage())
+        self.records.append((record.threadName or "", record.levelno, record.getMessage()))
+
+    @property
+    def lines(self) -> list[str]:
+        return [message for _, _, message in self.records]
+
+    def of_thread_that_logged(self, line: str) -> list[tuple[int, str]]:
+        """Every line of the thread that logged `line`: one stream's own, since the data client runs each
+        stream on a thread named for it alone, and a stream another test left running keeps its own."""
+        threads = {thread for thread, _, message in self.records if message == line}
+        return [(level, message) for thread, level, message in self.records if thread in threads]
 
 
 @pytest.fixture
@@ -147,9 +180,9 @@ def paper_node(strategy: Strategy) -> LiveNode:
     return node
 
 
-def run_for(node: LiveNode, seconds: float) -> None:
-    """Run the node for `seconds` once it is running, then stop it through its handle and let it finish,
-    as `test_paper_matrix.run_for` does."""
+def run_for(node: LiveNode, seconds: float, until: Callable[[], bool] | None = None) -> None:
+    """Run the node for `seconds` once it is running, or until `until` holds, then stop it through its
+    handle and let it finish, as `test_paper_matrix.run_for` does."""
     handle = node.handle()
 
     async def main() -> None:
@@ -163,7 +196,7 @@ def run_for(node: LiveNode, seconds: float) -> None:
                 f"the node did not start in {START_TIMEOUT_SECS} s"
             )
             ends = loop.time() + seconds
-            while not task.done() and loop.time() < ends:
+            while not task.done() and loop.time() < ends and not (until and until()):
                 await asyncio.sleep(0.25)
         finally:
             if not task.done():
@@ -178,16 +211,44 @@ def test_paper_boats_quotes_reach_the_strategy(stream_log) -> None:
         pytest.skip("boats sent nothing outside the overnight session on paper; this test needs it")
     strategy = Quotes()
     strategy.params = {"feed": "boats"}
+    strategy.with_trades = True
     node = paper_node(strategy)
 
-    run_for(node, 30)
+    run_for(node, BOATS_WAIT_SECS, until=lambda: bool(strategy.quotes and strategy.trades))
+    stopped_at = time.monotonic()
 
-    assert f"connected to {STREAM_HOST}/v1beta1/boats" in stream_log.lines, stream_log.lines
-    assert strategy.quotes, "no AAPL quote from boats in 30 s of the overnight session"
+    subscribed = strategy.subscribed_at
+    waited = stopped_at - subscribed if subscribed is not None else 0.0
+    first = strategy.first_trade_at
+    first_trade = f"{first - subscribed:.0f} s" if first is not None and subscribed else "none"
+    crossed = sum(q.bid_price > q.ask_price for q in strategy.quotes)
+    print(
+        f"PAPER-FEED boats quotes={len(strategy.quotes)} crossed={crossed} "
+        f"trades={len(strategy.trades)} first trade after {first_trade}, {waited:.0f} s subscribed"
+    )
+    connected = f"connected to {STREAM_HOST}/v1beta1/boats"
+    assert connected in stream_log.lines, stream_log.lines
+    # This stream's own lines: a warning is a reconnect ("data websocket error, restarting connection"),
+    # an error a refusal or a failed run (alpaca-py 0.45.0, `alpaca/data/live/websocket.py`).
+    boats = stream_log.of_thread_that_logged(connected)
+    troubles = [message for level, message in boats if level >= logging.WARNING]
+    assert strategy.quotes, (
+        f"no AAPL quote from boats in {BOATS_WAIT_SECS} s of the overnight session"
+    )
     assert all(q.instrument_id == AAPL for q in strategy.quotes)
     assert all(q.bid_price.as_double() > 0 and q.ask_price.as_double() > 0 for q in strategy.quotes)
-    crossed = sum(q.bid_price > q.ask_price for q in strategy.quotes)
-    print(f"PAPER-FEED boats quotes={len(strategy.quotes)} crossed={crossed}")
+    assert not troubles, troubles
+    if not strategy.trades:
+        # A quiet market, not a defect, but only once Alpaca has confirmed the trade subscription: alpaca-py
+        # logs each confirmation, "subscribed to trades: ['AAPL'], quotes: ['AAPL']" or the like.
+        confirmed = any(m.startswith("subscribed to") and "trades: ['AAPL']" in m for _, m in boats)
+        assert confirmed, ("Alpaca never confirmed the boats trade subscription", boats)
+        pytest.skip(
+            f"no boats trade for AAPL in {waited:.0f} s subscribed; "
+            f"{len(strategy.quotes)} quotes arrived"
+        )
+    assert all(t.instrument_id == AAPL for t in strategy.trades)
+    assert all(t.price.as_double() > 0 and t.size.as_double() > 0 for t in strategy.trades)
 
 
 def test_paper_default_feed_is_iex(stream_log) -> None:
