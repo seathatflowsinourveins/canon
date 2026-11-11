@@ -32,14 +32,29 @@ actionlint = "1.7.12"   # canon/upstreams.json: actionlint
 # here holds a value. Sources: `man security` (add-, find-, delete-generic-password); mise's task `env` and
 # `exec()` (https://mise.jdx.dev/tasks/task-configuration.html#env, https://mise.jdx.dev/templates.html).
 # Task scripts are Tera templates too, so they must not contain "{{", "{%" or "{#".
+# Two paper accounts (docs/adr/0069-two-paper-accounts.md): `tests`, account A, the service above, and
+# `windows`, account B, service "canon-alpaca-paper-windows", the same two item names. paper:store, paper:check
+# and paper:remove take the account as an argument, `tests` when none is given; mise refuses any other name
+# before the script starts (the `usage` spec's `choices`, https://mise.jdx.dev/tasks/task-arguments.html,
+# tried with mise 2026.11.5), and each script's `case` refuses it again. No task reads account B's pair yet.
 
 [tasks."paper:store"]
-description = "Enter the Alpaca paper key pair at a hidden prompt; store it only if Alpaca's paper API accepts it"
+description = "Enter an Alpaca paper account's key pair at a hidden prompt; store it only if Alpaca's paper API accepts it"
 interactive = true
 shell = "bash -c"
+usage = '''
+arg "[account]" help="tests: account A, the default; windows: account B (ADR 0069), which no task reads yet" default="tests" {
+  choices "tests" "windows"
+}
+'''
 run = '''
 set -euo pipefail
-svc=canon-alpaca-paper
+# the account (ADR 0069): its service, the other account's, its items' label, and the argument that names it
+case "${usage_account:-tests}" in
+  tests) svc=canon-alpaca-paper; other=canon-alpaca-paper-windows; label=Alpaca-paper; arg="" ;;
+  windows) svc=canon-alpaca-paper-windows; other=canon-alpaca-paper; label=Alpaca-paper-windows; arg=" windows" ;;
+  *) echo "paper:store: no paper account named ${usage_account}; the names are tests and windows. Nothing stored." >&2; exit 1 ;;
+esac
 [ -t 0 ] || { echo "paper:store: needs a terminal to ask for the pair; run it in your own terminal" >&2; exit 1; }
 # Exit statuses: 0 found, 44 absent (errSecItemNotFound, observed; ADR 0029). security documents none, and
 # 44 is that status's low byte, so another error ending in the same byte would read as absent. Any other
@@ -49,10 +64,19 @@ for a in ALPACA_API_KEY ALPACA_SECRET_KEY; do
   rc=0; /usr/bin/security find-generic-password -s "$svc" -a "$a" >/dev/null 2>&1 || rc=$?
   case "$rc" in
     44) ;;
-    0) echo "paper:store: $a is already in the login keychain; run: mise run paper:remove" >&2; exit 1 ;;
+    0) echo "paper:store: $a is already in the login keychain (service $svc); run: mise run paper:remove$arg" >&2; exit 1 ;;
     *) echo "paper:store: could not check whether $a is in the login keychain (security exit $rc); nothing stored" >&2; exit 1 ;;
   esac
 done
+# The two accounts never hold one pair (ADR 0069): the other account's stored key ID, compared below with the
+# one entered. It is read here, before either prompt, so a failure stops the task before anything is typed,
+# and under timeout(1) for 30 s, as paper:test's reads are, so a read waiting at a dialog does not hold it
+# (exit 124). security writes it to a pipe into this shell; its secret is never read. 44: none stored there.
+orc=0; okey=$(/usr/bin/timeout 30 /usr/bin/security find-generic-password -s "$other" -a ALPACA_API_KEY -w 2>/dev/null) || orc=$?
+case "$orc" in
+  0|44) ;;
+  *) echo "paper:store: could not read the other paper account's key ID to compare (security exit $orc, 124 if no answer in 30 s); nothing stored" >&2; exit 1 ;;
+esac
 # Echo off before either prompt shows: a silent read turns it off only after its prompt, so a value typed
 # or pasted at once could show (observed with bash 3.2; ADR 0033). It is back on however the task ends.
 trap 'stty echo' EXIT; trap 'exit 130' INT TERM HUP; stty -echo
@@ -63,6 +87,12 @@ if [ -z "$key" ] || [ -z "$secret" ]; then echo "paper:store: both values are ne
 # Alpaca: "Live keys with an AK... prefix, these prefixes are visual hints" (alpaca.markets/learn,
 # api-key-security-best-practices-for-alpaca-builders). A hint can refuse a key, never accept one.
 case "$key" in AK*) echo "paper:store: refused. The key ID starts with AK, which Alpaca uses for live keys. Nothing stored." >&2; exit 1 ;; esac
+# Two equal pairs have equal key IDs, so a key ID equal to the other account's stored one is refused, before
+# the paper API is asked. bash's `[`, a builtin, compares them, so neither value is in a process's arguments.
+if [ "$orc" = 0 ] && [ "$okey" = "$key" ]; then
+  okey=""; echo "paper:store: refused. This key ID is the one stored for the other paper account (service $other); each account has its own pair. Nothing stored." >&2; exit 1
+fi
+okey=""
 # Alpaca: "you cannot use your live account's credentials with the paper API" (us/docs/authentication.md).
 # The headers go to curl on stdin (-H @-), so neither value is in a command line.
 code=$(printf 'APCA-API-KEY-ID: %s\nAPCA-API-SECRET-KEY: %s\n' "$key" "$secret" \
@@ -78,7 +108,7 @@ esac
 store() {
   local hex
   hex=$(printf '%s' "$2" | od -An -tx1 | tr -dc 0-9a-f)
-  printf 'add-generic-password -a %s -s %s -l Alpaca-paper-%s -X %s\n' "$1" "$svc" "$1" "$hex" | /usr/bin/security -i >/dev/null 2>&1
+  printf 'add-generic-password -a %s -s %s -l %s-%s -X %s\n' "$1" "$svc" "$label" "$1" "$hex" | /usr/bin/security -i >/dev/null 2>&1
 }
 same() { [ "$(/usr/bin/security find-generic-password -s "$svc" -a "$1" -w 2>/dev/null)" = "$2" ]; }
 if store ALPACA_API_KEY "$key" && store ALPACA_SECRET_KEY "$secret" \
@@ -92,21 +122,33 @@ else
     rc=0; /usr/bin/security delete-generic-password -s "$svc" -a "$a" >/dev/null 2>&1 || rc=$?
     [ "$rc" = 0 ] || [ "$rc" = 44 ] || left="$left, could not remove $a (security exit $rc)"
   done
-  if [ -n "$left" ]; then echo "paper:store: storing failed or read back differently${left}; run: mise run paper:remove" >&2
+  if [ -n "$left" ]; then echo "paper:store: storing failed or read back differently${left}; run: mise run paper:remove$arg" >&2
   else echo "paper:store: storing failed or read back differently; nothing kept (each item removed or never stored)" >&2; fi
   exit 1
 fi
 '''
 
 [tasks."paper:check"]
-description = "Say whether both paper keychain items exist, without reading either value"
+description = "Say whether both keychain items of a paper account exist, without reading either value"
 shell = "bash -c"
+usage = '''
+arg "[account]" help="tests: account A, the default; windows: account B (ADR 0069), which no task reads yet" default="tests" {
+  choices "tests" "windows"
+}
+'''
 run = '''
+case "${usage_account:-tests}" in
+  tests) svc=canon-alpaca-paper ;;
+  windows) svc=canon-alpaca-paper-windows ;;
+  *) echo "paper:check: no paper account named ${usage_account}; the names are tests and windows" >&2; exit 3 ;;
+esac
+echo "paper account ${usage_account:-tests}, service $svc:"
 # exit 0 when both are there, 1 when one is absent (44, as paper:store reads it), 2 when security failed
-# otherwise, which says nothing about whether the item is there (a locked keychain, a refused access)
+# otherwise, which says nothing about whether the item is there (a locked keychain, a refused access), and 3
+# when the account named is neither of the two (ADR 0069)
 missing=0
 for a in ALPACA_API_KEY ALPACA_SECRET_KEY; do
-  rc=0; /usr/bin/security find-generic-password -s canon-alpaca-paper -a "$a" >/dev/null 2>&1 || rc=$?
+  rc=0; /usr/bin/security find-generic-password -s "$svc" -a "$a" >/dev/null 2>&1 || rc=$?
   if [ "$rc" = 0 ]; then echo "$a: in the login keychain"
   elif [ "$rc" = 44 ]; then echo "$a: absent"; [ "$missing" = 2 ] || missing=1
   else echo "$a: could not be checked (security exit $rc)"; missing=2; fi
@@ -115,14 +157,25 @@ exit "$missing"
 '''
 
 [tasks."paper:remove"]
-description = "Delete both paper keychain items"
+description = "Delete both keychain items of a paper account"
 shell = "bash -c"
+usage = '''
+arg "[account]" help="tests: account A, the default; windows: account B (ADR 0069), which no task reads yet" default="tests" {
+  choices "tests" "windows"
+}
+'''
 run = '''
+case "${usage_account:-tests}" in
+  tests) svc=canon-alpaca-paper ;;
+  windows) svc=canon-alpaca-paper-windows ;;
+  *) echo "paper:remove: no paper account named ${usage_account}; the names are tests and windows. Nothing removed." >&2; exit 1 ;;
+esac
+echo "paper account ${usage_account:-tests}, service $svc:"
 # 44 is an absent item (as paper:store reads it; scripts/test-lanes observes it for a deletion too); any other
 # failure leaves the item where it was, and the task fails
 failed=0
 for a in ALPACA_API_KEY ALPACA_SECRET_KEY; do
-  rc=0; /usr/bin/security delete-generic-password -s canon-alpaca-paper -a "$a" >/dev/null 2>&1 || rc=$?
+  rc=0; /usr/bin/security delete-generic-password -s "$svc" -a "$a" >/dev/null 2>&1 || rc=$?
   if [ "$rc" = 0 ]; then echo "$a: removed"
   elif [ "$rc" = 44 ]; then echo "$a: was not there"
   else echo "$a: could not be removed (security exit $rc)"; failed=1; fi

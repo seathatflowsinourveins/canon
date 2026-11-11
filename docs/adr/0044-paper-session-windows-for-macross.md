@@ -335,6 +335,8 @@ the next open, and extended windows once the extended-hours change and the disco
 
 Read 2026-11-10. "raw": fetched with `curl` and read whole. NautilusTrader files at the pin, `d53849b216e2`.
 
+* ADR 0069, 2026-11-10: a second paper account, B, for session windows. It amends "Sharing the account"
+  once `paper:session` reads B's pair, with a lock of its own; until then this record stands as written.
 * 2026-11-10: `paper:session`'s deadline moved from 85 to 105 minutes, so the start before the node and the
   window's bounded end both fit before the lock's owner is killed (ADR 0050, a second reader's review) (run).
 * https://nautilustrader.io/docs/md/latest/how_to/configure_live_trading.md, "Continuous reconciliation":
