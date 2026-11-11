@@ -89,9 +89,10 @@ daily bars (ADR 0048).
 
 1. A `LiveNode` gets the adapter's factories, both or the data one alone in its paper tests, or both through `ema_cross_paper_node`,
    which adds upstream's `EmaCross` at one share an order (`paper_node.py`, `tests/test_paper_ema_cross.py`, ADR 0037),
-   or through `session_window.window_node`, which adds `SessionMaCross`, or `EmaCross` in a regular window
-   (`--strategy`, ADR 0068), and the `PositionCap` with the execution engine's open-order and position
-   checks on (`session_window.py`, ADR 0044).
+   or through `session_window.window_node`, which adds `SessionMaCross` (the table refuses `EmaCross` by
+   name, since it sells while flat and a window never opens a short), and the `PositionCap` with the
+   execution engine's open-order and position checks on (`session_window.py`, ADR 0044). A window starts
+   only on an account Alpaca holds long-only (`no_shorting`, set by `mise run paper:long-only`).
 2. On connect the provider loads `Equity` instruments from `/v2/assets`; the data client streams quotes
    and trades, on the feed the first subscription's params name and IEX when they name none, and serves
    historical bars, and IEX quotes, into the data engine, which can write them back into the catalog

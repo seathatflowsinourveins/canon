@@ -10,22 +10,42 @@
 #       settings and the runtime defaults, `scripts/automation install` for the agents and their scripts.
 #   (c) once a day, the runtimes' own update commands, `claude update` and `agy update` (ADR 0065).
 #       Codex, Muse Code, DeepSeek Harness and dsh-tui are not updated here: none has its updater turned on
-#       (ADR 0065 rule 4), and Codex, DeepSeek Harness and dsh-tui are exact mise pins, which move through the
-#       drift issue and adopt-upstream.
-# Nothing here reads a secret, installs a tool (`scripts/bootstrap --install` stays a deliberate step) or
-# changes the registry or the pins.
+#       (ADR 0065 rule 4), and Codex, DeepSeek Harness and dsh-tui are exact mise pins, which (d) keeps.
+#   (d) when the checkout is at origin/main, the exact pins main's registry records for what mise installs
+#       outside this repository: mise itself (`mise self-update --yes --no-plugins <version>`) and the tools
+#       of mise's global config listed in PINS (`mise use --global --yes <tool>@<version>`, mise's documented
+#       way to install a version and record it there). A tool already at its pin is left alone.
+# Nothing here reads a secret, installs a tool beyond (d)'s pins (`scripts/bootstrap --install` stays a
+# deliberate step) or changes the registry or the pins.
 #
 # Usage: maintenance.sh <checkout> <mise>
 #
 # The paper locks are the files mise.toml's paper tasks lock (ADR 0069): canon-paper-windows.lock, account B's,
 # which a window holds; canon-paper-test.lock, account A's, which a paper test holds; and canon-alpaca-stream.lock,
 # the login's market-data stream, which paper:data's sandbox node takes alone and a window or a streaming test
-# also takes. A round takes them without waiting (lockf(1) -t 0) and never waits for one: when one is held,
-# the round ends there, saying which. It takes all three at its start and for (a), since any of those runs may
-# run from the checkout, and only the windows' lock for the install, which reloads the paper agent and touches
-# nothing else they use. The daily updates, the compare and the settings step touch none of them and run with
-# them let go. A scheduled window waits 900 s for its lock (mise.toml). The round holds its own lock,
-# <config>/canon/maintenance.lock, for the whole round and the reinstall it starts, so rounds never overlap.
+# also takes. A round takes them without waiting (lockf(1) -t 0). A paper test's lock, or the stream's held
+# with no window running, ends the round there, saying which, since those runs may run from the checkout.
+# A window runs from the paper runner's own clone (ADR 0050), so its lock defers only what that window
+# depends on: the paper section of `scripts/automation install` (the runner, its plist and the clone the
+# runner makes anew at each firing), which the round's install then skips (`install --defer-paper`). The
+# rest of the round runs at once: the fast-forward, the settings step, the other agents' install and the
+# updates; a pin that differs waits too, the window running with mise and its global config. The deferred part waits for the session boundary, the moment the window's lock goes
+# free: the session map ends each run at its session's end by Alpaca's clock and calendar, which this agent
+# cannot read itself, since it reads no secret. A round that defers starts one detached waiter (its own
+# process group, as the reinstall below), which holds <config>/canon/watch/maintenance-boundary.lock, so a
+# second is never started beside it, waits on the windows' lock for at most BOUNDARY_SECS (lockf(1) -t),
+# and once it holds it, and the clone's own lock has gone free too, runs a round with it held
+# (CANON_MAINTENANCE_AT_BOUNDARY=1), which installs the whole, paper section included, and moves the pins;
+# or it records that it timed out. It writes maintenance-boundary.json, which also says when the boundary's
+# round ended before its install.
+# Without a window, the round holds all three for (a) and the windows' lock alone for the install, which
+# reloads the paper agent and touches nothing else they use. The daily updates, the compare, the settings
+# step and the pins touch none of them and run with them let go. A scheduled window waits 900 s for its lock
+# (mise.toml). The round holds its own lock, <config>/canon/maintenance.lock, for the whole round and the
+# reinstall it starts, so rounds never overlap; the round a waiter starts waits for it at most
+# BOUNDARY_ROUND_SECS. Limits: a window started by hand from the main checkout is not told apart from the
+# scheduled one, so the checkout may move under it; and a window waiting for the stream lock that
+# paper:data holds from the main checkout does not hold (a) back.
 # An install is not repeated within a day for the same differences at the same origin/main once an install
 # for them finished (each install restarts the paper agent's interval, ADR 0050); the row says FAILED until
 # then. One that timed out or never reported is. `scripts/automation install` reloads launchd agents, this
@@ -36,8 +56,9 @@
 # Each round rewrites <config>/canon/watch/maintenance-status.json, which `scripts/automation status` reads;
 # the daily updates write maintenance-updates.json beside it. The log is launchd's, watch/maintenance.log.
 # CLAUDE_CONFIG_DIR replaces ~/.claude (the plist sets it to the folder install used, so the installers write
-# there). CANON_GETCONF, CANON_MAINTENANCE_FETCH_SECS, CANON_MAINTENANCE_STEP_SECS and
-# CANON_MAINTENANCE_UPDATE_SECS replace getconf and the bounds (tests only).
+# there). CANON_GETCONF, CANON_MAINTENANCE_FETCH_SECS, CANON_MAINTENANCE_STEP_SECS,
+# CANON_MAINTENANCE_UPDATE_SECS, CANON_MAINTENANCE_BOUNDARY_SECS and CANON_MAINTENANCE_BOUNDARY_ROUND_SECS
+# replace getconf and the bounds (tests only).
 # mise's folder goes first on PATH, so the installers find the mise the plists name (scripts/automation
 # find_mise); exported, as under an empty environment a child gets no PATH (lanes-watch.sh).
 [ $# -ge 2 ] || { echo "usage: maintenance.sh <checkout> <mise>" >&2; exit 2; }
@@ -52,6 +73,17 @@ FETCH_SECS=${CANON_MAINTENANCE_FETCH_SECS:-120}    # the fetch of main
 GIT_SECS=30                                        # each local git command
 STEP_SECS=${CANON_MAINTENANCE_STEP_SECS:-900}      # `differs`, each installer (scripts/automation MAINT_STEP)
 UPDATE_SECS=${CANON_MAINTENANCE_UPDATE_SECS:-900}  # each update command, a download included
+# the waiter's bound: the longest session the session map runs in, the overnight one (20:00 to 04:00 New York,
+# session_window.OVERNIGHT_STARTS), and an hour more; past it a deferral has outlived a whole session
+# (scripts/automation MAINT_BOUNDARY)
+BOUNDARY_SECS=${CANON_MAINTENANCE_BOUNDARY_SECS:-32400}
+BOUNDARY_ROUND_SECS=${CANON_MAINTENANCE_BOUNDARY_ROUND_SECS:-300}   # the round it starts waits this for its lock
+BOUNDARY="$w/maintenance-boundary.json"
+# PINS: <tool as mise's global config names it>|<registry id>|<the registry tag's prefix before the version>.
+# The tools mise installs machine-level whose registry entry records an exact version (canon/upstreams.json);
+# not agy, which updates itself (ADR 0065), nor muse, which follows latest.
+PINS="codex|codex-cli|rust-v pnpm|pnpm|v npm:@deepseek-ai/dsh|deepseek-harness|dsh-v npm:@deepseek-harness-tui/dsh-tui|dsh-tui|v"
+AT_BOUNDARY=${CANON_MAINTENANCE_AT_BOUNDARY:-0}; unset CANON_MAINTENANCE_AT_BOUNDARY
 DAY=86400
 now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { printf '%s maintenance: %s\n' "$(now)" "$*"; }
@@ -74,6 +106,9 @@ FOUND='[]' INSTALLED='[]' FAILED='[]' FF="" OUTCOME=ok NOTE=""
 # its result once it reports; "keep" carries the earlier record's, null clears it (a compare that found no
 # agent or script differing)
 TRIED='"keep"'
+# DEFER: what this round does to the record of a deferred paper section: "set" (deferred now; the earliest
+# deferral's time is kept), "clear" (compared, and nothing of it is left waiting), "keep" (not known)
+DEFER=keep PINRES='[]'
 add() { local v; v=$(jq -c --arg x "$2" '. + [$x]' <<<"${!1}") && printf -v "$1" '%s' "$v"; }
 # record [install json]: this round's record; the last round that found something is kept as last_change
 record() {
@@ -82,22 +117,48 @@ record() {
   [ -n "$prev" ] || prev='{}'
   put "$STATUS" "$(jq -cn --argjson p "$prev" --arg at "$(now)" --arg o "$OUTCOME" --arg ff "$FF" --arg n "$NOTE" \
       --argjson f "$FOUND" --argjson i "$INSTALLED" --argjson x "$FAILED" --arg r "$root" --argjson ins "${1:-null}" \
-      --argjson tr "$TRIED" '
+      --argjson tr "$TRIED" --arg d "$DEFER" --argjson pins "$PINRES" --argjson b "$([ "$AT_BOUNDARY" = 1 ] && echo true || echo false)" '
       {at: $at, at_epoch: now, checkout: $r, outcome: $o, ff: $ff, found: $f, installed: $i, failed: $x,
-       note: $n, install: $ins, tried: (if $tr == "keep" then ($p.tried // null) else $tr end)}
+       note: $n, install: $ins, tried: (if $tr == "keep" then ($p.tried // null) else $tr end), pins: $pins,
+       at_boundary: $b,
+       deferred: (if $d == "set" then ($p.deferred // {since: $at, since_epoch: now, what: "the paper checkout"})
+                  elif $d == "clear" then null else ($p.deferred // null) end)}
       | .last_change = (if ($f | length) > 0 then {at: $at, found: $f, installed: $i, failed: $x} else ($p.last_change // null) end)')" \
     || log "could not write $STATUS"
 }
+# boundary_put <state> [why]: the waiter's record, maintenance-boundary.json; `since_epoch` is when the
+# waiter started, kept from the record it replaces while one waiter runs
+boundary_put() {
+  local prev='{}'
+  [ ! -f "$BOUNDARY" ] || prev=$(jq -c 'objects' "$BOUNDARY" 2>/dev/null) || prev='{}'
+  [ -n "$prev" ] || prev='{}'
+  put "$BOUNDARY" "$(jq -cn --argjson p "$prev" --arg s "$1" --arg why "${2:-}" --arg at "$(now)" --argjson bound "$BOUNDARY_SECS" '
+      {state: $s, at: $at, at_epoch: now, bound: $bound, why: $why,
+       since: (if $s == "waiting" then $at else ($p.since // $at) end),
+       since_epoch: (if $s == "waiting" then now else ($p.since_epoch // now) end)}')" || log "could not write $BOUNDARY"
+}
 # bounded <secs> <command...>: the command under timeout(1), SIGKILL 5 s after SIGTERM, with stdin empty and
-# the locks closed, so nothing it leaves running holds them
-bounded() { local s=$1; shift; /usr/bin/timeout -k 5 "$s" "$@" < /dev/null 6>&- 7>&- 8>&- 9>&-; }
+# the locks closed (the waiter's too), so nothing it leaves running holds them
+bounded() { local s=$1; shift; /usr/bin/timeout -k 5 "$s" "$@" < /dev/null 5>&- 6>&- 7>&- 8>&- 9>&-; }
 timed_out() { [ "$1" = 124 ] || [ "$1" = 137 ]; }
 g() { bounded "$GIT_SECS" git -C "$root" "$@"; }
 
-# one round at a time, the reinstall it started included
+# at the boundary, the waiter that started this round holds the windows' lock on descriptor 9 and its own on 5
+if [ "$AT_BOUNDARY" = 1 ] && ! { true >&9; } 2>/dev/null; then log "started as the boundary's round with no windows' lock held; nothing was run"; exit 1; fi
+# one round at a time, the reinstall it started included; the boundary's round waits for one still running
 exec 7>>"$base/maintenance.lock" || { log "cannot open $base/maintenance.lock"; exit 1; }
-if ! /usr/bin/lockf -t 0 7 2>/dev/null; then log "an earlier round, or the reinstall it started, still runs; nothing this round"; exit 0; fi
-log "round starts in $root"
+if [ "$AT_BOUNDARY" = 1 ]; then
+  if ! /usr/bin/lockf -t "$BOUNDARY_ROUND_SECS" 7 2>/dev/null; then
+    boundary_put failed "an earlier round, or the reinstall it started, still ran after $BOUNDARY_ROUND_SECS s; the next round that finds a window defers again"
+    log "at the boundary: an earlier round still ran after $BOUNDARY_ROUND_SECS s; nothing this round"; exit 0
+  fi
+  log "round starts in $root, at the session boundary: the windows' lock is held for this round"
+  # it says whether its round installed what waited: one that ended first (a paper test's lock held, the
+  # checkout off main) leaves it to the next round that finds a window, which arms a waiter again
+  trap 'if [ "$DEFER" = clear ]; then boundary_put ran "the round at the boundary ran; its record is maintenance-status.json"
+        else boundary_put missed "the round at the boundary ended $OUTCOME before its install; the next round that finds a window waits again"; fi' EXIT
+elif ! /usr/bin/lockf -t 0 7 2>/dev/null; then log "an earlier round, or the reinstall it started, still runs; nothing this round"; exit 0
+else log "round starts in $root"; fi
 # the paper locks are in the per-user temporary folder, where mise.toml's paper tasks lock them on a descriptor
 tmp=$("${CANON_GETCONF:-/usr/bin/getconf}" DARWIN_USER_TEMP_DIR 2>/dev/null) || tmp=""
 case "$tmp" in
@@ -105,37 +166,47 @@ case "$tmp" in
   *) OUTCOME=failed FF="not run"; add FAILED "paper lock: the per-user temporary folder is not known (getconf DARWIN_USER_TEMP_DIR)"
      record; log "the per-user temporary folder is not known, so there is no paper lock to take; nothing was run"; exit 1 ;;
 esac
-paper_free() { exec 6>&- 8>&- 9>&-; }
-# paper_lock <checkout|install>: takes, without waiting, the windows' lock on descriptor 9 and, for
-# `checkout`, the paper tests' on 8 and the stream lock on 6. 0 when this round holds them all; 1 when one is
-# held, with HELD saying which (every caller then ends the round). A lock file that cannot be opened ends the
-# round FAILED, naming it.
-paper_lock() {
-  local spec fd f who
-  paper_free
-  for spec in "9 canon-paper-windows.lock a paper window" "8 canon-paper-test.lock a paper test" \
-              "6 canon-alpaca-stream.lock a run on the market-data stream (paper:data's sandbox node, a window or a paper test)"; do
-    read -r fd f who <<<"$spec"
-    [ "$1" = checkout ] || [ "$fd" = 9 ] || continue
-    if ! eval "exec $fd>>\"\${tmp}\$f\""; then
-      OUTCOME=failed; add FAILED "paper lock: cannot open ${tmp}$f"; record; log "cannot open ${tmp}$f"; exit 1
-    fi
-    if ! /usr/bin/lockf -t 0 "$fd" 2>/dev/null; then HELD="$f is held: $who runs"; return 1; fi
-  done
+# at the boundary the windows' lock stays held for the whole round
+paper_free() { exec 6>&- 8>&-; [ "$AT_BOUNDARY" = 1 ] || exec 9>&-; }
+# plock <fd> <file>: opens the lock file on the descriptor and takes it without waiting; 1 when another
+# holds it. A lock file that cannot be opened ends the round FAILED, naming it.
+plock() {
+  if ! eval "exec $1>>\"\${tmp}\$2\""; then
+    OUTCOME=failed; add FAILED "paper lock: cannot open ${tmp}$2"; record; log "cannot open ${tmp}$2"; exit 1
+  fi
+  /usr/bin/lockf -t 0 "$1" 2>/dev/null
 }
-HELD=""
+# paper_lock <checkout|install>: WINDOW=1 when a window holds the windows' lock (descriptor 9, which this
+# round holds otherwise); for `checkout`, then the paper tests' lock on 8 and, with no window running, the
+# stream lock on 6. 0 when the round may go on; 1 when a paper test or a run on the stream holds one, with
+# HELD saying which (every caller then ends the round).
+paper_lock() {
+  paper_free
+  WINDOW=0 HELD=""
+  if [ "$AT_BOUNDARY" != 1 ] && ! plock 9 canon-paper-windows.lock; then WINDOW=1; exec 9>&-; fi
+  [ "$1" = checkout ] || return 0
+  if ! plock 8 canon-paper-test.lock; then HELD="canon-paper-test.lock is held: a paper test runs"; return 1; fi
+  if [ "$WINDOW" = 0 ] && ! plock 6 canon-alpaca-stream.lock; then
+    HELD="canon-alpaca-stream.lock is held: a run on the market-data stream (paper:data's sandbox node or a paper test)"; return 1
+  fi
+  return 0
+}
+HELD="" WINDOW=0
 if ! paper_lock checkout; then
   OUTCOME=waited FF="not run: the paper lock is held ($HELD), so nothing this round"
   record; log "$FF"; exit 0
 fi
+[ "$WINDOW" = 0 ] || log "a window runs (canon-paper-windows.lock is held): its runner and clone wait for the session boundary; the rest of the round runs"
 
 # (c) the runtimes' own updates, once a day, first and with the paper lock let go: they touch nothing a
-# window uses
+# window uses. Not at the boundary, where the next window waits for this round's windows' lock.
 paper_free
 last=$(jq -r '.at_epoch // 0 | floor' "$UPDATES" 2>/dev/null) || last=0
 [[ "$last" =~ ^[0-9]+$ ]] || last=0
-if [ $(( $(date +%s) - last )) -ge "$DAY" ]; then
-  log "(c) runtime updates (Codex, Muse Code, DeepSeek Harness and dsh-tui are not updated here: Codex, DeepSeek Harness and dsh-tui are exact mise pins)"
+if [ "$AT_BOUNDARY" = 1 ]; then
+  log "(c) runtime updates: not at the boundary; the next round runs them when due"
+elif [ $(( $(date +%s) - last )) -ge "$DAY" ]; then
+  log "(c) runtime updates (Codex, Muse Code, DeepSeek Harness and dsh-tui are not updated here: Codex, DeepSeek Harness and dsh-tui are exact mise pins, which (d) keeps)"
   ures='[]'
   # update <name> <binary>: its update command, bounded; the outcome joins ures
   update() {
@@ -232,15 +303,122 @@ else
   log "(b) skipped: the checkout is not at origin/main, so its tree is not main's"
 fi
 
+# (d) the exact pins main's registry records, at origin/main only, with the locks let go. While a window runs
+# none moves (its mise and mise's global config are in use): each that differs waits for the session
+# boundary, whose round moves it with the windows' lock held (PINWAIT=1 arms the waiter)
+# pin_of <registry id> <tag prefix>: the version of the entry's track, tag:<prefix><version>; empty if none
+pin_of() {
+  jq -r --arg id "$1" '.upstreams[]? | select(.id == $id) | .track // empty' "$root/canon/upstreams.json" 2>/dev/null \
+    | sed -n "s/^tag:$2\([0-9][0-9A-Za-z.+-]*\)\$/\1/p" | head -n 1
+}
+pin_fail() { add PINRES "FAILED: $1"; add FAILED "pin $1"; log "(d) FAILED: $1"; }
+mise_version() { bounded 30 "$mise" --version 2>/dev/null | head -n 1 | awk '{ print $1 }'; }
+# global_at <tool> <version>: "at" when mise's global config requests that version and it is installed,
+# "absent" when the global config names no version of the tool, otherwise what it requests; 1 when mise
+# did not answer
+global_at() {
+  local j
+  j=$(cd "$HOME" && bounded 30 "$mise" ls --global --json "$1" 2>/dev/null) || return 1
+  jq -r --arg v "$2" '(if type == "object" then [.[][]] else . end) as $a
+    | if ($a | map(select(.installed and (.requested_version // .version) == $v)) | length) > 0 then "at"
+      elif ($a | length) == 0 then "absent" else ($a | map(.requested_version // .version) | join(", ")) end' <<<"$j" 2>/dev/null
+}
+PINWAIT=0 PW=0
+if [ "$at_main" = 1 ]; then
+  log "(d) exact pins: mise and its global tools to main's registry"
+  # a window now, read afresh (the round let the locks go for the updates); at the boundary the round holds its lock
+  if [ "$AT_BOUNDARY" != 1 ] && ! /usr/bin/lockf -k -t 0 "${tmp}canon-paper-windows.lock" true 2>/dev/null; then
+    PW=1; log "(d) a window runs: a pin that differs waits for the session boundary"
+  fi
+  v=$(pin_of mise v)
+  if [ -z "$v" ]; then pin_fail "mise: main's registry gives no tag:v<version> for it"
+  elif cur=$(mise_version) && [ "$cur" = "$v" ]; then add PINRES "mise: at $v"
+  elif [ "$PW" = 1 ]; then add PINRES "mise: ${cur:-no version} -> $v at the session boundary"; PINWAIT=1
+  else
+    o=$(cd "$HOME" && bounded "$UPDATE_SECS" "$mise" self-update --yes --no-plugins "$v" 2>&1); rc=$?
+    printf '%s\n' "$o" | sed 's/^/  /'
+    if timed_out "$rc"; then pin_fail "mise: self-update to $v did not finish within $UPDATE_SECS s"
+    elif [ "$rc" != 0 ]; then pin_fail "mise: self-update to $v exited $rc: $(printf '%s' "$o" | tail -n 1)"
+    elif [ "$(mise_version)" != "$v" ]; then pin_fail "mise: self-update to $v exited 0, but mise reports ${cur:-no version} still"
+    else add PINRES "mise: ${cur:-no version} -> $v"; log "(d) mise: ${cur:-no version} -> $v"; fi
+  fi
+  for spec in $PINS; do
+    IFS='|' read -r tool id pre <<<"$spec"
+    v=$(pin_of "$id" "$pre")
+    if [ -z "$v" ]; then pin_fail "$tool: main's registry gives no tag:${pre}<version> for $id"; continue; fi
+    if ! cur=$(global_at "$tool" "$v") || [ -z "$cur" ]; then pin_fail "$tool: mise ls --global did not answer"; continue; fi
+    case "$cur" in
+      at) add PINRES "$tool: at $v" ;;
+      absent) add PINRES "$tool: not in mise's global config; left alone" ;;
+      *) if [ "$PW" = 1 ]; then add PINRES "$tool: $cur -> $v at the session boundary"; PINWAIT=1; continue; fi
+        o=$(cd "$HOME" && bounded "$UPDATE_SECS" "$mise" use --global --yes "$tool@$v" 2>&1); rc=$?
+        printf '%s\n' "$o" | sed 's/^/  /'
+        if timed_out "$rc"; then pin_fail "$tool: mise use $tool@$v did not finish within $UPDATE_SECS s"
+        elif [ "$rc" != 0 ]; then pin_fail "$tool: mise use $tool@$v exited $rc: $(printf '%s' "$o" | tail -n 1)"
+        elif [ "$(global_at "$tool" "$v")" != at ]; then pin_fail "$tool: mise use $tool@$v exited 0, but the global config does not have it installed"
+        else add PINRES "$tool: $cur -> $v"; log "(d) $tool: $cur -> $v"; fi ;;
+    esac
+  done
+fi
+
+# arm_waiter <what>: one detached waiter for the session boundary, never two (it holds the boundary lock
+# for as long as it lives). It waits for the windows' lock at most BOUNDARY_SECS; once it holds it, it waits
+# for the clone's own lock too (the runner holds it on its way out, after the task has let the windows' lock
+# go), lets that one go, and runs a round with the windows' lock held
+arm_waiter() {
+  if ! exec 5>>"$w/maintenance-boundary.lock"; then add FAILED "boundary waiter: cannot open $w/maintenance-boundary.lock"; OUTCOME=failed; return; fi
+  if ! /usr/bin/lockf -t 0 5 2>/dev/null; then exec 5>&-; log "a boundary waiter is already waiting; none added"; return; fi
+  boundary_put waiting
+  set -m
+  (
+    set +m
+    exec 6>&- 7>&- 8>&- 9>&- < /dev/null
+    if ! exec 9>>"${tmp}canon-paper-windows.lock"; then boundary_put failed "cannot open ${tmp}canon-paper-windows.lock"; exit 1; fi
+    if /usr/bin/lockf -t "$BOUNDARY_SECS" 9 2>/dev/null; then
+      if exec 4>>"$base/paper-checkout.lock" && ! /usr/bin/lockf -t "$BOUNDARY_ROUND_SECS" 4 2>/dev/null; then
+        log "boundary: the clone's lock was still held after $BOUNDARY_ROUND_SECS s; the round runs, and install leaves the clone as it is"
+      fi
+      exec 4>&-
+      boundary_put "at the boundary"
+      log "boundary: the windows' lock is free; a round runs the deferred part with it held"
+      CANON_MAINTENANCE_AT_BOUNDARY=1 exec /bin/bash "$0" "$root" "$mise"
+    fi
+    boundary_put "timed out" "the windows' lock stayed held for $BOUNDARY_SECS s"
+    log "boundary: FAILED: the windows' lock stayed held for $BOUNDARY_SECS s; the next round that finds a window waits again"
+  ) &
+  set +m
+  exec 5>&-
+  log "deferred to the session boundary: $1; a waiter waits for the windows' lock as process $!"
+}
 [ "$FAILED" = '[]' ] || OUTCOME=failed
+[ "$PINWAIT" != 1 ] || arm_waiter "the pins that differ"
 if [ "$auto" != 1 ]; then
-  [ "$compared" != 1 ] || TRIED=null
+  [ "$compared" != 1 ] || { TRIED=null; DEFER=clear; }
   record; log "round ends: $OUTCOME"; exit 0
 fi
-# (b) the agents and their scripts, last and detached: install reloads launchd agents, this one included.
+# what the paper section of install manages: the runner, its plist and its agent (scripts/automation differs
+# names each by its path or label)
+autoall=$(jq -c 'map(select(startswith("automation: ")))' <<<"$FOUND")
+autop=$(jq -c 'map(select(test("paper-session")))' <<<"$autoall")
+# the windows' lock again, without waiting: the paper section of install reloads the paper agent
+paper_lock install
+mode=(install)
+if [ "$WINDOW" = 1 ]; then
+  # a window runs: install all but the paper section now, and leave that to the session boundary
+  mode=(install --defer-paper)
+  autof=$(jq -c --argjson p "$autop" '. - $p' <<<"$autoall")
+  if [ "$autop" = '[]' ]; then DEFER="clear"
+  else
+    DEFER="set"
+    NOTE="${NOTE:+$NOTE; }deferred to the session boundary: the paper checkout"
+    arm_waiter "the paper checkout"
+  fi
+  if [ "$autof" = '[]' ]; then record; log "round ends: $OUTCOME (the paper checkout deferred to the session boundary)"; exit 0; fi
+else
+  autof=$autoall DEFER=clear
+fi
 # Not again within a day for the very differences an install already left: each restarts the paper
 # agent's interval (ADR 0050), so a difference no install can fix would hold every window off.
-autof=$(jq -c 'map(select(startswith("automation: ")))' <<<"$FOUND")
 prev=$(jq -c --argjson a "$autof" --arg c "$want" --argjson day "$DAY" \
          '.tried // empty | select(.found == $a and .commit == $c and (now - (.at_epoch // 0)) < $day
                                    and (.result == "done" or (.result == "failed" and (.timeout | not)))) | .at' "$STATUS" 2>/dev/null) || prev=""
@@ -248,19 +426,14 @@ if [ -n "$prev" ]; then
   add FAILED "automation install not repeated: these differences remained after the install at ${prev//\"/} at this origin/main; see that install in the log, or run scripts/automation install by hand"
   OUTCOME=failed; record; log "round ends: $OUTCOME (install not repeated)"; exit 0
 fi
-# the windows' lock again, without waiting: install reloads the paper agent
-if ! paper_lock install; then
-  NOTE="${NOTE:+$NOTE; }automation install not started: the windows' lock was taken ($HELD); the next round installs"
-  record; log "round ends: $OUTCOME (install waits for the windows' lock)"; exit 0
-fi
 TRIED=$(jq -cn --arg at "$(now)" --argjson a "$autof" --arg c "$want" '{at: $at, at_epoch: now, found: $a, commit: $c}')
 start=$(jq -cn '{state: "started", at_epoch: now}')
 record "$start"
-log "(b) scripts/automation install, detached"
+log "(b) scripts/automation ${mode[*]}, detached"
 set -m
 (
   set +m
-  io=$(bounded "$STEP_SECS" "$root/scripts/automation" install 2>&1); rc=$?
+  io=$(bounded "$STEP_SECS" "$root/scripts/automation" "${mode[@]}" 2>&1); rc=$?
   printf '%s\n' "$io" | sed 's/^/  /'
   # the failures install repeats after its status table, after "install: FAILED (exit N):"
   fl=$(printf '%s\n' "$io" | sed -n '/^install: FAILED (exit/,$p' | sed '1d' | sed 's/^ *FAILED: //' | grep -v '^$' | jq -Rsc 'split("\n") | map(select(length > 0))')

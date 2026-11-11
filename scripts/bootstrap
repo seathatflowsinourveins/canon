@@ -600,6 +600,20 @@ codex_defaults_row() {
   else row "codex defaults" ok "$want(home/.codex/defaults.toml, ADR 0059)"; fi
 }
 
+# codex_version_row: Codex's version (`codex --version`, "codex-cli <version>") against the pin main's
+# registry records (canon/upstreams.json codex-cli, tag:rust-v<version>). The maintenance agent brings it to
+# the pin at its next round on main (ADR 0065); by hand: mise use -g codex@<pin>.
+codex_version_row() {
+  local pin v t
+  pin=$(jq -r '.upstreams[]? | select(.id == "codex-cli") | .track // empty' "$ROOT/canon/upstreams.json" 2>/dev/null | sed -n 's/^tag:rust-v//p' | first_line)
+  if ! command -v codex >/dev/null 2>&1; then row "codex version" absent "no codex on PATH (Codex not installed)"; return; fi
+  v=$(runtime_version codex); t=$(sed -n 's/^codex-cli \([0-9][0-9A-Za-z.+-]*\)$/\1/p' <<<"$v")
+  if [ -z "$pin" ]; then row "codex version" UNKNOWN "$v; no readable codex-cli pin in canon/upstreams.json"
+  elif [ -z "$t" ]; then row "codex version" UNKNOWN "cannot read a version from '$v'; pinned $pin (canon/upstreams.json)"
+  elif [ "$t" = "$pin" ]; then row "codex version" ok "$t; pinned $pin"
+  else row "codex version" OUTDATED "$t; pinned $pin (canon/upstreams.json); the maintenance agent's next round on main moves it, or: mise use -g codex@$pin"; fi
+}
+
 # agy_label: the label canon/models.json gives Antigravity's default model; agy_model_state: ok, missing,
 # other, invalid (not a JSON object), absent (no agy folder)
 agy_label() { jq -r '.runtimes[]? | select(.runtime == "antigravity") | .label // empty' "$ROOT/canon/models.json" 2>/dev/null | first_line; }
@@ -732,6 +746,7 @@ check() {
   paper_row "paper key pair" "$PAPER_SERVICE" "mise run paper:store"
   paper_row "paper key pair (windows)" "$PAPER_SERVICE_WINDOWS" "mise run paper:store windows"
   note "Review-only workers (ADR 0045) and their defaults (ADR 0059), optional:"
+  codex_version_row
   codex_defaults_row
   agy_model_row
   dsh_row

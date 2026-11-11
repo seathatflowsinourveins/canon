@@ -86,6 +86,24 @@ then held the paper lock; `paper:data` now gives it account A's pair on the term
 6. Until it is built, a sandbox run under `paper:test` checks after the build that no Alpaca execution
    client is registered and fails otherwise, as the proof's probe did.
 
+**Addition, 2026-11-11: two listed modules for the movers probe.** Decided by the lead under ADR 0074 on
+the owner's instruction of 2026-11-11: term 2's "a third needs a new record" is relaxed, and a further
+data-only module joins the list by an ordinary reviewed change with its GET-only test and a dated line
+here. The list is now `sandbox`, `movers-stream`, `movers-screener` and `quotes`. `movers-stream`
+(`canon_trading.movers_stream`) runs alpaca-py's `StockDataStream` on `sip` with raw messages, bars `*`
+and then trades `*`, and its `StockHistoricalDataClient` for snapshots and minute bars. Each minute it logs
+message counts, peak memory and the top 50 by the movers ranking score. It runs 1 to 60 minutes and holds
+the stream lock. `movers-screener` (`canon_trading.movers_screener`) reads alpaca-py's `ScreenerClient`
+(`get_market_movers`, and `get_most_actives` by volume and by trades) once a minute, for 1 to 85 polls,
+and takes no stream lock. Only modules that stream now take that lock, and `paper:data`'s timeout is 100
+minutes so the screener's longest run fits. Both modules keep `CANON_ALPACA_DATA_ONLY=1`, pass their one
+REST client through `with_http_timeout` and `require_get_only`, import nothing from `alpaca.trading`,
+and log to `canon-paper-data/` in the per-user temporary folder. Their tests show POST, PUT, PATCH and
+DELETE on each module's client refused with nothing sent, no `TradingClient` built, and the screener run
+without the stream lock (`tests/test_movers_*.py`, `scripts/test-lanes`, offline). The ranking score has
+no upstream, so its arithmetic is in the module header, and its parameters are UNCALIBRATED. Whether one
+`sip` connection carries `*` for bars and trades, and at what rate, is UNVERIFIED until a run measures it.
+
 The next step after the transport refusal, not built now: instruments read from the catalog would keep the
 process off the trading host altogether, an adapter change.
 

@@ -85,10 +85,18 @@ ls*|lsof|true
 ls:*|ls -la|true
 EOF
 
-# What a lane runs when it follows adopt-upstream as written: no prompt in any mode.
+# What a lane runs when it follows adopt-upstream as written, or reads an upstream at the pin (rule 1): no
+# prompt in any mode.
 while IFS= read -r cmd; do check "runs without a prompt: $cmd" runs "$cmd"; done <<'EOF'
 scripts/canon resolve alpaca-py
 ./scripts/canon resolve alpaca-py
+scripts/canon src alpaca-py
+./scripts/canon src alpaca-py
+scripts/canon src
+./scripts/canon src
+mise exec -- scripts/canon src alpaca-py
+mise exec -- ./scripts/canon src alpaca-py
+mise exec -- scripts/canon src
 uv add httpx==0.27.2
 uv add --package canon-alpaca httpx==0.27.2
 uv add httpx==0.27.2 idna==3.10

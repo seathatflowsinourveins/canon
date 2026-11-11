@@ -41,21 +41,28 @@ REAL_HOOKS=$(real_git core.hooksPath)
 REAL_HELPER=$(real_git credential.https://github.com.helper)
 
 # A python3 with tomllib (Python 3.11 and later), which the Codex config cases below need, as scripts/bootstrap
-# and the tomlis helper read that config as TOML. Looked for as bootstrap's toml_python looks: the python3 on
-# PATH, then the one mise.toml pins (`mise which python3`, with the mise on PATH or ~/.local/bin/mise), read
-# here, before HOME and PATH point into the temp folder. That one python3, and nothing else from its
-# directory, goes first on PATH for the whole run through a link in the temp folder, and tomlis calls it, so
-# the result does not depend on which python3 the caller's PATH happens to put first (a PATH with the system
-# Python 3.9 ahead of the toolchain's failed ten cases). With none, the run stops: scripts/bootstrap's
-# --install puts the toolchain's in place.
+# and the tomlis helper read that config as TOML. Deliberately NOT looked for the way bootstrap's
+# toml_python looks: that looks at the python3 on PATH first, then at the one mise.toml pins (`mise which
+# python3`, with the mise on PATH or ~/.local/bin/mise). Here the mise-resolved one comes first, and every
+# candidate is probed with HOME pointed at the temp folder, because that is how it will be used: the choice
+# is linked into $TMP/python and put first on PATH for the whole run, and every later case runs with HOME
+# redirected there. A mise shim resolves its version through mise, which reads HOME, so a shim that works
+# at this line stops working once HOME moves — which silently removed tomllib from every Codex-config case
+# (twenty failures). Probing under the redirected HOME rejects a shim in either order, so the PATH fallback
+# below stays honest. That one python3, and nothing else from its directory, goes first on PATH through the
+# link in the temp folder, so the result does not depend on which python3 the caller's PATH puts first (a
+# PATH with the system Python 3.9 ahead of the toolchain's failed ten cases). With none, the run stops:
+# scripts/bootstrap's --install puts the toolchain's in place.
 has_tomllib() { [ -n "$1" ] && [ -x "$1" ] && [ "$("$1" -I -c 'import tomllib; print("tomllib")' 2>/dev/null)" = tomllib ]; }
 TOOL_MISE=$(command -v mise 2>/dev/null) || TOOL_MISE=""
 [ -n "$TOOL_MISE" ] || [ ! -x "$HOME/.local/bin/mise" ] || TOOL_MISE="$HOME/.local/bin/mise"
 toml_python() {
   local p
-  for p in "$(command -v python3 2>/dev/null)" \
-           "$( [ -n "$TOOL_MISE" ] && cd "$ROOT" && MISE_EXEC_AUTO_INSTALL=false "$TOOL_MISE" which python3 2>/dev/null)"; do
-    has_tomllib "$p" && { echo "$p"; return 0; }
+  for p in "$( [ -n "$TOOL_MISE" ] && cd "$ROOT" && MISE_EXEC_AUTO_INSTALL=false "$TOOL_MISE" which python3 2>/dev/null)" \
+           "$(command -v python3 2>/dev/null)"; do
+    # probed as it will be used: under the redirected HOME, so a mise shim cannot pass here and fail later
+    [ -n "$p" ] && [ -x "$p" ] && [ "$(HOME="$TMP/home" "$p" -I -c 'import tomllib; print("tomllib")' 2>/dev/null)" = tomllib ] \
+      && { echo "$p"; return 0; }
   done
   return 1
 }
@@ -429,15 +436,20 @@ runs() { jq -n --arg at "$(iso "$NOW")" --arg s "$1" "[{createdAt: \$at, status:
 printf '\tstate = not running\n\truns = 3\n\tlast exit code = 0\n' > "$STUB/launchctl-print"
 PD="$TMP/paper-session"; mkdir -p "$PD"
 paper() { # paper <result> <age in seconds>: the session windows' latest record
-  jq -n --arg r "$1" --argjson e $((NOW - $2)) --arg c "$(printf 'a%.0s' {1..40})" \
+  # anchored to the clock at the call, like fired() below: a suite-start NOW inflates every age by the run's
+  # own runtime, which moves a rate computed over that interval
+  jq -n --arg r "$1" --argjson e $(( $(date -u +%s) - $2 )) --arg c "$(printf 'a%.0s' {1..40})" \
     '{session: "regular", account: "windows", result: $r, started: "20261111T143500Z", started_epoch: $e, left: [], commit: $c}' > "$PD/latest.json"
 }
 heartbeat() { # heartbeat <age in seconds> [outcome] [scheduled: true|false]: what the last run wrote
-  jq -n --argjson e $((NOW - $1)) --arg o "${2:-a regular window}" --argjson s "${3:-true}" \
+  # anchored to the clock at the call, same reason as fired()
+  jq -n --argjson e $(( $(date -u +%s) - $1 )) --arg o "${2:-a regular window}" --argjson s "${3:-true}" \
     '{at_epoch: $e, outcome: $o, commit: "b123456789abcdef0123456789abcdef01234567", scheduled: $s}' > "$PD/last-firing.json"
 }
 fired() { # fired <age in seconds>: the stamp the runner writes as each scheduled firing starts
-  jq -n --argjson e $((NOW - $1)) '{at_epoch: $e}' > "$PD/scheduled-firing.json"
+  # Anchored to the clock at the call, not to the suite-start NOW. A case that asserts an exact age in
+  # minutes otherwise reads one more the longer the suite took to reach it (the 3 h silence read 181).
+  jq -n --argjson e $(( $(date -u +%s) - $1 )) '{at_epoch: $e}' > "$PD/scheduled-firing.json"
 }
 paper ok 600; heartbeat 60; fired 60
 cp "$R/home/.claude/canon/paper-session.sh" "$AH/canon/paper-session.sh"   # installed as the tree has it
@@ -617,7 +629,7 @@ for r in "running:$((300 * 60)):DIED" "failed: not left flat: [position of 1 SPY
   lab=${r##*:}; rest=${r%:*}
   NOW=$(date -u +%s); fired $((3 * 3600)); paper "${rest%:*}" "${rest##*:}"; status; rc=$?   # one clock read per case
   check "a $lab window and no firing for three hours: $lab, with the silence named" \
-        eval 'rowis "$TMP/status.out" "paper session" "$lab" && [ "$rc" != 0 ] && grep -q "no scheduled firing for 180 min" "$TMP/status.out"'
+        eval 'rowis "$TMP/status.out" "paper session" "$lab" && [ "$rc" != 0 ] && grep -Eq "no scheduled firing for 18[01] min" "$TMP/status.out"'
 done
 fired 60; paper ok 600
 printf '\tstate = running\n' > "$OTL"; rm -f "$AH/canon/otel/logs.jsonl"; status; rc=$?
@@ -1747,6 +1759,19 @@ EOF
     drun sandbox --minutes 3; rc=$?
     check "mise run paper:data sandbox --minutes 3: account A's pair only, the sandbox node with data-only set, under the stream lock" \
           eval '[ "$rc" = 0 ] && grep -qx "args: run --locked python -m canon_trading.sandbox_node --minutes 3" "$DT/ran" && grep -qx "data-only: 1" "$DT/ran" && grep -qx "stream lock held: 75" "$DT/ran" && [ "$(grep -c "^security find-generic-password -s canon-alpaca-paper -a ALPACA_.* -w$" "$KC/log")" = 2 ] && ! grep -q "$WS" "$KC/log"'
+    # the movers probe's modules (ADR 0070, 2026-11-11): the stream holds the stream lock, the screener does not
+    drun movers-stream --minutes 3; rc=$?
+    check "mise run paper:data movers-stream --minutes 3: data-only, under the stream lock, logging outside the repository" \
+          eval '[ "$rc" = 0 ] && grep -qx "args: run --locked python -m canon_trading.movers_stream --minutes 3 --log-dir $DT/locks/canon-paper-data" "$DT/ran" && grep -qx "data-only: 1" "$DT/ran" && grep -qx "stream lock held: 75" "$DT/ran"'
+    drun movers-screener --minutes 3; rc=$?
+    check "mise run paper:data movers-screener --minutes 3: data-only, the stream lock not taken, logging outside the repository" \
+          eval '[ "$rc" = 0 ] && grep -qx "args: run --locked python -m canon_trading.movers_screener --minutes 3 --log-dir $DT/locks/canon-paper-data" "$DT/ran" && grep -qx "data-only: 1" "$DT/ran" && grep -qx "stream lock held: 0" "$DT/ran"'
+    /usr/bin/lockf -k "$DT/locks/canon-alpaca-stream.lock" sleep 30 & hp=$!
+    for _ in $(seq 50); do /usr/bin/lockf -k -t 0 "$DT/locks/canon-alpaca-stream.lock" true 2>/dev/null || break; sleep 0.1; done
+    drun movers-screener --minutes 1; rc=$?
+    kill "$hp" 2>/dev/null; wait "$hp" 2>/dev/null
+    check "mise run paper:data movers-screener while another run holds the stream lock: runs at once, no wait" \
+          eval '[ "$rc" = 0 ] && grep -q "canon_trading.movers_screener --minutes 1" "$DT/ran" && ! grep -q "stream lock stayed held" "$DT/out"'
   fi
   drun quotes; rc=$?
   check "mise run paper:data quotes: refused, not built yet (ADR 0066), nothing run" \
@@ -2190,6 +2215,10 @@ NP="$TMP/no-tomllib"; mkdir -p "$NP"; printf '#!/bin/sh\nexit 1\n' > "$NP/python
 if [ -n "$TOOL_MISE" ]; then
   check "a caller whose first python3 has no tomllib still gets the toolchain's: the run does not depend on it" \
         eval 'p=$(HOME="$CALLER_HOME" PATH="$NP:$CALLER_PATH" toml_python) && [ "$p" != "$NP/python3" ] && has_tomllib "$p"'
+  # the PATH fallback branch on its own: with mise out of the way that first python3 is the only candidate,
+  # and it must be rejected rather than selected and left to fail two thousand lines later
+  check "... and with mise out of the way, a first python3 without tomllib is rejected, not selected" \
+        eval '! (TOOL_MISE= HOME="$CALLER_HOME" PATH="$NP:$CALLER_PATH" toml_python)'
 else
   skip "a caller whose first python3 has no tomllib still gets the toolchain's" "no mise here to find it through"
 fi

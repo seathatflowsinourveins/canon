@@ -16,7 +16,8 @@ the $1,000 cap; were the cap not applied it would rest about $250 above the mark
 test stops the node at the first of: an `EmaCross` order filled, `DEADLINE_SECS` gone, or the strategy's
 net position over one share, which fails the test, as does Alpaca holding more than one share at stop.
 `EmaCross` does not flatten on stop, so a filled order leaves one share, long or short, which the clean-up
-closes outside the node. It needs the regular session and skips outside it: IEX then sends no quote for
+closes outside the node. It skips on an account Alpaca holds long-only (`no_shorting`): there Alpaca refuses
+`EmaCross`'s sell while flat, so whether a fill comes would depend on the first cross's direction. It needs the regular session and skips outside it: IEX then sends no quote for
 minutes, so nothing could be placed. A fill is required when the session is open at the start and the end.
 
 The account is left as it was found: the test places nothing, and fails, if the account holds an open SPY
@@ -223,6 +224,12 @@ def net_position(cache) -> int:
 
 
 def test_paper_ema_cross_trades_one_share_under_the_risk_limits() -> None:
+    configuration = paper_trading().get_account_configurations()
+    if getattr(configuration, "no_shorting", False):
+        # `EmaCross` sells while flat whenever its first cross is down, and Alpaca refuses that sell on
+        # a long-only account (`no_shorting`, `mise run paper:long-only`), so the fill this run requires
+        # would come only when the first cross is up.
+        pytest.skip("the paper account is long-only (no_shorting), and EmaCross sells while flat")
     node = ema_cross_paper_node(SPY, max_order_submit_rate=RUN_SUBMIT_RATE)
     probe = NotionalProbe()
     node.add_strategy(probe)
