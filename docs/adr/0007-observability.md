@@ -80,7 +80,14 @@ reference stack and needs a container runtime, which this Mac does not have.
   own metrics are off (`service.telemetry.metrics.level: none`), so it opens no other port. Between the
   receiver and the exporter, a `filter` drops every record except Claude Code's `api_request` and Codex's
   `codex.sse_event` `response.completed` and `codex.turn_cost`. A `transform` then keeps only the
-  attributes the manifest reads and clears the resource and scope attributes. **The filter is the guard,
+  attributes the manifest reads, clears the resource and scope attributes and every other text field a
+  record can carry (event name, severity text, trace and span ids, scope name and version, schema URLs),
+  and turns a count or cost sent as a decimal string into a number. It removes a model name with a
+  character beyond letters, digits and `. _ - : [ ]` (an `@` and eight digits may end it, as Vertex AI model
+  IDs do) and a time that is not ISO 8601, so neither an address nor a path is kept and the record still
+  counts. A second `filter` then drops a record whose count or cost is not a number or whose identifier has a
+  character beyond letters, digits, `_` and `-`. It fails closed (`error_mode: propagate`): a condition that
+  errs drops the whole request, valid records in it included. This holds for anything that reaches 127.0.0.1, not only the two clients. **The filter is the guard,
   not a convenience:** at rust-v0.167.0, Codex logs every `codex.tool_result` with the tool's full
   `arguments` and a 2 KB output preview. It has a setting for the preview's size (`tool_result.max_bytes`)
   but none for the arguments (`codex-rs/otel/src/tool_result.rs`), and its shared fields carry
@@ -91,7 +98,14 @@ reference stack and needs a container runtime, which this Mac does not have.
   on a refused config. It names the binary by the absolute, versioned path `mise which otelcol` gives, so
   a move of the `otelcol` pin needs `scripts/bootstrap --install` and then `scripts/automation install`
   again, and `status` says FAILED once that binary is gone. The Collector logs warnings and errors only,
-  to `~/.claude/canon/watch/otel-collector.log`, which each install empties. `status` shows whether
+  to `~/.claude/canon/watch/otel-collector.log`, which each install empties. Neither otelcol (its
+  `service.telemetry.logs` takes no rotation key at v0.165.0) nor launchd rotates that file. **Known limit:**
+  at `level: warn` a healthy run writes nothing to it, and a failed start (measured with a port already in
+  use) writes 439 bytes, two lines naming the error. The agent's `ThrottleInterval` of 60 s (launchd's default
+  is 10) spawns it at most 1440 times a day, so a restart loop grows the file by at most about
+  1440 x 439 B = 0.63 MB a day until the next `scripts/automation install` empties it; at the default it
+  would be about 3.8 MB. `KeepAlive` stays `true`: restarting only on failure (`SuccessfulExit` false) would
+  leave the Collector down after a SIGKILL or a clean exit. `status` shows whether
   launchd has the agent running and how old `logs.jsonl` is. `uninstall` removes the agent and the
   config and keeps the events.
 * **Claude Code** gets `CLAUDE_CODE_ENABLE_TELEMETRY=1`, `OTEL_LOGS_EXPORTER=otlp`,
@@ -101,15 +115,21 @@ reference stack and needs a container runtime, which this Mac does not have.
   `OTEL_LOG_TOOL_CONTENT`, `OTEL_LOG_RAW_API_BODIES`) stays unset, which is off. The variables are ignored
   in a project's settings, so `scripts/bootstrap --user-config` adds the ones an existing
   `~/.claude/settings.json` lacks, and keeps a copy of the previous file. A value the owner set
-  differently is left alone and named, as the owner's choice, and `--check` shows it as `OWNER`.
+  differently is left alone and named, as the owner's choice, and `--check` shows it as `OWNER`. So is
+  an `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` or `OTEL_EXPORTER_OTLP_LOGS_PROTOCOL` in the settings or the
+  environment, which overrides the general endpoint for logs, so they do not reach the local Collector. A
+  settings file that cannot be written fails the run.
 * **Codex** gets the `[otel]` table of `home/.codex/otel.toml`: `exporter = { otlp-http = { endpoint =
   "http://127.0.0.1:4318/v1/logs", protocol = "binary" } }`, `log_user_prompt = false` (its default) and
   `log_sse_deltas = false`. The last one departs from Codex's default (`true`) so that the per-token
   `.delta` events are not sent at all; completion events still are. `otel` is ignored in a project's
   `.codex/config.toml`, so `scripts/bootstrap --user-config` appends the table to
-  `${CODEX_HOME:-~/.codex}/config.toml` when that folder exists (Codex is installed) and the file sets no
+  `${CODEX_HOME:-~/.codex}/config.toml` when that folder exists (Codex is installed) and the file, read as
+  TOML with Python's `tomllib` (never a pattern), sets no
   `otel` of its own. It keeps a copy of the previous file and changes nothing else in it. A different
-  `otel` setting is left alone and named as the owner's choice.
+  `otel` setting is left alone and named as the owner's choice. A file that is not TOML is left alone and
+  named `INVALID`; with no `python3` that has `tomllib`, nothing is written and the row is `UNKNOWN`. The
+  appended copy must read back as TOML with canon's table before it replaces the file.
 
 **Tokens per second, from OpenTelemetry only (added 2026-11-10).** `scripts/lanes --rates [--window MIN]
 [--json]` prints one row per running worker of every runtime: lane, runtime, model, state, output tokens
@@ -135,9 +155,10 @@ documented token source gets a row saying "not measured" and why; no figure is e
   `~/.claude/canon/otel/logs.jsonl` (`CANON_OTLP_FILE` overrides it). It copies out only the attributes
   named above; Codex also sends account fields, which are never read.
 * The Collector of tier 3 writes that file. A session started before the telemetry settings reached
-  `~/.claude/settings.json` sends nothing and reads "not measured" until it restarts. The manifest reads
-  only the current `logs.jsonl`, not its rotated copies. A rotation therefore drops the window's earlier
-  events, and one is due only every 10 MB.
+  `~/.claude/settings.json` sends nothing and reads "not measured" until it restarts. The manifest also reads
+  the rotated copies the file exporter leaves beside `logs.jsonl` (`logs-<UTC time>-size.jsonl`) that were
+  written within the window, so a rotation drops none of the window's events. A row whose window holds
+  events but no output token count (a cost-only turn, a completion with no usage) is "not measured", not 0.
 
 **Gap, stated plainly:** no fleet or stall-detection tool has converged upstream. `scripts/lanes` is thin
 glue over documented hook payloads and is provisional; it is replaced when an upstream tool earns adoption.
@@ -177,6 +198,27 @@ arrived as one `api_request` record carrying `session.id`, `model`, `output_toke
 `cost_usd`, `event.name` and `event.timestamp` and nothing else. A fixture request through
 `scripts/lanes --rates` gave the Codex conversation row 2 tok/s. No real Codex run was sent: that Codex
 exports to this endpoint with this table is UNVERIFIED, read from its source and docs only.
+
+Fixes after a second reader's review, 2026-11-10, each with a test that failed before it:
+
+* `scripts/test-otel` sends a second request, as a local producer that is not one of the clients would, with an
+  email address and a home path in the event name, severity text, trace and span ids, scope name, version and
+  attributes, schema URLs, a count, the identifiers, the model, the time and an `event.kind`; none reaches the
+  file, the well-formed record keeps its count as a number, the four with text for a count or an identifier
+  are dropped, and the two with text for a model or a time keep their record without it; a Vertex AI model
+  ID and a time with an offset are kept. Rehearsed the same
+  day with the pinned Collector on scratch ports: a real `claude -p` request arrived as one `api_request` with
+  only the named attributes, and of that request only the well-formed record was written.
+* `scripts/test-lanes`: a quoted `['otel']` table is the owner's and is left valid; an `[otel]` line inside a
+  multi-line string gets canon's table added; a config that is not TOML is `INVALID`; with no `tomllib`,
+  nothing is written (`UNKNOWN`); an unwritable `settings.json` fails the run and is not reported added; a
+  per-signal logs endpoint or protocol, in the settings or the environment, is `OWNER` and not called local,
+  named without its value; canon's table with a key of the owner's added is still canon's.
+* `scripts/test-lanes`: five completions in a window, four of them in a rotated copy, give 10 tok/s; a
+  completion with no token count and a cost-only turn are not measured, their spend kept.
+* `scripts/test-lanes`: the Collector agent's plist sets `ThrottleInterval` 60; the bytes of a failed start
+  were measured with the pinned otelcol on a port in use (439 bytes).
+* `scripts/test-canon`: the pipefail rule finds a pipe whose reader starts the next line.
 
 `ccusage` 20.0.48 was run on 2026-11-09 and reported the day's use across four models: 57.0M tokens, of
 which 54.9M were cache reads (about 97% of input, above the 80% bar in ADR 0006), and an estimated $37.36
@@ -266,3 +308,17 @@ Read 2026-11-09 (fetched; fetches are model-summarised).
   rust-v0.167.0.
 * Restated 2026-11-10 against the headers of `scripts/lanes` and `home/.claude/canon/ledger.sh`: the
   ledger's time fields and file date, the session states and the limits.
+* Second reader's fixes, read 2026-11-10 at the pins. OTTL at contrib v0.165.0, raw files:
+  `pkg/ottl/contexts/ottllog/README.md` (`log.event_name`, `log.severity_text`, `log.trace_id.string`,
+  `log.span_id.string`), `pkg/ottl/contexts/ottlscope/README.md` (`scope.name`, `scope.version`),
+  `pkg/ottl/ottlfuncs/README.md` (`Int`, `Double`, `IsInt`, `IsDouble`, `IsString`, `IsMatch`,
+  `delete_key`), `processor/filterprocessor/README.md` (`error_mode: propagate` drops the payload), and the
+  `schema_url` paths, which the READMEs omit, in `pkg/ottl/contexts/internal/ctxresource/resource.go` and
+  `ctxscope/scope.go`. `otelcol validate` refused `service.telemetry.logs.rotation` ("invalid keys:
+  rotation"). launchd.plist(5) on this Mac: `ThrottleInterval` ("by default, jobs will not be spawned more
+  than once every 10 seconds"), `KeepAlive` `SuccessfulExit` and `Crashed`. Rotated file names: `exporter/fileexporter/README.md`, "File Rotation" (`data.json` becomes
+  `data-<time>-size.json`). Per-signal precedence: https://code.claude.com/docs/en/monitoring-usage.md
+  (`OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` and `_PROTOCOL` each "overrides general setting") and
+  https://opentelemetry.io/docs/specs/otel/protocol/exporter/ ("The per-signal endpoint configuration options
+  take precedence"). `tomllib`: https://docs.python.org/3/library/tomllib.html (Python 3.11 and later; the
+  pinned Python is 3.14, macOS's `/usr/bin/python3` has none).

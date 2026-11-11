@@ -211,6 +211,24 @@ check "... with the ledger's own hint"             w '.ledger_note | test("ledge
 mv "$RD/ledger.off" "$RD/ledger"
 rc=0; rates --window 0 >/dev/null 2>&1 || rc=$?
 check "--window 0: usage error, exit 2"            test "$rc" = 2
+# The file exporter renames a full file to <name>-<UTC time>-size.<ext> beside it (fileexporter README at
+# v0.165.0, "File Rotation"): completions still inside the window but in the rotated file count (claim of a
+# second reader: five 1200-token completions within 10 minutes, four of them rotated, are 10 tok/s, not 2)
+RO="$TMP/rot"; mkdir -p "$RO"
+cc() { rec "[$(s event.name codex.sse_event),$(s event.kind response.completed),$(s conversation.id "$1")${3:+,$(n output_token_count intValue "$3")}]" "$((NOW - $2))000000000"; }
+tc() { rec "[$(s event.name codex.turn_cost),$(s conversation.id "$1"),$(n usage.estimated_usd doubleValue "$3")]" "$((NOW - $2))000000000"; }
+{ cc c-rot 500 1200; cc c-rot 400 1200; cc c-rot 300 1200; cc c-rot 200 1200; } > "$RO/logs-2026-11-10T12-00-00.000-size.jsonl"
+cc c-rot 3000 9999 > "$RO/logs-2026-11-10T11-00-00.000-size.jsonl"; touch -t 202611101100 "$RO/logs-2026-11-10T11-00-00.000-size.jsonl"
+# a completion-shaped event with no token count (Codex's completion-error path), and a cost-only turn, are
+# not a measured zero
+{ cc c-rot 100 1200; cc c-err 90; tc c-err 80 0.03; tc c-cost 70 0.01; } > "$RO/logs.jsonl"
+CANON_OTLP_FILE="$RO/logs.jsonl" rates --json > "$TMP/rates.json" 2>/dev/null
+check "completions in the rotated file count too: 6000 tokens over 10 min is 10 tok/s" \
+      w '.workers[] | select(.id == "c-rot") | .measured and .out_tokens == 6000 and .tok_s == 10'
+check "a completion with no token count: not measured, saying why, its spend kept" \
+      w '.workers[] | select(.id == "c-err") | (.measured | not) and .tok_s == null and .out_tokens == null and (.note | test("no event in the window carries an output token count")) and .spend_window_usd == 0.03'
+check "a cost-only conversation: not measured, its spend kept" \
+      w '.workers[] | select(.id == "c-cost") | (.measured | not) and .tok_s == null and .spend_window_usd == 0.01'
 
 # ---------- status line ----------
 echo "status line:"
@@ -471,6 +489,8 @@ if command -v plutil >/dev/null 2>&1; then
         grep -qE "^otelcol validate --config /.*/repo/home/\.claude/canon/otel/config\.yaml \| dir=$AH/canon/otel\$" "$STUB/otelcol.log"
   check "... CANON_OTEL_DIR set, kept alive and started at load" \
         eval '[ "$(plutil -extract EnvironmentVariables.CANON_OTEL_DIR raw -o - "$OP")" = "$AH/canon/otel" ] && [ "$(plutil -extract KeepAlive raw -o - "$OP")" = true ] && [ "$(plutil -extract RunAtLoad raw -o - "$OP")" = true ]'
+  # its own log has a bound (claim of a second reader): a restart loop spawns it at most once a minute
+  check "... started again at most once every 60 s"  test "$(plutil -extract ThrottleInterval raw -o - "$OP")" = 60
   echo "# installed before" > "$AH/canon/otel/config.yaml"
   : > "$STUB/otelcol-refuses"; rm -f "$OP"; inst; rc=$?
   check "a config otelcol refuses fails install and writes no collector agent" \
@@ -876,6 +896,50 @@ check "a Codex config with its own otel table is left as it is, and named" \
       eval 'cmp -s "$CX" "$TMP/cx.before" && grep -q "sets otel itself; left as the owner set it" "$TMP/bs.out"'
 CLAUDE_CONFIG_DIR="$C3" bs --check
 check "... and check calls it OWNER"              rowis "$TMP/bs.out" "codex telemetry" OWNER
+# Codex's config is read as TOML (claims of a second reader, 2026-11-10): a quoted key is the owner's otel
+# table, and an [otel] line inside a multi-line string is no table at all
+tomlis() { python3 -I -c 'import sys, tomllib; d = tomllib.load(open(sys.argv[1], "rb")); sys.exit(0 if eval(sys.argv[2]) else 1)' "$@"; }
+printf "model = \"o3\"\n['otel']\nexporter = 'none'\n" > "$CX"; cp "$CX" "$TMP/cx.before"
+CLAUDE_CONFIG_DIR="$C3" bs --user-config
+check "a quoted ['otel'] table is the owner's: left as it is, still valid TOML" \
+      eval 'cmp -s "$CX" "$TMP/cx.before" && tomlis "$CX" "d[\"otel\"] == {\"exporter\": \"none\"}" && grep -q "sets otel itself" "$TMP/bs.out"'
+printf 'instructions = """\nsome text\n[otel]\nmore text\n"""\n' > "$CX"
+CLAUDE_CONFIG_DIR="$C3" bs --user-config
+check "an [otel] line inside a multi-line string is not a table: canon's is added, the string kept" \
+      eval 'tomlis "$CX" "d[\"otel\"][\"log_sse_deltas\"] is False and \"[otel]\" in d[\"instructions\"]" && grep -q "added      \[otel\]" "$TMP/bs.out"'
+CLAUDE_CONFIG_DIR="$C3" bs --check
+check "... and check reads it as canon's"         rowis "$TMP/bs.out" "codex telemetry" ok
+awk '{ print } /^\[otel\]$/ { print "environment = \"dev\"" }' "$CX" > "$TMP/cx.extra"; cp "$TMP/cx.extra" "$CX"
+CLAUDE_CONFIG_DIR="$C3" bs --check
+check "canon's table with a key of the owner's added is still canon's" \
+      eval 'tomlis "$CX" "d[\"otel\"][\"environment\"] == \"dev\"" && rowis "$TMP/bs.out" "codex telemetry" ok'
+printf 'model = \n' > "$CX"; cp "$CX" "$TMP/cx.before"
+CLAUDE_CONFIG_DIR="$C3" bs --user-config
+check "a Codex config that is not TOML is left as it is, and named" \
+      eval 'cmp -s "$CX" "$TMP/cx.before" && grep -q "INVALID    $CX is not valid TOML" "$TMP/bs.out"'
+CLAUDE_CONFIG_DIR="$C3" bs --check
+check "... and check calls it INVALID"            rowis "$TMP/bs.out" "codex telemetry" INVALID
+NP="$TMP/no-tomllib"; mkdir -p "$NP"; printf '#!/bin/sh\nexit 1\n' > "$NP/python3"; chmod +x "$NP/python3"
+: > "$CX"; CLAUDE_CONFIG_DIR="$C3" PATH="$NP:$PATH" bs --user-config
+check "with no python3 that has tomllib, nothing is guessed: the config left empty, UNKNOWN named" \
+      eval '[ ! -s "$CX" ] && grep -q "UNKNOWN    no python3 with tomllib" "$TMP/bs.out"'
+CLAUDE_CONFIG_DIR="$C3" PATH="$NP:$PATH" bs --check
+check "... and check calls it UNKNOWN"            rowis "$TMP/bs.out" "codex telemetry" UNKNOWN
+# a settings.json bootstrap cannot write fails the run and says so, never "added" (claim of a second reader)
+C4="$TMP/cfg4"; mkdir -p "$C4"; echo '{"env":{"MY_VAR":"1"}}' > "$C4/settings.json"; chmod 444 "$C4/settings.json"
+CLAUDE_CONFIG_DIR="$C4" bs --user-config; rc=$?
+check "an unwritable settings.json: exit 1, named, not reported added, left as it was" \
+      eval '[ "$rc" != 0 ] && ! grep -q "  added  .*settings.json" "$TMP/bs.out" && grep -q "could not write $C4/settings.json" "$TMP/bs.out" && jqt "$C4/settings.json" ".env == {\"MY_VAR\": \"1\"}"'
+chmod 644 "$C4/settings.json"
+# a per-signal logs endpoint or protocol overrides the general one canon sets, so the logs are not local
+jq '.env.OTEL_EXPORTER_OTLP_LOGS_ENDPOINT = "http://collector.example.com:4318/v1/logs"' "$C/settings.json" > "$C4/settings.json"
+CLAUDE_CONFIG_DIR="$C4" bs --check
+check "a per-signal logs endpoint in the settings: OWNER, saying the logs do not reach the local collector, its value not shown" \
+      eval 'rowis "$TMP/bs.out" "telemetry settings" OWNER && grep -q "do not reach the local collector: .*sets OTEL_EXPORTER_OTLP_LOGS_ENDPOINT" "$TMP/bs.out" && ! grep -q "collector.example.com" "$TMP/bs.out"'
+cp "$C/settings.json" "$C4/settings.json"
+CLAUDE_CONFIG_DIR="$C4" OTEL_EXPORTER_OTLP_LOGS_PROTOCOL=http/json bs --check
+check "... and one in the environment: OWNER, naming it" \
+      eval 'rowis "$TMP/bs.out" "telemetry settings" OWNER && grep -q "this environment sets OTEL_EXPORTER_OTLP_LOGS_PROTOCOL" "$TMP/bs.out"'
 rm -rf "$HOME/.codex"
 # JSON keeps the last of two equal keys, so a second "env" (or any repeated key) drops the first silently;
 # two changes that each add one merge without a textual conflict. Every tracked JSON file is held to it.
