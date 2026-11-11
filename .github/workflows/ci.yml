@@ -53,11 +53,13 @@ jobs:
   # plutil(1). No credential, no paper run, no keychain item (CANON_TEST_NO_KEYCHAIN skips, by name, the one
   # case that writes to the login keychain), and launchctl is a stand-in in both scripts, so nothing is loaded
   # into launchd. CANON_TEST_ALLOWED_SKIPS makes any other skipped case of test-lanes a failure, and the
-  # test-maintenance step fails unless its last line reports cases passed. macOS 27, which has /usr/bin/timeout
-  # (macos-26 has not): xcode-27 is the one hosted macOS 27 label, a standard runner and a preview image. A
-  # version label, not macos-latest, so the OS version moves only when this line does (the image itself is
-  # updated weekly). Not among required-checks-passed's needs: it reports and does not block until a GA
-  # macOS 27 label exists and it has passed on three landings there (ADR 0082).
+  # test-maintenance step fails unless its last line reports cases passed. xcode-27 is the one hosted macOS 27
+  # label, a standard runner and a preview image; a version label, not macos-latest, so the OS version moves
+  # only when this line does (the image itself is updated weekly). Neither it (macOS 27.0.1) nor macos-26 has
+  # /usr/bin/timeout, without which 113 test-lanes cases fail and test-maintenance skips, so the first step
+  # checks for it and, while it is missing, the job runs nothing and says so; once an image ships it, the
+  # cases run with no edit here. Not among required-checks-passed's needs: it reports and does not block until
+  # a GA macOS 27 label exists and it has run its cases and passed on three landings there (ADR 0082).
   macos:
     name: macOS self-tests
     runs-on: xcode-27
@@ -69,34 +71,51 @@ jobs:
       CANON_TEST_NO_KEYCHAIN: 1
       CANON_TEST_ALLOWED_SKIPS: "paper:store on a terminal"
     steps:
+      # Without /usr/bin/timeout the job runs nothing: one warning naming the image and its macOS version, a
+      # step summary saying nothing ran, so a green tick is not read as a pass, and every later step skipped.
+      # The image is read from the imagedata.json the runner-images build writes (configure-preimagedata.sh).
+      - name: Whether this image has /usr/bin/timeout
+        id: gate
+        run: |
+          if [ -x /usr/bin/timeout ]; then echo "run=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          image=$(jq -r '.[] | select(.group == "Runner Image") | .detail' "$HOME/imagedata.json" 2>/dev/null \
+            | sed -n 's/^Image: //p; s/^Version: //p' | paste -sd ' ' - || true)
+          msg="${image:-an image that \$HOME/imagedata.json does not name} on macOS $(sw_vers -productVersion) ($(sw_vers -buildVersion)) has no /usr/bin/timeout"
+          echo "run=false" >> "$GITHUB_OUTPUT"
+          echo "::warning title=macOS self-tests did not run::$msg, so no case ran (ADR 0082)"
+          echo "**Nothing ran.** $msg, so no macOS self-test case ran and this job's green tick is not a pass (ADR 0082)." >> "$GITHUB_STEP_SUMMARY"
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ steps.gate.outputs.run == 'true' }}
         with:
           persist-credentials: false
 
       - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
+        if: ${{ steps.gate.outputs.run == 'true' }}
         with:
           version: 2026.11.6
           cache: false
 
-      # Fails naming any tool the cases need that is missing; the two scripts still run after it, so their
+      # Fails naming any other tool the cases need that is missing; the two scripts still run after it, so their
       # own failures show too.
       - name: The macOS tools the cases need
+        if: ${{ steps.gate.outputs.run == 'true' }}
         run: |
           sw_vers; /bin/bash --version | head -n 1
           missing=""
-          for t in lockf timeout plutil expect getconf jq nc sqlite3 security; do
+          for t in lockf plutil expect getconf jq nc sqlite3 security; do
             if [ -x "/usr/bin/$t" ]; then echo "/usr/bin/$t"; else missing="$missing /usr/bin/$t"; fi
           done
           if [ -n "$missing" ]; then echo "::error title=missing on this image::$missing"; exit 1; fi
 
       - name: test-lanes
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.gate.outputs.run == 'true' }}
         run: scripts/test-lanes
 
       # test-maintenance has no strict mode; its last line must report cases passed and none failed, which a
       # run that skips as a whole ("0 passed, 0 failed, 1 skipped") does not
       - name: test-maintenance
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.gate.outputs.run == 'true' }}
         run: |
           scripts/test-maintenance | tee "$RUNNER_TEMP/test-maintenance.out"
           if ! tail -n 1 "$RUNNER_TEMP/test-maintenance.out" | grep -Eqx 'test-maintenance: [1-9][0-9]* passed, 0 failed'; then
