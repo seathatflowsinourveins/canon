@@ -388,9 +388,10 @@ class SessionMaCross(MaCross):
         is closed: one Alpaca has not acknowledged yet is looked at again, one whose cancel was rejected
         (open again) is canceled again, and its signal is dropped once. One whose cancel went unanswered
         stays pending cancel, which the strategy cannot cancel again (`mark_order_pending_cancel` at the
-        pin) nor query (the adapter answers no order query): the node's open-order check (every 10 s) and
-        the window's account check after the stop are what reconcile and cancel it. A limit that filled
-        in part, by its timeout or by its close, is no dropped signal: what it left is the next cross's."""
+        pin): the node's in-flight check (which queries it, answered by the adapter's `_query_order`), its
+        open-order check (every 10 s) and the window's account check after the stop are what reconcile
+        and cancel it. A limit that filled in part, by its timeout or by its close, is no dropped signal:
+        what it left is the next cross's."""
         name = event.name.removeprefix("limit-timeout-")
         order = self._order(ClientOrderId(name))
         if order is None or order.is_closed:
