@@ -15,7 +15,8 @@ Modify (ADR 0042): TC-E30 through the tester, whose one-tick amend the client de
 $1.00 buy modified to $1.01 through a node, then canceled.
 Two run with any session closed and need no node event for the order: TC-E84, a $1.00 buy placed with
 alpaca-py, as a prior session would leave it, which a node's start-up reconciliation must load open; and
-TC-E44's venue side, a $1.00 buy canceled twice through alpaca-py (ADR 0036).
+TC-E44's venue side, a $1.00 buy canceled twice through alpaca-py (ADR 0036). A third, in any session, submits a
+resting $1.00 buy's `client_order_id` again, as alpaca-py's resend of a submit would (ADR 0039).
 Two test extended hours (ADR 0038): a $1.00 buy marked eligible, accepted and canceled in any open session;
 and, in pre-market or after-hours only, a buy of 1 AAPL priced through the latest IEX ask (read from
 Alpaca's market data API), filled and sold back through the bid: that one trades a real paper share.
@@ -28,6 +29,7 @@ open order there that this slice does not map fails the start.
 import asyncio
 import os
 import time
+import uuid
 from collections.abc import Callable
 from collections.abc import Generator
 from contextlib import contextmanager
@@ -688,6 +690,46 @@ def test_paper_cancel_of_a_canceled_order_tc_e44() -> None:
     assert cleaned == {"orders": 0, "positions": 0}, cleaned
     assert second in (None, 422), second
     assert after == AlpacaOrderStatus.CANCELED
+
+
+def test_paper_resent_client_order_id_is_refused_and_one_order_rests() -> None:
+    """What Alpaca answers a submit that repeats a resting order's `client_order_id`, as alpaca-py's own
+    resend of a submit answered 504 would (ADR 0039); "Create an Order" documents the field as "A unique
+    identifier for the order" and documents no answer to a repeat. A $1.00 buy with its own client order
+    ID, then the same request again, through alpaca-py. Pass: the repeat is refused with a 4xx and Alpaca
+    holds one open order with that ID, the first. The clean-up cancels it, the one order it finds."""
+    with aapl_left_as_found() as cleaned:
+        trading = paper_trading()
+        request = LimitOrderRequest(
+            symbol="AAPL",
+            qty=1,
+            side=AlpacaOrderSide.BUY,
+            time_in_force=AlpacaTimeInForce.DAY,
+            limit_price=1.00,
+            client_order_id=f"canon-resend-{uuid.uuid4()}",
+        )
+        placed = trading.submit_order(request)
+        assert isinstance(placed, AlpacaOrder)
+        placed_id = placed.id
+        wait_until(
+            lambda: any(o.id == placed_id for o in open_aapl_orders(trading)),
+            "Alpaca to list the order open",
+        )
+        try:
+            repeat = trading.submit_order(request)
+            refusal: tuple[int | None, str] | None = None
+        except APIError as e:
+            repeat = None
+            refusal = (e.status_code, str(e))
+        held = [
+            o.id for o in open_aapl_orders(trading) if o.client_order_id == request.client_order_id
+        ]
+
+    print(f"resent client_order_id: answered {refusal or 'with an order'}")  # shown with -s
+    assert repeat is None, f"Alpaca took the repeat as order {getattr(repeat, 'id', repeat)}"
+    assert refusal is not None and refusal[0] is not None and 400 <= refusal[0] < 500, refusal
+    assert held == [placed_id], held
+    assert cleaned == {"orders": 1, "positions": 0}, cleaned
 
 
 def test_paper_cancel_all_on_stop_tc_e41() -> None:
