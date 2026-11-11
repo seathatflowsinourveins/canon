@@ -102,6 +102,47 @@ lanes_home="$TMP/lanes"; mkdir -p "$lanes_home/canon/ledger"
 CLAUDE_CONFIG_DIR="$lanes_home" CANON_OTLP_FILE="$F" "$ROOT/scripts/lanes" --rates --json > "$TMP/rates.json" 2>"$TMP/rates.err"
 check "scripts/lanes --rates reads the exported line: conv-1 at 2 tok/s, spend 0.02" \
       eval 'jq -e "[.workers[] | select(.runtime == \"codex\" and .id == \"conv-1\")] | length == 1 and (.[0] | .measured and .tok_s == 2 and .spend_window_usd == 0.02 and .model == \"m2\")" "$TMP/rates.json" >/dev/null'
+# A second producer, not one of the two clients (claim of a second reader, 2026-11-10): anything that reaches
+# 127.0.0.1 can send OTLP, so every text field a record can carry is held to the guard, not only the
+# attributes the clients use. Private text (an email address and a home path) goes into the log record's
+# eventName and severityText, its trace and span ids, the scope's name, version and attributes, the resource
+# and scope schemaUrl, a kept attribute whose value is text where a count belongs, the identifiers, and an
+# event.kind on an event that has none. A count sent as a decimal string is a number once written.
+P="leak@example.org /Users/leak/private"
+prec() { local ev="$1" body="$2"; shift 2; local IFS=,; printf '{"timeUnixNano":"%s","eventName":"%s","severityText":"%s","traceId":"6c65616b406578616d706c652e6f7267","spanId":"6c65616b2f557365","body":%s,"attributes":[%s]}' "$NS" "$ev" "$P" "$body" "$*"; }
+KVL='{"values":[{"key":"x","value":{"stringValue":"'"$P"'"}}]}'
+cat > "$TMP/req2.json" <<EOF
+{"resourceLogs":[{"schemaUrl":"https://example.org/$P","resource":{"attributes":[$(s user.email "$P")]},
+"scopeLogs":[{"schemaUrl":"https://example.org/$P","scope":{"name":"$P","version":"$P","attributes":[$(s note "$P")]},"logRecords":[
+$(prec "$P" '{"kvlistValue":{"values":[{"key":"k","value":{"stringValue":"PRIVATE-BODY"}}]}}' "$(s event.name api_request)" "$(s session.id sess-ok)" "$(s model claude-x-1)" "$(kv output_tokens stringValue '"300"')" "$(kv duration_ms doubleValue 1500)" "$(s event.kind "$P")"),
+$(prec "$P" '{"stringValue":"api_request"}' "$(s event.name api_request)" "$(s session.id sess-2)" "$(kv output_tokens stringValue "\"$P\"")"),
+$(prec "$P" '{"stringValue":"api_request"}' "$(s event.name api_request)" "$(s session.id "$P")" "$(kv output_tokens intValue '"5"')"),
+$(prec "$P" '{"stringValue":"api_request"}' "$(s event.name api_request)" "$(s session.id sess-4)" "$(s model "$P")" "$(kv output_tokens intValue '"5"')"),
+$(prec "$P" '{"stringValue":"api_request"}' "$(s event.name api_request)" "$(s session.id sess-5)" "$(s event.timestamp "$P")"),
+$(prec "$P" '{"stringValue":"api_request"}' "$(s event.name api_request)" "$(s session.id sess-6)" "$(kv cost_usd kvlistValue "$KVL")"),
+$(prec "$P" '{"stringValue":""}' "$(s event.name codex.turn_cost)" "$(s conversation.id conv-2)" "$(kv usage.estimated_usd stringValue "\"$P\"")"),
+$(prec "" '{"stringValue":"api_request"}' "$(s event.name api_request)" "$(s session.id sess-7)" "$(s model claude-opus-4-1@20250805)" "$(s event.timestamp 2026-11-10T12:00:00.123+00:00)" "$(kv output_tokens intValue '"7"')")
+]}]}]}
+EOF
+: > "$F.before"; cp "$F" "$F.before"
+code=$(curl -s -o "$TMP/resp" -w '%{http_code}' --max-time 10 -H 'Content-Type: application/json' \
+       --data-binary @"$TMP/req2.json" "http://127.0.0.1:$HP/v1/logs")
+check "the Collector accepts the second producer's request (HTTP 200)" test "$code" = 200
+for _ in $(seq 50); do [ "$(wc -l < "$F")" -gt "$(wc -l < "$F.before")" ] && break; sleep 0.1; done
+check "no text of the second producer reaches the file, in any field" \
+      eval '! grep -Eq "leak|/Users/|PRIVATE|example\.org|6c65616b" "$F"'
+# the one well-formed record is kept, its count a number; the six with text where it does not belong are not
+jq -c '.resourceLogs[].scopeLogs[].logRecords[] | (.attributes | map({(.key): .value}) | add) | select(.["session.id"].stringValue == "sess-ok")' "$F" > "$TMP/ok" 2>/dev/null
+check "... the well-formed record is kept, its count sent as text written as a number, event.kind dropped" \
+      eval '[ "$(wc -l < "$TMP/ok" | tr -d " ")" = 1 ] && jq -e ".output_tokens.intValue == \"300\" and .duration_ms.doubleValue == 1500 and (has(\"event.kind\") | not)" "$TMP/ok" >/dev/null'
+check "... the four with text where a count or identifier belongs are dropped" \
+      eval '! grep -Eqx "sess-[236]|conv-2" <<<"$(jq -r ".resourceLogs[].scopeLogs[].logRecords[].attributes[] | select(.key == \"session.id\" or .key == \"conversation.id\") | .value.stringValue" "$F")"'
+check "... a model name or time that is text of another kind is removed, its record kept" \
+      eval '[ "$(jq -c ".resourceLogs[].scopeLogs[].logRecords[] | (.attributes | map({(.key): .value.stringValue}) | add) | select(.\"session.id\" == \"sess-4\" or .\"session.id\" == \"sess-5\") | [.\"session.id\", .model, .\"event.timestamp\"]" "$F" | sort | tr -d "\n")" = "[\"sess-4\",null,null][\"sess-5\",null,null]" ]'
+check "... a Vertex AI model ID (@date) and a time with an offset are kept" \
+      eval 'jq -e "select(any(.resourceLogs[].scopeLogs[].logRecords[]; (.attributes | map({(.key): .value.stringValue}) | add) | .\"session.id\" == \"sess-7\" and .model == \"claude-opus-4-1@20250805\" and .\"event.timestamp\" == \"2026-11-10T12:00:00.123+00:00\"))" "$F" >/dev/null'
+check "... no record keeps an eventName, severityText, trace or span id, scope name or version, or a schemaUrl" \
+      eval '[ "$(jq -s "[.[].resourceLogs[] | (.schemaUrl // \"\"), (.scopeLogs[] | (.schemaUrl // \"\"), (.scope.name // \"\"), (.scope.version // \"\"), (.logRecords[] | (.eventName // \"\"), (.severityText // \"\"), (.traceId // \"\"), (.spanId // \"\"))) | select(. != \"\")] | length" "$F")" = 0 ]'
 grep -Eqi "error|warn" "$TMP/otelcol.log" && { echo "        otelcol log:"; sed 's/^/        /' "$TMP/otelcol.log"; }
 check "the Collector logged no warning or error"    eval '! grep -Eqi "\\b(warn|error)\\b" "$TMP/otelcol.log"'
 finish

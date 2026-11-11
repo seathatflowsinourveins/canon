@@ -11,10 +11,16 @@
 # CANON_OTEL_DIR (the folder for logs.jsonl) is set by the agent; the two ports may be overridden for a
 # rehearsal. The host is fixed at 127.0.0.1, so nothing listens beyond this Mac.
 #
-# Only names and counts reach the file (ADR 0007): the filter keeps the three events scripts/lanes reads,
-# and the transform keeps only the attributes it reads and drops every resource attribute. The guard is
+# Only names and counts reach the file (ADR 0007): the filter keeps the three events scripts/lanes reads;
+# the transform keeps only the attributes it reads, clears every other text field and makes a count sent as
+# text a number; filter/values drops a record whose kept attribute is not what it must be. The guard is
 # here because Codex at rust-v0.167.0 logs every codex.tool_result with the tool's full arguments and an
-# output preview, with no setting to switch the arguments off, and its events carry user.email.
+# output preview, with no setting to switch the arguments off, and its events carry user.email; and because
+# anything on this Mac can send OTLP to 127.0.0.1, not only the two clients. The OTTL paths and functions:
+#   https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/v0.165.0/pkg/ottl/contexts/ottllog/README.md
+#   https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/v0.165.0/pkg/ottl/ottlfuncs/README.md
+#   resource.schema_url and scope.schema_url, which those READMEs omit:
+#   https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/v0.165.0/pkg/ottl/contexts/internal/ctxresource/resource.go
 
 receivers:
   otlp:
@@ -37,14 +43,57 @@ processors:
         or (log.attributes["event.name"] == nil and (log.body == "api_request" or log.body == "claude_code.api_request"))
         or (log.attributes["event.name"] == "codex.sse_event" and log.attributes["event.kind"] == "response.completed")
         or log.attributes["event.name"] == "codex.turn_cost")
+  # Every other field a record can carry is cleared, and each kept attribute is held to what it must be,
+  # because anything that reaches 127.0.0.1 can send OTLP, not only the two clients.
   transform/lanes:
     error_mode: ignore
     log_statements:
-      - keep_keys(resource.attributes, [])
-      - keep_keys(scope.attributes, [])
-      - keep_keys(log.attributes, ["event.name", "event.timestamp", "event.kind", "session.id", "model", "output_tokens", "duration_ms", "cost_usd", "conversation.id", "output_token_count", "usage.estimated_usd"])
-      - set(log.body, log.attributes["event.name"]) where log.attributes["event.name"] != nil
-      - set(log.body, "") where log.attributes["event.name"] == nil and log.body != "api_request" and log.body != "claude_code.api_request"
+      - context: resource
+        statements:
+          - keep_keys(resource.attributes, [])
+          - set(resource.schema_url, "")
+      - context: scope
+        statements:
+          - keep_keys(scope.attributes, [])
+          - set(scope.name, "")
+          - set(scope.version, "")
+          - set(scope.schema_url, "")
+      - context: log
+        statements:
+          - keep_keys(log.attributes, ["event.name", "event.timestamp", "event.kind", "session.id", "model", "output_tokens", "duration_ms", "cost_usd", "conversation.id", "output_token_count", "usage.estimated_usd"])
+          - delete_key(log.attributes, "event.kind") where log.attributes["event.name"] != "codex.sse_event"
+          # a count or a cost sent as a decimal string becomes a number; any other string stays one, and
+          # filter/values below drops the record
+          - set(log.attributes["output_tokens"], Int(log.attributes["output_tokens"])) where IsString(log.attributes["output_tokens"]) and IsMatch(log.attributes["output_tokens"], "^[0-9]{1,15}$")
+          - set(log.attributes["output_token_count"], Int(log.attributes["output_token_count"])) where IsString(log.attributes["output_token_count"]) and IsMatch(log.attributes["output_token_count"], "^[0-9]{1,15}$")
+          - set(log.attributes["duration_ms"], Double(log.attributes["duration_ms"])) where IsString(log.attributes["duration_ms"]) and IsMatch(log.attributes["duration_ms"], "^[0-9]{1,15}([.][0-9]{1,15})?$")
+          - set(log.attributes["cost_usd"], Double(log.attributes["cost_usd"])) where IsString(log.attributes["cost_usd"]) and IsMatch(log.attributes["cost_usd"], "^[0-9]{1,15}([.][0-9]{1,15})?([eE][-+]?[0-9]{1,3})?$")
+          - set(log.attributes["usage.estimated_usd"], Double(log.attributes["usage.estimated_usd"])) where IsString(log.attributes["usage.estimated_usd"]) and IsMatch(log.attributes["usage.estimated_usd"], "^[0-9]{1,15}([.][0-9]{1,15})?([eE][-+]?[0-9]{1,3})?$")
+          # a model name or a time that is not what it must be is removed, and the record still counts
+          # (scripts/lanes then takes the model from the status line and the time from timeUnixNano):
+          # letters, digits and . _ - : [ ], with an optional @<8 digits> as Vertex AI model IDs carry,
+          # so no address and no path; ISO 8601 with Z or an offset
+          - delete_key(log.attributes, "model") where log.attributes["model"] != nil and not (IsString(log.attributes["model"]) and IsMatch(log.attributes["model"], "^[0-9A-Za-z._:\\[\\]-]{1,128}(@[0-9]{8})?$"))
+          - delete_key(log.attributes, "event.timestamp") where log.attributes["event.timestamp"] != nil and not (IsString(log.attributes["event.timestamp"]) and IsMatch(log.attributes["event.timestamp"], "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,9})?(Z|[+-][0-9]{2}:[0-9]{2})$"))
+          - set(log.body, log.attributes["event.name"]) where log.attributes["event.name"] != nil
+          - set(log.body, "") where log.attributes["event.name"] == nil and log.body != "api_request" and log.body != "claude_code.api_request"
+          - set(log.event_name, "")
+          - set(log.severity_text, "")
+          - set(log.trace_id.string, "00000000000000000000000000000000")
+          - set(log.span_id.string, "0000000000000000")
+  # Drop a record whose kept attribute is not what it must be: a count or cost that is not a number, an
+  # identifier with any character beyond letters, digits, _ and - (so no address and no path). A condition
+  # that errs drops the request (propagate), so the guard fails closed.
+  filter/values:
+    error_mode: propagate
+    log_conditions:
+      - log.attributes["output_tokens"] != nil and not IsInt(log.attributes["output_tokens"])
+      - log.attributes["output_token_count"] != nil and not IsInt(log.attributes["output_token_count"])
+      - log.attributes["duration_ms"] != nil and not (IsInt(log.attributes["duration_ms"]) or IsDouble(log.attributes["duration_ms"]))
+      - log.attributes["cost_usd"] != nil and not (IsInt(log.attributes["cost_usd"]) or IsDouble(log.attributes["cost_usd"]))
+      - log.attributes["usage.estimated_usd"] != nil and not (IsInt(log.attributes["usage.estimated_usd"]) or IsDouble(log.attributes["usage.estimated_usd"]))
+      - log.attributes["session.id"] != nil and not (IsString(log.attributes["session.id"]) and IsMatch(log.attributes["session.id"], "^[0-9A-Za-z_-]{1,128}$"))
+      - log.attributes["conversation.id"] != nil and not (IsString(log.attributes["conversation.id"]) and IsMatch(log.attributes["conversation.id"], "^[0-9A-Za-z_-]{1,128}$"))
 
 exporters:
   file/lanes:
@@ -64,5 +113,5 @@ service:
   pipelines:
     logs:
       receivers: [otlp]
-      processors: [filter/lanes, transform/lanes]
+      processors: [filter/lanes, transform/lanes, filter/values]
       exporters: [file/lanes]

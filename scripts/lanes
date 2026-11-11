@@ -30,7 +30,7 @@
 # "not measured" with the reason, never estimated. Its inputs, besides the ledger and snapshots above:
 #   OTLP log file   ${CANON_OTLP_FILE:-~/.claude/canon/otel/logs.jsonl}, JSON Lines of OTLP/JSON
 #                   ExportLogsServiceRequest objects, as OpenTelemetry's file exporter and the Collector's
-#                   file exporter write them:
+#                   file exporter write them, and the copies it rotates beside it, those written within the window:
 #                   https://opentelemetry.io/docs/specs/otel/protocol/file-exporter/
 #                   https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/exporter/fileexporter
 #                   https://github.com/open-telemetry/opentelemetry-proto/blob/main/docs/specification.md (JSON)
@@ -259,7 +259,7 @@ otlp_records() {
            elif $n == "codex.sse_event" and $a["event.kind"] == "response.completed" then
              {rt: "codex", sid: $a["conversation.id"], out: ($a.output_token_count | num), dur: null, cost: null}
            elif $n == "codex.turn_cost" then
-             {rt: "codex", sid: $a["conversation.id"], out: 0, dur: null, cost: ($a["usage.estimated_usd"] | num)}
+             {rt: "codex", sid: $a["conversation.id"], out: null, dur: null, cost: ($a["usage.estimated_usd"] | num)}
            else empty end)
         + {model: (if ($a.model | type) == "string" then $a.model else null end), t: $t}
         | select((.sid | type) == "string" and .sid != "" and .t != null)
@@ -302,7 +302,16 @@ rates_report() {
   : > "$t/otlp"
   if [ -f "$otlp" ]; then
     present=true
+    # the file exporter's rotated copies, <stem>-<UTC time>-size<.ext> beside it (fileexporter README at
+    # v0.165.0, "File Rotation"); one last written before the window began holds no event in it. They are
+    # listed before the current file is read, so a rotation during the read cannot count its events twice.
+    local f stem="${otlp##*/}" ext=""
+    case "$stem" in *.*) ext=".${stem##*.}"; stem="${stem%.*}" ;; esac
+    find "$(dirname "$otlp")" -maxdepth 1 -type f -name "$stem-[0-9][0-9][0-9][0-9]-*$ext" -mmin "-$((WINDOW + 2))" > "$t/rotated" 2>/dev/null
     otlp_records "$otlp" > "$t/otlp" || { rm -rf "$t"; echo "lanes: ERROR: could not read $otlp" >&2; return 1; }
+    while IFS= read -r f; do
+      otlp_records "$f" >> "$t/otlp" || { rm -rf "$t"; echo "lanes: ERROR: could not read $f" >&2; return 1; }
+    done < "$t/rotated"
   fi
   proc_list | jq -R 'split("\t") | {pid: .[0], etime: .[1], rt: .[2], cwd: (.[3] // "")}' | jq -s . > "$t/procs" \
     || { rm -rf "$t"; echo "lanes: ERROR: could not list processes" >&2; return 1; }
@@ -318,13 +327,17 @@ rates_report() {
     | ($r | map(select(.rt == "claude-code") | {key: .sid, value: true}) | from_entries) as $seen
     | def measure($rt; $sid):
         ($w | map(select(.rt == $rt and .sid == $sid))) as $m
+        | ($m | map(select(.out != null)) | length) as $counted
         | ($m | map(.out // 0) | add // 0) as $out
         | ($m | map(select(.dur != null and .dur > 0))) as $timed
         | ($timed | map(.dur) | add) as $dur
         | {out_tokens: $out, tok_s: (($out / ($win * 60)) | r2),
            gen_tok_s: (if $dur != null then ((($timed | map(.out // 0) | add) / ($dur / 1000)) | r2) else null end),
            spend_window_usd: ($m | map(.cost // empty) | if length > 0 then add | r4 else null end),
-           measured: true, note: "", model_seen: ($m | map(.model // empty) | last)};
+           measured: true, note: "", model_seen: ($m | map(.model // empty) | last)}
+        # events with no token count (a cost-only turn, a completion with no usage) are not a measured zero
+        | if $counted > 0 then . else . + {out_tokens: null, tok_s: null, gen_tok_s: null, measured: false,
+            note: "not measured: no event in the window carries an output token count"} end;
       def unmeasured($why): {out_tokens: null, tok_s: null, gen_tok_s: null, spend_window_usd: null,
                              measured: false, note: ("not measured: " + $why), model_seen: null};
     ($r | map(select(.rt == "codex")) | length > 0) as $codex_otlp
@@ -354,7 +367,7 @@ rates_report() {
             | measure("codex"; $sid) as $m
             | {lane: "-", runtime: "codex", model: $m.model_seen, state: "events in window", id: $sid, spend_session_usd: null}
               + ($m | del(.model_seen))
-              + {note: "per conversation; no documented field names its directory or process"} ),
+              + {note: ((if $m.measured then "" else $m.note + "; " end) + "per conversation; no documented field names its directory or process")} ),
           ( $procs[0][]
             | {lane: (if .cwd == "" then "?" else (.cwd | split("/") | last) end), runtime: .rt, model: null,
                state: ("running " + .etime), id: ("pid " + .pid), spend_session_usd: null}

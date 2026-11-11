@@ -495,19 +495,30 @@ sec_mise_requests() {
 # then fails though the reader succeeded, at random, by how the writer's output is split (bash(1),
 # pipefail). No tracked script that sets pipefail may pipe into such a reader; read a here-string, or a
 # reader that reads to the end, instead. Comment lines are not code and are skipped.
+# A pipe may end a line and its reader start the next, or a line may end in a backslash (bash(1), "Pipelines"
+# and QUOTING): joined prints each logical line once, as <first line number>:<text>, so the rule sees the
+# writer and the reader together. A comment line is never joined to the next, and neither is a line ending
+# in ||, which continues a list, not a pipe.
+joined() {
+  awk '{ if (buf == "") { start = NR; buf = $0 } else buf = buf " " $0
+         if (buf !~ /^[[:space:]]*#/ && (buf ~ /\\$/ || (buf ~ /[|][[:space:]]*$/ && buf !~ /[|][|][[:space:]]*$/))) { sub(/\\$/, "", buf); next }
+         print start ":" buf; buf = "" }
+       END { if (buf != "") print start ":" buf }'
+}
 # shellcheck disable=SC2016  # the regular expression, the sample lines and the eval'd check are not expanded here
 sec_pipe_readers() {
   local re hits
   re='\|[[:space:]]*(grep[[:space:]]([^|]*[[:space:]])?(-[A-Za-z]*[qm][A-Za-z0-9]*|--quiet|--silent|--max-count)([[:space:]=]|$)|head([[:space:]]|$)|sed[[:space:]][^|]*[;{ '"'"']q)'
   hits=$(cd "$SRC" && git ls-files -z | xargs -0 grep -lE 'set -[a-z]*o pipefail' 2>/dev/null \
-         | while IFS= read -r f; do grep -nE "$re" "$f" | grep -vE '^[0-9]+:[[:space:]]*#' | sed "s|^|$f:|"; done)
+         | while IFS= read -r f; do joined < "$f" | grep -E "$re" | grep -vE '^[0-9]+:[[:space:]]*#' | sed "s|^|$f:|"; done)
   out=$hits
   check "no script that sets pipefail pipes into a reader that stops early (grep -q, grep -m, head, sed q)" test -z "$hits"
   local p='|'   # the samples are built here, so this file holds no line the rule would find
   out=$(printf '%s\n' 'set -euo pipefail' "printf x $p grep -qxF -- n" "y=\$(ls $p head -1)" "# a $p grep -q in a comment" \
-        | grep -nE "$re" | grep -vE '^[0-9]+:[[:space:]]*#')
-  check "... and the rule finds the shapes it is for: a pipe into grep -qxF and into head -1" \
-        eval '[ "$(wc -l <<<"$out" | tr -d " ")" = 2 ]'
+          "printf x $p" "  grep -q n" "printf x \\" "  $p head -1" "# a comment ending in $p" "echo ok" \
+        | joined | grep -E "$re" | grep -vE '^[0-9]+:[[:space:]]*#')
+  check "... and the rule finds the shapes it is for: a pipe into grep -qxF and into head -1, on one line or split across two" \
+        eval '[ "$(wc -l <<<"$out" | tr -d " ")" = 4 ]'
 }
 
 sec_claude_pin() {

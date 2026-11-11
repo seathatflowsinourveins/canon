@@ -172,8 +172,13 @@ EOF
 }
 
 # The collector agent runs otelcol with the config from home/.claude/canon/otel/, kept alive by launchd
-# (launchd.plist(5) KeepAlive, RunAtLoad); CANON_OTEL_DIR tells the config where to write logs.jsonl.
+# (launchd.plist(5) KeepAlive, RunAtLoad; KeepAlive true, so a SIGKILL or a clean exit is restarted too);
+# CANON_OTEL_DIR tells the config where to write logs.jsonl. Its own log, at service.telemetry.logs.level
+# warn, is empty while it runs well; a failed start (a port in use) writes about 440 bytes, and
+# ThrottleInterval spawns it at most once a minute, so a restart loop adds at most about 0.63 MB a day
+# (1440 x 440 B) until the next install empties the file (ADR 0007).
 # write_otel_plist <otelcol path>
+OTEL_THROTTLE=60
 write_otel_plist() {
   local c; c=$(xml "$CANON_HOME")
   cat > "$OTEL_PLIST" <<EOF
@@ -200,6 +205,8 @@ write_otel_plist() {
   <true/>
   <key>KeepAlive</key>
   <true/>
+  <key>ThrottleInterval</key>
+  <integer>$OTEL_THROTTLE</integer>
   <key>ProcessType</key>
   <string>Background</string>
   <key>StandardOutPath</key>

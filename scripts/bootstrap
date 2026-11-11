@@ -214,26 +214,58 @@ paper_row() {
   else row "paper key pair" absent "no keychain item for:$miss; to enter the pair: mise run paper:store"; fi
 }
 
-# codex_otel_state <config.toml>: "canon" when every line of home/.codex/otel.toml's table is a line of the
-# file, "other" when it sets otel some other way ([otel], [otel.x], otel = or otel.x =), else "none"
+# toml_python: a python3 that has tomllib (Python 3.11 and later, https://docs.python.org/3/library/tomllib.html):
+# the one on PATH, else the one mise.toml pins for this repo; empty when there is neither. Codex's config is
+# read with a TOML parser, never a pattern, so a quoted key (['otel']) or an [otel] line inside a string is
+# read as TOML reads it.
+toml_python() {
+  local p
+  for p in "$(command -v python3 2>/dev/null)" "$( [ -n "$MISE" ] && cd "$ROOT" && MISE_EXEC_AUTO_INSTALL=false "$MISE" which python3 2>/dev/null)"; do
+    [ -n "$p" ] && [ -x "$p" ] && [ "$("$p" -I -c 'import tomllib; print("tomllib")' 2>/dev/null)" = tomllib ] && { echo "$p"; return 0; }
+  done
+  return 1
+}
+
+# codex_otel_state <config.toml>: "canon" when the file's otel table has every key home/.codex/otel.toml sets,
+# with its value,
+# "other" when it sets otel some other way, "none" when it is absent or sets no otel, "invalid" when it is
+# not TOML, "unknown" when no python3 with tomllib is here
 codex_otel_state() {
-  local l all=1
+  local py
   [ -f "$1" ] || { echo none; return; }
-  while IFS= read -r l; do
-    grep -qxF -- "$l" "$1" || { all=0; break; }
-  done < <(grep -v -e '^#' -e '^$' "$ROOT/home/.codex/otel.toml")
-  if [ "$all" = 1 ]; then
-    echo canon
-  elif grep -Eq '^[[:space:]]*(\[[[:space:]]*"?otel"?[[:space:]]*[].]|"?otel"?[[:space:]]*[.=])' "$1"; then
-    echo other
-  else echo none; fi
+  py=$(toml_python) || { echo unknown; return; }
+  "$py" -I -c 'import sys, tomllib
+want = tomllib.load(open(sys.argv[2], "rb"))["otel"]
+try: have = tomllib.load(open(sys.argv[1], "rb"))
+except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError): print("invalid"); sys.exit()
+o = have.get("otel")
+print("none" if o is None else "canon" if isinstance(o, dict) and all(o.get(k) == v for k, v in want.items()) else "other")' "$1" "$ROOT/home/.codex/otel.toml" \
+    || echo unknown
+}
+
+# logs_override <settings.json>: the per-signal logs variables that would send Claude Code's logs elsewhere than
+# the general endpoint canon sets, named (never their values, which may hold a credential), from the
+# settings' env and from this environment
+# (Claude Code: OTEL_EXPORTER_OTLP_LOGS_ENDPOINT and OTEL_EXPORTER_OTLP_LOGS_PROTOCOL each "overrides general
+# setting", https://code.claude.com/docs/en/monitoring-usage.md; the OTLP exporter spec: "The per-signal
+# endpoint configuration options take precedence",
+# https://opentelemetry.io/docs/specs/otel/protocol/exporter/). Canon sets neither.
+LOGS_OVERRIDES="OTEL_EXPORTER_OTLP_LOGS_ENDPOINT OTEL_EXPORTER_OTLP_LOGS_PROTOCOL"
+logs_override() {
+  local k v out=""
+  for k in $LOGS_OVERRIDES; do
+    v=$(jq -r --arg k "$k" '(.env // {})[$k] // empty | tostring' "$1" 2>/dev/null) || v=""
+    [ -n "$v" ] && out="$out; $1 sets $k"
+    [ -n "${!k:-}" ] && out="$out; this environment sets $k"
+  done
+  printf '%s' "${out#; }"
 }
 
 # telemetry_rows: whether the user settings carry every telemetry variable (CLAUDE_CODE_ENABLE_TELEMETRY,
 # OTEL_*; the model alias pins have their own row) home/.claude/settings.json sets,
 # with its value, and whether Codex's config has canon's [otel] table
 telemetry_rows() {
-  local s="$CLAUDE_HOME/settings.json" miss differ rc=0
+  local s="$CLAUDE_HOME/settings.json" miss differ over rc=0
   # shellcheck disable=SC2016  # jq programs, not shell
   if ! jq -e 'type == "object" and ((.env // {}) | type == "object")' "$s" >/dev/null 2>&1 \
      || ! miss=$(jq -r --slurpfile w "$ROOT/home/.claude/settings.json" --arg re "$TELEMETRY_RE" \
@@ -243,12 +275,16 @@ telemetry_rows() {
     row "telemetry settings" MISSING "no readable $s with an object env; run: scripts/bootstrap --user-config"; rc=1
   elif [ -n "$miss" ]; then
     row "telemetry settings" MISSING "$s lacks: $miss; run: scripts/bootstrap --user-config"; rc=1
+  elif over=$(logs_override "$s") && [ -n "$over" ]; then
+    row "telemetry settings" OWNER "logs do not reach the local collector: $over, which overrides canon's general endpoint${differ:+; it also sets $differ to a value other than the one canon sets}"
   elif [ -n "$differ" ]; then
     row "telemetry settings" OWNER "$s sets $differ to another value than canon's (left as the owner set it)"
   else row "telemetry settings" ok "OTLP logs to the local collector (ADR 0007)"; fi
   case "$(codex_otel_state "$CODEX_DIR/config.toml")" in
     canon) row "codex telemetry" ok "$CODEX_DIR/config.toml has canon's [otel] table" ;;
     other) row "codex telemetry" OWNER "$CODEX_DIR/config.toml sets otel itself; canon's table is in home/.codex/otel.toml" ;;
+    invalid) row "codex telemetry" INVALID "$CODEX_DIR/config.toml is not valid TOML; Codex cannot read it either" ;;
+    unknown) row "codex telemetry" UNKNOWN "no python3 with tomllib to read $CODEX_DIR/config.toml; run: scripts/bootstrap --install" ;;
     *)     row "codex telemetry" absent "no canon [otel] table in $CODEX_DIR/config.toml; run: scripts/bootstrap --user-config" ;;
   esac
   return "$rc"
@@ -496,7 +532,8 @@ install_telemetry() {
       jq --argjson a "$add" '.env = ((.env // {}) + $a)' "$s" > "$tmp" || { rm -f "$tmp"; die "could not add the telemetry settings to $s"; }
       [ "$(jq -S . "$tmp")" != "$(jq -S . "$1")" ] || cat "$1" > "$tmp"
       keep_copy "$s"
-      cat "$tmp" > "$s"; rm -f "$tmp"
+      cat "$tmp" > "$s" || { rm -f "$tmp"; die "could not write $s; its previous content is in the copy kept above"; }
+      rm -f "$tmp"
       note "  added      $(jq -r 'keys | join(", ")' <<<"$add") to the env of $s"
     else
       note "  unchanged  telemetry settings in $s"
@@ -510,14 +547,22 @@ install_telemetry() {
   case "$(codex_otel_state "$c")" in
     canon) note "  unchanged  [otel] in $c" ;;
     other) note "  KEPT       $c sets otel itself; left as the owner set it. Canon's table: $ROOT/home/.codex/otel.toml" ;;
+    invalid) note "  INVALID    $c is not valid TOML; left as it is, and no [otel] added"; rc=1 ;;
+    unknown) note "  UNKNOWN    no python3 with tomllib to read $c; left as it is (run: scripts/bootstrap --install)"; rc=1 ;;
     *)
+      # the table is appended to a copy, which must then read as TOML with canon's table before it replaces c
+      tmp=$(mktemp) || die "could not create a temp file"
       if [ -s "$c" ]; then
-        keep_copy "$c"
-        [ -z "$(tail -c 1 "$c")" ] || printf '\n' >> "$c"
-        printf '\n' >> "$c"
+        cat "$c" > "$tmp" || { rm -f "$tmp"; die "could not read $c"; }
+        [ -z "$(tail -c 1 "$tmp")" ] || printf '\n' >> "$tmp"
+        printf '\n' >> "$tmp"
       fi
       { echo "# canon: OTLP log export to the local collector (home/.codex/otel.toml, docs/adr/0007-observability.md)"
-        grep -v -e '^#' -e '^$' "$ROOT/home/.codex/otel.toml"; } >> "$c" || die "could not write $c"
+        grep -v -e '^#' -e '^$' "$ROOT/home/.codex/otel.toml"; } >> "$tmp" || { rm -f "$tmp"; die "could not write a temp file"; }
+      [ "$(codex_otel_state "$tmp")" = canon ] || { rm -f "$tmp"; die "appending canon's [otel] table to $c would not leave canon's table in valid TOML; nothing written"; }
+      [ ! -s "$c" ] || keep_copy "$c"
+      cat "$tmp" > "$c" || { rm -f "$tmp"; die "could not write $c; its previous content is in the copy kept above"; }
+      rm -f "$tmp"
       note "  added      [otel] to $c"
       ;;
   esac
