@@ -604,11 +604,54 @@ def test_auto_takes_the_overnight_session_when_extended_windows_are_on(monkeypat
 
 @pytest.mark.parametrize(
     ("part", "expected"),
-    [("overnight", "boats"), ("after-hours", "iex"), ("pre-market", "iex"), ("regular", "iex")],
+    [("overnight", "boats"), ("pre-market", "iex"), ("regular", "iex")],
 )
-def test_a_window_streams_boats_overnight_and_iex_otherwise(part, expected) -> None:
+def test_a_window_streams_boats_overnight_and_iex_in_the_regular_session_and_pre_market(
+    part, expected
+) -> None:
     """ADR 0055: on paper `boats` delivered the overnight session's quotes, trades and bars."""
     assert session_window.window_feed(part) == expected
+
+
+def test_a_part_with_no_feed_is_skipped_and_an_unknown_part_named() -> None:
+    with pytest.raises(
+        session_window.WindowSkipped, match="no after-hours window: probed on paper"
+    ):
+        session_window.window_feed("after-hours")
+    with pytest.raises(RuntimeError, match="no feed is set for the 'midday' part"):
+        session_window.window_feed("midday")
+
+
+def test_each_part_of_a_session_names_its_feed_and_what_paper_has_shown_of_it() -> None:
+    """One table holds, per part, the feed a window uses and whether paper has shown it delivering."""
+    table = session_window.SESSION_FEEDS
+    assert set(table) == {"regular", "pre-market", "after-hours", "overnight"}
+    assert table["after-hours"].feed is None and "2026-11-10" in table["after-hours"].observed
+    assert table["overnight"].feed == "boats" and "2026-11-10" in table["overnight"].observed
+    assert table["pre-market"].feed == "iex" and "not yet probed" in table["pre-market"].observed
+    assert table["regular"].feed == "iex" and "2026-11-10" in table["regular"].observed
+
+
+def test_an_after_hours_window_is_skipped_by_name_not_failed(monkeypatch, tmp_path, capsys) -> None:
+    """The lead decided on 2026-11-11 that a part no feed has been seen to serve on paper is skipped,
+    naming the part and the observation, rather than run to fail for no data every evening."""
+
+    class AfterHours(Account):
+        def get_clock(self) -> Clock:
+            return clock(datetime(2026, 11, 10, 17, 0, tzinfo=NEW_YORK), is_open=False)
+
+    monkeypatch.setattr(session_window, "paper_trading", lambda: AfterHours())
+    monkeypatch.setattr(
+        session_window, "window_node", lambda *a, **k: pytest.fail("a node was built")
+    )
+    (tmp_path / "latest.json").write_text('{"result": "ok"}')
+    for session, said in (("auto", "nothing to run"), ("extended", "skipped")):
+        assert session_window.main(["--session", session, "--log-dir", str(tmp_path)]) == 0
+        out = capsys.readouterr().out
+        assert f"{said}: no after-hours window" in out and "16:46 New York, 2026-11-10" in out
+        assert json.loads((tmp_path / "latest.json").read_text()) == {"result": "ok"}
+        heard = json.loads((tmp_path / "last-firing.json").read_text())
+        assert heard["outcome"].startswith(f"{said}: no after-hours window")
 
 
 def test_an_overnight_window_needs_only_its_trade_dates_session_open() -> None:
@@ -1058,7 +1101,8 @@ def test_the_warm_up_needs_time_bars() -> None:
     [
         (datetime(2026, 11, 10, 11, 0), True, False, "regular"),
         (datetime(2026, 11, 10, 17, 0), False, False, None),
-        (datetime(2026, 11, 10, 17, 0), False, True, "extended"),
+        (datetime(2026, 11, 10, 5, 0), False, True, "extended"),  # pre-market
+        (datetime(2026, 11, 10, 17, 0), False, True, None),  # after-hours: no feed
         (datetime(2026, 11, 10, 21, 0), False, True, None),  # overnight is not run
     ],
 )
