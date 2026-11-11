@@ -104,7 +104,22 @@ still winds down; the engine passes on only the first subscription to an instrum
 unsubscribe the params its subscription had; an unsubscribe naming a feed Alpaca does not stream, or
 another feed than the stream's, sends nothing and is logged, as the adapter guide has unsubscribe hooks
 tolerate members whose subscription failed; each relayed log line names the stream's thread, by a
-name unique in the process.
+name unique in the process; a subscribe made while alpaca-py connects, which alpaca-py 0.45.0 records
+and never sends (the contract test runs this on alpaca-py's real stream, on an in-memory socket, and
+fails once upstream closes the window), is sent once the stream's first quote or trade arrives, when
+the client sends its subscriptions again, if a subscribe was made after the stream started; a start
+whose sent subscriptions stay quiet, a reconnect alpaca-py makes by itself, and an unsubscribe lost in
+the same window (alpaca-py does not send it either, and a subscribe does not undo it) are not covered.
+
+What a caller sees when the stream fails: a stream that ends by itself is not restarted (alpaca-py
+reconnects and resubscribes by itself after a websocket error and after any error while connecting, and
+keeps the connection after an error once connected; it ends a run only on 409, which a restart on the
+same feed would meet again), its end is logged as an error naming the feed, and later
+subscriptions are refused until the client reconnects. A stream alpaca-py never gets connected (406,
+for one) is retried by alpaca-py without end: the node logs its retry warnings naming the feed and
+thread, and no data arrives; no bound is set, since its connection state is private to alpaca-py.
+NautilusTrader v2.0.0rc8 has no channel for a data client to tell the engine its data has stopped, so
+neither reaches the engine as more than the log.
 
 Paper, `mise run paper:test -- -s -k "test_paper_boats_quotes_reach_the_strategy or
 test_paper_default_feed_is_iex or test_paper_asset_and_daily_bars_reach_the_strategy"`, 2026-11-10 20:49
@@ -152,5 +167,14 @@ Read 2026-11-10; "raw": fetched with `curl` and read, not summarised.
   fetched, raw): "Unsubscribe hooks must therefore tolerate members whose subscription failed".
 * Offline, 2026-11-10: a strategy that subscribed AAPL quotes on `boats` and called `unsubscribe_quotes`
   with no params reached the client's hook with `{'feed': 'boats'}` (ran).
+* NautilusTrader v2.0.0rc8, `nautilus_trader/live/clients.py` as installed: `is_connected` is a read-only
+  property of the client runtime, and the client has no other connection or health method (bundled;
+  read). `crates/adapters/databento/src/data.rs` at the tag: when its feed handler gives up reconnecting
+  (`DatabentoMessage::Error`, "Reconnection timeout after N minutes" in `live.rs`), the client logs
+  "Feed handler error" and does nothing more (fetched, raw).
+* alpaca-py 0.45.0, the latest release (https://github.com/alpacahq/alpaca-py/releases, read
+  2026-11-10): `_drive_run` sends the handler maps, then sets `_running`; `_subscribe` sends only while
+  `_running`; a subscribe in between was recorded and never sent, run offline on the real
+  `StockDataStream` (ran). No upstream issue found for it (searched 2026-11-10).
 * Second reader, 2026-11-10 (`evidence-verifier`): B stands; corrected above: Databento's refusal cited
   from source, the data hooks' sentence quoted, the after-hours claim narrowed, the per-endpoint limit.

@@ -852,6 +852,7 @@ class FakeStream:
         self.running = threading.Event()
         self.finished = threading.Event()
         self.stopped = threading.Event()  # stop() was called, for tests to read
+        self.subscribes_sent = 0  # subscribes sent while running
         self.max_active = 0  # the most subscribe or unsubscribe calls inside the stand-in at once
         self._active = 0
         self._lock = threading.Lock()
@@ -891,6 +892,7 @@ class FakeStream:
             self._changed.set()
             if self.running.is_set():
                 self._send()
+                self.subscribes_sent += 1
                 self._snapshot()
         finally:
             self._leave()
@@ -1066,6 +1068,13 @@ class MemorySocket:
         self.closed = True
 
 
+def wire_quote() -> dict:
+    """The docs' quote as the stream sends it, before alpaca-py's `_cast`: `t` as a msgpack timestamp,
+    whose `to_datetime()` gives the fixture's `datetime`."""
+    moment = QUOTE_AAPL["t"]
+    return {**QUOTE_AAPL, "t": SimpleNamespace(to_datetime=lambda: moment)}
+
+
 def memory_stream(monkeypatch: pytest.MonkeyPatch) -> tuple[StockDataStream, MemorySocket]:
     """alpaca-py's real `StockDataStream` on a `MemorySocket`: no network, no credentials.
 
@@ -1153,4 +1162,5 @@ def alpaca() -> SimpleNamespace:
         HistoricalClient=FakeHistoricalClient,
         Stream=FakeStream,
         memory_stream=memory_stream,
+        wire_quote=wire_quote,
     )

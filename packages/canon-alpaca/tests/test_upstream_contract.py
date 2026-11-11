@@ -377,7 +377,9 @@ def test_stream_stand_in_misses_a_subscribe_made_while_it_connects(
 ) -> None:
     """alpaca-py's `_drive_run` sends the handler maps as they are when it connects and only then counts
     as running, and `_subscribe` sends only while running: a subscribe made in between is not sent
-    until a later subscribe sends the maps again."""
+    until a later subscribe sends the maps again. The data client makes up for it by sending its
+    subscriptions again on a stream's first message (`AlpacaDataClient._resend_subscriptions`); the
+    real row fails once alpaca-py closes the window, and that resend can then be dropped."""
     import threading
 
     stream, wire, running, socket = running_stream(make, alpaca, monkeypatch)
