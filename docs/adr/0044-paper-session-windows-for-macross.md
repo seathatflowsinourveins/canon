@@ -261,6 +261,32 @@ part does not serve (removed: the part decides); subscriptions sent before `MaCr
 and leftovers (a stale refusal message, a function with no caller, two ways to say no feed). The last seven
 are covered by a test.
 
+2026-11-11, ADR 0068's step 3: a window takes a strategy by name from a fixed table
+(`session_window.WINDOW_STRATEGIES`, `--strategy` through `paper:session` and the runner, `SessionMaCross`
+by default, so the schedule is unchanged), and the name is in its record and the `scripts/automation
+status` row. Upstream's built-in `EmaCross` is the other entry, added through `add_builtin_strategy` beside
+the cap; it does not flatten on stop and the account check closes at market in the regular session only,
+so a named extended session is refused for it by name, `--session auto` outside the regular session has
+nothing to run for it and says why (exit 0), and a part whose feed is not the adapter's default is
+refused, since its subscription names none. It has no wind-down: it trades to the stop, and an order it
+sent then is the account check's. The decision above is unchanged: no setting makes `EmaCross` safe
+unattended, and a window of it is a bounded check. At the pin it reads neither its position nor its
+working orders, and an order refused still flips its side, so a second order can stack a position (ADR
+0037's 4-share short); so its window's submit budget is one order (`EMA_CROSS_SUBMIT_RATE`, one an hour,
+longer than any window), ADR 0037's bound through the risk engine's own rate limit, which denies every
+later cross before it leaves the node. The cap stays as the backstop and the account check closes the
+share. Offline, `tests/test_session_window.py`: the table and its refusals, the node's wiring and budget,
+one order sent and every later cross denied over an hour of quotes, the record's strategy, and a
+built-in's orders and quotes read from the node's cache (run); a built-in's quote and trade counts are
+the cache's, at most its `tick_capacity` (10,000), so they show that data came, not how much. Code review
+(`/code-review`, high), 2026-11-11: ten findings. The one that changed behaviour, `--session auto`
+resolving to the extended session whatever the strategy (exit 1 where nothing was to run), was first
+shown by a failing test; the refusal's wording now comes from the table, the node is built from the
+table, the strategy ID is required where orders are read, and the status row's strategy is in its
+self-test; the capped count and the missing wind-down are stated above; a feed check that the table
+makes unreachable is kept as a guard. On paper: pending, the first regular window of it (ADR 0068,
+Confirmation).
+
 ## Evidence
 
 Read 2026-11-10. "raw": fetched with `curl` and read whole. NautilusTrader files at the pin, `d53849b216e2`.

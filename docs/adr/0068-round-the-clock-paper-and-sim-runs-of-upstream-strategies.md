@@ -153,6 +153,14 @@ run that exposed a defect also ends as a test and a case in `evals/` (ADR 0046, 
 
 * The sandbox proof run, its command, exit and log: ADR 0070's Confirmation.
 * The sizing runs above: scripts kept outside the repository, run offline on generated quotes.
+* Step 3, 2026-11-11: `--strategy` in the window runner, `EmaCross` in regular windows only, its name in
+  the record (ADR 0044, Confirmation). Offline in `tests/test_session_window.py` (run). Under latency, from
+  `ema_cross/strategy.rs` at the pin: it keeps only the last quote's `fast > slow` and sends one market
+  order at each change, reading neither its position nor its working orders, so one cross sends one order
+  however slow the venue, crosses while one is in flight each send another, and a refused order leaves
+  its side flipped. That is why its window's submit budget is one order (ADR 0044, Confirmation), with
+  the cap behind it and the account check closing the share. On paper: pending, one regular window,
+  `mise run paper:session --session regular --strategy EmaCross --minutes 10`.
 
 ## Evidence
 

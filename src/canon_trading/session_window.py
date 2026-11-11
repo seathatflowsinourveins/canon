@@ -1,7 +1,8 @@
-"""One bounded window of `SessionMaCross` on Alpaca's paper environment: start flat, trade, flatten, check, report.
+"""One bounded window of a named strategy on Alpaca's paper environment: start flat, trade, flatten, check, report.
 
-Contract: NautilusTrader v2.0.0rc8's `LiveNode.builder`, `LiveExecutionEngineConfig` and `LoggerConfig` with a
-`FileWriterConfig` (`live/__init__.pyi`, `common/__init__.pyi`); alpaca-py 0.45.0's `TradingClient` (paper)
+Contract: NautilusTrader v2.0.0rc8's `LiveNode.builder`, `LiveNode.add_builtin_strategy`, `Cache.quote_count`
+and `trade_count`, `LiveExecutionEngineConfig` and `LoggerConfig` with a `FileWriterConfig`
+(`live/__init__.pyi`, `common/__init__.pyi`); alpaca-py 0.45.0's `TradingClient` (paper)
 `get_clock`, `get_calendar`, `get_orders`, `get_open_position`, `get_order_by_client_id`,
 `cancel_order_by_id` and `submit_order` with a `MarketOrderRequest`. Read 2026-11-10 (ADR 0044; the account
 check's sources, ADR 0060):
@@ -38,11 +39,14 @@ check's sources, ADR 0060):
   answers a lookup of an ID it does not hold (a 404, as the adapter's lookup reads it; UNVERIFIED), and
   how soon after a submit an order shows in a lookup or a listing.
 
-What one window is (one node, one process): the configured session and feed, checked against Alpaca's
+What one window is (one node, one process): one strategy of `WINDOW_STRATEGIES`, `SessionMaCross` unless
+`--strategy` names upstream's built-in `EmaCross`, which runs in regular windows only (ADR 0068, step 3;
+`crates/trading/src/examples/strategies/ema_cross/` at the pin); the configured session and feed, checked against Alpaca's
 clock and calendar before anything starts; the paper account holding no open order and no position in the
 symbol; at least `GAP_SECS` since the last window ended; then the node runs for `minutes` (default 30, at
 most 60), clipped to the session's end and to `LONGEST_WINDOW_SECS` (about 49 minutes, so a paper test
-waiting for the lock outlasts the window and its bounded end), the record saying so when it is. The strategy winds down `FLATTEN_SECS` before the end, the node
+waiting for the lock outlasts the window and its bounded end), the record saying so when it is. `SessionMaCross` winds down `FLATTEN_SECS` before the end (`EmaCross` has
+no wind-down and trades to the stop), the node
 stops, and the account is checked: no open order, no position. The wait for the stop is bounded by
 `STOP_TIMEOUT_SECS`, the node's own stop bounds summed; past it the window is recorded failed, the
 account is still checked, and `main` ends the process (`os._exit`), since the node's task can be neither
@@ -163,9 +167,13 @@ from nautilus_trader.model import StrategyId
 from nautilus_trader.model import TimeInForce
 
 from .paper_node import DELAY_POST_STOP_SECS
+from .paper_node import EMA_CROSS
+from .paper_node import EMA_CROSS_ID
+from .paper_node import MAX_ORDER_SUBMIT_RATE
 from .paper_node import TIMEOUT_DISCONNECTION_SECS
 from .paper_node import TIMEOUT_SHUTDOWN_SECS
 from .paper_node import alpaca_paper_builder
+from .paper_node import ema_cross_config
 from .position_cap import PositionCap
 from .position_cap import position_cap_config
 from .session_ma_cross import SessionMaCross
@@ -174,6 +182,8 @@ from .session_ma_cross import SessionMaCrossConfig
 if TYPE_CHECKING:
     from collections.abc import Mapping
     from collections.abc import Sequence
+
+    from nautilus_trader.common import Cache
 
 NEW_YORK = ZoneInfo("America/New_York")
 SESSIONS = ("regular", "extended")
@@ -223,8 +233,66 @@ MAX_MINUTES = 60
 GAP_SECS = 300
 """Between one window's end and the next one's start, so paper tests waiting for the lock get it."""
 FLATTEN_SECS = 120
-"""The strategy winds down this long before the window ends."""
+"""`SessionMaCross` winds down this long before the window ends. A built-in has no wind-down: `EmaCross`
+trades until the stop, and an order it sent then is the account check's to settle (ADR 0060)."""
 STRATEGY_ID = StrategyId("SessionMaCross-001")
+
+
+EMA_CROSS_SUBMIT_RATE = "1/01:00:00"
+"""`EmaCross`'s submit budget in a window: one order an hour, longer than any window (`MAX_MINUTES`), so
+one order reaches Alpaca and the risk engine denies every later one with `RATE_LIMIT_EXCEEDED` before it
+leaves the node, as ADR 0037's paper test bounds it. One, because `EmaCross` at the pin reads neither its
+position nor its working orders and an order refused still flips its side, so any second order can stack
+a position (`WINDOW_STRATEGIES`); the cap stays behind it."""
+
+
+@dataclass(frozen=True)
+class WindowStrategy:
+    """A strategy a window may run: its ID in the node, the sessions it may run in, with why, its
+    submit budget for the risk engine (`paper_node.risk_limits`), and, for one of upstream's built-ins,
+    the type name `add_builtin_strategy` takes; None for `SessionMaCross`, the one Python strategy."""
+
+    strategy_id: StrategyId
+    sessions: tuple[str, ...]
+    why: str = ""
+    """Why it runs in `sessions` only, when that is not every session."""
+    max_order_submit_rate: str = MAX_ORDER_SUBMIT_RATE
+    builtin: str | None = None
+
+
+WINDOW_STRATEGIES = {
+    "SessionMaCross": WindowStrategy(STRATEGY_ID, SESSIONS),
+    EMA_CROSS: WindowStrategy(
+        EMA_CROSS_ID,
+        ("regular",),
+        "it does not flatten on stop, and the account check after the stop closes at market only "
+        "while the regular session is open (ADR 0068)",
+        EMA_CROSS_SUBMIT_RATE,
+        builtin=EMA_CROSS,
+    ),
+}
+"""The strategies a window runs, by the name `--strategy` takes (ADR 0068, step 3): the repo's
+`SessionMaCross`, a Python strategy, and upstream's built-in `EmaCross`, added by its type name through
+`LiveNode.add_builtin_strategy` with `paper_node.ema_cross_config` (one share an order, upstream's periods,
+10 and 50), as `paper_node.ema_cross_paper_node` adds it (ADR 0037). Both run beside `PositionCap` under the
+same bounds: start flat, one share, the engine's risk limits and the account check after the stop.
+`EmaCross` at the pin (`crates/trading/src/examples/strategies/ema_cross/strategy.rs`) keeps only whether
+the fast EMA of the mid was above the slow one at the last quote, and sends one market order of
+`trade_size` at each change, never reading its position or its working orders. So under latency one cross
+still sends one order, but every cross while an order is in flight sends another, and an order Alpaca
+refuses does not undo its side, so the alternation breaks and the position stacks (ADR 0037 saw a 4-share
+short in under two seconds). Nothing in it guards orders in flight, unlike `SessionMaCross`
+(`session_ma_cross`). So a window gives it one order (`EMA_CROSS_SUBMIT_RATE`, the risk engine's own
+limit): it holds at most one share, the cap stays as the backstop, and the account check closes it."""
+DEFAULT_STRATEGY = "SessionMaCross"
+"""What a window runs when no `--strategy` is given, as the schedule gives none (ADR 0050)."""
+
+
+def _runs_only(name: str, runs: WindowStrategy) -> str:
+    """`<name> runs in <sessions> windows only`, from the table."""
+    return f"{name} runs in {' and '.join(runs.sessions)} windows only"
+
+
 STALE_RUNNING_SECS = 70 * 60
 """A record still `running` this long after it started is a window that died (60 minutes at most, plus
 start-up, shutdown and the account check)."""
@@ -379,18 +447,30 @@ def _checkout_commit(root: Path) -> str:
 
 @dataclass(frozen=True)
 class WindowConfig:
-    """What one window runs. `session` is `regular` (market orders) or `extended` (marked limits)."""
+    """What one window runs. `session` is `regular` (market orders) or `extended` (marked limits);
+    `strategy` a name of `WINDOW_STRATEGIES`, refused by name in a session it does not run in."""
 
     symbol: str = "SPY"
     session: str = "regular"
     minutes: int = DEFAULT_MINUTES
     fast_period: int = 10
     slow_period: int = 20
+    """`SessionMaCross`'s periods; `EmaCross` runs at upstream's (`paper_node.ema_cross_config`)."""
     log_dir: Path = field(default_factory=default_log_dir)
+    strategy: str = DEFAULT_STRATEGY
+    """A name of `WINDOW_STRATEGIES`."""
 
     def __post_init__(self) -> None:
         if self.session not in SESSIONS:
             raise ValueError(f"session must be one of {SESSIONS}, got {self.session!r}")
+        if (runs := WINDOW_STRATEGIES.get(self.strategy)) is None:
+            raise ValueError(
+                f"strategy must be one of {tuple(WINDOW_STRATEGIES)}, got {self.strategy!r}"
+            )
+        if self.session not in runs.sessions:
+            raise ValueError(
+                f"{_runs_only(self.strategy, runs)}, not in the {self.session} session: {runs.why}"
+            )
         if self.symbol != "SPY":
             raise ValueError(
                 f"the notional cap is sized for SPY (paper_node.MAX_NOTIONAL_PER_ORDER_USD); got {self.symbol}"
@@ -506,19 +586,64 @@ def window_feed(part: str) -> str:
     return found.feed
 
 
+def builtin_config(builtin: str, instrument_id: InstrumentId) -> object:
+    """The config a built-in of `WINDOW_STRATEGIES` runs with in a window, or `ValueError` for one the
+    window has no config for."""
+    if builtin == EMA_CROSS:
+        return ema_cross_config(instrument_id)
+    raise ValueError(f"no window config for the built-in {builtin!r}")
+
+
+class CachedData:
+    """What a window's record reads of a built-in strategy, which runs in Rust and hands the window no
+    Python object: the quotes and trades in the node's cache for the instrument (`Cache.quote_count`,
+    `trade_count`), the data engine's copy of what reached the strategies, at most the cache's
+    `tick_capacity` (10,000 by default at the pin) each, read before the node is disposed. No warm-up and
+    no bars of the window's own, so those counts are 0."""
+
+    dropped: tuple = ()
+    history_bars = 0
+    history_dropped = 0
+    live_bars = 0
+
+    def __init__(self, cache: Cache, instrument_id: InstrumentId) -> None:
+        self._cache = cache
+        self._instrument_id = instrument_id
+
+    @property
+    def quotes(self) -> int:
+        return self._cache.quote_count(self._instrument_id)
+
+    @property
+    def trades(self) -> int:
+        return self._cache.trade_count(self._instrument_id)
+
+
 def window_node(
     config: WindowConfig, *, wind_down_at: datetime, log_name: str, feed: str
-) -> tuple[LiveNode, SessionMaCross, PositionCap]:
+) -> tuple[LiveNode, SessionMaCross | CachedData, PositionCap]:
     """The node, Alpaca's clients, the native risk limits and runtime checks, with the strategy and the cap
-    it runs (returned too: the node does not hand its Python strategies back). `feed` is named in the
-    strategy's subscriptions and its warm-up request (ADR 0055)."""
+    it runs (returned too: the node does not hand its Python strategies back; for a built-in, what the
+    record reads of it, `CachedData`). `feed` is named in `SessionMaCross`'s subscriptions and its warm-up
+    request (ADR 0055); `EmaCross` subscribes with no params, so it runs only where the feed is the
+    adapter's default."""
+    runs = WINDOW_STRATEGIES[config.strategy]
+    if runs.builtin is not None and feed != FEED.value:
+        # holds while `SESSION_FEEDS` gives a built-in's sessions the adapter's default feed
+        raise RuntimeError(
+            f"{config.strategy} names no feed in its subscription, so it streams {FEED.value}; this "
+            f"window's part streams {feed}"
+        )
     extended = config.session == "extended"
+    # `SessionMaCross`'s managed stop runs a market exit inside the post-stop delay; a built-in has none
+    managed = runs.builtin is None and not extended
     node = (
         alpaca_paper_builder(
             "CANON-PAPER-SESSION",
             config.instrument_id,
             # the managed stop's market exit runs inside the post-stop delay
-            delay_post_stop_secs=DELAY_POST_STOP_SECS if extended else MANAGED_DELAY_POST_STOP_SECS,
+            delay_post_stop_secs=MANAGED_DELAY_POST_STOP_SECS if managed else DELAY_POST_STOP_SECS,
+            max_order_submit_rate=runs.max_order_submit_rate,
         )
         .with_logging(
             LoggerConfig(
@@ -528,6 +653,11 @@ def window_node(
         )
         .build()
     )
+    if runs.builtin is not None:
+        node.add_builtin_strategy(runs.builtin, builtin_config(runs.builtin, config.instrument_id))
+        cap = PositionCap(position_cap_config(config.instrument_id))
+        node.add_strategy(cap)
+        return node, CachedData(node.cache, config.instrument_id), cap
     strategy = SessionMaCross(
         SessionMaCrossConfig(
             bar_type=config.bar_type,
@@ -590,6 +720,8 @@ class WindowReport:
     errors: list[str] = field(default_factory=list)
     part: str = ""
     """The part of the session the window ran in: `regular`, `pre-market`, `after-hours`, `overnight`."""
+    strategy: str = DEFAULT_STRATEGY
+    """The strategy the window ran, a name of `WINDOW_STRATEGIES`."""
     feed: str = ""
     """The feed the strategy streamed and warmed up on (ADR 0055)."""
     overnight: str = ""
@@ -598,7 +730,9 @@ class WindowReport:
     trades: int = 0
     live_bars: int = 0
     """The quotes, trades and live bars that reached the strategy: none of the first two is a stream that
-    delivered nothing (`result` failed); trades and no bars, a quiet market."""
+    delivered nothing (`result` failed); trades and no bars, a quiet market. For a built-in, the node
+    cache's counts (`CachedData`), each at most the cache's `tick_capacity` (10,000), so they show that
+    data came, not how much."""
     stream: list[str] = field(default_factory=list)
     """The adapter's own log lines about its stream (`STREAM_LINES`): alpaca-py's warnings and errors,
     the stream's end by itself and a subscription it refused. An error among them fails the window."""
@@ -826,6 +960,7 @@ def run_window(
         planned_seconds=seconds,
         shortened=shortened,
         part=part,
+        strategy=config.strategy,
         feed=feed,
         overnight=overnight,
     )
@@ -838,6 +973,7 @@ def run_window(
     ran = False  # whether the node was run: only then is the gap marker written
     cache = None
     unsettled: dict[str, tuple[str, str]] = {}
+    strategy_id = WINDOW_STRATEGIES[config.strategy].strategy_id
     try:
         node, strategy, cap = window_node(
             config,
@@ -852,7 +988,7 @@ def run_window(
         finally:
             try:
                 report.seconds = round(time.monotonic() - started, 1)
-                _fill(report, cache)
+                _fill(report, cache, strategy_id)
                 report.dropped = list(strategy.dropped)
                 report.warm_up_bars = strategy.history_bars
                 report.warm_up_dropped = strategy.history_dropped
@@ -863,7 +999,7 @@ def run_window(
             finally:
                 try:
                     # before the disposal, which clears the cache
-                    unsettled = _unsettled(cache)
+                    unsettled = _unsettled(cache, strategy_id)
                 finally:
                     if len(_ABANDONED) == abandoned_before:  # else its abandoned task owns it
                         node.dispose()
@@ -875,7 +1011,7 @@ def run_window(
             _wait_for_calls(_ABANDONED[abandoned_before:], report)
             if cache is not None and len(_ABANDONED) > abandoned_before:
                 # after the wait: an abandoned node's last submits are in it
-                unsettled = _unsettled(cache)
+                unsettled = _unsettled(cache, strategy_id)
             for client_order_id, (side, why) in unsettled.items():
                 report.unsettled[client_order_id] = [f"{side}: {why}"]
             report.left = _flatten_after_stop(
@@ -1480,7 +1616,7 @@ ANSWERED = frozenset(
 """The events by which the node has heard what became of an order it sent."""
 
 
-def _unsettled(cache) -> dict[str, tuple[str, str]]:
+def _unsettled(cache, strategy_id: StrategyId) -> dict[str, tuple[str, str]]:
     """The strategy's orders the node did not see end, by client order ID, each with its side and why it
     is here: `sent with no answer` of Alpaca's (the adapter logs an unknown outcome and leaves the order
     submitted when a submit's answer is lost, `_log_unknown_outcome`, and the node's own rejection of it
@@ -1491,7 +1627,7 @@ def _unsettled(cache) -> dict[str, tuple[str, str]]:
     Alpaca may hold any of them after the node has stopped; the account check looks each up
     (`_flatten_after_stop`)."""
     found: dict[str, tuple[str, str]] = {}
-    for order in cache.orders(strategy_id=STRATEGY_ID):
+    for order in cache.orders(strategy_id=strategy_id):
         names = [_event_name(e) for e in order.events()]
         if "OrderSubmitted" not in names:
             continue
@@ -1507,8 +1643,9 @@ def _unsettled(cache) -> dict[str, tuple[str, str]]:
     return found
 
 
-def _fill(report: WindowReport, cache) -> None:
-    for order in cache.orders(strategy_id=STRATEGY_ID):
+def _fill(report: WindowReport, cache, strategy_id: StrategyId) -> None:
+    """The strategy's orders, by its ID, into the report: each one's events, the fills, the denials."""
+    for order in cache.orders(strategy_id=strategy_id):
         names = [_event_name(e) for e in order.events()]
         report.orders[order.client_order_id.value] = names
         report.fills += names.count("OrderFilled")
@@ -1518,13 +1655,18 @@ def _fill(report: WindowReport, cache) -> None:
 
 
 def resolve_session(
-    clock: AlpacaClock, calendar: AlpacaCalendar | Sequence[AlpacaCalendar] | None
+    clock: AlpacaClock,
+    calendar: AlpacaCalendar | Sequence[AlpacaCalendar] | None,
+    strategy: str = DEFAULT_STRATEGY,
 ) -> tuple[str | None, str]:
     """The session `--session auto` runs, from Alpaca's clock and calendar, or None and why not: the
-    regular session when the clock says it is open; else the extended one, if `EXTENDED_READY` and it is
-    open now; else nothing. The schedule fires on a timer and leaves this choice to Alpaca's clock."""
+    regular session when the clock says it is open; else the extended one, if `EXTENDED_READY`, it is
+    open now and `strategy` runs in it (`WINDOW_STRATEGIES`); else nothing. The schedule fires on a timer
+    and leaves this choice to Alpaca's clock."""
     if clock.is_open:
         return "regular", "Alpaca's clock says the regular session is open"
+    if "extended" not in (runs := WINDOW_STRATEGIES[strategy]).sessions:
+        return None, f"the regular session is closed, and {_runs_only(strategy, runs)}: {runs.why}"
     if not EXTENDED_READY:
         return (
             None,
@@ -1567,8 +1709,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="One SessionMaCross window on Alpaca paper")
+    parser = argparse.ArgumentParser(description="One bounded strategy window on Alpaca paper")
     parser.add_argument("--session", choices=(*SESSIONS, "auto"), default="regular")
+    parser.add_argument("--strategy", choices=tuple(WINDOW_STRATEGIES), default=DEFAULT_STRATEGY)
     parser.add_argument("--minutes", type=int, default=DEFAULT_MINUTES)
     parser.add_argument("--symbol", default="SPY")
     parser.add_argument("--log-dir", type=Path, help="default: `default_log_dir()`")
@@ -1610,7 +1753,7 @@ def _main(args: argparse.Namespace) -> int:
             trading = paper_trading()
             clock, calendar, market_read_at = session_now(trading)
             market = (clock, calendar)
-            resolved, why = resolve_session(clock, calendar)
+            resolved, why = resolve_session(clock, calendar, args.strategy)
             if resolved is None:
                 print(f"paper:session: nothing to run: {why}")
                 _heard(args.log_dir, f"nothing to run: {why}")
@@ -1621,8 +1764,9 @@ def _main(args: argparse.Namespace) -> int:
             session=session,
             minutes=args.minutes,
             log_dir=args.log_dir,
+            strategy=args.strategy,
         )
-        write_heartbeat(args.log_dir, f"a {session} window")
+        write_heartbeat(args.log_dir, f"a {session} window of {args.strategy}")
         report = run_window(config, trading=trading, market=market, market_read_at=market_read_at)
     except WindowSkipped as e:
         print(f"paper:session: skipped: {e}")
@@ -1636,6 +1780,7 @@ def _main(args: argparse.Namespace) -> int:
                 args.log_dir,
                 {
                     "session": session,
+                    "strategy": args.strategy,
                     "result": f"refused: {e}",
                     "started_epoch": time.time(),
                     "started": datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ"),

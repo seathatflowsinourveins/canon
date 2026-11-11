@@ -70,6 +70,7 @@ from requests.adapters import HTTPAdapter
 
 from canon_trading import session_ma_cross
 from canon_trading import session_window
+from canon_trading.paper_node import MAX_ORDER_SUBMIT_RATE
 from canon_trading.paper_node import exec_engine_config
 from canon_trading.paper_node import risk_limits
 from canon_trading.position_cap import PositionCap
@@ -98,10 +99,11 @@ T0 = 1_762_790_400_000_000_000  # 2025-11-10T16:00:00Z
 MINUTE = 60_000_000_000
 
 
-def engine() -> BacktestEngine:
+def engine(*, max_order_submit_rate: str = MAX_ORDER_SUBMIT_RATE) -> BacktestEngine:
+    limits = risk_limits(SPY, max_order_submit_rate=max_order_submit_rate)
     eng = BacktestEngine(
         BacktestEngineConfig(
-            trader_id=TraderId("TESTER-001"), risk_engine=RiskEngineConfig(**risk_limits(SPY))
+            trader_id=TraderId("TESTER-001"), risk_engine=RiskEngineConfig(**limits)
         )
     )
     eng.add_venue(
@@ -861,6 +863,7 @@ def test_the_regular_window_node_runs_upstreams_managed_stop(tmp_path) -> None:
         WindowConfig(log_dir=tmp_path), wind_down_at=at, log_name="r", feed="iex"
     )
     try:
+        assert isinstance(s, SessionMaCross)
         assert s.manage_stop and not s.extended_hours and s.warm_up
         assert s.feed_params == {"feed": "iex"}
         assert str(s.history_bar_type) == "SPY.ALPACA-1-MINUTE-LAST-EXTERNAL"
@@ -877,6 +880,7 @@ def test_the_extended_window_node_builds_without_connecting(tmp_path, extended) 
         feed="boats",
     )
     try:
+        assert isinstance(s, SessionMaCross)
         assert s.extended_hours and not s.manage_stop and s.wind_down_at == at
         assert s.feed_params == {"feed": "boats"}
         assert cap.max_position == 1
@@ -1219,9 +1223,20 @@ def test_a_window_whose_account_check_fails_is_recorded_failed_not_ok(
     assert latest["result"] == "failed: RuntimeError: Alpaca answered 503"
 
 
-def quiet_window(monkeypatch, tmp_path, *, quotes, trades, live_bars=0, log=(), account=None):
-    """A window whose node runs at once, its strategy having seen `quotes`, `trades` and `live_bars`, and
-    its node log holding the lines `log`; returns the report or the error, and the latest record."""
+def quiet_window(
+    monkeypatch,
+    tmp_path,
+    *,
+    quotes,
+    trades,
+    live_bars=0,
+    log=(),
+    account=None,
+    strategy="SessionMaCross",
+):
+    """A window of `strategy` whose node runs at once, its strategy having seen `quotes`, `trades` and
+    `live_bars`, and its node log holding the lines `log`; returns the report or the error, and the
+    latest record."""
 
     class Ran:
         cache = SimpleNamespace(orders=lambda **kwargs: [])
@@ -1250,7 +1265,7 @@ def quiet_window(monkeypatch, tmp_path, *, quotes, trades, live_bars=0, log=(), 
     monkeypatch.setattr(session_window, "_run_node", lambda node, ends: None)
     monkeypatch.setattr(session_window, "_flatten_after_stop", lambda *a, **k: [])
     try:
-        outcome: Any = session_window.run_window(WindowConfig(log_dir=tmp_path))
+        outcome: Any = session_window.run_window(WindowConfig(log_dir=tmp_path, strategy=strategy))
     except RuntimeError as e:
         outcome = e
     return outcome, json.loads((tmp_path / "latest.json").read_text()), seen
@@ -2430,7 +2445,7 @@ def test_a_managed_stop_has_the_post_stop_delay_its_market_exit_needs(
     time, so at 5 s it was cut off after five attempts and the strategy never stopped."""
     built: list[Builder] = []
 
-    def builder(*args, delay_post_stop_secs: int = 5) -> Builder:
+    def builder(*args, delay_post_stop_secs: int = 5, **kwargs) -> Builder:
         built.append(Builder())
         built[-1].calls.append(("with_delay_post_stop_secs", (delay_post_stop_secs,)))
         return built[-1]
@@ -2440,7 +2455,7 @@ def test_a_managed_stop_has_the_post_stop_delay_its_market_exit_needs(
     _, s, _ = session_window.window_node(
         WindowConfig(log_dir=tmp_path), wind_down_at=at, log_name="r", feed="iex"
     )
-    assert s.manage_stop
+    assert isinstance(s, SessionMaCross) and s.manage_stop
     delays = [args[0] for name, args in built[-1].calls if name == "with_delay_post_stop_secs"]
     exit_secs = (
         session_window.MARKET_EXIT_INTERVAL_MS * session_window.MARKET_EXIT_MAX_ATTEMPTS / 1000
@@ -2641,7 +2656,7 @@ def test_a_node_order_the_node_did_not_see_end_is_unsettled() -> None:
             node_order("never-sent", OrderInitialized()),
         ]
     )
-    assert session_window._unsettled(cache) == {
+    assert session_window._unsettled(cache, session_window.STRATEGY_ID) == {
         "lost": ("sell", "sent with no answer"),
         "working": ("buy", "open at the node"),
         "part-filled": ("buy", "open at the node"),
@@ -2658,7 +2673,7 @@ def test_a_real_order_of_the_pinned_node_has_what_the_window_reads() -> None:
     eng = engine()
     (first, *_) = run(eng, strategy())
     assert first.is_closed is True and first.side.name in {"BUY", "SELL"}
-    assert session_window._unsettled(eng.cache) == {}
+    assert session_window._unsettled(eng.cache, session_window.STRATEGY_ID) == {}
 
 
 def test_the_window_hands_the_nodes_orders_in_doubt_to_the_check(monkeypatch, tmp_path) -> None:
@@ -4161,3 +4176,238 @@ def test_a_position_that_can_only_be_reported_is_read_once(fake_time) -> None:
     left, _ = check(venue)
     assert [name for _, name in venue.calls] == ["orders", "position", "clock"]
     assert left == ["position of 1 SPY"]
+
+
+# --- The strategy a window runs, from a fixed table (ADR 0068 step 3, ADR 0044) ---
+
+
+def test_a_window_runs_session_ma_cross_unless_another_strategy_of_the_table_is_named() -> None:
+    """The schedule passes no `--strategy`, so its windows stay `SessionMaCross`; a name outside the
+    table is refused before anything is read."""
+    assert WindowConfig().strategy == "SessionMaCross"
+    assert session_window._parser().parse_args([]).strategy == "SessionMaCross"
+    assert set(session_window.WINDOW_STRATEGIES) == {"SessionMaCross", "EmaCross"}
+    assert WindowConfig(strategy="EmaCross").strategy == "EmaCross"
+    with pytest.raises(ValueError, match="strategy must be one of"):
+        WindowConfig(strategy="GridMarketMaker")
+    with pytest.raises(SystemExit):
+        session_window._parser().parse_args(["--strategy", "GridMarketMaker"])
+
+
+def test_ema_cross_is_refused_by_name_outside_the_regular_session(extended) -> None:
+    """`EmaCross` does not flatten on stop, and the account check closes at market in the regular
+    session only, so an extended window of it could end holding a position."""
+    with pytest.raises(ValueError, match="EmaCross runs in regular windows only"):
+        WindowConfig(session="extended", strategy="EmaCross")
+
+
+def test_auto_with_ema_cross_outside_the_regular_session_has_nothing_to_run_and_says_why(
+    monkeypatch, tmp_path, capsys, extended
+) -> None:
+    """Review finding: `--session auto` resolved to the extended session whatever the strategy, so a run
+    of `EmaCross` in pre-market failed (exit 1) where nothing was to run; it now says so by name and
+    exits 0, keeping the last result. A named extended session is still refused (above)."""
+
+    class PreMarket(Account):
+        def get_clock(self) -> Clock:
+            return clock(datetime(2026, 11, 10, 5, 0, tzinfo=NEW_YORK), is_open=False)
+
+    monkeypatch.setattr(session_window, "paper_trading", lambda: PreMarket())
+    monkeypatch.setattr(
+        session_window, "window_node", lambda *a, **k: pytest.fail("a node was built")
+    )
+    argv = ["--session", "auto", "--strategy", "EmaCross", "--log-dir", str(tmp_path)]
+    assert session_window.main(argv) == 0
+    said = (
+        "nothing to run: the regular session is closed, and EmaCross runs in regular windows only"
+    )
+    assert said in capsys.readouterr().out
+    assert json.loads((tmp_path / "last-firing.json").read_text())["outcome"].startswith(said)
+    assert not (tmp_path / "latest.json").exists()
+
+
+def test_a_refusal_names_the_sessions_the_table_gives(monkeypatch) -> None:
+    """Review finding: the refusal said "regular windows only" whatever the entry's sessions were."""
+    monkeypatch.setitem(
+        session_window.WINDOW_STRATEGIES,
+        "EmaCross",
+        session_window.WindowStrategy(
+            session_window.WINDOW_STRATEGIES["EmaCross"].strategy_id, ("extended",), "a test"
+        ),
+    )
+    with pytest.raises(
+        ValueError, match="EmaCross runs in extended windows only, not in the regular"
+    ):
+        WindowConfig(strategy="EmaCross")
+
+
+def test_the_ema_cross_window_node_adds_upstreams_builtin_beside_the_cap(
+    monkeypatch, tmp_path
+) -> None:
+    """`window_node` adds `EmaCross` through `add_builtin_strategy` with `paper_node.ema_cross_config`
+    (one share an order, upstream's periods) and the cap beside it; with no managed stop to wait for,
+    the post-stop delay is the node's own. A spy on each module function records that it was called."""
+    calls: list[tuple[str, dict]] = []
+    for name in ("ema_cross_config", "position_cap_config", "alpaca_paper_builder"):
+        real = getattr(session_window, name)
+
+        def spy(*args, _real=real, _name=name, **kwargs):
+            calls.append((_name, kwargs))
+            return _real(*args, **kwargs)
+
+        monkeypatch.setattr(session_window, name, spy)
+    at = datetime(2026, 11, 10, 21, 30, tzinfo=UTC)
+    node, s, cap = session_window.window_node(
+        WindowConfig(strategy="EmaCross", log_dir=tmp_path),
+        wind_down_at=at,
+        log_name="e",
+        feed="iex",
+    )
+    try:
+        assert [n for n, _ in calls] == [
+            "alpaca_paper_builder",
+            "ema_cross_config",
+            "position_cap_config",
+        ]
+        assert calls[0][1]["delay_post_stop_secs"] == session_window.DELAY_POST_STOP_SECS
+        assert calls[0][1]["max_order_submit_rate"] == session_window.EMA_CROSS_SUBMIT_RATE
+        assert cap.max_position == 1 and not node.is_running
+        assert (s.quotes, s.trades, s.live_bars, list(s.dropped)) == (0, 0, 0, [])
+    finally:
+        node.dispose()
+
+
+def test_an_ema_cross_window_refuses_a_feed_its_subscription_cannot_name(tmp_path) -> None:
+    """`EmaCross` subscribes with no params, so it streams the adapter's default feed (IEX): a window
+    whose part names another would trade on data it did not ask for."""
+    with pytest.raises(RuntimeError, match="EmaCross names no feed"):
+        session_window.window_node(
+            WindowConfig(strategy="EmaCross", log_dir=tmp_path),
+            wind_down_at=datetime(2026, 11, 10, 21, 30, tzinfo=UTC),
+            log_name="e",
+            feed="boats",
+        )
+
+
+def ema_quotes(n: int) -> list:
+    """Quotes whose mid swings $2 around $750, slowly enough for `EmaCross` to cross a few times."""
+    out = []
+    for i in range(n):
+        mid = 750 + 2 * math.sin(i / 40.0)
+        ts = T0 + i * 1_000_000_000
+        out.append(
+            QuoteTick(
+                SPY,
+                Price(mid - 0.01, 4),
+                Price(mid + 0.01, 4),
+                Quantity.from_int(100),
+                Quantity.from_int(100),
+                ts,
+                ts,
+            )
+        )
+    return out
+
+
+def test_the_record_reads_a_builtins_orders_and_data_from_the_nodes_cache() -> None:
+    """A built-in runs in Rust and hands the window no Python object: its orders are read from the cache
+    by its own strategy ID, and the quotes and trades that reached it from the cache's counts."""
+    from canon_trading.paper_node import EMA_CROSS
+    from canon_trading.paper_node import EMA_CROSS_ID
+    from canon_trading.paper_node import ema_cross_config
+
+    eng = engine()
+    eng.add_data(ema_quotes(600))
+    eng.add_builtin_strategy(EMA_CROSS, ema_cross_config(SPY))
+    eng.run()
+    try:
+        seen = session_window.CachedData(eng.cache, SPY)
+        report = session_window.WindowReport("regular", "SPY", started="t")
+        session_window._fill(report, eng.cache, EMA_CROSS_ID)
+        assert seen.quotes == 600 and seen.trades == 0
+        assert len(report.orders) >= 2
+        assert session_window._unsettled(eng.cache, EMA_CROSS_ID) == {}
+        # SessionMaCross's ID holds none of them
+        assert session_window._unsettled(eng.cache, session_window.STRATEGY_ID) == {}
+    finally:
+        eng.dispose()
+
+
+def test_a_window_record_names_its_strategy(monkeypatch, tmp_path) -> None:
+    """The record, `running` and the result alike, names the strategy, and `run_window` reads that
+    strategy's orders by its own ID."""
+    _, latest, _ = quiet_window(monkeypatch, tmp_path, quotes=5, trades=0, strategy="EmaCross")
+    assert latest["strategy"] == "EmaCross" and latest["result"] == "ok"
+    _, latest, _ = quiet_window(monkeypatch, tmp_path / "default", quotes=5, trades=0)
+    assert latest["strategy"] == "SessionMaCross"
+
+
+def test_a_refused_window_record_names_its_strategy(monkeypatch, tmp_path) -> None:
+    held = SimpleNamespace(client_order_id="someone-elses")
+    monkeypatch.setattr(session_window, "paper_trading", lambda: Account(orders=[held]))
+    argv = ["--session", "regular", "--strategy", "EmaCross", "--log-dir", str(tmp_path)]
+    assert session_window.main(argv) == 1
+    latest = json.loads((tmp_path / "latest.json").read_text())
+    assert latest["result"].startswith("refused: ") and latest["strategy"] == "EmaCross"
+
+
+def test_the_schedule_and_the_task_pass_strategy_through_and_name_none() -> None:
+    """`--strategy` reaches the window through `paper:session` and the runner, which pass their
+    arguments on; the schedule names none, so its windows stay `SessionMaCross`."""
+    root = Path(__file__).resolve().parents[1]
+    task = tomllib.loads((root / "mise.toml").read_text())["tasks"]["paper:session"]
+    assert '"$@"' in task["run"] and "--strategy" not in task["run"]
+    runner = (root / "home/.claude/canon/paper-session.sh").read_text()
+    assert 'paper:session "$@"' in runner
+    automation = (root / "scripts/automation").read_text()
+    assert "<string>--session</string>" in automation  # the schedule's own arguments, in its plist
+    assert "<string>--strategy</string>" not in automation
+
+
+def test_a_session_ma_cross_window_keeps_the_ceiling_submit_rate(monkeypatch, tmp_path) -> None:
+    seen: list[dict] = []
+    real = session_window.alpaca_paper_builder
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(session_window, "alpaca_paper_builder", spy)
+    node, _, _ = session_window.window_node(
+        WindowConfig(log_dir=tmp_path),
+        wind_down_at=datetime(2026, 11, 10, 21, 30, tzinfo=UTC),
+        log_name="r",
+        feed="iex",
+    )
+    node.dispose()
+    assert seen[0]["max_order_submit_rate"] == MAX_ORDER_SUBMIT_RATE
+
+
+def test_an_ema_cross_window_sends_one_order_and_the_engine_denies_every_later_cross() -> None:
+    """`EmaCross` at the pin reads neither its position nor its working orders, and an order refused
+    still flips its side, so a second order can stack a position: under the window's submit budget,
+    the engine's own rate limit, one order reaches the venue in a window of any length the window
+    allows, and every later cross is denied before it leaves the node (ADR 0037's budget)."""
+    from canon_trading.paper_node import EMA_CROSS
+    from canon_trading.paper_node import EMA_CROSS_ID
+    from canon_trading.paper_node import ema_cross_config
+
+    budget = session_window.EMA_CROSS_SUBMIT_RATE
+    count, span = budget.split("/")
+    hours, minutes, seconds = (int(x) for x in span.split(":"))
+    assert int(count) == 1
+    assert hours * 3600 + minutes * 60 + seconds >= session_window.MAX_MINUTES * 60
+    eng = engine(max_order_submit_rate=budget)
+    eng.add_data(ema_quotes(session_window.MAX_MINUTES * 60))  # a quote a second, an hour
+    eng.add_builtin_strategy(EMA_CROSS, ema_cross_config(SPY))
+    eng.run()
+    try:
+        orders = eng.cache.orders(strategy_id=EMA_CROSS_ID)
+        reasons = [
+            str(e.reason) for o in orders for e in o.events() if type(e).__name__ == "OrderDenied"
+        ]
+        sent = [o for o in orders if "OrderSubmitted" in [type(e).__name__ for e in o.events()]]
+        assert len(orders) >= 4 and len(sent) == 1
+        assert reasons == ["RATE_LIMIT_EXCEEDED"] * (len(orders) - 1)
+    finally:
+        eng.dispose()

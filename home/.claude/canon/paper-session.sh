@@ -22,7 +22,8 @@
 #      hooks off (`-c core.hooksPath=/dev/null`, git-config(1)), no user or system config
 #      (GIT_CONFIG_GLOBAL, GIT_CONFIG_NOSYSTEM, git(1)) and no replace refs (GIT_NO_REPLACE_OBJECTS, git(1)).
 #   2. check that HEAD is that commit and no tracked file differs;
-#   3. run `mise run paper:session <arguments>` there with CANON_COMMIT set to it, so the window's records
+#   3. run `mise run paper:session <arguments>` there (a `--strategy` among them reaches the window; the
+#      schedule gives none, so it runs SessionMaCross) with CANON_COMMIT set to it, so the window's records
 #      name the code that ran (canon_trading.session_window.running_commit). `mise run` trusts the config it
 #      runs ("Commands that run project code ... trust their active config automatically", mise trust docs
 #      at v2026.11.5); scripts/automation uninstall removes that trust with the clone.
