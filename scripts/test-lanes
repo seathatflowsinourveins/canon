@@ -1234,6 +1234,92 @@ psvc=$(sed -n 's/^PAPER_SERVICE="\([^"]*\)".*/\1/p' "$ROOT/scripts/bootstrap")
 check "mise.toml's paper tasks name only bootstrap's keychain service" \
       eval '[ -n "$psvc" ] && [ "$(paper_names | wc -l | tr -d " ")" -ge 5 ] && [ -z "$(paper_names | grep -vxF "$psvc")" ]'
 
+# ---------- paper:check, paper:remove and paper:store's rollback, against a stand-in security ----------
+# Each task's own body from mise.toml, /usr/bin/security swapped for a stand-in that answers each verb and
+# account with the exit status in $KC/<find|delete|add>-<account> (44, Apple's errSecItemNotFound, by default;
+# ADR 0029 observed it for an absent item). No keychain is read or written. Claims of second readers (Codex,
+# Antigravity): any exit but 0 read as an absent item, or as one removed, so a failed check or deletion said
+# nothing was wrong.
+echo "paper keychain tasks:"
+export KC="$TMP/kc"; mkdir -p "$KC"
+cat > "$KC/security" <<'EOF'
+#!/bin/bash
+echo "security $*" >> "$KC/log"
+case "${1:-}" in
+  find-generic-password) v=find ;; delete-generic-password) v=delete ;;
+  -i) v=add; read -r _ _ acct _; cat > /dev/null; echo "security -i: add $acct" >> "$KC/log" ;;
+  *) exit 1 ;;
+esac
+while [ $# -gt 0 ]; do [ "$1" = -a ] && acct="$2"; shift; done
+exit "$(cat "$KC/$v-${acct:-}" 2>/dev/null || echo 44)"
+EOF
+chmod +x "$KC/security"
+kc_task() { # kc_task <task>: run its body with the stand-in security; output in $KC/out
+  local body; body=$(awk -v q="'''" -v hdr="[tasks.\"$1\"]" '$0 == hdr {t=1; next} /^\[/ {t=0} t && $0 == "run = " q {b=1; next} b && $0 == q {exit} b' "$ROOT/mise.toml")
+  body=${body//\/usr\/bin\/security/$KC/security}
+  [[ "$body" == *"$KC/security"* ]] || { echo "no body" > "$KC/out"; return 99; }
+  bash -c "$body" > "$KC/out" 2>&1
+}
+rm -f "$KC"/find-* "$KC"/delete-*; echo 0 > "$KC/find-ALPACA_API_KEY"; echo 36 > "$KC/find-ALPACA_SECRET_KEY"
+kc_task paper:check; rc=$?
+check "paper:check, security failing (exit 36) for one item: an error, not absent, exit 2" \
+      eval '[ "$rc" = 2 ] && grep -q "ALPACA_SECRET_KEY: could not be checked (security exit 36)" "$KC/out" && ! grep -q "ALPACA_SECRET_KEY: absent" "$KC/out"'
+echo 44 > "$KC/find-ALPACA_SECRET_KEY"; kc_task paper:check; rc=$?
+check "... one absent (44): absent, exit 1"       eval '[ "$rc" = 1 ] && grep -q "ALPACA_SECRET_KEY: absent" "$KC/out" && grep -q "ALPACA_API_KEY: in the login keychain" "$KC/out"'
+echo 0 > "$KC/find-ALPACA_SECRET_KEY"; kc_task paper:check; rc=$?
+check "... both there: exit 0"                    test "$rc" = 0
+echo 0 > "$KC/delete-ALPACA_API_KEY"; echo 36 > "$KC/delete-ALPACA_SECRET_KEY"; kc_task paper:remove; rc=$?
+check "paper:remove, a deletion security refuses (exit 36): said, the item kept, exit 1" \
+      eval '[ "$rc" = 1 ] && grep -q "ALPACA_API_KEY: removed" "$KC/out" && grep -q "ALPACA_SECRET_KEY: could not be removed (security exit 36)" "$KC/out" && ! grep -q "was not there" "$KC/out"'
+echo 44 > "$KC/delete-ALPACA_SECRET_KEY"; kc_task paper:remove; rc=$?
+check "... one not there (44): said, exit 0"      eval '[ "$rc" = 0 ] && grep -q "ALPACA_SECRET_KEY: was not there" "$KC/out"'
+# paper:store's rollback: storing fails, and a deletion of what it may have stored is refused; it said both
+# were removed. On a pseudo-terminal (expect), the curl stand-in answering 200, nothing typed but made-up values.
+if [ ! -x /usr/bin/expect ] || ! /usr/bin/expect -c 'spawn -noecho true; expect eof' >/dev/null 2>&1; then
+  skip "paper:store's rollback" "no /usr/bin/expect that can open a pseudo-terminal here"
+else
+  mkdir -p "$KC/bin"; printf '#!/bin/bash\ncat > /dev/null\necho 200\n' > "$KC/bin/curl"; chmod +x "$KC/bin/curl"
+  rm -f "$KC"/find-* "$KC"/delete-*; echo 1 > "$KC/add-ALPACA_API_KEY"; echo 36 > "$KC/delete-ALPACA_SECRET_KEY"
+  sbody=$(awk -v q="'''" '$0 == "[tasks.\"paper:store\"]" {t=1; next} /^\[/ {t=0} t && $0 == "run = " q {b=1; next} b && $0 == q {exit} b' "$ROOT/mise.toml")
+  sbody=${sbody//\/usr\/bin\/security/$KC/security}
+  cat > "$KC/store.exp" <<'EOF'
+set timeout 20
+proc finish {} { lassign [wait] pid sid oserr value; exit $value }
+spawn -noecho bash -c $env(KC_BODY)
+expect {
+  "key ID (hidden): " { send -- "PKMADEUPMADEUP\r" }
+  timeout { puts "\n<<no key prompt>>"; exit 98 }
+  eof { finish }
+}
+expect {
+  "secret key (hidden): " { send -- "madeupmadeupmadeup\r" }
+  timeout { puts "\n<<no secret prompt>>"; exit 98 }
+  eof { finish }
+}
+expect {
+  timeout { puts "\n<<no end>>"; exit 98 }
+  eof { finish }
+}
+EOF
+  kstore() { : > "$KC/log"; PATH="$KC/bin:$PATH" KC_BODY="$sbody" /usr/bin/expect -f "$KC/store.exp" > "$KC/out" 2>&1; }
+  kstore; rc=$?
+  check "paper:store, storing failed and a rollback deletion refused (exit 36): said, not 'nothing kept', exit 1" \
+        eval '[ "$rc" = 1 ] && [[ "$sbody" == *"$KC/security"* ]] && grep -q "could not remove ALPACA_SECRET_KEY (security exit 36)" "$KC/out" && ! grep -q "nothing kept" "$KC/out" && [ "$(grep -c "^security delete-generic-password" "$KC/log")" = 2 ]'
+  # the key stored, the secret refused: the key's deletion refused too, so a stored item is named
+  rm -f "$KC"/add-* "$KC"/delete-*; echo 0 > "$KC/add-ALPACA_API_KEY"; echo 1 > "$KC/add-ALPACA_SECRET_KEY"; echo 36 > "$KC/delete-ALPACA_API_KEY"
+  kstore; rc=$?
+  check "... the key stored and the secret refused, the key's deletion refused: the key named, exit 1" \
+        eval '[ "$rc" = 1 ] && grep -q "security -i: add ALPACA_SECRET_KEY" "$KC/log" && grep -q "could not remove ALPACA_API_KEY (security exit 36)" "$KC/out"'
+  rm -f "$KC"/add-* "$KC"/delete-*; echo 1 > "$KC/add-ALPACA_API_KEY"; kstore; rc=$?
+  check "... every rollback deletion done or not needed (0 or 44): nothing kept, exit 1" \
+        eval '[ "$rc" = 1 ] && grep -q "nothing kept (each item removed or never stored)" "$KC/out"'
+  # a pre-check security cannot answer (a reviewer's finding): read as absent, it went on to a rollback that
+  # deleted the pair already stored; now it stops before any prompt, adding and deleting nothing
+  rm -f "$KC"/add-* "$KC"/delete-*; echo 36 > "$KC/find-ALPACA_API_KEY"; kstore; rc=$?; rm -f "$KC/find-ALPACA_API_KEY"
+  check "paper:store, a pre-check security fails (exit 36): refused before any prompt, nothing added or deleted, exit 1" \
+        eval '[ "$rc" = 1 ] && grep -q "could not check whether ALPACA_API_KEY is in the login keychain (security exit 36)" "$KC/out" && ! grep -Eq "security (-i|delete-generic-password)" "$KC/log" && ! grep -q "hidden" "$KC/out"'
+fi
+
 # ---------- paper:store on a terminal, against the real security ----------
 # The stub above cannot see how Apple's security behaves on a terminal (ADR 0033: with -w last it prompts on
 # the terminal and never reads a pipe). So paper:store's own body, taken from mise.toml with only the
@@ -1321,6 +1407,10 @@ EOF
   fi
   paper_cleanup
   check "throwaway keychain items gone, the probe too" pabsent probe
+  # what paper:remove and paper:store's rollback read as "not there": Apple's security deleting an item that
+  # is absent, under the throwaway service (security documents no exit status)
+  HOME="$REAL_HOME" /usr/bin/security delete-generic-password -s "$tsvc" -a never-stored >/dev/null 2>&1; drc=$?
+  check "security delete-generic-password of an absent item exits 44, as find-generic-password does (got $drc)" test "$drc" = 44
 fi
 
 mkdir -p "$C/canon"; echo "# previous" > "$C/canon/ledger.sh"

@@ -41,10 +41,17 @@ run = '''
 set -euo pipefail
 svc=canon-alpaca-paper
 [ -t 0 ] || { echo "paper:store: needs a terminal to ask for the pair; run it in your own terminal" >&2; exit 1; }
+# Exit statuses: 0 found, 44 absent (errSecItemNotFound, observed; ADR 0029). security documents none, and
+# 44 is that status's low byte, so another error ending in the same byte would read as absent. Any other
+# failure stops the task: read as absent, it went on to an add that failed and a rollback that deleted the
+# pair already stored (a second reader's review).
 for a in ALPACA_API_KEY ALPACA_SECRET_KEY; do
-  if /usr/bin/security find-generic-password -s "$svc" -a "$a" >/dev/null 2>&1; then
-    echo "paper:store: $a is already in the login keychain; run: mise run paper:remove" >&2; exit 1
-  fi
+  rc=0; /usr/bin/security find-generic-password -s "$svc" -a "$a" >/dev/null 2>&1 || rc=$?
+  case "$rc" in
+    44) ;;
+    0) echo "paper:store: $a is already in the login keychain; run: mise run paper:remove" >&2; exit 1 ;;
+    *) echo "paper:store: could not check whether $a is in the login keychain (security exit $rc); nothing stored" >&2; exit 1 ;;
+  esac
 done
 # Echo off before either prompt shows: a silent read turns it off only after its prompt, so a value typed
 # or pasted at once could show (observed with bash 3.2; ADR 0033). It is back on however the task ends.
@@ -78,8 +85,15 @@ if store ALPACA_API_KEY "$key" && store ALPACA_SECRET_KEY "$secret" \
    && same ALPACA_API_KEY "$key" && same ALPACA_SECRET_KEY "$secret"; then
   echo "paper:store: Alpaca's paper API accepted the pair; stored ALPACA_API_KEY and ALPACA_SECRET_KEY in the login keychain (service $svc)"
 else
-  for a in ALPACA_API_KEY ALPACA_SECRET_KEY; do /usr/bin/security delete-generic-password -s "$svc" -a "$a" >/dev/null 2>&1 || true; done
-  echo "paper:store: storing failed or read back differently; both items removed, nothing kept" >&2
+  # 44 (absent, as above) is an item that was not stored; any other failure leaves one that may be (a second
+  # reader's claim: it said both were removed whatever the deletions answered)
+  left=""
+  for a in ALPACA_API_KEY ALPACA_SECRET_KEY; do
+    rc=0; /usr/bin/security delete-generic-password -s "$svc" -a "$a" >/dev/null 2>&1 || rc=$?
+    [ "$rc" = 0 ] || [ "$rc" = 44 ] || left="$left, could not remove $a (security exit $rc)"
+  done
+  if [ -n "$left" ]; then echo "paper:store: storing failed or read back differently${left}; run: mise run paper:remove" >&2
+  else echo "paper:store: storing failed or read back differently; nothing kept (each item removed or never stored)" >&2; fi
   exit 1
 fi
 '''
@@ -88,10 +102,14 @@ fi
 description = "Say whether both paper keychain items exist, without reading either value"
 shell = "bash -c"
 run = '''
+# exit 0 when both are there, 1 when one is absent (44, as paper:store reads it), 2 when security failed
+# otherwise, which says nothing about whether the item is there (a locked keychain, a refused access)
 missing=0
 for a in ALPACA_API_KEY ALPACA_SECRET_KEY; do
-  if /usr/bin/security find-generic-password -s canon-alpaca-paper -a "$a" >/dev/null 2>&1; then echo "$a: in the login keychain"
-  else echo "$a: absent"; missing=1; fi
+  rc=0; /usr/bin/security find-generic-password -s canon-alpaca-paper -a "$a" >/dev/null 2>&1 || rc=$?
+  if [ "$rc" = 0 ]; then echo "$a: in the login keychain"
+  elif [ "$rc" = 44 ]; then echo "$a: absent"; [ "$missing" = 2 ] || missing=1
+  else echo "$a: could not be checked (security exit $rc)"; missing=2; fi
 done
 exit "$missing"
 '''
@@ -100,10 +118,16 @@ exit "$missing"
 description = "Delete both paper keychain items"
 shell = "bash -c"
 run = '''
+# 44 is an absent item (as paper:store reads it; scripts/test-lanes observes it for a deletion too); any other
+# failure leaves the item where it was, and the task fails
+failed=0
 for a in ALPACA_API_KEY ALPACA_SECRET_KEY; do
-  if /usr/bin/security delete-generic-password -s canon-alpaca-paper -a "$a" >/dev/null 2>&1; then echo "$a: removed"
-  else echo "$a: was not there"; fi
+  rc=0; /usr/bin/security delete-generic-password -s canon-alpaca-paper -a "$a" >/dev/null 2>&1 || rc=$?
+  if [ "$rc" = 0 ]; then echo "$a: removed"
+  elif [ "$rc" = 44 ]; then echo "$a: was not there"
+  else echo "$a: could not be removed (security exit $rc)"; failed=1; fi
 done
+exit "$failed"
 '''
 
 # The paper lock's owner has a deadline (both paper tasks). The task opens the lock file on descriptor 9 and
