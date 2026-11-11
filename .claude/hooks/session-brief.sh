@@ -2,7 +2,8 @@
 # Claude Code SessionStart hook.
 # Contract: https://code.claude.com/docs/en/hooks.md
 #   plain stdout on SessionStart is added to Claude's context (capped at 10,000 characters).
-# Prints a few short lines: the pins, ADRs past review-by or proposed, the landscape watch, and a toolchain
+# Prints a few short lines: the pins, a static line of a coordinator's cold-start reads (ADR 0078),
+# ADRs past review-by or proposed, the landscape watch, and a toolchain
 # line only when it has something to say. Offline: reads files in this repo and asks mise for one path,
 # bounded at 3 seconds so the hook's 10 s (.claude/settings.json) is never spent there.
 # Pins, ADRs and the landscape watch result are all read from the tree the session is working in (a
@@ -24,6 +25,8 @@ fi
 pins=$(jq '.pins | length' "$lock")
 at=$(jq -r '.resolved_at[0:10]' "$lock")
 echo "canon: $pins upstreams pinned, last resolved $at. Decisions: docs/adr/."
+# Static text (ADR 0078 items 4 and 5): a coordinator starting cold reads these; the hook runs none of them.
+echo "Coordinators only (a worker or reviewer runs none of this), starting cold: orca orchestration run-list, then run-use --id <run>, task-list --ready, gate-list, worker-list; then git log on main; then scripts/automation status."
 
 expired=""; proposed=""
 for f in "$root"/docs/adr/[0-9][0-9][0-9][0-9]-*.md; do

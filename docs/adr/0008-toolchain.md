@@ -33,10 +33,10 @@ Chosen: **option 3**.
 | Tool | Source | Version held by |
 |---|---|---|
 | git, clang, make | Xcode Command Line Tools (`xcode-select --install`) | Apple |
-| mise | `https://mise.run` installer, into `~/.local/bin`, no sudo | `MISE_VERSION=v2026.11.5` in `scripts/bootstrap` |
+| mise | `https://mise.run` installer, into `~/.local/bin`, no sudo | `MISE_VERSION=v2026.11.6` in `scripts/bootstrap` |
 | Python 3.14, uv 0.13.7, Node, gh | mise | `mise.toml` plus `mise.lock` (versions, URLs, checksums) |
 | Claude Code CLI | `https://claude.ai/install.sh`, into `~/.local/bin` | `stable` channel (`latest` from 2026-11-10, ADR 0065) |
-| ccusage | run on demand with `npx ccusage@20.0.48` | version in the command |
+| ccusage | run on demand with `npx ccusage@20.0.49` | version in the command |
 
 Notes:
 
@@ -107,3 +107,9 @@ Read 2026-11-09 (fetched unless noted).
 * https://github.com/cli/cli/releases/tag/v2.103.3 — gh 2.103.3 (fetched 2026-11-10; resolved to
   `63837fb778d6`; second reader). These three were registered that day, and `scripts/canon lint` now fails
   when `mise.toml` installs a tool that no registry entry names.
+* mise pin moved 2026-11-11 to `tag:v2026.11.6` → `9d5aec80ebfb` (resolved), in `MISE_VERSION` and the CI
+  workflow's mise-action input. https://github.com/jdx/mise/releases/tag/v2026.11.6 — published 2026-11-10,
+  the newest published release (tag `v2026.11.7` has no release); adds `mise run --multi` and unprefixed
+  `[bootstrap.packages]` keys, makes `base16` the default prompt theme, and fixes task `usage` loading,
+  `mise env --dotenv` quoting and install wrappers; nothing in it touches a key `mise.toml` uses (`gh`).
+  ccusage moved to 20.0.49 the same day (ADR 0007).

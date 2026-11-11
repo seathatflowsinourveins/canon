@@ -100,9 +100,9 @@ Only the coordinator starts workers. `runs` is the number of runs per worker per
 2. Start one worker with that tree as its workspace and `brief.md`'s text as its whole task, with the
    case's `paths`, `statement` and `fail_to_pass` and the report path
    (`<folder>/<run id>/report.md`) filled in, and nothing else. The task never names the case.
-   The tree is not a worktree of this repository and must not become one. How the cockpit starts a
-   worker in a folder of its own is UNVERIFIED; if it can only start one in a worktree, the trial does
-   not run until that is solved, since a worktree carries the fix in its history.
+   The tree is not a worktree of this repository and must not become one, since a worktree carries
+   the fix in its history. In the first trial each worker ran in its tree as a folder of its own, and
+   each tree still had one commit and no remote when it finished (`runs/2026-11-10-first/scores.md`).
 3. When the worker reports, or after a time limit the run's sheet states, grade what is in the tree:
    `harness.py grade <case id> <folder>/<run id>/tree <folder>/<run id>/grade`. The grader makes the
    starting tree again and runs the suite on it, takes the worker's files as a patch, puts back every

@@ -9,7 +9,7 @@ lockfile = true
 [tools]
 python = "3.14"   # the pinned NautilusTrader release ships wheels for 3.13 and 3.14 only
 uv = "0.13.7"     # canon/upstreams.json: uv
-node = "24"       # runtime for `npx ccusage@20.0.48`
+node = "24"       # runtime for `npx ccusage@20.0.49`
 gh = "latest"     # GitHub CLI; the exact version is fixed in mise.lock at first install
 
 # Quality tools that are not Python packages (docs/adr/0013-quality-gates.md). ruff and ty are Python

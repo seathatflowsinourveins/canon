@@ -9,7 +9,7 @@ model: haiku
 
 1. Run `scripts/lanes`. If it says the ledger is empty, the machine-level hooks are not installed; say so
    and point to `scripts/bootstrap --user-config`. Do not guess at session state.
-2. If `npx` is available, run `npx ccusage@20.0.48 daily` for token and cost totals. If it is not, say the
+2. If `npx` is available, run `npx ccusage@20.0.49 daily` for token and cost totals. If it is not, say the
    spend history was not checked.
 3. Reply in under 15 lines:
    * flagged sessions first, one line each: lane, flag, the number behind it;

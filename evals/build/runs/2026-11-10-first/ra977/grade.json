@@ -1,0 +1,49 @@
+{
+  "case": "ledger-remaining-defects",
+  "changed": [
+    ".gitignore",
+    "docs/adr/0035-trial-ledger-in-an-optuna-study.md",
+    "docs/architecture.md",
+    "docs/roadmap.md",
+    "src/canon_trading/backtest.py",
+    "src/canon_trading/ledger.py",
+    "src/canon_trading/ranking.py",
+    "src/canon_trading/returns_matrix.py",
+    "tests/test_returns_matrix_finite.py"
+  ],
+  "flags": [],
+  "restored": [],
+  "resolved": true,
+  "fail_to_pass": {
+    "tests/test_backtest.py::test_a_run_config_run_without_a_strategy_is_refused": [
+      "passed"
+    ],
+    "tests/test_ledger.py::test_the_ledger_folder_is_ignored_only_at_the_root": [
+      "passed"
+    ],
+    "tests/test_ledger.py::test_the_value_told_is_none_for_a_series_the_gate_rejects": [
+      "passed"
+    ],
+    "tests/test_ledger.py::test_two_processes_creating_one_new_ledger_both_succeed": [
+      "passed"
+    ],
+    "tests/test_ranking.py::test_the_recorded_range_is_utc_whatever_the_zone": [
+      "passed"
+    ],
+    "tests/test_returns_matrix.py::test_a_return_that_is_not_finite_is_refused_when_called_directly": [
+      "passed"
+    ]
+  },
+  "failed": [],
+  "lost": [],
+  "checks": {
+    "ruff lint": true,
+    "ruff format": true,
+    "ty type check": true
+  },
+  "tests": {
+    "passed": 456,
+    "failed": 0,
+    "skipped": 21
+  }
+}

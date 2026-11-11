@@ -1,0 +1,39 @@
+{
+  "case": "cancel-again-and-unholdable-id",
+  "changed": [
+    "docs/adr/0036-alpaca-adapter-order-management.md",
+    "docs/adr/0042-alpaca-adapter-modify.md",
+    "packages/canon-alpaca/README.md",
+    "packages/canon-alpaca/src/canon_alpaca/execution.py",
+    "packages/canon-alpaca/tests/test_execution_unholdable_and_cancel_all.py"
+  ],
+  "flags": [],
+  "restored": [],
+  "resolved": true,
+  "fail_to_pass": {
+    "packages/canon-alpaca/tests/test_execution_client.py::test_cancel_all_cancels_again_an_order_whose_cancel_had_no_answer": [
+      "passed"
+    ],
+    "packages/canon-alpaca/tests/test_execution_client.py::test_closed_order_with_a_client_id_nautilus_cannot_hold_is_skipped": [
+      "passed"
+    ],
+    "packages/canon-alpaca/tests/test_execution_client.py::test_open_order_with_a_client_id_nautilus_cannot_hold_fails_startup_by_name": [
+      "passed"
+    ],
+    "packages/canon-alpaca/tests/test_execution_client.py::test_replacement_of_an_order_with_an_unholdable_id_is_reported_under_its_own": [
+      "passed"
+    ]
+  },
+  "failed": [],
+  "lost": [],
+  "checks": {
+    "ruff lint": true,
+    "ruff format": true,
+    "ty type check": true
+  },
+  "tests": {
+    "passed": 506,
+    "failed": 0,
+    "skipped": 24
+  }
+}

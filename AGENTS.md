@@ -9,7 +9,8 @@ dependency, pattern and practice traces to a pinned upstream or a dated source. 
 1. **Evidence over memory.** Your training data is older than this repo's pins. Before using an upstream API,
    config key, model name or CLI flag, read the pinned source or its current docs. Docs for agents:
    `https://nautilustrader.io/docs/llms.txt`, `https://docs.alpaca.markets/llms.txt`,
-   `https://code.claude.com/docs/llms.txt`.
+   `https://code.claude.com/docs/llms.txt`. `scripts/canon src <id>` is the way to read an upstream's source at
+   its pin: it fetches the locked commit into a read-only folder and prints the path.
 2. **Adopt through the canon.** Anything not already in `canon/upstreams.json` (library, tool, skill, plugin,
    practice) goes through the `adopt-upstream` skill before it is installed, imported, enabled or copied.
 3. **Glue yes, invention no.** Code here calls an upstream API as documented or implements a contract an
@@ -44,6 +45,7 @@ dependency, pattern and practice traces to a pinned upstream or a dated source. 
 | `scripts/canon lint` | Check registry, lock and ADRs for required evidence (offline) |
 | `scripts/ci` | Run every check: registry, shell, self-tests and `scripts/test-*`, lockfile, ruff, ty, pytest, workflow, secrets |
 | `scripts/land` | Land the current branch on `main` once every check passes; no manual merge step. `--pr <n>` lands a pull request the dependency bot opened |
+| `scripts/canon src [id]` | Fetch one pin's repository (every git pin without an id) at its locked commit into `~/.cache/canon/upstream-src/<id>@<commit>`, read-only, and print the path; a folder already there is checked against the lock |
 | `scripts/canon check` | Compare pins with live upstream; exit 3 if a pinned release tag was re-pointed, 4 if the lock is stale against the registry |
 | `scripts/canon outdated` | Show upstreams that have a newer release tag than the one pinned |
 | `scripts/canon resolve <id>` | Resolve one pin and merge it into the lock; without an id, re-resolve all (ask first) |

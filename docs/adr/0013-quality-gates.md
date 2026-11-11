@@ -37,7 +37,7 @@ add a second pinning mechanism. Option 1 is where the upstreams converge and is 
 | Each tracked executable `scripts/test-*`: hook registration (21 cases), the checks themselves (56), landing and the address check (66), watchdog, automation and bootstrap (62), the registry script and its hooks (157) | `test-hooks`, `test-ci`, `test-land`, `test-lanes`, `test-canon` | this repo |
 | Lockfile current | `uv lock --check` | uv 0.13.7 |
 | Python lint and format | ruff 0.17.4 | `uv.lock` |
-| Python types | ty 0.0.100 | `uv.lock` |
+| Python types | ty 0.0.101 | `uv.lock` |
 | Tests | pytest 9.2.0 | `uv.lock` |
 | Workflow files | actionlint 1.7.12 | `mise.lock` |
 | Secrets, in history and working tree | gitleaks 8.30.1 | `mise.lock` |
@@ -112,3 +112,8 @@ Read 2026-11-09 (fetched by a research lane unless noted; fetches are model-summ
   rule 1, the run time (three runs of `scripts/ci` on macOS) and Confirmation.
 * Licences read from each repo's licence file at the pinned tag (by the orchestrator): MIT for ruff, ty,
   gitleaks, actionlint, checkout and mise-action; GPL for shellcheck, which is run as a tool, not linked.
+* ty pin moved 2026-11-11 to 0.0.101 (`tag:0.0.101` → `ac02f737a976`, resolved; `uv add --dev
+  ty==0.0.101`). https://github.com/astral-sh/ty/releases/tag/0.0.101 — released 2026-11-11: bug fixes
+  (recursive named tuple unions, nested partials, Pydantic strictness through PEP 695 aliases, tuple
+  callbacks, exception checkpoints), an LSP watcher fallback, and `Field[..]` narrowing; no new rule and
+  nothing breaking (`gh`). `scripts/ci` passed with it, ty check included (run 2026-11-11).

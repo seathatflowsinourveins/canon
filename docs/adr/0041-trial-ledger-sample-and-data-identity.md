@@ -78,7 +78,9 @@ Local, no upstream. The ranking's own glue, where the upstreams read say nothing
 
 * A tie at the top: keys within `math.isclose` of the best Sharpe ratio with equal returns day by day
   are one pick; tied keys with other returns stop. The paper's pick is "the" highest; skfolio takes
-  one series and says nothing of ties.
+  one series and says nothing of ties. Since 2026-11-11 the keys tied are those whose ratios are
+  within the rounding of their own computation of the highest, and their returns are compared
+  exactly: ADR 0031's addition of that date, term 3, which replaces `math.isclose` here.
 * The DSR at N̂ is withheld when its benchmark is below 0. skfolio 1.12.8's
   `expected_max_sharpe_ratio` returns a negative benchmark for 1 < N̂ < about 1.28 without comment;
   the expected maximum of N̂ ≥ 1 trials of mean 0 is not below 0.
@@ -174,6 +176,19 @@ Who decided. The orchestrator chose option 2 and its terms under the owner's del
   last session day may lack that day; it now stops the ranking, and moving the sample to one that
   ends on its last bar's day and running every configuration again is the remedy, as for any
   record not in the writer's shape.
+* The gate's seventh outside round, 2026-11-11, tests that failed before their fix
+  (`tests/test_returns_matrix.py`, `tests/test_ranking.py`): the numeric check now reads the session
+  days alone, after the closed days are dropped, where the zeros of closed days hid session-day
+  moments that underflow or overflow (`test_closed_day_zeros_do_not_hide_moments_that_underflow`,
+  `test_closed_day_zeros_do_not_hide_moments_that_overflow`); and returns in the top group are
+  compared exactly, where two series that differ within 1e-9 of their largest return were one pick
+  and the result followed the order of recording
+  (`test_a_tie_between_other_returns_stops_whatever_the_recording_order`). ADR 0031's addition of
+  that date holds the terms. The step 7 study (ADR 0052), ranked again on its stored records and on
+  a fresh recording: N = 8, T = 1,366, the same pick, DSR 0.9338299302788473, rejected. V differs
+  from the 2026-11-10 run in the last bit, by key order, with the DSR and verdict identical:
+  0.00011297439028764905 summed in recording order on 2026-11-10, 0.00011297439028764906 in key
+  order. From this change on the key-order figures are the ones a later run is held to. Run.
 
 ## Evidence
 

@@ -7,15 +7,19 @@ is Tuesday 2025-03-11 at 00:00 UTC.
 
 from __future__ import annotations
 
+import math
+import statistics
 from datetime import date
 
 import pandas as pd
 import pytest
+from skfolio import Portfolio
 
 from canon_trading.ledger import DAY_NS
 from canon_trading.returns_matrix import ReturnsRejected
 from canon_trading.returns_matrix import daily_series
 from canon_trading.returns_matrix import returns_matrix
+from canon_trading.returns_matrix import session_returns
 
 DAY_0 = 1_741_651_200 * 1_000_000_000  # 2025-03-11T00:00:00Z
 
@@ -127,9 +131,11 @@ def test_series_on_the_same_days_make_the_matrix() -> None:
 
 def test_calendars_that_differ_inside_the_range_are_refused() -> None:
     """Trial b had no bar on day 3, so its row is gone there while trial a has one."""
-    first = daily_series("a", entry({n: 0.01 for n in range(6)}), sessions(*range(6)))
+    first = daily_series("a", entry({n: 0.01 * (n + 1) for n in range(6)}), sessions(*range(6)))
     second = daily_series(
-        "b", entry({n: 0.0 if n == 3 else 0.02 for n in range(6)}), sessions(0, 1, 2, 4, 5)
+        "b",
+        entry({n: 0.0 if n == 3 else 0.02 * (n + 1) for n in range(6)}),
+        sessions(0, 1, 2, 4, 5),
     )
 
     with pytest.raises(
@@ -213,10 +219,11 @@ def test_a_return_that_is_not_a_finite_float_is_refused(value: object, message: 
 
 def test_returns_whose_squares_overflow_are_refused() -> None:
     """Antigravity, gate round 4: each return finite, about 1e155, their squares past float64's
-    largest, so skfolio's Sharpe ratio of them read 0.0 rather than failing."""
+    largest, so skfolio's Sharpe ratio of them read 0.0 rather than failing. The check names the
+    variance skfolio takes of them (round 7's one check), where it summed their squares itself."""
     returns = entry({0: 1e155, 1: -2e155, 2: 3e155})
 
-    with pytest.raises(ReturnsRejected, match="a: the sum of the squares of its returns is inf"):
+    with pytest.raises(ReturnsRejected, match="a: [^\n]*skfolio's variance is inf"):
         daily_series("a", returns, sessions(0, 1, 2))
 
 
@@ -245,3 +252,128 @@ def test_returns_whose_moments_underflow_are_refused() -> None:
 
     with pytest.raises(ReturnsRejected, match=r"a: .* below float64's smallest normal"):
         daily_series("a", returns, sessions(*range(30)))
+
+
+# The gate's seventh outside round, 2026-11-11: one numeric check of the session-day series every
+# gate calculation uses (ADR 0031). Each test below failed before that check.
+
+# Monday 2025-03-10 is day -1: forty UTC days from it hold thirty weekday sessions and five weekends.
+WEEKDAYS = [n for n in range(-1, 39) if (n + 1) % 7 < 5]
+SWINGS = [1.0, -1.0] * 14 + [2.0, -2.0]
+
+
+def over_weekends(open_day_returns: list[float]) -> dict[str, float]:
+    """`open_day_returns` on the thirty weekdays, and 0.0 on each closed day between them."""
+    by_day = dict(zip(WEEKDAYS, open_day_returns, strict=True))
+    return entry({n: by_day.get(n, 0.0) for n in range(-1, 39)})
+
+
+def test_closed_day_zeros_do_not_hide_moments_that_underflow() -> None:
+    """Antigravity, gate round 7: the moments were taken over every UTC day, closed days' zeros
+    included, and the gate computes on session days only. Returns of 4.0e-77, 1.6e-81 apart, kept
+    the checked moments normal through the weekend zeros, while the session-day kurtosis rounded
+    from 1.39 to 1.0 and a pick rejected at its own scale passed."""
+    returns = over_weekends([4.0e-77 + x * 1.6e-81 for x in SWINGS])
+
+    with pytest.raises(ReturnsRejected, match=r"a: .* below float64's smallest normal"):
+        daily_series("a", returns, sessions(*WEEKDAYS))
+
+
+def test_closed_day_zeros_do_not_hide_moments_that_overflow() -> None:
+    """Antigravity, gate round 7: weekend zeros pulled the mean toward 0 and kept the checked fourth
+    central moment finite, while that of the session days alone is past float64's largest."""
+    returns = over_weekends([6.0e76] * 29 + [-6.0e76])
+
+    with pytest.raises(ReturnsRejected, match=r"a: [^\n]*fourth central moment is inf"):
+        daily_series("a", returns, sessions(*WEEKDAYS))
+
+
+@pytest.mark.parametrize("constant", [-0.01, 0.01, -0.07, 0.1, 0.3])
+def test_a_constant_series_is_refused_whatever_its_mean_rounds_to(constant: float) -> None:
+    """Antigravity, gate round 7: thirty returns of -0.01 have a mean one rounding step from -0.01,
+    so skfolio's standard deviation of them is 1.8e-18, not 0, and their Sharpe ratio a finite
+    -5.67e15 (-0.07 happens to round to itself, and gave -inf). A series with no spread at its own
+    size is refused by name, by one measure, whichever way its mean rounds."""
+    returns = entry(dict.fromkeys(range(30), constant))
+
+    with pytest.raises(ReturnsRejected, match="a: its returns do not vary beyond rounding"):
+        daily_series("a", returns, sessions(*range(30)))
+
+
+@pytest.mark.parametrize("constant", [1e200, -1e200, 3e250])
+def test_a_constant_series_too_large_to_square_is_refused_as_one_that_does_not_vary(
+    constant: float,
+) -> None:
+    """Second code review of the round-7 change: thirty returns of 1e200 are a constant series,
+    but the square of what rounding their mean left overflows, so skfolio's variance is inf and
+    the refusal named that, not the constancy. Equal returns are refused as not varying before
+    any statistic of them is read."""
+    returns = entry(dict.fromkeys(range(30), constant))
+
+    with pytest.raises(ReturnsRejected, match="a: its returns do not vary") as rejected:
+        session_returns("a", returns, sessions(*range(30)))
+
+    assert rejected.value.no_spread and "inf" not in str(rejected.value)
+
+
+def test_a_series_of_zeros_is_refused_as_one_that_does_not_vary() -> None:
+    """A strategy that never moved its balance: every return 0.0, the exact case of the same
+    measure (float64's spacing at 0 is its smallest subnormal, and no spread is no more than it)."""
+    returns = entry(dict.fromkeys(range(30), 0.0))
+
+    with pytest.raises(ReturnsRejected, match="a: its returns do not vary beyond rounding"):
+        daily_series("a", returns, sessions(*range(30)))
+
+
+@pytest.mark.parametrize(("low", "high"), [(1e-170, 2e-170), (1e-160, 3e-160), (1e-90, 3e-90)])
+def test_returns_that_vary_and_underflow_are_refused_as_underflow(low: float, high: float) -> None:
+    """Code review of the round-7 change: returns that differ by a factor of two or three, small
+    enough that their squares underflow, were refused for the wrong reason: at 1e-170 as not
+    varying, their standard deviation having underflowed to 0.0, and at 1e-160 and 1e-90 as a
+    kurtosis that is NaN. The cause is the underflow, and the refusal names it."""
+    returns = entry({n: high if n % 2 else low for n in range(30)})
+
+    with pytest.raises(ReturnsRejected) as rejected:
+        session_returns("a", returns, sessions(*range(30)))
+
+    message = str(rejected.value)
+    assert "underflow" in message and "below float64's smallest normal" in message
+    assert "do not vary" not in message and "nan" not in message
+
+
+def test_one_session_day_gives_no_series() -> None:
+    with pytest.raises(ReturnsRejected, match="a: has 1 session day"):
+        daily_series("a", entry({0: 0.01}), sessions(0))
+
+
+def test_a_series_just_above_the_threshold_is_accepted_with_the_sharpe_ratio_it_has() -> None:
+    """The limit of the measure (ADR 0031): returns of 1.0 and 1.0 + 128 steps of float64's spacing
+    there have a standard deviation of 65 steps, above the 60 that twice thirty returns' rounding
+    allows, so the series is accepted, and its Sharpe ratio is the 6.9e13 its returns give. With 96
+    steps the deviation is 49, and the series is refused."""
+    step = math.ulp(1.0)
+    above = entry({n: 1.0 + 128 * step * (n % 2) for n in range(30)})
+    below = entry({n: 1.0 + 96 * step * (n % 2) for n in range(30)})
+
+    accepted = session_returns("a", above, sessions(*range(30)))
+
+    assert accepted.sharpe == pytest.approx((1.0 + 64 * step) / (64 * step * math.sqrt(30 / 29)))
+    assert accepted.sharpe > 6.9e13
+    assert list(accepted.series) == list(above.values())
+    with pytest.raises(ReturnsRejected, match="a: its returns do not vary beyond rounding"):
+        session_returns("a", below, sessions(*range(30)))
+
+
+def test_the_series_comes_with_skfolio_s_sharpe_ratio_of_it() -> None:
+    """The gate reads each trial's Sharpe ratio from the check's result: skfolio's own, of the
+    session days alone, and how far a second computation of it could differ."""
+    values = [0.001 * (n + 1) * (-1) ** n for n in range(9)]
+    returns = entry({n: 0.0 if n in (5, 6) else values[n] for n in range(9)})
+
+    checked = session_returns("a", returns, sessions(0, 1, 2, 3, 4, 7, 8))
+
+    kept = [values[n] for n in (0, 1, 2, 3, 4, 7, 8)]
+    assert list(checked.series) == kept
+    assert checked.sharpe == float(Portfolio(X=[[v] for v in kept], weights=[1.0]).sharpe_ratio)
+    assert checked.sharpe == pytest.approx(statistics.fmean(kept) / statistics.stdev(kept))
+    assert 0 < checked.rounding < 1e-12

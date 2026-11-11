@@ -23,7 +23,7 @@ Follows upstream's adapter template, `examples/live/_template/` at the pinned Na
 |---|---|---|
 | `constants.py` | Venue identity (`ALPACA`), credential variable names, feed, price increment, each with its source | Built |
 | `providers.py` | `AlpacaInstrumentProvider`: US equities from Alpaca's `/v2/assets` as `Equity` instruments | Built |
-| `data.py` | `AlpacaDataClient` (`MarketDataClient`): `_request_bars`, `_request_quotes`, `_subscribe_quotes`, `_subscribe_trades` and their unsubscribes | Built |
+| `data.py` | `AlpacaDataClient` (`MarketDataClient`): `_request_bars`, `_request_quotes`, `_subscribe_quotes`, `_subscribe_trades` and their unsubscribes; `AlpacaDataClientConfig`, the stream's silence bounds | Built |
 | `factories.py` | `AlpacaDataClientFactory`, `AlpacaExecutionClientFactory` | Built |
 | `execution.py` | `AlpacaExecutionClient` (`ExecutionClient`): account state on connect, `_submit_order`, `_modify_order`, `_cancel_order` and `_cancel_all_orders` for market, limit, stop and stop-limit orders, trade updates as order events and fills, order and position status reports; `AlpacaExecutionClientConfig`, which refuses anything but paper trading | Built (first slice) |
 
@@ -45,6 +45,12 @@ data_clients = {
 }
 data_factories = {"ALPACA": AlpacaDataClientFactory}
 ```
+
+A plain `DataClientConfig` gives the stream its default silence bounds. `AlpacaDataClientConfig`, from
+`canon_alpaca.data`, takes the same fields and sets them: `stream_data_timeout_secs` (900 s), after which
+alpaca-py reconnects a connection that has sent no quote or trade, and `stream_mute_limit_secs` (3,600 s),
+after which the client stops a stream still silent and says so; `None` turns either off, and any other
+keyword is refused (Known limits, "Mute stream").
 
 A subscription or bars request names its Alpaca feed in its params, and gets IEX when it names none
 ([ADR 0055](../../docs/adr/0055-alpaca-data-feed-named-in-params.md)):
@@ -104,9 +110,9 @@ From upstream's Python adapter guide (`developer_guide/python_adapters`):
 * Provide `DataClientFactory` and `ExecutionClientFactory` subclasses. `create(*, name, config, cache, clock)`
   returns the client synchronously; execution factories also receive `trader_id`.
 * Name classes `Alpaca<Role>`: `AlpacaDataClient`, `AlpacaDataClientConfig`, `AlpacaDataClientFactory`, and
-  the same for execution. No `Live` prefix. The data client has no adapter config fields, so it uses a plain
-  `DataClientConfig` and there is no `AlpacaDataClientConfig` yet. `AlpacaExecutionClientConfig` has none
-  either; it exists to refuse what is not paper trading.
+  the same for execution. No `Live` prefix. `AlpacaDataClientConfig` has two adapter fields, the stream's
+  silence bounds (Known limits, "Mute stream"); a plain `DataClientConfig` gets their defaults.
+  `AlpacaExecutionClientConfig` has none; it exists to refuse what is not paper trading.
 * Execution clients take `trader_id`, `venue`, `account_id`, `account_type` and `oms_type` at
   construction, implement the four reconciliation hooks, and emit events through `generate_*`. Here the
   account is `ALPACA-PAPER`, a `CASH` account with `NETTING` positions.
@@ -236,16 +242,54 @@ Each is stated where it is implemented, with its source.
   symbol it holds, with its own handler, after which alpaca-py sends every map whole and Alpaca answers
   with the full list it holds. That covers a start whose subscriptions deliver something; it does not
   cover a start where everything sent stays quiet (the lost one is sent with the next subscribe, or not
-  at all), nor a reconnect alpaca-py makes by itself, which the client cannot see, nor an unsubscribe
-  made in the same window, which alpaca-py does not send either and a subscribe does not undo.
+  at all), nor an unsubscribe made in the same window, which alpaca-py does not send either and a
+  subscribe does not undo. A reconnect alpaca-py makes by itself opens the same window, and alpaca-py
+  logs a warning before it (after `data_timeout`, a websocket error or a failed connect), so the client
+  treats a subscribe made after that warning and before the next message the same way.
+* **Mute stream:** a connection that is up but sends nothing is closed and made again by alpaca-py's
+  own `data_timeout` (`StockDataStream(data_timeout=...)`, seconds, `None` by default, which disables it).
+  At the pin (`alpaca/data/live/websocket.py`, alpaca-py `c42add7c0a70`): only market data resets the
+  clock, not subscription acknowledgements or errors (lines 52-76, 287-299); on expiry `_consume` logs
+  "no data received on data stream for N s, reconnecting", closes the socket and returns (272-281); and
+  `_drive_run` waits a backoff that starts at 0.5 to 1 s and doubles to 30 s while no data comes
+  (525-535, 120-121, `alpaca/common/utils.py` 47-76), connects and authenticates again and sends every
+  handler map whole (519-524, 412-424), so every subscription the client holds is sent again. The client
+  sets it from `AlpacaDataClientConfig.stream_data_timeout_secs`, 900 s by default: above the longest
+  silence seen on a feed that then delivered (513 s: `iex` subscribed to QQQ alone in pre-market,
+  2026-11-11, one trade and no quote in 600 s), while the parts a window runs in are far busier (SPY on
+  `iex` in the regular session, hundreds of quotes a minute; on `boats` overnight, 1,552 to 3,700 quotes
+  a window, ADR 0044). On a feed that sends nothing for hours (`iex` before about 08:00, a part ADR 0044
+  skips), it reconnects every 15 minutes with nothing to lose. A reconnect is relayed as a warning naming
+  the feed, so a quiet feed fails nothing. alpaca-py reconnects without end, so the client also counts the
+  silence itself: once no quote or trade has arrived for `stream_mute_limit_secs` (3,600 s by default,
+  longer than the data timeout, which the config enforces) while it holds a subscription, it stops the
+  stream, logs an error that begins "Alpaca stream on feed <feed> went mute", which a session window
+  reads as its stream's error, and refuses later subscriptions, naming why, until it reconnects: the
+  pattern of an ended stream (No restart) and of upstream's Databento feed handler, which gives up
+  reconnecting after `reconnect_timeout_mins` with an error. Silence while nothing is subscribed is not
+  counted. A node spanning a part no feed serves (pre-market and after-hours) sets the limit longer than
+  that part, or `None`; the limit outlasts every window this repository runs (an hour at most), where
+  the window's own no-data check speaks first, so it matters to longer nodes. With nothing subscribed, a
+  running stream is still made again after each `data_timeout`, with a warning each time. A stream given
+  to the constructor keeps its own `data_timeout`. UNVERIFIED: how
+  long a healthy feed can stay silent beyond the one 10-minute sample; a mute connection on a live stream
+  (forced offline only, on alpaca-py's real stream over an in-memory socket).
 * **A stream that never connects:** alpaca-py retries a refused connection without end (406 "connection
   limit exceeded", for one, as when an abandoned stream still holds the connection). The subscription
   has returned; the node logs alpaca-py's retry warnings, naming the feed and thread, and no data
-  arrives. alpaca-py keeps its connection state private, so the client sets no bound of its own.
+  arrives. alpaca-py keeps its connection state private; the mute limit, which counts from the stream's
+  start, ends it and says so.
 * **Nothing reaches the engine but the log:** NautilusTrader v2.0.0rc8 gives a Python data client no
   way to say its data has stopped (`is_connected` is the runtime's, read-only); upstream's Databento
-  client, when it gives up reconnecting, logs the error and goes no further. A stream that ended or never
-  connected shows only in the node's log.
+  client, when it gives up reconnecting, logs the error and goes no further. A stream that ended, never
+  connected or went mute shows in the node's log and in the refusal of later subscriptions.
+* **Subscriptions across a reconnect:** a reconnect alpaca-py makes sends every subscription again (Mute
+  stream). The client forgets its subscriptions at `_disconnect`, while NautilusTrader's engine keeps its
+  own record of them until a reset (`DataClientAdapter::clear_subscription_state`, `crates/data/src/
+  client.rs`) and skips a subscribe it already holds, so connecting the same client again under one engine
+  would leave them unsent. At the pin that cannot happen: "A client instance and its bound provider belong
+  to one node run" (the adapter guide), and a stopped `LiveNode` refuses to run again
+  (`test_a_stopped_node_cannot_run_again_so_a_client_serves_one_run`, which fails if upstream allows it).
 * **Stream shutdown:** `_disconnect` waits `STREAM_JOIN_TIMEOUT_SECS` (10 s) for the stream thread. A
   connected alpaca-py stream sees the stop within its 5 s receive timeout and then closes the websocket,
   which `websockets` allows 10 s, so a slow close can exceed it; a stop during connect or auth waits for

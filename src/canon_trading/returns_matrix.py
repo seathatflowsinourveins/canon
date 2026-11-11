@@ -21,25 +21,68 @@ requires every return of the pick to be finite, and skfolio's `Portfolio` does n
 turns a NaN into 0.0 (observed at 1.12.8 and 1.12.9), so `returns_matrix` refuses one in any series
 it is given as well.
 
-Every return of a ledger record is checked once, where it enters the gate (`daily_series`,
-`_check_returns`): it must be a float, as `record_trial` writes each one (NautilusTrader's `f64`, a
-`float` through JSON), never a `bool` or an `int`, which Python's `==` reads as equal to 0.0 or 1.0;
-it must be finite; the sum of the squares of the series must be finite; and so must the two moments
-of it that skfolio divides by or raises to the fourth power, `measures.variance` and
-`measures.fourth_central_moment`, computed by skfolio itself so that the check rounds as the gate
-does. skfolio's Sharpe ratio is the mean over the sample standard deviation
-(`measures.standard_deviation`, the square root of `measures.variance`, NumPy's `nanvar` with
-`ddof=1`, read in the installed 1.12.9), which squares each deviation in float64: with returns of
-about 1.34e154 or more, each finite, the squares overflow to infinity and the ratio reads 0.0 rather
-than failing (run at 1.12.9, 2026-11-11). The DSR's kurtosis takes the fourth central moment, which
-overflows from returns of about 1e77, and skfolio then gives a DSR of NaN; refused here, the series
-is named instead. At the other end, a series that is not constant is refused when the square of its
-second central moment (`measures.variance(biased=True)`), which the kurtosis divides the fourth by,
-is below float64's smallest normal (`sys.float_info.min`): there IEEE 754 keeps absolute, not
-relative, precision, and with returns about 1e-81 apart the fourth moment rounds to 0.0, skfolio's
-kurtosis reads 0, below the 1 every series has, and the DSR of a pick rejected at its own scale
-passes (run at 1.12.9, 2026-11-11). `returns_matrix` keeps its own refusal of a return that is not
-finite, for a series given to it directly.
+Every return of a ledger record is read once, where it enters the gate (`session_returns`): it must
+be a float, as `record_trial` writes each one (NautilusTrader's `f64`, a `float` through JSON), never
+a `bool` or an `int`, which Python's `==` reads as equal to 0.0 or 1.0, and finite. `returns_matrix`
+keeps its own refusal of a return that is not finite, for a series given to it directly.
+
+**The numeric check** (ADR 0031, 2026-11-11; ADR 0073 rule 4, the family found in rounds 5, 6 and
+7) is one function, `_numerically_valid`, with one call site: `session_returns`, on the series of
+session days alone, after closed days are dropped, which is the series every gate calculation takes.
+Taken over every UTC day, the zeros of closed days moved the mean and hid moments that overflow or
+underflow on the session days (round 7). It computes what the gate consumes by the functions the
+gate computes with, skfolio 1.12.9's, read in the installed `measures/_measures.py` and
+`portfolio/_base.py`, and returns the series with its Sharpe ratio, so `canon_trading.ranking` and
+`canon_trading.ledger.told_sharpe` read every statistic of a series from a result that passed. In
+order:
+
+1. *No spread at its own size.* One measure, `rounding_of_the_mean`: n returns no larger than m in
+   size have a mean that rounding moves by less than n times float64's spacing at m
+   (`math.ulp(m)`): NumPy's mean is n - 1 additions and a division, each rounding by at most half
+   the spacing at its result, and no partial sum exceeds n times m. A series of n equal returns has
+   that one error as every deviation, so skfolio's sample standard deviation of it
+   (`measures.standard_deviation`, NumPy's `nanvar` with `ddof=1`) is the error times
+   sqrt(n / (n - 1)), at most sqrt(2) of it, where exact arithmetic gives 0: thirty returns of -0.01
+   read 1.8e-18 and a Sharpe ratio of -5.67e15 (run at 1.12.9, 2026-11-11). So a series whose
+   standard deviation is no more than `DEGENERATE` = 2 times the measure, the least whole number
+   above sqrt(2), cannot be told from a constant one and is refused by name. Exact constancy is its
+   special case, a series of zeros included, and is read from the returns themselves before any
+   statistic: thirty returns of 1e200 leave an error whose square overflows, and skfolio's variance
+   of them is inf (run at 1.12.9, 2026-11-11).
+   skfolio's own skewness and kurtosis follow the same idea with a lower floor (NaN when the second
+   moment is at most `(eps * mean)**2`, `_standardized_moment`); every series this accepts is above
+   that floor. A choice, stated as one: the factor 2 separates rounding from spread, it does not
+   make a series just above it meaningful. Such a series has the very large Sharpe ratio its returns
+   give (up to about 2**52 / n) and a bound, below, above that ratio, so the ranking stops on it;
+   one further from the threshold ranks as it is (ADR 0031's limits).
+2. *Moments that underflow.* The square of the second central moment (`measures.variance(biased=
+   True)`), which the kurtosis divides the fourth by, must be at or above float64's smallest normal
+   (`sys.float_info.min`): below it IEEE 754 keeps absolute, not relative, precision, and with
+   returns about 1e-81 apart the kurtosis rounds toward 1 or 0 and the DSR of a pick rejected at its
+   own scale passes (run at 1.12.9, 2026-11-11). The fourth moment is never below that square, the
+   3/2 power the skewness divides by is above it, and two such standard deviations multiply to a
+   normal number, so this one floor covers them. It is read before item 3 so that the cause named
+   is the underflow, where the skewness and the kurtosis it leaves are NaN; and returns that differ
+   with a standard deviation of exactly 0.0, about 1e-170 apart, are refused here too, not by
+   item 1, since it is their squares that vanished.
+3. *Not finite.* The Sharpe ratio (`session_sharpe`), the variance, the fourth central moment, the
+   skewness, the kurtosis and the series' correlation with itself, by `measures.correlation`, whose
+   inputs are NumPy's covariance of the column and the product of two standard deviations: each must
+   be finite. Returns of about 1e77 overflow the fourth moment, and of 1.34e154 the variance, where
+   skfolio's Sharpe ratio reads 0.0 rather than failing (run at 1.12.9, 2026-11-11).
+
+The same measure gives the one bound the gate compares Sharpe ratios by
+(`SessionReturns.rounding`): two computations of one series' ratio, summing in any order, have means
+less than twice the measure apart and standard deviations whose squares differ by less than twice
+its square and the rounding of n squares. With r the measure over the standard deviation, under 1/2
+for a series that passed, that is less than 13 r max(1, |ratio|) to first order (the largest seen
+over reordered sums is 0.56 of r max(1, |ratio|), run 2026-11-11), and `RECOMPUTED` = 16 is the next
+power of two. A ratio is known no more finely than that, so the gate holds a value told to within
+it of the one computed again, and reads two trials' ratios as told apart only when they differ by
+more than the sum of their two bounds (`canon_trading.ranking`; ADR 0031, 2026-11-11). It is about
+2e-13 for thirty daily returns of a per cent and 2e-11 to 3e-11 for the step-7 records of 1,366
+sessions (run 2026-11-11), and wide only next to the threshold of item 1, where it exceeds the
+ratio itself.
 
 Which upstream call does what:
 
@@ -52,7 +95,8 @@ Which upstream call does what:
 * `DataFrame.isna`: a day one trial has and another lacks. The rows are the union of the trials' session
   days, so a trial with a NaN did not cover the whole sample, and the matrix is refused.
 
-No statistic is computed here; the two moments `_check_returns` takes only refuse a series.
+The only statistic kept is each series' Sharpe ratio, skfolio's; the others the check takes only
+refuse a series.
 """
 
 from __future__ import annotations
@@ -60,6 +104,7 @@ from __future__ import annotations
 import itertools
 import math
 import sys
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -79,21 +124,50 @@ class ReturnsRejected(ValueError):
     """Returns that ADR 0010 step 2 or ADR 0041 does not accept; the message names every trial.
 
     `names` holds the name of each series rejected, in the order the message gives them.
+    `no_spread` says the one series was refused for not varying beyond rounding (the numeric
+    check's first item), which is what a trial that never traded leaves.
     """
 
-    def __init__(self, message: str, names: Sequence[str] = ()) -> None:
+    def __init__(self, message: str, names: Sequence[str] = (), *, no_spread: bool = False) -> None:
         super().__init__(message)
         self.names = tuple(names)
+        self.no_spread = no_spread
 
 
-def daily_series(name: str, returns: object, session_days: object) -> pd.Series:
-    """One trial's daily portfolio returns on its session days, indexed by UTC date, named `name`.
+DEGENERATE = 2
+"""A series whose standard deviation is no more than this many times `rounding_of_the_mean` has no
+spread at its own size: the least whole number above sqrt(2), the most a constant series' deviation
+can be of its mean's rounding (module header)."""
+
+RECOMPUTED = 16
+"""How many times `rounding_of_the_mean` over the standard deviation two computations of one series'
+Sharpe ratio can differ by, relative to the larger of 1 and the ratio (module header)."""
+
+
+@dataclass(frozen=True)
+class SessionReturns:
+    """One trial's returns on its session days, having passed the numeric check, with what the gate
+    reads of them.
+
+    `series` is indexed by UTC date and named for the trial; `sharpe` is skfolio's per-session
+    Sharpe ratio of it; `rounding` is how far a second computation of that ratio from the same
+    returns can be from it (module header, `RECOMPUTED`), the one bound the gate compares ratios by.
+    """
+
+    series: pd.Series
+    sharpe: float
+    rounding: float
+
+
+def session_returns(name: str, returns: object, session_days: object) -> SessionReturns:
+    """One trial's daily portfolio returns on its session days, named `name`, with its Sharpe ratio.
 
     `returns` is a ledger entry's `returns_series` (nanoseconds as text to a return) and `session_days`
     its `session_days`, in the shape `canon_trading.ledger.record_trial` writes them: each key and day
     the decimal text of a whole number, as `str(int)` gives it, each session day once and in order,
     and each return a number. Anything
-    else came from another writer and is refused, naming `name`.
+    else came from another writer and is refused, naming `name`; so is a series the numeric check
+    refuses (module header). Every series the gate computes on comes from here.
     """
     returns, session_days = _check_shape(name, returns, session_days)
     if not returns:
@@ -111,7 +185,7 @@ def daily_series(name: str, returns: object, session_days: object) -> pd.Series:
             f"{name}: returns_series skips from {gaps[0][0]} to {gaps[0][1]}; the daily portfolio "
             "series has one key for every UTC day",
         )
-    by_day = _check_returns(name, returns, keys)
+    by_day = _finite_floats(name, returns, keys)
     open_days = {int(day) for day in session_days}
     moved_while_closed = [key for key in keys if key not in open_days and by_day[key] != 0.0]
     if moved_while_closed:
@@ -129,11 +203,85 @@ def daily_series(name: str, returns: object, session_days: object) -> pd.Series:
     kept = [key for key in keys if key in open_days]
     if not kept:
         raise ReturnsRejected(f"{name}: no return falls on a session day")
-    return pd.Series(
-        [by_day[key] for key in kept],
-        index=pd.to_datetime(kept, unit="ns", utc=True),
-        name=name,
+    return _numerically_valid(
+        pd.Series(
+            [by_day[key] for key in kept],
+            index=pd.to_datetime(kept, unit="ns", utc=True),
+            name=name,
+        )
     )
+
+
+def daily_series(name: str, returns: object, session_days: object) -> pd.Series:
+    """The series of `session_returns`, checked as there, for a caller that reads no statistic
+    of it."""
+    return session_returns(name, returns, session_days).series
+
+
+def rounding_of_the_mean(values: np.ndarray) -> float:
+    """The gate's one measure of rounding: less than this separates the mean NumPy takes of
+    `values` from their exact mean, the count times float64's spacing at the largest of them in
+    size (module header, item 1)."""
+    return len(values) * math.ulp(float(np.abs(values).max()))
+
+
+def _numerically_valid(series: pd.Series) -> SessionReturns:
+    """`series`, one trial's returns on its session days, with its Sharpe ratio, or `ReturnsRejected`
+    naming it: the gate's one numeric check (module header), called from `session_returns` alone."""
+    name = series.name
+    values = series.to_numpy(dtype=float)
+    count = len(values)
+    if count < 2:  # skfolio's sample variance needs two returns
+        raise ReturnsRejected(
+            f"{name}: has {count} session day, and a Sharpe ratio needs two",
+        )
+    largest = float(np.abs(values).max())
+    if values.max() == values.min():
+        # Before any statistic: the square of what rounding left of a large constant overflows.
+        raise ReturnsRejected(
+            f"{name}: its returns do not vary beyond rounding at their own size: each of the "
+            f"{count} is {float(values[0])}, so they give no Sharpe ratio (ADR 0031)",
+            no_spread=True,
+        )
+    with np.errstate(all="ignore"):
+        deviation = float(measures.standard_deviation(values))
+        read = {
+            "Sharpe ratio": session_sharpe(series),
+            "variance": float(measures.variance(values)),
+            "fourth central moment": float(measures.fourth_central_moment(values)),
+            "skewness": float(measures.skew(values)),
+            "kurtosis": float(measures.kurtosis(values)),
+            "correlation with itself": float(
+                measures.correlation(np.column_stack([values, values]))[0, 1]
+            ),
+        }
+        # The second central moment, whose square skfolio's kurtosis divides the fourth by.
+        second = float(measures.variance(values, biased=True))
+    rounding = rounding_of_the_mean(values)
+    # A standard deviation of exactly 0.0 from returns that differ is their squares vanishing,
+    # which the next check names.
+    if 0.0 < deviation <= DEGENERATE * rounding:
+        raise ReturnsRejected(
+            f"{name}: its returns do not vary beyond rounding at their own size: their standard "
+            f"deviation is {deviation}, no more than {DEGENERATE * rounding}, {DEGENERATE} times "
+            f"what rounding the mean of {count} returns as large as {largest} "
+            "can leave of a constant series, so they give no Sharpe ratio (ADR 0031)",
+            no_spread=True,
+        )
+    if second * second < sys.float_info.min:
+        raise ReturnsRejected(
+            f"{name}: the square of the second central moment of its returns on its session days "
+            f"is {second * second}, below float64's smallest normal, {sys.float_info.min}, so the "
+            "DSR's kurtosis underflows (ADR 0031)",
+        )
+    not_finite = [f"{what} is {value}" for what, value in read.items() if not math.isfinite(value)]
+    if not_finite:
+        raise ReturnsRejected(
+            f"{name}: of its returns on its session days, skfolio's {', its '.join(not_finite)}: "
+            "not finite, so the gate cannot compute with them (ADR 0031)",
+        )
+    sharpe = read["Sharpe ratio"]
+    return SessionReturns(series, sharpe, RECOMPUTED * rounding / deviation * max(1.0, abs(sharpe)))
 
 
 def _portfolio(series: pd.Series) -> Portfolio:
@@ -147,7 +295,8 @@ def _portfolio(series: pd.Series) -> Portfolio:
 
 
 def session_sharpe(series: pd.Series) -> float:
-    """skfolio's per-session Sharpe ratio of one trial's series from `daily_series`."""
+    """skfolio's per-session Sharpe ratio of one trial's series: `Portfolio.sharpe_ratio`, the mean
+    over the sample standard deviation. The gate reads it from `session_returns`' result."""
     return float(_portfolio(series).sharpe_ratio)
 
 
@@ -174,11 +323,9 @@ def is_ns_text(value: object) -> bool:
     )
 
 
-def _check_returns(name: str, returns: dict[str, object], keys: list[int]) -> dict[int, float]:
+def _finite_floats(name: str, returns: dict[str, object], keys: list[int]) -> dict[int, float]:
     """Each of `returns` by its day, keyed at `keys` in order; refused unless each is a finite float,
-    the sum of their squares is finite, and the moments skfolio takes of them are neither past
-    float64's largest nor, for a series that is not constant, below its smallest normal (module
-    header): the one check of every return that enters the gate."""
+    closed days' included. What the series of session days amounts to is `_numerically_valid`'s."""
     checked: dict[int, float] = {}
     for key in keys:
         value = returns[str(key)]
@@ -193,32 +340,6 @@ def _check_returns(name: str, returns: dict[str, object], keys: list[int]) -> di
                 f"{name}: return {value} on {_date(key)} is not finite",
             )
         checked[key] = value
-    squares = sum(value * value for value in checked.values())
-    if not math.isfinite(squares):
-        raise ReturnsRejected(
-            f"{name}: the sum of the squares of its returns is {squares}, past float64's largest, "
-            "so the standard deviation its Sharpe ratio divides by overflows (ADR 0031)",
-        )
-    if len(checked) > 1:  # skfolio's sample variance needs two returns
-        values = np.fromiter(checked.values(), dtype=float)
-        with np.errstate(over="ignore", invalid="ignore"):
-            spread = float(measures.variance(values))
-            fourth = float(measures.fourth_central_moment(values))
-            # The second central moment, whose square skfolio's kurtosis divides the fourth by; the
-            # fourth is never below that square, so the square decides alone.
-            second = float(measures.variance(values, biased=True))
-        if not (math.isfinite(spread) and math.isfinite(fourth)):
-            raise ReturnsRejected(
-                f"{name}: skfolio's variance of its returns is {spread} and their fourth central "
-                f"moment {fourth}, one past float64's largest, so its Sharpe ratio or the DSR's "
-                "kurtosis overflows (ADR 0031)",
-            )
-        if values.max() != values.min() and second * second < sys.float_info.min:
-            raise ReturnsRejected(
-                f"{name}: the square of the second central moment of its returns is "
-                f"{second * second}, below float64's smallest normal, {sys.float_info.min}, so the "
-                "DSR's kurtosis underflows (ADR 0031)",
-            )
     return checked
 
 
@@ -226,7 +347,7 @@ def _check_shape(
     name: str, returns: object, session_days: object
 ) -> tuple[dict[str, object], list[str]]:
     """Refuse `returns` and `session_days` unless they are in the shape `record_trial` writes; each
-    return is `_check_returns`'s."""
+    return is `_finite_floats`'s."""
     if not isinstance(returns, dict):
         raise ReturnsRejected(f"{name}: returns_series is {type(returns).__name__}, not a mapping")
     if not isinstance(session_days, list):
@@ -272,7 +393,7 @@ def returns_matrix(series: Sequence[pd.Series]) -> pd.DataFrame:
         )
     population = Population([_portfolio(s) for s in series])
     matrix = population.returns_df(use_tag_in_column_name=False)
-    # The UTC dates `daily_series` gave, their zone restored after skfolio's zone-free build.
+    # The UTC dates `session_returns` gave, their zone restored after skfolio's zone-free build.
     matrix.index = pd.DatetimeIndex(matrix.index).tz_localize("UTC")
     missing = matrix.isna()
     short = [name for name in matrix.columns if missing[name].any()]

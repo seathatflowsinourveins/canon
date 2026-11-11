@@ -1,0 +1,24 @@
+# Second reader: r5539
+Mark: fix
+Blocker: none
+## Findings
+1. src/canon_trading/ledger.py:167 — `_creation_lock` opens the lock file `O_RDWR` even for `open_study` (mode `rw`), where it only needs to hold a lock. `flock` works on a read-only descriptor, so `O_RDONLY` would do when `create` is false. As written, a ledger whose files are write-protected (an archived or handed-over ledger, or a lock file made by another user under a 0644 umask) no longer opens. It raises a bare `PermissionError`, which also falls outside `open_study`'s stated `LedgerNotFound` contract. Before the change, SQLite's `mode=rw` opened such a file read-only and the study loaded. Shown with a scratch script: create a ledger, `chmod 0444` both files, then the old path (`RDBStorage(_sqlite_url(p,"rw"), skip_table_creation=True)` + `load_study`) printed `s`, and `open_study("s", p)` raised `PermissionError(13)`. I did not mark this as blocker 4: no record or docstring promises that a write-protected ledger opens, `open_study` exists for writing trials, and nothing in `src/` calls it read-only. (severity: fix)
+2. src/canon_trading/returns_matrix.py:172 — the new refusal formats the day with `day.date()`. If a direct caller (the case this check is for) passes a series without a DatetimeIndex and with a NaN in it, the caller gets `AttributeError: 'int' object has no attribute 'date'` instead of `ReturnsRejected` naming the series (seen with `returns_matrix([pd.Series([0.01, nan, 0.02], name="a")])`). The series is still refused, so this is not a silent acceptance. But the exception type and message are wrong. The fix is to format the index label as it is, or to refuse a non-datetime index explicitly. (severity: fix)
+
+## Per-defect check
+1. Ledger creation race — removed. `_storage` builds `RDBStorage` under an exclusive `fcntl.flock` on `<name>.lock` (ledger.py `_creation_lock`/`_storage`). The creator makes the lock file before the db, and `open_study` waits on it when it exists. The two-process test passes. Optuna 5.0.0 `storage.py:262-265` confirms the separate `create_all` and version-manager writes.
+2. Recorded range in naive local time — removed. `rank` converts each `datetime_start` with `.astimezone(UTC)` (ranking.py ~314). Optuna `models.py` confirms it returns naive local time converted from stored naive UTC, so this gives the UTC instant with `+00:00`. An aware value (JournalStorage) also converts correctly. The DST-fold ambiguity is upstream's and the report states it.
+3. `returns_matrix` accepts a non-finite return when called directly — removed. A check before skfolio reads any series refuses NaN, ±inf and None and names every bad series (returns_matrix.py ~168). I confirmed skfolio 1.12.8 turns NaN into 0.0. Caveat in finding 2.
+4. Value told not from the series the gate accepts — removed. `_session_sharpe` now uses `daily_series(key, returns, days)` and the same `Portfolio(X=series.to_frame(), weights=[1.0], name=key).sharpe_ratio` call as `ranking.rank`. On `ReturnsRejected` it returns NaN, so the run is told FAIL/traded with no value, which is what the statement asks for. The gate re-derives the refusal and stops on it, so nothing is hidden.
+5. Run config with no strategy is run — removed. `run_backtest_config` raises `ValueError` before it builds a node (backtest.py ~250).
+6. `ledger/` ignored at any depth — removed. The rule is now `/ledger/`, anchored to the root.
+
+## What I ran
+- `mise exec -- uv run --locked pytest tests/test_backtest.py tests/test_deflated_sharpe.py tests/test_ledger.py tests/test_ranking.py tests/test_returns_matrix.py tests/test_ledger_creation_lock.py -q` — 149 passed.
+- Scratch script (outside the tree, since removed): write-protected ledger, old open path vs new `open_study` — old opened, new `PermissionError(13)`.
+- Scratch script: skfolio `Portfolio` on a NaN series gives returns `[0.01, 0.0, 0.02]`. `returns_matrix` on an int-indexed NaN series raises `AttributeError`; on a UTC-indexed series holding `None` it raises `ReturnsRejected`.
+- Read installed Optuna `storages/_rdb/storage.py` (lines 262-265, 1096-1145) and `models.py` (`datetime_start`) to check the report's upstream claims; both hold.
+- `grade.json` `flags` is empty. No existing test file was edited (`git status`: one new untracked test file only). Report claims checked against the diff found no false statement.
+
+## Reread (settling the first reader's no)
+Final mark: no. Blocker: 4. Changed from fix. Blocker 4 asks only for behaviour the suite does not cover, broken and shown by an input; the scratch run showed that (old open path loads a write-protected ledger, new `open_study` raises `PermissionError(13)`). Requiring a record or docstring to promise the behaviour added a condition the rule does not set. The lock never needed write access (`flock` works on a read-only descriptor). The readers' exclusive lock with no timeout is fix-level and does not change the mark.
