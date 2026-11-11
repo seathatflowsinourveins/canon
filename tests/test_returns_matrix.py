@@ -10,10 +10,13 @@ from __future__ import annotations
 import math
 import statistics
 from datetime import date
+from fractions import Fraction
 
+import numpy as np
 import pandas as pd
 import pytest
 from skfolio import Portfolio
+from skfolio import measures
 
 from canon_trading.ledger import DAY_NS
 from canon_trading.returns_matrix import ReturnsRejected
@@ -145,8 +148,8 @@ def test_calendars_that_differ_inside_the_range_are_refused() -> None:
 
 
 def test_ranges_that_do_not_overlap_are_refused_naming_both() -> None:
-    first = daily_series("a", entry({0: 0.01, 1: 0.02}), sessions(0, 1))
-    second = daily_series("b", entry({4: 0.01, 5: 0.02}), sessions(4, 5))
+    first = daily_series("a", entry({0: 0.01, 1: 0.02, 2: 0.04}), sessions(0, 1, 2))
+    second = daily_series("b", entry({4: 0.01, 5: 0.02, 6: 0.04}), sessions(4, 5, 6))
 
     with pytest.raises(ReturnsRejected) as rejected:
         returns_matrix([first, second])
@@ -192,10 +195,10 @@ def test_names_distinct_only_by_type_are_refused() -> None:
 def test_series_named_by_numbers_that_cover_other_days_are_refused_by_name() -> None:
     """A third reader: names that are not text met skfolio's text column names in the lookup, and a
     series short of a day raised `KeyError` instead of being named."""
-    short = daily_series("x", entry({0: 0.01, 1: 0.02}), sessions(0, 1)).rename(1)
-    full = daily_series("y", entry({0: 0.01, 1: 0.02, 2: 0.03}), sessions(0, 1, 2))
+    short = daily_series("x", entry({0: 0.01, 1: 0.02, 2: 0.04}), sessions(0, 1, 2)).rename(1)
+    full = daily_series("y", entry({0: 0.01, 1: 0.02, 2: 0.03, 3: 0.05}), sessions(0, 1, 2, 3))
 
-    with pytest.raises(ReturnsRejected, match="1: no return on 1 of the 3 session days") as refused:
+    with pytest.raises(ReturnsRejected, match="1: no return on 1 of the 4 session days") as refused:
         returns_matrix([short, full.rename(2)])
     assert refused.value.names == ("1",)
 
@@ -219,11 +222,15 @@ def test_a_return_that_is_not_a_finite_float_is_refused(value: object, message: 
 
 def test_returns_whose_squares_overflow_are_refused() -> None:
     """Antigravity, gate round 4: each return finite, about 1e155, their squares past float64's
-    largest, so skfolio's Sharpe ratio of them read 0.0 rather than failing. The check names the
-    variance skfolio takes of them (round 7's one check), where it summed their squares itself."""
+    largest, so skfolio's Sharpe ratio of them read 0.0 rather than failing. skfolio itself is
+    asked for what the gate takes of them (round 8), and gives no deflated Sharpe ratio: its
+    skewness and kurtosis of them are NaN."""
     returns = entry({0: 1e155, 1: -2e155, 2: 3e155})
 
-    with pytest.raises(ReturnsRejected, match="a: [^\n]*skfolio's variance is inf"):
+    with pytest.raises(
+        ReturnsRejected,
+        match="a: [^\n]*skfolio's deflated Sharpe ratio is nan[^\n]*skewness nan, kurtosis nan",
+    ):
         daily_series("a", returns, sessions(0, 1, 2))
 
 
@@ -281,10 +288,13 @@ def test_closed_day_zeros_do_not_hide_moments_that_underflow() -> None:
 
 def test_closed_day_zeros_do_not_hide_moments_that_overflow() -> None:
     """Antigravity, gate round 7: weekend zeros pulled the mean toward 0 and kept the checked fourth
-    central moment finite, while that of the session days alone is past float64's largest."""
+    central moment finite, while that of the session days alone is past float64's largest: skfolio's
+    kurtosis of them is NaN, and it gives no deflated Sharpe ratio."""
     returns = over_weekends([6.0e76] * 29 + [-6.0e76])
 
-    with pytest.raises(ReturnsRejected, match=r"a: [^\n]*fourth central moment is inf"):
+    with pytest.raises(
+        ReturnsRejected, match=r"a: [^\n]*deflated Sharpe ratio is nan[^\n]*kurtosis nan"
+    ):
         daily_series("a", returns, sessions(*WEEKDAYS))
 
 
@@ -342,26 +352,158 @@ def test_returns_that_vary_and_underflow_are_refused_as_underflow(low: float, hi
 
 
 def test_one_session_day_gives_no_series() -> None:
-    with pytest.raises(ReturnsRejected, match="a: has 1 session day"):
-        daily_series("a", entry({0: 0.01}), sessions(0))
+    """One return has no sample standard deviation: skfolio's Sharpe ratio of it is NaN, and that
+    is the refusal, not a count kept here."""
+    with pytest.raises(
+        ReturnsRejected,
+        match="a: of its returns on its 1 session day, skfolio's Sharpe ratio is nan",
+    ) as rejected:
+        session_returns("a", entry({0: 0.01}), sessions(0))
+
+    assert not rejected.value.no_spread
 
 
 def test_a_series_just_above_the_threshold_is_accepted_with_the_sharpe_ratio_it_has() -> None:
-    """The limit of the measure (ADR 0080): returns of 1.0 and 1.0 + 128 steps of float64's spacing
-    there have a standard deviation of 65 steps, above the 60 that twice thirty returns' rounding
-    allows, so the series is accepted, and its Sharpe ratio is the 6.9e13 its returns give. With 96
-    steps the deviation is 49, and the series is refused."""
+    """The limit of the measure (ADR 0080): returns of 1.0 and 1.0 + 1,024 steps of float64's
+    spacing there have a standard deviation of 521 steps, above the 480 that sixteen times thirty
+    returns' rounding allows, so the series is accepted, its Sharpe ratio is the 8.6e12 its returns
+    give, and rounding can move it by less than its own size. With 896 steps the deviation is 456,
+    and the series is refused: its bound would not be below its ratio."""
     step = math.ulp(1.0)
-    above = entry({n: 1.0 + 128 * step * (n % 2) for n in range(30)})
-    below = entry({n: 1.0 + 96 * step * (n % 2) for n in range(30)})
+    above = entry({n: 1.0 + 1024 * step * (n % 2) for n in range(30)})
+    below = entry({n: 1.0 + 896 * step * (n % 2) for n in range(30)})
 
     accepted = session_returns("a", above, sessions(*range(30)))
 
-    assert accepted.sharpe == pytest.approx((1.0 + 64 * step) / (64 * step * math.sqrt(30 / 29)))
-    assert accepted.sharpe > 6.9e13
+    assert accepted.sharpe == pytest.approx((1.0 + 512 * step) / (512 * step * math.sqrt(30 / 29)))
+    assert accepted.sharpe > 8.6e12
+    assert 0.9 * accepted.sharpe < accepted.rounding < accepted.sharpe
     assert list(accepted.series) == list(above.values())
     with pytest.raises(ReturnsRejected, match="a: its returns do not vary beyond rounding"):
         session_returns("a", below, sessions(*range(30)))
+
+
+# The gate's eighth outside round, 2026-11-11 (Antigravity): a series is valid exactly when the
+# skfolio functions the gate calls accept it, with the two float64 conditions skfolio does not
+# catch (ADR 0080). Each test below failed before that model.
+
+# Fifty-five returns at two levels whose Sharpe ratio is next to 2 / skewness, where the variance
+# adjustment of skfolio's probabilistic Sharpe ratio, (1 - skew * SR / 2)**2 for two levels, is 0.
+HIGH, LOW = 0.05650675558054833, 0.05450675558054833
+
+
+def test_two_session_days_give_no_series_since_skfolio_gives_no_dsr_of_them() -> None:
+    """Round 8, finding 3: the check counted two returns as enough, the least a sample variance
+    takes, and read six finite statistics of them, while skfolio's deflated Sharpe ratio, which
+    the gate takes, is NaN below three. A record of two session days was told `COMPLETE`."""
+    returns = entry({0: 0.01, 1: -0.02})
+    assert math.isnan(measures.deflated_sharpe_ratio([0.01, -0.02], [-0.2357]))
+
+    with pytest.raises(
+        ReturnsRejected,
+        match="a: of its returns on its 2 session days, skfolio's deflated Sharpe ratio is nan",
+    ):
+        session_returns("a", returns, sessions(0, 1))
+
+    three = session_returns("a", entry({0: 0.01, 1: -0.02, 2: 0.005}), sessions(0, 1, 2))
+    assert math.isfinite(three.sharpe)
+
+
+@pytest.mark.parametrize("sign", [1.0, -1.0], ids=["a positive ratio", "a negative ratio"])
+def test_a_variance_adjustment_not_above_zero_gives_no_series_in_either_sign(sign: float) -> None:
+    """Round 8, finding 3: 27 returns at one level and 28 at another, 0.002 apart, have a finite
+    Sharpe ratio (54.99), variance, skewness, kurtosis and self-correlation, and a spread 2.6e12
+    times the mean's rounding, so the check accepted them; skfolio's variance adjustment of them
+    is -6e-13, and its deflated Sharpe ratio NaN. With a negative ratio the series was never the
+    pick, so nothing found it. The same levels with the counts exchanged have a DSR of 1.0: the
+    condition is skfolio's, of the series and its sign as it stands, and the check asks it."""
+    values = [sign * HIGH] * 27 + [sign * LOW] * 28
+    with np.errstate(all="ignore"):
+        ratio = float(np.mean(values) / measures.standard_deviation(values))
+        assert math.isnan(measures.deflated_sharpe_ratio(values, [ratio]))
+    assert ratio == pytest.approx(sign * 54.9909)
+
+    with pytest.raises(ReturnsRejected, match="a: [^\n]*deflated Sharpe ratio is nan") as rejected:
+        session_returns("a", entry(dict(enumerate(values))), sessions(*range(55)))
+
+    assert "variance adjustment" in str(rejected.value) and not rejected.value.no_spread
+    exchanged = [sign * HIGH] * 28 + [sign * LOW] * 27
+    accepted = session_returns("a", entry(dict(enumerate(exchanged))), sessions(*range(55)))
+    assert accepted.sharpe == pytest.approx(sign * 55.0269)
+
+
+def test_what_skfolio_raises_on_is_refused_naming_its_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The model's other half: a call skfolio raises `ValueError` on refuses the series with
+    skfolio's own words. No series reaches one today, since the deflated Sharpe ratio is asked only
+    of a finite ratio, so the call is made to raise."""
+
+    def raises(*_: object) -> float:
+        raise ValueError("trial_sharpe_ratios must not contain infinite values")
+
+    monkeypatch.setattr("canon_trading.returns_matrix.measures.deflated_sharpe_ratio", raises)
+
+    with pytest.raises(
+        ReturnsRejected,
+        match="a: [^\n]*skfolio's deflated Sharpe ratio raised ValueError: trial_sharpe_ratios",
+    ) as rejected:
+        session_returns("a", entry({0: 0.01, 1: -0.02, 2: 0.005}), sessions(0, 1, 2))
+
+    assert "variance adjustment" not in str(rejected.value)  # that explains a NaN, not an error
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        pytest.param([-1.0 - 880 * math.ulp(1.0) * (n % 2) for n in range(30)], id="14.9 times"),
+        pytest.param(
+            [-1.5 + k * math.ulp(1.5) for k in [1776, -1776, 432, -432] + [0] * 26],
+            id="16 times exactly",
+        ),
+        pytest.param([1.0 + 128 * math.ulp(1.0) * (n % 2) for n in range(30)], id="2.2 times"),
+    ],
+)
+def test_a_series_whose_ratio_rounding_can_move_by_its_own_size_is_refused(
+    values: list[float],
+) -> None:
+    """Round 8, finding 2: a series was refused when its standard deviation was at most 2 times
+    the mean's rounding, and its ratio's bound is 16 times that rounding over the deviation, so
+    between the two it was accepted with a bound at or above its own ratio. skfolio answers for
+    each with finite numbers. One threshold now, the bound's own: such a series is refused, in
+    either sign."""
+    with np.errstate(all="ignore"):
+        ratio = float(np.mean(values) / measures.standard_deviation(values))
+        assert math.isfinite(measures.deflated_sharpe_ratio(values, [ratio]))
+
+    with pytest.raises(ReturnsRejected, match="a: its returns do not vary beyond rounding") as no:
+        session_returns("a", entry(dict(enumerate(values))), sessions(*range(30)))
+
+    assert (
+        no.value.no_spread
+        and "move their Sharpe ratio by the larger of 1 and its own size" in str(no.value)
+    )
+
+
+def test_a_spread_inside_the_mean_s_rounding_is_what_skfolio_does_not_catch() -> None:
+    """Why the spread is still measured here (ADR 0080): skfolio's variance subtracts the computed
+    mean once, so a spread smaller than that mean's rounding error is read as the error. One
+    hundred returns of 1.63 and two or four steps of float64's spacing above it have a Sharpe
+    ratio of 4.46e15 in exact arithmetic; skfolio gives 2.15e15, and a finite deflated Sharpe
+    ratio."""
+    step = 2 * math.ulp(1.6304211694124828)
+    values = [1.6304211694124828 + step * (n * 7 % 3) for n in range(100)]
+    exact = [Fraction(value) for value in values]
+    mean = sum(exact) / 100
+    deviation = math.sqrt(sum((value - mean) ** 2 for value in exact) / 99)
+    with np.errstate(all="ignore"):
+        ratio = float(np.mean(values) / measures.standard_deviation(values))
+        assert math.isfinite(measures.deflated_sharpe_ratio(values, [ratio]))
+    assert float(mean) / deviation == pytest.approx(4.46e15, rel=1e-2)
+    assert ratio == pytest.approx(2.15e15, rel=1e-2)
+
+    with pytest.raises(ReturnsRejected, match="a: its returns do not vary beyond rounding"):
+        session_returns("a", entry(dict(enumerate(values))), sessions(*range(100)))
 
 
 def test_the_series_comes_with_skfolio_s_sharpe_ratio_of_it() -> None:

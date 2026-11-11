@@ -48,7 +48,8 @@ one model, and it replaces the checks of those rounds and the two tolerances ADR
    toward 1 or 0 or is NaN (round 6's floor); with any of the six not finite. It returns the series
    with its Sharpe ratio; the ranking and the value `record_trial` tells read both from that
    result, and nothing else checks a moment of a return series. Taken over every UTC day, the zeros
-   of closed days hid session-day moments that overflow or underflow.
+   of closed days hid session-day moments that overflow or underflow. Round 8 replaced the
+   count and the list of six by skfolio's own answers (term 6).
 2. **No spread at its own size.** skfolio's `variance` is NumPy's `nanvar`, which subtracts the
    computed mean once and does not centre again, so n equal returns keep the mean's rounding error
    as every deviation: thirty of −0.01 have a standard deviation of 1.8e-18 and a Sharpe ratio of
@@ -62,7 +63,7 @@ one model, and it replaces the checks of those rounds and the two tolerances ADR
    skewness and kurtosis, NaN when the centred second moment is at most (eps·mean)², lies inside
    this one. Where a sum or a square overflows instead, the statistic is not finite and term 1
    refuses the series for that. The factor is a choice made here on that derivation; no
-   statistical source gives one.
+   statistical source gives one. Round 8 moved it from 2 to 16, the bound's own (term 7).
 3. **Ratios compared by their own rounding.** A computed Sharpe ratio is known no more finely than
    rounding can move it. For a series that passed, two computations summing in any order differ by
    less than 13·r·max(1, |SR|), r being the measure over its standard deviation, under 1/2 (to
@@ -104,7 +105,63 @@ one model, and it replaces the checks of those rounds and the two tolerances ADR
    clear of it, a standard deviation more than 16 times the measure, ranks with the Sharpe ratio
    its returns give, up to about 2⁴⁹/n, and can pass, or with that ratio negative
    raises V until no pick passes; a value told for it is held only to its wide bound. The check
-   separates spread from rounding; it does not judge whether a series is plausible.
+   separates spread from rounding; it does not judge whether a series is plausible. Round 8
+   showed the sentence on a series next to the threshold false for a negative ratio, and the
+   one on a negative ratio false beside a pick as large: terms 7 and 8 replace both.
+
+**A series is valid exactly when skfolio accepts it, and one threshold for spread (added 2026-11-11,
+after the gate's eighth outside round).** The numeric family turned up again in round 8, in two
+findings, so under ADR 0073 rule 4 the model is reopened, not patched. The lead decided the model on
+2026-11-11: a series is valid for the gate exactly when the pinned skfolio functions the gate calls
+accept it and return finite numbers, for the series and its sign as it stands; the gate asks skfolio,
+by the same calls when a trial is recorded and when a study is ranked, and keeps no list of skfolio's
+own conditions. Terms 6 and 7 replace term 1's count and its list of six statistics, term 2's factor,
+and term 5's sentence on a series next to the threshold. Terms 3 and 4 stand.
+
+6. **What is asked.** `session_returns` asks three things of the session-day series:
+   `Portfolio.sharpe_ratio`; `measures.deflated_sharpe_ratio` with that ratio as the one trial, the
+   function the pick's DSR comes from, whose benchmark is then 0 and whose answer is
+   `probabilistic_sharpe_ratio`'s; and `measures.correlation` of the series with itself. A call that
+   raises `ValueError`, or returns a number that is not finite, refuses the series by name with what
+   skfolio said. skfolio's own conditions apply without being copied here: no ratio for one return;
+   no DSR for fewer than three returns, for a variance adjustment 1 − γ₃SR + (γ₄−1)/4·SR² that is
+   not above 0, which depends on the ratio's sign, or for a skewness or kurtosis it leaves undefined.
+   Neither condition depends on the benchmark, so a series with a DSR of its own has one against any
+   trials; the stop on a DSR of the pick that is not finite stays as the last one. `record_trial`
+   tells a value through the same function, so a record is `COMPLETE` exactly when the ranking takes
+   its series, and one refused is told no value and `FAIL`, still `traded`.
+7. **Two conditions are float64's, not skfolio's, and stay**, each because skfolio answers with
+   finite numbers that are wrong. They are read before skfolio's answers, so the cause named is the
+   rounding.
+   * *A spread inside the rounding of the mean.* skfolio's standard deviation subtracts the computed
+     mean once, where its skewness and kurtosis centre again: 100 returns of 1.6304211694124828 and
+     two or four steps of float64's spacing above it have a Sharpe ratio of 4.46e15 in exact
+     arithmetic and 2.15e15 from skfolio, with a finite skewness, kurtosis and DSR. The refusal is
+     at the comparison bound's own factor: a series is refused when its standard deviation is at
+     most 16 times the measure of term 2, which is when term 3's bound is not below max(1, |SR|).
+     The factor 2 goes. Between 2 and 16 a series was accepted with a bound at or above its own
+     ratio, and term 5 said the ranking then stops. That held only when its ratio was the highest:
+     thirty returns of −1 and −1 − 880 steps, 14.9 times the measure, ranked beside thirty of 1.99
+     and 1.99 + 1,020 steps, 17.3 times, and that pick passed at DSR 1.0. Exact constancy stays the
+     special case, read from the returns before any statistic.
+   * *Moments that underflow.* Round 6's floor, as term 1 had it. skfolio's own floor for skewness
+     and kurtosis is relative to the mean and underflows with it: thirty returns about 1e-81 apart
+     have a kurtosis of 1.008, skfolio reads 0, and a probabilistic Sharpe ratio of 0.8460 against a
+     benchmark of 0.5 reads 0.8613, every number finite.
+8. **The limit that remains.** A series clear of the threshold ranks with the Sharpe ratio its returns
+   give, up to about 2⁴⁹/n, and can pass. With that ratio negative it raises V, which rejects no pick
+   whose own ratio is as large: with the negative series above at 1,010 steps, 17.1 times the
+   measure, the same pick passes at DSR 1.0, and eqs. 1–2 in exact rational arithmetic give 1.0 for
+   those returns too (ratios −8.77e12 and 1.73e13, SR₀ 9.57e12). That is the statistic's answer for
+   the input; the check separates spread from rounding and does not judge whether a series is
+   plausible, and the registration, read before any trial (ADR 0048), is where such a series is seen.
+
+Who decided, round 8, 2026-11-11. The lead decided the model, that the gate keeps no list of skfolio's
+conditions, and that the factor 2 goes unless something skfolio does not catch needs it. Chosen in
+building it, under the owner's delegation of 2026-11-10: the three calls; the deflated Sharpe ratio
+asked with the series' own ratio as the one trial; the two float64 conditions kept, each with its
+case; and the one threshold at the bound's factor, 16.
+
 
 Who decided, 2026-11-11. The lead decided the terms: one check with one call site; degeneracy relative
 to the series' own size; no free tolerance; and, on reading the exact rules first built, that ratios
@@ -120,7 +177,8 @@ split, with the number 0080 kept for one: this record.
 
 * Good: one function checks every moment the DSR reads, and no result hangs on the order of recording
   or on a free tolerance (terms 1, 3 and 4).
-* Bad: the factors 2 and 16 are chosen here, on the derivations of terms 2 and 3; no statistical
+* Bad: the factor 16, and until round 8 the factor 2, are chosen here, on the derivations of terms 2
+  and 3; no statistical
   source gives either.
 * Bad: near-copies the 1e-9 rule stopped now rank, with a small V and a pick near its undeflated value
   (term 5).
@@ -173,6 +231,26 @@ split, with the number 0080 kept for one: this record.
 
   `tests/test_deflated_sharpe.py` pins the two things skfolio does that the terms rest on: a constant
   series keeps the spread its mean rounds to, and the variance of equal ratios can be above 0.
+* Round 8's terms, added 2026-11-11, each a test that fails against the code before the change. The
+  two tests of term 5's limits above changed with the threshold: at 128 ulp the series is now
+  refused and stops the ranking by name, at 1,024 ulp, a standard deviation of 521 ulp against a
+  threshold of 480, it is accepted with a ratio of 8.6e12 and a bound below it, and at 4,096 ulp it
+  ranks as before.
+  * two session days, and a variance adjustment not above 0 in either sign, give no series
+    (`test_two_session_days_give_no_series_since_skfolio_gives_no_dsr_of_them`,
+    `test_a_variance_adjustment_not_above_zero_gives_no_series_in_either_sign`), are told no value and
+    stop the ranking by name (`test_a_series_skfolio_gives_no_dsr_of_is_told_no_value_and_stops_by_name`),
+    and by the ledger's own writer over a sample of two days
+    (`tests/test_variant_study.py::test_a_study_of_two_session_days_is_told_no_value_and_stops_by_name`);
+  * a series whose ratio rounding can move by its own size is refused in either sign, at 2.2, 14.9 and
+    exactly 16 times the measure (`test_a_series_whose_ratio_rounding_can_move_by_its_own_size_is_refused`),
+    and finding 2's pair never ranks, in either order of recording
+    (`test_a_negative_ratio_next_to_the_threshold_never_ranks_beside_a_pick_that_passes`);
+  * what skfolio raises on refuses the series with its error
+    (`test_what_skfolio_raises_on_is_refused_naming_its_error`);
+  * kept as controls, passing before and after: the case skfolio does not catch
+    (`test_a_spread_inside_the_mean_s_rounding_is_what_skfolio_does_not_catch`) and round 6's and round
+    7's underflow cases.
 
 ## Evidence
 
@@ -256,3 +334,23 @@ Read 2026-11-11. Fetched means read as raw text or source; run means executed in
 * The gate's seventh outside round, 2026-11-11, read only, by Antigravity: its first three
   findings are the first three cases under Confirmation, each reproduced as a failing test before
   the change. Rounds 5 and 6 are in ADR 0054's term 6.
+* Added 2026-11-11, for round 8's terms. Run means executed in this checkout on Python 3.14.10 with
+  skfolio 1.12.9 and NumPy 2.5.4.
+  * `src/skfolio/measures/_measures.py` at the pinned commit `772109053763`, sha256 761cbbe3, read in
+    the local copy at the pin: `probabilistic_sharpe_ratio` counts the returns (line 1389), computes the
+    variance adjustment (line 1396) and returns NaN where the count is below 3 or the adjustment is not
+    above 0 (lines 1403-1407); `deflated_sharpe_ratio` raises `ValueError` for an infinite trial ratio
+    and for none that is finite (lines 1484-1489) and takes a standard deviation of 0 for one trial
+    (line 1493), for which `expected_max_sharpe_ratio` returns the mean, 0 (line 1322);
+    `_standardized_moment` centres again (line 1624) and gives NaN at its floor or for a quotient that
+    is not finite (lines 1627-1629); `variance` is `np.nanvar` (line 196).
+  * Run, 2026-11-11: every number in terms 6 to 8; the 13 tests of the gate that changed with the model
+    and the new ones; step 7's figures unchanged to the bit on a read-only snapshot of the ledger, N = 8,
+    T = 1,366, DSR 0.9338299302788473, on the code before and after.
+  * The gate's eighth outside round, 2026-11-11, read only, by Antigravity at b586935: findings 2 and 3,
+    each reproduced before the change.
+  * Code review of the change, 2026-11-11 (`/code-review`, high): no finding that changes a gate
+    result. The explanation of skfolio's two conditions was printed beside an error skfolio raised,
+    which it does not explain, and the bound was described as below the ratio's own size, where it
+    is below the larger of 1 and that size (thirty returns of 0.01 and -0.01 have a ratio of 0.0
+    and a bound of 8.2e-14). Both are corrected.

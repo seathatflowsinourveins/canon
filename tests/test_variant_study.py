@@ -12,13 +12,18 @@ The bars are invented (`conftest.AlpacaBars`), so no number here says anything a
 from __future__ import annotations
 
 import fcntl
+from datetime import UTC
 from datetime import datetime
 from typing import TYPE_CHECKING
 from typing import Any
 
 import optuna
 import pytest
+from alpaca.data.models import Bar as AlpacaBar
+from canon_alpaca.data import parse_bar
+from nautilus_trader.model import BarType
 from nautilus_trader.model import Quantity
+from nautilus_trader.persistence import ParquetDataCatalog
 from optuna.exceptions import DuplicatedStudyError
 from optuna.trial import TrialState
 
@@ -32,6 +37,7 @@ from canon_trading.ledger import LedgerNotFound
 from canon_trading.ledger import create_ledger_study
 from canon_trading.ledger import open_study
 from canon_trading.ledger import record_trial
+from canon_trading.ma_cross import MaCrossConfig
 from canon_trading.ranking import RankingReport
 from canon_trading.ranking import RankingStopped
 from canon_trading.ranking import rank
@@ -736,11 +742,11 @@ def test_a_ranking_of_a_sample_moved_beneath_the_pass_is_refused(
     )
     original = canon_trading.variant_study.rank
 
-    def moved_recorded_then_ranked(study: optuna.Study) -> Any:
+    def moved_recorded_then_ranked(study: optuna.Study, *plan: Any, **named: Any) -> Any:
         _move(ledger, study.study_name)
         with open_study(study.study_name, ledger) as other:
             record_grid(other, tmp_path / "catalog", configs)
-        return original(study)
+        return original(study, *plan, **named)
 
     monkeypatch.setattr(canon_trading.variant_study, "rank", moved_recorded_then_ranked)
     with pytest.raises(ValueError, match=r"ranked sample 1 \(2025-03-17.*not sample 0"):
@@ -766,9 +772,9 @@ def test_a_stop_on_a_sample_moved_beneath_the_pass_is_refused(
     configs = grid(symbols=("SPY",), periods=SHORT)
     original = canon_trading.variant_study.rank
 
-    def moved_then_ranked(study: optuna.Study) -> Any:
+    def moved_then_ranked(study: optuna.Study, *plan: Any, **named: Any) -> Any:
         _move(ledger, study.study_name)
-        return original(study)
+        return original(study, *plan, **named)
 
     monkeypatch.setattr(canon_trading.variant_study, "rank", moved_then_ranked)
     with pytest.raises(ValueError, match=r"stopped on sample 1 \(2025-03-17.*not sample 0"):
@@ -922,3 +928,158 @@ def test_a_pass_whose_configurations_repeat_a_key_is_refused_before_any_trial(
             assert key_of(first) in str(refused.value)
         assert study.get_trials() == []
         assert record_grid(study, tmp_path / "catalog", [first, second]).recorded == (0, 1)
+
+
+@pytest.mark.parametrize("on_the_plan_s_range", [True, False], ids=["its range", "another range"])
+def test_a_plan_that_repeats_a_key_is_refused_whichever_way_into_the_ranking(
+    alpaca_bars: AlpacaBars, tmp_path: Path, on_the_plan_s_range: bool
+) -> None:
+    """Antigravity, gate round 8: the repeated-key refusal stood in `record_grid` alone, so
+    `run_study(..., rank_only=True)` went round it. With both keys recorded, a plan of three
+    entries naming one twice was ranked and passed at N = 2, where the pass that records refused
+    it. Every way into a ranking now passes one refusal, first: the pass that records, the pass
+    that only ranks, and `rank` given the plan, each before it reads or runs anything, and before
+    the check of the study's range, so the two kinds of pass stop at the same place."""
+    write_both(alpaca_bars, tmp_path / "catalog")
+    [first, second] = grid(symbols=("SPY",), periods=SHORT)
+    ledger = tmp_path / "trials.db"
+    recorded, whole = run_study(
+        tmp_path / "catalog",
+        name="s",
+        ledger_path=ledger,
+        configs=[first, second],
+        start=START,
+        end=END,
+        create=True,
+    )
+    assert recorded is not None and recorded.recorded == (0, 1)
+    assert isinstance(whole, RankingReport) and whole.n == 2
+    twice = [first, first, second]
+
+    for rank_only in (True, False):
+        with pytest.raises(ValueError, match=r"the plan names SPY 2/5 twice") as refused:
+            run_study(
+                tmp_path / "catalog",
+                name="s",
+                ledger_path=ledger,
+                configs=twice,
+                start=START if on_the_plan_s_range else SHIFTED,
+                end=END,
+                rank_only=rank_only,
+            )
+        assert key_of(first) in str(refused.value)
+    with pytest.raises(ValueError, match=r"the plan names SPY 2/5 twice"):
+        # Code review of the change: a pass that creates its study refused the plan only after
+        # the ledger and the study were made, so the corrected plan then met a duplicate study.
+        run_study(
+            tmp_path / "catalog",
+            name="s",
+            ledger_path=tmp_path / "new" / "trials.db",
+            configs=twice,
+            start=START,
+            end=END,
+            create=True,
+        )
+    assert not (tmp_path / "new").exists()
+    with open_study("s", ledger) as study:
+        assert len(study.get_trials()) == 2  # neither pass ran a trial
+        with pytest.raises(ValueError, match=r"the plan names SPY 2/5 twice"):
+            rank(study, [key_of(config) for config in twice], legend=legend(twice))
+        assert rank(study, [key_of(first), key_of(second)]) == whole
+
+
+def test_a_pass_with_a_second_currency_records_nothing(
+    alpaca_bars: AlpacaBars, tmp_path: Path
+) -> None:
+    """Antigravity, gate round 8: with balances in two currencies the pass recorded every trial
+    as traded with none failed, each holding per-position returns, and the ranking then stopped on
+    every one as not in the writer's shape; a retry skipped them, and a moved sample carried their
+    keys in N. The balances are refused by name before the first trial (ADR 0053)."""
+    write_both(alpaca_bars, tmp_path / "catalog")
+    configs = grid(symbols=("SPY",), periods=SHORT)
+    with create_ledger_study(
+        "s", start=START.isoformat(), end=END.isoformat(), path=tmp_path / "trials.db"
+    ) as study:
+        with pytest.raises(ValueError, match="are not one balance in USD"):
+            record_grid(
+                study,
+                tmp_path / "catalog",
+                configs,
+                starting_balances=["100000 USD", "50000 EUR"],
+            )
+        assert study.get_trials() == []
+        assert record_grid(study, tmp_path / "catalog", configs).recorded == (0, 1)
+        assert rank(study).n == 2
+
+
+HOURLY = BarType.from_str("AAPL.ALPACA-1-HOUR-LAST-EXTERNAL")
+# Six hourly closes on each of two UTC days, Monday 2025-03-10 and Tuesday 2025-03-11.
+HOURLY_CLOSES = (101.0, 103.0, 102.0, 105.0, 104.0, 107.0, 106.0, 103.0, 105.0, 101.0, 104.0, 108.0)
+
+
+def write_two_days_of_hourly_bars(alpaca_bars: AlpacaBars, path: Path) -> None:
+    """AAPL's instrument and twelve hourly bars, opening 13:00 to 18:00 UTC on each of two days,
+    through the adapter's own parsing, as `conftest.AlpacaBars` writes daily ones."""
+    instrument = alpaca_bars.equity("AAPL")
+    bars, previous = [], 100.0
+    for n, close in enumerate(HOURLY_CLOSES):
+        opened = datetime(2025, 3, 10 + n // 6, 13 + n % 6, tzinfo=UTC)
+        payload = {
+            "t": opened.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "o": previous,
+            "h": max(previous, close),
+            "l": min(previous, close),
+            "c": close,
+            "v": 1_000_000,
+            "n": 1_000,
+            "vw": close,
+        }
+        bars.append(parse_bar(AlpacaBar("AAPL", payload), HOURLY, instrument))
+        previous = close
+    path.mkdir(exist_ok=True)
+    catalog = ParquetDataCatalog(str(path))
+    catalog.write_instruments([instrument])
+    day = 86_400 * 1_000_000_000
+    start = bars[0].ts_init // day * day
+    catalog.write_bars(bars, start=start, end=start + 2 * day)
+
+
+def test_a_study_of_two_session_days_is_told_no_value_and_stops_by_name(
+    alpaca_bars: AlpacaBars, tmp_path: Path
+) -> None:
+    """Antigravity, gate round 8, by the ledger's own writer: over a sample of two UTC days each
+    run traded and was told `COMPLETE` with a Sharpe ratio, though skfolio's deflated Sharpe ratio,
+    which the gate takes, is NaN below three returns; the ranking stopped only at its last stop,
+    on the pick. Each record is told no value, and the ranking names every one of them."""
+    write_two_days_of_hourly_bars(alpaca_bars, tmp_path / "catalog")
+    configs = [
+        MaCrossConfig(
+            bar_type=HOURLY, trade_size=Quantity.from_int(100), fast_period=f, slow_period=s
+        )
+        for f, s in ((1, 2), (2, 4))
+    ]
+    with create_ledger_study(
+        "two-days",
+        start="2025-03-10T12:00:00",
+        end="2025-03-11T20:00:00",
+        path=tmp_path / "trials.db",
+    ) as study:
+        recorded = record_grid(study, tmp_path / "catalog", configs)
+        trials = study.get_trials()
+
+        assert (recorded.recorded, recorded.failed) == ((0, 1), ())
+        assert [len(t.user_attrs["session_days"]) for t in trials] == [2, 2]
+        assert [(t.user_attrs[OUTCOME], t.state, t.values) for t in trials] == [
+            (TRADED, TrialState.FAIL, None)
+        ] * 2
+        with pytest.raises(RankingStopped) as stopped:
+            rank(study)
+
+    message = str(stopped.value)
+    for number, config in enumerate(configs):
+        assert (
+            f"{key_of(config)}: of its returns on its 2 session days, skfolio's deflated Sharpe "
+            "ratio is nan"
+        ) in message
+        assert f"(#{number})" in message
+    assert "for the pick" not in message

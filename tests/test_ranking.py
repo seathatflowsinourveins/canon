@@ -978,10 +978,14 @@ def test_returns_that_differ_by_rounding_around_zero_are_not_the_same_returns(
 def test_a_dsr_that_is_not_finite_stops_naming_the_pick(
     study: optuna.Study, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """The last stop: every series has a DSR of its own before it is ranked (the numeric check asks
+    skfolio for it), so this one is reached only if skfolio has none against the study's trials."""
     first = write(study, "pick", PICK)
     write(study, "second", SECOND)
+    asked = measures.deflated_sharpe_ratio
     monkeypatch.setattr(
-        "canon_trading.ranking.measures.deflated_sharpe_ratio", lambda *_: float("nan")
+        "canon_trading.ranking.measures.deflated_sharpe_ratio",
+        lambda returns, trials: float("nan") if len(trials) > 1 else asked(returns, trials),
     )
 
     with pytest.raises(
@@ -2309,8 +2313,8 @@ def test_returns_whose_squares_overflow_stop_by_name(
     """Antigravity, gate round 4: finite returns whose squares pass float64's largest made skfolio's
     standard deviation infinite and the Sharpe ratio 0.0, so a study rejected at DSR 0.69241 passed
     at 0.97295, a pick of Sharpe ratio 3.93 lost to one of 0.699, and two such trials raised a bare
-    ValueError from N-hat. The series is refused where it enters the gate, naming it and the
-    variance skfolio takes of it (round 7's one check)."""
+    ValueError from N-hat. The series is refused where it enters the gate, naming it: skfolio,
+    asked for what the gate takes of it, gives no deflated Sharpe ratio (round 8's model)."""
     big = [label for label, returns in case.items() if max(map(abs, returns)) > 1e150]
     numbers = {label: write(study, label, returns) for label, returns in case.items()}
 
@@ -2320,7 +2324,7 @@ def test_returns_whose_squares_overflow_stop_by_name(
     message = str(stopped.value)
     for label in big:
         assert re.search(
-            rf"{label}: [^\n]*skfolio's variance is inf[^\n]*\(#{numbers[label]}\)",
+            rf"{label}: [^\n]*skfolio's deflated Sharpe ratio is nan[^\n]*\(#{numbers[label]}\)",
             message,
         )
 
@@ -2390,7 +2394,7 @@ def test_returns_whose_fourth_central_moment_overflows_stop_by_name(study: optun
 
     with pytest.raises(
         RankingStopped,
-        match=rf"pick: [^\n]*skfolio's fourth central moment is inf[^\n]*\(#{number}\)",
+        match=rf"pick: [^\n]*deflated Sharpe ratio is nan[^\n]*kurtosis nan[^\n]*\(#{number}\)",
     ):
         rank(study)
 
@@ -2524,7 +2528,7 @@ def test_closed_day_zeros_do_not_let_moments_that_overflow_into_the_matrix(tmp_p
 
         with pytest.raises(
             RankingStopped,
-            match=rf"second: [^\n]*fourth central moment is inf[^\n]*\(#{number}\)",
+            match=rf"second: [^\n]*deflated Sharpe ratio is nan[^\n]*kurtosis nan[^\n]*\(#{number}\)",
         ):
             rank(study)
 
@@ -2617,26 +2621,26 @@ def test_a_series_next_to_the_threshold_stops_and_one_clear_of_it_ranks_as_it_is
     study: optuna.Study, tmp_path: Path
 ) -> None:
     """The limit of the measure, stated once (ADR 0080): returns of 1.0 and 1.0 + 128 steps of
-    float64's spacing vary by more than rounding can give thirty equal returns, so the series is
-    read, with a Sharpe ratio of 6.9e13; but rounding can move that ratio by more than its own
-    size, so every other trial ranks within rounding of it and the ranking stops by name. At 4,096
-    steps the ratio is 2.2e12 and rounding moves it by a quarter of that: it is the highest, and
-    the gate ranks the input as it is. At 96 steps the same shape is refused."""
+    float64's spacing vary by more than rounding can give thirty equal returns, but rounding can
+    move their Sharpe ratio, 6.9e13, by more than its own size, so the series is refused where it
+    enters the gate, told no value, and the ranking stops naming it. Until round 8 it was accepted
+    and stopped the ranking only by having the highest ratio. At 4,096 steps the ratio is 2.2e12
+    and rounding moves it by a quarter of that: it is the highest, and the gate ranks the input as
+    it is."""
     step = math.ulp(1.0)
     write(study, "second", SECOND)
     write(study, "third", THIRD_CLOSE)
     narrow = write(study, "narrow", [1.0 + 128 * step * (n % 2) for n in range(T)])
+    [trial] = [t for t in study.trials if t.number == narrow]
+    assert (trial.state, trial.values) == (TrialState.FAIL, None)
 
-    with pytest.raises(RankingStopped) as stopped:
+    with pytest.raises(
+        RankingStopped,
+        match=rf"narrow: its returns do not vary beyond rounding[^\n]*\(#{narrow}\)",
+    ) as stopped:
         rank(study)
 
-    message = str(stopped.value)
-    [line] = [line for line in message.splitlines() if "on returns that differ" in line]
-    assert f"narrow (#{narrow}), Sharpe ratio 6918" in line and "second (#" in line
-    # The one trial that causes it is named as the cause, with why.
-    [cause] = [line for line in message.splitlines() if "barely vary beyond rounding" in line]
-    assert cause.startswith(f"* narrow (#{narrow}): its returns barely vary beyond rounding")
-    assert "more than the ratio itself, so no trial is told apart from it" in cause
+    assert "on returns that differ" not in str(stopped.value)
     with create_ledger_study("clear", start=DAY_0, end=END, path=tmp_path / "clear.db") as clear:
         write(clear, "second", SECOND)
         write(clear, "third", THIRD_CLOSE)
@@ -2647,12 +2651,140 @@ def test_a_series_next_to_the_threshold_stops_and_one_clear_of_it_ranks_as_it_is
         (1.0 + 2048 * step) / (2048 * step * math.sqrt(T / (T - 1)))
     )
     assert report.sharpe > 2.1e12 and math.isfinite(report.v) and math.isfinite(report.dsr)
-    with create_ledger_study("below", start=DAY_0, end=END, path=tmp_path / "below.db") as below:
-        write(below, "second", SECOND)
-        write(below, "third", THIRD_CLOSE)
-        write(below, "narrow", [1.0 + 96 * step * (n % 2) for n in range(T)])
-        with pytest.raises(RankingStopped, match="narrow: its returns do not vary beyond rounding"):
-            rank(below)
+
+
+# The gate's eighth outside round, 2026-11-11 (Antigravity). Finding 2's two series: thirty returns
+# of -1 and -1 - 880 steps of float64's spacing, a standard deviation 14.9 times the rounding of
+# their mean and a Sharpe ratio of -1.006e13 that rounding can move by 1.079e13; and thirty of 1.99
+# and 1.99 + 1,020 steps, 17.3 times, a ratio of 1.728e13.
+NEAR_THRESHOLD_NEGATIVE = [-1.0 - 880 * math.ulp(1.0) * (n % 2) for n in range(T)]
+CLEAR_POSITIVE = [1.99 + 1020 * math.ulp(1.99) * (n % 2) for n in range(T)]
+
+
+@pytest.mark.parametrize("negative_first", [False, True])
+def test_a_negative_ratio_next_to_the_threshold_never_ranks_beside_a_pick_that_passes(
+    study: optuna.Study, negative_first: bool
+) -> None:
+    """Round 8, finding 2, the worst the gate can do: a pass the statistic does not support. A
+    series between the two factors was accepted with a bound above its own ratio, on the stated
+    ground that nothing could then be told apart from it and the ranking would stop. That held
+    only for the highest ratio. With a negative one the two sides of the comparison both carry
+    its size, which cancels, so a positive pick clear of the threshold was told apart from it:
+    the ranking went on, computed V from a ratio rounding could move by more than its size, and
+    returned DSR 1.0, passed. The series is refused where it enters the gate, in either sign: it
+    is told no value, and the ranking stops naming it, whichever was recorded first."""
+    assert math.isnan(told_sharpe(*as_recorded(NEAR_THRESHOLD_NEGATIVE)))
+    assert told_sharpe(*as_recorded(CLEAR_POSITIVE)) == pytest.approx(1.728e13, rel=1e-3)
+    written = {"negative": NEAR_THRESHOLD_NEGATIVE, "positive": CLEAR_POSITIVE}
+    order = ("negative", "positive") if negative_first else ("positive", "negative")
+    numbers = {label: write(study, label, written[label]) for label in order}
+    states = {t.number: (t.state, t.values) for t in study.trials}
+    assert states[numbers["negative"]] == (TrialState.FAIL, None)
+    assert states[numbers["positive"]][0] is TrialState.COMPLETE
+
+    with pytest.raises(
+        RankingStopped,
+        match=rf"negative: its returns do not vary beyond rounding[^\n]*\(#{numbers['negative']}\)",
+    ) as stopped:
+        rank(study)
+
+    assert "move their Sharpe ratio by the larger of 1 and its own size" in str(stopped.value)
+
+
+def test_a_record_told_complete_next_to_the_threshold_is_not_the_writers(
+    study: optuna.Study,
+) -> None:
+    """The same series in a record told `COMPLETE` with the value the code before told it: the
+    ledger's writer tells none now, so the record stops as one told a value where its returns are
+    refused, and no ranking reads the value."""
+    write(study, "positive", CLEAR_POSITIVE)
+    number = write(study, "negative", SECOND)
+    [trial] = [t for t in study.trials if t.number == number]
+    returns, days = as_recorded(NEAR_THRESHOLD_NEGATIVE)
+    study.add_trial(
+        optuna.trial.create_trial(
+            state=TrialState.COMPLETE,
+            value=-10063417014201.691,
+            user_attrs={**trial.user_attrs, "returns_series": returns, "session_days": days},
+        )
+    )
+
+    with pytest.raises(
+        RankingStopped,
+        match=r"negative: #\d+ [^\n]*told -10063417014201.691 where record_trial tells no value",
+    ):
+        rank(study)
+
+
+@pytest.mark.parametrize("sign", [1.0, -1.0], ids=["the pick", "never the pick"])
+def test_a_series_skfolio_gives_no_dsr_of_is_told_no_value_and_stops_by_name(
+    tmp_path: Path, sign: float
+) -> None:
+    """Round 8, finding 3: 55 returns at two levels with a Sharpe ratio of 54.99, for which
+    skfolio's variance adjustment is not above 0, were told `COMPLETE`. As the pick they stopped
+    the ranking only at its last stop, on a DSR of NaN; with the ratio negative they were never
+    the pick, and the ranking went on with a series skfolio gives no DSR of in its matrix. The
+    check asks skfolio what the gate asks it, so the record is told no value and the ranking stops
+    naming it, in either sign."""
+    high, low = 0.05650675558054833, 0.05450675558054833
+    returns = [sign * high] * 27 + [sign * low] * 28
+    with create_ledger_study(
+        "levels", start=DAY_0, end=DAY_0 + 55 * DAY_NS, path=tmp_path / "levels.db"
+    ) as levels:
+        write(levels, "pick", [PATTERN[n % 10] for n in range(55)])
+        write(levels, "second", [PATTERN[(n + 3) % 10] * 0.5 - 0.001 for n in range(55)])
+        number = write(levels, "levels", returns)
+        [trial] = [t for t in levels.trials if t.number == number]
+        assert (trial.state, trial.values) == (TrialState.FAIL, None)
+
+        with pytest.raises(
+            RankingStopped,
+            match=rf"levels: [^\n]*skfolio's deflated Sharpe ratio is nan[^\n]*\(#{number}\)",
+        ) as stopped:
+            rank(levels)
+
+    assert "for the pick" not in str(stopped.value)
+
+
+def test_a_plan_that_names_a_key_twice_is_refused_before_the_study_is_read(
+    study: optuna.Study,
+) -> None:
+    """Round 8, finding 4: the ranking's one door. A plan of three entries and two keys, ranked on
+    a ledger that holds both keys, would pass at N = 2 as if it were whole. `rank` refuses it by
+    name before it reads a trial, and ranks the same study with the plan given once each."""
+    write(study, "pick", PICK)
+    write(study, "second", SECOND)
+    keys = [key_of("pick"), key_of("second")]
+    names = {key_of("pick"): "the pick", key_of("second"): "the second"}
+
+    with pytest.raises(ValueError, match="the plan names the pick twice") as refused:
+        ranking.rank(study, [keys[0], keys[0], keys[1]], legend=names)
+    assert keys[0] in str(refused.value)
+    with pytest.raises(ValueError, match="the plan names one configuration twice"):
+        ranking.rank(study, [keys[1], keys[0], keys[1]])
+
+    assert ranking.rank(study, keys, legend=names) == ranking.rank(study)
+    assert ranking.rank(study, keys).n == 2
+
+
+def test_a_planned_key_with_no_record_stops_the_ranking_with_its_other_stops(
+    study: optuna.Study,
+) -> None:
+    """A plan never lowers N and is never ranked short: a planned key the ledger holds no record
+    of stops the ranking, named, beside every other stop, and a key the ledger counts that the
+    plan lacks stays counted."""
+    write(study, "pick", PICK)
+    write(study, "second", SECOND)
+    write(study, "idle", [0.0] * T, outcome=IDLE)
+    plan = [key_of("pick"), key_of("second"), key_of("never")]
+
+    with pytest.raises(RankingStopped) as stopped:
+        ranking.rank(study, plan, legend={key_of("never"): "NEVER 1/2"})
+
+    message = str(stopped.value)
+    assert "(N = 3)" in message and "never traded" in labelled(message)
+    assert "1 of the plan's 3 configurations have no record on any sample" in message
+    assert f"{key_of('never')} (NEVER 1/2): planned but never recorded" in message
 
 
 def test_trials_with_one_sharpe_ratio_have_no_v_whatever_its_variance_rounds_to(

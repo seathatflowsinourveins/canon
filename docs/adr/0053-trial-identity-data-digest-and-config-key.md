@@ -63,9 +63,14 @@ grows with the data and not with what was tried. Terms 1, 2 and 3 below were ADR
    (read from the class by reflection, so a field upstream adds is not missed), the venue's name,
    settings, fee rates and starting balances, and the bar types; not the sample. The strategies are
    built from the configs after the key is taken. Floats are written by `repr`, enums by name, decimals
-   normalised, balances as `Money` prints them, one per currency and sorted (two of one currency are
-   refused, since the venue keeps one), other NautilusTrader types by `str()`; a value with no
-   stable text form is refused, naming its field. N is the number of distinct keys over every record,
+   normalised, the starting balance as `Money` prints it, other NautilusTrader types by `str()`; a
+   value with no
+   stable text form is refused, naming its field. A trial has one starting balance, in US dollars,
+   the account's base currency and the one every instrument the adapter builds is quoted in: a
+   second balance, or another currency, is refused by name where the key is made and where the
+   venue is configured, before anything is recorded (2026-11-11, the gate's eighth outside round).
+   Until then balances were keyed one per currency, sorted, and a run with two was a trial. N is
+   the number of distinct keys over every record,
    on every sample. Known limit: the defaults are those of the pinned NautilusTrader, so a pin that
    changes one moves the key of every config that holds that field at its old or new default; a pin
    move compares `canon_trading.ledger.base_config_defaults()` before and after, which
@@ -151,8 +156,9 @@ Who decided. The orchestrator chose option 2 and its terms under the owner's del
   (`test_a_catalog_with_two_definitions_of_one_instrument_does_not_run`).
 * A sixth review of the gate, tests that failed before their fix: USD at precisions 2, 0 and 8 gives
   three digests (`test_an_instrument_s_digest_holds_the_precision_of_its_currency`); starting balances
-  are keyed one per currency in any order, and two of one currency are refused
-  (`test_starting_balances_are_keyed_one_per_currency_in_any_order`); a queued record marked while
+  were keyed one per currency in any order, and two of one currency refused (a test that went with
+  the rule on 2026-11-11, when `test_a_trial_is_keyed_on_one_balance_in_the_base_currency` took its
+  place); a queued record marked while
   `WAITING`, then started and told `FAIL` by another writer, stops and cannot be marked again
   (`test_a_waiting_record_marked_and_then_failed_by_another_writer_stops`,
   `test_a_keyless_waiting_record_can_be_marked_not_run`, which had asserted the old reading). With
@@ -296,3 +302,18 @@ package; run, executed in this checkout.
   ranking of one is UNVERIFIED, since NautilusTrader's daily series takes an account in one currency
   only (`calculate_snapshot_returns`, `crates/analysis/src/analyzer.rs` at the pinned commit, fetched).
   Not done: the series of a record whose value is checked is built again for the matrix.
+* The gate's eighth outside round, 2026-11-11, read only, by Antigravity at b586935, its first finding,
+  reproduced before the change: with balances in two currencies the account's equity is in two, so
+  NautilusTrader's daily returns give nothing (`if snapshot.total_equity.len() != 1 { return None; }`,
+  `crates/analysis/src/analyzer.rs` line 436 at the pinned commit, read in the local copy at the pin)
+  and the result holds per-position returns; each record was `traded`, the ranking stopped on every
+  one as not in the writer's shape, a later pass skipped them, and a moved sample carried their keys
+  in N. The limit kept above, a ranking of such a configuration UNVERIFIED, is closed by refusing
+  it: term 2 corrected, and no key of a single balance moves
+  (`test_the_keys_of_default_configs_are_as_they_were` passes;
+  `test_a_trial_is_keyed_on_one_balance_in_the_base_currency`, `test_a_run_with_a_second_currency_is_no_trial`,
+  `tests/test_variant_study.py::test_a_pass_with_a_second_currency_records_nothing` and
+  `tests/test_backtest.py::test_a_run_takes_one_balance_in_the_account_s_base_currency` failed first).
+  The acceptance was added for the order of balances alone (#141, a third reader's two keys for one
+  run); one balance has no order. The venue's own `base_currency` stays unset, so no run config
+  moves. A balance of zero still runs as an idle trial, which stops the ranking as one: not changed.
