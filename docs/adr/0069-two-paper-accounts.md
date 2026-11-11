@@ -66,7 +66,8 @@ names, the adapter and `canon_alpaca` stay as they are. B's items are labelled `
    account, "200 requests per minute, per account" (a support page that does not name paper accounts, so
    for paper UNVERIFIED). The stream limit belongs to the user: "in many subscriptions (or without one)
    this limit is 1". So two paper accounts of one login share one stream (read from "from a user"; no
-   page states it for a second paper account, so this is UNVERIFIED). Alpaca support states that paper
+   page states it for a second paper account, so this is UNVERIFIED; one pair held two connections at once
+   on 2026-11-11, Confirmation, "The open ends"). Alpaca support states that paper
    accounts are not eligible for the increased API rate (private correspondence, read 2026-11-11; not
    publicly documented), so paper work is sized for the standard 200 a minute. Alpaca staff forum posts say the
    200 is "per account (ie each paper and live account is separate)"
@@ -170,6 +171,43 @@ exit 0, both items in the login keychain; `mise run paper:check` exit 0, account
   (run).
 * Option 3's comparison of account IDs is still not built.
 
+**The open ends, checked 2026-11-11.** Each clause marked UNVERIFIED above, and what came of it:
+
+* The stream limit (clause 3). On paper, 2026-11-11, from 15:21:05 to 15:21:49 UTC, at 349fc9e with a
+  working tree that differed only in two records, under `mise run paper:test` (account A's lock), with B's
+  lock and the stream lock taken without waiting, so no window streamed: a probe kept outside the
+  repository opened two connections to the IEX stream with account A's pair, sending the frames
+  alpaca-py's `_connect` and `_auth` exchange. Both answered `connected`, then `authenticated` (15:21:44 and 15:21:46 UTC).
+  The first was still open after the second authenticated. Nothing was subscribed or placed, and the run
+  exited 0 (run). So on this login one pair held two authenticated connections to one endpoint for about
+  2 s, with nothing subscribed. Whether a second connection that subscribes is refused, as the page's "only
+  1 active stream connection" would have it, is UNVERIFIED. The stream lock is kept as decided. Whether A's pair and B's pair share one count of connections is still UNVERIFIED: a probe needs
+  B's pair, and only `paper:session`, which runs the window and nothing else, puts B's pair in a process.
+* The request limit (clause 3) stays UNVERIFIED for paper. Alpaca's paper-trading skill says every
+  response carries `X-RateLimit-*` headers (ADR 0044). alpaca-py 0.45.0's `RESTClient._one_request`
+  returns only the parsed body, so no documented alpaca-py path gives the headers. Settling it needs a
+  read of one response's headers on each account in the same minute, by two runs, one under each task,
+  each with a request outside alpaca-py.
+* A pair reaching one account (Decision Drivers) and a key ID shared by two pairs (clause 2) stay
+  UNVERIFIED. No Alpaca page read states either. Option 3's comparison of the `id` that `GET /v2/account`
+  returns would settle the first for the two pairs stored here.
+* The test beside the first window, whose working tree was not compared, stays UNVERIFIED for that run. It
+  was run again on paper, 2026-11-11, from 15:22:47 to 15:23:37 UTC, at 349fc9e with a working tree that
+  differed only in two records (`git status`):
+  `mise run paper:test -- -v -rs -k "flat_reconciliation or quotes_write_back"` on account A, exit 0,
+  4 passed. A window that `mise run paper:session --session auto --minutes 5` had started at 15:22:14
+  held B's lock throughout, and the stream lock from about 15:23:09, when its node started. The test did
+  not wait for B's lock. These tests open no stream, so the stream lock was not exercised. The window
+  exited 0 at 15:29:15 UTC: result `ok`, 2 fills, nothing left open, record `account: windows` (run).
+* The scheduled series on B, 2026-11-11, from the first firing at 07:48:37 UTC to the one at 15:08:42 UTC
+  (the runner's log and the window records, read). There were 15 firings. Three ran a window: 07:50 was
+  `ok` with 2 fills, and 09:25 and 10:25, in the pre-market, failed with no IEX quote or trade and placed
+  nothing. Each of the three ended with nothing left open. Of the other twelve, seven were pre-market
+  firings skipped by name (ADR 0044), and one skipped with under 635 s left in the overnight session.
+  Three skipped because a window started by hand on B had ended under 300 s before. One gave up after
+  900 s on B's lock, which a window started by hand held. The record of B's stored pair is above
+  ("Account B's pair was stored").
+
 ## Evidence
 
 Read 2026-11-10.
@@ -201,6 +239,14 @@ Read 2026-11-10.
   it (run, 2026-11-11).
 * alpaca-py 0.45.0 in `.venv`, `alpaca/data/live/`: `StockDataStream`, `CryptoDataStream`,
   `OptionDataStream` and `NewsDataStream` subclass `DataStream`, and only `DataStream` defines `run` (read).
+* Read 2026-11-11: https://docs.alpaca.markets/us/docs/streaming-market-data.md, the same lines and the
+  406 `connection limit exceeded` row (fetched again).
+  https://github.com/alpacahq/alpaca-py/blob/c42add7c0a7026e2ead3ed64e76f4def2b99fda4/alpaca/common/rest.py
+  lines 179 to 213: `_one_request` returns `response.json()`, and the headers are not returned.
+  `alpaca/data/live/websocket.py`, lines 169 to 222: `_connect` waits for `connected`, and `_auth` sends
+  `auth` and expects `authenticated`. Both were read in the local copy at the pin. The paper-trading skill's
+  `X-RateLimit-*` line is cited in ADR 0044's Evidence.
+* The 2026-11-11 runs: their saved logs and the window records are kept outside the repository (run).
 * Reviews, 2026-11-10. `/code-review` (high): nine findings, seven fixed (the real-mise cases' environment
   and copy; the other key ID read before the prompts, bounded; the help; `paper:check`'s exit 3 for a bad
   name; the key-ID claim), two left: the README's paper section, for the change that moves

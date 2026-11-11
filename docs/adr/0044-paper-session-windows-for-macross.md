@@ -349,6 +349,10 @@ Read 2026-11-10. "raw": fetched with `curl` and read whole. NautilusTrader files
   prior trading day refused, and the reach-back across a 15-hour gap in a backtest (run). Code review
   (`/code-review`, high): a refusal raised as a failure and a span counted in minutes, each fixed with a
   test; stale docstrings corrected; `sip` history for the last 15 minutes doubted, and served on paper.
+* ADR 0069, 2026-11-11: `paper:session` reads B's pair under `canon-paper-windows.lock` and the login's
+  stream lock, and `paper:test` reads account A's under its own, so "Sharing the account" and the
+  consequence that a test can lose the lock to a window describe the one account before that date (a
+  test that streams still waits for a window's stream lock); ADR 0050 states what each waits for now.
 * 2026-11-11: pre-market joined after-hours as a part with no feed, on the observations in its row of the
   table: the two windows' records (read), the probe under `mise run paper:test`, read-only, SPY through the
   adapter's node on `iex` and `boats` and alpaca-py's REST bars on each, 04:53 to 04:58 New York, exit 0
