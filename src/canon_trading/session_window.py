@@ -188,7 +188,10 @@ stop at its bound, the node's last worker calls, and the check's deadline with t
 AFTER_END_SECS = LAST_CLOSE_SECS + 2 * REQUEST_SECS
 """From a window's end until its process is done with Alpaca, at most (about 394 s): to the last close, then
 that call and the check's last reading."""
-END_MARGIN_SECS = math.ceil(LAST_CLOSE_SECS + 60)
+SKEW_SECS = 60
+"""How far this host's clock may be from Alpaca's: the window runs to an end taken from Alpaca's clock, timed
+on this host's."""
+END_MARGIN_SECS = math.ceil(LAST_CLOSE_SECS + SKEW_SECS)
 """A window ends at least this long before its session does, so the account check's last market close is
 sent while the session is open, with a minute for skew between Alpaca's clock and this host's."""
 PAPER_LOCK_WAIT_SECS = 3900
@@ -576,6 +579,7 @@ def run_window(
     failure: BaseException | None = None
     ran = False  # whether the node was run: only then is the gap marker written
     cache = None
+    events: dict[str, list[str]] = {}
     try:
         node, strategy, cap = window_node(
             config, wind_down_at=ends - timedelta(seconds=FLATTEN_SECS), log_name=f"window-{stamp}"
@@ -594,17 +598,25 @@ def run_window(
                 report.cap_checks, report.cap_peak = cap.checks, str(cap.peak)
                 report.cap_tripped = cap.tripped
             finally:
-                if len(_ABANDONED) == abandoned_before:  # else its abandoned task still owns it
-                    node.dispose()
+                try:
+                    # before the disposal, which clears the cache
+                    events = _events(cache)
+                finally:
+                    if len(_ABANDONED) == abandoned_before:  # else its abandoned task owns it
+                        node.dispose()
     except BaseException as e:
         failure = e
         raise
     finally:
         try:
             _wait_for_calls(_ABANDONED[abandoned_before:], report)
-            # read after the wait: an abandoned node's last submits are in the cache by then
-            doubtful = in_doubt(_events(cache)) if cache is not None else []
-            report.left = _flatten_after_stop(trading, config, report, in_doubt=doubtful)
+            if cache is not None and len(_ABANDONED) > abandoned_before:
+                # after the wait: an abandoned node's last submits are in it
+                events = _events(cache)
+            doubtful = in_doubt(events)
+            report.left = _flatten_after_stop(
+                trading, config, report, in_doubt=doubtful, node_ids=list(events)
+            )
         except BaseException as e:  # the account could not be checked: never recorded as ok
             failure = failure or e
             report.errors.append(f"checking the account after the stop: {type(e).__name__}: {e}")
@@ -683,6 +695,7 @@ def _flatten_after_stop(
     report: WindowReport,
     *,
     in_doubt: Sequence[str] = (),
+    node_ids: Sequence[str] = (),
 ) -> list:
     """What the account holds in the symbol after the stop, once the check has worked at clearing it.
 
@@ -696,8 +709,13 @@ def _flatten_after_stop(
     the next session). A failed call (Alpaca's `APIError`, or an `OSError`, which requests' errors are, the
     adapter's timeouts included) is recorded once and the rest of the poll is skipped, or, for one cancel,
     the next order's cancel
-    goes on. The check's own close is the order its close call returns; when that answer is lost, the
-    first new order with the close's side, quantity and type (`_matches_close`); any other is canceled.
+    goes on. The check's own close is the order its close call returns. When that answer is lost (any
+    failure but Alpaca's refusal, 403 or 422), it is the first order with the close's side, quantity and
+    type (`_matches_close`) that is no order of the node's and was not known when the close was sent,
+    looked for among the open orders and then among all the symbol's orders since; the account is not
+    flat until it is found, no other close is sent until `LOST_CLOSE_SEARCHES` searches have not found
+    it, and a close answered later ends the wait (one the lost close becomes is then canceled). Any other
+    order is canceled.
     Each node order `in_doubt` is looked up by its client order ID (`get_order_by_client_id`) each poll
     until Alpaca holds it, and the account is not flat while one is not found; one never found is named
     in the result. The result is a reading taken after the check's last cancel or close (one more read,
@@ -714,10 +732,40 @@ def _flatten_after_stop(
     known: set[str] = set()
     sent: set[str] = set()
     lost_close: Decimal | None = None  # the held quantity a close was sent for, its answer lost
+    lost_since: datetime | None = None  # a little before that close was sent, by this host's clock
+    before_close: set[str] = set()  # the orders known when it was sent: none of them is it
+    unseen = 0  # the searches that have not found the lost close
+    node_orders = set(node_ids) | set(in_doubt)  # the node's own: never the check's close
     doubtful = list(in_doubt)
     seen: list[str] | None = None
     acted = False  # whether a cancel or close was attempted after the last reading
     last_error = ""
+
+    def lose(held: Decimal, attempt: tuple[set[str], datetime]) -> None:
+        """A close whose answer was lost: what it closed, and when, to know it again."""
+        nonlocal lost_close, lost_since, before_close, unseen
+        lost_close, unseen = held, 0
+        before_close, lost_since = attempt
+
+    def find_lost_close(working: list, caller) -> None:
+        """Take the lost close from the open orders, else from every order since it was sent."""
+        nonlocal lost_close, unseen
+        for order in working:
+            if (order_id := str(order.id)) not in known:
+                known.add(order_id)
+                if lost_close is not None and _is_the_close(order, lost_close, node_orders):
+                    sent.add(order_id)
+                    lost_close = None
+        if lost_close is None or lost_since is None:
+            return
+        for order in caller(_orders_since, trading, symbol, lost_since):
+            if str(order.id) not in before_close and _is_the_close(order, lost_close, node_orders):
+                sent.add(str(order.id))
+                known.add(str(order.id))
+                lost_close = None
+                return
+        unseen += 1
+
     while True:
         try:
             found = _look_up(
@@ -727,13 +775,12 @@ def _flatten_after_stop(
             listed = {str(o.id) for o in working}
             working += [o for o in found if str(o.id) not in listed]  # held, if not yet listed
             held = call(position_qty, trading, symbol)
-            for order in working:
-                if (order_id := str(order.id)) not in known:
-                    known.add(order_id)
-                    if lost_close is not None and _matches_close(order, lost_close):
-                        sent.add(order_id)
-                        lost_close = None
-            seen = described(working, held, symbol) + _unfound(doubtful, found)
+            find_lost_close(working, call)
+            seen = (
+                described(working, held, symbol)
+                + _unfound(doubtful, found)
+                + _lost(lost_close, symbol)
+            )
             acted = False
             if not seen:
                 return seen
@@ -749,23 +796,28 @@ def _flatten_after_stop(
                     for order in working:
                         acted = True
                         call(trading.cancel_order_by_id, order.id)
+            elif held and lost_close is not None and unseen < LOST_CLOSE_SEARCHES:
+                pass  # a close whose answer was lost may still be taken: look for it before another
             elif held and call(_regular_session_open, trading):
                 acted = True
+                attempt = (set(known), datetime.now(UTC) - timedelta(seconds=SKEW_SECS))
                 try:
                     close_order = call(trading.close_position, symbol)
                 except APIError as e:
-                    if e.status_code not in CLOSE_REFUSALS:
-                        lost_close = held  # it may have reached Alpaca
+                    if e.status_code not in CLOSE_REFUSALS:  # it may have reached Alpaca
+                        lose(held, attempt)
                     raise
                 except OSError:
-                    lost_close = held
+                    lose(held, attempt)
                     raise
                 report.closed_after_stop = True
                 if (order_id := getattr(close_order, "id", None)) is not None:
                     sent.add(str(order_id))
                     known.add(str(order_id))
+                    # answered: an earlier lost close, if Alpaca takes it, is another's, canceled
+                    lost_close = lost_since = None
                 else:
-                    lost_close = held
+                    lose(held, attempt)
             elif held:
                 _note(
                     report,
@@ -787,18 +839,24 @@ def _flatten_after_stop(
         )
     if acted:  # the last reading came before a cancel or close: read once more
         try:
-            found = _look_up(lambda fn, *args: fn(*args), trading, doubtful, report)
+            # no lookups here, so the bound holds: the last poll's findings stand
             working = open_orders(trading, symbol)
             listed = {str(o.id) for o in working}
             working += [o for o in found if str(o.id) not in listed]
-            seen = described(working, position_qty(trading, symbol), symbol) + _unfound(
-                doubtful, found
+            find_lost_close(working, lambda fn, *args: fn(*args))
+            seen = (
+                described(working, position_qty(trading, symbol), symbol)
+                + _unfound(doubtful, found)
+                + _lost(lost_close, symbol)
             )
         except (APIError, OSError) as e:
             _note(report, f"reading the account after the last step: {type(e).__name__}: {e}")
     return seen
 
 
+LOST_CLOSE_SEARCHES = 2
+"""Polls that look for a close whose answer was lost before another close is sent, so that two closes do
+not both reach Alpaca (a second would open a short)."""
 CLOSE_REFUSALS = frozenset({403, 422})
 """Statuses by which Alpaca refuses an order and places nothing (the adapter's
 `DEFINITIVE_SUBMIT_REFUSALS`, from "Create an Order"); after any other failure a close may have been placed."""
@@ -825,6 +883,28 @@ def _look_up(call, trading: TradingClient, doubtful: list[str], report: WindowRe
         else:
             found.append(order)
     return found
+
+
+def _is_the_close(order, held: Decimal, node_orders: set[str]) -> bool:
+    """Whether `order` is the check's close whose answer was lost: no order of the node's, and the close's
+    side, quantity and type (`_matches_close`)."""
+    return str(order.client_order_id) not in node_orders and _matches_close(order, held)
+
+
+def _orders_since(trading: TradingClient, symbol: str, since: datetime) -> list:
+    """Every order in `symbol` submitted after `since`, whatever its status (`GetOrdersRequest.after`)."""
+    orders = trading.get_orders(
+        GetOrdersRequest(status=QueryOrderStatus.ALL, symbols=[symbol], after=since)
+    )
+    assert isinstance(orders, list)
+    return orders
+
+
+def _lost(held: Decimal | None, symbol: str) -> list[str]:
+    """A close whose answer was lost and that is not found among the orders since it was sent."""
+    if held is None:
+        return []
+    return [f"a close of {abs(held)} {symbol} sent with no answer, not found at Alpaca"]
 
 
 def _unfound(doubtful: list[str], found: list) -> list[str]:
@@ -935,17 +1015,32 @@ def _abandon(runner: asyncio.Runner, task: asyncio.Task, calls: Calls) -> None:
     _ABANDONED.append((runner, task, calls))
 
 
+LOCAL_REJECTIONS = ("INFLIGHT_TIMEOUT", "NOT_FOUND_AT_VENUE")
+"""The reasons the node gives a rejection of its own, for a submit never acknowledged: the two
+`create_reconciliation_rejected` calls in `crates/live/src/execution/manager.rs` at the pin (the in-flight
+check out of retries, an order its queries did not find). Alpaca may still take such an order."""
+
+
+def _event_name(event) -> str:
+    """An event's type name; the node's own rejection is named apart (`OrderRejectedLocally`)."""
+    found = type(event).__name__
+    reason = str(getattr(event, "reason", ""))
+    if found == "OrderRejected" and any(r in reason for r in LOCAL_REJECTIONS):
+        return "OrderRejectedLocally"
+    return found
+
+
 def _events(cache) -> dict[str, list[str]]:
     """Each of the strategy's orders in the node's cache, by client order ID, with its events' names."""
     return {
-        order.client_order_id.value: [type(e).__name__ for e in order.events()]
+        order.client_order_id.value: [_event_name(e) for e in order.events()]
         for order in cache.orders(strategy_id=STRATEGY_ID)
     }
 
 
 def _fill(report: WindowReport, cache) -> None:
     for order in cache.orders(strategy_id=STRATEGY_ID):
-        names = [type(e).__name__ for e in order.events()]
+        names = [_event_name(e) for e in order.events()]
         report.orders[order.client_order_id.value] = names
         report.fills += names.count("OrderFilled")
         for event in order.events():
