@@ -1810,8 +1810,8 @@ gw_body() { # gw_body <task> [real-curl]: its run body from mise.gateway.toml wi
   [ "${2:-}" = real-curl ] || body=${body//\/usr\/bin\/curl/$GW/curl}
   printf '%s' "$body"
 }
-gw_run() { # gw_run <task> [VAR=value ...]: the body with HOME in the temp folder; output in $GW/out
-  local t="$1" body; shift; body=$(gw_body "$t")
+gw_run() { # gw_run <task> [VAR=value ...]: the body (or $GW_BODY) with HOME in the temp folder; output in $GW/out
+  local t="$1" body; shift; body=${GW_BODY:-$(gw_body "$t")}
   [ -n "$body" ] || { echo "no body" > "$GW/out"; return 99; }
   rm -f "$GW/omniroute.env"; : > "$GW/log"; : > "$GW/curl.log"; : > "$GW/curl.in"
   env HOME="$GW/home" PATH="$GW/bin:$PATH" "$@" bash -c "$body" > "$GW/out" 2>&1
@@ -1862,7 +1862,7 @@ if [ ! -x /usr/bin/sqlite3 ]; then
   skip "omniroute:serve and stored overrides" "no /usr/bin/sqlite3 here"
 else
   gdb="$GW/home/.omniroute/storage.sqlite"; mkdir -p "$GW/home/.omniroute"
-  gw_db() { rm -f "$gdb"; /usr/bin/sqlite3 "$gdb" "CREATE TABLE key_value (namespace TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (namespace, key)); $1"; }
+  gw_db() { rm -f "$gdb" "$gdb-wal" "$gdb-shm"; /usr/bin/sqlite3 "$gdb" "CREATE TABLE key_value (namespace TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (namespace, key)); $1"; }
   gw_db "INSERT INTO key_value VALUES ('feature_flags','REQUIRE_API_KEY','false');"; gw_run omniroute:serve; rc=$?
   check "omniroute:serve, a stored REQUIRE_API_KEY override of false: refused, the gateway not started, exit 1" \
         eval '[ "$rc" = 1 ] && [ ! -e "$GW/omniroute.env" ] && grep -q "REQUIRE_API_KEY override" "$GW/out"'
@@ -1876,7 +1876,23 @@ else
   rm -f "$gdb"; echo "not a database" > "$gdb"; gw_run omniroute:serve; rc=$?
   check "... a database that cannot be read: refused, never read as no override, naming the way out, exit 1" \
         eval '[ "$rc" = 1 ] && [ ! -e "$GW/omniroute.env" ] && grep -q "move that folder away" "$GW/out"'
-  rm -f "$gdb"
+  # OmniRoute's database is in WAL mode, and a clean stop removes its -wal and -shm files; a read-only
+  # connection then cannot open it (https://www.sqlite.org/wal.html, section 5, Read-Only Databases; Apple's
+  # sqlite3 3.54.0 says "unable to open database file (14)"), so the read must open it normally under
+  # query_only. gw_wal: the table in a WAL database, checkpointed, with no side files, as after a clean stop.
+  gw_wal() { gw_db "PRAGMA journal_mode=WAL; $1 PRAGMA wal_checkpoint(TRUNCATE);" > /dev/null; rm -f "$gdb-wal" "$gdb-shm"; }
+  gw_wal ""; gw_run omniroute:serve; rc=$?
+  check "... a WAL database after a clean stop (no -wal or -shm), no override: read, and started" \
+        eval '[ "$(od -An -tx1 -j18 -N2 "$gdb" | tr -d " ")" = 0202 ] && [ "$rc" = 0 ] && [ -e "$GW/omniroute.env" ]'
+  gw_wal "INSERT INTO key_value VALUES ('feature_flags','REQUIRE_API_KEY','false');"; gw_run omniroute:serve; rc=$?
+  check "... the same with an override of false: read, and refused for the override, not for the open" \
+        eval '[ "$rc" = 1 ] && [ ! -e "$GW/omniroute.env" ] && grep -q "REQUIRE_API_KEY override" "$GW/out"'
+  # The task's own open, with an INSERT put ahead of its SELECT: query_only refuses the write
+  gw_wal ""; body=$(gw_body omniroute:serve); wbody=${body/\"SELECT count(\*)/\"INSERT INTO key_value VALUES (\'feature_flags\', \'REQUIRE_API_KEY\', \'false\'); SELECT count(*)}
+  GW_BODY=$wbody gw_run omniroute:serve; rc=$?
+  check "... a write through the task's own open: refused as a readonly database, nothing stored" \
+        eval '[ "$wbody" != "$body" ] && [ "$rc" = 1 ] && grep -q "attempt to write a readonly database" "$GW/out" && [ "$(/usr/bin/sqlite3 "$gdb" "SELECT count(*) FROM key_value;")" = 0 ]'
+  rm -f "$gdb" "$gdb-wal" "$gdb-shm"
 fi
 gw_reset
 

@@ -149,10 +149,17 @@ if [ -e "$data/storage.sqlite" ]; then
   # (resolveFeatureFlag, src/shared/utils/featureFlags.ts), and no setting makes the environment win, so a
   # database that turns it off is refused. Classified in SQL as OmniRoute parses it (requireApiKeyValue.mjs:
   # on only as true, 1 or yes, any case, ends trimmed) from its key_value table (src/lib/db/featureFlags.ts),
-  # read as bootstrap reads it: Apple's sqlite3, read-only. The dashboard login is off by design (setup).
+  # opened as bootstrap opens it: Apple's sqlite3, a normal open with the SQL on stdin after PRAGMA
+  # query_only=1, which refuses any statement that writes. Not -readonly: the database is in WAL mode, a clean
+  # stop removes its -wal and -shm files, and a read-only connection cannot create them, so it fails to open
+  # ("unable to open database file (14)", Apple's sqlite3 3.54.0; https://www.sqlite.org/wal.html, 5.
+  # Read-Only Databases). The open itself is not inert: it creates the side files, and after a crash it
+  # checkpoints a leftover WAL or rolls back a hot journal, as OmniRoute's own open does on its start.
+  # Unlike bootstrap, the error text goes into the message and sqlite3 has no test override. The dashboard
+  # login is off by design (setup).
   ov=$(printf '%s\n' 'PRAGMA query_only=1;' \
          "SELECT count(*) FROM key_value WHERE namespace = 'feature_flags' AND key = 'REQUIRE_API_KEY' AND lower(trim(value, ' ' || char(9, 10, 11, 12, 13))) NOT IN ('true', '1', 'yes');" \
-       | /usr/bin/sqlite3 -readonly -bail "$data/storage.sqlite" 2>&1) \
+       | /usr/bin/sqlite3 -bail "$data/storage.sqlite" 2>&1) \
     || { echo "omniroute:serve: could not read the stored settings in $data/storage.sqlite ($ov); not started. If a first start was stopped before it finished, move that folder away and run omniroute:store again." >&2; exit 1; }
   [ "$ov" = 0 ] || { echo "omniroute:serve: $data/storage.sqlite stores a REQUIRE_API_KEY override that turns the API key off, which OmniRoute applies over this task's settings; turn it back on in the dashboard (Feature Flags) and start again. Not started." >&2; exit 1; }
 fi
