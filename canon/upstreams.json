@@ -612,10 +612,15 @@
       "track": "tag:v10.34.9",
       "role": "tool",
       "license": "MIT",
-      "why": "Package manager dsh-tui needs to build and update its profile (ADR 0045). Installed machine-level by the owner (mise pnpm 10.34.9), not in mise.toml; check with pnpm --version. It runs on the machine-level mise node, 24.22.2 by mise ls -g; the node entry is this repo's own request, which the same release meets. Held 2026-11-10: v12.19.0 (published 2026-11-10) is two major versions past v10; the v11.0.0 and v12.0.0 notes are not yet read against dsh-tui's use, and pin and hand install move together; mise's 24-hour minimum_release_age default (ADR 0008) would not install it before 2026-11-11 either. No record sets a waiting period for a pin moved by hand (ADR 0016's seven days is the bot's; ADR 0001 only quotes Dependabot's default). Look again 2026-11-13.",
+      "why": "Package manager dsh-tui needs to build and update its profile (ADR 0045). Installed machine-level by the owner (mise pnpm 10.34.9), not in mise.toml; check with pnpm --version. It runs on the machine-level mise node, 24.22.2 by mise ls -g; the node entry is this repo's own request, which the same release meets. Held 2026-11-10: v12.19.0 (published 2026-11-10) is two major versions past v10. The v11.0.0 notes (2026-04-28) require Node 22 or later, turn on strictDepBuilds, blockExoticSubdeps and a one-day minimumReleaseAge by default, replace the build-dependency settings with allowBuilds, and read .npmrc for auth and registry only. Among the v12.0.0 notes (2026-08-26): git dependencies on known hosts resolve through HTTPS, an unrecognised pnpm-workspace.yaml setting fails where the project's pnpm pin is satisfied, --frozen-lockfile false is gone, engineStrict is stricter, and cyclic peer dependencies re-key a lockfile once. dsh-TUI at v0.17.0 and v0.19.0 asks for pnpm 10 or newer (docs/getting-started.en.md: 'CI uses 11'), so the pinned 10.34.9 is inside its range; its package.json pins packageManager pnpm@11.21.0, and its README documents pnpm 11's blocked install scripts, which its update command configures. Its CI runs only pnpm 11 (newest v11 tag v11.28.11), so v12 with dsh-tui is UNVERIFIED. Pin and hand install move together. mise's minimum_release_age (ADR 0008) does not filter an exact version such as pnpm@12.19.0 (mise settings page), so it would not hold a hand install. No record sets a waiting period for a pin moved by hand (ADR 0016's seven days is the bot's; ADR 0001 only quotes Dependabot's default). Look again 2026-11-13.",
       "evidence": [
         "https://github.com/pnpm/pnpm/releases/tag/v10.34.9",
-        "https://raw.githubusercontent.com/ccch1mneyyy/dsh-TUI/main/README.md"
+        "https://github.com/pnpm/pnpm/releases/tag/v11.0.0",
+        "https://github.com/pnpm/pnpm/releases/tag/v12.0.0",
+        "https://raw.githubusercontent.com/ccch1mneyyy/dsh-TUI/v0.17.0/docs/getting-started.en.md",
+        "https://raw.githubusercontent.com/ccch1mneyyy/dsh-TUI/v0.17.0/README.md",
+        "https://raw.githubusercontent.com/ccch1mneyyy/dsh-TUI/v0.17.0/package.json",
+        "https://mise.jdx.dev/configuration/settings.html"
       ],
       "adr": "0045"
     },
