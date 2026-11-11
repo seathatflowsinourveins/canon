@@ -24,7 +24,8 @@
 #
 # Overrides: CLAUDE_CONFIG_DIR replaces ~/.claude; CANON_LAUNCHAGENTS_DIR replaces ~/Library/LaunchAgents
 # and CANON_PAPER_SESSION_DIR the session windows' record folder, CANON_UNLOAD_SECS the wait for a job to
-# leave launchd (default 30) (tests only); AUTOMATION_SKIP_LAUNCHD=1 is a rehearsal of `install` that does every step except the
+# leave launchd (default 30), CANON_LAUNCHCTL_SECS the bound on each launchctl call (default 30) and
+# CANON_LOCKF lockf(1) (tests only); AUTOMATION_SKIP_LAUNCHD=1 is a rehearsal of `install` that does every step except the
 # launchctl calls. mise is the one on PATH, else ~/.local/bin/mise; its absolute path goes into the git
 # credential helper.
 set -uo pipefail
@@ -53,8 +54,10 @@ PAPER_FIRING=$((120 + PAPER_DEADLINE + 300))
 # interval after the longest firing ends; with no stamp for longer, and 300 s more, the schedule has stopped
 PAPER_SILENT=$((PAPER_FIRING + PAPER_INTERVAL + 300))
 WATCH_SECS=120                                        # lanes-watch.sh's bound on the lanes report it runs
+WATCH_NOTIFY_SECS=30                                  # ...and on its notification (NOTIFY_SECS)
 # the watchdog stamps each check as it starts; the next starts at most an interval after the longest ends
-WATCH_SILENT=$((WATCH_SECS + INTERVAL + 300))
+# (each bound with the 5 s timeout -k gives a command that ignores SIGTERM)
+WATCH_SILENT=$((WATCH_SECS + 5 + WATCH_NOTIFY_SECS + 5 + INTERVAL + 300))
 PAPER_CHECKOUT="$CANON_HOME/paper-checkout"           # the clone each firing brings to origin's main
 PAPER_DIR="${CANON_PAPER_SESSION_DIR:-$(/usr/bin/getconf DARWIN_USER_TEMP_DIR 2>/dev/null)canon-paper-session}"
 STALE_DAYS=2
@@ -71,38 +74,69 @@ PAPER_COMMIT='def short: (. // "not recorded") as $c | if ($c | test("^[0-9a-f]{
 FAILS=""
 note() { printf '%s\n' "$*"; case "$*" in *FAILED:*|*SKIPPED:*) FAILS="$FAILS"$'\n'"$*" ;; esac; }
 
+# lc <launchctl arguments>: launchctl, each call bounded at LAUNCHCTL_SECS by timeout(1) (SIGTERM, then
+# SIGKILL 5 s later), so a launchd that does not answer fails the call, exit 124 or 137, instead of holding
+# install, uninstall or status (a bound on the wait below bounds no single call in it)
+LAUNCHCTL_SECS=${CANON_LAUNCHCTL_SECS:-30}
+case "$LAUNCHCTL_SECS" in ''|*[!0-9]*) LAUNCHCTL_SECS=30 ;; esac
+# --foreground: launchctl stays in the caller's process group, so a Ctrl-C at install reaches it (timeout(1))
+lc() { /usr/bin/timeout --foreground -k 5 "$LAUNCHCTL_SECS" launchctl "$@"; }
+# no_answer <rc>: whether lc ended at its bound
+no_answer() { [ "$1" = 124 ] || [ "$1" = 137 ]; }
+# loaded <label>: 0 when `launchctl print` finds the label, 2 when it did not answer, 1 otherwise
+loaded() { local rc=0; lc print "$DOMAIN/$1" >/dev/null 2>&1 || rc=$?; if [ "$rc" = 0 ]; then return 0; elif no_answer "$rc"; then return 2; fi; return 1; }
 # unload <label>: `launchctl bootout`, then wait, at most UNLOAD_SECS of elapsed time, until `launchctl print`
 # no longer finds the label. bootout returns while a running job is still stopping, and a bootstrap of the
 # same label then fails with 5, Input/output error (observed on this Mac with a throwaway label whose job
 # takes 4 s to exit on SIGTERM); the kept-alive collector is such a job. Returns 0 when the label is gone; 2,
-# with launchctl's message in UNLOAD_ERR, when bootout was refused for a label print still finds; 1 when the
-# label is still loaded once the wait is over. UNLOAD_ABSENT=1 says there was nothing to unload.
+# with launchctl's message in UNLOAD_ERR, when bootout was refused for a label print still finds; 3 when
+# launchctl did not answer within LAUNCHCTL_SECS; 1 when the label is still loaded once the wait is over.
+# UNLOAD_ABSENT=1 says there was nothing to unload.
+# the lock(1) that tells whether a window still runs from the paper clone (CANON_LOCKF: tests only)
+LOCKF=${CANON_LOCKF:-/usr/bin/lockf}
 UNLOAD_SECS=${CANON_UNLOAD_SECS:-30}
 case "$UNLOAD_SECS" in ''|*[!0-9]*) UNLOAD_SECS=30 ;; esac
 UNLOAD_ERR="" UNLOAD_ABSENT=0
 unload() {
-  local end=$((SECONDS + UNLOAD_SECS))
+  local end=$((SECONDS + UNLOAD_SECS)) rc=0 st
   UNLOAD_ABSENT=0
-  if ! UNLOAD_ERR=$(launchctl bootout "$DOMAIN/$1" 2>&1); then
-    if ! launchctl print "$DOMAIN/$1" >/dev/null 2>&1; then UNLOAD_ABSENT=1; return 0; fi   # it was not loaded
+  UNLOAD_ERR=$(lc bootout "$DOMAIN/$1" 2>&1) || rc=$?
+  if no_answer "$rc"; then return 3; fi
+  if [ "$rc" != 0 ]; then
+    loaded "$1"; st=$?
+    if [ "$st" = 1 ]; then UNLOAD_ABSENT=1; return 0; fi   # it was not loaded
+    [ "$st" != 2 ] || return 3
     UNLOAD_ERR=${UNLOAD_ERR//$'\n'/; }; return 2
   fi
-  while launchctl print "$DOMAIN/$1" >/dev/null 2>&1; do
+  while :; do
+    loaded "$1"; st=$?
+    [ "$st" != 1 ] || return 0
+    [ "$st" != 2 ] || return 3
     [ "$SECONDS" -lt "$end" ] || return 1
     sleep 0.5
   done
 }
 # unload_note <label> <rc of unload>: the line a failed unload gets
 unload_note() {
-  if [ "$2" = 2 ]; then note "  FAILED: launchctl bootout refused $1: ${UNLOAD_ERR:-no message}; run: scripts/automation install"
-  else note "  FAILED: the earlier $1 was still stopping after ${UNLOAD_SECS} s, so the new one was not loaded; run: scripts/automation install"; fi
+  case "$2" in
+    2) note "  FAILED: launchctl bootout refused $1: ${UNLOAD_ERR:-no message}; run: scripts/automation install" ;;
+    3) note "  FAILED: launchctl did not answer within ${LAUNCHCTL_SECS} s about $1, so the new one was not loaded; run: scripts/automation install" ;;
+    *) note "  FAILED: the earlier $1 was still stopping after ${UNLOAD_SECS} s, so the new one was not loaded; run: scripts/automation install" ;;
+  esac
 }
 # boot <label> <plist> <what loaded says>: bootstrap the plist; on a refusal it says plainly what launchd has
 # loaded for the label now, and what to run
 boot() {
-  if launchctl bootstrap "$DOMAIN" "$2"; then note "  loaded     $1 $3"; return 0; fi
-  if launchctl print "$DOMAIN/$1" >/dev/null 2>&1; then
+  local rc=0 st
+  lc bootstrap "$DOMAIN" "$2" || rc=$?
+  if [ "$rc" = 0 ]; then note "  loaded     $1 $3"; return 0; fi
+  if no_answer "$rc"; then
+    note "  FAILED: launchctl bootstrap of $1 did not answer within ${LAUNCHCTL_SECS} s; whether it is loaded is not known; run: scripts/automation install"; return 1
+  fi
+  loaded "$1"; st=$?
+  if [ "$st" = 0 ]; then
     note "  FAILED: launchctl bootstrap refused $1; launchd still has a job loaded for it, not this install's; run: scripts/automation install"
+  elif [ "$st" = 2 ]; then note "  FAILED: launchctl bootstrap refused $1, and launchctl did not answer whether anything is loaded for it; run: scripts/automation install"
   else note "  FAILED: launchctl bootstrap refused $1; nothing is loaded for it now; run: scripts/automation install"; fi
   return 1
 }
@@ -343,31 +377,31 @@ do_install() {
     note "  FAILED: $paper_mise"; ok=1
   elif ! paper_url=$(git -C "$ROOT" remote get-url origin 2>/dev/null) || [ -z "$paper_url" ]; then
     note "  FAILED: no origin remote, so there is no main to fetch for the windows"; ok=1
-  elif ! /usr/bin/install -m 755 "$ROOT/home/.claude/canon/paper-session.sh" "$CANON_HOME/paper-session.sh"; then
-    note "  FAILED: could not install $CANON_HOME/paper-session.sh"; ok=1
   else
-    note "  installed  $CANON_HOME/paper-session.sh"
-    # unload the old job first, so no firing runs in the clone while install moves it to origin's main
+    # the old job is unloaded before anything it runs is replaced, so no firing of it runs the new runner or
+    # the clone while install moves them; one that would not unload leaves all of them as they were
     local paper_unloaded=0
-    if [ "${AUTOMATION_SKIP_LAUNCHD:-0}" != "1" ]; then
-      unload "$PAPER_LABEL"; paper_unloaded=$?
-      [ "$paper_unloaded" = 0 ] || { unload_note "$PAPER_LABEL" "$paper_unloaded"; ok=1; }
-    fi
-    if ! out=$(/bin/bash "$CANON_HOME/paper-session.sh" --checkout-only "$paper_mise" "$PAPER_CHECKOUT" "$paper_url" 2>&1); then
-      # no plist left behind for launchd to load at the next login, the old main-checkout one included
-      rm -f "$PAPER_PLIST"
-      note "  FAILED: ${out//$'\n'/; } (not loaded; $PAPER_PLIST removed)"; ok=1
+    if [ "${AUTOMATION_SKIP_LAUNCHD:-0}" != "1" ]; then unload "$PAPER_LABEL"; paper_unloaded=$?; fi
+    if [ "$paper_unloaded" != 0 ]; then
+      unload_note "$PAPER_LABEL" "$paper_unloaded"; ok=1
+      note "  kept       $CANON_HOME/paper-session.sh, $PAPER_CHECKOUT and $PAPER_PLIST as they were, under the job still loaded"
+    elif ! /usr/bin/install -m 755 "$ROOT/home/.claude/canon/paper-session.sh" "$CANON_HOME/paper-session.sh"; then
+      note "  FAILED: could not install $CANON_HOME/paper-session.sh"; ok=1
     else
-      note "  ${out#paper-session: }"
-      if ! write_paper_plist "$paper_mise" "$paper_url" || ! plutil -lint "$PAPER_PLIST" >/dev/null; then
-        note "  FAILED: could not write a valid $PAPER_PLIST"; ok=1
+      note "  installed  $CANON_HOME/paper-session.sh"
+      if ! out=$(/bin/bash "$CANON_HOME/paper-session.sh" --checkout-only "$paper_mise" "$PAPER_CHECKOUT" "$paper_url" 2>&1); then
+        # no plist left behind for launchd to load at the next login, the old main-checkout one included
+        rm -f "$PAPER_PLIST"
+        note "  FAILED: ${out//$'\n'/; } (not loaded; $PAPER_PLIST removed)"; ok=1
       else
-        note "  wrote      $PAPER_PLIST"
-        if [ "${AUTOMATION_SKIP_LAUNCHD:-0}" = "1" ]; then
-          note "  not loaded (AUTOMATION_SKIP_LAUNCHD=1)"
+        note "  ${out#paper-session: }"
+        if ! write_paper_plist "$paper_mise" "$paper_url" || ! plutil -lint "$PAPER_PLIST" >/dev/null; then
+          note "  FAILED: could not write a valid $PAPER_PLIST"; ok=1
         else
-          # unloaded above, before the checkout; one that would not unload is not booted over
-          if [ "$paper_unloaded" = 0 ]; then
+          note "  wrote      $PAPER_PLIST"
+          if [ "${AUTOMATION_SKIP_LAUNCHD:-0}" = "1" ]; then
+            note "  not loaded (AUTOMATION_SKIP_LAUNCHD=1)"
+          else
             boot "$PAPER_LABEL" "$PAPER_PLIST" "(every $((PAPER_INTERVAL / 60)) minutes; a window only when a session is open)" || ok=1
           fi
         fi
@@ -395,36 +429,64 @@ do_install() {
   return "$ok"
 }
 
-# do_uninstall: returns 1, naming what is left, when any removal fails
+# do_uninstall: returns 1, naming what is left, when any removal fails. The files a job runs are removed only
+# once its job is unloaded: removed under a job still loaded, they left launchd firing it at programs that
+# were gone (a second reader's claim), and a retry would find nothing to tell it what to unload.
 do_uninstall() {
-  local left="" f
-  local l rc
+  local left="" f l rc still="" fs
   for l in "$LABEL" "$PAPER_LABEL" "$OTEL_LABEL"; do
     unload "$l"; rc=$?
     case "$rc" in
-      0) if [ "$UNLOAD_ABSENT" = 1 ]; then note "  $l was not loaded"; else note "  unloaded   $l"; fi ;;
-      2) note "  FAILED: launchctl bootout refused $l: ${UNLOAD_ERR:-no message}"; left="$left
-  launchd job $l" ;;
-      *) note "  FAILED: $l is still loaded after ${UNLOAD_SECS} s"; left="$left
-  launchd job $l" ;;
+      0) if [ "$UNLOAD_ABSENT" = 1 ]; then note "  $l was not loaded"; else note "  unloaded   $l"; fi; continue ;;
+      2) note "  FAILED: launchctl bootout refused $l: ${UNLOAD_ERR:-no message}" ;;
+      3) note "  FAILED: launchctl did not answer within ${LAUNCHCTL_SECS} s about $l" ;;
+      *) note "  FAILED: $l is still loaded after ${UNLOAD_SECS} s" ;;
     esac
+    still="$still $l "; left="$left
+  launchd job $l"
   done
-  for f in "$PLIST" "$PAPER_PLIST" "$OTEL_PLIST" "$CANON_HOME/lanes" "$CANON_HOME/lanes-watch.sh" "$CANON_HOME/paper-session.sh" \
-           "$OTEL_DIR/config.yaml"; do
-    [ -e "$f" ] || continue
-    if rm -f "$f" && [ ! -e "$f" ]; then note "  removed    $f"
-    else note "  FAILED: could not remove $f"; left="$left
+  for l in "$LABEL" "$PAPER_LABEL" "$OTEL_LABEL"; do
+    case "$l" in
+      "$LABEL") fs="$PLIST|$CANON_HOME/lanes|$CANON_HOME/lanes-watch.sh" ;;
+      "$PAPER_LABEL") fs="$PAPER_PLIST|$CANON_HOME/paper-session.sh" ;;
+      *) fs="$OTEL_PLIST|$OTEL_DIR/config.yaml" ;;
+    esac
+    if [[ "$still" == *" $l "* ]]; then
+      note "  kept       ${fs//|/, }: $l is still loaded and runs them; run uninstall again once it is not"
+      left="$left
+  ${fs//|/, }"; continue
+    fi
+    local IFS='|'
+    for f in $fs; do
+      [ -e "$f" ] || continue
+      if rm -f "$f" && [ ! -e "$f" ]; then note "  removed    $f"
+      else note "  FAILED: could not remove $f"; left="$left
   $f"; fi
+    done
+    unset IFS
   done
-  if [ -e "$PAPER_CHECKOUT" ]; then
+  # marked <git dir>: as the runner's own check (home/.claude/canon/paper-session.sh), a git directory, not a
+  # link, whose config carries the mark; a run stopped part way leaves it as .git.old or .git.new
+  marked() { [ -d "$1" ] && [ ! -L "$1" ] && [ "$(git config --file "$1/config" --get canon.paperCheckout 2>/dev/null)" = true ]; }
+  if [ ! -e "$PAPER_CHECKOUT" ]; then :
+  elif [[ "$still" == *" $PAPER_LABEL "* ]]; then
+    note "  kept       $PAPER_CHECKOUT: $PAPER_LABEL is still loaded and runs from it"
+    left="$left
+  $PAPER_CHECKOUT"
+  else
     local m
-    # only the clone install made: its own git config marks it (home/.claude/canon/paper-session.sh)
-    if [ ! -d "$PAPER_CHECKOUT/.git" ] || [ -L "$PAPER_CHECKOUT/.git" ] \
-       || [ "$(git config --file "$PAPER_CHECKOUT/.git/config" --get canon.paperCheckout 2>/dev/null)" != true ]; then
+    # only the clone install made: its own git config marks it
+    if ! marked "$PAPER_CHECKOUT/.git" && ! marked "$PAPER_CHECKOUT/.git.old" && ! marked "$PAPER_CHECKOUT/.git.new"; then
       note "  FAILED: $PAPER_CHECKOUT is not the clone install made; not touching it"; left="$left
   $PAPER_CHECKOUT"
+    # with no lockf, whether a window runs from it cannot be told, so it is kept (AGENTS.md rule 5; a second
+    # reader, Codex, found the removal went ahead)
+    elif [ ! -x "$LOCKF" ]; then
+      note "  FAILED: no $LOCKF to tell whether a window still runs from $PAPER_CHECKOUT; not removing it"
+      left="$left
+  $PAPER_CHECKOUT"
     # a window still running from it holds its lock (paper-session.sh), even after the bootout above
-    elif [ -x /usr/bin/lockf ] && ! /usr/bin/lockf -k -t 0 "$PAPER_CHECKOUT.lock" true 2>/dev/null; then
+    elif ! "$LOCKF" -k -t 0 "$PAPER_CHECKOUT.lock" true 2>/dev/null; then
       note "  FAILED: a window is still running from $PAPER_CHECKOUT; not removing it (run uninstall again once it ends)"
       left="$left
   $PAPER_CHECKOUT"
@@ -496,8 +558,9 @@ do_status() {
     else check_row "landscape watch" UNKNOWN "registered; has not run yet (runs at the next session start in this repo)"; fi
   else check_row "landscape watch" OFF "hook missing from .claude/settings.json"; fi
 
-  local pr state runs last label
-  if pr=$(launchctl print "$DOMAIN/$LABEL" 2>/dev/null); then
+  local pr prc state runs last label
+  prc=0; pr=$(lc print "$DOMAIN/$LABEL" 2>/dev/null) || prc=$?
+  if [ "$prc" = 0 ]; then
     # launchctl(1) says this output is not an API, so a value it does not show is UNKNOWN, never ok
     state=$(printf '%s\n' "$pr" | awk -F' = ' '/^\tstate = / && s == "" { s = $2 } END { print s }')
     runs=$(printf '%s\n' "$pr" | awk -F' = ' '/^\truns = / && s == "" { s = $2 } END { print s }')
@@ -524,22 +587,26 @@ do_status() {
       v="$v | no status file yet at $CANON_HOME/watch/lanes-status.json"
     fi
     check_row "lane watchdog" "$label" "$v"
+  elif no_answer "$prc"; then check_row "lane watchdog" UNKNOWN "launchctl did not answer within ${LAUNCHCTL_SECS} s, so whether it is loaded is not known"
   else check_row "lane watchdog" OFF "run: scripts/automation install"; fi
 
-  if pr=$(launchctl print "$DOMAIN/$PAPER_LABEL" 2>/dev/null); then
+  prc=0; pr=$(lc print "$DOMAIN/$PAPER_LABEL" 2>/dev/null) || prc=$?
+  if [ "$prc" = 0 ]; then
     last=$(printf '%s\n' "$pr" | awk -F' = ' '/^\tlast exit code = / && s == "" { s = $2 } END { print s }')
     # launchctl(1), list: "The second column displays the last exit status of the job. If the number in this
     # column is negative, it represents the negative of the signal which stopped the job"; launchctl print
     # then shows no exit code
     local sig lab txt heard hb_at fired o
-    sig=$(launchctl list 2>/dev/null | awk -v l="$PAPER_LABEL" '$3 == l { print $2; exit }')
+    sig=$(lc list 2>/dev/null | awk -v l="$PAPER_LABEL" '$3 == l { print $2; exit }')
     # the last run's heartbeat, read first: a run newer than a `running` record took the paper lock after it
     hb_at=null heard=""
     if [ -f "$PAPER_DIR/last-firing.json" ]; then
       # shellcheck disable=SC2016  # jq program, not shell
-      heard=$(jq -r --argjson now "$(date -u +%s)" "$PAPER_COMMIT"'(($now - (.at_epoch // 0)) | floor | tostring) + "\t"
+      # a record without its time and outcome is unreadable, never ok (`{}` read ok, a second reader's claim)
+      heard=$(jq -r --argjson now "$(date -u +%s)" "$PAPER_COMMIT"'select((.at_epoch | type) == "number" and (.outcome | type) == "string")
+                    | (($now - .at_epoch) | floor | tostring) + "\t"
                     + (if .scheduled == false then "by hand: " else "" end)
-                    + (.outcome // "?") + (if (.commit // "") | test("^[0-9a-f]{40}") then " at " + (.commit | short) else "" end)' \
+                    + .outcome + (if (.commit // "") | test("^[0-9a-f]{40}") then " at " + (.commit | short) else "" end)' \
               "$PAPER_DIR/last-firing.json" 2>/dev/null)
       # only a run that held the lock counts: the runner's own failures ran nothing ("none: nothing ran")
       [[ "$heard" =~ ^-?[0-9]+$'\t' ]] \
@@ -607,11 +674,13 @@ do_status() {
     fi
     txt="$txt | last exit code=${last:-?}; log $CANON_HOME/watch/paper-session.log"
     check_row "paper session" "$lab" "$txt"
+  elif no_answer "$prc"; then check_row "paper session" UNKNOWN "launchctl did not answer within ${LAUNCHCTL_SECS} s, so whether it is loaded is not known"
   else check_row "paper session" OFF "run: scripts/automation install"; fi
 
   # The collector: launchd must show it running (KeepAlive restarts it); the file's age is shown, not judged,
   # since a quiet hour with no session writes nothing.
-  if pr=$(launchctl print "$DOMAIN/$OTEL_LABEL" 2>/dev/null); then
+  prc=0; pr=$(lc print "$DOMAIN/$OTEL_LABEL" 2>/dev/null) || prc=$?
+  if [ "$prc" = 0 ]; then
     state=$(printf '%s\n' "$pr" | awk -F' = ' '/^\tstate = / && s == "" { s = $2 } END { print s }')
     last=$(printf '%s\n' "$pr" | awk -F' = ' '/^\tlast exit code = / && s == "" { s = $2 } END { print s }')
     local lf="$OTEL_DIR/logs.jsonl" mt obin
@@ -635,6 +704,7 @@ do_status() {
       v="$v | no $lf yet: no session has sent an event (settings: scripts/bootstrap --user-config)"
     fi
     check_row "otlp collector" "$label" "$v"
+  elif no_answer "$prc"; then check_row "otlp collector" UNKNOWN "launchctl did not answer within ${LAUNCHCTL_SECS} s, so whether it is loaded is not known"
   else check_row "otlp collector" OFF "run: scripts/automation install"; fi
 
   if [ -f "$CLAUDE_HOME/scheduled-tasks/$TASK_ID/SKILL.md" ]; then

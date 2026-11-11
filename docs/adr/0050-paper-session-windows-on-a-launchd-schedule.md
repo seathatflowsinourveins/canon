@@ -131,6 +131,25 @@ job still stops, and the bootstrap that follows is refused with 5 (reproduced wi
 takes 4 s to exit on SIGTERM). Install and uninstall now wait, at most 30 s, until `launchctl print` no longer
 finds each of the three labels, say plainly when nothing is loaded, and repeat every failure after the status
 table; `scripts/test-lanes` shows each with a stand-in launchctl that stops as slowly.
+Two second readers' review of that (2026-11-10), each first shown by a failing test in `scripts/test-lanes`
+or `tests/test_session_window.py`, or by a probe under mise 2026.11.5:
+* a SIGTERM to mise, or to the inner timeout(1), before the deadline ended uv while a child that ignored it kept
+  the lock (lockf exit 75): the task's shell now waits and kills uv's group whole on a stop and when uv ends;
+* the start-up allowance held nothing: uv's sync now runs first under its own bound (`sync`, 600 s), and the
+  deadline test counts it and `START_UP_SECS` (the imports, which the shell cannot bound);
+* not reproduced: the runner's kill landing in a window. mise runs a task in a process group of its own
+  (observed), so that kill ends mise, and a stand-in window finished after it;
+* a first making of the clone stopped before its last rename left a marked `.git.new`, now accepted;
+* uninstall removed the files of jobs it failed to unload, and install replaced the runner before the old
+  job was unloaded: both now leave a job still loaded and its files as they were;
+* each `launchctl` call and the watchdog's notification now run under timeout(1); a heartbeat without its
+  time and outcome reads UNKNOWN;
+* own finding: mise appends a task's arguments to its script's last line (observed), so from a terminal
+  `--session` and `-k` were dropped; that line now calls the function that runs uv.
+The account check's uncounted lookups (orders in doubt, a lost close's search) stay ADR 0044's; the deadline
+test reads `session_window`'s bounds, so it fails once they outgrow the deadline. GitHub's Ubuntu runner has
+no lockf(1), plutil or launchd: the runner, the deadline under mise and the install rehearsal run only on a
+Mac, and a run that skips them says so last and as a warning annotation. flock(1) is another call, not a stand-in.
 
 ## Evidence
 
@@ -190,6 +209,13 @@ Read 2026-11-10. "raw": fetched with `curl` and read whole.
 * https://raw.githubusercontent.com/jdx/mise/v2026.11.5/settings.toml, `task.run_auto_install`: "Install
   missing tools automatically before tasks run" (fetched, raw).
 * https://www.rfc-editor.org/rfc/rfc3986.txt, sections 3.4 and 3.5: the query and the fragment (fetched, raw).
+* Two second readers' review of the runner, the watchdog and the installer (2026-11-10), nine claims, each
+  reproduced offline, by a probe under mise 2026.11.5, or reported as not reproduced (run).
+* `man timeout` on this machine: "For any other signals delivered to timeout, it will propagate them to
+  command" (read). mise 2026.11.5: a task's arguments reach the last line of its script, and the task runs as
+  `sh` with errexit, in a process group of its own (observed).
+* https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-commands, "Setting a warning
+  message" (fetched).
 * Second reader (`evidence-verifier`), 2026-11-10, on this split: added the skill and clock lines, marked
   the weekend reading `UNVERIFIED`, narrowed the Good consequence and corrected the install line.
 * 2026-11-10: the deadline's sum follows ADR 0044's recounted account check (`LONGEST_WINDOW_SECS` 3076 to
