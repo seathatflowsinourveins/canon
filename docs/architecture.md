@@ -59,8 +59,8 @@ flowchart LR
 | Strategies and node configuration | `MaCross` and `run_backtest` on a simulated `ALPACA` venue; `ema_cross_paper_node`, a paper `LiveNode` running upstream's built-in `EmaCross` under risk limits | NautilusTrader v2.0.0rc8 | `src/canon_trading/` | ADR 0009, 0012, 0037, 0049 |
 | Local data | `ParquetDataCatalog` of bars and instruments, ignored by git, filled from Alpaca by `load_bars` | NautilusTrader v2.0.0rc8 | `catalog/`, `canon_trading/bars_to_catalog.py` | ADR 0012, 0040 |
 | Trial ledger | One Optuna trial per backtest, in a SQLite study over a fixed sample, in the main checkout and shared by every worktree, ignored by git | Optuna v5.0.0 | `canon_trading/ledger.py`, `ledger/` | ADR 0010, 0035, 0041, 0053, 0054 |
-| Returns matrix | T daily rows, the session days every trial covers over the sample, one column per configuration | pandas v3.1.1; skfolio v1.12.8 `Population` | `canon_trading/returns_matrix.py` | ADR 0010, 0041 |
-| Gate | The pick's deflated Sharpe ratio against 0.95, N = every trial | skfolio v1.12.8 | `canon_trading/ranking.py` | ADR 0010, 0031, 0054 |
+| Returns matrix | T daily rows, the session days every trial covers over the sample, one column per configuration | pandas v3.1.1; skfolio v1.12.9 `Population` | `canon_trading/returns_matrix.py` | ADR 0010, 0041 |
+| Gate | The pick's deflated Sharpe ratio against 0.95, N = every trial | skfolio v1.12.9 | `canon_trading/ranking.py` | ADR 0010, 0031, 0054 |
 
 Pins are in `canon/upstreams.json` and `pyproject.toml`, commits in `canon/upstreams.lock.json`. The
 adapter is a uv workspace member of its own, kept apart from strategies as upstream keeps them

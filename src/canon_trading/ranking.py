@@ -2,7 +2,8 @@
 
 Contract: ADR 0010, protocol step 3, computed as ADR 0031 decides, on the ledger of ADR 0035 and ADR 0054
 over the sample of ADR 0041. skfolio
-1.12.8, read 2026-11-10 in the installed `measures/_measures.py` and `portfolio/_base.py`:
+1.12.8, read 2026-11-10 in the installed `measures/_measures.py` and `portfolio/_base.py`; at 1.12.9
+the first is byte-identical and the second differs only in `ty: ignore` comments (ADR 0031):
 
 * `Portfolio.sharpe_ratio` of a one-asset portfolio with weight 1: each trial's Sharpe ratio per
   session, mean over sample standard deviation, the convention `probabilistic_sharpe_ratio` uses for

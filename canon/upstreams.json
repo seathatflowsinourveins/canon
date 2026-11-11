@@ -673,14 +673,14 @@
       "id": "skfolio",
       "field": "strategy-evaluation",
       "repo": "skfolio/skfolio",
-      "track": "tag:v1.12.8",
+      "track": "tag:v1.12.9",
       "role": "tool",
       "license": "BSD-3-Clause",
-      "why": "Computes the deflated Sharpe ratio that gates a ranking (ADR 0010, computed per ADR 0031): measures.expected_max_sharpe_ratio, probabilistic_sharpe_ratio and deflated_sharpe_ratio follow Bailey and Lopez de Prado (2014), eqs. 1-2. The gate calls only those three; the test also reads its mean, standard_deviation, skew and kurtosis. Held 2026-11-10: v1.12.9 (published 2026-11-10; notes: two prior-model fixes; measures/_measures.py unchanged) is not moved because files that carry its version belong to other work in progress. A move touches pyproject.toml and uv.lock (uv add skfolio==1.12.9), src/canon_trading/ranking.py, returns_matrix.py and ledger.py, tests/test_deflated_sharpe.py docs/architecture.md (the returns-matrix and gate rows) and ADR 0031's version lines; the past reads ADRs 0032, 0035 and 0041 record stay as written. Look again 2026-11-13.",
+      "why": "Computes the deflated Sharpe ratio that gates a ranking (ADR 0010, computed per ADR 0031): measures.expected_max_sharpe_ratio, probabilistic_sharpe_ratio and deflated_sharpe_ratio follow Bailey and Lopez de Prado (2014), eqs. 1-2. The gate calls only those three; the test also reads its mean, standard_deviation, skew and kurtosis. Moved 2026-11-10 from v1.12.8: v1.12.9's notes list two prior-model fixes and type-check rules updated for ty 0.0.100; in the files this repository reads, measures/ and population/ are unchanged and portfolio/_base.py, portfolio/_portfolio.py and utils/stats.py change only in ty: ignore comments. A move touches pyproject.toml and uv.lock (uv add skfolio==<version>), src/canon_trading/ranking.py, returns_matrix.py and ledger.py, tests/test_deflated_sharpe.py, docs/architecture.md (the returns-matrix and gate rows) and ADR 0031's version lines; the past reads ADRs 0032, 0035 and 0041 record, and measurements a module header dates to a version, stay as written.",
       "evidence": [
         "https://pypi.org/pypi/skfolio/json",
-        "https://raw.githubusercontent.com/skfolio/skfolio/433991778607285ecd274942e89029190c45e44c/src/skfolio/measures/_measures.py",
-        "https://raw.githubusercontent.com/skfolio/skfolio/433991778607285ecd274942e89029190c45e44c/.github/workflows/ci.yml"
+        "https://raw.githubusercontent.com/skfolio/skfolio/7721090537634a549008a546c8968cdec0eaf69a/src/skfolio/measures/_measures.py",
+        "https://raw.githubusercontent.com/skfolio/skfolio/7721090537634a549008a546c8968cdec0eaf69a/.github/workflows/ci.yml"
       ],
       "adr": "0031",
       "pypi": "skfolio"

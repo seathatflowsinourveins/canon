@@ -29,7 +29,7 @@ identity is glue, ADR 0054 term 4: `config_key` is the SHA-256 of the canonical 
 built from what this repo sets, and the run is built with it as its `id`. Nothing upstream identifies
 the data a run read either, so `data_digest` is glue too (ADR 0053).
 
-The value told for a run that traded is skfolio's `Portfolio.sharpe_ratio` (1.12.8,
+The value told for a run that traded is skfolio's `Portfolio.sharpe_ratio` (1.12.8 and 1.12.9,
 `portfolio/_base.py`) over the run's own series as `canon_trading.returns_matrix.daily_series` accepts
 it: mean over sample standard deviation, per session. It is there for a later sampler;
 `canon_trading.ranking` does not read it.

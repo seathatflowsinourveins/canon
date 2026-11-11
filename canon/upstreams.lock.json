@@ -407,12 +407,12 @@
     },
     "skfolio": {
       "default_branch": "main",
-      "default_sha": "433991778607285ecd274942e89029190c45e44c",
-      "ref": "refs/tags/v1.12.8",
+      "default_sha": "7721090537634a549008a546c8968cdec0eaf69a",
+      "ref": "refs/tags/v1.12.9",
       "repo": "skfolio/skfolio",
-      "resolved_at": "2026-11-10T16:15:25Z",
-      "sha": "433991778607285ecd274942e89029190c45e44c",
-      "track": "tag:v1.12.8"
+      "resolved_at": "2026-11-11T02:57:38Z",
+      "sha": "7721090537634a549008a546c8968cdec0eaf69a",
+      "track": "tag:v1.12.9"
     },
     "spec-kit": {
       "default_branch": "main",
