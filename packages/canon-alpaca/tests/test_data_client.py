@@ -19,6 +19,7 @@ import asyncio
 import concurrent.futures
 import functools
 import gc
+import json
 import logging
 import re
 import threading
@@ -38,8 +39,10 @@ import canon_alpaca.data
 import canon_alpaca.factories
 import canon_alpaca.providers
 import pytest
+import requests
 from alpaca.common.exceptions import APIError
 from alpaca.data.enums import DataFeed
+from alpaca.data.historical.stock import StockHistoricalDataClient
 from alpaca.data.timeframe import TimeFrameUnit
 from canon_alpaca.constants import ENV_API_KEY
 from canon_alpaca.constants import ENV_SECRET_KEY
@@ -56,6 +59,8 @@ from nautilus_trader.core import UUID4
 from nautilus_trader.core.datetime import dt_to_unix_nanos
 from nautilus_trader.core.datetime import unix_nanos_to_dt
 from nautilus_trader.live import LiveNode
+from nautilus_trader.live import TradesResponse
+from nautilus_trader.model import AggressorSide
 from nautilus_trader.model import BarType
 from nautilus_trader.model import Equity
 from nautilus_trader.model import InstrumentId
@@ -2171,6 +2176,304 @@ def test_a_stream_call_that_returns_at_once_is_recorded_before_its_hook_returns(
         assert not client._stream_calls.locked()
 
     run_with_client(body, executor=InlineStreamExecutor())
+
+
+# -- historical trades: the single-symbol HTTP endpoint --------------------------------------------
+
+
+@pytest.fixture
+def trades_http(venue, monkeypatch) -> SimpleNamespace:
+    """Real alpaca-py GET handling, with its HTTP session answered entirely offline.
+
+    Alpaca documents `trades` and `next_page_token` for GET /v2/stocks/{symbol}/trades:
+    https://docs.alpaca.markets/us/reference/stocktradesingle-1.
+    """
+    historical = StockHistoricalDataClient(PLACEHOLDER, PLACEHOLDER)
+    ns = SimpleNamespace(pages=[], calls=[], historical=historical)
+
+    def answer(method: str, url: str, **kwargs) -> requests.Response:
+        assert method == "GET"
+        assert url == "https://data.alpaca.markets/v2/stocks/AAPL/trades"
+        ns.calls.append(dict(kwargs["params"]))
+        assert ns.pages, "unexpected HTTP request"
+        page = ns.pages.pop(0)
+        if isinstance(page, Exception):
+            raise page
+        response = requests.Response()
+        response.status_code = 200
+        response._content = json.dumps(page).encode()
+        return response
+
+    monkeypatch.setattr(historical._session, "request", answer)
+    monkeypatch.setattr(canon_alpaca.data, "StockHistoricalDataClient", lambda **_: historical)
+    return ns
+
+
+def historical_trade(second: int, **changes) -> dict:
+    return {
+        "t": (START + timedelta(seconds=second)).isoformat(),
+        "p": 182.12,
+        "s": 100,
+        "i": second + 1000,
+        "x": "V",
+        "c": ["@"],
+        "z": "C",
+        **changes,
+    }
+
+
+class TradeRequester(Strategy):
+    """Drive the real request/response bridge and record its historical trade callback."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.params: dict | None = None
+        self.limit: int | None = None
+        self.instrument_ids = [AAPL]
+        self.seen: list = []
+        self.responses: list = []
+        self.request_id = None
+
+    def on_start(self) -> None:
+        ids = self.instrument_ids[0] if len(self.instrument_ids) == 1 else self.instrument_ids
+        self.request_id = self.request_trades(
+            ids, start=START, end=END, limit=self.limit, params=self.params
+        )
+
+    def on_historical_trades(self, trades) -> None:
+        self.seen.extend(trades)
+
+    def on_data_response(self, response) -> None:
+        if response.failure_reason or response.completed:
+            self.responses.append(response)
+            self.shutdown_system("Alpaca historical trades checked")
+
+
+def test_historical_trades_follow_every_page_and_reach_the_strategy(trades_http) -> None:
+    trades_http.pages = [
+        {"trades": [historical_trade(0)], "next_page_token": "second"},
+        {"trades": [], "next_page_token": "third"},
+        {"trades": [historical_trade(3600)], "next_page_token": None},
+    ]
+    strategy = TradeRequester()
+
+    run(build_node(strategy), "hosted")
+
+    assert [r.failure_reason for r in strategy.responses] == [None]
+    assert str(strategy.responses[0].correlation_id) == str(strategy.request_id)
+    assert [t.trade_id for t in strategy.seen] == [TradeId("1000"), TradeId("4600")]
+    assert [t.ts_event for t in strategy.seen] == [dt_to_unix_nanos(START), dt_to_unix_nanos(END)]
+    assert [t.ts_init for t in strategy.seen] == [t.ts_event for t in strategy.seen]
+    first = strategy.seen[0]
+    assert first.instrument_id == AAPL
+    assert first.price == Price.from_str("182.1200")
+    assert int(first.size) == 100
+    assert first.aggressor_side == AggressorSide.NO_AGGRESSOR
+    assert [c.get("page_token") for c in trades_http.calls] == [None, "second", "third"]
+    for call in trades_http.calls:
+        assert call["feed"] == "iex"
+        assert call["sort"] == "asc"
+        assert call["limit"] == 10_000
+        assert datetime.fromisoformat(call["start"]) == START
+        assert datetime.fromisoformat(call["end"]) == END
+        assert "symbols" not in call
+
+
+def test_a_trade_limit_counts_across_pages_and_stops_without_an_extra_fetch(trades_http):
+    trades_http.pages = [
+        {"trades": [historical_trade(0), historical_trade(1)], "next_page_token": "second"},
+        {"trades": [historical_trade(2)], "next_page_token": "unneeded"},
+    ]
+    strategy = TradeRequester()
+    strategy.limit = 3
+
+    run(build_node(strategy), "hosted")
+
+    assert [r.failure_reason for r in strategy.responses] == [None]
+    assert [t.trade_id for t in strategy.seen] == [TradeId(str(n)) for n in (1000, 1001, 1002)]
+    assert [c["limit"] for c in trades_http.calls] == [3, 1]
+
+
+@pytest.mark.parametrize("feed", ["iex", "sip", "boats", "otc"])
+def test_trade_history_sends_the_named_feed_and_preserves_response_metadata(
+    venue, trades_http, monkeypatch, feed
+):
+    trades_http.pages = [{"trades": [historical_trade(1)], "next_page_token": None}]
+    responses = []
+    request = quotes_request(AAPL, start=START, end=END)
+    request.params = {"feed": feed, "update_catalog": True}
+    # Response bounds retain the exact nanoseconds, not the datetime's truncation.
+    request.start_ns += 17
+    request.end_ns += 23
+
+    async def body(client) -> None:
+        monkeypatch.setattr(client, "_handle_response", responses.append)
+        await client._request_trades(request)
+
+    run_with_client(body)
+
+    (response,) = responses
+    assert isinstance(response, TradesResponse)
+    assert response.client_id.value == "ALPACA"
+    assert response.instrument_id == AAPL
+    assert response.correlation_id == request.request_id
+    assert (response.start, response.end) == (request.start_ns, request.end_ns)
+    assert response.params == request.params == {"feed": feed, "update_catalog": True}
+    assert len(response.data) == 1
+    assert trades_http.calls[0]["feed"] == feed
+
+
+@pytest.mark.parametrize("feed", ["overnight", "delayed_sip", "other", None, 1])
+def test_trade_history_refuses_an_unsupported_feed_before_http(trades_http, feed):
+    strategy = TradeRequester()
+    strategy.params = {"feed": feed}
+
+    run(build_node(strategy), "hosted")
+
+    (response,) = strategy.responses
+    assert response.failure_reason is not None and "feed" in response.failure_reason
+    assert strategy.seen == []
+    assert trades_http.calls == []
+
+
+@pytest.mark.parametrize("trades", [[], None])
+def test_empty_trade_history_completes_with_one_empty_response(trades_http, trades):
+    trades_http.pages = [{"trades": trades, "next_page_token": None}]
+    strategy = TradeRequester()
+
+    run(build_node(strategy), "hosted")
+
+    assert [r.failure_reason for r in strategy.responses] == [None]
+    assert strategy.seen == []
+    assert len(trades_http.calls) == 1
+
+
+def test_a_later_trade_page_failure_does_not_emit_partial_history(trades_http):
+    trades_http.pages = [
+        {"trades": [historical_trade(1)], "next_page_token": "second"},
+        APIError('{"code": 42210000, "message": "trade page failed"}'),
+    ]
+    strategy = TradeRequester()
+
+    run(build_node(strategy), "hosted")
+
+    (response,) = strategy.responses
+    assert response.failure_reason is not None and "trade page failed" in response.failure_reason
+    assert strategy.seen == []
+    assert len(trades_http.calls) == 2
+
+
+@pytest.mark.parametrize(
+    ("changes", "reason"),
+    [
+        ({"i": None}, "no trade ID"),
+        ({"s": 1.5}, "fractional"),
+        ({"p": float("nan")}, "not a finite number"),
+        ({"p": 0.00001}, "rounds to zero"),
+    ],
+)
+def test_an_unconvertible_historical_trade_fails_the_whole_request(trades_http, changes, reason):
+    trades_http.pages = [
+        {"trades": [historical_trade(1), historical_trade(2, **changes)], "next_page_token": None}
+    ]
+    strategy = TradeRequester()
+
+    run(build_node(strategy), "hosted")
+
+    (response,) = strategy.responses
+    assert response.failure_reason is not None and reason in response.failure_reason
+    assert strategy.seen == []
+
+
+def test_historical_trade_rounding_is_counted_and_named(trades_http, capfd):
+    trades_http.pages = [
+        {"trades": [historical_trade(1, p=0.12345), historical_trade(2)], "next_page_token": None}
+    ]
+    strategy = TradeRequester()
+
+    run(build_node(strategy), "hosted")
+
+    assert [r.failure_reason for r in strategy.responses] == [None]
+    assert [t.price for t in strategy.seen] == [
+        Price.from_str("0.1234"),
+        Price.from_str("182.1200"),
+    ]
+    log = logged(capfd)
+    assert "Rounded 1 of 2 Alpaca trades for AAPL" in log
+    assert "0.12345" in log
+
+
+def test_trade_history_refuses_multiple_instruments_before_http(venue, trades_http):
+    async def body(client) -> None:
+        with pytest.raises(ValueError, match="one instrument, got 2"):
+            await client._request_trades(quotes_request(AAPL, AAPL, start=START, end=END))
+
+    run_with_client(body)
+
+    assert trades_http.calls == []
+
+
+def test_trade_history_caps_each_page_at_the_documented_maximum(trades_http):
+    trades_http.pages = [{"trades": [historical_trade(1)], "next_page_token": None}]
+    strategy = TradeRequester()
+    strategy.limit = 10_001
+
+    run(build_node(strategy), "hosted")
+
+    assert [r.failure_reason for r in strategy.responses] == [None]
+    assert len(strategy.seen) == 1
+    assert trades_http.calls[0]["limit"] == 10_000
+
+
+def test_trade_history_starting_after_now_completes_without_http(venue, trades_http, monkeypatch):
+    responses = []
+
+    async def body(client) -> None:
+        now = datetime.now(UTC)
+        monkeypatch.setattr(client, "_handle_response", responses.append)
+        await client._request_trades(quotes_request(AAPL, start=now + HOUR, end=now + 2 * HOUR))
+
+    run_with_client(body)
+
+    (response,) = responses
+    assert isinstance(response, TradesResponse) and response.data == []
+    assert trades_http.calls == []
+
+
+def test_historical_trades_let_the_node_loop_run_between_conversion_slices(
+    venue, trades_http, monkeypatch
+):
+    trades_http.pages = [
+        {"trades": [historical_trade(n) for n in range(4)], "next_page_token": None}
+    ]
+    # Set without requiring the constant to exist yet, so the unimplemented hook is the before failure.
+    monkeypatch.setattr(canon_alpaca.data, "TRADES_PER_SLICE", 2, raising=False)
+    turns = [0]
+    seen_at: list[int] = []
+    parse = canon_alpaca.data.parse_trade
+
+    def counting_parse(*args, **kwargs):
+        seen_at.append(turns[0])
+        return parse(*args, **kwargs)
+
+    monkeypatch.setattr(canon_alpaca.data, "parse_trade", counting_parse)
+
+    async def body(client) -> None:
+        async def count() -> None:
+            while True:
+                turns[0] += 1
+                await asyncio.sleep(0)
+
+        counter = asyncio.ensure_future(count())
+        try:
+            await client._request_trades(quotes_request(AAPL, start=START, end=END))
+        finally:
+            counter.cancel()
+
+    run_with_client(body)
+
+    assert len(seen_at) == 4
+    assert seen_at[0] == seen_at[1] < seen_at[2] == seen_at[3]
 
 
 # -- historical quotes (ADR 0066) ------------------------------------------------------------------

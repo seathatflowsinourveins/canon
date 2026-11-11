@@ -3,7 +3,7 @@
 An out-of-tree NautilusTrader adapter for Alpaca, built on `alpaca-py`.
 
 **Status: data slice and first execution slice, paper only.** It loads US equities as instruments, serves
-historical bars and quotes on request and streams quotes and trades, all against Alpaca's paper data. Its execution
+historical bars, quotes and trades on request and streams quotes and trades, all against Alpaca's paper data. Its execution
 client sends market, limit, stop and stop-limit orders for US equities to Alpaca's **paper** Trading API, cancels them one
 at a time or all of an instrument's at once, turns Alpaca's trade updates into order events and fills, and
 reports orders and positions for reconciliation at start-up. Its config refuses anything but paper
@@ -23,7 +23,7 @@ Follows upstream's adapter template, `examples/live/_template/` at the pinned Na
 |---|---|---|
 | `constants.py` | Venue identity (`ALPACA`), credential variable names, feed, price increment, each with its source | Built |
 | `providers.py` | `AlpacaInstrumentProvider`: US equities from Alpaca's `/v2/assets` as `Equity` instruments | Built |
-| `data.py` | `AlpacaDataClient` (`MarketDataClient`): `_request_bars`, `_request_quotes`, `_subscribe_quotes`, `_subscribe_trades` and their unsubscribes; `AlpacaDataClientConfig`, the stream's silence bounds | Built |
+| `data.py` | `AlpacaDataClient` (`MarketDataClient`): `_request_bars`, `_request_quotes`, `_request_trades`, `_subscribe_quotes`, `_subscribe_trades` and their unsubscribes; `AlpacaDataClientConfig`, the stream's silence bounds | Built |
 | `factories.py` | `AlpacaDataClientFactory`, `AlpacaExecutionClientFactory` | Built |
 | `execution.py` | `AlpacaExecutionClient` (`ExecutionClient`): account state on connect, `_submit_order`, `_modify_order`, `_cancel_order` and `_cancel_all_orders` for market, limit, stop and stop-limit orders, trade updates as order events and fills, order and position status reports; `AlpacaExecutionClientConfig`, which refuses anything but paper trading | Built (first slice) |
 
@@ -66,6 +66,14 @@ into it, as ADR 0040 does for bars
 
 ```python
 self.request_quotes(instrument_id, start=start, end=end, params={"update_catalog": True})
+```
+
+Historical trades use the same default IEX feed as bars and subscriptions. A request may name `iex`,
+`sip`, `otc` or `boats`, the feeds Alpaca documents for its
+[single-symbol historical trades endpoint](https://docs.alpaca.markets/us/reference/stocktradesingle-1):
+
+```python
+self.request_trades(instrument_id, start=start, end=end, params={"feed": "iex"})
 ```
 
 Register the execution client the same way, with its own config class:
@@ -207,6 +215,19 @@ Each is stated where it is implemented, with its source.
 * **Trades** carry no aggressor side (`NO_AGGRESSOR`). Alpaca's trade cancels, errors and corrections
   are logged as warnings naming the symbol and trade ID; a trade tick already emitted cannot be withdrawn
   or corrected.
+* **Trade history** (`_request_trades`): one loaded instrument per request, using
+  `GET /v2/stocks/{symbol}/trades` through alpaca-py's existing HTTP session. Every page is read,
+  including a short or empty page with a `next_page_token`, until the token ends or the request's total
+  `limit` is reached; each page asks for at most 10,000 records and the remaining limit. Results are
+  requested in ascending timestamp order and delivered in one `TradesResponse`, preserving the request
+  ID, bounds and params. The inclusive window is cut at now, and a missing start uses midnight New York
+  of the end's day, as quotes do. Each tick's `ts_init` equals its own `ts_event`; trade IDs and whole-share
+  sizes are preserved. Prices are rounded half to even and any rounding counted and named, as on the
+  trade stream. A failed page or unconvertible trade fails the whole request; no partial response is
+  emitted. The HTTP lock covers every page and history is gathered in memory, so callers keep windows
+  small; tick conversion yields to the node's loop every 10,000 trades. Catalog keys do not distinguish
+  feeds, so callers must keep one feed per instrument when writing trades back. Offline HTTP and node
+  tests verify this path; its response from the paper data API remains **UNVERIFIED**.
 * **Feed:** named in a subscription's or bars request's params, `{"feed": "boats"}`, the channel the
   adapter guide documents for adapter-specific options, as upstream's Databento (`schema`) and OKX
   (`rpi`) adapters choose a venue channel there; IEX when the params name none, so nothing that names
@@ -737,7 +758,8 @@ tasks"): with none, a queued unsubscribe was discarded and logged as an error on
 | TC-D30 subscribe trades | Passed, except the aggressor side: 5 to 28 trades in 30 s; Alpaca sends no aggressor, so every trade is `NO_AGGRESSOR` |
 | TC-D41 historical bars | Passed: 60 one-minute bars, valid OHLC, no duplicate timestamps |
 | TC-D70 unsubscribe on stop | Passed with the grace period: quotes and trades unsubscribed, no tick after, no warning or error |
-| TC-D01, D02, D31, D40, D60, D61, D73 | Not in this slice: no instrument requests or subscriptions, no historical trades, no bar subscriptions, no status or close; D73 not run |
+| TC-D31 historical trades | Implemented and tested offline through a real node and fake HTTP pages (`test_data_client.py`): pagination, limits, feed selection, timestamps, IDs, whole shares, rounding, response metadata and failure propagation; paper API response UNVERIFIED |
+| TC-D01, D02, D40, D60, D61, D73 | Not in this slice: no instrument requests or subscriptions, no bar subscriptions, no status or close; D73 not run |
 | TC-D10 to D14, D50 to D53, D62, D63, D71, D72, D74, D75 | Do not apply: no order book in Alpaca's stock stream, no derivatives or options here, no custom parameters, no DeFi |
 | TC-E01 market buy, TC-E80 open on start | Passed: submitted, accepted, filled; the fill's trade ID is Alpaca's `execution_id` |
 | TC-E06, TC-E82 close position on stop | Passed: a market sell, filled, position closed |

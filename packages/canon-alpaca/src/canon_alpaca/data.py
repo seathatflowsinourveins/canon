@@ -1,4 +1,4 @@
-"""Market data client: historical bars and quotes, and live quotes, trades, minute bars and trading statuses,
+"""Market data client: historical bars, quotes and trades, and live quotes, trades, minute bars and trading statuses,
 for US equities on Alpaca.
 
 Contract: `nautilus_trader.live.clients.MarketDataClient`, NautilusTrader v2.0.0rc8 (Python adapter guide,
@@ -9,6 +9,23 @@ responses preserve the request ID, params and bounds, and a failed fetch raises.
 through `_handle_data`, instruments through `_handle_instrument` before their data. Nothing is started in
 the constructor; resources are made in `_connect` and adapter-owned work is joined in `_disconnect`. Hooks
 not overridden here raise `NotImplementedError` from the base class.
+
+Historical trades implement `_request_trades(RequestTrades)` and `_handle_response(TradesResponse)`:
+https://github.com/nautechsystems/nautilus_trader/blob/d53849b216e20f2c122ca01b4dd0da377638b186/python/nautilus_trader/live/clients.py
+https://github.com/nautechsystems/nautilus_trader/blob/d53849b216e20f2c122ca01b4dd0da377638b186/docs/developer_guide/python_adapters.md#historical-responses
+over Alpaca's GET /v2/stocks/{symbol}/trades:
+https://docs.alpaca.markets/us/reference/stocktradesingle-1 (read 2026-11-11).
+The single-symbol endpoint is called with alpaca-py's public `RESTClient.get`, since its
+`get_stock_trades` uses the multi-symbol endpoint. `StockTradesRequest.to_request_fields` serializes
+the bounds and feed; the symbol moves into the path. `fetch_trades` follows `next_page_token` even
+on a short or empty page, requesting ascending order and at most 10,000 records per page, until the
+token ends or the request's total limit is reached. The existing HTTP lock covers the whole fetch.
+As with quote history, the inclusive window is cut at now and each tick's `ts_init` is its own
+`ts_event` (Databento's `decode_trade_msg` defaults to the event timestamp when no init time is given,
+`crates/adapters/databento/src/decode/market_data.rs` at the pin). Conversion errors and page failures
+raise before any response is emitted. Trade history is gathered in memory, as bars and quotes are;
+tick conversion yields to the node's loop every `TRADES_PER_SLICE`, and rounded prices are counted
+and named once per request. The live paper endpoint remains UNVERIFIED for this hook.
 
 Venue side, alpaca-py 0.45.0:
 
@@ -226,6 +243,7 @@ from alpaca.data.models import TradeCorrection
 from alpaca.data.models import TradingStatus
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.requests import StockQuotesRequest
+from alpaca.data.requests import StockTradesRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.data.timeframe import TimeFrameUnit
 from nautilus_trader.common import Logger
@@ -233,6 +251,7 @@ from nautilus_trader.config import DataClientConfig
 from nautilus_trader.core.datetime import dt_to_unix_nanos
 from nautilus_trader.live import BarsResponse
 from nautilus_trader.live import QuotesResponse
+from nautilus_trader.live import TradesResponse
 from nautilus_trader.live.clients import MarketDataClient
 from nautilus_trader.model import AggregationSource
 from nautilus_trader.model import AggressorSide
@@ -267,6 +286,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
     from collections.abc import Sequence
 
+    from alpaca.common.types import HTTPResult
     from alpaca.common.types import RawData
     from nautilus_trader import live
     from nautilus_trader.common import Clock
@@ -316,6 +336,14 @@ QUOTES_FEEDS = (DataFeed.IEX,)
 quote by instrument alone, not by source ("catalog keys do not distinguish them", the catalog guide), so
 a second feed written back would mix with IEX's under one key."""
 
+TRADES_FEEDS = (DataFeed.IEX, DataFeed.OTC, DataFeed.SIP, DataFeed.BOATS)
+"""The `feed` enum of Alpaca's historical trades reference:
+https://docs.alpaca.markets/us/reference/stocktradesingle-1. IEX remains the default (`FEED`);
+no other feed is tried when a request fails."""
+
+TRADES_PER_SLICE = 10_000
+"""How many historical trades are converted before letting the node's loop run, as quotes are."""
+
 NEW_YORK = ZoneInfo("America/New_York")
 """The US equity market's time zone, which sets the day a bar request's default start falls in."""
 
@@ -333,6 +361,37 @@ class HistoricalClient(Protocol):
     def get_stock_bars(self, request_params: StockBarsRequest) -> BarSet | RawData: ...
 
     def get_stock_quotes(self, request_params: StockQuotesRequest) -> QuoteSet | RawData: ...
+
+    def get(self, path: str, data: dict | None = None) -> HTTPResult: ...
+
+
+def fetch_trades(historical: HistoricalClient, request: StockTradesRequest) -> list[Trade]:
+    """Fetch the single-symbol trade endpoint through alpaca-py's public GET transport, with the
+    historical trades reference's pagination contract (URL in the module header).
+
+    Called in a worker thread under the HTTP session's lock. `get_stock_trades` at alpaca-py 0.45.0
+    uses `/stocks/trades`, so it cannot call this single-symbol endpoint. Its request serializer and
+    `Trade` model still apply; the symbol belongs in the path instead of the `symbols` query field.
+    """
+    params = request.to_request_fields()
+    symbol = params.pop("symbols")
+    trades: list[Trade] = []
+    remaining = request.limit
+    params["sort"] = "asc"
+    while remaining is None or remaining > 0:
+        params["limit"] = 10_000 if remaining is None else min(remaining, 10_000)
+        # This endpoint returns an object; HTTPResult also covers list endpoints in alpaca-py.
+        page = cast("dict", historical.get(path=f"/stocks/{symbol}/trades", data=params))
+        raw_trades = page["trades"]
+        if raw_trades is not None:
+            trades.extend(Trade(symbol, raw) for raw in raw_trades)
+            if remaining is not None:
+                remaining -= len(raw_trades)
+        token = page.get("next_page_token")
+        if token is None:
+            break
+        params["page_token"] = token
+    return trades
 
 
 type QuoteHandler = Callable[[Quote | RawData], Awaitable[None]]
@@ -1695,6 +1754,58 @@ class AlpacaDataClient(MarketDataClient):
             start=request.start_ns,
             end=request.end_ns,
             params=request.params,
+        )
+
+    @override
+    async def _request_trades(self, request: live.RequestTrades) -> None:
+        instrument_ids = request.instrument_ids
+        if len(instrument_ids) != 1:
+            raise ValueError(
+                f"Alpaca trade requests take one instrument, got {len(instrument_ids)}"
+            )
+        instrument = self._equity(instrument_ids[0])
+        historical = self._historical
+        if historical is None:
+            raise RuntimeError("Alpaca data client is not connected")
+        symbol = instrument.id.symbol.value
+        feed, _ = named_feed(request.params, TRADES_FEEDS, "trade requests")
+        window = alpaca_quotes_window(request.start, request.end, self.clock.utc_now())
+        ticks: list[TradeTick] = []
+        if window is not None:
+            start, end = window
+            params = StockTradesRequest(
+                symbol_or_symbols=symbol, start=start, end=end, limit=request.limit, feed=feed
+            )
+            trades = await self._one_historical_call(
+                functools.partial(fetch_trades, historical), params
+            )
+            rounded = 0
+            first_rounded = ""
+            for n, trade in enumerate(trades, 1):
+                tick = parse_trade(trade, instrument, dt_to_unix_nanos(trade.timestamp))
+                ticks.append(tick)
+                if was_rounded(tick.price, trade.price):
+                    rounded += 1
+                    first_rounded = first_rounded or f"{trade.timestamp} trade price {trade.price}"
+                if n % TRADES_PER_SLICE == 0:
+                    await asyncio.sleep(0)
+            if rounded:
+                self._log.warning(
+                    f"Rounded {rounded} of {len(ticks)} Alpaca trades for {symbol} from {start} to {end} "
+                    f"to price precision {instrument.price_precision}, half to even as NautilusTrader's "
+                    f"Instrument.make_price rounds; the first: {first_rounded}"
+                )
+        self._handle_response(
+            TradesResponse(
+                client_id=self.client_id,
+                instrument_id=instrument.id,
+                data=ticks,
+                correlation_id=request.request_id,
+                ts_init=self.clock.timestamp_ns(),
+                start=request.start_ns,
+                end=request.end_ns,
+                params=request.params,
+            )
         )
 
     async def _one_historical_call[A, R](self, fn: Callable[[A], R], arg: A) -> R:
