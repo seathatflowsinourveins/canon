@@ -56,13 +56,14 @@ and rotation rules; the chase's price and floor; the yield of entries to the req
 (`canon_alpaca.providers.request_counts`). The order path's rules, each with a test:
 
 * No order is modified (the lead's decision of 2026-11-11, until the adapter's replace chain has passed
-  two clean outside reviews). A re-price is cancel, the cancel seen terminal, then a new limit; the
-  emulated trailing sell is canceled and made again when the held quantity changes, from the trigger
-  it had reached. The cost is two requests and a moment with no working sale.
-* At the release a working entry is canceled. A sale that covers less than is held is canceled and the
-  next covers all of it.
+  two clean outside reviews), and a config that asks for it is refused by name. A re-price is cancel,
+  the cancel seen terminal, then a new limit; the emulated trailing sell is canceled and made again
+  when the held quantity changes, from the trigger it had reached, which a refused remake keeps. The
+  cost is two requests and a moment with no working sale.
+* At the release a working entry is canceled, and again every `chase_secs` while it still works. A
+  sale that covers less than is held is canceled and the next covers all of it.
 * The chase floor belongs to the position: `chase_cap` under its first sale price, kept when that sale
-  is refused.
+  is refused. A refused sale is sent again every `chase_secs`, in either wind-down too.
 * An entry whose bid is already under its planned stop is refused by name: the quote is wider than the
   plan the size rests on.
 * Every limit price the strategy computes is a tick of upstream's tiered scheme stating Alpaca's two
@@ -71,8 +72,10 @@ and rotation rules; the chase's price and floor; the yield of entries to the req
   cents, which is a price Alpaca takes under a bid on either side of a dollar; for a name under a
   dollar the release sits up to a cent lower than `exit_through` asks, and the size takes that in.
 * A live node builds a bar for every clock minute, a paused one too (`time_bars_build_with_no_updates`,
-  `nt:crates/data/src/engine/config.rs:36-38`). A repeated close is not a rise, so a pause restarts the
-  run; the default is left on.
+  `nt:crates/data/src/engine/config.rs:36-38`). A repeated close is not a rise, so an equal close or a
+  minute with no trade restarts the run, as built and as ADR 0083's row reads (three strictly rising
+  closes); the default is left on. A run that only a lower close restarts is another rule, for the
+  gate to measure beside this one, and is not built.
 
 **The ranking's contract** with the ranking actor (ADR 0087, numbered and not yet on `main`): the signal
 `movers-rank`, its value the ranked instrument IDs best first, at most 20, each with its move from the
@@ -81,7 +84,7 @@ than `rank_max_age_secs`, or one that does not parse, means no entry. The strate
 
 **The rows** are `MoverConfig`'s defaults, all UNCALIBRATED: `slots` 1, `watch` 3, `risk` 0.01 of the
 balance, `run_bars` 3, `entry_ticks` 0, `exit_ticks` 1, `trail` 0.02 of the entry price (a fixed offset
-under the highest bid), `exit_through` 0.005, `chase_cap` 0.02, `chase_secs` 5, `chase` `resend`,
+under the highest bid), `exit_through` 0.005, `chase_cap` 0.02, `chase_secs` 5, `chase` `resend` (its one value),
 `flow_share` 0.05 of `flow_bars` 5, `entry_timeout_secs` 30, `cooldown_secs` 300, `rank_max_age_secs` 90,
 `soft_line` 140 requests in 60 s, `trigger` `BID_ASK`; `max_shares` and `entries` unbounded;
 `max_notional` (the largest entry) and `max_move` (the no-chase cap) have none and are stated by each
@@ -107,6 +110,11 @@ replay computes them).
   window nothing sells: the position stays until the window's own account check, if its process still
   runs, the next window's start check, which refuses to start while the account is not flat and names
   what is left, or a person. The requirement's backstop, a wide stop held by the broker, is not built.
+* Bad: the emulated trailing sell triggers on a single quote. In the second paper window (ADR 0091) it
+  was armed at 14:26:02.30 and released at 14:26:07.19 at a bid of 0.8258, on a spike in the bid and
+  its reversal within a millisecond, 8 seconds after the entry. A breach that must persist is not built.
+* Bad: shares held with no filled entry of this strategy's have no price to size a sale from: they are
+  named in the run's record and sold only at the wind-down (a window starts flat).
 * Bad: nothing bounds the time without a working sale when a replacement is refused again and again;
   `is_closed` after a reconciliation cancel is not proof of a venue cancel (ADR 0075); the market exit
   at the wind-down does not wait for cancels to be terminal; with the `LAST_PRICE` trigger a sub-penny
@@ -114,8 +122,8 @@ replay computes them).
 
 ### Confirmation
 
-* `tests/test_mover.py`: 71 tests, the order-path cases through a real `BacktestEngine` on generated
-  bars, trades and quotes. `tests/test_mover_day.py`: the replay and its shape checks on a generated tape.
+* `tests/test_mover.py`: 77 tests, the order-path cases through a real `BacktestEngine` on generated
+  bars, trades and quotes, and six states the simulated venue does not reach on a stand-in. `tests/test_mover_day.py`: the replay and its shape checks on a generated tape.
 * UNVERIFIED at rc8, from rc9's release notes: `market_exit` "skipping emulated and active-local orders
   during cancellation" (a test here shows the trailing sell canceled no later than the exit's order);
   `FixedRiskSizer` "exceeding risk and quantity limits"; `Portfolio` reservations "remaining locked after
@@ -152,5 +160,7 @@ Read 2026-11-11. Resolved means read in a local copy at the commit `canon/upstre
 * A second reader (Codex) on the strategy's first commit, 2026-11-11: five order-path findings, each
   reproduced by a failing test before its fix; `/code-review` at high effort, ten findings, each fixed
   the same way. An `evidence-verifier` pass the same day corrected line ranges, the cap's exemption
-  and the labels above.
+  and the labels above. A second reader (Muse) on the window's commit: six findings, five fixed with
+  a failing test first (the kept trigger, the two retries, the unnamed position, the modify row); the
+  sixth, in the replay's check, is ADR 0091's stated limit.
 * The owner's requirement of 2026-11-11 — an instruction, not evidence: each number is UNCALIBRATED.

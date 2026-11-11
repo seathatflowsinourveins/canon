@@ -5507,6 +5507,58 @@ def test_the_schedule_fires_the_mover_path() -> None:
     assert "<string>auto</string>" in automation and "<string>--mover</string>" in automation
 
 
+@pytest.mark.parametrize(
+    ("named", "hour", "is_open", "mover", "ran"),
+    [
+        ("Mover", 11, True, True, [("Mover", "regular", True)]),
+        ("Mover", 17, False, True, []),  # a mover window runs in the regular session only
+        ("EmaCross", 17, False, False, [(session_window.DEFAULT_STRATEGY, "extended", False)]),
+    ],
+)
+def test_auto_runs_the_strategy_the_schedule_names_for_the_regular_session(
+    monkeypatch, tmp_path, named, hour, is_open, mover, ran
+) -> None:
+    """The schedule names the regular session's strategy (`--regular-strategy`, ADR 0091). With
+    Alpaca's clock open the window is that strategy's; with it closed the name is not used, and the
+    part runs what `--strategy` says, or nothing."""
+    seen = []
+
+    class At(Account):
+        def get_clock(self) -> Clock:
+            return clock(datetime(2026, 11, 10, hour, 0, tzinfo=NEW_YORK), is_open=is_open)
+
+    def window(config, **_kwargs):
+        seen.append((config.strategy, config.session, config.mover))
+        raise session_window.WindowSkipped("the test stops here")
+
+    monkeypatch.setattr(session_window, "EXTENDED_READY", True)
+    monkeypatch.setattr(session_window, "paper_trading", lambda: At())
+    monkeypatch.setattr(session_window, "run_window", window)
+    argv = ["--session", "auto", "--regular-strategy", named, "--log-dir", str(tmp_path)]
+    assert session_window.main(argv + (["--mover"] if mover else [])) == 0
+    assert seen == ran
+
+
+def test_a_regular_strategy_is_named_only_for_the_schedules_auto_session(capsys) -> None:
+    with pytest.raises(SystemExit):
+        session_window._args(["--regular-strategy", "Mover", "--mover", "--log-dir", "/tmp/x"])
+    assert "needs --session auto" in capsys.readouterr().err
+    with pytest.raises(SystemExit):  # refused when the arguments are read, not at the first open
+        session_window._args(
+            ["--session", "auto", "--regular-strategy", "Mover", "--log-dir", "/tmp/x"]
+        )
+    assert "needs --mover" in capsys.readouterr().err
+
+
+def test_the_schedule_names_the_mover_strategy_for_the_regular_session() -> None:
+    """The scheduled agent's arguments name `Mover` for the regular session and no strategy for any
+    other part (the lead's decision of 2026-11-11, ADR 0091)."""
+    automation = (session_window.SOURCE_ROOT / "scripts/automation").read_text()
+    named = "<string>--regular-strategy</string>\n    <string>$PAPER_REGULAR_STRATEGY</string>"
+    assert named in automation and "\nPAPER_REGULAR_STRATEGY=Mover " in automation
+    assert "<string>--strategy</string>" not in automation
+
+
 def test_a_mover_window_enters_with_limits_never_a_market_order(tmp_path) -> None:
     """An entry is never a market order: a mover window's `SessionMaCross` sends its marked DAY limit
     through the touch in the regular session too, and its stop is the limit wind-down, not the managed

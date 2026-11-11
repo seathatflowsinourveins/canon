@@ -29,9 +29,9 @@ A composition of upstream parts (ADR 0083, ADR 0088). What each part is, at Naut
 * **The chase** of a released limit that rests is `cancel_order`, the cancel seen terminal at a later
   step, then a new limit for all that is held (`chase="resend"`, the default). No order is modified: the
   lead's decision of 2026-11-11, until the adapter's replace chain has passed two clean outside reviews.
-  `chase="modify"` is `Strategy.modify_order(client_order_id, price=...)` (concepts/strategies,
-  "Modifying orders") and stays unused until then. The cost of a re-price is two requests and a moment
-  with no working sale.
+  `Strategy.modify_order` (concepts/strategies, "Modifying orders") is not called, and the row that
+  would ask for it, `chase="modify"`, is refused by name. The cost of a re-price is two requests and a
+  moment with no working sale.
 * **Prices** are ticks of upstream's `TieredTickScheme` stating Alpaca's two bands (`PRICES`;
   `crates/model/src/instruments/tick_scheme.rs`), through `next_ask_price` and `next_bid_price`.
 * **The end** in the session is upstream's `market_exit()` (concepts/strategies, "Market exit"), as
@@ -157,7 +157,7 @@ CENT = Decimal("0.01")
 SUB_DOLLAR = Decimal("0.0001")
 SECOND_NS = 1_000_000_000
 BUDGET_SPAN_NS = 60 * SECOND_NS
-CHASES = ("modify", "resend")
+CHASES = ("resend",)
 TRIGGERS = (TriggerType.BID_ASK, TriggerType.LAST_PRICE)
 """The triggers the local emulator accepts for an order it holds (concepts/orders/emulated)."""
 REFUSED = (OrderStatus.DENIED, OrderStatus.REJECTED)
@@ -388,6 +388,11 @@ class MoverConfig(StrategyConfig):
                 raise ValueError(f"{name} must not be negative, got {fields[name]}")
         if not slots <= watch <= RANK_MOST:
             raise ValueError(f"watch must be from slots ({slots}) to {RANK_MOST}, got {watch}")
+        if chase == "modify":
+            raise ValueError(
+                "chase='modify' is refused: no order is modified until the adapter's replace chain "
+                "has passed two outside reviews (ADR 0088); a re-price is chase='resend'"
+            )
         if chase not in CHASES:
             raise ValueError(f"chase must be one of {CHASES}, got {chase!r}")
         if trigger not in TRIGGERS:
@@ -746,13 +751,14 @@ class Mover(Strategy):
     def _time_out(self, slot: Slot, entry: Any, now: int) -> None:
         """Cancel an entry still working after its time (again after another, if it is open still); at
         once when the wind-down has begun or this name's sale has been released, since nothing more is
-        bought of a name that is being sold."""
+        bought of a name that is being sold, and then again every `chase_secs` while it still works."""
         timeout = self.settings.entry_timeout_secs * SECOND_NS
         due = (slot.entry_cancel_ns or entry.ts_init) + timeout
         at_once = self.winding_down or slot.exiting
         if (now < due and not at_once) or entry.is_pending_cancel or not entry.is_open:
             return
-        if at_once and slot.entry_cancel_ns and now < slot.entry_cancel_ns + timeout:
+        retry = self.settings.chase_secs * SECOND_NS  # a cancel that failed while the name is sold
+        if at_once and slot.entry_cancel_ns and now < slot.entry_cancel_ns + retry:
             return
         slot.entry_cancel_ns = now
         self.cancel_order(entry.client_order_id)
@@ -799,7 +805,8 @@ class Mover(Strategy):
             # and one for all of it is made from the trigger this one had reached.
             if order.quantity.as_decimal() != held and not order.is_pending_cancel:
                 if order.trigger_price is not None:
-                    slot.trail_trigger = order.trigger_price.as_decimal()
+                    reached = order.trigger_price.as_decimal()
+                    slot.trail_trigger = max(reached, slot.trail_trigger or reached)
                 self.cancel_order(order.client_order_id)
                 # The emulator cancels its own order before the call returns, so the cancel is seen
                 # terminal here and the new sell follows in this step, not a second later.
@@ -815,8 +822,15 @@ class Mover(Strategy):
         trigger = self.settings.trigger
         at = self._followed(slot)
         entry = self._order(slot.entry_id)
-        if at is None or entry is None or entry.avg_px is None:
+        if entry is None or entry.avg_px is None:
+            self._note(
+                slot,
+                f"{slot.instrument_id}: {held} held with no filled entry of this strategy to size a "
+                "trailing sell from; not protected, and sold only at the wind-down",
+            )
             return
+        if at is None:
+            return  # no quote or trade yet for the trigger to start from: the next step asks again
         kept = slot.trail_trigger
         if kept is not None and at <= kept:
             # the market is at the trigger the canceled sell had reached: its sale is due now
@@ -846,8 +860,9 @@ class Mover(Strategy):
             emulation_trigger=trigger,
         )
         slot.protect_id = order.client_order_id
-        slot.priced_ns = now
-        slot.trail_trigger = None
+        slot.priced_ns = (
+            now  # the trigger is kept: a remake that is refused starts the next from it
+        )
         self.submit_order(order, params=self.submit_params)
 
     def _followed(self, slot: Slot) -> Decimal | None:
@@ -880,14 +895,9 @@ class Mover(Strategy):
         if price >= order.price.as_decimal():
             return
         slot.priced_ns = now
-        if self.settings.chase == "modify":
-            instrument = self._instrument(slot.instrument_id)
-            self.modify_order(
-                order.client_order_id,
-                price=Price.from_str(f"{price:.{instrument.price_precision}f}"),
-            )
-        else:  # the next step finds it closed and sends the new limit
-            self.cancel_order(order.client_order_id)
+        self.cancel_order(
+            order.client_order_id
+        )  # the next step finds it closed and sends the new limit
 
     def _limit_sell(self, slot: Slot, held: Decimal, now: int, floor: Decimal | None) -> None:
         """A plain DAY limit for what is held, `exit_ticks` through the bid and not below `floor`."""
@@ -911,11 +921,15 @@ class Mover(Strategy):
     def _sell_out(self, slot: Slot, held: Decimal, now: int) -> None:
         """The wind-down outside the session: withdraw the entry and the trailing sell, then sell what
         is held with a limit through the bid, re-priced every `chase_secs`, with no floor."""
-        slot.exiting = True  # `_time_out` cancels a working entry at once; what it still buys is
-        order = self._order(
-            slot.protect_id
-        )  # covered by `_chase`, which re-sends for all that is held
+        # `_time_out` cancels a working entry at once; what it still buys is covered by `_chase`, which
+        # re-sends for all that is held
+        begun, slot.exiting = slot.exiting, True
+        chase = self.settings.chase_secs * SECOND_NS
+        order = self._order(slot.protect_id)
         if order is None or order.is_closed:
+            refused = begun and order is not None and order.status in REFUSED
+            if refused and now - slot.priced_ns < chase:
+                return  # as in `_protect`: a refused sale is sent again every `chase_secs`
             self._limit_sell(slot, held, now, None)
         elif order.is_emulated:
             if not order.is_pending_cancel:

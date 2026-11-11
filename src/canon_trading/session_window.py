@@ -2595,6 +2595,12 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="One bounded strategy window on Alpaca paper")
     parser.add_argument("--session", choices=(*SESSIONS, "auto"), default="regular")
     parser.add_argument("--strategy", choices=tuple(WINDOW_STRATEGIES), default=DEFAULT_STRATEGY)
+    parser.add_argument(
+        "--regular-strategy",
+        choices=tuple(n for n, runs in WINDOW_STRATEGIES.items() if "regular" in runs.sessions),
+        help="with --session auto: the strategy of a window in the regular session; every other "
+        "part runs --strategy",
+    )
     parser.add_argument("--minutes", type=int, default=DEFAULT_MINUTES)
     chosen = parser.add_mutually_exclusive_group()
     chosen.add_argument("--symbol", default="SPY")
@@ -2611,7 +2617,12 @@ def _args(argv: Sequence[str] | None) -> argparse.Namespace:
     """The arguments, `--log-dir` defaulted to `default_log_dir()` only when it is not given, and
     `RuntimeError` for a relative one: the records go outside the repository, wherever the run starts
     (an empty `getconf` in the caller's shell leaves only the folder's name)."""
-    args = _parser().parse_args(argv)
+    parser = _parser()
+    args = parser.parse_args(argv)
+    if args.regular_strategy is not None and args.session != "auto":
+        parser.error("--regular-strategy names a part's strategy, so it needs --session auto")
+    if args.regular_strategy == MOVER and not args.mover:
+        parser.error(f"--regular-strategy {MOVER} trades the day's mover, so it needs --mover")
     if args.log_dir is None:
         args.log_dir = default_log_dir()
     elif not args.log_dir.is_absolute():
@@ -2642,6 +2653,8 @@ def _main(args: argparse.Namespace) -> int:
             trading = paper_trading()
             clock, calendar, market_read_at = session_now(trading)
             market = (clock, calendar)
+            if args.regular_strategy is not None and clock.is_open:
+                args.strategy = args.regular_strategy  # the schedule names the strategy a part runs
             resolved, why = resolve_session(clock, calendar, args.strategy)
             if args.mover and resolved not in (None, "regular"):
                 resolved, why = None, f"{why}, and a mover window runs in the regular session only"

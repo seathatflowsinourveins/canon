@@ -704,9 +704,9 @@ if command -v plutil >/dev/null 2>&1; then
   fi
   PP="$TMP/agents/local.canon.paper-session.plist"
   pargs=""
-  for i in 0 1 2 3 4 5 6 7 8 9 10; do pargs="$pargs|$(plutil -extract "ProgramArguments.$i" raw -o - "$PP" 2>/dev/null)"; done
-  check "rehearsal writes the paper session agent: the runner, its clone and origin, --session auto --minutes 25 --mover" \
-        test "$pargs" = "|/bin/bash|$AH/canon/paper-session.sh|$B/mise|$CK|$OURL|--session|auto|--minutes|25|--mover|"
+  for i in 0 1 2 3 4 5 6 7 8 9 10 11 12; do pargs="$pargs|$(plutil -extract "ProgramArguments.$i" raw -o - "$PP" 2>/dev/null)"; done
+  check "rehearsal writes the paper session agent: the runner, its clone and origin, --session auto --minutes 25 --mover, and Mover named for the regular session" \
+        test "$pargs" = "|/bin/bash|$AH/canon/paper-session.sh|$B/mise|$CK|$OURL|--session|auto|--minutes|25|--mover|--regular-strategy|Mover|"
   check "... the runner installed beside the watchdog" cmp -s "$ROOT/home/.claude/canon/paper-session.sh" "$AH/canon/paper-session.sh"
   check "... and its clone at origin's main, detached, marked as made by it" \
         eval '[ "$(git -C "$CK" rev-parse HEAD)" = "$(git -C "$O" rev-parse main)" ] && ! git -C "$CK" symbolic-ref -q HEAD >/dev/null && [ "$(git -C "$CK" config canon.paperCheckout)" = true ]'

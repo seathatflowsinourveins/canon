@@ -499,32 +499,32 @@ def test_a_fall_through_the_trigger_releases_a_limit_that_sells_all_and_nothing_
 
 def test_a_release_that_rests_is_chased_down_to_the_bid_but_not_below_its_cap() -> None:
     """A gap: the bid falls from 10.69 to 9.99 in one quote, so the released limit (10.42) rests above
-    it. Every `chase_secs` it is re-priced one tick through the bid, never below 2% under its first
-    price (10.42 -> floor 10.22); the bid is under the floor, so it rests there, unfilled, until the
-    run's stop cancels it."""
+    it. Every `chase_secs` it is canceled and sent again one tick through the bid, never below 2% under
+    its first price (10.42 -> floor 10.22); the bid is under the floor, so it rests there, unfilled,
+    until the run's stop cancels it."""
     eng = engine()
-    s = strategy(chase_secs=5, chase="modify")
+    s = strategy(chase_secs=5)
     orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, [*RISING, 10.00, 10.00]))
-    exit_ = orders[1]
+    exit_ = orders[-1]
     facts = (exit_.order_type.name, exit_.status.name, exit_.price.as_decimal())
     count = len(orders)
     eng.dispose()
     assert facts == ("LIMIT", "CANCELED", Decimal("10.22"))
-    assert count == 2
+    assert count == 3
 
 
 def test_a_chase_inside_the_cap_follows_the_bid_and_fills() -> None:
-    """The bid gaps to 10.29, inside the cap: the limit moves to 10.28 and is filled by the next quote."""
+    """The bid gaps to 10.29, inside the cap: the limit is sent again at 10.28 and is filled by the next quote."""
     eng = engine()
-    s = strategy(chase_secs=5, chase="modify")
+    s = strategy(chase_secs=5)
     orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, [*RISING, 10.30, 10.30]))
-    exit_ = orders[1]
+    exit_ = orders[-1]
     facts = (exit_.status.name, exit_.price.as_decimal())
     flat = not eng.cache.positions_open(strategy_id=MOVER_ID)
     count = len(orders)
     eng.dispose()
     assert facts == ("FILLED", Decimal("10.28"))
-    assert flat and count == 2
+    assert flat and count == 3
 
 
 def test_a_chase_by_resend_cancels_the_resting_limit_and_sends_one_at_the_new_price() -> None:
@@ -1297,3 +1297,177 @@ def test_a_name_whose_one_share_is_over_the_largest_entry_is_refused_before_the_
 ):
     with pytest.raises(ValueError, match="over the largest entry"):
         window_parts(price=Decimal("500.01"))
+
+
+# --- states the simulated venue does not reach: the sale path's own methods on a stand-in -----------------
+
+
+class Seam:
+    """Stands in for a `Mover` in one step of its sale path, for states a second reader named that the
+    simulated venue does not produce (a refused remake, a cancel that failed, a position with no entry
+    of the strategy's): the orders by client order ID, one bid, and what the step sent. Every method
+    under test is `Mover`'s own."""
+
+    _protect = Mover._protect
+    _trail = Mover._trail
+    _followed = Mover._followed
+    _limit_sell = Mover._limit_sell
+    _sell_out = Mover._sell_out
+    _time_out = Mover._time_out
+    _chase = Mover._chase
+    _note = Mover._note
+
+    def __init__(self, bid: str, **rows: Any) -> None:
+        self.settings = MoverConfig(max_notional=Decimal(50_000), max_move=Decimal(5), **rows)
+        self.submit_params = None
+        self.winding_down = False
+        self.bid = bid
+        self.orders: dict[str, SimpleNamespace] = {}
+        self.sent: list[SimpleNamespace] = []
+        self.canceled: list[str] = []
+        self.said: list[str] = []
+        self.notes: dict = {}
+        self.dropped: list[str] = []
+        self.cache = SimpleNamespace(quote=self._quote)
+        self.order_factory = SimpleNamespace(trailing_stop_limit=self._trailing, limit=self._limit)
+
+    def _quote(self, _instrument_id: InstrumentId) -> SimpleNamespace:
+        return SimpleNamespace(bid_price=Price.from_str(self.bid))
+
+    def _order(self, client_order_id: Any) -> SimpleNamespace | None:
+        return None if client_order_id is None else self.orders.get(client_order_id.value)
+
+    def _instrument(self, _instrument_id: InstrumentId) -> SimpleNamespace:
+        return SimpleNamespace(
+            make_qty=lambda q: Quantity.from_str(str(q)),
+            make_price=lambda p: Price.from_str(f"{p:.4f}"),
+            price_precision=4,
+        )
+
+    def _new(self, kind: str, **fields: Any) -> SimpleNamespace:
+        cid = SimpleNamespace(value=f"S-{len(self.orders) + 1}")
+        working = {"is_open": kind == "LIMIT", "is_emulated": kind == "TRAILING"}
+        pending = {"is_pending_cancel": False, "is_pending_update": False}
+        return SimpleNamespace(
+            client_order_id=cid,
+            kind=kind,
+            status=None,
+            is_closed=False,
+            **working,
+            **pending,
+            **fields,
+        )
+
+    def _trailing(self, _id: Any, _side: Any, qty: Any, _price: Any, **kw: Any) -> SimpleNamespace:
+        return self._new("TRAILING", quantity=qty, trigger_price=kw["trigger_price"], price=None)
+
+    def _limit(self, _id: Any, _side: Any, qty: Any, price: Any, **_kw: Any) -> SimpleNamespace:
+        return self._new("LIMIT", quantity=qty, leaves_qty=qty, price=price, trigger_price=None)
+
+    def submit_order(self, order: SimpleNamespace, params: Any = None) -> None:
+        self.orders[order.client_order_id.value] = order
+        self.sent.append(order)
+
+    def cancel_order(self, client_order_id: Any) -> None:
+        self.canceled.append(client_order_id.value)
+
+    def _say(self, text: str) -> None:
+        self.said.append(text)
+
+    def refuse(self, order: SimpleNamespace) -> None:
+        """The order as the cache shows one the risk engine denied."""
+        order.status = mover.REFUSED[0]
+        order.is_closed, order.is_open, order.is_emulated = True, False, False
+
+
+def seam_slot(seam: Seam, *, bought: str | None = "10.00") -> mover.Slot:
+    """A slot of AAA whose entry filled at `bought`; with None, a position the strategy has no entry for."""
+    slot = cast(Any, mover.Slot)(AAA, None, None, None)
+    if bought is not None:
+        slot.entry_id = SimpleNamespace(value="E-1")
+        seam.orders["E-1"] = SimpleNamespace(avg_px=float(bought), is_closed=True)
+    return slot
+
+
+def test_a_refused_remake_of_the_trailing_sell_keeps_the_trigger_it_had_reached() -> None:
+    """A trailing sell is made again from a trigger of 10.38 and the risk engine denies it. The bid is
+    then 10.20, under that trigger: the next step sells by limit. It does not start a new trailing
+    sell 0.20 under a bid that is already through the trigger."""
+    seam = Seam("10.50")
+    slot = seam_slot(seam)
+    slot.trail_trigger = Decimal("10.38")
+    cast(Any, seam)._protect(slot, Decimal(3), T0)
+    remade = seam.sent[-1]
+    assert (remade.kind, remade.trigger_price) == ("TRAILING", Price.from_str("10.3800"))
+    seam.refuse(remade)
+    seam.bid = "10.20"
+    cast(Any, seam)._protect(slot, Decimal(3), T0 + 5 * SECOND)
+    assert [o.kind for o in seam.sent] == ["TRAILING", "LIMIT"]
+    assert slot.exiting
+
+
+def test_a_position_with_no_entry_of_the_strategys_is_named_as_unprotected() -> None:
+    """Shares held in a watched name with no entry order of this strategy have no price to size a
+    trailing sell from. Nothing is sent, and the run's record says so, once."""
+    seam = Seam("10.50")
+    slot = seam_slot(seam, bought=None)
+    for step in range(3):
+        cast(Any, seam)._protect(slot, Decimal(5), T0 + step * SECOND)
+    assert seam.sent == []
+    assert len(seam.notes[AAA]) == 1
+    assert "no filled entry of this strategy" in seam.notes[AAA][0]
+
+
+def test_a_config_that_modifies_orders_is_refused_by_name() -> None:
+    """No order is modified until the adapter's replace chain has been read twice from outside (ADR
+    0088): the row that would turn `modify_order` on is refused, not left to each run's choice."""
+    with pytest.raises(ValueError, match="no order is modified"):
+        MoverConfig(max_notional=Decimal(500), max_move=Decimal(5), chase="modify")
+    code = [f.__code__ for f in vars(Mover).values() if hasattr(f, "__code__")]
+    assert code and not any("modify_order" in c.co_names for c in code)
+
+
+def test_a_refused_sale_in_the_wind_down_outside_the_session_waits_chase_secs() -> None:
+    """Outside the session the wind-down sells by limit. A sale the engine denies is sent again after
+    `chase_secs`, not at every one-second step."""
+    seam = Seam("10.20", extended_hours=True, chase_secs=5)
+    seam.winding_down = True
+    slot = seam_slot(seam)
+    cast(Any, seam)._sell_out(slot, Decimal(3), T0)
+    seam.refuse(seam.sent[-1])
+    for step in range(1, 5):
+        cast(Any, seam)._sell_out(slot, Decimal(3), T0 + step * SECOND)
+    assert len(seam.sent) == 1
+    cast(Any, seam)._sell_out(slot, Decimal(3), T0 + 5 * SECOND)
+    assert len(seam.sent) == 2
+
+
+def test_the_wind_down_outside_the_session_does_not_wait_on_a_refused_trailing_sell() -> None:
+    """The trailing sell was refused a second before the wind-down began. The wind-down's first limit
+    goes at once: the wait is for a sale the wind-down itself had sent."""
+    seam = Seam("10.50", extended_hours=True, chase_secs=5)
+    slot = seam_slot(seam)
+    cast(Any, seam)._protect(slot, Decimal(3), T0)
+    seam.refuse(seam.sent[-1])
+    seam.winding_down = True
+    cast(Any, seam)._sell_out(slot, Decimal(3), T0 + SECOND)
+    assert [o.kind for o in seam.sent] == ["TRAILING", "LIMIT"]
+
+
+def test_an_entry_whose_cancel_failed_during_the_exit_is_canceled_again_after_chase_secs() -> None:
+    """The sale has been released and the entry's cancel was rejected while it still works. The cancel
+    is sent again after `chase_secs`, not after the entry's own timeout of 30 seconds."""
+    seam = Seam("10.20", chase_secs=5, entry_timeout_secs=30)
+    slot = seam_slot(seam)
+    slot.exiting = True
+    entry = SimpleNamespace(
+        client_order_id=SimpleNamespace(value="E-1"),
+        ts_init=T0,
+        is_open=True,
+        is_pending_cancel=False,
+    )
+    cast(Any, seam)._time_out(slot, entry, T0)
+    cast(Any, seam)._time_out(slot, entry, T0 + 4 * SECOND)
+    assert seam.canceled == ["E-1"]
+    cast(Any, seam)._time_out(slot, entry, T0 + 5 * SECOND)
+    assert seam.canceled == ["E-1", "E-1"]
