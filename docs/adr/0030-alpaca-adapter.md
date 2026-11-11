@@ -158,3 +158,11 @@ For the execution slice, read 2026-11-10:
   `crates/adapters/kraken/src/http/spot/client.rs` at the pin, fetched, raw); "Get All Orders" gives the
   limit ("Defaults to 50 and max is 500") and newest-first order
   (https://docs.alpaca.markets/us/reference/getallorders-1.md, fetched, raw).
+* A second reader after landing, 2026-11-10: a subscription after the market data stream ended by itself
+  was recorded on a stream that was not running; a client given to a constructor was dropped at
+  disconnect, so a reconnect built one from the environment in its place; and a shielded worker call
+  whose hook was cancelled left its later error "never retrieved". Each reproduced with a test and fixed:
+  the subscription fails, naming the "No restart" limit; a given client is kept, as the adapter guide
+  closes only what `_connect` creates (`docs/developer_guide/python_adapters.md` at the pin, "Bind
+  resources at startup", "Disconnect and drain tasks", fetched, raw); and the call's outcome is read when
+  it ends (asyncio's `shield` leaves the inner task running).

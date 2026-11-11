@@ -32,6 +32,7 @@ from typing import cast
 
 import canon_alpaca.data
 import canon_alpaca.execution
+import canon_alpaca.factories
 import canon_alpaca.providers
 import pytest
 import requests
@@ -2223,12 +2224,39 @@ def test_fill_history_that_cannot_be_read_leaves_fills_inferred(venue, alpaca, c
 
 
 @pytest.mark.parametrize("change", [{"price": None}, {"qty": "not a number"}])
-def test_fill_reports_skip_an_activity_with_a_value_they_cannot_read(venue, alpaca, change) -> None:
+def test_fill_reports_skip_an_activity_with_a_value_they_cannot_read(
+    venue, alpaca, capfd, change
+) -> None:
+    # Two one-share fills of a two-share order, as Alpaca lists them (`cum_qty` 1 then 2), the second
+    # unreadable: it is skipped with a warning, and the order's one readable fill cannot be shown to be
+    # all of them, so it is left to the engine. Another order's complete fill is still reported.
     order = alpaca.alpaca_order(status="filled", filled_qty="2")
+    other = alpaca.alpaca_order(
+        id="7f000000-0000-4000-8000-000000000001",
+        client_order_id="other-filled",
+        status="filled",
+        qty="1",
+        filled_qty="1",
+    )
     at = datetime(2026, 11, 10, 15, 0, tzinfo=UTC)
     venue.trading.activities = [
-        alpaca.fill_activity(order, str(uuid.UUID(int=1)), 1, "174.7", at),
-        {**alpaca.fill_activity(order, str(uuid.UUID(int=2)), 1, "174.8", at), **change},
+        alpaca.fill_activity(
+            order,
+            str(uuid.UUID(int=1)),
+            1,
+            "174.7",
+            at - timedelta(seconds=1),
+            "partial_fill",
+            cum_qty=1,
+            leaves_qty=1,
+        ),
+        {
+            **alpaca.fill_activity(
+                order, str(uuid.UUID(int=2)), 1, "174.8", at, cum_qty=2, leaves_qty=0
+            ),
+            **change,
+        },
+        alpaca.fill_activity(other, str(uuid.UUID(int=3)), 1, "174.9", at - timedelta(seconds=2)),
     ]
     reports: list = []
 
@@ -2237,7 +2265,10 @@ def test_fill_reports_skip_an_activity_with_a_value_they_cannot_read(venue, alpa
 
     run_with_client(body)
 
-    assert [r.trade_id.value for r in reports] == [str(uuid.UUID(int=1))]
+    assert [r.trade_id.value for r in reports] == [str(uuid.UUID(int=3))]
+    log = logged(capfd)
+    assert f"Alpaca fill activity {venue.trading.activities[1]['id']} is not reported" in log
+    assert f"Alpaca lists only some fills of order {order['id']}" in log
 
 
 def test_fill_report_maps_a_short_sale_to_a_sell(alpaca) -> None:
@@ -2405,12 +2436,31 @@ def test_fill_reports_stop_paging_before_the_window(venue, alpaca) -> None:
 
 
 def test_fill_reports_ask_alpaca_for_one_order_and_skip_what_they_cannot_map(venue, alpaca) -> None:
+    # One order's fills, asked for by its ID; its second fill is fractional, which this slice cannot map,
+    # so the first alone cannot be shown to be all of them and none is reported.
     order = alpaca.alpaca_order(status="filled", filled_qty="2")
     at = datetime(2026, 11, 10, 15, 0, tzinfo=UTC)
     venue.trading.activities = [
-        alpaca.fill_activity(order, "d7c568d4-4cf3-4326-8362-8dd41d44da80", 1, "174.7", at),
+        alpaca.fill_activity(
+            order,
+            "d7c568d4-4cf3-4326-8362-8dd41d44da80",
+            1,
+            "174.7",
+            at - timedelta(seconds=1),
+            "partial_fill",
+            cum_qty=1,
+            leaves_qty=1,
+        ),
         {
-            **alpaca.fill_activity(order, "d83ed35d-fb7a-4b11-a888-0a5ba5298620", 1, "174.8", at),
+            **alpaca.fill_activity(
+                order,
+                "d83ed35d-fb7a-4b11-a888-0a5ba5298620",
+                1,
+                "174.8",
+                at,
+                cum_qty=2,
+                leaves_qty=0,
+            ),
             "qty": "0.5",
         },
     ]
@@ -2424,7 +2474,7 @@ def test_fill_reports_ask_alpaca_for_one_order_and_skip_what_they_cannot_map(ven
 
     run_with_client(body)
 
-    assert [r.trade_id.value for r in reports] == ["d7c568d4-4cf3-4326-8362-8dd41d44da80"]
+    assert reports == []
     assert venue.trading.activity_requests[0]["order_id"] == order["id"]
 
 
@@ -3184,3 +3234,453 @@ def test_open_only_report_request_reads_open_orders_with_no_window(venue, alpaca
     (open_now,) = queries
     assert (open_now.status, open_now.after, open_now.until) == (QueryOrderStatus.OPEN, None, None)
     assert [r.venue_order_id.value for r in reports] == [alpaca.ORDER_AAPL["id"]]
+
+
+# -- A third reader's findings on the same changes (each failed before its fix) ------------------------
+
+UNBUILDABLE = [
+    ValueError("a body alpaca-py's Order model refuses"),
+    TypeError("Order() argument after ** must be a mapping"),
+]
+UNBUILDABLE_IDS = ["value", "type"]
+
+
+@pytest.mark.parametrize("error", UNBUILDABLE, ids=UNBUILDABLE_IDS)
+def test_submit_refused_whose_lookup_cannot_be_built_stays_submitted(
+    venue, alpaca, capfd, error
+) -> None:
+    # A 422 on the submit, then a lookup answered with a body alpaca-py cannot build: the outcome is
+    # unknown, logged as such, as `_filled_quantities` takes the same two classes.
+    venue.trading.script = "silent"
+    venue.trading.submit_error = alpaca.api_error(422, 40010001, "client_order_id must be unique")
+    venue.trading.lookup_error = error
+    strategy = trader(order_type="limit")
+
+    async def body(client) -> None:
+        async with asyncio.timeout(10):
+            while not venue.trading.submitted:
+                await asyncio.sleep(0.01)
+        await until_idle(client, venue)
+
+    run_with_client(body, strategy)
+
+    assert strategy.names() == ["OrderSubmitted"]
+    assert "refused (422), then the lookup failed" in logged(capfd)
+
+
+@pytest.mark.parametrize("error", UNBUILDABLE, ids=UNBUILDABLE_IDS)
+def test_cancel_refused_whose_lookup_cannot_be_built_leaves_the_order(
+    venue, alpaca, capfd, error
+) -> None:
+    venue.trading.script = "accept"
+    strategy = trader(order_type="limit")
+    strategy.stopped_for = "held open"  # the strategy does not stop the node; the test does
+
+    async def body(client) -> None:
+        async with asyncio.timeout(10):
+            while "OrderAccepted" not in strategy.names():
+                await asyncio.sleep(0.01)
+        await until_idle(client, venue)
+        venue.trading.cancel_error = alpaca.api_error(422, 42210000, "order is not cancelable")
+        venue.trading.order_lookup_error = lambda order_id: error
+        assert strategy.client_order_id is not None
+        strategy.cancel_order(strategy.client_order_id)
+        await until_idle(client, venue)
+
+    run_with_client(body, strategy)
+
+    assert strategy.names() == ["OrderSubmitted", "OrderAccepted", "OrderPendingCancel"]
+    assert "Alpaca refused the cancel of" in logged(capfd)
+
+
+@pytest.mark.parametrize("error", UNBUILDABLE, ids=UNBUILDABLE_IDS)
+def test_modify_refused_whose_lookup_cannot_be_built_is_an_unknown_outcome(
+    venue, alpaca, capfd, error
+) -> None:
+    venue.trading.script = "accept"
+    venue.trading.replace_error = alpaca.api_error(422, 42210000, "order is not replaceable")
+    venue.trading.order_lookup_error = lambda order_id: (
+        error
+    )  # nothing else reads an order by ID here
+    strategy = modifier()
+
+    run_modify(venue, strategy, lambda: bool(venue.trading.replace_requests))
+
+    assert strategy.names()[-1] == "OrderPendingUpdate", strategy.names()
+    assert "refused (422), then the lookup failed" in logged(capfd)
+
+
+def test_rejected_replacement_after_replaced_whose_read_failed_ends_the_order(
+    venue, alpaca
+) -> None:
+    # Alpaca sent `replaced` for the node's order, the replacement could not be read then, and the
+    # replacement is then rejected: it had taken over, so its rejection ends the node's order, which is
+    # not put back to its old terms by an `OrderModifyRejected` while nothing works at Alpaca.
+    venue.trading.script = "accept"
+    venue.trading.replace_script = "silent"
+    venue.trading.replace_error = requests.ReadTimeout("read timed out")
+    venue.trading.took_before_error = True
+    strategy = modifier()
+
+    async def replaced_then_rejected(client) -> None:
+        old, new = placed_order(venue, 0), placed_order(venue, 1)
+        venue.trading.order_lookup_error = lambda order_id: (
+            requests.ReadTimeout("read timed out") if order_id == new["id"] else None
+        )
+        venue.trading.confirm_replace(old["id"])
+        await until_idle(client, venue)
+        venue.trading.order_lookup_error = None
+        venue.trading.update(new["id"], "rejected", status="rejected")
+
+    run_modify(
+        venue, strategy, lambda: bool(venue.trading.replace_requests), replaced_then_rejected
+    )
+
+    assert "OrderModifyRejected" not in strategy.names(), strategy.names()
+    assert strategy.names()[-1] == "OrderRejected", strategy.names()
+
+
+def test_rejected_replacement_of_a_replaced_order_is_reported(venue, alpaca) -> None:
+    # Alpaca shows the node's order replaced and its replacement rejected: the replacement had taken
+    # over, so it is the node's order's outcome, reported under its ID, unlike a replacement rejected
+    # because the old order filled first, which leaves the old order's report.
+    old = alpaca.alpaca_order(
+        id="6e000000-0000-4000-8000-000000000001",
+        client_order_id="node-6",
+        status="replaced",
+        replaced_by="6e000000-0000-4000-8000-000000000002",
+    )
+    new = alpaca.alpaca_order(
+        id="6e000000-0000-4000-8000-000000000002",
+        client_order_id="alpaca-made-6",
+        status="rejected",
+        replaces=old["id"],
+    )
+    venue.trading.orders = [old, new]
+    reports: list = []
+    by_id = SimpleNamespace(venue_order_id=VenueOrderId(old["id"]), client_order_id=None)
+    window = SimpleNamespace(open_only=False, instrument_id=None, start=None, end=None)
+
+    async def body(client) -> None:
+        reports.append(await client._generate_order_status_report(by_id))
+        reports.extend(await client._generate_order_status_reports(window))
+
+    run_with_client(body)
+
+    assert [(r.client_order_id, r.venue_order_id.value, r.order_status) for r in reports] == [
+        (ClientOrderId("node-6"), new["id"], OrderStatus.REJECTED)
+    ] * 2
+
+
+def test_a_cancelled_call_whose_worker_fails_later_leaves_no_unretrieved_error(venue) -> None:
+    # A hook cancelled while its alpaca-py call runs (as the drain at disconnect cancels the update task):
+    # the shielded call goes on, and its later error must not reach the loop as "never retrieved".
+    import gc
+
+    messages: list[str] = []
+
+    async def body(client) -> None:
+        loop = asyncio.get_running_loop()
+        handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _, context: messages.append(str(context.get("message"))))
+        release = threading.Event()
+
+        def fails_later() -> None:
+            release.wait(5)
+            raise OSError("read timed out")
+
+        try:
+            waiting = asyncio.ensure_future(client._call(fails_later))
+            await asyncio.sleep(0.05)
+            waiting.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiting
+            release.set()
+            async with asyncio.timeout(5):
+                while client._rest_lock.locked():
+                    await asyncio.sleep(0.01)
+            await asyncio.sleep(0.05)
+            gc.collect()
+            await asyncio.sleep(0.05)
+        finally:
+            loop.set_exception_handler(handler)
+
+    run_with_client(body)
+
+    assert not [m for m in messages if "never retrieved" in m], messages
+
+
+def test_a_client_given_at_construction_is_kept_across_a_reconnect(venue, monkeypatch) -> None:
+    # A trading client given to the constructor is the caller's: a reconnect uses it again rather than
+    # building one from the environment in its place.
+    import functools
+
+    def refuse(**kwargs: object) -> object:
+        raise AssertionError("built from the environment in place of the given client")
+
+    monkeypatch.setattr(canon_alpaca.execution, "TradingClient", refuse)
+    monkeypatch.setattr(
+        canon_alpaca.factories,
+        "AlpacaExecutionClient",
+        functools.partial(AlpacaExecutionClient, trading_client=venue.trading),
+    )
+    seen: list = []
+
+    async def body(client) -> None:
+        await client._disconnect()
+        seen.append(client._trading)
+        await client._connect()
+        seen.append(client._trading)
+
+    run_with_client(body)
+
+    assert seen == [None, venue.trading]
+
+
+def test_a_stream_given_at_construction_serves_one_connect(venue, monkeypatch) -> None:
+    # alpaca-py's stream keeps its handlers and websocket between runs, and a run abandoned at a timed-out
+    # disconnect may still use it: a second connect with a given stream fails, naming why.
+    import functools
+
+    monkeypatch.setattr(
+        canon_alpaca.factories,
+        "AlpacaExecutionClient",
+        functools.partial(AlpacaExecutionClient, stream=venue.stream),
+    )
+
+    async def body(client) -> None:
+        await client._disconnect()
+        with pytest.raises(RuntimeError, match="serves one connect"):
+            await client._connect()
+
+    run_with_client(body)
+
+
+REPLACED_ID = "8a000000-0000-4000-8000-000000000001"
+REPLACEMENT_ID = "8a000000-0000-4000-8000-000000000002"
+
+
+def replaced_after_one_fill(
+    alpaca, venue, replacement: dict[str, str], last_fill: bool = False
+) -> None:
+    """The node's buy of 2 at 150, filled 1 and then replaced; the replacement as `replacement` gives it,
+    with Alpaca's activities for the fill before the replace and, with `last_fill`, one on the
+    replacement."""
+    at = datetime.now(UTC) - timedelta(minutes=5)
+    old = alpaca.alpaca_order(
+        id=REPLACED_ID,
+        client_order_id="my-order-1",
+        status="replaced",
+        replaced_by=REPLACEMENT_ID,
+        filled_qty="1",
+        filled_avg_price="150",
+    )
+    new = alpaca.alpaca_order(
+        id=REPLACEMENT_ID,
+        client_order_id="alpaca-made-8",
+        replaces=REPLACED_ID,
+        **replacement,
+    )
+    venue.trading.orders = [old, new]
+    venue.trading.activities = [
+        alpaca.fill_activity(
+            old, str(uuid.UUID(int=1)), 1, "150", at, "partial_fill", cum_qty=1, leaves_qty=1
+        )
+    ]
+    if last_fill:
+        venue.trading.activities.append(
+            alpaca.fill_activity(
+                new, str(uuid.UUID(int=2)), 1, "150", at + timedelta(minutes=1), cum_qty=2
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("replacement", "last_fill", "status", "held"),
+    [
+        (
+            {"status": "new", "filled_qty": "1", "filled_avg_price": "150"},
+            False,
+            OrderStatus.PARTIALLY_FILLED,
+            "1",
+        ),
+        (
+            {"status": "filled", "filled_qty": "2", "filled_avg_price": "150"},
+            True,
+            OrderStatus.FILLED,
+            "2",
+        ),
+    ],
+    ids=["open", "filled"],
+)
+def test_a_fill_before_a_replace_is_reported_on_the_node_order_at_startup(
+    venue, alpaca, replacement, last_fill, status, held
+) -> None:
+    # Alpaca lists the fill before the replace under the replaced order, which is not reported (its
+    # replacement is). The fill belongs to the node's order, now the replacement, as on the stream:
+    # reported there, it is not taken for an outside order's.
+    replaced_after_one_fill(alpaca, venue, replacement, last_fill)
+    venue.trading.positions = [
+        {**alpaca.POSITION_AAPL, "qty": held, "qty_available": held, "avg_entry_price": "150"}
+    ]
+    node = build_node(trader(submit=False))
+
+    run(node)
+
+    orders = node.cache.orders()
+    assert [o.client_order_id.value for o in orders] == ["my-order-1"], orders
+    (order,) = orders
+    assert (order.venue_order_id.value, order.status) == (REPLACEMENT_ID, status)
+    trades = [e.trade_id.value for e in order.events() if type(e).__name__ == "OrderFilled"]
+    assert str(uuid.UUID(int=1)) in trades
+
+
+def test_fills_before_a_replace_the_replacement_does_not_count_are_left_to_the_engine(
+    venue, alpaca, capfd
+) -> None:
+    # Whether a replacement's `filled_qty` counts the fills before it is UNVERIFIED (ADR 0042): when it
+    # does not, the fills listed across the chain do not add up to it, and they are not reported.
+    replaced_after_one_fill(alpaca, venue, {"status": "new", "qty": "1", "filled_qty": "0"})
+    reports: list = []
+
+    async def body(client: AlpacaExecutionClient) -> None:
+        reports.extend(await client._fill_reports(fills_command()))
+
+    run_with_client(body)
+
+    assert reports == []
+    assert f"Alpaca lists fills of order {REPLACED_ID}, replaced by {REPLACEMENT_ID}" in logged(
+        capfd
+    )
+
+
+def test_a_rejected_replacement_of_an_order_replaced_by_another_is_not_reported(
+    venue, alpaca
+) -> None:
+    # A replacement Alpaca rejected while its old order stayed open, which a later modify then replaced
+    # with another: only the working replacement is the node's order.
+    old = alpaca.alpaca_order(
+        id="9b000000-0000-4000-8000-000000000001",
+        client_order_id="node-9",
+        status="replaced",
+        replaced_by="9b000000-0000-4000-8000-000000000003",
+    )
+    rejected = alpaca.alpaca_order(
+        id="9b000000-0000-4000-8000-000000000002",
+        client_order_id="alpaca-made-9a",
+        status="rejected",
+        replaces=old["id"],
+    )
+    working = alpaca.alpaca_order(
+        id="9b000000-0000-4000-8000-000000000003",
+        client_order_id="alpaca-made-9b",
+        status="new",
+        replaces=old["id"],
+    )
+    venue.trading.orders = [old, rejected, working]
+    reports: list = []
+    window = SimpleNamespace(open_only=False, instrument_id=None, start=None, end=None)
+
+    async def body(client) -> None:
+        reports.extend(await client._generate_order_status_reports(window))
+
+    run_with_client(body)
+
+    assert [(r.client_order_id.value, r.venue_order_id.value) for r in reports] == [
+        ("node-9", working["id"])
+    ]
+
+
+def chain_fill_reports(venue, alpaca, replacement: dict[str, str], own: list[tuple[int, int]]):
+    """The node's buy of 2, filled 1 and replaced; `own` lists the replacement's activities as (UUID
+    number, `cum_qty`), one share each. Returns the fill reports' trade ID numbers, newest first."""
+    replaced_after_one_fill(alpaca, venue, replacement)
+    new = venue.trading.orders[1]
+    at = datetime.now(UTC) - timedelta(minutes=4)
+    for n, (number, cum) in enumerate(own):
+        venue.trading.activities.append(
+            alpaca.fill_activity(
+                new,
+                str(uuid.UUID(int=number)),
+                1,
+                "150",
+                at + timedelta(seconds=n),
+                cum_qty=cum,
+                leaves_qty=int(new["qty"]) - cum,
+            )
+        )
+    reports: list = []
+
+    async def body(client: AlpacaExecutionClient) -> None:
+        reports.extend(await client._fill_reports(fills_command()))
+
+    run_with_client(body)
+    return [uuid.UUID(r.trade_id.value).int for r in reports]
+
+
+def test_a_chain_whose_live_order_has_an_unlisted_fill_is_left_to_the_engine(venue, alpaca) -> None:
+    # The replacement shows 2 filled, counting only its own, and one of its two fills is not listed yet:
+    # the chain's listed fills add up to 2 by coincidence. Its newest activity's `cum_qty` (1) shows a
+    # fill after it, so nothing of the chain is reported.
+    kept = chain_fill_reports(
+        venue, alpaca, {"status": "filled", "filled_qty": "2", "filled_avg_price": "150"}, [(2, 1)]
+    )
+
+    assert kept == []
+
+
+def test_a_replacement_that_counts_only_its_own_fills_keeps_them(venue, alpaca, capfd) -> None:
+    # The replacement shows 1 filled, its newest activity's `cum_qty` 1, and lists that fill: it counts
+    # only its own. Its fill is reported; the one before the replace cannot be shown on it and is left.
+    kept = chain_fill_reports(
+        venue,
+        alpaca,
+        {"status": "filled", "qty": "1", "filled_qty": "1", "filled_avg_price": "150"},
+        [(2, 1)],
+    )
+
+    assert kept == [2]
+    assert "it does not count the earlier fills" in logged(capfd)
+
+
+def test_a_replaced_order_whose_replacement_cannot_be_read_warns(venue, alpaca, capfd) -> None:
+    # Alpaca answers the replacement's read with raw data: the replaced order's fills are left to the
+    # engine, and the log says why.
+    replaced_after_one_fill(alpaca, venue, {"status": "new", "filled_qty": "1"})
+    get_order_by_id = venue.trading.get_order_by_id
+    venue.trading.get_order_by_id = lambda order_id: (
+        {} if str(order_id) == REPLACEMENT_ID else get_order_by_id(order_id)
+    )
+    reports: list = []
+
+    async def body(client: AlpacaExecutionClient) -> None:
+        reports.extend(await client._fill_reports(fills_command()))
+
+    run_with_client(body)
+
+    assert reports == []
+    assert (
+        f"Alpaca order {REPLACED_ID} was replaced and the order replacing it could not be read"
+        in (logged(capfd))
+    )
+
+
+@pytest.mark.parametrize("error", UNBUILDABLE, ids=UNBUILDABLE_IDS)
+def test_replaced_whose_replacement_cannot_be_built_is_left_to_reconciliation(
+    venue, alpaca, capfd, error
+) -> None:
+    venue.trading.script = "accept"
+    venue.trading.replace_script = "silent"
+    venue.trading.replace_error = requests.ReadTimeout("read timed out")
+    venue.trading.took_before_error = True
+    strategy = modifier()
+
+    async def replaced(client) -> None:
+        old, new = placed_order(venue, 0), placed_order(venue, 1)
+        venue.trading.order_lookup_error = lambda order_id: error if order_id == new["id"] else None
+        venue.trading.confirm_replace(old["id"])
+
+    run_modify(venue, strategy, lambda: bool(venue.trading.replace_requests), replaced)
+
+    assert "which could not be read" in logged(capfd)
+    assert "OrderUpdated" not in strategy.names()

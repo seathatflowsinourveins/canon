@@ -120,3 +120,10 @@ Read 2026-11-10; "raw": fetched with `curl` and read, not summarised. NautilusTr
   build. Reproduced with a test each and fixed: a failed trace, those classes included, fails the report
   for an open order, as any open order this slice cannot represent does (ADR 0030), and skips a closed one
   with a warning.
+* A second reader after landing, 2026-11-10: a replacement that could not be read on `replaced` and was
+  then rejected gave `OrderModifyRejected`, putting the node's order back to its old terms with nothing
+  open at Alpaca, and its report was skipped. Reproduced with a test each and fixed: after `replaced` the
+  replacement is adopted from its own first update, as this record has a replacement adopted by
+  `replaced` or its own first update, so its rejection ends the order; and a rejected replacement whose
+  old order Alpaca shows replaced is reported. A rejected replacement whose old order filled first still
+  leaves the old order's report.
