@@ -57,7 +57,16 @@ check "status line prints what it printed before" '[ "$out" = "$SHOWN" ] && [ ! 
 check "the session's file holds only the two windows and the time" \
   'jq -e --argjson r5 $R5 --argjson r7 $R7 --argjson now $NOW "keys == [\"rate_limits\",\"t\"] and .t >= \$now
      and .rate_limits == {five_hour: {used_percentage: 23.5, resets_at: \$r5}, seven_day: {used_percentage: 41.2, resets_at: \$r7}}" "$FILE" >/dev/null'
-check "no path, model or spend in the file" '! grep -q "secret\|opus\|Opus\|used_usd\|spend\|1.234" "$FILE"'
+# leaks <file>: the file names a path, model or spend figure; each is matched literally, so a "1.234" is not
+# "1" and "234" around any character (a timestamp such as 1823400000 is not the session's spend)
+leaks() { grep -qF -e secret -e opus -e Opus -e used_usd -e spend -e 1.234 "$1"; }
+printf '{"t":1823400000}' > "$TMP/lookalike"
+check "the leak test reads a number that only looks like the spend figure as clean" '! leaks "$TMP/lookalike"'
+for term in secret opus Opus used_usd spend 1.234; do
+  printf '{"x":"%s"}' "$term" > "$TMP/leak"
+  check "... and finds $term" 'leaks "$TMP/leak"'
+done
+check "no path, model or spend in the file" '[ -s "$FILE" ] && ! leaks "$FILE"'
 check "no temporary file left beside it" '[ "$(ls -A "$DIR" | grep -c tmp)" = 0 ]'
 r=$(row)
 check "lanes shows both percentages, resets and ages" \
