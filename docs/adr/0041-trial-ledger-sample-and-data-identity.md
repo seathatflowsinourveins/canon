@@ -148,6 +148,17 @@ Who decided. The orchestrator chose option 2 and its terms under the owner's del
   days after its last bar (`test_a_sample_ending_on_a_day_with_no_bar_is_refused_before_a_trial`) are
   refused before a trial; series named by numbers that cover other days are refused by name
   (`test_series_named_by_numbers_that_cover_other_days_are_refused_by_name`, `tests/test_returns_matrix.py`).
+* The gate's fifth outside round, 2026-11-11, tests that failed before their fix: a sample holding no
+  bar, a weekend inside the catalog's window, is refused before a trial
+  (`test_a_sample_holding_no_bar_is_refused_before_a_trial`), where it was recorded as an idle trial;
+  and a sample moved by another reader beneath the study's pass, after its plan check, stops the
+  pass before a trial on the moved sample, at its first trial or a later one, and a ranking of the
+  moved sample is refused, by name (`tests/test_variant_study.py`:
+  `test_a_sample_moved_after_the_plan_check_stops_the_pass_before_a_trial`,
+  `test_a_sample_moved_during_the_recording_stops_the_pass_at_the_next_trial`,
+  `test_a_ranking_of_a_sample_moved_beneath_the_pass_is_refused`), and from the code review of that
+  fix, a stop on the moved sample is refused too
+  (`test_a_stop_on_a_sample_moved_beneath_the_pass_is_refused`).
 
 ## Evidence
 

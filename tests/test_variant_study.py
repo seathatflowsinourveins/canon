@@ -5,7 +5,7 @@ config key; a pass records every configuration as one trial, two instruments in 
 gate ranks them; a second pass records nothing new, and one after a killed pass runs again only the
 key the gate would stop on; a configuration that never trades is recorded and stops the ranking, as
 ADR 0010's Limits give; a refusal before any trial stops the pass; nothing is created unless asked; a
-study on another range, and a second pass on one study, are refused.
+study on another range, a sample moved beneath a pass, and a second pass on one study, are refused.
 The bars are invented (`conftest.AlpacaBars`), so no number here says anything about a market.
 """
 
@@ -641,3 +641,142 @@ def test_a_record_taken_from_the_queue_is_no_run_the_pass_skips_its_key_for(
             )
         )
         assert canon_trading.variant_study._to_record(study, [key]) == [key]
+
+
+# The gate's fifth round, 2026-11-11: each test failed before its fix.
+
+SHIFTED = datetime(2025, 3, 17, 12, tzinfo=NEW_YORK)
+
+
+def _move(ledger: Path, name: str) -> None:
+    """Another study's `move_sample`, as any reader of the ledger may call it under the ledger's
+    lock while a pass holds only its own: the same end, a start a week later than the plan's."""
+    with open_study(name, ledger) as other:
+        canon_trading.ledger.move_sample(other, start=SHIFTED.isoformat(), end=END.isoformat())
+
+
+def test_a_sample_moved_after_the_plan_check_stops_the_pass_before_a_trial(
+    alpaca_bars: AlpacaBars, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fifth-round reader (Codex): a move between the plan check and the recording put every record
+    on the moved sample, and the pass returned a ranking that passed, at N = 2, T = 35 and DSR
+    0.9868, on a range nobody planned."""
+    alpaca_bars.write(tmp_path / "catalog", symbols=("SPY",))
+    ledger = tmp_path / "trials.db"
+    configs = grid(symbols=("SPY",), periods=SHORT)
+    original = canon_trading.variant_study.record_grid
+
+    def moved_then_recorded(study: optuna.Study, *args: Any, **kwargs: Any) -> Any:
+        _move(ledger, study.study_name)
+        return original(study, *args, **kwargs)
+
+    monkeypatch.setattr(canon_trading.variant_study, "record_grid", moved_then_recorded)
+    with pytest.raises(ValueError, match=r"moved to sample 1 \(2025-03-17.*after the pass checked"):
+        run_study(
+            tmp_path / "catalog",
+            name="s",
+            ledger_path=ledger,
+            configs=configs,
+            start=START,
+            end=END,
+            create=True,
+        )
+    with open_study("s", ledger) as study:
+        assert study.trials == []
+
+
+def test_a_sample_moved_during_the_recording_stops_the_pass_at_the_next_trial(
+    alpaca_bars: AlpacaBars, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same move after the first record: the next configuration is refused before its trial,
+    so no record of this pass is on the moved sample."""
+    alpaca_bars.write(tmp_path / "catalog", symbols=("SPY",))
+    ledger = tmp_path / "trials.db"
+    configs = grid(symbols=("SPY",), periods=SHORT)
+    original = canon_trading.ledger.record_trial
+
+    def recorded_then_moved(study: optuna.Study, *args: Any, **kwargs: Any) -> Any:
+        recorded = original(study, *args, **kwargs)
+        _move(ledger, study.study_name)
+        return recorded
+
+    monkeypatch.setattr(canon_trading.variant_study, "record_trial", recorded_then_moved)
+    with pytest.raises(ValueError, match="after the pass checked"):
+        run_study(
+            tmp_path / "catalog",
+            name="s",
+            ledger_path=ledger,
+            configs=configs,
+            start=START,
+            end=END,
+            create=True,
+        )
+    with open_study("s", ledger) as study:
+        assert [t.user_attrs["sample"] for t in study.trials] == [0]
+
+
+@pytest.mark.parametrize("rank_only", [False, True], ids=["pass", "rank only"])
+def test_a_ranking_of_a_sample_moved_beneath_the_pass_is_refused(
+    alpaca_bars: AlpacaBars, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, rank_only: bool
+) -> None:
+    """The move after the recording, with the grid recorded on the moved sample by another caller of
+    `record_trial`: the ranking answered for the moved sample, which the plan never named."""
+    alpaca_bars.write(tmp_path / "catalog", symbols=("SPY",))
+    ledger = tmp_path / "trials.db"
+    configs = grid(symbols=("SPY",), periods=SHORT)
+    run_study(
+        tmp_path / "catalog",
+        name="s",
+        ledger_path=ledger,
+        configs=configs,
+        start=START,
+        end=END,
+        create=True,
+    )
+    original = canon_trading.variant_study.rank
+
+    def moved_recorded_then_ranked(study: optuna.Study) -> Any:
+        _move(ledger, study.study_name)
+        with open_study(study.study_name, ledger) as other:
+            record_grid(other, tmp_path / "catalog", configs)
+        return original(study)
+
+    monkeypatch.setattr(canon_trading.variant_study, "rank", moved_recorded_then_ranked)
+    with pytest.raises(ValueError, match=r"ranked sample 1 \(2025-03-17.*not sample 0"):
+        run_study(
+            tmp_path / "catalog",
+            name="s",
+            ledger_path=ledger,
+            configs=configs,
+            start=START,
+            end=END,
+            rank_only=rank_only,
+        )
+
+
+def test_a_stop_on_a_sample_moved_beneath_the_pass_is_refused(
+    alpaca_bars: AlpacaBars, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Code review of the fifth round's fix: a move after the last trial and before the ranking left
+    the moved sample with no run, and its stop was returned as the planned study's own, naming a
+    remedy the next pass's plan check refuses."""
+    alpaca_bars.write(tmp_path / "catalog", symbols=("SPY",))
+    ledger = tmp_path / "trials.db"
+    configs = grid(symbols=("SPY",), periods=SHORT)
+    original = canon_trading.variant_study.rank
+
+    def moved_then_ranked(study: optuna.Study) -> Any:
+        _move(ledger, study.study_name)
+        return original(study)
+
+    monkeypatch.setattr(canon_trading.variant_study, "rank", moved_then_ranked)
+    with pytest.raises(ValueError, match=r"stopped on sample 1 \(2025-03-17.*not sample 0"):
+        run_study(
+            tmp_path / "catalog",
+            name="s",
+            ledger_path=ledger,
+            configs=configs,
+            start=START,
+            end=END,
+            create=True,
+        )

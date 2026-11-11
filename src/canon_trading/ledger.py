@@ -71,7 +71,9 @@ Before a trial is asked for, a sample whose ends NautilusTrader's daily series c
 (`_refuse_unbooked_ends`, ADR 0041 term 1): a bar on the day the series books the account's
 registration on, the day before the start (`snapshot_day_start`, `crates/analysis/src/analyzer.rs` at
 the pinned commit), and no bar on the session day of the end, where the run's last fills are booked.
-Either made `record_trial` tell its own run `FAIL`.
+Either made `record_trial` tell its own run `FAIL`. A sample holding no bar at all, which the catalog's
+recorded window can still cover (a weekend), is refused there too: it had been recorded as an idle
+trial, its key counted in N.
 
 Another writer's keyed trial waiting in Optuna's queue is refused before `ask`, and
 `retire_queued` retires it, or one `record_trial` took before it refused, through Optuna's public
@@ -130,6 +132,7 @@ from .returns_matrix import session_sharpe
 
 if TYPE_CHECKING:
     from collections.abc import Generator
+    from collections.abc import Iterable
     from collections.abc import Sequence
 
     from nautilus_trader.config import LoggerConfig
@@ -528,7 +531,7 @@ def trial_config(
         )
     for config in strategies:
         check_as_built(config)
-    bar_types = list(dict.fromkeys(str(config.bar_type) for config in strategies))
+    bar_types = data_bar_types(str(config.bar_type) for config in strategies)
     return {
         "strategies": [
             {
@@ -548,6 +551,14 @@ def trial_config(
         },
         "data": {"data_type": "Bar", "bar_types": bar_types},
     }
+
+
+def data_bar_types(traded: Iterable[str]) -> list[str]:
+    """The bar types a trial's data loads, from those its strategies trade: each once, in order.
+
+    `trial_config` writes them so, and the ranking holds a stored config to the same rule.
+    """
+    return list(dict.fromkeys(traded))
 
 
 def _balances(starting_balances: Sequence[str]) -> list[str]:
@@ -748,6 +759,7 @@ def record_trial(
     *,
     starting_balances: Sequence[str],
     logging: LoggerConfig | None = None,
+    on_sample: Sample | None = None,
 ) -> RecordedTrial:
     """Build a `MaCross` from each config and run them over the study's sample, as one trial.
 
@@ -772,8 +784,18 @@ def record_trial(
     a process killed outright, or a store that refuses the very first write, leaves a record with no
     key; no backtest ran for it, and `mark_not_run` clears it (ADR 0053 term 3). Nothing is overwritten: the
     same configuration again is a new record.
+
+    A caller that checked the study's sample against a plan passes the sample it checked as
+    `on_sample`, and a study whose current sample is another one, moved since by any reader of the
+    ledger (`move_sample`), is refused before a trial, naming both: the run is bounded by the sample
+    read here, once, and the record carries that sample's number.
     """
     sample = current_sample(study)
+    if on_sample is not None and sample != on_sample:
+        raise ValueError(
+            f"study {study.study_name!r} moved to {sample.describe()} after the pass checked "
+            f"{on_sample.describe()} against its plan; nothing was recorded on the moved sample",
+        )
     config = trial_config(strategies, starting_balances=starting_balances)
     key = config_key(config)
     built = [MaCross(strategy) for strategy in strategies]
@@ -871,18 +893,25 @@ def _refuse_unbooked_ends(bars: Sequence[Bar], sample: Sample) -> None:
     it back a day), is a session day with no return, so `daily_series` refuses every such run. And a
     run's last fills, its strategies' `on_stop`, are booked on the session day of its end, which must
     hold a bar: with none there, a fill that moved the balance gave a return on a day with no bar,
-    refused the same way. Either is refused here, before a trial is asked for, as a sample the
-    catalog does not cover is: such a call is not a trial.
+    refused the same way. A sample holding no bar at all has no session day of its end either, and is
+    refused first, by name. Each is refused here, before a trial is asked for, as a sample the catalog
+    does not cover is: such a call is not a trial.
     """
     base = registration_day(sample.start)
     days = {session_day(bar.ts_init) for bar in bars}
+    if not days:
+        raise ValueError(
+            f"{sample.describe()} holds no bar, though the catalog's recorded window covers it: a run "
+            "over it trades nothing and books no session day, which is no trial (ADR 0041 term 1); "
+            "give the study a sample that holds its bars",
+        )
     if base in days:
         raise ValueError(
             f"{sample.describe()} starts at {_date(sample.start)}, a UTC midnight on which a bar "
             "becomes available: NautilusTrader's daily series books that bar on the day before, "
             "the account's registration, which holds no return; start the sample before it",
         )
-    if days and session_day(sample.end) not in days:
+    if session_day(sample.end) not in days:
         raise ValueError(
             f"{sample.describe()} ends on {_date(session_day(sample.end))}, a session day of no "
             f"bar, the last on {_date(max(days))}: NautilusTrader books a run's last fills on the "

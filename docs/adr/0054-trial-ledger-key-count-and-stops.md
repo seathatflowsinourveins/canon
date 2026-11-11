@@ -52,7 +52,9 @@ ADR 0035's numbers, 4 to 6; terms 1 to 3 (storage, recording, entry) are ADR 003
    step 2 rejects, or a record not in the shape `record_trial` writes. Every record that ran on the
    sample has its returns read before any two are compared: each a float, finite, the sum of their
    squares finite, and skfolio's variance and fourth central moment of them finite, or its Sharpe
-   ratio of them reads 0.0 and the DSR's kurtosis NaN (2026-11-11). Each message names the key and
+   ratio of them reads 0.0 and the DSR's kurtosis NaN (2026-11-11). A stored config whose data does
+   not load exactly the bar types its strategies trade, each once, in order, as `trial_config` writes
+   them, is not in that shape either, on every sample (2026-11-11). Each message names the key and
    trial; one ranking gathers every trial's stops before it raises.
    A configuration that can never run to the end stops the ranking for as long as that study is used.
    That is the strict reading: a tried configuration is a trial, and no source read gives it a value.
@@ -249,7 +251,11 @@ study, a larger mechanism than one foreign record needs.
   longer hides its key's other stops
   (`test_a_return_refused_still_lets_its_key_s_disagreement_be_named`); and returns whose fourth
   central moment overflows stop by name
-  (`test_returns_whose_fourth_central_moment_overflows_stop_by_name`).
+  (`test_returns_whose_fourth_central_moment_overflows_stop_by_name`). From the gate's fifth round,
+  tests that failed before their fix (`tests/test_ranking.py`): a config whose strategies trade
+  other bar types than its data loads, none, or none in the writer's form, stops
+  (`test_a_config_whose_strategies_trade_other_bars_than_its_data_loads_stops`), and so does one
+  loading a bar type twice (`test_a_config_loading_one_bar_type_twice_stops`).
 * The trial count is per study (term 5): nothing in the code stops a new study of the same
   configurations from starting at N = 0, and no record carries an earlier study's keys into it. What
   holds that line is pre-registering every study in a record before its first run, as ADR 0048 does
@@ -448,3 +454,32 @@ Term numbers are ADR 0035's.
   threshold. Not changed: each record's returns parsed again by the told value's check, and `origin`
   read up to three times for one marked record, neither of which changes what is read. No change of
   decision.
+* Gate's fifth round, 2026-11-11 (ADR 0073), two outside readers of the gate as checked out at #179;
+  three findings that change behaviour, each reproduced here by a test that failed first
+  (Confirmation here and in ADR 0041). The first reader (Codex), medium: another reader's
+  `move_sample` between the study pass's plan check and its recording put every record on a range
+  nobody planned, and the pass returned a ranking that passed at N = 2, T = 35, DSR 0.9868 (run in
+  a temporary ledger, with the move injected at the recording's entry). The pass now hands the
+  sample it checked to every `record_trial`, which refuses a trial once the study has moved, and it
+  refuses a report on any other sample than that one, by name (ADR 0041 term 5, ADR 0048). The
+  second reader (Muse): a sample holding no bar, a weekend inside the catalog's window, skipped the
+  end check and was recorded as an idle trial counted in N, where ADR 0041 term 1 refuses it before
+  a trial; and a record whose strategies trade one instrument while its data and digest name
+  another, rehashed to its key, passed at DSR 0.98849. `trial_config` cannot write the last, since
+  it writes the data's bar types from the strategies'; it is closed by the shape check in term 6,
+  one comparison, rather than stated as a limit. One finding is a sample race, one an input
+  refusal, one reachable only by a handcrafted record; no new family. Not checked, and not
+  changed: the inner form of a stored config's venue, which no reader showed lowering N, since the
+  key binds the config it is stored with. No change of decision.
+  Code review of the fix (`/code-review`, high): seven findings. Fixed, shown by a test that failed
+  first: a move after the last trial left the moved sample with no run, and its stop was returned
+  as the planned study's own; the pass now reads the sample again after a stop and refuses one that
+  moved. Fixed with no test: the report carries the `Sample` it ranked, so the pass compares that
+  sample rather than its text; the rule deriving a trial's data bar types from its strategies' is one
+  function (`data_bar_types`), shared by `trial_config` and the shape check; a comment citing term 7
+  for term 6; a docstring's wrapping. Not changed: holding off `move_sample` while a pass runs, since
+  a record made during a move carries the sample number it was bounded by, the next trial is refused
+  and the ranking checks the sample it read, so no record or report of the pass answers for an
+  unplanned range; and refusing a multi-instrument trial for one instrument with no bar in its
+  sample, which ADR 0053 records as such (its Confirmation: a bar type with no bar in the sample is
+  in the digest), outside this round's findings.
