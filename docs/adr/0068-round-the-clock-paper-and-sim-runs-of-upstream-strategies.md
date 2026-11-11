@@ -9,8 +9,9 @@ review-by: 2026-12-10
 
 ## Context and Problem Statement
 
-The owner (2026-11-10): paper and simulation should run "24/5 24.7 for sota stratgies e2e", since the paper
-account takes 200 requests a minute. Here that means strategies a maintained upstream ships, through ADR
+The owner's instruction of 2026-11-10: keep the paper and simulation lanes in use around the clock, five
+days a week for paper and seven for simulation, running current strategies end to end, since the paper
+account's request limit (200 a minute) is not the constraint. Here current strategies means strategies a maintained upstream ships, through ADR
 0010's protocol; this recommends no strategy, trade or position. Which of upstream's strategies can run end
 to end, in which lane, what bounds how many run at once, and in what order can it start?
 
@@ -97,7 +98,8 @@ name goes in the record and `scripts/automation status`, with `tests/test_sessio
 does not flatten on stop; the window's account check closes at market in the regular session only, so it
 runs in regular windows. The week ("Orders at Alpaca", the 24/5 page): overnight 20:00 to 04:00 from
 Sunday evening to Friday morning, pre-market 04:00 to 09:30, regular 09:30 to 16:00, after-hours 16:00 to
-20:00. Windows run in the regular session today (`EXTENDED_READY` is off; overnight is refused). The
+20:00. Windows run in the regular session and, with `EXTENDED_READY` on, in pre-market, after-hours and
+overnight, on `boats` overnight and only for an asset marked `overnight_tradable` (`session_window.py`). The
 sandbox runs while a feed streams: IEX in the regular session; `boats` overnight on one night's
 observation, not an entitlement; after-hours, nothing in one 45-second check, not proof (ADR 0055). From
 Friday 20:00 to Sunday 20:00 only the backtest queue runs.
@@ -189,3 +191,5 @@ Read 2026-11-10. Fetched means read in this session as raw text or source; run m
 * Second reader (`evidence-verifier`) of the split, 2026-11-10: the accounts facts had lost their home,
   A and B were undefined, ADR 0066 had reached `main` as `proposed`, "one stream per user" had come
   back, and an Evidence line cited sources the text no longer used. Applied above.
+* Follow-up, 2026-11-11: the owner's instruction restated rather than quoted; the window runner's
+  sessions brought up to date with `session_window.py` on `main` (extended and overnight windows).

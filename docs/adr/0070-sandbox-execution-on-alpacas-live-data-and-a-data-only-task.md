@@ -9,7 +9,8 @@ review-by: 2026-12-10
 
 ## Context and Problem Statement
 
-The owner asked whether simulation can run without limit on NautilusTrader's native features. ADR 0068
+The owner asked on 2026-11-10 whether simulation could run without limit on NautilusTrader's native
+features. ADR 0068
 lays out the lanes; the backtest forms are there. This record covers the third native form, the sandbox
 execution client, which matches orders locally on live market data: whether it works here at the pin, what
 it models, how many strategies it carries, and what a process that only streams would need so that it
@@ -104,6 +105,11 @@ asked, and whether a `data`-only token reads `/v2/assets` is UNVERIFIED.
 ### Confirmation
 
 * When `paper:data` is built: its test (term 4) in `scripts/ci`; until then the task does not exist.
+* A condition on that build, since term 3 holds "fails closed" in one place, the adapter
+  `with_http_timeout` mounts: its test enumerates every place the adapter, the provider and alpaca-py
+  construct a REST client or a `requests.Session` (a library path that does not pass through
+  `with_http_timeout`, a session replaced after the mount), and shows that the node refuses to start in
+  data-only mode if any client it holds lacks the refusing adapter.
 * `mise run paper:test -- -c pytest.toml -v -s -k sandbox <probe>`, 2026-11-10, 23:18 to 23:20 New York,
   exit 0, 4 passed; the probe is not committed. A `LiveNode` with the Alpaca data client and the sandbox
   client (venue `ALPACA`, `CASH`, `NETTING`, $100k, zero fees). Mid-run the venue's account was the
@@ -143,3 +149,5 @@ Read 2026-11-10. Fetched means read in this session as raw text or source; run m
   would be replaced by `with_http_timeout` (an offline run); the wash-trade refusal was cited to the wrong
   page; the run's start times were another run's; pair A and ADR 0069 were undefined; "one stream per
   login" overstated; ADR 0066 is `proposed`; a third module needs a new record. All applied above.
+* Follow-up, 2026-11-11: the build's enumeration condition added to Confirmation; the owner's question
+  dated.
