@@ -33,7 +33,7 @@
 # free: the session map ends each run at its session's end by Alpaca's clock and calendar, which this agent
 # cannot read itself, since it reads no secret. A round that defers starts one detached waiter (its own
 # process group, as the reinstall below), which holds <config>/canon/watch/maintenance-boundary.lock, so a
-# second is never started beside it, waits on the windows' lock for at most BOUNDARY_SECS (lockf(1) -t),
+# second is never started beside it, waits on the windows' lock for at most BOUNDARY_SECS (waitlock, below),
 # and once it holds it, and the clone's own lock has gone free too, runs a round with it held
 # (CANON_MAINTENANCE_AT_BOUNDARY=1), which installs the whole, paper section included, and moves the pins;
 # or it records that it timed out. It writes maintenance-boundary.json, which also says when the boundary's
@@ -137,6 +137,20 @@ boundary_put() {
        since: (if $s == "waiting" then $at else ($p.since // $at) end),
        since_epoch: (if $s == "waiting" then now else ($p.since_epoch // now) end)}')" || log "could not write $BOUNDARY"
 }
+# waitlock <fd> <seconds>: take the lock on <fd>, trying each second for at most <seconds>; 1 when the
+# time ran out, lockf's own status for any error but a held lock (75, EX_TEMPFAIL). lockf(1)'s own -t on
+# a descriptor spins a whole core for as long as it waits (measured here), so a wait is -t 0 between
+# sleeps, which hold none of the locks. Limit: a run that takes the lock within the second between two
+# tries takes it first.
+waitlock() {
+  local end=$((SECONDS + $2)) rc
+  while :; do
+    /usr/bin/lockf -t 0 "$1" 2>/dev/null; rc=$?
+    [ "$rc" = 75 ] || return "$rc"
+    [ "$SECONDS" -lt "$end" ] || return 1
+    sleep 1 4>&- 5>&- 7>&- 9>&-
+  done
+}
 # bounded <secs> <command...>: the command under timeout(1), SIGKILL 5 s after SIGTERM, with stdin empty and
 # the locks closed (the waiter's too), so nothing it leaves running holds them
 bounded() { local s=$1; shift; /usr/bin/timeout -k 5 "$s" "$@" < /dev/null 5>&- 6>&- 7>&- 8>&- 9>&-; }
@@ -148,7 +162,7 @@ if [ "$AT_BOUNDARY" = 1 ] && ! { true >&9; } 2>/dev/null; then log "started as t
 # one round at a time, the reinstall it started included; the boundary's round waits for one still running
 exec 7>>"$base/maintenance.lock" || { log "cannot open $base/maintenance.lock"; exit 1; }
 if [ "$AT_BOUNDARY" = 1 ]; then
-  if ! /usr/bin/lockf -t "$BOUNDARY_ROUND_SECS" 7 2>/dev/null; then
+  if ! waitlock 7 "$BOUNDARY_ROUND_SECS"; then
     boundary_put failed "an earlier round, or the reinstall it started, still ran after $BOUNDARY_ROUND_SECS s; the next round that finds a window defers again"
     log "at the boundary: an earlier round still ran after $BOUNDARY_ROUND_SECS s; nothing this round"; exit 0
   fi
@@ -374,8 +388,9 @@ arm_waiter() {
     set +m
     exec 6>&- 7>&- 8>&- 9>&- < /dev/null
     if ! exec 9>>"${tmp}canon-paper-windows.lock"; then boundary_put failed "cannot open ${tmp}canon-paper-windows.lock"; exit 1; fi
-    if /usr/bin/lockf -t "$BOUNDARY_SECS" 9 2>/dev/null; then
-      if exec 4>>"$base/paper-checkout.lock" && ! /usr/bin/lockf -t "$BOUNDARY_ROUND_SECS" 4 2>/dev/null; then
+    waitlock 9 "$BOUNDARY_SECS"; rc=$?
+    if [ "$rc" = 0 ]; then
+      if exec 4>>"$base/paper-checkout.lock" && ! waitlock 4 "$BOUNDARY_ROUND_SECS"; then
         log "boundary: the clone's lock was still held after $BOUNDARY_ROUND_SECS s; the round runs, and install leaves the clone as it is"
       fi
       exec 4>&-
@@ -383,6 +398,7 @@ arm_waiter() {
       log "boundary: the windows' lock is free; a round runs the deferred part with it held"
       CANON_MAINTENANCE_AT_BOUNDARY=1 exec /bin/bash "$0" "$root" "$mise"
     fi
+    if [ "$rc" != 1 ]; then boundary_put failed "lockf exited $rc on ${tmp}canon-paper-windows.lock"; exit 1; fi
     boundary_put "timed out" "the windows' lock stayed held for $BOUNDARY_SECS s"
     log "boundary: FAILED: the windows' lock stayed held for $BOUNDARY_SECS s; the next round that finds a window waits again"
   ) &

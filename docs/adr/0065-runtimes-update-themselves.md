@@ -211,7 +211,9 @@ the round, since those runs may run from the main checkout. The deferred part wa
 boundary, the moment the window's lock goes free. Alpaca's clock and calendar end each run at its
 session's end, but this agent reads no secret and cannot read them itself. A round that defers starts
 one detached waiter, which holds its own lock so a second is never added. The waiter waits on the
-windows' lock (lockf(1) `-t`) for at most nine hours: the overnight session's eight and one more. It
+windows' lock for at most nine hours, the overnight session's eight and one more, trying `lockf -t 0`
+each second: lockf's own `-t` on a descriptor spins a core while it waits. A run that takes the lock
+within the second between two tries takes it first. It
 then waits up to five minutes for the clone's own lock, which the runner holds on its way out. With
 the windows' lock held, it runs a round that installs the whole, moves the pins, and lets the lock go when the install ends, so
 the next session's run starts from the clone its runner makes then. The status row reads "deferred to
@@ -288,6 +290,10 @@ Read 2026-11-10. `fetched`: downloaded and searched here; `run`: a command run h
   * home/.claude/canon/paper-session.sh (read): the runner holds `<checkout>.lock` on descriptor 8 and
     `exec`s the task, so the clone's lock is let go only when the run's last process has ended.
   * `scripts/test-maintenance` (run).
+  * lockf(1) `-t` on a descriptor, waiting on a held lock: ps(1) showed 70.9 %CPU (its decaying
+    average) after 6 s, and the process group used 4.24 s of CPU in 4 s, a whole core; the file form
+    `lockf -k -t 30 <file> true` showed 0.0 (run, 2026-11-11). `-t 0` on a held lock exits 75, on a closed
+    descriptor 73 (run). The waits poll `-t 0` each second instead.
   * 2026-11-11, corrected after a code review of the change: the first text moved the pins while a
     window ran, its waiter did not wait for the clone's lock, and a boundary round that ended before its
     install read as having run. The text above says what changed.
