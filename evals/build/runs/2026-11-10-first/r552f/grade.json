@@ -1,0 +1,61 @@
+{
+  "case": "gate-reads-what-the-run-read",
+  "changed": [
+    "README.md",
+    "docs/adr/0035-trial-ledger-in-an-optuna-study.md",
+    "docs/adr/0041-trial-ledger-sample-and-data-identity.md",
+    "src/canon_trading/backtest.py",
+    "src/canon_trading/ledger.py",
+    "src/canon_trading/ranking.py",
+    "src/canon_trading/returns_matrix.py",
+    "src/canon_trading/variant_study.py",
+    "tests/test_gate_contracts.py"
+  ],
+  "flags": [],
+  "restored": [],
+  "resolved": true,
+  "fail_to_pass": {
+    "tests/test_ledger.py::test_a_creation_interrupted_before_its_sample_is_completed_by_the_next": [
+      "passed"
+    ],
+    "tests/test_ledger.py::test_a_hole_no_load_can_fill_is_closed_by_consolidating_the_catalog": [
+      "passed"
+    ],
+    "tests/test_ledger.py::test_a_keyed_failure_before_its_sample_is_written_stops_the_ranking": [
+      "passed"
+    ],
+    "tests/test_ledger.py::test_a_sample_the_catalog_covers_in_part_is_refused_naming_the_gap": [
+      "passed"
+    ],
+    "tests/test_ledger.py::test_a_sample_the_catalog_does_not_reach_is_refused_before_a_trial": [
+      "passed"
+    ],
+    "tests/test_ledger.py::test_bars_the_cache_does_not_account_for_are_told_failed": [
+      "passed"
+    ],
+    "tests/test_ledger.py::test_the_digest_is_of_the_bars_the_run_read_not_a_later_catalog": [
+      "passed"
+    ],
+    "tests/test_ranking.py::test_a_record_that_ran_with_no_sample_number_of_the_study_stops": [
+      "passed"
+    ],
+    "tests/test_ranking.py::test_session_days_with_no_return_stop_and_are_named": [
+      "passed"
+    ],
+    "tests/test_returns_matrix.py::test_a_session_day_with_no_return_is_refused": [
+      "passed"
+    ]
+  },
+  "failed": [],
+  "lost": [],
+  "checks": {
+    "ruff lint": true,
+    "ruff format": true,
+    "ty type check": true
+  },
+  "tests": {
+    "passed": 521,
+    "failed": 0,
+    "skipped": 24
+  }
+}

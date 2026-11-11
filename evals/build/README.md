@@ -126,7 +126,9 @@ A run that broke a term scores nothing and is listed. A run that is not `resolve
 resolved run is then read by two readers working apart, the scoring task and a second reader it
 starts, each with the patch applied to the starting tree, the case file, the report and this section,
 neither with the other's marks or the table of workers. The first reader's reading is ADR 0017's
-review: `/code-review` at the effort the case's paths get.
+review: `/code-review` at the effort the case's paths get. A reader started as a subagent writes its
+marks to a file and ends with none in its message, which reaches the scoring task, and neither file is
+read by the other reader until both readers' marks are final.
 
 A reader marks a run **no** when it finds a blocker, and names it:
 

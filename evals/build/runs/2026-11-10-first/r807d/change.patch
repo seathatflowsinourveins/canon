@@ -1,0 +1,1044 @@
+diff --git a/docs/adr/0036-alpaca-adapter-order-management.md b/docs/adr/0036-alpaca-adapter-order-management.md
+index 2c10241..ebd9990 100644
+--- a/docs/adr/0036-alpaca-adapter-order-management.md
++++ b/docs/adr/0036-alpaca-adapter-order-management.md
+@@ -69,13 +69,18 @@ unique identifier for the new order. Automatically generated if not sent." It le
+ answer has a new ID, an Alpaca-made client order ID and `replaces`; `replaced` carries the old order with
+ `replaced_by`; a second replace of the old order is refused, 422 "order already replaced"; no replacement
+ sent `new`. On that, the master orchestrator chose (b) under the owner's delegation of 2026-11-10.
+-`_modify_order` sends no client order ID; `OrderUpdated` comes only with `replaced`, its values from the
+-replacement as the answer or a read of `replaced_by` gives it, nothing if neither does. Updates and reports
+-of a replacement are traced to the node's order through `replaces`, at most 16 links, from the orders
+-already fetched first, cached, misses too, and walked again after a restart. A 422 is `OrderModifyRejected`
+-unless Alpaca shows the order replaced as asked (alpaca-py's own retry); any other status leaves the outcome
+-unknown. `order_replace_rejected` and the `rejected` of a replacement that has not taken over are
+-`OrderModifyRejected` too. Denied before Alpaca: no venue order ID, a fractional quantity, a sub-penny
++`_modify_order` sends no client order ID; `OrderUpdated` comes once per replacement when the stream confirms
++it (`replaced`, following `replaced_by` when already replaced again, or ahead of a replacement's fill, cancel
++or expiry that arrives before `replaced`), never from the PATCH answer alone, its values from the answer, the
++update or a read of `replaced_by`, nothing if a lookup fails. Superseded orders' late cancels and expiries are
++ignored. Updates and reports of a replacement are traced to the node's order through `replaces`, at most 16
++links, from the orders already fetched first, cached, misses too, and walked again after a restart (only a
++`rejected` replacement is omitted as one that never took over; `pending_replace` reports `ACCEPTED`, or
++`PARTIALLY_FILLED` with fills). Each modify is settled once: a 422 is `OrderModifyRejected` unless Alpaca
++shows the order replaced by an unanswered replacement with every term asked (alpaca-py's own retry); any
++other status leaves the outcome unknown. `order_replace_rejected` and the `rejected` of a replacement that has
++not taken over settle an unsettled modify too, as `OrderModifyRejected` while the order is open and logged
++when the old order filled first. Denied before Alpaca: no venue order ID, a fractional quantity, a sub-penny
+ price, a price the order type lacks.
+ 
+ ### Consequences
+@@ -107,8 +112,9 @@ own tests mock its paper endpoints; the offline tests are listed in the package
+ `UNVERIFIED`, shown by no run: an elected stop and its fill, and what the stream sends on election; any sell
+ stop; `order_replace_rejected`; `pending_replace`; a `new` for a replacement later than ~200 ms; a status on
+ a replace other than 422; a modify of a partially filled order (what `qty` means then); a fill on the old
+-order racing a replace, where the old order's fill applies as usual and the replacement's `rejected` becomes
+-`OrderModifyRejected`, not `OrderRejected`.
++order racing a replace, where the old order's fill applies as usual and the replacement's `rejected` settles
++and logs the modify (or emits `OrderModifyRejected` if the old order has not filled yet), never
++`OrderRejected`.
+ 
+ ## Evidence
+ 
+diff --git a/packages/canon-alpaca/README.md b/packages/canon-alpaca/README.md
+index 4a85907..6b4c1ee 100644
+--- a/packages/canon-alpaca/README.md
++++ b/packages/canon-alpaca/README.md
+@@ -214,14 +214,18 @@ Each is stated in `execution.py`'s header, with its source.
+   Alpaca, which rejects them ("Orders at Alpaca", "Extended Hours Trading"). The data client still streams
+   IEX only; overnight quotes come from Alpaca's `overnight` or `boats` feed, not used yet
+   ([ADR 0038](../../docs/adr/0038-alpaca-extended-hours.md)).
+-* **Modify** replaces the order on Alpaca ("Replace Order by ID") and generates `OrderUpdated` only when
+-  Alpaca's stream sends `replaced` for it, with the replacement's ID, quantity and prices; a success answer
+-  alone does not, since Alpaca says it "does NOT guarantee" the replacement. The replacement gets a client
+-  order ID Alpaca makes, so its updates and reports are traced back to the node's order through its
+-  `replaces` links, cached and walked again after a restart. Alpaca's refusal, `order_replace_rejected`
+-  and a replacement's `rejected` are `OrderModifyRejected`; a modify without a venue order ID, to a
+-  fractional quantity or to a sub-penny price is denied before Alpaca. What Alpaca's pages leave open was
+-  observed on paper and is asserted by `test_paper_replace.py`
++* **Modify** replaces the order on Alpaca ("Replace Order by ID") and generates `OrderUpdated` once per
++  replacement when Alpaca's stream confirms it (on `replaced`, following `replaced_by` when already replaced
++  again, or before a replacement's fill, cancel or expiry that arrives ahead of `replaced`), with the
++  replacement's ID, quantity and prices; a success answer alone does not, since Alpaca says it "does NOT
++  guarantee" the replacement. Superseded orders' late cancels or expiries are ignored. The replacement gets a
++  client order ID Alpaca makes, so its updates and reports are traced back to the node's order through its
++  `replaces` links, cached and walked again after a restart (only a `rejected` replacement is omitted as one
++  that never took over). Each modify is settled once: Alpaca's refusal, `order_replace_rejected` and a
++  replacement's `rejected` give one `OrderModifyRejected` while the order is open, or log that the fill is
++  the outcome when the old order filled first; a modify without a venue order ID, to a fractional quantity or
++  to a sub-penny price is denied before Alpaca. What Alpaca's pages leave open was observed on paper and is
++  asserted by `test_paper_replace.py`
+   ([ADR 0036](../../docs/adr/0036-alpaca-adapter-order-management.md)).
+ * **Cancel-all** cancels the node's open and in-flight orders for the command's instrument, and side if
+   it names one, each by ID, one at a time, as a single cancel does, skipping one already pending cancel;
+@@ -285,9 +289,10 @@ Each is stated in `execution.py`'s header, with its source.
+   account number are kept in the account state's `info`.
+ * **Stream:** alpaca-py does not expose the stream's `listening` acknowledgement, so updates sent before
+   it is listening are missed and reconciliation resolves those orders. Updates for orders the node does
+-  not hold are logged and dropped. Events this slice does not map (`replaced`, `done_for_day`, `stopped`,
+-  `suspended` and the rest) are logged as warnings. As with the data stream, there is no restart, and
+-  shutdown waits `STREAM_JOIN_TIMEOUT_SECS`.
++  not hold are logged and dropped. Events this slice does not map (`pending_cancel`, `done_for_day`,
++  `stopped`, `suspended` and the rest) are logged as warnings; `pending_replace` is ignored on the stream
++  and mapped in order reports (`ACCEPTED`, or `PARTIALLY_FILLED` when it has fills). As with the data
++  stream, there is no restart, and shutdown waits `STREAM_JOIN_TIMEOUT_SECS`.
+ * **Retries:** alpaca-py retries a request answered 429 or 504 up to three times, a submit or cancel
+   included (`RESTClient._request`), and cannot be told not to. A repeated submit carries the same
+   `client_order_id`; what Alpaca answers it is not documented on the pages read (UNVERIFIED). So before a
+@@ -315,6 +320,7 @@ This package has all three for each client, offline, plus a paper test for each:
+ | `test_paper_matrix.py` | Upstream's `DataTester` and `ExecTester` through a real node on Alpaca's paper environment: the rows in "Upstream's test matrices against paper" | Paper only; needs the regular session for the stream and fill rows; stops if the account holds any open order or position; cancels and closes what its node opened; skipped without `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` |
+ | `test_paper_fill_reports.py` | TC-E85 with fill reports: a market buy of 2 AAPL with alpaca-py, its trade updates recorded; a node's start-up reconciliation must give the order one fill per update, with that update's `execution_id` and price | Paper only; needs the regular session and skips outside it; stops if the account holds any open order or position; sells what it bought; skipped without `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` |
+ | `test_paper_replace.py` | Alpaca's replace through alpaca-py directly: a $1.00 buy replaced with $1.01; asserts what a paper observation showed and the modify rests on (a replacement may not keep the client order ID, the answer's new IDs and `replaces`, `replaced` carrying the old order with `replaced_by`, a second replace refused) | Paper only; needs the regular session; places nothing while the account holds an open AAPL order, cancels what it opened |
++| `test_replace_ordering.py` | Offline `LiveNode` ordering permutations for replace: stream `order_replace_rejected` before delayed HTTP 422, a second modify with identical terms refused after the first was answered, replacement cancel/expiry and partial fill ahead of `replaced`, late expiry on a superseded order, and missed-`replaced` reconciliation of canceled and expired replacements | None |
+ | `test_upstream_contract.py` | The upstream names this README quotes still exist in the pinned packages; the execution hooks and `generate_order_filled` signature; alpaca-py's trading clients default to and target paper; the native config drops unknown keywords; the stream stand-ins refuse and keep what alpaca-py's `StockDataStream` and `TradingStream` do; alpaca-py's REST clients keep a `requests.Session` at `_session` and pass no timeout (ADR 0039) | None |
+ 
+ The offline tests use payloads hand-built from the examples in Alpaca's docs (sources in `tests/conftest.py`)
+diff --git a/packages/canon-alpaca/src/canon_alpaca/execution.py b/packages/canon-alpaca/src/canon_alpaca/execution.py
+index a944074..6281424 100644
+--- a/packages/canon-alpaca/src/canon_alpaca/execution.py
++++ b/packages/canon-alpaca/src/canon_alpaca/execution.py
+@@ -16,15 +16,18 @@ Modify (ADR 0036) rests on Alpaca's "Replace Order by ID"
+ (https://docs.alpaca.markets/us/reference/patchorderbyorderid-1.md) and on a paper observation of
+ 2026-11-10, 3 of 3 runs, for what that page does not state. The PATCH answer is "The new Order object with
+ the new order ID", but a success "does NOT guarantee the existing open order has been replaced", so
+-`OrderUpdated` is generated only on the stream's `replaced` for the node's order, which carries the old
+-order with `replaced_by` (observed), with the replacement's values from the answer or, failing that, from
+-Alpaca; if neither yields them, nothing is generated and reconciliation settles the order. The replacement
+-gets a client order ID Alpaca makes (one kept is refused, observed), so its updates and reports are traced
+-back to the node's order through its `replaces` links, cached and walked again after a restart. A 422
+-refusal is `OrderModifyRejected` unless Alpaca shows the order already replaced as asked (a second replace is
+-refused "order already replaced", observed, as alpaca-py's own retry would be); `order_replace_rejected`
+-and a replacement's `rejected` are `OrderModifyRejected` too, the second because Alpaca rejects the
+-replacement when the old order fills first. Denied before Alpaca: no venue order ID, a fractional quantity
++`OrderUpdated` is never generated from the answer alone: it comes once per replacement, on the stream's
++`replaced` for the node's order (which carries the old order with `replaced_by`, observed, and follows
++`replaced_by` if that replacement was replaced again) or ahead of a replacement's fill, cancel or expiry
++that arrives before `replaced`, with the replacement's values from the answer, the update or Alpaca; if a
++lookup fails, nothing is generated and reconciliation settles the order. Superseded orders' later cancels or
++expiries are ignored. The replacement gets a client order ID Alpaca makes (one kept is refused, observed),
++so its updates and reports are traced back to the node's order through its `replaces` links, cached and
++walked again after a restart. Each modify is settled once: a 422 refusal is `OrderModifyRejected` unless
++Alpaca shows the order replaced as that call asked by an unanswered replacement (a second replace is refused
++"order already replaced", observed, as alpaca-py's own retry would be); `order_replace_rejected` and a
++replacement's `rejected` settle an unsettled modify too, as `OrderModifyRejected` while the order is open
++and logged when the old order filled first. Denied before Alpaca: no venue order ID, a fractional quantity
+ and a sub-penny price; what only Alpaca knows (an order in `accepted` "cannot be replaced") is left to its
+ answer.
+ 
+@@ -304,12 +307,16 @@ OPEN_STATUSES = {
+     AlpacaOrderStatus.NEW: OrderStatus.ACCEPTED,
+     AlpacaOrderStatus.ACCEPTED: OrderStatus.ACCEPTED,
+     AlpacaOrderStatus.PENDING_NEW: OrderStatus.ACCEPTED,
++    AlpacaOrderStatus.PENDING_REPLACE: OrderStatus.ACCEPTED,
+     AlpacaOrderStatus.PARTIALLY_FILLED: OrderStatus.PARTIALLY_FILLED,
+     AlpacaOrderStatus.PENDING_CANCEL: OrderStatus.PENDING_CANCEL,
+ }
+ """Alpaca's open order statuses this slice maps. `new`, `accepted` and `pending_new` all mean Alpaca has
+-received the order ("Order Lifecycle" on the stream page and "Get Order by ID"); NautilusTrader's
+-`ACCEPTED` is the venue's acknowledgement that it is "received and valid"."""
++received the order ("Order Lifecycle" on the stream page and "Get Order by ID"), and `pending_replace` means
++it is still working while its replace is pending (`OrderStatus.PENDING_UPDATE` is unhandled by
++NautilusTrader v2.0.0rc8's external-order reconciliation); NautilusTrader's `ACCEPTED` is the venue's
++acknowledgement that it is "received and valid", and `order_status_report` reports `PARTIALLY_FILLED` when
++one has fills."""
+ 
+ CLOSED_STATUSES = {
+     AlpacaOrderStatus.FILLED: OrderStatus.FILLED,
+@@ -537,15 +544,17 @@ def extended_hours_denial(order: Any) -> str | None:
+     return None  # `_denial` has already refused a time in force other than `DAY` and `GTC`
+ 
+ 
+-def replaces_as_asked(replacement: AlpacaOrder, request: ReplaceOrderRequest) -> bool:
+-    """Whether Alpaca's replacement has every term the replace request set."""
++def replaces_as_asked(replacement: AlpacaOrder, request: ReplaceOrderRequest, order: Any) -> bool:
++    """Whether Alpaca's replacement has every term the modify asked for, including an unchanged quantity."""
++    asked_qty = request.qty if request.qty is not None else int(order.quantity.as_double())
+     pairs = (
+-        (request.qty, replacement.qty),
++        (asked_qty, replacement.qty),
+         (request.limit_price, replacement.limit_price),
+         (request.stop_price, replacement.stop_price),
+     )
+     return all(
+-        asked is None or (held is not None and Decimal(str(held)) == Decimal(str(asked)))
++        (asked is None and held is None)
++        or (asked is not None and held is not None and Decimal(str(held)) == Decimal(str(asked)))
+         for asked, held in pairs
+     )
+ 
+@@ -596,6 +605,8 @@ def order_status_report(
+         quantity = whole_quantity(order.qty, "quantity")
+         filled_qty = whole_quantity(order.filled_qty or 0, "filled quantity")
+         filled = filled_qty.as_double() > 0
++        if nautilus_status == OrderStatus.ACCEPTED and filled:
++            nautilus_status = OrderStatus.PARTIALLY_FILLED
+         return OrderStatusReport(
+             account_id=ACCOUNT_ID,
+             instrument_id=InstrumentId(Symbol(order.symbol), VENUE),
+@@ -741,11 +752,24 @@ class AlpacaExecutionClient(ExecutionClient):
+         # an acknowledgement is generated once and nothing is generated after the end.
+         self._accepted: set[ClientOrderId] = set()
+         self._finished: set[ClientOrderId] = set()
++        self._filled_orders: set[ClientOrderId] = set()
+         # A replacement's Alpaca client order ID, mapped to the node's order it replaces: a cache of the
+         # `replaces` chain, which is walked again when it misses (a new client after a restart).
+         self._replacements: dict[str, ClientOrderId] = {}
+-        # PATCH answers by the replacement's order ID, read when Alpaca's `replaced` update arrives.
++        # PATCH answers by the replacement's order ID, read when Alpaca's `replaced` update arrives, and
++        # the IDs already answered so a later modify's refusal is not taken for alpaca-py's retry of an
++        # earlier one.
+         self._answers: dict[str, AlpacaOrder] = {}
++        self._answered: set[str] = set()
++        # Unsettled modifies, keyed by an attempt token until the PATCH answers and by the replacement's
++        # order ID once it does, with the venue order ID each attempt asked to replace.
++        self._modifying: dict[str, ClientOrderId] = {}
++        self._modify_targets: dict[str, str] = {}
++        self._modify_seq = 0
++        # Alpaca order IDs whose replacement has taken over, and replacement IDs whose replace outcome
++        # (`replaced`, adoption on an earlier event, or `rejected`) has already been handled.
++        self._superseded: set[str] = set()
++        self._settled_replacements: set[str] = set()
+         # Alpaca client order IDs whose `replaces` chain reaches no order the node holds.
+         self._foreign: set[str] = set()
+         # Trade updates, applied in arrival order by one task on the node's loop.
+@@ -810,8 +834,14 @@ class AlpacaExecutionClient(ExecutionClient):
+         self._trading = None
+         self._accepted.clear()
+         self._finished.clear()
++        self._filled_orders.clear()
+         self._replacements.clear()
+         self._answers.clear()
++        self._answered.clear()
++        self._modifying.clear()
++        self._modify_targets.clear()
++        self._superseded.clear()
++        self._settled_replacements.clear()
+         self._foreign.clear()
+         if thread is not None and thread.is_alive():
+             raise RuntimeError(
+@@ -1063,10 +1093,11 @@ class AlpacaExecutionClient(ExecutionClient):
+ 
+         Alpaca answers with "The new Order object with the new order ID" and says a success "does NOT
+         guarantee the existing open order has been replaced". So `OrderUpdated` is not generated from the
+-        answer: it comes with Alpaca's `replaced` trade update for the node's order, which carries the old
+-        order with `replaced_by` (observed on paper, ADR 0036). The answer is kept for that update's values,
+-        and the replacement's Alpaca client order ID is mapped to the node's order. Alpaca refuses a
+-        replacement that keeps the original client order ID (observed), so none is sent.
++        answer: it comes once Alpaca's stream confirms the replacement (`replaced`, or an earlier fill,
++        cancel or expiry on the replacement). The answer is kept for that update's values when `replaced`
++        has not already been applied, and the replacement's Alpaca client order ID is mapped to the node's
++        order. Alpaca refuses a replacement that keeps the original client order ID (observed), so none is
++        sent.
+         """
+         order = self.cache.order(command.client_order_id)
+         if order is None:
+@@ -1092,33 +1123,42 @@ class AlpacaExecutionClient(ExecutionClient):
+             if order.order_type in STOP_TYPES
+             else None,
+         )
++        attempt = self._begin_modify(order.client_order_id, venue_order_id.value)
+         try:
+             answer = await self._call(
+                 self._venue().replace_order_by_id, venue_order_id.value, request
+             )
+         except APIError as e:
+             if e.status_code == REPLACE_REFUSAL:
+-                await self._replace_refused(order, venue_order_id, request, e)
++                await self._replace_refused(order, venue_order_id, request, e, attempt)
+                 return
+             self._log_unknown_replace(order, f"HTTP {e.status_code}: {api_error_text(e)}")
+             return
+         except OSError as e:
+             if not_sent(e):
+                 # A connect timeout on the replace's only attempt: it never reached Alpaca (ADR 0039).
+-                self.generate_order_modify_rejected(
+-                    order,
+-                    venue_order_id,
+-                    not_sent_reason(e),
+-                    self.clock.timestamp_ns(),
+-                )
++                if self._settle_modify_key(attempt):
++                    self.generate_order_modify_rejected(
++                        order,
++                        venue_order_id,
++                        not_sent_reason(e),
++                        self.clock.timestamp_ns(),
++                    )
+                 return
+             self._log_unknown_replace(order, repr(e))
+             return
+         if not isinstance(answer, AlpacaOrder):
++            self._settle_modify_key(attempt)
+             raise TypeError("alpaca-py returned raw order data; the client must use raw_data=False")
++        answer_id = str(answer.id)
++        self._answered.add(answer_id)
+         self._replacements[answer.client_order_id] = order.client_order_id
+-        if order.client_order_id not in self._finished:
+-            self._answers[str(answer.id)] = answer
++        self._settle_modify_key(attempt)
++        if answer_id not in self._settled_replacements and answer_id not in self._superseded:
++            self._modifying[answer_id] = order.client_order_id
++            self._modify_targets[answer_id] = str(answer.replaces or venue_order_id.value)
++            if order.client_order_id not in self._finished:
++                self._answers[answer_id] = answer
+ 
+     async def _replace_refused(
+         self,
+@@ -1126,14 +1166,15 @@ class AlpacaExecutionClient(ExecutionClient):
+         venue_order_id: VenueOrderId,
+         request: ReplaceOrderRequest,
+         error: APIError,
++        attempt: str,
+     ) -> None:
+         """Reject a modify Alpaca refused, unless the refusal answered alpaca-py's own retry.
+ 
+         alpaca-py repeats a request answered 429 or 504, and a second replace of an order already replaced
+         is answered 422 "order already replaced" (observed). So the order is looked up: replaced by an
+-        order with the terms this request asked for, the refusal answered the retry and the `replaced`
+-        trade update brings `OrderUpdated`; replaced with other terms, it was another modify, and this one
+-        is rejected; if a lookup fails, the outcome is unknown.
++        unanswered order with every term this modify asked for, the refusal answered the retry and the
++        stream brings `OrderUpdated`; replaced by an earlier modify's answer or with other terms, it was
++        another modify, and this one is rejected once; if a lookup fails, the outcome is unknown.
+         """
+         try:
+             held = await self._call(self._venue().get_order_by_id, venue_order_id.value)
+@@ -1149,19 +1190,76 @@ class AlpacaExecutionClient(ExecutionClient):
+                 order, f"refused ({error.status_code}), then the lookup failed ({e!r})"
+             )
+             return
+-        if isinstance(replacement, AlpacaOrder) and replaces_as_asked(replacement, request):
++        if (
++            isinstance(replacement, AlpacaOrder)
++            and str(replacement.id) not in self._answered
++            and replaces_as_asked(replacement, request, order)
++        ):
++            replacement_id = str(replacement.id)
++            self._answered.add(replacement_id)
++            self._replacements[replacement.client_order_id] = order.client_order_id
++            self._settle_modify_key(attempt)
++            if (
++                replacement_id not in self._settled_replacements
++                and replacement_id not in self._superseded
++            ):
++                self._modifying[replacement_id] = order.client_order_id
++                self._modify_targets[replacement_id] = venue_order_id.value
++                if order.client_order_id not in self._finished:
++                    self._answers[replacement_id] = replacement
+             self._log.warning(
+                 f"Alpaca refused a replace of {order.client_order_id} ({error.status_code}) but shows "
+                 "the order replaced as asked: an earlier attempt reached it",
+             )
+             return
++        if not self._settle_modify_key(attempt):
++            return
++        current = self.cache.order(order.client_order_id) or order
++        if order.client_order_id in self._filled_orders or current.status == OrderStatus.FILLED:
++            self._log.info(
++                f"Alpaca refused the replace of {order.client_order_id} ({error.status_code}), "
++                "which had filled first; the fill is the outcome",
++            )
++            return
++        if order.client_order_id in self._finished or current.is_closed:
++            self._log.info(
++                f"Alpaca refused the replace of {order.client_order_id} ({error.status_code}), "
++                f"which is already {current.status.name.lower()}",
++            )
++            return
+         self.generate_order_modify_rejected(
+-            order,
++            current,
+             venue_order_id,
+             f"Alpaca refused the replace ({error.status_code}): {api_error_text(error)}",
+             self.clock.timestamp_ns(),
+         )
+ 
++    def _begin_modify(self, client_order_id: ClientOrderId, target_id: str) -> str:
++        self._modify_seq += 1
++        key = f"attempt:{self._modify_seq}"
++        self._modifying[key] = client_order_id
++        self._modify_targets[key] = target_id
++        return key
++
++    def _settle_modify_key(self, key: str) -> bool:
++        self._modify_targets.pop(key, None)
++        return self._modifying.pop(key, None) is not None
++
++    def _settle_modify_target(self, target_id: str) -> bool:
++        for key, candidate in list(self._modify_targets.items()):
++            if candidate == target_id:
++                self._modify_targets.pop(key, None)
++                self._modifying.pop(key, None)
++                self._answers.pop(key, None)
++                return True
++        return False
++
++    def _settle_replacement(self, replacement_id: str, replaces_id: str | None) -> None:
++        self._settled_replacements.add(replacement_id)
++        self._answers.pop(replacement_id, None)
++        if not self._settle_modify_key(replacement_id) and replaces_id is not None:
++            self._settle_modify_target(replaces_id)
++
+     def _log_unknown_replace(self, order: Any, detail: str) -> None:
+         self._log.error(
+             f"Alpaca replace of {order.client_order_id} got no definitive answer ({detail}); a trade "
+@@ -1365,29 +1463,60 @@ class AlpacaExecutionClient(ExecutionClient):
+                 "which this node does not hold; reconciliation reports it",
+             )
+             return
+-        if client_order_id in self._finished:
+-            return
+         event = getattr(update.event, "value", update.event)
+         venue_order_id = VenueOrderId(str(alpaca_order.id))
+         ts_event = dt_to_unix_nanos(update.timestamp)
+         is_replacement = alpaca_order.client_order_id != client_order_id.value
+-        if event == "replaced":
+-            await self._replaced(order, alpaca_order, ts_event)
+-            return
+         if event == "order_replace_rejected":
+             for key in [
+                 k for k, a in self._answers.items() if str(a.replaces) == str(alpaca_order.id)
+             ]:
++                self._settled_replacements.add(key)
+                 del self._answers[key]
++            if not self._settle_modify_target(str(alpaca_order.id)):
++                return
++            if client_order_id in self._filled_orders or order.status == OrderStatus.FILLED:
++                self._log.info(
++                    f"Alpaca rejected the replace of {client_order_id}, "
++                    "which had filled first; the fill is the outcome",
++                )
++                return
++            if client_order_id in self._finished or order.is_closed:
++                self._log.info(
++                    f"Alpaca rejected the replace of {client_order_id}, "
++                    f"which is already {order.status.name.lower()}",
++                )
++                return
+             self.generate_order_modify_rejected(
+                 order, venue_order_id, "Alpaca rejected the replace (trade update)", ts_event
+             )
+             return
+-        if event == "pending_replace":
+-            return  # NautilusTrader generates `OrderPendingUpdate` itself when a modify is sent
+         if event == "rejected" and is_replacement and order.venue_order_id != venue_order_id:
+             # Alpaca: if the old order "is filled before the replacing (new) order reaches the execution
+-            # venue, the replacing (new) order is rejected". The node's order is the old one, filled.
++            # venue, the replacing (new) order is rejected". When the old order filled first,
++            # NautilusTrader drops `OrderModifyRejected` on a filled order, so the modify is settled and
++            # logged here.
++            if (
++                str(alpaca_order.id) in self._settled_replacements
++                or str(alpaca_order.id) in self._superseded
++            ):
++                return
++            self._settle_replacement(
++                str(alpaca_order.id),
++                str(alpaca_order.replaces) if alpaca_order.replaces is not None else None,
++            )
++            if client_order_id in self._filled_orders or order.status == OrderStatus.FILLED:
++                self._log.info(
++                    f"Alpaca rejected the replacement order {alpaca_order.id} for {client_order_id}, "
++                    "which had filled first; the fill is the outcome",
++                )
++                return
++            if client_order_id in self._finished or order.is_closed:
++                self._log.info(
++                    f"Alpaca rejected the replacement order {alpaca_order.id} for {client_order_id}, "
++                    f"which is already {order.status.name.lower()}",
++                )
++                return
+             self.generate_order_modify_rejected(
+                 order,
+                 venue_order_id,
+@@ -1395,58 +1524,107 @@ class AlpacaExecutionClient(ExecutionClient):
+                 ts_event,
+             )
+             return
++        if client_order_id in self._finished:
++            if event == "replaced" and alpaca_order.replaced_by is not None:
++                self._superseded.add(str(alpaca_order.id))
++                self._settle_replacement(str(alpaca_order.replaced_by), str(alpaca_order.id))
++            return
++        if event == "replaced":
++            await self._replaced(order, alpaca_order, ts_event)
++            return
++        if event == "pending_replace":
++            return  # NautilusTrader generates `OrderPendingUpdate` itself when a modify is sent
++        if event == "order_cancel_rejected":
++            self.generate_order_cancel_rejected(
++                order, venue_order_id, "Alpaca rejected the cancel (trade update)", ts_event
++            )
++            return
+         if event == "rejected":
++            if await self._is_superseded(order, alpaca_order, is_replacement):
++                return
+             self._reject(
+                 order,
+                 f"Alpaca rejected the order (trade update, status {alpaca_order.status.value})",
+                 ts_event,
+             )
+             return
+-        if event == "order_cancel_rejected":
+-            self.generate_order_cancel_rejected(
+-                order, venue_order_id, "Alpaca rejected the cancel (trade update)", ts_event
+-            )
+-            return
+         if event not in ACCEPTING_EVENTS | FILL_EVENTS | {"canceled", "expired"}:
+             self._log.warning(
+                 f"Alpaca trade update {event} for {client_order_id} is not mapped in this slice; ignored",
+             )
+             return
+-        self._accept(order, venue_order_id, ts_event)
++        if event in ACCEPTING_EVENTS and is_replacement:
++            return
++        superseded = await self._is_superseded(order, alpaca_order, is_replacement)
++        if superseded and event not in FILL_EVENTS:
++            return
++        if (
++            not superseded
++            and is_replacement
++            and order.venue_order_id != venue_order_id
++            and str(alpaca_order.id) not in self._settled_replacements
++        ):
++            self._adopt_order(order, alpaca_order, ts_event)
++        if not superseded:
++            self._accept(order, venue_order_id, ts_event)
+         if event in FILL_EVENTS:
+             self._fill(order, update, venue_order_id, ts_event)
+         elif event == "canceled":
+             self.generate_order_canceled(order, venue_order_id, ts_event)
+         elif event == "expired":
+             self.generate_order_expired(order, venue_order_id, ts_event)
+-        if event in TERMINAL_EVENTS:
++        if event in TERMINAL_EVENTS and not superseded:
+             self._finished.add(client_order_id)
++            if event == "fill":
++                self._filled_orders.add(client_order_id)
++            for key in [
++                k for k, a in self._answers.items() if str(a.replaces) == str(alpaca_order.id)
++            ]:
++                del self._answers[key]
+ 
+-    async def _replaced(self, order: Any, old: AlpacaOrder, ts_event: int) -> None:
+-        """Alpaca's `replaced` for the node's order: `OrderUpdated` with the replacement's values.
++    async def _is_superseded(
++        self, order: Any, alpaca_order: AlpacaOrder, is_replacement: bool
++    ) -> bool:
++        """Whether `alpaca_order` has already been replaced by a newer order for `order`."""
++        order_id = str(alpaca_order.id)
++        if order_id in self._superseded:
++            return True
++        if alpaca_order.status == AlpacaOrderStatus.REPLACED:
++            self._superseded.add(order_id)
++            return True
++        current_id = order.venue_order_id
++        if current_id is None or current_id == VenueOrderId(order_id):
++            return False
++        if not is_replacement or alpaca_order.replaced_by is not None:
++            self._superseded.add(order_id)
++            return True
++        replaces = alpaca_order.replaces
++        for _ in range(MAX_REPLACE_CHAIN):
++            if replaces is None:
++                self._superseded.add(order_id)
++                return True
++            replaces_id = str(replaces)
++            if replaces_id == current_id.value:
++                return False
++            prior = self._answers.get(replaces_id)
++            if prior is None:
++                try:
++                    fetched = await self._call(self._venue().get_order_by_id, replaces_id)
++                except APIError, OSError:
++                    return False
++                if not isinstance(fetched, AlpacaOrder):
++                    return False
++                prior = fetched
++            replaces = prior.replaces
++        return False
+ 
+-        The update carries the old order, with `replaced_by` (observed). The replacement is the PATCH
+-        answer if it is in, otherwise read from Alpaca; if neither yields it, nothing is generated and
+-        reconciliation settles the order, so no value is invented.
+-        """
+-        if old.replaced_by is None:
+-            self._log.error(
+-                f"Alpaca replaced {old.id} without saying by which order; nothing applied"
+-            )
+-            return
+-        replacement = self._answers.pop(str(old.replaced_by), None)
+-        if replacement is None:
+-            try:
+-                replacement = await self._call(self._venue().get_order_by_id, str(old.replaced_by))
+-            except (APIError, OSError) as e:
+-                self._log.error(
+-                    f"Alpaca replaced {order.client_order_id} by {old.replaced_by}, which could not be "
+-                    f"read ({e!r}); no OrderUpdated, reconciliation settles it",
+-                )
+-                return
+-        if not isinstance(replacement, AlpacaOrder):
+-            raise TypeError("alpaca-py returned raw order data; the client must use raw_data=False")
+-        self._replacements[replacement.client_order_id] = order.client_order_id
++    def _adopt_order(
++        self,
++        order: Any,
++        replacement: AlpacaOrder,
++        ts_event: int,
++        superseded_ids: tuple[str, ...] = (),
++    ) -> None:
+         report = order_status_report(
+             replacement,
+             self.clock.timestamp_ns(),
+@@ -1455,6 +1633,25 @@ class AlpacaExecutionClient(ExecutionClient):
+         )
+         if report is None:
+             raise ValueError(f"replacement {replacement.id} is not an order this slice maps")
++        if order.venue_order_id is not None and order.venue_order_id.value != str(replacement.id):
++            self._superseded.add(order.venue_order_id.value)
++        prior_id = str(replacement.replaces) if replacement.replaces is not None else None
++        for _ in range(MAX_REPLACE_CHAIN):
++            if prior_id is None:
++                break
++            self._superseded.add(prior_id)
++            prior = self._answers.get(prior_id)
++            prior_replaces = str(prior.replaces) if prior and prior.replaces is not None else None
++            self._settle_replacement(prior_id, prior_replaces)
++            prior_id = prior_replaces
++        for old_id in superseded_ids:
++            self._superseded.add(old_id)
++            self._settle_replacement(old_id, None)
++        self._replacements[replacement.client_order_id] = order.client_order_id
++        self._settle_replacement(
++            str(replacement.id),
++            str(replacement.replaces) if replacement.replaces is not None else None,
++        )
+         self.generate_order_updated(
+             order,
+             VenueOrderId(str(replacement.id)),
+@@ -1465,6 +1662,70 @@ class AlpacaExecutionClient(ExecutionClient):
+             ts_event,
+         )
+ 
++    async def _replaced(self, order: Any, old: AlpacaOrder, ts_event: int) -> None:
++        """Alpaca's `replaced` for the node's order: `OrderUpdated` with the replacement's values.
++
++        The update carries the old order, with `replaced_by` (observed). The replacement is the PATCH
++        answer if it is in, otherwise read from Alpaca; if Alpaca shows it already replaced again, its
++        `replaced_by` links are followed to the live replacement; if a read fails, nothing is generated
++        and reconciliation settles the order, so no value is invented.
++        """
++        old_id = str(old.id)
++        if old_id in self._superseded:
++            if old.replaced_by is not None:
++                self._settle_replacement(str(old.replaced_by), old_id)
++            return
++        if old.replaced_by is None:
++            self._log.error(
++                f"Alpaca replaced {old.id} without saying by which order; nothing applied"
++            )
++            return
++        superseded = [old_id]
++        next_id = str(old.replaced_by)
++        replacement: AlpacaOrder | RawData | None = None
++        for _ in range(MAX_REPLACE_CHAIN):
++            replacement = self._answers.pop(next_id, None)
++            if replacement is None:
++                try:
++                    replacement = await self._call(self._venue().get_order_by_id, next_id)
++                except (APIError, OSError) as e:
++                    self._log.error(
++                        f"Alpaca replaced {order.client_order_id} by {next_id}, which could not be "
++                        f"read ({e!r}); no OrderUpdated, reconciliation settles it",
++                    )
++                    return
++            if not isinstance(replacement, AlpacaOrder):
++                raise TypeError(
++                    "alpaca-py returned raw order data; the client must use raw_data=False"
++                )
++            self._replacements[replacement.client_order_id] = order.client_order_id
++            if replacement.status != AlpacaOrderStatus.REPLACED or replacement.replaced_by is None:
++                break
++            superseded.append(str(replacement.id))
++            self._settle_replacement(
++                str(replacement.id),
++                str(replacement.replaces) if replacement.replaces is not None else None,
++            )
++            next_id = str(replacement.replaced_by)
++        if not isinstance(replacement, AlpacaOrder) or (
++            replacement.status == AlpacaOrderStatus.REPLACED
++        ):
++            raise ValueError(
++                f"replacement chain from {old.id} exceeded {MAX_REPLACE_CHAIN} replaces"
++            )
++        if (
++            str(replacement.id) in self._superseded
++            or str(replacement.id) in self._settled_replacements
++        ):
++            for prior_id in superseded:
++                self._superseded.add(prior_id)
++            self._settle_replacement(
++                str(replacement.id),
++                str(replacement.replaces) if replacement.replaces is not None else None,
++            )
++            return
++        self._adopt_order(order, replacement, ts_event, tuple(superseded))
++
+     def _fill(
+         self, order: Any, update: TradeUpdate, venue_order_id: VenueOrderId, ts_event: int
+     ) -> None:
+@@ -1793,7 +2054,7 @@ class AlpacaExecutionClient(ExecutionClient):
+             held is not None
+             and node_id is not None
+             and node_id.value != order.client_order_id
+-            and order.status in CLOSED_STATUSES
++            and order.status == AlpacaOrderStatus.REJECTED
+             and held.venue_order_id != VenueOrderId(str(order.id))
+         ):
+             # A replacement that closed without taking over (rejected when the old order filled first):
+diff --git a/packages/canon-alpaca/tests/test_replace_ordering.py b/packages/canon-alpaca/tests/test_replace_ordering.py
+new file mode 100644
+index 0000000..234acd4
+--- /dev/null
++++ b/packages/canon-alpaca/tests/test_replace_ordering.py
+@@ -0,0 +1,340 @@
++"""Offline LiveNode tests for out-of-order, late and repeated Alpaca replace updates.
++
++Contract: `nautilus_trader.live.clients.ExecutionClient` (NautilusTrader v2.0.0rc8) and Alpaca's "Replace
++Order by ID" (`TradingClient.replace_order_by_id`, alpaca-py 0.45.0; ADR 0036). These complement
++`test_execution_client.py` with arrival orders not already covered there: stream rejection before HTTP 422,
++identical-term second modifies against an answered replacement, replacement cancel/expiry or partial fill
++ahead of `replaced`, late expiry on a superseded order, and missed-`replaced` reconciliation of a closed
++replacement.
++"""
++
++from __future__ import annotations
++
++import asyncio
++from types import SimpleNamespace
++from typing import TYPE_CHECKING
++
++import canon_alpaca.data
++import canon_alpaca.execution
++import canon_alpaca.providers
++import pytest
++from canon_alpaca.constants import ENV_API_KEY
++from canon_alpaca.constants import ENV_SECRET_KEY
++from canon_alpaca.execution import AlpacaExecutionClient
++from canon_alpaca.execution import AlpacaExecutionClientConfig
++from canon_alpaca.factories import AlpacaDataClientFactory
++from canon_alpaca.factories import AlpacaExecutionClientFactory
++from nautilus_trader.common import Environment
++from nautilus_trader.config import DataClientConfig
++from nautilus_trader.config import InstrumentProviderConfig
++from nautilus_trader.config import LiveNodeConfig
++from nautilus_trader.live import LiveNode
++from nautilus_trader.model import InstrumentId
++from nautilus_trader.model import OrderSide
++from nautilus_trader.model import OrderStatus
++from nautilus_trader.model import Price
++from nautilus_trader.model import Quantity
++from nautilus_trader.model import TraderId
++from nautilus_trader.trading import Strategy
++
++if TYPE_CHECKING:
++    from collections.abc import Awaitable
++    from collections.abc import Callable
++
++AAPL = InstrumentId.from_str("AAPL.ALPACA")
++TRADER = TraderId("TESTER-001")
++PLACEHOLDER = "offline-placeholder"
++BUILT_NODES: list[LiveNode] = []
++
++
++@pytest.fixture(autouse=True)
++def dispose_nodes():
++    yield
++    while BUILT_NODES:
++        BUILT_NODES.pop().dispose()
++
++
++@pytest.fixture
++def venue(monkeypatch, alpaca) -> SimpleNamespace:
++    monkeypatch.setenv(ENV_API_KEY, PLACEHOLDER)
++    monkeypatch.setenv(ENV_SECRET_KEY, PLACEHOLDER)
++    trading = alpaca.OrdersClient()
++    stream = alpaca.TradeStream()
++    trading.stream = stream
++    ns = SimpleNamespace(
++        trading=trading,
++        stream=stream,
++        historical=alpaca.HistoricalClient(),
++        quotes=alpaca.Stream(),
++    )
++    monkeypatch.setattr(canon_alpaca.providers, "TradingClient", lambda **_kw: trading)
++    monkeypatch.setattr(canon_alpaca.execution, "TradingClient", lambda **_kw: trading)
++    monkeypatch.setattr(canon_alpaca.execution, "TradingStream", lambda **_kw: stream)
++    monkeypatch.setattr(canon_alpaca.data, "StockHistoricalDataClient", lambda **_kw: ns.historical)
++    monkeypatch.setattr(canon_alpaca.data, "StockDataStream", lambda **_kw: ns.quotes)
++    return ns
++
++
++class ModifyProbe(Strategy):
++    def __init__(self) -> None:
++        super().__init__()
++        self.events: list = []
++        self.client_order_id = None
++        self.started = False
++        self.modify_qty: int | None = None
++        self.modify_price: str | None = "150.50"
++
++    def on_start(self) -> None:
++        self.started = True
++        self.subscribe_quotes(AAPL)
++
++    def on_quote(self, quote) -> None:
++        if self.client_order_id is not None:
++            return
++        order = self.order_factory.limit(
++            AAPL, OrderSide.BUY, Quantity.from_int(2), Price.from_str("150.00")
++        )
++        self.client_order_id = order.client_order_id
++        self.submit_order(order)
++
++    def on_order_event(self, event) -> None:
++        name = type(event).__name__
++        if name == "OrderInitialized":
++            return
++        self.events.append(event)
++        if name == "OrderAccepted" and self.names().count("OrderAccepted") == 1:
++            assert self.client_order_id is not None
++            self.modify_order(
++                self.client_order_id,
++                quantity=Quantity.from_int(self.modify_qty)
++                if self.modify_qty is not None
++                else None,
++                price=Price.from_str(self.modify_price) if self.modify_price is not None else None,
++            )
++
++    def names(self) -> list[str]:
++        return [type(e).__name__ for e in self.events]
++
++
++async def until_idle(client: AlpacaExecutionClient, venue: SimpleNamespace) -> None:
++    async with asyncio.timeout(10):
++        while (
++            client._rest_lock.locked()
++            or not venue.stream._messages.empty()
++            or not client._updates.empty()
++            or client._applying
++        ):
++            await asyncio.sleep(0.01)
++        for _ in range(20):
++            await asyncio.sleep(0.01)
++
++
++def run_probe(
++    venue: SimpleNamespace,
++    strategy: ModifyProbe,
++    done: Callable[[], bool],
++    then: Callable[[AlpacaExecutionClient], Awaitable[None]] | None = None,
++) -> None:
++    clients: list[AlpacaExecutionClient] = []
++
++    class Capturing(AlpacaExecutionClientFactory):
++        @staticmethod
++        def create(**kwargs):
++            client = AlpacaExecutionClientFactory.create(**kwargs)
++            clients.append(client)
++            return client
++
++    provider = InstrumentProviderConfig(load_ids=[str(AAPL)])
++    node = LiveNode.build(
++        "CANON-ALPACA-REPLACE-ORDERING",
++        LiveNodeConfig(
++            environment=Environment.SANDBOX,
++            trader_id=TRADER,
++            timeout_connection_secs=2,
++            timeout_reconciliation_secs=5,
++            timeout_disconnection_secs=5,
++            delay_post_stop_secs=0,
++            data_clients={"ALPACA": DataClientConfig(instrument_provider=provider)},
++            exec_clients={"ALPACA": AlpacaExecutionClientConfig(instrument_provider=provider)},
++        ),
++        data_factories={"ALPACA": AlpacaDataClientFactory},
++        exec_factories={"ALPACA": Capturing},
++    )
++    node.add_strategy(strategy)
++    BUILT_NODES.append(node)
++
++    async def main() -> None:
++        async with asyncio.timeout(15):
++            task = asyncio.ensure_future(node.run_async())
++            try:
++                while not (
++                    task.done() or (clients and clients[0].is_connected and strategy.started)
++                ):
++                    await asyncio.sleep(0.005)
++                if task.done():
++                    task.result()
++                async with asyncio.timeout(10):
++                    while not done():
++                        await asyncio.sleep(0.01)
++                await until_idle(clients[0], venue)
++                if then is not None:
++                    await then(clients[0])
++                    await until_idle(clients[0], venue)
++            finally:
++                if not task.done():
++                    node.handle().stop()
++                await task
++
++    asyncio.run(main())
++
++
++def placed(venue: SimpleNamespace, index: int) -> dict:
++    return list(venue.trading._placed.values())[index]
++
++
++def test_stream_replace_rejected_before_delayed_http_refusal_is_one_rejection(
++    venue, alpaca
++) -> None:
++    venue.trading.script = "accept"
++    strategy = ModifyProbe()
++
++    original_replace = venue.trading.replace_order_by_id
++
++    def slow_refusal(order_id: object, order_data: object = None):
++        venue.trading.replace_requests.append((str(order_id), order_data))
++        old = venue.trading._placed[str(order_id)]
++        venue.trading._send("order_replace_rejected", old)
++        import time
++
++        time.sleep(0.2)
++        raise alpaca.api_error(422, 42210000, "replace rejected after stream update")
++
++    venue.trading.replace_order_by_id = slow_refusal
++    try:
++        run_probe(venue, strategy, lambda: "OrderModifyRejected" in strategy.names())
++    finally:
++        venue.trading.replace_order_by_id = original_replace
++
++    assert strategy.names().count("OrderModifyRejected") == 1, strategy.names()
++
++
++def test_second_modify_with_identical_terms_after_answered_first_is_still_rejected(venue) -> None:
++    # Even when a second modify asks for the exact same terms as the already-answered first modify,
++    # its 422 "order already replaced" is a second modify's refusal, not alpaca-py's retry.
++    venue.trading.script = "accept"
++    venue.trading.replace_script = "silent"
++    strategy = ModifyProbe()
++    strategy.modify_qty = 5
++    strategy.modify_price = "150.50"
++
++    async def repeat_same_terms(client: AlpacaExecutionClient) -> None:
++        assert strategy.client_order_id is not None
++        cached = client.cache.order(strategy.client_order_id)
++        assert cached is not None
++        command = SimpleNamespace(
++            client_order_id=strategy.client_order_id,
++            venue_order_id=cached.venue_order_id,
++            quantity=Quantity.from_int(5),
++            price=Price.from_str("150.50"),
++            trigger_price=None,
++        )
++        await client._modify_order(command)  # ty: ignore[invalid-argument-type]
++        async with asyncio.timeout(10):
++            while "OrderModifyRejected" not in strategy.names():
++                await asyncio.sleep(0.01)
++
++    run_probe(venue, strategy, lambda: bool(venue.trading.replace_requests), repeat_same_terms)
++
++    assert strategy.names().count("OrderModifyRejected") == 1
++
++
++@pytest.mark.parametrize(
++    ("terminal_event", "expected_event"),
++    [("canceled", "OrderCanceled"), ("expired", "OrderExpired")],
++)
++def test_replacement_close_before_replaced_adopts_first_and_ignores_late_replaced(
++    venue, terminal_event: str, expected_event: str
++) -> None:
++    venue.trading.script = "accept"
++    venue.trading.replace_script = "silent"
++    strategy = ModifyProbe()
++
++    async def close_then_replaced(_client: AlpacaExecutionClient) -> None:
++        old, new = placed(venue, 0), placed(venue, 1)
++        venue.trading.update(new["id"], terminal_event, status=terminal_event)
++        venue.trading.confirm_replace(old["id"])
++        async with asyncio.timeout(10):
++            while expected_event not in strategy.names():
++                await asyncio.sleep(0.01)
++
++    run_probe(venue, strategy, lambda: bool(venue.trading.replace_requests), close_then_replaced)
++
++    names = strategy.names()
++    assert names.count("OrderUpdated") == 1, names
++    assert names.index("OrderUpdated") < names.index(expected_event), names
++
++
++def test_partial_fill_on_replacement_before_replaced_then_late_replaced_updates_once(
++    venue,
++) -> None:
++    venue.trading.script = "accept"
++    venue.trading.replace_script = "silent"
++    strategy = ModifyProbe()
++    strategy.modify_qty = 5
++
++    async def partial_then_replaced(_client: AlpacaExecutionClient) -> None:
++        old, new = placed(venue, 0), placed(venue, 1)
++        venue.trading.update(
++            new["id"], "partial_fill", 3, status="partially_filled", filled_qty="3"
++        )
++        venue.trading.confirm_replace(old["id"])
++        async with asyncio.timeout(10):
++            while "OrderFilled" not in strategy.names():
++                await asyncio.sleep(0.01)
++
++    run_probe(venue, strategy, lambda: bool(venue.trading.replace_requests), partial_then_replaced)
++
++    names = strategy.names()
++    assert names.count("OrderUpdated") == 1, names
++    assert names.index("OrderUpdated") < names.index("OrderFilled"), names
++
++
++def test_late_expire_of_replaced_order_does_not_expire_replacement(venue) -> None:
++    venue.trading.script = "accept"
++    strategy = ModifyProbe()
++
++    async def late_expire(_client: AlpacaExecutionClient) -> None:
++        old = placed(venue, 0)
++        venue.trading.update(old["id"], "expired", status="expired")
++
++    run_probe(venue, strategy, lambda: "OrderUpdated" in strategy.names(), late_expire)
++
++    assert "OrderExpired" not in strategy.names(), strategy.names()
++
++
++@pytest.mark.parametrize(
++    ("alpaca_status", "expected_status"),
++    [("canceled", OrderStatus.CANCELED), ("expired", OrderStatus.EXPIRED)],
++)
++def test_closed_replacement_is_reported_when_replaced_was_missed(
++    venue, alpaca_status: str, expected_status: OrderStatus
++) -> None:
++    venue.trading.script = "accept"
++    venue.trading.replace_script = "silent"
++    strategy = ModifyProbe()
++    reports: list = []
++
++    async def reconcile(client: AlpacaExecutionClient) -> None:
++        new = placed(venue, 1)
++        new["status"] = alpaca_status
++        venue.trading.orders = list(venue.trading._placed.values())
++        client._replacements.clear()
++        window = SimpleNamespace(open_only=False, instrument_id=None, start=None, end=None)
++        reports.extend(await client._generate_order_status_reports(window))  # ty: ignore[invalid-argument-type]
++
++    run_probe(venue, strategy, lambda: bool(venue.trading.replace_requests), reconcile)
++
++    mine = [r for r in reports if r.client_order_id == strategy.client_order_id]
++    assert [(r.venue_order_id.value, r.order_status) for r in mine] == [
++        (placed(venue, 1)["id"], expected_status)
++    ]

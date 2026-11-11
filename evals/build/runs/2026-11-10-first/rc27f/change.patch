@@ -1,0 +1,456 @@
+diff --git a/docs/adr/0036-alpaca-adapter-order-management.md b/docs/adr/0036-alpaca-adapter-order-management.md
+index 28ef4b0..5557ad9 100644
+--- a/docs/adr/0036-alpaca-adapter-order-management.md
++++ b/docs/adr/0036-alpaca-adapter-order-management.md
+@@ -44,6 +44,8 @@ cancel") unless Alpaca shows the order canceled or pending cancel (alpaca-py's o
+ replaced, when the replacement is canceled; an unexpected error is logged with no event ("parse failures
+ after transmission" leave the outcome unknown). That the rest go on, in a batch cancel too, is this repo's
+ choice; `_batch_cancel_orders` keeps the guide's default: Alpaca has no cancel-by-list endpoint.
++Superseded in part by ADR 0049: an order already `PENDING_CANCEL` is canceled again, since that status does
++not show Alpaca took the cancel.
+ 
+ ### Stop and stop-limit orders
+ 
+diff --git a/docs/adr/0049-cancel-all-resends-to-an-order-pending-cancel.md b/docs/adr/0049-cancel-all-resends-to-an-order-pending-cancel.md
+new file mode 100644
+index 0000000..16bb76c
+--- /dev/null
++++ b/docs/adr/0049-cancel-all-resends-to-an-order-pending-cancel.md
+@@ -0,0 +1,68 @@
++---
++status: accepted
++date: 2026-11-11
++decision-makers: master orchestrator (Claude), under the owner's delegation of 2026-11-10; the defect confirmed by the coordinator
++review-by: 2026-12-11
++---
++
++# Cancel-all cancels again an order the node holds as pending cancel
++
++## Context and Problem Statement
++
++ADR 0036's cancel-all skipped an order already `PENDING_CANCEL`, "since a second cancel risks a
++rejection". NautilusTrader puts an order in `PENDING_CANCEL` when the cancel is sent, before Alpaca has
++answered (`execution.py`'s header: NautilusTrader generates `OrderPendingCancel` itself when a command is
++sent). A cancel that got no answer, a read timeout for one (ADR 0039), leaves the order there while it
++still works at Alpaca, and the skip meant no later cancel-all would cancel it. Confirmed as a defect,
++with a test that fails on the skip.
++
++## Decision Drivers
++
++* A cancel-all must not leave a working order uncanceled because of a status the node set itself.
++* No new event an order cannot take: a second cancel must not turn into a false `OrderCancelRejected`.
++
++## Considered Options
++
++1. Keep the skip (ADR 0036; Coinbase's adapter at the pin, as ADR 0036 read it).
++2. Cancel every open order of the command, `PENDING_CANCEL` included, through the single cancel's path.
++3. Ask Alpaca for each pending-cancel order first and cancel only those it still shows open.
++
++## Decision Outcome
++
++Chosen: **option 2**. A pending-cancel order gets one more cancel by ID, the same call as any other. The
++risk ADR 0036 named is already handled on that path: if Alpaca is canceling the order, a second cancel is
++answered 204 and waits for the `canceled` update, or refused 422, and `_cancel_refused` asks Alpaca for
++the order and generates nothing when it shows it canceled or pending cancel (ADR 0036, for alpaca-py's own
++retry). Option 3 adds a lookup to every pending-cancel order for what the 422 path does already. The test
++that showed the defect cites upstream's Kraken spot, Binance spot, Bybit and Interactive Brokers adapters
++as including every open order; that was not re-read for this record (Evidence).
++
++Supersedes, in ADR 0036's "Cancel-all: option 2", the skip of an order already `PENDING_CANCEL`. The rest
++of that decision stands: closed orders are still skipped at their turn.
++
++### Consequences
++
++* Good: an order whose cancel went unanswered is canceled by the next cancel-all.
++* Bad: an order whose cancel is still in flight gets a second cancel, one more HTTP call; whether Alpaca
++  answers it 204 or 422 is not on a page read (UNVERIFIED), and both are handled.
++
++### Confirmation
++
++Offline: `test_cancel_all_cancels_again_an_order_whose_cancel_had_no_answer` in
++`packages/canon-alpaca/tests/test_execution_client.py`: a cancel that raised a read timeout, then a
++cancel-all; two cancels reach Alpaca and the order ends `CANCELED`. It failed before the change, one
++cancel sent (run 2026-11-11). Not run on paper.
++
++## Evidence
++
++Read 2026-11-11, in this checkout only; nothing fetched.
++
++* `docs/adr/0036-alpaca-adapter-order-management.md`: the skip and its reason, and the 422 path that
++  generates nothing when Alpaca shows the order canceled or pending cancel (read).
++* `packages/canon-alpaca/src/canon_alpaca/execution.py`: `_cancel`, `_cancel_refused`, and the header line
++  on `OrderPendingCancel` (read).
++* https://docs.alpaca.markets/us/reference/deleteorderbyorderid-1.md: 422 "if the order is no longer
++  cancelable", else 204, as quoted in `execution.py`; not fetched this session (UNVERIFIED).
++* `crates/adapters/{kraken,binance,bybit,interactive_brokers}/` at the pin `d53849b216e2`: cancel-all
++  including every open order, as the test's comment states; the installed wheel holds no adapter source,
++  and the network was not used (UNVERIFIED).
+diff --git a/packages/canon-alpaca/README.md b/packages/canon-alpaca/README.md
+index 2fb1623..5cb63b1 100644
+--- a/packages/canon-alpaca/README.md
++++ b/packages/canon-alpaca/README.md
+@@ -224,7 +224,9 @@ Each is stated in `execution.py`'s header, with its source.
+   observed on paper and is asserted by `test_paper_replace.py`
+   ([ADR 0042](../../docs/adr/0042-alpaca-adapter-modify.md)).
+ * **Cancel-all** cancels the node's open and in-flight orders for the command's instrument, and side if
+-  it names one, each by ID, one at a time, as a single cancel does, skipping one already pending cancel;
++  it names one, each by ID, one at a time, as a single cancel does, one already pending cancel included,
++  since a cancel that got no answer leaves that status while the order still works at Alpaca
++  ([ADR 0049](../../docs/adr/0049-cancel-all-resends-to-an-order-pending-cancel.md));
+   a refused one gets `OrderCancelRejected`, and after a refusal or a failure the rest go on. Alpaca's "Delete All Orders" cancels every open order of the
+   account, so it is not called. A strategy sends the command only with `strategy_only=False`, and it then
+   covers every strategy's orders; with the default, the strategy cancels its own orders one by one
+@@ -287,8 +289,10 @@ Each is stated in `execution.py`'s header, with its source.
+   documented maximum, newest first; a full page
+   is logged as possibly truncated. An open order with a type, side, class, status, quantity or time in force
+   this slice does not map fails start-up, and its reason is logged; so does an open order in anything but
+-  US equities, and a fractional position (`Equity` is whole-share only). A closed order of that kind is
+-  skipped with a warning. Positions in anything but US equities are not reported. Alpaca does not say whether a short
++  US equities, an open order whose client order ID NautilusTrader's `ClientOrderId` refuses (empty or not
++  ASCII, as an order made outside the node can carry), and a fractional position (`Equity` is whole-share
++  only). A closed order of that kind is skipped with a warning. A replacement of an order with such an ID
++  is reported under its own client order ID. Positions in anything but US equities are not reported. Alpaca does not say whether a short
+   position's `qty` is negative, so the side comes from `side` and the size is its magnitude. Each loaded
+   instrument Alpaca lists no position in is reported flat: Alpaca's positions endpoint lists only open
+   positions, and NautilusTrader takes only "An explicit flat report" as evidence of flat. Without it,
+@@ -333,13 +337,14 @@ This package has all three for each client, offline, plus a paper test for each:
+ | `test_provider.py` | Asset queries and filters, load by ID, failures named, other venues refused | None |
+ | `test_data_client.py` | A real `LiveNode`: registration through config and builder, owned and hosted launch, bars, quotes and trades into strategy and cache, hourly and daily bar windows, `limit`, open-ended requests, concurrent and cancelled bar requests, request failures as `failure_reason`, unsubscribes that never subscribed or failed, late data for an unsubscribed symbol dropped, trade cancels and corrections logged, one-sided quotes dropped and counted, a stream ending by itself logged (and an abandoned one not), shutdown joining the stream thread or clearing state when it does not stop, stream handlers not keeping the client alive, paper and IEX client construction | None |
+ | `test_paper_integration.py` | One asset and a week of daily bars from Alpaca's paper environment through a real node, from midday New York on a fixed trading day: the first bar must be the one that opened at that day's midnight, which Alpaca returns only because the adapter shifts the window | Paper only; skipped without `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` |
+-| `test_execution_client.py` | A real `LiveNode` with both clients: registration through config and builder, owned and hosted launch, a market order that fills, partial fills, a limit order canceled, cancel-all by ID (side filter, a refused cancel, a failed cancel, nothing to cancel), rejections by HTTP status and by trade update, a cancel refused, stop and stop-limit orders sent with their prices, modify (`OrderUpdated` only on Alpaca's `replaced`, a fill on the replacement reaching the node's order with the client's map full and emptied, two replaces in a row, reports of a replacement under the node's ID, refusals, a refused repeat, `order_replace_rejected`, a rejected replacement, local denials, a stop's trigger price, a replacement that cannot be read), orders denied before Alpaca (type, time in force, stop trigger type, sub-penny limit and stop prices, not tradable), an unknown submit outcome left `SUBMITTED`, an update for an unknown order dropped, start-up fills from Alpaca's fill activities (trade IDs and prices, paging, the window, one order, an activity it cannot map skipped, a page whose last activity has no `id`, a body that is not JSON, fills not all listed whatever their age or with no `cum_qty` and `leaves_qty`, the order read to check them and one alpaca-py cannot build), start-up reconciliation of an open order, a filled order, a position and open stop and stop-limit orders, an unmapped open order failing start-up, account state on connect, paper-only client construction, shutdown joining the trade stream thread; the config's paper-only refusals, and a node refusing a plain `ExecutionClientConfig`; HTTP timeouts (a local server that never answers: the call ends, the next is answered, the run ends; a connect timeout on the only attempt rejects a submit or cancel as not sent, a read timeout or a repeated attempt leaves it unknown; a session holding another timeout, or the adapter on HTTPS only, gets the package's on both schemes) | None |
++| `test_execution_client.py` | A real `LiveNode` with both clients: registration through config and builder, owned and hosted launch, a market order that fills, partial fills, a limit order canceled, cancel-all by ID (side filter, a refused cancel, a failed cancel, nothing to cancel, an order whose cancel had no answer canceled again), rejections by HTTP status and by trade update, a cancel refused, stop and stop-limit orders sent with their prices, modify (`OrderUpdated` only on Alpaca's `replaced`, a fill on the replacement reaching the node's order with the client's map full and emptied, two replaces in a row, reports of a replacement under the node's ID, refusals, a refused repeat, `order_replace_rejected`, a rejected replacement, local denials, a stop's trigger price, a replacement that cannot be read), orders denied before Alpaca (type, time in force, stop trigger type, sub-penny limit and stop prices, not tradable), an unknown submit outcome left `SUBMITTED`, an update for an unknown order dropped, start-up fills from Alpaca's fill activities (trade IDs and prices, paging, the window, one order, an activity it cannot map skipped, a page whose last activity has no `id`, a body that is not JSON, fills not all listed whatever their age or with no `cum_qty` and `leaves_qty`, the order read to check them and one alpaca-py cannot build), start-up reconciliation of an open order, a filled order, a position and open stop and stop-limit orders, an unmapped open order failing start-up, an order with a client order ID NautilusTrader cannot hold (skipped when closed, failing start-up by name when open, its replacement reported under its own ID), account state on connect, paper-only client construction, shutdown joining the trade stream thread; the config's paper-only refusals, and a node refusing a plain `ExecutionClientConfig`; HTTP timeouts (a local server that never answers: the call ends, the next is answered, the run ends; a connect timeout on the only attempt rejects a submit or cancel as not sent, a read timeout or a repeated attempt leaves it unknown; a session holding another timeout, or the adapter on HTTPS only, gets the package's on both schemes) | None |
+ | `test_paper_execution.py` | DAY limit buys of 1 AAPL far below the market on Alpaca's paper Trading API through a real node: one submitted, accepted and canceled; upstream's `ExecTester` running rows of its Execution Testing Spec: TC-E41, a limit buy and a stop buy canceled by `CancelAllOrders` on stop, TC-E20 and TC-E22, a stop and a stop-limit buy accepted at the prices sent and reported back the same, and TC-E30, whose one-tick amend the client denies as sub-penny; and a $1.00 buy modified to $1.01 through a node, then canceled | Paper only; cancels every order it places; each places nothing and fails if the paper account already holds an open AAPL order or position; skipped without `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` |
+ | `test_paper_fill_ids.py` | ADR 0024's test, with alpaca-py directly, not through a node: a market buy of 2 AAPL and a market sell of 2 on Alpaca's paper Trading API; every fill and partial fill update's `execution_id` must be the UUID after `::` in one of the order's `FILL` activity `id`s | Paper only; needs the regular session and skips outside it; stops if the account holds any open order or position; sells what it bought; skipped without `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` |
+ | `test_paper_matrix.py` | Upstream's `DataTester` and `ExecTester` through a real node on Alpaca's paper environment: the rows in "Upstream's test matrices against paper" | Paper only; needs the regular session for the stream and fill rows; stops if the account holds any open order or position; cancels and closes what its node opened; skipped without `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` |
+ | `test_paper_flat_reconciliation.py` | TC-E85 on the shared account's past orders, with no lookback: with Alpaca holding no position, start-up must leave none open, through the explicit flat reports (no `EXTERNAL` position) | Paper only; places nothing, so needs no session; stops, touching nothing, if the account holds any open order or position; skipped without `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` |
+ | `test_paper_fill_reports.py` | TC-E85 with fill reports: a market buy of 2 AAPL with alpaca-py, its trade updates recorded; a node's start-up reconciliation must give the order one fill per update, with that update's `execution_id` and price | Paper only; needs the regular session and skips outside it; stops if the account holds any open order or position; sells what it bought; skipped without `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` |
+ | `test_paper_replace.py` | Alpaca's replace through alpaca-py directly: a $1.00 buy replaced with $1.01; asserts what a paper observation showed and the modify rests on (a replacement may not keep the client order ID, the answer's new IDs and `replaces`, `replaced` carrying the old order with `replaced_by`, a second replace refused) | Paper only; needs the regular session; places nothing while the account holds an open AAPL order, cancels what it opened |
++| `test_client_order_ids.py` | Client order IDs `ClientOrderId` refuses (empty, all whitespace, not ASCII) in the `replaces` trace, without a node: a trade update for such an order is not the node's, such an order between the node's and its replacement is passed over, nothing is cached under such an ID, and a chain of only such IDs has no root | None |
+ | `test_upstream_contract.py` | The upstream names this README quotes still exist in the pinned packages; the execution hooks and `generate_order_filled` signature; alpaca-py's trading clients default to and target paper; the native config drops unknown keywords; the stream stand-ins refuse and keep what alpaca-py's `StockDataStream` and `TradingStream` do; alpaca-py's REST clients keep a `requests.Session` at `_session` and pass no timeout (ADR 0039) | None |
+ 
+ The offline tests use payloads hand-built from the examples in Alpaca's docs (sources in `tests/conftest.py`)
+diff --git a/packages/canon-alpaca/src/canon_alpaca/execution.py b/packages/canon-alpaca/src/canon_alpaca/execution.py
+index 1b106b5..056146d 100644
+--- a/packages/canon-alpaca/src/canon_alpaca/execution.py
++++ b/packages/canon-alpaca/src/canon_alpaca/execution.py
+@@ -116,8 +116,9 @@ Known limits:
+   Its trade updates are mapped as any order's. A `day` order placed overnight stays active through the next
+   trading day and "If unfilled, the order is canceled at 8:00 PM ET" (Alpaca's 24/5 page); which update
+   that cancel sends is not documented.
+-* Cancel-all sends one cancel per order, one at a time, in no specified order, skipping an order already
+-  pending cancel; an order placed after the command was read from the cache is not canceled by it.
++* Cancel-all sends one cancel per order, one at a time, in no specified order, an order already pending
++  cancel included, since that status does not show Alpaca took the cancel (ADR 0049); an order placed
++  after the command was read from the cache is not canceled by it.
+ * A limit price at or above $1.00 with more than 2 decimals, or below $1.00 with more than 4, is denied
+   here: Alpaca rejects it ("Sub-penny increments for limit orders", same page).
+ * The account is a NautilusTrader cash account holding Alpaca's `cash` as its USD balance, all of it free,
+@@ -141,8 +142,10 @@ Known limits:
+ * Reports: the orders submitted in the engine's window plus every open order, since Alpaca filters on
+   submission time; at most 500 orders per request (`GetOrdersRequest.limit`, "max is 500"), the newest
+   first; a full page is logged as possibly truncated. An order Alpaca reports with a type, side, class, status,
+-  quantity or time in force this slice does not map fails the report when it is open and is skipped with a
+-  warning when it is closed.
++  quantity or time in force this slice does not map, or with a client order ID `ClientOrderId` refuses
++  (empty or not ASCII, as an order made outside the node can carry), fails the report when it is open and
++  is skipped with a warning when it is closed. A replacement of such an order is reported under its own
++  client order ID: the `replaces` trace passes over an ID the node could not have sent.
+ * alpaca-py retries a request answered 429 or 504 up to 3 times (`RESTClient._request`), a submit or
+   cancel included, and the client cannot turn that off. What Alpaca answers a repeated `client_order_id`
+   is not documented on the pages read (UNVERIFIED), so a submit refused with 403 or 422 is rejected only
+@@ -154,9 +157,9 @@ Known limits:
+   a cancel cancel-rejected, each "not sent" (NautilusTrader's policies, "Command outcomes"); any other
+   timeout is an unknown outcome, as above.
+ * Start-up fails, by design, on an open order or position this slice cannot represent: a fractional
+-  position, or an open order that is not a simple whole-share US equity market, limit, stop or stop-limit
+-  order. An open stop is reported with its stop price as the trigger price and the node's trigger type, else
+-  `DEFAULT`.
++  position, an open order that is not a simple whole-share US equity market, limit, stop or stop-limit
++  order, or an open order whose client order ID NautilusTrader cannot hold. An open stop is reported with
++  its stop price as the trigger price and the node's trigger type, else `DEFAULT`.
+ * Timestamps lose sub-microsecond precision: alpaca-py parses them into `datetime`.
+ """
+ 
+@@ -610,6 +613,19 @@ def alpaca_side(order: AlpacaOrder) -> OrderSide:
+     return side
+ 
+ 
++def holdable_client_order_id(value: str) -> ClientOrderId | None:
++    """`value` as a `ClientOrderId`, or None if NautilusTrader cannot hold it.
++
++    `ClientOrderId` refuses an empty, all-whitespace or non-ASCII value with a `ValueError` (its
++    constructor's own check, NautilusTrader v2.0.0rc8). Alpaca can list such an order, made outside the
++    node; every ID the node sends passes that check, so an ID that fails it is never the node's.
++    """
++    try:
++        return ClientOrderId(value)
++    except ValueError:
++        return None
++
++
+ def order_status_report(
+     order: AlpacaOrder,
+     ts_init: int,
+@@ -619,8 +635,10 @@ def order_status_report(
+     """An `OrderStatusReport` for one Alpaca order, None for a closed one this slice does not map.
+ 
+     An open order this slice does not map raises, so reconciliation fails rather than leaving a working
+-    order unknown to the node. `replaced` is skipped: the order replacing it is reported in its own right,
+-    under `client_order_id` when the client has traced it back to the node's order. A stop's trigger type
++    order unknown to the node; so does an open order whose client order ID `ClientOrderId` refuses (empty
++    or not ASCII), with no `client_order_id` given for it. `replaced` is skipped: the order replacing it
++    is reported in its own right, under `client_order_id` when the client has traced it back to the
++    node's order. A stop's trigger type
+     is `trigger_type` when the node holds the order, else `DEFAULT`: Alpaca's order has no trigger type
+     field.
+     """
+@@ -1074,10 +1092,14 @@ class AlpacaExecutionClient(ExecutionClient):
+         Alpaca's "Delete All Orders" cancels every open order of the account, whatever its symbol, so it
+         is not used: as upstream's Kraken spot adapter does for its account-wide cancel-all, the matching
+         orders are taken from the cache and canceled by ID. In-flight orders are included because Alpaca
+-        may hold an order the node still has as `SUBMITTED`. An order already `PENDING_CANCEL` has a cancel
+-        in flight and is left to it. A strategy sends this command only with `strategy_only=False`, and
+-        then means every strategy's orders, so none is filtered by strategy. A failure on one order is
+-        logged and the rest are still canceled.
++        may hold an order the node still has as `SUBMITTED`. So is an order already `PENDING_CANCEL`:
++        NautilusTrader sets that status when it sends a cancel, not when Alpaca takes it, so a cancel that
++        got no answer (a read timeout) leaves it while the order still works at Alpaca (ADR 0049). A cancel
++        sent again for an order Alpaca is already canceling waits on its `canceled` update if answered
++        204, and if refused 422, `_cancel_refused` generates nothing once Alpaca shows the order canceled
++        or pending cancel. A strategy sends this command only with `strategy_only=False`, and then means
++        every strategy's orders, so none is filtered by strategy. A failure on one order is logged and the
++        rest are still canceled.
+         """
+         selected: dict[ClientOrderId, None] = {}
+         for found in (self.cache.orders_open, self.cache.orders_inflight):
+@@ -1088,9 +1110,9 @@ class AlpacaExecutionClient(ExecutionClient):
+             return
+         for client_order_id in selected:
+             # Read again at its turn: the cancels before it took an HTTP round trip each, in which this
+-            # order may have filled, closed or been sent a cancel of its own.
++            # order may have filled or closed.
+             order = self.cache.order(client_order_id)
+-            if order is None or order.is_closed or order.status == OrderStatus.PENDING_CANCEL:
++            if order is None or order.is_closed:
+                 continue
+             await self._cancel_logged(client_order_id, order.venue_order_id)
+ 
+@@ -1461,27 +1483,35 @@ class AlpacaExecutionClient(ExecutionClient):
+         self, alpaca_order: AlpacaOrder, known: dict[str, AlpacaOrder] | None = None
+     ) -> ClientOrderId | None:
+         """The node's client order ID for an Alpaca order, or None if the node holds none."""
+-        own = ClientOrderId(alpaca_order.client_order_id)
+-        if self.cache.order(own) is not None:
++        own = holdable_client_order_id(alpaca_order.client_order_id)
++        if own is not None and self.cache.order(own) is not None:
+             return own
+         root = await self._root_id(alpaca_order, known)
+-        return root if self.cache.order(root) is not None else None
++        return root if root is not None and self.cache.order(root) is not None else None
+ 
+     async def _root_id(
+         self, alpaca_order: AlpacaOrder, known: dict[str, AlpacaOrder] | None = None
+-    ) -> ClientOrderId:
+-        """The client order ID of the order an Alpaca order's `replaces` chain starts from.
++    ) -> ClientOrderId | None:
++        """The first client order ID NautilusTrader can hold in an Alpaca order's `replaces` chain.
+ 
+         A replacement carries a client order ID Alpaca made (observed), so it is traced back through its
+         `replaces` links, from the orders already fetched first, at most `MAX_REPLACE_CHAIN` of them.
+         Every result is cached, a chain that ends without reaching the node's orders included, so an
+         order traced before the node holds its original (the start-up window) resolves once it does, and
+         no chain is walked twice; the cache is rebuilt after a restart.
++
++        An order whose client order ID NautilusTrader cannot hold (`holdable_client_order_id`), as an
++        order made outside the node can carry, is passed over: it is not the node's, and the order that
++        replaced it is reported under its own ID. None if no order in the chain has an ID it can hold.
++        Such an ID is neither looked up in the cache nor cached, since an empty one need not name one
++        order.
+         """
+-        cached = self._replacements.get(alpaca_order.client_order_id)
+-        if cached is not None:
+-            return cached
+-        root = ClientOrderId(alpaca_order.client_order_id)
++        own = holdable_client_order_id(alpaca_order.client_order_id)
++        if own is not None:
++            cached = self._replacements.get(own.value)
++            if cached is not None:
++                return cached
++        root = own
+         replaces = alpaca_order.replaces
+         for _ in range(MAX_REPLACE_CHAIN):
+             if replaces is None:
+@@ -1498,20 +1528,24 @@ class AlpacaExecutionClient(ExecutionClient):
+                 raise TypeError(
+                     "alpaca-py returned raw order data; the client must use raw_data=False"
+                 )
+-            mapped = self._replacements.get(prior.client_order_id)
++            replaces = prior.replaces
++            prior_id = holdable_client_order_id(prior.client_order_id)
++            if prior_id is None:
++                continue
++            mapped = self._replacements.get(prior_id.value)
+             if mapped is not None:
+                 root = mapped
+                 break
+-            root = ClientOrderId(prior.client_order_id)
++            root = prior_id
+             if self.cache.order(root) is not None:
+                 break
+-            replaces = prior.replaces
+         else:
+             self._log.warning(
+                 f"Alpaca order {alpaca_order.id} has more than {MAX_REPLACE_CHAIN} replaces; it is traced "
+                 f"to the order {MAX_REPLACE_CHAIN} links back",
+             )
+-        self._replacements[alpaca_order.client_order_id] = root
++        if own is not None and root is not None:
++            self._replacements[own.value] = root
+         return root
+ 
+     async def _apply(self, update: TradeUpdate) -> None:
+@@ -2076,8 +2110,9 @@ class AlpacaExecutionClient(ExecutionClient):
+         except (APIError, OSError) as e:
+             self._log.warning(f"Alpaca order {order.id} is not reported: tracing it failed ({e!r})")
+             return None
+-        # Reported under the chain's first client order ID, the node's, held or not: after a restart
+-        # the node's original order is created under its own ID.
++        # Reported under the chain's first client order ID NautilusTrader can hold, the node's, held or
++        # not: after a restart the node's original order is created under its own ID. With none (an
++        # order made outside the node, its ID empty or not ASCII), `order_status_report` refuses it.
+         node_id = root
+         held = self.cache.order(node_id) if node_id is not None else None
+         if (
+@@ -2101,7 +2136,8 @@ class AlpacaExecutionClient(ExecutionClient):
+         if report is None:
+             self._log.warning(
+                 f"Alpaca order {order.id} ({order.symbol}, {order.status.value}) is not reported: "
+-                "its type, side, class, quantity or time in force is not in this slice",
++                "its type, side, class, quantity or time in force is not in this slice, or "
++                "NautilusTrader cannot hold its client order ID",
+             )
+         return report
+ 
+diff --git a/packages/canon-alpaca/tests/test_client_order_ids.py b/packages/canon-alpaca/tests/test_client_order_ids.py
+new file mode 100644
+index 0000000..384e764
+--- /dev/null
++++ b/packages/canon-alpaca/tests/test_client_order_ids.py
+@@ -0,0 +1,117 @@
++"""Client order IDs NautilusTrader cannot hold, in the execution client's `replaces` trace.
++
++Alpaca can list an order whose client order ID `ClientOrderId` refuses (empty, all whitespace, not ASCII),
++as an order made outside the node can carry. `test_execution_client.py` covers such orders in start-up
++reconciliation through a node; these cover the trace itself, for the trade update path and for the chains
++a node run does not set up: the trace is called on the client class with a stand-in for the client's
++state (its cache, its replacement map and alpaca-py's order lookup), and no node.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import logging
++from types import SimpleNamespace
++
++import pytest
++from alpaca.trading.models import Order as AlpacaOrder
++from canon_alpaca.execution import AlpacaExecutionClient
++from canon_alpaca.execution import holdable_client_order_id
++from nautilus_trader.model import ClientOrderId
++
++NODE_ID = "node-order-1"
++
++
++class Tracer:
++    """The state `AlpacaExecutionClient._node_order_id` and `_root_id` read, and nothing else."""
++
++    _node_order_id = AlpacaExecutionClient._node_order_id
++    _root_id = AlpacaExecutionClient._root_id
++
++    def __init__(self, held: set[str], alpaca_orders: list[dict]) -> None:
++        self._replacements: dict[str, ClientOrderId] = {}
++        self._log = logging.getLogger("tracer")
++        self._orders = {order["id"]: AlpacaOrder(**order) for order in alpaca_orders}
++        self.lookups: list[str] = []
++        self.cache = SimpleNamespace(order=lambda cid: object() if cid.value in held else None)
++
++    def _venue(self) -> SimpleNamespace:
++        return SimpleNamespace(get_order_by_id=self._get_order_by_id)
++
++    def _get_order_by_id(self, order_id: str) -> AlpacaOrder:
++        self.lookups.append(order_id)
++        return self._orders[order_id]
++
++    async def _call(self, fn, *args):
++        return fn(*args)
++
++
++def chain(alpaca, *client_order_ids: str) -> list[dict]:
++    """Alpaca orders each replacing the one before, with these client order IDs, oldest first."""
++    orders: list[dict] = []
++    for n, client_order_id in enumerate(client_order_ids):
++        orders.append(
++            alpaca.alpaca_order(
++                id=f"00000000-0000-4000-8000-{n:012d}",
++                client_order_id=client_order_id,
++                status="new" if n == len(client_order_ids) - 1 else "replaced",
++                replaces=orders[-1]["id"] if orders else None,
++            )
++        )
++    return orders
++
++
++@pytest.mark.parametrize("value", ["", "   ", "订单-1"])
++def test_an_id_client_order_id_refuses_is_not_holdable(value) -> None:
++    with pytest.raises(ValueError):
++        ClientOrderId(value)
++    assert holdable_client_order_id(value) is None
++
++
++def test_an_id_the_node_could_send_is_holdable() -> None:
++    assert holdable_client_order_id(NODE_ID) == ClientOrderId(NODE_ID)
++
++
++@pytest.mark.parametrize("value", ["", "订单-1"])
++def test_a_trade_update_for_an_unholdable_order_is_not_the_nodes(alpaca, value) -> None:
++    # Before the fix `ClientOrderId("")` raised here, and the update failed instead of being dropped.
++    (order,) = chain(alpaca, value)
++    tracer = Tracer(held={NODE_ID}, alpaca_orders=[order])
++
++    found = asyncio.run(tracer._node_order_id(AlpacaOrder(**order)))
++
++    assert found is None
++    assert tracer._replacements == {}
++
++
++def test_an_unholdable_order_in_the_chain_is_passed_over_to_the_nodes(alpaca) -> None:
++    # The node's order, replaced by one whose ID NautilusTrader cannot hold, replaced again: the last is
++    # still the node's order.
++    orders = chain(alpaca, NODE_ID, "", "alpaca-made-2")
++    tracer = Tracer(held={NODE_ID}, alpaca_orders=orders)
++
++    found = asyncio.run(tracer._node_order_id(AlpacaOrder(**orders[-1])))
++
++    assert found == ClientOrderId(NODE_ID)
++    assert tracer._replacements == {"alpaca-made-2": ClientOrderId(NODE_ID)}
++
++
++def test_an_unholdable_replacement_of_the_nodes_order_is_traced_and_not_cached(alpaca) -> None:
++    # Its ID need not name one order, so nothing is cached under it: a second trace walks again.
++    orders = chain(alpaca, NODE_ID, "")
++    tracer = Tracer(held={NODE_ID}, alpaca_orders=orders)
++
++    for _ in range(2):
++        found = asyncio.run(tracer._node_order_id(AlpacaOrder(**orders[-1])))
++        assert found == ClientOrderId(NODE_ID)
++
++    assert tracer._replacements == {}
++    assert tracer.lookups == [orders[0]["id"]] * 2
++
++
++def test_a_chain_with_no_holdable_id_has_no_root(alpaca) -> None:
++    orders = chain(alpaca, "订单-1", "")
++    tracer = Tracer(held=set(), alpaca_orders=orders)
++
++    assert asyncio.run(tracer._root_id(AlpacaOrder(**orders[-1]))) is None
++    assert tracer._replacements == {}

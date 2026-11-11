@@ -1,0 +1,281 @@
+diff --git a/.gitignore b/.gitignore
+index 674c1d9..b1ce3ab 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -17,8 +17,9 @@ CLAUDE.local.md
+ catalog/*
+ !catalog/README.md
+ 
+-# the trial ledger: an Optuna SQLite study in ledger/ (ADR 0035), never committed
+-ledger/
++# the trial ledger: an Optuna SQLite study in the root's ledger/ (ADR 0035), never committed; the
++# leading slash keeps a folder of that name elsewhere, such as a package, tracked
++/ledger/
+ 
+ # Python
+ .venv/
+diff --git a/docs/adr/0035-trial-ledger-in-an-optuna-study.md b/docs/adr/0035-trial-ledger-in-an-optuna-study.md
+index 56b9ccb..f7e7427 100644
+--- a/docs/adr/0035-trial-ledger-in-an-optuna-study.md
++++ b/docs/adr/0035-trial-ledger-in-an-optuna-study.md
+@@ -48,7 +48,8 @@ trial store that meets every driver. Leaving it is cheap, since every trial read
+    then asked for, so a run that never returns stays as `RUNNING`. A run that raises is told `FAIL`
+    by this repo's code, with user attribute `outcome` = `failed`; one with no filled order `FAIL` with
+    `idle`; any other `COMPLETE` with `traded` and skfolio's per-session Sharpe ratio over its session
+-   days (for a later sampler; the gate does not read it), or `FAIL`, still `traded`, if that ratio is
++   days (for a later sampler; the gate does not read it), taken over the series as the gate accepts
++   it, or `FAIL`, still `traded` and with no value, if the gate refuses that series or the ratio is
+    not finite. Such a record ran to the end: no later record resolves it, and ADR 0031 stops the gate.
+ 3. **Entry.** User attributes `config`, `config_key`, `run_config_id`, `backtest_start`, `backtest_end`,
+    `returns_series` (keyed by nanoseconds as text), and `session_days`, this record's addition: the UTC
+@@ -151,3 +152,9 @@ Read 2026-11-10. Fetched means read in this session as raw text or source; run m
+   worktree (run). Opening an empty file raised `StorageInternalError` and left it unchanged (run).
+ * Code review, 2026-11-10 (`/code-review`): term 2 missed a traded run with no finite Sharpe ratio, and
+   the value told used calendar days. Both corrected, with no change of decision.
++* Defect fix, 2026-11-11: the value told was taken from the run's returns on its session days, not from
++  the series the gate accepts, so a run whose series the gate refuses was told `COMPLETE` with a value;
++  term 2 corrected, with no change of decision. Two processes creating one new file at once collided
++  inside `RDBStorage`'s table creation (Optuna 5.0.0, `storages/_rdb/storage.py`, `bundled`); storages
++  are now built under an `fcntl.flock` on the ledger's folder (run: two processes, three rounds). The
++  ignore rule is `/ledger/`, the root's folder only.
+diff --git a/src/canon_trading/backtest.py b/src/canon_trading/backtest.py
+index a5c7031..825f95f 100644
+--- a/src/canon_trading/backtest.py
++++ b/src/canon_trading/backtest.py
+@@ -244,8 +244,11 @@ def run_backtest_config(config: BacktestRunConfig, strategies: Sequence[MaCross]
+     """Run `strategies` under `config`, a config `backtest_run_config` built, and dispose the node.
+ 
+     `canon_trading.ledger` calls this with the config whose key it recorded, so the config hashed is
+-    the config run.
++    the config run. No strategy is refused before a node is built, as `backtest_run_config` refuses
++    it: the node would replay the bars with nothing to trade them and return an empty result.
+     """
++    if not strategies:
++        raise ValueError("run_backtest_config needs at least one strategy")
+     node = BacktestNode([config])
+     try:
+         node.build()
+diff --git a/src/canon_trading/ledger.py b/src/canon_trading/ledger.py
+index 6748ea4..d1d3b48 100644
+--- a/src/canon_trading/ledger.py
++++ b/src/canon_trading/ledger.py
+@@ -20,6 +20,16 @@ goes in SQLAlchemy's URL with `uri=true` (SQLAlchemy 2.1.8, `dialects/sqlite/pys
+ Connections"); SQLAlchemy percent-decodes the database part of a URL (`engine/url.py`, `_parse_url`), so
+ each `%` is encoded once more for it.
+ 
++Building an `RDBStorage` initialises the file it opens, and not atomically: `metadata.create_all` looks
++for each table and then creates it, and `_VersionManager` adds the version row and stamps the alembic
++revision when it finds none (`storages/_rdb/storage.py` at v5.0.0, installed). Two processes doing so at
++once on a new file collide ("table studies already exists"). So each storage is built while holding an
++exclusive `flock` on the folder that holds the file (Python 3.14's `fcntl.flock`, flock(2) on macOS and
++Linux): opening a folder creates nothing, the kernel drops the lock if its process dies, and the lock is
++released as soon as the storage is built. No fd of the SQLite file itself is opened for it, since
++closing one would drop SQLite's own POSIX locks (https://www.sqlite.org/howtocorrupt.html, section
++2.2; not re-read 2026-11-11, UNVERIFIED).
++
+ NautilusTrader v2.0.0rc8 binds no config identity to Python: `BacktestRunConfig.id` defaults to a fresh
+ UUID4 (`crates/backtest/src/config.rs` at the pinned commit) and the config cannot be serialised. So the
+ identity is glue, ADR 0035 term 4: `config_key` is the SHA-256 of the canonical JSON of `trial_config`,
+@@ -27,8 +37,10 @@ built from what this repo sets, and the run is built with it as its `id`. Nothin
+ the data a run read either, so `data_digest` is glue too (ADR 0041).
+ 
+ The value told for a run that traded is skfolio's `Portfolio.sharpe_ratio` (1.12.8,
+-`portfolio/_base.py`) over the run's own series: mean over sample standard deviation, per session. It is
+-there for a later sampler; `canon_trading.ranking` does not read it.
++`portfolio/_base.py`) over the run's series as the gate accepts it, `canon_trading.returns_matrix.
++daily_series`: mean over sample standard deviation, per session. A series the gate refuses has no
++value, and the run is told `FAIL`. The value is there for a later sampler; `canon_trading.ranking`
++does not read it.
+ 
+ A session day (ADR 0035 term 3) is a UTC day on which a bar of the run became available, its `ts_init`,
+ a bar at exactly 00:00 UTC counting for the day ending there, as the daily series books it; read with
+@@ -38,9 +50,11 @@ the run read, over the study's sample. `BacktestResult` has no such list.
+ 
+ from __future__ import annotations
+ 
++import fcntl
+ import hashlib
+ import json
+ import math
++import os
+ import subprocess
+ import traceback
+ from contextlib import ExitStack
+@@ -66,6 +80,9 @@ from .backtest import VENUE_SETTINGS
+ from .backtest import backtest_run_config
+ from .backtest import run_backtest_config
+ from .ma_cross import MaCross
++from .returns_matrix import DAY_NS
++from .returns_matrix import ReturnsRejected
++from .returns_matrix import daily_series
+ 
+ if TYPE_CHECKING:
+     from collections.abc import Generator
+@@ -79,7 +96,6 @@ if TYPE_CHECKING:
+     from .ma_cross import MaCrossConfig
+ 
+ LEDGER_FILE = Path("ledger") / "trials.db"
+-DAY_NS = 86_400 * 1_000_000_000
+ 
+ # The user attribute holding a trial's outcome, and its three values (ADR 0035 term 2).
+ OUTCOME = "outcome"
+@@ -137,10 +153,25 @@ def _sqlite_url(path: Path, mode: str) -> str:
+     return f"sqlite:///file:{quote(str(path), safe='/').replace('%', '%25')}?mode={mode}&uri=true"
+ 
+ 
++@contextmanager
++def _folder_lock(folder: Path) -> Generator[None]:
++    """Hold an exclusive `fcntl.flock` on `folder` for the `with` block (module header)."""
++    fd = os.open(folder, os.O_RDONLY)
++    try:
++        fcntl.flock(fd, fcntl.LOCK_EX)
++        yield
++    finally:
++        os.close(fd)  # closing the only fd of the open file description releases the lock
++
++
+ @contextmanager
+ def _storage(path: Path, mode: str) -> Generator[optuna.storages.RDBStorage]:
+-    """The `RDBStorage` of `path`; on leaving, its session removed and its engine disposed."""
+-    storage = optuna.storages.RDBStorage(_sqlite_url(path, mode), skip_table_creation=mode == "rw")
++    """The `RDBStorage` of `path`, built under the folder's lock; on leaving, its session removed and
++    its engine disposed."""
++    with _folder_lock(path.parent):
++        storage = optuna.storages.RDBStorage(
++            _sqlite_url(path, mode), skip_table_creation=mode == "rw"
++        )
+     try:
+         yield storage
+     finally:
+@@ -416,8 +447,8 @@ def record_trial(
+     returns stays in the study as `RUNNING`. The run is bounded by the study's current sample and built
+     with the key as its `id`. A run that raises, or whose result cannot be recorded, is told `FAIL` with
+     outcome `failed` and its error, and the exception passes through. A run with no filled order is told
+-    `FAIL` with outcome `idle`; any other `COMPLETE` with `traded`, or `FAIL`, still `traded`, if its
+-    Sharpe ratio is not finite. The outcome is written last, so a record that has one ran to the end.
++    `FAIL` with outcome `idle`; any other `COMPLETE` with `traded`, or `FAIL`, still `traded` and with
++    no value, if the gate refuses its series or its Sharpe ratio is not finite. The outcome is written last, so a record that has one ran to the end.
+     Every write after the trial is asked for, the outcome and the `tell` included, is inside the `try`
+     that tells a failure, so an error or `KeyboardInterrupt` there is told `FAIL` with its error. Only
+     a process killed outright, or a store that refuses the very first write, leaves a record with no
+@@ -539,8 +570,16 @@ def _tell_failed(study: optuna.Study, trial: optuna.Trial, error: BaseException)
+ 
+ 
+ def _session_sharpe(returns: dict[str, float], days: Sequence[str]) -> float:
+-    """skfolio's per-session Sharpe ratio over the returns on `days`; NaN if none can be taken."""
+-    values = [returns[day] for day in days if day in returns]
+-    if len(values) < 2 or not all(math.isfinite(value) for value in values):
++    """skfolio's per-session Sharpe ratio over the series the gate accepts; NaN if none can be taken.
++
++    The series is `daily_series`, the one `canon_trading.ranking` builds from this record, and the
++    ratio is taken as the ranking takes it, so the value told is the one the gate would see. A series
++    the gate refuses, or one of fewer than two sessions, gives NaN.
++    """
++    try:
++        series = daily_series("run", returns, list(days))
++    except ReturnsRejected:
++        return math.nan
++    if len(series) < 2:
+         return math.nan
+-    return float(Portfolio(X=[[value] for value in values], weights=[1.0]).sharpe_ratio)
++    return float(Portfolio(X=series.to_frame(), weights=[1.0]).sharpe_ratio)
+diff --git a/src/canon_trading/ranking.py b/src/canon_trading/ranking.py
+index e204521..4860570 100644
+--- a/src/canon_trading/ranking.py
++++ b/src/canon_trading/ranking.py
+@@ -38,6 +38,7 @@ from __future__ import annotations
+ import math
+ from collections import defaultdict
+ from dataclasses import dataclass
++from datetime import UTC
+ from typing import TYPE_CHECKING
+ 
+ from skfolio import Portfolio
+@@ -71,7 +72,11 @@ class RankingStopped(Exception):
+ 
+ @dataclass(frozen=True)
+ class RankingReport:
+-    """What a ranking states (ADR 0010, Confirmation): N, T, V, the DSR and the ledger range read."""
++    """What a ranking states (ADR 0010, Confirmation): N, T, V, the DSR and the ledger range read.
++
++    `first_recorded` and `last_recorded` are the earliest and latest start of a record on the sample,
++    in UTC as ISO 8601 with its offset, so the report reads the same in every time zone.
++    """
+ 
+     study: str
+     sample: str
+@@ -304,7 +309,13 @@ def rank(study: optuna.Study) -> RankingReport:
+         (trial for records in on_sample.values() for trial in records), key=lambda t: t.number
+     )
+     numbers = [trial.number for trial in current]
+-    starts = sorted(trial.datetime_start for trial in current if trial.datetime_start is not None)
++    # Optuna's `RDBStorage` gives a trial's start as naive local time (`TrialModel.datetime_start` in
++    # `storages/_rdb/models.py` at v5.0.0, installed); `astimezone` reads a naive time as local time.
++    starts = sorted(
++        trial.datetime_start.astimezone(UTC)
++        for trial in current
++        if trial.datetime_start is not None
++    )
+     return RankingReport(
+         study=study.study_name,
+         sample=sample.describe(),
+diff --git a/src/canon_trading/returns_matrix.py b/src/canon_trading/returns_matrix.py
+index 4d9a8e8..fc59772 100644
+--- a/src/canon_trading/returns_matrix.py
++++ b/src/canon_trading/returns_matrix.py
+@@ -14,8 +14,11 @@ consecutive UTC midnights; anything else is that fallback or a gap, and is rejec
+ 
+ A closed day is a UTC day on which no bar of the trial's run became available (its `session_days`, ADR
+ 0035 term 3). Nothing can fill or reprice on such a day, so its return must be 0, and one that is not
+-is refused rather than dropped. A return that is not finite is refused too: ADR 0031 requires every
+-return of the pick to be finite, and skfolio's `Portfolio` raises on one.
++is refused rather than dropped. A return that is not finite is refused too, by `daily_series` and again
++by `returns_matrix` for a series built elsewhere: ADR 0031 requires every return of the pick to be
++finite, and skfolio's `Portfolio` raises nothing on one but reads a NaN as 0.0 (`Portfolio.returns` of
++`[0.01, nan, 0.02]` is `[0.01, 0.0, 0.02]` in the installed 1.12.8, run 2026-11-11), a return nobody
++earned.
+ 
+ Which upstream call does what:
+ 
+@@ -41,11 +44,11 @@ import pandas as pd
+ from skfolio import Population
+ from skfolio import Portfolio
+ 
+-from .ledger import DAY_NS
+-
+ if TYPE_CHECKING:
+     from collections.abc import Sequence
+ 
++DAY_NS = 86_400 * 1_000_000_000
++
+ 
+ class ReturnsRejected(ValueError):
+     """Returns that ADR 0010 step 2 or ADR 0041 does not accept; the message names every trial.
+@@ -155,11 +158,26 @@ def returns_matrix(series: Sequence[pd.Series]) -> pd.DataFrame:
+     """Join `series` on their dates through skfolio; refuse them unless every one has every date.
+ 
+     The T rows are the session days of the sample (ADR 0041). Each series that lacks one of them is
+-    named, with how many it lacks and its first and last day, so one stop lists every such trial.
++    named, with how many it lacks and its first and last day, so one stop lists every such trial. A
++    series holding a return that is not finite is refused first, each such series named.
+     """
+     names = [s.name for s in series]
+     if not series or len(set(names)) != len(names):
+         raise ValueError("returns_matrix takes one or more series with distinct names")
++    not_finite = {
++        s.name: next((day, value) for day, value in s.items() if not math.isfinite(float(value)))
++        for s in series
++        if not all(math.isfinite(float(value)) for value in s)
++    }
++    if not_finite:
++        # Refused before skfolio, whose `Portfolio` reads a NaN as 0.0 (module header).
++        raise ReturnsRejected(
++            "\n".join(
++                f"{name}: a return that is not finite, {value} on {day}"
++                for name, (day, value) in not_finite.items()
++            ),
++            names=[str(name) for name in not_finite],
++        )
+     population = Population(
+         [Portfolio(X=s.to_frame(), weights=[1.0], name=str(s.name)) for s in series],
+     )
