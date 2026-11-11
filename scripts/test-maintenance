@@ -335,6 +335,11 @@ BF="$W/maintenance-boundary.json"
 # is, polled for up to 5 s (one that has run its round is ending)
 waiting_waiters() { local p n=0; while read -r p; do ! kill -0 "$p" 2>/dev/null || n=$((n + 1)); done < <(cat "$TMP/waiters" 2>/dev/null); echo "$n"; }
 no_waiter() { local i; for i in $(seq 1 50); do [ "$(waiting_waiters)" = 0 ] && return 0; sleep 0.1; done; return 1; }
+# group_cpu <process group>: the CPU seconds its processes have used, summed (ps(1) time, [[h:]m:]s)
+group_cpu() {
+  local l; l=$(pgrep -d, -g "$1" 2>/dev/null) || { echo 0; return; }
+  ps -o time= -p "$l" | awk '{ n = split($1, a, ":"); s = a[n] + (n > 1 ? a[n-1] * 60 : 0) + (n > 2 ? a[n-2] * 3600 : 0); t += s } END { print t + 0 }'
+}
 # boundary_is <state>: maintenance-boundary.json says it, polled for up to 60 s
 boundary_is() { local i; for i in $(seq 1 120); do jqt "$BF" ".state == \"$1\"" && return 0; sleep 0.5; done; return 1; }
 for l in local.canon.maintenance local.canon.lanes-watch local.canon.paper-session local.canon.otel-collector local.canon.omniroute; do echo running > "$STUB/loaded/$l"; done
@@ -350,6 +355,10 @@ check "... the other agents are installed at once, the paper section left out (i
 check "... the paper checkout deferred to the session boundary, so named in the record" \
       jqt "$MS" '.deferred.what == "the paper checkout" and (.note | test("deferred to the session boundary: the paper checkout"))'
 check "... one waiter waits for the windows' lock" eval 'jqt "$BF" ".state == \"waiting\"" && [ "$(waiting_waiters)" = 1 ]'
+# lockf(1) -t on a descriptor spins a core while it waits (measured: 70-98% CPU), so the waiter polls asleep
+wp=$(tail -n 1 "$TMP/waiters"); c0=$(group_cpu "$wp"); sleep 4; c1=$(group_cpu "$wp")
+check "... and waits asleep: under 1 s of CPU in 4 s ($c0 -> $c1), and no wait on a lock uses lockf's own -t" \
+      eval '[ -n "$wp" ] && kill -0 "$wp" 2>/dev/null && awk -v a="$c0" -v b="$c1" "BEGIN { exit !(b - a < 1) }" && ! grep -Eq "lockf (-[a-z]+ )*-t +[^0 ]" "$ROOT/home/.claude/canon/maintenance.sh"'
 since=$(jq -r '.deferred.since' "$MS")
 printf '%s\n' "$PDIFF" > "$STUB/differs-out"; logs_clear; round
 check "a second round while the window runs: no second waiter, no install, the first deferral's time kept" \
