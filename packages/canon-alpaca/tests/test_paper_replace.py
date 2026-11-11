@@ -13,8 +13,9 @@ a change on Alpaca's side fails it. It uses alpaca-py's `TradingClient` and `Tra
 It places a DAY limit buy of 1 AAPL at $1.00, far below the market, waits for Alpaca's `new`, replaces it
 with $1.01 asking to keep its client order ID, then without one, waits for `replaced`, replaces the old
 order again with $1.02, and cancels what is open. It needs the regular session: an order not yet routed
-(`accepted`) cannot be replaced. It places nothing if the account holds an open AAPL order, and in a
-`finally` cancels every order it opened and sells any share that filled.
+(`accepted`) cannot be replaced. It places nothing if the account holds an open AAPL order or an AAPL
+position, and in a `finally` cancels every open AAPL order and sells any share that filled, read from
+the position.
 """
 
 import os
@@ -24,6 +25,7 @@ import uuid
 from collections.abc import Callable
 from datetime import UTC
 from datetime import datetime
+from decimal import Decimal
 
 import pytest
 from alpaca.common.exceptions import APIError
@@ -149,6 +151,20 @@ def observe(trading: TradingClient, created: list[str], run: int) -> dict:
     return seen
 
 
+def held_shares(trading: TradingClient) -> int:
+    """The shares of `SYMBOL` the account holds, 0 with no position."""
+    try:
+        position = trading.get_open_position(SYMBOL)
+    except APIError as e:
+        if e.status_code == 404:
+            return 0
+        raise
+    qty = Decimal(str(position["qty"] if isinstance(position, dict) else position.qty))
+    if qty < 0 or qty != qty.to_integral_value():
+        raise AssertionError(f"{SYMBOL} position of {qty} is not one this test's buys can leave")
+    return int(qty)
+
+
 def cancel_open(trading: TradingClient, ids: list[str]) -> None:
     for order_id in ids:
         if status(trading, order_id) in OPEN_STATUSES:
@@ -175,6 +191,8 @@ def test_paper_replace_answers_as_observed() -> None:
         pytest.skip("the regular session is closed; Alpaca replaces only an order it has routed")
     held = trading.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[SYMBOL]))
     assert held == [], f"the paper account already holds {len(held)} open {SYMBOL} order(s)"
+    # Flat at the start, so a position at the end is this test's own and is the one closed.
+    assert held_shares(trading) == 0, f"the paper account already holds {SYMBOL}; placing nothing"
 
     recorder = Recorder()
     stream = TradingStream(api_key=api_key, secret_key=secret_key, paper=True, raw_data=True)
@@ -184,6 +202,7 @@ def test_paper_replace_answers_as_observed() -> None:
     created: list[str] = []
     runs: list[dict] = []
     filled = 0
+    cleanup_errors: list[BaseException] = []
     try:
         # alpaca-py sets `_running` once it has connected, authenticated and sent `listen`; Alpaca's
         # `listening` acknowledgement is not passed on, so a short margin follows.
@@ -194,26 +213,42 @@ def test_paper_replace_answers_as_observed() -> None:
     finally:
         try:
             cancel_open(trading, created)
+            # Then every other open order in the symbol: the account held none at the start, and a
+            # replace whose answer was lost leaves its replacement untracked.
+            listed = trading.get_orders(
+                GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[SYMBOL])
+            )
+            untracked = [
+                str(order["id"] if isinstance(order, dict) else order.id)
+                for order in (listed if isinstance(listed, list) else [])
+                if str(order["id"] if isinstance(order, dict) else order.id) not in created
+            ]
+            created.extend(untracked)
+            cancel_open(trading, untracked)
         finally:
             time.sleep(3)  # updates still on their way
             stream.stop()
             thread.join(15)
             updates = recorder.for_orders(set(created))
-            filled = sum(
-                int(float(u["data"].get("qty") or 0))
-                for u in updates
-                if u.get("data", {}).get("event") in ("fill", "partial_fill")
-            )
-            if filled:
-                trading.submit_order(
-                    MarketOrderRequest(
-                        symbol=SYMBOL,
-                        qty=filled,
-                        side=OrderSide.SELL,
-                        time_in_force=TimeInForce.DAY,
+            # What filled is read from the position Alpaca holds, not from the updates the stream
+            # delivered, which can miss one; the account was flat at the start and the test only buys.
+            try:
+                filled = held_shares(trading)
+                if filled > 0:
+                    trading.submit_order(
+                        MarketOrderRequest(
+                            symbol=SYMBOL,
+                            qty=filled,
+                            side=OrderSide.SELL,
+                            time_in_force=TimeInForce.DAY,
+                        )
                     )
-                )
+                    wait_for(lambda: held_shares(trading) == 0, f"the {SYMBOL} position to close")
+            except (APIError, AssertionError) as e:
+                # Not raised from here, where it would hide the test's own failure; reported below.
+                cleanup_errors.append(e)
 
+    assert cleanup_errors == [], cleanup_errors
     assert all(status(trading, order_id) not in OPEN_STATUSES for order_id in created)
     assert filled == 0, f"{filled} share(s) filled and were sold back"
     assert len(runs) == RUNS

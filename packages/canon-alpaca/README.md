@@ -376,8 +376,10 @@ Each is stated in `execution.py`'s header, with its source.
   error, with backoff, logging only through Python `logging`, and updates sent while it was down are not
   replayed; none of upstream's adapters at the pin catches up on a reconnect either. So a default node
   re-checks only orders in flight (the in-flight check, through `QueryOrder`); an accepted order whose
-  update was lost is re-checked only with the open-order check on (`open_check_interval_secs`; the paper
-  node sets 10 s), else at the next start. Updates for orders the node does not hold are logged and
+  update was lost is re-checked only with the open-order check on, else at the next start. A node that
+  holds orders for long enough to lose an update sets `LiveExecutionEngineConfig(open_check_interval_secs=...)`
+  within upstream's recommended "5-10s" (how_to/configure_live_trading), as the paper node does at 10 s
+  (`src/canon_trading/paper_node.py`); it costs one open-orders read per interval. Updates for orders the node does not hold are logged and
   dropped, and one alpaca-py hands over unparsed is logged as an error. Events this slice does not map
   (`done_for_day`, `stopped`, `suspended` and the rest) are logged as warnings. If alpaca-py's `run()`
   returns, the client logs an error and does not start the stream again, and shutdown waits `STREAM_JOIN_TIMEOUT_SECS` for the stream thread and, at the same time,
@@ -475,10 +477,12 @@ tasks"): with none, a queued unsubscribe was discarded and logged as an error on
 | TC-E85 reconcile filled orders | Passed twice (`test_paper_fill_reports.py`, after fill reports were added, 14:53 and 15:43): a market buy of 2 filled outside the node is reconciled `FILLED`, one fill per trade update, each with that update's `execution_id` and price, once Alpaca lists every fill. A first run, started before Alpaca listed the second fill, failed (see "Fill activities can lag the stream"); another hung after the node failed to disconnect its execution client, cause UNVERIFIED. The engine's log also says "Generated inferred fill" for orders it was given fill reports for; which path that line names is UNVERIFIED |
 | TC-E84 reconcile open orders | Passed (`test_paper_execution.py`, 2026-11-10, after hours): a $1.00 buy placed with alpaca-py, as a prior session leaves it, is loaded at start-up with its venue order ID, `ACCEPTED`, price, quantity, side and type, as an `EXTERNAL` order |
 | TC-E44 cancel already-canceled | Venue side only, through alpaca-py (`test_paper_execution.py`, 2026-11-10, after hours, twice): the second cancel is answered 204 and the order still reads `canceled`, the idempotent result the card allows. The client's 422 path for it runs offline only |
-| TC-E02, E32, E33, E86, E87 | Not run: a short, cancel-replace, and reconciliation of a prior session's positions |
+| TC-E02, E86, E87 | Not run: a market sell (a short from flat), and reconciliation of a prior session's positions |
 | TC-E20, TC-E22 stop and stop-limit buy | Passed in `test_paper_execution.py` (ADR 0036): accepted at the prices sent, as Alpaca holds them, reported back the same, canceled on stop |
 | TC-E30 modify limit buy | Ends `OrderModifyRejected` before Alpaca, as designed: the tester's one-tick amend is sub-penny at the 0.0001 increment (`test_paper_execution.py`, ADR 0042); a modify by a cent through a node passes there |
-| TC-E21, E23, E31, E33 to E35 | Not run: sells (a short from flat), cancel-replace, and a stop's trigger modified (offline only) |
+| TC-E21, E23, E31, E33 | Not run: sells, each a short from flat (E33 is also a cancel-replace) |
+| TC-E32, E35 | Not run: cancel-replace, which needs no hook beyond cancel and submit (ADR 0042) |
+| TC-E34 modify stop trigger | Offline only (`test_stop_trigger_is_modified`, ADR 0042) |
 | TC-E03 to E05, E13 to E18, E24 to E27, E36, E43, E50 to E53, E60 to E63, E70, E71 | Not in this slice, or do not apply: IOC, FOK, quote quantity, GTD, if-touched orders, an adapter without modify, batch cancel, brackets, order flags |
 | TC-E74 to E78 | Ambiguous submit and cancel failures run offline only (`test_execution_client.py`); a modify with no definitive answer is logged and left to the stream or reconciliation, not tested; batch does not apply |
 | TC-E88, E89, TC-E90 to E101 | Do not apply: Alpaca reports no commission, and options are not supported |
