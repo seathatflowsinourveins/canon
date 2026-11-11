@@ -449,5 +449,37 @@ nocomment=$(cat "$ROOT/.claude/hooks/session-brief.sh" "$ROOT/.claude/hooks/comp
 # shellcheck disable=SC2016 # the pattern is a grep regex, not a shell expansion
 check "no hook substitutes a command that names orca" test "$(grep -cE '(\$\(|`)[^)`]*orca' <<<"$nocomment")" = "0"
 
+# --- .githooks/pre-commit refuses a commit in the primary checkout, which the maintenance agent keeps on main ---
+# The primary worktree is the one whose git dir is the common dir (git-worktree(1)); a linked worktree's is not.
+# Scratch repository with a stub scripts/ci, so only the guard is under test. A fast-forward is not a commit, so
+# the maintenance agent's `git merge --ff-only` runs no pre-commit hook.
+# Hermetic: a hook's environment carries GIT_INDEX_FILE and the like, which would point these commands at the
+# real repository, and global config (signing, templates) is none of this test's business.
+unset GIT_INDEX_FILE GIT_DIR GIT_WORK_TREE
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+G=$(mktemp -d "${TMPDIR:-/tmp}/test-hooks.XXXXXX")
+trap 'rm -rf "${G:?}"' EXIT
+gq() { git -C "$G/main" -c user.name=t -c user.email=t@example.invalid "$@"; }
+git init -q -b main "$G/main"
+mkdir -p "$G/main/.githooks" "$G/main/scripts"
+cp "$ROOT/.githooks/pre-commit" "$G/main/.githooks/pre-commit"
+printf '#!/bin/bash\nexit 0\n' > "$G/main/scripts/ci"
+chmod +x "$G/main/.githooks/pre-commit" "$G/main/scripts/ci"
+git -C "$G/main" config core.hooksPath .githooks
+git -C "$G/main" add -A
+gq commit -q --no-verify -m seed
+git -C "$G/main" branch work
+git -C "$G/main" worktree add -q "$G/linked" work
+: > "$G/main/a"; git -C "$G/main" add a
+out=$(gq commit -q -m "in primary" 2>&1); rc=$?
+check "a commit in the primary checkout is refused"        test "$rc" -ne 0
+check "the refusal tells the committer to use a worktree"  grep -qi "work in a worktree" <<<"$out"
+check "the refusal is one line of its own"                 test "$(grep -c "^pre-commit:" <<<"$out")" = "1"
+git -C "$G/main" reset -q
+: > "$G/linked/b"; git -C "$G/linked" add b
+out=$(git -C "$G/linked" -c user.name=t -c user.email=t@example.invalid commit -q -m "in linked" 2>&1); rc=$?
+check "a commit in a linked worktree passes"               test "$rc" -eq 0
+check "a fast-forward in the primary checkout is no commit" git -C "$G/main" merge -q --ff-only work
+
 echo "test-hooks: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
