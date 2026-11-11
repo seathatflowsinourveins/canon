@@ -33,7 +33,7 @@ flowchart LR
   catalog[("catalog/: ParquetDataCatalog")]
   ledger[("main checkout's ledger/trials.db: Optuna study")]
 
-  rest -- assets, bars --> prov & dc
+  rest -- assets, bars, quotes --> prov & dc
   streams -- quotes, trades --> dc
   streams -- trade updates, fills --> ec
   ec -- submit, replace, cancel; account, order and position reads --> rest
@@ -42,7 +42,7 @@ flowchart LR
   strat -- orders --> re --> ee --> ec
   ec -- order events, fills --> ee --> cache --> pf
   de -- bars, quotes --> strat
-  dc -- bars by write-back --> catalog
+  dc -- bars, quotes by write-back --> catalog
   catalog -- bars, instruments --> bt --> node
   led -- runs --> bt
   pn -. configures .-> node
@@ -93,7 +93,8 @@ daily bars (ADR 0048).
    execution engine's open-order and position checks on (`session_window.py`, ADR 0044).
 2. On connect the provider loads `Equity` instruments from `/v2/assets`; the data client streams quotes
    and trades, on the feed the first subscription's params name and IEX when they name none, and serves
-   historical bars into the data engine (package README, ADR 0055).
+   historical bars, and IEX quotes, into the data engine, which can write them back into the catalog
+   (package README, ADR 0040, ADR 0055, ADR 0066).
 3. A strategy's order passes the risk engine, then the execution engine sends it to Alpaca's paper API
    with `paper=True`; denied types never reach Alpaca (package README, ADR 0036).
 4. Alpaca's trade updates stream becomes order events; each `fill` or `partial_fill` is an `OrderFilled`

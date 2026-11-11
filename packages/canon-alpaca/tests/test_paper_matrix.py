@@ -328,6 +328,39 @@ def test_paper_data_tester_quotes_trades_and_bars() -> None:
     assert len(set(ts)) == len(ts), "TC-D41: duplicate bar timestamps"
 
 
+def test_paper_data_tester_historical_quotes() -> None:
+    """TC-D21 (request historical quotes). The tester asks for the hour before now, with no end and no
+    limit (`crates/testkit/src/testers/data/actor.rs` at the pin, "default to last 1 hour"), which on IEX
+    can be hundreds of thousands of quotes, all fetched before the one response (ADR 0066), so it runs on
+    its own node, for 240 s; the hour before the open holds no regular-session quote, so run it once the
+    session has been open a while. The window needs the regular session's quotes."""
+    require_session(trading_client())
+    node = build_node("CANON-ALPACA-PAPER-DATA-TESTER-QUOTES", execution=False)
+    node.add_builtin_actor(
+        "DataTester",
+        DataTesterConfig(client_id=ALPACA, instrument_ids=[AAPL], request_quotes=True),
+    )
+    cache = node.cache
+    began = time.time_ns()
+    try:
+        run_for(node, 240)
+        quotes = cache.quotes(AAPL) or []  # the latest the cache holds, up to its tick capacity
+    finally:
+        node.dispose()
+    print(f"data tester: {len(quotes)} historical quotes in the cache")
+
+    assert quotes, "TC-D21: no historical QuoteTick for the hour before the run"
+    hour_ns = 3_600_000_000_000
+    # A historical quote is stamped once: `ts_init` is its `ts_event` (`canon_alpaca.data`).
+    assert all(q.ts_init == q.ts_event for q in quotes), "TC-D21: a quote not stamped by Alpaca"
+    assert all(began - 2 * hour_ns <= q.ts_event <= time.time_ns() for q in quotes)
+    assert all(q.bid_price.as_double() > 0 and q.ask_price.as_double() > 0 for q in quotes)
+    # TC-D21's "valid ... sizes": none negative, and at least one quote with both sides sized, as TC-D20
+    # asks of a live quote; one side may be sized zero while priced (the client drops only an unpriced side).
+    assert all(q.bid_size.as_double() >= 0 and q.ask_size.as_double() >= 0 for q in quotes)
+    assert any(q.bid_size.as_double() > 0 and q.ask_size.as_double() > 0 for q in quotes)
+
+
 def test_paper_exec_tester_market_and_limit_buy() -> None:
     """TC-E01 (market buy fills, position long), TC-E10 (GTC limit buy accepted), TC-E41 and TC-E81
     (canceled on stop by cancel-all), TC-E06 and TC-E82 (position closed with a market sell on stop)."""

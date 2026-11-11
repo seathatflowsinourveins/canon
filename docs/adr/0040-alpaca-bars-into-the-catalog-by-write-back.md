@@ -103,6 +103,11 @@ these bars); a second load over part of the range returned the same `CatalogBars
 Since ADR 0055 (2026-11-10) a bars request may name its feed in params; `load_bars` sends only
 `update_catalog`, which the data client leaves alone, so the loaded bars are still IEX.
 
+Since 2026-11-11 the data client answers quote requests by the same path, IEX only (ADR 0066). What
+write-back does with quotes, with an empty response and with a process killed while it writes is in
+ADR 0066's Confirmation: as here, an empty response records nothing; a data file is staged as
+`<name>#<n>` and renamed into place, so no partial file is read.
+
 ## Evidence
 
 Read 2026-11-10. Upstream's docs are the `latest` pages of https://nautilustrader.io/docs/llms.txt, which

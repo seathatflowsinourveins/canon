@@ -5,6 +5,9 @@ alpaca-py's own models, so the adapter's conversions are tested against what alp
 
 * asset: "Get Assets", schema example (https://docs.alpaca.markets/us/reference/get-v2-assets-1.md)
 * bar: "Historical bars", response example (https://docs.alpaca.markets/us/reference/stockbars.md)
+* historical quote: "Historical quotes", the `stock_quote` schema example
+  (https://docs.alpaca.markets/us/reference/stockquotes-1.md), read 2026-11-11, given as raw JSON, which
+  the stand-in parses with alpaca-py's `QuoteSet`, as `get_stock_quotes` does
 * trade and quote: "Real-time Stock Data", schema examples
   (https://docs.alpaca.markets/us/docs/real-time-stock-pricing-data.md). The stream sends `t` as a msgpack
   timestamp, and alpaca-py's `DataStream._cast` converts it with `Timestamp.to_datetime()`, a UTC
@@ -63,10 +66,12 @@ from alpaca.common.exceptions import APIError
 from alpaca.data.live.stock import StockDataStream
 from alpaca.data.models import BarSet
 from alpaca.data.models import Quote
+from alpaca.data.models import QuoteSet
 from alpaca.data.models import Trade
 from alpaca.data.models import TradeCancel
 from alpaca.data.models import TradeCorrection
 from alpaca.data.requests import StockBarsRequest
+from alpaca.data.requests import StockQuotesRequest
 from alpaca.trading.models import Asset
 from alpaca.trading.models import Order
 from alpaca.trading.models import Position
@@ -131,6 +136,19 @@ QUOTE_AAPL = {
     # The docs' "2021-02-22T15:51:45.335689322Z", as to_datetime() gives it: the last 322 ns are dropped.
     "t": datetime(2021, 2, 22, 15, 51, 45, 335_689, tzinfo=UTC),
     "c": ["R"],
+    "z": "C",
+}
+
+
+HISTORICAL_QUOTE_AAPL = {
+    "ap": 387.7,
+    "as": 1,
+    "ax": "C",
+    "bp": 387.67,
+    "bs": 1,
+    "bx": "N",
+    "c": ["R"],
+    "t": "2021-02-06T13:35:08.946977536Z",
     "z": "C",
 }
 
@@ -356,6 +374,14 @@ def trade_correction() -> TradeCorrection:
 def bars_opening(*opens: datetime) -> list[dict]:
     """Copies of the docs' bar, one opening at each UTC time given."""
     return [{**BAR_AAPL, "t": t.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")} for t in opens]
+
+
+def quotes_at(*times: datetime) -> list[dict]:
+    """Copies of the reference's historical quote, one stamped at each UTC time given, to the microsecond."""
+    return [
+        {**HISTORICAL_QUOTE_AAPL, "t": t.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")}
+        for t in times
+    ]
 
 
 def hourly_bars(first_open: datetime, count: int) -> list[dict]:
@@ -740,19 +766,27 @@ class FakeTradeStream:
 
 
 class FakeHistoricalClient:
-    """Stands in for `StockHistoricalDataClient.get_stock_bars`.
+    """Stands in for `StockHistoricalDataClient.get_stock_bars` and `get_stock_quotes`.
 
     It answers the way Alpaca's bars endpoint documents (https://docs.alpaca.markets/us/reference/stockbars.md):
     the bars whose timestamp, the open, lies in the inclusive `[start, end]`, in ascending time, at most
-    `limit` of them. alpaca-py has already made `start` and `end` naive UTC. With `gate` set, each call
-    sets `entered` and then waits for `gate`.
+    `limit` of them. Quotes are answered the same way, as the quotes reference documents its inclusive
+    `start` and `end` (https://docs.alpaca.markets/us/reference/stockquotes-1.md), from `quotes`, raw JSON
+    parsed with alpaca-py's `QuoteSet`. alpaca-py has already made `start` and `end` naive UTC. With `gate`
+    set, each call sets `entered` and then waits for `gate`.
     """
 
-    def __init__(self, bars: list[dict] | None = None, error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        bars: list[dict] | None = None,
+        error: Exception | None = None,
+        quotes: list[dict] | None = None,
+    ) -> None:
         self._session = requests.Session()  # where alpaca-py's RESTClient keeps it (ADR 0039)
         self.bars = bars if bars is not None else [BAR_AAPL]
+        self.quotes = quotes if quotes is not None else []
         self.error = error
-        self.requests: list[StockBarsRequest] = []
+        self.requests: list[StockBarsRequest | StockQuotesRequest] = []
         self.gate: threading.Event | None = None
         self.entered = threading.Event()
         self.max_active = 0  # the most calls that were inside `get_stock_bars` at once
@@ -769,15 +803,32 @@ class FakeHistoricalClient:
             with self._count_lock:
                 self._active -= 1
 
+    def get_stock_quotes(self, request_params: StockQuotesRequest) -> QuoteSet:
+        with self._count_lock:
+            self._active += 1
+            self.max_active = max(self.max_active, self._active)
+        try:
+            symbol = request_params.symbol_or_symbols
+            assert isinstance(symbol, str)
+            return QuoteSet({symbol: self._select(request_params, self.quotes)})
+        finally:
+            with self._count_lock:
+                self._active -= 1
+
     def _answer(self, request_params: StockBarsRequest) -> BarSet:
+        symbol = request_params.symbol_or_symbols
+        assert isinstance(symbol, str)
+        return BarSet({symbol: self._select(request_params, self.bars)})
+
+    def _select(
+        self, request_params: StockBarsRequest | StockQuotesRequest, records: list[dict]
+    ) -> list[dict]:
         self.requests.append(request_params)
         if self.gate is not None:
             self.entered.set()
             assert self.gate.wait(10), "gate never opened"
         if self.error is not None:
             raise self.error
-        symbol = request_params.symbol_or_symbols
-        assert isinstance(symbol, str)
         start, end, limit = request_params.start, request_params.end, request_params.limit
         assert start is None or start.tzinfo is None
         assert end is None or end.tzinfo is None
@@ -793,11 +844,11 @@ class FakeHistoricalClient:
             # The reference does not say what Alpaca answers; refusing makes an inverted window visible.
             raise api_error(422, 42210000, "start is after end (stand-in)")
         selected = []
-        for raw in sorted(self.bars, key=lambda b: b["t"]):
-            opened = datetime.fromisoformat(raw["t"]).replace(tzinfo=None)
-            if start <= opened <= end:
+        for raw in sorted(records, key=lambda b: b["t"]):
+            stamped = datetime.fromisoformat(raw["t"]).replace(tzinfo=None)
+            if start <= stamped <= end:
                 selected.append(raw)
-        return BarSet({symbol: selected[:limit] if limit else selected})
+        return selected[:limit] if limit else selected
 
 
 class FakeStream:
@@ -1148,6 +1199,8 @@ def alpaca() -> SimpleNamespace:
         trade_cancel=trade_cancel,
         trade_correction=trade_correction,
         hourly_bars=hourly_bars,
+        quotes_at=quotes_at,
+        HISTORICAL_QUOTE_AAPL=HISTORICAL_QUOTE_AAPL,
         bars_opening=bars_opening,
         ORDER_AAPL=ORDER_AAPL,
         POSITION_AAPL=POSITION_AAPL,
