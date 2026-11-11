@@ -39,20 +39,34 @@ repository (UNVERIFIED here).
 
 1. **Request.** `mise run paper:history <account>` runs `canon_trading.history_load`. For each bar type
    (1-MINUTE- and 1-DAY-LAST-EXTERNAL), the symbols the root lacks over `[start, end]` go in requests of
-   at most 200 symbols, and of at most `MAX_ROWS_PER_CALL` (100,000) bars, counting every bar the
-   symbols could have in the window, one an interval of wall-clock time. A window longer than that for
-   one symbol is cut into segments, each written over its own bounds. The request is `StockBarsRequest(symbol_or_symbols=…, timeframe, start, end,
+   at most 200 symbols, planned for at most `MAX_ROWS_PER_CALL` (100,000) bars. The count allows one bar
+   per minute, or per 23 hours for daily bars: New York daily opens can be only 23 hours apart at
+   spring DST, although `parse_bar` adds a fixed 24 hours to each open. It also counts a boundary row
+   returned again when alpaca-py truncates a gap's nanoseconds to microseconds. A window longer than
+   the bound for one symbol is cut into segments, each written over its own bounds. The returned row
+   count, including rows outside the gap, is checked before parsing or writing: an overfull response
+   stops by name, and none of that response is written. The request is `StockBarsRequest(symbol_or_symbols=…, timeframe, start, end,
    feed=sip)`, with no limit and no adjustment, so Alpaca's default `raw` applies, as for `load_bars`.
    alpaca-py follows `next_page_token` through every page of 10,000 rows.
 2. **Window and parsing.** Both are the adapter's: `alpaca_bars_window`, `parse_bar` and `bar_timeframe`.
    A bar written here is the bar `load_bars` writes. `ts_init` is the bar's close, and `[start, end]`
-   bounds it. An end less than one bar interval, or 15 minutes, before now is refused, by `load_bars`'
-   rule; `--bars 1-MINUTE` serves a more recent end.
+   bounds it. As the engine does, this path filters parsed bars to the inclusive missing interval
+   before writing; the catalog file's bounds alone do not filter its contents. `bar_roundings` names
+   price rounding with one line per symbol and response, giving the rounded-bar count, price precision,
+   half-to-even rule and first example. An end less than one bar interval, or 15 minutes, before now is
+   refused, by `load_bars`' rule; `--bars 1-MINUTE` serves a more recent end.
 3. **Writes.** `write_bars(bars, start, end)` runs per bar type over the bounds asked for, as the node's
    write-back gives them. What the root covers (`get_missing_intervals_for_request`) is not asked for
    again. Symbols with the same gap share a request. The root keeps one feed through `bars_to_catalog`'s
    `alpaca-feed` file, and a root holding another feed is refused. The root is an argument, defaulting
-   to `catalog/`, and anything under `ledger/` is refused.
+   to `catalog/`, and anything under `ledger/` is refused. A nonblocking exclusive `fcntl.flock` on
+   `.history-load.lock` in the root is held from the coverage read through the last write; another
+   history loader using that root stops by name before requesting data. The marker is rechecked before
+   every write and created with exclusive `open(..., "x")`, so a competing marker is never overwritten.
+   This is a catalog lock, independent of account and stream locks. It coordinates history loaders;
+   `load_bars` and quote write-back do not take it and must run separately or use other roots. A marker
+   changed during a request is refused before writing, but an uncooperative writer changing it after
+   that check remains outside this guarantee.
 4. **Instruments.** Each bar is parsed against its `Equity` (price precision), read from the catalog
    root. The definitions are meant to come from an asset list load: one trading GET for the whole list
    (`get_all_assets`, then `parse_equity`, then `write_instruments`). This task sends none. That load is
@@ -66,8 +80,11 @@ repository (UNVERIFIED here).
    adapter's request counter (`canon_alpaca.providers.request_counts`) gives the GETs it sent to each
    API. The next request starts no sooner than its data GETs allow at the row's data rate. The trading
    column is a guard: a request that sent any trading GET stops the run. Inside one request, alpaca-py
-   sends its pages back to back, at most ten by `MAX_ROWS_PER_CALL`, so the rate holds across requests,
-   not inside one.
+   sends its pages back to back. `MAX_ROWS_PER_CALL` plans for ten full pages; this is not a page or GET
+   ceiling, because Alpaca can return short pages and alpaca-py retries 504s. The rate holds across
+   requests, not inside one. Each process paces itself; simultaneous loads into different roots using
+   one account do not share a rate limiter. Their combined rate is UNCALIBRATED, and a 429 stops each
+   affected run by name.
 
    | Task | Data API GETs a minute | Trading API GETs a minute | State |
    |---|---|---|---|
@@ -91,7 +108,9 @@ repository (UNVERIFIED here).
    error. The counter's 429 count is checked after each request as well.
 7. **Failures.** A refused request, a 403 on `sip` included, stops the run by name, with the HTTP
    status. Nothing falls back to another feed. Whatever an earlier request wrote stays, and a rerun asks
-   only for what is missing.
+   only for what is missing. Transport, parsing and catalog-write errors are also raised as
+   `HistoryStopped`, with the operation, symbol or bar type and the original cause; the CLI reports
+   them and exits 1. A 429 retains its distinct exit 4.
 8. **Pairs.** The lead decided on 2026-11-11 that `paper:history <account>` takes either account's pair,
    `tests` (A) or `windows` (B). It reads market data and nothing of the account. ADR 0069's rule on who
    reads B's pair governs who trades and streams on B, and a GET-only history load does neither. The
@@ -110,8 +129,9 @@ repository (UNVERIFIED here).
   tests check that the bars and the coverage match.
 * Bad:
   * The pace is not calibrated.
-  * alpaca-py gathers every page of a request in memory before it returns: up to
-    `MAX_ROWS_PER_CALL`, 100,000 bars.
+  * alpaca-py gathers every page of a request in memory before it returns. The planned bound is
+    `MAX_ROWS_PER_CALL`, 100,000 bars, checked after the response: a venue that breaks the requested
+    window or the assumed spacing can exceed this memory estimate before the run stops.
   * Counting every interval of wall-clock time overstates a minute window's bars by the hours with
     no trade, so a request carries fewer symbols than the pages could hold.
   * The most symbols Alpaca accepts in one request is not stated (UNVERIFIED).
@@ -126,18 +146,39 @@ adapter and counter, with requests' transport answered by a stand-in of the bars
 * many symbols in one request on `sip`, with no trading host reached;
 * every page followed, and the next request waiting for the GETs the last one sent;
 * the symbols batched, and a long window cut into segments, by `MAX_ROWS_PER_CALL`;
+* overlapping extensions storing each bar once, within the missing interval;
+* daily opens across spring DST, and a truncated gap boundary, staying within the planned row bound;
+* an overfull response refused before any of its bars are written;
+* a competing history loader refused while a request is in flight, and a changed feed refused before
+  writing;
+* parse, write and transport failures named as `HistoryStopped`, and the CLI reporting a parse failure;
+* rounded SIP prices named with the count and first example;
 * a 429 stopping the run with one request sent, where alpaca-py would have sent four;
 * a 403 stopping it by name with no `iex` request;
 * a covered range asked for nothing;
 * a symbol with no definition, and a root holding `iex`, refused before any request;
 * the arguments refusing an open-ended or unplaced range;
 * `PACE` equal to this record's row;
-* the task reading one named pair, with no lock, in data-only mode.
+* the task reading one named pair, with no account or stream lock, in data-only mode.
 
 `tests/test_bars_to_catalog.py` shows a root holding only definitions taking a `sip` load. A paper run
 of the task against Alpaca is not part of this change (UNVERIFIED until one runs).
 
+Muse's independent review of `ea705a6` identified the overlap, row-bound, feed-race, unnamed-error and
+silent-rounding defects. Each fix above has a regression that failed before the fix in
+`tests/test_history_load.py`; the review's feed-marker interleaving is reproduced with the stand-in.
+Concurrency with legacy writers that do not take the catalog lock is a recorded limit, not a verified
+shared-lock guarantee.
+
 ## Evidence
+
+Fix-forward source check, 2026-11-11, without network access: cached alpaca-py `c42add7c0a70`
+`get_stock_bars` and `_get_marketdata` (page following, including short pages); NautilusTrader
+`d53849b216e2` catalog bindings and engine filtering; the adapter's `alpaca_bars_window`, `parse_bar`
+and `bar_roundings`; and Python `b703b2c5e704` (`Doc/library/fcntl.rst`, `contextlib.rst`,
+`Doc/builtins/functions.rst`) for advisory locking and exclusive file creation. The fake venue exercises
+New York midnights on both sides of spring DST; the venue's live daily-open convention remains
+UNVERIFIED as the adapter's header states.
 
 Read 2026-11-11. Fetched means read in this session; source means read at the pin in the upstream
 source cache.

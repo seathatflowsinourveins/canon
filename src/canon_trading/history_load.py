@@ -2,7 +2,8 @@
 
 `mise run paper:history <account>` runs this module with one paper account's pair in data-only mode
 (ADR 0070): it sends market data GETs and nothing else, and takes neither the account's lock nor a
-stream lock, since it places nothing and opens no stream.
+stream lock, since it places nothing and opens no stream. A separate catalog lock excludes another
+history load into the same root, from the coverage read through the last write.
 
 Contracts:
 
@@ -12,8 +13,10 @@ Contracts:
   Alpaca's bars reference: the limit "applies to the total number of data points, not per symbol", and
   the feed is named (`sip`) on every request (https://docs.alpaca.markets/us/reference/stockbars.md).
 * The adapter's own window and parsing (`canon_alpaca.data.alpaca_bars_window`, `parse_bar`,
-  `bar_timeframe`), so a bar written here is the bar `canon_trading.bars_to_catalog.load_bars` would
-  write: `ts_init` is the bar's close, and `[start, end]` bounds `ts_init`.
+  `bar_timeframe`), followed by the engine's inclusive `ts_init` filter, so a bar written here is the
+  bar `canon_trading.bars_to_catalog.load_bars` would write. A gap starts one nanosecond after coverage;
+  alpaca-py's datetime truncation can return the boundary bar again, so the filter matters.
+  `bar_roundings` names rounded SIP prices with a count and the first example, as the adapter does.
 * NautilusTrader v2.0.0rc8 `ParquetDataCatalog.write_bars(data, start, end)`, the bounds overriding the
   file's interval as the node's catalog write-back gives them, and `get_missing_intervals_for_request`
   (https://nautilustrader.io/docs/md/latest/concepts/data/catalog.md, "Reading data"): what a root
@@ -24,13 +27,19 @@ Contracts:
   `retry_attempts` of 0 keeps the default (`RESTClient.__init__` overrides only a value above 0). The
   adapter's execution client ends an order command the same way (`canon_alpaca.execution`,
   `end_at_first_error`).
+* Python 3.14 `fcntl.flock(LOCK_EX | LOCK_NB)` and `open(..., "x")`: an advisory catalog lock and
+  exclusive feed-marker creation. The feed is checked again before each write. Legacy writers
+  (`load_bars` and quote write-back) do not take this lock: use separate roots or run them separately.
 
 The pace: `PACE`, the row of ADR 0093's table. After each call the adapter's request counter
 (`canon_alpaca.providers.request_counts`) gives the data and trading GETs the call sent; the next call
 starts no sooner than the data GETs allow at `PACE.data_per_minute`. A call that sent any trading
 request stops the run, since `PACE.trading_per_minute` is 0: this module needs no trading GET, as the
 instruments come from the catalog. Within one call alpaca-py sends its pages back to back, so the
-ceiling holds across calls, not inside one; `MAX_ROWS_PER_CALL` bounds a call's pages to ten.
+ceiling holds across calls, not inside one. `MAX_ROWS_PER_CALL` bounds planned rows, and an overfull
+response stops before any of it is written. Ten full pages is an estimate, not a page ceiling: Alpaca
+may return short pages and alpaca-py retries 504s. Each process paces itself; separate roots can share
+an account's budget, so their combined rate is UNCALIBRATED and a 429 still stops each run by name.
 
 Instruments: a bar is parsed against its `Equity` (price precision), read from the catalog root. The
 definitions are written there by the asset list load, one trading GET for the whole list (ADR 0093). A
@@ -46,11 +55,14 @@ Trades: `--data trades` is refused until the adapter's `_request_trades` exists 
 from __future__ import annotations
 
 import argparse
+import fcntl
 import sys
 import time
 from collections.abc import Callable
+from collections.abc import Generator
 from collections.abc import Iterator
 from collections.abc import Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC
 from datetime import datetime
@@ -68,6 +80,7 @@ from alpaca.data.requests import StockBarsRequest
 from canon_alpaca.constants import VENUE
 from canon_alpaca.data import alpaca_bars_window
 from canon_alpaca.data import bar_interval_ns
+from canon_alpaca.data import bar_roundings
 from canon_alpaca.data import bar_timeframe
 from canon_alpaca.data import parse_bar
 from canon_alpaca.providers import DATA_API
@@ -117,10 +130,12 @@ PAGE_ROWS = 10_000
 page."""
 
 MAX_ROWS_PER_CALL = 10 * PAGE_ROWS
-"""The most bars one request may hold, counted as every bar its symbols could have in its window (one an
-interval, wall clock, so an hour with no trade counts too): at most ten pages, sent back to back by
-alpaca-py. Symbols are batched by that count, and a window longer than the bound for one symbol is cut
-into segments (ADR 0093)."""
+"""The planned row bound, checked again on the whole response before writing. Count every possible
+minute, or 23 hours between daily opens to allow for New York's spring DST, including a boundary row
+returned by datetime truncation. Symbols are batched by that count and long windows segmented.
+Ten full pages is an estimate: short pages or retries can send more GETs (ADR 0093). alpaca-py gathers
+the response before the row check, so a venue breaking the window/spacing contract can exceed this
+memory estimate before the run stops."""
 
 BAR_SPECS = {"1-MINUTE": "1-MINUTE-LAST-EXTERNAL", "1-DAY": "1-DAY-LAST-EXTERNAL"}
 """The bar specifications this module loads, by the name `--bars` takes."""
@@ -192,11 +207,12 @@ def margin(spec: str) -> timedelta:
 def _segments(
     intervals: Sequence[tuple[int, int]], step: int, max_rows: int
 ) -> Iterator[tuple[int, int]]:
-    """Each `[lo, hi]` of `intervals`, cut so no part could hold more than `max_rows` bars of one symbol,
-    one a `step` nanoseconds; the parts are inclusive and do not overlap."""
+    """Cut inclusive, disjoint parts using the minimum spacing `step` between bars. Allow for
+    alpaca-py's datetime truncation: the request can also return a bar just before `lo`."""
     for lo, hi in intervals:
         while lo <= hi:
-            end = min(hi, lo + max_rows * step - 1)  # at most `max_rows` multiples of `step`
+            request_lo = lo // 1_000 * 1_000
+            end = min(hi, request_lo + max_rows * step - 1)
             yield lo, end
             lo = end + 1
 
@@ -204,6 +220,44 @@ def _segments(
 def _batches(items: Sequence[str], size: int) -> Iterator[list[str]]:
     for i in range(0, len(items), size):
         yield list(items[i : i + size])
+
+
+@contextmanager
+def _catalog_lock(path: Path) -> Generator[None]:
+    """Python 3.14 `fcntl.flock`: one history loader per root, from coverage read through writes.
+
+    This is an advisory catalog lock, not an account or stream lock. Legacy writers that do not
+    take it must use another root or run separately (ADR 0093).
+    """
+    path.mkdir(parents=True, exist_ok=True)
+    with (path / ".history-load.lock").open("a") as held:
+        try:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as e:
+            raise HistoryStopped(f"another history load holds the catalog at {path}") from e
+        try:
+            yield
+        finally:
+            fcntl.flock(held, fcntl.LOCK_UN)
+
+
+def _check_feed(path: Path) -> None:
+    held = catalog_feed(path)
+    if held is not None and held != FEED.value:
+        raise HistoryStopped(
+            f"the catalog at {path} holds {held} data and this load is {FEED.value}: give each feed its own "
+            "root (bars_to_catalog's header)"
+        )
+
+
+def _claim_feed(path: Path) -> None:
+    """Recheck under the catalog lock and create the marker exclusively (Python `open`, mode `x`)."""
+    _check_feed(path)
+    try:
+        with (path / FEED_FILE).open("x", encoding="ascii") as marker:
+            marker.write(f"{FEED.value}\n")
+    except FileExistsError:
+        _check_feed(path)
 
 
 def load_history(
@@ -224,6 +278,49 @@ def load_history(
 ) -> int:
     """Load `specs` bars of `symbols` whose `ts_init` lies in `[start, end]` into the catalog root, and
     return the bars written. Raises `HistoryStopped` (or `RateLimited`) naming what stopped it."""
+    try:
+        path = Path(catalog_path).resolve()
+        with _catalog_lock(path):
+            return _load_history(
+                client,
+                symbols,
+                specs,
+                start,
+                end,
+                path,
+                pace=pace,
+                symbols_per_call=symbols_per_call,
+                max_rows=max_rows,
+                clock=clock,
+                sleep=sleep,
+                now=now,
+                out=out,
+            )
+    except HistoryStopped:
+        raise
+    except Exception as e:
+        raise HistoryStopped(
+            f"the history load of {', '.join(symbols[:20])} into {catalog_path} failed "
+            f"({type(e).__name__}): {e}"
+        ) from e
+
+
+def _load_history(
+    client: Any,
+    symbols: Sequence[str],
+    specs: Sequence[str],
+    start: datetime,
+    end: datetime,
+    path: Path,
+    *,
+    pace: Pace,
+    symbols_per_call: int,
+    max_rows: int,
+    clock: Callable[[], float],
+    sleep: Callable[[float], None],
+    now: Callable[[], datetime],
+    out: Callable[[str], None],
+) -> int:
     for name, value in (("start", start), ("end", end)):
         if value.tzinfo is None:
             raise HistoryStopped(f"{name} must carry a time zone, got {value}")
@@ -236,13 +333,7 @@ def load_history(
                 f"end {end} is after {latest}, less than {margin(spec)} before now, for {spec} bars: the "
                 "catalog would record a bar not yet formed or published as covered"
             )
-    path = Path(catalog_path).resolve()
-    held = catalog_feed(path)
-    if held is not None and held != FEED.value:
-        raise HistoryStopped(
-            f"the catalog at {path} holds {held} data and this load is {FEED.value}: give each feed its own "
-            "root (bars_to_catalog's header)"
-        )
+    _check_feed(path)
     catalog = ParquetDataCatalog(str(path))
     ids = [f"{s}.{VENUE}" for s in symbols]
     instruments = {str(i.id): i for i in catalog.instruments(instrument_ids=ids)}
@@ -268,6 +359,10 @@ def load_history(
             if missing:
                 gaps.setdefault(tuple((lo, hi) for lo, hi in missing), []).append(symbol)
         step = bar_interval_ns(next(iter(bar_types.values())))
+        if spec == "1-DAY":
+            # New York daily opens can be 23 hours apart at spring DST, even though parse_bar
+            # stamps each close a fixed 24 hours after its open (data.py, "Bar windows").
+            step -= step // 24
         for intervals, group in gaps.items():
             for lo, hi in _segments(intervals, step, max_rows):
                 window = alpaca_bars_window(
@@ -275,7 +370,7 @@ def load_history(
                 )
                 if window is None:
                     continue
-                per_symbol = (hi - lo) // step + 1
+                per_symbol = (hi - lo // 1_000 * 1_000) // step + 1
                 size = max(1, min(symbols_per_call, max_rows // per_symbol))
                 for batch in _batches(group, size):
                     wait = next_at - clock()
@@ -295,12 +390,16 @@ def load_history(
                     )
                     try:
                         result = client.get_stock_bars(request)
-                    except RateLimited:
+                    except HistoryStopped:
                         raise
                     except APIError as e:
                         raise HistoryStopped(
                             f"Alpaca refused the {what} request (HTTP {e.status_code}): {e}; nothing falls "
                             "back to another feed"
+                        ) from e
+                    except Exception as e:
+                        raise HistoryStopped(
+                            f"the {what} request failed ({type(e).__name__}): {e}"
                         ) from e
                     after = _sent()
                     if after.limited > before.limited:
@@ -322,18 +421,50 @@ def load_history(
                         raise HistoryStopped(
                             "alpaca-py returned raw bar data; the client must use raw_data=False"
                         )
+                    rows = sum(len(bars) for bars in result.data.values())
+                    if rows > max_rows:
+                        raise HistoryStopped(
+                            f"the {what} request returned {rows} bars, above the {max_rows} row bound; "
+                            "none of this response was written"
+                        )
                     count = 0
                     for symbol in batch:
                         bar_type = bar_types[symbol]
-                        bars = [
-                            parse_bar(b, bar_type, instruments[str(bar_type.instrument_id)])
-                            for b in result.data.get(symbol, [])
-                        ]
+                        instrument = instruments[str(bar_type.instrument_id)]
+                        bars = []
+                        rounded = 0
+                        first_rounding = ""
+                        try:
+                            for bar in result.data.get(symbol, []):
+                                parsed = parse_bar(bar, bar_type, instrument)
+                                if not lo <= parsed.ts_init <= hi:
+                                    continue
+                                bars.append(parsed)
+                                if fields := bar_roundings(bar, parsed):
+                                    rounded += 1
+                                    if not first_rounding:
+                                        first_rounding = f"{bar.timestamp} {', '.join(fields)}"
+                        except Exception as e:
+                            raise HistoryStopped(
+                                f"parsing {bar_type} on feed {FEED.value} failed "
+                                f"({type(e).__name__}): {e}"
+                            ) from e
                         if not bars:
                             continue  # an empty answer writes nothing and is asked for again
-                        if not (path / FEED_FILE).is_file():
-                            (path / FEED_FILE).write_text(f"{FEED.value}\n", encoding="ascii")
-                        catalog.write_bars(bars, start=lo, end=hi)
+                        if rounded:
+                            out(
+                                f"paper:history: Rounded {rounded} of {len(bars)} Alpaca bars for "
+                                f"{symbol} on feed {FEED.value} to price precision "
+                                f"{instrument.price_precision}, half to even as NautilusTrader's "
+                                f"Instrument.make_price rounds; the first: {first_rounding}"
+                            )
+                        _claim_feed(path)
+                        try:
+                            catalog.write_bars(bars, start=lo, end=hi)
+                        except Exception as e:
+                            raise HistoryStopped(
+                                f"writing {bar_type} into {path} failed ({type(e).__name__}): {e}"
+                            ) from e
                         count += len(bars)
                     written += count
                     out(f"paper:history: {what}: {count} bars, {gets} GET(s)")

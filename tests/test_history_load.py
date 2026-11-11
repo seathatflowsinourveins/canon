@@ -13,6 +13,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import re
+import sys
 import tomllib
 from dataclasses import dataclass
 from dataclasses import field
@@ -22,6 +23,7 @@ from datetime import timedelta
 from pathlib import Path
 from urllib.parse import parse_qs
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo
 
 import pytest
 import requests
@@ -65,6 +67,8 @@ class Venue:
     page_rows: int = 10_000
     answers: list[int] = field(default_factory=list)  # statuses to answer, in order, before 200s
     sent: list[tuple[str, str, dict[str, list[str]]]] = field(default_factory=list)
+    opens: list[datetime] | None = None
+    rows_per_call: list[int] = field(default_factory=list)
 
     def bars_sent(self) -> list[dict[str, list[str]]]:
         return [q for _, url, q in self.sent if urlsplit(url).path == "/v2/stocks/bars"]
@@ -92,10 +96,15 @@ def answer(venue: Venue, request: requests.PreparedRequest) -> tuple[int, dict]:
     start, end = utc(query["start"][0]), utc(query["end"][0])
     rows = []
     for symbol in sorted(query["symbols"][0].split(",")):
-        t = start
-        while t <= end:
-            rows.append((symbol, t))
-            t += step
+        if venue.opens is not None:
+            rows.extend((symbol, t) for t in venue.opens if start <= t <= end)
+        else:
+            t = start
+            while t <= end:
+                rows.append((symbol, t))
+                t += step
+    if "page_token" not in query:
+        venue.rows_per_call.append(len(rows))
     offset = int(query.get("page_token", ["0"])[0])
     page = rows[offset : offset + venue.page_rows]
     bars: dict[str, list[dict]] = {}
@@ -167,7 +176,7 @@ def run(catalog: Path, symbols=SYMBOLS, specs=("1-MINUTE",), start=MIN_START, en
         clock=clock,
         sleep=clock.sleep,
         now=lambda: NOW,
-        out=lambda line: None,
+        out=kw.pop("out", lambda line: None),
         **kw,
     )
 
@@ -252,6 +261,28 @@ def test_a_covered_range_is_not_asked_for_again(venue, catalog) -> None:
     assert venue.sent == []
 
 
+def test_an_overlapping_extension_writes_each_bar_once_within_its_file_bounds(
+    venue, catalog
+) -> None:
+    run(catalog, symbols=["AAPL"])
+
+    written = run(catalog, symbols=["AAPL"], end=MIN_END + timedelta(minutes=10))
+
+    bars = bars_in(catalog, "AAPL", "1-MINUTE")
+    assert written == 10
+    assert len(bars) == len({b.ts_init for b in bars}) == 21
+    store = ParquetDataCatalog(str(catalog))
+    bar_type = "AAPL.ALPACA-1-MINUTE-LAST-EXTERNAL"
+    intervals = store.get_intervals(history_load.NautilusDataType.Bar, bar_type)
+    assert len(intervals) == 2
+    for lo, hi in intervals:
+        files = store.query_files(history_load.NautilusDataType.Bar, [bar_type], lo, hi)
+        contents = store.query(
+            history_load.NautilusDataType.Bar, files=files, optimize_file_loading=False
+        )
+        assert contents and all(lo <= b.ts_init <= hi for b in contents)
+
+
 def test_a_symbol_with_no_instrument_in_the_catalog_is_refused_before_any_request(
     venue, catalog
 ) -> None:
@@ -268,6 +299,131 @@ def test_a_root_holding_another_feed_is_refused_before_any_request(venue, catalo
         run(catalog)
 
     assert venue.sent == []
+
+
+def test_another_history_load_cannot_enter_the_same_catalog_during_a_request(
+    venue, catalog, monkeypatch
+) -> None:
+    original = history_load.StockHistoricalDataClient.get_stock_bars
+
+    def concurrent(client, request):
+        with monkeypatch.context() as other:
+            other.setattr(history_load.StockHistoricalDataClient, "get_stock_bars", original)
+            with pytest.raises(HistoryStopped, match="another history load.*catalog"):
+                run(catalog, symbols=["MSFT"])
+        return original(client, request)
+
+    monkeypatch.setattr(history_load.StockHistoricalDataClient, "get_stock_bars", concurrent)
+    assert run(catalog, symbols=["AAPL"]) == 11
+    assert len(venue.sent) == 1
+    assert bars_in(catalog, "MSFT", "1-MINUTE") == []
+    # The lock is released on return; the other symbol can now load.
+    monkeypatch.setattr(history_load.StockHistoricalDataClient, "get_stock_bars", original)
+    assert run(catalog, symbols=["MSFT"]) == 11
+
+
+def test_a_feed_changed_while_the_request_runs_is_refused_before_writing(
+    venue, catalog, monkeypatch
+) -> None:
+    original = history_load.StockHistoricalDataClient.get_stock_bars
+
+    def changed(client, request):
+        result = original(client, request)
+        (catalog / FEED_FILE).write_text("iex\n")
+        return result
+
+    monkeypatch.setattr(history_load.StockHistoricalDataClient, "get_stock_bars", changed)
+    with pytest.raises(HistoryStopped, match="iex"):
+        run(catalog, symbols=["AAPL"])
+
+    assert bars_in(catalog, "AAPL", "1-MINUTE") == []
+    assert (catalog / FEED_FILE).read_text() == "iex\n"
+
+
+def test_a_parse_failure_names_the_symbol_and_preserves_the_cause(
+    venue, catalog, monkeypatch
+) -> None:
+    monkeypatch.setitem(standins.BAR_AAPL, "v", 1.5)
+
+    with pytest.raises(HistoryStopped, match=r"AAPL.*volume 1.5 is fractional") as stopped:
+        run(catalog, symbols=["AAPL"])
+
+    assert isinstance(stopped.value.__cause__, ValueError)
+    assert bars_in(catalog, "AAPL", "1-MINUTE") == []
+
+
+def test_a_write_failure_names_the_bar_type_and_preserves_the_cause(
+    venue, catalog, monkeypatch
+) -> None:
+    original = history_load.ParquetDataCatalog
+
+    class WriteFails:
+        def __init__(self, path):
+            self.catalog = original(path)
+
+        def __getattr__(self, name):
+            return getattr(self.catalog, name)
+
+        def write_bars(self, *args, **kwargs):
+            raise OSError("offline disk full")
+
+    monkeypatch.setattr(history_load, "ParquetDataCatalog", WriteFails)
+    with pytest.raises(HistoryStopped, match=r"AAPL.*offline disk full") as stopped:
+        run(catalog, symbols=["AAPL"])
+
+    assert isinstance(stopped.value.__cause__, OSError)
+    assert bars_in(catalog, "AAPL", "1-MINUTE") == []
+
+
+def test_a_transport_failure_names_the_request_and_preserves_the_cause(
+    venue, catalog, monkeypatch
+) -> None:
+    def timeout(*args, **kwargs):
+        raise requests.Timeout("offline connection stalled")
+
+    monkeypatch.setattr(HTTPAdapter, "send", timeout)
+    with pytest.raises(HistoryStopped, match=r"AAPL.*offline connection stalled") as stopped:
+        run(catalog, symbols=["AAPL"])
+
+    assert isinstance(stopped.value.__cause__, requests.Timeout)
+
+
+def test_main_reports_a_parse_failure_by_name(venue, catalog, monkeypatch, capsys) -> None:
+    monkeypatch.setitem(standins.BAR_AAPL, "v", 1.5)
+
+    result = history_load.main(
+        [
+            "--symbols",
+            "AAPL",
+            "--bars",
+            "1-MINUTE",
+            "--start",
+            MIN_START.isoformat(),
+            "--end",
+            MIN_END.isoformat(),
+            "--catalog",
+            str(catalog),
+        ]
+    )
+
+    assert result == 1
+    assert "AAPL" in capsys.readouterr().err
+
+
+def test_sip_rounding_names_the_count_and_first_price(venue, catalog, monkeypatch) -> None:
+    monkeypatch.setitem(standins.BAR_AAPL, "h", 178.263488)
+    lines: list[str] = []
+
+    assert run(catalog, symbols=["AAPL"], out=lines.append) == 11
+
+    warnings = [line for line in lines if "Rounded" in line]
+    assert len(warnings) == 1
+    [warning] = warnings
+    assert "11 of 11" in warning
+    assert "AAPL" in warning and "feed sip" in warning
+    assert "price precision 4" in warning and "half to even" in warning
+    assert "high 178.263488 to 178.2635" in warning
+    assert str(bars_in(catalog, "AAPL", "1-MINUTE")[0].high) == "178.2635"
 
 
 def test_outside_data_only_mode_no_client_is_built(monkeypatch) -> None:
@@ -409,3 +565,60 @@ def test_a_request_is_bounded_by_the_most_rows_its_symbols_could_have(venue, cat
     starts = [utc(q["start"][0]) for q in venue.bars_sent()]
     assert len(starts) == 3  # 30 possible bars, at most 10 a request
     assert len(bars_in(catalog, "AAPL", "1-MINUTE")) == 30 + 11
+
+
+@pytest.mark.parametrize("max_rows", [10, 20])
+def test_daily_requests_stay_bounded_across_spring_dst(venue, catalog, max_rows) -> None:
+    # Eleven New York midnights span 239 hours; a fixed 24-hour count gives only ten.
+    eastern = ZoneInfo("America/New_York")
+    venue.opens = [datetime(2026, 3, day, tzinfo=eastern) for day in range(6, 17)]
+    start = datetime(2026, 3, 7, 5, tzinfo=UTC)
+    end = datetime(2026, 3, 17, 4, tzinfo=UTC)
+
+    assert (
+        run(
+            catalog,
+            symbols=["AAPL", "MSFT"],
+            specs=("1-DAY",),
+            start=start,
+            end=end,
+            max_rows=max_rows,
+        )
+        == 22
+    )
+
+    assert max(venue.rows_per_call) <= max_rows
+    for symbol in ("AAPL", "MSFT"):
+        bars = bars_in(catalog, symbol, "1-DAY")
+        assert len(bars) == len({b.ts_init for b in bars}) == 11
+
+
+def test_a_gap_boundary_returned_again_still_counts_against_the_request_bound(
+    venue, catalog
+) -> None:
+    run(catalog, symbols=["AAPL"])
+    venue.rows_per_call.clear()
+
+    assert run(catalog, symbols=["AAPL"], end=MIN_END + timedelta(minutes=10), max_rows=10) == 10
+
+    assert max(venue.rows_per_call) <= 10
+    assert len(bars_in(catalog, "AAPL", "1-MINUTE")) == 21
+
+
+def test_an_overfull_response_stops_before_any_of_its_bars_are_written(
+    venue, catalog, monkeypatch
+) -> None:
+    original = answer
+
+    def overfull(stand_in, request):
+        status, body = original(stand_in, request)
+        bars = body["bars"]["AAPL"]
+        bars[:0] = [bars[0], bars[0]]  # 13 returned, against a planned bound of 12
+        return status, body
+
+    monkeypatch.setattr(sys.modules[__name__], "answer", overfull)
+    with pytest.raises(HistoryStopped, match=r"13.*12"):
+        run(catalog, symbols=["AAPL"], max_rows=12)
+
+    assert bars_in(catalog, "AAPL", "1-MINUTE") == []
+    assert not (catalog / FEED_FILE).exists()
