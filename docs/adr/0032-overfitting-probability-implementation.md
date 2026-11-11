@@ -78,6 +78,8 @@ delegation quoted in ADR 0010's Evidence.
 * No PBO package is in `pyproject.toml`, and none is imported.
 * When one is adopted, a test reproduces a hand-computed S = 4 case, and a ranking report states S and PBO
   beside the DSR.
+* Re-read 2026-11-10 against skfolio 1.12.9 (ADR 0031's pin): the gap is open. `CombinatorialPurgedCV`
+  only splits, with unequal blocks; Algorithm 2.3's pick, rank and logit would be our own code (option 2).
 
 ## Evidence
 
@@ -117,6 +119,13 @@ or run.
 * https://numpy.org/doc/2.5/reference/generated/numpy.sort.html — the default `quicksort` is not stable.
   Fetched.
 * skfolio 1.12.8, source archive — no PBO or CSCV in its source. Fetched, by search.
+* skfolio 1.12.9 at commit 7721090 (tag `v1.12.9`), GitHub source archive, sha256 848e1fee, read
+  2026-11-10: `model_selection/_combinatorial.py` and `docs/user_guide/model_selection.rst`. Fetched. Still
+  no PBO, CSCV or logit. `CombinatorialPurgedCV` yields training indices and test-fold lists for each of
+  C(n_folds, n_test_folds) splits (16 and 8 give 12,870; its cap is 100,000). The first `n_folds - 1`
+  blocks hold `T // n_folds` rows and the last holds the rest, where Algorithm 2.3 needs equal blocks, so T
+  is trimmed first. It cites López de Prado (2018), §12.4, for refitting a model per split, read only
+  through the book's table of contents; the chapter is UNVERIFIED.
 * https://cran.r-project.org/web/packages/pbo/index.html — R `pbo` 1.3.5, 2022-05-26, MIT. Fetched. Its
   source was not read.
 * An `upstream-scout` lane found three of the nine (RiskLabAI, backtest-overfitting, trialgate), and
@@ -125,6 +134,8 @@ or run.
 * Second reader, 2026-11-10 (`evidence-verifier`), the part that concerns this record: the checksums and
   tags hold. It corrected the tie column, the alphaengine, ml4t-diagnostic and factor-qc rows, and the
   claim that every permissive candidate is new or small, which RiskLabAI and ml4t-diagnostic contradict.
+* Second reader of the skfolio 1.12.9 re-read, 2026-11-10 (`evidence-verifier`): the lines hold. It
+  corrected an option that allowed unequal blocks, against Algorithm 2.3, and two loose wordings.
 * Second reader of the split, 2026-11-10 (`evidence-verifier`): nothing of ADR 0027 is missing from the two
   records. It corrected an option number that pointed at this record's own list, the options' wording,
   which read as declining ADR 0027's option 2, and a reference to the statistic, which is in ADR 0027.
