@@ -149,9 +149,15 @@ SOURCE_ROOT = Path(__file__).resolve().parents[2]
 """The checkout this module runs from."""
 MARKET_EXIT_INTERVAL_MS = 1000
 MARKET_EXIT_MAX_ATTEMPTS = 60
+MANAGED_DELAY_POST_STOP_SECS = math.ceil(
+    MARKET_EXIT_INTERVAL_MS * MARKET_EXIT_MAX_ATTEMPTS / 1000 + DELAY_POST_STOP_SECS
+)
+"""A regular window's `delay_post_stop` (65 s): after the trader's stop the node processes events, the
+managed stop's market exit among them, only for this long before it disconnects its clients
+(`LiveNode::stop`, `process_runner_for`, `crates/live/src/node/mod.rs` at the pin); so the market exit at its
+longest and the residual 5 s (`paper_node`). The strategy stops once its exit ends (`finalize_market_exit`)."""
 STOP_TIMEOUT_SECS = (
-    MARKET_EXIT_INTERVAL_MS * MARKET_EXIT_MAX_ATTEMPTS / 1000
-    + DELAY_POST_STOP_SECS
+    MANAGED_DELAY_POST_STOP_SECS
     + TIMEOUT_DISCONNECTION_SECS
     + TIMEOUT_SHUTDOWN_SECS
     + CONNECT_TIMEOUT_SECS
@@ -320,7 +326,12 @@ def window_node(
     it runs (returned too: the node does not hand its Python strategies back)."""
     extended = config.session == "extended"
     node = (
-        alpaca_paper_builder("CANON-PAPER-SESSION", config.instrument_id)
+        alpaca_paper_builder(
+            "CANON-PAPER-SESSION",
+            config.instrument_id,
+            # the managed stop's market exit runs inside the post-stop delay
+            delay_post_stop_secs=DELAY_POST_STOP_SECS if extended else MANAGED_DELAY_POST_STOP_SECS,
+        )
         .with_logging(
             LoggerConfig(
                 fileout_level=LogLevel.INFO,  # file output is off unless a level is given
@@ -762,8 +773,16 @@ def _run_node(node: LiveNode, ends: datetime) -> None:
             runner.close()
         raise
     if stuck is None:
-        runner.close()
-        return
+        # `Runner.close` waits up to 300 s for the executor's calls (`THREAD_JOIN_TIMEOUT`): wait for them
+        # at most `ADAPTER_CALL_SECS` first, and leave the runner if one still runs
+        calls.shutdown(wait=False, cancel_futures=True)
+        if not wait(calls.running(), timeout=ADAPTER_CALL_SECS).not_done:
+            runner.close()
+            return
+        _ABANDONED.append((runner, started[0], calls))
+        raise StopTimedOut(
+            f"a worker call of the node still ran {ADAPTER_CALL_SECS:g} s after it stopped; left running"
+        )
     _abandon(runner, stuck, calls)
     raise StopTimedOut(
         f"the node did not stop within {STOP_TIMEOUT_SECS:g} s of the window's end; left running"
@@ -858,6 +877,15 @@ def _log_dir(argv: Sequence[str] | None) -> Path:
     return _parser().parse_args(argv).log_dir
 
 
+def _heard_failed(log_dir: Path, error: BaseException) -> None:
+    """The heartbeat for a failed run; a heartbeat that cannot be written (the error may be the log
+    directory's own) is said on stderr, so the run's own error and exit code stand."""
+    try:
+        write_heartbeat(log_dir, f"failed: {type(error).__name__}: {error}")
+    except OSError as e:
+        print(f"paper:session: the heartbeat could not be written: {e}", file=sys.stderr)
+
+
 def _main(argv: Sequence[str] | None) -> int:
     args = _parser().parse_args(argv)
     session = args.session
@@ -896,10 +924,14 @@ def _main(argv: Sequence[str] | None) -> int:
         )
         print(f"paper:session: {e}", file=sys.stderr)
         return 1
-    except (RuntimeError, ValueError, KeyError, APIError) as e:  # KeyError: no key pair in the env
-        write_heartbeat(args.log_dir, f"failed: {type(e).__name__}: {e}")
+    # KeyError: no key pair in the env; OSError: the HTTP layer's errors, the adapter's timeouts among them
+    except (RuntimeError, ValueError, KeyError, APIError, OSError) as e:
         print(f"paper:session: {e}", file=sys.stderr)
+        _heard_failed(args.log_dir, e)
         return 1
+    except Exception as e:  # anything else: heard as failed, then raised with its traceback
+        _heard_failed(args.log_dir, e)
+        raise
     print(json.dumps(asdict(report), indent=2))
     return 0
 

@@ -49,7 +49,7 @@ window (`EXTENDED_READY`) until one has passed on paper and the disconnect-hang 
 | Order size and rate | ADR 0049's `risk_limits`: $1,000 per order, 50 submits and 25 modifies a minute | `LiveRiskEngineConfig` (ADR 0049) |
 | Orders and position in step with Alpaca | `open_check_interval_secs=10`, `position_check_interval_secs=60`, both off by default; the position check aligns to the adapter's position reports until `position_check_retries` (3) run out | configure_live_trading, "Continuous reconciliation": "5-10s", "30-60s" |
 | Start-up reconciliation | Scoped to the symbol and one minute of history: every run starts only once it has found the account flat, so history can only mislead, and 60 minutes could hold the last window's exit without its entry; open orders and positions are reported however old | The Lighter tutorial's `reconciliation_instrument_ids`; the minute is the adapter's own paper tests' (the tutorial uses 60; the docs' tip leaves it unset) |
-| The node | `LiveNode.builder(...)`, `with_risk_engine_config`, `with_exec_engine_config`, `with_delay_post_stop_secs(5)` | `examples/live/sandbox/exec_tester.py`, the Lighter tutorial |
+| The node | `LiveNode.builder(...)`, `with_risk_engine_config`, `with_exec_engine_config`, `with_delay_post_stop_secs(5)`; a regular window 65 s, since the managed stop's market exit (60 attempts a second apart) runs only inside that delay before the node disconnects | `examples/live/sandbox/exec_tester.py`, the Lighter tutorial; `LiveNode::stop` and `process_runner_for` in `crates/live/src/node/mod.rs` at the pin |
 | Exit at wind-down and stop, in the session | `market_exit()`, and `manage_stop=True` so `stop()` runs it; `market_exit_reduce_only=False`, `market_exit_time_in_force=DAY` | concepts/strategies, "Market exit" |
 | Start flat, confirm flat | Refuse to start unless flat in the symbol; after the node stops, read Alpaca and fail naming what is left (each poll for 60 s: cancel every open order the check did not send, again until it is gone; once none is open and while Alpaca's clock says the session is open, close at market, again while held; cancel a close that would only queue) | The Lighter tutorial: "Start with a flat target position", "confirm that no orders or positions from the run remain" |
 | The session | Alpaca's clock and calendar before anything is placed | Alpaca's paper-trading skill: "always check the clock/calendar endpoint" |
@@ -142,6 +142,32 @@ close (a flat account recorded not flat), the check's own close was canceled whe
 start-up reads had lost alpaca-py's retries, and the bounds were stated as wall-clock bounds; each fixed,
 the first three covered by a new test.
 
+A third second reader's review (2026-11-10), each fix first shown by a failing test in the same file:
+
+* The node runs events after the trader's stop only for `delay_post_stop`, then disconnects, so at 5 s a
+  managed stop's market exit was cut off after five attempts and the strategy never stopped: a regular
+  window's delay is now the exit at its longest and 5 s (`MANAGED_DELAY_POST_STOP_SECS`, 65 s; the stop
+  bound, 115 s, already summed the two).
+* A connect timeout (an `OSError`) left the run's heartbeat unwritten, or at "a regular window": it, and
+  any other error, is now heard as `failed`.
+* A limit was canceled once at its timeout and no alert followed, so a cancel rejected or unanswered left
+  it working for good, the strategy deciding nothing and its stop closing nothing: it is now looked at
+  after each further timeout until it is closed, canceled again when a cancel was rejected, its signal
+  dropped once. A cancel that went unanswered leaves it pending cancel, which the strategy can neither
+  cancel again (refused at the pin) nor query (the adapter answers no order query); the node's open-order
+  check and the window's account check, which cancels in any session, are what clear it. Extended
+  windows, the only ones that send these limits, stay off (`EXTENDED_READY`).
+* A close that filled in part and timed out held the dropped side, so the shares left stayed open for the
+  rest of the cross: a limit that filled in part, by its timeout or while its cancel was on its way, now
+  drops nothing.
+
+Code review (`/code-review`, high) of those fixes: a cancel sent again for an order pending cancel sends
+nothing (above), a part fill racing the cancel, a part-filled limit reported as a dropped signal, a
+heartbeat whose own write failure hid the run's error, the delay set by a second builder call, and
+`Runner.close` waiting up to 300 s for a worker call after a clean stop (now at most `ADAPTER_CALL_SECS`,
+then the runner is left as after an abandoned stop); each fixed, the first two and the last covered by a
+new test.
+
 On paper, 2026-11-10, after the close: a regular window refused, "the regular session is closed". An
 extended window started at 16:12 New York, before the adapter's extended-hours change was on `main`,
 against the condition for extended runs; the gate above now refuses that. The cap stopped it at its first
@@ -208,3 +234,10 @@ Read 2026-11-10. "raw": fetched with `curl` and read whole. NautilusTrader files
   `concurrent.futures`' `shutdown(cancel_futures=True)` and `wait(timeout=...)` (read; a test runs both).
 * Two more second readers' reviews of the window (2026-11-10): six findings, all reproduced offline and
   fixed above (run).
+* `crates/live/src/node/mod.rs` at the pin: `LiveNode::stop` stops the trader, processes runner events
+  until `delay_post_stop` (`process_runner_for`, a fixed deadline), then disconnects (`finalize_stop`);
+  `crates/trading/src/strategy/mod.rs`: a managed `stop()` defers the strategy's stop until
+  `finalize_market_exit` (fetched, raw). concepts/strategies, "Market exit": a managed stop "first performs
+  a market exit, then stops the strategy once flat or once `market_exit_max_attempts` is reached".
+* A third second reader's review of the window (2026-11-10): four findings beyond the six, reproduced
+  offline and fixed above (run).

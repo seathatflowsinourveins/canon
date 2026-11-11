@@ -24,7 +24,8 @@ Two departures from `MaCross`, both for live use:
 * **Outside the regular session** (`extended_hours=True`, set by the run's configuration, never from the
   clock) every order is a marked DAY limit, priced `limit_offset` through the touch from the latest quote:
   a buy at the ask plus the offset, a sell at the bid minus it, rounded to the cent away from the market's
-  side. A limit not filled within `limit_timeout_secs` is canceled and its signal dropped, never chased:
+  side. A limit not filled within `limit_timeout_secs` is canceled (again if the cancel is rejected) and its
+  signal dropped, never chased (one that filled in part drops nothing):
   a dropped entry is not sent again until the fast average has gone below the slow, nor a dropped close
   until it has gone above (a bar with the two equal is no cross), seen on any bar, the dropped limit's
   cancel still pending or not; the next cross takes its own. A short's
@@ -178,6 +179,8 @@ class SessionMaCross(MaCross):
         """The side of the last signal limit dropped at its timeout, held until the opposite cross."""
         self.signal_orders: set[str] = set()
         """The client order IDs of limits sent on a cross (an entry, or a close on the cross below)."""
+        self.timed_out: set[str] = set()
+        """The client order IDs of limits canceled at their timeout and not yet closed."""
 
     def on_start(self) -> None:
         if (
@@ -381,27 +384,55 @@ class SessionMaCross(MaCross):
         return self.cache.order(client_order_id)
 
     def _on_limit_timeout(self, event: TimeEvent) -> None:
-        """Cancel the limit if it is still open; if Alpaca has not acknowledged it yet, look again after
-        another timeout rather than leave it unwatched."""
+        """Cancel the limit if it is still open, and look at it again after each further timeout until it
+        is closed: one Alpaca has not acknowledged yet is looked at again, one whose cancel was rejected
+        (open again) is canceled again, and its signal is dropped once. One whose cancel went unanswered
+        stays pending cancel, which the strategy cannot cancel again (`mark_order_pending_cancel` at the
+        pin) nor query (the adapter answers no order query): the node's open-order check (every 10 s) and
+        the window's account check after the stop are what reconcile and cancel it. A limit that filled
+        in part, by its timeout or by its close, is no dropped signal: what it left is the next cross's."""
         name = event.name.removeprefix("limit-timeout-")
         order = self._order(ClientOrderId(name))
         if order is None or order.is_closed:
+            if (
+                order is not None
+                and name in self.timed_out
+                and order.filled_qty.as_decimal()
+                and self.dropped_side == order.side
+            ):
+                self.dropped_side = None  # it filled in part while its cancel was on its way
             self.signal_orders.discard(name)
-        else:
-            client_order_id = order.client_order_id.value
-            if order.is_open:
-                self.dropped.append(f"{order.side.name}: not filled in {self.limit_timeout_secs} s")
-                if client_order_id in self.signal_orders:  # not a short's buy-back or a wind-down
+            self.timed_out.discard(name)
+            return
+        client_order_id = order.client_order_id.value
+        if order.is_pending_cancel:
+            self.log.warning(f"{client_order_id} still pending cancel; looking again")
+        elif order.is_open:
+            if client_order_id not in self.timed_out:
+                self.timed_out.add(client_order_id)
+                filled = bool(order.filled_qty.as_decimal())
+                self.dropped.append(
+                    f"{order.side.name}: {'filled in part' if filled else 'not filled'} in "
+                    f"{self.limit_timeout_secs} s"
+                )
+                # not a short's buy-back or a wind-down, and nothing filled
+                if client_order_id in self.signal_orders and not filled:
                     self.dropped_side = order.side
                 self.signal_orders.discard(client_order_id)
                 self.log.warning(
-                    f"{client_order_id} not filled in {self.limit_timeout_secs} s; canceled, "
-                    "signal dropped"
+                    f"{client_order_id} {'filled in part' if filled else 'not filled'} in "
+                    f"{self.limit_timeout_secs} s; canceled"
+                    + ("; the rest is the next cross's" if filled else ", signal dropped")
                 )
-                self.cancel_order(order.client_order_id)
             else:
-                self.clock.set_time_alert(
-                    event.name,
-                    self.clock.utc_now() + timedelta(seconds=self.limit_timeout_secs),
-                    self._on_limit_timeout,
-                )
+                self.log.warning(f"{client_order_id} still open after its cancel; canceling again")
+            self.cancel_order(order.client_order_id)
+        self._rearm(event.name)
+
+    def _rearm(self, name: str) -> None:
+        """Look at the limit again after another timeout (one seam, so a test can see it re-armed)."""
+        self.clock.set_time_alert(
+            name,
+            self.clock.utc_now() + timedelta(seconds=self.limit_timeout_secs),
+            self._on_limit_timeout,
+        )

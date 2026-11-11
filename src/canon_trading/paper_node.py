@@ -77,7 +77,8 @@ TIMEOUT_SHUTDOWN_SECS = 5
 """The node's own shutdown bounds (`crates/live/src/node/config.rs` at the pin): residual events after the
 trader stops, the clients' disconnect, then pending tasks; `with_delay_shutdown_secs` sets
 `timeout_shutdown` (`node/builder.rs`), here at its default. A session window bounds its wait on the stop
-from these (`session_window.STOP_TIMEOUT_SECS`)."""
+from these (`session_window.STOP_TIMEOUT_SECS`), a regular one with a longer post-stop delay for its managed
+stop's market exit (`session_window.MANAGED_DELAY_POST_STOP_SECS`)."""
 
 RECONCILIATION_LOOKBACK_MINS = 1
 """A minute of order history at start-up, the value the adapter's own paper tests use
@@ -145,9 +146,12 @@ def alpaca_paper_builder(
     *,
     trader_id: TraderId = TRADER_ID,
     max_order_submit_rate: str = MAX_ORDER_SUBMIT_RATE,
+    delay_post_stop_secs: int = DELAY_POST_STOP_SECS,
 ) -> LiveNodeBuilder:
     """A builder with the Alpaca data and execution clients for `instrument_id`, `risk_limits`,
     `exec_engine_config` and the timeouts every paper node here uses; the caller adds logging and builds.
+    `delay_post_stop_secs` is longer for a strategy whose managed stop runs a market exit, which the node
+    runs only inside that delay (`session_window.MANAGED_DELAY_POST_STOP_SECS`).
     The calls are the ones upstream's live examples make (`examples/live/sandbox/exec_tester.py`)."""
     provider = InstrumentProviderConfig(load_ids=[str(instrument_id)])
     return (
@@ -158,7 +162,7 @@ def alpaca_paper_builder(
             )
         )
         .with_exec_engine_config(exec_engine_config(instrument_id))
-        .with_delay_post_stop_secs(DELAY_POST_STOP_SECS)
+        .with_delay_post_stop_secs(delay_post_stop_secs)
         .with_timeout_connection(TIMEOUT_CONNECTION_SECS)
         .with_timeout_disconnection_secs(TIMEOUT_DISCONNECTION_SECS)
         .with_delay_shutdown_secs(TIMEOUT_SHUTDOWN_SECS)
