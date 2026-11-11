@@ -2320,7 +2320,13 @@ async def _run_until(node: LiveNode, ends: datetime, started: list) -> asyncio.T
     try:
         # `ends` is a wall-clock time: read again every `END_TICK_SECS`, since the loop's own clock is
         # monotonic and stopped while the machine slept, which carried a window past its part (2026-11-11)
-        while not task.done() and (left := (ends - datetime.now(UTC)).total_seconds()) > 0:
+        # ... and also by the monotonic clock, so a wall clock stepped back cannot lengthen it (code review)
+        bound = time.monotonic() + max(0.0, (ends - datetime.now(UTC)).total_seconds())
+        await asyncio.sleep(0)  # the node's task takes one step before any stop (code review)
+        while not task.done():
+            left = min((ends - datetime.now(UTC)).total_seconds(), bound - time.monotonic())
+            if left <= 0:
+                break
             await asyncio.wait({task}, timeout=min(left, END_TICK_SECS))
     finally:
         if not task.done():
