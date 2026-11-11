@@ -1,0 +1,59 @@
+#!/bin/bash
+# manifest — join the documented reports of bootstrap --check, automation status and canon list.
+# ADR 0059: no checks are reimplemented here. Runtime rows follow bootstrap's documented seven-field TSV
+# contract; all three original reports and exit codes are retained, including unavailable checks.
+# --json emits {bootstrap, automation, canon, runtimes}; text prints the same reports and source statuses.
+# Emails, UUIDs (an account folder's name), home paths and local login names are redacted in both
+# formats, including source diagnostics.
+# Exit 0 when all sources succeed, 1 when a source fails, 2 for usage. Nothing installs or changes config.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+JSON=0
+usage() { echo 'usage: scripts/manifest [--json]' >&2; exit 2; }
+case "$#:${1:-}" in
+  0:) ;;
+  1:--json) JSON=1 ;;
+  *) usage ;;
+esac
+T=$(mktemp -d)
+trap 'rm -rf "$T"' EXIT
+rc=0
+collect() {
+  local key="$1" command="$2" status=0; shift 2
+  "$@" > "$T/$key.out" 2>&1 || status=$?
+  [ "$status" = 0 ] || rc=1
+  jq -n --arg command "$command" --argjson status "$status" --rawfile report "$T/$key.out" \
+    '{command: $command, exit_code: $status, report: (if $report == "" then "not reported (command returned no output)\n" else $report end)}' > "$T/$key.json"
+}
+collect bootstrap 'scripts/bootstrap --check' "$ROOT/scripts/bootstrap" --check
+collect automation 'scripts/automation status' "$ROOT/scripts/automation" status
+collect canon 'scripts/canon list' "$ROOT/scripts/canon" list
+# Identity is used only for redaction, never as a report input. Literal split/join handles regex characters
+# in a home path; a login name is regex-escaped and replaced only as a whole word, so a short name such as
+# 'code' leaves 'Claude Code' and 'codex' alone. Run the filter before either renderer so diagnostics are
+# covered too.
+login=$(id -un)
+jq -n --slurpfile b "$T/bootstrap.json" --slurpfile a "$T/automation.json" --slurpfile c "$T/canon.json" \
+  --arg home "$HOME" --arg login "$login" --arg user "${USER:-}" --arg logname "${LOGNAME:-}" '
+  def private_text:
+    (if ($home | length) > 1 then split($home) | join("~") else . end)
+    | gsub("[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}"; "[email]")
+    | gsub("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"; "[id]")
+    | reduce ([$login, $user, $logname, ($home | split("/") | last)] | unique[] | select(. != "" and . != null)
+              | gsub("(?<c>[^A-Za-z0-9_])"; "\\\(.c)")) as $name
+        (.; gsub("(?<![A-Za-z0-9])" + $name + "(?![A-Za-z0-9])"; "[account]"));
+  {bootstrap: $b[0], automation: $a[0], canon: $c[0]}
+  | walk(if type == "string" then private_text else . end)
+  | .runtimes = [.bootstrap.report | split("\n")[] | select(startswith("  ")) | ltrimstr("  ") | split("\t")
+      | select(length == 7 and .[0] != "RUNTIME")
+      | {name: .[0], version: .[1], model: .[2], effort: .[3], version_source: .[4], model_source: .[5], effort_source: .[6]}]
+  | if (.runtimes | map(.name) | sort) == (["Claude Code", "Codex", "Muse Code", "Antigravity", "DeepSeek Harness", "Orca", "OmniRoute"] | sort)
+    then . else .runtime_parse_error = "not reported: bootstrap runtime table is missing, incomplete or outside its documented TSV contract" end
+  ' > "$T/report.json"
+if jq -e '.runtime_parse_error != null' "$T/report.json" >/dev/null; then rc=1; fi
+if [ "$JSON" = 1 ]; then cat "$T/report.json"
+else
+  jq -r '[.bootstrap, .automation, .canon][] | "Source: " + .command + " (exit " + (.exit_code | tostring) + ")\n" + .report' "$T/report.json"
+  jq -r '.runtime_parse_error // empty' "$T/report.json"
+fi
+exit "$rc"

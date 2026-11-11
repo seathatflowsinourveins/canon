@@ -164,6 +164,75 @@ fixes no state-file path, so the line points at the one the summary keeps. A thi
 the CLAUDE.md section already carries them. UNVERIFIED: how a 300,000 window
 changes summary quality against the default.
 
+## Addition, 2026-11-11: one generated machine manifest
+
+`scripts/manifest` joins exactly `scripts/bootstrap --check`, `scripts/automation status` and
+`scripts/canon list`. It retains each complete report, command and exit code; text prints those reports,
+and `--json` carries them in one object with the parsed runtime rows. Any failed source makes the command
+exit nonzero, with its report still present. It performs no independent installation, health or pin check.
+Local login names and home paths are used only as redaction inputs, alongside email-address redaction,
+before either format is printed. They are not inventory fields.
+
+Bootstrap's new **Runtimes** section documents seven TSV fields: name, version, model, effort and a source
+for each value. All seven adopted runtimes appear even when their commands are missing. These are
+configured defaults, with launch overrides, other settings scopes and saved session choices explicitly
+outside the observation. Claude's model alias is not proof of a request's resolved model. Codex applies
+the active user profile before reporting its two settings. DeepSeek's model and effort are `not reported`
+because its documented `--dump-config` command rewrites `cordis.yml` through `prepareProfile`
+(`apps/cli/src/profile-boot.ts:194-198` at pinned commit `1f81c047fc48fa190a683e469daa699857e9afe8`).
+Bootstrap's check remains read-only; it neither runs that command nor reimplements profile composition.
+Neither the manifest nor bootstrap reads session transcripts.
+
+Muse's current install page documents `muse --version`, so it is queried; failure or empty output says
+`not reported` with the command named. Its configuration page documents launch flags and no model-default
+settings key, so an unobserved launch has no reported model or effort. Antigravity's saved label can fall
+back when unavailable: the label is shown alongside `not reported` for the actual model and effort. Orca's
+pinned CLI overview and reference document no version command, so its version is `not reported` with that
+reason. Orca is a host and OmniRoute a gateway; neither supplies a single model or effort for all requests.
+
+The lanes process matcher also recognises the pinned npm entry points `@deepseek-ai/dsh/lib/bin.js` and
+`@deepseek-harness-tui/dsh-tui/bin/dsh-tui.js` under node/bun. Ancestor suppression still leaves one row
+per worker. Those rows retain the existing `not measured` note and DeepSeek source line.
+
+Evidence read 2026-11-11:
+
+* https://dev.meta.ai/docs/muse-code — `muse --version`.
+* https://dev.meta.ai/docs/muse-code/configuration — launch model/effort flags; settings-key limit.
+* https://antigravity.google/docs/settings — `model` stores a label; unavailable selections fall back.
+* https://code.claude.com/docs/en/model-config.md — model aliases and the effort setting/environment.
+* https://learn.chatgpt.com/docs/config-file/config-reference — Codex model, effort and profiles.
+* https://raw.githubusercontent.com/stablyai/orca/d1466f6017c4bb6006b77eb46f2fc0f461ef021e/docs/site/content/docs/cli/overview.mdx
+  and https://raw.githubusercontent.com/stablyai/orca/d1466f6017c4bb6006b77eb46f2fc0f461ef021e/docs/site/content/docs/cli/reference.mdx
+  — no documented version command; the installed `orca --help` was also read.
+* https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/1f81c047fc48fa190a683e469daa699857e9afe8/apps/cli/package.json
+  — npm bin target; `src/args.ts` at that commit documents version and dump flags.
+* https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/1f81c047fc48fa190a683e469daa699857e9afe8/apps/cli/src/profile-boot.ts
+  — lines 194-198 rewrite the profile root even for `src/dump-config.ts`'s `prepareProfile` call.
+* https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/1f81c047fc48fa190a683e469daa699857e9afe8/packages/core/agent-default-model/README.md
+  — model field; per-session selection remains owned by the entry point.
+* https://raw.githubusercontent.com/ccch1mneyyy/dsh-TUI/v0.17.0/package.json — the TUI npm bin target.
+* https://raw.githubusercontent.com/ccch1mneyyy/dsh-TUI/v0.17.0/docs/configuration.en.md — profile patches.
+* https://raw.githubusercontent.com/cheaper-inference/OmniRoute/v3.8.53/bin/omniroute.mjs — bare version
+  fast path, before environment loading and provider/database imports.
+
+`scripts/test-manifest` tests runtime presence, missing/empty commands, Codex profile precedence, the
+refusal to run DeepSeek's mutating config dump, both manifest formats, source failures, email, UUID and
+login redaction, and both DeepSeek npm process entry points, without querying an installed runtime or
+credential store. Each case was seen to fail before the code it covers. `scripts/manifest` was run on this
+machine on 2026-11-11 (`run`): all seven runtime rows present, DeepSeek's model and effort `not reported`
+for the reason above, and no address, login name or account folder id in either format. UNVERIFIED: the
+model and effort an individual request resolves to, which these configured defaults do not observe.
+
+`scripts/bootstrap --user-config` calls an existing `settings.json` unchanged, and writes no
+`.canon-proposed` copy, when it holds every key the template sets with the same value (objects compared
+key by key) and every hook entry the template proposes, by event, matcher and command. The owner's own
+keys and another tool's hook entries beside canon's are no gap, since "its matching hooks run in
+parallel" (https://code.claude.com/docs/en/hooks.md, `fetched` 2026-11-11). Otherwise its EXISTS line
+names each missing or different key and hook entry; a hook entry counts as present only with every field
+the template gives it. Limit: a hook entry a later template drops is not named, since retiring one is a
+step of its own, as the retired values above are. This keeps a merge-by-hand step from being reported
+when there is nothing to merge (the owner decided on 2026-11-11 that no avoidable manual step is shown).
+
 ## Evidence
 
 Read 2026-11-10. `fetched`: downloaded and searched here; `run`: a command run here.

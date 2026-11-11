@@ -1,0 +1,132 @@
+#!/bin/bash
+# Offline contracts: scripts/bootstrap's runtime TSV, scripts/manifest's three command reports,
+# and ps(1)/lsof(1) process rows (ADR 0059). No installed runtime or credential store is queried.
+# shellcheck disable=SC2016  # the stub evaluates its own positional parameters
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+T=$(mktemp -d)
+trap 'rm -rf "$T"' EXIT
+mkdir -p "$T/repo/scripts" "$T/repo/canon" "$T/bin" "$T/login-fixture/.codex"
+cp "$ROOT/scripts/bootstrap" "$T/repo/scripts/"
+cp -R "$ROOT/home" "$T/repo/home"
+cp "$ROOT/canon/models.json" "$ROOT/canon/upstreams.json" "$T/repo/canon/"
+for tool in jq python3; do
+  ln -s "$(command -v "$tool")" "$T/bin/$tool"
+done
+export HOME="$T/login-fixture" CODEX_HOME="$T/login-fixture/.codex"
+export CLAUDE_CONFIG_DIR="$HOME/.claude"
+export PATH="$T/bin:/usr/bin:/bin" USER=login-fixture LOGNAME=login-fixture
+unset DSH_HOME
+for tool in security xcode-select; do printf '#!/bin/bash\nexit 1\n' > "$T/bin/$tool"; done
+for tool in claude codex agy muse dsh; do
+  printf '#!/bin/bash\n[ "$1" = --version ] && { echo "7.8.9"; exit; }; exit 1\n' > "$T/bin/$tool"
+done
+cat > "$T/bin/mise" <<'STUB'
+#!/bin/bash
+case "$1" in --version) echo '2026.11.5 stub';; where) exit 1;; exec) echo '7.8.9';; *) exit 1;; esac
+STUB
+chmod +x "$T/bin/security" "$T/bin/xcode-select" "$T/bin/mise" "$T/bin/claude" "$T/bin/codex" "$T/bin/agy" "$T/bin/muse" "$T/bin/dsh"
+mkdir -p "$HOME/.gemini/antigravity-cli"
+echo '{"model":"Gemini configured label"}' > "$HOME/.gemini/antigravity-cli/settings.json"
+cat > "$T/bin/dsh" <<'STUB'
+#!/bin/bash
+if [ "$1" = --version ]; then echo 0.2.1-rc.3; exit; fi
+touch "$HOME/dsh-unsafe-command"
+exit 90
+STUB
+cat > "$CODEX_HOME/config.toml" <<'CONFIG'
+model = "top-model"
+model_reasoning_effort = "low"
+profile = "review"
+[profiles.review]
+model = "profile-model"
+model_reasoning_effort = "max"
+CONFIG
+"$T/repo/scripts/bootstrap" --check > "$T/bootstrap" 2>&1 || true
+for runtime in 'Claude Code' Codex 'Muse Code' Antigravity 'DeepSeek Harness' Orca OmniRoute; do
+  if ! grep -qF "$(printf '  %s\t' "$runtime")" "$T/bootstrap"; then
+    echo "FAIL: bootstrap runtime missing: $runtime"; exit 1
+  fi
+done
+grep -q 'profile-model' "$T/bootstrap"
+grep -q 'profiles.review' "$T/bootstrap"
+grep -q 'DeepSeek Harness.*not reported (--dump-config rewrites cordis.yml' "$T/bootstrap"
+grep -q 'apps/cli/src/profile-boot.ts:194-198' "$T/bootstrap"
+test ! -e "$HOME/dsh-unsafe-command"
+grep -q 'Antigravity.*not reported (configured label: Gemini configured label' "$T/bootstrap"
+# A documented command may exist and report nothing; keep its name and the reason in the row.
+printf '#!/bin/bash\nexit 0\n' > "$T/bin/muse"
+"$T/repo/scripts/bootstrap" --check > "$T/bootstrap" 2>&1 || true
+grep -q 'Muse Code.*not reported (muse --version failed, timed out or returned no output)' "$T/bootstrap"
+mv "$T/bin/codex" "$T/codex-away"
+"$T/repo/scripts/bootstrap" --check > "$T/bootstrap" 2>&1 || true
+grep -q "$(printf '  Codex\tnot reported')" "$T/bootstrap"
+grep -q 'codex not on PATH' "$T/bootstrap"
+mv "$T/codex-away" "$T/bin/codex"
+# Run the real manifest with source commands as stand-ins; its only inputs must be those three commands.
+test -x "$ROOT/scripts/manifest" || { echo 'FAIL: scripts/manifest missing'; exit 1; }
+cp "$ROOT/scripts/manifest" "$T/repo/scripts/"
+mv "$T/repo/scripts/bootstrap" "$T/bootstrap-real"
+cat > "$T/repo/scripts/bootstrap" <<'STUB'
+#!/bin/bash
+[ "$*" = --check ] || exit 90
+cat "$HOME/../bootstrap"
+exit "${BOOTSTRAP_RC:-0}"
+STUB
+cat > "$T/repo/scripts/automation" <<'STUB'
+#!/bin/bash
+[ "$*" = status ] || exit 90
+printf 'Automation (ADR 0011):\n  maintenance  ok  %s/log; owner %s; contact fixture@example.com\n  codex  ok  accounts/16b71170-7ca8-4b90-b1a8-f22eb93aaff5/home\n' "$HOME" "$(id -un)"
+STUB
+cat > "$T/repo/scripts/canon" <<'STUB'
+#!/bin/bash
+[ "$*" = list ] || exit 90
+printf 'FIELD ID ROLE PIN SOURCE\nagent codex tool 0123456789ab example/project\n'
+STUB
+chmod +x "$T/repo/scripts/"*
+"$T/repo/scripts/manifest" > "$T/text"
+"$T/repo/scripts/manifest" --json > "$T/json"
+jq -e '(.runtimes | length == 7) and all(.runtimes[]; all(.[]; type == "string" and length > 0))' "$T/json" >/dev/null
+jq -e '.bootstrap.command == "scripts/bootstrap --check" and .automation.command == "scripts/automation status" and .canon.command == "scripts/canon list"' "$T/json" >/dev/null
+jq -e '(.automation.report | contains("maintenance")) and (.canon.report | contains("0123456789ab"))' "$T/json" >/dev/null
+for output in "$T/text" "$T/json"; do
+  for runtime in 'Claude Code' Codex 'Muse Code' Antigravity 'DeepSeek Harness' Orca OmniRoute; do grep -qF "$runtime" "$output"; done
+  if grep -Eq '[[:alnum:]._%+-]+@[[:alnum:].-]+\.[[:alpha:]]{2,}' "$output"; then echo 'FAIL: email leaked'; exit 1; fi
+  if grep -qF login-fixture "$output"; then echo 'FAIL: fixture account leaked'; exit 1; fi
+  if grep -qF "$(id -un)" "$output"; then echo 'FAIL: login account leaked'; exit 1; fi
+  if grep -qF 16b71170-7ca8 "$output"; then echo 'FAIL: account folder id leaked'; exit 1; fi
+done
+# A short login name is replaced only as a whole word: the runtime table still parses
+USER=code LOGNAME=code "$T/repo/scripts/manifest" --json > "$T/short"
+jq -e '(.runtimes | length == 7) and (.runtime_parse_error == null) and (.bootstrap.report | contains("codex"))' "$T/short" >/dev/null
+usage_refused() {
+  if "$T/repo/scripts/manifest" "$@" > /dev/null 2> "$T/usage"; then echo "FAIL: usage '$*' accepted"; exit 1; fi
+  grep -q '^usage: scripts/manifest' "$T/usage" || { echo "FAIL: usage '$*' printed no usage line"; exit 1; }
+}
+usage_refused --bogus; usage_refused ''; usage_refused --json extra
+if BOOTSTRAP_RC=1 "$T/repo/scripts/manifest" --json > "$T/failure"; then echo 'FAIL: swallowed bootstrap failure'; exit 1; fi
+jq -e '.bootstrap.exit_code == 1 and (.bootstrap.report | length > 0)' "$T/failure" >/dev/null
+# A changed/missing runtime table must not silently become an empty JSON inventory.
+cp "$T/bootstrap" "$T/bootstrap-complete"
+printf 'Toolchain: not reported\n' > "$T/bootstrap"
+if "$T/repo/scripts/manifest" --json > "$T/unparsed"; then echo 'FAIL: missing runtime table accepted'; exit 1; fi
+jq -e '.runtime_parse_error | contains("not reported")' "$T/unparsed" >/dev/null
+mv "$T/bootstrap-complete" "$T/bootstrap"
+# The npm bin target is lib/bin.js, not argv basename dsh (pinned apps/cli/package.json).
+cat > "$T/bin/ps" <<'STUB'
+#!/bin/bash
+printf '301 1 00:30 node /opt/lib/node_modules/@deepseek-ai/dsh/lib/bin.js --profile dsh-tui\n'
+printf '302 301 00:20 node /opt/lib/node_modules/@deepseek-ai/dsh/lib/bin.js\n'
+printf '303 1 00:40 node /opt/lib/node_modules/@deepseek-harness-tui/dsh-tui/bin/dsh-tui.js .\n'
+STUB
+cat > "$T/bin/lsof" <<'STUB'
+#!/bin/bash
+echo 'n/work/review'
+STUB
+chmod +x "$T/bin/ps" "$T/bin/lsof"
+CANON_LEDGER_HOME="$T/absent" "$ROOT/scripts/lanes" --rates --json > "$T/rates"
+jq -e '[.workers[] | select(.runtime == "deepseek-harness")] | length == 2 and (map(.id) | sort == ["pid 301", "pid 303"]) and all(.[]; (.measured | not) and (.note | startswith("not measured")))' "$T/rates" >/dev/null
+CANON_LEDGER_HOME="$T/absent" "$ROOT/scripts/lanes" --rates > "$T/rates-text"
+grep -q 'deepseek-harness.*not measured' "$T/rates-text"
+grep -q 'deepseek-harness: process table only' "$T/rates-text"
+echo 'manifest: all offline cases passed'

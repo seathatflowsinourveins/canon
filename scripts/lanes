@@ -344,13 +344,18 @@ otlp_records() {
 # proc_list: TSV pid, elapsed, runtime, directory for each top-level codex, muse, agy or dsh process.
 # The program is argv[0], or for node and bun the first argument that is not a flag. A process with an
 # ancestor of the same runtime is a helper of that worker and is left out. Known limit: any program named
-# muse, agy or dsh is taken for that runtime.
+# muse, agy or dsh is taken for that runtime. DeepSeek's npm target is @deepseek-ai/dsh/lib/bin.js
+# (apps/cli/package.json at dsh-v0.2.1-rc.3); dsh-TUI v0.17.0's package.json names bin/dsh-tui.js.
+# Recognise those exact package suffixes under node/bun too.
 proc_list() {
   local pid et rt cwd
   ps -axo pid=,ppid=,etime=,args= 2>/dev/null | awk '
     function base(x) { sub(/.*\//, "", x); return x }
     function rt(   n, k) { n = base($4)
-      if (n == "node" || n == "bun") { n = ""; for (k = 5; k <= NF; k++) if (substr($k, 1, 1) != "-") { n = base($k); break } }
+      if (n == "node" || n == "bun") { n = ""; for (k = 5; k <= NF; k++) if (substr($k, 1, 1) != "-") {
+        if ($k ~ /\/@deepseek-ai\/dsh\/lib\/bin\.js$/) return "deepseek-harness"
+        if ($k ~ /\/@deepseek-harness-tui\/dsh-tui\/bin\/dsh-tui\.js$/) return "deepseek-harness"
+        n = base($k); break } }
       if (n == "codex") return "codex"; if (n == "muse") return "muse-code"
       if (n == "agy") return "antigravity"; if (n == "dsh" || n == "dsh-tui") return "deepseek-harness"
       return "" }
