@@ -127,7 +127,7 @@ exit 0, both items in the login keychain; `mise run paper:check` exit 0, account
 * The locks of clause 3. `paper:test` holds `canon-paper-test.lock` for its run. `paper:session` holds
   `canon-paper-windows.lock`, then, after uv's sync, `canon-alpaca-stream.lock`, on descriptor 7, since the
   runner's checkout lock is 8. Both waits come out of its one 900 s wait, so ADR 0050's deadline sum is
-  unchanged. A paper test takes the stream lock per test, not per run: a lock for the whole run would make
+  unchanged. Each wait is a non-blocking `lockf -t 0 <fd>` and a one-second sleep (`lock_wait` in mise.toml), not `lockf -t <secs> <fd>`: measured here on macOS, the descriptor form busy-loops, 29.3 s of CPU over a 30 s wait against 0.03 s for the poll. A paper test takes the stream lock per test, not per run: a lock for the whole run would make
   every test wait for every window, since both stream. A paper test module that builds a data client or a
   stream carries the `alpaca_stream` marker. Its fixture, one block in both conftests, takes the stream lock
   with `fcntl.flock` for that test, at the path `paper:test` names (`CANON_ALPACA_STREAM_LOCK`). The wait
