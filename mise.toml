@@ -173,7 +173,11 @@ start=$(/bin/date +%s)
 # than this wait, and a test can still lose the race to the next window. The lock is in the per-user
 # temporary folder, which is the same for every process of the user whatever $TMPDIR a session sets.
 # Descriptor 9 and the deadline: the note above this task.
-exec 9>>"$(/usr/bin/getconf DARWIN_USER_TEMP_DIR)canon-paper-test.lock"
+# the folder's name, or a stop: none would leave a lock file of this run's own, beside no other run's
+# (scripts/test-lanes, "per-user temporary folder")
+tmp="$(/usr/bin/getconf DARWIN_USER_TEMP_DIR)" || tmp=""
+case "$tmp" in /*/) ;; *) echo "paper:test: the per-user temporary folder is not known (DARWIN_USER_TEMP_DIR gave '$tmp'), so there is no paper lock to take; nothing was placed" >&2; exit 1 ;; esac
+exec 9>>"${tmp}canon-paper-test.lock"
 /usr/bin/lockf -t 3900 9 || { echo "paper:test: the paper lock stayed held for 3900 s; nothing was placed" >&2; exit 1; }
 # bounded <secs> <command...>: the command under timeout(1) -s KILL, in the process group timeout leads, with
 # its whole group killed on a stop and once it ends (the note above paper:test)
@@ -224,7 +228,8 @@ deadline=6240
 sync=600
 start=$(/bin/date +%s)
 [ -n "$ALPACA_API_KEY" ] && [ -n "$ALPACA_SECRET_KEY" ] || { echo "paper:session: a keychain item is empty; run: mise run paper:remove, then mise run paper:store" >&2; exit 1; }
-tmp="$(/usr/bin/getconf DARWIN_USER_TEMP_DIR)"
+tmp="$(/usr/bin/getconf DARWIN_USER_TEMP_DIR)" || tmp=""
+case "$tmp" in /*/) ;; *) echo "paper:session: the per-user temporary folder is not known (DARWIN_USER_TEMP_DIR gave '$tmp'), so there is no paper lock or log folder; nothing was placed" >&2; exit 1 ;; esac
 # a run the runner started (CANON_COMMIT) is the schedule's unless the runner itself says by hand, so a
 # runner installed before CANON_PAPER_SCHEDULED existed still writes the records status reads
 [ "${CANON_PAPER_SCHEDULED:-}" = 1 ] || [ -n "${CANON_COMMIT:-}" ] || export CANON_PAPER_BY_HAND=1

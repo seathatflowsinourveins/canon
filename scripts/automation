@@ -59,7 +59,11 @@ WATCH_NOTIFY_SECS=30                                  # ...and on its notificati
 # (each bound with the 5 s timeout -k gives a command that ignores SIGTERM)
 WATCH_SILENT=$((WATCH_SECS + 5 + WATCH_NOTIFY_SECS + 5 + INTERVAL + 300))
 PAPER_CHECKOUT="$CANON_HOME/paper-checkout"           # the clone each firing brings to origin's main
-PAPER_DIR="${CANON_PAPER_SESSION_DIR:-$(/usr/bin/getconf DARWIN_USER_TEMP_DIR 2>/dev/null)canon-paper-session}"
+# the windows' records: in the per-user temporary folder (getconf(1)), or empty when getconf gives none, which
+# the paper row then says rather than read a relative folder (CANON_GETCONF replaces getconf: tests only)
+PAPER_TMP=$("${CANON_GETCONF:-/usr/bin/getconf}" DARWIN_USER_TEMP_DIR 2>/dev/null) || PAPER_TMP=""
+case "$PAPER_TMP" in /*/) ;; *) PAPER_TMP="" ;; esac
+PAPER_DIR="${CANON_PAPER_SESSION_DIR:-${PAPER_TMP:+${PAPER_TMP}canon-paper-session}}"
 STALE_DAYS=2
 OTEL_LABEL="local.canon.otel-collector"
 OTEL_PLIST="$AGENTS_DIR/$OTEL_LABEL.plist"
@@ -516,7 +520,7 @@ do_uninstall() {
   credential.https://github.com.helper in $ROOT"; fi
   fi
   note "Left in place: $CANON_HOME/ledger, $CANON_HOME/watch (alert history), the session windows' records"
-  note "in $PAPER_DIR, $OTEL_DIR/logs.jsonl (and its rotated copies) and the weekly scheduled task."
+  note "in ${PAPER_DIR:-the per-user temporary folder}, $OTEL_DIR/logs.jsonl (and its rotated copies) and the weekly scheduled task."
   note "Remove the weekly task from the desktop app's Scheduled list."
   if [ -n "$left" ]; then note "uninstall: not removed:$left"; return 1; fi
 }
@@ -591,7 +595,12 @@ do_status() {
   else check_row "lane watchdog" OFF "run: scripts/automation install"; fi
 
   prc=0; pr=$(lc print "$DOMAIN/$PAPER_LABEL" 2>/dev/null) || prc=$?
-  if [ "$prc" = 0 ]; then
+  if [ "$prc" = 0 ] && [ -z "$PAPER_DIR" ]; then
+    last=$(printf '%s\n' "$pr" | awk -F' = ' '/^\tlast exit code = / && s == "" { s = $2 } END { print s }')
+    v="loaded, last exit code=${last:-?}, but the per-user temporary folder is not known (getconf DARWIN_USER_TEMP_DIR gave none), so the windows' records cannot be found"
+    cmp -s "$ROOT/home/.claude/canon/paper-session.sh" "$CANON_HOME/paper-session.sh" || v="$v; the installed runner differs from this tree's: run scripts/automation install"
+    check_row "paper session" UNKNOWN "$v"
+  elif [ "$prc" = 0 ]; then
     last=$(printf '%s\n' "$pr" | awk -F' = ' '/^\tlast exit code = / && s == "" { s = $2 } END { print s }')
     # launchctl(1), list: "The second column displays the last exit status of the job. If the number in this
     # column is negative, it represents the negative of the signal which stopped the job"; launchctl print
