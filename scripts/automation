@@ -563,6 +563,13 @@ do_status() {
   else check_row "landscape watch" OFF "hook missing from .claude/settings.json"; fi
 
   local pr prc state runs last label
+  # A session's ledger hook writes under its own CLAUDE_CONFIG_DIR (ledger.sh), and the watchdog reads only the
+  # folder its plist names (write_plist): sessions of a shell whose Claude config is another folder are not
+  # watched at all, which the row says, never ok. The watchdog's own status file is in its folder (wd).
+  local wcfg wd wmis=""
+  wcfg=$(plutil -extract EnvironmentVariables.CLAUDE_CONFIG_DIR raw -o - "$PLIST" 2>/dev/null) || wcfg=""
+  wd="${wcfg:-$CLAUDE_HOME}/canon/watch"
+  if [ -n "$wcfg" ] && [ "$(cd "$wcfg" 2>/dev/null && pwd -P || echo "$wcfg")" != "$(cd "$CLAUDE_HOME" 2>/dev/null && pwd -P || echo "$CLAUDE_HOME")" ]; then wmis=1; fi
   prc=0; pr=$(lc print "$DOMAIN/$LABEL" 2>/dev/null) || prc=$?
   if [ "$prc" = 0 ]; then
     # launchctl(1) says this output is not an API, so a value it does not show is UNKNOWN, never ok
@@ -573,14 +580,14 @@ do_status() {
     case "$last" in
       0) label=ok ;;
       ''|*[!0-9-]*) label=UNKNOWN; v="$v (no exit code to check)" ;;
-      *) label=FAILED; v="$v; see $CANON_HOME/watch/lanes-watch.log" ;;
+      *) label=FAILED; v="$v; see $wd/lanes-watch.log" ;;
     esac
-    if [ -f "$CANON_HOME/watch/lanes-status.json" ]; then
-      v="$v | $(jq -r 'if .ok == true then "last check " + .checked_at + ": " + (.sessions | tostring) + " session(s), " + (.flagged_now | tostring) + " flagged, ledger " + (.ledger_kb | tostring) + " KB" else "LAST CHECK FAILED: " + (.error // "no error recorded") end' "$CANON_HOME/watch/lanes-status.json" 2>/dev/null)"
-      jq -e '.ok == true' "$CANON_HOME/watch/lanes-status.json" >/dev/null 2>&1 || label=FAILED
+    if [ -f "$wd/lanes-status.json" ]; then
+      v="$v | $(jq -r 'if .ok == true then "last check " + .checked_at + ": " + (.sessions | tostring) + " session(s), " + (.flagged_now | tostring) + " flagged, ledger " + (.ledger_kb | tostring) + " KB" else "LAST CHECK FAILED: " + (.error // "no error recorded") end' "$wd/lanes-status.json" 2>/dev/null)"
+      jq -e '.ok == true' "$wd/lanes-status.json" >/dev/null 2>&1 || label=FAILED
       # a watchdog that hangs, or a job launchd no longer runs, leaves the last check as it was
       local age
-      age=$(jq -r --argjson now "$(date -u +%s)" '($now - (.checked_at | fromdateiso8601)) | floor' "$CANON_HOME/watch/lanes-status.json" 2>/dev/null)
+      age=$(jq -r --argjson now "$(date -u +%s)" '($now - (.checked_at | fromdateiso8601)) | floor' "$wd/lanes-status.json" 2>/dev/null)
       if ! [[ "$age" =~ ^-?[0-9]+$ ]]; then
         [ "$label" != ok ] || label=UNKNOWN; v="$v; the last check's time is unreadable"
       elif [ "$age" -gt "$WATCH_SILENT" ]; then
@@ -588,7 +595,10 @@ do_status() {
       fi
     else
       [ "$label" != ok ] || label=UNKNOWN
-      v="$v | no status file yet at $CANON_HOME/watch/lanes-status.json"
+      v="$v | no status file yet at $wd/lanes-status.json"
+    fi
+    if [ -n "$wmis" ]; then
+      label=FAILED; v="$v; the watchdog reads $wcfg, while this shell's sessions write to $CLAUDE_HOME, so they are not watched: run scripts/automation install from this shell, or use one Claude config folder"
     fi
     check_row "lane watchdog" "$label" "$v"
   elif no_answer "$prc"; then check_row "lane watchdog" UNKNOWN "launchctl did not answer within ${LAUNCHCTL_SECS} s, so whether it is loaded is not known"

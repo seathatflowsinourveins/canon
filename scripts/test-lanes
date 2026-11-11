@@ -79,7 +79,7 @@ B="$TMP/bin"; mkdir -p "$B"
 cat > "$B/mise" <<'EOF'
 #!/bin/bash
 # mise stub: version from $STUB/mise-version; exec logs MISE_EXEC_AUTO_INSTALL and fakes the tools
-echo "mise $* | exec_auto_install=${MISE_EXEC_AUTO_INSTALL:-unset} | pwd=$PWD | commit=${CANON_COMMIT:-} | by_hand=${CANON_PAPER_BY_HAND:-} | path=${PATH:-unset}" >> "$STUB/mise.log"
+echo "mise $* | exec_auto_install=${MISE_EXEC_AUTO_INSTALL:-unset} | pwd=$PWD | commit=${CANON_COMMIT:-} | by_hand=${CANON_PAPER_BY_HAND:-} | ceiling=${MISE_CEILING_PATHS:-} | path=${PATH:-unset}" >> "$STUB/mise.log"
 case "${1:-}" in
   --version) cat "$STUB/mise-version"; exit 0 ;;
   trust|install) exit 0 ;;
@@ -668,6 +668,27 @@ if command -v plutil >/dev/null 2>&1; then
   chmod +x "$STUB/otelcol"
   check "agent environment points the watchdog at the installed directory" \
         eval '[ "$pe" = "$AH" ] && jqt "$AH/canon/watch/lanes-status.json" "has(\"checked_at\")"'
+  # sessions write their events under their own CLAUDE_CONFIG_DIR (ledger.sh) and the watchdog reads only the
+  # one its plist names, so a status run from a shell whose Claude config is another folder says so (the
+  # environment map's finding): those sessions are not watched
+  mkdir -p "$TMP/other-claude/canon/watch"; ln -s "$AH" "$TMP/same-claude"
+  [ ! -e "$STUB/launchctl-print" ] || cp "$STUB/launchctl-print" "$STUB/launchctl-print.kept"
+  printf '\tstate = not running\n\truns = 3\n\tlast exit code = 0\n' > "$STUB/launchctl-print"
+  # the watchdog's last check, fresh and ok, kept aside meanwhile
+  cp "$AH/canon/watch/lanes-status.json" "$TMP/lanes-status.kept"
+  jq -n --arg at "$(iso "$(date -u +%s)")" '{checked_at: $at, ok: true, sessions: 1, flagged_now: 0, ledger_kb: 1}' > "$AH/canon/watch/lanes-status.json"
+  wstatus() { CLAUDE_CONFIG_DIR="$1" CANON_LAUNCHAGENTS_DIR="$TMP/agents" CANON_PAPER_SESSION_DIR="$PD" "$R/scripts/automation" status > "$TMP/status.out" 2>&1; }
+  wstatus "$AH"
+  check "status from a shell whose Claude config is the watchdog's: the watchdog row ok, no mismatch said" \
+        eval 'rowis "$TMP/status.out" "lane watchdog" ok && ! grep -q "the watchdog reads" "$TMP/status.out"'
+  wstatus "$TMP/same-claude"
+  check "... and from one that names the same folder through a link: ok too" \
+        eval 'rowis "$TMP/status.out" "lane watchdog" ok && ! grep -q "the watchdog reads" "$TMP/status.out"'
+  wstatus "$TMP/other-claude"
+  check "... and from one whose Claude config is another folder: FAILED, naming both, the watchdog's own last check shown" \
+        eval 'rowis "$TMP/status.out" "lane watchdog" FAILED && grep -qF "the watchdog reads $AH, while this shell'"'"'s sessions write to $TMP/other-claude" "$TMP/status.out" && grep -q "last check " "$TMP/status.out" && ! grep -q "no status file yet" "$TMP/status.out"'
+  rm -f "$STUB/launchctl-print"; [ ! -e "$STUB/launchctl-print.kept" ] || mv "$STUB/launchctl-print.kept" "$STUB/launchctl-print"
+  mv "$TMP/lanes-status.kept" "$AH/canon/watch/lanes-status.json"
   # an install over agents that are running: launchd's bootout returns while each job still stops, and a
   # bootstrap of the same label before it has gone is refused (observed with a throwaway label)
   linst() { CLAUDE_CONFIG_DIR="$AH" CANON_LAUNCHAGENTS_DIR="$TMP/agents" CANON_UNLOAD_SECS="$1" "$R/scripts/automation" install > "$TMP/install.out" 2>&1; }
@@ -745,6 +766,10 @@ check "... mise run paper:session --session auto --minutes 25, in the clone, CAN
       eval 'grep -qF "mise run paper:session --session auto --minutes 25 |" <<<"$(ran)" && grep -qF "| pwd=$(cd "$FK" && pwd) | commit=$want |" <<<"$(ran)"'
 check "... with PATH exported, which mise's exec() templates need to start a shell" \
       eval 'grep -qE "\| path=/usr/bin:/bin:/usr/sbin:/sbin\$" <<<"$(ran)"'
+# mise reads every config from its folder up to the root; above the clone are the automation folder, the
+# Claude config folder and HOME (an environment map's finding): mise is told to search no higher than the clone
+check "... with mise's config search stopped at the clone (MISE_CEILING_PATHS its parent, physical)" \
+      eval 'grep -qF "| ceiling=$(cd "$(dirname "$FK")" && pwd -P) |" <<<"$(ran)"'
 check "... and stamps the firing's start, which status reads to tell a schedule gone silent" \
       jqt "$FD/scheduled-firing.json" '(.at_epoch | type) == "number" and (now - .at_epoch) < 120'
 echo 2 > "$OW/tracked"; ocommit second; want=$(git -C "$O" rev-parse main)
