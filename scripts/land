@@ -163,23 +163,66 @@ status=$(git status --porcelain) || die "could not read the working tree's statu
 git rev-parse --verify -q "$base" >/dev/null || die "there is no $base to land on"
 ahead=$(git rev-list --count "$base..$branch") || die "could not count the commits on $branch"
 [ "$ahead" -gt 0 ] || die "$branch has nothing that main lacks"
-# A branch behind main: one never pushed is rebased; one already pushed (its pull request may be open) is
-# not, since pushing a rebased branch again needs a forced push. Merging main into it needs none, and the
-# squash merge still leaves one commit on main. The remote's branch counts as this one's only when it is an
-# ancestor of it; a same-named branch with other history (an earlier pull request's, say) does not.
+# A branch behind main: one never pushed is rebased onto it here, as AGENTS.md's Landing step 2 says; one
+# already pushed (its pull request may be open) is not, since pushing a rebased branch again needs a forced
+# push. Merging main into it needs none, and the squash merge still leaves one commit on main. The remote's
+# branch counts as this one's only when it is an ancestor of it; a same-named branch with other history (an
+# earlier pull request's, say) does not. With no remote, nothing this script lands through has the branch.
 # `git ls-remote --exit-code` exits 2 when no ref matches; the full ref name keeps `x/<branch>` out.
+# The rebase is git's own (git-rebase(1)): on a conflict it is aborted, which puts the branch back where it
+# was, and the conflicting paths are named; a rebase that leaves nothing ahead of main is reset back too.
+# The working tree is clean (checked above), so nothing is lost. A dry run changes no branch: it predicts a
+# conflict with git-merge-tree(1) and otherwise says that the rebase would happen.
+rebase_onto_base() {
+  local err conflicts before
+  if [ "$DRY" -eq 1 ]; then
+    # git-merge-tree(1) --write-tree merges in memory and touches no branch, index or file; it exits 1 when
+    # the merge conflicts. A merge, not a replay of each commit, so it predicts the rebase, it does not run it.
+    if ! conflicts=$(git merge-tree --write-tree --name-only --no-messages "$base" "$branch" 2>/dev/null); then
+      conflicts=$(printf '%s\n' "$conflicts" | sed 1d | sed "s/.*/'&'/" | paste -sd, - | sed 's/,/, /g')
+      die "dry run: $branch does not contain the current main and was never pushed, and rebasing it onto $base would conflict in ${conflicts:-a path git did not name}; resolve it by hand: git rebase $base"
+    fi
+    note "dry run: $branch does not contain the current main and was never pushed, so a run without --dry-run rebases it onto $base first; it is left as it is here, and the checks below run on it unrebased"
+    return 0
+  fi
+  note "$branch does not contain the current main and was never pushed; rebasing it onto $base"
+  before=$(git rev-parse HEAD) || die "could not read the head of $branch"
+  if ! err=$(git rebase -q "$base" 2>&1 >/dev/null); then
+    conflicts=$(git diff --name-only --diff-filter=U 2>/dev/null | sed "s/.*/'&'/" | paste -sd, - | sed 's/,/, /g')
+    git rebase --abort 2>/dev/null \
+      || die "rebasing $branch onto $base failed and could not be undone, so a rebase is still in progress here. Look at git status, then git rebase --abort (or resolve it and git rebase --continue). Nothing landed"
+    [ -z "$conflicts" ] \
+      || die "rebasing $branch onto $base conflicts in $conflicts; the rebase was undone and nothing landed. Resolve it by hand: git rebase $base, fix the files, git rebase --continue, then run this again"
+    err=${err:-nothing}
+    die "rebasing $branch onto $base failed, so it was undone and nothing landed. git said: ${err:0:400}"
+  fi
+  if [ "$(git rev-list --count "$base..$branch" 2>/dev/null || echo 0)" -eq 0 ]; then
+    git reset -q --hard "$before" \
+      || die "rebasing $branch onto $base left nothing that main lacks, and $branch could not be put back at ${before:0:12}: git reset --hard $before"
+    die "$branch has nothing that main lacks once rebased: every commit on it is already on main. It was left as it was; nothing landed"
+  fi
+  # The rebase brought main's own copy of this script, scripts/ci and check-addresses into the working
+  # tree; run that copy, so the rules applied are main's, not those the branch was cut from.
+  local args=()
+  [ -z "$BODY" ] || args+=(--body "$BODY")
+  [ -z "$REVIEWED" ] || args+=(--reviewed "$REVIEWED")
+  note "rebased; running main's copy of scripts/land on it"
+  exec "$SELF" ${args[@]+"${args[@]}"}
+}
 if ! git merge-base --is-ancestor "$base" "$branch"; then
   behind="$branch does not contain the current main"
-  [ -n "$remote" ] || die "$behind; rebase it onto main first: git rebase $base"
-  pushed_ref=$(git ls-remote --exit-code --heads "$remote" "refs/heads/$branch" 2>/dev/null); lsrc=$?
-  pushed_sha=${pushed_ref%%[[:space:]]*}
-  case "$lsrc" in
-    0) git merge-base --is-ancestor "$pushed_sha" "$branch" 2>/dev/null \
-         || die "$behind, and $remote already has a $branch with other history (an earlier pull request's, or someone else's). Give this one a new name and rebase it: git branch -m <new-name>, then git rebase $base. For a pull request someone else opened, use --pr"
-       die "$behind, and it is already pushed to $remote, so a rebase could only be pushed with force. Merge main into it instead: git merge $base, then run this again (the squash merge still leaves one commit). For a pull request someone else opened, use --pr" ;;
-    2) die "$behind and is not pushed yet; rebase it onto main first: git rebase $base (for a pull request someone else opened, use --pr)" ;;
-    *) die "$behind, and whether it is already pushed to $remote could not be read. Not pushed: git rebase $base. Already pushed: git merge $base. Then run this again" ;;
-  esac
+  if [ -z "$remote" ]; then rebase_onto_base
+  else
+    pushed_ref=$(git ls-remote --exit-code --heads "$remote" "refs/heads/$branch" 2>/dev/null); lsrc=$?
+    pushed_sha=${pushed_ref%%[[:space:]]*}
+    case "$lsrc" in
+      0) git merge-base --is-ancestor "$pushed_sha" "$branch" 2>/dev/null \
+           || die "$behind, and $remote already has a $branch with other history (an earlier pull request's, or someone else's). Give this one a new name and rebase it: git branch -m <new-name>, then git rebase $base. For a pull request someone else opened, use --pr"
+         die "$behind, and it is already pushed to $remote, so a rebase could only be pushed with force. Merge main into it instead: git merge $base, then run this again (the squash merge still leaves one commit). For a pull request someone else opened, use --pr" ;;
+      2) rebase_onto_base ;;
+      *) die "$behind, and whether it is already pushed to $remote could not be read. Not pushed: git rebase $base. Already pushed: git merge $base. Then run this again" ;;
+    esac
+  fi
 fi
 
 # The checks below decide whether a change may merge. A model's review does not; what the gate asks is
