@@ -13,6 +13,9 @@ buy $50 below the bid and a stop buy $50 above the ask, canceled by `CancelAllOr
 TC-E22, a stop and a stop-limit buy $50 above the ask, accepted at the prices sent and canceled on stop.
 Modify (ADR 0042): TC-E30 through the tester, whose one-tick amend the client denies as sub-penny, and a
 $1.00 buy modified to $1.01 through a node, then canceled.
+Two run with any session closed and need no node event for the order: TC-E84, a $1.00 buy placed with
+alpaca-py, as a prior session would leave it, which a node's start-up reconciliation must load open; and
+TC-E44's venue side, a $1.00 buy canceled twice through alpaca-py (ADR 0036).
 Two test extended hours (ADR 0038): a $1.00 buy marked eligible, accepted and canceled in any open session;
 and, in pre-market or after-hours only, a buy of 1 AAPL priced through the latest IEX ask (read from
 Alpaca's market data API), filled and sold back through the bid: that one trades a real paper share.
@@ -44,6 +47,7 @@ from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide as AlpacaOrderSide
+from alpaca.trading.enums import OrderStatus as AlpacaOrderStatus
 from alpaca.trading.enums import PositionSide
 from alpaca.trading.enums import QueryOrderStatus
 from alpaca.trading.enums import TimeInForce as AlpacaTimeInForce
@@ -267,7 +271,7 @@ async def run_hosted(node) -> None:
         await node.run_async()
 
 
-def paper_node() -> LiveNode:
+def paper_node(exec_engine: LiveExecutionEngineConfig | None = None) -> LiveNode:
     return LiveNode.build(
         "CANON-ALPACA-PAPER-EXEC",
         LiveNodeConfig(
@@ -277,6 +281,7 @@ def paper_node() -> LiveNode:
             timeout_reconciliation_secs=20,
             timeout_disconnection_secs=15,
             delay_post_stop_secs=0,
+            exec_engine=exec_engine,
             exec_clients={
                 "ALPACA": AlpacaExecutionClientConfig(
                     instrument_provider=InstrumentProviderConfig(load_ids=[str(AAPL)]),
@@ -590,6 +595,89 @@ def test_paper_limit_order_is_accepted_and_canceled() -> None:
         "OrderCanceled",
     ]
     assert strategy.venue_order_id
+
+
+def resting_buy(trading: TradingClient) -> AlpacaOrder:
+    """A DAY limit buy of 1 AAPL at $1.00 placed with alpaca-py, once Alpaca lists it open."""
+    placed = trading.submit_order(
+        LimitOrderRequest(
+            symbol="AAPL",
+            qty=1,
+            side=AlpacaOrderSide.BUY,
+            time_in_force=AlpacaTimeInForce.DAY,
+            limit_price=1.00,
+        )
+    )
+    assert isinstance(placed, AlpacaOrder)
+    order_id = placed.id
+    wait_until(
+        lambda: any(o.id == order_id for o in open_aapl_orders(trading)),
+        "Alpaca to list the order open",
+    )
+    return placed
+
+
+def test_paper_open_order_from_a_prior_session_is_reconciled_tc_e84() -> None:
+    """TC-E84, "Reconcile open orders", of upstream's Execution Testing Spec: an open limit order left by a
+    prior session, here placed with alpaca-py, and a node started with reconciliation on and no lookback.
+    Pass: the order is loaded into the cache with its venue order ID, `ACCEPTED`, its price, quantity,
+    side and type. The client reads open orders on their own, with no window, so neither a lookback nor
+    the account's newest 500 orders can leave one out (ADR 0030). No strategy claims it, so it is
+    `EXTERNAL`, as the card says; the clean-up cancels it, the one order it finds."""
+
+    class StopOnStart(Strategy):
+        def on_start(self) -> None:
+            self.shutdown_system("reconciled")
+
+    with aapl_left_as_found() as cleaned:
+        placed = resting_buy(paper_trading())
+        node = paper_node(LiveExecutionEngineConfig(reconciliation=True))
+        cache = node.cache  # read through the cache taken before the run, as the flat test does
+        node.add_strategy(StopOnStart())
+        try:
+            asyncio.run(run_hosted(node))
+            loaded = [
+                (o.status, o.price.as_decimal(), o.quantity.as_double(), o.side, o.order_type)
+                for o in cache.orders()
+                if o.venue_order_id is not None and o.venue_order_id.value == str(placed.id)
+            ]
+        finally:
+            node.dispose()
+
+    assert cleaned == {"orders": 1, "positions": 0}, cleaned
+    assert loaded == [(OrderStatus.ACCEPTED, Decimal(1), 1.0, OrderSide.BUY, OrderType.LIMIT)]
+
+
+def test_paper_cancel_of_a_canceled_order_tc_e44() -> None:
+    """TC-E44, "Cancel already-canceled order", on the venue's side, through alpaca-py as the card's
+    adapter-focused form allows (`Strategy.cancel_order` drops a cancel for a locally closed order): a
+    $1.00 buy canceled, then canceled again once Alpaca shows it canceled. Alpaca's "Delete Order by ID"
+    documents 422 for an order not cancelable; on paper on 2026-11-10, after hours, the second cancel was
+    answered with no error (204), as the card allows "a documented idempotent result". Pass: the second
+    cancel is answered 204 or refused 422, and the order still reads `canceled`. The client handles both:
+    a 204 waits for the `canceled` update, a 422 cancels the order from Alpaca's read (ADR 0036)."""
+    with aapl_left_as_found() as cleaned:
+        trading = paper_trading()
+        placed = resting_buy(trading)
+        trading.cancel_order_by_id(placed.id)
+
+        def status() -> object:
+            held = trading.get_order_by_id(placed.id)
+            assert isinstance(held, AlpacaOrder)
+            return held.status
+
+        wait_until(lambda: status() == AlpacaOrderStatus.CANCELED, "Alpaca to show it canceled")
+        try:
+            trading.cancel_order_by_id(placed.id)
+            second: int | None = None
+        except APIError as e:
+            second = e.status_code
+        after = status()
+
+    print(f"TC-E44: the second cancel was answered {second or 204}")  # shown with -s
+    assert cleaned == {"orders": 0, "positions": 0}, cleaned
+    assert second in (None, 422), second
+    assert after == AlpacaOrderStatus.CANCELED
 
 
 def test_paper_cancel_all_on_stop_tc_e41() -> None:

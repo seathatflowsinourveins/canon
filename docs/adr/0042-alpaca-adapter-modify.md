@@ -112,3 +112,11 @@ Read 2026-11-10; "raw": fetched with `curl` and read, not summarised. NautilusTr
 * Second reader (`evidence-verifier`), 2026-11-10, on modify once: the decision stands. Corrected above, in
   ADR 0036 before the split: the documented client order ID; no source for a 403 on a replace; TC-E30's
   criterion; Binance's two paths.
+* A second reader after landing, 2026-11-10: traces were cached by the Alpaca order's client order ID, so
+  two orders made outside the node with an empty one shared a trace, either taking the other's root.
+  Reproduced with a test and fixed: the cache is keyed by Alpaca's order ID.
+* A second reader after landing, 2026-11-10: a trace that failed was skipped for a working replacement on a
+  timeout, so the node went on without it, and raised from the whole report on a body alpaca-py cannot
+  build. Reproduced with a test each and fixed: a failed trace, those classes included, fails the report
+  for an open order, as any open order this slice cannot represent does (ADR 0030), and skips a closed one
+  with a warning.
