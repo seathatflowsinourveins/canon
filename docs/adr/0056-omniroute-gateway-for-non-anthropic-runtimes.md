@@ -243,6 +243,22 @@ UNVERIFIED until the agent runs on this machine:
 * that its keychain reads succeed from a launchd job without a dialog;
 * that a stop through launchd leaves no process of the gateway.
 
+### Correction of 2026-11-11: the stored-settings read opens the database normally, under `query_only`
+
+The agent's first start failed in `omniroute:serve`'s read of the stored `REQUIRE_API_KEY` override.
+OmniRoute keeps `storage.sqlite` in WAL mode (header bytes 18 and 19 are 2), and a clean stop removes its
+`-wal` and `-shm` files. SQLite's WAL page says a WAL database can be read only if those files exist or can
+be created. A `-readonly` connection does not create them, so Apple's `sqlite3` 3.54.0 refused the open
+("unable to open database file (14)") and the gateway could not start again after a clean stop. The task now
+opens the database as `scripts/bootstrap --check` does: a normal open, with `PRAGMA query_only=1` ahead of
+the select, which refuses a statement that writes ("attempt to write a readonly database"). The open is
+not inert. It creates the side files, and after a crash SQLite's recovery checkpoints a leftover WAL or
+rolls back a hot journal into `storage.sqlite`, which OmniRoute's own open would do next anyway (the
+review reproduced the checkpoint on a copied WAL). The task's comment had said that bootstrap's read was
+read-only; it now says what both do. `scripts/test-lanes` covers it with a WAL
+database that has no side files. That database is read, an override in it is still refused, and an INSERT
+through the task's own open is refused with nothing stored. Those three cases failed on the task as it was.
+
 ## Evidence
 
 Read 2026-11-10; `fetched`: downloaded and searched, not summarised. Source lines are at `v3.8.53` in a
@@ -367,3 +383,11 @@ clone of the tag unless named otherwise (`read`).
   2026-11-11: the made-up key had gone to `GET /v1/models`, which `REQUIRE_API_KEY` does not gate; the
   caller's `NODE_OPTIONS`, proxy and CA reached the gateway; keychain errors read as absent; a newline
   could pass the override check; curl from `PATH`; and smaller ones: all fixed above.
+* https://www.sqlite.org/wal.html, 2026-11-11 (fetched). Section 5, "Read-Only Databases": a WAL database
+  "can still be read as long as" "The -shm and -wal files already exist and are readable", the directory can
+  be written so that they "can be created", or the connection uses `immutable`. Section 1: the opening process
+  needs write access to the `-shm` file or, if that file does not exist, to the directory. Section 4: the WAL
+  file "is deleted automatically when the last connection to the database closes". Apple's `/usr/bin/sqlite3`
+  3.54.0 on a scratch WAL database, checkpointed and with its side files removed (run). `-readonly`: "unable
+  to open database file (14)". A normal open with `PRAGMA query_only=1`: the select returned, and an INSERT
+  got "attempt to write a readonly database". That open left new `-wal` and `-shm` files.

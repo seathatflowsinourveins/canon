@@ -134,6 +134,12 @@ moved the CLI from 2.1.321 to 2.1.322. `scripts/bootstrap --check` ended "All pr
 `claude-fable-5-1` then started and billed on `claude-opus-5-5`, confirming the allowlist and the vendor's
 fallback.
 
+Confirmation, 2026-11-11, the lead applied #174 on this machine at commit 0cb6d1a. The claude-hud plugin v0.15.0
+was installed at user scope. `scripts/bootstrap --user-config` installed the status-line script and the HUD
+config. `scripts/bootstrap --check` showed "auto-compact window ok 300000 tokens" and the status line ok. A
+render with example input gave two lines with no address or account name, and a grep of it for identifiers
+matched 0 lines.
+
 **Auto-compaction (added 2026-11-11, the lead's decision).** The template sets `"autoCompactWindow": 300000`
 for every session, and `scripts/bootstrap --user-config` adds it to a settings file that lacks it. The
 documented default for a model with a native 1M window, which includes the Fable models, is to compact at
