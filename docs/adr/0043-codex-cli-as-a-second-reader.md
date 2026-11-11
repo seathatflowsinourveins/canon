@@ -154,3 +154,23 @@ page and a model summarised it. "Second reader": the `evidence-verifier`, the sa
   incremental tools to Amazon Bedrock providers"; nothing under `codex-rs/otel` (`gh api` compare). Licence
   at the tag: Apache 2.0 (fetched). The trials above ran 0.167.0; this machine moves with `mise use -g
   codex@0.167.1` once the pin is on main (not yet run).
+* DeepSeek Harness dispatch, 2026-11-11: twice that day a DeepSeek Harness worker started from an Orca Run
+  stayed at the dsh-tui start screen with its task never submitted. A trial dispatch of a one-word task
+  (dsh-tui v0.17.0, deepseek-flash, `--agent dsh`) did not reproduce it: the task was submitted at start and
+  answered within about 11 seconds, with the machine's one-minute load near 9. Orca's agent definition for
+  `dsh` (read from the installed app bundle) launches `dsh-tui .`, delivers the task on stdin after start
+  once a composer-ready signal shows, and retries the submit each second for up to 30 seconds. dsh-tui's
+  README says text entered while the backend starts is kept as a draft and an Enter before the backend is
+  ready sends nothing. dsh-tui's docs list no argument, flag or setting that passes a task at start for the
+  interactive TUI (its `run` and `-p` modes are a separate non-interactive CLI), and DeepSeek Harness's own
+  docs were not read for this; whether v0.19.0 changes the interactive start is UNVERIFIED, and no pin moves for this. The cause of
+  the two failures is UNVERIFIED; slow start under load, past the 30-second retry budget, is the one
+  candidate not ruled out. Runtime stays dispatchable. What would lift this: a failed start kept with its
+  screen and the load at the time, or Orca raising the budget; a worker that stays at the start screen is
+  stopped and re-dispatched.
+* DeepSeek Harness as a builder, 2026-11-11: the lead ruled that a DeepSeek Harness worker writes files in
+  its workspace and does not commit; a Claude lane reproduces its tests, commits and lands (ADR 0079). Trial
+  evidence: a worker in workspace-write finished its two files, then `git add` was refused because a linked
+  worktree keeps its index under the main repository's common git directory, outside the sandbox root, and
+  its approval prompt asked for full access, which nobody answers. No wider sandbox is proposed. Whether
+  DeepSeek Harness documents a setting that adds a writable root is UNVERIFIED (not read).
