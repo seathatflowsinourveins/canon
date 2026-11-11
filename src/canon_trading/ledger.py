@@ -60,7 +60,8 @@ a bar at exactly 00:00 UTC counting for the day ending there, as the daily serie
 `BacktestResult` has no such list. The session days and the data digest are taken from the bars the
 run read: those the engine's cache kept (`BacktestRun.bars`, from `Cache.bars`, with the run built by
 `checked_run_config` so the cache can keep every one), not a later read of the catalog, which may have
-changed after the replay. A run whose cache holds another number of bars than it replayed
+changed after the replay. The digest holds the instrument definitions the run traded against too, as
+the cache held them (`BacktestRun.instruments`): the node loads them from the catalog with the bars. A run whose cache holds another number of bars than it replayed
 (`BacktestResult.iterations`), or a bar outside the sample, is told `FAIL`. So is a run whose bars
 differ from those the coverage check read (`CheckedRunConfig.bars`): the node reads the catalog again
 from its path, and a catalog replaced between the check and the replay was never checked to cover the
@@ -576,8 +577,20 @@ def session_days(bars: Sequence[Bar]) -> list[str]:
     return [str(day) for day in sorted({session_day(bar.ts_init) for bar in bars})]
 
 
-def data_digest(bars: Sequence[Bar], bar_types: Sequence[str]) -> dict[str, str]:
-    """ADR 0053's identity of the data a run read: for each bar type, a SHA-256 of its bars.
+def data_digest(
+    bars: Sequence[Bar], bar_types: Sequence[str], instruments: Sequence[Any]
+) -> dict[str, str]:
+    """ADR 0053's identity of the data a run read: `bars_digest`, and for each instrument in
+    `instruments` a SHA-256 of its definition (`instrument_digest`), keyed by its ID (`AAPL.ALPACA`),
+    which no bar type's text equals."""
+    digests = bars_digest(bars, bar_types)
+    for instrument in instruments:
+        digests[str(instrument.id)] = instrument_digest(instrument)
+    return dict(sorted(digests.items()))
+
+
+def bars_digest(bars: Sequence[Bar], bar_types: Sequence[str]) -> dict[str, str]:
+    """The bars' part of the data identity: for each bar type, a SHA-256 of its bars (ADR 0053 term 1).
 
     Each of `bar_types`, the bar types the run loads, has an entry even with no bar in `bars`, the
     digest of no lines: the run read that bar type and found nothing, which another run that found
@@ -599,6 +612,33 @@ def data_digest(bars: Sequence[Bar], bar_types: Sequence[str]) -> dict[str, str]
         bar_type: hashlib.sha256("\n".join(found).encode("utf-8")).hexdigest()
         for bar_type, found in sorted(lines.items())
     }
+
+
+def instrument_digest(instrument: Any) -> str:
+    """The SHA-256 of an instrument's definition, as the data identity holds it (ADR 0053 term 1).
+
+    The definition is upstream's own dict form of the instrument, `Instrument.to_dict()` (its type,
+    ID, currency, precisions, increments, limits, margins and `info` at the pin), in `canonical_json`,
+    without `ts_event` and `ts_init`: those say when the definition was stamped, not what it is, and a
+    load that stores the same definition again stamps it anew. The node loads the definition from the
+    catalog and the engine trades against it: a quantity limit alone changed what a run traded on the
+    same bars (`tests/test_ledger.py`), so two runs on one sample that read two definitions of one
+    instrument read different data. A catalog that holds two definitions of one instrument does not
+    run: the node refuses it ("already registered with a different definition", observed at the pin),
+    so the cache's definition is the one the run traded against. `info` is kept: it is part of what the
+    catalog stores, and a load writes a definition only when the catalog holds none
+    (`canon_trading.bars_to_catalog`), so a refresh of the bars does not restamp it. A value in it with
+    no stable text form raises `TypeError` naming the instrument and its field.
+    """
+    try:
+        definition = {
+            name: _field(name, value)
+            for name, value in instrument.to_dict().items()
+            if name not in ("ts_event", "ts_init")
+        }
+    except TypeError as error:
+        raise TypeError(f"instrument {instrument.id}'s definition: {error}") from None
+    return hashlib.sha256(canonical_json(definition).encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -661,7 +701,8 @@ def record_trial(
     bar_types = [str(bar_type) for data in run_config.data for bar_type in data.bar_types or ()]
     if bar_types != config["data"]["bar_types"]:
         raise RuntimeError(f"the run loads {bar_types}, not the bar types its key names")
-    checked_digest = data_digest(_in_order(checked.bars), bar_types)
+    # The bars only: the instruments are the run's own, from its cache (ADR 0053 term 1).
+    checked_digest = bars_digest(_in_order(checked.bars), bar_types)
     del checked  # only the digest is kept, so the checked bars are not held through the run
 
     trial = _own_trial(study)
@@ -686,13 +727,19 @@ def record_trial(
                 f"the run replayed {len(outside)} bars outside {sample.describe()}, the first "
                 f"at {_date(outside[0].ts_init)}",
             )
-        digest = data_digest(bars, bar_types)
-        if digest != checked_digest:
+        missing = [b for b, i in zip(bar_types, run.instruments, strict=True) if i is None]
+        if missing:
+            raise RuntimeError(
+                f"the engine's cache holds no instrument for {missing[0]}, so the data the run read "
+                "cannot be identified (ADR 0053)",
+            )
+        if bars_digest(bars, bar_types) != checked_digest:
             raise RuntimeError(
                 f"the run read other bars than the coverage check read over {sample.describe()}: "
                 "the catalog changed between the check and the replay, so what the run read was "
                 "never checked to cover the sample (ADR 0041); record the trial again",
             )
+        digest = data_digest(bars, bar_types, run.instruments)
         days = session_days(bars)
         trial.set_user_attr("run_config_id", result.run_config_id)
         trial.set_user_attr("backtest_start", result.backtest_start)

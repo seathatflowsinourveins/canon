@@ -81,9 +81,26 @@ def study(tmp_path: Path) -> Iterator[optuna.Study]:
         yield opened
 
 
+def bars_of(label: str) -> str:
+    """The bar type of the configuration named `label`, on an instrument of its own."""
+    return f"{label.upper()}.ALPACA-1-DAY-LAST-EXTERNAL"
+
+
+def instrument_of(label: str) -> str:
+    return f"{label.upper()}.ALPACA"
+
+
 def config_of(label: str) -> dict[str, object]:
     """A stored config for the configuration named `label`, in the part of its form the gate reads."""
-    return {"label": label, "data": {"data_type": "Bar", "bar_types": [f"bars of {label}"]}}
+    return {"label": label, "data": {"data_type": "Bar", "bar_types": [bars_of(label)]}}
+
+
+def digest_of(label: str) -> dict[str, str]:
+    """A data digest as `record_trial` writes one for `config_of(label)`: its bars and instrument."""
+    return {
+        bars_of(label): hashlib.sha256(f"bars {label}".encode()).hexdigest(),
+        instrument_of(label): hashlib.sha256(f"instrument {label}".encode()).hexdigest(),
+    }
 
 
 # Each key `key_of` made, mapped back to its label, so a message reads "pick: ..." for the test.
@@ -165,7 +182,7 @@ def write(
         "backtest_end": bounds.end,
         "returns_series": {str(d): value for d, value in zip(days, returns or [], strict=True)},
         "session_days": [str(d) for d in calendar],
-        "data_digest": {f"bars of {label}": hashlib.sha256(str(label).encode()).hexdigest()},
+        "data_digest": digest_of(str(label)),
         "config": config_of(str(label)),
     }
     written.update(attrs or {})
@@ -1048,7 +1065,7 @@ def test_a_record_that_ran_in_a_state_the_writer_never_tells_stops(
         "backtest_end": END,
         "returns_series": {str(DAY_0 + n * DAY_NS): r for n, r in enumerate(PICK)},
         "session_days": [str(DAY_0 + n * DAY_NS) for n in range(T)],
-        "data_digest": {"bars of pick": hashlib.sha256(b"pick").hexdigest()},
+        "data_digest": digest_of("pick"),
         OUTCOME: outcome,
     }.items():
         trial.set_user_attr(name, attr)
@@ -1102,11 +1119,19 @@ def test_a_digest_that_lacks_a_bar_type_the_run_loads_stops(study: optuna.Study)
         study,
         "third",
         THIRD_CLOSE,
-        attrs={"config": {"data": {"data_type": "Bar", "bar_types": ["bars of third", "MSFT"]}}},
+        attrs={
+            "config": {
+                "data": {
+                    "data_type": "Bar",
+                    "bar_types": [bars_of("third"), "MSFT.ALPACA-1-DAY-LAST-EXTERNAL"],
+                },
+            },
+        },
     )
 
     with pytest.raises(
-        RankingStopped, match=rf"third: #{number} [^\n]*data_digest names \['bars of third'\], not"
+        RankingStopped,
+        match=rf"third: #{number} [^\n]*data_digest names \['THIRD\.ALPACA', 'THIRD\.ALPACA-1[^\]]*\], not",
     ):
         rank(study)
 
@@ -1240,3 +1265,18 @@ def test_an_outcome_is_a_run_only_in_a_state_the_writer_leaves(
         trial_id=0,
     )
     assert ranking.ran_to_the_end(trial) is ran
+
+
+def test_a_digest_without_its_instruments_stops(study: optuna.Study) -> None:
+    """A second reader: the data identity held the bars only, so records on two definitions of one
+    instrument agreed. A record whose digest names its bar types and not their instruments, as every
+    record made before the instruments joined it, is not in the writer's shape (ADR 0053 term 1)."""
+    write(study, "pick", PICK)
+    write(study, "second", SECOND)
+    bars_only = {bars_of("third"): digest_of("third")[bars_of("third")]}
+    number = write(study, "third", THIRD_CLOSE, attrs={"data_digest": bars_only})
+
+    with pytest.raises(
+        RankingStopped, match=rf"third: #{number} [^\n]*not the bar types it loads and their instr"
+    ):
+        rank(study)

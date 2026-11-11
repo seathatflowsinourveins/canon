@@ -39,7 +39,10 @@ from zoneinfo import ZoneInfo
 
 import optuna
 import pytest
+from alpaca.trading.models import Asset
+from canon_alpaca.providers import parse_equity
 from nautilus_trader.model import BarType
+from nautilus_trader.model import Equity
 from nautilus_trader.model import NautilusDataType
 from nautilus_trader.model import Quantity
 from nautilus_trader.persistence import ParquetDataCatalog
@@ -62,6 +65,7 @@ from canon_trading.ledger import create_ledger_study
 from canon_trading.ledger import current_sample
 from canon_trading.ledger import data_digest
 from canon_trading.ledger import default_ledger_path
+from canon_trading.ledger import instrument_digest
 from canon_trading.ledger import mark_not_run
 from canon_trading.ledger import move_sample
 from canon_trading.ledger import open_study
@@ -167,8 +171,10 @@ def test_a_trial_round_trips_through_the_sqlite_file(
         str(ns): value for ns, value in result.returns_series.items()
     }
     assert trial.user_attrs["session_days"] == [str(bar.ts_init // DAY_NS * DAY_NS) for bar in bars]
-    [(digested, digest)] = trial.user_attrs["data_digest"].items()
-    assert (digested, len(digest)) == (str(BAR_TYPE), 64)
+    digests = trial.user_attrs["data_digest"]
+    assert set(digests) == {str(BAR_TYPE), str(BAR_TYPE.instrument_id)}
+    assert all(len(digest) == 64 for digest in digests.values())
+    assert digests[str(BAR_TYPE.instrument_id)] == instrument_digest(alpaca_bars.equity())
     assert config_key(trial.user_attrs["config"]) == recorded.config_key
     strategy_config = trial.user_attrs["config"]["strategies"][0]
     assert strategy_config == {
@@ -918,7 +924,9 @@ def test_the_digest_is_of_the_bars_the_run_read_not_a_later_catalog(
     )
 
     first, second = study.trials
-    assert first.user_attrs["data_digest"] == data_digest(original, [str(BAR_TYPE)])
+    assert first.user_attrs["data_digest"] == data_digest(
+        original, [str(BAR_TYPE)], [alpaca_bars.equity()]
+    )
     assert second.user_attrs["data_digest"] != first.user_attrs["data_digest"]
     with pytest.raises(RankingStopped, match="read different bars"):
         rank(study)
@@ -1382,12 +1390,17 @@ def test_a_bar_type_with_no_bar_in_the_sample_is_in_the_digest(
 
     [trial] = study.trials
     assert recorded.outcome == TRADED
-    assert set(trial.user_attrs["data_digest"]) == {str(BAR_TYPE), str(MSFT_BAR_TYPE)}
+    assert set(trial.user_attrs["data_digest"]) == {
+        str(BAR_TYPE),
+        str(MSFT_BAR_TYPE),
+        str(BAR_TYPE.instrument_id),
+        str(MSFT_BAR_TYPE.instrument_id),
+    }
     assert trial.user_attrs["data_digest"][str(MSFT_BAR_TYPE)] == EMPTY_DIGEST
 
 
 def test_data_digest_names_every_bar_type_the_run_loads() -> None:
-    assert data_digest([], [str(MSFT_BAR_TYPE)]) == {str(MSFT_BAR_TYPE): EMPTY_DIGEST}
+    assert data_digest([], [str(MSFT_BAR_TYPE)], []) == {str(MSFT_BAR_TYPE): EMPTY_DIGEST}
 
 
 def test_a_base_strategy_config_field_set_away_from_its_default_is_in_the_key() -> None:
@@ -1482,3 +1495,121 @@ def test_a_stored_sample_not_in_the_writers_form_is_refused(
 
     with pytest.raises(LedgerNotFound, match="no sample in the form"):
         samples(study)
+
+
+def restricted_msft(alpaca_bars: AlpacaBars, path: Path) -> None:
+    """AAPL and MSFT bars as `alpaca_bars` writes them, with MSFT's `Equity` taking at most 5 shares an
+    order: the bars are the same, and only the instrument definition the node loads differs."""
+    alpaca_bars.write(path, symbols=("AAPL",))
+    alpaca_bars.write(path, symbols=("MSFT",), instrument=False)
+    listed = alpaca_bars.equity("MSFT")
+    ParquetDataCatalog(str(path)).write_instruments(
+        [
+            Equity(
+                instrument_id=listed.id,
+                raw_symbol=listed.raw_symbol,
+                currency=listed.quote_currency,
+                price_precision=listed.price_precision,
+                price_increment=listed.price_increment,
+                ts_event=0,
+                ts_init=0,
+                max_quantity=Quantity.from_int(5),
+                info=dict(listed.info),
+            )
+        ]
+    )
+
+
+def pair(fast: int, slow: int) -> list[MaCrossConfig]:
+    return [
+        MaCrossConfig(
+            bar_type=bar_type,
+            trade_size=Quantity.from_int(10),
+            fast_period=fast,
+            slow_period=slow,
+            order_id_tag=tag,
+        )
+        for bar_type, tag in ((BAR_TYPE, "A"), (MSFT_BAR_TYPE, "M"))
+    ]
+
+
+def test_trials_on_two_definitions_of_one_instrument_stop(
+    alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack
+) -> None:
+    """A second reader: the data identity held the bars only, so trials that ran on one catalog's bars
+    with two definitions of MSFT (a 5-share order limit in one) agreed on their digests, and three keys
+    recorded across the two ranked and passed at DSR 0.9916, though the limit changed what one run
+    traded and so its returns."""
+    alpaca_bars.write(tmp_path / "plain", symbols=("AAPL", "MSFT"))
+    restricted_msft(alpaca_bars, tmp_path / "restricted")
+    study = new_study(stack, tmp_path, "two definitions")
+
+    first = record_trial(study, tmp_path / "plain", pair(3, 8), starting_balances=BALANCES)
+    again = record_trial(study, tmp_path / "restricted", pair(3, 8), starting_balances=BALANCES)
+    trials = {t.number: t for t in study.trials}
+    # The same configuration on the same bars traded other returns under the other definition.
+    assert (first.outcome, again.outcome) == (TRADED, TRADED)
+    assert (
+        trials[first.number].user_attrs["returns_series"]
+        != trials[again.number].user_attrs["returns_series"]
+    )
+
+    other = new_study(stack, tmp_path, "across keys")
+    record_trial(other, tmp_path / "plain", pair(3, 8), starting_balances=BALANCES)
+    record_trial(other, tmp_path / "restricted", pair(4, 9), starting_balances=BALANCES)
+    record_trial(other, tmp_path / "restricted", pair(2, 7), starting_balances=BALANCES)
+    with pytest.raises(
+        RankingStopped,
+        match=r"MSFT\.ALPACA: records on sample 0 [^\n]*read different definitions of the instr",
+    ):
+        rank(other)
+
+
+def test_an_instrument_s_digest_is_its_definition_not_when_it_was_stamped(
+    alpaca_bars: AlpacaBars,
+) -> None:
+    listed = alpaca_bars.equity()
+    stamped_later = parse_equity(Asset.model_validate(alpaca_bars.ASSET), 1_000)
+    limited = Equity(
+        instrument_id=listed.id,
+        raw_symbol=listed.raw_symbol,
+        currency=listed.quote_currency,
+        price_precision=listed.price_precision,
+        price_increment=listed.price_increment,
+        ts_event=0,
+        ts_init=0,
+        max_quantity=Quantity.from_int(5),
+        info=dict(listed.info),
+    )
+
+    assert stamped_later.ts_init != listed.ts_init
+    assert instrument_digest(stamped_later) == instrument_digest(listed)
+    assert instrument_digest(limited) != instrument_digest(listed)
+
+
+def test_a_catalog_with_two_definitions_of_one_instrument_does_not_run(
+    alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack
+) -> None:
+    """The cache's definition is the one the run traded against only if a run reads one: the node
+    refuses a catalog that holds two definitions of an instrument, so no run read another first."""
+    alpaca_bars.write(tmp_path / "catalog", instrument=False)
+    listed = alpaca_bars.equity()
+    limited = Equity(
+        instrument_id=listed.id,
+        raw_symbol=listed.raw_symbol,
+        currency=listed.quote_currency,
+        price_precision=listed.price_precision,
+        price_increment=listed.price_increment,
+        ts_event=1,
+        ts_init=1,
+        max_quantity=Quantity.from_int(5),
+        info=dict(listed.info),
+    )
+    ParquetDataCatalog(str(tmp_path / "catalog")).write_instruments([listed])
+    ParquetDataCatalog(str(tmp_path / "catalog")).write_instruments([limited])
+    study = new_study(stack, tmp_path, "two versions")
+
+    with pytest.raises(RuntimeError, match="already registered with a different definition"):
+        record_trial(study, tmp_path / "catalog", [strategy()], starting_balances=BALANCES)
+    [trial] = study.trials
+    assert (trial.state, trial.user_attrs[OUTCOME]) == (TrialState.FAIL, FAILED)
