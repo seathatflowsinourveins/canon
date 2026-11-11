@@ -98,5 +98,9 @@ Read 2026-11-09 (fetched unless noted).
   had no source; all are corrected above.
 * https://github.com/github/spec-kit and https://github.com/bmad-code-org/BMAD-METHOD — both widely starred,
   no shared spec format between them.
+* https://github.com/github/spec-kit/releases/tag/v1.4.0 — published 2026-11-10; read 2026-11-10 (`gh`):
+  HTTPS required for catalog sources, workflow pipe filters, reasoning-effort mapping for Copilot, Claude Code and
+  Codex, fixes; no breaking change named. `spec-kit` stays `watch` and is not installed; its pin moved
+  from `tag:v1.3.3` to `tag:v1.4.0` → `0019fa14d12f` (resolved).
 * Star counts across this field are very high and could not be checked for inflation: UNVERIFIED as a quality
   signal.
