@@ -24,6 +24,7 @@ from types import SimpleNamespace
 import canon_alpaca.data
 import canon_alpaca.providers
 import pytest
+from alpaca.data.enums import DataFeed
 from canon_alpaca.constants import ENV_API_KEY
 from canon_alpaca.constants import ENV_SECRET_KEY
 from nautilus_trader.core.datetime import dt_to_unix_nanos
@@ -33,7 +34,9 @@ from nautilus_trader.model import Quantity
 from nautilus_trader.persistence import ParquetDataCatalog
 
 from canon_trading.backtest import run_backtest
+from canon_trading.bars_to_catalog import FEED_FILE
 from canon_trading.bars_to_catalog import catalog_bars
+from canon_trading.bars_to_catalog import catalog_feed
 from canon_trading.bars_to_catalog import load_bars
 from canon_trading.ma_cross import MaCross
 from canon_trading.ma_cross import MaCrossConfig
@@ -241,3 +244,46 @@ def test_a_write_back_that_fails_fails_the_load(venue, tmp_path: Path) -> None:
         bars_dir.chmod(0o755)
 
     assert catalog_bars(tmp_path, HOURLY).intervals == []
+
+
+def test_a_named_feed_reaches_alpaca_and_a_root_holds_one_feed(venue, tmp_path: Path) -> None:
+    # The catalog keys bars by bar type, not feed: a second feed's load into a root is refused, by
+    # name, before any node or request, so two feeds never read as one series (the module's header).
+    sip_root, iex_root = tmp_path / "sip", tmp_path / "iex"
+    window = (FIRST_OPEN, FIRST_OPEN + 2 * HOUR)
+
+    assert load_bars(HOURLY, *window, sip_root, feed="sip").count == 2
+    assert [r.feed.value for r in venue.historical.requests] == ["sip"]
+    assert catalog_feed(sip_root) == "sip"
+    with pytest.raises(ValueError, match="holds sip data and this load is iex"):
+        load_bars(HOURLY, *window, sip_root)
+
+    # A root filled before the feed file existed was IEX: it is read so, and refuses sip.
+    load_bars(HOURLY, *window, iex_root)
+    assert venue.historical.requests[-1].feed.value == "iex"
+    (iex_root / FEED_FILE).unlink()
+    assert catalog_feed(iex_root) == "iex"
+    with pytest.raises(ValueError, match="holds iex data and this load is sip"):
+        load_bars(HOURLY, *window, iex_root, feed="sip")
+    with pytest.raises(ValueError, match="not one a bars request takes"):
+        load_bars(HOURLY, *window, tmp_path / "other", feed="nasdaq")
+    assert len(venue.historical.requests) == 2
+    assert not (tmp_path / "other").exists()
+
+    # A failed load into an empty root leaves no feed named, so the root can still take any feed.
+    venue.historical.error = standins.api_error(500, 50010000, "internal error")
+    with pytest.raises(RuntimeError, match="request failed"):
+        load_bars(HOURLY, *window, tmp_path / "failed", feed="sip")
+    assert catalog_feed(tmp_path / "failed") is None
+
+
+def test_a_feed_given_as_alpaca_s_enum_is_named_by_its_value_and_a_damaged_feed_file_is_named(
+    venue, tmp_path: Path
+) -> None:
+    load_bars(HOURLY, FIRST_OPEN, FIRST_OPEN + 2 * HOUR, tmp_path, feed=DataFeed.SIP)
+    assert (tmp_path / FEED_FILE).read_text(encoding="ascii") == "sip\n"
+    assert load_bars(HOURLY, FIRST_OPEN, FIRST_OPEN + 2 * HOUR, tmp_path, feed="sip").count == 2
+
+    (tmp_path / FEED_FILE).write_text("", encoding="ascii")
+    with pytest.raises(ValueError, match="alpaca-feed names '', not one of .*damaged"):
+        load_bars(HOURLY, FIRST_OPEN, FIRST_OPEN + 2 * HOUR, tmp_path, feed="sip")
