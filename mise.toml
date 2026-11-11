@@ -354,44 +354,54 @@ window
 
 # The data-only task (docs/adr/0070-sandbox-execution-on-alpacas-live-data-and-a-data-only-task.md): account A's pair, read as
 # paper:test reads it, into this task's environment only (ADR 0070 term 1), for one module from a fixed list
-# (term 2): `sandbox`, the sandbox node (canon_trading.sandbox_node), or `quotes`, the historical quote
-# loader ADR 0066 proposes, refused until it is built. A third needs a new record. CANON_ALPACA_DATA_ONLY=1 makes
-# every alpaca-py REST client canon_alpaca builds refuse every method but GET before sending, and the data
-# client refuse to connect if one would send another; the module sets it again and checks, after the build,
-# that no Alpaca execution client exists (term 3). It places nothing on account A, so it takes no account's
-# lock. The sandbox node streams, so it takes the login's stream lock on descriptor 7 after uv's sync, as a
-# window does, and holds it for its run: a window that finds the lock held for longer than its own wait fails
-# placing nothing (ADR 0050). deadline: the stream lock's wait, the start-up held to `sync`, the imports, the
-# longest run (sandbox_node.MAX_MINUTES) and its stop (sandbox_node.STOP_TIMEOUT_SECS); tests/test_sandbox_node.py
-# holds the sum. Unattended runs wait for NautilusTrader rc9 (ADR 0068); by hand: mise run paper:data sandbox.
+# (term 2 and its addition of 2026-11-11): `sandbox`, the sandbox node (canon_trading.sandbox_node); `movers-stream`
+# (canon_trading.movers_stream) and `movers-screener` (canon_trading.movers_screener), the movers probe's two
+# modules, which log to canon-paper-data/ in the per-user temporary folder, outside the repository; or `quotes`,
+# the historical quote loader ADR 0066 proposes, refused until it is built. CANON_ALPACA_DATA_ONLY=1 makes
+# every alpaca-py REST client this repository builds refuse every method but GET before sending, and the data
+# client refuse to connect if one would send another; each module sets it again and checks (term 3). It places
+# nothing on account A, so it takes no account's lock. A module that streams (`sandbox`, `movers-stream`) takes
+# the login's stream lock on descriptor 7 after uv's sync, as a window does, and holds it for its run: a window
+# that finds the lock held for longer than its own wait fails placing nothing (ADR 0050). `movers-screener`
+# only reads REST, so it takes no stream lock and never keeps a window waiting. deadline: the stream lock's
+# wait, the start-up held to `sync`, the imports, the longest run and its stop for a streaming module, and the
+# start-up and the screener's 85 polls for the screener; tests/test_sandbox_node.py and tests/test_movers_*.py
+# hold the sums. Unattended sandbox runs wait for NautilusTrader rc9 (ADR 0068); by hand: mise run paper:data sandbox.
 [tasks."paper:data"]
 description = "Run one listed data-only module with paper account A's pair, every request but GET refused"
-timeout = "90m"
+timeout = "100m"
 env.ALPACA_API_KEY = { value = "{{ exec(command='/usr/bin/timeout 30 /usr/bin/security find-generic-password -s canon-alpaca-paper -a ALPACA_API_KEY -w') }}", redact = true }
 env.ALPACA_SECRET_KEY = { value = "{{ exec(command='/usr/bin/timeout 30 /usr/bin/security find-generic-password -s canon-alpaca-paper -a ALPACA_SECRET_KEY -w') }}", redact = true }
 env.CANON_ALPACA_DATA_ONLY = "1"
 usage = '''
-arg "<module>" help="sandbox: the sandbox node on Alpaca's data (ADR 0070); quotes: the historical quote loader, not built yet (ADR 0066)" {
-  choices "sandbox" "quotes"
+arg "<module>" help="sandbox: the sandbox node on Alpaca's data (ADR 0070); movers-stream: sip bars and trades for the whole market, rates, memory and a top 50; movers-screener: Alpaca's movers and most-actives once a minute, no stream; quotes: the historical quote loader, not built yet (ADR 0066)" {
+  choices "sandbox" "movers-stream" "movers-screener" "quotes"
 }
-flag "--minutes <minutes>" help="how long the sandbox node runs, 1 to 60" default="10"
+flag "--minutes <minutes>" help="how long the module runs: 1 to 60 for sandbox and movers-stream, 1 to 85 polls for movers-screener" default="10"
 '''
 run = '''
-deadline=5340
+deadline=5940
 sync=600
 lockwait=900
 start=$(/bin/date +%s)
 [ -n "$ALPACA_API_KEY" ] && [ -n "$ALPACA_SECRET_KEY" ] || { echo "paper:data: a keychain item of account A is empty; run: mise run paper:remove, then mise run paper:store" >&2; exit 1; }
 [ "${CANON_ALPACA_DATA_ONLY:-}" = 1 ] || { echo "paper:data: CANON_ALPACA_DATA_ONLY is not 1; nothing was run (ADR 0070)" >&2; exit 1; }
+streams=1; logs=0
 case "${usage_module:-}" in
   sandbox) module=canon_trading.sandbox_node ;;
+  movers-stream) module=canon_trading.movers_stream; logs=1 ;;
+  movers-screener) module=canon_trading.movers_screener; streams=0; logs=1 ;;
   quotes) echo "paper:data: quotes, the historical quote loader, is not built yet (ADR 0066); nothing was run" >&2; exit 1 ;;
-  *) echo "paper:data: no module named '${usage_module:-}'; the list is sandbox and quotes (ADR 0070)" >&2; exit 3 ;;
+  *) echo "paper:data: no module named '${usage_module:-}'; the list is sandbox, movers-stream, movers-screener and quotes (ADR 0070)" >&2; exit 3 ;;
 esac
 tmp="$(/usr/bin/getconf DARWIN_USER_TEMP_DIR)" || tmp=""
-case "$tmp" in /*/) ;; *) echo "paper:data: the per-user temporary folder is not known (DARWIN_USER_TEMP_DIR gave '$tmp'), so there is no stream lock to take; nothing was run" >&2; exit 1 ;; esac
-# stream: the login's market-data stream lock (ADR 0069), on descriptor 7, as paper:session takes it
+case "$tmp" in /*/) ;; *) echo "paper:data: the per-user temporary folder is not known (DARWIN_USER_TEMP_DIR gave '$tmp'), so there is no stream lock to take or log folder to write; nothing was run" >&2; exit 1 ;; esac
+set -- --minutes "${usage_minutes:-10}"
+[ "$logs" = 0 ] || set -- "$@" --log-dir "${tmp}canon-paper-data"
+# stream: the login's market-data stream lock (ADR 0069), on descriptor 7, as paper:session takes it; only a
+# module that streams takes it
 stream() {
+  [ "$streams" = 1 ] || return 0
   exec 7>>"${tmp}canon-alpaca-stream.lock"
   /usr/bin/lockf -t "$lockwait" 7 || { echo "paper:data: the market-data stream lock stayed held for $lockwait s; nothing was run" >&2; exit 1; }
 }
@@ -412,14 +422,14 @@ data() {
   if [ -t 0 ]; then
     uv run --locked /usr/bin/true || exit 1
     stream
-    exec uv run --locked python -m "$module" --minutes "${usage_minutes:-10}"
+    exec uv run --locked python -m "$module" "$@"
   fi
   bounded "$sync" uv run --locked /usr/bin/true \
     || { echo "paper:data: the start-up (uv making the environment uv.lock's) failed or took over $sync s; nothing was run" >&2; exit 1; }
   stream
   left=$((deadline - ($(/bin/date +%s) - start)))
   [ "$left" -gt 0 ] || { echo "paper:data: no time left before the deadline" >&2; exit 1; }
-  bounded "$left" uv run --locked python -m "$module" --minutes "${usage_minutes:-10}"
+  bounded "$left" uv run --locked python -m "$module" "$@"
 }
-data
+data "$@"
 '''

@@ -100,7 +100,7 @@ def test_paper_data_reads_account_a_and_its_deadline_holds_the_stream_wait_start
         k: int(v)
         for k, v in re.findall(r"^(deadline|sync|lockwait)=(\d+)$", task["run"], re.MULTILINE)
     }
-    assert task["timeout"] == "90m" and bound["deadline"] == 90 * 60 - 60
+    assert task["timeout"] == "100m" and bound["deadline"] == 100 * 60 - 60
     assert bound["deadline"] >= (
         bound["lockwait"]
         + bound["sync"]
