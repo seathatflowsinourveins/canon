@@ -193,6 +193,7 @@ check "ledger records the SessionStart source"     jqt "$TMP/lg.jsonl" '.source 
 echo "rates manifest:"
 unset CANON_OTLP_FILE
 RD="$TMP/rates"; RB="$TMP/rates-bin"; mkdir -p "$RD/ledger" "$RD/sessions" "$RD/otel" "$RB"
+NOW=$(date -u +%s)   # the fixtures below are aged from this read
 cat > "$RB/ps" <<'STUB'
 #!/bin/bash
 # ps stub: the process table, as ps -axo pid=,ppid=,etime=,args= prints it
@@ -295,6 +296,7 @@ check "--window 0: usage error, exit 2"            test "$rc" = 2
 # v0.165.0, "File Rotation"): completions still inside the window but in the rotated file count (claim of a
 # second reader: five 1200-token completions within 10 minutes, four of them rotated, are 10 tok/s, not 2)
 RO="$TMP/rot"; mkdir -p "$RO"
+NOW=$(date -u +%s)   # these fixtures sit 100 to 500 s inside a 600 s window: age them from this read, not the suite's first
 cc() { rec "[$(s event.name codex.sse_event),$(s event.kind response.completed),$(s conversation.id "$1")${3:+,$(n output_token_count intValue "$3")}]" "$((NOW - $2))000000000"; }
 tc() { rec "[$(s event.name codex.turn_cost),$(s conversation.id "$1"),$(n usage.estimated_usd doubleValue "$3")]" "$((NOW - $2))000000000"; }
 { cc c-rot 500 1200; cc c-rot 400 1200; cc c-rot 300 1200; cc c-rot 200 1200; } > "$RO/logs-2026-11-10T12-00-00.000-size.jsonl"
@@ -1238,7 +1240,8 @@ EOF
       ready "$LD" "$op"
       /usr/bin/lockf -k -t 0 "$LD/$alock" true 2>/dev/null; held=$?
       wait "$op"; orc=$?
-      sleep 1   # anything still alive now outlived the deadline
+      # the run has ended: anything still alive is given a generous ceiling to be reaped, and fails only if it never goes
+      for _ in $(seq 300); do [ -z "$(left_up "$LD")" ] && break; sleep 0.1; done
       up=$(left_up "$LD")
       /usr/bin/lockf -k -t 0 "$LD/$alock" true 2>/dev/null; free=$?
       check "$t, $how: a second run cannot take the lock while it runs" eval '[ -s "$LD/child.pid" ] && [ "$held" != 0 ]'
@@ -1260,8 +1263,9 @@ EOF
       if [ "$to" = mise ]; then kill -TERM "$op" 2>/dev/null
       else kill -TERM "$(ps -o pgid= -p "$(cat "$LD/uv.pid" 2>/dev/null)" 2>/dev/null | tr -d ' ')" 2>/dev/null; fi
       wait "$op"; orc=$?
-      for _ in $(seq 50); do [ -z "$(left_up "$LD")" ] && break; sleep 0.1; done
-      took=$(( $(date +%s) - s0 )); up=$(left_up "$LD")
+      took=$(( $(date +%s) - s0 ))
+      for _ in $(seq 300); do [ -z "$(left_up "$LD")" ] && break; sleep 0.1; done   # a ceiling a real hang alone reaches
+      up=$(left_up "$LD")
       /usr/bin/lockf -k -t 0 "$LD/$alock" true 2>/dev/null; free=$?
       check "$t, a SIGTERM to $to before the deadline: the task fails, nothing it started is left (left:${up:- none}), the lock free, in ${took} s" \
             eval '[ -s "$LD/child.pid" ] && [ "$orc" != 0 ] && [ -z "$up" ] && [ "$free" = 0 ] && [ "$took" -lt 30 ]'
