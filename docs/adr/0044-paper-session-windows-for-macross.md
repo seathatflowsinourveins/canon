@@ -42,7 +42,7 @@ touch, sent with `params={"extended_hours": True}`; one not filled in 30 s is ca
 dropped, never chased. The adapter sends that flag (ADR 0038). An extended window runs in pre-market,
 after-hours or the overnight session (`EXTENDED_READY`, on once an overnight window passed on paper;
 Confirmation), on the feed of the session's part, and skips a part no feed has been seen to serve on
-paper (Sessions, feeds and what paper has shown).
+paper, pre-market and after-hours so far (Sessions, feeds and what paper has shown).
 
 **Each part, and the upstream it follows:**
 
@@ -66,19 +66,27 @@ paper (Sessions, feeds and what paper has shown).
 **Sessions, feeds and what paper has shown** (`session_window.SESSION_FEEDS`), and what each firing of the
 schedule (ADR 0050, `--session auto`) does in each, New York time. A part where the feeds were probed on
 paper and none delivered has no feed and is skipped, naming the probe and its date, as the lead decided on
-2026-11-11, so the schedule does not fail every evening by design; a part not yet probed runs, and its
+2026-11-11, so the schedule does not fail every morning and evening by design; a part not yet probed runs, and its
 windows are the probe that decides its row; inside a part with a feed, a window that receives no quote and
 no trade fails (Data in the record). With no feed, `--session auto` says "nothing to run" and
-`--session extended` "skipped"; both exit 0 and keep the last result. No window can probe after-hours
-again until its row changes: a probe outside a window, as ADR 0055's was, would.
+`--session extended` "skipped"; both exit 0 and keep the last result. No window can probe pre-market or
+after-hours again until its row changes: a probe outside a window, as ADR 0055's and the one below were,
+would.
 
 | Part | Feed | Seen delivering on paper | A firing |
 |---|---|---|---|
 | Regular, while Alpaca's clock says open | IEX | Yes: upstream's data tester, 13:59 to 14:44, 2026-11-10 (the adapter's README) | Runs a window, market orders, ending `END_MARGIN_SECS` before the close |
-| Pre-market, the day's `session_open` to the regular open | IEX | Not yet probed | Runs a window, marked limits |
+| Pre-market, the day's `session_open` to the regular open | None | Probed, none delivered, 2026-11-11: the IEX windows of 04:13 (by hand, account B) and 04:25 New York (the schedule's first, at `a2042a4`) received no SPY quote or trade in 307.7 s and 1,506.4 s, and their warm-ups no bar; a read-only probe under `paper:test` at 04:53 had `iex` and `boats` each send no SPY quote or trade in 120 s, both subscriptions confirmed, and serve no one-minute bar for the hour before. In 2026-11-10's pre-market IEX's REST bars began at 08:15: 16 bars, 255 trades, `boats` none. IEX is the one feed a Paper Only account is documented to receive (Alpaca's "Paper Trading" page) | Skips, naming these observations |
 | After-hours, the regular close to the day's `session_close` | None | Probed, none delivered: `iex`, `overnight` and `boats` streams each sent no quote or trade in 45 s on four symbols at 16:46, 2026-11-10, though IEX's REST bars showed trades after the close; one short probe, not proof (ADR 0055) | Skips, naming that observation |
 | Overnight, 20:00 on the evening before a trade date to its `session_open` | `boats` | Yes, 2026-11-10 (Confirmation) | Runs a window, marked limits, on an asset `overnight_tradable` and not `overnight_halted` |
 | Friday 20:00 to Sunday 20:00, a holiday and the evening before it | None | | Nothing to run |
+
+Not taken: pre-market on IEX from about 08:00, skipping only the hours before. No Alpaca page gives that
+boundary (IEX's own pre-market hours were not read; UNVERIFIED), and what IEX served in 2026-11-10's
+pre-market, 16 bars in 75 minutes, gives the warm-up's hour (`WARM_UP_SPAN`) fewer than `slow_period`'s
+20, and live bars at that rate, about one in five minutes, would not fill the averages within a 25-minute
+window, so `SessionMaCross` would decide nothing there. The observations above are what such a split would
+rest on; a read-only probe under `paper:test` after 08:00, which has not run, would decide it.
 
 What a window knows at start-up, what is lost between windows, and the averages' warm-up: ADR 0047. The
 engine's memory purge (`purge_closed_orders_interval_mins` and the rest, configure_live_trading, "Memory
@@ -123,7 +131,9 @@ window does not yet know the end of, how it closes what is left, and how its req
 * Bad: with extended windows on, the schedule (ADR 0050) fires a 25-minute window every 35 minutes from
   04:00 to 20:00 on a trading day and through the overnight session before one, so from Sunday 20:00 to
   Friday 20:00 except a holiday and the evening before it; a half day's after-hours ends at its earlier
-  `session_close`. A window holds the paper lock for its 1,500 s, the
+  `session_close`. Firings in pre-market and after-hours skip, since neither has a feed (the table
+  above), so windows run in the regular session and overnight only, and the figures below for how long
+  the lock is held apply to those hours; in pre-market and after-hours no window holds it. A window holds the paper lock for its 1,500 s, the
   start-up before it and the stop and check after it: the overnight window above recorded 906 s for its
   planned 900, its start-up not counted (`START_UP_SECS` allows 30; UNVERIFIED), and a window whose stop
   or check runs to its bound holds it up to `AFTER_END_SECS` (725 s) longer. So the lock is held about
@@ -250,7 +260,8 @@ in between were not run in a window): 23:23:46 to 23:33:55, 25 warm-up bars,
 2,710 quotes, 25 trades, 9 live bars, a cross's buy filled at 754.39 and the cross back's sell at 754.42;
 23:39:35 to 23:49:41, 25 warm-up bars, 1,552 quotes, 38 trades, 9 live bars, a buy filled at 754.64 and
 the wind-down's sell at 754.64; each `ok`, exit 0, nothing left, no stream line. `EXTENDED_READY` was turned
-on with them; no pre-market or after-hours window has run on paper.
+on with them; no pre-market or after-hours window had run on paper then (the pre-market windows of
+2026-11-11 are in the table above).
 
 Code review (`/code-review`, high) of the extended windows: ten findings, each fixed: the market tuple's
 type; the node's log read before its writer had flushed (now after `logging_sync_to_disk`); the record
@@ -293,6 +304,13 @@ Read 2026-11-10. "raw": fetched with `curl` and read whole. NautilusTrader files
 
 * ADR 0069, 2026-11-10: a second paper account, B, for session windows. It amends "Sharing the account"
   once `paper:session` reads B's pair, with a lock of its own; until then this record stands as written.
+* 2026-11-11: pre-market joined after-hours as a part with no feed, on the observations in its row of the
+  table: the two windows' records (read), the probe under `mise run paper:test`, read-only, SPY through the
+  adapter's node on `iex` and `boats` and alpaca-py's REST bars on each, 04:53 to 04:58 New York, exit 0
+  (run), and https://docs.alpaca.markets/us/docs/paper-trading.md, "only entitled to receive and make use
+  of IEX market data", with https://docs.alpaca.markets/us/docs/historical-stock-data-1.md, `iex` "the only
+  feed that can be used without a subscription" (fetched, raw). Offline, `tests/test_session_window.py`: a
+  pre-market firing exits 0, builds no node, keeps the last result and names the observations (run).
 * 2026-11-11: the lead decided that a part of a session no feed has been seen to serve on paper is skipped
   by name, with the observation and its date, rather than run to fail; after-hours is such a part, on ADR
   0055's observation of 2026-11-10 (read). Offline, `tests/test_session_window.py`: an after-hours firing
