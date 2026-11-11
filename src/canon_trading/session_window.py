@@ -220,6 +220,7 @@ from nautilus_trader.config import LoggerConfig
 from nautilus_trader.live import LiveNode
 from nautilus_trader.model import BarType
 from nautilus_trader.model import InstrumentId
+from nautilus_trader.model import OrderSide
 from nautilus_trader.model import Quantity
 from nautilus_trader.model import StrategyId
 from nautilus_trader.model import TimeInForce
@@ -230,6 +231,7 @@ from .movers_stream import STREAM_LOGGER
 from .movers_stream import Reads
 from .movers_stream import Tape
 from .movers_stream import Warnings
+from .movers_stream import epoch_seconds
 from .movers_stream import minute_dollars
 from .movers_stream import minute_start
 from .movers_stream import rank
@@ -247,9 +249,11 @@ from .paper_node import alpaca_paper_builder
 from .paper_node import ema_cross_config
 from .position_cap import PositionCap
 from .position_cap import position_cap_config
+from .session_ma_cross import LIMIT_OFFSET
 from .session_ma_cross import WARM_UP_SPARE_BARS
 from .session_ma_cross import SessionMaCross
 from .session_ma_cross import SessionMaCrossConfig
+from .session_ma_cross import through_the_touch
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -916,10 +920,12 @@ class WindowReport:
     adapter counts it (`canon_alpaca.providers.request_counts`); the account is a number, never a key."""
     fill_prices: dict[str, list[str]] = field(default_factory=dict)
     """Each fill of the strategy's orders, by client order ID: `qty@price` and the venue's time
-    (`OrderFilled`'s `last_qty`, `last_px`, `ts_event`)."""
+    (`OrderFilled`'s `last_qty`, `last_px`, `ts_event`). A close the account check sends after the stop is
+    not the strategy's: its outcome is in `closes`, its fill price is not recorded (Muse's finding 5)."""
     submit_delays_ms: dict[str, int] = field(default_factory=dict)
     """Per order, from the strategy's submit to the node's receipt of Alpaca's acceptance: `OrderAccepted`'s
-    `ts_init` less the order's first event's (`OrderInitialized`), both on the node's clock."""
+    `ts_init` less the order's first event's (`OrderInitialized`), both on the node's clock. An order denied
+    or rejected before Alpaca accepted it has none; it is in `denials` (Muse's finding 5)."""
     worst_submit_delay_ms: int | None = None
 
 
@@ -1191,6 +1197,8 @@ class MoverPick:
     symbol: str
     price: Decimal
     record: dict[str, Any]
+    entry: Decimal = Decimal(0)
+    """The entry limit one share would be sent at (`entry_limit`), which the cap is checked against."""
 
 
 def window_data() -> StockHistoricalDataClient:
@@ -1292,7 +1300,9 @@ def select_mover(
     close: dict[str, float] = {}
     dvol: dict[str, float] = {}
     for symbol in symbols:
-        if found := bars.data.get(symbol):
+        # completed minutes only, the ones `minute_dollars` counts (Muse's finding 2, 2026-11-11)
+        done = regular_open + timedelta(minutes=elapsed)
+        if found := [b for b in bars.data.get(symbol, []) if b.timestamp < done]:
             close[symbol] = max(found, key=lambda b: b.timestamp).close
             dvol[symbol] = sum(minute_dollars(found, regular_open, elapsed))
     normals = read_normals(data, symbols, regular_open, elapsed)
@@ -1338,9 +1348,11 @@ def first_qualified(
         if age > FRESH_TRADE_SECS:
             passed[symbol] = f"its latest sip trade is {age:.0f} s old (halted, by the proxy)"
             continue
-        if price > MAX_NOTIONAL_PER_ORDER_USD:
+        entry = entry_limit(snapshots.get(symbol), price)
+        if entry > MAX_NOTIONAL_PER_ORDER_USD:
             passed[symbol] = (
-                f"one share at {price} USD is over the cap of {MAX_NOTIONAL_PER_ORDER_USD} USD"
+                f"one share's entry limit of {entry} USD (last trade {price}) is over the cap of "
+                f"{MAX_NOTIONAL_PER_ORDER_USD} USD"
             )
             continue
         try:
@@ -1364,13 +1376,24 @@ def first_qualified(
             symbol=symbol,
             inputs=asdict(scored),
             price=str(price),
+            entry_limit=str(entry),
             last_trade_at=trade.timestamp.isoformat(),
         )
-        return MoverPick(symbol, price, record)
+        return MoverPick(symbol, price, record, entry)
     raise WindowRefused(
         f"no mover qualified among the {len(ranked)} ranked of {listed} listed: "
         + ("; ".join(f"{s}: {why}" for s, why in passed.items()) or "none ranked")
     )
+
+
+def entry_limit(snapshot: object, last: Decimal) -> Decimal:
+    """The limit one share of a mover would be bought at: `SessionMaCross`'s through the touch
+    (`through_the_touch`, the ask plus `LIMIT_OFFSET`), on the snapshot's latest sip quote's ask, or the
+    last trade where that is higher or there is no ask; the risk engine prices a limit order at its limit
+    (Muse's finding 1, 2026-11-11), so this is the notional the per-order cap is checked on."""
+    quote = getattr(snapshot, "latest_quote", None)
+    ask = Decimal(str(getattr(quote, "ask_price", 0) or 0))
+    return through_the_touch(OrderSide.BUY, Decimal(0), max(ask, last), LIMIT_OFFSET)
 
 
 def corporate_actions(
@@ -1430,7 +1453,15 @@ def sample_stream(
     warnings = Warnings()
     logger = logging.getLogger(STREAM_LOGGER)
     logger.addHandler(warnings)
-    stream.subscribe_bars(tape.on_bar, "*")
+    seen: dict[str, set[float]] = {}
+
+    async def on_bar(msg: dict) -> None:  # on the stream's thread: the GIL guards `seen`'s updates
+        t, symbol = epoch_seconds(msg.get("t")), msg.get("S")
+        if isinstance(symbol, str) and t is not None and t >= window:
+            seen.setdefault(symbol, set()).add(minute_start(t))
+        await tape.on_bar(msg)
+
+    stream.subscribe_bars(on_bar, "*")
     thread = threading.Thread(target=runner, name="mover-sample", daemon=True)
     thread.start()
     try:
@@ -1458,6 +1489,11 @@ def sample_stream(
     elapsed = 0 if latest is None else int((latest - window) // 60) + 1
     if elapsed < 1 or not dvol:
         raise StreamSampleFailed(f"the sample saw no bar in its {minutes} minute(s): {counts}")
+    # a symbol is ranked only on a bar in every minute of the sample (Muse's finding 4, 2026-11-11)
+    incomplete = [s for s in dvol if len(seen.get(s, ())) < elapsed]
+    for s in incomplete:
+        del dvol[s]
+    counts["incomplete"] = len(incomplete)
     return close, dvol, datetime.fromtimestamp(window, UTC), elapsed, counts
 
 
@@ -1472,6 +1508,7 @@ def stream_mover(
     *,
     clock: Callable[[], float] = time.time,
     sleep: Callable[[float], None] = time.sleep,
+    now: Callable[[], datetime] | None = None,
 ) -> MoverPick:
     """The top name of the movers ranking over a `minutes` sample of the whole market's sip bars that
     passes `first_qualified`'s filters, or `WindowRefused`/`StreamSampleFailed`. The sample is
@@ -1487,7 +1524,9 @@ def stream_mover(
         if all(s in reads.references for s in close):
             break
     ranked = rank(close, dvol, reads.references, reads.normals, elapsed, top=MOVER_CHECKS)
-    at = datetime.fromtimestamp(clock(), UTC)
+    # Alpaca's clock where the caller has it (Muse's finding 3, 2026-11-11): the trade-age proxy is not
+    # widened by the host's skew
+    at = now() if now is not None else datetime.fromtimestamp(clock(), UTC)
     listed = movers_line(screener.get_market_movers(MarketMoversRequest(top=MOVERS_TOP)))
     record: dict[str, Any] = {
         "source": STREAM_SOURCE,
@@ -1496,6 +1535,7 @@ def stream_mover(
             "from": window_start.isoformat(),
             "minutes": minutes,
             "elapsed_minutes": elapsed,
+            "incomplete": counts.pop("incomplete", 0),
             "messages": counts,
             "symbols": len(close),
             "references_known": sum(1 for v in reads.references.values() if v is not None),
@@ -1531,7 +1571,15 @@ def choose_mover(
     began = time.monotonic()
     data, screener, actions = window_data(), window_screener(), window_actions()
     try:
-        return stream_mover(trading, window_stream(), data, screener, actions, since)
+        return stream_mover(
+            trading,
+            window_stream(),
+            data,
+            screener,
+            actions,
+            since,
+            now=lambda: at + timedelta(seconds=time.monotonic() - began),
+        )
     except (StreamSampleFailed, WindowRefused, *FAILED) as e:
         failed = f"{type(e).__name__}: {e}"
     now = at + timedelta(seconds=time.monotonic() - began)
@@ -1608,9 +1656,10 @@ def run_window(
             pick.record,
             MOVER_FEED,
         )
+        one_share_fits(config.symbol, pick.entry)
     else:
         price = share_price(window_data(), config.symbol)
-    one_share_fits(config.symbol, price)
+        one_share_fits(config.symbol, price)
     overnight = overnight_eligibility(trading, config.symbol) if part == "overnight" else ""
 
     now = clock.timestamp.astimezone(NEW_YORK)
