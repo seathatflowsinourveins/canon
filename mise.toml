@@ -284,6 +284,8 @@ tests
 # and in by-hand/ for a run by hand (CANON_PAPER_BY_HAND=1), so a run by hand never changes the schedule's row. Run
 # by the scheduled runner (CANON_COMMIT set), `--exact` makes its clone's kept .venv exactly uv.lock, as
 # `uv sync` would; a run by hand leaves the worktree's .venv as it is (uv run's inexact default; ADR 0050).
+# A run the schedule started reads the schedule's switch first, canon/paper-schedule, and takes no lock and
+# places nothing unless it says to (`scheduled` in the body; ADR 0050).
 [tasks."paper:session"]
 description = "Run one bounded SessionMaCross window on paper account B, which Alpaca holds long-only, under its lock and the stream lock"
 # deadline: its 900 s wait for the two locks, the start-up (uv's sync, held to `sync`, then the imports before the
@@ -299,15 +301,54 @@ deadline=6240
 sync=600
 lockwait=900
 start=$(/bin/date +%s)
-[ -n "$ALPACA_API_KEY" ] && [ -n "$ALPACA_SECRET_KEY" ] || { echo "paper:session: a keychain item of account B is empty; run: mise run paper:remove windows, then mise run paper:store windows" >&2; exit 1; }
 tmp="$(/usr/bin/getconf DARWIN_USER_TEMP_DIR)" || tmp=""
 case "$tmp" in /*/) ;; *) echo "paper:session: the per-user temporary folder is not known (DARWIN_USER_TEMP_DIR gave '$tmp'), so there is no paper lock or log folder; nothing was placed" >&2; exit 1 ;; esac
 # a run the runner started (CANON_COMMIT) is the schedule's unless the runner itself says by hand, so a
 # runner installed before CANON_PAPER_SCHEDULED existed still writes the records status reads
 [ "${CANON_PAPER_SCHEDULED:-}" = 1 ] || [ -n "${CANON_COMMIT:-}" ] || export CANON_PAPER_BY_HAND=1
-exec 9>>"${tmp}canon-paper-windows.lock"
-/usr/bin/lockf -t "$lockwait" 9 || { echo "paper:session: account B's lock stayed held for $lockwait s; nothing was placed" >&2; exit 1; }
-waited=$(( $(/bin/date +%s) - start ))
+waited=0
+# heard <exit code> <outcome>: say what a scheduled firing came to before any lock, write it as the heartbeat
+# `scripts/automation status` reads (last-firing.json, the fields canon_trading.session_window.write_heartbeat
+# writes; the commit is "none: nothing ran", as the runner writes for a firing that ran nothing, so status does
+# not count it as a run that held the lock) through a file of its own (mktemp(1)), and exit. A heartbeat that
+# cannot be written is said on stderr and the outcome's exit code stands, as the window's own does (`_heard`).
+heard() {
+  if [ "$1" = 0 ]; then echo "paper:session: $2"; else echo "paper:session: $2" >&2; fi
+  d="${tmp}canon-paper-session"; t=""
+  # not onto a directory of that name, which mv would move the file into
+  if [ ! -d "$d/last-firing.json" ] && /bin/mkdir -p "$d" && t=$(/usr/bin/mktemp "$d/.last-firing.json.XXXXXX") \
+     && printf '{"at_epoch": %s, "outcome": "%s", "commit": "none: nothing ran", "scheduled": true}\n' "$(/bin/date +%s)" "$2" > "$t" \
+     && /bin/mv -f "$t" "$d/last-firing.json"; then :
+  else
+    [ -z "$t" ] || /bin/rm -f "$t"
+    echo "paper:session: the heartbeat could not be written in $d" >&2
+  fi
+  exit "$1"
+}
+# scheduled <arguments...>: the schedule's switch, the first line of canon/paper-schedule in the tree this task
+# runs from, which for a scheduled firing is the main it has just cloned (ADR 0050): so a landing on main turns
+# the schedule off or on at the next firing, with nothing to install. Read before any lock is taken. `off`: the
+# firing skips by name, exit 0. `mover`: it goes on only with --mover among its arguments, and one without (a
+# plist installed before main's) is refused by name. Anything else fails by name: the first line is the value
+# and nothing else, and scripts/test-lanes reads the tracked file the same way, so one that would fail every
+# firing does not pass the checks. A run by hand reads none of it. The outcomes hold no double quote or
+# backslash: heard writes them into JSON as they are. It is read before the pair is looked at, so an empty
+# keychain item does not turn a skip into a failure; mise has rendered the task's env by then, the two
+# keychain reads included, which only a check in the installed runner would spare (a limit ADR 0050 records).
+# (mise's own `skip_if`, a command whose exit 0 skips a task, only skips: mise's task configuration page, read
+# 2026-11-11 through a summary.)
+scheduled() {
+  [ -z "${CANON_PAPER_BY_HAND:-}" ] || return 0
+  schedule=""
+  if [ -f canon/paper-schedule ]; then read -r schedule < canon/paper-schedule || :; fi
+  case "$schedule" in
+    off) heard 0 "skipped: the schedule is off (canon/paper-schedule); nothing was placed" ;;
+    mover)
+      for a in "$@"; do [ "$a" != --mover ] || return 0; done
+      heard 1 "refused: the schedule is the mover's (canon/paper-schedule) and this firing carries no --mover, so its plist is older than main (scripts/automation install); nothing was placed" ;;
+    *) heard 1 "failed: canon/paper-schedule's first line is neither off nor mover; nothing was placed" ;;
+  esac
+}
 # stream: the login's market-data stream lock (ADR 0069), on descriptor 7 (the runner's checkout lock is 8),
 # for what is left of `lockwait`; taken after uv's sync, so a window holds it only while its process runs
 stream() {
@@ -331,6 +372,13 @@ bounded() {
   return "$rc"
 }
 window() {
+  # the switch first, then the pair and account B's lock: here, not above, because the task's arguments reach
+  # only the function the script's last line calls (the note above paper:test)
+  scheduled "$@"
+  [ -n "$ALPACA_API_KEY" ] && [ -n "$ALPACA_SECRET_KEY" ] || { echo "paper:session: a keychain item of account B is empty; run: mise run paper:remove windows, then mise run paper:store windows" >&2; exit 1; }
+  exec 9>>"${tmp}canon-paper-windows.lock"
+  /usr/bin/lockf -t "$lockwait" 9 || { echo "paper:session: account B's lock stayed held for $lockwait s; nothing was placed" >&2; exit 1; }
+  waited=$(( $(/bin/date +%s) - start ))
   left=$((deadline - ($(/bin/date +%s) - start)))
   [ "$left" -gt 0 ] || { echo "paper:session: no time left before the deadline" >&2; exit 1; }
   # from a terminal, too, uv's sync runs before the stream lock is taken, so the lock is held only while the

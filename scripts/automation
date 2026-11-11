@@ -6,7 +6,8 @@
 #   landscape watch        once a day, at session start      .claude/hooks/canon-watch.sh, async SessionStart hook
 #   lane watchdog          every 10 minutes, Mac awake       launchd user agent (launchd.plist(5), launchctl(1))
 #   paper session          10 min after each firing, awake   launchd user agent running one window, if Alpaca's
-#                                                            clock says a session is open (ADR 0050)
+#                                                            clock says a session is open and main's
+#                                                            canon/paper-schedule says to (ADR 0050)
 #   OTLP collector         always, Mac awake                 launchd user agent running the pinned otelcol on
 #                                                            127.0.0.1, writing ~/.claude/canon/otel/logs.jsonl
 #                                                            for scripts/lanes --rates (ADR 0007)
@@ -976,7 +977,9 @@ do_status() {
     # Each check below can only make the label worse (paper_worse), so a schedule gone silent never hides a
     # window that died or failed. Failures the record cannot show: a firing that ended before Python wrote
     # anything (an empty keychain item, a lock wait run out) or was stopped by a signal, and a schedule that
-    # has stopped firing. The runner stamps each scheduled firing's start in scheduled-firing.json, which no
+    # has stopped firing. A schedule that is off (canon/paper-schedule on main, which paper:session reads at
+    # every scheduled firing) is in the row as that firing's own heartbeat, "skipped: the schedule is off":
+    # the firings go on, so every check here still holds. The runner stamps each scheduled firing's start in scheduled-firing.json, which no
     # run by hand writes; with no stamp, an unreadable one or one older than the longest firing and an
     # interval, the row is not ok, whatever last-firing.json says.
     case "$last" in
