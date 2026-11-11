@@ -21,28 +21,38 @@
 # must be tracked as tag:v<N>.<N>... (or tag:<N>.<N>...); scripts/canon lint refuses any other shape.
 # --install runs the vendor installer with the pinned version when the CLI is absent or below the pin, leaves
 # one at or above it alone, and then fails if the CLI's version is unreadable or still below the pin. The CLI
-# then follows the autoUpdatesChannel that home/.claude/settings.json sets, never below its minimumVersion.
+# then updates itself on the latest channel, which the template names (the docs: "The channel you choose at
+# install time becomes your default for auto-updates", so it is set, not left to the installer), never below
+# the template's minimumVersion (ADR 0065: the pin is a floor; --check calls a CLI ahead of it ok and names
+# the version it saw).
 # CLAUDE_CONFIG_DIR replaces ~/.claude. --user-config never overwrites settings.json or CLAUDE.md there: a
 # differing one gets a <name>.canon-proposed copy beside it. It does add to an existing settings.json the
 # telemetry variables (CLAUDE_CODE_ENABLE_TELEMETRY, OTEL_*) of home/.claude/settings.json's env block that
 # it lacks (ADR 0007, tier 3; Claude Code reads them only from user or managed settings,
-# https://code.claude.com/docs/en/monitoring-usage.md),
-# keeping a copy of the previous file, and leaves alone, naming it, one the owner set to another value; the
-# model alias pins are never written there (their row shows what is missing). It
+# https://code.claude.com/docs/en/monitoring-usage.md), and the keys it lacks of CANON_KEYS (model,
+# availableModels and modelPicker, ADR 0059; autoUpdatesChannel, ADR 0065). It replaces two values an
+# earlier template set (RETIRED: autoUpdatesChannel "stable", ADR 0065; env.ANTHROPIC_DEFAULT_FABLE_MODEL
+# "claude-fable-5-2", ADR 0059), keeping a copy of the previous file; a value the owner set otherwise is
+# left alone and named. It
 # appends home/.codex/otel.toml to ${CODEX_HOME:-~/.codex}/config.toml when that file has no otel table of its
-# own and its folder exists, keeping a copy of the previous file and changing nothing else in it; an otel
-# table that is not canon's is left alone and named (Codex: CODEX_HOME, codex-rs/utils/home-dir at the
-# pinned tag). It replaces canon/ledger.sh and
+# own and its folder exists, and writes home/.codex/defaults.toml's keys (model, model_reasoning_effort) that
+# the file lacks at its top, keeping a copy of the previous file and changing nothing else in it; an otel
+# table or a default that is not canon's is left alone and named (Codex: CODEX_HOME, codex-rs/utils/home-dir
+# at the pinned tag). It sets Antigravity's default model, the "model" key of
+# ~/.gemini/antigravity-cli/settings.json ("saved by its label", https://antigravity.google/docs/settings), to
+# the label canon/models.json gives when agy's folder exists and the key is unset. It replaces canon/ledger.sh and
 # canon/statusline.sh, keeping a differing previous copy beside each as <name>.replaced-<UTC time>. The
-# installed settings call the scripts in the config directory actually used. --check also compares every
-# env.ANTHROPIC_DEFAULT_<ALIAS>_MODEL the installed settings.json sets, and each one home/.claude/settings.json
-# sets, with the model canon/models.json gives that alias (ADR 0005), and labels a difference MISMATCH, as it
-# does a top-level "model" there that canon/models.json does not name.
+# installed settings call the scripts in the config directory actually used. --check also compares the
+# installed settings.json's model keys with the template's, labels any env.ANTHROPIC_DEFAULT_<ALIAS>_MODEL
+# there PINNED (it stops the alias following the vendor; ADR 0059) or MISMATCH (another model than
+# canon/models.json's), a top-level "model" outside canon/models.json MISMATCH, and reports the update channel
+# in effect from the settings and this environment.
 # --install also sets up the review-only workers (ADR 0045), each as its upstream documents: it adds
 # home/dsh/review.patch.yml's rows (session-log upload off, dsh-memento off) to the dsh-tui profile's user
 # patch, ${DSH_HOME:-~/.dsh}/profiles/dsh-tui/cordis.patch.yml, after the rows already there (dsh-TUI
-# v0.17.0 docs/configuration.en.md), and writes AGY_CLI_DISABLE_AUTO_UPDATE=true into ~/.zshrc, the shell
-# profile Antigravity's troubleshooting page names. A patch that already names either row, or is not a
+# v0.17.0 docs/configuration.en.md), and removes from ~/.zshrc the two lines an earlier --install wrote to
+# turn Antigravity's self-updater off (ADR 0065 reverses ADR 0045 on this), keeping a copy. A patch that
+# already names either row, or is not a
 # YAML block sequence or [], is left alone with review.patch.yml.canon-proposed beside it to merge by hand;
 # an older canon block is replaced where it stands.
 set -euo pipefail
@@ -55,9 +65,21 @@ LOCAL_BIN="$HOME/.local/bin"
 CLAUDE_HOME="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 CODEX_DIR="${CODEX_HOME:-$HOME/.codex}"
 # the env keys of home/.claude/settings.json that are telemetry (ADR 0007): what --user-config adds to an
-# existing settings.json and what the telemetry row checks. The model alias pins are not among them: their
-# own row reports drift and --user-config never writes them (ADR 0005)
+# existing settings.json and what the telemetry row checks. No model alias pin is among them: ADR 0059 pins
+# none, --check labels one PINNED, and --user-config removes only the one an earlier template set (RETIRED)
 TELEMETRY_RE='^(CLAUDE_CODE_ENABLE_TELEMETRY$|OTEL_)'
+# the top-level keys of home/.claude/settings.json that --user-config adds to an existing settings.json when
+# it lacks them (the model keys, ADR 0059; the update channel, ADR 0065), and the values an earlier template
+# set that those records retire: --user-config removes one only while it still holds exactly that value, and
+# a key of CANON_KEYS removed so is then added from the template. The earlier template's "model": "fable" is
+# not among them: it is also the orchestrator lane's alias, which an owner may choose, so --check names it
+CANON_KEYS='["model", "availableModels", "modelPicker", "autoUpdatesChannel"]'
+RETIRED='[{"path": ["autoUpdatesChannel"], "value": "stable"}, {"path": ["env", "ANTHROPIC_DEFAULT_FABLE_MODEL"], "value": "claude-fable-5-2"}]'
+# the variables that turn Claude Code's background updates off (https://code.claude.com/docs/en/env-vars.md)
+UPDATE_OFF_VARS="DISABLE_AUTOUPDATER DISABLE_UPDATES CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
+CODEX_DEFAULTS_SRC="$ROOT/home/.codex/defaults.toml"
+# Antigravity keeps its settings in one file at a fixed path (https://antigravity.google/docs/settings)
+AGY_SETTINGS="$HOME/.gemini/antigravity-cli/settings.json"
 
 note()  { printf '%s\n' "$*"; }
 die()  { printf 'bootstrap: ERROR: %s\n' "$*" >&2; exit 1; }
@@ -146,58 +168,133 @@ check_hooks() {
   return "$rc"
 }
 
-# check_model_pins: the model aliases the installed settings pin through env.ANTHROPIC_DEFAULT_<ALIAS>_MODEL
-# (https://code.claude.com/docs/en/model-config.md: unless that variable is set, an alias resolves to the
-# provider's recommended version, which moves; "to pin to a specific version ... set the corresponding
-# environment variable"). The expected ID for each alias comes from canon/models.json (ADR 0005). Every such
-# key home/.claude/settings.json sets must be in the installed file, and every such key the installed file
-# sets must name the ID canon/models.json gives its alias. The installed top-level "model", when set, must be
-# an alias or a model canon/models.json names: a full ID outside it (the /model picker can save one) bypasses
-# the alias pins. --user-config never overwrites an existing settings.json, so this is how drift is seen.
-# Only that one file is read; the shell environment and other settings scopes are not.
-check_model_pins() {
+# check_model_settings: the installed settings.json's model keys against home/.claude/settings.json and
+# canon/models.json (ADR 0005, ADR 0059; https://code.claude.com/docs/en/model-config.md).
+# * Alias pins: an env.ANTHROPIC_DEFAULT_<ALIAS>_MODEL makes the alias name that model, and "Aliases point to
+#   the recommended version for your provider and update over time" only without one. ADR 0059 lets every
+#   alias follow the vendor, so a pin is PINNED when it names the ID canon/models.json gives the alias and
+#   MISMATCH otherwise; the template must pin none.
+# * The top-level "model", the default for new sessions: ok when it is the session_default_lane's alias or
+#   model, OWNER when it is another one canon/models.json names (the /model picker's Enter saves one), and
+#   MISMATCH outside it; MISSING when unset.
+# * availableModels and modelPicker: ok when equal to the template's (the allowlist hides the picker's
+#   server-provided Fable 5.1 row; the picker row names the orchestrator lane's ID), MISSING when unset,
+#   MISMATCH for an allowlist that admits claude-fable-5-1 again or misses a lane's model, and for a
+#   picker with a claude-fable-5-1 row or none for the orchestrator lane's model; OWNER otherwise.
+#   A "model" of "fable", the earlier template's value, is OWNER, named as such.
+# --user-config never overwrites an existing settings.json, so this is how drift is seen. Only that one file
+# is read; the shell environment and other settings scopes are not.
+check_model_settings() {
   local s="$CLAUDE_HOME/settings.json" m="$ROOT/canon/models.json" t="$ROOT/home/.claude/settings.json"
-  local rc=0 out alias key live want state
-  if ! jq -e '[.lanes[]? | select((.alias | type) == "string" and (.model | type) == "string")] | length > 0' "$m" >/dev/null 2>&1; then
-    row "model alias pins" UNKNOWN "no readable lanes with alias and model in canon/models.json"; return 1
+  local rc=0 out name key live want state
+  if ! jq -e '([.lanes[]? | select((.alias | type) == "string" and (.model | type) == "string")] | length > 0)
+              and ((.claude_code.session_default_lane // "") as $l | any(.lanes[]?; .lane == $l))' "$m" >/dev/null 2>&1; then
+    row "model settings" UNKNOWN "no readable lanes with alias and model, or no claude_code.session_default_lane, in canon/models.json"; return 1
   fi
-  if ! jq -e '(.env // {}) | type == "object" and any(keys[]; test("^ANTHROPIC_DEFAULT_.+_MODEL$"))' "$t" >/dev/null 2>&1; then
-    row "model alias pins" UNKNOWN "home/.claude/settings.json is unreadable or pins no alias in env"; return 1
+  if ! jq -e 'type == "object" and (.availableModels | type) == "array" and (.modelPicker | type) == "object"' "$t" >/dev/null 2>&1; then
+    row "model settings" UNKNOWN "home/.claude/settings.json is unreadable or sets no availableModels and modelPicker"; return 1
   fi
   if [ ! -f "$s" ] || ! jq -e 'type == "object"' "$s" >/dev/null 2>&1; then
-    row "model alias pins" MISSING "no readable $s; run: scripts/bootstrap --user-config"; return 1
+    row "model settings" MISSING "no readable $s; run: scripts/bootstrap --user-config"; return 1
   fi
   # fields are joined with US (0x1f), not a tab: read collapses empty fields between whitespace separators
   if ! out=$(jq -rn --slurpfile t "$t" --slurpfile l "$s" --slurpfile m "$m" '
     def pins: (.env // {}) | if type == "object" then with_entries(select(.key | test("^ANTHROPIC_DEFAULT_.+_MODEL$"))) else {} end;
     ($m[0].lanes | map(select((.alias | type) == "string" and (.model | type) == "string"))) as $lanes
     | ($lanes | group_by(.alias) | map({key: .[0].alias, value: (map(.model) | unique)}) | from_entries) as $want
+    | ($m[0].claude_code.session_default_lane) as $dl | ($lanes | map(select(.lane == $dl)) | .[0]) as $d
     | ($t[0] | pins) as $tp | ($l[0] | pins) as $lp
-    | ((($tp + $lp) | keys[]) as $k
+    | (if ($lp | length) == 0 and ($tp | length) == 0 then ["model alias pins", "", "", "", "none"] else empty end),
+      ((($tp + $lp) | keys[]) as $k
        | ($k | ltrimstr("ANTHROPIC_DEFAULT_") | rtrimstr("_MODEL") | ascii_downcase) as $a
        | ($want[$a] // []) as $w
        | ($lp[$k] | if . == null then "" else tostring end) as $v
        | [$a + " alias", $k, $v, ($w | join(",")),
-          (if ($w | length) != 1 then "unknown" elif $lp[$k] == null then "missing" elif $v == $w[0] then "ok" else "mismatch" end)]),
+          (if $tp[$k] != null then "template" elif ($w | length) != 1 then "unknown" elif $v == $w[0] then "pinned" else "mismatch" end)]),
       (if $l[0] | has("model") then
          ($l[0].model | tostring) as $v
-         | ["default model", "model", $v, "",
-            (if any($lanes[]; .alias == $v or .model == $v) then "named" else "outside" end)]
-       else empty end)
+         | ["default model", "model", $v, $d.alias,
+            (if $v == $d.alias or $v == $d.model then "ok"
+             elif $v == "fable" then "former"
+             elif any($lanes[]; .alias == $v or .model == $v) then "owner" else "outside" end)]
+       else ["default model", "model", "", $d.alias, "missing"] end),
+      # an allowlist entry admits a model when it is its family alias, its ID, or a version prefix of it
+      # (https://code.claude.com/docs/en/model-config.md, "Restrict model selection")
+      # and a [1m] suffix is stripped from both before matching
+      (def bare: tostring | sub("\\[1m\\]$"; "");
+       def admits($id; $fam): bare as $e | $e == $fam or $e == $id or ($id | startswith($e + "-"));
+       ($lanes | map(select(.lane == "orchestrator")) | .[0].model) as $lead
+       | ["availableModels", "modelPicker"][] as $k
+       | ($l[0][$k]) as $v
+       | (if $k == "availableModels" then ($v | if type == "array" then . else [] end)
+          else [($v.options? // [])[]? | .model?] end) as $ids
+       | [(if $k == "availableModels" then "model allowlist" else "picker rows" end), $k,
+          ($v | tojson), ($t[0][$k] | tojson),
+          (if $v == null then "missing"
+           elif ($k == "availableModels" and ($v | type) == "array" and ($v | unique) == ($t[0][$k] | unique))
+                or $v == $t[0][$k] then "same"
+           elif ($k == "availableModels" and ($v | type) != "array") or ($k == "modelPicker" and ($v | type) != "object") then "legacy"
+           elif any($ids[]; admits("claude-fable-5-1"; if $k == "availableModels" then "fable" else "" end)) then "legacy"
+           elif $k == "availableModels" and any($lanes[]; .model as $id | .alias as $f | any($ids[]; admits($id; $f)) | not)
+             then "short:" + ([$lanes[] | .model as $id | .alias as $f | select(any($ids[]; admits($id; $f)) | not) | .model] | unique | join(", "))
+           elif $k == "modelPicker" and (any($ids[]; bare == $lead) | not) then "nolead:" + $lead
+           else "differs" end)])
     | map(gsub("[\u0000-\u001f]"; "?")) | join("\u001f")'); then
-    row "model alias pins" UNKNOWN "jq could not compare $s with canon/models.json"; return 1
+    row "model settings" UNKNOWN "jq could not compare $s with canon/models.json"; return 1
   fi
-  while IFS=$'\x1f' read -r alias key live want state; do
+  while IFS=$'\x1f' read -r name key live want state; do
     case "$state" in
-      ok)       row "$alias" ok "$key=$live (canon/models.json)" ;;
-      named)    row "$alias" ok "$live (an alias or model canon/models.json names)" ;;
-      outside)  row "$alias" MISMATCH "$s sets model to $live, which canon/models.json does not name; set an alias it lists"; rc=1 ;;
-      missing)  row "$alias" MISSING "$s sets no env.$key; set it to $want (canon/models.json), as home/.claude/settings.json does"; rc=1 ;;
-      unknown)  row "$alias" MISMATCH "${live:+$key=$live, but }canon/models.json gives no single model for alias ${alias% alias}"; rc=1 ;;
-      *)        row "$alias" MISMATCH "$key=$live; canon/models.json gives $want. Set env.$key to $want in $s"; rc=1 ;;
+      none)     row "$name" ok "none; every alias follows the vendor's newest model (ADR 0059)" ;;
+      pinned)   row "$name" PINNED "$s sets $key=$live, so ${name% alias} will not follow the vendor (ADR 0059); delete env.$key (run: scripts/bootstrap --user-config removes canon's former fable pin)"; rc=1 ;;
+      template) row "$name" MISMATCH "home/.claude/settings.json pins $key; ADR 0059 pins no alias"; rc=1 ;;
+      unknown)  row "$name" MISMATCH "${live:+$key=$live, but }canon/models.json gives no single model for alias ${name% alias}"; rc=1 ;;
+      mismatch) row "$name" MISMATCH "$key=$live; canon/models.json gives $want, and ADR 0059 pins no alias. Delete env.$key in $s"; rc=1 ;;
+      ok)       row "$name" ok "$live (the default for new sessions: canon/models.json's session_default_lane)" ;;
+      owner)    row "$name" OWNER "$live, a model canon/models.json names but not the session default, $want; /model saves the row Enter picks" ;;
+      outside)  row "$name" MISMATCH "$s sets model to $live, which canon/models.json does not name; set it to $want"; rc=1 ;;
+      former)   row "$name" OWNER "$live, which an earlier canon template set and is also the orchestrator lane's alias; ADR 0059 makes the default $want, and the lead starts with --model by ID. Left as it is" ;;
+      legacy)   row "$name" MISMATCH "$s sets $key to $live, which admits claude-fable-5-1, the picker's legacy Fable row (or is not the shape the docs give); home/.claude/settings.json sets $want (ADR 0059)"; rc=1 ;;
+      short:*)  row "$name" MISMATCH "$s sets $key to $live, which does not admit ${state#short:}, a model canon/models.json gives a lane; home/.claude/settings.json sets $want"; rc=1 ;;
+      nolead:*) row "$name" MISMATCH "$s sets $key to $live, with no row for ${state#nolead:}, the orchestrator lane's model; home/.claude/settings.json sets $want"; rc=1 ;;
+      missing)  row "$name" MISSING "$s sets no $key; run: scripts/bootstrap --user-config"; rc=1 ;;
+      same)     row "$name" ok "$key as home/.claude/settings.json sets it" ;;
+      *)        row "$name" OWNER "$s sets $key to $live; home/.claude/settings.json sets $want (ADR 0059); left as the owner set it" ;;
     esac
   done <<< "$out"
   return "$rc"
+}
+
+# update_row: the release channel Claude Code's background updates follow, as the installed settings and this
+# environment set it (https://code.claude.com/docs/en/setup.md: "latest", "receive new features as soon as
+# they're released"; "stable", "typically about one week old"; with no key, "The channel you choose at install
+# time becomes your default", which no file shows; DISABLE_AUTOUPDATER, DISABLE_UPDATES and
+# CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC turn background updates off). ADR 0065 follows latest, never below
+# minimumVersion. A session Orca starts with a prompt carries DISABLE_AUTOUPDATER=1 from Orca itself, which
+# is named without failing; `claude doctor` gives the same two lines.
+update_row() {
+  local s="$CLAUDE_HOME/settings.json" ch="" min="" k v off=""
+  if [ -f "$s" ] && jq -e 'type == "object"' "$s" >/dev/null 2>&1; then
+    ch=$(jq -r '.autoUpdatesChannel // "" | tostring' "$s"); min=$(jq -r '.minimumVersion // "" | tostring' "$s")
+    for k in $UPDATE_OFF_VARS; do
+      v=$(jq -r --arg k "$k" '(.env // {}) | if type == "object" then .[$k] // "" | tostring else "" end' "$s")
+      [ -z "$v" ] || off="$off; $s sets $k"
+    done
+  else
+    row "update channel" MISSING "no readable $s; run: scripts/bootstrap --user-config"; return 1
+  fi
+  if [ -n "$off" ]; then row "update channel" OFF "background updates off: ${off#; } (any non-empty value is counted)"; return 1; fi
+  for k in $UPDATE_OFF_VARS; do [ -z "${!k:-}" ] || off="$off, $k"; done
+  local envnote=""; [ -z "$off" ] || envnote="; this environment also sets${off#,}, so this session does not update"
+  case "$ch" in
+    latest)
+      # the environment is the session's, not the machine's: Orca sets DISABLE_AUTOUPDATER for every session
+      # it starts, so it is named without failing the check
+      if [ -n "$off" ]; then row "update channel" OFF "the settings follow latest, but this environment sets${off#,}, so this session does not update (Orca sets DISABLE_AUTOUPDATER for its sessions)"
+      else row "update channel" ok "latest, never below minimumVersion ${min:-(none set)}"; fi ;;
+    "")        row "update channel" "NOT SET" "$s names no autoUpdatesChannel, so the channel chosen at install time applies (claude doctor shows it); run: scripts/bootstrap --user-config$envnote"; return 1 ;;
+    stable)    row "update channel" MISMATCH "$s follows stable, about a week behind latest (ADR 0065 follows latest); run: scripts/bootstrap --user-config$envnote"; return 1 ;;
+    *)         row "update channel" MISMATCH "$s sets autoUpdatesChannel to '$ch', which the docs do not name$envnote"; return 1 ;;
+  esac
 }
 
 # paper_row: whether both Alpaca paper key items are in the login keychain (ADR 0029). It looks each item up
@@ -326,13 +423,103 @@ dsh_row() {
     *)        row "dsh-tui review patch" "NOT SET" "home/dsh/review.patch.yml's rows are not in $dst; run: scripts/bootstrap --install" ;;
   esac
 }
-# The line Antigravity's troubleshooting page gives, in the shell profile it names
+# Antigravity's self-updater. Its troubleshooting page gives `export AGY_CLI_DISABLE_AUTO_UPDATE=true` in the
+# shell profile to stop it; an earlier --install wrote that line with a comment of its own (ADR 0045), and ADR
+# 0059 reverses that, so --install removes exactly canon's pair (the comment and the line after it, with the
+# blank line before them). A line of the owner's is left alone and named.
 AGY_RE='^[[:space:]]*export[[:space:]]+AGY_CLI_DISABLE_AUTO_UPDATE=true[[:space:]]*$'
+AGY_CANON_COMMENT='# Antigravity CLI: background self-updater off, so agy stays at its pin (docs/adr/0045)'
+# agy_without_canon <file>: the file without canon's pair; agy_canon_pair <file>: true when the pair is there
+agy_without_canon() {
+  awk -v c="$AGY_CANON_COMMENT" -v re="$AGY_RE" '{ l[NR] = $0 }
+    END { for (i = 1; i <= NR; i++) if (l[i] == c && (i + 1) in l && l[i + 1] ~ re) { s[i] = 1; s[i + 1] = 1; if (i > 1 && l[i - 1] == "") s[i - 1] = 1 }
+          for (i = 1; i <= NR; i++) if (!(i in s)) print l[i] }' "$1"
+}
+agy_canon_pair() { [ -f "$1" ] && [ "$(agy_without_canon "$1")" != "$(cat "$1")" ]; }
 agy_row() {
-  if grep -Eq "$AGY_RE" "$HOME/.zshrc" 2>/dev/null; then row "agy self-updater" off "AGY_CLI_DISABLE_AUTO_UPDATE=true in ~/.zshrc"
-  elif grep -q 'AGY_CLI_DISABLE_AUTO_UPDATE' "$HOME/.zshrc" 2>/dev/null; then row "agy self-updater" "NOT SET" "$HOME/.zshrc names AGY_CLI_DISABLE_AUTO_UPDATE otherwise; make it: export AGY_CLI_DISABLE_AUTO_UPDATE=true"
-  elif command -v agy >/dev/null 2>&1; then row "agy self-updater" "NOT SET" "it moves agy past its pin; run: scripts/bootstrap --install"
+  local rc="$HOME/.zshrc"
+  if agy_canon_pair "$rc"; then row "agy self-updater" OFF "canon's earlier AGY_CLI_DISABLE_AUTO_UPDATE line is in ~/.zshrc; ADR 0065 turns the updater on: run scripts/bootstrap --install"
+  elif grep -q 'AGY_CLI_DISABLE_AUTO_UPDATE' "$rc" 2>/dev/null; then row "agy self-updater" OWNER "$rc names AGY_CLI_DISABLE_AUTO_UPDATE itself; left as the owner set it (ADR 0065 has the updater on)"
+  elif command -v agy >/dev/null 2>&1; then row "agy self-updater" on "agy updates itself (ADR 0065), except in a launch Orca starts with a prompt; agy update does it at once"
   else row "agy self-updater" absent "no agy on PATH"; fi
+}
+
+# codex_defaults <config.toml>: JSON naming the keys of home/.codex/defaults.toml the file lacks ("missing"),
+# sets to another value ("other"), and those an active profile sets ("profile_sets"; Codex: a profile's keys
+# override the top level, https://learn.chatgpt.com/docs/config-file/config-reference), or {"state":
+# "invalid"} when it is not TOML and {"state": "unknown"} when no python3 with tomllib is here. With a second
+# argument, it also writes to that path the file with the missing keys at its top, where TOML keeps keys of no
+# table, and fails unless the result reads as the old file plus exactly those keys.
+codex_defaults() {
+  local py
+  py=$(toml_python) || { echo '{"state": "unknown"}'; return; }
+  "$py" -I -c 'import json, sys, tomllib
+src, want_path = sys.argv[1], sys.argv[2]
+out = sys.argv[3] if len(sys.argv) > 3 else None
+want = tomllib.load(open(want_path, "rb"))
+try:
+    raw = open(src, "rb").read()
+    have = tomllib.loads(raw.decode())
+except FileNotFoundError:
+    raw, have = b"", {}
+except OSError:
+    print(json.dumps({"state": "unreadable"})); sys.exit()
+except (UnicodeDecodeError, tomllib.TOMLDecodeError):
+    print(json.dumps({"state": "invalid"})); sys.exit()
+missing = [k for k in want if k not in have]
+other = [k for k in want if k in have and have[k] != want[k]]
+prof = have.get("profile")
+pt = (have.get("profiles") or {}).get(prof) if isinstance(prof, str) else None
+psets = [k for k in want if isinstance(pt, dict) and k in pt and pt[k] != want[k]]
+if out and missing:
+    head = "# canon: native default model and effort (home/.codex/defaults.toml, docs/adr/0059-native-defaults-for-every-runtime.md)\n"
+    head += "".join(k + " = " + json.dumps(want[k]) + "\n" for k in missing)
+    new = head.encode() + (b"\n" + raw if raw else b"")
+    got = tomllib.loads(new.decode())
+    if {k: v for k, v in got.items() if k not in missing} != have or any(got[k] != want[k] for k in missing):
+        sys.exit(3)
+    open(out, "wb").write(new)
+print(json.dumps({"state": "read", "missing": missing, "other": other, "profile": prof if isinstance(prof, str) else None, "profile_sets": psets}))' "$1" "$CODEX_DEFAULTS_SRC" ${2:+"$2"}
+}
+codex_defaults_row() {
+  local c="$CODEX_DIR/config.toml" j
+  if [ ! -d "$CODEX_DIR" ]; then row "codex defaults" absent "no $CODEX_DIR (Codex not installed)"; return; fi
+  j=$(codex_defaults "$c") || j='{"state": "unknown"}'
+  case "$(jq -r '.state' <<<"$j")" in
+    invalid) row "codex defaults" INVALID "$c is not valid TOML; Codex cannot read it either"; return ;;
+    unreadable) row "codex defaults" UNKNOWN "$c cannot be read"; return ;;
+    unknown) row "codex defaults" UNKNOWN "no python3 with tomllib to read $c; run: scripts/bootstrap --install"; return ;;
+  esac
+  local want; want=$(grep -v -e '^#' -e '^$' "$CODEX_DEFAULTS_SRC" | tr '\n' ' ')
+  if [ "$(jq '.profile_sets | length' <<<"$j")" != 0 ]; then
+    row "codex defaults" OWNER "the active profile $(jq -r '.profile' <<<"$j") in $c sets $(jq -r '.profile_sets | join(", ")' <<<"$j") otherwise, which overrides $want"
+  elif [ "$(jq '.other | length' <<<"$j")" != 0 ]; then
+    row "codex defaults" OWNER "$c sets $(jq -r '.other | join(", ")' <<<"$j") to another value than home/.codex/defaults.toml ($want); left as the owner set it"
+  elif [ "$(jq '.missing | length' <<<"$j")" != 0 ]; then
+    row "codex defaults" "NOT SET" "$c lacks $(jq -r '.missing | join(", ")' <<<"$j"), so Codex starts on its catalog default; run: scripts/bootstrap --user-config"
+  else row "codex defaults" ok "$want(home/.codex/defaults.toml, ADR 0059)"; fi
+}
+
+# agy_label: the label canon/models.json gives Antigravity's default model; agy_model_state: ok, missing,
+# other, invalid (not a JSON object), absent (no agy folder)
+agy_label() { jq -r '.runtimes[]? | select(.runtime == "antigravity") | .label // empty' "$ROOT/canon/models.json" 2>/dev/null | first_line; }
+agy_model_state() {
+  local want="$1"
+  [ -d "$(dirname "$AGY_SETTINGS")" ] || { echo absent; return; }
+  [ -f "$AGY_SETTINGS" ] || { echo missing; return; }
+  jq -e 'type == "object"' "$AGY_SETTINGS" >/dev/null 2>&1 || { echo invalid; return; }
+  jq -r --arg w "$want" 'if (.model // "") == "" then "missing" elif .model == $w then "ok" else "other" end' "$AGY_SETTINGS"
+}
+agy_model_row() {
+  local want; want=$(agy_label)
+  [ -n "$want" ] || { row "agy default model" UNKNOWN "canon/models.json gives no label for antigravity"; return; }
+  case "$(agy_model_state "$want")" in
+    ok)      row "agy default model" ok "$want ($AGY_SETTINGS, ADR 0059)" ;;
+    other)   row "agy default model" OWNER "$AGY_SETTINGS sets model to $(jq -r '.model' "$AGY_SETTINGS"); canon/models.json gives $want" ;;
+    missing) row "agy default model" "NOT SET" "$AGY_SETTINGS sets no model, so agy starts on its own default; run: scripts/bootstrap --user-config" ;;
+    invalid) row "agy default model" INVALID "$AGY_SETTINGS is not a JSON object" ;;
+    *)       row "agy default model" absent "no $(dirname "$AGY_SETTINGS") (Antigravity not installed)" ;;
+  esac
 }
 
 check() {
@@ -362,17 +549,22 @@ check() {
     t=${v%% *}; t=${t#v}; pin=$(claude_pin)
     if [ -z "$pin" ]; then row "claude CLI" UNKNOWN "${v:-no version}; no readable claude-code pin in canon/upstreams.json"; missing=1
     elif ! dotted "$t"; then row "claude CLI" UNKNOWN "cannot read a version from '${v:-nothing}'; pinned $pin (canon/upstreams.json)"; missing=1
-    elif ver_ge "$t" "$pin"; then row "claude CLI" ok "$t; pinned $pin"
+    elif ver_ge "$t" "$pin"; then
+      if ver_ge "$pin" "$t"; then row "claude CLI" ok "$t; pinned $pin"
+      else row "claude CLI" ok "$t, ahead of the pin $pin (the floor; ADR 0065)"; fi
     else row "claude CLI" BEHIND "$t; pinned $pin (canon/upstreams.json); run: claude install $pin"; missing=1; fi
   else row "claude CLI" MISSING "run: scripts/bootstrap --install"; missing=1; fi
   note "Machine-level Claude Code config (ADR 0007), in $CLAUDE_HOME:"
   check_hooks || missing=1
-  check_model_pins || missing=1
+  check_model_settings || missing=1
+  update_row || missing=1
   if [ -f "$CLAUDE_HOME/CLAUDE.md" ]; then row "user CLAUDE.md" ok ""; else row "user CLAUDE.md" MISSING "run: scripts/bootstrap --user-config"; missing=1; fi
   telemetry_rows || missing=1
   note "Alpaca paper key pair (ADR 0029), optional:"
   paper_row
-  note "Review-only workers (ADR 0045), optional:"
+  note "Review-only workers (ADR 0045) and their defaults (ADR 0059), optional:"
+  codex_defaults_row
+  agy_model_row
   dsh_row
   agy_row
   return "$missing"
@@ -436,8 +628,9 @@ install_toolchain() {
   fi
 }
 
-# install_reviewer_settings: the dsh-tui patch rows and the agy line in ~/.zshrc (ADR 0045). Every row and
-# line already there is kept; a patch it cannot extend safely gets a .canon-proposed copy instead.
+# install_reviewer_settings: the dsh-tui patch rows (ADR 0045), and canon's earlier agy line taken out of
+# ~/.zshrc (ADR 0065). Every other row and line is kept; a patch it cannot extend safely gets a
+# .canon-proposed copy instead.
 install_reviewer_settings() {
   local dir dst body tmp="" bak rc="$HOME/.zshrc" state
   dir=$(dsh_profile_dir); dst="$dir/cordis.patch.yml"
@@ -477,17 +670,17 @@ install_reviewer_settings() {
       fi
     fi
   fi
-  if grep -Eq "$AGY_RE" "$rc" 2>/dev/null; then
-    note "  unchanged  $rc already sets AGY_CLI_DISABLE_AUTO_UPDATE=true"
+  if agy_canon_pair "$rc"; then
+    tmp=$(mktemp) || die "could not create a temp file"
+    agy_without_canon "$rc" > "$tmp" || { rm -f "$tmp"; die "could not read $rc"; }
+    keep_copy "$rc"
+    cat "$tmp" > "$rc" || { rm -f "$tmp"; die "could not write $rc; its previous content is in the copy kept above"; }
+    rm -f "$tmp"
+    note "  removed    canon's AGY_CLI_DISABLE_AUTO_UPDATE=true and its comment from $rc, so agy updates itself again (ADR 0065); open a new terminal to pick it up"
   elif grep -q 'AGY_CLI_DISABLE_AUTO_UPDATE' "$rc" 2>/dev/null; then
-    note "  EXISTS     $rc names AGY_CLI_DISABLE_AUTO_UPDATE otherwise; left alone. Make it: export AGY_CLI_DISABLE_AUTO_UPDATE=true"
+    note "  KEPT       $rc names AGY_CLI_DISABLE_AUTO_UPDATE in a line that is not canon's; left as the owner set it (ADR 0065 has the updater on)"
   else
-    {
-      echo ''
-      echo "# Antigravity CLI: background self-updater off, so agy stays at its pin (docs/adr/0045)"
-      echo 'export AGY_CLI_DISABLE_AUTO_UPDATE=true'
-    } >> "$rc"
-    note "  added      AGY_CLI_DISABLE_AUTO_UPDATE=true to $rc (open a new terminal to pick it up)"
+    note "  unchanged  $rc does not turn Antigravity's self-updater off"
   fi
 }
 
@@ -501,44 +694,61 @@ render_settings() {
     (.statusLine.command |= place) | (.hooks[][].hooks[].command |= place)' "$ROOT/home/.claude/settings.json"
 }
 
-# keep_copy <file>: copies the file beside itself as <file>.replaced-<UTC time> and says so
+# keep_copy <file>: copies the file beside itself as <file>.replaced-<UTC time> and says so; a second copy in
+# the same second (two steps of one run writing the same file) gets -2, -3 and so on, never the first's name
 keep_copy() {
-  local bak; bak="$1.replaced-$(date -u +%Y%m%dT%H%M%SZ)"
+  local base bak n=1
+  base="$1.replaced-$(date -u +%Y%m%dT%H%M%SZ)"; bak="$base"
+  while [ -e "$bak" ]; do n=$((n + 1)); bak="$base-$n"; done
   cp -p "$1" "$bak" || die "could not keep the previous $1"
   note "  kept       the previous $(basename "$1") as $bak"
 }
 
 # install_telemetry <rendered settings.json>: the OTLP settings of ADR 0007 tier 3, for Claude Code and
-# Codex. An existing settings.json gets the telemetry variables it lacks; when that leaves it the same JSON
-# as the rendered canon settings, it takes the rendered file's bytes, so the copy step after finds it
-# unchanged. A value the owner set otherwise, and an otel setting of Codex's that is not canon's, are left
-# alone and named, as the owner's choice. Codex's config is written only when its folder exists (Codex
-# installed). Returns 1 only when settings.json cannot be read as settings.
+# Codex, and the model keys of ADR 0059. An existing settings.json gets the telemetry variables and the model
+# keys (CANON_KEYS) it lacks, and loses a RETIRED value it still holds; when that leaves it the same JSON as
+# the rendered canon settings, it takes the rendered file's bytes, so the copy step after finds it unchanged.
+# A value the owner set otherwise, and an otel setting of Codex's that is not canon's, are left alone and
+# named, as the owner's choice. Codex's config is written only when its folder exists (Codex installed).
+# Returns 1 only when settings.json cannot be read as settings.
 install_telemetry() {
-  local s="$CLAUDE_HOME/settings.json" add differ tmp c="$CODEX_DIR/config.toml" rc=0
+  local s="$CLAUDE_HOME/settings.json" plan differ tmp c="$CODEX_DIR/config.toml" rc=0
   if [ ! -e "$s" ]; then :   # the copy step installs the rendered file, env block included
   elif ! jq -e 'type == "object" and ((.env // {}) | type == "object")' "$s" >/dev/null 2>&1; then
-    note "  EXISTS     $s is not a JSON object with an object env; telemetry settings not added"; rc=1
+    note "  EXISTS     $s is not a JSON object with an object env; telemetry and model settings not added"; rc=1
   else
+    # one plan: the merged document, and what was added, removed and kept, so the file is written once
     # shellcheck disable=SC2016  # jq program, not shell
-    add=$(jq -c --slurpfile w "$1" --arg re "$TELEMETRY_RE" 'def telemetry: with_entries(select(.key | test($re))); . as $in | ($w[0].env // {} | telemetry) | with_entries(select(($in.env // {})[.key] == null))' "$s") \
-      || die "could not read the env of $s"
-    # shellcheck disable=SC2016  # jq program, not shell
-    differ=$(jq -r --slurpfile w "$1" --arg re "$TELEMETRY_RE" \
-               'def telemetry: with_entries(select(.key | test($re))); (.env // {}) as $e | ($w[0].env // {} | telemetry) | to_entries | map(select($e[.key] != null and $e[.key] != .value) | .key) | join(" ")' "$s") \
-      || die "could not read the env of $s"
-    if [ "$add" != "{}" ]; then
+    plan=$(jq -c --slurpfile w "$1" --arg re "$TELEMETRY_RE" --argjson mk "$CANON_KEYS" --argjson ret "$RETIRED" '
+      def telemetry: with_entries(select(.key | test($re)));
+      . as $in | $w[0] as $t
+      | ($t.env // {} | telemetry | with_entries(select(($in.env // {})[.key] == null))) as $env
+      | [$ret[] | select(. as $r | $in | getpath($r.path) == $r.value)] as $gone
+      | (reduce $gone[] as $r ($in; delpaths([$r.path]))) as $kept
+      | [$mk[] | select($kept[.] == null and $t[.] != null)] as $top
+      | (($kept | if ($env | length) > 0 then .env = ((.env // {}) + $env) else . end)
+         | reduce $top[] as $k (.; .[$k] = $t[$k])) as $doc
+      | {doc: $doc, env: ($env | keys), top: $top, gone: [$gone[] | .path | join(".")],
+         kept: [($t.env // {} | telemetry | to_entries[] | select(($in.env // {})[.key] != null and $in.env[.key] != .value) | .key)],
+         kept_top: [$mk[] | select($kept[.] != null and $t[.] != null and $kept[.] != $t[.])]}' "$s") \
+      || die "could not read $s"
+    differ=$(jq -r '.kept | join(" ")' <<<"$plan")
+    if [ "$(jq '(.env + .top + .gone) | length' <<<"$plan")" != 0 ]; then
       tmp=$(mktemp)
-      jq --argjson a "$add" '.env = ((.env // {}) + $a)' "$s" > "$tmp" || { rm -f "$tmp"; die "could not add the telemetry settings to $s"; }
+      jq '.doc' <<<"$plan" > "$tmp" || { rm -f "$tmp"; die "could not merge the settings into $s"; }
       [ "$(jq -S . "$tmp")" != "$(jq -S . "$1")" ] || cat "$1" > "$tmp"
       keep_copy "$s"
       cat "$tmp" > "$s" || { rm -f "$tmp"; die "could not write $s; its previous content is in the copy kept above"; }
       rm -f "$tmp"
-      note "  added      $(jq -r 'keys | join(", ")' <<<"$add") to the env of $s"
+      [ "$(jq '.env | length' <<<"$plan")" = 0 ] || note "  added      $(jq -r '.env | join(", ")' <<<"$plan") to the env of $s"
+      [ "$(jq '.top | length' <<<"$plan")" = 0 ] || note "  added      $(jq -r '.top | join(", ")' <<<"$plan") to $s (ADR 0059, ADR 0065)"
+      [ "$(jq '.gone | length' <<<"$plan")" = 0 ] || note "  retired    $(jq -r '.gone | join(", ")' <<<"$plan") in $s, values an earlier canon template set (ADR 0059, ADR 0065); a key retired here is then added from the template"
     else
-      note "  unchanged  telemetry settings in $s"
+      note "  unchanged  telemetry and model settings in $s"
     fi
     [ -z "$differ" ] || note "  KEPT       $s sets $differ to another value than canon's; left as the owner set it"
+    differ=$(jq -r '.kept_top | join(", ")' <<<"$plan")
+    [ -z "$differ" ] || note "  KEPT       $s sets $differ to another value than home/.claude/settings.json; left as the owner set it (scripts/bootstrap --check names each)"
   fi
   if [ ! -d "$CODEX_DIR" ]; then
     note "  skipped    Codex telemetry: no $CODEX_DIR (Codex not installed); run --user-config again after installing it"
@@ -565,6 +775,70 @@ install_telemetry() {
       rm -f "$tmp"
       note "  added      [otel] to $c"
       ;;
+  esac
+  return "$rc"
+}
+
+# install_runtime_defaults: the default model and effort of the other runtimes that keep them in a file
+# (ADR 0059). Codex: home/.codex/defaults.toml's keys that config.toml lacks, written at its top (only when
+# the result reads as the old file plus those keys). Antigravity: settings.json's model, set to the label
+# canon/models.json gives when unset. Each only when the runtime's folder exists; a value the owner set
+# otherwise is left alone and named. Returns 1 when a file cannot be read as its format.
+install_runtime_defaults() {
+  local c="$CODEX_DIR/config.toml" j tmp rc=0 want st
+  if [ ! -d "$CODEX_DIR" ]; then
+    note "  skipped    Codex defaults: no $CODEX_DIR (Codex not installed)"
+  else
+    tmp=$(mktemp) || die "could not create a temp file"
+    local xc=0; j=$(codex_defaults "$c" "$tmp") || xc=$?
+    case "$xc" in
+      0) ;;
+      3) j='{"state": "unsafe"}' ;;
+      *) j='{"state": "failed"}' ;;
+    esac
+    case "$(jq -r '.state' <<<"$j")" in
+      unsafe)  note "  FAILED     writing home/.codex/defaults.toml's keys at the top of $c would not leave the old file plus those keys; nothing written"; rc=1 ;;
+      failed)  note "  FAILED     the TOML step for $c stopped with an error (exit $xc); nothing written"; rc=1 ;;
+      unreadable) note "  UNKNOWN    $c cannot be read; left as it is"; rc=1 ;;
+      invalid) note "  INVALID    $c is not valid TOML; left as it is, and no defaults added"; rc=1 ;;
+      unknown) note "  UNKNOWN    no python3 with tomllib to read $c; left as it is (run: scripts/bootstrap --install)"; rc=1 ;;
+      *)
+        if [ "$(jq '.missing | length' <<<"$j")" != 0 ]; then
+          [ ! -s "$c" ] || keep_copy "$c"
+          cat "$tmp" > "$c" || { rm -f "$tmp"; die "could not write $c; its previous content is in the copy kept above"; }
+          note "  added      $(jq -r '.missing | join(", ")' <<<"$j") to $c (home/.codex/defaults.toml, ADR 0059)"
+        else
+          note "  unchanged  Codex defaults in $c"
+        fi
+        [ "$(jq '.other | length' <<<"$j")" = 0 ] || note "  KEPT       $c sets $(jq -r '.other | join(", ")' <<<"$j") to another value than home/.codex/defaults.toml; left as the owner set it"
+        [ "$(jq '.profile_sets | length' <<<"$j")" = 0 ] || note "  KEPT       the active profile in $c sets $(jq -r '.profile_sets | join(", ")' <<<"$j") otherwise, which overrides the top level; left as the owner set it"
+        ;;
+    esac
+    rm -f "$tmp"
+  fi
+  want=$(agy_label)
+  if [ ! -d "$(dirname "$AGY_SETTINGS")" ]; then st=absent
+  elif [ -z "$want" ]; then st=nolabel
+  else st=$(agy_model_state "$want"); fi
+  case "$st" in
+    nolabel) note "  UNKNOWN    canon/models.json gives no label for antigravity; $AGY_SETTINGS left as it is"; rc=1 ;;
+    absent)  note "  skipped    Antigravity default model: no $(dirname "$AGY_SETTINGS") (Antigravity not installed)" ;;
+    ok)      note "  unchanged  model in $AGY_SETTINGS" ;;
+    other)   note "  KEPT       $AGY_SETTINGS sets model to $(jq -r '.model' "$AGY_SETTINGS"); left as the owner set it. Canon's: $want" ;;
+    invalid) note "  INVALID    $AGY_SETTINGS is not a JSON object; left as it is"; rc=1 ;;
+    missing)
+      tmp=$(mktemp) || die "could not create a temp file"
+      if [ -f "$AGY_SETTINGS" ]; then
+        jq --arg w "$want" '.model = $w' "$AGY_SETTINGS" > "$tmp" || { rm -f "$tmp"; die "could not read $AGY_SETTINGS"; }
+        keep_copy "$AGY_SETTINGS"
+        cat "$tmp" > "$AGY_SETTINGS" || { rm -f "$tmp"; die "could not write $AGY_SETTINGS; its previous content is in the copy kept above"; }
+      else
+        jq -n --arg w "$want" '{model: $w}' > "$tmp" || { rm -f "$tmp"; die "could not write a temp file"; }
+        # the CLI makes the file "readable only by" its owner (https://antigravity.google/docs/settings)
+        install -m 600 "$tmp" "$AGY_SETTINGS" || { rm -f "$tmp"; die "could not write $AGY_SETTINGS"; }
+      fi
+      rm -f "$tmp"
+      note "  added      model \"$want\" to $AGY_SETTINGS (ADR 0059)" ;;
   esac
   return "$rc"
 }
@@ -601,8 +875,12 @@ install_user_config() {
     fi
   done
   rm -f "$tmp"
-  [ "$pending" -eq 0 ] || note "Some files were not applied (see EXISTS above)."
+  local failed=0; install_runtime_defaults || failed=1
+  [ "$pending" -eq 0 ] && [ "$failed" -eq 0 ] || note "Some files were not applied (see EXISTS, FAILED, INVALID or UNKNOWN above)."
   note "New Claude Code sessions will pick this up. Verify with: scripts/bootstrap --check, then scripts/lanes"
+  # a step that could not run (FAILED, INVALID, UNKNOWN for another runtime's file) fails the run; a
+  # differing file left for the owner to merge (EXISTS) does not
+  [ "$failed" -eq 0 ] || { note "bootstrap: another runtime's defaults could not be written (see above)" >&2; return 1; }
 }
 
 case "${1:-}" in

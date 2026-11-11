@@ -35,18 +35,20 @@ Chosen: **option 3**.
 | git, clang, make | Xcode Command Line Tools (`xcode-select --install`) | Apple |
 | mise | `https://mise.run` installer, into `~/.local/bin`, no sudo | `MISE_VERSION=v2026.11.5` in `scripts/bootstrap` |
 | Python 3.14, uv 0.13.7, Node, gh | mise | `mise.toml` plus `mise.lock` (versions, URLs, checksums) |
-| Claude Code CLI | `https://claude.ai/install.sh`, into `~/.local/bin` | `stable` channel |
+| Claude Code CLI | `https://claude.ai/install.sh`, into `~/.local/bin` | `stable` channel (`latest` from 2026-11-10, ADR 0065) |
 | ccusage | run on demand with `npx ccusage@20.0.48` | version in the command |
 
 Notes:
 
 * Python 3.14 because the pinned NautilusTrader release ships wheels for 3.13 and 3.14 only (3.15 is a
   source build) and upstream recommends 3.14.
-* Claude Code is the one tool allowed to auto-update. It follows the `stable` channel (about a week behind
+* Claude Code is the one tool allowed to auto-update (from 2026-11-10 Antigravity's updater is on too, ADR
+  0065). It follows the `stable` channel (about a week behind
   `latest`), which serves as a cooldown. The desktop app updates on its own schedule regardless. A newly
   launched model can need a CLI newer than `stable` serves.
   ADR 0022 supersedes the Claude Code row above and this note in part: the CLI is installed at the
-  registry's pin and held at or above it.
+  registry's pin and held at or above it. ADR 0065 (2026-11-10) supersedes the stable channel and this week of
+  hold: the CLI follows `latest`, never below that pin.
 * Homebrew is not installed: it needs `sudo` and its formulae roll forward (UNVERIFIED: no source was read
   for this). Add it later if a tool needs it.
 * mise applies a `minimum_release_age` cooldown of 24 hours by default, so a release under a day old is
@@ -91,6 +93,9 @@ Read 2026-11-09 (fetched unless noted).
 * Second reader, 2026-11-09 (`evidence-verifier`): the install, lockfile and channel claims are supported.
   The Python range, the lock and disk figures and the cooldown note were stale or too broad and are
   corrected above; `minimum_release_age` defaulting to 24 hours is from the same settings page.
+* https://mise.jdx.dev/configuration/settings.html, read again 2026-11-10 — the cutoff "applies when mise
+  resolves a version request such as node@22 or latest"; "Exact versions such as node@22.5.0, and
+  versions recorded in mise.lock, are not filtered", which the cooldown line above leaves out (fetched).
 * https://code.claude.com/docs/en/setup.md — native installer is the recommended install; `stable` channel;
   version pinning with `bash -s <version>`; requires macOS 13 or later.
 * https://github.com/anthropics/claude-code — npm install marked deprecated in favour of the native

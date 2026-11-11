@@ -1,10 +1,11 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
-  "autoUpdatesChannel": "stable",
+  "autoUpdatesChannel": "latest",
   "minimumVersion": "2.1.321",
-  "model": "fable",
+  "model": "opus",
+  "availableModels": ["opus", "sonnet", "haiku", "claude-fable-5-2"],
+  "modelPicker": { "options": [{ "model": "claude-fable-5-2" }] },
   "env": {
-    "ANTHROPIC_DEFAULT_FABLE_MODEL": "claude-fable-5-2",
     "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
     "OTEL_LOGS_EXPORTER": "otlp",
     "OTEL_METRICS_EXPORTER": "none",

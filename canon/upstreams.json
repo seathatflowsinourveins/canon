@@ -9,7 +9,7 @@
       "track": "tag:v2.1.321",
       "role": "platform",
       "license": "UNVERIFIED (LICENSE.md not read)",
-      "why": "The agent harness itself; its docs define every config layer this repo uses. The terminal CLI is installed at this pin and held at or above it (ADR 0022). Held 2026-11-10: v2.1.322 (published 2026-11-10; notes: fast mode on Vertex) waits for the stable channel, about a week behind latest (ADR 0008, ADR 0022); a move also changes minimumVersion in home/.claude/settings.json. Look again 2026-11-17.",
+      "why": "The agent harness itself; its docs define every config layer this repo uses. The terminal CLI is installed at this pin and held at or above it (ADR 0022). Since ADR 0065 the pin is a floor: the CLI updates itself on the latest channel, which the settings template names, so a newer release such as v2.1.322 (published 2026-11-10; notes: fast mode on Vertex) runs before it is read here: in the background in a session with no update switch (Orca sets one in each launch that submits a prompt), or at once with claude update; a move of the pin also changes minimumVersion in home/.claude/settings.json. Look again 2026-11-17.",
       "evidence": [
         "https://github.com/anthropics/claude-code/releases",
         "https://code.claude.com/docs/en/memory",
@@ -554,7 +554,7 @@
       "track": "tag:1.5.5",
       "role": "tool",
       "license": "UNVERIFIED (no licence file in the repository; GitHub reports none)",
-      "why": "Google's Antigravity CLI (agy), a review-only Orca worker from another model family (ADR 0045, under ADR 0043's terms). Installed machine-level by the owner (aqua:google-antigravity/antigravity-cli), not in mise.toml; check with agy --version. Its background self-updater moved it from 1.5.3 to 1.5.5, and the pin followed after the release notes of 1.5.4 and 1.5.5 were read (Auto mode for agy acp, a swarm preview, fixes; nothing that changes a review-only reader). Its troubleshooting page documents AGY_CLI_DISABLE_AUTO_UPDATE=true, set in the shell profile, to stop the updater; scripts/bootstrap --install writes it to ~/.zshrc (ADR 0045).",
+      "why": "Google's Antigravity CLI (agy), a review-only Orca worker from another model family (ADR 0045, under ADR 0043's terms). Installed machine-level by the owner (aqua:google-antigravity/antigravity-cli), not in mise.toml; check with agy --version. Its background self-updater moved it from 1.5.3 to 1.5.5, and the pin followed after the release notes of 1.5.4 and 1.5.5 were read (Auto mode for agy acp, a swarm preview, fixes; nothing that changes a review-only reader). Its troubleshooting page documents AGY_CLI_DISABLE_AUTO_UPDATE=true, set in the shell profile, to stop the updater; ADR 0065 keeps the updater on (reversing ADR 0045), so the pin is the version last read, and scripts/bootstrap --install removes the line an earlier run wrote to ~/.zshrc. Orca sets the variable in each Antigravity launch that submits a prompt, so its workers do not update; agy update does it at once.",
       "evidence": [
         "https://github.com/google-antigravity/antigravity-cli/releases",
         "https://raw.githubusercontent.com/google-antigravity/antigravity-cli/main/README.md",

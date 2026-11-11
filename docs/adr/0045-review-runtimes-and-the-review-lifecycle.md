@@ -46,7 +46,8 @@ owner's delegation of 2026-11-10.
      the pin followed once 1.5.4's and 1.5.5's notes were read (Auto mode for `agy acp`, a `/swarm`
      preview, hook-input fields, models, fixes; none changes a reader's terms; a brief starts no swarm).
      Its docs set `AGY_CLI_DISABLE_AUTO_UPDATE=true` in the shell profile, so `scripts/bootstrap
-     --install` writes it to `~/.zshrc`.
+     --install` writes it to `~/.zshrc`. (Reversed 2026-11-10 by ADR 0065 rule 3: the updater is on
+     again, and `--install` removes that line.)
    * *DeepSeek Harness* (MIT, pre-release only; agent id `dsh`, no entry in the map): API key in its own
      file (not read). Orca launches `dsh-tui .`, whose `/update` moves past the pin. Open Orca issues: a
      first prompt lost past 30 s (#38131), `git` failing in its terminals (#26594). Session logs go to
@@ -108,7 +109,10 @@ owner's delegation of 2026-11-10.
    UNVERIFIED. So a report names the model and effort its session showed, and where `max` is not
    offered the coordinator starts the next review at the highest level below `ultra` that is. If the
    flags start no worker, the same two keys in the machine's Codex config do it: the owner's step, since
-   `scripts/bootstrap` writes only its own table there.
+   `scripts/bootstrap` writes only its own table there. (From 2026-11-10, ADR 0059 rule 4:
+   `scripts/bootstrap --user-config` writes both keys there, from `home/.codex/defaults.toml`, so flags
+   and config agree; its rules 5 and 6 give Antigravity and Muse a default of their own, and rule 7 keeps
+   DeepSeek Harness on its bundle's.)
    **Before this rule** every Codex review named no model or effort: both reviewer benchmark runs
    (`evals/review/runs/2026-11-10-first` and `-second`; their sheets say "on its own defaults") and, by
    ADR 0043 rule 5, the trials below. The machine's Codex config sets neither, so the catalog's defaults
@@ -120,7 +124,8 @@ owner's delegation of 2026-11-10.
 * Good: three more families can read the riskiest code, and the review starts from the task graph rather
   than from memory. By the trial reports, Muse's and Codex's findings overlapped in three of nine.
 * Bad: each sign-in is in reach of an unsandboxed worker (ADR 0043). Antigravity updates itself past its
-  pin until `~/.zshrc` sets its switch, Muse and `dsh-tui` on any update. Nine packages no one here read run
+  pin until `~/.zshrc` sets its switch (from 2026-11-10 the switch is off on purpose and updating past
+  the pin is intended, ADR 0065), Muse and `dsh-tui` on any update. Nine packages no one here read run
   inside DeepSeek Harness. More readers, more claims for the owning lane to reproduce.
 * Leaving: delete the entry and pin, drop the agent from `AGENTS.md`, `mise uninstall -g` the tool (the
   owner's); this record is then superseded.

@@ -38,7 +38,9 @@ decided against a gate. Nothing measured here supports the choice yet: no build 
 ADR 0005's table rests on other people's workloads.
 
 1. **Who.** The adopted runtimes: Codex (an OpenAI model, on the model and effort ADR 0045 rule 7
-   names), Antigravity (Google) and Muse Code (Meta) on their defaults, and DeepSeek Harness only while
+   names), Antigravity (Google) and Muse Code (Meta) on their defaults (from 2026-11-10 set by ADR 0059:
+   Antigravity's in its settings file; Muse's only as launch flags, `--model muse-wonder-1.0 --effort max`,
+   so a Muse worker started without them is not on that default), and DeepSeek Harness only while
    `scripts/bootstrap --check` shows its review patch ok (ADR 0045 rule 6). A runtime with no adoption
    record builds nothing: OMP and Hermes have none.
 2. **Terms**, as the Orca section of `AGENTS.md` now states them. The worker has its own workspace
