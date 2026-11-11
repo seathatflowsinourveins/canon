@@ -345,16 +345,22 @@ def test_a_value_with_no_stable_text_form_is_refused() -> None:
     config = strategy()
     setattr(config, "extra", Opaque())  # noqa: B010, a field the class does not declare
 
-    with pytest.raises(TypeError, match="no stable text form"):
+    with pytest.raises(TypeError, match="not as MaCrossConfig builds it"):
         trial_config([config], starting_balances=BALANCES)
+    # The key's own refusal still stands behind it, for a field the class may declare later.
+    with pytest.raises(TypeError, match="no stable text form"):
+        canon_trading.ledger._field("extra", vars(config)["extra"])
 
 
 def test_a_callable_config_field_is_refused() -> None:
     config = strategy()
     setattr(config, "sizer", len)  # noqa: B010, a field the class does not declare
 
-    with pytest.raises(TypeError, match="no stable text form"):
+    with pytest.raises(TypeError, match="not as MaCrossConfig builds it"):
         trial_config([config], starting_balances=BALANCES)
+    # The key's own refusal still stands behind it, for a field the class may declare later.
+    with pytest.raises(TypeError, match="no stable text form"):
+        canon_trading.ledger._field("sizer", vars(config)["sizer"])
 
 
 def test_a_config_changed_between_records_is_hashed_as_it_ran(
@@ -1318,8 +1324,11 @@ def test_a_value_keyed_by_what_it_is_not_is_refused(extra: object) -> None:
     config = strategy()
     setattr(config, "extra", extra)  # noqa: B010, a field the class does not declare
 
-    with pytest.raises(TypeError, match="no stable text form"):
+    with pytest.raises(TypeError, match="not as MaCrossConfig builds it"):
         trial_config([config], starting_balances=BALANCES)
+    # The key's own refusal still stands behind it, for a field the class may declare later.
+    with pytest.raises(TypeError, match="no stable text form"):
+        canon_trading.ledger._field("extra", vars(config)["extra"])
 
 
 def test_a_waiting_trial_added_with_attributes_is_not_recorded_in(
@@ -1455,8 +1464,11 @@ def test_a_field_with_no_stable_text_form_is_named() -> None:
     config = strategy()
     setattr(config, "extra", object())  # noqa: B010, a field the class does not declare
 
-    with pytest.raises(TypeError, match="field 'extra'"):
+    with pytest.raises(TypeError, match="not as MaCrossConfig builds it"):
         trial_config([config], starting_balances=BALANCES)
+    # The key's own refusal still stands behind it, for a field the class may declare later.
+    with pytest.raises(TypeError, match="field 'extra'"):
+        canon_trading.ledger._field("extra", vars(config)["extra"])
 
 
 @pytest.mark.parametrize(
@@ -1613,3 +1625,59 @@ def test_a_catalog_with_two_definitions_of_one_instrument_does_not_run(
         record_trial(study, tmp_path / "catalog", [strategy()], starting_balances=BALANCES)
     [trial] = study.trials
     assert (trial.state, trial.user_attrs[OUTCOME]) == (TrialState.FAIL, FAILED)
+
+
+@pytest.mark.parametrize(
+    ("given", "named"),
+    [
+        pytest.param({"fast": 3, "slow": 12}, "'fast', 'slow'", id="a mistyped field"),
+        pytest.param({"order_tag": "01"}, "'order_tag'", id="a mistyped base field"),
+    ],
+)
+def test_a_keyword_ma_cross_config_does_not_take_is_refused(
+    given: dict[str, Any], named: str
+) -> None:
+    """A third reader of the gate: `MaCrossConfig` took any keyword and ran its defaults, so two
+    configs with a mistyped field were one run under one key; only the base `StrategyConfig` fields
+    pass through."""
+    with pytest.raises(
+        TypeError, match=f"MaCrossConfig got an unexpected keyword argument {named}"
+    ):
+        MaCrossConfig(bar_type=BAR_TYPE, trade_size=Quantity.from_int(10), **given)
+    tagged_config = MaCrossConfig(
+        bar_type=BAR_TYPE, trade_size=Quantity.from_int(10), order_id_tag="A"
+    )
+    assert tagged_config.order_id_tag == "A"
+
+
+@pytest.mark.parametrize(
+    "given",
+    [
+        pytest.param({"fast_period": True}, id="bool period"),
+        pytest.param({"fast_period": 3.0}, id="float period"),
+        pytest.param({"slow_period": "20"}, id="text period"),
+        pytest.param({"trade_size": Decimal(10)}, id="decimal size"),
+    ],
+)
+def test_a_field_of_another_type_is_refused(given: dict[str, object]) -> None:
+    """A third reader of the gate: values of another type keyed apart (`3.0` and `3`) or together
+    (`Decimal("10")` and `Quantity(10)` print alike) though they run alike or not at all; each field
+    takes one type."""
+    fields: dict[str, Any] = {"bar_type": BAR_TYPE, "trade_size": Quantity.from_int(10), **given}
+    with pytest.raises(TypeError, match=f"MaCrossConfig's {next(iter(given))} is"):
+        MaCrossConfig(**fields)
+
+
+def test_a_config_whose_fields_were_changed_after_it_was_built_is_refused() -> None:
+    """A third reader of the gate: a value in `vars(config)` under a base field's name was keyed
+    though the engine reads the base field's own getter; so would a field added after construction."""
+    for change in ({"order_id_tag": "01"}, {"extra": 1}, {"fast_period": "3"}):
+        config = strategy()
+        vars(config).update(change)
+        with pytest.raises(TypeError, match="not as MaCrossConfig builds it"):
+            trial_config([config], starting_balances=BALANCES)
+    for change in ({"fast_period": 30, "slow_period": 20}, {"trade_size": Quantity.from_int(0)}):
+        config = strategy()
+        vars(config).update(change)
+        with pytest.raises(ValueError, match="not as MaCrossConfig builds it"):
+            trial_config([config], starting_balances=BALANCES)

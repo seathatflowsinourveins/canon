@@ -70,6 +70,7 @@ from canon_trading import session_window
 from canon_trading.paper_node import exec_engine_config
 from canon_trading.paper_node import risk_limits
 from canon_trading.position_cap import PositionCap
+from canon_trading.position_cap import PositionCapConfig
 from canon_trading.position_cap import position_cap_config
 from canon_trading.session_ma_cross import EXTENDED_HOURS
 from canon_trading.session_ma_cross import SessionMaCross
@@ -210,6 +211,15 @@ def test_the_config_refuses_settings_it_cannot_honour(changes: dict, message: st
         strategy(**changes)
 
 
+@pytest.mark.parametrize("misspelled", ["wind_down", "fast_perid", "manage_stp"])
+def test_the_config_refuses_a_keyword_it_does_not_have(misspelled: str) -> None:
+    """A misspelled `wind_down_at` used to mean no wind-down, silently (reported by DeepSeek Harness)."""
+    with pytest.raises(
+        TypeError, match=f"SessionMaCrossConfig got an unexpected keyword argument '{misspelled}'"
+    ):
+        strategy(**{misspelled: datetime(2025, 11, 10, 21, tzinfo=UTC)})
+
+
 def test_in_the_session_it_trades_like_macross_with_market_orders() -> None:
     eng = engine()
     s = strategy()
@@ -320,6 +330,51 @@ def test_the_cap_trips_over_one_share_and_shuts_the_system_down(monkeypatch) -> 
     assert cap.tripped == "net position 2 in SPY.ALPACA is over the cap of 1"
     assert reasons == [cap.tripped]
     assert cap.peak == 2
+
+
+def test_the_cap_config_refuses_a_keyword_it_does_not_have() -> None:
+    """`max_postion=0` used to leave the cap at one share, silently (reported by DeepSeek Harness)."""
+    with pytest.raises(
+        TypeError, match="PositionCapConfig got an unexpected keyword argument 'max_postion'"
+    ):
+        PositionCapConfig(instrument_id=SPY, max_postion=Decimal(0))
+
+
+def test_the_cap_config_keeps_its_base_fields() -> None:
+    config = position_cap_config(SPY, max_position=Decimal(0))
+    assert (config.max_position, config.order_id_tag) == (Decimal(0), "CAP")
+
+
+@pytest.mark.parametrize(
+    ("changes", "named"),
+    [
+        pytest.param({"extended_hours": "False"}, "extended_hours", id="text flag"),
+        pytest.param({"warm_up": 1}, "warm_up", id="int flag"),
+        pytest.param({"limit_timeout_secs": 30.5}, "limit_timeout_secs", id="float seconds"),
+        pytest.param({"limit_offset": 0.05}, "limit_offset", id="float offset"),
+        pytest.param({"wind_down_at": "2025-11-10T21:00Z"}, "wind_down_at", id="text time"),
+        pytest.param({"fast_period": 3.0}, "fast_period", id="float period"),
+    ],
+)
+def test_the_config_refuses_a_setting_of_another_type(changes: dict, named: str) -> None:
+    """`extended_hours="False"` is true and would run the window on marked limits; each setting takes
+    one type."""
+    with pytest.raises(TypeError, match=f"SessionMaCrossConfig's {named} is"):
+        strategy(**changes)
+
+
+@pytest.mark.parametrize(
+    ("changes", "named"),
+    [
+        pytest.param({"instrument_id": "SPY.ALPACA"}, "instrument_id", id="text instrument"),
+        pytest.param({"max_position": 1}, "max_position", id="int cap"),
+        pytest.param({"interval_secs": True}, "interval_secs", id="bool interval"),
+    ],
+)
+def test_the_cap_config_refuses_a_field_of_another_type(changes: dict, named: str) -> None:
+    fields: dict = {"instrument_id": SPY, **changes}
+    with pytest.raises(TypeError, match=f"PositionCapConfig's {named} is"):
+        PositionCapConfig(**fields)
 
 
 def test_the_cap_holds_still_at_one_share() -> None:

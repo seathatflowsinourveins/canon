@@ -52,6 +52,7 @@ from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -409,6 +410,19 @@ def test_config_keeps_the_base_fields_and_upstreams_default_periods() -> None:
 
     assert (made.fast_period, made.slow_period) == (10, 20)
     assert made.order_id_tag == "007"
+
+
+@pytest.mark.parametrize("misspelled", ["fast_perid", "order_id_tg"])
+def test_config_refuses_a_keyword_it_does_not_have(misspelled: str) -> None:
+    """NautilusTrader's `StrategyConfig.__new__` ignores an unknown keyword, so `fast_perid=5` used to
+    leave `fast_period` at 10 without a word (reported by DeepSeek Harness). A dict-built config gets
+    the same refusal, naming the key. Antigravity found the same: the misspelled config hashed to the
+    default's key, so a study took it as already run."""
+    fields: dict[str, Any] = {"bar_type": BAR_TYPE, "trade_size": TRADE_SIZE, misspelled: 5}
+    with pytest.raises(
+        TypeError, match=f"MaCrossConfig got an unexpected keyword argument '{misspelled}'"
+    ):
+        MaCrossConfig(**fields)
 
 
 @pytest.mark.parametrize("bound", ["start", "end"])

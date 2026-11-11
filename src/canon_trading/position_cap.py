@@ -28,12 +28,15 @@ from decimal import Decimal
 from typing import TYPE_CHECKING
 
 from nautilus_trader.config import StrategyConfig
+from nautilus_trader.model import InstrumentId
 from nautilus_trader.model import StrategyId
 from nautilus_trader.trading import Strategy
 
+from .ma_cross import refuse_another_type
+from .ma_cross import refuse_unknown_keywords
+
 if TYPE_CHECKING:
     from nautilus_trader.common import TimeEvent
-    from nautilus_trader.model import InstrumentId
 
 CAP_ID = StrategyId("PositionCap-CAP")
 
@@ -43,7 +46,9 @@ class PositionCapConfig(StrategyConfig):
 
     Build it with `position_cap_config`, which also gives the base fields (`strategy_id`, `order_id_tag`):
     at the pin they reach a `StrategyConfig` subclass only as constructor keywords (concepts/strategies,
-    "Strategy configuration").
+    "Strategy configuration"). Any other keyword raises `TypeError` naming it
+    (`ma_cross.refuse_unknown_keywords`), since upstream's `__new__` would drop it, and each field takes
+    one type (`ma_cross.refuse_another_type`).
     """
 
     def __init__(
@@ -55,6 +60,16 @@ class PositionCapConfig(StrategyConfig):
         **_kwargs: object,
     ) -> None:
         super().__init__()
+        refuse_unknown_keywords(self, _kwargs)
+        refuse_another_type(
+            self,
+            {
+                "instrument_id": instrument_id,
+                "max_position": max_position,
+                "interval_secs": interval_secs,
+            },
+            {"instrument_id": InstrumentId, "max_position": Decimal, "interval_secs": int},
+        )
         if max_position < 0:
             raise ValueError(f"max_position must not be negative, got {max_position}")
         if interval_secs <= 0:

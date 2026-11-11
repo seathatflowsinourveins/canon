@@ -103,6 +103,7 @@ from .backtest import checked_run_config
 from .backtest import run_backtest_config
 from .ma_cross import MaCross
 from .ma_cross import MaCrossConfig
+from .ma_cross import check_as_built
 from .returns_matrix import DAY_NS
 from .returns_matrix import NS_RANGE
 from .returns_matrix import ReturnsRejected
@@ -470,7 +471,10 @@ def trial_config(
     Each config must be a `MaCrossConfig` itself, not a subclass: `record_trial` builds `MaCross` from
     every config and the key names that class, so a subclass's own fields (`SessionMaCrossConfig`'s
     `limit_offset`, `wind_down_at`) would be keyed though no run reads them, and two configs that differ
-    only there would be two trials of one run. Such a config raises `TypeError`, naming its class.
+    only there would be two trials of one run. Such a config raises `TypeError`, naming its class, and
+    so does one whose attributes are not the four `MaCrossConfig` builds, of their types, and
+    `ValueError` one whose values its constructor would refuse (`ma_cross.check_as_built`): a value
+    changed or added after it was built would be keyed though the run does not read it as keyed.
     """
     other = [type(config).__name__ for config in strategies if type(config) is not MaCrossConfig]
     if other:
@@ -478,6 +482,8 @@ def trial_config(
             f"a trial runs MaCross, so each config is a MaCrossConfig itself: got {other[0]}, not "
             "MaCrossConfig",
         )
+    for config in strategies:
+        check_as_built(config)
     bar_types = list(dict.fromkeys(str(config.bar_type) for config in strategies))
     return {
         "strategies": [
