@@ -197,11 +197,10 @@ Read 2026-11-10. `fetched`: downloaded whole with `curl` and read, not summarise
   process arguments, its environment (no `ALPACA` variable), and no
   `/Library/Application Support/ClaudeCode/` (run). ADR 0009, 0018, 0020, 0023, the adapter's README, both
   settings files and `scripts/land` (read). ADR 0028 was not read: it had not landed.
-* The owner's instructions, 2026-11-10 (reported to the author, not read first-hand): "auto proceed with sota
-  convergence you as master orchestrator"; "high quality is the directive, research convergence
-  convergenced is the evidance, proceed with sota evidances automatically as long as they are form sota
-  sources, per our very harness rules"; and the driver, "make sure every lanes are seamless without
-  consistant premission frictions". The coordinator chose option 3 and its terms the same day.
+* The owner's requirements of 2026-11-10 (reported to the author, not read first-hand): the coordinator,
+  as master orchestrator, proceeds automatically on converged state-of-the-art evidence; high quality is
+  the directive; converged research from state-of-the-art sources is the evidence, per the harness rules;
+  and, as the driver, every lane runs without recurring permission prompts. The coordinator chose option 3 and its terms the same day.
 * Second reader, 2026-11-10 (`evidence-verifier`, two passes): every quotation and the hosts held. It
   corrected the second run's account and the cause of the `gh` failure, narrowed two table rows and option
   2, added auto mode, `credentials.envVars` and `--settings`, marked ADR 0028 and the managed file's reach
