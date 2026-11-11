@@ -475,7 +475,8 @@ window
 # a paper test that streams waits for it, and a window, on B's pair, does not (ADR 0069). `movers-screener`
 # only reads REST, so it takes no stream lock. deadline: the stream lock's
 # wait, the start-up held to `sync`, the imports, the longest run and its stop for a streaming module, and the
-# start-up and the screener's 85 polls for the screener; tests/test_sandbox_node.py and tests/test_movers_*.py
+# start-up and the screener's 85 polls for the screener, and the start-up, the last load's start and that
+# load's timeout for bars-list; tests/test_sandbox_node.py, tests/test_movers_*.py and tests/test_bars_list.py
 # hold the sums. Unattended sandbox runs wait for NautilusTrader rc9 (ADR 0068); by hand: mise run paper:data sandbox.
 [tasks."paper:data"]
 description = "Run one listed data-only module with paper account A's pair, every request but GET refused"
@@ -484,10 +485,10 @@ env.ALPACA_API_KEY = { value = "{{ exec(command='/usr/bin/timeout 30 /usr/bin/se
 env.ALPACA_SECRET_KEY = { value = "{{ exec(command='/usr/bin/timeout 30 /usr/bin/security find-generic-password -s canon-alpaca-paper -a ALPACA_SECRET_KEY -w') }}", redact = true }
 env.CANON_ALPACA_DATA_ONLY = "1"
 usage = '''
-arg "<module>" help="sandbox: the sandbox node on Alpaca's data (ADR 0070); movers-stream: sip bars and trades for the whole market, rates, memory and a top 50; movers-screener: Alpaca's movers and most-actives once a minute, no stream; quotes: the historical quote loader, not built yet (ADR 0066)" {
-  choices "sandbox" "movers-stream" "movers-screener" "quotes"
+arg "<module>" help="sandbox: the sandbox node on Alpaca's data (ADR 0070); movers-stream: sip bars and trades for the whole market, rates, memory and a top 50; movers-screener: Alpaca's movers and most-actives once a minute, no stream; quotes: the historical quote loader, not built yet (ADR 0066); bars-list: the bar windows of the list CANON_BARS_LIST names into catalog/bars-list/<feed>/, no stream" {
+  choices "sandbox" "movers-stream" "movers-screener" "quotes" "bars-list"
 }
-flag "--minutes <minutes>" help="how long the module runs: 1 to 60 for sandbox and movers-stream, 1 to 85 polls for movers-screener" default="10"
+flag "--minutes <minutes>" help="how long the module runs: 1 to 60 for sandbox and movers-stream, 1 to 85 polls for movers-screener, 1 to 60 for bars-list (no load starts after it)" default="10"
 '''
 run = '''
 deadline=5940
@@ -501,8 +502,9 @@ case "${usage_module:-}" in
   sandbox) module=canon_trading.sandbox_node ;;
   movers-stream) module=canon_trading.movers_stream; logs=1 ;;
   movers-screener) module=canon_trading.movers_screener; streams=0; logs=1 ;;
+  bars-list) module=canon_trading.bars_list; streams=0 ;;  # a list of bar windows into catalog/bars-list/<feed>/, CANON_BARS_LIST naming it
   quotes) echo "paper:data: quotes, the historical quote loader, is not built yet (ADR 0066); nothing was run" >&2; exit 1 ;;
-  *) echo "paper:data: no module named '${usage_module:-}'; the list is sandbox, movers-stream, movers-screener and quotes (ADR 0070)" >&2; exit 3 ;;
+  *) echo "paper:data: no module named '${usage_module:-}'; the list is sandbox, movers-stream, movers-screener, quotes and bars-list (ADR 0070)" >&2; exit 3 ;;
 esac
 tmp="$(/usr/bin/getconf DARWIN_USER_TEMP_DIR)" || tmp=""
 case "$tmp" in /*/) ;; *) echo "paper:data: the per-user temporary folder is not known (DARWIN_USER_TEMP_DIR gave '$tmp'), so there is no stream lock to take or log folder to write; nothing was run" >&2; exit 1 ;; esac
