@@ -800,6 +800,10 @@ class FakeHistoricalClient:
     `start` and `end` (https://docs.alpaca.markets/us/reference/stockquotes-1.md), from `quotes`, raw JSON
     parsed with alpaca-py's `QuoteSet`. alpaca-py has already made `start` and `end` naive UTC. With `gate`
     set, each call sets `entered` and then waits for `gate`.
+
+    `get` serves empty AAPL trade history only, using the single-symbol endpoint's required response
+    fields (https://docs.alpaca.markets/us/reference/stocktradesingle-1). Nonempty and paginated trade
+    histories use the real SDK with a fake HTTP session in `test_data_client.py`.
     """
 
     def __init__(
@@ -840,6 +844,13 @@ class FakeHistoricalClient:
         finally:
             with self._count_lock:
                 self._active -= 1
+
+    def get(self, path: str, data: dict | None = None) -> dict:
+        if path != "/stocks/AAPL/trades":
+            raise NotImplementedError(f"Historical stand-in serves empty AAPL trades only: {path}")
+        if self.error is not None:
+            raise self.error
+        return {"symbol": "AAPL", "trades": [], "next_page_token": None}
 
     def _answer(self, request_params: StockBarsRequest) -> BarSet:
         symbol = request_params.symbol_or_symbols

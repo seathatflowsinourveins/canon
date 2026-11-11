@@ -17,7 +17,8 @@ over Alpaca's GET /v2/stocks/{symbol}/trades:
 https://docs.alpaca.markets/us/reference/stocktradesingle-1 (read 2026-11-11).
 The single-symbol endpoint is called with alpaca-py's public `RESTClient.get`, since its
 `get_stock_trades` uses the multi-symbol endpoint. `StockTradesRequest.to_request_fields` serializes
-the bounds and feed; the symbol moves into the path. `fetch_trades` follows `next_page_token` even
+the feed; exact nanosecond bounds are formatted separately and the symbol moves into the path.
+`fetch_trades` follows `next_page_token` even
 on a short or empty page, requesting ascending order and at most 10,000 records per page, until the
 token ends or the request's total limit of valid trades is reached, enforcing that limit even if a
 page over-returns. The existing HTTP lock covers the whole fetch. An empty string, malformed token
@@ -37,6 +38,17 @@ counted and logged once per request. Trade condition flags are not validity flag
 Only `feed` is supported from the venue's optional params; `asof` and `currency` are refused rather
 than ignored. Alpaca's default current-day symbol mapping and USD prices apply, matching the
 adapter's USD equities; the engine's params, such as `update_catalog`, are preserved as before.
+Trade history retains nanoseconds end to end: the request's `start_ns` and `end_ns` are formatted with
+`unix_nanos_to_iso8601`, and raw `t` strings parsed with `dt_to_unix_nanos`, rather than via the SDK's
+microsecond datetime (`nautilus_trader/core/datetime.py` at the pin; `dt_to_unix_nanos` accepts strings
+and delegates to the installed, adopted pandas). Alpaca's reference accepts and returns RFC-3339 with
+nanosecond precision. This matters for catalog gaps: upstream `missing_intervals` starts the next leg
+at the last covered end plus one nanosecond (`crates/persistence/src/common/coverage.rs`), and its
+response trim compares ticks with those exact bounds (`crates/common/src/messages/data/response.rs`).
+Only in-window trades consume the result limit. A registered catalog answers covered ranges without
+consulting `params["feed"]`, even without write-back; `skip_catalog_data=True` bypasses those reads and
+fetches the full window (`crates/data/src/engine/streaming.rs`, `dispatch_date_range_request`). It does
+not partition writes by feed, so a caller keeps one feed per instrument in each registered catalog.
 As with quote history, the inclusive window is cut at now and each tick's `ts_init` is its own
 `ts_event` (Databento's `decode_trade_msg` defaults to the event timestamp when no init time is given,
 `crates/adapters/databento/src/decode/market_data.rs` at the pin). Conversion errors and page failures
@@ -107,7 +119,8 @@ subscription failed" ("Queue admission and failures").
 Timestamps: Alpaca stamps a bar at its open (alpaca-py `Bar.timestamp`, "The opening timestamp of the
 bar"), so `ts_event` is the open and `ts_init = ts_event + interval`, the rule NautilusTrader gives for bars
 timestamped at the open (concepts/backtesting/bar-execution, "Bar timestamp convention"). alpaca-py parses
-timestamps into `datetime`, so sub-microsecond precision is lost.
+timestamps into `datetime`, so sub-microsecond precision is lost except for trade history, which parses
+the raw timestamp separately.
 
 Bar windows: a bar's `ts_init` is its open plus the bar's fixed length (`get_interval_ns`: 24 hours for a
 day, 168 for a week), not the end of trading. Alpaca opens daily and weekly bars at midnight New York time
@@ -267,6 +280,8 @@ from alpaca.data.timeframe import TimeFrameUnit
 from nautilus_trader.common import Logger
 from nautilus_trader.config import DataClientConfig
 from nautilus_trader.core.datetime import dt_to_unix_nanos
+from nautilus_trader.core.datetime import unix_nanos_to_dt
+from nautilus_trader.core.datetime import unix_nanos_to_iso8601
 from nautilus_trader.live import BarsResponse
 from nautilus_trader.live import QuotesResponse
 from nautilus_trader.live import TradesResponse
@@ -392,12 +407,19 @@ class HistoricalClient(Protocol):
 class TradeHistory:
     """Fetched trades and the invalid prints excluded using the endpoint's raw `u` field."""
 
-    trades: list[Trade]
+    trades: list[tuple[Trade, int]]
+    """Each SDK trade and the exact nanosecond timestamp from its raw `t` string."""
     canceled: int = 0
     incorrect: int = 0
 
 
-def fetch_trades(historical: HistoricalClient, request: StockTradesRequest) -> TradeHistory:
+def fetch_trades(
+    historical: HistoricalClient,
+    request: StockTradesRequest,
+    *,
+    start_ns: int | None = None,
+    end_ns: int | None = None,
+) -> TradeHistory:
     """Fetch the single-symbol trade endpoint through alpaca-py's public GET transport, with the
     historical trades reference's pagination contract (URL in the module header).
 
@@ -407,6 +429,10 @@ def fetch_trades(historical: HistoricalClient, request: StockTradesRequest) -> T
     """
     params = request.to_request_fields()
     symbol = params.pop("symbols")
+    if start_ns is not None:
+        params["start"] = unix_nanos_to_iso8601(start_ns)
+    if end_ns is not None:
+        params["end"] = unix_nanos_to_iso8601(end_ns)
     history = TradeHistory([])
     remaining = request.limit
     if remaining is not None and remaining <= 0:
@@ -451,9 +477,15 @@ def fetch_trades(historical: HistoricalClient, request: StockTradesRequest) -> T
                 history.incorrect += 1
                 continue
             try:
-                history.trades.append(Trade(symbol, raw))
+                trade = Trade(symbol, raw)
+                ts_event = dt_to_unix_nanos(raw["t"])
             except ValueError as e:
                 raise ValueError(f"{context}: invalid trade row {row_number}: {e}") from e
+            if (start_ns is not None and ts_event < start_ns) or (
+                end_ns is not None and ts_event > end_ns
+            ):
+                continue  # the engine would trim it: it must not consume the result limit
+            history.trades.append((trade, ts_event))
             if remaining is not None:
                 remaining -= 1
                 if remaining == 0:  # enforce the total even if the server over-returns
@@ -1065,9 +1097,12 @@ def parse_quote(quote: Quote, instrument: Equity, ts_init: int | None = None) ->
     )
 
 
-def parse_trade(trade: Trade, instrument: Equity, ts_init: int) -> TradeTick:
+def parse_trade(
+    trade: Trade, instrument: Equity, ts_init: int, *, ts_event: int | None = None
+) -> TradeTick:
     """Convert one alpaca-py trade into a NautilusTrader trade, its price rounded as upstream rounds
-    (`rounded_price`)."""
+    (`rounded_price`). History supplies `ts_event` parsed from the raw timestamp, retaining its
+    nanoseconds; a live trade keeps the SDK datetime's precision."""
     if trade.id is None:
         raise ValueError(f"{instrument.id} trade at {trade.timestamp} has no trade ID")
     return TradeTick(
@@ -1076,7 +1111,7 @@ def parse_trade(trade: Trade, instrument: Equity, ts_init: int) -> TradeTick:
         size=whole_shares(instrument, trade.size, "trade size"),
         aggressor_side=AggressorSide.NO_AGGRESSOR,
         trade_id=TradeId(str(trade.id)),
-        ts_event=dt_to_unix_nanos(trade.timestamp),
+        ts_event=dt_to_unix_nanos(trade.timestamp) if ts_event is None else ts_event,
         ts_init=ts_init,
     )
 
@@ -1848,15 +1883,18 @@ class AlpacaDataClient(MarketDataClient):
                 f"Alpaca trade request params {', '.join(unsupported)} not supported; "
                 "the adapter uses Alpaca's default current-day symbol mapping and USD prices"
             )
-        window = alpaca_quotes_window(request.start, request.end, self.clock.utc_now())
+        now_ns = self.clock.timestamp_ns()
+        start_ns = request.start_ns
+        end_ns = now_ns if request.end_ns is None else min(request.end_ns, now_ns)
+        if start_ns is None:
+            start_ns = dt_to_unix_nanos(start_of_day(unix_nanos_to_dt(end_ns)))
         ticks: list[TradeTick] = []
-        if window is not None:
-            start, end = window
-            params = StockTradesRequest(
-                symbol_or_symbols=symbol, start=start, end=end, limit=request.limit, feed=feed
-            )
+        if start_ns <= now_ns:
+            start, end = unix_nanos_to_iso8601(start_ns), unix_nanos_to_iso8601(end_ns)
+            params = StockTradesRequest(symbol_or_symbols=symbol, limit=request.limit, feed=feed)
             history = await self._one_historical_call(
-                functools.partial(fetch_trades, historical), params
+                functools.partial(fetch_trades, historical, start_ns=start_ns, end_ns=end_ns),
+                params,
             )
             dropped = history.canceled + history.incorrect
             if dropped:
@@ -1866,8 +1904,8 @@ class AlpacaDataClient(MarketDataClient):
                 )
             rounded = 0
             first_rounded = ""
-            for n, trade in enumerate(history.trades, 1):
-                tick = parse_trade(trade, instrument, dt_to_unix_nanos(trade.timestamp))
+            for n, (trade, ts_event) in enumerate(history.trades, 1):
+                tick = parse_trade(trade, instrument, ts_event, ts_event=ts_event)
                 ticks.append(tick)
                 if was_rounded(tick.price, trade.price):
                     rounded += 1

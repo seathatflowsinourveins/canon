@@ -2240,6 +2240,8 @@ class TradeRequester(Strategy):
         super().__init__()
         self.params: dict | None = None
         self.limit: int | None = None
+        self.trades_start: datetime | None = START
+        self.trades_end: datetime | None = END
         self.instrument_ids = [AAPL]
         self.seen: list = []
         self.responses: list = []
@@ -2248,7 +2250,7 @@ class TradeRequester(Strategy):
     def on_start(self) -> None:
         ids = self.instrument_ids[0] if len(self.instrument_ids) == 1 else self.instrument_ids
         self.request_id = self.request_trades(
-            ids, start=START, end=END, limit=self.limit, params=self.params
+            ids, start=self.trades_start, end=self.trades_end, limit=self.limit, params=self.params
         )
 
     def on_historical_trades(self, trades) -> None:
@@ -2650,6 +2652,142 @@ def test_trade_history_refuses_unsupported_mapping_and_currency_params_before_ht
     assert "not supported" in response.failure_reason
     assert trades_http.calls == []
     assert strategy.seen == []
+
+
+def test_the_shared_historical_stand_in_can_answer_an_empty_trade_request(venue):
+    strategy = TradeRequester()
+
+    run(build_node(strategy), "hosted")
+
+    assert [r.failure_reason for r in strategy.responses] == [None]
+    assert strategy.seen == []
+
+
+def test_trade_history_preserves_nanosecond_bounds_and_raw_trade_timestamps(
+    venue, trades_http, monkeypatch
+):
+    trades_http.pages = [
+        trade_page([historical_trade(0, t="2022-01-03T09:00:00.000000500Z")], "unneeded")
+    ]
+    request = quotes_request(AAPL, start=START, end=START)
+    request.start_ns += 17
+    request.end_ns += 800
+    request.limit = 1
+    responses = []
+
+    async def body(client) -> None:
+        monkeypatch.setattr(client, "_handle_response", responses.append)
+        await client._request_trades(request)
+
+    run_with_client(body)
+
+    (sent,) = trades_http.calls
+    assert dt_to_unix_nanos(sent["start"]) == request.start_ns
+    assert dt_to_unix_nanos(sent["end"]) == request.end_ns
+    (response,) = responses
+    (trade,) = response.data
+    assert trade.ts_event == trade.ts_init == dt_to_unix_nanos(START) + 500
+    assert (response.start, response.end) == (request.start_ns, request.end_ns)
+
+
+def test_out_of_window_trade_rows_do_not_consume_the_exact_window_limit(
+    venue, trades_http, monkeypatch
+):
+    trades_http.pages = [
+        trade_page([historical_trade(0)], "inside"),
+        trade_page([historical_trade(1, t="2022-01-03T09:00:00.000000500Z")]),
+    ]
+    request = quotes_request(AAPL, start=START, end=START)
+    request.start_ns += 17
+    request.end_ns += 800
+    request.limit = 1
+    responses = []
+
+    async def body(client) -> None:
+        monkeypatch.setattr(client, "_handle_response", responses.append)
+        await client._request_trades(request)
+
+    run_with_client(body)
+
+    (response,) = responses
+    assert [t.trade_id for t in response.data] == [TradeId("1001")]
+    assert [c["limit"] for c in trades_http.calls] == [1, 1]
+
+
+def test_a_trade_catalog_gap_starting_one_nanosecond_after_coverage_keeps_its_first_trade(
+    trades_http, tmp_path
+):
+    boundary = START + timedelta(seconds=1)
+    trades_http.pages = [trade_page([historical_trade(1)])]
+    first = TradeRequester()
+    first.trades_end = boundary
+    first.params = {"update_catalog": True}
+
+    run(build_node(first, catalog=tmp_path), "hosted")
+
+    assert [r.failure_reason for r in first.responses] == [None]
+    assert [t.trade_id for t in first.seen] == [TradeId("1001")]
+    BUILT_NODES.pop().dispose()
+    trades_http.pages = [trade_page([historical_trade(2, t="2022-01-03T09:00:01.000000500Z")])]
+    second = TradeRequester()
+    second.trades_end = START + timedelta(seconds=2)
+    second.params = {"update_catalog": True}
+
+    run(build_node(second, catalog=tmp_path), "hosted")
+
+    assert [r.failure_reason for r in second.responses] == [None]
+    assert [t.trade_id for t in second.seen] == [TradeId("1001"), TradeId("1002")]
+    assert [t.ts_init for t in second.seen] == [
+        dt_to_unix_nanos(boundary),
+        dt_to_unix_nanos(boundary) + 500,
+    ]
+    assert dt_to_unix_nanos(trades_http.calls[1]["start"]) == dt_to_unix_nanos(boundary) + 1
+    catalog = ParquetDataCatalog(str(tmp_path))
+    assert [t.ts_init for t in catalog.query_trade_ticks([str(AAPL)])] == [
+        t.ts_init for t in second.seen
+    ]
+    BUILT_NODES.pop().dispose()
+    again = TradeRequester()
+    again.trades_end = second.trades_end
+    again.params = {"update_catalog": True}
+
+    run(build_node(again, catalog=tmp_path), "hosted")
+
+    assert [r.failure_reason for r in again.responses] == [None]
+    assert [t.ts_init for t in again.seen] == [t.ts_init for t in second.seen]
+    assert len(trades_http.calls) == 2
+
+
+def test_trade_catalog_reads_ignore_feed_unless_skip_catalog_data_is_set(trades_http, tmp_path):
+    trades_http.pages = [trade_page([historical_trade(0)])]
+    first = TradeRequester()
+    first.params = {"feed": "iex", "update_catalog": True}
+
+    run(build_node(first, catalog=tmp_path), "hosted")
+
+    assert [r.failure_reason for r in first.responses] == [None]
+    BUILT_NODES.pop().dispose()
+    trades_http.pages = [trade_page([historical_trade(1, p=999)])]
+    catalog_read = TradeRequester()
+    catalog_read.params = {"feed": "sip"}  # no write-back: the registered catalog still answers
+
+    run(build_node(catalog_read, catalog=tmp_path), "hosted")
+
+    assert [r.failure_reason for r in catalog_read.responses] == [None]
+    assert [t.trade_id for t in catalog_read.seen] == [TradeId("1000")]
+    assert len(trades_http.calls) == 1
+    BUILT_NODES.pop().dispose()
+    bypass = TradeRequester()
+    bypass.params = {"feed": "sip", "skip_catalog_data": True}
+
+    run(build_node(bypass, catalog=tmp_path), "hosted")
+
+    assert [r.failure_reason for r in bypass.responses] == [None]
+    assert [t.price for t in bypass.seen] == [Price.from_str("999.0000")]
+    assert len(trades_http.calls) == 2
+    assert trades_http.calls[1]["feed"] == "sip"
+    assert dt_to_unix_nanos(trades_http.calls[1]["start"]) == dt_to_unix_nanos(START)
+    assert dt_to_unix_nanos(trades_http.calls[1]["end"]) == dt_to_unix_nanos(END)
 
 
 # -- historical quotes (ADR 0066) ------------------------------------------------------------------

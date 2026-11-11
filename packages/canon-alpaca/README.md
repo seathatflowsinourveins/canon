@@ -233,12 +233,19 @@ Each is stated where it is implemented, with its source.
   `corrected` replacements are kept; condition flags alone do not invalidate a print. Results are
   requested in ascending timestamp order and delivered in one `TradesResponse`, preserving the request
   ID, bounds and params. The inclusive window is cut at now, and a missing start uses midnight New York
-  of the end's day, as quotes do. Each tick's `ts_init` equals its own `ts_event`; trade IDs and whole-share
+  of the end's day, as quotes do. Bounds and raw trade timestamps retain nanoseconds, including the
+  `+1 ns` legs the catalog creates after existing coverage; only in-window valid trades consume a
+  request's limit. Each tick's `ts_init` equals its own `ts_event`; trade IDs and whole-share
   sizes are preserved. Prices are rounded half to even and any rounding counted and named, as on the
   trade stream. A failed page or unconvertible trade fails the whole request; no partial response is
   emitted. The HTTP lock covers every page and history is gathered in memory, so callers keep windows
   small; tick conversion yields to the node's loop every 10,000 trades. Catalog keys do not distinguish
-  feeds, so callers must keep one feed per instrument when writing trades back. Offline HTTP and node
+  feeds, so callers must keep one feed per instrument for both reading and writing a registered
+  catalog. Covered `request_trades` ranges are read from that catalog regardless of `params["feed"]`,
+  even without `update_catalog`; an uncovered range may therefore merge stored IEX prints with
+  newly requested SIP prints. `params={"feed": "sip", "skip_catalog_data": True}` bypasses catalog
+  reads and requests the full window from SIP, but a write-back still uses the same instrument key.
+  Offline HTTP and node
   tests verify this path; its response from the paper data API remains **UNVERIFIED**.
 * **Feed:** named in a subscription's or bars request's params, `{"feed": "boats"}`, the channel the
   adapter guide documents for adapter-specific options, as upstream's Databento (`schema`) and OKX
@@ -261,7 +268,8 @@ Each is stated where it is implemented, with its source.
   documented as entitled to IEX alone, so none of this is an entitlement (ADR 0055). In pre-market
   `iex` and `boats` delivered nothing before 05:00 on 2026-11-11; the sip feed authenticated on paper on
   2026-11-10, and authenticated and delivered on 2026-11-11, from 08:23 in that pre-market (ADR 0055).
-* **Timestamps** lose sub-microsecond precision: alpaca-py parses them into `datetime`.
+* **Timestamps** lose sub-microsecond precision where alpaca-py parses them into `datetime`.
+  Trade history preserves the raw timestamp's nanoseconds separately, along with exact request bounds.
 * **No restart:** if alpaca-py's stream ends by itself, the client logs an error and does not restart it;
   a later subscription fails with an error saying so, until the client is reconnected. The end counts
   from the moment alpaca-py's `run()` returns, marked on the stream's thread before it is reported or
