@@ -172,6 +172,15 @@ head=$(g rev-parse --verify -q HEAD)
 
 if [ "$only" = 1 ]; then echo "paper-session: $dir is at origin/main $want"; exit 0; fi
 cd "$dir" || fail "cannot enter $dir"
+# mise reads every config from the folder it runs in up to the root, here the automation folder, the Claude
+# config folder and HOME above the clone; it searches no higher than MISE_CEILING_PATHS, "which is not
+# searched itself" (mise settings, ceiling_paths), so the clone's parent keeps the run to the clone's own
+# mise.toml (mise's global config, ~/.config/mise, still applies)
+ceiling=$(cd "$(dirname "$dir")" && pwd -P) || fail "cannot read the folder above $dir"
+# a list, so a path holding its separator would not be one ceiling (UNVERIFIED which character mise splits on;
+# both are refused)
+case "$ceiling" in *:*|*,*) fail "the folder above $dir holds a : or a , which MISE_CEILING_PATHS would split; give another path" ;; esac
+export MISE_CEILING_PATHS="$ceiling"
 echo "paper-session: $(date -u +%Y-%m-%dT%H:%M:%SZ) running origin/main $want"
 # timeout(1): "makes itself the leader of a process group that the command inherits"; -s KILL ends the
 # group whole, timeout and mise included, so the job ends on signal 9, which status reads (launchctl list).
