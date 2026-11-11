@@ -21,10 +21,11 @@
 # Usage: maintenance.sh <checkout> <mise>
 #
 # The paper locks are the files mise.toml's paper tasks lock (ADR 0069): canon-paper-windows.lock, account B's,
-# which a window holds; canon-paper-test.lock, account A's, which a paper test holds; and canon-alpaca-stream.lock,
-# the login's market-data stream, which paper:data's sandbox node takes alone and a window or a streaming test
-# also takes. A round takes them without waiting (lockf(1) -t 0). A paper test's lock, or the stream's held
-# with no window running, ends the round there, saying which, since those runs may run from the checkout.
+# which a window holds; canon-paper-test.lock, account A's, which a paper test holds; and
+# canon-alpaca-stream-tests.lock, the market-data stream of account A's pair, which a streaming paper test and
+# paper:data's streaming modules take (account B's stream lock is taken only by a window, under B's lock). A
+# round takes them without waiting (lockf(1) -t 0). A paper test's lock, or A's stream lock, ends the round
+# there, saying which, whether or not a window runs, since those runs may run from the checkout.
 # A window runs from the paper runner's own clone (ADR 0050), so its lock defers only what that window
 # depends on: the paper section of `scripts/automation install` (the runner, its plist and the clone the
 # runner makes anew at each firing), which the round's install then skips (`install --defer-paper`). The
@@ -38,14 +39,14 @@
 # (CANON_MAINTENANCE_AT_BOUNDARY=1), which installs the whole, paper section included, and moves the pins;
 # or it records that it timed out. It writes maintenance-boundary.json, which also says when the boundary's
 # round ended before its install.
-# Without a window, the round holds all three for (a) and the windows' lock alone for the install, which
+# Without a window, the round holds all three it takes for (a) and the windows' lock alone for the install, which
 # reloads the paper agent and touches nothing else they use. The daily updates, the compare, the settings
 # step and the pins touch none of them and run with them let go. A scheduled window waits 900 s for its lock
 # (mise.toml). The round holds its own lock, <config>/canon/maintenance.lock, for the whole round and the
 # reinstall it starts, so rounds never overlap; the round a waiter starts waits for it at most
 # BOUNDARY_ROUND_SECS. Limits: a window started by hand from the main checkout is not told apart from the
-# scheduled one, so the checkout may move under it; and a window waiting for the stream lock that
-# paper:data holds from the main checkout does not hold (a) back.
+# scheduled one, so the checkout may move under it; and a run that started before the stream lock was split
+# per account (ADR 0069, 2026-11-11) holds the old canon-alpaca-stream.lock, which no round checks.
 # An install is not repeated within a day for the same differences at the same origin/main once an install
 # for them finished (each install restarts the paper agent's interval, ADR 0050); the row says FAILED until
 # then. One that timed out or never reported is. `scripts/automation install` reloads launchd agents, this
@@ -191,8 +192,7 @@ plock() {
   /usr/bin/lockf -t 0 "$1" 2>/dev/null
 }
 # paper_lock <checkout|install>: WINDOW=1 when a window holds the windows' lock (descriptor 9, which this
-# round holds otherwise); for `checkout`, then the paper tests' lock on 8 and, with no window running, the
-# stream lock on 6. 0 when the round may go on; 1 when a paper test or a run on the stream holds one, with
+# round holds otherwise); for `checkout`, then the paper tests' lock on 8 and account A's stream lock on 6. 0 when the round may go on; 1 when a paper test or a run on the stream holds one, with
 # HELD saying which (every caller then ends the round).
 paper_lock() {
   paper_free
@@ -200,8 +200,8 @@ paper_lock() {
   if [ "$AT_BOUNDARY" != 1 ] && ! plock 9 canon-paper-windows.lock; then WINDOW=1; exec 9>&-; fi
   [ "$1" = checkout ] || return 0
   if ! plock 8 canon-paper-test.lock; then HELD="canon-paper-test.lock is held: a paper test runs"; return 1; fi
-  if [ "$WINDOW" = 0 ] && ! plock 6 canon-alpaca-stream.lock; then
-    HELD="canon-alpaca-stream.lock is held: a run on the market-data stream (paper:data's sandbox node or a paper test)"; return 1
+  if ! plock 6 canon-alpaca-stream-tests.lock; then
+    HELD="canon-alpaca-stream-tests.lock is held: a run on account A's market-data stream (paper:data or a paper test)"; return 1
   fi
   return 0
 }

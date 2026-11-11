@@ -96,7 +96,7 @@ pytestmark = [
             "to run this integration test"
         ),
     ),
-    # each test opens a market-data stream, so it holds the login's stream lock (conftest.py, ADR 0069)
+    # each test opens a market-data stream, so it holds account A's stream lock (conftest.py, ADR 0069)
     pytest.mark.alpaca_stream,
 ]
 

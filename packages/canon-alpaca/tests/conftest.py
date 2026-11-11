@@ -1245,26 +1245,28 @@ def alpaca() -> SimpleNamespace:
     )
 
 
-# --- The login's market-data stream lock (ADR 0069). The same block is in tests/conftest.py and
+# --- Account A's market-data stream lock (ADR 0069). The same block is in tests/conftest.py and
 # packages/canon-alpaca/tests/conftest.py, and tests/test_session_window.py keeps the two equal. ---
 #
 # Alpaca allows a user "in many subscriptions (or without one)" one connection to a market-data stream
-# endpoint ("Streaming Market Data", https://docs.alpaca.markets/us/docs/streaming-market-data.md), and paper
-# accounts A and B belong to one login (that the limit spans a second paper account is UNVERIFIED), so a
-# paper test that opens a stream and a session window on account B take one lock,
-# `canon-alpaca-stream.lock`, whose path `mise run paper:test` exports. A test marked `alpaca_stream` holds it
+# endpoint ("Streaming Market Data", https://docs.alpaca.markets/us/docs/streaming-market-data.md). On
+# 2026-11-11 two pairs of one login each held a subscribed connection at once (ADR 0069), so each account's
+# pair has its own stream lock, and a paper test that opens a stream takes account A's,
+# `canon-alpaca-stream-tests.lock`, whose path `mise run paper:test` exports; paper:data's streaming modules,
+# on A's pair, take it too, and a window on account B takes B's instead. A test marked `alpaca_stream` holds it
 # from its setup until its teardown has seen every stream it started end; a paper test not marked that starts
 # an alpaca-py market-data stream is stopped before the stream connects and fails. The lock is flock(2), the
 # call lockf(1) makes ("BSD-style locking is used, as described in flock(2)", lockf(1)), so this lock and the
-# window's lockf exclude each other (Python's `fcntl.flock`). The wait blocks in flock(2), as lockf(1)'s does,
-# under an interval timer, rather than polling, so a test and a window wait in the same way. Offline, with no
+# lockf(1) of paper:data exclude each other (Python's `fcntl.flock`). The wait blocks in flock(2) under an
+# interval timer, which sleeps, rather than polling. Offline, with no
 # paper pair, it does nothing.
 STREAM_LOCK_ENV = "CANON_ALPACA_STREAM_LOCK"
 DEADLINE_ENV = "CANON_PAPER_TEST_DEADLINE"
 """The epoch second at which `mise run paper:test` kills the run (its `deadline`), which it exports."""
 STREAM_LOCK_WAIT_SECS = 3900
-"""As long as `paper:test` waits for account A's lock (`lockwait` in mise.toml): it outlasts one window that
-runs as it should, from taking the stream lock to its bounded end (`session_window.PAPER_LOCK_WAIT_SECS`)."""
+"""As long as `paper:test` waits for account A's lock (`lockwait` in mise.toml), and
+`session_window.PAPER_LOCK_WAIT_SECS`, set when a window held the one stream lock. A window no longer takes
+this lock; a `paper:data` run that streams does, and may hold it longer than this wait."""
 TEST_ROOM_SECS = 900
 """Left before the run's deadline for a streaming test once it has the lock: three times a whole paper run
 (about five minutes, observed), so the deadline does not kill a test before its `finally` cleans up."""
@@ -1279,7 +1281,7 @@ KEPT_LOCKS: list[int] = []
 def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line(
         "markers",
-        f"{STREAM_MARKER}: the test opens an Alpaca market-data stream, so it holds the login's stream lock "
+        f"{STREAM_MARKER}: the test opens an Alpaca market-data stream, so it holds account A's stream lock "
         "(ADR 0069)",
     )
 
@@ -1395,8 +1397,8 @@ def alpaca_stream_lock(
     fd = take_stream_lock(path, wait) if wait >= 0 else None
     if fd is None:
         pytest.fail(
-            f"the market-data stream lock stayed held for {max(wait, 0):.0f} s (a session window or another "
-            f"paper test streams), or {TEST_ROOM_SECS} s were no longer left before the run's deadline; "
+            f"the market-data stream lock stayed held for {max(wait, 0):.0f} s (another paper test or "
+            f"paper:data streams on account A's pair), or {TEST_ROOM_SECS} s were no longer left before the run's deadline; "
             "nothing was placed"
         )
     ended = track_streams(monkeypatch)

@@ -61,13 +61,29 @@ names, the adapter and `canon_alpaca` stay as they are. B's items are labelled `
    stops the task. The refusal holds both ways, whichever pair was entered first.
 3. **Locks, decided now, built when a task reads account B.** Each account gets its own lock:
    `canon-paper-test.lock` for A, as today, and `canon-paper-windows.lock` for B, so a test and a window
-   no longer wait for each other. Each Alpaca login gets one lock for the market-data stream,
-   `canon-alpaca-stream.lock`, held by any run that opens a stream. The trading API's request limit is per
+   no longer wait for each other. Each account's pair gets its own lock for the market-data stream,
+   held by any run that opens a stream on that pair and taken after the account's lock:
+   `canon-alpaca-stream-tests.lock` for A's pair (a paper test that streams, and `paper:data`'s streaming
+   modules) and `canon-alpaca-stream-windows.lock` for B's (a window). Until 2026-11-11 one lock,
+   `canon-alpaca-stream.lock`, served the whole login; it was split on these observations, each one
+   observation, on paper that day: (1) 12:11:01 to 12:12:01 New York, a `sip` connection on B's pair,
+   subscribed to SPY trades, authenticated and received 930 trades with no 406, no error and no drop,
+   while a `sip` connection on A's pair carried 223,840 messages in the same minute, none of its seconds
+   under 2,508; (2) 12:41:10 to 12:42:10, a second `sip` connection on A's pair beside a whole-market
+   recorder on the same pair authenticated, received 1,386 SPY trades, the first after 0.32 s, with no
+   406 and no drop, and the recorder's minute was normal (3,823 bars, 218,338 trades); (3) 12:42:32 to
+   12:43:33, an `iex` connection on A's pair beside the same recorder authenticated and received 231 SPY
+   trades, the first after 0.51 s, with no 406 and no drop, the recorder's minutes normal (3,927 and 3,823
+   bars). At most two connections per pair are used: the holder of that pair's stream lock, and a recorder
+   that takes no lock, never opens a third connection, and reports a 406 by name without retrying around
+   it. No task here is such a recorder: a recorder runs outside the tasks and keeps to these terms
+   itself; nothing here enforces them. B's stream lock is taken only by a window, which already holds B's lock, so today it
+   never waits; it is there for the next run that streams on B's pair. Two lock holders on one pair stay excluded; that case is not measured. The trading API's request limit is per
    account, "200 requests per minute, per account" (a support page that does not name paper accounts, so
    for paper UNVERIFIED). The stream limit belongs to the user: "in many subscriptions (or without one)
-   this limit is 1". So two paper accounts of one login share one stream (read from "from a user"; no
-   page states it for a second paper account, so this is UNVERIFIED; one pair held two connections at once
-   on 2026-11-11, Confirmation, "The open ends"). Alpaca support states that paper
+   this limit is 1". Read from "from a user", two paper accounts of one login would share one stream, but
+   no page states it for a second paper account, and the observations above found otherwise (one pair also
+   held two connections at once on 2026-11-11, Confirmation, "The open ends"). Alpaca support states that paper
    accounts are not eligible for the increased API rate (private correspondence, read 2026-11-11; not
    publicly documented), so paper work is sized for the standard 200 a minute. Alpaca staff forum posts say the
    200 is "per account (ie each paper and live account is separate)"
@@ -93,8 +109,9 @@ account" and ADR 0050's schedule. Each of the three points here.
   request limit (UNVERIFIED for paper, clause 3).
 * Bad: the refusal catches the same pair entered for both accounts. It does not catch two different pairs
   of one account: neither the keychain nor the paper API check here says which account a pair reaches.
-* Bad: two runs that each open a stream still contend for the login's stream (one connection per endpoint, UNVERIFIED for a second paper account, clause 3), which the stream lock
-  orders.
+* Bad: two runs that each open a stream on one pair still wait for each other on that pair's stream lock;
+  runs on the two pairs do not, on the observations of 2026-11-11 in clause 3, which are single
+  observations, not a documented limit.
 
 ### Confirmation
 
@@ -170,6 +187,26 @@ exit 0, both items in the login keychain; `mise run paper:check` exit 0, account
   The window itself failed, since IEX delivered no SPY quote or trade in 307 s of the early pre-market
   (run).
 * Option 3's comparison of account IDs is still not built.
+
+**One stream lock per pair, built 2026-11-11** (clause 3). `paper:test` names
+`canon-alpaca-stream-tests.lock` to its fixture (`CANON_ALPACA_STREAM_LOCK`); `paper:data`'s streaming
+modules take the same lock; `paper:session` takes `canon-alpaca-stream-windows.lock` after B's lock. The
+two tasks' stream waits now try lockf(1) `-t 0` once a second and sleep in between, as ADR 0065's
+`waitlock` does, since lockf's own `-t` on a descriptor spins a core while it waits; a lockf error other
+than 75 ends the wait at once. The maintenance agent's round now checks A's stream lock whether or not a
+window runs, and no longer the old file. `scripts/test-lanes`, under the real mise with one lock folder: a
+window on B starts while A's stream lock is held as the fixture holds it; a window waits for B's stream
+lock and fails past its wait; `paper:data` waits for A's stream lock and runs while B's is held; no task
+names `canon-alpaca-stream.lock`. `scripts/test-maintenance`: a round does nothing while A's stream lock is
+held, with or without a window. Against the tasks as they were, 11 and 2 of these cases fail (run). At
+the change, a window or a `paper:data` run started before it holds the old `canon-alpaca-stream.lock`
+until it ends, and the maintenance round does not see it; nothing built after the change takes or waits
+for that file (`scripts/test-lanes`, run), so a test that streams
+on A no longer waits for that window. Whether A's pair and B's pair share one count of connections, left
+open below, is answered for `sip` by observation (1) in clause 3. The window's longest run,
+`session_window.LONGEST_WINDOW_SECS`, is still sized for a streaming test waiting behind a window for
+one shared lock; it is left as it was. A streaming test's 3,900 s wait for A's stream lock can run out
+behind a `paper:data` stream of 60 minutes run to its deadline; it is not changed here.
 
 **The open ends, checked 2026-11-11.** Each clause marked UNVERIFIED above, and what came of it:
 

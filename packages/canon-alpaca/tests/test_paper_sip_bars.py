@@ -9,7 +9,7 @@ answered, every price keeps four decimals, and the bars the client rounded (half
 `Instrument.make_price` rounds) are counted from its warning. Any hour.
 
 It places nothing and opens no market-data stream (the client builds one only at a subscription), so it
-does not take the login's stream lock and does not wait behind a session window. It runs only with a
+does not take account A's stream lock and does not wait behind another stream on A's pair. It runs only with a
 paper key pair in the environment, through `mise run paper:test`, which holds the paper lock.
 """
 

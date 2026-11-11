@@ -132,8 +132,9 @@ mise run paper:long-only windows check  # print Alpaca's long-only setting (no_s
 There are two paper accounts ([ADR 0069](docs/adr/0069-two-paper-accounts.md)): account A, the default,
 whose pair only `paper:test` and the data-only `paper:data` read, and account B (`windows`), whose pair only `paper:session` and its
 schedule read. Each account has its own lock, so a test and a window do not wait for each other; the two
-accounts share the login's market-data stream (one connection per endpoint, ADR 0069), so a paper test that streams and a window take turns on
-a third lock. `mise run paper:data sandbox [--minutes N]` runs NautilusTrader's sandbox execution client on
+pairs each have their own market-data stream lock too (ADR 0069), so a paper test that streams and a window
+do not wait for each other either; a paper test that streams and a streaming `paper:data` run, both on A's
+pair, take turns. `mise run paper:data sandbox [--minutes N]` runs NautilusTrader's sandbox execution client on
 Alpaca's live data with account A's pair, every request but GET refused and no Alpaca execution client
 (ADR 0070); `quotes`, the other listed module, is refused until ADR 0066's loader is built.
 

@@ -1129,8 +1129,14 @@ check "... each takes its own account's lock: paper:session canon-paper-windows.
       eval 'grep -qF "exec 9>>\"\${tmp}canon-paper-windows.lock\"" <<<"$sb" && ! grep -q canon-paper-test.lock <<<"$sb" && grep -qF "exec 9>>\"\${tmp}canon-paper-test.lock\"" <<<"$tb" && ! grep -q canon-paper-windows.lock <<<"$tb"'
 # shellcheck disable=SC2034  # read by the eval'd check
 term=$(sed -n '/^  if \[ -t 0 \]; then$/,/^  fi$/p' <<<"$sb" | sed -n '2,4p' | cut -c1-14 | tr '\n' '|')
-check "... paper:session takes the stream lock on descriptor 7 after uv's sync, from a terminal too, and paper:test names it and its deadline to its tests" \
-      eval '[ "$term" = "    uv run --l|    stream|    exec uv ru|" ] && grep -qF "export CANON_ALPACA_STREAM_LOCK=\"\${tmp}canon-alpaca-stream.lock\" CANON_PAPER_TEST_DEADLINE=\$((start + deadline))" <<<"$tb" && grep -qF "exec 7>>\"\${tmp}canon-alpaca-stream.lock\"" <<<"$sb" && grep -qx "  stream" <<<"$sb" && ! grep -q "exec 7>>" <<<"$tb"'
+check "... paper:session takes account B's stream lock on descriptor 7 after uv's sync, from a terminal too, and paper:test names account A's and its deadline to its tests" \
+      eval '[ "$term" = "    uv run --l|    stream|    exec uv ru|" ] && grep -qF "export CANON_ALPACA_STREAM_LOCK=\"\${tmp}canon-alpaca-stream-tests.lock\" CANON_PAPER_TEST_DEADLINE=\$((start + deadline))" <<<"$tb" && grep -qF "exec 7>>\"\${tmp}canon-alpaca-stream-windows.lock\"" <<<"$sb" && grep -qx "  stream" <<<"$sb" && ! grep -q "exec 7>>" <<<"$tb"'
+# shellcheck disable=SC2034  # read by the eval'd check
+db=$(task_part paper:data run)
+check "... paper:data, on account A's pair, takes account A's stream lock, and no task takes the one lock the login had" \
+      eval 'grep -qF "exec 7>>\"\${tmp}canon-alpaca-stream-tests.lock\"" <<<"$db" && ! grep -q "canon-alpaca-stream\.lock" "$ROOT/mise.toml"'
+check "... each stream wait polls lockf -t 0 with a sleep (lockf -t <secs> on a descriptor spins a core), in paper:session and paper:data" \
+      eval '[ -z "$(grep -E "lockf -t [^0].* 7( |\$)" <<<"$sb$db")" ] && [ "$(grep -c "/usr/bin/lockf -t 0 7" <<<"$sb")" = 1 ] && [ "$(grep -c "/usr/bin/lockf -t 0 7" <<<"$db")" = 1 ]'
 RUNNER="$ROOT/home/.claude/canon/paper-session.sh"
 check "paper:session's timeout is scripts/automation's PAPER_DEADLINE and the runner's TASK_SECS" \
       eval '[ "$(num PAPER_DEADLINE "$ROOT/scripts/automation")" = "$(secs "$(task_part paper:session timeout)")" ] && [ "$(num TASK_SECS "$RUNNER")" = "$(num PAPER_DEADLINE "$ROOT/scripts/automation")" ]'
@@ -1301,7 +1307,7 @@ EOF
   fi
   # Two accounts, two locks (ADR 0069), run under mise with both bodies sharing one lock folder: a window that
   # runs holds account B's lock and the stream lock, and a paper test on account A runs meanwhile, at once
-  AB="$TMP/two-accounts"; mkdir -p "$AB/locks" "$AB/s" "$AB/t" "$AB/w"
+  AB="$TMP/two-accounts"; mkdir -p "$AB/locks" "$AB/s" "$AB/t" "$AB/w" "$AB/b"
   if owner paper:session "$AB/s" 40 1 "$AB/locks" && owner paper:test "$AB/t" 40 1 "$AB/locks" && owner paper:session "$AB/w" 40 1 "$AB/locks" 3; then
     standin "$AB/s" ""
     (cd "$AB/s" && exec env -i HOME="$HOME" MISE_CEILING_PATHS="$TMPP" PATH="$AB/s/bin:/usr/bin:/bin" "$LMISE" run owner > "$AB/s/out" 2>&1) & op=$!
@@ -1309,7 +1315,7 @@ EOF
     # shellcheck disable=SC2034  # read by the eval'd checks
     { /usr/bin/lockf -k -t 0 "$AB/locks/canon-paper-windows.lock" true 2>/dev/null; bheld=$?; }
     # shellcheck disable=SC2034  # read by the eval'd checks
-    { /usr/bin/lockf -k -t 0 "$AB/locks/canon-alpaca-stream.lock" true 2>/dev/null; sheld=$?; }
+    { /usr/bin/lockf -k -t 0 "$AB/locks/canon-alpaca-stream-windows.lock" true 2>/dev/null; sheld=$?; }
     # shellcheck disable=SC2034  # read by the eval'd checks
     { /usr/bin/lockf -k -t 0 "$AB/locks/canon-paper-test.lock" true 2>/dev/null; afree=$?; }
     mkdir -p "$AB/t/bin"
@@ -1320,15 +1326,33 @@ EOF
     # shellcheck disable=SC2034  # read by the eval'd checks
     trc=$?
     took=$(( $(date +%s) - s0 ))
-    check "a window on account B, running: it holds B's lock and the stream lock, and A's lock is free" \
+    check "a window on account B, running: it holds B's lock and B's stream lock, and A's lock is free" \
           eval '[ -s "$AB/s/child.pid" ] && [ "$bheld" != 0 ] && [ "$sheld" != 0 ] && [ "$afree" = 0 ]'
-    check "... a paper test on account A runs meanwhile at once (${took} s) and is told where the stream lock is" \
-          eval '[ "$trc" = 0 ] && [ "$took" -lt 20 ] && [ "$(cat "$AB/t/stream-env" 2>/dev/null)" = "$AB/locks/canon-alpaca-stream.lock" ]'
+    check "... a paper test on account A runs meanwhile at once (${took} s) and is told where A's stream lock is" \
+          eval '[ "$trc" = 0 ] && [ "$took" -lt 20 ] && [ "$(cat "$AB/t/stream-env" 2>/dev/null)" = "$AB/locks/canon-alpaca-stream-tests.lock" ]'
     kill -TERM "$op" 2>/dev/null; wait "$op" 2>/dev/null; reap "$AB/s"
-    # a window waits for the stream lock a streaming paper test holds, inside its one wait, and past it fails
-    # with no window started and account B's lock free
-    /usr/bin/lockf -k "$AB/locks/canon-alpaca-stream.lock" sleep 30 & hp=$!
-    for _ in $(seq 50); do /usr/bin/lockf -k -t 0 "$AB/locks/canon-alpaca-stream.lock" true 2>/dev/null || break; sleep 0.1; done
+    # a stream on account A (the lock paper:test names, held as its fixture holds it) and a window on B at
+    # once: each pair has its own stream lock, so the window starts (ADR 0069, 2026-11-11)
+    sa=$(cat "$AB/t/stream-env" 2>/dev/null)
+    if [ -n "$sa" ] && owner paper:session "$AB/b" 40 1 "$AB/locks" 3; then
+      /usr/bin/lockf -k "$sa" sleep 30 & hp=$!
+      for _ in $(seq 50); do /usr/bin/lockf -k -t 0 "$sa" true 2>/dev/null || break; sleep 0.1; done
+      standin "$AB/b" ""
+      (cd "$AB/b" && exec env -i HOME="$HOME" MISE_CEILING_PATHS="$TMPP" PATH="$AB/b/bin:/usr/bin:/bin" "$LMISE" run owner > "$AB/b/out" 2>&1) & op=$!
+      ready "$AB/b" "$op"
+      # shellcheck disable=SC2034  # read by the eval'd checks
+      { /usr/bin/lockf -k -t 0 "$sa" true 2>/dev/null; aheld=$?; }
+      check "a stream on account A's pair holds A's stream lock, and a window on B starts meanwhile, under B's" \
+            eval '[ "$aheld" != 0 ] && [ -s "$AB/b/child.pid" ] && ! grep -q "stream lock stayed held" "$AB/b/out"'
+      kill -TERM "$op" 2>/dev/null; wait "$op" 2>/dev/null; reap "$AB/b"
+      kill "$hp" 2>/dev/null; wait "$hp" 2>/dev/null
+    else
+      t_fail "paper:test named a stream lock, and a second paper:session body was moved into the shared lock folder"
+    fi
+    # a window waits for account B's stream lock while another holds it, inside its one wait, and past it
+    # fails with no window started and account B's lock free
+    /usr/bin/lockf -k "$AB/locks/canon-alpaca-stream-windows.lock" sleep 30 & hp=$!
+    for _ in $(seq 50); do /usr/bin/lockf -k -t 0 "$AB/locks/canon-alpaca-stream-windows.lock" true 2>/dev/null || break; sleep 0.1; done
     standin "$AB/w" ""
     s0=$(date +%s)
     # shellcheck disable=SC2034  # read by the eval'd checks
@@ -1339,7 +1363,7 @@ EOF
     # shellcheck disable=SC2034  # read by the eval'd checks
     { /usr/bin/lockf -k -t 0 "$AB/locks/canon-paper-windows.lock" true 2>/dev/null; bfree=$?; }
     kill "$hp" 2>/dev/null; wait "$hp" 2>/dev/null
-    check "a window while a paper test holds the stream lock: it waits its 3 s, fails with no window started (${took} s), B's lock free" \
+    check "a window while B's stream lock is held: it waits its 3 s, fails with no window started (${took} s), B's lock free" \
           eval '[ "$wrc" != 0 ] && [ "$took" -lt 20 ] && [ ! -e "$AB/w/uv.pid" ] && [ "$bfree" = 0 ] && grep -q "stream lock stayed held" "$AB/w/out"'
     reap "$AB/w"
   else
@@ -1745,7 +1769,7 @@ else
   cat > "$DT/bin/uv" <<EOF
 #!/bin/bash
 case "\$*" in *" /usr/bin/true") exit 0 ;; esac
-/usr/bin/lockf -k -t 0 "$DT/locks/canon-alpaca-stream.lock" true 2>/dev/null; held=\$?
+/usr/bin/lockf -k -t 0 "$DT/locks/canon-alpaca-stream-tests.lock" true 2>/dev/null; held=\$?
 printf 'args: %s\ndata-only: %s\nstream lock held: %s\n' "\$*" "\${CANON_ALPACA_DATA_ONLY:-}" "\$held" > "$DT/ran"
 EOF
   chmod +x "$DT/bin/uv"
@@ -1770,8 +1794,8 @@ EOF
     drun movers-screener --minutes 3; rc=$?
     check "mise run paper:data movers-screener --minutes 3: data-only, the stream lock not taken, logging outside the repository" \
           eval '[ "$rc" = 0 ] && grep -qx "args: run --locked python -m canon_trading.movers_screener --minutes 3 --log-dir $DT/locks/canon-paper-data" "$DT/ran" && grep -qx "data-only: 1" "$DT/ran" && grep -qx "stream lock held: 0" "$DT/ran"'
-    /usr/bin/lockf -k "$DT/locks/canon-alpaca-stream.lock" sleep 30 & hp=$!
-    for _ in $(seq 50); do /usr/bin/lockf -k -t 0 "$DT/locks/canon-alpaca-stream.lock" true 2>/dev/null || break; sleep 0.1; done
+    /usr/bin/lockf -k "$DT/locks/canon-alpaca-stream-tests.lock" sleep 30 & hp=$!
+    for _ in $(seq 50); do /usr/bin/lockf -k -t 0 "$DT/locks/canon-alpaca-stream-tests.lock" true 2>/dev/null || break; sleep 0.1; done
     drun movers-screener --minutes 1; rc=$?
     kill "$hp" 2>/dev/null; wait "$hp" 2>/dev/null
     check "mise run paper:data movers-screener while another run holds the stream lock: runs at once, no wait" \
@@ -1784,12 +1808,18 @@ EOF
   check "mise run paper:data pytest: a module not on the list is refused by mise before the script runs" \
         eval '[ "$rc" != 0 ] && grep -q "Invalid choice for arg module: pytest" "$DT/out" && [ ! -e "$DT/ran" ] && [ ! -s "$KC/log" ]'
   if [ -x /usr/bin/lockf ] && [ -x /usr/bin/timeout ]; then
-    /usr/bin/lockf -k "$DT/locks/canon-alpaca-stream.lock" sleep 30 & hp=$!
-    for _ in $(seq 50); do /usr/bin/lockf -k -t 0 "$DT/locks/canon-alpaca-stream.lock" true 2>/dev/null || break; sleep 0.1; done
+    /usr/bin/lockf -k "$DT/locks/canon-alpaca-stream-tests.lock" sleep 30 & hp=$!
+    for _ in $(seq 50); do /usr/bin/lockf -k -t 0 "$DT/locks/canon-alpaca-stream-tests.lock" true 2>/dev/null || break; sleep 0.1; done
     drun sandbox; rc=$?
     kill "$hp" 2>/dev/null; wait "$hp" 2>/dev/null
-    check "mise run paper:data sandbox while another run holds the stream lock: waits its 2 s, fails, nothing run" \
+    check "mise run paper:data sandbox while another run holds account A's stream lock: waits its 2 s, fails, nothing run" \
           eval '[ "$rc" = 1 ] && grep -q "stream lock stayed held for 2 s; nothing was run" "$DT/out" && [ ! -e "$DT/ran" ]'
+    /usr/bin/lockf -k "$DT/locks/canon-alpaca-stream-windows.lock" sleep 30 & hp=$!
+    for _ in $(seq 50); do /usr/bin/lockf -k -t 0 "$DT/locks/canon-alpaca-stream-windows.lock" true 2>/dev/null || break; sleep 0.1; done
+    drun sandbox --minutes 1; rc=$?
+    kill "$hp" 2>/dev/null; wait "$hp" 2>/dev/null
+    check "mise run paper:data sandbox while a window holds account B's stream lock: runs at once under A's" \
+          eval '[ "$rc" = 0 ] && grep -qx "stream lock held: 75" "$DT/ran" && ! grep -q "stream lock stayed held" "$DT/out"'
   fi
   rm -f "$KC"/read-* "$KC"/value-*
 fi
