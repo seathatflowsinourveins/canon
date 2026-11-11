@@ -284,7 +284,8 @@ proc_list() {
         if (byp[p] == run[i]) return 1; p = par[p] } return 0 }
     END { for (i = 1; i <= NR; i++) if (run[i] != "" && !helper(i)) print pid[i] "\t" et[i] "\t" run[i] }' \
     | while IFS="$(printf '\t')" read -r pid et rt; do
-        cwd=$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)
+        # the first n line, read by one awk that reads to the end, so no writer is cut off under pipefail
+        cwd=$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | awk '!f && sub(/^n/, "") { print; f = 1 }')
         printf '%s\t%s\t%s\t%s\n' "$pid" "$et" "$rt" "$cwd"
       done
 }

@@ -67,11 +67,13 @@ awk 'BEGIN { for (i = 0; i < 3000; i++) printf "003f%040d refs/tags/zz-0.0.%d sy
 : > "$EXTRA"; fake_build; cp -R "$FAKE_DIR" "$TMP/fake.plain"
 
 pass=0; fail=0; out=""
-# check <label> <command...>: passes when the command succeeds
+# check <label> <command...>: passes when the command succeeds. A failing case prints the first lines of
+# the last command output it saw ($out), so a hosted log says why; TEST_CANON_VERBOSE=1 prints all of it.
+# $out is kept from check to check on purpose: a "..." case checks more of the output the case before it read.
 check() { local label="$1"; shift
   if "$@"; then pass=$((pass+1)); echo "  pass  $label"
   else fail=$((fail+1)); echo "  FAIL  $label"
-       [ -z "${TEST_CANON_VERBOSE:-}" ] || printf '%s\n' "$out" | awk 'NR <= 12 { print "        " $0 }'; fi; }
+       [ -z "$out" ] || awk -v all="${TEST_CANON_VERBOSE:-}" 'all != "" || NR <= 12 { print "        " $0 }' <<<"$out"; fi; }
 has()   { case "$1" in *"$2"*) return 0 ;; esac; return 1; }   # has <text> <needle>
 lacks() { ! has "$1" "$2"; }
 same()  { cmp -s "$1" "$2"; }
@@ -430,6 +432,21 @@ sec_network_down() {
 
 sec_mise_requests() {
   fresh
+  # A registry whose "mise" names outrun a pipe buffer (64 KB), the adopted ones first: a membership test
+  # that pipes the list into grep -q loses its writer to SIGPIPE whenever grep matches early, and under
+  # pipefail reports an adopted tool missing. This makes that happen on every run, not only under load.
+  # shellcheck disable=SC2016  # jq program, not shell
+  reg_edit '.upstreams += [range(0; 2000) as $i | {id: "pad-\($i)", field: "x", repo: "o/pad\($i)", track: "default",
+    role: "watch", license: "MIT", why: "pad", evidence: ["https://example.org/"], adr: "0007",
+    mise: "padding-tool-name-that-is-fairly-long-\($i)"}]'
+  out=$(canon lint)
+  # the padding is there and lint read it (each padded entry lacks a pin), so the next check is not vacuous
+  # shellcheck disable=SC2016  # eval'd when the check runs
+  check "a registry padded with 2,000 more mise names reaches the lint" \
+        eval '[ "$(jq "[.upstreams[] | select(.mise != null)] | length" "$T/canon/upstreams.json")" -ge 2000 ] && has "$out" "pad-1999 has no 40-hex pin"'
+  out=$(canon lint); out=$(grep -F "mise.toml installs" <<<"$out")   # the padding's own missing pins aside
+  check "an adopted tool is found however long the registry's mise list is" lacks "$out" "mise.toml installs"
+  fresh
   # start without the two entries this section adds, so the cases do not depend on what the registry holds
   reg_edit '.upstreams |= map(select(.id != "gh" and .id != "python"))'
   jq 'del(.pins.gh, .pins.python)' "$T/canon/upstreams.lock.json" > "$W/l.json" && mv "$W/l.json" "$T/canon/upstreams.lock.json"
@@ -471,6 +488,26 @@ sec_mise_requests() {
   printf '\n[tools.deno]\nversion = "2"\n' >> "$T/mise.toml"
   out=$(canon lint)
   check "a tool given its own table is refused"              has "$out" "its own [tools.<name>] table"
+}
+
+# Under pipefail a pipeline fails when any command in it fails, and a reader that stops early (grep -q or
+# -m, head, sed's q) leaves its writer to die of SIGPIPE (exit 141) if it has more to write: the pipeline
+# then fails though the reader succeeded, at random, by how the writer's output is split (bash(1),
+# pipefail). No tracked script that sets pipefail may pipe into such a reader; read a here-string, or a
+# reader that reads to the end, instead. Comment lines are not code and are skipped.
+# shellcheck disable=SC2016  # the regular expression, the sample lines and the eval'd check are not expanded here
+sec_pipe_readers() {
+  local re hits
+  re='\|[[:space:]]*(grep[[:space:]]([^|]*[[:space:]])?(-[A-Za-z]*[qm][A-Za-z0-9]*|--quiet|--silent|--max-count)([[:space:]=]|$)|head([[:space:]]|$)|sed[[:space:]][^|]*[;{ '"'"']q)'
+  hits=$(cd "$SRC" && git ls-files -z | xargs -0 grep -lE 'set -[a-z]*o pipefail' 2>/dev/null \
+         | while IFS= read -r f; do grep -nE "$re" "$f" | grep -vE '^[0-9]+:[[:space:]]*#' | sed "s|^|$f:|"; done)
+  out=$hits
+  check "no script that sets pipefail pipes into a reader that stops early (grep -q, grep -m, head, sed q)" test -z "$hits"
+  local p='|'   # the samples are built here, so this file holds no line the rule would find
+  out=$(printf '%s\n' 'set -euo pipefail' "printf x $p grep -qxF -- n" "y=\$(ls $p head -1)" "# a $p grep -q in a comment" \
+        | grep -nE "$re" | grep -vE '^[0-9]+:[[:space:]]*#')
+  check "... and the rule finds the shapes it is for: a pipe into grep -qxF and into head -1" \
+        eval '[ "$(wc -l <<<"$out" | tr -d " ")" = 2 ]'
 }
 
 sec_claude_pin() {
@@ -611,7 +648,7 @@ sec_watch_and_brief() {
 # Each section runs in the background in its own work directory (W, T, EXTRA, FAKE_DIR, BEFORE), so the
 # sections can run at once. Their lines are printed in order once all have finished.
 SECTIONS="baseline registry_validation resolve_keeps_pins stale_pin check_exits refs evidence workflows broken_pipe
-          outdated network_down mise_requests claude_pin resolve_lock lint_hook watch_and_brief"
+          outdated network_down mise_requests claude_pin resolve_lock lint_hook watch_and_brief pipe_readers"
 pids=""; ran=""
 for s in $SECTIONS; do
   name=${s//_/ }

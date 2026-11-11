@@ -91,7 +91,7 @@ export STUB="$TMP/stub"; mkdir -p "$STUB"
 export PATH="$B:$PATH"
 REAL_HOME="$HOME"   # the paper:store case needs the user's own login keychain, which security finds through HOME
 export HOME="$TMP/home"; mkdir -p "$HOME"
-unset CLAUDE_CONFIG_DIR CANON_LEDGER_HOME AUTOMATION_SKIP_LAUNCHD CANON_LAUNCHAGENTS_DIR CODEX_HOME
+unset CLAUDE_CONFIG_DIR CANON_LEDGER_HOME AUTOMATION_SKIP_LAUNCHD CANON_LAUNCHAGENTS_DIR CODEX_HOME DSH_HOME
 PINNED=$(sed -n 's/^MISE_VERSION="v\([^"]*\)".*/\1/p' "$ROOT/scripts/bootstrap")
 echo "$PINNED macos-arm64 (stub)" > "$STUB/mise-version"
 CCPIN="2.1.321"   # the claude-code pin the bootstrap fixture's registry sets, whatever the real one is
@@ -510,9 +510,9 @@ want=$(git -C "$O" rev-parse main)
 check "first firing clones origin's main and runs the window there: exit 0" \
       eval '[ "$rc" = 0 ] && [ "$(git -C "$FK" rev-parse HEAD)" = "$want" ]'
 check "... mise run paper:session --session auto --minutes 25, in the clone, CANON_COMMIT the commit" \
-      eval 'ran | grep -qF "mise run paper:session --session auto --minutes 25 |" && ran | grep -qF "| pwd=$(cd "$FK" && pwd) | commit=$want |"'
+      eval 'grep -qF "mise run paper:session --session auto --minutes 25 |" <<<"$(ran)" && grep -qF "| pwd=$(cd "$FK" && pwd) | commit=$want |" <<<"$(ran)"'
 check "... with PATH exported, which mise's exec() templates need to start a shell" \
-      eval 'ran | grep -qE "\| path=/usr/bin:/bin:/usr/sbin:/sbin\$"'
+      eval 'grep -qE "\| path=/usr/bin:/bin:/usr/sbin:/sbin\$" <<<"$(ran)"'
 check "... and stamps the firing's start, which status reads to tell a schedule gone silent" \
       jqt "$FD/scheduled-firing.json" '(.at_epoch | type) == "number" and (now - .at_epoch) < 120'
 echo 2 > "$OW/tracked"; ocommit second; want=$(git -C "$O" rev-parse main)
@@ -522,7 +522,7 @@ mkdir -p "$FK/.venv" "$FK/catalog"; : > "$FK/.venv/kept"; : > "$FK/catalog/bars"
 printf '#!/bin/sh\necho ran > "%s"\n' "$TMP/hook-ran" > "$FK/.git/hooks/post-checkout"; chmod +x "$FK/.git/hooks/post-checkout"
 git -C "$FK" branch -q planted; git -C "$FK" branch -q origin/main; rm -f "$TMP/hook-ran"
 fire "$B/mise" "$FK" "$OURL" --session auto; rc=$?
-check "the next firing runs the main origin has now"  eval '[ "$rc" = 0 ] && ran | grep -qF "commit=$want" && [ "$(cat "$FK/tracked")" = 2 ]'
+check "the next firing runs the main origin has now"  eval '[ "$rc" = 0 ] && grep -qF "commit=$want" <<<"$(ran)" && [ "$(cat "$FK/tracked")" = 2 ]'
 check "... detached, keeping .venv and nothing else untracked" \
       eval '! git -C "$FK" symbolic-ref -q HEAD >/dev/null && [ -e "$FK/.venv/kept" ] && [ ! -e "$FK/catalog/bars" ] && [ ! -e "$FK/untracked" ]'
 check "... running no hook the clone holds (core.hooksPath=/dev/null, git-config(1))" test ! -e "$TMP/hook-ran"
@@ -533,7 +533,7 @@ printf '#!/bin/sh\necho ran > "%s"\n' "$TMP/fsmonitor-ran" > "$TMP/fsmonitor"; c
 git -C "$FK" config core.fsmonitor "$TMP/fsmonitor"; rm -f "$TMP/fsmonitor-ran"
 fire "$B/mise" "$FK" "$OURL" --session auto; rc=$?
 check "a clone with local config the runner did not write is made again: it runs no command that config names" \
-      eval '[ "$rc" = 0 ] && ran | grep -qF "commit=$want" && [ ! -e "$TMP/fsmonitor-ran" ] && [ -z "$(git -C "$FK" config --local --get core.fsmonitor)" ]'
+      eval '[ "$rc" = 0 ] && grep -qF "commit=$want" <<<"$(ran)" && [ ! -e "$TMP/fsmonitor-ran" ] && [ -z "$(git -C "$FK" config --local --get core.fsmonitor)" ]'
 lines=$(grep -c "run paper:session" "$STUB/mise.log")
 mv "$O" "$O.away"; echo 3 > "$OW/tracked"
 fire "$B/mise" "$FK" "$OURL" --session auto; rc=$?
@@ -550,7 +550,7 @@ mv "$O.away" "$O"
 git -C "$FK" remote set-url origin "$TMP/elsewhere.git"
 fire "$B/mise" "$FK" "$OURL" --session auto; rc=$?
 check "a clone with another origin is made again from the right one" \
-      eval '[ "$rc" = 0 ] && [ "$(git -C "$FK" remote get-url origin)" = "$OURL" ] && ran | grep -qF "commit=$want"'
+      eval '[ "$rc" = 0 ] && [ "$(git -C "$FK" remote get-url origin)" = "$OURL" ] && grep -qF "commit=$want" <<<"$(ran)"'
 mkdir -p "$TMP/someones"; echo mine > "$TMP/someones/file"
 # shellcheck disable=SC2034  # read by the eval'd checks
 lines=$(grep -c "run paper:session" "$STUB/mise.log")
@@ -628,7 +628,7 @@ ceiling=$(( $(sed -n 's/^STALE_RUNNING_SECS = \([0-9 *]*\)$/\1/p' "$ROOT/src/can
 # shellcheck disable=SC2034  # need is read by the eval'd check
 for t in paper:session paper:test; do
   to=$(secs "$(task_part "$t" timeout)")
-  w=$(task_part "$t" run | grep -oE 'lockf( -[a-z]+)* -t [0-9]+' | grep -oE '[0-9]+$' | head -1)
+  w=$(task_part "$t" run | grep -oE 'lockf( -[a-z]+)* -t [0-9]+' | grep -oE '[0-9]+$' | awk 'NR == 1')
   need=$(( ${w:-0} + 1 )); extra=""
   if [ "$t" = paper:session ]; then need=$(( ${w:-0} + ceiling )); extra=" plus the window's ceiling (${ceiling} s)"; fi
   check "$t declares a mise timeout (${to} s) above its lock wait (${w:-none} s)$extra" \
@@ -718,12 +718,26 @@ check "... and its absence does not change the exit status" test "$rc" = "$rc_pr
 check "paper row looks items up by service and account only, never -w or -g" \
       eval 'grep -q "find-generic-password -s canon-alpaca-paper -a ALPACA_SECRET_KEY\$" "$STUB/security.log" && ! grep -Eq " -(w|g)( |\$)" "$STUB/security.log"'
 rm -f "$STUB/keychain"
+# a dsh-tui patch with its own memento row first and more than a pipe buffer (64 KB) after it: the conflict
+# is found however early it comes, which a pipe into grep -q under pipefail misses (its writer cut off)
+DP="$HOME/.dsh/profiles/dsh-tui"; mkdir -p "$DP"
+{ echo '- id: memento'; echo '  enabled: true'; for _ in $(seq 2000); do echo '# padding line, long enough to outrun one pipe buffer'; done; } > "$DP/cordis.patch.yml"
+bs --check
+check "a dsh-tui patch with its own row first, past a pipe buffer long: conflict" \
+      grep -q "another row in $DP/cordis.patch.yml sets session-log-deepseek or memento" "$TMP/bs.out"
+if [ "$(id -u)" = 0 ]; then skip "an unreadable dsh-tui patch" "root reads a file whatever its mode"
+else
+  chmod 000 "$DP/cordis.patch.yml"; bs --check; chmod 644 "$DP/cordis.patch.yml"
+  check "an unreadable dsh-tui patch: UNKNOWN, saying it cannot be read, never a silent none" \
+        eval 'rowis "$TMP/bs.out" "dsh-tui review patch" UNKNOWN && grep -q "cordis.patch.yml cannot be read" "$TMP/bs.out"'
+fi
+rm -rf "$HOME/.dsh"
 # every keychain service mise.toml's paper tasks name is the one the bootstrap row looks up (ADR 0029)
 paper_names() { grep -oE '(-s |svc=)[A-Za-z0-9"$_-]+' "$ROOT/mise.toml" | sed -E 's/^(-s |svc=)//' | grep -vxF '"$svc"'; }
 # shellcheck disable=SC2034  # read by the eval'd check below
 psvc=$(sed -n 's/^PAPER_SERVICE="\([^"]*\)".*/\1/p' "$ROOT/scripts/bootstrap")
 check "mise.toml's paper tasks name only bootstrap's keychain service" \
-      eval '[ -n "$psvc" ] && [ "$(paper_names | wc -l | tr -d " ")" -ge 5 ] && ! paper_names | grep -vxF "$psvc" | grep -q .'
+      eval '[ -n "$psvc" ] && [ "$(paper_names | wc -l | tr -d " ")" -ge 5 ] && [ -z "$(paper_names | grep -vxF "$psvc")" ]'
 
 # ---------- paper:store on a terminal, against the real security ----------
 # The stub above cannot see how Apple's security behaves on a terminal (ADR 0033: with -w last it prompts on
@@ -844,7 +858,7 @@ check "... and only those: the template's fable pin is not added" \
 check "... leaves a value the owner set, and names it" \
       eval 'jqt "$C3/settings.json" ".env.OTEL_METRICS_EXPORTER == \"otlp\"" && grep -q "sets OTEL_METRICS_EXPORTER to another value" "$TMP/bs.out"'
 check "... keeping the previous file beside it" \
-      eval 'f=$(find "$C3" -name "settings.json.replaced-*" | head -1); [ -n "$f" ] && jqt "$f" ".env | has(\"OTEL_LOGS_EXPORTER\") | not"'
+      eval 'f=$(find "$C3" -name "settings.json.replaced-*" | awk "NR == 1"); [ -n "$f" ] && jqt "$f" ".env | has(\"OTEL_LOGS_EXPORTER\") | not"'
 check "an existing Codex config gets the table appended, its own lines kept" \
       eval 'grep -qxF "model = \"o3\"" "$CX" && grep -qxF "model = \"x\"" "$CX" && grep -qxF "[otel]" "$CX" && [ -n "$(find "$HOME/.codex" -name "config.toml.replaced-*")" ]'
 check "... on a line of its own after the last one"  grep -qxF '[profiles.fast]' "$CX"
