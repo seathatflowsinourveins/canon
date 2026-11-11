@@ -80,8 +80,10 @@ and the check waits, at most `ADAPTER_CALL_SECS`, for the ones the adapter left 
 shielded), so an order one of them sends is in the account before the check reads it. The run's node log and a
 JSON report go to `log_dir`, outside the repository.
 
-An extended window runs in the overnight session, and in pre-market or after-hours once a feed has been seen
-to deliver there on paper (`SESSION_FEEDS`; until then such a window is skipped, naming the observation).
+An extended window runs in each part of the extended session that `SESSION_FEEDS` gives a feed: overnight on
+`boats`, pre-market and after-hours on `sip` (a part given none is skipped, naming the observation). A pre-market window's warm-up
+reaches back into the prior session (`warm_up_start`): NautilusTrader's `Strategy.request_bars` takes any
+`start`, and the adapter pages Alpaca's bars from it to the end it is given (`canon_alpaca.data`).
 The overnight session is the one Alpaca's 24/5 page
 (https://docs.alpaca.markets/us/docs/245-trading-for-trading-api.md) puts from 8:00 PM to 4:00 AM ET "on
 the evening before the trade date", following the NYSE holiday calendar, with its data on `boats` or
@@ -176,6 +178,7 @@ from .paper_node import alpaca_paper_builder
 from .paper_node import ema_cross_config
 from .position_cap import PositionCap
 from .position_cap import position_cap_config
+from .session_ma_cross import WARM_UP_SPARE_BARS
 from .session_ma_cross import SessionMaCross
 from .session_ma_cross import SessionMaCrossConfig
 
@@ -208,18 +211,18 @@ SESSION_FEEDS = {
         "tester, 13:59 to 14:44 New York, 2026-11-10 (the adapter's README)",
     ),
     "pre-market": SessionFeed(
-        None,
-        "probed on paper and no stream delivered: the iex windows of 04:13 and 04:25 New York, 2026-11-11, "
-        "received no SPY quote or trade in 307.7 s and 1,506.4 s, their warm-ups no bar; at 04:53 the same day "
-        "iex and boats each sent no quote or trade in 120 s and served no bar for the hour before. IEX, the "
-        "one feed a Paper Only account is documented to receive, served SPY bars from 08:15 New York in "
-        "2026-11-10's pre-market, 16 in 75 minutes, fewer than the slow average's 20 (ADR 0044)",
+        DataFeed.SIP.value,
+        "sip delivered on paper in pre-market: a read-only probe on account A, 08:23 to 08:26 New York, "
+        "2026-11-11, received 1,167 SPY quotes, 240 trades and 3 bars, where iex, 08:26 to 08:36, sent 5 SPY "
+        "trades and 2 bars; iex and boats sent nothing at 04:13 to 04:58, before IEX Exchange's 08:00 "
+        "pre-market open. The warm-up reaches back into the prior session (`warm_up_start`, ADR 0044)",
     ),
     "after-hours": SessionFeed(
-        None,
-        "probed on paper and no stream delivered: iex, overnight and boats each sent no quote or trade "
-        "in 45 s on four symbols at 16:46 New York, 2026-11-10, though IEX's REST bars showed trades after "
-        "the close; one short probe, not proof (ADR 0055)",
+        DataFeed.SIP.value,
+        "iex, overnight and boats each sent no quote or trade in 45 s on four symbols at 16:46 New York, "
+        "2026-11-10 (ADR 0055); the sip feed authenticated on paper on 2026-11-10, and authenticated and "
+        "delivered on 2026-11-11 (pre-market's row); after-hours has not yet been run on it, so its windows "
+        "are the probe",
     ),
     "overnight": SessionFeed(
         DataFeed.BOATS.value,
@@ -230,10 +233,12 @@ SESSION_FEEDS = {
 streams and serves bars (`STREAM_FEEDS`, `BARS_FEEDS`), as the strategy needs of its one feed; `overnight`
 streams quotes only (ADR 0055). A part where the feeds were probed on paper and none delivered has no feed
 and is skipped, naming the probe, as the lead decided on 2026-11-11, so the schedule does not fail every
-evening and every morning by design; a part not yet probed would run, and its windows be the probe
-(every part has been probed now); inside a part with a feed, a
+evening and every morning by design; a part not yet probed on its feed runs, and its windows are the probe
+(after-hours, and pre-market before 08:00, on `sip`); inside a part with a feed, a
 window that receives nothing still fails (`_data_failure`). The feed is named in the subscriptions' and the bars
 request's params, `{"feed": ...}` (ADR 0055); one not served fails loudly, never another."""
+CALENDAR_BACK = timedelta(days=7)
+"""How far back the calendar is read: past any run of weekend and holiday days before a trading day."""
 DEFAULT_MINUTES = 30
 MAX_MINUTES = 60
 GAP_SECS = 300
@@ -304,7 +309,7 @@ STALE_RUNNING_SECS = 70 * 60
 start-up, shutdown and the account check)."""
 EXTENDED_READY = True
 """Whether extended windows may run: pre-market, after-hours and overnight, each where `SESSION_FEEDS` gives
-it a feed (pre-market and after-hours have none, so they are skipped). The adapter sends
+it a feed (every part has one; a part given none is skipped). The adapter sends
 `extended_hours` from the submit params (ADR 0038), its disconnect is bounded (ADR 0039), and an overnight
 window passed on paper before this was turned on (ADR 0044, Confirmation)."""
 POLL_SECS = 2.5
@@ -605,6 +610,30 @@ def window_feed(part: str) -> str:
     return found.feed
 
 
+def warm_up_start(
+    part: str,
+    now: datetime,
+    calendar: AlpacaCalendar | Sequence[AlpacaCalendar] | None,
+    *,
+    span: timedelta,
+) -> datetime | None:
+    """Where a window's warm-up starts when its own part of the session is too thin for the slow average:
+    in pre-market, `span` before the regular close of the last trading day before `now`'s (Alpaca's
+    calendar), so the request reaches back into the prior session, as `request_bars` takes any `start`
+    (`SessionMaCross._warm_up_from`); None elsewhere, which warms up on the strategy's own span.
+    `RuntimeError` if the calendar holds no earlier trading day."""
+    if part != "pre-market":
+        return None
+    today = in_new_york(now).date()
+    days = _trading_days(calendar)
+    if not (earlier := [d for d in days if d < today]):
+        raise RuntimeError(
+            f"no trading day before {today} on the calendar read, so the pre-market warm-up "
+            "cannot reach back into the prior session"
+        )
+    return in_new_york(days[max(earlier)].close) - span
+
+
 def builtin_config(builtin: str, instrument_id: InstrumentId) -> object:
     """The config a built-in of `WINDOW_STRATEGIES` runs with in a window, or `ValueError` for one the
     window has no config for."""
@@ -639,7 +668,12 @@ class CachedData:
 
 
 def window_node(
-    config: WindowConfig, *, wind_down_at: datetime, log_name: str, feed: str
+    config: WindowConfig,
+    *,
+    wind_down_at: datetime,
+    log_name: str,
+    feed: str,
+    warm_up_start: datetime | None = None,
 ) -> tuple[LiveNode, SessionMaCross | CachedData, PositionCap]:
     """The node, Alpaca's clients, the native risk limits and runtime checks, with the strategy and the cap
     it runs (returned too: the node does not hand its Python strategies back; for a built-in, what the
@@ -687,6 +721,7 @@ def window_node(
             feed=feed,
             wind_down_at=wind_down_at,
             warm_up=True,  # the averages start from the adapter's last bars (ADR 0047)
+            warm_up_start=warm_up_start,  # in pre-market, the prior session's (`warm_up_start`)
             strategy_id=STRATEGY_ID,
             order_id_tag="001",
             # In the session, `stop()` runs upstream's market exit, with closing orders Alpaca takes.
@@ -847,7 +882,7 @@ def write_heartbeat(log_dir: Path, outcome: str) -> None:
 
 
 def session_now(trading: TradingClient) -> tuple[AlpacaClock, list[AlpacaCalendar], float]:
-    """Alpaca's clock and the calendar's days from today to tomorrow (New York; a day that is not a
+    """Alpaca's clock and the calendar's days from a week before today to tomorrow (New York; a day that is not a
     trading day is absent), read once per run, and the `time.monotonic()`
     at which the clock's answer arrived: its timestamp is as old as the time since, whatever the read's
     own retries took before it."""
@@ -855,8 +890,11 @@ def session_now(trading: TradingClient) -> tuple[AlpacaClock, list[AlpacaCalenda
     read_at = time.monotonic()
     assert isinstance(clock, AlpacaClock)
     today = clock.timestamp.astimezone(NEW_YORK).date()
-    # the next day too: an overnight session that starts at 20:00 belongs to the next trading day
-    days = trading.get_calendar(GetCalendarRequest(start=today, end=today + timedelta(days=1)))
+    # the next day too: an overnight session that starts at 20:00 belongs to the next trading day; and
+    # the week before, for the last trading day's close a pre-market warm-up reaches back to
+    days = trading.get_calendar(
+        GetCalendarRequest(start=today - CALENDAR_BACK, end=today + timedelta(days=1))
+    )
     return clock, list(days) if isinstance(days, list) else [], read_at
 
 
@@ -958,6 +996,15 @@ def run_window(
     except RuntimeError as e:
         raise WindowRefused(str(e)) from e
     feed = window_feed(part)
+    try:  # the slow average's bars and the spare ones, in the bar type's own interval
+        history_from = warm_up_start(
+            part,
+            clock.timestamp,
+            calendar,
+            span=(config.slow_period + WARM_UP_SPARE_BARS) * config.bar_type.spec.timedelta,
+        )
+    except RuntimeError as e:
+        raise WindowRefused(str(e)) from e
     overnight = overnight_eligibility(trading, config.symbol) if part == "overnight" else ""
     if left := leftovers(trading, config.symbol):
         raise WindowRefused(
@@ -1001,6 +1048,7 @@ def run_window(
             wind_down_at=ends - timedelta(seconds=FLATTEN_SECS),
             log_name=f"window-{stamp}",
             feed=feed,
+            warm_up_start=history_from,
         )
         cache = node.cache
         try:
