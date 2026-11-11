@@ -162,5 +162,11 @@ Read 2026-11-11. Resolved means read in a local copy at the commit `canon/upstre
   the same way. An `evidence-verifier` pass the same day corrected line ranges, the cap's exemption
   and the labels above. A second reader (Muse) on the window's commit: six findings, five fixed with
   a failing test first (the kept trigger, the two retries, the unnamed position, the modify row); the
-  sixth, in the replay's check, is ADR 0091's stated limit.
+  sixth, in the replay's check, was ADR 0091's stated limit. **Update, 2026-11-11:** the replay's `stage_one` added
+  the check across remade sells within a holding, resetting after flat, with a failing test first:
+  `tests/test_mover_day.py::test_stage_one_checks_a_remade_sells_trigger_until_the_position_is_flat`.
+  **Follow-up, 2026-11-11 (Antigravity findings 1 and 2):** real-engine regressions reproduced the
+  release timestamp and sub-second sampling faults; the replay now keeps the original initialization
+  time and reads trigger events from cached order histories, including stops released during submit.
+  The one-instrument limit remains; the sizing difference and evidence are in ADR 0091.
 * The owner's requirement of 2026-11-11 — an instruction, not evidence: each number is UNCALIBRATED.

@@ -2,8 +2,8 @@
 
 The replay itself (`replay`, `stage_one`) is `tests/test_mover_day.py`'s, loaded here by path since the
 tests are not a package; this file loads one symbol-day from Alpaca's Market Data API into a catalog
-folder of its own and replays it. It runs only when a paper key pair is in the environment, under the
-names in `canon_alpaca.constants`, otherwise pytest reports it as skipped.
+folder of its own and replays it. The recorded-day test runs only when a paper key pair is in the
+environment, under the names in `canon_alpaca.constants`, otherwise pytest reports it as skipped.
 `mise run paper:test -- -s -k test_paper_mover_day` runs it alone under account A's lock (ADR 0029,
 ADR 0040). Never write the keys to a file. It opens no stream: every read is a request.
 
