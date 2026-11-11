@@ -31,7 +31,13 @@ different bars, trials that do not cover the same session days over the sample, 
 key not marked by `mark_not_run`. A record that ran on the current sample is in `record_trial`'s shape
 only if its run's bounds are the sample's, its `run_config_id` is its key, its digest names at least
 one bar type, each with a SHA-256 hex digest, and every return and session day falls on a UTC day of
-the sample (`canon_trading.ledger.session_day` of its two ends); Optuna validates no user attribute.
+the sample (`canon_trading.ledger.session_day` of its two ends) no later than the session day of the
+run's own end; Optuna validates no user attribute. A record with a key that did not run to the end
+is a failure a later record resolves only if it is one `record_trial` leaves: one that shows a
+result Optuna keeps (`COMPLETE`, `PRUNED`, a value or an intermediate value), or an outcome
+`record_trial` never writes, stops for good. A keyless record marked by `mark_not_run` is cleared
+only while it is in a state the mark leaves, `FAIL` or `WAITING`. The samples are read once, so the
+current sample and the numbers known agree.
 Every such stop is gathered before one is raised. Configurations tied at the highest Sharpe ratio with
 the same returns are one pick; tied with other returns, they leave no single pick and stop it. N-hat
 below 1 is raised to 1, skfolio's least, and the DSR at N-hat is withheld when its benchmark is below
@@ -48,18 +54,21 @@ from datetime import UTC
 from datetime import datetime
 from typing import TYPE_CHECKING
 
+from optuna.trial import TrialState
 from skfolio import measures
 
+from .ledger import FAILED
 from .ledger import IDLE
 from .ledger import NOT_RUN
 from .ledger import OUTCOME
 from .ledger import TRADED
 from .ledger import Sample
-from .ledger import current_sample
 from .ledger import has_key
+from .ledger import is_not_run_list
 from .ledger import ran_something
 from .ledger import samples
 from .ledger import session_day
+from .ledger import shows_an_evaluation
 from .returns_matrix import ReturnsRejected
 from .returns_matrix import daily_series
 from .returns_matrix import is_ns_text
@@ -167,6 +176,38 @@ def on_current_sample(trial: FrozenTrial, sample: Sample, known: set[int]) -> bo
     return not ran_to_the_end(trial)
 
 
+# The states `canon_trading.ledger.mark_not_run` leaves a record in. A marked record in another state
+# was started after its mark, by an `ask` that took it from Optuna's queue, and stops again.
+_LEFT_BY_A_MARK = (TrialState.FAIL, TrialState.WAITING)
+
+
+def _not_the_writers(trial: FrozenTrial) -> str | None:
+    """Why `trial`, a record with a key, is in no state and outcome `record_trial` leaves, if it is.
+
+    `record_trial` leaves a record that ran to the end `COMPLETE`, `traded`, with a value, or `FAIL`,
+    `traded` or `idle`, with none; one cut short `RUNNING` with any outcome or none, or `FAIL`,
+    `failed` or with none. It suggests no parameter and reports no intermediate value. Anything else
+    was told by another writer: read as a failure it would be resolved by a later record and drop out
+    of every check, and read as a run it would enter the matrix unchecked.
+    """
+    outcome = trial.user_attrs.get(OUTCOME)
+    state = trial.state
+    if outcome not in (None, FAILED, TRADED, IDLE):
+        return f"has outcome {outcome!r}, not one record_trial writes"
+    if trial.intermediate_values or trial.distributions:
+        return "holds an intermediate value or a parameter, which record_trial never writes"
+    if ran_to_the_end(trial):
+        told = (state, outcome, trial.values is not None)
+        if told in ((TrialState.COMPLETE, TRADED, True), (TrialState.FAIL, TRADED, False)) or (
+            told == (TrialState.FAIL, IDLE, False)
+        ):
+            return None
+        return f"was told {state.name} with outcome {outcome!r}, as record_trial never tells one"
+    if shows_an_evaluation(trial):
+        return "shows a result Optuna keeps but no outcome record_trial writes for one"
+    return None
+
+
 def _known_sample(trial: FrozenTrial, known: set[int]) -> bool:
     """Whether `trial` holds the number of one of the study's samples (ADR 0041 term 5)."""
     number = trial.user_attrs.get("sample")
@@ -188,11 +229,20 @@ def rank(study: optuna.Study) -> RankingReport:
     trials = study.get_trials(deepcopy=False)  # read only; a copy of every series is not needed
     if not trials:
         raise RankingStopped(f"study {study.study_name!r} has no trials")
-    sample = current_sample(study)
-    known = {s.number for s in samples(study)}
-    not_run = set(study.user_attrs.get(NOT_RUN, []))
+    history = samples(study)  # one read, so the current sample and the known numbers agree
+    sample = history[-1]
+    known = {s.number for s in history}
     by_key: dict[str, list[FrozenTrial]] = defaultdict(list)
     stops: list[str] = []
+    marked = study.user_attrs.get(NOT_RUN, [])
+    if is_not_run_list(marked):
+        not_run = set(marked)
+    else:
+        not_run = set()
+        stops.append(
+            f"study user attribute {NOT_RUN} is {marked!r}, not a list of trial numbers in the form "
+            "mark_not_run writes, so no record is read as marked (ADR 0053)",
+        )
     for trial in trials:
         if has_key(trial):
             by_key[trial.user_attrs["config_key"]].append(trial)
@@ -202,7 +252,7 @@ def rank(study: optuna.Study) -> RankingReport:
                 "record_trial writes but shows a run: a trial of an unknown configuration, which "
                 "another writer left and nothing clears (ADR 0053)",
             )
-        elif trial.number not in not_run:
+        elif trial.number not in not_run or trial.state not in _LEFT_BY_A_MARK:
             stops.append(
                 f"#{trial.number} ({trial.state.name.lower()}) has no config key, so it ran no "
                 f"backtest; if its process is gone, mark_not_run(study, {trial.number}) clears it "
@@ -234,6 +284,14 @@ def rank(study: optuna.Study) -> RankingReport:
             )
             continue
         on_sample[key] = records
+        foreign = [(trial, why) for trial in records if (why := _not_the_writers(trial))]
+        if foreign:
+            stops.extend(
+                f"{key}: {_describe(trial)} {why}: not in the shape record_trial writes, so another "
+                "writer left it and no later record resolves it (ADR 0035)"
+                for trial, why in foreign
+            )
+            continue
         ran = [trial for trial in records if ran_to_the_end(trial)]
         if not ran:
             stops.append(
@@ -453,17 +511,19 @@ def _shape_faults(trial: FrozenTrial, sample: Sample) -> list[str]:
     NautilusTrader sets a run's `backtest_start` to the start it was given and its `backtest_end` to
     the engine's clock when the run ends, at or before the end it was given (`run_impl` and
     `end_impl`, `crates/backtest/src/engine.rs` at the pinned commit), so the start must be the
-    sample's and the end within it. The returns' and session days' own form is `daily_series`'s to
-    refuse; here only their range.
+    sample's and the end within it. The returns and session days must fall on the run's own days, from
+    the session day of its start to that of its end: a run books nothing after its clock stopped. Their
+    own form is `daily_series`'s to refuse; here only their range.
     """
     attrs = trial.user_attrs
     faults = []
     start, end = attrs.get("backtest_start"), attrs.get("backtest_end")
     if not (isinstance(start, int) and not isinstance(start, bool) and start == sample.start):
         faults.append(f"backtest_start {start!r}, not the start of {sample.describe()}")
-    if not (
+    end_ok = (
         isinstance(end, int) and not isinstance(end, bool) and sample.start <= end <= sample.end
-    ):
+    )
+    if not end_ok:
         faults.append(f"backtest_end {end!r}, not within {sample.describe()}")
     if attrs.get("run_config_id") != attrs.get("config_key"):
         faults.append(f"run_config_id {attrs.get('run_config_id')!r}, not its config key")
@@ -481,18 +541,24 @@ def _shape_faults(trial: FrozenTrial, sample: Sample) -> list[str]:
     ):
         faults.append(f"data_digest {digests!r}")
     low, high = session_day(sample.start), session_day(sample.end)
+    ran_until = session_day(end) if end_ok else high
     for values, what in (
         (attrs.get("returns_series"), "returns_series has a key on"),
         (attrs.get("session_days"), "session_days has"),
     ):
-        days = values if isinstance(values, dict | list) else ()
-        outside = sorted(
-            int(day) for day in days if is_ns_text(day) and not low <= int(day) <= high
+        days = sorted(
+            int(day)
+            for day in (values if isinstance(values, dict | list) else ())
+            if is_ns_text(day)
         )
+        outside = [day for day in days if not low <= day <= high]
         if outside:
             faults.append(
                 f"{what} {_day(outside[0])}, outside {sample.describe()} ({len(outside)} in all)"
             )
+        after = [day for day in days if ran_until < day <= high]
+        if after:
+            faults.append(f"{what} {_day(after[0])}, after its backtest_end ({len(after)} in all)")
     return faults
 
 

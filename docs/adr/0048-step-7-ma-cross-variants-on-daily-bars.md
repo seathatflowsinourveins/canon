@@ -143,6 +143,12 @@ recommendation either.
   are identified by their data digests: SPY
   `a0b82593e1401adbd875b142f24c414ad77e3ffa92c6c690bcaff5a02a09ad09`, QQQ
   `e2e493377d3614bbc3373867b0e789bc353b6322bb032757c3730b1d4457db40` (ADR 0053 term 1).
+  `e2e493377d3614bbc3373867b0e789bc353b6322bb032757c3730b1d4457db40` (ADR 0041 term 3).
+* Since the run: a study is ranked only once every configuration of the plan has a record
+  (`test_a_study_short_of_its_plan_is_not_ranked`), and a run whose failure could not be told stops
+  the pass (`test_a_failure_that_cannot_be_told_stops_the_pass`), each a test that failed before its
+  fix. Neither arose in the run above: one pass recorded all eight keys, all `traded`, so its N = 8
+  is the plan's.
 
 ## Evidence
 
@@ -193,3 +199,7 @@ Read 2026-11-10. Fetched means read in this session as raw text or source; run m
   close claims, and found the Alpaca staff reply and the IEX-or-SIP cause, all applied above. On the
   result it re-read the ledger and `rank`'s report, which match, and corrected the unsourced open
   defects, the single-process claim, and the code that ran.
+* A fourth review of the gate, 2026-11-10, read only, by a second reader: after a pass stopped at
+  three of the plan's keys, `--rank-only` passed at N = 3; an engine error whose `FAIL` could not be
+  written left the record `RUNNING`, and the pass went on without the storage error. Each reproduced
+  as a failing test and fixed, with no change to the plan.

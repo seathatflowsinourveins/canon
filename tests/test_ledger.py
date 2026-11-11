@@ -20,6 +20,8 @@ then covers 2025-03-10 to 2025-06-15.
 from __future__ import annotations
 
 import dataclasses
+import enum
+import math
 import shutil
 import subprocess
 import sys
@@ -28,6 +30,7 @@ import time
 from contextlib import ExitStack
 from datetime import UTC
 from datetime import datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING
 from typing import Any
@@ -46,6 +49,7 @@ import canon_trading.ledger
 from canon_trading.ledger import DAY_NS
 from canon_trading.ledger import FAILED
 from canon_trading.ledger import IDLE
+from canon_trading.ledger import NOT_RUN
 from canon_trading.ledger import OUTCOME
 from canon_trading.ledger import SAMPLES
 from canon_trading.ledger import TRADED
@@ -57,6 +61,7 @@ from canon_trading.ledger import create_ledger_study
 from canon_trading.ledger import current_sample
 from canon_trading.ledger import data_digest
 from canon_trading.ledger import default_ledger_path
+from canon_trading.ledger import mark_not_run
 from canon_trading.ledger import move_sample
 from canon_trading.ledger import open_study
 from canon_trading.ledger import record_trial
@@ -649,8 +654,16 @@ def test_an_error_after_the_trial_is_asked_for_is_told_failed(
         record_trial(study, tmp_path / "catalog", [strategy()], starting_balances=BALANCES)
 
     [trial] = study.trials
-    assert (trial.state, trial.user_attrs[OUTCOME]) == (TrialState.FAIL, FAILED)
+    assert trial.state == TrialState.FAIL
     assert trial.user_attrs["error"] == "OSError: database is locked"
+    if failing == "outcome":
+        assert trial.user_attrs[OUTCOME] == FAILED
+    else:
+        # No key was written, so no run started: no outcome, which would show one (ADR 0053
+        # term 3), and the record is cleared as one that ran nothing.
+        assert OUTCOME not in trial.user_attrs
+        mark_not_run(study, trial.number)
+        assert study.user_attrs[NOT_RUN] == [trial.number]
 
 
 def test_an_interrupt_during_the_run_is_told_failed(
@@ -1098,3 +1111,142 @@ def test_a_catalog_swapped_between_the_check_and_its_query_is_refused(
     monkeypatch.undo()
 
     assert study.trials == []
+
+
+# The fourth review of the gate, 2026-11-10: each test failed before its fix.
+
+
+def test_two_marks_at_once_are_both_kept(
+    tmp_path: Path, stack: ExitStack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two handles marking two keyless records both returned, and one mark was lost: each wrote
+    back the `not_run` list it had read."""
+    study = new_study(stack, tmp_path, "marking")
+    numbers = [study.ask().number for _ in "ab"]
+    handles = [stack.enter_context(open_study("marking", tmp_path / "trials.db")) for _ in "ab"]
+    real = optuna.Study.set_user_attr
+
+    def slow_first(self: optuna.Study, key: str, value: object) -> None:
+        if key == NOT_RUN and threading.current_thread().name == "first":
+            time.sleep(0.5)  # between reading the marks and writing the new list
+        real(self, key, value)
+
+    monkeypatch.setattr(optuna.Study, "set_user_attr", slow_first)
+    errors: list[BaseException] = []
+
+    def mark(handle: optuna.Study, number: int) -> None:
+        try:
+            mark_not_run(handle, number)
+        except BaseException as error:  # noqa: BLE001, reported below
+            errors.append(error)
+
+    first = threading.Thread(target=mark, args=(handles[0], numbers[0]), name="first")
+    second = threading.Thread(target=mark, args=(handles[1], numbers[1]), name="second")
+    first.start()
+    time.sleep(0.1)
+    second.start()
+    first.join(10)
+    second.join(10)
+    monkeypatch.undo()
+
+    assert errors == []
+    reopened = stack.enter_context(open_study("marking", tmp_path / "trials.db"))
+    assert reopened.user_attrs[NOT_RUN] == numbers
+
+
+def test_a_trial_is_recorded_in_its_own_trial_not_one_from_optuna_s_queue(
+    alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack
+) -> None:
+    """`Study.ask` takes the oldest queued trial, numbered below records already made, where the
+    ranking reads a higher number as a later record; the queued one is told FAIL and left keyless."""
+    alpaca_bars.write(tmp_path / "catalog")
+    study = new_study(stack, tmp_path, "queued")
+    study.enqueue_trial({"fast": 5})
+
+    recorded = record_trial(study, tmp_path / "catalog", [strategy()], starting_balances=BALANCES)
+
+    queued, own = study.trials
+    assert (recorded.number, own.user_attrs[OUTCOME]) == (1, TRADED)
+    assert (queued.state, queued.user_attrs) == (
+        TrialState.FAIL,
+        {"error": "taken from Optuna's queue by record_trial, which runs only in its own trial"},
+    )
+    mark_not_run(study, queued.number)
+    assert study.user_attrs[NOT_RUN] == [queued.number]
+
+
+def test_a_failure_whose_record_cannot_be_read_still_raises_the_run_s_error(
+    alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A storage error reading the trial back replaced the run's own error, with no note."""
+    alpaca_bars.write(tmp_path / "catalog")
+    study = new_study(stack, tmp_path, "unreadable")
+
+    def engine_error(*_: object) -> None:
+        raise RuntimeError("engine error")
+
+    real = optuna.Study.get_trials
+    calls: list[int] = []
+
+    def locked_after_the_run(self: optuna.Study, *args: Any, **kwargs: Any) -> object:
+        if calls:
+            raise OSError("database is locked")
+        return real(self, *args, **kwargs)
+
+    def run_then_lock(*args: object) -> None:
+        calls.append(1)
+        engine_error()
+
+    monkeypatch.setattr(canon_trading.ledger, "run_backtest_config", run_then_lock)
+    monkeypatch.setattr(optuna.Study, "get_trials", locked_after_the_run)
+    with pytest.raises(RuntimeError, match="engine error") as raised:
+        record_trial(study, tmp_path / "catalog", [strategy()], starting_balances=BALANCES)
+    monkeypatch.undo()
+
+    assert any("could not be told FAIL" in note for note in raised.value.__notes__)
+
+
+class _Mode(enum.IntEnum):
+    LIVE = 1
+
+
+class _Venue(enum.StrEnum):
+    LIVE = "live"
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        pytest.param(_Mode.LIVE, id="IntEnum"),
+        pytest.param(_Venue.LIVE, id="StrEnum"),
+        pytest.param({math.nan: 1}, id="NaN key"),
+        pytest.param({math.inf: 1}, id="infinite key"),
+        pytest.param({Decimal("Infinity"): 1}, id="infinite decimal key"),
+        pytest.param(Decimal("NaN"), id="decimal NaN"),
+        pytest.param(Decimal("sNaN"), id="signalling decimal NaN"),
+    ],
+)
+def test_a_value_keyed_by_what_it_is_not_is_refused(extra: object) -> None:
+    """An IntEnum or StrEnum was keyed by its value, against "enums by name", and a NaN dict key
+    became the text "nan", past the canonical JSON's refusal of NaN."""
+    config = strategy()
+    setattr(config, "extra", extra)  # noqa: B010, a field the class does not declare
+
+    with pytest.raises(TypeError, match="no stable text form"):
+        trial_config([config], starting_balances=BALANCES)
+
+
+def test_a_waiting_trial_added_with_attributes_is_not_recorded_in(
+    alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack
+) -> None:
+    """A `WAITING` trial added through `Study.add_trial` carries no `fixed_params`, and its own
+    attributes would have stayed on the record `record_trial` wrote into it."""
+    alpaca_bars.write(tmp_path / "catalog")
+    study = new_study(stack, tmp_path, "added")
+    study.add_trial(optuna.trial.create_trial(state=TrialState.WAITING, user_attrs={OUTCOME: IDLE}))
+
+    recorded = record_trial(study, tmp_path / "catalog", [strategy()], starting_balances=BALANCES)
+
+    added, own = study.trials
+    assert recorded.number == own.number == 1
+    assert added.state == TrialState.FAIL and "config_key" not in added.user_attrs

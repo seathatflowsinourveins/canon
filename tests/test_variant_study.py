@@ -14,11 +14,13 @@ from __future__ import annotations
 import fcntl
 from datetime import datetime
 from typing import TYPE_CHECKING
+from typing import Any
 
 import optuna
 import pytest
 from nautilus_trader.model import Quantity
 from optuna.exceptions import DuplicatedStudyError
+from optuna.trial import TrialState
 
 import canon_trading.ledger
 from canon_trading.ledger import IDLE
@@ -36,6 +38,7 @@ from canon_trading.variant_study import SYMBOLS
 from canon_trading.variant_study import WINDOW_END
 from canon_trading.variant_study import WINDOW_START
 from canon_trading.variant_study import bar_type
+from canon_trading.variant_study import describe
 from canon_trading.variant_study import grid
 from canon_trading.variant_study import key_of
 from canon_trading.variant_study import legend
@@ -303,3 +306,110 @@ def test_a_completed_record_with_no_sample_number_is_not_a_run_of_its_key(
     assert len(recorded.recorded) == 2
     assert isinstance(outcome, RankingStopped)
     assert "not a sample number of the study" in str(outcome)
+
+
+# The fourth review of the gate, 2026-11-10: each test failed before its fix.
+
+
+def test_a_study_short_of_its_plan_is_not_ranked(alpaca_bars: AlpacaBars, tmp_path: Path) -> None:
+    """A pass stopped after three of the plan's keys left a study `--rank-only` passed at N = 3,
+    short of the plan's N, which the deflated Sharpe ratio corrects for."""
+    write_both(alpaca_bars, tmp_path / "catalog")
+    configs = grid(periods=SHORT)
+    ledger = tmp_path / "trials.db"
+    run_study(
+        tmp_path / "catalog",
+        name="s",
+        ledger_path=ledger,
+        configs=configs[:3],
+        start=START,
+        end=END,
+        create=True,
+    )
+
+    recorded, outcome = run_study(
+        tmp_path / "catalog",
+        name="s",
+        ledger_path=ledger,
+        configs=configs,
+        start=START,
+        end=END,
+        rank_only=True,
+    )
+
+    assert recorded is None
+    assert isinstance(outcome, RankingStopped), outcome
+    assert f"{key_of(configs[3])} ({describe(configs[3])}): planned but never recorded" in str(
+        outcome
+    )
+
+
+def test_a_failure_that_cannot_be_told_stops_the_pass(
+    alpaca_bars: AlpacaBars, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An engine error whose FAIL could not be written left the record RUNNING, and the pass went
+    on with the storage error unreported."""
+    write_both(alpaca_bars, tmp_path / "catalog")
+    configs = grid(periods=SHORT)
+
+    def engine_error(*_: object) -> BacktestRun:
+        raise RuntimeError("engine error")
+
+    real_tell = optuna.Study.tell
+
+    def refused(self: optuna.Study, *args: Any, **kwargs: Any) -> object:
+        if kwargs.get("state") == TrialState.FAIL:
+            raise OSError("database is locked")
+        return real_tell(self, *args, **kwargs)
+
+    monkeypatch.setattr(canon_trading.ledger, "run_backtest_config", engine_error)
+    monkeypatch.setattr(optuna.Study, "tell", refused)
+    with pytest.raises(RuntimeError, match="engine error") as stopped:
+        run_study(
+            tmp_path / "catalog",
+            name="s",
+            ledger_path=tmp_path / "trials.db",
+            configs=configs,
+            start=START,
+            end=END,
+            create=True,
+        )
+    monkeypatch.undo()
+
+    assert any("could not be told FAIL" in note for note in stopped.value.__notes__)
+    with open_study("s", tmp_path / "trials.db") as study:
+        assert [t.state for t in study.trials] == [TrialState.RUNNING]
+
+
+def test_a_key_of_another_writer_s_form_does_not_crash_the_plan_check(
+    alpaca_bars: AlpacaBars, tmp_path: Path
+) -> None:
+    """A list as `config_key` raised TypeError (unhashable) before `rank` could name it."""
+    write_both(alpaca_bars, tmp_path / "catalog")
+    configs = grid(periods=SHORT)
+    ledger = tmp_path / "trials.db"
+    run_study(
+        tmp_path / "catalog",
+        name="s",
+        ledger_path=ledger,
+        configs=configs,
+        start=START,
+        end=END,
+        create=True,
+    )
+    with open_study("s", ledger) as study:
+        odd = study.ask()
+        odd.set_user_attr("config_key", ["x"])
+
+    _, outcome = run_study(
+        tmp_path / "catalog",
+        name="s",
+        ledger_path=ledger,
+        configs=configs,
+        start=START,
+        end=END,
+        rank_only=True,
+    )
+
+    assert isinstance(outcome, RankingStopped), outcome
+    assert f"#{odd.number} (running) has no config key" in str(outcome)

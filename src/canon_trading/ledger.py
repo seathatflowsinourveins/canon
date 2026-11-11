@@ -44,8 +44,10 @@ optimisation, and ADR 0035 keeps `RDBStorage` on SQLite for the reasons it gives
 The same lock serialises moving a study's sample (ADR 0041 term 5), which reads the `samples` list
 and writes it back: Optuna's `Study.set_user_attr` replaces a study attribute whole
 (`RDBStorage.set_study_user_attr`, 5.0.0) and offers no compare-and-set, so two moves without the lock
-both took the next number and one was lost. A move needs the ledger's file to name the lock, so it
-takes only a study `create_ledger_study` or `open_study` opened, which the module keeps a weak map of.
+both took the next number and one was lost. Marking a record not run (`mark_not_run`) reads and
+writes the `not_run` list the same way, and takes the same lock: two marks at once each kept only
+their own number. A move or a mark needs the ledger's file to name the lock, so each takes only a
+study `create_ledger_study` or `open_study` opened, which the module keeps a weak map of.
 
 A study is created in two writes, its name and then its sample, under the creation lock. A creation
 interrupted between them leaves a name with no sample and no trial. The next `create_ledger_study` of
@@ -67,6 +69,7 @@ sample. The two are compared by their data digest, so the check and the run agre
 
 from __future__ import annotations
 
+import enum
 import fcntl
 import hashlib
 import json
@@ -335,17 +338,22 @@ def move_sample(
     `open_study` raises `ValueError`: its lock cannot be named.
     """
     first, last = _range(start, end)
-    path = _OPENED.get(study)
-    if path is None:
-        raise ValueError(
-            f"study {study.study_name!r} was not opened by open_study or create_ledger_study, so "
-            "the ledger's lock cannot be held to move its sample; open it with open_study",
-        )
-    with _ledger_lock(path):
+    with _ledger_lock(_opened_ledger(study, "move its sample")):
         history = samples(study)
         sample = Sample(history[-1].number + 1, first, last)
         study.set_user_attr(SAMPLES, [*map(_sample_attr, history), _sample_attr(sample)])
     return sample
+
+
+def _opened_ledger(study: optuna.Study, to: str) -> Path:
+    """The ledger file of `study`, for its lock, or `ValueError` if the ledger did not open it."""
+    path = _OPENED.get(study)
+    if path is None:
+        raise ValueError(
+            f"study {study.study_name!r} was not opened by open_study or create_ledger_study, so "
+            f"the ledger's lock cannot be held to {to}; open it with open_study",
+        )
+    return path
 
 
 def _range(start: int | str | pd.Timestamp, end: int | str | pd.Timestamp) -> tuple[int, int]:
@@ -378,9 +386,21 @@ def _canonical(value: object) -> Any:
     prints with its precision, which is not normalised away: an order size of `10.0` is refused by an
     instrument that takes whole shares, where `10` runs, so the two are different configurations.
     """
+    if isinstance(value, enum.Enum):
+        # An `IntEnum` or `StrEnum` is an `int` or `str` too, and would be keyed by its value, where
+        # ADR 0053 term 2 keys enums by name. NautilusTrader's enums are not Python enums (pyo3
+        # classes at the pin) and print by name below; a Python enum is refused.
+        raise TypeError(
+            f"{type(value).__name__} {value!r} has no stable text form for a config key"
+        )
+    if isinstance(value, float) and not math.isfinite(value):
+        # Refused here, not left to `json.dumps`: as a dict key it would become the text "nan".
+        raise TypeError(f"float {value!r} has no stable text form for a config key")
     if value is None or isinstance(value, bool | int | float | str):
-        return value  # `json.dumps` writes a float by `repr` and refuses NaN and infinities
+        return value  # `json.dumps` writes a float by `repr`
     if isinstance(value, Decimal):
+        if not value.is_finite():  # NaN, sNaN and infinities print as text json.dumps would take
+            raise TypeError(f"Decimal {value!r} has no stable text form for a config key")
         text = format(value.normalize(), "f")
         return "0" if text == "-0" else text
     if isinstance(value, list | tuple):
@@ -546,7 +566,7 @@ def record_trial(
     if bar_types != config["data"]["bar_types"]:
         raise RuntimeError(f"the run loads {bar_types}, not the bar types its key names")
 
-    trial = study.ask()
+    trial = _own_trial(study)
     try:
         # The key first, so the shortest stretch of a record has none; the run starts only after it.
         trial.set_user_attr("config_key", key)
@@ -596,6 +616,47 @@ def record_trial(
     return RecordedTrial(number=trial.number, config_key=key, outcome=outcome, run=run)
 
 
+def _own_trial(study: optuna.Study) -> optuna.Trial:
+    """A trial `Study.ask` creates, never one it takes from Optuna's queue of `WAITING` trials.
+
+    `Study.ask` takes the oldest `WAITING` trial before it creates one (`Study._pop_waiting_trial_id`,
+    Optuna 5.0.0), and such a trial holds another writer's parameters and attributes, and a number
+    below records already made, where the ranking reads a higher number as a later record (ADR 0035
+    term 5). A taken one is told `FAIL` at once, with no key and no outcome, so it shows no run and
+    `mark_not_run` clears it, and the next is asked for. A trial is taken from the queue if it was
+    `WAITING` before `ask`, or if it holds anything a trial `ask` creates does not: a user or system
+    attribute (`Study.enqueue_trial` writes `fixed_params` on every trial it queues), a parameter or
+    an intermediate value. Only the `WAITING` and `RUNNING` trials are read, not every series. An
+    error reading the trial back tells it `FAIL`, as `record_trial` tells an error after `ask`.
+    """
+    while True:
+        queued = {t.number for t in study.get_trials(deepcopy=False, states=(TrialState.WAITING,))}
+        trial = study.ask()
+        try:
+            [frozen] = [
+                t
+                for t in study.get_trials(deepcopy=False, states=(TrialState.RUNNING,))
+                if t.number == trial.number
+            ]
+        except BaseException as error:
+            _tell_failed(study, trial, error)
+            raise
+        if trial.number not in queued and not (
+            frozen.user_attrs
+            or frozen.system_attrs
+            or frozen.distributions
+            or frozen.intermediate_values
+        ):
+            return trial
+        try:
+            trial.set_user_attr(
+                "error",
+                "taken from Optuna's queue by record_trial, which runs only in its own trial",
+            )
+        finally:
+            study.tell(trial, state=TrialState.FAIL)
+
+
 def _in_order(bars: Sequence[Bar]) -> list[Bar]:
     """`bars` in a total order: bars that tie on both times by their text (ADR 0053 term 1)."""
     return sorted(bars, key=lambda bar: (str(bar.bar_type), bar.ts_init, bar.ts_event, str(bar)))
@@ -606,31 +667,52 @@ def mark_not_run(study: optuna.Study, number: int) -> None:
 
     `record_trial` writes the key before it starts a run, so a record without one ran nothing: it is
     what a process killed between `ask` and that write leaves. The record is kept; a `RUNNING` one is
-    told `FAIL`, through `Study.tell`, which takes a trial number. Its number joins the study user
-    attribute `not_run`, and the ranking leaves it out of N. A record that has a key is refused, and
-    so is one that shows a run (`ran_something`), a result told by a writer other than `record_trial`
-    included: a trial of an unknown configuration, which nothing clears.
-    Use it only on a record whose process is gone: a live one would have its run told `FAIL`.
+    told `FAIL`, through `Study.tell`, which takes a trial number. A `WAITING` one, which another
+    writer queued (`Study.enqueue_trial`) and never started, is left `WAITING`: Optuna 5.0.0 tells
+    only a `RUNNING` trial (`study/_tell.py`), and its one public way out of `WAITING` is `Study.ask`,
+    which takes the oldest queued trial (`Study._pop_waiting_trial_id`); the storage that could set
+    its state "is not supposed to be directly accessed by library users" (`storages/_base.py`). Its
+    number joins the study user attribute `not_run`, and the ranking leaves it out of N while it is
+    `FAIL` or `WAITING`; one a later `ask` started stops the ranking again. A record that has a key is
+    refused, and so is one that shows a run (`ran_something`), a result told by a writer other than
+    `record_trial` included: a trial of an unknown configuration, which nothing clears.
+    The check, the `tell` and the `not_run` list are read and written under the ledger's lock (module
+    header), so two marks at once are both kept; a study not opened by `create_ledger_study` or
+    `open_study` raises `ValueError`. Use it only on a record whose process is gone: a live one would
+    have its run told `FAIL`.
     """
-    found = [trial for trial in study.get_trials(deepcopy=False) if trial.number == number]
-    if not found:
-        raise LookupError(f"study {study.study_name!r} has no trial #{number}")
-    [trial] = found
-    if has_key(trial):
-        raise ValueError(
-            f"trial #{number} has config key {trial.user_attrs['config_key']}: it was tried, and only"
-            " a later record of that key resolves it",
-        )
-    if ran_something(trial):
-        raise ValueError(
-            f"trial #{number} has no config key but shows a run (outcome "
-            f"{trial.user_attrs.get(OUTCOME)!r}): it is a trial of an unknown configuration",
-        )
-    if not trial.state.is_finished():
-        study.tell(number, state=TrialState.FAIL)
-    marked = study.user_attrs.get(NOT_RUN, [])
-    if number not in marked:
-        study.set_user_attr(NOT_RUN, sorted([*marked, number]))
+    with _ledger_lock(_opened_ledger(study, "mark a trial not run")):
+        found = [trial for trial in study.get_trials(deepcopy=False) if trial.number == number]
+        if not found:
+            raise LookupError(f"study {study.study_name!r} has no trial #{number}")
+        [trial] = found
+        if has_key(trial):
+            raise ValueError(
+                f"trial #{number} has config key {trial.user_attrs['config_key']}: it was tried, and"
+                " only a later record of that key resolves it",
+            )
+        if ran_something(trial):
+            raise ValueError(
+                f"trial #{number} has no config key but shows a run (outcome "
+                f"{trial.user_attrs.get(OUTCOME)!r}): it is a trial of an unknown configuration",
+            )
+        marked = study.user_attrs.get(NOT_RUN, [])
+        if not is_not_run_list(marked):
+            raise ValueError(
+                f"study user attribute {NOT_RUN} is {marked!r}, not a list of trial numbers in the "
+                "form mark_not_run writes; another writer left it",
+            )
+        if trial.state == TrialState.RUNNING:
+            study.tell(number, state=TrialState.FAIL)
+        if number not in marked:
+            study.set_user_attr(NOT_RUN, sorted([*marked, number]))
+
+
+def is_not_run_list(marked: object) -> bool:
+    """Whether `marked` is a `not_run` list as `mark_not_run` writes it: trial numbers, no `bool`."""
+    return isinstance(marked, list) and all(
+        isinstance(number, int) and not isinstance(number, bool) for number in marked
+    )
 
 
 def has_key(trial: FrozenTrial) -> bool:
@@ -640,21 +722,35 @@ def has_key(trial: FrozenTrial) -> bool:
 
 
 def ran_something(trial: FrozenTrial) -> bool:
-    """Whether `trial` shows a run: an outcome of traded or idle, returns or session days, or a result.
+    """Whether `trial` shows a run: an outcome, returns or session days, or a result (ADR 0053 term 3).
 
-    A result is what Optuna keeps of an evaluation (`optuna/trial/_state.py` and `_frozen.py` at
-    5.0.0): the state `COMPLETE` or `PRUNED`, a value told, or an intermediate value reported. A
-    writer that knows nothing of the ledger's attributes, such as `Study.optimize` or a bare `tell`,
-    leaves one; `record_trial` never leaves a keyless record with any of them.
+    Any outcome counts, `failed` too: `record_trial` writes one only on a record that has its key,
+    so a keyless record with an outcome came from another writer. An evaluation is
+    `shows_an_evaluation`'s.
     """
     attrs = trial.user_attrs
     return (
-        attrs.get(OUTCOME) in (TRADED, IDLE)
+        OUTCOME in attrs
         or "returns_series" in attrs
         or "session_days" in attrs
-        or trial.state in (TrialState.COMPLETE, TrialState.PRUNED)
+        or shows_an_evaluation(trial)
+    )
+
+
+def shows_an_evaluation(trial: FrozenTrial) -> bool:
+    """Whether Optuna keeps an evaluation of `trial`: a result, or a parameter it suggested.
+
+    A result is the state `COMPLETE` or `PRUNED`, a value told, or an intermediate value reported; a
+    suggested parameter is in `distributions` (`optuna/trial/_state.py` and `_frozen.py` at 5.0.0).
+    `Study.optimize` leaves a parameter on a trial whose objective raised or returned NaN, which it
+    tells `FAIL` with no value (`study/_tell.py`). `record_trial` suggests no parameter, reports no
+    intermediate value and tells a value only after outcome `traded`.
+    """
+    return (
+        trial.state in (TrialState.COMPLETE, TrialState.PRUNED)
         or trial.values is not None
         or bool(trial.intermediate_values)
+        or bool(trial.distributions)
     )
 
 
@@ -662,15 +758,20 @@ def _tell_failed(study: optuna.Study, trial: optuna.Trial, error: BaseException)
     """Tell `trial` `FAIL` with outcome `failed`; if that cannot be written, say so on `error`.
 
     A trial already told, as when an interrupt lands just after its `tell`, is left as it is, and the
-    note says so.
+    note says so. A trial whose key was never written started no run, so it is told `FAIL` with its
+    error and no outcome: an outcome on a keyless record shows a run (ADR 0053 term 3), and
+    `mark_not_run` clears this one.
     """
-    [frozen] = [t for t in study.get_trials(deepcopy=False) if t.number == trial.number]
-    if frozen.state.is_finished():
-        error.add_note(f"trial #{trial.number} was already told {frozen.state.name}; left as it is")
-        return
     try:
+        [frozen] = [t for t in study.get_trials(deepcopy=False) if t.number == trial.number]
+        if frozen.state.is_finished():
+            error.add_note(
+                f"trial #{trial.number} was already told {frozen.state.name}; left as it is"
+            )
+            return
         trial.set_user_attr("error", "".join(traceback.format_exception_only(error)).strip())
-        trial.set_user_attr(OUTCOME, FAILED)
+        if has_key(frozen):
+            trial.set_user_attr(OUTCOME, FAILED)
         study.tell(trial, state=TrialState.FAIL)
     except Exception as recording:  # noqa: BLE001, the run's own error is the one raised
         error.add_note(

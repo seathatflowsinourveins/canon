@@ -134,13 +134,26 @@ def session_sharpe(series: pd.Series) -> float:
     return float(_portfolio(series).sharpe_ratio)
 
 
+NS_RANGE = range(2**63)
+"""Nanoseconds both NautilusTrader and pandas hold: `UnixNanos` wraps a `u64` (`crates/core/src/nanos.rs`
+at the pinned commit), and a pandas `Timestamp` holds at most 2**63 - 1 (-2**63 is `NaT`)."""
+
+_MISSING = object()
+
+
 def is_ns_text(value: object) -> bool:
-    """Whether `value` is a whole number of nanoseconds as `record_trial` writes it, `str(int)`."""
+    """Whether `value` is a whole number of nanoseconds as `record_trial` writes it, `str(int)`.
+
+    The number is a timestamp, so it must lie in `NS_RANGE`. The length is checked before `int`
+    reads the text: Python refuses to convert a text of more than 4,300 digits, with `ValueError`.
+    """
     return (
         isinstance(value, str)
         and value.isascii()
-        and value.removeprefix("-").isdecimal()
+        and 0 < len(value) <= 19
+        and value.isdecimal()
         and str(int(value)) == value
+        and int(value) in NS_RANGE
     )
 
 
@@ -162,19 +175,17 @@ def _check_shape(
         raise ReturnsRejected(f"{name}: returns_series is {type(returns).__name__}, not a mapping")
     if not isinstance(session_days, list):
         raise ReturnsRejected(f"{name}: session_days is {type(session_days).__name__}, not a list")
-    bad_key = next((key for key in returns if not is_ns_text(key)), None)
-    if bad_key is not None:
+    bad_key = next((key for key in returns if not is_ns_text(key)), _MISSING)
+    if bad_key is not _MISSING:
         raise ReturnsRejected(f"{name}: returns_series key {bad_key!r} is not nanoseconds as text")
-    bad = next(
-        (key for key, value in returns.items() if not _is_number(value)),
-        None,
-    )
-    if bad is not None:
+    bad = next((key for key, value in returns.items() if not _is_number(value)), _MISSING)
+    if bad is not _MISSING:
         raise ReturnsRejected(
             f"{name}: returns_series value {returns[bad]!r} on {bad} is not a number"
         )
-    bad_day = next((day for day in session_days if not is_ns_text(day)), None)
-    if bad_day is not None:
+    # A sentinel no JSON value can be: a JSON null in the list is a day this refuses.
+    bad_day = next((day for day in session_days if not is_ns_text(day)), _MISSING)
+    if bad_day is not _MISSING:
         raise ReturnsRejected(f"{name}: session day {bad_day!r} is not nanoseconds as text")
     return returns, session_days
 
@@ -186,7 +197,8 @@ def returns_matrix(series: Sequence[pd.Series]) -> pd.DataFrame:
     named, with how many it lacks and its first and last day, so one stop lists every such trial.
     """
     names = [s.name for s in series]
-    if not series or len(set(names)) != len(names):
+    # skfolio names each column by `str` of the name, so names distinct only by type collide.
+    if not series or len({str(name) for name in names}) != len(names):
         raise ValueError("returns_matrix takes one or more series with distinct names")
     not_finite = [str(s.name) for s in series if not np.isfinite(s.to_numpy(dtype=float)).all()]
     if not_finite:

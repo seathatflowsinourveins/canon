@@ -169,3 +169,15 @@ def test_a_session_day_with_no_return_is_refused() -> None:
         ReturnsRejected, match="a: no return on 1 of its 31 session days, the first 2025-04-10"
     ):
         daily_series("a", returns, sessions(*range(31)))
+
+
+def test_names_distinct_only_by_type_are_refused() -> None:
+    """skfolio names each column by `str`, so series named 1 and "1" became columns 1 and 1_1."""
+    index = pd.to_datetime([0, DAY_NS], unit="ns", utc=True)
+    one, other = (
+        pd.Series([0.01, 0.02], index=index, name=1),
+        pd.Series([0.01, 0.03], index=index, name="1"),
+    )
+
+    with pytest.raises(ValueError, match="distinct names"):
+        returns_matrix([one, other])

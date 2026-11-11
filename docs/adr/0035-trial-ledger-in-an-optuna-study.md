@@ -109,6 +109,11 @@ Who decided. The orchestrator chose option 3 and the terms under the owner's del
   (`tests/test_ledger.py`).
 * Records of one key that differ only in outcome stop the ranking in either order, and a report names
   only the pick's records that ran (`tests/test_ranking.py`).
+* A keyed record in a state and outcome `record_trial` never leaves stops for good, and no later
+  record resolves it (`test_a_keyed_record_with_a_result_and_no_outcome_stops_for_good`,
+  `test_a_record_that_ran_in_a_state_the_writer_never_tells_stops`); a trial queued in Optuna is
+  never recorded in (`test_a_trial_is_recorded_in_its_own_trial_not_one_from_optuna_s_queue`). Each
+  failed before its fix.
 
 ## Evidence
 
@@ -180,3 +185,14 @@ Read 2026-11-10. Fetched means read in this session as raw text or source; run m
   decision.
 * ADR 0041's key and data identity, and part of the reviews' sources cited above, moved to ADR 0053 on
   2026-11-10, with no change of decision; terms 3 to 6 point to ADR 0053 for them.
+* A fourth review of the gate, 2026-11-10, read only, by a second reader: a keyed `COMPLETE` record
+  with a value and no outcome was read as a failure, so a later traded record of its key passed and
+  the completed one was never checked. Term 5 resolves a record cut short as `record_trial` leaves
+  one, `RUNNING`, or `FAIL` with outcome `failed` or none; the ranking now stops for good on a keyed
+  record in any state and outcome `record_trial` never leaves, a result (`COMPLETE`, `PRUNED`, a
+  value or an intermediate value; Optuna 5.0.0 `trial/_state.py`, `bundled`) or a suggested
+  parameter among them. Its code review added that `Study.ask` takes the oldest queued `WAITING`
+  trial before it creates one (`study/study.py`, `bundled`), numbered below records already made,
+  where term 5 reads a higher number as later: `record_trial` now runs only in a trial `ask`
+  created, and tells a taken one `FAIL`, keyless. Each reproduced as a failing test. No change of
+  decision.

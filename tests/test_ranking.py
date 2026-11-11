@@ -831,3 +831,207 @@ def test_the_pick_s_trials_are_only_records_that_ran(study: optuna.Study) -> Non
     assert failed not in report.pick_trials
     assert report.pick_trials == (ran,)
     assert f"(trials {ran})" in report.summary()
+
+
+# The fourth review of the gate, 2026-11-10: each test failed before its fix.
+
+
+@pytest.mark.parametrize("result", ["complete", "pruned", "intermediate value"])
+def test_a_keyed_record_with_a_result_and_no_outcome_stops_for_good(
+    study: optuna.Study, result: str
+) -> None:
+    """Another writer's completed record of a key was read as a failure a later run resolves, so a
+    traded record of that key passed and the completed one was never checked."""
+    trial = study.ask()
+    trial.set_user_attr("config_key", "pick")
+    trial.set_user_attr("sample", 0)
+    if result == "complete":
+        study.tell(trial, 1.5)
+    elif result == "pruned":
+        study.tell(trial, state=TrialState.PRUNED)
+    else:
+        trial.report(1.5, step=0)
+        study.tell(trial, state=TrialState.FAIL)
+    write(study, "pick", PICK)
+    write(study, "second", SECOND)
+    write(study, "third", THIRD_CLOSE)
+
+    with pytest.raises(RankingStopped) as stopped:
+        rank(study)
+
+    assert re.search(
+        rf"pick: #{trial.number} \([a-z]+\) (shows a result Optuna keeps but no outcome "
+        r"record_trial writes|holds an intermediate value or a parameter)",
+        str(stopped.value),
+    ), stopped.value
+
+
+def test_returns_after_the_run_s_end_stop(study: optuna.Study) -> None:
+    """A record whose run ended at the sample's start carried 29 more days of returns and passed:
+    its returns and session days were checked against the sample, not against the run."""
+    numbers = [
+        write(study, key, returns, attrs={"backtest_end": DAY_0 + DAY_NS})
+        for key, returns in (("pick", PICK), ("second", SECOND), ("third", THIRD_CLOSE))
+    ]
+
+    with pytest.raises(RankingStopped) as stopped:
+        rank(study)
+
+    text = str(stopped.value)
+    for key, number in zip(("pick", "second", "third"), numbers, strict=True):
+        assert re.search(
+            rf"{key}: #{number} [^\n]*returns_series has a key on 2025-03-12, after its "
+            r"backtest_end \(29 in all\)",
+            text,
+        ), text
+
+
+@pytest.mark.parametrize(
+    ("days", "message"),
+    [
+        pytest.param([str(DAY_0), None], "session day None is not nanoseconds", id="null day"),
+        pytest.param(
+            [str(DAY_0), "1" + "0" * 30],
+            "session day '1000000000000000000000000000000' is not nanoseconds",
+            id="31-digit day",
+        ),
+        pytest.param([str(DAY_0), "1" * 5000], "is not nanoseconds as text", id="5000-digit day"),
+        pytest.param([str(DAY_0), str(2**63)], f"session day '{2**63}' is not", id="past int64"),
+        pytest.param([str(DAY_0), "-5"], "session day '-5' is not", id="negative"),
+    ],
+)
+def test_a_session_day_that_crashed_the_ranking_stops_naming_it(
+    study: optuna.Study, days: list[object], message: str
+) -> None:
+    """A JSON null in a list of days raised TypeError, a 31-digit day OverflowError, and one of
+    5,000 digits ValueError; a day past a 64-bit count of nanoseconds names no instant."""
+    write(study, "pick", PICK)
+    number = write(study, "odd", PICK[:1], attrs={"session_days": days})
+
+    with pytest.raises(RankingStopped) as stopped:
+        rank(study)
+
+    [line] = [line for line in str(stopped.value).splitlines() if line.startswith("* odd:")]
+    assert message in line and f"#{number}" in line, line
+
+
+def test_a_keyless_record_with_a_failed_outcome_shows_a_run(study: optuna.Study) -> None:
+    """ADR 0053 term 3: an outcome shows a run, and `failed` is an outcome. Marking it dropped a
+    trial of an unknown configuration from N, and the gate passed at N = 3."""
+    write(study, "pick", PICK)
+    write(study, "second", SECOND)
+    write(study, "third", THIRD_CLOSE)
+    trial = study.ask()
+    trial.set_user_attr(OUTCOME, FAILED)
+    study.tell(trial, state=TrialState.FAIL)
+
+    with pytest.raises(ValueError, match="shows a run"):
+        mark_not_run(study, trial.number)
+    assert "not_run" not in study.user_attrs
+    with pytest.raises(RankingStopped, match=rf"#{trial.number} \(fail\)[^\n]*shows a run"):
+        rank(study)
+
+
+def test_a_keyless_waiting_record_can_be_marked_not_run(study: optuna.Study) -> None:
+    """Optuna refuses to tell a WAITING trial, so the remedy the stop names always raised."""
+    write(study, "pick", PICK)
+    write(study, "second", SECOND)
+    write(study, "third", THIRD_CLOSE)
+    study.enqueue_trial({})
+    [waiting] = [t.number for t in study.trials if t.state == TrialState.WAITING]
+
+    with pytest.raises(RankingStopped, match=rf"mark_not_run\(study, {waiting}\) clears it"):
+        rank(study)
+    mark_not_run(study, waiting)
+
+    [trial] = [t for t in study.trials if t.number == waiting]
+    assert trial.state == TrialState.WAITING  # Optuna tells only a RUNNING trial
+    assert study.user_attrs["not_run"] == [waiting]
+    assert rank(study).n == 3
+
+    # Optuna's next `ask` takes the queued trial; started, it is no longer cleared by its mark.
+    assert study.ask().number == waiting
+    with pytest.raises(RankingStopped, match=rf"#{waiting} \(running\) has no config key"):
+        rank(study)
+    mark_not_run(study, waiting)
+    assert [t.state for t in study.trials if t.number == waiting] == [TrialState.FAIL]
+    assert rank(study).n == 3
+
+
+def test_a_trial_is_marked_not_run_only_on_a_study_the_ledger_opened(tmp_path: Path) -> None:
+    """The mark holds the ledger's lock, which only a study the ledger opened can name."""
+    bare = optuna.create_study(
+        study_name="bare", storage=f"sqlite:///{tmp_path / 'bare.db'}", direction="maximize"
+    )
+    bare.ask()
+
+    with pytest.raises(ValueError, match="open_study"):
+        mark_not_run(bare, 0)
+    assert "not_run" not in bare.user_attrs
+
+
+@pytest.mark.parametrize(
+    ("state", "outcome", "value"),
+    [
+        pytest.param(TrialState.PRUNED, TRADED, None, id="pruned, traded"),
+        pytest.param(TrialState.COMPLETE, IDLE, 0.5, id="complete, idle"),
+    ],
+)
+def test_a_record_that_ran_in_a_state_the_writer_never_tells_stops(
+    study: optuna.Study, state: TrialState, outcome: str, value: float | None
+) -> None:
+    """A keyed record that ran to the end in a state record_trial never leaves entered the matrix."""
+    write(study, "second", SECOND)
+    write(study, "third", THIRD_CLOSE)
+    trial = study.ask()
+    for name, attr in {
+        "config_key": "pick",
+        "sample": 0,
+        "run_config_id": "pick",
+        "backtest_start": DAY_0,
+        "backtest_end": END,
+        "returns_series": {str(DAY_0 + n * DAY_NS): r for n, r in enumerate(PICK)},
+        "session_days": [str(DAY_0 + n * DAY_NS) for n in range(T)],
+        "data_digest": {"bars of pick": hashlib.sha256(b"pick").hexdigest()},
+        OUTCOME: outcome,
+    }.items():
+        trial.set_user_attr(name, attr)
+    study.tell(trial, value, state=state) if value is not None else study.tell(trial, state=state)
+
+    with pytest.raises(RankingStopped, match=rf"pick: #{trial.number} [^\n]*was told {state.name}"):
+        rank(study)
+
+
+def test_a_keyless_record_with_a_suggested_parameter_shows_a_run(study: optuna.Study) -> None:
+    """Study.optimize tells FAIL, with no value, an objective that returned NaN; its parameter
+    shows the evaluation, and marking it dropped a tried configuration from N."""
+    write(study, "pick", PICK)
+    write(study, "second", SECOND)
+    write(study, "third", THIRD_CLOSE)
+    study.optimize(lambda trial: trial.suggest_int("fast", 2, 9) * math.nan, n_trials=1)
+    [tried] = [t.number for t in study.trials if t.params]
+
+    with pytest.raises(ValueError, match="shows a run"):
+        mark_not_run(study, tried)
+    with pytest.raises(RankingStopped, match=rf"#{tried} \(fail\)[^\n]*shows a run"):
+        rank(study)
+
+
+@pytest.mark.parametrize("marked", [[0, True], None, [None], "0"])
+def test_a_not_run_list_not_in_the_writers_shape_stops(study: optuna.Study, marked: object) -> None:
+    """`True` cleared trial #1, and `None` raised a bare TypeError."""
+    keyless = write(study, None, None, tell=False)
+    second = study.ask()  # #1, keyless and RUNNING
+    write(study, "pick", PICK)
+    write(study, "second", SECOND)
+    study.set_user_attr("not_run", marked)
+
+    with pytest.raises(RankingStopped) as stopped:
+        rank(study)
+
+    text = str(stopped.value)
+    assert f"not_run is {marked!r}, not a list of trial numbers" in text
+    assert f"#{second.number} (running) has no config key" in text
+    assert f"#{keyless} (running) has no config key" in text
+    with pytest.raises(ValueError, match="not a list of trial numbers"):
+        mark_not_run(study, second.number)
