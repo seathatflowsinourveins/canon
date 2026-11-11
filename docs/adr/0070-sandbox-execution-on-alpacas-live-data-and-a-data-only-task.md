@@ -32,8 +32,8 @@ cannot place an order.
 
 ## Decision Outcome
 
-Chosen: **option 2**, under the owner's delegation of 2026-11-10; option 1 serves until it is built, with
-the reading side of ADR 0069 (not yet written). Option 3 is not shown for paper keys (below). What is untested is UNVERIFIED.
+Chosen: **option 2**, under the owner's delegation of 2026-11-10; option 1 served until it was built
+(2026-11-11, Confirmation), after the reading side of ADR 0069. Option 3 is not shown for paper keys (below). What is untested is UNVERIFIED.
 
 **The sandbox at the pin.** `add_simulated_exec_client(name, SandboxExecutionClientFactory(),
 SandboxExecutionClientConfig(venue=...))` on a `LiveNode`, reachable from Python. The client matches in
@@ -57,8 +57,8 @@ and parallel strategies go in one node. A built-in subscribes with no params, so
 overnight it needs a strategy that names `boats`, one night's observation, not an entitlement (ADR 0055).
 
 **The pair, the lock and the trading host.** The data client authenticates with the paper pair, which
-reaches only `paper:test` and `paper:session` (ADR 0029, ADR 0044), so a sandbox run holds the paper lock
-today. Its instrument provider builds a `TradingClient` for the asset reads (`providers.py`), and
+reached only `paper:test` and `paper:session` when this was decided (ADR 0029, ADR 0044), so a sandbox run
+then held the paper lock; `paper:data` now gives it account A's pair on the terms below. Its instrument provider builds a `TradingClient` for the asset reads (`providers.py`), and
 `/v2/assets` is documented on the trading hosts only, so a data-only process holds a pair that can trade.
 
 **The data-only task's terms.**
@@ -67,8 +67,8 @@ today. Its instrument provider builds a `TradingClient` for the asset reads (`pr
    environment, as `paper:test` does (ADR 0029), and by no other route.
 2. It runs one named module, never a test runner over a path. Two modules are allowed; a third needs a
    new record:
-   * the sandbox node, which holds the stream lock ADR 0069 is to define (whether Alpaca's limit binds
-     per endpoint or per user is UNVERIFIED);
+   * the sandbox node, which holds the stream lock ADR 0069 defines (whether Alpaca's limit spans a
+     second paper account of one login is UNVERIFIED);
    * the historical quote loader ADR 0066 proposes, once built: REST reads only, no stream and so no stream lock, at a rate
      that leaves room for the windows' own data calls once that share is measured (UNVERIFIED until then).
 3. "Never places an order" fails closed in code, twice: a transport adapter refusing every method but GET
@@ -96,15 +96,51 @@ asked, and whether a `data`-only token reads `/v2/assets` is UNVERIFIED.
 ### Consequences
 
 * Good: live-data runs with no account and many strategies on one stream; the proof ran on `main`'s code.
-* Good: once built, a data-only process cannot send an order through this repository's clients: two
-  checks in code (UNVERIFIED until term 4's test runs).
+* Good: a data-only process cannot send an order through this repository's clients: two checks in code,
+  shown offline by term 4's test (Confirmation).
+* Bad: a sandbox run holds the stream lock for its whole run, up to an hour, and a window waits at most
+  900 s for that lock (ADR 0050), so a window that starts during a longer sandbox run fails placing
+  nothing. Runs by hand are chosen around the schedule until an unattended sandbox lane exists (ADR 0068).
 * Bad: the guard does not reach code that builds its own HTTP client with the pair.
 * Bad: the stream is one connection on many plans, so a sandbox node and a streaming paper test take turns; Alpaca's own
   rules are not simulated.
 
 ### Confirmation
 
-* When `paper:data` is built: its test (term 4) in `scripts/ci`; until then the task does not exist.
+* Built 2026-11-11, with term 4's test in `scripts/ci`:
+  * `mise run paper:data` reads account A's pair (service `canon-alpaca-paper`) into its own environment, sets
+    `CANON_ALPACA_DATA_ONLY=1`, and runs one module from the list `sandbox` (`canon_trading.sandbox_node`) and
+    `quotes`, which it refuses as not built yet (ADR 0066); mise refuses any other name before the script
+    runs. The sandbox node takes the stream lock after uv's sync, under a bounded deadline
+    (`scripts/test-lanes`, under mise, with a stand-in keychain and uv).
+  * Term 3: a `get_only` mode of `providers.TimeoutAdapter`, raising `MethodRefused` before anything is
+    sent; `with_http_timeout` keeps it once set and replaces an adapter mounted for any other prefix. The
+    data client's connect calls `require_get_only` on its historical client before its first request, and
+    the provider calls it on its own client each time it fetches it, before anything is sent. `sandbox_node` sets the mode itself, refuses to build outside it, and
+    after the build stops if an `AlpacaExecutionClient` exists (read from the collector: the node lists no
+    clients at the pin).
+  * Term 4 (`packages/canon-alpaca/tests/test_data_only.py`, `tests/test_sandbox_node.py`): submit (POST),
+    replace (PATCH), cancel and close (DELETE) through the provider's client, fetched twice, each refused
+    with nothing reaching requests' transport, while a GET goes out; a node built with the Alpaca execution
+    client refused. Each behaviour test failed with its guard removed (run); the enumeration tests are
+    checked instead on made-up source, where an aliased import and an unguarded client are found (run).
+  * The build condition: the test enumerates, by name in the source, alpaca-py 0.45.0's `Session()` constructions (one, in
+    `RESTClient.__init__`), its `_session` assignments (the same one), its module-level requests calls and
+    other HTTP libraries (none), and its `RESTClient` subclasses (eight); and every REST client
+    construction in the adapter and `canon_trading` (four: the data client's, the execution client's, the
+    provider's and the window's account check's), each passed to `with_http_timeout`. A node in data-only
+    mode whose historical or provider client sends on a session the refusing adapter is not on (a
+    session replaced before the connect) does not start: the data client's connect fails and the node ends
+    with "readiness timeout while waiting for engine connections"; with both clients refusing it starts
+    (run, offline).
+  * `mise run paper:data sandbox --minutes 3`, 2026-11-11, 07:47:28 to 07:50:34 UTC, exit 0: every engine
+    client connected, the account was the sandbox's (`ALPACA-SANDBOX-001`), no request was refused, and the
+    tester placed no order, since a built-in streams IEX, which carries nothing overnight (ADR 0055).
+    That run was on a working tree before the review's fixes; the run on the commit that landed is the
+    next bullet. Fills on this task wait for a run in the regular session (UNVERIFIED until then).
+  * A limit of term 3's check: it reads each client's session once, at the connect or the fetch, so a
+    session an alpaca-py client replaced after that, which alpaca-py 0.45.0 never does (its one `_session`
+    assignment is in `RESTClient.__init__`), would not be checked again.
 * A condition on that build, since term 3 holds "fails closed" in one place, the adapter
   `with_http_timeout` mounts: its test enumerates every place the adapter, the provider and alpaca-py
   construct a REST client or a `requests.Session` (a library path that does not pass through
@@ -151,3 +187,9 @@ Read 2026-11-10. Fetched means read in this session as raw text or source; run m
   login" overstated; ADR 0066 is `proposed`; a third module needs a new record. All applied above.
 * Follow-up, 2026-11-11: the build's enumeration condition added to Confirmation; the owner's question
   dated.
+* alpaca-py 0.45.0 in `.venv` — `RESTClient._one_request` sends through `self._session.request`, and an
+  error other than `HTTPError` leaves its retry loop, so `MethodRefused` ends the call. Read and run,
+  2026-11-11.
+* NautilusTrader v2.0.0rc8 in `.venv` — `LiveNode` exposes no list of its clients; `nautilus_trader.adapters.sandbox`
+  is the example's import path at the pin; a data client whose connect fails leaves the hosted run ending
+  with "readiness timeout while waiting for engine connections". Run, 2026-11-11.

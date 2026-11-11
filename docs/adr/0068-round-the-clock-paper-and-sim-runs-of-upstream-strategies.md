@@ -90,7 +90,7 @@ quotes in the catalog (ADR 0066, `proposed`) and what a backtest is read against
 
 **Paper around the clock.** A paper window is a check of the stack, not a trial: ADR 0010 sends to paper
 only a pick that passed the gate, and no `MaCross` variant has (ADR 0052). The window harness (start flat,
-one share and `PositionCap`, the engine's limits, the account check after the stop; ADR 0044) runs
+one share and `PositionCap`, the engine's limits, ADR 0044; the account check after the stop, ADR 0060) runs
 `SessionMaCross` only. Proposal for the session lane, which holds these files: `WindowConfig` takes a
 strategy name from a fixed table (a built-in type and its config, or a Python strategy), `window_node`
 adds it beside the cap, `--strategy` reaches `session_window`, `paper:session` and `paper-session.sh`, the

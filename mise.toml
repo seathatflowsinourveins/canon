@@ -350,3 +350,75 @@ window() {
 }
 window
 '''
+
+# The data-only task (docs/adr/0070-sandbox-execution-on-alpacas-live-data-and-a-data-only-task.md): account A's pair, read as
+# paper:test reads it, into this task's environment only (ADR 0070 term 1), for one module from a fixed list
+# (term 2): `sandbox`, the sandbox node (canon_trading.sandbox_node), or `quotes`, the historical quote
+# loader ADR 0066 proposes, refused until it is built. A third needs a new record. CANON_ALPACA_DATA_ONLY=1 makes
+# every alpaca-py REST client canon_alpaca builds refuse every method but GET before sending, and the data
+# client refuse to connect if one would send another; the module sets it again and checks, after the build,
+# that no Alpaca execution client exists (term 3). It places nothing on account A, so it takes no account's
+# lock. The sandbox node streams, so it takes the login's stream lock on descriptor 7 after uv's sync, as a
+# window does, and holds it for its run: a window that finds the lock held for longer than its own wait fails
+# placing nothing (ADR 0050). deadline: the stream lock's wait, the start-up held to `sync`, the imports, the
+# longest run (sandbox_node.MAX_MINUTES) and its stop (sandbox_node.STOP_TIMEOUT_SECS); tests/test_sandbox_node.py
+# holds the sum. Unattended runs wait for NautilusTrader rc9 (ADR 0068); by hand: mise run paper:data sandbox.
+[tasks."paper:data"]
+description = "Run one listed data-only module with paper account A's pair, every request but GET refused"
+timeout = "90m"
+env.ALPACA_API_KEY = { value = "{{ exec(command='/usr/bin/timeout 30 /usr/bin/security find-generic-password -s canon-alpaca-paper -a ALPACA_API_KEY -w') }}", redact = true }
+env.ALPACA_SECRET_KEY = { value = "{{ exec(command='/usr/bin/timeout 30 /usr/bin/security find-generic-password -s canon-alpaca-paper -a ALPACA_SECRET_KEY -w') }}", redact = true }
+env.CANON_ALPACA_DATA_ONLY = "1"
+usage = '''
+arg "<module>" help="sandbox: the sandbox node on Alpaca's data (ADR 0070); quotes: the historical quote loader, not built yet (ADR 0066)" {
+  choices "sandbox" "quotes"
+}
+flag "--minutes <minutes>" help="how long the sandbox node runs, 1 to 60" default="10"
+'''
+run = '''
+deadline=5340
+sync=600
+lockwait=900
+start=$(/bin/date +%s)
+[ -n "$ALPACA_API_KEY" ] && [ -n "$ALPACA_SECRET_KEY" ] || { echo "paper:data: a keychain item of account A is empty; run: mise run paper:remove, then mise run paper:store" >&2; exit 1; }
+[ "${CANON_ALPACA_DATA_ONLY:-}" = 1 ] || { echo "paper:data: CANON_ALPACA_DATA_ONLY is not 1; nothing was run (ADR 0070)" >&2; exit 1; }
+case "${usage_module:-}" in
+  sandbox) module=canon_trading.sandbox_node ;;
+  quotes) echo "paper:data: quotes, the historical quote loader, is not built yet (ADR 0066); nothing was run" >&2; exit 1 ;;
+  *) echo "paper:data: no module named '${usage_module:-}'; the list is sandbox and quotes (ADR 0070)" >&2; exit 3 ;;
+esac
+tmp="$(/usr/bin/getconf DARWIN_USER_TEMP_DIR)" || tmp=""
+case "$tmp" in /*/) ;; *) echo "paper:data: the per-user temporary folder is not known (DARWIN_USER_TEMP_DIR gave '$tmp'), so there is no stream lock to take; nothing was run" >&2; exit 1 ;; esac
+# stream: the login's market-data stream lock (ADR 0069), on descriptor 7, as paper:session takes it
+stream() {
+  exec 7>>"${tmp}canon-alpaca-stream.lock"
+  /usr/bin/lockf -t "$lockwait" 7 || { echo "paper:data: the market-data stream lock stayed held for $lockwait s; nothing was run" >&2; exit 1; }
+}
+# bounded <secs> <command...>: as in paper:session (the note above paper:test)
+bounded() {
+  b=$1; shift; g=""
+  stop() { [ -z "$g" ] || kill -KILL -- "-$g" 2>/dev/null || kill -KILL "$g" 2>/dev/null; exit "$1"; }
+  trap 'stop 143' TERM; trap 'stop 129' HUP; trap 'stop 130' INT
+  /usr/bin/timeout -s KILL "$b" "$@" & g=$!
+  rc=0; wait "$g" || rc=$?
+  kill -KILL -- "-$g" 2>/dev/null || :
+  trap - TERM HUP INT
+  return "$rc"
+}
+data() {
+  # from a person's terminal uv runs in the terminal's process group, bounded by mise's `timeout`, as
+  # paper:test and paper:session run (the note above paper:test); the module bounds its own run too
+  if [ -t 0 ]; then
+    uv run --locked /usr/bin/true || exit 1
+    stream
+    exec uv run --locked python -m "$module" --minutes "${usage_minutes:-10}"
+  fi
+  bounded "$sync" uv run --locked /usr/bin/true \
+    || { echo "paper:data: the start-up (uv making the environment uv.lock's) failed or took over $sync s; nothing was run" >&2; exit 1; }
+  stream
+  left=$((deadline - ($(/bin/date +%s) - start)))
+  [ "$left" -gt 0 ] || { echo "paper:data: no time left before the deadline" >&2; exit 1; }
+  bounded "$left" uv run --locked python -m "$module" --minutes "${usage_minutes:-10}"
+}
+data
+'''

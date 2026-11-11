@@ -32,6 +32,11 @@ Known limits:
   attribute at the pin, and a client without it is refused.
 * Only active assets are loaded (alpaca-py `Asset.status`); an inactive one is refused, and so is a
   `status` filter other than `active`.
+* Data-only mode (`CANON_ALPACA_DATA_ONLY=1`, ADR 0070 term 3): the `TimeoutAdapter` that
+  `with_http_timeout` mounts refuses every method but GET before anything is sent, using requests' own
+  transport-adapter hook (`HTTPAdapter.send`), so a process that holds the paper pair to read data
+  cannot submit, replace, cancel or close through any client this package builds. It guards this
+  package's clients only, not other code that holds the pair.
 """
 
 from __future__ import annotations
@@ -71,6 +76,20 @@ if TYPE_CHECKING:
     from alpaca.common.types import RawData
     from nautilus_trader.config import InstrumentProviderConfig
 
+DATA_ONLY_ENV = "CANON_ALPACA_DATA_ONLY"
+"""Set to `1` by `mise run paper:data` and by the module it runs (ADR 0070): every REST client this package
+builds sends GET requests only."""
+
+
+def data_only() -> bool:
+    """Whether this process runs in data-only mode (`DATA_ONLY_ENV` is `1`)."""
+    return os.environ.get(DATA_ONLY_ENV) == "1"
+
+
+class MethodRefused(RuntimeError):
+    """A request other than GET in data-only mode, refused before it was sent (ADR 0070)."""
+
+
 CONNECT_TIMEOUT_SECS = 3.05
 """requests' "Timeouts" (Advanced Usage): "It's a good practice to set connect timeouts to slightly larger
 than a multiple of 3, which is the default TCP packet retransmission window"; its example is
@@ -87,11 +106,15 @@ class TimeoutAdapter(HTTPAdapter):
     It counts the requests each thread sends, so `counted` can tell how many attempts one alpaca-py call
     made: alpaca-py repeats a request answered 429 or 504 (`RESTClient._request`), and a 504 may have
     reached Alpaca. The count is per thread, and a call runs on one thread, so no other call touches it.
+
+    With `get_only`, every method but GET is refused with `MethodRefused` before anything is sent or
+    counted (data-only mode, ADR 0070).
     """
 
-    def __init__(self, timeout: tuple[float, float]) -> None:
+    def __init__(self, timeout: tuple[float, float], *, get_only: bool = False) -> None:
         super().__init__()
         self.timeout = timeout
+        self.get_only = get_only
         self._local = threading.local()
 
     @property
@@ -107,6 +130,11 @@ class TimeoutAdapter(HTTPAdapter):
 
     @override
     def send(self, request, stream=False, timeout=None, verify=True, cert=None, proxies=None):
+        if self.get_only and request.method != "GET":
+            raise MethodRefused(
+                f"data-only mode ({DATA_ONLY_ENV}=1): {request.method} {request.path_url} refused, "
+                "nothing was sent (ADR 0070)"
+            )
         self.record_send()
         return super().send(
             request,
@@ -128,7 +156,10 @@ def session_of(client: object) -> requests.Session | None:
 def with_http_timeout[C](client: C) -> C:
     """Mount a `TimeoutAdapter` with this package's (connect, read) timeout on an alpaca-py REST client's
     session for both `https://` and `http://`, unless that one adapter is already mounted on both, and
-    return the client. A `TimeoutAdapter` with another timeout, or on one scheme only, is replaced.
+    return the client. A `TimeoutAdapter` with another timeout, or on one scheme only, is replaced. In
+    data-only mode the adapter refuses every method but GET, and one that does not is replaced, as is any
+    adapter mounted for another prefix, which requests would pick for a longer matching URL; once refusing,
+    it stays so.
 
     Raises `TypeError` if the client holds no `requests.Session` at `_session`, so a client that would
     run without a timeout does not start.
@@ -141,21 +172,46 @@ def with_http_timeout[C](client: C) -> C:
         )
     timeout = (CONNECT_TIMEOUT_SECS, READ_TIMEOUT_SECS)
     mounted = timeout_adapter(client)
+    get_only = data_only() or (mounted is not None and mounted.get_only)
     if (
         mounted is None
         or mounted.timeout != timeout
+        or mounted.get_only != get_only
         or session.adapters.get("http://") is not mounted
+        or (get_only and any(a is not mounted for a in session.adapters.values()))
     ):
         # alpaca-py's session holds requests' two default adapters; they are closed, not kept. A client
-        # passed in with an adapter of its own loses that adapter's settings (ADR 0039).
-        for old in {
-            id(a): a for a in (session.adapters.get(p) for p in ("https://", "http://")) if a
-        }.values():
+        # passed in with an adapter of its own loses that adapter's settings (ADR 0039). In data-only mode
+        # an adapter for any other prefix goes too, so no request can bypass the refusal (ADR 0070).
+        prefixes = list(session.adapters) if get_only else ["https://", "http://"]
+        for old in {id(a): a for a in (session.adapters.get(p) for p in prefixes) if a}.values():
             old.close()
-        adapter = TimeoutAdapter(timeout)
+        for prefix in prefixes:
+            session.adapters.pop(prefix, None)
+        adapter = TimeoutAdapter(timeout, get_only=get_only)
         session.mount("https://", adapter)
         session.mount("http://", adapter)
     return client
+
+
+def require_get_only(*clients: object) -> None:
+    """In data-only mode, raise `MethodRefused` unless every adapter on each client's session is one
+    `TimeoutAdapter` that refuses every method but GET (ADR 0070); outside it, do nothing."""
+    if not data_only():
+        return
+    for client in clients:
+        session = session_of(client)
+        if session is None:
+            raise MethodRefused(
+                f"data-only mode ({DATA_ONLY_ENV}=1): {type(client).__name__} has no requests.Session at "
+                "_session, so its requests cannot be checked; refusing to start (ADR 0070)"
+            )
+        adapters = list(session.adapters.values())
+        if not adapters or not all(isinstance(a, TimeoutAdapter) and a.get_only for a in adapters):
+            raise MethodRefused(
+                f"data-only mode ({DATA_ONLY_ENV}=1): {type(client).__name__}'s session has an adapter "
+                "that would send a method other than GET; refusing to start (ADR 0070)"
+            )
 
 
 def timeout_adapter(client: object) -> TimeoutAdapter | None:
@@ -299,7 +355,9 @@ class AlpacaInstrumentProvider(InstrumentProvider):
         if self._assets_client is None:
             api_key, secret_key = credentials_from_env()
             self._assets_client = TradingClient(api_key=api_key, secret_key=secret_key, paper=True)
-        return with_http_timeout(self._assets_client)  # a client passed in too (ADR 0039)
+        client = with_http_timeout(self._assets_client)  # a client passed in too (ADR 0039)
+        require_get_only(client)  # in data-only mode, before anything is sent on it (ADR 0070)
+        return client
 
     @override
     async def load_all_async(self, filters: dict | None = None) -> None:

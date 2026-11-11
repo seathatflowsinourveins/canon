@@ -1662,6 +1662,42 @@ else
   mrun paper:remove windows extra; rc=$?
   check "mise run paper:remove windows extra: refused, nothing deleted" eval '[ "$rc" != 0 ] && [ ! -s "$KC/log" ]'
   rm -f "$KC"/find-*
+  # paper:data (ADR 0070), the whole task under mise: its env reads account A's pair from the stand-in
+  # security (made-up values), its locks are in a test folder, and uv is a stand-in that records what it was
+  # asked to run, the data-only flag it was given and whether the stream lock was held while it ran
+  DT="$MTP/mise-data"; mkdir -p "$DT/locks" "$DT/bin"
+  awk -v hdr='[tasks."paper:data"]' '$0 == hdr {t=1; print; next} /^\[tasks\./ {t=0} t' "$ROOT/mise.toml" \
+    | sed -e "s#/usr/bin/security#$KC/security#g" -e "s#\$(/usr/bin/getconf DARWIN_USER_TEMP_DIR)#$DT/locks/#" \
+          -e 's/^lockwait=[0-9]*$/lockwait=2/' > "$DT/mise.toml"
+  cat > "$DT/bin/uv" <<EOF
+#!/bin/bash
+case "\$*" in *" /usr/bin/true") exit 0 ;; esac
+/usr/bin/lockf -k -t 0 "$DT/locks/canon-alpaca-stream.lock" true 2>/dev/null; held=\$?
+printf 'args: %s\ndata-only: %s\nstream lock held: %s\n' "\$*" "\${CANON_ALPACA_DATA_ONLY:-}" "\$held" > "$DT/ran"
+EOF
+  chmod +x "$DT/bin/uv"
+  for a in ALPACA_API_KEY ALPACA_SECRET_KEY; do
+    echo 0 > "$KC/read-canon-alpaca-paper-$a"; echo "made-up-$a" > "$KC/value-canon-alpaca-paper-$a"
+  done
+  drun() { : > "$KC/log"; rm -f "$DT/ran"; (cd "$DT" && env -i HOME="$HOME" KC="$KC" MISE_CEILING_PATHS="$MTP" MISE_TRUSTED_CONFIG_PATHS="$DT" PATH="$DT/bin:/usr/bin:/bin" "$LMISE" run paper:data "$@") > "$DT/out" 2>&1 < /dev/null; }
+  check "the paper:data test folder holds that task alone, its locks moved and its stream wait shortened" \
+        eval '[ "$(grep -c "^\[tasks\." "$DT/mise.toml")" = 1 ] && ! grep -q getconf "$DT/mise.toml" && grep -q "^lockwait=2$" "$DT/mise.toml" && grep -q "^env.CANON_ALPACA_DATA_ONLY = \"1\"$" "$DT/mise.toml"'
+  drun sandbox --minutes 3; rc=$?
+  check "mise run paper:data sandbox --minutes 3: account A's pair only, the sandbox node with data-only set, under the stream lock" \
+        eval '[ "$rc" = 0 ] && grep -qx "args: run --locked python -m canon_trading.sandbox_node --minutes 3" "$DT/ran" && grep -qx "data-only: 1" "$DT/ran" && grep -qx "stream lock held: 75" "$DT/ran" && [ "$(grep -c "^security find-generic-password -s canon-alpaca-paper -a ALPACA_.* -w$" "$KC/log")" = 2 ] && ! grep -q "$WS" "$KC/log"'
+  drun quotes; rc=$?
+  check "mise run paper:data quotes: refused, not built yet (ADR 0066), nothing run" \
+        eval '[ "$rc" = 1 ] && grep -q "not built yet (ADR 0066); nothing was run" "$DT/out" && [ ! -e "$DT/ran" ]'
+  drun pytest; rc=$?
+  check "mise run paper:data pytest: a module not on the list is refused by mise before the script runs" \
+        eval '[ "$rc" != 0 ] && grep -q "Invalid choice for arg module: pytest" "$DT/out" && [ ! -e "$DT/ran" ] && [ ! -s "$KC/log" ]'
+  /usr/bin/lockf -k "$DT/locks/canon-alpaca-stream.lock" sleep 30 & hp=$!
+  for _ in $(seq 50); do /usr/bin/lockf -k -t 0 "$DT/locks/canon-alpaca-stream.lock" true 2>/dev/null || break; sleep 0.1; done
+  drun sandbox; rc=$?
+  kill "$hp" 2>/dev/null; wait "$hp" 2>/dev/null
+  check "mise run paper:data sandbox while another run holds the stream lock: waits its 2 s, fails, nothing run" \
+        eval '[ "$rc" = 1 ] && grep -q "stream lock stayed held for 2 s; nothing was run" "$DT/out" && [ ! -e "$DT/ran" ]'
+  rm -f "$KC"/read-* "$KC"/value-*
 fi
 
 # ---------- the OmniRoute gateway tasks, against stand-ins (ADR 0056) ----------
