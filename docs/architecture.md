@@ -117,7 +117,7 @@ locally on the data client's live data; nothing in `src/` builds one yet (ADR 00
   lock (`mise.toml`, ADR 0029, ADR 0044); it is checked against the paper API before it is stored (ADR 0033).
 * **A session window** holds a position of at most one share: `PositionCap` reads the portfolio every second
   inside the node and shuts the system down over it; the window starts flat, ends flat or fails, and lasts
-  at most 60 minutes (ADR 0044).
+  at most 60 minutes (ADR 0044); the account check after its stop is ADR 0060.
 * **The risk engine** limits submits and modifies only; cancels and queries pass it. `ema_cross_paper_node`
   sets 50 submits and 25 modifies a minute, under Alpaca's working figure of 200 calls a minute, and
   $1,000 notional per order; its paper test allows one submit in five minutes (ADR 0037, ADR 0049). The adapter's

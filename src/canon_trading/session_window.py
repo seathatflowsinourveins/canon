@@ -3,7 +3,8 @@
 Contract: NautilusTrader v2.0.0rc8's `LiveNode.builder`, `LiveExecutionEngineConfig` and `LoggerConfig` with a
 `FileWriterConfig` (`live/__init__.pyi`, `common/__init__.pyi`); alpaca-py 0.45.0's `TradingClient` (paper)
 `get_clock`, `get_calendar`, `get_orders`, `get_open_position`, `get_order_by_client_id`,
-`cancel_order_by_id` and `submit_order` with a `MarketOrderRequest`. Read 2026-11-10 (ADR 0044):
+`cancel_order_by_id` and `submit_order` with a `MarketOrderRequest`. Read 2026-11-10 (ADR 0044; the account
+check's sources, ADR 0060):
 
 * https://nautilustrader.io/docs/md/latest/how_to/configure_live_trading.md, "Continuous reconciliation":
   `open_check_interval_secs` ("None or 0.0 disables. Recommended: 5-10s") and `position_check_interval_secs`
@@ -47,7 +48,7 @@ stops, and the account is checked: no open order, no position. The wait for the 
 account is still checked, and `main` ends the process (`os._exit`), since the node's task can be neither
 awaited nor cancelled.
 
-The account check after the stop (`_flatten_after_stop`) answers one question: which requests does this
+The account check after the stop (`_flatten_after_stop`, ADR 0060) answers one question: which requests does this
 window not yet know the end of, and has Alpaca shown each ended before the account is called flat? It
 keeps them in one set: each order of the node's that the node did not see end (`_unsettled`: sent with
 no answer, or still open in its cache), and each close the check itself sends. One leaves the set only on

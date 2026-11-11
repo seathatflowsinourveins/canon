@@ -2754,7 +2754,7 @@ def test_a_refusal_is_recorded_though_its_heartbeat_cannot_be_written(
     assert latest["result"].startswith("refused: the paper account is not flat")
 
 
-# The account check after the stop, against one stand-in for Alpaca's paper Trading API (ADR 0044).
+# The account check after the stop, against one stand-in for Alpaca's paper Trading API (ADR 0060).
 
 
 def api_error(status: int, code: int, message: str) -> APIError:
