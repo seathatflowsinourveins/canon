@@ -36,7 +36,7 @@ bounded windows; each part below follows the upstream named:
 | What runs | `~/.claude/canon/paper-session.sh` brings its own clone, `~/.claude/canon/paper-checkout`, to the `main` the origin has at that firing, detached, or fails the firing, then runs `mise run paper:session --session auto --minutes 25` there: one window, one node, one process, disposed, its records naming the commit. 25 minutes, with about two of start-up and stop, leaves the 300 s gap inside 35 | configure_live_trading: "run nodes as standalone Python scripts or services"; "One LiveNode per process"; actions/checkout's reuse of a directory (the runner's header) |
 | Which session | `auto` takes the regular session when Alpaca's clock says it is open (`is_open`, which is false on weekends and holidays; UNVERIFIED, the clock page says only "Whether or not the market is open"), the extended one when `EXTENDED_READY` and it is open, and otherwise prints "nothing to run" and exits 0 | Alpaca's paper-trading skill: "always check the clock/calendar endpoint" |
 | A window that dies | It writes `latest.json` as `running` before the node is built and `ok` or `failed: <why>` after, the account check included; a refusal someone must look at (account not flat) is `refused: <why>`, while a skip that clears by itself (the gap, under 360 s of session left) exits 0 and keeps the last result. A `running` record past its `stale_after` (70 minutes) is a window that died | No upstream |
-| Status | `scripts/automation status`'s `paper session` row: the last window, its result, age and leftovers; FAILED when the last firing exited non-zero (one that ended before Python wrote anything); STALE when no run, a window or not, wrote `last-firing.json` for two intervals | ADR 0011's status rows |
+| Status | `scripts/automation status`'s `paper session` row: the last window, its result, age and leftovers; FAILED when the last firing exited non-zero (one that ended before Python wrote anything); STALE when the runner's own stamp, `scheduled-firing.json`, written as each firing starts, is older than the longest firing (its 85-minute deadline) plus an interval and 300 s, since launchd misses the intervals a firing runs through, and not ok when it is missing or unreadable, whatever a window run by hand wrote | ADR 0011's status rows |
 
 Installing it is the owner's step: `scripts/automation install`. Whether the agent's `mise run` reads the
 login keychain without a dialog is UNVERIFIED until its first firing. A firing while the Mac sleeps is missed.
@@ -50,6 +50,12 @@ login keychain without a dialog is UNVERIFIED until its first firing. A firing w
   node that hangs on stop (ADR 0044's disconnect hang) is waited for at most `STOP_TIMEOUT_SECS` (about
   115 s); the window is then recorded failed, the account checked (at most `AFTER_STOP_SECS`, 60 s, and a
   30 s settle, each Alpaca call within the adapter's timeouts), and the process ended (ADR 0044).
+* Bad: the clone's kept `.venv` is trusted local state, as a person's checkout's is: `--exact` removes
+  extraneous packages but not other files (a loose `.pth` still ran, observed), and uv documents no check
+  of files outside its packages. Its `.git` is not: hooks are off and a foreign local config is remade.
+* Bad: a run that hangs holding the paper lock is stopped by mise's task `timeout` (paper:session 85
+  minutes, paper:test 2 hours, each counting the wait for the lock); a window stopped there flattens nothing
+  and shows as died, and the next starts only once the account is flat.
 
 ### Confirmation
 
@@ -69,6 +75,14 @@ The same test fires the runner at a stand-in origin: each firing runs its newest
 clone and its mise trust. On GitHub: a fresh clone 0.5 s, its environment 6.6 s, a kept one 0.4 s. One
 firing from GitHub's `main`, run with no environment but `HOME`, read the pair, found no session open and
 recorded its commit; it first failed until the runner exported `PATH`, which mise's `exec()` needs (observed).
+After a second reader's review of the runner (2026-11-10), each first shown by a failing test in
+`scripts/test-lanes`: a hung owner of the paper lock is now stopped at the task's `timeout` and the lock
+held until all it started has ended (with `lockf <file> uv`, the lock was freed while the uv kept running);
+a schedule gone silent is STALE or UNKNOWN even after a window run by hand, with no heartbeat or an
+unreadable one; a post-checkout hook, a local branch and a `core.fsmonitor` left in the clone no longer act;
+an origin URL with user information is refused at install and by the runner, and messages name host and path.
+`/code-review` (high) of the fix found six more (a same-second heartbeat, a long firing, a branch named
+`origin/main`, scp-style credentials, git's init keys, `@` in a path), each fixed with a case there.
 
 ## Evidence
 
@@ -100,5 +114,21 @@ Read 2026-11-10. "raw": fetched with `curl` and read whole.
   (fetched by the second reader, raw).
 * `home/.claude/canon/paper-session.sh`, `src/canon_trading/session_window.py` and `scripts/test-lanes`:
   the runner, the records, the timeouts and the rehearsal (read).
+* A second reader's review of the runner (2026-11-10): the lock owner's missing deadline, the status row
+  kept green by a run by hand, state in the kept clone, and an origin URL carrying credentials; each
+  reproduced offline and fixed or recorded above (run).
+* https://raw.githubusercontent.com/jdx/mise/v2026.11.5/docs/tasks/task-configuration.md, "timeout": SIGTERM
+  to the task's processes, then SIGKILL 5 s later; observed with mise 2026.11.5 to reach a child that ignores
+  SIGTERM only when the task's own process is still waiting, hence `exec uv` (fetched, raw; run).
+* `man lockf` on this machine: locking a descriptor the shell opened ("Protect a section of a shell script
+  with a lock"); the lock then lasts while any process holding the descriptor runs (read; observed).
+* `man git-config`, core.hooksPath: "disable all hooks entirely by setting core.hooksPath to /dev/null ...
+  on a per-command basis" with `git -c` (read).
+* https://docs.astral.sh/uv/reference/cli/ (`uv run --exact`, "removing extraneous packages"; `uv sync
+  --check`, whether the environment "is synchronized with the project") and uv 0.13.7
+  `docs/concepts/projects/sync.md`; a loose `.pth` in a venv ran under `uv run --locked --exact` (fetched,
+  raw; observed with uv 0.13.7).
+* https://www.rfc-editor.org/rfc/rfc3986.txt, section 3.2.1: user information precedes "@" before the host,
+  and "user:password" there is deprecated (fetched, raw).
 * Second reader (`evidence-verifier`), 2026-11-10, on this split: added the skill and clock lines, marked
   the weekend reading `UNVERIFIED`, narrowed the Good consequence and corrected the install line.
