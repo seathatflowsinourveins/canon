@@ -60,7 +60,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-MISE_VERSION="v2026.11.5"      # canon/upstreams.json: mise
+MISE_VERSION="v2026.11.6"      # canon/upstreams.json: mise
 # Claude Code: the version is the registry's claude-code pin (claude_pin below), not a channel; later updates
 # follow home/.claude/settings.json (ADR 0008: the one tool allowed to auto-update)
 LOCAL_BIN="$HOME/.local/bin"

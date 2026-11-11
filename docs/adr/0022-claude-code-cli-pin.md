@@ -130,3 +130,7 @@ quoted sentences verbatim.
   called silent; that the floor reaches a machine only with the user config; that the vendor advises the
   latest channel; and that ADR 0005 sets no machine default. An independent code review had `--install`
   upgrade a CLI behind the pin and the lint refuse a pin the bootstrap cannot install. All are above.
+* Pin moved 2026-11-11 to `tag:v2.1.322` → `6e1e44f6433b` (resolved), with `minimumVersion` in the settings
+  template. https://github.com/anthropics/claude-code/releases/tag/v2.1.322 — published 2026-11-10, its one
+  note "Added fast mode on Vertex in the global, us and eu regions" (`gh`). `claude --version` gave 2.1.322
+  on this machine before the move (run).

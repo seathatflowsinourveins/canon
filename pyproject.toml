@@ -29,7 +29,7 @@ canon-alpaca = { workspace = true }
 dev = [
     "pytest==9.2.0",
     "ruff==0.17.4",
-    "ty==0.0.100",
+    "ty==0.0.101",
 ]
 
 # Lint and format (docs/adr/0013-quality-gates.md). Line length and import style follow NautilusTrader's

@@ -441,3 +441,7 @@ Read 2026-11-09 (fetched; fetches are model-summarised).
   https://opentelemetry.io/docs/specs/otel/protocol/exporter/ ("The per-signal endpoint configuration options
   take precedence"). `tomllib`: https://docs.python.org/3/library/tomllib.html (Python 3.11 and later; the
   pinned Python is 3.14, macOS's `/usr/bin/python3` has none).
+* ccusage pin moved 2026-11-11 to `tag:v20.0.49` → `d1d95c994067` (resolved).
+  https://github.com/ryoppippi/ccusage/releases/tag/v20.0.49 — published 2026-11-10: 1h cache writes in JSON
+  model breakdowns, a cline adapter, in-window counting in unified session reports, parser fixes and a
+  faster `ccusage claude`; nothing breaking (`gh`). The 2026-11-09 run above used 20.0.48.

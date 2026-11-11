@@ -53,7 +53,7 @@ owner's delegation of 2026-11-10.
 5. **Codex's own default model and effort.** Its docs say only that it "uses a recommended model"; which
    one 0.167.0 picks is UNVERIFIED, and `--model` on a Codex worker is untried. `canon/models.json` and
    ADR 0005 are unchanged: this is a reader, not a lane.
-6. **The pin**: registry entry `codex-cli`, a `tool` at `tag:rust-v0.167.0`, the version installed. It
+6. **The pin**: registry entry `codex-cli`, a `tool` at `tag:rust-v0.167.1`, installed by hand after it lands. It
    stays machine-level: in `mise.toml` every CI run would install a binary no check uses. The bootstrap
    does not check it; `codex --version` does. Upstream ships five to nine `rust-vX.Y.Z-alpha.N` tags
    (some `alpha.N.M`) per stable release; `scripts/canon outdated` ignores pre-releases for a stable pin
@@ -145,3 +145,8 @@ page and a model summarised it. "Second reader": the `evidence-verifier`, the sa
 * ADR 0045 rule 7, 2026-11-10: Codex reads on a named model and effort; rule 5 above is superseded by it.
 * ADR 0034, 2026-11-11: Codex starts in its own sandbox (`:workspace`, `/tmp` read-only) with
   `approval_policy = "never"` once the owner sets its launch arguments; rule 2 holds until then.
+* Pin moved 2026-11-11 to `tag:rust-v0.167.1` → `0a94398fa60c` (resolved). Its two commits against
+  `rust-v0.167.0`: "Add opt-in incremental tools for regular OpenAI Responses" and "Restrict legacy
+  incremental tools to Amazon Bedrock providers"; nothing under `codex-rs/otel` (`gh api` compare). Licence
+  at the tag: Apache 2.0 (fetched). The trials above ran 0.167.0; this machine moves with `mise use -g
+  codex@0.167.1` once the pin is on main (not yet run).
