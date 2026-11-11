@@ -4635,7 +4635,7 @@ def test_a_window_runs_session_ma_cross_unless_another_strategy_of_the_table_is_
     table is refused before anything is read."""
     assert WindowConfig().strategy == "SessionMaCross"
     assert session_window._parser().parse_args([]).strategy == "SessionMaCross"
-    assert set(session_window.WINDOW_STRATEGIES) == {"SessionMaCross", "EmaCross"}
+    assert set(session_window.WINDOW_STRATEGIES) == {"SessionMaCross", "EmaCross", "Mover"}
     with pytest.raises(ValueError, match="strategy must be one of"):
         WindowConfig(strategy="GridMarketMaker")
     with pytest.raises(SystemExit):
@@ -5819,3 +5819,126 @@ def test_a_first_minute_no_bar_was_received_for_does_not_leave_every_symbol_out(
     assert pick.record["sample"]["elapsed_minutes"] == 2
     assert pick.record["sample"]["incomplete"] == 0
     assert pick.record["sample"]["from"] == AT.astimezone(UTC).isoformat()
+
+
+# --- `Mover` in a window (ADR 0088) ------------------------------------------------------------------
+
+
+def mover_pick(price: str = "1.5") -> session_window.MoverPick:
+    return session_window.MoverPick(
+        "LLL",
+        Decimal(price),
+        {"at": "2026-11-10T14:57:00+00:00", "inputs": {"move": 2.0000004}},
+        Decimal(price),
+    )
+
+
+def test_mover_runs_only_on_the_name_the_ranking_gives() -> None:
+    with pytest.raises(ValueError, match="run it with --mover"):
+        WindowConfig(strategy="Mover")
+    with pytest.raises(ValueError, match="regular"):
+        WindowConfig(strategy="Mover", mover=True, session="extended")
+    assert WindowConfig(strategy="Mover", mover=True).strategy == "Mover"
+
+
+def test_a_mover_strategy_window_builds_the_strategy_its_ranking_and_the_outer_bound(
+    monkeypatch, tmp_path
+) -> None:
+    """The node of a `Mover` window: the risk engine's per-order cap is the outer bound, ten times the
+    largest entry, since the engine holds a sale to the cap as it does a buy; the strategy sizes its
+    own entry inside 500 dollars, on bars built from trades; the window's choice is the ranking, with
+    the time it was made; the position cap is the shares the largest entry buys at the choice's price;
+    and its stop in the session is the managed market exit."""
+    from canon_trading.mover import Mover
+
+    seen: list[dict] = []
+    real = session_window.alpaca_paper_builder
+
+    def spy(*args, **kwargs):
+        seen.append(kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(session_window, "alpaca_paper_builder", spy)
+    ends = datetime(2026, 11, 10, 15, 30, tzinfo=UTC)
+    node, strategy, cap = session_window.window_node(
+        WindowConfig(symbol="LLL", mover=True, strategy="Mover", log_dir=tmp_path),
+        wind_down_at=ends - timedelta(seconds=session_window.FLATTEN_SECS),
+        log_name="m",
+        feed="sip",
+        pick=mover_pick(),
+        ends=ends,
+    )
+    try:
+        assert isinstance(strategy, Mover)
+        rows = strategy.settings
+        assert seen[0]["max_notional_per_order"] == Decimal(5000)
+        assert seen[0]["delay_post_stop_secs"] == session_window.MANAGED_DELAY_POST_STOP_SECS
+        assert (rows.max_notional, rows.max_shares, rows.entries) == (Decimal(500), 333, 1)
+        assert rows.bar_spec == "1-MINUTE-LAST-INTERNAL" and rows.feed == "sip"
+        assert rows.manage_stop is True and rows.extended_hours is False
+        assert rows.rank_max_age_secs == 33 * 60  # from the choice at 14:57 to the end at 15:30
+        assert cap.max_position == Decimal(333)
+        assert session_window.WINDOW_STRATEGIES["Mover"].strategy_id == strategy.strategy_id
+    finally:
+        node.dispose()
+
+
+def test_a_mover_strategy_window_is_refused_without_its_choice(tmp_path) -> None:
+    with pytest.raises(RuntimeError, match="built on the window's choice"):
+        session_window.window_node(
+            WindowConfig(symbol="LLL", mover=True, strategy="Mover", log_dir=tmp_path),
+            wind_down_at=datetime(2026, 11, 10, 15, 0, tzinfo=UTC),
+            log_name="m",
+            feed="sip",
+        )
+
+
+def test_a_mover_strategy_window_fails_by_name_over_its_request_ceiling_or_on_a_429() -> None:
+    report = session_window.WindowReport("regular", "LLL", started="20261110T160000Z")
+    quiet = {"account": 1, "api": "trading", "total": 40, "peak_minute": 30, "peak_60s": 31}
+    report.requests_by_api = [{**quiet, "rate_limited": 0}]
+    assert session_window.request_failure(report) is None
+    report.requests_by_api = [{**quiet, "peak_60s": 180, "rate_limited": 0}]
+    assert "180 requests" in (session_window.request_failure(report) or "")
+    report.requests_by_api = [{**quiet, "rate_limited": 1}]
+    assert "429" in (session_window.request_failure(report) or "")
+
+
+class Quoted(Data):
+    """`Data` that also answers alpaca-py's `get_stock_latest_quote`, with one `ask` for any symbol."""
+
+    ask = 1.6
+
+    def get_stock_latest_quote(self, request_params) -> dict:
+        self.requests.append(request_params)
+        symbol = request_params.symbol_or_symbols
+        return {symbol: SimpleNamespace(ask_price=self.ask, bid_price=self.ask - 0.01)}
+
+
+def test_a_mover_strategy_window_hands_the_node_its_choice_and_its_end(
+    monkeypatch, tmp_path
+) -> None:
+    """The window's one choice reaches the node's build with the window's end, which bounds how long
+    that choice stands as the ranking. One share is checked at the limit the strategy would send, the
+    ask of the latest sip quote, since the risk engine values a limit order at its limit price, not at
+    the last trade (a second reader's finding on the bridge window, Muse, 2026-11-11): the shares bound
+    comes from that limit, and a name whose one share at it is over the largest entry starts nothing."""
+    data, screener = Quoted(), Screener()
+    monkeypatch.setattr(session_window, "window_data", lambda: data)
+    monkeypatch.setattr(session_window, "window_screener", lambda: screener)
+    outcome, latest, seen = quiet_window(
+        monkeypatch, tmp_path, quotes=5, trades=5, account=Assets(), mover=True, strategy="Mover"
+    )
+    assert not isinstance(outcome, Exception), outcome
+    assert latest["strategy"] == "Mover" and latest["symbol"] == "LLL" and latest["result"] == "ok"
+    assert latest["share_price"] == "1.5" and latest["mover"]["entry_limit"] == "1.6000"
+    assert seen["pick"].symbol == "LLL" and seen["pick"].price == Decimal("1.6")
+    assert seen["ends"] - seen["wind_down_at"] == timedelta(seconds=session_window.FLATTEN_SECS)
+
+    data.ask = 500.01  # the last trade is still 1.5: only the limit is over the largest entry
+    monkeypatch.setattr(session_window, "GAP_SECS", 0)
+    with pytest.raises(session_window.WindowRefused, match="at its entry limit of 500.0100"):
+        session_window.run_window(
+            WindowConfig(log_dir=tmp_path, strategy="Mover", mover=True),
+            trading=cast(TradingClient, Assets()),
+        )
