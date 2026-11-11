@@ -83,6 +83,9 @@ grows with the data and not with what was tried. Terms 1, 2 and 3 below were ADR
    run (an outcome, returns or session days, or a result Optuna keeps: `COMPLETE` or `PRUNED`, a value
    or an intermediate value), a trial of an unknown configuration, which stops for good.
 
+   Narrowed 2026-11-11: ADR 0054 term 7 holds the model as built (#177, `canon_trading.ledger.origin`);
+   where this term reads wider, term 7 governs.
+
 Local, no upstream, where the upstreams read say nothing:
 
 * `not_run` and `not_run_waiting` (term 3): Optuna 5.0.0 has states, not a "ran nothing" mark, and its `fail_stale_trials`
