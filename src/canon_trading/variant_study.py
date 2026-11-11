@@ -25,7 +25,12 @@ Run `python -m canon_trading.variant_study --create` once to create the study wi
 `python -m canon_trading.variant_study` to record and rank. A pass records every configuration of the
 grid whose latest record on the current sample did not run to the end, the same rule the gate uses to
 resolve a key (ADR 0054 term 5), then ranks and prints the report or the stop. `--rank-only` ranks
-without recording. A pass holds an exclusive `fcntl.flock` (the standard library's, as
+without recording. Either way the study is ranked only once every configuration of the plan has a
+record: `rank` counts N from the ledger and cannot see a planned configuration never tried, so a
+pass stopped part way would be ranked at an N short of the plan's (ADR 0010 step 1, ADR 0048). A run
+that raises goes into the pass's failures only once `record_trial` has told it `FAIL`; one whose
+failure could not be written stops the pass, with the storage error as a note on the run's own. A
+pass holds an exclusive `fcntl.flock` (the standard library's, as
 `canon_trading.ledger` takes for creation) on a lock file beside the ledger, named for the study, so a
 second pass on the same study is refused rather than run beside it. The catalog defaults to the
 `catalog/` of the checkout this module is in, where the paper test loads the bars; the ledger to
@@ -50,6 +55,7 @@ from nautilus_trader.config import LoggerConfig
 from nautilus_trader.core.datetime import dt_to_unix_nanos
 from nautilus_trader.model import BarType
 from nautilus_trader.model import Quantity
+from optuna.trial import TrialState
 
 from .ledger import FAILED
 from .ledger import OUTCOME
@@ -57,6 +63,7 @@ from .ledger import config_key
 from .ledger import create_ledger_study
 from .ledger import current_sample
 from .ledger import default_ledger_path
+from .ledger import has_key
 from .ledger import open_study
 from .ledger import record_trial
 from .ledger import samples
@@ -133,8 +140,9 @@ def _to_record(study: optuna.Study, keys: Sequence[str]) -> list[str]:
     `canon_trading.ranking.on_current_sample` and `ran_to_the_end`, so it follows any change to it.
     The study is read once.
     """
-    sample = current_sample(study)
-    known = {s.number for s in samples(study)}
+    history = samples(study)  # one read, as `rank` takes it
+    sample = history[-1]
+    known = {s.number for s in history}
     latest: dict[str, optuna.trial.FrozenTrial] = {}
     for trial in study.get_trials(deepcopy=False):
         key = trial.user_attrs.get("config_key")
@@ -157,11 +165,16 @@ class Recorded:
 
 
 def _told_failed(study: optuna.Study, key: str, before: int) -> bool:
-    """Whether a record of `key` numbered `before` or later was told `failed` by `record_trial`."""
+    """Whether a record of `key` numbered `before` or later was told `FAIL`, `failed`, by `record_trial`.
+
+    Both the state and the outcome: `record_trial` writes the outcome before its `tell`, so a record
+    whose `tell` failed has the outcome and is still `RUNNING`, and that storage error stops the pass.
+    """
     return any(
         trial.number >= before
         and trial.user_attrs.get("config_key") == key
         and trial.user_attrs.get(OUTCOME) == FAILED
+        and trial.state == TrialState.FAIL
         for trial in study.get_trials(deepcopy=False)
     )
 
@@ -229,7 +242,7 @@ def run_study(
     raises `LedgerNotFound`, each from `canon_trading.ledger`: nothing is created unless asked. A study
     whose current sample is not [start, end] is refused, since the sample is part of the plan. The
     pass holds the study's pass lock (module header). Returns what the pass recorded and the report, or
-    the `RankingStopped` that stopped it.
+    the `RankingStopped` that stopped it, which names any configuration of `configs` with no record.
     """
     configs = grid() if configs is None else configs
     first, last = dt_to_unix_nanos(start), dt_to_unix_nanos(end)
@@ -273,10 +286,45 @@ def _record_and_rank(
             f"{first} to {last}",
         )
     recorded = None if rank_only else record_grid(study, catalog_path, configs)
+    unrecorded = _never_recorded(study, configs)
     try:
-        return recorded, rank(study)
+        report = rank(study)
     except RankingStopped as stopped:
-        return recorded, stopped
+        if not unrecorded:
+            return recorded, stopped
+        return recorded, RankingStopped(f"{_short_of_the_plan(study, unrecorded)}\n{stopped}")
+    if unrecorded:
+        return recorded, RankingStopped(_short_of_the_plan(study, unrecorded))
+    return recorded, report
+
+
+def _never_recorded(study: optuna.Study, configs: Sequence[MaCrossConfig]) -> list[MaCrossConfig]:
+    """The configurations of the plan with no record of their key in `study`, on any sample.
+
+    `rank` counts N from the ledger (ADR 0010 step 1), so it cannot see a planned configuration that
+    was never tried: a pass stopped part way leaves a study whose N is short of the plan's, and a
+    smaller N deflates the pick's Sharpe ratio less. The plan is ADR 0048's, so the study is not
+    ranked until every configuration of it has a record. A key with a record that did not run to the
+    end, or one on another sample only, `rank` stops on itself.
+    """
+    keys = {
+        trial.user_attrs["config_key"]
+        for trial in study.get_trials(deepcopy=False)
+        if has_key(trial)
+    }
+    return [config for config in configs if key_of(config) not in keys]
+
+
+def _short_of_the_plan(study: optuna.Study, configs: Sequence[MaCrossConfig]) -> str:
+    return (
+        f"The ranking of study {study.study_name!r} stopped: {len(configs)} configurations of "
+        "the plan (ADR 0048) have no record, so N would be short of the plan's; record the grid "
+        "first:\n"
+        + "\n".join(
+            f"* {key_of(config)} ({describe(config)}): planned but never recorded"
+            for config in configs
+        )
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:

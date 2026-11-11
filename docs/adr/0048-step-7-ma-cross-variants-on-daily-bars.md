@@ -89,6 +89,9 @@ has a deflated Sharpe ratio of 0.9338 and is rejected at 0.95, accepted on the c
   refusal, the second pass and a run that raises behave as stated above.
 * `mise run paper:test -k variant_study_bars`: the bars of the sample load (Evidence).
 * The run and its result: ADR 0052's Confirmation.
+* Since the run: a study is ranked only once every configuration of the plan has a record
+  (`test_a_study_short_of_its_plan_is_not_ranked`), and a run whose failure could not be told stops the
+  pass (`test_a_failure_that_cannot_be_told_stops_the_pass`), each a test that failed before its fix.
 
 ## Evidence
 
@@ -138,3 +141,7 @@ Read 2026-11-10. Fetched means read in this session as raw text or source; run m
   with no change of decision; the Evidence lines that support both records are kept in both. The first
   two Confirmation lines were written on the split, from `tests/test_variant_study.py` and the paper
   load above, to say what confirms the plan here (run).
+* A fourth review of the gate, 2026-11-10, read only, by a second reader: after a pass stopped at three
+  of the plan's keys, `--rank-only` passed at N = 3; an engine error whose `FAIL` could not be written
+  left the record `RUNNING`, and the pass went on without the storage error. Each reproduced as a
+  failing test and fixed, with no change to the plan.

@@ -132,6 +132,10 @@ Who decided. The orchestrator chose option 2 and its terms under the owner's del
   and its query (`test_a_catalog_swapped_between_the_check_and_its_query_is_refused`); records out of the
   writer's shape (`test_a_record_that_ran_out_of_the_writers_shape_stops_naming_it`); and two moves at once
   (`test_two_sample_moves_at_once_are_both_kept`).
+* The fourth review's cases, each a test that failed before its fix: returns and session days after the
+  run's own end (`test_returns_after_the_run_s_end_stop`); a null, a 31-digit, a 5,000-digit, a negative
+  and a past-64-bit session day (`test_a_session_day_that_crashed_the_ranking_stops_naming_it`); series
+  named `1` and `"1"` (`test_names_distinct_only_by_type_are_refused`).
 
 ## Evidence
 
@@ -188,3 +192,14 @@ package; run, executed in this checkout.
   decision.
 * Terms 3, 4 and 6, the data identity, the key and the record with no key, with their glue,
   consequences, tests and evidence, moved to ADR 0053 on 2026-11-10, with no change of decision.
+* A fourth review of the gate, 2026-11-10, read only, by a second reader, each finding reproduced here
+  as a failing test: records whose `backtest_end` was the sample's start carried 29 more days of returns
+  and passed, since returns and session days were checked against the sample and not the run; a null or
+  a 31-digit session day raised `TypeError` or `OverflowError` instead of naming the trial, and the code
+  review added one of 5,000 digits (`ValueError`). A nanosecond text is now a decimal of at most 2**63 -
+  1, not negative: NautilusTrader's `UnixNanos` wraps a `u64` (`crates/core/src/nanos.rs` at the
+  pinned commit, fetched) and pandas reads -2**63 as `NaT` (run). Series named `1` and `"1"` passed as
+  distinct, though skfolio names a portfolio's column by `str` (`bundled`). By reading only: `rank` read
+  the current sample and the sample numbers in two reads, now one. Kept as a known limit: a ranking
+  answers for the sample current when it read the study, and a move after that read is first seen by the
+  next one. No change of decision.

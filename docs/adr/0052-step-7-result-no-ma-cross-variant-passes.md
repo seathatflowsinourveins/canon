@@ -101,6 +101,9 @@ recommendation either.
   trial read are identified by their data digests: SPY
   `a0b82593e1401adbd875b142f24c414ad77e3ffa92c6c690bcaff5a02a09ad09`, QQQ
   `e2e493377d3614bbc3373867b0e789bc353b6322bb032757c3730b1d4457db40` (ADR 0053 term 1).
+* The fourth review of the gate (ADR 0048's Evidence) changes nothing read here: one pass recorded all
+  eight planned keys, all `traded`, so N = 8 is the plan's, and the study has no `not_run` mark, no
+  queued trial and no record out of `record_trial`'s shape.
 
 ## Evidence
 

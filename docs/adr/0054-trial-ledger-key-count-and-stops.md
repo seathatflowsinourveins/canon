@@ -72,6 +72,9 @@ Who decided. The orchestrator chose option 3 and the terms under the owner's del
   (`tests/test_ledger.py`).
 * Records of one key that differ only in outcome stop the ranking in either order, and a report names
   only the pick's records that ran (`tests/test_ranking.py`).
+* A keyed record in a state and outcome `record_trial` never leaves stops for good, and no later record
+  resolves it (`test_a_keyed_record_with_a_result_and_no_outcome_stops_for_good`,
+  `test_a_record_that_ran_in_a_state_the_writer_never_tells_stops`), tests that failed before their fix.
 
 ## Evidence
 
@@ -117,3 +120,11 @@ Term numbers are ADR 0035's.
   the first Confirmation line, which had joined two tests' halves, this section's preamble and its
   labels. Code review (`/code-review`, medium) of the split, the same day: references left on ADR 0035
   for N, the key and the stops; corrected.
+* A fourth review of the gate, 2026-11-10, read only, by a second reader: a keyed `COMPLETE` record with
+  a value and no outcome was read as a failure, so a later traded record of its key passed and the
+  completed one was never checked; its code review added `PRUNED` and `traded`, and `COMPLETE` and
+  `idle`, read as runs. Term 5 resolves a record cut short as `record_trial` leaves one, `RUNNING`, or
+  `FAIL` with outcome `failed` or none; the ranking now stops for good on a keyed record in any state
+  and outcome `record_trial` never leaves, a result (`COMPLETE`, `PRUNED`, a value or an intermediate
+  value; Optuna 5.0.0 `trial/_state.py`, `bundled`) or a suggested parameter among them. Reproduced as
+  failing tests. No change of decision.

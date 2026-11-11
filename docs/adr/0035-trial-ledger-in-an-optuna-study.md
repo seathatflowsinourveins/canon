@@ -87,6 +87,9 @@ Who decided. The orchestrator chose option 3 and the terms under the owner's del
 * A creation interrupted before its sample is completed by the next creation of its name
   (`tests/test_ledger.py`).
 * N, the keys and the ranking's stops: ADR 0054's Confirmation.
+* A trial queued in Optuna is never recorded in: `record_trial` tells it `FAIL`, keyless, and asks again
+  (`test_a_trial_is_recorded_in_its_own_trial_not_one_from_optuna_s_queue`,
+  `test_a_waiting_trial_added_with_attributes_is_not_recorded_in`), tests that failed before their fix.
 
 ## Evidence
 
@@ -161,3 +164,9 @@ Read 2026-11-10. Fetched means read in this session as raw text or source; run m
 * Terms 4 to 6, the key, N and what stops the ranking, with their consequences, tests and evidence,
   moved to ADR 0054 on 2026-11-10, with no change of decision; the Evidence lines that support both
   records are kept in both.
+* A fourth review of the gate, 2026-11-10, read only, by a second reader, with its code review:
+  `Study.ask` takes the oldest queued `WAITING` trial before it creates one (Optuna 5.0.0
+  `study/study.py`, `_pop_waiting_trial_id`, `bundled`), so a record could be written into another
+  writer's trial, with its attributes, at a number below records already made, where ADR 0054 term 5
+  reads a higher number as later. Term 2's recording now asks for a trial `ask` created; a taken one is
+  told `FAIL` with no key. Reproduced as a failing test. No change of decision.

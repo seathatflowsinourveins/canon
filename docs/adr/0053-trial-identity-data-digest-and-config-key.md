@@ -92,6 +92,17 @@ Who decided. The orchestrator chose option 2 and its terms under the owner's del
   `consolidate_data` records the same digest as a catalog loaded whole.
 * The third review's case, a test that failed before its fix: a keyless record told a value
   (`test_a_keyless_record_told_a_value_cannot_be_marked_and_stops`).
+* The fourth review's cases, each a test that failed before its fix: a keyless record with outcome
+  `failed` (`test_a_keyless_record_with_a_failed_outcome_shows_a_run`) or with a suggested parameter
+  (`test_a_keyless_record_with_a_suggested_parameter_shows_a_run`); a keyless `WAITING` record, marked
+  and left `WAITING`, which stops again once an `ask` starts it
+  (`test_a_keyless_waiting_record_can_be_marked_not_run`); two marks at once
+  (`test_two_marks_at_once_are_both_kept`), and a mark only on a study the ledger opened; a `not_run`
+  attribute of another shape (`test_a_not_run_list_not_in_the_writers_shape_stops`); an `IntEnum`, a
+  `StrEnum`, or a NaN or infinite float or `Decimal` in a config
+  (`test_a_value_keyed_by_what_it_is_not_is_refused`). A store that refuses the key's write leaves a
+  `FAIL` record with no outcome, which `mark_not_run` clears
+  (`test_an_error_after_the_trial_is_asked_for_is_told_failed`).
 
 ## Evidence
 
@@ -134,3 +145,18 @@ package; run, executed in this checkout.
   option 2, which had been worded as ADR 0041's option 2, and a pointer left on ADR 0041 in
   `ranking.py`. Code review (`/code-review`, medium) of the split, the same day: the tests credited
   under Confirmation, and pointers left on ADR 0041; corrected.
+* A fourth review of the gate, 2026-11-10, read only, by a second reader, each finding reproduced here
+  as a failing test: a keyless record with outcome `failed`, or one `Study.optimize` told `FAIL` for a
+  NaN with its suggested parameter and no value (`study/_tell.py`), could be marked not run and the
+  ranking then passed at N = 3; a keyless `WAITING` record could never be marked, since `mark_not_run`
+  told it `FAIL`; two marks at once kept one number; a `not_run` attribute of `True` cleared trial #1;
+  an `IntEnum` or `StrEnum` was keyed by value, and a NaN dict key or a `Decimal` NaN or infinity passed
+  as text. The code now follows terms 2 and 3 as written, with no change of decision: an outcome shows a
+  run, enums are keyed by name, and a value with no stable text form is refused. Sources: Optuna 5.0.0
+  in `.venv`, `study/_tell.py` (only a `RUNNING` trial is told), `study/study.py` (`Study.ask` takes the
+  oldest `WAITING` trial, `_pop_waiting_trial_id`) and `storages/_base.py` (only a `WAITING` trial's
+  state may change, and the class "is not supposed to be directly accessed by library users"),
+  `bundled`; NautilusTrader's enums are pyo3 classes, not Python enums (run). Kept as a known limit: a
+  keyless record in the shape `record_trial` wrote before this change on a refused key write (an error
+  and outcome `failed`) now shows a run and stops for good; the shared ledger held no keyless record
+  when the third review's fixes landed.
