@@ -1,0 +1,714 @@
+"""The mover strategy offline: `canon_trading.mover.Mover` through a real `BacktestEngine` (ADR 0088).
+
+No test here opens a network connection or reads a credential. Bars and quotes are generated in this
+file: each minute a bar, and a quote a nanosecond before the bar closes, a cent either side of its close,
+so a decision taken on a bar finds the quote of that close in the cache. The simulated venue fills on
+quotes only (`bar_execution=False`): with bars and quotes together it also fills a resting limit from the
+bar's earlier path (measured at the pin, ADR 0088). The ranking comes from a test component that publishes
+the `movers-rank` signal each minute, as the ranking actor will (ADR 0087): nothing of a vendor's list
+reaches the strategy.
+"""
+
+from __future__ import annotations
+
+from datetime import UTC
+from datetime import datetime
+from datetime import timedelta
+from decimal import Decimal
+from itertools import pairwise
+from types import SimpleNamespace
+from typing import TYPE_CHECKING
+from typing import Any
+from typing import cast
+
+import pytest
+from nautilus_trader.backtest import BacktestEngine
+from nautilus_trader.config import BacktestEngineConfig
+from nautilus_trader.config import StrategyConfig
+from nautilus_trader.execution import MakerTakerFeeModel
+from nautilus_trader.model import AccountType
+from nautilus_trader.model import Bar
+from nautilus_trader.model import BarType
+from nautilus_trader.model import Currency
+from nautilus_trader.model import Equity
+from nautilus_trader.model import InstrumentId
+from nautilus_trader.model import Money
+from nautilus_trader.model import OmsType
+from nautilus_trader.model import OrderSide
+from nautilus_trader.model import Price
+from nautilus_trader.model import Quantity
+from nautilus_trader.model import QuoteTick
+from nautilus_trader.model import StrategyId
+from nautilus_trader.model import Symbol
+from nautilus_trader.model import TimeInForce
+from nautilus_trader.model import TraderId
+from nautilus_trader.model import TriggerType
+from nautilus_trader.model import Venue
+from nautilus_trader.risk import FixedRiskSizer
+from nautilus_trader.trading import Strategy
+
+from canon_trading import mover
+from canon_trading.mover import EXTENDED_HOURS
+from canon_trading.mover import RANK_SIGNAL
+from canon_trading.mover import Mover
+from canon_trading.mover import MoverConfig
+from canon_trading.mover import format_rank
+from canon_trading.mover import parse_rank
+from canon_trading.mover import tick
+
+if TYPE_CHECKING:
+    from nautilus_trader.common import TimeEvent
+
+USD = Currency.from_str("USD")
+VENUE = Venue("ALPACA")
+AAA = InstrumentId.from_str("AAA.ALPACA")
+BBB = InstrumentId.from_str("BBB.ALPACA")
+T0 = 1_762_790_400_000_000_000  # 2025-11-10T16:00:00Z
+MINUTE = 60_000_000_000
+SECOND = 1_000_000_000
+MOVER_ID = StrategyId("Mover-001")
+
+RISING = [10.00, 10.10, 10.20, 10.30, 10.40, 10.50, 10.60, 10.70]
+"""Closes of a first leg: every bar closes above the one before."""
+FALL = [10.46, 10.00, 9.90, 9.80]
+"""Then a fall through the trigger (10.48 after a bid of 10.69) that stops above the released limit
+(10.42), and lower still."""
+
+
+def engine() -> BacktestEngine:
+    eng = BacktestEngine(BacktestEngineConfig(trader_id=TraderId("TESTER-001")))
+    eng.add_venue(
+        VENUE,
+        OmsType.NETTING,
+        AccountType.CASH,
+        [Money(100_000, USD)],
+        fee_model=MakerTakerFeeModel(maker_rate=Decimal(0), taker_rate=Decimal(0)),
+        bar_execution=False,
+    )
+    for instrument_id in (AAA, BBB):
+        eng.add_instrument(
+            Equity(
+                instrument_id=instrument_id,
+                raw_symbol=Symbol(instrument_id.symbol.value),
+                currency=USD,
+                price_precision=4,
+                price_increment=Price.from_str("0.0001"),
+                ts_event=0,
+                ts_init=0,
+            )
+        )
+    return eng
+
+
+def bar_type(instrument_id: InstrumentId) -> BarType:
+    return BarType.from_str(f"{instrument_id}-1-MINUTE-LAST-EXTERNAL")
+
+
+def tape(
+    instrument_id: InstrumentId, closes: list[float], *, volume: int = 100_000, spread: float = 0.01
+) -> list:
+    """One bar a minute from `T0` with these closes, and the quote of each close a nanosecond before it."""
+    data: list = []
+    for i, close in enumerate(closes):
+        opened = closes[i - 1] if i else close
+        ts_close = T0 + (i + 1) * MINUTE
+        data.append(
+            Bar(
+                bar_type(instrument_id),
+                Price(opened, 4),
+                Price(max(opened, close), 4),
+                Price(min(opened, close), 4),
+                Price(close, 4),
+                Quantity.from_int(volume),
+                T0 + i * MINUTE,
+                ts_close,
+            )
+        )
+        data.append(
+            QuoteTick(
+                instrument_id,
+                Price(close - spread, 4),
+                Price(close + spread, 4),
+                Quantity.from_int(10_000),
+                Quantity.from_int(10_000),
+                ts_close - 1,
+                ts_close - 1,
+            )
+        )
+    return data
+
+
+class RankerConfig(StrategyConfig):
+    def __init__(self, **_kwargs: object) -> None:
+        super().__init__()
+
+
+class Ranker(Strategy):
+    """Publishes `value` as the ranking at its start and every minute until `until_minute`, as the
+    ranking actor will; `values` replaces it from a given minute on. Build it with `ranker`."""
+
+    value = ""
+    until_minute = 10_000
+    values: dict[int, str] | None = None
+    minute = 0
+
+    def on_start(self) -> None:
+        self.publish_signal(RANK_SIGNAL, self.value, ts_event=self.clock.timestamp_ns())
+        self.clock.set_timer("ranker", timedelta(minutes=1), callback=self._publish)
+
+    def _publish(self, event: TimeEvent) -> None:
+        self.minute += 1
+        self.value = (self.values or {}).get(self.minute, self.value)
+        if self.minute <= self.until_minute:
+            self.publish_signal(RANK_SIGNAL, self.value, ts_event=event.ts_event)
+
+
+def ranker(
+    value: str, *, until_minute: int = 10_000, values: dict[int, str] | None = None
+) -> Ranker:
+    made = Ranker(RankerConfig(strategy_id=StrategyId("Ranker-001"), order_id_tag="RNK"))
+    made.value, made.until_minute, made.values = value, until_minute, values
+    return made
+
+
+class Recording(Mover):
+    """`Mover` that keeps each submit's params and each order it sent, in the order sent."""
+
+    def __init__(self, config: MoverConfig) -> None:
+        super().__init__(config)
+        self.params: list[dict | None] = []
+        self.triggers: list[Decimal] = []
+
+    def submit_order(self, order, position_id=None, client_id=None, params=None) -> None:
+        self.params.append(params)
+        super().submit_order(order, position_id, client_id, params)
+
+    def _on_step(self, event) -> None:
+        super()._on_step(event)
+        for slot in self.slots.values():
+            order = self._order(slot.protect_id) if slot.protect_id else None
+            if order is not None and order.is_emulated and order.trigger_price is not None:
+                self.triggers.append(order.trigger_price.as_decimal())
+
+
+def strategy(**changes: object) -> Recording:
+    settings: dict = {
+        "max_notional": Decimal(50_000),
+        "max_move": Decimal(5),
+        "strategy_id": MOVER_ID,
+        "order_id_tag": "001",
+    }
+    settings.update(changes)
+    return Recording(MoverConfig(**settings))
+
+
+def rank(*entries: tuple[InstrumentId, str]) -> str:
+    return format_rank([(i, Decimal(m)) for i, m in entries])
+
+
+def run(eng: BacktestEngine, s: Mover, ranking: Ranker | None, *tapes: list) -> list:
+    for data in tapes:
+        eng.add_data(data)
+    eng.add_strategy(s)  # first, so it has subscribed before the ranking's first publish
+    if ranking is not None:
+        eng.add_strategy(ranking)
+    eng.run()
+    return sorted(
+        eng.cache.orders(strategy_id=MOVER_ID),
+        key=lambda o: int(o.client_order_id.value.rsplit("-", 1)[1]),
+    )
+
+
+def sides(orders: list) -> list[str]:
+    return [f"{o.side.name} {o.order_type.name} {o.status.name}" for o in orders]
+
+
+# --- the contract's small parts ---------------------------------------------------------------------
+
+
+def test_the_ranking_signal_round_trips_and_a_malformed_one_is_refused() -> None:
+    value = rank((AAA, "0.25"), (BBB, "0.1"))
+    assert value == "AAA.ALPACA=0.25;BBB.ALPACA=0.1"
+    assert parse_rank(value) == [(AAA, Decimal("0.25")), (BBB, Decimal("0.1"))]
+    assert parse_rank("") == []
+    for bad in ("AAA.ALPACA", "AAA.ALPACA=x", "=0.1", "AAA.ALPACA=0.1;AAA.ALPACA=0.2", "AAA=0.1"):
+        with pytest.raises(ValueError, match="movers-rank"):
+            parse_rank(bad)
+
+
+def test_a_price_has_two_decimals_at_or_above_a_dollar_and_four_below() -> None:
+    """Alpaca's "Sub-penny increments for limit orders": 2 decimals at or above $1.00, 4 below."""
+    assert tick(Decimal("1.00")) == Decimal("0.01")
+    assert tick(Decimal(750)) == Decimal("0.01")
+    assert tick(Decimal("0.9999")) == Decimal("0.0001")
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"max_notional": Decimal(0)}, "max_notional"),
+        ({"max_move": Decimal(0)}, "max_move"),
+        ({"slots": 0}, "slots"),
+        ({"watch": 0, "slots": 1}, "watch"),
+        ({"risk": Decimal(0)}, "risk"),
+        ({"risk": Decimal(1)}, "risk"),
+        ({"run_bars": 0}, "run_bars"),
+        ({"trail": Decimal(0)}, "trail"),
+        ({"chase": "market"}, "chase"),
+        ({"trigger": TriggerType.MARK_PRICE}, "trigger"),
+        ({"wind_down_at": datetime(2025, 11, 10, 16, 20)}, "aware"),
+        ({"bar_spec": "1-MINUTE"}, "bar_spec"),
+    ],
+)
+def test_the_config_refuses_settings_it_cannot_honour(changes: dict, message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        strategy(**changes)
+
+
+@pytest.mark.parametrize("misspelled", ["max_notinal", "slot", "wind_down"])
+def test_the_config_refuses_a_keyword_it_does_not_have(misspelled: str) -> None:
+    with pytest.raises(
+        TypeError, match=f"MoverConfig got an unexpected keyword argument '{misspelled}'"
+    ):
+        strategy(**{misspelled: 1})
+
+
+def test_the_config_has_no_default_for_the_notional_cap_or_the_no_chase_cap() -> None:
+    """No cap, no trade (ADR 0083, gap 2): the run states both; neither is assumed."""
+    only_move: dict = {"max_move": Decimal(1)}
+    only_notional: dict = {"max_notional": Decimal(1000)}
+    with pytest.raises(TypeError, match="max_notional"):
+        MoverConfig(**only_move)
+    with pytest.raises(TypeError, match="max_move"):
+        MoverConfig(**only_notional)
+
+
+def test_a_setting_of_another_type_is_refused() -> None:
+    with pytest.raises(TypeError, match="MoverConfig's extended_hours is str"):
+        strategy(extended_hours="False")
+    with pytest.raises(TypeError, match="MoverConfig's slots is bool"):
+        strategy(slots=True)
+
+
+# --- entry -------------------------------------------------------------------------------------------
+
+
+def test_with_no_ranking_nothing_is_watched_and_nothing_is_sent() -> None:
+    eng = engine()
+    s = strategy()
+    orders = run(eng, s, None, tape(AAA, RISING))
+    eng.dispose()
+    assert orders == []
+    assert s.slots == {}
+
+
+def test_it_buys_the_first_rising_run_with_a_limit_at_the_ask_sized_from_risk() -> None:
+    """The slot opens at the first step, so the bars from the second minute on are seen: 10.10, 10.20,
+    10.30, 10.40 are three closes in a row above the one before. The buy is a DAY limit at the ask of that
+    close (10.41), sized by upstream's `FixedRiskSizer`: 1% of the balance over the distance to the
+    lowest planned sale (10.41 less the 0.27 the trail and the release give, less 2%: 9.93)."""
+    eng = engine()
+    s = strategy()
+    orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, RISING))
+    entry = orders[0]
+    instrument = eng.cache.instrument(AAA)
+    price = Decimal("10.41")
+    expected = FixedRiskSizer(instrument).calculate(
+        Price.from_str("10.41"),
+        Price.from_str("9.93"),
+        Money(100_000, USD),
+        Decimal("0.01"),
+        hard_limit=Decimal(50_000) // price,
+    )
+    summary = (entry.side, entry.order_type.name, entry.time_in_force, entry.price.as_decimal())
+    quantity, status, sent = entry.quantity, entry.status.name, entry.ts_init
+    eng.dispose()
+    assert summary == (OrderSide.BUY, "LIMIT", TimeInForce.DAY, price)
+    assert quantity == expected and quantity.as_decimal() == Decimal(2083)
+    assert status == "FILLED"
+    assert T0 + 5 * MINUTE <= sent <= T0 + 5 * MINUTE + 2 * SECOND  # the step after the fifth bar
+
+
+def test_the_size_is_capped_by_the_notional_cap_and_by_the_share_of_recent_dollar_volume() -> None:
+    eng = engine()
+    s = strategy(max_notional=Decimal(1000))
+    orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, RISING))
+    capped = orders[0].quantity.as_decimal()
+    eng.dispose()
+    assert capped == Decimal(96)  # 1,000 // 10.41
+
+    eng = engine()
+    s = strategy()
+    orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, RISING, volume=2000))
+    thin = orders[0].quantity.as_decimal()
+    eng.dispose()
+    # 5% of the four bars seen: (10.10 + 10.20 + 10.30 + 10.40) x 2,000 = 82,000 dollars -> 4,100 // 10.41
+    assert thin == Decimal(393)
+
+
+@pytest.mark.parametrize(
+    ("changes", "ranking", "why"),
+    [
+        (
+            {"max_move": Decimal("0.2")},
+            {"value": rank((AAA, "0.25"))},
+            "moved 0.25, over the no-chase cap",
+        ),
+        ({}, {"value": rank((BBB, "0.25"))}, None),  # another name ranks; AAA is not watched
+        ({}, {"value": rank((AAA, "0.25")), "until_minute": 1}, "the ranking is stale"),
+    ],
+)
+def test_no_entry_past_the_no_chase_cap_for_an_unranked_name_or_on_a_stale_ranking(
+    changes: dict, ranking: dict, why: str | None
+) -> None:
+    eng = engine()
+    s = strategy(**changes)
+    orders = run(eng, s, ranker(ranking.pop("value"), **ranking), tape(AAA, RISING))
+    eng.dispose()
+    assert orders == []
+    if why is not None:
+        assert any(why in reason for reason in s.dropped), s.dropped
+
+
+def test_entries_yield_at_the_soft_line_and_exits_do_not(monkeypatch) -> None:
+    """With the adapter's count of the last 60 seconds at the soft line no entry is sent; the position
+    another run opened is still protected and sold."""
+    total = {"n": 0}
+
+    def counted() -> int:
+        total["n"] += 10  # ten requests a step: 600 in 60 s, over any line
+        return total["n"]
+
+    monkeypatch.setattr(mover, "requests_sent", counted)
+    eng = engine()
+    s = strategy()
+    orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, RISING))
+    eng.dispose()
+    assert orders == []
+    assert any("soft line" in reason for reason in s.dropped), s.dropped
+
+
+def test_one_slot_takes_the_better_ranked_name_when_two_signal_in_the_same_minute() -> None:
+    eng = engine()
+    s = strategy(slots=1, watch=2)
+    orders = run(
+        eng, s, ranker(rank((BBB, "0.4"), (AAA, "0.25"))), tape(AAA, RISING), tape(BBB, RISING)
+    )
+    bought = [o.instrument_id for o in orders if o.side == OrderSide.BUY]
+    eng.dispose()
+    assert bought == [BBB]
+
+
+def test_two_slots_take_both() -> None:
+    eng = engine()
+    s = strategy(slots=2, watch=2)
+    orders = run(
+        eng, s, ranker(rank((BBB, "0.4"), (AAA, "0.25"))), tape(AAA, RISING), tape(BBB, RISING)
+    )
+    bought = [o.instrument_id for o in orders if o.side == OrderSide.BUY]
+    eng.dispose()
+    assert bought == [BBB, AAA]
+
+
+def test_an_entry_not_filled_in_time_is_canceled(monkeypatch) -> None:
+    monkeypatch.setattr(mover, "entry_price", lambda ask, ticks: ask - 1)  # far below the market
+    eng = engine()
+    s = strategy(entry_timeout_secs=20)
+    orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, RISING))
+    first = orders[0]
+    status, lived = first.status.name, first.ts_last - first.ts_init
+    eng.dispose()
+    assert status == "CANCELED"
+    assert 20 * SECOND <= lived <= 22 * SECOND
+    assert all(o.side == OrderSide.BUY for o in orders)  # nothing was held, so nothing was sold
+
+
+# --- protection and exit -----------------------------------------------------------------------------
+
+
+def test_the_fill_is_protected_by_an_emulated_trailing_stop_limit_that_only_rises() -> None:
+    eng = engine()
+    s = strategy()
+    orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, RISING))
+    entry, protect = orders[0], orders[1]
+    held = eng.cache.positions_open(instrument_id=AAA, strategy_id=MOVER_ID)[0].quantity
+    facts = (
+        protect.side,
+        protect.order_type.name,
+        protect.status.name,
+        protect.emulation_trigger,
+        protect.time_in_force,
+        protect.quantity == entry.quantity == held,
+    )
+    eng.dispose()
+    assert facts == (
+        OrderSide.SELL,
+        "TRAILING_STOP_LIMIT",
+        "CANCELED",  # by the run's stop; it was held by the emulator until then (`triggers`)
+        TriggerType.BID_ASK,
+        TimeInForce.DAY,
+        True,
+    )
+    assert len(orders) == 2
+    assert s.triggers and all(a <= b for a, b in pairwise(s.triggers))
+    assert s.triggers[-1] == Decimal("10.69") - Decimal("0.21")  # the last bid less the trail
+
+
+def test_a_fall_through_the_trigger_releases_a_limit_that_sells_all_and_nothing_is_sold_flat() -> (
+    None
+):
+    """The bid falls from 10.69 to 10.45, through the trigger at 10.48: the emulator releases a DAY limit
+    below the trigger (10.42), which the bid fills. After it the strategy is flat and sends nothing."""
+    eng = engine()
+    s = strategy()
+    orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, RISING + FALL))
+    entry, exit_ = orders[0], orders[1]
+    facts = (exit_.side, exit_.order_type.name, exit_.status.name, exit_.time_in_force)
+    sold, bought = exit_.filled_qty, entry.filled_qty
+    limit = exit_.price.as_decimal()
+    flat = not eng.cache.positions_open(strategy_id=MOVER_ID)
+    eng.dispose()
+    assert facts == (OrderSide.SELL, "LIMIT", "FILLED", TimeInForce.DAY)
+    assert sold == bought and flat
+    assert limit == Decimal("10.69") - Decimal("0.21") - Decimal("0.06")  # trail, then 0.5% through
+    assert len(orders) == 2  # one buy, one sell: long only, and no sale while flat
+
+
+def test_a_release_that_rests_is_chased_down_to_the_bid_but_not_below_its_cap() -> None:
+    """A gap: the bid falls from 10.69 to 9.99 in one quote, so the released limit (10.42) rests above
+    it. Every `chase_secs` it is re-priced one tick through the bid, never below 2% under its first
+    price (10.42 -> floor 10.22); the bid is under the floor, so it rests there, unfilled, until the
+    run's stop cancels it."""
+    eng = engine()
+    s = strategy(chase_secs=5)
+    orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, [*RISING, 10.00, 10.00]))
+    exit_ = orders[1]
+    facts = (exit_.order_type.name, exit_.status.name, exit_.price.as_decimal())
+    count = len(orders)
+    eng.dispose()
+    assert facts == ("LIMIT", "CANCELED", Decimal("10.22"))
+    assert count == 2
+
+
+def test_a_chase_inside_the_cap_follows_the_bid_and_fills() -> None:
+    """The bid gaps to 10.29, inside the cap: the limit moves to 10.28 and is filled by the next quote."""
+    eng = engine()
+    s = strategy(chase_secs=5)
+    orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, [*RISING, 10.30, 10.30]))
+    exit_ = orders[1]
+    facts = (exit_.status.name, exit_.price.as_decimal())
+    flat = not eng.cache.positions_open(strategy_id=MOVER_ID)
+    count = len(orders)
+    eng.dispose()
+    assert facts == ("FILLED", Decimal("10.28"))
+    assert flat and count == 2
+
+
+def test_a_chase_by_resend_cancels_the_resting_limit_and_sends_one_at_the_new_price() -> None:
+    eng = engine()
+    s = strategy(chase_secs=5, chase="resend")
+    orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, [*RISING, 10.30, 10.30]))
+    summary = sides(orders)
+    last_price = orders[-1].price.as_decimal()
+    sold = sum(o.filled_qty.as_decimal() for o in orders if o.side == OrderSide.SELL)
+    bought = orders[0].filled_qty.as_decimal()
+    eng.dispose()
+    assert summary == ["BUY LIMIT FILLED", "SELL LIMIT CANCELED", "SELL LIMIT FILLED"]
+    assert last_price == Decimal("10.28")
+    assert sold == bought
+
+
+def test_the_hold_to_close_row_sends_no_protection_and_sells_at_the_wind_down() -> None:
+    eng = engine()
+    s = strategy(
+        protect=False,
+        wind_down_at=datetime.fromtimestamp((T0 + 10 * MINUTE) / 1e9, tz=UTC),
+        extended_hours=True,
+    )
+    orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, RISING + FALL))
+    summary = sides(orders)
+    closed_at = orders[-1].ts_init
+    flat = not eng.cache.positions_open(strategy_id=MOVER_ID)
+    eng.dispose()
+    assert summary == ["BUY LIMIT FILLED", "SELL LIMIT FILLED"]
+    assert closed_at >= T0 + 10 * MINUTE
+    assert flat
+
+
+# --- sessions and the end ----------------------------------------------------------------------------
+
+
+def test_outside_the_session_every_order_is_marked_extended_hours() -> None:
+    eng = engine()
+    s = strategy(extended_hours=True)
+    orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, RISING + FALL))
+    kinds = {(o.order_type.name, o.time_in_force.name) for o in orders}
+    eng.dispose()
+    assert len(orders) == 2 and kinds == {("LIMIT", "DAY")}
+    assert s.params == [EXTENDED_HOURS, EXTENDED_HOURS]
+
+
+def test_in_the_session_no_order_is_marked() -> None:
+    eng = engine()
+    s = strategy()
+    run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, RISING + FALL))
+    eng.dispose()
+    assert s.params == [None, None]
+
+
+def test_the_wind_down_outside_the_session_cancels_the_protection_and_sells_with_a_marked_limit() -> (
+    None
+):
+    eng = engine()
+    s = strategy(
+        extended_hours=True, wind_down_at=datetime.fromtimestamp((T0 + 6 * MINUTE) / 1e9, tz=UTC)
+    )
+    orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, RISING))
+    summary = sides(orders)
+    flat = not eng.cache.positions_open(strategy_id=MOVER_ID)
+    eng.dispose()
+    assert summary == [
+        "BUY LIMIT FILLED",
+        "SELL TRAILING_STOP_LIMIT CANCELED",
+        "SELL LIMIT FILLED",
+    ]
+    assert flat
+    assert s.params == [EXTENDED_HOURS] * 3
+
+
+def test_the_wind_down_in_the_session_is_upstreams_market_exit_and_nothing_is_entered_after() -> (
+    None
+):
+    eng = engine()
+    s = strategy(
+        wind_down_at=datetime.fromtimestamp((T0 + 6 * MINUTE) / 1e9, tz=UTC),
+        market_exit_reduce_only=False,
+        market_exit_time_in_force=TimeInForce.DAY,
+    )
+    orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, RISING))
+    last = orders[-1]
+    facts = (
+        last.side,
+        last.order_type.name,
+        last.status.name,
+        last.is_reduce_only,
+        list(last.tags or []),
+    )
+    buys = [o for o in orders if o.side == OrderSide.BUY]
+    flat = not eng.cache.positions_open(strategy_id=MOVER_ID)
+    eng.dispose()
+    assert facts == (OrderSide.SELL, "MARKET", "FILLED", False, ["MARKET_EXIT"])
+    assert len(buys) == 1 and flat
+
+
+# --- re-entry and rotation ---------------------------------------------------------------------------
+
+RECLAIM = [10.00, 10.10, 10.20, 10.30, 10.40, 10.50, 10.60, 10.70]
+
+
+def test_after_an_exit_and_the_cooldown_it_buys_back_on_a_reclaim_while_the_name_ranks() -> None:
+    """Sold at 10.45 after the fall. After the cooldown a new rising run that closes above the sale's
+    price is a reclaim: a second buy."""
+    eng = engine()
+    s = strategy(cooldown_secs=60)
+    closes = RISING + FALL + RECLAIM
+    orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, closes))
+    buys = [o for o in orders if o.side == OrderSide.BUY]
+    second_close = (buys[1].ts_init - T0) // MINUTE if len(buys) > 1 else None
+    eng.dispose()
+    assert len(buys) == 2
+    # the run must end above the sale's price: 10.50 is the first close of the new leg that does
+    assert second_close == len(RISING + FALL) + 6
+
+
+def test_no_buy_back_inside_the_cooldown_or_below_the_sale_price() -> None:
+    eng = engine()
+    s = strategy(cooldown_secs=3600)
+    orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, RISING + FALL + RECLAIM))
+    buys = [o for o in orders if o.side == OrderSide.BUY]
+    eng.dispose()
+    assert len(buys) == 1
+
+    eng = engine()
+    s = strategy(cooldown_secs=60)
+    below = [9.80, 9.85, 9.90, 9.95, 10.00, 10.05]  # rising, and never back above the sale
+    orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, RISING + FALL + below))
+    buys = [o for o in orders if o.side == OrderSide.BUY]
+    eng.dispose()
+    assert len(buys) == 1
+
+
+def test_a_freed_slot_rotates_into_the_new_top_name() -> None:
+    """AAA is sold; from minute 12 the ranking names BBB alone, whose first leg then starts."""
+    eng = engine()
+    s = strategy(slots=1, watch=1)
+    first = RISING + FALL
+    flat_then_leg = [20.0] * len(first) + [20.0, 20.2, 20.4, 20.6, 20.8, 21.0, 21.2, 21.4]
+    ranking = ranker(rank((AAA, "0.25")), values={len(first): rank((BBB, "0.3"))})
+    orders = run(eng, s, ranking, tape(AAA, first + [9.8] * 8), tape(BBB, flat_then_leg))
+    bought = [o.instrument_id for o in orders if o.side == OrderSide.BUY]
+    eng.dispose()
+    assert bought == [AAA, BBB]
+
+
+# --- handlers that an order command of its own can call back into -----------------------------------
+
+
+class Borrowed:
+    """Stands in for a strategy while one of its own commands runs: at the pin the order events that a
+    `submit_order`, `cancel_order` or `modify_order` publishes reach the handlers while the strategy
+    object is mutably borrowed, so reading an engine attribute there raises (the 24/5 run's finding).
+    Plain attributes work; the engine's do not."""
+
+    def __init__(self) -> None:
+        self.released: set[str] = set()
+        self.fills: list = []
+        self.refused: list = []
+        self.rank: list = []
+        self.rank_ns = 0
+        self.rank_faults = 0
+        self.quotes = 0
+        self.trades = 0
+
+    def __getattr__(self, name: str):
+        raise RuntimeError(f"Already mutably borrowed: {name}")
+
+
+def test_no_order_event_handler_reads_the_engine() -> None:
+    cid = SimpleNamespace(value="O-1")
+    event = SimpleNamespace(
+        client_order_id=cid,
+        instrument_id=AAA,
+        order_side=OrderSide.BUY,
+        last_qty=Quantity.from_int(1),
+        last_px=Price.from_str("10.00"),
+        released_price=Price.from_str("10.00"),
+        reason="no",
+        ts_event=1,
+    )
+    own = [
+        name
+        for name in vars(Mover)
+        if name.startswith(("on_order_", "on_position_"))
+        or name in ("on_signal", "on_quote", "on_trade")
+    ]
+    assert {"on_order_released", "on_order_filled", "on_signal"} <= set(own)
+    borrowed = Borrowed()
+    for name in own:
+        payload = (
+            SimpleNamespace(name=RANK_SIGNAL, value=rank((AAA, "0.25")), ts_event=5)
+            if name == "on_signal"
+            else event
+        )
+        getattr(Mover, name)(cast(Any, borrowed), payload)
+    assert borrowed.released == {"O-1"}
+    assert borrowed.rank == [(AAA, Decimal("0.25"))] and borrowed.rank_ns == 5
+
+
+def test_a_malformed_ranking_is_counted_and_leaves_no_ranking() -> None:
+    borrowed = Borrowed()
+    Mover.on_signal(
+        cast(Any, borrowed),
+        cast(Any, SimpleNamespace(name=RANK_SIGNAL, value="AAA.ALPACA", ts_event=5)),
+    )
+    assert borrowed.rank == [] and borrowed.rank_faults == 1
