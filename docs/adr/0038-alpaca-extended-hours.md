@@ -71,7 +71,9 @@ delegation of 2026-11-10: this record lands the execution part, and the data cli
 
 * Good: an order trades outside the regular session only when its strategy asks, in the form Alpaca takes.
 * Bad: the client does not check `overnight_tradable`. Of the overnight feeds, only `boats` has been seen
-  reaching a node (ADR 0055).
+  reaching a node (ADR 0055). A session window checks it, raw, before an overnight window starts, and
+  refuses an asset that is not eligible or is halted (ADR 0044, 2026-11-10); an order sent another way is
+  not checked.
 
 ### Confirmation
 
@@ -116,6 +118,9 @@ Read 2026-11-10; "raw": fetched with `curl` and read, not summarised.
   `SubmitOrder.params`, `ExecTesterConfig.order_params`, `LimitOrderRequest.extended_hours`, `DataFeed`
   (`BOATS`, `OVERNIGHT`), `StockDataStream`'s per-feed URL, `Asset` without `overnight_tradable`, `Calendar`
   with `session_open` and `session_close` (bundled with the pinned packages; read).
+* https://docs.alpaca.markets/us/reference/get-v2-assets-symbol_or_asset_id.md: `overnight_tradable` and
+  `overnight_halted` as values of the asset's `attributes`, where the 24/5 page calls them "boolean
+  attributes"; a session window takes either form (ADR 0044) (fetched, raw, 2026-11-10).
 * Paper, 2026-11-10, logs kept outside the repo: the feed probe at 15:59 ET (a temporary test, not kept);
   the two extended-hours tests at 16:02 ET and again at 16:16 ET (ran).
 * Paper, overnight, 23:20 ET on 2026-11-10, log kept outside the repo:

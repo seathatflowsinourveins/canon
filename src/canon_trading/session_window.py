@@ -73,8 +73,17 @@ cancels, so every request is counted). And the node's loop runs its worker
 calls in an executor of the window's own (`Calls`): after an abandoned stop no new call can start in it,
 and the check waits, at most `ADAPTER_CALL_SECS`, for the ones the adapter left running (its `_call` is
 shielded), so an order one of them sends is in the account before the check reads it. The run's node log and a
-JSON report go to `log_dir`, outside the repository. Overnight is refused: what the feeds deliver then is
-not yet observed.
+JSON report go to `log_dir`, outside the repository.
+
+An extended window runs in pre-market, after-hours or the overnight session, which Alpaca's 24/5 page
+(https://docs.alpaca.markets/us/docs/245-trading-for-trading-api.md) puts from 8:00 PM to 4:00 AM ET "on
+the evening before the trade date", following the NYSE holiday calendar, with its data on `boats` or
+`overnight` and its eligible assets marked `overnight_tradable` in the Assets API: so an overnight window
+runs only before a trade date on Alpaca's calendar, streams `boats` (`FEEDS`, ADR 0055), and starts only on
+an asset so marked and not `overnight_halted`. What reached the strategy (quotes, trades, live bars) and
+the adapter's own lines about its stream, from the node's log, go in the record; a stream that delivered
+nothing, or that the adapter logged an error for, fails the window, since the adapter reports a refused
+or ended stream only there (ADR 0055).
 
 Paper only: the execution client is `canon_alpaca`'s, whose config refuses anything but paper trading, and
 the alpaca-py client here is built with `paper=True`. The key pair comes from the environment, which
@@ -89,6 +98,7 @@ import functools
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -103,6 +113,7 @@ from dataclasses import dataclass
 from dataclasses import field
 from datetime import UTC
 from datetime import datetime
+from datetime import time as dt_time
 from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -115,6 +126,7 @@ from alpaca.common.constants import DEFAULT_RETRY_ATTEMPTS
 from alpaca.common.constants import DEFAULT_RETRY_WAIT_SECONDS
 from alpaca.common.exceptions import APIError
 from alpaca.common.rest import RESTClient
+from alpaca.data.enums import DataFeed
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide as AlpacaOrderSide
 from alpaca.trading.enums import QueryOrderStatus
@@ -137,6 +149,7 @@ from canon_alpaca.providers import counted
 from canon_alpaca.providers import not_sent
 from canon_alpaca.providers import with_http_timeout
 from nautilus_trader.common import LogLevel
+from nautilus_trader.common import logging_sync_to_disk
 from nautilus_trader.config import FileWriterConfig
 from nautilus_trader.config import LoggerConfig
 from nautilus_trader.live import LiveNode
@@ -161,6 +174,16 @@ if TYPE_CHECKING:
 
 NEW_YORK = ZoneInfo("America/New_York")
 SESSIONS = ("regular", "extended")
+OVERNIGHT_STARTS = dt_time(20, 0)
+"""The overnight session's start in New York, "8:00 PM - 4:00 AM ET", on the evening before its trade date
+(Alpaca's 24/5 page); its end is the trade date's `session_open`."""
+FEEDS = {"overnight": DataFeed.BOATS.value}
+"""The feed a window streams and warms up on in each part of a session; IEX (`FEED`) in any other. The
+overnight session's quotes, trades and bars reached a node on `boats` on paper, and `overnight` streams
+quotes only (ADR 0055); `boats` both streams and serves bars (`STREAM_FEEDS`, `BARS_FEEDS`), as the
+strategy needs of its one feed. Named in the subscriptions' and the bars request's params,
+`{"feed": ...}` (ADR 0055); one not served fails loudly, never another. Not configurable: the part
+decides."""
 DEFAULT_MINUTES = 30
 MAX_MINUTES = 60
 GAP_SECS = 300
@@ -171,10 +194,10 @@ STRATEGY_ID = StrategyId("SessionMaCross-001")
 STALE_RUNNING_SECS = 70 * 60
 """A record still `running` this long after it started is a window that died (60 minutes at most, plus
 start-up, shutdown and the account check)."""
-EXTENDED_READY = False
-"""Whether extended windows may run. The adapter sends `extended_hours` from the submit params (ADR 0038);
-a reviewed change turns this on once an extended window has passed on paper and the adapter's
-disconnect-hang fix is on `main` (ADR 0044)."""
+EXTENDED_READY = True
+"""Whether extended windows may run: pre-market, after-hours and overnight. The adapter sends
+`extended_hours` from the submit params (ADR 0038), its disconnect is bounded (ADR 0039), and an overnight
+window passed on paper before this was turned on (ADR 0044, Confirmation)."""
 POLL_SECS = 2.5
 """Between the account check's polls after the stop. A poll sends at most seven requests (`LOOKUPS`
 lookups, two reads, the clock, `CANCELS` cancels or one close), two when nothing is unsettled: at most
@@ -325,7 +348,6 @@ class WindowConfig:
 
     symbol: str = "SPY"
     session: str = "regular"
-    feed: str = FEED.value
     minutes: int = DEFAULT_MINUTES
     fast_period: int = 10
     slow_period: int = 20
@@ -338,16 +360,13 @@ class WindowConfig:
             raise ValueError(
                 f"the notional cap is sized for SPY (paper_node.MAX_NOTIONAL_PER_ORDER_USD); got {self.symbol}"
             )
-        if self.feed != FEED.value:
-            raise ValueError(f"the adapter streams the {FEED.value} feed only, got {self.feed!r}")
         if not 1 <= self.minutes <= MAX_MINUTES:
             raise ValueError(f"minutes must be 1 to {MAX_MINUTES}, got {self.minutes}")
         if self.minutes * 60 <= FLATTEN_SECS:
             raise ValueError(f"a window must be longer than its {FLATTEN_SECS} s wind-down")
         if self.session == "extended" and not EXTENDED_READY:
             raise ValueError(
-                "an extended window waits until one has passed on paper and the adapter's "
-                "disconnect-hang fix is on main (EXTENDED_READY, ADR 0044)"
+                "an extended window waits until one has passed on paper (EXTENDED_READY, ADR 0044)"
             )
 
     @property
@@ -366,8 +385,40 @@ def in_new_york(moment: datetime) -> datetime:
     return moment.replace(tzinfo=NEW_YORK) if moment.tzinfo is None else moment.astimezone(NEW_YORK)
 
 
-def session_end(session: str, clock: AlpacaClock, calendar: AlpacaCalendar | None) -> datetime:
-    """When the configured session that is open now ends, or `RuntimeError` if it is not open now."""
+def _trading_days(calendar: AlpacaCalendar | Sequence[AlpacaCalendar] | None) -> dict:
+    """The calendar's trading days by date: one day, several, or none."""
+    if calendar is None:
+        return {}
+    days = [calendar] if isinstance(calendar, AlpacaCalendar) else list(calendar)
+    return {day.date: day for day in days}
+
+
+def _session_bounds(day: AlpacaCalendar) -> tuple[datetime, datetime]:
+    """A trading day's `session_open` and `session_close` in New York, or `RuntimeError` naming each one
+    missing: both `Optional[str]` in alpaca-py's `Calendar`, and no bound is assumed in their place."""
+    session_open, session_close = day.session_open, day.session_close
+    if not session_open or not session_close:
+        missing = [n for n in ("session_open", "session_close") if not getattr(day, n)]
+        raise RuntimeError(
+            f"Alpaca's calendar for {day.date:%Y-%m-%d} gives no {' or '.join(missing)}, so the "
+            "extended session's bounds are not known"
+        )
+    opens = datetime.strptime(session_open, "%H%M").time()
+    closes = datetime.strptime(session_close, "%H%M").time()
+    return datetime.combine(day.date, opens, NEW_YORK), datetime.combine(day.date, closes, NEW_YORK)
+
+
+def session_part(
+    session: str, clock: AlpacaClock, calendar: AlpacaCalendar | Sequence[AlpacaCalendar] | None
+) -> tuple[datetime, str]:
+    """When the configured session that is open now ends, and which part of it is open (`regular`,
+    `pre-market`, `after-hours` or `overnight`), or `RuntimeError` if none is open now.
+
+    The extended session is pre-market and after-hours on a trading day, from its `session_open` to the
+    regular open and from the regular close to its `session_close`, and the overnight session, which
+    Alpaca's 24/5 page puts from 8:00 PM to 4:00 AM ET, "on the evening before the trade date", following
+    the NYSE holiday calendar: from `OVERNIGHT_STARTS` on the day before a trading day to that day's
+    `session_open`."""
     now = clock.timestamp.astimezone(NEW_YORK)
     if session == "regular":
         if not clock.is_open:
@@ -375,38 +426,52 @@ def session_end(session: str, clock: AlpacaClock, calendar: AlpacaCalendar | Non
                 "the regular session is closed; Alpaca's clock says it next opens "
                 f"{clock.next_open.astimezone(NEW_YORK):%Y-%m-%d %H:%M} New York"
             )
-        return clock.next_close.astimezone(NEW_YORK)
+        return clock.next_close.astimezone(NEW_YORK), "regular"
     if clock.is_open:
         raise RuntimeError("the regular session is open; an extended window runs outside it")
-    if calendar is None or calendar.date != now.date():
-        raise RuntimeError(f"{now:%Y-%m-%d} is not a trading day on Alpaca's calendar")
-    # both `Optional[str]` in alpaca-py's `Calendar`: a day without one does not say when the extended
-    # session starts or ends, and no bound is assumed in its place
-    session_open, session_close = calendar.session_open, calendar.session_close
-    if not session_open or not session_close:
-        missing = [n for n in ("session_open", "session_close") if not getattr(calendar, n)]
+    days = _trading_days(calendar)
+    # the overnight session open now belongs to today's trade date before 20:00, else to tomorrow's; it
+    # needs only that date's `session_open`, its end
+    starts_today = now.time() >= OVERNIGHT_STARTS
+    trade_date = now.date() + timedelta(days=1) if starts_today else now.date()
+    if (trade_day := days.get(trade_date)) is not None:
+        starts = datetime.combine(trade_date - timedelta(days=1), OVERNIGHT_STARTS, NEW_YORK)
+        if starts <= now:
+            if not trade_day.session_open:
+                _session_bounds(trade_day)  # raises, naming what is missing
+            ends = datetime.combine(
+                trade_date, datetime.strptime(trade_day.session_open, "%H%M").time(), NEW_YORK
+            )
+            if now < ends:
+                return ends, "overnight"
+    if (today := days.get(now.date())) is not None:
+        opens, closes = _session_bounds(today)
+        regular_open, regular_close = in_new_york(today.open), in_new_york(today.close)
+        if opens <= now < regular_open:
+            return regular_open, "pre-market"
+        if regular_close <= now < closes:
+            return closes, "after-hours"
+    if today is None and trade_day is None:
         raise RuntimeError(
-            f"Alpaca's calendar for {now:%Y-%m-%d} gives no {' or '.join(missing)}, so the "
-            "extended session's bounds are not known"
+            f"{now:%Y-%m-%d} is not a trading day on Alpaca's calendar, and no overnight session "
+            "is open for the next one"
         )
-    opens = datetime.strptime(session_open, "%H%M").time()
-    closes = datetime.strptime(session_close, "%H%M").time()
-    regular_open, regular_close = in_new_york(calendar.open), in_new_york(calendar.close)
-    pre = (datetime.combine(now.date(), opens, NEW_YORK), regular_open)
-    after = (regular_close, datetime.combine(now.date(), closes, NEW_YORK))
-    for start, end in (pre, after):
-        if start <= now < end:
-            return end
     raise RuntimeError(
-        f"{now:%H:%M} New York is outside pre-market and after-hours; overnight is not run"
+        f"{now:%H:%M} New York is outside pre-market, after-hours and the overnight session"
     )
 
 
+def window_feed(part: str) -> str:
+    """The feed a window on `part` of its session streams and warms up on (`FEEDS`), else IEX."""
+    return FEEDS.get(part, FEED.value)
+
+
 def window_node(
-    config: WindowConfig, *, wind_down_at: datetime, log_name: str
+    config: WindowConfig, *, wind_down_at: datetime, log_name: str, feed: str
 ) -> tuple[LiveNode, SessionMaCross, PositionCap]:
     """The node, Alpaca's clients, the native risk limits and runtime checks, with the strategy and the cap
-    it runs (returned too: the node does not hand its Python strategies back)."""
+    it runs (returned too: the node does not hand its Python strategies back). `feed` is named in the
+    strategy's subscriptions and its warm-up request (ADR 0055)."""
     extended = config.session == "extended"
     node = (
         alpaca_paper_builder(
@@ -430,6 +495,7 @@ def window_node(
             fast_period=config.fast_period,
             slow_period=config.slow_period,
             extended_hours=extended,
+            feed=feed,
             wind_down_at=wind_down_at,
             warm_up=True,  # the averages start from the adapter's last bars (ADR 0047)
             strategy_id=STRATEGY_ID,
@@ -482,6 +548,20 @@ class WindowReport:
     """The closes the account check sent that placed nothing: refused by Alpaca (403, 422), or never sent
     (a connect timeout); `errors` holds what each was answered."""
     errors: list[str] = field(default_factory=list)
+    part: str = ""
+    """The part of the session the window ran in: `regular`, `pre-market`, `after-hours`, `overnight`."""
+    feed: str = ""
+    """The feed the strategy streamed and warmed up on (ADR 0055)."""
+    overnight: str = ""
+    """What Alpaca's asset said of the symbol overnight, for an overnight window."""
+    quotes: int = 0
+    trades: int = 0
+    live_bars: int = 0
+    """The quotes, trades and live bars that reached the strategy: none of the first two is a stream that
+    delivered nothing (`result` failed); trades and no bars, a quiet market."""
+    stream: list[str] = field(default_factory=list)
+    """The adapter's own log lines about its stream (`STREAM_LINES`): alpaca-py's warnings and errors,
+    the stream's end by itself and a subscription it refused. An error among them fails the window."""
     warm_up_bars: int = 0
     warm_up_dropped: int = 0
     result: str = "running"
@@ -569,16 +649,18 @@ def write_heartbeat(log_dir: Path, outcome: str) -> None:
     )
 
 
-def session_now(trading: TradingClient) -> tuple[AlpacaClock, AlpacaCalendar | None, float]:
-    """Alpaca's clock and today's calendar day (New York), read once per run, and the `time.monotonic()`
+def session_now(trading: TradingClient) -> tuple[AlpacaClock, list[AlpacaCalendar], float]:
+    """Alpaca's clock and the calendar's days from today to tomorrow (New York; a day that is not a
+    trading day is absent), read once per run, and the `time.monotonic()`
     at which the clock's answer arrived: its timestamp is as old as the time since, whatever the read's
     own retries took before it."""
     clock = trading.get_clock()
     read_at = time.monotonic()
     assert isinstance(clock, AlpacaClock)
     today = clock.timestamp.astimezone(NEW_YORK).date()
-    days = trading.get_calendar(GetCalendarRequest(start=today, end=today))
-    return clock, days[0] if isinstance(days, list) and days else None, read_at
+    # the next day too: an overnight session that starts at 20:00 belongs to the next trading day
+    days = trading.get_calendar(GetCalendarRequest(start=today, end=today + timedelta(days=1)))
+    return clock, list(days) if isinstance(days, list) else [], read_at
 
 
 def paper_trading() -> TradingClient:
@@ -656,7 +738,7 @@ def run_window(
     config: WindowConfig,
     *,
     trading: TradingClient | None = None,
-    market: tuple[AlpacaClock, AlpacaCalendar | None] | None = None,
+    market: tuple[AlpacaClock, AlpacaCalendar | Sequence[AlpacaCalendar] | None] | None = None,
     market_read_at: float | None = None,
 ) -> WindowReport:
     """Run one window as the module header describes; raise if it cannot start or is not left flat.
@@ -675,9 +757,11 @@ def run_window(
         clock, calendar = market
         read_at = time.monotonic() if market_read_at is None else market_read_at
     try:
-        end_of_session = session_end(config.session, clock, calendar)
+        end_of_session, part = session_part(config.session, clock, calendar)
     except RuntimeError as e:
         raise WindowRefused(str(e)) from e
+    overnight = overnight_eligibility(trading, config.symbol) if part == "overnight" else ""
+    feed = window_feed(part)
     if left := leftovers(trading, config.symbol):
         raise WindowRefused(
             f"the paper account is not flat in {config.symbol}; not starting: {left}"
@@ -694,7 +778,14 @@ def run_window(
         raise WindowSkipped(f"the start-up reads left under {FLATTEN_SECS + 1} s of the window")
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     report = WindowReport(
-        config.session, config.symbol, started=stamp, planned_seconds=seconds, shortened=shortened
+        config.session,
+        config.symbol,
+        started=stamp,
+        planned_seconds=seconds,
+        shortened=shortened,
+        part=part,
+        feed=feed,
+        overnight=overnight,
     )
     write_record(
         config.log_dir, report
@@ -707,7 +798,10 @@ def run_window(
     unsettled: dict[str, tuple[str, str]] = {}
     try:
         node, strategy, cap = window_node(
-            config, wind_down_at=ends - timedelta(seconds=FLATTEN_SECS), log_name=f"window-{stamp}"
+            config,
+            wind_down_at=ends - timedelta(seconds=FLATTEN_SECS),
+            log_name=f"window-{stamp}",
+            feed=feed,
         )
         cache = node.cache
         try:
@@ -720,6 +814,8 @@ def run_window(
                 report.dropped = list(strategy.dropped)
                 report.warm_up_bars = strategy.history_bars
                 report.warm_up_dropped = strategy.history_dropped
+                report.quotes, report.trades = strategy.quotes, strategy.trades
+                report.live_bars = strategy.live_bars
                 report.cap_checks, report.cap_peak = cap.checks, str(cap.peak)
                 report.cap_tripped = cap.tripped
             finally:
@@ -754,12 +850,16 @@ def run_window(
             report.ended = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
             if ran:
                 marker.write_text(str(time.time()))
+                _read_stream_lines(report, config.log_dir / f"window-{stamp}.log")
+            no_data = _data_failure(report) if ran else None
             if failure is not None:
                 report.result = f"failed: {type(failure).__name__}: {failure}"
             elif report.left:
                 report.result = f"failed: not left flat: {report.left}"
             elif report.cap_tripped:
                 report.result = f"failed: {report.cap_tripped}"
+            elif no_data:
+                report.result = f"failed: {no_data}"
             else:
                 report.result = "ok"
             write_record(config.log_dir, report)
@@ -767,7 +867,86 @@ def run_window(
         raise RuntimeError(f"the paper account was not left flat in {config.symbol}: {report.left}")
     if report.cap_tripped:
         raise RuntimeError(f"the position cap stopped the window: {report.cap_tripped}")
+    if no_data:
+        raise RuntimeError(f"the window ran without market data: {no_data}")
     return report
+
+
+STREAM_LINES = ("Alpaca stream on feed ", "Cannot subscribe: ")
+"""How the adapter's data client begins each line it logs about its stream: alpaca-py's own warnings and
+errors, relayed from the stream's thread, the stream's end by itself, and a subscription it refused, a
+feed other than its stream's among them (`canon_alpaca.data`, ADR 0055; the package README)."""
+LOG_LEVEL = re.compile(r"^\S+ \[(?P<level>[A-Z]+)\] ")
+"""The level of a line of the node's plain-text log, `<timestamp> [LEVEL] <component>: <message>`."""
+MAX_STREAM_LINES = 20
+
+
+def _read_stream_lines(report: WindowReport, log: Path) -> None:
+    """Copy the adapter's stream lines from the node's log (`STREAM_LINES`, at most `MAX_STREAM_LINES`,
+    then a count) into `report.stream`: the log is where the adapter reports a stream Alpaca refused or
+    that ended, since the subscription has returned by then (ADR 0055). A log that cannot be read is
+    noted in `errors`."""
+    # The node's logger writes on its own thread; wait until what it was sent is on disk
+    # (`logging_sync_to_disk`, as the adapter's tests do).
+    logging_sync_to_disk()
+    try:
+        lines = [line.strip() for line in log.read_text(errors="replace").splitlines()]
+    except OSError as e:
+        _note(report, f"reading the node log for the stream's own lines: {type(e).__name__}: {e}")
+        return
+    found = [line for line in lines if any(mark in line for mark in STREAM_LINES)]
+    report.stream = found[:MAX_STREAM_LINES]
+    if len(found) > MAX_STREAM_LINES:
+        report.stream.append(f"... and {len(found) - MAX_STREAM_LINES} more such lines")
+
+
+def _data_failure(report: WindowReport) -> str | None:
+    """Why the window's market data cannot be trusted, or None: the adapter logged an error about its
+    stream (it ended by itself, or Alpaca refused it), or the stream delivered no quote and no trade for
+    the symbol in the whole window. A window with quotes but no trade, and so no bar, is a quiet market,
+    not a failure: overnight that is normal (the record's `live_bars` shows it)."""
+    if errors := [
+        line
+        for line in report.stream
+        if (level := LOG_LEVEL.match(line)) is not None and level["level"] == "ERROR"
+    ]:
+        return f"the {report.feed} data stream reported an error: {errors[0]}"
+    if not report.quotes and not report.trades:
+        return (
+            f"no market data: the {report.feed} stream delivered no quote and no trade for "
+            f"{report.symbol} in {report.seconds} s"
+        )
+    return None
+
+
+def overnight_eligibility(trading: TradingClient, symbol: str) -> str:
+    """What Alpaca says of `symbol` in the overnight session, or `WindowRefused` if it is not eligible
+    there or is halted for it. Alpaca's 24/5 page: "Assets tradable in the overnight session can be
+    identified via the `overnight_tradable` attribute in the Assets API", with `overnight_halted` for an
+    eligible asset halted overnight; the page calls them boolean attributes and the asset reference lists
+    them as values of `attributes`, so either form counts. Read raw, through alpaca-py's own
+    `RESTClient.get` on the path `get_asset` calls, since alpaca-py 0.45.0's `Asset` has no such field."""
+    try:
+        asset = trading.get(f"/assets/{symbol}")
+    except FAILED as e:
+        raise WindowRefused(
+            f"Alpaca's asset for {symbol} could not be read ({type(e).__name__}: {e}), so whether it "
+            "trades overnight is not known; not starting"
+        ) from e
+    if not isinstance(asset, dict):
+        raise WindowRefused(f"Alpaca's asset for {symbol} could not be read: {asset!r}")
+    attributes = asset.get("attributes") or []
+
+    def says(name: str) -> bool:
+        return asset.get(name) is True or name in attributes
+
+    if not says("overnight_tradable"):
+        raise WindowRefused(
+            f"{symbol} is not overnight_tradable on Alpaca's asset; no overnight window runs on it"
+        )
+    if says("overnight_halted"):
+        raise WindowRefused(f"{symbol} is overnight_halted on Alpaca's asset; not starting")
+    return "overnight_tradable"
 
 
 TERMINAL = frozenset({"filled", "canceled", "expired", "rejected"})
@@ -1296,7 +1475,9 @@ def _fill(report: WindowReport, cache) -> None:
                 report.denials[order.client_order_id.value] = str(event.reason)
 
 
-def resolve_session(clock: AlpacaClock, calendar: AlpacaCalendar | None) -> tuple[str | None, str]:
+def resolve_session(
+    clock: AlpacaClock, calendar: AlpacaCalendar | Sequence[AlpacaCalendar] | None
+) -> tuple[str | None, str]:
     """The session `--session auto` runs, from Alpaca's clock and calendar, or None and why not: the
     regular session when the clock says it is open; else the extended one, if `EXTENDED_READY` and it is
     open now; else nothing. The schedule fires on a timer and leaves this choice to Alpaca's clock."""
@@ -1308,10 +1489,10 @@ def resolve_session(clock: AlpacaClock, calendar: AlpacaCalendar | None) -> tupl
             "the regular session is closed and extended windows are not on (EXTENDED_READY)",
         )
     try:
-        session_end("extended", clock, calendar)
+        _, part = session_part("extended", clock, calendar)
     except RuntimeError as e:
         return None, str(e)
-    return "extended", "outside the regular session, inside pre-market or after-hours"
+    return "extended", f"outside the regular session, in its {part} part"
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1393,7 +1574,10 @@ def _main(args: argparse.Namespace) -> int:
                 return 0
             session = resolved
         config = WindowConfig(
-            symbol=args.symbol, session=session, minutes=args.minutes, log_dir=args.log_dir
+            symbol=args.symbol,
+            session=session,
+            minutes=args.minutes,
+            log_dir=args.log_dir,
         )
         write_heartbeat(args.log_dir, f"a {session} window")
         report = run_window(config, trading=trading, market=market, market_read_at=market_read_at)
