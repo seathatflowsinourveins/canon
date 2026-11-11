@@ -238,3 +238,10 @@ clone of the tag unless named otherwise (`read`).
   page's proxy line, the Anthropic and maintainer quotes, the mise review wording, the sampling rate and
   the trial's settings, and found the untried per-CLI overrides, `runtimeEnv.ts`, `secrets.ts`, #13893 and
   the organisation's age; all above.
+* Installation held, 2026-11-11: rule 2's install step is not to be run, and the owner installs nothing of
+  OmniRoute, until three questions have answers. Why npm's provenance names `diegosouzapw/OmniRoute` for
+  3.8.51 and `cheaper-inference/OmniRoute` for 3.8.53 (a transfer, a fork or a new owner); which pin, 3.8.50
+  (the last with npm's staged-publish approver) or a newer one under exemptions; and whether a documented
+  setting closes what two further readers (Codex, Antigravity) found in OmniRoute itself after landing: a
+  loopback CLI token that can export decrypted provider credentials, and prompt and response bodies written
+  under `call_logs/` although `ENABLE_REQUEST_LOGS=false` (read, not yet reproduced).
