@@ -33,8 +33,9 @@ arrangement with Alpaca, and outside what agents decide.
 * **When the harness is done for now.** Six checks end harness growth; once they hold, one lane does its
   maintenance and the others take steps 6 to 8 (ADR 0071, accepted, with ADR 0073's exit rule for review
   rounds); check 3's duties and handover are placed by ADR 0078. Enhancing a runtime as a named configuration waits on containment (ADR 0072, `proposed`).
-* **Overfitting probability.** Its proposed role is a diagnostic beside the gate; no implementation is
-  adopted until one passes this repo's tests (ADR 0027 and ADR 0032, both `proposed`).
+* **Overfitting probability.** Settled as a diagnostic beside the gate, never a pass or fail (ADR 0027,
+  accepted); skfolio's splitter and Sharpe ratio with Algorithm 2.3's last steps as code here (ADR 0032,
+  accepted). Open until that code lands.
 * **A trial that never traded, or a configuration that never runs to the end**, stops every ranking of
   its study; what value it should count as is undecided (ADR 0010, ADR 0054).
 * **One paper account or several.** ADR 0010 step 4 runs the pick and the incumbent on separate paper
