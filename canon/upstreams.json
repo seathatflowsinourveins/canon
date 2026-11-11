@@ -9,7 +9,7 @@
       "track": "tag:v2.1.321",
       "role": "platform",
       "license": "UNVERIFIED (LICENSE.md not read)",
-      "why": "The agent harness itself; its docs define every config layer this repo uses. The terminal CLI is installed at this pin and held at or above it (ADR 0022).",
+      "why": "The agent harness itself; its docs define every config layer this repo uses. The terminal CLI is installed at this pin and held at or above it (ADR 0022). Held 2026-11-10: v2.1.322 (published 2026-11-10; notes: fast mode on Vertex) waits for the stable channel, about a week behind latest (ADR 0008, ADR 0022); a move also changes minimumVersion in home/.claude/settings.json. Look again 2026-11-17.",
       "evidence": [
         "https://github.com/anthropics/claude-code/releases",
         "https://code.claude.com/docs/en/memory",
@@ -159,7 +159,7 @@
       "track": "tag:v20.0.48",
       "role": "tool",
       "license": "MIT",
-      "why": "Most-adopted local token/cost reporter; reads Claude Code's own session logs, no backend needed.",
+      "why": "Most-adopted local token/cost reporter; reads Claude Code's own session logs, no backend needed. Held 2026-11-10: v20.0.49 (published 2026-11-10; notes: 1h cache writes in JSON model breakdowns, a cline adapter, fixes; nothing breaking) is not moved because files that carry its version belong to other work in progress. A move touches .claude/skills/lane-report/SKILL.md, scripts/test-land, scripts/check-addresses (a comment), mise.toml (a comment), ADR 0008's table and ADR 0007's Evidence line; the past run ADR 0007 records stays as written. Look again 2026-11-13.",
       "evidence": [
         "https://github.com/ryoppippi/ccusage"
       ],
@@ -190,7 +190,7 @@
       "track": "tag:v2026.11.5",
       "role": "tool",
       "license": "MIT",
-      "why": "Pinned, lockfile-backed tool versions installable without sudo.",
+      "why": "Pinned, lockfile-backed tool versions installable without sudo. Held 2026-11-10: v2026.11.6 (published 2026-11-10; notes: features and fixes, the default prompt theme now base16, nothing that touches mise.toml) is not moved because files that carry its version belong to other work in progress. A move touches scripts/bootstrap (MISE_VERSION), .github/workflows/ci.yml (the mise-action version input), home/.claude/canon/paper-session.sh (a comment), and ADR 0008's table and Evidence line; scripts/canon's self-test fixture and the trials ADRs 0029, 0033, 0040 and 0050 record stay as written. Look again 2026-11-13.",
       "evidence": [
         "https://mise.jdx.dev/installing-mise.html",
         "https://mise.jdx.dev/dev-tools/"
@@ -219,7 +219,7 @@
       "track": "tag:v2.0.0rc8",
       "role": "foundation",
       "license": "LGPL-3.0",
-      "why": "Backtest + live engine sharing one strategy codebase. v2 is the line upstream docs describe; still a release candidate.",
+      "why": "Backtest + live engine sharing one strategy codebase. v2 is the line upstream docs describe; still a release candidate. Held 2026-11-10: v2.0.0rc9 (pre-release, published 2026-11-10) lists 89 breaking changes; the five that touch names this repository uses are in ADR 0009's Evidence and are the scope for reading it against the adapter before it moves. Look again 2026-11-13.",
       "evidence": [
         "https://github.com/nautechsystems/nautilus_trader/releases",
         "https://nautilustrader.io/docs/latest/concepts/live/",
@@ -524,7 +524,7 @@
       "track": "tag:rust-v0.167.0",
       "role": "tool",
       "license": "Apache-2.0",
-      "why": "OpenAI's Codex CLI, a second agent runtime from another model family, used only as an Orca worker that reads a change and reports findings: an additional reader beside /code-review that never edits, lands or blocks (ADR 0043). Installed machine-level by the owner (mise use -g codex@0.167.0, aqua:openai/codex), not in mise.toml; check with codex --version. Upstream tags about eight rust-vX.Y.Z-alpha.N pre-releases per stable release; scripts/canon outdated ignores them for this stable pin. rust-v0.167.1 was tagged 2026-11-10 with no release and is not adopted.",
+      "why": "OpenAI's Codex CLI, a second agent runtime from another model family, used only as an Orca worker that reads a change and reports findings: an additional reader beside /code-review that never edits, lands or blocks (ADR 0043). Installed machine-level by the owner (mise use -g codex@0.167.0, aqua:openai/codex), not in mise.toml; check with codex --version. Upstream tags about eight rust-vX.Y.Z-alpha.N pre-releases per stable release; scripts/canon outdated ignores them for this stable pin. Held 2026-11-10: rust-v0.167.1 (released 2026-11-10; three commits, incremental tools, nothing under codex-rs/otel, so the event names home/.codex/otel.toml and ADR 0007 rest on are unchanged) moves only with the owner's hand install. Look again 2026-11-13.",
       "evidence": [
         "https://github.com/openai/codex/releases",
         "https://raw.githubusercontent.com/openai/codex/rust-v0.167.0/LICENSE",
@@ -570,7 +570,7 @@
       "track": "tag:dsh-v0.2.1-rc.3",
       "role": "tool",
       "license": "MIT",
-      "why": "DeepSeek Harness (npm @deepseek-ai/dsh), the engine under dsh-tui, a review-only Orca worker from another model family (ADR 0045, under ADR 0043's terms). Every tag is a pre-release. Installed machine-level by the owner (npm:@deepseek-ai/dsh 0.2.1-rc.3, with pnpm for its profile), not in mise.toml; check with dsh --version. Seven community plugins and two of its own hook packages installed machine-level into the dsh-tui profile, chosen for workflow from a community list that is not a review: aegis 2.14.2 (GanyuanRan/Aegis at commit 0461c211e4d8, MIT), dsh-doublecheck 0.9.29 (PerryLink, Apache-2.0), dsh-advisor 0.6.4 (omdsh-dev, MIT), dsh-github-skills 0.2.1 (Starfie1d1272, Apache-2.0), dsh-llm-fallbacks 0.6.12 (omdsh-dev, MIT by its LICENSE file; npm gives none), dsh-memento 0.5.28 (PerryLink, Apache-2.0), dsh-tui-find 0.5.2 (xiaoxiaohaigui, MIT), and the hook packages @deepseek-ai/dsh-hooks-claude-code and @deepseek-ai/dsh-hook-protocol 0.2.1-rc.3 (deepseek-ai/deepseek-harness, MIT). Versions and licences from the profile's installed package files; none was read beyond them.",
+      "why": "DeepSeek Harness (npm @deepseek-ai/dsh), the engine under dsh-tui, a review-only Orca worker from another model family (ADR 0045, under ADR 0043's terms). Every tag is a pre-release. Installed machine-level by the owner (npm:@deepseek-ai/dsh 0.2.1-rc.3, with pnpm for its profile), not in mise.toml; check with dsh --version. Seven community plugins and two of its own hook packages installed machine-level into the dsh-tui profile, chosen for workflow from a community list that is not a review: aegis 2.14.2 (GanyuanRan/Aegis at commit 0461c211e4d8, MIT), dsh-doublecheck 0.9.29 (PerryLink, Apache-2.0), dsh-advisor 0.6.4 (omdsh-dev, MIT), dsh-github-skills 0.2.1 (Starfie1d1272, Apache-2.0), dsh-llm-fallbacks 0.6.12 (omdsh-dev, MIT by its LICENSE file; npm gives none), dsh-memento 0.5.28 (PerryLink, Apache-2.0), dsh-tui-find 0.5.2 (xiaoxiaohaigui, MIT), and the hook packages @deepseek-ai/dsh-hooks-claude-code and @deepseek-ai/dsh-hook-protocol 0.2.1-rc.3 (deepseek-ai/deepseek-harness, MIT). Versions and licences from the profile's installed package files; none was read beyond them. Held 2026-11-10: dsh-v0.2.2-rc.1 (2026-11-04; needs Node >=24.9) moves only with the hand-installed engine: after the owner upgrades it and dsh-tui and scripts/bootstrap --check still shows the review patch ok, both pins move in one pull request (ADR 0045 Evidence). Look again 2026-11-13.",
       "evidence": [
         "https://github.com/deepseek-ai/deepseek-harness",
         "https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/dsh-v0.2.1-rc.3/packages/session/session-log-deepseek/README.md",
@@ -594,7 +594,7 @@
       "track": "tag:v0.17.0",
       "role": "tool",
       "license": "MIT",
-      "why": "Community terminal interface for DeepSeek Harness, the program Orca launches for it (dsh-tui .) under agent id dsh (its CLI bundle); which versions Orca's fixtures used is UNVERIFIED; 0.17.0 follows dsh 0.2.1-rc.3 (ADR 0045). Installed machine-level by the owner (npm:@deepseek-harness-tui/dsh-tui 0.17.0), not in mise.toml; its profile lives in the user's home and its update command updates the profile and aligns the launcher, outside the pin. Its profiles send session logs to the configured base URL by default (session-log-deepseek.enabled, true); its configuration page at v0.17.0 documents a user profile patch row that sets it false, which scripts/bootstrap --install adds to the dsh-tui profile with the dsh-memento row memento.enabled false (ADR 0045).",
+      "why": "Community terminal interface for DeepSeek Harness, the program Orca launches for it (dsh-tui .) under agent id dsh (its CLI bundle); which versions Orca's fixtures used is UNVERIFIED; 0.17.0 follows dsh 0.2.1-rc.3 (ADR 0045). Installed machine-level by the owner (npm:@deepseek-harness-tui/dsh-tui 0.17.0), not in mise.toml; its profile lives in the user's home and its update command updates the profile and aligns the launcher, outside the pin. Its profiles send session logs to the configured base URL by default (session-log-deepseek.enabled, true); its configuration page at v0.17.0 documents a user profile patch row that sets it false, which scripts/bootstrap --install adds to the dsh-tui profile with the dsh-memento row memento.enabled false (ADR 0045). Held 2026-11-10: v0.19.0 (2026-11-06) keeps the user patch format and is validated against dsh 0.2.2-rc.1; it moves only with the hand-installed version: after the owner upgrades it and deepseek-harness and scripts/bootstrap --check still shows the review patch ok, both pins move in one pull request (ADR 0045 Evidence). Look again 2026-11-13.",
       "evidence": [
         "https://github.com/ccch1mneyyy/dsh-TUI/releases",
         "https://raw.githubusercontent.com/ccch1mneyyy/dsh-TUI/v0.17.0/README.md",
@@ -612,7 +612,7 @@
       "track": "tag:v10.34.9",
       "role": "tool",
       "license": "MIT",
-      "why": "Package manager dsh-tui needs to build and update its profile (ADR 0045). Installed machine-level by the owner (mise pnpm 10.34.9), not in mise.toml; check with pnpm --version. It runs on the machine-level mise node, 24.22.2 by mise ls -g; the node entry is this repo's own request, which the same release meets.",
+      "why": "Package manager dsh-tui needs to build and update its profile (ADR 0045). Installed machine-level by the owner (mise pnpm 10.34.9), not in mise.toml; check with pnpm --version. It runs on the machine-level mise node, 24.22.2 by mise ls -g; the node entry is this repo's own request, which the same release meets. Held 2026-11-10: v12.19.0 (published 2026-11-10) is two major versions past v10; the v11.0.0 and v12.0.0 notes are not yet read against dsh-tui's use, and pin and hand install move together; mise's 24-hour minimum_release_age default (ADR 0008) would not install it before 2026-11-11 either. No record sets a waiting period for a pin moved by hand (ADR 0016's seven days is the bot's; ADR 0001 only quotes Dependabot's default). Look again 2026-11-13.",
       "evidence": [
         "https://github.com/pnpm/pnpm/releases/tag/v10.34.9",
         "https://raw.githubusercontent.com/ccch1mneyyy/dsh-TUI/main/README.md"
@@ -676,7 +676,7 @@
       "track": "tag:v1.12.8",
       "role": "tool",
       "license": "BSD-3-Clause",
-      "why": "Computes the deflated Sharpe ratio that gates a ranking (ADR 0010, computed per ADR 0031): measures.expected_max_sharpe_ratio, probabilistic_sharpe_ratio and deflated_sharpe_ratio follow Bailey and Lopez de Prado (2014), eqs. 1-2. The gate calls only those three; the test also reads its mean, standard_deviation, skew and kurtosis.",
+      "why": "Computes the deflated Sharpe ratio that gates a ranking (ADR 0010, computed per ADR 0031): measures.expected_max_sharpe_ratio, probabilistic_sharpe_ratio and deflated_sharpe_ratio follow Bailey and Lopez de Prado (2014), eqs. 1-2. The gate calls only those three; the test also reads its mean, standard_deviation, skew and kurtosis. Held 2026-11-10: v1.12.9 (published 2026-11-10; notes: two prior-model fixes; measures/_measures.py unchanged) is not moved because files that carry its version belong to other work in progress. A move touches pyproject.toml and uv.lock (uv add skfolio==1.12.9), src/canon_trading/ranking.py, returns_matrix.py and ledger.py, tests/test_deflated_sharpe.py docs/architecture.md (the returns-matrix and gate rows) and ADR 0031's version lines; the past reads ADRs 0032, 0035 and 0041 record stay as written. Look again 2026-11-13.",
       "evidence": [
         "https://pypi.org/pypi/skfolio/json",
         "https://raw.githubusercontent.com/skfolio/skfolio/433991778607285ecd274942e89029190c45e44c/src/skfolio/measures/_measures.py",

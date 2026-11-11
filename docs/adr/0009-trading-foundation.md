@@ -113,3 +113,18 @@ Read 2026-11-09 (fetched; fetches are model-summarised. Pins resolved by `script
   adapters; last commits 2026-10-18 and 2026-10-01.
 * Second reader, 2026-11-09 (`evidence-verifier`): 17 of 19 claims supported. The two corrections (the
   "alpha" wording and the Python range) and the fractional-share limit are applied above.
+* https://github.com/nautechsystems/nautilus_trader/releases/tag/v2.0.0rc9 — pre-release published
+  2026-11-10; read 2026-11-10 (`gh`), held at `v2.0.0rc8`. Its Breaking Changes list has 89 entries. Most
+  name Rust APIs or venue adapters this repository does not use. A name search of `packages/canon-alpaca`
+  and `src/canon_trading` for 26 Python-facing names among them (`git grep`) matched three entries; two more name
+  nothing used here but sit on the same paths (modify and cancel refusals, and `from_decimal`). The entries not searched for
+  are UNVERIFIED, and so is whether these five change behaviour here; they are the scope for reading rc9
+  against the adapter:
+  local modify and cancel refusals are now denied events (`on_order_modify_denied`,
+  `on_order_cancel_denied`; neither name is used here); the modify and cancel rejection emitters take
+  `causation_id` (`execution.py` calls `generate_order_modify_rejected` and
+  `generate_order_cancel_rejected`); raw `Price` and `Quantity` construction and decoding reject digits
+  beyond precision, and, a separate entry, `from_decimal` rounds half even (not called here; `execution.py` builds `Price` and `Quantity`, and
+  `Price.from_str` appears in `constants.py`, `execution.py`, `session_ma_cross.py` and the adapter's tests);
+  Parquet consolidation rejects gaps unless `ensure_contiguous_files=False` (`backtest.py` names
+  `ParquetDataCatalog.consolidate_data`). Look again on 2026-11-13.
