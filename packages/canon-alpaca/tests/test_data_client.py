@@ -18,6 +18,7 @@ thread that does not stop.
 import asyncio
 import gc
 import logging
+import re
 import threading
 import weakref
 from collections.abc import Awaitable
@@ -379,7 +380,8 @@ def test_alpaca_clients_are_built_for_paper_and_iex(venue) -> None:
 def test_shutdown_stops_and_joins_the_stream_thread(venue) -> None:
     run(build_node(Consumer()), "hosted")
 
-    assert venue.stream.run_threads == ["ALPACA-stream"]
+    (name,) = venue.stream.run_threads
+    assert re.fullmatch(r"ALPACA-stream-\d+", name)
     assert venue.stream.stopped.is_set()
     assert stream_threads_alive(venue.stream) == []
 
@@ -544,7 +546,7 @@ def test_bar_request_with_no_bounds_starts_at_the_beginning_of_the_day(venue, al
     start_sent, end_sent = sent_window(venue)
     now = end_sent + DAY  # the node clock's time when the request was made
     midnight = datetime.combine(now.astimezone(NEW_YORK).date(), datetime.min.time(), NEW_YORK)
-    assert start_sent == midnight - DAY
+    assert start_sent == midnight.astimezone(UTC) - DAY  # 24 elapsed hours, as the client moves it
     assert start_sent <= end_sent
     assert strategy.seen_responses == [(strategy.request_id, None)]
     assert [b.ts_event for b in strategy.seen_bars] == opens_received(venue, alpaca)
@@ -708,10 +710,10 @@ def test_one_sided_quote_count_restarts_after_resubscribing(venue, alpaca, capfd
     async def body(client) -> None:
         await client._subscribe_quotes(command(AAPL))
         for _ in range(2):
-            client._emit_quote(client._stream, alpaca.quote(bp=0.0, bs=0))
+            client._emit_quote(client._quote_symbols["AAPL"], alpaca.quote(bp=0.0, bs=0))
         await client._unsubscribe_quotes(command(AAPL))
         await client._subscribe_quotes(command(AAPL))
-        client._emit_quote(client._stream, alpaca.quote(bp=0.0, bs=0))
+        client._emit_quote(client._quote_symbols["AAPL"], alpaca.quote(bp=0.0, bs=0))
 
     run_with_client(body)
 
@@ -732,9 +734,18 @@ def test_logged_waits_for_lines_still_queued_after_a_run(venue, capfd) -> None:
 
 
 def test_quote_for_a_symbol_not_subscribed_is_dropped(venue, alpaca) -> None:
+    venue.stream.quotes = []
+
     async def body(client) -> None:
-        # As a late message after an unsubscribe would arrive.
-        client._emit_quote(client._stream, alpaca.quote())
+        await client._subscribe_quotes(command(AAPL))
+        await wait_until(venue.stream.running.is_set)
+        handler = venue.stream.quote_handlers["AAPL"]
+        await client._unsubscribe_quotes(command(AAPL))
+        assert client._stream is not None  # the stream still runs; only the symbol is gone
+        # As a late message after an unsubscribe would arrive, on the stream's thread.
+        await asyncio.to_thread(asyncio.run, handler(alpaca.quote()))
+        for _ in range(5):
+            await asyncio.sleep(0.01)
 
     cache = run_with_client(body)
 
@@ -796,7 +807,7 @@ def test_disconnect_clears_state_when_the_stream_thread_does_not_stop(venue, mon
             assert client._stream is None
             assert client._stream_thread is None
             assert client._historical is None
-            assert client._quote_symbols == set()
+            assert client._quote_symbols == {}
         finally:
             venue.stream.release.set()
 
@@ -918,7 +929,7 @@ def test_subscription_after_the_stream_ended_by_itself_is_refused(venue) -> None
         )
         with pytest.raises(RuntimeError, match="ended by itself"):
             await client._subscribe_trades(command(AAPL))
-        assert client._trade_symbols == set()
+        assert client._trade_symbols == {}
 
     run_with_client(body)
 
@@ -1006,9 +1017,11 @@ def test_a_stream_given_at_construction_serves_one_connect(venue, monkeypatch) -
 def test_bars_window_with_no_start_is_the_end_days_window_in_elapsed_time(
     end, now, interval, window
 ):
-    start_sent, end_sent = canon_alpaca.data.alpaca_bars_window(None, end, now, interval)
+    sent = canon_alpaca.data.alpaca_bars_window(None, end, now, interval)
 
-    assert (start_sent, end_sent) == window
+    assert sent is not None
+    start_sent, end_sent = sent
+    assert sent == window
     assert start_sent <= end_sent
 
 
@@ -1145,7 +1158,7 @@ def test_a_disconnect_cancelled_by_the_node_still_clears_the_clients_state(venue
             assert client._stream is None
             assert client._stream_thread is None
             assert client._historical is None
-            assert client._quote_symbols == set()
+            assert client._quote_symbols == {}
             assert client._one_sided_quotes == {}
         finally:
             venue.stream.release.set()
@@ -1355,9 +1368,9 @@ def test_a_subscription_on_another_feed_than_the_stream_is_refused(venue, capfd)
             await client._subscribe_trades(command(AAPL, params={"feed": "sip"}))
         with pytest.raises(ValueError, match="asks for overnight"):  # already subscribed, on boats
             await client._subscribe_quotes(command(AAPL, params={"feed": "overnight"}))
-        assert client._trade_symbols == set()
+        assert client._trade_symbols == {}
         await client._subscribe_trades(command(AAPL, params={"feed": "boats"}))
-        assert client._trade_symbols == {"AAPL"}
+        assert list(client._trade_symbols) == ["AAPL"]
 
     run_with_client(body)
 
@@ -1372,6 +1385,7 @@ def test_a_subscription_on_another_feed_than_the_stream_is_refused(venue, capfd)
         ("otc", ValueError, "subscriptions take feed iex, sip, delayed_sip, boats, overnight"),
         ("BOATS", ValueError, "params named 'BOATS'"),
         (1, TypeError, "must name an Alpaca feed"),
+        (None, TypeError, "must name an Alpaca feed .* got None"),
     ],
 )
 def test_a_subscription_naming_a_feed_alpaca_does_not_stream_sends_nothing(
@@ -1417,9 +1431,10 @@ def test_a_feed_alpaca_refuses_fails_loudly_naming_it(venue, capfd) -> None:
 
     assert cache.quote(AAPL) is None
     log = logged(capfd)
-    assert (
-        "Alpaca stream on feed sip: error during websocket communication: insufficient subscription"
-        in log
+    assert re.search(
+        r"Alpaca stream on feed sip \(ALPACA-stream-\d+\): error during websocket "
+        "communication: insufficient subscription",
+        log,
     )
     assert "Alpaca stream on feed sip ended by itself while subscribed" in log
 
@@ -1469,7 +1484,9 @@ def test_an_old_stream_threads_log_lines_are_not_taken_for_the_new_streams(
     run_with_client(body)
 
     log = logged(capfd)
-    assert "Alpaca stream on feed boats: websocket error: new" in log
+    assert re.search(
+        r"Alpaca stream on feed boats \(ALPACA-stream-\d+\): websocket error: new", log
+    )
     assert "restarting connection: old" not in log
 
 
@@ -1489,7 +1506,7 @@ def test_a_log_record_that_cannot_be_formatted_is_not_raised_into_the_stream(
 
     run_with_client(body)
 
-    assert "Alpaca stream on feed iex: after it" in logged(capfd)
+    assert re.search(r"Alpaca stream on feed iex \(ALPACA-stream-\d+\): after it", logged(capfd))
 
 
 def test_a_stream_thread_that_cannot_start_leaves_nothing_recorded(venue, monkeypatch) -> None:
@@ -1497,7 +1514,7 @@ def test_a_stream_thread_that_cannot_start_leaves_nothing_recorded(venue, monkey
     refused = []
 
     def start(self) -> None:
-        if self.name.endswith("-stream") and not refused:
+        if "-stream-" in self.name and not refused:
             refused.append(self.name)
             raise RuntimeError("can't start new thread")
         real_start(self)
@@ -1562,3 +1579,425 @@ def test_the_engine_passes_on_only_the_first_subscription_to_an_instrument(venue
 
     assert calls == ["boats"]
     assert venue.built["stream"]["feed"] == DataFeed.BOATS
+
+
+# -- the second readers of #113 and #122 ----------------------------------------------------------------
+
+
+def stream_call_name(fn: object) -> str:
+    """The alpaca-py stream method a submitted worker call makes, through the partials around it."""
+    target = (getattr(fn, "args", ()) or (None,))[0]
+    target = getattr(target, "func", target)
+    return getattr(target, "__name__", "")
+
+
+class RefusingStreamExecutor(ThreadPoolExecutor):
+    """A default executor that, once told to, refuses a stream subscribe or unsubscribe call, as a
+    shut-down executor does, and runs the node's other work."""
+
+    refuse = False
+
+    def submit(self, fn, /, *args, **kwargs):
+        if self.refuse and stream_call_name(fn).startswith(("subscribe_", "unsubscribe_")):
+            raise RuntimeError("cannot schedule new futures after shutdown")
+        return super().submit(fn, *args, **kwargs)
+
+
+def test_a_cancelled_unsubscribe_keeps_the_next_stream_call_out_until_alpaca_py_returns(venue):
+    # Codex and Antigravity: a cancelled worker call let the next one into alpaca-py's unlocked handler
+    # maps, and the client never dropped the symbol alpaca-py did, so a resubscribe sent nothing.
+    async def body(client) -> None:
+        await client._subscribe_quotes(command(AAPL))
+        await wait_until(venue.stream.running.is_set)
+        gate = venue.stream.send_gate = threading.Event()
+        second = None
+        try:
+            first = asyncio.ensure_future(client._unsubscribe_quotes(command(AAPL)))
+            await wait_until(venue.stream.sending.is_set)
+            first.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await first
+            assert client._stream_calls.locked()  # alpaca-py is still inside the unsubscribe
+            second = asyncio.ensure_future(client._subscribe_trades(command(AAPL)))
+            await asyncio.sleep(0.2)
+            assert venue.stream.trade_handlers == {}  # kept out until the first call returns
+        finally:
+            venue.stream.send_gate = None
+            gate.set()
+        assert second is not None
+        await second
+        assert "AAPL" not in client._quote_symbols  # dropped as alpaca-py dropped it
+        await client._subscribe_quotes(command(AAPL))
+        assert list(venue.stream.quote_handlers) == ["AAPL"]
+
+    run_with_client(body)
+
+    assert venue.stream.max_active == 1
+
+
+def test_a_subscribe_the_executor_refuses_records_nothing(venue) -> None:
+    # Antigravity: the symbols were recorded before the call, so a refused call left them recorded with
+    # no handler in alpaca-py, and every later subscribe of them sent nothing.
+    executor = RefusingStreamExecutor()
+
+    async def body(client) -> None:
+        executor.refuse = True
+        try:
+            with pytest.raises(RuntimeError, match="cannot schedule"):
+                await client._subscribe_quotes(command(AAPL))
+        finally:
+            executor.refuse = False
+        assert not client._quote_symbols
+        assert not client._stream_calls.locked()
+        await client._subscribe_quotes(command(AAPL))
+        assert list(venue.stream.quote_handlers) == ["AAPL"]
+
+    run_with_client(body, executor=executor)
+
+
+def test_a_subscription_once_the_stream_has_ended_is_refused_while_its_thread_winds_down(
+    venue, monkeypatch
+) -> None:
+    # Antigravity and Muse: the end was known from the thread alone, which outlives `run()` by
+    # alpaca-py's loop teardown, so a subscription made after the end was reported still succeeded.
+    venue.stream.ends_on_its_own = True
+    real_post = canon_alpaca.data.post
+    reported, wind_down = threading.Event(), threading.Event()
+
+    def post(loop, callback, item) -> None:
+        real_post(loop, callback, item)
+        if isinstance(item, tuple) and len(item) == 2 and item[0] is venue.stream:
+            reported.set()
+            wind_down.wait(5)  # the thread is still alive after its end is reported
+
+    monkeypatch.setattr(canon_alpaca.data, "post", post)
+
+    async def body(client) -> None:
+        try:
+            await client._subscribe_quotes(command(AAPL))
+            await wait_until(reported.is_set)
+            for _ in range(5):
+                await asyncio.sleep(0.01)  # the end has reached the client
+            assert client._stream_thread is not None and client._stream_thread.is_alive()
+            with pytest.raises(RuntimeError, match="ended by itself"):
+                await client._subscribe_trades(command(AAPL))
+            assert not client._trade_symbols
+        finally:
+            wind_down.set()
+
+    run_with_client(body)
+
+
+@pytest.mark.parametrize("how", ["fails", "is cancelled"])
+def test_a_connect_that_stops_part_way_leaves_nothing_a_hook_can_use(venue, how) -> None:
+    # Antigravity: the clients a connect built stayed set when loading instruments failed, so a later
+    # subscription started a stream on a client that never connected.
+    async def body(client) -> None:
+        await client._disconnect()
+        provider = client._provider
+
+        async def initialize(*_: object, **__: object) -> None:
+            if how == "fails":
+                raise ConnectionError("assets request failed")
+            await asyncio.sleep(10)
+
+        provider.initialize = initialize
+        connecting = asyncio.ensure_future(client._connect())
+        if how == "fails":
+            with pytest.raises(ConnectionError):
+                await connecting
+        else:
+            await asyncio.sleep(0.05)
+            connecting.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await connecting
+        del provider.initialize
+        with pytest.raises(RuntimeError, match="not connected"):
+            await client._subscribe_quotes(command(AAPL))
+        with pytest.raises(RuntimeError, match="not connected"):
+            await client._request_bars(bars_request())
+        await client._connect()  # a connect that completes serves again
+        await client._subscribe_quotes(command(AAPL))
+        await wait_until(venue.stream.running.is_set)
+
+    run_with_client(body)
+
+    assert len(venue.stream.run_threads) == 1
+
+
+def test_a_stream_thread_that_cannot_start_leaves_no_feed_behind(venue, monkeypatch) -> None:
+    # Antigravity: the stream built for the first subscription stayed, with its feed, so the next
+    # subscription on another feed was refused although no stream had ever run.
+    real_start = threading.Thread.start
+    refused = []
+
+    def start(self) -> None:
+        if "-stream-" in self.name and not refused:
+            refused.append(self.name)
+            raise RuntimeError("can't start new thread")
+        real_start(self)
+
+    monkeypatch.setattr(threading.Thread, "start", start)
+
+    async def body(client) -> None:
+        with pytest.raises(RuntimeError, match="can't start new thread"):
+            await client._subscribe_quotes(command(AAPL, params={"feed": "boats"}))
+        assert client._stream is None
+        await client._subscribe_quotes(
+            command(AAPL)
+        )  # the default feed, not refused as "not boats"
+        await wait_until(venue.stream.running.is_set)
+
+    run_with_client(body)
+
+    assert venue.built["stream"]["feed"] == DataFeed.IEX
+
+
+@pytest.mark.parametrize("call", ["subscriptions", "bar requests"])
+def test_a_feed_given_as_none_is_refused_not_read_as_the_default(call) -> None:
+    # Codex and Antigravity: ADR 0055 refuses a value that is not a string; only an absent key is the
+    # default.
+    from canon_alpaca.constants import BARS_FEEDS
+    from canon_alpaca.constants import STREAM_FEEDS
+
+    feeds = STREAM_FEEDS if call == "subscriptions" else BARS_FEEDS
+    with pytest.raises(TypeError, match="got None"):
+        canon_alpaca.data.named_feed({"feed": None, "start_ns": None}, feeds, call)
+    assert canon_alpaca.data.named_feed({"start_ns": None}, feeds, call) == (DataFeed.IEX, False)
+
+
+def test_a_bars_request_naming_feed_none_becomes_the_failure_reason(venue) -> None:
+    strategy = consumer(want_quotes=False, want_trades=False, bars_params={"feed": None})
+
+    run(build_node(strategy), "hosted")
+
+    ((_, reason),) = strategy.seen_responses
+    assert "must name an Alpaca feed" in reason
+    assert venue.historical.requests == []
+
+
+def test_an_unsubscribe_reads_its_feed_as_a_subscription_does(venue, capfd) -> None:
+    # Muse and Antigravity: an unsubscribe naming another feed, or one Alpaca does not stream, removed
+    # the subscription on the stream's feed. The engine passes an unsubscribe the params its
+    # subscription had (observed offline), so one from a strategy names the stream's feed.
+    async def body(client) -> None:
+        await client._subscribe_quotes(command(AAPL, params={"feed": "boats"}))
+        await wait_until(venue.stream.running.is_set)
+        # Each names a subscription the client never made: a refused one's params come back on its
+        # unsubscribe, so each is tolerated.
+        await client._unsubscribe_quotes(command(AAPL, params={"feed": 1}))
+        await client._unsubscribe_quotes(command(AAPL, params={"feed": "otc"}))
+        await client._unsubscribe_quotes(command(AAPL, params={"feed": "sip"}))
+        await client._unsubscribe_quotes(command(AAPL))  # the default feed, iex
+        assert list(client._quote_symbols) == ["AAPL"]
+        assert venue.stream.unsubscribed == []
+        await client._unsubscribe_quotes(command(AAPL, params={"feed": "boats"}))
+        assert not client._quote_symbols
+
+    run_with_client(body)
+
+    assert venue.stream.unsubscribed == [("quotes", ("AAPL",))]
+    log = logged(capfd)
+    assert "Not unsubscribing quotes: params 'feed' must name an Alpaca feed" in log
+    assert "params named 'otc'; nothing was subscribed on it" in log
+    assert "Not unsubscribing quotes for AAPL: the unsubscribe names feed sip" in log
+    assert "names feed iex (named none, so the default)" in log
+
+
+def test_an_unsubscribe_from_the_engine_names_the_subscriptions_feed(venue, monkeypatch) -> None:
+    # What the test above relies on: a strategy that subscribed on `boats` and unsubscribes with no
+    # params reaches the hook with `boats`. Fails if NautilusTrader stops passing them on.
+    calls: list = []
+    original = AlpacaDataClient._unsubscribe_quotes
+
+    async def recorded(self, command) -> None:
+        calls.append(dict(command.params or {}).get("feed"))
+        await original(self, command)
+
+    monkeypatch.setattr(AlpacaDataClient, "_unsubscribe_quotes", recorded)
+
+    class Unsubscribes(Consumer):
+        def on_quote(self, quote) -> None:
+            self.seen_quotes.append(quote)
+            if len(self.seen_quotes) == 1:
+                self.unsubscribe_quotes(AAPL)
+                self.shutdown_system("unsubscribed")
+
+    strategy = Unsubscribes()
+    strategy.want_trades, strategy.bar_type, strategy.auto_shutdown = False, None, False
+    strategy.subscribe_params = {"feed": "boats"}
+
+    run(build_node(strategy), "hosted")
+
+    assert calls == ["boats"]
+    assert venue.stream.unsubscribed == [("quotes", ("AAPL",))]
+
+
+def test_a_bar_request_starting_after_now_sends_nothing_and_answers_no_bars(venue) -> None:
+    # Muse and Antigravity: the end was cut to now and the start was not, so Alpaca was asked for an
+    # inverted window and the request failed on its 422.
+    async def body(client) -> None:
+        now = datetime.now(UTC)
+        await client._request_bars(bars_request(now + HOUR, now + 2 * HOUR))
+
+    run_with_client(body)
+
+    assert venue.historical.requests == []
+
+
+def test_a_window_starting_after_now_holds_nothing_to_ask_for() -> None:
+    now = datetime(2026, 11, 10, 15, tzinfo=UTC)
+    window = canon_alpaca.data.alpaca_bars_window(now + HOUR, now + 2 * HOUR, now, HOUR)
+
+    assert window is None
+    assert canon_alpaca.data.alpaca_bars_window(now - HOUR, now + HOUR, now, HOUR) == (
+        now - 2 * HOUR,
+        now - HOUR,
+    )
+
+
+def test_a_stream_another_client_with_the_same_id_left_behind_is_not_taken_for_this_ones(
+    venue, alpaca, monkeypatch, capfd
+) -> None:
+    # Codex: thread names were unique only within one client, so a fresh node's client logged an
+    # abandoned stream's lines as its own stream's, on its own feed.
+    monkeypatch.setattr(canon_alpaca.data, "STREAM_JOIN_TIMEOUT_SECS", 0.05)
+    old, new = venue.stream, alpaca.Stream()
+    names: list[str] = []
+
+    async def abandon(client) -> None:
+        await client._subscribe_quotes(command(AAPL))
+        await wait_until(old.running.is_set)
+        old.ignores_stop = True
+        names.append(client._stream_thread.name)
+        with pytest.raises(RuntimeError, match="did not stop"):
+            await client._disconnect()
+
+    async def fresh(client) -> None:
+        await client._subscribe_quotes(command(AAPL, params={"feed": "boats"}))
+        assert client._stream_thread.name != names[0]
+        alpaca_log_on_thread(names[0], "from the abandoned stream")
+        for _ in range(5):
+            await asyncio.sleep(0.01)
+
+    try:
+        run_with_client(abandon)
+        while BUILT_NODES:  # one node per thread: the first goes before the fresh one is built
+            BUILT_NODES.pop().dispose()
+        monkeypatch.setattr(canon_alpaca.data, "StockDataStream", lambda **_: new)
+        run_with_client(fresh)
+    finally:
+        old.release.set()
+
+    assert "from the abandoned stream" not in logged(capfd)
+
+
+def test_a_stopping_streams_own_lines_are_kept_and_name_its_thread(venue, monkeypatch, capfd):
+    # Antigravity read a line logged while the stream stops as misattributed. It is that stream's own,
+    # carries its feed and thread, and says why a stop is slow, so it is kept.
+    monkeypatch.setattr(canon_alpaca.data, "STREAM_JOIN_TIMEOUT_SECS", 0.3)
+
+    async def body(client) -> None:
+        await client._subscribe_quotes(command(AAPL))
+        await wait_until(venue.stream.running.is_set)
+        venue.stream.ignores_stop = True
+        name = client._stream_thread.name
+        try:
+            stopping = asyncio.ensure_future(client._disconnect())
+            await asyncio.sleep(0.05)
+            alpaca_log_on_thread(name, "websocket error while stopping")
+            with pytest.raises(RuntimeError, match="did not stop"):
+                await stopping
+        finally:
+            venue.stream.release.set()
+
+    run_with_client(body)
+
+    assert re.search(
+        r"Alpaca stream on feed iex \(ALPACA-stream-\d+\): websocket error while stopping",
+        logged(capfd),
+    )
+
+
+def test_a_quote_from_before_an_unsubscribe_is_dropped_after_a_resubscribe(venue, alpaca) -> None:
+    # Muse: a quote alpaca-py dispatched before an unsubscribe and the node's loop handled after the
+    # symbol was subscribed again passed both the stream and the symbol check, with a fresh `ts_init`.
+    venue.stream.quotes = []
+
+    async def body(client) -> None:
+        await client._subscribe_quotes(command(AAPL))
+        await wait_until(venue.stream.running.is_set)
+        handler = venue.stream.quote_handlers["AAPL"]
+        await client._unsubscribe_quotes(command(AAPL))
+        await client._subscribe_quotes(command(AAPL))
+        await asyncio.to_thread(asyncio.run, handler(alpaca.quote()))  # the earlier subscription's
+        for _ in range(5):
+            await asyncio.sleep(0.01)
+
+    cache = run_with_client(body)
+
+    assert cache.quote(AAPL) is None
+
+
+def test_an_unsubscribe_after_a_refused_subscription_on_its_feed_is_tolerated(venue, capfd) -> None:
+    # The code review: the engine passes an unsubscribe its subscription's params, so a subscription
+    # refused for its feed comes back as an unsubscribe naming that feed, which must not fail again.
+    async def body(client) -> None:
+        with pytest.raises(ValueError, match="params named 'otc'"):
+            await client._subscribe_quotes(command(AAPL, params={"feed": "otc"}))
+        await client._unsubscribe_quotes(command(AAPL, params={"feed": "otc"}))
+
+    run_with_client(body)
+
+    assert "Not unsubscribing quotes" in logged(capfd)
+
+
+def test_a_subscription_while_disconnecting_says_so_not_that_the_stream_ended(venue) -> None:
+    # The code review: the stop `_disconnect` asks for also ends the stream's run.
+    async def body(client) -> None:
+        await client._subscribe_quotes(command(AAPL))
+        await wait_until(venue.stream.running.is_set)
+        venue.stream.ignores_stop = True
+        try:
+            stopping = asyncio.ensure_future(client._disconnect())
+            await asyncio.sleep(0.05)
+            with pytest.raises(RuntimeError, match="disconnecting"):
+                await client._subscribe_trades(command(AAPL))
+            await client._unsubscribe_quotes(command(AAPL))  # forgotten, nothing sent
+            assert venue.stream.unsubscribed == []
+        finally:
+            venue.stream.release.set()
+        await stopping
+
+    run_with_client(body)
+
+
+def test_no_stream_call_waits_on_a_call_stuck_in_a_stream_that_has_ended(venue) -> None:
+    # The code review: a call alpaca-py posts to its loop as the run ends can wait for good, holding
+    # the client's stream lock. Once the run has ended, hooks make no call and wait for none.
+    venue.stream.ends_on_its_own = True
+
+    async def body(client) -> None:
+        await client._subscribe_quotes(command(AAPL))
+        await wait_until(lambda: client._stream_ended is not None and client._stream_ended.is_set())
+        await client._stream_calls.acquire()  # as a call stuck in the ended stream
+        with pytest.raises(RuntimeError, match="ended by itself"):
+            await asyncio.wait_for(client._subscribe_trades(command(AAPL)), 1)
+        await asyncio.wait_for(client._unsubscribe_quotes(command(AAPL)), 1)
+        assert not client._quote_symbols
+
+    run_with_client(body)
+
+    assert venue.stream.unsubscribed == []
+
+
+def test_a_window_inverted_in_the_past_is_still_sent(venue) -> None:
+    # The code review: only a window starting after now is answered with no bars unasked; one
+    # inverted as requested goes to Alpaca, whose refusal becomes the failure reason.
+    async def body(client) -> None:
+        with pytest.raises(APIError, match="start is after end"):
+            await client._request_bars(bars_request(END, START))
+
+    run_with_client(body)
+
+    assert len(venue.historical.requests) == 1

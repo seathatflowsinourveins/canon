@@ -268,13 +268,26 @@ after the clock read are inside the window, whose end is absolute."""
 
 def default_log_dir() -> Path:
     """The per-user temporary folder `mise run paper:session` passes, whatever `$TMPDIR` a session sets,
-    so the gap marker is found by every caller; elsewhere than macOS, the system's temporary folder."""
+    so the gap marker is found by every caller: on macOS `getconf DARWIN_USER_TEMP_DIR` (getconf(1),
+    `confstr(3)`'s `_CS_DARWIN_USER_TEMP_DIR`), and `RuntimeError` if it does not give one, since `$TMPDIR`'s
+    folder is not where the gap marker and `scripts/automation status` look; elsewhere, Python's
+    `tempfile.gettempdir()`."""
+    if sys.platform != "darwin":
+        return Path(tempfile.gettempdir()) / "canon-paper-session"
     try:
         found = subprocess.run(
             ["/usr/bin/getconf", "DARWIN_USER_TEMP_DIR"], capture_output=True, text=True, check=True
         ).stdout.strip()
-    except OSError, subprocess.CalledProcessError:
-        found = tempfile.gettempdir()
+    except (OSError, subprocess.CalledProcessError) as e:
+        raise RuntimeError(
+            f"getconf DARWIN_USER_TEMP_DIR failed ({type(e).__name__}: {e}), so the per-user folder "
+            "for the records is not known; pass --log-dir"
+        ) from e
+    if not Path(found).is_absolute():
+        raise RuntimeError(
+            f"getconf DARWIN_USER_TEMP_DIR gave {found!r}, not an absolute folder, so the per-user "
+            "folder for the records is not known; pass --log-dir"
+        )
     return Path(found) / "canon-paper-session"
 
 
@@ -353,12 +366,10 @@ def in_new_york(moment: datetime) -> datetime:
     return moment.replace(tzinfo=NEW_YORK) if moment.tzinfo is None else moment.astimezone(NEW_YORK)
 
 
-def session_end(
-    config: WindowConfig, clock: AlpacaClock, calendar: AlpacaCalendar | None
-) -> datetime:
+def session_end(session: str, clock: AlpacaClock, calendar: AlpacaCalendar | None) -> datetime:
     """When the configured session that is open now ends, or `RuntimeError` if it is not open now."""
     now = clock.timestamp.astimezone(NEW_YORK)
-    if config.session == "regular":
+    if session == "regular":
         if not clock.is_open:
             raise RuntimeError(
                 "the regular session is closed; Alpaca's clock says it next opens "
@@ -367,10 +378,19 @@ def session_end(
         return clock.next_close.astimezone(NEW_YORK)
     if clock.is_open:
         raise RuntimeError("the regular session is open; an extended window runs outside it")
-    if calendar is None or calendar.date != now.date() or not calendar.session_open:
+    if calendar is None or calendar.date != now.date():
         raise RuntimeError(f"{now:%Y-%m-%d} is not a trading day on Alpaca's calendar")
-    opens = datetime.strptime(calendar.session_open, "%H%M").time()
-    closes = datetime.strptime(calendar.session_close or "2000", "%H%M").time()
+    # both `Optional[str]` in alpaca-py's `Calendar`: a day without one does not say when the extended
+    # session starts or ends, and no bound is assumed in its place
+    session_open, session_close = calendar.session_open, calendar.session_close
+    if not session_open or not session_close:
+        missing = [n for n in ("session_open", "session_close") if not getattr(calendar, n)]
+        raise RuntimeError(
+            f"Alpaca's calendar for {now:%Y-%m-%d} gives no {' or '.join(missing)}, so the "
+            "extended session's bounds are not known"
+        )
+    opens = datetime.strptime(session_open, "%H%M").time()
+    closes = datetime.strptime(session_close, "%H%M").time()
     regular_open, regular_close = in_new_york(calendar.open), in_new_york(calendar.close)
     pre = (datetime.combine(now.date(), opens, NEW_YORK), regular_open)
     after = (regular_close, datetime.combine(now.date(), closes, NEW_YORK))
@@ -655,7 +675,7 @@ def run_window(
         clock, calendar = market
         read_at = time.monotonic() if market_read_at is None else market_read_at
     try:
-        end_of_session = session_end(config, clock, calendar)
+        end_of_session = session_end(config.session, clock, calendar)
     except RuntimeError as e:
         raise WindowRefused(str(e)) from e
     if left := leftovers(trading, config.symbol):
@@ -1288,7 +1308,7 @@ def resolve_session(clock: AlpacaClock, calendar: AlpacaCalendar | None) -> tupl
             "the regular session is closed and extended windows are not on (EXTENDED_READY)",
         )
     try:
-        session_end(WindowConfig(session="extended"), clock, calendar)
+        session_end("extended", clock, calendar)
     except RuntimeError as e:
         return None, str(e)
     return "extended", "outside the regular session, inside pre-market or after-hours"
@@ -1298,15 +1318,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     """`_main`, and after a stop that timed out or was interrupted (`_ABANDONED`), whatever error then
     reached here, the process ended with `os._exit` once the record is written: the node's task would
     otherwise hold the interpreter's exit (module header)."""
+    try:
+        args = _args(argv)
+    except RuntimeError as e:  # no folder for the records: nothing is read or written
+        print(f"paper:session: {e}", file=sys.stderr)
+        return 1
     code = 1
     try:
-        code = _main(argv)
+        code = _main(args)
     except BaseException as e:
         if not _ABANDONED:
             raise
         traceback.print_exc()  # `os._exit` below would discard it
         try:
-            write_heartbeat(_log_dir(argv), f"failed: {type(e).__name__}: {e}")
+            write_heartbeat(args.log_dir, f"failed: {type(e).__name__}: {e}")
         except OSError:
             pass
     finally:
@@ -1322,12 +1347,20 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--session", choices=(*SESSIONS, "auto"), default="regular")
     parser.add_argument("--minutes", type=int, default=DEFAULT_MINUTES)
     parser.add_argument("--symbol", default="SPY")
-    parser.add_argument("--log-dir", type=Path, default=default_log_dir())
+    parser.add_argument("--log-dir", type=Path, help="default: `default_log_dir()`")
     return parser
 
 
-def _log_dir(argv: Sequence[str] | None) -> Path:
-    return _parser().parse_args(argv).log_dir
+def _args(argv: Sequence[str] | None) -> argparse.Namespace:
+    """The arguments, `--log-dir` defaulted to `default_log_dir()` only when it is not given, and
+    `RuntimeError` for a relative one: the records go outside the repository, wherever the run starts
+    (an empty `getconf` in the caller's shell leaves only the folder's name)."""
+    args = _parser().parse_args(argv)
+    if args.log_dir is None:
+        args.log_dir = default_log_dir()
+    elif not args.log_dir.is_absolute():
+        raise RuntimeError(f"--log-dir must be an absolute folder, got {str(args.log_dir)!r}")
+    return args
 
 
 def _heard(log_dir: Path, outcome: str) -> None:
@@ -1344,8 +1377,7 @@ def _heard_failed(log_dir: Path, error: BaseException) -> None:
     _heard(log_dir, f"failed: {type(error).__name__}: {error}")
 
 
-def _main(argv: Sequence[str] | None) -> int:
-    args = _parser().parse_args(argv)
+def _main(args: argparse.Namespace) -> int:
     session = args.session
     try:
         trading = market = None

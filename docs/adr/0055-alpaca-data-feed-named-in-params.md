@@ -97,9 +97,14 @@ D was not taken: a per-call option belongs in params, and a config feed would be
 Offline, in `scripts/ci` (`test_data_client.py`): no params gives an IEX stream and IEX bars; `boats` named
 through a real node reaches the stream and the bars request; a second subscription on another feed, or
 none, is refused, naming both; a name not documented for the call or a value not a string is refused
-before anything is sent; a stream refused at authentication, as alpaca-py logs and ends it on 409, is
-logged naming the feed and the reason, and later subscriptions are refused; the engine passes on only the
-first subscription to an instrument.
+before anything is sent, `None` included (only a missing key is the default); a stream refused at
+authentication, as alpaca-py logs and ends it on 409, is logged naming the feed and the reason, and
+later subscriptions are refused, from the moment alpaca-py's `run()` returns, while the stream's thread
+still winds down; the engine passes on only the first subscription to an instrument, and passes an
+unsubscribe the params its subscription had; an unsubscribe naming a feed Alpaca does not stream, or
+another feed than the stream's, sends nothing and is logged, as the adapter guide has unsubscribe hooks
+tolerate members whose subscription failed; each relayed log line names the stream's thread, by a
+name unique in the process.
 
 Paper, `mise run paper:test -- -s -k "test_paper_boats_quotes_reach_the_strategy or
 test_paper_default_feed_is_iex or test_paper_asset_and_daily_bars_reach_the_strategy"`, 2026-11-10 20:49
@@ -143,5 +148,9 @@ Read 2026-11-10; "raw": fetched with `curl` and read, not summarised.
   delivered; `overnight` and `boats` nothing), 16:46 ET (no feed delivered in 45 s), 20:01 ET (90 s:
   `overnight` quotes only; `boats` quotes, trades and minute bars, and current REST data) (ran). 20:46 ET
   through a node, a first `test_paper_feed.py` with a `sip` subscription: it authenticated, no quote (ran).
+* NautilusTrader's Python adapter guide, read 2026-11-10 (https://nautilustrader.io/docs/md/latest/developer_guide/python_adapters.md,
+  fetched, raw): "Unsubscribe hooks must therefore tolerate members whose subscription failed".
+* Offline, 2026-11-10: a strategy that subscribed AAPL quotes on `boats` and called `unsubscribe_quotes`
+  with no params reached the client's hook with `{'feed': 'boats'}` (ran).
 * Second reader, 2026-11-10 (`evidence-verifier`): B stands; corrected above: Databento's refusal cited
   from source, the data hooks' sentence quoted, the after-hours claim narrowed, the per-endpoint limit.

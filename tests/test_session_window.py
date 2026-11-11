@@ -391,10 +391,10 @@ CALENDAR = Calendar(
 
 def test_a_regular_window_ends_with_the_session() -> None:
     at = datetime(2026, 11, 10, 15, 0, tzinfo=NEW_YORK)
-    end = session_end(WindowConfig(), clock(at, is_open=True), CALENDAR)
+    end = session_end("regular", clock(at, is_open=True), CALENDAR)
     assert end == datetime(2026, 11, 10, 16, 0, tzinfo=NEW_YORK)
     with pytest.raises(RuntimeError, match="regular session is closed"):
-        session_end(WindowConfig(), clock(at, is_open=False), CALENDAR)
+        session_end("regular", clock(at, is_open=False), CALENDAR)
 
 
 @pytest.mark.parametrize(
@@ -405,7 +405,7 @@ def test_an_extended_window_ends_with_pre_market_or_after_hours(
     hour, minute, end, extended
 ) -> None:
     at = datetime(2026, 11, 10, hour, minute, tzinfo=NEW_YORK)
-    found = session_end(WindowConfig(session="extended"), clock(at, is_open=False), CALENDAR)
+    found = session_end("extended", clock(at, is_open=False), CALENDAR)
     assert found == end.replace(tzinfo=NEW_YORK)
 
 
@@ -421,11 +421,110 @@ def test_an_extended_window_refuses_overnight_the_session_and_other_days(
     at, is_open, message, extended
 ):
     with pytest.raises(RuntimeError, match=message):
-        session_end(
-            WindowConfig(session="extended"),
-            clock(at.replace(tzinfo=NEW_YORK), is_open=is_open),
-            CALENDAR,
-        )
+        session_end("extended", clock(at.replace(tzinfo=NEW_YORK), is_open=is_open), CALENDAR)
+
+
+@pytest.mark.parametrize("hour", [5, 17])
+@pytest.mark.parametrize(
+    "missing",
+    [("session_open",), ("session_close",), ("session_open", "session_close")],
+)
+def test_an_extended_window_is_refused_when_the_calendar_omits_its_session_bounds(
+    hour, missing, extended
+) -> None:
+    """`Calendar.session_open` and `session_close` are `Optional[str]` in alpaca-py 0.45.0
+    (`trading/models.py`); a day that omits either does not say when the extended session starts or ends,
+    so the window is refused, naming the field, rather than given a bound of its own (20:00 was assumed).
+    Sweep reading by Muse Code and DeepSeek Harness."""
+    bounds: dict[str, str | None] = {"session_open": "0400", "session_close": "2000"}
+    bounds.update(dict.fromkeys(missing))
+    calendar = Calendar(date="2026-11-10", open="09:30", close="16:00", **bounds)
+    at = datetime(2026, 11, 10, hour, 0, tzinfo=NEW_YORK)
+    with pytest.raises(RuntimeError, match=f"no {' or '.join(missing)},"):
+        session_end("extended", clock(at, is_open=False), calendar)
+
+
+def getconf_failing(monkeypatch, error: BaseException | str) -> None:
+    """`subprocess.run` raising `error` for `getconf`, or answering it with `error` when it is a string;
+    any other command runs as before."""
+    real = subprocess.run
+
+    def run(command, *args, **kwargs):
+        if command != ["/usr/bin/getconf", "DARWIN_USER_TEMP_DIR"]:
+            return real(command, *args, **kwargs)
+        if isinstance(error, BaseException):
+            raise error
+        return subprocess.CompletedProcess(command, 0, stdout=error, stderr="")
+
+    monkeypatch.setattr(session_window.subprocess, "run", run)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [OSError("no such file"), subprocess.CalledProcessError(1, "getconf"), "\n", "T/\n"],
+)
+def test_the_records_folder_is_refused_on_macos_when_getconf_does_not_give_it(
+    monkeypatch, tmp_path, error
+) -> None:
+    """On macOS the records go to the per-user folder `getconf DARWIN_USER_TEMP_DIR` names, whatever
+    `$TMPDIR` says; one `getconf` does not give is refused by name, not swapped for `$TMPDIR`'s, where the
+    gap marker and `scripts/automation status` would not look. Sweep reading by DeepSeek Harness."""
+    monkeypatch.setattr(session_window.sys, "platform", "darwin")
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    session_window.tempfile.tempdir = None  # `gettempdir` caches; read `$TMPDIR` again
+    try:
+        getconf_failing(monkeypatch, error)
+        with pytest.raises(RuntimeError, match="DARWIN_USER_TEMP_DIR"):
+            session_window.default_log_dir()
+    finally:
+        session_window.tempfile.tempdir = None
+
+
+def test_elsewhere_than_macos_the_records_folder_is_the_systems_temporary_one(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setattr(session_window.sys, "platform", "linux")
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    session_window.tempfile.tempdir = None
+    try:
+        getconf_failing(monkeypatch, OSError("no such file"))
+        assert session_window.default_log_dir() == tmp_path / "canon-paper-session"
+    finally:
+        session_window.tempfile.tempdir = None
+
+
+def test_a_records_folder_given_is_used_though_getconf_fails(monkeypatch, tmp_path) -> None:
+    """`mise run paper:session` passes `--log-dir`; the default is not looked for then, so a failing
+    `getconf` neither stops nor redirects that run."""
+    monkeypatch.setattr(session_window.sys, "platform", "darwin")
+    getconf_failing(monkeypatch, OSError("no such file"))
+    assert session_window._args(["--log-dir", str(tmp_path)]).log_dir == tmp_path
+
+
+def test_a_relative_records_folder_is_refused(monkeypatch, capsys) -> None:
+    """`mise run paper:session` builds `--log-dir` from `getconf`; one that printed nothing leaves the bare
+    name, a folder inside wherever the run started."""
+    monkeypatch.setattr(session_window, "paper_trading", lambda: pytest.fail("Alpaca was read"))
+    assert session_window.main(["--session", "auto", "--log-dir", "canon-paper-session"]) == 1
+    assert "--log-dir must be an absolute folder" in capsys.readouterr().err
+
+
+def test_a_run_whose_records_folder_cannot_be_found_says_so_and_exits_1(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """Refused before anything reads Alpaca or writes a record."""
+    monkeypatch.setattr(session_window.sys, "platform", "darwin")
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    monkeypatch.setenv(session_window.COMMIT_ENV, "test")
+    session_window.tempfile.tempdir = None
+    monkeypatch.setattr(session_window, "paper_trading", lambda: pytest.fail("Alpaca was read"))
+    try:
+        getconf_failing(monkeypatch, OSError("no such file"))
+        assert session_window.main(["--session", "auto"]) == 1
+    finally:
+        session_window.tempfile.tempdir = None
+    assert "DARWIN_USER_TEMP_DIR" in capsys.readouterr().err
+    assert not any(tmp_path.iterdir())
 
 
 class Account:
