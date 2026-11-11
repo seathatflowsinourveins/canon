@@ -602,9 +602,9 @@ check "a fresh stamp and an ok window, but no heartbeat: UNKNOWN, exit 1" \
       eval 'rowis "$TMP/status.out" "paper session" UNKNOWN && [ "$rc" != 0 ] && grep -q "no last-firing.json" "$TMP/status.out"'
 heartbeat 60
 # a schedule gone silent does not hide a worse label: the account may not be flat
-fired $((3 * 3600))
 for r in "running:$((300 * 60)):DIED" "failed: not left flat: [position of 1 SPY]:600:FAILED" "refused: the paper account is not flat in SPY:600:REFUSED"; do
-  lab=${r##*:}; rest=${r%:*}; paper "${rest%:*}" "${rest##*:}"; status; rc=$?
+  lab=${r##*:}; rest=${r%:*}
+  NOW=$(date -u +%s); fired $((3 * 3600)); paper "${rest%:*}" "${rest##*:}"; status; rc=$?   # one clock read per case
   check "a $lab window and no firing for three hours: $lab, with the silence named" \
         eval 'rowis "$TMP/status.out" "paper session" "$lab" && [ "$rc" != 0 ] && grep -q "no scheduled firing for 180 min" "$TMP/status.out"'
 done
