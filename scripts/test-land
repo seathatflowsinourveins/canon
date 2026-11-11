@@ -168,11 +168,43 @@ case_ "an ADR made by renaming needs a note"                t_rename_adr
 case_ "an unreadable file list stops the run"               t_unreadable
 t_dirty() { new_repo; change README.md; echo "more" >> "$W/README.md"; land
             [ "$rc" -ne 0 ] && has "uncommitted changes" && ! ci_ran && ! pushed topic; }
-t_behind() {
+t_behind() {   # a never-pushed branch behind main, with no conflict, is rebased onto it and lands
   new_repo; git -C "$W" switch -q -c side main; change uv.lock; git -C "$W" push -q origin side:main
+  git -C "$W" switch -q topic; change README.md "Say what the change does"; land
+  [ "$rc" -eq 0 ] && has "rebasing it onto origin/main" && ci_ran && pushed topic \
+    && git -C "$C/origin.git" merge-base --is-ancestor main topic \
+    && [ "$(git -C "$C/origin.git" rev-list --count main..topic)" -eq 1 ] \
+    && [ "$(git -C "$C/origin.git" log -1 --format=%s topic)" = "Say what the change does" ]
+}
+t_behind_conflict() {   # the rebase conflicts: stopped, named, rolled back, nothing pushed or checked
+  new_repo; git -C "$W" switch -q -c side main; echo "main's" > "$W/README.md"; git -C "$W" commit -q -am "Main"
+  git -C "$W" push -q origin side:main; git -C "$W" switch -q topic
+  echo "topic's" > "$W/README.md"; git -C "$W" commit -q -am "Topic"; local before; before=$(git -C "$W" rev-parse topic)
+  land
+  [ "$rc" -ne 0 ] && has "rebasing topic onto origin/main conflicts in 'README.md'" && ! ci_ran && ! pushed topic \
+    && [ "$(git -C "$W" rev-parse topic)" = "$before" ] && [ "$(git -C "$W" branch --show-current)" = topic ] \
+    && [ ! -e "$(git -C "$W" rev-parse --git-path rebase-merge)" ] && [ -z "$(git -C "$W" status --porcelain)" ]
+}
+t_behind_empty() {   # every commit is already on main: nothing is left to land after the rebase
+  new_repo; change README.md "Same"; git -C "$W" switch -q -c side main; echo "line" >> "$W/README.md"
+  git -C "$W" commit -q -am "Same on main"; git -C "$W" push -q origin side:main; git -C "$W" switch -q topic
+  local before; before=$(git -C "$W" rev-parse topic); land
+  [ "$rc" -ne 0 ] && has "has nothing that main lacks once rebased" && ! ci_ran && ! pushed topic \
+    && [ "$(git -C "$W" rev-parse topic)" = "$before" ] && [ -z "$(git -C "$W" status --porcelain)" ]
+}
+t_behind_dry_conflict() {   # a dry run predicts the conflict and changes nothing
+  new_repo; git -C "$W" switch -q -c side main; echo "main's" > "$W/README.md"; git -C "$W" commit -q -am "Main"
+  git -C "$W" push -q origin side:main; git -C "$W" switch -q topic
+  echo "topic's" > "$W/README.md"; git -C "$W" commit -q -am "Topic"; local before; before=$(git -C "$W" rev-parse topic)
+  land --dry-run
+  [ "$rc" -ne 0 ] && has "would conflict in 'README.md'" && ! ci_ran && ! pushed topic \
+    && [ "$(git -C "$W" rev-parse topic)" = "$before" ] && [ -z "$(git -C "$W" status --porcelain)" ]
+}
+t_behind_rerun() {   # after the rebase, main's own copy of scripts/land is the one that runs on
+  new_repo; git -C "$W" switch -q -c side main; printf '%s\n' 'echo "land: main copy ran"; exit 0' >> "$W/scripts/land"
+  git -C "$W" commit -q -am "Change land"; git -C "$W" push -q origin side:main
   git -C "$W" switch -q topic; change README.md; land
-  [ "$rc" -ne 0 ] && has "does not contain the current main and is not pushed yet; rebase it onto main first" \
-    && ! has "git merge" && ! ci_ran && ! pushed topic
+  [ "$rc" -eq 0 ] && has "rebased; running main's copy" && has "land: main copy ran"
 }
 t_behind_pushed() {
   new_repo; change README.md; git -C "$W" push -q origin topic; local sent; sent=$(git -C "$W" rev-parse topic)
@@ -182,10 +214,23 @@ t_behind_pushed() {
     && ! has "rebase it" && ! ci_ran && [ "$(git -C "$C/origin.git" rev-parse topic)" = "$sent" ]
 }
 case_ "a dirty working tree is refused"                     t_dirty
-case_ "a branch that does not contain main is refused"      t_behind
+case_ "a never-pushed branch behind main is rebased and lands" t_behind
+case_ "a rebase that conflicts stops and names the file"    t_behind_conflict
+case_ "a rebase that leaves nothing to land stops"          t_behind_empty
+case_ "a dry run predicts a rebase conflict"                t_behind_dry_conflict
+case_ "main's copy of land runs after the rebase"           t_behind_rerun
+t_behind_dry() {   # a dry run says it would rebase and leaves the branch where it was
+  new_repo; git -C "$W" switch -q -c side main; change uv.lock; git -C "$W" push -q origin side:main
+  git -C "$W" switch -q topic; change README.md; local before; before=$(git -C "$W" rev-parse topic); land --dry-run
+  [ "$rc" -eq 0 ] && has "a run without --dry-run rebases it onto origin/main first" && ! pushed topic \
+    && [ "$(git -C "$W" rev-parse topic)" = "$before" ]
+}
+case_ "a dry run behind main says it would rebase"          t_behind_dry
 t_behind_local() {
-  new_repo noremote; git -C "$W" switch -q main; change uv.lock; git -C "$W" switch -q topic; change README.md; land
-  [ "$rc" -ne 0 ] && has "does not contain the current main; rebase it onto main first: git rebase main" && ! ci_ran
+  new_repo noremote; git -C "$W" switch -q main; change uv.lock; git -C "$W" switch -q topic; change README.md
+  local was; was=$(git -C "$W" rev-parse main); land
+  [ "$rc" -eq 0 ] && has "rebasing it onto main" && ci_ran && [ "$(git -C "$W" rev-parse main)" = "$(git -C "$W" rev-parse topic)" ] \
+    && [ "$(git -C "$W" rev-parse main~1)" = "$was" ]
 }
 t_behind_stale() {   # origin's topic is an earlier, unrelated branch of the same name
   new_repo; git -C "$W" switch -q -c old main; change old.txt; git -C "$W" push -q origin old:topic
@@ -197,7 +242,7 @@ t_behind_suffix() {  # a remote branch whose name only ends in /topic is not thi
   new_repo; git -C "$W" push -q origin main:refs/heads/someone/topic
   git -C "$W" switch -q -c side main; change uv.lock; git -C "$W" push -q origin side:main
   git -C "$W" switch -q topic; change README.md; land
-  [ "$rc" -ne 0 ] && has "is not pushed yet; rebase it onto main first" && ! ci_ran
+  [ "$rc" -eq 0 ] && has "rebasing it onto origin/main" && ci_ran && pushed topic
 }
 t_main_merged_in() { # a pushed branch with main merged in lands under its own subject and message
   new_repo; change README.md "Say what the change does"; git -C "$W" push -q origin topic
@@ -206,7 +251,7 @@ t_main_merged_in() { # a pushed branch with main merged in lands under its own s
   logged "Say what the change does" && ! logged "Merge remote-tracking branch"
 }
 case_ "a pushed branch behind main is told to merge main"   t_behind_pushed
-case_ "a branch behind main with no remote is told to rebase" t_behind_local
+case_ "a branch behind main with no remote is rebased"       t_behind_local
 case_ "a stale same-named remote branch is not 'pushed'"    t_behind_stale
 case_ "a remote x/topic does not count as topic pushed"     t_behind_suffix
 case_ "a merge of main stays out of the pull request text"  t_main_merged_in
