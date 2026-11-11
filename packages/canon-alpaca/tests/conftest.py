@@ -800,11 +800,12 @@ class FakeStream:
     after its first delivery without a `stop()`, as alpaca-py's does after an insufficient-subscription
     error. With `ignores_stop`, `run()` keeps going after `stop()` until `release` is set.
 
-    As in alpaca-py 0.45.0 (`DataStream._subscribe`, `_unsubscribe`, `_ensure_coroutine`): a handler that is
-    not a coroutine function raises `ValueError`; a subscribe records its handlers and then sends; an
-    unsubscribe sends first and deletes its handlers only if the send succeeded, and deleting a symbol never
-    subscribed raises `KeyError`. Sends are made only while running. With `send_error` set, every send
-    raises it.
+    As in alpaca-py 0.45.0 (`DataStream._subscribe`, `_unsubscribe`, `_ensure_coroutine`, `_drive_run`): a
+    handler that is not a coroutine function raises `ValueError`; a subscribe records its handlers and then
+    sends; an unsubscribe sends first and deletes its handlers only if the send succeeded, and deleting a
+    symbol never subscribed raises `KeyError`. `run()` connects, and `running` is set, only once something
+    is subscribed, and sends are made only while running. With `send_error` set, every send raises it. A
+    symbol unsubscribed and subscribed again is served again.
     """
 
     def __init__(self) -> None:
@@ -825,6 +826,7 @@ class FakeStream:
         self.finished = threading.Event()
         self.stopped = threading.Event()
         self._changed = threading.Event()
+        self._sent: set[tuple[str, str]] = set()  # (channel, symbol) served since it was subscribed
 
     def _send(self) -> None:
         if self.running.is_set() and self.send_error is not None:
@@ -842,6 +844,7 @@ class FakeStream:
         self.unsubscribed.append((channel, symbols))
         for s in symbols:
             del handlers[s]
+            self._sent.discard((channel, s))
 
     def subscribe_quotes(self, handler: Handler, *symbols: str) -> None:
         self._subscribe(handler, symbols, self.quote_handlers)
@@ -863,7 +866,6 @@ class FakeStream:
 
     def run(self) -> None:
         self.run_threads.append(threading.current_thread().name)
-        self.running.set()
         try:
             asyncio.run(self._serve())
         finally:
@@ -885,7 +887,14 @@ class FakeStream:
         return channel.get(symbol, channel.get("*"))
 
     async def _serve(self) -> None:
-        sent: set[tuple[str, str]] = set()
+        sent = self._sent
+        # alpaca-py waits for a market subscription before it connects, and then counts as running.
+        while not (self.quote_handlers or self.trade_handlers):
+            if self.stopped.is_set():
+                return
+            self._changed.clear()
+            await asyncio.to_thread(self._changed.wait, 0.05)
+        self.running.set()
         while not self.stopped.is_set() or (self.ignores_stop and not self.release.is_set()):
             for channel, handlers, builders in (
                 ("quotes", self.quote_handlers, self.quotes),
