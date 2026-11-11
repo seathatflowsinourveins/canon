@@ -32,7 +32,7 @@ arrangement with Alpaca, and outside what agents decide.
 
 * **When the harness is done for now.** Six checks end harness growth; once they hold, one lane does its
   maintenance and the others take steps 6 to 8 (ADR 0071, accepted, with ADR 0073's exit rule for review
-  rounds). Enhancing a runtime as a named configuration waits on containment (ADR 0072, `proposed`).
+  rounds); check 3's duties and handover are placed by ADR 0078. Enhancing a runtime as a named configuration waits on containment (ADR 0072, `proposed`).
 * **Overfitting probability.** Its proposed role is a diagnostic beside the gate; no implementation is
   adopted until one passes this repo's tests (ADR 0027 and ADR 0032, both `proposed`).
 * **A trial that never traded, or a configuration that never runs to the end**, stops every ranking of
