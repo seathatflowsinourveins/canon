@@ -176,3 +176,9 @@ Read 2026-11-10; "raw": fetched with `curl` and read, not summarised. NautilusTr
   at the pin, for `check_inflight_orders` and `check_open_order_queries` in
   `crates/live/src/execution/manager.rs` (fetched, raw); the order state machine
   (`crates/model/src/orders/mod.rs`, fetched, raw) gives the transitions used.
+* Reconnects, read 2026-11-10: alpaca-py 0.45.0's `TradingStream._drive_run` reconnects after a websocket
+  or connection error with backoff and replays nothing; Kraken spot and Binance spot log a reconnect and
+  Coinbase reads its account again (`execution.rs` at the pin, fetched, raw), none catching up on orders.
+  So no catch-up is added: a node that must catch an accepted order's lost update turns on
+  NautilusTrader's open-order check (`open_check_interval_secs`, upstream's "5-10s"; the paper node 10 s),
+  and the in-flight check, on by default, covers orders in flight; both reach `_query_order`.
