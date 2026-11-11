@@ -61,6 +61,7 @@ from canon_alpaca.execution import AlpacaExecutionClient
 from canon_alpaca.execution import AlpacaExecutionClientConfig
 from canon_alpaca.execution import FilledReading
 from canon_alpaca.execution import fill_report
+from canon_alpaca.execution import report_with
 from canon_alpaca.execution import send_order_commands_once
 from canon_alpaca.factories import AlpacaDataClientFactory
 from canon_alpaca.factories import AlpacaExecutionClientFactory
@@ -7479,6 +7480,7 @@ def lost_submit_filled(
     retain: bool,
     claim: bool,
     took: bool = True,
+    order_unread: bool = False,
 ) -> dict:
     """One limit order of one share whose submit Alpaca takes and answers 500, every read of the order
     failing meanwhile (by client order ID, by ID, and the open orders), until the engine's in-flight
@@ -7487,7 +7489,9 @@ def lost_submit_filled(
     left). With `delivered` the fill's trade update reaches the client; without, the stream lost it.
     `retain` and `claim` are the two upstream settings: the engine's `RETAIN_UNRESOLVED` and the
     strategy's claim on the instrument. Without `took`, Alpaca never placed the order, and nothing fills.
-    Returns what the node holds once it has settled, and the error the node's run ended with, if any."""
+    With `order_unread`, Alpaca's order can still not be read by its ID once the fill is made, so the fill
+    report cannot be named. Returns what the node holds once it has settled, and the error the node's
+    run ended with, if any."""
     reads_lost = {"on": False}
     queries: list[str] = []
     get_orders = venue.trading.get_orders
@@ -7569,6 +7573,8 @@ def lost_submit_filled(
         venue.trading.submit_error = None
         venue.trading.took_before_error = False
         reads_lost["on"] = False
+        if order_unread:
+            venue.trading.order_lookup_error = lambda _id: ConnectionError("connection reset")
         seen["client_order_id"] = order.client_order_id.value
         if not took:
             await asyncio.sleep(1.0)  # every check runs again, with the reads answered
@@ -7627,15 +7633,11 @@ def test_a_submit_never_answered_and_filled_later_is_the_strategys_own_with_both
     assert seen["held"] == seen["alpaca_holds"], seen
     assert seen["external"] == [], seen
     assert seen["submits"] == (1 if side == "entry" else 2), seen  # nothing sent again
-    if delivered:
-        assert seen["order"] == (OrderStatus.FILLED, [seen["trade_id"]]), seen
-        assert "run" not in seen, seen
-    else:
-        # Nothing Alpaca sends names the order again: it stays submitted, and the node's run ends with
-        # the error that names it ("Submission recovery at shutdown", concepts/live.md at the pin).
-        assert seen["order"] == (OrderStatus.SUBMITTED, []), seen
-        assert seen["run"].startswith("Submission recovery incomplete at shutdown"), seen
-        assert seen["client_order_id"] in seen["run"], seen
+    # Lost, the position check's fill report names the order by the client order ID Alpaca's read of it
+    # shows, so the fill reaches the order itself, under Alpaca's trade ID, and nothing is left unresolved
+    # at the stop.
+    assert seen["order"] == (OrderStatus.FILLED, [seen["trade_id"]]), seen
+    assert "run" not in seen, seen
 
 
 @pytest.mark.parametrize("side", ["entry", "close"])
@@ -7677,21 +7679,24 @@ def test_the_claim_alone_leaves_the_order_closed_while_alpaca_may_still_fill_it(
     assert "run" not in seen, seen
 
 
-def test_retaining_alone_still_books_a_lost_fill_to_external(
-    venue, alpaca, monkeypatch, capfd
+@pytest.mark.parametrize("side", ["entry", "close"])
+def test_retained_a_lost_fill_reaches_the_order_by_its_client_order_id(
+    venue, alpaca, monkeypatch, capfd, side
 ) -> None:
-    # Why the strategy claims its instrument: retained, the order stays submitted, but with its trade
-    # update lost the position check's fill reports (which carry Alpaca's order ID, unknown to the node
-    # for an order never answered) and its own reconciliation book the fill to `EXTERNAL`.
+    # Retained, the order stays submitted; with its trade update lost, the position check's fill report
+    # carried only Alpaca's order ID, which the node never heard for an order never answered, so the
+    # engine booked the fill to `EXTERNAL` and the order stayed submitted until the stop. The report now
+    # carries the client order ID Alpaca's read of the order shows, as upstream's OKX adapter carries
+    # the one the venue echoes, and the engine matches the fill to the order by it, with no claim.
     seen = lost_submit_filled(
-        venue, alpaca, monkeypatch, capfd, side="entry", delivered=False, retain=True, claim=False
+        venue, alpaca, monkeypatch, capfd, side=side, delivered=False, retain=True, claim=False
     )
 
     assert seen["given_up"][:2] == (OrderStatus.SUBMITTED, False), seen
-    assert seen["held"] == Decimal(0), seen
-    assert seen["external"], seen
-    # The order is still submitted at the stop: the run ends with the error naming it.
-    assert seen["run"].startswith("Submission recovery incomplete at shutdown"), seen
+    assert seen["order"] == (OrderStatus.FILLED, [seen["trade_id"]]), seen
+    assert seen["held"] == seen["alpaca_holds"], seen
+    assert seen["external"] == [], seen
+    assert "run" not in seen, seen
 
 
 @pytest.mark.parametrize("retain", [True, False], ids=["retained", "resolved locally"])
@@ -7723,3 +7728,178 @@ def test_a_submit_alpaca_never_placed_is_retained_too_and_nothing_is_sent_again(
     else:
         assert seen["order"][0] == OrderStatus.REJECTED, seen
         assert "run" not in seen, seen
+
+
+# -- the code review of the fill report's client order ID (`_unanswered_named`) --------------------
+
+
+def naming(venue, alpaca, monkeypatch, check) -> None:
+    """Run `check(client, strategy, waiting, placed_id, reads)` once the strategy holds a buy whose submit
+    Alpaca took and answered 500, so the node holds it `SUBMITTED` with no Alpaca order ID; `reads`
+    lists every `get_order_by_id`."""
+    strategy = Claimant()
+    reads: list[str] = []
+    by_id = venue.trading.get_order_by_id
+
+    def counted(order_id):
+        reads.append(str(order_id))
+        return by_id(order_id)
+
+    monkeypatch.setattr(venue.trading, "get_order_by_id", counted)
+
+    async def body(client) -> None:
+        venue.trading.script = "silent"
+        venue.trading.took_before_error = True
+        venue.trading.submit_error = alpaca.api_error(500, 50010000, "internal server error")
+        order = strategy.order_factory.limit(
+            AAPL, OrderSide.BUY, Quantity.from_int(1), Price.from_str("150.00")
+        )
+        strategy.submit_order(order)
+        await until_true(lambda: bool(venue.trading._placed))
+        await until_true(lambda: "OrderSubmitted" in strategy.names())
+        (placed,) = venue.trading._placed.values()
+        await check(
+            client, strategy, strategy.cache.order(order.client_order_id), placed["id"], reads
+        )
+
+    run_with_client(body, strategy)
+
+
+def fill_of(alpaca, order_id: str, side: str = "buy", symbol: str = "AAPL"):
+    return fill_report(
+        {**alpaca.FILL_ACTIVITY, "order_id": order_id, "side": side, "symbol": symbol}, 0
+    )
+
+
+def test_a_fill_of_a_submit_never_answered_is_named_and_other_fills_are_not(
+    venue, alpaca, monkeypatch
+) -> None:
+    named: list = []
+
+    async def check(client, strategy, waiting, placed_id, reads) -> None:
+        own = fill_of(alpaca, placed_id)
+        other_side = fill_of(alpaca, placed_id, side="sell")
+        already = report_with(own, client_order_id=ClientOrderId("O-elsewhere"))
+        named.extend(await client._unanswered_named([own, other_side, already]))
+        named.append(list(reads))
+
+    naming(venue, alpaca, monkeypatch, check)
+
+    own, other_side, already, reads = named
+    assert own.client_order_id is not None and own.client_order_id.value.startswith("O-"), own
+    assert other_side.client_order_id is None  # not the waiting order's side: not read for it
+    assert already.client_order_id == ClientOrderId("O-elsewhere")
+    assert len(reads) == 1, reads
+
+
+def test_no_order_is_read_while_the_node_holds_no_submit_never_answered(
+    venue, alpaca, monkeypatch
+) -> None:
+    seen: list = []
+
+    async def body(client) -> None:
+        report = fill_of(alpaca, "b5abe576-6a8a-49f3-a353-46b72c1ccae9")
+        seen.append(await client._unanswered_named([report]))
+
+    reads: list[str] = []
+    monkeypatch.setattr(venue.trading, "get_order_by_id", lambda order_id: reads.append(order_id))
+    run_with_client(body)
+
+    ((report,),) = seen
+    assert report.client_order_id is None and reads == []
+
+
+def test_an_order_that_cannot_be_read_is_left_unnamed_and_read_again(
+    venue, alpaca, monkeypatch
+) -> None:
+    named: list = []
+
+    async def check(client, strategy, waiting, placed_id, reads) -> None:
+        venue.trading.order_lookup_error = lambda _id: ConnectionError("connection reset")
+        (first,) = await client._unanswered_named([fill_of(alpaca, placed_id)])
+        venue.trading.order_lookup_error = None
+        (second,) = await client._unanswered_named([fill_of(alpaca, placed_id)])
+        named.extend([first, second, list(reads)])
+
+    naming(venue, alpaca, monkeypatch, check)
+
+    first, second, reads = named
+    assert first.client_order_id is None
+    assert second.client_order_id is not None
+    assert len(reads) == 2, reads
+
+
+def test_an_order_not_the_nodes_is_read_once(venue, alpaca, monkeypatch) -> None:
+    outside = alpaca.alpaca_order(
+        id="c0ffee00-0000-4000-8000-000000000001", client_order_id="theirs-1"
+    )
+    named: list = []
+
+    async def check(client, strategy, waiting, placed_id, reads) -> None:
+        venue.trading.orders.append(outside)  # after start-up, which would have made it the node's
+        for _ in range(2):
+            (report,) = await client._unanswered_named([fill_of(alpaca, outside["id"])])
+            named.append(report)
+        named.append(list(reads))
+
+    naming(venue, alpaca, monkeypatch, check)
+
+    first, second, reads = named
+    assert first.client_order_id is None and second.client_order_id is None
+    assert reads == [outside["id"]], reads
+
+
+def test_a_submit_answered_while_its_order_is_read_is_not_named(venue, alpaca, monkeypatch) -> None:
+    # The node's orders waiting on an answer were taken before the read: an order rejected meanwhile
+    # (the in-flight check giving up under upstream's default, or a refusal) was named, and the engine
+    # given a fill for a closed order rather than booking it.
+    named: list = []
+
+    async def check(client, strategy, waiting, placed_id, reads) -> None:
+        read = client._orders_read
+
+        async def answered_meanwhile(order_ids):
+            found = await read(order_ids)
+            client.generate_order_rejected(
+                waiting, "refused while read", client.clock.timestamp_ns(), False
+            )
+            await until_true(lambda: strategy.cache.order(waiting.client_order_id).is_closed)
+            return found
+
+        monkeypatch.setattr(client, "_orders_read", answered_meanwhile)
+        named.extend(await client._unanswered_named([fill_of(alpaca, placed_id)]))
+
+    naming(venue, alpaca, monkeypatch, check)
+
+    (report,) = named
+    assert report.client_order_id is None
+
+
+@pytest.mark.parametrize("claim", [True, False], ids=["claimed", "unclaimed"])
+def test_a_lost_fill_whose_order_cannot_be_read_is_the_strategys_only_by_the_claim(
+    venue, alpaca, monkeypatch, capfd, claim
+) -> None:
+    # Why the strategy still claims its instrument: when Alpaca's order cannot be read, the fill report
+    # is not named, and the engine books the fill as an external order. Claimed, that booking is the
+    # strategy's ("Claimed orders and fills use the claiming strategy ID"); unclaimed, it is `EXTERNAL`'s,
+    # which the strategy does not read.
+    seen = lost_submit_filled(
+        venue,
+        alpaca,
+        monkeypatch,
+        capfd,
+        side="entry",
+        delivered=False,
+        retain=True,
+        claim=claim,
+        order_unread=True,
+    )
+
+    assert seen["order"][0] == OrderStatus.SUBMITTED, seen
+    assert seen["run"].startswith("Submission recovery incomplete at shutdown"), seen
+    if claim:
+        assert seen["held"] == seen["alpaca_holds"], seen
+        assert seen["external"] == [], seen
+    else:
+        assert seen["held"] == Decimal(0), seen
+        assert seen["external"], seen

@@ -49,7 +49,7 @@ paper, pre-market and after-hours so far (Sessions, feeds and what paper has sho
 | Part | Setting or code | Upstream it follows |
 |---|---|---|
 | Order size and rate | ADR 0049's `risk_limits`: $1,000 per order, 50 submits and 25 modifies a minute | `LiveRiskEngineConfig` (ADR 0049) |
-| Orders and position in step with Alpaca | `open_check_interval_secs=10`, `position_check_interval_secs=60`, both off by default; the position check aligns to the adapter's position reports until `position_check_retries` (3) run out; since 2026-11-11 (claim 10), a submit never answered is retained (`submission_recovery_policy=RETAIN_UNRESOLVED`) and the strategy claims its instrument (`external_order_instrument_ids`), so a fill reconciliation books is its own | configure_live_trading, "Continuous reconciliation": "5-10s", "30-60s"; concepts/execution/reconciliation, "Submission recovery" and "Order ownership and tags" |
+| Orders and position in step with Alpaca | `open_check_interval_secs=10`, `position_check_interval_secs=60`, both off by default; the position check aligns to the adapter's position reports until `position_check_retries` (3) run out; since 2026-11-11 (claim 10), a submit never answered is retained (`submission_recovery_policy=RETAIN_UNRESOLVED`) and the strategy claims its instrument (`external_order_instrument_ids`), so a fill reconciliation books is its own; the adapter's fill reports name such an order by the client order ID Alpaca's read of it shows |  configure_live_trading, "Continuous reconciliation": "5-10s", "30-60s"; concepts/execution/reconciliation, "Submission recovery" and "Order ownership and tags" |
 | Start-up reconciliation | Scoped to the symbol and one minute of history: every run starts only once it has found the account flat, so history can only mislead, and 60 minutes could hold the last window's exit without its entry; open orders and positions are reported however old | The Lighter tutorial's `reconciliation_instrument_ids`; the minute is the adapter's own paper tests' (the tutorial uses 60; the docs' tip leaves it unset) |
 | The node | `LiveNode.builder(...)`, `with_risk_engine_config`, `with_exec_engine_config`, `with_delay_post_stop_secs(5)`; a regular window 65 s, since the managed stop's market exit (60 attempts a second apart) runs only inside that delay before the node disconnects | `examples/live/sandbox/exec_tester.py`, the Lighter tutorial; `LiveNode::stop` and `process_runner_for` in `crates/live/src/node/mod.rs` at the pin |
 | Exit at wind-down and stop, in the session | `market_exit()`, and `manage_stop=True` so `stop()` runs it; `market_exit_reduce_only=False`, `market_exit_time_in_force=DAY` | concepts/strategies, "Market exit" |
@@ -344,8 +344,8 @@ sell, the trade update delivered or lost. Two upstream settings close it, and ea
 
 With both, the strategy's position was Alpaca's in all four cases. Delivered, the order filled under
 Alpaca's trade ID. Lost, it stayed submitted and the node's run ended with the error naming it ("Submission
-recovery at shutdown", concepts/live), so the window is recorded failed and its account check looks the
-order up. An update delivered after the position check had booked the fill was not counted again (observed
+recovery at shutdown", concepts/live), so the window was recorded failed and its account check looked the
+order up, until the adapter's change below. An update delivered after the position check had booked the fill was not counted again (observed
 while building, not kept as a test). The window's tests of the claim and of the engine's policy
 (`tests/test_session_window.py`) failed before the change. The case needs a submit with no answer (a
 5xx or a read timeout, ADR 0039) and every read of the order failing through the in-flight check, which
@@ -362,16 +362,36 @@ market exit: at the wind-down and again at the managed stop, `market_exit` cance
 and closes its position as the node holds it (`market_exit`, `crates/trading/src/strategy/mod.rs` at the
 pin), so a retained close whose fill the position check has not yet booked can be sent a second time, as
 a close rejected locally could before; the account check after the stop finds and closes what that
-leaves, in the regular session.
+leaves, in the regular session. Retention covers only a `SUBMITTED` order: an `ACCEPTED` one the open-order
+check does not find is still rejected by the node (`NOT_FOUND_AT_VENUE`, the missing-order resolution in
+`crates/live/src/execution/manager.rs` at the pin), and the per-client opt-in
+(`retain_unresolved_submissions`) has no Python binding, so `paper_node` sets the engine's policy. A run
+that ends with the shutdown error is recorded failed and still hands the order to the account check
+(`test_a_retained_submit_fails_the_window_and_is_handed_to_the_check`).
 
-The limit left: with the trade update lost, the retained order stays `SUBMITTED` until the node stops, which
-then fails with "Submission recovery incomplete at shutdown: unresolved client order IDs [...]" naming it,
-so the window is recorded failed; the account check after the stop looks the order up by its client order
-ID and, in the regular session, closes the position it left. The adapter could resolve the order instead
-by setting the order's client order ID on its fill reports, so the engine matches the fill to it, as
-upstream's OKX adapter sets the one the venue echoes (`parse_fill_report` in
-`crates/adapters/okx/src/common/parse.rs` at the pin); this adapter's fill reports leave it unset, and
-that change to the adapter's fill path is not built here.
+2026-11-11, the lost update's limit closed: with the trade update lost, the retained order stayed `SUBMITTED`
+until the node stopped, which then failed with "Submission recovery incomplete at shutdown: unresolved
+client order IDs [...]" naming it. A fill activity names its Alpaca order and no client order ID, and the
+node held no Alpaca order ID for a submit never answered, so the engine matched the position check's fill
+report to nothing. The adapter now sets the node order's client order ID on such a report, from Alpaca's
+read of the order ("Get an Order by ID" returns `client_order_id`), as upstream's OKX adapter sets the one
+the venue echoes (`parse_fill_report` in `crates/adapters/okx/src/common/parse.rs` at the pin; Coinbase's
+leaves it unset because its fill records carry none). The engine matches a report by its client order ID
+first (`reconcile_fill_report`), so the fill reaches the order itself under Alpaca's trade ID and the run
+ends clean, for an entry and a closing sell, with both settings and with retention alone
+(`test_retained_a_lost_fill_reaches_the_order_by_its_client_order_id`, which failed before the change).
+The adapter reads an order for this only while the node holds an order in flight with no Alpaca order
+ID, only for a report in such an order's instrument and side, and each Alpaca order once; it names a
+report only if the order is still waiting after the read. The code review of this change (round 1, 7
+findings) found an order answered during the read still named, and an order not the node's read on
+every request, each shown by a test failing before its fix
+(`test_a_submit_answered_while_its_order_is_read_is_not_named`, `test_an_order_not_the_nodes_is_read_once`),
+the branches that leave a report unnamed untested, which now have tests, and the reads the filters
+above remove. The claim stays: when Alpaca's order cannot be read the report is not named and the engine
+books the fill as an external order, which the claim makes the strategy's
+(`test_a_lost_fill_whose_order_cannot_be_read_is_the_strategys_only_by_the_claim`). The naming acts only
+on a submit never answered, which no paper run has shown: it runs offline on a real `LiveNode` with
+stand-ins for Alpaca, and on paper it is UNVERIFIED.
 
 ## Evidence
 

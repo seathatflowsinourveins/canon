@@ -3146,6 +3146,46 @@ def test_the_window_hands_the_nodes_orders_in_doubt_to_the_check(monkeypatch, tm
     assert report.unsettled == {"entry-late": ["buy: sent with no answer"]}
 
 
+def test_a_retained_submit_fails_the_window_and_is_handed_to_the_check(
+    monkeypatch, tmp_path
+) -> None:
+    """The paper nodes retain a submit never answered (`RETAIN_UNRESOLVED`, claim 10): if nothing resolves
+    it, the node's run ends with upstream's error naming it ("Submission recovery at shutdown",
+    concepts/live at the pin). The window is recorded failed with that error, and the order still goes to
+    the account check as one sent with no answer."""
+    retained = node_order("entry-late", OrderInitialized(), OrderSubmitted())
+    error = "Submission recovery incomplete at shutdown: unresolved client order IDs [entry-late]"
+
+    class Ran:
+        cache = SimpleNamespace(orders=lambda **kwargs: [retained])
+
+        def dispose(self) -> None: ...
+
+    def run_node(node, ends) -> None:
+        raise RuntimeError(error)
+
+    s = SimpleNamespace(
+        dropped=[], history_bars=0, history_dropped=0, quotes=1, trades=1, live_bars=0
+    )
+    cap = SimpleNamespace(checks=1, peak=Decimal(0), tripped=None)
+    handed: list = []
+    monkeypatch.setattr(session_window, "_ABANDONED", [])
+    monkeypatch.setattr(session_window, "paper_trading", lambda: Account())
+    monkeypatch.setattr(session_window, "window_node", lambda config, **kw: (Ran(), s, cap))
+    monkeypatch.setattr(session_window, "_run_node", run_node)
+    monkeypatch.setattr(
+        session_window,
+        "_flatten_after_stop",
+        lambda trading, config, report, **kw: handed.append(kw["unsettled"]) or [],
+    )
+    with pytest.raises(RuntimeError, match="Submission recovery incomplete"):
+        session_window.run_window(WindowConfig(log_dir=tmp_path))
+    assert handed == [{"entry-late": "buy"}]
+    latest = json.loads((tmp_path / "latest.json").read_text())
+    assert latest["result"].startswith(f"failed: RuntimeError: {error}"), latest["result"]
+    assert latest["unsettled"] == {"entry-late": ["buy: sent with no answer"]}
+
+
 # An independent review of the in-doubt lookup as landed (2026-11-10): each shown here before its fix.
 
 

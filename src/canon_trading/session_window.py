@@ -1759,9 +1759,12 @@ def _close_runner(runner: asyncio.Runner, task: asyncio.Task | None, calls: Call
 
 
 LOCAL_REJECTIONS = ("INFLIGHT_TIMEOUT", "NOT_FOUND_AT_VENUE")
-"""The reasons the node gives a rejection of its own, for a submit never acknowledged: the two
-`create_reconciliation_rejected` calls in `crates/live/src/execution/manager.rs` at the pin (the in-flight
-check out of retries, an order its queries did not find). Alpaca may still take such an order."""
+"""The reasons the node gives a rejection of its own: the two `create_reconciliation_rejected` calls in
+`crates/live/src/execution/manager.rs` at the pin (the in-flight check out of retries, an order its
+queries did not find). Alpaca may still hold such an order. The paper nodes retain a submit never
+acknowledged (`RETAIN_UNRESOLVED`), which takes `SUBMITTED` orders out of both; an `ACCEPTED` order the
+open-order check does not find is still rejected `NOT_FOUND_AT_VENUE`, and a node built without
+`paper_node.exec_engine_config` keeps upstream's default."""
 
 
 def _event_name(event) -> str:

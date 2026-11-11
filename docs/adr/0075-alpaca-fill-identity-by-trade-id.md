@@ -96,7 +96,8 @@ stream", which Alpaca's do.
   still `SUBMITTED`, `PENDING_UPDATE` or `PENDING_CANCEL` whose fills the activities do not list through
   all of the engine's in-flight queries is resolved locally: a submit rejected with `INFLIGHT_TIMEOUT`, the
   others canceled (`check_inflight_orders` at the pin). A fill Alpaca makes on it afterwards is booked to
-  an `EXTERNAL` order. With `open_check_open_only` off, an open order whose report is held back past
+  an `EXTERNAL` order. Closed for a submit on the paper nodes (2026-11-11, ADR 0044): their engine retains
+  it, and the adapter's fill report names it by the client order ID Alpaca's read of it shows. With `open_check_open_only` off, an open order whose report is held back past
   `open_check_missing_retries` and a targeted query is resolved locally too: an accepted one rejected
   with `NOT_FOUND_AT_VENUE`, a partly filled one canceled, a pending one deferred. How long the
   activities lag is not on Alpaca's pages (UNVERIFIED).
