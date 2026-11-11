@@ -199,6 +199,7 @@ lists; "system" is `/usr/bin` or `/bin`. Secret variables are named, never shown
 | `.githooks/pre-commit`, `pre-push`, `scripts/ci` and `scripts/land` by hand | git's own `libexec/git-core` (in a hook), then the caller's; `scripts/ci` then puts mise's first for its checks | caller's; mise's inside `scripts/ci` | mise's (`land` calls `gh` through `mise exec`) | system | caller's | not used |
 | launchd agents `scripts/automation` installs: lane watchdog, OTLP collector, paper session, maintenance, OmniRoute gateway | `/usr/bin:/bin:/usr/sbin:/sbin`, set by each script, by the gateway's plist, and by the maintenance agent after mise's own folder; mise named by absolute path, and `mise run` adds its own | mise's inside `mise run paper:session` | mise's, through mise | system | the watchdog's and the maintenance agent's plists set `CLAUDE_CONFIG_DIR` to the folder at install | not used |
 | Hosted workflow (`.github/workflows/ci.yml`, `ubuntu-24.04`) | mise's (mise-action adds each to `GITHUB_PATH`) | mise's 3.14 | mise's | runner's; git 2.56, bash at `/usr/bin/bash` | none | not used |
+| Hosted workflow's macOS job (`xcode-27`, macOS 27, two self-tests only) | mise's (mise-action) | mise's 3.14 | mise's | system; scripts run `/bin/bash` 3.2 (the image readme: Bash 3.2.57) | none | not used |
 
 Where they differ in a way a script here depends on:
 
@@ -209,8 +210,11 @@ Where they differ in a way a script here depends on:
   (`toolchain_first`; `scripts/test-ci`, "pathorder"), and the session brief says when a session's
   `python3` is not the toolchain's (`.claude/hooks/session-brief.sh`; `scripts/test-canon`, "brief
   toolchain"). `scripts/test-lanes` and `scripts/bootstrap` find a Python with `tomllib` themselves.
-* **macOS-only tools.** The hosted runner has no `plutil`, `lockf`, `timeout` at `/usr/bin` or `security`;
-  `scripts/test-lanes` skips those cases there and says so, so they run only on this Mac's commit gate.
+* **macOS-only tools.** The hosted Ubuntu runner has no `plutil`, `lockf` or `security` at `/usr/bin`, nor
+  an `expect` that opens a pseudo-terminal; `scripts/test-lanes` skips those cases there and `scripts/ci`
+  names them in its last lines.
+  The workflow's `macOS self-tests` job runs them on `xcode-27` (macOS 27; `macos-26` has no `/usr/bin/timeout`), where only the case that writes to the
+  login keychain may skip (ADR 0082).
 * **mise configs above the working folder.** mise reads a config in every folder from the root down to
   the one it runs in, unless `MISE_CEILING_PATHS` stops it (mise's `ceiling_paths` setting). A reviewer
   that wrote a copy of `mise.toml` into `/tmp` changed every mise run under `/tmp`, so the self-tests that

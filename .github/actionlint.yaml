@@ -1,0 +1,7 @@
+# actionlint configuration (https://github.com/rhysd/actionlint/blob/main/docs/config.md).
+# xcode-27 is a GitHub-hosted standard runner label (macOS 27, a preview image) that actionlint 1.7.12 does
+# not list yet. This key is actionlint's one documented way to accept a label it does not know; the label is
+# hosted, not self-hosted. Remove this file once actionlint lists the label (ADR 0082).
+self-hosted-runner:
+  labels:
+    - xcode-27

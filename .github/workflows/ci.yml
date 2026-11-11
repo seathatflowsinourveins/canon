@@ -1,5 +1,7 @@
 # CI for Canon (docs/adr/0013-quality-gates.md, docs/adr/0014-landing-workflow.md).
-# It runs scripts/ci, the same script the commit gate and scripts/land run.
+# It runs scripts/ci, the same script the commit gate and scripts/land run, on Ubuntu; and on a hosted macOS
+# runner the two self-tests whose cases need lockf(1), plutil(1) and an expect(1) that opens a pseudo-terminal
+# at /usr/bin, as macOS has them, and which skip those cases on Ubuntu (ADR 0082).
 #
 # The ruleset on main requires this workflow's `all required checks passed` job, and the `signoff` status
 # that scripts/land posts after the same checks pass locally. Checked with actionlint.
@@ -15,8 +17,11 @@ on:
 permissions:
   contents: read
 
+# A pull request's newer push cancels its older run; a push to main has no head_ref and gets a group of its own
+# (the run id), so one landing never cancels the run of the landing before it, the macOS job's included. The
+# group GitHub's concurrency docs give for "cancels in-progress jobs or runs on pull_request events only".
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
 
 jobs:
@@ -42,6 +47,62 @@ jobs:
 
       - name: Run every check
         run: scripts/ci
+
+  # The self-test cases Ubuntu skips, run where they can run: the paper runner under lockf(1) and timeout(1),
+  # the paper lock's deadline and the sandbox node's stream lock, and the LaunchAgent plists read back with
+  # plutil(1). No credential, no paper run, no keychain item (CANON_TEST_NO_KEYCHAIN skips, by name, the one
+  # case that writes to the login keychain), and launchctl is a stand-in in both scripts, so nothing is loaded
+  # into launchd. CANON_TEST_ALLOWED_SKIPS makes any other skipped case of test-lanes a failure, and the
+  # test-maintenance step fails unless its last line reports cases passed. macOS 27, which has /usr/bin/timeout
+  # (macos-26 has not): xcode-27 is the one hosted macOS 27 label, a standard runner and a preview image. A
+  # version label, not macos-latest, so the OS version moves only when this line does (the image itself is
+  # updated weekly). Not among required-checks-passed's needs: it reports and does not block until a GA
+  # macOS 27 label exists and it has passed on three landings there (ADR 0082).
+  macos:
+    name: macOS self-tests
+    runs-on: xcode-27
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash # bash --noprofile --norc -eo pipefail: tee below keeps the script's exit status
+    env:
+      CANON_TEST_NO_KEYCHAIN: 1
+      CANON_TEST_ALLOWED_SKIPS: "paper:store on a terminal"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
+        with:
+          version: 2026.11.6
+          cache: false
+
+      # Fails naming any tool the cases need that is missing; the two scripts still run after it, so their
+      # own failures show too.
+      - name: The macOS tools the cases need
+        run: |
+          sw_vers; /bin/bash --version | head -n 1
+          missing=""
+          for t in lockf timeout plutil expect getconf jq nc sqlite3 security; do
+            if [ -x "/usr/bin/$t" ]; then echo "/usr/bin/$t"; else missing="$missing /usr/bin/$t"; fi
+          done
+          if [ -n "$missing" ]; then echo "::error title=missing on this image::$missing"; exit 1; fi
+
+      - name: test-lanes
+        if: ${{ !cancelled() }}
+        run: scripts/test-lanes
+
+      # test-maintenance has no strict mode; its last line must report cases passed and none failed, which a
+      # run that skips as a whole ("0 passed, 0 failed, 1 skipped") does not
+      - name: test-maintenance
+        if: ${{ !cancelled() }}
+        run: |
+          scripts/test-maintenance | tee "$RUNNER_TEMP/test-maintenance.out"
+          if ! tail -n 1 "$RUNNER_TEMP/test-maintenance.out" | grep -Eqx 'test-maintenance: [1-9][0-9]* passed, 0 failed'; then
+            echo "::error title=test-maintenance did not run its cases::its last line: $(tail -n 1 "$RUNNER_TEMP/test-maintenance.out")"
+            exit 1
+          fi
 
   # The one status check that branch rules require, so jobs can be added above without touching the
   # repository's settings. Same shape as the `required-checks-passed` job in astral-sh/uv and astral-sh/ruff.
