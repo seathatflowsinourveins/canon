@@ -28,6 +28,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC
 from datetime import datetime
 from datetime import timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Literal
 from zoneinfo import ZoneInfo
@@ -56,9 +57,12 @@ from nautilus_trader.live import LiveNode
 from nautilus_trader.model import BarType
 from nautilus_trader.model import Equity
 from nautilus_trader.model import InstrumentId
+from nautilus_trader.model import NautilusDataType
 from nautilus_trader.model import Price
 from nautilus_trader.model import TradeId
 from nautilus_trader.model import TraderId
+from nautilus_trader.persistence import DataCatalogConfig
+from nautilus_trader.persistence import ParquetDataCatalog
 from nautilus_trader.trading import Strategy
 
 AAPL = InstrumentId.from_str("AAPL.ALPACA")
@@ -212,6 +216,7 @@ def build_node(
     registration: str = "config",
     timeout_connection_secs: int = 2,
     factory: type[AlpacaDataClientFactory] = AlpacaDataClientFactory,
+    catalog: Path | None = None,
 ):
     config = DataClientConfig(
         instrument_provider=InstrumentProviderConfig(load_ids=["AAPL.ALPACA"])
@@ -226,10 +231,12 @@ def build_node(
                 timeout_disconnection_secs=5,
                 delay_post_stop_secs=0,
                 data_clients={"ALPACA": config},
+                catalogs=[] if catalog is None else [DataCatalogConfig(path=str(catalog))],
             ),
             data_factories={"ALPACA": factory},
         )
     else:
+        assert catalog is None, "the builder path is not used with a catalog here"
         node = (
             LiveNode.builder("CANON-ALPACA", TRADER, Environment.SANDBOX)
             .with_delay_post_stop_secs(0)
@@ -2139,3 +2146,331 @@ def test_a_stream_call_that_returns_at_once_is_recorded_before_its_hook_returns(
         assert not client._stream_calls.locked()
 
     run_with_client(body, executor=InlineStreamExecutor())
+
+
+# -- historical quotes (ADR 0066) ------------------------------------------------------------------
+
+Q_START = datetime(2022, 1, 3, 15, tzinfo=UTC)
+Q_END = Q_START + timedelta(minutes=1)
+WRITE_BACK = {"update_catalog": True}
+
+
+class QuoteRequester(Strategy):
+    """Request AAPL's quotes over each window in turn, recording what arrives, then stop the node.
+
+    `Strategy` is a native class whose `__new__` takes no extra arguments, so the caller sets the options."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.windows: list[tuple[datetime | None, datetime | None]] = [(Q_START, Q_END)]
+        self.params: dict | None = dict(WRITE_BACK)
+        self.limit: int | None = None
+        self.instrument_ids: list[InstrumentId] = [AAPL]
+        self.seen: list = []
+        self.failures: list[str | None] = []
+
+    def on_start(self) -> None:
+        self._request_next()
+
+    def _request_next(self) -> None:
+        start, end = self.windows[len(self.failures)]
+        ids = self.instrument_ids[0] if len(self.instrument_ids) == 1 else self.instrument_ids
+        self.request_quotes(ids, start=start, end=end, limit=self.limit, params=self.params)
+
+    def on_historical_quotes(self, quotes) -> None:
+        self.seen.extend(quotes)
+
+    def on_data_response(self, response) -> None:
+        if not (response.failure_reason or response.completed):
+            return
+        self.failures.append(response.failure_reason)
+        if len(self.failures) < len(self.windows):
+            self._request_next()
+        else:
+            self.shutdown_system("Alpaca quotes checked")
+
+
+def quote_requester(**options: object) -> QuoteRequester:
+    strategy = QuoteRequester()
+    for name, value in options.items():
+        assert hasattr(strategy, name), name
+        setattr(strategy, name, value)
+    return strategy
+
+
+def quote_seconds(*seconds: float) -> list[datetime]:
+    return [Q_START + timedelta(seconds=s) for s in seconds]
+
+
+def stored_quotes(catalog: Path) -> list:
+    return ParquetDataCatalog(str(catalog)).query_quote_ticks([str(AAPL)])
+
+
+def quote_intervals(catalog: Path) -> list[tuple[int, int]]:
+    return sorted(
+        ParquetDataCatalog(str(catalog)).get_intervals(NautilusDataType.QuoteTick, str(AAPL))
+    )
+
+
+def catalog_files(catalog: Path) -> list[str]:
+    return sorted(str(p.relative_to(catalog)) for p in catalog.rglob("*") if p.is_file())
+
+
+def test_quotes_reach_the_strategy_stamped_when_alpaca_stamped_them(venue, alpaca) -> None:
+    times = quote_seconds(0, 0.5, 30, 60, 61)
+    venue.historical.quotes = alpaca.quotes_at(*times)
+    strategy = quote_requester(params=None)
+
+    run(build_node(strategy), "hosted")
+
+    assert strategy.failures == [None]
+    # Alpaca's window is inclusive at both ends (the quotes reference), so the quote at the end is kept.
+    expected = [dt_to_unix_nanos(t) for t in times[:4]]
+    assert [q.ts_event for q in strategy.seen] == expected
+    assert [q.ts_init for q in strategy.seen] == expected
+    first = strategy.seen[0]
+    quote = alpaca.HISTORICAL_QUOTE_AAPL
+    assert (first.bid_price, first.ask_price) == (
+        Price.from_str("387.6700"),
+        Price.from_str("387.7000"),
+    )
+    assert (int(first.bid_size), int(first.ask_size)) == (quote["bs"], quote["as"])
+    (sent,) = venue.historical.requests
+    assert sent.symbol_or_symbols == "AAPL"
+    assert sent.feed is DataFeed.IEX
+    assert (sent.start, sent.end) == (Q_START.replace(tzinfo=None), Q_END.replace(tzinfo=None))
+    assert sent.limit is None
+
+
+def test_a_quote_request_writes_back_and_a_covered_one_asks_alpaca_nothing(
+    venue, alpaca, tmp_path
+) -> None:
+    """ADR 0066's first point offline: write-back works for quotes at the pin, as ADR 0040 found for bars."""
+    venue.historical.quotes = alpaca.quotes_at(*quote_seconds(1, 2, 3))
+    first = quote_requester()
+    run(build_node(first, catalog=tmp_path), "hosted")
+
+    assert first.failures == [None]
+    assert quote_intervals(tmp_path) == [(dt_to_unix_nanos(Q_START), dt_to_unix_nanos(Q_END))]
+    files = catalog_files(tmp_path)
+    assert files == [
+        "data/quotes/AAPL.ALPACA/2022-01-03T15-00-00-000000000Z_2022-01-03T15-01-00-000000000Z.parquet"
+    ]
+    assert [(q.ts_event, q.ts_init) for q in stored_quotes(tmp_path)] == [
+        (q.ts_event, q.ts_init) for q in first.seen
+    ]
+
+    BUILT_NODES.pop().dispose()
+    again = quote_requester()
+    run(build_node(again, catalog=tmp_path), "hosted")
+
+    assert again.failures == [None]
+    assert len(venue.historical.requests) == 1  # served from the catalog
+    assert [q.ts_event for q in again.seen] == [q.ts_event for q in first.seen]
+    assert catalog_files(tmp_path) == files
+
+
+def test_an_empty_quote_response_records_nothing_and_is_asked_for_again(
+    venue, tmp_path, capfd
+) -> None:
+    """ADR 0066's second point offline: the Parquet catalog records no known-empty coverage."""
+    strategy = quote_requester(windows=[(Q_START, Q_END), (Q_START, Q_END)])
+
+    run(build_node(strategy, catalog=tmp_path), "hosted")
+
+    assert strategy.failures == [None, None]
+    assert strategy.seen == []
+    assert len(venue.historical.requests) == 2
+    assert quote_intervals(tmp_path) == []
+    assert catalog_files(tmp_path) == []
+    assert "Received empty QuoteTick response" in logged(capfd)
+
+
+def test_a_staging_file_a_killed_write_leaves_is_not_read_and_the_window_is_written_again(
+    venue, alpaca, tmp_path
+) -> None:
+    """ADR 0066's third point offline. The catalog encodes a file whole, writes it as `<name>#<n>` and
+    renames it into place (observed at the pin), so a process killed in between leaves only that staging
+    file, which is cut short here to stand for one killed mid-write."""
+    name = "2022-01-03T15-00-00-000000000Z_2022-01-03T15-01-00-000000000Z.parquet"
+    staged = tmp_path / "data" / "quotes" / str(AAPL) / f"{name}#1"
+    staged.parent.mkdir(parents=True)
+    staged.write_bytes(b"PAR1" + bytes(1000))
+    assert quote_intervals(tmp_path) == []
+    assert stored_quotes(tmp_path) == []
+
+    venue.historical.quotes = alpaca.quotes_at(*quote_seconds(1, 2, 3))
+    strategy = quote_requester()
+    run(build_node(strategy, catalog=tmp_path), "hosted")
+
+    assert strategy.failures == [None]
+    assert len(venue.historical.requests) == 1
+    assert quote_intervals(tmp_path) == [(dt_to_unix_nanos(Q_START), dt_to_unix_nanos(Q_END))]
+    assert len(stored_quotes(tmp_path)) == 3
+    assert catalog_files(tmp_path) == [
+        f"data/quotes/AAPL.ALPACA/{name}",
+        f"data/quotes/AAPL.ALPACA/{name}#1",
+    ]
+
+
+def test_a_quote_request_with_a_limit_is_answered_and_not_written_back(venue, alpaca, tmp_path):
+    """The catalog guide: write-back refuses a request with a record limit. At the pin the request is
+    answered and nothing is written or recorded (observed)."""
+    venue.historical.quotes = alpaca.quotes_at(*quote_seconds(1, 2, 3))
+    strategy = quote_requester(limit=2)
+
+    run(build_node(strategy, catalog=tmp_path), "hosted")
+
+    assert strategy.failures == [None]
+    assert len(strategy.seen) == 2
+    assert venue.historical.requests[0].limit == 2
+    assert quote_intervals(tmp_path) == []
+    assert catalog_files(tmp_path) == []
+
+
+def test_one_sided_historical_quotes_are_dropped_and_counted(venue, alpaca, capfd) -> None:
+    venue.historical.quotes = [
+        *alpaca.quotes_at(*quote_seconds(1)),
+        {**alpaca.quotes_at(*quote_seconds(2))[0], "bp": 0},
+        {**alpaca.quotes_at(*quote_seconds(3))[0], "ap": 0},
+    ]
+    strategy = quote_requester(params=None)
+
+    run(build_node(strategy), "hosted")
+
+    assert strategy.failures == [None]
+    assert [q.ts_event for q in strategy.seen] == [dt_to_unix_nanos(quote_seconds(1)[0])]
+    assert "Dropped 2 one-sided Alpaca quotes of 3 for AAPL" in logged(capfd)
+
+
+def test_a_malformed_historical_quote_fails_the_request(venue, alpaca) -> None:
+    """A price finer than the instrument's precision cannot be stored without rounding, so the request
+    fails, naming it, as a bars request does, and nothing of it is kept."""
+    venue.historical.quotes = [{**alpaca.quotes_at(*quote_seconds(1))[0], "bp": 387.67001}]
+    strategy = quote_requester(params=None)
+
+    run(build_node(strategy), "hosted")
+
+    (reason,) = strategy.failures
+    assert reason is not None and "not representable" in reason
+    assert strategy.seen == []
+
+
+@pytest.mark.parametrize("feed", ["sip", "boats", "otc", "overnight"])
+def test_a_quote_request_naming_another_feed_than_iex_is_refused_before_sending(venue, feed):
+    strategy = quote_requester(params={"feed": feed, **WRITE_BACK})
+
+    run(build_node(strategy), "hosted")
+
+    (reason,) = strategy.failures
+    assert reason is not None and "quote requests take feed iex" in reason
+    assert venue.historical.requests == []
+
+
+def test_a_quote_request_naming_iex_is_sent_on_iex(venue) -> None:
+    strategy = quote_requester(params={"feed": "iex"})
+
+    run(build_node(strategy), "hosted")
+
+    assert strategy.failures == [None]
+    assert venue.historical.requests[0].feed is DataFeed.IEX
+
+
+def test_a_failed_quotes_fetch_becomes_the_failure_reason(venue, tmp_path) -> None:
+    venue.historical.error = APIError('{"code": 42210000, "message": "invalid start"}')
+    strategy = quote_requester()
+
+    run(build_node(strategy, catalog=tmp_path), "hosted")
+
+    (reason,) = strategy.failures
+    assert reason is not None and "invalid start" in reason
+    assert catalog_files(tmp_path) == []
+
+
+def quotes_request(
+    *instrument_ids: InstrumentId, start: datetime, end: datetime
+) -> SimpleNamespace:
+    """The fields `_request_quotes` reads from a `RequestQuotes`, for calling the hook directly."""
+    return SimpleNamespace(
+        instrument_ids=list(instrument_ids),
+        start=start,
+        end=end,
+        limit=None,
+        request_id=UUID4(),
+        start_ns=dt_to_unix_nanos(start),
+        end_ns=dt_to_unix_nanos(end),
+        params=None,
+    )
+
+
+def test_a_quote_request_for_two_instruments_is_refused(venue) -> None:
+    async def body(client) -> None:
+        with pytest.raises(ValueError, match="one instrument, got 2"):
+            await client._request_quotes(quotes_request(AAPL, AAPL, start=Q_START, end=Q_END))
+
+    run_with_client(body)
+    assert venue.historical.requests == []
+
+
+def test_a_quote_request_starting_after_now_sends_nothing(venue) -> None:
+    # NautilusTrader's `request_quotes` refuses an end after now ("end was > now"), so the hook is called
+    # directly, as another caller of it could.
+    async def body(client) -> None:
+        now = datetime.now(UTC)
+        await client._request_quotes(quotes_request(AAPL, start=now + HOUR, end=now + 2 * HOUR))
+
+    run_with_client(body)
+
+    assert venue.historical.requests == []
+
+
+def test_a_quote_request_ending_after_now_is_cut_at_now(venue) -> None:
+    times = {}
+
+    async def body(client) -> None:
+        times["before"] = datetime.now(UTC)
+        await client._request_quotes(
+            quotes_request(AAPL, start=times["before"] - HOUR, end=times["before"] + HOUR)
+        )
+        times["after"] = datetime.now(UTC)
+
+    run_with_client(body)
+
+    (sent,) = venue.historical.requests
+    assert sent.start == (times["before"] - HOUR).astimezone(UTC).replace(tzinfo=None)
+    assert times["before"].replace(tzinfo=None) <= sent.end <= times["after"].replace(tzinfo=None)
+
+
+def test_historical_quotes_are_converted_in_slices_that_let_the_loop_run(
+    venue, alpaca, monkeypatch
+) -> None:
+    """An hour of IEX quotes takes seconds to convert on the node's loop, so the hook lets it run every
+    `QUOTES_PER_SLICE` quotes: a task counting loop turns sees the count move between slices."""
+    venue.historical.quotes = alpaca.quotes_at(*quote_seconds(1, 2, 3, 4))
+    monkeypatch.setattr(canon_alpaca.data, "QUOTES_PER_SLICE", 2)
+    turns = [0]
+    seen_at: list[int] = []
+    parse = canon_alpaca.data.parse_quote
+
+    def counting_parse(*args, **kwargs):
+        seen_at.append(turns[0])
+        return parse(*args, **kwargs)
+
+    monkeypatch.setattr(canon_alpaca.data, "parse_quote", counting_parse)
+
+    async def body(client) -> None:
+        async def count() -> None:
+            while True:
+                turns[0] += 1
+                await asyncio.sleep(0)
+
+        counter = asyncio.ensure_future(count())
+        try:
+            await client._request_quotes(quotes_request(AAPL, start=Q_START, end=Q_END))
+        finally:
+            counter.cancel()
+
+    run_with_client(body)
+
+    assert len(seen_at) == 4
+    assert seen_at[0] == seen_at[1] < seen_at[2] == seen_at[3]

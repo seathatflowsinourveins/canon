@@ -45,8 +45,10 @@ deadline at the probe's page rate (41 and 31 minutes against
 54; parsing, writing and start-up unmeasured). Each piece asks only for what the catalog
 does not cover. An empty hour (night, weekend) may record no coverage (ADR 0040 saw an empty bars
 response write nothing), so it is asked for again, at one call each. Whether a piece stopped at the
-deadline by SIGKILL leaves a partial Parquet file is UNVERIFIED. Condition 2 below says where the bulk
-load runs. That write-back works for quotes at the pin is UNVERIFIED until that code runs. ADR 0040
+deadline by SIGKILL leaves a partial Parquet file is UNVERIFIED (settled 2026-11-11: it does not,
+Confirmation). Condition 2 below says where the bulk
+load runs. That write-back works for quotes at the pin is UNVERIFIED until that code runs (it does,
+Confirmation, 2026-11-11). ADR 0040
 observed that an empty bars response
 wrote nothing, though the guide says it can record known-empty coverage. Option 2 would need ADR 0040's
 reasons against it answered again. Option 3 stays open if the owner finds the load too large.
@@ -145,6 +147,39 @@ call, logs kept outside the repository:
   `mise run paper:test -- -v -k quote_history_begins`, exit 0, 1 passed in 2 s. The counting
   probes were throwaway tests, kept outside the repository.
 
+**Condition 1** (2026-11-11). The data client answers `_request_quotes` (v1's
+`_request_quote_ticks`, renamed in v2 by the adapter guide's migration table), IEX only, one
+response a request, each quote stamped `ts_init = ts_event` as upstream's Databento client stamps a
+historical range (`canon_alpaca.data`). On paper, 01:09 New York, `mise run paper:test -- -s -v -k
+quotes_write_back`, exit 0, 3 passed in 5 s after the paper lock came free (log kept outside the
+repository), each catalog in a temporary folder:
+
+* Write-back works for quotes at the pin: SPY on IEX, 10:00 to 10:03 New York on 2026-11-09, one
+  request, 48,924 quotes in one file, `data/quotes/SPY.ALPACA/2026-11-09T15-00-00-000000000Z_2026-11-09T15-03-00-000000000Z.parquet`,
+  the window recorded as covered; a second request over it wrote nothing.
+* An empty response records nothing: SPY on IEX, 12:00 to 12:01 New York on Sunday 2026-11-08, no quote;
+  the engine logged "Received empty QuoteTick response", wrote no file and recorded no coverage, as ADR
+  0040 found for bars, so an empty hour is asked for again.
+* A request killed in mid-write leaves no partial file: the same window, requested in a child process
+  sent SIGKILL as its catalog logged "Writing", left no data file, no staging file and no coverage; a
+  request after it filled the window with the same quotes. Offline, with a million stand-in quotes, the
+  catalog encoded the file whole, wrote it as `<name>#1` and renamed it into place, about 80 ms after its
+  "Writing" line; killed on seeing the staging file, the rename had already landed, and the catalog
+  held the complete file. A staging file left behind, even cut short, is not read: no coverage, no
+  quote, the window still reported missing, and the next write-back writes the file beside it.
+
+Each is an offline test in `packages/canon-alpaca/tests/test_data_client.py` (`test_a_quote_request_writes_back_and_a_covered_one_asks_alpaca_nothing`,
+`test_an_empty_quote_response_records_nothing_and_is_asked_for_again`,
+`test_a_staging_file_a_killed_write_leaves_is_not_read_and_the_window_is_written_again`) and a paper test in
+`test_paper_quotes_write_back.py`. Also observed at the pin, offline: a request with a `limit` is answered
+and not written back, with no failure. Upstream's TC-D21 (`DataTester`, `request_quotes=True`) is added to
+`test_paper_matrix.py` and runs in the regular session; it has not run yet.
+
+Quote sizes: the quotes reference gives bid and ask size "in shares (round lots prior to November 3,
+2025)"; the real-time page still gives round lots for the stream. Of the 97,848 sizes above, 3,755 were a
+multiple of 100 and the largest 640, which does not settle the unit. Nothing converts a size, so a
+catalog spanning 2025-11-03 may change unit there (UNVERIFIED which).
+
 `UNVERIFIED`: a full SIP day (not counted, to keep the lock short); whether HTTP compression shrinks the
 133 bytes on the wire; whether a full day compresses like one page; how long a backtest takes over a
 quarter of quotes.
@@ -178,6 +213,15 @@ Read 2026-11-10. Fetched means read as raw text; run means executed here.
 * alpaca-py 0.45.0 as installed: `get_stock_quotes` pages `/stocks/quotes` at `page_size=10_000` through
   `RESTClient.get`; `DataFeed`'s six members. Bundled.
 * ParquetDataCatalog at the pin: `write_quote_ticks` (installed docstring). Bundled.
+* Read 2026-11-11: https://docs.alpaca.markets/us/reference/stockquotes-1.md (inclusive `start` and
+  `end`; sizes "in shares (round lots prior to November 3, 2025)") and
+  https://docs.alpaca.markets/us/docs/real-time-stock-pricing-data.md (sizes "in round lots"), fetched;
+  https://nautilustrader.io/docs/md/latest/developer_guide/python_adapters.md (`_request_quotes`; v1
+  `quote_ticks` hooks became `quotes` hooks) and `concepts/data/catalog.md` (write-back rules), fetched;
+  `developer_guide/spec_data_testing.md` (TC-D21), fetched. At the pinned commit,
+  `crates/adapters/databento/src/historical.rs` and `decode/market_data.rs` (historical quotes decoded with
+  no `ts_init`, so each takes its record's own timestamp) and `crates/testkit/src/testers/data/actor.rs`
+  (TC-D21 asks for the hour before now), fetched. The write-back runs under Confirmation, run.
 * The probes under Confirmation. Run.
 * Accepted 2026-11-10 by the master orchestrator under the owner's delegation of 2026-11-10, on the
   four conditions under Decision Outcome.

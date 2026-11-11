@@ -104,9 +104,12 @@ still winds down; the engine passes on only the first subscription to an instrum
 unsubscribe the params its subscription had; an unsubscribe naming a feed Alpaca does not stream, or
 another feed than the stream's, sends nothing and is logged, as the adapter guide has unsubscribe hooks
 tolerate members whose subscription failed; each relayed log line names the stream's thread, by a
-name unique in the process; a subscribe made while alpaca-py connects, which alpaca-py 0.45.0 records
-and never sends (the contract test runs this on alpaca-py's real stream, on an in-memory socket, and
-fails once upstream closes the window), is sent once the stream's first quote or trade arrives, when
+name unique in the process; a subscribe made from another thread while alpaca-py sends its first
+subscribe message, which alpaca-py 0.45.0 records and does not send (a narrow start-up race: the three
+statements run with no lock around them, as on upstream's master; reproduced offline by holding that
+send, on alpaca-py's real stream on an in-memory socket, in a contract test that fails if upstream
+changes the path; not observed on a live stream; the usual pattern, subscribe and then run, cannot meet
+it), is sent once the stream's first quote or trade arrives, when
 the client sends its subscriptions again, if a subscribe was made after the stream started; a start
 whose sent subscriptions stay quiet, a reconnect alpaca-py makes by itself, and an unsubscribe lost in
 the same window (alpaca-py does not send it either, and a subscribe does not undo it) are not covered.
@@ -175,6 +178,10 @@ Read 2026-11-10; "raw": fetched with `curl` and read, not summarised.
 * alpaca-py 0.45.0, the latest release (https://github.com/alpacahq/alpaca-py/releases, read
   2026-11-10): `_drive_run` sends the handler maps, then sets `_running`; `_subscribe` sends only while
   `_running`; a subscribe in between was recorded and never sent, run offline on the real
-  `StockDataStream` (ran). No upstream issue found for it (searched 2026-11-10).
+  `StockDataStream` (ran). No upstream issue found for it (searched 2026-11-10). 2026-11-11:
+  `_drive_run` and `_subscribe` on alpaca-py's `master`
+  (https://raw.githubusercontent.com/alpacahq/alpaca-py/master/alpaca/data/live/websocket.py) are the
+  same as 0.45.0's (fetched, compared); described above as a narrow start-up race, which the offline run
+  reaches only by holding the first send.
 * Second reader, 2026-11-10 (`evidence-verifier`): B stands; corrected above: Databento's refusal cited
   from source, the data hooks' sentence quoted, the after-hours claim narrowed, the per-endpoint limit.

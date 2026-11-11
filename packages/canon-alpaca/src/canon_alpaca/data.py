@@ -1,4 +1,4 @@
-"""Market data client: historical bars, and live quotes and trades, for US equities on Alpaca.
+"""Market data client: historical bars and quotes, and live quotes and trades, for US equities on Alpaca.
 
 Contract: `nautilus_trader.live.clients.MarketDataClient`, NautilusTrader v2.0.0rc8 (Python adapter guide,
 "Data client hooks" and "Startup, scheduling, and shutdown"). Hooks are async and receive frozen commands.
@@ -11,8 +11,10 @@ not overridden here raise `NotImplementedError` from the base class.
 
 Venue side, alpaca-py 0.45.0:
 
-* `StockHistoricalDataClient.get_stock_bars(StockBarsRequest)` serves `_request_bars`. alpaca-py pages
-  through the response until `limit` bars have arrived (`RESTClient._get_marketdata`).
+* `StockHistoricalDataClient.get_stock_bars(StockBarsRequest)` serves `_request_bars`, and
+  `get_stock_quotes(StockQuotesRequest)` serves `_request_quotes`. alpaca-py pages through the response
+  until `limit` records, or every page, have arrived (`RESTClient._get_marketdata`), and returns them
+  together, so each request is answered with one response.
 * `StockDataStream` serves `_subscribe_quotes` and `_subscribe_trades`. Its `run()` drives its own asyncio
   loop, and once running its `subscribe_*` and `unsubscribe_*` wait on that loop, so the stream runs on a
   thread this client owns. The thread starts on the first subscription and is stopped (`stop()`, safe from
@@ -41,8 +43,8 @@ and params"), as upstream's Databento adapter takes `params={"schema": ...}` on 
 OKX `params={"rpi": True}` for its `books-rpi` channel. With none, the feed is IEX (`constants.FEED`), as
 before. The key is read and the rest of the dict left alone, since the engine shares it (`update_catalog`,
 ADR 0040). A name Alpaca does not document for the call is refused before anything is sent, as Databento
-refuses a schema: `constants.STREAM_FEEDS` for a subscription, `constants.BARS_FEEDS` for bars. The client
-builds its one stream at its first subscription, on that subscription's feed, and refuses one whose feed
+refuses a schema: `constants.STREAM_FEEDS` for a subscription, `constants.BARS_FEEDS` for bars, and
+`QUOTES_FEEDS`, IEX alone, for a quotes request (ADR 0066). The client builds its one stream at its first subscription, on that subscription's feed, and refuses one whose feed
 differs (Alpaca allows most users one stream connection, "Streaming Market Data", 406). alpaca-py reports
 a stream Alpaca refuses only through Python `logging` (`DataStream._auth` raises the server's message,
 `_drive_run` ends the run on "insufficient subscription" and retries on anything else), so its warnings
@@ -81,14 +83,33 @@ a weekly bar that spans the spring change, and a window inside D's trading hours
 response carries the bounds as requested. `limit` returns the earliest bars of the window, since Alpaca sorts ascending by
 default; alpaca-py's `sort` parameter (`Sort.DESC`) would return the latest and is not used here.
 
-A bar request runs one alpaca-py call at a time on the one HTTP session. The lock is released when the
+Quote history (ADR 0066): `_request_quotes`, the hook the adapter guide names for it ("Quote history
+calls `_request_quotes(request)`"; `quote_ticks` hooks became `quotes` hooks in v2), answers with one
+`QuotesResponse` carrying the request's ID, bounds and params, so the catalog can write it back
+(`params={"update_catalog": True}`, the catalog guide's "Reading data"), as ADR 0040 does for bars. One
+instrument per request, as for bars. IEX only (`QUOTES_FEEDS`). Alpaca's quotes reference takes an inclusive
+`start` and `end` (https://docs.alpaca.markets/us/reference/stockquotes-1.md, read 2026-11-11), and a
+quote is stamped once, so the window is sent as requested, cut at now and with no `start` given the
+start of the end's day, as bars are (`alpaca_quotes_window`). `ts_init` is the quote's
+own `ts_event`, as upstream's Databento client stamps the quotes of a historical range
+(`get_range_quotes` decodes with no `ts_init`, so `determine_timestamp` takes the record's own;
+`crates/adapters/databento/src/historical.rs` and `decode/market_data.rs` at the pinned commit). The
+catalog files and covers quotes by `ts_init` and a backtest replays them in its order; stamping each with
+the time the response arrived would give a whole request one `ts_init`. alpaca-py's microsecond `datetime` drops a quote's
+last nanoseconds, which moves it earlier within the second, never out of the window Alpaca chose it
+for. A one-sided quote is dropped and the request's count logged; any other quote that cannot be
+converted fails the request, naming it, as a bar does. A request's `limit` is passed on; the catalog
+does not write back a request with one (observed at the pin: answered, nothing written).
+
+A bar or quote request runs one alpaca-py call at a time on the one HTTP session. The lock is released when the
 worker thread's call returns, not when the awaiting hook ends, so a request cancelled mid-call (as on
 shutdown) still keeps the next one waiting until the call it started has finished.
 
 Known limits:
 
-* Quote sizes keep Alpaca's unit, round lots ("Real-time Stock Data" quote schema), not shares. Alpaca
-  gives no lot size to convert with.
+* Quote sizes keep Alpaca's unit, round lots on the stream ("Real-time Stock Data" quote schema), not
+  shares. Alpaca gives no lot size to convert with. The historical quotes reference gives "shares (round
+  lots prior to November 3, 2025)", so stored quotes may change unit at that date; nothing converts them.
 * Alpaca trades carry no aggressor side, so trade ticks use `NO_AGGRESSOR`.
 * Bars: `LAST` price, `EXTERNAL` source, and MINUTE, HOUR, DAY or WEEK aggregation, at the steps both
   NautilusTrader's `BarType` and alpaca-py's `TimeFrame` accept (DAY and WEEK only at 1). MONTH is
@@ -105,6 +126,14 @@ Known limits:
   Alpaca at authentication shows in the log once the stream has started, not as a failed subscription:
   alpaca-py connects only after its first subscription and does not expose the outcome.
 * Sizes must be whole shares (`Equity` is whole-share only); a fractional size is refused, not rounded.
+* A quote request is not bounded here. alpaca-py gathers every page before it returns, so memory grows
+  with the window; ADR 0066 has a load ask for an hour at a time, and enforcing that is the loader's.
+  It shares the one HTTP session's lock with bar requests, so a bar request waits behind a long quote
+  fetch.
+* A quote request written back with an end at or near now records the window as covered when the last
+  quotes may not yet be published, and they are never asked for again. ADR 0040's `load_bars` refuses
+  an end less than 15 minutes before now for bars; nothing does yet for quotes, so a caller of
+  `update_catalog` keeps that margin itself.
 * alpaca-py's REST client has no `close()`; `_disconnect` drops the reference.
 * If alpaca-py's stream ends on its own (for example after an insufficient-subscription error), the client
   logs an error and does not restart it; later subscriptions are refused until it reconnects.
@@ -119,8 +148,10 @@ Known limits:
   abandoned at a timed-out disconnect holds the one connection) is retried by alpaca-py without end.
   The subscription has returned, the node logs alpaca-py's retry warnings naming the feed and thread,
   and no data arrives. Its connection state is private to alpaca-py, so the client sets no bound on it.
-* A subscribe made while alpaca-py connects, after it has sent the handler maps and before it counts as
-  running, is not sent by alpaca-py 0.45.0 (`_drive_run`, `_subscribe`). The client sends its
+* A narrow start-up race in alpaca-py 0.45.0, reproduced offline by holding the first send and not
+  observed on a live stream: a subscribe made from another thread while alpaca-py sends its first
+  subscribe message, before it counts as running, is recorded and not sent (`_drive_run`, `_subscribe`).
+  Subscribing and then running cannot meet it. The client sends its
   subscriptions again on the first quote or trade of each stream run (`_resend_subscriptions`), which
   covers the start but not a stream whose sent subscriptions stay quiet, a reconnect alpaca-py makes by
   itself, or an unsubscribe made in the same window, which alpaca-py does not send either.
@@ -143,6 +174,7 @@ from datetime import time
 from datetime import timedelta
 from typing import TYPE_CHECKING
 from typing import Protocol
+from typing import cast
 from typing import override
 from zoneinfo import ZoneInfo
 
@@ -151,15 +183,18 @@ from alpaca.data.historical.stock import StockHistoricalDataClient
 from alpaca.data.live.stock import StockDataStream
 from alpaca.data.models import BarSet
 from alpaca.data.models import Quote
+from alpaca.data.models import QuoteSet
 from alpaca.data.models import Trade
 from alpaca.data.models import TradeCancel
 from alpaca.data.models import TradeCorrection
 from alpaca.data.requests import StockBarsRequest
+from alpaca.data.requests import StockQuotesRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.data.timeframe import TimeFrameUnit
 from nautilus_trader.common import Logger
 from nautilus_trader.core.datetime import dt_to_unix_nanos
 from nautilus_trader.live import BarsResponse
+from nautilus_trader.live import QuotesResponse
 from nautilus_trader.live.clients import MarketDataClient
 from nautilus_trader.model import AggregationSource
 from nautilus_trader.model import AggressorSide
@@ -216,6 +251,17 @@ or authenticating is seen only once that finishes: the handshake is bounded by `
 `ping_interval` 10 and `ping_timeout` 180 seconds). If the thread is still alive after this timeout,
 `_disconnect` clears the client's state and raises; the daemon thread is left to finish on its own."""
 
+QUOTES_PER_SLICE = 10_000
+"""How many historical quotes `_request_quotes` converts before it lets the node's loop run: about 40 ms
+of work (0.4 s per 100,000 quotes, measured here), where an hour of SPY on IEX would hold the loop for
+seconds."""
+
+QUOTES_FEEDS = (DataFeed.IEX,)
+"""The feeds a quotes request may name: IEX only (ADR 0066). The quotes reference also lists `sip`,
+`boats` and `otc` (https://docs.alpaca.markets/us/reference/stockquotes-1.md), but the catalog keys a
+quote by instrument alone, not by source ("catalog keys do not distinguish them", the catalog guide), so
+a second feed written back would mix with IEX's under one key."""
+
 NEW_YORK = ZoneInfo("America/New_York")
 """The US equity market's time zone, which sets the day a bar request's default start falls in."""
 
@@ -227,10 +273,12 @@ TIMEFRAME_UNITS = {
 }
 
 
-class BarsClient(Protocol):
+class HistoricalClient(Protocol):
     """The part of alpaca-py's `StockHistoricalDataClient` this client uses."""
 
     def get_stock_bars(self, request_params: StockBarsRequest) -> BarSet | RawData: ...
+
+    def get_stock_quotes(self, request_params: StockQuotesRequest) -> QuoteSet | RawData: ...
 
 
 type QuoteHandler = Callable[[Quote | RawData], Awaitable[None]]
@@ -332,12 +380,12 @@ def post[T](loop: asyncio.AbstractEventLoop, callback: Callable[[T], None], item
         pass
 
 
-def release_after(
+def release_after[A, R](
     loop: asyncio.AbstractEventLoop,
     lock: asyncio.Lock,
-    fn: Callable[[StockBarsRequest], BarSet | RawData],
-    arg: StockBarsRequest,
-) -> BarSet | RawData:
+    fn: Callable[[A], R],
+    arg: A,
+) -> R:
     """In a worker thread: return `fn(arg)`, then release `lock` on the node's loop, however `fn` ends."""
     try:
         return fn(arg)
@@ -572,6 +620,19 @@ def alpaca_bars_window(
     return start.astimezone(UTC) - interval, end.astimezone(UTC) - interval
 
 
+def alpaca_quotes_window(
+    start: datetime | None, end: datetime | None, now: datetime
+) -> tuple[datetime, datetime] | None:
+    """Return the `start` and `end` to send Alpaca for quotes whose `ts_init`, their own `ts_event`, lies
+    in `[start, end]`: the bars window with no interval to move it by, since a quote is stamped once.
+
+    Alpaca's quotes reference has the same inclusive bounds and the same default start as the bars one
+    ("the beginning of the current day", https://docs.alpaca.markets/us/reference/stockquotes-1.md), so
+    the end is cut at `now`, a missing start is midnight New York of the end's day, and a window starting
+    after `now` returns None. A change to `alpaca_bars_window` changes this one too."""
+    return alpaca_bars_window(start, end, now, timedelta(0))
+
+
 def exact_price(instrument: Equity, value: float, field: str) -> Price:
     """Return a price at the instrument's precision, refusing a value that would need rounding.
 
@@ -615,8 +676,10 @@ class OneSidedQuoteError(ValueError):
     """A quote with no price on one side, which a `QuoteTick` cannot hold."""
 
 
-def parse_quote(quote: Quote, instrument: Equity, ts_init: int) -> QuoteTick:
-    """Convert one alpaca-py quote into a NautilusTrader quote. Sizes stay in round lots.
+def parse_quote(quote: Quote, instrument: Equity, ts_init: int | None = None) -> QuoteTick:
+    """Convert one alpaca-py quote into a NautilusTrader quote, stamped `ts_init`, or with its own
+    `ts_event` when none is given (a historical quote). Sizes keep Alpaca's unit: round lots on the
+    stream, shares in history since 2025-11-03 (module header, "Known limits").
 
     A side priced at zero or less is refused as one-sided: a `QuoteTick` holds both sides, and a one-sided
     quote would otherwise carry a 0.0000 price for the missing side. A price that is not a finite number
@@ -631,14 +694,15 @@ def parse_quote(quote: Quote, instrument: Equity, ts_init: int) -> QuoteTick:
             raise OneSidedQuoteError(
                 f"{instrument.id} quote at {quote.timestamp} has {side} price {price}"
             )
+    ts_event = dt_to_unix_nanos(quote.timestamp)
     return QuoteTick(
         instrument_id=instrument.id,
         bid_price=exact_price(instrument, quote.bid_price, "bid price"),
         ask_price=exact_price(instrument, quote.ask_price, "ask price"),
         bid_size=whole_shares(instrument, quote.bid_size, "bid size"),
         ask_size=whole_shares(instrument, quote.ask_size, "ask size"),
-        ts_event=dt_to_unix_nanos(quote.timestamp),
-        ts_init=ts_init,
+        ts_event=ts_event,
+        ts_init=ts_event if ts_init is None else ts_init,
     )
 
 
@@ -668,7 +732,7 @@ class AlpacaDataClient(MarketDataClient):
         cache: ClientCache,
         clock: Clock,
         instrument_provider: AlpacaInstrumentProvider,
-        historical_client: BarsClient | None = None,
+        historical_client: HistoricalClient | None = None,
         stream: QuoteTradeStream | None = None,
     ) -> None:
         """Retain configuration and local state. The alpaca-py clients are built in `_connect`.
@@ -693,7 +757,7 @@ class AlpacaDataClient(MarketDataClient):
         # and its websocket between runs, and a run abandoned at a timed-out disconnect may still be
         # using it. A connect that never subscribed never ran it.
         self._given_stream_used = False
-        self._historical: BarsClient | None = None
+        self._historical: HistoricalClient | None = None
         # Historical requests run concurrently, but alpaca-py's REST client holds one requests.Session,
         # which is not documented as thread-safe, so calls on it are made one at a time. The lock is held
         # on the node's loop, so a waiting request occupies no worker thread. Kept across a reconnect on
@@ -1079,9 +1143,63 @@ class AlpacaDataClient(MarketDataClient):
             params=request.params,
         )
 
-    async def _one_historical_call(
-        self, fn: Callable[[StockBarsRequest], BarSet | RawData], arg: StockBarsRequest
-    ) -> BarSet | RawData:
+    @override
+    async def _request_quotes(self, request: live.RequestQuotes) -> None:
+        instrument_ids = request.instrument_ids
+        if len(instrument_ids) != 1:
+            raise ValueError(
+                f"Alpaca quote requests take one instrument, got {len(instrument_ids)}"
+            )
+        instrument = self._equity(instrument_ids[0])
+        historical = self._historical
+        if historical is None:
+            raise RuntimeError("Alpaca data client is not connected")
+        symbol = instrument.id.symbol.value
+        feed, _ = named_feed(request.params, QUOTES_FEEDS, "quote requests")
+        window = alpaca_quotes_window(request.start, request.end, self.clock.utc_now())
+        if window is None:  # a window starting after now holds no quote yet: nothing to ask for
+            self._handle_response(self._quotes_response(request, instrument.id, []))
+            return
+        start, end = window
+        params = StockQuotesRequest(
+            symbol_or_symbols=symbol, start=start, end=end, limit=request.limit, feed=feed
+        )
+
+        result = await self._one_historical_call(historical.get_stock_quotes, params)
+        if not isinstance(result, QuoteSet):
+            raise TypeError("alpaca-py returned raw quote data; the client must use raw_data=False")
+        ticks: list[QuoteTick] = []
+        one_sided = 0
+        for n, quote in enumerate(result.data.get(symbol, []), 1):
+            try:
+                ticks.append(parse_quote(quote, instrument))
+            except OneSidedQuoteError:
+                one_sided += 1
+            if n % QUOTES_PER_SLICE == 0:
+                await asyncio.sleep(0)  # let the node's loop run between slices
+        if one_sided:
+            self._log.warning(
+                f"Dropped {one_sided} one-sided Alpaca quotes of {len(ticks) + one_sided} for "
+                f"{symbol} from {start} to {end}"
+            )
+        self._handle_response(self._quotes_response(request, instrument.id, ticks))
+
+    def _quotes_response(
+        self, request: live.RequestQuotes, instrument_id: InstrumentId, ticks: list[QuoteTick]
+    ) -> QuotesResponse:
+        """The response to `request`, with its ID, bounds and params as requested."""
+        return QuotesResponse(
+            client_id=self.client_id,
+            instrument_id=instrument_id,
+            data=ticks,
+            correlation_id=request.request_id,
+            ts_init=self.clock.timestamp_ns(),
+            start=request.start_ns,
+            end=request.end_ns,
+            params=request.params,
+        )
+
+    async def _one_historical_call[A, R](self, fn: Callable[[A], R], arg: A) -> R:
         """Run `fn(arg)` in a worker thread, one call at a time, releasing the lock when the call returns.
 
         The worker's future is shielded, so cancelling the awaiting hook leaves the call running and the
@@ -1096,7 +1214,11 @@ class AlpacaDataClient(MarketDataClient):
             # What `asyncio.to_thread` does (CPython 3.14, `asyncio/threads.py`), called here so that an
             # executor refusing the work raises before anything could release the lock.
             context = contextvars.copy_context()
-            work = functools.partial(context.run, release_after, loop, lock, fn, arg)
+            # `partial` of `context.run` drops the type parameters, which `cast` restores.
+            work = cast(
+                "Callable[[], R]",
+                functools.partial(context.run, release_after, loop, lock, fn, arg),
+            )
             call = loop.run_in_executor(None, work)
         except BaseException:
             lock.release()
