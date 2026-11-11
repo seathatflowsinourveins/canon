@@ -1,6 +1,6 @@
 """The gate: rank the trials of a ledger study and test the pick's deflated Sharpe ratio at 0.95.
 
-Contract: ADR 0010, protocol step 3, computed as ADR 0031 decides, on the ledger of ADR 0035 and ADR 0054
+Contract: ADR 0010, protocol step 3, computed as ADR 0031 and ADR 0080 decide, on the ledger of ADR 0035, ADR 0054 and ADR 0081
 over the sample of ADR 0041. skfolio
 1.12.8, read 2026-11-10 in the installed `measures/_measures.py` and `portfolio/_base.py`; at 1.12.9
 the first is byte-identical and the second differs only in `ty: ignore` comments (ADR 0031):
@@ -21,11 +21,11 @@ skfolio raises nothing on input that lets a pick pass more easily (ADR 0031), so
 naming the trials, unless every trial's Sharpe ratio and every return of the pick is finite, N >= 2 and
 V > 0. Every series it computes on, and each trial's Sharpe ratio, comes from
 `canon_trading.returns_matrix.session_returns`, whose one numeric check (that module's header; ADR
-0031, 2026-11-11) refuses, for every record that ran on the current sample and before any two are
+0080, 2026-11-11) refuses, for every record that ran on the current sample and before any two are
 compared, a return that is not a finite float, and a series of session days that does not vary beyond
 rounding at its own size (a constant one, or one of zeros), whose statistics are not finite, or whose
 moments underflow. No moment is checked here. Sharpe ratios are compared by one bound, each series'
-own (`SessionReturns.rounding`, what rounding can move its computed ratio by; ADR 0031, 2026-11-11),
+own (`SessionReturns.rounding`, what rounding can move its computed ratio by; ADR 0080, 2026-11-11),
 and two ratios are told apart only when they differ by more than the sum of their two bounds. Both
 rules of the study are judged on the set, never pair by pair, so no order of recording changes
 either, and the columns are taken in the order of the keys, so V, N-hat and which of several keys
@@ -63,7 +63,7 @@ keyless record another writer started, told or wrote on (a system attribute, a u
 `record_trial` never writes before its key) stops for good, marked or not. A keyed record `canon_trading.ledger.retire_queued` retired, another writer's queued
 trial, is never read, and its key stays counted in N; a key tried only in such records stops until
 `record_trial` runs it on the current sample. The stops on another writer's queued keyed record,
-`WAITING` or taken from Optuna's queue, name `retire_queued` (ADR 0054, 2026-11-10).
+`WAITING` or taken from Optuna's queue, name `retire_queued` (ADR 0081, 2026-11-10).
 The samples are read once, so the current sample and the numbers known agree.
 Every such stop is gathered before one is raised. The top group is every configuration whose Sharpe
 ratio is not told apart from the highest. Inside it returns are compared exactly, day by day: the
@@ -204,7 +204,7 @@ def ran_to_the_end(trial: FrozenTrial) -> bool:
     written (`canon_trading.ledger._tell_failed`). Its run is compared with every other record of its
     key like any other; read as cut short, a later record of its key would resolve it and the returns
     and data it read would never be compared. A traded record told `FAIL` because its own Sharpe ratio
-    is not finite ran to the end too; the gate stops on it below, under ADR 0031, and no later record
+    is not finite ran to the end too; the gate stops on it below, under ADR 0080, and no later record
     of its key resolves it. Such an outcome in another state (`WAITING`, `PRUNED`) is no run of the
     writer's, and `_not_the_writers` stops on it.
     """
@@ -290,7 +290,7 @@ def _not_the_writers(trial: FrozenTrial) -> str | None:
 
 def _remedy(trial: FrozenTrial) -> str:
     """The remedy for another writer's record, if it is one `retire_queued` takes: a queued keyed
-    record, `WAITING` or taken from Optuna's queue with its note (`origin`, ADR 0054 term 7)."""
+    record, `WAITING` or taken from Optuna's queue with its note (`origin`, ADR 0081)."""
     if origin(trial).origin in (Origin.QUEUED, Origin.TAKEN):
         return f"; retire_queued(study, {trial.number}) retires it, its key still counted in N"
     return ""
@@ -413,7 +413,7 @@ def rank(study: optuna.Study) -> RankingReport:
                 "(ADR 0053, ADR 0054)",
             )
     # Another writer's queued records `retire_queued` retired, by key: none is read, and each key
-    # stays counted in N (ADR 0054, 2026-11-10).
+    # stays counted in N (ADR 0081, 2026-11-10).
     retired: dict[str, list[FrozenTrial]] = defaultdict(list)
     for trial in trials:
         if has_key(trial) and trial.number in marks[RETIRED]:
@@ -600,7 +600,7 @@ def rank(study: optuna.Study) -> RankingReport:
         try:
             # In the order of the keys, not of recording: what is computed from the columns (V,
             # N-hat, which of several keys with the same returns is named) then follows no order
-            # of recording, to the last bit (ADR 0031, 2026-11-11).
+            # of recording, to the last bit (ADR 0080, 2026-11-11).
             matrix = returns_matrix([series[key].series for key in sorted(series)])
         except ReturnsRejected as rejected:
             named = ", ".join(f"{key} (#{chosen[key].number})" for key in rejected.names)
@@ -623,7 +623,7 @@ def rank(study: optuna.Study) -> RankingReport:
         return max(series[key].rounding for key in matrix.columns if sharpes[key] == ratio)
 
     # Two computed ratios are told apart only when they differ by more than the rounding of both
-    # (ADR 0031, 2026-11-11). Judged on the set, against the highest, so no order of recording
+    # (ADR 0080, 2026-11-11). Judged on the set, against the highest, so no order of recording
     # changes the group: a key within rounding of a member but not of the highest is not in it.
     at_best, at_worst = rounding_at(best), rounding_at(worst)
     top = [key for key in matrix.columns if best - sharpes[key] <= at_best + series[key].rounding]
@@ -779,7 +779,7 @@ def _shape_faults(
     `record_trial` tells, the per-session Sharpe ratio of the returns the record holds
     (`canon_trading.ledger.told_sharpe`, which reads it as `reading` was read), within what rounding
     can move a second computation of it (`SessionReturns.rounding`, the one bound the gate compares
-    ratios by, ADR 0031); where its returns are refused, `record_trial` tells no value, so any
+    ratios by, ADR 0080); where its returns are refused, `record_trial` tells no value, so any
     value stops.
     """
     attrs = trial.user_attrs

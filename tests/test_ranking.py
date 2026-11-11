@@ -367,7 +367,7 @@ def test_a_failure_after_a_run_of_the_same_configuration_stops(study: optuna.Stu
 
 
 def test_a_traded_record_with_no_finite_sharpe_ratio_ran_and_stops(study: optuna.Study) -> None:
-    """Told FAIL by the ledger, still traded: it ran to the end, and ADR 0031 stops the gate on it."""
+    """Told FAIL by the ledger, still traded: it ran to the end, and ADR 0080 stops the gate on it."""
     write(study, "pick", PICK)
     write(study, "second", SECOND)
     write(study, "flat", [0.0] * T, told_complete=False)
@@ -470,7 +470,7 @@ def test_no_spread_between_trials_stops(study: optuna.Study) -> None:
 def test_copies_at_another_scale_stop_by_name_in_either_order(
     tmp_path: Path, scale: float, copy_first: bool
 ) -> None:
-    """ADR 0031, 2026-11-11, the rule that closes the scaled copy: one configuration at another
+    """ADR 0080, 2026-11-11, the rule that closes the scaled copy: one configuration at another
     scale has returns that differ on every day and a Sharpe ratio within rounding of its own, one
     step apart at 3 times and the same to the bit at 7 times. Two computed ratios cannot be told
     apart more finely than the rounding of both, so the ranking stops, naming both and not the
@@ -498,7 +498,7 @@ def test_copies_at_another_scale_stop_by_name_in_either_order(
 def test_two_trials_within_rounding_of_each_other_have_no_v(study: optuna.Study) -> None:
     """With nothing else in the study, a configuration and its copy at 3 times the scale are the
     highest and the lowest ratio, within rounding of each other: V counts as 0, and the stop says
-    so beside the tie (ADR 0031, 2026-11-11)."""
+    so beside the tie (ADR 0080, 2026-11-11)."""
     write(study, "pick", PICK)
     write(study, "copy", [value * 3.0 for value in PICK])
 
@@ -516,7 +516,7 @@ def test_two_trials_within_rounding_of_each_other_have_no_v(study: optuna.Study)
 def test_a_ratio_beyond_rounding_ahead_is_the_pick_in_either_order(
     tmp_path: Path, nudged_first: bool
 ) -> None:
-    """The limit that is left, recorded once (ADR 0031, 2026-11-11): with one day's return 1e-9
+    """The limit that is left, recorded once (ADR 0080, 2026-11-11): with one day's return 1e-9
     higher the Sharpe ratio is 9e-10 lower, thousands of times what rounding can move either, so
     the two are told apart and the higher is the pick, whichever was recorded first. Trials that
     are nearly one have the small V their ratios give, and the pick is near its undeflated value:
@@ -561,7 +561,7 @@ def test_bit_identical_columns_tied_at_the_top_are_one_pick(
 
 
 def test_the_report_is_the_same_to_the_bit_whatever_the_recording_order(tmp_path: Path) -> None:
-    """The second reader of ADR 0031's addition: which of two keys with the same returns was named
+    """The second reader of ADR 0080's terms: which of two keys with the same returns was named
     the pick, and the last bit of V and of N-hat, followed the order of recording, since the
     columns did. They are taken in the order of the keys, so every number of the report is the
     same to the bit in any order."""
@@ -613,7 +613,7 @@ def test_a_ratio_one_rounding_step_ahead_is_no_pick_in_either_order(
     """The pick's returns in reverse order sum in another order, and their Sharpe ratio comes out
     one rounding step higher. That step is the computation's, not the returns': the two rank within
     rounding of each other on returns that differ day by day, and the ranking stops, naming both,
-    whichever was recorded first (ADR 0031, 2026-11-11). Compared exactly, the reversed copy was
+    whichever was recorded first (ADR 0080, 2026-11-11). Compared exactly, the reversed copy was
     the pick."""
     pick, ahead = (
         session_returns(key, *as_recorded(x)) for key, x in (("p", PICK), ("r", PICK[::-1]))
@@ -958,7 +958,7 @@ def test_returns_that_differ_by_rounding_around_zero_are_not_the_same_returns(
     study: optuna.Study,
 ) -> None:
     """One day's return is 0.0 in one column and 1e-19 in the other, and their Sharpe ratios are the
-    same number. Returns are the same only when every day's are (ADR 0031, 2026-11-11): these
+    same number. Returns are the same only when every day's are (ADR 0080, 2026-11-11): these
     differ, so ratios within rounding leave no one pick. Until round 7 a tolerance on the returns
     read them as one."""
     base = [0.0 if i == 5 else value for i, value in enumerate(PICK)]
@@ -1812,7 +1812,7 @@ def test_a_value_told_where_record_trial_tells_none_stops(study: optuna.Study) -
         rank(study)
 
 
-# A recorded retirement of another writer's queued record (ADR 0054, 2026-11-10): each test failed
+# A recorded retirement of another writer's queued record (ADR 0081, 2026-11-10): each test failed
 # before its change.
 
 
@@ -1950,7 +1950,7 @@ def test_no_remedy_is_named_while_the_retired_list_is_not_in_its_form(study: opt
     assert "retire_queued(study" not in str(stopped.value)
 
 
-# The gate round after the retirement of queued records (ADR 0054 term 7, ADR 0073): each test failed
+# The gate round after the retirement of queued records (ADR 0081, ADR 0073): each test failed
 # before its change, or on the mutation of the guard it names.
 
 
@@ -2463,7 +2463,7 @@ def test_a_pick_whose_moments_underflow_stops(study: optuna.Study, tmp_path: Pat
             rank(scaled)
 
 
-# The gate's seventh outside round, 2026-11-11 (ADR 0031): one numeric check of the session-day
+# The gate's seventh outside round, 2026-11-11 (ADR 0080): one numeric check of the session-day
 # series, and Sharpe ratios compared by the rounding of their own computation. Each test below
 # fails against the code before that change.
 
@@ -2616,7 +2616,7 @@ def test_a_traded_record_whose_returns_are_all_zero_stops_by_name(study: optuna.
 def test_a_series_next_to_the_threshold_stops_and_one_clear_of_it_ranks_as_it_is(
     study: optuna.Study, tmp_path: Path
 ) -> None:
-    """The limit of the measure, stated once (ADR 0031): returns of 1.0 and 1.0 + 128 steps of
+    """The limit of the measure, stated once (ADR 0080): returns of 1.0 and 1.0 + 128 steps of
     float64's spacing vary by more than rounding can give thirty equal returns, so the series is
     read, with a Sharpe ratio of 6.9e13; but rounding can move that ratio by more than its own
     size, so every other trial ranks within rounding of it and the ranking stops by name. At 4,096
@@ -2675,7 +2675,7 @@ def test_trials_with_one_sharpe_ratio_have_no_v_whatever_its_variance_rounds_to(
 
 def test_a_told_value_is_held_to_the_rounding_of_its_own_series(study: optuna.Study) -> None:
     """A value told is compared with the one computed again from the stored returns, within what
-    rounding can move it (ADR 0031): sixteen times the mean's rounding over the standard deviation,
+    rounding can move it (ADR 0080): sixteen times the mean's rounding over the standard deviation,
     about 1e-13 here, where `math.isclose`'s default let a value 1e-10 off pass."""
     write(study, "pick", PICK)
     write(study, "second", SECOND)

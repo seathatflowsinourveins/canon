@@ -18,7 +18,7 @@ the window it asked for (`write_bars(start, end)`): from the UTC midnight of the
 the UTC midnight after the last bar's `ts_init`, 2025-03-10 to 2025-05-04 for the default series.
 
 `stated_n` reads N as `canon_trading.ranking.rank` states it, in its report or in the message it stops
-with, for the tests of what a retirement does to N (ADR 0054 term 7).
+with, for the tests of what a retirement does to N (ADR 0081).
 
 `equations_one_and_two` works the DSR without skfolio, under the conventions ADR 0031 read in skfolio's
 source: the sample standard deviation in both Sharpe ratios, population skewness, raw kurtosis and

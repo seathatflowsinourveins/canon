@@ -11,7 +11,7 @@ packages/canon-alpaca.
   adapter's data client, with NautilusTrader's catalog write-back (ADR 0040)
 * `ledger` - `record_trial`, a run meant as a trial recorded in an Optuna study (ADR 0035)
 * `returns_matrix` - the daily returns of the ledger's trials on a common range (ADR 0010, step 2)
-* `ranking` - `rank`, the pick and its deflated Sharpe ratio against 0.95 (ADR 0010, step 3; ADR 0031)
+* `ranking` - `rank`, the pick and its deflated Sharpe ratio against 0.95 (ADR 0010, step 3; ADR 0031, ADR 0080)
 * `variant_study` - the step 7 study: eight `MaCross` variants on daily bars, recorded and ranked
   (ADR 0048)
 * `paper_node` - `ema_cross_paper_node`, upstream's built-in `EmaCross` on a paper node under the risk

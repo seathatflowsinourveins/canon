@@ -40,7 +40,7 @@ of trials.
    (DSR p. 3). An optimiser search counts every configuration it tried. An entry holds NautilusTrader's
    `BacktestRunConfig` with its `id`, and the `BacktestResult` fields `run_config_id`, `backtest_start`,
    `backtest_end` and `returns_series`. `canon_trading.ledger.record_trial` writes it, in the store and
-   on the terms of ADR 0035 and ADR 0054.
+   on the terms of ADR 0035, ADR 0054 and ADR 0081.
 2. **Run each variant over the whole period**, one `BacktestNode` per variant, through
    `canon_trading.backtest.run_backtest`. Accept `BacktestResult.returns_series` only if it is the daily
    portfolio series, with one key per UTC day. Any other shape is the per-position fallback, and that run is
@@ -48,7 +48,8 @@ of trials.
    ADR 0041: every variant runs over its study's sample and must cover the same session days, or the
    ranking stops. `canon_trading.returns_matrix` does this through skfolio's `Population` and pandas.
 3. **DSR of the pick.** ADR 0031 holds how it is computed: eqs. 1–2, their conventions, skfolio, and the
-   input that stops the ranking. `canon_trading.ranking.rank` applies it.
+   input that stops the ranking; ADR 0080 holds the numeric check of each series and when two ratios
+   are equal. `canon_trading.ranking.rank` applies it.
    * **Reject the pick below 0.95**, with N = all trials. The paper's N is the number of independent trials,
      and counting dependent ones overstates SR₀ (App. A.3), so this is the strict reading.
    * Report N̂ = ρ̂ + (1−ρ̂)N (eq. 9) only when T ≥ N(N−1)/2 (p. 15). N̂ never replaces N in the gate.

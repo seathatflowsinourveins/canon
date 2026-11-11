@@ -215,7 +215,7 @@ def test_one_trial_or_identical_trials_leave_no_hurdle() -> None:
 
 
 def test_skfolio_gives_a_constant_series_the_spread_its_mean_rounds_to() -> None:
-    """What the gate's numeric check rests on (ADR 0031, 2026-11-11; Antigravity, gate round 7):
+    """What the gate's numeric check rests on (ADR 0080, 2026-11-11; Antigravity, gate round 7):
     skfolio's variance subtracts the computed mean once, so thirty returns of -0.01, whose mean
     rounds, keep a standard deviation and a mean over it above 1e15, where thirty of 0.07, whose
     mean comes out exact, have none.
@@ -233,7 +233,7 @@ def test_skfolio_gives_a_constant_series_the_spread_its_mean_rounds_to() -> None
 
 
 def test_skfolio_s_variance_of_equal_trial_sharpe_ratios_can_be_above_zero() -> None:
-    """So V = 0 is read from the ratios, never from their variance (ADR 0031, 2026-11-11)."""
+    """So V = 0 is read from the ratios, never from their variance (ADR 0080, 2026-11-11)."""
     assert float(measures.variance([0.1] * 3)) > 0
     assert float(measures.variance([5.0] * 46)) == 0.0
 
