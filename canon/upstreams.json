@@ -793,6 +793,36 @@
         "https://raw.githubusercontent.com/cheaper-inference/OmniRoute/v3.8.53/LICENSE"
       ],
       "adr": "0056"
+    },
+    {
+      "id": "agent-orchestrator",
+      "field": "agent-harness",
+      "repo": "OrchestratorInc/agent-orchestrator",
+      "track": "tag:v0.14.10",
+      "role": "watch",
+      "license": "Apache-2.0",
+      "why": "Agent Orchestrator (AO), a local desktop workspace that runs a daemon and gives each task its own agent, branch and worktree: a host in the same class as Orca (ADR 0018). Not adopted; nothing installed or imported. Its docs say the npm CLI @aoagents/ao is frozen at 0.10.0, though the npm registry lists 0.10.3 as latest; the repository publishes nightly pre-releases several times a day beside stable tags about every two or three days. Permission model and cost tracking are UNVERIFIED (its migration page covers neither).",
+      "evidence": [
+        "https://github.com/OrchestratorInc/agent-orchestrator",
+        "https://github.com/OrchestratorInc/agent-orchestrator/releases",
+        "https://docs.orchestrator.inc/migration/"
+      ],
+      "adr": "0018"
+    },
+    {
+      "id": "gascity",
+      "field": "agent-harness",
+      "repo": "gastownhall/gascity",
+      "track": "tag:v1.5.1",
+      "role": "watch",
+      "license": "MIT",
+      "why": "Gas City, an orchestration-builder SDK for software factories of coding agents, with work held as beads in Dolt: a framework, not a desktop host (ADR 0018). Successor to Gas Town (gastownhall/gastown), which its author's page calls retired (the repository still receives commits). Not adopted; nothing installed or imported. Its v1.5.1 notes (24 Oct 2026) mention a fix to Claude permission prompts and cost estimates for the Claude 5 family; its release notes also name Claude's builtin permission_mode \"unrestricted\" as a default; its permission model is otherwise UNVERIFIED.",
+      "evidence": [
+        "https://github.com/gastownhall/gascity",
+        "https://yegge.ai/gastown",
+        "https://github.com/gastownhall/gascity/releases"
+      ],
+      "adr": "0018"
     }
   ]
 }
