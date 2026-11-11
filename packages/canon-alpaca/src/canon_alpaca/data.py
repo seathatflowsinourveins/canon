@@ -109,8 +109,9 @@ own `ts_event`, as upstream's Databento client stamps the quotes of a historical
 catalog files and covers quotes by `ts_init` and a backtest replays them in its order; stamping each with
 the time the response arrived would give a whole request one `ts_init`. alpaca-py's microsecond `datetime` drops a quote's
 last nanoseconds, which moves it earlier within the second, never out of the window Alpaca chose it
-for. A one-sided quote is dropped and the request's count logged; any other quote that cannot be
-converted fails the request, naming it, as a bar does. A request's `limit` is passed on; the catalog
+for. A one-sided quote, and one priced finer than the instrument's precision, is dropped and the
+request's count logged, naming the first; any other quote that cannot be converted fails the request,
+naming it, as a bar does. A request's `limit` is passed on; the catalog
 does not write back a request with one (observed at the pin: answered, nothing written).
 
 A bar or quote request runs one alpaca-py call at a time on the one HTTP session. The lock is released when the
@@ -133,7 +134,15 @@ Known limits:
   (`providers.with_http_timeout`, ADR 0039); a stalled request fails with a timeout. A request whose first
   byte takes longer than 27 s fails too, and alpaca-py does not repeat it.
 * A trade tick already emitted cannot be withdrawn or corrected: a cancel or correction is only logged.
-* Prices must be representable at the instrument's precision; a finer price is refused, not rounded.
+* A trade or bar price finer than the instrument's precision (four decimals) is rounded half to even,
+  as upstream rounds a venue's value: `Instrument.make_price` (`try_make_price`, `MidpointNearestEven`)
+  and the Deribit and Bybit parsers (`Price::from_decimal_dp`) at NautilusTrader `d53849b2`. The
+  consolidated tape (`sip`) carries such prints, and sub-dollar names often do. Each rounding is named,
+  never silent: on the stream, the first per symbol and then the count at each power of ten, and the total
+  at unsubscribe or disconnect, as warnings on lines that begin `Alpaca stream on feed `, which a session
+  window keeps and does not fail on; for a bars request, one warning with the count and the first. A quote
+  finer than the precision is dropped and counted the same way, never rounded: a lit book quotes at the
+  tick. A price that is not a finite number, or a positive one that rounds to zero, is still refused.
 * One feed per stream, the first subscription's; a subscription naming another is refused. A refusal by
   Alpaca at authentication shows in the log once the stream has started, not as a failed subscription:
   alpaca-py connects only after its first subscription and does not expose the outcome.
@@ -194,6 +203,7 @@ from datetime import UTC
 from datetime import datetime
 from datetime import time
 from datetime import timedelta
+from decimal import Decimal
 from typing import TYPE_CHECKING
 from typing import ClassVar
 from typing import Protocol
@@ -751,19 +761,56 @@ def alpaca_quotes_window(
     return alpaca_bars_window(start, end, now, timedelta(0))
 
 
-def exact_price(instrument: Equity, value: float, field: str) -> Price:
-    """Return a price at the instrument's precision, refusing a value that would need rounding.
+class FinePriceError(ValueError):
+    """A quote price finer than the instrument's precision. A lit book quotes at the tick, so such a
+    quote is a fault to drop and name, not a price to round (`exact_price`)."""
 
-    `Instrument.make_price` rounds to the instrument's precision without saying so, so this checks first.
-    `round(value, precision) == value` holds exactly when the float's shortest decimal form has at most
-    `precision` decimals.
+
+def rounded_price(instrument: Equity, value: float, field: str) -> Price:
+    """Return `value` as a price at the instrument's precision, rounded as upstream rounds a venue's
+    value; a value that is not a finite number is refused.
+
+    `Instrument.make_price` (`try_make_price` in `crates/model/src/instruments/mod.rs` at NautilusTrader
+    `d53849b2`) reads the float's decimal string and rounds it to the price increment's precision half to
+    even (`MidpointNearestEven`), as upstream's Deribit and Bybit parsers build every trade, quote and bar
+    price (`Price::from_decimal_dp`, banker's rounding). The consolidated tape (`sip`) carries trades and
+    bars finer than this adapter's four decimals (a SPY bar high of 747.086488 becomes 747.0865).
+    Whether a price was rounded is `was_rounded`, and the client counts and names each one. A positive
+    value that rounds to zero is refused: no US equity trades below the 0.0001 tick, and a zero price would
+    reach strategies as a real one.
     """
-    precision = instrument.price_precision
-    if not math.isfinite(value) or round(value, precision) != value:
+    if not math.isfinite(value):
+        raise ValueError(f"{instrument.id} {field} {value} is not a finite number")
+    price = instrument.make_price(value)
+    if value > 0 and price.is_zero():
         raise ValueError(
-            f"{instrument.id} {field} {value} is not representable at price precision {precision}",
+            f"{instrument.id} {field} {value} rounds to zero at price precision "
+            f"{instrument.price_precision}"
         )
-    return instrument.make_price(value)
+    return price
+
+
+def was_rounded(price: Price, value: float) -> bool:
+    """Whether `price` differs from `value` as the venue wrote it: the shortest decimal form of the float,
+    which `make_price` starts from (Rust's `f64` `Display`, as Python's `repr`). No upstream symbol answers
+    this in Python: `Instrument::try_normalize_price`, which refuses a price off the grid, is not in the
+    bindings at the pin (searched `Equity` and `Price`). `round(value, precision) == value` holds exactly
+    when that form has at most `precision` decimals, so the decimal comparison runs only when it fails."""
+    if round(value, price.precision) == value:
+        return False
+    return price.as_decimal() != Decimal(repr(value))
+
+
+def exact_price(instrument: Equity, value: float, field: str) -> Price:
+    """Return a quote price at the instrument's precision, refusing one `make_price` would have to round
+    (`FinePriceError`), since a lit book quotes at the tick."""
+    price = rounded_price(instrument, value, field)
+    if was_rounded(price, value):
+        raise FinePriceError(
+            f"{instrument.id} {field} {value} is finer than price precision "
+            f"{instrument.price_precision}"
+        )
+    return price
 
 
 def whole_shares(instrument: Equity, value: float, field: str) -> Quantity:
@@ -776,18 +823,33 @@ def whole_shares(instrument: Equity, value: float, field: str) -> Quantity:
 
 
 def parse_bar(bar: AlpacaBar, bar_type: BarType, instrument: Equity) -> Bar:
-    """Convert one alpaca-py bar, timestamped at its open, into a NautilusTrader bar."""
+    """Convert one alpaca-py bar, timestamped at its open, into a NautilusTrader bar, its prices rounded
+    as upstream rounds (`rounded_price`; `bar_roundings` names what was)."""
     ts_event = dt_to_unix_nanos(bar.timestamp)
     return Bar(
         bar_type=bar_type,
-        open=exact_price(instrument, bar.open, "open"),
-        high=exact_price(instrument, bar.high, "high"),
-        low=exact_price(instrument, bar.low, "low"),
-        close=exact_price(instrument, bar.close, "close"),
+        open=rounded_price(instrument, bar.open, "open"),
+        high=rounded_price(instrument, bar.high, "high"),
+        low=rounded_price(instrument, bar.low, "low"),
+        close=rounded_price(instrument, bar.close, "close"),
         volume=whole_shares(instrument, bar.volume, "volume"),
         ts_event=ts_event,
         ts_init=ts_event + bar_interval_ns(bar_type),
     )
+
+
+def bar_roundings(bar: AlpacaBar, parsed: Bar) -> list[str]:
+    """Each price of `bar` that `parse_bar` rounded, as "high 747.086488 to 747.0865"."""
+    return [
+        f"{name} {value} to {price}"
+        for name, value, price in (
+            ("open", bar.open, parsed.open),
+            ("high", bar.high, parsed.high),
+            ("low", bar.low, parsed.low),
+            ("close", bar.close, parsed.close),
+        )
+        if was_rounded(price, value)
+    ]
 
 
 class OneSidedQuoteError(ValueError):
@@ -801,7 +863,8 @@ def parse_quote(quote: Quote, instrument: Equity, ts_init: int | None = None) ->
 
     A side priced at zero or less is refused as one-sided: a `QuoteTick` holds both sides, and a one-sided
     quote would otherwise carry a 0.0000 price for the missing side. A price that is not a finite number
-    is refused as malformed, not as one-sided.
+    is refused as malformed, not as one-sided, and one finer than the instrument's precision as
+    `FinePriceError`.
     """
     sides = (("bid", quote.bid_price), ("ask", quote.ask_price))
     for side, price in sides:  # both sides first: a malformed quote is not counted as one-sided
@@ -825,12 +888,13 @@ def parse_quote(quote: Quote, instrument: Equity, ts_init: int | None = None) ->
 
 
 def parse_trade(trade: Trade, instrument: Equity, ts_init: int) -> TradeTick:
-    """Convert one alpaca-py trade into a NautilusTrader trade."""
+    """Convert one alpaca-py trade into a NautilusTrader trade, its price rounded as upstream rounds
+    (`rounded_price`)."""
     if trade.id is None:
         raise ValueError(f"{instrument.id} trade at {trade.timestamp} has no trade ID")
     return TradeTick(
         instrument_id=instrument.id,
-        price=exact_price(instrument, trade.price, "trade price"),
+        price=rounded_price(instrument, trade.price, "trade price"),
         size=whole_shares(instrument, trade.size, "trade size"),
         aggressor_side=AggressorSide.NO_AGGRESSOR,
         trade_id=TradeId(str(trade.id)),
@@ -910,6 +974,9 @@ class AlpacaDataClient(MarketDataClient):
         self._quote_symbols: dict[str, Subscription] = {}
         self._trade_symbols: dict[str, Subscription] = {}
         self._one_sided_quotes: dict[str, int] = {}  # dropped per symbol since connect
+        # Per symbol since subscribing: quotes finer than the precision dropped, trade prices rounded.
+        self._fine_quotes: dict[str, int] = {}
+        self._rounded_trades: dict[str, int] = {}
         self._log = Logger(type(self).__name__)
 
     # -- lifecycle ---------------------------------------------------------------------------------
@@ -1015,6 +1082,7 @@ class AlpacaDataClient(MarketDataClient):
         self._stream_heard = self._resend_needed = False
         self._resend_tries = 0
         self._stream = None
+        feed = self._feed_name()
         self._stream_feed = None
         self._new_stream = None
         self._historical = None
@@ -1025,6 +1093,44 @@ class AlpacaDataClient(MarketDataClient):
                 f"Dropped {count} one-sided Alpaca quotes for {symbol} since subscribing"
             )
         self._one_sided_quotes.clear()
+        for kind in (Quote, Trade):
+            for symbol in sorted(self._price_counts(kind)):
+                self._log_price_count(feed, kind, symbol)
+            self._price_counts(kind).clear()
+
+    def _price_counts(self, kind: type[Quote | Trade]) -> dict[str, int]:
+        """Per symbol since subscribing: quotes dropped, or trade prices rounded, for their precision."""
+        return self._fine_quotes if kind is Quote else self._rounded_trades
+
+    def _count_price(self, kind: type[Quote | Trade], symbol: str, first: str) -> None:
+        """Count one of `symbol`'s quotes dropped or trade prices rounded for its precision: `first` is
+        logged the first time, then the count at each power of ten, and the total at unsubscribe or
+        disconnect (`_log_price_count`), each kind on its own."""
+        counts = self._price_counts(kind)
+        count = counts.get(symbol, 0) + 1
+        counts[symbol] = count
+        if count == 1:
+            self._log.warning(
+                f"Alpaca stream on feed {self._feed_name()}: {first}; later ones for this symbol are "
+                "counted"
+            )
+        elif is_power_of_ten(count):
+            self._log_price_count(self._feed_name(), kind, symbol)
+
+    def _log_price_count(self, feed: str, kind: type[Quote | Trade], symbol: str) -> None:
+        """Log `symbol`'s count of `kind` on a line the session window keeps (`Alpaca stream on feed `),
+        as a warning, which never fails it."""
+        count = self._price_counts(kind).get(symbol)
+        if not count:
+            return
+        what = (
+            "dropped {count} {symbol} quotes finer than"
+            if kind is Quote
+            else "rounded {count} {symbol} trade prices to"
+        ).format(count=count, symbol=symbol)
+        self._log.warning(
+            f"Alpaca stream on feed {feed}: {what} the instrument's price precision since subscribing"
+        )
 
     # -- subscriptions -----------------------------------------------------------------------------
 
@@ -1222,7 +1328,10 @@ class AlpacaDataClient(MarketDataClient):
             for symbol, subscription in made.items():
                 if symbols.get(symbol) is subscription:
                     del symbols[symbol]
-                    if kind is Quote:  # counted afresh after a new subscription
+                    # counted afresh after a new subscription, this kind's count so far logged first
+                    self._log_price_count(self._feed_name(), kind, symbol)
+                    self._price_counts(kind).pop(symbol, None)
+                    if kind is Quote:
                         self._one_sided_quotes.pop(symbol, None)
 
         return StreamCall(functools.partial(unsubscribe, *found), nothing, settle)
@@ -1260,7 +1369,19 @@ class AlpacaDataClient(MarketDataClient):
         result = await self._one_historical_call(historical.get_stock_bars, params)
         if not isinstance(result, BarSet):
             raise TypeError("alpaca-py returned raw bar data; the client must use raw_data=False")
-        bars = [parse_bar(bar, bar_type, instrument) for bar in result.data.get(symbol, [])]
+        bars: list[Bar] = []
+        rounded: list[str] = []
+        for bar in result.data.get(symbol, []):
+            parsed = parse_bar(bar, bar_type, instrument)
+            bars.append(parsed)
+            if fields := bar_roundings(bar, parsed):
+                rounded.append(f"{bar.timestamp} {', '.join(fields)}")
+        if rounded:
+            self._log.warning(
+                f"Rounded {len(rounded)} of {len(bars)} Alpaca bars for {symbol} from {start} to {end} "
+                f"to price precision {instrument.price_precision}, half to even as NautilusTrader's "
+                f"Instrument.make_price rounds; the first: {rounded[0]}"
+            )
         self._handle_response(self._bars_response(request, bar_type, bars))
 
     def _bars_response(
@@ -1305,17 +1426,27 @@ class AlpacaDataClient(MarketDataClient):
             raise TypeError("alpaca-py returned raw quote data; the client must use raw_data=False")
         ticks: list[QuoteTick] = []
         one_sided = 0
+        fine = 0
+        first_fine = ""
+        n = 0
         for n, quote in enumerate(result.data.get(symbol, []), 1):
             try:
                 ticks.append(parse_quote(quote, instrument))
             except OneSidedQuoteError:
                 one_sided += 1
+            except FinePriceError as e:
+                fine += 1
+                first_fine = first_fine or str(e)
             if n % QUOTES_PER_SLICE == 0:
                 await asyncio.sleep(0)  # let the node's loop run between slices
         if one_sided:
             self._log.warning(
-                f"Dropped {one_sided} one-sided Alpaca quotes of {len(ticks) + one_sided} for "
-                f"{symbol} from {start} to {end}"
+                f"Dropped {one_sided} one-sided Alpaca quotes of {n} for {symbol} from {start} to {end}"
+            )
+        if fine:
+            self._log.warning(
+                f"Dropped {fine} Alpaca quotes of {n} for {symbol} from {start} to {end} with a "
+                f"price finer than the instrument's precision; the first: {first_fine}"
             )
         self._handle_response(self._quotes_response(request, instrument.id, ticks))
 
@@ -1668,6 +1799,10 @@ class AlpacaDataClient(MarketDataClient):
                     f"Dropped {count} one-sided Alpaca quotes for {quote.symbol} since subscribing",
                 )
             return
+        except FinePriceError as e:
+            # A lit book quotes at the tick, so this is a fault in the quote, not a price to round.
+            self._count_price(Quote, quote.symbol, f"dropped {quote.symbol} quote: {e}")
+            return
         except (ValueError, TypeError) as e:
             self._log.error(f"Dropped Alpaca quote: {e}")
             return
@@ -1683,6 +1818,16 @@ class AlpacaDataClient(MarketDataClient):
         except (ValueError, TypeError) as e:
             self._log.error(f"Dropped Alpaca trade: {e}")
             return
+        if was_rounded(tick.price, trade.price):
+            # The consolidated tape carries prices finer than the instrument's: rounded as upstream
+            # rounds (`rounded_price`), and named.
+            self._count_price(
+                Trade,
+                trade.symbol,
+                f"rounded {trade.symbol} trade price {trade.price} to {tick.price} at price precision "
+                f"{instrument.price_precision}, half to even as NautilusTrader's Instrument.make_price "
+                "rounds",
+            )
         self._handle_data(tick)
 
     def _warn_trade_cancel(self, stream: QuoteTradeStream, cancel: TradeCancel) -> None:
