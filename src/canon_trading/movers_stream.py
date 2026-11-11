@@ -15,7 +15,8 @@ Contract: alpaca-py 0.45.0 (the pin), used as shipped:
   minutes of earlier sessions.
 
 The ranking score has no upstream (none ships one): it is the movers requirement's, `move x dvol_ratio`, where
-`move` is the last bar's close over the last completed session's daily close, less one, and `dvol_ratio` the
+`move` is the last bar's close over the daily close of the last session completed at the run's start,
+less one, and `dvol_ratio` the
 run's dollar volume (the sum of close x volume over its bars) over the mean dollar volume of the same clock
 minutes in the last `NORMAL_SESSIONS` sessions. Only a symbol that has risen is ranked (the practice is long
 only), and not one whose close or normal is unknown or zero; ties go by symbol. The arithmetic is here; every input is an upstream read. To bound the reads, a
@@ -102,7 +103,10 @@ STOP_SECS = 15.0
 """How long the stream's thread may take to end after `stop()`, as alpaca-py's probe waits (10 s), and 5 s
 for a handler in flight."""
 READ_MARGIN_SECS = 10.0
-"""No read starts this close to the run's end."""
+"""No read starts this close to the next minute's line or the run's end, so a minute's reads stay inside
+it, give or take one read (alpaca-py's (connect, read) timeout and its retries)."""
+SUBSCRIBE_SECS = 30.0
+"""The longest the main loop waits for alpaca-py to send the trades subscription."""
 LOG_PREFIX = "movers-stream"
 STREAM_LOGGER = "alpaca.data.live.websocket"
 
@@ -216,7 +220,11 @@ class Warnings(logging.Handler):
             self.errors += 1
 
     def take(self) -> list[tuple[str, str]]:
-        taken, self.records = self.records, []
+        self.acquire()  # `emit` runs under the handler's lock (`Handler.handle`), on the stream's thread
+        try:
+            taken, self.records = self.records, []
+        finally:
+            self.release()
         return taken
 
 
@@ -271,10 +279,12 @@ def read_references(
 
 
 def prior_weekdays(today: date) -> Iterable[date]:
-    day = today
-    for _ in range(LOOKBACK_WEEKDAYS * 2):
+    """The `LOOKBACK_WEEKDAYS` weekdays before `today`, latest first."""
+    day, found = today, 0
+    while found < LOOKBACK_WEEKDAYS:
         day -= timedelta(days=1)
         if day.weekday() < 5:
+            found += 1
             yield day
 
 
@@ -389,7 +399,8 @@ class Reads:
     normals: dict[str, list[list[float]]] = field(default_factory=dict)
     failed: list[str] = field(default_factory=list)
 
-    def read(self, what: str, fn: Callable[[], None]) -> None:
+    def read(self, what: str, fn: Callable[[], None]) -> bool:
+        """Run one read; a failure is recorded by name and returns False."""
         try:
             fn()
         except MethodRefused:
@@ -397,6 +408,8 @@ class Reads:
         # alpaca-py's HTTP errors are `APIError`, requests' network errors OSErrors (`_one_request`)
         except (APIError, OSError, ValueError, TypeError) as e:
             self.failed.append(f"{what}: {type(e).__name__}: {e}")
+            return False
+        return True
 
 
 def refresh(
@@ -405,29 +418,58 @@ def refresh(
     close: dict[str, float],
     window_start: datetime,
     minutes: int,
-    now: datetime,
+    clock: Callable[[], float],
+    until: float,
 ) -> int:
     """Read references for symbols not yet looked up, then normals for the top `CANDIDATES` by move not yet
-    read, each within its bound per minute. Returns the reads that failed this minute."""
+    read, each within its bound per minute, starting no read at or after `until` on `clock`. References are
+    taken as of the run's start, so one run's moves share one base. A batch that fails leaves its symbols
+    unknown, not read again, so one bad batch cannot hold up the rest. Returns the reads that failed."""
     before = len(reads.failed)
     new = sorted(s for s in close if s not in reads.references)[
         : REF_BATCH * REF_REQUESTS_PER_MINUTE
     ]
     for batch in batches(new, REF_BATCH):
-        reads.read(
+        if clock() >= until:
+            break
+        if not reads.read(
             f"snapshots ({len(batch)})",
-            lambda b=batch: reads.references.update(read_references(client, b, now)),
-        )
+            lambda b=batch: reads.references.update(read_references(client, b, window_start)),
+        ):
+            reads.references.update(dict.fromkeys(batch))
     leaders = sorted(moves(close, reads.references).items(), key=lambda m: (-m[1], m[0]))[
         :CANDIDATES
     ]
     unread = [s for s, _ in leaders if s not in reads.normals]
     for batch in list(batches(unread, NORMAL_BATCH))[:NORMAL_BATCHES_PER_MINUTE]:
-        reads.read(
+        if clock() >= until:
+            break
+        if not reads.read(
             f"normals ({len(batch)})",
             lambda b=batch: reads.normals.update(read_normals(client, b, window_start, minutes)),
-        )
+        ):
+            reads.normals.update({s: [] for s in batch})
     return len(reads.failed) - before
+
+
+def subscribe_trades(stream: Stream, tape: Tape) -> list[str]:
+    """Add trades `*` to the running stream. alpaca-py's `_subscribe` waits, with no bound, for its message
+    to be sent on the stream's loop (`run_coroutine_threadsafe(...).result()`), so the call runs in its own
+    thread and is waited on for `SUBSCRIBE_SECS`; what failed, or that it did not finish, is returned."""
+    failed: list[str] = []
+
+    def call() -> None:
+        try:
+            stream.subscribe_trades(tape.on_trade, "*")
+        except Exception as e:  # noqa: BLE001, returned: the run fails on it; the handler stays registered
+            failed.append(f"subscribe trades: {type(e).__name__}: {e}")
+
+    helper = threading.Thread(target=call, name="movers-stream-subscribe", daemon=True)
+    helper.start()
+    helper.join(SUBSCRIBE_SECS)
+    if helper.is_alive():
+        return [f"subscribe trades: not sent within {SUBSCRIBE_SECS} s"]
+    return failed
 
 
 def minute_start(t: float) -> float:
@@ -479,16 +521,12 @@ def run(
                 if not thread.is_alive():
                     stopped_early = True
                 if not trades_on and n >= trades_after and n < minutes:
-                    try:
-                        stream.subscribe_trades(tape.on_trade, "*")
-                    except Exception as e:  # noqa: BLE001, recorded; the handler stays and a reconnect sends it
-                        failures.append(f"subscribe trades: {type(e).__name__}: {e}")
+                    failures.extend(subscribe_trades(stream, tape))
                     trades_on = True
                 counts, close, dvol, latest = tape.minute()
                 now = datetime.fromtimestamp(clock(), UTC)
-                failed = 0
-                if start + minutes * 60 - clock() > READ_MARGIN_SECS:
-                    failed = refresh(reads, client, close, window_start, minutes, now)
+                until = min(start + (n + 1) * 60, start + minutes * 60) - READ_MARGIN_SECS
+                failed = refresh(reads, client, close, window_start, minutes, clock, until)
                 elapsed = 0 if latest is None else int((latest - window) // 60) + 1
                 ranked = rank(close, dvol, reads.references, reads.normals, elapsed)
                 line = {
@@ -536,6 +574,7 @@ def run(
             out.write(json.dumps(summary) + "\n")
     finally:
         stream.stop()
+        thread.join(STOP_SECS)
         logger.removeHandler(warnings)
     for f in failures:
         print(f"movers-stream: {f}", file=sys.stderr)

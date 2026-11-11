@@ -401,3 +401,47 @@ def test_a_refused_method_ends_the_run_and_stops_the_stream(tmp_path) -> None:
     with pytest.raises(MethodRefused):
         movers_stream.run(stream, Refusing(), 3, 0, tmp_path / "s.jsonl", clock=clock, sleep=sleep)
     assert stream.stopped.is_set()
+
+
+def test_the_lookback_is_ten_weekdays() -> None:
+    days = list(movers_stream.prior_weekdays(datetime(2026, 11, 11).date()))
+    assert len(days) == movers_stream.LOOKBACK_WEEKDAYS and all(d.weekday() < 5 for d in days)
+    assert days[0].isoformat() == "2026-11-10" and days[-1].isoformat() == "2026-10-28"
+
+
+def test_a_failed_batch_leaves_its_symbols_unknown_and_is_not_read_again() -> None:
+    """One bad batch cannot hold up the rest, minute after minute; references are as of the run's start."""
+
+    class Failing(DataClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.asked: list[datetime] = []
+
+        def get_stock_snapshot(self, request_params):
+            self.snapshots += 1
+            raise OSError("down")
+
+        def get_stock_bars(self, request_params):
+            self.bars += 1
+            raise OSError("down")
+
+    reads = movers_stream.Reads()
+    client = Failing()
+    start = datetime(2026, 11, 11, 20, 50, tzinfo=UTC)
+    close = {"AAA": 12.0}
+    for _ in range(2):
+        movers_stream.refresh(reads, client, close, start, 30, lambda: 0.0, 1.0)
+    assert client.snapshots == 1 and reads.references == {"AAA": None}
+    reads.references["AAA"] = 10.0
+    for _ in range(2):
+        movers_stream.refresh(reads, client, close, start, 30, lambda: 0.0, 1.0)
+    assert client.bars == 1 and reads.normals == {"AAA": []}
+    assert len(reads.failed) == 2
+
+
+def test_no_read_starts_at_or_after_its_bound() -> None:
+    reads = movers_stream.Reads()
+    client = DataClient()
+    start = datetime(2026, 11, 11, 20, 50, tzinfo=UTC)
+    assert movers_stream.refresh(reads, client, {"AAA": 12.0}, start, 30, lambda: 5.0, 5.0) == 0
+    assert client.snapshots == 0 and client.bars == 0 and reads.references == {}
