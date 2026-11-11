@@ -39,6 +39,7 @@ Chosen: **option 2**. It is the shape uv's workspace guide documents, and uv gen
 | `catalog/` | Local `ParquetDataCatalog`; ignored by git | NautilusTrader catalog guide |
 | `ledger/` | The trial ledger, an Optuna SQLite study; the main checkout's, shared by every worktree; ignored by git | ADR 0035 |
 | `evals/review/` | The reviewer benchmark: cases, the brief, runs and score sheets | ADR 0046 |
+| `evals/build/` | The build eval: cases, the brief, the harness, runs and score sheets | ADR 0057 |
 | `canon/`, `docs/adr/`, `scripts/`, `home/`, `.claude/`, `.githooks/` | The harness | ADR 0003, ADR 0011 |
 
 On this Mac:

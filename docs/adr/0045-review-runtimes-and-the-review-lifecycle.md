@@ -264,6 +264,8 @@ Read 2026-11-10. `fetched`: downloaded and searched. "Lane": a model summarised 
 * The first start under rule 7, 2026-11-10, Orca 1.4.255 and codex-cli 0.167.0 — the receipt "ready" with
   the model and effort asked for (the coordinator's report); the worker's process line, of which only
   the bypass flag, `-m gpt-6.1-sol` and `model_reasoning_effort=max` were read (`ps`).
+* ADR 0058, 2026-11-10: these runtimes may also be given build work, under that record's terms; rule
+  1 holds for a review.
 * Second reader of rule 7, 2026-11-10 (`evidence-verifier`): the levels, the default and the quotes held.
   It found the fallback claim unsupported by Codex's source and what `ultra` sends, both corrected
   above, and noted that this record is past the length at which a record is split.

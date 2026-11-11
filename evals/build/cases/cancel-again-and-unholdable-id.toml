@@ -1,0 +1,32 @@
+# A build case: the format is in evals/build/README.md and ADR 0057.
+id = "cancel-again-and-unholdable-id"
+status = "ready"
+fix = "f8505c422855d8543d4d7eef931125de6760a3d0"
+review_case = "stop-orders"
+defects = [
+    "unholdable-client-id-aborts-startup",
+]
+paths = ["packages/canon-alpaca/"]
+tests = [
+    "packages/canon-alpaca/tests/test_execution_client.py",
+]
+fail_to_pass = [
+    "packages/canon-alpaca/tests/test_execution_client.py::test_cancel_all_cancels_again_an_order_whose_cancel_had_no_answer",
+    "packages/canon-alpaca/tests/test_execution_client.py::test_closed_order_with_a_client_id_nautilus_cannot_hold_is_skipped",
+    "packages/canon-alpaca/tests/test_execution_client.py::test_open_order_with_a_client_id_nautilus_cannot_hold_fails_startup_by_name",
+    "packages/canon-alpaca/tests/test_execution_client.py::test_replacement_of_an_order_with_an_unholdable_id_is_reported_under_its_own",
+]
+admitted = "2026-11-10"
+statement = """
+Two defects in the execution client.
+
+1. Cancel-all skips an order that is already `PENDING_CANCEL`. A cancel that got no answer, a read
+   timeout for one, leaves the node's order pending cancel while it still works at Alpaca, and a later
+   cancel-all does not cancel it again.
+2. Alpaca can list an order whose client order ID NautilusTrader cannot hold: empty, or not ASCII, as
+   an order made outside the node can carry. Tracing such an order raises outside the handling that
+   skips an order the client cannot report, so one closed order like that aborts the mass status and
+   with it start-up reconciliation. A closed one should be skipped with a warning. An open one cannot
+   be represented, and start-up should fail with a reason that names it. A valid order that replaced
+   one should still be reported, under its own ID.
+"""

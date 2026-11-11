@@ -1,0 +1,63 @@
+# A build case: the format is in evals/build/README.md and ADR 0057.
+id = "modify-follows-replace"
+status = "ready"
+fix = "52ac69cc96c28d0a88ade58fc1413a1c831d38fb"
+review_case = "order-modify"
+defects = [
+    "filled-replacement-lost-when-replaced-missed",
+    "refused-replace-rejected-twice",
+    "replaced-applied-twice",
+    "replacement-fill-before-replaced",
+    "late-cancel-of-replaced-order",
+    "pending-replace-fails-startup",
+    "replacement-moved-on-before-replaced",
+    "second-modify-refusal-taken-for-retry",
+    "answers-kept-for-the-session",
+    "rejected-replacement-after-fill-never-reached",
+]
+paths = ["packages/canon-alpaca/"]
+tests = [
+    "packages/canon-alpaca/tests/conftest.py",
+    "packages/canon-alpaca/tests/test_execution_client.py",
+]
+fail_to_pass = [
+    "packages/canon-alpaca/tests/test_execution_client.py::test_answer_after_replaced_is_not_kept",
+    "packages/canon-alpaca/tests/test_execution_client.py::test_fill_on_a_replacement_before_its_replaced_applies_the_replacement_first",
+    "packages/canon-alpaca/tests/test_execution_client.py::test_filled_replacement_is_reported_when_replaced_was_missed",
+    "packages/canon-alpaca/tests/test_execution_client.py::test_late_cancel_of_the_replaced_order_does_not_cancel_the_replacement",
+    "packages/canon-alpaca/tests/test_execution_client.py::test_open_order_pending_replace_at_startup_is_reported",
+    "packages/canon-alpaca/tests/test_execution_client.py::test_pending_replace_with_fills_is_reported_partly_filled",
+    "packages/canon-alpaca/tests/test_execution_client.py::test_rejected_replacement_after_the_old_order_filled_settles_the_modify",
+    "packages/canon-alpaca/tests/test_execution_client.py::test_replace_rejected_twice_over_is_one_modify_rejection",
+    "packages/canon-alpaca/tests/test_execution_client.py::test_replaced_delivered_twice_is_one_update",
+    "packages/canon-alpaca/tests/test_execution_client.py::test_replaced_whose_replacement_has_moved_on_still_updates",
+    "packages/canon-alpaca/tests/test_execution_client.py::test_second_modify_refused_after_the_first_replaced_is_rejected",
+]
+admitted = "2026-11-10"
+statement = """
+The execution client modifies an order by Alpaca's replace. It goes wrong when Alpaca's updates for a
+replace arrive late, twice or out of order:
+
+1. When the `replaced` update never reaches the client and the replacement then fills,
+   reconciliation reports neither the replacement nor the old order, so the node's order is never
+   reported filled and its fill is lost.
+2. A replace that Alpaca refuses on the HTTP answer and again with an `order_replace_rejected`
+   update gives two `OrderModifyRejected` events for one modify.
+3. A `replaced` update delivered twice gives two `OrderUpdated` events.
+4. A fill on the replacement that arrives before `replaced` is applied to the node's order under
+   the old terms: a fill larger than the old quantity is dropped as an overfill, and the order takes
+   the replacement's terms only after the fill.
+5. A `canceled` or `expired` update for the old order, arriving after it was replaced, closes the
+   node's order while its replacement still works at Alpaca.
+6. `pending_replace` is not a status the client maps, so an open order that is mid-replace fails
+   start-up reconciliation; one that has fills should be reported partly filled.
+7. When the replacement read at `replaced` is itself pending replace, or already replaced again,
+   the client raises and generates no `OrderUpdated` instead of following it to the live order.
+8. A second modify sent before the first's `replaced`, and refused by Alpaca, is taken for
+   alpaca-py's retry of the first when the first replacement already holds the terms it asked for,
+   so it gets no `OrderModifyRejected`.
+9. A PATCH answer that arrives after its `replaced` was applied is stored and never removed, so
+   answers build up for the whole session.
+10. When the old order fills before Alpaca rejects its replacement, the client returns before the
+    branch written for that case, so nothing says what became of the modify.
+"""

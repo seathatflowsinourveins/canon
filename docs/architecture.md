@@ -140,6 +140,12 @@ daily bars (ADR 0048).
   for every reviewer, found-or-missed scoring by two scorers (`evals/review/`, ADR 0046). First run
   2026-11-10, scored in `evals/review/runs/2026-11-10-first/`; the cases hold 23 confirmed defects, 10 in
   `order-modify` and 10 in `trial-ledger-gate`.
+* **Build eval.** A past fix's parent tree with the fix's failing tests, in a one-commit copy with no
+  history; a harness that grades the worker's files out of its reach, then two readers who say whether
+  the change would land (`evals/build/`, ADR 0057). Four cases; no trial has run. It is the measure
+  that keeps or retires a runtime, model, effort and configuration that builds here, not a gate: an
+  adopted runtime other than Claude Code builds in its own workspace, and a Claude lane or the
+  coordinator reviews and lands its change (ADR 0058).
 * **Context layers.** None adopted: the runtimes read `AGENTS.md` and take MCP servers, none configured;
   OpenViking, WeKnora, Serena and Context7 are watched until a reviewer trial on the benchmark shows a
   gain (ADR 0051).

@@ -1,0 +1,21 @@
+# A build case: the format is in evals/build/README.md and ADR 0057.
+id = "ledger-rejected-study-passes"
+status = "left-out"
+fix = "828c08273851530b38d5e797bf9abfe4b92b88f8"
+review_case = "trial-ledger-gate"
+defects = [
+    "ledger-path-per-directory",
+    "common-range-trim",
+    "key-ignores-the-data",
+    "variance-exact-zero-test",
+    "key-hashes-raw-text",
+    "path-interpolated-into-url",
+    "key-read-from-mutable-config",
+    "no-day-in-common-names-no-trial",
+]
+reason = """
+The fix's tests import names the fix introduces, so on the starting tree two of the three test files
+cannot be collected and pytest stops before it runs anything: no test can be shown to pass before and
+after. The fix also made the decisions ADR 0041 records in the same commit, which its tests alone do
+not state.
+"""
