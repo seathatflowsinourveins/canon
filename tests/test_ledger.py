@@ -24,6 +24,7 @@ import enum
 import fcntl
 import hashlib
 import math
+import os
 import re
 import shutil
 import sqlite3
@@ -32,6 +33,7 @@ import sys
 import threading
 import time
 from contextlib import ExitStack
+from contextlib import closing
 from datetime import UTC
 from datetime import datetime
 from decimal import Decimal
@@ -50,6 +52,7 @@ from nautilus_trader.model import NautilusDataType
 from nautilus_trader.model import Quantity
 from nautilus_trader.persistence import ParquetDataCatalog
 from optuna.exceptions import DuplicatedStudyError
+from optuna.exceptions import StorageInternalError
 from optuna.trial import TrialState
 
 import canon_trading.backtest
@@ -76,6 +79,7 @@ from canon_trading.ledger import open_study
 from canon_trading.ledger import record_trial
 from canon_trading.ledger import samples
 from canon_trading.ledger import session_day
+from canon_trading.ledger import trial_asked_for
 from canon_trading.ledger import trial_config
 from canon_trading.ma_cross import MaCrossConfig
 from canon_trading.ranking import RankingStopped
@@ -306,7 +310,6 @@ def test_the_catalog_path_does_not_change_the_key_or_the_digest(
         pytest.param([strategy(), strategy()], BALANCES, id="strategy count"),
         pytest.param([strategy(bar_type=MSFT_BAR_TYPE)], BALANCES, id="bar type"),
         pytest.param([strategy()], ["50000 USD"], id="balance"),
-        pytest.param([strategy()], ["100000 USD", "10 EUR"], id="second balance"),
     ],
 )
 def test_runs_that_differ_in_one_input_get_different_keys(
@@ -493,14 +496,170 @@ def test_reading_a_missing_study_creates_nothing(tmp_path: Path, stack: ExitStac
     assert names == ["present"]
 
 
-def test_a_file_that_is_not_a_ledger_is_refused_unchanged(tmp_path: Path) -> None:
-    empty = tmp_path / "empty.db"
-    empty.touch()
+def not_a_database(path: Path) -> None:
+    path.write_text("not a database, a text file\n" * 40)
 
-    with pytest.raises(LedgerNotFound, match="is not an Optuna ledger"), open_study("s", empty):
+
+def another_database(path: Path) -> None:
+    with closing(sqlite3.connect(path)) as other:
+        other.execute("create table notes (text)")
+        other.commit()
+
+
+@pytest.mark.parametrize("make", [Path.touch, not_a_database, another_database])
+def test_a_file_that_is_not_a_ledger_is_refused_unchanged(
+    tmp_path: Path, make: Callable[[Path], None]
+) -> None:
+    """An empty file, a file SQLite does not read as a database, and a database with none of
+    Optuna's tables: each is no ledger, and is left as it was."""
+    file = tmp_path / "file.db"
+    make(file)
+    before = file.read_bytes()
+
+    with pytest.raises(LedgerNotFound, match="is not an Optuna ledger"), open_study("s", file):
         pass
 
-    assert empty.read_bytes() == b""
+    assert file.read_bytes() == before
+
+
+def storage_error(tmp_path: Path, name: str = "s") -> pytest.ExceptionInfo[StorageInternalError]:
+    """The storage error `open_study` raises for the ledger in `tmp_path`, which is there."""
+    with pytest.raises(StorageInternalError) as raised, open_study(name, tmp_path / "trials.db"):
+        pass
+    assert not isinstance(raised.value, LookupError)
+    return raised
+
+
+def sqlite_error(error: StorageInternalError) -> sqlite3.Error:
+    """SQLite's own error behind Optuna's, which SQLAlchemy keeps as `orig` on the one between."""
+    orig = getattr(error.__cause__, "orig", None)
+    assert isinstance(orig, sqlite3.Error), error.__cause__
+    return orig
+
+
+def a_short_wait(monkeypatch: pytest.MonkeyPatch, seconds: float) -> None:
+    """Open the ledger with SQLite's wait for a lock set to `seconds`, not sqlite3's default five:
+    SQLAlchemy's pysqlite dialect passes a `timeout` in the URL's query to `sqlite3.connect`."""
+    url = canon_trading.ledger._sqlite_url
+    monkeypatch.setattr(
+        canon_trading.ledger,
+        "_sqlite_url",
+        lambda path, mode: f"{url(path, mode)}&timeout={seconds}",
+    )
+
+
+def test_a_ledger_held_busy_past_sqlite_s_wait_is_raised_as_busy(
+    tmp_path: Path, stack: ExitStack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 8, finding 5: `open_study` named every storage error of Optuna's "not an Optuna
+    ledger", so a ledger another connection held locked for longer than SQLite waits read as no
+    ledger at all, and its reader was told to create one. It is raised as Optuna raises it, its
+    cause SQLite's `SQLITE_BUSY`, with a note that the ledger is busy."""
+    new_study(stack, tmp_path, "s")
+    a_short_wait(monkeypatch, 0.2)
+    with closing(sqlite3.connect(tmp_path / "trials.db", isolation_level=None)) as holder:
+        holder.execute("BEGIN EXCLUSIVE")
+        raised = storage_error(tmp_path)
+        holder.execute("ROLLBACK")
+
+    orig = sqlite_error(raised.value)
+    assert (orig.sqlite_errorname, orig.sqlite_errorcode) == ("SQLITE_BUSY", sqlite3.SQLITE_BUSY)
+    [note] = raised.value.__notes__
+    assert f"the ledger at {tmp_path / 'trials.db'} is busy" in note and "open it again" in note
+    with open_study("s", tmp_path / "trials.db") as study:
+        assert study.study_name == "s"
+
+
+def test_a_ledger_released_within_sqlite_s_wait_is_opened(tmp_path: Path, stack: ExitStack) -> None:
+    """The retry is SQLite's own: a lock let go inside its wait delays the open and fails nothing.
+    The open cannot finish while the lock is held, so it returns only after the release."""
+    new_study(stack, tmp_path, "s")
+    holder = sqlite3.connect(tmp_path / "trials.db", isolation_level=None, check_same_thread=False)
+    holder.execute("BEGIN EXCLUSIVE")
+    released = threading.Event()
+
+    def release() -> None:
+        released.set()
+        holder.execute("ROLLBACK")
+        holder.close()
+
+    timer = threading.Timer(0.3, release)
+    timer.start()
+    try:
+        with open_study("s", tmp_path / "trials.db") as study:
+            assert released.is_set() and study.study_name == "s"
+    finally:
+        timer.join()
+
+
+class Unwrapped(Exception):
+    """An error with the driver's own as `orig`, as SQLAlchemy's `DBAPIError` keeps it."""
+
+    def __init__(self, orig: sqlite3.Error) -> None:
+        super().__init__(str(orig))
+        self.orig = orig
+
+
+def sqlite_said(code: int, text: str) -> sqlite3.OperationalError:
+    said = sqlite3.OperationalError(text)
+    said.sqlite_errorcode = code
+    return said
+
+
+@pytest.mark.parametrize("wrapped", [True, False], ids=["Optuna's error", "SQLAlchemy's own"])
+@pytest.mark.parametrize(
+    "code", [5, 261, 517, 773], ids=["BUSY", "RECOVERY", "SNAPSHOT", "TIMEOUT"]
+)
+def test_every_busy_code_is_noted_whichever_error_carries_it(
+    tmp_path: Path, stack: ExitStack, monkeypatch: pytest.MonkeyPatch, wrapped: bool, code: int
+) -> None:
+    """Code review of the round-8 change: `sqlite_errorcode` is SQLite's extended code, whose low
+    byte is the primary one, so a WAL-mode ledger's `SQLITE_BUSY_SNAPSHOT` (517) was not read as
+    busy; and Optuna reads its schema version on a bare connection, outside the session that wraps
+    an error in `StorageInternalError`, so a lock met there came through as SQLAlchemy's own error
+    with no note. Each is raised as it is, with the note."""
+    new_study(stack, tmp_path, "s")
+
+    def refuse(**_: object) -> None:
+        inner = Unwrapped(sqlite_said(code, "database is locked"))
+        if not wrapped:
+            raise inner
+        raise StorageInternalError("An exception is raised during the commit.") from inner
+
+    monkeypatch.setattr(canon_trading.ledger.optuna, "load_study", refuse)
+
+    with (
+        pytest.raises(StorageInternalError if wrapped else Unwrapped) as raised,
+        open_study("s", tmp_path / "trials.db"),
+    ):
+        pass
+
+    [note] = raised.value.__notes__
+    assert "is busy" in note
+
+
+def test_a_ledger_that_cannot_be_read_is_raised_by_its_own_name(
+    tmp_path: Path, stack: ExitStack
+) -> None:
+    """A ledger whose file cannot be opened, or is cut short, is there: each is raised as the
+    storage error it is, with SQLite's own code as its cause, and never as a ledger not found."""
+    new_study(stack, tmp_path, "s")
+    stack.close()
+    ledger = tmp_path / "trials.db"
+    whole = ledger.read_bytes()
+
+    if os.geteuid() != 0:  # a file's mode keeps nothing from root
+        ledger.chmod(0o000)
+        try:
+            closed = storage_error(tmp_path)
+        finally:
+            ledger.chmod(0o600)
+        assert sqlite_error(closed.value).sqlite_errorname == "SQLITE_CANTOPEN"
+        assert not getattr(closed.value, "__notes__", [])
+
+    ledger.write_bytes(whole[:5000])
+    cut = storage_error(tmp_path)
+    assert sqlite_error(cut.value).sqlite_errorname == "SQLITE_CORRUPT"
 
 
 def test_a_study_is_created_once(tmp_path: Path, stack: ExitStack) -> None:
@@ -1856,16 +2015,52 @@ def test_the_digest_holds_each_instrument_the_run_names(alpaca_bars: AlpacaBars)
     }
 
 
-def test_starting_balances_are_keyed_one_per_currency_in_any_order() -> None:
-    """A third reader: the balances were keyed in the order given and with repeats, though the venue
-    keeps one per currency, so runs alike took two keys and N grew."""
-    one = config_key(trial_config([strategy()], starting_balances=["100000 USD", "50000 EUR"]))
-    other = config_key(trial_config([strategy()], starting_balances=["50000 EUR", "100000 USD"]))
-    assert one == other
-    with pytest.raises(ValueError, match="name USD more than once"):
-        trial_config([strategy()], starting_balances=["50000 USD", "50000 USD"])
+@pytest.mark.parametrize(
+    "balances",
+    [
+        pytest.param(["100000 USD", "50000 EUR"], id="a second currency"),
+        pytest.param(["50000 EUR", "100000 USD"], id="a second currency first"),
+        pytest.param(["100000 EUR"], id="another currency alone"),
+        pytest.param(["50000 USD", "50000 USD"], id="the base currency twice"),
+    ],
+)
+def test_a_trial_is_keyed_on_one_balance_in_the_base_currency(balances: list[str]) -> None:
+    """Round 8, finding 1: balances were keyed one per currency, in any order, and a run with two
+    was a trial. Its account's equity is in two currencies, so NautilusTrader's daily returns give
+    nothing and the result holds per-position returns; the record was `traded`, stopped the
+    ranking as not in the writer's shape, was skipped by every later pass and carried its key in
+    N onto every sample. A study is on one account in US dollars, and anything else is refused by
+    name where the key is made, before anything is recorded. A third reader's two keys for one
+    run (#141) cannot arise either: one balance has no order and no repeat."""
+    with pytest.raises(ValueError, match="are not one balance in USD") as refused:
+        trial_config([strategy()], starting_balances=balances)
+
+    assert str(balances) in str(refused.value)
     assert (
         config_key(trial_config([strategy()], starting_balances=BALANCES)) == DEFAULT_CONFIG_SHA256
+    )
+
+
+def test_a_run_with_a_second_currency_is_no_trial(
+    alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack
+) -> None:
+    """The same refusal through the ledger's writer: nothing is recorded, so N does not move, and
+    the study records and ranks as before."""
+    alpaca_bars.write(tmp_path / "catalog")
+    study = new_study(stack, tmp_path, "s")
+
+    with pytest.raises(ValueError, match="are not one balance in USD") as refused:
+        record_trial(
+            study,
+            tmp_path / "catalog",
+            [strategy()],
+            starting_balances=["100000 USD", "50000 EUR"],
+        )
+
+    assert trial_asked_for(refused.value) is None and study.get_trials() == []
+    assert (
+        record_trial(study, tmp_path / "catalog", [strategy()], starting_balances=BALANCES).outcome
+        == TRADED
     )
 
 
@@ -2250,7 +2445,7 @@ def test_a_raced_trial_not_read_back_with_its_note_refused_names_itself(
     [number] = raced
     notes = "\n".join(raised.value.__notes__)
     assert f"trial #{number} may be another writer's queued trial" in notes
-    assert "ADR 0054 term 7's named limit" in notes
+    assert "ADR 0081's named limit" in notes
     if isinstance(refusal, Exception):
         assert f"trial #{number}, asked by record_trial, could not be read back" in notes
         assert "refused the read" in str(raised.value)
@@ -2270,7 +2465,7 @@ def test_a_trial_told_by_another_process_before_its_read_is_left_as_it_is(
     alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Code review: a trial `record_trial` asked for and `mark_not_run` told `FAIL` before it was
-    read back refuses the queue's note, and the error then named ADR 0054 term 7's limit, which does
+    read back refuses the queue's note, and the error then named ADR 0081's limit, which does
     not apply to a keyless trial marked not run. It is left as it is, and the error says so."""
     alpaca_bars.write(tmp_path / "catalog")
     study = new_study(stack, tmp_path, "told meanwhile")

@@ -25,9 +25,13 @@ Run `python -m canon_trading.variant_study --create` once to create the study wi
 `python -m canon_trading.variant_study` to record and rank. A pass records every configuration of the
 grid whose latest record on the current sample did not run to the end, the same rule the gate uses to
 resolve a key (ADR 0054 term 5), then ranks and prints the report or the stop. `--rank-only` ranks
-without recording. Either way the study is ranked only once every configuration of the plan has a
-record: `rank` counts N from the ledger and cannot see a planned configuration never tried, so a
-pass stopped part way would be ranked at an N short of the plan's (ADR 0010 step 1, ADR 0048). A run
+without recording. Either way the pass goes into the ranking by one door, `rank` given the plan's
+keys, and passes the same refusals in the same order (`run_study`): a plan that names one
+configuration twice, refused before anything is created, read or run, with or without recording
+(`planned`); a study whose sample is not the plan's; and, among the ranking's own stops, a
+configuration of the plan
+with no record, since `rank` counts N from the ledger and a pass stopped part way would be ranked
+at an N short of the plan's (ADR 0010 step 1, ADR 0048). A run
 that raises goes into the pass's failures only once `record_trial` has told it `FAIL` with its error
 (a refused `tell` after a run included, which keeps the run's outcome, and both its `tell`s refused,
 which leaves it `RUNNING` with its outcome and error); one whose
@@ -76,7 +80,6 @@ from .ledger import config_key
 from .ledger import create_ledger_study
 from .ledger import current_sample
 from .ledger import default_ledger_path
-from .ledger import has_key
 from .ledger import open_study
 from .ledger import origin
 from .ledger import record_trial
@@ -91,6 +94,7 @@ from .ranking import RankingStopped
 from .ranking import on_current_sample
 from .ranking import ran_to_the_end
 from .ranking import rank
+from .ranking import refuse_a_repeated_key
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -143,6 +147,22 @@ def grid(
 def key_of(config: MaCrossConfig, starting_balances: Sequence[str] = STARTING_BALANCES) -> str:
     """The ledger's config key of a one-strategy trial of `config` (ADR 0053 term 2)."""
     return config_key(trial_config([config], starting_balances=starting_balances))
+
+
+def planned(
+    configs: Sequence[MaCrossConfig], starting_balances: Sequence[str] = STARTING_BALANCES
+) -> tuple[list[str], dict[str, str]]:
+    """The plan as the ledger and the ranking take it: each configuration's key, in the plan's
+    order, and each key's name (`describe`); refused if it names one configuration twice.
+
+    The refusal is the ranking's own (`canon_trading.ranking.refuse_a_repeated_key`), and every pass
+    makes it here before anything else: before a ledger or a study is created, a trial run or a
+    record read. A config the ledger cannot key raises here too, as `trial_config` raises it.
+    """
+    keys = [key_of(config, starting_balances) for config in configs]
+    names = dict(zip(keys, map(describe, configs), strict=True))
+    refuse_a_repeated_key(keys, names)
+    return keys, names
 
 
 def _to_record(
@@ -248,10 +268,10 @@ def record_grid(
     `on_sample`, the one the pass checked against its plan: refused before any key is read
     (`_to_record`), before each trial by `record_trial`, and after each attempt, whether its run
     raised or not, naming both samples. A plan that names one configuration twice is refused before
-    any of that (`_refuse_a_repeated_key`).
+    any of that, by the ranking's own refusal (`planned`): the keys left to record are read once,
+    before the first trial, so a key given twice would run twice in one pass.
     """
-    keys = [key_of(config, starting_balances) for config in configs]
-    _refuse_a_repeated_key(configs, keys)
+    keys, _ = planned(configs, starting_balances)
     pending = set(_to_record(study, keys, on_sample))
     quiet = LoggerConfig(stdout_level=LogLevel.ERROR)
     recorded, skipped, failed = [], [], []
@@ -281,23 +301,6 @@ def record_grid(
     return Recorded(tuple(recorded), tuple(skipped), tuple(failed))
 
 
-def _refuse_a_repeated_key(configs: Sequence[MaCrossConfig], keys: Sequence[str]) -> None:
-    """Refuse a plan that names one configuration twice, by name and key, before any trial.
-
-    The keys left to record are read once, before the first trial, so a key given twice would run
-    twice in one pass: two records of one configuration where the plan is one trial each, and a
-    repeat that failed would leave the key unresolved though its first run ended.
-    """
-    seen: set[str] = set()
-    for config, key in zip(configs, keys, strict=True):
-        if key in seen:
-            raise ValueError(
-                f"the pass names {describe(config)} twice (config key {key}); a pass records each "
-                "configuration once, so give each once",
-            )
-        seen.add(key)
-
-
 def describe(config: MaCrossConfig) -> str:
     return f"{config.bar_type.instrument_id.symbol} {config.fast_period}/{config.slow_period}"
 
@@ -325,11 +328,14 @@ def run_study(
     Creating a study that exists raises Optuna's `DuplicatedStudyError`, and opening one that does not
     raises `LedgerNotFound`, each from `canon_trading.ledger`: nothing is created unless asked. A study
     whose current sample is not [start, end] is refused, since the sample is part of the plan, and so
-    is one whose sample moves beneath the pass after that check (`_record_and_rank`). The pass holds
+    is one whose sample moves beneath the pass after that check (`_record_and_rank`). A plan
+    that names one configuration twice is refused first, whether the pass records or only ranks,
+    before the ledger is looked for and before a study is created (`planned`). The pass holds
     the study's pass lock (module header). Returns what the pass recorded and the report, or
     the `RankingStopped` that stopped it, which names any configuration of `configs` with no record.
     """
     configs = grid() if configs is None else configs
+    plan, names = planned(configs)
     first, last = dt_to_unix_nanos(start), dt_to_unix_nanos(end)
     ledger = default_ledger_path() if ledger_path is None else Path(ledger_path).resolve()
     if not create and not ledger.is_file():
@@ -341,7 +347,9 @@ def run_study(
         else:
             opened = open_study(name, ledger)
         with opened as study:
-            return _record_and_rank(study, catalog_path, configs, first, last, rank_only)
+            return _record_and_rank(
+                study, catalog_path, configs, first, last, rank_only, plan=plan, names=names
+            )
 
 
 @contextmanager
@@ -374,8 +382,19 @@ def _record_and_rank(
     first: int,
     last: int,
     rank_only: bool,
+    *,
+    plan: Sequence[str],
+    names: dict[str, str],
 ) -> tuple[Recorded | None, RankingReport | RankingStopped]:
     """Check the study's sample against the plan, record the grid on that sample, and rank it.
+
+    `plan` and `names` are `planned`'s, which `run_study` took before it opened the study, so a
+    plan that names one configuration twice never reaches here. Every pass, recording or
+    `rank_only`, then passes the same refusals in this order. The study's sample must be the
+    plan's. Then the grid is recorded, unless `rank_only`, and the study is ranked through `rank`
+    given the plan's keys, which stops, with its other stops, on a configuration of the plan that
+    has no record (ADR 0048). `record_grid` and `rank` each refuse a repeated key themselves, as a
+    direct call to either does.
 
     The pass lock keeps a second pass off the study, but not another caller's `move_sample`, which
     holds the study's write lock and so lands between two of the pass's trials, never inside one.
@@ -393,19 +412,14 @@ def _record_and_rank(
             f"{first} to {last}",
         )
     recorded = None if rank_only else record_grid(study, catalog_path, configs, on_sample=sample)
-    unrecorded = _never_recorded(study, configs)
     try:
-        report = rank(study)
+        report = rank(study, plan, legend=names)
     except RankingStopped as stopped:
         if (moved := current_sample(study)) != sample:
             raise _moved(study, "stopped on", moved, sample) from stopped
-        if not unrecorded:
-            return recorded, stopped
-        return recorded, RankingStopped(f"{_short_of_the_plan(study, unrecorded)}\n{stopped}")
+        return recorded, stopped
     if report.ranked_sample != sample:  # the sample of `rank`'s own read
         raise _moved(study, "ranked", report.ranked_sample, sample)
-    if unrecorded:
-        return recorded, RankingStopped(_short_of_the_plan(study, unrecorded))
     return recorded, report
 
 
@@ -414,35 +428,6 @@ def _moved(study: optuna.Study, did: str, moved: Sample, checked: Sample) -> Val
         f"study {study.study_name!r} {did} {moved.describe()}, not {checked.describe()}, the "
         "sample the pass checked against its plan: the sample moved beneath the pass, and its "
         "ranking is refused",
-    )
-
-
-def _never_recorded(study: optuna.Study, configs: Sequence[MaCrossConfig]) -> list[MaCrossConfig]:
-    """The configurations of the plan with no record of their key in `study`, on any sample.
-
-    `rank` counts N from the ledger (ADR 0010 step 1), so it cannot see a planned configuration that
-    was never tried: a pass stopped part way leaves a study whose N is short of the plan's, and a
-    smaller N deflates the pick's Sharpe ratio less. The plan is ADR 0048's, so the study is not
-    ranked until every configuration of it has a record. A key with a record that did not run to the
-    end, or one on another sample only, `rank` stops on itself.
-    """
-    keys = {
-        trial.user_attrs["config_key"]
-        for trial in study.get_trials(deepcopy=False)
-        if has_key(trial)
-    }
-    return [config for config in configs if key_of(config) not in keys]
-
-
-def _short_of_the_plan(study: optuna.Study, configs: Sequence[MaCrossConfig]) -> str:
-    return (
-        f"The ranking of study {study.study_name!r} stopped: {len(configs)} configurations of "
-        "the plan (ADR 0048) have no record, so N would be short of the plan's; record the grid "
-        "first:\n"
-        + "\n".join(
-            f"* {key_of(config)} ({describe(config)}): planned but never recorded"
-            for config in configs
-        )
     )
 
 

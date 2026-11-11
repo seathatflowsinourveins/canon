@@ -121,7 +121,10 @@ the hand-written class.
    the study, the sample, to its last write, the `tell` of its run or of its failure, so a move, a
    mark or a retirement lands before a record or after it, never inside, and a second writer waits.
    ADR 0035 term 1's lock keeps first creation only. `open_study`, the ranking and the pass lock
-   take no write lock, and a second pass on a study is still refused, not queued. Who failed is read
+   take no write lock, and a second pass on a study is still refused, not queued. A reader that
+   meets the store locked waits SQLite's own wait and no longer, and is then given the storage's
+   error with a note that the ledger is busy; only a file that is no database, or holds none of
+   Optuna's tables, is reported as no ledger (2026-11-11, round 8). Who failed is read
    by identity: the error `record_trial` lets through carries the number of the trial its attempt
    asked for, or none if it was refused before one, and the study's pass reads only that trial as
    its written failure, where it scanned the study for a failed record of the key.
@@ -176,7 +179,11 @@ the hand-written class.
    states the number tried, its own keys plus each configuration of the earlier study that could
    not start, and says that the gate's printed N is short by that many; whoever reads a pass from
    that study reads it against the stated number. The study's pass refuses, by name and before any
-   trial, a plan that names one key twice.
+   trial, a plan that names one key twice. Since 2026-11-11 (the gate's eighth outside round) that
+   refusal is the ranking's own and comes first on every way into a ranking: `rank` takes the
+   plan's keys and refuses a repeated one before it reads the study; the pass makes the same
+   refusal before it creates, opens or runs anything, whether it records or only ranks; and a
+   planned key with no record stops the ranking among its other stops. A plan never lowers N.
    **The hand-written class** (2026-11-11; ADR 0073's reachability rule). The gate trusts the ledger
    as its named writers write it. A state that needs a record written by hand, through Optuna's API
    or the store, is recorded here once, as a class, and is not defended against: no input check
@@ -503,3 +510,24 @@ checkout.
   sentence true only of a fork by the holding thread; the two other cases above are its runs, and
   the term now states them. The code review also corrected a line here that called the ledger module
   unchanged, which this split's own comment edits would have made untrue.
+* The gate's eighth outside round, 2026-11-11, read only, by Antigravity at b586935, its fourth and
+  fifth findings, each reproduced before the change. With both keys recorded,
+  `run_study(..., rank_only=True)` on a plan of three entries naming one key twice ranked and passed
+  at N = 2, since the refusal stood in the recording alone
+  (`tests/test_variant_study.py::test_a_plan_that_repeats_a_key_is_refused_whichever_way_into_the_ranking`,
+  `tests/test_ranking.py::test_a_plan_that_names_a_key_twice_is_refused_before_the_study_is_read`,
+  `test_a_planned_key_with_no_record_stops_the_ranking_with_its_other_stops`). And `open_study` named
+  every storage error "not an Optuna ledger": a ledger held locked for the 5.3 seconds SQLite waited
+  (run), one that could not be opened and one cut short. Optuna 5.0.0 wraps every SQLAlchemy error
+  of a session in `StorageInternalError` (`optuna/storages/_rdb/storage.py` lines 91-98 at the pinned
+  commit, read in the local copy), so the cause is read from SQLite's own code:
+  https://docs.python.org/3/library/sqlite3.html gives `sqlite3.connect`'s `timeout` as "Default five
+  seconds" and `sqlite_errorcode` from Python 3.11, and https://sqlite.org/rescode.html the primary
+  code as the low 8 bits of the extended one (both fetched)
+  (`tests/test_ledger.py::test_a_ledger_held_busy_past_sqlite_s_wait_is_raised_as_busy`,
+  `test_a_ledger_that_cannot_be_read_is_raised_by_its_own_name`). Code review of the change
+  (`/code-review`, high): a pass that creates its study refused a repeated key only after the ledger
+  and the study were made; extended busy codes (517 in WAL mode) were not read as busy; and a lock
+  met where Optuna reads on a bare connection (`_init_alembic`, line 1124) came through as
+  SQLAlchemy's own error with no note, the last from reading the source and not reproduced. Each is
+  corrected, with a test (`test_every_busy_code_is_noted_whichever_error_carries_it`).

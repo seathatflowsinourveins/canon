@@ -32,9 +32,16 @@ the data a run read either, so `data_digest` is glue too (ADR 0053).
 The value told for a run that traded is the per-session Sharpe ratio the gate would take of the
 run's own series, mean over sample standard deviation, read from
 `canon_trading.returns_matrix.session_returns`, the gate's one numeric check (ADR 0080;
-`told_sharpe`). A run whose series that check refuses is told no value, and `FAIL`, still `traded`.
+`told_sharpe`), which asks skfolio what the ranking asks it. A run whose series that check refuses,
+one skfolio gives no deflated Sharpe ratio of among them, is told no value, and `FAIL`, still
+`traded`: a record is `COMPLETE` exactly when the ranking takes its series.
 The value is there for a later sampler; `canon_trading.ranking` ranks from the returns and holds a
 told value to this one.
+
+A study is on one account in one currency, US dollars: the key takes one starting balance in it
+(`_balances`), by the refusal the venue's configuration gives
+(`canon_trading.backtest.account_balances`), so a run NautilusTrader's daily returns cannot book is
+no trial.
 
 First creation of a ledger file is serialised with an exclusive `fcntl.flock` (the standard library's
 `fcntl`, POSIX `flock(2)`) on `trials.db.lock` beside it. Optuna's `RDBStorage` runs SQLAlchemy's
@@ -106,6 +113,7 @@ import hashlib
 import inspect
 import json
 import math
+import sqlite3
 import subprocess
 import threading
 import traceback
@@ -125,12 +133,12 @@ import pandas as pd
 from canon_alpaca.constants import VENUE
 from nautilus_trader.config import StrategyConfig
 from nautilus_trader.model import Currency
-from nautilus_trader.model import Money
 from optuna.study import StudyDirection
 from optuna.trial import TrialState
 
 from .backtest import FEE_RATES
 from .backtest import VENUE_SETTINGS
+from .backtest import account_balances
 from .backtest import built_backtest
 from .backtest import checked_run_config
 from .backtest import run_built
@@ -327,8 +335,17 @@ def open_study(name: str, path: Path | None = None) -> Generator[optuna.Study]:
     """Open the study `name` in the ledger at `path`; never create a file, a table or a study.
 
     With no `path`, the ledger is `default_ledger_path()`. A missing file or study raises
-    `LedgerNotFound`, and so do a file that is not an Optuna ledger, a study with no sample and a
-    study whose directions are not the ledger's, one objective maximized. On leaving the `with` block the storage's
+    `LedgerNotFound`, and so do a file that is not an Optuna ledger (`_not_a_ledger`), a study with
+    no sample and a study whose directions are not the ledger's, one objective maximized. Any other
+    error of the storage is raised as it is: Optuna's `StorageInternalError` with SQLAlchemy's
+    and SQLite's own as its cause, or SQLAlchemy's own where Optuna reads outside the session
+    that wraps one (`_VersionManager._init_alembic`, line 1124, on a bare `engine.connect()`). A
+    ledger that cannot be read, or is damaged, is there, and
+    saying it is not would send its reader to create one. A ledger another connection holds locked
+    is waited for by SQLite itself, for `sqlite3.connect`'s default `timeout` of five seconds
+    (https://docs.python.org/3/library/sqlite3.html, fetched 2026-11-11; 5.3 seconds measured
+    here), and after that the same error is raised, `SQLITE_BUSY` its cause, with a note that the
+    ledger is busy and can be opened again; nothing here waits a second time. On leaving the `with` block the storage's
     session is removed (`RDBStorage.remove_session`) and its SQLAlchemy engine disposed, so no SQLite
     connection is left for the garbage collector.
     """
@@ -344,8 +361,17 @@ def open_study(name: str, path: Path | None = None) -> Generator[optuna.Study]:
             raise LedgerNotFound(
                 f"the ledger at {path} holds no study {name!r}; create_ledger_study creates one",
             ) from None
-        except optuna.exceptions.StorageInternalError as error:
-            raise LedgerNotFound(f"the file at {path} is not an Optuna ledger") from error
+        except Exception as error:
+            # Read for what SQLite said, then raised as it is unless that names no ledger.
+            if _not_a_ledger(error):
+                raise LedgerNotFound(f"the file at {path} is not an Optuna ledger") from error
+            if _sqlite_code(error) == sqlite3.SQLITE_BUSY:
+                error.add_note(
+                    f"the ledger at {path} is busy: another connection held its SQLite lock for "
+                    "longer than SQLite waits for one (sqlite3's timeout, five seconds by "
+                    "default); the ledger is there, so open it again",
+                )
+            raise
         if _left_by_an_interrupted_creation(study):
             raise LedgerNotFound(
                 f"study {name!r} in the ledger at {path} has no sample: its creation was interrupted "
@@ -364,6 +390,49 @@ def open_study(name: str, path: Path | None = None) -> Generator[optuna.Study]:
             yield study
         finally:
             _OPENED.pop(study, None)
+
+
+def _sqlite_error(error: BaseException) -> sqlite3.Error | None:
+    """SQLite's own error behind an error the storage raised, if there is one.
+
+    Optuna 5.0.0 wraps every `sqlalchemy.exc.SQLAlchemyError` of a session in
+    `StorageInternalError` (`_create_scoped_session`, `optuna/storages/_rdb/storage.py` lines
+    91-98 at the pinned commit), and SQLAlchemy keeps the driver's exception as `orig` on its
+    `DBAPIError`. So it is the `orig` of the error's cause, or of the error itself where Optuna
+    read outside such a session and SQLAlchemy's error came through unwrapped.
+    """
+    for raised in (error.__cause__, error):
+        orig = getattr(raised, "orig", None)
+        if isinstance(orig, sqlite3.Error):
+            return orig
+    return None
+
+
+def _sqlite_code(error: BaseException) -> int | None:
+    """SQLite's primary result code behind `error`, if any.
+
+    `sqlite3.Error.sqlite_errorcode` (Python 3.11) is the extended code, whose low byte is the
+    primary one (https://sqlite.org/rescode.html, fetched 2026-11-11: an application finds the
+    primary code "merely by extracting the least significant 8 bits"): `SQLITE_BUSY_RECOVERY`,
+    `SQLITE_BUSY_SNAPSHOT` and `SQLITE_BUSY_TIMEOUT`, 261, 517 and 773, are all `SQLITE_BUSY`, 5.
+    """
+    code = getattr(_sqlite_error(error), "sqlite_errorcode", None)
+    return code & 0xFF if isinstance(code, int) else None
+
+
+def _not_a_ledger(error: BaseException) -> bool:
+    """Whether SQLite said the file `open_study` read is no Optuna ledger: it is not a database
+    (`SQLITE_NOTADB`), or it is one without a table Optuna reads (`SQLITE_ERROR`, "no such table",
+    SQLite's own text for it; an empty file is a database with no table).
+
+    Only these two are the condition `LedgerNotFound` names. A lock held past SQLite's wait
+    (`SQLITE_BUSY`), a file that cannot be opened (`SQLITE_CANTOPEN`), a damaged one
+    (`SQLITE_CORRUPT`) and every other code are a ledger that is there and could not be read.
+    """
+    code, said = _sqlite_code(error), str(_sqlite_error(error))
+    return code == sqlite3.SQLITE_NOTADB or (
+        code == sqlite3.SQLITE_ERROR and said.startswith("no such table")
+    )
 
 
 @contextmanager
@@ -652,20 +721,15 @@ def data_bar_types(traded: Iterable[str]) -> list[str]:
 
 
 def _balances(starting_balances: Sequence[str]) -> list[str]:
-    """The starting balances as the key holds them: one per currency, each as `Money` prints it, sorted.
+    """The starting balance as the key holds it, as `Money` prints it: one, in the account's base
+    currency, or `ValueError` by name (`canon_trading.backtest.account_balances`, the refusal the
+    venue's configuration gives).
 
-    `BacktestVenueConfig` keeps one balance per currency, so the order they are given in runs
-    nothing differently, and two of one currency are refused: the venue would keep only one of them
-    and run as if the other were not there.
+    A study is on one account in one currency, so the key takes no second balance: a run with two
+    books per-position returns that the gate does not take, was recorded as traded and stopped
+    its study on every sample (round 8). One balance has no order and no repeat to normalise.
     """
-    balances = [Money.from_str(balance) for balance in starting_balances]
-    codes = [str(balance.currency) for balance in balances]
-    twice = sorted({code for code in codes if codes.count(code) > 1})
-    if twice:
-        raise ValueError(
-            f"starting balances name {twice[0]} more than once: {list(starting_balances)}"
-        )
-    return sorted(_canonical(balance) for balance in balances)
+    return [_canonical(balance) for balance in account_balances(starting_balances)]
 
 
 def base_config_defaults() -> dict[str, Any]:
@@ -1189,7 +1253,7 @@ def _tell_unread(study: optuna.Study, trial: optuna.Trial, error: BaseException,
     except BaseException as refused:
         limit = (
             f"trial #{trial.number} may be another writer's queued trial, and its note was refused "
-            f"({refused!r}), so the ranking may read it as a run of its key (ADR 0054 term 7's "
+            f"({refused!r}), so the ranking may read it as a run of its key (ADR 0081's "
             "named limit)"
         )
         error.add_note(limit)
@@ -1218,12 +1282,12 @@ def _untold(frozen: FrozenTrial, retired: set[int]) -> str | None:
         return (
             f"trial #{frozen.number}, queued by another writer with no config key, was taken without "
             "its note, so it reads as another writer's started record: it stops the ranking for "
-            "good, and mark_not_run does not clear it (ADR 0054 term 7)"
+            "good, and mark_not_run does not clear it (ADR 0081)"
         )
     return (
         f"trial #{frozen.number}, queued by another writer with config key "
         f"{frozen.user_attrs['config_key']}, was taken without its note, so the ranking may read it "
-        "as a run of that key (ADR 0054 term 7's named limit)"
+        "as a run of that key (ADR 0081's named limit)"
     )
 
 
@@ -1766,8 +1830,9 @@ def told_sharpe(returns: object, days: object) -> float:
 
     The value `record_trial` tells, and the one `canon_trading.ranking` holds a told value to. It is
     read from `session_returns`, ADR 0010 step 2 and the gate's one numeric check as the gate applies
-    them (ADR 0080), so a run whose returns the gate refuses, a constant series or one of zeros
-    among them, is told no value (and `FAIL`, still `traded`), not one the gate never sees;
+    them (ADR 0080), so a run whose returns the gate refuses, a constant series, one of zeros or
+    one skfolio gives no deflated Sharpe ratio of among them, is told no value (and `FAIL`, still
+    `traded`), not one the gate never sees;
     `session_returns` refuses `returns` and `days` not in the shape `record_trial` writes.
     """
     try:

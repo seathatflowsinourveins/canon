@@ -63,7 +63,16 @@ The simulated venue, and where each setting comes from:
 * `L1_MBP` with bar execution left on (its default), the only book type on which bars fill orders.
 * A zero-rate fee model, stated because upstream requires one. Alpaca's paper environment "does not
   account for" regulatory fees (same page), so this matches paper, not live.
-* Starting balances are the caller's. Alpaca creates a paper account with $100k (same page).
+* The starting balance is the caller's, and is one balance in US dollars
+  (`account_balances`): the account's base currency, the one every instrument the adapter builds
+  is quoted in (`canon_alpaca.providers.parse_equity`, `canon_alpaca.constants.USD`). Anything
+  else is refused by name before a venue is configured. NautilusTrader's daily portfolio returns
+  take an account whose equity is in one currency: with a second balance, `daily_returns` gives
+  nothing (`if snapshot.total_equity.len() != 1 { return None; }`,
+  `crates/analysis/src/analyzer.rs` line 436 at the pinned commit) and the result's returns fall
+  back to per-position ones, keyed at position closes, which the gate does not take
+  (`canon_trading.returns_matrix`). The venue's own `base_currency` stays unset, as it was, so no
+  run config changes. Alpaca creates a paper account with $100k (same page).
 
 Known limits:
 
@@ -96,6 +105,7 @@ from typing import TYPE_CHECKING
 from typing import Any
 
 import pandas as pd
+from canon_alpaca.constants import USD
 from canon_alpaca.constants import VENUE
 from nautilus_trader.backtest import BacktestNode
 from nautilus_trader.config import BacktestDataConfig
@@ -108,6 +118,7 @@ from nautilus_trader.execution import MakerTakerFeeModel
 from nautilus_trader.model import AccountType
 from nautilus_trader.model import BarType
 from nautilus_trader.model import BookType
+from nautilus_trader.model import Money
 from nautilus_trader.model import NautilusDataType
 from nautilus_trader.model import OmsType
 from nautilus_trader.persistence import ParquetDataCatalog
@@ -172,11 +183,32 @@ VENUE_SETTINGS: dict[str, Any] = {
 FEE_RATES: dict[str, Decimal] = {"maker_rate": Decimal(0), "taker_rate": Decimal(0)}
 
 
+def account_balances(starting_balances: Sequence[str]) -> list[Money]:
+    """`starting_balances` as NautilusTrader's `Money` reads each (`Money.from_str`), refused by name
+    unless they are one balance in the account's base currency, US dollars (module header).
+
+    The door of every run here: `simulated_alpaca_venue` and the trial's key
+    (`canon_trading.ledger.trial_config`) both read the balances through it. No balance at all is
+    left to upstream, which refuses it when the node is built (`SimulatedVenueConfig::validate`).
+    """
+    balances = [Money.from_str(balance) for balance in starting_balances]
+    if len(balances) > 1 or any(balance.currency != USD for balance in balances):
+        raise ValueError(
+            f"starting balances {list(starting_balances)} are not one balance in {USD}: a run "
+            f"here is on one account in its base currency, {USD}, which every instrument on "
+            f"{VENUE} is quoted in, and NautilusTrader's daily returns take an account in one "
+            "currency",
+        )
+    return balances
+
+
 def simulated_alpaca_venue(starting_balances: Sequence[str]) -> BacktestVenueConfig:
     """Return the venue configuration described in this module's header.
 
-    `starting_balances` are strings such as `"100_000 USD"`, the form the high-level API takes.
+    `starting_balances` are strings such as `"100_000 USD"`, the form the high-level API takes:
+    one balance, in US dollars (`account_balances`).
     """
+    account_balances(starting_balances)
     return BacktestVenueConfig(
         name=str(VENUE),
         starting_balances=list(starting_balances),

@@ -73,11 +73,13 @@ from nautilus_trader.model import Venue
 
 import canon_trading.backtest
 from canon_trading.backtest import BacktestRun
+from canon_trading.backtest import account_balances
 from canon_trading.backtest import backtest_run_config
 from canon_trading.backtest import built_backtest
 from canon_trading.backtest import run_backtest
 from canon_trading.backtest import run_backtest_config
 from canon_trading.backtest import run_built
+from canon_trading.backtest import simulated_alpaca_venue
 from canon_trading.ma_cross import MaCross
 from canon_trading.ma_cross import MaCrossConfig
 
@@ -471,6 +473,37 @@ def test_a_node_built_then_run_is_the_whole_run_and_is_disposed_on_leaving(
     assert split.bars == whole.bars
     with pytest.raises(RuntimeError, match="has been disposed"):
         built.node.run()
+
+
+@pytest.mark.parametrize(
+    "balances",
+    [
+        pytest.param(["100000 USD", "50000 EUR"], id="a second currency"),
+        pytest.param(["100000 EUR"], id="another currency alone"),
+        pytest.param(["60000 USD", "40000 USD"], id="the base currency twice"),
+    ],
+)
+def test_a_run_takes_one_balance_in_the_account_s_base_currency(
+    alpaca_bars: AlpacaBars, tmp_path: Path, balances: list[str]
+) -> None:
+    """Antigravity, gate round 8: with a second currency the account's equity is in two, so
+    NautilusTrader's daily returns give nothing and the result falls back to per-position returns,
+    which nothing here said. A run is on one account in US dollars, the currency of every
+    instrument the adapter builds; anything else is refused by name before a venue is configured,
+    for a plain backtest as for a trial."""
+    alpaca_bars.write(tmp_path)
+
+    for refuse in (
+        lambda: simulated_alpaca_venue(balances),
+        lambda: account_balances(balances),
+        lambda: run_backtest(tmp_path, [MaCross(config())], starting_balances=balances),
+    ):
+        with pytest.raises(ValueError, match="are not one balance in USD") as refused:
+            refuse()
+        assert str(balances) in str(refused.value)
+
+    assert account_balances(["100_000 USD"]) == [STARTING_BALANCE]
+    assert account_balances([]) == []  # upstream's to refuse, when the node is built
 
 
 @pytest.mark.parametrize(
