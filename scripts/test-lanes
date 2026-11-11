@@ -904,7 +904,12 @@ check "a checkout path that is a link is refused: exit 1, what it points at unto
 fi
 
 UH="$TMP/un-home"; UA="$TMP/un-agents"
-uninst() { CLAUDE_CONFIG_DIR="$UH" CANON_LAUNCHAGENTS_DIR="$UA" CANON_UNLOAD_SECS=1 CANON_LAUNCHCTL_SECS="${LCS:-30}" "$R/scripts/automation" uninstall > "$TMP/uninstall.out" 2>&1; }
+# uninstall removes the clone only once lockf(1) says no window holds its lock, and refuses where there is no
+# lockf. Where there is none (GitHub's Ubuntu), the removal cases get a stand-in that finds the lock free,
+# named as such; the cases that need a lock held run only with the real one.
+UL=/usr/bin/lockf
+if [ ! -x "$UL" ]; then UL="$B/lockf-finds-it-free"; printf '#!/bin/bash\nexit 0\n' > "$UL"; chmod +x "$UL"; fi
+uninst() { CLAUDE_CONFIG_DIR="$UH" CANON_LAUNCHAGENTS_DIR="$UA" CANON_UNLOAD_SECS=1 CANON_LAUNCHCTL_SECS="${LCS:-30}" CANON_LOCKF="${CANON_LOCKF:-$UL}" "$R/scripts/automation" uninstall > "$TMP/uninstall.out" 2>&1; }
 mkdir -p "$UH/canon/otel" "$UA"; : > "$UH/canon/lanes"; : > "$UH/canon/lanes-watch.sh"; : > "$UA/local.canon.lanes-watch.plist"
 : > "$UA/local.canon.otel-collector.plist"; : > "$UH/canon/otel/config.yaml"; : > "$UH/canon/otel/logs.jsonl"
 : > "$UA/local.canon.paper-session.plist"; : > "$UH/canon/paper-session.sh"
