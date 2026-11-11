@@ -32,7 +32,7 @@ bounded windows; each part below follows the upstream named:
 
 | Part | How | Follows |
 |---|---|---|
-| What fires | A second launchd user agent, `local.canon.paper-session`, installed, reported and removed by `scripts/automation` beside the lane watchdog; every 2100 s, not at load; a firing while the job still runs or the Mac sleeps is missed (launchd.plist(5)) | ADR 0011's launchd agent |
+| What fires | A second launchd user agent, `local.canon.paper-session`, installed, reported and removed by `scripts/automation` beside the lane watchdog; every 2100 s (from 2026-11-11, 600 s after each firing ends: below), not at load; a firing while the job still runs or the Mac sleeps is missed (launchd.plist(5)) | ADR 0011's launchd agent |
 | What runs | `~/.claude/canon/paper-session.sh` makes its own clone, `~/.claude/canon/paper-checkout`, anew at each firing from the `main` the origin has then, detached, keeping only `.venv`, or fails the firing, then runs `mise run paper:session --session auto --minutes 25` there: one window, one node, one process, disposed, its records naming the commit. 25 minutes, with about three of start-up and stop (a regular stop waits its 65 s post-stop delay; an estimate, UNVERIFIED until a window has run), leaves the 300 s gap inside 35 | configure_live_trading: "run nodes as standalone Python scripts or services"; "One LiveNode per process"; actions/checkout's path for a directory it does not reuse (the runner's header) |
 | Which session | `auto` takes the regular session when Alpaca's clock says it is open (`is_open`, which is false on weekends and holidays; UNVERIFIED, the clock page says only "Whether or not the market is open"), the extended one when `EXTENDED_READY` and it is open, and otherwise prints "nothing to run" and exits 0 | Alpaca's paper-trading skill: "always check the clock/calendar endpoint" |
 | A window that dies | It writes `latest.json` as `running` before the node is built and `ok` or `failed: <why>` after, the account check included; a refusal someone must look at (account not flat) is `refused: <why>`, while a skip that clears by itself (the gap, under 575 s of session left, or start-up reads that left too little of the window) exits 0 and keeps the last result. A `running` record past its `stale_after` (70 minutes) is a window that died | No upstream |
@@ -93,6 +93,48 @@ login keychain without a dialog is UNVERIFIED until its first firing. A firing w
   after which status calls it died, and a queued streaming test fails placing nothing. `timeout` is `/usr/bin/timeout`,
   Apple's (signed `com.apple.timeout`, on the sealed system volume of macOS 27.2); which macOS first
   shipped it is UNVERIFIED, and where it is absent the runner, the watchdog and the paper tasks fail.
+* Bad (2026-11-11): a reinstall restarts the interval. Each time `scripts/automation install`
+  reloads this agent, the interval starts again from the load. That holds whether the owner, a
+  coordinator or the maintenance agent (ADR 0065, addition of 2026-11-11) runs the install. Launchd
+  documents no other start for `StartInterval`, so this is UNVERIFIED on real launchd. Install reloads
+  this agent only when its runner or plist changed, or it is not loaded. So only landings that change
+  those, less than the interval apart (35 minutes until 2026-11-11, now 10 after a firing ends), can
+  hold windows off. The maintenance agent does not repeat an
+  install within a day for the same differences at the same origin/main. Its install runs while it holds account B's lock, which a window
+  holds (ADR 0069), so it never unloads a window that is running; a scheduled firing then waits for the
+  lock, at most 900 s.
+
+### The interval counts from a firing's end (2026-11-11)
+
+launchd starts a `StartInterval` job an interval after its last run ended, not after it started. This was
+observed on macOS 27.2.
+
+* **Throwaway agents.** Two agents had a 20 s interval and a 15 s job, one with `ProcessType` Background
+  and one with Standard. Both started every 35 or 36 s.
+* **The real agent.** It was loaded at about 01:14 New York time and first fired at 01:48. That firing's
+  window ended at 02:13:35, and the next firing started at 02:48:36: 2,100 s after the end. Nothing was
+  missed, and the Mac did not sleep.
+* **What launchd.plist(5) says.** It describes `ProcessType` as resource limits only (CPU and I/O
+  throttling), not timer coalescing. The lane watchdog, also Background, kept its 600 s interval from its
+  runs' ends.
+
+So with 2,100 s, windows came about an hour apart: the firing's own length plus 35 minutes.
+
+The interval is now 600 s, the pause after a firing. That is above the 300 s gap, and a 25-minute window
+with its start and stop then comes about every 35 minutes, as decided above. A closed session's firing
+ends in seconds and checks the clock again 10 minutes later: a fresh clone (0.5 s) and one clock call,
+about 144 a day when no session is open where there were about 40, each holding account B's lock for its
+few seconds.
+
+The row's STALE bound (the longest firing plus an interval and 300 s) already assumed this. The row now
+also flags a firing overdue by more than one interval. When the job is not running and nothing has been
+written for two intervals and 300 s, the row is STALE. "Nothing written" covers the firing's stamp,
+heartbeat, record and log, and the plist an install rewrites as it reloads the job, which restarts the
+interval. A sleep that long shows too, as the message says. `scripts/test-lanes` shows the interval and the overdue row, each test failing before
+its change.
+
+UNVERIFIED: that launchd keeps counting from the end on other macOS releases. The page says only "started
+every N seconds".
 
 ### Confirmation
 

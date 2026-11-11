@@ -101,9 +101,9 @@ def instrument_of(label: str) -> str:
 
 def config_of(label: str) -> dict[str, object]:
     """A stored config for the configuration named `label`, in `record_trial`'s three parts, with only
-    the data's filled in as the gate reads it."""
+    the data and the bar type its strategy trades filled in as the gate reads them."""
     return {
-        "strategies": [{"label": label}],
+        "strategies": [{"label": label, "config": {"bar_type": bars_of(label)}}],
         "venue": {},
         "data": {"data_type": "Bar", "bar_types": [bars_of(label)]},
     }
@@ -1222,6 +1222,11 @@ def test_a_digest_that_lacks_a_bar_type_the_run_loads_stops(study: optuna.Study)
         attrs={
             "config": {
                 **config_of("third"),
+                # A strategy on each bar type, as `trial_config` writes a two-instrument trial.
+                "strategies": [
+                    {"config": {"bar_type": bars_of("third")}},
+                    {"config": {"bar_type": "MSFT.ALPACA-1-DAY-LAST-EXTERNAL"}},
+                ],
                 "data": {
                     "data_type": "Bar",
                     "bar_types": [bars_of("third"), "MSFT.ALPACA-1-DAY-LAST-EXTERNAL"],
@@ -1486,6 +1491,50 @@ def test_a_config_not_in_the_form_record_trial_writes_stops(study: optuna.Study)
     number = write(study, "third", THIRD_CLOSE, attrs={"config": data_only})
 
     with pytest.raises(RankingStopped, match=rf"third: #{number} [^\n]*config holds \['data'\]"):
+        rank(study)
+
+
+@pytest.mark.parametrize(
+    "strategies",
+    [
+        [{"label": "third", "config": {"bar_type": bars_of("third")}}],
+        [],
+        "MaCross",
+        [{"label": "third"}],
+        [
+            {"label": "other", "config": {"bar_type": bars_of("other")}},
+            {"label": "third", "config": {"bar_type": bars_of("third")}},
+        ],
+    ],
+    ids=["another instrument", "none", "not a list", "no bar type", "one more"],
+)
+def test_a_config_whose_strategies_trade_other_bars_than_its_data_loads_stops(
+    study: optuna.Study, strategies: object
+) -> None:
+    """A fifth-round reader (Muse): a record whose strategies trade one instrument and whose data and
+    digest name another, rehashed to its key, passed at DSR 0.98849. `trial_config` writes the data's
+    bar types from the strategies' own, one per instrument, so no record of its writer differs."""
+    write(study, "pick", PICK)
+    write(study, "second", SECOND)
+    mixed = {**config_of("other"), "strategies": strategies}
+    number = write(
+        study, "third", THIRD_CLOSE, attrs={"config": mixed, "data_digest": digest_of("other")}
+    )
+
+    with pytest.raises(RankingStopped, match=rf"third: #{number} [^\n]*strategies trade"):
+        rank(study)
+
+
+def test_a_config_loading_one_bar_type_twice_stops(study: optuna.Study) -> None:
+    """A fifth-round reader (Muse): a bar type named twice in the data passed; `trial_config` names
+    each once."""
+    write(study, "pick", PICK)
+    write(study, "second", SECOND)
+    twice = config_of("third")
+    twice["data"] = {"data_type": "Bar", "bar_types": [bars_of("third")] * 2}
+    number = write(study, "third", THIRD_CLOSE, attrs={"config": twice})
+
+    with pytest.raises(RankingStopped, match=rf"third: #{number} [^\n]*strategies trade"):
         rank(study)
 
 

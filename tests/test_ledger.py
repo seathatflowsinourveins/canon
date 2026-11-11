@@ -1757,6 +1757,22 @@ def test_a_sample_ending_on_a_day_with_no_bar_is_refused_before_a_trial(
     assert study.trials == []
 
 
+def test_a_sample_holding_no_bar_is_refused_before_a_trial(
+    alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack
+) -> None:
+    """A fifth-round reader (Muse): a weekend inside the catalog's window, Sunday noon to Monday noon
+    New York, holds no bar, so the end check was skipped and the run was recorded as an idle trial,
+    its key counted in N, where ADR 0041 term 1 refuses such a sample before a trial."""
+    alpaca_bars.write(tmp_path / "catalog")
+    study = new_study(
+        stack, tmp_path, "weekend", start="2025-03-16T12:00-04:00", end="2025-03-17T12:00-04:00"
+    )
+
+    with pytest.raises(ValueError, match="holds no bar"):
+        record_trial(study, tmp_path / "catalog", [strategy()], starting_balances=BALANCES)
+    assert study.trials == []
+
+
 def test_an_instrument_s_digest_holds_the_precision_of_its_currency(
     alpaca_bars: AlpacaBars,
 ) -> None:

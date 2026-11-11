@@ -1,0 +1,457 @@
+#!/bin/bash
+# test-maintenance — offline checks of the maintenance agent, home/.claude/canon/maintenance.sh, and of what
+# scripts/automation does for it and for the OmniRoute gateway agent (ADR 0065, dated addition of 2026-11-11;
+# ADR 0056). Everything runs in a temporary folder with HOME and CLAUDE_CONFIG_DIR pointed there:
+#   * the agent runs as launchd runs it, with no environment but HOME and CLAUDE_CONFIG_DIR, on a clone of a
+#     local bare origin, with stand-ins for both installers (scripts/automation and scripts/bootstrap in the
+#     clone), launchctl, mise, `claude` and `agy`, and getconf naming a temporary folder for the paper locks;
+#   * a stand-in launchctl that kills the job's process group at its bootout, as launchd kills a job, so the
+#     reinstall the agent starts must outlive both its own job's bootout and the end of its round;
+#   * the real scripts/automation, rehearsed with AUTOMATION_SKIP_LAUNCHD=1 or the stand-in launchctl, for the
+#     plists, `differs` and the status rows.
+# Nothing outside the temporary folder is read or changed, and nothing reaches the network. Needs macOS's
+# lockf(1), timeout(1) and plutil(1); without them it says so and skips. Exit 0 if every case passes.
+# shellcheck disable=SC2016,SC2034  # stub bodies and eval'd checks are single-quoted: they expand, and read the variables set before them, when they run
+set -uo pipefail
+# shellcheck disable=SC2046  # one variable name per word
+unset $(git rev-parse --local-env-vars)
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/canon-test-maintenance.XXXXXX") \
+  || { echo "test-maintenance: could not create a temp folder under ${TMPDIR:-/tmp}" >&2; exit 1; }
+TMP=$(cd "$TMP" && pwd)   # TMPDIR ends in a slash; the scripts name paths as pwd(1) gives them
+HOLDERS=""
+cleanup() { local p; for p in $HOLDERS; do kill "$p" 2>/dev/null; done; rm -rf "${TMP:?}"; }
+trap cleanup EXIT
+GIT_CEILING_DIRECTORIES=$(cd "$TMP/.." && pwd -P); export GIT_CEILING_DIRECTORIES
+pass=0; fail=0
+t_pass() { pass=$((pass+1)); echo "  pass  $1"; }
+t_fail() { fail=$((fail+1)); echo "  FAIL  $1"; }
+check()  { local label="$1"; shift; if "$@"; then t_pass "$label"; else t_fail "$label"; fi; }
+jqt()    { jq -e "$2" "$1" >/dev/null 2>&1; }
+rowis()  { grep -Eq "^  $2 +$3( |\$)" "$1"; }
+for t in /usr/bin/lockf /usr/bin/timeout /usr/bin/plutil /usr/bin/jq; do
+  [ -x "$t" ] || { echo "test-maintenance: skip (no $t here; macOS only)"; echo "test-maintenance: 0 passed, 0 failed, 1 skipped"; exit 0; }
+done
+
+H="$TMP/home"; AH="$H/.claude"; W="$AH/canon/watch"; mkdir -p "$H/.local/bin" "$W"
+B="$TMP/bin"; STUB="$TMP/stub"; LT="$TMP/user-tmp/"; mkdir -p "$B" "$STUB" "$LT"
+export STUB
+# ---------- stand-ins ----------
+cat > "$B/getconf" <<EOF
+#!/bin/bash
+echo "$LT"
+EOF
+# mise: logs; `which agy` names the agy stand-in when there is one; `where npm:omniroute` says installed when
+# $STUB/omniroute-installed exists; `which otelcol` names the otelcol stand-in
+cat > "$B/mise" <<'EOF'
+#!/bin/bash
+echo "mise $* | env=${MISE_ENV:-}" >> "$STUB/mise.log"
+case "$1 ${2:-}" in
+  "which agy") [ -x "$STUB/agy" ] && { echo "$STUB/agy"; exit 0; }; exit 1 ;;
+  "which otelcol") echo "$STUB/otelcol"; exit 0 ;;
+  "where npm:omniroute") [ -f "$STUB/omniroute-installed" ] && { echo "$STUB/omniroute"; exit 0; }
+                         [ -f "$STUB/omniroute-unknown" ] && { echo "mise ERROR could not read the config" >&2; exit 1; }
+                         echo "mise ERROR npm:omniroute not installed" >&2; exit 1 ;;
+esac
+exit 0
+EOF
+# launchctl: a job is loaded while $STUB/loaded/<label> exists. bootout of a job whose process group is in
+# $STUB/pgid-<label> sends that group SIGTERM, as launchd ends a job (launchd.plist(5), AbandonProcessGroup)
+cat > "$B/launchctl" <<'EOF'
+#!/bin/bash
+echo "launchctl $*" >> "$STUB/launchctl.log"
+mkdir -p "$STUB/loaded"
+case "${1:-}" in
+  print) [ -f "$STUB/loaded/${2##*/}" ] || exit 113; printf '\tstate = %s\n\tlast exit code = 0\n' "$(cat "$STUB/loaded/${2##*/}")" ;;
+  bootout) l=${2##*/}; [ -f "$STUB/loaded/$l" ] || { echo "Boot-out failed: 3: No such process" >&2; exit 3; }
+           if [ -f "$STUB/pgid-$l" ]; then kill -TERM -- "-$(cat "$STUB/pgid-$l")" 2>/dev/null; fi
+           rm -f "$STUB/loaded/$l" ;;
+  bootstrap) l=$(basename "${3:-}" .plist); [ ! -f "$STUB/loaded/$l" ] || { echo "Bootstrap failed: 5: Input/output error" >&2; exit 5; }
+             echo running > "$STUB/loaded/$l" ;;
+  list) ;;
+esac
+exit 0
+EOF
+printf '#!/bin/bash\necho "otelcol $*" >> "$STUB/otelcol.log"\nexit 0\n' > "$STUB/otelcol"
+# takelock <file>: a stand-in window takes the paper lock for 4 s; returns once it is held
+cat > "$STUB/takelock" <<'EOF'
+#!/bin/bash
+/usr/bin/lockf -k "$1" sleep 4 >/dev/null 2>&1 &
+for _ in $(seq 1 100); do /usr/bin/lockf -t 0 "$1" true 2>/dev/null || exit 0; sleep 0.05; done
+exit 1
+EOF
+chmod +x "$STUB/takelock"
+# claude and agy: log `update`; $STUB/<name>-rc is the exit code, $STUB/<name>-hangs makes it hang
+for n in claude agy; do
+  cat > "$STUB/$n" <<EOF
+#!/bin/bash
+echo "$n \$*" >> "\$STUB/updates.log"
+[ ! -f "\$STUB/$n-hangs" ] || sleep 60
+[ ! -f "\$STUB/$n-takes-lock" ] || "\$STUB/takelock" "\$(cat "\$STUB/$n-takes-lock")"
+echo "$n: updated (stand-in)"
+exit "\$(cat "\$STUB/$n-rc" 2>/dev/null || echo 0)"
+EOF
+done
+chmod +x "$B"/* "$STUB/otelcol" "$STUB/claude" "$STUB/agy"
+ln -s "$STUB/claude" "$H/.local/bin/claude"
+
+# ---------- the main checkout: a clone of a local bare origin, with stand-in installers ----------
+O="$TMP/origin.git"; OW="$TMP/origin-work"; R="$TMP/main-checkout"
+git init -q --bare -b main "$O" && git init -q -b main "$OW"
+mkdir -p "$OW/scripts"
+# scripts/automation stand-in: differs prints $STUB/differs-out and exits $STUB/differs-rc; install logs, ends
+# its own job as the real one would when the maintenance plist changed (bootout, then bootstrap of all five
+# labels), sleeps $STUB/install-secs, and exits $STUB/install-rc with $STUB/install-out
+cat > "$OW/scripts/automation" <<'EOF'
+#!/bin/bash
+echo "automation $* | pgid=$(ps -o pgid= -p $$ | tr -d ' ') | cfg=${CLAUDE_CONFIG_DIR:-}" >> "$STUB/installers.log"
+case "$1" in
+  differs) [ ! -f "$STUB/differs-takes-lock" ] || "$STUB/takelock" "$(cat "$STUB/differs-takes-lock")"
+           cat "$STUB/differs-out" 2>/dev/null; exit "$(cat "$STUB/differs-rc" 2>/dev/null || echo 0)" ;;
+  mark-user-config) exit 0 ;;
+  install)
+    # whether each paper lock is held while install runs (the round's reinstall holds the windows' alone);
+    # -k keeps the file, which the round has open
+    t=$("$CANON_GETCONF" DARWIN_USER_TEMP_DIR 2>/dev/null)
+    for f in paper-windows paper-test alpaca-stream; do
+      if /usr/bin/lockf -k -t 0 "${t}canon-$f.lock" true 2>/dev/null; then echo "install: $f lock free" >> "$STUB/installers.log"
+      else echo "install: $f lock held" >> "$STUB/installers.log"; fi
+    done
+    d="gui/$(id -u)"
+    for l in local.canon.maintenance local.canon.lanes-watch local.canon.paper-session local.canon.otel-collector local.canon.omniroute; do
+      launchctl bootout "$d/$l" 2>/dev/null
+      sleep "$(cat "$STUB/install-secs" 2>/dev/null || echo 0)"
+      launchctl bootstrap "$d" "$HOME/Library/LaunchAgents/$l.plist"
+    done
+    cat "$STUB/install-out" 2>/dev/null
+    echo "install finished" >> "$STUB/installers.log"
+    exit "$(cat "$STUB/install-rc" 2>/dev/null || echo 0)" ;;
+esac
+exit 2
+EOF
+cat > "$OW/scripts/bootstrap" <<'EOF'
+#!/bin/bash
+echo "bootstrap $*" >> "$STUB/installers.log"
+[ ! -f "$STUB/bootstrap-hangs" ] || sleep 60
+cat "$STUB/bootstrap-out" 2>/dev/null
+exit "$(cat "$STUB/bootstrap-rc" 2>/dev/null || echo 0)"
+EOF
+chmod +x "$OW/scripts/automation" "$OW/scripts/bootstrap"; echo 1 > "$OW/tracked"
+ocommit() { git -C "$OW" add -A && git -C "$OW" -c user.name=t -c user.email=t@example.com commit -qm "$1" && git -C "$OW" push -q "$O" HEAD:main; }
+ocommit first
+git clone -q "$O" "$R"
+git -C "$R" config user.name t; git -C "$R" config user.email t@example.com
+
+MS="$W/maintenance-status.json"; MU="$W/maintenance-updates.json"
+# round: one round as launchd runs it, in a process group of its own (as a launchd job is), whose id the
+# stand-in launchctl kills at the job's bootout; once the round exits, launchd's kill of what is left of the
+# group (no AbandonProcessGroup) is done too, the worst case
+round() {
+  : > "$TMP/round.out"
+  set -m
+  env -i HOME="$H" CLAUDE_CONFIG_DIR="$AH" STUB="$STUB" CANON_GETCONF="$B/getconf" \
+      CANON_MAINTENANCE_FETCH_SECS="${FETCH_SECS:-30}" CANON_MAINTENANCE_STEP_SECS="${STEP_SECS:-30}" \
+      CANON_MAINTENANCE_UPDATE_SECS="${UPDATE_SECS:-30}" \
+      /bin/bash "$ROOT/home/.claude/canon/maintenance.sh" "$R" "$B/mise" >> "$TMP/round.out" 2>&1 &
+  local p=$!
+  set +m
+  echo "$p" > "$STUB/pgid-local.canon.maintenance"
+  wait "$p"; RC=$?; ROUNDPG=$p; export RC ROUNDPG
+  kill -KILL -- "-$p" 2>/dev/null
+  rm -f "$STUB/pgid-local.canon.maintenance"
+  return 0
+}
+# settled: wait, at most 30 s, for a reinstall the round started to report
+# freed <lock file>: true once the lock is free, polled for up to 5 s (-k keeps the file)
+freed() { local i; for i in $(seq 1 50); do /usr/bin/lockf -k -t 0 "$1" true 2>/dev/null && return 0; sleep 0.1; done; return 1; }
+settled() { local i; for i in $(seq 1 60); do jqt "$MS" '.install == null or .install.state != "started"' && return 0; sleep 0.5; done; return 1; }
+logs_clear() { : > "$STUB/installers.log"; : > "$STUB/updates.log"; : > "$STUB/mise.log"; : > "$STUB/launchctl.log"; }
+head_is_origin() { [ "$(git -C "$R" rev-parse HEAD)" = "$(git -C "$O" rev-parse main)" ]; }
+
+echo "maintenance rounds:"
+logs_clear; echo 2 > "$OW/tracked"; ocommit second
+round
+check "fast-forward: the checkout on main, clean and behind, is brought to origin/main" \
+      eval '[ "$RC" = 0 ] && head_is_origin && jqt "$MS" ".ff | startswith(\"fast-forwarded \")"'
+check "... it asked what differs from the tree, from the checkout" grep -q '^automation differs ' "$STUB/installers.log"
+check "... nothing differed: no installer ran, the record says ok and nothing installed" \
+      eval '! grep -Eq "^(bootstrap|automation install)" "$STUB/installers.log" && jqt "$MS" ".outcome == \"ok\" and .found == [] and .installed == [] and .failed == []"'
+check "... each step logged" eval 'grep -q "(a) fast-forwarded" "$TMP/round.out" && grep -q "(b) compare" "$TMP/round.out" && grep -q "(c) runtime updates" "$TMP/round.out"'
+check "... the daily updates ran: claude update and agy update, nothing else" \
+      eval '[ "$(cat "$STUB/updates.log")" = "$(printf "claude update\nagy update")" ] && jqt "$MU" ".results == [\"claude: claude: updated (stand-in)\", \"agy: agy: updated (stand-in)\"]"'
+check "... Codex, Muse Code, DeepSeek Harness and dsh-tui left alone, said once in the log" \
+      eval '! grep -Eiq "codex|dsh|muse" "$STUB/mise.log" "$STUB/updates.log" && [ "$(grep -c "Codex, Muse Code, DeepSeek Harness and dsh-tui are not updated here" "$TMP/round.out")" = 1 ]'
+
+logs_clear; round
+check "nothing differs, at origin/main: no installer, no update within the day" \
+      eval 'jqt "$MS" ".ff | startswith(\"at origin/main \")" && [ ! -s "$STUB/updates.log" ] && ! grep -Eq "^(bootstrap|automation install)" "$STUB/installers.log" && grep -q "ran less than a day ago" "$TMP/round.out"'
+
+# a tracked change: skipped, nothing fetched or merged, the tree's state left as it is
+echo 3 > "$OW/tracked"; ocommit third; echo dirty > "$R/tracked"; logs_clear; round
+check "skipped on a dirty tree: SKIPPED, HEAD not moved, the change kept, no compare" \
+      eval '[ "$RC" = 0 ] && ! head_is_origin && [ "$(cat "$R/tracked")" = dirty ] && jqt "$MS" ".outcome == \"skipped\" and (.ff | test(\"tracked changes\"))" && ! grep -q differs "$STUB/installers.log"'
+git -C "$R" checkout -q -- tracked
+git -C "$R" checkout -q -b other; logs_clear; round
+check "skipped on another branch: SKIPPED naming it, no branch switched" \
+      eval 'jqt "$MS" ".outcome == \"skipped\" and .ff == \"skipped: the checkout is on other, not main\"" && [ "$(git -C "$R" symbolic-ref --short HEAD)" = other ] && ! grep -q differs "$STUB/installers.log"'
+git -C "$R" checkout -q main
+git -C "$R" fetch -q origin && git -C "$R" merge -q --ff-only origin/main
+git -C "$R" commit -q --allow-empty -m local; logs_clear; round
+check "skipped when main has a commit origin lacks: nothing reset" \
+      eval 'jqt "$MS" ".outcome == \"skipped\" and (.ff | test(\"commits origin/main lacks\"))" && [ "$(git -C "$R" log -1 --format=%s)" = local ]'
+git -C "$R" reset -q --hard origin/main 2>/dev/null; git -C "$R" merge -q --ff-only origin/main
+
+# the settings step
+printf 'user-config: the settings sources changed since the last settings step\n' > "$STUB/differs-out"; echo 1 > "$STUB/differs-rc"
+printf '  EXISTS     %s/settings.json differs; wrote settings.json.canon-proposed beside it. Merge by hand.\n' "$AH" > "$STUB/bootstrap-out"
+logs_clear; round
+check "installer run: bootstrap --user-config for a settings difference, then the step recorded" \
+      eval 'grep -q "^bootstrap --user-config" "$STUB/installers.log" && grep -q "^automation mark-user-config" "$STUB/installers.log" && jqt "$MS" ".installed == [\"bootstrap --user-config\"] and .outcome == \"ok\" and (.found | length) == 1"'
+check "... with the config folder the plist names, and a file left to merge said" \
+      eval 'grep -q "^bootstrap --user-config.*" "$STUB/installers.log" && grep -q "cfg=$AH" "$STUB/installers.log" && jqt "$MS" ".note | test(\"left for the owner to merge: .*settings.json\")"'
+check "... and no automation install for it" eval '! grep -q "^automation install" "$STUB/installers.log"'
+echo 1 > "$STUB/bootstrap-rc"; logs_clear; round
+check "installer failed: FAILED naming it, the step not recorded as applied" \
+      eval 'jqt "$MS" ".outcome == \"failed\" and .failed == [\"bootstrap --user-config (exit 1)\"]" && ! grep -q mark-user-config "$STUB/installers.log"'
+rm -f "$STUB/bootstrap-rc" "$STUB/bootstrap-out"
+
+# the reinstall the agent starts: it unloads the agent's own job (whose process group the stand-in launchctl
+# kills) and the round's group is killed once it ends; the reinstall must still finish and load all five
+mkdir -p "$STUB/loaded"
+for l in local.canon.maintenance local.canon.lanes-watch local.canon.paper-session local.canon.otel-collector local.canon.omniroute; do echo running > "$STUB/loaded/$l"; done
+printf 'automation: %s/Library/LaunchAgents/local.canon.maintenance.plist differs from what install writes\n' "$H" > "$STUB/differs-out"
+echo 1 > "$STUB/install-secs"; logs_clear; s0=$(date +%s); round; took=$(( $(date +%s) - s0 ))
+check "the reinstall started by the agent: the round ends at once (${took} s) with the reinstall running" \
+      eval '[ "$RC" = 0 ] && [ "$took" -lt 4 ] && grep -q "the reinstall runs on as process" "$TMP/round.out"'
+settled
+check "... it completes, though its own job was booted out and the round's process group killed" \
+      eval 'grep -q "^install finished" "$STUB/installers.log" && jqt "$MS" ".install.state == \"done\" and (.installed | index(\"automation install\")) != null"'
+check "... and leaves all five agents loaded" \
+      eval '[ "$(ls "$STUB/loaded" | wc -l | tr -d " ")" = 5 ]'
+check "... holding the windows' lock while it installs, so no window starts meanwhile, and no other paper lock" \
+      eval 'grep -qx "install: paper-windows lock held" "$STUB/installers.log" && grep -qx "install: paper-test lock free" "$STUB/installers.log" && grep -qx "install: alpaca-stream lock free" "$STUB/installers.log"'
+check "... and letting it go once it ends" freed "${LT}canon-paper-windows.lock"
+jpg=$(grep -m1 'bootout.*local.canon.maintenance' "$STUB/launchctl.log" >/dev/null && echo seen)
+ipg=$(sed -n 's/^automation install | pgid=\([0-9]*\).*/\1/p' "$STUB/installers.log"); export ipg
+check "... in a process group of its own, which the job's bootout did not reach (bootout ${jpg:-not seen})" \
+      eval '[ -n "$ipg" ] && [ "$ipg" != "$ROUNDPG" ] && [ "$jpg" = seen ] && ! grep -q "Boot-out failed" "$STUB/launchctl.log"'
+check "... and the record keeps it as the last change" jqt "$MS" '.last_change.installed == ["automation install"]'
+rm -f "$STUB/install-secs" "$STUB/differs-out"; round
+check "... and once nothing differs, the install it tried is forgotten" jqt "$MS" '.tried == null and .outcome == "ok"'
+printf 'automation: %s/Library/LaunchAgents/local.canon.maintenance.plist differs from what install writes\n' "$H" > "$STUB/differs-out"
+printf 'install: FAILED (exit 1):\n  FAILED: could not install %s/.claude/canon/lanes\n' "$H" > "$STUB/install-out"; echo 1 > "$STUB/install-rc"
+logs_clear; round; settled
+check "an automation install that fails: FAILED, naming what install repeated after its table" \
+      eval 'jqt "$MS" ".outcome == \"failed\" and .install.state == \"failed\" and (.failed | index(\"could not install '"$H"'/.claude/canon/lanes\")) != null"'
+rm -f "$STUB/install-out" "$STUB/install-rc"
+logs_clear; round
+check "the same differences again within a day: install not repeated, FAILED saying so (each install restarts the paper interval)" \
+      eval '! grep -q "^automation install" "$STUB/installers.log" && jqt "$MS" ".outcome == \"failed\" and (.failed | map(test(\"^automation install not repeated\")) | any)"'
+jq '.tried.at_epoch -= 86401' "$MS" > "$MS.t" && mv "$MS.t" "$MS"; logs_clear; round; settled
+check "... a day later: repeated" grep -q "^automation install" "$STUB/installers.log"
+logs_clear; round
+check "... and not again after it finished, at the same origin/main" eval '! grep -q "^automation install" "$STUB/installers.log"'
+echo 3b > "$OW/tracked"; ocommit same-file-again; logs_clear; round; settled
+check "the same differences at a new origin/main: installed again" eval 'grep -q "^automation install" "$STUB/installers.log" && jqt "$MS" ".tried.commit == \"$(git -C "$O" rev-parse main)\""'
+cp "$STUB/differs-out" "$TMP/differs-out.kept"; echo 'unknown: launchctl did not answer about local.canon.paper-session' > "$STUB/differs-out"; echo 2 > "$STUB/differs-rc"
+round
+check "a compare that failed: FAILED, and the install tried is not forgotten" jqt "$MS" '.outcome == "failed" and .tried != null and (.failed | map(test("^compare: launchctl did not answer")) | any)'
+mv "$TMP/differs-out.kept" "$STUB/differs-out"; echo 1 > "$STUB/differs-rc"
+echo 3c > "$OW/tracked"; ocommit timed-out; echo 1 > "$STUB/install-secs"; logs_clear; STEP_SECS=2 round; settled
+check "an install that timed out: FAILED, timeout named" jqt "$MS" '.install.state == "failed" and .tried.timeout == true and (.failed | index("automation install (timeout after 2 s)")) != null'
+rm -f "$STUB/install-secs"; for l in local.canon.maintenance local.canon.lanes-watch local.canon.paper-session local.canon.otel-collector local.canon.omniroute; do echo running > "$STUB/loaded/$l"; done
+logs_clear; round; settled
+check "... retried at the next round, at the same origin/main" eval 'grep -q "^automation install" "$STUB/installers.log" && jqt "$MS" ".install.state == \"done\""'
+echo 3d > "$OW/tracked"; ocommit window-meanwhile; echo "${LT}canon-paper-windows.lock" > "$STUB/differs-takes-lock"; logs_clear; round
+check "a window that took the paper lock during the compare: the install not started, the next round installs" \
+      eval '! grep -q "^automation install" "$STUB/installers.log" && jqt "$MS" "(.note | test(\"automation install not started: the windows. lock was taken \\\\(canon-paper-windows.lock is held: a paper window runs\\\\)\")) and .install == null"'
+rm -f "$STUB/differs-takes-lock"; sleep 4; logs_clear; round; settled
+check "... and it does" grep -q "^automation install" "$STUB/installers.log"
+echo 3e > "$OW/tracked"; ocommit test-meanwhile; echo "${LT}canon-paper-test.lock" > "$STUB/differs-takes-lock"; logs_clear; round; settled
+check "a paper test that took its lock during the compare: the install runs all the same, since it touches nothing account A uses" \
+      eval 'grep -q "^install finished" "$STUB/installers.log" && grep -qx "install: paper-test lock held" "$STUB/installers.log" && jqt "$MS" ".install.state == \"done\""'
+rm -f "$STUB/differs-takes-lock"; sleep 4
+rm -f "$STUB/differs-out" "$STUB/differs-rc"; round
+
+# the paper lock held, a window's (account B) or a paper test's (account A): nothing at all this round
+echo 4 > "$OW/tracked"; ocommit fourth
+/usr/bin/lockf -k "${LT}canon-paper-windows.lock" sleep 30 & HOLDERS="$HOLDERS $!"; hp=$!; sleep 0.5
+logs_clear; round
+check "a window's lock held: the round is skipped, ok, with nothing fetched, compared, installed or updated" \
+      eval '[ "$RC" = 0 ] && ! head_is_origin && [ ! -s "$STUB/installers.log" ] && [ ! -s "$STUB/updates.log" ] && jqt "$MS" ".outcome == \"waited\" and (.ff | test(\"paper lock is held\"))"'
+check "... and the last change is kept" jqt "$MS" '.last_change.installed == ["automation install"] or .last_change.failed != null'
+kill "$hp" 2>/dev/null; wait "$hp" 2>/dev/null
+for hl in "canon-paper-test.lock:a paper test" "canon-alpaca-stream.lock:a run on the market-data stream"; do
+  /usr/bin/lockf -k "${LT}${hl%%:*}" sleep 30 & HOLDERS="$HOLDERS $!"; hp=$!; sleep 0.5
+  logs_clear; round; export HL="${hl%%:*} is held: ${hl#*:}"
+  check "${hl%%:*} held (${hl#*:}): the round is skipped the same way, naming it" \
+        eval '[ "$RC" = 0 ] && ! head_is_origin && [ ! -s "$STUB/installers.log" ] && [ ! -s "$STUB/updates.log" ] && jqt "$MS" ".outcome == \"waited\" and (.ff | test(\"paper lock is held\")) and (.ff | contains(env.HL))"'
+  kill "$hp" 2>/dev/null; wait "$hp" 2>/dev/null
+done
+# its own lock held (a reinstall still running): nothing, and the record left as it was
+cp "$MS" "$TMP/ms.before"
+/usr/bin/lockf -k "$AH/canon/maintenance.lock" sleep 30 & HOLDERS="$HOLDERS $!"; hp=$!; sleep 0.5
+logs_clear; round
+check "its own lock held: nothing this round, the record unchanged" \
+      eval '[ "$RC" = 0 ] && cmp -s "$MS" "$TMP/ms.before" && [ ! -s "$STUB/installers.log" ] && grep -q "still runs; nothing this round" "$TMP/round.out"'
+kill "$hp" 2>/dev/null; wait "$hp" 2>/dev/null
+
+# timeouts: a fetch that hangs (the origin's upload-pack, git-config(1) remote.<name>.uploadpack), and an
+# installer that hangs
+rm -f "$STUB/differs-out" "$STUB/differs-rc"
+printf '#!/bin/bash\nsleep 60\n' > "$STUB/hang-upload-pack"; chmod +x "$STUB/hang-upload-pack"
+git -C "$R" config remote.origin.uploadpack "$STUB/hang-upload-pack"
+logs_clear; s0=$(date +%s); FETCH_SECS=2 round; took=$(( $(date +%s) - s0 ))
+check "a timeout: a fetch that hangs is stopped at its bound (${took} s), FAILED naming it" \
+      eval '[ "$took" -lt 15 ] && jqt "$MS" ".outcome == \"failed\" and (.failed | index(\"fetch (timeout)\")) != null and (.ff | test(\"did not finish within 2 s\"))"'
+check "... and with origin/main not known, nothing compared or installed" eval '! grep -q differs "$STUB/installers.log"'
+git -C "$R" config --unset remote.origin.uploadpack
+printf 'user-config: x\n' > "$STUB/differs-out"; echo 1 > "$STUB/differs-rc"; : > "$STUB/bootstrap-hangs"
+logs_clear; s0=$(date +%s); STEP_SECS=2 round; took=$(( $(date +%s) - s0 ))
+check "... and an installer that hangs (${took} s): FAILED, timeout named" \
+      eval '[ "$took" -lt 15 ] && jqt "$MS" ".failed == [\"bootstrap --user-config (timeout after 2 s)\"]"'
+rm -f "$STUB/bootstrap-hangs" "$STUB/differs-out" "$STUB/differs-rc"
+
+# the daily updates: due again after a day; one that fails is FAILED; one that hangs is stopped
+jq '.at_epoch -= 86401' "$MU" > "$MU.t" && mv "$MU.t" "$MU"; echo 1 > "$STUB/claude-rc"; logs_clear; round
+check "updates a day later: run again; a failed claude update is FAILED by name, agy still updated" \
+      eval 'grep -q "^claude update" "$STUB/updates.log" && grep -q "^agy update" "$STUB/updates.log" && jqt "$MS" "(.failed | map(test(\"^claude update exited 1\")) | any)"'
+rm -f "$STUB/claude-rc"; jq '.at_epoch -= 86401' "$MU" > "$MU.t" && mv "$MU.t" "$MU"; : > "$STUB/agy-hangs"
+logs_clear; s0=$(date +%s); UPDATE_SECS=2 round; took=$(( $(date +%s) - s0 ))
+check "... an update that hangs is stopped at its bound (${took} s)" \
+      eval '[ "$took" -lt 15 ] && jqt "$MU" "(.results | map(test(\"agy update did not finish within 2 s\")) | any)"'
+rm -f "$STUB/agy-hangs"; mv "$STUB/agy" "$STUB/agy.away"; jq '.at_epoch -= 86401' "$MU" > "$MU.t" && mv "$MU.t" "$MU"; logs_clear; round
+check "... agy not installed: said, not a failure" eval 'jqt "$MU" ".results[1] == \"agy: not installed\"" && jqt "$MS" ".failed == []"'
+mv "$STUB/agy.away" "$STUB/agy"
+jq '.at_epoch -= 86401' "$MU" > "$MU.t" && mv "$MU.t" "$MU"; echo "${LT}canon-paper-windows.lock" > "$STUB/claude-takes-lock"
+echo 5 > "$OW/tracked"; ocommit fifth; logs_clear; round
+check "the updates run with the paper lock let go; a window that took it meanwhile ends the round there" \
+      eval '[ "$RC" = 0 ] && grep -q "^claude update" "$STUB/updates.log" && ! head_is_origin && [ ! -s "$STUB/installers.log" ] && jqt "$MS" ".outcome == \"waited\" and (.ff | test(\"during the updates\"))"'
+rm -f "$STUB/claude-takes-lock"; sleep 4; round
+check "... and the next round goes on" head_is_origin
+jq '.at_epoch -= 86401' "$MU" > "$MU.t" && mv "$MU.t" "$MU"; echo "${LT}canon-paper-test.lock" > "$STUB/claude-takes-lock"
+echo 6 > "$OW/tracked"; ocommit sixth; logs_clear; round
+check "... and so does a paper test that took its lock meanwhile, before the fast-forward" \
+      eval '[ "$RC" = 0 ] && ! head_is_origin && [ ! -s "$STUB/installers.log" ] && jqt "$MS" ".outcome == \"waited\" and (.ff | test(\"during the updates \\\\(canon-paper-test.lock is held\"))"'
+rm -f "$STUB/claude-takes-lock"; sleep 4; round
+
+# ---------- scripts/automation: the plists, differs and the rows ----------
+echo "scripts/automation:"
+A="$TMP/repo"; mkdir -p "$A/scripts" "$A/home/.claude/canon" "$A/home/.codex" "$A/canon" "$A/.githooks"
+cp "$ROOT/scripts/automation" "$ROOT/scripts/lanes" "$ROOT/scripts/bootstrap" "$A/scripts/"
+cp "$ROOT/home/.claude/canon/"*.sh "$A/home/.claude/canon/"; cp -R "$ROOT/home/.claude/canon/otel" "$A/home/.claude/canon/"
+cp "$ROOT/home/.claude/settings.json" "$ROOT/home/.claude/CLAUDE.md" "$A/home/.claude/"; cp "$ROOT/home/.codex/"* "$A/home/.codex/"
+cp "$ROOT/canon/models.json" "$ROOT/mise.gateway.toml" "$A/"; mv "$A/models.json" "$A/canon/"
+printf '#!/bin/bash\nexit 0\n' > "$A/.githooks/pre-commit"; chmod +x "$A/.githooks/pre-commit"
+git -C "$A" init -q -b main && git -C "$A" remote add origin "$O"
+# install's paper step clones the origin; with a local path, its stand-in mise is never run
+LA="$H/Library/LaunchAgents"; MP="$LA/local.canon.maintenance.plist"; GP="$LA/local.canon.omniroute.plist"
+ainst() { env -i HOME="$H" PATH="$B:/usr/bin:/bin:/usr/sbin:/sbin" STUB="$STUB" CLAUDE_CONFIG_DIR="$AH" CANON_GETCONF="$B/getconf" "$@" "$A/scripts/automation" install > "$TMP/inst.out" 2>&1; }
+adiff() { env -i HOME="$H" PATH="$B:/usr/bin:/bin:/usr/sbin:/sbin" STUB="$STUB" CLAUDE_CONFIG_DIR="$AH" CANON_GETCONF="$B/getconf" "$@" "$A/scripts/automation" differs > "$TMP/diff.out" 2>&1; }
+astat() { env -i HOME="$H" PATH="$B:/usr/bin:/bin:/usr/sbin:/sbin" STUB="$STUB" CLAUDE_CONFIG_DIR="$AH" CANON_GETCONF="$B/getconf" CANON_CURL="$B/gwcurl" "$A/scripts/automation" status > "$TMP/stat.out" 2>&1; }
+rm -rf "$STUB/loaded"; logs_clear
+ainst AUTOMATION_SKIP_LAUNCHD=1; rc=$?
+check "rehearsal install: exit 0, the maintenance agent's script installed" \
+      eval '[ "$rc" = 0 ] && cmp -s "$ROOT/home/.claude/canon/maintenance.sh" "$AH/canon/maintenance.sh"'
+margs=""; for i in 0 1 2 3; do margs="$margs|$(plutil -extract "ProgramArguments.$i" raw -o - "$MP" 2>/dev/null)"; done
+check "... its plist: the script on this clone with the mise install found" test "$margs" = "|/bin/bash|$AH/canon/maintenance.sh|$A|$B/mise"
+check "... every 30 minutes, not at load, its process group abandoned, CLAUDE_CONFIG_DIR the install's" \
+      eval '[ "$(plutil -extract StartInterval raw -o - "$MP")" = 1800 ] && [ "$(plutil -extract RunAtLoad raw -o - "$MP")" = false ] && [ "$(plutil -extract AbandonProcessGroup raw -o - "$MP")" = true ] && [ "$(plutil -extract EnvironmentVariables.CLAUDE_CONFIG_DIR raw -o - "$MP")" = "$AH" ]'
+check "... OmniRoute not installed: no gateway agent, said" eval '[ ! -e "$GP" ] && grep -q "skipped    OmniRoute is not installed for this clone" "$TMP/inst.out"'
+: > "$STUB/omniroute-installed"; ainst AUTOMATION_SKIP_LAUNCHD=1; rc=$?
+gargs=""; for i in 0 1 2 3 4; do gargs="$gargs|$(plutil -extract "ProgramArguments.$i" raw -o - "$GP" 2>/dev/null)"; done
+check "OmniRoute installed: the gateway agent runs mise.gateway.toml's own task in this clone" \
+      eval '[ "$rc" = 0 ] && [ "$gargs" = "|$B/mise|-E|gateway|run|omniroute:serve" ] && [ "$(plutil -extract WorkingDirectory raw -o - "$GP")" = "$A" ]'
+check "... kept alive and started at load, with no install by mise and only PATH besides" \
+      eval '[ "$(plutil -extract KeepAlive raw -o - "$GP")" = true ] && [ "$(plutil -extract RunAtLoad raw -o - "$GP")" = true ] && [ "$(plutil -extract EnvironmentVariables.MISE_TASK_RUN_AUTO_INSTALL raw -o - "$GP")" = false ] && [ "$(plutil -extract EnvironmentVariables.PATH raw -o - "$GP")" = /usr/bin:/bin:/usr/sbin:/sbin ]'
+check "... named by a checksum of mise.gateway.toml, so a change to the task changes the plist" \
+      test "$(plutil -extract EnvironmentVariables.CANON_GATEWAY_CONFIG raw -o - "$GP")" = "$(cksum < "$A/mise.gateway.toml" | awk '{ print $1 "-" $2 }')"
+
+# differs, after that install and once the settings step is recorded: nothing
+cp "$ROOT/home/.claude/canon/ledger.sh" "$ROOT/home/.claude/canon/statusline.sh" "$AH/canon/"
+env -i HOME="$H" PATH="$B:/usr/bin:/bin" CLAUDE_CONFIG_DIR="$AH" "$A/scripts/automation" mark-user-config >/dev/null 2>&1
+adiff AUTOMATION_SKIP_LAUNCHD=1; rc=$?
+check "differs right after install and the settings step: nothing, exit 0" eval '[ "$rc" = 0 ] && [ ! -s "$TMP/diff.out" ]'
+echo "# changed on main" >> "$A/home/.claude/canon/lanes-watch.sh"; echo "# changed" >> "$A/mise.gateway.toml"
+adiff AUTOMATION_SKIP_LAUNCHD=1; rc=$?
+check "... a script and the gateway task changed on main: automation lines for each, exit 1" \
+      eval '[ "$rc" = 1 ] && grep -q "^automation: $AH/canon/lanes-watch.sh differs from home/.claude/canon/lanes-watch.sh" "$TMP/diff.out" && grep -q "^automation: $GP differs" "$TMP/diff.out" && ! grep -q "^user-config" "$TMP/diff.out"'
+mkdir -p "$H/.codex"; adiff AUTOMATION_SKIP_LAUNCHD=1
+check "... Codex's folder made since the settings step: a user-config line" grep -q '^user-config: the settings sources' "$TMP/diff.out"
+echo '{}' > "$A/home/.codex/defaults.toml"
+adiff AUTOMATION_SKIP_LAUNCHD=1
+check "... a settings source changed: a user-config line" grep -q '^user-config: the settings sources' "$TMP/diff.out"
+rm -f "$STUB/omniroute-installed"; adiff AUTOMATION_SKIP_LAUNCHD=1
+check "... OmniRoute gone, its agent still written: an automation line, so install removes it" grep -q "^automation: $GP is there, but OmniRoute is not installed" "$TMP/diff.out"
+adiff
+check "... with launchd asked: an agent not loaded is an automation line" grep -q '^automation: local.canon.maintenance is not loaded' "$TMP/diff.out"
+
+: > "$STUB/omniroute-unknown"; adiff AUTOMATION_SKIP_LAUNCHD=1; rc=$?
+check "... mise not saying whether OmniRoute is installed: unknown, exit 2, the agent not called absent" \
+      eval '[ "$rc" = 2 ] && grep -q "^unknown: mise did not say whether OmniRoute is installed" "$TMP/diff.out" && ! grep -q "is there, but" "$TMP/diff.out"'
+mkdir -p "$STUB/loaded"; ainst; rc=$?
+check "... and install keeps the gateway agent as it was, FAILED" \
+      eval '[ "$rc" != 0 ] && [ -f "$GP" ] && grep -q "FAILED: mise did not say whether OmniRoute is installed" "$TMP/inst.out" && ! grep -q "bootout.*omniroute" "$STUB/launchctl.log"'
+rm -f "$STUB/omniroute-unknown"; rm -rf "$STUB/loaded"
+
+# install with launchd (the stand-in): the maintenance agent reloaded only when its plist changed
+mkdir -p "$STUB/loaded"; ainst
+check "an install with launchd: the maintenance agent loaded when it was not" grep -q '^  loaded     local.canon.maintenance' "$TMP/inst.out"
+check "... the gateway's agent removed, OmniRoute being gone" eval '[ ! -e "$GP" ] && grep -q "^  removed    $GP" "$TMP/inst.out"'
+: > "$STUB/omniroute-installed"; ainst; logs_clear; ainst
+check "... and kept, not booted out, when its plist is unchanged" \
+      eval 'grep -q "^  kept       local.canon.maintenance loaded: its plist is unchanged" "$TMP/inst.out" && ! grep -q "bootout.*local.canon.maintenance" "$STUB/launchctl.log"'
+check "... the paper agent kept, its interval running on, with runner and plist unchanged" \
+      eval 'grep -q "^  kept       local.canon.paper-session loaded: its runner and plist are unchanged" "$TMP/inst.out" && ! grep -q "bootout.*local.canon.paper-session" "$STUB/launchctl.log"'
+check "... the collector and the gateway kept running too" \
+      eval 'grep -q "^  kept       local.canon.otel-collector running" "$TMP/inst.out" && grep -q "^  kept       local.canon.omniroute loaded" "$TMP/inst.out" && ! grep -Eq "bootout.*(otel-collector|omniroute)" "$STUB/launchctl.log"'
+echo "# changed" >> "$A/home/.claude/canon/paper-session.sh"; logs_clear; ainst
+check "... and the paper agent reloaded once its runner changed" grep -q "bootout.*local.canon.paper-session" "$STUB/launchctl.log"
+check "... loaded after everything else" eval '[ "$(grep -n "^Maintenance:" "$TMP/inst.out" | cut -d: -f1)" -gt "$(grep -n "^Landing:" "$TMP/inst.out" | cut -d: -f1)" ]'
+
+# the rows
+cp "$ROOT/home/.claude/canon/maintenance.sh" "$A/home/.claude/canon/maintenance.sh"
+now=$(date +%s); at=$(jq -nr --argjson t "$now" '$t | todate')
+rec() { jq -n --arg at "$at" --argjson e "$now" "{at: \$at, at_epoch: \$e, outcome: \"ok\", ff: \"at origin/main 0123456789ab\", found: [], installed: [], failed: [], note: \"\", install: null, last_change: null} $1" > "$MS"; }
+jq -n --arg at "$at" --argjson e "$now" '{at: $at, at_epoch: $e, results: ["claude: ok", "agy: ok"]}' > "$MU"
+rec ''; astat
+check "status: a fresh round with nothing different: ok, saying so" eval 'rowis "$TMP/stat.out" maintenance ok && grep -q "nothing differed from main" "$TMP/stat.out"'
+rec '| .found = ["automation: x differs"] | .installed = ["automation install"] | .install = {state: "done", at_epoch: $e, failed: []}'; astat
+check "... what it found and installed, named" eval 'rowis "$TMP/stat.out" maintenance ok && grep -q "differed: x differs; installed: automation install" "$TMP/stat.out"'
+rec '| .outcome = "failed" | .failed = ["bootstrap --user-config (exit 1)"]'; astat
+check "... a failed step: FAILED by name" eval 'rowis "$TMP/stat.out" maintenance FAILED && grep -q "FAILED: bootstrap --user-config (exit 1)" "$TMP/stat.out"'
+rec '| .outcome = "skipped" | .ff = "skipped: the checkout is on other, not main"'; astat
+check "... the checkout not on main: SKIPPED, saying why" eval 'rowis "$TMP/stat.out" maintenance SKIPPED && grep -q "the checkout is on other, not main" "$TMP/stat.out"'
+rec '| .outcome = "waited" | .ff = "not run: the paper lock is held" | .last_change = {at: "earlier", found: ["automation: y"], installed: ["automation install"], failed: []}'; astat
+check "... the paper lock held: ok, with the last change shown" eval 'rowis "$TMP/stat.out" maintenance ok && grep -q "last change earlier: installed automation install" "$TMP/stat.out"'
+rec '| .install = {state: "started", at_epoch: ($e - 2000)}'; astat
+check "... a reinstall that never reported: FAILED" eval 'rowis "$TMP/stat.out" maintenance FAILED && grep -q "the reinstall it started has not reported" "$TMP/stat.out"'
+rec '| .at_epoch = ($e - 20000)'; astat
+check "... no round for hours: STALE" rowis "$TMP/stat.out" maintenance STALE
+rec '| .at_epoch = ($e - 20000) | .outcome = "skipped" | .ff = "skipped: the checkout is on other, not main"'; astat
+check "... STALE too when the last, hours ago, was skipped" rowis "$TMP/stat.out" maintenance STALE
+rec ''; jq '.results = ["FAILED: claude update exited 1: no network"]' "$MU" > "$MU.t" && mv "$MU.t" "$MU"; astat
+check "... a failed daily update: FAILED, named" eval 'rowis "$TMP/stat.out" maintenance FAILED && grep -q "updates .*FAILED: claude update exited 1" "$TMP/stat.out"'
+rec ''; jq '.results = ["claude: ok", "agy: ok"]' "$MU" > "$MU.t" && mv "$MU.t" "$MU"; echo "# older" >> "$AH/canon/maintenance.sh"; astat
+check "... the installed script not the tree's: OUTDATED" rowis "$TMP/stat.out" maintenance OUTDATED
+cp "$A/home/.claude/canon/maintenance.sh" "$AH/canon/maintenance.sh"
+rm -f "$MS" "$MU"; astat
+check "... no round yet: UNKNOWN, naming when the first comes" eval 'rowis "$TMP/stat.out" maintenance UNKNOWN && grep -q "the first comes 30 minutes after install" "$TMP/stat.out"'
+rm -f "$STUB/loaded/local.canon.maintenance"; astat
+check "... not loaded: OFF" rowis "$TMP/stat.out" maintenance OFF
+# the gateway row: the curl stand-in prints $STUB/gw-code for the gateway's port
+printf '#!/bin/bash\ncase "$*" in *127.0.0.1:20128*) cat "$STUB/gw-code" 2>/dev/null || exit 7 ;; esac\n' > "$B/gwcurl"; chmod +x "$B/gwcurl"
+echo running > "$STUB/loaded/local.canon.omniroute"; printf 401 > "$STUB/gw-code"; astat
+check "gateway row: running and refusing a made-up key: ok" eval 'rowis "$TMP/stat.out" "omniroute gateway" ok && grep -q "its API key required" "$TMP/stat.out"'
+printf 200 > "$STUB/gw-code"; astat
+check "... taking a made-up key: FAILED" eval 'rowis "$TMP/stat.out" "omniroute gateway" FAILED && grep -q "not 401" "$TMP/stat.out"'
+echo waiting > "$STUB/loaded/local.canon.omniroute"; printf 401 > "$STUB/gw-code"; astat
+check "... not running under launchd, yet a gateway answers: UNKNOWN, another copy holding the port" \
+      eval 'rowis "$TMP/stat.out" "omniroute gateway" UNKNOWN && grep -q "another copy of the gateway may hold the port" "$TMP/stat.out"'
+echo running > "$STUB/loaded/local.canon.omniroute"; rm -f "$STUB/gw-code"; astat
+check "... nothing answering: FAILED, naming the log" eval 'rowis "$TMP/stat.out" "omniroute gateway" FAILED && grep -q "omniroute.log" "$TMP/stat.out"'
+rm -f "$GP"; astat
+check "... no agent written: absent, not counted against status" rowis "$TMP/stat.out" "omniroute gateway" absent
+
+echo "test-maintenance: $pass passed, $fail failed"
+[ "$fail" = 0 ]

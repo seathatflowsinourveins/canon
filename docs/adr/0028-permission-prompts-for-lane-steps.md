@@ -210,6 +210,49 @@ Still UNVERIFIED: the real `uv add`, `uv sync`, `uv lock` and `scripts/canon res
 here (stubs and an absent `pyproject.toml` stood in for the commands), quoting beyond the forms above, and
 an Orca session, where its plugin can approve a call (above).
 
+### Standing pre-approval of 2026-11-11: end-to-end automation of what is adopted
+
+The owner's standing instruction of 2026-11-11 pre-approves, as a class, end-to-end automation of what the
+repository has already adopted:
+
+* reinstalling the machine layer and applying settings from main;
+* updating the adopted runtimes;
+* paper end-to-end runs on both paper accounts, at any hour, by a lane, a coordinator or a scheduled
+  agent;
+* simulation runs.
+
+As before, it does not cover:
+
+* entering or creating a credential or an account;
+* anything billed;
+* a tool not yet adopted;
+* repository settings and visibility;
+* anything that touches live trading.
+
+It is honoured without loosening what protects main:
+
+* **The maintenance agent installs only from main** (ADR 0065, addition of 2026-11-11). It runs an
+  installer only when the main checkout is at origin/main with no tracked change. So what it puts on the
+  machine has passed main's checks, independent review and sign-off.
+* **A coordinator in the main checkout may run the installers and the settings step directly**
+  (`scripts/automation install`, `scripts/bootstrap --user-config`), when that checkout is on main at
+  origin/main. That is the same code the agent would install at its next round. It still meets the
+  installers' prompt, which stays the owner's to answer and is not routed around; the pre-approval
+  says the owner expects to answer it yes there.
+* **A worker in its own workspace still does not run an installer from its branch.** Its branch has not
+  passed main's gate, so an install from it would put code no one has reviewed on the machine, under
+  every session's settings. That is why the `ask` rules on the installers stay. Paper runs meet no
+  prompt: `mise run paper:test` and `mise run paper:session` match no `ask` rule.
+
+No permission rule changes. The prompts that remain each guard a step that should not run unasked:
+
+* a re-resolve of every pin, because a pin moves one reviewed change at a time;
+* `uv sync`, because it can rewrite `uv.lock`;
+* the installers, which would run a worker's branch on the machine;
+* a direct push or `gh` write, because landing goes through `scripts/land`, which runs the gate.
+
+A rule cannot tell main's checkout from a worker's (`*` only, see above), so both meet the same prompt.
+
 ## Evidence
 
 Read 2026-11-10. `fetched`: downloaded whole with `curl` and read, not summarised.

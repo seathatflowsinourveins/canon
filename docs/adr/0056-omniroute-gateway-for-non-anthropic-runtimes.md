@@ -193,6 +193,56 @@ checkout. Look at: the answer; `scripts/bootstrap --check` (`omniroute providers
 call log (metadata, no body). Stop if: anything listens beyond 127.0.0.1, an address other than the
 provider's and the start-up lookups above appears, a body is stored, or a request answers without a key.
 
+Confirmation, 2026-11-11, the lead's live run at commit 2847368:
+
+* The locked install confirmed 3.8.53.
+* `omniroute:store` made the storage key into the keychain.
+* `omniroute:serve` listened on 127.0.0.1 only: 20128, 20131 and 20132.
+* `omniroute:setup` turned the dashboard login off and minted a no-log API key into the keychain.
+* `omniroute:check` showed both items, and "running, its API key required".
+* An API call with a made-up key got 401.
+* The dashboard answered 307 to `/dashboard`, then 200 with no login.
+* The bootstrap `omniroute providers` row read: no connections, none Anthropic, API keys only, every key
+  no-log.
+
+### Addition of 2026-11-11: the gateway kept running as a launchd agent
+
+Once OmniRoute is installed for the checkout, `scripts/automation install` writes a fifth launchd user
+agent, `local.canon.omniroute`, beside the paper and maintenance agents. Without OmniRoute installed it
+writes nothing and says so. When mise says it is not installed, install also removes an agent an
+earlier install wrote; when mise gives no clear answer, the agent is kept and install fails. The agent runs mise.gateway.toml's own task, `mise -E gateway run
+omniroute:serve`, from the checkout:
+
+* `KeepAlive`, started at load, with its log in `~/.claude/canon/watch/omniroute.log`.
+* Its environment sets `PATH`, `MISE_TASK_RUN_AUTO_INSTALL=false` ("Install missing tools automatically
+  before tasks run", mise's settings reference) and `CANON_GATEWAY_CONFIG`, which the task does not read.
+  With the first, a missing package should fail instead of being installed unlocked, closing that limit
+  above for the agent (from the reference; not run, UNVERIFIED).
+* `CANON_GATEWAY_CONFIG` is a checksum of `mise.gateway.toml`. A change to the task therefore changes the
+  plist, and the maintenance agent (ADR 0065, addition of 2026-11-11) reinstalls it. A change to its lock
+  alone does not.
+
+The task's settings, the loopback listener and the keychain reads are unchanged: the agent invents none.
+mise passes SIGTERM on to its task (run: `mise run` of a task that `exec`s a sleep, with SIGTERM sent to
+mise, ended the sleep), so a bootout should stop the server (not run against the gateway itself).
+
+The gateway takes no paper lock. `scripts/automation status` gains an `omniroute gateway` row:
+
+* ok when launchd shows the agent running and an inference route refuses a made-up key with 401, as
+  `omniroute:check` asks;
+* FAILED when nothing answers, or when such a key is taken;
+* UNKNOWN when another copy holds the port.
+
+The `scripts/bootstrap --check` version row now gives that probe's answer too, where before it said only
+"the package on disk". A copy started by hand with `omniroute:serve` holds the port, so it must stop
+before the agent's copy can listen. Rule 2's "installed only on request" stands: the agent runs only once
+the package is installed.
+
+UNVERIFIED until the agent runs on this machine:
+
+* that its keychain reads succeed from a launchd job without a dialog;
+* that a stop through launchd leaves no process of the gateway.
+
 ## Evidence
 
 Read 2026-11-10; `fetched`: downloaded and searched, not summarised. Source lines are at `v3.8.53` in a

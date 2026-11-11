@@ -142,7 +142,8 @@ exit 0
 EOF
 printf '#!/bin/bash\necho "osascript $*" >> "$STUB/osascript.log"\n' > "$B/osascript"
 printf '#!/bin/bash\n[ "${1:-}" = -p ] && echo /Library/Developer/CommandLineTools\nexit 0\n' > "$B/xcode-select"
-printf '#!/bin/bash\n[ "${1:-}" = --version ] && { echo "curl stub"; exit 0; }\necho "curl stub: no network in tests" >&2\nexit 1\n' > "$B/curl"
+# curl stub: no network; with $STUB/curl-code, a call to the gateway's port gets that status code
+printf '#!/bin/bash\n[ "${1:-}" = --version ] && { echo "curl stub"; exit 0; }\ncase "$*" in *127.0.0.1:20128*) [ -f "$STUB/curl-code" ] && { cat "$STUB/curl-code"; exit 0; } ;; esac\necho "curl stub: no network in tests" >&2\nexit 1\n' > "$B/curl"
 printf '#!/bin/bash\ncat "$STUB/claude-version"\n' > "$B/claude"   # claude stub: --version from $STUB/claude-version
 # security stub: logs its arguments; find-generic-password succeeds for an account listed in $STUB/keychain,
 # under any service, or listed as <service>/<account> under that one; else it exits 44 as Apple's does for an
@@ -388,7 +389,7 @@ R="$TMP/repo"; AH="$TMP/auto-home"
 mkdir -p "$R/scripts" "$R/.githooks" "$R/.claude/hooks" "$R/.github/workflows" "$R/.canon" "$R/home/.claude/canon" \
          "$AH/scheduled-tasks/canon-landscape-refresh" "$AH/canon/watch"
 cp "$ROOT/scripts/automation" "$ROOT/scripts/lanes" "$R/scripts/"
-cp "$ROOT/home/.claude/canon/lanes-watch.sh" "$ROOT/home/.claude/canon/paper-session.sh" "$R/home/.claude/canon/"
+cp "$ROOT/home/.claude/canon/lanes-watch.sh" "$ROOT/home/.claude/canon/paper-session.sh" "$ROOT/home/.claude/canon/maintenance.sh" "$R/home/.claude/canon/"
 cp -R "$ROOT/home/.claude/canon/otel" "$R/home/.claude/canon/"
 # otelcol stub: logs its arguments and CANON_OTEL_DIR; validate fails when $STUB/otelcol-refuses exists
 cat > "$STUB/otelcol" <<'EOF'
@@ -429,6 +430,10 @@ fired() { # fired <age in seconds>: the stamp the runner writes as each schedule
 }
 paper ok 600; heartbeat 60; fired 60
 cp "$R/home/.claude/canon/paper-session.sh" "$AH/canon/paper-session.sh"   # installed as the tree has it
+# the maintenance agent installed as the tree has it, its last round fresh and ok (scripts/test-maintenance
+# covers its row)
+cp "$R/home/.claude/canon/maintenance.sh" "$AH/canon/maintenance.sh"
+jq -n --arg at "$(iso "$NOW")" --argjson e "$NOW" '{at: $at, at_epoch: $e, outcome: "ok", ff: "at origin/main 0123456789ab", found: [], installed: [], failed: [], note: "", install: null, last_change: null}' > "$AH/canon/watch/maintenance-status.json"
 status() { CLAUDE_CONFIG_DIR="$AH" CANON_PAPER_SESSION_DIR="$PD" CANON_LAUNCHCTL_SECS="${LCS:-30}" "$R/scripts/automation" status > "$TMP/status.out" 2>&1; }
 watchjson 60 true; runs completed '{conclusion: "success"}'
 status; rc=$?
@@ -539,6 +544,28 @@ for hb in '{}' '{"at_epoch": "soon", "outcome": "ok"}' '{"at_epoch": 1}'; do
 done
 heartbeat 60; status; rc=$?
 check "fresh stamp and heartbeat again: ok"       eval 'rowis "$TMP/status.out" "paper session" ok && [ "$rc" = 0 ]'
+# a firing overdue: launchd starts the next one an interval after a firing ends, so with the job not running
+# and nothing of the last firing written for more than an interval and 300 s, the schedule is behind
+# touch(1) -t in UTC, from epoch seconds: BSD date -r, else GNU date -d @
+tstamp() { date -u -r "$1" +%Y%m%d%H%M.%S 2>/dev/null || date -u -d "@$1" +%Y%m%d%H%M.%S; }
+aged() { local t; t=$(tstamp $(( $(date +%s) - $1 ))) && TZ=UTC touch -t "$t" "${@:2}"; }
+# the plist status reads (install rewrites it as it reloads the job), kept aside meanwhile if there is one
+SPP="$HOME/Library/LaunchAgents/local.canon.paper-session.plist"; mkdir -p "${SPP%/*}"; spp_kept=""
+if [ -e "$SPP" ]; then spp_kept="$TMP/spp.kept"; cp -p "$SPP" "$spp_kept"; fi
+aged 900 "$PD/latest.json" "$PD/last-firing.json" "$PD/scheduled-firing.json" "$SPP"; status
+check "the last firing 15 minutes ago, the job not running: not yet overdue (a sleep, or a reload restarting the interval)" \
+      eval '! grep -q "overdue" "$TMP/status.out"'
+aged 1800 "$PD/latest.json" "$PD/last-firing.json" "$PD/scheduled-firing.json" "$SPP"; status; rc=$?
+check "the last firing ended 30 minutes ago, the job not running: STALE, overdue, exit 1" \
+      eval 'rowis "$TMP/status.out" "paper session" STALE && grep -Eq "overdue: nothing from a scheduled firing for 3[0-9] min" "$TMP/status.out" && [ "$rc" != 0 ]'
+aged 1800 "$PD/latest.json" "$PD/last-firing.json" "$PD/scheduled-firing.json"; touch "$SPP"; status
+check "... not when an install has just loaded the job again" eval '! grep -q "overdue" "$TMP/status.out"'
+if [ -n "$spp_kept" ]; then mv "$spp_kept" "$SPP"; else rm -f "$SPP"; fi
+printf '\tstate = running\n\truns = 3\n\tlast exit code = 0\n' > "$STUB/launchctl-print-local.canon.paper-session"; status
+check "... not while the job runs (a firing waiting for the lock, or a window)" eval '! grep -q "overdue" "$TMP/status.out"'
+rm -f "$STUB/launchctl-print-local.canon.paper-session"
+paper ok 600; heartbeat 60; fired 60; status; rc=$?
+check "... and ok again once a firing has written" eval 'rowis "$TMP/status.out" "paper session" ok && [ "$rc" = 0 ]'
 heartbeat -1; status; rc=$?
 check "a heartbeat written within the same second (a negative whole age): ok" \
       eval 'rowis "$TMP/status.out" "paper session" ok && [ "$rc" = 0 ]'
@@ -646,10 +673,14 @@ if command -v plutil >/dev/null 2>&1; then
   check "... the runner installed beside the watchdog" cmp -s "$ROOT/home/.claude/canon/paper-session.sh" "$AH/canon/paper-session.sh"
   check "... and its clone at origin's main, detached, marked as made by it" \
         eval '[ "$(git -C "$CK" rev-parse HEAD)" = "$(git -C "$O" rev-parse main)" ] && ! git -C "$CK" symbolic-ref -q HEAD >/dev/null && [ "$(git -C "$CK" config canon.paperCheckout)" = true ]'
-  # a window, about two minutes of start-up and stop, and session_window.GAP_SECS must fit one interval
-  check "... a 25-minute window, two minutes of start and stop, and the 300 s gap fit 35 minutes" \
-        test $((2100 - 25 * 60 - 120)) -ge 300
-  check "... every 35 minutes"                    test "$(plutil -extract StartInterval raw -o - "$PP")" = 2100
+  # launchd counts StartInterval from the end of the last firing, not its start (observed on macOS 27.2: a
+  # 20 s interval and a 15 s job started every 35 s), so the interval is the pause after a firing: at least
+  # session_window.GAP_SECS, and with a 25-minute window and about two minutes of start-up and stop, a
+  # window every 35 minutes or so
+  piv=$(plutil -extract StartInterval raw -o - "$PP"); pmin=$(plutil -extract ProgramArguments.9 raw -o - "$PP")
+  pgap=$(sed -n 's/^GAP_SECS = \([0-9]*\).*/\1/p' "$ROOT/src/canon_trading/session_window.py")
+  check "... 10 minutes after each firing ends (${piv} s): above session_window's gap (${pgap} s), a ${pmin}-minute window about every 35 minutes" \
+        eval '[ "$piv" = 600 ] && [ -n "$pgap" ] && [ "$piv" -ge "$pgap" ] && [ $((pmin * 60 + 120 + piv)) -le 2300 ]'
   check "... from the automation folder, not a checkout" test "$(plutil -extract WorkingDirectory raw -o - "$PP")" = "$AH/canon"
   check "... not at load"                         test "$(plutil -extract RunAtLoad raw -o - "$PP")" = false
   check "... marked as the schedule's (CANON_PAPER_SCHEDULED=1), which a run by hand is not" \
@@ -701,17 +732,20 @@ if command -v plutil >/dev/null 2>&1; then
   # an install over agents that are running: launchd's bootout returns while each job still stops, and a
   # bootstrap of the same label before it has gone is refused (observed with a throwaway label)
   linst() { CLAUDE_CONFIG_DIR="$AH" CANON_LAUNCHAGENTS_DIR="$TMP/agents" CANON_UNLOAD_SECS="$1" "$R/scripts/automation" install > "$TMP/install.out" 2>&1; }
+  # install keeps a loaded paper or collector agent whose files are unchanged (scripts/test-maintenance);
+  # these cases rehearse the reload, so the plists go first
+  unkeep() { rm -f "$TMP/agents/local.canon.paper-session.plist" "$TMP/agents/local.canon.otel-collector.plist"; }
   mv "$STUB/launchctl-print" "$STUB/kept-print"; : > "$STUB/track-bootstrap"; echo 4 > "$STUB/slow-bootout"
-  for l in local.canon.lanes-watch local.canon.paper-session local.canon.otel-collector; do printf '\tstate = running\n' > "$STUB/launchctl-print-$l"; done
-  : > "$STUB/launchctl.log"; linst 5; rc=$?
-  check "an install over running agents waits for each to stop, then loads it: exit 0, all three loaded" \
-        eval '[ "$rc" = 0 ] && [ "$(grep -c "^  loaded     local.canon" "$TMP/install.out")" = 3 ] && ! grep -q "Bootstrap failed" "$TMP/install.out" && grep -q "state = running" "$STUB/launchctl-print-local.canon.otel-collector"'
+  for l in local.canon.lanes-watch local.canon.paper-session local.canon.otel-collector local.canon.maintenance; do printf '\tstate = running\n' > "$STUB/launchctl-print-$l"; done
+  : > "$STUB/launchctl.log"; unkeep; linst 5; rc=$?
+  check "an install over running agents waits for each to stop, then loads it: exit 0, three loaded, the maintenance agent's unchanged job kept" \
+        eval '[ "$rc" = 0 ] && [ "$(grep -c "^  loaded     local.canon" "$TMP/install.out")" = 3 ] && grep -q "^  kept       local.canon.maintenance loaded: its plist is unchanged" "$TMP/install.out" && ! grep -q "Bootstrap failed" "$TMP/install.out" && grep -q "state = running" "$STUB/launchctl-print-local.canon.otel-collector"'
   # only the collector loaded now, and it does not stop in time
   echo 100 > "$STUB/slow-bootout"; rm -f "$STUB/stopping-"* "$STUB/launchctl-print-local.canon."*; printf '\tstate = running\n' > "$OTL"
-  : > "$STUB/launchctl.log"; linst 1; rc=$?
+  : > "$STUB/launchctl.log"; unkeep; linst 1; rc=$?
   check "... one that does not stop in time: exit 1, nothing new loaded for it, said after the status table" \
         eval '[ "$rc" != 0 ] && grep -q "the earlier local.canon.otel-collector was still stopping after 1 s" "$TMP/install.out" && ! grep -q "bootstrap .*otel-collector.plist" "$STUB/launchctl.log" && grep -q "still stopping" <<<"$(tail -n 3 "$TMP/install.out")" && grep -q "^install: FAILED (exit 1):" "$TMP/install.out"'
-  check "... the other two loaded meanwhile"         test "$(grep -c "^  loaded     local.canon" "$TMP/install.out")" = 2
+  check "... the other three loaded meanwhile"       test "$(grep -c "^  loaded     local.canon" "$TMP/install.out")" = 3
   # the paper agent alone does not stop: said once, nothing booted over it, and (claim of a second reader) its
   # runner, clone and plist not replaced under it, where a firing of the old job would run the new runner
   rm -f "$STUB/stopping-"* "$STUB/launchctl-print-local.canon."*; printf '\tstate = running\n' > "$STUB/launchctl-print-local.canon.paper-session"
@@ -729,7 +763,7 @@ if command -v plutil >/dev/null 2>&1; then
         eval '[ "$rc" != 0 ] && [ "$(grep -c "earlier local.canon.paper-session was still stopping" "$TMP/install.out")" = 2 ] && ! grep -q "bootstrap .*paper-session.plist" "$STUB/launchctl.log"'
   # a bootout launchd refuses outright: said at once, with launchd's message, not after the whole wait
   rm -f "$STUB/slow-bootout" "$STUB/stopping-"* "$STUB/launchctl-print-local.canon."*; printf '\tstate = running\n' > "$OTL"; : > "$STUB/bootout-fails"
-  s0=$(date +%s); linst 30; rc=$?; took=$(( $(date +%s) - s0 )); rm -f "$STUB/bootout-fails"
+  s0=$(date +%s); unkeep; linst 30; rc=$?; took=$(( $(date +%s) - s0 )); rm -f "$STUB/bootout-fails"
   check "... a bootout launchd refuses: exit 1 at once (${took} s), with launchd's message" \
         eval '[ "$rc" != 0 ] && [ "$took" -lt 20 ] && grep -q "launchctl bootout refused local.canon.otel-collector: Boot-out failed: 5" "$TMP/install.out"'
   rm -f "$STUB/launchctl-print-local.canon."*; : > "$STUB/bootstrap-fails"; linst 1; rc=$?
@@ -1305,7 +1339,7 @@ echo "bootstrap:"
 BS="$TMP/bs"; mkdir -p "$BS/scripts" "$BS/canon"; cp "$ROOT/scripts/bootstrap" "$BS/scripts/"; cp -R "$ROOT/home" "$BS/home"; : > "$BS/mise.toml"
 jq -n --arg t "tag:v$CCPIN" '{upstreams: [{id: "claude-code", track: $t}]}' > "$BS/canon/upstreams.json"
 cp "$ROOT/canon/models.json" "$BS/canon/models.json"   # the real lane table: the template's pins are held to it
-bs() { "$BS/scripts/bootstrap" "$@" > "$TMP/bs.out" 2>&1; }
+bs() { CANON_CURL="$B/curl" "$BS/scripts/bootstrap" "$@" > "$TMP/bs.out" 2>&1; }
 C="$TMP/cfg dir"
 : > "$STUB/mise.log"
 bs --check
@@ -1392,6 +1426,15 @@ check "omniroute at the pin: ok, and the exit status is as without it" \
       eval 'rowis "$TMP/bs.out" "omniroute" ok && grep -q "3.8.53; pinned 3.8.53" "$TMP/bs.out" && [ "$rc" = "$rc_none" ]'
 check "... asked through mise's gateway environment, with no install" \
       eval 'grep -q "^omniroute env=gateway --version\$" "$STUB/omniroute.log" && grep "exec -- omniroute" "$STUB/mise.log" > "$TMP/omx" && ! grep -qv "exec_auto_install=false" "$TMP/omx"'
+check "... the gateway not running: said so, naming its agent" \
+      eval 'grep -q "3.8.53; pinned 3.8.53; the gateway is not running (scripts/automation status shows its agent" "$TMP/bs.out" && ! grep -q "not a configured or running gateway" "$TMP/bs.out"'
+printf 401 > "$STUB/curl-code"; bs --check; rc=$?
+check "... the gateway up, refusing a made-up key: ok, saying it runs with its API key required, as omniroute:check does" \
+      eval 'rowis "$TMP/bs.out" "omniroute" ok && grep -q "the gateway is running on 127.0.0.1:20128, its API key required" "$TMP/bs.out" && [ "$rc" = "$rc_none" ]'
+printf 200 > "$STUB/curl-code"; bs --check; rc=$?
+check "... the gateway up, taking a made-up key: FAILED, exit 1" \
+      eval 'rowis "$TMP/bs.out" "omniroute" FAILED && grep -q "answered a made-up key with 200, not 401" "$TMP/bs.out" && [ "$rc" != 0 ]'
+rm -f "$STUB/curl-code"
 echo 3.8.52 > "$STUB/omniroute-version"; bs --check; rc=$?
 check "omniroute at another version than the pin: OTHER, exit 1" eval 'rowis "$TMP/bs.out" "omniroute" OTHER && [ "$rc" != 0 ]'
 echo 'npm error' > "$STUB/omniroute-version"; bs --check; rc=$?
