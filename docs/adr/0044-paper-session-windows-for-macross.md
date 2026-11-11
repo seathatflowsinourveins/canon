@@ -270,6 +270,22 @@ the wind-down's sell at 754.64; each `ok`, exit 0, nothing left, no stream line.
 on with them; no pre-market or after-hours window had run on paper then (the pre-market windows of
 2026-11-11 are in the table above).
 
+2026-11-11, a correction to the warm-up: until then `SessionMaCross.on_historical_bars` fed the history to
+the averages a second time, after upstream's response path had already fed them (`prepare_response`,
+`crates/common/src/python/response.rs` lines 357-363 at `d53849b216e2`, which routes a bar by instrument
+and bar specification whatever its aggregation source, `BarType::id_spec_key`). With fewer history bars
+than `slow_period` the duplicates made the slow average report itself initialized on a doubled window, and
+the first live bar decided on it; the callback now only counts the bars, shown first by a failing test in
+`tests/test_session_window.py` on the `BacktestEngine` harness (five history bars against a slow period of
+eight). The windows recorded here were not affected: each was served at least `slow_period` (20) bars,
+the first pre-market window 525, the overnight windows 25 and 26, and a simple average of period n holds
+only the last n bars it was fed. The second feed was the same bars again, oldest first, so its last 20 (and
+the fast average's last 10) were the bars the first feed had ended on, and the averages' values at the
+first live bar were the same as with one feed. None of their answers was late: the old callback counted
+a late answer's bars as dropped, not as warm-up bars, and each window's warm-up bars were its whole
+answer. A late or out-of-order answer is now fed again in time order with the live bars (the module
+header of `session_ma_cross`).
+
 Code review (`/code-review`, high) of the extended windows: ten findings, each fixed: the market tuple's
 type; the node's log read before its writer had flushed (now after `logging_sync_to_disk`); the record
 claiming a paper run not yet written; a refused subscription ("Cannot subscribe") read as a quiet market;
@@ -309,6 +325,12 @@ Confirmation).
 
 Read 2026-11-10. "raw": fetched with `curl` and read whole. NautilusTrader files at the pin, `d53849b216e2`.
 
+* 2026-11-11, the warm-up fed once: NautilusTrader `crates/common/src/python/response.rs` lines 357-363,
+  `crates/common/src/actor/indicators.rs` lines 171-178 and 241-246, `crates/model/src/data/bar.rs` lines
+  910-921 at `d53849b216e2` (read in the local copy at the pin); `SimpleMovingAverage.reset` in `.venv`
+  (`bundled`). Offline, `tests/test_session_window.py` on the `BacktestEngine` harness: thin and full
+  history fed once, and an answer after a live bar fed again in time order with the live bars; directly,
+  an answer out of order, with a bar twice, overlapping the live bars, or older than the bars taken (run).
 * ADR 0069, 2026-11-10: a second paper account, B, for session windows. It amends "Sharing the account"
   once `paper:session` reads B's pair, with a lock of its own; until then this record stands as written.
 * 2026-11-11: pre-market and after-hours given `sip`, as the lead decided that day, with no fallback to

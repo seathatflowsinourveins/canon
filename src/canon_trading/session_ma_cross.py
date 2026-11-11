@@ -58,11 +58,24 @@ at `d53849b216e2`), sent as a span with no `limit`, since alpaca-py 0.45.0's bar
 default (`alpaca/data/requests.py` line 39 at `c42add7c0a70`) and a limit would keep the oldest bars; the
 adapter pages Alpaca's bars from `start` until every page has arrived (`canon_alpaca.data`), and the averages
 keep the last bars fed.
-One departure: the averages are registered for the live bar type only, and `on_historical_bars` feeds the
-history to them, oldest first, only while no live bar has reached them; a later answer (after a live bar,
-or after `WARM_UP_TIMEOUT_SECS`) is dropped and counted, so older bars never follow newer ones. Decisions
-wait until the request completes or times out (`hydrated`). The live bars stay the `INTERNAL` ones built
-from trades.
+The averages are registered for the live bar type, before the request, and upstream feeds them the
+answer itself: its response path updates the registered indicators before `on_historical_bars` runs
+(`prepare_response`, `crates/common/src/python/response.rs` lines 357-363 at `d53849b216e2`), and routes a
+bar by instrument and bar specification, ignoring the aggregation source (`BarType::id_spec_key`,
+`crates/model/src/data/bar.rs` lines 910-921; `crates/common/src/actor/indicators.rs` lines 171-178 and
+241-246), so the `EXTERNAL` history reaches averages registered for the `INTERNAL` bars, in the order the
+adapter serves it, oldest first. `on_historical_bars` only counts the bars. Decisions wait until the
+request completes or times out (`hydrated`). The live bars stay the `INTERNAL` ones built from trades.
+One departure, for an answer that is not strictly in time order or not newer than every bar the
+averages have taken (one that arrives after a live bar): no callback can stop upstream applying it, older
+bars after newer, so the strategy keeps the last `slow_period` bars the averages have taken (all a
+simple average of that period holds), and `on_historical_bars` then resets the averages
+(`Indicator.reset`) and feeds them again in time order from those bars and the answer's bars older than
+the first live bar, one per `ts_init`; the answer's bars from the first live bar on are dropped and
+counted, as the live bars cover those minutes. An answer after the timeout but before any live bar has
+been applied in order and is kept. Keeping a late answer out of the averages altogether would need them
+registered only once the warm-up has ended, with the history fed by hand meanwhile, which upstream's
+handler example does not do.
 
 **Feed** (`feed`). The quote and trade subscriptions and the warm-up request name it in their params,
 `{"feed": ...}`, Alpaca's own parameter name, as the adapter takes it (ADR 0055); with none they name
@@ -75,12 +88,14 @@ Known limit: the strategy does not know the session calendar (the run checks it 
 
 from __future__ import annotations
 
+from collections import deque
 from datetime import UTC
 from datetime import datetime
 from datetime import timedelta
 from decimal import ROUND_CEILING
 from decimal import ROUND_FLOOR
 from decimal import Decimal
+from itertools import pairwise
 from types import NoneType
 from typing import TYPE_CHECKING
 from typing import Any
@@ -227,6 +242,10 @@ class SessionMaCross(MaCross):
         self.history_bars = 0
         self.history_dropped = 0
         self.live_bars = 0
+        self.taken: deque[Bar] = deque(maxlen=config.slow_period)
+        """The last `slow_period` bars the averages have taken, history or live, oldest first: all that
+        a simple average of that period (and the shorter fast one) holds."""
+        self.first_live_ns: int | None = None
         self.winding_down = False
         self.dropped: list[str] = []
         """Why each dropped signal was dropped, for the run's report."""
@@ -242,13 +261,20 @@ class SessionMaCross(MaCross):
         if instrument is None or self.trade_size.precision > instrument.size_precision:
             super().on_start()  # `MaCross`'s own checks raise, before anything is requested
             return
-        if (
-            self.warm_up
-        ):  # requested before the live subscription, as upstream's handler example does
+        if self.warm_up:  # registered, then requested, then subscribed: upstream's handler example
             self.hydrated = False
             self.history_bars = 0
             self.history_dropped = 0
             self.live_bars = 0
+            self.taken.clear()
+            self.first_live_ns = None
+            self.fast.reset()  # a restarted strategy starts from nothing, as a new window does
+            self.slow.reset()
+            # Upstream updates the averages from the response before `on_historical_bars` runs, so
+            # they are registered before the request; `MaCross.on_start` registers them again below,
+            # which upstream ignores for an indicator already registered for the bar type.
+            self.register_indicator_for_bars(self.bar_type, self.fast)
+            self.register_indicator_for_bars(self.bar_type, self.slow)
             self.request_bars(
                 self.history_bar_type,
                 start=self._warm_up_from(),
@@ -291,17 +317,40 @@ class SessionMaCross(MaCross):
         return max(WARM_UP_SPAN, bars)
 
     def on_historical_bars(self, bars) -> None:
-        """Feed the requested bars to the averages, oldest first, only while no live bar has reached
-        them: the averages are registered for the live bar type alone, so a late answer (after a live
-        bar, or after the timeout) is dropped rather than applied after newer bars."""
-        if self.live_bars or self.hydrated:
-            self.history_dropped += len(bars)
-            self.log.warning(f"Warm-up: {len(bars)} bars arrived after live bars; dropped")
+        """Count the warm-up's bars; upstream has already fed them to the averages, in the order served
+        (module header).
+
+        An answer not strictly in time order, or not newer than every bar the averages have taken (one
+        after a live bar), has been applied with older bars after newer ones, which no callback can
+        stop; the averages are then reset (`Indicator.reset`) and fed again in time order from the bars
+        they had taken and the answer's bars older than the first live bar, one per `ts_init`. The
+        answer's bars from the first live bar on are dropped and counted, since the live bars cover
+        those minutes."""
+        if not bars:
             return
-        for bar in sorted(bars, key=lambda b: b.ts_init):
+        in_order = all(a.ts_init < b.ts_init for a, b in pairwise(bars))
+        if in_order and (not self.taken or bars[0].ts_init > self.taken[-1].ts_init):
+            self.history_bars += len(bars)
+            self.taken.extend(bars)
+            if self.hydrated:
+                self.log.info(f"Warm-up: {len(bars)} bars arrived after the timeout; kept")
+            return
+        first_live = self.first_live_ns
+        older = {b.ts_init: b for b in bars if first_live is None or b.ts_init < first_live}
+        by_time = older | {b.ts_init: b for b in self.taken}
+        self.taken = deque(sorted(by_time.values(), key=lambda b: b.ts_init), self.taken.maxlen)
+        self.fast.reset()
+        self.slow.reset()
+        for bar in self.taken:
             self.fast.handle_bar(bar)
             self.slow.handle_bar(bar)
-        self.history_bars += len(bars)
+        self.history_bars += len(older)
+        self.history_dropped += len(bars) - sum(1 for b in bars if b.ts_init in older)
+        self.log.warning(
+            f"Warm-up: {len(bars)} bars arrived "
+            f"{'after live bars' if self.live_bars else 'out of order or older than those taken'}; "
+            f"averages fed again in time order from the last {len(self.taken)} bars"
+        )
 
     def _on_history_timeout(self, event: TimeEvent) -> None:  # the alert only times it
         if not self.hydrated:
@@ -346,6 +395,9 @@ class SessionMaCross(MaCross):
     def on_bar(self, bar: Bar) -> None:
         if bar.bar_type == self.bar_type:
             self.live_bars += 1  # the averages have already taken this bar
+            self.taken.append(bar)
+            if self.first_live_ns is None:
+                self.first_live_ns = bar.ts_init
         decides = self.hydrated and self.indicators_initialized()
         above = below = False
         if decides:  # an opposite cross clears a dropped signal on any bar, an order working or not
