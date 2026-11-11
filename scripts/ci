@@ -14,6 +14,8 @@
 #   test scripts  every tracked executable scripts/test-*, each as its own check, in name order
 #   workflows     actionlint on .github/workflows/*.yml and *.yaml; a skip line when there are none
 #   pytest        skipped tests are listed under the `ok pytest` line with their reasons
+#   mise configs  before anything runs: a config mise loads from a folder above the checkout (anything but
+#                 the checkout's, the global one and /etc/mise) stops the run, naming the file
 #
 # `uv lock --check` and one `uv run --locked` (which creates the Python environment) run first; then every
 # check runs as a background job writing to its own temp file, and the results are printed in a fixed order.
@@ -32,6 +34,32 @@ STAGED=0; [ "${1:-}" = "--staged" ] && STAGED=1
 if command -v mise >/dev/null 2>&1; then MISE=$(command -v mise)
 elif [ -x "$HOME/.local/bin/mise" ]; then MISE="$HOME/.local/bin/mise"
 else echo "ci: FAIL: mise not found. Run scripts/bootstrap --install."; exit 1; fi
+
+# Only configs this checkout, the user's global mise config or /etc/mise hold may shape the checks. mise
+# reads "config files in every directory from the filesystem root down to the current directory" (mise
+# docs, configuration.md) unless a `ceiling_paths` directory stops it, so a mise.toml (or .tool-versions)
+# in a folder above this checkout would change the tools, env or tasks every check gets, here and nowhere
+# else. Named and refused, not ignored: `mise config ls --json` lists the files in use (`mise help config
+# ls`). This sees folders above the checkout only; a self-test that writes its own config in a temp folder
+# bounds mise there itself (MISE_CEILING_PATHS). The global folder is compared as given and as resolved.
+command -v jq >/dev/null 2>&1 || { echo "ci: FAIL: jq not found; it reads \`mise config ls --json\`. Run scripts/bootstrap --check."; exit 1; }
+if ! MISE_CONFIGS=$("$MISE" config ls --json); then echo "ci: FAIL: \`mise config ls --json\` failed."; exit 1; fi
+GLOBAL_MISE="${MISE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/mise}"
+GLOBAL_MISE="${GLOBAL_MISE%/}"
+GLOBAL_MISE_P=$(cd "$GLOBAL_MISE" 2>/dev/null && pwd -P) || GLOBAL_MISE_P="$GLOBAL_MISE"
+if ! STRAY=$(jq -r --arg r "$ROOT" --arg rp "$(pwd -P)" --arg g "$GLOBAL_MISE" --arg gp "$GLOBAL_MISE_P" \
+       --arg gf "${MISE_GLOBAL_CONFIG_FILE:-}" '.[].path as $p
+       | select(($p == $gf) or ([$r, $rp, $g, $gp, "/etc/mise"] | any(. as $d | $p | startswith($d + "/"))) | not) | $p' \
+       <<<"$MISE_CONFIGS"); then
+  echo "ci: FAIL: could not read the output of \`mise config ls --json\`:"; printf '%s\n' "${MISE_CONFIGS:0:400}"; exit 1
+fi
+if [ -n "$STRAY" ]; then
+  echo "ci: FAIL: mise loads a config from outside this checkout, its global config and /etc/mise:"
+  printf '  %s\n' "$STRAY"
+  echo "  It changes what every check runs. Move it, or, if it serves other projects, set MISE_CEILING_PATHS"
+  echo "  to a folder between it and this checkout (mise's ceiling_paths setting), then run this again."
+  exit 1
+fi
 
 # Load the toolchain once: `mise env -s bash` prints the exports, `mise env --paths` the directories mise
 # manages (both documented in `mise env --help`).
