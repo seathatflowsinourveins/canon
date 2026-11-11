@@ -2,7 +2,9 @@
 # Claude Code SessionStart hook.
 # Contract: https://code.claude.com/docs/en/hooks.md
 #   plain stdout on SessionStart is added to Claude's context (capped at 10,000 characters).
-# Prints at most three short lines. Offline: reads only files in this repo.
+# Prints a few short lines: the pins, ADRs past review-by or proposed, the landscape watch, and a toolchain
+# line only when it has something to say. Offline: reads files in this repo and asks mise for one path,
+# bounded at 3 seconds so the hook's 10 s (.claude/settings.json) is never spent there.
 # Pins, ADRs and the landscape watch result are all read from the tree the session is working in (a
 # worktree has its own canon/, docs/adr/ and .canon/). A watch result is printed only when its `registry`
 # checksum matches that tree's canon/upstreams.json and canon/upstreams.lock.json now, the checksum
@@ -73,5 +75,27 @@ elif [ -f "$watch" ]; then
   ' "$watch" 2>/dev/null || echo "landscape watch: .canon/watch.json is unreadable."
 else
   echo "landscape watch: no result yet; the first check runs in the background now."
+fi
+
+# A toolchain line, only when a bare `python3` in this session is not the toolchain's (mise.toml, through
+# `mise which python3`). An agent Orca starts after a workspace's setup runs under `bash -lc`, whose
+# /etc/profile runs macOS's path_helper, which puts /usr/bin and the other system directories ahead of the
+# mise ones; `mise env` and `mise exec -- bash -c ...` leave that order as it is (observed with mise
+# 2026.11.5), and scripts/ci puts the toolchain first for its own checks only. Neither python3 is run. The
+# same file reached another way (a .venv's python3 links to the toolchain's) or mise's shim counts as the
+# toolchain's. perl's alarm bounds the mise call, as in canon-watch.sh.
+real() { (cd -P "$(dirname "$1")" 2>/dev/null && f=$(basename "$1") && while [ -L "$f" ]; do
+           l=$(readlink "$f"); cd -P "$(dirname "$l")" 2>/dev/null || exit 1; f=$(basename "$l"); done
+           echo "$(pwd -P)/$f"); }
+if mise_bin=$(command -v mise 2>/dev/null) || { [ -x "$HOME/.local/bin/mise" ] && mise_bin="$HOME/.local/bin/mise"; }; then
+  have=$(command -v python3 2>/dev/null) || have=""
+  if ! want=$(cd "$root" && MISE_EXEC_AUTO_INSTALL=false perl -e 'alarm 3; exec @ARGV' "$mise_bin" which python3 2>/dev/null) \
+     || [ -z "$want" ]; then
+    echo "toolchain: \`mise which python3\` gave no answer here within 3 s, so which python3 this session runs is unchecked; see scripts/bootstrap --check."
+  elif [ -z "$have" ] || { [ "$(real "$have")" != "$(real "$want")" ] && [ "$have" != "${MISE_DATA_DIR:-$HOME/.local/share/mise}/shims/python3" ]; }; then
+    echo "toolchain: python3 on this session's PATH is ${have:-missing}, not the toolchain's $want. scripts/ci puts the toolchain first for its checks; for anything else, name the tool to mise (mise exec -- python3 ...) or use uv run --locked."
+  fi
+else
+  echo "toolchain: mise not found on PATH or at ~/.local/bin/mise; run scripts/bootstrap --install."
 fi
 exit 0

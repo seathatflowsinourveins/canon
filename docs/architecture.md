@@ -154,3 +154,33 @@ daily bars (ADR 0048).
   Once installed, a paper session window every 35 minutes, run from a clone each firing brings to
   GitHub's `main` first, never from a checkout a person uses (ADR 0050).
   Models are routed by lane in `canon/models.json` (ADR 0005).
+
+## Where code runs, and what it has
+
+Read from each process's own environment on 2026-11-10 (`sysctl` `KERN_PROCARGS2`, `launchctl print`, the
+hosted run's log), on macOS with mise 2026.11.5 and Orca 1.4.255. "mise's" is a directory `mise env --paths`
+lists; "system" is `/usr/bin` or `/bin`. Secret variables are named, never shown.
+
+| Way of running | PATH starts with | `python3` | `uv`, `gh` | `jq`, `git`, `bash` | Claude config | Model and effort come from |
+|---|---|---|---|---|---|---|
+| First agent in a workspace Orca creates (`orca.yaml` setup, then Orca's startup script under `bash -lc`): Claude, Codex, Antigravity, Muse, DeepSeek Harness | `/etc/paths`, `/etc/paths.d`, then mise's | system 3.9 | mise's | system; bash 3.2 | `~/.claude` (`CLAUDE_CONFIG_DIR` unset unless Orca's profile pointer names a folder) | Claude: `--model`, `--effort` from the dispatch; the others: their own config (`~/.codex`, `~/.gemini/antigravity-cli`, `~/.dsh/profiles/dsh-tui`) and flags; no model variable in any environment |
+| An agent Orca types into an existing workspace's pane, or a tab the owner opens (interactive `zsh -l`, `mise activate` in `~/.zshrc`) | mise's | mise's 3.14 | mise's | system; bash 3.2 | `~/.claude` | as above |
+| Claude Code subagent, Bash tool, hooks in `.claude/hooks/` | as its session | as its session | as its session | system | as its session | the session; settings `env` adds `ANTHROPIC_DEFAULT_FABLE_MODEL`, Claude Code adds `CLAUDE_EFFORT` and `CLAUDE_CODE_*` |
+| `.githooks/pre-commit`, `pre-push`, `scripts/ci` and `scripts/land` by hand | git's own `libexec/git-core` (in a hook), then the caller's; `scripts/ci` then puts mise's first for its checks | caller's; mise's inside `scripts/ci` | mise's (`land` calls `gh` through `mise exec`) | system | caller's | not used |
+| launchd agents `scripts/automation` installs: lane watchdog, OTLP collector, paper session | `/usr/bin:/bin:/usr/sbin:/sbin`, set by each script; mise named by absolute path, and `mise run` adds its own | mise's inside `mise run paper:session` | mise's, through mise | system | the watchdog's plist sets `CLAUDE_CONFIG_DIR` to the folder at install | not used |
+| Hosted workflow (`.github/workflows/ci.yml`, `ubuntu-24.04`) | mise's (mise-action adds each to `GITHUB_PATH`) | mise's 3.14 | mise's | runner's; git 2.56, bash at `/usr/bin/bash` | none | not used |
+
+Where they differ in a way a script here depends on:
+
+* **`python3`.** The first route has the system Python 3.9 first: a login bash sources `/etc/profile`, whose
+  `path_helper` puts the system directories ahead of the mise ones `zsh` had put first, and no
+  `~/.bash_profile` activates mise again. `mise env` and `mise exec -- bash -c ...` leave a directory where
+  the caller's PATH already lists it. `scripts/ci` therefore puts mise's directories first itself
+  (`toolchain_first`; `scripts/test-ci`, "pathorder"), and the session brief says when a session's
+  `python3` is not the toolchain's (`.claude/hooks/session-brief.sh`; `scripts/test-canon`, "brief
+  toolchain"). `scripts/test-lanes` and `scripts/bootstrap` find a Python with `tomllib` themselves.
+* **macOS-only tools.** The hosted runner has no `plutil`, `lockf`, `timeout` at `/usr/bin` or `security`;
+  `scripts/test-lanes` skips those cases there and says so, so they run only on this Mac's commit gate.
+* **The Claude config folder.** Sessions, the lane watchdog and `scripts/lanes` each read
+  `${CLAUDE_CONFIG_DIR:-~/.claude}`; the watchdog's is fixed at install. They agree while Orca's profile
+  pointer is empty; nothing checks that they still agree.

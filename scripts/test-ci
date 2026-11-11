@@ -27,7 +27,9 @@ FAKE="$TMP/fakebin"; mkdir -p "$FAKE"
 cat >"$FAKE/mise" <<'EOF'
 #!/bin/bash
 case "$*" in
-  "env -s bash") printf 'export PATH=%q\n' "$TOOLS:$PATH" ;;
+  # FAKE_MISE_KEEP=1: PATH as it was, as mise 2026.11.5 leaves it when it already lists mise's directories
+  "env -s bash") if [ -n "${FAKE_MISE_KEEP:-}" ]; then printf 'export PATH=%q\n' "$PATH"
+                 else printf 'export PATH=%q\n' "$TOOLS:$PATH"; fi ;;
   "env --paths") printf '%s\n' "$TOOLS" ;;
   *) echo "fake mise: unexpected arguments: $*" >&2; exit 2 ;;
 esac
@@ -297,8 +299,35 @@ check "tools that are present still pass"          has '^  ok    shellcheck$'
 check "the run fails"                              test "$RC" = 1
 }
 
+# --- the toolchain's directories go first, though the caller's PATH lists them behind a system python3 ---
+# An agent Orca starts after a workspace's setup has /usr/bin ahead of mise's directories, and `mise env`
+# leaves them there (FAKE_MISE_KEEP). Without toolchain_first in scripts/ci, the check ran the system python3
+# and the run failed on the outside uv.
+case_pathorder() {
+fresh pathorder
+TOOLS="$C.tools"; mkdir -p "$TOOLS"; cp "$TMP/tools"/* "$TOOLS/"
+printf '#!/bin/bash\necho "toolchain python3"\n' >"$TOOLS/python3"
+SHADOW="$C.shadow"; mkdir -p "$SHADOW"
+printf '#!/bin/bash\necho "system python3"\n' >"$SHADOW/python3"
+printf '#!/bin/bash\necho "uv from outside the toolchain ran"\nexit 1\n' >"$SHADOW/uv"
+chmod +x "$TOOLS/python3" "$SHADOW/python3" "$SHADOW/uv"
+# shellcheck disable=SC2016  # expanded by the test script, not here
+printf '#!/bin/bash\npython3 >"$PY_LOG"\necho "$PATH" >>"$PY_LOG"\n' >"$C/scripts/test-py"; chmod +x "$C/scripts/test-py"
+gitq -C "$C" add -A; gitq -C "$C" commit -q -m py
+export FAKE_MISE_KEEP=1 PY_LOG="$C.py.log"
+PATH="$SHADOW:$TOOLS:$PATH" runci
+check "a check's python3 is the toolchain's, not the one the caller's PATH lists first" \
+      test "$(sed -n 1p "$C.py.log")" = "toolchain python3"
+# shellcheck disable=SC2016  # expanded by eval
+check "the toolchain's directory is first on its PATH, the caller's others kept after it" \
+      eval 'case "$(sed -n 2p "$C.py.log")" in "$TOOLS:$SHADOW:"*|"$TOOLS:"*":$SHADOW:"*) true ;; *) false ;; esac'
+check "and listed once"                            test "$(sed -n 2p "$C.py.log" | tr ':' '\n' | grep -cxF "$TOOLS")" = 1
+check "the uv it checked for is the one it ran"    test "$(grep -c '^lock --check' "$C.uv.log")" = 1
+check "so the run passes"                          test "$RC" = 0
+}
+
 # Every case above works in its own copy, so they run concurrently; their output prints in this order.
-CASES="yaml noflows shell staged untracked tests testdir testgone notes died symlink deleted deleted2 lockfail hookenv parallel order missing"
+CASES="yaml noflows shell staged untracked tests testdir testgone notes died symlink deleted deleted2 lockfail hookenv parallel order missing pathorder"
 for c in $CASES; do ( "case_$c" ) >"$TMP/out.$c" 2>&1 & done
 wait
 for c in $CASES; do cat "$TMP/out.$c"; done
