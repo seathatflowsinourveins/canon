@@ -128,13 +128,14 @@ others() { find "$dir" -mindepth 1 -maxdepth 1 ! -name .venv -print | head -n 1;
 marked() { [ -d "$1" ] && [ ! -L "$1" ] && [ "$(git config --file "$1/config" --get canon.paperCheckout 2>/dev/null)" = true ]; }
 # fresh: empty the directory's contents but .venv, keep the directory (actions/checkout's own way), and make
 # it a new clone of <origin url>. It empties only a directory that holds nothing but .venv or that it made
-# itself (its .git, or the .git.old a run stopped part way left, carries canon.paperCheckout), so a wrong path
-# deletes nothing. The new .git is made and marked aside, then swapped in by two renames, so at every point a
-# run can be stopped the folder holds a marked .git or .git.old, or .venv alone.
+# itself (its .git, or the .git.old or .git.new a run stopped part way left, carries canon.paperCheckout), so
+# a wrong path deletes nothing. The new .git is made and marked aside, then swapped in by two renames, so at
+# every point a run can be stopped the folder holds a marked .git, .git.old or .git.new, or .venv alone (a
+# first making stopped before its last rename left a marked .git.new alone, which every later firing refused).
 fresh() {
   local t
   mkdir -p "$dir" || return 1
-  if [ -n "$(others)" ] && ! marked "$dir/.git" && ! marked "$dir/.git.old"; then
+  if [ -n "$(others)" ] && ! marked "$dir/.git" && ! marked "$dir/.git.old" && ! marked "$dir/.git.new"; then
     echo "paper-session: $dir holds files and is not a clone this script made; not deleting it" >&2; return 1
   fi
   [ ! -L "$dir/.venv" ] || rm -f "$dir/.venv" || return 1   # a link would point the environment elsewhere
@@ -163,5 +164,7 @@ if [ "$only" = 1 ]; then echo "paper-session: $dir is at origin/main $want"; exi
 cd "$dir" || fail "cannot enter $dir"
 echo "paper-session: $(date -u +%Y-%m-%dT%H:%M:%SZ) running origin/main $want"
 # timeout(1): "makes itself the leader of a process group that the command inherits"; -s KILL ends the
-# group whole, timeout itself included, so the job ends on signal 9, which status reads (launchctl list)
+# group whole, timeout and mise included, so the job ends on signal 9, which status reads (launchctl list).
+# The task mise was running is in a process group of its own (observed with mise 2026.11.5), out of this
+# kill's reach: a window then still runs to its own deadline, holding the paper lock and the clone's.
 CANON_COMMIT=$want exec /usr/bin/timeout -s KILL "$RUN_SECS" "$mise" run paper:session "$@"

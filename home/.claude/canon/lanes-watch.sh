@@ -14,10 +14,12 @@
 # ~/.claude/canon/watch/lanes-status.json, through a temporary file, so a broken watchdog is visible, and
 # exits non-zero when it cannot; `scripts/automation status` reads its age. An empty ledger counts as ok only
 # while the ledger hook is installed and registered in ~/.claude/settings.json.
-# The lanes report runs under timeout(1) (macOS's /usr/bin/timeout) for LANES_SECS, so a report that hangs
-# fails this run instead of holding the job while launchd misses its intervals (launchd.plist(5)).
+# The lanes report runs under timeout(1) (macOS's /usr/bin/timeout) for LANES_SECS, and the notification for
+# NOTIFY_SECS, so a report or a notification that hangs ends this run instead of holding the job while
+# launchd misses its intervals (launchd.plist(5)); a notification stopped there counts as not sent.
 # CLAUDE_CONFIG_DIR replaces ~/.claude. CANON_WATCH_NO_NOTIFY=1 keeps the alert file and skips the notification.
-# CANON_WATCH_OSASCRIPT and CANON_WATCH_LANES_SECS replace osascript and the bound (tests only).
+# CANON_WATCH_OSASCRIPT, CANON_WATCH_LANES_SECS and CANON_WATCH_NOTIFY_SECS replace osascript and the bounds
+# (tests only).
 # It runs no model, costs no tokens, and never deletes anything.
 # exported: under an empty environment bash keeps an assigned PATH to itself and a child gets no PATH; the
 # lanes report, a bash script, then fell back to bash's compiled-in /usr/gnu/bin:/usr/local/bin:/bin:/usr/bin:.
@@ -29,6 +31,7 @@ w="$base/watch"
 mkdir -p "$w" || exit 1
 now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 LANES_SECS=${CANON_WATCH_LANES_SECS:-120}   # scripts/automation's WATCH_SECS
+NOTIFY_SECS=${CANON_WATCH_NOTIFY_SECS:-30}  # scripts/automation's WATCH_NOTIFY_SECS
 OSA=${CANON_WATCH_OSASCRIPT:-/usr/bin/osascript}
 
 # put <file> <content>: replace $w/<file> whole, through a temporary file of this run's own (mktemp(1))
@@ -116,7 +119,7 @@ notified=false
 if [ "$notifying" = true ]; then
   msg=$(jq -r 'map(.lane + ": " + .flag) | unique | .[0:4] | join("  ·  ")' <<<"$notify")
   # text is passed as arguments, never spliced into the script, so a directory name cannot inject AppleScript.
-  if "$OSA" -e 'on run argv' \
+  if /usr/bin/timeout -k 5 "$NOTIFY_SECS" "$OSA" -e 'on run argv' \
        -e 'display notification (item 1 of argv) with title "Canon lanes" subtitle (item 2 of argv)' \
        -e 'end run' "$msg" "$ncount new flag(s). Run scripts/lanes" >/dev/null 2>&1; then
     notified=true

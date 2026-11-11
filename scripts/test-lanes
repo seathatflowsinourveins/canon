@@ -23,7 +23,17 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/canon-test-lanes.XXXXXX") \
   || { echo "test-lanes: could not create a temp folder under ${TMPDIR:-/tmp}; nothing was written" >&2; exit 1; }
 trap 'rm -rf "$TMP"' EXIT
-pass=0; fail=0; skipped=0
+pass=0; fail=0; skipped=0; skips=""
+# No git command here may find a repository above the temp folder, this clone's included: install and
+# uninstall set and unset core.hooksPath and the credential helper of the repository they run from (a second
+# reader's probe, run in place, unset this clone's), so a temp repository that is not there must fail, not
+# reach this one (git(1), GIT_CEILING_DIRECTORIES). What this clone has is compared at the end.
+GIT_CEILING_DIRECTORIES=$(cd "$TMP/.." && pwd -P); export GIT_CEILING_DIRECTORIES
+real_git() { git -C "$ROOT" config --local --get-all "$1" 2>/dev/null | tr '\n' '|'; }
+# shellcheck disable=SC2034  # read by the eval'd check at the end
+REAL_HOOKS=$(real_git core.hooksPath)
+# shellcheck disable=SC2034  # read by the eval'd check at the end
+REAL_HELPER=$(real_git credential.https://github.com.helper)
 
 # A python3 with tomllib (Python 3.11 and later), which the Codex config cases below need, as scripts/bootstrap
 # and the tomlis helper read that config as TOML. Looked for as bootstrap's toml_python looks: the python3 on
@@ -56,7 +66,7 @@ PATH="$TMP/python:$PATH"
 
 t_pass() { pass=$((pass+1)); echo "  pass  $1"; }
 t_fail() { fail=$((fail+1)); echo "  FAIL  $1"; }
-skip()   { skipped=$((skipped+1)); echo "  skip  $1 ($2)"; }
+skip()   { skipped=$((skipped+1)); skips="$skips; $1"; echo "  skip  $1 ($2)"; }
 # check <label> <command...>: passes when the command succeeds
 check()  { local label="$1"; shift; if "$@"; then t_pass "$label"; else t_fail "$label"; fi; }
 jqt()    { jq -e "$2" "$1" >/dev/null 2>&1; }                 # jqt <file> <jq boolean>
@@ -95,6 +105,8 @@ EOF
 cat > "$B/launchctl" <<'EOF'
 #!/bin/bash
 echo "launchctl $*" >> "$STUB/launchctl.log"
+# a launchd that does not answer one verb ($STUB/launchctl-hangs-<verb>)
+[ ! -f "$STUB/launchctl-hangs-${1:-}" ] || exec sleep 60
 case "${1:-}" in
   # one label's own answer first ($STUB/launchctl-print-<label>), else the shared one
   print) l=${2##*/}
@@ -349,6 +361,15 @@ CLAUDE_CONFIG_DIR="$WD" CANON_WATCH_NO_NOTIFY=1 CANON_WATCH_LANES_SECS=1 "$ROOT/
 took=$(( $(date +%s) - s0 )); rm -f "$STUB/lanes-hangs"
 check "a lanes report that hangs is stopped at its bound (${took} s): exit non-zero, the status saying so" \
       eval '[ "$rc" != 0 ] && [ "$took" -lt 15 ] && jqt "$st" ".ok == false and (.error | test(\"did not finish within 1 s\"))"'
+# a notification that hangs (claim of two second readers): the report was bounded but osascript was not, so a
+# stuck notification held the watchdog before it wrote its status, and launchd missed every interval meanwhile
+printf '#!/bin/bash\necho $$ > "%s/osa-hung.pid"\nexec sleep 60\n' "$STUB" > "$STUB/osa-hangs"; chmod +x "$STUB/osa-hangs"
+report s5 '["model-switch"]'; rm -f "$st"; s0=$(date +%s)
+CLAUDE_CONFIG_DIR="$WD" CANON_WATCH_OSASCRIPT="$STUB/osa-hangs" CANON_WATCH_NOTIFY_SECS=1 "$ROOT/home/.claude/canon/lanes-watch.sh" 2>/dev/null; rc=$?
+took=$(( $(date +%s) - s0 ))
+check "a notification that hangs is stopped at its bound (${took} s): the status written, the alert kept to send again" \
+      eval '[ "$rc" = 0 ] && [ "$took" -lt 15 ] && jqt "$st" ".ok and .notified == false" && jqt "$WD/canon/watch/unnotified.json" "index(\"s5:model-switch\") != null" && ! kill -0 "$(cat "$STUB/osa-hung.pid")" 2>/dev/null'
+kill -KILL "$(cat "$STUB/osa-hung.pid" 2>/dev/null)" 2>/dev/null
 
 # ---------- automation ----------
 echo "automation:"
@@ -397,7 +418,7 @@ fired() { # fired <age in seconds>: the stamp the runner writes as each schedule
 }
 paper ok 600; heartbeat 60; fired 60
 cp "$R/home/.claude/canon/paper-session.sh" "$AH/canon/paper-session.sh"   # installed as the tree has it
-status() { CLAUDE_CONFIG_DIR="$AH" CANON_PAPER_SESSION_DIR="$PD" "$R/scripts/automation" status > "$TMP/status.out" 2>&1; }
+status() { CLAUDE_CONFIG_DIR="$AH" CANON_PAPER_SESSION_DIR="$PD" CANON_LAUNCHCTL_SECS="${LCS:-30}" "$R/scripts/automation" status > "$TMP/status.out" 2>&1; }
 watchjson 60 true; runs completed '{conclusion: "success"}'
 status; rc=$?
 check "all healthy: exit 0"                       test "$rc" = 0
@@ -493,11 +514,21 @@ echo '{' > "$PD/scheduled-firing.json"; status; rc=$?
 check "an unreadable firing stamp: UNKNOWN, exit 1" eval 'rowis "$TMP/status.out" "paper session" UNKNOWN && [ "$rc" != 0 ]'
 fired 60; echo 'not json' > "$PD/last-firing.json"; status; rc=$?
 check "an unreadable heartbeat: UNKNOWN, exit 1"  eval 'rowis "$TMP/status.out" "paper session" UNKNOWN && [ "$rc" != 0 ]'
+# valid JSON with no fields (claim of a second reader): it read ok, its age taken as now
+for hb in '{}' '{"at_epoch": "soon", "outcome": "ok"}' '{"at_epoch": 1}'; do
+  echo "$hb" > "$PD/last-firing.json"; status; rc=$?
+  check "a heartbeat without its time and outcome ($hb): UNKNOWN, unreadable, exit 1" \
+        eval 'rowis "$TMP/status.out" "paper session" UNKNOWN && [ "$rc" != 0 ] && grep -q "last-firing.json is unreadable" "$TMP/status.out"'
+done
 heartbeat 60; status; rc=$?
 check "fresh stamp and heartbeat again: ok"       eval 'rowis "$TMP/status.out" "paper session" ok && [ "$rc" = 0 ]'
 heartbeat -1; status; rc=$?
 check "a heartbeat written within the same second (a negative whole age): ok" \
       eval 'rowis "$TMP/status.out" "paper session" ok && [ "$rc" = 0 ]'
+# a launchd that does not answer (claim of a second reader): no single launchctl call was bounded
+: > "$STUB/launchctl-hangs-print"; s0=$(date +%s); LCS=1 status; rc=$?; took=$(( $(date +%s) - s0 )); rm -f "$STUB/launchctl-hangs-print"
+check "a launchctl print that never answers: each agent's row UNKNOWN, saying so, exit 1, in ${took} s" \
+      eval '[ "$rc" != 0 ] && [ "$took" -lt 30 ] && rowis "$TMP/status.out" "lane watchdog" UNKNOWN && rowis "$TMP/status.out" "paper session" UNKNOWN && rowis "$TMP/status.out" "otlp collector" UNKNOWN && grep -q "launchctl did not answer within 1 s" "$TMP/status.out"'
 heartbeat 60
 git -C "$R" remote set-url origin "https://someone:s3cr3t-t0ken@example.com/example/repo@v2?q=1"; status
 check "the landing row names the origin by host and path, an @ in the path kept, its user information never" \
@@ -566,6 +597,8 @@ ocommit first
 git config --global "url.$O.insteadOf" https://github.com/example/repo.git
 OURL=$(git -C "$R" remote get-url origin)
 CK="$AH/canon/paper-checkout"
+check "the install rehearsal's repository is the temp one, not one above it" \
+      test "$(git -C "$R" rev-parse --show-toplevel 2>/dev/null)" = "$(cd "$R" && pwd -P)"
 if command -v plutil >/dev/null 2>&1; then
   : > "$STUB/launchctl.log"
   inst() { CLAUDE_CONFIG_DIR="$AH" CANON_LAUNCHAGENTS_DIR="$TMP/agents" AUTOMATION_SKIP_LAUNCHD=1 "$R/scripts/automation" install > "$TMP/install.out" 2>&1; }
@@ -638,9 +671,19 @@ if command -v plutil >/dev/null 2>&1; then
   check "... one that does not stop in time: exit 1, nothing new loaded for it, said after the status table" \
         eval '[ "$rc" != 0 ] && grep -q "the earlier local.canon.otel-collector was still stopping after 1 s" "$TMP/install.out" && ! grep -q "bootstrap .*otel-collector.plist" "$STUB/launchctl.log" && grep -q "still stopping" <<<"$(tail -n 3 "$TMP/install.out")" && grep -q "^install: FAILED (exit 1):" "$TMP/install.out"'
   check "... the other two loaded meanwhile"         test "$(grep -c "^  loaded     local.canon" "$TMP/install.out")" = 2
-  # the paper agent alone does not stop: said once, and nothing booted over it after the checkout
+  # the paper agent alone does not stop: said once, nothing booted over it, and (claim of a second reader) its
+  # runner, clone and plist not replaced under it, where a firing of the old job would run the new runner
   rm -f "$STUB/stopping-"* "$STUB/launchctl-print-local.canon."*; printf '\tstate = running\n' > "$STUB/launchctl-print-local.canon.paper-session"
+  echo "# the runner the loaded job runs" > "$AH/canon/paper-session.sh"
+  # shellcheck disable=SC2034  # read by the eval'd check
+  ppsum=$(cksum < "$PP")
+  # shellcheck disable=SC2034  # read by the eval'd check
+  ckhead=$(git -C "$CK" rev-parse HEAD)
+  echo 3 > "$OW/tracked"; ocommit third
   : > "$STUB/launchctl.log"; linst 1; rc=$?
+  check "... the paper agent that does not stop: its runner, clone and plist left as they were" \
+        eval '[ "$rc" != 0 ] && [ "$(cat "$AH/canon/paper-session.sh")" = "# the runner the loaded job runs" ] && [ "$(cksum < "$PP")" = "$ppsum" ] && [ "$(git -C "$CK" rev-parse HEAD)" = "$ckhead" ]'
+  cp "$R/home/.claude/canon/paper-session.sh" "$AH/canon/paper-session.sh"
   check "... the paper agent that does not stop: said once, not booted over" \
         eval '[ "$rc" != 0 ] && [ "$(grep -c "earlier local.canon.paper-session was still stopping" "$TMP/install.out")" = 2 ] && ! grep -q "bootstrap .*paper-session.plist" "$STUB/launchctl.log"'
   # a bootout launchd refuses outright: said at once, with launchd's message, not after the whole wait
@@ -847,6 +890,13 @@ mv "$FK/.git" "$FK/.git.old"; mkdir -p "$FK/.git.new/objects"; : > "$FK/tracked"
 fire "$B/mise" "$FK" "$OURL" --session auto; rc=$?
 check "... and one stopped between the renames that swap .git (a marked .git.old left): made again" \
       eval '[ "$rc" = 0 ] && grep -qF "commit=$want" <<<"$(ran)" && [ ! -e "$FK/.git.old" ] && [ ! -e "$FK/.git.new" ]'
+# a first making stopped before its last rename (claim of a second reader): the marked new .git moved in as
+# .git.new, no .git or .git.old yet; every later firing refused it as a folder it had not made
+find "$FK" -mindepth 1 -maxdepth 1 ! -name .venv -exec rm -rf {} +
+git init -q "$TMP/half-made" && git -C "$TMP/half-made" config canon.paperCheckout true && mv "$TMP/half-made/.git" "$FK/.git.new" && rm -rf "$TMP/half-made"
+fire "$B/mise" "$FK" "$OURL" --session auto; rc=$?
+check "... and a first making stopped before its last rename (a marked .git.new alone): made again" \
+      eval '[ "$rc" = 0 ] && grep -qF "commit=$want" <<<"$(ran)" && [ ! -e "$FK/.git.new" ] && [ -e "$FK/.venv/kept" ]'
 mkdir -p "$TMP/real-repo"; echo mine > "$TMP/real-repo/file"; ln -s "$TMP/real-repo" "$TMP/linked-checkout"
 fire "$B/mise" "$TMP/linked-checkout" "$OURL" --session auto; rc=$?
 check "a checkout path that is a link is refused: exit 1, what it points at untouched" \
@@ -854,7 +904,7 @@ check "a checkout path that is a link is refused: exit 1, what it points at unto
 fi
 
 UH="$TMP/un-home"; UA="$TMP/un-agents"
-uninst() { CLAUDE_CONFIG_DIR="$UH" CANON_LAUNCHAGENTS_DIR="$UA" CANON_UNLOAD_SECS=1 "$R/scripts/automation" uninstall > "$TMP/uninstall.out" 2>&1; }
+uninst() { CLAUDE_CONFIG_DIR="$UH" CANON_LAUNCHAGENTS_DIR="$UA" CANON_UNLOAD_SECS=1 CANON_LAUNCHCTL_SECS="${LCS:-30}" "$R/scripts/automation" uninstall > "$TMP/uninstall.out" 2>&1; }
 mkdir -p "$UH/canon/otel" "$UA"; : > "$UH/canon/lanes"; : > "$UH/canon/lanes-watch.sh"; : > "$UA/local.canon.lanes-watch.plist"
 : > "$UA/local.canon.otel-collector.plist"; : > "$UH/canon/otel/config.yaml"; : > "$UH/canon/otel/logs.jsonl"
 : > "$UA/local.canon.paper-session.plist"; : > "$UH/canon/paper-session.sh"
@@ -874,6 +924,13 @@ uninst; rc=$?
 check "a paper-checkout install did not make is kept, named and its mise trust untouched: exit 1" \
       eval '[ "$rc" != 0 ] && [ -e "$UH/canon/paper-checkout/file" ] && grep -q "is not the clone install made" "$TMP/uninstall.out" && ! grep -q "trust --untrust" "$STUB/mise.log"'
 rm -rf "$UH/canon/paper-checkout"
+# a clone a firing stopped part way through making (a marked .git.new alone), which the runner takes as its
+# own: uninstall takes it as the clone install made too (a second reader's review)
+mkdir -p "$UH/canon/paper-checkout/.venv"; git init -q "$TMP/half-un" && git -C "$TMP/half-un" config canon.paperCheckout true
+mv "$TMP/half-un/.git" "$UH/canon/paper-checkout/.git.new"; rm -rf "$TMP/half-un"
+uninst; rc=$?
+check "uninstall removes a clone stopped part way through its making (a marked .git.new): exit 0" \
+      eval '[ "$rc" = 0 ] && [ ! -e "$UH/canon/paper-checkout" ]'
 if [ -x /usr/bin/lockf ]; then
   git clone -q "$OURL" "$UH/canon/paper-checkout" && git -C "$UH/canon/paper-checkout" config canon.paperCheckout true
   /usr/bin/lockf -k "$UH/canon/paper-checkout.lock" sleep 20 & lk=$!
@@ -882,16 +939,37 @@ if [ -x /usr/bin/lockf ]; then
   check "uninstall while a window still runs from the clone: exit 1, the clone kept, named" \
         eval '[ "$rc" != 0 ] && [ -e "$UH/canon/paper-checkout/tracked" ] && grep -q "a window is still running from" "$TMP/uninstall.out"'
   kill "$lk" 2>/dev/null; wait "$lk" 2>/dev/null; rm -rf "$UH/canon/paper-checkout" "$UH/canon/paper-checkout.lock"
+else
+  skip "uninstall while a window still runs from the clone" "no /usr/bin/lockf here (macOS only)"
 fi
+# a lock check that cannot run (claim of a second reader, Codex): with no lockf, uninstall took the branch that
+# deletes, so it could remove a clone a window still ran from; it must refuse and say why (AGENTS.md rule 5)
+git clone -q "$OURL" "$UH/canon/paper-checkout" && git -C "$UH/canon/paper-checkout" config canon.paperCheckout true
+CANON_LOCKF="$TMP/no-lockf" uninst; rc=$?
+check "uninstall with no lockf to tell whether a window runs from the clone: exit 1, the clone kept, saying why" \
+      eval '[ "$rc" != 0 ] && [ -e "$UH/canon/paper-checkout/tracked" ] && grep -q "no $TMP/no-lockf to tell whether a window still runs from" "$TMP/uninstall.out"'
+rm -rf "$UH/canon/paper-checkout" "$UH/canon/paper-checkout.lock"
+# uninstall whose unload fails (claim of a second reader): it removed the plists and programs of jobs still
+# loaded, which launchd then fired at files that were gone; now each such job's files are kept and named
+ufiles() { : > "$UH/canon/lanes"; : > "$UH/canon/lanes-watch.sh"; : > "$UH/canon/paper-session.sh"; : > "$UH/canon/otel/config.yaml"
+           : > "$UA/local.canon.lanes-watch.plist"; : > "$UA/local.canon.paper-session.plist"; : > "$UA/local.canon.otel-collector.plist"; }
+ufiles; printf '\tstate = running\n' > "$STUB/launchctl-print"; : > "$STUB/bootout-fails"
+uninst; rc=$?; rm -f "$STUB/bootout-fails"
+check "uninstall whose bootout launchd refuses keeps the files those jobs run: exit 1, each named" \
+      eval '[ "$rc" != 0 ] && [ -e "$UA/local.canon.paper-session.plist" ] && [ -e "$UH/canon/paper-session.sh" ] && [ -e "$UH/canon/lanes-watch.sh" ] && [ -e "$UA/local.canon.otel-collector.plist" ] && [ -e "$UH/canon/otel/config.yaml" ] && grep -q "kept .*paper-session.sh: local.canon.paper-session is still loaded" "$TMP/uninstall.out"'
+: > "$STUB/launchctl-hangs-bootout"; s0=$(date +%s); LCS=1 uninst; rc=$?; took=$(( $(date +%s) - s0 )); rm -f "$STUB/launchctl-hangs-bootout"
+check "... and one whose bootout never answers: stopped at its bound (${took} s), exit 1, the files kept" \
+      eval '[ "$rc" != 0 ] && [ "$took" -lt 30 ] && grep -q "launchctl did not answer within 1 s about local.canon.paper-session" "$TMP/uninstall.out" && [ -e "$UA/local.canon.paper-session.plist" ] && [ -e "$UH/canon/lanes" ]'
+rm -f "$STUB/launchctl-print"
 if [ "$(id -u)" = 0 ]; then
   skip "uninstall that leaves things" "a read-only directory does not stop root"
 else
-  : > "$UH/canon/lanes"; printf '\tstate = not running\n' > "$STUB/launchctl-print"; : > "$STUB/bootout-fails"
+  ufiles
   chmod 555 "$UH/canon"
   uninst; rc=$?
-  chmod 755 "$UH/canon"; rm -f "$STUB/bootout-fails"
-  check "uninstall that leaves things: exit 1, names them" \
-        eval '[ "$rc" != 0 ] && grep -q "not removed" "$TMP/uninstall.out" && grep -q "$UH/canon/lanes" "$TMP/uninstall.out" && grep -q "local.canon.lanes-watch" "$TMP/uninstall.out"'
+  chmod 755 "$UH/canon"
+  check "uninstall that cannot remove files: exit 1, names them" \
+        eval '[ "$rc" != 0 ] && grep -q "not removed" "$TMP/uninstall.out" && grep -q "FAILED: could not remove $UH/canon/lanes" "$TMP/uninstall.out"'
 fi
 
 # ---------- the paper lock's owner has a deadline ----------
@@ -903,7 +981,7 @@ fi
 # kept the lock after either). Checked statically: each deadline is its timeout less 60 s and above its lock
 # wait; the numbers scripts/automation and the runner count are mise.toml's; every keychain read is bounded.
 # (The window's own arithmetic, against session_window's bounds, is in tests/test_session_window.py.) Then each
-# task's own body, from mise.toml with only its lock folder moved into $TMP and its deadline 2 s, runs under
+# task's own body, from mise.toml with only its lock folder moved into $TMP and its deadline 6 s, runs under
 # the real mise with two uv stand-ins: one that ignores SIGTERM and starts a child that ignores it too, and one
 # that keeps SIGTERM's default and starts a child that ignores it. For each, a second run cannot take the lock
 # while it runs, and once the deadline has passed nothing it started is left and the lock is free.
@@ -926,7 +1004,7 @@ for t in paper:session paper:test; do
   w=$(task_part "$t" run | grep -oE 'lockf( -[a-z]+)* -t [0-9]+' | grep -oE '[0-9]+$' | awk 'NR == 1')
   dl=$(task_part "$t" run | sed -n 's/^deadline=\([0-9]*\)$/\1/p' | awk 'NR == 1')
   check "$t: uv runs under timeout -s KILL at its deadline (${dl:-none} s), 60 s inside its mise timeout (${to} s), above its lock wait (${w:-none} s), unless from a terminal" \
-        eval '[ -n "$w" ] && [ -n "$dl" ] && [ "$dl" = $((to - 60)) ] && [ "$dl" -gt "$w" ] && grep -qE "^exec /usr/bin/timeout -s KILL \"\\\$left\" uv run " <<<"$(task_part "$t" run)" && grep -qE "^\[ ! -t 0 \] \|\| exec uv run " <<<"$(task_part "$t" run)"'
+        eval '[ -n "$w" ] && [ -n "$dl" ] && [ "$dl" = $((to - 60)) ] && [ "$dl" -gt "$w" ] && grep -qE "^  bounded \"\\\$left\" uv run " <<<"$(task_part "$t" run)" && grep -qE "^  /usr/bin/timeout -s KILL \"\\\$b\" \"\\\$@\" & g=\\\$!\$" <<<"$(task_part "$t" run)" && grep -qE "^  \[ ! -t 0 \] \|\| exec uv run " <<<"$(task_part "$t" run)"'
   envs=$(task_env "$t")
   check "$t: each keychain read runs under timeout(1), at most 30 s" \
         eval '[ "$(grep -c "exec(command=" <<<"$envs")" = 2 ] && [ "$(grep -cE "exec\(command=.\/usr\/bin\/timeout (30|[12][0-9]|[1-9]) \/usr\/bin\/security " <<<"$envs")" = 2 ]'
@@ -939,8 +1017,25 @@ check "scripts/automation's longest firing is the runner's fetch bound, the task
 check "... mise's start covers its two keychain reads"   test "$(num START_SECS "$RUNNER")" -ge 60
 check "scripts/automation's WATCH_SECS is the watchdog's bound on the lanes report" \
       eval '[ "$(num WATCH_SECS "$ROOT/scripts/automation")" = 120 ] && grep -q "^LANES_SECS=\${CANON_WATCH_LANES_SECS:-120}" "$ROOT/home/.claude/canon/lanes-watch.sh"'
+check "... and its WATCH_NOTIFY_SECS the watchdog's bound on the notification" \
+      eval '[ "$(num WATCH_NOTIFY_SECS "$ROOT/scripts/automation")" = 30 ] && grep -q "^NOTIFY_SECS=\${CANON_WATCH_NOTIFY_SECS:-30}" "$ROOT/home/.claude/canon/lanes-watch.sh"'
+# shellcheck disable=SC2034  # read by the eval'd check
+bt=$(task_part paper:test run | sed -n '/^bounded() {/,/^}/p')
+# shellcheck disable=SC2034  # read by the eval'd check
+bs=$(task_part paper:session run | sed -n '/^bounded() {/,/^}/p')
+check "paper:session and paper:test run uv through one and the same bounded()" eval '[ -n "$bt" ] && [ "$bt" = "$bs" ]'
 check "paper:session marks a run the schedule did not start, so its records go to by-hand/" \
       eval 'grep -qxF "[ \"\${CANON_PAPER_SCHEDULED:-}\" = 1 ] || [ -n \"\${CANON_COMMIT:-}\" ] || export CANON_PAPER_BY_HAND=1" <<<"$(task_part paper:session run)"'
+# mise appends a task's arguments to the last line of its script (observed with mise 2026.11.5 under a pty and
+# without), so every uv command must be reached from the last line, the one run from a terminal included: it
+# was not, and from a terminal --session, --minutes and -k were dropped
+for t in paper:session paper:test; do
+  b=$(task_part "$t" run)
+  # shellcheck disable=SC2034  # read by the eval'd check
+  uvl=$(grep -E '(^|[ &|])uv run ' <<<"$b" | grep -v '/usr/bin/true')
+  check "$t: its arguments reach uv from a terminal and from the schedule (the last line calls the function that runs uv with \"\$@\")" \
+        eval '[ "$(grep -c "" <<<"$uvl")" = 2 ] && ! grep -vqF "\"\$@\"" <<<"$uvl" && grep -Eqx "[a-z_]+" <<<"$(tail -n 1 <<<"$b")"'
+done
 LMISE=$(PATH="${PATH#"$B:"}" command -v mise 2>/dev/null) || LMISE=""
 [ -n "$LMISE" ] || [ ! -x "$REAL_HOME/.local/bin/mise" ] || LMISE="$REAL_HOME/.local/bin/mise"
 if [ ! -x /usr/bin/lockf ] || [ ! -x /usr/bin/getconf ] || [ ! -x /usr/bin/timeout ]; then
@@ -949,43 +1044,112 @@ elif [ -z "$LMISE" ]; then
   skip "paper lock deadline, run under mise" "no mise outside the stubs"
 else
   getconf='$(/usr/bin/getconf DARWIN_USER_TEMP_DIR)'   # in a variable: a / in an inline pattern ends it
-  # shellcheck disable=SC2034  # held and orc are read by the eval'd checks
-  for t in paper:session paper:test; do
-    for how in "uv ignores SIGTERM" "uv keeps SIGTERM's default"; do
-      LD="$TMP/deadline-${t#paper:}-${how%% *}${how##* }"; mkdir -p "$LD/bin"
-      body=$(task_part "$t" run)
-      moved=${body//"$getconf"/"$LD/"}
-      # shellcheck disable=SC2001  # a whole line, anchored
-      moved=$(sed 's/^deadline=[0-9]*$/deadline=2/' <<<"$moved")
-      if [ -z "$body" ] || [[ "$moved" == *getconf* ]] || [[ "$moved" != *"$LD/"* ]] || [[ "$moved" == *"{{"* ]] || [[ "$moved" != *deadline=2* ]]; then
-        t_fail "$t's body found in mise.toml, its lock folder moved into the test's and its deadline 2 s"; continue
-      fi
-      trapline=""; [ "$how" = "uv ignores SIGTERM" ] && trapline="trap '' TERM"
-      cat > "$LD/bin/uv" <<EOF
+  # mise reads every config from the task's folder up to the root, and a mise.toml above the temp folder (one
+  # in /private/tmp, which a TMPDIR there puts above it) gave the task other tools: the uv stand-in was not the
+  # uv that ran, and the four lock checks failed, load or none. mise searches no higher than MISE_CEILING_PATHS
+  # (mise settings, ceiling_paths), here the temp folder, physical, as mise sees its working folder.
+  TMPP=$(cd "$TMP" && pwd -P)
+  # owner <task> <folder> <deadline> [sync]: <folder>/mise.toml with one task, owner, whose body is <task>'s
+  # from mise.toml with its lock folder moved into <folder>, its deadline (and paper:session's start-up bound,
+  # sync) shortened; fails when the body cannot be found or moved
+  owner() {
+    local body moved
+    body=$(task_part "$1" run)
+    moved=${body//"$getconf"/"$2/"}
+    # shellcheck disable=SC2001  # whole lines, anchored
+    moved=$(sed -e "s/^deadline=[0-9]*\$/deadline=$3/" -e "s/^sync=[0-9]*\$/sync=${4:-1}/" <<<"$moved")
+    if [ -z "$body" ] || [[ "$moved" == *getconf* ]] || [[ "$moved" != *"$2/"* ]] || [[ "$moved" == *"{{"* ]] || [[ "$moved" != *"deadline=$3"* ]]; then
+      return 1
+    fi
+    { printf '[tasks.owner]\ntimeout = "%ss"\nenv.ALPACA_API_KEY = "stand-in"\nenv.ALPACA_SECRET_KEY = "stand-in"\n' "$(( $3 + 30 ))"
+      printf "run = '''\n%s\n'''\n" "$moved"; } > "$2/mise.toml"
+  }
+  # standin <folder> <trap line> [hang]: a uv that hangs, with a child that ignores SIGTERM; the start-up step
+  # paper:session runs first (`uv run ... /usr/bin/true`) passes at once, or with `hang`, hangs too
+  standin() {
+    mkdir -p "$1/bin"
+    cat > "$1/bin/uv" <<EOF
 #!/bin/bash
-# a uv that hangs ($how), with a child that ignores SIGTERM
-$trapline
-echo \$\$ > "$LD/uv.pid"
-/bin/bash -c 'trap "" TERM; echo \$\$ > "$LD/child.pid"; sleep 60' &
+$2
+case "\$*" in *" /usr/bin/true") [ "${3:-}" = hang ] || exit 0; echo \$\$ > "$1/sync.pid"; exec sleep 60 ;; esac
+echo \$\$ > "$1/uv.pid"
+/bin/bash -c 'trap "" TERM; echo \$\$ > "$1/child.pid"; sleep 60' &
 wait
 EOF
-      chmod +x "$LD/bin/uv"
-      { printf '[tasks.owner]\ntimeout = "6s"\nenv.ALPACA_API_KEY = "stand-in"\nenv.ALPACA_SECRET_KEY = "stand-in"\n'
-        printf "run = '''\n%s\n'''\n" "$moved"; } > "$LD/mise.toml"
-      (cd "$LD" && env -i HOME="$HOME" LD="$LD" PATH="$LD/bin:/usr/bin:/bin" "$LMISE" run owner > "$LD/out" 2>&1) & op=$!
-      for _ in $(seq 100); do [ -s "$LD/child.pid" ] && break; sleep 0.1; done
+    chmod +x "$1/bin/uv"
+  }
+  # ready <folder> <pid>: wait until the stand-in's child has started, or the run has ended: a readiness signal,
+  # not a wall-clock bound, so mise's start-up under load (scripts/ci runs checks in parallel) decides nothing
+  ready() { while [ ! -s "$1/child.pid" ] && kill -0 "$2" 2>/dev/null; do sleep 0.1; done; }
+  # left_up <folder>: which of the stand-in's processes still run; reap <folder>: end them, their groups whole
+  left_up() { local f up=""; for f in uv.pid child.pid; do [ -s "$1/$f" ] && kill -0 "$(cat "$1/$f")" 2>/dev/null && up="$up ${f%.pid}"; done; echo "$up"; }
+  reap() {
+    local f g
+    for f in uv.pid child.pid sync.pid; do
+      [ -s "$1/$f" ] || continue
+      g=$(ps -o pgid= -p "$(cat "$1/$f")" 2>/dev/null | tr -d ' ')
+      [ -z "$g" ] || kill -KILL -- "-$g" 2>/dev/null; kill -KILL "$(cat "$1/$f")" 2>/dev/null
+    done
+  }
+  # shellcheck disable=SC2034  # held, orc, up, free and took are read by the eval'd checks
+  for t in paper:session paper:test; do
+    for how in "uv ignores SIGTERM" "uv keeps SIGTERM's default"; do
+      LD="$TMP/deadline-${t#paper:}-${how%% *}${how##* }"; mkdir -p "$LD"
+      if ! owner "$t" "$LD" 6; then
+        t_fail "$t's body found in mise.toml, its lock folder moved into the test's and its deadline 6 s"; continue
+      fi
+      trapline=""; [ "$how" = "uv ignores SIGTERM" ] && trapline="trap '' TERM"
+      standin "$LD" "$trapline"
+      (cd "$LD" && env -i HOME="$HOME" MISE_CEILING_PATHS="$TMPP" LD="$LD" PATH="$LD/bin:/usr/bin:/bin" "$LMISE" run owner > "$LD/out" 2>&1) & op=$!
+      ready "$LD" "$op"
       /usr/bin/lockf -k -t 0 "$LD/canon-paper-test.lock" true 2>/dev/null; held=$?
       wait "$op"; orc=$?
       sleep 1   # anything still alive now outlived the deadline
-      up=""; for f in uv.pid child.pid; do [ -s "$LD/$f" ] && kill -0 "$(cat "$LD/$f")" 2>/dev/null && up="$up ${f%.pid}"; done
+      up=$(left_up "$LD")
       /usr/bin/lockf -k -t 0 "$LD/canon-paper-test.lock" true 2>/dev/null; free=$?
       check "$t, $how: a second run cannot take the lock while it runs" eval '[ -s "$LD/child.pid" ] && [ "$held" != 0 ]'
       check "... the deadline stops it and fails the task"      test "$orc" != 0
       check "... nothing it started is left running (left:${up:- none})" test -z "$up"
       check "... and the lock is free for the next run"         test "$free" = 0
-      for f in uv.pid child.pid; do [ -s "$LD/$f" ] && kill -KILL "$(cat "$LD/$f")" 2>/dev/null; done
+      reap "$LD"
+    done
+    # a stop before the deadline (claim of a second reader): a SIGTERM to mise (launchd's bootout of a firing,
+    # a person's kill) or to the leader of uv's process group ended uv, and timeout(1) exited with it, while a
+    # child that ignored SIGTERM kept the lock with nothing left to end it at the deadline (lockf exit 75)
+    for to in mise "the group's leader"; do
+      LD="$TMP/early-${t#paper:}-${to##* }"; mkdir -p "$LD"
+      if ! owner "$t" "$LD" 40; then t_fail "$t's body found in mise.toml, moved, its deadline 40 s"; continue; fi
+      standin "$LD" ""
+      (cd "$LD" && exec env -i HOME="$HOME" MISE_CEILING_PATHS="$TMPP" PATH="$LD/bin:/usr/bin:/bin" "$LMISE" run owner > "$LD/out" 2>&1) & op=$!
+      ready "$LD" "$op"
+      s0=$(date +%s)
+      if [ "$to" = mise ]; then kill -TERM "$op" 2>/dev/null
+      else kill -TERM "$(ps -o pgid= -p "$(cat "$LD/uv.pid" 2>/dev/null)" 2>/dev/null | tr -d ' ')" 2>/dev/null; fi
+      wait "$op"; orc=$?
+      for _ in $(seq 50); do [ -z "$(left_up "$LD")" ] && break; sleep 0.1; done
+      took=$(( $(date +%s) - s0 )); up=$(left_up "$LD")
+      /usr/bin/lockf -k -t 0 "$LD/canon-paper-test.lock" true 2>/dev/null; free=$?
+      check "$t, a SIGTERM to $to before the deadline: the task fails, nothing it started is left (left:${up:- none}), the lock free, in ${took} s" \
+            eval '[ -s "$LD/child.pid" ] && [ "$orc" != 0 ] && [ -z "$up" ] && [ "$free" = 0 ] && [ "$took" -lt 30 ]'
+      reap "$LD"
     done
   done
+  # paper:session's start-up is held to its allowance (claim of two second readers): the deadline counted
+  # `sync` seconds for uv to make the environment uv.lock's, but nothing stopped a slower one, which ate the
+  # time the window's bounded end needs. A start-up that hangs fails the task at `sync`, before any window.
+  LD="$TMP/start-up-bound"; mkdir -p "$LD"
+  if owner paper:session "$LD" 40 2 && grep -q '^sync=2$' "$LD/mise.toml"; then
+    standin "$LD" "" hang
+    s0=$(date +%s)
+    (cd "$LD" && exec env -i HOME="$HOME" MISE_CEILING_PATHS="$TMPP" PATH="$LD/bin:/usr/bin:/bin" "$LMISE" run owner > "$LD/out" 2>&1); orc=$?
+    took=$(( $(date +%s) - s0 ))
+    /usr/bin/lockf -k -t 0 "$LD/canon-paper-test.lock" true 2>/dev/null; free=$?
+    check "paper:session, a start-up that hangs: the task fails at its start-up bound (${took} s of a 40 s deadline), no window started, the lock free" \
+          eval '[ "$orc" != 0 ] && [ "$took" -lt 35 ] && [ -s "$LD/sync.pid" ] && ! kill -0 "$(cat "$LD/sync.pid")" 2>/dev/null && [ ! -e "$LD/uv.pid" ] && [ "$free" = 0 ] && grep -q "start-up" "$LD/out"'
+    reap "$LD"
+  else
+    t_fail "paper:session's body has a start-up bound, sync=, that the test can shorten"
+  fi
   # a keychain read that waits (at a dialog no one sees): the task's env, rendered before its timeout starts,
   # ends at the read's own bound, and the body never runs
   KD="$TMP/keychain-wait"; mkdir -p "$KD"
@@ -993,11 +1157,11 @@ EOF
   envs=$(task_env paper:session | sed -e "s|/usr/bin/security|$KD/security|" -e 's|/usr/bin/timeout [0-9]* |/usr/bin/timeout 1 |')
   { printf '[tasks.owner]\ntimeout = "60s"\n%s\nrun = "echo ran > %s/ran"\n' "$envs" "$KD"; } > "$KD/mise.toml"
   s0=$(date +%s)
-  (cd "$KD" && env -i HOME="$HOME" PATH="/usr/bin:/bin" "$LMISE" trust -q "$KD/mise.toml" >/dev/null 2>&1; cd "$KD" && env -i HOME="$HOME" PATH="/usr/bin:/bin" "$LMISE" run owner > "$KD/out" 2>&1)
+  (cd "$KD" && env -i HOME="$HOME" MISE_CEILING_PATHS="$TMPP" PATH="/usr/bin:/bin" "$LMISE" trust -q "$KD/mise.toml" >/dev/null 2>&1; cd "$KD" && env -i HOME="$HOME" MISE_CEILING_PATHS="$TMPP" PATH="/usr/bin:/bin" "$LMISE" run owner > "$KD/out" 2>&1)
   # shellcheck disable=SC2034  # krc is read by the eval'd check
   krc=$?
   took=$(( $(date +%s) - s0 ))
-  env -i HOME="$HOME" PATH="/usr/bin:/bin" "$LMISE" trust -q --untrust "$KD/mise.toml" >/dev/null 2>&1
+  env -i HOME="$HOME" MISE_CEILING_PATHS="$TMPP" PATH="/usr/bin:/bin" "$LMISE" trust -q --untrust "$KD/mise.toml" >/dev/null 2>&1
   check "a keychain read that waits ends at its timeout(1) bound (${took} s): the task fails, its body never runs" \
         eval '[ "$krc" != 0 ] && [ "$took" -lt 15 ] && [ ! -e "$KD/ran" ] && grep -q "$KD/security" <<<"$envs"'
 fi
@@ -1409,5 +1573,15 @@ inst_cli 9999.0.0 0.0.1; rc=$?
 check "install with a CLI above the pin runs no installer" eval '[ "$rc" = 0 ] && [ ! -s "$STUB/installer.log" ]'
 rm -f "$HOME/.local/bin/claude"
 
+check "this clone's own git config is as the run found it (core.hooksPath, the github.com credential helper)" \
+      eval '[ "$(real_git core.hooksPath)" = "$REAL_HOOKS" ] && [ "$(real_git credential.https://github.com.helper)" = "$REAL_HELPER" ]'
 echo "test-lanes: $pass passed, $fail failed, $skipped skipped"
+# A skipped case checked nothing (GitHub's Ubuntu runner has no lockf(1), plutil or launchd, so the runner, the
+# paper lock's deadline and the install rehearsal run only on a Mac; ADR 0050): said last, and on GitHub as a
+# warning annotation (workflow commands, "Setting a warning message"), so a green run does not read as a
+# check of them.
+if [ "$skipped" -gt 0 ]; then
+  echo "test-lanes: NOT CHECKED here (skipped):${skips#;}"
+  [ "${GITHUB_ACTIONS:-}" != true ] || echo "::warning title=test-lanes skipped $skipped case(s)::not checked on this runner:${skips#;}"
+fi
 [ "$fail" -eq 0 ]

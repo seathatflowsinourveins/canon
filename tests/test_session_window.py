@@ -923,26 +923,30 @@ def _paper_task(name: str) -> tuple[int, int, int]:
     return secs, int(deadline.group(1)), int(wait.group(1))
 
 
-# A start-up allowance for the paper:session deadline: from the task's start to Alpaca's first clock read, past
-# the lock, uv's sync of the kept .venv after a uv.lock change and the imports. Measured 2026-11-10: 8 s with an
-# empty uv cache, downloading 464 MB, 4 s for a new .venv from the cache, 0 s for one in step. 600 s covers that
-# download at under 1 MB/s. Larger than session_window.START_UP_SECS (30 s), which sizes a window so a queued
-# paper test gets the lock in its wait: running over that only makes a test wait longer, while running over this
-# lets the deadline end a window in its account check.
-START_UP_ALLOWANCE_SECS = 600
-# Counted on top, whichever reading of the start holds: the four Alpaca calls before the node runs (clock,
-# calendar, open orders, position), each at its longest with alpaca-py's retries, though the window's end is
-# timed from the first; and a host clock behind Alpaca's by up to `session_window.SKEW_SECS`.
+# Counted on top of the lock wait and the start-up: the four Alpaca calls before the node runs (clock, calendar,
+# open orders, position), each at its longest with alpaca-py's retries, though the window's end is timed from
+# the first; and a host clock behind Alpaca's by up to `session_window.SKEW_SECS`.
 START_CALLS = 4
 
 
 def test_the_paper_session_deadline_covers_its_lock_wait_start_window_and_bounded_end() -> None:
     """A second reader's review: the deadline (85 minutes) was the lock wait plus the 70-minute stale ceiling,
     with nothing for uv's sync or the start, so a window of full length could be killed in mid-flatten. Now:
-    the lock wait, the start-up allowance, the calls before the node with their retries, the longest window
-    and its bounded end all fit before uv's process group is killed, read from session_window's own bounds so
-    the test follows them; mise's own timeout is 60 s after that."""
+    the lock wait, the start-up, the calls before the node with their retries, the longest window and its
+    bounded end all fit before uv's process group is killed, read from session_window's own bounds so the test
+    follows them whatever they become; mise's own timeout is 60 s after that.
+
+    Two second readers' review of that: the start-up was an allowance nothing held, so a slow sync ate the time
+    the bounded end needs. Now the task holds uv's sync to its `sync` bound, read here from mise.toml (measured
+    2026-11-10: 8 s with an empty uv cache, downloading 464 MB, 4 s for a new .venv from the cache, 0 s for one
+    in step; 600 s covers that download at under 1 MB/s), and the imports after it are
+    `session_window.START_UP_SECS`, which the shell cannot hold (ADR 0050)."""
     timeout, deadline, wait = _paper_task("paper:session")
+    tasks = tomllib.loads((session_window.SOURCE_ROOT / "mise.toml").read_text())["tasks"]
+    run = tasks["paper:session"]["run"]
+    sync = re.search(r"^sync=(\d+)$", run, re.MULTILINE)
+    assert sync is not None, "paper:session holds its start-up to a `sync=` bound"
+    assert re.search(r'^  bounded "\$b" uv run .* /usr/bin/true \\$', run, re.MULTILINE)
     after_start = (
         session_window.ADAPTER_CALL_SECS
         + session_window.LONGEST_WINDOW_SECS
@@ -950,7 +954,8 @@ def test_the_paper_session_deadline_covers_its_lock_wait_start_window_and_bounde
     )
     assert deadline == timeout - 60
     start = (
-        START_UP_ALLOWANCE_SECS
+        int(sync.group(1))
+        + session_window.START_UP_SECS
         + (START_CALLS - 1) * session_window.ADAPTER_CALL_SECS
         + session_window.SKEW_SECS
     )

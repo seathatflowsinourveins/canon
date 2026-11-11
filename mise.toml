@@ -108,20 +108,28 @@ done
 
 # The paper lock's owner has a deadline (both paper tasks). The task opens the lock file on descriptor 9 and
 # locks that descriptor (lockf(1), "Protect a section of a shell script with a lock"), so every process the
-# task starts inherits the lock and it is free only once the last of them has ended. Then it `exec`s uv under
-# timeout(1) -s KILL, its `deadline` less the time the lock took: timeout "makes itself the leader of a
+# task starts inherits the lock and it is free only once the last of them has ended. Then `bounded` runs uv
+# under timeout(1) -s KILL, its `deadline` less the time already spent: timeout "makes itself the leader of a
 # process group that the command inherits and sends the signal to that process group", so at the deadline
 # uv, Python and every process they started (one that ignores SIGTERM included, unless it left the group with
 # setsid(2)) end together and the lock is free. SIGKILL, not SIGTERM first: timeout(1) and mise's own task
 # `timeout` (SIGTERM, then SIGKILL 5 s later, mise docs, tasks/task-configuration) both stop waiting once
 # their direct child has exited, and a descendant that ignored SIGTERM then kept the lock (scripts/test-lanes,
-# "paper lock deadline"); Python's default SIGTERM action ends it without running `finally` either. mise's
-# `timeout`, 60 s later than `deadline`, stays as the bound on the task's own body, and is the deadline of a
-# run from a person's terminal (stdin a terminal): there uv runs in the terminal's process group as before,
-# since one Ctrl-C reached Python twice through timeout(1) and mise (observed), and a second interrupt would
-# cut a window's flatten or a test's cleanup short; a person is there to see a hang. Each keychain read runs
-# under timeout(1) for 30 s: mise renders the env before the task's `timeout` starts (observed with mise
-# 2026.11.5), and a read waiting at a dialog no one sees would hold the firing.
+# "paper lock deadline"); Python's default SIGTERM action ends it without running `finally` either. For the
+# same reason a stop before the deadline must not leave the group to timeout(1): a SIGTERM to mise, which
+# passes it to the task, or to timeout itself, which propagates it to the group (timeout(1)), ended uv, and
+# timeout exited with it while a child that ignored SIGTERM kept the lock past the deadline (observed). So
+# the task's shell stays, waits for timeout, and on a TERM, HUP or INT, and again once timeout has exited,
+# sends SIGKILL to the whole group (kill(1), a negative pid). mise runs the task in a process group of its
+# own (observed with mise 2026.11.5), so the runner's bound on `mise run` ends mise and leaves the task and
+# its deadline as they were. mise appends a task's arguments to the last line of its script (observed), so
+# that line calls the function that runs uv with "$@". mise's `timeout`, 60 s later than `deadline`, stays as
+# the bound on the task's own body, and is the deadline of a run from a person's terminal (stdin a
+# terminal): there uv runs in the terminal's process group as before, since one Ctrl-C reached Python twice
+# through timeout(1) and mise (observed), and a second interrupt would cut a window's flatten or a test's
+# cleanup short; a person is there to see a hang. Each keychain read runs under timeout(1) for 30 s: mise
+# renders the env before the task's `timeout` starts (observed with mise 2026.11.5), and a read waiting at a
+# dialog no one sees would hold the firing.
 [tasks."paper:test"]
 description = "Run every paper test with the key pair read from the login keychain for this task only"
 # its 3900 s wait for the lock, then 55 minutes for tests that take about five (observed); deadline 60 s inside
@@ -143,10 +151,28 @@ start=$(/bin/date +%s)
 # Descriptor 9 and the deadline: the note above this task.
 exec 9>>"$(/usr/bin/getconf DARWIN_USER_TEMP_DIR)canon-paper-test.lock"
 /usr/bin/lockf -t 3900 9 || { echo "paper:test: the paper lock stayed held for 3900 s; nothing was placed" >&2; exit 1; }
-left=$((deadline - ($(/bin/date +%s) - start)))
-[ "$left" -gt 0 ] || { echo "paper:test: no time left before the deadline" >&2; exit 1; }
-[ ! -t 0 ] || exec uv run --locked pytest -rs packages/canon-alpaca/tests/test_paper_*.py tests/test_paper_*.py
-exec /usr/bin/timeout -s KILL "$left" uv run --locked pytest -rs packages/canon-alpaca/tests/test_paper_*.py tests/test_paper_*.py
+# bounded <secs> <command...>: the command under timeout(1) -s KILL, in the process group timeout leads, with
+# its whole group killed on a stop and once it ends (the note above paper:test)
+bounded() {
+  b=$1; shift; g=""
+  # traps first, so a stop at any point after this ends what has started; `g` is timeout's pid, and its group's
+  stop() { [ -z "$g" ] || kill -KILL -- "-$g" 2>/dev/null || kill -KILL "$g" 2>/dev/null; exit "$1"; }
+  trap 'stop 143' TERM; trap 'stop 129' HUP; trap 'stop 130' INT
+  /usr/bin/timeout -s KILL "$b" "$@" & g=$!
+  rc=0; wait "$g" || rc=$?
+  # what of the group outlived timeout; the group's id is timeout's pid, which the system does not hand out
+  # again at once (a group left empty is gone, and the kill finds nothing)
+  kill -KILL -- "-$g" 2>/dev/null || :
+  trap - TERM HUP INT
+  return "$rc"
+}
+tests() {
+  left=$((deadline - ($(/bin/date +%s) - start)))
+  [ "$left" -gt 0 ] || { echo "paper:test: no time left before the deadline" >&2; exit 1; }
+  [ ! -t 0 ] || exec uv run --locked pytest -rs packages/canon-alpaca/tests/test_paper_*.py tests/test_paper_*.py "$@"
+  bounded "$left" uv run --locked pytest -rs packages/canon-alpaca/tests/test_paper_*.py tests/test_paper_*.py "$@"
+}
+tests
 '''
 
 # One window of the session run (docs/adr/0044-paper-session-windows-for-macross.md, which supersedes ADR
@@ -162,15 +188,16 @@ exec /usr/bin/timeout -s KILL "$left" uv run --locked pytest -rs packages/canon-
 # `uv sync` would; a run by hand leaves the worktree's .venv as it is (uv run's inexact default; ADR 0050).
 [tasks."paper:session"]
 description = "Run one bounded SessionMaCross window on the paper account under the paper lock"
-# deadline: its 900 s wait for the lock, an allowance for uv's sync and the imports before the first clock
-# read, the window's longest and its bounded end (the arithmetic is ADR 0050's, and tests/test_session_window.py
-# holds it); a window stopped there is recorded `running` and so shows as died, and the next one starts only
+# deadline: its 900 s wait for the lock, the start-up (uv's sync, held to `sync`, then the imports before the
+# first clock read), the window's longest and its bounded end (the arithmetic is ADR 0050's, and
+# tests/test_session_window.py holds it); a window stopped there is recorded `running` and so shows as died, and the next one starts only
 # once the account is flat. Descriptor 9 and the deadline: the note above paper:test.
 timeout = "105m"
 env.ALPACA_API_KEY = { value = "{{ exec(command='/usr/bin/timeout 30 /usr/bin/security find-generic-password -s canon-alpaca-paper -a ALPACA_API_KEY -w') }}", redact = true }
 env.ALPACA_SECRET_KEY = { value = "{{ exec(command='/usr/bin/timeout 30 /usr/bin/security find-generic-password -s canon-alpaca-paper -a ALPACA_SECRET_KEY -w') }}", redact = true }
 run = '''
 deadline=6240
+sync=600
 start=$(/bin/date +%s)
 [ -n "$ALPACA_API_KEY" ] && [ -n "$ALPACA_SECRET_KEY" ] || { echo "paper:session: a keychain item is empty; run: mise run paper:remove, then mise run paper:store" >&2; exit 1; }
 tmp="$(/usr/bin/getconf DARWIN_USER_TEMP_DIR)"
@@ -179,8 +206,33 @@ tmp="$(/usr/bin/getconf DARWIN_USER_TEMP_DIR)"
 [ "${CANON_PAPER_SCHEDULED:-}" = 1 ] || [ -n "${CANON_COMMIT:-}" ] || export CANON_PAPER_BY_HAND=1
 exec 9>>"${tmp}canon-paper-test.lock"
 /usr/bin/lockf -t 900 9 || { echo "paper:session: the paper lock stayed held for 900 s; nothing was placed" >&2; exit 1; }
-left=$((deadline - ($(/bin/date +%s) - start)))
-[ "$left" -gt 0 ] || { echo "paper:session: no time left before the deadline" >&2; exit 1; }
-[ ! -t 0 ] || exec uv run --locked ${CANON_COMMIT:+--exact} python -m canon_trading.session_window --log-dir "${tmp}canon-paper-session"
-exec /usr/bin/timeout -s KILL "$left" uv run --locked ${CANON_COMMIT:+--exact} python -m canon_trading.session_window --log-dir "${tmp}canon-paper-session"
+# bounded <secs> <command...>: the command under timeout(1) -s KILL, in the process group timeout leads, with
+# its whole group killed on a stop and once it ends (the note above paper:test)
+bounded() {
+  b=$1; shift; g=""
+  # traps first, so a stop at any point after this ends what has started; `g` is timeout's pid, and its group's
+  stop() { [ -z "$g" ] || kill -KILL -- "-$g" 2>/dev/null || kill -KILL "$g" 2>/dev/null; exit "$1"; }
+  trap 'stop 143' TERM; trap 'stop 129' HUP; trap 'stop 130' INT
+  /usr/bin/timeout -s KILL "$b" "$@" & g=$!
+  rc=0; wait "$g" || rc=$?
+  # what of the group outlived timeout; the group's id is timeout's pid, which the system does not hand out
+  # again at once (a group left empty is gone, and the kill finds nothing)
+  kill -KILL -- "-$g" 2>/dev/null || :
+  trap - TERM HUP INT
+  return "$rc"
+}
+window() {
+  left=$((deadline - ($(/bin/date +%s) - start)))
+  [ "$left" -gt 0 ] || { echo "paper:session: no time left before the deadline" >&2; exit 1; }
+  [ ! -t 0 ] || exec uv run --locked ${CANON_COMMIT:+--exact} python -m canon_trading.session_window --log-dir "${tmp}canon-paper-session" "$@"
+  # the start-up, held to `sync`: uv makes the environment uv.lock's before it runs a command (uv docs, `uv
+  # run`), here /usr/bin/true, so the window's own `uv run` finds it in step
+  b=$sync; [ "$left" -ge "$sync" ] || b=$left
+  bounded "$b" uv run --locked ${CANON_COMMIT:+--exact} /usr/bin/true \
+    || { echo "paper:session: the start-up (uv making the environment uv.lock's) failed or took over $b s; no window was started" >&2; exit 1; }
+  left=$((deadline - ($(/bin/date +%s) - start)))
+  [ "$left" -gt 0 ] || { echo "paper:session: no time left before the deadline" >&2; exit 1; }
+  bounded "$left" uv run --locked ${CANON_COMMIT:+--exact} python -m canon_trading.session_window --log-dir "${tmp}canon-paper-session" "$@"
+}
+window
 '''
