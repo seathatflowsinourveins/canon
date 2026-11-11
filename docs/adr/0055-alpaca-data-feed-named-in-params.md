@@ -80,8 +80,9 @@ fails as above.
 **Pre-market and after-hours** (04:00-09:30 and 16:00-20:00 New York): at 16:46 the `iex`, `overnight`
 and `boats` streams each sent no quote or trade in 45 s on four symbols. IEX did trade after 16:00 (REST
 latest bars at 16:17 and 16:50), so this is one short window, not proof that no feed serves those hours;
-`sip` and `delayed_sip` were not probed then, and pre-market not at all (UNVERIFIED). Nothing is built to
-work around it.
+`sip` and `delayed_sip` were not probed then (UNVERIFIED). Pre-market was probed on 2026-11-11, `iex`
+and `boats` delivering nothing before 05:00, and is skipped by name (ADR 0044, its pre-market row).
+Nothing is built to work around it.
 
 D was not taken: a per-call option belongs in params, and a config feed would be a field of this repo's.
 
@@ -134,11 +135,17 @@ with 2 `boats` quotes in 30 s. Shaped on TC-D20 and TC-D71 with a small strategy
 Python `DataTesterConfig` takes no `subscribe_params`.
 
 `UNVERIFIED`: why the paper pair is served `boats` and `sip`; a second stream on another feed; a refused
-feed's server message on paper (none tried was refused; 409 is documented); pre-market data on any feed.
+feed's server message on paper (none tried was refused; 409 is documented); pre-market data on any feed
+from 08:00, which IEX's REST bars showed on 2026-11-10 and no stream has been probed for (ADR 0044).
 
 ## Evidence
 
 Read 2026-11-10; "raw": fetched with `curl` and read, not summarised.
+
+* 2026-11-11, an evidence refresh with no change of decision: two pre-market IEX windows and a read-only
+  probe of `iex` and `boats` under `paper:test`, 04:53 New York, received no SPY quote, trade or bar;
+  IEX's REST bars began at 08:15 in 2026-11-10's pre-market. The counts and sources are in ADR 0044's
+  pre-market row and Evidence (run).
 
 * NautilusTrader at the pin, `d53849b216e2`: `crates/common/src/python/actor.rs` (`params=None` on
   `subscribe_quotes`, `subscribe_trades`, `request_bars`), `crates/common/src/python/commands.rs` (the

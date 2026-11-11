@@ -608,11 +608,9 @@ def test_auto_takes_the_overnight_session_when_extended_windows_are_on(monkeypat
 
 @pytest.mark.parametrize(
     ("part", "expected"),
-    [("overnight", "boats"), ("pre-market", "iex"), ("regular", "iex")],
+    [("overnight", "boats"), ("regular", "iex")],
 )
-def test_a_window_streams_boats_overnight_and_iex_in_the_regular_session_and_pre_market(
-    part, expected
-) -> None:
+def test_a_window_streams_boats_overnight_and_iex_in_the_regular_session(part, expected) -> None:
     """ADR 0055: on paper `boats` delivered the overnight session's quotes, trades and bars."""
     assert session_window.window_feed(part) == expected
 
@@ -622,6 +620,8 @@ def test_a_part_with_no_feed_is_skipped_and_an_unknown_part_named() -> None:
         session_window.WindowSkipped, match="no after-hours window: probed on paper"
     ):
         session_window.window_feed("after-hours")
+    with pytest.raises(session_window.WindowSkipped, match="no pre-market window: probed on paper"):
+        session_window.window_feed("pre-market")
     with pytest.raises(RuntimeError, match="no feed is set for the 'midday' part"):
         session_window.window_feed("midday")
 
@@ -632,19 +632,29 @@ def test_each_part_of_a_session_names_its_feed_and_what_paper_has_shown_of_it() 
     assert set(table) == {"regular", "pre-market", "after-hours", "overnight"}
     assert table["after-hours"].feed is None and "2026-11-10" in table["after-hours"].observed
     assert table["overnight"].feed == "boats" and "2026-11-10" in table["overnight"].observed
-    assert table["pre-market"].feed == "iex" and "not yet probed" in table["pre-market"].observed
+    assert table["pre-market"].feed is None and "2026-11-11" in table["pre-market"].observed
     assert table["regular"].feed == "iex" and "2026-11-10" in table["regular"].observed
 
 
-def test_an_after_hours_window_is_skipped_by_name_not_failed(monkeypatch, tmp_path, capsys) -> None:
+@pytest.mark.parametrize(
+    ("at", "part", "observed"),
+    [
+        (datetime(2026, 11, 10, 17, 0), "after-hours", "16:46 New York, 2026-11-10"),
+        (datetime(2026, 11, 10, 5, 0), "pre-market", "04:25 New York, 2026-11-11"),
+    ],
+)
+def test_a_part_with_no_feed_is_skipped_by_name_not_failed(
+    monkeypatch, tmp_path, capsys, at, part, observed
+) -> None:
     """The lead decided on 2026-11-11 that a part no feed has been seen to serve on paper is skipped,
-    naming the part and the observation, rather than run to fail for no data every evening."""
+    naming the part and the observation, rather than run to fail for no data every evening; after-hours
+    on the probe of 2026-11-10, pre-market on the windows and the probe of 2026-11-11."""
 
-    class AfterHours(Account):
+    class Outside(Account):
         def get_clock(self) -> Clock:
-            return clock(datetime(2026, 11, 10, 17, 0, tzinfo=NEW_YORK), is_open=False)
+            return clock(at.replace(tzinfo=NEW_YORK), is_open=False)
 
-    monkeypatch.setattr(session_window, "paper_trading", lambda: AfterHours())
+    monkeypatch.setattr(session_window, "paper_trading", lambda: Outside())
     monkeypatch.setattr(
         session_window, "window_node", lambda *a, **k: pytest.fail("a node was built")
     )
@@ -652,10 +662,26 @@ def test_an_after_hours_window_is_skipped_by_name_not_failed(monkeypatch, tmp_pa
     for session, said in (("auto", "nothing to run"), ("extended", "skipped")):
         assert session_window.main(["--session", session, "--log-dir", str(tmp_path)]) == 0
         out = capsys.readouterr().out
-        assert f"{said}: no after-hours window" in out and "16:46 New York, 2026-11-10" in out
+        assert f"{said}: no {part} window" in out and observed in out
         assert json.loads((tmp_path / "latest.json").read_text()) == {"result": "ok"}
         heard = json.loads((tmp_path / "last-firing.json").read_text())
-        assert heard["outcome"].startswith(f"{said}: no after-hours window")
+        assert heard["outcome"].startswith(f"{said}: no {part} window")
+
+
+def test_a_part_given_a_feed_again_runs_its_windows(monkeypatch) -> None:
+    """Review finding: with pre-market and after-hours skipped, nothing showed that a row given a feed
+    again (a later probe that delivers) runs that part's windows on it."""
+    monkeypatch.setattr(session_window, "EXTENDED_READY", True)
+    monkeypatch.setitem(
+        session_window.SESSION_FEEDS,
+        "pre-market",
+        session_window.SessionFeed("iex", "a later probe delivered"),
+    )
+    found, why = session_window.resolve_session(
+        clock(datetime(2026, 11, 10, 8, 30, tzinfo=NEW_YORK), is_open=False), CALENDAR
+    )
+    assert (found, why) == ("extended", "outside the regular session, in its pre-market part")
+    assert session_window.window_feed("pre-market") == "iex"
 
 
 def test_an_overnight_window_needs_only_its_trade_dates_session_open() -> None:
@@ -1107,7 +1133,7 @@ def test_the_warm_up_needs_time_bars() -> None:
     [
         (datetime(2026, 11, 10, 11, 0), True, False, "regular"),
         (datetime(2026, 11, 10, 17, 0), False, False, None),
-        (datetime(2026, 11, 10, 5, 0), False, True, "extended"),  # pre-market
+        (datetime(2026, 11, 10, 5, 0), False, True, None),  # pre-market: no feed
         (datetime(2026, 11, 10, 17, 0), False, True, None),  # after-hours: no feed
         (datetime(2026, 11, 10, 21, 0), False, True, None),  # overnight is not run
     ],
