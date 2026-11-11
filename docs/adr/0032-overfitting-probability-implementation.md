@@ -1,11 +1,11 @@
 ---
-status: proposed
+status: accepted
 date: 2026-11-10
 decision-makers: repo owner by delegation; master orchestrator (Claude)
-review-by: 2026-12-10
+review-by: 2027-02-09
 ---
 
-# Overfitting probability implementation: nine read, none adopted until one passes this repo's tests
+# Overfitting probability implementation: skfolio's splits and Sharpe ratios, Algorithm 2.3's last steps here
 
 ## Context and Problem Statement
 
@@ -28,9 +28,14 @@ Options 1 and 3 both sit under ADR 0027's option 2, a diagnostic computed by an 
 
 ## Decision Outcome
 
-Proposed: **option 3**. The implementation is the open gap: nine were read and none is adopted, so a
-ranking report carries no PBO yet. The paper's open points (leftover rows, ties, the boundary) are in
-ADR 0027.
+Accepted: **option 2**, narrowed to what no adopted upstream ships. skfolio 1.12.9, already pinned for
+the DSR (ADR 0031), does Algorithm 2.3 up to each half's Sharpe ratios:
+`CombinatorialPurgedCV(n_folds=16, n_test_folds=8, purged_size=0, embargo_size=0)` makes the 12,870
+halvings of `returns_matrix`'s rows, trimmed to a multiple of 16, and `Portfolio.sharpe_ratio` the ratios.
+The fourth step's pick and out-of-sample rank, ω and λ, and the fifth step's share are code here, a
+contract its module header names: the paper, the algorithm and its step numbers, and skfolio's two
+symbols. Its tests, each failing first: a hand-computed S = 4 case and the §6 planted-signal case. The
+paper's open points are settled in ADR 0027.
 
 What each implementation does. "Unspecified" ties are ranked by `np.argsort`, whose default sort is not
 stable.
@@ -47,7 +52,7 @@ stable.
 | sharpebench 0.28.0 | MIT OR Apache-2.0 | unequal | all | against the pick | Rust; wheels for Linux x86-64 and Python 3.10–3.13 only |
 | pypbo `4d723f0` | AGPL-3.0 | equal; drops the first rows | all | average rank | not on PyPI, no tags; excluded by licence |
 
-Nothing is adopted, because the implementations have not converged and nothing waits on this:
+No package is adopted, because the implementations have not converged:
 
 * The nine differ on leftover rows, ties, the split count and the boundary. No two were shown to agree.
 * **trialgate 0.6.0** is closest to the statistic as written in ADR 0027, but has one maintainer, five releases
@@ -57,29 +62,55 @@ Nothing is adopted, because the implementations have not converged and nothing w
   and PyWavelets for one function.
 * No adoption signal was verified for any of them. None is in the registry: an entry needs a resolved pin.
 
-What would close the gap, either of:
+Why a few lines here rather than RiskLabAI 3.2.0, the most established candidate. Its
+`probability_of_backtest_overfitting` (`src/RiskLabAI/backtest/probability_of_backtest_overfitting.py`)
+matches Algorithm 2.3 on the halvings (lines 129-149, every C(S, S/2), once T is trimmed), the rank and
+logit (lines 69-74: ascending 1-based rank, the best N, ω = r/(N+1)) and the boundary (line 77, λ ≤ 0).
+It departs on the one open point it decides: ties. Line 69 ranks by `np.argsort(np.argsort(...))`, with
+numpy's default sort, which is not stable, so a configuration tied with the pick lands above or below it
+in no stated order, where ADR 0027 ranks it above. Its blocks come from `np.array_split` (line 129),
+unequal unless T is trimmed first, and its default Sharpe ratio uses `np.std` with ddof 0
+(`backtest_statistics.py` line 51), which leaves the ranks of one halving unchanged. Adopting it would
+also bring joblib, statsmodels and PyWavelets for one function.
 
-* One candidate reproduces, in this repo's tests, a hand-computed S = 4 case and the §6 planted-signal
-  case: RiskLabAI with T trimmed, or trialgate once it declares Python 3.14 and has a longer history or
-  a second maintainer. It then goes through `adopt-upstream`.
-* The owner decides that Algorithm 2.3 is a documented contract we may implement (ADR 0027, option 3). The same two
-  test cases apply, plus agreement with a read package on a shared matrix.
-
-Who decided. Adopting nothing now was chosen by the orchestrator on 2026-11-10 under the owner's
-delegation quoted in ADR 0010's Evidence.
+Who decided. Adopting no package was chosen by the orchestrator on 2026-11-10 under the owner's
+delegation quoted in ADR 0010's Evidence. This record said on 2026-11-10 that implementing Algorithm 2.3
+here was the owner's decision; that is superseded by the owner's delegation of 2026-11-11 (ADR 0074),
+under which the lead chose this route on 2026-11-11, on the condition that RiskLabAI's departure be
+stated, as above.
 
 ### Consequences
 
 * Good: the candidates are read at pinned source instead of listed from summaries.
-* Bad: a ranking report has no overfitting diagnostic until an implementation exists.
+* Good: the split and the ratio are upstream; what is code here is the part on which upstreams disagree.
+* Bad: a ranking report has no overfitting diagnostic until the code lands, and the code is ours to keep.
 
 ### Confirmation
 
 * No PBO package is in `pyproject.toml`, and none is imported.
-* When one is adopted, a test reproduces a hand-computed S = 4 case, and a ranking report states S and PBO
-  beside the DSR.
+* When the code lands, its header names the paper, Algorithm 2.3's steps and skfolio's two symbols; its
+  tests reproduce the hand-computed S = 4 case and the §6 planted-signal case, each failing first; and a
+  ranking report states S, N, T and PBO beside the DSR, or "not computable" below ADR 0027's floors.
 * Re-read 2026-11-10 against skfolio 1.12.9 (ADR 0031's pin): the gap is open. `CombinatorialPurgedCV`
   only splits, with unequal blocks; Algorithm 2.3's pick, rank and logit would be our own code (option 2).
+* Re-read 2026-11-11 at the same pin, for the extreme-movers study's adoption test: the gap
+  is open, and narrower. With skfolio, everything up to each half's Sharpe ratios is upstream: the
+  matrix (the first step) from `returns_df`, and the blocks and halvings (the second, after trimming,
+  and the third and the start of the fourth) from the splitter. How the
+  gate would call it: take `returns_matrix` (a T×N `DataFrame` of daily returns, one column per
+  configuration, from skfolio's `Population.returns_df`), drop T mod 16 rows, and iterate
+  `CombinatorialPurgedCV(n_folds=16, n_test_folds=8, purged_size=0, embargo_size=0).split(M)`, which
+  yields the training rows and a list of eight test blocks, joined, for each of the 12,870 halvings. It
+  raises unless T // 16 is at least 2, so T is at least 32 (line 350).
+  Each half's Sharpe ratio per column is skfolio's (`Portfolio.sharpe_ratio`, as `session_sharpe`
+  already takes it). The pick, its out-of-sample rank, the logit and the share at or below zero are the
+  four steps no adopted upstream ships; the nine packages above each do them, and differently.
+* skfolio's splitter is the combinatorial purged cross-validation of López de Prado (2018), built to
+  refit a model on each training set and recombine test paths (`_combinatorial.py` lines 81-82 and 236;
+  López de Prado, SSRN 3104816, 2018, Solution 9, read through a mirror because SSRN returned 403).
+  Used here only for its split indices, with purging and embargo at zero, which Algorithm 2.3 does not
+  have. That source also puts the remainder rows in the last group, as skfolio does, so trimming T is a
+  departure CSCV's equal blocks need, not a correction of skfolio.
 
 ## Evidence
 
@@ -124,8 +155,8 @@ or run.
   no PBO, CSCV or logit. `CombinatorialPurgedCV` yields training indices and test-fold lists for each of
   C(n_folds, n_test_folds) splits (16 and 8 give 12,870; its cap is 100,000). The first `n_folds - 1`
   blocks hold `T // n_folds` rows and the last holds the rest, where Algorithm 2.3 needs equal blocks, so T
-  is trimmed first. It cites López de Prado (2018), §12.4, for refitting a model per split, read only
-  through the book's table of contents; the chapter is UNVERIFIED.
+  is trimmed first. It cites López de Prado (2018), with no section (lines 185-186). The book's
+  chapter 12 on this splitter was not read (its table of contents is scanned images): UNVERIFIED.
 * https://cran.r-project.org/web/packages/pbo/index.html — R `pbo` 1.3.5, 2022-05-26, MIT. Fetched. Its
   source was not read.
 * An `upstream-scout` lane found three of the nine (RiskLabAI, backtest-overfitting, trialgate), and
@@ -139,3 +170,14 @@ or run.
 * Second reader of the split, 2026-11-10 (`evidence-verifier`): nothing of ADR 0027 is missing from the two
   records. It corrected an option number that pointed at this record's own list, the options' wording,
   which read as declining ADR 0027's option 2, and a reference to the statistic, which is in ADR 0027.
+* The 2026-11-11 skfolio read and the run on 64 and 70 rows are in ADR 0027's Evidence.
+  `src/canon_trading/returns_matrix.py`, `returns_matrix` and `session_sharpe`, read the same day for
+  what the gate already provides.
+* Second reader of the 2026-11-11 re-read (`evidence-verifier`): the call, `returns_matrix` and
+  `session_sharpe` hold. It corrected which of Algorithm 2.3's steps skfolio covers and the attribution
+  of §12.4, which skfolio does not cite, and added the T ≥ 32 floor, the refit sources and the
+  remainder rows of López de Prado's own splitter. The nine-package table was not re-read.
+* RiskLabAI 3.2.0, PyPI source archive `risklabai-3.2.0.tar.gz`, sha256 c498676a (matches
+  https://pypi.org/pypi/RiskLabAI/3.2.0/json), read 2026-11-11:
+  `src/RiskLabAI/backtest/probability_of_backtest_overfitting.py` lines 56-77 and 122-156, and
+  `src/RiskLabAI/backtest/backtest_statistics.py` lines 34-56. Fetched. Not installed or run.
