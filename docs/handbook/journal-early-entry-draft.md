@@ -72,7 +72,9 @@ Dollar volume by 15-minute segment, against the mean of the same segment in its 
 | 12:30 | 1,048,681 | 20,387 | **51.4** | 0.6 |
 | 12:45 | 6,011,829 | 23,622 | **254.5** | 2.8 |
 | 13:00 | 15,944,873 | 11,411 | 1,397.3 | 8.7 |
-| 13:15 (to 13:22) | 6,543,466 | 16,760 | 390.4 | 11.0 |
+
+The 13:15 segment is left out: the bars cover seven of its minutes, and the run that printed this
+table set them against a full segment's mean (since corrected in the code).
 
 **Reading.** The segment's own ratio passed 3 in the 11:45 segment and 50 in the 12:30 segment. The
 listing's measure, volume since 04:00 over its normal, passed 3 only at 13:01. CENN's five earlier
@@ -136,7 +138,7 @@ rule enters none of them in the four minutes of bars there are.
 * evidence: `canon_trading.early_entry_study` at commit `7cfde3b`; the table above; the bar walk is NautilusTrader's docs/concepts/backtesting/bar-execution.md at the pin
 * lesson: On names whose one-minute range is wider than the trigger's distance, the exit's price depends on whether the minute's high or low came first, which a bar does not record. The managed outcome on bars is not evidence for or against the trigger; the entry's timing is
 * change: none. A diagnostic changes no row (ADR 0092)
-* next: Measure the exit on the paper window's own `sip` quotes and trades; ask the data lane for historical trades through the adapter; report each managed outcome under both orders of high and low until then
+* next: Measure the exit on the paper window's own `sip` quotes and trades; add historical trades to the adapter's data client; report each managed outcome under both orders of high and low until then
 * status: open
 * supersedes: none
 * source: lead

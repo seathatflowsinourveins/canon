@@ -13,14 +13,16 @@ What is upstream's, and what is mirrored:
   `<symbol>.ALPACA-1-MINUTE-LAST-EXTERNAL` and `-1-DAY-LAST-EXTERNAL`, on one feed a root.
 * **The listing arithmetic** is the movers ranking's (ADR 0083, requirement 1): the move from the latest
   completed regular-session close, and the dollar volume since 04:00 New York over its normal, the mean of
-  the same clock minutes in earlier sessions, by `canon_trading.movers_stream.normal`. A bar's dollar
+  the same clock minutes in earlier sessions, as `canon_trading.movers_stream.normal` defines it (a test
+  holds this module's running sums equal to it). A bar's dollar
   volume is close x volume, as `movers_stream` takes it. The ranking functions of ADR 0087 are not on
   `main`; when they are, this module calls them instead of `movers_stream`'s, and a difference in a
   listing minute is a finding (their dollar volume is VWAP x volume, which a catalog `Bar` does not carry).
 * **The entry** mirrors `canon_trading.mover.Mover` as committed at `660b37e` (not on `main`): a watched
   name's bars are kept from the minute it is listed, a run is `run_bars` closes in a row each above the
   one before (a repeated close is not a rise), a run is decided on once, and the buy is a limit at the
-  ask. The exit mirrors its protection: a trailing trigger `TRAIL` of the entry under the highest bid
+  ask. One refusal is not at that commit: an entry whose bid is under the planned stop, which the paper
+  window's working copy makes (UNVERIFIED here until it is committed). The exit mirrors its protection: a trailing trigger `TRAIL` of the entry under the highest bid
   since the entry, a released limit `EXIT_THROUGH` of the entry under the trigger, and a chase that
   never prices below `CHASE_CAP` under that first limit. Those three are `MoverConfig`'s defaults there,
   not arms here. When `Mover` is on `main` the rule is imported, not mirrored.
@@ -61,6 +63,8 @@ from datetime import date
 from datetime import datetime
 from datetime import time
 from datetime import timedelta
+from functools import lru_cache
+from itertools import accumulate
 from itertools import pairwise
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -71,8 +75,6 @@ from canon_alpaca.constants import VENUE
 from nautilus_trader.model import NautilusDataType
 from nautilus_trader.persistence import ParquetDataCatalog
 from skfolio.model_selection import WalkForward
-
-from .movers_stream import normal
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -96,8 +98,8 @@ CHASE_CAP = 0.02
 LATE = 0.5
 """An entry after this share of the day's move is late (ADR 0092)."""
 MINUTE_NS = 60 * 1_000_000_000
-DEVELOPMENT_SHARE = 0.7
-"""The earliest share of the list's dates that is development; the rest is the holdout (ADR 0092)."""
+DEVELOPMENT_TENTHS = 7
+"""The earliest tenths of the list's dates that are development; the rest is the holdout (ADR 0092)."""
 BLOCKS = 5
 """A walk-forward block is one in this many of the development dates, rounded down."""
 HOLDOUT_MARK = ".holdout-opened"
@@ -125,13 +127,13 @@ class Rows:
 
     The first five are in code: `list_move` and `list_ratio` are ADR 0083's starting rows,
     `baseline_sessions` the ranking's baseline length, `run_bars` and `max_move` `MoverConfig`'s
-    (`max_move`, the no-chase cap on the move from the reference close, has no default there, and `None`
-    here is no cap). The last four are in no code yet and take no default: `first_leg_minutes` (a run
+    (`max_move`, the no-chase cap on the move from the reference close, is required there with no
+    default, so `None` here, no cap, is a run `Mover` itself cannot make: ADR 0092 says why). The last four are in no code yet and take no default: `first_leg_minutes` (a run
     that completes later than this after the name was first listed is extended), `quiet_minutes` and
     `max_above_quiet` (a run whose close is further than this above the quiet price is extended; the
     quiet price is the median close of the bars in the `quiet_minutes` before the run's first bar) and
     `pullback` (an extended run is refused, unless after the highest close up to the run's first bar some
-    close up to that bar was at least this fraction under it). `None` turns a rule off, which is `Mover` at `660b37e`.
+    close up to that bar was at least this fraction under it). For these four `None` turns the rule off, as at `660b37e`.
     """
 
     list_move: float
@@ -291,26 +293,33 @@ def minute_dollars(bars: Iterable[Minute]) -> list[float]:
     return by_minute
 
 
-def listing(day: Day, rows: Rows) -> list[Listed]:
+def listing(day: Day, rows: Rows) -> tuple[Listed, ...]:
     """The listing thresholds at each bar's close: the move from the reference and the dollar volume
-    since 04:00 over the mean of the same minutes in the latest `baseline_sessions` earlier sessions. A
-    name with no reference is never listed; one with no normal (no earlier session, or none that traded
-    by that minute) has no ratio and is not listed, as the ranking leaves an unknown out."""
-    sessions = [minute_dollars(s) for s in day.earlier[: rows.baseline_sessions]]
+    since 04:00 over the mean of the same minutes in the latest `baseline_sessions` earlier sessions
+    (`canon_trading.movers_stream.normal`'s definition, kept as running sums). A name with no
+    reference is never listed; one with no normal (no earlier session, or none that traded by that
+    minute) has no ratio and is not listed, as the ranking leaves an unknown out."""
+    return _listing(day, rows.list_move, rows.list_ratio, rows.baseline_sessions)
+
+
+@lru_cache(maxsize=4096)
+def _listing(day: Day, list_move: float, list_ratio: float, sessions: int) -> tuple[Listed, ...]:
+    taken = day.earlier[:sessions]
+    normals = [0.0] * (WINDOW_END - PART_START + 1)  # the mean dollar volume by each minute's end
+    for session in taken:
+        for elapsed, total in enumerate(accumulate(minute_dollars(session)), 1):
+            normals[elapsed] += total / len(taken)
     out, dollars = [], 0.0
     for bar in day.bars:
         dollars += bar.dollars
-        base = normal(sessions, bar.start + 1 - PART_START)
+        base = normals[bar.start + 1 - PART_START] or None
         move = bar.close / day.reference - 1.0 if day.reference else float("nan")
         ratio = None if base is None else dollars / base
         listed = bool(
-            day.reference
-            and move >= rows.list_move
-            and ratio is not None
-            and ratio >= rows.list_ratio
+            day.reference and move >= list_move and ratio is not None and ratio >= list_ratio
         )
         out.append(Listed(bar.start + 1, move, dollars, base, ratio, listed))
-    return out
+    return tuple(out)
 
 
 def first_listed(seen: Sequence[Listed]) -> int | None:
@@ -389,25 +398,25 @@ def refusal(
     return None
 
 
-def protect(bars: Sequence[Minute], entry: float, costs: Costs) -> Exit | None:
+def protect(bars: Sequence[Minute], entry: float, bid: float, costs: Costs) -> Exit | None:
     """The trailing sell over the bars after the entry's bar, each walked open, high, low, close.
 
-    The trigger starts `TRAIL` of the entry under the entry's bid and follows the highest bid up. A low
-    that reaches it sells at the trigger. An open already under it sells at that open's bid if that is
-    within the released limit's give and the chase's cap, and otherwise rests at the cap's floor until a
-    bid reaches it. None if nothing sold by the last bar: the position is closed at the window's end.
+    The trigger starts `TRAIL` of the entry under `bid`, the bid at the entry, and follows the highest
+    bid up. A low that reaches it sells at the trigger. An open already under it sells at that open's
+    bid if that is within the released limit's give and the chase's cap, and otherwise rests at the
+    cap's floor until a bid reaches it: at a later open's bid if that is above the floor, else at the
+    floor. None if nothing sold by the last bar: the position is closed at the window's end.
     """
-    if not bars:
-        return None
     trailing = entry * TRAIL
-    high = entry / (1 + costs.half(bars[0].start)) * (1 - costs.half(bars[0].start))
-    first = trigger = high - trailing
+    first = trigger = bid - trailing
     raises, floor = 0, None
     for bar in bars:
         half = costs.half(bar.start + 1)
         bids = [p * (1 - half) for p in (bar.open, bar.high, bar.low, bar.close)]
         if floor is not None:  # a released limit resting at the chase's floor
-            if max(bids) >= floor:
+            if bids[0] >= floor:
+                return Exit(bar.start + 1, bids[0], "floor", first, trigger, raises)
+            if bids[1] >= floor:
                 return Exit(bar.start + 1, floor, "floor", first, trigger, raises)
             continue
         if bids[0] <= trigger:  # opened under the trigger: the limit is released into a gap
@@ -469,7 +478,7 @@ def replay(day: Day, rows: Rows, costs: Costs = GROSS, *, start: int = PART_STAR
             continue
         entry = bar.close * (1 + costs.half(now.minute))
         after = day.bars[index + 1 :]
-        out = protect(after, entry, costs)
+        out = protect(after, entry, bar.close * (1 - costs.half(now.minute)), costs)
         last_bid = day.bars[-1].close * (1 - costs.half(day.bars[-1].start + 1))
         sold = last_bid if out is None else out.price
         ahead = (max(b.high for b in after) - entry) / span if after else 0.0
@@ -519,10 +528,10 @@ def read_days(path: Path, sha256: str) -> list[tuple[date, str]]:
 
 
 def split_dates(dates: Iterable[date]) -> tuple[list[date], list[date]]:
-    """The list's dates in order, cut into development (the earliest `DEVELOPMENT_SHARE`, rounded down)
+    """The list's dates in order, cut into development (the earliest `DEVELOPMENT_TENTHS` tenths, rounded down)
     and the later holdout. Refused if development is short of one date a block."""
     unique = sorted(set(dates))
-    cut = int(len(unique) * DEVELOPMENT_SHARE)
+    cut = len(unique) * DEVELOPMENT_TENTHS // 10
     if cut < BLOCKS or cut == len(unique):
         raise ValueError(
             f"{len(unique)} dates leave {cut} for development, where the walk-forward needs {BLOCKS} "
@@ -546,14 +555,13 @@ def folds(development: Sequence[date]) -> list[tuple[list[date], list[date]]]:
 
 def early_share(runs: Sequence[Replay]) -> tuple[float, float]:
     """The choice's objective: the share of the names replayed (missing ones left out) entered not
-    late, then the median share of the move still ahead at entry (zero with no entry)."""
+    late, then the median share of the move still ahead at entry, a name not entered counting zero."""
     held = [r for r in runs if r.day.missing is None]
     if not held:
         return (0.0, 0.0)
-    ahead = [r.ahead for r in held if r.ahead is not None]
     return (
         sum(not r.late for r in held) / len(held),
-        statistics.median(ahead) if ahead else 0.0,
+        statistics.median(r.ahead or 0.0 for r in held),
     )
 
 
@@ -590,10 +598,15 @@ def walk_forward(
     return out
 
 
+def holdout_marker(list_path: Path) -> Path:
+    """The file beside the list that says its holdout was opened."""
+    return list_path.with_name(list_path.name + HOLDOUT_MARK)
+
+
 def open_holdout(list_path: Path) -> Path:
-    """Mark the holdout of the list at `list_path` as opened, in a file beside it, and refuse a second
-    opening: the marker is created exclusively, so it cannot be made twice."""
-    marker = list_path.with_name(list_path.name + HOLDOUT_MARK)
+    """Mark the holdout of the list at `list_path` as opened and refuse a second opening: the marker is
+    created exclusively, so it cannot be made twice."""
+    marker = holdout_marker(list_path)
     try:
         with marker.open("x", encoding="utf-8") as out:
             out.write(f"opened {datetime.now(UTC).isoformat()}\n")
@@ -688,6 +701,10 @@ def load_day(catalog_path: Path, symbol: str, day: date) -> Day:
         return gone("no bar before the day: the reference close is unknown")
     reference, source = closes.get(sessions[0]), "the daily bar"
     if reference is None:
+        if _covered_to(catalog, minute_type, sessions[0]) != WINDOW_END:
+            return gone(
+                f"no daily bar for {sessions[0]}, and its minute bars are not covered to 16:00"
+            )
         regular = [m for m in by_day.get(sessions[0], ()) if m.start >= REGULAR_OPEN]
         if not regular:
             return gone(f"no daily bar and no regular-session minute bar on {sessions[0]}")
@@ -723,14 +740,17 @@ def pct(value: float | None) -> str:
     return "-" if value is None else f"{value:+.1%}"
 
 
-def segments(day: Day, sessions: int) -> list[tuple[int, float, float | None]]:
-    """Each 15-minute segment's dollar volume and the mean of the same segment in earlier sessions."""
+def segments(day: Day, sessions: int) -> list[tuple[int, int, float, float | None]]:
+    """Each 15-minute segment's start and end, its dollar volume and the mean of the same minutes in
+    earlier sessions. The last segment ends where the catalog's cover of the day does."""
     today = minute_dollars(day.bars)
     before = [minute_dollars(s) for s in day.earlier[:sessions]]
+    covered = day.covered_to - PART_START
     out = []
-    for at in range(0, day.covered_to - PART_START, SEGMENT):
-        mean = sum(sum(s[at : at + SEGMENT]) for s in before) / len(before) if before else None
-        out.append((PART_START + at, sum(today[at : at + SEGMENT]), mean))
+    for at in range(0, covered, SEGMENT):
+        end = min(at + SEGMENT, covered)
+        mean = sum(sum(s[at:end]) for s in before) / len(before) if before else None
+        out.append((PART_START + at, PART_START + end, sum(today[at:end]), mean))
     return out
 
 
@@ -789,10 +809,10 @@ def section(day: Day, rows: Rows, costs: Costs | None, start: int) -> list[str]:
         "|---|---|---|---|---|",
     ]
     total = total_mean = 0.0
-    for at, dollars, mean in segments(day, rows.baseline_sessions):
+    for at, end, dollars, mean in segments(day, rows.baseline_sessions):
         total, total_mean = total + dollars, total_mean + (mean or 0.0)
         lines.append(
-            f"| {clock(at)} | {dollars:,.0f} | {'-' if mean is None else f'{mean:,.0f}'} | "
+            f"| {clock(at)}{'' if end - at == SEGMENT else f' to {clock(end)}'} | {dollars:,.0f} | {'-' if mean is None else f'{mean:,.0f}'} | "
             f"{'-' if not mean else f'{dollars / mean:.1f}'} | "
             f"{'-' if not total_mean else f'{total / total_mean:.1f}'} |"
         )
@@ -898,10 +918,30 @@ def _one_day(args: argparse.Namespace, costs: Costs | None) -> int:
     return 0
 
 
+def _priced(costs: Costs | None) -> list[tuple[str, Costs]]:
+    """Gross, and with a spread given the costs at one and at two times it (ADR 0092, measure 4)."""
+    return [("gross", GROSS)] + (
+        [] if costs is None else [("costs x1", costs), ("costs x2", costs.times(2))]
+    )
+
+
+def _at_each_cost(days: Sequence[Day], rows: Rows, costs: Costs | None) -> str:
+    return "\n\n".join(
+        f"*{label}*\n\n" + "\n".join(summary([replay(day, rows, cost) for day in days]))
+        for label, cost in _priced(costs)
+    )
+
+
 def _listed_days(args: argparse.Namespace, costs: Costs | None) -> int:
-    """The walk-forward over the list's development dates; with `--open-holdout`, the one holdout run."""
+    """The walk-forward over the list's development dates; with `--open-holdout`, the one holdout run.
+
+    An arm is chosen at the spread given (gross without one) and reported at every cost. The holdout is
+    marked opened only once its days are read and replayed, so a run that fails, or finds none of its
+    names in the catalog, leaves it unopened; a holdout already opened is refused before anything runs."""
     listed = read_days(args.days_file, args.sha256)
     development, holdout = split_dates(d for d, _ in listed)
+    if args.open_holdout and holdout_marker(args.days_file).exists():
+        open_holdout(args.days_file)  # raises: it is opened once
     cost = costs or GROSS
     print(
         f"## Early-entry walk-forward (DIAGNOSTIC: changes no row): {len(listed)} name-days on "
@@ -910,10 +950,11 @@ def _listed_days(args: argparse.Namespace, costs: Costs | None) -> int:
     )
     days = [load_day(args.catalog, s, d) for d, s in listed if d in development]
     for number, fold in enumerate(walk_forward(days, development, cost), 1):
+        judged = [run.day for run in fold.runs]
         print(
             f"**Fold {number}**: chosen on {len(fold.chosen_on)} dates, judged on "
             f"{len(fold.judged)} later dates: `{fold.arm}`\n\n"
-            + "\n".join(summary(fold.runs))
+            + _at_each_cost(judged, ARMS[fold.arm], costs)
             + "\n"
         )
     chosen = choose(days, cost)
@@ -921,12 +962,16 @@ def _listed_days(args: argparse.Namespace, costs: Costs | None) -> int:
         f"**Chosen on all development dates**: `{chosen}`\n\n" + "\n".join(arms_table(days, cost))
     )
     if args.open_holdout:
-        marker = open_holdout(args.days_file)
         held_out = [load_day(args.catalog, s, d) for d, s in listed if d in holdout]
-        runs = [replay(day, ARMS[chosen], cost) for day in held_out]
+        if all(day.missing is not None for day in held_out):
+            raise LookupError(
+                "none of the holdout's names is in the catalog, so the holdout stays unopened"
+            )
+        report = _at_each_cost(held_out, ARMS[chosen], costs)
+        marker = open_holdout(args.days_file)
         print(
             f"\n**Holdout, opened once ({marker.name} written beside the list)**: `{chosen}`\n\n"
-            + "\n".join(summary(runs))
+            + report
         )
     return 0
 
@@ -970,6 +1015,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("give --day with --symbols, or --days-file with --sha256, and not both")
     if args.open_holdout and not a_list:
         parser.error("--open-holdout goes with --days-file")
+    if a_list and args.start != PART_START:
+        parser.error("--from goes with --day: a list is replayed from 04:00")
     if not PART_START <= args.start < WINDOW_END:
         parser.error("--from must be from 04:00 to before 16:00")
     costs = None

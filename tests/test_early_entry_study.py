@@ -30,6 +30,7 @@ from canon_trading.early_entry_study import Costs
 from canon_trading.early_entry_study import Day
 from canon_trading.early_entry_study import Minute
 from canon_trading.early_entry_study import replay as replay_day
+from canon_trading.movers_stream import normal
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -171,7 +172,7 @@ def test_the_trigger_rises_on_a_bar_s_high_before_its_low_is_tested() -> None:
     after = [
         Minute(600, 10.0, 10.5, 10.1, 10.4, 1.0),  # trigger to 10.3; the low 10.1 reaches it
     ]
-    out = study.protect(after, entry, study.GROSS)
+    out = study.protect(after, entry, entry, study.GROSS)
     assert out is not None
     assert (out.why, out.minute, out.raises) == ("trail", 601, 1)
     assert out.first_trigger == pytest.approx(entry * (1 - TRAIL))
@@ -182,13 +183,15 @@ def test_an_open_under_the_trigger_sells_at_the_open_or_rests_at_the_chase_s_flo
     entry, trigger = 10.0, 9.8
     limit = trigger - entry * EXIT_THROUGH
     floor = limit * (1 - CHASE_CAP)
-    gap = study.protect([Minute(600, 9.7, 9.7, 9.6, 9.6, 1.0)], entry, study.GROSS)
+    gap = study.protect([Minute(600, 9.7, 9.7, 9.6, 9.6, 1.0)], entry, entry, study.GROSS)
     assert gap is not None and (gap.why, gap.price) == ("gap", 9.7)
     deep = [Minute(600, 9.0, 9.1, 8.9, 9.0, 1.0), Minute(601, 9.0, 9.7, 9.0, 9.6, 1.0)]
-    rest = study.protect(deep, entry, study.GROSS)
+    rest = study.protect(deep, entry, entry, study.GROSS)
     assert rest is not None and (rest.why, rest.minute) == ("floor", 602)
     assert rest.price == pytest.approx(floor)
-    assert study.protect(deep[:1], entry, study.GROSS) is None  # still held at the window's end
+    assert (
+        study.protect(deep[:1], entry, entry, study.GROSS) is None
+    )  # still held at the window's end
 
 
 def test_costs_move_the_entry_to_the_ask_and_the_sale_to_the_bid() -> None:
@@ -344,6 +347,8 @@ def test_the_dates_split_in_order_and_the_folds_never_judge_a_date_they_chose_on
     assert (development, holdout) == (DATES[:7], DATES[7:])
     with pytest.raises(ValueError, match="walk-forward needs 5"):
         study.split_dates(DATES[:7])
+    ninety = [date(2026, 1, 1) + timedelta(days=i) for i in range(90)]
+    assert len(study.split_dates(ninety)[0]) == 63  # 90 x 0.7 in floating point is under 63
     folds = study.folds(DATES)
     assert [(len(train), test) for train, test in folds] == [
         (2, DATES[2:4]),
@@ -439,3 +444,109 @@ def test_a_top_up_s_own_interval_is_joined_to_the_one_before_it(
     day = study.load_day(tmp_path, "TEST", DAY)
     assert day.covered_to == OPEN + 30
     assert len(day.bars) == 7
+
+
+# --- what the review of 2026-11-11 found -----------------------------------------------------------
+
+
+def test_the_running_normal_is_movers_stream_s_normal() -> None:
+    earlier = tuple(
+        tuple(bars(OPEN + i, [10.0, 10.2, 10.1], volume=100.0 * (i + 1))) for i in range(5)
+    )
+    day = a_day(RISE, earlier=earlier)
+    sessions = [study.minute_dollars(s) for s in earlier]
+    for seen in study.listing(day, REGISTERED):
+        assert seen.normal == pytest.approx(normal(sessions, seen.minute - study.PART_START))
+    assert study.listing(a_day(RISE), REGISTERED)[0].normal == pytest.approx(1000.0)
+
+
+def test_the_first_trigger_is_under_the_entry_s_own_bid_across_the_open() -> None:
+    costs = Costs(premarket=0.005, regular=0.001)
+    early = study.REGULAR_OPEN - 10
+    today = [
+        Minute(early - 1, 10.0, 10.1, 10.0, 10.1, 100.0),
+        *bars(early, [10.4, 10.5, 10.6, 10.7], first=10.1),
+        Minute(OPEN + 1, 10.7, 10.7, 10.6, 10.65, 1000.0),  # the next bar is after the open
+    ]
+    run = replay_day(a_day(today), REGISTERED, costs)
+    assert run.entry is not None and run.entry == pytest.approx(10.7 * 1.005)
+    assert (
+        run.exit is None
+    )  # the low's bid, 10.6 x 0.999, is above 10.7 x 0.995 less 2% of the entry
+    out = study.protect(today[-1:], run.entry, 10.7 * 0.995, costs)
+    assert out is None
+
+
+def test_a_limit_resting_at_the_floor_sells_at_a_later_open_above_it() -> None:
+    entry = 10.0
+    floor = (9.8 - entry * EXIT_THROUGH) * (1 - CHASE_CAP)
+    deep = [Minute(600, 9.0, 9.1, 8.9, 9.0, 1.0), Minute(601, 9.9, 10.0, 9.9, 10.0, 1.0)]
+    out = study.protect(deep, entry, entry, study.GROSS)
+    assert out is not None and (out.why, out.price) == ("floor", 9.9)
+    assert out.price > floor
+
+
+def test_a_name_not_entered_counts_zero_in_the_tie_break() -> None:
+    entered = replay_day(on(DATES[0], RISE), REGISTERED)
+    never = replay_day(on(DATES[1], SLOW), REGISTERED)
+    assert study.early_share([entered, never, never]) == (0.0, 0.0)
+    assert study.early_share([entered])[1] == pytest.approx(0.2 / 0.9)
+
+
+def test_a_part_segment_is_set_against_the_same_minutes_of_earlier_sessions() -> None:
+    earlier = (
+        tuple(Minute(study.PART_START + i, 10.0, 10.0, 10.0, 10.0, 10.0) for i in range(30)),
+    )
+    today = Day(
+        "TEST", DAY, tuple(earlier[0][:20]), earlier, 10.0, covered_to=study.PART_START + 20
+    )
+    assert study.segments(today, 5) == [
+        (study.PART_START, study.PART_START + 15, 1500.0, 1500.0),
+        (study.PART_START + 15, study.PART_START + 20, 500.0, 500.0),
+    ]
+    assert "| 04:15 to 04:20 | 500 | 500 | 1.0 | 1.0 |" in study.section(
+        today, REGISTERED, None, 240
+    )
+
+
+def test_no_reference_is_taken_from_a_session_not_covered_to_its_close(
+    tmp_path: Path, alpaca_bars: AlpacaBars
+) -> None:
+    before = date(2026, 11, 10)
+    equity = alpaca_bars.equity("TEST")
+    bar_type = BarType.from_str(f"{equity.id}-1-MINUTE-LAST-EXTERNAL")
+    tmp_path.mkdir(exist_ok=True)
+    catalog = ParquetDataCatalog(str(tmp_path))
+    for day, start, until in ((before, 13 * 60, 13 * 60 + 22), (DAY, OPEN, OPEN + 30)):
+        series = [
+            parse_bar(AlpacaBar("TEST", payload), bar_type, equity)
+            for payload in minute_payloads(day, start, [10.0, 10.1], 100)
+        ]
+        catalog.write_bars(series, start=study._ns(day, 0), end=study._ns(day, until))
+    assert study.load_day(tmp_path, "TEST", DAY).missing == (
+        "no daily bar for 2026-11-10, and its minute bars are not covered to 16:00"
+    )
+
+
+def test_a_holdout_that_cannot_be_replayed_stays_unopened_and_one_that_can_is_priced_twice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = tmp_path / "days.csv"
+    digest = write_list(path, [f"{d},TEST" for d in DATES])
+    gone = Day("TEST", DAY, (), (), None, missing="no minute bars in the catalog")
+    monkeypatch.setattr(
+        study, "load_day", lambda catalog, symbol, day: on(day, SLOW) if day in DATES[:7] else gone
+    )
+    argv = ["--catalog", str(tmp_path), "--days-file", str(path), "--sha256", digest]
+    with pytest.raises(LookupError, match="stays unopened"):
+        study.main([*argv, "--open-holdout"])
+    assert not study.holdout_marker(path).exists()
+    monkeypatch.setattr(study, "load_day", lambda catalog, symbol, day: on(day, SLOW))
+    capsys.readouterr()
+    assert study.main([*argv, "--open-holdout", "--half-spread-bps", "20", "10"]) == 0
+    out = capsys.readouterr().out
+    holdout = out[out.index("**Holdout, opened once") :]
+    assert all(label in holdout for label in ("*gross*", "*costs x1*", "*costs x2*"))
+    assert study.holdout_marker(path).exists()
+    with pytest.raises(SystemExit):
+        study.main([*argv, "--from", "09:40"])
