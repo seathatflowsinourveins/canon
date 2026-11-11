@@ -125,8 +125,10 @@ canceled at its timeout with its signal dropped and no second order meanwhile, a
 with a marked limit; a stop while an order works sends no second exit; a short is bought back; the cap
 trips at two shares and holds at one over 3,000 checks; the runtime checks and the scoped reconciliation
 are set; the window refuses an extended session while `EXTENDED_READY` is off, overnight, the regular
-session when closed, a non-trading day, a SIP feed, over 60 minutes, an account not flat and a start
-inside the gap.
+session when closed, a non-trading day, a calendar day without `session_open` or `session_close`, a SIP
+feed, over 60 minutes, an account not flat and a start inside the gap; on macOS, a run with no
+`--log-dir` whose `getconf DARWIN_USER_TEMP_DIR` gives no absolute folder, and a relative `--log-dir`,
+are refused before Alpaca is read.
 
 A second reader's review (2026-11-10), each fix first shown by a failing test in the same file: the wait for
 the node's stop had no bound (now `STOP_TIMEOUT_SECS`, about 115 s, the node's own stop bounds and one request
@@ -177,9 +179,10 @@ A third second reader's review (2026-11-10), each fix first shown by a failing t
 * A limit was canceled once at its timeout and no alert followed, so a cancel rejected or unanswered left
   it working for good, the strategy deciding nothing and its stop closing nothing: it is now looked at
   after each further timeout until it is closed, canceled again when a cancel was rejected, its signal
-  dropped once. A cancel that went unanswered leaves it pending cancel, which the strategy can neither
-  cancel again (refused at the pin) nor query (the adapter answers no order query); the node's open-order
-  check and the window's account check, which cancels in any session, are what clear it. Extended
+  dropped once. A cancel that went unanswered leaves it pending cancel, which the strategy cannot cancel
+  again (refused at the pin); the node's in-flight check (which queries it, and the adapter answers
+  `QueryOrder`), its open-order check and the window's account check, which cancels in any session, are
+  what clear it. Extended
   windows, the only ones that send these limits, stay off (`EXTENDED_READY`).
 * A close that filled in part and timed out held the dropped side, so the shares left stayed open for the
   rest of the cross: a limit that filled in part, by its timeout or while its cancel was on its way, now
@@ -446,6 +449,13 @@ Read 2026-11-10. "raw": fetched with `curl` and read whole. NautilusTrader files
   nautilus-trader 2.0.0rc8 in `.venv`, `model/__init__.pyi`: `OrderRejected.reconciliation`,
   `OrderCanceled.reconciliation` (`bundled`). `packages/canon-alpaca/src/canon_alpaca/providers.py`,
   `counted` and `not_sent`: a connect timeout on a call's only attempt sent nothing (ADR 0039) (read).
+* 2026-11-10, second readers' sweep for silent fallbacks (Muse Code, DeepSeek Harness), each reproduced
+  by a failing test: a calendar day without `session_close` (`Optional[str]` in alpaca-py 0.45.0's
+  `Calendar`) gave an extended window a 20:00 end, and a failing `getconf` on macOS moved the records to
+  `$TMPDIR`'s folder; both are now refused by name, as is a relative `--log-dir` (what `mise.toml`'s
+  `paper:session` passes when its own `getconf` prints nothing; its lock file has the same gap). The window's code no longer matches a close by its
+  quantity, so the third claim, an unreadable `qty` taken for no close, no longer applies. Corrected: the
+  adapter answers `QueryOrder` (ADR 0036), so the in-flight check queries a limit left pending cancel (run).
 * Code review (`/code-review`, high), 2026-11-10, of the account check as one set: ten findings, eight
   reproduced against the tests' stand-in and fixed above, one (a second record of the check's own
   closes) removed, one (this record's length) left open (run).
