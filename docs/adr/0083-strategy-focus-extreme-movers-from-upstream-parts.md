@@ -172,6 +172,34 @@ landed steps stand, and it carries a dated pointer. ADR 0077's quote study is he
 * When a gap's record lands, that gap's paragraph here shrinks to one line and a pointer.
 * M0's figures and each paper run are added here, with command, exit and log.
 * Accepted 2026-11-11 on the lead's read, after one evidence-verifier pass.
+* 2026-11-11, the mover window (`session_window --mover`): a one-day bridge and a check of the stack on a
+  mover (spreads, halts, the feed), not the practice's strategy and not M1. It runs the existing
+  long-only `SessionMaCross`, one share, its marked DAY limit through the touch for every order (never a
+  market entry, the practice's rule restated by the lead on 2026-11-11), regular session only, on `sip`, on one name
+  chosen before the node is built (`choose_mover`). The name is the top of `movers_stream.rank` over a
+  three-minute sample of the whole market's sip minute bars on the window's own pair (`stream_mover`:
+  `subscribe_bars(handler, "*")`, then `movers_stream.refresh`); if the sample fails or qualifies no name,
+  over Alpaca's 50 gainers (`get_market_movers`, `get_stock_snapshot`, `get_stock_bars`, `read_normals`),
+  and the record says so. The pick is the first that
+  `TradingClient.get_asset` gives `status` active and `tradable` (`ap:alpaca/trading/models.py:37-97`,
+  `client.py:399`), whose name does not mark a warrant, unit or right (a name match, a proxy: an ETF is
+  not told apart, UNVERIFIED), and that has no corporate action since the last session
+  (`CorporateActionsClient.get_corporate_actions`). Halted has no REST read at the pin and Alpaca's assets page has `overnight_halted`
+  only; the statuses channel (`ap:…/live/stock.py:135`) is not used, since Alpaca's page does not say a
+  subscription is sent the current status, so not-halted is approximated by a latest sip trade at most
+  120 s old (UNCALIBRATED, a proxy with no upstream behind it). No price floor. The
+  SPY-only refusal is now "one share must fit the cap" for any symbol, from the latest sip trade
+  (`get_stock_latest_trade`); the instrument loads through NautilusTrader's
+  `InstrumentProviderConfig(load_ids=...)`; the start check and the check after the stop read the whole
+  account (`get_orders` with no symbol, `get_all_positions`) and act on the window's symbol only. The
+  record names the symbol, its rank inputs, the ranked and passed-over names and the screener's list.
+  A limit found on its first run (YMT, account A, 2026-11-11: no order, no cross in 25 live bars, the
+  10-bar average below the 20 on every bar as YMT fell): the node's time bars are built for every clock
+  minute, trades or not, since NautilusTrader's `time_bars_build_with_no_updates` defaults to true at the
+  pin (`nt:crates/data/src/engine/config.rs:36-38`), so a volatility pause adds flat bars that Alpaca's
+  sip bars do not have (25 against 9; by count, the bars were not kept). For a mover's averages and
+  ranking Alpaca's bars are the right ones; a mover node sets it false, as upstream's data testing spec
+  does (`nt:docs/developer_guide/spec_data_testing.md:42`). Not changed in the bridge.
 
 ## Evidence
 
@@ -198,6 +226,9 @@ the commit `canon/upstreams.lock.json` records.
 * https://docs.alpaca.markets/us/docs/orders-at-alpaca.md — "Only limit orders with `time_in_force` set
   to `day` or `gtc` orders are accepted as extended hours eligible"; "Trailing stop will not trigger
   outside of the regular market hours"; brackets: "Extended hours are not supported". Fetched.
+* https://docs.alpaca.markets/us/reference/get-v2-assets-symbol_or_asset_id.md — `status` "active or
+  inactive", `tradable`, and `attributes` whose one halt value is `overnight_halted`; no general halt
+  field. Fetched 2026-11-11 for the mover window's line (Confirmation).
 * https://docs.alpaca.markets/us/docs/245-trading.md — the four sessions; an order for a security halted
   overnight is "accepted" and "held in a pending state". Fetched.
 * NautilusTrader at the pin

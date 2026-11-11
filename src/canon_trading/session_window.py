@@ -3,9 +3,12 @@
 Contract: NautilusTrader v2.0.0rc8's `LiveNode.builder`, `LiveNode.add_builtin_strategy`, `Cache.quote_count`
 and `trade_count`, `LiveExecutionEngineConfig` and `LoggerConfig` with a `FileWriterConfig`
 (`live/__init__.pyi`, `common/__init__.pyi`); alpaca-py 0.45.0's `TradingClient` (paper)
-`get_clock`, `get_calendar`, `get_orders`, `get_open_position`, `get_order_by_client_id`,
+`get_clock`, `get_calendar`, `get_orders`, `get_all_positions`, `get_asset`, `get_order_by_client_id`,
 `cancel_order_by_id` and `submit_order` with a `MarketOrderRequest`, and `get_account_configurations` and
-`set_account_configurations` with an `AccountConfiguration`. Read 2026-11-10 (ADR 0044; the account
+`set_account_configurations` with an `AccountConfiguration`; for a mover window, `ScreenerClient`
+`get_market_movers`, `CorporateActionsClient.get_corporate_actions`, `StockHistoricalDataClient`
+`get_stock_latest_trade`, `get_stock_snapshot` and `get_stock_bars`, and `StockDataStream.subscribe_bars`
+(2026-11-11, ADR 0083). Read 2026-11-10 (ADR 0044; the account
 check's sources, ADR 0060), and the long-only sources 2026-11-11:
 
 * https://nautilustrader.io/docs/md/latest/how_to/configure_live_trading.md, "Continuous reconciliation":
@@ -56,8 +59,9 @@ setting is somehow off still holds none: upstream's `EmaCross` is one.
 What one window is (one node, one process): one strategy of `WINDOW_STRATEGIES` that the table does not
 refuse: `SessionMaCross` (upstream's built-in `EmaCross` stays in the table, ADR 0068 step 3, and is
 refused by name for selling while flat, "Long-only" above); the configured session and feed, checked against Alpaca's
-clock and calendar before anything starts; the paper account holding no open order and no position in the
-symbol; at least `GAP_SECS` since the last window ended; then the node runs for `minutes` (default 30, at
+clock and calendar before anything starts; the paper account holding no open order and no position in any
+symbol (`leftovers`); one share of the symbol, at its latest sip trade, inside the per-order notional cap
+(`one_share_fits`); at least `GAP_SECS` since the last window ended; then the node runs for `minutes` (default 30, at
 most 60), clipped to the session's end and to `LONGEST_WINDOW_SECS` (about 49 minutes, so a paper test
 waiting for the stream lock outlasts the window and its bounded end), the record saying so when it is. `SessionMaCross` winds down `FLATTEN_SECS` before the end (`EmaCross` has
 no wind-down and trades to the stop), the node
@@ -108,6 +112,25 @@ the adapter's own lines about its stream, from the node's log, go in the record;
 nothing, or that the adapter logged an error for, fails the window, since the adapter reports a refused
 or ended stream only there (ADR 0055).
 
+A mover window (`--mover`, ADR 0083's dated line of 2026-11-11) is a one-day bridge and a check of the
+stack on a mover (its spreads, halts and feed), not the practice's strategy: the same `SessionMaCross`, one
+share, in the regular session only, streaming `sip`, with every order in the strategy's limit form (a
+marked DAY limit through the touch, `WindowConfig.limits`), since an entry is never a market order; the
+account check after the stop may still close at market in the session. Its name is chosen once before the
+node is built (`choose_mover`) and loaded by NautilusTrader's instrument provider at connect
+(`InstrumentProviderConfig(load_ids=...)`, `paper_node.alpaca_paper_builder`). The name comes from
+`stream_mover`: a `SAMPLE_MINUTES` sample of the whole market's sip minute bars on the window's own pair
+(alpaca-py's `StockDataStream.subscribe_bars(handler, "*")`, as `movers_stream` streams them), ranked by
+`movers_stream.rank` on `movers_stream.refresh`'s references and normals. If the sample fails or qualifies
+no name, `select_mover` takes Alpaca's gainers (alpaca-py's `ScreenerClient.get_market_movers`), ranked the
+same way on `get_stock_snapshot`, `get_stock_bars` and `read_normals`, and the record says why. Either way
+the pick is the first that `TradingClient.get_asset` gives `status`
+active and `tradable` and a name that is not a warrant, unit or right (`NOT_COMMON`), with no corporate
+action since the last session (`get_corporate_actions`), a sip trade inside `FRESH_TRADE_SECS` (not halted,
+by a proxy: alpaca-py reads no halt over REST) and one share inside the cap. The start check and the check
+after the stop read the whole account (`get_orders` with no symbol, `get_all_positions`); the check acts on
+the window's symbol only and names anything else as left.
+
 Paper only: the execution client is `canon_alpaca`'s, whose config refuses anything but paper trading, and
 the alpaca-py client here is built with `paper=True`. The key pair comes from the environment, which
 `mise run paper:session` fills as `paper:test` does (ADR 0044, superseding ADR 0029's "only" clause). This evaluates nothing (ADR 0010).
@@ -119,12 +142,14 @@ import argparse
 import asyncio
 import functools
 import json
+import logging
 import math
 import os
 import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import traceback
 from collections import deque
@@ -134,7 +159,9 @@ from concurrent.futures import wait
 from dataclasses import asdict
 from dataclasses import dataclass
 from dataclasses import field
+from dataclasses import replace
 from datetime import UTC
+from datetime import date
 from datetime import datetime
 from datetime import time as dt_time
 from datetime import timedelta
@@ -142,6 +169,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import cast
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -150,6 +178,18 @@ from alpaca.common.constants import DEFAULT_RETRY_WAIT_SECONDS
 from alpaca.common.exceptions import APIError
 from alpaca.common.rest import RESTClient
 from alpaca.data.enums import DataFeed
+from alpaca.data.historical.corporate_actions import CorporateActionsClient
+from alpaca.data.historical.screener import ScreenerClient
+from alpaca.data.historical.stock import StockHistoricalDataClient
+from alpaca.data.live.stock import StockDataStream
+from alpaca.data.models.bars import BarSet
+from alpaca.data.models.corporate_actions import CorporateActionsSet
+from alpaca.data.requests import CorporateActionsRequest
+from alpaca.data.requests import MarketMoversRequest
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.requests import StockLatestTradeRequest
+from alpaca.data.requests import StockSnapshotRequest
+from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide as AlpacaOrderSide
 from alpaca.trading.enums import QueryOrderStatus
@@ -171,6 +211,7 @@ from canon_alpaca.providers import CONNECT_TIMEOUT_SECS
 from canon_alpaca.providers import READ_TIMEOUT_SECS
 from canon_alpaca.providers import counted
 from canon_alpaca.providers import not_sent
+from canon_alpaca.providers import request_counts
 from canon_alpaca.providers import with_http_timeout
 from nautilus_trader.common import LogLevel
 from nautilus_trader.common import logging_sync_to_disk
@@ -183,9 +224,22 @@ from nautilus_trader.model import Quantity
 from nautilus_trader.model import StrategyId
 from nautilus_trader.model import TimeInForce
 
+from .movers_screener import MOVERS_TOP
+from .movers_screener import movers_line
+from .movers_stream import STREAM_LOGGER
+from .movers_stream import Reads
+from .movers_stream import Tape
+from .movers_stream import Warnings
+from .movers_stream import minute_dollars
+from .movers_stream import minute_start
+from .movers_stream import rank
+from .movers_stream import read_normals
+from .movers_stream import reference_close
+from .movers_stream import refresh
 from .paper_node import DELAY_POST_STOP_SECS
 from .paper_node import EMA_CROSS
 from .paper_node import EMA_CROSS_ID
+from .paper_node import MAX_NOTIONAL_PER_ORDER_USD
 from .paper_node import MAX_ORDER_SUBMIT_RATE
 from .paper_node import TIMEOUT_DISCONNECTION_SECS
 from .paper_node import TIMEOUT_SHUTDOWN_SECS
@@ -198,10 +252,13 @@ from .session_ma_cross import SessionMaCross
 from .session_ma_cross import SessionMaCrossConfig
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Mapping
     from collections.abc import Sequence
 
     from nautilus_trader.common import Cache
+
+    from .movers_stream import Stream
 
 NEW_YORK = ZoneInfo("America/New_York")
 SESSIONS = ("regular", "extended")
@@ -511,6 +568,9 @@ class WindowConfig:
     log_dir: Path = field(default_factory=default_log_dir)
     strategy: str = DEFAULT_STRATEGY
     """A name of `WINDOW_STRATEGIES`."""
+    mover: bool = False
+    """Run on the name `choose_mover` gives at the start, in place of `symbol` (`MOVER_FEED`, regular
+    session only); `symbol` is then the one chosen."""
 
     def __post_init__(self) -> None:
         if self.session not in SESSIONS:
@@ -528,9 +588,10 @@ class WindowConfig:
             raise ValueError(
                 f"{_runs_only(self.strategy, runs)}, not in the {self.session} session: {runs.why}"
             )
-        if self.symbol != "SPY":
+        if self.mover and self.session != "regular":
             raise ValueError(
-                f"the notional cap is sized for SPY (paper_node.MAX_NOTIONAL_PER_ORDER_USD); got {self.symbol}"
+                "a mover window runs in the regular session only (marked DAY limits on sip), not in "
+                f"the {self.session} session"
             )
         if not 1 <= self.minutes <= MAX_MINUTES:
             raise ValueError(f"minutes must be 1 to {MAX_MINUTES}, got {self.minutes}")
@@ -540,6 +601,13 @@ class WindowConfig:
             raise ValueError(
                 "an extended window waits until one has passed on paper (EXTENDED_READY, ADR 0044)"
             )
+
+    @property
+    def limits(self) -> bool:
+        """Whether every order of `SessionMaCross` is its marked DAY limit through the touch: outside the
+        regular session, and in a mover window in any session, since an entry is never a market order
+        (ADR 0083's dated line of 2026-11-11)."""
+        return self.session == "extended" or self.mover
 
     @property
     def instrument_id(self) -> InstrumentId:
@@ -720,9 +788,9 @@ def window_node(
             f"{config.strategy} names no feed in its subscription, so it streams {FEED.value}; this "
             f"window's part streams {feed}"
         )
-    extended = config.session == "extended"
+    limits = config.limits
     # `SessionMaCross`'s managed stop runs a market exit inside the post-stop delay; a built-in has none
-    managed = runs.builtin is None and not extended
+    managed = runs.builtin is None and not limits
     node = (
         alpaca_paper_builder(
             "CANON-PAPER-SESSION",
@@ -750,7 +818,7 @@ def window_node(
             trade_size=Quantity.from_int(1),
             fast_period=config.fast_period,
             slow_period=config.slow_period,
-            extended_hours=extended,
+            extended_hours=limits,  # every order a marked DAY limit through the touch
             feed=feed,
             wind_down_at=wind_down_at,
             warm_up=True,  # the averages start from the adapter's last bars (ADR 0047)
@@ -758,7 +826,7 @@ def window_node(
             strategy_id=STRATEGY_ID,
             order_id_tag="001",
             # In the session, `stop()` runs upstream's market exit, with closing orders Alpaca takes.
-            manage_stop=not extended,
+            manage_stop=not limits,
             market_exit_reduce_only=False,
             market_exit_time_in_force=TimeInForce.DAY,
             market_exit_interval_ms=MARKET_EXIT_INTERVAL_MS,
@@ -837,6 +905,22 @@ class WindowReport:
     no_shorting: bool | None = None
     """Alpaca's `no_shorting` for the account, read by the start check (`venue_no_shorting`): true, the
     account is long-only at the venue."""
+    share_price: str = ""
+    """One share's latest sip price at the start, which must fit the per-order cap (`one_share_fits`)."""
+    mover: dict[str, Any] = field(default_factory=dict)
+    """For a mover window, its choice (`stream_mover`, or `select_mover` as the fallback): the source,
+    the symbol, its rank inputs, the names ranked and passed over with why, and the screener's list as
+    Alpaca gave it."""
+    requests: list[dict[str, Any]] = field(default_factory=list)
+    """What the process sent to Alpaca's REST APIs by the window's end, per account and API, as the
+    adapter counts it (`canon_alpaca.providers.request_counts`); the account is a number, never a key."""
+    fill_prices: dict[str, list[str]] = field(default_factory=dict)
+    """Each fill of the strategy's orders, by client order ID: `qty@price` and the venue's time
+    (`OrderFilled`'s `last_qty`, `last_px`, `ts_event`)."""
+    submit_delays_ms: dict[str, int] = field(default_factory=dict)
+    """Per order, from the strategy's submit to the node's receipt of Alpaca's acceptance: `OrderAccepted`'s
+    `ts_init` less the order's first event's (`OrderInitialized`), both on the node's clock."""
+    worst_submit_delay_ms: int | None = None
 
 
 class WindowRefused(RuntimeError):
@@ -952,26 +1036,28 @@ def send_once(trading: TradingClient) -> None:
         trading._retry = 0
 
 
-def open_orders(trading: TradingClient, symbol: str) -> list:
+def open_orders(trading: TradingClient) -> list:
+    """Every open order in the account, whatever its symbol."""
     orders = trading.get_orders(
         # the most one listing returns ("Defaults to 50 and max is 500"), as the adapter asks
-        GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol], limit=ORDERS_PAGE_LIMIT)
+        GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=ORDERS_PAGE_LIMIT)
     )
     assert isinstance(orders, list)
     return orders
 
 
-def position_qty(trading: TradingClient, symbol: str) -> Decimal:
-    """The signed quantity Alpaca holds in `symbol`, 0 when none (404)."""
-    try:
-        position = trading.get_open_position(symbol)
-    except APIError as e:
-        if e.status_code == 404:
-            return Decimal(0)
-        raise
-    assert isinstance(position, AlpacaPosition)
-    qty = abs(Decimal(str(position.qty)))
-    return -qty if getattr(position.side, "value", position.side) == "short" else qty
+def positions(trading: TradingClient) -> dict[str, Decimal]:
+    """The signed quantity Alpaca holds in each symbol of the account (alpaca-py's `get_all_positions`,
+    `GET /v2/positions`); a symbol with none is absent."""
+    found = trading.get_all_positions()
+    assert isinstance(found, list)
+    held: dict[str, Decimal] = {}
+    for position in found:
+        assert isinstance(position, AlpacaPosition)
+        qty = abs(Decimal(str(position.qty)))
+        short = getattr(position.side, "value", position.side) == "short"
+        held[position.symbol] = -qty if short else qty
+    return held
 
 
 def venue_no_shorting(trading: TradingClient) -> bool:
@@ -1021,16 +1107,25 @@ def long_only_task(action: str, trading: TradingClient | None = None) -> int:
     return failed
 
 
-def leftovers(trading: TradingClient, symbol: str) -> list[str]:
-    return described(open_orders(trading, symbol), position_qty(trading, symbol), symbol)
+def leftovers(trading: TradingClient) -> list[str]:
+    """What the whole account holds: each open order and each position, whatever its symbol."""
+    return elsewhere(open_orders(trading), positions(trading))
 
 
 def described(orders: list, qty: Decimal, symbol: str) -> list[str]:
-    """What is left, as a window's record names it: each open order, then the position."""
+    """What is left in the window's symbol, as its record names it: each open order, then the position."""
     left = [f"open order {o.client_order_id}" for o in orders]
     if qty:
         left.append(f"position of {qty} {symbol}")
     return left
+
+
+def elsewhere(orders: list, held: Mapping[str, Decimal]) -> list[str]:
+    """What is left in symbols other than the window's, each named with its symbol: the account is not
+    flat while any is there, and the window sends nothing for one, since it is not the window's."""
+    return [f"open order {o.client_order_id} in {o.symbol}" for o in orders] + [
+        f"position of {qty} {symbol}" for symbol, qty in held.items() if qty
+    ]
 
 
 def window_seconds(minutes: int, session_left: float) -> tuple[float, str]:
@@ -1050,6 +1145,405 @@ def window_seconds(minutes: int, session_left: float) -> tuple[float, str]:
             f"{PAPER_LOCK_WAIT_SECS} s wait"
         )
     return seconds, f"shortened from {minutes} minutes to {seconds:.0f} s: {why}"
+
+
+NOT_COMMON = re.compile(r"\b(warrants?|units?|rights?)\b", re.IGNORECASE)
+"""What in Alpaca's asset `name` marks a warrant, a unit or a right, which a mover window passes over; common
+shares and depositary receipts are kept. A proxy with no upstream behind it: alpaca-py 0.45.0's `Asset` and
+Alpaca's assets page give `class` `us_equity` and no security type."""
+FRESH_TRADE_SECS = 120
+"""A mover's latest sip trade must be at most this old at its selection (UNCALIBRATED): a proxy for not
+halted, with no upstream behind it. alpaca-py 0.45.0 reads no halt over REST (`Asset` has `status` and
+`tradable`; Alpaca's asset `attributes` has `overnight_halted` only), and halts come on the stream's
+statuses channel (`subscribe_trading_statuses`), whose page does not say a subscription is sent the current
+status (ADR 0083, gap 4)."""
+MOVER_CHECKS = 10
+"""The ranked names checked, best first, before a mover window is refused: each priced and fresh one costs
+one asset read."""
+MOVER_FEED = DataFeed.SIP.value
+"""What a mover window streams: the consolidated feed the ranking reads (`movers_stream`, ADR 0083)."""
+MOVER_SOURCE = "screener"
+"""`select_mover`'s source: Alpaca's movers (`movers_screener`), `choose_mover`'s fallback when the stream
+sample fails or qualifies no name (ADR 0083's dated line of 2026-11-11)."""
+STREAM_SOURCE = "stream"
+"""`stream_mover`'s source: a short sample of the whole market's sip minute bars on the window's own pair."""
+SAMPLE_MINUTES = 3
+"""Clock minutes of bars the stream sample ranks on (UNCALIBRATED; the lead's 2026-11-11 direction: two or
+three). The sample's time counts against the window, as every start-up read does."""
+BAR_GRACE_SECS = 5.0
+"""How long after a minute ends the sample waits for that minute's bars (UNCALIBRATED)."""
+SAMPLE_STOP_SECS = 15.0
+"""How long the sample's stream thread may take to end after `stop()` (`movers_stream.STOP_SECS`)."""
+REFRESH_PASSES = 4
+"""`movers_stream.refresh` calls after the sample: each reads up to 4,000 references and 200 normals."""
+REFRESH_SECS = 60.0
+"""The longest one `refresh` pass starts reads for."""
+
+
+class StreamSampleFailed(RuntimeError):
+    """The stream sample could not rank: the stream stopped or failed, or no bar came."""
+
+
+@dataclass(frozen=True)
+class MoverPick:
+    """The name a mover window runs on, its latest sip price, and what its record keeps of the choice."""
+
+    symbol: str
+    price: Decimal
+    record: dict[str, Any]
+
+
+def window_data() -> StockHistoricalDataClient:
+    """alpaca-py's market data client on the environment's pair, with the adapter's HTTP timeout
+    (ADR 0039); paper and live keys read the same market data API."""
+    return with_http_timeout(
+        StockHistoricalDataClient(
+            api_key=os.environ[ENV_API_KEY], secret_key=os.environ[ENV_SECRET_KEY]
+        )
+    )
+
+
+def window_actions() -> CorporateActionsClient:
+    """alpaca-py's corporate actions client on the environment's pair, with the adapter's HTTP timeout."""
+    return with_http_timeout(
+        CorporateActionsClient(
+            api_key=os.environ[ENV_API_KEY], secret_key=os.environ[ENV_SECRET_KEY]
+        )
+    )
+
+
+def window_screener() -> ScreenerClient:
+    """alpaca-py's screener client on the environment's pair, with the adapter's HTTP timeout."""
+    return with_http_timeout(
+        ScreenerClient(api_key=os.environ[ENV_API_KEY], secret_key=os.environ[ENV_SECRET_KEY])
+    )
+
+
+def share_price(data: StockHistoricalDataClient, symbol: str) -> Decimal:
+    """`symbol`'s latest sip trade price (alpaca-py's `get_stock_latest_trade`), or `WindowRefused`."""
+    found = data.get_stock_latest_trade(
+        StockLatestTradeRequest(symbol_or_symbols=symbol, feed=DataFeed.SIP)
+    )
+    if not isinstance(found, dict) or (trade := found.get(symbol)) is None:
+        raise WindowRefused(
+            f"Alpaca gave no latest sip trade for {symbol}, so whether one share fits the cap is not "
+            "known; not starting"
+        )
+    return Decimal(str(trade.price))
+
+
+def one_share_fits(symbol: str, price: Decimal) -> None:
+    """`WindowRefused` unless one share at `price` fits the risk engine's per-order notional cap
+    (`paper_node.MAX_NOTIONAL_PER_ORDER_USD`), which every window's order of one share must pass."""
+    if price > MAX_NOTIONAL_PER_ORDER_USD:
+        raise WindowRefused(
+            f"one share of {symbol} at {price} USD does not fit the per-order notional cap of "
+            f"{MAX_NOTIONAL_PER_ORDER_USD} USD; not starting"
+        )
+
+
+def select_mover(
+    trading: TradingClient,
+    data: StockHistoricalDataClient,
+    screener: ScreenerClient,
+    actions: CorporateActionsClient,
+    at: datetime,
+    regular_open: datetime,
+    since: date,
+) -> MoverPick:
+    """The top name of the movers ranking at `at` among Alpaca's gainers that Alpaca reports active and
+    tradable, whose latest sip trade is inside `FRESH_TRADE_SECS`, whose one share fits the cap, which is
+    not a warrant, a unit or a right (`NOT_COMMON`), and which has no corporate action from `since`, the
+    last completed session, to today (alpaca-py's `get_corporate_actions`), since one would change what its
+    move is measured from; or `WindowRefused` naming why each checked name was passed over.
+
+    Every input is an upstream read through alpaca-py 0.45.0: the gainers from `get_market_movers` (top
+    50), each one's last completed close and latest trade from `get_stock_snapshot`, today's minute bars
+    from the regular open from `get_stock_bars`, and its normal from `movers_stream.read_normals`; the
+    score is `movers_stream.rank`'s, `move x dvol_ratio` (UNCALIBRATED, ADR 0083 gap 1)."""
+    elapsed = int((at - regular_open).total_seconds() // 60)
+    if elapsed < 1:
+        raise WindowRefused("no minute of the regular session has passed to rank a mover on")
+    listed = movers_line(screener.get_market_movers(MarketMoversRequest(top=MOVERS_TOP)))
+    gainers = cast("list[dict[str, Any]]", listed["gainers"])  # `Mover.model_dump()`, in order
+    symbols = [str(g["symbol"]) for g in gainers]
+    if not symbols:
+        raise WindowRefused("Alpaca's movers listed no gainer; no mover window runs")
+    snapshots = data.get_stock_snapshot(
+        StockSnapshotRequest(symbol_or_symbols=symbols, feed=DataFeed.SIP)
+    )
+    if not isinstance(snapshots, dict):
+        raise TypeError("alpaca-py returned raw snapshot data; the client must use raw_data=False")
+    references = {
+        s: reference_close(snap, at) if (snap := snapshots.get(s)) is not None else None
+        for s in symbols
+    }
+    bars = data.get_stock_bars(
+        StockBarsRequest(
+            symbol_or_symbols=symbols,
+            timeframe=TimeFrame.Minute,
+            start=regular_open,
+            end=at,
+            feed=DataFeed.SIP,
+        )
+    )
+    if not isinstance(bars, BarSet):
+        raise TypeError("alpaca-py returned raw bar data; the client must use raw_data=False")
+    close: dict[str, float] = {}
+    dvol: dict[str, float] = {}
+    for symbol in symbols:
+        if found := bars.data.get(symbol):
+            close[symbol] = max(found, key=lambda b: b.timestamp).close
+            dvol[symbol] = sum(minute_dollars(found, regular_open, elapsed))
+    normals = read_normals(data, symbols, regular_open, elapsed)
+    ranked = rank(close, dvol, references, normals, elapsed, top=len(symbols))
+    record: dict[str, Any] = {
+        "source": MOVER_SOURCE,
+        "at": at.isoformat(),
+        "elapsed_minutes": elapsed,
+        "screener": gainers,
+        "ranked": [asdict(r) for r in ranked[:MOVER_CHECKS]],
+        "passed_over": {},
+        "bounds": {
+            "cap_usd": str(MAX_NOTIONAL_PER_ORDER_USD),
+            "fresh_trade_secs": FRESH_TRADE_SECS,
+        },
+    }
+    return first_qualified(trading, actions, ranked, snapshots, record, at, since, len(symbols))
+
+
+def first_qualified(
+    trading: TradingClient,
+    actions: CorporateActionsClient,
+    ranked: list,
+    snapshots: dict,
+    record: dict[str, Any],
+    at: datetime,
+    since: date,
+    listed: int,
+) -> MoverPick:
+    """The first of `ranked`'s best `MOVER_CHECKS` that passes every filter `select_mover` names, with
+    `record` completed; or `WindowRefused` naming why each was passed over. `snapshots` holds each one's
+    latest sip trade (alpaca-py's `get_stock_snapshot`)."""
+    passed: dict[str, str] = record["passed_over"]
+    acted = corporate_actions(actions, [r.symbol for r in ranked[:MOVER_CHECKS]], since, at)
+    for scored in ranked[:MOVER_CHECKS]:
+        symbol = scored.symbol
+        trade = getattr(snapshots.get(symbol), "latest_trade", None)
+        if trade is None:
+            passed[symbol] = "no latest sip trade in its snapshot"
+            continue
+        price = Decimal(str(trade.price))
+        age = (at - trade.timestamp).total_seconds()
+        if age > FRESH_TRADE_SECS:
+            passed[symbol] = f"its latest sip trade is {age:.0f} s old (halted, by the proxy)"
+            continue
+        if price > MAX_NOTIONAL_PER_ORDER_USD:
+            passed[symbol] = (
+                f"one share at {price} USD is over the cap of {MAX_NOTIONAL_PER_ORDER_USD} USD"
+            )
+            continue
+        try:
+            asset = trading.get_asset(symbol)
+        except FAILED as e:
+            passed[symbol] = f"its asset could not be read: {type(e).__name__}: {e}"
+            continue
+        status = _value(getattr(asset, "status", None))
+        if status != "active" or getattr(asset, "tradable", False) is not True:
+            passed[symbol] = (
+                f"Alpaca's asset is {status}, tradable {getattr(asset, 'tradable', None)}"
+            )
+            continue
+        if (kind := NOT_COMMON.search(name := str(getattr(asset, "name", "") or ""))) is not None:
+            passed[symbol] = f"Alpaca's asset name {name!r} marks a {kind[1].lower()}"
+            continue
+        if symbol in acted:
+            passed[symbol] = f"a corporate action since {since}: {', '.join(acted[symbol])}"
+            continue
+        record.update(
+            symbol=symbol,
+            inputs=asdict(scored),
+            price=str(price),
+            last_trade_at=trade.timestamp.isoformat(),
+        )
+        return MoverPick(symbol, price, record)
+    raise WindowRefused(
+        f"no mover qualified among the {len(ranked)} ranked of {listed} listed: "
+        + ("; ".join(f"{s}: {why}" for s, why in passed.items()) or "none ranked")
+    )
+
+
+def corporate_actions(
+    actions: CorporateActionsClient, symbols: list[str], since: date, at: datetime
+) -> dict[str, list[str]]:
+    """The corporate action types Alpaca lists from `since` to `at`'s New York date for each of `symbols`
+    (one `get_corporate_actions` read), by every symbol an action names (`symbol`, `old_symbol`,
+    `new_symbol`, `acquiree_symbol` and the like)."""
+    if not symbols:
+        return {}
+    found = actions.get_corporate_actions(
+        CorporateActionsRequest(symbols=symbols, start=since, end=in_new_york(at).date())
+    )
+    if not isinstance(found, CorporateActionsSet):
+        raise TypeError(
+            "alpaca-py returned raw corporate actions; the client must use raw_data=False"
+        )
+    acted: dict[str, list[str]] = {}
+    for kind, listed in found.data.items():
+        for action in listed:
+            named = {v for k, v in action.model_dump().items() if k.endswith("symbol") and v}
+            for symbol in sorted(named & set(symbols)):
+                acted.setdefault(symbol, []).append(kind)
+    return acted
+
+
+def window_stream() -> StockDataStream:
+    """alpaca-py's stock stream on the environment's pair, on `sip`, handing messages over as decoded
+    (`raw_data=True`), as `movers_stream.sip_stream` builds it outside data-only mode."""
+    return StockDataStream(
+        os.environ[ENV_API_KEY], os.environ[ENV_SECRET_KEY], raw_data=True, feed=DataFeed.SIP
+    )
+
+
+def sample_stream(
+    stream: Stream,
+    minutes: int,
+    *,
+    clock: Callable[[], float] = time.time,
+    sleep: Callable[[float], None] = time.sleep,
+) -> tuple[dict[str, float], dict[str, float], datetime, int, dict[str, int]]:
+    """The whole market's sip minute bars (`subscribe_bars(handler, "*")`, run in a thread ended by
+    `stop()`, as `movers_stream.run` streams them) from the current clock minute for `minutes` minutes:
+    each symbol's last close, its dollar volume since the sample's first minute (`movers_stream.Tape`),
+    that minute's start, the minutes with bars, and the message counts; or `StreamSampleFailed`."""
+    start = clock()
+    window = minute_start(start)
+    tape = Tape(window_start=window)
+    failures: list[str] = []
+
+    def runner() -> None:
+        try:
+            stream.run()
+        except Exception as e:  # noqa: BLE001, the sample fails on it
+            failures.append(f"{type(e).__name__}: {e}")
+
+    warnings = Warnings()
+    logger = logging.getLogger(STREAM_LOGGER)
+    logger.addHandler(warnings)
+    stream.subscribe_bars(tape.on_bar, "*")
+    thread = threading.Thread(target=runner, name="mover-sample", daemon=True)
+    thread.start()
+    try:
+        wait = window + minutes * 60 + BAR_GRACE_SECS - clock()
+        if wait > 0:
+            sleep(wait)
+        alive = thread.is_alive()
+    finally:
+        stream.stop()
+        thread.join(SAMPLE_STOP_SECS)
+        logger.removeHandler(warnings)
+    if failures or not alive:
+        raise StreamSampleFailed(f"the sample's stream stopped early: {failures or 'no error'}")
+    if (
+        thread.is_alive()
+    ):  # its connection may still hold the login's stream (movers_stream.run checks)
+        raise StreamSampleFailed(
+            f"the sample's stream did not end within {SAMPLE_STOP_SECS} s of stop()"
+        )
+    if (
+        logged := warnings.take()
+    ):  # a reconnect drops minutes of bars: a partial sample ranks nothing
+        raise StreamSampleFailed(f"the sample's stream logged {logged}")
+    counts, close, dvol, latest = tape.minute()
+    elapsed = 0 if latest is None else int((latest - window) // 60) + 1
+    if elapsed < 1 or not dvol:
+        raise StreamSampleFailed(f"the sample saw no bar in its {minutes} minute(s): {counts}")
+    return close, dvol, datetime.fromtimestamp(window, UTC), elapsed, counts
+
+
+def stream_mover(
+    trading: TradingClient,
+    stream: Stream,
+    data: StockHistoricalDataClient,
+    screener: ScreenerClient,
+    actions: CorporateActionsClient,
+    since: date,
+    minutes: int = SAMPLE_MINUTES,
+    *,
+    clock: Callable[[], float] = time.time,
+    sleep: Callable[[float], None] = time.sleep,
+) -> MoverPick:
+    """The top name of the movers ranking over a `minutes` sample of the whole market's sip bars that
+    passes `first_qualified`'s filters, or `WindowRefused`/`StreamSampleFailed`. The sample is
+    `sample_stream`'s; references and normals are `movers_stream.refresh`'s reads (`REFRESH_PASSES`), the
+    score `movers_stream.rank`'s (UNCALIBRATED, ADR 0083 gap 1), over the sample's own clock minutes. Alpaca's
+    gainers are read once beside it, for the record only."""
+    close, dvol, window_start, elapsed, counts = sample_stream(
+        stream, minutes, clock=clock, sleep=sleep
+    )
+    reads = Reads()
+    for _ in range(REFRESH_PASSES):
+        refresh(reads, data, close, window_start, elapsed, clock, clock() + REFRESH_SECS)
+        if all(s in reads.references for s in close):
+            break
+    ranked = rank(close, dvol, reads.references, reads.normals, elapsed, top=MOVER_CHECKS)
+    at = datetime.fromtimestamp(clock(), UTC)
+    listed = movers_line(screener.get_market_movers(MarketMoversRequest(top=MOVERS_TOP)))
+    record: dict[str, Any] = {
+        "source": STREAM_SOURCE,
+        "at": at.isoformat(),
+        "sample": {
+            "from": window_start.isoformat(),
+            "minutes": minutes,
+            "elapsed_minutes": elapsed,
+            "messages": counts,
+            "symbols": len(close),
+            "references_known": sum(1 for v in reads.references.values() if v is not None),
+            "references_unread": sum(1 for s in close if s not in reads.references),
+            "normals_read": len(reads.normals),
+            "reads_failed": reads.failed,
+        },
+        "screener": listed["gainers"],
+        "ranked": [asdict(r) for r in ranked],
+        "passed_over": {},
+        "bounds": {
+            "cap_usd": str(MAX_NOTIONAL_PER_ORDER_USD),
+            "fresh_trade_secs": FRESH_TRADE_SECS,
+        },
+    }
+    if not ranked:
+        raise WindowRefused(f"the stream sample ranked no name: {record['sample']}")
+    snapshots = data.get_stock_snapshot(
+        StockSnapshotRequest(symbol_or_symbols=[r.symbol for r in ranked], feed=DataFeed.SIP)
+    )
+    if not isinstance(snapshots, dict):
+        raise TypeError("alpaca-py returned raw snapshot data; the client must use raw_data=False")
+    return first_qualified(trading, actions, ranked, snapshots, record, at, since, len(close))
+
+
+def choose_mover(
+    trading: TradingClient, at: datetime, regular_open: datetime, since: date
+) -> MoverPick:
+    """A mover window's name, chosen once before the node is built: `stream_mover` over a short sample of
+    the window's own sip stream; if that fails or qualifies no name, `select_mover` over Alpaca's movers
+    (`MOVER_SOURCE`), and the record says why (`stream_failed`). `at` is Alpaca's clock at the start; the
+    fallback's is moved on by the time the sample took."""
+    began = time.monotonic()
+    data, screener, actions = window_data(), window_screener(), window_actions()
+    try:
+        return stream_mover(trading, window_stream(), data, screener, actions, since)
+    except (StreamSampleFailed, WindowRefused, *FAILED) as e:
+        failed = f"{type(e).__name__}: {e}"
+    now = at + timedelta(seconds=time.monotonic() - began)
+    try:
+        pick = select_mover(trading, data, screener, actions, now, regular_open, since)
+    except FAILED as e:
+        raise WindowRefused(
+            f"no mover: the stream sample failed ({failed}), then Alpaca's movers did: "
+            f"{type(e).__name__}: {e}"
+        ) from e
+    pick.record["stream_failed"] = failed
+    return pick
 
 
 def run_window(
@@ -1088,11 +1582,8 @@ def run_window(
         )
     except RuntimeError as e:
         raise WindowRefused(str(e)) from e
-    overnight = overnight_eligibility(trading, config.symbol) if part == "overnight" else ""
-    if left := leftovers(trading, config.symbol):
-        raise WindowRefused(
-            f"the paper account is not flat in {config.symbol}; not starting: {left}"
-        )
+    if left := leftovers(trading):
+        raise WindowRefused(f"the paper account is not flat; not starting: {left}")
     no_shorting = venue_no_shorting(trading)
     if VENUE_LONG_ONLY and not no_shorting:
         raise WindowRefused(
@@ -1100,6 +1591,27 @@ def run_window(
             "and a window never opens a short; not starting. To set it: mise run paper:long-only "
             f"{account if (account := paper_account()) in PAPER_ACCOUNTS else 'windows'} on"
         )
+    mover: dict[str, Any] = {}
+    if config.mover:  # chosen once, before the node is built (ADR 0083's dated line of 2026-11-11)
+        at = clock.timestamp + timedelta(seconds=time.monotonic() - read_at)
+        days = _trading_days(calendar)
+        today = clock.timestamp.astimezone(NEW_YORK).date()
+        if today not in days or not (earlier := [d for d in days if d < today]):
+            raise WindowRefused(
+                "today and a trading day before it are not both on Alpaca's calendar read, so the "
+                "open and the last completed session are not known"
+            )
+        pick = choose_mover(trading, at, in_new_york(days[today].open), max(earlier))
+        config, price, mover, feed = (
+            replace(config, symbol=pick.symbol),
+            pick.price,
+            pick.record,
+            MOVER_FEED,
+        )
+    else:
+        price = share_price(window_data(), config.symbol)
+    one_share_fits(config.symbol, price)
+    overnight = overnight_eligibility(trading, config.symbol) if part == "overnight" else ""
 
     now = clock.timestamp.astimezone(NEW_YORK)
     seconds, shortened = window_seconds(config.minutes, (end_of_session - now).total_seconds())
@@ -1122,6 +1634,8 @@ def run_window(
         feed=feed,
         overnight=overnight,
         no_shorting=no_shorting,
+        share_price=str(price),
+        mover=mover,
     )
     write_record(
         config.log_dir, report
@@ -1186,6 +1700,17 @@ def run_window(
             raise
         finally:
             report.ended = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+            report.requests = [
+                {
+                    "account": c.account,
+                    "api": c.api,
+                    "total": c.total,
+                    "peak_minute": c.peak,
+                    "peak_60s": c.peak_60s,
+                    "rate_limited": c.rate_limited_total,
+                }
+                for c in request_counts()
+            ]
             if ran:
                 marker.write_text(str(time.time()))
                 _read_stream_lines(report, config.log_dir / f"window-{stamp}.log")
@@ -1202,7 +1727,7 @@ def run_window(
                 report.result = "ok"
             write_record(config.log_dir, report)
     if report.left:
-        raise RuntimeError(f"the paper account was not left flat in {config.symbol}: {report.left}")
+        raise RuntimeError(f"the paper account was not left flat: {report.left}")
     if report.cap_tripped:
         raise RuntimeError(f"the position cap stopped the window: {report.cap_tripped}")
     if no_data:
@@ -1348,31 +1873,40 @@ class _AccountCheck:
         self.turn = deque(self.requests)  # whose lookup comes next
         self.closes_sent = 0
         self.ended: set[str] = set()  # Alpaca's IDs of the orders it showed in a terminal status
-        self.listed: list = []  # the open orders of the last reading
-        self.held = Decimal(0)  # the position of the last reading
+        self.listed: list = []  # the open orders in the symbol of the last reading
+        self.held = Decimal(0)  # the position in the symbol of the last reading
+        self.others: list = []  # the open orders in other symbols of the last reading
+        self.others_held: dict[str, Decimal] = {}  # the positions in other symbols, likewise
         self.tried: dict[str, int] = {}  # the cancels sent for each order
         self.open_until: float | None = None  # by the clock's last answer; None before any
         for client_order_id, side in unsettled.items():
             report.unsettled.setdefault(client_order_id, [side or "side not known"])
 
     def read(self) -> list[str]:
-        """One reading: look up to `LOOKUPS` unsettled requests up, then read the open orders, which show
-        a request as its lookup does, and the position; return what is left (`left`). A lookup that
-        fails is recorded and the reading goes on; a failed read of the orders or the position raises."""
+        """One reading: look up to `LOOKUPS` unsettled requests up, then read the account's open orders,
+        which show a request as its lookup does, and its positions; return what is left (`left`). The
+        reading is of the whole account; only the symbol's orders and position are the check's to act
+        on. A lookup that fails is recorded and the reading goes on; a failed read of the orders or the
+        positions raises."""
         self._look_up()
-        self.listed = open_orders(self.trading, self.symbol)
+        listed = open_orders(self.trading)
+        self.listed = [o for o in listed if o.symbol == self.symbol]
+        self.others = [o for o in listed if o.symbol != self.symbol]
         for order in self.listed:  # the listing shows a request as its lookup does
             if (request := self.requests.get(str(order.client_order_id))) is not None:
                 self._seen(request, order)
-        self.held = position_qty(self.trading, self.symbol)
+        self.others_held = positions(self.trading)
+        self.held = self.others_held.pop(self.symbol, Decimal(0))
         return self.left()
 
     def left(self) -> list[str]:
-        """What keeps the account from being flat, as last read: each working order, the position, and
-        each unsettled request Alpaca has not shown."""
-        return described(self.working(), self.held, self.symbol) + [
-            r.missing() for r in self.requests.values() if r.order is None
-        ]
+        """What keeps the account from being flat, as last read: each working order and the position in
+        the symbol, each unsettled request Alpaca has not shown, then what other symbols hold."""
+        return (
+            described(self.working(), self.held, self.symbol)
+            + [r.missing() for r in self.requests.values() if r.order is None]
+            + elsewhere(self.others, self.others_held)
+        )
 
     def working(self) -> list:
         """Every order known to work: the open orders last listed, and each unsettled request Alpaca
@@ -1487,7 +2021,9 @@ class _AccountCheck:
             self.cancel()
             return True
         if not self.held:
-            return True  # only requests Alpaca has not shown are left: look again
+            # requests Alpaca has not shown: look again; else only other symbols' are left, not the
+            # window's to act on
+            return bool(self.requests)
         side = _closing_side(self.held)
         if waiting := [
             r.client_order_id
@@ -1564,7 +2100,8 @@ def _flatten_after_stop(
     *,
     unsettled: Mapping[str, str] | None = None,
 ) -> list:
-    """What the account holds in the symbol after the stop, once the check has worked at clearing it.
+    """What the account holds after the stop, once the check has worked at clearing the symbol: the
+    reading is of the whole account, and what another symbol holds is named and left alone.
 
     The check keeps one set of requests whose end the window does not know: each order of the node's in
     `unsettled` (its client order ID and side; `_unsettled`), and each close the check itself sends. A
@@ -1806,10 +2343,22 @@ def _unsettled(cache, strategy_id: StrategyId) -> dict[str, tuple[str, str]]:
 def _fill(report: WindowReport, cache, strategy_id: StrategyId) -> None:
     """The strategy's orders, by its ID, into the report: each one's events, the fills, the denials."""
     for order in cache.orders(strategy_id=strategy_id):
-        names = [_event_name(e) for e in order.events()]
-        report.orders[order.client_order_id.value] = names
+        events = order.events()
+        names = [_event_name(e) for e in events]
+        cid = order.client_order_id.value
+        report.orders[cid] = names
         report.fills += names.count("OrderFilled")
-        for event in order.events():
+        accepted = [e for e in events if type(e).__name__ == "OrderAccepted"]
+        if events and accepted:
+            delay = (int(accepted[0].ts_init) - int(events[0].ts_init)) // 1_000_000
+            report.submit_delays_ms[cid] = delay
+            worst = report.worst_submit_delay_ms
+            report.worst_submit_delay_ms = delay if worst is None else max(worst, delay)
+        for e in events:
+            if type(e).__name__ == "OrderFilled":
+                when = datetime.fromtimestamp(int(e.ts_event) / 1e9, UTC).isoformat()
+                report.fill_prices.setdefault(cid, []).append(f"{e.last_qty}@{e.last_px} {when}")
+        for event in events:
             if type(event).__name__ in {"OrderDenied", "OrderRejected"}:
                 report.denials[order.client_order_id.value] = str(event.reason)
 
@@ -1873,7 +2422,13 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--session", choices=(*SESSIONS, "auto"), default="regular")
     parser.add_argument("--strategy", choices=tuple(WINDOW_STRATEGIES), default=DEFAULT_STRATEGY)
     parser.add_argument("--minutes", type=int, default=DEFAULT_MINUTES)
-    parser.add_argument("--symbol", default="SPY")
+    chosen = parser.add_mutually_exclusive_group()
+    chosen.add_argument("--symbol", default="SPY")
+    chosen.add_argument(
+        "--mover",
+        action="store_true",
+        help="run on today's top mover, chosen at the start (regular session only)",
+    )
     parser.add_argument("--log-dir", type=Path, help="default: `default_log_dir()`")
     return parser
 
@@ -1914,6 +2469,8 @@ def _main(args: argparse.Namespace) -> int:
             clock, calendar, market_read_at = session_now(trading)
             market = (clock, calendar)
             resolved, why = resolve_session(clock, calendar, args.strategy)
+            if args.mover and resolved not in (None, "regular"):
+                resolved, why = None, f"{why}, and a mover window runs in the regular session only"
             if resolved is None:
                 print(f"paper:session: nothing to run: {why}")
                 _heard(args.log_dir, f"nothing to run: {why}")
@@ -1925,6 +2482,7 @@ def _main(args: argparse.Namespace) -> int:
             minutes=args.minutes,
             log_dir=args.log_dir,
             strategy=args.strategy,
+            mover=args.mover,
         )
         write_heartbeat(args.log_dir, f"a {session} window of {args.strategy}")
         report = run_window(config, trading=trading, market=market, market_read_at=market_read_at)

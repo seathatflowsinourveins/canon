@@ -270,7 +270,8 @@ EOF
 }
 
 # The session window agent runs ~/.claude/canon/paper-session.sh, which brings its own clone to the main the
-# origin has at that firing, or fails the firing, and runs `mise run paper:session --session auto` there:
+# origin has at that firing, or fails the firing, and runs `mise run paper:session --session auto --mover`
+# there, a window on the day's top mover in the regular session and nothing outside it (ADR 0083):
 # the task reads the paper pair from the login keychain, takes the paper lock and runs one window, or prints
 # "nothing to run" when Alpaca's clock says no session is open (weekends and holidays included). Not run at
 # load. No checkout a person uses is read or written (ADR 0050). CANON_PAPER_SCHEDULED=1 (launchd.plist(5),
@@ -297,6 +298,7 @@ write_paper_plist() {
     <string>auto</string>
     <string>--minutes</string>
     <string>$PAPER_MINUTES</string>
+    <string>--mover</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
