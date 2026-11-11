@@ -22,6 +22,10 @@
 # after `scheme://` or `scheme://<user>:` is a URL's userinfo, not an address, and is skipped. So
 # `actions/checkout@<sha>`, `ccusage@20.0.48`, a decorator and an escaped pattern such as `@users\.noreply`
 # are not addresses, and an address with `@users.noreply.github.com` appended is judged as one token.
+# A token at the start of a line or after a space or tab loses any leading `+` or `-` first, a diff
+# marker: in a committed patch an added decorator's line starts with `+` and then `@pytest.fixture`, and
+# what is left is judged as above. So a local part of nothing but `+` and `-` in that place is not judged;
+# after any other character (a non-ASCII letter ends a token) the marker is kept and the token judged.
 # Allowed tokens have exactly one @ and are one of:
 #   noreply@github.com, noreply@anthropic.com, support@github.com, git@github.com (the SSH remote form)
 #   <digits>+<login>@users.noreply.github.com, the login optionally ending in [bot]
@@ -101,6 +105,7 @@ function judge(s, where,   tok, t, dom, pre) {
     tok = substr(s, RSTART, RLENGTH); s = substr(s, RSTART + RLENGTH)
     if (pre ~ /[A-Za-z][A-Za-z0-9+.-]*:\/\/([^\/@ ]*:)?$/) continue      # userinfo of a URL
     t = tolower(tok)
+    if (pre == "" || pre ~ /[ \t]$/) sub(/^[+-]+/, "", t)            # a diff marker in a committed patch
     sub(/^(\[|\.)+/, "", t); sub(/(\]|\.)+$/, "", t)
     if (t !~ /^[^@]+@/) continue
     dom = t; sub(/^.*@/, "", dom)
