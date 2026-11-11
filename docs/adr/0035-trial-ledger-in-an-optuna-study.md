@@ -46,7 +46,7 @@ trial store that meets every driver. Leaving it is cheap, since every trial read
    two processes creating one new file raced in `create_all` and crashed in 14 of 15 rounds (measured
    here). The lock guards first creation only (corrected 2026-11-11: the per-study write lock
    (round 7); no change of decision): a sample's move (ADR 0041 term 5) and recording (term 2) are
-   held by the study's write lock, ADR 0054 term 7. The name and the sample are two writes; a creation
+   held by the study's write lock, ADR 0081. The name and the sample are two writes; a creation
    interrupted between them is completed by the next creation of that name (ADR 0041 term 1). Recording stays on `RDBStorage`, not the
    `JournalFileBackend` the FAQ gives for parallel optimisation: sessions record trials now and then,
    not in a parallel search, and SQLite serialises those writes (3,100 recordings from 10 processes
@@ -58,8 +58,8 @@ trial store that meets every driver. Leaving it is cheap, since every trial read
    by this repo's code, with user attribute `outcome` = `failed`; one with no filled order `FAIL` with
    `idle`; any other `COMPLETE` with `traded` and skfolio's per-session Sharpe ratio over its session
    days (for a later sampler; the gate does not read it), or `FAIL`, still `traded`, if that ratio is
-   not finite. Such a record ran to the end: no later record resolves it, and ADR 0031 stops the gate.
-   Added 2026-11-11 (the gate's seventh round; ADR 0054 term 7 holds both models). A record is
+   not finite. Such a record ran to the end: no later record resolves it, and ADR 0031 and ADR 0080 stop the gate.
+   Added 2026-11-11 (the gate's seventh round; ADR 0081 holds both models). A record is
    made under the study's write lock, from the first read of the study to the `tell`, so one writer
    at a time writes a study; only a study the ledger opened is recorded in. The configuration is
    frozen once and the node is built from it, strategies added, before the trial is asked for, and
@@ -114,7 +114,7 @@ Who decided. The orchestrator chose option 3 and the terms under the owner's del
   (`test_a_pass_that_only_opens_creates_no_folder_and_no_lock`); a study name with a `/` takes its pass
   lock (`test_a_study_name_with_a_slash_takes_its_pass_lock`, `tests/test_variant_study.py`); and a
   run's record holds no system attribute (`test_a_trial_round_trips_through_the_sqlite_file`).
-* Term 2's addition of 2026-11-11: ADR 0054's Confirmation lists its tests, and says which failed
+* Term 2's addition of 2026-11-11: ADR 0081's Confirmation lists its tests, and says which failed
   first and which passed before and after.
 
 ## Evidence

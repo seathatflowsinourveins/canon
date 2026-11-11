@@ -535,7 +535,7 @@ def test_a_study_name_with_a_slash_takes_its_pass_lock(
 def test_a_key_whose_only_record_on_the_sample_is_retired_is_run(
     alpaca_bars: AlpacaBars, tmp_path: Path
 ) -> None:
-    """A retired record (ADR 0054, 2026-11-10), another writer's that `rank` never reads, was read by
+    """A retired record (ADR 0081, 2026-11-10), another writer's that `rank` never reads, was read by
     the pass as a run of its key, so the key was skipped and the ranking stopped on it for good; it
     is now run. The test failed before its change."""
     write_both(alpaca_bars, tmp_path / "catalog")
@@ -574,7 +574,7 @@ def test_a_raced_queued_record_of_the_key_is_not_a_failure_the_pass_goes_on_from
     alpaca_bars: AlpacaBars, tmp_path: Path, how: str
 ) -> None:
     """Antigravity, gate round after #172: another writer's record of the pass's key, queued after
-    `record_trial`'s check of the queue (ADR 0054 term 7's race), was taken with the queue's note
+    `record_trial`'s check of the queue (ADR 0081's race), was taken with the queue's note
     and its writer's outcome kept. When `record_trial` then raised before any run of its own (the
     next queued keyed record refused, or the read of the trial `ask` gave refused), the pass read
     that record as `record_trial`'s written failure, put the error among its failures and went on.

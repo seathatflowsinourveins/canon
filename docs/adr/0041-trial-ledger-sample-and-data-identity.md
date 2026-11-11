@@ -66,7 +66,7 @@ with what was tried.
    `config` holds.
 5. **Moving the sample.** `move_sample(study, start, end)` appends a sample numbered after the last; the
    same range again is a new sample, the way a corrected catalog is taken in. A move reads and writes the
-   samples under the study's write lock, ADR 0054 term 7 (corrected 2026-11-11: the per-study write
+   samples under the study's write lock, ADR 0081 (corrected 2026-11-11: the per-study write
    lock (round 7); no change of decision), so two moves at once are both kept, and a move waits for a
    record being written. No record is overwritten or
    deleted. The ranking reads only records on the current sample, and stops, naming it, on a key with no
@@ -82,7 +82,7 @@ Local, no upstream. The ranking's own glue, where the upstreams read say nothing
   are one pick; tied keys with other returns stop. The paper's pick is "the" highest; skfolio takes
   one series and says nothing of ties. Since 2026-11-11 the keys tied are those whose ratios are
   within the rounding of their own computation of the highest, and their returns are compared
-  exactly: ADR 0031's addition of that date, term 3, which replaces `math.isclose` here.
+  exactly: ADR 0080 term 3, which replaces `math.isclose` here.
 * The DSR at N̂ is withheld when its benchmark is below 0. skfolio 1.12.8's
   `expected_max_sharpe_ratio` returns a negative benchmark for 1 < N̂ < about 1.28 without comment;
   the expected maximum of N̂ ≥ 1 trials of mean 0 is not below 0.
@@ -186,8 +186,8 @@ Who decided. The orchestrator chose option 2 and its terms under the owner's del
   `test_closed_day_zeros_do_not_hide_moments_that_overflow`); and returns in the top group are
   compared exactly, where two series that differ within 1e-9 of their largest return were one pick
   and the result followed the order of recording
-  (`test_a_tie_between_other_returns_stops_whatever_the_recording_order`). ADR 0031's addition of
-  that date holds the terms. The step 7 study (ADR 0052), ranked again on its stored records and on
+  (`test_a_tie_between_other_returns_stops_whatever_the_recording_order`). ADR 0080 holds the
+  terms. The step 7 study (ADR 0052), ranked again on its stored records and on
   a fresh recording: N = 8, T = 1,366, the same pick, DSR 0.9338299302788473, rejected. V differs
   from the 2026-11-10 run in the last bit, by key order, with the DSR and verdict identical:
   0.00011297439028764905 summed in recording order on 2026-11-10, 0.00011297439028764906 in key
@@ -204,7 +204,7 @@ Who decided. The orchestrator chose option 2 and its terms under the owner's del
   the bars and no definition of the instrument, or two definitions, is refused before a trial,
   where it was a failed trial of its key
   (`test_a_catalog_without_the_instrument_is_refused_before_a_trial`,
-  `test_a_catalog_with_two_definitions_of_one_instrument_does_not_run`; ADR 0054 term 7).
+  `test_a_catalog_with_two_definitions_of_one_instrument_does_not_run`; ADR 0081).
 
 ## Evidence
 

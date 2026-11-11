@@ -176,7 +176,7 @@ def test_a_trial_round_trips_through_the_sqlite_file(
         str(ns): value for ns, value in result.returns_series.items()
     }
     assert trial.user_attrs["session_days"] == [str(bar.ts_init // DAY_NS * DAY_NS) for bar in bars]
-    assert trial.system_attrs == {}  # the ranking reads any as another writer's (ADR 0054)
+    assert trial.system_attrs == {}  # the ranking reads any as another writer's (ADR 0081)
     digests = trial.user_attrs["data_digest"]
     assert set(digests) == {str(BAR_TYPE), str(BAR_TYPE.instrument_id)}
     assert all(len(digest) == 64 for digest in digests.values())
@@ -1905,7 +1905,7 @@ def record_each(study: optuna.Study, catalog: Path, *periods: tuple[int, int]) -
         record_trial(study, catalog, [strategy(fast=fast, slow=slow)], starting_balances=BALANCES)
 
 
-# A recorded retirement of another writer's queued record (ADR 0054, 2026-11-10): each test failed
+# A recorded retirement of another writer's queued record (ADR 0081, 2026-11-10): each test failed
 # before its change.
 
 
@@ -2118,7 +2118,7 @@ def test_a_retirement_that_finds_its_trial_gone_takes_the_next_with_record_trial
 def test_a_keyed_trial_queued_after_the_check_names_itself_when_nothing_can_be_written(
     alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Code review: in the race ADR 0054 term 7 names, a keyed trial queued after `record_trial`'s
+    """Code review: in the race ADR 0081 names, a keyed trial queued after `record_trial`'s
     check, a refused note's error carried a note naming the trial, which a refused `tell` then
     replaced. Both refusals are now on the one error raised."""
     alpaca_bars.write(tmp_path / "catalog")
@@ -2189,7 +2189,7 @@ def test_a_retired_trial_that_cannot_be_read_back_is_still_told_fail(
 
 def queued_at_ask(monkeypatch: pytest.MonkeyPatch, config: MaCrossConfig) -> list[int]:
     """Make the next `Study.ask` find another writer's keyed record of `config` queued just before
-    it, after `record_trial`'s check (ADR 0054 term 7's race); the list gets its number."""
+    it, after `record_trial`'s check (ADR 0081's race); the list gets its number."""
     real_ask = optuna.Study.ask
     raced: list[int] = []
 
@@ -2228,7 +2228,7 @@ def test_a_raced_trial_not_read_back_with_its_note_refused_names_itself(
     """Codex, gate round after #160: a trial `ask` gave that cannot be read back may be another
     writer's keyed record queued after `record_trial`'s check, and it now carries the queue note
     (`tests/test_ranking.py`). With that note refused too, the error raised names the trial and the
-    limit ADR 0054 term 7 states, the trial is still told `FAIL`, and the other writer's key and
+    limit ADR 0081 states, the trial is still told `FAIL`, and the other writer's key and
     outcome are left as they were. Code review: an interrupt while the note was written was raised
     with no note naming the trial."""
     alpaca_bars.write(tmp_path / "catalog")

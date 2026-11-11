@@ -255,7 +255,7 @@ def test_returns_whose_moments_underflow_are_refused() -> None:
 
 
 # The gate's seventh outside round, 2026-11-11: one numeric check of the session-day series every
-# gate calculation uses (ADR 0031). Each test below failed before that check.
+# gate calculation uses (ADR 0080). Each test below failed before that check.
 
 # Monday 2025-03-10 is day -1: forty UTC days from it hold thirty weekday sessions and five weekends.
 WEEKDAYS = [n for n in range(-1, 39) if (n + 1) % 7 < 5]
@@ -347,7 +347,7 @@ def test_one_session_day_gives_no_series() -> None:
 
 
 def test_a_series_just_above_the_threshold_is_accepted_with_the_sharpe_ratio_it_has() -> None:
-    """The limit of the measure (ADR 0031): returns of 1.0 and 1.0 + 128 steps of float64's spacing
+    """The limit of the measure (ADR 0080): returns of 1.0 and 1.0 + 128 steps of float64's spacing
     there have a standard deviation of 65 steps, above the 60 that twice thirty returns' rounding
     allows, so the series is accepted, and its Sharpe ratio is the 6.9e13 its returns give. With 96
     steps the deviation is 49, and the series is refused."""

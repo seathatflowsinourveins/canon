@@ -26,7 +26,7 @@ be a float, as `record_trial` writes each one (NautilusTrader's `f64`, a `float`
 a `bool` or an `int`, which Python's `==` reads as equal to 0.0 or 1.0, and finite. `returns_matrix`
 keeps its own refusal of a return that is not finite, for a series given to it directly.
 
-**The numeric check** (ADR 0031, 2026-11-11; ADR 0073 rule 4, the family found in rounds 5, 6 and
+**The numeric check** (ADR 0080, 2026-11-11; ADR 0073 rule 4, the family found in rounds 5, 6 and
 7) is one function, `_numerically_valid`, with one call site: `session_returns`, on the series of
 session days alone, after closed days are dropped, which is the series every gate calculation takes.
 Taken over every UTC day, the zeros of closed days moved the mean and hid moments that overflow or
@@ -54,7 +54,7 @@ order:
    that floor. A choice, stated as one: the factor 2 separates rounding from spread, it does not
    make a series just above it meaningful. Such a series has the very large Sharpe ratio its returns
    give (up to about 2**52 / n) and a bound, below, above that ratio, so the ranking stops on it;
-   one further from the threshold ranks as it is (ADR 0031's limits).
+   one further from the threshold ranks as it is (ADR 0080's limits).
 2. *Moments that underflow.* The square of the second central moment (`measures.variance(biased=
    True)`), which the kurtosis divides the fourth by, must be at or above float64's smallest normal
    (`sys.float_info.min`): below it IEEE 754 keeps absolute, not relative, precision, and with
@@ -79,7 +79,7 @@ for a series that passed, that is less than 13 r max(1, |ratio|) to first order 
 over reordered sums is 0.56 of r max(1, |ratio|), run 2026-11-11), and `RECOMPUTED` = 16 is the next
 power of two. A ratio is known no more finely than that, so the gate holds a value told to within
 it of the one computed again, and reads two trials' ratios as told apart only when they differ by
-more than the sum of their two bounds (`canon_trading.ranking`; ADR 0031, 2026-11-11). It is about
+more than the sum of their two bounds (`canon_trading.ranking`; ADR 0080, 2026-11-11). It is about
 2e-13 for thirty daily returns of a per cent and 2e-11 to 3e-11 for the step-7 records of 1,366
 sessions (run 2026-11-11), and wide only next to the threshold of item 1, where it exceeds the
 ratio itself.

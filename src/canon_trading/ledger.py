@@ -1,7 +1,7 @@
 """The trial ledger: every backtest meant as a trial, recorded as one trial of an Optuna study.
 
-Contract: ADR 0010, protocol step 1 ("Ledger every trial"), in the store and on the terms ADR 0035
-and ADR 0054 decide, over the sample ADR 0041 fixes for each study. Optuna 5.0.0, read 2026-11-10 at tag v5.0.0:
+Contract: ADR 0010, protocol step 1 ("Ledger every trial"), in the store and on the terms ADR 0035,
+ADR 0054 and ADR 0081 decide, over the sample ADR 0041 fixes for each study. Optuna 5.0.0, read 2026-11-10 at tag v5.0.0:
 
 * `docs/source/faq.rst` ("save and resume studies"): `RDBStorage` on a local SQLite file.
   `optuna.create_study` without `load_if_exists` creates a study and raises `DuplicatedStudyError` for
@@ -31,7 +31,7 @@ the data a run read either, so `data_digest` is glue too (ADR 0053).
 
 The value told for a run that traded is the per-session Sharpe ratio the gate would take of the
 run's own series, mean over sample standard deviation, read from
-`canon_trading.returns_matrix.session_returns`, the gate's one numeric check (ADR 0031;
+`canon_trading.returns_matrix.session_returns`, the gate's one numeric check (ADR 0080;
 `told_sharpe`). A run whose series that check refuses is told no value, and `FAIL`, still `traded`.
 The value is there for a later sampler; `canon_trading.ranking` ranks from the returns and holds a
 told value to this one.
@@ -43,7 +43,7 @@ two processes crashed with "table studies already exists" (measured on this mach
 lock guards first creation only; Optuna's FAQ keeps `JournalFileBackend` for parallel optimisation,
 and ADR 0035 keeps `RDBStorage` on SQLite for the reasons it gives.
 
-One writer at a time writes a study (ADR 0054 term 7, 2026-11-11). Each writer this module names,
+One writer at a time writes a study (ADR 0081, 2026-11-11). Each writer this module names,
 `record_trial`, `move_sample`, `mark_not_run` and `retire_queued`, holds the study's write lock for
 everything it reads and writes: an exclusive, blocking `fcntl.flock` on a file beside the ledger named
 for the study (`_write_lock`), so a second writer waits for the first. Optuna gives no such guarantee
@@ -88,11 +88,11 @@ trial, its key counted in N.
 
 Another writer's keyed trial waiting in Optuna's queue is refused before `ask`, and
 `retire_queued` retires it, or one `record_trial` took before it refused, through Optuna's public
-`Study.ask`, `Trial.set_user_attr`, `Study.tell` and `Study.set_user_attr` (ADR 0054, 2026-11-10).
+`Study.ask`, `Trial.set_user_attr`, `Study.tell` and `Study.set_user_attr` (ADR 0081, 2026-11-10).
 Who wrote a record, `record_trial` or another writer, and whether another writer's was queued, taken
 from the queue here or started outside it, is decided in one place, `origin`, by key, state, note and
 attributes; `record_trial`, `retire_queued`, `mark_not_run`, the ranking and the study's pass all read
-it (ADR 0054 term 7, 2026-11-11). The attributes it compares are those Optuna 5.0.0 keeps on a
+it (ADR 0081, 2026-11-11). The attributes it compares are those Optuna 5.0.0 keeps on a
 `FrozenTrial` (`trial/_frozen.py`): `user_attrs`, `system_attrs`, `distributions` and
 `intermediate_values`.
 """
@@ -176,7 +176,7 @@ NOT_RUN_WAITING = "not_run_waiting"
 # The error `record_trial` writes on a trial it took from Optuna's queue and ran nothing in.
 TAKEN_FROM_QUEUE = "taken from Optuna's queue by record_trial, which runs only in its own trial"
 # The study user attribute holding the numbers of another writer's queued keyed records that
-# `retire_queued` retired: never read as a run, each one's key still counted in N (ADR 0054).
+# `retire_queued` retired: never read as a run, each one's key still counted in N (ADR 0081).
 RETIRED = "retired"
 # The error `retire_queued` writes on a queued record it takes from Optuna's queue to retire it.
 RETIRED_NOTE = (
@@ -973,7 +973,7 @@ def _record(
     checked_digest = bars_digest(_in_order(checked.bars), bar_types)
     del checked  # only the digest is kept, so the checked bars are not held through the run
 
-    # The build is the check (ADR 0054 term 7): the node is built from the frozen configuration and
+    # The build is the check (ADR 0081): the node is built from the frozen configuration and
     # its strategies added before a trial is asked for, so a configuration upstream refuses leaves
     # no record, and the node run in the trial is that one. It is disposed however this is left.
     with built_backtest(run_config, built) as node:
@@ -1139,7 +1139,7 @@ def _own_trial(study: optuna.Study) -> optuna.Trial:
     ranking from reading one as a run of its key.
     A queued trial that holds a config key and is not retired (`retire_queued`) is refused before
     `ask`, naming it: taken, it would keep that key and any outcome another writer gave it, and only
-    its note would keep the ranking from reading it as a run of that key (ADR 0054, 2026-11-10). One
+    its note would keep the ranking from reading it as a run of that key (ADR 0081, 2026-11-10). One
     queued between that check and `ask` is still taken, with the note, and the ranking stops on it
     naming `retire_queued`, which retires it; if that note is refused too, the error says so, naming
     the trial (`_untold`).
@@ -1147,7 +1147,7 @@ def _own_trial(study: optuna.Study) -> optuna.Trial:
     No writer this module names queues a trial: one in the queue was put there by hand, through
     `Study.enqueue_trial` or the store, outside the study's write lock. So everything here about a
     queue, with `_refuse_a_keyed_queue`, `_tell_unread` and `_untold`, guards that hand-written
-    class, which ADR 0054's limits record once (ADR 0073's reachability rule, 2026-11-11), and is
+    class, which ADR 0081's limits record once (ADR 0073's reachability rule, 2026-11-11), and is
     kept as it was: the gate trusts the ledger as its writers write it.
     """
     while True:
@@ -1171,14 +1171,14 @@ def _tell_unread(study: optuna.Study, trial: optuna.Trial, error: BaseException,
     note of a trial taken from Optuna's queue; if that is refused, say so on `error`, the read's.
 
     Nothing read tells whether `ask` created the trial or took it from the queue, and another writer
-    may have queued a keyed trial after the queue was last read (ADR 0054 term 7's race), whose
+    may have queued a keyed trial after the queue was last read (ADR 0081's race), whose
     outcome and returns that writer's would, under any other note, read as a run of its key. With
     the queue's note the ranking stops on such a record naming `retire_queued`, which retires it
     (`carries_a_queue_note`); one `ask` created holds no key, so it shows no run and `mark_not_run`
     clears it. A trial another process told meanwhile, which only `mark_not_run` does to a keyless
     one, refuses every write (`UpdateFinishedTrialError`, Optuna 5.0.0 `storages/_base.py`) and is
     left as it is. If the note is otherwise refused, the trial is still told `FAIL` (`_tell_taken`)
-    and `error` names the limit left: a raced record left so reads as a run of its key, as term 7
+    and `error` names the limit left: a raced record left so reads as a run of its key, as ADR 0081
     states. An interrupt while the note is written is raised with the same note, the read's error
     its context.
     """
@@ -1204,7 +1204,7 @@ def _untold(frozen: FrozenTrial, retired: set[int]) -> str | None:
     """What a refused note leaves on another writer's trial taken from the queue: the note added to
     the store's error, or nothing for a retired one, which the list already holds.
 
-    A keyed one, not retired, may read as a run of its key (ADR 0054 term 7's named limit). A keyless
+    A keyed one, not retired, may read as a run of its key (ADR 0081's named limit). A keyless
     one holding what `record_trial` never writes on such a record (`Study.enqueue_trial`'s
     `fixed_params`, another writer's attributes) reads, with no note, as another writer's started
     record (`origin`): it stops the ranking for good, the strict side, and nothing clears it. A
@@ -1265,7 +1265,7 @@ def _tell_taken(study: optuna.Study, trial: optuna.Trial, note: str, limit: str 
             error.add_note(f"trial #{trial.number} could not be told FAIL either: {telling!r}")
         raise
     # `skip_if_finished`: a hand-written `tell` may have finished a taken trial between the two
-    # writes (ADR 0054 term 7, the hand-written class; `retire_queued` waits for the write lock).
+    # writes (ADR 0081, the hand-written class; `retire_queued` waits for the write lock).
     study.tell(trial, state=TrialState.FAIL, skip_if_finished=True)
 
 
@@ -1335,7 +1335,7 @@ WRITTEN_KEYLESS = frozenset({"error"})
 
 
 class Origin(enum.Enum):
-    """Who wrote a record, as `origin` reads it (ADR 0054 term 7)."""
+    """Who wrote a record, as `origin` reads it (ADR 0081)."""
 
     WRITER = "record_trial's own"
     QUEUED = "another writer's, waiting in Optuna's queue"
@@ -1352,7 +1352,7 @@ class Reading:
 
 
 def origin(trial: FrozenTrial) -> Reading:
-    """Who wrote `trial`: the one rule every reader of the ledger applies (ADR 0054 term 7).
+    """Who wrote `trial`: the one rule every reader of the ledger applies (ADR 0081).
 
     `record_trial` asks for its own trial, writes its key first and then only the attributes in
     `WRITTEN` (on a record with no key, only its error), and suggests no parameter, reports no
@@ -1385,7 +1385,7 @@ def origin(trial: FrozenTrial) -> Reading:
     reads only a keyed `WRITER` record as `record_trial`'s written failure
     (`canon_trading.variant_study`). A record another writer made in `record_trial`'s exact form,
     with no system attribute, reads as `WRITER`: nothing on it tells the two apart, and the ledger's
-    writers are this repository's own sessions (term 7's named limits).
+    writers are this repository's own sessions (ADR 0081's named limits).
 
     One question is asked apart, at `ask` and of the trial `ask` just gave: whether it was taken from
     the queue (`_from_the_queue`). There a trial `ask` created holds nothing at all, so anything on
@@ -1471,7 +1471,7 @@ def _trial_numbered(study: optuna.Study, number: int) -> FrozenTrial:
 
 
 def retire_queued(study: optuna.Study, number: int) -> None:
-    """Retire trial `number` of `study`, another writer's queued record with a config key (ADR 0054).
+    """Retire trial `number` of `study`, another writer's queued record with a config key (ADR 0081).
 
     Such a record never ran here, and whatever results it holds came from its writer. Retired, it is
     never read as a run, and its key stays counted in N as a configuration that was tried: the
@@ -1766,7 +1766,7 @@ def told_sharpe(returns: object, days: object) -> float:
 
     The value `record_trial` tells, and the one `canon_trading.ranking` holds a told value to. It is
     read from `session_returns`, ADR 0010 step 2 and the gate's one numeric check as the gate applies
-    them (ADR 0031), so a run whose returns the gate refuses, a constant series or one of zeros
+    them (ADR 0080), so a run whose returns the gate refuses, a constant series or one of zeros
     among them, is told no value (and `FAIL`, still `traded`), not one the gate never sees;
     `session_returns` refuses `returns` and `days` not in the shape `record_trial` writes.
     """

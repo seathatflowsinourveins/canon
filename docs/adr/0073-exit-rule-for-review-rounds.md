@@ -169,7 +169,7 @@ Read 2026-11-10 and 2026-11-11.
   missed) and the two sweep rows.
 * The merged sweep of four readers' silent-fallback reports, 71 entries (read).
 * The reachability rule added 2026-11-11 is the lead's decision under ADR 0074, given to the lanes of
-  the gate's seventh round. ADR 0054 term 7 holds the class it names, with the two earlier findings it
+  the gate's seventh round. ADR 0081 holds the class it names, with the two earlier findings it
   reclassifies, #172 and #177 (`git log`, read).
 * https://git-scm.com/docs/git-interpret-trailers and https://git-scm.com/docs/pretty-formats — the
   trailer block, key syntax and `--no-divider`; `%(trailers:key=...,valueonly,unfold,separator=...)`,
