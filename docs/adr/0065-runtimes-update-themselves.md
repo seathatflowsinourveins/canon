@@ -93,6 +93,113 @@ Applied on 2026-11-11, at the owner's request, from the main checkout at commit 
 --install` removed the Antigravity no-update line; `claude update` moved the CLI from 2.1.321 to 2.1.322;
 `scripts/bootstrap --check` ended "All present".
 
+### Addition of 2026-11-11: the machine layer follows main by itself
+
+The owner's instruction of 2026-11-11: the machine layer is reinstalled by itself whenever main changes
+it, so no one has to remember an installer. A fourth launchd user agent, `local.canon.maintenance`, is
+installed, reported and removed by `scripts/automation` beside ADR 0011's watchdog and ADR 0050's paper
+agent and ADR 0007's Collector. It runs `~/.claude/canon/maintenance.sh` every 30 minutes
+(`StartInterval` 1800, which launchd counts from the end of a round, ADR 0050; not at load). Each round is logged, and each step is bounded by timeout(1):
+
+1. **The paper lock first.** The round takes, without waiting (lockf(1) `-t 0`), the three file locks
+   that mise.toml's paper tasks take (ADR 0069): account B's, which a window holds; account A's, which a
+   paper test holds; and the market-data stream's, which `paper:data`'s sandbox node takes alone. "The
+   paper lock" here means all three. When one is held, one of those runs is running, perhaps from the
+   checkout, and the round does nothing at all. The status row names the lock. The round also holds a lock of its own, so two rounds never overlap.
+2. **(c) Once a day, the vendors' update commands** (rule 5), with the paper lock let go: `claude update`
+   and `agy update`. They touch nothing a window uses, and a scheduled window waits only 900 s for the
+   lock (mise.toml), so they do not hold it. Codex, Muse Code, DeepSeek Harness and `dsh-tui` are not
+   updated (rule 4). Codex, DeepSeek Harness and `dsh-tui` are exact mise pins, whose versions move through
+   the drift issue and `adopt-upstream`. Then the round takes the paper lock again without waiting. If a
+   window took it meanwhile, the round ends there.
+3. **(a) Fast-forward only.** The main checkout moves to origin/main with `git merge --ff-only`, and only
+   when it is on main with no tracked change and the fetch succeeded. Otherwise neither (a) nor (b) runs,
+   and the status row says why: SKIPPED, or FAILED for a fetch. It never resets, stashes or switches a
+   branch.
+4. **(b) What differs, then the installer that manages it.** At origin/main, `scripts/automation differs`
+   compares what is installed with the tree. It checks the installed scripts, the Collector's
+   configuration, each plist as install would write it now, the loaded agents, and a checksum of the
+   settings sources (and of which runtimes' folders exist, since the settings step writes only into
+   those) against the last settings step. A settings difference runs `scripts/bootstrap
+   --user-config`, inline. An agent or script difference runs `scripts/automation install`, last and
+   detached: the job is put in a process group of its own (bash `set -m`), and the agent's plist sets
+   `AbandonProcessGroup`. So when install reloads this agent's own job, the reinstall is not ended with
+   it. Install loads the maintenance job after everything else, and reloads it only when its plist
+   changed or it is not loaded. The paper agent, the Collector and the gateway are kept the same way when
+   their files are unchanged. So a landing that leaves them alone does not restart the paper interval
+   (ADR 0050). An install is not repeated within a day for the same differences at the same origin/main
+   once an install for them has finished. Otherwise a difference no install can fix, such as a Collector
+   mise has not installed, would restart the paper interval every round. The row says FAILED until the
+   next day, a new landing, or an install by hand. An install that timed out or never reported is tried
+   again at the next round.
+   The paper lock is held for (a), since any of those runs may run from the checkout. For the install,
+   which reloads the paper agent and touches nothing else they use, the round holds account B's lock
+   alone, so no window starts while it runs and a paper test is not held up. The compare and the
+   settings step touch none of them and run with the locks let go. The install takes account B's again
+   without waiting, and if a window took it meanwhile, the install waits for the next round.
+
+The agent reads no secret, installs no tool (`scripts/bootstrap --install` stays a deliberate step) and
+changes neither the registry nor the pins. Rule 6 stands: `scripts/bootstrap` itself runs no update.
+Once the agent is installed, rule 5's "one command" runs once a day without anyone typing it.
+
+What follows from this: whatever lands on main under `home/` and in the installers reaches this machine
+at the next round, within half an hour of landing, and no person reads it first. A held paper lock, a
+checkout kept off main, or a Mac asleep at the firing (launchd.plist(5)) puts it off to a later round. Main's gate is the control: `scripts/ci`, the
+independent review of ADR 0017, and the `signoff` status that `scripts/land` posts. The agent adds no
+control and removes none. A checkout that is off main, has a tracked change, or has a commit origin lacks
+keeps the agent from installing.
+
+`scripts/automation status` gains a `maintenance` row. It shows the last round, the fast-forward, what
+differed, what was installed and what was left for the owner to merge. A step that failed is shown as
+FAILED by name, and so is a reinstall that never reported. The row reads STALE when no round has run
+for an interval past its longest round, SKIPPED when the checkout kept the round from main, and OUTDATED
+when the installed script is not the tree's. The same install keeps ADR 0056's gateway running as an
+agent (ADR 0056, addition of 2026-11-11), and the maintenance agent keeps that agent current like the
+others. Each reinstall restarts the paper agent's interval (ADR 0050).
+
+Confirmation, 2026-11-11, offline: `scripts/test-maintenance` runs the agent from an empty environment:
+`HOME` and `CLAUDE_CONFIG_DIR`, as its plist gives them, plus the test's own overrides of getconf and the
+bounds. It runs on a clone of a local bare origin, with stand-ins for both installers, `launchctl`, mise,
+`claude` and `agy`, and getconf names a temporary folder for the paper lock. The cases:
+
+* a fast-forward is done;
+* the round is skipped on a dirty tree, on another branch, and when main has a commit origin lacks;
+* when nothing differs, no installer runs;
+* the settings step runs, and when it fails it is FAILED and is not recorded as applied;
+* when any of the three locks is held, the round does nothing and names it; a paper test that takes its
+  lock during the compare does not hold up the install; when a window takes the lock during the updates,
+  the round ends there; when the agent's own lock is held, the record is left unchanged;
+* the same differences an install left are not installed again within a day at the same origin/main,
+  but are at a new one, after a day, and after an install that timed out;
+* a compare that failed keeps that record;
+* a window that takes the lock during the compare puts the install off to the next round;
+* a fetch that hangs, and an installer that hangs, are stopped at their bounds, and with the fetch
+  failed nothing is compared or installed;
+* the updates run once a day, Codex is left untouched, and an update that fails or hangs is named;
+* the agent starts a reinstall itself. The stand-in launchctl kills the job's process group at its
+  bootout, and the round's process group is killed once the round ends: the worst case of launchd's
+  kill "when a job dies" (launchd.plist(5)) with `AbandonProcessGroup` unset. The reinstall still
+  completes and leaves all five agents loaded, holding account B's lock while it installs.
+
+The real `scripts/automation`, rehearsed there, shows:
+
+* the plists' arguments and keys;
+* the maintenance, paper, Collector and gateway jobs kept loaded when their files are unchanged, the
+  paper agent reloaded once its runner changed, the maintenance job loaded last, and a gateway agent
+  removed once OmniRoute is gone;
+* `differs` clean right after install, and naming a changed script, a changed gateway task, a gateway
+  agent left behind, a runtime folder made since, and a changed settings source, and saying unknown, with
+  the agent kept, when mise does not say whether OmniRoute is installed;
+* the row's labels ok, FAILED, SKIPPED, STALE, OUTDATED, UNKNOWN and OFF.
+
+UNVERIFIED until the first rounds on this machine:
+
+* that real launchd's bootout of the maintenance job leaves the reinstall running, since both safeguards
+  were shown only against the stand-in;
+* that `claude update` and `agy update` complete from a launchd job with no terminal, and that `agy
+  update` replaces the copy mise runs (above);
+* the first round itself.
+
 ## Evidence
 
 Read 2026-11-10. `fetched`: downloaded and searched here; `run`: a command run here.
@@ -122,3 +229,13 @@ Read 2026-11-10. `fetched`: downloaded and searched here; `run`: a command run h
   the two pages' disagreement on the default channel, and where this session's Antigravity switch came
   from; all above.
 * `claude doctor`, from an empty environment and from this session (run).
+* Addition of 2026-11-11, read and run 2026-11-11:
+  * launchd.plist(5) (`man launchd.plist`), read:
+    * `StartInterval`: "If the job is running during an interval firing, that interval firing will
+      likewise be missed";
+    * `AbandonProcessGroup`: "When a job dies, launchd kills any remaining processes with the same
+      process group ID as the job. Setting this key to true disables that behavior".
+  * bash(1) `set -m`: "Background processes run in a separate process group" (read).
+  * lockf(1) `-t`; git-merge(1) `--ff-only`; git-config(1) `remote.<name>.uploadpack`, which the test
+    uses for a fetch that hangs (read).
+  * `scripts/test-maintenance` (run).

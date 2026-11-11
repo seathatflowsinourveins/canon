@@ -5,17 +5,33 @@
 #   commit gate            on every `git commit`             .githooks/pre-commit via core.hooksPath (githooks(5))
 #   landscape watch        once a day, at session start      .claude/hooks/canon-watch.sh, async SessionStart hook
 #   lane watchdog          every 10 minutes, Mac awake       launchd user agent (launchd.plist(5), launchctl(1))
-#   paper session          every 35 minutes, Mac awake       launchd user agent running one window, if Alpaca's
+#   paper session          10 min after each firing, awake   launchd user agent running one window, if Alpaca's
 #                                                            clock says a session is open (ADR 0050)
 #   OTLP collector         always, Mac awake                 launchd user agent running the pinned otelcol on
 #                                                            127.0.0.1, writing ~/.claude/canon/otel/logs.jsonl
 #                                                            for scripts/lanes --rates (ADR 0007)
 #   weekly refresh         weekly, desktop app open          Claude desktop scheduled task (created from a session)
+#   maintenance            every 30 minutes, Mac awake       launchd user agent: this clone to origin/main by
+#                                                            fast-forward, then the installers for what differs
+#                                                            from main, and the runtimes' updates once a day
+#                                                            (home/.claude/canon/maintenance.sh, ADR 0065)
+#   OmniRoute gateway      always, Mac awake, once OmniRoute  launchd user agent running mise.gateway.toml's
+#                          is installed                      omniroute:serve in this clone (ADR 0056)
 #
-# Usage: scripts/automation status | install | uninstall
+# Usage: scripts/automation status | install | uninstall | differs | mark-user-config
 # `install` uses no sudo and touches: this clone's git config, ~/.claude/canon/ (the paper session's
-# runner and its clone of origin's main, ~/.claude/canon/paper-checkout, and the collector's config,
-# ~/.claude/canon/otel/config.yaml, included), and three files in ~/Library/LaunchAgents/. The collector is
+# runner and its clone of origin's main, ~/.claude/canon/paper-checkout, the maintenance agent's script and the
+# collector's config, ~/.claude/canon/otel/config.yaml, included), and four files in ~/Library/LaunchAgents/,
+# five once OmniRoute is installed. It reloads the maintenance and gateway agents only when a plist changed or
+# the job is not loaded, so a reinstall the maintenance agent starts does not stop that agent's own job (a new
+# script reaches its next round, which runs the file anew), and the gateway is not restarted for nothing.
+# `differs` changes nothing: it prints one line per thing an installer manages that differs from this tree,
+# `automation: <what>` (scripts/automation install), `user-config: <what>` (scripts/bootstrap --user-config)
+# or `unknown: <why>` for what it could not compare, and exits 0 when nothing differs, 1 when something does,
+# 2 when something could not be compared. --user-config never overwrites settings.json (scripts/bootstrap), so
+# its part is the two scripts it installs and a checksum of the sources it reads (home/.claude but its canon/
+# folder, home/.codex, canon/models.json and scripts/bootstrap), against the one `mark-user-config` recorded
+# after the last run the maintenance agent made. The collector is
 # the otelcol mise installed for this clone (`scripts/bootstrap --install`), named by its absolute path. The watchdog's plist sets CLAUDE_CONFIG_DIR to the directory install used.
 # `uninstall` reverses exactly that, the trust `mise run` gave the clone's mise.toml included, leaves the
 # ledger, the alert history, the windows' records and the collector's logs.jsonl alone, and exits non-zero naming anything it could not
@@ -41,10 +57,12 @@ INTERVAL=600
 TASK_ID="canon-landscape-refresh"
 PAPER_LABEL="local.canon.paper-session"
 PAPER_PLIST="$AGENTS_DIR/$PAPER_LABEL.plist"
-PAPER_INTERVAL=2100                                   # every 35 minutes...
-PAPER_MINUTES=25                                      # ...a 25-minute window: with start-up, stop and the
-                                                      # account check it ends before the next firing less
-                                                      # the 300 s gap (session_window.GAP_SECS)
+# launchd counts StartInterval from the end of the last firing, not its start (observed on macOS 27.2: a 20 s
+# interval and a 15 s job started every 35 s, with ProcessType Background and Standard alike), so the interval
+# is the pause after each firing: above the 300 s gap (session_window.GAP_SECS), and with a 25-minute window
+# and its start-up, stop and account check, a window about every 35 minutes (ADR 0050, 2026-11-11)
+PAPER_INTERVAL=600
+PAPER_MINUTES=25
 PAPER_STALE=4200                                      # a record `running` after 70 minutes, if it gives none
 PAPER_DEADLINE=6300                                   # mise.toml's paper:session timeout, 105 minutes
 # the longest firing: the runner's fetch bound, then its bound on the whole `mise run`, which is that timeout
@@ -68,6 +86,18 @@ STALE_DAYS=2
 OTEL_LABEL="local.canon.otel-collector"
 OTEL_PLIST="$AGENTS_DIR/$OTEL_LABEL.plist"
 OTEL_DIR="$CANON_HOME/otel"                           # config.yaml and the logs.jsonl scripts/lanes reads
+MAINT_LABEL="local.canon.maintenance"
+MAINT_PLIST="$AGENTS_DIR/$MAINT_LABEL.plist"
+MAINT_INTERVAL=1800                                   # every 30 minutes
+MAINT_STEP=900                                        # maintenance.sh STEP_SECS: its bound on each installer
+# the longest round: the fetch (120), local git (6 x 30), the compare, the settings step, the two daily updates
+# and the reinstall it starts, which holds its lock (5 x MAINT_STEP); then an interval and 300 s
+# a round at its longest: the fetch (120), ten bounded git and mise calls (30 each, 5 of kill grace), five
+# steps (differs, the settings step, two updates, install, each MAINT_STEP and 5), then an interval and 300
+MAINT_SILENT=$((120 + 10 * 35 + 5 * (MAINT_STEP + 5) + MAINT_INTERVAL + 300))
+UC_MARK="$CANON_HOME/watch/user-config.applied"        # the sources' checksum at the last --user-config it ran
+GW_LABEL="local.canon.omniroute"
+GW_PLIST="$AGENTS_DIR/$GW_LABEL.plist"
 # jq: a commit as status shows it, the first 12 of a full id plus what follows it ("with uncommitted
 # changes"), or the text a record gives in its place ("unknown: <why>")
 # shellcheck disable=SC2016  # jq program, not shell
@@ -197,7 +227,7 @@ xml() { local s=${1//&/\&amp;}; s=${s//</\&lt;}; printf '%s' "${s//>/\&gt;}"; }
 # installed lanes read the same directory this install wrote to; they find it the way every script here does.
 write_plist() {
   local c; c=$(xml "$CANON_HOME")
-  cat > "$PLIST" <<EOF
+  cat > "${1:-$PLIST}" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -238,10 +268,10 @@ EOF
 # load. No checkout a person uses is read or written (ADR 0050). CANON_PAPER_SCHEDULED=1 (launchd.plist(5),
 # EnvironmentVariables) tells the runner and the window that the schedule started them: only they stamp the
 # firing and write the records status reads.
-# write_paper_plist <mise> <origin url>
+# write_paper_plist <mise> <origin url> [file, else PAPER_PLIST]
 write_paper_plist() {
   local c; c=$(xml "$CANON_HOME")
-  cat > "$PAPER_PLIST" <<EOF
+  cat > "${3:-$PAPER_PLIST}" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -288,11 +318,11 @@ EOF
 # warn, is empty while it runs well; a failed start (a port in use) writes about 440 bytes, and
 # ThrottleInterval spawns it at most once a minute, so a restart loop adds at most about 0.63 MB a day
 # (1440 x 440 B) until the next install empties the file (ADR 0007).
-# write_otel_plist <otelcol path>
+# write_otel_plist <otelcol path> [file, else OTEL_PLIST]
 OTEL_THROTTLE=60
 write_otel_plist() {
   local c; c=$(xml "$CANON_HOME")
-  cat > "$OTEL_PLIST" <<EOF
+  cat > "${2:-$OTEL_PLIST}" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -329,6 +359,176 @@ write_otel_plist() {
 EOF
 }
 
+# The maintenance agent runs ~/.claude/canon/maintenance.sh on this clone (the main checkout install ran from)
+# with the mise this install found, every MAINT_INTERVAL, not at load (the first round comes an interval after
+# install). AbandonProcessGroup: the reinstall a round starts is a job of its own process group and outlives
+# the round, which launchd's kill of the job's process group would otherwise end (launchd.plist(5)).
+# CLAUDE_CONFIG_DIR, as for the watchdog, so the installers it runs write to the folder this install used.
+# write_maint_plist <mise> [file, else MAINT_PLIST]
+write_maint_plist() {
+  local c; c=$(xml "$CANON_HOME")
+  cat > "${2:-$MAINT_PLIST}" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$MAINT_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>$c/maintenance.sh</string>
+    <string>$(xml "$ROOT")</string>
+    <string>$(xml "$1")</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CLAUDE_CONFIG_DIR</key>
+    <string>$(xml "$CLAUDE_HOME")</string>
+  </dict>
+  <key>WorkingDirectory</key>
+  <string>$c</string>
+  <key>StartInterval</key>
+  <integer>$MAINT_INTERVAL</integer>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>AbandonProcessGroup</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>LowPriorityIO</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>$c/watch/maintenance.log</string>
+  <key>StandardErrorPath</key>
+  <string>$c/watch/maintenance.log</string>
+</dict>
+</plist>
+EOF
+}
+
+# install_maint: installs the maintenance agent's script and plist, last. Its job is reloaded only when the plist
+# changed or it is not loaded: a reinstall the agent started then never stops the agent's own job, and its
+# interval is not restarted; a changed script needs no reload, since each round runs the file anew.
+install_maint() {
+  local m t
+  if ! m=$(find_mise 2>&1); then note "  FAILED: $m"; return 1; fi
+  if ! /usr/bin/install -m 755 "$ROOT/home/.claude/canon/maintenance.sh" "$CANON_HOME/maintenance.sh"; then
+    note "  FAILED: could not install $CANON_HOME/maintenance.sh"; return 1
+  fi
+  note "  installed  $CANON_HOME/maintenance.sh"
+  t=$(mktemp "$AGENTS_DIR/.$MAINT_LABEL.XXXXXX") || { note "  FAILED: could not write $MAINT_PLIST"; return 1; }
+  write_maint_plist "$m" "$t" || { rm -f "$t"; note "  FAILED: could not write $MAINT_PLIST"; return 1; }
+  load_if_changed "$MAINT_LABEL" "$t" "$MAINT_PLIST" "the next round runs the new script" \
+    "(every $((MAINT_INTERVAL / 60)) minutes; the first round $((MAINT_INTERVAL / 60)) minutes from now)"
+}
+
+# load_if_changed <label> <new plist> <plist> <why keeping is enough> <what loaded says>: checks the new plist,
+# puts it in place, and reloads the job only when the plist changed or the job is not loaded
+load_if_changed() {
+  local same=0 st
+  if ! plutil -lint "$2" >/dev/null; then rm -f "$2"; note "  FAILED: could not write a valid $3"; return 1; fi
+  cmp -s "$2" "$3" && same=1
+  if ! mv -f "$2" "$3"; then rm -f "$2"; note "  FAILED: could not write $3"; return 1; fi
+  note "  wrote      $3"
+  if [ "${AUTOMATION_SKIP_LAUNCHD:-0}" = "1" ]; then note "  not loaded (AUTOMATION_SKIP_LAUNCHD=1)"; return 0; fi
+  if [ "$same" = 1 ]; then
+    loaded "$1"; st=$?
+    if [ "$st" = 0 ]; then note "  kept       $1 loaded: its plist is unchanged ($4)"; return 0; fi
+    if [ "$st" = 2 ]; then note "  FAILED: launchctl did not answer within ${LAUNCHCTL_SECS} s about $1; run: scripts/automation install"; return 1; fi
+  fi
+  load "$1" "$3" "$5"
+}
+
+# The OmniRoute gateway agent (ADR 0056) runs mise.gateway.toml's own task, `mise -E gateway run omniroute:serve`,
+# in this clone, kept alive by launchd (KeepAlive, RunAtLoad, ThrottleInterval as the collector's): the task
+# reads its storage key from the login keychain, clears the environment and starts the gateway on
+# 127.0.0.1:20128 with ADR 0056's settings; nothing is set here but PATH, which mise needs (paper-session.sh),
+# MISE_TASK_RUN_AUTO_INSTALL=false (mise settings, task.run_auto_install: "Install missing tools automatically
+# before tasks run"), so a moved pin is never installed by the agent, and CANON_GATEWAY_CONFIG, a checksum of
+# mise.gateway.toml that the task ignores, so a change to the task changes the plist and the next install
+# reloads the gateway. A SIGTERM to `mise run` ends its task (observed with mise 2026.11.5), so a bootout stops
+# the gateway. It takes no paper lock.
+# write_gw_plist <mise> [file, else GW_PLIST]
+write_gw_plist() {
+  local c sum; c=$(xml "$CANON_HOME")
+  sum=$(cksum < "$ROOT/mise.gateway.toml" 2>/dev/null | awk '{ print $1 "-" $2 }')
+  cat > "${2:-$GW_PLIST}" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$GW_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$(xml "$1")</string>
+    <string>-E</string>
+    <string>gateway</string>
+    <string>run</string>
+    <string>omniroute:serve</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>MISE_TASK_RUN_AUTO_INSTALL</key>
+    <string>false</string>
+    <key>CANON_GATEWAY_CONFIG</key>
+    <string>${sum:-none}</string>
+  </dict>
+  <key>WorkingDirectory</key>
+  <string>$(xml "$ROOT")</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>$OTEL_THROTTLE</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>$c/watch/omniroute.log</string>
+  <key>StandardErrorPath</key>
+  <string>$c/watch/omniroute.log</string>
+</dict>
+</plist>
+EOF
+}
+# gw_state <mise>: whether mise has the gateway environment's omniroute installed for this clone (as
+# scripts/bootstrap's omniroute row asks): "installed"; "absent" when mise.gateway.toml is gone or mise says
+# "not installed" (mise 2026.11.5: "mise ERROR npm:omniroute not installed", observed); otherwise
+# "unknown: <mise's first line>", which neither loads nor removes an agent
+gw_state() {
+  local out
+  [ -f "$ROOT/mise.gateway.toml" ] || { echo absent; return; }
+  if out=$(cd "$ROOT" && MISE_ENV=gateway "$1" where npm:omniroute 2>&1); then echo installed
+  elif grep -q 'npm:omniroute[^ ]* not installed' <<<"$out"; then echo absent
+  else echo "unknown: ${out%%$'\n'*}"; fi
+}
+install_gw() {
+  local m t
+  if ! m=$(find_mise 2>&1); then note "  FAILED: $m"; return 1; fi
+  local gs; gs=$(gw_state "$m")
+  case "$gs" in
+    installed) ;;
+    absent)
+      note "  skipped    OmniRoute is not installed for this clone (on request: mise -E gateway install --locked npm:omniroute; ADR 0056)"
+      [ -f "$GW_PLIST" ] || return 0
+      # an agent from an earlier install would restart a gateway that is gone every ThrottleInterval
+      if [ "${AUTOMATION_SKIP_LAUNCHD:-0}" = "1" ]; then note "  kept       $GW_PLIST (AUTOMATION_SKIP_LAUNCHD=1: not unloaded, so not removed)"; return 0; fi
+      local rc; unload "$GW_LABEL"; rc=$?
+      if [ "$rc" != 0 ]; then unload_note "$GW_LABEL" "$rc"; return 1; fi
+      rm -f "$GW_PLIST" && note "  removed    $GW_PLIST, the agent of a gateway no longer installed"; return 0 ;;
+    *)
+      if [ -f "$GW_PLIST" ]; then note "  FAILED: mise did not say whether OmniRoute is installed (${gs#unknown: }); $GW_PLIST kept as it was"; return 1; fi
+      note "  skipped    mise did not say whether OmniRoute is installed (${gs#unknown: }); no gateway agent written"; return 0 ;;
+  esac
+  t=$(mktemp "$AGENTS_DIR/.$GW_LABEL.XXXXXX") || { note "  FAILED: could not write $GW_PLIST"; return 1; }
+  write_gw_plist "$m" "$t" || { rm -f "$t"; note "  FAILED: could not write $GW_PLIST"; return 1; }
+  load_if_changed "$GW_LABEL" "$t" "$GW_PLIST" "the gateway keeps running" "(kept running on 127.0.0.1:20128, its API key required)"
+}
+
 # install_otel: installs the collector's config and agent; returns 1 naming what failed. The config is
 # validated before it replaces the installed one, so a refused config never reaches a running agent; on a
 # failure before the plist is written, an agent loaded by an earlier install is left as it was, and says so.
@@ -344,6 +544,14 @@ install_otel() {
   mkdir -p "$OTEL_DIR" || { note "  FAILED: cannot create $OTEL_DIR$prev"; return 1; }
   if ! out=$(CANON_OTEL_DIR="$OTEL_DIR" "$bin" validate --config "$src" 2>&1); then
     note "  FAILED: otelcol validate refused the config: ${out//$'\n'/; }$prev"; return 1
+  fi
+  # config and plist as they are, and the job loaded: kept running, its events and log with it
+  if [ "${AUTOMATION_SKIP_LAUNCHD:-0}" != "1" ] && cmp -s "$src" "$OTEL_DIR/config.yaml" && [ -f "$OTEL_PLIST" ]; then
+    local t
+    if t=$(mktemp "$AGENTS_DIR/.$OTEL_LABEL.XXXXXX") && write_otel_plist "$bin" "$t" && cmp -s "$t" "$OTEL_PLIST" && loaded "$OTEL_LABEL"; then
+      rm -f "$t"; note "  kept       $OTEL_LABEL running: its config and plist are unchanged"; return 0
+    fi
+    rm -f "${t:-}"
   fi
   if ! /usr/bin/install -m 644 "$src" "$OTEL_DIR/config.yaml"; then
     note "  FAILED: could not install $OTEL_DIR/config.yaml$prev"; return 1
@@ -393,9 +601,18 @@ do_install() {
   else
     # the old job is unloaded before anything it runs is replaced, so no firing of it runs the new runner or
     # the clone while install moves them; one that would not unload leaves all of them as they were
-    local paper_unloaded=0
-    if [ "${AUTOMATION_SKIP_LAUNCHD:-0}" != "1" ]; then unload "$PAPER_LABEL"; paper_unloaded=$?; fi
-    if [ "$paper_unloaded" != 0 ]; then
+    # with runner and plist as they are and the job loaded, it is left alone: a reload starts its 35-minute
+    # interval again (ADR 0050), and each firing makes its clone anew anyway
+    local paper_unloaded=0 paper_keep=0 pt=""
+    if [ "${AUTOMATION_SKIP_LAUNCHD:-0}" != "1" ] && [ -f "$PAPER_PLIST" ] \
+       && cmp -s "$ROOT/home/.claude/canon/paper-session.sh" "$CANON_HOME/paper-session.sh" \
+       && pt=$(mktemp "$AGENTS_DIR/.$PAPER_LABEL.XXXXXX") && write_paper_plist "$paper_mise" "$paper_url" "$pt" \
+       && cmp -s "$pt" "$PAPER_PLIST" && loaded "$PAPER_LABEL"; then paper_keep=1; fi
+    rm -f "${pt:-}"
+    if [ "$paper_keep" != 1 ] && [ "${AUTOMATION_SKIP_LAUNCHD:-0}" != "1" ]; then unload "$PAPER_LABEL"; paper_unloaded=$?; fi
+    if [ "$paper_keep" = 1 ]; then
+      note "  kept       $PAPER_LABEL loaded: its runner and plist are unchanged (its interval runs on)"
+    elif [ "$paper_unloaded" != 0 ]; then
       unload_note "$PAPER_LABEL" "$paper_unloaded"; ok=1
       note "  kept       $CANON_HOME/paper-session.sh, $PAPER_CHECKOUT and $PAPER_PLIST as they were, under the job still loaded"
     elif ! /usr/bin/install -m 755 "$ROOT/home/.claude/canon/paper-session.sh" "$CANON_HOME/paper-session.sh"; then
@@ -415,7 +632,7 @@ do_install() {
           if [ "${AUTOMATION_SKIP_LAUNCHD:-0}" = "1" ]; then
             note "  not loaded (AUTOMATION_SKIP_LAUNCHD=1)"
           else
-            boot "$PAPER_LABEL" "$PAPER_PLIST" "(every $((PAPER_INTERVAL / 60)) minutes; a window only when a session is open)" || ok=1
+            boot "$PAPER_LABEL" "$PAPER_PLIST" "($((PAPER_INTERVAL / 60)) minutes after each firing ends; a window only when a session is open)" || ok=1
           fi
         fi
       fi
@@ -423,6 +640,8 @@ do_install() {
   fi
   note "OTLP collector:"
   install_otel || ok=1
+  note "OmniRoute gateway:"
+  install_gw || ok=1
   note "Landing:"
   local mise_bin
   if ! git -C "$ROOT" remote get-url origin >/dev/null 2>&1; then
@@ -437,6 +656,9 @@ do_install() {
   else
     note "  FAILED: could not set the git credential helper"; ok=1
   fi
+  # last: when the agent's own round started this install, a reload of its job comes after everything else
+  note "Maintenance:"
+  install_maint || ok=1
   note "Landscape watch: registered in .claude/settings.json; nothing to install."
   note "Weekly refresh: created from a Claude desktop session, not from this script."
   return "$ok"
@@ -447,7 +669,7 @@ do_install() {
 # were gone (a second reader's claim), and a retry would find nothing to tell it what to unload.
 do_uninstall() {
   local left="" f l rc still="" fs
-  for l in "$LABEL" "$PAPER_LABEL" "$OTEL_LABEL"; do
+  for l in "$MAINT_LABEL" "$LABEL" "$PAPER_LABEL" "$OTEL_LABEL" "$GW_LABEL"; do
     unload "$l"; rc=$?
     case "$rc" in
       0) if [ "$UNLOAD_ABSENT" = 1 ]; then note "  $l was not loaded"; else note "  unloaded   $l"; fi; continue ;;
@@ -458,10 +680,12 @@ do_uninstall() {
     still="$still $l "; left="$left
   launchd job $l"
   done
-  for l in "$LABEL" "$PAPER_LABEL" "$OTEL_LABEL"; do
+  for l in "$MAINT_LABEL" "$LABEL" "$PAPER_LABEL" "$OTEL_LABEL" "$GW_LABEL"; do
     case "$l" in
       "$LABEL") fs="$PLIST|$CANON_HOME/lanes|$CANON_HOME/lanes-watch.sh" ;;
       "$PAPER_LABEL") fs="$PAPER_PLIST|$CANON_HOME/paper-session.sh" ;;
+      "$MAINT_LABEL") fs="$MAINT_PLIST|$CANON_HOME/maintenance.sh|$CANON_HOME/maintenance.lock" ;;
+      "$GW_LABEL") fs="$GW_PLIST" ;;
       *) fs="$OTEL_PLIST|$OTEL_DIR/config.yaml" ;;
     esac
     if [[ "$still" == *" $l "* ]]; then
@@ -532,6 +756,80 @@ do_uninstall() {
   note "in ${PAPER_DIR:-the per-user temporary folder}, $OTEL_DIR/logs.jsonl (and its rotated copies) and the weekly scheduled task."
   note "Remove the weekly task from the desktop app's Scheduled list."
   if [ -n "$left" ]; then note "uninstall: not removed:$left"; return 1; fi
+}
+
+# uc_sources: a checksum of what scripts/bootstrap --user-config reads from this tree, by relative path, so the
+# clone's place does not change it: home/.claude but its canon/ folder (whose two scripts are compared whole),
+# home/.codex, canon/models.json and scripts/bootstrap itself
+# The settings step also writes only where a runtime's own folder exists (Codex's, Antigravity's, dsh-tui's
+# profile; scripts/bootstrap), so which of those exist is part of what it was run for.
+uc_sources() {
+  local dir
+  { (cd "$ROOT" && { find home/.claude home/.codex -type f ! -path 'home/.claude/canon/*' -print; echo canon/models.json; echo scripts/bootstrap; } \
+       | LC_ALL=C sort | while IFS= read -r f; do printf '%s %s\n' "$f" "$(cksum < "$f" 2>/dev/null || echo missing)"; done)
+    for dir in "${CODEX_HOME:-$HOME/.codex}" "$HOME/.gemini/antigravity-cli" "${DSH_HOME:-$HOME/.dsh}/profiles/dsh-tui"; do
+      if [ -d "$dir" ]; then echo "present $dir"; else echo "absent $dir"; fi
+    done
+  } | cksum | awk '{ print $1 "-" $2 }'
+}
+do_mark_user_config() {
+  mkdir -p "$CANON_HOME/watch" && uc_sources > "$UC_MARK" && note "recorded the settings step's sources: $(cat "$UC_MARK")"
+}
+
+# do_differs: what `install` and `scripts/bootstrap --user-config` would change, one line each (usage above).
+# The plists are rendered by the functions install uses, into a temporary folder, and compared whole.
+do_differs() {
+  local d=0 u=0 t m url bin f st l p gw=0
+  say() { printf '%s: %s\n' "$1" "$2"; if [ "$1" = unknown ]; then u=1; else d=1; fi; }
+  t=$(mktemp -d "${TMPDIR:-/tmp}/automation-differs.XXXXXX") || { say unknown "cannot create a temporary folder"; return 2; }
+  [ "$(git -C "$ROOT" config --local --get core.hooksPath 2>/dev/null)" = ".githooks" ] || say automation "commit gate: core.hooksPath is not .githooks"
+  for f in "scripts/lanes:lanes" "home/.claude/canon/lanes-watch.sh:lanes-watch.sh" \
+           "home/.claude/canon/paper-session.sh:paper-session.sh" "home/.claude/canon/maintenance.sh:maintenance.sh"; do
+    cmp -s "$ROOT/${f%%:*}" "$CANON_HOME/${f#*:}" || say automation "$CANON_HOME/${f#*:} differs from ${f%%:*}"
+  done
+  cmp -s "$ROOT/home/.claude/canon/otel/config.yaml" "$OTEL_DIR/config.yaml" || say automation "$OTEL_DIR/config.yaml differs from home/.claude/canon/otel/config.yaml"
+  if ! m=$(find_mise 2>&1); then
+    say unknown "$m"
+  else
+    write_plist "$t/w" && { cmp -s "$t/w" "$PLIST" || say automation "$PLIST differs from what install writes"; }
+    write_maint_plist "$m" "$t/m" && { cmp -s "$t/m" "$MAINT_PLIST" || say automation "$MAINT_PLIST differs from what install writes"; }
+    if url=$(git -C "$ROOT" remote get-url origin 2>/dev/null) && [ -n "$url" ]; then
+      write_paper_plist "$m" "$url" "$t/p" && { cmp -s "$t/p" "$PAPER_PLIST" || say automation "$PAPER_PLIST differs from what install writes"; }
+      [ "$(git -C "$ROOT" config --local --get-all credential.https://github.com.helper 2>/dev/null | tail -n 1)" = "!\"$m\" exec -- gh auth git-credential" ] \
+        || say automation "landing: the git sign-in helper is not the one install sets"
+    else
+      say unknown "no origin remote, so there is no main for the paper session plist"
+    fi
+    # the gateway only where OmniRoute is installed, as install has it
+    case "$(gw_state "$m")" in
+      installed) gw=1; write_gw_plist "$m" "$t/g" && { cmp -s "$t/g" "$GW_PLIST" || say automation "$GW_PLIST differs from what install writes"; } ;;
+      absent) [ ! -f "$GW_PLIST" ] || say automation "$GW_PLIST is there, but OmniRoute is not installed for this clone (install removes it)" ;;
+      *) [ ! -f "$GW_PLIST" ] || say unknown "mise did not say whether OmniRoute is installed, so $GW_PLIST cannot be compared" ;;
+    esac
+    if bin=$(cd "$ROOT" && "$m" which otelcol 2>/dev/null) && [ -n "$bin" ] && [ -x "$bin" ]; then
+      write_otel_plist "$bin" "$t/o" && { cmp -s "$t/o" "$OTEL_PLIST" || say automation "$OTEL_PLIST differs from what install writes"; }
+    else
+      say unknown "mise has no otelcol installed for this clone, so the collector's plist cannot be compared; run: scripts/bootstrap --install"
+    fi
+  fi
+  rm -rf "${t:?}"
+  if [ "${AUTOMATION_SKIP_LAUNCHD:-0}" != "1" ]; then
+    for l in "$LABEL" "$PAPER_LABEL" "$OTEL_LABEL" "$MAINT_LABEL" "$GW_LABEL"; do
+      [ "$l" != "$GW_LABEL" ] || [ "$gw" = 1 ] || continue
+      loaded "$l"; st=$?
+      if [ "$st" = 1 ]; then say automation "$l is not loaded"; elif [ "$st" = 2 ]; then say unknown "launchctl did not answer about $l"; fi
+    done
+  fi
+  for f in ledger.sh statusline.sh; do
+    cmp -s "$ROOT/home/.claude/canon/$f" "$CLAUDE_HOME/canon/$f" || say user-config "$CLAUDE_HOME/canon/$f differs from home/.claude/canon/$f"
+  done
+  if [ ! -f "$UC_MARK" ]; then say user-config "no record of an earlier settings step by the maintenance agent"
+  else
+    p=$(uc_sources)
+    [ "$(cat "$UC_MARK" 2>/dev/null)" = "$p" ] || say user-config "the settings sources (home/.claude, home/.codex, canon/models.json, scripts/bootstrap), or which runtimes' folders exist, changed since the last settings step"
+  fi
+  if [ "$u" = 1 ]; then return 2; fi
+  return "$d"
 }
 
 do_status() {
@@ -696,6 +994,27 @@ do_status() {
       paper_worse STALE; txt="$txt | no scheduled firing for $((fired / 60)) min (the Mac asleep, or the job not running)"
     else
       txt="$txt | last scheduled firing $((fired / 60)) min ago"
+      # launchd starts the next firing an interval after one ends, or after the job is loaded: with the job
+      # not running and nothing written since for more than two intervals and 300 s, a firing is overdue by
+      # more than one interval. What a firing writes last is its stamp, heartbeat, record or log; an install
+      # rewrites the plist as it loads the job. File times, as the firing's end is in no record; GNU stat
+      # -c %Y, else BSD stat -f %m (stat(1) on each)
+      local pstate pend=0 pf pm
+      pstate=$(printf '%s\n' "$pr" | awk -F' = ' '/^\tstate = / && s == "" { s = $2 } END { print s }')
+      if [ "$pstate" != running ]; then
+        for pf in "$PAPER_DIR/scheduled-firing.json" "$PAPER_DIR/last-firing.json" "$PAPER_DIR/latest.json" \
+                  "$CANON_HOME/watch/paper-session.log" "$PAPER_PLIST"; do
+          pm=$(stat -c %Y "$pf" 2>/dev/null || stat -f %m "$pf" 2>/dev/null) || continue
+          [[ "$pm" =~ ^[0-9]+$ ]] || continue
+          [ "$pm" -le "$pend" ] || pend=$pm
+        done
+        if [ "$pend" -gt 0 ]; then
+          pend=$(( $(date +%s) - pend ))
+          if [ "$pend" -gt $((2 * PAPER_INTERVAL + 300)) ]; then
+            paper_worse STALE; txt="$txt | overdue: nothing from a scheduled firing for $((pend / 60)) min, while launchd starts one $((PAPER_INTERVAL / 60)) min after the last ends (the Mac asleep, or the schedule stopped)"
+          fi
+        fi
+      fi
     fi
     # the runner launchd runs is the installed copy, which only install replaces
     if ! cmp -s "$ROOT/home/.claude/canon/paper-session.sh" "$CANON_HOME/paper-session.sh"; then
@@ -735,6 +1054,84 @@ do_status() {
     check_row "otlp collector" "$label" "$v"
   elif no_answer "$prc"; then check_row "otlp collector" UNKNOWN "launchctl did not answer within ${LAUNCHCTL_SECS} s, so whether it is loaded is not known"
   else check_row "otlp collector" OFF "run: scripts/automation install"; fi
+
+  # The maintenance agent: its last round's record, written by maintenance.sh in the folder its plist names.
+  # FAILED names each failed step; SKIPPED when the checkout was not brought to main (another branch, tracked
+  # changes, commits origin lacks); a round that found the paper lock held did nothing and is ok.
+  prc=0; pr=$(lc print "$DOMAIN/$MAINT_LABEL" 2>/dev/null) || prc=$?
+  if [ "$prc" = 0 ]; then
+    local mcfg mw ms mu mlab mtxt
+    mcfg=$(plutil -extract EnvironmentVariables.CLAUDE_CONFIG_DIR raw -o - "$MAINT_PLIST" 2>/dev/null) || mcfg=""
+    mw="${mcfg:-$CLAUDE_HOME}/canon/watch"; ms="$mw/maintenance-status.json"; mu="$mw/maintenance-updates.json"
+    last=$(printf '%s\n' "$pr" | awk -F' = ' '/^\tlast exit code = / && s == "" { s = $2 } END { print s }')
+    maint_rank() { case "$1" in ok) echo 0 ;; UNKNOWN) echo 1 ;; SKIPPED) echo 2 ;; OUTDATED) echo 3 ;; STALE) echo 4 ;; *) echo 5 ;; esac; }
+    maint_worse() { [ "$(maint_rank "$1")" -le "$(maint_rank "$mlab")" ] || mlab=$1; }
+    if [ -f "$ms" ]; then
+      v=$(jq -r --argjson now "$(date -u +%s)" --argjson silent "$MAINT_SILENT" --argjson step "$MAINT_STEP" '
+            def what: map(sub("^(automation|user-config): "; "")) | join("; ");
+            ((($now - .at_epoch) / 60) | floor) as $m
+            | (.install // null) as $ins
+            | ($ins != null and $ins.state == "started" and ($now - $ins.at_epoch) > ($step + 300)) as $lost
+            | (if (.failed | length) > 0 or $lost then "FAILED" elif ($m * 60) > $silent then "STALE"
+               elif .outcome == "skipped" then "SKIPPED" else "ok" end) + "\t"
+              + "last round " + .at + " (" + ($m | tostring) + " min ago): " + .ff
+              + (if (.found | length) > 0 then "; differed: " + (.found | what)
+                 elif .outcome == "ok" then "; nothing differed from main" else "" end)
+              + (if (.installed | length) > 0 then "; installed: " + (.installed | join(", ")) else "" end)
+              + (if $ins != null and $ins.state == "started" then
+                   (if $lost then "; the reinstall it started has not reported" else "; its reinstall is running" end)
+                 else "" end)
+              + (if (.failed | length) > 0 then "; FAILED: " + (.failed | join("; ")) else "" end)
+              + (if (.note // "") != "" then "; " + .note else "" end)
+              + (if (.found | length) == 0 and .last_change != null then
+                   " | last change " + .last_change.at + ": installed "
+                   + (if (.last_change.installed | length) > 0 then (.last_change.installed | join(", ")) else "nothing" end)
+                   + (if (.last_change.failed | length) > 0 then ", FAILED: " + (.last_change.failed | join("; ")) else "" end)
+                 else "" end)' "$ms" 2>/dev/null)
+      [ -n "$v" ] || v=$(printf 'UNKNOWN\t%s is unreadable' "$ms")
+    else
+      v=$(printf 'UNKNOWN\tloaded; no round yet (the first comes %s minutes after install)' "$((MAINT_INTERVAL / 60))")
+    fi
+    mlab=${v%%$'\t'*} mtxt=${v#*$'\t'}
+    if [ -f "$mu" ]; then
+      v=$(jq -r '"updates " + .at + ": " + (.results | join("; "))' "$mu" 2>/dev/null) || v=""
+      if [ -z "$v" ]; then maint_worse UNKNOWN; mtxt="$mtxt | $mu is unreadable"
+      else mtxt="$mtxt | $v"; case "$v" in *FAILED:*) maint_worse FAILED ;; esac; fi
+    fi
+    case "$last" in
+      0|''|*[!0-9-]*) ;;
+      *) maint_worse FAILED; mtxt="$mtxt; the last round exited $last" ;;
+    esac
+    if ! cmp -s "$ROOT/home/.claude/canon/maintenance.sh" "$CANON_HOME/maintenance.sh"; then
+      maint_worse OUTDATED; mtxt="$mtxt; the installed script differs from this tree's (its next round on main installs it)"
+    fi
+    check_row "maintenance" "$mlab" "$mtxt | log $mw/maintenance.log"
+  elif no_answer "$prc"; then check_row "maintenance" UNKNOWN "launchctl did not answer within ${LAUNCHCTL_SECS} s, so whether it is loaded is not known"
+  else check_row "maintenance" OFF "run: scripts/automation install"; fi
+
+  # The OmniRoute gateway, only where install wrote its agent (OmniRoute installed): launchd must show it
+  # running, and an inference route must refuse a made-up key with 401, as omniroute:check asks
+  # (mise.gateway.toml; GET /v1/models follows the dashboard login, not the API key). CANON_CURL: tests only.
+  if [ ! -f "$GW_PLIST" ]; then
+    row "omniroute gateway" absent "no agent: OmniRoute is not installed for this clone, or install has not run since (ADR 0056)"
+  else
+    prc=0; pr=$(lc print "$DOMAIN/$GW_LABEL" 2>/dev/null) || prc=$?
+    if [ "$prc" = 0 ]; then
+      local gcode
+      state=$(printf '%s\n' "$pr" | awk -F' = ' '/^\tstate = / && s == "" { s = $2 } END { print s }')
+      gcode=$(printf 'Authorization: Bearer canon-made-up-%s\n' "$(/usr/bin/openssl rand -hex 16 2>/dev/null)" \
+        | "${CANON_CURL:-/usr/bin/curl}" -q --noproxy '*' -sS -o /dev/null -w '%{http_code}' --max-time 10 -H @- -H 'Content-Type: application/json' \
+            --data-binary '{}' http://127.0.0.1:20128/v1/chat/completions 2>/dev/null) || gcode=000
+      case "$state:$gcode" in
+        running:401) label=ok; v="running on 127.0.0.1:20128, its API key required" ;;
+        *:401) label=UNKNOWN; v="launchd shows state=${state:-?}, but 127.0.0.1:20128 refuses a made-up key: another copy of the gateway may hold the port" ;;
+        *:000) label=FAILED; v="state=${state:-?}, and nothing answers on 127.0.0.1:20128; see $CANON_HOME/watch/omniroute.log (a missing storage key: mise -E gateway run omniroute:store)" ;;
+        *) label=FAILED; v="state=${state:-?}; a made-up key got $gcode, not 401: its API key is not required" ;;
+      esac
+      check_row "omniroute gateway" "$label" "$v"
+    elif no_answer "$prc"; then check_row "omniroute gateway" UNKNOWN "launchctl did not answer within ${LAUNCHCTL_SECS} s, so whether it is loaded is not known"
+    else check_row "omniroute gateway" OFF "run: scripts/automation install"; fi
+  fi
 
   if [ -f "$CLAUDE_HOME/scheduled-tasks/$TASK_ID/SKILL.md" ]; then
     row "weekly refresh" ok "task file present at $CLAUDE_HOME/scheduled-tasks/$TASK_ID; whether it is still scheduled shows only in the desktop app"
@@ -793,5 +1190,7 @@ case "${1:-}" in
              if [ "$rc" != 0 ]; then printf '\ninstall: FAILED (exit %s):%s\n' "$rc" "$FAILS"; fi
              exit "$rc" ;;
   uninstall) do_uninstall ;;
-  *) note "usage: scripts/automation status | install | uninstall"; exit 2 ;;
+  differs)   do_differs ;;
+  mark-user-config) do_mark_user_config ;;
+  *) note "usage: scripts/automation status | install | uninstall | differs | mark-user-config"; exit 2 ;;
 esac

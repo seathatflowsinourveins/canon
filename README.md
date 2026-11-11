@@ -158,7 +158,7 @@ config environment (`mise.gateway.toml`, locked in `mise.gateway.lock`). On a Ma
 ```bash
 mise -E gateway install --locked npm:omniroute   # the pinned release, exactly the locked dependency graph
 mise -E gateway run omniroute:store      # makes its storage key into the keychain; nothing typed or shown
-mise -E gateway run omniroute:serve      # the gateway on 127.0.0.1:20128 with ADR 0056's settings, until Ctrl-C
+mise -E gateway run omniroute:serve      # by hand: the gateway on 127.0.0.1:20128 with ADR 0056's settings, until Ctrl-C
 mise -E gateway run omniroute:setup      # with it running: dashboard login off, a no-log API key minted into the keychain
 mise -E gateway run omniroute:provider openai  # yours: a provider's API key at a hidden prompt, registered in the gateway
 mise -E gateway run omniroute:codex      # Codex with its provider set to the gateway; arguments go to codex
@@ -169,7 +169,9 @@ mise -E gateway run omniroute:remove     # deletes them; without the storage key
 The provider key is the one thing you type: API keys only, never Anthropic or a sign-in, best one made for
 this gateway alone with a spend limit. The dashboard at `http://127.0.0.1:20128` opens without a login.
 `scripts/bootstrap --check` shows the installed version against the pin, and fails if a connection there
-says Anthropic or Claude, is not an API key, or an API key logs request bodies.
+says Anthropic or Claude, is not an API key, or an API key logs request bodies. Once OmniRoute is installed,
+`scripts/automation install` keeps the same `omniroute:serve` running as a launchd agent. A copy started
+by hand holds the port, so stop it first.
 
 ## What runs on its own
 
@@ -182,13 +184,17 @@ says Anthropic or Claude, is not an API key, or an API key logs request bodies.
 | Hosted watch (`canon check` on GitHub) | Once a day; keeps one locked `canon-drift` issue in step with what has drifted (ADR 0064) | No |
 | Landscape watch | Once a day, at session start | No |
 | Lane watchdog | Every 10 minutes while the Mac is awake | No |
-| Paper session | Every 35 minutes while the Mac is awake; a window only when Alpaca's clock says a session is open, on the `main` GitHub has then (ADR 0050) | No |
+| Paper session | About every 35 minutes while the Mac is awake (launchd fires it 10 minutes after each firing ends); a window only when Alpaca's clock says a session is open, on the `main` GitHub has then (ADR 0050) | No |
+| Maintenance | Every 30 minutes while the Mac is awake, unless the paper lock is held. It fast-forwards the main checkout and reinstalls whatever differs from `main`. Once a day it runs `claude update` and `agy update` (ADR 0065) | No |
+| OmniRoute gateway | Always, once OmniRoute is installed: `omniroute:serve` on 127.0.0.1 (ADR 0056) | No |
 | OTLP collector | Always, while the Mac is awake: the pinned OpenTelemetry Collector on 127.0.0.1, writing the events `scripts/lanes --rates` reads (ADR 0007) | No |
 | Weekly refresh | Weekly, when the desktop app is open | One session, short when nothing changed |
 | Dependency bot (Dependabot) | Weekly, on GitHub | Only when a session lands its pull request |
 
 `scripts/automation install` turns on the commit gate, the address check, the lane watchdog, the paper
-session agent, whose runner keeps its own clone of `main` in `~/.claude/canon/`, and the OTLP collector. The edit
+session agent, whose runner keeps its own clone of `main` in `~/.claude/canon/`, the OTLP collector, the
+OmniRoute gateway once it is installed, and the maintenance agent, which from then on reinstalls
+whatever `main` changes. The edit
 checks and the landscape watch are hooks in `.claude/settings.json`. The weekly refresh is a
 scheduled task in the Claude desktop app, and the dependency bot is `.github/dependabot.yml`, which GitHub
 runs.
@@ -220,7 +226,7 @@ runs.
 | `.claude/rules/` | Rules scoped to `canon/`, `docs/adr/` and trading code |
 | `.claude/skills/` | `adopt-upstream`, `new-adr`, `landscape-refresh`, `lane-report` |
 | `.claude/agents/` | `upstream-scout` (Sonnet), `evidence-verifier` (Opus) |
-| `home/` | Machine-level config: event ledger hook, status line and its Claude HUD settings, lane watchdog, paper session runner, OTLP collector config, Claude Code and Codex telemetry settings, user `CLAUDE.md` |
+| `home/` | Machine-level config: event ledger hook, status line and its Claude HUD settings, lane watchdog, paper session runner, maintenance agent, OTLP collector config, Claude Code and Codex telemetry settings, user `CLAUDE.md` |
 | `mise.toml` | Pinned toolchain |
 
 ## How a decision gets made

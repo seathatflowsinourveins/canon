@@ -165,7 +165,8 @@ locally on the data client's live data; nothing in `src/` builds one yet (ADR 00
   adopted runtime other than Claude Code builds in its own workspace, and a Claude lane or the
   coordinator reviews and lands its change (ADR 0058).
 * **Gateway.** OmniRoute on 127.0.0.1 for GPT and other non-Anthropic runtimes, installed on request from
-  mise's `gateway` environment and started on demand by `mise -E gateway run omniroute:serve`; never a
+  mise's `gateway` environment, and kept running by a launchd agent that runs `mise -E gateway run omniroute:serve`
+  once it is installed; never a
   Claude credential, account or model, and Claude Code keeps its own login. Its storage key is in the
   login keychain, which, as for the paper pair, any process of this user can read; `scripts/bootstrap --check` fails on an Anthropic connection (ADR 0056).
 * **Context layers.** None adopted: the runtimes read `AGENTS.md` and take MCP servers, none configured;
@@ -173,8 +174,11 @@ locally on the data client's live data; nothing in `src/` builds one yet (ADR 00
   gain (ADR 0051).
 * **Unasked.** The commit gate, the push address check, edit-time lint, a daily canon watch, a lane
   watchdog, a weekly model run and Dependabot (ADR 0011, ADR 0016, ADR 0026; `AGENTS.md`, "Automation").
-  Once installed, a paper session window every 35 minutes, run from a clone each firing brings to
-  GitHub's `main` first, never from a checkout a person uses (ADR 0050).
+  Once installed, a paper session window about every 35 minutes, run from a clone each firing brings to
+  GitHub's `main` first, never from a checkout a person uses (ADR 0050). Every 30 minutes, the
+  maintenance agent brings the main checkout to origin/main by fast-forward and reinstalls what differs
+  from it, so what lands under `home/` and in the installers reaches the machine at its next round,
+  with main's gate as the control (ADR 0065).
   Models are routed by lane in `canon/models.json` (ADR 0005).
 
 ## Where code runs, and what it has
@@ -189,7 +193,7 @@ lists; "system" is `/usr/bin` or `/bin`. Secret variables are named, never shown
 | An agent Orca types into an existing workspace's pane, or a tab the owner opens (interactive `zsh -l`, `mise activate` in `~/.zshrc`) | mise's | mise's 3.14 | mise's | system; bash 3.2 | `~/.claude` | as above |
 | Claude Code subagent, Bash tool, hooks in `.claude/hooks/` | as its session | as its session | as its session | system | as its session | the session; settings `env` pins no alias (ADR 0059), Claude Code adds `CLAUDE_EFFORT` and `CLAUDE_CODE_*` |
 | `.githooks/pre-commit`, `pre-push`, `scripts/ci` and `scripts/land` by hand | git's own `libexec/git-core` (in a hook), then the caller's; `scripts/ci` then puts mise's first for its checks | caller's; mise's inside `scripts/ci` | mise's (`land` calls `gh` through `mise exec`) | system | caller's | not used |
-| launchd agents `scripts/automation` installs: lane watchdog, OTLP collector, paper session | `/usr/bin:/bin:/usr/sbin:/sbin`, set by each script; mise named by absolute path, and `mise run` adds its own | mise's inside `mise run paper:session` | mise's, through mise | system | the watchdog's plist sets `CLAUDE_CONFIG_DIR` to the folder at install | not used |
+| launchd agents `scripts/automation` installs: lane watchdog, OTLP collector, paper session, maintenance, OmniRoute gateway | `/usr/bin:/bin:/usr/sbin:/sbin`, set by each script, by the gateway's plist, and by the maintenance agent after mise's own folder; mise named by absolute path, and `mise run` adds its own | mise's inside `mise run paper:session` | mise's, through mise | system | the watchdog's and the maintenance agent's plists set `CLAUDE_CONFIG_DIR` to the folder at install | not used |
 | Hosted workflow (`.github/workflows/ci.yml`, `ubuntu-24.04`) | mise's (mise-action adds each to `GITHUB_PATH`) | mise's 3.14 | mise's | runner's; git 2.56, bash at `/usr/bin/bash` | none | not used |
 
 Where they differ in a way a script here depends on:
