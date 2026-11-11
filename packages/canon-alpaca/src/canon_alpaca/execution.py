@@ -43,8 +43,11 @@ judged through it:
 * An Alpaca order is the node's by its own client order ID, the client's index, the node's cache
   (`ClientCache.client_order_id`) or, only on a miss, a walk of `replaces` (`_root_id`), which reads at most
   `MAX_REPLACE_CHAIN` orders and fails by name past that or on an order Alpaca does not find.
-* A fill is applied once per trade ID, on any order of the chain, and the order ends when the record's count
-  reaches its quantity, so a late fill of an order since replaced still counts.
+* A fill is applied once, on any order of the chain, and the order ends when the record's count reaches its
+  quantity, so a late fill of an order since replaced still counts. A fill is known by Alpaca's execution ID
+  from the stream and from a fill report alike. The node's order holds a fill under any other ID only when
+  the engine inferred it from a status report; a stream fill under an ID not yet seen is taken for one of
+  those inferred shares while any are unmatched, and is otherwise a fill of its own (`_counted_already`).
 * A replacement is adopted once: by `replaced`, by its own update once the record shows the order it replaces
   replaced by it, or by a fill, which proves it live (`record_order_update_from_fill`); its `new` alone does
   not, since it may still be rejected. A late update of an order the record has left is ignored, but for its
@@ -285,6 +288,7 @@ from nautilus_trader.model import InstrumentId
 from nautilus_trader.model import LiquiditySide
 from nautilus_trader.model import Money
 from nautilus_trader.model import OmsType
+from nautilus_trader.model import OrderFilled
 from nautilus_trader.model import OrderSide
 from nautilus_trader.model import OrderStatus
 from nautilus_trader.model import OrderStatusReport
@@ -1154,6 +1158,13 @@ class AlpacaExecutionClient(ExecutionClient):
         # Alpaca's acknowledgement of an order that was pending cancel or update when it came, kept for
         # the refusal that puts the order back to `SUBMITTED` (`_accept`).
         self._acknowledged: dict[ClientOrderId, tuple[VenueOrderId, int]] = {}
+        # Every trade ID Alpaca has given this client, from the stream and from its fill activities, so a
+        # fill the node's order holds under any other ID is one the engine inferred (`_counted_already`);
+        # and, per order, the stream fills taken for those inferred shares, by trade ID with their shares.
+        # Both are kept across a reconnect, since the node's cache keeps the fills; the matches are dropped
+        # when the order ends. The trade IDs grow with the distinct fills read, as the cache's fills do.
+        self._alpaca_trades: set[str] = set()
+        self._matched: dict[ClientOrderId, dict[str, Decimal]] = {}
         # Trade updates, applied in arrival order by one task on the node's loop.
         self._updates: asyncio.Queue[TradeUpdate] = asyncio.Queue()
         self._consumer: asyncio.Task[object] | None = None
@@ -2279,6 +2290,7 @@ class AlpacaExecutionClient(ExecutionClient):
             if self._index.get(leg_id) == client_order_id:
                 del self._index[leg_id]
         self._acknowledged.pop(client_order_id, None)
+        self._matched.pop(client_order_id, None)
 
     async def _replaced(
         self, order: Any, record: OrderRecord, old: AlpacaOrder, ts_event: int
@@ -2426,6 +2438,7 @@ class AlpacaExecutionClient(ExecutionClient):
             if update.qty is None or update.price is None:
                 raise ValueError("it has no qty or price")
             last_qty = whole_quantity(update.qty, "fill quantity")
+            last_px = fill_price(update.price)
         except ValueError as e:
             self._log.error(
                 f"Alpaca {update.event} for {order.client_order_id} not applied: {e}; reconciliation "
@@ -2434,33 +2447,96 @@ class AlpacaExecutionClient(ExecutionClient):
             return
         client_order_id = order.client_order_id
         trade_id = str(update.execution_id)
-        # A trade ID the node's order holds was applied already, by this client or by the engine from a
-        # report (`_query_order`, reconciliation), whose fill the record's count has not seen.
-        if trade_id in record.trades or (
-            order.filled_qty.as_decimal() > record.filled
-            and any(str(t) == trade_id for t in order.trade_ids)
-        ):
-            self._log.info(
-                f"Alpaca {update.event} {trade_id} for {client_order_id} was applied already; ignored"
-            )
-            return
+        self._alpaca_trades.add(trade_id)
+        counted = self._counted_already(order, record, update, trade_id, last_qty.as_decimal())
         record.trades.add(trade_id)
+        if counted is not None:
+            self._log.info(
+                f"Alpaca {update.event} {trade_id} for {client_order_id} was counted already ({counted}); "
+                "ignored"
+            )
+            if (
+                counted == "inferred"
+            ):  # the engine's fill for it is applied: the order's count holds it
+                record.filled = max(record.filled, order.filled_qty.as_decimal())
+                if record.filled >= record.quantity:
+                    self._finish(client_order_id)
+            return
         self._acknowledged.pop(client_order_id, None)  # a fill implies it
         record.filled = max(record.filled, order.filled_qty.as_decimal()) + last_qty.as_decimal()
+        self._filled(order, venue_order_id, trade_id, last_qty, last_px, ts_event)
+        if record.filled >= record.quantity:
+            self._finish(client_order_id)
+
+    def _filled(
+        self,
+        order: Any,
+        venue_order_id: VenueOrderId,
+        trade_id: str,
+        last_qty: Quantity,
+        last_px: Price,
+        ts_event: int,
+    ) -> None:
         self.generate_order_filled(
             order,
             venue_order_id,
             None,
             TradeId(trade_id),
             last_qty,
-            fill_price(update.price),
+            last_px,
             USD,
             None,
             LiquiditySide.NO_LIQUIDITY_SIDE,
             ts_event,
         )
-        if record.filled >= record.quantity:
-            self._finish(client_order_id)
+
+    def _counted_already(
+        self, order: Any, record: OrderRecord, update: TradeUpdate, trade_id: str, shares: Decimal
+    ) -> str | None:
+        """How the node's order counts this fill already: `"by trade ID"`, `"inferred"` (taken for a
+        share the engine inferred), or None for a fill not yet counted. Judged on what the node has
+        applied (its cached order), never on what was only sent.
+
+        One rule, whichever source brought the fill first. NautilusTrader's order "enforces one
+        quantity-bearing fill per `trade_id`", and "Stable `trade_id` values let the engine deduplicate
+        the same fill across both channels. If the logical fill arrives with different IDs, the engine
+        treats the reports as distinct" (`docs/concepts/execution/index.md` at the pinned commit). So a
+        fill is known by Alpaca's execution ID wherever Alpaca carries it, the stream's `execution_id`
+        and a fill activity's trade ID being the same UUID (ADR 0024): an ID the record, the node's order
+        or an earlier match holds is counted. The one fill the engine makes an ID for is one it infers
+        from a status report (`reconcile_order_report` at the pin); every fill report comes from
+        `_fill_reports` and every stream fill through here, so the order's shares under an ID Alpaca never
+        gave this client are inferred. A stream fill under an ID not yet seen is taken for one of them
+        while any are unmatched, on any order of the chain, and is otherwise a fill of its own. Alpaca's
+        cumulative `filled_qty` on the update, under `FILLED_READING` (`chain_filled`), only narrows that:
+        past what the node has applied, the fill is its own."""
+        matched = self._matched.setdefault(order.client_order_id, {})
+        if (
+            trade_id in record.trades
+            or trade_id in matched
+            or trade_id in {str(t) for t in order.trade_ids}
+        ):
+            return "by trade ID"
+        inferred = sum(
+            (
+                event.last_qty.as_decimal()
+                for event in order.events()
+                if isinstance(event, OrderFilled) and str(event.trade_id) not in self._alpaca_trades
+            ),
+            Decimal(0),
+        )
+        if inferred - sum(matched.values(), Decimal(0)) < shares:
+            return None
+        own = share_count(update.order.filled_qty)
+        if own is not None:
+            leg_id = str(update.order.id)
+            earlier = (
+                record.earlier_filled(leg_id) if update.order.replaces is not None else Decimal(0)
+            )
+            if chain_filled(own, earlier) > max(record.filled, order.filled_qty.as_decimal()):
+                return None
+        matched[trade_id] = shares
+        return "inferred"
 
     def _on_stream_exit(self, exit: StreamExit) -> None:
         stream, error = exit
@@ -2716,6 +2792,7 @@ class AlpacaExecutionClient(ExecutionClient):
                 name = activity.get("id") if isinstance(activity, dict) else repr(activity)
                 self._log.warning(f"Alpaca fill activity {name} is not reported: {e}")
                 continue
+            self._alpaca_trades.add(str(report.trade_id))
             if command.start is not None and report.ts_event < command.start:
                 continue
             if command.end is not None and report.ts_event > command.end:

@@ -520,7 +520,14 @@ class FakeOrdersClient(FakeTradingClient):
         time_module.sleep(self.submit_delay)
         return answer
 
-    def _send(self, event: str, placed: dict, qty: int | None = None, **status: str) -> None:
+    def _send(
+        self,
+        event: str,
+        placed: dict,
+        qty: int | None = None,
+        deliver: bool = True,
+        **status: str,
+    ) -> dict:
         placed.update(status, updated_at=datetime.now(UTC).isoformat())
         update: dict[str, object] = {
             "event": event,
@@ -544,8 +551,10 @@ class FakeOrdersClient(FakeTradingClient):
                     )
                 )
             placed["filled_avg_price"] = self.fill_price
-        assert self.stream is not None, "no trade stream to send to"
-        self.stream.send(update)
+        if deliver:
+            assert self.stream is not None, "no trade stream to send to"
+            self.stream.send(update)
+        return update
 
     def cancel_order_by_id(self, order_id: object) -> None:
         self._count_sends()
@@ -628,9 +637,18 @@ class FakeOrdersClient(FakeTradingClient):
         old = self._placed[old_id]
         self._send("replaced", old, status="replaced")
 
-    def update(self, order_id: str, event: str, qty: int | None = None, **status: str) -> None:
-        """Send one trade update for an order the stand-in holds, as Alpaca would."""
-        self._send(event, self._placed[order_id], qty, **status)
+    def update(
+        self,
+        order_id: str,
+        event: str,
+        qty: int | None = None,
+        deliver: bool = True,
+        **status: str,
+    ) -> dict:
+        """Send one trade update for an order the stand-in holds, as Alpaca would, and return it. With
+        `deliver` false Alpaca's state and its fill activity change but the update is held back, as a
+        stream that is slow or down holds it; `stream.send` delivers it later."""
+        return self._send(event, self._placed[order_id], qty, deliver, **status)
 
     def get_order_by_id(self, order_id: object) -> Order:
         refusal = self.order_lookup_error(str(order_id)) if self.order_lookup_error else None
