@@ -7,7 +7,7 @@ outrank this page. What is planned is in [roadmap.md](roadmap.md).
 flowchart LR
   subgraph alpaca["Alpaca paper environment"]
     rest["Trading API and market data (REST)"]
-    streams["IEX data stream, trade updates stream"]
+    streams["Market data stream (IEX unless named), trade updates stream"]
   end
   subgraph adapter["canon-alpaca, on alpaca-py"]
     prov["AlpacaInstrumentProvider"]
@@ -53,8 +53,8 @@ flowchart LR
 
 | Layer | What it is | Rests on (pin) | Code | Decided by |
 |---|---|---|---|---|
-| Venue | Alpaca's paper Trading API, its market data (IEX feed) and its two streams | Alpaca's docs; `alpaca-py` v0.45.0 | none here | ADR 0009 |
-| Adapter | Instrument provider, data client, execution client, factories, in upstream's five modules | `alpaca-py` v0.45.0; `requests` v2.34.2, for the HTTP timeout alpaca-py does not set; NautilusTrader's adapter guide and template (template at v2.0.0rc8) | `packages/canon-alpaca/` | ADR 0009, 0012, 0024, 0030, 0036, 0038, 0039, 0042 |
+| Venue | Alpaca's paper Trading API, its market data (the IEX feed unless a subscription or request names another) and its two streams | Alpaca's docs; `alpaca-py` v0.45.0 | none here | ADR 0009, 0055 |
+| Adapter | Instrument provider, data client, execution client, factories, in upstream's five modules | `alpaca-py` v0.45.0; `requests` v2.34.2, for the HTTP timeout alpaca-py does not set; NautilusTrader's adapter guide and template (template at v2.0.0rc8) | `packages/canon-alpaca/` | ADR 0009, 0012, 0024, 0030, 0036, 0038, 0039, 0042, 0055 |
 | Engine | The node: data, risk and execution engines, cache, portfolio; `BacktestNode` for backtests, `LiveNode` for paper | NautilusTrader v2.0.0rc8 | upstream | ADR 0009 |
 | Strategies and node configuration | `MaCross` and `run_backtest` on a simulated `ALPACA` venue; `ema_cross_paper_node`, a paper `LiveNode` running upstream's built-in `EmaCross` under risk limits | NautilusTrader v2.0.0rc8 | `src/canon_trading/` | ADR 0009, 0012, 0037, 0049 |
 | Local data | `ParquetDataCatalog` of bars and instruments, ignored by git, filled from Alpaca by `load_bars` | NautilusTrader v2.0.0rc8 | `catalog/`, `canon_trading/bars_to_catalog.py` | ADR 0012, 0040 |
@@ -91,8 +91,9 @@ daily bars (ADR 0048).
    which adds upstream's `EmaCross` at one share an order (`paper_node.py`, `tests/test_paper_ema_cross.py`, ADR 0037),
    or through `session_window.window_node`, which adds `SessionMaCross` and the `PositionCap` with the
    execution engine's open-order and position checks on (`session_window.py`, ADR 0044).
-2. On connect the provider loads `Equity` instruments from `/v2/assets`; the data client streams IEX
-   quotes and trades and serves historical bars into the data engine (package README).
+2. On connect the provider loads `Equity` instruments from `/v2/assets`; the data client streams quotes
+   and trades, on the feed the first subscription's params name and IEX when they name none, and serves
+   historical bars into the data engine (package README, ADR 0055).
 3. A strategy's order passes the risk engine, then the execution engine sends it to Alpaca's paper API
    with `paper=True`; denied types never reach Alpaca (package README, ADR 0036).
 4. Alpaca's trade updates stream becomes order events; each `fill` or `partial_fill` is an `OrderFilled`

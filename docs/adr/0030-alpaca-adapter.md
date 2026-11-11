@@ -97,6 +97,9 @@ alpaca-py was loaded by a node's start-up reconciliation, with no lookback, with
 
 ADR 0036 records the order-management slice, one change at a time, starting with cancel-all.
 
+**Feed (2026-11-10).** The first slice's "the IEX feed only" no longer holds: a subscription or bars
+request names its feed in params and gets IEX when it names none (ADR 0055).
+
 ## Evidence
 
 * Split from ADR 0009 on 2026-11-10 with no change of decision: the text above is ADR 0009's own, moved,

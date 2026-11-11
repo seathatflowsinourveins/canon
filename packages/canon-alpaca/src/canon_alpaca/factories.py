@@ -8,8 +8,9 @@ passes the node's values through and starts no task and opens no network resourc
 under a client name with `LiveNodeBuilder.add_data_client` and `add_exec_client`, or
 `LiveNode.build(..., data_factories=..., exec_factories=...)`.
 
-The config is a plain `DataClientConfig`: this slice has no adapter fields (the feed is fixed in
-`constants.FEED` and credentials come from the environment), so there is no `AlpacaDataClientConfig` yet.
+The config is a plain `DataClientConfig`: this slice has no adapter fields (a subscription or bars request
+names its feed in its params, `constants.FEED` when it names none, ADR 0055, and credentials come from the
+environment), so there is no `AlpacaDataClientConfig` yet.
 Its `instrument_provider` decides what is loaded: `load_ids=["AAPL.ALPACA", ...]`, or `load_all=True` with
 optional `filters` (`providers.FILTER_KEYS`).
 

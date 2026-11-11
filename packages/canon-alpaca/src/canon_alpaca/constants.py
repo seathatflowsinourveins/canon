@@ -35,12 +35,33 @@ pinned in `canon/upstreams.json`.
 """
 
 FEED = DataFeed.IEX
-"""Market data feed for historical bars and the live stream.
+"""The market data feed for a subscription or bars request whose params name none (ADR 0055).
 
 An Alpaca Paper Only account "is only entitled to receive and make use of IEX market data"
 (https://docs.alpaca.markets/us/docs/paper-trading.md). IEX is also alpaca-py's `StockDataStream`
 default.
 """
+
+FEED_PARAM = "feed"
+"""The params key a subscription or bars request names its feed with, Alpaca's own parameter name
+(the bars reference's `feed`; alpaca-py's `StockDataStream(feed=...)`), for example
+`subscribe_quotes(instrument_id, params={"feed": "boats"})` (ADR 0055)."""
+
+STREAM_FEEDS = (
+    DataFeed.IEX,
+    DataFeed.SIP,
+    DataFeed.DELAYED_SIP,
+    DataFeed.BOATS,
+    DataFeed.OVERNIGHT,
+)
+"""The feeds a subscription may name: the stream URLs of "Real-time Stock Data"
+(https://docs.alpaca.markets/us/docs/real-time-stock-pricing-data.md: `v2/sip`, `v2/iex`, `v2/delayed_sip`,
+`v1beta1/boats`, `v1beta1/overnight`), the feeds alpaca-py 0.45.0's `StockDataStream` takes. Which of them
+an account is served is Alpaca's to decide at authentication."""
+
+BARS_FEEDS = (DataFeed.IEX, DataFeed.OTC, DataFeed.SIP, DataFeed.BOATS)
+"""The feeds a bars request may name: the `feed` enum of "Historical bars"
+(https://docs.alpaca.markets/us/reference/stockbars.md: `iex`, `otc`, `sip`, `boats`)."""
 
 PRICE_PRECISION = 4
 PRICE_INCREMENT = Price.from_str("0.0001")
