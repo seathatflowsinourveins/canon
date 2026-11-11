@@ -1095,6 +1095,21 @@ def pytest_runtest_makereport(item, call):
     return report
 
 
+@pytest.hookimpl(wrapper=True)
+def pytest_pyfunc_call(pyfuncitem):
+    """Collect, before each test body, what an earlier failure left held only in reference cycles.
+
+    pytest keeps a failed test's exception in `sys.last_value` for post-mortem debugging until the next
+    test's call phase deletes it, just before the body runs (`_pytest.runner.pytest_runtest_call`), so the
+    failed test's own teardown collection (`collect_on_main_thread`) cannot free it. Cycles in what it
+    held kept the failed run's NautilusTrader node alive, and the one-`LiveNode`-per-thread guard
+    (`NODE_THREAD_OWNER`, `crates/live/src/node/mod.rs` at the pinned commit) then refused the next
+    test's `build_node`: one failure failed the test after it. Collected here, they are gone first.
+    """
+    gc.collect()
+    return (yield)
+
+
 @pytest.fixture(autouse=True)
 def collect_on_main_thread():
     """Collect each test's garbage on the main thread before the next test starts threads.

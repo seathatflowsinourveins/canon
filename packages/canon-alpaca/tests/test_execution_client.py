@@ -52,6 +52,7 @@ from canon_alpaca.constants import ENV_SECRET_KEY
 from canon_alpaca.constants import USD
 from canon_alpaca.execution import AlpacaExecutionClient
 from canon_alpaca.execution import AlpacaExecutionClientConfig
+from canon_alpaca.execution import FilledReading
 from canon_alpaca.execution import fill_report
 from canon_alpaca.factories import AlpacaDataClientFactory
 from canon_alpaca.factories import AlpacaExecutionClientFactory
@@ -1220,6 +1221,13 @@ def placed_order(venue: SimpleNamespace, index: int = 0) -> dict:
     return list(venue.trading._placed.values())[index]
 
 
+def forget(client: AlpacaExecutionClient) -> None:
+    """Drop what the client keeps of each order's replaces, as a new client after a restart has none: its
+    records and its index of Alpaca order IDs. The node's cache still holds the orders."""
+    client._records.clear()
+    client._index.clear()
+
+
 def test_modify_is_updated_when_alpacas_stream_confirms_the_replace(venue) -> None:
     venue.trading.script = "accept"
     strategy = modifier()
@@ -1272,7 +1280,7 @@ def test_fill_on_the_replacement_reaches_the_nodes_order(venue, cold) -> None:
 
     async def fill(client) -> None:
         if cold:
-            client._replacements.clear()
+            forget(client)
         new = placed_order(venue, 1)
         venue.trading.update(new["id"], "fill", 2, status="filled", filled_qty="2")
         async with asyncio.timeout(10):
@@ -1291,7 +1299,7 @@ def test_two_replaces_in_a_row_and_a_fill_traced_back_through_both(venue) -> Non
     strategy = modifier(prices=["150.50", "151.00"])
 
     async def fill(client) -> None:
-        client._replacements.clear()
+        forget(client)
         newest = placed_order(venue, 2)
         venue.trading.update(newest["id"], "fill", 2, status="filled", filled_qty="2")
         async with asyncio.timeout(10):
@@ -1317,7 +1325,7 @@ def test_reconciliation_reports_the_replacement_under_the_nodes_id(venue) -> Non
     reports: list = []
 
     async def report(client) -> None:
-        client._replacements.clear()
+        forget(client)
         venue.trading.orders = list(venue.trading._placed.values())
         window = SimpleNamespace(open_only=True, instrument_id=None, start=None, end=None)
         reports.extend(await client._generate_order_status_reports(window))
@@ -1455,7 +1463,7 @@ def test_replacement_that_cannot_be_read_gives_no_update(venue, alpaca, capfd) -
 
     async def confirm(client) -> None:
         old = placed_order(venue, 0)
-        client._answers.clear()  # the PATCH answer is lost
+        client._records[strategy.client_order_id].answers.clear()  # the PATCH answer is lost
         venue.trading.orders = []
         del venue.trading._placed[old["replaced_by"]]  # and the replacement cannot be read
         venue.trading.confirm_replace(old["id"])
@@ -1478,7 +1486,7 @@ def test_filled_replacement_is_reported_when_replaced_was_missed(venue) -> None:
         new = placed_order(venue, 1)
         new.update(status="filled", filled_qty="2", filled_avg_price="150.5")
         venue.trading.orders = list(venue.trading._placed.values())
-        client._replacements.clear()
+        forget(client)
         window = SimpleNamespace(open_only=False, instrument_id=None, start=None, end=None)
         reports.extend(await client._generate_order_status_reports(window))
 
@@ -1531,7 +1539,7 @@ def test_rejected_replacement_after_the_old_order_filled_settles_the_modify(venu
             while "OrderFilled" not in strategy.names():
                 await asyncio.sleep(0.01)
         await until_idle(client, venue)
-        assert strategy.client_order_id not in client._modifying.values()
+        assert strategy.client_order_id not in client._records  # its pending modify with it
 
     run_modify(venue, strategy, lambda: bool(venue.trading.replace_requests), race)
 
@@ -1596,7 +1604,7 @@ def test_replaced_whose_replacement_has_moved_on_still_updates(venue, status) ->
     strategy = modifier()
 
     async def moved(client) -> None:
-        client._answers.clear()
+        client._records[strategy.client_order_id].answers.clear()
         old, new = placed_order(venue, 0), placed_order(venue, 1)
         if status == "replaced":
             newer = {**new, "id": "9c0f6b2e-1d4a-4e8b-a3f5-7b6c5d4e3f21", "replaces": new["id"]}
@@ -1649,7 +1657,7 @@ def test_answer_after_replaced_is_not_kept(venue) -> None:
     left: list = []
 
     async def check(client) -> None:
-        left.extend(client._answers)
+        left.extend(a for record in client._records.values() for a in record.answers)
 
     run_modify(venue, strategy, lambda: "OrderUpdated" in strategy.names(), check)
 
@@ -1665,10 +1673,10 @@ def test_replacement_seen_before_the_node_holds_its_original_is_traced_later(ven
 
     async def trace(client) -> None:
         new = placed_order(venue, 1)
-        client._replacements.clear()
+        forget(client)
         # What a trace in the window records: the chain's root, the original's client order ID, which
         # the node did not hold then (before the fix, the miss was recorded as tracing to nothing).
-        client._replacements[new["id"]] = ClientOrderId(placed_order(venue, 0)["client_order_id"])
+        client._index[new["id"]] = ClientOrderId(placed_order(venue, 0)["client_order_id"])
         traced.append(await client._node_order_id(alpaca_order_model(new)))
 
     run_modify(venue, strategy, lambda: "OrderUpdated" in strategy.names(), trace)
@@ -1708,7 +1716,7 @@ def test_rejected_replacement_is_not_reported_after_a_restart(venue) -> None:
         old.update(status="filled", filled_qty="2", filled_avg_price="150")
         new["status"] = "rejected"
         venue.trading.orders = list(venue.trading._placed.values())
-        client._replacements.clear()
+        forget(client)
         window = SimpleNamespace(open_only=False, instrument_id=None, start=None, end=None)
         reports.extend(await client._generate_order_status_reports(window))
 
@@ -2930,7 +2938,7 @@ def test_orders_with_an_empty_client_id_are_each_traced_on_their_own(
     traced: dict[str, ClientOrderId | None] = {}
 
     async def body(client) -> None:
-        client._replacements.clear()
+        forget(client)
         for name in sorted(orders, key=lambda n: n != first):
             traced[name] = await client._root_id(orders[name])
 
@@ -2974,14 +2982,15 @@ def test_an_update_for_an_unrelated_order_with_an_empty_client_id_leaves_the_nod
 
 TRACE_FAILURES = [
     requests.ReadTimeout("read timed out"),
-    None,  # HTTP 500, built in the test: an `APIError` needs the fixture
+    500,  # an HTTP status is built in the test: an `APIError` needs the fixture
+    404,  # an order Alpaca names in `replaces` and does not find is a chain that cannot be read
     ValueError("a body alpaca-py's Order model refuses"),
     TypeError("Order() argument after ** must be a mapping"),
 ]
-TRACE_FAILURE_IDS = ["timeout", "http-500", "value", "type"]
+TRACE_FAILURE_IDS = ["timeout", "http-500", "http-404", "value", "type"]
 
 
-def replacement_of_an_unread_order(alpaca, venue, status: str, error: Exception | None) -> dict:
+def replacement_of_an_unread_order(alpaca, venue, status: str, error: Exception | int) -> dict:
     """A replacement whose prior order is not among the orders listed and cannot be read."""
     prior = "2b000000-0000-4000-8000-000000000001"
     replacement = alpaca.alpaca_order(
@@ -2992,7 +3001,9 @@ def replacement_of_an_unread_order(alpaca, venue, status: str, error: Exception 
     )
     venue.trading.orders = [replacement]
     failure = (
-        error if error is not None else alpaca.api_error(500, 50010000, "internal server error")
+        alpaca.api_error(error, error * 100000, "order not found" if error == 404 else "internal")
+        if isinstance(error, int)
+        else error
     )
     venue.trading.order_lookup_error = lambda order_id: failure if order_id == prior else None
     return replacement
@@ -3729,6 +3740,7 @@ def generated(monkeypatch) -> list[str]:
         "generate_order_cancel_rejected",
         "generate_order_expired",
         "generate_order_updated",
+        "generate_order_modify_rejected",
     ):
         original = getattr(AlpacaExecutionClient, method)
 
@@ -4429,7 +4441,7 @@ def test_an_acknowledgement_kept_during_a_cancel_is_not_generated_after_a_fill(
         order = client.cache.order(strategy.client_order_id)
         client._accepted.discard(order.client_order_id)
         client._acknowledged[order.client_order_id] = (order.venue_order_id, 1)
-        client._filled[order.client_order_id] = Decimal(1)
+        client._record(order).filled = Decimal(1)
         generated.clear()
         client._refusal_settled(order)
         seen.extend(generated)
@@ -4486,3 +4498,776 @@ def test_a_kept_acknowledgement_gives_the_next_command_alpacas_order_id(venue) -
     run_with_client(body, strategy)
 
     assert found == [VenueOrderId("ab000000-0000-4000-8000-000000000001")]
+
+
+# -- one record per node order: the replace chain as one model (ADR 0042) ---------------------------
+
+
+async def reconnect(client: AlpacaExecutionClient, venue: SimpleNamespace) -> None:
+    """Disconnect the client and connect it again, as a dropped session does: what it kept of each
+    order's replaces is gone, and the node's cache still holds the orders."""
+    await client._disconnect()
+    venue.stream.stopped.clear()
+    await client._connect()
+
+
+async def settled(client: AlpacaExecutionClient, venue: SimpleNamespace) -> None:
+    """Every update applied, and the engine given time to apply what they generated."""
+    await until_idle(client, venue)
+    await asyncio.sleep(0.2)
+
+
+@pytest.mark.parametrize("first", ["replaced", "rejected"])
+def test_a_rejected_takeover_of_a_partly_filled_order_ends_canceled(venue, first) -> None:
+    # One of two shares fills, the order is replaced, and Alpaca rejects the replacement after it took
+    # over: nothing works at Alpaca. NautilusTrader drops `OrderRejected` for a partly filled order, which
+    # left it open in the cache; the order ends canceled with its fill, as upstream's Binance spot emits
+    # the old order's cancel when its cancel-replace is rejected (`reject_replace`).
+    venue.trading.script = "accept"
+    venue.trading.replace_script = "silent"
+    strategy = modifier()
+    held: list = []
+
+    async def partly_filled_then_rejected(client) -> None:
+        old, new = placed_order(venue, 0), placed_order(venue, 1)
+        old["status"] = "new"
+        venue.trading.update(
+            old["id"], "partial_fill", 1, status="partially_filled", filled_qty="1"
+        )
+        await until_named(strategy, "OrderFilled")
+        await until_idle(client, venue)
+        if first == "replaced":
+            venue.trading.confirm_replace(old["id"])
+            await until_named(strategy, "OrderUpdated")
+            venue.trading.update(new["id"], "rejected", status="rejected")
+        else:
+            old["status"] = "replaced"  # as Alpaca shows it; its `replaced` is delivered second
+            venue.trading.update(new["id"], "rejected", status="rejected")
+            await until_idle(client, venue)
+            venue.trading.confirm_replace(old["id"])
+        await settled(client, venue)
+        cached = client.cache.order(strategy.client_order_id)
+        held.append((cached.status, cached.filled_qty.as_double()))
+
+    run_modify(
+        venue, strategy, lambda: bool(venue.trading.replace_requests), partly_filled_then_rejected
+    )
+
+    assert "OrderRejected" not in strategy.names(), strategy.names()
+    assert strategy.names()[-1] == "OrderCanceled", strategy.names()
+    assert held == [(OrderStatus.CANCELED, 1.0)]
+
+
+def test_a_rejected_takeover_of_a_partly_filled_order_is_reported_canceled_with_its_fill(
+    venue, alpaca
+) -> None:
+    # The same state read at start-up: reported `REJECTED`, the engine dropped the order's fill report
+    # and held it rejected with nothing filled. It is reported canceled, its fill on it.
+    replaced_after_one_fill(
+        alpaca, venue, {"status": "rejected", "filled_qty": "1", "filled_avg_price": "150"}
+    )
+    venue.trading.positions = [
+        {**alpaca.POSITION_AAPL, "qty": "1", "qty_available": "1", "avg_entry_price": "150"}
+    ]
+    node = build_node(trader(submit=False))
+
+    run(node)
+
+    orders = node.cache.orders()
+    assert [o.client_order_id.value for o in orders] == ["my-order-1"], orders
+    (order,) = orders
+    assert (order.venue_order_id.value, order.status, order.filled_qty.as_double()) == (
+        REPLACEMENT_ID,
+        OrderStatus.CANCELED,
+        1.0,
+    )
+    trades = [e.trade_id.value for e in order.events() if type(e).__name__ == "OrderFilled"]
+    assert trades == [str(uuid.UUID(int=1))]
+
+
+def test_a_late_rejection_of_an_earlier_replacement_leaves_the_working_one(venue) -> None:
+    # Modify 1's replacement is rejected while the old order stays open, and its `rejected` is delayed;
+    # modify 2 replaces the old order with a working replacement. The late `rejected` names a replacement
+    # the old order was not replaced by: it must not move the node's order to it and reject it.
+    venue.trading.script = "accept"
+    venue.trading.replace_script = "silent"
+    strategy = modifier()
+    held: list = []
+
+    async def second_modify_then_late_rejection(client) -> None:
+        old, failed = placed_order(venue, 0), placed_order(venue, 1)
+        old.update(
+            status="new", replaced_by=None
+        )  # Alpaca rejected the replacement; the old one works
+        failed["status"] = "rejected"
+        venue.trading.replace_script = "replaced"
+        cached = client.cache.order(strategy.client_order_id)
+        await client._modify_order(
+            SimpleNamespace(
+                client_order_id=strategy.client_order_id,
+                venue_order_id=cached.venue_order_id,
+                quantity=None,
+                price=Price.from_str("151.00"),
+                trigger_price=None,
+            )
+        )
+        await until_named(strategy, "OrderUpdated")
+        venue.trading.update(failed["id"], "rejected", status="rejected")
+        await settled(client, venue)
+        cached = client.cache.order(strategy.client_order_id)
+        held.append((cached.venue_order_id.value, cached.is_open))
+
+    run_modify(
+        venue,
+        strategy,
+        lambda: bool(venue.trading.replace_requests),
+        second_modify_then_late_rejection,
+    )
+
+    working = placed_order(venue, 2)
+    assert "OrderRejected" not in strategy.names(), strategy.names()
+    assert strategy.names().count("OrderUpdated") == 1, strategy.names()
+    assert held == [(working["id"], True)]
+
+
+CHAIN_IDS = [f"7c000000-0000-4000-8000-00000000000{n}" for n in range(1, 4)]
+
+
+def replaced_twice_with_a_fill_on_each(alpaca, venue) -> None:
+    """The node's buy of 3, one share filled on the order and on each of its two replacements, as
+    Alpaca lists them while a replacement counts the fills before it: `cum_qty` 1, 2 and 3."""
+    first, second, third = CHAIN_IDS
+    at = datetime.now(UTC) - timedelta(minutes=10)
+    common = {"qty": "3", "filled_avg_price": "174.6"}
+    orders = [
+        alpaca.alpaca_order(
+            **common,
+            id=first,
+            client_order_id="my-order-7",
+            status="replaced",
+            replaced_by=second,
+            filled_qty="1",
+        ),
+        alpaca.alpaca_order(
+            **common,
+            id=second,
+            client_order_id="alpaca-made-7a",
+            replaces=first,
+            status="replaced",
+            replaced_by=third,
+            filled_qty="2",
+        ),
+        alpaca.alpaca_order(
+            **common,
+            id=third,
+            client_order_id="alpaca-made-7b",
+            replaces=second,
+            status="filled",
+            filled_qty="3",
+        ),
+    ]
+    venue.trading.orders = orders
+    venue.trading.activities = [
+        alpaca.fill_activity(
+            order,
+            str(uuid.UUID(int=n + 1)),
+            1,
+            "174.6",
+            at + timedelta(minutes=n),
+            "fill" if n == 2 else "partial_fill",
+            cum_qty=n + 1,
+            leaves_qty=2 - n,
+        )
+        for n, order in enumerate(orders)
+    ]
+
+
+@pytest.mark.parametrize("asked", [None, 0, 1, 2], ids=["bulk", "first", "middle", "last"])
+def test_fills_across_two_replaces_are_reported_on_the_order_now_working(
+    venue, alpaca, asked
+) -> None:
+    # Three orders in a chain, a fill on each. The middle one's listed fill is short of its `cum_qty`
+    # (which counts the first's), so it was set aside before the chain was assembled and the whole
+    # chain's fills were dropped. Every fill is reported on the last order, whichever order is asked for,
+    # and the order's status report agrees.
+    replaced_twice_with_a_fill_on_each(alpaca, venue)
+    fills: list = []
+    statuses: list = []
+    window = SimpleNamespace(open_only=False, instrument_id=None, start=None, end=None)
+    by = {} if asked is None else {"venue_order_id": VenueOrderId(CHAIN_IDS[asked])}
+
+    async def body(client) -> None:
+        fills.extend(await client._fill_reports(fills_command(**by)))
+        statuses.extend(await client._generate_order_status_reports(window))
+
+    run_with_client(body)
+
+    assert sorted((r.venue_order_id.value, uuid.UUID(r.trade_id.value).int) for r in fills) == [
+        (CHAIN_IDS[2], 1),
+        (CHAIN_IDS[2], 2),
+        (CHAIN_IDS[2], 3),
+    ]
+    assert [
+        (r.client_order_id.value, r.venue_order_id.value, r.order_status, r.filled_qty.as_double())
+        for r in statuses
+    ] == [("my-order-7", CHAIN_IDS[2], OrderStatus.FILLED, 3.0)]
+
+
+def test_a_fill_on_the_replacement_after_a_reconnect_needs_no_read_of_the_order_before_it(
+    venue,
+) -> None:
+    # After a reconnect the client has kept nothing of the replace, but the node's cache holds the order
+    # under the replacement's ID: the fill is the node's order's without walking `replaces` over HTTP,
+    # so a read that times out cannot lose it.
+    venue.trading.script = "accept"
+    strategy = modifier()
+
+    async def fill_after_reconnect(client) -> None:
+        await reconnect(client, venue)
+        venue.trading.order_lookup_error = lambda order_id: requests.ReadTimeout("read timed out")
+        new = placed_order(venue, 1)
+        venue.trading.update(new["id"], "fill", 2, status="filled", filled_qty="2")
+        await settled(client, venue)
+
+    run_modify(venue, strategy, lambda: "OrderUpdated" in strategy.names(), fill_after_reconnect)
+
+    assert strategy.names()[-1] == "OrderFilled", strategy.names()
+    assert strategy.last("OrderFilled").venue_order_id.value == placed_order(venue, 1)["id"]
+
+
+def test_a_late_cancel_of_the_replaced_order_after_a_reconnect_is_ignored(venue) -> None:
+    # The same late `canceled` as before a reconnect: the node's order names the replacement, so an
+    # update of the order it left does not cancel it.
+    venue.trading.script = "accept"
+    strategy = modifier()
+    held: list = []
+
+    async def late_cancel(client) -> None:
+        await reconnect(client, venue)
+        old = placed_order(venue, 0)
+        venue.trading.update(old["id"], "canceled", status="canceled")
+        await settled(client, venue)
+        held.append(client.cache.order(strategy.client_order_id).is_open)
+
+    run_modify(venue, strategy, lambda: "OrderUpdated" in strategy.names(), late_cancel)
+
+    assert "OrderCanceled" not in strategy.names(), strategy.names()
+    assert held == [True]
+
+
+def test_a_rejected_replacement_of_an_outside_order_with_no_client_id_is_not_reported(
+    venue, alpaca
+) -> None:
+    # An order made outside the node with an empty client order ID fills, and its replacement, with an
+    # ID Alpaca made, is rejected without taking over. The replacement's own ID is where its trace ends,
+    # which was taken for "not a replacement": it was reported rejected, as an order of its own.
+    outside = alpaca.alpaca_order(
+        id="5f000000-0000-4000-8000-000000000001",
+        client_order_id="",
+        status="filled",
+        filled_qty="2",
+        filled_avg_price="150",
+    )
+    rejected = alpaca.alpaca_order(
+        id="5f000000-0000-4000-8000-000000000002",
+        client_order_id="alpaca-made-501",
+        status="rejected",
+        replaces=outside["id"],
+    )
+    venue.trading.orders = [outside, rejected]
+    reports: list = []
+    window = SimpleNamespace(open_only=False, instrument_id=None, start=None, end=None)
+
+    async def body(client) -> None:
+        reports.extend(await client._generate_order_status_reports(window))
+
+    run_with_client(body)
+
+    assert reports == []
+
+
+def long_chain(alpaca, links: int) -> list[dict]:
+    """An order "node-long" replaced `links` times, the last replacement working."""
+    ids = [str(uuid.UUID(int=0xA000 + n)) for n in range(links + 1)]
+    return [
+        alpaca.alpaca_order(
+            id=ids[n],
+            client_order_id="node-long" if n == 0 else f"alpaca-made-{n}",
+            replaces=ids[n - 1] if n else None,
+            replaced_by=ids[n + 1] if n < links else None,
+            status="replaced" if n < links else "new",
+        )
+        for n in range(links + 1)
+    ]
+
+
+def test_a_chain_longer_than_the_lookup_limit_is_traced_through_the_orders_already_read(
+    venue, alpaca
+) -> None:
+    # Seventeen replaces, every order of the chain in the orders start-up reads: the working order is
+    # the first order's, "node-long". The limit is on lookups, and none is needed; counted in links, it
+    # named the order sixteen links back, one with an ID Alpaca made.
+    from canon_alpaca.execution import MAX_REPLACE_CHAIN
+
+    venue.trading.orders = long_chain(alpaca, MAX_REPLACE_CHAIN + 1)
+    node = build_node(trader(submit=False))
+
+    run(node)
+
+    (working,) = node.cache.orders_open()
+    assert working.client_order_id == ClientOrderId("node-long")
+
+
+def test_a_chain_that_needs_more_lookups_than_the_limit_is_not_traced_to_another_order(
+    venue, alpaca
+) -> None:
+    # The same chain when only its working order is among the orders read: tracing it takes seventeen
+    # lookups, one past the limit. It is an open order whose chain cannot be read, which fails the
+    # report by name, not an order reported under the ID sixteen links back.
+    from canon_alpaca.execution import MAX_REPLACE_CHAIN
+
+    chain = long_chain(alpaca, MAX_REPLACE_CHAIN + 1)
+    venue.trading.orders = chain
+    open_only = SimpleNamespace(open_only=True, instrument_id=None, start=None, end=None)
+    failures: list[str] = []
+
+    async def body(client) -> None:
+        with pytest.raises(ValueError) as failure:
+            await client._generate_order_status_reports(open_only)
+        failures.append(str(failure.value))
+
+    venue.trading.orders = []  # start-up reads nothing
+    strategy = trader(idle=True)
+
+    async def with_the_chain(client) -> None:
+        venue.trading.orders = chain
+        await body(client)
+
+    run_with_client(with_the_chain, strategy)
+
+    (failure,) = failures
+    assert f"Alpaca order {chain[-1]['id']} (AAPL) is open and tracing it failed" in failure
+
+
+def test_an_order_the_node_holds_is_its_own_however_often_it_was_replaced(venue) -> None:
+    # Seventeen modifies through the node, then a reconnect: the node's cache names the working order,
+    # so its fill, its report among the open orders and its report by client order ID are the node's
+    # order's with no walk at all. Walked, the chain ended sixteen links back, at an ID the node does not
+    # hold: the fill was dropped and the reports named another order or none.
+    from canon_alpaca.execution import MAX_REPLACE_CHAIN
+
+    replaces = MAX_REPLACE_CHAIN + 1
+    venue.trading.script = "accept"
+    strategy = modifier(prices=[f"{150 + n / 100:.2f}" for n in range(1, replaces + 1)])
+    reports: list = []
+    open_only = SimpleNamespace(open_only=True, instrument_id=None, start=None, end=None)
+
+    async def after_a_reconnect(client) -> None:
+        await reconnect(client, venue)
+        reports.extend(await client._generate_order_status_reports(open_only))
+        by_id = SimpleNamespace(venue_order_id=None, client_order_id=strategy.client_order_id)
+        reports.append(await client._generate_order_status_report(by_id))
+        venue.trading.update(
+            placed_order(venue, replaces)["id"], "fill", 2, status="filled", filled_qty="2"
+        )
+        await settled(client, venue)
+
+    run_modify(
+        venue,
+        strategy,
+        lambda: strategy.names().count("OrderUpdated") == replaces,
+        after_a_reconnect,
+    )
+
+    working = placed_order(venue, replaces)["id"]
+    assert [(r.client_order_id, r.venue_order_id.value) for r in reports if r is not None] == [
+        (strategy.client_order_id, working)
+    ] * 2
+    assert strategy.names()[-1] == "OrderFilled", strategy.names()
+
+
+def test_a_replace_alpaca_answers_and_then_rejects_on_the_stream_is_modify_rejected(venue) -> None:
+    # The PATCH is answered with a replacement and Alpaca then sends `order_replace_rejected` for the
+    # old order: only the stream says the modify failed. The modify is rejected once, the old order still
+    # works, and its fill is applied under its own ID. (The stand-in's "reject" script also refuses the
+    # PATCH, so a test on it passes with the stream's rejection ignored.)
+    venue.trading.script = "accept"
+    venue.trading.replace_script = "silent"
+    strategy = modifier()
+
+    async def rejected_on_the_stream(client) -> None:
+        old, new = placed_order(venue, 0), placed_order(venue, 1)
+        del venue.trading._placed[new["id"]]  # the replacement never worked
+        old.update(status="new", replaced_by=None)
+        venue.trading.update(old["id"], "order_replace_rejected")
+        await until_named(strategy, "OrderModifyRejected", timeout=5)
+        venue.trading.update(old["id"], "fill", 2, status="filled", filled_qty="2")
+        await until_named(strategy, "OrderFilled", timeout=5)
+        await settled(client, venue)
+
+    run_modify(
+        venue, strategy, lambda: bool(venue.trading.replace_requests), rejected_on_the_stream
+    )
+
+    assert strategy.names()[-3:] == ["OrderPendingUpdate", "OrderModifyRejected", "OrderFilled"]
+    assert (
+        strategy.last("OrderModifyRejected").reason == "Alpaca rejected the replace (trade update)"
+    )
+    assert strategy.last("OrderFilled").venue_order_id.value == placed_order(venue, 0)["id"]
+    assert "OrderUpdated" not in strategy.names()
+
+
+READINGS = ["chain", "own"]
+"""Both readings of a replacement's `qty` and `filled_qty` (`FilledReading`, UNVERIFIED, ADR 0042)."""
+
+
+def replacement_as_read(reading: str, filled: int) -> dict[str, str]:
+    """The replacement of a buy of 2 filled 1 before the replace, with `filled` shares of its own, as
+    Alpaca would show it under `reading`: carrying the order on, or an order for what is left."""
+    if reading == "chain":
+        return {"qty": "2", "filled_qty": str(1 + filled)}
+    return {"qty": "1", "filled_qty": str(filled)}
+
+
+@pytest.mark.parametrize("reading", READINGS)
+def test_a_partly_filled_order_replaced_and_filled_reconciles_whole_under_either_reading(
+    venue, alpaca, monkeypatch, reading
+) -> None:
+    # The seam: with Alpaca's data shaped as each reading says, start-up reconciles the node's order
+    # filled 2 of 2 on the replacement, both trade IDs on it, whichever reading the client is set to.
+    monkeypatch.setattr(canon_alpaca.execution, "FILLED_READING", FilledReading(reading))
+    shown = replacement_as_read(reading, 1)
+    replaced_after_one_fill(alpaca, venue, {"status": "filled", "filled_avg_price": "150", **shown})
+    new = venue.trading.orders[1]
+    venue.trading.activities.append(
+        alpaca.fill_activity(
+            new,
+            str(uuid.UUID(int=2)),
+            1,
+            "150",
+            datetime.now(UTC) - timedelta(minutes=4),
+            cum_qty=int(shown["filled_qty"]),
+            leaves_qty=0,
+        )
+    )
+    venue.trading.positions = [
+        {**alpaca.POSITION_AAPL, "qty": "2", "qty_available": "2", "avg_entry_price": "150"}
+    ]
+    node = build_node(trader(submit=False))
+
+    run(node)
+
+    (order,) = node.cache.orders()
+    assert (
+        order.venue_order_id.value,
+        order.status,
+        order.quantity.as_double(),
+        order.filled_qty.as_double(),
+    ) == (REPLACEMENT_ID, OrderStatus.FILLED, 2.0, 2.0)
+    trades = sorted(
+        uuid.UUID(e.trade_id.value).int for e in order.events() if type(e).__name__ == "OrderFilled"
+    )
+    assert trades == [1, 2]
+
+
+@pytest.mark.parametrize("reading", READINGS)
+def test_a_partly_filled_order_replaced_on_the_stream_keeps_its_quantity_under_either_reading(
+    venue, monkeypatch, reading
+) -> None:
+    # The same chain on the stream: one share fills, the order is replaced, the replacement fills the
+    # other. `OrderUpdated` keeps the order's quantity of 2 and the order ends filled with 2, under each
+    # reading with Alpaca's data shaped as it says.
+    monkeypatch.setattr(canon_alpaca.execution, "FILLED_READING", FilledReading(reading))
+    venue.trading.script = "accept"
+    venue.trading.replace_script = "silent"
+    strategy = modifier()
+    held: list = []
+
+    async def partly_filled_replaced_filled(client) -> None:
+        old, new = placed_order(venue, 0), placed_order(venue, 1)
+        old["status"] = "new"
+        venue.trading.update(
+            old["id"], "partial_fill", 1, status="partially_filled", filled_qty="1"
+        )
+        await until_named(strategy, "OrderFilled")
+        await until_idle(client, venue)
+        new.update(replacement_as_read(reading, 0))
+        client._records[strategy.client_order_id].answers.clear()  # read from Alpaca, as shaped
+        venue.trading.confirm_replace(old["id"])
+        await until_named(strategy, "OrderUpdated")
+        venue.trading.update(
+            new["id"],
+            "fill",
+            1,
+            status="filled",
+            filled_qty=replacement_as_read(reading, 1)["filled_qty"],
+        )
+        await settled(client, venue)
+        cached = client.cache.order(strategy.client_order_id)
+        held.append((cached.status, cached.quantity.as_double(), cached.filled_qty.as_double()))
+
+    run_modify(
+        venue, strategy, lambda: bool(venue.trading.replace_requests), partly_filled_replaced_filled
+    )
+
+    assert strategy.last("OrderUpdated").quantity == Quantity.from_int(2)
+    assert held == [(OrderStatus.FILLED, 2.0, 2.0)]
+
+
+@pytest.mark.parametrize("reconnected", [False, True], ids=["same-connect", "after-reconnect"])
+def test_a_fill_delivered_twice_is_applied_once(venue, reconnected) -> None:
+    # One trade ID delivered twice counted two shares on the client's own count: a buy of 2 ended on its
+    # first share and dropped the second. Applied once per trade ID, as NautilusTrader's order takes one
+    # fill per trade ID; after a reconnect the record is rebuilt from the node's cache, trade IDs with it.
+    venue.trading.script = "accept"
+    strategy = trader(order_type="limit")
+    strategy.stopped_for = "held open"
+
+    async def body(client) -> None:
+        await until_named(strategy, "OrderAccepted")
+        await until_idle(client, venue)
+        placed = placed_order(venue)
+        placed.update(status="partially_filled", filled_qty="1")
+        message = {
+            "event": "partial_fill",
+            "order": dict(placed),
+            "timestamp": datetime.now(UTC).isoformat(),
+            "price": venue.trading.fill_price,
+            "qty": "1",
+            "position_qty": "1",
+            "execution_id": str(uuid.UUID(int=7)),
+        }
+        venue.stream.send(message)
+        await until_named(strategy, "OrderFilled")
+        await settled(client, venue)
+        if reconnected:
+            await reconnect(client, venue)
+        venue.stream.send(dict(message))
+        await settled(client, venue)
+        venue.trading.update(placed["id"], "fill", 1, status="filled", filled_qty="2")
+        await settled(client, venue)
+
+    run_with_client(body, strategy)
+
+    filled = [e for e in strategy.events if type(e).__name__ == "OrderFilled"]
+    assert len({e.trade_id for e in filled}) == len(filled) == 2, strategy.names()
+    assert sum(e.last_qty.as_double() for e in filled) == 2
+
+
+def test_a_fill_the_engine_applied_from_a_report_is_not_counted_again_from_the_stream(
+    venue, alpaca
+) -> None:
+    # A fill report handed to the engine applies one share under its trade ID; the stream then delivers the
+    # same fill. The record's own count took it a second time and ended a buy of 2 on one share, dropping
+    # the real second fill. A trade ID the node's order holds is applied once, whoever applied it.
+    venue.trading.script = "accept"
+    strategy = trader(order_type="limit")
+    strategy.stopped_for = "held open"
+    held: list = []
+
+    async def body(client) -> None:
+        await until_named(strategy, "OrderAccepted")
+        await until_idle(client, venue)
+        placed = placed_order(venue)
+        execution_id = str(uuid.UUID(int=11))
+        activity = alpaca.fill_activity(
+            placed, execution_id, 1, "150", datetime.now(UTC), "partial_fill", leaves_qty=1
+        )
+        client._handle_report(fill_report(activity, client.clock.timestamp_ns()))
+        await until_named(strategy, "OrderFilled")
+        await settled(client, venue)
+        placed.update(status="partially_filled", filled_qty="1")
+        venue.stream.send(
+            {
+                "event": "partial_fill",
+                "order": dict(placed),
+                "timestamp": datetime.now(UTC).isoformat(),
+                "price": "150",
+                "qty": "1",
+                "position_qty": "1",
+                "execution_id": execution_id,
+            }
+        )
+        await settled(client, venue)
+        venue.trading.update(placed["id"], "fill", 1, status="filled", filled_qty="2")
+        await settled(client, venue)
+        cached = client.cache.order(strategy.client_order_id)
+        held.append((cached.status, cached.filled_qty.as_double()))
+
+    run_with_client(body, strategy)
+
+    assert held == [(OrderStatus.FILLED, 2.0)], strategy.names()
+
+
+# -- the code review of the record -------------------------------------------------------------------
+
+
+def test_a_rejected_takeover_alpaca_shows_unfilled_after_a_fill_is_reported_canceled_with_it(
+    venue, alpaca
+) -> None:
+    # The replacement took over a partly filled order and was rejected, and Alpaca's rejected order shows
+    # nothing filled. The order before it shows the fill: the report is canceled with it, not rejected
+    # with none, which NautilusTrader would leave open.
+    replaced_after_one_fill(alpaca, venue, {"status": "rejected", "filled_qty": "0"})
+    venue.trading.positions = [
+        {**alpaca.POSITION_AAPL, "qty": "1", "qty_available": "1", "avg_entry_price": "150"}
+    ]
+    node = build_node(trader(submit=False))
+
+    run(node)
+
+    orders = node.cache.orders()
+    assert [(o.client_order_id.value, o.status, o.filled_qty.as_double()) for o in orders] == [
+        ("my-order-1", OrderStatus.CANCELED, 1.0)
+    ]
+
+
+def test_two_modifies_sent_to_one_order_each_get_their_rejection(venue, generated) -> None:
+    # Two replaces sent to the order before either has an outcome, both replacements rejected while the
+    # order stays open: each modify gets its own rejection, where one entry per Alpaca order held both.
+    venue.trading.script = "accept"
+    venue.trading.replace_script = "silent"
+    strategy = modifier()
+    seen: list[str] = []
+
+    async def second_then_both_rejected(client) -> None:
+        old, first = placed_order(venue, 0), placed_order(venue, 1)
+        old.update(status="new", replaced_by=None)
+        cached = client.cache.order(strategy.client_order_id)
+        await client._modify_order(
+            SimpleNamespace(
+                client_order_id=strategy.client_order_id,
+                venue_order_id=cached.venue_order_id,
+                quantity=None,
+                price=Price.from_str("151.00"),
+                trigger_price=None,
+            )
+        )
+        second = placed_order(venue, 2)
+        old.update(status="new", replaced_by=None)
+        generated.clear()
+        for replacement in (first, second):
+            venue.trading.update(replacement["id"], "rejected", status="rejected")
+        await settled(client, venue)
+        seen.extend(generated)
+
+    run_modify(
+        venue, strategy, lambda: bool(venue.trading.replace_requests), second_then_both_rejected
+    )
+
+    assert seen == ["modify_rejected", "modify_rejected"], seen
+
+
+def test_a_cancel_refused_on_a_replacement_not_yet_adopted_is_a_cancel_rejection(
+    venue, monkeypatch
+) -> None:
+    # A cancel is answered 204 and Alpaca refuses it on the replacement's stream before its `replaced`
+    # for the order it replaces is applied: the node's pending cancel gets its refusal.
+    venue.trading.script = "accept"
+    venue.trading.replace_script = "silent"
+    strategy = modifier()
+
+    async def refused_on_the_replacement(client) -> None:
+        new = placed_order(venue, 1)
+        monkeypatch.setattr(venue.trading, "cancel_order_by_id", lambda order_id: None)
+        assert strategy.client_order_id is not None
+        strategy.cancel_order(strategy.client_order_id)
+        await settled(client, venue)
+        venue.trading.update(new["id"], "order_cancel_rejected")
+        await until_named(strategy, "OrderCancelRejected", timeout=5)
+
+    run_modify(
+        venue, strategy, lambda: bool(venue.trading.replace_requests), refused_on_the_replacement
+    )
+
+    assert "OrderCancelRejected" in strategy.names(), strategy.names()
+
+
+def test_an_ended_order_leaves_nothing_in_the_index(venue) -> None:
+    # The index holds what the client traced while an order lives; once it ends, the node's cache knows
+    # its Alpaca orders, so a long session does not keep one entry per order it ever placed.
+    venue.trading.script = "accept"
+    strategy = modifier()
+    left: list = []
+
+    async def fill(client) -> None:
+        new = placed_order(venue, 1)
+        venue.trading.update(new["id"], "fill", 2, status="filled", filled_qty="2")
+        await until_named(strategy, "OrderFilled")
+        await settled(client, venue)
+        left.extend(k for k, v in client._index.items() if v == strategy.client_order_id)
+
+    run_modify(venue, strategy, lambda: "OrderUpdated" in strategy.names(), fill)
+
+    assert left == []
+
+
+def test_under_the_own_reading_a_chain_with_an_unlisted_middle_fill_is_left_to_the_engine(
+    venue, alpaca, monkeypatch
+) -> None:
+    # Three orders, each counting its own fills: the first's and the last's are listed, the middle one's
+    # are not. The middle order is read on the way to the last, and its fills are missing: nothing of
+    # the chain is reported, rather than two fills taken for all of them.
+    monkeypatch.setattr(canon_alpaca.execution, "FILLED_READING", FilledReading.OWN)
+    first, second, third = CHAIN_IDS
+    at = datetime.now(UTC) - timedelta(minutes=10)
+    orders = [
+        alpaca.alpaca_order(
+            id=first,
+            client_order_id="my-order-7",
+            qty="3",
+            status="replaced",
+            replaced_by=second,
+            filled_qty="1",
+            filled_avg_price="174.6",
+        ),
+        alpaca.alpaca_order(
+            id=second,
+            client_order_id="alpaca-made-7a",
+            qty="2",
+            replaces=first,
+            status="replaced",
+            replaced_by=third,
+            filled_qty="1",
+            filled_avg_price="174.6",
+        ),
+        alpaca.alpaca_order(
+            id=third,
+            client_order_id="alpaca-made-7b",
+            qty="1",
+            replaces=second,
+            status="filled",
+            filled_qty="1",
+            filled_avg_price="174.6",
+        ),
+    ]
+    venue.trading.orders = orders
+    venue.trading.activities = [
+        alpaca.fill_activity(
+            orders[0],
+            str(uuid.UUID(int=1)),
+            1,
+            "174.6",
+            at,
+            "partial_fill",
+            cum_qty=1,
+            leaves_qty=2,
+        ),
+        alpaca.fill_activity(
+            orders[2],
+            str(uuid.UUID(int=3)),
+            1,
+            "174.6",
+            at + timedelta(minutes=2),
+            cum_qty=1,
+            leaves_qty=0,
+        ),
+    ]
+    reports: list = []
+
+    async def body(client) -> None:
+        reports.extend(await client._fill_reports(fills_command()))
+
+    run_with_client(body)
+
+    assert reports == []
