@@ -13,7 +13,7 @@ reviewer: `<case>/<reviewer>-1.md`.
 
   | Label | Runtime, model, effort |
   |---|---|
-  | `claude-opus-high` | Claude Code, `claude-opus-5-5`, effort high |
+  | `claude-opus-high` | Claude Code, `claude-opus-5-5`, effort high; auto memory not turned off, so likely on (UNVERIFIED; README, "Running a benchmark") |
   | `codex` | Codex CLI on its own defaults |
   | `muse` | Muse Code on its defaults |
   | `antigravity` | Antigravity CLI on its defaults |

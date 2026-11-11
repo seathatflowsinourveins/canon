@@ -58,7 +58,16 @@ reviewer per case, by default 1.
    0043 rule 3 sets up, and detach it at the case's commit (`git checkout --detach <commit>`; check that
    `git rev-parse HEAD` prints it and `git status` is clean). The task is `brief.md`'s text with
    `<commit>`, `<paths>` (joined by ", ") and `<report path>` filled in, and nothing else. The task never
-   names the case, its defects or another reviewer's report.
+   names the case, its defects or another reviewer's report. A Claude reviewer starts with auto memory
+   off, through `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` in its environment or
+   `--settings '{"autoMemoryEnabled": false}'`. Auto memory is on by default and one directory serves
+   every worktree of the repository, so otherwise what one session saved loads into the next review. A
+   `.claude/settings.local.json` in the workspace does not do it, since a worktree reads the main
+   checkout's. Whether Orca's launch can pass either is UNVERIFIED; if it cannot, the sheet says the
+   Claude reviewer ran with auto memory on. Turning it off stops the load, not a read: the memory files
+   and session transcripts on the machine stay readable, so that, like git history, rests on the brief.
+   Whether the other runtimes keep memory across sessions is not checked here; ADR 0045 turns off
+   DeepSeek Harness's.
 3. When it reports, check the workspace has no change and no new commit and that the report file exists,
    then remove the workspace. A report that is missing is recorded as missing, not re-run silently.
 4. Hand the report folder to a scoring task.

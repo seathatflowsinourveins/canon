@@ -42,7 +42,9 @@ score could come from the prompt rather than the reviewer; it is possible later 
 2. **Not shown to the reviewer**: the fix, any later commit, the case file. Its workspace is new and
    detached at the case's commit, and the brief forbids reading later history. Git still holds that
    history, so this rests on the brief; Anthropic reports a model that gained an unfair advantage by
-   reading git history left by earlier trials.
+   reading git history left by earlier trials. Claude Code's auto memory is another such carrier: it is
+   on by default and shared by every worktree of a repository. A Claude reviewer starts with it off,
+   and the README says how.
 3. **A reviewer** is a runtime, model and effort, given `evals/review/brief.md` word for word as its whole
    task, with only the commit, the paths and the report path filled in. It may run the offline tests.
 4. **Scoring.** A confirmed defect is **found** if one finding names its location and says what its
@@ -59,7 +61,7 @@ score could come from the prompt rather than the reviewer; it is possible later 
    single runs says it measures no variance between runs (Anthropic recommends several trials).
 7. **What the set can show.** For n defects, taken as independent, a found-rate p has a standard error
    of about √(p(1−p)/n). The first run scored 10 defects, in three cases, 8 of them in one: at p = 0.5 that is about ±31 points per reviewer at 95% and, unpaired, about ±44
-   on a difference; the 21 confirmed now (10 in `order-modify`, 9 in `trial-ledger-gate`) give about ±22 and ±31. Pairing narrows that only as far as the
+   on a difference; the 23 confirmed now (10 in `order-modify`, 10 in `trial-ledger-gate`) give about ±20 and ±29. Pairing narrows that only as far as the
    reviewers' results correlate; defects bunched in one case widen it (clustering tripled the standard
    error on one of the paper's sets, DROP). The paper's worked example needs about 1,000 questions for 3
    points, paired, at 80% power, on parameters it calls fictional. **A dozen cases rank nothing
@@ -135,5 +137,12 @@ Read 2026-11-10, by a research subagent that fetched each page and summarised it
   scorers' and the defects' sources stated as limits; all above.
 * 2026-11-10, after the first run: the case count, the modify defects' sources and the Confirmation now
   state the run (`evals/review/runs/2026-11-10-first/scores.md`) and `order-modify` made ready.
+* https://code.claude.com/docs/en/memory, read 2026-11-10 (first-hand): "Auto memory is on by default in
+  local sessions"; "all worktrees and subdirectories within the same repo share one auto memory
+  directory", whose first 200 lines or 25KB load into every session; off with `autoMemoryEnabled: false`
+  or `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`. https://code.claude.com/docs/en/settings, same day: `--settings`
+  sets a key for one session, and in a worktree `.claude/settings.local.json` is the main checkout's.
+  Nothing in this repository or the machine's user settings turned it off for the first run's Claude
+  reviewer, so it likely ran with auto memory on (UNVERIFIED: its environment was not recorded).
 * Not found first-hand: Cohen's kappa or McNemar's test used for review scoring, and Defects4J,
   BugsInPy or SWE-bench used as a review benchmark (UNVERIFIED).
