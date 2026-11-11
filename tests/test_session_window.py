@@ -1301,9 +1301,13 @@ class Timeouts(SessionMaCross):
         super().__init__(config)
         self.test_order = None
         self.canceled: list[str] = []
+        self.rearmed: list[str] = []
 
     def _order(self, client_order_id):
         return self.test_order
+
+    def _rearm(self, name: str) -> None:  # an unregistered strategy has no clock
+        self.rearmed.append(name)
 
     def cancel_order(self, client_order_id, client_id=None, params=None) -> None:
         self.canceled.append(str(client_order_id))
@@ -1313,7 +1317,12 @@ def timed_out(side: OrderSide, client_order_id: str = "O-1"):
     from nautilus_trader.model import ClientOrderId
 
     return SimpleNamespace(
-        is_closed=False, is_open=True, side=side, client_order_id=ClientOrderId(client_order_id)
+        is_closed=False,
+        is_open=True,
+        is_pending_cancel=False,
+        side=side,
+        client_order_id=ClientOrderId(client_order_id),
+        filled_qty=Quantity.from_int(0),
     )
 
 
@@ -1911,3 +1920,172 @@ def test_a_window_is_shortened_to_fit_the_lock_wait_and_says_so() -> None:
     seconds, why = w.window_seconds(30, session_left=600)
     assert seconds == 600 - w.END_MARGIN_SECS and "before the session does" in why
     assert w.window_seconds(30, session_left=4 * 3600) == (1800, "")
+
+
+# A third second reader's review of the window (2026-11-10): each shown here before its fix.
+
+
+class Builder:
+    """A stand-in for `LiveNode.builder`'s chain that records each setting and builds a stand-in node."""
+
+    def __init__(self, *args) -> None:
+        self.calls: list[tuple[str, tuple]] = []
+
+    def __getattr__(self, name: str):
+        def setting(*args, **kwargs):
+            self.calls.append((name, args))
+            return self
+
+        return setting
+
+    def build(self):
+        return SimpleNamespace(add_strategy=lambda strategy: None)
+
+
+def test_a_managed_stop_has_the_post_stop_delay_its_market_exit_needs(
+    monkeypatch, tmp_path
+) -> None:
+    """The node processes events after the trader's stop only for `delay_post_stop`, then disconnects
+    (`LiveNode::stop`, `process_runner_for`, at the pin); the managed stop's market exit runs in that
+    time, so at 5 s it was cut off after five attempts and the strategy never stopped."""
+    built: list[Builder] = []
+
+    def builder(*args, delay_post_stop_secs: int = 5) -> Builder:
+        built.append(Builder())
+        built[-1].calls.append(("with_delay_post_stop_secs", (delay_post_stop_secs,)))
+        return built[-1]
+
+    monkeypatch.setattr(session_window, "alpaca_paper_builder", builder)
+    at = datetime(2026, 11, 10, 21, 30, tzinfo=UTC)
+    _, s, _ = session_window.window_node(
+        WindowConfig(log_dir=tmp_path), wind_down_at=at, log_name="r"
+    )
+    assert s.manage_stop
+    delays = [args[0] for name, args in built[-1].calls if name == "with_delay_post_stop_secs"]
+    exit_secs = (
+        session_window.MARKET_EXIT_INTERVAL_MS * session_window.MARKET_EXIT_MAX_ATTEMPTS / 1000
+    )
+    assert delays and delays[-1] >= exit_secs + session_window.DELAY_POST_STOP_SECS
+    assert session_window.STOP_TIMEOUT_SECS >= (
+        delays[-1]
+        + session_window.TIMEOUT_DISCONNECTION_SECS
+        + session_window.TIMEOUT_SHUTDOWN_SECS
+        + session_window.REQUEST_SECS
+    )
+
+
+@pytest.mark.parametrize("where", ["auto", "window"])
+def test_a_network_error_leaves_a_failed_heartbeat(monkeypatch, tmp_path, where) -> None:
+    """`_main` caught `APIError` but not the HTTP layer's errors (an `OSError`): a connect timeout left
+    the heartbeat unwritten, or at "a regular window", while the run exited with a traceback."""
+
+    def unreachable(*args, **kwargs):
+        raise requests.ConnectTimeout("connect timed out")
+
+    if where == "auto":
+        monkeypatch.setattr(session_window, "paper_trading", lambda: Account())
+        monkeypatch.setattr(session_window, "session_now", unreachable)
+        argv = ["--session", "auto", "--log-dir", str(tmp_path)]
+    else:
+        monkeypatch.setattr(session_window, "run_window", unreachable)
+        argv = ["--log-dir", str(tmp_path)]
+    assert session_window.main(argv) == 1
+    heard = json.loads((tmp_path / "last-firing.json").read_text())
+    assert heard["outcome"].startswith("failed: ConnectTimeout")
+
+
+def rearming(order) -> Timeouts:
+    s = Timeouts(
+        SessionMaCrossConfig(
+            bar_type=BARS,
+            trade_size=Quantity.from_int(1),
+            fast_period=3,
+            slow_period=8,
+            extended_hours=True,
+            strategy_id=StrategyId("SessionMaCross-001"),
+            order_id_tag="001",
+        )
+    )
+    s.test_order = order
+    return s
+
+
+def test_a_limit_whose_cancel_did_not_land_is_canceled_again() -> None:
+    """The timeout canceled once and set no further alert: a cancel rejected or unanswered left the order
+    working for good, every later bar returned at the guard, and the stop skipped the close."""
+    s = rearming(timed_out(OrderSide.SELL))
+    s.signal_orders.add("O-1")
+    event = cast(TimeEvent, SimpleNamespace(name="limit-timeout-O-1"))
+    s._on_limit_timeout(event)
+    assert s.canceled == ["O-1"] and s.rearmed == ["limit-timeout-O-1"]
+    s._on_limit_timeout(event)  # open again: the cancel was rejected
+    assert s.canceled == ["O-1", "O-1"] and len(s.rearmed) == 2
+    assert len(s.dropped) == 1 and s.dropped_side == OrderSide.SELL
+    s.test_order = SimpleNamespace(is_closed=True, filled_qty=Quantity.from_int(0))
+    s._on_limit_timeout(event)
+    assert len(s.rearmed) == 2 and s.signal_orders == set()
+
+
+def test_a_partly_filled_close_that_times_out_does_not_hold_back_the_rest() -> None:
+    """A close that filled in part and timed out held the dropped side, so the shares left were not
+    closed for the rest of the cross; a partly filled limit is no dropped signal."""
+    order = timed_out(OrderSide.SELL)
+    order.filled_qty = Quantity.from_int(1)
+    s = rearming(order)
+    s.signal_orders.add("O-1")
+    s._on_limit_timeout(cast(TimeEvent, SimpleNamespace(name="limit-timeout-O-1")))
+    assert s.canceled == ["O-1"] and s.dropped_side is None
+
+
+def test_a_close_that_filled_in_part_while_its_cancel_was_on_its_way_drops_nothing() -> None:
+    order = timed_out(OrderSide.SELL)
+    s = rearming(order)
+    s.signal_orders.add("O-1")
+    event = cast(TimeEvent, SimpleNamespace(name="limit-timeout-O-1"))
+    s._on_limit_timeout(event)
+    assert s.dropped_side == OrderSide.SELL
+    order.is_open, order.is_closed, order.filled_qty = False, True, Quantity.from_int(1)
+    s._on_limit_timeout(event)
+    assert s.dropped_side is None
+
+
+def test_a_limit_pending_cancel_is_watched_not_canceled_again() -> None:
+    """A cancel sent again for an order pending cancel is refused at the pin and sends nothing; the
+    strategy looks again instead."""
+    order = timed_out(OrderSide.SELL)
+    s = rearming(order)
+    event = cast(TimeEvent, SimpleNamespace(name="limit-timeout-O-1"))
+    s._on_limit_timeout(event)
+    order.is_pending_cancel = True
+    s._on_limit_timeout(event)
+    assert s.canceled == ["O-1"] and len(s.rearmed) == 2
+
+
+def test_a_worker_call_left_after_a_clean_stop_is_bounded(monkeypatch) -> None:
+    """`Runner.close` waits up to 300 s for the executor's calls; a call still running after a clean
+    stop held the account check that long."""
+    import threading
+    import time
+
+    release = threading.Event()
+
+    class Clean:
+        async def run_async(self) -> None:
+            import asyncio
+
+            asyncio.ensure_future(asyncio.to_thread(release.wait, 30))
+            await asyncio.sleep(0.05)
+
+        def handle(self):
+            return SimpleNamespace(stop=lambda: None)
+
+    monkeypatch.setattr(session_window, "_ABANDONED", [])
+    monkeypatch.setattr(session_window, "ADAPTER_CALL_SECS", 0.2)
+    started = time.monotonic()
+    try:
+        with pytest.raises(session_window.StopTimedOut, match="still ran"):
+            session_window._run_node(cast(Any, Clean()), datetime.now(UTC))
+        assert time.monotonic() - started < 5
+        assert len(session_window._ABANDONED) == 1
+    finally:
+        release.set()
