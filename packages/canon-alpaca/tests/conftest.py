@@ -39,11 +39,14 @@ endpoint documents, the stream stand-in checks handlers and unsubscribes the way
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import gc
 import inspect
 import json
 import logging
+import os
 import queue
+import signal
 import threading
 import time as time_module
 import traceback
@@ -51,10 +54,12 @@ import uuid
 from collections.abc import Awaitable
 from collections.abc import Callable
 from collections.abc import Iterable
+from collections.abc import Iterator
 from datetime import UTC
 from datetime import datetime
 from datetime import time
 from datetime import timedelta
+from time import monotonic
 from types import SimpleNamespace
 from typing import Any
 from typing import cast
@@ -64,6 +69,7 @@ import pytest
 import requests
 from alpaca.common.exceptions import APIError
 from alpaca.data.live.stock import StockDataStream
+from alpaca.data.live.websocket import DataStream
 from alpaca.data.models import BarSet
 from alpaca.data.models import Quote
 from alpaca.data.models import QuoteSet
@@ -79,6 +85,8 @@ from alpaca.trading.models import TradeAccount
 from alpaca.trading.models import TradeUpdate
 from alpaca.trading.requests import GetOrdersRequest
 from alpaca.trading.requests import OrderRequest
+from canon_alpaca.constants import ENV_API_KEY
+from canon_alpaca.constants import ENV_SECRET_KEY
 from canon_alpaca.providers import timeout_adapter
 
 type Handler = Callable[[object], Awaitable[None]]
@@ -1235,3 +1243,175 @@ def alpaca() -> SimpleNamespace:
         memory_stream=memory_stream,
         wire_quote=wire_quote,
     )
+
+
+# --- The login's market-data stream lock (ADR 0069). The same block is in tests/conftest.py and
+# packages/canon-alpaca/tests/conftest.py, and tests/test_session_window.py keeps the two equal. ---
+#
+# Alpaca allows a user "in many subscriptions (or without one)" one connection to a market-data stream
+# endpoint ("Streaming Market Data", https://docs.alpaca.markets/us/docs/streaming-market-data.md), and paper
+# accounts A and B belong to one login (that the limit spans a second paper account is UNVERIFIED), so a
+# paper test that opens a stream and a session window on account B take one lock,
+# `canon-alpaca-stream.lock`, whose path `mise run paper:test` exports. A test marked `alpaca_stream` holds it
+# from its setup until its teardown has seen every stream it started end; a paper test not marked that starts
+# an alpaca-py market-data stream is stopped before the stream connects and fails. The lock is flock(2), the
+# call lockf(1) makes ("BSD-style locking is used, as described in flock(2)", lockf(1)), so this lock and the
+# window's lockf exclude each other (Python's `fcntl.flock`). The wait blocks in flock(2), as lockf(1)'s does,
+# under an interval timer, rather than polling, so a test and a window wait in the same way. Offline, with no
+# paper pair, it does nothing.
+STREAM_LOCK_ENV = "CANON_ALPACA_STREAM_LOCK"
+DEADLINE_ENV = "CANON_PAPER_TEST_DEADLINE"
+"""The epoch second at which `mise run paper:test` kills the run (its `deadline`), which it exports."""
+STREAM_LOCK_WAIT_SECS = 3900
+"""As long as `paper:test` waits for account A's lock (`lockwait` in mise.toml): it outlasts one window that
+runs as it should, from taking the stream lock to its bounded end (`session_window.PAPER_LOCK_WAIT_SECS`)."""
+TEST_ROOM_SECS = 900
+"""Left before the run's deadline for a streaming test once it has the lock: three times a whole paper run
+(about five minutes, observed), so the deadline does not kill a test before its `finally` cleans up."""
+STREAM_END_SECS = 60
+"""How long the teardown waits for a stream the test started to end before the lock is let go: six times
+the adapter's own wait for its stream thread (`canon_alpaca.data.STREAM_JOIN_TIMEOUT_SECS`)."""
+STREAM_MARKER = "alpaca_stream"
+KEPT_LOCKS: list[int] = []
+"""Descriptors held past their test because a stream outlived it; the lock goes when the run ends."""
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers",
+        f"{STREAM_MARKER}: the test opens an Alpaca market-data stream, so it holds the login's stream lock "
+        "(ADR 0069)",
+    )
+
+
+def take_stream_lock(path: str, wait_secs: float) -> int | None:
+    """A descriptor holding the exclusive flock(2) lock on `path`, taken within `wait_secs`, or None, the
+    descriptor closed, when the lock stayed held that long. Closing the descriptor releases the lock. The
+    wait blocks in flock(2) under `ITIMER_REAL`, so it runs on the main thread only."""
+    if threading.current_thread() is not threading.main_thread():
+        raise RuntimeError(
+            "the stream lock is taken on the main thread, where SIGALRM is delivered"
+        )
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    if wait_secs <= 0:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            return None
+        return fd
+
+    def expired(signum: int, frame: object) -> None:
+        raise TimeoutError
+
+    before = signal.signal(signal.SIGALRM, expired)
+    try:
+        signal.setitimer(signal.ITIMER_REAL, wait_secs)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return fd
+    except (
+        TimeoutError
+    ):  # also when the timer fires just after flock returns: the lock goes with fd
+        os.close(fd)
+        return None
+    except BaseException:
+        os.close(fd)
+        raise
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, before)
+
+
+def refuse_streams(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Stop every alpaca-py market-data stream before it connects (`DataStream.run`, which alpaca-py 0.45.0's
+    stock, crypto, option and news streams inherit), and return the list each refused stream is named in."""
+    started: list[str] = []
+
+    def refused(stream: DataStream) -> None:
+        started.append(type(stream).__name__)
+        raise RuntimeError(
+            f"this test is not marked {STREAM_MARKER}, so it holds no stream lock and opens no Alpaca "
+            "market-data stream (ADR 0069)"
+        )
+
+    monkeypatch.setattr(DataStream, "run", refused)
+    return started
+
+
+def track_streams(monkeypatch: pytest.MonkeyPatch) -> list[threading.Event]:
+    """Run alpaca-py's market-data streams as before, and return one event per stream started, set once its
+    `run()` has returned, so the lock is let go only after the test's streams have ended."""
+    ended: list[threading.Event] = []
+    run = DataStream.run
+
+    def tracked(stream: DataStream) -> None:
+        done = threading.Event()
+        ended.append(done)
+        try:
+            run(stream)
+        finally:
+            done.set()
+
+    monkeypatch.setattr(DataStream, "run", tracked)
+    return ended
+
+
+def stream_wait_secs(now: float) -> float:
+    """How long a streaming test may wait for the lock: `STREAM_LOCK_WAIT_SECS`, less whatever would leave it
+    under `TEST_ROOM_SECS` before the run's deadline; `pytest.fail` if the deadline is not named."""
+    deadline = os.environ.get(DEADLINE_ENV, "")
+    if not deadline.isdigit():
+        pytest.fail(
+            f"{DEADLINE_ENV} is not set, so the test cannot tell how long it may wait; run paper tests with "
+            "`mise run paper:test`, which names it. Nothing was placed."
+        )
+    return min(STREAM_LOCK_WAIT_SECS, int(deadline) - now - TEST_ROOM_SECS)
+
+
+@pytest.fixture(autouse=True)
+def alpaca_stream_lock(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[None]:
+    """Hold the stream lock for a test marked `alpaca_stream`; refuse a stream to any other paper test."""
+    if not (os.environ.get(ENV_API_KEY) and os.environ.get(ENV_SECRET_KEY)):
+        yield  # offline: nothing reaches Alpaca
+        return
+    if request.node.get_closest_marker(STREAM_MARKER) is None:
+        started = refuse_streams(monkeypatch)
+        yield
+        if started:
+            pytest.fail(
+                f"started an Alpaca market-data stream ({', '.join(started)}) without the "
+                f"{STREAM_MARKER} marker, so without the stream lock; mark the test (ADR 0069)"
+            )
+        return
+    path = os.environ.get(STREAM_LOCK_ENV)
+    if not path:
+        pytest.fail(
+            f"{STREAM_LOCK_ENV} is not set, so there is no stream lock to take; run paper tests with "
+            "`mise run paper:test`, which names it. Nothing was placed."
+        )
+    wait = stream_wait_secs(datetime.now(UTC).timestamp())
+    fd = take_stream_lock(path, wait) if wait >= 0 else None
+    if fd is None:
+        pytest.fail(
+            f"the market-data stream lock stayed held for {max(wait, 0):.0f} s (a session window or another "
+            f"paper test streams), or {TEST_ROOM_SECS} s were no longer left before the run's deadline; "
+            "nothing was placed"
+        )
+    ended = track_streams(monkeypatch)
+    try:
+        yield
+    finally:
+        give_up = monotonic() + STREAM_END_SECS
+        if all(e.wait(max(0.0, give_up - monotonic())) for e in ended):
+            os.close(fd)  # the lock goes with the descriptor (flock(2))
+        else:
+            KEPT_LOCKS.append(fd)
+            pytest.fail(
+                f"a market-data stream this test started was still running {STREAM_END_SECS} s after it "
+                "ended; the stream lock is kept until this paper run ends (ADR 0069)"
+            )
+
+
+# --- End of the stream lock block. ---

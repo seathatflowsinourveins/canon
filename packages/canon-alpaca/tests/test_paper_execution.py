@@ -88,13 +88,17 @@ from nautilus_trader.model import TriggerType
 from nautilus_trader.testkit import ExecTesterConfig
 from nautilus_trader.trading import Strategy
 
-pytestmark = pytest.mark.skipif(
-    not (os.environ.get(ENV_API_KEY) and os.environ.get(ENV_SECRET_KEY)),
-    reason=(
-        f"Alpaca paper credentials not in the environment: set {ENV_API_KEY} and {ENV_SECRET_KEY} "
-        "to run this integration test"
+pytestmark = [
+    pytest.mark.skipif(
+        not (os.environ.get(ENV_API_KEY) and os.environ.get(ENV_SECRET_KEY)),
+        reason=(
+            f"Alpaca paper credentials not in the environment: set {ENV_API_KEY} and {ENV_SECRET_KEY} "
+            "to run this integration test"
+        ),
     ),
-)
+    # each test opens a market-data stream, so it holds the login's stream lock (conftest.py, ADR 0069)
+    pytest.mark.alpaca_stream,
+]
 
 AAPL = InstrumentId.from_str("AAPL.ALPACA")
 NEW_YORK = ZoneInfo("America/New_York")
