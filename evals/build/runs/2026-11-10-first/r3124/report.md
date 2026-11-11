@@ -1,0 +1,44 @@
+# Report
+
+## What was wrong
+
+1. **Ledger creation race (`src/canon_trading/ledger.py`).** `create_ledger_study` opened `RDBStorage(..., mode="rwc")` with no inter-process serialisation. Optuna/SQLAlchemy table creation checks whether a table exists and then creates it, so two processes creating one new file at the same moment could both pass the check and one crashed creating a table that already existed.
+2. **Recorded range timezone (`src/canon_trading/ranking.py`).** `rank` used `trial.datetime_start.isoformat()` directly. In the installed Optuna 5.0.0, `optuna/storages/_rdb/models.py` stores a trial start as naive UTC and its getter converts it to naive local time (`.astimezone().replace(tzinfo=None)`), so the report's string depended on the reader's `TZ` and carried no offset.
+3. **Non-finite return accepted directly (`src/canon_trading/returns_matrix.py`).** `daily_series` rejected non-finite returns, but `returns_matrix` itself went straight to skfolio `Portfolio`/`Population`. Contrary to the module header's old claim, skfolio does not raise on a NaN there — it becomes `0.0` — so a direct caller could get a matrix holding a return nobody earned.
+4. **Told value not from the gate's series (`src/canon_trading/ledger.py`).** `_session_sharpe` computed the Sharpe ratio from `[returns[day] for day in days if day in returns]`, silently dropping returns that fell on no session day and ignoring every other shape rule of `daily_series` (gaps, off-midnight keys, non-finite or moved-while-closed returns). A run whose series the gate would refuse could therefore be told a finite value and `COMPLETE`.
+5. **Empty strategy run (`src/canon_trading/backtest.py`).** Only `backtest_run_config` refused an empty strategy list. `run_backtest_config(config, [])`, callable directly with a pre-built config, built a node, replayed the bars with nothing trading them, and returned an empty result instead of refusing.
+6. **Ledger ignore rule (`.gitignore`).** `ledger/` matches a directory named `ledger` at any depth (gitignore semantics: a pattern with no slash other than a trailing one matches at every level), so `src/canon_trading/ledger/...` and any other nested `ledger/` were ignored, not only the root trial ledger.
+
+## What I changed, and why that way
+
+- [`.gitignore`](.gitignore): `ledger/` → `/ledger/`. Anchoring with a leading slash is git's own documented way to match only at the root; the root `ledger/trials.db` stays ignored and nested `ledger/` folders no longer are.
+- [`src/canon_trading/ledger.py`](src/canon_trading/ledger.py): added `_creation_lock`, an exclusive `fcntl.flock` on the sibling `<file>.lock`, and wrapped only the table-creating/storage-opening and study-creating part of `create_ledger_study` in it (the storage is kept open via `ExitStack` and yielded after the lock is released, so users of the study are not serialised). `flock` is released on close, so a killed creator leaves no stale lock. This removes the check-then-create race at its source rather than catching the resulting "table already exists" error.
+- [`src/canon_trading/ledger.py`](src/canon_trading/ledger.py): `_session_sharpe` now builds its values from `canon_trading.returns_matrix.daily_series` (imported inside the function because `returns_matrix` imports `DAY_NS` from `ledger`, so a top-level import would be circular) and returns NaN when `daily_series` raises `ReturnsRejected`. The existing caller then tells the trial `FAIL` with no value while keeping outcome `traded`. The told value now literally comes from the series as the gate accepts it, in the gate's order, instead of a parallel re-derivation that could drift from it.
+- [`src/canon_trading/returns_matrix.py`](src/canon_trading/returns_matrix.py): `returns_matrix` checks every value of every series for finiteness before constructing any `Portfolio`, collecting each offending series (in input order) into `ReturnsRejected.names` with a line `"<name>: a return that is not finite on <date>: <value>"`. Non-numeric/bool values count as not finite. The header's false claim that skfolio raises on such input was corrected.
+- [`src/canon_trading/ranking.py`](src/canon_trading/ranking.py): the recorded range is now `trial.datetime_start.astimezone(UTC)`. Python's `datetime.astimezone` reads a naive datetime as local time, which exactly inverts Optuna RDB storage's UTC→naive-local conversion, recovering the stored instant with a `+00:00` offset in any zone; an already-aware value is converted correctly too. A comment at the site names the Optuna source file.
+- [`src/canon_trading/backtest.py`](src/canon_trading/backtest.py): `run_backtest_config` raises `ValueError("run_backtest_config needs at least one strategy")` before building the node, mirroring the existing refusal in `backtest_run_config` at the other public entry point, so neither path can run an empty replay.
+
+Headers/docstrings that the fixes made untrue were corrected in the same files (the skfolio claim in `returns_matrix`, the told-value description and `record_trial`'s outcome description in `ledger`). No dependency was added: `fcntl`, `datetime.UTC`, `math`, `ExitStack` are standard library or already imported. No test file was edited; the six named tests already in the checkout are the maintained regression tests for these defects, so I added none.
+
+## Which upstream API or contract the change follows
+
+- Optuna 5.0.0 (pinned, read this session in the installed package): `RDBStorage` table creation via SQLAlchemy `create_all` in `optuna/storages/_rdb/storage.py`, and trial datetimes stored as naive UTC and returned as naive local time in `optuna/storages/_rdb/models.py` — the ranking fix is the documented inverse of that getter.
+- Python standard library: `fcntl.flock` (POSIX advisory locking, released on close) for the creation lock; `datetime.astimezone`'s documented "naive is local time" rule for the UTC conversion.
+- gitignore format (git documentation): a pattern beginning with `/` matches only relative to the directory of the `.gitignore` file, i.e. the repository root here.
+- ADR 0010 step 2 / ADR 0031 / ADR 0041 via the repo's own `daily_series` contract: the ledger's told value is computed from exactly the series that contract accepts, and ADR 0031's "every return must be finite" is now enforced in `returns_matrix` itself since skfolio's `Portfolio` does not enforce it.
+
+## What I ran, with its result
+
+- The six named tests: `mise exec -- uv run --locked pytest tests/test_backtest.py::test_a_run_config_run_without_a_strategy_is_refused tests/test_ledger.py::test_the_ledger_folder_is_ignored_only_at_the_root tests/test_ledger.py::test_the_value_told_is_none_for_a_series_the_gate_rejects tests/test_ledger.py::test_two_processes_creating_one_new_ledger_both_succeed tests/test_ranking.py::test_the_recorded_range_is_utc_whatever_the_zone tests/test_returns_matrix.py::test_a_return_that_is_not_finite_is_refused_when_called_directly -q` — **6 passed**. (An earlier `-x` run before any change confirmed the first of them fails on the untouched code.)
+- Full suite after the final edit: `mise exec -- uv run --locked pytest -q` — **452 passed, 21 skipped** (skips are the pre-existing paper/network-gated tests; no paper test was run and no credential was read).
+- `mise exec -- uv run --locked ruff check .` — all checks passed.
+- `mise exec -- uv run --locked ruff format --check .` — 106 files already formatted.
+- `mise exec -- uv run --locked ty check` — all checks passed.
+- `scripts/ci` was not run: the task states this copy leaves out files it expects, so its result here would not be meaningful; the graded gates above were run instead.
+
+## Anything I am unsure of
+
+- `fcntl` is POSIX-only. This repository targets the owner's macOS machine (keychain, `mise`, macOS notifications in `AGENTS.md`), so that holds here; the lock would not import on Windows. That is stated in the code header as a POSIX advisory lock.
+- The creation lock leaves a `trials.db.lock` sibling file behind after first creation. Inside the real repo that is under `/ledger/` and ignored; for a ledger path elsewhere it is a small extra file next to the database. It is never removed deliberately — removing it while another process holds it open would split the lock.
+- The timezone conversion relies on the process timezone (`TZ`/`tzset`) matching the zone Optuna's getter used when it produced the naive local value, which is true for values read from the store in the same process — the only path `rank` has. Around a DST fold an ambiguous local wall time could in principle be off by the fold interval; the stored data does not carry the fold, so no reader could do better.
+- `_session_sharpe` with fewer than two accepted session values returns NaN (told `FAIL`, still `traded`) as before; `daily_series` accepting a single day is unchanged.

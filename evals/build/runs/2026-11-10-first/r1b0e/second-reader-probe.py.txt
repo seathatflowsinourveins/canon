@@ -1,0 +1,104 @@
+"""Second reader's scratch probe (not part of the change)."""
+
+from __future__ import annotations
+
+import asyncio
+from types import SimpleNamespace
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
+from nautilus_trader.model import Price  # noqa: E402
+from test_execution_client import modifier
+from test_execution_client import run_modify  # noqa: E402
+from test_execution_client import venue  # noqa: E402,F401
+
+
+def _cmd(strategy, client, price):
+    cached = client.cache.order(strategy.client_order_id)
+    return SimpleNamespace(
+        client_order_id=strategy.client_order_id,
+        venue_order_id=cached.venue_order_id,
+        quantity=None,
+        price=Price.from_str(price),
+        trigger_price=None,
+    )
+
+
+def test_refused_twice_after_an_unknown_modify(venue, alpaca) -> None:
+    # n0 is answered HTTP 500 (outcome unknown, nothing changed at Alpaca); n1 is refused on the
+    # stream and on the HTTP answer. One replace refused twice over.
+    venue.trading.script = "accept"
+    strategy = modifier(prices=[])
+
+    async def two(client) -> None:
+        venue.trading.replace_error = alpaca.api_error(500, 50010000, "internal error")
+        await client._modify_order(_cmd(strategy, client, "150.10"))
+        venue.trading.replace_error = None
+        venue.trading.replace_script = "reject"
+        await client._modify_order(_cmd(strategy, client, "150.20"))
+        await asyncio.sleep(0.5)
+
+    run_modify(venue, strategy, lambda: "OrderAccepted" in strategy.names(), two)
+
+    print("EVENTS", strategy.names())
+    assert strategy.names().count("OrderModifyRejected") == 1, strategy.names()
+
+
+def test_retry_after_an_unknown_modify(venue, alpaca) -> None:
+    # n0 is answered HTTP 500 (outcome unknown, nothing changed at Alpaca). n1 reaches Alpaca, which
+    # replaces the order and sends `replaced`; alpaca-py's repeat of n1 is refused "order already
+    # replaced". n1 succeeded: it must not be rejected.
+    venue.trading.script = "accept"
+    strategy = modifier(prices=[])
+
+    async def two(client) -> None:
+        venue.trading.replace_error = alpaca.api_error(500, 50010000, "internal error")
+        await client._modify_order(_cmd(strategy, client, "150.10"))
+        venue.trading.replace_error = alpaca.api_error(422, 42210000, "order already replaced")
+        venue.trading.took_before_error = True
+        await client._modify_order(_cmd(strategy, client, "150.20"))
+        await asyncio.sleep(0.5)
+
+    run_modify(venue, strategy, lambda: "OrderAccepted" in strategy.names(), two)
+
+    print("EVENTS", strategy.names())
+    assert "OrderUpdated" in strategy.names()
+    assert "OrderModifyRejected" not in strategy.names(), strategy.names()
+
+
+def test_retry_alone(venue, alpaca) -> None:
+    venue.trading.script = "accept"
+    strategy = modifier(prices=[])
+
+    async def one(client) -> None:
+        venue.trading.replace_error = alpaca.api_error(422, 42210000, "order already replaced")
+        venue.trading.took_before_error = True
+        await client._modify_order(_cmd(strategy, client, "150.20"))
+        await asyncio.sleep(0.5)
+
+    run_modify(venue, strategy, lambda: "OrderAccepted" in strategy.names(), one)
+
+    print("EVENTS", strategy.names())
+    assert "OrderModifyRejected" not in strategy.names(), strategy.names()
+
+
+def test_answer_after_replaced_with_an_unknown_modify(venue, alpaca) -> None:
+    venue.trading.script = "accept"
+    strategy = modifier(prices=[])
+    left: list = []
+
+    async def two(client) -> None:
+        venue.trading.replace_error = alpaca.api_error(500, 50010000, "internal error")
+        await client._modify_order(_cmd(strategy, client, "150.10"))
+        venue.trading.replace_error = None
+        venue.trading.replace_delay = 0.3
+        await client._modify_order(_cmd(strategy, client, "150.20"))
+        await asyncio.sleep(0.5)
+        left.extend(client._answers)
+
+    run_modify(venue, strategy, lambda: "OrderAccepted" in strategy.names(), two)
+
+    print("EVENTS", strategy.names(), "ANSWERS", left)
+    assert left == []
