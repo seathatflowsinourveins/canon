@@ -116,7 +116,13 @@ reader's finding; the strategy's own test does look across).
   the trigger to 0.8340, which a bid of 0.8507 gives (the quote is not in the log), and released
   within the same millisecond at a bid of 0.8258; the limit's acceptance came back in 25 ms and it
   filled in two parts at 0.8258 by 14:26:10.40, 374.91 dollars. Result: 2.72 lost, 0.72%, 8 seconds
-  held. The window's one entry was used; its end and request counts are added once it has ended.
+  held. The window's one entry was used. The machine then slept from 14:40 to 15:49, and the window
+  waits for its end on the event loop's monotonic clock (`session_window._run_until`), which a sleep
+  stops, so it ran past its planned end of 14:56. It was ended by an interrupt at 15:53:38, seven
+  minutes before the close: flat, nothing for its account check to cancel or close, 228 trading-API
+  requests, at most 14 in 60 seconds, no 429. Its record reads `failed: KeyboardInterrupt`, so it
+  does not count as a window that ended `ok`; the wait is every window strategy's, and is not fixed
+  here. Its record is `window-20261111T191346Z.json`.
 
 ## Evidence
 
