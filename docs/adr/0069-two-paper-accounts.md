@@ -89,6 +89,24 @@ names, the adapter and `canon_alpaca` stay as they are. B's items are labelled `
    200 is "per account (ie each paper and live account is separate)"
    (https://forum.alpaca.markets/t/what-constitutes-an-api-call/16502, 2025-03-24); that is a forum
    statement, not documentation, so the per-account question stays UNVERIFIED.
+   What the observations cover, and what they do not (2026-11-11). Alpaca's page: "The number of
+   connections to a single endpoint from a user is limited based on the user's subscription", and a
+   connection past it gets `[{"T":"error","code":406,"msg":"connection limit exceeded"}]`, "You
+   already have the number of sessions allowed by your subscription"
+   (https://docs.alpaca.markets/us/docs/streaming-market-data.md). Measured: two pairs at once on
+   `sip` (1), and two connections on one pair on `sip` (2) and on `iex` beside a `sip` recorder (3).
+   Read from the logs, with no 406 and no "connection limit" in any of them: from 17:45:50 to 18:10:28
+   and 18:20:49 to 18:21:06 UTC, account A's window logs (`window-20261111T174550Z.log`,
+   `window-20261111T182049Z.log`, `sip`); from 17:13:01 UTC, account B's window log
+   (`window-20261111T171301Z.log`, `iex`), its last line at 18:44:01 UTC. So a `sip` connection on A's
+   pair and an `iex` connection on B's pair ran at once. The recorder on A's pair writes no log in
+   either folder, so a third connection in that span is not confirmed. Not measured, so UNVERIFIED:
+   a connection on each pair to the `iex` endpoint at once; the same on the `boats` (overnight)
+   endpoint; and three connections across the login on one endpoint (A's lock holder, A's recorder and
+   B's window). The lead decided on 2026-11-11 that the split holds for every feed until a run shows
+   otherwise, and that the runs are the measurement: the first overnight pair measures `boats`. A 406 on
+   any combination fails that window by name, with no retry and no change of feed. A login-wide lock for
+   that endpoint is then restored as its own change.
 4. **What this change builds:** storing, checking and removing B's pair, and an optional
    `paper key pair (windows)` row in `scripts/bootstrap --check` that shows present or absent and never a
    value. **What it does not build yet:** no task puts account B's pair in an environment; the only read
@@ -202,8 +220,10 @@ held, with or without a window. Against the tasks as they were, 11 and 2 of thes
 the change, a window or a `paper:data` run started before it holds the old `canon-alpaca-stream.lock`
 until it ends, and the maintenance round does not see it; nothing built after the change takes or waits
 for that file (`scripts/test-lanes`, run), so a test that streams
-on A no longer waits for that window. Whether A's pair and B's pair share one count of connections, left
-open below, is answered for `sip` by observation (1) in clause 3. The window's longest run,
+on A no longer waits for that window. Whether A's pair and B's pair share one count of connections is
+answered for two `sip` connections by observation (1) in clause 3, and for a `sip` and an `iex`
+connection by the logs read there. The `iex` and `boats` endpoints, each with both pairs, and three
+connections across the login stay UNVERIFIED (clause 3). The window's longest run,
 `session_window.LONGEST_WINDOW_SECS`, is still sized for a streaming test waiting behind a window for
 one shared lock; it is left as it was. A streaming test's 3,900 s wait for A's stream lock can run out
 behind a `paper:data` stream of 60 minutes run to its deadline; it is not changed here.
@@ -218,8 +238,9 @@ behind a `paper:data` stream of 60 minutes run to its deadline; it is not change
   The first was still open after the second authenticated. Nothing was subscribed or placed, and the run
   exited 0 (run). So on this login one pair held two authenticated connections to one endpoint for about
   2 s, with nothing subscribed. Whether a second connection that subscribes is refused, as the page's "only
-  1 active stream connection" would have it, is UNVERIFIED. The stream lock is kept as decided. Whether A's pair and B's pair share one count of connections is still UNVERIFIED: a probe needs
-  B's pair, and only `paper:session`, which runs the window and nothing else, puts B's pair in a process.
+  1 active stream connection" would have it, is UNVERIFIED. The stream lock is kept as decided. Whether A's pair and B's pair share one count of connections was
+  UNVERIFIED when this probe ran. Later that day it was answered for `sip` and for `sip` beside `iex`, and
+  it is still open for the cases clause 3 lists.
 * The request limit (clause 3) stays UNVERIFIED for paper. Alpaca's paper-trading skill says every
   response carries `X-RateLimit-*` headers (ADR 0044). alpaca-py 0.45.0's `RESTClient._one_request`
   returns only the parsed body, so no documented alpaca-py path gives the headers. Settling it needs a
