@@ -30,6 +30,7 @@ import requests
 from canon_alpaca.constants import ENV_API_KEY
 from canon_alpaca.constants import ENV_SECRET_KEY
 from canon_alpaca.providers import DATA_ONLY_ENV
+from canon_alpaca.providers import MethodRefused
 from canon_alpaca.providers import parse_equity
 from nautilus_trader.model import BarType
 from nautilus_trader.persistence import ParquetDataCatalog
@@ -290,6 +291,7 @@ def test_a_symbol_with_no_instrument_in_the_catalog_is_refused_before_any_reques
         run(catalog, symbols=["AAPL", "NOPE"])
 
     assert venue.sent == []
+    assert not (catalog / ".history-load.lock").exists()
 
 
 def test_a_root_holding_another_feed_is_refused_before_any_request(venue, catalog) -> None:
@@ -298,6 +300,67 @@ def test_a_root_holding_another_feed_is_refused_before_any_request(venue, catalo
     with pytest.raises(HistoryStopped, match="iex"):
         run(catalog)
 
+    assert venue.sent == []
+    assert not (catalog / ".history-load.lock").exists()
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        ({"start": MIN_START.replace(tzinfo=None)}, "time zone"),
+        ({"end": MIN_END.replace(tzinfo=None)}, "time zone"),
+        ({"start": MIN_END, "end": MIN_START}, "not before"),
+        ({"end": NOW}, "before now"),
+        ({"specs": []}, "bar specification"),
+        ({"specs": ["1-HOUR"]}, "bar specification"),
+        ({"symbols": []}, "symbol"),
+    ],
+)
+def test_invalid_load_inputs_do_not_create_a_catalog_lock(venue, catalog, options, message) -> None:
+    with pytest.raises(HistoryStopped, match=message):
+        run(catalog, **options)
+
+    assert not (catalog / ".history-load.lock").exists()
+    assert venue.sent == []
+
+
+def test_a_missing_catalog_is_refused_without_creating_it(venue, tmp_path) -> None:
+    catalog = tmp_path / "typo" / "catalog"
+
+    with pytest.raises(HistoryStopped, match="existing directory"):
+        run(catalog)
+
+    assert not (tmp_path / "typo").exists()
+    assert venue.sent == []
+
+
+def test_a_catalog_path_that_is_a_file_is_refused(venue, tmp_path) -> None:
+    catalog = tmp_path / "catalog"
+    catalog.write_text("keep me")
+
+    with pytest.raises(HistoryStopped, match="existing directory"):
+        run(catalog)
+
+    assert catalog.read_text() == "keep me"
+    assert venue.sent == []
+
+
+@pytest.mark.parametrize("kind", ["root", "descendant", "named"])
+def test_direct_load_refuses_ledger_paths_without_creating_them(
+    venue, tmp_path, monkeypatch, kind
+) -> None:
+    ledger = tmp_path / "trial-store"
+    monkeypatch.setattr(history_load, "LEDGER", ledger)
+    catalog = {
+        "root": ledger,
+        "descendant": ledger / "history",
+        "named": tmp_path / "ledger" / "history",
+    }[kind]
+
+    with pytest.raises(HistoryStopped, match="trial ledger"):
+        run(catalog)
+
+    assert not ledger.exists() and not (tmp_path / "ledger").exists()
     assert venue.sent == []
 
 
@@ -352,10 +415,13 @@ def test_a_parse_failure_names_the_symbol_and_preserves_the_cause(
     assert bars_in(catalog, "AAPL", "1-MINUTE") == []
 
 
+@pytest.mark.parametrize("state", ["empty", "preclaimed", "partial", "changed"])
 def test_a_write_failure_names_the_bar_type_and_preserves_the_cause(
-    venue, catalog, monkeypatch
+    venue, catalog, monkeypatch, state
 ) -> None:
     original = history_load.ParquetDataCatalog
+    if state == "preclaimed":
+        (catalog / FEED_FILE).write_text("sip\n")
 
     class WriteFails:
         def __init__(self, path):
@@ -365,6 +431,10 @@ def test_a_write_failure_names_the_bar_type_and_preserves_the_cause(
             return getattr(self.catalog, name)
 
         def write_bars(self, *args, **kwargs):
+            if state == "partial":
+                self.catalog.write_bars(*args, **kwargs)
+            elif state == "changed":
+                (catalog / FEED_FILE).write_text("iex\n")
             raise OSError("offline disk full")
 
     monkeypatch.setattr(history_load, "ParquetDataCatalog", WriteFails)
@@ -372,7 +442,11 @@ def test_a_write_failure_names_the_bar_type_and_preserves_the_cause(
         run(catalog, symbols=["AAPL"])
 
     assert isinstance(stopped.value.__cause__, OSError)
-    assert bars_in(catalog, "AAPL", "1-MINUTE") == []
+    assert len(bars_in(catalog, "AAPL", "1-MINUTE")) == (11 if state == "partial" else 0)
+    if state == "empty":
+        assert not (catalog / FEED_FILE).exists()
+    else:
+        assert (catalog / FEED_FILE).read_text() == ("iex\n" if state == "changed" else "sip\n")
 
 
 def test_a_transport_failure_names_the_request_and_preserves_the_cause(
@@ -430,6 +504,57 @@ def test_outside_data_only_mode_no_client_is_built(monkeypatch) -> None:
     monkeypatch.delenv(DATA_ONLY_ENV, raising=False)
     with pytest.raises(HistoryStopped, match="data-only"):
         history_client()
+
+
+@pytest.mark.parametrize(
+    ("stage", "cause"),
+    [("credentials", RuntimeError), ("timeout", TypeError), ("get-only", MethodRefused)],
+)
+def test_client_setup_failures_stop_by_name(venue, monkeypatch, stage, cause) -> None:
+    if stage == "credentials":
+        monkeypatch.delenv(ENV_API_KEY)
+        monkeypatch.delenv(ENV_SECRET_KEY)
+    else:
+
+        def refused(*args, **kwargs):
+            raise cause(f"offline {stage} validation failed")
+
+        name = "with_http_timeout" if stage == "timeout" else "require_get_only"
+        monkeypatch.setattr(history_load, name, refused)
+
+    with pytest.raises(HistoryStopped, match="history client") as stopped:
+        history_client()
+
+    assert isinstance(stopped.value.__cause__, cause)
+    assert venue.sent == []
+
+
+def test_main_names_missing_credentials_and_returns_one(
+    venue, catalog, monkeypatch, capsys
+) -> None:
+    monkeypatch.delenv(ENV_API_KEY)
+    monkeypatch.delenv(ENV_SECRET_KEY)
+
+    result = history_load.main(
+        [
+            "--symbols",
+            "AAPL",
+            "--bars",
+            "1-MINUTE",
+            "--start",
+            MIN_START.isoformat(),
+            "--end",
+            MIN_END.isoformat(),
+            "--catalog",
+            str(catalog),
+        ]
+    )
+
+    assert result == 1
+    error = capsys.readouterr().err
+    assert "history client" in error and "credentials" in error
+    assert not (catalog / ".history-load.lock").exists()
+    assert venue.sent == []
 
 
 @pytest.mark.parametrize(

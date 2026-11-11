@@ -62,10 +62,17 @@ repository (UNVERIFIED here).
    write-back gives them. What the root covers (`get_missing_intervals_for_request`) is not asked for
    again. Symbols with the same gap share a request. The root keeps one feed through `bars_to_catalog`'s
    `alpaca-feed` file, and a root holding another feed is refused. The root is an argument, defaulting
-   to `catalog/`, and anything under `ledger/` is refused. A nonblocking exclusive `fcntl.flock` on
+   to `catalog/`, and anything under `ledger/` is refused by the public loader as well as the CLI.
+   The root must already be a directory holding the required definitions. The window, nonempty
+   symbols, supported nonempty bar specifications, ledger exclusion, directory, feed and definitions
+   are validated before creating a lock file; preflight refusals create no catalog directory or lock.
+   A nonblocking exclusive `fcntl.flock` on
    `.history-load.lock` in the root is held from the coverage read through the last write; another
    history loader using that root stops by name before requesting data. The marker is rechecked before
    every write and created with exclusive `open(..., "x")`, so a competing marker is never overwritten.
+   If a write fails and the root holds no feed data, a marker newly created by this load is removed,
+   as `bars_to_catalog` does. Pre-existing markers, markers whose feed has changed, and markers on roots
+   holding any feed data are kept.
    This is a catalog lock, independent of account and stream locks. It coordinates history loaders;
    `load_bars` and quote write-back do not take it and must run separately or use other roots. A marker
    changed during a request is refused before writing, but an uncooperative writer changing it after
@@ -111,7 +118,8 @@ repository (UNVERIFIED here).
    error. The counter's 429 count is checked after each request as well.
 7. **Failures.** A refused request, a 403 on `sip` included, stops the run by name, with the HTTP
    status. Nothing falls back to another feed. Whatever an earlier request wrote stays, and a rerun asks
-   only for what is missing. Transport, parsing and catalog-write errors are also raised as
+   only for what is missing. Client setup errors (missing credentials, timeout or GET-only session
+   validation), transport, parsing and catalog-write errors are also raised as
    `HistoryStopped`, with the operation, symbol or bar type and the original cause; the CLI reports
    them and exits 1. A 429 retains its distinct exit 4.
 8. **Pairs.** The lead decided on 2026-11-11 that `paper:history <account>` takes either account's pair,
@@ -155,6 +163,11 @@ adapter and counter, with requests' transport answered by a stand-in of the bars
 * a competing history loader refused while a request is in flight, and a changed feed refused before
   writing;
 * parse, write and transport failures named as `HistoryStopped`, and the CLI reporting a parse failure;
+* invalid direct-loader inputs and ledger paths refused without creating catalog directories or a lock;
+* a failed first write removing its new marker only while the root holds no feed data, with existing,
+  changed and partial-write markers kept;
+* client setup failures named as `HistoryStopped` with their causes, and missing credentials reported
+  by the CLI with exit 1 and no request;
 * rounded SIP prices named with the count and first example;
 * a 429 stopping the run with one request sent, where alpaca-py would have sent four;
 * a 403 stopping it by name with no `iex` request;
@@ -173,6 +186,9 @@ silent-rounding defects. Each fix above has a regression that failed before the 
 Concurrency with legacy writers that do not take the catalog lock is a recorded limit, not a verified
 shared-lock guarantee.
 
+Antigravity's review of `0bcca05` found the premature filesystem writes, unused marker after a failed
+first write, and unnamed client setup errors. Each reproduced in this test file before its fix.
+
 ## Evidence
 
 Fix-forward source check, 2026-11-11, without network access: cached alpaca-py `c42add7c0a70`
@@ -182,6 +198,12 @@ and `bar_roundings`; and Python `b703b2c5e704` (`Doc/library/fcntl.rst`, `contex
 `Doc/builtins/functions.rst`) for advisory locking and exclusive file creation. The fake venue exercises
 New York midnights on both sides of spring DST; the venue's live daily-open convention remains
 UNVERIFIED as the adapter's header states.
+
+Antigravity follow-up, 2026-11-11: `bars_to_catalog._holds_data` and its failed-load marker cleanup,
+the adapter's `credentials_from_env`, `with_http_timeout` and `require_get_only`, and Python
+`b703b2c5e704` `Lib/pathlib/__init__.py` (`is_dir`, `resolve`, `unlink`) were checked for preflight and
+marker cleanup. Setup-error tests remove only placeholder environment values; no real credential is
+read and no request is sent.
 
 Read 2026-11-11. Fetched means read in this session; source means read at the pin in the upstream
 source cache.

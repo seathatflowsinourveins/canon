@@ -45,7 +45,8 @@ an account's budget, so their combined rate is UNCALIBRATED and a 429 still stop
 
 Instruments: a bar is parsed against its `Equity` (price precision), read from the catalog root. The
 definitions are written there by the asset list load, one trading GET for the whole list (ADR 0093). A
-symbol with no definition in the root is refused by name before any request.
+symbol with no definition in the root is refused by name before any request or lock-file creation.
+The root must already be a directory, and inputs and ledger exclusions are checked before locking it.
 
 What stops a run, by name, keeping what was written: a 429 on any API; a request Alpaca refuses (a 403
 on `sip` included; nothing falls back to another feed); a root that holds another feed's data
@@ -103,6 +104,7 @@ from nautilus_trader.persistence import ParquetDataCatalog
 from canon_trading.bars_to_catalog import DEFAULT_CATALOG
 from canon_trading.bars_to_catalog import FEED_FILE
 from canon_trading.bars_to_catalog import PUBLICATION_DELAY
+from canon_trading.bars_to_catalog import _holds_data
 from canon_trading.bars_to_catalog import catalog_feed
 from canon_trading.session_window import SOURCE_ROOT
 
@@ -174,13 +176,22 @@ def history_client() -> StockHistoricalDataClient:
         raise HistoryStopped(
             f"paper:history runs in data-only mode only ({DATA_ONLY_ENV}=1, ADR 0070); nothing was built"
         )
-    api_key, secret_key = credentials_from_env()
-    client = with_http_timeout(StockHistoricalDataClient(api_key=api_key, secret_key=secret_key))
-    require_get_only(client)
-    session = session_of(client)
-    assert session is not None  # with_http_timeout raised otherwise
-    session.hooks["response"].append(stop_at_429)
-    return client
+    try:
+        api_key, secret_key = credentials_from_env()
+        client = with_http_timeout(
+            StockHistoricalDataClient(api_key=api_key, secret_key=secret_key)
+        )
+        require_get_only(client)
+        session = session_of(client)
+        assert session is not None  # with_http_timeout raised otherwise
+        session.hooks["response"].append(stop_at_429)
+        return client
+    except HistoryStopped:
+        raise
+    except Exception as e:
+        raise HistoryStopped(
+            f"building the GET-only Alpaca history client failed ({type(e).__name__}): {e}"
+        ) from e
 
 
 @dataclass(frozen=True)
@@ -231,10 +242,10 @@ def _batches(items: Sequence[str], size: int) -> Iterator[list[str]]:
 def _catalog_lock(path: Path) -> Generator[None]:
     """Python 3.14 `fcntl.flock`: one history loader per root, from coverage read through writes.
 
-    This is an advisory catalog lock, not an account or stream lock. Legacy writers that do not
-    take it must use another root or run separately (ADR 0093).
+    The path is an existing root validated by `load_history`. This is an advisory catalog lock, not
+    an account or stream lock. Legacy writers that do not take it must use another root or run
+    separately (ADR 0093).
     """
-    path.mkdir(parents=True, exist_ok=True)
     with (path / ".history-load.lock").open("a") as held:
         try:
             fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -255,14 +266,16 @@ def _check_feed(path: Path) -> None:
         )
 
 
-def _claim_feed(path: Path) -> None:
-    """Recheck under the catalog lock and create the marker exclusively (Python `open`, mode `x`)."""
+def _claim_feed(path: Path) -> bool:
+    """Recheck and exclusively create the marker under the lock; return whether this load created it."""
     _check_feed(path)
     try:
         with (path / FEED_FILE).open("x", encoding="ascii") as marker:
             marker.write(f"{FEED.value}\n")
     except FileExistsError:
         _check_feed(path)
+        return False
+    return True
 
 
 def load_history(
@@ -284,8 +297,47 @@ def load_history(
     """Load `specs` bars of `symbols` whose `ts_init` lies in `[start, end]` into the catalog root, and
     return the bars written. Raises `HistoryStopped` (or `RateLimited`) naming what stopped it."""
     try:
+        for name, value in (("start", start), ("end", end)):
+            if value.tzinfo is None:
+                raise HistoryStopped(f"{name} must carry a time zone, got {value}")
+        if start >= end:
+            raise HistoryStopped(f"start {start} is not before end {end}")
+        if not symbols:
+            raise HistoryStopped("at least one symbol is required")
+        if not specs or any(spec not in BAR_SPECS for spec in specs):
+            raise HistoryStopped(
+                f"bar specifications must be one or more of {', '.join(BAR_SPECS)}, got {list(specs)}"
+            )
+        for spec in specs:
+            latest = now() - margin(spec)
+            if end > latest:
+                raise HistoryStopped(
+                    f"end {end} is after {latest}, less than {margin(spec)} before now, for {spec} bars: "
+                    "the catalog would record a bar not yet formed or published as covered"
+                )
         path = Path(catalog_path).resolve()
+        if (
+            path == LEDGER.resolve()
+            or LEDGER.resolve() in path.parents
+            or "ledger" in Path(catalog_path).parts
+        ):
+            raise HistoryStopped(
+                f"the catalog at {catalog_path} is under ledger/, which holds the trial ledger only"
+            )
+        if not path.is_dir():
+            raise HistoryStopped(f"the catalog at {path} must be an existing directory")
+        _check_feed(path)
+        catalog = ParquetDataCatalog(str(path))
+        ids = [f"{s}.{VENUE}" for s in symbols]
+        instruments = {str(i.id): i for i in catalog.instruments(instrument_ids=ids)}
+        if absent := [i for i in ids if i not in instruments]:
+            raise HistoryStopped(
+                f"no instrument definition in {path} for {', '.join(absent[:20])}"
+                f"{' and more' if len(absent) > 20 else ''}: the asset list load writes them (ADR 0093); "
+                "nothing was requested"
+            )
         with _catalog_lock(path):
+            _check_feed(path)
             return _load_history(
                 client,
                 symbols,
@@ -293,6 +345,8 @@ def load_history(
                 start,
                 end,
                 path,
+                catalog,
+                instruments,
                 pace=pace,
                 symbols_per_call=symbols_per_call,
                 max_rows=max_rows,
@@ -317,6 +371,8 @@ def _load_history(
     start: datetime,
     end: datetime,
     path: Path,
+    catalog: ParquetDataCatalog,
+    instruments: dict[str, Any],
     *,
     pace: Pace,
     symbols_per_call: int,
@@ -326,29 +382,6 @@ def _load_history(
     now: Callable[[], datetime],
     out: Callable[[str], None],
 ) -> int:
-    for name, value in (("start", start), ("end", end)):
-        if value.tzinfo is None:
-            raise HistoryStopped(f"{name} must carry a time zone, got {value}")
-    if start >= end:
-        raise HistoryStopped(f"start {start} is not before end {end}")
-    for spec in specs:
-        latest = now() - margin(spec)
-        if end > latest:
-            raise HistoryStopped(
-                f"end {end} is after {latest}, less than {margin(spec)} before now, for {spec} bars: the "
-                "catalog would record a bar not yet formed or published as covered"
-            )
-    _check_feed(path)
-    catalog = ParquetDataCatalog(str(path))
-    ids = [f"{s}.{VENUE}" for s in symbols]
-    instruments = {str(i.id): i for i in catalog.instruments(instrument_ids=ids)}
-    if absent := [i for i in ids if i not in instruments]:
-        raise HistoryStopped(
-            f"no instrument definition in {path} for {', '.join(absent[:20])}"
-            f"{' and more' if len(absent) > 20 else ''}: the asset list load writes them (ADR 0093); "
-            "nothing was requested"
-        )
-
     written = 0
     next_at = clock()
     start_ns, end_ns = dt_to_unix_nanos(start), dt_to_unix_nanos(end)
@@ -463,10 +496,16 @@ def _load_history(
                                 f"{instrument.price_precision}, half to even as NautilusTrader's "
                                 f"Instrument.make_price rounds; the first: {first_rounding}"
                             )
-                        _claim_feed(path)
+                        claimed = _claim_feed(path)
                         try:
                             catalog.write_bars(bars, start=lo, end=hi)
                         except Exception as e:
+                            if (
+                                claimed
+                                and not _holds_data(path)
+                                and catalog_feed(path) == FEED.value
+                            ):
+                                (path / FEED_FILE).unlink(missing_ok=True)
                             raise HistoryStopped(
                                 f"writing {bar_type} into {path} failed ({type(e).__name__}): {e}"
                             ) from e
