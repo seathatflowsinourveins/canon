@@ -84,6 +84,7 @@ case "${1:-}" in
   --version) cat "$STUB/mise-version"; exit 0 ;;
   trust|install) exit 0 ;;
   which) [ -x "$STUB/otelcol" ] && echo "$STUB/otelcol"; exit 0 ;;   # mise which: the otelcol stub, if any
+  where) [ -f "$STUB/omniroute-version" ] && { echo "$STUB/omniroute-install"; exit 0; }; exit 1 ;;   # omniroute installed?
   # a run that hangs ($STUB/mise-hangs), ignoring SIGTERM as a stuck keychain read or tool install might
   run) [ -f "$STUB/mise-hangs" ] && { trap '' TERM; echo $$ > "$STUB/mise-hung.pid"; sleep 30; }; exit 0 ;;
   exec) shift; [ "${1:-}" = "--" ] && shift ;;
@@ -99,6 +100,12 @@ if [ "$cmd" = gh ]; then
       jq -r "$expr" "$STUB/gh-runs.json"; exit $? ;;
   esac
   exit 0
+fi
+# omniroute: `--version` prints $STUB/omniroute-version (absent: exec fails, as for a tool not installed)
+if [ "$cmd" = omniroute ]; then
+  echo "omniroute env=${MISE_ENV:-} $*" >> "$STUB/omniroute.log"
+  [ -f "$STUB/omniroute-version" ] || exit 1
+  cat "$STUB/omniroute-version"; exit 0
 fi
 echo "$cmd 1.0 (stub)"
 EOF
@@ -1226,6 +1233,68 @@ else
         eval 'rowis "$TMP/bs.out" "dsh-tui review patch" UNKNOWN && grep -q "cordis.patch.yml cannot be read" "$TMP/bs.out"'
 fi
 rm -rf "$HOME/.dsh"
+# the OmniRoute rows (ADR 0056), optional: not installed is absent and passes; installed, its version is held
+# to the registry's pin; with no database the providers row is absent, otherwise the provider_connections
+# table, read by sqlite3 under query_only, decides: a connection whose provider, name or default model says
+# Anthropic or Claude fails the check
+OD="$HOME/.omniroute"
+cat > "$B/sqlite3" <<'SQLSTUB'
+#!/bin/bash
+# sqlite3 stub: logs its arguments and the SQL it was given, prints $STUB/omniroute-rows, exits $STUB/sqlite-rc
+echo "sqlite3 $*" >> "$STUB/sqlite.log"; cat >> "$STUB/sqlite.log"
+cat "$STUB/omniroute-rows" 2>/dev/null; exit "$(cat "$STUB/sqlite-rc" 2>/dev/null || echo 0)"
+SQLSTUB
+chmod +x "$B/sqlite3"; export CANON_SQLITE3="$B/sqlite3"
+cp "$BS/canon/upstreams.json" "$TMP/reg.keep"
+jq '.upstreams += [{id: "omniroute", track: "tag:v3.8.53"}]' "$TMP/reg.keep" > "$BS/canon/upstreams.json"
+: > "$STUB/omniroute.log"; : > "$STUB/sqlite.log"; bs --check
+# shellcheck disable=SC2034  # rc_none is read by the eval'd checks below
+rc_none=$?
+check "omniroute not installed: absent, naming the install, and the check still passes" \
+      eval 'rowis "$TMP/bs.out" "omniroute" absent && grep -q "mise -E gateway install --locked npm:omniroute" "$TMP/bs.out" && ! grep -q "omniroute env=" "$STUB/omniroute.log"'
+check "omniroute row with no gateway data: absent, never reads a database" \
+      eval 'rowis "$TMP/bs.out" "omniroute providers" absent && [ ! -s "$STUB/sqlite.log" ]'
+echo 3.8.53 > "$STUB/omniroute-version"; : > "$STUB/mise.log"; bs --check; rc=$?
+check "omniroute at the pin: ok, and the exit status is as without it" \
+      eval 'rowis "$TMP/bs.out" "omniroute" ok && grep -q "3.8.53; pinned 3.8.53" "$TMP/bs.out" && [ "$rc" = "$rc_none" ]'
+check "... asked through mise's gateway environment, with no install" \
+      eval 'grep -q "^omniroute env=gateway --version\$" "$STUB/omniroute.log" && grep "exec -- omniroute" "$STUB/mise.log" > "$TMP/omx" && ! grep -qv "exec_auto_install=false" "$TMP/omx"'
+echo 3.8.52 > "$STUB/omniroute-version"; bs --check; rc=$?
+check "omniroute at another version than the pin: OTHER, exit 1" eval 'rowis "$TMP/bs.out" "omniroute" OTHER && [ "$rc" != 0 ]'
+echo 'npm error' > "$STUB/omniroute-version"; bs --check; rc=$?
+check "omniroute installed whose version cannot be read: UNKNOWN, exit 1, never absent" \
+      eval 'rowis "$TMP/bs.out" "omniroute" UNKNOWN && [ "$rc" != 0 ]'
+echo 3.8.53 > "$STUB/omniroute-version"
+mkdir -p "$OD"; : > "$OD/storage.sqlite"
+printf '%s\n' '[{"provider":"openai","name":"OpenAI","default_model":""},' '{"provider":"deepseek","name":"DeepSeek","default_model":"deepseek-chat"}]' > "$STUB/omniroute-rows"
+: > "$STUB/sqlite.log"; bs --check; rc=$?
+check "omniroute row with OpenAI and DeepSeek only: ok, naming them" \
+      eval 'rowis "$TMP/bs.out" "omniroute providers" ok && grep -q "deepseek openai; none Anthropic" "$TMP/bs.out" && [ "$rc" = "$rc_none" ]'
+check "... read with query_only first, selecting no key or token column" \
+      eval 'grep -qxF "sqlite3 -bail $OD/storage.sqlite" "$STUB/sqlite.log" && [ "$(sed -n 2p "$STUB/sqlite.log")" = "PRAGMA query_only=1;" ] && ! grep -Eq "api_key|access_token|refresh_token|id_token|provider_specific_data" "$STUB/sqlite.log"'
+: > "$STUB/omniroute-rows"; bs --check
+check "omniroute row with an empty table: ok, no connections" \
+      eval 'rowis "$TMP/bs.out" "omniroute providers" ok && grep -q "no connections; none Anthropic" "$TMP/bs.out"'
+for p in '"provider":"anthropic","name":"Anthropic","default_model":""' '"provider":"claude","name":"Claude Code","default_model":""' \
+         '"provider":"anthropic-compatible-x","name":"Mine","default_model":""' '"provider":"openai-compatible-y","name":"Claude via a relay","default_model":""' \
+         '"provider":"openrouter","name":"OpenRouter","default_model":"anthropic/claude-sonnet"'; do
+  echo "[{\"provider\":\"openai\",\"name\":\"OpenAI\",\"default_model\":\"\"},{$p}]" > "$STUB/omniroute-rows"
+  bs --check; rc=$?
+  check "omniroute row with $p: FAILED, exit 1" eval 'rowis "$TMP/bs.out" "omniroute providers" FAILED && [ "$rc" != 0 ]'
+done
+echo 'not json' > "$STUB/omniroute-rows"; bs --check; rc=$?
+check "omniroute table read that is not JSON: UNKNOWN, exit 1, never a silent none" \
+      eval 'rowis "$TMP/bs.out" "omniroute providers" UNKNOWN && [ "$rc" != 0 ]'
+: > "$STUB/omniroute-rows"; echo 1 > "$STUB/sqlite-rc"; bs --check; rc=$?
+check "omniroute table that cannot be read: UNKNOWN, exit 1" eval 'rowis "$TMP/bs.out" "omniroute providers" UNKNOWN && [ "$rc" != 0 ]'
+rm -rf "$OD" "$STUB/sqlite-rc" "$STUB/omniroute-rows" "$STUB/omniroute-version" "$B/sqlite3"; unset CANON_SQLITE3
+cp "$TMP/reg.keep" "$BS/canon/upstreams.json"
+# the gateway environment's version is the registry's pin: scripts/canon lint reads mise.toml alone (ADR 0056)
+gwv=$(sed -n 's/^"npm:omniroute" = { version = "\([^"]*\)".*/\1/p' "$ROOT/mise.gateway.toml")
+gwpin=$(jq -r '.upstreams[] | select(.id == "omniroute") | .track' "$ROOT/canon/upstreams.json")
+check "mise.gateway.toml installs omniroute at the registry's pin ($gwv, ${gwpin:-none})" \
+      eval '[ -n "$gwv" ] && [ "tag:v$gwv" = "$gwpin" ] && grep -q "version = \"$gwv\"" "$ROOT/mise.gateway.lock"'
+check "... and a plain mise.toml installs no gateway" eval '! grep -q "omniroute" "$ROOT/mise.toml"'
 # every keychain service mise.toml's paper tasks name is the one the bootstrap row looks up (ADR 0029)
 # (timeout(1)'s own `-s KILL` names a signal, not a service)
 paper_names() { grep -vE 'timeout(\(1\))? -s ' "$ROOT/mise.toml" | grep -oE '(-s |svc=)[A-Za-z0-9"$_-]+' | sed -E 's/^(-s |svc=)//' | grep -vxF '"$svc"'; }

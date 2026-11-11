@@ -1,0 +1,178 @@
+# The `gateway` config environment (https://mise.jdx.dev/configuration/environments.html): this file loads on
+# top of mise.toml only when it is selected, `mise -E gateway <command>` or MISE_ENV=gateway, and its tools are
+# locked in mise.gateway.lock, with the npm dependency graph in .mise/locks/ beside it. A plain `mise install`,
+# `scripts/bootstrap --install` and hosted CI (which sets no MISE_ENV) read only mise.toml and mise.lock, so
+# none of them installs the gateway (docs/adr/0056-omniroute-gateway-for-non-anthropic-runtimes.md).
+# Install it, on request: mise -E gateway install --locked npm:omniroute (with no tool named, --locked also
+# asks for every global tool of the user, which no lockfile here records). Its tasks run as mise -E gateway run <task>.
+
+[tools]
+# OmniRoute, the local gateway for non-Anthropic runtimes, from npm through mise's npm backend, on macOS only.
+# 3.8.49 and 3.8.50 were published with the maintainer's 2FA approval (npm staged publishing); from 3.8.51 the
+# publish workflow defaults to Trusted Publishing with no approver, which aube's no-downgrade trust policy
+# refuses. Two versions are exempted by name after review (https://aube.jdx.dev/security#trust-policy): this
+# one, whose provenance names the repository's own npm-publish.yml, tag v3.8.53, commit 191dce8d534c (the
+# pin), and the dependency @pierre/theme@1.1.0, whose new publisher gave no provenance. A pin move reads the
+# next version's provenance, names that version here instead, and regenerates the lock and its graph with
+# `mise -E gateway lock` (ADR 0056). canon/upstreams.json: omniroute; scripts/test-lanes holds the two equal.
+"npm:omniroute" = { version = "3.8.53", os = ["macos"], trust_policy_excludes = ["omniroute@3.8.53", "@pierre/theme@1.1.0"] }
+# OmniRoute, the local gateway (docs/adr/0056-omniroute-gateway-for-non-anthropic-runtimes.md). Three generic
+# password items in the login keychain, service "canon-omniroute", account = the variable's name, written and
+# read by Apple's `security` as the paper pair is (ADR 0029): STORAGE_ENCRYPTION_KEY, which OmniRoute uses to
+# encrypt every stored provider credential (AES-256-GCM, src/lib/db/encryption.ts at v3.8.53; with it unset,
+# OmniRoute generates one and writes it to <DATA_DIR>/.env, bin/omniroute.mjs), INITIAL_PASSWORD, the
+# dashboard password OmniRoute saves as a bcrypt hash at its first start (src/lib/auth/managementPassword.ts),
+# and OMNIROUTE_API_KEY, the key a client sends, created in OmniRoute's dashboard. The storage key is made
+# here by openssl and never shown; the other two are typed at a hidden prompt. No Anthropic or Claude
+# credential, account or model is ever configured in OmniRoute (ADR 0056); `scripts/bootstrap --check` says
+# when one is. Not one of these tasks reads a provider credential.
+
+[tasks."omniroute:store"]
+description = "Make OmniRoute's storage key and enter its dashboard password at a hidden prompt, into the login keychain"
+interactive = true
+shell = "bash -c"
+run = '''
+set -euo pipefail
+svc=canon-omniroute
+[ -t 0 ] || { echo "omniroute:store: needs a terminal to ask for the password; run it in your own terminal" >&2; exit 1; }
+# A database is encrypted with the key it was made with, and keeps the password it was first given, so a new
+# pair would lock it: start over only with the folder moved away.
+[ ! -e "$HOME/.omniroute/storage.sqlite" ] || { echo "omniroute:store: $HOME/.omniroute already holds a database, made with an earlier key and password; move that folder away to start over. Nothing stored." >&2; exit 1; }
+for a in STORAGE_ENCRYPTION_KEY INITIAL_PASSWORD; do
+  if /usr/bin/security find-generic-password -s "$svc" -a "$a" >/dev/null 2>&1; then
+    echo "omniroute:store: $a is already in the login keychain. Removing the storage key makes every stored credential unreadable; run mise -E gateway run omniroute:remove only to start over." >&2; exit 1
+  fi
+done
+# Echo off before the prompts show (ADR 0033); back on however the task ends.
+trap 'stty echo' EXIT; trap 'exit 130' INT TERM HUP; stty -echo
+IFS= read -rsp "OmniRoute dashboard password, 12 characters or more (hidden): " pw; echo
+IFS= read -rsp "The same again (hidden): " pw2; echo
+stty echo
+[ "$pw" = "$pw2" ] || { echo "omniroute:store: the two entries differ; nothing stored" >&2; exit 1; }
+[ "$(printf '%s' "$pw" | /usr/bin/wc -c)" -ge 12 ] || { echo "omniroute:store: under 12 characters; nothing stored" >&2; exit 1; }
+# OmniRoute ships CHANGEME as its template password and warns that it is publicly known.
+case "$pw" in CHANGEME|changeme) echo "omniroute:store: that is OmniRoute's published default; nothing stored" >&2; exit 1 ;; esac
+key=$(/usr/bin/openssl rand -hex 32)
+# As paper:store: `security -i` reads the command on stdin and -X takes the value as hex (man security).
+store() {
+  local hex
+  hex=$(printf '%s' "$2" | od -An -tx1 | tr -dc 0-9a-f)
+  printf 'add-generic-password -a %s -s %s -l OmniRoute-%s -X %s\n' "$1" "$svc" "$1" "$hex" | /usr/bin/security -i >/dev/null 2>&1
+}
+same() { [ "$(/usr/bin/security find-generic-password -s "$svc" -a "$1" -w 2>/dev/null)" = "$2" ]; }
+if store STORAGE_ENCRYPTION_KEY "$key" && store INITIAL_PASSWORD "$pw" \
+   && same STORAGE_ENCRYPTION_KEY "$key" && same INITIAL_PASSWORD "$pw"; then
+  echo "omniroute:store: stored STORAGE_ENCRYPTION_KEY (made here, not shown) and INITIAL_PASSWORD in the login keychain (service $svc)"
+else
+  for a in STORAGE_ENCRYPTION_KEY INITIAL_PASSWORD; do /usr/bin/security delete-generic-password -s "$svc" -a "$a" >/dev/null 2>&1 || true; done
+  echo "omniroute:store: storing failed or read back differently; both items removed, nothing kept" >&2
+  exit 1
+fi
+'''
+
+[tasks."omniroute:store-key"]
+description = "Enter the API key made in OmniRoute's dashboard at a hidden prompt, into the login keychain, for omniroute:codex"
+interactive = true
+shell = "bash -c"
+run = '''
+set -euo pipefail
+svc=canon-omniroute
+[ -t 0 ] || { echo "omniroute:store-key: needs a terminal; run it in your own terminal" >&2; exit 1; }
+if /usr/bin/security find-generic-password -s "$svc" -a OMNIROUTE_API_KEY >/dev/null 2>&1; then
+  echo "omniroute:store-key: OMNIROUTE_API_KEY is already in the login keychain; to replace it: security delete-generic-password -s $svc -a OMNIROUTE_API_KEY" >&2; exit 1
+fi
+trap 'stty echo' EXIT; trap 'exit 130' INT TERM HUP; stty -echo
+IFS= read -rsp "OmniRoute API key from its dashboard (hidden): " key; echo
+stty echo
+[ -n "$key" ] || { echo "omniroute:store-key: empty; nothing stored" >&2; exit 1; }
+# The gateway must accept it: one GET of its model list on the loopback address, the key on curl's stdin.
+code=$(printf 'Authorization: Bearer %s\n' "$key" | curl -sS -o /dev/null -w '%{http_code}' --max-time 10 -H @- http://127.0.0.1:20128/v1/models) || code="no answer"
+[ "$code" = 200 ] || { echo "omniroute:store-key: the gateway answered $code (is mise -E gateway run omniroute:serve running?); nothing stored" >&2; exit 1; }
+hex=$(printf '%s' "$key" | od -An -tx1 | tr -dc 0-9a-f)
+printf 'add-generic-password -a OMNIROUTE_API_KEY -s %s -l OmniRoute-OMNIROUTE_API_KEY -X %s\n' "$svc" "$hex" | /usr/bin/security -i >/dev/null 2>&1
+[ "$(/usr/bin/security find-generic-password -s "$svc" -a OMNIROUTE_API_KEY -w 2>/dev/null)" = "$key" ] \
+  || { /usr/bin/security delete-generic-password -s "$svc" -a OMNIROUTE_API_KEY >/dev/null 2>&1 || true; echo "omniroute:store-key: storing failed; nothing kept" >&2; exit 1; }
+echo "omniroute:store-key: the gateway accepted the key; stored OMNIROUTE_API_KEY in the login keychain (service $svc)"
+'''
+
+[tasks."omniroute:check"]
+description = "Say whether each OmniRoute keychain item exists, without reading any value; exit 1 if serve's two are not both there"
+shell = "bash -c"
+run = '''
+missing=0
+for a in STORAGE_ENCRYPTION_KEY INITIAL_PASSWORD OMNIROUTE_API_KEY; do
+  if /usr/bin/security find-generic-password -s canon-omniroute -a "$a" >/dev/null 2>&1; then echo "$a: in the login keychain"
+  elif [ "$a" = OMNIROUTE_API_KEY ]; then echo "$a: absent (optional until omniroute:store-key, for omniroute:codex)"
+  else echo "$a: absent"; missing=1; fi
+done
+exit "$missing"
+'''
+
+[tasks."omniroute:remove"]
+description = "Delete the OmniRoute keychain items; without the storage key its stored credentials cannot be read again"
+shell = "bash -c"
+run = '''
+for a in STORAGE_ENCRYPTION_KEY INITIAL_PASSWORD OMNIROUTE_API_KEY; do
+  if /usr/bin/security delete-generic-password -s canon-omniroute -a "$a" >/dev/null 2>&1; then echo "$a: removed"
+  else echo "$a: was not there"; fi
+done
+[ ! -e "$HOME/.omniroute/storage.sqlite" ] || echo "the database in $HOME/.omniroute stays; its credentials are unreadable without the old key: move the folder away before omniroute:store"
+'''
+
+# The gateway, in the foreground of the terminal that starts it, until Ctrl-C. Every setting ADR 0056 fixes is
+# set here, in this task's environment, which OmniRoute's own .env loading never overrides (it fills only
+# variables that are unset, bin/omniroute.mjs): loopback only (OMNIROUTE_SERVER_HOST; `serve` binds 0.0.0.0
+# otherwise, bin/cli/utils/serverHost.mjs; its live and embedded-service WebSocket servers default to
+# loopback), an API key on every /v1 request (REQUIRE_API_KEY), detailed request logs off
+# (ENABLE_REQUEST_LOGS), no update check (NO_UPDATE_NOTIFIER for the CLI's update-notifier,
+# OMNIROUTE_NO_UPDATE_NOTIFIER for the server's npm and GitHub lookups, src/lib/system/versionCheck.ts), none of
+# the start-up fetches the no-credential trial saw (ARENA_ELO_SYNC_ENABLED: api.wulong.dev and Hugging Face;
+# OPENROUTER_PROVIDER_STATS_ENABLED: openrouter.ai), and Cloud Sync unset: CLOUD_URL is its only switch and
+# "off" fails OmniRoute's start-up check, so it is removed instead. The
+# package's own .env (with CHANGEME) and the default data folder's are not read (OMNIROUTE_CLI_SKIP_REPO_ENV,
+# OMNIROUTE_CLI_SKIP_DEFAULT_DATA_ENV), and a key file in the data folder stops the start. The password is
+# read only while no database exists, so it is in the environment of the first start alone.
+[tasks."omniroute:serve"]
+description = "Run the OmniRoute gateway on 127.0.0.1:20128 with ADR 0056's settings, its storage key read from the login keychain"
+shell = "bash -c"
+run = '''
+set -euo pipefail
+data="$HOME/.omniroute"
+# Read here rather than in the task's env, so a missing item ends with this task's own message; the value is
+# exported to omniroute alone and never printed.
+STORAGE_ENCRYPTION_KEY=$(/usr/bin/timeout 30 /usr/bin/security find-generic-password -s canon-omniroute -a STORAGE_ENCRYPTION_KEY -w 2>/dev/null) || STORAGE_ENCRYPTION_KEY=""
+[ -n "$STORAGE_ENCRYPTION_KEY" ] || { echo "omniroute:serve: no storage key in the login keychain; run: mise -E gateway run omniroute:store" >&2; exit 1; }
+export STORAGE_ENCRYPTION_KEY
+for f in .env server.env; do
+  [ ! -e "$data/$f" ] || { echo "omniroute:serve: $data/$f exists; OmniRoute would read secrets from a file (ADR 0056). Move it out of the folder first." >&2; exit 1; }
+done
+mkdir -p "$data"; chmod 700 "$data"; cd "$data"
+if [ ! -e "$data/storage.sqlite" ]; then
+  INITIAL_PASSWORD=$(/usr/bin/timeout 30 /usr/bin/security find-generic-password -s canon-omniroute -a INITIAL_PASSWORD -w) \
+    && [ -n "$INITIAL_PASSWORD" ] || { echo "omniroute:serve: no dashboard password for a first start; run: mise -E gateway run omniroute:store" >&2; exit 1; }
+  export INITIAL_PASSWORD
+else
+  unset INITIAL_PASSWORD
+fi
+unset CLOUD_URL NEXT_PUBLIC_CLOUD_URL
+export DATA_DIR="$data" OMNIROUTE_SERVER_HOST=127.0.0.1 LIVE_WS_HOST=127.0.0.1 EMBED_WS_PROXY_HOST=127.0.0.1 \
+  REQUIRE_API_KEY=true ENABLE_REQUEST_LOGS=false NO_UPDATE_NOTIFIER=1 OMNIROUTE_NO_UPDATE_NOTIFIER=1 \
+  ARENA_ELO_SYNC_ENABLED=false OPENROUTER_PROVIDER_STATS_ENABLED=false \
+  OMNIROUTE_CLI_SKIP_REPO_ENV=1 OMNIROUTE_CLI_SKIP_DEFAULT_DATA_ENV=1
+exec omniroute serve --no-open
+'''
+
+# Codex through the gateway, by Codex's own provider configuration given as -c overrides, so the owner's
+# ~/.codex/config.toml is not touched and Codex's own sign-in stays its default. The key reaches Codex by its
+# documented command-backed auth (`model_providers.<id>.auth`, codex-rs/protocol/src/config_types.rs at
+# rust-v0.167.0): Codex runs `security` and reads the token from its stdout, so it is in no file, argument or
+# environment. Arguments after the task name go to codex (mise forwards them).
+[tasks."omniroute:codex"]
+description = "Run the Codex CLI with its model provider set to the local OmniRoute gateway"
+shell = "bash -c"
+run = '''
+exec codex -c model_provider=omniroute -c model_providers.omniroute.name=OmniRoute \
+  -c model_providers.omniroute.base_url=http://127.0.0.1:20128/v1 -c model_providers.omniroute.wire_api=responses \
+  -c model_providers.omniroute.auth.command=/usr/bin/security \
+  -c 'model_providers.omniroute.auth.args=["find-generic-password","-s","canon-omniroute","-a","OMNIROUTE_API_KEY","-w"]'
+'''

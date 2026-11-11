@@ -776,6 +776,23 @@
         "https://github.com/upstash/context7"
       ],
       "adr": "0051"
+    },
+    {
+      "id": "omniroute",
+      "field": "agent-gateway",
+      "repo": "cheaper-inference/OmniRoute",
+      "track": "tag:v3.8.53",
+      "line": "v3.",
+      "role": "tool",
+      "license": "MIT",
+      "why": "OmniRoute (npm omniroute), a local OpenAI-compatible gateway, adopted on the owner's word to start GPT and other non-Anthropic runtimes through one endpoint (ADR 0056). No Anthropic or Claude credential, account or model is configured in it; Claude Code keeps its own login. Installed only on request, from mise's gateway config environment: mise.gateway.toml, locked in mise.gateway.lock with its npm dependency graph under .mise/locks/mise.gateway/ (mise -E gateway install --locked npm:omniroute). No mise field: scripts/canon lint reads mise.toml alone, so scripts/test-lanes holds mise.gateway.toml's version to this pin, and scripts/bootstrap --check compares the installed version with it. Started on demand by mise -E gateway run omniroute:serve with its settings fixed in that task and its storage key read from the login keychain. The repository was renamed from diegosouzapw/OmniRoute; the pin is at or above both fixes for GHSA-hf57-cqmx-p4gr (3.8.49 and 3.8.50).",
+      "evidence": [
+        "https://github.com/cheaper-inference/OmniRoute",
+        "https://github.com/cheaper-inference/OmniRoute/releases/tag/v3.8.53",
+        "https://github.com/cheaper-inference/OmniRoute/security/advisories/GHSA-hf57-cqmx-p4gr",
+        "https://raw.githubusercontent.com/cheaper-inference/OmniRoute/v3.8.53/LICENSE"
+      ],
+      "adr": "0056"
     }
   ]
 }

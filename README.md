@@ -134,6 +134,27 @@ Why it works this way, and what the keychain does not protect against:
 [ADR 0029](docs/adr/0029-paper-keys-in-the-login-keychain.md); how the pair is checked before it is stored:
 [ADR 0033](docs/adr/0033-paper-key-entry-checked-against-the-paper-api.md).
 
+## Run Codex through the OmniRoute gateway
+
+OmniRoute is a local OpenAI-compatible gateway for GPT and other non-Anthropic providers
+([ADR 0056](docs/adr/0056-omniroute-gateway-for-non-anthropic-runtimes.md)). Claude is never routed through
+it: no Anthropic or Claude credential, account or model goes in, and Claude Code keeps its own login. It is
+optional: neither `mise install` nor `scripts/bootstrap --install` installs it. It lives in mise's `gateway`
+config environment (`mise.gateway.toml`, locked in `mise.gateway.lock`). On a Mac, in your own terminal:
+
+```bash
+mise -E gateway install --locked npm:omniroute   # the pinned release, exactly the locked dependency graph
+mise -E gateway run omniroute:store      # makes its storage key, asks for a dashboard password; both to the keychain
+mise -E gateway run omniroute:serve      # the gateway on 127.0.0.1:20128 with ADR 0056's settings, until Ctrl-C
+mise -E gateway run omniroute:store-key  # after making a no-log API key in its dashboard: asks for it, checks it, stores it
+mise -E gateway run omniroute:codex      # Codex with its provider set to the gateway; arguments go to codex
+mise -E gateway run omniroute:check      # says which keychain items exist; prints none
+mise -E gateway run omniroute:remove     # deletes them; without the storage key its stored credentials are lost
+```
+
+A provider key goes in through the dashboard at `http://127.0.0.1:20128`, by you. `scripts/bootstrap
+--check` shows the installed version against the pin, and fails if a connection there says Anthropic or Claude.
+
 ## What runs on its own
 
 | Layer | Runs | Costs tokens |

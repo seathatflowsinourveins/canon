@@ -117,6 +117,11 @@ be used within these limits (ADR 0021):
   depends on the build (`task-create --deps`) and starts it when `task-list --ready` shows it and the
   change is on `main`: Codex and Muse there, Antigravity in place of either. The owning lane reproduces
   each finding, by a failing test where one can show it, and fixes forward, crediting the second reader.
+* A non-Claude runtime may reach GPT and other providers through OmniRoute, a local gateway on 127.0.0.1
+  that the owner installs and starts on request (`mise -E gateway run omniroute:serve`); Codex through it is
+  `mise -E gateway run omniroute:codex` (ADR 0056). That changes none of the terms above. No Anthropic or
+  Claude credential, account or model is ever configured in it, and Claude Code keeps its own login. A provider credential goes in only by the
+  owner, in its dashboard; a session never enters, reads or prints one.
 * A worker that changes files gets its own workspace (`--worktree new-top-level`). Share yours only for
   work that reads.
 * Do not run through an Orca terminal what a prompt would have asked the owner, and do not answer another

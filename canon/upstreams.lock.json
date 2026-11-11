@@ -288,6 +288,15 @@
       "sha": "f7f273a9bb6445f6f7fb6349105e7532972045fb",
       "track": "tag:v24.22.2"
     },
+    "omniroute": {
+      "default_branch": "release/v3.8.54",
+      "default_sha": "7e354e65ccadec179ff0f9a27b236047f3fce5f7",
+      "ref": "refs/tags/v3.8.53",
+      "repo": "cheaper-inference/OmniRoute",
+      "resolved_at": "2026-11-11T01:57:22Z",
+      "sha": "191dce8d534ceb56c28a08e71381284a9a87838f",
+      "track": "tag:v3.8.53"
+    },
     "openviking": {
       "default_branch": "main",
       "default_sha": "7be89c23d21c438ce39aadf8d7939ef6f56a4b74",
