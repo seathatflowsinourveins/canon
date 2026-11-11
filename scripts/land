@@ -27,6 +27,14 @@
 # ends in "(#<number>)", which is added unless the title already ends with it.
 # Environment: LAND_WAIT_SECONDS (default 540) and LAND_POLL_SECONDS (default 10) bound the wait for the
 # merge. LAND_PR is set by --pr for the run inside the worktree.
+# The fix marker (ADR 0073, addition of 2026-11-11): a commit that fixes a finding names the test that failed
+# before it in a `Fails-before: <test file>::<test function>` trailer and, optionally, the finding in
+# `Confirms: <round or reader>/<finding>`, both git trailers as git-interpret-trailers(1) defines them. No
+# maintained convention names the test that failed before a fix: AOSP's and Fuchsia's `Test:` name tests run
+# on a change, and the Linux kernel's `Fixes:` and `Closes:` name a commit and a report.
+# Every commit's Fails-before and Confirms trailers are carried into the squash message's trailer block, and
+# a change on the trading path whose message says it fixes a finding but names no Fails-before gets a
+# warning, as does a named test the tree lacks. It never refuses a change for a missing or malformed marker. scripts/fix-index lists them.
 # gh flags used are from gh's own help (gh 2.103.3): auth status, pr create --title/--body-file,
 # pr merge --squash/--auto/--match-head-commit/--subject/--body-file, pr checks --required --json, pr checkout --worktree,
 # pr view --json/--jq (title, body, state), pr list --json/--jq, api (commit statuses).
@@ -249,17 +257,38 @@ no_review() {   # no_review <status> <path>: succeeds if the path is on the list
   done
   return 1
 }
+# The trading path: the paths of ADR 0073 rule 1 that ADR 0074 item 4 calls the trading path (the adapter,
+# the session window and what it runs, the gate), plus the paper runner and the sandbox node on Alpaca's
+# live data, as ADR 0073's addition of 2026-11-11 names them. Unlike NO_REVIEW, * here crosses a /, so a
+# module moved into a subpackage of the adapter stays on the path. scripts/test-land checks that every
+# pattern matches a tracked file.
+#   packages/canon-alpaca/src/canon_alpaca/*.py                         the adapter
+#   session_window, session_ma_cross, ma_cross, position_cap            the session window and what it runs
+#   paper_node, home/.claude/canon/paper-session.sh, sandbox_node       the paper runner, the sandbox node
+#   ranking, returns_matrix, ledger, variant_study, backtest           the gate
+TRADING_PATHS='packages/canon-alpaca/src/canon_alpaca/*.py src/canon_trading/session_window.py src/canon_trading/session_ma_cross.py src/canon_trading/ma_cross.py src/canon_trading/position_cap.py src/canon_trading/paper_node.py home/.claude/canon/paper-session.sh src/canon_trading/sandbox_node.py src/canon_trading/ranking.py src/canon_trading/returns_matrix.py src/canon_trading/ledger.py src/canon_trading/variant_study.py src/canon_trading/backtest.py'
+on_trading_path() {   # on_trading_path <path>
+  local pattern
+  for pattern in $TRADING_PATHS; do
+    # shellcheck disable=SC2254  # the pattern is meant to match as a glob
+    case "$1" in $pattern) return 0 ;; esac
+  done
+  return 1
+}
 set -f      # the list's patterns must not expand against files in the working tree
 tmpd=$(mktemp -d) || die "could not create a temporary directory"
 git diff --name-status --no-renames -z "$base...$branch" > "$tmpd/changed" \
   || die "could not list what $branch changes, so the review gate cannot be applied"
-needs=(); count=0
+needs=(); trading=(); count=0
 while IFS= read -r -d '' st && IFS= read -r -d '' path; do
   count=$((count + 1))
   no_review "$st" "$path" || needs+=("$path")
+  ! on_trading_path "$path" || trading+=("$path")
 done < "$tmpd/changed"
 set +f
 [ "$count" -gt 0 ] || die "git listed no changed paths for $branch, so the review gate cannot be applied"
+
+set +f
 missing_note=0
 if [ ${#needs[@]} -gt 0 ] && [ -z "$REVIEWED" ]; then
   cmd="scripts/land"
@@ -323,6 +352,73 @@ if [ -z "$pr_body" ]; then
   else git log --reverse --no-merges --format='* %s%n%n%b' "$base..$branch" > "$pr_body"; fi \
     || die "could not read the commit messages on $branch"
 fi
+# The squash message keeps one trailer block, its last paragraph, so a Fails-before or Confirms trailer on
+# any commit but the last, or missing from a --body file, is added here. git-interpret-trailers(1) reads
+# the message (--no-divider: a `---` line in a description is markdown, not the end of a patch's message)
+# but does not write it, since it also normalises a last paragraph it reads as trailers, and a bare URL
+# line in an Evidence section is one (`https://x` would become `https: //x`). The missing lines go after
+# the last paragraph when every line of it is a `Key: value` trailer, else in a paragraph of their own.
+# Values already there are not repeated. The --body file itself is not changed.
+fb=$(git log --reverse --no-merges --format='%(trailers:key=Fails-before,valueonly,unfold)' "$base..$branch") \
+  || die "could not read the trailers of the commits on $branch"
+cf=$(git log --reverse --no-merges --format='%(trailers:key=Confirms,valueonly,unfold)' "$base..$branch") \
+  || die "could not read the trailers of the commits on $branch"
+have=$( { printf '%s\n\n' "$title"; cat "$pr_body"; } | git interpret-trailers --parse --no-divider \
+        | sed -n 's/^[Ff][Aa][Ii][Ll][Ss]-[Bb][Ee][Ff][Oo][Rr][Ee]: */Fails-before: /p; s/^[Cc][Oo][Nn][Ff][Ii][Rr][Mm][Ss]: */Confirms: /p') \
+  || die "git could not read the trailers of the squash message"
+missing=()
+while IFS= read -r line; do
+  case "$line" in "Fails-before: " | "Confirms: ") continue ;; esac
+  case $'\n'"$have"$'\n' in *$'\n'"$line"$'\n'*) continue ;; esac
+  missing+=("$line"); have="$have"$'\n'"$line"
+done < <(while IFS= read -r v; do [ -z "$v" ] || printf 'Fails-before: %s\n' "$v"; done <<<"$fb"
+         while IFS= read -r v; do [ -z "$v" ] || printf 'Confirms: %s\n' "$v"; done <<<"$cf")
+if [ ${#missing[@]} -gt 0 ]; then
+  text=$(cat "$pr_body") || die "could not read $pr_body"
+  last=$(awk 'BEGIN { RS = "" } { p = $0 } END { print p }' <<<"$text")
+  {
+    if [ -z "${text//[[:space:]]/}" ]; then :
+    elif [ -n "$last" ] && [ "$(grep -cvE '^[A-Za-z0-9-]+:[[:space:]]' <<<"$last")" = 0 ]; then printf '%s\n' "$text"
+    else printf '%s\n\n' "$text"; fi
+    printf '%s\n' "${missing[@]}"
+  } > "$tmpd/body.marked" || die "could not write the squash message"
+  mv "$tmpd/body.marked" "$tmpd/body" || die "could not write the squash message"
+  pr_body="$tmpd/body"
+fi
+# fix_marks: the warnings about the fix marker, on what the squash commit will say. Warnings only.
+fix_marks() {
+  local msg trailers named v file fn src classes cls
+  msg=$(printf '%s\n\n' "$title"; cat "$pr_body")
+  trailers=$(printf '%s\n' "$msg" | git interpret-trailers --parse --no-divider)
+  named=$(printf '%s\n' "$trailers" | sed -n 's/^[Ff][Aa][Ii][Ll][Ss]-[Bb][Ee][Ff][Oo][Rr][Ee]: *//p')
+  # grep reads to the end of its input (no -q), as scripts/test-canon asks of every pipe under pipefail
+  if [ ${#trading[@]} -gt 0 ] && [ -z "$named" ]; then
+    if [ "$(printf '%s\n' "$trailers" | grep -ci '^Confirms:')" -gt 0 ] \
+       || [ "$(printf '%s\n' "$msg" | grep -ciwE 'fix|fixes|fixing|finding|findings|defect|defects')" -gt 0 ]; then
+      echo "land: warning: this change touches the trading path (${trading[0]}$([ ${#trading[@]} -le 1 ] || echo " and $((${#trading[@]} - 1)) more")) and its message says it fixes a finding, but it carries no Fails-before trailer naming the test that failed before the fix (ADR 0073)"
+    fi
+  fi
+  while IFS= read -r v; do
+    [ -n "$v" ] || continue
+    file=${v%%::*}; fn=${v##*::}; fn=${fn%%\[*}; classes=${v#*::}; classes=${classes%"${v##*::}"}
+    if [ "$file" = "$v" ] || ! [[ "$fn" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] \
+       || ! [[ "$classes" =~ ^([A-Za-z_][A-Za-z0-9_]*::)*$ ]]; then
+      echo "land: warning: Fails-before: $v is not in the form <test file>::<test function>"
+    elif ! src=$(git show "$branch:$file" 2>/dev/null); then
+      echo "land: warning: Fails-before names $v, but $file is not in the tree"
+    elif [ "$(grep -cE "^[[:space:]]*(async[[:space:]]+)?def[[:space:]]+${fn}[[:space:]]*[(]" <<<"$src")" = 0 ]; then
+      echo "land: warning: Fails-before names $v, but $file defines no $fn"
+    else
+      while [ -n "$classes" ]; do
+        cls=${classes%%::*}; classes=${classes#*::}
+        if [ "$(grep -cE "^[[:space:]]*class[[:space:]]+${cls}[[:space:]]*[(:]" <<<"$src")" = 0 ]; then
+          echo "land: warning: Fails-before names $v, but $file defines no class $cls"; break
+        fi
+      done
+    fi
+  done <<<"$named"
+}
+fix_marks
 # A public repository shows everything pushed, and every piece of text this script posts, so nothing goes
 # out that carries a personal address (ADR 0014).
 review_note="${REVIEWED:-${review_default:-}}"
