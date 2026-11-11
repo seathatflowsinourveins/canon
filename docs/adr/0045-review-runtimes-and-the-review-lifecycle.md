@@ -190,6 +190,18 @@ Read 2026-11-10. `fetched`: downloaded and searched. "Lane": a model summarised 
   `memento` row"; `enabled` "Master switch"; `memory_recall` "recent session-history matches"; store at
   `$DSH_HOME/dsh-memento/memory.db` (read). `dsh --profile dsh-tui --dump-config` on a copy of the
   profile, after `scripts/bootstrap`'s merge: both rows composed with `enabled: false` (run).
+* Newer tags, read 2026-11-10, held: https://github.com/ccch1mneyyy/dsh-TUI/releases/tag/v0.19.0
+  (2026-11-06) — validated against DSH `0.2.2-rc.1`, `0.2.1-rc.3` still in its contract; `/update` now
+  also moves the global dsh engine (`DSH_TUI_UPDATE_ENGINE=0` pins it); DSH 0.2.2 needs Node `>=24.9`
+  (`gh`). Its `docs/configuration.en.md` at `v0.19.0` against `v0.17.0`: the user patch section unchanged;
+  the diff adds environment variables and moves two DSH version labels (fetched, diffed).
+  https://github.com/deepseek-ai/deepseek-harness/releases/tag/dsh-v0.2.2-rc.1 (2026-11-04) — Cordis Core
+  4.1, plugin tool APIs to migrate, Node 24.9 minimum (`gh`); its session-log README keeps `enabled`
+  (`false` stops upload), adds plugin upload exclusions, and puts Auto review calls under the same upload
+  eligibility (fetched, diffed against `dsh-v0.2.1-rc.3`).
+  Whether the nine profile packages load on 0.2.2 is UNVERIFIED. Both pins move together, after the
+  owner upgrades both and `scripts/bootstrap --check` still shows the review patch ok; look again
+  2026-11-13.
 * The DSH retry's report and its brief (read; not in this repository); `evals/review/cases/order-modify.toml`
   (read); the session folder and memento's audit row for the retry (read by the second reader).
 * https://github.com/stablyai/orca/issues/38131, /26594 — open; "30 s submit retry budget", `git` fails in
