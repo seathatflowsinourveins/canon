@@ -1,7 +1,7 @@
 ---
-status: proposed
+status: accepted
 date: 2026-11-10
-decision-makers: master orchestrator (Claude); repo owner ratifies
+decision-makers: master orchestrator (Claude), under the owner's delegation of 2026-11-10
 review-by: 2026-12-10
 ---
 
@@ -36,8 +36,9 @@ and what does each study leave behind?
 ## Decision Outcome
 
 Chosen for now: **option 1**, named for what it is, with upstream's reports and tearsheet saved for each
-study. The choice of costs to read a future study against stays `proposed` for the owner. Upstream is
-silent on it. What each option would change in the step 7 result (ADR 0052: the pick, SPY 5/20, DSR
+study. The choice of costs to read a future study against stays open: a later record decides it before
+the first study that needs costs. Upstream is silent on it. What each option would change in the step 7
+result (ADR 0052: the pick, SPY 5/20, DSR
 0.9338, rejected at 0.95; 100 shares a trade, ADR 0048):
 
 * **1** produced it. It is not paper. Paper fills a limit order only when it is marketable, fills at the
@@ -52,9 +53,15 @@ silent on it. What each option would change in the step 7 result (ADR 0052: the 
   book (`get_orderbook_for_fill_simulation`) or a 0.01 tick, and a 0.01 tick changes the instrument
   definition and so every data digest (ADR 0053). NautilusTrader v2.0.0rc9 notes "Fixed L1 slippage
   exceeding limit and protection prices (#5612)", so a slippage choice is made at the pin it runs on.
-* **3**: the rates are in Alpaca's fee schedule, which was not read (UNVERIFIED), so the size of the
-  effect is UNVERIFIED. Alpaca accrues fees through the day and charges the total at day's end, rounded
-  up to the cent. A per-fill model cannot reproduce that rounding. Upstream's `MakerTakerFeeModel`
+* **3**: Alpaca's own rates are in its fee schedule, which could not be read (UNVERIFIED), and its fees
+  page lists TAF and CAT for equities, not the SEC's Section 31 fee. The regulators' 2026 rates, as a
+  scout's summary gave them and UNVERIFIED here: the SEC fee about 0.2 basis points of a sale ($20.60 a
+  million), FINRA's TAF $0.000195 a share, or $0.00 from 2026-10-01 to 2026-12-31 by FINRA's billing
+  FAQ; CAT's rate unknown. On a 100-share SPY sale at about $750 the SEC fee alone would be $1.55
+  rounded, if Alpaca passes it on; TAF alone about $0.02 or nothing. Either way it is small against
+  the study's per-session moves, but not zero. Alpaca accrues fees through
+  the day and charges the total at day's end, rounded up to the cent. A per-fill model cannot reproduce
+  that rounding. Upstream's `MakerTakerFeeModel`
   (notional), `FixedFeeModel` (per fill) and `PerContractFeeModel` (per unit) charge both sides, and
   TAF is sells only, so a custom `FeeModel` would be needed. Fees can only lower a trial's mean; the DSR
   also moves with the trials' variance, so whether the rejection stays one is UNVERIFIED.
@@ -92,7 +99,7 @@ and `ledger.py`, which are gate modules, and this record does not make that chan
 ### Consequences
 
 * Good: a result names the venue it is read against, and a study leaves the evidence a reader can check.
-* Bad: until the owner chooses, no result here says anything about costs, and a study's local output
+* Bad: until that record, no result here says anything about costs, and a study's local output
   grows by about 5 MB a trial.
 
 ### Confirmation
@@ -111,6 +118,11 @@ one model each:
 
 The probe scripts were kept outside the repository. Nothing in `scripts/ci` checks this record yet; the
 change that saves the reports brings a test that a study's directory holds them.
+
+Rules for the first study on quotes (ADR 0066), written into its pre-registration:
+
+* It names its venue explicitly, since with quotes in the catalog a market order can pay the spread.
+* Any fill, fee or latency model it chooses enters `ledger.trial_config` first, which is gate code.
 
 ## Evidence
 
@@ -135,6 +147,11 @@ Read 2026-11-10. Fetched means read as raw text at the pin; run means executed h
 * https://docs.alpaca.markets/us/docs/regulatory-fees.md: TAF on sells and CAT on both for equities;
   accrued intraday, charged at day's end, rounded up to the cent; rates "refer to our brokerage fee
   schedule" at https://alpaca.markets/disclosures (not fetched, UNVERIFIED). Fetched.
+* Fee rates, fetched 2026-11-10 by a research scout through a summarising fetcher and not re-read here:
+  the SEC's fee rate advisory 2026-2 ($20.60 per million of covered sales from 2026-04-04); FINRA's
+  fee-adjustment schedule (TAF $0.000195 a share for 2026, capped at $9.79 a trade) and its billing FAQ
+  (TAF $0.00 for 2026-10-01 to 2026-12-31), which disagree; Alpaca's fee schedule PDF, whose text could
+  not be extracted, so Alpaca's pass-through is UNVERIFIED.
 * `canon_trading.ledger.trial_config`, `canon_trading.backtest` (`simulated_alpaca_venue`,
   `run_backtest_config`), `canon_trading.ma_cross`, `canon_trading.variant_study` (`TRADE_SIZE` 100),
   read; the offline runs under Confirmation. Run.
@@ -144,3 +161,5 @@ Read 2026-11-10. Fetched means read as raw text at the pin; run means executed h
   and `PerContractFeeModel`, a cent of slippage by a custom book, the two slippage settings, the last
   latency fill, rc9's slippage fix; on its second read, bid and ask bars, quotes as closer to paper and
   not paper, and latency's settlement bar.
+* Accepted 2026-11-10 by the master orchestrator under the owner's delegation of 2026-11-10, as it
+  stands; the choice of costs to read a future study against stays open.

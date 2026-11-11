@@ -1,7 +1,7 @@
 ---
-status: proposed
+status: accepted
 date: 2026-11-10
-decision-makers: master orchestrator (Claude); repo owner ratifies
+decision-makers: master orchestrator (Claude), under the owner's delegation of 2026-11-10
 review-by: 2026-12-10
 ---
 
@@ -30,7 +30,7 @@ the paper pair, how large is a load, which feed may a load use, and by what path
 
 ## Decision Outcome
 
-Proposed: **option 1, on IEX only, over a window of weeks to a quarter of 2025 or later**. It is ADR
+Chosen: **option 1, on IEX only, over a window of weeks to a quarter of 2025 or later**. It is ADR
 0040's path for bars and keeps its conventions (window, coverage, re-runs). The catalog guide's rules
 apply as written: a request with a record limit or a source `schema` is refused for write-back, and a
 request split across several source envelopes skips it. So the hook answers each request with one
@@ -39,15 +39,36 @@ response, and a load is a run of requests an hour long at most, not one request:
 0.74 M quotes an hour over the regular session of 2026-11-06 (the busiest hour unmeasured; memory
 UNVERIFIED). The key pair reaches a process only through `mise run paper:test` or `paper:session` (ADR
 0029, ADR 0044), and `paper:test` holds the paper lock with a deadline of 7,140 s, less its wait for the
-lock, up to 3,900 s. So a load runs in pieces under that task: about two weeks of 2025 or one week of
-2026 for both symbols, each inside the deadline at the probe's page rate (41 and 31 minutes against
+lock, up to 3,900 s. Under that task a load would run in pieces (condition 2 below says it does not,
+while windows run): about two weeks of 2025 or one week of 2026 for both symbols, each inside the
+deadline at the probe's page rate (41 and 31 minutes against
 54; parsing, writing and start-up unmeasured). Each piece asks only for what the catalog
 does not cover. An empty hour (night, weekend) may record no coverage (ADR 0040 saw an empty bars
 response write nothing), so it is asked for again, at one call each. Whether a piece stopped at the
-deadline by SIGKILL leaves a partial Parquet file is UNVERIFIED. A task of its own is a later change. That write-back works
-for quotes at the pin is UNVERIFIED until that code runs. ADR 0040 observed that an empty bars response
+deadline by SIGKILL leaves a partial Parquet file is UNVERIFIED. Condition 2 below says where the bulk
+load runs. That write-back works for quotes at the pin is UNVERIFIED until that code runs. ADR 0040
+observed that an empty bars response
 wrote nothing, though the guide says it can record known-empty coverage. Option 2 would need ADR 0040's
 reasons against it answered again. Option 3 stays open if the owner finds the load too large.
+
+**Conditions of acceptance** (accepted 2026-11-10, below):
+
+1. First, the hook and one small write-back on paper: a few minutes of SPY quotes on IEX, one request.
+   It settles the three UNVERIFIED points the rest rests on: whether write-back works for quotes at the
+   pin, what an empty response records, and what a request stopped in mid-write leaves in the catalog.
+2. The bulk load does not run under `paper:test` once session windows run around the clock, since a
+   window that fires during a piece fails. It waits for whichever comes first: a task for REST data
+   reads only, decided in its own record first since it would be a third path for the key pair, at a
+   rate that leaves room for the windows' own data calls, with whether the 200 a minute is shared
+   measured first; or a weekend window checked first to be idle, since whether Alpaca's clock is
+   closed all weekend is UNVERIFIED (ADR 0050), the overnight session opens on Sunday evening, and
+   another lane's paper run may take the lock at any hour.
+3. The first study on quotes takes the small end: about a month of 2025 for SPY and QQQ, about 110 M
+   quotes and under a gigabyte in the catalog. It is pre-registered in its own record before any
+   trial, with its own N; a study that repeats an earlier one's configurations says so and counts them,
+   and a re-run on a moved sample stays in its study.
+4. A result on IEX quotes is read as ADR 0067 reads it: closer to paper, not paper; IEX is about 2.5% of
+   volume and its best bid and ask are not the NBBO; SPY's IEX quotes are thin before 2022.
 
 **What the paper pair is served** (probe, Confirmation). The first quote is 2020-07-27 for SPY and
 2020-07-28 for QQQ on `iex`, 2016-01-04 for both on `sip`, and 2024-09-16 on `boats`. `otc` was refused
@@ -71,8 +92,9 @@ and starts in September 2024, so it does not serve a regular-session study. It, 
 docs' gate on SIP is unsettled, not shown to be wrong.
 
 **Size, on IEX** (probe; one counted November day a year, so each figure is an order of magnitude: three
-SPY days of one 2026 week ranged 2.31 M to 4.86 M). A day's quotes for SPY and QQQ: 2022 0.79 M and 0.82 M; 2023 1.76 M and 1.94 M; 2024
-0.68 M and 0.95 M; 2025 2.22 M and 3.03 M; the 2026 days counted, 6.7 M to 8.9 M for the two, so a
+SPY days of one 2026 week ranged 2.31 M to 4.86 M). A day's quotes for SPY and QQQ: 2022 0.79 M and
+0.82 M; 2023 1.76 M and 1.94 M; 2024 0.68 M and 0.95 M; 2025 2.22 M and 3.03 M; the 2026 days counted,
+6.7 M to 8.9 M for the two, so a
 2026 window is larger than the rows below. A page holds at most 10,000 quotes. A quote is about 133
 bytes of JSON (the parsed page serialised again, not the bytes on the wire), and 8 bytes in the
 catalog's Parquet (one page, written by `write_quote_ticks`). For both symbols, at 250 sessions a year:
@@ -88,18 +110,17 @@ The probe took 0.47 s a page, its own 0.31 s spacing included. A loader under 20
 every 0.3 s at best, so the hours above are the floor; at the probe's pace, 2025 would take 17 h and the
 full sample 43 h. Whether other paper runs' data calls share that budget while a load runs, and whether
 the Trading API's 200 a minute is separate, is UNVERIFIED: the plan page gives only "Historical API
-calls 200 / min". On IEX the
-bar study's sample is not usable for SPY before 2022, being served but sparse, and would take more than
-a day. So the
-pre-registration of a quote study picks a window of weeks to a quarter from 2025 on, and loads it before
-any trial runs.
+calls 200 / min". On IEX the bar study's sample is not usable for SPY before 2022, being served but
+sparse, and would take more than a day. So the pre-registration of a quote study picks a window of
+weeks to a quarter from 2025 on, and loads it before any trial runs (condition 3).
 
 ### Consequences
 
 * Good: the shipped `EmaCross` can run on the quotes it subscribes to, over the path the bars take.
 * Bad: a quote study's sample is months, not years, and IEX is about 2.5% of volume (historical data
-  page). A load holds the paper lock for hours, in pieces. A session window (ADR 0050) waits at most
-  900 s for the lock, so a window that fires during a piece fails, placing nothing, and shows FAILED.
+  page). A load holds the key's data budget for hours. A session window (ADR 0050) waits at most 900 s
+  for the paper lock, so a load under `paper:test` would make a window that fires during a piece fail,
+  placing nothing, which is why condition 2 keeps the bulk load out of it.
 
 ### Confirmation
 
@@ -158,6 +179,8 @@ Read 2026-11-10. Fetched means read as raw text; run means executed here.
   `RESTClient.get`; `DataFeed`'s six members. Bundled.
 * ParquetDataCatalog at the pin: `write_quote_ticks` (installed docstring). Bundled.
 * The probes under Confirmation. Run.
+* Accepted 2026-11-10 by the master orchestrator under the owner's delegation of 2026-11-10, on the
+  four conditions under Decision Outcome.
 * Second reader, 2026-11-10 (`evidence-verifier`): the counts, first quotes, refusals and table hold
   against the logs; corrected above: the hook's class, write-back for quotes unverified and its catalog
   rules, the JSON byte measure, SPY (not QQQ) thin before 2022, `boats` documented for the free plan,
