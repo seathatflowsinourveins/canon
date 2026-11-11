@@ -1097,6 +1097,7 @@ do_status() {
                elif $b.state == "at the boundary" then "its round at the boundary runs"
                elif $b.state == "timed out" then "FAILED: the boundary waiter timed out at " + ($b.at // "?") + ": " + ($b.why // "")
                elif $b.state == "failed" then "FAILED: the boundary waiter at " + ($b.at // "?") + ": " + ($b.why // "")
+               elif $b.state == "missed" then "at " + ($b.at // "?") + " " + ($b.why // "")
                else "" end) as $w
             | (.pins // []) as $p | ($p | map(select(test(": at ") | not))) as $pc
             | (if (.failed | length) > 0 or $lost or $overdue or ($w | startswith("FAILED")) then "FAILED" elif ($m * 60) > $silent then "STALE"

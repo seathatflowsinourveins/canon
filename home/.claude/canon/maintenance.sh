@@ -28,14 +28,16 @@
 # A window runs from the paper runner's own clone (ADR 0050), so its lock defers only what that window
 # depends on: the paper section of `scripts/automation install` (the runner, its plist and the clone the
 # runner makes anew at each firing), which the round's install then skips (`install --defer-paper`). The
-# rest of the round runs at once: the fast-forward, the settings step, the other agents' install, the
-# updates and the pins. The deferred part waits for the session boundary, the moment the window's lock goes
+# rest of the round runs at once: the fast-forward, the settings step, the other agents' install and the
+# updates; a pin that differs waits too, the window running with mise and its global config. The deferred part waits for the session boundary, the moment the window's lock goes
 # free: the session map ends each run at its session's end by Alpaca's clock and calendar, which this agent
 # cannot read itself, since it reads no secret. A round that defers starts one detached waiter (its own
 # process group, as the reinstall below), which holds <config>/canon/watch/maintenance-boundary.lock, so a
 # second is never started beside it, waits on the windows' lock for at most BOUNDARY_SECS (lockf(1) -t),
-# and once it holds it runs a round with it held (CANON_MAINTENANCE_AT_BOUNDARY=1), which installs the
-# whole, paper section included; or it records that it timed out. It writes maintenance-boundary.json.
+# and once it holds it, and the clone's own lock has gone free too, runs a round with it held
+# (CANON_MAINTENANCE_AT_BOUNDARY=1), which installs the whole, paper section included, and moves the pins;
+# or it records that it timed out. It writes maintenance-boundary.json, which also says when the boundary's
+# round ended before its install.
 # Without a window, the round holds all three for (a) and the windows' lock alone for the install, which
 # reloads the paper agent and touches nothing else they use. The daily updates, the compare, the settings
 # step and the pins touch none of them and run with them let go. A scheduled window waits 900 s for its lock
@@ -151,7 +153,10 @@ if [ "$AT_BOUNDARY" = 1 ]; then
     log "at the boundary: an earlier round still ran after $BOUNDARY_ROUND_SECS s; nothing this round"; exit 0
   fi
   log "round starts in $root, at the session boundary: the windows' lock is held for this round"
-  trap 'boundary_put ran "the round at the boundary ran; its record is maintenance-status.json"' EXIT
+  # it says whether its round installed what waited: one that ended first (a paper test's lock held, the
+  # checkout off main) leaves it to the next round that finds a window, which arms a waiter again
+  trap 'if [ "$DEFER" = clear ]; then boundary_put ran "the round at the boundary ran; its record is maintenance-status.json"
+        else boundary_put missed "the round at the boundary ended $OUTCOME before its install; the next round that finds a window waits again"; fi' EXIT
 elif ! /usr/bin/lockf -t 0 7 2>/dev/null; then log "an earlier round, or the reinstall it started, still runs; nothing this round"; exit 0
 else log "round starts in $root"; fi
 # the paper locks are in the per-user temporary folder, where mise.toml's paper tasks lock them on a descriptor
@@ -298,7 +303,9 @@ else
   log "(b) skipped: the checkout is not at origin/main, so its tree is not main's"
 fi
 
-# (d) the exact pins main's registry records, at origin/main only, with the locks let go; not at the boundary
+# (d) the exact pins main's registry records, at origin/main only, with the locks let go. While a window runs
+# none moves (its mise and mise's global config are in use): each that differs waits for the session
+# boundary, whose round moves it with the windows' lock held (PINWAIT=1 arms the waiter)
 # pin_of <registry id> <tag prefix>: the version of the entry's track, tag:<prefix><version>; empty if none
 pin_of() {
   jq -r --arg id "$1" '.upstreams[]? | select(.id == $id) | .track // empty' "$root/canon/upstreams.json" 2>/dev/null \
@@ -316,11 +323,17 @@ global_at() {
     | if ($a | map(select(.installed and (.requested_version // .version) == $v)) | length) > 0 then "at"
       elif ($a | length) == 0 then "absent" else ($a | map(.requested_version // .version) | join(", ")) end' <<<"$j" 2>/dev/null
 }
-if [ "$at_main" = 1 ] && [ "$AT_BOUNDARY" != 1 ]; then
+PINWAIT=0 PW=0
+if [ "$at_main" = 1 ]; then
   log "(d) exact pins: mise and its global tools to main's registry"
+  # a window now, read afresh (the round let the locks go for the updates); at the boundary the round holds its lock
+  if [ "$AT_BOUNDARY" != 1 ] && ! /usr/bin/lockf -k -t 0 "${tmp}canon-paper-windows.lock" true 2>/dev/null; then
+    PW=1; log "(d) a window runs: a pin that differs waits for the session boundary"
+  fi
   v=$(pin_of mise v)
   if [ -z "$v" ]; then pin_fail "mise: main's registry gives no tag:v<version> for it"
   elif cur=$(mise_version) && [ "$cur" = "$v" ]; then add PINRES "mise: at $v"
+  elif [ "$PW" = 1 ]; then add PINRES "mise: ${cur:-no version} -> $v at the session boundary"; PINWAIT=1
   else
     o=$(cd "$HOME" && bounded "$UPDATE_SECS" "$mise" self-update --yes --no-plugins "$v" 2>&1); rc=$?
     printf '%s\n' "$o" | sed 's/^/  /'
@@ -337,7 +350,7 @@ if [ "$at_main" = 1 ] && [ "$AT_BOUNDARY" != 1 ]; then
     case "$cur" in
       at) add PINRES "$tool: at $v" ;;
       absent) add PINRES "$tool: not in mise's global config; left alone" ;;
-      *)
+      *) if [ "$PW" = 1 ]; then add PINRES "$tool: $cur -> $v at the session boundary"; PINWAIT=1; continue; fi
         o=$(cd "$HOME" && bounded "$UPDATE_SECS" "$mise" use --global --yes "$tool@$v" 2>&1); rc=$?
         printf '%s\n' "$o" | sed 's/^/  /'
         if timed_out "$rc"; then pin_fail "$tool: mise use $tool@$v did not finish within $UPDATE_SECS s"
@@ -348,7 +361,37 @@ if [ "$at_main" = 1 ] && [ "$AT_BOUNDARY" != 1 ]; then
   done
 fi
 
+# arm_waiter <what>: one detached waiter for the session boundary, never two (it holds the boundary lock
+# for as long as it lives). It waits for the windows' lock at most BOUNDARY_SECS; once it holds it, it waits
+# for the clone's own lock too (the runner holds it on its way out, after the task has let the windows' lock
+# go), lets that one go, and runs a round with the windows' lock held
+arm_waiter() {
+  if ! exec 5>>"$w/maintenance-boundary.lock"; then add FAILED "boundary waiter: cannot open $w/maintenance-boundary.lock"; OUTCOME=failed; return; fi
+  if ! /usr/bin/lockf -t 0 5 2>/dev/null; then exec 5>&-; log "a boundary waiter is already waiting; none added"; return; fi
+  boundary_put waiting
+  set -m
+  (
+    set +m
+    exec 6>&- 7>&- 8>&- 9>&- < /dev/null
+    if ! exec 9>>"${tmp}canon-paper-windows.lock"; then boundary_put failed "cannot open ${tmp}canon-paper-windows.lock"; exit 1; fi
+    if /usr/bin/lockf -t "$BOUNDARY_SECS" 9 2>/dev/null; then
+      if exec 4>>"$base/paper-checkout.lock" && ! /usr/bin/lockf -t "$BOUNDARY_ROUND_SECS" 4 2>/dev/null; then
+        log "boundary: the clone's lock was still held after $BOUNDARY_ROUND_SECS s; the round runs, and install leaves the clone as it is"
+      fi
+      exec 4>&-
+      boundary_put "at the boundary"
+      log "boundary: the windows' lock is free; a round runs the deferred part with it held"
+      CANON_MAINTENANCE_AT_BOUNDARY=1 exec /bin/bash "$0" "$root" "$mise"
+    fi
+    boundary_put "timed out" "the windows' lock stayed held for $BOUNDARY_SECS s"
+    log "boundary: FAILED: the windows' lock stayed held for $BOUNDARY_SECS s; the next round that finds a window waits again"
+  ) &
+  set +m
+  exec 5>&-
+  log "deferred to the session boundary: $1; a waiter waits for the windows' lock as process $!"
+}
 [ "$FAILED" = '[]' ] || OUTCOME=failed
+[ "$PINWAIT" != 1 ] || arm_waiter "the pins that differ"
 if [ "$auto" != 1 ]; then
   [ "$compared" != 1 ] || { TRIED=null; DEFER=clear; }
   record; log "round ends: $OUTCOME"; exit 0
@@ -368,28 +411,7 @@ if [ "$WINDOW" = 1 ]; then
   else
     DEFER="set"
     NOTE="${NOTE:+$NOTE; }deferred to the session boundary: the paper checkout"
-    # one waiter at a time: it holds the boundary lock for as long as it lives
-    if ! exec 5>>"$w/maintenance-boundary.lock"; then add FAILED "boundary waiter: cannot open $w/maintenance-boundary.lock"; OUTCOME=failed
-    elif ! /usr/bin/lockf -t 0 5 2>/dev/null; then exec 5>&-; log "a boundary waiter is already waiting; none added"
-    else
-      boundary_put waiting
-      set -m
-      (
-        set +m
-        exec 6>&- 7>&- 8>&- 9>&- < /dev/null
-        if ! exec 9>>"${tmp}canon-paper-windows.lock"; then boundary_put failed "cannot open ${tmp}canon-paper-windows.lock"; exit 1; fi
-        if /usr/bin/lockf -t "$BOUNDARY_SECS" 9 2>/dev/null; then
-          boundary_put "at the boundary"
-          log "boundary: the windows' lock is free; a round runs the deferred part with it held"
-          CANON_MAINTENANCE_AT_BOUNDARY=1 exec /bin/bash "$0" "$root" "$mise"
-        fi
-        boundary_put "timed out" "the windows' lock stayed held for $BOUNDARY_SECS s"
-        log "boundary: FAILED: the windows' lock stayed held for $BOUNDARY_SECS s; the next round that finds a window waits again"
-      ) &
-      set +m
-      exec 5>&-
-      log "deferred to the session boundary: the paper checkout; a waiter waits for the windows' lock as process $!"
-    fi
+    arm_waiter "the paper checkout"
   fi
   if [ "$autof" = '[]' ]; then record; log "round ends: $OUTCOME (the paper checkout deferred to the session boundary)"; exit 0; fi
 else

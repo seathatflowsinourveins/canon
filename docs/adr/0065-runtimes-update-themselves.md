@@ -205,17 +205,19 @@ machine follow main by itself. Once a session's run is in progress through every
 have stopped the agent from Sunday evening to Friday evening. So a held windows' lock now defers only
 what a running window depends on: the paper section of `scripts/automation install`, which covers the
 runner, its plist, its agent and the clone the runner makes anew at each firing. The rest of the round
-runs at once: the fast-forward, the settings step, `install --defer-paper` for the other agents, the
-updates and the pins below. A paper test's lock, or the stream's held with no window running, still ends
+runs at once: the fast-forward, the settings step, `install --defer-paper` for the other agents and the
+updates. A pin below that differs waits as well, since the window runs with mise and its global config. A paper test's lock, or the stream's held with no window running, still ends
 the round, since those runs may run from the main checkout. The deferred part waits for the session
 boundary, the moment the window's lock goes free. Alpaca's clock and calendar end each run at its
 session's end, but this agent reads no secret and cannot read them itself. A round that defers starts
 one detached waiter, which holds its own lock so a second is never added. The waiter waits on the
-windows' lock (lockf(1) `-t`) for at most nine hours: the overnight session's eight and one more. With
-that lock held, it runs a round that installs the whole and lets the lock go when the install ends, so
+windows' lock (lockf(1) `-t`) for at most nine hours: the overnight session's eight and one more. It
+then waits up to five minutes for the clone's own lock, which the runner holds on its way out. With
+the windows' lock held, it runs a round that installs the whole, moves the pins, and lets the lock go when the install ends, so
 the next session's run starts from the clone its runner makes then. The status row reads "deferred to
 the session boundary: the paper checkout". It reads FAILED once the deferral is older than nine hours,
-or when the waiter timed out or stopped reporting. **(d) The exact pins.** At origin/main, each round
+or when the waiter timed out or stopped reporting. A boundary round that ended before its install, on a
+paper test's lock for one, says so, and the next round that finds a window waits again. **(d) The exact pins.** At origin/main, each round
 also brings mise (`mise self-update --yes --no-plugins <version>`) and the tools in mise's global config
 with an exact registry pin (codex, pnpm, DeepSeek Harness, dsh-tui) to the versions
 `canon/upstreams.json` records (`mise use --global --yes <tool>@<version>`). A tool already at its pin
@@ -226,10 +228,11 @@ the scheduled one. Confirmed offline by `scripts/test-maintenance` with the stan
 * a held windows' lock still moves the main checkout and installs the rest;
 * a second round adds no second waiter;
 * the waiter's round installs the whole once the lock frees, and a waiter past its bound is named;
-* a pin that moved is applied, one already met changes nothing, and a failed update is FAILED by name.
+* a pin that moved is applied, one already met changes nothing, and a failed update is FAILED by name;
+* a pin that moved while a window runs waits for the boundary's round, which applies it.
 
-UNVERIFIED until it runs here: that `mise self-update` replaces the binary while a window's mise runs
-from it without disturbing that window.
+UNVERIFIED until it runs here: `mise self-update` and `mise use --global` against the real mise, at the
+boundary's round.
 
 ## Evidence
 
@@ -280,4 +283,11 @@ Read 2026-11-10. `fetched`: downloaded and searched here; `run`: a command run h
     `--json`; `mise ls -g --json codex` printed an array with `requested_version` and `installed` (run).
   * session_window.py `OVERNIGHT_STARTS` (20:00) and the overnight session's end at 04:00 New York,
     which the nine-hour bound follows (read).
+  * `mise ls --global --json <tool>` for a tool the global config does not name printed `[]` and
+    exited 0 (mise 2026.11.6, run); `mise doctor` says `self_update_available: yes` here (run).
+  * home/.claude/canon/paper-session.sh (read): the runner holds `<checkout>.lock` on descriptor 8 and
+    `exec`s the task, so the clone's lock is let go only when the run's last process has ended.
   * `scripts/test-maintenance` (run).
+  * 2026-11-11, corrected after a code review of the change: the first text moved the pins while a
+    window ran, its waiter did not wait for the clone's lock, and a boundary round that ended before its
+    install read as having run. The text above says what changed.
