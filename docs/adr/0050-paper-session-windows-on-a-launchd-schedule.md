@@ -155,6 +155,8 @@ Mac, and a run that skips them says so last and as a warning annotation. flock(1
 
 Read 2026-11-10. "raw": fetched with `curl` and read whole.
 
+* ADR 0069, 2026-11-10: a second paper account, B, for the windows; the schedule moves to it once
+  `paper:session` reads B's pair. Until then this record stands as written.
 * https://nautilustrader.io/docs/md/latest/how_to/configure_live_trading.md: "run nodes as standalone
   Python scripts or services"; "One LiveNode per process" (fetched, raw).
 * `scripts/automation` and ADR 0011: the launchd agent, its install, status and uninstall (read).

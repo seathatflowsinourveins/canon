@@ -9,7 +9,7 @@
 # osascript, mise, xcode-select, curl and claude, so nothing outside the temp folder is read or changed and
 # nothing reaches the network. The --install case for a missing CLI drops the claude stub from PATH and uses
 # a curl stub that serves an installer stub recording the version it was asked for. A case that needs a macOS-only tool is skipped with a line saying so.
-# One exception: the paper:store case writes to the real login keychain, under a throwaway service only, and
+# One exception: the paper:store case writes to the real login keychain, under throwaway services only, and
 # deletes what it wrote on exit (ADR 0033).
 # Exit 0 if every case behaves as expected, 1 otherwise.
 # shellcheck disable=SC2016  # stub bodies and eval'd checks are single-quoted so they expand when they run
@@ -145,18 +145,20 @@ printf '#!/bin/bash\n[ "${1:-}" = -p ] && echo /Library/Developer/CommandLineToo
 printf '#!/bin/bash\n[ "${1:-}" = --version ] && { echo "curl stub"; exit 0; }\necho "curl stub: no network in tests" >&2\nexit 1\n' > "$B/curl"
 printf '#!/bin/bash\ncat "$STUB/claude-version"\n' > "$B/claude"   # claude stub: --version from $STUB/claude-version
 # security stub: logs its arguments; find-generic-password succeeds for an account listed in $STUB/keychain,
-# else exits 44 as Apple's does for an absent item. It never holds a value.
+# under any service, or listed as <service>/<account> under that one; else it exits 44 as Apple's does for an
+# absent item. It never holds a value.
 cat > "$B/security" <<'EOF'
 #!/bin/bash
 echo "security $*" >> "$STUB/security.log"
 [ "${1:-}" = find-generic-password ] || exit 1
-acct=""; while [ $# -gt 0 ]; do [ "$1" = -a ] && acct="$2"; shift; done
-grep -qxF "$acct" "$STUB/keychain" 2>/dev/null || exit 44
+acct=""; svc=""; while [ $# -gt 0 ]; do [ "$1" = -a ] && acct="$2"; [ "$1" = -s ] && svc="$2"; shift; done
+grep -qxF -e "$acct" -e "$svc/$acct" "$STUB/keychain" 2>/dev/null || exit 44
 echo 'keychain: "stub"'
 EOF
 chmod +x "$B"/*
 export STUB="$TMP/stub"; mkdir -p "$STUB"
 export PATH="$B:$PATH"
+unset usage_account
 REAL_HOME="$HOME"   # the paper:store case needs the user's own login keychain, which security finds through HOME
 export HOME="$TMP/home"; mkdir -p "$HOME"
 # a session Orca starts carries DISABLE_AUTOUPDATER (Orca 1.4.255 sets it), which bootstrap's update row reads
@@ -1242,6 +1244,16 @@ check "paper key pair present: ok"                 rowis "$TMP/bs.out" "paper ke
 check "... and its absence does not change the exit status" test "$rc" = "$rc_present"
 check "paper row looks items up by service and account only, never -w or -g" \
       eval 'grep -q "find-generic-password -s canon-alpaca-paper -a ALPACA_SECRET_KEY\$" "$STUB/security.log" && ! grep -Eq " -(w|g)( |\$)" "$STUB/security.log"'
+# account B's row (ADR 0069): its own service, optional like A's, present or absent and never a value
+: > "$STUB/security.log"; printf 'canon-alpaca-paper/ALPACA_API_KEY\ncanon-alpaca-paper/ALPACA_SECRET_KEY\n' > "$STUB/keychain"; bs --check; rc_b=$?
+check "account A there, B absent: A's row ok, B's row absent, naming paper:store windows" \
+      eval 'rowis "$TMP/bs.out" "paper key pair" ok && rowis "$TMP/bs.out" "paper key pair \(windows\)" absent && grep -q "ALPACA_API_KEY ALPACA_SECRET_KEY; to enter the pair: mise run paper:store windows\$" "$TMP/bs.out"'
+check "... and B's absence does not change the exit status" test "$rc_b" = "$rc_present"
+printf 'canon-alpaca-paper-windows/ALPACA_API_KEY\ncanon-alpaca-paper-windows/ALPACA_SECRET_KEY\n' > "$STUB/keychain"; bs --check
+check "account B there, A absent: B's row ok, naming its service, A's row absent" \
+      eval 'rowis "$TMP/bs.out" "paper key pair \(windows\)" ok && grep -q "service canon-alpaca-paper-windows\$" "$TMP/bs.out" && rowis "$TMP/bs.out" "paper key pair" absent'
+check "... B's row looks its items up by its service and account only, never -w or -g" \
+      eval 'grep -q "find-generic-password -s canon-alpaca-paper-windows -a ALPACA_SECRET_KEY\$" "$STUB/security.log" && ! grep -Eq " -(w|g)( |\$)" "$STUB/security.log"'
 rm -f "$STUB/keychain"
 # a dsh-tui patch with its own memento row first and more than a pipe buffer (64 KB) after it: the conflict
 # is found however early it comes, which a pipe into grep -q under pipefail misses (its writer cut off)
@@ -1319,13 +1331,17 @@ gwpin=$(jq -r '.upstreams[] | select(.id == "omniroute") | .track' "$ROOT/canon/
 check "mise.gateway.toml installs omniroute at the registry's pin ($gwv, ${gwpin:-none})" \
       eval '[ -n "$gwv" ] && [ "tag:v$gwv" = "$gwpin" ] && grep -q "version = \"$gwv\"" "$ROOT/mise.gateway.lock"'
 check "... and a plain mise.toml installs no gateway" eval '! grep -q "omniroute" "$ROOT/mise.toml"'
-# every keychain service mise.toml's paper tasks name is the one the bootstrap row looks up (ADR 0029)
-# (timeout(1)'s own `-s KILL` names a signal, not a service)
-paper_names() { grep -vE 'timeout(\(1\))? -s ' "$ROOT/mise.toml" | grep -oE '(-s |svc=)[A-Za-z0-9"$_-]+' | sed -E 's/^(-s |svc=)//' | grep -vxF '"$svc"'; }
+# every keychain service mise.toml's paper tasks name is one the bootstrap rows look up, and both are named
+# (ADR 0029, ADR 0069) (timeout(1)'s own `-s KILL` names a signal, not a service)
+paper_names() { grep -vE 'timeout(\(1\))? -s ' "$ROOT/mise.toml" | grep -oE '(-s |svc=|other=)[A-Za-z0-9"$_-]+' | sed -E 's/^(-s |svc=|other=)//' | grep -vxF -e '"$svc"' -e '"$other"'; }
 # shellcheck disable=SC2034  # read by the eval'd check below
 psvc=$(sed -n 's/^PAPER_SERVICE="\([^"]*\)".*/\1/p' "$ROOT/scripts/bootstrap")
-check "mise.toml's paper tasks name only bootstrap's keychain service" \
-      eval '[ -n "$psvc" ] && [ "$(paper_names | wc -l | tr -d " ")" -ge 5 ] && [ -z "$(paper_names | grep -vxF "$psvc")" ]'
+# shellcheck disable=SC2034  # read by the eval'd check below
+psvcw=$(sed -n 's/^PAPER_SERVICE_WINDOWS="\([^"]*\)".*/\1/p' "$ROOT/scripts/bootstrap")
+# shellcheck disable=SC2034  # read by the eval'd check below
+pn=$(paper_names)
+check "mise.toml's paper tasks name only bootstrap's two keychain services, and each of them" \
+      eval '[ -n "$psvc" ] && [ "$psvcw" = canon-alpaca-paper-windows ] && [ "$(wc -l <<<"$pn" | tr -d " ")" -ge 5 ] && [ -z "$(grep -vxF -e "$psvc" -e "$psvcw" <<<"$pn")" ] && grep -qxF "$psvc" <<<"$pn" && grep -qxF "$psvcw" <<<"$pn"'
 
 # ---------- the per-user temporary folder, when getconf gives none ----------
 # The paper lock, the windows' records and status's reading of them are in the folder
@@ -1374,8 +1390,10 @@ fi
 
 # ---------- paper:check, paper:remove and paper:store's rollback, against a stand-in security ----------
 # Each task's own body from mise.toml, /usr/bin/security swapped for a stand-in that answers each verb and
-# account with the exit status in $KC/<find|delete|add>-<account> (44, Apple's errSecItemNotFound, by default;
-# ADR 0029 observed it for an absent item). No keychain is read or written. Claims of second readers (Codex,
+# account with the exit status in $KC/<verb>-<service>-<account>, else $KC/<verb>-<account> (44, Apple's
+# errSecItemNotFound, by default; ADR 0029 observed it for an absent item). The verbs are find, read (a find
+# with -w, which prints the made-up value in $KC/value-<service>-<account>), delete and add (security -i).
+# No keychain is read or written. Claims of second readers (Codex,
 # Antigravity): any exit but 0 read as an absent item, or as one removed, so a failed check or deletion said
 # nothing was wrong.
 echo "paper keychain tasks:"
@@ -1383,20 +1401,24 @@ export KC="$TMP/kc"; mkdir -p "$KC"
 cat > "$KC/security" <<'EOF'
 #!/bin/bash
 echo "security $*" >> "$KC/log"
+acct=""; svc=""; w=""
 case "${1:-}" in
   find-generic-password) v=find ;; delete-generic-password) v=delete ;;
-  -i) v=add; read -r _ _ acct _; cat > /dev/null; echo "security -i: add $acct" >> "$KC/log" ;;
+  -i) v=add; read -r _ _ acct _ svc _ lab _; cat > /dev/null; echo "security -i: add $acct to $svc as $lab" >> "$KC/log" ;;
   *) exit 1 ;;
 esac
-while [ $# -gt 0 ]; do [ "$1" = -a ] && acct="$2"; shift; done
-exit "$(cat "$KC/$v-${acct:-}" 2>/dev/null || echo 44)"
+while [ $# -gt 0 ]; do [ "$1" = -a ] && acct="$2"; [ "$1" = -s ] && svc="$2"; [ "$1" = -w ] && w=1; shift; done
+[ -z "$w" ] || v=read
+st=$(cat "$KC/$v-$svc-$acct" 2>/dev/null || cat "$KC/$v-$acct" 2>/dev/null || echo 44)
+[ "$v" != read ] || [ "$st" != 0 ] || cat "$KC/value-$svc-$acct" 2>/dev/null
+exit "$st"
 EOF
 chmod +x "$KC/security"
-kc_task() { # kc_task <task>: run its body with the stand-in security; output in $KC/out
+kc_task() { # kc_task <task> [account]: run its body with the stand-in security, as mise would with that account; output in $KC/out
   local body; body=$(awk -v q="'''" -v hdr="[tasks.\"$1\"]" '$0 == hdr {t=1; next} /^\[/ {t=0} t && $0 == "run = " q {b=1; next} b && $0 == q {exit} b' "$ROOT/mise.toml")
   body=${body//\/usr\/bin\/security/$KC/security}
   [[ "$body" == *"$KC/security"* ]] || { echo "no body" > "$KC/out"; return 99; }
-  bash -c "$body" > "$KC/out" 2>&1
+  if [ $# -ge 2 ]; then usage_account="$2" bash -c "$body" > "$KC/out" 2>&1; else bash -c "$body" > "$KC/out" 2>&1; fi
 }
 rm -f "$KC"/find-* "$KC"/delete-*; echo 0 > "$KC/find-ALPACA_API_KEY"; echo 36 > "$KC/find-ALPACA_SECRET_KEY"
 kc_task paper:check; rc=$?
@@ -1411,12 +1433,35 @@ check "paper:remove, a deletion security refuses (exit 36): said, the item kept,
       eval '[ "$rc" = 1 ] && grep -q "ALPACA_API_KEY: removed" "$KC/out" && grep -q "ALPACA_SECRET_KEY: could not be removed (security exit 36)" "$KC/out" && ! grep -q "was not there" "$KC/out"'
 echo 44 > "$KC/delete-ALPACA_SECRET_KEY"; kc_task paper:remove; rc=$?
 check "... one not there (44): said, exit 0"      eval '[ "$rc" = 0 ] && grep -q "ALPACA_SECRET_KEY: was not there" "$KC/out"'
+# The account argument (ADR 0069): `windows` acts on account B's service only, none or `tests` on A's only,
+# and any other name is refused before security is asked anything.
+WS=canon-alpaca-paper-windows
+rm -f "$KC"/find-* "$KC"/delete-* "$KC"/read-* "$KC"/value-*; echo 0 > "$KC/find-$WS-ALPACA_API_KEY"; echo 0 > "$KC/find-$WS-ALPACA_SECRET_KEY"
+: > "$KC/log"; kc_task paper:check windows; rc=$?
+check "paper:check windows, B's pair there and A's absent: exit 0, naming B's service, asking only about B's" \
+      eval '[ "$rc" = 0 ] && grep -q "service $WS:" "$KC/out" && [ "$(grep -c "^security find-generic-password -s $WS -a ALPACA_" "$KC/log")" = 2 ] && [ "$(wc -l < "$KC/log" | tr -d " ")" = 2 ]'
+for g in "" tests; do
+  : > "$KC/log"; if [ -n "$g" ]; then kc_task paper:check "$g"; else kc_task paper:check; fi; rc=$?
+  check "paper:check ${g:-with no account}: account A as before, its service only, exit 1 (absent)" \
+        eval '[ "$rc" = 1 ] && grep -q "service canon-alpaca-paper:" "$KC/out" && [ "$(grep -c "^security find-generic-password -s canon-alpaca-paper -a ALPACA_" "$KC/log")" = 2 ] && ! grep -q "$WS" "$KC/log"'
+done
+: > "$KC/log"; kc_task paper:check live; rc=$?
+check "paper:check live: refused, no security call, exit 3" eval '[ "$rc" = 3 ] && grep -q "no paper account named live" "$KC/out" && [ ! -s "$KC/log" ]'
+: > "$KC/log"; echo 0 > "$KC/delete-$WS-ALPACA_API_KEY"; kc_task paper:remove windows; rc=$?
+check "paper:remove windows: deletes B's two items only, never A's, exit 0" \
+      eval '[ "$rc" = 0 ] && grep -q "ALPACA_API_KEY: removed" "$KC/out" && [ "$(grep -c "^security delete-generic-password -s $WS -a ALPACA_" "$KC/log")" = 2 ] && [ "$(wc -l < "$KC/log" | tr -d " ")" = 2 ]'
+: > "$KC/log"; kc_task paper:remove; rc=$?
+check "paper:remove with no account: A's two items only" \
+      eval '[ "$(grep -c "^security delete-generic-password -s canon-alpaca-paper -a ALPACA_" "$KC/log")" = 2 ] && ! grep -q "$WS" "$KC/log"'
+: > "$KC/log"; kc_task paper:remove b; rc=$?
+check "paper:remove b: refused, nothing deleted, exit 1" eval '[ "$rc" = 1 ] && grep -q "no paper account named b" "$KC/out" && [ ! -s "$KC/log" ]'
+rm -f "$KC"/find-* "$KC"/delete-*
 # paper:store's rollback: storing fails, and a deletion of what it may have stored is refused; it said both
 # were removed. On a pseudo-terminal (expect), the curl stand-in answering 200, nothing typed but made-up values.
 if [ ! -x /usr/bin/expect ] || ! /usr/bin/expect -c 'spawn -noecho true; expect eof' >/dev/null 2>&1; then
   skip "paper:store's rollback" "no /usr/bin/expect that can open a pseudo-terminal here"
 else
-  mkdir -p "$KC/bin"; printf '#!/bin/bash\ncat > /dev/null\necho 200\n' > "$KC/bin/curl"; chmod +x "$KC/bin/curl"
+  mkdir -p "$KC/bin"; printf '#!/bin/bash\ncat > /dev/null\necho asked >> "$KC/curl.log"\necho 200\n' > "$KC/bin/curl"; chmod +x "$KC/bin/curl"
   rm -f "$KC"/find-* "$KC"/delete-*; echo 1 > "$KC/add-ALPACA_API_KEY"; echo 36 > "$KC/delete-ALPACA_SECRET_KEY"
   sbody=$(awk -v q="'''" '$0 == "[tasks.\"paper:store\"]" {t=1; next} /^\[/ {t=0} t && $0 == "run = " q {b=1; next} b && $0 == q {exit} b' "$ROOT/mise.toml")
   sbody=${sbody//\/usr\/bin\/security/$KC/security}
@@ -1439,7 +1484,8 @@ expect {
   eof { finish }
 }
 EOF
-  kstore() { : > "$KC/log"; PATH="$KC/bin:$PATH" KC_BODY="$sbody" /usr/bin/expect -f "$KC/store.exp" > "$KC/out" 2>&1; }
+  # kstore [account]: the body on a pseudo-terminal, as mise runs it with that account (none: as with no argument)
+  kstore() { : > "$KC/log"; : > "$KC/curl.log"; env ${1:+"usage_account=$1"} PATH="$KC/bin:$PATH" KC_BODY="$sbody" /usr/bin/expect -f "$KC/store.exp" > "$KC/out" 2>&1; }
   kstore; rc=$?
   check "paper:store, storing failed and a rollback deletion refused (exit 36): said, not 'nothing kept', exit 1" \
         eval '[ "$rc" = 1 ] && [[ "$sbody" == *"$KC/security"* ]] && grep -q "could not remove ALPACA_SECRET_KEY (security exit 36)" "$KC/out" && ! grep -q "nothing kept" "$KC/out" && [ "$(grep -c "^security delete-generic-password" "$KC/log")" = 2 ]'
@@ -1456,36 +1502,99 @@ EOF
   rm -f "$KC"/add-* "$KC"/delete-*; echo 36 > "$KC/find-ALPACA_API_KEY"; kstore; rc=$?; rm -f "$KC/find-ALPACA_API_KEY"
   check "paper:store, a pre-check security fails (exit 36): refused before any prompt, nothing added or deleted, exit 1" \
         eval '[ "$rc" = 1 ] && grep -q "could not check whether ALPACA_API_KEY is in the login keychain (security exit 36)" "$KC/out" && ! grep -Eq "security (-i|delete-generic-password)" "$KC/log" && ! grep -q "hidden" "$KC/out"'
+  # Account B (ADR 0069), the made-up key ID PKMADEUPMADEUP typed. A's stored key ID the same: refused before
+  # the paper API is asked, and A's secret never read.
+  rm -f "$KC"/find-* "$KC"/add-* "$KC"/delete-* "$KC"/read-* "$KC"/value-*
+  echo 0 > "$KC/read-canon-alpaca-paper-ALPACA_API_KEY"; echo PKMADEUPMADEUP > "$KC/value-canon-alpaca-paper-ALPACA_API_KEY"
+  kstore windows; rc=$?
+  check "paper:store windows, the key ID entered is the one stored for A: refused before the paper API, nothing added or deleted, exit 1" \
+        eval '[ "$rc" = 1 ] && grep -q "This key ID is the one stored for the other paper account (service canon-alpaca-paper)" "$KC/out" && [ ! -s "$KC/curl.log" ] && ! grep -Eq "security (-i|delete-generic-password)" "$KC/log"'
+  check "... neither value printed or in a security argument, A's key ID read once with -w, A's secret never read" \
+        eval '! grep -qF -e PKMADEUPMADEUP -e madeupmadeupmadeup "$KC/out" "$KC/log" && [ "$(grep -c "^security find-generic-password -s canon-alpaca-paper -a ALPACA_API_KEY -w\$" "$KC/log")" = 1 ] && ! grep -q "canon-alpaca-paper -a ALPACA_SECRET_KEY" "$KC/log"'
+  # A holding another key ID: B stored under its own service and label and read back; A's items untouched
+  echo PKOTHERKEYOTHERKEY > "$KC/value-canon-alpaca-paper-ALPACA_API_KEY"
+  for a in ALPACA_API_KEY ALPACA_SECRET_KEY; do echo 0 > "$KC/add-$WS-$a"; echo 0 > "$KC/read-$WS-$a"; done
+  echo PKMADEUPMADEUP > "$KC/value-$WS-ALPACA_API_KEY"; echo madeupmadeupmadeup > "$KC/value-$WS-ALPACA_SECRET_KEY"
+  kstore windows; rc=$?
+  check "paper:store windows, A holding another pair: checked with the paper API, stored under B's service, exit 0" \
+        eval '[ "$rc" = 0 ] && grep -q "stored ALPACA_API_KEY and ALPACA_SECRET_KEY in the login keychain (service $WS)" "$KC/out" && [ -s "$KC/curl.log" ]'
+  check "... B's two items added, labelled Alpaca-paper-windows-<item>; nothing added to A or deleted; no value in an argument" \
+        eval 'grep -q "security -i: add ALPACA_API_KEY to $WS as Alpaca-paper-windows-ALPACA_API_KEY\$" "$KC/log" && grep -q "security -i: add ALPACA_SECRET_KEY to $WS as Alpaca-paper-windows-ALPACA_SECRET_KEY\$" "$KC/log" && ! grep -Eq "to canon-alpaca-paper |delete-generic-password" "$KC/log" && ! grep -qF -e PKMADEUPMADEUP -e madeupmadeupmadeup "$KC/log" "$KC/out"'
+  # A's key ID unreadable (security exit 36): nothing to compare with, so nothing stored
+  echo 36 > "$KC/read-canon-alpaca-paper-ALPACA_API_KEY"; kstore windows; rc=$?
+  check "paper:store windows, A's key ID unreadable (exit 36): refused before any prompt, nothing added, exit 1" \
+        eval '[ "$rc" = 1 ] && grep -q "could not read the other paper account.s key ID to compare (security exit 36" "$KC/out" && ! grep -q "security -i" "$KC/log" && [ ! -s "$KC/curl.log" ] && ! grep -q hidden "$KC/out"'
+  # the same refusal for A, against B's stored key ID, and a name that is neither
+  rm -f "$KC"/add-* "$KC"/read-* "$KC"/value-*; echo 0 > "$KC/read-$WS-ALPACA_API_KEY"; echo PKMADEUPMADEUP > "$KC/value-$WS-ALPACA_API_KEY"
+  kstore; rc=$?
+  check "paper:store with no account, the key ID entered is the one stored for B: refused, nothing added, exit 1" \
+        eval '[ "$rc" = 1 ] && grep -q "the one stored for the other paper account (service $WS)" "$KC/out" && ! grep -q "security -i" "$KC/log" && [ ! -s "$KC/curl.log" ]'
+  kstore other; rc=$?
+  check "paper:store other: refused before any prompt or security call, exit 1" \
+        eval '[ "$rc" = 1 ] && grep -q "no paper account named other" "$KC/out" && [ ! -s "$KC/log" ] && ! grep -q hidden "$KC/out"'
+  rm -f "$KC"/read-* "$KC"/value-*
+fi
+# mise's own reading of the account (ADR 0069): the three tasks, copied from mise.toml with security swapped
+# for the stand-in, run by the real mise in a folder of their own (trusted for that run only), with no
+# environment but HOME, KC and PATH, and no config above the temp folder (MISE_CEILING_PATHS, as the paper
+# lock deadline cases above run it)
+if [ -z "$LMISE" ]; then skip "the paper tasks under mise" "no mise outside the stubs"
+else
+  MTP=$(cd "$TMP" && pwd -P); MT="$MTP/mise-paper"; mkdir -p "$MT"   # physical, as mise sees its folder and trusts it
+  for t in paper:store paper:check paper:remove; do
+    awk -v hdr="[tasks.\"$t\"]" '$0 == hdr {t=1; print; next} /^\[tasks\./ {t=0} t' "$ROOT/mise.toml"   # a body line may start with [
+  done | sed "s#/usr/bin/security#$KC/security#g" > "$MT/mise.toml"
+  mrun() { : > "$KC/log"; (cd "$MT" && env -i HOME="$HOME" KC="$KC" MISE_CEILING_PATHS="$MTP" MISE_TRUSTED_CONFIG_PATHS="$MT" PATH="/usr/bin:/bin" "$LMISE" run "$@") > "$KC/out" 2>&1 < /dev/null; }
+  rm -f "$KC"/find-*; echo 0 > "$KC/find-$WS-ALPACA_API_KEY"; echo 0 > "$KC/find-$WS-ALPACA_SECRET_KEY"
+  mrun paper:check windows; rc=$?
+  check "the mise test folder holds the three tasks, and no other, copied by name" eval '[ "$(grep -c "^\[tasks\." "$MT/mise.toml")" = 3 ] && ! grep -q "exec(" "$MT/mise.toml" && grep -q "stty -echo" "$MT/mise.toml"'
+  check "mise run paper:check windows: account B's service only, exit 0" \
+        eval '[ "$rc" = 0 ] && [ "$(grep -c "^security find-generic-password -s $WS -a ALPACA_" "$KC/log")" = 2 ] && [ "$(wc -l < "$KC/log" | tr -d " ")" = 2 ]'
+  mrun paper:check; rc=$?
+  check "mise run paper:check: account A's service only, as before, exit 1 (absent)" \
+        eval '[ "$rc" = 1 ] && [ "$(grep -c "^security find-generic-password -s canon-alpaca-paper -a ALPACA_" "$KC/log")" = 2 ] && ! grep -q "$WS" "$KC/log"'
+  for t in paper:check paper:remove paper:store; do
+    mrun "$t" live; rc=$?
+    check "mise run $t live: refused by mise before the script runs, no security call" \
+          eval '[ "$rc" != 0 ] && grep -q "Invalid choice for arg account: live" "$KC/out" && [ ! -s "$KC/log" ]'
+  done
+  mrun paper:remove windows extra; rc=$?
+  check "mise run paper:remove windows extra: refused, nothing deleted" eval '[ "$rc" != 0 ] && [ ! -s "$KC/log" ]'
+  rm -f "$KC"/find-*
 fi
 
 # ---------- paper:store on a terminal, against the real security ----------
 # The stub above cannot see how Apple's security behaves on a terminal (ADR 0033: with -w last it prompts on
 # the terminal and never reads a pipe). So paper:store's own body, taken from mise.toml with only the
-# service changed to a throwaway one, runs on a pseudo-terminal made by expect, typed a made-up pair, with a
-# curl stand-in first on PATH answering for Alpaca's paper API. It writes to the real login keychain under
-# that throwaway service only, and the EXIT trap deletes those items however the run ends.
+# services changed to throwaway ones (A's to $tsvc, B's to $tsvc-windows), runs on a pseudo-terminal made by
+# expect, typed a made-up pair, with a curl stand-in first on PATH answering for Alpaca's paper API. It writes
+# to the real login keychain under those throwaway services only, and the EXIT trap deletes those items
+# however the run ends.
 echo "paper:store on a terminal:"
 tsvc="canon-test-lanes-throwaway-$$-$RANDOM"
 pstore_body=$(awk -v q="'''" '/^\[tasks\."paper:store"\]$/ {t=1; next} t && $0 == "run = " q {b=1; next} b && $0 == q {exit} b' "$ROOT/mise.toml")
-body=${pstore_body/"svc=$psvc"/"svc=$tsvc"}
+body=${pstore_body//canon-alpaca-paper/$tsvc}   # canon-alpaca-paper-windows becomes $tsvc-windows
 pkey=PKMADEUPMADEUPMADEUP; psecret=madeupsecretmadeupsecretmadeupsecret   # made-up; never a real pair
+pkeyb=PKMADEUPWINDOWSMADEUP; psecretb=madeupwindowssecretmadeupwindowssecret   # made-up, for account B
 paper_cleanup() {
-  local a
-  for a in ALPACA_API_KEY ALPACA_SECRET_KEY probe; do
-    HOME="$REAL_HOME" /usr/bin/security delete-generic-password -s "$tsvc" -a "$a" >/dev/null 2>&1
-  done
+  local a s
+  for s in "$tsvc" "$tsvc-windows"; do for a in ALPACA_API_KEY ALPACA_SECRET_KEY probe; do
+    HOME="$REAL_HOME" /usr/bin/security delete-generic-password -s "$s" -a "$a" >/dev/null 2>&1
+  done; done
 }
-pabsent() { local a; for a in ALPACA_API_KEY ALPACA_SECRET_KEY ${1:+"$1"}; do
-  HOME="$REAL_HOME" /usr/bin/security find-generic-password -s "$tsvc" -a "$a" >/dev/null 2>&1; [ $? = 44 ] || return 1; done; }
-pread() { HOME="$REAL_HOME" /usr/bin/security find-generic-password -s "$tsvc" -a "$1" -w 2>/dev/null; }
+pabsent() { local a s; for s in "$tsvc" "$tsvc-windows"; do for a in ALPACA_API_KEY ALPACA_SECRET_KEY ${1:+"$1"}; do
+  HOME="$REAL_HOME" /usr/bin/security find-generic-password -s "$s" -a "$a" >/dev/null 2>&1; [ $? = 44 ] || return 1; done; done; }
+pabsentw() { local a; for a in ALPACA_API_KEY ALPACA_SECRET_KEY; do
+  HOME="$REAL_HOME" /usr/bin/security find-generic-password -s "$tsvc-windows" -a "$a" >/dev/null 2>&1; [ $? = 44 ] || return 1; done; }
+pread() { HOME="$REAL_HOME" /usr/bin/security find-generic-password -s "${2:-$tsvc}" -a "$1" -w 2>/dev/null; }
 if [ ! -x /usr/bin/security ]; then skip "paper:store on a terminal" "no /usr/bin/security here (macOS only)"
 elif [ ! -x /usr/bin/expect ]; then skip "paper:store on a terminal" "no /usr/bin/expect to make a pseudo-terminal"
 elif ! /usr/bin/expect -c 'spawn -noecho true; expect eof' >/dev/null 2>&1; then
   skip "paper:store on a terminal" "expect could not open a pseudo-terminal here"
 elif ! HOME="$REAL_HOME" /usr/bin/security default-keychain >/dev/null 2>&1; then
   skip "paper:store on a terminal" "no default keychain for this user"
-elif [ -z "$psvc" ] || [ "$tsvc" = "$psvc" ] || [[ "$body" == *"$psvc"* ]] || [[ "$body" != *"svc=$tsvc"* ]]; then
-  t_fail "paper:store's body found in mise.toml, its service swapped for a throwaway one"
+elif [ -z "$psvc" ] || [ "$tsvc" = "$psvc" ] || [[ "$body" == *"$psvc"* ]] || [[ "$body" != *"svc=$tsvc;"* ]] || [[ "$body" != *"svc=$tsvc-windows;"* ]]; then
+  t_fail "paper:store's body found in mise.toml, both its services swapped for throwaway ones"
 elif [[ "$body" == *"{{"* || "$body" == *"{%"* || "$body" == *"{#"* ]]; then
   t_fail "paper:store's body holds no Tera delimiter, so mise runs it as written (ADR 0029)"
 else
@@ -1524,9 +1633,9 @@ expect {
   eof { finish }
 }
 EOF
-    pstore() {
+    pstore() { # pstore <code> [account key secret]: the paper API answering <code>; the made-up pair A's by default
       echo "$1" > "$STUB/curl-code"
-      PATH="$PB:$PATH" HOME="$REAL_HOME" PSTORE_BODY="$body" PSTORE_KEY="$pkey" PSTORE_SECRET="$psecret" \
+      env ${2:+"usage_account=$2"} PATH="$PB:$PATH" HOME="$REAL_HOME" PSTORE_BODY="$body" PSTORE_KEY="${3:-$pkey}" PSTORE_SECRET="${4:-$psecret}" \
         /usr/bin/expect -f "$TMP/pstore.exp" > "$TMP/pstore.out" 2>&1
     }
     pstore 200; rc=$?
@@ -1538,6 +1647,18 @@ EOF
     check "... neither value on the terminal" eval '! grep -qF -e "$pkey" -e "$psecret" "$TMP/pstore.out"'
     pstore 200; rc=$?
     check "paper:store with the items there: refused, exit 1" eval '[ "$rc" = 1 ] && grep -q "already in the login keychain" "$TMP/pstore.out"'
+    # account B (ADR 0069), A's made-up pair stored: the same pair refused, another stored beside it
+    pstore 200 windows; rc=$?
+    check "paper:store windows, the pair entered is A's: refused, exit 1, nothing stored for B" \
+          eval '[ "$rc" = 1 ] && grep -q "the one stored for the other paper account" "$TMP/pstore.out" && pabsentw'
+    check "... neither value on the terminal" eval '! grep -qF -e "$pkey" -e "$psecret" "$TMP/pstore.out"'
+    pstore 200 windows "$pkeyb" "$psecretb"; rc=$?
+    check "paper:store windows, another pair: exit 0, stored under B's service" \
+          eval '[ "$rc" = 0 ] && grep -q "(service $tsvc-windows)" "$TMP/pstore.out" && [ "$(pread ALPACA_API_KEY "$tsvc-windows")" = "$pkeyb" ] && [ "$(pread ALPACA_SECRET_KEY "$tsvc-windows")" = "$psecretb" ]'
+    # security prints the label as attribute 0x00000007, not "labl" (observed, macOS 27.2); no other attribute holds it
+    check "... labelled Alpaca-paper-windows-ALPACA_API_KEY, and A's items as they were" \
+          eval 'grep -qF "<blob>=\"Alpaca-paper-windows-ALPACA_API_KEY\"" <<<"$(HOME="$REAL_HOME" /usr/bin/security find-generic-password -s "$tsvc-windows" -a ALPACA_API_KEY 2>/dev/null)" && [ "$(pread ALPACA_API_KEY)" = "$pkey" ] && [ "$(pread ALPACA_SECRET_KEY)" = "$psecret" ]'
+    check "... neither of B's values on the terminal" eval '! grep -qF -e "$pkeyb" -e "$psecretb" "$TMP/pstore.out"'
     paper_cleanup
     pstore 401; rc=$?
     check "paper:store, the paper API answering 401: exit 1, nothing stored" \

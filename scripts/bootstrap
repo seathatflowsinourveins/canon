@@ -297,18 +297,20 @@ update_row() {
   esac
 }
 
-# paper_row: whether both Alpaca paper key items are in the login keychain (ADR 0029). It looks each item up
-# by service and account without -w or -g, so no value is read (man security: find-generic-password). An
-# absent pair is reported and never fails the check: only the paper tests need it.
-PAPER_SERVICE="canon-alpaca-paper"   # the service mise.toml's paper tasks use
+# paper_row <row> <service> <store command>: whether both Alpaca paper key items of one account are in the
+# login keychain (ADR 0029, ADR 0069). It looks each item up by service and account without -w or -g, so no
+# value is read (man security: find-generic-password). An absent pair is reported and never fails the check:
+# only the paper runs need it.
+PAPER_SERVICE="canon-alpaca-paper"   # account A, `tests`: the service mise.toml's paper tasks use by default
+PAPER_SERVICE_WINDOWS="canon-alpaca-paper-windows"   # account B, `windows` (ADR 0069)
 paper_row() {
   local a miss=""
-  if ! command -v security >/dev/null 2>&1; then row "paper key pair" absent "no security command here (macOS only)"; return 0; fi
+  if ! command -v security >/dev/null 2>&1; then row "$1" absent "no security command here (macOS only)"; return 0; fi
   for a in ALPACA_API_KEY ALPACA_SECRET_KEY; do
-    security find-generic-password -s "$PAPER_SERVICE" -a "$a" >/dev/null 2>&1 || miss="$miss $a"
+    security find-generic-password -s "$2" -a "$a" >/dev/null 2>&1 || miss="$miss $a"
   done
-  if [ -z "$miss" ]; then row "paper key pair" ok "login keychain, service $PAPER_SERVICE"
-  else row "paper key pair" absent "no keychain item for:$miss; to enter the pair: mise run paper:store"; fi
+  if [ -z "$miss" ]; then row "$1" ok "login keychain, service $2"
+  else row "$1" absent "no keychain item for:$miss; to enter the pair: $3"; fi
 }
 
 # toml_python: a python3 that has tomllib (Python 3.11 and later, https://docs.python.org/3/library/tomllib.html):
@@ -605,8 +607,9 @@ check() {
   update_row || missing=1
   if [ -f "$CLAUDE_HOME/CLAUDE.md" ]; then row "user CLAUDE.md" ok ""; else row "user CLAUDE.md" MISSING "run: scripts/bootstrap --user-config"; missing=1; fi
   telemetry_rows || missing=1
-  note "Alpaca paper key pair (ADR 0029), optional:"
-  paper_row
+  note "Alpaca paper key pairs (ADR 0029, ADR 0069), optional:"
+  paper_row "paper key pair" "$PAPER_SERVICE" "mise run paper:store"
+  paper_row "paper key pair (windows)" "$PAPER_SERVICE_WINDOWS" "mise run paper:store windows"
   note "Review-only workers (ADR 0045) and their defaults (ADR 0059), optional:"
   codex_defaults_row
   agy_model_row
