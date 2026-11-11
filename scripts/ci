@@ -31,6 +31,10 @@
 # Slots: one of CANON_CI_SLOTS (default 3) machine-wide slots is held for the whole run (take_slot, below).
 # CANON_TEST_CI=1 (set by scripts/test-ci) skips scripts/test-ci itself, with a skip line.
 set -uo pipefail
+# Priority: once, at the top, this script runs itself again under nice(1) (`man nice`, "nice -n increment utility")
+# at a fixed increment of 5, so every check it starts inherits the lower priority and a run of checks yields to
+# the paper tasks and to whatever else the machine is doing. CANON_CI_NICED marks the second run.
+if [ -z "${CANON_CI_NICED:-}" ]; then CANON_CI_NICED=1 exec nice -n 5 "$0" "$@"; fi
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT" || exit 1
 STAGED=0; [ "${1:-}" = "--staged" ] && STAGED=1

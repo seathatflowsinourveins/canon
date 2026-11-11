@@ -1146,6 +1146,44 @@ bt=$(task_part paper:test run | sed -n '/^bounded() {/,/^}/p')
 # shellcheck disable=SC2034  # read by the eval'd check
 bs=$(task_part paper:session run | sed -n '/^bounded() {/,/^}/p')
 check "paper:session and paper:test run uv through one and the same bounded()" eval '[ -n "$bt" ] && [ "$bt" = "$bs" ]'
+# Waiting for a paper lock must not spin: macOS lockf(1) in its descriptor form (`lockf -t <secs> <fd>`) busy-loops
+# while it waits (measured: about 71% of a core after 6 s). Every task that waits takes the lock through one
+# lock_wait() (a non-blocking try and a one-second sleep), the same text in each, and no task calls the
+# descriptor form with a wait.
+# shellcheck disable=SC2034  # read by the eval'd checks
+{ lw_t=$(task_part paper:test run | sed -n '/^lock_wait() {/,/^}/p'); n_lw=0; n_task=0; n_same=0; n_old=0
+  for t in paper:test paper:session paper:data paper:long-only; do
+    b=$(task_part "$t" run); n_task=$((n_task + 1))
+    [ "$(sed -n '/^lock_wait() {/,/^}/p' <<<"$b")" = "$lw_t" ] && n_same=$((n_same + 1))
+    grep -qE '^ *lock_wait [0-9] ' <<<"$b" && n_lw=$((n_lw + 1))
+    grep -qE '/usr/bin/lockf -t [^0 ]' <<<"$b" && n_old=$((n_old + 1))
+  done; }
+check "the four paper tasks that wait for a lock all call lock_wait, with the same text, and none the descriptor form of lockf -t" \
+      eval '[ -n "$lw_t" ] && [ "$n_task" = 4 ] && [ "$n_lw" = 4 ] && [ "$n_same" = 4 ] && [ "$n_old" = 0 ]'
+# A waiter on a held lock uses next to no CPU: lock_wait and the wait line, as paper:test has them, run in a
+# script of their own on a lock file of their own (never an account's lock) that another process holds. The
+# waiter waits out a 6 s bound and reports its own CPU time and its reaped children's (bash's `times`), so
+# every poll's lockf is counted; a spinning lockf has used 4 s and more by then. A second run, once the holder
+# has let go, takes the lock.
+# shellcheck disable=SC2034  # read by the eval'd checks
+if [ -x /usr/bin/lockf ]; then
+  LW="$TMP/lock-wait"; mkdir -p "$LW"
+  lw_line=$(task_part paper:test run | grep -E '(lock_wait 9 "\$lockwait"|/usr/bin/lockf -t "\$lockwait" 9)' | awk 'NR == 1')
+  printf '%s\n' 'lockwait=6' "$lw_t" 'trap '"'"'times >"$3"'"'"' EXIT' 'exec 9>>"$1"' "$lw_line" 'echo got >"$2"' > "$LW/waiter.sh"
+  /usr/bin/lockf -k "$LW/lock" sh -c 'echo held >"$1"; while [ ! -e "$2" ]; do sleep 0.1; done' sh "$LW/held" "$LW/release" & lw_holder=$!
+  for _ in $(seq 100); do [ -e "$LW/held" ] && break; sleep 0.1; done
+  bash "$LW/waiter.sh" "$LW/lock" "$LW/got" "$LW/times" >/dev/null 2>&1; lw_rc1=$?
+  lw_cpu=$(tr 'ms' '  ' <"$LW/times" 2>/dev/null | awk '{ for (i = 1; i <= NF; i += 2) t += $i * 60 + $(i + 1) } END { printf "%.2f", t }')
+  lw_got=0; [ -e "$LW/got" ] && lw_got=1
+  : >"$LW/release"; wait "$lw_holder"
+  bash "$LW/waiter.sh" "$LW/lock" "$LW/got" "$LW/times" >/dev/null 2>&1; lw_rc2=$?
+  check "the wait line is found in paper:test"   test -n "$lw_line"
+  check "a paper task that waited out a 6 s bound on a held lock used under 0.5 s of CPU (it used ${lw_cpu:-?} s), and failed without it" \
+        eval '[ -n "$lw_cpu" ] && [ "$lw_rc1" != 0 ] && [ "$lw_got" = 0 ] && awk -v c="$lw_cpu" "BEGIN { exit !(c < 0.5) }"'
+  check "... and took the lock once the holder let go" eval '[ "$lw_rc2" = 0 ] && [ -e "$LW/got" ]'
+else
+  skip "paper lock wait CPU" "no /usr/bin/lockf here (macOS only)"
+fi
 check "paper:session marks a run the schedule did not start, so its records go to by-hand/" \
       eval 'grep -qxF "[ \"\${CANON_PAPER_SCHEDULED:-}\" = 1 ] || [ -n \"\${CANON_COMMIT:-}\" ] || export CANON_PAPER_BY_HAND=1" <<<"$(task_part paper:session run)"'
 # mise appends a task's arguments to the last line of its script (observed with mise 2026.11.5 under a pty and

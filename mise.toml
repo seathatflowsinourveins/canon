@@ -239,8 +239,25 @@ start=$(/bin/date +%s)
 # (scripts/test-lanes, "per-user temporary folder")
 tmp="$(/usr/bin/getconf DARWIN_USER_TEMP_DIR)" || tmp=""
 case "$tmp" in /*/) ;; *) echo "paper:test: the per-user temporary folder is not known (DARWIN_USER_TEMP_DIR gave '$tmp'), so there is no paper lock to take; nothing was placed" >&2; exit 1 ;; esac
+# lock_wait <fd> <secs>: the exclusive lock on an open descriptor, waiting at most <secs>; 0 when held, 1 when the
+# bound ran out (a bound can run over by up to a second), or at once when lockf fails for any reason but the
+# lock being held (exit 75, EX_TEMPFAIL). lockf(1)'s descriptor form (`lockf -t <secs> <fd>`, man lockf) busy-loops while it waits, about
+# 71% of a core after 6 s (measured on this Mac), so this polls `lockf -t 0 <fd>`, which fails unless it can
+# take the lock at once, with a one-second sleep: about no CPU. The lock belongs to the open file description,
+# so every process the task starts still inherits it (the note above paper:test). The same text is in every
+# paper task that waits for a lock (scripts/test-lanes checks that).
+lock_wait() {
+  lw_end=$(( $(/bin/date +%s) + $2 ))
+  while :; do
+    /usr/bin/lockf -t 0 "$1" 2>/dev/null; lw_rc=$?
+    [ "$lw_rc" = 0 ] && return 0
+    [ "$lw_rc" = 75 ] || return 1
+    [ "$(/bin/date +%s)" -lt "$lw_end" ] || return 1
+    sleep 1
+  done
+}
 exec 9>>"${tmp}canon-paper-test.lock"
-/usr/bin/lockf -t "$lockwait" 9 || { echo "paper:test: account A's lock stayed held for $lockwait s; nothing was placed" >&2; exit 1; }
+lock_wait 9 "$lockwait" || { echo "paper:test: account A's lock stayed held for $lockwait s; nothing was placed" >&2; exit 1; }
 # the stream lock's path, and the deadline's epoch second, so a streaming test waits for the lock only while
 # TEST_ROOM_SECS would be left (the conftests' stream-lock block)
 export CANON_ALPACA_STREAM_LOCK="${tmp}canon-alpaca-stream.lock" CANON_PAPER_TEST_DEADLINE=$((start + deadline))
@@ -305,15 +322,32 @@ case "$tmp" in /*/) ;; *) echo "paper:session: the per-user temporary folder is 
 # a run the runner started (CANON_COMMIT) is the schedule's unless the runner itself says by hand, so a
 # runner installed before CANON_PAPER_SCHEDULED existed still writes the records status reads
 [ "${CANON_PAPER_SCHEDULED:-}" = 1 ] || [ -n "${CANON_COMMIT:-}" ] || export CANON_PAPER_BY_HAND=1
+# lock_wait <fd> <secs>: the exclusive lock on an open descriptor, waiting at most <secs>; 0 when held, 1 when the
+# bound ran out (a bound can run over by up to a second), or at once when lockf fails for any reason but the
+# lock being held (exit 75, EX_TEMPFAIL). lockf(1)'s descriptor form (`lockf -t <secs> <fd>`, man lockf) busy-loops while it waits, about
+# 71% of a core after 6 s (measured on this Mac), so this polls `lockf -t 0 <fd>`, which fails unless it can
+# take the lock at once, with a one-second sleep: about no CPU. The lock belongs to the open file description,
+# so every process the task starts still inherits it (the note above paper:test). The same text is in every
+# paper task that waits for a lock (scripts/test-lanes checks that).
+lock_wait() {
+  lw_end=$(( $(/bin/date +%s) + $2 ))
+  while :; do
+    /usr/bin/lockf -t 0 "$1" 2>/dev/null; lw_rc=$?
+    [ "$lw_rc" = 0 ] && return 0
+    [ "$lw_rc" = 75 ] || return 1
+    [ "$(/bin/date +%s)" -lt "$lw_end" ] || return 1
+    sleep 1
+  done
+}
 exec 9>>"${tmp}canon-paper-windows.lock"
-/usr/bin/lockf -t "$lockwait" 9 || { echo "paper:session: account B's lock stayed held for $lockwait s; nothing was placed" >&2; exit 1; }
+lock_wait 9 "$lockwait" || { echo "paper:session: account B's lock stayed held for $lockwait s; nothing was placed" >&2; exit 1; }
 waited=$(( $(/bin/date +%s) - start ))
 # stream: the login's market-data stream lock (ADR 0069), on descriptor 7 (the runner's checkout lock is 8),
 # for what is left of `lockwait`; taken after uv's sync, so a window holds it only while its process runs
 stream() {
   s=$((lockwait - waited)); [ "$s" -ge 0 ] || s=0
   exec 7>>"${tmp}canon-alpaca-stream.lock"
-  /usr/bin/lockf -t "$s" 7 || { echo "paper:session: the market-data stream lock stayed held ($lockwait s for both locks); nothing was placed" >&2; exit 1; }
+  lock_wait 7 "$s" || { echo "paper:session: the market-data stream lock stayed held ($lockwait s for both locks); nothing was placed" >&2; exit 1; }
 }
 # bounded <secs> <command...>: the command under timeout(1) -s KILL, in the process group timeout leads, with
 # its whole group killed on a stop and once it ends (the note above paper:test)
@@ -399,12 +433,29 @@ tmp="$(/usr/bin/getconf DARWIN_USER_TEMP_DIR)" || tmp=""
 case "$tmp" in /*/) ;; *) echo "paper:data: the per-user temporary folder is not known (DARWIN_USER_TEMP_DIR gave '$tmp'), so there is no stream lock to take or log folder to write; nothing was run" >&2; exit 1 ;; esac
 set -- --minutes "${usage_minutes:-10}"
 [ "$logs" = 0 ] || set -- "$@" --log-dir "${tmp}canon-paper-data"
+# lock_wait <fd> <secs>: the exclusive lock on an open descriptor, waiting at most <secs>; 0 when held, 1 when the
+# bound ran out (a bound can run over by up to a second), or at once when lockf fails for any reason but the
+# lock being held (exit 75, EX_TEMPFAIL). lockf(1)'s descriptor form (`lockf -t <secs> <fd>`, man lockf) busy-loops while it waits, about
+# 71% of a core after 6 s (measured on this Mac), so this polls `lockf -t 0 <fd>`, which fails unless it can
+# take the lock at once, with a one-second sleep: about no CPU. The lock belongs to the open file description,
+# so every process the task starts still inherits it (the note above paper:test). The same text is in every
+# paper task that waits for a lock (scripts/test-lanes checks that).
+lock_wait() {
+  lw_end=$(( $(/bin/date +%s) + $2 ))
+  while :; do
+    /usr/bin/lockf -t 0 "$1" 2>/dev/null; lw_rc=$?
+    [ "$lw_rc" = 0 ] && return 0
+    [ "$lw_rc" = 75 ] || return 1
+    [ "$(/bin/date +%s)" -lt "$lw_end" ] || return 1
+    sleep 1
+  done
+}
 # stream: the login's market-data stream lock (ADR 0069), on descriptor 7, as paper:session takes it; only a
 # module that streams takes it
 stream() {
   [ "$streams" = 1 ] || return 0
   exec 7>>"${tmp}canon-alpaca-stream.lock"
-  /usr/bin/lockf -t "$lockwait" 7 || { echo "paper:data: the market-data stream lock stayed held for $lockwait s; nothing was run" >&2; exit 1; }
+  lock_wait 7 "$lockwait" || { echo "paper:data: the market-data stream lock stayed held for $lockwait s; nothing was run" >&2; exit 1; }
 }
 # bounded <secs> <command...>: as in paper:session (the note above paper:test)
 bounded() {
@@ -471,8 +522,25 @@ export ALPACA_API_KEY ALPACA_SECRET_KEY CANON_PAPER_ACCOUNT="$usage_account"
 [ "$usage_action" = check ] || {
   tmp="$(/usr/bin/getconf DARWIN_USER_TEMP_DIR)" || tmp=""
   case "$tmp" in /*/) ;; *) echo "paper:long-only: the per-user temporary folder is not known, so there is no paper lock to take; nothing was changed" >&2; exit 1 ;; esac
+# lock_wait <fd> <secs>: the exclusive lock on an open descriptor, waiting at most <secs>; 0 when held, 1 when the
+# bound ran out (a bound can run over by up to a second), or at once when lockf fails for any reason but the
+# lock being held (exit 75, EX_TEMPFAIL). lockf(1)'s descriptor form (`lockf -t <secs> <fd>`, man lockf) busy-loops while it waits, about
+# 71% of a core after 6 s (measured on this Mac), so this polls `lockf -t 0 <fd>`, which fails unless it can
+# take the lock at once, with a one-second sleep: about no CPU. The lock belongs to the open file description,
+# so every process the task starts still inherits it (the note above paper:test). The same text is in every
+# paper task that waits for a lock (scripts/test-lanes checks that).
+lock_wait() {
+  lw_end=$(( $(/bin/date +%s) + $2 ))
+  while :; do
+    /usr/bin/lockf -t 0 "$1" 2>/dev/null; lw_rc=$?
+    [ "$lw_rc" = 0 ] && return 0
+    [ "$lw_rc" = 75 ] || return 1
+    [ "$(/bin/date +%s)" -lt "$lw_end" ] || return 1
+    sleep 1
+  done
+}
   exec 9>>"${tmp}${lock}"
-  /usr/bin/lockf -t "$lockwait" 9 || { echo "paper:long-only: account ${usage_account}'s lock stayed held for $lockwait s; nothing was changed" >&2; exit 1; }
+  lock_wait 9 "$lockwait" || { echo "paper:long-only: account ${usage_account}'s lock stayed held for $lockwait s; nothing was changed" >&2; exit 1; }
 }
 exec /usr/bin/timeout -s KILL 600 uv run --locked python -c 'import sys; from canon_trading.session_window import long_only_task; raise SystemExit(long_only_task(sys.argv[1]))' "$usage_action"
 '''
