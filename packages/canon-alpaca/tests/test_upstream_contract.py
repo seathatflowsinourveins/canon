@@ -246,13 +246,44 @@ def test_trade_stream_stand_in_matches_alpaca_py(make, alpaca) -> None:
 
 
 def test_api_error_status_comes_from_the_http_error(alpaca) -> None:
-    """The adapter reads `APIError.status_code`; the stand-in builds it the way alpaca-py's REST client does."""
-    error = alpaca.api_error(422, 42210000, "order is not cancelable")
+    """The adapter reads `APIError.status_code`, `.code` and `.message`: alpaca-py's own REST client raises
+    one for a 422, from a transport adapter that answers in place of the network, and the stand-in's has
+    the same fields."""
+    import json
 
-    assert (error.status_code, error.code, error.message) == (
-        422,
-        42210000,
-        "order is not cancelable",
+    import requests
+    import requests.adapters
+    from alpaca.common.exceptions import APIError
+    from alpaca.trading.client import TradingClient
+
+    body = {"code": 42210000, "message": "order is not cancelable"}
+
+    class Answers422(requests.adapters.BaseAdapter):
+        def send(
+            self, request, stream=False, timeout=None, verify=True, cert=None, proxies=None
+        ) -> requests.Response:
+            response = requests.Response()
+            response.status_code = 422
+            response._content = json.dumps(body).encode()
+            response.url = request.url
+            response.request = request
+            return response
+
+        def close(self) -> None:
+            pass
+
+    client = TradingClient("offline-placeholder", "offline-placeholder", paper=True)
+    client._session.mount("https://", Answers422())  # nothing reaches the network
+    with pytest.raises(APIError) as raised:
+        client.cancel_order_by_id("61e69015-8549-4bfd-b9c3-01e75843f47d")
+    real = raised.value
+    stand_in = alpaca.api_error(422, body["code"], body["message"])
+
+    assert (real.status_code, real.code, real.message) == (422, 42210000, "order is not cancelable")
+    assert (stand_in.status_code, stand_in.code, stand_in.message) == (
+        real.status_code,
+        real.code,
+        real.message,
     )
 
 

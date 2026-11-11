@@ -122,7 +122,9 @@ def observe(trading: TradingClient, created: list[str], run: int) -> dict:
                 old_id, ReplaceOrderRequest(limit_price=1.01, client_order_id=client_order_id)
             )
         )
+        # Kept, which paper refused each time it was observed: recorded, and the assertions say so.
         seen["replace_keeping_client_order_id"] = {"answer": answer}
+        seen["replace"] = {"answer": answer}
     except APIError as e:
         seen["replace_keeping_client_order_id"] = {"error": error(e)}
         answer = raw(trading.replace_order_by_id(old_id, ReplaceOrderRequest(limit_price=1.01)))
@@ -167,6 +169,10 @@ def test_paper_replace_answers_as_observed() -> None:
     trading = with_http_timeout(
         TradingClient(api_key=api_key, secret_key=secret_key, paper=True, raw_data=True)
     )
+    clock = trading.get_clock()  # raw data: Alpaca's clock as a mapping
+    if not (clock["is_open"] if isinstance(clock, dict) else clock.is_open):
+        # An order Alpaca has not routed yet is `accepted`, which "cannot be replaced".
+        pytest.skip("the regular session is closed; Alpaca replaces only an order it has routed")
     held = trading.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[SYMBOL]))
     assert held == [], f"the paper account already holds {len(held)} open {SYMBOL} order(s)"
 
@@ -215,6 +221,7 @@ def test_paper_replace_answers_as_observed() -> None:
         old, new = seen["placed"], seen["replace"]["answer"]
         # 2. The replacement may not keep the original client order ID.
         kept = seen["replace_keeping_client_order_id"]
+        assert "error" in kept, f"Alpaca accepted a replacement keeping the client order ID: {kept}"
         assert kept["error"]["status"] == 422, kept
         assert "client_order_id must be unique" in kept["error"]["body"], kept
         # 3. The answer is the replacement: a new ID, an Alpaca-made client order ID, `replaces`.

@@ -157,9 +157,10 @@ class AcceptModifyCancel(Strategy):
         self.events.append(event)
         if name == "OrderAccepted":
             self.modify_order(event.client_order_id, price=Price.from_str("1.01"))
-        elif name == "OrderUpdated":
+        elif name in {"OrderUpdated", "OrderModifyRejected"}:
+            # A refused modify leaves the order working: it is canceled too, so the run ends as it began.
             self.cancel_order(event.client_order_id)
-        elif name in {"OrderCanceled", "OrderRejected", "OrderDenied", "OrderModifyRejected"}:
+        elif name in {"OrderCanceled", "OrderRejected", "OrderDenied", "OrderCancelRejected"}:
             self.shutdown_system(f"Paper order ended with {name}")
 
     def names(self) -> list[str]:
@@ -294,7 +295,10 @@ def paper_node(exec_engine: LiveExecutionEngineConfig | None = None) -> LiveNode
 
 def test_paper_limit_order_is_modified_through_a_node() -> None:
     """One modify through a real node (ADR 0042): `OrderUpdated` arrives with Alpaca's `replaced`, under the
-    replacement's order ID and the new price, and the cancel after it reaches the replacement."""
+    replacement's order ID and the new price, and the cancel after it reaches the replacement. It needs the
+    regular session: Alpaca does not replace an order it has not routed (`accepted`)."""
+    if alpaca_session(paper_trading()) != "regular":
+        pytest.skip("needs the regular session: Alpaca replaces only an order it has routed")
     with aapl_left_as_found() as cleaned:
         node = paper_node()
         strategy = AcceptModifyCancel()
@@ -304,7 +308,7 @@ def test_paper_limit_order_is_modified_through_a_node() -> None:
         finally:
             node.dispose()
 
-    assert cleaned == {"orders": 0, "positions": 0}, cleaned
+    # The events first: when they differ, they say why the clean-up had something to do.
     assert strategy.names() == [
         "OrderSubmitted",
         "OrderAccepted",
@@ -312,7 +316,8 @@ def test_paper_limit_order_is_modified_through_a_node() -> None:
         "OrderUpdated",
         "OrderPendingCancel",
         "OrderCanceled",
-    ]
+    ], (strategy.names(), cleaned)
+    assert cleaned == {"orders": 0, "positions": 0}, cleaned
     accepted, updated, canceled = (strategy.events[i] for i in (1, 3, 5))
     assert updated.venue_order_id != accepted.venue_order_id
     assert updated.price == Price.from_str("1.0100")
@@ -565,8 +570,14 @@ def aapl_left_as_found() -> Generator[dict[str, int]]:
         yield cleaned
     finally:
         for order in open_aapl_orders(trading):
-            trading.cancel_order_by_id(order.id)
             cleaned["orders"] += 1
+            try:
+                trading.cancel_order_by_id(order.id)
+            except APIError as e:
+                # 422 "no longer cancelable": it closed between the listing and the cancel (the listing
+                # can lag the stream). Anything else is raised once the rest is cleaned up.
+                if e.status_code != 422:
+                    raise
         wait_until(lambda: not open_aapl_orders(trading), "the canceled orders to close")
         if holds_aapl(trading):
             cleaned["positions"] += 1
@@ -583,7 +594,6 @@ def test_paper_limit_order_is_accepted_and_canceled() -> None:
             asyncio.run(run_hosted(node))
             has_account = node.cache.account(ACCOUNT_ID) is not None
         finally:
-            # Disposed here, so a failure's traceback does not keep the node and fail the next paper test.
             node.dispose()
 
     assert cleaned == {"orders": 0, "positions": 0}, cleaned
@@ -724,9 +734,12 @@ def test_paper_stop_buy_is_accepted_with_its_prices(row: str, order_type: OrderT
     """TC-E20 ("StopMarket BUY") and TC-E22 ("StopLimit BUY") of upstream's Execution Testing Spec, through
     `ExecTester`: a stop buy `TOB_OFFSET_TICKS` above the ask (a stop-limit's limit 5 cents above its
     trigger), which must not trigger. Pass: accepted with the trigger and limit prices the node sent, as
-    Alpaca holds them; the client's report of Alpaca's order (what reconciliation reads) has the same
-    type, prices and trigger type `DEFAULT`; then canceled on stop. A trigger and fill need the market to
-    move $50 and are not tested (the card: "may not happen during the test")."""
+    Alpaca holds them; `order_status_report` of Alpaca's order, as for an order the node does not hold (a
+    prior session's), has the same type and prices and trigger type `DEFAULT`, since Alpaca's order
+    carries none; then canceled on stop. A stop the node holds is reported with the node's own trigger
+    type, offline only (`test_a_held_stop_is_reported_with_the_trigger_type_the_node_sent`). A trigger
+    and fill need the market to move $50 and are not tested (the card: "may not happen during the
+    test")."""
     trading = paper_trading()
     seen: list[tuple[Any, AlpacaOrder]] = []
 
@@ -759,7 +772,7 @@ def test_paper_stop_buy_is_accepted_with_its_prices(row: str, order_type: OrderT
     assert len(events) == 1, (row, events)
     ((order, held),) = seen
     assert Decimal(str(held.stop_price)) == Decimal(str(order.trigger_price)), row
-    report = order_status_report(held, 0)
+    report = order_status_report(held, 0)  # no trigger type given: an order the node does not hold
     assert report is not None
     assert (report.order_type, report.trigger_type) == (order_type, TriggerType.DEFAULT), row
     assert report.trigger_price == order.trigger_price, row
@@ -800,6 +813,7 @@ def run_exec_tester(
     node.add_builtin_strategy("ExecTester", config)
     events: dict[str, list[str]] = {}
     cache = node.cache  # a node run by `run_async` is read through the cache taken before the run
+    reached: list[bool] = []
 
     async def main() -> None:
         # Wait for the accepts with a deadline of its own, then stop the node and let it finish: a timeout
@@ -813,6 +827,7 @@ def run_exec_tester(
                     o.status == OrderStatus.ACCEPTED for o in orders
                 )
                 if accepted and (settle is None or settle(orders)):
+                    reached.append(True)
                     if check is not None:
                         check(orders)
                     break
@@ -828,4 +843,6 @@ def run_exec_tester(
             events[order.client_order_id.value] = [type(e).__name__ for e in order.events()]
     finally:
         node.dispose()
+    # The deadline running out is a failure, not a pass on whatever the stop then canceled.
+    assert reached, f"the tester's {count} orders were not all accepted within 60 s: {events}"
     return events
