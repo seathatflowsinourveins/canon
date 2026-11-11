@@ -18,7 +18,10 @@
 #   OmniRoute gateway      always, Mac awake, once OmniRoute  launchd user agent running mise.gateway.toml's
 #                          is installed                      omniroute:serve in this clone (ADR 0056)
 #
-# Usage: scripts/automation status | install | uninstall | differs | mark-user-config
+# Usage: scripts/automation status | install [--defer-paper] | uninstall | differs | mark-user-config
+# `install --defer-paper` installs everything but the paper session's runner, plist and clone, and leaves its
+# agent loaded as it is: the maintenance agent's round while a window runs from them, which defers that part
+# to the session boundary (home/.claude/canon/maintenance.sh, ADR 0065).
 # `install` uses no sudo and touches: this clone's git config, ~/.claude/canon/ (the paper session's
 # runner and its clone of origin's main, ~/.claude/canon/paper-checkout, the maintenance agent's script and the
 # collector's config, ~/.claude/canon/otel/config.yaml, included), and four files in ~/Library/LaunchAgents/,
@@ -93,8 +96,12 @@ MAINT_STEP=900                                        # maintenance.sh STEP_SECS
 # the longest round: the fetch (120), local git (6 x 30), the compare, the settings step, the two daily updates
 # and the reinstall it starts, which holds its lock (5 x MAINT_STEP); then an interval and 300 s
 # a round at its longest: the fetch (120), ten bounded git and mise calls (30 each, 5 of kill grace), five
-# steps (differs, the settings step, two updates, install, each MAINT_STEP and 5), then an interval and 300
-MAINT_SILENT=$((120 + 10 * 35 + 5 * (MAINT_STEP + 5) + MAINT_INTERVAL + 300))
+# steps (differs, the settings step, two updates, install, each MAINT_STEP and 5), the pins (mise and four
+# tools: two mise calls of 30 and one step each), then an interval and 300
+MAINT_SILENT=$((120 + 10 * 35 + 5 * (MAINT_STEP + 5) + 5 * (2 * 35 + MAINT_STEP + 5) + MAINT_INTERVAL + 300))
+# maintenance.sh BOUNDARY_SECS: its boundary waiter's bound, the longest session and an hour; a paper section
+# deferred for longer has outlived a whole session, which the row reads as a fault
+MAINT_BOUNDARY=32400
 UC_MARK="$CANON_HOME/watch/user-config.applied"        # the sources' checksum at the last --user-config it ran
 GW_LABEL="local.canon.omniroute"
 GW_PLIST="$AGENTS_DIR/$GW_LABEL.plist"
@@ -594,7 +601,9 @@ do_install() {
   fi
   note "Paper session:"
   local paper_mise paper_url out
-  if ! paper_mise=$(find_mise 2>&1); then
+  if [ "${DEFER_PAPER:-0}" = 1 ]; then
+    note "  deferred   to the session boundary: the paper checkout ($CANON_HOME/paper-session.sh, $PAPER_CHECKOUT and $PAPER_PLIST left as they are, $PAPER_LABEL loaded as it is, while a window runs from them)"
+  elif ! paper_mise=$(find_mise 2>&1); then
     note "  FAILED: $paper_mise"; ok=1
   elif ! paper_url=$(git -C "$ROOT" remote get-url origin 2>/dev/null) || [ -z "$paper_url" ]; then
     note "  FAILED: no origin remote, so there is no main to fetch for the windows"; ok=1
@@ -1057,22 +1066,41 @@ do_status() {
 
   # The maintenance agent: its last round's record, written by maintenance.sh in the folder its plist names.
   # FAILED names each failed step; SKIPPED when the checkout was not brought to main (another branch, tracked
-  # changes, commits origin lacks); a round that found the paper lock held did nothing and is ok.
+  # changes, commits origin lacks); a round that found a paper test's or the stream's lock held did nothing
+  # and is ok. A paper section deferred while a window runs reads "deferred to the session boundary: the
+  # paper checkout", ok until it has waited longer than a whole session (MAINT_BOUNDARY), then FAILED, as is
+  # a boundary waiter that timed out, failed or stopped reporting (maintenance-boundary.json). The pins say
+  # the versions main's registry records, or what moved and what FAILED.
   prc=0; pr=$(lc print "$DOMAIN/$MAINT_LABEL" 2>/dev/null) || prc=$?
   if [ "$prc" = 0 ]; then
     local mcfg mw ms mu mlab mtxt
     mcfg=$(plutil -extract EnvironmentVariables.CLAUDE_CONFIG_DIR raw -o - "$MAINT_PLIST" 2>/dev/null) || mcfg=""
     mw="${mcfg:-$CLAUDE_HOME}/canon/watch"; ms="$mw/maintenance-status.json"; mu="$mw/maintenance-updates.json"
+    local mb; mb=$(jq -c 'objects' "$mw/maintenance-boundary.json" 2>/dev/null) || mb=""
+    [ -n "$mb" ] || mb=null
     last=$(printf '%s\n' "$pr" | awk -F' = ' '/^\tlast exit code = / && s == "" { s = $2 } END { print s }')
     maint_rank() { case "$1" in ok) echo 0 ;; UNKNOWN) echo 1 ;; SKIPPED) echo 2 ;; OUTDATED) echo 3 ;; STALE) echo 4 ;; *) echo 5 ;; esac; }
     maint_worse() { [ "$(maint_rank "$1")" -le "$(maint_rank "$mlab")" ] || mlab=$1; }
     if [ -f "$ms" ]; then
-      v=$(jq -r --argjson now "$(date -u +%s)" --argjson silent "$MAINT_SILENT" --argjson step "$MAINT_STEP" '
+      v=$(jq -r --argjson now "$(date -u +%s)" --argjson silent "$MAINT_SILENT" --argjson step "$MAINT_STEP" \
+               --argjson bound "$MAINT_BOUNDARY" --argjson b "$mb" '
             def what: map(sub("^(automation|user-config): "; "")) | join("; ");
             ((($now - .at_epoch) / 60) | floor) as $m
             | (.install // null) as $ins
             | ($ins != null and $ins.state == "started" and ($now - $ins.at_epoch) > ($step + 300)) as $lost
-            | (if (.failed | length) > 0 or $lost then "FAILED" elif ($m * 60) > $silent then "STALE"
+            | (.deferred // null) as $d
+            | ($d != null and ($now - ($d.since_epoch // $now)) > $bound) as $overdue
+            | (if $d == null or $b == null then ""
+               elif $b.state == "waiting" and ($now - ($b.since_epoch // $now)) > ($bound + 600) then
+                 "FAILED: the boundary waiter started " + ($b.since // "?") + " has not reported"
+               elif $b.state == "waiting" then "a waiter waits for the windows lock (since " + ($b.since // "?") + ")"
+               elif $b.state == "at the boundary" then "its round at the boundary runs"
+               elif $b.state == "timed out" then "FAILED: the boundary waiter timed out at " + ($b.at // "?") + ": " + ($b.why // "")
+               elif $b.state == "failed" then "FAILED: the boundary waiter at " + ($b.at // "?") + ": " + ($b.why // "")
+               elif $b.state == "missed" then "at " + ($b.at // "?") + " " + ($b.why // "")
+               else "" end) as $w
+            | (.pins // []) as $p | ($p | map(select(test(": at ") | not))) as $pc
+            | (if (.failed | length) > 0 or $lost or $overdue or ($w | startswith("FAILED")) then "FAILED" elif ($m * 60) > $silent then "STALE"
                elif .outcome == "skipped" then "SKIPPED" else "ok" end) + "\t"
               + "last round " + .at + " (" + ($m | tostring) + " min ago): " + .ff
               + (if (.found | length) > 0 then "; differed: " + (.found | what)
@@ -1083,6 +1111,14 @@ do_status() {
                  else "" end)
               + (if (.failed | length) > 0 then "; FAILED: " + (.failed | join("; ")) else "" end)
               + (if (.note // "") != "" then "; " + .note else "" end)
+              + (if $d != null and ((.note // "") | test("deferred to the session boundary") | not) then
+                   "; deferred to the session boundary: " + ($d.what // "the paper checkout") else "" end)
+              + (if $d != null then " (since " + ($d.since // "?") + ")"
+                   + (if $overdue then "; FAILED: deferred for more than one whole session" else "" end)
+                   + (if $w != "" then "; " + $w else "" end) else "" end)
+              + (if ($p | length) == 0 then ""
+                 elif ($pc | length) == 0 then "; pins at main'"'"'s registry: " + ($p | map(sub(": at "; " ")) | join(", "))
+                 else "; pins: " + ($pc | join("; ")) end)
               + (if (.found | length) == 0 and .last_change != null then
                    " | last change " + .last_change.at + ": installed "
                    + (if (.last_change.installed | length) > 0 then (.last_change.installed | join(", ")) else "nothing" end)
@@ -1187,11 +1223,12 @@ do_status() {
 case "${1:-}" in
   status)    do_status ;;
   # the failures again after the status table, the last lines the owner sees, and the exit code with them
-  install)   do_install; rc=$?; echo; do_status
+  install)   case "${2:-}" in --defer-paper) DEFER_PAPER=1 ;; '') ;; *) note "usage: scripts/automation install [--defer-paper]"; exit 2 ;; esac
+             do_install; rc=$?; echo; do_status
              if [ "$rc" != 0 ]; then printf '\ninstall: FAILED (exit %s):%s\n' "$rc" "$FAILS"; fi
              exit "$rc" ;;
   uninstall) do_uninstall ;;
   differs)   do_differs ;;
   mark-user-config) do_mark_user_config ;;
-  *) note "usage: scripts/automation status | install | uninstall | differs | mark-user-config"; exit 2 ;;
+  *) note "usage: scripts/automation status | install [--defer-paper] | uninstall | differs | mark-user-config"; exit 2 ;;
 esac
