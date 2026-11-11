@@ -2166,6 +2166,143 @@ def test_a_retired_trial_that_cannot_be_read_back_is_still_told_fail(
     )
 
 
+def queued_at_ask(monkeypatch: pytest.MonkeyPatch, config: MaCrossConfig) -> list[int]:
+    """Make the next `Study.ask` find another writer's keyed record of `config` queued just before
+    it, after `record_trial`'s check (ADR 0054 term 7's race); the list gets its number."""
+    real_ask = optuna.Study.ask
+    raced: list[int] = []
+
+    def queued_then_asked(self: optuna.Study, *args: Any, **kwargs: Any) -> optuna.trial.Trial:
+        if not raced:
+            raced.append(foreign_queued(self, config))
+        return real_ask(self, *args, **kwargs)
+
+    monkeypatch.setattr(optuna.Study, "ask", queued_then_asked)
+    return raced
+
+
+def refuse_the_read(monkeypatch: pytest.MonkeyPatch, *, first: object = None) -> None:
+    """Make the store refuse the read back of the trial `Study.ask` gave, after calling `first`."""
+
+    def unread(study: optuna.Study, trial: optuna.trial.Trial) -> None:
+        if callable(first):
+            first(study, trial)
+        raise optuna.exceptions.StorageInternalError("the store refused the read")
+
+    monkeypatch.setattr(canon_trading.ledger, "_asked", unread)
+
+
+@pytest.mark.parametrize(
+    "refusal",
+    [optuna.exceptions.StorageInternalError("the store refused the note"), KeyboardInterrupt()],
+    ids=["a store error", "an interrupt"],
+)
+def test_a_raced_trial_not_read_back_with_its_note_refused_names_itself(
+    alpaca_bars: AlpacaBars,
+    tmp_path: Path,
+    stack: ExitStack,
+    monkeypatch: pytest.MonkeyPatch,
+    refusal: BaseException,
+) -> None:
+    """Codex, gate round after #160: a trial `ask` gave that cannot be read back may be another
+    writer's keyed record queued after `record_trial`'s check, and it now carries the queue note
+    (`tests/test_ranking.py`). With that note refused too, the error raised names the trial and the
+    limit ADR 0054 term 7 states, the trial is still told `FAIL`, and the other writer's key and
+    outcome are left as they were. Code review: an interrupt while the note was written was raised
+    with no note naming the trial."""
+    alpaca_bars.write(tmp_path / "catalog")
+    study = new_study(stack, tmp_path, "unread race")
+    raced = queued_at_ask(monkeypatch, strategy(fast=2, slow=5))
+    refuse_the_read(monkeypatch)
+    real = optuna.trial.Trial.set_user_attr
+
+    def refused(self: optuna.trial.Trial, key: str, value: Any) -> None:
+        if key == "error":
+            raise refusal
+        real(self, key, value)
+
+    monkeypatch.setattr(optuna.trial.Trial, "set_user_attr", refused)
+
+    with pytest.raises(type(refusal)) as raised:
+        record_trial(study, tmp_path / "catalog", [strategy()], starting_balances=BALANCES)
+
+    [number] = raced
+    notes = "\n".join(raised.value.__notes__)
+    assert f"trial #{number} may be another writer's queued trial" in notes
+    assert "ADR 0054 term 7's named limit" in notes
+    if isinstance(refusal, Exception):
+        assert f"trial #{number}, asked by record_trial, could not be read back" in notes
+        assert "refused the read" in str(raised.value)
+    monkeypatch.undo()
+    taken = study.trials[number]
+    assert (taken.state, "error" in taken.user_attrs, taken.user_attrs[OUTCOME]) == (
+        TrialState.FAIL,
+        False,
+        TRADED,
+    )
+    assert taken.user_attrs["config_key"] == config_key(
+        trial_config([strategy(fast=2, slow=5)], starting_balances=BALANCES)
+    )
+
+
+def test_a_trial_told_by_another_process_before_its_read_is_left_as_it_is(
+    alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Code review: a trial `record_trial` asked for and `mark_not_run` told `FAIL` before it was
+    read back refuses the queue's note, and the error then named ADR 0054 term 7's limit, which does
+    not apply to a keyless trial marked not run. It is left as it is, and the error says so."""
+    alpaca_bars.write(tmp_path / "catalog")
+    study = new_study(stack, tmp_path, "told meanwhile")
+    refuse_the_read(monkeypatch, first=lambda study, trial: mark_not_run(study, trial.number))
+
+    with pytest.raises(optuna.exceptions.StorageInternalError, match="refused the read") as raised:
+        record_trial(study, tmp_path / "catalog", [strategy()], starting_balances=BALANCES)
+
+    notes = "\n".join(raised.value.__notes__)
+    assert "trial #0 was already told by another process; left as it is" in notes
+    assert "named limit" not in notes
+    [trial] = study.trials
+    assert (trial.state, trial.user_attrs, study.user_attrs[NOT_RUN]) == (TrialState.FAIL, {}, [0])
+
+
+def test_a_raced_trial_retire_queued_cannot_read_back_carries_the_queue_note(
+    tmp_path: Path, stack: ExitStack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex's finding on `retire_queued`'s own take, gate round after #160: another process took
+    the retired trial between the snapshot and `ask`, a writer queued a keyed trial meanwhile, and
+    `ask` gave that one; its read refused, it was noted as a trial `ask` created and ran nothing in,
+    so the ranking read the other writer's outcome as a run and `retire_queued` refused it. A trial
+    not read back now carries `record_trial`'s queue note, which the ranking stops on and
+    `retire_queued` takes."""
+    study = new_study(stack, tmp_path, "unread gone")
+    number = foreign_queued(study, strategy(fast=2, slow=5))
+    real_ask = optuna.Study.ask
+    later: list[int] = []
+
+    def raced(self: optuna.Study, *args: Any, **kwargs: Any) -> optuna.trial.Trial:
+        if not later:  # another process takes the target, and a writer queues a keyed trial
+            taken = real_ask(self)
+            self.tell(taken, state=TrialState.FAIL)
+            later.append(foreign_queued(self, strategy(fast=4, slow=9)))
+        return real_ask(self, *args, **kwargs)
+
+    monkeypatch.setattr(optuna.Study, "ask", raced)
+    refuse_the_read(monkeypatch)
+    with pytest.raises(optuna.exceptions.StorageInternalError, match="refused the read"):
+        canon_trading.ledger.retire_queued(study, number)
+    monkeypatch.undo()
+
+    [queued] = later
+    assert (study.trials[queued].state, study.trials[queued].user_attrs["error"]) == (
+        TrialState.FAIL,
+        canon_trading.ledger.TAKEN_FROM_QUEUE,
+    )
+    with pytest.raises(RankingStopped, match=rf"retire_queued\(study, {queued}\)"):
+        rank(study)
+    canon_trading.ledger.retire_queued(study, queued)
+    assert study.user_attrs["retired"] == [number, queued]
+
+
 def test_a_retired_list_not_in_its_form_is_refused_by_record_trial_and_retire_queued(
     alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack
 ) -> None:

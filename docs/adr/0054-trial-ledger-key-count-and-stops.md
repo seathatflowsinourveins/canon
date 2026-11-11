@@ -74,11 +74,16 @@ ADR 0035's numbers, 4 to 6; terms 1 to 3 (storage, recording, entry) are ADR 003
    names `record_trial`. A `retired` list in another form is refused by `record_trial`, `retire_queued`
    and the study's pass (`canon_trading.variant_study`), and stops the ranking.
    Named limits. A keyed trial queued between `record_trial`'s check and its `ask` is still taken,
-   told `FAIL` with `record_trial`'s note, and the ranking stops on it naming `retire_queued`. If the
-   store refuses that note too, `record_trial` raises the store's error with a note naming the trial
-   and its key (and the refused `tell`, if that is refused as well); what the operator sees is that
-   error. The record is then `FAIL` (or `RUNNING`, if that `tell` is refused too) with the other
-   writer's outcome and no note: one queued through
+   told `FAIL` with `record_trial`'s note, and the ranking stops on it naming `retire_queued`. So is a
+   trial `ask` gives, in `record_trial` or in `retire_queued`'s own take, that the store refuses to read
+   back: nothing read tells a trial `ask` created from one it took, so it carries the queue's note and
+   the read's error is raised naming it (one `ask` created holds no key, and `mark_not_run` clears
+   it, as one `record_trial` takes from the queue). If the store refuses that note too, the error
+   raised names the trial and the limit (and the refused `tell`, if that is refused as well): for a
+   trial read back, the store's error, which names its key too; for one not read back, the read's
+   error, since no key was read. What the operator sees is that error. The record is then `FAIL`
+   (or `RUNNING`, if that `tell` is refused too) with the other writer's outcome and no note: one
+   queued through
    `Study.enqueue_trial` holds the system attribute `fixed_params`, and the ranking stops on it for
    good; one queued with no system attribute reads as a run of its key, as before (Evidence, sixth
    review). `retire_queued` refuses either, since nothing on it tells it from `record_trial`'s own
@@ -165,7 +170,22 @@ study, a larger mechanism than one foreign record needs.
   `retire_queued` takes and cannot read back is still told `FAIL` with its note
   (`test_a_retired_trial_that_cannot_be_read_back_is_still_told_fail`); no remedy is named while the
   `retired` list is not in its form
-  (`test_no_remedy_is_named_while_the_retired_list_is_not_in_its_form`).
+  (`test_no_remedy_is_named_while_the_retired_list_is_not_in_its_form`). From the gate round after
+  term 7's landing, tests that failed before their fix: a raced keyed trial whose read back is refused
+  carries the queue's note, stops the ranking and is retired
+  (`tests/test_ranking.py::test_a_raced_queued_record_whose_read_back_is_refused_stops_and_is_retired`),
+  with its note refused too the error names it and the limit
+  (`test_a_raced_trial_not_read_back_with_its_note_refused_names_itself`), and the same refused read in
+  `retire_queued`'s take gives the queue's note
+  (`test_a_raced_trial_retire_queued_cannot_read_back_carries_the_queue_note`), and one told by
+  another process before its read is left as it is
+  (`test_a_trial_told_by_another_process_before_its_read_is_left_as_it_is`); and three that fail
+  on the mutation of a guard no test held: either queue note on a record not in the `retired` list
+  (`test_a_record_with_either_queue_note_not_in_the_retired_list_stops`), an outcome `record_trial`
+  never writes on a `FAIL` record
+  (`test_a_failed_record_with_an_outcome_the_writer_never_writes_stops_for_good`), and a keyless
+  record holding only returns or only session days
+  (`test_a_keyless_record_holding_only_returns_or_session_days_shows_a_run`).
 * The trial count is per study (term 5): nothing in the code stops a new study of the same
   configurations from starting at N = 0, and no record carries an earlier study's keys into it. What
   holds that line is pre-registering every study in a record before its first run, as ADR 0048 does
@@ -292,3 +312,21 @@ Term numbers are ADR 0035's.
   test: a refused note in a retirement's race now names the trial, a docstring, the pass's refusal of
   such a list, a test fixture's import and a test's pattern. Not changed: two extra reads of the study
   per retirement, which hold the lock a little longer and change nothing read.
+* Gate round after term 7's landing, 2026-11-11 (ADR 0073), two outside readers of the gate as
+  checked out: one high finding, of the family term 7 names (the race), and three test-only findings.
+  The first reader (Codex) found that a refused read of the trial `ask` gave told it `FAIL` with a
+  generic error, so a keyed trial another writer queued after the check, with no system attribute,
+  lost the only sign it was taken from the queue, and the ranking passed on its returns at N = 3,
+  DSR 0.9885, with no backtest run (run in a temporary ledger with an injected refusal). A trial not
+  read back now carries the queue's note, through Optuna's public `Trial.set_user_attr` and
+  `Study.tell` only, as term 7's other takes do; `retire_queued`'s own take, which noted such a trial
+  by the queue it read before `ask`, does the same. The second reader (Muse) found no behaviour fault
+  and three guards no test failed on, each shown by a mutation that passed at DSR 0.9885; each now
+  has a test that fails on its mutation (run). Code review of the fix (`/code-review`, high): eight
+  findings. Fixed, each shown by a test that failed first: a trial another process told before its
+  read, which only `mark_not_run` does, was given term 7's limit note (now left as it is, Optuna
+  5.0.0's `UpdateFinishedTrialError`, `storages/_base.py`, read); an interrupt while the note was
+  written was raised with no note naming the trial. Fixed with no test: this record's wording for the
+  unread case, two docstrings, and a test that faked the race by its check rather than at `ask`.
+  Not changed: one helper for both notes on a refused note, and one test helper each file keeps.
+  Confirmation lists the tests. No change of decision.

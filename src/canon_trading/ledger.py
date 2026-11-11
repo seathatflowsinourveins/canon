@@ -881,12 +881,15 @@ def _own_trial(study: optuna.Study) -> optuna.Trial:
     `Study.ask` takes the oldest `WAITING` trial before it creates one (`Study._pop_waiting_trial_id`,
     Optuna 5.0.0), and such a trial holds another writer's parameters and attributes, and a number
     below records already made, where the ranking reads a higher number as a later record (ADR 0054
-    term 5). A taken one is told `FAIL` at once, with no key and no outcome, so it shows no run and
-    `mark_not_run` clears it, and the next is asked for. A trial is taken from the queue if it was
+    term 5). A taken one is told `FAIL` at once with the queue's note (`TAKEN_FROM_QUEUE`), and the
+    next is asked for; one queued with no key holds no outcome, so it shows no run and `mark_not_run`
+    clears it, and a keyed one stops the ranking naming `retire_queued`. A trial is taken from the queue if it was
     `WAITING` before `ask`, or if it holds anything a trial `ask` creates does not: a user or system
     attribute (`Study.enqueue_trial` writes `fixed_params` on every trial it queues), a parameter or
-    an intermediate value. Only the `WAITING` and `RUNNING` trials are read, not every series. An
-    error reading the trial back tells it `FAIL`, as `record_trial` tells an error after `ask`.
+    an intermediate value. Only the `WAITING` and `RUNNING` trials are read, not every series. A
+    trial that cannot be read back is told `FAIL` with the queue's note and the error raised
+    (`_tell_unread`): it may be a keyed trial taken from the queue, and no other note keeps the
+    ranking from reading one as a run of its key.
     A queued trial that holds a config key and is not retired (`retire_queued`) is refused before
     `ask`, naming it: taken, it would keep that key and any outcome another writer gave it, and only
     its note would keep the ranking from reading it as a run of that key (ADR 0054, 2026-11-10). One
@@ -902,11 +905,46 @@ def _own_trial(study: optuna.Study) -> optuna.Trial:
         try:
             frozen = _asked(study, trial)
         except BaseException as error:
-            _tell_failed(study, trial, error)
+            error.add_note(f"trial #{trial.number}, asked by record_trial, could not be read back")
+            _tell_unread(study, trial, error, TAKEN_FROM_QUEUE)
             raise
         if not _from_the_queue(frozen, queued):
             return trial
         _tell_taken(study, trial, TAKEN_FROM_QUEUE, _untold(frozen, retired))
+
+
+def _tell_unread(study: optuna.Study, trial: optuna.Trial, error: BaseException, note: str) -> None:
+    """Tell `trial`, which `Study.ask` gave and which could not be read back, `FAIL` with `note`, a
+    note of a trial taken from Optuna's queue; if that is refused, say so on `error`, the read's.
+
+    Nothing read tells whether `ask` created the trial or took it from the queue, and another writer
+    may have queued a keyed trial after the queue was last read (ADR 0054 term 7's race), whose
+    outcome and returns that writer's would, under any other note, read as a run of its key. With
+    the queue's note the ranking stops on such a record naming `retire_queued`, which retires it
+    (`carries_a_queue_note`); one `ask` created holds no key, so it shows no run and `mark_not_run`
+    clears it. A trial another process told meanwhile, which only `mark_not_run` does to a keyless
+    one, refuses every write (`UpdateFinishedTrialError`, Optuna 5.0.0 `storages/_base.py`) and is
+    left as it is. If the note is otherwise refused, the trial is still told `FAIL` (`_tell_taken`)
+    and `error` names the limit left: a raced record left so reads as a run of its key, as term 7
+    states. An interrupt while the note is written is raised with the same note, the read's error
+    its context.
+    """
+    try:
+        _tell_taken(study, trial, note, None)
+    except optuna.exceptions.UpdateFinishedTrialError:
+        error.add_note(f"trial #{trial.number} was already told by another process; left as it is")
+    except BaseException as refused:
+        limit = (
+            f"trial #{trial.number} may be another writer's queued trial, and its note was refused "
+            f"({refused!r}), so the ranking may read it as a run of its key (ADR 0054 term 7's "
+            "named limit)"
+        )
+        error.add_note(limit)
+        for told in getattr(refused, "__notes__", ()):
+            error.add_note(told)
+        if not isinstance(refused, Exception):
+            refused.add_note(limit)
+            raise
 
 
 def _untold(frozen: FrozenTrial, retired: set[int]) -> str | None:
@@ -1084,7 +1122,9 @@ def _take_retired(study: optuna.Study, number: int, retired: set[int]) -> None:
     `record_trial`'s note, which `retire_queued` accepts. A trial `ask` took from the queue is known
     as `_own_trial` knows it (`_from_the_queue`). If `number` has left the queue, taken by another
     process, it stays retired and nothing more is taken; a trial `ask` created because the queue
-    emptied meanwhile ran nothing, and is told `FAIL` keyless, for `mark_not_run` to clear.
+    emptied meanwhile ran nothing, and is told `FAIL` keyless, for `mark_not_run` to clear. A trial
+    that cannot be read back is noted as taken from the queue, whatever the queue read before `ask`
+    says (`_tell_unread`), so one `ask` created is noted so too, keyless, and `mark_not_run` clears it.
     """
     while True:
         queued = {t.number for t in study.get_trials(deepcopy=False, states=(TrialState.WAITING,))}
@@ -1094,11 +1134,9 @@ def _take_retired(study: optuna.Study, number: int, retired: set[int]) -> None:
         try:
             frozen = _asked(study, trial)
         except BaseException as error:
-            # Noted as the queue before `ask` says, and told `FAIL`, so it is not left `RUNNING`.
+            # Noted as taken from the queue, whatever the queue before `ask` says (`_tell_unread`).
             error.add_note(f"trial #{trial.number}, asked by retire_queued, could not be read back")
-            _tell_taken(
-                study, trial, _note_for(trial.number, trial.number in queued, retired), None
-            )
+            _tell_unread(study, trial, error, _note_for(trial.number, True, retired))
             raise
         from_the_queue = _from_the_queue(frozen, queued)
         note = _note_for(frozen.number, from_the_queue, retired)
