@@ -38,7 +38,8 @@
 # An origin URL with user information, a query or a fragment in it (a token or password, RFC 3986 sections
 # 3.2.1 and 3.4, which git repeats in its own messages) is refused, and a message names the origin by host
 # and path only.
-# A failure before the run writes last-firing.json as `failed: <why>`, prints why and exits 1, which
+# A failure before the run (but an unknown records folder, below) writes last-firing.json as `failed: <why>`,
+# prints why and exits 1, which
 # scripts/automation status shows; it never runs the code already in the clone (AGENTS.md rule 5). The paper
 # lock, the flat-account check and the stale rule are paper:session's own. A firing cannot overlap another:
 # launchd misses a firing while the job runs, and kills what is left of the job's process group when it
@@ -61,7 +62,16 @@ only=0
 if [ "${1:-}" = "--checkout-only" ]; then only=1; shift; fi
 if [ $# -lt 3 ]; then echo "usage: paper-session.sh [--checkout-only] <mise> <checkout> <origin url> [arguments...]" >&2; exit 2; fi
 mise=$1 dir=$2 url=$3; shift 3
-records="${CANON_PAPER_SESSION_DIR:-$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null)canon-paper-session}"
+# the records folder is in the per-user temporary folder (getconf(1)); a getconf that gives none stops a
+# firing here, before anything runs, rather than write records under a relative name that status never reads.
+# It can write no record of that, so it says so in its log and exits 1, which status shows as a failed firing
+# (launchctl). --checkout-only writes no records. (CANON_GETCONF replaces getconf: tests only.)
+utmp=""
+if [ "$only" = 0 ] && [ -z "${CANON_PAPER_SESSION_DIR:-}" ]; then
+  utmp=$("${CANON_GETCONF:-/usr/bin/getconf}" DARWIN_USER_TEMP_DIR 2>/dev/null) || utmp=""
+  case "$utmp" in /*/) ;; *) echo "paper-session: the per-user temporary folder is not known (getconf DARWIN_USER_TEMP_DIR gave '$utmp'); nothing was run" >&2; exit 1 ;; esac
+fi
+records="${CANON_PAPER_SESSION_DIR:-${utmp}canon-paper-session}"
 scheduled=false
 # a run by hand says so to paper:session and the window too (CANON_PAPER_BY_HAND, mise.toml)
 if [ "${CANON_PAPER_SCHEDULED:-}" = 1 ]; then scheduled=true; else records="$records/by-hand"; export CANON_PAPER_BY_HAND=1; fi
