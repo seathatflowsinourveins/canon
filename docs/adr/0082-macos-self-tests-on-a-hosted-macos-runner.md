@@ -37,15 +37,20 @@ Chosen: **option 2**. Option 3 repeats eight minutes of checks that already run 
 same two scripts.
 
 1. **A job `macOS self-tests` on `xcode-27`, macOS 27.** The scripts call `/usr/bin/timeout`, which
-   macOS 26 does not have (Confirmation). `xcode-27` is the one hosted label on macOS 27: a standard
+   macOS 26 does not have and macOS 27 does by 27.2 (Confirmation). `xcode-27` is the one hosted label on macOS 27: a standard
    arm64 runner in GitHub's table, a preview in the runner-images README. It is a version label, not
    `macos-latest`, so the OS version moves only when the workflow does, as the README advises; the image
    itself is updated weekly. When a generally available macOS 27 label exists, the job moves to it.
    actionlint does not list `xcode-27` yet, so `.github/actionlint.yaml` names it until it does. The job installs the same mise toolchain with the
    same pinned actions as `checks`, then runs `scripts/test-lanes` and `scripts/test-maintenance` and
    nothing else. `launchctl` is a stand-in on PATH in both scripts, so nothing is loaded into launchd.
-2. **Nothing it exists to run may skip.** A first step names any of the `/usr/bin` tools the cases need
-   that is missing, and fails. `CANON_TEST_ALLOWED_SKIPS` names the one case allowed to skip,
+2. **Nothing it exists to run may skip, and a job that ran nothing says so.** Without
+   `/usr/bin/timeout`, 113 `scripts/test-lanes` cases fail and `scripts/test-maintenance` skips, so the
+   first step checks for it. While the image lacks it (both images read so far), the job raises one
+   warning naming the image and its macOS version, writes in its step summary that nothing ran and its
+   green tick is not a pass, and skips every later step, the 305 cases that pass without the tool
+   included; once an image ships the tool, the cases run with no edit. Otherwise a step names any other
+   `/usr/bin` tool the cases need that is missing, and fails. `CANON_TEST_ALLOWED_SKIPS` names the one case allowed to skip,
    `paper:store on a terminal`, which writes to the login keychain and is skipped there by name
    (`CANON_TEST_NO_KEYCHAIN`). Any other skipped case of `scripts/test-lanes` fails, and the
    `test-maintenance` step fails unless the script's last line reports cases passed and none failed.
@@ -55,8 +60,9 @@ same two scripts.
    that list as a warning annotation.
 4. **Reporting first, then required.** The job is not among the `needs` of `all required checks
    passed`, the one job the ruleset requires, so it does not hold a landing; a failure is fixed forward.
-   Once a generally available macOS 27 label exists and the job has passed on three landings there, it
-   joins those `needs`; passes on the preview image do not count. That is a workflow change and needs no
+   Once a generally available macOS 27 label exists and the job has run its cases and passed on three
+   landings there, it joins those `needs`; passes on the preview image, and green runs that ran nothing,
+   do not count. That is a workflow change and needs no
    repository setting, and it goes to the lead for a read when it is due. Its duration and queue time decide whether it fits inside `scripts/land`'s wait:
    on 2026-11-11 the `checks` job took from 6 m 35 s to 8 m 10 s over its 31 successful runs.
 5. **One landing never cancels the run of the one before.** The concurrency group is the pull request's
@@ -75,6 +81,10 @@ same two scripts.
   the merge.
 * Bad: a preview image may change or be withdrawn without the notice a GA label gets; the job then fails
   by name and is moved, which is why it does not gate yet.
+* Bad: until a hosted image has `/usr/bin/timeout`, the job checks nothing, not even the 305 cases that
+  pass without it; the cases run only on this Mac's commit gate, and the job's green tick means only that
+  it warned. Running those 305 alone would need a list of expected failures, which nothing upstream
+  provides.
 * Bad: should the repository become private, each macOS minute would be billed at $0.062. That would be
   the owner's decision, and this record would be re-read first.
 
@@ -91,10 +101,19 @@ first step named `/usr/bin/timeout`; `scripts/test-lanes` passed 305 cases and f
 need `timeout`; `scripts/test-maintenance` skipped as a whole and its step failed on it. On the same run
 the Ubuntu job's `scripts/ci` named its eleven skipped self-test cases in one line. Hence `xcode-27`.
 
-UNVERIFIED until its first run: that `xcode-27` has `/usr/bin/timeout` and the other listed tools (macOS
-27 on this Mac has them all), that its `expect` opens a pseudo-terminal, and that the `mise`
-mise-action puts on PATH is the one the cases "run under mise" find. Whatever is missing fails the job
-by name. Its duration and queue time are added here once it has run.
+The second, on `xcode-27` (run 43066545064, 2026-11-11, the same pull request): queued 3 s, ran
+1 m 57 s. The image, `xcode-27-arm64` 20261104.0337.1, macOS 27.0.1 (26A434) with bash 3.2.57, has every
+listed tool but `timeout` too, and the job failed the same way: 305 cases passed and 113 failed, and
+`scripts/test-maintenance` skipped as a whole. macOS 27.2 on this Mac has `/usr/bin/timeout`, so it came
+after 27.0.1. Hence the first step's check. On this Mac the step was run with the tool present, with it
+absent, and with no `imagedata.json`: it gave `run=true`; the warning and summary naming the image; and
+the same saying the file does not name it (run).
+
+UNVERIFIED until the job's first hosted run with the check: that on `xcode-27` it warns naming the image
+and passes with the later steps skipped. UNVERIFIED until an image with `/usr/bin/timeout` runs the job: that its `expect` opens a
+pseudo-terminal, that the `mise` mise-action puts on PATH is the one the cases "run under mise" find,
+and the job's duration with the cases running (on this Mac they take about 3 m 40 s). Whatever fails,
+fails by name.
 
 ## Evidence
 
@@ -125,7 +144,15 @@ Read 2026-11-11. "Fetched" means the raw page was fetched with `curl` (docs.gith
   (fetched).
 * The github-hosted-runners page above lists `xcode-27` in the macOS arm64 row of "Standard
   GitHub-hosted runners for public repositories", whose use there "is free and unlimited" (fetched).
-* The first hosted run's job log, 2026-11-11 (`gh api .../actions/jobs/<id>/logs`, read).
+* The two hosted runs' job logs, 2026-11-11 (`gh api .../actions/jobs/<id>/logs`, read).
+* https://raw.githubusercontent.com/actions/runner-images/main/images/macos/scripts/build/configure-preimagedata.sh
+  — writes `$HOME/imagedata.json` with a "Runner Image" group whose detail reads "Image: ${image_label}\n
+  Version: ${image_version}"; it exports `ImageVersion` and `ImageOS` only in `~/.bashrc`, which `shell:
+  bash` (`--norc`) does not read, so the first step reads the file (fetched).
+* https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-commands — `core.setOutput`
+  and `core.summary` are the environment files `GITHUB_OUTPUT` and `GITHUB_STEP_SUMMARY`; "echo
+  "{name}={value}" >> "$GITHUB_OUTPUT"" sets an output, and a step summary takes GitHub flavored Markdown
+  (fetched).
 * https://raw.githubusercontent.com/rhysd/actionlint/main/docs/config.md — `self-hosted-runner`: "Label
   names added to your self-hosted runners as list of pattern" (fetched). actionlint 1.7.12, the pinned
   and latest release, and its `main` branch's `rule_runner_label.go` list `macos-26` but not `xcode-27`

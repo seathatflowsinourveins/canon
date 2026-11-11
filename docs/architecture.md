@@ -213,8 +213,10 @@ Where they differ in a way a script here depends on:
 * **macOS-only tools.** The hosted Ubuntu runner has no `plutil`, `lockf` or `security` at `/usr/bin`, nor
   an `expect` that opens a pseudo-terminal; `scripts/test-lanes` skips those cases there and `scripts/ci`
   names them in its last lines.
-  The workflow's `macOS self-tests` job runs them on `xcode-27` (macOS 27; `macos-26` has no `/usr/bin/timeout`), where only the case that writes to the
-  login keychain may skip (ADR 0082).
+  The workflow's `macOS self-tests` job is to run them on `xcode-27`, where only the case that writes to
+  the login keychain may skip. Neither hosted image read so far (`macos-26`, and `xcode-27` at macOS
+  27.0.1) has the `/usr/bin/timeout` many of the cases need, so while it lacks it the job warns and runs
+  nothing; it runs them with no edit once the image ships the tool (ADR 0082).
 * **mise configs above the working folder.** mise reads a config in every folder from the root down to
   the one it runs in, unless `MISE_CEILING_PATHS` stops it (mise's `ceiling_paths` setting). A reviewer
   that wrote a copy of `mise.toml` into `/tmp` changed every mise run under `/tmp`, so the self-tests that
