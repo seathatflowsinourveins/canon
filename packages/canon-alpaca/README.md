@@ -76,6 +76,10 @@ Historical trades use the same default IEX feed as bars and subscriptions. A req
 self.request_trades(instrument_id, start=start, end=end, params={"feed": "iex"})
 ```
 
+Only `feed` is supported as a venue option on trade requests. `asof` and `currency` in params are
+refused explicitly: Alpaca's current-day symbol mapping and default USD prices apply. The engine's
+own params, such as `update_catalog`, are preserved; they are not sent to Alpaca.
+
 Register the execution client the same way, with its own config class:
 
 ```python
@@ -218,7 +222,15 @@ Each is stated where it is implemented, with its source.
 * **Trade history** (`_request_trades`): one loaded instrument per request, using
   `GET /v2/stocks/{symbol}/trades` through alpaca-py's existing HTTP session. Every page is read,
   including a short or empty page with a `next_page_token`, until the token ends or the request's total
-  `limit` is reached; each page asks for at most 10,000 records and the remaining limit. Results are
+  `limit` of valid trades is reached; each page asks for at most 10,000 records and the remaining limit,
+  which is enforced even if the server over-returns. An empty string, malformed token or repeated
+  page token fails the request. A collection is capped at 1,000 pages, the pinned NautilusTrader Derive client's collection
+  cap; if more history remains it fails, and the caller shortens the window. This bounds page count,
+  with the existing HTTP timeouts still applying to each call. The response symbol must match the
+  request, and malformed pages or rows fail with the symbol, page number and token named. Symbols
+  are quoted as one URL path segment. Alpaca's documented `u` field is checked before the SDK drops it:
+  `canceled` and `incorrect` prints are excluded, counted and logged, while ordinary trades and
+  `corrected` replacements are kept; condition flags alone do not invalidate a print. Results are
   requested in ascending timestamp order and delivered in one `TradesResponse`, preserving the request
   ID, bounds and params. The inclusive window is cut at now, and a missing start uses midnight New York
   of the end's day, as quotes do. Each tick's `ts_init` equals its own `ts_event`; trade IDs and whole-share

@@ -19,7 +19,24 @@ The single-symbol endpoint is called with alpaca-py's public `RESTClient.get`, s
 `get_stock_trades` uses the multi-symbol endpoint. `StockTradesRequest.to_request_fields` serializes
 the bounds and feed; the symbol moves into the path. `fetch_trades` follows `next_page_token` even
 on a short or empty page, requesting ascending order and at most 10,000 records per page, until the
-token ends or the request's total limit is reached. The existing HTTP lock covers the whole fetch.
+token ends or the request's total limit of valid trades is reached, enforcing that limit even if a
+page over-returns. The existing HTTP lock covers the whole fetch. An empty string, malformed token
+or repeated token is refused, and the collection is capped at `TRADES_MAX_PAGES`, as upstream's Derive collection is
+(`crates/adapters/derive/src/http/query.rs` at the pin). A cap reached with more history outstanding
+fails the request, so a caller must shorten the window; no partial history is returned. This bounds
+the page count, not the wall-clock time of a request; the existing per-call HTTP timeouts still apply.
+Each page must name the requested symbol and contain `trades` (an array, or null for empty history)
+and `next_page_token`; malformed pages and rows fail with the symbol, page number and token named.
+The path quotes the symbol as one segment with Python's `urllib.parse.quote(safe="")`:
+https://docs.python.org/3.14/library/urllib.parse.html#urllib.parse.quote.
+Alpaca's response schema documents `u`: `canceled` and `incorrect` invalidate a print, while
+`corrected` identifies a valid replacement and an absent `u` an ordinary valid print (the historical
+trades reference above, response `stock_trade`). The raw field is checked before alpaca-py's
+`TRADE_MAPPING` drops it (`alpaca/data/mappings.py` at `c42add7c0a70`); invalid prints are dropped,
+counted and logged once per request. Trade condition flags are not validity flags and are not filtered.
+Only `feed` is supported from the venue's optional params; `asof` and `currency` are refused rather
+than ignored. Alpaca's default current-day symbol mapping and USD prices apply, matching the
+adapter's USD equities; the engine's params, such as `update_catalog`, are preserved as before.
 As with quote history, the inclusive window is cut at now and each tick's `ts_init` is its own
 `ts_event` (Databento's `decode_trade_msg` defaults to the event timestamp when no init time is given,
 `crates/adapters/databento/src/decode/market_data.rs` at the pin). Conversion errors and page failures
@@ -228,6 +245,7 @@ from typing import ClassVar
 from typing import Protocol
 from typing import cast
 from typing import override
+from urllib.parse import quote as url_quote
 from zoneinfo import ZoneInfo
 
 from alpaca.data.enums import DataFeed
@@ -344,6 +362,11 @@ no other feed is tried when a request fails."""
 TRADES_PER_SLICE = 10_000
 """How many historical trades are converted before letting the node's loop run, as quotes are."""
 
+TRADES_MAX_PAGES = 1_000
+"""Bound a trade collection as upstream's `DERIVE_COLLECTION_MAX_PAGES` does:
+`crates/adapters/derive/src/http/query.rs` at NautilusTrader `d53849b216e2`. This is a collection
+safety cap, not an Alpaca limit; reaching it with more history outstanding fails the whole request."""
+
 NEW_YORK = ZoneInfo("America/New_York")
 """The US equity market's time zone, which sets the day a bar request's default start falls in."""
 
@@ -365,7 +388,16 @@ class HistoricalClient(Protocol):
     def get(self, path: str, data: dict | None = None) -> HTTPResult: ...
 
 
-def fetch_trades(historical: HistoricalClient, request: StockTradesRequest) -> list[Trade]:
+@dataclass
+class TradeHistory:
+    """Fetched trades and the invalid prints excluded using the endpoint's raw `u` field."""
+
+    trades: list[Trade]
+    canceled: int = 0
+    incorrect: int = 0
+
+
+def fetch_trades(historical: HistoricalClient, request: StockTradesRequest) -> TradeHistory:
     """Fetch the single-symbol trade endpoint through alpaca-py's public GET transport, with the
     historical trades reference's pagination contract (URL in the module header).
 
@@ -375,23 +407,63 @@ def fetch_trades(historical: HistoricalClient, request: StockTradesRequest) -> l
     """
     params = request.to_request_fields()
     symbol = params.pop("symbols")
-    trades: list[Trade] = []
+    history = TradeHistory([])
     remaining = request.limit
+    if remaining is not None and remaining <= 0:
+        return history
+    path = f"/stocks/{url_quote(symbol, safe='')}/trades"
     params["sort"] = "asc"
-    while remaining is None or remaining > 0:
+    seen_tokens: set[str] = set()
+    for page_number in range(1, TRADES_MAX_PAGES + 1):
         params["limit"] = 10_000 if remaining is None else min(remaining, 10_000)
-        # This endpoint returns an object; HTTPResult also covers list endpoints in alpaca-py.
-        page = cast("dict", historical.get(path=f"/stocks/{symbol}/trades", data=params))
+        page = historical.get(path=path, data=params)
+        context = (
+            f"Alpaca trades for {symbol} page {page_number} (token {params.get('page_token')!r})"
+        )
+        if not isinstance(page, dict):
+            raise TypeError(f"{context}: expected an object")
+        if page.get("symbol") != symbol:
+            raise ValueError(
+                f"{context}: response symbol {page.get('symbol')!r} differs from {symbol!r}"
+            )
+        if "trades" not in page or not (page["trades"] is None or isinstance(page["trades"], list)):
+            raise ValueError(f"{context}: expected a trades array or null")
+        if "next_page_token" not in page:
+            raise ValueError(f"{context}: missing next_page_token")
+        token = page["next_page_token"]
+        if token is not None and (not isinstance(token, str) or not token):
+            raise ValueError(f"{context}: invalid page token {token!r}")
+        if token is not None:
+            if token in seen_tokens:
+                raise ValueError(f"{context}: repeated page token {token!r}")
+            seen_tokens.add(token)
         raw_trades = page["trades"]
-        if raw_trades is not None:
-            trades.extend(Trade(symbol, raw) for raw in raw_trades)
+        for row_number, raw in enumerate(raw_trades or [], 1):
+            if not isinstance(raw, dict):
+                raise TypeError(f"{context}: trade row {row_number} is not an object")
+            update = raw.get("u")
+            if "u" in raw and update not in ("canceled", "incorrect", "corrected"):
+                raise ValueError(f"{context}: trade row {row_number} has unknown update {update!r}")
+            if update == "canceled":
+                history.canceled += 1
+                continue
+            if update == "incorrect":
+                history.incorrect += 1
+                continue
+            try:
+                history.trades.append(Trade(symbol, raw))
+            except ValueError as e:
+                raise ValueError(f"{context}: invalid trade row {row_number}: {e}") from e
             if remaining is not None:
-                remaining -= len(raw_trades)
-        token = page.get("next_page_token")
+                remaining -= 1
+                if remaining == 0:  # enforce the total even if the server over-returns
+                    return history
         if token is None:
-            break
+            return history
         params["page_token"] = token
-    return trades
+    raise ValueError(
+        f"Alpaca trades for {symbol} exceeded {TRADES_MAX_PAGES} pages; shorten the window"
+    )
 
 
 type QuoteHandler = Callable[[Quote | RawData], Awaitable[None]]
@@ -1769,6 +1841,13 @@ class AlpacaDataClient(MarketDataClient):
             raise RuntimeError("Alpaca data client is not connected")
         symbol = instrument.id.symbol.value
         feed, _ = named_feed(request.params, TRADES_FEEDS, "trade requests")
+        options = request.params or {}
+        unsupported = [key for key in ("asof", "currency") if key in options]
+        if unsupported:
+            raise ValueError(
+                f"Alpaca trade request params {', '.join(unsupported)} not supported; "
+                "the adapter uses Alpaca's default current-day symbol mapping and USD prices"
+            )
         window = alpaca_quotes_window(request.start, request.end, self.clock.utc_now())
         ticks: list[TradeTick] = []
         if window is not None:
@@ -1776,12 +1855,18 @@ class AlpacaDataClient(MarketDataClient):
             params = StockTradesRequest(
                 symbol_or_symbols=symbol, start=start, end=end, limit=request.limit, feed=feed
             )
-            trades = await self._one_historical_call(
+            history = await self._one_historical_call(
                 functools.partial(fetch_trades, historical), params
             )
+            dropped = history.canceled + history.incorrect
+            if dropped:
+                self._log.warning(
+                    f"Dropped {dropped} invalid Alpaca trades for {symbol} from {start} to {end}: "
+                    f"canceled={history.canceled}, incorrect={history.incorrect} (historical u field)"
+                )
             rounded = 0
             first_rounded = ""
-            for n, trade in enumerate(trades, 1):
+            for n, trade in enumerate(history.trades, 1):
                 tick = parse_trade(trade, instrument, dt_to_unix_nanos(trade.timestamp))
                 ticks.append(tick)
                 if was_rounded(tick.price, trade.price):

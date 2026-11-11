@@ -43,6 +43,7 @@ import requests
 from alpaca.common.exceptions import APIError
 from alpaca.data.enums import DataFeed
 from alpaca.data.historical.stock import StockHistoricalDataClient
+from alpaca.data.requests import StockTradesRequest
 from alpaca.data.timeframe import TimeFrameUnit
 from canon_alpaca.constants import ENV_API_KEY
 from canon_alpaca.constants import ENV_SECRET_KEY
@@ -2189,11 +2190,16 @@ def trades_http(venue, monkeypatch) -> SimpleNamespace:
     https://docs.alpaca.markets/us/reference/stocktradesingle-1.
     """
     historical = StockHistoricalDataClient(PLACEHOLDER, PLACEHOLDER)
-    ns = SimpleNamespace(pages=[], calls=[], historical=historical)
+    ns = SimpleNamespace(
+        pages=[],
+        calls=[],
+        historical=historical,
+        url="https://data.alpaca.markets/v2/stocks/AAPL/trades",
+    )
 
     def answer(method: str, url: str, **kwargs) -> requests.Response:
         assert method == "GET"
-        assert url == "https://data.alpaca.markets/v2/stocks/AAPL/trades"
+        assert url == ns.url
         ns.calls.append(dict(kwargs["params"]))
         assert ns.pages, "unexpected HTTP request"
         page = ns.pages.pop(0)
@@ -2220,6 +2226,11 @@ def historical_trade(second: int, **changes) -> dict:
         "z": "C",
         **changes,
     }
+
+
+def trade_page(trades: list | None, token: str | None = None, symbol: str = "AAPL") -> dict:
+    """The endpoint's required fields, including its required response symbol."""
+    return {"symbol": symbol, "trades": trades, "next_page_token": token}
 
 
 class TradeRequester(Strategy):
@@ -2251,9 +2262,9 @@ class TradeRequester(Strategy):
 
 def test_historical_trades_follow_every_page_and_reach_the_strategy(trades_http) -> None:
     trades_http.pages = [
-        {"trades": [historical_trade(0)], "next_page_token": "second"},
-        {"trades": [], "next_page_token": "third"},
-        {"trades": [historical_trade(3600)], "next_page_token": None},
+        trade_page([historical_trade(0)], "second"),
+        trade_page([], "third"),
+        trade_page([historical_trade(3600)]),
     ]
     strategy = TradeRequester()
 
@@ -2281,8 +2292,8 @@ def test_historical_trades_follow_every_page_and_reach_the_strategy(trades_http)
 
 def test_a_trade_limit_counts_across_pages_and_stops_without_an_extra_fetch(trades_http):
     trades_http.pages = [
-        {"trades": [historical_trade(0), historical_trade(1)], "next_page_token": "second"},
-        {"trades": [historical_trade(2)], "next_page_token": "unneeded"},
+        trade_page([historical_trade(0), historical_trade(1)], "second"),
+        trade_page([historical_trade(2)], "unneeded"),
     ]
     strategy = TradeRequester()
     strategy.limit = 3
@@ -2298,7 +2309,7 @@ def test_a_trade_limit_counts_across_pages_and_stops_without_an_extra_fetch(trad
 def test_trade_history_sends_the_named_feed_and_preserves_response_metadata(
     venue, trades_http, monkeypatch, feed
 ):
-    trades_http.pages = [{"trades": [historical_trade(1)], "next_page_token": None}]
+    trades_http.pages = [trade_page([historical_trade(1)])]
     responses = []
     request = quotes_request(AAPL, start=START, end=END)
     request.params = {"feed": feed, "update_catalog": True}
@@ -2338,7 +2349,7 @@ def test_trade_history_refuses_an_unsupported_feed_before_http(trades_http, feed
 
 @pytest.mark.parametrize("trades", [[], None])
 def test_empty_trade_history_completes_with_one_empty_response(trades_http, trades):
-    trades_http.pages = [{"trades": trades, "next_page_token": None}]
+    trades_http.pages = [trade_page(trades)]
     strategy = TradeRequester()
 
     run(build_node(strategy), "hosted")
@@ -2350,7 +2361,7 @@ def test_empty_trade_history_completes_with_one_empty_response(trades_http, trad
 
 def test_a_later_trade_page_failure_does_not_emit_partial_history(trades_http):
     trades_http.pages = [
-        {"trades": [historical_trade(1)], "next_page_token": "second"},
+        trade_page([historical_trade(1)], "second"),
         APIError('{"code": 42210000, "message": "trade page failed"}'),
     ]
     strategy = TradeRequester()
@@ -2373,9 +2384,7 @@ def test_a_later_trade_page_failure_does_not_emit_partial_history(trades_http):
     ],
 )
 def test_an_unconvertible_historical_trade_fails_the_whole_request(trades_http, changes, reason):
-    trades_http.pages = [
-        {"trades": [historical_trade(1), historical_trade(2, **changes)], "next_page_token": None}
-    ]
+    trades_http.pages = [trade_page([historical_trade(1), historical_trade(2, **changes)])]
     strategy = TradeRequester()
 
     run(build_node(strategy), "hosted")
@@ -2386,9 +2395,7 @@ def test_an_unconvertible_historical_trade_fails_the_whole_request(trades_http, 
 
 
 def test_historical_trade_rounding_is_counted_and_named(trades_http, capfd):
-    trades_http.pages = [
-        {"trades": [historical_trade(1, p=0.12345), historical_trade(2)], "next_page_token": None}
-    ]
+    trades_http.pages = [trade_page([historical_trade(1, p=0.12345), historical_trade(2)])]
     strategy = TradeRequester()
 
     run(build_node(strategy), "hosted")
@@ -2414,7 +2421,7 @@ def test_trade_history_refuses_multiple_instruments_before_http(venue, trades_ht
 
 
 def test_trade_history_caps_each_page_at_the_documented_maximum(trades_http):
-    trades_http.pages = [{"trades": [historical_trade(1)], "next_page_token": None}]
+    trades_http.pages = [trade_page([historical_trade(1)])]
     strategy = TradeRequester()
     strategy.limit = 10_001
 
@@ -2443,9 +2450,7 @@ def test_trade_history_starting_after_now_completes_without_http(venue, trades_h
 def test_historical_trades_let_the_node_loop_run_between_conversion_slices(
     venue, trades_http, monkeypatch
 ):
-    trades_http.pages = [
-        {"trades": [historical_trade(n) for n in range(4)], "next_page_token": None}
-    ]
+    trades_http.pages = [trade_page([historical_trade(n) for n in range(4)])]
     # Set without requiring the constant to exist yet, so the unimplemented hook is the before failure.
     monkeypatch.setattr(canon_alpaca.data, "TRADES_PER_SLICE", 2, raising=False)
     turns = [0]
@@ -2474,6 +2479,177 @@ def test_historical_trades_let_the_node_loop_run_between_conversion_slices(
 
     assert len(seen_at) == 4
     assert seen_at[0] == seen_at[1] < seen_at[2] == seen_at[3]
+
+
+def test_trade_history_filters_canceled_and_incorrect_prints_before_the_sdk_drops_u(
+    trades_http, capfd
+):
+    trades_http.pages = [
+        trade_page(
+            [historical_trade(0, u="canceled"), historical_trade(1, u="incorrect")], "valid"
+        ),
+        trade_page([historical_trade(2, c=["I"]), historical_trade(3, u="corrected")]),
+    ]
+    strategy = TradeRequester()
+    strategy.limit = 2
+
+    run(build_node(strategy), "hosted")
+
+    assert [r.failure_reason for r in strategy.responses] == [None]
+    assert [t.trade_id for t in strategy.seen] == [TradeId("1002"), TradeId("1003")]
+    assert [c["limit"] for c in trades_http.calls] == [2, 2]
+    log = logged(capfd)
+    assert "Dropped 2 invalid Alpaca trades for AAPL" in log
+    assert "canceled=1, incorrect=1" in log
+
+
+@pytest.mark.parametrize("tokens", [["same", "same"], ["a", "b", "a"], [""]])
+def test_trade_history_refuses_empty_or_repeated_page_tokens(trades_http, tokens):
+    # A final page stops the unfixed implementation too, so a before run cannot spin forever.
+    trades_http.pages = [trade_page([], token) for token in tokens] + [trade_page([])]
+    strategy = TradeRequester()
+
+    run(build_node(strategy), "hosted")
+
+    (response,) = strategy.responses
+    assert response.failure_reason is not None
+    assert "AAPL" in response.failure_reason and "page token" in response.failure_reason
+    assert len(trades_http.calls) == len(tokens)
+    assert strategy.seen == []
+
+
+def test_a_repeated_trade_token_is_refused_even_when_the_page_fills_the_limit(trades_http):
+    trades_http.pages = [
+        trade_page([historical_trade(0)], "same"),
+        trade_page([historical_trade(1)], "same"),
+    ]
+    strategy = TradeRequester()
+    strategy.limit = 2
+
+    run(build_node(strategy), "hosted")
+
+    (response,) = strategy.responses
+    assert response.failure_reason is not None and "repeated page token" in response.failure_reason
+    assert strategy.seen == []
+
+
+def test_trade_history_page_cap_fails_without_partial_data_and_releases_the_http_lock(
+    venue, trades_http, monkeypatch
+):
+    monkeypatch.setattr(canon_alpaca.data, "TRADES_MAX_PAGES", 2, raising=False)
+    trades_http.pages = [
+        trade_page([historical_trade(0)], "a"),
+        trade_page([historical_trade(1)], "b"),
+        trade_page([historical_trade(2)]),
+    ]
+    responses = []
+
+    async def body(client) -> None:
+        monkeypatch.setattr(client, "_handle_response", responses.append)
+        request = quotes_request(AAPL, start=START, end=END)
+        with pytest.raises(ValueError, match="AAPL.*exceeded 2 pages"):
+            await client._request_trades(request)
+        assert len(trades_http.calls) == 2
+        assert responses == []
+        await asyncio.wait_for(client._request_trades(request), 2)
+
+    run_with_client(body)
+
+    (response,) = responses
+    assert [t.trade_id for t in response.data] == [TradeId("1002")]
+    assert len(trades_http.calls) == 3
+
+
+@pytest.mark.parametrize("first_page_size", [1, 3])
+def test_trade_history_enforces_its_total_limit_even_when_a_page_over_returns(
+    trades_http, first_page_size
+):
+    trades_http.pages = [
+        trade_page([historical_trade(n) for n in range(first_page_size)], "second"),
+        trade_page([historical_trade(3), historical_trade(4)]),
+    ]
+    strategy = TradeRequester()
+    strategy.limit = 2
+
+    run(build_node(strategy), "hosted")
+
+    assert [r.failure_reason for r in strategy.responses] == [None]
+    expected_ids = ("1000", "1003") if first_page_size == 1 else ("1000", "1001")
+    assert [t.trade_id for t in strategy.seen] == [TradeId(i) for i in expected_ids]
+
+
+@pytest.mark.parametrize(
+    ("symbol", "encoded"),
+    [("BRK/B", "BRK%2FB"), ("A?B", "A%3FB"), ("A#B", "A%23B"), ("A%B", "A%25B")],
+)
+def test_trade_history_quotes_the_symbol_as_one_url_path_segment(trades_http, symbol, encoded):
+    trades_http.url = f"https://data.alpaca.markets/v2/stocks/{encoded}/trades"
+    trades_http.pages = [trade_page([], symbol=symbol)]
+
+    canon_alpaca.data.fetch_trades(
+        trades_http.historical, StockTradesRequest(symbol_or_symbols=symbol, feed=DataFeed.IEX)
+    )
+
+    assert len(trades_http.calls) == 1
+
+
+def test_trade_history_refuses_a_page_for_another_symbol(trades_http):
+    trades_http.pages = [trade_page([historical_trade(0)], symbol="MSFT")]
+    strategy = TradeRequester()
+
+    run(build_node(strategy), "hosted")
+
+    (response,) = strategy.responses
+    assert response.failure_reason is not None
+    assert "AAPL" in response.failure_reason and "MSFT" in response.failure_reason
+    assert strategy.seen == []
+
+
+@pytest.mark.parametrize(
+    "page",
+    [
+        None,
+        [],
+        {"symbol": "AAPL", "next_page_token": None},
+        {"trades": [], "next_page_token": None},
+        {"symbol": "AAPL", "trades": []},
+        {**trade_page([]), "trades": {}},
+        {**trade_page([]), "trades": "not an array"},
+        trade_page([None]),
+        trade_page(["not an object"]),
+        trade_page([{}]),
+        trade_page([historical_trade(0, u="unknown")]),
+        {**trade_page([]), "next_page_token": 123},
+    ],
+)
+def test_malformed_trade_pages_fail_with_the_symbol_and_page_context(trades_http, page):
+    trades_http.pages = [page]
+    strategy = TradeRequester()
+
+    run(build_node(strategy), "hosted")
+
+    (response,) = strategy.responses
+    assert response.failure_reason is not None
+    assert "AAPL" in response.failure_reason and "page 1" in response.failure_reason
+    assert strategy.seen == []
+
+
+@pytest.mark.parametrize("params", [{"asof": "2022-01-01"}, {"currency": "EUR"}])
+def test_trade_history_refuses_unsupported_mapping_and_currency_params_before_http(
+    trades_http, params
+):
+    trades_http.pages = [trade_page([historical_trade(0)])]
+    strategy = TradeRequester()
+    strategy.params = params
+
+    run(build_node(strategy), "hosted")
+
+    (response,) = strategy.responses
+    assert response.failure_reason is not None
+    assert next(iter(params)) in response.failure_reason
+    assert "not supported" in response.failure_reason
+    assert trades_http.calls == []
+    assert strategy.seen == []
 
 
 # -- historical quotes (ADR 0066) ------------------------------------------------------------------
