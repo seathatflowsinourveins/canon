@@ -24,17 +24,20 @@ from optuna.trial import TrialState
 
 import canon_trading.ledger
 import canon_trading.variant_study
+from canon_trading.ledger import FAILED
 from canon_trading.ledger import IDLE
 from canon_trading.ledger import OUTCOME
 from canon_trading.ledger import TRADED
 from canon_trading.ledger import LedgerNotFound
 from canon_trading.ledger import create_ledger_study
 from canon_trading.ledger import open_study
+from canon_trading.ledger import record_trial
 from canon_trading.ranking import RankingReport
 from canon_trading.ranking import RankingStopped
 from canon_trading.ranking import rank
 from canon_trading.variant_study import NEW_YORK
 from canon_trading.variant_study import PERIODS
+from canon_trading.variant_study import STARTING_BALANCES
 from canon_trading.variant_study import SYMBOLS
 from canon_trading.variant_study import WINDOW_END
 from canon_trading.variant_study import WINDOW_START
@@ -47,14 +50,12 @@ from canon_trading.variant_study import record_grid
 from canon_trading.variant_study import run_study
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
     from pathlib import Path
 
     from conftest import AlpacaBars
-    from nautilus_trader.config import BacktestRunConfig
 
     from canon_trading.backtest import BacktestRun
-    from canon_trading.ma_cross import MaCross
+    from canon_trading.backtest import BuiltBacktest
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
@@ -258,16 +259,16 @@ def test_a_run_that_raises_is_recorded_failed_and_the_pass_goes_on(
 ) -> None:
     write_both(alpaca_bars, tmp_path / "catalog")
     configs = grid(periods=SHORT)
-    real = canon_trading.ledger.run_backtest_config
+    real = canon_trading.ledger.run_built
     calls = []
 
-    def first_raises(config: BacktestRunConfig, strategies: Sequence[MaCross]) -> BacktestRun:
+    def first_raises(built: BuiltBacktest) -> BacktestRun:
         calls.append(1)
         if len(calls) == 1:
             raise RuntimeError("engine error")
-        return real(config, strategies)
+        return real(built)
 
-    monkeypatch.setattr(canon_trading.ledger, "run_backtest_config", first_raises)
+    monkeypatch.setattr(canon_trading.ledger, "run_built", first_raises)
     recorded, outcome = run_study(
         tmp_path / "catalog",
         name="s",
@@ -367,7 +368,7 @@ def test_a_failure_that_cannot_be_told_stops_the_pass(
             raise OSError("database is locked")
         return real_tell(self, *args, **kwargs)
 
-    monkeypatch.setattr(canon_trading.ledger, "run_backtest_config", engine_error)
+    monkeypatch.setattr(canon_trading.ledger, "run_built", engine_error)
     monkeypatch.setattr(optuna.Study, "tell", refused)
     with pytest.raises(RuntimeError, match="engine error") as stopped:
         run_study(
@@ -649,8 +650,8 @@ SHIFTED = datetime(2025, 3, 17, 12, tzinfo=NEW_YORK)
 
 
 def _move(ledger: Path, name: str) -> None:
-    """Another study's `move_sample`, as any reader of the ledger may call it under the ledger's
-    lock while a pass holds only its own: the same end, a start a week later than the plan's."""
+    """Another study's `move_sample`, as any reader of the ledger may call it under the study's
+    write lock while a pass holds only its own: the same end, a start a week later than the plan's."""
     with open_study(name, ledger) as other:
         canon_trading.ledger.move_sample(other, start=SHIFTED.isoformat(), end=END.isoformat())
 
@@ -815,7 +816,7 @@ def test_a_failed_run_on_a_sample_moved_beneath_it_stops_the_pass(
     ledger = tmp_path / "trials.db"
     configs = grid(symbols=("SPY",), periods=SHORT[:1])
 
-    def moved_then_raises(config: BacktestRunConfig, strategies: Sequence[MaCross]) -> BacktestRun:
+    def moved_then_raises(built: BuiltBacktest) -> BacktestRun:
         _move(ledger, "s")
         raise RuntimeError("engine error")
 
@@ -823,7 +824,7 @@ def test_a_failed_run_on_a_sample_moved_beneath_it_stops_the_pass(
         "s", start=START.isoformat(), end=END.isoformat(), path=ledger
     ) as study:
         checked = canon_trading.ledger.current_sample(study)
-        monkeypatch.setattr(canon_trading.ledger, "run_backtest_config", moved_then_raises)
+        monkeypatch.setattr(canon_trading.ledger, "run_built", moved_then_raises)
         with pytest.raises(
             ValueError, match=r"moved to sample 1 .*after the pass checked sample 0"
         ):
@@ -840,19 +841,84 @@ def test_a_run_recorded_on_a_sample_moved_beneath_it_stops_the_pass(
     alpaca_bars.write(tmp_path / "catalog", symbols=("SPY",))
     ledger = tmp_path / "trials.db"
     configs = grid(symbols=("SPY",), periods=SHORT[:1])
-    real = canon_trading.ledger.run_backtest_config
+    real = canon_trading.ledger.run_built
 
-    def moved_then_runs(config: BacktestRunConfig, strategies: Sequence[MaCross]) -> BacktestRun:
+    def moved_then_runs(built: BuiltBacktest) -> BacktestRun:
         _move(ledger, "s")
-        return real(config, strategies)
+        return real(built)
 
     with create_ledger_study(
         "s", start=START.isoformat(), end=END.isoformat(), path=ledger
     ) as study:
         checked = canon_trading.ledger.current_sample(study)
-        monkeypatch.setattr(canon_trading.ledger, "run_backtest_config", moved_then_runs)
+        monkeypatch.setattr(canon_trading.ledger, "run_built", moved_then_runs)
         with pytest.raises(
             ValueError, match=r"moved to sample 1 .*after the pass checked sample 0"
         ):
             record_grid(study, tmp_path / "catalog", configs, on_sample=checked)
         assert [t.user_attrs["sample"] for t in study.get_trials()] == [0]
+
+
+# The gate's seventh round, 2026-11-11 (ADR 0073): each test failed before its change.
+
+
+def test_another_caller_s_failed_record_is_no_failure_of_an_attempt_refused_before_its_trial(
+    alpaca_bars: AlpacaBars, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex, gate round 7: the pass told a failed run of its own from a refusal by scanning the
+    study for a failed record of the key numbered after a count it took before the attempt. A
+    record another caller failed meanwhile met that scan, so an attempt refused before any trial (a
+    catalog that holds no bar of the instrument) was noted as a failed run and the pass went on.
+    The pass now reads only the trial its own attempt asked for, by the number the error carries,
+    and an error that carries none stops it."""
+    write_both(alpaca_bars, tmp_path / "catalog")
+    (tmp_path / "empty").mkdir()
+    [config] = grid(symbols=("SPY",), periods=SHORT[:1])
+    ledger = tmp_path / "trials.db"
+    real = canon_trading.ledger.checked_run_config
+
+    def unreadable(_: object) -> list[str]:
+        raise RuntimeError("the run's session days could not be read")
+
+    def another_caller_fails_first(catalog_path: Path, *args: Any, **kwargs: Any) -> object:
+        if catalog_path == tmp_path / "empty":
+            with (
+                open_study("s", ledger) as other,
+                pytest.raises(RuntimeError, match="session days"),
+            ):
+                record_trial(
+                    other, tmp_path / "catalog", [config], starting_balances=STARTING_BALANCES
+                )
+        return real(catalog_path, *args, **kwargs)
+
+    monkeypatch.setattr(canon_trading.ledger, "session_days", unreadable)
+    monkeypatch.setattr(canon_trading.ledger, "checked_run_config", another_caller_fails_first)
+    with create_ledger_study(
+        "s", start=START.isoformat(), end=END.isoformat(), path=ledger
+    ) as study:
+        with pytest.raises(LookupError, match="SPY"):
+            record_grid(study, tmp_path / "empty", [config])
+        [other_s] = study.get_trials()
+
+    assert (other_s.state, other_s.user_attrs[OUTCOME]) == (TrialState.FAIL, FAILED)
+    assert other_s.user_attrs["config_key"] == key_of(config)
+
+
+def test_a_pass_whose_configurations_repeat_a_key_is_refused_before_any_trial(
+    alpaca_bars: AlpacaBars, tmp_path: Path
+) -> None:
+    """Antigravity, gate round 7: the pass read the keys left to record once, as a set, and ran
+    each configuration whose key was in it, so a key given twice was run twice in one pass, and a
+    failed repeat left the key unresolved though its first run had ended. A plan that names one
+    configuration twice is refused by name before any trial."""
+    write_both(alpaca_bars, tmp_path / "catalog")
+    [first, second] = grid(symbols=("SPY",), periods=SHORT)
+    with create_ledger_study(
+        "s", start=START.isoformat(), end=END.isoformat(), path=tmp_path / "trials.db"
+    ) as study:
+        for configs in ([first, first, second], grid(symbols=("SPY", "SPY"), periods=SHORT)):
+            with pytest.raises(ValueError, match=r"SPY 2/5 twice") as refused:
+                record_grid(study, tmp_path / "catalog", configs)
+            assert key_of(first) in str(refused.value)
+        assert study.get_trials() == []
+        assert record_grid(study, tmp_path / "catalog", [first, second]).recorded == (0, 1)

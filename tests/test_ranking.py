@@ -1282,7 +1282,7 @@ def test_a_keyless_waiting_record_can_be_marked_not_run(study: optuna.Study) -> 
 
 
 def test_a_trial_is_marked_not_run_only_on_a_study_the_ledger_opened(tmp_path: Path) -> None:
-    """The mark holds the ledger's lock, which only a study the ledger opened can name."""
+    """The mark holds the study's write lock, which only a study the ledger opened can name."""
     bare = optuna.create_study(
         study_name="bare", storage=f"sqlite:///{tmp_path / 'bare.db'}", direction="maximize"
     )
@@ -1986,7 +1986,7 @@ def test_a_raced_queued_record_whose_read_back_is_refused_stops_and_is_retired(
     with pytest.MonkeyPatch.context() as patched:
         patched.setattr(optuna.Study, "ask", queued_then_asked)
         patched.setattr(canon_trading.ledger, "_asked", unread)
-        patched.setattr(canon_trading.ledger, "run_backtest_config", never)
+        patched.setattr(canon_trading.ledger, "run_built", never)
         with pytest.raises(optuna.exceptions.StorageInternalError, match="refused the read") as err:
             canon_trading.ledger.record_trial(
                 study, tmp_path / "catalog", [ma_cross_config()], starting_balances=["100000 USD"]

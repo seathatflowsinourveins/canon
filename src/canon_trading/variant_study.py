@@ -35,8 +35,9 @@ failure could not be written stops the pass, with the storage error as a note on
 pass holds an exclusive `fcntl.flock` (the standard library's, as
 `canon_trading.ledger` takes for creation) on a lock file beside the ledger, named for the study
 (percent-encoded, so a name holding `/` names one file), so a second pass on the same study is
-refused rather than run beside it. That lock does not hold the study's sample, which any reader of
-the ledger may move under the ledger's own lock (`canon_trading.ledger.move_sample`), so the pass
+refused rather than run beside it. That lock does not hold the study's sample, which another caller
+may move between two of the pass's trials under the study's write lock
+(`canon_trading.ledger.move_sample`, which waits for a record being written), so the pass
 records and ranks only on the sample it checked against the plan, and refuses one moved beneath it.
 A pass that only opens a study looks for the ledger before it takes that lock, and creates no folder
 and no file where there is none. The catalog defaults to the
@@ -82,6 +83,7 @@ from .ledger import record_trial
 from .ledger import refuse_a_moved_sample
 from .ledger import retired_numbers
 from .ledger import samples
+from .ledger import trial_asked_for
 from .ledger import trial_config
 from .ma_cross import MaCrossConfig
 from .ranking import RankingReport
@@ -194,8 +196,10 @@ class Recorded:
     failed: tuple[str, ...]
 
 
-def _told_failed(study: optuna.Study, key: str, before: int) -> bool:
-    """Whether a record of `key` numbered `before` or later holds its failure as `record_trial` wrote it.
+def _told_failed(study: optuna.Study, key: str, number: int) -> bool:
+    """Whether trial `number`, the one this attempt at `key` asked for, holds its failure as
+    `record_trial` wrote it. Only that trial is read: another caller's failed record of the key is
+    no failure of this attempt (`canon_trading.ledger.trial_asked_for`).
 
     `record_trial` tells a raised run `FAIL` with outcome `failed`, and a run whose `tell` was refused
     after its outcome `FAIL` with that outcome kept (`traded` or `idle`); either way it writes the
@@ -204,13 +208,11 @@ def _told_failed(study: optuna.Study, key: str, before: int) -> bool:
     its error written: every result is there, and the gate reads it as the run it was
     (`canon_trading.ranking.ran_to_the_end`), so it is a written failure as well. Any other record
     still `RUNNING`, or one with no error written, is a failure that could not be told, and stops the
-    pass. So does a record of `key` another writer queued, taken from Optuna's queue with its note
-    in `record_trial`'s race (ADR 0054 term 7): it holds that writer's outcome and no failure of
-    `record_trial`'s, so only a record the ledger's one rule reads as `record_trial`'s own counts
-    (`canon_trading.ledger.origin`).
+    pass. So does a record the ledger's one rule does not read as `record_trial`'s own
+    (`canon_trading.ledger.origin`), or one of another key: neither is what this attempt wrote.
     """
     return any(
-        trial.number >= before
+        trial.number == number
         and trial.user_attrs.get("config_key") == key
         and origin(trial).origin is Origin.WRITER
         and "error" in trial.user_attrs
@@ -240,12 +242,16 @@ def record_grid(
     the ranking stops on the key until a later record of it runs to the end (ADR 0054 term 5), and a
     catalog changed mid-pass leaves records that read different bars, which stop it too (ADR 0053
     term 1). Anything that leaves no failure told (a refusal before a trial exists, a failure that
-    could not be written, a defect here) stops the pass. So does a study whose sample is no longer
+    could not be written, a defect here) stops the pass: the error names the trial its attempt asked
+    for (`canon_trading.ledger.trial_asked_for`), only that trial is read, and an error that names
+    none is a refusal, whatever another caller recorded meanwhile. So does a study whose sample is no longer
     `on_sample`, the one the pass checked against its plan: refused before any key is read
     (`_to_record`), before each trial by `record_trial`, and after each attempt, whether its run
-    raised or not, naming both samples.
+    raised or not, naming both samples. A plan that names one configuration twice is refused before
+    any of that (`_refuse_a_repeated_key`).
     """
     keys = [key_of(config, starting_balances) for config in configs]
+    _refuse_a_repeated_key(configs, keys)
     pending = set(_to_record(study, keys, on_sample))
     quiet = LoggerConfig(stdout_level=LogLevel.ERROR)
     recorded, skipped, failed = [], [], []
@@ -253,7 +259,6 @@ def record_grid(
         if key not in pending:
             skipped.append(key)
             continue
-        before = len(study.get_trials(deepcopy=False))
         try:
             trial = record_trial(
                 study,
@@ -264,7 +269,8 @@ def record_grid(
                 on_sample=on_sample,
             )
         except Exception as error:
-            if not _told_failed(study, key, before):
+            number = trial_asked_for(error)
+            if number is None or not _told_failed(study, key, number):
                 raise
             failed.append(f"{describe(config)}: {error!r}")
         else:
@@ -273,6 +279,23 @@ def record_grid(
         # whatever that run left, as a later `record_trial` would refuse it before its trial.
         refuse_a_moved_sample(study, current_sample(study), on_sample)
     return Recorded(tuple(recorded), tuple(skipped), tuple(failed))
+
+
+def _refuse_a_repeated_key(configs: Sequence[MaCrossConfig], keys: Sequence[str]) -> None:
+    """Refuse a plan that names one configuration twice, by name and key, before any trial.
+
+    The keys left to record are read once, before the first trial, so a key given twice would run
+    twice in one pass: two records of one configuration where the plan is one trial each, and a
+    repeat that failed would leave the key unresolved though its first run ended.
+    """
+    seen: set[str] = set()
+    for config, key in zip(configs, keys, strict=True):
+        if key in seen:
+            raise ValueError(
+                f"the pass names {describe(config)} twice (config key {key}); a pass records each "
+                "configuration once, so give each once",
+            )
+        seen.add(key)
 
 
 def describe(config: MaCrossConfig) -> str:
@@ -354,8 +377,9 @@ def _record_and_rank(
 ) -> tuple[Recorded | None, RankingReport | RankingStopped]:
     """Check the study's sample against the plan, record the grid on that sample, and rank it.
 
-    The pass lock keeps a second pass off the study, but not another reader's `move_sample`, which
-    holds the ledger's lock only. So the sample checked here is the one the recording and the ranking
+    The pass lock keeps a second pass off the study, but not another caller's `move_sample`, which
+    holds the study's write lock and so lands between two of the pass's trials, never inside one.
+    So the sample checked here is the one the recording and the ranking
     must answer for: each trial is refused before it is asked for if the study has moved since
     (`record_trial`'s `on_sample`), and a report on another sample than the one checked is refused,
     naming both, since its range is not the plan's (ADR 0048). So is a stop once the study has moved

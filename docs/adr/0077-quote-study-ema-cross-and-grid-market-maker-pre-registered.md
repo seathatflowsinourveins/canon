@@ -1,7 +1,7 @@
 ---
-status: proposed
+status: accepted
 date: 2026-11-11
-decision-makers: master orchestrator (Claude), under the owner's delegation of 2026-11-10; the lead reads the plan
+decision-makers: master orchestrator (Claude), under the owner's delegation of 2026-11-10; the lead, under ADR 0074
 review-by: 2026-12-11
 ---
 
@@ -205,8 +205,13 @@ narrowed that expectation to the precision refusal alone, exit 0, 1 passed and 1
   increment 0.0001 and size increment 1; lows and highs over the lengthened sample, SPY 629.29 to
   781.59 and QQQ 555.60 to 762.83, so `EmaCross`'s 100 shares are at most $78,159 and the grid's 30 at
   most $23,447.70, within the balance.
-* Quotes: not loaded; they wait on the unit of the quote sizes. Trials: none until the gate takes
-  quotes; the study is not created before.
+* Quotes: not loaded. Their sizes are shares from 2025-11-03, the sample's first day, so none is
+  converted (ADR 0066, Confirmation, 2026-11-11). Trials: none until the gate takes quotes; the study is
+  not created before.
+* Accepted 2026-11-11 by the lead under ADR 0074, after one evidence-verifier pass and a second over
+  its changed parts.
+* Held on 2026-11-11: the owner refocused strategy work on extreme movers; no quote was loaded and no
+  trial was run.
 
 ## Evidence
 
