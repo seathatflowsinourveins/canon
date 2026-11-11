@@ -34,8 +34,8 @@ paths:
   The owner decided on 2026-11-11 that this covers both paper accounts, each under its own lock, whoever
   starts the run (a lane, a coordinator or the scheduled agent): `mise run paper:test` on account A,
   `mise run paper:session` on account B and `mise run paper:data` (ADR 0069, ADR 0070).
-  A paper test that opens a market-data stream carries the `alpaca_stream` marker, so it holds the
-  login's stream lock, which a window also takes.
+  A paper test that opens a market-data stream carries the `alpaca_stream` marker, so it holds account
+  A's stream lock, which `paper:data`'s streaming modules also take; a window takes account B's.
   Every paper test places nothing if the account holds an open order it could touch, and cancels what it
   opened and closes any position it opened, in a `finally`.
 * NautilusTrader is pinned to a v2 release candidate in `pyproject.toml` and `uv.lock`. Install with

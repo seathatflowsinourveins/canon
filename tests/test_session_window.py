@@ -2033,8 +2033,8 @@ def test_the_paper_session_deadline_covers_its_lock_wait_start_window_and_bounde
     )
 
 
-# The login's market-data stream lock (ADR 0069): one block in both conftests, which a paper test that streams
-# takes from its fixture, and a window from paper:session's body, after account B's lock.
+# Account A's market-data stream lock (ADR 0069): one block in both conftests, which a paper test that streams
+# takes from its fixture; paper:data's streaming modules take the same lock, and a window takes account B's.
 CONFTESTS = ("tests/conftest.py", "packages/canon-alpaca/tests/conftest.py")
 STREAMING = re.compile(
     r"subscribe_quotes|subscribe_trades|subscribe_bars|DataStream|ExecTester|DataTester"
@@ -2043,7 +2043,7 @@ STREAMING = re.compile(
 
 
 def _stream_block(text: str) -> str:
-    start = text.index("# --- The login's market-data stream lock (ADR 0069).")
+    start = text.index("# --- Account A's market-data stream lock (ADR 0069).")
     return text[start : text.index("# --- End of the stream lock block. ---", start)]
 
 

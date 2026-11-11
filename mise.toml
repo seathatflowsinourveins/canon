@@ -39,9 +39,12 @@ actionlint = "1.7.12"   # canon/upstreams.json: actionlint
 # tried with mise 2026.11.5), and each script's `case` refuses it again. paper:test reads account A's pair and
 # paper:session, by hand or from the schedule, account B's; neither reads the other's. Each account has its own
 # lock, canon-paper-test.lock for A and canon-paper-windows.lock for B, so a test and a window do not wait for
-# each other, and the login's market-data stream (one connection per endpoint, which for a second paper
-# account is UNVERIFIED, ADR 0069) has a third, canon-alpaca-stream.lock, taken last by
-# whatever opens a stream: a window after its sync, and each paper test that streams, from its fixture.
+# each other. Each account's pair has its own market-data stream lock as well, taken last by whatever opens a
+# stream on that pair (ADR 0069, 2026-11-11: two pairs of one login each held a subscribed connection at
+# once): canon-alpaca-stream-tests.lock for A's pair, taken by each paper test that streams, from its fixture,
+# and by paper:data's streaming modules; canon-alpaca-stream-windows.lock for B's, taken by a window after its
+# sync. A stream wait polls lockf(1) -t 0 once a second, since lockf's own -t on a descriptor spins a core
+# while it waits (ADR 0065, 2026-11-11).
 
 [tasks."paper:store"]
 description = "Enter an Alpaca paper account's key pair at a hidden prompt; store it only if Alpaca's paper API accepts it"
@@ -229,10 +232,9 @@ start=$(/bin/date +%s)
 # Account A serves the paper tests and nothing else (ADR 0069), so the run holds account A's lock throughout
 # and a second run waits for it, at most `lockwait` seconds, then fails without placing anything (lockf(1);
 # the file is kept, as a descriptor implies and lockf(1) advises when processes contend). No window takes
-# this lock: windows run on account B under its own. What a test still shares with a window is the login's
-# market-data stream: each paper test that opens one (the `alpaca_stream` marker) takes the stream lock
-# named below from its fixture, waiting as long as this wait, which outlasts one window that runs as it
-# should (session_window.LONGEST_WINDOW_SECS, ADR 0050). The locks are in the per-user temporary folder,
+# this lock: windows run on account B under its own, and stream on B's pair under B's stream lock. Each paper
+# test that opens a stream (the `alpaca_stream` marker) takes account A's stream lock, named below, from its
+# fixture, waiting as long as this wait; paper:data's streaming modules, on A's pair too, take the same lock. The locks are in the per-user temporary folder,
 # which is the same for every process of the user whatever $TMPDIR a session sets.
 # Descriptor 9 and the deadline: the note above this task.
 # the folder's name, or a stop: none would leave a lock file of this run's own, beside no other run's
@@ -258,9 +260,9 @@ lock_wait() {
 }
 exec 9>>"${tmp}canon-paper-test.lock"
 lock_wait 9 "$lockwait" || { echo "paper:test: account A's lock stayed held for $lockwait s; nothing was placed" >&2; exit 1; }
-# the stream lock's path, and the deadline's epoch second, so a streaming test waits for the lock only while
+# account A's stream lock's path, and the deadline's epoch second, so a streaming test waits for the lock only while
 # TEST_ROOM_SECS would be left (the conftests' stream-lock block)
-export CANON_ALPACA_STREAM_LOCK="${tmp}canon-alpaca-stream.lock" CANON_PAPER_TEST_DEADLINE=$((start + deadline))
+export CANON_ALPACA_STREAM_LOCK="${tmp}canon-alpaca-stream-tests.lock" CANON_PAPER_TEST_DEADLINE=$((start + deadline))
 # bounded <secs> <command...>: the command under timeout(1) -s KILL, in the process group timeout leads, with
 # its whole group killed on a stop and once it ends (the note above paper:test)
 bounded() {
@@ -288,8 +290,8 @@ tests
 # One window of the session run (docs/adr/0044-paper-session-windows-for-macross.md, which supersedes ADR
 # 0029's "only paper:test" clause: this task, too, reads a pair into its own env), on paper account B, service
 # canon-alpaca-paper-windows, and no other (ADR 0069). It waits for account B's lock, which only another window
-# takes, and holds it for the window; then, after uv's sync, for the login's market-data stream lock, which a
-# paper test that streams on account A also takes; the two waits share `lockwait`. It holds both for the window,
+# takes, and holds it for the window; then, after uv's sync, for account B's market-data stream lock, which
+# only a window takes; the two waits share `lockwait`. It holds both for the window,
 # at most `session_window.LONGEST_WINDOW_SECS` plus start-up and the bounded end; the window flattens and
 # checks the account before it ends. Arguments go to
 # `python -m canon_trading.session_window` (--session regular|extended|auto, --strategy SessionMaCross, the
@@ -383,11 +385,12 @@ lock_wait() {
     sleep 1
   done
 }
-# stream: the login's market-data stream lock (ADR 0069), on descriptor 7 (the runner's checkout lock is 8),
-# for what is left of `lockwait`; taken after uv's sync, so a window holds it only while its process runs
+# stream: account B's market-data stream lock (ADR 0069), on descriptor 7 (the runner's checkout lock is 8),
+# for what is left of `lockwait`, by lock_wait; taken after uv's sync, so a window holds it only while its
+# process runs
 stream() {
   s=$((lockwait - waited)); [ "$s" -ge 0 ] || s=0
-  exec 7>>"${tmp}canon-alpaca-stream.lock"
+  exec 7>>"${tmp}canon-alpaca-stream-windows.lock"
   lock_wait 7 "$s" || { echo "paper:session: the market-data stream lock stayed held ($lockwait s for both locks); nothing was placed" >&2; exit 1; }
 }
 # bounded <secs> <command...>: the command under timeout(1) -s KILL, in the process group timeout leads, with
@@ -444,9 +447,9 @@ window
 # every alpaca-py REST client this repository builds refuse every method but GET before sending, and the data
 # client refuse to connect if one would send another; each module sets it again and checks (term 3). It places
 # nothing on account A, so it takes no account's lock. A module that streams (`sandbox`, `movers-stream`) takes
-# the login's stream lock on descriptor 7 after uv's sync, as a window does, and holds it for its run: a window
-# that finds the lock held for longer than its own wait fails placing nothing (ADR 0050). `movers-screener`
-# only reads REST, so it takes no stream lock and never keeps a window waiting. deadline: the stream lock's
+# account A's stream lock on descriptor 7 after uv's sync, as a window takes B's, and holds it for its run, so
+# a paper test that streams waits for it, and a window, on B's pair, does not (ADR 0069). `movers-screener`
+# only reads REST, so it takes no stream lock. deadline: the stream lock's
 # wait, the start-up held to `sync`, the imports, the longest run and its stop for a streaming module, and the
 # start-up and the screener's 85 polls for the screener; tests/test_sandbox_node.py and tests/test_movers_*.py
 # hold the sums. Unattended sandbox runs wait for NautilusTrader rc9 (ADR 0068); by hand: mise run paper:data sandbox.
@@ -498,11 +501,11 @@ lock_wait() {
     sleep 1
   done
 }
-# stream: the login's market-data stream lock (ADR 0069), on descriptor 7, as paper:session takes it; only a
-# module that streams takes it
+# stream: account A's market-data stream lock (ADR 0069), on descriptor 7, waited for as paper:session waits
+# for B's; only a module that streams takes it
 stream() {
   [ "$streams" = 1 ] || return 0
-  exec 7>>"${tmp}canon-alpaca-stream.lock"
+  exec 7>>"${tmp}canon-alpaca-stream-tests.lock"
   lock_wait 7 "$lockwait" || { echo "paper:data: the market-data stream lock stayed held for $lockwait s; nothing was run" >&2; exit 1; }
 }
 # bounded <secs> <command...>: as in paper:session (the note above paper:test)

@@ -26,7 +26,7 @@ and very large volume ratio can be missed (UNCALIBRATED, as every threshold of t
 How it is kept from trading (ADR 0070, terms 3 and 5): data-only mode, which `mise run paper:data` sets and
 `main` sets again; its one REST client goes through `canon_alpaca.providers.with_http_timeout`, so every
 method but GET is refused before anything is sent, checked by `require_get_only` before the first request.
-It builds no trading client. It streams, so the task runs it under the login's stream lock.
+It builds no trading client. It streams, so the task runs it under account A's stream lock.
 
 Bounds: `--minutes`, 1 to `MAX_MINUTES`; at most `REF_REQUESTS_PER_MINUTE` snapshot reads and
 `NORMAL_BATCHES_PER_MINUTE` normal reads a minute. Each minute is one JSON line in the log folder the task

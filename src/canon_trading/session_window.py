@@ -62,8 +62,8 @@ refused by name for selling while flat, "Long-only" above); the configured sessi
 clock and calendar before anything starts; the paper account holding no open order and no position in any
 symbol (`leftovers`); one share of the symbol, at its latest sip trade, inside the per-order notional cap
 (`one_share_fits`); at least `GAP_SECS` since the last window ended; then the node runs for `minutes` (default 30, at
-most 60), clipped to the session's end and to `LONGEST_WINDOW_SECS` (about 49 minutes, so a paper test
-waiting for the stream lock outlasts the window and its bounded end), the record saying so when it is. `SessionMaCross` winds down `FLATTEN_SECS` before the end (`EmaCross` has
+most 60), clipped to the session's end and to `LONGEST_WINDOW_SECS` (about 49 minutes, a bound set when a
+streaming paper test waited for the window's stream lock, which since 2026-11-11 is account B's alone), the record saying so when it is. `SessionMaCross` winds down `FLATTEN_SECS` before the end (`EmaCross` has
 no wind-down and trades to the stop), the node
 stops, and the account is checked: no open order, no position. The wait for the stop is bounded by
 `STOP_TIMEOUT_SECS`, the node's own stop bounds summed; past it the window is recorded failed, the
@@ -318,7 +318,7 @@ CALENDAR_BACK = timedelta(days=7)
 DEFAULT_MINUTES = 30
 MAX_MINUTES = 60
 GAP_SECS = 300
-"""Between one window's end and the next one's start, so paper tests waiting for the stream lock get it."""
+"""Between one window's end and the next one's start."""
 FLATTEN_SECS = 120
 """`SessionMaCross` winds down this long before the window ends. A built-in has no wind-down: `EmaCross`
 trades until the stop, and an order it sent then is the account check's to settle (ADR 0060)."""
@@ -483,8 +483,8 @@ END_MARGIN_SECS = math.ceil(LAST_CLOSE_SECS + SKEW_SECS)
 """A window ends at least this long before its session does, so the account check's last market close is
 sent while the session is open, with a minute for skew between Alpaca's clock and this host's."""
 PAPER_LOCK_WAIT_SECS = 3900
-"""How long a paper test that streams waits for the login's market-data stream lock, which a window holds
-from its start to its bounded end (the conftests' `STREAM_LOCK_WAIT_SECS`), and how long
+"""How long a paper test that streams waits for account A's market-data stream lock (the conftests'
+`STREAM_LOCK_WAIT_SECS`; a window holds account B's, not that one, since 2026-11-11), and how long
 `mise run paper:test` waits for account A's lock (`lockwait` in `mise.toml`); no window takes that lock,
 since windows run on account B under their own (ADR 0069). Tests read both, so the three cannot drift."""
 START_UP_SECS = 30
@@ -492,8 +492,10 @@ START_UP_SECS = 30
 LONGEST_WINDOW_SECS = math.floor(
     PAPER_LOCK_WAIT_SECS - START_UP_SECS - ADAPTER_CALL_SECS - SKEW_SECS - AFTER_END_SECS
 )
-"""The longest a window runs (about 49 minutes): a paper test queued behind it for the stream lock gets the
-lock within its wait (`PAPER_LOCK_WAIT_SECS`), after the start-up, the first clock read (with alpaca-py's retries, `ADAPTER_CALL_SECS`), the window
+"""The longest a window runs (about 49 minutes): sized so that a paper test queued behind it for one shared
+stream lock would get the lock within its wait (`PAPER_LOCK_WAIT_SECS`); each account's pair has had its own
+stream lock since 2026-11-11 (ADR 0069), and the bound is kept as it was. It counts the start-up, the first
+clock read (with alpaca-py's retries, `ADAPTER_CALL_SECS`), the window
 timed on a host clock up to `SKEW_SECS` behind Alpaca's, and its bounded end (`AFTER_END_SECS`). The reads
 after the clock read are inside the window, whose end is absolute."""
 
@@ -1137,7 +1139,7 @@ def elsewhere(orders: list, held: Mapping[str, Decimal]) -> list[str]:
 def window_seconds(minutes: int, session_left: float) -> tuple[float, str]:
     """How long a window of `minutes` runs with `session_left` seconds of its session to go, and why it
     is shorter, if it is: it ends `END_MARGIN_SECS` before the session does, and runs at most
-    `LONGEST_WINDOW_SECS`, so it and its bounded end fit a paper test's wait for the stream lock."""
+    `LONGEST_WINDOW_SECS`."""
     asked = minutes * 60
     by_session = session_left - END_MARGIN_SECS
     seconds = min(asked, LONGEST_WINDOW_SECS, by_session)
@@ -1147,7 +1149,7 @@ def window_seconds(minutes: int, session_left: float) -> tuple[float, str]:
         why = f"ends {END_MARGIN_SECS} s before the session does"
     else:
         why = (
-            f"at most {LONGEST_WINDOW_SECS} s, so it and its bounded end fit the stream lock's "
+            f"at most {LONGEST_WINDOW_SECS} s, the longest window, so it and its bounded end fit a "
             f"{PAPER_LOCK_WAIT_SECS} s wait"
         )
     return seconds, f"shortened from {minutes} minutes to {seconds:.0f} s: {why}"

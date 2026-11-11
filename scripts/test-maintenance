@@ -136,7 +136,7 @@ case "$1" in
     # whether each paper lock is held while install runs (the round's reinstall holds the windows' alone);
     # -k keeps the file, which the round has open
     t=$("$CANON_GETCONF" DARWIN_USER_TEMP_DIR 2>/dev/null)
-    for f in paper-windows paper-test alpaca-stream; do
+    for f in paper-windows paper-test alpaca-stream-tests alpaca-stream-windows; do
       if /usr/bin/lockf -k -t 0 "${t}canon-$f.lock" true 2>/dev/null; then echo "install: $f lock free" >> "$STUB/installers.log"
       else echo "install: $f lock held" >> "$STUB/installers.log"; fi
     done
@@ -280,7 +280,7 @@ check "... it completes, though its own job was booted out and the round's proce
 check "... and leaves all five agents loaded" \
       eval '[ "$(ls "$STUB/loaded" | wc -l | tr -d " ")" = 5 ]'
 check "... holding the windows' lock while it installs, so no window starts meanwhile, and no other paper lock" \
-      eval 'grep -qx "install: paper-windows lock held" "$STUB/installers.log" && grep -qx "install: paper-test lock free" "$STUB/installers.log" && grep -qx "install: alpaca-stream lock free" "$STUB/installers.log"'
+      eval 'grep -qx "install: paper-windows lock held" "$STUB/installers.log" && grep -qx "install: paper-test lock free" "$STUB/installers.log" && grep -qx "install: alpaca-stream-tests lock free" "$STUB/installers.log" && grep -qx "install: alpaca-stream-windows lock free" "$STUB/installers.log"'
 check "... and letting it go once it ends" freed "${LT}canon-paper-windows.lock"
 jpg=$(grep -m1 'bootout.*local.canon.maintenance' "$STUB/launchctl.log" >/dev/null && echo seen)
 ipg=$(sed -n 's/^automation install | pgid=\([0-9]*\).*/\1/p' "$STUB/installers.log"); export ipg
@@ -395,13 +395,22 @@ check "... and the next round with no window installs the whole, clearing the de
 rm -f "$STUB/differs-out" "$STUB/differs-rc"; round
 # a paper test's lock, or the stream's with no window: those runs may run from the checkout, so nothing
 echo 4c > "$OW/tracked"; ocommit fourth-c
-for hl in "canon-paper-test.lock:a paper test" "canon-alpaca-stream.lock:a run on the market-data stream"; do
+for hl in "canon-paper-test.lock:a paper test" "canon-alpaca-stream-tests.lock:a run on account A's market-data stream"; do
   /usr/bin/lockf -k "${LT}${hl%%:*}" sleep 30 & HOLDERS="$HOLDERS $!"; hp=$!; sleep 0.5
   logs_clear; round; export HL="${hl%%:*} is held: ${hl#*:}"
   check "${hl%%:*} held (${hl#*:}): the round does nothing, naming it" \
         eval '[ "$RC" = 0 ] && ! head_is_origin && [ ! -s "$STUB/installers.log" ] && [ ! -s "$STUB/updates.log" ] && jqt "$MS" ".outcome == \"waited\" and (.ff | test(\"paper lock is held\")) and (.ff | contains(env.HL))"'
   kill "$hp" 2>/dev/null; wait "$hp" 2>/dev/null
 done
+# a window on B and a stream on account A's pair at once (each pair has its own stream lock, ADR 0069): the
+# stream may run from the checkout, so the round does nothing, though a window runs too
+echo 4d > "$OW/tracked"; ocommit fourth-d
+/usr/bin/lockf -k "${LT}canon-paper-windows.lock" sleep 30 & HOLDERS="$HOLDERS $!"; wh=$!
+/usr/bin/lockf -k "${LT}canon-alpaca-stream-tests.lock" sleep 30 & HOLDERS="$HOLDERS $!"; hp=$!; sleep 0.5
+logs_clear; round; export HL="canon-alpaca-stream-tests.lock is held"
+check "a window runs and account A's stream lock is held: the round does nothing, naming the stream" \
+      eval '[ "$RC" = 0 ] && ! head_is_origin && [ ! -s "$STUB/installers.log" ] && [ ! -s "$STUB/updates.log" ] && jqt "$MS" ".outcome == \"waited\" and (.ff | contains(env.HL))"'
+kill "$hp" "$wh" 2>/dev/null; wait "$hp" "$wh" 2>/dev/null
 # its own lock held (a reinstall still running): nothing, and the record left as it was
 cp "$MS" "$TMP/ms.before"
 /usr/bin/lockf -k "$AH/canon/maintenance.lock" sleep 30 & HOLDERS="$HOLDERS $!"; hp=$!; sleep 0.5
