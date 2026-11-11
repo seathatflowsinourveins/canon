@@ -95,7 +95,8 @@ recommendation either.
   fixed on `main` (`dc49fb6`, ADR 0041's third review); `rank` from that code up to `05955f9`, on a
   copy of the ledger, gives the report above word for word (Evidence, run at `05955f9`); after it, the
   study stops, below. Whether the study is to be recorded again on a
-  moved sample under the fixed recording code is not decided here.
+  moved sample under the fixed recording code is not decided here; it was recorded again on
+  2026-11-11 (below).
 * What ran: `main` at `ba44c25` with ADR 0048's wiring (`canon_trading.variant_study`) before its last
   change, which places a completed record with no sample number as `rank` does (Evidence, code review).
   On a fresh study every version records all eight keys, so that change touches no trial. The bars each
@@ -110,11 +111,43 @@ recommendation either.
   symbol's four trials read one definition unless the catalog's instrument files changed during the
   pass, which nothing recorded can rule out (UNVERIFIED). Under the corrected rule the study as stored
   stops, every record's digest lacking its instrument, until its eight configurations run again on a
-  moved sample; their keys are unchanged, so N stays 8.
+  moved sample; their keys are unchanged, so N stays 8. That re-run is the next entry.
+* The re-run, 2026-11-11 00:04 New York, inside the same study as the corrected rule asks: the bars
+  loaded again from Alpaca into a fresh catalog (`mise run paper:test -- -s -v -k variant_study_bars`,
+  exit 0, 1,366 bars a symbol over the same window); `ledger.move_sample` gave the study sample 1, the
+  same range as sample 0, under the ledger's lock; `python -m canon_trading.variant_study` recorded
+  trials 8 to 15, all `traded`, and printed `rank`'s report:
+
+  ```text
+  Study 'step7-ma-cross-daily-spy-qqq-2020-07-to-2025', sample 1 (2020-07-27T16:00:00+00:00 to 2026-01-01T17:00:00+00:00): 8 records on it, trials 8 to 15, recorded 2026-11-11T05:04:28.301977+00:00 to 2026-11-11T05:04:28.755036+00:00; 16 records on every sample.
+  N = 8 configurations over every sample, T = 1366 sessions (2020-07-28 to 2026-01-01), V = 0.000112974.
+  Pick a437779d65601e16bb9ccfb46e9cfc2a9c26c49477063a31cdec742742c28297 (trials 9): Sharpe ratio 0.0565838 per session, DSR 0.9338; it is rejected at 0.95.
+  N-hat = 2.996, DSR at N-hat 0.9592 (not used in the gate).
+  ```
+
+  N is still 8: the eight keys are those of the plan, and sixteen records over two samples count eight
+  configurations. Every statistic equals the first run's to the digit printed: N, T, V, the session
+  range, the pick and its Sharpe ratio, the DSR, N-hat and the DSR at N-hat; only the sample, trial
+  numbers, times and record count differ, as they must. That is what the inputs predict: the bars'
+  digests are those of the first run (SPY `a0b82593...`, QQQ
+  `e2e49337...`), so Alpaca served the same bars; each trial's configuration and key, session days and
+  returns series equal those of the trial of the same key on sample 0 (compared from the ledger). The
+  code has every change since `ba44c25` in the modules the study runs through, among them the gate's
+  checks, the data identity, the run reading the bars its coverage check read (`dc49fb6`), the key
+  holding base strategy fields set away from their defaults (`3c89ce6`), the config's keyword checks,
+  and skfolio at v1.12.9, whose deflated Sharpe functions are byte-identical to v1.12.8 (#125). The
+  equal keys, returns and report show that none of them moved a figure here. The new digests also name
+  each instrument's definition: SPY
+  `208607431e57368eba0d3e659523742b69b3934ecef825ba5c98bba764baf981`, QQQ
+  `eabf7a651d7c50fada58491e37b225757779a95e9fbfe93704cd1c48d3eae091`. No record holds a system
+  attribute, on either sample. What ran: the checkout was at `main`'s `71e542e` (from the reflog),
+  with an uncommitted comment-only change in `ma_cross.py`; the study run's own log names no package
+  versions. The result stands: no variant passes, and the pick's DSR is 0.9338.
 
 ## Evidence
 
-Read 2026-11-10. Fetched means read in this session as raw text or source; run means executed here.
+Read 2026-11-10, and 2026-11-11 for the re-run. Fetched means read in this session as raw text or
+source; run means executed here.
 
 * The run above and a read of the eight records through `open_study`. Run.
 * Code review of the result, 2026-11-10 (`/code-review`): the pass still counted a completed record
@@ -140,3 +173,10 @@ Read 2026-11-10. Fetched means read in this session as raw text or source; run m
 * `rank` at `05955f9`, on a backup copy of the shared ledger, 2026-11-10: the report above word for
   word; at the next change, which adds the instrument definitions to the data identity (ADR 0053's
   fifth review), the same copy stops on all eight records, each digest lacking its instrument. Run.
+* The re-run on sample 1 above, 2026-11-11, and the ledger read that compares its trials with sample
+  0's; the shared ledger was copied before the sample moved. Run.
+* Second reader of the re-run, 2026-11-11 (`evidence-verifier`): re-ranked copies of the ledger before
+  and after the move, recomputed the instrument digests from the catalog, and compared every pair of
+  trials; corrected above: "every statistic", not every figure; the code changes no longer presented
+  as the full list; skfolio's `_measures.py` the same at v1.12.8 and v1.12.9 (sha256, fetched from the
+  tags); what is known of the code that ran; the two lines the re-run settles.
