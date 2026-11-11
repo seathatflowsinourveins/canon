@@ -779,10 +779,11 @@ def test_a_tell_refused_after_the_run_keeps_the_outcome_it_ran_to(
     assert trial.user_attrs["error"] == "OSError: database is locked"
 
     # It ran to the end, so a later record of its key that read other returns disagrees with it,
-    # where it used to resolve it: the later record here is the same run with one return changed.
+    # where it used to resolve it: the later record here is the same run with one return changed,
+    # on a session day, so the gate accepts each series and compares the two.
     returns = dict(trial.user_attrs["returns_series"])
-    first_day = next(iter(returns))
-    returns[first_day] += 0.01
+    last_session_day = trial.user_attrs["session_days"][-1]
+    returns[last_session_day] += 0.01
     study.add_trial(
         optuna.trial.create_trial(
             state=TrialState.FAIL,  # traded, with no value, as `record_trial` tells returns it refuses

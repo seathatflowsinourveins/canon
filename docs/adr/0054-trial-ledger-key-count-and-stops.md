@@ -44,10 +44,15 @@ ADR 0035's numbers, 4 to 6; terms 1 to 3 (storage, recording, entry) are ADR 003
    or idle); the earlier one stays. Every record of a key that ran to the end on one sample must carry
    the same outcome, range, returns and data (ADR 0053), else the ranking stops and names them. A key is one
    column of the returns matrix.
-6. **What stops the ranking**, beside ADR 0031's, ADR 0041's and ADR 0053's: a study with no record; a key with no
+6. **What stops the ranking**, beside ADR 0031's, ADR 0041's and ADR 0053's: a study with no record, or
+   of other directions than one objective maximized (`record_trial` tells one value, the Sharpe
+   ratio, and `open_study` refuses such a study); a key with no
    record that ran to the end; a `failed` or `RUNNING` record no later record of its key resolves;
    records of one key that disagree (term 5); an idle key (ADR 0010's Limits); and returns ADR 0010
-   step 2 rejects, or a record not in the shape `record_trial` writes. Each message names the key and
+   step 2 rejects, or a record not in the shape `record_trial` writes. Every record that ran on the
+   sample has its returns read before any two are compared: each a float, finite, the sum of their
+   squares finite, and skfolio's variance and fourth central moment of them finite, or its Sharpe
+   ratio of them reads 0.0 and the DSR's kurtosis NaN (2026-11-11). Each message names the key and
    trial; one ranking gathers every trial's stops before it raises.
    A configuration that can never run to the end stops the ranking for as long as that study is used.
    That is the strict reading: a tried configuration is a trial, and no source read gives it a value.
@@ -94,14 +99,17 @@ ADR 0035's numbers, 4 to 6; terms 1 to 3 (storage, recording, entry) are ADR 003
    **One model of who wrote a record** (2026-11-11; ADR 0073 rule 4, the queued record's family found
    in a second round). It is decided in one place, `canon_trading.ledger.origin`, which `record_trial`,
    `retire_queued`, `mark_not_run`, the ranking and the study's pass all read. By key, state, note and
-   attributes, in that order: a keyless record that shows a run is another writer's; a `WAITING` one
-   is queued; one `FAIL` or `RUNNING` with a queue note was taken from the queue here and ran nothing;
-   one with a queue note in another state, a system attribute, a user attribute `record_trial` does
+   attributes, in that order (values first, 2026-11-11): a record told more than one value is
+   another writer's; a keyless record that shows a run is another writer's; a `WAITING` one
+   is queued; one `FAIL` or `RUNNING` with a queue note this module writes on it was taken from the
+   queue here and ran nothing (on a keyless record that is `record_trial`'s note alone, since
+   `retire_queued` takes only a keyed one); one with a queue note in another state, a system attribute, a user attribute `record_trial` does
    not write (on a keyless record, any but its error), a parameter or an intermediate value was
    started, told or written by another writer outside the queue's take, and may have run anything;
    anything else is `record_trial`'s own. When: a keyless record leaves N only by its mark, and only
    while it is in the state the mark leaves (`FAIL` in `not_run`; in `not_run_waiting`, `WAITING`, or
-   `FAIL` once taken here). One another writer started is cleared by nothing, a mark made before
+   `FAIL` once taken here; one taken here and left `RUNNING`, its `tell` refused, `mark_not_run` tells
+   `FAIL`, marked or not). One another writer started is cleared by nothing, a mark made before
    included, so `mark_not_run` refuses it and the ranking stops on it for good. Only a keyed record
    of `record_trial`'s own is read by the pass as its written failure. This narrows ADR 0053 term 3:
    a keyless record ran no backtest only if it is `record_trial`'s own or one taken here. A trial
@@ -223,6 +231,25 @@ study, a larger mechanism than one foreign record needs.
   (`test_a_marked_waiting_record_told_fail_with_the_retirement_s_note_still_stops`); and the pass runs
   a key whose record was taken from the queue
   (`tests/test_variant_study.py::test_a_record_taken_from_the_queue_is_no_run_the_pass_skips_its_key_for`).
+  From the gate's fourth round, tests that failed before their fix (`tests/test_ranking.py`): a study
+  of two objectives, or minimized, is refused by `open_study` and stops the ranking, with each
+  two-valued record named
+  (`test_a_study_not_of_the_ledger_s_one_maximized_objective_is_refused_by_name`,
+  `test_a_record_told_more_than_one_value_is_another_writers`); a keyless record with the
+  retirement's note is another writer's, unmarked, queued or not
+  (`test_a_keyless_record_with_the_retirement_s_note_is_another_writers`); a marked `WAITING` record
+  taken whose `tell` was refused is finished by its mark
+  (`test_a_marked_waiting_record_taken_whose_tell_was_refused_is_finished_by_its_mark`); returns
+  whose squares overflow stop, in the three cases found
+  (`test_returns_whose_squares_overflow_stop_by_name`); and every record of a key has its returns
+  read, in either order (`test_every_record_of_a_key_has_its_returns_checked_whatever_their_order`).
+  `tests/test_returns_matrix.py` refuses a `bool`, an `int`, a NaN and overflowing squares at
+  `daily_series` itself. From the code review of that fix, tests that failed before their change:
+  a minimized study is refused as a two-objective one is (the test above); a rejected return no
+  longer hides its key's other stops
+  (`test_a_return_refused_still_lets_its_key_s_disagreement_be_named`); and returns whose fourth
+  central moment overflows stop by name
+  (`test_returns_whose_fourth_central_moment_overflows_stop_by_name`).
 * The trial count is per study (term 5): nothing in the code stops a new study of the same
   configurations from starting at N = 0, and no record carries an earlier study's keys into it. What
   holds that line is pre-registering every study in a record before its first run, as ADR 0048 does
@@ -390,3 +417,34 @@ Term numbers are ADR 0035's.
   could never fail, the queue notes held in two places, and `origin`'s word on the one reading it
   leaves to `ask`. A NumPy integer stays refused as a trial number, its error naming `int()`. Not
   changed: `origin` read twice for one record's remedy, which changes nothing read.
+* Gate's fourth round, 2026-11-11 (ADR 0073), two outside readers of the gate as checked out at
+  #177; five findings, each reproduced here by a test that failed first (Confirmation). The first
+  reader (Codex): a study of two objectives, opened with the ledger's sample, ranked records told
+  `[Sharpe ratio, 123.0]` at N = 3, DSR 0.988485, as one objective does; `origin` now reads a record
+  told more than one value as another writer's, and the ranking stops on the study by its directions
+  (Optuna 5.0.0 `Study.directions`, run). The second reader (Antigravity): `origin` read a keyless
+  `FAIL` or `RUNNING` record with `retire_queued`'s note as taken here, so `mark_not_run` cleared
+  another writer's started record and the gate passed with N short (fixed inside `origin`:
+  `carries_a_queue_note` accepts on a keyless record only `record_trial`'s note); finite returns
+  whose squares pass float64's largest (about 1.34e154 each) gave skfolio a Sharpe ratio of 0.0,
+  which passed a rejected study, inverted the pick, or raised a bare `ValueError` from N-hat (run at
+  skfolio 1.12.9); a marked `WAITING` record taken here whose `tell` was refused stopped for good,
+  and `mark_not_run` refused it (the mark now tells it `FAIL`); and with several records of one key,
+  only the first was read by `daily_series`, the rest compared by Python's `==`, under which `False`
+  equals 0.0, so the gate passed or stopped by trial order. The last two of those are one input
+  check where returns enter the gate (`daily_series`): every return a float, finite, the squares'
+  sum finite, on every record that ran. Two of the five are of the origin family, three of input
+  validation. Code review of the fix (`/code-review`, high): nine findings. Fixed, each shown by a
+  test that failed first: only the count of objectives was read, so a minimized study passed and
+  `open_study` opened either (now one `MAXIMIZE` objective, read by `open_study` and the ranking);
+  a rejected return hid its key's other stops; and with squares finite, the fourth central moment of
+  returns of about 1e77 or more overflowed, so the gate stopped only on skfolio's DSR of NaN, naming
+  no series (skfolio 1.12.9 `measures.kurtosis` gives NaN for a quotient not finite, read; scaled by
+  1e80 to 1e150, run). The input check now also takes skfolio's own `measures.variance` and
+  `measures.fourth_central_moment`, so it rounds as the gate does, where a sum of squares in
+  Python could round otherwise at float64's edge. Fixed with no test: `mark_not_run`'s `tell` of a
+  take left `RUNNING` skips a trial already finished, as `retire_queued`'s does; a stop that named
+  `record_trial` as the taker, where `retire_queued` takes with the same note; and a header's
+  threshold. Not changed: each record's returns parsed again by the told value's check, and `origin`
+  read up to three times for one marked record, neither of which changes what is read. No change of
+  decision.

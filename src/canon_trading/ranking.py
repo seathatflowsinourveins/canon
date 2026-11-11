@@ -21,8 +21,11 @@ skfolio raises nothing on input that lets a pick pass more easily (ADR 0031), so
 naming the trials, unless every trial's Sharpe ratio and every return of the pick is finite, N >= 2 and
 V > 0. V counts as 0 when every trial's Sharpe ratio equals the first's under `math.isclose` at its
 default tolerance (ADR 0031): copies of one configuration differ only in rounding, and would otherwise
-pass undeflated. A return that is not finite is refused, for every trial, by
-`canon_trading.returns_matrix`.
+pass undeflated. A return that is not finite, not a float, or in a series whose squares sum past
+float64's largest, is refused, for every record that ran on the current sample and before any two are
+compared, by `canon_trading.returns_matrix.daily_series`, and so is one whose variance or fourth
+central moment overflows. A study of any directions but one objective maximized stops it too:
+`record_trial` tells one value, and a record told more is another writer's (`origin`).
 It also stops on what ADR 0054 terms 5 and 6, ADR 0041 and ADR 0053 add: a configuration with a failed or
 `RUNNING` record that no later record of it resolves (a record with a key and no sample number is
 read as on the current sample, unless it ran; one with outcome traded or idle ran, in any state
@@ -69,6 +72,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 from nautilus_trader.model import BarType
+from optuna.study import StudyDirection
 from optuna.trial import TrialState
 from skfolio import measures
 
@@ -91,6 +95,7 @@ from .ledger import origin
 from .ledger import samples
 from .ledger import session_day
 from .ledger import shows_an_evaluation
+from .ledger import taken_untold
 from .ledger import told_sharpe
 from .returns_matrix import ReturnsRejected
 from .returns_matrix import daily_series
@@ -327,6 +332,15 @@ def rank(study: optuna.Study) -> RankingReport:
     known = {s.number for s in history}
     by_key: dict[str, list[FrozenTrial]] = defaultdict(list)
     stops: list[str] = []
+    directions = study.directions
+    if directions != [StudyDirection.MAXIMIZE]:
+        # `record_trial` tells one value, the Sharpe ratio; Optuna 5.0.0 refuses one value on a
+        # study of more objectives (`study/_tell.py`), so no record of its own is told there.
+        stops.append(
+            f"study {study.study_name!r} has {len(directions)} objectives "
+            f"({', '.join(d.name for d in directions)}), where a ledger study has one, MAXIMIZE, "
+            "the Sharpe ratio record_trial tells (ADR 0035, ADR 0054)",
+        )
     marks: dict[str, set[int]] = {}
     malformed: set[str] = set()  # the lists not in their form, whose remedies cannot be taken
     for name in (NOT_RUN, NOT_RUN_WAITING, RETIRED):
@@ -351,7 +365,14 @@ def rank(study: optuna.Study) -> RankingReport:
             by_key[trial.user_attrs["config_key"]].append(trial)
         elif trial.number in marks[NOT_RUN_WAITING]:
             # Read before `origin`, so a record started after its mark is named as such.
-            if not cleared_while_waiting(trial):
+            if taken_untold(trial):
+                stops.append(
+                    f"#{trial.number} (running) was marked not run while WAITING and taken from "
+                    "Optuna's queue with record_trial's note, whose tell was refused; if its "
+                    f"process is gone, mark_not_run(study, {trial.number}) tells it FAIL, and its "
+                    "mark then clears it (ADR 0053)",
+                )
+            elif not cleared_while_waiting(trial):
                 stops.append(
                     f"#{trial.number} ({trial.state.name.lower()}) was marked not run while "
                     f"WAITING and {after_its_mark(trial)}, not as record_trial takes a queued trial "
@@ -392,6 +413,7 @@ def rank(study: optuna.Study) -> RankingReport:
         str, list[FrozenTrial]
     ] = {}  # of those, the ones that ran, for what names them
     read: list[FrozenTrial] = []  # every record on the current sample that ran to the end
+    series: dict[str, pd.Series] = {}  # each chosen record's returns, as `daily_series` read them
     for key, every in by_key.items():
         # On every sample, as N counts keys on every sample: a move clears none of these.
         foreign = [
@@ -445,6 +467,20 @@ def rank(study: optuna.Study) -> RankingReport:
             continue
         read.extend(ran)
         ran_on_sample[key] = ran
+        # Every record that ran is read as returns enter the gate, whatever their order, before
+        # any is compared with another (ADR 0010 step 2).
+        parsed: dict[int, pd.Series] = {}
+        rejected = []
+        for trial in ran:
+            try:
+                parsed[trial.number] = daily_series(
+                    key,
+                    trial.user_attrs.get("returns_series"),
+                    trial.user_attrs.get("session_days"),
+                )
+            except ReturnsRejected as rejection:
+                rejected.append(f"{rejection} (#{trial.number})")
+        stops.extend(rejected)  # the key's other stops are still gathered; no pick is read from it
         unresolved = [
             trial
             for trial in records
@@ -482,17 +518,12 @@ def rank(study: optuna.Study) -> RankingReport:
                 "trial no value",
             )
             continue
+        if rejected:
+            continue
         chosen[key] = first
+        series[key] = parsed[first.number]
 
     stops.extend(_data_disagreements(read, sample))
-    series = {}
-    for key, trial in chosen.items():
-        try:
-            series[key] = daily_series(
-                key, trial.user_attrs.get("returns_series"), trial.user_attrs.get("session_days")
-            )
-        except ReturnsRejected as rejected:
-            stops.append(f"{rejected} (#{trial.number})")
     matrix = None
     if len(series) > 1:
         try:
