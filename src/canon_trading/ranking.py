@@ -21,11 +21,16 @@ skfolio raises nothing on input that lets a pick pass more easily (ADR 0031), so
 naming the trials, unless every trial's Sharpe ratio and every return of the pick is finite, N >= 2 and
 V > 0. Every series it computes on, and each trial's Sharpe ratio, comes from
 `canon_trading.returns_matrix.session_returns`, whose one numeric check (that module's header; ADR
-0080, 2026-11-11) refuses, for every record that ran on the current sample and before any two are
-compared, a return that is not a finite float, and a series of session days that does not vary beyond
-rounding at its own size (a constant one, or one of zeros), whose statistics are not finite, or whose
-moments underflow. No moment is checked here. Sharpe ratios are compared by one bound, each series'
-own (`SessionReturns.rounding`, what rounding can move its computed ratio by; ADR 0080, 2026-11-11),
+0080) refuses, for every record that ran on the current sample and before any two are
+compared, a return that is not a finite float, and a series of session days that skfolio's own
+functions, asked as the gate asks them, raise on or answer with a number that is not finite (fewer
+than three returns and a variance adjustment not above 0 among them), that does not vary beyond
+rounding at its own size (a constant one, one of zeros, or one whose ratio rounding can move by the
+larger of 1 and its own size), or whose moments underflow. `record_trial` tells a value by the same function, so a record
+is `COMPLETE` exactly when its series is taken here. No moment is checked here. Sharpe ratios are
+compared by one bound, each series' own (`SessionReturns.rounding`, what rounding can move its
+computed ratio by, below the larger of 1 and the ratio's size for every series that passed; ADR
+0080),
 and two ratios are told apart only when they differ by more than the sum of their two bounds. Both
 rules of the study are judged on the set, never pair by pair, so no order of recording changes
 either, and the columns are taken in the order of the keys, so V, N-hat and which of several keys
@@ -71,6 +76,17 @@ same on every day, the group is one pick; with any day that differs it leaves no
 stops the ranking, naming the group, whatever order they were recorded in. N-hat
 below 1 is raised to 1, skfolio's least, and the DSR at N-hat is withheld when its benchmark is below
 0 (ADR 0031).
+
+**One door.** `rank` is the only way into a ranking, and every caller passes its refusals in its
+order: the study's pass (`canon_trading.variant_study.run_study`, recording first or with
+`rank_only`, and its command line) and a direct call. A caller that has a plan gives it as `plan`,
+the config key of each configuration planned. The plan is refused first, before the study is read,
+if it names one key twice (`refuse_a_repeated_key`, the function the pass also calls before its
+first trial): N counts a configuration once, so a plan of three entries and two keys would be
+ranked at N = 2 as if it were whole. Then every stop is gathered as above, and with them each
+planned key the ledger holds no record of, on any sample: `rank` counts N from the ledger (ADR 0010
+step 1), so a plan recorded in part would be ranked at an N short of the plan's (ADR 0048). A plan
+never lowers N; a key the ledger counts and the plan lacks stays counted.
 """
 
 from __future__ import annotations
@@ -119,6 +135,7 @@ from .returns_matrix import returns_matrix
 from .returns_matrix import session_returns
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
     from collections.abc import Sequence
 
     import optuna
@@ -373,16 +390,48 @@ def _named(key: str, records: Sequence[FrozenTrial]) -> str:
     return f"{key} ({', '.join(f'#{t.number}' for t in records)})"
 
 
-def rank(study: optuna.Study) -> RankingReport:
+def refuse_a_repeated_key(plan: Sequence[str], legend: Mapping[str, str] | None = None) -> None:
+    """Refuse a plan that names one configuration twice, by name and key: the first refusal of
+    every way into a ranking, and of the study's pass before its first trial (module header).
+
+    `plan` holds the config key of each configuration planned, and `legend` a name to show for a
+    key. A plan is one trial for each configuration. Recorded, a key given twice would run twice in
+    one pass, and a repeat that failed would leave the key unresolved though its first run ended;
+    ranked, the repeat would stand for a configuration the ledger never held, at an N one short.
+    """
+    seen: set[str] = set()
+    for key in plan:
+        if key in seen:
+            raise ValueError(
+                f"the plan names {(legend or {}).get(key, 'one configuration')} twice (config key "
+                f"{key}); a plan holds each configuration once, since each is one trial and N "
+                "counts it once, so give each once",
+            )
+        seen.add(key)
+
+
+def rank(
+    study: optuna.Study,
+    plan: Sequence[str] | None = None,
+    *,
+    legend: Mapping[str, str] | None = None,
+) -> RankingReport:
     """Rank every trial of `study` and test the pick, or raise `RankingStopped` saying why not.
+
+    `plan`, if the caller has one, is the config key of each configuration it planned, and `legend`
+    a name to show for a key. A plan that names one key twice raises `ValueError` before the study
+    is read (`refuse_a_repeated_key`), and a planned key with no record stops the ranking with the
+    other stops (module header, "One door").
 
     Every stop a trial causes is gathered before any is raised, so one call names them all: each
     configuration's records, the shape of its returns, the data it read, the session days it covers
     and its Sharpe ratio. The stops of the study as a whole (N, V, a tie at the top, the DSR) need
     every trial to have cleared those, and come after.
     """
+    planned = list(plan or ())
+    refuse_a_repeated_key(planned, legend)
     trials = study.get_trials(deepcopy=False)  # read only; a copy of every series is not needed
-    if not trials:
+    if not trials and not planned:
         raise RankingStopped(f"study {study.study_name!r} has no trials")
     history = samples(study)  # one read, so the current sample and the known numbers agree
     sample = history[-1]
@@ -463,6 +512,18 @@ def rank(study: optuna.Study) -> RankingReport:
         for key, records in retired.items()
         if key not in by_key
     )
+    unrecorded = [key for key in planned if key not in counted]
+    if unrecorded:
+        stops.append(
+            f"{len(unrecorded)} of the plan's {len(planned)} configurations have no record on any "
+            "sample, so N would be short of the plan's (ADR 0010 step 1, ADR 0048); record them "
+            "first: "
+            + "; ".join(
+                f"{key}{f' ({legend[key]})' if legend and key in legend else ''}: planned but "
+                "never recorded"
+                for key in unrecorded
+            ),
+        )
 
     chosen: dict[str, FrozenTrial] = {}
     on_sample: dict[str, list[FrozenTrial]] = {}
@@ -632,7 +693,7 @@ def rank(study: optuna.Study) -> RankingReport:
     if any(not np.array_equal(matrix[pick].to_numpy(), matrix[key].to_numpy()) for key in top[1:]):
         unranked.append(
             "rank within rounding of each other on returns that differ, so there is no one pick "
-            "(ADR 0031): "
+            "(ADR 0080): "
             + "; ".join(
                 f"{_named(key, ran_on_sample[key])}, Sharpe ratio {sharpes[key]!r} give or take "
                 f"{series[key].rounding:.3g}"
@@ -646,24 +707,16 @@ def rank(study: optuna.Study) -> RankingReport:
         unranked.append(
             f"V = 0: the highest Sharpe ratio, {best!r}, and the lowest, {worst!r}, are within "
             f"rounding of each other ({spread:.3g}), so eq. 1 has no spread to deflate by "
-            f"(ADR 0031): {everyone}",
+            f"(ADR 0080): {everyone}",
         )
     elif not (math.isfinite(v) and v > 0):
         unranked.append(
             f"V = {v}: skfolio's variance of the trials' Sharpe ratios is not above 0 and finite "
-            f"(ADR 0031): {everyone}",
+            f"(ADR 0031, ADR 0080): {everyone}",
         )
     if unranked:
-        # A series next to the numeric check's threshold has a bound above its own ratio: it is
-        # the cause, since nothing can be told apart from it, and is named as that.
-        unranked.extend(
-            f"{_named(key, ran_on_sample[key])}: its returns barely vary beyond rounding at their "
-            f"own size, so rounding can move its Sharpe ratio, {sharpes[key]!r}, by "
-            f"{series[key].rounding:.3g}, more than the ratio itself, so no trial is told apart "
-            "from it (ADR 0031)"
-            for key in matrix.columns
-            if series[key].rounding >= max(1.0, abs(sharpes[key]))
-        )
+        # Every bound here is below the larger of 1 and its ratio's size: a series whose bound
+        # is not was refused where it entered, by the numeric check, in either sign (ADR 0080).
         raise RankingStopped(_stopped(study, n, unranked))
     pick_returns = [float(value) for value in matrix[pick]]
     dsr = float(measures.deflated_sharpe_ratio(pick_returns, values))
