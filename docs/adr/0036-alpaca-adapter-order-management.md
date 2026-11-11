@@ -43,7 +43,7 @@ canceled again, after the others, since its first cancel may have had no answer:
 Brokers select every open order of the instrument, and Binance spot and Bybit every open order of a sided
 command, with no status filter, where Coinbase alone filters it out. A 422 is `OrderCancelRejected`
 ("Cancel, cancel-all, or batch cancel") unless Alpaca shows the order canceled or pending cancel
-(alpaca-py's own retry, ADR 0030), or replaced, when the replacement is canceled; an unexpected error is
+(the refusal then does not show the cancel failed; the cancel itself is sent once, ADR 0039), or replaced, when the replacement is canceled; an unexpected error is
 logged with no event ("parse failures after transmission" leave the outcome unknown). That the rest go on,
 in a batch cancel too, is this repo's choice; `_batch_cancel_orders` keeps the guide's default: Alpaca has
 no cancel-by-list endpoint.
@@ -97,6 +97,10 @@ package README.
 **Account query.** Offline: a strategy's `query_account` reaches the client and the node's balance takes
 Alpaca's new `cash`; a failed read is logged and changes nothing. Paper, 2026-11-10, `mise run paper:test`:
 a query through a node, the node's USD balance equal to Alpaca's `cash` as `get_account` gives it.
+An answer without `cash` or `currency`, both optional in alpaca-py's `TradeAccount`, read as $0 and USD
+with no log, as two independent readers' sweeps reported (DeepSeek Harness, Muse) and a failing test
+showed for each field (run, 2026-11-10); it is now refused naming the field: a connect fails, a query is
+logged and leaves the state as it was (offline). The same paper query ran again on 2026-11-10, overnight, and passed.
 
 TC-E44, venue side, through alpaca-py (2026-11-10, after hours, `mise run paper:test`, twice): a second
 cancel of a canceled $1.00 buy was answered 204, not 422, and the order still read `canceled`, the

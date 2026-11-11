@@ -49,11 +49,36 @@ tens of seconds (Kraken `timeout_secs` 30, OKX `http_timeout_secs` 60). The read
 "between bytes", not the whole response, and a connect timeout applies per address tried.
 
 **With alpaca-py's retry and the node's disconnect.** alpaca-py repeats a request answered 429 or 504 up to
-3 times, 3 s apart; a timeout is not an HTTP status, so it is not repeated. One attempt that hangs now ends
-within about 30 s; a call repeated three times after 429s can take about four attempts' time plus 9 s. The
+3 times, 3 s apart, but not an order command (below); a timeout is not an HTTP status, so it is not repeated.
+One attempt that hangs now ends within about 30 s; a read repeated three times after 429s can take about
+four attempts' time plus 9 s. The
 paper node's disconnect timeout is 15 s, shorter than the read timeout, so a call hanging when the node
 stops can still outlast the disconnect; that the run then ends once the read timeout fires, rather than
 never, follows from the request ending, and is UNVERIFIED on a stopping node.
+
+**Order commands are sent once.** alpaca-py's repeat covers a submit, a replace and a cancel too, and
+`TradingClient` takes no retry setting (the `RESTClient` arguments it does not pass cannot turn the repeat
+off either: a zero or empty value keeps the default). NautilusTrader's policies send a submit, modify or
+cancel "Once, unless the safety test holds", which only "stable request identity and duplicate detection,
+or ... idempotent semantics" can meet, and keep a read's repeat; in its conformance table Architect AX,
+Binance, Coinbase, Derive, Hyperliquid and Lighter send order commands once, and Betfair, the one that
+repeats them, reuses a stable `customerRef`. A repeat here would fail the test's third condition, that it
+"Cannot report an earlier success as a rejection". Alpaca's FAQ says not to resend an order that
+timed out, and on paper it refuses a repeated `client_order_id` with 422 (Confirmation), so a repeat would
+turn a taken submit into a refusal. So the execution client adds a requests response hook ("Event Hooks")
+to the same private session at connect (`execution.send_order_commands_once`, refused without a session as
+the timeout is): while an order command runs on its worker thread (`without_resend`), an error answer
+raises alpaca-py's own `APIError`, built as `RESTClient._one_request` builds it, before alpaca-py can repeat
+the request. The adapter does not set alpaca-py's private retry state (`_retry`, `_retry_codes`): that
+would stop reads' repeats too, and the hook reaches nothing the timeout does not already reach. (The
+session window's own client, outside the adapter, sets `_retry = 0` for its bounded account check, ADR
+0044.) A 504 or 429 is then an unknown outcome, "An HTTP 5xx without definitive command evidence is
+ambiguous" and "rate limits are definitive only when venue-specific semantics prove that the command was
+not accepted", which Alpaca's pages read do not do for the Trading API (its one rate-limit page is the
+Broker API's), and the order is left for the stream, the engine's in-flight `QueryOrder` or
+reconciliation. A public retry option in alpaca-py
+(open pull request 870 lets a zero retry count disable the repeat on `RESTClient`, not `TradingClient`)
+would replace the hook.
 
 **Outcomes.** requests' `ConnectTimeout` and `ReadTimeout` are `OSError`s, which the execution client
 already treats as transport errors. requests' connect timeout is the wait "to establish a connection",
@@ -99,6 +124,26 @@ disconnect on paper stays UNVERIFIED. On paper, the execution rows of `test_pape
 the adapter at the next regular session (UNVERIFIED until then). Before moving the alpaca-py pin, read its
 notes for a timeout option and for `RESTClient`.
 
+**Order commands sent once.** `test_execution_client.py` runs alpaca-py's own `TradingClient` and
+`RESTClient`, its retry included, over a stand-in for the network under requests' `HTTPAdapter` that
+answers every request 504: unchanged, alpaca-py sends a cancel four times (the upstream behaviour, a test
+that fails once alpaca-py stops repeating, when the hook can go); through the execution client a submit, a
+replace and a cancel are each sent once and left unknown, and a read is still sent four times. The three
+order-command tests failed before the hook, each with four requests sent (run, 2026-11-10). The hook
+covers error answers only, and needs nothing more, by two facts each with a test: alpaca-py repeats only
+on its own `RetryException`, raised for a status in its retry codes, so a transport error, a timeout
+above all, propagates unrepeated (`RESTClient._request`); and the transport retries nothing, since
+`TimeoutAdapter` keeps requests' `HTTPAdapter` default, `Retry(0, read=False)`. Over the same stand-in, a
+submit, a replace and a cancel meeting a connect timeout or a read timeout are each sent once, the
+connect timeout's rejected "not sent" and the read timeout's left unknown; the adapter mounted on the
+trading client's session is asserted to retry nothing; and a POST to a local server that never answers,
+through the real requests and urllib3 stack, reaches it once. Paper, 2026-11-10, overnight,
+`mise run paper:test` (`test_paper_resent_client_order_id_is_refused_and_one_order_rests`): a submit
+repeating a resting $1.00 buy's `client_order_id` was answered 422
+`{"code":42210000,"message":"client_order_id must be unique"}`, and Alpaca held one open order under that
+ID, the first. Not shown by any run: that Alpaca answers 504, or anything, when an order request times out
+on its side; Alpaca's pages read do not say what the FAQ's "timeout message" is (UNVERIFIED).
+
 ## Evidence
 
 Read 2026-11-10.
@@ -138,6 +183,30 @@ Read 2026-11-10.
   Duration::from_secs(2))` in its disconnect) (fetched, raw).
 * alpaca-py 0.45.0 as installed, `trading/stream.py`: `stop()` "never blocks"; `_auth` awaits
   `self._ws.recv()` with no timeout, under websockets' `ping_interval` 10 and `ping_timeout` 180 (read).
+* https://raw.githubusercontent.com/nautechsystems/nautilus_trader/d53849b216e20f2c122ca01b4dd0da377638b186/docs/concepts/execution/policies.md
+  ("Delivery and retry limits": "An adapter retries a transient failure only when a repeat is safe"; the
+  table's submit, modify and cancel rows, "Once, unless the safety test holds"; a read, "On a transient
+  failure"; "Command outcomes": "HTTP status codes and rate limits are definitive only when venue-specific
+  semantics prove that the command was not accepted") and `docs/developer_guide/adapters.md` at the same commit ("Send submit ... modify, cancel ...
+  one time only"; "An HTTP 5xx without definitive command evidence is ambiguous"; "Retry gate
+  conformance": Architect AX, Binance, Coinbase, Derive, Hyperliquid and Lighter send order commands once,
+  Betfair repeats them under a stable `customerRef`; Bybit, Kraken spot and OKX can send some twice,
+  "Unsafe") (fetched, raw).
+* https://docs.alpaca.markets/us/docs/working-with-orders.md, FAQ: "What should I do if I receive a
+  timeout message from Alpaca when submitting an order? The order may have been sent to the market for
+  execution. You should not attempt to resend the order or mark the timed-out order as canceled until
+  confirmed by Alpaca Support or the trading team." No status is named (fetched, raw). "Create an Order"
+  (`/us/reference/postorder.md`) lists 200, 403 and 422 and calls `client_order_id` "A unique identifier for
+  the order" (fetched, raw).
+* https://raw.githubusercontent.com/psf/requests/v2.34.2/docs/user/advanced.rst, "Event Hooks": "You can
+  also add hooks to a `Session` instance. Any hooks you add will then be called on every request made to
+  the session"; an unhandled exception in one "won't be passed silently" (fetched, raw).
+* alpaca-py 0.45.0 as installed, `alpaca/common/rest.py`: `RESTClient.__init__` keeps the defaults unless
+  `retry_attempts > 0` or `retry_exception_codes` is non-empty; `_one_request` raises `RetryException` for
+  a code in `_retry_codes` while retries are left, else `APIError(response.text, http_error)` (read).
+  https://github.com/alpacahq/alpaca-py/pull/870, "fix: honor zero retry count and wait options", open,
+  not merged, changes `alpaca/common/rest.py` and its test, `tests/common/test_rest.py` (GitHub API,
+  fetched).
 * Second reader, 2026-11-10 (`evidence-verifier`): the sources hold. Corrected above: a race in the first
   send count, now per call; the search result #211; the disconnect claim, now UNVERIFIED; the hang's cause
   and duration; where the connect-timeout inference comes from; what the contract test checks.

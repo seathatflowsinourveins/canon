@@ -24,7 +24,7 @@ order of the node's chain, which carries the old order with `replaced_by` (obser
 values from the answer or, failing that, from Alpaca; if neither yields them, nothing is generated and
 reconciliation settles the order. The replacement gets a client order ID Alpaca makes (one kept is refused,
 observed). A 422 refusal is `OrderModifyRejected` unless Alpaca shows the order already replaced as asked (a
-second replace is refused "order already replaced", observed, as alpaca-py's own retry would be);
+second replace is refused "order already replaced", observed);
 `order_replace_rejected` is `OrderModifyRejected` too. Denied before Alpaca: no venue order ID, a fractional
 quantity, a quantity or price that is not positive, and a sub-penny price; what only Alpaca knows (an order in
 `accepted` "cannot be replaced") is left to its answer. Each modify sent gets one outcome, though Alpaca can
@@ -164,7 +164,9 @@ Known limits:
   Coinbase, Binance spot and Bybit adapters fetch their venue's account on a query; Alpaca's stream pushes
   no account update, and NautilusTrader keeps a reported cash account's balance as reported
   (`calculate_account_state` off), so the balance is stale between reads (ADR 0036). Cash finer than a
-  cent is reported to the cent with a warning. Buying power, margin and shorting are not modelled.
+  cent is reported to the cent with a warning. An answer without `cash` or `currency`, both optional in
+  alpaca-py's `TradeAccount`, is refused naming the field: a connect fails, a query leaves the state.
+  Buying power, margin and shorting are not modelled.
 * No commission: Alpaca's trade updates carry none, so fills pass `None` and NautilusTrader's own fallback
   applies. No liquidity side: Alpaca reports none, so fills are `NO_LIQUIDITY_SIDE`.
 * A fill's trade ID is Alpaca's `execution_id`, which the stream page shows in its example but does not
@@ -189,11 +191,26 @@ Known limits:
   logged as possibly truncated. An order Alpaca reports with a type, side, class, status, quantity, time in
   force or client order ID this slice does not map, or a replacement whose chain cannot be read, fails the
   report when it is open and is skipped with a warning naming why when it is closed.
-* alpaca-py retries a request answered 429 or 504 up to 3 times (`RESTClient._request`), a submit or
-  cancel included, and the client cannot turn that off. What Alpaca answers a repeated `client_order_id`
-  is not documented on the pages read (UNVERIFIED), so a submit refused with 403 or 422 is rejected only
-  once Alpaca shows it does not hold the order, and a cancel refused with 422 only once Alpaca shows the
-  order neither canceled nor pending cancel; one it shows canceled is canceled.
+* Order commands are sent once (ADR 0039). alpaca-py 0.45.0 sends a request answered 429 or 504 up to 3
+  more times (`RESTClient._request`), a submit, replace or cancel included, and `TradingClient` takes no
+  retry setting. NautilusTrader's policies send a submit, modify or cancel "Once, unless the safety test
+  holds" ("Delivery and retry limits", `docs/concepts/execution/policies.md` at the pinned commit), and
+  upstream's Binance, Coinbase, Derive, Hyperliquid and Lighter adapters send them once ("Retry gate
+  conformance", `docs/developer_guide/adapters.md`); Alpaca's "Working with Orders" FAQ says of an order
+  that timed out "You should not attempt to resend the order". So `send_order_commands_once` adds a
+  requests response hook to the client's session at connect, and `without_resend` has it end an order
+  command at Alpaca's first error answer with alpaca-py's own `APIError`; reads keep alpaca-py's retry,
+  a repeat that is safe ("Read or other idempotent request": "On a transient failure"). A 504 or 429 is
+  an unknown outcome ("An HTTP 5xx without definitive command evidence is ambiguous", adapters.md; "rate
+  limits are definitive only when venue-specific semantics prove that the command was not accepted",
+  policies; Alpaca's pages read document none for the Trading API): the order stays as it was,
+  `SUBMITTED`, `PENDING_UPDATE` or `PENDING_CANCEL`, for a trade update, the engine's in-flight check (`QueryOrder`,
+  read by client order ID for an order without a venue order ID) or reconciliation. Whether a 504 is the
+  FAQ's "timeout message" is not stated on Alpaca's pages read (UNVERIFIED).
+* A submit refused with 403 or 422 is rejected only once Alpaca shows it does not hold the order: Alpaca
+  refuses a repeated `client_order_id`, 422 "client_order_id must be unique" (paper, 2026-11-10), and so
+  holds an order under it. A cancel refused with 422 is rejected only once Alpaca shows the order neither
+  canceled nor pending cancel; one it shows canceled is canceled.
 * alpaca-py sets no HTTP timeout; the client's `TradingClient` gets one, (3.05, 27) s, from a transport
   adapter on alpaca-py's private `_session` (`providers.with_http_timeout`, ADR 0039). A connect timeout
   on a call's only attempt proves nothing was sent, so a submit is rejected, a modify modify-rejected and
@@ -231,6 +248,7 @@ from typing import cast
 from typing import override
 from urllib.parse import urlsplit
 
+import requests
 from alpaca.common.enums import BaseURL
 from alpaca.common.exceptions import APIError
 from alpaca.trading.client import TradingClient
@@ -296,6 +314,7 @@ from .providers import AlpacaInstrumentProvider
 from .providers import counted
 from .providers import credentials_from_env
 from .providers import not_sent
+from .providers import session_of
 from .providers import with_http_timeout
 
 if TYPE_CHECKING:
@@ -551,6 +570,63 @@ def release_after[R](
             loop.call_soon_threadsafe(lock.release)
         except RuntimeError:
             pass  # the loop is closed, and the lock with it
+
+
+SENDING_ONCE = threading.local()
+"""`active` on a worker thread while it runs an order command (`without_resend`)."""
+
+
+def send_order_commands_once[C](client: C) -> C:
+    """Add `end_at_first_error` to the response hooks of an alpaca-py REST client's `requests.Session`
+    ("Event Hooks": a `Session`'s hooks "will then be called on every request made to the session"), once,
+    and return the client. alpaca-py 0.45.0 keeps the session at `_session`, the attribute ADR 0039 reaches
+    through `session_of`; a client without one is refused, as `with_http_timeout` refuses it."""
+    session = session_of(client)
+    if session is None:
+        raise TypeError(
+            f"{type(client).__name__} has no requests.Session at _session; refusing to run with "
+            "alpaca-py's resend of order commands (ADR 0039)"
+        )
+    hooks = session.hooks.setdefault("response", [])
+    if end_at_first_error not in hooks:
+        hooks.append(end_at_first_error)
+    return client
+
+
+def without_resend[R](fn: Callable[..., R]) -> Callable[..., R]:
+    """`fn`, an order command of a client `send_order_commands_once` has prepared, run as an order command:
+    on the worker thread that runs it, `end_at_first_error` ends it at Alpaca's first error answer, so
+    alpaca-py does not send it again."""
+
+    def call(*args: object) -> R:
+        SENDING_ONCE.active = True
+        try:
+            return fn(*args)
+        finally:
+            SENDING_ONCE.active = False
+
+    call.__name__ = getattr(fn, "__name__", "call")
+    return call
+
+
+def end_at_first_error(
+    response: requests.Response, *args: object, **kwargs: object
+) -> requests.Response:
+    """A requests response hook ("Event Hooks", Advanced Usage): during an order command, an error answer
+    raises alpaca-py's `APIError` at once, the exception `RESTClient._one_request` raises for an answer it
+    does not retry, built as it builds it (`APIError(response.text, http_error)`). alpaca-py 0.45.0 sends a
+    request answered 429 or 504 up to three more times, an order command included, and its `TradingClient`
+    takes no retry setting; NautilusTrader's policies send a submit, modify or cancel "Once, unless the
+    safety test holds", and Alpaca's "Working with Orders" says not to resend an order that timed out. A
+    429 ends it too: "rate limits are definitive only when venue-specific semantics prove that the command
+    was not accepted" (policies), and Alpaca's pages read document none for the Trading API. Any other
+    answer, and every answer outside an order command, goes to alpaca-py as it came."""
+    if getattr(SENDING_ONCE, "active", False):
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as e:
+            raise APIError(response.text, e) from e
+    return response
 
 
 def not_sent_reason(error: BaseException) -> str:
@@ -1116,6 +1192,7 @@ class AlpacaExecutionClient(ExecutionClient):
         with_http_timeout(
             self._trading
         )  # a client passed in too; refused without a session (ADR 0039)
+        send_order_commands_once(self._trading)  # refused the same way
         await self._provider.initialize()
         for instrument in self._provider.list_all():
             self._handle_instrument(instrument)
@@ -1194,8 +1271,8 @@ class AlpacaExecutionClient(ExecutionClient):
         try:
             await self._report_account()
         except (APIError, OSError, ValueError, TypeError, RuntimeError, ArithmeticError) as e:
-            # A failed read, a raw or unparsable answer (an unparsable `cash` is a decimal error), or a
-            # client not connected: the state is left as it was.
+            # A failed read, a raw, incomplete or unparsable answer (each named), or a client not
+            # connected: the state is left as it was.
             self._log.error(
                 f"Alpaca account query failed: {e!r}; the account state is left as it was"
             )
@@ -1206,9 +1283,15 @@ class AlpacaExecutionClient(ExecutionClient):
             raise TypeError(
                 "alpaca-py returned raw account data; the client must use raw_data=False"
             )
-        if account.currency not in (None, "USD"):
+        # Both are optional in alpaca-py's `TradeAccount`: a missing one is refused by name, not read as
+        # USD or $0.
+        if account.currency is None:
+            raise ValueError("Alpaca's account answer has no currency")
+        if account.currency != "USD":
             raise ValueError(f"Alpaca account currency is {account.currency}, not USD")
-        amount = Decimal(account.cash or "0")
+        if account.cash is None:
+            raise ValueError("Alpaca's account answer has no cash")
+        amount = decimal_value(account.cash, "cash")
         cents = amount.quantize(Decimal("0.01"))
         if cents != amount:
             # `Money` holds USD at 2 decimals and `Money.from_str` would round without a word.
@@ -1244,7 +1327,7 @@ class AlpacaExecutionClient(ExecutionClient):
         venue = self._venue()  # raises before `OrderSubmitted` when not connected: nothing was sent
         self.generate_order_submitted(order)
         try:
-            placed = await self._call(venue.submit_order, request)
+            placed = await self._call(venue.submit_order, request, once=True)
         except APIError as e:
             if e.status_code in DEFINITIVE_SUBMIT_REFUSALS:
                 await self._refused(order, e)
@@ -1276,13 +1359,12 @@ class AlpacaExecutionClient(ExecutionClient):
         self._accept(order, VenueOrderId(str(placed.id)), dt_to_unix_nanos(placed.submitted_at))
 
     async def _refused(self, order: Any, error: APIError) -> None:
-        """Reject an order Alpaca refused, unless the refusal answered alpaca-py's own retry.
+        """Reject an order Alpaca refused, unless Alpaca holds it.
 
-        alpaca-py repeats a request answered 429 or 504 (`RESTClient._request`) with the same
-        `client_order_id`, so a 403 or 422 can answer the repeat of a submit Alpaca had already taken.
-        What Alpaca answers a repeated `client_order_id` is not documented, so the order is looked up
-        first: if Alpaca holds it, it is accepted, not rejected; if the lookup fails, the outcome is
-        unknown.
+        Alpaca refuses a submit whose `client_order_id` it already holds, 422 "client_order_id must be
+        unique" (paper, 2026-11-10), so a refusal does not prove the order absent. The submit itself is
+        sent once (`without_resend`), so the order is looked up first: if Alpaca holds it, it is accepted, not
+        rejected; if the lookup fails, the outcome is unknown.
         """
         client_order_id = order.client_order_id
         if client_order_id in self._accepted or self._ended(client_order_id):
@@ -1400,7 +1482,7 @@ class AlpacaExecutionClient(ExecutionClient):
                 if not isinstance(found, AlpacaOrder):
                     raise TypeError("alpaca-py returned raw order data")
                 venue_order_id = VenueOrderId(str(found.id))
-            await self._call(self._venue().cancel_order_by_id, venue_order_id.value)
+            await self._call(self._venue().cancel_order_by_id, venue_order_id.value, once=True)
         except APIError as e:
             if e.status_code == NOT_CANCELABLE and venue_order_id is not None:
                 await self._cancel_refused(order, venue_order_id, e)
@@ -1431,10 +1513,9 @@ class AlpacaExecutionClient(ExecutionClient):
     async def _cancel_refused(
         self, order: Any, venue_order_id: VenueOrderId, error: APIError
     ) -> None:
-        """Reject a cancel Alpaca refused, unless the refusal answered alpaca-py's own retry or Alpaca had
-        canceled the order already.
+        """Reject a cancel Alpaca refused, unless Alpaca shows it pending cancel or canceled already.
 
-        As for a submit, a 422 can answer the repeat of a cancel Alpaca had already taken. If Alpaca shows
+        A 422 can answer a cancel of an order a cancel before it, or Alpaca, already took. If Alpaca shows
         the order pending cancel, the `canceled` trade update confirms it and nothing is generated here;
         if the lookup fails, nothing is either. If it shows the order canceled, the `canceled` update may
         never come (a dropped stream sends none), so the order is canceled from what Alpaca shows
@@ -1581,7 +1662,7 @@ class AlpacaExecutionClient(ExecutionClient):
         record.pending[venue_order_id.value] += 1
         try:
             answer = await self._call(
-                self._venue().replace_order_by_id, venue_order_id.value, request
+                self._venue().replace_order_by_id, venue_order_id.value, request, once=True
             )
         except APIError as e:
             if e.status_code == REPLACE_REFUSAL:
@@ -1620,11 +1701,11 @@ class AlpacaExecutionClient(ExecutionClient):
         request: ReplaceOrderRequest,
         error: APIError,
     ) -> None:
-        """Reject a modify Alpaca refused, unless the refusal answered alpaca-py's own retry.
+        """Reject a modify Alpaca refused, unless Alpaca shows the order replaced as asked.
 
-        alpaca-py repeats a request answered 429 or 504, and a second replace of an order already replaced
-        is answered 422 "order already replaced" (observed). So the order is looked up: replaced by an
-        order with the terms this request asked for, the refusal answered the retry and the `replaced`
+        A second replace of an order already replaced is answered 422 "order already replaced" (observed),
+        and the replace itself is sent once (`without_resend`). So the order is looked up: replaced by an
+        order with the terms this request asked for, an earlier replace took it and the `replaced`
         trade update brings `OrderUpdated`; replaced with other terms, it was another modify, and this one
         is rejected; if a lookup fails, the outcome is unknown.
         """
@@ -3195,19 +3276,23 @@ class AlpacaExecutionClient(ExecutionClient):
             raise RuntimeError("Alpaca execution client is not connected")
         return self._trading
 
-    async def _call[R](self, fn: Callable[..., R], *args: object) -> R:
-        """Call a `TradingClient` method in a worker thread, one call at a time.
+    async def _call[R](self, fn: Callable[..., R], *args: object, once: bool = False) -> R:
+        """Call a `TradingClient` method in a worker thread, one call at a time; with `once`, an order
+        command, its request is sent once (`without_resend`; the client was prepared at connect).
 
         As `data.AlpacaDataClient._one_historical_call`: the lock is held on the node's loop and released
         by the worker when the call returns, and the call is shielded, so a cancelled hook leaves it
         running and the lock held until it ends.
         """
         loop = asyncio.get_running_loop()
+        worker = counted(fn)
+        if once:
+            worker = without_resend(worker)
         lock = self._rest_lock
         await lock.acquire()
         try:
             call = asyncio.ensure_future(
-                asyncio.to_thread(release_after, loop, lock, counted(fn), *args)
+                asyncio.to_thread(release_after, loop, lock, worker, *args)
             )
         except BaseException:
             lock.release()

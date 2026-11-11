@@ -29,14 +29,19 @@ from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any
 from typing import cast
+from urllib.parse import urlsplit
 
+import alpaca.common.rest as alpaca_rest
 import canon_alpaca.data
 import canon_alpaca.execution
 import canon_alpaca.factories
 import canon_alpaca.providers
 import pytest
 import requests
+import requests.adapters
+from alpaca.common.exceptions import APIError
 from alpaca.common.rest import RESTClient
+from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide as AlpacaOrderSide
 from alpaca.trading.enums import QueryOrderStatus
 from alpaca.trading.enums import TimeInForce as AlpacaTimeInForce
@@ -54,6 +59,7 @@ from canon_alpaca.execution import AlpacaExecutionClient
 from canon_alpaca.execution import AlpacaExecutionClientConfig
 from canon_alpaca.execution import FilledReading
 from canon_alpaca.execution import fill_report
+from canon_alpaca.execution import send_order_commands_once
 from canon_alpaca.factories import AlpacaDataClientFactory
 from canon_alpaca.factories import AlpacaExecutionClientFactory
 from canon_alpaca.providers import TimeoutAdapter
@@ -665,7 +671,7 @@ def test_submit_whose_connection_timed_out_on_its_only_attempt_is_rejected(venue
         (
             requests.ConnectTimeout("connect timed out"),
             2,
-        ),  # a repeat of a 504, which may have arrived
+        ),  # a second attempt, which the first may have reached
     ],
 )
 def test_submit_that_may_have_reached_alpaca_stays_submitted(venue, capfd, error, sends) -> None:
@@ -736,6 +742,262 @@ def test_cancel_whose_answer_timed_out_leaves_the_order(venue, capfd) -> None:
 
     assert "OrderCancelRejected" not in strategy.names()
     assert "got no answer" in logged(capfd)
+
+
+class GatewayTimeouts:
+    """The network under requests' `HTTPAdapter`, standing in for Alpaca behind an intermediary that gives
+    up waiting: every request is recorded and answered 504 with a gateway's page, or, given `error`, met
+    with that transport error. alpaca-py's own `TradingClient` and `RESTClient` run above it unchanged, its
+    retry included; only its wait between attempts is made instant."""
+
+    def __init__(
+        self, monkeypatch: pytest.MonkeyPatch, error: Callable[[], Exception] | None = None
+    ) -> None:
+        self.sent: list[tuple[str, str]] = []
+
+        def send(
+            adapter, request, stream=False, timeout=None, verify=True, cert=None, proxies=None
+        ):
+            self.sent.append((request.method, urlsplit(request.url).path))
+            if error is not None:
+                raise error()
+            response = requests.Response()
+            response.status_code = 504
+            response.reason = "Gateway Timeout"
+            response._content = b"<html><body>504 Gateway Time-out</body></html>"
+            response.url = request.url
+            response.request = request
+            return response
+
+        monkeypatch.setattr(requests.adapters.HTTPAdapter, "send", send)
+        monkeypatch.setattr(alpaca_rest, "time", SimpleNamespace(sleep=lambda _seconds: None))
+
+    def count(self, method: str) -> int:
+        return sum(1 for sent, _ in self.sent if sent == method)
+
+
+def alpaca_py_trading_client() -> TradingClient:
+    """alpaca-py's own paper `TradingClient`, prepared as the execution client prepares its own at connect:
+    the adapter's timeout and its hook for order commands (ADR 0039)."""
+    return send_order_commands_once(
+        with_http_timeout(TradingClient(api_key=PLACEHOLDER, secret_key=PLACEHOLDER, paper=True))
+    )
+
+
+def test_connect_prepares_the_trading_client_to_send_order_commands_once(venue) -> None:
+    hooks: list[object] = []
+
+    async def body(client: AlpacaExecutionClient) -> None:
+        hooks.extend(venue.trading._session.hooks["response"])
+        send_order_commands_once(venue.trading)  # a second connect adds nothing
+        hooks.append(len(venue.trading._session.hooks["response"]))
+
+    run_with_client(body)
+
+    assert hooks == [canon_alpaca.execution.end_at_first_error, 1]
+
+
+def test_a_client_without_a_requests_session_is_refused_its_order_commands() -> None:
+    with pytest.raises(
+        TypeError, match="refusing to run with alpaca-py's resend of order commands"
+    ):
+        send_order_commands_once(SimpleNamespace())
+
+
+def test_alpaca_py_resends_a_request_answered_504(monkeypatch) -> None:
+    # The upstream behaviour the adapter guards against: alpaca-py 0.45.0 sends a request answered 504
+    # four times (`RESTClient._request`, `DEFAULT_RETRY_ATTEMPTS = 3`), an order command included. If this
+    # fails, alpaca-py no longer resends, and `execution.send_order_commands_once` and its hook can go.
+    wire = GatewayTimeouts(monkeypatch)
+    trading = TradingClient(api_key=PLACEHOLDER, secret_key=PLACEHOLDER, paper=True)
+    with pytest.raises(APIError) as raised:
+        trading.cancel_order_by_id(str(uuid.uuid4()))
+    assert raised.value.status_code == 504
+    assert wire.count("DELETE") == 4
+
+
+def test_a_submit_answered_504_is_sent_once_and_stays_submitted(venue, monkeypatch, capfd) -> None:
+    # NautilusTrader's policies send a submit "once, unless the safety test holds", and Alpaca's FAQ says
+    # not to resend an order that timed out; alpaca-py would resend it three times.
+    wire = GatewayTimeouts(monkeypatch)
+    real = alpaca_py_trading_client()
+    venue.trading.submit_order = real.submit_order
+    strategy = trader(order_type="limit")
+
+    async def body(client) -> None:
+        async with asyncio.timeout(10):
+            while not wire.count("POST"):
+                await asyncio.sleep(0.01)
+        await until_idle(client, venue)
+
+    run_with_client(body, strategy)
+
+    assert wire.count("POST") == 1, wire.sent
+    assert strategy.names() == ["OrderSubmitted"]
+    text = logged(capfd)
+    assert "HTTP 504" in text
+    assert "stays SUBMITTED until a trade update or reconciliation resolves it" in text
+
+
+def test_a_replace_answered_504_is_sent_once_and_left_unknown(venue, monkeypatch) -> None:
+    venue.trading.script = "accept"
+    wire = GatewayTimeouts(monkeypatch)
+    real = alpaca_py_trading_client()
+    venue.trading.replace_order_by_id = real.replace_order_by_id
+    strategy = modifier()
+
+    run_modify(venue, strategy, lambda: bool(wire.count("PATCH")))
+
+    assert wire.count("PATCH") == 1, wire.sent
+    assert "OrderModifyRejected" not in strategy.names()
+    assert "OrderUpdated" not in strategy.names()
+
+
+def test_a_cancel_answered_504_is_sent_once_and_left_unknown(venue, monkeypatch, capfd) -> None:
+    venue.trading.script = "accept"
+    wire = GatewayTimeouts(monkeypatch)
+    real = alpaca_py_trading_client()
+    venue.trading.cancel_order_by_id = real.cancel_order_by_id
+    strategy = trader(order_type="limit", cancel_on="OrderAccepted")
+
+    async def body(client) -> None:
+        async with asyncio.timeout(10):
+            while not wire.count("DELETE"):
+                await asyncio.sleep(0.01)
+        await until_idle(client, venue)
+
+    run_with_client(body, strategy)
+
+    assert wire.count("DELETE") == 1, wire.sent
+    assert "OrderCancelRejected" not in strategy.names()
+    assert "OrderCanceled" not in strategy.names()
+    assert "got no definitive answer (HTTP 504" in logged(capfd)
+
+
+TIMEOUTS = {
+    "connect": lambda: requests.ConnectTimeout("connect timed out"),
+    "read": lambda: requests.ReadTimeout("read timed out"),
+}
+
+
+@pytest.mark.parametrize("timeout", ["connect", "read"])
+@pytest.mark.parametrize("command", ["submit", "replace", "cancel"])
+def test_an_order_command_that_times_out_is_sent_once(venue, monkeypatch, command, timeout) -> None:
+    # alpaca-py resends only on its own `RetryException`, raised for a status in its retry codes; a
+    # transport error propagates (`RESTClient._request`), and requests' `HTTPAdapter`, which the
+    # adapter's `TimeoutAdapter` subclasses, retries nothing by default (`DEFAULT_RETRIES = 0`). Counted at
+    # the transport, each command is sent once. A connect timeout on the only attempt proves nothing was
+    # sent, so the command is rejected "not sent"; a read timeout leaves its outcome unknown (ADR 0039).
+    method, rejection = {
+        "submit": ("POST", "OrderRejected"),
+        "replace": ("PATCH", "OrderModifyRejected"),
+        "cancel": ("DELETE", "OrderCancelRejected"),
+    }[command]
+    if command != "submit":
+        venue.trading.script = "accept"
+    wire = GatewayTimeouts(monkeypatch, TIMEOUTS[timeout])
+    real = alpaca_py_trading_client()
+    if command == "submit":
+        venue.trading.submit_order = real.submit_order
+        strategy: Trader | Modifier = trader(order_type="limit")
+    elif command == "replace":
+        venue.trading.replace_order_by_id = real.replace_order_by_id
+        strategy = modifier()
+    else:
+        venue.trading.cancel_order_by_id = real.cancel_order_by_id
+        strategy = trader(order_type="limit", cancel_on="OrderAccepted")
+
+    async def body(client) -> None:
+        async with asyncio.timeout(10):
+            while not wire.count(method):
+                await asyncio.sleep(0.01)
+        await until_idle(client, venue)
+
+    FINAL_EVENTS.add("OrderCancelRejected")
+    try:
+        run_with_client(body, strategy)
+    finally:
+        FINAL_EVENTS.discard("OrderCancelRejected")
+
+    assert wire.count(method) == 1, wire.sent
+    if timeout == "connect":
+        assert strategy.names()[-1] == rejection, strategy.names()
+        (event,) = [e for e in strategy.events if type(e).__name__ == rejection]
+        assert event.reason.startswith("not sent: "), event.reason
+    else:
+        assert rejection not in strategy.names(), strategy.names()
+
+
+def test_the_trading_clients_transport_retries_nothing(venue) -> None:
+    # The second place a resend could come from: the transport adapter on the trading client's session.
+    # requests' `HTTPAdapter` defaults to `Retry(0, read=False)`; the adapter's `TimeoutAdapter` must keep
+    # that, so a later change to it cannot add a retry unseen.
+    adapters: list[object] = []
+
+    async def body(client: AlpacaExecutionClient) -> None:
+        session = venue.trading._session
+        adapters.extend(session.adapters.get(scheme) for scheme in ("https://", "http://"))
+
+    run_with_client(body)
+
+    for adapter in adapters:
+        assert isinstance(adapter, TimeoutAdapter)
+        retries = adapter.max_retries
+        assert retries.total == 0 and retries.read is False, retries
+        assert not retries.connect and not retries.status and not retries.other, retries
+
+
+def test_a_post_that_times_out_on_the_wire_is_sent_once(venue, monkeypatch) -> None:
+    # The same through the real requests and urllib3 stack, no stand-in under it: a local server that
+    # reads each request and never answers counts what reaches it.
+    monkeypatch.setattr(canon_alpaca.providers, "CONNECT_TIMEOUT_SECS", 0.5)
+    monkeypatch.setattr(canon_alpaca.providers, "READ_TIMEOUT_SECS", 0.5)
+    server = SilentServer()
+    rest = send_order_commands_once(
+        with_http_timeout(
+            RESTClient(
+                base_url=f"http://127.0.0.1:{server.port}",
+                api_version="v2",
+                api_key=PLACEHOLDER,
+                secret_key=PLACEHOLDER,
+            )
+        )
+    )
+    outcomes: list[str] = []
+
+    async def body(client: AlpacaExecutionClient) -> None:
+        try:
+            await client._call(rest.post, "/hang", {}, once=True)
+        except requests.ReadTimeout as e:
+            outcomes.append(type(e).__name__)
+
+    try:
+        run_with_client(body)
+        held = len(server.held)
+    finally:
+        server.close()
+
+    assert outcomes == ["ReadTimeout"]
+    assert held == 1
+
+
+def test_a_read_answered_504_keeps_alpaca_pys_retry(venue, monkeypatch) -> None:
+    # A read changes nothing at Alpaca, so a repeat is safe ("Read or other idempotent request": "On a
+    # transient failure", NautilusTrader's policies); only order commands are sent once.
+    wire = GatewayTimeouts(monkeypatch)
+    real = alpaca_py_trading_client()
+    outcomes: list[object] = []
+
+    async def body(client: AlpacaExecutionClient) -> None:
+        try:
+            await client._call(real.get_order_by_client_id, "some-order")
+        except APIError as e:
+            outcomes.append(e.status_code)
+
+    run_with_client(body)
+
+    assert outcomes == [504]
+    assert wire.count("GET") == 4, wire.sent
 
 
 class SilentServer:
@@ -913,10 +1175,11 @@ def test_fill_without_an_execution_id_is_logged_not_applied(venue, capfd) -> Non
 
 
 def test_refused_repeat_of_a_submit_alpaca_took_is_not_a_rejection(venue, alpaca, capfd) -> None:
-    # alpaca-py repeats a submit answered 504; the repeat is refused, but Alpaca holds the first one.
-    # No trade update has arrived yet, so only the lookup can tell.
+    # Alpaca refuses a submit whose client order ID it holds, 422 "client_order_id must be unique" (paper,
+    # 2026-11-10), so a refusal can come while Alpaca holds the order. No trade update has arrived yet,
+    # so only the lookup can tell.
     venue.trading.script = "silent"
-    venue.trading.submit_error = alpaca.api_error(422, 40010001, "client_order_id must be unique")
+    venue.trading.submit_error = alpaca.api_error(422, 42210000, "client_order_id must be unique")
     venue.trading.took_before_error = True
     strategy = trader(order_type="limit")
 
@@ -933,7 +1196,7 @@ def test_refused_repeat_of_a_submit_alpaca_took_is_not_a_rejection(venue, alpaca
 
 
 def test_refused_repeat_of_a_cancel_alpaca_took_is_not_a_rejection(venue, alpaca) -> None:
-    # The repeat of a cancel is refused 422 while Alpaca shows the order pending cancel.
+    # A cancel is refused 422 while Alpaca shows the order pending cancel from a cancel before it.
     venue.trading.script = "accept"
     venue.trading.cancel_error = alpaca.api_error(422, 42210000, "order is not cancelable")
     venue.trading.took_before_error = True
@@ -1376,7 +1639,7 @@ def test_modify_whose_answer_timed_out_is_not_rejected(venue) -> None:
 
 
 def test_refused_repeat_of_a_replace_alpaca_took_is_not_a_rejection(venue, alpaca, capfd) -> None:
-    # alpaca-py repeats a replace answered 504; the repeat gets 422 "order already replaced" (observed).
+    # A second replace of an order already replaced gets 422 "order already replaced" (observed).
     venue.trading.script = "accept"
     venue.trading.replace_error = alpaca.api_error(422, 42210000, "order already replaced")
     venue.trading.took_before_error = True
@@ -2616,7 +2879,7 @@ def test_query_account_reports_alpacas_account_again(venue) -> None:
     ("failure", "logged_as"),
     [
         (ConnectionError("connection reset"), "ConnectionError('connection reset')"),
-        (None, "InvalidOperation"),  # an unparsable `cash`
+        (None, "cash 'not a number' is not a number"),  # an unparsable `cash`, named
     ],
 )
 def test_failed_account_query_leaves_the_state_as_it_was(venue, capfd, failure, logged_as) -> None:
@@ -2649,6 +2912,47 @@ def test_failed_account_query_leaves_the_state_as_it_was(venue, capfd, failure, 
     text = logged(capfd)
     assert "Alpaca account query failed:" in text
     assert logged_as in text
+
+
+@pytest.mark.parametrize("field", ["cash", "currency"])
+def test_an_account_answer_without_cash_or_currency_is_refused_by_name(venue, capfd, field) -> None:
+    # Found by two independent readers' sweeps (DeepSeek Harness, finding 3; Muse): a missing `cash` read
+    # as $0 and a missing `currency` as USD, with no log. Both are optional in alpaca-py's `TradeAccount`.
+    strategy = trader(idle=True)
+    seen: list = []
+
+    async def body(client) -> None:
+        def state() -> tuple[str, int]:
+            account = client.cache.account(ACCOUNT_ID)
+            assert account is not None
+            return str(account.balance().total), len(account.events)
+
+        before = state()
+        venue.trading.account = {k: v for k, v in venue.trading.account.items() if k != field}
+        strategy.query_account(ACCOUNT_ID, ClientId("ALPACA"))
+        await until_idle(client, venue)
+        seen.append((before, state()))
+
+    run_with_client(body, strategy)
+
+    ((before, after),) = seen
+    assert after == before
+    text = logged(capfd)
+    assert "Alpaca account query failed:" in text
+    assert f"Alpaca's account answer has no {field}" in text
+
+
+def test_a_connect_whose_account_answer_has_no_cash_fails_naming_it(venue, capfd) -> None:
+    venue.trading.account = {k: v for k, v in venue.trading.account.items() if k != "cash"}
+    node = build_node(trader(submit=False))
+
+    with pytest.raises(
+        RuntimeError, match="readiness timeout while waiting for engine connections"
+    ):
+        run(node)
+
+    assert node.cache.account(ACCOUNT_ID) is None
+    assert "failed to connect: Alpaca's account answer has no cash" in logged(capfd)
 
 
 def test_query_for_another_account_is_refused(venue, capfd) -> None:
@@ -3283,7 +3587,7 @@ def test_submit_refused_whose_lookup_cannot_be_built_stays_submitted(
     # A 422 on the submit, then a lookup answered with a body alpaca-py cannot build: the outcome is
     # unknown, logged as such, as `_filled_quantities` takes the same two classes.
     venue.trading.script = "silent"
-    venue.trading.submit_error = alpaca.api_error(422, 40010001, "client_order_id must be unique")
+    venue.trading.submit_error = alpaca.api_error(422, 42210000, "client_order_id must be unique")
     venue.trading.lookup_error = error
     strategy = trader(order_type="limit")
 
