@@ -127,7 +127,10 @@ cancels and queries skip the risk engine and are uncapped, and the adapter's `_q
 The binding bounds are the locks: each paper account has its own, account A's for the tests and account
 B's for the windows (ADR 0069 term 3), and the schedule holds B's for about 28 of every 38 minutes a
 session is open (a 25-minute window and about three of start and stop, then 600 s after each firing
-ends, ADR 0050). Every run that streams shares the login's stream lock. Streams are the bound behind it: "The number of connections to a single endpoint from
+ends, ADR 0050). Updated 2026-11-11: each task or test here that opens a market-data stream takes its
+account pair's stream lock
+(`canon-alpaca-stream-tests.lock` for A, `canon-alpaca-stream-windows.lock` for B; ADR 0069 term 3).
+Streams are the bound behind it: "The number of connections to a single endpoint from
 a user is limited based on the user's subscription, but in many subscriptions (or without one) this limit
 is 1", and "most users can have only 1 active stream connection", 406 beyond. Whether it binds per
 endpoint or per user across endpoints is UNVERIFIED.
@@ -135,7 +138,8 @@ endpoint or per user across endpoints is UNVERIFIED.
 ### More paper accounts, and which runs stream
 
 A second paper account for windows, beside the one the tests use, with a lock per account and a stream
-lock, is ADR 0069's decision, accepted and built: account A for the tests, account B for the windows. What this plan takes from Alpaca: paper accounts are
+lock per account pair, is ADR 0069's decision, accepted and built: account A for the tests, account B for
+the windows. What this plan takes from Alpaca: paper accounts are
 created and deleted in the dashboard "rather than resetting them", with "new API keys for any newly
 created account", and the initial one starts at $100k ("Paper Trading"). One staff post (forum, 2025-11-07) says "Each owner is currently allowed 3 paper accounts
 and 1 live account" and "You can actually have as many paper accounts as you wish", and reconciles them
@@ -147,12 +151,16 @@ subscription", a staff reply comparing paper and live keys), so a second account
 data budget, and no stream if the limit binds per user (UNVERIFIED, above). No Trading API plan gives a
 connection count; Broker API plans list 5 or 10. Nothing here recommends buying or opening anything.
 
-Runs that open a market-data stream (the adapter opens it at a node's first quote or trade subscription; on
-`main`): every window; `test_paper_feed.py` (2); `test_paper_matrix.py` (6); `tests/test_paper_ema_cross.py`;
+Tasks and tests here that open a market-data stream on `main`: `paper:data`'s `sandbox` and
+`movers-stream` modules; every window; `test_paper_feed.py` (2); `test_paper_matrix.py` (6);
+`tests/test_paper_ema_cross.py`;
 `test_paper_overnight_fill.py` (its `boats` quote subscription);
 and in `test_paper_execution.py` the four `ExecTester` tests, TC-E30, TC-E41 and the TC-E20 and TC-E22
-stop rows (`ExecTesterConfig` subscribes quotes and trades by default; run). The rest open none. Each node
-with the Alpaca execution client also opens the trade-updates stream, whose limit no page read states.
+stop rows (`ExecTesterConfig` subscribes quotes and trades by default; run). The adapter opens its
+market-data stream at a node's first quote or trade subscription. The remaining paper tests and
+`movers-screener` open no market-data stream. Each node with the Alpaca execution client also opens the
+trade-updates stream, whose limit no page read states; the market-data lock does not cover it. A recorder
+outside the tasks takes no lock, under ADR 0069 term 3's separate terms.
 
 **The plan, in the order it can start.** (1) Tonight, on `main`: the sandbox on `boats` with a strategy that
 names its feed, under `paper:test` (done once); built-ins in a sandbox node and in the backtest node on
@@ -240,4 +248,19 @@ Read 2026-11-10. Fetched means read in this session as raw text or source; run m
   (`ema_cross/strategy.rs`), so "a refused order leaves its side flipped" holds for a refusal after
   the submit returns; applied in the Confirmation.
 * Pointer, 2026-11-11: the dated paragraph under the Decision Outcome, added with ADR 0083. No other text
-  of this record changed.
+  of this record changed then.
+* Correction, 2026-11-11: `mise.toml:265,393,508`, read, names A's and B's stream locks as ADR 0069
+  term 3 assigns them. An expired stream-lock wait fails the waiter by name before the waiting module
+  or test streams or places an order, while the holder continues: `mise.toml:494-509` returns failure
+  and exits the waiting data task; `tests/conftest.py:358-365` fails setup of that test item. Neither
+  signals the holder. With the repository's defaults, pytest continues the remaining items while
+  keeping A's account lock (`mise.toml:281-285`, `pytest.toml`; ADR 0069's bounds). The data task's 900 s
+  admission wait deliberately permits this failure
+  (`scripts/test-lanes:1930`, read); the streaming test's at-most-3,900 s wait remains a recorded limit
+  (ADR 0069, "Bounds checked 2026-11-11"). This checks the source, not a paper run's duration, which
+  remains UNVERIFIED here.
+* Further correction, 2026-11-11: the lock claim covers this repository's tasks and tests opening a
+  market-data stream; the adjacent account paragraph and stream list now agree. `mise.toml:477-479`
+  lists the two streaming data modules and the REST-only screener; `canon_alpaca/data.py:18-21` and
+  `canon_alpaca/execution.py:1253-1263` distinguish market data from trade updates. ADR 0069 term 3
+  separately covers an external recorder taking no lock. Read at `7d28f77`.
