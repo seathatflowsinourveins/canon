@@ -57,6 +57,13 @@ reviews the redesigned model (rule 4).
    behaviour, new families, and members of known families. That count is the rule's evidence, and the
    rule is tuned from it.
 
+Added 2026-11-11, decided by the lead under ADR 0074. For the gate, a finding counts against a clean
+round only when the state it needs can be produced by one of the ledger's named writers, or by an input
+that passes the gate's own input check. A finding that needs a ledger record written by hand is recorded
+once, as a class, among the gate's limits: the gate trusts the ledger as its writers write it and does
+not defend against someone with write access forging a record, which no input check could prevent. Each
+reader's task states this rule.
+
 **What it would have done on 2026-11-10** (counts under Confirmation):
 
 * *Session window.* The account check's family (which orders and closes are settled) appeared in round 1
@@ -141,3 +148,6 @@ Read 2026-11-10 and 2026-11-11.
   by hand). An independent recount on 2026-11-11 corrected the adapter's round 3 (a second report was
   missed) and the two sweep rows.
 * The merged sweep of four readers' silent-fallback reports, 71 entries (read).
+* The reachability rule added 2026-11-11 is the lead's decision under ADR 0074, given to the lanes of
+  the gate's seventh round. ADR 0054 term 7 holds the class it names, with the two earlier findings it
+  reclassifies, #172 and #177 (`git log`, read).

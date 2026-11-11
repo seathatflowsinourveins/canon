@@ -44,7 +44,9 @@ trial store that meets every driver. Leaving it is cheap, since every trial read
    outside a git checkout a path must be given. Opening never creates a file or study; creating one is
    its own call, with its sample (ADR 0041), under an exclusive `fcntl.flock` on `trials.db.lock`:
    two processes creating one new file raced in `create_all` and crashed in 14 of 15 rounds (measured
-   here). The lock guards first creation and a sample's move (ADR 0041 term 5), not recording. The name and the sample are two writes; a creation
+   here). The lock guards first creation only (corrected 2026-11-11: the per-study write lock
+   (round 7); no change of decision): a sample's move (ADR 0041 term 5) and recording (term 2) are
+   held by the study's write lock, ADR 0054 term 7. The name and the sample are two writes; a creation
    interrupted between them is completed by the next creation of that name (ADR 0041 term 1). Recording stays on `RDBStorage`, not the
    `JournalFileBackend` the FAQ gives for parallel optimisation: sessions record trials now and then,
    not in a parallel search, and SQLite serialises those writes (3,100 recordings from 10 processes
@@ -57,6 +59,13 @@ trial store that meets every driver. Leaving it is cheap, since every trial read
    `idle`; any other `COMPLETE` with `traded` and skfolio's per-session Sharpe ratio over its session
    days (for a later sampler; the gate does not read it), or `FAIL`, still `traded`, if that ratio is
    not finite. Such a record ran to the end: no later record resolves it, and ADR 0031 stops the gate.
+   Added 2026-11-11 (the gate's seventh round; ADR 0054 term 7 holds both models). A record is
+   made under the study's write lock, from the first read of the study to the `tell`, so one writer
+   at a time writes a study; only a study the ledger opened is recorded in. The configuration is
+   frozen once and the node is built from it, strategies added, before the trial is asked for, and
+   that node is run after: what upstream refuses at the build is a call refused before a config
+   exists, not a trial, and a failure after a build that succeeded is a trial told `FAIL`. The
+   outcome is still written after every result, which is what lets a ranking read beside a writer.
 3. **Entry.** User attributes `config`, `config_key`, `run_config_id`, `backtest_start`, `backtest_end`,
    `returns_series` (keyed by nanoseconds as text), and `session_days`, this record's addition: the UTC
    days on which a bar of the run arrived (one at exactly 00:00 counts for the day ending there, as
@@ -105,6 +114,8 @@ Who decided. The orchestrator chose option 3 and the terms under the owner's del
   (`test_a_pass_that_only_opens_creates_no_folder_and_no_lock`); a study name with a `/` takes its pass
   lock (`test_a_study_name_with_a_slash_takes_its_pass_lock`, `tests/test_variant_study.py`); and a
   run's record holds no system attribute (`test_a_trial_round_trips_through_the_sqlite_file`).
+* Term 2's addition of 2026-11-11: ADR 0054's Confirmation lists its tests, and says which failed
+  first and which passed before and after.
 
 ## Evidence
 
