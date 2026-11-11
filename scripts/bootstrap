@@ -24,9 +24,11 @@
 # then follows the autoUpdatesChannel that home/.claude/settings.json sets, never below its minimumVersion.
 # CLAUDE_CONFIG_DIR replaces ~/.claude. --user-config never overwrites settings.json or CLAUDE.md there: a
 # differing one gets a <name>.canon-proposed copy beside it. It does add to an existing settings.json the
-# telemetry variables of home/.claude/settings.json's env block that it lacks (ADR 0007, tier 3; Claude Code
-# reads them only from user or managed settings, https://code.claude.com/docs/en/monitoring-usage.md),
-# keeping a copy of the previous file, and leaves alone, naming it, one the owner set to another value. It
+# telemetry variables (CLAUDE_CODE_ENABLE_TELEMETRY, OTEL_*) of home/.claude/settings.json's env block that
+# it lacks (ADR 0007, tier 3; Claude Code reads them only from user or managed settings,
+# https://code.claude.com/docs/en/monitoring-usage.md),
+# keeping a copy of the previous file, and leaves alone, naming it, one the owner set to another value; the
+# model alias pins are never written there (their row shows what is missing). It
 # appends home/.codex/otel.toml to ${CODEX_HOME:-~/.codex}/config.toml when that file has no otel table of its
 # own and its folder exists, keeping a copy of the previous file and changing nothing else in it; an otel
 # table that is not canon's is left alone and named (Codex: CODEX_HOME, codex-rs/utils/home-dir at the
@@ -52,6 +54,10 @@ MISE_VERSION="v2026.11.5"      # canon/upstreams.json: mise
 LOCAL_BIN="$HOME/.local/bin"
 CLAUDE_HOME="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 CODEX_DIR="${CODEX_HOME:-$HOME/.codex}"
+# the env keys of home/.claude/settings.json that are telemetry (ADR 0007): what --user-config adds to an
+# existing settings.json and what the telemetry row checks. The model alias pins are not among them: their
+# own row reports drift and --user-config never writes them (ADR 0005)
+TELEMETRY_RE='^(CLAUDE_CODE_ENABLE_TELEMETRY$|OTEL_)'
 
 note()  { printf '%s\n' "$*"; }
 die()  { printf 'bootstrap: ERROR: %s\n' "$*" >&2; exit 1; }
@@ -222,16 +228,17 @@ codex_otel_state() {
   else echo none; fi
 }
 
-# telemetry_rows: whether the user settings carry every telemetry variable home/.claude/settings.json sets,
+# telemetry_rows: whether the user settings carry every telemetry variable (CLAUDE_CODE_ENABLE_TELEMETRY,
+# OTEL_*; the model alias pins have their own row) home/.claude/settings.json sets,
 # with its value, and whether Codex's config has canon's [otel] table
 telemetry_rows() {
   local s="$CLAUDE_HOME/settings.json" miss differ rc=0
   # shellcheck disable=SC2016  # jq programs, not shell
   if ! jq -e 'type == "object" and ((.env // {}) | type == "object")' "$s" >/dev/null 2>&1 \
-     || ! miss=$(jq -r --slurpfile w "$ROOT/home/.claude/settings.json" \
-                   '(.env // {}) as $e | [($w[0].env // {}) | to_entries[] | select($e[.key] == null) | .key] | join(" ")' "$s") \
-     || ! differ=$(jq -r --slurpfile w "$ROOT/home/.claude/settings.json" \
-                   '(.env // {}) as $e | [($w[0].env // {}) | to_entries[] | select($e[.key] != null and $e[.key] != .value) | .key] | join(" ")' "$s"); then
+     || ! miss=$(jq -r --slurpfile w "$ROOT/home/.claude/settings.json" --arg re "$TELEMETRY_RE" \
+                   'def telemetry: with_entries(select(.key | test($re))); (.env // {}) as $e | [($w[0].env // {} | telemetry) | to_entries[] | select($e[.key] == null) | .key] | join(" ")' "$s") \
+     || ! differ=$(jq -r --slurpfile w "$ROOT/home/.claude/settings.json" --arg re "$TELEMETRY_RE" \
+                   'def telemetry: with_entries(select(.key | test($re))); (.env // {}) as $e | [($w[0].env // {} | telemetry) | to_entries[] | select($e[.key] != null and $e[.key] != .value) | .key] | join(" ")' "$s"); then
     row "telemetry settings" MISSING "no readable $s with an object env; run: scripts/bootstrap --user-config"; rc=1
   elif [ -n "$miss" ]; then
     row "telemetry settings" MISSING "$s lacks: $miss; run: scripts/bootstrap --user-config"; rc=1
@@ -471,11 +478,11 @@ install_telemetry() {
     note "  EXISTS     $s is not a JSON object with an object env; telemetry settings not added"; rc=1
   else
     # shellcheck disable=SC2016  # jq program, not shell
-    add=$(jq -c --slurpfile w "$1" '. as $in | ($w[0].env // {}) | with_entries(select(($in.env // {})[.key] == null))' "$s") \
+    add=$(jq -c --slurpfile w "$1" --arg re "$TELEMETRY_RE" 'def telemetry: with_entries(select(.key | test($re))); . as $in | ($w[0].env // {} | telemetry) | with_entries(select(($in.env // {})[.key] == null))' "$s") \
       || die "could not read the env of $s"
     # shellcheck disable=SC2016  # jq program, not shell
-    differ=$(jq -r --slurpfile w "$1" \
-               '(.env // {}) as $e | ($w[0].env // {}) | to_entries | map(select($e[.key] != null and $e[.key] != .value) | .key) | join(" ")' "$s") \
+    differ=$(jq -r --slurpfile w "$1" --arg re "$TELEMETRY_RE" \
+               'def telemetry: with_entries(select(.key | test($re))); (.env // {}) as $e | ($w[0].env // {} | telemetry) | to_entries | map(select($e[.key] != null and $e[.key] != .value) | .key) | join(" ")' "$s") \
       || die "could not read the env of $s"
     if [ "$add" != "{}" ]; then
       tmp=$(mktemp)
