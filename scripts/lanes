@@ -6,13 +6,25 @@
 #                   https://code.claude.com/docs/en/hooks.md
 #   snapshots       written by home/.claude/canon/statusline.sh
 #                   https://code.claude.com/docs/en/statusline.md
+#   usage readings  ${CLAUDE_CONFIG_DIR:-~/.claude}/canon/rate-limits/<session>.json, written by the status line,
+#                   those changed in the last eight days: per window (rate_limits.five_hour, .seven_day) the
+#                   input's used_percentage (0 to 100) and resets_at (epoch seconds), present for Pro, Max and
+#                   Ultra subscribers after a session's first API response, each window possibly absent, and t,
+#                   when that session's reading was last new. The report's Usage row shows, per window, the
+#                   newest reading, with its reset time and age, or "not reported" when there is no readable
+#                   reading, or the newest was read USAGE_STALE_MIN (30) or more minutes ago, or has reset.
+#                   The status-line input has no per-model window. The Agent SDK documents usage rows a model can
+#                   scope (https://code.claude.com/docs/en/agent-sdk/typescript.md, SDKUsageReport, experimental)
+#                   and per-model limit events (https://code.claude.com/docs/en/agent-sdk/python.md,
+#                   RateLimitEvent's RateLimitInfo); neither is read here.
 #
 # Usage: scripts/lanes [--days N] [--quiet-min N] [--json]
 #        scripts/lanes --selftest
 # --days N covers the ledger files of the last N UTC dates, today included (default 2); the header says which.
 # Only the snapshots of sessions that appear in that window are read.
 # Exit:  0 report printed; 2 usage error; 4 no ledger file in the window (hooks not installed, or no
-#        sessions in that period); 1 selftest or another step failed.
+#        sessions in that period), with only the Usage row printed ({"usage": ...} with --json); 1 selftest or
+#        another step failed. Paths under $HOME are printed as ~, and a session started there is lane "~".
 # A line that is not a JSON object with a session id and a ts of the form YYYY-MM-DDTHH:MM:SSZ is counted
 # as unreadable and skipped. Events are ordered by t (epoch seconds with milliseconds, when the line has it),
 # else by ts; at an equal time a prompt sorts before the Stop that ends it.
@@ -58,6 +70,7 @@ JSON=0
 SELFTEST=0
 RATES=0
 WINDOW=10
+USAGE_STALE_MIN=30
 usage() {
   [ -z "${1:-}" ] || echo "lanes: $1" >&2
   echo "usage: scripts/lanes [--days N] [--quiet-min N] [--json] | --rates [--window MIN] [--days N] [--json] | --selftest" >&2
@@ -131,7 +144,7 @@ build_report() {
   done < "$t/sids" \
     | jq -cR 'try fromjson catch empty | select(type == "object" and .sid != null)' > "$t/snaps" \
     || { rm -rf "$t"; echo "lanes: ERROR: could not read session snapshots" >&2; return 1; }
-  jq -s --argjson now "$now" --argjson quiet "$QUIET" --argjson days "$DAYS" --arg from "$from" --arg to "$to" \
+  jq -s --argjson now "$now" --argjson quiet "$QUIET" --argjson days "$DAYS" --arg from "$from" --arg to "$to" --arg home "$HOME" \
      --slurpfile snaps "$t/snaps" '
       def count(f): map(select(f)) | length;
       def tally: group_by(.) | map({name: .[0], n: length}) | sort_by(-.n);
@@ -170,7 +183,9 @@ build_report() {
               | ($e[0].sid | tostring) as $sid
               | {
                   sid: $sid,
-                  lane: ((($e | map(.cwd // empty | select(type == "string" and . != "")) | last) // "?") | split("/") | last),
+                  # a session started in the home folder is "~", not the user name
+                  lane: ((($e | map(.cwd // empty | select(type == "string" and . != "")) | last) // "?")
+                         | if . == $home then "~" else split("/") | last end),
                   state: $state,
                   quiet_min: $q,
                   prompts: ($e | count(.ev == "UserPromptSubmit")),
@@ -233,6 +248,66 @@ print_report() {
   local flagged; flagged=$(echo "$r" | jq '[.sessions[] | select((.flags | length) > 0)] | length')
   echo
   echo "$flagged of $(echo "$r" | jq '.sessions | length') session(s) flagged. MODEL, CTX and COST come from the status line and are '-' for sessions that never drew one."
+  # the selftest builds a report without one
+  if [ "$(echo "$r" | jq 'has("usage")')" = true ]; then echo; print_usage "$(echo "$r" | jq -c '.usage')"; fi
+}
+
+# usage_reading -> one JSON object on stdout: the usage readings, judged against USAGE_STALE_MIN. A number
+# appears in it only for a window read within that time and not yet reset. It reads the folder where the
+# status line writes, which CANON_LEDGER_HOME does not move. A file that is not a reading is skipped and counted.
+usage_reading() {
+  local d="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/canon/rate-limits" f present=false t
+  t=$(mktemp) || return 1
+  if [ -d "$d" ]; then
+    present=true
+    # only the fields read below, at most 4 KB of each file, one line per file (a bad one as null)
+    find "$d" -maxdepth 1 -type f -name '*.json' -mtime -8 2>/dev/null | while IFS= read -r f; do
+      head -c 4096 "$f" | jq -c -s 'if length == 1 and (.[0] | type) == "object" and (.[0].rate_limits | type) == "object"
+                                       and (.[0].t | type) == "number" then .[0] | {rate_limits, t} else null end' 2>/dev/null \
+        || echo null
+    done > "$t"
+  fi
+  jq -n -c --argjson stale "$USAGE_STALE_MIN" --arg dir "$d" --argjson present "$present" --slurpfile all "$t" '
+    (now | floor) as $now
+    | ($all | map(select(. != null and .t <= $now + 60))) as $ok
+    | ($all | length - ($ok | length)) as $bad
+    | (if ($present | not) or ($all | length) == 0
+       then "no reading in \($dir) (rate_limits reach the status line only for Pro, Max and Ultra subscribers, or behind a gateway with a spend limit, after a session\u0027s first API response)"
+       elif ($ok | length) == 0 then "no readable reading in \($dir)"
+       else null end) as $why
+    | def win($k):
+        ($ok | map(.t as $t | .rate_limits[$k]? | select(type == "object" and (.used_percentage | type) == "number"
+                     and .used_percentage >= 0 and .used_percentage <= 100
+                     and (.resets_at | type) == "number" and .resets_at > 0 and .resets_at <= $now + 8 * 86400)
+                   | . + {t: $t}) | sort_by(.t, .used_percentage) | last) as $w
+        | if $why != null then {used_pct: null, resets_at: null, age_min: null, note: "not reported"}
+          elif $w == null then {used_pct: null, resets_at: null, age_min: null, note: "not reported: no reading of this window"}
+          else ((([($now - $w.t), 0] | max) / 60) | floor) as $age
+            | if $age >= $stale then {used_pct: null, resets_at: null, age_min: $age,
+                                       note: "not reported: last read \($age) min ago, older than \($stale) min"}
+              elif $w.resets_at <= $now then {used_pct: null, resets_at: null, age_min: $age,
+                                               note: "not reported: the window reset at \($w.resets_at | todate)"}
+              else {used_pct: $w.used_percentage, resets_at: ($w.resets_at | todate), age_min: $age, note: ""} end
+          end;
+    {dir: $dir, stale_after_min: $stale, readable: ($why == null), note: ($why // ""), skipped_files: $bad,
+     seven_day: win("seven_day"), five_hour: win("five_hour"),
+     source: "rate_limits in the status-line input (https://code.claude.com/docs/en/statusline.md), which has no per-model window; the Agent SDK documents usage rows a model can scope (SDKUsageReport, experimental) and per-model limit events (RateLimitEvent), not read here"}'
+  local rc=$?
+  rm -f "$t"
+  return "$rc"
+}
+
+print_usage() {
+  echo "$1" | jq -r '
+    def hm: sub(":[0-9]{2}Z$"; " UTC") | sub("T"; " ");
+    def w($k): .[$k] as $w | (if $k == "seven_day" then "7-day" else "5-hour" end) + " "
+      + (if $w.used_pct != null
+         then ((($w.used_pct * 10) | round) / 10 | tostring) + "% (resets " + ($w.resets_at | hm) + ", read " + ($w.age_min | tostring) + " min ago)"
+         else $w.note end);
+    "Usage: " + (if .readable then w("seven_day") + ", " + w("five_hour") else "not reported: " + .note end)
+      + "; stale after " + (.stale_after_min | tostring) + " min"
+      + (if (.skipped_files // 0) > 0 then " (\(.skipped_files) unreadable reading file(s) skipped)" else "" end),
+    "  source: " + .source'
 }
 
 # otlp_records <file>: one compact record per token-bearing event, {rt, sid, model, t, out, dur, cost},
@@ -542,10 +617,30 @@ selftest() {
 }
 
 if [ "$SELFTEST" = 1 ]; then selftest; exit $?; fi
+# What is printed shows no home folder path, so no user name: the owner pastes this output into conversations.
+# $HOME reads as ~ in the text and the JSON alike (a path's meaning is unchanged for a reader on this machine).
+# Only the home folder itself or a path under it is replaced, never a sibling such as $HOME-old.
+home_out() {
+  # patterns and replacements go through variables: bash 3.2 mishandles a quoted "/" or an escaped ~ inline
+  # shellcheck disable=SC2088  # a literal ~ is the point
+  local l p1="$HOME/" r1="~/" p2="$HOME\"" r2="~\"" p3="$HOME " r3="~ "
+  while IFS= read -r l || [ -n "$l" ]; do
+    l=${l//"$p1"/$r1}; l=${l//"$p2"/$r2}; l=${l//"$p3"/$r3}; [[ "$l" != *"$HOME" ]] || l="${l%"$HOME"}~"
+    printf '%s\n' "$l"
+  done
+}
 if [ "$RATES" = 1 ]; then
   R=$(rates_report) || exit $?
-  if [ "$JSON" = 1 ]; then echo "$R"; else print_rates "$R"; fi
+  if [ "$JSON" = 1 ]; then echo "$R"; else print_rates "$R"; fi | home_out
   exit 0
 fi
-R=$(build_report) || exit $?
-if [ "$JSON" = 1 ]; then echo "$R"; else print_report "$R"; fi
+# the usage row never stops the session report: a failure to read it is reported in the row itself
+U=$(usage_reading 2>/dev/null) || U=""
+[ -n "$U" ] || U='{"readable": false, "note": "the usage readings could not be read (scripts/lanes error)", "stale_after_min": '"$USAGE_STALE_MIN"', "skipped_files": 0,
+  "seven_day": {"used_pct": null, "resets_at": null, "age_min": null, "note": "not reported"},
+  "five_hour": {"used_pct": null, "resets_at": null, "age_min": null, "note": "not reported"},
+  "source": "rate_limits in the status-line input (https://code.claude.com/docs/en/statusline.md)"}'
+# with no ledger in the window the usage reading is still printed, as {"usage": ...} with --json, and the exit stays 4
+R=$(build_report) || { rc=$?; if [ "$rc" = 4 ]; then if [ "$JSON" = 1 ]; then echo "$U" | jq '{usage: .}'; else print_usage "$U"; fi | home_out; fi; exit "$rc"; }
+R=$(echo "$R" | jq --argjson u "$U" '. + {usage: $u}')
+if [ "$JSON" = 1 ]; then echo "$R"; else print_report "$R"; fi | home_out

@@ -13,6 +13,7 @@
     "OTEL_EXPORTER_OTLP_ENDPOINT": "http://127.0.0.1:4317"
   },
   "showThinkingSummaries": true,
+  "autoCompactWindow": 300000,
   "statusLine": {
     "type": "command",
     "command": "~/.claude/canon/statusline.sh"

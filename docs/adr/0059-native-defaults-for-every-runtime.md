@@ -134,6 +134,30 @@ moved the CLI from 2.1.321 to 2.1.322. `scripts/bootstrap --check` ended "All pr
 `claude-fable-5-1` then started and billed on `claude-opus-5-5`, confirming the allowlist and the vendor's
 fallback.
 
+**Auto-compaction (added 2026-11-11, the lead's decision).** The template sets `"autoCompactWindow": 300000`
+for every session, and `scripts/bootstrap --user-config` adds it to a settings file that lacks it. The
+documented default for a model with a native 1M window, which includes the Fable models, is to compact at
+about 967K tokens. `autoCompactWindow` takes 100,000 to 1,000,000 in any settings file. A model's
+`modelSettings.<model>.autoCompactWindow`, which `/autocompact` writes, wins over it for that model in the
+same settings file. `--autocompact` wins for one launch. `CLAUDE_CODE_AUTO_COMPACT_WINDOW` wins over all
+three unless Claude Code ignores its value. 300,000 is
+canon's choice, not a documented recommendation: the docs give no figure. A wake's cost grows with the
+context it carries, and a session's state lives in records, memory and digest files rather than in its
+context. The figure is tuned from the lanes Usage row (ADR 0007) once readings exist. `scripts/bootstrap
+--check` has an "auto-compact window" row. It reads ok at the template's value, and OWNER, without failing,
+at another one. It reads NOT SET, failing, with none, and it names any per-model or environment override.
+Claude HUD's `claude-hud.json` carries the same 300000 for its context bar, and the row names a difference
+between the two. Standing compaction instructions use two of the documented ways. The repository's `CLAUDE.md` has a
+`# Compact instructions` section that keeps the session's role and who it reports to, decisions and who
+made them, open obligations with times, running lanes' dispatch IDs, and the paths of state files and
+reports. It keeps the owner's rules by reference to `AGENTS.md` and the records. `.claude/settings.json` has a
+`SessionStart` hook with the `compact` matcher, `.claude/hooks/compact-brief.sh`, that prints one line pointing a coordinator at its state
+file. It runs after a compaction, not before a tool call, so ADR 0020 does not bear on it. The repository
+fixes no state-file path, so the line points at the one the summary keeps. A third documented way, a
+`PreCompact` hook whose output "becomes instructions for the compaction summary" (hooks.md), is not used:
+the CLAUDE.md section already carries them. UNVERIFIED: how a 300,000 window
+changes summary quality against the default.
+
 ## Evidence
 
 Read 2026-11-10. `fetched`: downloaded and searched here; `run`: a command run here.
@@ -188,3 +212,11 @@ Read 2026-11-10. `fetched`: downloaded and searched here; `run`: a command run h
   verbatim, OpenAI's effort guidance, Muse Code's own default, Wonder Full, the pro model and `agy
   --effort` stated, option 3's rejection argued from its docs, the Orca sentence and the Consequences
   corrected, the update policy moved to ADR 0065, and the Evidence put one source to a line; all above.
+* Auto-compaction, read 2026-11-11 (`fetched`, raw): https://code.claude.com/docs/en/model-config.md
+  ("Sessions auto-compact at about 967K tokens by default"; the command, setting, flag and variable and
+  their precedence; 100,000 to 1,000,000), https://code.claude.com/docs/en/settings-reference.md
+  (`autoCompactWindow`: "Any file", "Default: unset, so Claude Code picks a window tuned for your model";
+  `modelSettings`), https://code.claude.com/docs/en/context-window.md (`/autocompact`; `SessionStart` hooks
+  that match the `compact` source run and "adds their output to the compacted context"),
+  https://code.claude.com/docs/en/costs.md (the `# Compact instructions` section of CLAUDE.md) and
+  https://code.claude.com/docs/en/hooks.md (`SessionStart` matcher `compact`).

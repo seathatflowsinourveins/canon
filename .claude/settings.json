@@ -398,6 +398,17 @@
             "async": true
           }
         ]
+      },
+      {
+        "matcher": "compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/compact-brief.sh",
+            "args": [],
+            "timeout": 5
+          }
+        ]
       }
     ]
   }

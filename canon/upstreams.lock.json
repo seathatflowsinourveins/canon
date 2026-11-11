@@ -144,6 +144,15 @@
       "sha": "02777441f2a3fa38a187b57872ca9dc5e0411b48",
       "track": "default"
     },
+    "claude-hud": {
+      "default_branch": "main",
+      "default_sha": "9d2b6fa4df43c8ced61c0c23956fd291551726ac",
+      "ref": "refs/tags/v0.15.0",
+      "repo": "jarrodwatts/claude-hud",
+      "resolved_at": "2026-11-11T06:05:44Z",
+      "sha": "b86e1c3e5255880578de4b7cc87dc383228c2a18",
+      "track": "tag:v0.15.0"
+    },
     "claude-plugins-official": {
       "default_branch": "main",
       "default_sha": "ea686bae367e20a4092b2fd4327ffd299bb60f24",

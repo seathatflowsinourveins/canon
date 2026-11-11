@@ -91,6 +91,29 @@ read, and it is the owner's to create.
 absence as seen in `/plugin`, which a session cannot open for itself; what the app does with a post
 beyond the handler; and whether the first run in ADR 0018 had the plugin.
 
+**Exception, 2026-11-11: Claude HUD.** The owner decided on 2026-11-11 that installs are run for the
+sessions, and the lead chose Claude HUD (`jarrodwatts/claude-hud`, registry entry `claude-hud`, pinned at
+tag v0.15.0) as the status-line renderer. It is the one plugin a session may have installed besides Orca's.
+It is installed by the lead or the owner, never by a session, from the shell:
+`claude plugin marketplace add jarrodwatts/claude-hud#v0.15.0`, then
+`claude plugin install claude-hud@claude-hud --scope user` (the marketplace's name is its `name` field,
+`claude-hud`). `~/.claude/canon/statusline.sh` stays the configured status line. It runs the HUD, but
+not through the plugin's launcher, which loads the newest copy from any marketplace's cache: it runs the
+newest version's `hud.mjs` in the marketplace the user settings enable. The `/hud` skill's `hud install`
+would point `statusLine` at the plugin instead, so it is not run;
+`hud set` writes the plugin's own `config.json`, which canon's `~/.claude/claude-hud.json` overrides. Read
+at the pin: `.claude-plugin/plugin.json` (no hooks, no MCP servers), `skills/hud/SKILL.md` (one skill that
+runs `hud.mjs doctor` when invoked and pre-approves only `hud.mjs` doctor, schema, preview and report),
+`scripts/statusline.mjs` (picks the newest cached version and enters `hud.mjs`), `hud.mjs` and `fence.mjs`
+(the logic runs under Node's permission model with read grants by name, and an import fence that refuses
+network modules and removes `fetch` and `WebSocket`; its own comment says the fence is "never proven
+complete", so that it sends nothing is UNVERIFIED beyond that reading), `src/config.ts` and `src/auth.ts`
+(the account display reads `~/.claude.json`'s `oauthAccount` and is off by default and in canon's file),
+and `collector.mjs` (git's status read runs with `protocol.allow=never`, every git call with
+`GIT_NO_LAZY_FETCH`; each render writes `~/.claude/plugins/claude-hud/heartbeat.json`, mode 600, holding the
+status-line input, so the session's paths and model, on this machine only).
+That the CLI commands above install this tag as written is UNVERIFIED until the first run.
+
 ## Evidence
 
 Read 2026-11-10. `fetched`: downloaded whole with `curl` and read, not summarised.
@@ -130,3 +153,7 @@ Read 2026-11-10. `fetched`: downloaded whole with `curl` and read, not summarise
 * The owner's delegation, 2026-11-10: the coordinator proceeds automatically on state-of-the-art convergence,
   leaving the open choices to it. It was given
   after this record's risk was reported to the owner (not re-observable; UNVERIFIED).
+* Claude HUD exception, 2026-11-11: https://github.com/jarrodwatts/claude-hud at tag v0.15.0 (`b86e1c3e5255`,
+  `resolved`), the files named above read from a clone at that tag;
+  https://code.claude.com/docs/en/discover-plugins.md — `claude plugin install`, `enable` and `marketplace
+  add` "as ordinary terminal commands", and `owner/repo#ref` "to pin a branch or tag" (`fetched`, raw).

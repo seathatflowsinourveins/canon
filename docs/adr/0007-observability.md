@@ -220,6 +220,99 @@ Fixes after a second reader's review, 2026-11-10, each with a test that failed b
   were measured with the pinned otelcol on a port in use (439 bytes).
 * `scripts/test-canon`: the pipefail rule finds a pipe whose reader starts the next line.
 
+**Usage against the subscription limits (added 2026-11-11).** The status line also writes, per session,
+`~/.claude/canon/rate-limits/<session>.json` atomically (a temporary file, then a rename). The file holds the
+input's `rate_limits.five_hour` and `rate_limits.seven_day`, each window's `used_percentage` and `resets_at`,
+and a time `t`. Nothing else from the input goes in, since the input carries the session's paths and model.
+A window outside the documented types, outside 0 to 100, or with a `resets_at` not within the next eight
+days is dropped. The status line also re-renders an idle session with its last response's numbers, and
+again when a window reaches its `resets_at` (Claude Code then drops that window). So `t` moves only for
+something new: a window that is new or changed, or a session cost (`cost.total_cost_usd`, cumulative) that
+moved since the reading last came up to date. The session snapshot keeps that cost as `rl_cost`. A window
+that only disappeared, or a re-render, leaves the file alone. That every response moves the cost is
+UNVERIFIED. An input with neither window, from a non-subscriber or from before the session's first API
+response, leaves the file as it was; `spend_limit` is not read. Each session writes only its own file, so no
+session's reading overwrites another's. A session's first file removes files unchanged for more than eight
+days. `scripts/lanes` takes, per window, the reading with the newest `t` among files changed in the last
+eight days. It prints a Usage row: the 7-day and 5-hour percentages, each with its reset time and the age of
+its reading. A window is "not reported" when there is no readable reading, when the window is absent, when
+its newest reading is 30 or more minutes old (no older number is shown as current), and when it is past its
+reset. An unreadable file is skipped and counted, and a failure to read the usage never stops the session
+report. With `--json` the same object is `.usage`; with no ledger the row still prints, as `{"usage": ...}`
+with `--json`, and the exit stays 4. The status line also now uses a session id only if it is plain
+(letters, digits, `_`, `-`), as an id with `/` or `..` would have written its snapshot outside `sessions/`.
+
+The status-line input has no per-model window. The Agent SDK documents two related sources, neither read
+here. TypeScript's `SDKUsageReport` is experimental. Its `rate_limits.limits[]` rows have a `kind` such as
+`weekly_scoped` and an optional `scope` that is "a model or a surface". It is attached to a `/usage` reply
+only in a session with a claude.ai credential, with a known plan type or the `user:profile` scope, on an
+account not billed by usage. Python's `RateLimitEvent` is "emitted when rate limit status changes"; its
+`RateLimitInfo` can name `seven_day_opus` or `seven_day_sonnet`, so it is an event, not a running reading.
+A per-model reading, such as one model's weekly meter, stays the owner's reading in the app until a
+decision takes up the SDK source.
+
+**The display (added 2026-11-11).** Claude HUD renders the status line when the owner has it installed
+(ADR 0023's exception). `statusline.sh` stays the configured command. It does the writes above, then runs
+the newest installed version's `hud.mjs` (by number) in the marketplace that the user `settings.json`'s
+`enabledPlugins` enables, with `node` from PATH, else mise's. It does not use the plugin's launcher, which
+would load the newest copy from any marketplace's cache, a stale one kept 14 days included. Another scope's
+`enabledPlugins` entry is not read, since canon installs it with `--scope user`. The HUD gets the input
+with `model.display_name` set to the documented `model.id`, so the model actually in use is shown. The
+lines it prints, and canon's own line, lose their terminal hyperlinks (the HUD links the branch to
+`github.com/<owner>/<repo>` and the project to a `file://` path, with no setting to stop it). They are also
+scrubbed of e-mail addresses, and of the input's `workspace.repo.owner` and the home folder's user name as
+whole words of three characters or more. This repository's branch names begin with the owner's handle,
+which shows as `~`. With the plugin absent, canon's own line is shown. If the HUD fails, prints nothing, or
+prints its own failure line (an internal error or an old Node, a line naming `/hud`), canon's line is shown
+marked `(hud failed)`. On each render the HUD also writes `~/.claude/plugins/claude-hud/heartbeat.json`
+(mode 600), holding the status-line input, and its own data folder, on this machine only.
+`home/.claude/claude-hud.json`, which `scripts/bootstrap --user-config` installs beside `settings.json`,
+sets the HUD's options at v0.15.0 (`src/config.ts`, `src/schema.ts`). The choices, by group:
+
+* **Shown.** The model with effort as text: the ID in use and its effort. The project, one path level: the
+  lane's folder, never a full path. The git branch with `*` for uncommitted changes and ahead/behind counts:
+  a branch is unsafe to leave until it is pushed. A context bar and value as `40% (120k/300k)`: tokens and
+  percent. `autoCompactWindow` 300000: the bar measures against canon's compaction point (ADR 0059), with
+  the warning colour at 70% and critical at 85% of it. The session cost: `cost.total_cost_usd`. The
+  duration: the elapsed session time. Usage compact, always, both windows, with countdown and 24-hour reset
+  time: one short line at any width. The Claude Code version: the running CLI. A newer installed version
+  waiting on a restart is not available, since no documented input field or command gives it.
+* **Off, for identifiers.** `showAuth` and `showAuthUser` (plan and account; v0.15.0 has no other
+  account key, and an unknown key is dropped),
+  `showProvider`, `showSessionName` (free text), `showLaunchDir`, `showAddedDirs` (other paths),
+  `showWorktree` (its name repeats the folder), `showModelScopedUsage` (it would read an undocumented stdin
+  field), and `externalUsagePath` and `externalUsageWritePath` (canon keeps its own reading).
+* **Off, for undocumented sources.** Tools, skills, MCP, agents, todos, advisor, compactions, session start,
+  last response and agent effort all come from the session transcript, whose format the docs call internal.
+  `modelSource` stays `stdin`.
+* **Off, for cost or space.** Memory (it runs `vm_stat`), daily and weekly cost, speed, the token breakdown,
+  config counts, prompt cache and hit rate, output style, the custom line and jj.
+
+Checked on 2026-11-11 at 60 and 100 columns, through `statusline.sh` with the pinned HUD placed in a
+temporary config folder's plugin cache: five lines at 60, three at 100, about 0.2 s a render, no hyperlink
+left, the branch's handle shown as `~`, and the bar in the warning colour at 250k of 300k. The status line's refresh is event-driven and debounced at 300 ms, and a new
+event cancels a run still going (statusline.md).
+
+`scripts/test-usage` feeds the status line fake inputs: both windows, an input without `rate_limits`, an
+idle re-render with the same cost and a new response with a higher one, three sessions (an idle one older,
+one with a single window), out-of-range windows (`resets_at` 1e18, in milliseconds or past; a percentage of
+4120 or -1; wrong types), malformed JSON, an unsafe session id, a corrupt file and an unwritable directory.
+It checks the status line exits 0 and prints what it printed before, and that the file holds only the named
+fields. It checks the row shows current numbers, and reports as not reported a reading 40 minutes old, a
+reset window, a stored `resets_at` too large for a date, and unreadable or missing files. It runs the
+renderer path with stubs. A renderer's lines are shown scrubbed of a hyperlink, an address, the owner and
+the home user, and it is given the model ID. One that fails, prints nothing or is missing shows canon's
+line marked, and so does one printing a line that names `/hud`. A HUD in the cache that settings do not
+enable is not run. Of an enabled marketplace's 0.9.0 and 0.15.0, 0.15.0 is run with `node`, and a newer copy
+in a marketplace that is not enabled is not; one whose `node` fails shows the marked line. Names are
+scrubbed as whole words only (`dev` leaves `devtools`). In `scripts/lanes` and `scripts/automation status`,
+which the owner pastes, a path under `$HOME` prints as `~` (a sibling such as `$HOME-old` does not), a
+session started in the home folder is lane `~`, and the landing row names the host and repository without
+its owner, for an SSH remote too. Three code reviews and two record checks on 2026-11-11
+shaped this. A shared merged file relied on two undocumented assumptions (usage only grows within a window,
+and `resets_at` stays fixed), and a window's reset re-stamped an idle session's old numbers. The per-session
+files, with the cost and changed-window rule, fix both, and each fix has a test that failed before it.
+
 `ccusage` 20.0.48 was run on 2026-11-09 and reported the day's use across four models: 57.0M tokens, of
 which 54.9M were cache reads (about 97% of input, above the 80% bar in ADR 0006), and an estimated $37.36
 at API rates. That figure is ccusage's own estimate, not a bill.
@@ -247,6 +340,32 @@ Read 2026-11-09 (fetched; fetches are model-summarised).
   not in the schema, so it is not registered; the status line detects model changes instead.
 * https://code.claude.com/docs/en/statusline.md — stdin fields `model`, `cost.total_cost_usd`,
   `context_window.used_percentage`, `effort.level`, `rate_limits`.
+  Re-read 2026-11-11 (fetched in full, searched): `rate_limits.five_hour.used_percentage` and
+  `rate_limits.seven_day.used_percentage`, "from 0 to 100"; each window's `resets_at`, "Unix epoch seconds";
+  `rate_limits` "appears only for claude.ai Pro, Max, and Ultra subscribers, or behind a Claude apps gateway
+  that sets a spend limit for you", "only after the first API response in the session", each window "may be
+  independently absent", and "Claude Code drops a window once its `resets_at` time passes". The page names
+  no per-model window. https://code.claude.com/docs/en/agent-sdk/typescript.md (fetched 2026-11-11, raw):
+  `SDKUsageReport`, "experimental: its shape may change", `rate_limits.limits[]` rows with `kind` such as
+  `weekly_scoped`, `percent` 0-100, `resets_at` and an optional `scope`, "a model or a surface", attached to
+  the `/usage` reply under the conditions above, Agent SDK v0.3.273 or later; its `SDKRateLimitEvent` has
+  no window type. https://code.claude.com/docs/en/agent-sdk/python.md (fetched 2026-11-11, raw):
+  `RateLimitEvent`, "emitted when rate limit status changes", whose `RateLimitInfo.rate_limit_type` is one of
+  `five_hour`, `seven_day`, `seven_day_opus`, `seven_day_sonnet`, `overage`, with `utilization` 0.0 to 1.0.
+  Whether either reports a weekly meter for every model in use is UNVERIFIED. The statusline page also says
+  `cost.total_cost_usd` "accumulates the estimated cost of all API calls in the current session", and lists
+  the update triggers above (an idle re-render on a permission-mode change, at a window's `resets_at`).
+  Second reader, 2026-11-11 (`evidence-verifier`, twice): the `rate_limits` claims hold; the first text said
+  no documented source gives a per-model limit, which the two Agent SDK pages contradict; then the
+  `weekly_scoped` scope, the `/usage` conditions and the event's nature were overstated, a gateway sending
+  only `spend_limit` was unbacked, and a reset re-stamped an idle reading; all corrected above.
+* Claude HUD, read 2026-11-11 from a clone at tag v0.15.0 (`b86e1c3e5255`, `resolved`): `src/config.ts`
+  and `src/schema.ts` (every option above and its default), `src/utils/hyperlinks.ts` and `src/git.ts`
+  (the OSC 8 links and their targets), `scripts/statusline.mjs`, `hud.mjs` and `fence.mjs` (ADR 0023).
+  https://code.claude.com/docs/en/plugins/security.md: installed copies under
+  `~/.claude/plugins/cache/<marketplace>/<plugin>/<version>/`, kept 14 days after removal;
+  https://code.claude.com/docs/en/settings-reference.md: `enabledPlugins` keyed by
+  `plugin-name@marketplace-name` (both `fetched`, raw).
 * https://code.claude.com/docs/en/sessions.md — transcript location; the format is internal and may change.
 * https://code.claude.com/docs/en/settings.md — telemetry export variables are ignored from project and
   local settings files.

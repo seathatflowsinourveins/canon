@@ -207,7 +207,7 @@ runs.
 | `.claude/rules/` | Rules scoped to `canon/`, `docs/adr/` and trading code |
 | `.claude/skills/` | `adopt-upstream`, `new-adr`, `landscape-refresh`, `lane-report` |
 | `.claude/agents/` | `upstream-scout` (Sonnet), `evidence-verifier` (Opus) |
-| `home/` | Machine-level config: event ledger hook, status line, lane watchdog, paper session runner, OTLP collector config, Claude Code and Codex telemetry settings, user `CLAUDE.md` |
+| `home/` | Machine-level config: event ledger hook, status line and its Claude HUD settings, lane watchdog, paper session runner, OTLP collector config, Claude Code and Codex telemetry settings, user `CLAUDE.md` |
 | `mise.toml` | Pinned toolchain |
 
 ## How a decision gets made

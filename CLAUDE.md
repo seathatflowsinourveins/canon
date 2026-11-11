@@ -19,3 +19,16 @@
   review. The one exception is `/code-review ultra`: it is billed and only the owner can start it, so say
   when a change is large enough to deserve it and give the exact command.
 - **Planning:** use plan mode. No spec framework is adopted (ADR 0004).
+
+# Compact instructions
+
+When the conversation is compacted, keep in the summary (Claude Code reads this section, per
+https://code.claude.com/docs/en/costs.md):
+
+- The session's role (coordinator, lane or reviewer) and who it reports to.
+- Each decision made in the session, and who made it: the owner, the lead, the coordinator or this session.
+- Open obligations, with the times they fall due: reports owed, waits on a reply, scheduled runs.
+- The task and dispatch IDs of every lane still running, and the branch and workspace of each.
+- The paths of the session's state files and reports, so they can be re-read rather than remembered.
+- The owner's standing rules by reference only: `AGENTS.md` and the records in `docs/adr/` hold them, and are
+  re-read, not restated.
