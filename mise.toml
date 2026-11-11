@@ -108,53 +108,79 @@ done
 
 # The paper lock's owner has a deadline (both paper tasks). The task opens the lock file on descriptor 9 and
 # locks that descriptor (lockf(1), "Protect a section of a shell script with a lock"), so every process the
-# task starts inherits the lock and it is free only once the last of them has ended; then `exec`s uv, so
-# mise's `timeout` (mise docs, tasks/task-configuration, "timeout": SIGTERM to the task's processes, SIGKILL
-# 5 s later) stops a run that hangs, even one that ignores SIGTERM. With `lockf <file> uv ...` instead,
-# the timeout ended lockf and freed the lock while a uv that ignored SIGTERM kept running (scripts/test-lanes,
-# "paper lock deadline"). The timeout counts the wait for the lock too.
+# task starts inherits the lock and it is free only once the last of them has ended. Then it `exec`s uv under
+# timeout(1) -s KILL, its `deadline` less the time the lock took: timeout "makes itself the leader of a
+# process group that the command inherits and sends the signal to that process group", so at the deadline
+# uv, Python and every process they started (one that ignores SIGTERM included, unless it left the group with
+# setsid(2)) end together and the lock is free. SIGKILL, not SIGTERM first: timeout(1) and mise's own task
+# `timeout` (SIGTERM, then SIGKILL 5 s later, mise docs, tasks/task-configuration) both stop waiting once
+# their direct child has exited, and a descendant that ignored SIGTERM then kept the lock (scripts/test-lanes,
+# "paper lock deadline"); Python's default SIGTERM action ends it without running `finally` either. mise's
+# `timeout`, 60 s later than `deadline`, stays as the bound on the task's own body, and is the deadline of a
+# run from a person's terminal (stdin a terminal): there uv runs in the terminal's process group as before,
+# since one Ctrl-C reached Python twice through timeout(1) and mise (observed), and a second interrupt would
+# cut a window's flatten or a test's cleanup short; a person is there to see a hang. Each keychain read runs
+# under timeout(1) for 30 s: mise renders the env before the task's `timeout` starts (observed with mise
+# 2026.11.5), and a read waiting at a dialog no one sees would hold the firing.
 [tasks."paper:test"]
 description = "Run every paper test with the key pair read from the login keychain for this task only"
-# its 3900 s wait for the lock, then 55 minutes for tests that take about five (observed)
+# its 3900 s wait for the lock, then 55 minutes for tests that take about five (observed); deadline 60 s inside
 timeout = "2h"
-env.ALPACA_API_KEY = { value = "{{ exec(command='/usr/bin/security find-generic-password -s canon-alpaca-paper -a ALPACA_API_KEY -w') }}", redact = true }
-env.ALPACA_SECRET_KEY = { value = "{{ exec(command='/usr/bin/security find-generic-password -s canon-alpaca-paper -a ALPACA_SECRET_KEY -w') }}", redact = true }
+env.ALPACA_API_KEY = { value = "{{ exec(command='/usr/bin/timeout 30 /usr/bin/security find-generic-password -s canon-alpaca-paper -a ALPACA_API_KEY -w') }}", redact = true }
+env.ALPACA_SECRET_KEY = { value = "{{ exec(command='/usr/bin/timeout 30 /usr/bin/security find-generic-password -s canon-alpaca-paper -a ALPACA_SECRET_KEY -w') }}", redact = true }
 # An empty value would make every paper test skip and the task pass, so it is refused first.
 run = '''
+deadline=7140
+start=$(/bin/date +%s)
 [ -n "$ALPACA_API_KEY" ] && [ -n "$ALPACA_SECRET_KEY" ] || { echo "paper:test: a keychain item is empty; run: mise run paper:remove, then mise run paper:store" >&2; exit 1; }
 # One paper account serves every session on this machine, so the run holds an exclusive lock throughout
 # and a second run waits for it, at most 3900 s, then fails without placing anything (lockf(1); the file is
 # kept, as a descriptor implies and lockf(1) advises when processes contend). 3900 s outlasts one
-# `paper:session` window that runs as it should, which holds the same lock for its window of at most 60
-# minutes and its bounded stop and account check (ADR 0044); a window that hangs holds it until its 85-minute
-# deadline, longer than this wait, and a test can still lose the race to the next window. The
-# lock is in the per-user temporary folder, which is the same for every process of the user whatever
-# $TMPDIR a session sets. Descriptor 9 and the deadline: the note above this task.
+# `paper:session` window that runs as it should, which holds the same lock for its window and its bounded
+# end (session_window.LONGEST_WINDOW_SECS, ADR 0044); a window that hangs holds it until its deadline, longer
+# than this wait, and a test can still lose the race to the next window. The lock is in the per-user
+# temporary folder, which is the same for every process of the user whatever $TMPDIR a session sets.
+# Descriptor 9 and the deadline: the note above this task.
 exec 9>>"$(/usr/bin/getconf DARWIN_USER_TEMP_DIR)canon-paper-test.lock"
 /usr/bin/lockf -t 3900 9 || { echo "paper:test: the paper lock stayed held for 3900 s; nothing was placed" >&2; exit 1; }
-exec uv run --locked pytest -rs packages/canon-alpaca/tests/test_paper_*.py tests/test_paper_*.py
+left=$((deadline - ($(/bin/date +%s) - start)))
+[ "$left" -gt 0 ] || { echo "paper:test: no time left before the deadline" >&2; exit 1; }
+[ ! -t 0 ] || exec uv run --locked pytest -rs packages/canon-alpaca/tests/test_paper_*.py tests/test_paper_*.py
+exec /usr/bin/timeout -s KILL "$left" uv run --locked pytest -rs packages/canon-alpaca/tests/test_paper_*.py tests/test_paper_*.py
 '''
 
 # One window of the session run (docs/adr/0044-paper-session-windows-for-macross.md, which supersedes ADR
 # 0029's "only paper:test" clause: this task, too, reads the pair into its own env). It waits for the paper
-# lock as a test does and holds it for the window, at most 60 minutes plus start-up, shutdown and the
-# account check, about a minute more; the window flattens and checks the account before it ends. Arguments
-# go to `python -m canon_trading.session_window` (--session regular|extended, --minutes, --symbol). Its log
-# and report are in the per-user temporary folder, outside the repository. Run by the scheduled runner
-# (CANON_COMMIT set), `--exact` makes its clone's kept .venv exactly uv.lock, as `uv sync` would; a run by
-# hand leaves the worktree's .venv as it is (uv run's inexact default; ADR 0050).
+# lock as a test does and holds it for the window, at most `session_window.LONGEST_WINDOW_SECS` plus start-up
+# and the bounded end; the window flattens and checks the account before it ends. Arguments go to
+# `python -m canon_trading.session_window` (--session regular|extended|auto, --minutes, --symbol). Its log and
+# report are in the per-user temporary folder, outside the repository, canon-paper-session/, with the gap
+# marker every run reads. Its records (latest.json, window-*.json, last-firing.json) are there for the
+# scheduled runner's run (CANON_PAPER_SCHEDULED=1, or CANON_COMMIT), which `scripts/automation status` reads,
+# and in by-hand/ for a run by hand (CANON_PAPER_BY_HAND=1), so a run by hand never changes the schedule's row. Run
+# by the scheduled runner (CANON_COMMIT set), `--exact` makes its clone's kept .venv exactly uv.lock, as
+# `uv sync` would; a run by hand leaves the worktree's .venv as it is (uv run's inexact default; ADR 0050).
 [tasks."paper:session"]
 description = "Run one bounded SessionMaCross window on the paper account under the paper lock"
-# its 900 s wait for the lock, then the 70 minutes after which status calls a window dead
-# (session_window.STALE_RUNNING_SECS); a window stopped here is recorded `running` and so shows as died, and
-# the next one starts only once the account is flat. Descriptor 9 and the deadline: the note above paper:test.
-timeout = "85m"
-env.ALPACA_API_KEY = { value = "{{ exec(command='/usr/bin/security find-generic-password -s canon-alpaca-paper -a ALPACA_API_KEY -w') }}", redact = true }
-env.ALPACA_SECRET_KEY = { value = "{{ exec(command='/usr/bin/security find-generic-password -s canon-alpaca-paper -a ALPACA_SECRET_KEY -w') }}", redact = true }
+# deadline: its 900 s wait for the lock, an allowance for uv's sync and the imports before the first clock
+# read, the window's longest and its bounded end (the arithmetic is ADR 0050's, and tests/test_session_window.py
+# holds it); a window stopped there is recorded `running` and so shows as died, and the next one starts only
+# once the account is flat. Descriptor 9 and the deadline: the note above paper:test.
+timeout = "105m"
+env.ALPACA_API_KEY = { value = "{{ exec(command='/usr/bin/timeout 30 /usr/bin/security find-generic-password -s canon-alpaca-paper -a ALPACA_API_KEY -w') }}", redact = true }
+env.ALPACA_SECRET_KEY = { value = "{{ exec(command='/usr/bin/timeout 30 /usr/bin/security find-generic-password -s canon-alpaca-paper -a ALPACA_SECRET_KEY -w') }}", redact = true }
 run = '''
+deadline=6240
+start=$(/bin/date +%s)
 [ -n "$ALPACA_API_KEY" ] && [ -n "$ALPACA_SECRET_KEY" ] || { echo "paper:session: a keychain item is empty; run: mise run paper:remove, then mise run paper:store" >&2; exit 1; }
 tmp="$(/usr/bin/getconf DARWIN_USER_TEMP_DIR)"
+# a run the runner started (CANON_COMMIT) is the schedule's unless the runner itself says by hand, so a
+# runner installed before CANON_PAPER_SCHEDULED existed still writes the records status reads
+[ "${CANON_PAPER_SCHEDULED:-}" = 1 ] || [ -n "${CANON_COMMIT:-}" ] || export CANON_PAPER_BY_HAND=1
 exec 9>>"${tmp}canon-paper-test.lock"
 /usr/bin/lockf -t 900 9 || { echo "paper:session: the paper lock stayed held for 900 s; nothing was placed" >&2; exit 1; }
-exec uv run --locked ${CANON_COMMIT:+--exact} python -m canon_trading.session_window --log-dir "${tmp}canon-paper-session"
+left=$((deadline - ($(/bin/date +%s) - start)))
+[ "$left" -gt 0 ] || { echo "paper:session: no time left before the deadline" >&2; exit 1; }
+[ ! -t 0 ] || exec uv run --locked ${CANON_COMMIT:+--exact} python -m canon_trading.session_window --log-dir "${tmp}canon-paper-session"
+exec /usr/bin/timeout -s KILL "$left" uv run --locked ${CANON_COMMIT:+--exact} python -m canon_trading.session_window --log-dir "${tmp}canon-paper-session"
 '''

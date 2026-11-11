@@ -44,10 +44,16 @@ PAPER_MINUTES=25                                      # ...a 25-minute window: w
                                                       # account check it ends before the next firing less
                                                       # the 300 s gap (session_window.GAP_SECS)
 PAPER_STALE=4200                                      # a record `running` after 70 minutes, if it gives none
-PAPER_DEADLINE=5100                                   # mise.toml's paper:session timeout, 85 minutes
+PAPER_DEADLINE=6300                                   # mise.toml's paper:session timeout, 105 minutes
+# the longest firing: the runner's fetch bound, then its bound on the whole `mise run`, which is that timeout
+# and its allowance for mise's own start (paper-session.sh FETCH_SECS, TASK_SECS, START_SECS)
+PAPER_FIRING=$((120 + PAPER_DEADLINE + 300))
 # launchd misses every interval while a firing runs (launchd.plist(5)), so the next firing starts at most one
 # interval after the longest firing ends; with no stamp for longer, and 300 s more, the schedule has stopped
-PAPER_SILENT=$((PAPER_DEADLINE + PAPER_INTERVAL + 300))
+PAPER_SILENT=$((PAPER_FIRING + PAPER_INTERVAL + 300))
+WATCH_SECS=120                                        # lanes-watch.sh's bound on the lanes report it runs
+# the watchdog stamps each check as it starts; the next starts at most an interval after the longest ends
+WATCH_SILENT=$((WATCH_SECS + INTERVAL + 300))
 PAPER_CHECKOUT="$CANON_HOME/paper-checkout"           # the clone each firing brings to origin's main
 PAPER_DIR="${CANON_PAPER_SESSION_DIR:-$(/usr/bin/getconf DARWIN_USER_TEMP_DIR 2>/dev/null)canon-paper-session}"
 STALE_DAYS=2
@@ -63,6 +69,10 @@ note() { printf '%s\n' "$*"; }
 row() { printf '  %-18s %-9s %s\n' "$1" "$2" "$3"; }
 # check_row <name> <label> <text>: prints the row and counts any label but ok as unhealthy
 check_row() { row "$1" "$2" "$3"; [ "$2" = ok ] || bad=1; }
+# paper_worse <label>: the paper row's label becomes <label> when that is worse than the one it has ($lab)
+# (a refusal exits 1 too, so REFUSED outranks the FAILED that exit code gives)
+paper_rank() { case "$1" in ok) echo 0 ;; UNKNOWN) echo 1 ;; OUTDATED) echo 2 ;; STALE) echo 3 ;; REFUSED) echo 5 ;; DIED) echo 6 ;; *) echo 4 ;; esac; }
+paper_worse() { [ "$(paper_rank "$1")" -le "$(paper_rank "$lab")" ] || lab=$1; }
 
 # find_mise -> absolute path of mise: the one on PATH first, then ~/.local/bin/mise. Fails with a message
 # when there is neither, or when the path holds a character that cannot be quoted in a git helper.
@@ -131,7 +141,9 @@ EOF
 # origin has at that firing, or fails the firing, and runs `mise run paper:session --session auto` there:
 # the task reads the paper pair from the login keychain, takes the paper lock and runs one window, or prints
 # "nothing to run" when Alpaca's clock says no session is open (weekends and holidays included). Not run at
-# load. No checkout a person uses is read or written (ADR 0050).
+# load. No checkout a person uses is read or written (ADR 0050). CANON_PAPER_SCHEDULED=1 (launchd.plist(5),
+# EnvironmentVariables) tells the runner and the window that the schedule started them: only they stamp the
+# firing and write the records status reads.
 # write_paper_plist <mise> <origin url>
 write_paper_plist() {
   local c; c=$(xml "$CANON_HOME")
@@ -154,6 +166,11 @@ write_paper_plist() {
     <string>--minutes</string>
     <string>$PAPER_MINUTES</string>
   </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CANON_PAPER_SCHEDULED</key>
+    <string>1</string>
+  </dict>
   <key>WorkingDirectory</key>
   <string>$c</string>
   <key>StartInterval</key>
@@ -358,8 +375,14 @@ do_uninstall() {
   if [ -e "$PAPER_CHECKOUT" ]; then
     local m
     # only the clone install made: its own git config marks it (home/.claude/canon/paper-session.sh)
-    if [ ! -d "$PAPER_CHECKOUT/.git" ] || [ "$(git -C "$PAPER_CHECKOUT" config --local --get canon.paperCheckout 2>/dev/null)" != true ]; then
+    if [ ! -d "$PAPER_CHECKOUT/.git" ] || [ -L "$PAPER_CHECKOUT/.git" ] \
+       || [ "$(git config --file "$PAPER_CHECKOUT/.git/config" --get canon.paperCheckout 2>/dev/null)" != true ]; then
       note "  FAILED: $PAPER_CHECKOUT is not the clone install made; not touching it"; left="$left
+  $PAPER_CHECKOUT"
+    # a window still running from it holds its lock (paper-session.sh), even after the bootout above
+    elif [ -x /usr/bin/lockf ] && ! /usr/bin/lockf -k -t 0 "$PAPER_CHECKOUT.lock" true 2>/dev/null; then
+      note "  FAILED: a window is still running from $PAPER_CHECKOUT; not removing it (run uninstall again once it ends)"
+      left="$left
   $PAPER_CHECKOUT"
     else
       # `mise run` trusted the clone's mise.toml at its first firing (mise trust docs); that goes with it.
@@ -370,7 +393,7 @@ do_uninstall() {
       elif "$m" trust --untrust "$PAPER_CHECKOUT/mise.toml" >/dev/null 2>&1; then note "  untrusted  $PAPER_CHECKOUT/mise.toml (mise)"
       else note "  FAILED: mise could not untrust $PAPER_CHECKOUT/mise.toml"; left="$left
   mise trust of $PAPER_CHECKOUT/mise.toml"; fi
-      if rm -rf "$PAPER_CHECKOUT" && [ ! -e "$PAPER_CHECKOUT" ]; then note "  removed    $PAPER_CHECKOUT"
+      if rm -rf "$PAPER_CHECKOUT" "$PAPER_CHECKOUT.lock" && [ ! -e "$PAPER_CHECKOUT" ]; then note "  removed    $PAPER_CHECKOUT"
       else note "  FAILED: could not remove $PAPER_CHECKOUT"; left="$left
   $PAPER_CHECKOUT"; fi
     fi
@@ -444,6 +467,14 @@ do_status() {
     if [ -f "$CANON_HOME/watch/lanes-status.json" ]; then
       v="$v | $(jq -r 'if .ok == true then "last check " + .checked_at + ": " + (.sessions | tostring) + " session(s), " + (.flagged_now | tostring) + " flagged, ledger " + (.ledger_kb | tostring) + " KB" else "LAST CHECK FAILED: " + (.error // "no error recorded") end' "$CANON_HOME/watch/lanes-status.json" 2>/dev/null)"
       jq -e '.ok == true' "$CANON_HOME/watch/lanes-status.json" >/dev/null 2>&1 || label=FAILED
+      # a watchdog that hangs, or a job launchd no longer runs, leaves the last check as it was
+      local age
+      age=$(jq -r --argjson now "$(date -u +%s)" '($now - (.checked_at | fromdateiso8601)) | floor' "$CANON_HOME/watch/lanes-status.json" 2>/dev/null)
+      if ! [[ "$age" =~ ^-?[0-9]+$ ]]; then
+        [ "$label" != ok ] || label=UNKNOWN; v="$v; the last check's time is unreadable"
+      elif [ "$age" -gt "$WATCH_SILENT" ]; then
+        [ "$label" != ok ] || label=STALE; v="$v; no check for $((age / 60)) min (the Mac asleep, a check that hangs, or the job not running)"
+      fi
     else
       [ "$label" != ok ] || label=UNKNOWN
       v="$v | no status file yet at $CANON_HOME/watch/lanes-status.json"
@@ -453,18 +484,40 @@ do_status() {
 
   if pr=$(launchctl print "$DOMAIN/$PAPER_LABEL" 2>/dev/null); then
     last=$(printf '%s\n' "$pr" | awk -F' = ' '/^\tlast exit code = / && s == "" { s = $2 } END { print s }')
-    if [ -f "$PAPER_DIR/latest.json" ]; then
-      # the window's own record decides; a `running` one past PAPER_STALE belongs to a window that died
+    # launchctl(1), list: "The second column displays the last exit status of the job. If the number in this
+    # column is negative, it represents the negative of the signal which stopped the job"; launchctl print
+    # then shows no exit code
+    local sig lab txt heard hb_at fired o
+    sig=$(launchctl list 2>/dev/null | awk -v l="$PAPER_LABEL" '$3 == l { print $2; exit }')
+    # the last run's heartbeat, read first: a run newer than a `running` record took the paper lock after it
+    hb_at=null heard=""
+    if [ -f "$PAPER_DIR/last-firing.json" ]; then
       # shellcheck disable=SC2016  # jq program, not shell
-      v=$(jq -r --argjson now "$(date -u +%s)" --argjson stale "$PAPER_STALE" "$PAPER_COMMIT"'
+      heard=$(jq -r --argjson now "$(date -u +%s)" "$PAPER_COMMIT"'(($now - (.at_epoch // 0)) | floor | tostring) + "\t"
+                    + (if .scheduled == false then "by hand: " else "" end)
+                    + (.outcome // "?") + (if (.commit // "") | test("^[0-9a-f]{40}") then " at " + (.commit | short) else "" end)' \
+              "$PAPER_DIR/last-firing.json" 2>/dev/null)
+      # only a run that held the lock counts: the runner's own failures ran nothing ("none: nothing ran")
+      [[ "$heard" =~ ^-?[0-9]+$'\t' ]] \
+        && hb_at=$(jq 'select((.commit // "") | startswith("none") | not) | .at_epoch | numbers' "$PAPER_DIR/last-firing.json" 2>/dev/null)
+      [ -n "$hb_at" ] || hb_at=null
+    fi
+    if [ -f "$PAPER_DIR/latest.json" ]; then
+      # the window's own record decides; a `running` one past its stale_after, or older than a run that came
+      # after it (which held the paper lock, so the window was no longer running), belongs to a window that died
+      # shellcheck disable=SC2016  # jq program, not shell
+      v=$(jq -r --argjson now "$(date -u +%s)" --argjson stale "$PAPER_STALE" --argjson heard "$hb_at" "$PAPER_COMMIT"'
             ((($now - (.started_epoch // 0)) / 60) | floor) as $m
             | (.result // "") as $r
-            | (($r | startswith("running")) and ($m * 60) > (.stale_after // $stale)) as $died
+            | ($heard != null and $heard > (.started_epoch // 0)) as $later
+            | (($r | startswith("running")) and (($m * 60) > (.stale_after // $stale) or $later)) as $died
             | (if $r == "ok" then "ok" elif $died then "DIED" elif ($r | startswith("running")) then "ok"
                elif ($r | startswith("refused")) then "REFUSED" else "FAILED" end) + "\t"
               + "last window " + (.started // "?") + " (" + ($m | tostring) + " min ago, " + (.session // "?")
               + ", commit " + (.commit | short) + "): "
-              + (if $died then "still running after " + ($m | tostring)
+              + (if $died and $later then "still running by its record, but a run after it took the paper lock, so it died;"
+                   + " the account may not be flat, and the next window starts only once it is"
+                 elif $died then "still running after " + ($m | tostring)
                    + " min, so it died; the next window starts only once the account is flat" else $r end)
               + (if ((.left // []) | length) > 0 then "; left: " + ((.left // []) | join(", ")) else "" end)' \
           "$PAPER_DIR/latest.json" 2>/dev/null)
@@ -472,49 +525,44 @@ do_status() {
     else
       v=$(printf 'UNKNOWN\tno window has run yet (records in %s)' "$PAPER_DIR")
     fi
-    # Two failures the record cannot show: a firing that ended before Python wrote anything (an empty
-    # keychain item, a lock wait run out), and a schedule that has stopped firing. The runner stamps each
-    # firing's start in scheduled-firing.json, which a window run by hand never writes; with no stamp, an
-    # unreadable one or one older than two intervals the row is not ok, whatever last-firing.json says.
+    lab=${v%%$'\t'*} txt=${v#*$'\t'}
+    # Each check below can only make the label worse (paper_worse), so a schedule gone silent never hides a
+    # window that died or failed. Failures the record cannot show: a firing that ended before Python wrote
+    # anything (an empty keychain item, a lock wait run out) or was stopped by a signal, and a schedule that
+    # has stopped firing. The runner stamps each scheduled firing's start in scheduled-firing.json, which no
+    # run by hand writes; with no stamp, an unreadable one or one older than the longest firing and an
+    # interval, the row is not ok, whatever last-firing.json says.
     case "$last" in
       0|''|*[!0-9-]*) ;;
-      *) [ "${v%%$'\t'*}" != ok ] || v="FAILED${v#ok}; the last firing exited $last" ;;
+      *) paper_worse FAILED; txt="$txt; the last firing exited $last" ;;
     esac
-    local heard fired o
-    if [ -f "$PAPER_DIR/last-firing.json" ]; then
-      # shellcheck disable=SC2016  # jq program, not shell
-      heard=$(jq -r --argjson now "$(date -u +%s)" "$PAPER_COMMIT"'(($now - (.at_epoch // 0)) | floor | tostring) + "\t"
-                    + (if .scheduled == false then "by hand: " else "" end)
-                    + (.outcome // "?") + (if (.commit // "") | test("^[0-9a-f]{40}") then " at " + (.commit | short) else "" end)' \
-              "$PAPER_DIR/last-firing.json" 2>/dev/null)
-      if [[ "$heard" =~ ^-?[0-9]+$'\t' ]]; then   # negative within a second: at_epoch has a fraction
-        # a run that failed before or outside a window (the fetch of main included) fails the row too
-        # (it outranks ok, and UNKNOWN: a schedule whose every firing fails has no window record at all)
-        o=${heard#*$'\t'}
-        case "${o#by hand: }:${v%%$'\t'*}" in failed:*:ok) v="FAILED${v#ok}" ;; failed:*:UNKNOWN) v="FAILED${v#UNKNOWN}" ;; esac
-        v="$v | last run $(( ${heard%%$'\t'*} / 60 )) min ago: ${heard#*$'\t'}"
-      else
-        [ "${v%%$'\t'*}" != ok ] || v="UNKNOWN${v#ok}"
-        v="$v | $PAPER_DIR/last-firing.json is unreadable"
-      fi
+    if [[ "$sig" =~ ^-[0-9]+$ ]]; then paper_worse FAILED; txt="$txt; the last firing was stopped by signal ${sig#-}"; fi
+    if [ ! -f "$PAPER_DIR/last-firing.json" ]; then
+      paper_worse UNKNOWN; txt="$txt | no last-firing.json in $PAPER_DIR: no run has left its heartbeat"
+    elif [[ "$heard" =~ ^-?[0-9]+$'\t' ]]; then   # negative within a second: at_epoch has a fraction
+      # a run that failed before or outside a window (the fetch of main included) fails the row too
+      o=${heard#*$'\t'}
+      case "${o#by hand: }" in failed:*) paper_worse FAILED ;; esac
+      txt="$txt | last run $(( ${heard%%$'\t'*} / 60 )) min ago: $o"
+    else
+      paper_worse UNKNOWN; txt="$txt | $PAPER_DIR/last-firing.json is unreadable"
     fi
     fired=$(jq -r --argjson now "$(date -u +%s)" '($now - .at_epoch) | floor' "$PAPER_DIR/scheduled-firing.json" 2>/dev/null)
     if [ ! -f "$PAPER_DIR/scheduled-firing.json" ]; then
-      [ "${v%%$'\t'*}" != ok ] || v="UNKNOWN${v#ok}"
-      v="$v | no scheduled firing recorded yet (the first comes $((PAPER_INTERVAL / 60)) min after install)"
-      # a runner installed before the stamp existed never writes one
-      cmp -s "$ROOT/home/.claude/canon/paper-session.sh" "$CANON_HOME/paper-session.sh" \
-        || v="$v; the installed runner differs from this tree's: run scripts/automation install"
+      paper_worse UNKNOWN; txt="$txt | no scheduled firing recorded yet (the first comes $((PAPER_INTERVAL / 60)) min after install)"
     elif ! [[ "$fired" =~ ^-?[0-9]+$ ]]; then
-      [ "${v%%$'\t'*}" != ok ] || v="UNKNOWN${v#ok}"
-      v="$v | $PAPER_DIR/scheduled-firing.json is unreadable, so whether the schedule fires is not known"
+      paper_worse UNKNOWN; txt="$txt | $PAPER_DIR/scheduled-firing.json is unreadable, so whether the schedule fires is not known"
     elif [ "$fired" -gt "$PAPER_SILENT" ]; then
-      v="STALE"$'\t'"no scheduled firing for $((fired / 60)) min (the Mac asleep, or the job not running) | ${v#*$'\t'}"
+      paper_worse STALE; txt="$txt | no scheduled firing for $((fired / 60)) min (the Mac asleep, or the job not running)"
     else
-      v="$v | last scheduled firing $((fired / 60)) min ago"
+      txt="$txt | last scheduled firing $((fired / 60)) min ago"
     fi
-    v="$v | last exit code=${last:-?}; log $CANON_HOME/watch/paper-session.log"
-    check_row "paper session" "${v%%$'\t'*}" "${v#*$'\t'}"
+    # the runner launchd runs is the installed copy, which only install replaces
+    if ! cmp -s "$ROOT/home/.claude/canon/paper-session.sh" "$CANON_HOME/paper-session.sh"; then
+      paper_worse OUTDATED; txt="$txt; the installed runner differs from this tree's: run scripts/automation install"
+    fi
+    txt="$txt | last exit code=${last:-?}; log $CANON_HOME/watch/paper-session.log"
+    check_row "paper session" "$lab" "$txt"
   else check_row "paper session" OFF "run: scripts/automation install"; fi
 
   # The collector: launchd must show it running (KeepAlive restarts it); the file's age is shown, not judged,

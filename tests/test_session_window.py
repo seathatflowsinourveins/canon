@@ -10,7 +10,9 @@ for the paper `TradingClient`; the times are New York's.
 import json
 import math
 import os
+import re
 import subprocess
+import tomllib
 from datetime import UTC
 from datetime import datetime
 from decimal import Decimal
@@ -899,6 +901,7 @@ def test_every_run_leaves_a_heartbeat_even_with_nothing_to_run(monkeypatch, tmp_
 
     monkeypatch.setattr(session_window, "paper_trading", lambda: Closed())
     monkeypatch.setenv(session_window.COMMIT_ENV, "d" * 40)
+    monkeypatch.setenv(session_window.SCHEDULED_ENV, "1")
     assert session_window.main(["--session", "auto", "--log-dir", str(tmp_path)]) == 0
     heard = json.loads((tmp_path / "last-firing.json").read_text())
     assert heard["outcome"].startswith("nothing to run") and heard["commit"] == "d" * 40
@@ -910,13 +913,119 @@ def test_a_heartbeat_says_whether_the_scheduled_runner_started_the_run(
 ) -> None:
     """A second reader's review: a window run by hand wrote the same heartbeat as a scheduled firing, so
     status could not tell the schedule had stopped. The runner stamps its own firings; the heartbeat says
-    which kind of run wrote it, so status can name a run by hand."""
-    monkeypatch.delenv(session_window.COMMIT_ENV, raising=False)
+    which kind of run wrote it, so status can name a run by hand. A second reader's review of that: the
+    runner run by hand sets `CANON_COMMIT` too, so only the plist's `CANON_PAPER_SCHEDULED=1` says the
+    schedule started it."""
+    monkeypatch.delenv(session_window.SCHEDULED_ENV, raising=False)
+    monkeypatch.setenv(session_window.COMMIT_ENV, "e" * 40)  # the runner, run by hand, says so
+    monkeypatch.setenv(session_window.BY_HAND_ENV, "1")
     session_window.write_heartbeat(tmp_path, "a regular window")
-    assert json.loads((tmp_path / "last-firing.json").read_text())["scheduled"] is False
-    monkeypatch.setenv(session_window.COMMIT_ENV, "e" * 40)
+    assert json.loads((tmp_path / "by-hand" / "last-firing.json").read_text())["scheduled"] is False
+    monkeypatch.delenv(
+        session_window.BY_HAND_ENV
+    )  # a runner installed before the plist set SCHEDULED_ENV
     session_window.write_heartbeat(tmp_path, "a regular window")
     assert json.loads((tmp_path / "last-firing.json").read_text())["scheduled"] is True
+    monkeypatch.setenv(session_window.SCHEDULED_ENV, "1")
+    session_window.write_heartbeat(tmp_path, "a regular window")
+    assert json.loads((tmp_path / "last-firing.json").read_text())["scheduled"] is True
+
+
+def test_a_record_is_written_through_a_temporary_file_of_its_own(tmp_path) -> None:
+    """A second reader's review: the runner's failure record and a window's heartbeat went through one
+    temporary name, so two writers at once could publish each other's text. Each now has its own."""
+    (tmp_path / ".last-firing.json.tmp").mkdir()  # the name both used, held by another writer
+    session_window.write_heartbeat(tmp_path, "a regular window")
+    assert json.loads((tmp_path / "last-firing.json").read_text())["outcome"] == "a regular window"
+    session_window.write_record(tmp_path, {"result": "ok"})
+    assert json.loads((tmp_path / "latest.json").read_text()) == {"result": "ok"}
+    assert sorted(p.name for p in tmp_path.iterdir()) == [
+        ".last-firing.json.tmp",
+        "last-firing.json",
+        "latest.json",
+    ]
+
+
+def test_a_run_by_hand_writes_its_records_apart_and_keeps_the_gap_shared(
+    monkeypatch, tmp_path
+) -> None:
+    """A second reader's review: a run by hand shared the schedule's records, so one after hours left the
+    row REFUSED all night. `mise run paper:session` marks a run the schedule did not start; its records go to
+    `by-hand/`, while the gap marker stays in the log folder every run reads."""
+    monkeypatch.setenv(session_window.BY_HAND_ENV, "1")
+    (tmp_path / "latest.json").write_text('{"result": "ok"}')
+    session_window.write_record(tmp_path, {"result": "refused: the regular session is closed"})
+    session_window.write_heartbeat(tmp_path, "refused: the regular session is closed")
+    assert json.loads((tmp_path / "latest.json").read_text()) == {"result": "ok"}
+    assert not (tmp_path / "last-firing.json").exists()
+    assert json.loads((tmp_path / "by-hand" / "latest.json").read_text())["result"].startswith(
+        "refused"
+    )
+    assert (tmp_path / "by-hand" / "last-firing.json").exists()
+    (tmp_path / "last-window-end").write_text("1")  # a scheduled window just ended
+    assert (
+        session_window.main(["--log-dir", str(tmp_path)]) == 0
+    )  # skipped inside the gap, by hand too
+    monkeypatch.delenv(session_window.BY_HAND_ENV)
+    session_window.write_record(tmp_path, {"result": "ok"})
+    assert session_window.records_dir(tmp_path) == tmp_path
+
+
+def _paper_task(name: str) -> tuple[int, int, int]:
+    """(mise `timeout`, the body's `deadline`, its lock wait) of a paper task in `mise.toml`, in seconds."""
+    task = tomllib.loads((session_window.SOURCE_ROOT / "mise.toml").read_text())["tasks"][name]
+    timeout = task["timeout"]
+    secs = int(timeout[:-1]) * {"s": 1, "m": 60, "h": 3600}[timeout[-1]]
+    deadline = re.search(r"^deadline=(\d+)$", task["run"], re.MULTILINE)
+    wait = re.search(r"lockf -t (\d+) 9", task["run"])
+    assert deadline is not None and wait is not None
+    return secs, int(deadline.group(1)), int(wait.group(1))
+
+
+# A start-up allowance for the paper:session deadline: from the task's start to Alpaca's first clock read, past
+# the lock, uv's sync of the kept .venv after a uv.lock change and the imports. Measured 2026-11-10: 8 s with an
+# empty uv cache, downloading 464 MB, 4 s for a new .venv from the cache, 0 s for one in step. 600 s covers that
+# download at under 1 MB/s. Larger than session_window.START_UP_SECS (30 s), which sizes a window so a queued
+# paper test gets the lock in its wait: running over that only makes a test wait longer, while running over this
+# lets the deadline end a window in its account check.
+START_UP_ALLOWANCE_SECS = 600
+# Counted on top, whichever reading of the start holds: the four Alpaca calls before the node runs (clock,
+# calendar, open orders, position), each at its longest with alpaca-py's retries, though the window's end is
+# timed from the first; and a host clock behind Alpaca's by up to `session_window.SKEW_SECS`.
+START_CALLS = 4
+
+
+def test_the_paper_session_deadline_covers_its_lock_wait_start_window_and_bounded_end() -> None:
+    """A second reader's review: the deadline (85 minutes) was the lock wait plus the 70-minute stale ceiling,
+    with nothing for uv's sync or the start, so a window of full length could be killed in mid-flatten. Now:
+    the lock wait, the start-up allowance, the calls before the node with their retries, the longest window
+    and its bounded end all fit before uv's process group is killed, read from session_window's own bounds so
+    the test follows them; mise's own timeout is 60 s after that."""
+    timeout, deadline, wait = _paper_task("paper:session")
+    after_start = (
+        session_window.ADAPTER_CALL_SECS
+        + session_window.LONGEST_WINDOW_SECS
+        + session_window.AFTER_END_SECS
+    )
+    assert deadline == timeout - 60
+    start = (
+        START_UP_ALLOWANCE_SECS
+        + (START_CALLS - 1) * session_window.ADAPTER_CALL_SECS
+        + session_window.SKEW_SECS
+    )
+    assert deadline >= wait + start + after_start
+    # the other way round: a window that runs as it should, from the lock to its end, fits a paper test's wait
+    test_timeout, test_deadline, test_wait = _paper_task("paper:test")
+    assert (
+        session_window.START_UP_SECS + after_start
+        <= test_wait
+        == session_window.PAPER_LOCK_WAIT_SECS
+    )
+    assert test_deadline == test_timeout - 60 and test_deadline > test_wait
+    # a record written `running` after the first clock read is not called dead while its window runs as it should
+    assert session_window.STALE_RUNNING_SECS >= (
+        session_window.LONGEST_WINDOW_SECS + session_window.AFTER_END_SECS
+    )
 
 
 # Review findings on the session windows (a second reader, 2026-11-10): each shown here before its fix.

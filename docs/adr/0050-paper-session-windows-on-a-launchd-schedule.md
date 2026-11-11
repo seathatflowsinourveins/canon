@@ -33,10 +33,10 @@ bounded windows; each part below follows the upstream named:
 | Part | How | Follows |
 |---|---|---|
 | What fires | A second launchd user agent, `local.canon.paper-session`, installed, reported and removed by `scripts/automation` beside the lane watchdog; every 2100 s, not at load; a firing while the job still runs or the Mac sleeps is missed (launchd.plist(5)) | ADR 0011's launchd agent |
-| What runs | `~/.claude/canon/paper-session.sh` brings its own clone, `~/.claude/canon/paper-checkout`, to the `main` the origin has at that firing, detached, or fails the firing, then runs `mise run paper:session --session auto --minutes 25` there: one window, one node, one process, disposed, its records naming the commit. 25 minutes, with about three of start-up and stop (a regular stop waits its 65 s post-stop delay; an estimate, UNVERIFIED until a window has run), leaves the 300 s gap inside 35 | configure_live_trading: "run nodes as standalone Python scripts or services"; "One LiveNode per process"; actions/checkout's reuse of a directory (the runner's header) |
+| What runs | `~/.claude/canon/paper-session.sh` makes its own clone, `~/.claude/canon/paper-checkout`, anew at each firing from the `main` the origin has then, detached, keeping only `.venv`, or fails the firing, then runs `mise run paper:session --session auto --minutes 25` there: one window, one node, one process, disposed, its records naming the commit. 25 minutes, with about three of start-up and stop (a regular stop waits its 65 s post-stop delay; an estimate, UNVERIFIED until a window has run), leaves the 300 s gap inside 35 | configure_live_trading: "run nodes as standalone Python scripts or services"; "One LiveNode per process"; actions/checkout's path for a directory it does not reuse (the runner's header) |
 | Which session | `auto` takes the regular session when Alpaca's clock says it is open (`is_open`, which is false on weekends and holidays; UNVERIFIED, the clock page says only "Whether or not the market is open"), the extended one when `EXTENDED_READY` and it is open, and otherwise prints "nothing to run" and exits 0 | Alpaca's paper-trading skill: "always check the clock/calendar endpoint" |
 | A window that dies | It writes `latest.json` as `running` before the node is built and `ok` or `failed: <why>` after, the account check included; a refusal someone must look at (account not flat) is `refused: <why>`, while a skip that clears by itself (the gap, under 515 s of session left) exits 0 and keeps the last result. A `running` record past its `stale_after` (70 minutes) is a window that died | No upstream |
-| Status | `scripts/automation status`'s `paper session` row: the last window, its result, age and leftovers; FAILED when the last firing exited non-zero (one that ended before Python wrote anything); STALE when the runner's own stamp, `scheduled-firing.json`, written as each firing starts, is older than the longest firing (its 85-minute deadline) plus an interval and 300 s, since launchd misses the intervals a firing runs through, and not ok when it is missing or unreadable, whatever a window run by hand wrote | ADR 0011's status rows |
+| Status | `scripts/automation status`'s `paper session` row: the last window, its result, age and leftovers; FAILED when the last firing exited non-zero or was stopped by a signal (`launchctl list`); DIED, too, for a `running` record older than a later run's heartbeat (that run held the lock); STALE when the runner's own stamp, `scheduled-firing.json`, written as each scheduled firing starts, is older than the longest firing (its fetch bound, the 105-minute task timeout and 300 s for mise's start) plus an interval and 300 s, since launchd misses the intervals a firing runs through; not ok when the stamp or heartbeat is missing or unreadable, or the installed runner is not the tree's. A check only makes the label worse. A run by hand writes to `by-hand/`, which the row does not read | ADR 0011's status rows |
 
 Installing it is the owner's step: `scripts/automation install`. Whether the agent's `mise run` reads the
 login keychain without a dialog is UNVERIFIED until its first firing. A firing while the Mac sleeps is missed.
@@ -53,10 +53,22 @@ login keychain without a dialog is UNVERIFIED until its first firing. A firing w
   (ADR 0044).
 * Bad: the clone's kept `.venv` is trusted local state, as a person's checkout's is: `--exact` removes
   extraneous packages but not other files (a loose `.pth` still ran, observed), and uv documents no check
-  of files outside its packages. Its `.git` is not: hooks are off and a foreign local config is remade.
-* Bad: a run that hangs holding the paper lock is stopped by mise's task `timeout` (paper:session 85
-  minutes, paper:test 2 hours, each counting the wait for the lock); a window stopped there flattens nothing
-  and shows as died, and the next starts only once the account is flat.
+  of files outside its packages. Nothing else is kept: the clone, its `.git` and worktree are new each firing.
+* Bad: a run that hangs holding the paper lock is killed at its task's deadline, its process group whole
+  (`timeout -s KILL`), 60 s before mise's `timeout` (paper:session 105 minutes, paper:test 2 hours, each
+  counting the wait for the lock); a window killed there flattens nothing and shows as died, and the next
+  starts only once the account is flat. paper:session's deadline, 6240 s from the task's start, holds the
+  lock wait (900), a start-up allowance (600: uv's sync after a uv.lock change measured 8 s from an empty
+  cache, 464 MB), four Alpaca calls before the node at their longest with alpaca-py's retries (4 x
+  `ADAPTER_CALL_SECS`, 517), a host clock behind Alpaca's (`SKEW_SECS`, 60), the longest window
+  (`LONGEST_WINDOW_SECS`, 3346) and its bounded end (`AFTER_END_SECS`, 394): 5817, 423 s spare (482 s with
+  the 3106 and 575 the window's next change gives); a test reads those bounds from `session_window`. From a
+  person's terminal uv runs as before, with mise's `timeout` as the deadline: through timeout(1) one Ctrl-C
+  reached Python twice (observed), which could cut a flatten short. A window run as it should holds the lock under
+  paper:test's 3900 s wait (ADR 0044); one that hangs holds it to the deadline, past the 70 minutes after
+  which status calls it died, and a queued test fails placing nothing. `timeout` is `/usr/bin/timeout`,
+  Apple's (signed `com.apple.timeout`, on the sealed system volume of macOS 27.2); which macOS first
+  shipped it is UNVERIFIED, and where it is absent the runner, the watchdog and the paper tasks fail.
 
 ### Confirmation
 
@@ -84,6 +96,36 @@ unreadable one; a post-checkout hook, a local branch and a `core.fsmonitor` left
 an origin URL with user information is refused at install and by the runner, and messages name host and path.
 `/code-review` (high) of the fix found six more (a same-second heartbeat, a long firing, a branch named
 `origin/main`, scp-style credentials, git's init keys, `@` in a path), each fixed with a case there.
+Three second readers' review of that (2026-11-10), each first shown by a failing test in `scripts/test-lanes`
+or `tests/test_session_window.py`, one line per fix:
+* the deadline had no room for start-up: now the arithmetic above, held by a test against the window's bounds;
+* a descendant that ignored SIGTERM kept the lock after mise's timeout (reproduced: lockf exit 75): uv runs
+  under `timeout -s KILL`, and both stand-ins, with and without SIGTERM ignored, leave nothing and the lock free;
+* nothing bounded a firing before the task: the fetch at 120 s, each keychain read at 30 s, the whole `mise run`;
+* a replace ref, a second remote URL, a skip-worktree bit, an info/attributes rule and a mise.local.toml
+  beside an unborn HEAD each ran other code under the reported commit: the clone is made new at every firing;
+* a token in the origin's query reached the firing's record through git's own message: a query or fragment is refused;
+* a firing stopped by a signal read ok: FAILED from `launchctl list`'s negative status, kept after a run by hand;
+* a missing heartbeat read ok, and an installed runner older than the tree's read ok once a stamp existed;
+* STALE hid DIED, FAILED and REFUSED, and a firing that exited 1 before any record read UNKNOWN;
+* a `running` record stayed ok after a later run held the lock: DIED;
+* a run by hand stamped the schedule's firing and wrote its records: only `CANON_PAPER_SCHEDULED=1` stamps,
+  and a run by hand writes to `by-hand/` (a runner installed before this, which sets only `CANON_COMMIT`,
+  still writes the schedule's records until the owner installs again);
+* the runner and a window shared one temporary file name: each writer has its own;
+* the lane watchdog exited 0 after a failed status write, never retried a failed notification, could hang
+  with its row still ok, and alerted a flag again after a stop between recording and remembering it: each fixed.
+`/code-review` (high) of those fixes found five more, each fixed with a case: a firing stopped part way
+through remaking the clone left a folder every later one refused (now `.git` goes last, `.venv` alone is
+accepted); a run by hand moved the gap marker (now only its records go to `by-hand/`); a run by hand or an
+install could delete the clone under a running window, which the task's own process group puts out of
+reach of the runner's bound and launchd's bootout (now each run holds `<checkout>.lock`, and uninstall
+keeps a clone whose lock is held); a stop between recording an alert and queuing its notification lost it.
+A second `/code-review` (high) found five more, each fixed with a case: a checkout path that is a link
+(refused); a refusal shown as FAILED by its exit code (REFUSED outranks it); `.git` and its mark swapped in
+by two renames, so no stop leaves an unmarked one; DIED read from a runner failure that took no lock (only a
+run that held it counts); an install's origin unchecked while a window held the clone (`git ls-remote`).
+Ctrl-C from a terminal: as above.
 
 ## Evidence
 
@@ -131,5 +173,17 @@ Read 2026-11-10. "raw": fetched with `curl` and read whole.
   raw; observed with uv 0.13.7).
 * https://www.rfc-editor.org/rfc/rfc3986.txt, section 3.2.1: user information precedes "@" before the host,
   and "user:password" there is deprecated (fetched, raw).
+* Three second readers' review of the runner and the watchdog (2026-11-10), fifteen claims, each reproduced
+  offline before its fix, or by a probe with mise 2026.11.5 and lockf (run).
+* `man timeout` on this machine: it "makes itself the leader of a process group that the command inherits",
+  `-s KILL` "terminate[s] timeout along with the command"; observed: without `-s KILL` it exits with its
+  direct child and a grandchild that ignores SIGTERM lives on (read; run).
+* `man launchctl`, list: a negative status "represents the negative of the signal which stopped the job" (read).
+* `man git`: GIT_NO_REPLACE_OBJECTS, GIT_CONFIG_NOSYSTEM; `man mktemp`: a unique name (read).
+* actions/checkout v7.0.1 at `3d3c42e5aac5`, `src/git-directory-helper.ts` ("Delete the contents of the
+  directory") and `src/git-source-provider.ts` (`git.init`, `remoteAdd`) (fetched, raw).
+* https://raw.githubusercontent.com/jdx/mise/v2026.11.5/settings.toml, `task.run_auto_install`: "Install
+  missing tools automatically before tasks run" (fetched, raw).
+* https://www.rfc-editor.org/rfc/rfc3986.txt, sections 3.4 and 3.5: the query and the fragment (fetched, raw).
 * Second reader (`evidence-verifier`), 2026-11-10, on this split: added the skill and clock lines, marked
   the weekend reading `UNVERIFIED`, narrowed the Good consequence and corrected the install line.
