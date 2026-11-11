@@ -214,7 +214,7 @@ def returns_matrix(series: Sequence[pd.Series]) -> pd.DataFrame:
     missing = matrix.isna()
     short = [name for name in matrix.columns if missing[name].any()]
     if short:
-        by_name = {s.name: s for s in series}
+        by_name = {str(s.name): s for s in series}  # the columns are `str` of each name
         lines = [
             f"{name}: no return on {int(missing[name].sum())} of the {len(matrix)} session days of "
             f"the sample, the first {missing[name].idxmax().date()}; it covers "

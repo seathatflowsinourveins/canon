@@ -29,11 +29,14 @@ without recording. Either way the study is ranked only once every configuration 
 record: `rank` counts N from the ledger and cannot see a planned configuration never tried, so a
 pass stopped part way would be ranked at an N short of the plan's (ADR 0010 step 1, ADR 0048). A run
 that raises goes into the pass's failures only once `record_trial` has told it `FAIL` with its error
-(a refused `tell` after a run included, which keeps the run's outcome); one whose
+(a refused `tell` after a run included, which keeps the run's outcome, and both its `tell`s refused,
+which leaves it `RUNNING` with its outcome and error); one whose
 failure could not be written stops the pass, with the storage error as a note on the run's own. A
 pass holds an exclusive `fcntl.flock` (the standard library's, as
-`canon_trading.ledger` takes for creation) on a lock file beside the ledger, named for the study, so a
-second pass on the same study is refused rather than run beside it. The catalog defaults to the
+`canon_trading.ledger` takes for creation) on a lock file beside the ledger, named for the study
+(percent-encoded, so a name holding `/` names one file), so a second pass on the same study is
+refused rather than run beside it. A pass that only opens a study looks for the ledger before it takes
+that lock, and creates no folder and no file where there is none. The catalog defaults to the
 `catalog/` of the checkout this module is in, where the paper test loads the bars; the ledger to
 `canon_trading.ledger.default_ledger_path()`, shared by every worktree (ADR 0035).
 """
@@ -48,6 +51,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
+from urllib.parse import quote
 
 from canon_alpaca.constants import VENUE
 from canon_alpaca.data import NEW_YORK
@@ -61,6 +65,7 @@ from optuna.trial import TrialState
 from .ledger import FAILED
 from .ledger import OUTCOME
 from .ledger import RAN
+from .ledger import LedgerNotFound
 from .ledger import config_key
 from .ledger import create_ledger_study
 from .ledger import current_sample
@@ -168,20 +173,25 @@ class Recorded:
 
 
 def _told_failed(study: optuna.Study, key: str, before: int) -> bool:
-    """Whether a record of `key` numbered `before` or later was told `FAIL` with its error by `record_trial`.
+    """Whether a record of `key` numbered `before` or later holds its failure as `record_trial` wrote it.
 
     `record_trial` tells a raised run `FAIL` with outcome `failed`, and a run whose `tell` was refused
     after its outcome `FAIL` with that outcome kept (`traded` or `idle`); either way it writes the
     error (`canon_trading.ledger._tell_failed`), and the failure is in the ledger for the gate to read.
-    A record still `RUNNING`, or with no error written, is a failure that could not be told, and stops
-    the pass.
+    When that `FAIL` is refused too, a run that ran to the end stays `RUNNING` with its outcome and
+    its error written: every result is there, and the gate reads it as the run it was
+    (`canon_trading.ranking.ran_to_the_end`), so it is a written failure as well. Any other record
+    still `RUNNING`, or one with no error written, is a failure that could not be told, and stops the
+    pass.
     """
     return any(
         trial.number >= before
         and trial.user_attrs.get("config_key") == key
-        and trial.user_attrs.get(OUTCOME) in (FAILED, *RAN)
         and "error" in trial.user_attrs
-        and trial.state == TrialState.FAIL
+        and (
+            (trial.state == TrialState.FAIL and trial.user_attrs.get(OUTCOME) in (FAILED, *RAN))
+            or (trial.state == TrialState.RUNNING and trial.user_attrs.get(OUTCOME) in RAN)
+        )
         for trial in study.get_trials(deepcopy=False)
     )
 
@@ -260,7 +270,10 @@ def run_study(
     configs = grid() if configs is None else configs
     first, last = dt_to_unix_nanos(start), dt_to_unix_nanos(end)
     ledger = default_ledger_path() if ledger_path is None else Path(ledger_path).resolve()
-    with _pass_lock(ledger, name):
+    if not create and not ledger.is_file():
+        # Before the pass lock, whose file would be created beside a ledger that is not there.
+        raise LedgerNotFound(f"there is no ledger at {ledger}; create_ledger_study creates one")
+    with _pass_lock(ledger, name, create=create):
         if create:
             opened = create_ledger_study(name, start=first, end=last, path=ledger)
         else:
@@ -270,10 +283,18 @@ def run_study(
 
 
 @contextmanager
-def _pass_lock(ledger: Path, name: str) -> Generator[None]:
-    """Hold an exclusive, non-blocking `flock` on `<ledger>.<name>.pass.lock`; refuse if it is held."""
-    ledger.parent.mkdir(parents=True, exist_ok=True)
-    with (ledger.parent / f"{ledger.name}.{name}.pass.lock").open("a") as lock:
+def _pass_lock(ledger: Path, name: str, *, create: bool) -> Generator[None]:
+    """Hold an exclusive, non-blocking `flock` on `<ledger>.<name>.pass.lock`; refuse if it is held.
+
+    The name is percent-encoded with no character left safe (`urllib.parse.quote`, as the ledger
+    encodes its SQLite path), so a study name holding `/` names one file beside the ledger. On a file
+    system that folds case, two names that differ only in case share one lock, and a pass on one
+    refuses a pass on the other, which runs nothing twice. The ledger's folder is made only for a pass
+    that creates the study.
+    """
+    if create:
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+    with (ledger.parent / f"{ledger.name}.{quote(name, safe='')}.pass.lock").open("a") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:

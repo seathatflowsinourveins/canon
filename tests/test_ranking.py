@@ -33,12 +33,14 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 from typing import Any
 
+import numpy as np
 import optuna
 import pytest
 from optuna.trial import TrialState
 from skfolio import Portfolio
 from skfolio import measures
 
+import canon_trading.ledger
 from canon_trading import ranking
 from canon_trading.ledger import DAY_NS
 from canon_trading.ledger import FAILED
@@ -51,6 +53,7 @@ from canon_trading.ledger import current_sample
 from canon_trading.ledger import mark_not_run
 from canon_trading.ledger import move_sample
 from canon_trading.ledger import open_study
+from canon_trading.ledger import told_sharpe
 from canon_trading.ranking import SHA256_HEX
 from canon_trading.ranking import THRESHOLD
 from canon_trading.ranking import RankingReport
@@ -91,8 +94,13 @@ def instrument_of(label: str) -> str:
 
 
 def config_of(label: str) -> dict[str, object]:
-    """A stored config for the configuration named `label`, in the part of its form the gate reads."""
-    return {"label": label, "data": {"data_type": "Bar", "bar_types": [bars_of(label)]}}
+    """A stored config for the configuration named `label`, in `record_trial`'s three parts, with only
+    the data's filled in as the gate reads it."""
+    return {
+        "strategies": [{"label": label}],
+        "venue": {},
+        "data": {"data_type": "Bar", "bar_types": [bars_of(label)]},
+    }
 
 
 def digest_of(label: str) -> dict[str, str]:
@@ -190,10 +198,12 @@ def write(
         if name not in drop:
             trial.set_user_attr(name, value)
     trial.set_user_attr(OUTCOME, outcome)
-    if outcome == IDLE or not told_complete:
-        study.tell(trial, state=TrialState.FAIL)
+    with np.errstate(divide="ignore", invalid="ignore"):  # constant returns: NaN, told FAIL
+        value = told_sharpe(written.get("returns_series"), written.get("session_days"))
+    if outcome == IDLE or not told_complete or not math.isfinite(value):
+        study.tell(trial, state=TrialState.FAIL)  # as `record_trial` tells a ratio not finite
     else:
-        study.tell(trial, 0.0)
+        study.tell(trial, value)
     return trial.number
 
 
@@ -916,7 +926,7 @@ def test_a_keyed_record_with_a_result_and_no_outcome_stops_for_good(
     """Another writer's completed record of a key was read as a failure a later run resolves, so a
     traded record of that key passed and the completed one was never checked."""
     trial = study.ask()
-    trial.set_user_attr("config_key", "pick")
+    trial.set_user_attr("config_key", key_of("pick"))  # the pick's own key, so a resolve would pass
     trial.set_user_attr("sample", 0)
     if result == "complete":
         study.tell(trial, 1.5)
@@ -932,6 +942,7 @@ def test_a_keyed_record_with_a_result_and_no_outcome_stops_for_good(
     with pytest.raises(RankingStopped) as stopped:
         rank(study)
 
+    assert "(N = 3)" in str(stopped.value), stopped.value  # one key with the pick's records
     assert re.search(
         rf"pick: #{trial.number} \([a-z]+\) (shows a result Optuna keeps but no outcome "
         r"record_trial writes|holds an intermediate value or a parameter)",
@@ -1019,16 +1030,19 @@ def test_a_keyless_waiting_record_can_be_marked_not_run(study: optuna.Study) -> 
 
     [trial] = [t for t in study.trials if t.number == waiting]
     assert trial.state == TrialState.WAITING  # Optuna tells only a RUNNING trial
-    assert study.user_attrs["not_run"] == [waiting]
+    assert study.user_attrs["not_run_waiting"] == [waiting]
+    assert "not_run" not in study.user_attrs
     assert rank(study).n == 3
 
-    # Optuna's next `ask` takes the queued trial; started, it is no longer cleared by its mark.
+    # Optuna's next `ask` takes the queued trial; started, it is no longer cleared by its mark, and
+    # it is not marked again: whoever started it may have run anything in it.
     assert study.ask().number == waiting
-    with pytest.raises(RankingStopped, match=rf"#{waiting} \(running\) has no config key"):
+    with pytest.raises(
+        RankingStopped, match=rf"#{waiting} \(running\) [^\n]*started after its mark"
+    ):
         rank(study)
-    mark_not_run(study, waiting)
-    assert [t.state for t in study.trials if t.number == waiting] == [TrialState.FAIL]
-    assert rank(study).n == 3
+    with pytest.raises(ValueError, match="started after its mark"):
+        mark_not_run(study, waiting)
 
 
 def test_a_trial_is_marked_not_run_only_on_a_study_the_ledger_opened(tmp_path: Path) -> None:
@@ -1121,6 +1135,7 @@ def test_a_digest_that_lacks_a_bar_type_the_run_loads_stops(study: optuna.Study)
         THIRD_CLOSE,
         attrs={
             "config": {
+                **config_of("third"),
                 "data": {
                     "data_type": "Bar",
                     "bar_types": [bars_of("third"), "MSFT.ALPACA-1-DAY-LAST-EXTERNAL"],
@@ -1136,7 +1151,11 @@ def test_a_digest_that_lacks_a_bar_type_the_run_loads_stops(study: optuna.Study)
         rank(study)
 
 
-@pytest.mark.parametrize("config", [None, {"data": {"bar_types": "bars"}}], ids=["none", "odd"])
+@pytest.mark.parametrize(
+    "config",
+    [None, {**config_of("third"), "data": {"bar_types": "bars"}}],
+    ids=["none", "odd"],
+)
 def test_a_record_that_ran_with_no_config_in_the_writers_form_stops(
     study: optuna.Study, config: object
 ) -> None:
@@ -1189,7 +1208,7 @@ def test_a_pick_whose_config_is_another_configuration_s_stops(study: optuna.Stud
     types its digest names kept, was accepted as the pick."""
     write(study, "pick", PICK)
     write(study, "second", SECOND)
-    other = {**config_of("other"), "data": config_of("pick")["data"]}
+    other = {**config_of("other"), "data": config_of("pick")["data"]}  # the pick's data, kept
     number = write(
         study,
         "pick",
@@ -1279,4 +1298,157 @@ def test_a_digest_without_its_instruments_stops(study: optuna.Study) -> None:
     with pytest.raises(
         RankingStopped, match=rf"third: #{number} [^\n]*not the bar types it loads and their instr"
     ):
+        rank(study)
+
+
+def test_a_waiting_record_marked_and_then_failed_by_another_writer_stops(
+    study: optuna.Study,
+) -> None:
+    """A third reader: a queued record marked not run while `WAITING`, then started and told `FAIL` by
+    another writer (`Study.optimize`, or `ask` and `tell`), stayed cleared and out of N, though it
+    may have run a backtest after its mark."""
+    write(study, "pick", PICK)
+    write(study, "second", SECOND)
+    write(study, "third", THIRD_CLOSE)
+    study.enqueue_trial({})
+    [waiting] = [t.number for t in study.trials if t.state == TrialState.WAITING]
+    mark_not_run(study, waiting)
+    assert rank(study).n == 3
+
+    started = study.ask()
+    assert started.number == waiting
+    study.tell(started, state=TrialState.FAIL)
+
+    with pytest.raises(RankingStopped, match=rf"#{waiting} \(fail\) [^\n]*started after its mark"):
+        rank(study)
+    with pytest.raises(ValueError, match="started after its mark"):
+        mark_not_run(study, waiting)
+
+
+def test_a_record_of_another_writer_on_an_earlier_sample_still_stops(study: optuna.Study) -> None:
+    """A third reader: moving the sample to the same range left another writer's record behind, and
+    its stop, which no later record resolves, cleared without anything having changed."""
+    write(study, "pick", PICK)
+    trial = study.ask()
+    trial.set_user_attr("config_key", key_of("second"))
+    trial.set_user_attr("sample", 0)
+    study.tell(trial, 99.0)  # COMPLETE with a value and no outcome: never the writer's
+    with pytest.raises(RankingStopped, match=rf"second: #{trial.number} [^\n]*another writer"):
+        rank(study)
+
+    bounds = current_sample(study)
+    move_sample(study, start=bounds.start, end=bounds.end)
+    write(study, "pick", PICK, sample=1)
+    write(study, "second", SECOND, sample=1)
+    write(study, "third", THIRD_CLOSE, sample=1)
+
+    with pytest.raises(RankingStopped, match=rf"second: #{trial.number} [^\n]*another writer"):
+        rank(study)
+
+
+@pytest.mark.parametrize("how", ["queued", "with a system attribute"])
+def test_a_keyed_record_queued_or_with_system_attributes_is_another_writers(
+    study: optuna.Study, how: str
+) -> None:
+    """A third reader: a keyed record queued by another writer (`Study.enqueue_trial`, which writes
+    `fixed_params`) was read as a failure a later record of its key resolves."""
+    write(study, "pick", PICK)
+    write(study, "second", SECOND)
+    if how == "queued":
+        study.enqueue_trial({}, user_attrs={"config_key": key_of("third"), "sample": 0})
+        [number] = [t.number for t in study.trials if t.state == TrialState.WAITING]
+    else:
+        study.add_trial(
+            optuna.trial.create_trial(
+                state=TrialState.FAIL,
+                user_attrs={"config_key": key_of("third"), "sample": 0},
+                system_attrs={"fixed_params": {"fast": 2}},
+            )
+        )
+        number = study.trials[-1].number
+    write(study, "third", THIRD_CLOSE)
+
+    with pytest.raises(RankingStopped, match=rf"third: #{number} [^\n]*another writer"):
+        rank(study)
+
+
+def test_a_told_value_that_is_not_the_sharpe_ratio_of_its_returns_stops(
+    study: optuna.Study,
+) -> None:
+    """A third reader: a record told a value its returns do not give was read like the writer's;
+    `record_trial` tells the per-session Sharpe ratio of the returns it stores."""
+    write(study, "pick", PICK)
+    write(study, "second", SECOND)
+    number = write(study, "third", THIRD_CLOSE)
+    [trial] = [t for t in study.trials if t.number == number]
+    study.add_trial(
+        optuna.trial.create_trial(
+            state=TrialState.COMPLETE, value=-999999.0, user_attrs=trial.user_attrs
+        )
+    )
+
+    with pytest.raises(RankingStopped, match=r"third: #\d+ [^\n]*told -999999\.0"):
+        rank(study)
+
+
+def test_a_config_not_in_the_form_record_trial_writes_stops(study: optuna.Study) -> None:
+    """A third reader: a config naming only the data, with no strategies or venue, hashed to its
+    key and passed; `record_trial` stores the strategies, the venue and the data."""
+    write(study, "pick", PICK)
+    write(study, "second", SECOND)
+    data_only = {"data": config_of("third")["data"]}
+    number = write(study, "third", THIRD_CLOSE, attrs={"config": data_only})
+
+    with pytest.raises(RankingStopped, match=rf"third: #{number} [^\n]*config holds \['data'\]"):
+        rank(study)
+
+
+def test_a_record_that_ran_on_an_earlier_sample_with_no_config_still_stops(
+    study: optuna.Study,
+) -> None:
+    """A third reader: a record that ran with no `config` under a configuration's key stopped the
+    ranking only while its sample was current; a move to the same range cleared it, at N = 3."""
+    write(study, "pick", PICK)
+    number = write(study, "second", SECOND, drop=("config",))
+    bounds = current_sample(study)
+    move_sample(study, start=bounds.start, end=bounds.end)
+    for label, returns in (("pick", PICK), ("second", SECOND), ("third", THIRD_CLOSE)):
+        write(study, label, returns, sample=1)
+
+    with pytest.raises(
+        RankingStopped, match=rf"second: #{number} [^\n]*ran on sample 0 with no config"
+    ):
+        rank(study)
+
+
+def test_a_keyed_record_record_trial_took_from_the_queue_stops(study: optuna.Study) -> None:
+    """A third reader: `record_trial` took another writer's queued record of a key and told it `FAIL`
+    with its note, its outcome kept, which read as a run of that key's (`record_trial` now refuses to
+    take one; a record left so by the code before stops)."""
+    write(study, "second", SECOND)
+    write(study, "third", THIRD_CLOSE)
+    number = write(
+        study,
+        "pick",
+        PICK,
+        told_complete=False,
+        attrs={"error": canon_trading.ledger.TAKEN_FROM_QUEUE},
+    )
+
+    with pytest.raises(RankingStopped, match=rf"pick: #{number} [^\n]*taken from Optuna's queue"):
+        rank(study)
+
+
+def test_a_value_told_where_record_trial_tells_none_stops(study: optuna.Study) -> None:
+    """Code review: a value told on returns that give no Sharpe ratio (one session here) passed the
+    check of told values; `record_trial` tells `FAIL` with no value there."""
+    write(study, "pick", PICK)
+    write(study, "second", SECOND)
+    number = write(study, "third", THIRD_CLOSE[:1], told_complete=False)
+    [trial] = [t for t in study.trials if t.number == number]
+    study.add_trial(
+        optuna.trial.create_trial(state=TrialState.COMPLETE, value=2.5, user_attrs=trial.user_attrs)
+    )
+
+    with pytest.raises(RankingStopped, match=r"third: #\d+ [^\n]*told 2\.5, not nan"):
         rank(study)

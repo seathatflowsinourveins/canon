@@ -171,6 +171,7 @@ def test_a_trial_round_trips_through_the_sqlite_file(
         str(ns): value for ns, value in result.returns_series.items()
     }
     assert trial.user_attrs["session_days"] == [str(bar.ts_init // DAY_NS * DAY_NS) for bar in bars]
+    assert trial.system_attrs == {}  # the ranking reads any as another writer's (ADR 0054)
     digests = trial.user_attrs["data_digest"]
     assert set(digests) == {str(BAR_TYPE), str(BAR_TYPE.instrument_id)}
     assert all(len(digest) == 64 for digest in digests.values())
@@ -759,8 +760,7 @@ def test_a_tell_refused_after_the_run_keeps_the_outcome_it_ran_to(
     returns[first_day] += 0.01
     study.add_trial(
         optuna.trial.create_trial(
-            state=TrialState.COMPLETE,
-            value=0.0,
+            state=TrialState.FAIL,  # traded, with no value, as `record_trial` tells returns it refuses
             user_attrs={**trial.user_attrs, "returns_series": returns},
         )
     )
@@ -816,7 +816,8 @@ def test_daily_bars_stamped_at_utc_midnight_rank(
     returns on days the ledger called closed, so every ranking of the study stopped."""
     bars = alpaca_bars.write(tmp_path / "catalog", first=datetime(2025, 3, 10, tzinfo=UTC))
     assert all(bar.ts_init % DAY_NS == 0 for bar in bars)
-    study = new_study(stack, tmp_path, "midnight")
+    # Ending on the session day of the last bar, 2025-05-02 (`_refuse_unbooked_ends`).
+    study = new_study(stack, tmp_path, "midnight", end="2025-05-03")
     for fast, slow in ((3, 8), (2, 5)):
         record_trial(
             study,
@@ -1408,10 +1409,6 @@ def test_a_bar_type_with_no_bar_in_the_sample_is_in_the_digest(
     assert trial.user_attrs["data_digest"][str(MSFT_BAR_TYPE)] == EMPTY_DIGEST
 
 
-def test_data_digest_names_every_bar_type_the_run_loads() -> None:
-    assert data_digest([], [str(MSFT_BAR_TYPE)], []) == {str(MSFT_BAR_TYPE): EMPTY_DIGEST}
-
-
 def test_a_base_strategy_config_field_set_away_from_its_default_is_in_the_key() -> None:
     """`order_id_tag` reaches the engine and was left out of the key: two configurations shared one."""
     keys = [
@@ -1681,3 +1678,205 @@ def test_a_config_whose_fields_were_changed_after_it_was_built_is_refused() -> N
         vars(config).update(change)
         with pytest.raises(ValueError, match="not as MaCrossConfig builds it"):
             trial_config([config], starting_balances=BALANCES)
+
+
+# The gate's remaining claims, 2026-11-10: each test failed before its fix unless it says otherwise.
+
+
+def test_a_sample_starting_at_a_bar_at_utc_midnight_is_refused_before_a_trial(
+    alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack
+) -> None:
+    """A third reader: a sample starting at 00:00 UTC on a bar's `ts_init` put that bar on the day
+    NautilusTrader's daily series books the account's registration on, which holds no return, so
+    `record_trial` told its own run `FAIL` and the ranking stopped for good."""
+    alpaca_bars.write(tmp_path / "catalog", first=datetime(2025, 3, 10, tzinfo=UTC))
+    study = new_study(stack, tmp_path, "midnight start", start="2025-03-11", end="2025-05-03")
+
+    with pytest.raises(ValueError, match="books that bar on the day before"):
+        record_trial(study, tmp_path / "catalog", [strategy()], starting_balances=BALANCES)
+    assert study.trials == []
+
+
+def test_a_sample_ending_on_a_day_with_no_bar_is_refused_before_a_trial(
+    alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack
+) -> None:
+    """A third reader: on bars too thin for the strategy's closing order, a sample ending two days
+    after its last bar had `on_stop`'s fill booked on a day with no bar, and `record_trial` told its
+    own run `FAIL` (traded, no value), which no later record resolves."""
+    from nautilus_trader.model import Bar
+
+    listed = alpaca_bars.equity()
+    thin = [
+        Bar(b.bar_type, b.open, b.high, b.low, b.close, Quantity.from_int(4), b.ts_event, b.ts_init)
+        for b in alpaca_bars.daily(listed)
+    ]
+    (tmp_path / "catalog").mkdir()
+    catalog = ParquetDataCatalog(str(tmp_path / "catalog"))
+    catalog.write_instruments([listed])
+    last = thin[-1].ts_init // DAY_NS * DAY_NS
+    catalog.write_bars(
+        thin, start=(thin[0].ts_init - DAY_NS) // DAY_NS * DAY_NS, end=last + 3 * DAY_NS
+    )
+    study = stack.enter_context(
+        create_ledger_study(
+            "late end",
+            start=START,
+            end=last + 2 * DAY_NS + DAY_NS // 2,
+            path=tmp_path / "trials.db",
+        )
+    )
+
+    with pytest.raises(ValueError, match="books a run's last fills on the session day of its end"):
+        record_trial(study, tmp_path / "catalog", [strategy()], starting_balances=BALANCES)
+    assert study.trials == []
+
+
+def test_an_instrument_s_digest_holds_the_precision_of_its_currency(
+    alpaca_bars: AlpacaBars,
+) -> None:
+    """A second reader and a third: `to_dict` writes a currency as its code, so USD at precisions 2,
+    0 and 8 gave one digest though the engine rounds money to the currency's precision, and three
+    keys recorded across them passed at DSR 0.9922."""
+    from nautilus_trader.model import Currency
+
+    listed = alpaca_bars.equity()
+    usd = listed.quote_currency
+    digests = set()
+    for precision in (2, 0, 8):
+        currency = Currency(usd.code, precision, usd.iso4217, usd.name, usd.currency_type)
+        held = Equity(
+            instrument_id=listed.id,
+            raw_symbol=listed.raw_symbol,
+            currency=currency,
+            price_precision=listed.price_precision,
+            price_increment=listed.price_increment,
+            ts_event=0,
+            ts_init=0,
+            info=dict(listed.info),
+        )
+        assert held.to_dict() == listed.to_dict()  # the form upstream compares names USD alone
+        digests.add(instrument_digest(held))
+    assert len(digests) == 3
+
+
+@pytest.mark.parametrize(
+    ("field", "values"),
+    [
+        pytest.param(
+            "max_quantity", (Quantity.from_str("5"), Quantity.from_str("5.0")), id="5, 5.0"
+        ),
+        pytest.param("margin_init", (Decimal("0.1"), Decimal("0.10")), id="0.1, 0.10"),
+    ],
+)
+def test_two_texts_of_one_value_are_two_definitions_to_the_node_and_the_digest(
+    alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack, field: str, values: tuple[Any, Any]
+) -> None:
+    """Two readers: values equal as numbers but written with another precision gave two digests.
+    That is upstream's own rule, not a defect (passes before and after): the node refuses a second
+    definition whose serialized form differs, a value's text included, and the digest follows it."""
+    alpaca_bars.write(tmp_path / "catalog", instrument=False)
+    listed = alpaca_bars.equity()
+    defined = [
+        Equity(
+            instrument_id=listed.id,
+            raw_symbol=listed.raw_symbol,
+            currency=listed.quote_currency,
+            price_precision=listed.price_precision,
+            price_increment=listed.price_increment,
+            ts_event=stamp,
+            ts_init=stamp,
+            info=dict(listed.info),
+            **{field: value},
+        )
+        for stamp, value in enumerate(values)
+    ]
+    assert getattr(defined[0], field) == getattr(defined[1], field)
+    assert instrument_digest(defined[0]) != instrument_digest(defined[1])
+    for definition in defined:
+        ParquetDataCatalog(str(tmp_path / "catalog")).write_instruments([definition])
+    study = new_study(stack, tmp_path, "two texts")
+
+    with pytest.raises(RuntimeError, match="already registered with a different definition"):
+        record_trial(study, tmp_path / "catalog", [strategy()], starting_balances=BALANCES)
+
+
+def test_the_digest_holds_each_instrument_the_run_names(alpaca_bars: AlpacaBars) -> None:
+    """A second reader: `test_data_digest_names_every_bar_type_the_run_loads` passed no instrument,
+    so it held whatever `data_digest` did with one (it passed with the instruments left out)."""
+    msft = alpaca_bars.equity("MSFT")
+    assert data_digest([], [str(MSFT_BAR_TYPE)], [msft]) == {
+        str(MSFT_BAR_TYPE): EMPTY_DIGEST,
+        str(msft.id): instrument_digest(msft),
+    }
+
+
+def test_starting_balances_are_keyed_one_per_currency_in_any_order() -> None:
+    """A third reader: the balances were keyed in the order given and with repeats, though the venue
+    keeps one per currency, so runs alike took two keys and N grew."""
+    one = config_key(trial_config([strategy()], starting_balances=["100000 USD", "50000 EUR"]))
+    other = config_key(trial_config([strategy()], starting_balances=["50000 EUR", "100000 USD"]))
+    assert one == other
+    with pytest.raises(ValueError, match="name USD more than once"):
+        trial_config([strategy()], starting_balances=["50000 USD", "50000 USD"])
+    assert (
+        config_key(trial_config([strategy()], starting_balances=BALANCES)) == DEFAULT_CONFIG_SHA256
+    )
+
+
+def test_a_queued_trial_with_a_key_that_record_trial_takes_stops_the_ranking(
+    alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack
+) -> None:
+    """A third reader: `record_trial` took another writer's queued record of a key, outcome `traded`
+    and returns made up, and told it `FAIL`, which reads as a run that ran to the end; the ranking
+    then passed on returns no backtest gave. Taken with its note, it now stops the ranking for good."""
+    alpaca_bars.write(tmp_path / "catalog")
+    study = new_study(stack, tmp_path, "queued key")
+    key = config_key(trial_config([strategy()], starting_balances=BALANCES))
+    study.add_trial(
+        optuna.trial.create_trial(
+            state=TrialState.WAITING, user_attrs={"config_key": key, "sample": 0, OUTCOME: TRADED}
+        )
+    )
+
+    for fast, slow in ((3, 8), (2, 5)):
+        record_trial(
+            study,
+            tmp_path / "catalog",
+            [strategy(fast=fast, slow=slow)],
+            starting_balances=BALANCES,
+        )
+
+    taken = study.trials[0]
+    assert (taken.state, taken.user_attrs["error"]) == (
+        TrialState.FAIL,
+        canon_trading.ledger.TAKEN_FROM_QUEUE,
+    )
+    with pytest.raises(RankingStopped, match=r"#0 \(traded\) was taken from Optuna's queue"):
+        rank(study)
+
+
+def test_a_queued_record_marked_while_waiting_stays_cleared_once_record_trial_takes_it(
+    alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack
+) -> None:
+    """A mark made while `WAITING` holds only while the record is not started, and `record_trial`'s
+    own `ask` takes the oldest queued trial: told `FAIL` with its note and no run, it stays cleared,
+    as it was before the mark was kept apart (the case that change must keep)."""
+    alpaca_bars.write(tmp_path / "catalog")
+    study = new_study(stack, tmp_path, "marked queue")
+    study.enqueue_trial({})
+    mark_not_run(study, 0)
+    for fast, slow in ((3, 8), (2, 5)):
+        record_trial(
+            study,
+            tmp_path / "catalog",
+            [strategy(fast=fast, slow=slow)],
+            starting_balances=BALANCES,
+        )
+
+    taken = study.trials[0]
+    assert (taken.state, taken.user_attrs) == (
+        TrialState.FAIL,
+        {"error": canon_trading.ledger.TAKEN_FROM_QUEUE},
+    )
+    mark_not_run(study, 0)  # cleared already: nothing to refuse
+    assert rank(study).n == 2

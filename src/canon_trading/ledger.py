@@ -66,6 +66,12 @@ the cache held them (`BacktestRun.instruments`): the node loads them from the ca
 differ from those the coverage check read (`CheckedRunConfig.bars`): the node reads the catalog again
 from its path, and a catalog replaced between the check and the replay was never checked to cover the
 sample. The two are compared by their data digest, so the check and the run agree on one read.
+
+Before a trial is asked for, a sample whose ends NautilusTrader's daily series cannot book is refused
+(`_refuse_unbooked_ends`, ADR 0041 term 1): a bar on the day the series books the account's
+registration on, the day before the start (`snapshot_day_start`, `crates/analysis/src/analyzer.rs` at
+the pinned commit), and no bar on the session day of the end, where the run's last fills are booked.
+Either made `record_trial` tell its own run `FAIL`.
 """
 
 from __future__ import annotations
@@ -93,6 +99,7 @@ import optuna
 import pandas as pd
 from canon_alpaca.constants import VENUE
 from nautilus_trader.config import StrategyConfig
+from nautilus_trader.model import Currency
 from nautilus_trader.model import Money
 from optuna.study import StudyDirection
 from optuna.trial import TrialState
@@ -101,6 +108,7 @@ from .backtest import FEE_RATES
 from .backtest import VENUE_SETTINGS
 from .backtest import checked_run_config
 from .backtest import run_backtest_config
+from .ma_cross import BASE_FIELDS
 from .ma_cross import MaCross
 from .ma_cross import MaCrossConfig
 from .ma_cross import check_as_built
@@ -134,7 +142,15 @@ RAN = (TRADED, IDLE)
 # that ran no backtest (ADR 0041, ADR 0053 term 3).
 SAMPLES = "samples"
 NOT_RUN = "not_run"
+# The numbers of records marked while `WAITING`, apart from `not_run`: such a record can still be
+# started by an `ask`, and its mark holds only while it is not (`mark_not_run`).
+NOT_RUN_WAITING = "not_run_waiting"
+# The error `record_trial` writes on a trial it took from Optuna's queue and ran nothing in.
+TAKEN_FROM_QUEUE = "taken from Optuna's queue by record_trial, which runs only in its own trial"
 STRATEGY_CLASS = f"{MaCross.__module__}:{MaCross.__qualname__}"
+# The fields of NautilusTrader's `Currency` (its constructor and `Debug` at the pinned commit), each
+# held for every currency an instrument holds (`instrument_digest`).
+CURRENCY_FIELDS = ("code", "precision", "iso4217", "name", "currency_type")
 
 
 # The ledger file of each study `create_ledger_study` or `open_study` opened, for its lock.
@@ -500,12 +516,27 @@ def trial_config(
                 "class": "MakerTakerFeeModel",
                 **{name: _canonical(rate) for name, rate in FEE_RATES.items()},
             },
-            "starting_balances": [
-                _canonical(Money.from_str(balance)) for balance in starting_balances
-            ],
+            "starting_balances": _balances(starting_balances),
         },
         "data": {"data_type": "Bar", "bar_types": bar_types},
     }
+
+
+def _balances(starting_balances: Sequence[str]) -> list[str]:
+    """The starting balances as the key holds them: one per currency, each as `Money` prints it, sorted.
+
+    `BacktestVenueConfig` keeps one balance per currency, so the order they are given in runs
+    nothing differently, and two of one currency are refused: the venue would keep only one of them
+    and run as if the other were not there.
+    """
+    balances = [Money.from_str(balance) for balance in starting_balances]
+    codes = [str(balance.currency) for balance in balances]
+    twice = sorted({code for code in codes if codes.count(code) > 1})
+    if twice:
+        raise ValueError(
+            f"starting balances name {twice[0]} more than once: {list(starting_balances)}"
+        )
+    return sorted(_canonical(balance) for balance in balances)
 
 
 def base_config_defaults() -> dict[str, Any]:
@@ -517,15 +548,12 @@ def base_config_defaults() -> dict[str, Any]:
 def _base_config_defaults() -> dict[str, Any]:
     """Each field of NautilusTrader's `StrategyConfig`, canonical, at its default at the pinned release.
 
-    The fields are read from the class by reflection when called, its data descriptors
-    (`inspect.getmembers(StrategyConfig, inspect.isgetsetdescriptor)`: the pyo3 getters of a Rust
-    struct), so a field upstream adds is in the key's reach without a change here.
+    The fields are `canon_trading.ma_cross.BASE_FIELDS`, read from the class by reflection once, for
+    the config's refusal of unknown keywords and for the key alike: its data descriptors, the pyo3
+    getters of a Rust struct. So a field upstream adds is in the key's reach without a change here.
     """
     default = StrategyConfig()
-    return {
-        name: _field(name, getattr(default, name))
-        for name, _ in inspect.getmembers(StrategyConfig, inspect.isgetsetdescriptor)
-    }
+    return {name: _field(name, getattr(default, name)) for name in sorted(BASE_FIELDS)}
 
 
 def _strategy_fields(config: MaCrossConfig) -> dict[str, Any]:
@@ -623,18 +651,31 @@ def bars_digest(bars: Sequence[Bar], bar_types: Sequence[str]) -> dict[str, str]
 def instrument_digest(instrument: Any) -> str:
     """The SHA-256 of an instrument's definition, as the data identity holds it (ADR 0053 term 1).
 
-    The definition is upstream's own dict form of the instrument, `Instrument.to_dict()` (its type,
-    ID, currency, precisions, increments, limits, margins and `info` at the pin), in `canonical_json`,
-    without `ts_event` and `ts_init`: those say when the definition was stamped, not what it is, and a
-    load that stores the same definition again stamps it anew. The node loads the definition from the
-    catalog and the engine trades against it: a quantity limit alone changed what a run traded on the
-    same bars (`tests/test_ledger.py`), so two runs on one sample that read two definitions of one
-    instrument read different data. A catalog that holds two definitions of one instrument does not
-    run: the node refuses it ("already registered with a different definition", observed at the pin),
-    so the cache's definition is the one the run traded against. `info` is kept: it is part of what the
-    catalog stores, and a load writes a definition only when the catalog holds none
-    (`canon_trading.bars_to_catalog`), so a refresh of the bars does not restamp it. A value in it with
-    no stable text form raises `TypeError` naming the instrument and its field.
+    The definition is the one NautilusTrader's backtest node compares: `instrument_definitions_match`
+    (`crates/backtest/src/exchange.rs` at the pinned commit) refuses a second definition of an
+    instrument ID unless the two agree on their serialized form without `ts_event` and `ts_init`,
+    every field and `info` included. Here that form is upstream's own dict of the instrument,
+    `Instrument.to_dict()`, which writes each field as the serialization does (a price, quantity or
+    decimal as its text, so `5` and `5.0` are two definitions to the node as to this digest), in
+    `canonical_json`. Without the two stamps: they say when the definition was stamped, not what it
+    is, and a load that stores the same definition again stamps it anew.
+
+    Upstream writes a currency as its code alone (`Currency`'s `Serialize`, and its `PartialEq` and
+    `Hash`, read only `code`): the node compares two definitions in one process, where a code names
+    one currency of the process's registry. The ledger compares runs of different processes, and a
+    currency registered again (`Currency.register(..., overwrite=True)`) under the same code at
+    another precision changed what a run traded on the same bars. So each currency the instrument
+    holds, the `Currency` of each of its pyo3 getters named for one (`quote_currency` and, by class,
+    `base_currency`, `settlement_currency` or `currency`, found by reflection), is held beside the definition with the fields `Currency`
+    has: `code`, `precision`, `iso4217`, `name` and `currency_type`.
+
+    The node loads the definition from the catalog and the engine trades against it: a quantity limit
+    alone changed what a run traded on the same bars (`tests/test_ledger.py`), so two runs on one
+    sample that read two definitions of one instrument read different data. A catalog that holds two
+    definitions of one instrument does not run (the check above), so the cache's definition is the one
+    the run traded against. `info` is kept: the node compares it, and a load writes a definition only
+    when the catalog holds none (`canon_trading.bars_to_catalog`), so a refresh of the bars does not
+    restamp it. A value with no stable text form raises `TypeError` naming the instrument and its field.
     """
     try:
         definition = {
@@ -644,7 +685,22 @@ def instrument_digest(instrument: Any) -> str:
         }
     except TypeError as error:
         raise TypeError(f"instrument {instrument.id}'s definition: {error}") from None
-    return hashlib.sha256(canonical_json(definition).encode("utf-8")).hexdigest()
+    getters = [
+        name
+        for name, _ in inspect.getmembers(type(instrument), inspect.isgetsetdescriptor)
+        if name.endswith("currency")
+    ]
+    try:
+        held_currencies = {name: getattr(instrument, name) for name in getters}
+    except Exception as error:  # noqa: BLE001, named and raised as the definition's own error
+        raise TypeError(f"instrument {instrument.id}'s currencies: {error!r}") from None
+    currencies = {
+        name: {field: _canonical(getattr(currency, field)) for field in CURRENCY_FIELDS}
+        for name, currency in held_currencies.items()
+        if isinstance(currency, Currency)
+    }
+    held = {"definition": definition, "currencies": currencies}
+    return hashlib.sha256(canonical_json(held).encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -707,6 +763,7 @@ def record_trial(
     bar_types = [str(bar_type) for data in run_config.data for bar_type in data.bar_types or ()]
     if bar_types != config["data"]["bar_types"]:
         raise RuntimeError(f"the run loads {bar_types}, not the bar types its key names")
+    _refuse_unbooked_ends(checked.bars, sample)
     # The bars only: the instruments are the run's own, from its cache (ADR 0053 term 1).
     checked_digest = bars_digest(_in_order(checked.bars), bar_types)
     del checked  # only the digest is kept, so the checked bars are not held through the run
@@ -754,7 +811,7 @@ def record_trial(
         trial.set_user_attr("session_days", days)
         trial.set_user_attr("data_digest", digest)
         traded = any(order.filled_qty.is_positive() for order in run.orders)
-        sharpe = _session_sharpe(returns, days) if traded else math.nan
+        sharpe = told_sharpe(returns, days) if traded else math.nan
         outcome = TRADED if traded else IDLE
         trial.set_user_attr(OUTCOME, outcome)
         if math.isfinite(sharpe):
@@ -765,6 +822,44 @@ def record_trial(
         _tell_failed(study, trial, error)
         raise
     return RecordedTrial(number=trial.number, config_key=key, outcome=outcome, run=run)
+
+
+def registration_day(start: int) -> int:
+    """The UTC day NautilusTrader's daily series books a run's account on when it starts at `start`.
+
+    `snapshot_day_start` in `crates/analysis/src/analyzer.rs` at the pinned commit books the first
+    snapshot of an account, its registration at the run's start, on the day before the one holding
+    it, as the base of the first return, and holds no return for that day itself.
+    """
+    return max(start // DAY_NS * DAY_NS - DAY_NS, 0)
+
+
+def _refuse_unbooked_ends(bars: Sequence[Bar], sample: Sample) -> None:
+    """Refuse a sample whose ends leave a run's moves on a day no session day holds (ADR 0041 term 1).
+
+    NautilusTrader's daily series books the run as `session_day` and `registration_day` say. A bar on
+    the registration's day, as one at exactly a sample's start at 00:00 UTC is (`session_day` moves
+    it back a day), is a session day with no return, so `daily_series` refuses every such run. And a
+    run's last fills, its strategies' `on_stop`, are booked on the session day of its end, which must
+    hold a bar: with none there, a fill that moved the balance gave a return on a day with no bar,
+    refused the same way. Either is refused here, before a trial is asked for, as a sample the
+    catalog does not cover is: such a call is not a trial.
+    """
+    base = registration_day(sample.start)
+    days = {session_day(bar.ts_init) for bar in bars}
+    if base in days:
+        raise ValueError(
+            f"{sample.describe()} starts at {_date(sample.start)}, a UTC midnight on which a bar "
+            "becomes available: NautilusTrader's daily series books that bar on the day before, "
+            "the account's registration, which holds no return; start the sample before it",
+        )
+    if days and session_day(sample.end) not in days:
+        raise ValueError(
+            f"{sample.describe()} ends on {_date(session_day(sample.end))}, a session day of no "
+            f"bar, the last on {_date(max(days))}: NautilusTrader books a run's last fills on the "
+            "session day of its end, where no return is accepted; end the sample on its last bar's "
+            "day",
+        )
 
 
 def _own_trial(study: optuna.Study) -> optuna.Trial:
@@ -779,6 +874,9 @@ def _own_trial(study: optuna.Study) -> optuna.Trial:
     attribute (`Study.enqueue_trial` writes `fixed_params` on every trial it queues), a parameter or
     an intermediate value. Only the `WAITING` and `RUNNING` trials are read, not every series. An
     error reading the trial back tells it `FAIL`, as `record_trial` tells an error after `ask`.
+    A queued trial that holds a config key is taken like any other and keeps that key and any
+    outcome another writer gave it; the note written here is what `canon_trading.ranking` reads to
+    stop on it for good rather than read it as a run of that key (ADR 0054 term 6).
     """
     while True:
         queued = {t.number for t in study.get_trials(deepcopy=False, states=(TrialState.WAITING,))}
@@ -800,10 +898,7 @@ def _own_trial(study: optuna.Study) -> optuna.Trial:
         ):
             return trial
         try:
-            trial.set_user_attr(
-                "error",
-                "taken from Optuna's queue by record_trial, which runs only in its own trial",
-            )
+            trial.set_user_attr("error", TAKEN_FROM_QUEUE)
         finally:
             study.tell(trial, state=TrialState.FAIL)
 
@@ -818,19 +913,22 @@ def mark_not_run(study: optuna.Study, number: int) -> None:
 
     `record_trial` writes the key before it starts a run, so a record without one ran nothing: it is
     what a process killed between `ask` and that write leaves. The record is kept; a `RUNNING` one is
-    told `FAIL`, through `Study.tell`, which takes a trial number. A `WAITING` one, which another
-    writer queued (`Study.enqueue_trial`) and never started, is left `WAITING`: Optuna 5.0.0 tells
-    only a `RUNNING` trial (`study/_tell.py`), and its one public way out of `WAITING` is `Study.ask`,
-    which takes the oldest queued trial (`Study._pop_waiting_trial_id`); the storage that could set
-    its state "is not supposed to be directly accessed by library users" (`storages/_base.py`). Its
-    number joins the study user attribute `not_run`, and the ranking leaves it out of N while it is
-    `FAIL` or `WAITING`; one a later `ask` started stops the ranking again. A record that has a key is
-    refused, and so is one that shows a run (`ran_something`), a result told by a writer other than
-    `record_trial` included: a trial of an unknown configuration, which nothing clears.
-    The check, the `tell` and the `not_run` list are read and written under the ledger's lock (module
-    header), so two marks at once are both kept; a study not opened by `create_ledger_study` or
-    `open_study` raises `ValueError`. Use it only on a record whose process is gone: a live one would
-    have its run told `FAIL`.
+    told `FAIL`, through `Study.tell`, which takes a trial number, and its number joins the study user
+    attribute `not_run`, as does a `FAIL` one's. A `WAITING` one, which another writer queued
+    (`Study.enqueue_trial`) and never started, is left `WAITING`: Optuna 5.0.0 tells only a `RUNNING`
+    trial (`study/_tell.py`), and its one public way out of `WAITING` is `Study.ask`, which takes the
+    oldest queued trial (`Study._pop_waiting_trial_id`); the storage that could set its state "is not
+    supposed to be directly accessed by library users" (`storages/_base.py`). Its number joins
+    `not_run_waiting` instead, kept apart because an `ask` may still start it: the ranking leaves it out
+    of N only while it is `WAITING`, or once `record_trial` took it from the queue and ran nothing in
+    it (`_own_trial`). One another writer started after its mark may have run anything, so the ranking
+    stops on it and it cannot be marked again. A record that has a key is refused, and so is one that
+    shows a run (`ran_something`), a result told by a writer other than `record_trial` included: a
+    trial of an unknown configuration, which nothing clears.
+    The check, the `tell` and the lists are read and written under the ledger's lock (module header),
+    so two marks at once are both kept; a study not opened by `create_ledger_study` or `open_study`
+    raises `ValueError`. Use it only on a record whose process is gone: a live one would have its run
+    told `FAIL`.
     """
     with _ledger_lock(_opened_ledger(study, "mark a trial not run")):
         found = [trial for trial in study.get_trials(deepcopy=False) if trial.number == number]
@@ -847,16 +945,39 @@ def mark_not_run(study: optuna.Study, number: int) -> None:
                 f"trial #{number} has no config key but shows a run (outcome "
                 f"{trial.user_attrs.get(OUTCOME)!r}): it is a trial of an unknown configuration",
             )
-        marked = study.user_attrs.get(NOT_RUN, [])
-        if not is_not_run_list(marked):
-            raise ValueError(
-                f"study user attribute {NOT_RUN} is {marked!r}, not a list of trial numbers in the "
-                "form mark_not_run writes; another writer left it",
-            )
+        lists = {name: study.user_attrs.get(name, []) for name in (NOT_RUN, NOT_RUN_WAITING)}
+        for name, marked in lists.items():
+            if not is_not_run_list(marked):
+                raise ValueError(
+                    f"study user attribute {name} is {marked!r}, not a list of trial numbers in the "
+                    "form mark_not_run writes; another writer left it",
+                )
+        if number in lists[NOT_RUN_WAITING]:
+            if not cleared_while_waiting(trial):
+                raise ValueError(
+                    f"trial #{number} was marked not run while WAITING and started after its mark "
+                    f"({trial.state.name}), so it may have run anything; it is not marked again",
+                )
+            return
+        name = NOT_RUN_WAITING if trial.state == TrialState.WAITING else NOT_RUN
         if trial.state == TrialState.RUNNING:
             study.tell(number, state=TrialState.FAIL)
-        if number not in marked:
-            study.set_user_attr(NOT_RUN, sorted([*marked, number]))
+        if number not in lists[name]:
+            study.set_user_attr(name, sorted([*lists[name], number]))
+
+
+def cleared_while_waiting(trial: FrozenTrial) -> bool:
+    """Whether `trial`, marked not run while `WAITING`, is still in a state that mark clears.
+
+    It is if it is still `WAITING`, or if `record_trial` took it from Optuna's queue and told it
+    `FAIL` at once, its error that note and no run shown (`_own_trial`, `ran_something`); any other
+    state is a start by another writer after the mark.
+    """
+    return trial.state == TrialState.WAITING or (
+        trial.state == TrialState.FAIL
+        and trial.user_attrs.get("error") == TAKEN_FROM_QUEUE
+        and not ran_something(trial)
+    )
 
 
 def is_not_run_list(marked: object) -> bool:
@@ -935,14 +1056,16 @@ def _tell_failed(study: optuna.Study, trial: optuna.Trial, error: BaseException)
         )
 
 
-def _session_sharpe(returns: dict[str, float], days: Sequence[str]) -> float:
+def told_sharpe(returns: object, days: object) -> float:
     """The per-session Sharpe ratio the gate would take of this run, or NaN where it takes none.
 
+    The value `record_trial` tells, and the one `canon_trading.ranking` checks a told value against.
     The series goes through `daily_series`, ADR 0010 step 2 as the gate applies it, so a run whose
-    returns the gate rejects is told no value (and `FAIL`, still `traded`), not one the gate never sees.
+    returns the gate rejects is told no value (and `FAIL`, still `traded`), not one the gate never
+    sees; `daily_series` refuses `returns` and `days` not in the shape `record_trial` writes.
     """
     try:
-        series = daily_series("run", returns, list(days))
+        series = daily_series("run", returns, days)
     except ReturnsRejected:
         return math.nan
     return session_sharpe(series) if len(series) > 1 else math.nan

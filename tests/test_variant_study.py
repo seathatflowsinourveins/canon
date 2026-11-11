@@ -454,3 +454,76 @@ def test_a_tell_refused_after_the_run_is_a_failure_the_pass_goes_on_from(
     with open_study("s", tmp_path / "trials.db") as study:
         [refused] = [t for t in study.trials if "error" in t.user_attrs]
         assert (refused.state, refused.user_attrs[OUTCOME]) == (TrialState.FAIL, TRADED)
+
+
+def test_both_tells_refused_after_the_run_are_a_failure_the_pass_goes_on_from(
+    alpaca_bars: AlpacaBars, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A second reader: when the `tell` of a run's value and then the `tell` of `FAIL` were both
+    refused, the record stayed `RUNNING` with its outcome and its error written, which the gate reads
+    as a run, yet the pass stopped and left the rest of the grid unrecorded."""
+    write_both(alpaca_bars, tmp_path / "catalog")
+    configs = grid(periods=SHORT)
+    real_tell = optuna.Study.tell
+    refusals = [2]
+
+    def refused_twice(self: optuna.Study, *args: Any, **kwargs: Any) -> object:
+        if refusals[0]:  # the first run's tell of its value, then `_tell_failed`'s tell of FAIL
+            refusals[0] -= 1
+            raise OSError("database is locked")
+        return real_tell(self, *args, **kwargs)
+
+    monkeypatch.setattr(optuna.Study, "tell", refused_twice)
+    recorded, _ = run_study(
+        tmp_path / "catalog",
+        name="s",
+        ledger_path=tmp_path / "trials.db",
+        configs=configs,
+        start=START,
+        end=END,
+        create=True,
+    )
+    monkeypatch.undo()
+
+    assert refusals == [0]
+    assert recorded is not None
+    assert len(recorded.recorded) == len(configs) - 1
+    [failure] = recorded.failed
+    assert "database is locked" in failure
+    with open_study("s", tmp_path / "trials.db") as study:
+        [refused] = [t for t in study.trials if "error" in t.user_attrs]
+        assert (refused.state, refused.user_attrs[OUTCOME]) == (TrialState.RUNNING, TRADED)
+
+
+def test_a_pass_that_only_opens_creates_no_folder_and_no_lock(tmp_path: Path) -> None:
+    """A third reader: a pass that opens a study took its pass lock first, so a ledger that was not
+    there left its folder and a lock file behind, though nothing is created unless asked."""
+    missing = tmp_path / "missing"
+    for rank_only in (False, True):
+        with pytest.raises(LedgerNotFound):
+            run_study(
+                tmp_path / "catalog", name="s", ledger_path=missing / "t.db", rank_only=rank_only
+            )
+    assert not missing.exists()
+
+
+def test_a_study_name_with_a_slash_takes_its_pass_lock(
+    alpaca_bars: AlpacaBars, tmp_path: Path
+) -> None:
+    """A third reader: the pass lock was named with the study's name as given, so a name with a `/`
+    named a folder that does not exist and the pass raised `FileNotFoundError`."""
+    write_both(alpaca_bars, tmp_path / "catalog")
+    recorded, _ = run_study(
+        tmp_path / "catalog",
+        name="exp/step7",
+        ledger_path=tmp_path / "trials.db",
+        configs=grid(periods=SHORT),
+        start=START,
+        end=END,
+        create=True,
+    )
+    assert recorded is not None
+    assert len(recorded.recorded) == len(grid(periods=SHORT))
+    assert [path.name for path in tmp_path.glob("*.pass.lock")] == [
+        "trials.db.exp%2Fstep7.pass.lock"
+    ]
