@@ -127,8 +127,7 @@ from .ma_cross import check_as_built
 from .returns_matrix import DAY_NS
 from .returns_matrix import NS_RANGE
 from .returns_matrix import ReturnsRejected
-from .returns_matrix import daily_series
-from .returns_matrix import session_sharpe
+from .returns_matrix import session_returns
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -1556,13 +1555,13 @@ def _tell_failed(study: optuna.Study, trial: optuna.Trial, error: BaseException)
 def told_sharpe(returns: object, days: object) -> float:
     """The per-session Sharpe ratio the gate would take of this run, or NaN where it takes none.
 
-    The value `record_trial` tells, and the one `canon_trading.ranking` checks a told value against.
-    The series goes through `daily_series`, ADR 0010 step 2 as the gate applies it, so a run whose
-    returns the gate rejects is told no value (and `FAIL`, still `traded`), not one the gate never
-    sees; `daily_series` refuses `returns` and `days` not in the shape `record_trial` writes.
+    The value `record_trial` tells, and the one `canon_trading.ranking` holds a told value to. It is
+    read from `session_returns`, ADR 0010 step 2 and the gate's one numeric check as the gate applies
+    them (ADR 0031), so a run whose returns the gate refuses, a constant series or one of zeros
+    among them, is told no value (and `FAIL`, still `traded`), not one the gate never sees;
+    `session_returns` refuses `returns` and `days` not in the shape `record_trial` writes.
     """
     try:
-        series = daily_series("run", returns, days)
+        return session_returns("run", returns, days).sharpe
     except ReturnsRejected:
         return math.nan
-    return session_sharpe(series) if len(series) > 1 else math.nan

@@ -40,7 +40,6 @@ from nautilus_trader.model import BarType
 from nautilus_trader.model import Quantity
 from optuna.study import StudyDirection
 from optuna.trial import TrialState
-from skfolio import Portfolio
 from skfolio import measures
 
 import canon_trading.ledger
@@ -62,6 +61,7 @@ from canon_trading.ranking import SHA256_HEX
 from canon_trading.ranking import THRESHOLD
 from canon_trading.ranking import RankingReport
 from canon_trading.ranking import RankingStopped
+from canon_trading.returns_matrix import session_returns
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -208,10 +208,10 @@ def write(
         if name not in drop:
             trial.set_user_attr(name, value)
     trial.set_user_attr(OUTCOME, outcome)
-    with np.errstate(divide="ignore", invalid="ignore"):  # constant returns: NaN, told FAIL
-        value = told_sharpe(written.get("returns_series"), written.get("session_days"))
+    # NaN for returns the numeric check refuses, which `record_trial` tells FAIL.
+    value = told_sharpe(written.get("returns_series"), written.get("session_days"))
     if outcome == IDLE or not told_complete or not math.isfinite(value):
-        study.tell(trial, state=TrialState.FAIL)  # as `record_trial` tells a ratio not finite
+        study.tell(trial, state=TrialState.FAIL)
     else:
         study.tell(trial, [value, *also] if also else value)
     return trial.number
@@ -366,14 +366,13 @@ def test_a_failure_after_a_run_of_the_same_configuration_stops(study: optuna.Stu
         rank(study)
 
 
-@pytest.mark.filterwarnings("ignore:invalid value encountered in scalar divide:RuntimeWarning")
 def test_a_traded_record_with_no_finite_sharpe_ratio_ran_and_stops(study: optuna.Study) -> None:
     """Told FAIL by the ledger, still traded: it ran to the end, and ADR 0031 stops the gate on it."""
     write(study, "pick", PICK)
     write(study, "second", SECOND)
     write(study, "flat", [0.0] * T, told_complete=False)
 
-    with pytest.raises(RankingStopped, match="flat: Sharpe ratio nan"):
+    with pytest.raises(RankingStopped, match="flat: its returns do not vary beyond rounding"):
         rank(study)
 
 
@@ -395,8 +394,14 @@ def test_an_idle_trial_stops(study: optuna.Study) -> None:
     write(study, "second", SECOND)
     number = write(study, "idle", [0.0] * T, outcome=IDLE)
 
-    with pytest.raises(RankingStopped, match=rf"idle: never traded \(#{number} \(idle\)\)"):
+    with pytest.raises(
+        RankingStopped, match=rf"idle: never traded \(#{number} \(idle\)\)"
+    ) as stopped:
         rank(study)
+
+    # Its returns are all zero because it never traded: that is the one reason given, not a
+    # second line reading the zeros as a refused series (code review of the round-7 change).
+    assert "do not vary beyond rounding" not in str(stopped.value)
 
 
 def test_two_records_of_one_configuration_that_disagree_stop(study: optuna.Study) -> None:
@@ -436,12 +441,11 @@ def test_one_configuration_stops(study: optuna.Study) -> None:
         rank(study)
 
 
-@pytest.mark.filterwarnings("ignore:invalid value encountered in scalar divide:RuntimeWarning")
-def test_a_sharpe_ratio_that_is_not_finite_stops(study: optuna.Study) -> None:
+def test_a_series_with_no_sharpe_ratio_stops(study: optuna.Study) -> None:
     write(study, "pick", PICK)
     write(study, "flat", [0.0] * T)
 
-    with pytest.raises(RankingStopped, match="flat: Sharpe ratio nan"):
+    with pytest.raises(RankingStopped, match="flat: its returns do not vary beyond rounding"):
         rank(study)
 
 
@@ -457,23 +461,82 @@ def test_no_spread_between_trials_stops(study: optuna.Study) -> None:
     write(study, "pick", PICK)
     write(study, "copy", PICK)
 
-    with pytest.raises(RankingStopped, match="V = 0.0"):
+    with pytest.raises(RankingStopped, match="V = 0: "):
         rank(study)
 
 
-@pytest.mark.parametrize("scale", [0.97, 3.0, 1 / 7])
-def test_copies_that_differ_only_in_rounding_stop(study: optuna.Study, scale: float) -> None:
-    """The review: one configuration at two scales gave V = 1.1e-27 and passed undeflated."""
+@pytest.mark.parametrize("scale", [0.97, 3.0, 7.0, 1 / 7])
+@pytest.mark.parametrize("copy_first", [False, True])
+def test_copies_at_another_scale_stop_by_name_in_either_order(
+    tmp_path: Path, scale: float, copy_first: bool
+) -> None:
+    """ADR 0031, 2026-11-11, the rule that closes the scaled copy: one configuration at another
+    scale has returns that differ on every day and a Sharpe ratio within rounding of its own, one
+    step apart at 3 times and the same to the bit at 7 times. Two computed ratios cannot be told
+    apart more finely than the rounding of both, so the ranking stops, naming both and not the
+    third, whichever was recorded first. Compared exactly, the first pair ranked with V = 1.2e-32
+    and passed at the undeflated 0.9997 and the second stopped: rounding decided which."""
     copy = [value * scale for value in PICK]
-    sharpes = {
-        float(Portfolio(X=[[v] for v in x], weights=[1.0]).sharpe_ratio) for x in (PICK, copy)
-    }
-    assert len(sharpes) == 2  # not bit-identical: an exact test of V = 0 would let this pass
-    write(study, "pick", PICK)
-    write(study, "copy", copy)
+    with create_ledger_study("scale", start=DAY_0, end=END, path=tmp_path / "s.db") as study:
+        numbers = {
+            label: write(study, label, copy if label == "copy" else PICK)
+            for label in (("copy", "pick") if copy_first else ("pick", "copy"))
+        }
+        write(study, "second", SECOND)
 
-    with pytest.raises(RankingStopped, match="within floating-point noise"):
+        with pytest.raises(RankingStopped) as stopped:
+            rank(study)
+
+    [line] = [line for line in str(stopped.value).splitlines() if "within rounding" in line]
+    assert "rank within rounding of each other on returns that differ" in line
+    # Named in the order of their keys, the same line whichever was recorded first.
+    first, last = sorted(("copy", "pick"), key=key_of)
+    assert line.index(f"{first} (#{numbers[first]})") < line.index(f"{last} (#{numbers[last]})")
+    assert "second (#" not in line
+
+
+def test_two_trials_within_rounding_of_each_other_have_no_v(study: optuna.Study) -> None:
+    """With nothing else in the study, a configuration and its copy at 3 times the scale are the
+    highest and the lowest ratio, within rounding of each other: V counts as 0, and the stop says
+    so beside the tie (ADR 0031, 2026-11-11)."""
+    write(study, "pick", PICK)
+    write(study, "copy", [value * 3.0 for value in PICK])
+
+    with pytest.raises(RankingStopped) as stopped:
         rank(study)
+
+    message = str(stopped.value)
+    assert "rank within rounding of each other on returns that differ" in message
+    assert (
+        "V = 0: the highest Sharpe ratio" in message and "within rounding of each other" in message
+    )
+
+
+@pytest.mark.parametrize("nudged_first", [False, True])
+def test_a_ratio_beyond_rounding_ahead_is_the_pick_in_either_order(
+    tmp_path: Path, nudged_first: bool
+) -> None:
+    """The limit that is left, recorded once (ADR 0031, 2026-11-11): with one day's return 1e-9
+    higher the Sharpe ratio is 9e-10 lower, thousands of times what rounding can move either, so
+    the two are told apart and the higher is the pick, whichever was recorded first. Trials that
+    are nearly one have the small V their ratios give, and the pick is near its undeflated value:
+    what the statistic computes, with N-hat = 1 printed beside it."""
+    nudged = [PICK[0] + 1e-9, *PICK[1:]]
+    ahead, behind = (
+        session_returns(key, *as_recorded(x)) for key, x in (("p", PICK), ("n", nudged))
+    )
+    assert 1000 * (ahead.rounding + behind.rounding) < ahead.sharpe - behind.sharpe < 1e-8
+    with create_ledger_study("near", start=DAY_0, end=END, path=tmp_path / "n.db") as study:
+        for label in ("nudged", "pick") if nudged_first else ("pick", "nudged"):
+            write(study, label, nudged if label == "nudged" else PICK)
+
+        report = rank(study)
+
+    assert (report.pick, report.tied, report.sharpe) == ("pick", (), ahead.sharpe)
+    assert 0 < report.v < 1e-16
+    undeflated = float(measures.probabilistic_sharpe_ratio(PICK))
+    assert report.dsr == pytest.approx(undeflated, abs=1e-6)
+    assert report.n_hat == pytest.approx(1.0, abs=1e-6)
 
 
 def test_bit_identical_columns_tied_at_the_top_are_one_pick(
@@ -497,21 +560,79 @@ def test_bit_identical_columns_tied_at_the_top_are_one_pick(
     assert "Pick pick, the same returns as twin" in report.summary()
 
 
+def test_the_report_is_the_same_to_the_bit_whatever_the_recording_order(tmp_path: Path) -> None:
+    """The second reader of ADR 0031's addition: which of two keys with the same returns was named
+    the pick, and the last bit of V and of N-hat, followed the order of recording, since the
+    columns did. They are taken in the order of the keys, so every number of the report is the
+    same to the bit in any order."""
+    returns = {
+        "pick": PICK,
+        "twin": PICK,
+        "second": SECOND,
+        "third": THIRD_CLOSE,
+        "wide": THIRD_WIDE,
+    }
+    reports = []
+    for order in (list(returns), list(returns)[::-1], ["third", "twin", "wide", "pick", "second"]):
+        with create_ledger_study(
+            "order", start=DAY_0, end=END, path=tmp_path / f"{'-'.join(order)}.db"
+        ) as study:
+            for label in order:
+                write(study, label, returns[label])
+            report = rank(study)
+        reports.append(
+            (report.pick, report.tied, report.v, report.sharpe, report.dsr, report.n_hat)
+            + (report.dsr_at_n_hat, report.passed)
+        )
+
+    first, last = sorted(("pick", "twin"), key=key_of)
+    assert reports[0][:2] == (first, (last,))
+    assert reports[0] == reports[1] == reports[2]
+
+
 def test_a_tie_at_the_top_with_different_returns_stops(study: optuna.Study) -> None:
-    """The pick's returns in reverse order: the same Sharpe ratio, other returns, no one pick."""
-    first = write(study, "pick", PICK)
-    other = write(study, "reversed", PICK[::-1])
+    """Two series with the same Sharpe ratio to the bit and other returns: no one pick."""
+    flat, peaked = exact_tie(T)
+    first = write(study, "flat", flat)
+    other = write(study, "peaked", peaked)
     write(study, "second", SECOND)
 
     with pytest.raises(RankingStopped) as stopped:
         rank(study)
 
     message = str(stopped.value)
-    assert "share the highest Sharpe ratio within floating-point noise" in message
-    assert f"pick (#{first}); reversed (#{other})" in message
+    assert "rank within rounding of each other on returns that differ" in message
+    assert f"flat (#{first}), Sharpe ratio 5630370440.480946" in message
+    assert f"peaked (#{other}), Sharpe ratio 5630370440.480946" in message
 
 
-@pytest.mark.filterwarnings("ignore:invalid value encountered in scalar divide:RuntimeWarning")
+@pytest.mark.parametrize("reversed_first", [False, True])
+def test_a_ratio_one_rounding_step_ahead_is_no_pick_in_either_order(
+    tmp_path: Path, reversed_first: bool
+) -> None:
+    """The pick's returns in reverse order sum in another order, and their Sharpe ratio comes out
+    one rounding step higher. That step is the computation's, not the returns': the two rank within
+    rounding of each other on returns that differ day by day, and the ranking stops, naming both,
+    whichever was recorded first (ADR 0031, 2026-11-11). Compared exactly, the reversed copy was
+    the pick."""
+    pick, ahead = (
+        session_returns(key, *as_recorded(x)) for key, x in (("p", PICK), ("r", PICK[::-1]))
+    )
+    # A step or so of rounding, whichever way this NumPy sums: not the same number, and well
+    # inside what rounding can move either.
+    assert 0 < abs(ahead.sharpe - pick.sharpe) <= pick.rounding / 100
+    with create_ledger_study("step", start=DAY_0, end=END, path=tmp_path / "s.db") as study:
+        for label in ("reversed", "pick") if reversed_first else ("pick", "reversed"):
+            write(study, label, PICK if label == "pick" else PICK[::-1])
+        write(study, "second", SECOND)
+
+        with pytest.raises(RankingStopped) as stopped:
+            rank(study)
+
+    [line] = [line for line in str(stopped.value).splitlines() if "within rounding" in line]
+    assert "pick (#" in line and "reversed (#" in line and "second (#" not in line
+
+
 def test_every_reason_is_named_at_once(study: optuna.Study) -> None:
     """The review needed three calls for a failed key, a flat key and one on a disjoint range."""
     write(study, "pick", PICK)
@@ -527,7 +648,7 @@ def test_every_reason_is_named_at_once(study: optuna.Study) -> None:
     message = str(stopped.value)
     assert f"broken: no record ran to the end (#{broken} (failed))" in message
     assert f"idle: never traded (#{idle} (idle))" in message
-    assert f"flat: Sharpe ratio nan over the sample (#{flat})" in message
+    assert re.search(rf"flat: its returns do not vary beyond rounding[^\n]*\(#{flat}\)", message)
     assert f"short (#{short})" in message
     assert f"#{keyless} (running) has no config key" in message
 
@@ -680,10 +801,16 @@ def test_a_mean_correlation_above_one_raises_n_hat_to_one(
     write(study, "pick", PICK)
     write(study, "affine", [value * 0.5 + 0.001 for value in PICK])
     above_one = 1.0000000000000002
-    monkeypatch.setattr(
-        "canon_trading.ranking.measures.correlation",
-        lambda _: [[1.0, above_one], [above_one, 1.0]],
-    )
+    correlation = measures.correlation
+
+    def of_the_study(x: np.ndarray) -> np.ndarray:
+        """The study's matrix reads above one; a series against itself, which the numeric check
+        asks for through the same skfolio function, reads what skfolio gives."""
+        if np.array_equal(np.asarray(x)[:, 0], np.asarray(x)[:, 1]):
+            return correlation(x)
+        return np.array([[1.0, above_one], [above_one, 1.0]])
+
+    monkeypatch.setattr("canon_trading.ranking.measures.correlation", of_the_study)
 
     report = rank(study)
 
@@ -827,18 +954,25 @@ def test_a_data_digest_not_in_the_writers_shape_stops_naming_it(study: optuna.St
         rank(study)
 
 
-def test_returns_equal_but_for_rounding_around_zero_are_one_pick(study: optuna.Study) -> None:
-    """One day's return is 0.0 in one column and 1e-19 in its twin: the same returns, one pick."""
+def test_returns_that_differ_by_rounding_around_zero_are_not_the_same_returns(
+    study: optuna.Study,
+) -> None:
+    """One day's return is 0.0 in one column and 1e-19 in the other, and their Sharpe ratios are the
+    same number. Returns are the same only when every day's are (ADR 0031, 2026-11-11): these
+    differ, so ratios within rounding leave no one pick. Until round 7 a tolerance on the returns
+    read them as one."""
     base = [0.0 if i == 5 else value for i, value in enumerate(PICK)]
     twin_returns = [1e-19 if i == 5 else value for i, value in enumerate(base)]
+    assert told_sharpe(*as_recorded(base)) == told_sharpe(*as_recorded(twin_returns))
     first = write(study, "pick", base)
     twin = write(study, "twin", twin_returns)
     write(study, "second", SECOND)
 
-    report = rank(study)
-
-    assert {report.pick, *report.tied} == {"pick", "twin"}
-    assert report.pick_trials == (first, twin)
+    with pytest.raises(
+        RankingStopped,
+        match=rf"on returns that differ[^\n]*pick \(#{first}\)[^\n]*; twin \(#{twin}\)",
+    ):
+        rank(study)
 
 
 def test_a_dsr_that_is_not_finite_stops_naming_the_pick(
@@ -1189,6 +1323,76 @@ def test_a_record_that_ran_in_a_state_the_writer_never_tells_stops(
 
     with pytest.raises(RankingStopped, match=rf"pick: #{trial.number} [^\n]*was told {state.name}"):
         rank(study)
+
+
+def test_a_running_record_with_a_value_says_a_writer_may_be_recording_it(
+    study: optuna.Study,
+) -> None:
+    """A record that ran, still RUNNING, holding a value: `record_trial` leaves none so, and the
+    stop read as a damaged ledger ("another writer left it, and no later record resolves it"). A
+    writer tells the value and the state together, so the stop now says one may be recording it,
+    and that ranking again is the remedy."""
+    write(study, "second", SECOND)
+    write(study, "third", THIRD_CLOSE)
+    trial = study.ask()
+    returns = {str(DAY_0 + n * DAY_NS): r for n, r in enumerate(PICK)}
+    days = [str(DAY_0 + n * DAY_NS) for n in range(T)]
+    for name, attr in {
+        "config_key": "pick",
+        "sample": 0,
+        "run_config_id": "pick",
+        "backtest_start": DAY_0,
+        "backtest_end": END,
+        "returns_series": returns,
+        "session_days": days,
+        "data_digest": digest_of("pick"),
+        OUTCOME: TRADED,
+    }.items():
+        trial.set_user_attr(name, attr)
+    # Optuna keeps the value and refuses the state: the record stays RUNNING, with a value.
+    assert not study._storage.set_trial_state_values(
+        trial._trial_id, TrialState.RUNNING, [told_sharpe(returns, days)]
+    )
+
+    with pytest.raises(RankingStopped) as stopped:
+        rank(study)
+
+    [line] = [line for line in str(stopped.value).splitlines() if line.startswith("* pick:")]
+    assert f"#{trial.number} (traded) is RUNNING with a value" in line
+    assert "a writer may be recording it" in line and "rank again" in line
+    assert "not in the shape record_trial writes, so another writer left it" not in line
+
+
+def test_a_running_idle_record_with_a_value_is_another_writer_s(study: optuna.Study) -> None:
+    """Second code review of the round-7 change: `record_trial` tells an idle run no value at all,
+    so one that is RUNNING with a value is no writer caught recording, and ranking again does not
+    clear it. The stop names it as another writer's, as before the wording for a traded one."""
+    write(study, "second", SECOND)
+    write(study, "third", THIRD_CLOSE)
+    trial = study.ask()
+    returns = {str(DAY_0 + n * DAY_NS): 0.0 for n in range(T)}
+    days = [str(DAY_0 + n * DAY_NS) for n in range(T)]
+    for name, attr in {
+        "config_key": "pick",
+        "sample": 0,
+        "run_config_id": "pick",
+        "backtest_start": DAY_0,
+        "backtest_end": END,
+        "returns_series": returns,
+        "session_days": days,
+        "data_digest": digest_of("pick"),
+        OUTCOME: IDLE,
+    }.items():
+        trial.set_user_attr(name, attr)
+    assert not study._storage.set_trial_state_values(trial._trial_id, TrialState.RUNNING, [0.5])
+
+    with pytest.raises(RankingStopped) as stopped:
+        rank(study)
+
+    [line] = [line for line in str(stopped.value).splitlines() if line.startswith("* pick:")]
+    assert f"#{trial.number} (idle) is RUNNING with a value" in line
+    assert "record_trial tells an idle run none" in line and "another writer left it" in line
+    assert "may be recording" not in line and "rank again" not in line
 
 
 def test_a_keyless_record_with_a_suggested_parameter_shows_a_run(study: optuna.Study) -> None:
@@ -1601,7 +1805,10 @@ def test_a_value_told_where_record_trial_tells_none_stops(study: optuna.Study) -
         optuna.trial.create_trial(state=TrialState.COMPLETE, value=2.5, user_attrs=trial.user_attrs)
     )
 
-    with pytest.raises(RankingStopped, match=r"third: #\d+ [^\n]*told 2\.5, not nan"):
+    with pytest.raises(
+        RankingStopped,
+        match=r"third: #\d+ [^\n]*told 2\.5 where record_trial tells no value[^\n]*1 session day",
+    ):
         rank(study)
 
 
@@ -2102,7 +2309,8 @@ def test_returns_whose_squares_overflow_stop_by_name(
     """Antigravity, gate round 4: finite returns whose squares pass float64's largest made skfolio's
     standard deviation infinite and the Sharpe ratio 0.0, so a study rejected at DSR 0.69241 passed
     at 0.97295, a pick of Sharpe ratio 3.93 lost to one of 0.699, and two such trials raised a bare
-    ValueError from N-hat. The series is refused where it enters the gate, naming it."""
+    ValueError from N-hat. The series is refused where it enters the gate, naming it and the
+    variance skfolio takes of it (round 7's one check)."""
     big = [label for label, returns in case.items() if max(map(abs, returns)) > 1e150]
     numbers = {label: write(study, label, returns) for label, returns in case.items()}
 
@@ -2112,7 +2320,7 @@ def test_returns_whose_squares_overflow_stop_by_name(
     message = str(stopped.value)
     for label in big:
         assert re.search(
-            rf"{label}: the sum of the squares of its returns is inf[^\n]*\(#{numbers[label]}\)",
+            rf"{label}: [^\n]*skfolio's variance is inf[^\n]*\(#{numbers[label]}\)",
             message,
         )
 
@@ -2182,7 +2390,7 @@ def test_returns_whose_fourth_central_moment_overflows_stop_by_name(study: optun
 
     with pytest.raises(
         RankingStopped,
-        match=rf"pick: skfolio's variance [^\n]*fourth central moment inf[^\n]*\(#{number}\)",
+        match=rf"pick: [^\n]*skfolio's fourth central moment is inf[^\n]*\(#{number}\)",
     ):
         rank(study)
 
@@ -2253,3 +2461,231 @@ def test_a_pick_whose_moments_underflow_stops(study: optuna.Study, tmp_path: Pat
         write(scaled, "third", third)
         with pytest.raises(RankingStopped, match=r"pick: .* below float64's smallest normal"):
             rank(scaled)
+
+
+# The gate's seventh outside round, 2026-11-11 (ADR 0031): one numeric check of the session-day
+# series, and Sharpe ratios compared by the rounding of their own computation. Each test below
+# fails against the code before that change.
+
+MONDAY = DAY_0 - DAY_NS  # 2025-03-10; forty UTC days from it hold thirty weekday sessions
+WEEKDAYS = [n for n in range(40) if n % 7 < 5]
+SWINGS = [1.0, -1.0] * 14 + [2.0, -2.0]
+
+
+def write_over_weekends(study: optuna.Study, label: str, open_day_returns: list[float]) -> int:
+    """Record `open_day_returns` on the thirty weekdays from `MONDAY`, with 0.0 on each closed day
+    between them, as NautilusTrader's daily series carries a balance over a weekend."""
+    by_day = dict(zip(WEEKDAYS, open_day_returns, strict=True))
+    return write(
+        study,
+        label,
+        [by_day.get(n, 0.0) for n in range(40)],
+        first_day=-1,
+        attrs={"session_days": [str(MONDAY + n * DAY_NS) for n in WEEKDAYS]},
+    )
+
+
+def test_closed_day_zeros_do_not_let_a_pick_whose_moments_underflow_pass(tmp_path: Path) -> None:
+    """Antigravity, gate round 7: the moments were checked over every UTC day, weekends' zeros
+    included, and the gate computes on session days. At scale 1 the pick is rejected at DSR 0.8610;
+    at 1e-81 the zeros kept the checked moments normal, the session-day kurtosis rounded from 1.39
+    to 1.0, and the same pick passed at DSR 1.0."""
+    dsr = None
+    for scale in (1.0, 1e-81):
+        name = f"weekends-{scale}"
+        with create_ledger_study(
+            name, start=MONDAY, end=MONDAY + 40 * DAY_NS, path=tmp_path / "w.db"
+        ) as study:
+            write_over_weekends(study, "pick", [(4.0e4 + x * 1.6) * scale for x in SWINGS])
+            write_over_weekends(
+                study, "second", [(-1.55 * 4.0e4 + x * 1.6) * scale for x in SWINGS]
+            )
+            if scale == 1.0:
+                report = rank(study)
+                dsr = report.dsr
+                assert (report.t, report.pick, report.passed) == (30, "pick", False)
+            else:
+                with pytest.raises(
+                    RankingStopped, match=r"pick: .* below float64's smallest normal"
+                ):
+                    rank(study)
+    assert dsr == pytest.approx(0.861021, abs=5e-7)
+
+
+def test_closed_day_zeros_do_not_let_moments_that_overflow_into_the_matrix(tmp_path: Path) -> None:
+    """Antigravity, gate round 7: weekend zeros kept the checked fourth central moment of returns
+    near 6.0e76 finite, that of the session days alone is infinite, and with another configuration
+    as the pick the ranking completed at DSR 1.0 without refusing the record."""
+    with create_ledger_study(
+        "weekends", start=MONDAY, end=MONDAY + 40 * DAY_NS, path=tmp_path / "w.db"
+    ) as study:
+        write_over_weekends(study, "pick", [0.05 + 0.005 * (-1) ** n for n in range(30)])
+        number = write_over_weekends(study, "second", [6.0e76] * 29 + [-6.0e76])
+
+        with pytest.raises(
+            RankingStopped,
+            match=rf"second: [^\n]*fourth central moment is inf[^\n]*\(#{number}\)",
+        ):
+            rank(study)
+
+
+def exact_tie(sessions: int) -> tuple[list[float], list[float]]:
+    """Two series of mean 2**-7 in steps of 2**-41, their sums of squares equal: every sum is exact
+    in float64, so their means, standard deviations and Sharpe ratios are bit for bit the same,
+    with kurtosis 1.0 in the first and above 4 in the second."""
+    mean, step = 2**-7, 2**-41
+    flat = [3, -3] * (sessions // 2)
+    squares = sum(k * k for k in flat)
+    peaked = {8: [6, -6], 30: [9, -9, 6, -6, 3, -3, 3, -3]}[sessions]
+    peaked = peaked + [0] * (sessions - len(peaked))
+    assert sum(k * k for k in peaked) == squares and sum(peaked) == 0
+    return [mean + step * k for k in flat], [mean + step * k for k in peaked]
+
+
+@pytest.mark.parametrize("order", ["ab", "ba"])
+def test_a_tie_between_other_returns_stops_whatever_the_recording_order(
+    tmp_path: Path, order: str
+) -> None:
+    """Antigravity, gate round 7: two configurations of the same mean and standard deviation to the
+    bit, kurtosis 1.0 and 4.0, were read as the same returns, since each day's difference was
+    within 1e-9 of the largest return, and the DSR was taken of whichever was recorded first: the
+    study passed at 1.0 recorded (A, B, C) and was rejected at 0.9395 recorded (B, A, C). An exact
+    tie between series that differ stops, naming both, in either order."""
+    a, b = exact_tie(8)
+    assert told_sharpe(*as_recorded(a)) == told_sharpe(*as_recorded(b))
+    with create_ledger_study(
+        "tie", start=DAY_0, end=DAY_0 + 8 * DAY_NS, path=tmp_path / "t.db"
+    ) as study:
+        numbers = {label: write(study, label, {"a": a, "b": b}[label]) for label in order}
+        write(study, "c", [0.01, -0.005] * 4)
+
+        with pytest.raises(RankingStopped) as stopped:
+            rank(study)
+
+    message = str(stopped.value)
+    [line] = [line for line in message.splitlines() if "on returns that differ" in line]
+    assert "rank within rounding of each other" in line and "c (#" not in line
+    # Named in the order of their keys, the same line whichever was recorded first.
+    first, last = sorted(("a", "b"), key=key_of)
+    assert line.index(f"{first} (#{numbers[first]})") < line.index(f"{last} (#{numbers[last]})")
+
+
+def as_recorded(returns: list[float]) -> tuple[dict[str, float], list[str]]:
+    """`returns` from `DAY_0`, every day a session day, as `write` stores them."""
+    days = [str(DAY_0 + n * DAY_NS) for n in range(len(returns))]
+    return dict(zip(days, returns, strict=True)), days
+
+
+@pytest.mark.parametrize("constant", [-0.01, 0.01, -0.07])
+def test_a_constant_series_is_told_no_value_and_stops_by_name(
+    study: optuna.Study, constant: float
+) -> None:
+    """Antigravity, gate round 7: thirty returns of -0.01 have a mean one rounding step off, so
+    their Sharpe ratio read a finite -5.67e15: the record was told COMPLETE with it, V rose to
+    1.07e31 and the ranking returned DSR 0.0 where -0.07, whose ratio is -inf, stopped it; +0.01
+    took the pick. Each is told no value and stops the ranking by name."""
+    assert math.isnan(told_sharpe(*as_recorded([constant] * T)))
+    write(study, "pick", PICK)
+    write(study, "second", SECOND)
+    number = write(study, "constant", [constant] * T)
+    [trial] = [t for t in study.trials if t.number == number]
+    assert (trial.state, trial.values) == (TrialState.FAIL, None)
+
+    with pytest.raises(
+        RankingStopped,
+        match=rf"constant: its returns do not vary beyond rounding[^\n]*\(#{number}\)",
+    ):
+        rank(study)
+
+
+def test_a_traded_record_whose_returns_are_all_zero_stops_by_name(study: optuna.Study) -> None:
+    """A strategy whose fills never moved its balance: every return 0.0. It is the exact case of
+    the measure a constant series is refused by, named as such, not by the NaN its ratio would be."""
+    assert math.isnan(told_sharpe(*as_recorded([0.0] * T)))
+    write(study, "pick", PICK)
+    write(study, "second", SECOND)
+    number = write(study, "flat", [0.0] * T)
+
+    with pytest.raises(
+        RankingStopped,
+        match=rf"flat: its returns do not vary beyond rounding[^\n]*\(#{number}\)",
+    ):
+        rank(study)
+
+
+def test_a_series_next_to_the_threshold_stops_and_one_clear_of_it_ranks_as_it_is(
+    study: optuna.Study, tmp_path: Path
+) -> None:
+    """The limit of the measure, stated once (ADR 0031): returns of 1.0 and 1.0 + 128 steps of
+    float64's spacing vary by more than rounding can give thirty equal returns, so the series is
+    read, with a Sharpe ratio of 6.9e13; but rounding can move that ratio by more than its own
+    size, so every other trial ranks within rounding of it and the ranking stops by name. At 4,096
+    steps the ratio is 2.2e12 and rounding moves it by a quarter of that: it is the highest, and
+    the gate ranks the input as it is. At 96 steps the same shape is refused."""
+    step = math.ulp(1.0)
+    write(study, "second", SECOND)
+    write(study, "third", THIRD_CLOSE)
+    narrow = write(study, "narrow", [1.0 + 128 * step * (n % 2) for n in range(T)])
+
+    with pytest.raises(RankingStopped) as stopped:
+        rank(study)
+
+    message = str(stopped.value)
+    [line] = [line for line in message.splitlines() if "on returns that differ" in line]
+    assert f"narrow (#{narrow}), Sharpe ratio 6918" in line and "second (#" in line
+    # The one trial that causes it is named as the cause, with why.
+    [cause] = [line for line in message.splitlines() if "barely vary beyond rounding" in line]
+    assert cause.startswith(f"* narrow (#{narrow}): its returns barely vary beyond rounding")
+    assert "more than the ratio itself, so no trial is told apart from it" in cause
+    with create_ledger_study("clear", start=DAY_0, end=END, path=tmp_path / "clear.db") as clear:
+        write(clear, "second", SECOND)
+        write(clear, "third", THIRD_CLOSE)
+        write(clear, "narrow", [1.0 + 4096 * step * (n % 2) for n in range(T)])
+        report = rank(clear)
+    assert (report.pick, report.tied) == ("narrow", ())
+    assert report.sharpe == pytest.approx(
+        (1.0 + 2048 * step) / (2048 * step * math.sqrt(T / (T - 1)))
+    )
+    assert report.sharpe > 2.1e12 and math.isfinite(report.v) and math.isfinite(report.dsr)
+    with create_ledger_study("below", start=DAY_0, end=END, path=tmp_path / "below.db") as below:
+        write(below, "second", SECOND)
+        write(below, "third", THIRD_CLOSE)
+        write(below, "narrow", [1.0 + 96 * step * (n % 2) for n in range(T)])
+        with pytest.raises(RankingStopped, match="narrow: its returns do not vary beyond rounding"):
+            rank(below)
+
+
+def test_trials_with_one_sharpe_ratio_have_no_v_whatever_its_variance_rounds_to(
+    study: optuna.Study,
+) -> None:
+    """V counts as 0 when the highest and the lowest Sharpe ratio are within rounding of each
+    other, here the same number. skfolio's variance of N equal numbers is not always 0.0: their
+    mean can round one step off, as a constant series' does (five times this ratio gives 9.6e-34),
+    so the ranking reads the ratios, not the variance, for it. Read from the variance alone, five
+    copies of one configuration would rank undeflated."""
+    assert float(measures.variance([told_sharpe(*as_recorded(SECOND))] * 5)) > 0
+    for label in ("one", "two", "three", "four", "five"):
+        write(study, label, SECOND)
+
+    with pytest.raises(
+        RankingStopped, match=r"V = 0: the highest Sharpe ratio[^\n]*and the lowest"
+    ):
+        rank(study)
+
+
+def test_a_told_value_is_held_to_the_rounding_of_its_own_series(study: optuna.Study) -> None:
+    """A value told is compared with the one computed again from the stored returns, within what
+    rounding can move it (ADR 0031): sixteen times the mean's rounding over the standard deviation,
+    about 1e-13 here, where `math.isclose`'s default let a value 1e-10 off pass."""
+    write(study, "pick", PICK)
+    write(study, "second", SECOND)
+    number = write(study, "third", THIRD_CLOSE)
+    [trial] = [t for t in study.trials if t.number == number]
+    assert trial.values is not None
+    off = trial.values[0] * (1 + 1e-10)
+    study.add_trial(
+        optuna.trial.create_trial(state=TrialState.COMPLETE, value=off, user_attrs=trial.user_attrs)
+    )
+
+    with pytest.raises(RankingStopped, match=rf"third: #\d+ [^\n]*told {re.escape(repr(off))}"):
+        rank(study)

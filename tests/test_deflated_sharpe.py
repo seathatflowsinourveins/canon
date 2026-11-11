@@ -214,6 +214,30 @@ def test_one_trial_or_identical_trials_leave_no_hurdle() -> None:
     assert against_zero > _deflated(returns, _trial_sharpes(46))
 
 
+def test_skfolio_gives_a_constant_series_the_spread_its_mean_rounds_to() -> None:
+    """What the gate's numeric check rests on (ADR 0031, 2026-11-11; Antigravity, gate round 7):
+    skfolio's variance subtracts the computed mean once, so thirty returns of -0.01, whose mean
+    rounds, keep a standard deviation and a mean over it above 1e15, where thirty of 0.07, whose
+    mean comes out exact, have none.
+    Its skewness and kurtosis centre again and call both undefined."""
+    rounded, exact = [-0.01] * 30, [0.07] * 30
+
+    deviation = float(measures.standard_deviation(rounded))
+
+    assert 0 < deviation < 30 * math.ulp(0.01)
+    assert abs(float(measures.mean(rounded)) / deviation) > 1e15
+    assert float(measures.standard_deviation(exact)) == 0.0
+    for series in (rounded, exact):
+        assert math.isnan(float(measures.skew(series)))
+        assert math.isnan(float(measures.kurtosis(series)))
+
+
+def test_skfolio_s_variance_of_equal_trial_sharpe_ratios_can_be_above_zero() -> None:
+    """So V = 0 is read from the ratios, never from their variance (ADR 0031, 2026-11-11)."""
+    assert float(measures.variance([0.1] * 3)) > 0
+    assert float(measures.variance([5.0] * 46)) == 0.0
+
+
 def test_annualised_trial_sharpe_ratios_do_not_mix_with_daily_returns() -> None:
     """The units are the caller's to keep: skfolio cannot tell an annualised Sharpe ratio from a daily one."""
     returns = _skewed_returns()
