@@ -10,7 +10,7 @@
 # and Ubuntu, so it runs before any toolchain install. Bash 3.2 or later.
 # Fails loudly: any upstream that cannot be resolved is an error, never a silent skip.
 #
-# Usage: scripts/canon resolve [id|--prune] | check | outdated [--json] | lint | list | selftest
+# Usage: scripts/canon resolve [id|--prune] | check | outdated [--json] | lint | list | src [id] | selftest
 # Exit codes: 0 ok; 1 an error, a lint failure, or (check, outdated) an upstream that could not be read or
 # a registry entry with no pin; 2 usage; 3 (check) a pinned release tag now points at another commit;
 # 4 (check) a pin whose repo or track differs from the registry, so it needs `resolve <id>`.
@@ -501,6 +501,70 @@ cmd_list() {
     | sort | awk -F'\t' 'BEGIN{printf "%-22s %-28s %-11s %-13s %s\n","FIELD","ID","ROLE","PIN","SOURCE"} {printf "%-22s %-28s %-11s %-13s %s\n",$1,$2,$3,$4,$5}'
 }
 
+# src [id]          read upstream source at the pin: materialise the repository at its locked commit in
+#                    ${CANON_SRC_DIR:-~/.cache/canon/upstream-src}/<id>@<first 12 characters of the commit>, depth 1, and
+#                    print the path. A folder already there is kept after its HEAD is checked against the lock; a mismatch
+#                    fails by name and changes nothing. The tree is made read-only; it is only read, never built, installed
+#                    or run. Fetch by commit follows https://git-scm.com/docs/git-fetch (a refspec may be a commit id) and
+#                    https://git-scm.com/docs/protocol-v2 (a v2 server serves any object id; with protocol v0 or v1 the
+#                    server needs uploadpack.allowReachableSHA1InWant or allowAnySHA1InWant, per git-config). A server
+#                    that refuses the fetch fails the id by name: nothing is substituted and no partial folder is left.
+#                    Remove a folder with chmod -R u+w first. CANON_SRC_BASE (default https://github.com) is the remote's base, so a test can point at a local path.
+src_one() {
+  local id="$1" repo="$2" sha="$3" lrepo="$4" track="$5" ltrack="$6" dir dest tmp head err
+  case "$sha" in
+    -|"") echo "canon: src $id: no pin in ${LOCK#"$ROOT"/}; run scripts/canon resolve $id" >&2; return 1 ;;
+  esac
+  if [ "$lrepo" != "$repo" ] || [ "$ltrack" != "$track" ]; then
+    echo "canon: src $id: the lock pins $lrepo ($ltrack) but the registry has $repo ($track); run scripts/canon resolve $id" >&2; return 1
+  fi
+  case "$sha" in
+    *[!0-9a-f]*) echo "canon: src $id: locked commit '$sha' is not a commit id" >&2; return 1 ;;
+  esac
+  [ "${#sha}" -eq 40 ] || { echo "canon: src $id: locked commit '$sha' is not a 40-character commit id" >&2; return 1; }
+  dir="${CANON_SRC_DIR:-$HOME/.cache/canon/upstream-src}"
+  dest="$dir/$id@${sha:0:12}"
+  if [ -e "$dest" ]; then
+    head=$(git -C "$dest" rev-parse HEAD 2>/dev/null) \
+      || { echo "canon: src $id: $dest exists but is not a git checkout; nothing changed" >&2; return 1; }
+    [ "$head" = "$sha" ] \
+      || { echo "canon: src $id: $dest is at $head but the lock records $sha; nothing changed" >&2; return 1; }
+    echo "$dest"
+    return 0
+  fi
+  mkdir -p "$dir" || { echo "canon: src $id: cannot create $dir" >&2; return 1; }
+  tmp=$(mktemp -d "$dir/.fetch.$id.XXXXXX") || { echo "canon: src $id: cannot create a temporary folder in $dir" >&2; return 1; }
+  if err=$(git -C "$tmp" init -q 2>&1 \
+     && git -C "$tmp" fetch -q --depth 1 "${CANON_SRC_BASE:-https://github.com}/$repo.git" "$sha" 2>&1 \
+     && git -C "$tmp" -c advice.detachedHead=false checkout -q --detach "$sha" 2>&1 \
+     && [ "$(git -C "$tmp" rev-parse HEAD)" = "$sha" ]); then
+    if chmod -R a-w "$tmp" && mv "$tmp" "$dest"; then :
+    else chmod -R u+w "$tmp"; rm -rf "${tmp:?}"; echo "canon: src $id: could not finish $dest" >&2; return 1; fi
+    echo "$dest"
+  else
+    chmod -R u+w "$tmp"; rm -rf "${tmp:?}"
+    echo "canon: src $id: could not fetch $repo at $sha: ${err:-checkout did not land on the commit} (a server may refuse a fetch by commit id; nothing substituted)" >&2
+    return 1
+  fi
+}
+cmd_src() {
+  local only="${1:-}" rows id repo track sha lrepo ltrack fail=0 n=0
+  command -v git >/dev/null 2>&1 || die "missing required tool: git"
+  [ -f "$LOCK" ] || die "no lock file yet; run scripts/canon resolve"
+  if [ -n "$only" ]; then
+    jq -e --arg id "$only" '.upstreams[] | select(.id == $id and .repo != null)' "$REG" >/dev/null \
+      || die "src: no upstream with id '$only' and a git repository in the registry"
+  fi
+  rows=$(pin_rows)
+  while IFS=$'\t' read -r id repo track sha lrepo ltrack; do
+    [ -n "$id" ] || continue
+    [ -z "$only" ] || [ "$id" = "$only" ] || continue
+    n=$((n+1))
+    src_one "$id" "$repo" "$sha" "$lrepo" "$track" "$ltrack" || fail=$((fail+1))
+  done <<<"$rows"
+  [ "$fail" -eq 0 ] || die "src: $fail of $n failed"
+}
+
 case "${1:-}" in
   resolve) cmd_resolve "${2:-}" ;;
   check)   cmd_check ;;
@@ -508,5 +572,6 @@ case "${1:-}" in
   list)    cmd_list ;;
   outdated) cmd_outdated "${2:-}" ;;
   selftest) cmd_selftest ;;
-  *) echo "usage: scripts/canon {resolve [id|--prune]|check|outdated [--json]|lint|list|selftest}" >&2; exit 2 ;;
+  src)     cmd_src "${2:-}" ;;
+  *) echo "usage: scripts/canon {resolve [id|--prune]|check|outdated [--json]|lint|list|src [id]|selftest}" >&2; exit 2 ;;
 esac

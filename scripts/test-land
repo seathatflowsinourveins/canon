@@ -346,6 +346,29 @@ t_userinfo() {
   [ "$rc" -eq 1 ]
 }
 case_ "a URL's userinfo is not an address"                  t_userinfo
+# (the decorators and gmail addresses below are written in two parts, so that this file itself passes)
+t_diff_marker() {
+  local a
+  for a in "+""@pytest.mark.parametrize" " +""@pytest.fixture" "    -""@pytest.fixture" "-""@gmail.com"; do
+    check_title "$a"; [ "$rc" -eq 0 ] || return 1
+  done
+  new_repo
+  printf '%s\n' '+''@pytest.mark.parametrize("x", [1])' ' -''@pytest.fixture' > "$W/change.patch"
+  git -C "$W" add -A; git -C "$W" commit -q -m "Add a patch"
+  out=$(cd "$W" && CHECK_ADDRESSES_STRICT=1 "$ROOT/scripts/check-addresses" HEAD~1..HEAD 2>&1); rc=$?
+  [ "$rc" -eq 0 ] || return 1
+  printf '%s\n' '+x@''gmail.com' ' -y@''gmail.com' > "$W/real.patch"
+  git -C "$W" add -A; git -C "$W" commit -q -m "Add another patch"
+  out=$(cd "$W" && "$ROOT/scripts/check-addresses" HEAD~1..HEAD 2>&1); rc=$?
+  [ "$rc" -eq 1 ] && has "file real.patch: an address at gmail.com" || return 1
+  out=$(CHECK_ADDRESSES_STRICT=1 "$ROOT/scripts/check-addresses" --title "a+b@example.org" 2>&1); rc=$?
+  [ "$rc" -eq 1 ] && has "title: an address at example.org" || return 1
+  for a in "x@""gmail.com" "+x@""gmail.com" "x_@""gmail.com" "jos"$'\xc3\xa9'"_@""gmail.com" \
+           "jos"$'\xc3\xa9'"-@""gmail.com" "_@+@""gmail.com"; do
+    check_title "$a"; [ "$rc" -eq 1 ] && has "title: an address at gmail.com" || return 1
+  done
+}
+case_ "a diff marker before a decorator is not an address; a real address stays refused" t_diff_marker
 case_ "a token with two @ is refused even at example domains" t_two_at
 case_ "check-addresses fails loudly when git cannot read the range" t_no_input
 

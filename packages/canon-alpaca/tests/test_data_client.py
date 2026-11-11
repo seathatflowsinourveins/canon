@@ -43,6 +43,7 @@ from alpaca.data.timeframe import TimeFrameUnit
 from canon_alpaca.constants import ENV_API_KEY
 from canon_alpaca.constants import ENV_SECRET_KEY
 from canon_alpaca.data import AlpacaDataClient
+from canon_alpaca.data import AlpacaDataClientConfig
 from canon_alpaca.factories import AlpacaDataClientFactory
 from nautilus_trader.common import Environment
 from nautilus_trader.common import Logger
@@ -217,10 +218,12 @@ def build_node(
     timeout_connection_secs: int = 2,
     factory: type[AlpacaDataClientFactory] = AlpacaDataClientFactory,
     catalog: Path | None = None,
+    config: DataClientConfig | None = None,
 ):
-    config = DataClientConfig(
-        instrument_provider=InstrumentProviderConfig(load_ids=["AAPL.ALPACA"])
-    )
+    if config is None:
+        config = DataClientConfig(
+            instrument_provider=InstrumentProviderConfig(load_ids=["AAPL.ALPACA"])
+        )
     if registration == "config":
         node = LiveNode.build(
             "CANON-ALPACA",
@@ -280,19 +283,20 @@ def run_with_client(
     strategy: Strategy | None = None,
     max_workers: int | None = None,
     executor: ThreadPoolExecutor | None = None,
+    config: DataClientConfig | None = None,
 ):
     """Run a hosted node, await `body` with its connected Alpaca client, stop the node, return its cache.
 
     With `max_workers`, the loop's default executor, which `asyncio.to_thread` uses, has that many threads;
-    with `executor`, it is that one. The cache is taken before the run, as NautilusTrader requires for a
-    node run by `run_async`.
+    with `executor`, it is that one. With `config`, the data client is built from it. The cache is taken
+    before the run, as NautilusTrader requires for a node run by `run_async`.
     """
     clients: list[AlpacaDataClient] = []
     strategy = strategy or consumer(
         want_quotes=False, want_trades=False, bar_type=None, auto_shutdown=False
     )
     # Held in a list that is emptied on the way out, so a failure's traceback does not keep the node.
-    nodes = [build_node(strategy, factory=capturing_factory(clients))]
+    nodes = [build_node(strategy, factory=capturing_factory(clients), config=config)]
     handle = nodes[0].handle()
     cache = nodes[0].cache
 
@@ -382,6 +386,7 @@ def test_alpaca_clients_are_built_for_paper_and_iex(venue) -> None:
         "api_key": PLACEHOLDER,
         "secret_key": PLACEHOLDER,
         "feed": DataFeed.IEX,
+        "data_timeout": canon_alpaca.data.STREAM_DATA_TIMEOUT_SECS,
     }
 
 
@@ -825,10 +830,19 @@ def test_disconnect_clears_state_when_the_stream_thread_does_not_stop(venue, mon
 
 
 def test_stream_ending_while_subscribed_is_logged(venue, capfd) -> None:
+    # The node stops only after the stream's thread has ended. Its exit report reaches the loop after its
+    # one quote, so a strategy stopping the node on that quote could disconnect first, and the client
+    # drops a report from a stream it no longer runs (`_current`): the test failed under load.
     venue.stream.ends_on_its_own = True
-    strategy = consumer(want_trades=False, bar_type=None)
+    strategy = consumer(want_trades=False, bar_type=None, auto_shutdown=False)
 
-    run(build_node(strategy), "hosted")
+    async def body(client) -> None:
+        await wait_until(
+            lambda: client._stream_thread is not None and not client._stream_thread.is_alive()
+        )
+        await asyncio.sleep(0)  # the report, posted before the thread ended, runs on this loop
+
+    run_with_client(body, strategy)
 
     assert len(strategy.seen_quotes) == 1
     assert "ended by itself while subscribed" in logged(capfd)
@@ -2474,3 +2488,255 @@ def test_historical_quotes_are_converted_in_slices_that_let_the_loop_run(
 
     assert len(seen_at) == 4
     assert seen_at[0] == seen_at[1] < seen_at[2] == seen_at[3]
+
+
+# -- a connected stream that sends nothing: alpaca-py's data_timeout and the client's mute limit ----------
+
+
+def data_config(
+    stream_data_timeout_secs: float | None = canon_alpaca.data.STREAM_DATA_TIMEOUT_SECS,
+    stream_mute_limit_secs: float | None = canon_alpaca.data.STREAM_MUTE_LIMIT_SECS,
+) -> AlpacaDataClientConfig:
+    return AlpacaDataClientConfig(
+        instrument_provider=InstrumentProviderConfig(load_ids=["AAPL.ALPACA"]),
+        stream_data_timeout_secs=stream_data_timeout_secs,
+        stream_mute_limit_secs=stream_mute_limit_secs,
+    )
+
+
+QUIETEST_HEALTHY_SILENCE_SECS = 513
+"""The longest silence seen on a stream that then delivered: `iex` subscribed to QQQ alone, pre-market
+2026-11-11, one trade and no quote in 600 s, the trade 513 s after the subscription (README, "Mute
+stream")."""
+
+
+def test_the_stream_takes_its_data_timeout_from_the_config(venue) -> None:
+    strategy = consumer(want_trades=False, bar_type=None)
+
+    run(build_node(strategy, config=data_config(stream_data_timeout_secs=120.0)), "hosted")
+
+    assert len(strategy.seen_quotes) == 1
+    assert venue.built["stream"]["data_timeout"] == 120.0
+
+
+def test_no_data_timeout_leaves_alpaca_py_without_one(venue) -> None:
+    strategy = consumer(want_trades=False, bar_type=None)
+    config = data_config(stream_data_timeout_secs=None, stream_mute_limit_secs=None)
+
+    run(build_node(strategy, config=config), "hosted")
+
+    assert venue.built["stream"]["data_timeout"] is None
+
+
+def test_the_defaults_outlast_the_quietest_feed_seen_delivering() -> None:
+    config = AlpacaDataClientConfig()
+
+    timeout, limit = config.stream_data_timeout_secs, config.stream_mute_limit_secs
+    assert timeout == canon_alpaca.data.STREAM_DATA_TIMEOUT_SECS
+    assert limit == canon_alpaca.data.STREAM_MUTE_LIMIT_SECS
+    assert timeout is not None and limit is not None
+    assert timeout > QUIETEST_HEALTHY_SILENCE_SECS
+    assert limit > timeout
+    assert config.dict()["stream_data_timeout_secs"] == timeout  # serialised, as the guide has it
+
+
+@pytest.mark.parametrize(
+    ("fields", "error"),
+    [
+        ({"stream_data_timeout_secs": 0}, "stream_data_timeout_secs must be"),
+        ({"stream_data_timeout_secs": -1.0}, "stream_data_timeout_secs must be"),
+        ({"stream_data_timeout_secs": float("nan")}, "stream_data_timeout_secs must be"),
+        ({"stream_data_timeout_secs": float("inf")}, "stream_data_timeout_secs must be"),
+        ({"stream_data_timeout_secs": True}, "stream_data_timeout_secs must be"),
+        ({"stream_data_timeout_secs": "900"}, "stream_data_timeout_secs must be"),
+        ({"stream_mute_limit_secs": 0}, "stream_mute_limit_secs must be"),
+        (
+            {"stream_data_timeout_secs": 600.0, "stream_mute_limit_secs": 600.0},
+            "longer than stream_data_timeout_secs",
+        ),
+        ({"feed": "sip"}, "no setting 'feed'"),
+    ],
+)
+def test_the_config_refuses_a_bound_it_cannot_use(fields, error) -> None:
+    with pytest.raises((TypeError, ValueError), match=error):
+        AlpacaDataClientConfig(**fields)
+
+
+def test_alpaca_py_reconnects_a_mute_stream_and_sends_its_subscriptions_again(
+    venue, alpaca, monkeypatch, capfd
+) -> None:
+    # alpaca-py 0.45.0's own path, on its real stream: `_consume` gives up on a connection that sends no
+    # market data for `data_timeout` seconds, and `_drive_run` connects again and sends every handler map.
+    stream, socket = alpaca.memory_stream(monkeypatch)
+    stream._reconnect_min_backoff = 0.01  # alpaca-py waits 0.5 to 1 s first; shortened here
+
+    def build(**kwargs: object) -> object:
+        # As `StockDataStream(data_timeout=...)` sets it.
+        stream._data_timeout = kwargs["data_timeout"]
+        return stream
+
+    monkeypatch.setattr(canon_alpaca.data, "StockDataStream", build)
+
+    def subscribes() -> list[dict]:
+        return [m for m in socket.sent if m["action"] == "subscribe"]
+
+    async def body(client) -> None:
+        await client._subscribe_quotes(command(AAPL))
+        await wait_until(lambda: len(subscribes()) >= 2)
+        socket.deliver(alpaca.wire_quote())
+        await wait_until(lambda: client._stream_heard)
+
+    config = data_config(stream_data_timeout_secs=0.1, stream_mute_limit_secs=None)
+    cache = run_with_client(body, config=config)
+
+    assert all(m["quotes"] == ["AAPL"] for m in subscribes())
+    assert cache.quote(AAPL) is not None
+    lines = [line for line in logged(capfd).splitlines() if "no data received" in line]
+    assert lines, "alpaca-py's reconnect was not relayed to the node's log"
+    assert re.search(r"Alpaca stream on feed iex \(ALPACA-stream-\d+\): no data received", lines[0])
+    assert "[ERROR]" not in lines[0]  # a reconnect is a warning: a quiet feed fails nothing
+
+
+def test_a_stream_mute_past_the_limit_is_stopped_and_named(venue, capfd) -> None:
+    venue.stream.quotes, venue.stream.trades = [], []  # connected, subscribed, and sending nothing
+
+    async def body(client) -> None:
+        await client._subscribe_quotes(command(AAPL))
+        await wait_until(venue.stream.stopped.is_set)
+        await wait_until(venue.stream.finished.is_set)
+        with pytest.raises(RuntimeError, match=r"Alpaca stream on feed iex went mute: .*reconnect"):
+            await client._subscribe_trades(command(AAPL))
+
+    config = data_config(stream_data_timeout_secs=0.05, stream_mute_limit_secs=0.2)
+    run_with_client(body, config=config)
+
+    log = logged(capfd)
+    (line,) = [line for line in log.splitlines() if "went mute" in line and "[ERROR]" in line][:1]
+    # What a session window reads as its stream's error: a line that begins with the feed.
+    assert "Alpaca stream on feed iex went mute: no quote or trade for" in line
+    assert "stream_mute_limit_secs" in line
+    assert "ended by itself" not in log
+
+
+def test_the_mute_limit_counts_from_the_last_quote(venue, alpaca, monkeypatch, capfd) -> None:
+    stream, socket = alpaca.memory_stream(monkeypatch)
+    monkeypatch.setattr(canon_alpaca.data, "StockDataStream", lambda **_: stream)
+
+    async def body(client) -> None:
+        await client._subscribe_quotes(command(AAPL))
+        for _ in range(8):  # a quote every 0.1 s for 0.8 s, past the limit four times over
+            socket.deliver(alpaca.wire_quote())
+            await asyncio.sleep(0.1)
+        assert client._stream_failure is None
+        await wait_until(lambda: client._stream_failure is not None)  # then nothing comes
+
+    run_with_client(
+        body, config=data_config(stream_data_timeout_secs=None, stream_mute_limit_secs=0.2)
+    )
+
+    assert "went mute" in logged(capfd)
+
+
+def test_a_stream_holding_no_subscription_is_not_mute(venue, capfd) -> None:
+    venue.stream.trades = []
+
+    async def body(client) -> None:
+        await client._subscribe_quotes(command(AAPL))
+        await wait_until(lambda: client._stream_heard)
+        await client._unsubscribe_quotes(command(AAPL))
+        await asyncio.sleep(0.6)  # three limits with nothing subscribed
+        assert client._stream_failure is None
+        assert not venue.stream.stopped.is_set()
+
+    run_with_client(
+        body, config=data_config(stream_data_timeout_secs=None, stream_mute_limit_secs=0.2)
+    )
+
+    assert "went mute" not in logged(capfd)
+
+
+def test_a_disconnect_cancels_the_mute_check(venue, capfd) -> None:
+    venue.stream.quotes, venue.stream.trades = [], []
+
+    async def body(client) -> None:
+        await client._subscribe_quotes(command(AAPL))
+        await client._disconnect()
+        await asyncio.sleep(0.4)  # twice the limit after the disconnect
+
+    run_with_client(
+        body, config=data_config(stream_data_timeout_secs=None, stream_mute_limit_secs=0.2)
+    )
+
+    assert "went mute" not in logged(capfd)
+
+
+def test_a_stopped_node_cannot_run_again_so_a_client_serves_one_run(venue) -> None:
+    # The client forgets its subscriptions at disconnect. The engine keeps its own record of them until a
+    # reset (`DataClientAdapter::clear_subscription_state`) and skips a subscribe it holds already, so a
+    # connect again under one engine would leave them unsent. NautilusTrader v2.0.0rc8 gives a client to one
+    # node run (the adapter guide, "A client instance and its bound provider belong to one node run"), and a
+    # stopped node refuses to run again: this fails if upstream allows that.
+    node = build_node(consumer(want_trades=False, bar_type=None))
+    run(node, "hosted")
+
+    with pytest.raises(RuntimeError, match="build a new node to run again"):
+        run(node, "hosted")
+
+
+def test_a_subscription_after_a_spell_with_none_starts_the_mute_count_afresh(venue, monkeypatch):
+    # The code review: silence while nothing was subscribed is not owed by a later subscription.
+    venue.stream.quotes, venue.stream.trades = [], []
+
+    async def body(client) -> None:
+        await client._subscribe_quotes(command(AAPL))
+        await client._unsubscribe_quotes(command(AAPL))
+        client._last_heard -= 10.0  # ten seconds with nothing subscribed and no check in between
+        await client._subscribe_trades(command(AAPL))
+        client._check_mute()
+        assert client._stream_failure is None
+
+    run_with_client(
+        body, config=data_config(stream_data_timeout_secs=1.0, stream_mute_limit_secs=5.0)
+    )
+
+
+def test_a_subscription_lost_in_a_reconnect_alpaca_py_makes_is_sent_on_the_next_message(
+    venue, alpaca, monkeypatch
+) -> None:
+    # The code review: alpaca-py's `data_timeout` reconnect sends its handler maps and only then counts as
+    # running, the same window as its start; its warning shows the client a new connection is coming, so a
+    # subscribe made before that connection's first message is sent again on it.
+    stream, socket = alpaca.memory_stream(monkeypatch)
+    stream._reconnect_min_backoff = 0.01
+
+    def build(**kwargs: object) -> object:
+        stream._data_timeout = kwargs["data_timeout"]
+        return stream
+
+    monkeypatch.setattr(canon_alpaca.data, "StockDataStream", build)
+    gate = threading.Event()
+
+    async def body(client) -> None:
+        await client._subscribe_quotes(command(AAPL))
+        socket.deliver(alpaca.wire_quote())
+        await wait_until(lambda: client._stream_heard)
+        socket.gate = gate  # holds the reconnect's send of the handler maps
+        try:
+            await wait_until(socket.holding.is_set)
+            await wait_until(lambda: not client._stream_heard)  # the reconnect warning was seen
+            await client._subscribe_trades(command(AAPL))  # in the window: recorded, not sent
+        finally:
+            gate.set()
+        await wait_until(lambda: stream._running)
+        assert socket.wire["trades"] == set()
+        socket.deliver(alpaca.wire_quote())
+        await wait_until(lambda: socket.wire["trades"] == {"AAPL"})
+
+    run_with_client(
+        body, config=data_config(stream_data_timeout_secs=0.2, stream_mute_limit_secs=None)
+    )
+
+
+def test_a_bound_too_large_for_a_float_is_refused_by_name() -> None:
+    with pytest.raises(ValueError, match="stream_mute_limit_secs must be"):
+        AlpacaDataClientConfig(stream_mute_limit_secs=10**400)

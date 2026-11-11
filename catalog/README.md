@@ -14,4 +14,8 @@ instrument's definition if none is here (ADR 0040). It fetches only what the cat
 cover. It needs the paper key pair, so it runs inside `mise run paper:test`;
 `tests/test_paper_bars_to_catalog.py` loads AAPL's daily bars for the first quarter of 2025 here.
 
+One feed a root. The catalog keys bars by bar type, not by Alpaca's feed, so `load_bars` writes the feed
+it loaded into `alpaca-feed` in the root and refuses another feed there. This folder holds IEX; SIP bars
+go in `catalog/sip/` (ADR 0077).
+
 Source: https://nautilustrader.io/docs/md/latest/concepts/data/catalog.md (read 2026-11-09 and 2026-11-10).

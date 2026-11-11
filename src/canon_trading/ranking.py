@@ -19,12 +19,20 @@ the first is byte-identical and the second differs only in `ty: ignore` comments
 Nothing statistical is computed here; the mean of the off-diagonal correlations is eq. 9's own input.
 skfolio raises nothing on input that lets a pick pass more easily (ADR 0031), so the ranking stops,
 naming the trials, unless every trial's Sharpe ratio and every return of the pick is finite, N >= 2 and
-V > 0. V counts as 0 when every trial's Sharpe ratio equals the first's under `math.isclose` at its
-default tolerance (ADR 0031): copies of one configuration differ only in rounding, and would otherwise
-pass undeflated. A return that is not finite, not a float, or in a series whose squares sum past
-float64's largest, is refused, for every record that ran on the current sample and before any two are
-compared, by `canon_trading.returns_matrix.daily_series`, and so is one whose variance or fourth
-central moment overflows. A study of any directions but one objective maximized stops it too:
+V > 0. Every series it computes on, and each trial's Sharpe ratio, comes from
+`canon_trading.returns_matrix.session_returns`, whose one numeric check (that module's header; ADR
+0031, 2026-11-11) refuses, for every record that ran on the current sample and before any two are
+compared, a return that is not a finite float, and a series of session days that does not vary beyond
+rounding at its own size (a constant one, or one of zeros), whose statistics are not finite, or whose
+moments underflow. No moment is checked here. Sharpe ratios are compared by one bound, each series'
+own (`SessionReturns.rounding`, what rounding can move its computed ratio by; ADR 0031, 2026-11-11),
+and two ratios are told apart only when they differ by more than the sum of their two bounds. Both
+rules of the study are judged on the set, never pair by pair, so no order of recording changes
+either, and the columns are taken in the order of the keys, so V, N-hat and which of several keys
+with the same returns is named the pick are the same to the bit in any order. V counts as 0 when the highest and the lowest ratio are not told apart, read from the ratios
+since skfolio's variance of equal numbers can round above 0; it also stops when that variance is
+not above 0 or not finite. Ratios told apart give the V they have. A value told is held to the same
+bound of the one computed again (`_shape_faults`). A study of any directions but one objective maximized stops it too:
 `record_trial` tells one value, and a record told more is another writer's (`origin`).
 It also stops on what ADR 0054 terms 5 and 6, ADR 0041 and ADR 0053 add: a configuration with a failed or
 `RUNNING` record that no later record of it resolves (a record with a key and no sample number is
@@ -57,8 +65,10 @@ trial, is never read, and its key stays counted in N; a key tried only in such r
 `record_trial` runs it on the current sample. The stops on another writer's queued keyed record,
 `WAITING` or taken from Optuna's queue, name `retire_queued` (ADR 0054, 2026-11-10).
 The samples are read once, so the current sample and the numbers known agree.
-Every such stop is gathered before one is raised. Configurations tied at the highest Sharpe ratio with
-the same returns are one pick; tied with other returns, they leave no single pick and stop it. N-hat
+Every such stop is gathered before one is raised. The top group is every configuration whose Sharpe
+ratio is not told apart from the highest. Inside it returns are compared exactly, day by day: the
+same on every day, the group is one pick; with any day that differs it leaves no single pick and
+stops the ranking, naming the group, whatever order they were recorded in. N-hat
 below 1 is raised to 1, skfolio's least, and the DSR at N-hat is withheld when its benchmark is below
 0 (ADR 0031).
 """
@@ -73,6 +83,7 @@ from datetime import UTC
 from datetime import datetime
 from typing import TYPE_CHECKING
 
+import numpy as np
 from nautilus_trader.model import BarType
 from optuna.study import StudyDirection
 from optuna.trial import TrialState
@@ -100,13 +111,12 @@ from .ledger import samples
 from .ledger import session_day
 from .ledger import shows_an_evaluation
 from .ledger import taken_untold
-from .ledger import told_sharpe
 from .returns_matrix import DAY_NS
 from .returns_matrix import ReturnsRejected
-from .returns_matrix import daily_series
+from .returns_matrix import SessionReturns
 from .returns_matrix import is_ns_text
 from .returns_matrix import returns_matrix
-from .returns_matrix import session_sharpe
+from .returns_matrix import session_returns
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -229,6 +239,15 @@ _RAN_AS_TOLD = frozenset(
 )
 _RAN_STATES = frozenset(state for state, _, _ in _RAN_AS_TOLD)
 
+# A record that ran, still `RUNNING`, with a value. `record_trial` leaves none so: Optuna's `tell`
+# writes the value and the state in one transaction (`set_trial_state_values`,
+# `optuna/storages/_rdb/storage.py` at the pinned commit). Whether a read can fall across that
+# write and show one is UNVERIFIED, so the stop does not call the ledger damaged: it names the
+# remedy that tells a writer still recording from another writer's record, ranking again.
+_MAY_BE_RECORDING = (
+    "is RUNNING with a value, as record_trial leaves none: a writer may be recording it now"
+)
+
 # The parts of the `config` `canon_trading.ledger.record_trial` stores (`trial_config`).
 CONFIG_PARTS = ("data", "strategies", "venue")
 
@@ -256,6 +275,10 @@ def _not_the_writers(trial: FrozenTrial) -> str | None:
     if outcome in RAN:
         if (state, outcome, trial.values is not None) in _RAN_AS_TOLD:
             return None
+        if state is TrialState.RUNNING:  # so with a value: the one state not in the set above
+            if outcome == IDLE:
+                return "is RUNNING with a value, and record_trial tells an idle run none"
+            return _MAY_BE_RECORDING
         return f"was told {state.name} with outcome {outcome!r}, as record_trial never tells one"
     if shows_an_evaluation(trial):
         return "shows a result Optuna keeps but no outcome record_trial writes for one"
@@ -444,7 +467,9 @@ def rank(study: optuna.Study) -> RankingReport:
         str, list[FrozenTrial]
     ] = {}  # of those, the ones that ran, for what names them
     read: list[FrozenTrial] = []  # every record on the current sample that ran to the end
-    series: dict[str, pd.Series] = {}  # each chosen record's returns, as `daily_series` read them
+    series: dict[
+        str, SessionReturns
+    ] = {}  # each chosen record's returns, as the one check read them
     for key, every in by_key.items():
         # On every sample, as N counts keys on every sample: a move clears none of these.
         foreign = [
@@ -459,9 +484,15 @@ def rank(study: optuna.Study) -> RankingReport:
         if foreign:
             # The key's records are not all the writer's of one configuration, so none is read.
             stops.extend(
-                f"{key}: {_describe(trial)} {why}: not in the shape record_trial writes, so "
-                f"another writer left it, and no later record resolves it"
-                f"{_remedy(trial) if RETIRED not in malformed else ''} (ADR 0054)"
+                f"{key}: {_describe(trial)} {why}: "
+                + (
+                    "rank again once it has finished; if it is still so then, another writer "
+                    "left it, and no later record resolves it"
+                    if why == _MAY_BE_RECORDING
+                    else "not in the shape record_trial writes, so another writer left it, and "
+                    "no later record resolves it"
+                )
+                + f"{_remedy(trial) if RETIRED not in malformed else ''} (ADR 0054)"
                 for trial, why in foreign
             )
             continue
@@ -488,7 +519,15 @@ def rank(study: optuna.Study) -> RankingReport:
                 f"{key}: no record ran to the end ({', '.join(map(_describe, records))})",
             )
             continue
-        faulty = [(trial, faults) for trial in ran if (faults := _shape_faults(trial, sample))]
+        # Every record that ran is read as returns enter the gate, once, whatever their order,
+        # before any is compared with another (ADR 0010 step 2): the series with its Sharpe ratio,
+        # or why it is refused.
+        readings = {trial.number: _read(key, trial) for trial in ran}
+        faulty = [
+            (trial, faults)
+            for trial in ran
+            if (faults := _shape_faults(trial, sample, readings[trial.number]))
+        ]
         if faulty:
             stops.extend(
                 f"{key}: {_describe(trial)} is not in the shape record_trial writes on "
@@ -498,19 +537,14 @@ def rank(study: optuna.Study) -> RankingReport:
             continue
         read.extend(ran)
         ran_on_sample[key] = ran
-        # Every record that ran is read as returns enter the gate, whatever their order, before
-        # any is compared with another (ADR 0010 step 2).
-        parsed: dict[int, pd.Series] = {}
-        rejected = []
-        for trial in ran:
-            try:
-                parsed[trial.number] = daily_series(
-                    key,
-                    trial.user_attrs.get("returns_series"),
-                    trial.user_attrs.get("session_days"),
-                )
-            except ReturnsRejected as rejection:
-                rejected.append(f"{rejection} (#{trial.number})")
+        # An idle record's zeros are what never trading leaves, and the stop below says so:
+        # that they do not vary is no second reason. Any other refusal of its returns is.
+        rejected = [
+            f"{reading} (#{trial.number})"
+            for trial in ran
+            if isinstance(reading := readings[trial.number], ReturnsRejected)
+            and not (reading.no_spread and trial.user_attrs[OUTCOME] == IDLE)
+        ]
         stops.extend(rejected)  # the key's other stops are still gathered; no pick is read from it
         unresolved = [
             trial
@@ -551,23 +585,25 @@ def rank(study: optuna.Study) -> RankingReport:
             continue
         if rejected:
             continue
+        reading = readings[first.number]
+        if isinstance(reading, ReturnsRejected):  # named above; told apart for the type alone
+            continue
         chosen[key] = first
-        series[key] = parsed[first.number]
+        series[key] = reading
 
     stops.extend(_data_disagreements(read, sample))
     matrix = None
     if len(series) > 1:
         try:
-            matrix = returns_matrix(list(series.values()))
+            # In the order of the keys, not of recording: what is computed from the columns (V,
+            # N-hat, which of several keys with the same returns is named) then follows no order
+            # of recording, to the last bit (ADR 0031, 2026-11-11).
+            matrix = returns_matrix([series[key].series for key in sorted(series)])
         except ReturnsRejected as rejected:
             named = ", ".join(f"{key} (#{chosen[key].number})" for key in rejected.names)
             stops.append(f"{rejected}\nTrials: {named}")
-    sharpes = {key: session_sharpe(one) for key, one in series.items()}
-    stops.extend(
-        f"{key}: Sharpe ratio {sharpe} over the sample (#{chosen[key].number})"
-        for key, sharpe in sharpes.items()
-        if not math.isfinite(sharpe)
-    )
+    # Each finite: a series whose ratio is not was refused by the one check, by name, above.
+    sharpes = {key: one.sharpe for key, one in series.items()}
     if n < 2:
         stops.append(
             f"N = {n}; the DSR needs N >= 2 ({'; '.join(_named(k, r) for k, r in counted.items())})",
@@ -577,36 +613,55 @@ def rank(study: optuna.Study) -> RankingReport:
 
     values = [sharpes[key] for key in matrix.columns]
     everyone = "; ".join(_named(key, ran_on_sample[key]) for key in matrix.columns)
+    best, worst = max(values), min(values)
+
+    def rounding_at(ratio: float) -> float:
+        """The widest bound among the keys whose Sharpe ratio is `ratio`, whatever their order."""
+        return max(series[key].rounding for key in matrix.columns if sharpes[key] == ratio)
+
+    # Two computed ratios are told apart only when they differ by more than the rounding of both
+    # (ADR 0031, 2026-11-11). Judged on the set, against the highest, so no order of recording
+    # changes the group: a key within rounding of a member but not of the highest is not in it.
+    at_best, at_worst = rounding_at(best), rounding_at(worst)
+    top = [key for key in matrix.columns if best - sharpes[key] <= at_best + series[key].rounding]
+    pick = top[0]  # any of them, once every one is seen to have the same returns
+    unranked = []
+    if any(not np.array_equal(matrix[pick].to_numpy(), matrix[key].to_numpy()) for key in top[1:]):
+        unranked.append(
+            "rank within rounding of each other on returns that differ, so there is no one pick "
+            "(ADR 0031): "
+            + "; ".join(
+                f"{_named(key, ran_on_sample[key])}, Sharpe ratio {sharpes[key]!r} give or take "
+                f"{series[key].rounding:.3g}"
+                for key in top
+            ),
+        )
     v = float(measures.variance(values))
-    if all(math.isclose(value, values[0]) for value in values):
-        raise RankingStopped(
-            _stopped(
-                study,
-                n,
-                [
-                    (
-                        f"V = {v}: every trial has the same Sharpe ratio, {values[0]!r}, within "
-                        "floating-point noise (math.isclose at its default rel_tol, 1e-9; "
-                        f"ADR 0031): {everyone}"
-                    ),
-                ],
-            ),
+    spread = at_best + at_worst
+    if best - worst <= spread:
+        # Read from the ratios: skfolio's variance of equal numbers can round above 0.
+        unranked.append(
+            f"V = 0: the highest Sharpe ratio, {best!r}, and the lowest, {worst!r}, are within "
+            f"rounding of each other ({spread:.3g}), so eq. 1 has no spread to deflate by "
+            f"(ADR 0031): {everyone}",
         )
-    best = max(values)
-    tied = [key for key in matrix.columns if math.isclose(sharpes[key], best)]
-    pick = tied[0]
-    if any(not _same(matrix[pick], matrix[key]) for key in tied[1:]):
-        raise RankingStopped(
-            _stopped(
-                study,
-                n,
-                [
-                    "share the highest Sharpe ratio within floating-point noise, with returns that "
-                    "differ, so there is no one pick (ADR 0031): "
-                    + "; ".join(_named(key, ran_on_sample[key]) for key in tied),
-                ],
-            ),
+    elif not (math.isfinite(v) and v > 0):
+        unranked.append(
+            f"V = {v}: skfolio's variance of the trials' Sharpe ratios is not above 0 and finite "
+            f"(ADR 0031): {everyone}",
         )
+    if unranked:
+        # A series next to the numeric check's threshold has a bound above its own ratio: it is
+        # the cause, since nothing can be told apart from it, and is named as that.
+        unranked.extend(
+            f"{_named(key, ran_on_sample[key])}: its returns barely vary beyond rounding at their "
+            f"own size, so rounding can move its Sharpe ratio, {sharpes[key]!r}, by "
+            f"{series[key].rounding:.3g}, more than the ratio itself, so no trial is told apart "
+            "from it (ADR 0031)"
+            for key in matrix.columns
+            if series[key].rounding >= max(1.0, abs(sharpes[key]))
+        )
+        raise RankingStopped(_stopped(study, n, unranked))
     pick_returns = [float(value) for value in matrix[pick]]
     dsr = float(measures.deflated_sharpe_ratio(pick_returns, values))
     if not math.isfinite(dsr):
@@ -642,8 +697,8 @@ def rank(study: optuna.Study) -> RankingReport:
         first_day=matrix.index[0].date().isoformat(),
         last_day=matrix.index[-1].date().isoformat(),
         pick=pick,
-        tied=tuple(tied[1:]),
-        pick_trials=tuple(sorted(t.number for key in tied for t in ran_on_sample[key])),
+        tied=tuple(top[1:]),
+        pick_trials=tuple(sorted(t.number for key in top for t in ran_on_sample[key])),
         sharpe=sharpes[pick],
         dsr=dsr,
         passed=dsr >= THRESHOLD,
@@ -665,14 +720,15 @@ def _utc(start: datetime) -> str:
     return start.astimezone(UTC).isoformat()
 
 
-def _same(a: pd.Series, b: pd.Series) -> bool:
-    """Whether two columns are equal day by day within the tolerance V uses (ADR 0031).
-
-    Each day's two returns must agree to `math.isclose`'s default `rel_tol` of the larger of them, or
-    of the largest return either column has, so a 0.0 against 1e-19 of rounding counts as equal.
-    """
-    scale = max(abs(float(x)) for x in (*a, *b))
-    return all(math.isclose(x, y, abs_tol=1e-9 * scale) for x, y in zip(a, b, strict=True))
+def _read(key: str, trial: FrozenTrial) -> SessionReturns | ReturnsRejected:
+    """`trial`'s returns on its session days with their Sharpe ratio, as the gate's one check reads
+    them (`canon_trading.returns_matrix.session_returns`), or its refusal, naming `key`."""
+    try:
+        return session_returns(
+            key, trial.user_attrs.get("returns_series"), trial.user_attrs.get("session_days")
+        )
+    except ReturnsRejected as rejection:
+        return rejection
 
 
 def _n_hat(
@@ -705,18 +761,23 @@ def _n_hat(
     return n_hat, dsr, ("; ".join(notes) + ".") if notes else None
 
 
-def _shape_faults(trial: FrozenTrial, sample: Sample) -> list[str]:
-    """How `trial`, a record that ran on `sample`, differs from what `record_trial` writes there.
+def _shape_faults(
+    trial: FrozenTrial, sample: Sample, reading: SessionReturns | ReturnsRejected
+) -> list[str]:
+    """How `trial`, a record that ran on `sample`, differs from what `record_trial` writes there;
+    `reading` is its returns as `_read` read them.
 
     NautilusTrader sets a run's `backtest_start` to the start it was given and its `backtest_end` to
     the engine's clock when the run ends, at or before the end it was given (`run_impl` and
     `end_impl`, `crates/backtest/src/engine.rs` at the pinned commit), so the start must be the
     sample's and the end within it. The returns and session days must fall on the run's own days, from
     the session day of its start to that of its end: a run books nothing after its clock stopped. Their
-    own form is `daily_series`'s to refuse; here only their range. A value told must be the one
+    own form is `session_returns`'s to refuse; here only their range. A value told must be the one
     `record_trial` tells, the per-session Sharpe ratio of the returns the record holds
-    (`canon_trading.ledger.told_sharpe`), within `math.isclose` at its default tolerance; where that is
-    not finite, its returns refused or too short, `record_trial` tells no value, so any value stops.
+    (`canon_trading.ledger.told_sharpe`, which reads it as `reading` was read), within what rounding
+    can move a second computation of it (`SessionReturns.rounding`, the one bound the gate compares
+    ratios by, ADR 0031); where its returns are refused, `record_trial` tells no value, so any
+    value stops.
     """
     attrs = trial.user_attrs
     faults = []
@@ -786,11 +847,17 @@ def _shape_faults(trial: FrozenTrial, sample: Sample) -> list[str]:
         if after:
             faults.append(f"{what} {_day(after[0])}, after its backtest_end ({len(after)} in all)")
     if trial.values is not None:
-        told = told_sharpe(attrs.get("returns_series"), attrs.get("session_days"))
-        if not (math.isfinite(told) and math.isclose(trial.values[0], told)):
+        told = trial.values[0]
+        if isinstance(reading, ReturnsRejected):
             faults.append(
-                f"told {trial.values[0]!r}, not {told!r}, the per-session Sharpe ratio of its "
-                "returns that record_trial tells (it tells none where that is not finite)"
+                f"told {told!r} where record_trial tells no value, its returns being refused "
+                f"({str(reading).removeprefix(f'{attrs.get("config_key")}: ')})"
+            )
+        elif not abs(told - reading.sharpe) <= reading.rounding:  # a NaN told is not within it
+            faults.append(
+                f"told {told!r}, not {reading.sharpe!r}, the per-session Sharpe ratio of its "
+                f"returns that record_trial tells, nor within {reading.rounding:.3g} of it, what "
+                "rounding can move it"
             )
     return faults
 

@@ -58,7 +58,22 @@ What this refuses, and why:
   adapter's worker thread, and alpaca-py sets no HTTP timeout (`canon_alpaca.data`, "Known limits"), so
   a call that never returns still holds the load until the connection ends.
 
-Known limits, set by the adapter and not here: the IEX feed only, Alpaca's default `raw` adjustment
+Feeds (ADR 0055, ADR 0077): `feed` names the bars request's feed, passed through as
+`params={"feed": ...}`, the adapter's own parameter (`canon_alpaca.constants.FEED_PARAM`), one of
+`BARS_FEEDS`; with none, no feed is named and the adapter's default, IEX, is used, as before. The
+catalog keys bars by bar type, not feed (`data/bars/<bar type>/`), so two feeds' bars of one bar type
+in one root would read as one series, and a window one feed covered would never be fetched for the
+other. So each catalog root holds one feed: the file `alpaca-feed` in the root names it, and a load
+naming another feed is refused, by name, before any node is built. No upstream records a feed per
+catalog; the file is this module's. It is written before the request, so a load cut short still
+leaves its feed named, and removed again if the load fails and the root holds no data file. A root
+with data and no such file was filled before the file existed, by this module, which could then load
+IEX only, or by the quote write-back, IEX only (ADR 0066), so it is read as IEX. Limits: the file is
+read and written without a lock, so two loads into one root at once are not kept apart (paper loads run
+one at a time under the paper lock); a root whose file is deleted by hand reads as IEX again; and only
+this module reads the file, so a quote load into a root checks `catalog_feed` itself.
+
+Known limits, set by the adapter and not here: the feed `BARS_FEEDS` allows, Alpaca's default `raw` adjustment
 (alpaca-py sends no `adjustment`, and https://docs.alpaca.markets/us/reference/stockbars.md gives
 "Default: `raw`"), and MINUTE, HOUR, DAY or WEEK bars of `LAST` price from an `EXTERNAL` source.
 Bars inside a covered window are never fetched again, so a bar Alpaca later revises is not picked up
@@ -75,6 +90,10 @@ from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from alpaca.data.enums import DataFeed
+from canon_alpaca.constants import BARS_FEEDS
+from canon_alpaca.constants import FEED
+from canon_alpaca.constants import FEED_PARAM
 from canon_alpaca.constants import VENUE
 from canon_alpaca.data import bar_interval_ns
 from canon_alpaca.factories import AlpacaDataClientFactory
@@ -99,6 +118,32 @@ PUBLICATION_DELAY = timedelta(minutes=15)
 
 DEFAULT_CATALOG = Path("catalog")
 """Upstream's catalog guide builds the path from the working directory; from the repo root this is it."""
+
+_FEEDS = tuple(f.value for f in BARS_FEEDS)
+
+FEED_FILE = "alpaca-feed"
+"""The file in a catalog root that names the one Alpaca feed its data came from (this module's header)."""
+
+
+def _holds_data(path: Path) -> bool:
+    data = path / "data"
+    return data.is_dir() and any(p.is_file() for p in data.rglob("*"))
+
+
+def catalog_feed(catalog_path: Path) -> str | None:
+    """The feed the catalog root at `catalog_path` holds, or `None` for a root that holds no data yet.
+
+    The name in its `FEED_FILE`; with no such file, `FEED` (IEX) if the root holds data, since every
+    load made before the file existed was IEX (this module's header).
+    """
+    path = Path(catalog_path).resolve()
+    marker = path / FEED_FILE
+    if not marker.is_file():
+        return FEED.value if _holds_data(path) else None
+    held = marker.read_text(encoding="ascii").strip()
+    if held not in _FEEDS:
+        raise ValueError(f"{marker} names {held!r}, not one of {', '.join(_FEEDS)}; it is damaged")
+    return held
 
 
 @dataclass(frozen=True)
@@ -139,6 +184,7 @@ class _RequestBars(DataActor):
         super().__init__()
         self.bar_type: BarType | None = None
         self.window: tuple[datetime, datetime] | None = None
+        self.params: dict[str, object] | None = None
         self.request_id: str | None = None
         self.failures: list[str | None] = []
         self.completed = False
@@ -147,12 +193,10 @@ class _RequestBars(DataActor):
         ] = []  # `ts_init` of every bar delivered, from the catalog or Alpaca
 
     def on_start(self) -> None:
-        if self.bar_type is None or self.window is None:
-            raise RuntimeError("the bar type and window are set before the node runs")
+        if self.bar_type is None or self.window is None or self.params is None:
+            raise RuntimeError("the bar type, window and params are set before the node runs")
         start, end = self.window
-        self.request_id = self.request_bars(
-            self.bar_type, start=start, end=end, params={"update_catalog": True}
-        )
+        self.request_id = self.request_bars(self.bar_type, start=start, end=end, params=self.params)
 
     def on_historical_bars(self, bars) -> None:
         self.received.extend(bar.ts_init for bar in bars)
@@ -174,12 +218,14 @@ def load_bars(
     *,
     timeout_secs: float = 120,
     logging: LoggerConfig | None = None,
+    feed: str | DataFeed | None = None,
 ) -> CatalogBars:
     """Load `bar_type`'s bars whose `ts_init` lies in `[start, end]` into the catalog, and report it.
 
     Idempotent: what the catalog already covers is not fetched again. The key pair comes from the
     environment, as the adapter reads it (`canon_alpaca.constants`). `logging` goes to the node; the
-    logging subsystem is process-global (see `canon_trading.backtest.run_backtest`).
+    logging subsystem is process-global (see `canon_trading.backtest.run_backtest`). `feed` names the
+    request's feed, and a root holding another feed's data is refused (this module's header).
     """
     for name, value in (("start", start), ("end", end)):
         if value.tzinfo is None:
@@ -197,8 +243,46 @@ def load_bars(
             "bar not yet formed or published as covered"
         )
 
+    if feed is not None:
+        # A `DataFeed` member is a `str` whose f-string is its name, so it is read as its value.
+        feed = feed.value if isinstance(feed, DataFeed) else feed
+        if feed not in _FEEDS:
+            raise ValueError(f"feed {feed!r} is not one a bars request takes: {', '.join(_FEEDS)}")
+    named = FEED.value if feed is None else feed
     path = Path(catalog_path).resolve()
+    held = catalog_feed(path)
+    if held is not None and held != named:
+        raise ValueError(
+            f"the catalog at {path} holds {held} data and this load is {named}: the catalog keys bars "
+            "by bar type, not feed, so the two would read as one series; give each feed its own root"
+        )
     path.mkdir(parents=True, exist_ok=True)
+    marker = path / FEED_FILE
+    claimed = not marker.is_file()
+    if claimed:
+        marker.write_text(f"{named}\n", encoding="ascii")
+    try:
+        return _load(bar_type, start, end, path, timeout_secs, logging, feed)
+    except BaseException:
+        if claimed:
+            try:
+                if not _holds_data(path):
+                    marker.unlink(missing_ok=True)
+            except OSError:
+                pass  # the file stays, the strict side, and the load's own error is raised
+        raise
+
+
+def _load(
+    bar_type: BarType,
+    start: datetime,
+    end: datetime,
+    path: Path,
+    timeout_secs: float,
+    logging: LoggerConfig | None,
+    feed: str | None,
+) -> CatalogBars:
+    instrument_id = bar_type.instrument_id
     node = LiveNode.build(
         "CANON-CATALOG",
         LiveNodeConfig(
@@ -219,6 +303,7 @@ def load_bars(
     )
     actor = _RequestBars()
     actor.bar_type, actor.window = bar_type, (start, end)
+    actor.params = {"update_catalog": True} | ({} if feed is None else {FEED_PARAM: feed})
     try:
         node.add_actor(actor)
         # A timeout is raised below, once the node is gone: a traceback holding its frame would keep
