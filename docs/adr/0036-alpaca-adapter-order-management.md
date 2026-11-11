@@ -162,3 +162,6 @@ Read 2026-11-10; "raw": fetched with `curl` and read, not summarised. NautilusTr
   `OrderCanceled` from an order it reads canceled (`crates/adapters/bybit/src/execution.rs` at the pin,
   fetched, raw), but only when Alpaca shows no more filled than the node holds, where Bybit does not
   check, since a fill the stream also missed would be lost; the skip names its reason.
+* A second reader after landing, 2026-11-10: the lookups after a 422 on a submit, cancel or replace took
+  only transport errors, so a body alpaca-py cannot build ended the hook without its unknown-outcome log.
+  Reproduced with a test each and fixed: they take `ValueError` and `TypeError` too, as the fill check does.

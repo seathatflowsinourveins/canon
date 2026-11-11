@@ -253,6 +253,16 @@ def release_after(
 type StreamExit = tuple[QuoteTradeStream, BaseException | None]
 
 
+def retrieved(task: asyncio.Future) -> None:
+    """Read a finished task's outcome, so an error it ended with is not left "never retrieved".
+
+    A shielded call whose awaiting hook was cancelled has no other reader: asyncio's own `shield`
+    documents that the inner task goes on, and a task's error nobody reads is reported as "Task
+    exception was never retrieved" when it is collected."""
+    if not task.cancelled():
+        task.exception()
+
+
 async def logged_failure[R](log: Logger, what: str, step: Awaitable[R]) -> R:
     """Await `step`, logging what failed and why before the error propagates: NautilusTrader v2.0.0rc8
     logs a failed connect as "connection failed", a failed disconnect as "Failed to disconnect" and a
@@ -451,12 +461,20 @@ class AlpacaDataClient(MarketDataClient):
             instrument_provider=instrument_provider,
         )
         self._provider = instrument_provider
-        self._historical = historical_client
+        # Clients given here are the caller's: used on every connect, never replaced by ones built from
+        # the environment, and not dropped at disconnect (the adapter guide closes what the adapter
+        # creates in `_connect`). The live fields are set in `_connect` and cleared on disconnect.
+        self._given_historical = historical_client
+        self._given_stream = stream
+        # A given stream serves one connect: alpaca-py's stream keeps its subscriptions and its
+        # websocket between runs, and a run abandoned at a timed-out disconnect may still be using it.
+        self._given_stream_used = False
+        self._historical: BarsClient | None = None
         # Historical requests run concurrently, but alpaca-py's REST client holds one requests.Session,
         # which is not documented as thread-safe, so calls on it are made one at a time. The lock is held
         # on the node's loop, so a waiting request occupies no worker thread. Rebuilt in `_connect`.
         self._historical_lock = asyncio.Lock()
-        self._stream = stream
+        self._stream: QuoteTradeStream | None = None
         self._stream_thread: threading.Thread | None = None
         self._owner_loop: asyncio.AbstractEventLoop | None = None
         self._stopping = False
@@ -475,6 +493,13 @@ class AlpacaDataClient(MarketDataClient):
         self._owner_loop = self.loop
         self._stopping = False
         self._historical_lock = asyncio.Lock()
+        if self._given_stream is not None and self._given_stream_used:
+            raise RuntimeError(
+                "a market data stream given to the constructor serves one connect; build a new client "
+                "to connect again"
+            )
+        self._given_stream_used = self._given_stream is not None
+        self._historical, self._stream = self._given_historical, self._given_stream
         if self._historical is None or self._stream is None:
             api_key, secret_key = credentials_from_env()
             if self._historical is None:
@@ -502,7 +527,8 @@ class AlpacaDataClient(MarketDataClient):
         if thread is not None and self._stream is not None:
             self._stream.stop()
             await join_within(thread, STREAM_JOIN_TIMEOUT_SECS)
-        # Cleared whether or not the thread stopped, so a later connect builds a fresh stream.
+        # Cleared whether or not the thread stopped, so a later connect builds a fresh stream (a given
+        # one serves one connect).
         self._stream_thread = None
         self._stream = None
         self._historical = None
@@ -618,6 +644,7 @@ class AlpacaDataClient(MarketDataClient):
         except BaseException:
             lock.release()
             raise
+        call.add_done_callback(retrieved)  # read if the hook awaiting it was cancelled meanwhile
         return await asyncio.shield(call)
 
     # -- helpers on the node's loop ----------------------------------------------------------------
@@ -648,6 +675,13 @@ class AlpacaDataClient(MarketDataClient):
     def _started_stream(self) -> QuoteTradeStream:
         if self._stream is None or self._owner_loop is None:
             raise RuntimeError("Alpaca data client is not connected")
+        if self._stream_thread is not None and not self._stream_thread.is_alive():
+            # The stream ended by itself (`_on_stream_exit`) and is not restarted (README, "No
+            # restart"): a subscription recorded on it would deliver nothing, so it fails, naming why.
+            raise RuntimeError(
+                "Alpaca stream ended by itself and this client does not restart it; reconnect the "
+                "data client to subscribe again"
+            )
         if self._stream_thread is None:
             self._stream_thread = threading.Thread(
                 target=run_stream,

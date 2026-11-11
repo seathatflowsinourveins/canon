@@ -192,3 +192,17 @@ Read 2026-11-10. "raw" means the page's markdown or source fetched with `curl` a
   one trade ID with two quantities or prices leaves the order's fills to the engine. Alpaca's pages
   neither promise nor rule out a repeated row, paging by `page_token`, "the ID of the end of your current
   page" (`docs/account-activities.md`, fetched, raw): UNVERIFIED.
+* A second reader after landing, 2026-11-10: a fill before a replace, listed under the replaced order, which
+  is not reported, was taken for an outside order's: NautilusTrader made an external order for it, and the
+  node's order lost the fill or start-up failed. Reproduced with a test and fixed: such a fill is reported
+  on the order that replaced it, as the stream applies a fill on a superseded order and as upstream's
+  Binance spot keeps a cancel-replace's superseded venue order IDs bound to the node's order
+  (`OrderBinding`'s `superseded`, `record_order_update_from_fill`,
+  `crates/adapters/binance/src/common/dispatch.rs` at the pin, fetched, raw), only when that order's
+  `filled_qty` (and, with fills of its own listed, its newest `cum_qty`) shows it counts them, since
+  whether a replacement counts the fills before it is UNVERIFIED (ADR 0042); one that counts only its
+  own keeps its own, and the engine infers the rest. A review before landing added the `cum_qty` check,
+  which catches a replacement's unlisted fill that the sum alone would hide.
+* A second reader after landing, 2026-11-10: two tests built two one-share fills of a two-share order,
+  both `cum_qty` 1 and `leaves_qty` 0, which Alpaca cannot list, and asserted the partial reports this
+  record's completeness rule drops. Corrected to fills as Alpaca lists them (`cum_qty` 1 then 2).

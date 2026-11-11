@@ -30,6 +30,7 @@ from typing import Literal
 from zoneinfo import ZoneInfo
 
 import canon_alpaca.data
+import canon_alpaca.factories
 import canon_alpaca.providers
 import pytest
 from alpaca.common.exceptions import APIError
@@ -839,3 +840,105 @@ def test_missing_credentials_fail_the_connect_and_build_no_client(monkeypatch, c
 
     assert built == []
     assert f"set {ENV_API_KEY} and {ENV_SECRET_KEY}" in logged(capfd)
+
+
+def test_a_cancelled_bar_call_whose_worker_fails_later_leaves_no_unretrieved_error(venue) -> None:
+    # As in the execution client: the shielded call goes on after its hook is cancelled, and its later
+    # error must not reach the loop as "never retrieved".
+    import gc
+    import threading
+
+    messages: list[str] = []
+
+    async def body(client) -> None:
+        loop = asyncio.get_running_loop()
+        handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _, context: messages.append(str(context.get("message"))))
+        release = threading.Event()
+
+        def fails_later(request) -> None:
+            release.wait(5)
+            raise OSError("read timed out")
+
+        try:
+            waiting = asyncio.ensure_future(client._one_historical_call(fails_later, None))
+            await asyncio.sleep(0.05)
+            waiting.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiting
+            release.set()
+            await wait_until(lambda: not client._historical_lock.locked())
+            await asyncio.sleep(0.05)
+            gc.collect()
+            await asyncio.sleep(0.05)
+        finally:
+            loop.set_exception_handler(handler)
+
+    run_with_client(body)
+
+    assert not [m for m in messages if "never retrieved" in m], messages
+
+
+def test_subscription_after_the_stream_ended_by_itself_is_refused(venue) -> None:
+    # The client does not restart a stream that ended by itself (README, "No restart"): a later
+    # subscription must fail, naming that, rather than be recorded on a stream that is not running.
+    venue.stream.ends_on_its_own = True
+
+    async def body(client) -> None:
+        await client._subscribe_quotes(command(AAPL))
+        await wait_until(
+            lambda: client._stream_thread is not None and not client._stream_thread.is_alive()
+        )
+        with pytest.raises(RuntimeError, match="ended by itself"):
+            await client._subscribe_trades(command(AAPL))
+        assert client._trade_symbols == set()
+
+    run_with_client(body)
+
+    assert len(venue.stream.run_threads) == 1
+
+
+def test_a_client_given_at_construction_is_kept_across_a_reconnect(venue, monkeypatch) -> None:
+    import functools
+
+    from canon_alpaca.data import AlpacaDataClient
+
+    def refuse(**kwargs: object) -> object:
+        raise AssertionError("built from the environment in place of the given client")
+
+    monkeypatch.setattr(canon_alpaca.data, "StockHistoricalDataClient", refuse)
+    monkeypatch.setattr(
+        canon_alpaca.factories,
+        "AlpacaDataClient",
+        functools.partial(AlpacaDataClient, historical_client=venue.historical),
+    )
+    seen: list = []
+
+    async def body(client) -> None:
+        await client._disconnect()
+        seen.append(client._historical)
+        await client._connect()
+        seen.append(client._historical)
+
+    run_with_client(body)
+
+    assert seen == [None, venue.historical]
+
+
+def test_a_stream_given_at_construction_serves_one_connect(venue, monkeypatch) -> None:
+    import functools
+
+    from canon_alpaca.data import AlpacaDataClient
+
+    monkeypatch.setattr(
+        canon_alpaca.factories,
+        "AlpacaDataClient",
+        functools.partial(AlpacaDataClient, stream=venue.stream),
+    )
+
+    async def body(client) -> None:
+        await client._disconnect()
+        with pytest.raises(RuntimeError, match="serves one connect"):
+            await client._connect()
+
+    run_with_client(body)
