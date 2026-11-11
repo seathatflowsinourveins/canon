@@ -51,11 +51,11 @@ window (`EXTENDED_READY`) until one has passed on paper and the disconnect-hang 
 | Start-up reconciliation | Scoped to the symbol and one minute of history: every run starts only once it has found the account flat, so history can only mislead, and 60 minutes could hold the last window's exit without its entry; open orders and positions are reported however old | The Lighter tutorial's `reconciliation_instrument_ids`; the minute is the adapter's own paper tests' (the tutorial uses 60; the docs' tip leaves it unset) |
 | The node | `LiveNode.builder(...)`, `with_risk_engine_config`, `with_exec_engine_config`, `with_delay_post_stop_secs(5)` | `examples/live/sandbox/exec_tester.py`, the Lighter tutorial |
 | Exit at wind-down and stop, in the session | `market_exit()`, and `manage_stop=True` so `stop()` runs it; `market_exit_reduce_only=False`, `market_exit_time_in_force=DAY` | concepts/strategies, "Market exit" |
-| Start flat, confirm flat | Refuse to start unless flat in the symbol; after the node stops, read Alpaca and fail naming what is left (first, while Alpaca's clock says the session is open, close at market, again while refused; cancel a close that would only queue) | The Lighter tutorial: "Start with a flat target position", "confirm that no orders or positions from the run remain" |
+| Start flat, confirm flat | Refuse to start unless flat in the symbol; after the node stops, read Alpaca and fail naming what is left (each poll for 60 s: cancel every open order the check did not send, again until it is gone; once none is open and while Alpaca's clock says the session is open, close at market, again while held; cancel a close that would only queue) | The Lighter tutorial: "Start with a flat target position", "confirm that no orders or positions from the run remain" |
 | The session | Alpaca's clock and calendar before anything is placed | Alpaca's paper-trading skill: "always check the clock/calendar endpoint" |
 | Bars | One-minute `INTERNAL` bars the data engine builds from trades; the adapter streams none | The data engine's bar aggregation |
 | A position over one share | `PositionCap`, a non-trading strategy in the node (a `DataActor` has no portfolio at the pin): the portfolio's net position every second, `shutdown_system` over one share | No upstream: no setting caps a position, and the trading state is not settable from Python |
-| A window's length and schedule | `minutes` (default 30, at most 60), clipped to the session's end, timed from Alpaca's clock; wind-down 120 s before; 300 s between windows; session and feed (IEX) from configuration; overnight refused until its data is observed | No upstream |
+| A window's length and schedule | `minutes` (default 30, at most 60), clipped to the session's end and to `LONGEST_WINDOW_SECS` (Sharing the account), timed from Alpaca's clock; wind-down 120 s before; 300 s between windows; session and feed (IEX) from configuration; overnight refused until its data is observed | No upstream |
 
 What a window knows at start-up, what is lost between windows, and the averages' warm-up: ADR 0047.
 
@@ -66,7 +66,19 @@ execution-engine settings and the cap, through one builder, `paper_node.alpaca_p
 **Sharing the account.** `paper:session` reads the key pair into its own `env` as `paper:test` does, which
 supersedes ADR 0029's clause "Only `paper:test` puts the items in an environment": now those two tasks do.
 It waits for the same lock (at most 900 s) and holds it for one window. `paper:test` waits up to 3900 s, so
-a test queued behind a window outlasts it.
+a test queued behind a window outlasts it: a window is shortened so that it and its bounded end fit that
+wait. After the window's end come the stop (`STOP_TIMEOUT_SECS`, about 115 s), the last of the node's
+worker calls (`ADAPTER_CALL_SECS`: alpaca-py's request and its three retries at the adapter's timeouts,
+three seconds apart, about 129 s) and the account check (60 s, no call starting after it, then the call in
+flight and one last reading, about 90 s), about 394 s in all (`AFTER_END_SECS`); before its start, 30 s of
+start-up and the first clock read, with alpaca-py's retries, 129 s. So a window runs at most
+3900 - 30 - 129 - 394, `LONGEST_WINDOW_SECS`, 3346 s (about 56 minutes); a `--minutes 60` window runs that
+and its record says so (`shortened`). The timeouts' sums are not wall-clock bounds (the connect timeout
+applies per address tried, the read timeout between bytes, ADR 0039). A window also ends `END_MARGIN_SECS`
+(395 s) before its session: the check's last market close goes out at most about 334 s after the end
+(`LAST_CLOSE_SECS`), and a minute covers skew between Alpaca's clock and the host's, so it is sent while
+the session is open. The same sum with `paper:session`'s 900 s wait for the lock fits its 85-minute
+deadline. A test reads the 3900, the 900 and the 85 minutes from `mise.toml`.
 
 ### Consequences
 
@@ -92,19 +104,43 @@ are set; the window refuses an extended session while `EXTENDED_READY` is off, o
 session when closed, a non-trading day, a SIP feed, over 60 minutes, an account not flat and a start
 inside the gap.
 
-A second reader's review (2026-11-10), each fix first shown by a failing test in the same file: the wait
-for the node's stop had no bound (now `STOP_TIMEOUT_SECS`, about 115 s, the node's own stop bounds and one
-request summed; past it the window is recorded failed, the account still checked, and the process ended);
-the market close after the stop was tried once and keyed on the configured session (now retried each poll
-for at most 60 s once the cancels land, sent only while Alpaca's clock says the session is open, and an
-order left open after the close is canceled); `PositionCap`'s header said the strategies then flatten,
-which upstream's `EmaCross` does not (header and README corrected; the cap sends no order); a limit dropped
-at its timeout was sent again on the next bar (now not until the opposite cross). Code review (`/code-review`,
-high) of those fixes: the process exit keyed on the error type, a Ctrl-C during a hung stop waiting on it, a
-60 s end margin shorter than the stop and the check (now 240 s), a short's buy-back or an equal bar moving
-the dropped signal; then the window's own Alpaca client without the adapter's HTTP timeout, an error after
-an abandoned stop exiting unprinted, and disposal keyed on any abandonment; each shown by a failing test
-and fixed.
+A second reader's review (2026-11-10), each fix first shown by a failing test in the same file: the wait for
+the node's stop had no bound (now `STOP_TIMEOUT_SECS`, about 115 s, the node's own stop bounds and one request
+summed; past it the window is recorded failed, the account still checked, and the process ended); the market
+close after the stop was tried once and keyed on the configured session (now retried each poll for at most 60
+s once the cancels land, sent only while Alpaca's clock says the session is open, and an order left open after
+the close is canceled); `PositionCap`'s header said the strategies then flatten, which upstream's `EmaCross`
+does not (header and README corrected; the cap sends no order); a limit dropped at its timeout was sent again
+on the next bar (now not until the opposite cross). Code review (`/code-review`, high) of those fixes: the
+process exit keyed on the error type, a Ctrl-C during a hung stop waiting on it, a 60 s end margin shorter
+than the stop and the check (then 240 s; now 395 s, below), a short's buy-back or an equal bar moving the
+dropped signal; then the window's own Alpaca client without the adapter's HTTP timeout, an error after an
+abandoned stop exiting unprinted, and disposal keyed on any abandonment; each shown by a failing test and
+fixed.
+
+Two more second readers' reviews (2026-11-10), each fix first shown by a failing test in the same file:
+
+* After an abandoned stop the adapter's shielded REST calls ran on in their worker threads, so an order
+  sent after the check read flat was outside it: the node's loop now runs them in the window's own
+  executor, shut on abandonment, and the check waits for those running (`ADAPTER_CALL_SECS`).
+* The check's 60 s did not bound it: calls before and after its deadline were not counted, and alpaca-py's
+  retries of a 429 or 504 ran outside the deadline and after its clock read (a close sent after the
+  session closed). The window's client now sends each request once, the check repeats each step under one
+  deadline that no call starts after, and the end margin and window length are computed from the bound.
+* An open order was canceled once; one whose cancel failed or did not land stayed working and could fill
+  unattended: every open order the check did not send is now canceled again each poll, its own close left
+  to fill while the session is open.
+* An error from a read, the clock or a cancel (an `APIError` or the adapter's timeout) ended the check at
+  once: each is now recorded and the next poll goes on.
+* A bar crossing the other way while a dropped limit's cancel was pending, or with a short to close, did
+  not clear the dropped signal: the cross is now read on every bar before the strategy's early returns.
+* The test of a close retried after a 403 sent its only close after the cancel had cleared; a test now
+  gets the 403 with no order open, twice.
+
+Code review (`/code-review`, high) of those fixes: the result was the reading from before the last poll's
+close (a flat account recorded not flat), the check's own close was canceled when its answer was lost, the
+start-up reads had lost alpaca-py's retries, and the bounds were stated as wall-clock bounds; each fixed,
+the first three covered by a new test.
 
 On paper, 2026-11-10, after the close: a regular window refused, "the regular session is closed". An
 extended window started at 16:12 New York, before the adapter's extended-hours change was on `main`,
@@ -164,3 +200,11 @@ Read 2026-11-10. "raw": fetched with `curl` and read whole. NautilusTrader files
   config exposes no `manage_stop`, and a market exit is reduce-only by default (fetched, raw).
 * A second reader's review of `main` (2026-11-10), six findings, all reproduced offline and fixed here and
   in ADR 0047, since moved to ADR 0050 (run).
+* alpaca-py 0.45.0 in `.venv`, `common/rest.py` and `common/constants.py`: `RESTClient._request` sends a
+  request answered 429 or 504 again, `DEFAULT_RETRY_ATTEMPTS` 3 times, `DEFAULT_RETRY_WAIT_SECONDS` 3 apart,
+  from the count it keeps at `_retry`; `TradingClient.__init__` passes no `retry_attempts` (`bundled`).
+* Python 3.14's `asyncio` in the toolchain: `set_default_executor` takes a `ThreadPoolExecutor`,
+  `to_thread` runs in the default executor, `Runner.close` waits for it at most 300 s (`THREAD_JOIN_TIMEOUT`);
+  `concurrent.futures`' `shutdown(cancel_futures=True)` and `wait(timeout=...)` (read; a test runs both).
+* Two more second readers' reviews of the window (2026-11-10): six findings, all reproduced offline and
+  fixed above (run).
