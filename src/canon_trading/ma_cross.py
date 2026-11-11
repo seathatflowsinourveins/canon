@@ -29,6 +29,16 @@ Where this differs from upstream's example, and why:
   the instrument's size precision without saying so (observed at v2.0.0rc8: `make_qty(Decimal("1.5"))`
   on an `Equity` gives 2), and `Equity` is whole-share only (concepts/instruments/equity). A size finer
   than the instrument allows is refused in `on_start`.
+* The config refuses a keyword it does not have, with `TypeError` naming it. Upstream's
+  `StrategyConfig.__new__` ignores an unknown keyword, and the `**_kwargs` that lets the base fields
+  through would then keep it without a word, so `fast_perid=5` left `fast_period` at 10. Upstream has no
+  strict option for `StrategyConfig`; its fixed config constructors raise `TypeError` for an unsupported
+  keyword (https://nautilustrader.io/docs/md/latest/concepts/configuration.md, "Unknown-field handling
+  depends on the construction path", read 2026-11-10), which `refuse_unknown_keywords` does for what
+  `**_kwargs` holds beyond the base fields. The base fields are read from `StrategyConfig` by reflection,
+  as `ledger` reads them, so a field upstream adds passes without a change here. Each own field also
+  takes one type (`OWN_FIELDS`), as upstream's fixed constructors type their fields, so
+  `fast_period=3.0` or a `Decimal` size is refused when built, not run as another value or met at start.
 * A missing instrument raises in `on_start`. Upstream's handler example logs and calls `self.stop()`
   there; at v2.0.0rc8 that fails the trader's start with "Invalid state trigger STOPPED ->
   START_COMPLETED" (observed 2026-11-10), so the reason is raised instead and the node's start fails
@@ -45,17 +55,112 @@ Known limits:
 
 from __future__ import annotations
 
+import inspect
+from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 from nautilus_trader.config import StrategyConfig
 from nautilus_trader.indicators import SimpleMovingAverage
+from nautilus_trader.model import BarType
 from nautilus_trader.model import OrderSide
+from nautilus_trader.model import Quantity
 from nautilus_trader.trading import Strategy
 
 if TYPE_CHECKING:
     from nautilus_trader.model import Bar
-    from nautilus_trader.model import BarType
-    from nautilus_trader.model import Quantity
+
+
+BASE_FIELDS: frozenset[str] = frozenset(
+    name for name, _ in inspect.getmembers(StrategyConfig, inspect.isgetsetdescriptor)
+)
+"""The base `StrategyConfig` fields at the pin: the pyo3 getters of the Rust struct."""
+
+
+def refuse_unknown_keywords(config: StrategyConfig, kwargs: Mapping[str, object]) -> None:
+    """Raise `TypeError` naming each keyword in `kwargs` that is not a base field.
+
+    Call it from a `StrategyConfig` subclass's `__init__` with its `**_kwargs`: upstream's `__new__` has
+    read the base fields from them and ignored the rest.
+    """
+    unknown = sorted(set(kwargs) - BASE_FIELDS)
+    if unknown:
+        raise TypeError(
+            f"{type(config).__name__} got an unexpected keyword argument "
+            + ", ".join(repr(name) for name in unknown)
+            + ": NautilusTrader's StrategyConfig would drop it without a word",
+        )
+
+
+OWN_FIELDS: dict[str, type] = {
+    "bar_type": BarType,
+    "trade_size": Quantity,
+    "fast_period": int,
+    "slow_period": int,
+}
+"""`MaCrossConfig`'s own fields and the one type each takes."""
+
+
+def refuse_another_type(
+    config: StrategyConfig,
+    fields: Mapping[str, object],
+    types: Mapping[str, type | tuple[type, ...]],
+    *,
+    after: str = "",
+) -> None:
+    """Raise `TypeError` for a field of `types` whose value in `fields` is not of its type.
+
+    An instance of the type, and a `bool` (an `int` subclass) only where `bool` is the type, so `True`
+    is not a period and a `Decimal` is not a `Quantity`: such a value either runs as another (`3.0` as
+    3, `"False"` as true) or fails only once the strategy starts, and its text form keys it apart from,
+    or together with, the value it runs as. A numpy integer is not an `int` and is refused too. Not the
+    exact type: at the pin a `BarType` is an instance of a variant subclass (observed:
+    `BarType.from_str(...)` is a `Standard`). `after` is added to the message.
+    """
+    for name, expected in types.items():
+        value = fields[name]
+        if not isinstance(value, expected) or (isinstance(value, bool) and expected is not bool):
+            wanted = (
+                " or ".join(t.__name__ for t in expected)
+                if isinstance(expected, tuple)
+                else expected.__name__
+            )
+            raise TypeError(
+                f"{type(config).__name__}'s {name} is {type(value).__name__} {value!r}, "
+                f"where it takes {wanted}{after}",
+            )
+
+
+def refuse_what_cannot_run(
+    fast_period: int, slow_period: int, trade_size: Quantity, *, after: str = ""
+) -> None:
+    """Raise `ValueError` unless 0 < `fast_period` < `slow_period` and `trade_size` is positive."""
+    if not 0 < fast_period < slow_period:
+        raise ValueError(
+            f"MaCross needs 0 < fast_period < slow_period, got {fast_period} and {slow_period}"
+            + after,
+        )
+    if not trade_size.is_positive():
+        raise ValueError(f"MaCross needs a positive trade_size, got {trade_size}{after}")
+
+
+def check_as_built(config: MaCrossConfig) -> None:
+    """Raise unless `config`'s attributes are what `MaCrossConfig` builds: exactly `OWN_FIELDS`.
+
+    `TypeError` for another set of attributes or a value of another type, `ValueError` for values the
+    constructor refuses. `MaCrossConfig` builds no other attribute, so one added since (a base field's
+    name in `vars(config)` shadows nothing the engine reads) is refused rather than read, and so is one
+    changed to what the constructor would not take. A change to another value it would take is not told
+    apart: the config then holds, and is keyed by, that value.
+    """
+    after = ", not as MaCrossConfig builds it"
+    held = {name: value for name, value in vars(config).items() if not name.startswith("_")}
+    if set(held) != set(OWN_FIELDS):
+        raise TypeError(
+            f"{type(config).__name__} holds {sorted(held)}, where MaCrossConfig builds "
+            f"{sorted(OWN_FIELDS)}{after}",
+        )
+    refuse_another_type(config, held, OWN_FIELDS, after=after)
+    refuse_what_cannot_run(config.fast_period, config.slow_period, config.trade_size, after=after)
 
 
 class MaCrossConfig(StrategyConfig):
@@ -63,7 +168,9 @@ class MaCrossConfig(StrategyConfig):
 
     `bar_type` names the bars to subscribe to and, through its instrument ID, the instrument to trade.
     `trade_size` is the quantity of each entry order. `fast_period` and `slow_period` are the lengths, in
-    bars, of the two simple moving averages; their defaults are the ones upstream's example uses.
+    bars, of the two simple moving averages; their defaults are the ones upstream's example uses. Any
+    other keyword must be a base `StrategyConfig` field, and each of the four takes the type `OWN_FIELDS`
+    gives it, or it raises `TypeError` naming it.
     """
 
     def __init__(
@@ -76,12 +183,18 @@ class MaCrossConfig(StrategyConfig):
         **_kwargs: object,
     ) -> None:
         super().__init__()
-        if not 0 < fast_period < slow_period:
-            raise ValueError(
-                f"MaCross needs 0 < fast_period < slow_period, got {fast_period} and {slow_period}",
-            )
-        if not trade_size.is_positive():
-            raise ValueError(f"MaCross needs a positive trade_size, got {trade_size}")
+        refuse_unknown_keywords(self, _kwargs)
+        refuse_another_type(
+            self,
+            {
+                "bar_type": bar_type,
+                "trade_size": trade_size,
+                "fast_period": fast_period,
+                "slow_period": slow_period,
+            },
+            OWN_FIELDS,
+        )
+        refuse_what_cannot_run(fast_period, slow_period, trade_size)
         self.bar_type = bar_type
         self.trade_size = trade_size
         self.fast_period = fast_period

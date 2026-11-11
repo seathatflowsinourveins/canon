@@ -66,6 +66,7 @@ from datetime import timedelta
 from decimal import ROUND_CEILING
 from decimal import ROUND_FLOOR
 from decimal import Decimal
+from types import NoneType
 from typing import TYPE_CHECKING
 from typing import Any
 
@@ -78,6 +79,7 @@ from nautilus_trader.model import TimeInForce
 
 from .ma_cross import MaCross
 from .ma_cross import MaCrossConfig
+from .ma_cross import refuse_another_type
 
 if TYPE_CHECKING:
     from nautilus_trader.common import TimeEvent
@@ -105,7 +107,10 @@ class SessionMaCrossConfig(MaCrossConfig):
     """`MaCrossConfig` plus the session settings described in the module header.
 
     `wind_down_at` is an aware UTC `datetime`. The base fields (`strategy_id`, `order_id_tag`) are given as
-    constructor keywords, as for any `StrategyConfig` subclass at the pin (concepts/strategies).
+    constructor keywords, as for any `StrategyConfig` subclass at the pin (concepts/strategies). Any
+    other keyword reaches `MaCrossConfig`, which raises `TypeError` naming it, and each session setting
+    takes one type (`ma_cross.refuse_another_type`), so `extended_hours="False"` is refused, not run as
+    true.
     """
 
     def __init__(
@@ -128,6 +133,23 @@ class SessionMaCrossConfig(MaCrossConfig):
             fast_period=fast_period,
             slow_period=slow_period,
             **kwargs,
+        )
+        refuse_another_type(
+            self,
+            {
+                "extended_hours": extended_hours,
+                "limit_offset": limit_offset,
+                "limit_timeout_secs": limit_timeout_secs,
+                "wind_down_at": wind_down_at,
+                "warm_up": warm_up,
+            },
+            {
+                "extended_hours": bool,
+                "limit_offset": Decimal,
+                "limit_timeout_secs": int,
+                "wind_down_at": (datetime, NoneType),
+                "warm_up": bool,
+            },
         )
         if limit_offset < 0 or limit_offset != limit_offset.quantize(CENT):
             raise ValueError(
