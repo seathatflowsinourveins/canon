@@ -69,15 +69,19 @@ It waits for the same lock (at most 900 s) and holds it for one window. `paper:t
 a test queued behind a window outlasts it: a window is shortened so that it and its bounded end fit that
 wait. After the window's end come the stop (`STOP_TIMEOUT_SECS`, about 115 s), the last of the node's
 worker calls (`ADAPTER_CALL_SECS`: alpaca-py's request and its three retries at the adapter's timeouts,
-three seconds apart, about 129 s) and the account check (60 s, no call starting after it, then the call in
-flight and one last reading, about 90 s), about 394 s in all (`AFTER_END_SECS`); before its start, 30 s of
-start-up and the first clock read, with alpaca-py's retries, 129 s. So a window runs at most
-3900 - 30 - 129 - 394, `LONGEST_WINDOW_SECS`, 3346 s (about 56 minutes); a `--minutes 60` window runs that
-and its record says so (`shortened`). The timeouts' sums are not wall-clock bounds (the connect timeout
-applies per address tried, the read timeout between bytes, ADR 0039). A window also ends `END_MARGIN_SECS`
-(395 s) before its session: the check's last market close goes out at most about 334 s after the end
-(`LAST_CLOSE_SECS`), and a minute covers skew between Alpaca's clock and the host's, so it is sent while
-the session is open. The same sum with `paper:session`'s 900 s wait for the lock fits its 105-minute
+three seconds apart, about 129 s) and the account check (60 s in which polls start; the poll begun
+before its end runs on, two reads, the clock and a cancel of each of up to two orders; then a last
+reading, the clock and a cancel of what it shows; about 360 s), about 605 s in all (`AFTER_END_SECS`); before its
+start, 30 s of start-up and the first clock read, with alpaca-py's retries, 129 s; and the window is timed
+on the host's clock, which may run 60 s behind Alpaca's (`SKEW_SECS`). So a window runs at most
+3900 - 30 - 129 - 60 - 605, `LONGEST_WINDOW_SECS`, 3076 s (about 51 minutes); a `--minutes 60` window runs
+that and its record says so (`shortened`). The reads after the clock read are inside the window, whose end
+is absolute, and a window whose start-up reads leave too little of it is skipped. Not counted: in each
+reading, one request for each order in doubt and one for a lost close's search, which only a lost answer
+brings. The timeouts' sums are not wall-clock bounds (the connect timeout applies per address tried, the read timeout
+between bytes, ADR 0039). A window also ends `END_MARGIN_SECS` (455 s) before its session: the check's last
+market close goes out at most about 394 s after the end (`LAST_CLOSE_SECS`), and a minute covers the skew,
+so it is sent while the session is open. The same sum with `paper:session`'s 900 s wait for the lock fits its 105-minute
 deadline. A test reads the 3900, the 900 and the 105 minutes from `mise.toml`.
 
 ### Consequences
@@ -113,7 +117,7 @@ the close is canceled); `PositionCap`'s header said the strategies then flatten,
 does not (header and README corrected; the cap sends no order); a limit dropped at its timeout was sent again
 on the next bar (now not until the opposite cross). Code review (`/code-review`, high) of those fixes: the
 process exit keyed on the error type, a Ctrl-C during a hung stop waiting on it, a 60 s end margin shorter
-than the stop and the check (then 240 s; now 395 s, below), a short's buy-back or an equal bar moving the
+than the stop and the check (then 240 s; now 455 s, above), a short's buy-back or an equal bar moving the
 dropped signal; then the window's own Alpaca client without the adapter's HTTP timeout, an error after an
 abandoned stop exiting unprinted, and disposal keyed on any abandonment; each shown by a failing test and
 fixed.
@@ -209,6 +213,37 @@ node's disposal, the record named the node's own rejection as Alpaca's, the node
 (`NOT_FOUND_AT_VENUE`) was missed, and the docstring trailed the code; each fixed, the first three and the
 sixth covered by a new test.
 
+Four further independent reviews of the check (2026-11-10), each fix first shown by a failing test in the
+same file unless named otherwise:
+
+* The time left was judged before the start-up reads, so a window could start after its own end: it is
+  judged again after them, and the window skipped if too little is left.
+* At full request timeouts the 60 s ended before a close was sent: the deadline now gates the start of a
+  poll, and a poll begun before it runs to its end, its close or cancels included.
+* The lock's arithmetic left 0.4 s for a host clock behind Alpaca's, counted the close's own call nowhere,
+  and its tests asserted the constants' own definitions: the bound counts the skew and a full poll, and a
+  test measures the check against it.
+* An order first seen in the reading after the deadline was never canceled: as the check ends, every
+  order the last reading shows that the check did not send is canceled, and its own close too once
+  Alpaca's clock says the session has closed (in the session it is left to fill).
+* A heartbeat or record that could not be written replaced a refusal's own message: the refusal is said
+  first.
+* Once the session had closed, the cancels of the check's own closes had no per-order guard: every cancel
+  now goes through one guarded step (no test of its own).
+* A worker call still running after a clean stop was waited for twice, and the branch for a node that
+  ended with its own error closed the runner with Python's 300 s wait: one wait, from the first shutdown,
+  serves both, and that branch closes as after a clean stop.
+* The reads after the clock were counted as adding to the lock's hold; they are inside the window's
+  absolute end (a test shows the end the node is given). A blocked worker after a clean stop ends the
+  process with the window recorded failed, and an order in doubt that Alpaca marks `done_for_day` is
+  canceled as working (Alpaca: such an order "may be canceled through the API up until" filled, canceled
+  or expired): both shown by a test that passes before and after.
+
+Code review (`/code-review`, high) of those fixes: the final cancels took the check's own close, still to
+fill in the session; the scheduled run's clock read was timed after its calendar read; a refusal whose
+heartbeat failed lost its record; a failed last reading canceled again what had just been canceled; the
+header and the bounds' notes trailed the code; each fixed, the first three covered by a new test.
+
 On paper, 2026-11-10, after the close: a regular window refused, "the regular session is closed". An
 extended window started at 16:12 New York, before the adapter's extended-hours change was on `main`,
 against the condition for extended runs; the gate above now refuses that. The cap stopped it at its first
@@ -297,3 +332,8 @@ Read 2026-11-10. "raw": fetched with `curl` and read whole. NautilusTrader files
   `GetOrdersRequest.after`: "only ones submitted after this timestamp" (`bundled`).
 * Two independent reviews of the fixes as landed (2026-11-10): five findings, reproduced offline and
   fixed above (run).
+* https://docs.alpaca.markets/us/docs/orders-at-alpaca.md, "Order Lifecycle": the statuses after which
+  "no further updates will occur", and "An order may be canceled through the API up until the point it
+  reaches a state of either `filled`, `canceled`, or `expired`" (fetched, raw).
+* Four further independent reviews of the check (2026-11-10): their findings reproduced offline and fixed
+  above, or shown not to hold (run).

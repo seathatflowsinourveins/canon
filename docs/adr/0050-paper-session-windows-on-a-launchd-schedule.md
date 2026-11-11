@@ -35,7 +35,7 @@ bounded windows; each part below follows the upstream named:
 | What fires | A second launchd user agent, `local.canon.paper-session`, installed, reported and removed by `scripts/automation` beside the lane watchdog; every 2100 s, not at load; a firing while the job still runs or the Mac sleeps is missed (launchd.plist(5)) | ADR 0011's launchd agent |
 | What runs | `~/.claude/canon/paper-session.sh` makes its own clone, `~/.claude/canon/paper-checkout`, anew at each firing from the `main` the origin has then, detached, keeping only `.venv`, or fails the firing, then runs `mise run paper:session --session auto --minutes 25` there: one window, one node, one process, disposed, its records naming the commit. 25 minutes, with about three of start-up and stop (a regular stop waits its 65 s post-stop delay; an estimate, UNVERIFIED until a window has run), leaves the 300 s gap inside 35 | configure_live_trading: "run nodes as standalone Python scripts or services"; "One LiveNode per process"; actions/checkout's path for a directory it does not reuse (the runner's header) |
 | Which session | `auto` takes the regular session when Alpaca's clock says it is open (`is_open`, which is false on weekends and holidays; UNVERIFIED, the clock page says only "Whether or not the market is open"), the extended one when `EXTENDED_READY` and it is open, and otherwise prints "nothing to run" and exits 0 | Alpaca's paper-trading skill: "always check the clock/calendar endpoint" |
-| A window that dies | It writes `latest.json` as `running` before the node is built and `ok` or `failed: <why>` after, the account check included; a refusal someone must look at (account not flat) is `refused: <why>`, while a skip that clears by itself (the gap, under 515 s of session left) exits 0 and keeps the last result. A `running` record past its `stale_after` (70 minutes) is a window that died | No upstream |
+| A window that dies | It writes `latest.json` as `running` before the node is built and `ok` or `failed: <why>` after, the account check included; a refusal someone must look at (account not flat) is `refused: <why>`, while a skip that clears by itself (the gap, under 575 s of session left, or start-up reads that left too little of the window) exits 0 and keeps the last result. A `running` record past its `stale_after` (70 minutes) is a window that died | No upstream |
 | Status | `scripts/automation status`'s `paper session` row: the last window, its result, age and leftovers; FAILED when the last firing exited non-zero or was stopped by a signal (`launchctl list`); DIED, too, for a `running` record older than a later run's heartbeat (that run held the lock); STALE when the runner's own stamp, `scheduled-firing.json`, written as each scheduled firing starts, is older than the longest firing (its fetch bound, the 105-minute task timeout and 300 s for mise's start) plus an interval and 300 s, since launchd misses the intervals a firing runs through; not ok when the stamp or heartbeat is missing or unreadable, or the installed runner is not the tree's. A check only makes the label worse. A run by hand writes to `by-hand/`, which the row does not read | ADR 0011's status rows |
 
 Installing it is the owner's step: `scripts/automation install`. Whether the agent's `mise run` reads the
@@ -49,8 +49,8 @@ login keychain without a dialog is UNVERIFIED until its first firing. A firing w
   (ADR 0044). A window refused for an account that is not flat stays refused until someone clears it. A
   node that hangs on stop (ADR 0044's disconnect hang) is waited for at most `STOP_TIMEOUT_SECS` (about
   115 s); the window is then recorded failed, the node's last worker calls waited for (at most about
-  129 s), the account checked (at most `AFTER_STOP_SECS`, 60 s, and three requests), and the process ended
-  (ADR 0044).
+  129 s), the account checked (polls start for `AFTER_STOP_SECS`, 60 s, and the last runs on), and the
+  process ended (ADR 0044).
 * Bad: the clone's kept `.venv` is trusted local state, as a person's checkout's is: `--exact` removes
   extraneous packages but not other files (a loose `.pth` still ran, observed), and uv documents no check
   of files outside its packages. Nothing else is kept: the clone, its `.git` and worktree are new each firing.
@@ -61,8 +61,8 @@ login keychain without a dialog is UNVERIFIED until its first firing. A firing w
   lock wait (900), a start-up allowance (600: uv's sync after a uv.lock change measured 8 s from an empty
   cache, 464 MB), four Alpaca calls before the node at their longest with alpaca-py's retries (4 x
   `ADAPTER_CALL_SECS`, 517), a host clock behind Alpaca's (`SKEW_SECS`, 60), the longest window
-  (`LONGEST_WINDOW_SECS`, 3346) and its bounded end (`AFTER_END_SECS`, 394): 5817, 423 s spare (482 s with
-  the 3106 and 575 the window's next change gives); a test reads those bounds from `session_window`. From a
+  (`LONGEST_WINDOW_SECS`, 3076) and its bounded end (`AFTER_END_SECS`, 605): 5758, 482 s spare; a test
+  reads those bounds from `session_window`. From a
   person's terminal uv runs as before, with mise's `timeout` as the deadline: through timeout(1) one Ctrl-C
   reached Python twice (observed), which could cut a flatten short. A window run as it should holds the lock under
   paper:test's 3900 s wait (ADR 0044); one that hangs holds it to the deadline, past the 70 minutes after

@@ -28,7 +28,7 @@ Contract: NautilusTrader v2.0.0rc8's `LiveNode.builder`, `LiveExecutionEngineCon
 What one window is (one node, one process): the configured session and feed, checked against Alpaca's
 clock and calendar before anything starts; the paper account holding no open order and no position in the
 symbol; at least `GAP_SECS` since the last window ended; then the node runs for `minutes` (default 30, at
-most 60), clipped to the session's end and to `LONGEST_WINDOW_SECS` (about 56 minutes, so a paper test
+most 60), clipped to the session's end and to `LONGEST_WINDOW_SECS` (about 51 minutes, so a paper test
 waiting for the lock outlasts the window and its bounded end), the record saying so when it is. The strategy winds down `FLATTEN_SECS` before the end, the node
 stops, and the account is checked: no open order, no position. The wait for the stop is bounded by
 `STOP_TIMEOUT_SECS`, the node's own stop bounds summed; past it the window is recorded failed, the
@@ -43,7 +43,8 @@ Two departures from upstream bound that check. In it, the window's alpaca-py cli
 (`_retry = 0`, the attribute `RESTClient` keeps its retry count in; the constructor cannot set 0): alpaca-py
 would repeat a 429 or 504 for up to `ADAPTER_CALL_SECS`, outside the check's deadline and after its reading
 of Alpaca's clock, so a market close could go out after the session closed. The check repeats each step
-itself, every poll, under one deadline that no call starts after. And the node's loop runs its worker
+itself, every poll, under one deadline that no poll starts after (a poll begun before it runs to its end,
+within the counted bound). And the node's loop runs its worker
 calls in an executor of the window's own (`Calls`): after an abandoned stop no new call can start in it,
 and the check waits, at most `ADAPTER_CALL_SECS`, for the ones the adapter left running (its `_call` is
 shielded), so an order one of them sends is in the account before the check reads it. The run's node log and a
@@ -120,7 +121,6 @@ from .session_ma_cross import SessionMaCross
 from .session_ma_cross import SessionMaCrossConfig
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
     from collections.abc import Sequence
 
 NEW_YORK = ZoneInfo("America/New_York")
@@ -175,9 +175,8 @@ STOP_TIMEOUT_SECS = (
 the node's own stop bounds (`paper_node`), and one Alpaca request at the adapter's timeouts (ADR 0039),
 which a call in flight at the disconnect can outlast it by."""
 AFTER_STOP_SECS = 60
-"""How long the account check after the stop works at clearing the account: no call starts after it but a
-last reading, so the check ends within this and three requests (`REQUEST_SECS`): the one in flight, and
-the last reading's two."""
+"""How long the account check after the stop starts polls: a poll begun before it runs to its end, then a
+last reading and a cancel of what it shows (`AFTER_END_SECS`)."""
 REQUEST_SECS = CONNECT_TIMEOUT_SECS + READ_TIMEOUT_SECS
 """One request at the adapter's timeouts (ADR 0039), sent once, as the account check sends it. The two
 timeouts' sum, not a wall-clock bound: the connect timeout applies per address tried and the read timeout
@@ -189,12 +188,25 @@ ADAPTER_CALL_SECS = (
 """One adapter REST call at its longest (about 129 s): alpaca-py's first request and its retries, each at
 the adapter's timeouts, and the waits between them. A stream call the node runs in a worker thread has no
 such bound; one still running after this is recorded and the check goes on."""
-LAST_CLOSE_SECS = STOP_TIMEOUT_SECS + ADAPTER_CALL_SECS + AFTER_STOP_SECS + REQUEST_SECS
-"""From a window's end until the account check's last market close is sent, at most (about 334 s): the
-stop at its bound, the node's last worker calls, and the check's deadline with the clock read in flight."""
-AFTER_END_SECS = LAST_CLOSE_SECS + 2 * REQUEST_SECS
-"""From a window's end until its process is done with Alpaca, at most (about 394 s): to the last close, then
-that call and the check's last reading."""
+LAST_CLOSE_SECS = STOP_TIMEOUT_SECS + ADAPTER_CALL_SECS + AFTER_STOP_SECS + 3 * REQUEST_SECS
+"""From a window's end until the account check's last market close is sent, at most (about 394 s): the
+stop at its bound, the node's last worker calls, and the check's deadline with the poll begun before it,
+its two reads and the clock read. Not counted: one request in that poll for each node order in doubt and
+one for a lost close's search, which only a lost answer brings."""
+FINAL_CANCELS = 2
+"""The orders a reading of the check can show, counted in its bound: the strategy's one and the check's
+close."""
+AFTER_END_SECS = (
+    STOP_TIMEOUT_SECS
+    + ADAPTER_CALL_SECS
+    + AFTER_STOP_SECS
+    + 2 * (2 + 1 + FINAL_CANCELS) * REQUEST_SECS
+)
+"""From a window's end until its process is done with Alpaca, at most (about 605 s): the stop, the node's
+last worker calls, the check's deadline, the poll begun before it at its longest (two reads, the clock, a
+cancel of each order: no fewer than its close), then the last reading, the clock and a cancel of each order
+it shows. Not counted: in each reading, one request for each node order in doubt and one for a lost
+close's search, which only a lost answer brings."""
 SKEW_SECS = 60
 """How far this host's clock may be from Alpaca's: the window runs to an end taken from Alpaca's clock, timed
 on this host's."""
@@ -207,11 +219,12 @@ there, so the two cannot drift)."""
 START_UP_SECS = 30
 """The process's start before Alpaca's clock is first read (`uv run`, the imports)."""
 LONGEST_WINDOW_SECS = math.floor(
-    PAPER_LOCK_WAIT_SECS - START_UP_SECS - ADAPTER_CALL_SECS - AFTER_END_SECS
+    PAPER_LOCK_WAIT_SECS - START_UP_SECS - ADAPTER_CALL_SECS - SKEW_SECS - AFTER_END_SECS
 )
-"""The longest a window runs (about 56 minutes): a paper test queued behind it gets the lock within its
+"""The longest a window runs (about 51 minutes): a paper test queued behind it gets the lock within its
 wait, after the start-up, the first clock read (with alpaca-py's retries, `ADAPTER_CALL_SECS`), the window
-and its bounded end (`AFTER_END_SECS`)."""
+timed on a host clock up to `SKEW_SECS` behind Alpaca's, and its bounded end (`AFTER_END_SECS`). The reads
+after the clock read are inside the window, whose end is absolute."""
 
 
 def default_log_dir() -> Path:
@@ -569,15 +582,20 @@ def run_window(
     *,
     trading: TradingClient | None = None,
     market: tuple[AlpacaClock, AlpacaCalendar | None] | None = None,
+    market_read_at: float | None = None,
 ) -> WindowReport:
     """Run one window as the module header describes; raise if it cannot start or is not left flat.
-    `trading` and `market` (the clock and calendar) are read here unless the caller already has them."""
+    `trading` and `market` (the clock and calendar) are read here unless the caller already has them, in
+    which case `market_read_at` is the `time.monotonic()` just before the caller read the clock."""
     config.log_dir.mkdir(parents=True, exist_ok=True)
     marker = config.log_dir / "last-window-end"
     # Dated by when it was written, so a marker cut short by a kill still counts.
     if marker.exists() and time.time() - marker.stat().st_mtime < GAP_SECS:
         raise WindowSkipped(f"the last window ended under {GAP_SECS} s ago")
     trading = trading or paper_trading()
+    read_at = (
+        market_read_at if market is not None and market_read_at is not None else time.monotonic()
+    )
     clock, calendar = market or session_now(trading)
     try:
         end_of_session = session_end(config, clock, calendar)
@@ -594,6 +612,9 @@ def run_window(
         raise WindowSkipped(f"under {FLATTEN_SECS + END_MARGIN_SECS} s left in the session")
     # Absolute times, taken from Alpaca's clock: start-up eats into the window, not into the wind-down.
     ends = clock.timestamp.astimezone(UTC) + timedelta(seconds=seconds)
+    seconds -= time.monotonic() - read_at  # what the reads since the clock read have left
+    if seconds <= FLATTEN_SECS + 1:
+        raise WindowSkipped(f"the start-up reads left under {FLATTEN_SECS + 1} s of the window")
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     report = WindowReport(
         config.session, config.symbol, started=stamp, planned_seconds=seconds, shortened=shortened
@@ -693,7 +714,11 @@ def in_doubt(orders: dict[str, list[str]]) -> list[str]:
 
 
 TERMINAL = frozenset({"filled", "canceled", "expired", "rejected", "replaced"})
-"""Alpaca order statuses after which an order works no more (alpaca-py 0.45.0, `OrderStatus`)."""
+"""Alpaca order statuses after which an order works no more: "no further updates will occur" for the
+first four, and a replaced one goes on as another order (orders-at-alpaca, "Order Lifecycle"). Every
+other status, `done_for_day`, `stopped`, `suspended` and `calculated` among them, can still be updated,
+and an order "may be canceled through the API up until" filled, canceled or expired, so the check cancels
+it as working."""
 
 
 def _value(field: object) -> str:
@@ -726,8 +751,9 @@ def _flatten_after_stop(
 ) -> list:
     """What the account holds in the symbol after the stop, once the check has worked at clearing it.
 
-    Each `POLL_SECS` until `AFTER_STOP_SECS` have gone, no call starting after that: read the open orders
-    and the position, and if both are clear, stop. An open order the check did not send is canceled, on
+    A poll each `POLL_SECS`, none starting once `AFTER_STOP_SECS` have gone; a poll begun before runs to its
+    end, so slow reads cannot leave it without its cancel or close (`AFTER_END_SECS` counts one such poll
+    past the deadline): read the open orders and the position, and if both are clear, stop. An open order the check did not send is canceled, on
     every poll until it is gone, in any session; with one open no close is sent (a held order keeps its
     shares from a close, which Alpaca refuses with a 403). With none open, a position still held is closed
     at market if Alpaca's clock, read just before, says the regular session is open, and closed again on
@@ -745,16 +771,12 @@ def _flatten_after_stop(
     order is canceled.
     Each node order `in_doubt` is looked up by its client order ID (`get_order_by_client_id`) each poll
     until Alpaca holds it, and the account is not flat while one is not found; one never found is named
-    in the result. The result is a reading taken after the check's last cancel or close (one more read,
+    in the result. Every order the last reading shows is canceled as the check ends, so nothing the window
+    knows of is left working once its process has gone (it is still named in the result). The result is a reading taken after the check's last cancel or close (one more read,
     past the deadline, if the last poll sent one); if no reading succeeded, `RuntimeError`."""
     symbol = config.symbol
     send_once(trading)
     deadline = time.monotonic() + AFTER_STOP_SECS
-
-    def call[R](fn: Callable[..., R], *args: object) -> R:
-        if time.monotonic() >= deadline:
-            raise _OutOfTime
-        return fn(*args)
 
     known: set[str] = set()
     sent: set[str] = set()
@@ -765,8 +787,17 @@ def _flatten_after_stop(
     node_orders = set(node_ids) | set(in_doubt)  # the node's own: never the check's close
     doubtful = list(in_doubt)
     seen: list[str] | None = None
-    acted = False  # whether a cancel or close was attempted after the last reading
+    acted = False  # whether a cancel or close was sent after the last reading
+    last: list = []  # the open orders of the last reading
     last_error = ""
+
+    def cancel(order, when: str = "") -> None:
+        nonlocal acted
+        acted = True
+        try:
+            trading.cancel_order_by_id(order.id)
+        except (APIError, OSError) as e:  # it filled or ended meanwhile
+            _note(report, f"canceling {order.client_order_id}{when}: {e}")
 
     def lose(held: Decimal, attempt: tuple[set[str], datetime]) -> None:
         """A close whose answer was lost: what it closed, and when, to know it again."""
@@ -774,7 +805,7 @@ def _flatten_after_stop(
         lost_close, unseen = held, 0
         before_close, lost_since = attempt
 
-    def find_lost_close(working: list, caller) -> None:
+    def find_lost_close(working: list) -> None:
         """Take the lost close from the open orders, else from every order since it was sent."""
         nonlocal lost_close, unseen
         for order in working:
@@ -785,7 +816,7 @@ def _flatten_after_stop(
                     lost_close = None
         if lost_close is None or lost_since is None:
             return
-        for order in caller(_orders_since, trading, symbol, lost_since):
+        for order in _orders_since(trading, symbol, lost_since):
             if str(order.id) not in before_close and _is_the_close(order, lost_close, node_orders):
                 sent.add(str(order.id))
                 known.add(str(order.id))
@@ -793,43 +824,38 @@ def _flatten_after_stop(
                 return
         unseen += 1
 
-    while True:
+    found: list = []
+    while time.monotonic() < deadline:  # a poll begun before the deadline runs to its end
         try:
-            found = _look_up(
-                call, trading, doubtful, report
-            )  # before the reads, so one found is in them
-            working = call(open_orders, trading, symbol)
+            # before the reads, so one found is in them
+            found = _look_up(trading, doubtful, report)
+            working = open_orders(trading, symbol)
             listed = {str(o.id) for o in working}
             working += [o for o in found if str(o.id) not in listed]  # held, if not yet listed
-            held = call(position_qty, trading, symbol)
-            find_lost_close(working, call)
+            held = position_qty(trading, symbol)
+            find_lost_close(working)
             seen = (
                 described(working, held, symbol)
                 + _unfound(doubtful, found)
                 + _lost(lost_close, symbol)
             )
-            acted = False
+            last, acted = working, False
             if not seen:
                 return seen
             if others := [o for o in working if str(o.id) not in sent]:
                 for order in others:
-                    acted = True
-                    try:
-                        call(trading.cancel_order_by_id, order.id)
-                    except (APIError, OSError) as e:  # it filled or ended meanwhile
-                        _note(report, f"canceling {order.client_order_id}: {e}")
+                    cancel(order)
             elif working:  # only closes this check sent
-                if not call(_regular_session_open, trading):
+                if not _regular_session_open(trading):
                     for order in working:
-                        acted = True
-                        call(trading.cancel_order_by_id, order.id)
+                        cancel(order)
             elif held and lost_close is not None and unseen < LOST_CLOSE_SEARCHES:
                 pass  # a close whose answer was lost may still be taken: look for it before another
-            elif held and call(_regular_session_open, trading):
+            elif held and _regular_session_open(trading):
                 acted = True
                 attempt = (set(known), datetime.now(UTC) - timedelta(seconds=SKEW_SECS))
                 try:
-                    close_order = call(trading.close_position, symbol)
+                    close_order = trading.close_position(symbol)
                 except APIError as e:
                     if e.status_code not in CLOSE_REFUSALS:  # it may have reached Alpaca
                         lose(held, attempt)
@@ -852,8 +878,6 @@ def _flatten_after_stop(
                     "so a market close would only queue",
                 )
                 break
-        except _OutOfTime:
-            break
         except (APIError, OSError) as e:
             last_error = f"{type(e).__name__}: {e}"
             _note(report, f"checking the account after the stop: {last_error}")
@@ -870,14 +894,28 @@ def _flatten_after_stop(
             working = open_orders(trading, symbol)
             listed = {str(o.id) for o in working}
             working += [o for o in found if str(o.id) not in listed]
-            find_lost_close(working, lambda fn, *args: fn(*args))
+            find_lost_close(working)
             seen = (
                 described(working, position_qty(trading, symbol), symbol)
                 + _unfound(doubtful, found)
                 + _lost(lost_close, symbol)
             )
+            last = working
         except (APIError, OSError) as e:
             _note(report, f"reading the account after the last step: {type(e).__name__}: {e}")
+            last = []  # its orders were just acted on; nothing newer is known
+    # The process is ending: leave nothing working that the check did not send, nor, once the session is
+    # closed, a close of its own (it would only queue); one of its own closes is left to fill in the session.
+    others = [o for o in last if str(o.id) not in sent]
+    own = [o for o in last if str(o.id) in sent]
+    try:
+        if own and not _regular_session_open(trading):
+            others += own
+    except (APIError, OSError) as e:
+        _note(report, f"reading Alpaca's clock as the check ends: {type(e).__name__}: {e}")
+        others += own  # the session may have closed: nothing is left to queue
+    for order in others:
+        cancel(order, " as the check ends")
     return seen
 
 
@@ -889,7 +927,7 @@ CLOSE_REFUSALS = frozenset({403, 422})
 `DEFINITIVE_SUBMIT_REFUSALS`, from "Create an Order"); after any other failure a close may have been placed."""
 
 
-def _look_up(call, trading: TradingClient, doubtful: list[str], report: WindowReport) -> list:
+def _look_up(trading: TradingClient, doubtful: list[str], report: WindowReport) -> list:
     """Look each order in doubt up by its client order ID; one Alpaca holds is no longer in doubt once its
     status is terminal, and is returned while it is not, to be taken as working. Alpaca's 404 for an ID
     it does not hold, as the adapter's `_refused` reads it, is UNVERIFIED against its documentation; any
@@ -897,7 +935,7 @@ def _look_up(call, trading: TradingClient, doubtful: list[str], report: WindowRe
     found = []
     for client_order_id in list(doubtful):
         try:
-            order = call(trading.get_order_by_client_id, client_order_id)
+            order = trading.get_order_by_client_id(client_order_id)
         except APIError as e:
             if e.status_code != 404:
                 _note(report, f"looking up {client_order_id}: {e}")
@@ -942,10 +980,6 @@ def _unfound(doubtful: list[str], found: list) -> list[str]:
     ]
 
 
-class _OutOfTime(Exception):
-    """The account check's deadline has passed: no call starts after it."""
-
-
 def _note(report: WindowReport, error: str) -> None:
     if error not in report.errors:
         report.errors.append(error)
@@ -964,6 +998,22 @@ class Calls(ThreadPoolExecutor):
     def __init__(self) -> None:
         super().__init__(thread_name_prefix="canon-window-call")
         self.futures: set[Future] = set()
+        self.until: float | None = None
+        """When the wait for the calls running at the shutdown ends: one `ADAPTER_CALL_SECS` from it."""
+
+    def shut(self) -> None:
+        """No new call starts; the wait for those running ends one `ADAPTER_CALL_SECS` from now, however
+        many times it is waited on."""
+        self.shutdown(wait=False, cancel_futures=True)
+        if self.until is None:
+            self.until = time.monotonic() + ADAPTER_CALL_SECS
+
+    def settle(self) -> set[Future]:
+        """Wait for the running calls until `until`; return those still running."""
+        self.shut()
+        assert self.until is not None
+        left = max(0.0, self.until - time.monotonic())
+        return set(wait(self.running(), timeout=left).not_done) if self.running() else set()
 
     def submit(self, fn, /, *args, **kwargs) -> Future:
         future = super().submit(fn, *args, **kwargs)
@@ -976,10 +1026,11 @@ class Calls(ThreadPoolExecutor):
 
 
 def _wait_for_calls(abandoned: list, report: WindowReport) -> None:
-    """Wait, at most `ADAPTER_CALL_SECS`, for the worker calls an abandoned node left running, so an
-    order one of them sends is in the account before the check reads it; record any still running."""
-    running = set().union(*(calls.running() for _, _, calls in abandoned))
-    if running and (still := wait(running, timeout=ADAPTER_CALL_SECS).not_done):
+    """Wait for the worker calls an abandoned node left running, at most `ADAPTER_CALL_SECS` from the
+    abandonment (not again if `_run_node` waited already), so an order one of them sends is in the
+    account before the check reads it; record any still running."""
+    still = set().union(*(calls.settle() for _, _, calls in abandoned))
+    if still:
         report.errors.append(
             f"{len(still)} call(s) of the abandoned node still running after {ADAPTER_CALL_SECS:g} s"
         )
@@ -998,20 +1049,16 @@ def _run_node(node: LiveNode, ends: datetime) -> None:
     except BaseException:
         if started and not started[0].done():  # interrupted (Ctrl-C) while the stop still runs
             _abandon(runner, started[0], calls)
-        else:
-            runner.close()
+        else:  # the node ended with its own error: close as after a clean stop, raise that error
+            _close_runner(runner, started[0] if started else None, calls)
         raise
     if stuck is None:
-        # `Runner.close` waits up to 300 s for the executor's calls (`THREAD_JOIN_TIMEOUT`): wait for them
-        # at most `ADAPTER_CALL_SECS` first, and leave the runner if one still runs
-        calls.shutdown(wait=False, cancel_futures=True)
-        if not wait(calls.running(), timeout=ADAPTER_CALL_SECS).not_done:
-            runner.close()
-            return
-        _ABANDONED.append((runner, started[0], calls))
-        raise StopTimedOut(
-            f"a worker call of the node still ran {ADAPTER_CALL_SECS:g} s after it stopped; left running"
-        )
+        if not _close_runner(runner, started[0], calls):
+            raise StopTimedOut(
+                f"a worker call of the node still ran {ADAPTER_CALL_SECS:g} s after it stopped; "
+                "left running"
+            )
+        return
     _abandon(runner, stuck, calls)
     raise StopTimedOut(
         f"the node did not stop within {STOP_TIMEOUT_SECS:g} s of the window's end; left running"
@@ -1036,10 +1083,21 @@ async def _run_until(node: LiveNode, ends: datetime, started: list) -> asyncio.T
     return None
 
 
-def _abandon(runner: asyncio.Runner, task: asyncio.Task, calls: Calls) -> None:
+def _abandon(runner: asyncio.Runner, task: asyncio.Task | None, calls: Calls) -> None:
     """Leave the runner and the node's task (`_ABANDONED`), with no new worker call able to start."""
-    calls.shutdown(wait=False, cancel_futures=True)
+    calls.shut()
     _ABANDONED.append((runner, task, calls))
+
+
+def _close_runner(runner: asyncio.Runner, task: asyncio.Task | None, calls: Calls) -> bool:
+    """Close the runner once its worker calls have ended, waiting at most `ADAPTER_CALL_SECS` for them
+    (`Runner.close` would wait up to 300 s, `THREAD_JOIN_TIMEOUT`); if one still runs, leave it as after
+    an abandoned stop and return False."""
+    if calls.settle():
+        _ABANDONED.append((runner, task, calls))
+        return False
+    runner.close()
+    return True
 
 
 LOCAL_REJECTIONS = ("INFLIGHT_TIMEOUT", "NOT_FOUND_AT_VENUE")
@@ -1143,8 +1201,10 @@ def _main(argv: Sequence[str] | None) -> int:
     session = args.session
     try:
         trading = market = None
+        market_read_at: float | None = None
         if session == "auto":
             trading = paper_trading()
+            market_read_at = time.monotonic()
             market = session_now(trading)
             resolved, why = resolve_session(*market)
             if resolved is None:
@@ -1156,25 +1216,31 @@ def _main(argv: Sequence[str] | None) -> int:
             symbol=args.symbol, session=session, minutes=args.minutes, log_dir=args.log_dir
         )
         write_heartbeat(args.log_dir, f"a {session} window")
-        report = run_window(config, trading=trading, market=market)
+        report = run_window(config, trading=trading, market=market, market_read_at=market_read_at)
     except WindowSkipped as e:
         write_heartbeat(args.log_dir, f"skipped: {e}")
         print(f"paper:session: skipped: {e}")
         return 0
     except WindowRefused as e:
-        write_heartbeat(args.log_dir, f"refused: {e}")
-        write_record(
-            args.log_dir,
-            {
-                "session": session,
-                "result": f"refused: {e}",
-                "started_epoch": time.time(),
-                "started": datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ"),
-                "stale_after": STALE_RUNNING_SECS,
-                "commit": running_commit(),
-            },
-        )
         print(f"paper:session: {e}", file=sys.stderr)
+        try:
+            write_heartbeat(args.log_dir, f"refused: {e}")
+        except OSError as written:  # the refusal stands, said above
+            print(f"paper:session: the heartbeat could not be written: {written}", file=sys.stderr)
+        try:
+            write_record(
+                args.log_dir,
+                {
+                    "session": session,
+                    "result": f"refused: {e}",
+                    "started_epoch": time.time(),
+                    "started": datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ"),
+                    "stale_after": STALE_RUNNING_SECS,
+                    "commit": running_commit(),
+                },
+            )
+        except OSError as written:
+            print(f"paper:session: the record could not be written: {written}", file=sys.stderr)
         return 1
     # KeyError: no key pair in the env; OSError: the HTTP layer's errors, the adapter's timeouts among them
     except (RuntimeError, ValueError, KeyError, APIError, OSError) as e:
