@@ -1609,7 +1609,7 @@ CLAUDE_CONFIG_DIR="$C" bs --user-config
 check "no Antigravity folder: its model skipped, nothing created" eval '[ ! -e "$HOME/.gemini" ] && grep -q "skipped    Antigravity default model" "$TMP/bs.out"'
 mkdir -p "$(dirname "$AS")"; CLAUDE_CONFIG_DIR="$C" bs --user-config
 check "an Antigravity folder with no settings: a file holding only the model, readable by its owner alone" \
-      eval 'jqt "$AS" ". == {\"model\": \"$agy_label\"}" && [ "$(stat -f %Lp "$AS")" = 600 ]'
+      eval 'jqt "$AS" ". == {\"model\": \"$agy_label\"}" && [ "$(ls -l "$AS" | cut -c1-10)" = "-rw-------" ]'
 echo '{"trustedWorkspaces": ["/w"]}' > "$AS"; CLAUDE_CONFIG_DIR="$C" bs --user-config
 check "settings with no model: the model added, the rest kept, a copy beside it" \
       eval 'jqt "$AS" ".model == \"$agy_label\" and .trustedWorkspaces == [\"/w\"]" && [ -n "$(find "$(dirname "$AS")" -name "settings.json.replaced-*")" ]'
