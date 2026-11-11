@@ -5403,6 +5403,305 @@ def test_a_fill_the_engine_applied_from_a_report_is_not_counted_again_from_the_s
     assert held == [(OrderStatus.FILLED, 2.0)], strategy.names()
 
 
+# -- one fill, one identity, whichever source brings it ---------------------------------------------
+
+
+@pytest.mark.parametrize("reconnected", [False, True], ids=["same-connect", "after-reconnect"])
+def test_a_fill_a_query_report_shows_is_not_counted_again_from_the_stream(
+    venue, reconnected
+) -> None:
+    # Found by two independent readers (Muse, finding 1; Antigravity, finding 1): an open order's status
+    # report showing a fill reached the engine before the stream's update for that share; the engine
+    # inferred the fill under a trade ID of its own, the stream's `execution_id` then counted it again, and
+    # a buy of 2 ended FILLED on one share at Alpaca. A fill keeps Alpaca's execution ID from every source
+    # ("Stable `trade_id` values let the engine deduplicate the same fill across both channels").
+    venue.trading.script = "accept"
+    strategy = trader(order_type="limit")
+    strategy.stopped_for = "held open"
+    held: list = []
+
+    async def body(client) -> None:
+        await until_named(strategy, "OrderAccepted")
+        await until_idle(client, venue)
+        placed = placed_order(venue)
+        late = venue.trading.update(
+            placed["id"],
+            "partial_fill",
+            1,
+            deliver=False,
+            status="partially_filled",
+            filled_qty="1",
+        )
+        await client._query_order(
+            SimpleNamespace(
+                venue_order_id=VenueOrderId(placed["id"]),
+                client_order_id=strategy.client_order_id,
+            )
+        )
+        await settled(client, venue)
+        if reconnected:  # the client keeps nothing of the report; the node's order holds its fill
+            await reconnect(client, venue)
+        venue.stream.send(late)
+        await settled(client, venue)
+        cached = client.cache.order(strategy.client_order_id)
+        held.append((cached.status, cached.filled_qty.as_double(), len(cached.trade_ids)))
+        # The order's second share, past what the report showed: a fill of its own.
+        venue.trading.update(placed["id"], "fill", 1, status="filled", filled_qty="2")
+        await settled(client, venue)
+        cached = client.cache.order(strategy.client_order_id)
+        held.append((cached.status, cached.filled_qty.as_double(), len(cached.trade_ids)))
+
+    run_with_client(body, strategy)
+
+    assert held == [
+        (OrderStatus.PARTIALLY_FILLED, 1.0, 1),
+        (OrderStatus.FILLED, 2.0, 2),
+    ], strategy.names()
+
+
+def test_a_fill_startup_reconciliation_inferred_is_not_counted_again_from_the_stream(
+    venue, alpaca
+) -> None:
+    # The start-up form of the same finding (Antigravity, finding 1): an open order filled 1 of 2 whose
+    # fill activities Alpaca does not list yet, so the engine infers its fill at start-up; the stream's
+    # update for that share then arrives.
+    venue.trading.orders = [
+        alpaca.alpaca_order(status="partially_filled", filled_qty="1", filled_avg_price="150")
+    ]
+    venue.trading.positions = [
+        {**alpaca.POSITION_AAPL, "qty": "1", "qty_available": "1", "avg_entry_price": "150"}
+    ]
+    external = ClientOrderId(alpaca.ORDER_AAPL["client_order_id"])
+    held: list = []
+
+    async def body(client) -> None:
+        venue.stream.send(
+            {
+                "event": "partial_fill",
+                "order": dict(venue.trading.orders[0]),
+                "timestamp": datetime.now(UTC).isoformat(),
+                "price": "150",
+                "qty": "1",
+                "position_qty": "1",
+                "execution_id": str(uuid.UUID(int=21)),
+            }
+        )
+        await settled(client, venue)
+        cached = client.cache.order(external)
+        held.append((cached.status, cached.filled_qty.as_double()))
+
+    run_with_client(body)
+
+    assert held == [(OrderStatus.PARTIALLY_FILLED, 1.0)]
+
+
+def test_a_stream_fill_taken_for_an_inferred_share_and_delivered_again_after_a_reconnect_is_counted_once(
+    venue,
+) -> None:
+    # The code review of the rule (round 3): a stream fill matched to a share the engine inferred was held
+    # only in the record, which a reconnect drops, so its second delivery counted it.
+    venue.trading.script = "accept"
+    strategy = trader(order_type="limit")
+    strategy.stopped_for = "held open"
+    held: list = []
+
+    async def body(client) -> None:
+        await until_named(strategy, "OrderAccepted")
+        await until_idle(client, venue)
+        placed = placed_order(venue)
+        late = venue.trading.update(
+            placed["id"],
+            "partial_fill",
+            1,
+            deliver=False,
+            status="partially_filled",
+            filled_qty="1",
+        )
+        await client._query_order(
+            SimpleNamespace(
+                venue_order_id=VenueOrderId(placed["id"]),
+                client_order_id=strategy.client_order_id,
+            )
+        )
+        await settled(client, venue)
+        venue.stream.send(late)
+        await settled(client, venue)
+        await reconnect(client, venue)
+        venue.stream.send(late)
+        await settled(client, venue)
+        cached = client.cache.order(strategy.client_order_id)
+        held.append((cached.status, cached.filled_qty.as_double(), len(cached.trade_ids)))
+
+    run_with_client(body, strategy)
+
+    assert held == [(OrderStatus.PARTIALLY_FILLED, 1.0, 1)], strategy.names()
+
+
+def test_a_stream_fill_before_a_later_fills_report_is_its_own_fill(venue) -> None:
+    # The code review of the rule: a fill report for the order's second share (B) reached the engine
+    # before the stream's update for its first (A). A rule on quantity alone took A, whose `filled_qty` the
+    # order had applied, for B and dropped it. B's ID is Alpaca's, so nothing was inferred: A counts.
+    venue.trading.script = "accept"
+    strategy = trader(order_type="limit")
+    strategy.stopped_for = "held open"
+    held: list = []
+
+    async def body(client) -> None:
+        await until_named(strategy, "OrderAccepted")
+        await until_idle(client, venue)
+        placed = placed_order(venue)
+        trade_a = venue.trading.update(
+            placed["id"],
+            "partial_fill",
+            1,
+            deliver=False,
+            status="partially_filled",
+            filled_qty="1",
+        )
+        trade_b = venue.trading.update(
+            placed["id"], "fill", 1, deliver=False, status="filled", filled_qty="2"
+        )
+        reports = await client._fill_reports(
+            fills_command(venue_order_id=VenueOrderId(placed["id"]))
+        )
+        client._handle_report(
+            next(r for r in reports if str(r.trade_id) == trade_b["execution_id"])
+        )
+        await settled(client, venue)
+        venue.stream.send(trade_a)
+        await settled(client, venue)
+        venue.stream.send(trade_b)
+        await settled(client, venue)
+        cached = client.cache.order(strategy.client_order_id)
+        held.append((cached.status, cached.filled_qty.as_double(), len(cached.trade_ids)))
+
+    run_with_client(body, strategy)
+
+    assert held == [(OrderStatus.FILLED, 2.0, 2)], strategy.names()
+
+
+def test_a_partial_fill_whose_order_shows_the_count_before_it_is_counted(venue) -> None:
+    # The code review of the rule: whether a `partial_fill`'s order shows `filled_qty` after the fill is
+    # not on Alpaca's page. One that showed it before, with nothing inferred, must still count.
+    venue.trading.script = "accept"
+    strategy = trader(order_type="limit")
+    strategy.stopped_for = "held open"
+    held: list = []
+
+    async def body(client) -> None:
+        await until_named(strategy, "OrderAccepted")
+        await until_idle(client, venue)
+        placed = placed_order(venue)
+        update = venue.trading.update(
+            placed["id"],
+            "partial_fill",
+            1,
+            deliver=False,
+            status="partially_filled",
+            filled_qty="1",
+        )
+        update["order"] = {**update["order"], "filled_qty": "0"}
+        venue.stream.send(update)
+        await settled(client, venue)
+        cached = client.cache.order(strategy.client_order_id)
+        held.append((cached.status, cached.filled_qty.as_double()))
+
+    run_with_client(body, strategy)
+
+    assert held == [(OrderStatus.PARTIALLY_FILLED, 1.0)], strategy.names()
+
+
+def test_a_late_fill_of_a_replaced_order_a_report_showed_is_not_counted_again(venue) -> None:
+    # The code review of the rule: an order's fill reached the engine through a `QueryOrder` report, the
+    # order was then replaced, and the stream's update for that fill arrived on the order replaced. A rule
+    # kept to the order now working counted it a second time.
+    venue.trading.script = "accept"
+    strategy = modifier(prices=[])
+    held: list = []
+
+    async def body(client) -> None:
+        await until_named(strategy, "OrderAccepted")
+        await until_idle(client, venue)
+        placed = placed_order(venue)
+        late = venue.trading.update(
+            placed["id"],
+            "partial_fill",
+            1,
+            deliver=False,
+            status="partially_filled",
+            filled_qty="1",
+        )
+        await client._query_order(
+            SimpleNamespace(
+                venue_order_id=VenueOrderId(placed["id"]),
+                client_order_id=strategy.client_order_id,
+            )
+        )
+        await settled(client, venue)
+        assert strategy.client_order_id is not None
+        strategy.modify_order(strategy.client_order_id, price=Price.from_str("149.00"))
+        await until_named(strategy, "OrderUpdated")
+        await settled(client, venue)
+        venue.stream.send(late)
+        await settled(client, venue)
+        cached = client.cache.order(strategy.client_order_id)
+        held.append((cached.filled_qty.as_double(), len(cached.trade_ids)))
+
+    run_with_client(body, strategy)
+
+    assert held == [(1.0, 1)], strategy.names()
+
+
+def test_a_fill_report_and_stream_fills_interleaved_are_each_counted_once(venue, alpaca) -> None:
+    # Found by an independent reader (Codex, finding 1): trade A reaches the engine as a fill report, B
+    # through the stream, then A again through the stream. The record consulted the order's trade IDs
+    # only while the order showed more filled than its own count, so after B it counted A a second time
+    # (the engine refused it), C ended the order, and D was dropped: PARTIALLY_FILLED 3 with 4 filled at
+    # Alpaca.
+    venue.trading.script = "accept"
+    strategy = trader(order_type="limit", quantity=4)
+    strategy.stopped_for = "held open"
+    held: list = []
+
+    async def body(client) -> None:
+        await until_named(strategy, "OrderAccepted")
+        await until_idle(client, venue)
+        placed = placed_order(venue)
+        trade_a = venue.trading.update(
+            placed["id"],
+            "partial_fill",
+            1,
+            deliver=False,
+            status="partially_filled",
+            filled_qty="1",
+        )
+        reports = await client._fill_reports(
+            fills_command(venue_order_id=VenueOrderId(placed["id"]))
+        )
+        client._handle_report(
+            next(r for r in reports if str(r.trade_id) == trade_a["execution_id"])
+        )
+        await settled(client, venue)
+        venue.trading.update(
+            placed["id"], "partial_fill", 1, status="partially_filled", filled_qty="2"
+        )
+        await settled(client, venue)
+        venue.stream.send(trade_a)
+        await settled(client, venue)
+        venue.trading.update(
+            placed["id"], "partial_fill", 1, status="partially_filled", filled_qty="3"
+        )
+        await settled(client, venue)
+        venue.trading.update(placed["id"], "fill", 1, status="filled", filled_qty="4")
+        await settled(client, venue)
+        cached = client.cache.order(strategy.client_order_id)
+        held.append((cached.status, cached.filled_qty.as_double(), len(cached.trade_ids)))
+
+    run_with_client(body, strategy)
+
+    assert held == [(OrderStatus.FILLED, 4.0, 4)], strategy.names()
+
+
 # -- the code review of the record -------------------------------------------------------------------
 
 

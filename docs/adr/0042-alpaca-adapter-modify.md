@@ -43,11 +43,22 @@ replace chain is one record, as Binance spot's `OrderBinding`: built from the no
 Alpaca orders the order has been, the one it is on and the replaces pending, and every update and report
 is judged through it. A replacement is the node's by the record or the cache, else by a walk of `replaces`
 of at most 16 reads. A 422 is `OrderModifyRejected` unless Alpaca shows the order replaced as asked
-(alpaca-py's own retry); any other status leaves the outcome unknown. `order_replace_rejected` and the
+(an earlier replace took it; each replace is sent once, ADR 0039); any other status leaves the outcome unknown. `order_replace_rejected` and the
 `rejected` of a replacement that has not taken over are `OrderModifyRejected` too. One that took over
 (the order it replaces shows replaced by it) ends the order: rejected, or canceled once partly filled, as
 Binance spot's `reject_replace` emits `OrderCanceled`. Denied before Alpaca: no venue order ID, a fractional quantity, a sub-penny
 price, a price the order type lacks.
+
+**Added 2026-11-11: one identity for a fill.** A fill counted twice was found three times in the record's
+fill accounting, each time from a different source reaching the engine first, so it is settled as one rule
+(ADR 0073's practice for a defect family) rather than a fourth point fix. A fill is counted once, whichever
+source brings it first. It is known by Alpaca's execution ID wherever Alpaca carries it, the stream's
+`execution_id` and a fill report's trade ID being the same UUID (ADR 0024): an ID the record or the node's
+cached order holds is not counted again, whatever either count shows. The engine makes an ID only for a
+fill it infers from a status report, so the client keeps the trade IDs Alpaca gave it, and the order's
+shares under any other ID are inferred: a stream fill under an ID not yet seen is taken for one of them,
+on any order of the chain, while any are unmatched, and otherwise is a fill of its own. Alpaca's
+cumulative `filled_qty` on the update only narrows that.
 
 ### Consequences
 
@@ -85,6 +96,33 @@ alpaca-py with `raw_data=True`, logs kept outside the repo:
   NautilusTrader's `Strategy` refuses to create the `ModifyOrder` ("quantity, price, and trigger were
   either None or the same as existing values", observed offline).
 * A second replace of a replaced order: 422 "order already replaced", 7 of 7.
+
+**One identity for a fill (2026-11-11).** NautilusTrader: "Stable `trade_id` values let the engine
+deduplicate the same fill across both channels. If the logical fill arrives with different IDs, the engine
+treats the reports as distinct" (execution `index.md`, "Overfills"); a reconciliation guide distinguishes a
+snapshot that predates a fill from "A snapshot that covers the fill" (`reconciliation.md`, "Snapshot
+freshness and fill corrections"); and an inferred fill's quantity is `report.filled_qty -
+order.filled_qty()` (`crates/execution/src/reconciliation/orders.rs`; the same difference prices its
+commission in `reconcile_order_report`, `crates/live/src/execution/manager.rs`). Offline, on a real
+`LiveNode`, four cases failing before the rule and passing with it: an open order's `QueryOrder` report
+showing a fill before the stream's update for that share, on the same connect and after a reconnect (FILLED 2 on one share at Alpaca,
+reported by two independent readers, Muse and Antigravity), and the order's next fill still counted; the
+same at start-up reconciliation while the activities lag (Antigravity); and a fill report, a stream fill
+and the report's fill again from the stream, interleaved (PARTIALLY_FILLED 3 with 4 filled at Alpaca,
+reported by Codex). The code review of the rule added three, each failing on a rule that judged by
+quantity alone: a stream fill after a fill report for a later share, a `partial_fill` whose order shows the
+count before the fill, and a late fill of an order since replaced that a report had shown; and a third
+round one more, a stream fill matched to an inferred share delivered again after a reconnect. A known limit
+stays: an inferred share whose stream update never comes is taken for the order's next fill under a new
+ID unless its `filled_qty` shows it is past what the node applied. Read at the pin (`check_open_orders`,
+`reconcile_open_order_reports`, `reconcile_order_report`): while Alpaca shows the order open, the
+open-order check (every 10 s on the paper node, off by NautilusTrader's default) infers the missing share
+once no local activity is within its threshold, so the count heals; once Alpaca shows it closed, the
+engine holds a terminal report with missing fills back, "waiting for fill reports", and whether anything
+before the next start-up brings them is UNVERIFIED; with the check off, it stays until then. That the
+stream's `execution_id` and a fill activity's trade ID are one UUID was observed on paper (ADR 0024), not
+documented. What paper sends in such a race, and whether a `partial_fill`'s order copy shows
+`filled_qty` after the fill (the stream page's examples are `fill`s, which do), are UNVERIFIED.
 
 `UNVERIFIED`, shown by no run: `order_replace_rejected`; `pending_replace` (never seen in 9 replaces); a
 status on a replace other than 422; whether the regular session counts a partly filled replacement as
@@ -176,3 +214,13 @@ Read 2026-11-10; "raw": fetched with `curl` and read, not summarised. NautilusTr
   and fills (2 of 2 runs), so the reading in force is the one observed; the Confirmation above is
   corrected, and the earlier `UNVERIFIED` items on a partially filled modify and a late `new` are closed
   by it, for the overnight session.
+* Corrected 2026-11-11: the Decision Outcome's reason for a 422 that Alpaca shows replaced as asked said
+  "alpaca-py's own retry"; each replace is now sent once (ADR 0039), so it reads "an earlier replace took
+  it".
+* https://raw.githubusercontent.com/nautechsystems/nautilus_trader/d53849b216e20f2c122ca01b4dd0da377638b186/docs/concepts/execution/index.md
+  ("Overfills", "Duplicate fill detection") and `docs/concepts/execution/reconciliation.md` at the same
+  commit ("Snapshot freshness and fill corrections"; `OrderStatusReport` "Creates an order and infers any
+  reported fill"), and `crates/live/src/execution/manager.rs` (`reconcile_order_report`), quoted in the
+  Confirmation (fetched, raw, 2026-11-11). https://docs.alpaca.markets/us/docs/websocket-streaming.md: its
+  `fill` examples carry the order with `filled_qty` equal to the filled shares; no `partial_fill` example
+  (fetched, raw).
