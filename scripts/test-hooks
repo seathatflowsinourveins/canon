@@ -449,6 +449,39 @@ nocomment=$(cat "$ROOT/.claude/hooks/session-brief.sh" "$ROOT/.claude/hooks/comp
 # shellcheck disable=SC2016 # the pattern is a grep regex, not a shell expansion
 check "no hook substitutes a command that names orca" test "$(grep -cE '(\$\(|`)[^)`]*orca' <<<"$nocomment")" = "0"
 
+# --- the morning line: the nightly study's last night, and the entries not yet landed (ADR 0089) ---
+# (the brief is read into a variable first: under pipefail a grep -q that stops reading would fail the pipe)
+NB=$(mktemp -d "${TMPDIR:-/tmp}/test-hooks-brief.XXXXXX")
+brief() { printf '{"cwd":"%s"}' "$ROOT" | CANON_NIGHTLY_DIR="$NB/nightly" CANON_HANDBOOK_NIGHTS="$NB/nights.md" "$ROOT/.claude/hooks/session-brief.sh" 2>/dev/null; }
+nb=$(brief)
+check "no nightly record: the brief says nothing of the study" test "$(grep -c 'nightly study' <<<"$nb")" = "0"
+mkdir -p "$NB/nightly/s"
+NLINE="nightly study 2026-11-12 (s): N=8, T=6 over 5 New York days, pick SPY 5/20, Sharpe 0.11 per session, DSR 0.4100, not yet: the pick's DSR 0.4100 is below 0.95 | paper windows to 2026-11-12 20:00 New York: 12 ran, 11 ok, 6 fills, fill gap not measured"
+jq -n --arg l "$NLINE" '{study: "s", day: "2026-11-12", status: "not yet", line: $l}' > "$NB/nightly/latest.json"
+nb=$(brief)
+check "a studied night: the brief prints the driver's line whole" grep -qxF -- "$NLINE" <<<"$nb"
+check "... and nothing of an entry when none was written" test "$(grep -c 'not in docs/handbook/nights.md' <<<"$nb")" = "0"
+printf '## 2026-11-11, s\n' > "$NB/nightly/s/2026-11-11.md"; printf '## 2026-11-12, s\n' > "$NB/nightly/s/2026-11-12.md"
+: > "$NB/nightly/s/2026-11-12.json"; : > "$NB/nightly/s/notes.md"
+nb=$(brief)
+check "... entries with no page yet: every night named, for a coordinator, with where a session lands them from" \
+      grep -qF "nightly study: 2 night(s) with an entry not in docs/handbook/nights.md on main yet (2026-11-11, 2026-11-12). Coordinators only: one session lands them from ledger/nightly/<study>/<day>.md of the main checkout" <<<"$nb"
+printf '# Nights\n\n## 2026-11-11, s\n\n* landed\n\n## 2026-11-12, another-study\n' > "$NB/nights.md"
+nb=$(brief)
+check "... one landed under its day and study: only the other named, another study's heading not taken for it" \
+      grep -qF "nightly study: 1 night(s) with an entry not in docs/handbook/nights.md on main yet (2026-11-12)." <<<"$nb"
+printf '## 2026-11-12, s\n' >> "$NB/nights.md"
+nb=$(brief)
+check "... all landed: no second line" test "$(grep -c 'not in docs/handbook/nights.md' <<<"$nb")" = "0"
+for d in 13 14 15 16 17 18 19; do : > "$NB/nightly/s/2026-11-$d.md"; done
+nb=$(brief)
+check "... more than five waiting: five named and the rest counted" \
+      grep -qF "7 night(s) with an entry not in docs/handbook/nights.md on main yet (2026-11-13, 2026-11-14, 2026-11-15, 2026-11-16, 2026-11-17 and 2 more)" <<<"$nb"
+echo '{' > "$NB/nightly/latest.json"
+nb=$(brief)
+check "... a record that cannot be read: said, pointing at the status" grep -qF "nightly study: its last record is unreadable or has no line; see scripts/automation status." <<<"$nb"
+rm -rf "${NB:?}"
+
 # --- .githooks/pre-commit refuses a commit in the primary checkout, which the maintenance agent keeps on main ---
 # The primary worktree is the one whose git dir is the common dir (git-worktree(1)); a linked worktree's is not.
 # Scratch repository with a stub scripts/ci, so only the guard is under test. A fast-forward is not a commit, so

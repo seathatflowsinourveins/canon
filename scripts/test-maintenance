@@ -508,6 +508,12 @@ margs=""; for i in 0 1 2 3; do margs="$margs|$(plutil -extract "ProgramArguments
 check "... its plist: the script on this clone with the mise install found" test "$margs" = "|/bin/bash|$AH/canon/maintenance.sh|$A|$B/mise"
 check "... every 30 minutes, not at load, its process group abandoned, CLAUDE_CONFIG_DIR the install's" \
       eval '[ "$(plutil -extract StartInterval raw -o - "$MP")" = 1800 ] && [ "$(plutil -extract RunAtLoad raw -o - "$MP")" = false ] && [ "$(plutil -extract AbandonProcessGroup raw -o - "$MP")" = true ] && [ "$(plutil -extract EnvironmentVariables.CLAUDE_CONFIG_DIR raw -o - "$MP")" = "$AH" ]'
+SP="$LA/local.canon.nightly-study.plist"
+sargs=""; for i in 0 1 2 3; do sargs="$sargs|$(plutil -extract "ProgramArguments.$i" raw -o - "$SP" 2>/dev/null)"; done
+check "... the nightly study's agent runs mise.toml's own task, study:nightly, in this clone" \
+      eval '[ "$sargs" = "|$B/mise|run|study:nightly|" ] && [ "$(plutil -extract WorkingDirectory raw -o - "$SP")" = "$A" ]'
+check "... every 30 minutes, not at load, with no install by mise and only PATH besides" \
+      eval '[ "$(plutil -extract StartInterval raw -o - "$SP")" = 1800 ] && [ "$(plutil -extract RunAtLoad raw -o - "$SP")" = false ] && [ "$(plutil -extract EnvironmentVariables.MISE_TASK_RUN_AUTO_INSTALL raw -o - "$SP")" = false ] && [ "$(plutil -extract EnvironmentVariables.PATH raw -o - "$SP")" = /usr/bin:/bin:/usr/sbin:/sbin ] && [ "$(plutil -extract EnvironmentVariables raw -o - "$SP" | wc -l | tr -d " ")" = 2 ]'
 check "... OmniRoute not installed: no gateway agent, said" eval '[ ! -e "$GP" ] && grep -q "skipped    OmniRoute is not installed for this clone" "$TMP/inst.out"'
 : > "$STUB/omniroute-installed"; ainst AUTOMATION_SKIP_LAUNCHD=1; rc=$?
 gargs=""; for i in 0 1 2 3 4; do gargs="$gargs|$(plutil -extract "ProgramArguments.$i" raw -o - "$GP" 2>/dev/null)"; done
@@ -523,6 +529,10 @@ cp "$ROOT/home/.claude/canon/ledger.sh" "$ROOT/home/.claude/canon/statusline.sh"
 env -i HOME="$H" PATH="$B:/usr/bin:/bin" CLAUDE_CONFIG_DIR="$AH" "$A/scripts/automation" mark-user-config >/dev/null 2>&1
 adiff AUTOMATION_SKIP_LAUNCHD=1; rc=$?
 check "differs right after install and the settings step: nothing, exit 0" eval '[ "$rc" = 0 ] && [ ! -s "$TMP/diff.out" ]'
+mv "$SP" "$SP.kept"; adiff AUTOMATION_SKIP_LAUNCHD=1; rc=$?
+check "... the nightly study's agent not written yet, as on a machine installed before it: an automation line, exit 1" \
+      eval '[ "$rc" = 1 ] && [ "$(cat "$TMP/diff.out")" = "automation: $SP differs from what install writes" ]'
+mv "$SP.kept" "$SP"
 echo "# changed on main" >> "$A/home/.claude/canon/lanes-watch.sh"; echo "# changed" >> "$A/mise.gateway.toml"
 adiff AUTOMATION_SKIP_LAUNCHD=1; rc=$?
 check "... a script and the gateway task changed on main: automation lines for each, exit 1" \
@@ -556,6 +566,8 @@ check "... the paper agent kept, its interval running on, with runner and plist 
       eval 'grep -q "^  kept       local.canon.paper-session loaded: its runner and plist are unchanged" "$TMP/inst.out" && ! grep -q "bootout.*local.canon.paper-session" "$STUB/launchctl.log"'
 check "... the collector and the gateway kept running too" \
       eval 'grep -q "^  kept       local.canon.otel-collector running" "$TMP/inst.out" && grep -q "^  kept       local.canon.omniroute loaded" "$TMP/inst.out" && ! grep -Eq "bootout.*(otel-collector|omniroute)" "$STUB/launchctl.log"'
+check "... the nightly study's agent kept, its interval running on" \
+      eval 'grep -q "^  kept       local.canon.nightly-study loaded: its plist is unchanged" "$TMP/inst.out" && ! grep -q "bootout.*local.canon.nightly-study" "$STUB/launchctl.log"'
 echo "# changed" >> "$A/home/.claude/canon/paper-session.sh"; logs_clear; ainst
 check "... and the paper agent reloaded once its runner changed" grep -q "bootout.*local.canon.paper-session" "$STUB/launchctl.log"
 check "... loaded after everything else" eval '[ "$(grep -n "^Maintenance:" "$TMP/inst.out" | cut -d: -f1)" -gt "$(grep -n "^Landing:" "$TMP/inst.out" | cut -d: -f1)" ]'
@@ -624,6 +636,54 @@ echo running > "$STUB/loaded/local.canon.omniroute"; rm -f "$STUB/gw-code"; asta
 check "... nothing answering: FAILED, naming the log" eval 'rowis "$TMP/stat.out" "omniroute gateway" FAILED && grep -q "omniroute.log" "$TMP/stat.out"'
 rm -f "$GP"; astat
 check "... no agent written: absent, not counted against status" rowis "$TMP/stat.out" "omniroute gateway" absent
+
+# the nightly study row (ADR 0089): the driver's own line for the last night it studied, from the records
+# beside the ledger of the clone status runs in, and the schedule's heartbeat
+ND="$A/ledger/nightly"; mkdir -p "$ND"; SL=local.canon.nightly-study
+night() { # night <status> <days since the night's end> [line]
+  jq -n --arg s "$1" --argjson e $(( $(date +%s) - $2 * 86400 )) \
+    --arg l "${3:-nightly study 2026-11-11 (s): N=8, T=6, pick SPY 5/20, DSR 0.4100, $1: the pick is below 0.95 | paper windows 2026-11-11: 12 ran, 11 ok, 6 fills, fill gap not measured}" \
+    '{status: $s, line: $l, end_ns: ($e * 1000000000)}' > "$ND/latest.json"
+}
+beat() { jq -n --argjson e $(( $(date +%s) - $1 )) --arg s "${2:-nothing new}" --arg l "${3:-}" '{epoch: $e, status: $s, line: $l}' > "$ND/last-firing.json"; }
+echo "not running" > "$STUB/loaded/$SL"; night "not yet" 0; beat 60; astat
+check "nightly study row: a night studied, not yet, and a fresh firing: ok, with the driver's line and the firing" \
+      eval 'rowis "$TMP/stat.out" "nightly study" ok && grep -q "N=8, T=6, pick SPY 5/20, DSR 0.4100, not yet: the pick is below 0.95 | paper windows 2026-11-11: 12 ran" "$TMP/stat.out" && grep -q "last firing 1 min ago: nothing new" "$TMP/stat.out"'
+night passed 0; astat
+check "... a night that passed: ok" rowis "$TMP/stat.out" "nightly study" ok
+night failed 0; astat
+check "... a night that failed: FAILED" rowis "$TMP/stat.out" "nightly study" FAILED
+night waiting 0 "nightly study (s): waiting: the catalog holds no SPY bars"; astat
+check "... no night studied yet, the firing waiting: UNKNOWN, saying what it waits for" \
+      eval 'rowis "$TMP/stat.out" "nightly study" UNKNOWN && grep -q "waiting: the catalog holds no SPY bars" "$TMP/stat.out"'
+night "not yet" 0; beat 60 waiting "nightly study (s): waiting: the catalog does not cover SPY yet"; astat
+check "... a night studied and the last firing waiting: ok, the firing's own line beside the night's" \
+      eval 'rowis "$TMP/stat.out" "nightly study" ok && grep -q "not yet: the pick is below 0.95 .* last firing 1 min ago: nightly study (s): waiting: the catalog does not cover SPY yet" "$TMP/stat.out"'
+beat 60 failed "nightly study (s): 8 configurations planned, failed: ValueError: the catalog lost bars"; astat
+check "... the last firing failed before it knew its night: FAILED, saying why, the night's record kept" \
+      eval 'rowis "$TMP/stat.out" "nightly study" FAILED && grep -q "not yet: the pick is below 0.95 .* last firing 1 min ago: nightly study (s): 8 configurations planned, failed: ValueError: the catalog lost bars" "$TMP/stat.out"'
+beat 60
+night "not yet" 7; astat
+check "... the last night studied a week old: STALE, in days" \
+      eval 'rowis "$TMP/stat.out" "nightly study" STALE && grep -q "the last night studied ended 7 days ago" "$TMP/stat.out"'
+night "not yet" 4; astat
+check "... four days old, a long weekend: ok" rowis "$TMP/stat.out" "nightly study" ok
+night "not yet" 0; beat 7200; astat
+check "... no firing for two hours: STALE" eval 'rowis "$TMP/stat.out" "nightly study" STALE && grep -q "last firing 120 min ago: nothing new (the Mac asleep, or the job not running)" "$TMP/stat.out"'
+night failed 0; astat
+check "... a failed night outranks a silent schedule: FAILED" rowis "$TMP/stat.out" "nightly study" FAILED
+night "not yet" 0; rm -f "$ND/last-firing.json"; astat
+check "... no firing yet: UNKNOWN, naming when the first comes" \
+      eval 'rowis "$TMP/stat.out" "nightly study" UNKNOWN && grep -q "no firing recorded yet (the first comes 30 minutes after install)" "$TMP/stat.out"'
+beat 60; echo '{' > "$ND/last-firing.json"; astat
+check "... a heartbeat that cannot be read: UNKNOWN" eval 'rowis "$TMP/stat.out" "nightly study" UNKNOWN && grep -q "last-firing.json is unreadable" "$TMP/stat.out"'
+beat 60; rm -f "$ND/latest.json"; astat
+check "... no record of a night: UNKNOWN" eval 'rowis "$TMP/stat.out" "nightly study" UNKNOWN && grep -q "no night studied yet" "$TMP/stat.out"'
+echo '{' > "$ND/latest.json"; astat
+check "... a record that cannot be read: UNKNOWN" eval 'rowis "$TMP/stat.out" "nightly study" UNKNOWN && grep -q "latest.json is unreadable" "$TMP/stat.out"'
+check "... and no home folder path in the row" eval '[ "$(grep "nightly study" "$TMP/stat.out" | grep -cF "$H/")" = 0 ]'
+rm -f "$STUB/loaded/$SL"; astat
+check "... not loaded: OFF" rowis "$TMP/stat.out" "nightly study" OFF
 
 echo "test-maintenance: $pass passed, $fail failed"
 [ "$fail" = 0 ]
