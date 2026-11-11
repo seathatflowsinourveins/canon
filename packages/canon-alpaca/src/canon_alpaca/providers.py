@@ -37,19 +37,37 @@ Known limits:
   transport-adapter hook (`HTTPAdapter.send`), so a process that holds the paper pair to read data
   cannot submit, replace, cancel or close through any client this package builds. It guards this
   package's clients only, not other code that holds the pair.
+* Request count (`request_counts`): the `TimeoutAdapter` counts what it hands to requests' transport, per
+  key pair and per API, in UTC wall-clock minutes, and records each 429 by name, time and path. This is
+  glue around alpaca-py's session, on the same transport-adapter hook. NautilusTrader's own quota code is
+  a GCRA rate limiter shared by its Rust HTTP clients (nautilus_trader@d53849b216e2:
+  crates/network/src/ratelimiter/mod.rs:155, crates/network/src/http/mod.rs:25), with Python bindings for
+  none of it (crates/network/src/python/mod.rs:31, which registers only `TransportBackend`), so a Python
+  adapter on alpaca-py cannot use it. It throttles; this counts. alpaca-py repeats a 429 itself
+  (`RESTClient._request`, `_retry_codes`), and each attempt is counted; nothing here changes that.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import os
+import secrets
 import threading
 import time
+from collections import deque
+from dataclasses import dataclass
+from datetime import UTC
+from datetime import datetime
+from http import HTTPStatus
 from typing import TYPE_CHECKING
 from typing import Protocol
 from typing import override
+from urllib.parse import urlsplit
 
 import requests
+from alpaca.common.enums import BaseURL
 from alpaca.common.exceptions import APIError
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import AssetClass
@@ -90,6 +108,167 @@ class MethodRefused(RuntimeError):
     """A request other than GET in data-only mode, refused before it was sent (ADR 0070)."""
 
 
+TRADING_API = "trading"
+DATA_API = "data"
+DATA_HOSTS = frozenset(urlsplit(u.value).hostname for u in (BaseURL.DATA, BaseURL.DATA_SANDBOX))
+"""Alpaca's market data API hosts, from alpaca-py 0.45.0's `BaseURL`; a request to any other host counts
+against the trading API, so an unknown host is never left out of the trading budget."""
+
+RATE_LIMITED_KEPT = 100
+"""The most recent 429s kept by name, time and path for each account and API; every 429 is counted."""
+
+
+@dataclass(frozen=True)
+class RateLimited:
+    """One response Alpaca answered 429: its status by name, its UTC time and the endpoint's path, with
+    no query string and no header."""
+
+    name: str
+    at: datetime
+    path: str
+
+
+@dataclass(frozen=True)
+class RequestCount:
+    """The requests one account sent to one Alpaca API in this process, as `request_counts` returns them.
+
+    `account` numbers each key pair in the order its first request was sent (1, 2, ...); nothing derived
+    from a key is shown. `api` is `TRADING_API` or `DATA_API`. `peak` is the most requests sent in one
+    wall-clock minute (UTC), and `peak_minute` that minute's start; the first minute to reach it keeps it.
+    `peak_60s` is the most sent within any 60 seconds, which a burst across a minute's end can make
+    larger than `peak`. `rate_limited_total` counts every 429, and `rate_limited` keeps the latest
+    `RATE_LIMITED_KEPT`, oldest first.
+    """
+
+    account: int
+    api: str
+    total: int
+    peak: int
+    peak_minute: datetime | None
+    peak_60s: int
+    rate_limited_total: int
+    rate_limited: tuple[RateLimited, ...]
+
+
+class _Tally:
+    def __init__(self) -> None:
+        self.total = 0
+        self.minute = -1
+        self.in_minute = 0
+        self.peak = 0
+        self.peak_minute = -1
+        self.last = float("-inf")
+        self.recent: deque[float] = deque()  # send times within the last 60 seconds
+        self.peak_60s = 0
+        self.rate_limited_total = 0
+        self.rate_limited: deque[RateLimited] = deque(maxlen=RATE_LIMITED_KEPT)
+
+
+class RequestCounter:
+    """Requests sent through every `TimeoutAdapter` in this process, per account and per API, in
+    wall-clock minutes, and the 429s Alpaca answered. Thread-safe: alpaca-py calls run in worker threads.
+
+    The account is the request's own credential header as alpaca-py sets it (`APCA-API-KEY-ID`, or
+    `Authorization` for its other schemes; alpaca-py 0.45.0 `RESTClient._get_auth_headers`), held only as
+    an HMAC-SHA256 under a random key made for this counter, so two clients built on one key pair count as
+    one account and nothing kept can be matched to a key outside this process.
+
+    The clock is read under the lock, and a minute never moves back: a request stamped before the minute
+    in hand, by a clock stepped back, counts in that minute, and in the 60-second window at the latest
+    time seen; a 429 is stamped no earlier than that time either.
+    """
+
+    def __init__(self, clock: Callable[[], float] = time.time) -> None:
+        self._clock = clock
+        self._salt = secrets.token_bytes(32)
+        self._lock = threading.Lock()
+        self._accounts: dict[bytes, int] = {}
+        self._tallies: dict[tuple[int, str], _Tally] = {}
+
+    def _key(self, request: requests.PreparedRequest) -> tuple[bytes, str]:
+        """`request`'s account, as a keyed digest, and its API."""
+        headers = request.headers
+        credential = headers.get("APCA-API-KEY-ID") or headers.get("Authorization") or ""
+        if isinstance(credential, str):
+            credential = credential.encode()
+        digest = hmac.digest(self._salt, credential, hashlib.sha256)
+        host = (urlsplit(request.url or "").hostname or "").rstrip(".")
+        api = DATA_API if host in DATA_HOSTS else TRADING_API
+        return digest, api
+
+    def _tally(self, key: tuple[bytes, str]) -> _Tally:
+        """The tally for `key`'s account and API; the caller holds the lock."""
+        digest, api = key
+        account = self._accounts.setdefault(digest, len(self._accounts) + 1)
+        return self._tallies.setdefault((account, api), _Tally())
+
+    def sent(self, request: requests.PreparedRequest) -> None:
+        """Count `request`, handed to requests' transport now."""
+        key = self._key(request)
+        with self._lock:
+            tally = self._tally(key)
+            now = max(self._clock(), tally.last)
+            tally.last = now
+            tally.total += 1
+            minute = int(now // 60)
+            if minute != tally.minute:
+                tally.minute, tally.in_minute = minute, 0
+            tally.in_minute += 1
+            if tally.in_minute > tally.peak:
+                tally.peak, tally.peak_minute = tally.in_minute, minute
+            tally.recent.append(now)
+            while tally.recent[0] <= now - 60:
+                tally.recent.popleft()
+            tally.peak_60s = max(tally.peak_60s, len(tally.recent))
+
+    def answered(self, request: requests.PreparedRequest, status: int) -> None:
+        """Record a 429 answer to `request`; any other status is not kept."""
+        if status != HTTPStatus.TOO_MANY_REQUESTS:
+            return
+        key = self._key(request)
+        path = urlsplit(request.url or "").path
+        with self._lock:
+            tally = self._tally(key)
+            record = RateLimited(
+                name=f"{status} {HTTPStatus(status).phrase}",
+                at=datetime.fromtimestamp(max(self._clock(), tally.last), UTC),
+                path=path,
+            )
+            tally.rate_limited_total += 1
+            tally.rate_limited.append(record)
+
+    def counts(self) -> tuple[RequestCount, ...]:
+        """A snapshot of every account's and API's counts, by account, then trading before data."""
+        with self._lock:
+            return tuple(
+                RequestCount(
+                    account=account,
+                    api=api,
+                    total=t.total,
+                    peak=t.peak,
+                    peak_minute=(
+                        datetime.fromtimestamp(t.peak_minute * 60, UTC) if t.peak else None
+                    ),
+                    peak_60s=t.peak_60s,
+                    rate_limited_total=t.rate_limited_total,
+                    rate_limited=tuple(t.rate_limited),
+                )
+                for (account, api), t in sorted(
+                    self._tallies.items(), key=lambda i: (i[0][0], i[0][1] != TRADING_API)
+                )
+            )
+
+
+REQUESTS = RequestCounter()
+"""The process's one counter, which every `TimeoutAdapter` adds to."""
+
+
+def request_counts() -> tuple[RequestCount, ...]:
+    """What this process has sent to Alpaca's REST APIs through this package's clients so far, per account
+    and API (`RequestCount`), for a node or a session window to read at its end. Read-only: a snapshot."""
+    return REQUESTS.counts()
+
+
 CONNECT_TIMEOUT_SECS = 3.05
 """requests' "Timeouts" (Advanced Usage): "It's a good practice to set connect timeouts to slightly larger
 than a multiple of 3, which is the default TCP packet retransmission window"; its example is
@@ -106,6 +285,9 @@ class TimeoutAdapter(HTTPAdapter):
     It counts the requests each thread sends, so `counted` can tell how many attempts one alpaca-py call
     made: alpaca-py repeats a request answered 429 or 504 (`RESTClient._request`), and a 504 may have
     reached Alpaca. The count is per thread, and a call runs on one thread, so no other call touches it.
+
+    Every request it hands to requests' transport is also added to the process's `RequestCounter`
+    (`request_counts`), and a 429 answer recorded there; alpaca-py's own retry is left as it is.
 
     With `get_only`, every method but GET is refused with `MethodRefused` before anything is sent or
     counted (data-only mode, ADR 0070).
@@ -136,7 +318,9 @@ class TimeoutAdapter(HTTPAdapter):
                 "nothing was sent (ADR 0070)"
             )
         self.record_send()
-        return super().send(
+        counter = REQUESTS
+        counter.sent(request)
+        response = super().send(
             request,
             stream=stream,
             timeout=self.timeout if timeout is None else timeout,
@@ -144,6 +328,8 @@ class TimeoutAdapter(HTTPAdapter):
             cert=cert,
             proxies=proxies,
         )
+        counter.answered(request, response.status_code)
+        return response
 
 
 def session_of(client: object) -> requests.Session | None:
