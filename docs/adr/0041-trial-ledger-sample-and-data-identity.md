@@ -41,7 +41,11 @@ with what was tried.
    (`canon_trading.ledger.create_ledger_study`). A date with no time is its midnight. A sample the
    catalog does not cover in full is refused before a trial is asked for, naming each missing part:
    what NautilusTrader's `ParquetDataCatalog.get_missing_intervals_for_request` reports missing, the
-   check its own historical requests use. The run must read the bars that check read: the same catalog
+   check its own historical requests use. So is a sample whose ends NautilusTrader's daily series
+   cannot book: a bar on the day before the start's, the day it books the account's registration on
+   as the base of the first return, with no return of its own (`snapshot_day_start`), as a bar at
+   exactly a 00:00 UTC start is; or no bar on the session day of the end, where it books the run's
+   last fills (a strategy's `on_stop`). The run must read the bars that check read: the same catalog
    object gives them (`ParquetDataCatalog.query`), and since the node reads the catalog again from its
    path, a run whose bars (ADR 0053 term 1) have another digest is told `FAIL`. A catalog covers the window a
    load asked for (`canon_trading.bars_to_catalog`), or, for bars written without one, their first to
@@ -139,6 +143,11 @@ Who decided. The orchestrator chose option 2 and its terms under the owner's del
 * The fourth review's second part: a sample no nanosecond timestamp holds is refused on write
   (`test_a_sample_no_timestamp_holds_is_refused`), and a stored sample not in the writer's form on read
   (`test_a_stored_sample_not_in_the_writers_form_is_refused`), tests that failed before their fix.
+* A sixth review of the gate, tests that failed before their fix: a sample starting at 00:00 UTC on a
+  bar (`test_a_sample_starting_at_a_bar_at_utc_midnight_is_refused_before_a_trial`) and one ending two
+  days after its last bar (`test_a_sample_ending_on_a_day_with_no_bar_is_refused_before_a_trial`) are
+  refused before a trial; series named by numbers that cover other days are refused by name
+  (`test_series_named_by_numbers_that_cover_other_days_are_refused_by_name`, `tests/test_returns_matrix.py`).
 
 ## Evidence
 
@@ -212,3 +221,18 @@ package; run, executed in this checkout.
   a start after its end. Term 1's range is now checked on write against what NautilusTrader's
   `UnixNanos` (a `u64`) and pandas (at most 2**63 - 1) both hold, and on read for that and for the form
   `create_ledger_study` writes. Reproduced as failing tests. No change of decision.
+* A sixth review of the gate, 2026-11-10, by a third reader, each finding reproduced here as a
+  failing test: a sample starting at 00:00 UTC on a bar's `ts_init` had `record_trial` tell its own run
+  `FAIL` (returns from 2025-03-11, session days from 2025-03-10), and so did one ending two days after
+  its last bar, on bars too thin for the closing order (a return of -9.0e-9 on 2025-05-04, a day with no
+  bar). Term 1 corrected: both are refused before a trial, as a sample the catalog does not cover is,
+  rather than the session days redefined, so no record reads differently. Source:
+  https://raw.githubusercontent.com/nautechsystems/nautilus_trader/d53849b216e20f2c122ca01b4dd0da377638b186/crates/analysis/src/analyzer.rs
+  — `snapshot_day_start` books an account's first snapshot on the day before the one holding it, and
+  `calculate_daily_returns` gives the first day of the series no return. Fetched. The step 7 study's
+  window passes both: its start, 16:00 UTC, is no midnight, and its last bar's session day is its end's,
+  2026-01-01 (run). Refusing an end day with no bar also refuses a study whose run books nothing there,
+  as one test's did (its sample now ends on its last bar's day); kept, since the refusal is the same
+  for every run and says how to end the sample, where the run's failure depends on a fill. `returns_matrix`
+  looked up a short series by its name where skfolio's columns hold `str` of it, and raised `KeyError`
+  for series named `1` and `2` (`bundled`, run). No change of decision.

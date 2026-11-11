@@ -81,6 +81,17 @@ Who decided. The orchestrator chose option 3 and the terms under the owner's del
   (`test_a_record_whose_config_is_not_the_one_its_key_hashes_stops`,
   `test_a_pick_whose_config_is_another_configuration_s_stops`,
   `test_a_failed_record_whose_config_is_not_its_key_s_stops`).
+* A sixth review's cases, tests that failed before their fix: another writer's record stops on every
+  sample, so a move to the same range clears none
+  (`test_a_record_of_another_writer_on_an_earlier_sample_still_stops`,
+  `test_a_record_that_ran_on_an_earlier_sample_with_no_config_still_stops`); a keyed record queued or
+  holding a system attribute (`test_a_keyed_record_queued_or_with_system_attributes_is_another_writers`),
+  one `record_trial` took from Optuna's queue (`test_a_keyed_record_record_trial_took_from_the_queue_stops`,
+  `test_a_queued_trial_with_a_key_that_record_trial_takes_stops_the_ranking`), a value told that is not its
+  returns' Sharpe ratio (`test_a_told_value_that_is_not_the_sharpe_ratio_of_its_returns_stops`) and a
+  config not in `record_trial`'s three parts (`test_a_config_not_in_the_form_record_trial_writes_stops`)
+  stop for good. `test_a_keyed_record_with_a_result_and_no_outcome_stops_for_good` now keys its record
+  with the pick's own key, as the regression it names needs.
 
 ## Evidence
 
@@ -140,3 +151,30 @@ Term numbers are ADR 0035's.
   every stored `config` and stops on one that is not its key's. The eight step 7 records hash to their
   keys (read from a backup copy of the shared ledger, run). Reproduced as failing tests. No change of
   decision.
+* A sixth review of the gate, 2026-11-10, by a second reader and a third, each finding reproduced here
+  as a failing test: term 6's records not in `record_trial`'s shape were read only on the current
+  sample, so a move of the sample to the same range cleared another writer's record, one completed with
+  no outcome or one that ran with no `config`, and ranked at N = 3; they are now read on every sample,
+  as N counts keys on every sample, except what is measured against a sample's own bounds. A keyed
+  `WAITING` record (`Study.enqueue_trial`, which writes `fixed_params`) or one with a system attribute
+  was read as a failure a later record resolves; `record_trial` writes neither. `record_trial` took
+  another writer's queued record of a key and told it `FAIL` with that writer's outcome kept, which read
+  as a run of its key, and the ranking passed on returns no backtest gave: taken (Optuna 5.0.0
+  `Study.ask` takes the oldest queued trial, `_pop_waiting_trial_id`, `bundled`), it carries
+  `record_trial`'s note, and the ranking stops on a keyed record with that note for good. Kept as a
+  known limit: a refused write of the note leaves it `FAIL` with the other writer's outcome, read as a
+  run of its key; a refusal before `ask` would close that, and is not decided here (below). A value told against its returns, and a config holding only the data, passed. Under the
+  regression its docstring names, the test of a record with a result and no outcome passed, its key the
+  text `pick` and not the pick's (run). No change of decision.
+* What a study stopped for good does to N, read in these records on 2026-11-10: N is the number of
+  keys in the study (term 5), a ranking reads one study (ADR 0035 term 1), and counting N over a chain
+  of studies, each naming the one before, was considered and not chosen (ADR 0041, option 3). So a
+  study that another writer's record stops for good keeps its N but is never ranked again, and a new
+  study of the same configurations is ranked at its own N, counted from 0: no record carries the old
+  study's keys into a successor. A refusal that leaves a new study as the only remedy would therefore
+  be a way to lower N, which the protocol forbids (DSR paper, p. 10, fn. 1), and `record_trial` does
+  not refuse a study that holds such a record; carrying N by key into a named successor, or a recorded
+  retirement of the foreign record with its key still counted, is undecided. Stated limit: any writer
+  to the ledger can queue a keyed trial (`Study.enqueue_trial`) and so stop a study for good. The
+  ledger is a local file whose writers are this repository's own sessions, so this is stated, not
+  defended against.

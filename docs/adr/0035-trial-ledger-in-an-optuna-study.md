@@ -98,6 +98,13 @@ Who decided. The orchestrator chose option 3 and the terms under the owner's del
   from any failure told (`test_a_tell_refused_after_the_run_is_a_failure_the_pass_goes_on_from`), and
   such an outcome in a state the writer never leaves is no run
   (`test_an_outcome_is_a_run_only_in_a_state_the_writer_leaves`).
+* A sixth review's cases, tests that failed before their fix: both `tell`s refused after a run leave
+  it `RUNNING` with its outcome and error, a failure the pass goes on from
+  (`test_both_tells_refused_after_the_run_are_a_failure_the_pass_goes_on_from`); a pass that only opens
+  a ledger that is not there creates no folder and no lock
+  (`test_a_pass_that_only_opens_creates_no_folder_and_no_lock`); a study name with a `/` takes its pass
+  lock (`test_a_study_name_with_a_slash_takes_its_pass_lock`, `tests/test_variant_study.py`); and a
+  run's record holds no system attribute (`test_a_trial_round_trips_through_the_sqlite_file`).
 
 ## Evidence
 
@@ -184,3 +191,12 @@ Read 2026-11-10. Fetched means read in this session as raw text or source; run m
   does, and the ranking reads a record holding `traded` or `idle` as run to the end in any state
   `record_trial` leaves (`FAIL` or `RUNNING` with no value too). Reproduced as failing tests. No change
   of decision.
+* A sixth review of the gate, 2026-11-10, by a second reader and a third, each finding reproduced here
+  as a failing test: with both the `tell` of a run's value and `_tell_failed`'s `FAIL` refused, the
+  record stayed `RUNNING` with its outcome and error, which the gate reads as the run it was, yet a pass
+  stopped and left the rest of the grid unrecorded; it now notes it among the failures. A pass that
+  only opened a study made the ledger's folder and its pass lock before finding no ledger, against term
+  1's "opening never creates a file", and a study name holding `/` named a folder; the ledger is looked
+  for first, and the name is percent-encoded (`urllib.parse.quote`, as the ledger's own path). Term 2's
+  value is the per-session Sharpe ratio of the returns stored, and the ranking now stops on a record
+  told another. No change of decision.

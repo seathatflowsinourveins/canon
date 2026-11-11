@@ -181,3 +181,14 @@ def test_names_distinct_only_by_type_are_refused() -> None:
 
     with pytest.raises(ValueError, match="distinct names"):
         returns_matrix([one, other])
+
+
+def test_series_named_by_numbers_that_cover_other_days_are_refused_by_name() -> None:
+    """A third reader: names that are not text met skfolio's text column names in the lookup, and a
+    series short of a day raised `KeyError` instead of being named."""
+    short = daily_series("x", entry({0: 0.01, 1: 0.02}), sessions(0, 1)).rename(1)
+    full = daily_series("y", entry({0: 0.01, 1: 0.02, 2: 0.03}), sessions(0, 1, 2))
+
+    with pytest.raises(ReturnsRejected, match="1: no return on 1 of the 3 session days") as refused:
+        returns_matrix([short, full.rename(2)])
+    assert refused.value.names == ("1",)

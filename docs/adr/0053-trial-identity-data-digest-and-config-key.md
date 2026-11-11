@@ -40,8 +40,13 @@ grows with the data and not with what was tried. Terms 1, 2 and 3 below were ADR
    catalog, read after every other check. A run whose cache holds another number of bars than it
    replayed (`BacktestResult.iterations`, one per data item at the pinned commit), or a bar outside
    the sample, is told `FAIL`. The digest also holds, keyed by instrument ID, the SHA-256 of each
-   instrument the bar types name, as the engine's cache held it (`Cache.instrument`): upstream's
-   `Instrument.to_dict()` without `ts_event` and `ts_init`, in the key's canonical JSON. The node loads
+   instrument the bar types name, as the engine's cache held it (`Cache.instrument`): its definition as
+   NautilusTrader's backtest node compares two (`instrument_definitions_match`, its serialized form
+   without `ts_event` and `ts_init`, every field, a value's text and `info` included), read as
+   upstream's `Instrument.to_dict()`, in the key's canonical JSON, and beside it each `Currency` the
+   instrument holds, by the fields that type has (`code`, `precision`, `iso4217`, `name`,
+   `currency_type`). Upstream writes a currency as its code, which names one currency within a
+   process; the ledger compares runs of different processes. The node loads
    the definition from the catalog with the bars, and the engine trades against it. A cache with no
    definition of one is told `FAIL`.
    Nothing upstream identifies data,
@@ -58,7 +63,8 @@ grows with the data and not with what was tried. Terms 1, 2 and 3 below were ADR
    (read from the class by reflection, so a field upstream adds is not missed), the venue's name,
    settings, fee rates and starting balances, and the bar types; not the sample. The strategies are
    built from the configs after the key is taken. Floats are written by `repr`, enums by name, decimals
-   normalised, balances as `Money` prints them, other NautilusTrader types by `str()`; a value with no
+   normalised, balances as `Money` prints them, one per currency and sorted (two of one currency are
+   refused, since the venue keeps one), other NautilusTrader types by `str()`; a value with no
    stable text form is refused, naming its field. N is the number of distinct keys over every record,
    on every sample. Known limit: the defaults are those of the pinned NautilusTrader, so a pin that
    changes one moves the key of every config that holds that field at its old or new default; a pin
@@ -69,14 +75,17 @@ grows with the data and not with what was tried. Terms 1, 2 and 3 below were ADR
 3. **A record with no key ran no backtest.** `record_trial` writes the key before the run starts, so a
    record without one is what a process killed between `ask` and that write leaves. The ranking stops,
    naming it, until `mark_not_run(study, number)` clears it: a `RUNNING` one is told `FAIL`, its number
-   joins the study user attribute `not_run`, and it is kept and not counted in N. A record with a key
+   joins the study user attribute `not_run`, and it is kept and not counted in N. A `WAITING` one stays
+   `WAITING` and its number joins `not_run_waiting`: it is cleared only while it is `WAITING`, or once
+   `record_trial` took it from Optuna's queue and ran nothing in it; started by another writer after its
+   mark, it may have run anything, stops for good and is not marked again. A record with a key
    is refused, since only a later record of its key resolves it; so is a keyless record that shows a
    run (an outcome, returns or session days, or a result Optuna keeps: `COMPLETE` or `PRUNED`, a value
    or an intermediate value), a trial of an unknown configuration, which stops for good.
 
 Local, no upstream, where the upstreams read say nothing:
 
-* `not_run` (term 3): Optuna 5.0.0 has states, not a "ran nothing" mark, and its `fail_stale_trials`
+* `not_run` and `not_run_waiting` (term 3): Optuna 5.0.0 has states, not a "ran nothing" mark, and its `fail_stale_trials`
   only tells a stale trial `FAIL`; the DSR paper counts trials and says nothing of a record with none.
 * The cache's bar capacity is sized from a count of the catalog's bars before the run (term 1);
   upstream's default keeps 10,000 bars of a type.
@@ -137,6 +146,19 @@ Who decided. The orchestrator chose option 2 and its terms under the owner's del
   (`test_an_instrument_s_digest_is_its_definition_not_when_it_was_stamped`), and a catalog holding two
   definitions of one instrument does not run, so the cache's is the one traded against
   (`test_a_catalog_with_two_definitions_of_one_instrument_does_not_run`).
+* A sixth review of the gate, tests that failed before their fix: USD at precisions 2, 0 and 8 gives
+  three digests (`test_an_instrument_s_digest_holds_the_precision_of_its_currency`); starting balances
+  are keyed one per currency in any order, and two of one currency are refused
+  (`test_starting_balances_are_keyed_one_per_currency_in_any_order`); a queued record marked while
+  `WAITING`, then started and told `FAIL` by another writer, stops and cannot be marked again
+  (`test_a_waiting_record_marked_and_then_failed_by_another_writer_stops`,
+  `test_a_keyless_waiting_record_can_be_marked_not_run`, which had asserted the old reading). With
+  them, passing before and after: one marked while `WAITING` stays cleared once `record_trial` takes it
+  (`test_a_queued_record_marked_while_waiting_stays_cleared_once_record_trial_takes_it`); `5` and `5.0`,
+  and `0.1` and `0.10`, are two definitions to the node and to the digest
+  (`test_two_texts_of_one_value_are_two_definitions_to_the_node_and_the_digest`); and the digest's
+  instruments are tested with an instrument (`test_the_digest_holds_each_instrument_the_run_names`,
+  which fails with the instruments left out, where the test it replaces passed).
 
 ## Evidence
 
@@ -230,3 +252,44 @@ package; run, executed in this checkout.
   definition only when the catalog holds none (`canon_trading.bars_to_catalog`), so a refresh does not
   restamp it. Effects of other instrument classes' fields: UNVERIFIED. Every record made before this correction stops, the step 7 study's eight included
   (ADR 0052).
+* A sixth review of the gate, 2026-11-10, by three second readers and a third, each finding reproduced
+  here as a failing test unless it says otherwise. Two pulled the instrument digest apart: one found
+  definitions equal as numbers but written at another precision (`5` and `5.0`) stop the ranking, the
+  other that USD at precisions 2, 0 and 8, registered again in the recording process, gave one digest
+  and three keys across them passed at DSR 0.9922. Both are settled by upstream's rule for two
+  definitions of one instrument: the backtest node refuses a second definition unless its serialized
+  form without the two stamps is the same (`instrument_definitions_match`,
+  https://raw.githubusercontent.com/nautechsystems/nautilus_trader/d53849b216e20f2c122ca01b4dd0da377638b186/crates/backtest/src/exchange.rs,
+  fetched), and that form writes a `Quantity` as its text with its precision (`Serialize`,
+  `crates/model/src/types/quantity.rs`, fetched) and a `Currency` as its code alone (`Serialize`,
+  `PartialEq` and `Hash` read only `code`, `crates/model/src/types/currency.rs`, fetched). So `5` and
+  `5.0` are two definitions to upstream as to the digest: the node refused a catalog holding both, and
+  `0.1` and `0.10` likewise (run); not a defect. The currency's precision lives in the process's
+  registry, not the catalog, and changed what a run traded: term 1 now holds each currency the
+  instrument holds by its fields, found by reflection over the instrument's getters (`Equity.to_dict`
+  names it `currency`, its getter `quote_currency`; `crates/model/src/python/instruments/equity.rs`,
+  fetched). Nothing in this repository registers a currency (read). The digest of every instrument
+  moves with this; a record made since the instruments joined the digest disagrees with a new one on
+  its sample, and the sample is moved. The step 7 study's records hold no instrument digest and stop
+  until run again on a moved sample, as before (ADR 0052). Starting balances were keyed in the order
+  given and with repeats (a third reader, run); term 2 corrected, and no key of a single balance moves
+  (`test_the_keys_of_default_configs_are_as_they_were` passes). A queued record marked while `WAITING`,
+  later started and told `FAIL` by another writer, stayed out of N (a third reader); term 3 corrected,
+  keeping the case `record_trial`'s own `ask` makes, which takes the oldest queued trial (Optuna 5.0.0
+  `Study._pop_waiting_trial_id`, `bundled`) and tells it `FAIL` with a note and no run. A ranking of a
+  ledger that holds a `WAITING` record in `not_run` from before stops until it is marked again. By
+  reading, test only: the test of the digest's bar types passed no instrument (a second reader). Left
+  to the strategy config's own change: a `bool` keyed apart from the `int` it equals, and fields
+  `MaCrossConfig` takes without using. No change of decision.
+* Code review (`/code-review`, high) of the sixth review's fixes, 2026-11-10: a value told where the
+  returns give no Sharpe ratio passed the check of told values, now a stop
+  (`test_a_value_told_where_record_trial_tells_none_stops`, which failed first); the told value is
+  computed by one function, `told_sharpe`, for the writer and the gate; only the getters named for a
+  currency are read, an error there naming the instrument. Kept as known limits: a number `not_run` holds from a mark made
+  while `WAITING` before `not_run_waiting` existed reads as a mark of a `FAIL` record, so one started
+  since by another writer stays cleared (the step 7 study has no mark, ADR 0052); a refused write of
+  the note on a queued trial `record_trial` takes leaves a marked one stopped for good, the safe side;
+  and a configuration with balances in two currencies given out of order takes a new key, though a
+  ranking of one is UNVERIFIED, since NautilusTrader's daily series takes an account in one currency
+  only (`calculate_snapshot_returns`, `crates/analysis/src/analyzer.rs` at the pinned commit, fetched).
+  Not done: the series of a record whose value is checked is built again for the matrix.
