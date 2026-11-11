@@ -50,11 +50,12 @@ ADR 0035's numbers, 4 to 6; terms 1 to 3 (storage, recording, entry) are ADR 003
    record that ran to the end; a `failed` or `RUNNING` record no later record of its key resolves;
    records of one key that disagree (term 5); an idle key (ADR 0010's Limits); and returns ADR 0010
    step 2 rejects, or a record not in the shape `record_trial` writes. Every record that ran on the
-   sample has its returns read before any two are compared: each a float, finite, the sum of their
-   squares finite, and skfolio's variance and fourth central moment of them finite, or its Sharpe
-   ratio of them reads 0.0 and the DSR's kurtosis NaN (2026-11-11); and for a series that is not
-   constant, the fourth central moment and the square of the second at or above float64's smallest
-   normal, or the kurtosis rounds toward 0 and the DSR rises (2026-11-11). Its session days are each
+   sample has its returns read before any two are compared: each a float, finite, and the series of
+   its session days accepted by the gate's one numeric check,
+   `canon_trading.returns_matrix.session_returns` (corrected 2026-11-11, the seventh round: ADR
+   0031's addition of that date holds the check and replaces the ones this sentence listed until
+   then, the sum of squares finite, skfolio's variance and fourth central moment finite, and both
+   moments at or above float64's smallest normal for a series that is not constant). Its session days are each
    once, in order, as `record_trial` writes them, and include the session day of the sample's end,
    which `record_trial` refuses a sample without (ADR 0041 term 1); none falls on the account's
    registration day before the start (2026-11-11). A stored config whose data does
@@ -71,7 +72,8 @@ ADR 0035's numbers, 4 to 6; terms 1 to 3 (storage, recording, entry) are ADR 003
    as a run, and its key stays counted in N as a configuration that was tried: the strict side, which
    is the gate's. It is kept, as a record in `not_run_waiting` is (ADR 0053 term 3), but unlike that
    keyless record its key is known, and counted. Its number joins the study user attribute `retired`,
-   written under the ledger's lock before the record is taken from the queue (`Study.ask`) and told
+   written under the study's write lock (below; the ledger's lock until 2026-11-11) before the
+   record is taken from the queue (`Study.ask`) and told
    `FAIL` with a note, so a retirement cut short reads as retired, never as a run; nothing is deleted,
    and a second retirement is refused. A keyed record taken from the queue with a note before (as
    `record_trial` took one before it refused) is retired by the list alone if it is `FAIL`, since
@@ -132,11 +134,82 @@ ADR 0035's numbers, 4 to 6; terms 1 to 3 (storage, recording, entry) are ADR 003
    writes a known sample number, its config and every result in that order before its outcome, and
    tells a traded run `FAIL` without an error only where its ratio is not finite; no writer this
    repository names writes either record, so this is stated, not defended against.
+   **One writer at a time** (2026-11-11, the seventh round; ADR 0073 rule 4, the interleaving family,
+   answered in #172 and #177 and found again: those two members were the queue's, the hand-written
+   class below, and the seventh round's is a named writer's, so the lock covers the named writers
+   and the queue's guards stay). Each writer the ledger names, `record_trial`,
+   `move_sample`, `mark_not_run` and `retire_queued`, holds the study's write lock for everything it
+   reads and writes: an exclusive, blocking `fcntl.flock` on a file beside the ledger named for the
+   study, percent-encoded, reentrant in one thread. `record_trial` holds it from its first read of
+   the study, the sample, to its last write, the `tell` of its run or of its failure, so a move, a
+   mark or a retirement lands before a record or after it, never inside, and a second writer waits.
+   ADR 0035 term 1's lock keeps first creation only. `open_study`, the ranking and the pass lock
+   take no write lock, and a second pass on a study is still refused, not queued. Who failed is read
+   by identity: the error `record_trial` lets through carries the number of the trial its attempt
+   asked for, or none if it was refused before one, and the study's pass reads only that trial as
+   its written failure, where it scanned the study for a failed record of the key.
+   The ranking needs no lock because a record is whole at the level of the record. Optuna commits
+   each user attribute in a transaction of its own and a `tell`'s state and value in one (Evidence);
+   `record_trial` writes the outcome after every result (ADR 0035 term 2); and the ranking reads a
+   record as a run only by its outcome. So a ranking read between any two of a record's writes
+   stops on that record, naming it, until its outcome is written, and reads the run it was from then
+   on. One read is of no single moment: Optuna reads a study's trials in several statements, and a
+   `tell` that lands between two gives a record still `RUNNING` with the value told, a state
+   `record_trial` never leaves, on which the ranking stops by name, saying a writer may be
+   recording it and to rank again (term 6). A ranking beside a
+   writer can therefore stop where a moment later it would report; it never reports from half a
+   record. Named limits: the lock is a local `flock`, so it orders writers on the one machine that
+   holds the ledger's file (ADR 0035 term 1); a run that never returns holds it until its process
+   ends, and a move, a mark or a retirement of that study waits that long, with no time limit
+   and nothing printed; on a file system that folds case, two study names differing only in case
+   share one lock and take turns; the reentrancy is found by the lock file's path as spelled, so
+   a writer nested on one thread through a second spelling of one file would wait for itself, and
+   no writer here calls another. `create_ledger_study` opens the lock file before it creates
+   anything, so a study whose lock cannot be opened, a name too long for a file name included,
+   is refused by name and never created: the open is the check.
+   **The build is the check** (2026-11-11, the seventh round; ADR 0073 rule 4, the family of a
+   configuration refused or changed after its trial was asked for, found before, in a sample
+   holding no bar that was recorded where term 1 refuses it (#182), and again). `record_trial` freezes the configuration once, when the attempt starts: the configs and
+   the starting balances as tuples, and one strategy built from each config. The key, the run config
+   and the node are made from that copy alone, so a sequence its caller changes afterwards changes
+   neither. Before the trial is asked for it reads the sample's bars (ADR 0041 term 1) and builds
+   the node with its strategies added (`BacktestNode.build`, `add_strategy`); after, it runs exactly
+   that node, and disposes of it on every path. A configuration upstream refuses at the build (no
+   starting balance, no definition of an instrument in the catalog or two, a strategy ID given
+   twice) is therefore refused before any record exists: it writes nothing, raises no N and cannot
+   stop a study. No list of what upstream refuses is kept here. A failure after a build that
+   succeeded is a real trial and stays a counted `FAIL`: a trade size finer than the instrument
+   takes, refused when the strategy starts, is one. A key whose configuration can never start is
+   never resolved (term 5), so by term 6 its study stops for good, on purpose: the registered plan
+   named a configuration that cannot run, and the strict side is the gate's. Nothing clears the
+   failed key in its study (`mark_not_run` refuses a record with a key, and `retire_queued` takes
+   only another writer's queued record). The remedy as it exists is a new study under a new name
+   (`create_ledger_study`), from a corrected plan pre-registered in a record before its first run,
+   naming the configuration that could not start. Its N, counted from its own keys, is one short
+   of what was tried: the lowering of N the entry of 2026-11-10 names (Evidence). That shortfall is
+   held only by the pre-registration, not by code; carrying N by key into a successor is not built,
+   and the question is not solved. So the limit can be used, the successor's pre-registration
+   states the number tried, its own keys plus each configuration of the earlier study that could
+   not start, and says that the gate's printed N is short by that many; whoever reads a pass from
+   that study reads it against the stated number. The study's pass refuses, by name and before any
+   trial, a plan that names one key twice.
+   **The hand-written class** (2026-11-11; ADR 0073's reachability rule). The gate trusts the ledger
+   as its named writers write it. A state that needs a record written by hand, through Optuna's API
+   or the store, is recorded here once, as a class, and is not defended against: no input check
+   could prevent a forged record. Its members: a trial put in Optuna's queue (`Study.enqueue_trial`,
+   `add_trial`) at any moment, the one between `record_trial`'s check and its `ask` included, which
+   #172 and #177 answered and which is reclassified here, since no named writer queues a trial; a
+   study attribute (`samples`, `not_run`, `not_run_waiting`, `retired`) written by another hand; and
+   the keyed records in no form `record_trial` leaves that the limits above name. The write lock
+   does not cover the class. What the ledger does about a queue (`_refuse_a_keyed_queue`,
+   `_tell_unread`, `_untold`, `retire_queued`) stays as it was, a guard for this class only, and the
+   named limits above about the queue are its members, kept for the operator who meets one.
 
 Who decided. The orchestrator chose option 3 and the terms under the owner's delegation of 2026-11-10
 (ADR 0010's Evidence). Term 7 was decided by the orchestrator under the same delegation, 2026-11-10, over a
 chain of studies (ADR 0041's option 3, not chosen) and over carrying N by key into a named successor
-study, a larger mechanism than one foreign record needs.
+study, a larger mechanism than one foreign record needs. The lead decided term 7's three additions of
+2026-11-11 (one writer at a time, the build as the check, the hand-written class) under ADR 0074.
 
 ### Consequences
 
@@ -147,6 +220,15 @@ study, a larger mechanism than one foreign record needs.
   retired, its key still counts, so the remedy never lowers N (term 7).
 * Bad: retirement is an operator's action; a retired key no configuration of the study runs stops it
   for good, and the race term 7 names is left to the operator.
+* Good (2026-11-11): a configuration upstream refuses to build no longer leaves a failed trial that
+  stops its study for good, and no other caller's move, mark or retirement lands inside a record.
+* Bad (2026-11-11): writers of one study wait for each other, a run that never returns included, and
+  `record_trial` takes only a study the ledger opened. A catalog with no definition of an instrument
+  is now a refusal, where it was a failed trial of its key.
+* Bad (2026-11-11): a configuration that builds and can never start still stops its study for good
+  (terms 5 and 6), on purpose. The remedy that exists, a new study from a corrected plan, has an N
+  one short of what was tried; only its pre-registration, which states the number tried, holds
+  that, and no code does (term 7).
 
 ### Confirmation
 
@@ -276,6 +358,39 @@ study, a larger mechanism than one foreign record needs.
   days reversed, or holding a day twice, are refused
   (`test_session_days_out_of_order_stop`,
   `test_session_days_out_of_record_trial_s_order_are_refused`).
+* From the gate's seventh round (2026-11-11), term 7's two models. Tests that failed before the
+  change, in `tests/test_ledger.py` unless named: each named writer waits for the study's write lock
+  held by another descriptor (`test_every_named_writer_waits_for_the_study_s_write_lock`); a move
+  waits for a record being written (ADR 0041's Confirmation); a study the ledger did not open is
+  refused (`test_a_record_is_written_only_on_a_study_the_ledger_opened`); the error names the trial
+  asked for, or none (`test_a_raised_record_names_the_trial_it_asked_for_or_none`); another
+  caller's failed record is no failure of an attempt refused before its trial
+  (`tests/test_variant_study.py::test_another_caller_s_failed_record_is_no_failure_of_an_attempt_refused_before_its_trial`,
+  Codex); a configuration with no starting balance, or one strategy ID twice, leaves no trial and
+  the ranking as it was (`test_a_configuration_the_node_refuses_to_build_is_refused_before_a_trial`,
+  Antigravity); a balance list changed after the key ran 200,000 USD under the key of 100,000 USD,
+  and now runs what was keyed (`test_a_balance_changed_after_the_key_does_not_reach_the_run`,
+  Codex); the node is disposed however the attempt ends
+  (`test_the_node_is_disposed_however_the_attempt_ends`); the build alone refuses what upstream
+  refuses (`tests/test_backtest.py::test_what_upstream_refuses_of_a_configuration_is_refused_by_the_build`);
+  and a pass naming one key twice is refused before any trial
+  (`tests/test_variant_study.py::test_a_pass_whose_configurations_repeat_a_key_is_refused_before_any_trial`,
+  Antigravity).
+* The ranking beside a writer, tests that passed before and after the change, which is why the
+  ranking takes no lock: read before each of a record's eleven writes, it stops on the record by
+  name before the outcome is written and is the finished study's report, figure for figure, after
+  (`test_rank_beside_a_writer_never_reads_a_half_written_record`); and a read split by a `tell`
+  between two of Optuna's statements stops naming the record `RUNNING` with a value, and the next
+  read ranks (`test_a_read_split_by_a_tell_stops_the_ranking_and_never_ranks_half_a_record`).
+  `open_study`, the ranking and the creation of another study do not wait for the write lock
+  (`test_opening_and_ranking_a_study_do_not_take_its_write_lock`), and a writer nested in one
+  attempt on one thread goes on (`test_a_writer_nested_in_one_attempt_does_not_wait_for_itself`).
+* From the code review of the seventh round's change (2026-11-11): a study named past what a file
+  name holds was created and could then not be written, and is now refused at creation, a test
+  that failed first (`test_a_study_whose_write_lock_cannot_be_opened_is_not_created`); and the
+  test that each named writer waits releases the lock only once the writer has asked for it, where
+  a pause alone would have passed a slow writer that takes no lock (run against writers with the
+  lock taken out: all four fail).
 * The trial count is per study (term 5): nothing in the code stops a new study of the same
   configurations from starting at N = 0, and no record carries an earlier study's keys into it. What
   holds that line is pre-registering every study in a record before its first run, as ADR 0048 does
@@ -526,3 +641,58 @@ Term numbers are ADR 0035's.
   and now stops. Not changed: the ranking-level test of trials with no day in common, which no
   record in the writer's shape can now reach (every one holds the last day); `returns_matrix`'s
   own tests keep that case.
+* The gate's seventh outside round, 2026-11-11 (Codex and Antigravity, on the gate as landed in #185):
+  seven findings, Codex 2 and Antigravity 5, each changing behaviour and each reproduced by a test
+  that failed first; all reachable from a named writer or an input the gate's check passes, none by
+  a hand-written record only (ADR 0073 rule 5 and its reachability rule). Antigravity's first three
+  are the numeric family, answered in ADR 0031's addition of this date. The other four are this
+  record's: Codex's second, another caller's failed record read as this attempt's, in the
+  interleaving family (term 7, one writer at a time); Antigravity's fourth and Codex's first, a
+  configuration refused or changed after its trial was asked for, in the family #182 met (term 7,
+  the build is the check); Antigravity's fifth, a pass naming one key twice, fixed on
+  its own. Two families found again and redesigned as one model each; no new family. No change of
+  decision.
+* https://raw.githubusercontent.com/optuna/optuna/01ddd17ab9f36c3d2817aed9afe376e1cb047d35/optuna/storages/_rdb/storage.py
+  — what makes a record whole at the level of the record. `_create_scoped_session` (line 73)
+  commits once on leaving its block (line 80). `set_trial_user_attr` (line 758) is one such block,
+  so each attribute is one transaction; `Trial.set_user_attr` calls it once (`trial/_trial.py`
+  line 599). `set_trial_state_values` (line 670) writes the values and the state in one block, and
+  `Study.tell` calls it once (`study/_tell.py` line 173), so a `tell` is one transaction.
+  `_get_trials` (line 858) reads the trials with `selectinload` of their values and attributes
+  (lines 874 to 878), a statement each, and `set_study_user_attr` (line 332) replaces an attribute
+  whole with no compare-and-set. Read in the local copy at the pin. That a commit lands between two
+  of the read's statements on SQLite is observed by the test named above, not read in SQLAlchemy.
+* https://raw.githubusercontent.com/nautechsystems/nautilus_trader/d53849b216e20f2c122ca01b4dd0da377638b186/crates/backtest/src/node.rs
+  — `BacktestNode::build` (line 103) "creates a `BacktestEngine`, adds venues, and loads instruments
+  from the catalog", returning the error when `raise_exception` is on; `run` (line 161) "loads data
+  from the catalog and runs the engine" and builds only if no engine exists; `dispose` (line 229),
+  after which neither runs. The three refusals: "No instruments found in catalog" (line 342, in the
+  build); empty `starting_balances` (`…/config.rs` line 391, `SimulatedVenueConfig::validate`, which
+  the build reaches at `node.rs` line 323; the message "starting_balances must not be empty" is
+  `crates/common/src/config.rs` line 199); "Strategy … is already registered"
+  (`crates/system/src/trader.rs` line 588, on `add_strategy`). Read in the local copy at the pin;
+  each refusal run here through `canon_trading.backtest.built_backtest`, 2026-11-11.
+* Second reader (evidence-verifier), 2026-11-11, on the seventh round's text: the empty balances
+  are refused in `config.rs`, not in `exchange.rs` as first cited; #177 redesigned and did not
+  patch; the configuration family's earlier member is named by its pull request, #182, where a
+  round number was given that these entries do not bear out; and the remedy for a configuration
+  that can never start was written as a new study counting its own N, which the entry of
+  2026-11-10 above forbids as a way to lower N, so term 7 now states it as a limit (the lead's
+  decision of that date). Each corrected in place.
+* Code review of the seventh round's change, 2026-11-11, eight findings. Fixed: the study whose
+  lock file cannot be named (above); the waiting test's proof; two comments and a docstring that
+  still described a race between named writers; this section's `fcntl` entry, which cited a page
+  not fetched. Recorded as limits in term 7: the wait has no time limit and prints nothing, and
+  the reentrancy goes by the path's spelling. Stated in `record_trial`'s code: the node is disposed
+  of after the `tell`, so an error raised there names a trial told as it ran (upstream's `dispose`
+  returns nothing, `node.rs` line 229). Not this change's: term 6's pointer holds once ADR 0031's
+  addition of this date is on the same commit.
+* The standard library's `fcntl.flock`, whose docstring in the pinned Python 3.14.10 reads "Perform
+  the lock operation on file descriptor fd. See the Unix manual page for flock(2) for details"
+  (`bundled`, read); its page, https://docs.python.org/3/library/fcntl.html#fcntl.flock, was not
+  fetched this session and is `UNVERIFIED`. `man 2 flock` on macOS (`bundled` with the system, read): "Requesting a lock on an object that is
+  already locked normally causes the caller to be blocked until the lock may be acquired", unless
+  `LOCK_NB` is given; "Locks are on files, not file descriptors", a descriptor duplicated by `dup`
+  or `fork` being one more reference to the one lock. That a second `open` of the lock file waits
+  for a lock held through another descriptor of the same process, which is why the lock is made
+  reentrant here, and that closing the holder's descriptor releases it, are run by the tests above.

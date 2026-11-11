@@ -2494,11 +2494,17 @@ def test_a_sample_move_waits_for_a_record_being_written(
 
 @pytest.mark.parametrize("writer", ["record_trial", "move_sample", "mark_not_run", "retire_queued"])
 def test_every_named_writer_waits_for_the_study_s_write_lock(
-    alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack, writer: str
+    alpaca_bars: AlpacaBars,
+    tmp_path: Path,
+    stack: ExitStack,
+    monkeypatch: pytest.MonkeyPatch,
+    writer: str,
 ) -> None:
     """The same family: each writer the ledger names takes one exclusive `flock` on a file beside
     the ledger named for the study, percent-encoded as the pass lock is, and waits for it. Held
-    here by a thread through a descriptor of its own, as another process holds it."""
+    here by a thread through a descriptor of its own, as another process holds it, and released
+    only once the writer has asked for the lock (from the code review of this change, which found
+    a pause alone would pass a slow writer that takes no lock)."""
     alpaca_bars.write(tmp_path / "catalog")
     study = new_study(stack, tmp_path, "exp/locks")
     calls: dict[str, Callable[[], object]] = {
@@ -2513,38 +2519,72 @@ def test_every_named_writer_waits_for_the_study_s_write_lock(
     if writer == "retire_queued":
         number = foreign_queued(study, strategy())
         calls[writer] = lambda: canon_trading.ledger.retire_queued(study, number)
-    held, released = threading.Event(), []
+    held, asked, released = threading.Event(), threading.Event(), []
+    lock_file = tmp_path / "trials.db.exp%2Flocks.write.lock"
 
     def hold_the_lock() -> object:
-        with (
-            (tmp_path / "trials.db.exp%2Flocks.write.lock").open("a") as lock,
-            open_study("exp/locks", tmp_path / "trials.db") as seen,
-        ):
+        with lock_file.open("a") as lock, open_study("exp/locks", tmp_path / "trials.db") as seen:
             fcntl.flock(lock, fcntl.LOCK_EX)
             held.set()
-            time.sleep(0.5)
+            waited_for = asked.wait(30)
+            time.sleep(0.2)
             states = [t.state for t in seen.get_trials()]
             written = states, seen.user_attrs.get(SAMPLES), seen.user_attrs.get(NOT_RUN)
             released.append(time.monotonic())
             fcntl.flock(lock, fcntl.LOCK_UN)
-            return written
+            return waited_for, written
+
+    real = fcntl.flock
+
+    def asks_then_waits(file: Any, operation: int) -> None:
+        if threading.current_thread() is threading.main_thread():
+            assert Path(file.name) == lock_file
+            assert operation == fcntl.LOCK_EX
+            asked.set()
+        real(file, operation)
 
     holder, written = in_thread(hold_the_lock)
     assert held.wait(60), written
+    monkeypatch.setattr(canon_trading.ledger.fcntl, "flock", asks_then_waits)
     calls[writer]()
     returned = time.monotonic()
+    monkeypatch.undo()
     holder.join(60)
 
     assert released and returned >= released[0], f"{writer} did not wait for the write lock"
     assert written == [
         (
-            {"mark_not_run": [TrialState.RUNNING], "retire_queued": [TrialState.WAITING]}.get(
-                writer, []
+            True,
+            (
+                {"mark_not_run": [TrialState.RUNNING], "retire_queued": [TrialState.WAITING]}.get(
+                    writer, []
+                ),
+                [{"number": 0, "start": utc_ns(START), "end": utc_ns(END)}],
+                None,
             ),
-            [{"number": 0, "start": utc_ns(START), "end": utc_ns(END)}],
-            None,
         )
-    ]
+    ], f"{writer} did not ask for the write lock, or wrote while another held it"
+
+
+def test_a_study_whose_write_lock_cannot_be_opened_is_not_created(tmp_path: Path) -> None:
+    """From the code review of this change: the lock file's name holds the study's name,
+    percent-encoded, so a name the file system cannot hold as a file name made a study that was
+    created and that no writer could then write in (`OSError`, file name too long). The creation
+    opens the lock first, and a study whose lock cannot be opened is not created: the open is the
+    check, and no length is counted here."""
+    # 252 bytes percent-encoded: with the ledger's name, past the 255 bytes a file name may have.
+    name = "試" * 28
+    with (
+        pytest.raises(ValueError, match="write lock of study .* cannot be opened") as raised,
+        create_ledger_study(name, start=START, end=END, path=tmp_path / "trials.db"),
+    ):
+        pytest.fail("the study was created")
+
+    assert isinstance(raised.value.__cause__, OSError)
+    assert not (tmp_path / "trials.db").exists()
+    with create_ledger_study("試" * 4, start=START, end=END, path=tmp_path / "trials.db") as study:
+        move_sample(study, start=START, end="2025-05-04T12:00")
+        assert [s.number for s in samples(study)] == [0, 1]
 
 
 def test_opening_and_ranking_a_study_do_not_take_its_write_lock(
@@ -2674,7 +2714,8 @@ def test_a_read_split_by_a_tell_stops_the_ranking_and_never_ranks_half_a_record(
     several statements (`RDBStorage._get_trials`: the trials, then each one's values and
     attributes), each seeing the last commit, so a `tell` that lands between two of them gives a
     record still `RUNNING` with the value told. That is no state `record_trial` leaves, and the
-    ranking stops on it, naming it; the next read ranks the finished study. The statements are
+    ranking stops on it, naming it and saying a writer may be recording it and to rank again; the
+    next read ranks the finished study. The statements are
     watched through the standard library's `sqlite3.Connection.set_trace_callback`."""
     alpaca_bars.write(tmp_path / "catalog")
     study = new_study(stack, tmp_path, "split")
@@ -2724,7 +2765,11 @@ def test_a_read_split_by_a_tell_stops_the_ranking_and_never_ranks_half_a_record(
     assert split and not thread.is_alive()
     [stopped] = read
     assert isinstance(stopped, RankingStopped), stopped
-    assert re.search(r"#2 \(traded\) was told RUNNING with outcome", str(stopped)), stopped
+    assert re.search(
+        r"#2 \(traded\) is RUNNING with a value, as record_trial leaves none: a writer may be "
+        r"recording it now: rank again once it has finished",
+        str(stopped),
+    ), stopped
     assert rank(reader).n == 3
 
 

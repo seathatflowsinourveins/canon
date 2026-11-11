@@ -241,9 +241,12 @@ _RAN_STATES = frozenset(state for state, _, _ in _RAN_AS_TOLD)
 
 # A record that ran, still `RUNNING`, with a value. `record_trial` leaves none so: Optuna's `tell`
 # writes the value and the state in one transaction (`set_trial_state_values`,
-# `optuna/storages/_rdb/storage.py` at the pinned commit). Whether a read can fall across that
-# write and show one is UNVERIFIED, so the stop does not call the ledger damaged: it names the
-# remedy that tells a writer still recording from another writer's record, ranking again.
+# `optuna/storages/_rdb/storage.py` at the pinned commit). A read can fall across that write and
+# show one: Optuna reads a study's trials in several statements, and a `tell` between two of them
+# is observed in `tests/test_ledger.py`,
+# `test_a_read_split_by_a_tell_stops_the_ranking_and_never_ranks_half_a_record`. So the stop does
+# not call the ledger damaged: it names the remedy that tells a writer still recording from
+# another writer's record, ranking again.
 _MAY_BE_RECORDING = (
     "is RUNNING with a value, as record_trial leaves none: a writer may be recording it now"
 )

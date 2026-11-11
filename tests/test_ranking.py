@@ -1282,7 +1282,7 @@ def test_a_keyless_waiting_record_can_be_marked_not_run(study: optuna.Study) -> 
 
 
 def test_a_trial_is_marked_not_run_only_on_a_study_the_ledger_opened(tmp_path: Path) -> None:
-    """The mark holds the ledger's lock, which only a study the ledger opened can name."""
+    """The mark holds the study's write lock, which only a study the ledger opened can name."""
     bare = optuna.create_study(
         study_name="bare", storage=f"sqlite:///{tmp_path / 'bare.db'}", direction="maximize"
     )

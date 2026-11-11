@@ -66,7 +66,9 @@ with what was tried.
    `config` holds.
 5. **Moving the sample.** `move_sample(study, start, end)` appends a sample numbered after the last; the
    same range again is a new sample, the way a corrected catalog is taken in. A move reads and writes the
-   samples under ADR 0035 term 1's lock, so two moves at once are both kept. No record is overwritten or
+   samples under the study's write lock, ADR 0054 term 7 (corrected 2026-11-11: the per-study write
+   lock (round 7); no change of decision), so two moves at once are both kept, and a move waits for a
+   record being written. No record is overwritten or
    deleted. The ranking reads only records on the current sample, and stops, naming it, on a key with no
    record there: every configuration the study tried is run again before a ranking. A record with a key
    and no sample number of the study's is read as on the current sample, so its failure stops the
@@ -107,8 +109,9 @@ Who decided. The orchestrator chose option 2 and its terms under the owner's del
 * Bad: after a move, every configuration must run again before any ranking; a configuration whose data
   cannot cover the sample, such as an instrument listed later, stops the study until the sample moves
   to a range it covers.
-* Moving the sample takes the ledger's lock, so only a study the ledger opened (`open_study`,
-  `create_ledger_study`) can be moved.
+* Moving the sample takes the study's write lock (corrected 2026-11-11: the per-study write lock
+  (round 7); no change of decision), so only a study the ledger opened (`open_study`,
+  `create_ledger_study`) can be moved, and a move waits for a record being written.
 * Bad: a sample must lie inside what the catalog recorded. Bars written without a window cover only
   their first to last `ts_init`, and a stretch with no bar between two loads is never recorded;
   `record_trial` refuses the sample, naming it, and consolidating the catalog's files closes it.
@@ -189,6 +192,19 @@ Who decided. The orchestrator chose option 2 and its terms under the owner's del
   from the 2026-11-10 run in the last bit, by key order, with the DSR and verdict identical:
   0.00011297439028764905 summed in recording order on 2026-11-10, 0.00011297439028764906 in key
   order. From this change on the key-order figures are the ones a later run is held to. Run.
+* From the gate's seventh round (2026-11-11), tests that failed before the change: a move from
+  another caller waits for a record being written, held at five points from the read of the
+  sample's bars to the `tell` and on a run that raises, and lands after it as sample 1 with the
+  record on sample 0 (`test_a_sample_move_waits_for_a_record_being_written`, Codex); `move_sample`
+  waits for the study's write lock held by another descriptor
+  (`test_every_named_writer_waits_for_the_study_s_write_lock`). The pass's own checks of a moved
+  sample (term 5) stay: a move still lands between two of a pass's trials. The two tests above of
+  a sample moved beneath a run move it from the run's own thread, through the lock's reentrancy;
+  no other caller reaches inside a record any more. And a catalog that holds
+  the bars and no definition of the instrument, or two definitions, is refused before a trial,
+  where it was a failed trial of its key
+  (`test_a_catalog_without_the_instrument_is_refused_before_a_trial`,
+  `test_a_catalog_with_two_definitions_of_one_instrument_does_not_run`; ADR 0054 term 7).
 
 ## Evidence
 

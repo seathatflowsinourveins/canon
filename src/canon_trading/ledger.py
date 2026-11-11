@@ -29,10 +29,12 @@ identity is glue, ADR 0054 term 4: `config_key` is the SHA-256 of the canonical 
 built from what this repo sets, and the run is built with it as its `id`. Nothing upstream identifies
 the data a run read either, so `data_digest` is glue too (ADR 0053).
 
-The value told for a run that traded is skfolio's `Portfolio.sharpe_ratio` (1.12.8 and 1.12.9,
-`portfolio/_base.py`) over the run's own series as `canon_trading.returns_matrix.daily_series` accepts
-it: mean over sample standard deviation, per session. It is there for a later sampler;
-`canon_trading.ranking` does not read it.
+The value told for a run that traded is the per-session Sharpe ratio the gate would take of the
+run's own series, mean over sample standard deviation, read from
+`canon_trading.returns_matrix.session_returns`, the gate's one numeric check (ADR 0031;
+`told_sharpe`). A run whose series that check refuses is told no value, and `FAIL`, still `traded`.
+The value is there for a later sampler; `canon_trading.ranking` ranks from the returns and holds a
+told value to this one.
 
 First creation of a ledger file is serialised with an exclusive `fcntl.flock` (the standard library's
 `fcntl`, POSIX `flock(2)`) on `trials.db.lock` beside it. Optuna's `RDBStorage` runs SQLAlchemy's
@@ -263,6 +265,9 @@ def create_ledger_study(
 
     ADR 0041. A study of that name already in the file raises Optuna's `DuplicatedStudyError`, unless
     an interrupted creation left it with no sample and no trial: then it is completed (module header).
+    A study whose write lock cannot be opened beside the ledger (`_write_lock`; a name longer than a
+    file name may be, percent-encoded) raises `ValueError` before anything is created, since no
+    writer could write in it.
     `start` and `end` are UTC nanoseconds, or a date or time that `pandas.Timestamp` reads, taken as UTC
     when it has no offset. Both are instants and both are included: a date with no time is its
     midnight, so an `end` of `"2025-06-16"` leaves out a bar of that day stamped after 00:00. With no
@@ -271,6 +276,14 @@ def create_ledger_study(
     sample = Sample(0, *_range(start, end))
     path = _ledger(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        # The open is the check: a name the file system does not take as a file name is refused here.
+        _write_lock_path(path, name).open("a").close()
+    except OSError as error:
+        raise ValueError(
+            f"the write lock of study {name!r} cannot be opened beside the ledger at {path} "
+            f"({error}), so no record could be written in it; the study is not created",
+        ) from error
     with ExitStack() as opened:
         with _ledger_lock(path):
             storage = opened.enter_context(_storage(path, "rwc"))
@@ -386,6 +399,11 @@ _WRITE_LOCKS: dict[Path, _WriteLock] = {}
 _WRITE_LOCKS_GUARD = threading.Lock()
 
 
+def _write_lock_path(path: Path, name: str) -> Path:
+    """The write lock file of the study `name` in the ledger at `path` (`_write_lock`)."""
+    return path.parent / f"{path.name}.{quote(name, safe='')}.write.lock"
+
+
 @contextmanager
 def _write_lock(study: optuna.Study, to: str) -> Generator[None]:
     """Hold `study`'s write lock, waiting for whoever holds it: one writer at a time (module header).
@@ -397,12 +415,17 @@ def _write_lock(study: optuna.Study, to: str) -> Generator[None]:
     wait for it for ever; each lock file therefore has one `threading.RLock` in the process, and the
     file is locked when a thread first takes that and unlocked when it last leaves. So a writer
     called inside another on the same study and thread, through any handle on it, goes on, and one
-    on another thread or in another process waits. On a file system that folds case, two study names
-    that differ only in case share one file, and their writers take turns. A study not opened by
-    `create_ledger_study` or `open_study` raises `ValueError`: its lock cannot be named.
+    on another thread or in another process waits, with no time limit: a writer that never returns
+    holds the others until its process ends. On a file system that folds case, two study names
+    that differ only in case share one file, and their writers take turns. The `RLock` is found by
+    the lock file's path as spelled, so a writer nested in another on one thread through a second
+    spelling of one file (those two names, or the ledger's folder in another case) would wait for
+    itself; no writer here calls another. A study not opened by `create_ledger_study` or
+    `open_study` raises `ValueError`: its lock cannot be named. `create_ledger_study` opens the
+    file once, so a study whose lock cannot be opened is never created.
     """
     path = _opened_ledger(study, to)
-    lock_path = path.parent / f"{path.name}.{quote(study.study_name, safe='')}.write.lock"
+    lock_path = _write_lock_path(path, study.study_name)
     with _WRITE_LOCKS_GUARD:
         held = _WRITE_LOCKS.setdefault(lock_path, _WriteLock(threading.RLock()))
     with held.thread:
@@ -840,8 +863,8 @@ def record_trial(
     A run that raises, or whose result cannot be
     recorded before its outcome, is told `FAIL` with outcome `failed` and its error, and the exception
     passes through. A
-    run with no filled order is told `FAIL` with outcome `idle`; any other `COMPLETE` with `traded`, or `FAIL`, still `traded`, if its
-    Sharpe ratio is not finite. The outcome is written last, so a record that has one ran to the end:
+    run with no filled order is told `FAIL` with outcome `idle`; any other `COMPLETE` with `traded`, or `FAIL`, still `traded`, if
+    the gate's numeric check refuses its series (`told_sharpe`). The outcome is written last, so a record that has one ran to the end:
     a `tell` that fails after it leaves the outcome as it is, told `FAIL` with its error, or still
     `RUNNING` if that cannot be told either (`_tell_failed`). A config that is not a `MaCrossConfig`
     itself is refused before anything is recorded (`trial_config`), and so is a study where another
@@ -902,6 +925,8 @@ def trial_asked_for(error: BaseException) -> int | None:
     None for an attempt refused before its trial, where nothing was recorded, and for an error
     `record_trial` did not raise. The trial is the attempt's own, one `Study.ask` created
     (`_own_trial`): a trial it took from Optuna's queue and told `FAIL` with the queue's note is not.
+    The number says which trial the attempt asked for, not how it was told: read the trial for that
+    (an error raised after the `tell`, while the node is disposed of, names a trial told as it ran).
     """
     number = getattr(error, ASKED_FOR, None)
     return number if isinstance(number, int) and not isinstance(number, bool) else None
@@ -978,8 +1003,11 @@ def _run_as_a_trial(
     """Ask for the attempt's trial, run `node` in it, write what the run left and tell it.
 
     `node` is the node built from the configuration `key` hashes (`_record`), over `sample`, whose
-    bars the coverage check read with digest `checked_digest`. Everything after the trial is asked
-    for is inside the `try` that tells a failure (`record_trial`).
+    bars the coverage check read with digest `checked_digest`. Everything here after the trial is
+    asked for is inside the `try` that tells a failure (`record_trial`). The node is disposed of
+    after this returns or raises (`_record`), so after the `tell`: upstream's `dispose` returns
+    nothing and refuses nothing, and an error or interrupt raised while it runs leaves the trial as
+    it was told and names it (`trial_asked_for`).
     """
     trial = _own_trial(study)
     asked.append(trial.number)
@@ -1064,7 +1092,7 @@ def _refuse_unbooked_ends(bars: Sequence[Bar], sample: Sample) -> None:
 
     NautilusTrader's daily series books the run as `session_day` and `registration_day` say. A bar on
     the registration's day, as one at exactly a sample's start at 00:00 UTC is (`session_day` moves
-    it back a day), is a session day with no return, so `daily_series` refuses every such run. And a
+    it back a day), is a session day with no return, so `session_returns` refuses every such run. And a
     run's last fills, its strategies' `on_stop`, are booked on the session day of its end, which must
     hold a bar: with none there, a fill that moved the balance gave a return on a day with no bar,
     refused the same way. A sample holding no bar at all has no session day of its end either, and is
@@ -1236,7 +1264,8 @@ def _tell_taken(study: optuna.Study, trial: optuna.Trial, note: str, limit: str 
         except Exception as telling:  # noqa: BLE001, the note's refusal is the error raised
             error.add_note(f"trial #{trial.number} could not be told FAIL either: {telling!r}")
         raise
-    # `skip_if_finished`: `retire_queued` may have told a taken trial `FAIL` between the two writes.
+    # `skip_if_finished`: a hand-written `tell` may have finished a taken trial between the two
+    # writes (ADR 0054 term 7, the hand-written class; `retire_queued` waits for the write lock).
     study.tell(trial, state=TrialState.FAIL, skip_if_finished=True)
 
 
@@ -1600,7 +1629,8 @@ def mark_not_run(study: optuna.Study, number: int) -> None:
                 )
         if number in lists[NOT_RUN_WAITING]:
             if taken_untold(trial):
-                # `skip_if_finished`: the taker's own `tell` may land first, to the same end.
+                # `skip_if_finished`: a `tell` by another hand may land first, to the same end
+                # (the hand-written class; `record_trial`'s own waits for the write lock).
                 study.tell(number, state=TrialState.FAIL, skip_if_finished=True)
                 return
             if not cleared_while_waiting(trial):
