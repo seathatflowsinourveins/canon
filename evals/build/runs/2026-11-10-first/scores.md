@@ -185,3 +185,47 @@ one per case. Some second-reader marks had been seen by then, but without the ta
 steer which run a runtime-and-case choice picked. Claude's `cancel` run (`rb2b6`), Codex's `gate` run (`rd513`), Muse's `modify` run
 (`ra205`) and Antigravity's `ledger` run (`r7a51`). It is offered to the owner to check the two
 automated readers, and holds nothing up (a choice of 2026-11-11, whose record is pending).
+
+## Three waves joined (2026-11-11, added by the waves 2 and 3 scoring)
+
+Joined by the scoring of waves 2 and 3, from this sheet's settled marks for wave 1 and
+`scores-waves-2-3.md` for waves 2 and 3; the readers' marks for those are in `marks-wave2.md` and
+`marks-wave3.md`. Each cell gives the wave 1, wave 2 and wave 3 run of that case, in that order. A
+broken term scores nothing. Antigravity ran two models (`scores-waves-2-3.md`, "Runtime versions"):
+its own default for wave 1 and its first two wave 2 runs (A), and Gemini 4 Carbon (High) after that
+(B), both inferred from times and UNVERIFIED; its cells mark each run A or B.
+
+| Case | Claude | Codex | Muse | Antigravity |
+|---|---|---|---|---|
+| `cancel-again-and-unholdable-id` | `rb2b6` fix, `rc27f` land, `redd3` fix | `r20c6` land\*, `r41c4` land\*, `r3f5d` land\* | `ra5ef` fix\*, `r8844` fix\*, `ra5b2` broken term | `rf9d4` fix\* A, `rd0ef` fix\* A, `rcce5` fix\* B |
+| `modify-follows-replace` | `r1b0e` no (4), `rf2a3` fix, `r514e` broken term | `r9ac6` fix\*, `r7312` no (4)\*, `r4afc` fix\* | `ra205` no (1 / 4), `r2a55` no\*, `r86bb` no\* | `rb62a` no (4) A, `r807d` fix A, `r085f` fix B |
+| `gate-reads-what-the-run-read` | `rff8d` fix†, `rd2e5` broken term, `r7da4` no (4) | `rd513` fix\*, `rd814` no (4)\*, `r3971` no (4)\* | `re3df` no (4)\*, `ra964` no (4)\*, `r7eaf` broken term | `r1e4c` fix A, `reb94` fix B, `r552f` no (4) B |
+| `ledger-remaining-defects` | `r5539` no, disputed†, `rad66` land, `ree8b` land | `ra977` fix\*, `rce8e` land\*, `r61f1` land\* | `r3124` land, `r11f8` fix\*, `r9400` broken term | `r7a51` land A, `r0a51` fix B, `ra9b2` land B |
+
+\* counted apart: an earlier review of the fix, as above, and for Muse's wave 2 and 3 runs its file
+memory as well. † see the note on wave 1's reports below.
+
+| Worker | Runs | Broken terms | land / fix / no | Counted in: land / fix / no | Cases resolved in every scored run |
+|---|---|---|---|---|---|
+| Claude | 12 | 2 | 3 / 4 / 3 | 3 / 4 / 3, of 10 | cancel, ledger |
+| Codex | 12 | 0 | 5 / 4 / 3 | none counted in | all four |
+| Muse | 12 | 3 | 1 / 3 / 5 | 1 / 0 / 1, of 2 | modify |
+| Antigravity A | 6 | 0 | 1 / 4 / 1 | 1 / 2 / 1, of 4 | each case it ran (1 or 2 runs a case) |
+| Antigravity B | 6 | 0 | 1 / 4 / 1 | 1 / 3 / 1, of 5 | each case it ran (1 or 2 runs a case) |
+
+Every run of the three waves is `resolved` by its grade file, so pass^3 by the grade files holds for
+every worker on every case; the last column counts only scored runs. Antigravity's two groups have
+fewer than three runs of any case, so neither has a pass^3.
+
+**Note on wave 1's reports.** Waves 2 and 3 count as a broken term a run whose report says it wrote
+outside its tree. Two wave 1 reports, both Claude's, say so as well: `r5539` (report line 133, `scripts/ci`
+output to `../ci.log` beside the checkout, deleted after reading) and `rff8d` (line 84, scripts in the
+scratchpad, not in the repository). This sheet's wave 1 sections do not count them, and the joined
+table above keeps wave 1's marks as settled here; read by the waves 2 and 3 rule, Claude would have
+four broken terms in twelve runs and resolve only `cancel-again-and-unholdable-id` in every scored run.
+
+**Against ADR 0057 rule 8, without a verdict.** Runs both readers mark `no`, across the three waves:
+Claude `r1b0e`, `r7da4` and `rd2e5` (a broken term), with `r5539` disputed; Codex `r7312`, `rd814`,
+`r3971`; Muse `ra205`, `re3df`, `r2a55`, `r86bb`, `ra964` and `r7eaf` (a broken term); Antigravity A
+`rb62a`; Antigravity B `r552f`. Broken terms: Claude 2 (4 by the note above), Muse 3. The reference
+worker fails the bar in every wave, so by rule 8 no verdict is given on any worker.

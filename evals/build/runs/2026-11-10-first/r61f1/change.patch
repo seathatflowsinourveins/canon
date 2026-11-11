@@ -1,0 +1,300 @@
+diff --git a/.gitignore b/.gitignore
+index 674c1d9..a4e4fa5 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -17,8 +17,8 @@ CLAUDE.local.md
+ catalog/*
+ !catalog/README.md
+ 
+-# the trial ledger: an Optuna SQLite study in ledger/ (ADR 0035), never committed
+-ledger/
++# the trial ledger: an Optuna SQLite study at the root in ledger/ (ADR 0035), never committed
++/ledger/
+ 
+ # Python
+ .venv/
+diff --git a/docs/adr/0035-trial-ledger-in-an-optuna-study.md b/docs/adr/0035-trial-ledger-in-an-optuna-study.md
+index 56b9ccb..af65380 100644
+--- a/docs/adr/0035-trial-ledger-in-an-optuna-study.md
++++ b/docs/adr/0035-trial-ledger-in-an-optuna-study.md
+@@ -41,15 +41,19 @@ trial store that meets every driver. Leaving it is cheap, since every trial read
+    study; it keeps `JournalFileBackend` for parallel and NFS use. The file is `ledger/trials.db` in the
+    main checkout, the folder holding the clone's common git directory, so every worktree shares it;
+    outside a git checkout a path must be given. Opening never creates a file or study; creating one is
+-   its own call, with its sample (ADR 0041). The folder is ignored like `catalog/`. A ranking reads one
+-   study.
++   its own call, with its sample (ADR 0041). The root folder is ignored like `catalog/`. Creating
++   storage takes a process-shared `fcntl.flock` on a persistent sibling `<filename>.lock` for the
++   `RDBStorage` constructor only: table creation and schema-version initialization otherwise race.
++   Opening takes no such lock and creates no lock file; runs are not held under it. A ranking reads
++   one study.
+ 2. **Recording**, through ask and tell, the tutorial's way to apply Optuna to an existing problem. The
+    key (term 4) is computed first; a call refused before a config exists is not a trial. The trial is
+    then asked for, so a run that never returns stays as `RUNNING`. A run that raises is told `FAIL`
+    by this repo's code, with user attribute `outcome` = `failed`; one with no filled order `FAIL` with
+-   `idle`; any other `COMPLETE` with `traded` and skfolio's per-session Sharpe ratio over its session
+-   days (for a later sampler; the gate does not read it), or `FAIL`, still `traded`, if that ratio is
+-   not finite. Such a record ran to the end: no later record resolves it, and ADR 0031 stops the gate.
++   `idle`; any other `COMPLETE` with `traded` and skfolio's per-session Sharpe ratio over the daily
++   series ADR 0010 step 2 accepts (for a later sampler; the gate does not read it), or `FAIL` with no
++   value, still `traded`, if that series is refused or its ratio is not finite. Such a record ran to
++   the end: no later record resolves it, and ADR 0010 or ADR 0031 stops the gate.
+ 3. **Entry.** User attributes `config`, `config_key`, `run_config_id`, `backtest_start`, `backtest_end`,
+    `returns_series` (keyed by nanoseconds as text), and `session_days`, this record's addition: the UTC
+    days on which a bar of the run arrived (one at exactly 00:00 counts for the day ending there, as
+@@ -151,3 +155,10 @@ Read 2026-11-10. Fetched means read in this session as raw text or source; run m
+   worktree (run). Opening an empty file raised `StorageInternalError` and left it unchanged (run).
+ * Code review, 2026-11-10 (`/code-review`): term 2 missed a traded run with no finite Sharpe ratio, and
+   the value told used calendar days. Both corrected, with no change of decision.
++* Follow-up correction, 2026-11-11, checked offline against the installed pins: Optuna 5.0.0's
++  `storages/_rdb/storage.py`, `RDBStorage.__init__` and `_VersionManager`, initialize tables and
++  schema versions in separate operations. Python 3.14's `fcntl.flock` and the local `flock(2)` manual
++  give an exclusive advisory lock; holding it around that constructor passes three rounds of two
++  processes creating one new ledger. The value told now uses the gate's own `daily_series`; a
++  traded run whose returns it refuses is told `FAIL` with no value. The ignore rule is `/ledger/`,
++  so a nested folder of that name remains trackable. The six follow-up regression tests passed.
+diff --git a/docs/architecture.md b/docs/architecture.md
+index 59945f1..83e64d2 100644
+--- a/docs/architecture.md
++++ b/docs/architecture.md
+@@ -74,8 +74,9 @@ adapter is a uv workspace member of its own, kept apart from strategies as upstr
+ 2. `run_backtest` builds one `BacktestNode` per run on a simulated `ALPACA` venue: `NETTING`, `CASH`,
+    `L1_MBP` bar execution, a zero-rate fee model; no slippage, latency or market-hours model (`backtest.py`).
+ 3. `record_trial` asks the study for a trial, runs it over the study's sample, and tells it `COMPLETE`
+-   (traded) or `FAIL` (failed, idle, or traded with a Sharpe ratio that is not finite), with its config
+-   key, sample, range, daily returns, session days and data digest (`ledger.py`, ADR 0035, ADR 0041).
++   (traded) or `FAIL` (failed, idle, or traded with a refused daily series or a Sharpe ratio that is
++   not finite), with its config key, sample, range, daily returns, session days and data digest
++   (`ledger.py`, ADR 0035, ADR 0041). The value told uses the same daily series the gate accepts.
+ 4. `returns_matrix` keeps only daily series and drops closed days; a trial that does not cover every
+    session day of the sample stops the ranking, with nothing trimmed, through skfolio's `Population`
+    and pandas (`returns_matrix.py`, ADR 0010 step 2, ADR 0041).
+diff --git a/docs/roadmap.md b/docs/roadmap.md
+index 7c402a6..d7cc368 100644
+--- a/docs/roadmap.md
++++ b/docs/roadmap.md
+@@ -8,7 +8,7 @@ target, the Record column says so. No step has a date; no record gives one.
+ |---|---|---|---|---|
+ | 1 | The harness | Registry and lock, records with evidence and expiry, one check script, landing with a review note, model routing | Done | ADR 0001, 0002, 0005, 0013, 0014, 0017, 0019 |
+ | 2 | The Alpaca adapter proven on paper | Data, orders, cancels and fills pass through a real node against Alpaca's paper environment | Done for data, market and limit orders, cancels, fills and a rejection, in upstream's data and execution testers; not run: a partial fill through the adapter, `load_all` at full scale | ADR 0030, 0036 |
+-| 3 | Strategy evaluation | Every backtest a trial in the ledger, the returns matrix, the deflated Sharpe gate at 0.95 | Landed and tested on generated bars and series. A full review found defects: those that let a ledger that should be rejected pass are fixed (one shared ledger, a fixed sample per study, the data each trial read, a key of what this repo sets, V tested within rounding; ADR 0041). Stops that never cleared, crashed or named no trial are fixed too (every stop listed in ADR 0031, 0035 and 0041, gathered in one call). Smaller defects are not yet fixed. **No ranking is to be relied on until they are** | ADR 0010, 0031, 0035, 0041 |
++| 3 | Strategy evaluation | Every backtest a trial in the ledger, the returns matrix, the deflated Sharpe gate at 0.95 | Implemented and tested on generated bars and series. A full review found defects: those that let a ledger that should be rejected pass are fixed (one shared ledger, a fixed sample per study, the data each trial read, a key of what this repo sets, V tested within rounding; ADR 0041). Stops that never cleared, crashed or named no trial are fixed too (every stop listed in ADR 0031, 0035 and 0041, gathered in one call). The six follow-up defects are fixed and tested offline: concurrent ledger creation, UTC recorded ranges, finite matrix input, values only for accepted daily series, refusal of an empty strategy list, and a root-only ledger ignore rule. Real strategies have not been ranked | ADR 0010, 0031, 0035, 0041 |
+ | 4 | Order management | Cancel-all, stop orders, modify, the account query, fill history at start-up, request timeouts | Cancel-all, stop and stop-limit orders, and modify by Alpaca's replace landed; the account is read at connect only; fill history at start-up comes from Alpaca's fill activities (ADR 0024), passed twice on paper before its latest changes, which wait for a regular session; every alpaca-py REST request has a timeout, through a requests transport adapter on alpaca-py's private session, since alpaca-py offers none; on paper it waits for the next regular session | ADR 0024, 0036, 0039, 0042 |
+ | 5 | Real market data in the local catalog | Alpaca's bars and instruments written to `catalog/` | Done: `load_bars` requests a bar type's bars through the adapter's data client with the node's catalog write-back and writes the instrument; on paper it loaded 60 AAPL daily bars (2025-01-02 to 2025-03-31) and `run_backtest` ran on them. Raw IEX bars only, the adapter's feed and adjustment | ADR 0040 |
+ | 6 | Extended hours, and a whole session on paper | Orders in the extended and overnight sessions; a strategy running a whole session on paper under the engine's own risk limits, around the clock on weekdays. This target is intent: no record sets it yet | Begun: `ema_cross_paper_node` runs upstream's `EmaCross` on paper in real time under the risk engine's limits (50 submits a minute); its paper test bounds it to one order a run. `EmaCross` has no position check, so it suits that bounded check and not an unattended run. A limit order submitted with `params={"extended_hours": True}` is sent eligible for the extended and overnight sessions, and passed on paper in after-hours; the data client still streams IEX only, and the overnight feed is not chosen. `mise run paper:session` runs `SessionMaCross` for one bounded window with a one-share cap in the node, marked limits outside the session; no window has traded yet | ADR 0037, 0038, 0044; ADR 0036 records why stops are never sent in extended hours |
+diff --git a/src/canon_trading/backtest.py b/src/canon_trading/backtest.py
+index a5c7031..f072c57 100644
+--- a/src/canon_trading/backtest.py
++++ b/src/canon_trading/backtest.py
+@@ -244,8 +244,11 @@ def run_backtest_config(config: BacktestRunConfig, strategies: Sequence[MaCross]
+     """Run `strategies` under `config`, a config `backtest_run_config` built, and dispose the node.
+ 
+     `canon_trading.ledger` calls this with the config whose key it recorded, so the config hashed is
+-    the config run.
++    the config run. As in `backtest_run_config`, at least one strategy is required before a node is
++    built: the node otherwise replays the bars without anything to trade them.
+     """
++    if not strategies:
++        raise ValueError("run_backtest_config needs at least one strategy")
+     node = BacktestNode([config])
+     try:
+         node.build()
+diff --git a/src/canon_trading/ledger.py b/src/canon_trading/ledger.py
+index 6748ea4..11ecb14 100644
+--- a/src/canon_trading/ledger.py
++++ b/src/canon_trading/ledger.py
+@@ -20,6 +20,13 @@ goes in SQLAlchemy's URL with `uri=true` (SQLAlchemy 2.1.8, `dialects/sqlite/pys
+ Connections"); SQLAlchemy percent-decodes the database part of a URL (`engine/url.py`, `_parse_url`), so
+ each `%` is encoded once more for it.
+ 
++Creating storage is serialized through Python's `fcntl.flock(LOCK_EX)` on a persistent sibling
++`<filename>.lock` (Python 3.14, `fcntl.flock`; `flock(2)`, read locally 2026-11-11). Optuna's
++`RDBStorage.__init__` creates tables and initializes its schema version in separate operations
++(`storages/_rdb/storage.py` at the pin), so SQLite's transaction locks alone do not serialize that
++setup. The advisory lock covers that constructor only, is explicitly unlocked afterwards and is
++never unlinked; opening an existing ledger creates no lock file.
++
+ NautilusTrader v2.0.0rc8 binds no config identity to Python: `BacktestRunConfig.id` defaults to a fresh
+ UUID4 (`crates/backtest/src/config.rs` at the pinned commit) and the config cannot be serialised. So the
+ identity is glue, ADR 0035 term 4: `config_key` is the SHA-256 of the canonical JSON of `trial_config`,
+@@ -27,8 +34,9 @@ built from what this repo sets, and the run is built with it as its `id`. Nothin
+ the data a run read either, so `data_digest` is glue too (ADR 0041).
+ 
+ The value told for a run that traded is skfolio's `Portfolio.sharpe_ratio` (1.12.8,
+-`portfolio/_base.py`) over the run's own series: mean over sample standard deviation, per session. It is
+-there for a later sampler; `canon_trading.ranking` does not read it.
++`portfolio/_base.py`) over the same `daily_series` the gate accepts: mean over sample standard
++deviation, per session. A series that `daily_series` refuses is told no value and `FAIL`, still
++`traded`. The value is there for a later sampler; `canon_trading.ranking` does not read it.
+ 
+ A session day (ADR 0035 term 3) is a UTC day on which a bar of the run became available, its `ts_init`,
+ a bar at exactly 00:00 UTC counting for the day ending there, as the daily series books it; read with
+@@ -38,6 +46,7 @@ the run read, over the study's sample. `BacktestResult` has no such list.
+ 
+ from __future__ import annotations
+ 
++import fcntl
+ import hashlib
+ import json
+ import math
+@@ -66,6 +75,9 @@ from .backtest import VENUE_SETTINGS
+ from .backtest import backtest_run_config
+ from .backtest import run_backtest_config
+ from .ma_cross import MaCross
++from .returns_matrix import DAY_NS
++from .returns_matrix import ReturnsRejected
++from .returns_matrix import daily_series
+ 
+ if TYPE_CHECKING:
+     from collections.abc import Generator
+@@ -79,7 +91,6 @@ if TYPE_CHECKING:
+     from .ma_cross import MaCrossConfig
+ 
+ LEDGER_FILE = Path("ledger") / "trials.db"
+-DAY_NS = 86_400 * 1_000_000_000
+ 
+ # The user attribute holding a trial's outcome, and its three values (ADR 0035 term 2).
+ OUTCOME = "outcome"
+@@ -140,7 +151,14 @@ def _sqlite_url(path: Path, mode: str) -> str:
+ @contextmanager
+ def _storage(path: Path, mode: str) -> Generator[optuna.storages.RDBStorage]:
+     """The `RDBStorage` of `path`; on leaving, its session removed and its engine disposed."""
+-    storage = optuna.storages.RDBStorage(_sqlite_url(path, mode), skip_table_creation=mode == "rw")
++    with ExitStack() as creating:
++        if mode == "rwc":
++            lock = creating.enter_context(path.with_name(path.name + ".lock").open("a"))
++            fcntl.flock(lock, fcntl.LOCK_EX)
++            creating.callback(fcntl.flock, lock, fcntl.LOCK_UN)
++        storage = optuna.storages.RDBStorage(
++            _sqlite_url(path, mode), skip_table_creation=mode == "rw"
++        )
+     try:
+         yield storage
+     finally:
+@@ -416,8 +434,9 @@ def record_trial(
+     returns stays in the study as `RUNNING`. The run is bounded by the study's current sample and built
+     with the key as its `id`. A run that raises, or whose result cannot be recorded, is told `FAIL` with
+     outcome `failed` and its error, and the exception passes through. A run with no filled order is told
+-    `FAIL` with outcome `idle`; any other `COMPLETE` with `traded`, or `FAIL`, still `traded`, if its
+-    Sharpe ratio is not finite. The outcome is written last, so a record that has one ran to the end.
++    `FAIL` with outcome `idle`; any other `COMPLETE` with `traded`, or `FAIL`, still `traded`, if the
++    gate's `daily_series` refuses its returns or its Sharpe ratio is not finite. The outcome is written
++    last, so a record that has one ran to the end.
+     Every write after the trial is asked for, the outcome and the `tell` included, is inside the `try`
+     that tells a failure, so an error or `KeyboardInterrupt` there is told `FAIL` with its error. Only
+     a process killed outright, or a store that refuses the very first write, leaves a record with no
+@@ -539,8 +558,11 @@ def _tell_failed(study: optuna.Study, trial: optuna.Trial, error: BaseException)
+ 
+ 
+ def _session_sharpe(returns: dict[str, float], days: Sequence[str]) -> float:
+-    """skfolio's per-session Sharpe ratio over the returns on `days`; NaN if none can be taken."""
+-    values = [returns[day] for day in days if day in returns]
+-    if len(values) < 2 or not all(math.isfinite(value) for value in values):
++    """skfolio's per-session Sharpe ratio over the gate's daily series; NaN if none can be taken."""
++    try:
++        series = daily_series("trial", returns, list(days))
++    except ReturnsRejected:
++        return math.nan
++    if len(series) < 2:
+         return math.nan
+-    return float(Portfolio(X=[[value] for value in values], weights=[1.0]).sharpe_ratio)
++    return float(Portfolio(X=series.to_frame(), weights=[1.0]).sharpe_ratio)
+diff --git a/src/canon_trading/ranking.py b/src/canon_trading/ranking.py
+index e204521..ea41c06 100644
+--- a/src/canon_trading/ranking.py
++++ b/src/canon_trading/ranking.py
+@@ -31,6 +31,11 @@ Every such stop is gathered before one is raised. Configurations tied at the hig
+ the same returns are one pick; tied with other returns, they leave no single pick and stop it. N-hat
+ below 1 is raised to 1, skfolio's least, and the DSR at N-hat is withheld when its benchmark is below
+ 0 (ADR 0031).
++
++The recorded range is UTC with its offset. Optuna 5.0.0's `TrialModel.datetime_start` converts its
++stored UTC timestamp to naive local time (`storages/_rdb/models.py`, read locally 2026-11-11).
++Python's `datetime.astimezone(UTC)` converts it back before sorting and `isoformat` prints the offset
++(Python 3.14, `datetime.astimezone` and `datetime.isoformat`).
+ """
+ 
+ from __future__ import annotations
+@@ -38,6 +43,7 @@ from __future__ import annotations
+ import math
+ from collections import defaultdict
+ from dataclasses import dataclass
++from datetime import UTC
+ from typing import TYPE_CHECKING
+ 
+ from skfolio import Portfolio
+@@ -131,8 +137,9 @@ def _ran(trial: FrozenTrial) -> bool:
+     """Whether the record ran to the end: finished, with outcome traded or idle (ADR 0035 term 5).
+ 
+     The ledger writes the outcome last, so a record that has one of those finished its run. A traded
+-    record told `FAIL` because its own Sharpe ratio is not finite ran to the end too; the gate stops
+-    on it below, under ADR 0031, and no later record of its key resolves it.
++    record told `FAIL` because its series was refused or its own Sharpe ratio is not finite ran to the
++    end too; the gate stops on it below, under ADR 0010 and ADR 0031, and no later record of its key
++    resolves it.
+     """
+     return trial.state.is_finished() and trial.user_attrs.get(OUTCOME) in (TRADED, IDLE)
+ 
+@@ -304,7 +311,11 @@ def rank(study: optuna.Study) -> RankingReport:
+         (trial for records in on_sample.values() for trial in records), key=lambda t: t.number
+     )
+     numbers = [trial.number for trial in current]
+-    starts = sorted(trial.datetime_start for trial in current if trial.datetime_start is not None)
++    starts = sorted(
++        trial.datetime_start.astimezone(UTC)
++        for trial in current
++        if trial.datetime_start is not None
++    )
+     return RankingReport(
+         study=study.study_name,
+         sample=sample.describe(),
+diff --git a/src/canon_trading/returns_matrix.py b/src/canon_trading/returns_matrix.py
+index 4d9a8e8..1da2d96 100644
+--- a/src/canon_trading/returns_matrix.py
++++ b/src/canon_trading/returns_matrix.py
+@@ -15,7 +15,8 @@ consecutive UTC midnights; anything else is that fallback or a gap, and is rejec
+ A closed day is a UTC day on which no bar of the trial's run became available (its `session_days`, ADR
+ 0035 term 3). Nothing can fill or reprice on such a day, so its return must be 0, and one that is not
+ is refused rather than dropped. A return that is not finite is refused too: ADR 0031 requires every
+-return of the pick to be finite, and skfolio's `Portfolio` raises on one.
++return of the pick to be finite. skfolio's `Portfolio` treats NaN as zero (`portfolio/_portfolio.py`),
++so both `daily_series` and a direct call to `returns_matrix` check before constructing a portfolio.
+ 
+ Which upstream call does what:
+ 
+@@ -41,11 +42,11 @@ import pandas as pd
+ from skfolio import Population
+ from skfolio import Portfolio
+ 
+-from .ledger import DAY_NS
+-
+ if TYPE_CHECKING:
+     from collections.abc import Sequence
+ 
++DAY_NS = 86_400 * 1_000_000_000
++
+ 
+ class ReturnsRejected(ValueError):
+     """Returns that ADR 0010 step 2 or ADR 0041 does not accept; the message names every trial.
+@@ -154,12 +155,19 @@ def _check_shape(
+ def returns_matrix(series: Sequence[pd.Series]) -> pd.DataFrame:
+     """Join `series` on their dates through skfolio; refuse them unless every one has every date.
+ 
+-    The T rows are the session days of the sample (ADR 0041). Each series that lacks one of them is
+-    named, with how many it lacks and its first and last day, so one stop lists every such trial.
++    Every return must be finite before skfolio reads it. The T rows are the session days of the sample
++    (ADR 0041). Each series that lacks one of them is named, with how many it lacks and its first and
++    last day, so one stop lists every such trial.
+     """
+     names = [s.name for s in series]
+     if not series or len(set(names)) != len(names):
+         raise ValueError("returns_matrix takes one or more series with distinct names")
++    not_finite = [str(s.name) for s in series if not all(math.isfinite(value) for value in s)]
++    if not_finite:
++        raise ReturnsRejected(
++            "\n".join(f"{name}: a return that is not finite" for name in not_finite),
++            names=not_finite,
++        )
+     population = Population(
+         [Portfolio(X=s.to_frame(), weights=[1.0], name=str(s.name)) for s in series],
+     )
