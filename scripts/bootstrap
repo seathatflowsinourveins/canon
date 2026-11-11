@@ -452,9 +452,10 @@ omniroute_version_row() {
   # key with 401 when the gateway runs requiring its API key (Apple's curl -q --noproxy '*', as every gateway
   # call there: no curlrc, no proxy; CANON_CURL: tests only)
   local code gw
-  code=$(printf 'Authorization: Bearer canon-made-up-%s\n' "$(/usr/bin/openssl rand -hex 16 2>/dev/null)" \
-    | "${CANON_CURL:-/usr/bin/curl}" -q --noproxy '*' -sS -o /dev/null -w '%{http_code}' --max-time 10 -H @- -H 'Content-Type: application/json' \
-        --data-binary '{}' http://127.0.0.1:20128/v1/chat/completions 2>/dev/null) || code=000
+  # (the header from a here-string, not a pipe: under pipefail a curl that never read it would fail the probe)
+  code=$("${CANON_CURL:-/usr/bin/curl}" -q --noproxy '*' -sS -o /dev/null -w '%{http_code}' --max-time 10 -H @- -H 'Content-Type: application/json' \
+        --data-binary '{}' http://127.0.0.1:20128/v1/chat/completions 2>/dev/null \
+        <<<"Authorization: Bearer canon-made-up-$(/usr/bin/openssl rand -hex 16 2>/dev/null)") || code=000
   case "$code" in
     401) gw="the gateway is running on 127.0.0.1:20128, its API key required" ;;
     000) gw="the gateway is not running (scripts/automation status shows its agent; by hand: mise -E gateway run omniroute:serve)" ;;
