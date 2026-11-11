@@ -44,10 +44,11 @@ check "py-lint calls uv run --locked"        test "$pyl" = "0"
 # deny, then ask, then allow, the first match deciding; `*` matches any text, spaces included; a rule's
 # one trailing ` *` (or `:*`) also matches the bare command; `mise exec` is not a wrapper Claude Code
 # strips, so a rule names it. Not emulated: compound commands (an ask rule applies when any subcommand
-# matches), stripped wrappers and environment assignments. A redirection is matched here as text, so
-# this matcher matches fewer commands than Claude Code, which still prompted for an exact rule's command
-# with `2>&1` or `> file` after it (ADR 0028, Confirmation). Ask rules apply in every permission mode; allow rules are
-# what keeps a command from prompting outside bypassPermissions.
+# matches), stripped wrappers and environment assignments. Redirections and quotes are matched here as
+# text, so this matcher matches fewer commands than Claude Code, which still prompted for an exact rule's
+# command with `2>&1` or `> file` after it, and for `gh 'pr' merge` and `gh api -X 'POST'` (ADR 0028,
+# Confirmation). Ask rules apply in every permission mode; allow rules are what keeps a command from
+# prompting outside bypassPermissions.
 # shellcheck disable=SC2016  # a jq program; its $names are jq's, not the shell's
 MATCH='
   def esc: gsub("(?<c>[.^$|?+()\\[\\]{}\\\\])"; "\\\(.c)");
@@ -95,6 +96,12 @@ mise exec -- uv add httpx==0.27.2
 mise exec -- uv add --package canon-alpaca httpx==0.27.2
 uv add httpx==0.27.2 --no-sync
 uv add httpx==0.27.2 2>&1
+uv add types-PyYAML==6.0.12
+uv add Flask-UUID==0.2
+uv add sphinx-index-plugin==1.0
+uv add --package canon-alpaca types-PyYAML==6.0.12
+mise exec -- uv add types-PyYAML==6.0.12
+mise exec -- uv add Flask-UUID==0.2 sphinx-index-plugin==1.0
 scripts/land
 ./scripts/land
 scripts/land --reviewed "code-review medium: no findings"
@@ -144,6 +151,12 @@ uv add -ihttps://example.com/simple httpx==0.27.2
 uv add httpx==0.27.2 --upgrade
 uv add -U httpx==0.27.2
 uv add -P idna httpx==0.27.2
+uv add httpx==0.27.2 -U
+uv add types-PyYAML==6.0.12 -U
+uv add -Pidna httpx==0.27.2
+uv add httpx==0.27.2 -P idna
+uv add --extra-index-url ./index httpx==0.27.2
+uv add --index-strategy unsafe-best-match httpx==0.27.2
 uv add --upgrade-group dev httpx==0.27.2
 uv add --index ./index httpx==0.27.2
 uv add --default-index ./index httpx==0.27.2
@@ -165,6 +178,12 @@ mise exec -- uv add -ihttps://example.com/simple httpx==0.27.2
 mise exec -- uv add httpx==0.27.2 --upgrade
 mise exec -- uv add -U httpx==0.27.2
 mise exec -- uv add -P idna httpx==0.27.2
+mise exec -- uv add httpx==0.27.2 -U
+mise exec -- uv add types-PyYAML==6.0.12 -U
+mise exec -- uv add -Pidna httpx==0.27.2
+mise exec -- uv add httpx==0.27.2 -P idna
+mise exec -- uv add --extra-index-url ./index httpx==0.27.2
+mise exec -- uv add --index-strategy unsafe-best-match httpx==0.27.2
 mise exec -- uv add --upgrade-group dev httpx==0.27.2
 mise exec -- uv add --index ./index httpx==0.27.2
 mise exec -- uv add --default-index ./index httpx==0.27.2
@@ -180,6 +199,8 @@ uv lock -U
 uv lock --upgrade-package idna
 mise exec -- uv lock --upgrade
 mise exec -- uv lock -U
+uv lock --offline -U
+mise exec -- uv lock --offline -U
 uv sync
 uv sync --upgrade
 uv sync --locked
@@ -212,11 +233,172 @@ mise exec -- git push
 mise exec -- git push origin main
 EOF
 
+# A direct gh write publishes, as a push does, so it asks; landing goes through scripts/land, which calls
+# gh inside, where no rule reaches. So do an alias (a way round every rule), an extension install, the
+# auth commands that change credential state, and those that print the token (AGENTS.md, ADR 0018: use
+# no credentials). Each form is checked bare and under `mise exec --`. gh upper-cases the method it is
+# given (pkg/cmd/api/http.go at v2.103.3), so a rule names its first letter, in either case.
+while IFS= read -r cmd; do
+  check "prompts: $cmd" prompts "$cmd"
+  check "prompts: mise exec -- $cmd" prompts "mise exec -- $cmd"
+done <<'EOF'
+gh pr merge 1
+gh pr create 1
+gh pr close 1
+gh pr review 1
+gh pr comment 1
+gh pr edit 1
+gh pr ready 1
+gh pr reopen 1
+gh pr lock 1
+gh pr unlock 1
+gh pr revert 1
+gh pr update-branch 1
+gh issue create 1
+gh issue close 1
+gh issue lock 1
+gh issue comment 1
+gh issue edit 1
+gh issue reopen 1
+gh issue delete 1
+gh issue transfer 1
+gh issue pin 1
+gh issue unpin 1
+gh issue unlock 1
+gh issue develop 1
+gh repo edit 1
+gh repo create 1
+gh repo delete 1
+gh repo archive 1
+gh repo unarchive 1
+gh repo rename 1
+gh repo fork 1
+gh repo sync 1
+gh repo deploy-key add 1
+gh repo deploy-key delete 1
+gh repo autolink create 1
+gh repo autolink delete 1
+gh release create 1
+gh release edit 1
+gh release delete 1
+gh release delete-asset 1
+gh release upload 1
+gh label create 1
+gh label edit 1
+gh label delete 1
+gh label clone 1
+gh secret set 1
+gh secret delete 1
+gh variable set 1
+gh variable delete 1
+gh workflow run 1
+gh workflow enable 1
+gh workflow disable 1
+gh run rerun 1
+gh run cancel 1
+gh run delete 1
+gh gist create 1
+gh gist edit 1
+gh gist delete 1
+gh gist rename 1
+gh cache delete 1
+gh pr new 1
+gh issue new 1
+gh repo new 1
+gh repo autolink new 1
+gh release new 1
+gh gist new 1
+gh secret remove 1
+gh variable remove 1
+gh issue artifact create 1
+gh issue artifact edit 1
+gh issue artifact delete 1
+gh alias set m 'pr merge'
+gh alias import aliases.yml
+gh extension install o/gh-x
+gh extensions install o/gh-x
+gh ext install o/gh-x
+gh extension upgrade --all
+gh extensions upgrade --all
+gh ext upgrade --all
+gh auth token
+gh auth login
+gh auth logout
+gh auth refresh
+gh auth setup-git
+gh auth status -t
+gh auth status --show-token
+gh auth status --json hosts --show-token
+gh api -X POST repos/o/r/statuses/abc
+gh api -XPUT repos/o/r/statuses/abc
+gh api -X=PATCH repos/o/r/statuses/abc
+gh api --method POST repos/o/r/statuses/abc
+gh api --method=PUT repos/o/r/statuses/abc
+gh api -X post repos/o/r/statuses/abc
+gh api -Xput repos/o/r/statuses/abc
+gh api -X=patch repos/o/r/statuses/abc
+gh api --method post repos/o/r/statuses/abc
+gh api --method=put repos/o/r/statuses/abc
+gh api -X DELETE repos/o/r/statuses/abc
+gh api -XDELETE repos/o/r/statuses/abc
+gh api -X=DELETE repos/o/r/statuses/abc
+gh api --method DELETE repos/o/r/statuses/abc
+gh api --method=DELETE repos/o/r/statuses/abc
+gh api -X delete repos/o/r/statuses/abc
+gh api -Xdelete repos/o/r/statuses/abc
+gh api -X=delete repos/o/r/statuses/abc
+gh api --method delete repos/o/r/statuses/abc
+gh api --method=delete repos/o/r/statuses/abc
+gh pr merge 5 --squash --auto
+gh pr create
+gh api repos/o/r/issues/1 -X PATCH -f state=closed
+gh api -X Post repos/o/r/statuses/abc
+EOF
+
+# What lanes read through gh: no gh rule catches it (reads of a group whose writes ask included).
+while IFS= read -r cmd; do
+  check "neither allowed nor asked: $cmd" unlisted "$cmd"
+  check "neither allowed nor asked: mise exec -- $cmd" unlisted "mise exec -- $cmd"
+done <<'EOF'
+gh run view 1
+gh run view 1 --log
+gh run list
+gh pr view 1
+gh pr view 1 --json title --jq .title
+gh pr list --head main --state open
+gh pr checks 1 --required
+gh pr diff 1
+gh api repos/o/r
+gh api -X GET repos/o/r/issues -f state=open
+gh api --method GET repos/o/r/issues -f state=open
+gh api -X get repos/o/r/pulls --jq .output
+gh issue list
+gh issue view 1
+gh auth status
+gh auth status --json hosts
+gh auth status -a
+gh alias list
+gh extension list
+gh release list
+gh release view v1
+gh release download v1
+gh label list
+gh secret list
+gh variable list
+gh variable get X
+gh workflow list
+gh workflow view watch.yml
+gh repo view
+gh cache list
+gh gist list
+EOF
+
 # A bare name is neither pinned nor matchable: Manual mode asks, as for any command not allowed.
 while IFS= read -r cmd; do check "neither allowed nor asked: $cmd" unlisted "$cmd"; done <<'EOF'
 uv add httpx
 mise exec -- uv add httpx
 uv lock
+uv lock -P Flask-UUID
 mise exec -- scripts/canon resolve alpaca-py
 EOF
 
@@ -226,7 +408,22 @@ while IFS= read -r cmd; do check "a spelling no rule matches: $cmd" unlisted "$c
 mise x -- git push origin main
 sh -c 'scripts/automation install'
 git -C . push origin main
+gh api repos/o/r/issues -f title=x
+gh api --input body.json repos/o/r/issues
+gh api graphql -f query='mutation { x }'
+gh api -iX POST repos/o/r/statuses/abc
+gh auth status -at
+gh m 1
+gh -R o/r pr merge 1
+gh pr -R o/r merge 1
+mise x -- gh pr merge 1
+sh -c 'gh pr merge 1'
 EOF
+
+# A short flag bundled after another is not its own word, so `uv add -qU` with an exact pin is allowed and
+# upgrades unasked (ADR 0028, stated limit), as it did under `*-U*`, which also asked for a name holding
+# `-U`.
+check "a bundled flag no rule asks for: uv add -qU httpx==0.27.2" runs "uv add -qU httpx==0.27.2"
 
 echo "test-hooks: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
