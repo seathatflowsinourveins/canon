@@ -33,8 +33,13 @@ does. skfolio's Sharpe ratio is the mean over the sample standard deviation
 about 1.34e154 or more, each finite, the squares overflow to infinity and the ratio reads 0.0 rather
 than failing (run at 1.12.9, 2026-11-11). The DSR's kurtosis takes the fourth central moment, which
 overflows from returns of about 1e77, and skfolio then gives a DSR of NaN; refused here, the series
-is named instead. `returns_matrix` keeps its own refusal of a return that is not finite, for a series
-given to it directly.
+is named instead. At the other end, a series that is not constant is refused when the square of its
+second central moment (`measures.variance(biased=True)`), which the kurtosis divides the fourth by,
+is below float64's smallest normal (`sys.float_info.min`): there IEEE 754 keeps absolute, not
+relative, precision, and with returns about 1e-81 apart the fourth moment rounds to 0.0, skfolio's
+kurtosis reads 0, below the 1 every series has, and the DSR of a pick rejected at its own scale
+passes (run at 1.12.9, 2026-11-11). `returns_matrix` keeps its own refusal of a return that is not
+finite, for a series given to it directly.
 
 Which upstream call does what:
 
@@ -54,6 +59,7 @@ from __future__ import annotations
 
 import itertools
 import math
+import sys
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -85,7 +91,8 @@ def daily_series(name: str, returns: object, session_days: object) -> pd.Series:
 
     `returns` is a ledger entry's `returns_series` (nanoseconds as text to a return) and `session_days`
     its `session_days`, in the shape `canon_trading.ledger.record_trial` writes them: each key and day
-    the decimal text of a whole number, as `str(int)` gives it, and each return a number. Anything
+    the decimal text of a whole number, as `str(int)` gives it, each session day once and in order,
+    and each return a number. Anything
     else came from another writer and is refused, naming `name`.
     """
     returns, session_days = _check_shape(name, returns, session_days)
@@ -110,14 +117,13 @@ def daily_series(name: str, returns: object, session_days: object) -> pd.Series:
     if moved_while_closed:
         day = moved_while_closed[0]
         raise ReturnsRejected(
-            f"{name}: return {by_day[day]} on {pd.to_datetime(day, unit='ns', utc=True).date()}, "
-            "a day with no bar of the run",
+            f"{name}: return {by_day[day]} on {_date(day)}, a day with no bar of the run",
         )
     unreturned = sorted(open_days.difference(keys))
     if unreturned:
         raise ReturnsRejected(
             f"{name}: no return on {len(unreturned)} of its {len(open_days)} session days, the "
-            f"first {pd.to_datetime(unreturned[0], unit='ns', utc=True).date()}; the daily "
+            f"first {_date(unreturned[0])}; the daily "
             "portfolio series has a return for every day of the run",
         )
     kept = [key for key in keys if key in open_days]
@@ -169,9 +175,10 @@ def is_ns_text(value: object) -> bool:
 
 
 def _check_returns(name: str, returns: dict[str, object], keys: list[int]) -> dict[int, float]:
-    """Each of `returns` by its day, keyed at `keys` in order; refused unless each is a finite float
-    and the sum of their squares is finite (module header): the one check of every return that
-    enters the gate."""
+    """Each of `returns` by its day, keyed at `keys` in order; refused unless each is a finite float,
+    the sum of their squares is finite, and the moments skfolio takes of them are neither past
+    float64's largest nor, for a series that is not constant, below its smallest normal (module
+    header): the one check of every return that enters the gate."""
     checked: dict[int, float] = {}
     for key in keys:
         value = returns[str(key)]
@@ -183,8 +190,7 @@ def _check_returns(name: str, returns: dict[str, object], keys: list[int]) -> di
             )
         if not math.isfinite(value):
             raise ReturnsRejected(
-                f"{name}: return {value} on {pd.to_datetime(key, unit='ns', utc=True).date()} is "
-                "not finite",
+                f"{name}: return {value} on {_date(key)} is not finite",
             )
         checked[key] = value
     squares = sum(value * value for value in checked.values())
@@ -198,11 +204,20 @@ def _check_returns(name: str, returns: dict[str, object], keys: list[int]) -> di
         with np.errstate(over="ignore", invalid="ignore"):
             spread = float(measures.variance(values))
             fourth = float(measures.fourth_central_moment(values))
+            # The second central moment, whose square skfolio's kurtosis divides the fourth by; the
+            # fourth is never below that square, so the square decides alone.
+            second = float(measures.variance(values, biased=True))
         if not (math.isfinite(spread) and math.isfinite(fourth)):
             raise ReturnsRejected(
                 f"{name}: skfolio's variance of its returns is {spread} and their fourth central "
                 f"moment {fourth}, one past float64's largest, so its Sharpe ratio or the DSR's "
                 "kurtosis overflows (ADR 0031)",
+            )
+        if values.max() != values.min() and second * second < sys.float_info.min:
+            raise ReturnsRejected(
+                f"{name}: the square of the second central moment of its returns is "
+                f"{second * second}, below float64's smallest normal, {sys.float_info.min}, so the "
+                "DSR's kurtosis underflows (ADR 0031)",
             )
     return checked
 
@@ -223,7 +238,20 @@ def _check_shape(
     bad_day = next((day for day in session_days if not is_ns_text(day)), _MISSING)
     if bad_day is not _MISSING:
         raise ReturnsRejected(f"{name}: session day {bad_day!r} is not nanoseconds as text")
+    # `record_trial` writes each session day once, in order (`canon_trading.ledger.session_days`).
+    disorder = next(
+        ((a, b) for a, b in itertools.pairwise(int(day) for day in session_days) if b <= a), None
+    )
+    if disorder is not None:
+        raise ReturnsRejected(
+            f"{name}: session day {_date(disorder[1])} follows {_date(disorder[0])}, not after it; "
+            "record_trial writes each session day once, in order",
+        )
     return returns, session_days
+
+
+def _date(ns: int) -> str:
+    return str(pd.to_datetime(ns, unit="ns", utc=True).date())
 
 
 def returns_matrix(series: Sequence[pd.Series]) -> pd.DataFrame:

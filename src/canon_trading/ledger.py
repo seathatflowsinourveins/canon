@@ -791,11 +791,7 @@ def record_trial(
     read here, once, and the record carries that sample's number.
     """
     sample = current_sample(study)
-    if on_sample is not None and sample != on_sample:
-        raise ValueError(
-            f"study {study.study_name!r} moved to {sample.describe()} after the pass checked "
-            f"{on_sample.describe()} against its plan; nothing was recorded on the moved sample",
-        )
+    refuse_a_moved_sample(study, sample, on_sample)
     config = trial_config(strategies, starting_balances=starting_balances)
     key = config_key(config)
     built = [MaCross(strategy) for strategy in strategies]
@@ -873,6 +869,17 @@ def record_trial(
         _tell_failed(study, trial, error)
         raise
     return RecordedTrial(number=trial.number, config_key=key, outcome=outcome, run=run)
+
+
+def refuse_a_moved_sample(study: optuna.Study, sample: Sample, on_sample: Sample | None) -> None:
+    """Refuse `study`, read on `sample`, if a caller checked `on_sample` against its plan and the
+    study has moved since (ADR 0041 term 5), naming both; the one refusal `record_trial` and the
+    study's pass (`canon_trading.variant_study.record_grid`) give."""
+    if on_sample is not None and sample != on_sample:
+        raise ValueError(
+            f"study {study.study_name!r} moved to {sample.describe()} after the pass checked "
+            f"{on_sample.describe()} against its plan; nothing was recorded on the moved sample",
+        )
 
 
 def registration_day(start: int) -> int:

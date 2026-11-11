@@ -82,6 +82,8 @@ THIRD_WIDE = [-PATTERN[(i + 5) % 10] * 0.8 for i in range(T)]
 # The sample's end, the midnight after its last day: its T session days are DAY_0 to DAY_0 + T - 1,
 # the way a real run books a sample that ends at a midnight (`canon_trading.ledger.session_day`).
 END = DAY_0 + T * DAY_NS
+# The sample's last session day, which every record `record_trial` writes on it holds.
+LAST_DAY = str(DAY_0 + (T - 1) * DAY_NS)
 
 
 @pytest.fixture
@@ -295,12 +297,15 @@ def test_a_pick_below_the_threshold_is_rejected(
     assert "is rejected at 0.95" in report.summary()
 
 
-def test_n_hat_is_not_reported_when_t_is_short(study: optuna.Study) -> None:
+def test_n_hat_is_not_reported_when_t_is_short(tmp_path: Path) -> None:
     """N = 4 needs T >= 6 for N-hat (p. 15); with T = 5 it is left out and the gate still runs."""
-    for index, key in enumerate("abcd"):
-        write(study, key, [PICK[i] * (1 - 0.2 * index) + 0.001 * index for i in range(5)])
+    with create_ledger_study(
+        "short", start=DAY_0, end=DAY_0 + 5 * DAY_NS, path=tmp_path / "short.db"
+    ) as study:
+        for index, key in enumerate("abcd"):
+            write(study, key, [PICK[i] * (1 - 0.2 * index) + 0.001 * index for i in range(5)])
 
-    report = rank(study)
+        report = rank(study)
 
     assert (report.n, report.t) == (4, 5)
     assert report.n_hat is None and report.dsr_at_n_hat is None
@@ -413,7 +418,7 @@ def test_a_rejected_series_stops(study: optuna.Study) -> None:
         PICK,
         attrs={
             "returns_series": {str(DAY_0 + 3_600 * 10**9): 0.01, str(DAY_0 + DAY_NS): 0.02},
-            "session_days": [str(DAY_0), str(DAY_0 + DAY_NS)],
+            "session_days": [str(DAY_0), str(DAY_0 + DAY_NS), LAST_DAY],
         },
     )
 
@@ -582,7 +587,11 @@ def test_a_record_not_in_the_writers_shape_stops_naming_it(
         study,
         "odd",
         PICK,
-        attrs={"returns_series": returns, "session_days": days},
+        # With the sample's last day, which `_shape_faults` asks for before the form is read.
+        attrs={
+            "returns_series": returns,
+            "session_days": [*days, LAST_DAY] if isinstance(days, list) else days,
+        },
         drop=("returns_series",) if returns is None else (),
     )
 
@@ -608,8 +617,15 @@ def test_a_trial_over_a_shorter_range_stops_and_is_named(study: optuna.Study) ->
     assert "pick" not in message.split("Trials:")[1]
 
 
-def test_trials_with_no_day_in_common_are_each_named(study: optuna.Study) -> None:
-    early = write(study, "early", PICK[:10])
+def test_trials_that_each_lack_days_the_other_has_are_each_named(study: optuna.Study) -> None:
+    """Each holds the sample's last day, as `record_trial` writes every record (`early` no return
+    on it), and lacks days the other has."""
+    early = write(
+        study,
+        "early",
+        [*PICK[:10], *[0.0] * (T - 10)],
+        attrs={"session_days": [*(str(DAY_0 + n * DAY_NS) for n in range(10)), LAST_DAY]},
+    )
     late = write(study, "late", SECOND[20:], first_day=20)
 
     with pytest.raises(RankingStopped) as stopped:
@@ -1076,7 +1092,7 @@ def test_a_session_day_that_crashed_the_ranking_stops_naming_it(
     """A JSON null in a list of days raised TypeError, a 31-digit day OverflowError, and one of
     5,000 digits ValueError; a day past a 64-bit count of nanoseconds names no instant."""
     write(study, "pick", PICK)
-    number = write(study, "odd", PICK[:1], attrs={"session_days": days})
+    number = write(study, "odd", PICK[:1], attrs={"session_days": [*days, LAST_DAY]})
 
     with pytest.raises(RankingStopped) as stopped:
         rank(study)
@@ -2169,3 +2185,71 @@ def test_returns_whose_fourth_central_moment_overflows_stop_by_name(study: optun
         match=rf"pick: skfolio's variance [^\n]*fourth central moment inf[^\n]*\(#{number}\)",
     ):
         rank(study)
+
+
+def test_a_record_that_lacks_the_sample_s_last_session_day_stops(study: optuna.Study) -> None:
+    """A sixth-round reader (Antigravity): records that stopped 10 days into the sample passed as
+    the whole sample. `record_trial` refuses a sample whose last session day holds no bar, so each of
+    its records holds that day."""
+    for label, returns in (("pick", PICK), ("second", SECOND), ("third", THIRD_CLOSE)):
+        write(study, label, returns[:20], attrs={"backtest_end": DAY_0 + 20 * DAY_NS})
+
+    with pytest.raises(RankingStopped) as stopped:
+        rank(study)
+
+    for label in ("pick", "second", "third"):
+        assert re.search(
+            rf"{label}: #\d+ [^\n]*session_days lacks 2025-04-09, the session day of the end of "
+            r"sample 0",
+            str(stopped.value),
+        ), str(stopped.value)
+
+
+def test_returns_on_the_registration_day_before_a_midnight_start_stop(study: optuna.Study) -> None:
+    """A sixth-round reader (Antigravity): with the sample starting at 00:00 UTC, records carrying a
+    return and a session day on the day before passed. NautilusTrader books only the account's
+    registration there, and `record_trial` refuses a bar on it."""
+    for label, returns in (("pick", PICK), ("second", SECOND), ("third", THIRD_CLOSE)):
+        write(study, label, [0.0, *returns], first_day=-1)
+
+    with pytest.raises(RankingStopped) as stopped:
+        rank(study)
+
+    for label in ("pick", "second", "third"):
+        assert re.search(
+            rf"{label}: #\d+ [^\n]*session_days has 2025-03-10, outside sample 0",
+            str(stopped.value),
+        ), str(stopped.value)
+
+
+def test_session_days_out_of_order_stop(study: optuna.Study) -> None:
+    """A sixth-round reader (Antigravity): session days reversed with a day twice passed at DSR 1.0."""
+    days = [str(DAY_0 + n * DAY_NS) for n in range(T)]
+    write(study, "pick", PICK, attrs={"session_days": [*reversed(days), days[0], days[0]]})
+    write(study, "second", SECOND)
+    write(study, "third", THIRD_CLOSE)
+
+    with pytest.raises(RankingStopped, match=r"pick: session day .* not after it"):
+        rank(study)
+
+
+def test_a_pick_whose_moments_underflow_stops(study: optuna.Study, tmp_path: Path) -> None:
+    """A sixth-round reader (Antigravity): the same pick rescaled by 1e-81, its Sharpe ratio, skewness
+    and kurtosis unchanged in exact arithmetic, went from DSR 0.9464, rejected, to 0.9570, passed:
+    its fourth central moment rounded to 0.0 and skfolio's kurtosis read 0."""
+    pick = [0.88 + x for x in [1.24, -1.24] * 14 + [1.45, -1.45]]
+    third = [PATTERN[(i + 5) % 10] * 0.6 - 0.0024 for i in range(T)]
+    write(study, "pick", pick)
+    write(study, "second", SECOND)
+    write(study, "third", third)
+    report = rank(study)
+    assert report.pick == "pick"
+    assert report.dsr == pytest.approx(0.94637, abs=5e-6)
+    assert not report.passed
+
+    with create_ledger_study("scaled", start=DAY_0, end=END, path=tmp_path / "scaled.db") as scaled:
+        write(scaled, "pick", [value * 1e-81 for value in pick])
+        write(scaled, "second", SECOND)
+        write(scaled, "third", third)
+        with pytest.raises(RankingStopped, match=r"pick: .* below float64's smallest normal"):
+            rank(scaled)

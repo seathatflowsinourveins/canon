@@ -52,7 +52,12 @@ ADR 0035's numbers, 4 to 6; terms 1 to 3 (storage, recording, entry) are ADR 003
    step 2 rejects, or a record not in the shape `record_trial` writes. Every record that ran on the
    sample has its returns read before any two are compared: each a float, finite, the sum of their
    squares finite, and skfolio's variance and fourth central moment of them finite, or its Sharpe
-   ratio of them reads 0.0 and the DSR's kurtosis NaN (2026-11-11). A stored config whose data does
+   ratio of them reads 0.0 and the DSR's kurtosis NaN (2026-11-11); and for a series that is not
+   constant, the fourth central moment and the square of the second at or above float64's smallest
+   normal, or the kurtosis rounds toward 0 and the DSR rises (2026-11-11). Its session days are each
+   once, in order, as `record_trial` writes them, and include the session day of the sample's end,
+   which `record_trial` refuses a sample without (ADR 0041 term 1); none falls on the account's
+   registration day before the start (2026-11-11). A stored config whose data does
    not load exactly the bar types its strategies trade, each once, in order, as `trial_config` writes
    them, is not in that shape either, on every sample (2026-11-11). Each message names the key and
    trial; one ranking gathers every trial's stops before it raises.
@@ -118,7 +123,15 @@ ADR 0035's numbers, 4 to 6; terms 1 to 3 (storage, recording, entry) are ADR 003
    number given to `mark_not_run` or `retire_queued` is an `int`, never a `bool` or a float. Named
    limit: a keyless queued trial taken here whose note the store refuses holds `fixed_params` and no
    note, so it reads as another writer's and stops the study for good, the strict side; the error
-   raised says so.
+   raised says so. Named limits (2026-11-11): two keyed records in no form `record_trial` leaves
+   read as its own, since `origin` reads who wrote a record from its attributes' names, not their
+   values or order. A record cut short holding a `sample` that is no number of the study's, or
+   results with no `sample` or `config` written before them, is read as an interrupted record on the
+   current sample, which a later run of its key resolves. A record told `FAIL` with outcome `traded`,
+   no error and returns whose Sharpe ratio is finite is read as a run and ranked. `record_trial`
+   writes a known sample number, its config and every result in that order before its outcome, and
+   tells a traded run `FAIL` without an error only where its ratio is not finite; no writer this
+   repository names writes either record, so this is stated, not defended against.
 
 Who decided. The orchestrator chose option 3 and the terms under the owner's delegation of 2026-11-10
 (ADR 0010's Evidence). Term 7 was decided by the orchestrator under the same delegation, 2026-11-10, over a
@@ -255,7 +268,14 @@ study, a larger mechanism than one foreign record needs.
   tests that failed before their fix (`tests/test_ranking.py`): a config whose strategies trade
   other bar types than its data loads, none, or none in the writer's form, stops
   (`test_a_config_whose_strategies_trade_other_bars_than_its_data_loads_stops`), and so does one
-  loading a bar type twice (`test_a_config_loading_one_bar_type_twice_stops`).
+  loading a bar type twice (`test_a_config_loading_one_bar_type_twice_stops`). From the gate's
+  sixth round, tests that failed before their fix: a pick whose returns, rescaled by 1e-81, have a
+  fourth central moment that rounds to 0.0 stops, where it went from DSR 0.9464, rejected, to
+  0.9570, passed (`tests/test_ranking.py::test_a_pick_whose_moments_underflow_stops`,
+  `tests/test_returns_matrix.py::test_returns_whose_moments_underflow_are_refused`); and session
+  days reversed, or holding a day twice, are refused
+  (`test_session_days_out_of_order_stop`,
+  `test_session_days_out_of_record_trial_s_order_are_refused`).
 * The trial count is per study (term 5): nothing in the code stops a new study of the same
   configurations from starting at N = 0, and no record carries an earlier study's keys into it. What
   holds that line is pre-registering every study in a record before its first run, as ADR 0048 does
@@ -483,3 +503,26 @@ Term numbers are ADR 0035's.
   unplanned range; and refusing a multi-instrument trial for one instrument with no bar in its
   sample, which ADR 0053 records as such (its Confirmation: a bar type with no bar in the sample is
   in the digest), outside this round's findings.
+* The gate's sixth outside round, 2026-11-11 (Antigravity, one reader; Codex read the same commit and
+  found nothing): seven findings, each reproduced. Five are reachable from the writers this
+  repository names or from an input that passed the gate's own input check, and are fixed, each
+  shown by a test that failed first: returns whose moments underflow (term 6); records holding only
+  a prefix of the sample, without its last session day, and records with a return on the account's
+  registration day before a midnight start (ADR 0041 term 1); session days out of order or held
+  twice (term 6); and a study pass on a moved sample with nothing left to record, or whose failed
+  run's sample moved beneath it, which returned instead of stopping (ADR 0041 term 5). Two are
+  reachable only by a hand-written record that no named writer produces, and are stated as term 7's
+  named limits rather than defended against: a cut-short record holding a sample no number of the
+  study's, or results written before its sample and config; and a `FAIL`, `traded` record with no
+  error and a finite Sharpe ratio. Counted under ADR 0073 rule 5: seven findings, all changing
+  behaviour; no new family. No change of decision.
+  Code review of the fix (`/code-review`, high): nine findings. Fixed, shown by a test that failed
+  first: the pass's move check, which ran only after a run that raised and gave that run's error,
+  now runs after every attempt and names both samples, so a last run recorded while the sample moved
+  stops the pass too. Fixed with no test: the second central moment is skfolio's own
+  (`measures.variance(biased=True)`) and decides alone, since the fourth is never below its square;
+  one date helper in `returns_matrix`; a comment that named the wrong case. Stated in ADR 0041's
+  Confirmation: a record made before the end-day refusal may lack the sample's last session day,
+  and now stops. Not changed: the ranking-level test of trials with no day in common, which no
+  record in the writer's shape can now reach (every one holds the last day); `returns_matrix`'s
+  own tests keep that case.
