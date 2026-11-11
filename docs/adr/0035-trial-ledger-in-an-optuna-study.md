@@ -90,6 +90,14 @@ Who decided. The orchestrator chose option 3 and the terms under the owner's del
 * A trial queued in Optuna is never recorded in: `record_trial` tells it `FAIL`, keyless, and asks again
   (`test_a_trial_is_recorded_in_its_own_trial_not_one_from_optuna_s_queue`,
   `test_a_waiting_trial_added_with_attributes_is_not_recorded_in`), tests that failed before their fix.
+* A fifth review's case, tests that failed before their fix: a `tell` refused after the run, its
+  results and outcome written, kept that outcome and is compared with the later records of its key,
+  told `FAIL` or, if that is refused too, left `RUNNING`
+  (`test_a_tell_refused_after_the_run_keeps_the_outcome_it_ran_to`,
+  `test_a_record_left_running_after_its_outcome_ran_and_is_compared`); a grid pass goes on from it as
+  from any failure told (`test_a_tell_refused_after_the_run_is_a_failure_the_pass_goes_on_from`), and
+  such an outcome in a state the writer never leaves is no run
+  (`test_an_outcome_is_a_run_only_in_a_state_the_writer_leaves`).
 
 ## Evidence
 
@@ -170,3 +178,9 @@ Read 2026-11-10. Fetched means read in this session as raw text or source; run m
   writer's trial, with its attributes, at a number below records already made, where ADR 0054 term 5
   reads a higher number as later. Term 2's recording now asks for a trial `ask` created; a taken one is
   told `FAIL` with no key. Reproduced as a failing test. No change of decision.
+* A fifth review of the gate, 2026-11-10, by a second reader: a final `tell` refused after the outcome
+  was written overwrote it `failed`, so a later record of its key resolved a run that had ended and its
+  returns and data were never compared. Term 2's outcome, written last, now stands whatever the `tell`
+  does, and the ranking reads a record holding `traded` or `idle` as run to the end in any state
+  `record_trial` leaves (`FAIL` or `RUNNING` with no value too). Reproduced as failing tests. No change
+  of decision.

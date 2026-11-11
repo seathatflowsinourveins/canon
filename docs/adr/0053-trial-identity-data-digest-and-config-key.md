@@ -121,6 +121,9 @@ Who decided. The orchestrator chose option 2 and its terms under the owner's del
   pinned (`test_the_base_defaults_the_key_is_taken_against_are_the_pinned_ones`). The eight keys of the
   step 7 study and the tests' default key are byte for byte as before
   (`test_the_keys_of_default_configs_are_as_they_were`, which passes before and after).
+* A fifth review's case, a test that failed before its fix: a `SessionMaCrossConfig`, a subclass
+  `record_trial`'s type admits, is refused before a trial, naming its class
+  (`test_a_config_of_another_strategy_class_is_refused_before_a_trial`).
 
 ## Evidence
 
@@ -193,3 +196,10 @@ package; run, executed in this checkout.
   code review added that a record with no `config` in the writer's form skipped the bar-type check, now
   a stop. Records already in the shared ledger are not affected: each step 7 trial read one bar type
   with 1,366 bars (ADR 0052) and holds no base field away from its default.
+* A fifth review of the gate, 2026-11-10, by a second reader: `record_trial` runs `MaCross` for every
+  config while term 2's key held a subclass's own fields, so two `SessionMaCrossConfig`s differing only
+  in `limit_offset` were two trials of one run, and one with `wind_down_at` was refused for its value.
+  Term 2's class is the class that runs; a config not exactly `MaCrossConfig` is now refused, the
+  narrow reading, since only `MaCross` is run and building another class from a config is a change of
+  decision this record has not made. The step 7 study's eight are `MaCross` (run). Reproduced as a
+  failing test. No change of decision.

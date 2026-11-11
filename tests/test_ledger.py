@@ -73,6 +73,7 @@ from canon_trading.ma_cross import MaCrossConfig
 from canon_trading.ranking import RankingStopped
 from canon_trading.ranking import rank
 from canon_trading.returns_matrix import daily_series
+from canon_trading.session_ma_cross import SessionMaCrossConfig
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -705,6 +706,82 @@ def test_an_interrupt_just_after_the_tell_leaves_the_record_as_told(
     assert interrupted.value.__notes__ == [
         f"trial #{trial.number} was already told COMPLETE; left as it is"
     ]
+
+
+@pytest.mark.parametrize("refusals", [1, 2], ids=["the tell", "the tell and its FAIL"])
+def test_a_tell_refused_after_the_run_keeps_the_outcome_it_ran_to(
+    alpaca_bars: AlpacaBars,
+    tmp_path: Path,
+    stack: ExitStack,
+    monkeypatch: pytest.MonkeyPatch,
+    refusals: int,
+) -> None:
+    """A second reader: a store that refused the last `tell`, after every result and the outcome were
+    written, had the record overwritten `failed`, so a later record of its key resolved it and the
+    ranking never compared the returns and data it had read."""
+    alpaca_bars.write(tmp_path / "catalog")
+    study = new_study(stack, tmp_path, "refused tell")
+    real = optuna.Study.tell
+    left = [refusals]
+
+    def refused(self: optuna.Study, *args: Any, **kwargs: Any) -> object:
+        if left[0]:
+            left[0] -= 1
+            raise OSError("database is locked")
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(optuna.Study, "tell", refused)
+    with pytest.raises(OSError, match="database is locked"):
+        record_trial(study, tmp_path / "catalog", [strategy()], starting_balances=BALANCES)
+    monkeypatch.undo()
+
+    [trial] = study.trials
+    assert trial.user_attrs[OUTCOME] == TRADED
+    assert trial.state == (TrialState.FAIL if refusals == 1 else TrialState.RUNNING)
+    assert trial.user_attrs["error"] == "OSError: database is locked"
+
+    # It ran to the end, so a later record of its key that read other returns disagrees with it,
+    # where it used to resolve it: the later record here is the same run with one return changed.
+    returns = dict(trial.user_attrs["returns_series"])
+    first_day = next(iter(returns))
+    returns[first_day] += 0.01
+    study.add_trial(
+        optuna.trial.create_trial(
+            state=TrialState.COMPLETE,
+            value=0.0,
+            user_attrs={**trial.user_attrs, "returns_series": returns},
+        )
+    )
+    later = study.trials[-1].number
+    with pytest.raises(
+        RankingStopped, match=rf"#{trial.number} \(traded\), #{later} \(traded\) ran the same"
+    ):
+        rank(study)
+
+
+def test_a_config_of_another_strategy_class_is_refused_before_a_trial(
+    alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack
+) -> None:
+    """A second reader: `record_trial` builds `MaCross` from every config, and a `SessionMaCrossConfig`
+    was keyed with session fields that never ran (two limit offsets, two trials of one run), or
+    refused for a `wind_down_at` with no canonical form."""
+    alpaca_bars.write(tmp_path / "catalog")
+    study = new_study(stack, tmp_path, "session config")
+    session = SessionMaCrossConfig(
+        bar_type=BAR_TYPE,
+        trade_size=Quantity.from_int(10),
+        fast_period=3,
+        slow_period=8,
+        limit_offset=Decimal("0.02"),
+    )
+
+    for refused in (
+        lambda: trial_config([session], starting_balances=BALANCES),
+        lambda: record_trial(study, tmp_path / "catalog", [session], starting_balances=BALANCES),
+    ):
+        with pytest.raises(TypeError, match="got SessionMaCrossConfig, not MaCrossConfig"):
+            refused()
+    assert study.trials == []
 
 
 @pytest.mark.parametrize(

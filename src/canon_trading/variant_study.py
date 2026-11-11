@@ -28,7 +28,8 @@ resolve a key (ADR 0054 term 5), then ranks and prints the report or the stop. `
 without recording. Either way the study is ranked only once every configuration of the plan has a
 record: `rank` counts N from the ledger and cannot see a planned configuration never tried, so a
 pass stopped part way would be ranked at an N short of the plan's (ADR 0010 step 1, ADR 0048). A run
-that raises goes into the pass's failures only once `record_trial` has told it `FAIL`; one whose
+that raises goes into the pass's failures only once `record_trial` has told it `FAIL` with its error
+(a refused `tell` after a run included, which keeps the run's outcome); one whose
 failure could not be written stops the pass, with the storage error as a note on the run's own. A
 pass holds an exclusive `fcntl.flock` (the standard library's, as
 `canon_trading.ledger` takes for creation) on a lock file beside the ledger, named for the study, so a
@@ -59,6 +60,7 @@ from optuna.trial import TrialState
 
 from .ledger import FAILED
 from .ledger import OUTCOME
+from .ledger import RAN
 from .ledger import config_key
 from .ledger import create_ledger_study
 from .ledger import current_sample
@@ -133,8 +135,9 @@ def _to_record(study: optuna.Study, keys: Sequence[str]) -> list[str]:
 
     A key is resolved for the gate when every record that did not run to the end has a later one that
     did (ADR 0054 term 5, `canon_trading.ranking`), which holds exactly when its latest record ran. So
-    a key with no record on the sample, or whose latest record failed or is still `RUNNING`, is run
-    again. Records are placed on samples as `rank` places them (ADR 0041 term 5): a keyed one with no
+    a key with no record on the sample, or whose latest record failed or is still `RUNNING` with no
+    outcome of a run, is run again; one left `RUNNING` with outcome traded or idle, its `tell`
+    refused after the run, ran to the end and is not. Records are placed on samples as `rank` places them (ADR 0041 term 5): a keyed one with no
     sample number of the study's is on the current sample, unless it ran to the end, which `rank`
     stops on as another writer's and which no re-run clears. The rule is the gate's own,
     `canon_trading.ranking.on_current_sample` and `ran_to_the_end`, so it follows any change to it.
@@ -165,15 +168,19 @@ class Recorded:
 
 
 def _told_failed(study: optuna.Study, key: str, before: int) -> bool:
-    """Whether a record of `key` numbered `before` or later was told `FAIL`, `failed`, by `record_trial`.
+    """Whether a record of `key` numbered `before` or later was told `FAIL` with its error by `record_trial`.
 
-    Both the state and the outcome: `record_trial` writes the outcome before its `tell`, so a record
-    whose `tell` failed has the outcome and is still `RUNNING`, and that storage error stops the pass.
+    `record_trial` tells a raised run `FAIL` with outcome `failed`, and a run whose `tell` was refused
+    after its outcome `FAIL` with that outcome kept (`traded` or `idle`); either way it writes the
+    error (`canon_trading.ledger._tell_failed`), and the failure is in the ledger for the gate to read.
+    A record still `RUNNING`, or with no error written, is a failure that could not be told, and stops
+    the pass.
     """
     return any(
         trial.number >= before
         and trial.user_attrs.get("config_key") == key
-        and trial.user_attrs.get(OUTCOME) == FAILED
+        and trial.user_attrs.get(OUTCOME) in (FAILED, *RAN)
+        and "error" in trial.user_attrs
         and trial.state == TrialState.FAIL
         for trial in study.get_trials(deepcopy=False)
     )
@@ -188,9 +195,11 @@ def record_grid(
 ) -> Recorded:
     """Record each configuration `_to_record` names, one trial each, in the plan's order.
 
-    A trial `record_trial` told `FAIL`, `failed`, is noted and the pass goes on, so every configuration
-    of the plan is tried: a run that raised, and also a result it could not record or bars that
-    differ from those its check read, once the failure itself was written. That is safe for the gate:
+    A trial `record_trial` told `FAIL` with its error (`_told_failed`) is noted among the failures and
+    the pass goes on, so every configuration of the plan is tried: a run that raised, and also a
+    result it could not record or bars that differ from those its check read, once the failure itself
+    was written. A run whose `tell` alone was refused, after its outcome, is noted there too, for the
+    storage error, though it ran to the end and the gate reads its run. That is safe for the gate:
     the ranking stops on the key until a later record of it runs to the end (ADR 0054 term 5), and a
     catalog changed mid-pass leaves records that read different bars, which stop it too (ADR 0053
     term 1). Anything that leaves no failure told (a refusal before a trial exists, a failure that
