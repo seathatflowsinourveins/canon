@@ -25,6 +25,35 @@ TMP=$(mktemp -d "${TMPDIR:-/tmp}/canon-test-lanes.XXXXXX") \
 trap 'rm -rf "$TMP"' EXIT
 pass=0; fail=0; skipped=0
 
+# A python3 with tomllib (Python 3.11 and later), which the Codex config cases below need, as scripts/bootstrap
+# and the tomlis helper read that config as TOML. Looked for as bootstrap's toml_python looks: the python3 on
+# PATH, then the one mise.toml pins (`mise which python3`, with the mise on PATH or ~/.local/bin/mise), read
+# here, before HOME and PATH point into the temp folder. That one python3, and nothing else from its
+# directory, goes first on PATH for the whole run through a link in the temp folder, and tomlis calls it, so
+# the result does not depend on which python3 the caller's PATH happens to put first (a PATH with the system
+# Python 3.9 ahead of the toolchain's failed ten cases). With none, the run stops: scripts/bootstrap's
+# --install puts the toolchain's in place.
+has_tomllib() { [ -n "$1" ] && [ -x "$1" ] && [ "$("$1" -I -c 'import tomllib; print("tomllib")' 2>/dev/null)" = tomllib ]; }
+TOOL_MISE=$(command -v mise 2>/dev/null) || TOOL_MISE=""
+[ -n "$TOOL_MISE" ] || [ ! -x "$HOME/.local/bin/mise" ] || TOOL_MISE="$HOME/.local/bin/mise"
+toml_python() {
+  local p
+  for p in "$(command -v python3 2>/dev/null)" \
+           "$( [ -n "$TOOL_MISE" ] && cd "$ROOT" && MISE_EXEC_AUTO_INSTALL=false "$TOOL_MISE" which python3 2>/dev/null)"; do
+    has_tomllib "$p" && { echo "$p"; return 0; }
+  done
+  return 1
+}
+TOML_PY=$(toml_python) \
+  || { echo "test-lanes: no python3 with tomllib on PATH or through mise; run scripts/bootstrap --install" >&2; exit 1; }
+# For the case that shows a caller's first python3 does not decide the run; read by an eval'd check below.
+# shellcheck disable=SC2034
+CALLER_PATH="$PATH"
+# shellcheck disable=SC2034
+CALLER_HOME="$HOME"
+mkdir -p "$TMP/python"; ln -s "$TOML_PY" "$TMP/python/python3"
+PATH="$TMP/python:$PATH"
+
 t_pass() { pass=$((pass+1)); echo "  pass  $1"; }
 t_fail() { fail=$((fail+1)); echo "  FAIL  $1"; }
 skip()   { skipped=$((skipped+1)); echo "  skip  $1 ($2)"; }
@@ -1175,7 +1204,7 @@ CLAUDE_CONFIG_DIR="$C3" bs --check
 check "... and check calls it OWNER"              rowis "$TMP/bs.out" "codex telemetry" OWNER
 # Codex's config is read as TOML (claims of a second reader, 2026-11-10): a quoted key is the owner's otel
 # table, and an [otel] line inside a multi-line string is no table at all
-tomlis() { python3 -I -c 'import sys, tomllib; d = tomllib.load(open(sys.argv[1], "rb")); sys.exit(0 if eval(sys.argv[2]) else 1)' "$@"; }
+tomlis() { "$TOML_PY" -I -c 'import sys, tomllib; d = tomllib.load(open(sys.argv[1], "rb")); sys.exit(0 if eval(sys.argv[2]) else 1)' "$@"; }
 printf "model = \"o3\"\n['otel']\nexporter = 'none'\n" > "$CX"; cp "$CX" "$TMP/cx.before"
 CLAUDE_CONFIG_DIR="$C3" bs --user-config
 check "a quoted ['otel'] table is the owner's: left as it is, still valid TOML" \
@@ -1197,6 +1226,12 @@ check "a Codex config that is not TOML is left as it is, and named" \
 CLAUDE_CONFIG_DIR="$C3" bs --check
 check "... and check calls it INVALID"            rowis "$TMP/bs.out" "codex telemetry" INVALID
 NP="$TMP/no-tomllib"; mkdir -p "$NP"; printf '#!/bin/sh\nexit 1\n' > "$NP/python3"; chmod +x "$NP/python3"
+if [ -n "$TOOL_MISE" ]; then
+  check "a caller whose first python3 has no tomllib still gets the toolchain's: the run does not depend on it" \
+        eval 'p=$(HOME="$CALLER_HOME" PATH="$NP:$CALLER_PATH" toml_python) && [ "$p" != "$NP/python3" ] && has_tomllib "$p"'
+else
+  skip "a caller whose first python3 has no tomllib still gets the toolchain's" "no mise here to find it through"
+fi
 : > "$CX"; CLAUDE_CONFIG_DIR="$C3" PATH="$NP:$PATH" bs --user-config
 check "with no python3 that has tomllib, nothing is guessed: the config left empty, UNKNOWN named" \
       eval '[ ! -s "$CX" ] && grep -q "UNKNOWN    no python3 with tomllib" "$TMP/bs.out"'
