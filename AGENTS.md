@@ -181,6 +181,10 @@ The owner's standing instruction (2026-11-09): work lands automatically once its
    not recorded anywhere (ADR 0017, ADR 0019).
 4. Pull request text has `Summary`, `Test Plan` and `Evidence`, written for a later reader: no conversation
    history, discarded attempts or tool usage. Titles are a plain sentence, with no `feat:` style prefix.
+   A commit that fixes a finding ends with a `Fails-before: <test file>::<test function>` trailer for each
+   test that failed before it, and `Confirms: <round or reader>/<finding>` where it answers a review, which
+   `scripts/land` carries into the squash commit, warns about when a trading-path fix lacks one, and
+   `scripts/fix-index` lists (ADR 0073).
 5. This covers work a session of the owner's produced. It does not cover creating a remote, changing a
    repository's visibility, or anything a permission rule asks about; those still go to the owner.
 6. It also covers the dependency bot's pull requests (ADR 0016). When the session brief lists any, land

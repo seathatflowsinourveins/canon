@@ -132,6 +132,26 @@ the writer's shape; not-run marks; sample bounds and timestamps; a refused `tell
 The rule is followed when each high-effort fix's message carries its round's count (rule 5), and the brief
 for a path still in the loop names the families found so far.
 
+*Addition of 2026-11-11, the fix marker:* rule 2 counts a finding by a test that fails before its fix,
+rule 5's count and ADR 0057's cases (a case's fail-to-pass set) rest on that test, and ADR 0046 notes
+that "the test failed or hung before the fix rests on the fix's message", in prose. A commit that fixes a
+finding now carries git trailers (git-interpret-trailers(1)): `Fails-before: <test file>::<test
+function>`, one per test that failed before the fix, and optionally `Confirms: <round or
+reader>/<finding>`. No maintained convention names the test that failed before a fix: git's trailer
+documentation lists none; AOSP's `Test:` and Fuchsia's `Test:` and `Multiply:` name tests run on a change;
+the Linux kernel's `Fixes:` and `Closes:` name the commit that introduced a bug and a report, and
+`Confirms` overlaps them and Fuchsia's `Fixed:` only in tying a fix to a report. `scripts/land` adds every
+commit's two trailers to the squash message's last paragraph, prints one warning line when a change on
+the trading path says it fixes a finding (a `Confirms` trailer, or fix, finding or defect as a word in
+its text; a heuristic, so a fix worded otherwise is missed and a mention of `fix-index` warns) but names
+no `Fails-before`, and one for each named test, file or class the tree lacks. It never refuses a change
+for a missing or malformed marker. Its `TRADING_PATHS` list holds the paths of rule 1 that ADR 0074 item
+4 calls the trading path (the whole adapter package, the session window and what it runs, the gate),
+plus the paper runner and the sandbox node on Alpaca's live data. `scripts/fix-index` prints landed
+commits with the two trailers as JSON, parsed by git's `%(trailers)` format. GitHub's squash merge kept
+the one-trailer last paragraph `scripts/land` passed it on #183 to #186; a trailer added by this change
+reaching main through GitHub is UNVERIFIED until the first fix lands with one.
+
 ## Evidence
 
 Read 2026-11-10 and 2026-11-11.
@@ -151,3 +171,18 @@ Read 2026-11-10 and 2026-11-11.
 * The reachability rule added 2026-11-11 is the lead's decision under ADR 0074, given to the lanes of
   the gate's seventh round. ADR 0054 term 7 holds the class it names, with the two earlier findings it
   reclassifies, #172 and #177 (`git log`, read).
+* https://git-scm.com/docs/git-interpret-trailers and https://git-scm.com/docs/pretty-formats — the
+  trailer block, key syntax and `--no-divider`; `%(trailers:key=...,valueonly,unfold,separator=...)`,
+  `key=` repeatable and case-insensitive; no documented trailer names a test (fetched 2026-11-11, and
+  re-read by the evidence-verifier).
+* https://docs.kernel.org/process/submitting-patches.html — `Fixes:` takes a commit, `Closes:` a report's
+  URL, no tag names a failing test (fetched 2026-11-11, summarised by the fetch tool).
+* https://android.googlesource.com/platform/tools/repohooks/+/refs/heads/master/README.md (`Test:` line),
+  https://fuchsia.dev/fuchsia-src/contribute/commit-message-style-guide and
+  https://fuchsia.dev/fuchsia-src/development/testing/testing_for_flakiness_in_cq (`Test:`, `Multiply:`),
+  https://www.conventionalcommits.org/en/v1.0.0/ (no such footer) — found and read by the
+  evidence-verifier, 2026-11-11, not fetched again here. `scripts/survey-github report
+  canon/github-practice.json`: the survey measures co-author trailers only (run 2026-11-11).
+* `git log --format='%s | %(trailers:key=Co-Authored-By,valueonly)' f76675e..349fc9e` (#183 to #186), and
+  `scripts/test-land`'s fix-marker cases (run 2026-11-11). An evidence-verifier pass on 2026-11-11
+  corrected the convention claim and the trading path's scope.

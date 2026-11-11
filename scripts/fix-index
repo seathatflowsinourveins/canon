@@ -1,0 +1,36 @@
+#!/bin/bash
+# fix-index — list landed commits that carry the fix marker, as JSON, for the build eval's case drafting
+# (ADR 0057) and the review rounds' counts (ADR 0073, addition of 2026-11-11).
+#
+# A commit that fixes a finding names the test that failed before it in `Fails-before: <file>::<test>` and
+# the finding in `Confirms: <round or reader>/<finding>`, both git trailers (git-interpret-trailers(1)).
+# Git parses them itself, through git-log's %(trailers:key=...,valueonly,unfold) format (git's
+# pretty-formats documentation); nothing here reads a message by hand. scripts/land carries every commit's
+# trailers into the squash commit, so main's commits hold them.
+#
+# Usage: scripts/fix-index [<revision or range>]   default: origin/main where there is one (what scripts/land
+#   lands on; fetch first for the latest), else main
+# Prints a JSON array, newest first, of the commits that carry either trailer:
+#   {"commit", "date" (committer date, YYYY-MM-DD), "subject", "fails_before": [...], "confirms": [...]}
+# Exit 0 with the array (possibly empty), 1 if git or jq cannot read the history.
+set -uo pipefail
+die() { echo "fix-index: $*" >&2; exit 1; }
+[ $# -le 1 ] || die "usage: scripts/fix-index [<revision or range>]"
+if [ $# -eq 1 ]; then rev="$1"
+elif git rev-parse --verify -q origin/main >/dev/null 2>&1; then rev=origin/main
+else rev=main; fi
+case "$rev" in -*) die "usage: scripts/fix-index [<revision or range>]" ;; esac
+command -v jq >/dev/null 2>&1 || die "jq is not on PATH"
+git rev-parse --git-dir >/dev/null 2>&1 || die "not inside a git repository"
+# Fields end in NUL, commits in RS (0x1e); multiple values of one trailer are joined by US (0x1f).
+fmt='%H%x00%cs%x00%s%x00%(trailers:key=Fails-before,valueonly,unfold,separator=%x1f)%x00%(trailers:key=Confirms,valueonly,unfold,separator=%x1f)%x00%x1e'
+git rev-list -n 1 "$rev" -- >/dev/null || die "git cannot read the revision $rev"
+# Piped, not captured: a shell variable cannot hold the NUL separators. pipefail makes git's failure count.
+git log --format="$fmt" "$rev" -- | jq -Rs '
+  split("\u001e")
+  | map(ltrimstr("\n") | select(length > 0) | split("\u0000")
+        | {commit: .[0], date: .[1], subject: .[2],
+           fails_before: (.[3] | split("\u001f") | map(select(length > 0))),
+           confirms: (.[4] | split("\u001f") | map(select(length > 0)))}
+        | select((.fails_before | length) > 0 or (.confirms | length) > 0))' \
+  || die "git could not read the history of $rev, or jq could not parse it (see above)"

@@ -76,10 +76,15 @@ T="$TMP/template"
 mkdir -p "$T/work/scripts" "$T/work/docs/adr" "$T/work/src"
 { git init -q -b main "$T/work" && git init -q --bare "$T/origin.git"; } || { echo "test-land: git init failed"; exit 1; }
 cp "$ROOT/scripts/land" "$ROOT/scripts/check-addresses" "$T/work/scripts/"
+[ ! -f "$ROOT/scripts/fix-index" ] || cp "$ROOT/scripts/fix-index" "$T/work/scripts/"
 # shellcheck disable=SC2016  # expanded by the stub, not here
 printf '%s\n' '#!/bin/bash' 'echo ran >> "$FAKE/ci"' > "$T/work/scripts/ci"; chmod +x "$T/work/scripts/ci"
 echo "readme" > "$T/work/README.md"; echo "# 0001 First" > "$T/work/docs/adr/0001-first.md"
 echo "lock" > "$T/work/uv.lock"; echo "x = 1" > "$T/work/src/a.py"
+# A gate module on the trading path, and a test file for Fails-before to name.
+mkdir -p "$T/work/src/canon_trading" "$T/work/tests"
+echo "y = 1" > "$T/work/src/canon_trading/ranking.py"
+printf 'class TestGate:\n    def test_refuses(self):\n        pass\n\n\ndef test_gate():\n    pass\n' > "$T/work/tests/test_gate.py"
 { git -C "$T/work" add -A && git -C "$T/work" commit -q -m "Start" \
   && git -C "$T/work" push -q "$T/origin.git" main; } || { echo "test-land: template setup failed"; exit 1; }
 
@@ -572,6 +577,199 @@ case_ "the direct merge gives the checked subject and message" t_merge_text 0
 case_ "auto-merge gives the checked subject and message"    t_merge_text 1
 case_ "a pull request closed while waiting stops the wait"  t_closed
 case_ "both merge calls' errors are shown when both fail"   t_merge_errors
+
+# --- the fix marker (ADR 0073, addition of 2026-11-11) ---
+# fix <path> <subject> [<trailer line>...]: change a file and commit it with a body and the given trailers
+fix() {
+  local path="$1" subject="$2" msg; shift 2
+  msg=$(printf '%s\n\n## Summary\n\nDetails for the reader.\n\nCo-Authored-By: Test <1+test@users.noreply.github.com>' "$subject")
+  [ $# -eq 0 ] || msg=$(printf '%s\n%s' "$msg" "$(printf '%s\n' "$@")")
+  mkdir -p "$(dirname "$W/$path")"; echo "line" >> "$W/$path"
+  git -C "$W" add -A && git -C "$W" commit -q -m "$msg"
+}
+# merged_trailer <key>: the values of that trailer in the squash commit GitHub would write from the merge call
+# (its --subject, a blank line, then its --body-file), as git itself parses them
+merged_trailer() {
+  { logged "--subject " && [ -f "$FAKE/merge_body" ]; } || return 1
+  { sed -n 's/.* --subject \(.*\) --body-file .*/\1/p' "$FAKE/log" | tail -n 1; echo; cat "$FAKE/merge_body"; } \
+    | git interpret-trailers --parse --no-divider | sed -n "s/^$1: //p"
+}
+warned() { printf '%s\n' "$out" | grep -c "^land: warning:" ; }
+t_fix_warns() {
+  new_repo; fix src/canon_trading/ranking.py "Fix the gate's finding on an empty sample"
+  land --reviewed "code-review ran"
+  why="no warning naming Fails-before, or not landed"
+  [ "$rc" -eq 0 ] && has "landed:" && [ "$(warned)" -eq 1 ] && has "no Fails-before trailer" \
+    && has "src/canon_trading/ranking.py"
+}
+t_fix_confirms_warns() {   # a Confirms trailer says it fixes a finding, whatever the subject says
+  new_repo; fix src/canon_trading/ranking.py "Refuse an empty sample" "Confirms: round-3/codex-2"
+  land --reviewed "code-review ran"; [ "$rc" -eq 0 ] && [ "$(warned)" -eq 1 ] && has "no Fails-before trailer"
+}
+t_fix_dry_warns() {
+  new_repo; fix src/canon_trading/ranking.py "Fix a finding"; land --dry-run --reviewed "code-review ran"
+  [ "$rc" -eq 0 ] && [ "$(warned)" -eq 1 ] && ! pushed topic
+}
+t_fix_named() {
+  new_repo
+  fix src/canon_trading/ranking.py "Fix the gate's finding" "Fails-before: tests/test_gate.py::test_gate" \
+    "Fails-before: tests/test_gate.py::TestGate::test_refuses[empty]"
+  land --reviewed "code-review ran"; why="warned on tests that exist"
+  [ "$rc" -eq 0 ] && has "landed:" && [ "$(warned)" -eq 0 ]
+}
+t_fix_named_missing() {    # one warning line per named test the tree lacks; the run still lands
+  new_repo
+  fix src/canon_trading/ranking.py "Fix the gate's finding" "Fails-before: tests/test_gate.py::test_nothing" \
+    "Fails-before: tests/test_absent.py::test_gate" "Fails-before: tests/test_gate.py::test_gate"
+  land --reviewed "code-review ran"
+  [ "$rc" -eq 0 ] && has "landed:" && [ "$(warned)" -eq 2 ] && has "tests/test_gate.py::test_nothing" \
+    && has "tests/test_absent.py::test_gate"
+}
+t_fix_named_off_path() {   # a named test is checked wherever the change is
+  new_repo; fix src/a.py "Fix a finding" "Fails-before: tests/test_gate.py::test_gone"
+  land --reviewed "code-review ran"; [ "$rc" -eq 0 ] && [ "$(warned)" -eq 1 ] && has "tests/test_gate.py::test_gone"
+}
+t_fix_off_path() {
+  new_repo; fix src/a.py "Fix the finding in a helper"; land --reviewed "code-review ran"
+  [ "$rc" -eq 0 ] && [ "$(warned)" -eq 0 ]
+}
+t_no_fix_on_path() {
+  new_repo; fix src/canon_trading/ranking.py "Name the gate's threshold"; land --reviewed "code-review ran"
+  [ "$rc" -eq 0 ] && [ "$(warned)" -eq 0 ]
+}
+t_trailers_merge() {       # t_trailers_merge <merge_rc>: one commit's trailers reach the squash commit
+  new_repo
+  fix src/canon_trading/ranking.py "Fix the gate's finding" "Fails-before: tests/test_gate.py::test_gate" \
+    "Confirms: round-3/codex-2"
+  echo "$1" > "$FAKE/merge_rc"; land --reviewed "code-review ran"
+  why="trailers missing from the squash message"
+  [ "$rc" -eq 0 ] && [ "$(merged_trailer Fails-before)" = "tests/test_gate.py::test_gate" ] \
+    && [ "$(merged_trailer Confirms)" = "round-3/codex-2" ] && [ -n "$(merged_trailer Co-Authored-By)" ]
+}
+t_trailers_merge_many() {  # a trailer on an earlier commit of several reaches the squash commit's trailer block
+  new_repo
+  fix src/canon_trading/ranking.py "Fix the gate's finding" "Fails-before: tests/test_gate.py::test_gate" \
+    "Confirms: round-3/codex-2"
+  fix src/canon_trading/ranking.py "Fix the second finding" "Fails-before: tests/test_gate.py::TestGate::test_refuses"
+  land --reviewed "code-review ran"; why="an earlier commit's trailers missing from the squash message"
+  [ "$rc" -eq 0 ] && [ "$(warned)" -eq 0 ] \
+    && [ "$(merged_trailer Fails-before | LC_ALL=C sort | paste -sd, -)" = "tests/test_gate.py::TestGate::test_refuses,tests/test_gate.py::test_gate" ] \
+    && [ "$(merged_trailer Confirms)" = "round-3/codex-2" ]
+}
+t_trailers_body_file() {   # a --body file without them gets the commits' trailers; the file itself is left alone
+  new_repo
+  fix src/canon_trading/ranking.py "Fix the gate's finding" "Fails-before: tests/test_gate.py::test_gate"
+  printf '## Summary\n\nWritten by hand.\n' > "$C/body.md"
+  land --body "$C/body.md" --reviewed "code-review ran"
+  [ "$rc" -eq 0 ] && [ "$(merged_trailer Fails-before)" = "tests/test_gate.py::test_gate" ] \
+    && grep -c "Written by hand." "$FAKE/merge_body" >/dev/null && ! grep -c "Fails-before" "$C/body.md" >/dev/null
+}
+t_trailers_local() {       # with no remote, main is the branch itself, so its trailers are on main
+  new_repo noremote
+  fix src/canon_trading/ranking.py "Fix the gate's finding" "Fails-before: tests/test_gate.py::test_gate"
+  land --reviewed "code-review ran"
+  [ "$rc" -eq 0 ] && [ "$(git -C "$W" log -1 --format='%(trailers:key=Fails-before,valueonly)' main)" = "tests/test_gate.py::test_gate" ]
+}
+t_index() {                # the index lists landed commits with their trailers, newest first, and no others
+  new_repo noremote
+  fix src/canon_trading/ranking.py "Fix the gate's finding" "Fails-before: tests/test_gate.py::test_gate" \
+    "Fails-before: tests/test_gate.py::TestGate::test_refuses" "Confirms: round-3/codex-2"
+  fix README.md "Reword the readme"
+  fix src/a.py "Answer a reader" "Confirms: muse/4"
+  land --reviewed "code-review ran" || return 1
+  out=$(cd "$W" && scripts/fix-index 2>&1); rc=$?
+  why="fix-index output not as expected"
+  [ "$rc" -eq 0 ] || return 1
+  jq -e --arg a "$(git -C "$W" rev-parse main)" --arg b "$(git -C "$W" rev-parse main~2)" '
+    length == 2
+    and .[0].commit == $a and .[0].subject == "Answer a reader"
+    and .[0].fails_before == [] and .[0].confirms == ["muse/4"]
+    and .[1].commit == $b and .[1].subject == "Fix the gate'"'"'s finding"
+    and .[1].fails_before == ["tests/test_gate.py::test_gate", "tests/test_gate.py::TestGate::test_refuses"]
+    and .[1].confirms == ["round-3/codex-2"]
+    and (.[1].date | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}$"))' <<<"$out" >/dev/null
+}
+t_index_squash() {         # a squash commit made from the merge call's subject and message is indexed the same
+  new_repo
+  fix src/canon_trading/ranking.py "Fix the gate's finding" "Fails-before: tests/test_gate.py::test_gate"
+  fix src/canon_trading/ranking.py "Fix the next one" "Confirms: round-3/codex-2"
+  land --reviewed "code-review ran" || return 1
+  local subject tree sq
+  subject=$(sed -n 's/.* --subject \(.*\) --body-file .*/\1/p' "$FAKE/log" | tail -n 1)
+  tree=$(git -C "$W" rev-parse 'topic^{tree}')
+  sq=$({ printf '%s\n\n' "$subject"; cat "$FAKE/merge_body"; } | git -C "$W" commit-tree "$tree" -p main) || return 1
+  git -C "$W" update-ref refs/heads/squashed "$sq"
+  out=$(cd "$W" && scripts/fix-index squashed 2>&1); rc=$?
+  [ "$rc" -eq 0 ] && jq -e '.[0].subject == "Fix the next one (#7)" and .[0].fails_before == ["tests/test_gate.py::test_gate"]
+    and .[0].confirms == ["round-3/codex-2"] and length == 1' <<<"$out" >/dev/null
+}
+t_index_bad_rev() { new_repo noremote; out=$(cd "$W" && scripts/fix-index no-such-rev 2>&1); rc=$?
+                    [ "$rc" -ne 0 ] && has "fix-index"; }
+t_trailers_url_body() {    # a description ending in a bare URL keeps it as written; the trailers get their own paragraph
+  new_repo
+  fix src/canon_trading/ranking.py "Fix the gate's finding" "Fails-before: tests/test_gate.py::test_gate"
+  fix src/canon_trading/ranking.py "Fix the next one" "Confirms: round-3/codex-2"
+  printf '## Summary\n\nBy hand.\n\n## Evidence\n\nhttps://docs.example.com/page\n' > "$C/body.md"
+  land --body "$C/body.md" --reviewed "code-review ran"; why="the URL was rewritten or the trailers lost"
+  [ "$rc" -eq 0 ] && [ "$(grep -cxF "https://docs.example.com/page" "$FAKE/merge_body")" = 1 ] \
+    && [ "$(merged_trailer Fails-before)" = "tests/test_gate.py::test_gate" ] \
+    && [ "$(merged_trailer Confirms)" = "round-3/codex-2" ]
+}
+t_fix_subpackage() {       # an adapter module in a subpackage is on the trading path
+  new_repo; fix packages/canon-alpaca/src/canon_alpaca/execution/orders.py "Fix the order path's finding"
+  land --reviewed "code-review ran"; [ "$rc" -eq 0 ] && [ "$(warned)" -eq 1 ] && has "no Fails-before trailer"
+}
+t_fix_wrong_class() {
+  new_repo
+  fix src/canon_trading/ranking.py "Fix the gate's finding" "Fails-before: tests/test_gate.py::TestGaet::test_refuses"
+  land --reviewed "code-review ran"; [ "$rc" -eq 0 ] && [ "$(warned)" -eq 1 ] && has "defines no class TestGaet"
+}
+t_fixed_seed() {           # "fixed" alone, as in a fixed seed, is not taken for a fix
+  new_repo; fix src/canon_trading/ranking.py "Draw the variants from a fixed seed"; land --reviewed "code-review ran"
+  [ "$rc" -eq 0 ] && [ "$(warned)" -eq 0 ]
+}
+t_index_origin() {         # with no revision, the index reads origin/main, which a stale local main may lag
+  new_repo
+  git -C "$W" switch -q -c side main
+  fix src/canon_trading/ranking.py "Fix the gate's finding" "Fails-before: tests/test_gate.py::test_gate"
+  git -C "$W" push -q origin side:main && git -C "$W" fetch -q origin || return 1
+  out=$(cd "$W" && scripts/fix-index 2>&1); rc=$?
+  [ "$rc" -eq 0 ] && jq -e 'length == 1 and .[0].subject == "Fix the gate'"'"'s finding"' <<<"$out" >/dev/null
+}
+t_trading_globs() {        # every glob of scripts/land's trading path matches a tracked file here
+  local list g n bad=""
+  list=$(sed -n "s/^TRADING_PATHS='\(.*\)'$/\1/p" "$ROOT/scripts/land")
+  why="TRADING_PATHS missing from scripts/land"; [ -n "$list" ] || return 1
+  set -f
+  for g in $list; do
+    n=$(git -C "$ROOT" ls-files -- ":(glob)$g" | grep -c .)
+    [ "$n" -gt 0 ] || bad="$bad $g"
+  done
+  set +f
+  why="globs matching no tracked file:${bad}"; [ -z "$bad" ]
+}
+case_ "a trading-path fix with no Fails-before warns and still lands" t_fix_warns
+case_ "a Confirms trailer counts as fixing a finding"       t_fix_confirms_warns
+case_ "a dry run prints the same warning"                   t_fix_dry_warns
+case_ "Fails-before naming tests that exist: no warning"    t_fix_named
+case_ "Fails-before naming tests the tree lacks warns once each and lands" t_fix_named_missing
+case_ "a named test is checked off the trading path too"    t_fix_named_off_path
+case_ "a fix off the trading path does not warn"            t_fix_off_path
+case_ "a trading-path change that fixes nothing does not warn" t_no_fix_on_path
+case_ "the direct merge keeps the commit's trailers"        t_trailers_merge 0
+case_ "auto-merge keeps the commit's trailers"              t_trailers_merge 1
+case_ "an earlier commit's trailers reach the squash message" t_trailers_merge_many
+case_ "a --body file gets the commits' trailers"            t_trailers_body_file
+case_ "with no remote the trailers are on main"             t_trailers_local
+case_ "fix-index lists landed commits with their trailers"  t_index
+case_ "fix-index reads a squash commit built from the merge call" t_index_squash
+case_ "fix-index fails loudly on a revision git cannot read" t_index_bad_rev
+case_ "a description ending in a URL keeps it, and gets the trailers" t_trailers_url_body
+case_ "an adapter module in a subpackage is on the trading path" t_fix_subpackage
+case_ "Fails-before naming a class the file lacks warns"   t_fix_wrong_class
+case_ "a fixed seed is not a fix"                           t_fixed_seed
+case_ "fix-index reads origin/main by default"              t_index_origin
+case_ "every trading-path glob matches a tracked file"      t_trading_globs
 
 wait
 pass=0; fail=0
