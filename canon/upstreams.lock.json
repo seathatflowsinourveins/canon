@@ -18,6 +18,15 @@
       "sha": "3d3c42e5aac5ba805825da76410c181273ba90b1",
       "track": "tag:v7.0.1"
     },
+    "agent-orchestrator": {
+      "default_branch": "main",
+      "default_sha": "f9b90ef6ce923ba36f47e0d2f25856a7144a7c29",
+      "ref": "refs/tags/v0.14.10",
+      "repo": "OrchestratorInc/agent-orchestrator",
+      "resolved_at": "2026-11-11T04:49:30Z",
+      "sha": "033d597032e448a0ea16c298350e36b099f74106",
+      "track": "tag:v0.14.10"
+    },
     "agents-md": {
       "default_branch": "main",
       "default_sha": "d001185d792eb6402a58e4cbef1c228b309ec25d",
@@ -188,6 +197,15 @@
       "resolved_at": "2026-11-10T21:34:03Z",
       "sha": "103834cb1000a84569a71646fec7162f18a058c8",
       "track": "tag:v0.17.0"
+    },
+    "gascity": {
+      "default_branch": "main",
+      "default_sha": "607e3570e3fa2409cb6d216c36a243b35a99d6fb",
+      "ref": "refs/tags/v1.5.1",
+      "repo": "gastownhall/gascity",
+      "resolved_at": "2026-11-11T04:49:33Z",
+      "sha": "4f698fe2a7eefae49e545c5e38189f1b63fb9b39",
+      "track": "tag:v1.5.1"
     },
     "gh": {
       "default_branch": "trunk",

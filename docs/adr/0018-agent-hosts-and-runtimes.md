@@ -143,3 +143,34 @@ Read 2026-11-10. "Lane": a research subagent fetched and summarised the page. "S
   Claude Code; the reader's corrections are made above.
 * ADR 0043, 2026-11-10 — supersedes rule 5 on the owner's instruction to use other runtimes as Orca
   workers where that raises quality; pointer lines were added to rule 5 and to the outcome, and nothing else changed.
+* Refresh, 2026-11-10 (fetched; pages summarised by a small model; decision unchanged). Two projects
+  entered the registry as `watch`, not adopted, nothing installed: `agent-orchestrator` and `gascity`.
+  * https://github.com/OrchestratorInc/agent-orchestrator (Apache-2.0, `main`): "a local desktop workspace",
+    and "The desktop app runs the daemon for you"; each task gets its own agent, branch and worktree. It is
+    a desktop host in the same class as Orca. https://docs.orchestrator.inc/migration/: the npm package
+    `@aoagents/ao` is "frozen at `0.10.0`" and "will receive no new features or fixes"; the `ao` command is
+    "a bridge to fetch and open the desktop build". The releases page shows nightly pre-releases several
+    times a day; stable tags v0.14.8 to v0.14.10 exist (GitHub API, not that page). The npm registry lists
+    `@aoagents/ao` 0.10.3 as latest (12 Jul 2026), which disagrees with the docs' "frozen at `0.10.0`".
+    The repository's former owner name resolves through the GitHub API to this one, so it was transferred or
+    renamed; no notice was read.
+  * https://github.com/gastownhall/gascity (MIT, `main`): "Orchestration-builder SDK for multi-agent coding
+    workflows"; work is stored "in beads, which keeps its data in Dolt". A framework built on a work-item
+    store, not a desktop host. Latest stable v1.5.1, 24 Oct 2026. https://yegge.ai/gastown: Gas Town was
+    "Shipped at v1.0 in 2026, now retired. Its successor is Gas City." The Gas Town repository
+    (gastownhall/gastown) is not archived (GitHub API) and had a commit on 10 Nov 2026; its last release is
+    v1.2.1, 6 Jun 2026.
+  * UNVERIFIED: AO's permission model and cost tracking (its migration page covers neither; its README
+    mentions "needs approval" notifications in a mobile section and no permission model). For Gas City only
+    release-note lines were read: v1.5.1 "a security fix for Claude permission prompts", cost estimates priced
+    for the Claude 5 family, and an agent guide covering Claude's builtin `permission_mode = "unrestricted"`
+    default; its permission model is otherwise UNVERIFIED.
+  * https://raw.githubusercontent.com/stablyai/orca/main/docs/site/content/docs/cli/orchestration.mdx
+    (fetched with curl, line 12): `<Callout title="Experimental">`, "Enable orchestration under Settings →
+    Experimental before using these commands." An earlier summary of the page missed the callout; rule 7
+    stands.
+  * https://github.com/OrchestratorInc/agent-orchestrator/releases, release `v0.14.11-nightly.202611101246`,
+    10 Nov 2026: "Add a Move from Conductor guide for the Cloud shutdown". Conductor was one of the hosts
+    weighed under option 3; the note concerns its cloud service, and the shutdown itself is not read at
+    Conductor's own source. Secondary reports (unite.ai, cellcog.ai; not fetched by the author) say Meta
+    acquired Conductor and that its cloud shuts down on 20 Nov 2026: UNVERIFIED.
