@@ -34,6 +34,7 @@ import pytest
 import requests
 from alpaca.common.exceptions import APIError
 from alpaca.trading.client import TradingClient
+from alpaca.trading.models import AccountConfiguration
 from alpaca.trading.models import Calendar
 from alpaca.trading.models import Clock
 from alpaca.trading.models import Order
@@ -1018,11 +1019,30 @@ def test_a_run_whose_records_folder_cannot_be_found_says_so_and_exits_1(
     assert not any(tmp_path.iterdir())
 
 
-class Account:
-    """A stand-in for the paper `TradingClient`: a clock, a calendar day, and what the account holds."""
+LONG_ONLY: dict[str, Any] = {
+    "no_shorting": True,
+    "suspend_trade": False,
+    "fractional_trading": True,
+    "max_margin_multiplier": "4",
+    "trade_confirm_email": "all",
+    "ptp_no_exception_entry": False,
+    "max_options_trading_level": 3,
+    "disable_overnight_trading": False,
+}
+"""Alpaca's account configuration as `GET /v2/account/configurations` answers it since the fields it
+stopped sending (alpaca-py 0.45.0's `AccountConfiguration`), on an account held long-only."""
 
-    def __init__(self, *, orders: list | None = None) -> None:
+
+class Account:
+    """A stand-in for the paper `TradingClient`: a clock, a calendar day, what the account holds, and its
+    configuration (long-only unless `no_shorting` says otherwise)."""
+
+    def __init__(self, *, orders: list | None = None, no_shorting: bool = True) -> None:
         self.orders = orders or []
+        self.no_shorting = no_shorting
+
+    def get_account_configurations(self) -> AccountConfiguration:
+        return AccountConfiguration.model_validate({**LONG_ONLY, "no_shorting": self.no_shorting})
 
     def get_clock(self) -> Clock:
         return clock(datetime(2026, 11, 10, 11, 0, tzinfo=NEW_YORK), is_open=True)
@@ -3312,6 +3332,11 @@ class Flat:
     def get_open_position(self, symbol):
         from alpaca.common.exceptions import APIError
         raise APIError('{"code": 40410000}', SimpleNamespace(response=SimpleNamespace(status_code=404)))
+    def get_account_configurations(self):
+        from alpaca.trading.models import AccountConfiguration
+        return AccountConfiguration(no_shorting=True, suspend_trade=False, fractional_trading=True,
+                                    max_margin_multiplier="4", trade_confirm_email="all",
+                                    ptp_no_exception_entry=False)
 
 session_window.ADAPTER_CALL_SECS = 0.3
 session_window.paper_trading = lambda: Flat()
@@ -4610,14 +4635,13 @@ def test_a_window_runs_session_ma_cross_unless_another_strategy_of_the_table_is_
     assert WindowConfig().strategy == "SessionMaCross"
     assert session_window._parser().parse_args([]).strategy == "SessionMaCross"
     assert set(session_window.WINDOW_STRATEGIES) == {"SessionMaCross", "EmaCross"}
-    assert WindowConfig(strategy="EmaCross").strategy == "EmaCross"
     with pytest.raises(ValueError, match="strategy must be one of"):
         WindowConfig(strategy="GridMarketMaker")
     with pytest.raises(SystemExit):
         session_window._parser().parse_args(["--strategy", "GridMarketMaker"])
 
 
-def test_ema_cross_is_refused_by_name_outside_the_regular_session(extended) -> None:
+def test_ema_cross_is_refused_by_name_outside_the_regular_session(extended, ema_cross_runs) -> None:
     """`EmaCross` does not flatten on stop, and the account check closes at market in the regular
     session only, so an extended window of it could end holding a position."""
     with pytest.raises(ValueError, match="EmaCross runs in regular windows only"):
@@ -4664,8 +4688,186 @@ def test_a_refusal_names_the_sessions_the_table_gives(monkeypatch) -> None:
         WindowConfig(strategy="EmaCross")
 
 
-def test_the_ema_cross_window_node_adds_upstreams_builtin_beside_the_cap(
+# --- Long-only: a window never opens a short (the lead's rule, 2026-11-11) ---
+
+
+@pytest.fixture
+def ema_cross_runs(monkeypatch):
+    """`EmaCross` as the table held it before it was refused for selling while flat, for the tests of
+    the window machinery it still exercises (its node, its record)."""
+    from dataclasses import replace
+
+    entry = session_window.WINDOW_STRATEGIES["EmaCross"]
+    monkeypatch.setitem(
+        session_window.WINDOW_STRATEGIES, "EmaCross", replace(entry, sells_while_flat="")
+    )
+
+
+def test_ema_cross_is_refused_by_name_because_it_sells_while_flat() -> None:
+    """Upstream's `EmaCross` sends a market order at each cross whatever it holds, and on paper on
+    2026-11-11 it sold 1 SPY while flat and held the short for the whole window. The table refuses it by
+    name in every session, whatever the account's setting."""
+    with pytest.raises(ValueError, match="EmaCross sells while flat") as refused:
+        WindowConfig(strategy="EmaCross")
+    assert "a window never opens a short" in str(refused.value)
+    assert WindowConfig().strategy == "SessionMaCross"
+    assert not session_window.WINDOW_STRATEGIES["SessionMaCross"].sells_while_flat
+
+
+def test_a_window_of_ema_cross_is_refused_before_alpaca_is_read(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    monkeypatch.setattr(session_window, "paper_trading", lambda: pytest.fail("Alpaca was read"))
+    argv = ["--session", "regular", "--strategy", "EmaCross", "--log-dir", str(tmp_path)]
+    assert session_window.main(argv) == 1
+    assert "EmaCross sells while flat" in capsys.readouterr().err
+
+
+def test_a_window_starts_only_on_an_account_alpaca_holds_long_only(monkeypatch, tmp_path) -> None:
+    """The start check reads Alpaca's account configuration and refuses, by name and before a node is
+    built, an account whose `no_shorting` is false; the record of a window that ran says what it read."""
+    assert session_window.VENUE_LONG_ONLY
+    monkeypatch.setattr(session_window, "paper_trading", lambda: Account(no_shorting=False))
+    monkeypatch.setattr(
+        session_window, "window_node", lambda *a, **k: pytest.fail("a node was built")
+    )
+    with pytest.raises(session_window.WindowRefused, match="no_shorting is false") as refused:
+        session_window.run_window(WindowConfig(log_dir=tmp_path))
+    assert "paper:long-only" in str(refused.value)
+    assert not (tmp_path / "latest.json").exists()
+    monkeypatch.undo()
+    _, latest, _ = quiet_window(monkeypatch, tmp_path / "held", quotes=5, trades=0)
+    assert latest["result"] == "ok" and latest["no_shorting"] is True
+
+
+def test_a_refused_window_on_an_account_that_allows_shorting_is_recorded_by_name(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    monkeypatch.setattr(session_window, "paper_trading", lambda: Account(no_shorting=False))
+    argv = ["--session", "regular", "--log-dir", str(tmp_path)]
+    assert session_window.main(argv) == 1
+    latest = json.loads((tmp_path / "latest.json").read_text())
+    assert latest["result"].startswith("refused: ") and "no_shorting is false" in latest["result"]
+
+
+def test_in_report_mode_the_start_check_records_the_setting_and_starts_either_way(
     monkeypatch, tmp_path
+) -> None:
+    """`VENUE_LONG_ONLY` off is the state before the setting was first made: the check reads and
+    records, and refuses nothing."""
+    monkeypatch.setattr(session_window, "VENUE_LONG_ONLY", False)
+    _, latest, _ = quiet_window(
+        monkeypatch, tmp_path, quotes=5, trades=0, account=Account(no_shorting=False)
+    )
+    assert latest["result"] == "ok" and latest["no_shorting"] is False
+
+
+def configured_client(monkeypatch, answer: dict) -> tuple[TradingClient, list]:
+    """alpaca-py's own paper `TradingClient`, its HTTP calls answered here: `GET` with `answer`, a
+    `PATCH` with what it sent, as Alpaca answers it. Each call is kept as (method, path, body)."""
+    trading = TradingClient(api_key="stand-in", secret_key="stand-in", paper=True)
+    calls: list = []
+
+    def get(path, data=None, **kwargs):
+        calls.append(("GET", path, data))
+        return dict(answer)
+
+    def patch(path, data=None, **kwargs):
+        calls.append(("PATCH", path, data))
+        return dict(data or {})
+
+    monkeypatch.setattr(trading, "get", get)
+    monkeypatch.setattr(trading, "patch", patch)
+    return trading, calls
+
+
+def test_the_setting_task_turns_long_only_on_and_off_by_alpaca_pys_documented_call(
+    monkeypatch, capsys
+) -> None:
+    """`on` reads the configuration and sends it back through `set_account_configurations` with
+    `no_shorting` true, everything else as read; `off` reverses it by the same call. It prints the
+    setting's value and nothing else."""
+    trading, calls = configured_client(monkeypatch, {**LONG_ONLY, "no_shorting": False})
+    assert session_window.long_only_task("on", trading) == 0
+    assert [(m, p) for m, p, _ in calls] == [
+        ("GET", "/account/configurations"),
+        ("PATCH", "/account/configurations"),
+    ]
+    sent = calls[1][2]
+    assert sent["no_shorting"] is True
+    assert {k: v for k, v in sent.items() if k in LONG_ONLY and k != "no_shorting"} == {
+        k: v for k, v in LONG_ONLY.items() if k != "no_shorting"
+    }
+    assert capsys.readouterr().out == "no_shorting: false -> true\n"
+
+    trading, calls = configured_client(monkeypatch, LONG_ONLY)
+    assert session_window.long_only_task("off", trading) == 0
+    assert calls[1][2]["no_shorting"] is False
+    assert capsys.readouterr().out == "no_shorting: true -> false\n"
+
+
+def test_the_setting_tasks_check_reads_only_and_prints_only_the_value(monkeypatch, capsys) -> None:
+    trading, calls = configured_client(monkeypatch, LONG_ONLY)
+    assert session_window.long_only_task("check", trading) == 0
+    assert [m for m, _, _ in calls] == ["GET"]
+    assert capsys.readouterr().out == "no_shorting: true\n"
+
+
+def test_the_setting_task_fails_naming_any_other_field_alpaca_changed(monkeypatch, capsys) -> None:
+    """The PATCH sends the whole configuration as read (alpaca-py's `to_patch_payload`); a field that
+    comes back different is named and the task fails, so a change beyond the setting is not missed."""
+    trading = TradingClient(api_key="stand-in", secret_key="stand-in", paper=True)
+    monkeypatch.setattr(trading, "get", lambda path, data=None, **kw: dict(LONG_ONLY))
+    monkeypatch.setattr(
+        trading,
+        "patch",
+        lambda path, data=None, **kw: {**(data or {}), "max_options_trading_level": None},
+    )
+    assert session_window.long_only_task("off", trading) == 1
+    said = capsys.readouterr()
+    assert said.out == "no_shorting: true -> false\n"
+    assert "max_options_trading_level" in said.err
+    with pytest.raises(ValueError, match="check, on or off"):
+        session_window.long_only_task("short", trading)
+
+
+def test_the_setting_task_sends_nothing_when_the_setting_is_already_as_asked(
+    monkeypatch, capsys
+) -> None:
+    trading, calls = configured_client(monkeypatch, LONG_ONLY)
+    assert session_window.long_only_task("on", trading) == 0
+    assert [m for m, _, _ in calls] == ["GET"]
+    assert capsys.readouterr().out == "no_shorting: true (unchanged)\n"
+
+
+def test_the_refusal_names_a_task_that_exists_whatever_the_environment(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.delenv(session_window.ACCOUNT_ENV, raising=False)
+    monkeypatch.setattr(session_window, "paper_trading", lambda: Account(no_shorting=False))
+    with pytest.raises(session_window.WindowRefused, match="paper:long-only windows on"):
+        session_window.run_window(WindowConfig(log_dir=tmp_path))
+
+
+def test_the_setting_task_reads_one_named_accounts_pair_and_holds_its_lock_to_change_it() -> None:
+    """`paper:long-only <tests|windows> <check|on|off>`: account A's pair and lock for `tests`, account
+    B's for `windows` (ADR 0069); the pair is read into the task's environment only, never echoed;
+    a change waits for the account's lock, so no paper run is mid-way; `check` takes none."""
+    root = Path(__file__).resolve().parents[1]
+    task = tomllib.loads((root / "mise.toml").read_text())["tasks"]["paper:long-only"]
+    run = task["run"]
+    assert "tests) svc=canon-alpaca-paper; lock=canon-paper-test.lock ;;" in run
+    assert "windows) svc=canon-alpaca-paper-windows; lock=canon-paper-windows.lock ;;" in run
+    assert 'choices "check" "on" "off"' in task["usage"]
+    assert "long_only_task" in run and '"$usage_action"' in run
+    reads = [line for line in run.splitlines() if "find-generic-password" in line]
+    assert len(reads) == 2 and all("/usr/bin/timeout 30 " in line for line in reads)
+    assert not re.search(r"\b(echo|printf)\b[^\n]*\$ALPACA_", run)
+    assert '[ "$usage_action" = check ] ||' in run
+
+
+def test_the_ema_cross_window_node_adds_upstreams_builtin_beside_the_cap(
+    monkeypatch, tmp_path, ema_cross_runs
 ) -> None:
     """`window_node` adds `EmaCross` through `add_builtin_strategy` with `paper_node.ema_cross_config`
     (one share an order, upstream's periods) and the cap beside it; with no managed stop to wait for,
@@ -4700,7 +4902,9 @@ def test_the_ema_cross_window_node_adds_upstreams_builtin_beside_the_cap(
         node.dispose()
 
 
-def test_an_ema_cross_window_refuses_a_feed_its_subscription_cannot_name(tmp_path) -> None:
+def test_an_ema_cross_window_refuses_a_feed_its_subscription_cannot_name(
+    tmp_path, ema_cross_runs
+) -> None:
     """`EmaCross` subscribes with no params, so it streams the adapter's default feed (IEX): a window
     whose part names another would trade on data it did not ask for."""
     with pytest.raises(RuntimeError, match="EmaCross names no feed"):
@@ -4756,7 +4960,7 @@ def test_the_record_reads_a_builtins_orders_and_data_from_the_nodes_cache() -> N
         eng.dispose()
 
 
-def test_a_window_record_names_its_strategy(monkeypatch, tmp_path) -> None:
+def test_a_window_record_names_its_strategy(monkeypatch, tmp_path, ema_cross_runs) -> None:
     """The record, `running` and the result alike, names the strategy, and `run_window` reads that
     strategy's orders by its own ID."""
     _, latest, _ = quiet_window(monkeypatch, tmp_path, quotes=5, trades=0, strategy="EmaCross")
@@ -4765,7 +4969,7 @@ def test_a_window_record_names_its_strategy(monkeypatch, tmp_path) -> None:
     assert latest["strategy"] == "SessionMaCross"
 
 
-def test_a_refused_window_record_names_its_strategy(monkeypatch, tmp_path) -> None:
+def test_a_refused_window_record_names_its_strategy(monkeypatch, tmp_path, ema_cross_runs) -> None:
     held = SimpleNamespace(client_order_id="someone-elses")
     monkeypatch.setattr(session_window, "paper_trading", lambda: Account(orders=[held]))
     argv = ["--session", "regular", "--strategy", "EmaCross", "--log-dir", str(tmp_path)]

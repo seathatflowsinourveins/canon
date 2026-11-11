@@ -4,8 +4,9 @@ Contract: NautilusTrader v2.0.0rc8's `LiveNode.builder`, `LiveNode.add_builtin_s
 and `trade_count`, `LiveExecutionEngineConfig` and `LoggerConfig` with a `FileWriterConfig`
 (`live/__init__.pyi`, `common/__init__.pyi`); alpaca-py 0.45.0's `TradingClient` (paper)
 `get_clock`, `get_calendar`, `get_orders`, `get_open_position`, `get_order_by_client_id`,
-`cancel_order_by_id` and `submit_order` with a `MarketOrderRequest`. Read 2026-11-10 (ADR 0044; the account
-check's sources, ADR 0060):
+`cancel_order_by_id` and `submit_order` with a `MarketOrderRequest`, and `get_account_configurations` and
+`set_account_configurations` with an `AccountConfiguration`. Read 2026-11-10 (ADR 0044; the account
+check's sources, ADR 0060), and the long-only sources 2026-11-11:
 
 * https://nautilustrader.io/docs/md/latest/how_to/configure_live_trading.md, "Continuous reconciliation":
   `open_check_interval_secs` ("None or 0.0 disables. Recommended: 5-10s") and `position_check_interval_secs`
@@ -34,14 +35,27 @@ check's sources, ADR 0060):
 * https://docs.alpaca.markets/us/docs/orders-at-alpaca.md: "Once an order is placed, it can be queried
   using either the client-provided order ID or the system-assigned unique ID"; "Order Lifecycle": the four
   statuses after which "no further updates will occur for the order".
+* alpaca-py 0.45.0, `trading/models.py` `AccountConfiguration` ("no_shorting (bool): If true then Account
+  becomes long-only mode") and `trading/client.py` (`get_account_configurations`, `GET
+  /account/configurations`; `set_account_configurations`, a `PATCH` of `to_patch_payload()`, the whole
+  configuration); https://docs.alpaca.markets/us/reference/patchaccountconfig-1.md ("If true, account
+  becomes long-only mode", served from the paper host too). What Alpaca answers an order that would sell
+  short on such an account is not on either page (UNVERIFIED until `tests/test_paper_long_only.py` runs).
 * https://docs.alpaca.markets/us/reference/postorder.md: 403 "Buying power or shares is not sufficient",
   422 "Input parameters are not recognized". Not documented there or in the pages above: what Alpaca
   answers a lookup of an ID it does not hold (a 404, as the adapter's lookup reads it; UNVERIFIED), and
   how soon after a submit an order shows in a lookup or a listing.
 
-What one window is (one node, one process): one strategy of `WINDOW_STRATEGIES`, `SessionMaCross` unless
-`--strategy` names upstream's built-in `EmaCross`, which runs in regular windows only (ADR 0068, step 3;
-`crates/trading/src/examples/strategies/ema_cross/` at the pin); the configured session and feed, checked against Alpaca's
+Long-only (the lead's rule, 2026-11-11): a window never opens a short; a sell is allowed only against a
+long it holds. It is held at the venue: the start check reads Alpaca's account configuration and refuses,
+by name, an account whose `no_shorting` is not true (`VENUE_LONG_ONLY`; `paper:long-only` sets it, by
+alpaca-py's documented call, and reverses it by the same call). And the table refuses by name a
+strategy whose shipped behaviour sells while flat (`WindowStrategy.sells_while_flat`), so a node where the
+setting is somehow off still holds none: upstream's `EmaCross` is one.
+
+What one window is (one node, one process): one strategy of `WINDOW_STRATEGIES` that the table does not
+refuse: `SessionMaCross` (upstream's built-in `EmaCross` stays in the table, ADR 0068 step 3, and is
+refused by name for selling while flat, "Long-only" above); the configured session and feed, checked against Alpaca's
 clock and calendar before anything starts; the paper account holding no open order and no position in the
 symbol; at least `GAP_SECS` since the last window ended; then the node runs for `minutes` (default 30, at
 most 60), clipped to the session's end and to `LONGEST_WINDOW_SECS` (about 49 minutes, so a paper test
@@ -140,6 +154,7 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderSide as AlpacaOrderSide
 from alpaca.trading.enums import QueryOrderStatus
 from alpaca.trading.enums import TimeInForce as AlpacaTimeInForce
+from alpaca.trading.models import AccountConfiguration
 from alpaca.trading.models import Calendar as AlpacaCalendar
 from alpaca.trading.models import Clock as AlpacaClock
 from alpaca.trading.models import Position as AlpacaPosition
@@ -269,6 +284,9 @@ class WindowStrategy:
     """Why it runs in `sessions` only, when that is not every session."""
     max_order_submit_rate: str = MAX_ORDER_SUBMIT_RATE
     builtin: str | None = None
+    sells_while_flat: str = ""
+    """Why its shipped behaviour sells while flat, if it does: such a strategy is refused by name in
+    every window, since a window never opens a short (module header, "Long-only")."""
 
 
 WINDOW_STRATEGIES = {
@@ -280,6 +298,11 @@ WINDOW_STRATEGIES = {
         "while the regular session is open (ADR 0068)",
         EMA_CROSS_SUBMIT_RATE,
         builtin=EMA_CROSS,
+        sells_while_flat=(
+            "at the pin it sends a market order of `trade_size` at each cross whatever it holds, so a "
+            "cross down while flat opens a short (on paper on 2026-11-11 it sold 1 SPY while flat and "
+            "held the short for the whole window)"
+        ),
     ),
 }
 """The strategies a window runs, by the name `--strategy` takes (ADR 0068, step 3): the repo's
@@ -304,6 +327,11 @@ def _runs_only(name: str, runs: WindowStrategy) -> str:
     return f"{name} runs in {' and '.join(runs.sessions)} windows only"
 
 
+VENUE_LONG_ONLY = True
+"""Whether the start check refuses an account that Alpaca does not hold long-only (`no_shorting` false).
+On from the landing that added it: the owner approved on 2026-11-11 setting `no_shorting` on both paper
+accounts (`paper:long-only`). Off, the check only records what it read (report mode, the state before the
+setting is made)."""
 STALE_RUNNING_SECS = 70 * 60
 """A record still `running` this long after it started is a window that died (60 minutes at most, plus
 start-up, shutdown and the account check)."""
@@ -490,6 +518,11 @@ class WindowConfig:
         if (runs := WINDOW_STRATEGIES.get(self.strategy)) is None:
             raise ValueError(
                 f"strategy must be one of {tuple(WINDOW_STRATEGIES)}, got {self.strategy!r}"
+            )
+        if runs.sells_while_flat:
+            raise ValueError(
+                f"{self.strategy} sells while flat: {runs.sells_while_flat}; a window never opens a "
+                "short (long-only)"
             )
         if self.session not in runs.sessions:
             raise ValueError(
@@ -801,6 +834,9 @@ class WindowReport:
     """The code this window runs (`running_commit`), in the `running` record and the result alike."""
     account: str = field(default_factory=paper_account)
     """The paper account the window ran on (`paper_account`), in the `running` record and the result alike."""
+    no_shorting: bool | None = None
+    """Alpaca's `no_shorting` for the account, read by the start check (`venue_no_shorting`): true, the
+    account is long-only at the venue."""
 
 
 class WindowRefused(RuntimeError):
@@ -938,6 +974,53 @@ def position_qty(trading: TradingClient, symbol: str) -> Decimal:
     return -qty if getattr(position.side, "value", position.side) == "short" else qty
 
 
+def venue_no_shorting(trading: TradingClient) -> bool:
+    """Alpaca's `no_shorting` for the account (alpaca-py's `get_account_configurations`): true, the
+    account is long-only (module header, "Long-only")."""
+    configuration = trading.get_account_configurations()
+    assert isinstance(configuration, AccountConfiguration)
+    return configuration.no_shorting
+
+
+LONG_ONLY_ACTIONS = ("check", "on", "off")
+
+
+def long_only_task(action: str, trading: TradingClient | None = None) -> int:
+    """`mise run paper:long-only <account> <action>`: `check` prints the account's `no_shorting`; `on`
+    and `off` set it through alpaca-py's `set_account_configurations`, sending back the configuration as
+    read with only `no_shorting` changed, and print it before and after. Prints the setting's value and
+    nothing else; exits 1 naming any other field Alpaca's answer changed, and if the setting did not
+    take."""
+    if action not in LONG_ONLY_ACTIONS:
+        raise ValueError(f"the action is check, on or off, got {action!r}")
+    trading = trading or paper_trading()
+    if action == "check":
+        print(f"no_shorting: {str(venue_no_shorting(trading)).lower()}")
+        return 0
+    before = trading.get_account_configurations()
+    assert isinstance(before, AccountConfiguration)
+    if before.no_shorting is (action == "on"):  # nothing to change: no PATCH
+        print(f"no_shorting: {str(before.no_shorting).lower()} (unchanged)")
+        return 0
+    after = trading.set_account_configurations(
+        before.model_copy(update={"no_shorting": action == "on"})
+    )
+    assert isinstance(after, AccountConfiguration)
+    print(f"no_shorting: {str(before.no_shorting).lower()} -> {str(after.no_shorting).lower()}")
+    was, now = before.model_dump(), after.model_dump()
+    changed = sorted(k for k in was if k != "no_shorting" and was[k] != now.get(k))
+    failed = 0
+    if changed:
+        print(
+            f"paper:long-only: Alpaca's answer changed other fields too: {changed}", file=sys.stderr
+        )
+        failed = 1
+    if after.no_shorting is not (action == "on"):
+        print("paper:long-only: Alpaca's answer does not carry the setting", file=sys.stderr)
+        failed = 1
+    return failed
+
+
 def leftovers(trading: TradingClient, symbol: str) -> list[str]:
     return described(open_orders(trading, symbol), position_qty(trading, symbol), symbol)
 
@@ -1010,6 +1093,13 @@ def run_window(
         raise WindowRefused(
             f"the paper account is not flat in {config.symbol}; not starting: {left}"
         )
+    no_shorting = venue_no_shorting(trading)
+    if VENUE_LONG_ONLY and not no_shorting:
+        raise WindowRefused(
+            "the paper account allows shorting (Alpaca's account configuration no_shorting is false), "
+            "and a window never opens a short; not starting. To set it: mise run paper:long-only "
+            f"{account if (account := paper_account()) in PAPER_ACCOUNTS else 'windows'} on"
+        )
 
     now = clock.timestamp.astimezone(NEW_YORK)
     seconds, shortened = window_seconds(config.minutes, (end_of_session - now).total_seconds())
@@ -1031,6 +1121,7 @@ def run_window(
         strategy=config.strategy,
         feed=feed,
         overnight=overnight,
+        no_shorting=no_shorting,
     )
     write_record(
         config.log_dir, report

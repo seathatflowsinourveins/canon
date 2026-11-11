@@ -53,9 +53,9 @@ over their bars in a `ParquetDataCatalog` on a simulated Alpaca venue and return
 upstream's built-in `EmaCross` under the risk engine's native limits; the paper test runs it for one order
 ([ADR 0037](docs/adr/0037-ema-cross-paper-run-under-native-risk-limits.md); the limits are
 [ADR 0049](docs/adr/0049-paper-node-risk-limits-within-alpacas-rate-limit.md)). `SessionMaCross`
-(`session_ma_cross.py`) is `MaCross` guarded for live use, and `session_window.py` runs it, or with
-`--strategy EmaCross` upstream's `EmaCross` in the regular session only, for one bounded window on paper
-with a one-share cap inside the node
+(`session_ma_cross.py`) is `MaCross` guarded for live use, and `session_window.py` runs it for one bounded
+window on paper, on an account Alpaca holds long-only (`mise run paper:long-only`), with a one-share cap
+inside the node (`EmaCross` sells while flat, so a window refuses it by name)
 ([ADR 0044](docs/adr/0044-paper-session-windows-for-macross.md)). The cap stops the node and sends no order:
 in a window `SessionMaCross` exits at market on stop and the window then closes what is left, while
 upstream's `EmaCross` does not flatten on stop, so its caller closes the position.
@@ -123,8 +123,10 @@ mise run paper:test     # runs the paper tests with the pair, one session at a t
                         # EmaCross trade 1 SPY, then close it)
 mise run paper:store windows    # the same three for account B, the session windows' account
 mise run paper:session  # one SessionMaCross window on account B, 30 minutes by default; it ends
-                        # flat or fails (--session extended outside the regular session; --strategy
-                        # EmaCross runs upstream's built-in instead, in the regular session only)
+                        # flat or fails (--session extended outside the regular session); it starts
+                        # only if Alpaca holds the account long-only
+mise run paper:long-only windows check  # print Alpaca's long-only setting (no_shorting) on account B;
+                        # on and off set it (tests names account A)
 ```
 
 There are two paper accounts ([ADR 0069](docs/adr/0069-two-paper-accounts.md)): account A, the default,
