@@ -293,7 +293,7 @@ def test_the_command_prints_a_section_a_name_and_a_summary(
     assert study.main([*argv, "--half-spread-bps", "50", "10", "--from", "09:34"]) == 0
     out = capsys.readouterr().out
     assert "**Summary, costs x2**" in out
-    assert "watching from 09:34" in out
+    assert "watching from 09:34: the price then stood" in out
 
 
 def test_the_arms_are_the_fifteen_the_record_registers() -> None:
@@ -413,3 +413,29 @@ def test_every_arm_is_printed_for_a_name_and_for_the_day(
     assert "| run-1 | 09:32 | 09:33 | 10.5000 | 1 |" in out
     assert "| registered | 09:32 | - | - | - |" in out
     assert "| run-1 | 1 of 1 | " in out
+
+
+def test_a_top_up_s_own_interval_is_joined_to_the_one_before_it(
+    tmp_path: Path, alpaca_bars: AlpacaBars
+) -> None:
+    before = date(2026, 11, 10)
+    first = {
+        before: minute_payloads(before, study.PART_START, [10.0], 100)
+        + minute_payloads(before, 15 * 60 + 59, [10.0], 1),
+        DAY: minute_payloads(DAY, OPEN, [10.1, 10.4, 10.5], 1000),
+    }
+    write_minutes(tmp_path, alpaca_bars, "TEST", first, OPEN + 3)
+    equity = alpaca_bars.equity("TEST")
+    bar_type = BarType.from_str(f"{equity.id}-1-MINUTE-LAST-EXTERNAL")
+    more = [
+        parse_bar(AlpacaBar("TEST", payload), bar_type, equity)
+        for payload in minute_payloads(DAY, OPEN + 3, [10.6, 10.7, 10.9, 10.8], 1000)
+    ]
+    ParquetDataCatalog(
+        str(tmp_path)
+    ).write_bars(  # as a later load writes it: the next nanosecond on
+        more, start=study._ns(DAY, OPEN + 3) + 1, end=study._ns(DAY, OPEN + 30)
+    )
+    day = study.load_day(tmp_path, "TEST", DAY)
+    assert day.covered_to == OPEN + 30
+    assert len(day.bars) == 7

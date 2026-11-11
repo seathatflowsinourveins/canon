@@ -613,12 +613,22 @@ def _ns(day: date, minute: int) -> int:
 
 
 def _covered_to(catalog: ParquetDataCatalog, bar_type: str, day: date) -> int | None:
-    """The minute of `day` the catalog covers its window to, from 04:00; None if 04:00 is not covered."""
+    """The minute of `day` the catalog covers its window to, from 04:00; None if 04:00 is not covered.
+    A later load's interval starts the nanosecond after the one before it ends (`bars_to_catalog`: an
+    overlapping load "asks only for the part not covered and writes it to a file of its own"), so
+    intervals that touch are read as one."""
     first, last = _ns(day, PART_START + 1), _ns(day, WINDOW_END)
+    reach = None
     for low, high in sorted(catalog.get_intervals(NautilusDataType.Bar, bar_type)):
-        if low <= first <= high:
-            return WINDOW_END if high >= last else PART_START + int((high - first) // MINUTE_NS) + 1
-    return None
+        if reach is None:
+            reach = high if low <= first <= high else None
+        elif low <= reach + 1:
+            reach = max(reach, high)
+        else:
+            break
+    if reach is None:
+        return None
+    return WINDOW_END if reach >= last else PART_START + int((reach - first) // MINUTE_NS) + 1
 
 
 def load_day(catalog_path: Path, symbol: str, day: date) -> Day:
@@ -746,7 +756,8 @@ def section(day: Day, rows: Rows, costs: Costs | None, start: int) -> list[str]:
     ]
     if start > PART_START:
         lines.append(
-            f"* watching from {clock(start)}: {pct(gross.done_at_start)} of the move was done by then"
+            f"* watching from {clock(start)}: the price then stood {pct(gross.done_at_start)} of the way "
+            f"from the reference to the window high, which came at {clock(gross.high_minute)}"
         )
     priced = [] if costs is None else [("costs x1", costs), ("costs x2", costs.times(2))]
     for name, cost in (("gross", GROSS), *priced):
