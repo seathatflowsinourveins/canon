@@ -187,6 +187,28 @@ was read; each fixed, the first three and the fifth covered by a new test. That 
 client order ID it does not hold, as the adapter's lookup also reads it, is UNVERIFIED against its
 documentation.
 
+Two independent reviews of those fixes as landed (2026-11-10), each fix first shown by a failing test in the
+same file:
+
+* The orders in doubt were read from the node's cache after its disposal had cleared it (`Cache.reset`,
+  at the pin), so on a clean stop none was looked up: they are now read before the disposal, and again
+  after the wait when the stop was abandoned.
+* The node's own in-flight check rejects a submit never acknowledged, with the reason `INFLIGHT_TIMEOUT`
+  (`create_reconciliation_rejected`, at the pin); that rejection was counted as Alpaca's answer, and is
+  now not.
+* A close whose answer was lost was left out of the flat test: it is now looked for among all the
+  symbol's orders since it was sent (`GetOrdersRequest(status=all, after=...)`), the account is not flat
+  until it is found, and one never found is named in what is left. A node order in doubt is never taken
+  for the check's close, and a close answered later ends the wait for a lost one, so an order the lost
+  one becomes if Alpaca takes it late is canceled.
+
+Code review (`/code-review`, high) of those fixes: the last reading did not look for a lost close, a
+second close could be sent while the lost one might still be taken (two sells, a short), an answered node
+order inside the search's span could be taken for the lost close, a failed read of the cache skipped the
+node's disposal, the record named the node's own rejection as Alpaca's, the node's second local reason
+(`NOT_FOUND_AT_VENUE`) was missed, and the docstring trailed the code; each fixed, the first three and the
+sixth covered by a new test.
+
 On paper, 2026-11-10, after the close: a regular window refused, "the regular session is closed". An
 extended window started at 16:12 New York, before the adapter's extended-hours change was on `main`,
 against the condition for extended runs; the gate above now refuses that. The cap stopped it at its first
@@ -266,3 +288,10 @@ Read 2026-11-10. "raw": fetched with `curl` and read whole. NautilusTrader files
   is logged as an unknown outcome and left submitted (read).
 * An independent review of the check as landed (2026-11-10): two findings, reproduced offline and fixed
   above (run).
+* `crates/live/src/execution/manager.rs` at the pin: a submitted order past its in-flight retries is
+  rejected with `create_reconciliation_rejected(&order, Some("INFLIGHT_TIMEOUT"), ...)` unless the
+  submission recovery policy is `RetainUnresolved`, and one its queries did not find with
+  `Some("NOT_FOUND_AT_VENUE")` (fetched, raw). alpaca-py 0.45.0
+  `GetOrdersRequest.after`: "only ones submitted after this timestamp" (`bundled`).
+* Two independent reviews of the fixes as landed (2026-11-10): five findings, reproduced offline and
+  fixed above (run).
