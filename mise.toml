@@ -292,6 +292,7 @@ description = "Run one bounded strategy window (SessionMaCross unless --strategy
 timeout = "105m"
 env.ALPACA_API_KEY = { value = "{{ exec(command='/usr/bin/timeout 30 /usr/bin/security find-generic-password -s canon-alpaca-paper-windows -a ALPACA_API_KEY -w') }}", redact = true }
 env.ALPACA_SECRET_KEY = { value = "{{ exec(command='/usr/bin/timeout 30 /usr/bin/security find-generic-password -s canon-alpaca-paper-windows -a ALPACA_SECRET_KEY -w') }}", redact = true }
+env.CANON_PAPER_ACCOUNT = "windows"  # the account's name for the window records (ADR 0069); never a key
 run = '''
 deadline=6240
 sync=600

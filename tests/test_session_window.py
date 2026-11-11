@@ -4411,3 +4411,49 @@ def test_an_ema_cross_window_sends_one_order_and_the_engine_denies_every_later_c
         assert reasons == ["RATE_LIMIT_EXCEEDED"] * (len(orders) - 1)
     finally:
         eng.dispose()
+
+
+@pytest.mark.parametrize(
+    ("set_to", "recorded"),
+    [("windows", "windows"), ("tests", "tests"), (None, "unknown"), ("PKMADEUP", "unknown")],
+)
+def test_a_window_record_names_the_paper_account_its_task_set_and_nothing_else(
+    monkeypatch, tmp_path, set_to, recorded
+) -> None:
+    """A reader of the series sees which paper account a window used: the paper task names it
+    (`ACCOUNT_ENV`), the record carries `windows` or `tests`, and any other value is recorded as `unknown`,
+    never echoed, so nothing the variable held by mistake reaches a record."""
+    if set_to is None:
+        monkeypatch.delenv(session_window.ACCOUNT_ENV, raising=False)
+    else:
+        monkeypatch.setenv(session_window.ACCOUNT_ENV, set_to)
+    report = session_window.WindowReport("regular", "SPY", started="20261111T143500Z")
+    assert report.account == recorded
+    session_window.write_record(tmp_path, report)
+    body = (session_window.records_dir(tmp_path) / "latest.json").read_text()
+    assert json.loads(body)["account"] == recorded
+    assert "PKMADEUP" not in body
+
+
+def test_a_refused_window_records_its_account_too(monkeypatch, tmp_path) -> None:
+    """The refusal's own record, written by `main`, names the account as a window's report does."""
+    monkeypatch.setenv(session_window.ACCOUNT_ENV, "windows")
+
+    def refused(*_args, **_kwargs):
+        raise session_window.WindowRefused("the account is not flat")
+
+    monkeypatch.setattr(session_window, "run_window", refused)
+    assert session_window.main(["--log-dir", str(tmp_path), "--session", "regular"]) == 1
+    record = json.loads((session_window.records_dir(tmp_path) / "latest.json").read_text())
+    assert record["result"].startswith("refused") and record["account"] == "windows"
+
+
+def test_the_window_task_names_the_account_whose_pair_it_reads() -> None:
+    """`paper:session` names its account `windows`, and the pair it reads is that account's service, the
+    one `paper:check windows` checks, so the label cannot drift from the keys (ADR 0069)."""
+    task = tomllib.loads((session_window.SOURCE_ROOT / "mise.toml").read_text())["tasks"][
+        "paper:session"
+    ]
+    assert task["env"][session_window.ACCOUNT_ENV] == "windows"
+    for item in ("ALPACA_API_KEY", "ALPACA_SECRET_KEY"):
+        assert f"-s canon-alpaca-paper-windows -a {item} -w" in task["env"][item]["value"]

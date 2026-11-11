@@ -654,7 +654,7 @@ do_status() {
                elif ($r | startswith("refused")) then "REFUSED" else "FAILED" end) + "\t"
               + "last window " + (.started // "?") + " of " + (.strategy // "SessionMaCross")
               + " (" + ($m | tostring) + " min ago, " + (.session // "?")
-              + ", commit " + (.commit | short) + "): "
+              + ", account " + (.account // "not recorded" | tostring) + ", commit " + (.commit | short) + "): "
               + (if $died and $later then "still running by its record, but a run after it took the paper lock, so it died;"
                    + " the account may not be flat, and the next window starts only once it is"
                  elif $died then "still running after " + ($m | tostring)
