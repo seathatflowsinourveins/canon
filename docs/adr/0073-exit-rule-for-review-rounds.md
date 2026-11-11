@@ -78,6 +78,10 @@ reviews the redesigned model (rule 4).
 * No path met rule 3: every saved round found something that changes behaviour. All four stay in the loop,
   and each one's next round reviews the redesigned model.
 
+*Amended 2026-11-11 by ADR 0074:* rules 3 and 4 apply to the trading paths (the adapter's order and data
+paths, the session window, the gate) and to the runner's keychain tasks. A harness or tooling path gets
+the review ADR 0017 requires and at most one outside round.
+
 ### Consequences
 
 * Good: a round has a stopping condition, and a repeated family becomes one design, not a series of
