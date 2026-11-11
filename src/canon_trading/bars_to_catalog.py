@@ -67,7 +67,8 @@ other. So each catalog root holds one feed: the file `alpaca-feed` in the root n
 naming another feed is refused, by name, before any node is built. No upstream records a feed per
 catalog; the file is this module's. It is written before the request, so a load cut short still
 leaves its feed named, and removed again if the load fails and the root holds no data file. A root
-with data and no such file was filled before the file existed, by this module, which could then load
+with data and no such file (instrument definitions alone are not data: the asset list load writes them
+first, ADR 0093) was filled before the file existed, by this module, which could then load
 IEX only, or by the quote write-back, IEX only (ADR 0066), so it is read as IEX. Limits: the file is
 read and written without a lock, so two loads into one root at once are not kept apart (paper loads run
 one at a time under the paper lock); a root whose file is deleted by hand reads as IEX again; and only
@@ -125,9 +126,19 @@ FEED_FILE = "alpaca-feed"
 """The file in a catalog root that names the one Alpaca feed its data came from (this module's header)."""
 
 
+_DEFINITION_DIRS = frozenset({"equity", "instruments"})
+"""Folders under `data/` that hold instrument definitions, not a feed's data: the guide's "one directory
+per concrete instrument class, such as ... `data/equity/`", where the catalog writes an `Equity`, and the
+`data/instruments/` that `write_instruments`' docstring names (this module's header)."""
+
+
 def _holds_data(path: Path) -> bool:
+    """Whether the root holds any feed's data; instrument definitions alone are none (ADR 0093)."""
     data = path / "data"
-    return data.is_dir() and any(p.is_file() for p in data.rglob("*"))
+    return data.is_dir() and any(
+        p.is_file() and p.relative_to(data).parts[0] not in _DEFINITION_DIRS
+        for p in data.rglob("*")
+    )
 
 
 def catalog_feed(catalog_path: Path) -> str | None:
