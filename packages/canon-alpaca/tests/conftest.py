@@ -39,6 +39,7 @@ import asyncio
 import gc
 import inspect
 import json
+import logging
 import queue
 import threading
 import time as time_module
@@ -801,7 +802,9 @@ class FakeStream:
     Cancels and corrections go to the handlers set with `register_trade_cancels` and
     `register_trade_corrections`, which alpaca-py keys under "*". With `ends_on_its_own`, `run()` returns
     after its first delivery without a `stop()`, as alpaca-py's does after an insufficient-subscription
-    error. With `ignores_stop`, `run()` keeps going after `stop()` until `release` is set.
+    error. With `ignores_stop`, `run()` keeps going after `stop()` until `release` is set. With `refused`
+    set, `run()` logs it as alpaca-py's `_drive_run` logs an authentication error, on its stream logger
+    and thread, and returns without delivering, as it does for "insufficient subscription".
 
     As in alpaca-py 0.45.0 (`DataStream._subscribe`, `_unsubscribe`, `_ensure_coroutine`, `_drive_run`): a
     handler that is not a coroutine function raises `ValueError`; a subscribe records its handlers and then
@@ -813,6 +816,7 @@ class FakeStream:
 
     def __init__(self) -> None:
         self.ends_on_its_own = False
+        self.refused: str | None = None
         self.ignores_stop = False
         self.release = threading.Event()
         self.send_error: Exception | None = None
@@ -897,6 +901,11 @@ class FakeStream:
                 return
             self._changed.clear()
             await asyncio.to_thread(self._changed.wait, 0.05)
+        if self.refused is not None:
+            logging.getLogger("alpaca.data.live.websocket").error(
+                f"error during websocket communication: {self.refused}"
+            )
+            return
         self.running.set()
         while not self.stopped.is_set() or (self.ignores_stop and not self.release.is_set()):
             for channel, handlers, builders in (

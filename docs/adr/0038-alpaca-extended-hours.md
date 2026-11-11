@@ -84,6 +84,10 @@ minute, as at 16:16 ET; the cleanup closes a position outside the regular sessio
 order. Each paper test has a 60 s limit, runs under the paper lock and places nothing while the account
 holds an AAPL order or position.
 
+The data part is decided in [ADR 0055](0055-alpaca-data-feed-named-in-params.md) (2026-11-10): ADR
+0038's option (B), the feed named in a subscription's params, one stream per client; on paper that
+night `boats` quotes reached a strategy through a node in the overnight session.
+
 `UNVERIFIED`: an eligible order in pre-market and overnight (only after-hours ran); a modify of an eligible
 order (whether the replacement keeps `extended_hours`); why the `boats` stream and latest quote answered a
 paper pair whose plan the page does not say includes it; a `day` order across

@@ -100,6 +100,9 @@ New York and stamped 24 hours later (so the "UNVERIFIED" midnight open in `canon
 these bars); a second load over part of the range returned the same `CatalogBars`; `run_backtest` with
 `MaCross` ran 60 iterations on them. The same range is in this machine's `catalog/`, in one file.
 
+Since ADR 0055 (2026-11-10) a bars request may name its feed in params; `load_bars` sends only
+`update_catalog`, which the data client leaves alone, so the loaded bars are still IEX.
+
 ## Evidence
 
 Read 2026-11-10. Upstream's docs are the `latest` pages of https://nautilustrader.io/docs/llms.txt, which
