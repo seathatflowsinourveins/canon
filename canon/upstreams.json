@@ -627,6 +627,22 @@
       "adr": "0045"
     },
     {
+      "id": "dsh-ci-context",
+      "field": "agent-extensions",
+      "repo": "lucas-ward/dsh-ci-context",
+      "track": "tag:v0.1.1",
+      "role": "tool",
+      "license": "MIT",
+      "why": "DeepSeek Harness plugin that adds the CI run's allowlisted metadata (provider, repository, refs, commit, workflow, job, run id and URL) as one user message on a turn's first step, read from fixed environment fields; outside CI it does nothing. Its source at the pin makes no network call, writes no file and keeps nothing across sessions, so it may run in the reviewer arm (ADR 0072 rule 6). Installed only into a throwaway DSH_HOME profile, never ~/.dsh or a profile in use (ADR 0072 rule 5). Override of the host's compatibility guard: its peer range for dsh-agent and dsh-llm is ^0.1.0-rc.6, which excludes the pinned dsh 0.2.1-rc.3, so dsh refused the install (judged after the git fetch, then the profile restored) (\"Running it may cause crashes or data loss\") until the exact-version exemption dsh offers was granted in that profile alone (ADR 0094). A named configuration, UNVERIFIED until the review and build evals score it; a crash or data loss there retires it.",
+      "evidence": [
+        "https://github.com/lucas-ward/dsh-ci-context",
+        "https://raw.githubusercontent.com/lucas-ward/dsh-ci-context/v0.1.1/README.md",
+        "https://raw.githubusercontent.com/lucas-ward/dsh-ci-context/v0.1.1/package.json",
+        "https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/dsh-v0.2.1-rc.3/packages/boot/plugin-manager/README.md"
+      ],
+      "adr": "0094"
+    },
+    {
       "id": "pnpm",
       "field": "toolchain",
       "repo": "pnpm/pnpm",
