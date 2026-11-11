@@ -830,15 +830,21 @@ def test_disconnect_clears_state_when_the_stream_thread_does_not_stop(venue, mon
 
 
 def test_stream_ending_while_subscribed_is_logged(venue, capfd) -> None:
-    # The node stops only after the stream's thread has ended. Its exit report reaches the loop after its
-    # one quote, so a strategy stopping the node on that quote could disconnect first, and the client
-    # drops a report from a stream it no longer runs (`_current`): the test failed under load.
+    # The node stops only after the stream's thread has ended and its quote has reached the strategy. Its
+    # exit report reaches the loop after its one quote, so a strategy stopping the node on that quote
+    # could disconnect first, and the client drops a report from a stream it no longer runs (`_current`);
+    # and the quote passes through the data engine's queue, so a stop as the thread ends could beat it.
+    # Both failed under load.
     venue.stream.ends_on_its_own = True
     strategy = consumer(want_trades=False, bar_type=None, auto_shutdown=False)
 
     async def body(client) -> None:
         await wait_until(
-            lambda: client._stream_thread is not None and not client._stream_thread.is_alive()
+            lambda: (
+                client._stream_thread is not None
+                and not client._stream_thread.is_alive()
+                and strategy.seen_quotes
+            )
         )
         await asyncio.sleep(0)  # the report, posted before the thread ended, runs on this loop
 
@@ -2357,16 +2363,34 @@ def test_one_sided_historical_quotes_are_dropped_and_counted(venue, alpaca, capf
     assert "Dropped 2 one-sided Alpaca quotes of 3 for AAPL" in logged(capfd)
 
 
-def test_a_malformed_historical_quote_fails_the_request(venue, alpaca) -> None:
-    """A price finer than the instrument's precision cannot be stored without rounding, so the request
-    fails, naming it, as a bars request does, and nothing of it is kept."""
-    venue.historical.quotes = [{**alpaca.quotes_at(*quote_seconds(1))[0], "bp": 387.67001}]
+def test_a_historical_quote_finer_than_the_precision_is_dropped_and_counted(
+    venue, alpaca, capfd
+) -> None:
+    """A lit book quotes at the tick, so a finer quote price is a fault: dropped, counted and named,
+    and the rest of the request is kept, as one-sided quotes are."""
+    venue.historical.quotes = [
+        {**alpaca.quotes_at(*quote_seconds(1))[0], "bp": 387.67001},
+        *alpaca.quotes_at(*quote_seconds(2)),
+    ]
+    strategy = quote_requester(params=None)
+
+    run(build_node(strategy), "hosted")
+
+    assert strategy.failures == [None]
+    assert [q.ts_event for q in strategy.seen] == [dt_to_unix_nanos(quote_seconds(2)[0])]
+    log = logged(capfd)
+    assert "Dropped 1 Alpaca quotes of 2 for AAPL" in log
+    assert "bid price 387.67001 is finer than price precision 4" in log
+
+
+def test_a_historical_quote_that_is_not_a_number_still_fails_the_request(venue, alpaca) -> None:
+    venue.historical.quotes = [{**alpaca.quotes_at(*quote_seconds(1))[0], "bp": float("nan")}]
     strategy = quote_requester(params=None)
 
     run(build_node(strategy), "hosted")
 
     (reason,) = strategy.failures
-    assert reason is not None and "not representable" in reason
+    assert reason is not None and "not a finite number" in reason
     assert strategy.seen == []
 
 
@@ -2740,3 +2764,118 @@ def test_a_subscription_lost_in_a_reconnect_alpaca_py_makes_is_sent_on_the_next_
 def test_a_bound_too_large_for_a_float_is_refused_by_name() -> None:
     with pytest.raises(ValueError, match="stream_mute_limit_secs must be"):
         AlpacaDataClientConfig(stream_mute_limit_secs=10**400)
+
+
+# -- prices finer than the instrument's precision (sip) -------------------------------------------------
+
+SIP_PRICE = 747.086488
+"""A consolidated-tape price finer than the instrument's four decimals, as the study's loader met it in a
+SPY bar's high."""
+
+
+def stream_lines(log: str, mark: str) -> list[str]:
+    return [line for line in log.splitlines() if "Alpaca stream on feed " in line and mark in line]
+
+
+def test_a_sip_trade_finer_than_the_precision_is_rounded_counted_and_the_stream_goes_on(
+    venue, alpaca, capfd
+) -> None:
+    venue.stream.trades = [
+        lambda: alpaca.trade(p=SIP_PRICE),
+        lambda: alpaca.trade(p=SIP_PRICE, i=96922),
+        lambda: alpaca.trade(i=96923),
+        lambda: alpaca.trade(p=0.12345, i=96924),  # under a dollar, as extreme movers often are
+    ]
+    strategy = consumer(want_quotes=False, bar_type=None, auto_shutdown=False)
+
+    async def body(client) -> None:
+        await wait_until(lambda: len(strategy.seen_trades) == 4)
+
+    run_with_client(body, strategy)
+
+    prices = [str(t.price) for t in strategy.seen_trades]
+    assert prices == ["747.0865", "747.0865", "126.5500", "0.1234"]
+    log = logged(capfd)
+    first = stream_lines(log, "rounded AAPL trade price")
+    assert len(first) == 1, first  # the first per symbol, then counts at powers of ten
+    assert "747.086488 to 747.0865" in first[0]
+    assert "[ERROR]" not in first[0]  # never an error: a session window fails on one
+    (summary,) = stream_lines(log, "rounded 3 AAPL trade prices")
+    assert "[ERROR]" not in summary
+
+
+def test_a_quote_finer_than_the_precision_is_dropped_and_named_and_the_stream_goes_on(
+    venue, alpaca, capfd
+) -> None:
+    venue.stream.quotes = [lambda: alpaca.quote(ap=SIP_PRICE), alpaca.quote]
+    strategy = consumer(want_trades=False, bar_type=None, auto_shutdown=False)
+
+    async def body(client) -> None:
+        await wait_until(lambda: len(strategy.seen_quotes) == 1)
+
+    run_with_client(body, strategy)
+
+    (tick,) = strategy.seen_quotes
+    assert tick.ask_price == Price.from_str("87.6800")
+    log = logged(capfd)
+    (first,) = stream_lines(log, "dropped AAPL quote")
+    assert "ask price 747.086488 is finer than price precision 4" in first
+    assert "[ERROR]" not in first
+    (summary,) = stream_lines(log, "dropped 1 AAPL quotes")
+    assert "[ERROR]" not in summary
+    assert "Dropped Alpaca quote" not in log
+
+
+def test_a_sip_bar_finer_than_the_precision_is_rounded_and_counted(venue, alpaca, capfd) -> None:
+    venue.historical.bars = [
+        {**alpaca.BAR_AAPL, "o": 747.05, "h": SIP_PRICE, "l": 747.0, "c": 747.08},
+        alpaca.BAR_AAPL,
+    ]
+    strategy = consumer(want_quotes=False, want_trades=False)
+
+    run(build_node(strategy), "hosted")
+
+    assert [str(b.high) for b in strategy.seen_bars] == ["747.0865", "178.2600"]
+    ((_, reason),) = strategy.seen_responses
+    assert reason is None
+    log = logged(capfd)
+    assert "Rounded 1 of 2 Alpaca bars for AAPL" in log
+    assert "high 747.086488 to 747.0865" in log
+
+
+def test_each_price_count_is_logged_at_its_own_powers_of_ten(venue, alpaca, capfd) -> None:
+    # A quote dropped once, then ten trades rounded: the tenth logs the trades' count, not the quotes'.
+    venue.stream.quotes = [lambda: alpaca.quote(ap=SIP_PRICE), alpaca.quote]
+    venue.stream.trades = [lambda i=i: alpaca.trade(p=SIP_PRICE, i=97000 + i) for i in range(10)]
+    strategy = consumer(bar_type=None, auto_shutdown=False)
+
+    async def body(client) -> None:
+        await wait_until(lambda: strategy.seen_quotes and len(strategy.seen_trades) == 10)
+
+    run_with_client(body, strategy)
+
+    log = logged(capfd)
+    assert len(stream_lines(log, "rounded 10 AAPL trade prices")) == 2  # at ten, and at disconnect
+    assert len(stream_lines(log, "dropped 1 AAPL quotes")) == 1  # at disconnect only
+
+
+def test_unsubscribing_quotes_logs_the_quote_count_and_leaves_the_trade_count(
+    venue, alpaca, capfd
+) -> None:
+    venue.stream.quotes = [lambda: alpaca.quote(ap=SIP_PRICE), alpaca.quote]
+    venue.stream.trades = [
+        lambda: alpaca.trade(p=SIP_PRICE),
+        lambda: alpaca.trade(p=SIP_PRICE, i=96922),
+    ]
+    strategy = consumer(bar_type=None, auto_shutdown=False)
+
+    async def body(client) -> None:
+        await wait_until(lambda: strategy.seen_quotes and len(strategy.seen_trades) == 2)
+        await client._unsubscribe_quotes(command(AAPL))
+        await wait_until(lambda: "AAPL" not in client._quote_symbols)  # settled
+
+    run_with_client(body, strategy)
+
+    log = logged(capfd)
+    assert len(stream_lines(log, "dropped 1 AAPL quotes")) == 1  # at the unsubscribe, not again
+    assert len(stream_lines(log, "rounded 2 AAPL trade prices")) == 1  # at disconnect only

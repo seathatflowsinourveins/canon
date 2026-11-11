@@ -9,6 +9,7 @@ from alpaca.data.models import Bar as AlpacaBar
 from alpaca.data.timeframe import TimeFrameUnit
 from canon_alpaca.constants import ENV_API_KEY
 from canon_alpaca.constants import ENV_SECRET_KEY
+from canon_alpaca.data import FinePriceError
 from canon_alpaca.data import bar_timeframe
 from canon_alpaca.data import parse_bar
 from canon_alpaca.data import parse_quote
@@ -128,23 +129,61 @@ def test_one_sided_quote_is_refused_naming_the_side(alpaca, equity, changes, sid
         parse_quote(alpaca.quote(**changes), equity, TS_INIT)
 
 
-def test_bar_price_finer_than_the_precision_is_refused(alpaca, equity) -> None:
+SIP_BAR = {"o": 747.05, "h": 747.086488, "l": 747.0, "c": 747.08}
+"""A consolidated (sip) bar whose high is finer than the instrument's four decimals, as the study's
+loader met it for SPY."""
+
+
+def test_bar_price_finer_than_the_precision_is_rounded_as_upstream_rounds(alpaca, equity) -> None:
     bar_type = BarType.from_str("AAPL.ALPACA-1-MINUTE-LAST-EXTERNAL")
-    raw = {**alpaca.BAR_AAPL, "h": 178.26005}
-    with pytest.raises(
-        ValueError, match="high 178.26005 is not representable at price precision 4"
-    ):
+    bar = parse_bar(AlpacaBar("AAPL", {**alpaca.BAR_AAPL, **SIP_BAR}), bar_type, equity)
+
+    assert bar.high == Price.from_str("747.0865")
+    assert bar.open == Price.from_str("747.0500")
+
+
+@pytest.mark.parametrize(
+    ("value", "kept"),
+    [
+        (747.086488, "747.0865"),
+        (1.00025, "1.0002"),  # half to even, as `Instrument.make_price` rounds
+        (1.00015, "1.0002"),
+        (126.5500, "126.5500"),
+        (0.12345, "0.1234"),  # under a dollar, as extreme movers often are
+        (0.98765, "0.9876"),
+    ],
+)
+def test_trade_price_finer_than_the_precision_is_rounded_as_upstream_rounds(
+    alpaca, equity, value, kept
+) -> None:
+    tick = parse_trade(alpaca.trade(p=value), equity, TS_INIT)
+
+    assert tick.price == Price.from_str(kept)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf")])
+def test_a_trade_price_that_is_not_a_number_is_still_refused(alpaca, equity, value) -> None:
+    with pytest.raises(ValueError, match="trade price .* is not a finite number"):
+        parse_trade(alpaca.trade(p=value), equity, TS_INIT)
+
+
+def test_a_positive_trade_price_that_rounds_to_zero_is_refused(alpaca, equity) -> None:
+    with pytest.raises(ValueError, match="trade price 4e-05 rounds to zero at price precision 4"):
+        parse_trade(alpaca.trade(p=0.00004), equity, TS_INIT)
+
+
+def test_a_positive_bar_price_that_rounds_to_zero_is_refused(alpaca, equity) -> None:
+    bar_type = BarType.from_str("AAPL.ALPACA-1-MINUTE-LAST-EXTERNAL")
+    raw = {**alpaca.BAR_AAPL, "o": 0.0002, "h": 0.0003, "l": 0.00003, "c": 0.0002}
+    with pytest.raises(ValueError, match="low 3e-05 rounds to zero"):
         parse_bar(AlpacaBar("AAPL", raw), bar_type, equity)
 
 
-def test_quote_price_finer_than_the_precision_is_refused(alpaca, equity) -> None:
-    with pytest.raises(ValueError, match="ask price 87.68001 is not representable"):
-        parse_quote(alpaca.quote(ap=87.68001), equity, TS_INIT)
-
-
-def test_trade_price_finer_than_the_precision_is_refused(alpaca, equity) -> None:
-    with pytest.raises(ValueError, match="trade price 126.55001 is not representable"):
-        parse_trade(alpaca.trade(p=126.55001), equity, TS_INIT)
+def test_quote_price_finer_than_the_precision_is_refused_by_name(alpaca, equity) -> None:
+    with pytest.raises(
+        FinePriceError, match="ask price 747.086488 is finer than price precision 4"
+    ):
+        parse_quote(alpaca.quote(ap=747.086488), equity, TS_INIT)
 
 
 def test_sub_penny_price_at_the_precision_is_kept(alpaca, equity) -> None:

@@ -71,6 +71,8 @@ Alpaca's assets endpoint gives `price_increment` for crypto only (Get Assets ref
 https://docs.alpaca.markets/us/reference/get-v2-assets-1.md). For US equity orders Alpaca allows at most
 2 decimals at or above $1.00 and 4 decimals below (https://docs.alpaca.markets/us/docs/orders-at-alpaca.md,
 "Sub-penny increments"). NautilusTrader's `Equity` takes one increment, and its precision must equal
-`price_precision`, so this slice uses the finer one: market data is never rounded, but the instrument does
-not by itself stop a sub-penny order price at or above $1.00. The execution client denies such an order.
+`price_precision`, so this slice uses the finer one. The instrument does not by itself stop a sub-penny
+order price at or above $1.00; the execution client denies such an order. A trade or bar price finer than
+four decimals, which the consolidated tape carries, is rounded as upstream rounds and named; a quote that
+fine is dropped and named (`canon_alpaca.data.rounded_price`, ADR 0055).
 """

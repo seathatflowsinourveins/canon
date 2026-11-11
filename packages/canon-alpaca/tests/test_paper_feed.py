@@ -17,6 +17,12 @@ Upstream's `DataTester` cannot be used for TC-D71 here: v2.0.0rc8's Python `Data
   outside it. That the paper pair is served `boats` at all is an observation, not an entitlement (ADR 0055).
 * `test_paper_default_feed_is_iex`: a subscription with no params; the stream is on `v2/iex`, as before.
   Any hour: it checks where the stream authenticated, not that IEX sent anything.
+* `test_paper_sip_trade_prices_are_kept_at_four_decimals_and_named_when_rounded`:
+  `subscribe_trades(AAPL, params={"feed": "sip"})` and quotes on the same feed, for `SIP_SECS`, while
+  Alpaca's clock says the market is open. The consolidated tape carries prices finer than the
+  instrument's four decimals; the client rounds a trade's as upstream rounds and names it, and drops a
+  quote that fine, naming it (ADR 0055). It fails when no trade arrives or the client drops a trade; it
+  reports how many prices were rounded, which a quiet minute may leave at none.
 
 No paper test shows a feed refused: on 2026-11-10 at 20:46 New York the paper pair authenticated on
 `v2/sip` too, although "Paper Trading" (https://docs.alpaca.markets/us/docs/paper-trading.md) entitles a
@@ -41,6 +47,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 from alpaca.trading.client import TradingClient
+from alpaca.trading.models import Clock
 from alpaca.trading.requests import GetCalendarRequest
 from canon_alpaca.constants import ENV_API_KEY
 from canon_alpaca.constants import ENV_SECRET_KEY
@@ -48,6 +55,7 @@ from canon_alpaca.data import ALPACA_STREAM_LOGGER
 from canon_alpaca.factories import AlpacaDataClientFactory
 from canon_alpaca.providers import with_http_timeout
 from nautilus_trader.common import Environment
+from nautilus_trader.common import logging_sync_to_disk
 from nautilus_trader.config import DataClientConfig
 from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.config import LiveNodeConfig
@@ -73,6 +81,8 @@ NEW_YORK = ZoneInfo("America/New_York")
 STREAM_HOST = "wss://stream.data.alpaca.markets"
 START_TIMEOUT_SECS = 60
 BOATS_WAIT_SECS = 120
+SIP_SECS = 60
+"""How long the sip test runs: in the regular session sip sends AAPL trades many times a second."""
 """How long the boats test waits for both a quote and a trade."""
 
 
@@ -264,3 +274,40 @@ def test_paper_default_feed_is_iex(stream_log) -> None:
     assert f"connected to {STREAM_HOST}/v2/iex" in stream_log.lines, stream_log.lines
     assert not any("v1beta1" in line for line in stream_log.lines)
     print(f"PAPER-FEED iex quotes={len(strategy.quotes)}")
+
+
+def test_paper_sip_trade_prices_are_kept_at_four_decimals_and_named_when_rounded(
+    stream_log, capfd
+) -> None:
+    trading = with_http_timeout(
+        TradingClient(os.environ[ENV_API_KEY], os.environ[ENV_SECRET_KEY], paper=True)
+    )
+    clock = trading.get_clock()
+    assert isinstance(clock, Clock), f"Alpaca answered {clock!r} for its clock"
+    if not clock.is_open:
+        pytest.skip("the regular session is closed; this test reads sip while it is open")
+    strategy = Quotes()
+    strategy.params = {"feed": "sip"}
+    strategy.with_trades = True
+    node = paper_node(strategy)
+
+    run_for(node, SIP_SECS)
+
+    assert f"connected to {STREAM_HOST}/v2/sip" in stream_log.lines, stream_log.lines
+    logging_sync_to_disk()
+    log = capfd.readouterr()
+    lines = (log.out + log.err).splitlines()
+    dropped = [line for line in lines if "Dropped Alpaca trade" in line]
+    rounded = [line for line in lines if "Alpaca stream on feed sip: rounded AAPL" in line]
+    fine = [line for line in lines if "Alpaca stream on feed sip: dropped AAPL" in line]
+    print(
+        f"PAPER-FEED sip trades={len(strategy.trades)} quotes={len(strategy.quotes)} "
+        f"rounded_lines={len(rounded)} fine_quote_lines={len(fine)}"
+    )
+    for line in rounded + fine:
+        print(f"PAPER-FEED {line}")
+    # the node's own log was captured, so no line above means no such price, not a missed log
+    assert any("Subscribed AAPL.ALPACA trades" in line for line in lines), lines[-20:]
+    assert strategy.trades, f"no AAPL trade from sip in {SIP_SECS} s of the regular session"
+    assert not dropped, dropped
+    assert all(t.price.precision == 4 for t in strategy.trades)
