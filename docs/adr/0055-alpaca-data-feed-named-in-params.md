@@ -112,8 +112,9 @@ send, on alpaca-py's real stream on an in-memory socket, in a contract test that
 changes the path; not observed on a live stream; the usual pattern, subscribe and then run, cannot meet
 it), is sent once the stream's first quote or trade arrives, when
 the client sends its subscriptions again, if a subscribe was made after the stream started; a start
-whose sent subscriptions stay quiet, a reconnect alpaca-py makes by itself, and an unsubscribe lost in
-the same window (alpaca-py does not send it either, and a subscribe does not undo it) are not covered.
+whose sent subscriptions stay quiet and an unsubscribe lost in the same window (alpaca-py does not
+send it either, and a subscribe does not undo it) are not covered; a reconnect alpaca-py makes by itself,
+which it announces with a warning before connecting, is covered the same way (2026-11-11, below).
 
 What a caller sees when the stream fails: a stream that ends by itself is not restarted (alpaca-py
 reconnects and resubscribes by itself after a websocket error and after any error while connecting, and
@@ -124,6 +125,41 @@ for one) is retried by alpaca-py without end: the node logs its retry warnings n
 thread, and no data arrives; no bound is set, since its connection state is private to alpaca-py.
 NautilusTrader v2.0.0rc8 has no channel for a data client to tell the engine its data has stopped, so
 neither reaches the engine as more than the log.
+
+A stream that connects and then sends nothing (2026-11-11, `AlpacaDataClientConfig`). alpaca-py 0.45.0
+takes `data_timeout`, in seconds, `None` (off) by default: only market data resets its clock, and on
+expiry it logs "no data received ... reconnecting", closes the socket, waits a backoff of 0.5 to 1 s
+that doubles to 30 s while no data comes, and connects again, sending every handler map whole, so each
+subscription is sent again. The client sets it from `stream_data_timeout_secs`, 900 s by default, above
+the longest silence seen on a feed that then delivered (513 s: `iex` with QQQ alone, pre-market
+2026-11-11, one trade and no quote in 600 s); a window's parts are far busier (SPY on `iex` in the regular
+session, hundreds of quotes a minute; on `boats` overnight, 1,552 to 3,700 quotes a window, ADR 0044). Its
+reconnect reaches the log as a warning naming the feed, so a quiet feed fails nothing. As alpaca-py
+reconnects without end, the client counts the silence too: no quote or trade for
+`stream_mute_limit_secs` (3,600 s by default, and longer than the data timeout) while it holds a
+subscription, and it stops the stream, logs an error beginning "Alpaca stream on feed <feed> went mute",
+which a session window reads as its stream's error, and refuses later subscriptions until it reconnects,
+the same say-so as a stream that ended, and as upstream's Databento feed handler gives up reconnecting
+after `reconnect_timeout_mins` with an error. The limit counts from the stream's start, so a stream
+alpaca-py never gets connected meets it too. It cannot tell a dead stream from a feed with nothing to
+send, so a node spanning a part no feed serves sets it longer than that part, or `None`; it outlasts
+every window this repository runs (an hour at most), so it matters to longer nodes. A subscribe made
+after alpaca-py's reconnect warning and before the next message is sent again on that message, as at
+the stream's start. A client
+forgets its subscriptions at disconnect while the engine keeps its own record of them until a reset, but
+a client belongs to one node run and a stopped node refuses to run again, so none is owed to a later
+connect. Offline, in `scripts/ci` (`test_data_client.py`): the stream is built with the configured
+`data_timeout`, or the default from a plain `DataClientConfig`, or none; the config refuses a bound
+that is not a positive number of seconds, a limit not longer than the timeout and any other keyword;
+on alpaca-py's real stream over an in-memory socket, a mute connection is closed and made again with
+the subscription sent again, a later quote reaches the cache, and the reconnect is logged as a warning;
+a mute stand-in past the limit is stopped, its error names the feed and the limit, and a later
+subscription is refused; quotes inside the limit keep it running and the count starts from the last one;
+silence with nothing subscribed, before a later subscription, and after a disconnect fails nothing; a
+subscribe held in the window of a `data_timeout` reconnect on the real stream is sent on the next quote;
+a bound too large for a float is refused by name; a stopped node cannot run
+again (fails if upstream allows it). UNVERIFIED: how long a healthy feed can stay silent beyond the one
+10-minute sample; a mute connection on a live stream.
 
 Paper, `mise run paper:test -- -s -k "test_paper_boats_quotes_reach_the_strategy or
 test_paper_default_feed_is_iex or test_paper_asset_and_daily_bars_reach_the_strategy"`, 2026-11-10 20:49
@@ -190,5 +226,22 @@ Read 2026-11-10; "raw": fetched with `curl` and read, not summarised.
   (https://raw.githubusercontent.com/alpacahq/alpaca-py/master/alpaca/data/live/websocket.py) are the
   same as 0.45.0's (fetched, compared); described above as a narrow start-up race, which the offline run
   reaches only by holding the first send.
+* 2026-11-11, the silent stream: alpaca-py at the pin, read in the local copy at the pin,
+  https://github.com/alpacahq/alpaca-py/blob/c42add7c0a7026e2ead3ed64e76f4def2b99fda4/alpaca/data/live/websocket.py
+  (`DataStream.__init__` `data_timeout` lines 91-118; `_is_market_data` 52-76; `_consume` 264-299;
+  `_drive_run` 519-535; `_send_subscribe_msg` 412-424), `alpaca/data/live/stock.py` lines 35-72 and
+  `alpaca/common/utils.py` `reconnect_delay` lines 47-76; the installed 0.45.0 files are the same (compared).
+  NautilusTrader at the pin, read in the local copy:
+  https://github.com/nautechsystems/nautilus_trader/blob/d53849b216e20f2c122ca01b4dd0da377638b186/crates/adapters/databento/src/live.rs
+  (`reconnect_timeout_mins`, "Giving up reconnection"), `crates/adapters/hyperliquid/src/config.rs`
+  (`stale_stream_receive_timeout_secs`, "above the instrument's expected quiet period"),
+  `crates/data/src/client.rs` (`has_active_subscription`, `clear_subscription_state`),
+  `crates/data/src/engine/mod.rs` (`reset` clears it, `connect` and `disconnect` do not) and
+  `docs/developer_guide/python_adapters.md` ("Define adapter configuration"; "A client instance and its
+  bound provider belong to one node run"). Offline: a stopped `LiveNode` raised "LiveNode cannot be run
+  from state Stopped; build a new node to run again" (ran). Paper, pre-market 2026-11-11 08:23 to 08:36
+  New York, a read-only probe under `paper:test`: `sip` 180 s then `iex` 600 s on SPY and QQQ; `iex` QQQ
+  one trade at 08:34:39 and no quote, `iex` SPY 245 to 1,104 quotes per five minutes, `sip` hundreds of
+  quotes a minute on each (counts kept outside the repository; ran).
 * Second reader, 2026-11-10 (`evidence-verifier`): B stands; corrected above: Databento's refusal cited
   from source, the data hooks' sentence quoted, the after-hours claim narrowed, the per-endpoint limit.
