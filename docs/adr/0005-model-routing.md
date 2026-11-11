@@ -76,6 +76,8 @@ Not adopted:
 * **A second model provider for runtime workers.** Artificial Analysis shows GPT-6.1 Sol (xhigh) at index 52
   for $0.76 per task and Gemini 4 Carbon (high) at index 60. A second provider adds a second SDK, cache
   namespace and set of failure modes; it is adopted only after an eval on our own tasks shows it wins.
+  A coding runtime is another matter: ADR 0058 lets an adopted one build on the owner's word, and ADR
+  0057's eval, which has not run, keeps or retires it.
 
 Where this corrects the request: a cheaper model is often not cheaper per task. Opus 5.5 at `low` cost about
 7% more per solved task than Sonnet 5.5 at its default, and replacing Opus 5.5 with Fable 5.2 as orchestrator

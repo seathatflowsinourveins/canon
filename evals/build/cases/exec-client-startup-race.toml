@@ -1,0 +1,12 @@
+# A build case: the format is in evals/build/README.md and ADR 0057.
+id = "exec-client-startup-race"
+status = "left-out"
+fix = "05899f8468e859ed5023dd531d413fc68135d04a"
+review_case = "exec-client-first-slice"
+defects = [
+    "startup-reconciliation-race",
+]
+reason = """
+The defect is in a test helper, and its fix is in the one test file a case would supply, so the
+starting tree would already hold the fix.
+"""

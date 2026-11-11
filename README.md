@@ -177,6 +177,7 @@ runs.
 | `catalog/` | Local market data, loaded by `canon_trading.bars_to_catalog`; ignored by git |
 | `ledger/` | The trial ledger, an Optuna SQLite study, used from the main checkout by every worktree; ignored by git |
 | `evals/review/` | The reviewer benchmark: cases, the brief every reviewer gets, the procedure |
+| `evals/build/` | The build eval: cases made from past fixes, the brief every worker gets, the harness, the procedure |
 | `.claude/settings.json` | Permissions and hooks for this repo |
 | `orca.yaml` | The setup command Orca runs in a new worktree, once enabled and approved in the app |
 | `.claude/rules/` | Rules scoped to `canon/`, `docs/adr/` and trading code |
@@ -231,4 +232,7 @@ here, community convergence, then anyone's recollection.
   benchmark is defined, with its cases, brief and procedure in `evals/review/` (ADR 0046); its first run
   (2026-11-10) scored 10 confirmed defects, in `evals/review/runs/`. Its cases now hold 23, 10 in
   `order-modify`, 10 in `trial-ledger-gate` and one each in three others, so with most bunched in two cases it
-  can show only gross differences.
+  can show only gross differences. A build eval is defined too, for a runtime and model that would build
+  here: four cases made from past fixes, each shown sound by running, in `evals/build/` (ADR 0057). No
+  trial of it has run. It is not a gate: another adopted runtime may be given build work under ADR
+  0058's terms, and the eval is what keeps or retires it.

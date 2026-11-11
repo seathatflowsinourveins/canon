@@ -1,0 +1,12 @@
+# A build case: the format is in evals/build/README.md and ADR 0057.
+id = "data-client-log-capture"
+status = "left-out"
+fix = "2669c8645852c3d4e46dda75ff02bf6c16b30602"
+review_case = "data-client-hardening"
+defects = [
+    "log-capture-before-writer-flush",
+]
+reason = """
+The defect is in a test helper, and its fix is in the one test file a case would supply, so the
+starting tree would already hold the fix.
+"""

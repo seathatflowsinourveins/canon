@@ -1,0 +1,49 @@
+# A build case: the format is in evals/build/README.md and ADR 0057.
+id = "gate-reads-what-the-run-read"
+status = "ready"
+fix = "ba44c251b9e19e28130c065d1ae88b48c1b1c95b"
+review_case = "trial-ledger-gate"
+defects = [
+    "session-day-without-return-dropped",
+]
+paths = ["src/canon_trading/"]
+tests = [
+    "tests/conftest.py",
+    "tests/test_backtest.py",
+    "tests/test_ledger.py",
+    "tests/test_ranking.py",
+    "tests/test_returns_matrix.py",
+]
+fail_to_pass = [
+    "tests/test_ledger.py::test_a_creation_interrupted_before_its_sample_is_completed_by_the_next",
+    "tests/test_ledger.py::test_a_hole_no_load_can_fill_is_closed_by_consolidating_the_catalog",
+    "tests/test_ledger.py::test_a_keyed_failure_before_its_sample_is_written_stops_the_ranking",
+    "tests/test_ledger.py::test_a_sample_the_catalog_covers_in_part_is_refused_naming_the_gap",
+    "tests/test_ledger.py::test_a_sample_the_catalog_does_not_reach_is_refused_before_a_trial",
+    "tests/test_ledger.py::test_bars_the_cache_does_not_account_for_are_told_failed",
+    "tests/test_ledger.py::test_the_digest_is_of_the_bars_the_run_read_not_a_later_catalog",
+    "tests/test_ranking.py::test_a_record_that_ran_with_no_sample_number_of_the_study_stops",
+    "tests/test_ranking.py::test_session_days_with_no_return_stop_and_are_named",
+    "tests/test_returns_matrix.py::test_a_session_day_with_no_return_is_refused",
+]
+admitted = "2026-11-10"
+statement = """
+Five ways a study can pass the gate, or be left unusable, on inputs ADR 0010, ADR 0035 and ADR 0041
+do not accept:
+
+1. The data digest and the session days of a run are read from the catalog after the replay, so a
+   catalog replaced in between gives the old run the new bars' digest, and mixed inputs pass. The
+   digest should be of the bars the run read. A run whose bars cannot all be accounted for, or that
+   read a bar outside the sample, should be told failed.
+2. Any overlap of the catalog with the sample is accepted, so two configurations pass on a fragment
+   of the sample. A run should need the sample covered in full: a part that is missing is refused
+   before a trial is asked for, and named, and so is a sample the catalog does not reach at all. A
+   stretch that a load showed to hold no bar can be closed by consolidating the catalog.
+3. A keyed record that failed before its sample number was written is left out of the ranking,
+   instead of stopping it until a later record of its key resolves it. A record that ran to the end
+   with no sample number of the study should stop the ranking too, named.
+4. A creation interrupted between the study's name and its sample leaves a name that can be neither
+   opened nor created again.
+5. A session day with no return in a trial's series is dropped from the calendar, so that trial
+   ranks on fewer days than it had sessions. Such a day should be refused, and named.
+"""

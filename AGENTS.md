@@ -94,7 +94,12 @@ This is the same for every runtime, Claude Code or not: use no credentials, and 
 Orca is the cockpit (ADR 0018). From a session Orca started, its `orca-cli` and `orchestration` skills may
 be used within these limits (ADR 0021):
 
-* Workers that build, and handoffs, use `--agent claude`. A reviewer may be Codex (`--agent codex`),
+* Handoffs use `--agent claude`. A worker that builds is a Claude worker or, under ADR 0058's terms, a
+  worker of another adopted runtime (the agent ids below). Such a worker has its own workspace and a
+  task that names the paths it may change; it commits on its branch and reports, and never lands,
+  pushes, installs anything, runs paper tests or reads a credential; a Claude lane or the coordinator
+  reproduces its tests, runs the review ADR 0017 requires and lands it. The build eval (ADR 0057) is
+  the measure that keeps or retires it. A reviewer may be Codex (`--agent codex`),
   Muse Code (`--agent muse`) or Antigravity (`--agent antigravity`); DeepSeek Harness (`--agent dsh`) may
   stand in like Antigravity once `scripts/bootstrap --check` shows its review patch ok (ADR 0043, ADR 0045).
 * A reviewer reads a change and reports findings. It never edits, commits, pushes, lands, runs paper tests

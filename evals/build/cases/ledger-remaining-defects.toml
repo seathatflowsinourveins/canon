@@ -1,0 +1,42 @@
+# A build case: the format is in evals/build/README.md and ADR 0057.
+# The defect evals/review records for this fix is in a test (an assertion that could not fail). A build
+# case supplies the fixed tests, so that one is not the worker's to fix; the six below are, each with a
+# test of the fix that fails before it.
+id = "ledger-remaining-defects"
+status = "ready"
+fix = "6e6fed784711cee45c2ad0cbba8c1167e86b23d1"
+review_case = "trial-ledger-gate"
+defects = [
+    "n-hat-dsr-test-cannot-fail",
+]
+paths = ["src/canon_trading/", ".gitignore"]
+tests = [
+    "tests/conftest.py",
+    "tests/test_backtest.py",
+    "tests/test_deflated_sharpe.py",
+    "tests/test_ledger.py",
+    "tests/test_ranking.py",
+    "tests/test_returns_matrix.py",
+]
+fail_to_pass = [
+    "tests/test_backtest.py::test_a_run_config_run_without_a_strategy_is_refused",
+    "tests/test_ledger.py::test_the_ledger_folder_is_ignored_only_at_the_root",
+    "tests/test_ledger.py::test_the_value_told_is_none_for_a_series_the_gate_rejects",
+    "tests/test_ledger.py::test_two_processes_creating_one_new_ledger_both_succeed",
+    "tests/test_ranking.py::test_the_recorded_range_is_utc_whatever_the_zone",
+    "tests/test_returns_matrix.py::test_a_return_that_is_not_finite_is_refused_when_called_directly",
+]
+admitted = "2026-11-10"
+statement = """
+Six defects left in the trial ledger, the returns matrix and the gate after their first fix:
+
+1. Two processes that create one new ledger file at the same moment race, and one of them crashes.
+2. The report's recorded range is in the naive local time the store returns, so it reads differently
+   in another time zone. It should be UTC, with its offset.
+3. `returns_matrix`, called directly, accepts a return that is not finite.
+4. The value told for a trial does not come from the series as the gate accepts it: a run whose
+   returns the gate rejects should be told no value, and failed.
+5. A run configuration with no strategy is run instead of refused.
+6. The rule that ignores the `ledger/` folder matches a folder of that name anywhere in the tree,
+   not only at the root.
+"""

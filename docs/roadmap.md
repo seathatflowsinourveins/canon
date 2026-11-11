@@ -49,4 +49,6 @@ ADR 0009 keeps trading on paper at least until NautilusTrader v2.0.0 stable, a c
   (ADR 0005). For reviewers, the benchmark's cases and procedure are in `evals/review/` (ADR 0046); its
   first run is scored there, its cases hold 23 confirmed defects (10 in `order-modify`, 10 in
   `trial-ledger-gate`), and its pending
-  cases wait on fixes reaching `main`.
+  cases wait on fixes reaching `main`. For builders, the eval's cases, brief and harness are in
+  `evals/build/` (ADR 0057); its first trial, which also sets the bar's levels, has not run, and how the
+  cockpit starts a worker in a tree that is not a worktree is not yet known.
