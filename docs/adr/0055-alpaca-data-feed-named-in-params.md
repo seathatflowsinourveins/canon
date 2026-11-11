@@ -80,9 +80,10 @@ fails as above.
 **Pre-market and after-hours** (04:00-09:30 and 16:00-20:00 New York): at 16:46 the `iex`, `overnight`
 and `boats` streams each sent no quote or trade in 45 s on four symbols. IEX did trade after 16:00 (REST
 latest bars at 16:17 and 16:50), so this is one short window, not proof that no feed serves those hours;
-`sip` and `delayed_sip` were not probed then (UNVERIFIED). Pre-market was probed on 2026-11-11, `iex`
-and `boats` delivering nothing before 05:00, and is skipped by name (ADR 0044, its pre-market row).
-Nothing is built to work around it.
+`sip` and `delayed_sip` were not probed then. In pre-market on 2026-11-11 `iex` and `boats` delivered
+nothing from 04:13 to 04:58; from 08:23 the sip feed delivered and `iex` barely (Confirmation), so
+pre-market and after-hours name `sip`, one setting per part, with no fallback to another feed (ADR 0044,
+its rows).
 
 D was not taken: a per-call option belongs in params, and a config feed would be a field of this repo's.
 
@@ -134,9 +135,18 @@ as before (`test_paper_integration.py`). The same three passed again at 21:28 on
 with 2 `boats` quotes in 30 s. Shaped on TC-D20 and TC-D71 with a small strategy: v2.0.0rc8's
 Python `DataTesterConfig` takes no `subscribe_params`.
 
+Paper, 2026-11-11, pre-market, a read-only probe under `mise run paper:test` (account A, no order),
+exit 0: the sip feed authenticated on paper on 2026-11-10, and authenticated and delivered on 2026-11-11. On `v2/sip`,
+08:23:05 to 08:26:05 New York: SPY 1,167 quotes, 240 trades, 3 bars; QQQ 7,292 quotes, 796 trades, 3
+bars. On `v2/iex`, 08:26 to 08:36: SPY about 2,010 quotes, 5 trades, 2 bars; QQQ 0 quotes, 1 trade, 0
+bars; IEX's REST bars matched the stream. This replaces, for pre-market, the earlier observation that no
+stream delivered there, which held for 04:13 to 04:58 (ADR 0044). The same day a pre-market window on `sip` (account B, 08:42 to 09:08)
+was served 525 `sip` one-minute bars over REST, from the prior day's 15:35 to its start, and streamed
+18,388 SPY quotes and 1,571 trades (ADR 0044, its pre-market row).
+
 `UNVERIFIED`: why the paper pair is served `boats` and `sip`; a second stream on another feed; a refused
-feed's server message on paper (none tried was refused; 409 is documented); pre-market data on any feed
-from 08:00, which IEX's REST bars showed on 2026-11-10 and no stream has been probed for (ADR 0044).
+feed's server message on paper (none tried was refused; 409 is documented); `sip` in after-hours, which
+no stream has been probed for on it.
 
 ## Evidence
 

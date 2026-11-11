@@ -59,7 +59,7 @@ paper, pre-market and after-hours so far (Sessions, feeds and what paper has sho
 | A position over one share | `PositionCap`, a non-trading strategy in the node (a `DataActor` has no portfolio at the pin): the portfolio's net position every second, `shutdown_system` over one share | No upstream: no setting caps a position, and the trading state is not settable from Python |
 | A window's length and schedule | `minutes` (default 30, at most 60), clipped to the session's end and to `LONGEST_WINDOW_SECS` (Sharing the account), timed from Alpaca's clock; wind-down 120 s before; 300 s between windows; the session from configuration | No upstream |
 | The extended session's parts | Pre-market and after-hours from the calendar day's `session_open` and `session_close`, refused when either is absent; overnight from 20:00 on the evening before a trade date on Alpaca's calendar to that date's `session_open`, so none before a weekend or holiday | Alpaca's 24/5 page: 8:00 PM - 4:00 AM ET, "on the evening before the trade date", "follows the NYSE holiday calendar" |
-| The feed | `boats` overnight, IEX in the regular session and pre-market, none after-hours (below), the part deciding (both stream and serve bars; which plan entitles this paper pair to real-time `boats` is UNVERIFIED, ADR 0055), named in the strategy's quote and trade subscriptions, made before its bars, and its warm-up request | ADR 0055: params `{"feed": ...}`; the data engine hands the client an instrument's first subscription |
+| The feed | `boats` overnight, IEX in the regular session, `sip` in pre-market and after-hours (below), the part deciding (each streams and serves bars; `sip` bars over REST seen on paper in the first pre-market window, ADR 0055), named in the strategy's quote and trade subscriptions, made before its bars, and its warm-up request | ADR 0055: params `{"feed": ...}`; the data engine hands the client an instrument's first subscription |
 | Overnight eligibility | An overnight window starts only on an asset Alpaca marks `overnight_tradable` and not `overnight_halted`, read raw (alpaca-py 0.45.0's `Asset` has no such field), as a boolean (the 24/5 page's "boolean attributes") or a value of `attributes` (the asset reference; what paper showed), else refused by name | Alpaca's 24/5 page: "Assets tradable in the overnight session can be identified via the `overnight_tradable` attribute" |
 | Data in the record | The quotes, trades and live bars that reached the strategy, and the adapter's own stream lines from the node's log; failed when the stream delivered no quote and no trade, or the adapter logged a stream error; a quiet market (quotes, no bar) is ok | No upstream: the adapter reports a refused or ended stream only in the log (ADR 0055) |
 
@@ -69,24 +69,31 @@ paper and none delivered has no feed and is skipped, naming the probe and its da
 2026-11-11, so the schedule does not fail every morning and evening by design; a part not yet probed runs, and its
 windows are the probe that decides its row; inside a part with a feed, a window that receives no quote and
 no trade fails (Data in the record). With no feed, `--session auto` says "nothing to run" and
-`--session extended` "skipped"; both exit 0 and keep the last result. No window can probe pre-market or
-after-hours again until its row changes: a probe outside a window, as ADR 0055's and the one below were,
-would.
+`--session extended` "skipped"; both exit 0 and keep the last result. As of 2026-11-11 every part of a
+trading day's sessions has a feed; on `sip`, after-hours and pre-market before 08:00 are not yet seen on
+paper (UNVERIFIED), so their first windows are the probe.
 
 | Part | Feed | Seen delivering on paper | A firing |
 |---|---|---|---|
 | Regular, while Alpaca's clock says open | IEX | Yes: upstream's data tester, 13:59 to 14:44, 2026-11-10 (the adapter's README) | Runs a window, market orders, ending `END_MARGIN_SECS` before the close |
-| Pre-market, the day's `session_open` to the regular open | None | Probed, none delivered, 2026-11-11: the IEX windows of 04:13 (by hand, account B) and 04:25 New York (the schedule's first, at `a2042a4`) received no SPY quote or trade in 307.7 s and 1,506.4 s, and their warm-ups no bar; a read-only probe under `paper:test` at 04:53 had `iex` and `boats` each send no SPY quote or trade in 120 s, both subscriptions confirmed, and serve no one-minute bar for the hour before. In 2026-11-10's pre-market IEX's REST bars began at 08:15: 16 bars, 255 trades, `boats` none. IEX is the one feed a Paper Only account is documented to receive (Alpaca's "Paper Trading" page) | Skips, naming these observations |
-| After-hours, the regular close to the day's `session_close` | None | Probed, none delivered: `iex`, `overnight` and `boats` streams each sent no quote or trade in 45 s on four symbols at 16:46, 2026-11-10, though IEX's REST bars showed trades after the close; one short probe, not proof (ADR 0055) | Skips, naming that observation |
+| Pre-market, the day's `session_open` to the regular open | `sip` | Yes, 2026-11-11: the sip feed authenticated on paper on 2026-11-10, and authenticated and delivered on 2026-11-11; a read-only probe under `paper:test` (account A), 08:23:05 to 08:26:05 New York, received 1,167 SPY quotes, 240 trades and 3 bars on `sip`, where `iex`, 08:26 to 08:36, sent about 2,010 SPY quotes, 5 trades and 2 bars (QQQ: 7,292 quotes, 796 trades, 3 bars on `sip`; 1 trade on `iex`). Before that, `iex` and `boats` delivered nothing from 04:13 to 04:58, before IEX Exchange's 08:00 pre-market open: the IEX windows of 04:13 and 04:25 received no SPY quote or trade in 307.7 s and 1,506.4 s, and a probe at 04:53 none in 120 s on either. The first pre-market window, `SessionMaCross` on account B, `mise run paper:session --session extended --minutes 25`, 08:42:51 to 09:07:57 New York, 2026-11-11, exit 0, result ok: its warm-up was served 525 `sip` bars from the prior day's 15:35, so the averages were initialized at the start; 18,388 quotes, 1,571 trades and 25 live bars reached the strategy; it bought one share with a marked DAY limit at 757.10, filled at 757.05 at 08:49:00, and the wind-down sold it with a marked limit at 756.97, filled at 757.02 at 09:05:51; two fills, the cap's peak one share, no denial, nothing left | Runs a window, marked limits; its warm-up reaches back into the prior session (below) |
+| After-hours, the regular close to the day's `session_close` | `sip` | Not yet on `sip`: `iex`, `overnight` and `boats` streams each sent no quote or trade in 45 s on four symbols at 16:46, 2026-11-10, though IEX's REST bars showed trades after the close (ADR 0055); after-hours runs on `sip` as pre-market does, as the lead decided on 2026-11-11, and its first windows are the probe | Runs a window, marked limits, warmed up on its own hour |
 | Overnight, 20:00 on the evening before a trade date to its `session_open` | `boats` | Yes, 2026-11-10 (Confirmation) | Runs a window, marked limits, on an asset `overnight_tradable` and not `overnight_halted` |
 | Friday 20:00 to Sunday 20:00, a holiday and the evening before it | None | | Nothing to run |
 
-Not taken: pre-market on IEX from about 08:00, skipping only the hours before. No Alpaca page gives that
-boundary (IEX's own pre-market hours were not read; UNVERIFIED), and what IEX served in 2026-11-10's
-pre-market, 16 bars in 75 minutes, gives the warm-up's hour (`WARM_UP_SPAN`) fewer than `slow_period`'s
-20, and live bars at that rate, about one in five minutes, would not fill the averages within a 25-minute
-window, so `SessionMaCross` would decide nothing there. The observations above are what such a split would
-rest on; a read-only probe under `paper:test` after 08:00, which has not run, would decide it.
+Pre-market and after-hours stream `sip`, as the lead decided on 2026-11-11, since `iex` sent too few
+trades there to warm the averages up (the pre-market row; IEX Exchange's own pre-market opens only at 08:00,
+"Pre-Market Session 8:00 a.m. - 9:30 a.m.", its trading hours page). The regular session stays on `iex`. A
+part's feed is one setting in `SESSION_FEEDS`: a `sip` that Alpaca refuses or that delivers nothing fails the
+window by name, and nothing switches to another feed. A pre-market window's warm-up starts `slow_period` plus
+`WARM_UP_SPARE_BARS` bars, in the bar type's interval, before the last trading day's regular close on Alpaca's calendar
+(`session_window.warm_up_start`, the calendar read a week back), as a span with no `limit`, through
+`Strategy.request_bars`, which takes any `start`, and the adapter's bars request, which pages to the end; the
+simple averages keep the last bars fed, so they start from the prior session's close and the after-hours and
+pre-market bars since. Orders there are the extended session's marked DAY limits (Alpaca's orders page:
+limit orders, `day` or `gtc`, with `extended_hours` true; `SessionMaCross._limit`). Known limit: if the
+wind-down's limit does not fill, it is sent again only on a later bar, and the account check after the stop
+sends no close outside the regular session (ADR 0060), so a share left is a failed window, named.
 
 What a window knows at start-up, what is lost between windows, and the averages' warm-up: ADR 0047. The
 engine's memory purge (`purge_closed_orders_interval_mins` and the rest, configure_live_trading, "Memory
@@ -304,6 +311,22 @@ Read 2026-11-10. "raw": fetched with `curl` and read whole. NautilusTrader files
 
 * ADR 0069, 2026-11-10: a second paper account, B, for session windows. It amends "Sharing the account"
   once `paper:session` reads B's pair, with a lock of its own; until then this record stands as written.
+* 2026-11-11: pre-market and after-hours given `sip`, as the lead decided that day, with no fallback to
+  another feed; a pre-market window's warm-up reaches back into the prior session. Sources:
+  https://www.iex.io/resources/trading/trading-hours-holidays, "Pre-Market Session 8:00 a.m. - 9:30 a.m."
+  (fetched, summarised); https://docs.alpaca.markets/us/docs/orders-at-alpaca.md, pre-market "4:00am -
+  9:30am ET", "Only limit orders with `time_in_force` set to `day` or `gtc`", the `extended_hours` boolean
+  (fetched, summarised); NautilusTrader `crates/common/src/python/actor.rs` line 2956 at `d53849b216e2`
+  (https://github.com/nautechsystems/nautilus_trader/blob/d53849b216e2/crates/common/src/python/actor.rs,
+  `request_bars` with `start`, `end`, `limit`; read in the local copy at the pin); alpaca-py
+  `alpaca/data/requests.py` line 39 at `c42add7c0a70`
+  (https://github.com/alpacahq/alpaca-py/blob/c42add7c0a70/alpaca/data/requests.py, bars sorted ascending
+  by default; read in the local copy at the pin). The probe under `paper:test` and the first window, its
+  row (run). Offline, `tests/test_session_window.py`: the feed per part, a refused or empty `sip` failing
+  the window by name, the warm-up's start from the calendar in the bar type's interval, a calendar with no
+  prior trading day refused, and the reach-back across a 15-hour gap in a backtest (run). Code review
+  (`/code-review`, high): a refusal raised as a failure and a span counted in minutes, each fixed with a
+  test; stale docstrings corrected; `sip` history for the last 15 minutes doubted, and served on paper.
 * 2026-11-11: pre-market joined after-hours as a part with no feed, on the observations in its row of the
   table: the two windows' records (read), the probe under `mise run paper:test`, read-only, SPY through the
   adapter's node on `iex` and `boats` and alpaca-py's REST bars on each, 04:53 to 04:58 New York, exit 0

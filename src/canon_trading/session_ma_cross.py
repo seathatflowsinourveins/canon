@@ -49,7 +49,15 @@ client, ADR 0047), so the averages would need `slow_period` live bars before any
 upstream's EMA cross does in `on_start` (concepts/strategies, "Handler example": register the indicators,
 `request_bars`, subscribe; "Registered indicators receive the bars from a request response before
 `on_historical_bars()` runs, so a request hydrates them"), the `EXTERNAL` form of the live bar
-type, the bars the adapter serves, is requested before the live subscription, at least an hour of it.
+type, the bars the adapter serves, is requested before the live subscription, at least an hour of it, and
+from `warm_up_start` when that is earlier: the run sets it where the window's own part of the session is too
+thin for the slow average (pre-market, `session_window.warm_up_start`), so the request reaches back into the
+prior session. `Strategy.request_bars(bar_type, start=..., end=None, ...)` takes any `start`
+(`nautilus_trader/trading/__init__.pyi` line 993 at v2.0.0rc8; `crates/common/src/python/actor.rs` line 2956
+at `d53849b216e2`), sent as a span with no `limit`, since alpaca-py 0.45.0's bar request sorts ascending by
+default (`alpaca/data/requests.py` line 39 at `c42add7c0a70`) and a limit would keep the oldest bars; the
+adapter pages Alpaca's bars from `start` until every page has arrived (`canon_alpaca.data`), and the averages
+keep the last bars fed.
 One departure: the averages are registered for the live bar type only, and `on_historical_bars` feeds the
 history to them, oldest first, only while no live bar has reached them; a later answer (after a live bar,
 or after `WARM_UP_TIMEOUT_SECS`) is dropped and counted, so older bars never follow newer ones. Decisions
@@ -67,6 +75,7 @@ Known limit: the strategy does not know the session calendar (the run checks it 
 
 from __future__ import annotations
 
+from datetime import UTC
 from datetime import datetime
 from datetime import timedelta
 from decimal import ROUND_CEILING
@@ -131,6 +140,7 @@ class SessionMaCrossConfig(MaCrossConfig):
         limit_timeout_secs: int = LIMIT_TIMEOUT_SECS,
         wind_down_at: datetime | None = None,
         warm_up: bool = False,
+        warm_up_start: datetime | None = None,
         feed: str | None = None,
         **kwargs: object,
     ) -> None:
@@ -149,6 +159,7 @@ class SessionMaCrossConfig(MaCrossConfig):
                 "limit_timeout_secs": limit_timeout_secs,
                 "wind_down_at": wind_down_at,
                 "warm_up": warm_up,
+                "warm_up_start": warm_up_start,
                 "feed": feed,
             },
             {
@@ -157,6 +168,7 @@ class SessionMaCrossConfig(MaCrossConfig):
                 "limit_timeout_secs": int,
                 "wind_down_at": (datetime, NoneType),
                 "warm_up": bool,
+                "warm_up_start": (datetime, NoneType),
                 "feed": (str, NoneType),
             },
         )
@@ -168,6 +180,10 @@ class SessionMaCrossConfig(MaCrossConfig):
             raise ValueError(f"limit_timeout_secs must be positive, got {limit_timeout_secs}")
         if wind_down_at is not None and wind_down_at.tzinfo is None:
             raise ValueError("wind_down_at must be an aware datetime")
+        if warm_up_start is not None and warm_up_start.tzinfo is None:
+            raise ValueError("warm_up_start must be an aware datetime")
+        if warm_up_start is not None and not warm_up:
+            raise ValueError("warm_up_start needs warm_up=True; without it nothing is requested")
         self.extended_hours = extended_hours
         self.limit_offset = limit_offset
         self.limit_timeout_secs = limit_timeout_secs
@@ -175,6 +191,7 @@ class SessionMaCrossConfig(MaCrossConfig):
         if warm_up and not bar_type.spec.is_time_aggregated():
             raise ValueError(f"warm_up needs time bars to size its request, got {bar_type}")
         self.warm_up = warm_up
+        self.warm_up_start = warm_up_start
         self.feed = feed
 
 
@@ -196,6 +213,7 @@ class SessionMaCross(MaCross):
         self.wind_down_at = config.wind_down_at
         self.manage_stop = config.manage_stop
         self.warm_up = config.warm_up
+        self.warm_up_start = config.warm_up_start
         self.feed_params = {"feed": config.feed} if config.feed else None
         """The params naming the feed in each subscription and the warm-up request (ADR 0055)."""
         self.quotes = 0
@@ -233,7 +251,7 @@ class SessionMaCross(MaCross):
             self.live_bars = 0
             self.request_bars(
                 self.history_bar_type,
-                start=self.clock.utc_now() - self._warm_up_span(),
+                start=self._warm_up_from(),
                 callback=self._on_history,
                 params=self.feed_params,
             )
@@ -258,6 +276,14 @@ class SessionMaCross(MaCross):
 
     def on_trade(self, trade) -> None:
         self.trades += 1
+
+    def _warm_up_from(self) -> datetime:
+        """The warm-up request's start: `_warm_up_span` before now, or `warm_up_start` if that is
+        earlier."""
+        start = self.clock.utc_now() - self._warm_up_span()
+        if self.warm_up_start is not None:
+            start = min(start, self.warm_up_start.astimezone(UTC))
+        return start
 
     def _warm_up_span(self) -> timedelta:
         """`WARM_UP_SPAN`, or `slow_period` plus `WARM_UP_SPARE_BARS` bars if that is longer."""

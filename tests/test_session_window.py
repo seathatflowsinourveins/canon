@@ -18,6 +18,7 @@ import tomllib
 from dataclasses import dataclass
 from dataclasses import field
 from datetime import UTC
+from datetime import date
 from datetime import datetime
 from datetime import timedelta
 from decimal import Decimal
@@ -615,13 +616,16 @@ def test_a_window_streams_boats_overnight_and_iex_in_the_regular_session(part, e
     assert session_window.window_feed(part) == expected
 
 
-def test_a_part_with_no_feed_is_skipped_and_an_unknown_part_named() -> None:
+def test_a_part_with_no_feed_is_skipped_and_an_unknown_part_named(monkeypatch) -> None:
+    monkeypatch.setitem(
+        session_window.SESSION_FEEDS,
+        "after-hours",
+        session_window.SessionFeed(None, "probed on paper and no stream delivered"),
+    )
     with pytest.raises(
         session_window.WindowSkipped, match="no after-hours window: probed on paper"
     ):
         session_window.window_feed("after-hours")
-    with pytest.raises(session_window.WindowSkipped, match="no pre-market window: probed on paper"):
-        session_window.window_feed("pre-market")
     with pytest.raises(RuntimeError, match="no feed is set for the 'midday' part"):
         session_window.window_feed("midday")
 
@@ -630,9 +634,9 @@ def test_each_part_of_a_session_names_its_feed_and_what_paper_has_shown_of_it() 
     """One table holds, per part, the feed a window uses and whether paper has shown it delivering."""
     table = session_window.SESSION_FEEDS
     assert set(table) == {"regular", "pre-market", "after-hours", "overnight"}
-    assert table["after-hours"].feed is None and "2026-11-10" in table["after-hours"].observed
+    assert table["after-hours"].feed == "sip" and "2026-11-10" in table["after-hours"].observed
     assert table["overnight"].feed == "boats" and "2026-11-10" in table["overnight"].observed
-    assert table["pre-market"].feed is None and "2026-11-11" in table["pre-market"].observed
+    assert table["pre-market"].feed == "sip" and "2026-11-11" in table["pre-market"].observed
     assert table["regular"].feed == "iex" and "2026-11-10" in table["regular"].observed
 
 
@@ -648,7 +652,13 @@ def test_a_part_with_no_feed_is_skipped_by_name_not_failed(
 ) -> None:
     """The lead decided on 2026-11-11 that a part no feed has been seen to serve on paper is skipped,
     naming the part and the observation, rather than run to fail for no data every evening; after-hours
-    on the probe of 2026-11-10, pre-market on the windows and the probe of 2026-11-11."""
+    on the probe of 2026-11-10, pre-market on the windows and the probe of 2026-11-11, until each was
+    given sip (a row with no feed stands in for them here)."""
+    monkeypatch.setitem(
+        session_window.SESSION_FEEDS,
+        part,
+        session_window.SessionFeed(None, f"probed at {observed}"),
+    )
 
     class Outside(Account):
         def get_clock(self) -> Clock:
@@ -666,6 +676,170 @@ def test_a_part_with_no_feed_is_skipped_by_name_not_failed(
         assert json.loads((tmp_path / "latest.json").read_text()) == {"result": "ok"}
         heard = json.loads((tmp_path / "last-firing.json").read_text())
         assert heard["outcome"].startswith(f"{said}: no {part} window")
+
+
+@pytest.mark.parametrize(
+    ("at", "part"),
+    [(datetime(2026, 11, 10, 4, 0), "pre-market"), (datetime(2026, 11, 10, 17, 0), "after-hours")],
+)
+def test_pre_market_and_after_hours_stream_sip_from_their_open(at, part) -> None:
+    """The sip feed authenticated on paper on 2026-11-10, and authenticated and delivered on 2026-11-11,
+    where IEX sent too few trades to warm the averages up (ADR 0055): both parts run on it, from the calendar's bounds."""
+    found, why = session_window.resolve_session(
+        clock(at.replace(tzinfo=NEW_YORK), is_open=False), CALENDAR
+    )
+    assert (found, why) == ("extended", f"outside the regular session, in its {part} part")
+    assert session_window.window_feed(part) == "sip"
+
+
+@pytest.mark.parametrize(
+    ("at", "days", "expected"),
+    [
+        # Wednesday: Tuesday's regular close less the slow average's 20 bars and 5 spare
+        (
+            datetime(2026, 11, 11, 8, 30),
+            ["2026-11-10", "2026-11-11"],
+            datetime(2026, 11, 10, 15, 35),
+        ),
+        # Monday: Friday's, across the weekend
+        (datetime(2026, 11, 9, 8, 30), ["2026-11-06", "2026-11-09"], datetime(2026, 11, 6, 15, 35)),
+    ],
+)
+def test_a_pre_market_warm_up_starts_in_the_prior_session(at, days, expected) -> None:
+    """A pre-market window's own session is too thin for the slow average (ADR 0044), so its warm-up
+    starts the slow average's bars and the spare ones before the last trading day's regular close."""
+    start = session_window.warm_up_start(
+        "pre-market",
+        at.replace(tzinfo=NEW_YORK),
+        [day(d) for d in days],
+        span=timedelta(minutes=25),
+    )
+    assert start == expected.replace(tzinfo=NEW_YORK)
+
+
+def test_other_parts_warm_up_on_their_own_hour() -> None:
+    at = datetime(2026, 11, 10, 11, 0, tzinfo=NEW_YORK)
+    assert (
+        session_window.warm_up_start("regular", at, [day("2026-11-09")], span=timedelta(minutes=25))
+        is None
+    )
+    assert (
+        session_window.warm_up_start(
+            "overnight", at, [day("2026-11-09")], span=timedelta(minutes=25)
+        )
+        is None
+    )
+
+
+def test_a_pre_market_warm_up_with_no_prior_trading_day_on_the_calendar_is_refused() -> None:
+    at = datetime(2026, 11, 11, 8, 30, tzinfo=NEW_YORK)
+    with pytest.raises(RuntimeError, match="no trading day before 2026-11-11"):
+        session_window.warm_up_start(
+            "pre-market", at, [day("2026-11-11")], span=timedelta(minutes=25)
+        )
+
+
+def test_a_pre_market_window_with_no_prior_day_on_the_calendar_is_refused_not_failed(
+    monkeypatch, tmp_path
+) -> None:
+    """Review finding: the warm-up's start was outside the refusals, so a calendar without the prior
+    trading day failed the window as a `RuntimeError` instead of refusing it before anything ran."""
+
+    class OnlyToday(Account):
+        def get_clock(self) -> Clock:
+            return clock(datetime(2026, 11, 11, 8, 30, tzinfo=NEW_YORK), is_open=False)
+
+        def get_calendar(self, filters=None) -> list[Calendar]:
+            return [day("2026-11-11")]
+
+    monkeypatch.setattr(
+        session_window, "window_node", lambda *a, **k: pytest.fail("a node was built")
+    )
+    with pytest.raises(session_window.WindowRefused, match="no trading day before 2026-11-11"):
+        session_window.run_window(
+            WindowConfig(session="extended", log_dir=tmp_path), trading=cast(Any, OnlyToday())
+        )
+
+
+def test_the_pre_market_warm_up_span_is_counted_in_the_bar_types_interval(
+    monkeypatch, tmp_path
+) -> None:
+    """Review finding: the reach-back was counted in minutes whatever the bar type; five-minute bars need
+    five times the span for the same 25 bars."""
+    built = {}
+
+    class PreMarket(Account):
+        def get_clock(self) -> Clock:
+            return clock(datetime(2026, 11, 11, 8, 30, tzinfo=NEW_YORK), is_open=False)
+
+        def get_calendar(self, filters=None) -> list[Calendar]:
+            return [day("2026-11-10"), day("2026-11-11")]
+
+    def node(config, **kw):
+        built.update(kw)
+        raise RuntimeError("built")
+
+    monkeypatch.setattr(session_window, "window_node", node)
+    config = WindowConfig(session="extended", log_dir=tmp_path)
+    monkeypatch.setattr(
+        type(config),
+        "bar_type",
+        property(lambda self: BarType.from_str("SPY.ALPACA-5-MINUTE-LAST-INTERNAL")),
+    )
+    with pytest.raises(RuntimeError, match="built"):
+        session_window.run_window(config, trading=cast(Any, PreMarket()))
+    assert built["warm_up_start"] == datetime(2026, 11, 10, 13, 55, tzinfo=NEW_YORK)
+
+
+def test_the_calendar_read_reaches_back_a_week_for_the_prior_session() -> None:
+    asked = []
+
+    class Reads(Account):
+        def get_calendar(self, filters=None) -> list[Calendar]:
+            asked.append(filters)
+            return [CALENDAR]
+
+    session_window.session_now(cast(Any, Reads()))
+    assert (asked[0].start, asked[0].end) == (date(2026, 11, 3), date(2026, 11, 11))
+
+
+def test_a_pre_market_window_hands_the_warm_up_start_to_its_node(monkeypatch, tmp_path) -> None:
+    built = {}
+
+    class PreMarket(Account):
+        def get_clock(self) -> Clock:
+            return clock(datetime(2026, 11, 11, 8, 30, tzinfo=NEW_YORK), is_open=False)
+
+        def get_calendar(self, filters=None) -> list[Calendar]:
+            return [day("2026-11-10"), day("2026-11-11")]
+
+    def node(config, **kw):
+        built.update(kw)
+        raise RuntimeError("built")
+
+    monkeypatch.setattr(session_window, "window_node", node)
+    with pytest.raises(RuntimeError, match="built"):
+        session_window.run_window(
+            WindowConfig(session="extended", log_dir=tmp_path), trading=cast(Any, PreMarket())
+        )
+    assert built["feed"] == "sip"
+    assert built["warm_up_start"] == datetime(2026, 11, 10, 15, 35, tzinfo=NEW_YORK)
+
+
+def test_the_warm_up_start_reaches_the_strategy(tmp_path, extended) -> None:
+    at = datetime(2026, 11, 11, 14, 0, tzinfo=UTC)
+    start = datetime(2026, 11, 10, 15, 35, tzinfo=NEW_YORK)
+    node, s, _ = session_window.window_node(
+        WindowConfig(session="extended", log_dir=tmp_path),
+        wind_down_at=at,
+        log_name="w",
+        feed="iex",
+        warm_up_start=start,
+    )
+    try:
+        assert isinstance(s, SessionMaCross) and s.warm_up_start == start
+    finally:
+        node.dispose()
 
 
 def test_a_part_given_a_feed_again_runs_its_windows(monkeypatch) -> None:
@@ -987,10 +1161,12 @@ class FirstBar(SessionMaCross):
         super().on_bar(bar)
 
 
-def warm_up_run(tmp_path, *, warm_up: bool) -> FirstBar:
+def warm_up_run(
+    tmp_path, *, warm_up: bool, gap: int = 0, warm_up_start: datetime | None = None
+) -> FirstBar:
     """Thirty minutes of the adapter's EXTERNAL one-minute bars in a catalog, as `request_bars` would get
-    them, then twenty minutes of live trades every ten seconds, from which the data engine builds the
-    INTERNAL bars the window trades on."""
+    them, then, `gap` minutes after them, twenty minutes of live trades every ten seconds, from which the
+    data engine builds the INTERNAL bars the window trades on."""
     from nautilus_trader.config import DataCatalogConfig
     from nautilus_trader.model import AggressorSide
     from nautilus_trader.model import TradeId
@@ -1033,7 +1209,7 @@ def warm_up_run(tmp_path, *, warm_up: bool) -> FirstBar:
         fee_model=MakerTakerFeeModel(maker_rate=Decimal(0), taker_rate=Decimal(0)),
     )
     eng.add_instrument(instrument)
-    start = T0 + 30 * MINUTE
+    start = T0 + (30 + gap) * MINUTE
     eng.add_data(
         [
             TradeTick(
@@ -1055,6 +1231,7 @@ def warm_up_run(tmp_path, *, warm_up: bool) -> FirstBar:
             fast_period=3,
             slow_period=8,
             warm_up=warm_up,
+            warm_up_start=warm_up_start,
             strategy_id=StrategyId("SessionMaCross-001"),
             order_id_tag="001",
         )
@@ -1072,6 +1249,35 @@ def test_the_warm_up_initializes_the_averages_before_the_first_live_bar(tmp_path
     assert s.history_bars == 30  # the whole hour asked for, which the averages keep the end of
     assert s.history_dropped == 0
     assert s.live_bars > 0 and s.ready_at_first_bar is True
+
+
+def test_the_warm_up_reaches_back_to_its_start_across_a_gap_with_no_bars(tmp_path) -> None:
+    """A window whose own part of the session is too thin for the slow average (pre-market, ADR 0044)
+    warms up from `warm_up_start`, in the prior session: here bars that ended 15 hours before the live
+    trades, all of them served and fed; without it the request's hour finds none of them."""
+    at = datetime.fromtimestamp(T0 / 1e9, UTC)
+    (tmp_path / "start").mkdir()
+    (tmp_path / "hour").mkdir()
+    reached = warm_up_run(tmp_path / "start", warm_up=True, gap=900, warm_up_start=at)
+    assert reached.history_bars == 30 and reached.ready_at_first_bar is True
+    hour = warm_up_run(tmp_path / "hour", warm_up=True, gap=900)
+    assert hour.history_bars == 0 and hour.ready_at_first_bar is False
+
+
+def test_a_warm_up_start_without_the_warm_up_is_refused() -> None:
+    """Review finding: a start given with `warm_up=False` was stored and ignored, the averages starting
+    cold with nothing said."""
+    with pytest.raises(ValueError, match="warm_up_start needs warm_up"):
+        strategy(
+            bar_type=LIVE,
+            warm_up=False,
+            warm_up_start=datetime(2026, 11, 10, 15, 35, tzinfo=NEW_YORK),
+        )
+
+
+def test_the_warm_up_start_must_be_an_aware_datetime() -> None:
+    with pytest.raises(ValueError, match="warm_up_start must be an aware datetime"):
+        strategy(bar_type=LIVE, warm_up=True, warm_up_start=datetime(2026, 11, 10, 15, 35))
 
 
 def test_without_the_warm_up_the_first_live_bar_finds_the_averages_cold(tmp_path) -> None:
@@ -1133,8 +1339,8 @@ def test_the_warm_up_needs_time_bars() -> None:
     [
         (datetime(2026, 11, 10, 11, 0), True, False, "regular"),
         (datetime(2026, 11, 10, 17, 0), False, False, None),
-        (datetime(2026, 11, 10, 5, 0), False, True, None),  # pre-market: no feed
-        (datetime(2026, 11, 10, 17, 0), False, True, None),  # after-hours: no feed
+        (datetime(2026, 11, 10, 5, 0), False, True, "extended"),  # pre-market, on sip
+        (datetime(2026, 11, 10, 17, 0), False, True, "extended"),  # after-hours, on sip
         (datetime(2026, 11, 10, 21, 0), False, True, None),  # overnight is not run
     ],
 )
@@ -1259,6 +1465,7 @@ def quiet_window(
     log=(),
     account=None,
     strategy="SessionMaCross",
+    session="regular",
 ):
     """A window of `strategy` whose node runs at once, its strategy having seen `quotes`, `trades` and
     `live_bars`, and its node log holding the lines `log`; returns the report or the error, and the
@@ -1291,7 +1498,9 @@ def quiet_window(
     monkeypatch.setattr(session_window, "_run_node", lambda node, ends: None)
     monkeypatch.setattr(session_window, "_flatten_after_stop", lambda *a, **k: [])
     try:
-        outcome: Any = session_window.run_window(WindowConfig(log_dir=tmp_path, strategy=strategy))
+        outcome: Any = session_window.run_window(
+            WindowConfig(log_dir=tmp_path, strategy=strategy, session=session)
+        )
     except RuntimeError as e:
         outcome = e
     return outcome, json.loads((tmp_path / "latest.json").read_text()), seen
@@ -1320,6 +1529,52 @@ def test_a_window_whose_stream_delivered_nothing_is_failed(monkeypatch, tmp_path
     assert isinstance(error, RuntimeError) and "without market data" in str(error)
     assert latest["result"].startswith("failed: no market data: the iex stream delivered no quote")
     assert latest["stream"] == [never[0]]
+
+
+class PreMarketAccount(Account):
+    """The stand-in at 08:30 New York on a Wednesday, in pre-market, with Tuesday on the calendar."""
+
+    def get_clock(self) -> Clock:
+        return clock(datetime(2026, 11, 11, 8, 30, tzinfo=NEW_YORK), is_open=False)
+
+    def get_calendar(self, filters=None) -> list[Calendar]:
+        return [day("2026-11-10"), day("2026-11-11")]
+
+
+@pytest.mark.parametrize(
+    ("quotes", "log", "said"),
+    [
+        (
+            0,
+            [
+                (
+                    "2026-11-11T13:30:01.000000000Z [ERROR] CANON-PAPER-SESSION.AlpacaDataClient: "
+                    "Alpaca stream on feed sip: auth failed"
+                )
+            ],
+            "failed: the sip data stream reported an error: ",
+        ),
+        (0, [], "failed: no market data: the sip stream delivered no quote"),
+    ],
+)
+def test_a_refused_or_empty_sip_fails_the_pre_market_window_by_name(
+    monkeypatch, tmp_path, quotes, log, said
+) -> None:
+    """The lead decided on 2026-11-11 that a session's feed is one setting in `SESSION_FEEDS`: a sip that
+    Alpaca refuses, or that delivers nothing, fails the window naming sip and Alpaca's own text, and the
+    window streams no other feed."""
+    error, latest, seen = quiet_window(
+        monkeypatch,
+        tmp_path,
+        quotes=quotes,
+        trades=0,
+        log=log,
+        account=PreMarketAccount(),
+        session="extended",
+    )
+    assert isinstance(error, RuntimeError)
+    assert latest["result"].startswith(said) and all(line in latest["result"] for line in log[:1])
+    assert (latest["part"], latest["feed"], seen["feed"]) == ("pre-market", "sip", "sip")
 
 
 def test_a_window_whose_stream_ended_by_itself_is_failed_though_data_came(monkeypatch, tmp_path):

@@ -197,8 +197,9 @@ Each is stated where it is implemented, with its source.
   client and gets the first one's feed, unrefused.
   It never tries another feed. On paper on 2026-11-10 `boats` streamed overnight quotes, trades and bars
   and `iex` nothing after 16:00, and the pair also authenticated on `sip`; a Paper Only account is
-  documented as entitled to IEX alone, so none of this is an entitlement (ADR 0055). No feed delivered
-  in pre-market or after-hours on paper.
+  documented as entitled to IEX alone, so none of this is an entitlement (ADR 0055). In pre-market
+  `iex` and `boats` delivered nothing before 05:00 on 2026-11-11; the sip feed authenticated on paper on
+  2026-11-10, and authenticated and delivered on 2026-11-11, from 08:23 in that pre-market (ADR 0055).
 * **Timestamps** lose sub-microsecond precision: alpaca-py parses them into `datetime`.
 * **No restart:** if alpaca-py's stream ends by itself, the client logs an error and does not restart it;
   a later subscription fails with an error saying so, until the client is reconnected. The end counts
