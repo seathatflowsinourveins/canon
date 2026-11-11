@@ -68,9 +68,24 @@ cat > "$B/launchctl" <<'EOF'
 echo "launchctl $*" >> "$STUB/launchctl.log"
 case "${1:-}" in
   # one label's own answer first ($STUB/launchctl-print-<label>), else the shared one
-  print) f="$STUB/launchctl-print-${2##*/}"; [ -f "$f" ] || f="$STUB/launchctl-print"
+  print) l=${2##*/}
+         if [ -f "$STUB/stopping-$l" ]; then
+           n=$(cat "$STUB/stopping-$l"); if [ "$n" -gt 0 ]; then echo $((n - 1)) > "$STUB/stopping-$l"
+           else rm -f "$STUB/stopping-$l" "$STUB/launchctl-print-$l"; exit 113; fi
+         fi
+         f="$STUB/launchctl-print-$l"; [ -f "$f" ] || f="$STUB/launchctl-print"
          [ -f "$f" ] || exit 113; cat "$f" ;;
-  bootout) [ -f "$STUB/bootout-fails" ] && exit 5; rm -f "$STUB/launchctl-print" "$STUB/launchctl-print-${2##*/}" ;;
+  # with $STUB/slow-bootout holding N, a bootout returns at once and print still finds the label N more
+  # times, as launchd does while a running job stops (observed: state = SIGTERMed, then gone)
+  bootout) [ -f "$STUB/bootout-fails" ] && { echo "Boot-out failed: 5: Input/output error" >&2; exit 5; }
+           if [ -f "$STUB/slow-bootout" ] && [ -f "$STUB/launchctl-print-${2##*/}" ]; then
+             cp "$STUB/slow-bootout" "$STUB/stopping-${2##*/}"; printf '\tstate = SIGTERMed\n' > "$STUB/launchctl-print-${2##*/}"
+           else rm -f "$STUB/launchctl-print" "$STUB/launchctl-print-${2##*/}"; fi ;;
+  # bootstrap <domain> <plist>: refused (5, as launchd) while print still finds the label or when
+  # $STUB/bootstrap-fails exists; else the label is loaded and running
+  bootstrap) l=$(basename "${3:-}" .plist)
+             if [ -f "$STUB/launchctl-print-$l" ] || [ -f "$STUB/bootstrap-fails" ]; then echo "Bootstrap failed: 5: Input/output error" >&2; exit 5; fi
+             [ ! -f "$STUB/track-bootstrap" ] || printf '\tstate = running\n' > "$STUB/launchctl-print-$l" ;;
   # the job table, as launchctl(1) documents its columns: PID, last exit status (a negative one is the signal
   # that stopped the job), label
   list) [ -f "$STUB/launchctl-list" ] && cat "$STUB/launchctl-list" ;;
@@ -580,6 +595,35 @@ if command -v plutil >/dev/null 2>&1; then
   chmod +x "$STUB/otelcol"
   check "agent environment points the watchdog at the installed directory" \
         eval '[ "$pe" = "$AH" ] && jqt "$AH/canon/watch/lanes-status.json" "has(\"checked_at\")"'
+  # an install over agents that are running: launchd's bootout returns while each job still stops, and a
+  # bootstrap of the same label before it has gone is refused (observed with a throwaway label)
+  linst() { CLAUDE_CONFIG_DIR="$AH" CANON_LAUNCHAGENTS_DIR="$TMP/agents" CANON_UNLOAD_SECS="$1" "$R/scripts/automation" install > "$TMP/install.out" 2>&1; }
+  mv "$STUB/launchctl-print" "$STUB/kept-print"; : > "$STUB/track-bootstrap"; echo 4 > "$STUB/slow-bootout"
+  for l in local.canon.lanes-watch local.canon.paper-session local.canon.otel-collector; do printf '\tstate = running\n' > "$STUB/launchctl-print-$l"; done
+  : > "$STUB/launchctl.log"; linst 5; rc=$?
+  check "an install over running agents waits for each to stop, then loads it: exit 0, all three loaded" \
+        eval '[ "$rc" = 0 ] && [ "$(grep -c "^  loaded     local.canon" "$TMP/install.out")" = 3 ] && ! grep -q "Bootstrap failed" "$TMP/install.out" && grep -q "state = running" "$STUB/launchctl-print-local.canon.otel-collector"'
+  # only the collector loaded now, and it does not stop in time
+  echo 100 > "$STUB/slow-bootout"; rm -f "$STUB/stopping-"* "$STUB/launchctl-print-local.canon."*; printf '\tstate = running\n' > "$OTL"
+  : > "$STUB/launchctl.log"; linst 1; rc=$?
+  check "... one that does not stop in time: exit 1, nothing new loaded for it, said after the status table" \
+        eval '[ "$rc" != 0 ] && grep -q "the earlier local.canon.otel-collector was still stopping after 1 s" "$TMP/install.out" && ! grep -q "bootstrap .*otel-collector.plist" "$STUB/launchctl.log" && grep -q "still stopping" <<<"$(tail -n 3 "$TMP/install.out")" && grep -q "^install: FAILED (exit 1):" "$TMP/install.out"'
+  check "... the other two loaded meanwhile"         test "$(grep -c "^  loaded     local.canon" "$TMP/install.out")" = 2
+  # the paper agent alone does not stop: said once, and nothing booted over it after the checkout
+  rm -f "$STUB/stopping-"* "$STUB/launchctl-print-local.canon."*; printf '\tstate = running\n' > "$STUB/launchctl-print-local.canon.paper-session"
+  : > "$STUB/launchctl.log"; linst 1; rc=$?
+  check "... the paper agent that does not stop: said once, not booted over" \
+        eval '[ "$rc" != 0 ] && [ "$(grep -c "earlier local.canon.paper-session was still stopping" "$TMP/install.out")" = 2 ] && ! grep -q "bootstrap .*paper-session.plist" "$STUB/launchctl.log"'
+  # a bootout launchd refuses outright: said at once, with launchd's message, not after the whole wait
+  rm -f "$STUB/slow-bootout" "$STUB/stopping-"* "$STUB/launchctl-print-local.canon."*; printf '\tstate = running\n' > "$OTL"; : > "$STUB/bootout-fails"
+  s0=$(date +%s); linst 30; rc=$?; took=$(( $(date +%s) - s0 )); rm -f "$STUB/bootout-fails"
+  check "... a bootout launchd refuses: exit 1 at once (${took} s), with launchd's message" \
+        eval '[ "$rc" != 0 ] && [ "$took" -lt 20 ] && grep -q "launchctl bootout refused local.canon.otel-collector: Boot-out failed: 5" "$TMP/install.out"'
+  rm -f "$STUB/launchctl-print-local.canon."*; : > "$STUB/bootstrap-fails"; linst 1; rc=$?
+  check "... a bootstrap launchd refuses: exit 1, saying nothing is loaded and what to run" \
+        eval '[ "$rc" != 0 ] && grep -q "launchctl bootstrap refused local.canon.otel-collector; nothing is loaded for it now; run: scripts/automation install" "$TMP/install.out"'
+  rm -f "$STUB/bootstrap-fails" "$STUB/track-bootstrap" "$STUB/launchctl-print-local.canon."*; mv "$STUB/kept-print" "$STUB/launchctl-print"
+  printf '\tstate = running\n' > "$OTL"
   git -C "$R" remote set-url origin "https://someone:s3cr3t-t0ken@example.com/example/repo.git"; inst; rc=$?
   check "an origin URL carrying credentials is refused at install: exit 1, no paper plist, the secret never printed" \
         eval '[ "$rc" != 0 ] && [ ! -e "$PP" ] && grep -q "carries credentials" "$TMP/install.out" && ! grep -q "s3cr3t" "$TMP/install.out"'
@@ -781,18 +825,19 @@ check "a checkout path that is a link is refused: exit 1, what it points at unto
 fi
 
 UH="$TMP/un-home"; UA="$TMP/un-agents"
-uninst() { CLAUDE_CONFIG_DIR="$UH" CANON_LAUNCHAGENTS_DIR="$UA" "$R/scripts/automation" uninstall > "$TMP/uninstall.out" 2>&1; }
+uninst() { CLAUDE_CONFIG_DIR="$UH" CANON_LAUNCHAGENTS_DIR="$UA" CANON_UNLOAD_SECS=1 "$R/scripts/automation" uninstall > "$TMP/uninstall.out" 2>&1; }
 mkdir -p "$UH/canon/otel" "$UA"; : > "$UH/canon/lanes"; : > "$UH/canon/lanes-watch.sh"; : > "$UA/local.canon.lanes-watch.plist"
 : > "$UA/local.canon.otel-collector.plist"; : > "$UH/canon/otel/config.yaml"; : > "$UH/canon/otel/logs.jsonl"
 : > "$UA/local.canon.paper-session.plist"; : > "$UH/canon/paper-session.sh"
 if [ -x /usr/bin/lockf ] && [ -x /usr/bin/timeout ]; then fire --checkout-only "$B/mise" "$UH/canon/paper-checkout" "$OURL"
 else git clone -q "$OURL" "$UH/canon/paper-checkout" && git -C "$UH/canon/paper-checkout" config canon.paperCheckout true; fi
-printf '\tstate = not running\n' > "$STUB/launchctl-print"; rm -f "$STUB/bootout-fails"; : > "$STUB/mise.log"
+printf '\tstate = not running\n' > "$STUB/launchctl-print"; rm -f "$STUB/bootout-fails"; : > "$STUB/mise.log"; : > "$STUB/launchctl.log"
 uninst; rc=$?
 check "uninstall removes everything: exit 0"      eval '[ "$rc" = 0 ] && [ ! -e "$UH/canon/lanes" ] && [ ! -e "$UA/local.canon.lanes-watch.plist" ] && [ ! -e "$UA/local.canon.paper-session.plist" ]'
 check "... the collector agent and its config, keeping the events it wrote" \
       eval '[ ! -e "$UA/local.canon.otel-collector.plist" ] && [ ! -e "$UH/canon/otel/config.yaml" ] && [ -e "$UH/canon/otel/logs.jsonl" ]'
 check "... and unloads the collector"             grep -q "bootout gui/[0-9]*/local.canon.otel-collector" "$STUB/launchctl.log"
+check "... boots out each of the three agents"   test "$(grep -cE "^launchctl bootout gui/[0-9]+/local.canon.(lanes-watch|paper-session|otel-collector)\$" "$STUB/launchctl.log")" = 3
 check "... the paper runner, its clone, and the trust mise gave the clone's mise.toml" \
       eval '[ ! -e "$UH/canon/paper-session.sh" ] && [ ! -e "$UH/canon/paper-checkout" ] && grep -qF "mise trust --untrust $UH/canon/paper-checkout/mise.toml" "$STUB/mise.log"'
 mkdir -p "$UH/canon/paper-checkout"; echo mine > "$UH/canon/paper-checkout/file"; : > "$STUB/mise.log"

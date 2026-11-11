@@ -126,6 +126,11 @@ A second `/code-review` (high) found five more, each fixed with a case: a checko
 by two renames, so no stop leaves an unmarked one; DIED read from a runner failure that took no lock (only a
 run that held it counts); an install's origin unchecked while a window held the clone (`git ls-remote`).
 Ctrl-C from a terminal: as above.
+An install over a running collector left it unloaded (2026-11-10): `launchctl bootout` returns while a running
+job still stops, and the bootstrap that follows is refused with 5 (reproduced with a throwaway label whose job
+takes 4 s to exit on SIGTERM). Install and uninstall now wait, at most 30 s, until `launchctl print` no longer
+finds each of the three labels, say plainly when nothing is loaded, and repeat every failure after the status
+table; `scripts/test-lanes` shows each with a stand-in launchctl that stops as slowly.
 
 ## Evidence
 

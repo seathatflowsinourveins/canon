@@ -23,7 +23,8 @@
 # `status` exits non-zero when any row is not ok, including rows it could not check (UNKNOWN).
 #
 # Overrides: CLAUDE_CONFIG_DIR replaces ~/.claude; CANON_LAUNCHAGENTS_DIR replaces ~/Library/LaunchAgents
-# and CANON_PAPER_SESSION_DIR the session windows' record folder (tests only); AUTOMATION_SKIP_LAUNCHD=1 is a rehearsal of `install` that does every step except the
+# and CANON_PAPER_SESSION_DIR the session windows' record folder, CANON_UNLOAD_SECS the wait for a job to
+# leave launchd (default 30) (tests only); AUTOMATION_SKIP_LAUNCHD=1 is a rehearsal of `install` that does every step except the
 # launchctl calls. mise is the one on PATH, else ~/.local/bin/mise; its absolute path goes into the git
 # credential helper.
 set -uo pipefail
@@ -65,7 +66,53 @@ OTEL_DIR="$CANON_HOME/otel"                           # config.yaml and the logs
 # shellcheck disable=SC2016  # jq program, not shell
 PAPER_COMMIT='def short: (. // "not recorded") as $c | if ($c | test("^[0-9a-f]{40}")) then $c[0:12] + $c[40:] else $c end; '
 
-note() { printf '%s\n' "$*"; }
+# note: prints a line; one that reports a failure (FAILED: or SKIPPED:) is kept in FAILS too, so install can
+# repeat it after the status table, where the owner's eye ends
+FAILS=""
+note() { printf '%s\n' "$*"; case "$*" in *FAILED:*|*SKIPPED:*) FAILS="$FAILS"$'\n'"$*" ;; esac; }
+
+# unload <label>: `launchctl bootout`, then wait, at most UNLOAD_SECS of elapsed time, until `launchctl print`
+# no longer finds the label. bootout returns while a running job is still stopping, and a bootstrap of the
+# same label then fails with 5, Input/output error (observed on this Mac with a throwaway label whose job
+# takes 4 s to exit on SIGTERM); the kept-alive collector is such a job. Returns 0 when the label is gone; 2,
+# with launchctl's message in UNLOAD_ERR, when bootout was refused for a label print still finds; 1 when the
+# label is still loaded once the wait is over. UNLOAD_ABSENT=1 says there was nothing to unload.
+UNLOAD_SECS=${CANON_UNLOAD_SECS:-30}
+case "$UNLOAD_SECS" in ''|*[!0-9]*) UNLOAD_SECS=30 ;; esac
+UNLOAD_ERR="" UNLOAD_ABSENT=0
+unload() {
+  local end=$((SECONDS + UNLOAD_SECS))
+  UNLOAD_ABSENT=0
+  if ! UNLOAD_ERR=$(launchctl bootout "$DOMAIN/$1" 2>&1); then
+    if ! launchctl print "$DOMAIN/$1" >/dev/null 2>&1; then UNLOAD_ABSENT=1; return 0; fi   # it was not loaded
+    UNLOAD_ERR=${UNLOAD_ERR//$'\n'/; }; return 2
+  fi
+  while launchctl print "$DOMAIN/$1" >/dev/null 2>&1; do
+    [ "$SECONDS" -lt "$end" ] || return 1
+    sleep 0.5
+  done
+}
+# unload_note <label> <rc of unload>: the line a failed unload gets
+unload_note() {
+  if [ "$2" = 2 ]; then note "  FAILED: launchctl bootout refused $1: ${UNLOAD_ERR:-no message}; run: scripts/automation install"
+  else note "  FAILED: the earlier $1 was still stopping after ${UNLOAD_SECS} s, so the new one was not loaded; run: scripts/automation install"; fi
+}
+# boot <label> <plist> <what loaded says>: bootstrap the plist; on a refusal it says plainly what launchd has
+# loaded for the label now, and what to run
+boot() {
+  if launchctl bootstrap "$DOMAIN" "$2"; then note "  loaded     $1 $3"; return 0; fi
+  if launchctl print "$DOMAIN/$1" >/dev/null 2>&1; then
+    note "  FAILED: launchctl bootstrap refused $1; launchd still has a job loaded for it, not this install's; run: scripts/automation install"
+  else note "  FAILED: launchctl bootstrap refused $1; nothing is loaded for it now; run: scripts/automation install"; fi
+  return 1
+}
+# load <label> <plist> <what loaded says>: unload any earlier job of the label, then boot the plist
+load() {
+  local rc
+  unload "$1"; rc=$?
+  if [ "$rc" != 0 ]; then unload_note "$1" "$rc"; return 1; fi
+  boot "$1" "$2" "$3"
+}
 row() { printf '  %-18s %-9s %s\n' "$1" "$2" "$3"; }
 # check_row <name> <label> <text>: prints the row and counts any label but ok as unhealthy
 check_row() { row "$1" "$2" "$3"; [ "$2" = ok ] || bad=1; }
@@ -262,12 +309,7 @@ install_otel() {
   fi
   note "  wrote      $OTEL_PLIST ($bin)"
   if [ "${AUTOMATION_SKIP_LAUNCHD:-0}" = "1" ]; then note "  not loaded (AUTOMATION_SKIP_LAUNCHD=1)"; return 0; fi
-  launchctl bootout "$DOMAIN/$OTEL_LABEL" >/dev/null 2>&1   # replace a previous load, if any
-  if launchctl bootstrap "$DOMAIN" "$OTEL_PLIST"; then
-    note "  loaded     $OTEL_LABEL (kept running; OTLP on 127.0.0.1:4317 and :4318, writing $OTEL_DIR/logs.jsonl)"
-  else
-    note "  FAILED: launchctl bootstrap refused the agent"; return 1
-  fi
+  load "$OTEL_LABEL" "$OTEL_PLIST" "(kept running; OTLP on 127.0.0.1:4317 and :4318, writing $OTEL_DIR/logs.jsonl)"
 }
 
 do_install() {
@@ -293,12 +335,7 @@ do_install() {
   if [ "${AUTOMATION_SKIP_LAUNCHD:-0}" = "1" ]; then      # rehearsal: every step except the launchctl calls
     note "  not loaded (AUTOMATION_SKIP_LAUNCHD=1)"
   else
-    launchctl bootout "$DOMAIN/$LABEL" >/dev/null 2>&1    # replace a previous load, if any
-    if launchctl bootstrap "$DOMAIN" "$PLIST"; then
-      note "  loaded     $LABEL (every $((INTERVAL / 60)) minutes; first run now)"
-    else
-      note "  FAILED: launchctl bootstrap refused the agent"; ok=1
-    fi
+    load "$LABEL" "$PLIST" "(every $((INTERVAL / 60)) minutes; first run now)" || ok=1
   fi
   note "Paper session:"
   local paper_mise paper_url out
@@ -311,7 +348,11 @@ do_install() {
   else
     note "  installed  $CANON_HOME/paper-session.sh"
     # unload the old job first, so no firing runs in the clone while install moves it to origin's main
-    [ "${AUTOMATION_SKIP_LAUNCHD:-0}" = "1" ] || launchctl bootout "$DOMAIN/$PAPER_LABEL" >/dev/null 2>&1
+    local paper_unloaded=0
+    if [ "${AUTOMATION_SKIP_LAUNCHD:-0}" != "1" ]; then
+      unload "$PAPER_LABEL"; paper_unloaded=$?
+      [ "$paper_unloaded" = 0 ] || { unload_note "$PAPER_LABEL" "$paper_unloaded"; ok=1; }
+    fi
     if ! out=$(/bin/bash "$CANON_HOME/paper-session.sh" --checkout-only "$paper_mise" "$PAPER_CHECKOUT" "$paper_url" 2>&1); then
       # no plist left behind for launchd to load at the next login, the old main-checkout one included
       rm -f "$PAPER_PLIST"
@@ -324,10 +365,11 @@ do_install() {
         note "  wrote      $PAPER_PLIST"
         if [ "${AUTOMATION_SKIP_LAUNCHD:-0}" = "1" ]; then
           note "  not loaded (AUTOMATION_SKIP_LAUNCHD=1)"
-        elif launchctl bootstrap "$DOMAIN" "$PAPER_PLIST"; then
-          note "  loaded     $PAPER_LABEL (every $((PAPER_INTERVAL / 60)) minutes; a window only when a session is open)"
         else
-          note "  FAILED: launchctl bootstrap refused the agent"; ok=1
+          # unloaded above, before the checkout; one that would not unload is not booted over
+          if [ "$paper_unloaded" = 0 ]; then
+            boot "$PAPER_LABEL" "$PAPER_PLIST" "(every $((PAPER_INTERVAL / 60)) minutes; a window only when a session is open)" || ok=1
+          fi
         fi
       fi
     fi
@@ -356,15 +398,17 @@ do_install() {
 # do_uninstall: returns 1, naming what is left, when any removal fails
 do_uninstall() {
   local left="" f
-  if launchctl bootout "$DOMAIN/$LABEL" >/dev/null 2>&1; then note "  unloaded   $LABEL"; else note "  $LABEL was not loaded"; fi
-  if launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then note "  FAILED: $LABEL is still loaded"; left="$left
-  launchd job $LABEL"; fi
-  if launchctl bootout "$DOMAIN/$PAPER_LABEL" >/dev/null 2>&1; then note "  unloaded   $PAPER_LABEL"; else note "  $PAPER_LABEL was not loaded"; fi
-  if launchctl print "$DOMAIN/$PAPER_LABEL" >/dev/null 2>&1; then note "  FAILED: $PAPER_LABEL is still loaded"; left="$left
-  launchd job $PAPER_LABEL"; fi
-  if launchctl bootout "$DOMAIN/$OTEL_LABEL" >/dev/null 2>&1; then note "  unloaded   $OTEL_LABEL"; else note "  $OTEL_LABEL was not loaded"; fi
-  if launchctl print "$DOMAIN/$OTEL_LABEL" >/dev/null 2>&1; then note "  FAILED: $OTEL_LABEL is still loaded"; left="$left
-  launchd job $OTEL_LABEL"; fi
+  local l rc
+  for l in "$LABEL" "$PAPER_LABEL" "$OTEL_LABEL"; do
+    unload "$l"; rc=$?
+    case "$rc" in
+      0) if [ "$UNLOAD_ABSENT" = 1 ]; then note "  $l was not loaded"; else note "  unloaded   $l"; fi ;;
+      2) note "  FAILED: launchctl bootout refused $l: ${UNLOAD_ERR:-no message}"; left="$left
+  launchd job $l" ;;
+      *) note "  FAILED: $l is still loaded after ${UNLOAD_SECS} s"; left="$left
+  launchd job $l" ;;
+    esac
+  done
   for f in "$PLIST" "$PAPER_PLIST" "$OTEL_PLIST" "$CANON_HOME/lanes" "$CANON_HOME/lanes-watch.sh" "$CANON_HOME/paper-session.sh" \
            "$OTEL_DIR/config.yaml"; do
     [ -e "$f" ] || continue
@@ -645,7 +689,10 @@ do_status() {
 
 case "${1:-}" in
   status)    do_status ;;
-  install)   do_install; rc=$?; echo; do_status; exit "$rc" ;;
+  # the failures again after the status table, the last lines the owner sees, and the exit code with them
+  install)   do_install; rc=$?; echo; do_status
+             if [ "$rc" != 0 ]; then printf '\ninstall: FAILED (exit %s):%s\n' "$rc" "$FAILS"; fi
+             exit "$rc" ;;
   uninstall) do_uninstall ;;
   *) note "usage: scripts/automation status | install | uninstall"; exit 2 ;;
 esac
