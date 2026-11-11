@@ -10,13 +10,13 @@ review-by: 2026-12-10
 ## Context and Problem Statement
 
 ADR 0008 and ADR 0022 held Claude Code on the `stable` channel, about a week behind, and ADR 0045 turned
-Antigravity's self-updater off so it stayed at its pin. The owner's instruction of 2026-11-10: "it is
-important for our practice be auto default into sota as llm native, such as env set, cli update etc".
+Antigravity's self-updater off so it stayed at its pin. The owner's requirement of 2026-11-10: the practice automatically defaults to the state of the art
+and is LLM-native, through environment settings, CLI updates and the like.
 Which runtimes update themselves, through which setting, and what does a registry pin then mean?
 
 ## Decision Drivers
 
-* The owner's instruction above.
+* The owner's requirement above.
 * A claim that a tool "follows the newest by itself" must be true of the sessions that actually run here.
 * The vendor's documented update setting before a script of this repository's own.
 
