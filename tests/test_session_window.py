@@ -2450,6 +2450,91 @@ def test_an_abandoned_stop_ends_the_process_whatever_error_reaches_main(monkeypa
     assert exits == [1]
 
 
+def test_a_window_ends_at_its_wall_clock_end_after_the_clock_jumps(monkeypatch) -> None:
+    """The lead's record of 2026-11-11: a window's end is a wall-clock time fixed at its start, read again
+    on every tick, so a sleep that stops the loop's monotonic clock cannot carry the window past its part.
+    The wall clock here jumps an hour after the first reading; the window must end at the next tick, not
+    after the 30 minutes a timeout taken once would still wait."""
+    import asyncio
+
+    class Jumping(datetime):
+        readings = 0
+
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[override]
+            Jumping.readings += 1
+            real = datetime.now(tz)
+            return real if Jumping.readings == 1 else real + timedelta(hours=1)
+
+    class Node:
+        stops = 0
+
+        def __init__(self) -> None:
+            self.stopped = asyncio.Event()
+
+        def handle(self):
+            return self
+
+        def stop(self) -> None:
+            Node.stops += 1
+            self.stopped.set()
+
+        async def run_async(self) -> None:
+            await self.stopped.wait()
+
+    ends = datetime.now(UTC) + timedelta(minutes=30)
+    monkeypatch.setattr(session_window, "datetime", Jumping)
+    monkeypatch.setattr(session_window, "END_TICK_SECS", 0.05)
+
+    async def run() -> object:
+        node = Node()
+        return await asyncio.wait_for(session_window._run_until(cast(Any, node), ends, []), 5)
+
+    began = time.monotonic()
+    assert asyncio.run(run()) is None
+    assert Node.stops == 1
+    assert time.monotonic() - began < 0.5  # the next tick, not the half hour
+
+
+def test_a_window_ends_at_its_planned_length_after_the_wall_clock_steps_back(monkeypatch) -> None:
+    """Code review, 2026-11-11: the window also ends by the monotonic clock, so a wall clock stepped back an
+    hour (NTP, or by hand) cannot carry it past its planned length."""
+    import asyncio
+
+    class Back(datetime):
+        readings = 0
+
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[override]
+            Back.readings += 1
+            real = datetime.now(tz)
+            return real if Back.readings == 1 else real - timedelta(hours=1)
+
+    class Node:
+        def __init__(self) -> None:
+            self.stopped = asyncio.Event()
+
+        def handle(self):
+            return self
+
+        def stop(self) -> None:
+            self.stopped.set()
+
+        async def run_async(self) -> None:
+            await self.stopped.wait()
+
+    ends = datetime.now(UTC) + timedelta(seconds=0.2)
+    monkeypatch.setattr(session_window, "datetime", Back)
+    monkeypatch.setattr(session_window, "END_TICK_SECS", 0.05)
+
+    async def run() -> object:
+        return await asyncio.wait_for(session_window._run_until(cast(Any, Node()), ends, []), 5)
+
+    began = time.monotonic()
+    assert asyncio.run(run()) is None
+    assert time.monotonic() - began < 1.0
+
+
 INTERRUPTED = """
 import asyncio, signal, threading, time
 from datetime import UTC, datetime

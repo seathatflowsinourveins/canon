@@ -331,6 +331,8 @@ GAP_SECS = 300
 FLATTEN_SECS = 120
 """`SessionMaCross` winds down this long before the window ends. A built-in has no wind-down: `EmaCross`
 trades until the stop, and an order it sent then is the account check's to settle (ADR 0060)."""
+END_TICK_SECS = 1.0
+"""How often the node's run reads the wall clock against the window's end (`_run_until`)."""
 STRATEGY_ID = StrategyId("SessionMaCross-001")
 
 
@@ -2427,7 +2429,16 @@ async def _run_until(node: LiveNode, ends: datetime, started: list) -> asyncio.T
     task = asyncio.ensure_future(node.run_async())
     started.append(task)
     try:
-        await asyncio.wait({task}, timeout=max(0.0, (ends - datetime.now(UTC)).total_seconds()))
+        # `ends` is a wall-clock time: read again every `END_TICK_SECS`, since the loop's own clock is
+        # monotonic and stopped while the machine slept, which carried a window past its part (2026-11-11)
+        # ... and also by the monotonic clock, so a wall clock stepped back cannot lengthen it (code review)
+        bound = time.monotonic() + max(0.0, (ends - datetime.now(UTC)).total_seconds())
+        await asyncio.sleep(0)  # the node's task takes one step before any stop (code review)
+        while not task.done():
+            left = min((ends - datetime.now(UTC)).total_seconds(), bound - time.monotonic())
+            if left <= 0:
+                break
+            await asyncio.wait({task}, timeout=min(left, END_TICK_SECS))
     finally:
         if not task.done():
             node.handle().stop()
