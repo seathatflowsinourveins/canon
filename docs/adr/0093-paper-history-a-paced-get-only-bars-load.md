@@ -13,7 +13,8 @@ The movers work needs minute and day bars for a few thousand symbols. The baseli
 the eligible universe. `canon_trading.bars_to_catalog.load_bars` loads one bar type of one symbol per
 call. Each call builds a node, and the node's instrument provider sends one trading-API GET
 (`/v2/assets/{symbol}`) beside the data GETs. Over a whole market that would spend the account's
-trading budget, 200 a minute per account (ADR 0069), on asset reads. It would also take a node build per
+trading budget, 200 a minute per account (ADR 0069, which marks that figure UNVERIFIED for paper), on asset
+reads. It would also take a node build per
 symbol. A load of that size needs a pace that is written down, and a stop at Alpaca's first 429.
 
 ## Decision Drivers
@@ -53,7 +54,7 @@ repository (UNVERIFIED here).
    alpaca-py follows `next_page_token` through every page of 10,000 rows.
 2. **Window and parsing.** Both are the adapter's: `alpaca_bars_window`, `parse_bar` and `bar_timeframe`.
    A bar written here is the bar `load_bars` writes. `ts_init` is the bar's close, and `[start, end]`
-   bounds it. As the engine does, this path filters parsed bars to the inclusive missing interval
+   bounds it. As the engine is said to (UNVERIFIED: no line of the pinned source is cited), this path filters parsed bars to the inclusive missing interval
    before writing; the catalog file's bounds alone do not filter its contents. `bar_roundings` names
    price rounding with one line per symbol and response, giving the rounded-bar count, price precision,
    half-to-even rule and first example. An end less than one bar interval, or 15 minutes, before now is
@@ -114,8 +115,8 @@ repository (UNVERIFIED here).
    setting, and a `retry_attempts` of 0 keeps the default. So a requests response hook on the client's
    session raises at Alpaca's first 429, before alpaca-py sends the request again, and the run stops by
    name (exit 4). A 504 is still retried three times, unpaced, as alpaca-py does it, and each retry is
-   counted. This is the way the adapter's execution client ends an order command at its first
-   error. The counter's 429 count is checked after each request as well.
+   counted. The adapter's execution client is the precedent: it ends an order command at its first
+   error (`execution.py`, `end_at_first_error`), as an `APIError` on any error rather than a 429 alone. The counter's 429 count is checked after each request as well.
 7. **Failures.** A refused request, a 403 on `sip` included, stops the run by name, with the HTTP
    status. Nothing falls back to another feed. Whatever an earlier request wrote stays, and a rerun asks
    only for what is missing. Client setup errors (missing credentials, timeout or GET-only session
@@ -133,8 +134,10 @@ repository (UNVERIFIED here).
 
 * Good:
   * A whole-market load spends no trading budget.
-  * Each request carries up to 200 symbols, so the baseline (five sessions of minute bars for a few
-    thousand symbols) is tens of requests plus their pages, not thousands of node builds.
+  * Each request carries up to 200 symbols, but the row bound counts every wall-clock minute of the
+    window, so the baseline (five sessions of minute bars for a few thousand symbols, about seven
+    calendar days) batches about 9 symbols a request: hundreds of requests plus their pages, still not
+    thousands of node builds. Counting only session minutes would batch several times better; not done.
 * Good: what the root already holds is not fetched again, and a stop leaves what was written.
 * Bad: a second writer of bars beside `load_bars`. Both use the adapter's window and parsing, and the
   tests check that the bars and the coverage match.
@@ -148,6 +151,13 @@ repository (UNVERIFIED here).
   * The most symbols Alpaca accepts in one request is not stated (UNVERIFIED).
 * Bad: alpaca-py's pydantic model is built for every bar. The movers lane proposed `raw_data=True`,
   which would need a parser of its own. That is left until a measured load shows the cost.
+
+* Bad, recorded limits (code review, 2026-11-11): the load takes no account lock, so on account B it
+  shares the data budget with a scheduled window, and a long load can push the account past it; run it
+  on B only while the schedule is off or on A between paper tests. It holds none of the locks the
+  maintenance agent waits on, so a round can fast-forward the checkout under a running load. Its
+  deadline is `timeout -s KILL`, so a kill during a write is not given a grace period, and whether the
+  catalog's write is atomic is UNVERIFIED.
 
 ### Confirmation
 
@@ -177,8 +187,10 @@ adapter and counter, with requests' transport answered by a stand-in of the bars
 * `PACE` equal to this record's row;
 * the task reading one named pair, with no account or stream lock, in data-only mode.
 
-`tests/test_bars_to_catalog.py` shows a root holding only definitions taking a `sip` load. A paper run
-of the task against Alpaca is not part of this change (UNVERIFIED until one runs).
+`tests/test_bars_to_catalog.py` shows a root holding only definitions taking a `sip` load. One paper run
+on 2026-11-11, on account A's pair in data-only mode, loaded SPY and QQQ 1-minute `sip` bars for
+14:30-15:30 UTC on 2026-11-10 into a root holding only their definitions: exit 0, 122 bars, one GET; the
+same command again wrote nothing and sent no request.
 
 Muse's independent review of `ea705a6` identified the overlap, row-bound, feed-race, unnamed-error and
 silent-rounding defects. Each fix above has a regression that failed before the fix in
@@ -188,6 +200,8 @@ shared-lock guarantee.
 
 Antigravity's review of `0bcca05` found the premature filesystem writes, unused marker after a failed
 first write, and unnamed client setup errors. Each reproduced in this test file before its fix.
+DeepSeek Harness's review of `0bcca05` found that the record named the wrong component as truncating
+the gap's nanosecond, since the pinned stack keeps it; the text is corrected.
 
 ## Evidence
 
@@ -232,3 +246,6 @@ source cache.
 * https://requests.readthedocs.io/en/latest/user/advanced/#event-hooks — "You can also add hooks to a
   `Session` instance. Any hooks you add will then be called on every request made to the session", and
   "Any unhandled exception won't be passed silently". Fetched.
+* Second reader, 2026-11-11: an evidence check of this record found the trading budget's figure unlabelled,
+  the engine-filter claim uncited and the execution-client precedent loosely stated; each is corrected
+  above, and the DeepSeek Harness review is named.

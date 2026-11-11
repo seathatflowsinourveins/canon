@@ -570,9 +570,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             text = args.symbols_file.read_text(encoding="utf-8")
         except OSError as e:
             parser.error(f"--symbols-file: {e}")
-        symbols = [
-            line.strip() for line in text.splitlines() if line.strip() and not line.startswith("#")
-        ]
+        stripped = (line.strip() for line in text.splitlines())
+        symbols = [line for line in stripped if line and not line.startswith("#")]
     else:
         symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
     if not symbols:

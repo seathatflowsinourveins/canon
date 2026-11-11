@@ -27,6 +27,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 import requests
+from canon_alpaca import providers
 from canon_alpaca.constants import ENV_API_KEY
 from canon_alpaca.constants import ENV_SECRET_KEY
 from canon_alpaca.providers import DATA_ONLY_ENV
@@ -124,6 +125,9 @@ def venue(monkeypatch) -> Venue:
     monkeypatch.setenv(DATA_ONLY_ENV, "1")
     monkeypatch.setenv(ENV_API_KEY, PLACEHOLDER)
     monkeypatch.setenv(ENV_SECRET_KEY, PLACEHOLDER)
+    # A counter of this test's own: the process's one counter is what a later test's window reads for
+    # its request budget, and a 429 the stand-in answers here is not that window's (ADR 0076's check).
+    monkeypatch.setattr(providers, "REQUESTS", providers.RequestCounter())
     stand_in = Venue()
 
     def send(self, request, **kwargs):
@@ -747,3 +751,31 @@ def test_an_overfull_response_stops_before_any_of_its_bars_are_written(
 
     assert bars_in(catalog, "AAPL", "1-MINUTE") == []
     assert not (catalog / FEED_FILE).exists()
+
+
+def test_an_indented_comment_in_a_symbols_file_is_not_a_symbol(monkeypatch, tmp_path) -> None:
+    """Code review, 2026-11-11: a comment line is skipped wherever its `#` starts, so an indented note
+    is not loaded as a symbol and does not refuse the whole run."""
+    listed = tmp_path / "symbols.txt"
+    listed.write_text("  # large caps\nAAPL\n\n", encoding="utf-8")
+    seen: list[list[str]] = []
+    monkeypatch.setattr(history_load, "history_client", lambda: object())
+    monkeypatch.setattr(
+        history_load, "load_history", lambda client, symbols, *a, **k: seen.append(symbols) or 0
+    )
+    assert (
+        history_load.main(
+            [
+                "--symbols-file",
+                str(listed),
+                "--start",
+                "2026-11-10T14:00:00Z",
+                "--end",
+                "2026-11-10T15:00:00Z",
+                "--catalog",
+                str(tmp_path / "catalog"),
+            ]
+        )
+        == 0
+    )
+    assert seen == [["AAPL"]]
