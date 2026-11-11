@@ -39,13 +39,18 @@ grows with the data and not with what was tried. Terms 1, 2 and 3 below were ADR
    catalog. The cache's `CacheConfig.bar_capacity` is raised to the count of the sample's bars in the
    catalog, read after every other check. A run whose cache holds another number of bars than it
    replayed (`BacktestResult.iterations`, one per data item at the pinned commit), or a bar outside
-   the sample, is told `FAIL`.
+   the sample, is told `FAIL`. The digest also holds, keyed by instrument ID, the SHA-256 of each
+   instrument the bar types name, as the engine's cache held it (`Cache.instrument`): upstream's
+   `Instrument.to_dict()` without `ts_event` and `ts_init`, in the key's canonical JSON. The node loads
+   the definition from the catalog with the bars, and the engine trades against it. A cache with no
+   definition of one is told `FAIL`.
    Nothing upstream identifies data,
    so this is local glue like the config key. It is taken from the bars, not the catalog's file layout, so
    a writer that adds, rewrites or consolidates files moves no digest unless a bar of the range changes.
    Records of one key on one sample that differ in range, returns, session days or digest disagree and
    stop the ranking (ADR 0054 term 5), and so do any two records on one sample that read one bar type
-   as different bars, whatever their keys.
+   as different bars, or one instrument as different definitions, whatever their keys; a record whose
+   digest lacks a bar type or instrument it loads stops it too.
 2. **The key is the configuration.** This term supersedes what ADR 0035 term 4 (now ADR 0054 term 4) said `config` holds,
    which was every property upstream reflects and the run's range. `config` now holds what this repo
    sets: each strategy's class (`module:Class`), its config's own fields and each field of
@@ -124,6 +129,14 @@ Who decided. The orchestrator chose option 2 and its terms under the owner's del
 * A fifth review's case, a test that failed before its fix: a `SessionMaCrossConfig`, a subclass
   `record_trial`'s type admits, is refused before a trial, naming its class
   (`test_a_config_of_another_strategy_class_is_refused_before_a_trial`).
+* A fifth review's case, a test that failed before its fix: two definitions of MSFT under the same
+  bars (a 5-share order limit in one) traded other returns under one key, and three keys recorded across
+  them ranked and passed at DSR 0.9916; they now stop on the instrument
+  (`test_trials_on_two_definitions_of_one_instrument_stop`). With it: a digest without its instruments
+  stops (`test_a_digest_without_its_instruments_stops`), a definition stamped again keeps its digest
+  (`test_an_instrument_s_digest_is_its_definition_not_when_it_was_stamped`), and a catalog holding two
+  definitions of one instrument does not run, so the cache's is the one traded against
+  (`test_a_catalog_with_two_definitions_of_one_instrument_does_not_run`).
 
 ## Evidence
 
@@ -203,3 +216,17 @@ package; run, executed in this checkout.
   narrow reading, since only `MaCross` is run and building another class from a config is a change of
   decision this record has not made. The step 7 study's eight are `MaCross` (run). Reproduced as a
   failing test. No change of decision.
+* A fifth review of the gate, 2026-11-10, by a second reader: term 1 held the bars only, though the
+  intent (ADR 0041's) is the data each trial read from the catalog, and the instrument definition is
+  part of it. Term 1 corrected. Run at the pin: on identical bars, of the fields NautilusTrader's
+  `Equity` constructor takes (`model/__init__.pyi`, `bundled`; it takes no size precision, size
+  increment or fees, so the reviewers' `size_precision` cannot be set on an `Equity`), `min_quantity`
+  20, `max_quantity` 5, `price_precision` 2 or 5 and `currency` EUR turned a one-instrument run of 10
+  shares idle; `lot_size` 3 or 100, `max_quantity` and `min_quantity` 10, `max_price`, `min_price`,
+  `margin_init`, `price_increment` 0.0002 or 0.01, `isin`, `tick_scheme` and `info` changed nothing; in
+  a two-instrument run, `max_quantity` 5 on one kept the run `traded` with other returns. An idle run
+  stops the ranking already, and one key on both definitions disagreed on its returns (ADR 0054 term
+  5), so only records of different keys passed. `info` is hashed with the rest: a load writes a
+  definition only when the catalog holds none (`canon_trading.bars_to_catalog`), so a refresh does not
+  restamp it. Effects of other instrument classes' fields: UNVERIFIED. Every record made before this correction stops, the step 7 study's eight included
+  (ADR 0052).

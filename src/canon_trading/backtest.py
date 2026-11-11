@@ -19,7 +19,8 @@ v2.0.0rc8. Read 2026-11-10:
   ("Adds a constructed Python strategy to the engine for the given run config"), `BacktestNode.run`
   (with `raise_exception` off, a failed run is logged and its result left out),
   `ParquetDataCatalog.get_intervals` and `ParquetDataCatalog.get_missing_intervals_for_request`, and
-  `CacheConfig(bar_capacity)` with `Cache.bars` (the bars the engine's cache keeps, newest first).
+  `CacheConfig(bar_capacity)` with `Cache.bars` (the bars the engine's cache keeps, newest first),
+  and `Cache.instrument` (the definition the cache holds of an instrument, the one the node loaded).
 
 A run bounded by `start` and `end` must have its whole range covered by the catalog: any part the
 catalog's own `get_missing_intervals_for_request` reports missing is refused, named. Upstream's
@@ -143,8 +144,11 @@ class BacktestRun:
     its positions in their final state, `position_snapshots` the earlier round trips of positions that
     reopened, and `account` the simulated venue's account. `bars` is what the cache keeps of each bar
     type the run loaded (`Cache.bars`), in the order the cache gives them; every bar replayed, if the
-    run was built by `checked_run_config` and the catalog did not change in between. Nothing here is computed by
-    this repo.
+    run was built by `checked_run_config` and the catalog did not change in between. `instruments` is
+    the definition the cache held of each instrument those bar types name (`Cache.instrument`), in the
+    order of the bar types, `None` where it held none: the node loads them from the catalog, so they
+    are the definitions the run traded against. They are typed `Any`, as the orders are: the pinned
+    stubs name no common instrument type. Nothing here is computed by this repo.
     """
 
     result: BacktestResult
@@ -153,6 +157,7 @@ class BacktestRun:
     position_snapshots: list[Position]
     account: Any
     bars: list[Bar]
+    instruments: list[Any]
 
 
 # The simulated venue's settings, as data: `simulated_alpaca_venue` builds the venue from them and
@@ -411,6 +416,11 @@ def run_backtest_config(config: BacktestRunConfig, strategies: Sequence[MaCross]
                 for data in config.data
                 for bar_type in data.bar_types or ()
                 for bar in cache.bars(BarType.from_str(str(bar_type))) or []
+            ],
+            instruments=[
+                cache.instrument(BarType.from_str(str(bar_type)).instrument_id)
+                for data in config.data
+                for bar_type in data.bar_types or ()
             ],
         )
     finally:

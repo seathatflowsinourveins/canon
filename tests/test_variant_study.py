@@ -113,9 +113,12 @@ def test_two_instruments_are_recorded_and_ranked_in_one_study(
     assert report.pick in legend(configs)
     with open_study("s", ledger) as study:
         outcomes = [t.user_attrs[OUTCOME] for t in study.trials]
-        bar_types = {b for t in study.trials for b in t.user_attrs["data_digest"]}
+        digested = {b for t in study.trials for b in t.user_attrs["data_digest"]}
     assert outcomes == [TRADED] * 4
-    assert bar_types == {str(bar_type("SPY")), str(bar_type("QQQ"))}
+    assert digested == {
+        *(str(bar_type(symbol)) for symbol in ("SPY", "QQQ")),
+        *(str(bar_type(symbol).instrument_id) for symbol in ("SPY", "QQQ")),
+    }
 
     again, report_again = run_study(
         tmp_path / "catalog", name="s", ledger_path=ledger, configs=configs, start=START, end=END

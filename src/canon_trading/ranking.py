@@ -29,10 +29,10 @@ read as on the current sample, unless it ran; one with outcome traded or idle ra
 disagree (their outcome included), one not run on the study's current sample, returns ADR 0010 step 2
 rejects or a record not in the shape `record_trial` writes (on any sample, a stored `config` that does
 not hash to its key), records that read one bar type as
-different bars, trials that do not cover the same session days over the sample, and a record with no
+different bars or one instrument as different definitions, trials that do not cover the same session days over the sample, and a record with no
 key not marked by `mark_not_run`. A record that ran on the current sample is in `record_trial`'s shape
-only if its run's bounds are the sample's, its `run_config_id` is its key, its digest names at least
-one bar type, each with a SHA-256 hex digest, and every return and session day falls on a UTC day of
+only if its run's bounds are the sample's, its `run_config_id` is its key, its digest names exactly
+the bar types its config loads and the instruments they name, each with a SHA-256 hex digest, and every return and session day falls on a UTC day of
 the sample (`canon_trading.ledger.session_day` of its two ends) no later than the session day of the
 run's own end; Optuna validates no user attribute. A record with a key that did not run to the end
 is a failure a later record resolves only if it is one `record_trial` leaves: one that shows a
@@ -56,6 +56,7 @@ from datetime import UTC
 from datetime import datetime
 from typing import TYPE_CHECKING
 
+from nautilus_trader.model import BarType
 from optuna.trial import TrialState
 from skfolio import measures
 
@@ -595,9 +596,15 @@ def _shape_faults(trial: FrozenTrial, sample: Sample) -> list[str]:
         faults.append(
             f"config {attrs.get('config')!r} names no bar types in the form record_trial writes"
         )
-    elif set(digests) != set(loaded):
-        # `record_trial` digests every bar type the run loads, one with no bar included.
-        faults.append(f"data_digest names {sorted(digests)}, not the bar types it loads, {loaded}")
+    elif (named := _instruments_of(loaded)) is None:
+        faults.append(f"config names bar types {loaded}, not each in NautilusTrader's form")
+    elif set(digests) != {*loaded, *named}:
+        # `record_trial` digests every bar type the run loads, one with no bar included, and the
+        # definition of each instrument they name (ADR 0053 term 1).
+        faults.append(
+            f"data_digest names {sorted(digests)}, not the bar types it loads and their "
+            f"instruments, {sorted({*loaded, *named})}"
+        )
     low, high = session_day(sample.start), session_day(sample.end)
     ran_until = session_day(end) if end_ok else high
     for values, what in (
@@ -620,6 +627,15 @@ def _shape_faults(trial: FrozenTrial, sample: Sample) -> list[str]:
     return faults
 
 
+def _instruments_of(bar_types: list[str]) -> list[str] | None:
+    """The instrument IDs `bar_types` name, read by NautilusTrader's `BarType.from_str`, or `None` if
+    one of them is not a bar type in its form."""
+    try:
+        return [str(BarType.from_str(bar_type).instrument_id) for bar_type in bar_types]
+    except ValueError:
+        return None
+
+
 def _loaded_bar_types(config: object) -> list[str] | None:
     """The bar types a record's `config` says its run loads, or `None` if it says none in that form."""
     data = config.get("data") if isinstance(config, dict) else None
@@ -634,22 +650,26 @@ def _day(ns: int) -> str:
 
 
 def _data_disagreements(read: list[FrozenTrial], sample: Sample) -> list[str]:
-    """One reason for each bar type that records on `sample` read as different bars (ADR 0053 term 1).
+    """One reason for each bar type that records on `sample` read as different bars, and for each
+    instrument they read as different definitions (ADR 0053 term 1).
 
-    Every record in `read` has passed `_shape_faults`, so its digest is a mapping of texts.
+    Every record in `read` has passed `_shape_faults`, so its digest is a mapping of texts, each a bar
+    type or an instrument ID.
     """
     by_digest: dict[str, dict[str, list[FrozenTrial]]] = defaultdict(lambda: defaultdict(list))
     for trial in read:
-        for bar_type, digest in trial.user_attrs["data_digest"].items():
-            by_digest[bar_type][digest].append(trial)
+        for name, digest in trial.user_attrs["data_digest"].items():
+            by_digest[name][digest].append(trial)
     return [
-        f"{bar_type}: records on {sample.describe()} read different bars: "
+        f"{name}: records on {sample.describe()} read different "
+        + ("bars" if _instruments_of([name]) is not None else "definitions of the instrument")
+        + ": "
         + "; ".join(
             f"{digest[:12]} by {', '.join(f'#{t.number}' for t in trials)}"
             for digest, trials in digests.items()
         )
         + "; move the sample and run every configuration again (ADR 0053)"
-        for bar_type, digests in sorted(by_digest.items())
+        for name, digests in sorted(by_digest.items())
         if len(digests) > 1
     ]
 

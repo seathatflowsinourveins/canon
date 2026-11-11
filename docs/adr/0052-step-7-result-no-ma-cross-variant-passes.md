@@ -92,8 +92,9 @@ recommendation either.
   catalog's bar files were last written at 17:31 New York, before the first trial at 18:08; and that
   only one process wrote the study is consistent with the pass lock's file and with trials that ran
   back to back, not proved by them. Since the run, all four were reproduced as failing tests and
-  fixed on `main` (`dc49fb6`, ADR 0041's third review); `rank` at that code, on a copy of the ledger,
-  gives the report above word for word (Evidence). Whether the study is to be recorded again on a
+  fixed on `main` (`dc49fb6`, ADR 0041's third review); `rank` from that code up to `05955f9`, on a
+  copy of the ledger, gives the report above word for word (Evidence, run at `05955f9`); after it, the
+  study stops, below. Whether the study is to be recorded again on a
   moved sample under the fixed recording code is not decided here.
 * What ran: `main` at `ba44c25` with ADR 0048's wiring (`canon_trading.variant_study`) before its last
   change, which places a completed record with no sample number as `rank` does (Evidence, code review).
@@ -104,6 +105,12 @@ recommendation either.
 * The fourth review of the gate (ADR 0048's Evidence) changes nothing read here: one pass recorded all
   eight planned keys, all `traded`, so N = 8 is the plan's, and the study has no `not_run` mark, no
   queued trial and no record out of `record_trial`'s shape.
+* The instrument definitions the eight trials read were not recorded: the data identity then held the
+  bars only (ADR 0053 term 1, corrected by its fifth review). One catalog served all eight, so each
+  symbol's four trials read one definition unless the catalog's instrument files changed during the
+  pass, which nothing recorded can rule out (UNVERIFIED). Under the corrected rule the study as stored
+  stops, every record's digest lacking its instrument, until its eight configurations run again on a
+  moved sample; their keys are unchanged, so N stays 8.
 
 ## Evidence
 
@@ -130,3 +137,6 @@ Read 2026-11-10. Fetched means read in this session as raw text or source; run m
 * ADR 0048 as it stood on `main` before 2026-11-10's split: the result, what it can show, the run's
   Confirmation and its evidence, moved here with no change of decision (run: `git show` of the record
   on `main`).
+* `rank` at `05955f9`, on a backup copy of the shared ledger, 2026-11-10: the report above word for
+  word; at the next change, which adds the instrument definitions to the data identity (ADR 0053's
+  fifth review), the same copy stops on all eight records, each digest lacking its instrument. Run.
