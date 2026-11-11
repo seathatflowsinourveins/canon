@@ -118,6 +118,10 @@ hook that can deny a call. ADR 0020 runs no hook before a tool call, for the fai
 set to block when it failed left a session with no tool, and the owner wants none. This record does not reopen ADR
 0020. The risk those hooks answer is the one gap 2's containment answers.
 
+*Amended 2026-11-11 by ADR 0074:* stopping check 2's containment record is taken from the vendors' own
+documentation, with no end-to-end trial of each runtime; check 5 counts the trading paths only; gaps 7 to
+10 stay optional.
+
 ### Consequences
 
 * Good: the harness has a finish line made of checks, and the lanes have a cap after it.

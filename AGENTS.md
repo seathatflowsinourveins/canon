@@ -26,6 +26,15 @@ dependency, pattern and practice traces to a pinned upstream or a dated source. 
    this repo or an agent's context (ADR 0009).
 9. **One model per conversation.** Switching model mid-session discards the prompt cache; delegate bulky or
    cheap work to a subagent instead. Changing effort is fine (ADR 0005, ADR 0006).
+10. **Proportion and evidence.** The north star is the trading work: before starting anything outside it,
+   ask whether it moves a roadmap step or keeps the gate honest, and if not, do the smallest documented
+   form once or record a limit. Security is not a goal here, so a security-flavoured finding off the
+   trading path gets one decision, a small documented fix or a recorded limit, and no second round,
+   unless it bears on a credential the repository handles. Off the trading path, the upstream's
+   documentation and a landscape comparison are enough to land a record, with what was not run marked
+   `UNVERIFIED` and one `evidence-verifier` pass as its review. The
+   trading path (the adapter's order and data paths, the session window, the gate) still needs a failing
+   test first and a paper or simulation run (ADR 0074).
 
 ## Commands
 
