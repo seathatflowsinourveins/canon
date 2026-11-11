@@ -144,8 +144,16 @@ exit 0, both items in the login keychain; `mise run paper:check` exit 0, account
   lock gives up at its bound while lockf(1) holds the file, and lockf cannot take it while the fixture
   holds it. An unmarked stream is stopped in `run()`. The wait stops before the deadline's room, and a
   stream is tracked until its `run()` returns (run).
-* On paper, UNVERIFIED until it has run: that a firing reads B's keychain items with no dialog, and that a
-  window on B and a paper test on A run at the same time.
+* On paper, 2026-11-11, at `main`'s 93f23c0: `mise run paper:session --session auto --minutes 10` on account
+  B, 07:34:32 to 07:44:40 UTC, result `ok`, 2 fills, nothing left open; inside it, from 07:35:32 to 07:35:43,
+  `mise run paper:test -- -v -rs -k "flat_reconciliation or quotes_write_back"` on account A, exit 0, 4
+  passed, neither waiting for the other (run); the test ran from a checkout at 93f23c0 whose working tree
+  was not compared with it (UNVERIFIED). The account state the window logged differed from account A's
+  (compared in the two logs; the values are not recorded). The
+  first scheduled firing on B, 2026-11-11 at `main`'s e7b5d5c: the runner started at 07:48:37 UTC and the
+  window ran from 07:50:35 to 08:15:40, result `ok`, 2 fills, nothing left open, so the task's keychain
+  reads of B's items, each bounded to 30 s, finished with no dialog waiting (the runner's log and the
+  window's record, read).
 * Option 3's comparison of account IDs is still not built.
 
 ## Evidence

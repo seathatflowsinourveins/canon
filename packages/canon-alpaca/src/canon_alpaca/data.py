@@ -218,6 +218,7 @@ from .constants import STREAM_FEEDS
 from .constants import VENUE
 from .providers import AlpacaInstrumentProvider
 from .providers import credentials_from_env
+from .providers import require_get_only
 from .providers import with_http_timeout
 
 if TYPE_CHECKING:
@@ -836,6 +837,9 @@ class AlpacaDataClient(MarketDataClient):
         with_http_timeout(
             self._historical
         )  # a client passed in too; refused without a session (ADR 0039)
+        # data-only mode: refused before anything is sent unless the client sends GET only; the provider
+        # checks its own client the same way each time it fetches it (ADR 0070)
+        require_get_only(self._historical)
         if self._stream is not None:
             self._register_trade_events(self._stream, loop)
         await self._provider.initialize()

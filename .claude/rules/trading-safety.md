@@ -15,7 +15,8 @@ paths:
   pass `paper=False` or `url_override`.
 * Never place, modify or cancel a live order. Never read, print, log or commit a credential.
 * Credentials come from the environment. `.env` files are denied to agents by `.claude/settings.json`.
-  Account A's paper pair is in the login keychain and reaches only `mise run paper:test` (ADR 0029);
+  Account A's paper pair is in the login keychain and reaches only `mise run paper:test` (ADR 0029) and,
+  in data-only mode, `mise run paper:data` (ADR 0070);
   account B's, stored beside it with `paper:store windows`, reaches only `mise run paper:session`, by hand
   or from the scheduled agent (ADR 0044, ADR 0050, ADR 0069). Neither task reads the other's pair. Never run
   `security find-generic-password` with `-w` or `-g` on either pair, and never put a key value in a file, a command
@@ -26,7 +27,7 @@ paths:
   0042): run `mise run paper:test`, which holds account A's lock for the whole run. Never live.
   The owner decided on 2026-11-11 that this covers both paper accounts, each under its own lock, whoever
   starts the run (a lane, a coordinator or the scheduled agent): `mise run paper:test` on account A,
-  `mise run paper:session` on account B and `mise run paper:data` once it exists (ADR 0069, ADR 0070).
+  `mise run paper:session` on account B and `mise run paper:data` (ADR 0069, ADR 0070).
   A paper test that opens a market-data stream carries the `alpaca_stream` marker, so it holds the
   login's stream lock, which a window also takes.
   Every paper test places nothing if the account holds an open order it could touch, and cancels what it

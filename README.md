@@ -127,10 +127,12 @@ mise run paper:session  # one SessionMaCross window on account B, 30 minutes by 
 ```
 
 There are two paper accounts ([ADR 0069](docs/adr/0069-two-paper-accounts.md)): account A, the default,
-whose pair only `paper:test` reads, and account B (`windows`), whose pair only `paper:session` and its
+whose pair only `paper:test` and the data-only `paper:data` read, and account B (`windows`), whose pair only `paper:session` and its
 schedule read. Each account has its own lock, so a test and a window do not wait for each other; the two
 accounts share the login's market-data stream (one connection per endpoint, ADR 0069), so a paper test that streams and a window take turns on
-a third lock.
+a third lock. `mise run paper:data sandbox [--minutes N]` runs NautilusTrader's sandbox execution client on
+Alpaca's live data with account A's pair, every request but GET refused and no Alpaca execution client
+(ADR 0070); `quotes`, the other listed module, is refused until ADR 0066's loader is built.
 
 `paper:store` refuses a key ID starting with `AK`, Alpaca's hint for a live key, then sends the pair to
 Alpaca's paper API (`GET /v2/account`) and stores nothing unless it is accepted there; a live pair is
