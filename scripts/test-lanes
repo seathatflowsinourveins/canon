@@ -692,9 +692,9 @@ if command -v plutil >/dev/null 2>&1; then
   fi
   PP="$TMP/agents/local.canon.paper-session.plist"
   pargs=""
-  for i in 0 1 2 3 4 5 6 7 8 9; do pargs="$pargs|$(plutil -extract "ProgramArguments.$i" raw -o - "$PP" 2>/dev/null)"; done
-  check "rehearsal writes the paper session agent: the runner, its clone and origin, --session auto --minutes 25" \
-        test "$pargs" = "|/bin/bash|$AH/canon/paper-session.sh|$B/mise|$CK|$OURL|--session|auto|--minutes|25|"
+  for i in 0 1 2 3 4 5 6 7 8 9 10; do pargs="$pargs|$(plutil -extract "ProgramArguments.$i" raw -o - "$PP" 2>/dev/null)"; done
+  check "rehearsal writes the paper session agent: the runner, its clone and origin, --session auto --minutes 25 --mover" \
+        test "$pargs" = "|/bin/bash|$AH/canon/paper-session.sh|$B/mise|$CK|$OURL|--session|auto|--minutes|25|--mover|"
   check "... the runner installed beside the watchdog" cmp -s "$ROOT/home/.claude/canon/paper-session.sh" "$AH/canon/paper-session.sh"
   check "... and its clone at origin's main, detached, marked as made by it" \
         eval '[ "$(git -C "$CK" rev-parse HEAD)" = "$(git -C "$O" rev-parse main)" ] && ! git -C "$CK" symbolic-ref -q HEAD >/dev/null && [ "$(git -C "$CK" config canon.paperCheckout)" = true ]'
@@ -702,7 +702,7 @@ if command -v plutil >/dev/null 2>&1; then
   # 20 s interval and a 15 s job started every 35 s), so the interval is the pause after a firing: at least
   # session_window.GAP_SECS, and with a 25-minute window and about two minutes of start-up and stop, a
   # window every 35 minutes or so
-  piv=$(plutil -extract StartInterval raw -o - "$PP"); pmin=$(plutil -extract ProgramArguments.9 raw -o - "$PP")
+  piv=$(plutil -extract StartInterval raw -o - "$PP"); pmin=$(plutil -extract ProgramArguments.8 raw -o - "$PP")
   pgap=$(sed -n 's/^GAP_SECS = \([0-9]*\).*/\1/p' "$ROOT/src/canon_trading/session_window.py")
   check "... 10 minutes after each firing ends (${piv} s): above session_window's gap (${pgap} s), a ${pmin}-minute window about every 35 minutes" \
         eval '[ "$piv" = 600 ] && [ -n "$pgap" ] && [ "$piv" -ge "$pgap" ] && [ $((pmin * 60 + 120 + piv)) -le 2300 ]'
