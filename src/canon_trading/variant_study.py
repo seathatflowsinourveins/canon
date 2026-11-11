@@ -35,8 +35,11 @@ failure could not be written stops the pass, with the storage error as a note on
 pass holds an exclusive `fcntl.flock` (the standard library's, as
 `canon_trading.ledger` takes for creation) on a lock file beside the ledger, named for the study
 (percent-encoded, so a name holding `/` names one file), so a second pass on the same study is
-refused rather than run beside it. A pass that only opens a study looks for the ledger before it takes
-that lock, and creates no folder and no file where there is none. The catalog defaults to the
+refused rather than run beside it. That lock does not hold the study's sample, which any reader of
+the ledger may move under the ledger's own lock (`canon_trading.ledger.move_sample`), so the pass
+records and ranks only on the sample it checked against the plan, and refuses one moved beneath it.
+A pass that only opens a study looks for the ledger before it takes that lock, and creates no folder
+and no file where there is none. The catalog defaults to the
 `catalog/` of the checkout this module is in, where the paper test loads the bars; the ledger to
 `canon_trading.ledger.default_ledger_path()`, shared by every worktree (ADR 0035).
 """
@@ -67,6 +70,7 @@ from .ledger import OUTCOME
 from .ledger import RAN
 from .ledger import LedgerNotFound
 from .ledger import Origin
+from .ledger import Sample
 from .ledger import config_key
 from .ledger import create_ledger_study
 from .ledger import current_sample
@@ -216,6 +220,7 @@ def record_grid(
     configs: Sequence[MaCrossConfig],
     *,
     starting_balances: Sequence[str] = STARTING_BALANCES,
+    on_sample: Sample | None = None,
 ) -> Recorded:
     """Record each configuration `_to_record` names, one trial each, in the plan's order.
 
@@ -227,7 +232,8 @@ def record_grid(
     the ranking stops on the key until a later record of it runs to the end (ADR 0054 term 5), and a
     catalog changed mid-pass leaves records that read different bars, which stop it too (ADR 0053
     term 1). Anything that leaves no failure told (a refusal before a trial exists, a failure that
-    could not be written, a defect here) stops the pass.
+    could not be written, a defect here) stops the pass. So does a study whose sample is no longer
+    `on_sample`, the one the pass checked against its plan: `record_trial` refuses it before a trial.
     """
     keys = [key_of(config, starting_balances) for config in configs]
     pending = set(_to_record(study, keys))
@@ -240,7 +246,12 @@ def record_grid(
         before = len(study.get_trials(deepcopy=False))
         try:
             trial = record_trial(
-                study, catalog_path, [config], starting_balances=starting_balances, logging=quiet
+                study,
+                catalog_path,
+                [config],
+                starting_balances=starting_balances,
+                logging=quiet,
+                on_sample=on_sample,
             )
         except Exception as error:
             if not _told_failed(study, key, before):
@@ -277,8 +288,9 @@ def run_study(
 
     Creating a study that exists raises Optuna's `DuplicatedStudyError`, and opening one that does not
     raises `LedgerNotFound`, each from `canon_trading.ledger`: nothing is created unless asked. A study
-    whose current sample is not [start, end] is refused, since the sample is part of the plan. The
-    pass holds the study's pass lock (module header). Returns what the pass recorded and the report, or
+    whose current sample is not [start, end] is refused, since the sample is part of the plan, and so
+    is one whose sample moves beneath the pass after that check (`_record_and_rank`). The pass holds
+    the study's pass lock (module header). Returns what the pass recorded and the report, or
     the `RankingStopped` that stopped it, which names any configuration of `configs` with no record.
     """
     configs = grid() if configs is None else configs
@@ -327,23 +339,45 @@ def _record_and_rank(
     last: int,
     rank_only: bool,
 ) -> tuple[Recorded | None, RankingReport | RankingStopped]:
+    """Check the study's sample against the plan, record the grid on that sample, and rank it.
+
+    The pass lock keeps a second pass off the study, but not another reader's `move_sample`, which
+    holds the ledger's lock only. So the sample checked here is the one the recording and the ranking
+    must answer for: each trial is refused before it is asked for if the study has moved since
+    (`record_trial`'s `on_sample`), and a report on another sample than the one checked is refused,
+    naming both, since its range is not the plan's (ADR 0048). So is a stop once the study has moved
+    (read again after it, since a stop carries no sample): it passes nothing, but its remedy would
+    be the moved sample's, which the next pass's plan check refuses.
+    """
     sample = current_sample(study)
     if (sample.start, sample.end) != (first, last):
         raise ValueError(
             f"study {study.study_name!r} is on {sample.describe()}, not the planned range "
             f"{first} to {last}",
         )
-    recorded = None if rank_only else record_grid(study, catalog_path, configs)
+    recorded = None if rank_only else record_grid(study, catalog_path, configs, on_sample=sample)
     unrecorded = _never_recorded(study, configs)
     try:
         report = rank(study)
     except RankingStopped as stopped:
+        if (moved := current_sample(study)) != sample:
+            raise _moved(study, "stopped on", moved, sample) from stopped
         if not unrecorded:
             return recorded, stopped
         return recorded, RankingStopped(f"{_short_of_the_plan(study, unrecorded)}\n{stopped}")
+    if report.ranked_sample != sample:  # the sample of `rank`'s own read
+        raise _moved(study, "ranked", report.ranked_sample, sample)
     if unrecorded:
         return recorded, RankingStopped(_short_of_the_plan(study, unrecorded))
     return recorded, report
+
+
+def _moved(study: optuna.Study, did: str, moved: Sample, checked: Sample) -> ValueError:
+    return ValueError(
+        f"study {study.study_name!r} {did} {moved.describe()}, not {checked.describe()}, the "
+        "sample the pass checked against its plan: the sample moved beneath the pass, and its "
+        "ranking is refused",
+    )
 
 
 def _never_recorded(study: optuna.Study, configs: Sequence[MaCrossConfig]) -> list[MaCrossConfig]:

@@ -89,6 +89,7 @@ from .ledger import Sample
 from .ledger import after_its_mark
 from .ledger import cleared_while_waiting
 from .ledger import config_key
+from .ledger import data_bar_types
 from .ledger import has_key
 from .ledger import is_not_run_list
 from .ledger import origin
@@ -124,6 +125,7 @@ class RankingReport:
 
     study: str
     sample: str
+    ranked_sample: Sample
     records: int
     all_records: int
     first_trial: int
@@ -288,7 +290,32 @@ def _config_fault(trial: FrozenTrial, key: str) -> str | None:
         return f"has a config with no canonical form ({error})"
     if hashed != key:
         return f"has a config that hashes to {hashed}, not to its key"
+    traded = _traded_bar_types(config["strategies"])
+    loaded = _loaded_bar_types(config)
+    if traded is None or loaded is None or data_bar_types(traded) != loaded:
+        # `trial_config` writes the data's bar types from the strategies' own (`data_bar_types`),
+        # so a record of its writer never differs: one whose strategies trade other bars than its
+        # data and digest name would be read as a run of bars it never traded (ADR 0054 term 6).
+        return (
+            f"has a config whose strategies trade {traded!r} where its data loads {loaded!r}, "
+            "not the bar types of its strategies, each once, as record_trial writes them"
+        )
     return None
+
+
+def _traded_bar_types(strategies: object) -> list[str] | None:
+    """The bar type each stored strategy trades, in order, or `None` if any names none in the form
+    `trial_config` writes (`{"config": {"bar_type": ...}}`, a text), or there is no strategy."""
+    if not isinstance(strategies, list) or not strategies:
+        return None
+    traded = []
+    for strategy in strategies:
+        fields = strategy.get("config") if isinstance(strategy, dict) else None
+        bar_type = fields.get("bar_type") if isinstance(fields, dict) else None
+        if not isinstance(bar_type, str):
+            return None
+        traded.append(bar_type)
+    return traded
 
 
 def _ran_unconfigured(trial: FrozenTrial, sample: Sample, known: set[int]) -> str | None:
@@ -598,6 +625,7 @@ def rank(study: optuna.Study) -> RankingReport:
     return RankingReport(
         study=study.study_name,
         sample=sample.describe(),
+        ranked_sample=sample,
         records=len(current),
         all_records=len(trials),
         first_trial=min(numbers),
