@@ -180,6 +180,19 @@ Quote sizes: the quotes reference gives bid and ask size "in shares (round lots 
 multiple of 100 and the largest 640, which does not settle the unit. Nothing converts a size, so a
 catalog spanning 2025-11-03 may change unit there (UNVERIFIED which).
 
+**Quote sizes measured** (2026-11-11). On paper, 09:38 to 09:45 New York, a throwaway `alpaca_stream`
+test under `mise run paper:test`, exit 0, 1 passed (log kept outside the repository): SPY quotes on IEX
+from the stream for 180 s from 14:42:07 UTC, raw, and the historical quotes of the same span. Live
+36,769, history 37,162, every live quote matched in history by timestamp and both prices; bid sizes
+equal on 36,502 and ask sizes on 36,666, a factor of 100 either way on none. Sizes ran 40 to 560, and
+about 91% were not multiples of 100. So since 2025-11-03 sizes are shares on the stream and in history
+alike, and a load from that date converts nothing. Alpaca's two quotes references, historical and
+latest, give sizes "in shares (round lots prior to November 3, 2025)" and agree with the measurement.
+Alpaca's real-time page gives the stream's sizes "in round lots": fetched 2026-11-11; contradicted by
+measurement the same day. History before 2025-11-03 is in round lots by those references (UNVERIFIED
+here: only today's quotes were measured), so a load spanning that date multiplies its earlier sizes by
+100 or starts after it.
+
 `UNVERIFIED`: a full SIP day (not counted, to keep the lock short); whether HTTP compression shrinks the
 133 bytes on the wire; whether a full day compresses like one page; how long a backtest takes over a
 quarter of quotes.
@@ -216,6 +229,8 @@ Read 2026-11-10. Fetched means read as raw text; run means executed here.
 * Read 2026-11-11: https://docs.alpaca.markets/us/reference/stockquotes-1.md (inclusive `start` and
   `end`; sizes "in shares (round lots prior to November 3, 2025)") and
   https://docs.alpaca.markets/us/docs/real-time-stock-pricing-data.md (sizes "in round lots"), fetched;
+  https://docs.alpaca.markets/us/reference/stocklatestquotes-1.md (the same size wording as the
+  historical reference), fetched with the size measurement;
   https://nautilustrader.io/docs/md/latest/developer_guide/python_adapters.md (`_request_quotes`; v1
   `quote_ticks` hooks became `quotes` hooks) and `concepts/data/catalog.md` (write-back rules), fetched;
   `developer_guide/spec_data_testing.md` (TC-D21), fetched. At the pinned commit,
