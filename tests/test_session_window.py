@@ -1152,6 +1152,18 @@ class FirstBar(SessionMaCross):
         super().__init__(config)
         self.ready_at_first_bar: bool | None = None
         self.live_bars = 0
+        self.history_seen: list[tuple] = []
+        """The slow average's (count, initialized, value) as the warm-up's bars reach the callback,
+        and again after it has run."""
+
+    def on_historical_bars(self, bars) -> None:
+        self.history_seen.append(self._slow_state())
+        self.live_closes = [b.close.as_double() for b in reversed(self.cache.bars(LIVE) or [])]
+        super().on_historical_bars(bars)
+        self.history_seen.append(self._slow_state())
+
+    def _slow_state(self) -> tuple:
+        return (self.slow.count, self.slow.initialized, self.slow.value)
 
     def on_bar(self, bar) -> None:
         if bar.bar_type == LIVE:
@@ -1161,8 +1173,24 @@ class FirstBar(SessionMaCross):
         super().on_bar(bar)
 
 
+class LateAnswer(FirstBar):
+    """Asks for the history again at its first live bar, so an answer comes back after a live bar has
+    reached the averages, through upstream's own response path."""
+
+    def on_bar(self, bar) -> None:
+        first = bar.bar_type == LIVE and self.ready_at_first_bar is None
+        super().on_bar(bar)
+        if first:
+            self.request_bars(self.history_bar_type, start=datetime.fromtimestamp(T0 / 1e9, UTC))
+
+
 def warm_up_run(
-    tmp_path, *, warm_up: bool, gap: int = 0, warm_up_start: datetime | None = None
+    tmp_path,
+    *,
+    warm_up: bool,
+    gap: int = 0,
+    warm_up_start: datetime | None = None,
+    kind: type[FirstBar] = FirstBar,
 ) -> FirstBar:
     """Thirty minutes of the adapter's EXTERNAL one-minute bars in a catalog, as `request_bars` would get
     them, then, `gap` minutes after them, twenty minutes of live trades every ten seconds, from which the
@@ -1224,7 +1252,7 @@ def warm_up_run(
             for k in range(1, 121)
         ]
     )
-    s = FirstBar(
+    s = kind(
         SessionMaCrossConfig(
             bar_type=LIVE,
             trade_size=Quantity.from_int(1),
@@ -1262,6 +1290,30 @@ def test_the_warm_up_reaches_back_to_its_start_across_a_gap_with_no_bars(tmp_pat
     assert reached.history_bars == 30 and reached.ready_at_first_bar is True
     hour = warm_up_run(tmp_path / "hour", warm_up=True, gap=900)
     assert hour.history_bars == 0 and hour.ready_at_first_bar is False
+
+
+def test_upstream_feeds_the_warm_up_to_the_averages_and_the_callback_adds_nothing(tmp_path) -> None:
+    """Upstream's response path updates the registered averages before `on_historical_bars` runs
+    (`prepare_response`, `crates/common/src/python/response.rs` at the pin), routing by instrument and
+    bar specification whatever the aggregation source (`BarType::id_spec_key`), so the EXTERNAL history
+    reaches the averages registered for the INTERNAL bars. The callback must not feed them again: the
+    slow average holds the last eight closes on its way in, and holds them unchanged on its way out."""
+    s = warm_up_run(tmp_path, warm_up=True)
+    last_eight = sum(750 + i / 100 for i in range(22, 30)) / 8
+    assert s.history_seen[0][:2] == (8, True)
+    assert s.history_seen[0][2] == pytest.approx(last_eight)
+    assert s.history_seen[1] == s.history_seen[0]
+
+
+def test_thin_history_leaves_the_slow_average_cold_rather_than_doubled(tmp_path) -> None:
+    """Fewer history bars than `slow_period` (five against eight, the hour asked for reaching back over
+    the last five): fed once, the slow average holds five bars and is not initialized, so the first live
+    bar decides nothing. Fed twice it held them doubled, out of order, and reported itself initialized."""
+    s = warm_up_run(tmp_path, warm_up=True, gap=55)
+    assert s.history_bars == 5
+    assert s.history_seen[0][:2] == (5, False)
+    assert s.history_seen[1] == s.history_seen[0]
+    assert s.ready_at_first_bar is False
 
 
 def test_a_warm_up_start_without_the_warm_up_is_refused() -> None:
@@ -1308,25 +1360,115 @@ def history(count: int) -> list:
     ]
 
 
-def test_a_warm_up_answer_after_a_live_bar_is_dropped_not_fed_after_it() -> None:
+def test_a_warm_up_answer_after_a_live_bar_is_fed_again_in_time_order(tmp_path) -> None:
+    """Upstream applies a late answer to the averages before the callback, after newer live bars; the
+    callback cannot stop that, so it resets them and feeds them again in time order: the history older
+    than the first live bar, then the live bars. They stay initialized, with no wait for new bars."""
+    s = warm_up_run(tmp_path, warm_up=True, kind=LateAnswer)
+    # each answer's 30 bars counted, all older than the live bars, so none dropped
+    assert s.history_bars == 60 and s.history_dropped == 0
+    assert s.live_closes  # the live bar the averages had taken before the answer
+    closes = [750 + i / 100 for i in range(30)] + s.live_closes
+    count, initialized, value = s.history_seen[3]
+    assert (count, initialized) == (8, True)
+    assert value == pytest.approx(sum(closes[-8:]) / 8)
+
+
+def test_the_callback_feeds_the_averages_nothing() -> None:
+    """Called directly, with no upstream response path in front of it, the callback counts the bars and
+    leaves the averages as they were."""
     s = unstarted()
-    s.live_bars = 1  # a live bar has already reached the averages
     s.on_historical_bars(history(13))
-    assert (s.history_bars, s.history_dropped, s.slow.count) == (0, 13, 0)
+    assert (s.history_bars, s.history_dropped, s.slow.count) == (13, 0, 0)
 
 
-def test_a_warm_up_answer_after_the_timeout_is_dropped() -> None:
+def test_a_warm_up_answer_after_the_timeout_with_no_live_bar_yet_is_kept() -> None:
+    """After the timeout and before any live bar, upstream has applied the answer in order, oldest first,
+    with nothing newer in the averages, so it is kept."""
     s = unstarted()
     s._on_history_timeout(cast(TimeEvent, None))
     assert s.hydrated
     s.on_historical_bars(history(13))
-    assert (s.history_bars, s.history_dropped) == (0, 13)
+    assert (s.history_bars, s.history_dropped) == (13, 0)
 
 
-def test_a_warm_up_answer_in_time_initializes_the_averages() -> None:
+def closes_bars(bar_type: BarType, minutes: range) -> list:
+    """One-minute bars closing at `T0` plus each minute, each closing at 750 plus a cent a minute."""
+    return [
+        Bar(
+            bar_type,
+            Price(750, 4),
+            Price(751, 4),
+            Price(749, 4),
+            Price(750 + i / 100, 4),
+            Quantity.from_int(1),
+            T0 + i * MINUTE,
+            T0 + i * MINUTE,
+        )
+        for i in minutes
+    ]
+
+
+def mean_close(minutes) -> float:
+    return sum(750 + i / 100 for i in minutes) / len(minutes)
+
+
+def with_live(bars: list) -> SessionMaCross:
+    """An unstarted strategy whose averages have taken `bars` as live bars, as upstream feeds them."""
     s = unstarted()
-    s.on_historical_bars(list(reversed(history(13))))  # fed oldest first whatever the order
-    assert s.history_bars == 13 and s.fast.initialized and s.slow.initialized
+    for bar in bars:
+        s.fast.handle_bar(bar)
+        s.slow.handle_bar(bar)
+        s.live_bars += 1  # what `on_bar` keeps, without the engine its order checks need
+        s.taken.append(bar)
+    s.first_live_ns = bars[0].ts_init
+    return s
+
+
+def test_a_warm_up_answer_out_of_time_order_is_fed_again_oldest_first() -> None:
+    """Upstream feeds an answer in the order served; one out of order leaves the averages on the bars
+    that came last, not the newest, so the callback feeds them again oldest first."""
+    s = unstarted()
+    s.on_historical_bars(list(reversed(closes_bars(HISTORY, range(13)))))
+    assert (s.history_bars, s.history_dropped) == (13, 0)
+    assert s.slow.initialized and s.slow.value == pytest.approx(mean_close(range(5, 13)))
+
+
+def test_a_warm_up_answer_with_a_bar_twice_is_fed_again_once_per_bar() -> None:
+    """A bar repeated (a page boundary served twice) is not in strict time order: fed again, it counts
+    once, so five bars do not pass for the eight the slow average needs."""
+    bars = closes_bars(HISTORY, range(5))
+    s = unstarted()
+    s.on_historical_bars(bars[:3] + bars[2:])
+    assert (s.history_bars, s.slow.count, s.slow.initialized) == (5, 5, False)
+
+
+def test_a_late_answer_overlapping_the_live_bars_drops_the_minutes_they_cover() -> None:
+    """Live bars from minute 10 on; an answer for minutes 0 to 12 after them: minutes 0 to 9 of it and
+    then the live bars are fed again, and its minutes 10 to 12 are dropped and counted."""
+    s = with_live(closes_bars(LIVE, range(10, 13)))
+    s.on_historical_bars(closes_bars(HISTORY, range(13)))
+    assert (s.history_bars, s.history_dropped) == (10, 3)
+    assert s.slow.count == 8 and s.slow.value == pytest.approx(mean_close(range(5, 13)))
+    assert s.fast.value == pytest.approx(mean_close(range(10, 13)))
+
+
+def test_an_answer_older_than_the_bars_already_taken_is_fed_again_in_time_order() -> None:
+    """Two answers before any live bar, the second older than the first: in order on its own, but older
+    than what the averages hold, so it is not kept as served; they are fed again and end on the newest."""
+    s = unstarted()
+    s.on_historical_bars(closes_bars(HISTORY, range(10, 20)))
+    s.on_historical_bars(closes_bars(HISTORY, range(10)))
+    assert s.slow.value == pytest.approx(mean_close(range(12, 20)))
+    assert s.history_bars == 20 and s.history_dropped == 0
+
+
+def test_an_empty_warm_up_answer_after_a_live_bar_leaves_the_averages_alone() -> None:
+    s = unstarted()
+    s.live_bars = 1
+    s.slow.update_raw(750.0)
+    s.on_historical_bars([])
+    assert (s.history_bars, s.history_dropped, s.slow.count) == (0, 0, 1)
 
 
 def test_the_warm_up_needs_time_bars() -> None:
@@ -2648,7 +2790,7 @@ def test_an_opposite_cross_on_any_bar_clears_the_dropped_signal(
     s.indicators_initialized = lambda: True
     probe = cast(Any, s)
     probe.fast, probe.slow = SimpleNamespace(value=fast), SimpleNamespace(value=2.0)
-    s.on_bar(cast(Bar, SimpleNamespace(bar_type=s.bar_type)))
+    s.on_bar(cast(Bar, SimpleNamespace(bar_type=s.bar_type, ts_init=T0)))
     assert s.dropped_side is None
 
 

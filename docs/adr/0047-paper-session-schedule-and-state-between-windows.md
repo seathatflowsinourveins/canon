@@ -52,10 +52,15 @@ leaves is not the next one's: the next refuses to start unless the account is fl
 "Handler example": "Registered indicators receive the bars from a request response before
 `on_historical_bars()` runs, so a request hydrates them"): before the live subscription it requests at
 least an hour of the adapter's one-minute `EXTERNAL` bars from IEX; the live bars stay the `INTERNAL` ones
-built from IEX trades. One departure: the averages are registered for the live type only, and
-`on_historical_bars` feeds the history to them, oldest first, only while no live bar has reached them, since
-a registered history type would also take an answer arriving after a live bar or the 60 s timeout; such an
-answer is dropped and counted. Decisions wait for completion or the timeout; the report gives the counts.
+built from IEX trades. The averages are registered for the live type, before the request, and upstream's
+response path feeds them the answer before `on_historical_bars` runs, since it routes a bar by instrument
+and bar specification whatever its aggregation source; the callback only counts the bars. Corrected
+2026-11-11: until then the callback fed the history a second time, which with fewer bars than the slow
+period initialized the slow average on a doubled window (ADR 0044). No callback can stop upstream applying
+an answer that arrives after a live bar, older bars after newer; one departure: the strategy then feeds
+the averages again in time order, from the last bars they had taken and the answer's bars older than the
+first live bar, and counts the rest as dropped (`session_ma_cross`'s module header). Decisions wait for
+completion or the 60 s timeout; the report gives the counts.
 
 **What would close the gap upstream** (this repo's reading; no issue or plan found): database backing for
 custom Python clients; with it and Redis, `save_state` and "persist all execution events" would apply.
@@ -65,14 +70,18 @@ custom Python clients; with it and Redis, `save_state` and "persist all executio
 * Good: a window decides from its first live bar; every start is from Alpaca's state.
 * Bad: history bars (Alpaca's aggregation) and live bars (the engine's, from trades) are built by two
   different aggregators from the same feed; a minute with no IEX trade has no live bar.
-* Bad: an answer later than the first live bar is dropped, and that window warms up on live bars.
+* Bad: an answer later than the first live bar is applied by upstream after newer bars, which the
+  strategy cannot stop; it re-feeds the averages in time order, and the answer's bars that the live bars
+  cover are dropped (corrected 2026-11-11: this said such an answer was dropped whole).
 
 ### Confirmation
 
 Offline, in `scripts/ci` (`tests/test_session_window.py`): on NautilusTrader's `BacktestEngine`, with 30
 `EXTERNAL` one-minute bars in a `ParquetDataCatalog` and live `INTERNAL` bars built from trades, the
 history is fed and the averages are initialized at the first live bar; without the warm-up they are not.
-An answer after a live bar or after the timeout is dropped, not fed; one in any order is fed oldest first.
+Corrected 2026-11-11: the history is fed once, by upstream, with the slow average not initialized on thin
+history; an answer after a live bar, out of order, or older than the bars taken is fed again in time
+order with the live bars; one after the timeout and before any live bar is kept.
 The request's callback ran on failure too (no catalog), in a probe outside `scripts/ci`, as actors.md
 documents.
 On paper: UNVERIFIED until a regular window runs.
@@ -81,6 +90,11 @@ On paper: UNVERIFIED until a regular window runs.
 
 Read 2026-11-10. "raw": fetched with `curl` and read whole. NautilusTrader files at the pin, `d53849b216e2`.
 
+* 2026-11-11, the warm-up corrected: `crates/common/src/python/response.rs` lines 357-363 (`prepare_response`
+  updates the registered indicators before `on_historical_bars`), `crates/common/src/actor/indicators.rs`
+  lines 171-178 and 241-246, and `crates/model/src/data/bar.rs` lines 910-921 (`BarType::id_spec_key`
+  ignores the aggregation source), at `d53849b216e2`, read in the local copy at the pin; the thin-history
+  test in `tests/test_session_window.py` failed on the old callback and passes now (run).
 * https://nautilustrader.io/docs/md/latest/developer_guide/python_adapters.md, "Database cache backing";
   the same warning at the pin's `docs/developer_guide/python_adapters.md` (fetched, raw).
 * https://nautilustrader.io/docs/md/latest/how_to/configure_live_trading.md: `with_load_state` and
