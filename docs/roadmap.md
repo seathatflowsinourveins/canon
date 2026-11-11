@@ -36,7 +36,10 @@ arrangement with Alpaca, and outside what agents decide.
 * **Extreme movers.** Four gaps each stop the work they name: the ranking score and the strategy class,
   which no upstream ships; the adapter's part of a universe that changes in a session, with a notional
   cap that cannot follow a late instrument; and halts in the adapter. The request budget carries four
-  names in the regular session and one outside it until the worst order is smaller (ADR 0083).
+  names in the regular session and one outside it until the worst order is smaller (ADR 0083). The
+  strategy class is written, as a composition of upstream parts, and runs in the regular session's paper
+  windows on one chosen name, by hand and from the schedule (ADR 0088, ADR 0091, both `proposed`); the
+  ranking actor that replaces the one chosen name is not on `main`.
 * **Overfitting probability.** Settled as a diagnostic beside the gate, never a pass or fail (ADR 0027,
   accepted); skfolio's splitter and Sharpe ratio with Algorithm 2.3's last steps as code here (ADR 0032,
   accepted). Open until that code lands.

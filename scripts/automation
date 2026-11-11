@@ -67,6 +67,7 @@ PAPER_PLIST="$AGENTS_DIR/$PAPER_LABEL.plist"
 # and its start-up, stop and account check, a window about every 35 minutes (ADR 0050, 2026-11-11)
 PAPER_INTERVAL=600
 PAPER_MINUTES=25
+PAPER_REGULAR_STRATEGY=Mover                          # the regular session's strategy (ADR 0091); no other part names one
 PAPER_STALE=4200                                      # a record `running` after 70 minutes, if it gives none
 PAPER_DEADLINE=6300                                   # mise.toml's paper:session timeout, 105 minutes
 # the longest firing: the runner's fetch bound, then its bound on the whole `mise run`, which is that timeout
@@ -270,8 +271,10 @@ EOF
 }
 
 # The session window agent runs ~/.claude/canon/paper-session.sh, which brings its own clone to the main the
-# origin has at that firing, or fails the firing, and runs `mise run paper:session --session auto --mover`
-# there, a window on the day's top mover in the regular session and nothing outside it (ADR 0083):
+# origin has at that firing, or fails the firing, and runs `mise run paper:session --session auto --mover
+# --regular-strategy Mover` there, a window of the mover strategy on the day's top mover in the regular
+# session and nothing outside it (ADR 0083, ADR 0091; the strategy is named for each part of the day, and
+# a part that names none runs the window's default):
 # the task reads the paper pair from the login keychain, takes the paper lock and runs one window, or prints
 # "nothing to run" when Alpaca's clock says no session is open (weekends and holidays included). Not run at
 # load. No checkout a person uses is read or written (ADR 0050). CANON_PAPER_SCHEDULED=1 (launchd.plist(5),
@@ -299,6 +302,8 @@ write_paper_plist() {
     <string>--minutes</string>
     <string>$PAPER_MINUTES</string>
     <string>--mover</string>
+    <string>--regular-strategy</string>
+    <string>$PAPER_REGULAR_STRATEGY</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>

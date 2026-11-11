@@ -187,6 +187,7 @@ from alpaca.data.models.corporate_actions import CorporateActionsSet
 from alpaca.data.requests import CorporateActionsRequest
 from alpaca.data.requests import MarketMoversRequest
 from alpaca.data.requests import StockBarsRequest
+from alpaca.data.requests import StockLatestQuoteRequest
 from alpaca.data.requests import StockLatestTradeRequest
 from alpaca.data.requests import StockSnapshotRequest
 from alpaca.data.timeframe import TimeFrame
@@ -209,6 +210,7 @@ from canon_alpaca.execution import DEFINITIVE_SUBMIT_REFUSALS
 from canon_alpaca.execution import ORDERS_PAGE_LIMIT
 from canon_alpaca.providers import CONNECT_TIMEOUT_SECS
 from canon_alpaca.providers import READ_TIMEOUT_SECS
+from canon_alpaca.providers import TRADING_API
 from canon_alpaca.providers import counted
 from canon_alpaca.providers import not_sent
 from canon_alpaca.providers import request_counts
@@ -225,6 +227,13 @@ from nautilus_trader.model import Quantity
 from nautilus_trader.model import StrategyId
 from nautilus_trader.model import TimeInForce
 
+from .mover import Mover
+from .mover import entry_price
+from .mover_window import ENTRY_NOTIONAL_USD
+from .mover_window import MOVER
+from .mover_window import MOVER_ID
+from .mover_window import OUTER_BOUND_USD
+from .mover_window import mover_parts
 from .movers_screener import MOVERS_TOP
 from .movers_screener import movers_line
 from .movers_stream import STREAM_LOGGER
@@ -345,6 +354,8 @@ class WindowStrategy:
     """Why it runs in `sessions` only, when that is not every session."""
     max_order_submit_rate: str = MAX_ORDER_SUBMIT_RATE
     builtin: str | None = None
+    max_notional_per_order: Decimal = MAX_NOTIONAL_PER_ORDER_USD
+    """The risk engine's per-order notional cap for its node (`paper_node.risk_limits`)."""
     sells_while_flat: str = ""
     """Why its shipped behaviour sells while flat, if it does: such a strategy is refused by name in
     every window, since a window never opens a short (module header, "Long-only")."""
@@ -365,8 +376,19 @@ WINDOW_STRATEGIES = {
             "held the short for the whole window)"
         ),
     ),
+    MOVER: WindowStrategy(
+        MOVER_ID,
+        ("regular",),
+        "its first window is the regular session's (ADR 0088); outside it every order of its is a marked "
+        "limit, which has not run on paper yet",
+        max_notional_per_order=OUTER_BOUND_USD,
+    ),
 }
-"""The strategies a window runs, by the name `--strategy` takes (ADR 0068, step 3): the repo's
+"""`Mover` (ADR 0088) runs only in a mover window (`--mover`), on the one name `choose_mover` gives, which
+`mover_window.FixedRank` publishes as the ranking; it sizes its own entries (`mover_window`'s rows), so its
+node's per-order cap is the outer bound and its position cap the shares the largest entry buys.
+
+The strategies a window runs, by the name `--strategy` takes (ADR 0068, step 3): the repo's
 `SessionMaCross`, a Python strategy, and upstream's built-in `EmaCross`, added by its type name through
 `LiveNode.add_builtin_strategy` with `paper_node.ema_cross_config` (one share an order, upstream's periods,
 10 and 50), as `paper_node.ema_cross_paper_node` adds it (ADR 0037). Both run beside `PositionCap` under the
@@ -599,6 +621,10 @@ class WindowConfig:
                 "a mover window runs in the regular session only (marked DAY limits on sip), not in "
                 f"the {self.session} session"
             )
+        if self.strategy == MOVER and not self.mover:
+            raise ValueError(
+                f"{MOVER} trades the name the ranking gives, not a given symbol: run it with --mover"
+            )
         if not 1 <= self.minutes <= MAX_MINUTES:
             raise ValueError(f"minutes must be 1 to {MAX_MINUTES}, got {self.minutes}")
         if self.minutes * 60 <= FLATTEN_SECS:
@@ -781,7 +807,9 @@ def window_node(
     log_name: str,
     feed: str,
     warm_up_start: datetime | None = None,
-) -> tuple[LiveNode, SessionMaCross | CachedData, PositionCap]:
+    pick: MoverPick | None = None,
+    ends: datetime | None = None,
+) -> tuple[LiveNode, SessionMaCross | Mover | CachedData, PositionCap]:
     """The node, Alpaca's clients, the native risk limits and runtime checks, with the strategy and the cap
     it runs (returned too: the node does not hand its Python strategies back; for a built-in, what the
     record reads of it, `CachedData`). `feed` is named in `SessionMaCross`'s subscriptions and its warm-up
@@ -795,8 +823,10 @@ def window_node(
             f"window's part streams {feed}"
         )
     limits = config.limits
-    # `SessionMaCross`'s managed stop runs a market exit inside the post-stop delay; a built-in has none
-    managed = runs.builtin is None and not limits
+    extended = config.session == "extended"
+    # `SessionMaCross`'s managed stop runs a market exit inside the post-stop delay; a built-in has none.
+    # `Mover`'s orders in the session are unmarked, so its stop there is the managed market exit too.
+    managed = (not extended) if config.strategy == MOVER else (runs.builtin is None and not limits)
     node = (
         alpaca_paper_builder(
             "CANON-PAPER-SESSION",
@@ -804,6 +834,7 @@ def window_node(
             # the managed stop's market exit runs inside the post-stop delay
             delay_post_stop_secs=MANAGED_DELAY_POST_STOP_SECS if managed else DELAY_POST_STOP_SECS,
             max_order_submit_rate=runs.max_order_submit_rate,
+            max_notional_per_order=runs.max_notional_per_order,
         )
         .with_logging(
             LoggerConfig(
@@ -818,6 +849,27 @@ def window_node(
         cap = PositionCap(position_cap_config(config.instrument_id))
         node.add_strategy(cap)
         return node, CachedData(node.cache, config.instrument_id), cap
+    if config.strategy == MOVER:
+        if pick is None or ends is None:
+            raise RuntimeError(
+                f"{MOVER} is built on the window's choice and its end; none was given"
+            )
+        mover, ranking, cap = mover_parts(
+            config.instrument_id,
+            price=pick.price,
+            move=Decimal(str(round(float(pick.record["inputs"]["move"]), 6))),
+            computed_at=datetime.fromisoformat(pick.record["at"]),
+            ends=ends,
+            extended=extended,
+            feed=feed,
+            wind_down_at=wind_down_at,
+            market_exit_interval_ms=MARKET_EXIT_INTERVAL_MS,
+            market_exit_max_attempts=MARKET_EXIT_MAX_ATTEMPTS,
+        )
+        node.add_strategy(mover)
+        node.add_actor(ranking)
+        node.add_strategy(cap)
+        return node, mover, cap
     strategy = SessionMaCross(
         SessionMaCrossConfig(
             bar_type=config.bar_type,
@@ -1656,6 +1708,7 @@ def run_window(
             f"{account if (account := paper_account()) in PAPER_ACCOUNTS else 'windows'} on"
         )
     mover: dict[str, Any] = {}
+    pick: MoverPick | None = None
     if config.mover:  # chosen once, before the node is built (ADR 0083's dated line of 2026-11-11)
         at = clock.timestamp + timedelta(seconds=time.monotonic() - read_at)
         days = _trading_days(calendar)
@@ -1676,6 +1729,17 @@ def run_window(
     else:
         price = share_price(window_data(), config.symbol)
         one_share_fits(config.symbol, price)
+    if config.strategy == MOVER and pick is not None:
+        # at the limit `Mover` itself would send, which is what the risk engine values its order at; the
+        # record's `entry_limit` is then this strategy's, not the bridge's through the touch
+        limit = mover_entry_limit(window_data(), config.symbol)
+        if limit > ENTRY_NOTIONAL_USD:
+            raise WindowRefused(
+                f"one share of {config.symbol} at its entry limit of {limit} USD is over {MOVER}'s "
+                f"largest entry of {ENTRY_NOTIONAL_USD} USD; not starting"
+            )
+        mover["entry_limit"] = str(limit)
+        pick = replace(pick, price=limit)  # the shares the largest entry buys are counted at it
     overnight = overnight_eligibility(trading, config.symbol) if part == "overnight" else ""
 
     now = clock.timestamp.astimezone(NEW_YORK)
@@ -1719,6 +1783,8 @@ def run_window(
             log_name=f"window-{stamp}",
             feed=feed,
             warm_up_start=history_from,
+            pick=pick,
+            ends=ends,
         )
         cache = node.cache
         try:
@@ -1735,6 +1801,8 @@ def run_window(
                 report.live_bars = strategy.live_bars
                 report.cap_checks, report.cap_peak = cap.checks, str(cap.peak)
                 report.cap_tripped = cap.tripped
+                if isinstance(strategy, Mover):
+                    report.mover["run"] = strategy.record()
             finally:
                 try:
                     # before the disposal, which clears the cache
@@ -1780,6 +1848,7 @@ def run_window(
                 marker.write_text(str(time.time()))
                 _read_stream_lines(report, config.log_dir / f"window-{stamp}.log")
             no_data = _data_failure(report) if ran else None
+            over_budget = request_failure(report) if config.strategy == MOVER else None
             if failure is not None:
                 report.result = f"failed: {type(failure).__name__}: {failure}"
             elif report.left:
@@ -1788,6 +1857,8 @@ def run_window(
                 report.result = f"failed: {report.cap_tripped}"
             elif no_data:
                 report.result = f"failed: {no_data}"
+            elif over_budget:
+                report.result = f"failed: {over_budget}"
             else:
                 report.result = "ok"
             write_record(config.log_dir, report)
@@ -1797,7 +1868,47 @@ def run_window(
         raise RuntimeError(f"the position cap stopped the window: {report.cap_tripped}")
     if no_data:
         raise RuntimeError(f"the window ran without market data: {no_data}")
+    if over_budget:
+        raise RuntimeError(f"the window went over its request budget: {over_budget}")
     return report
+
+
+def mover_entry_limit(data: StockHistoricalDataClient, symbol: str) -> Decimal:
+    """The limit `Mover` would enter `symbol` at now: the ask of its latest sip quote (alpaca-py's
+    `get_stock_latest_quote`) as `mover.entry_price` makes it a price Alpaca takes; or `WindowRefused`.
+    The risk engine values a limit order at its limit price, not at the last trade, so this is the
+    price one share is checked at and the shares of an entry are counted at."""
+    found = data.get_stock_latest_quote(
+        StockLatestQuoteRequest(symbol_or_symbols=symbol, feed=DataFeed.SIP)
+    )
+    quote = found.get(symbol) if isinstance(found, dict) else None
+    ask = getattr(quote, "ask_price", None)
+    if not ask:
+        raise WindowRefused(
+            f"Alpaca gave no ask in {symbol}'s latest sip quote, so the limit an entry would be sent "
+            "at is not known; not starting"
+        )
+    return entry_price(Decimal(str(ask)), 0)
+
+
+REQUEST_CEILING = 180
+"""The most requests a mover node may send Alpaca's trading API in any 60 seconds (UNCALIBRATED, ADR 0088):
+under Alpaca's 200 a minute for an account; a window at or over it fails by name, as one that met a 429
+does."""
+
+
+def request_failure(report: WindowReport) -> str | None:
+    """Why a mover window's requests fail it, or None: a count at or over `REQUEST_CEILING` in some 60
+    seconds, or any 429, as the adapter counted them (`WindowReport.requests_by_api`)."""
+    for count in report.requests_by_api:
+        if count["rate_limited"]:
+            return f"Alpaca answered 429 to {count['rate_limited']} request(s) of the {count['api']} API"
+        if count["api"] == TRADING_API and count["peak_60s"] >= REQUEST_CEILING:
+            return (
+                f"{count['peak_60s']} requests to the {count['api']} API in 60 s, at or over the "
+                f"ceiling of {REQUEST_CEILING}"
+            )
+    return None
 
 
 STREAM_LINES = ("Alpaca stream on feed ", "Cannot subscribe: ")
@@ -2486,6 +2597,12 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="One bounded strategy window on Alpaca paper")
     parser.add_argument("--session", choices=(*SESSIONS, "auto"), default="regular")
     parser.add_argument("--strategy", choices=tuple(WINDOW_STRATEGIES), default=DEFAULT_STRATEGY)
+    parser.add_argument(
+        "--regular-strategy",
+        choices=tuple(n for n, runs in WINDOW_STRATEGIES.items() if "regular" in runs.sessions),
+        help="with --session auto: the strategy of a window in the regular session; every other "
+        "part runs --strategy",
+    )
     parser.add_argument("--minutes", type=int, default=DEFAULT_MINUTES)
     chosen = parser.add_mutually_exclusive_group()
     chosen.add_argument("--symbol", default="SPY")
@@ -2502,7 +2619,12 @@ def _args(argv: Sequence[str] | None) -> argparse.Namespace:
     """The arguments, `--log-dir` defaulted to `default_log_dir()` only when it is not given, and
     `RuntimeError` for a relative one: the records go outside the repository, wherever the run starts
     (an empty `getconf` in the caller's shell leaves only the folder's name)."""
-    args = _parser().parse_args(argv)
+    parser = _parser()
+    args = parser.parse_args(argv)
+    if args.regular_strategy is not None and args.session != "auto":
+        parser.error("--regular-strategy names a part's strategy, so it needs --session auto")
+    if args.regular_strategy == MOVER and not args.mover:
+        parser.error(f"--regular-strategy {MOVER} trades the day's mover, so it needs --mover")
     if args.log_dir is None:
         args.log_dir = default_log_dir()
     elif not args.log_dir.is_absolute():
@@ -2533,6 +2655,8 @@ def _main(args: argparse.Namespace) -> int:
             trading = paper_trading()
             clock, calendar, market_read_at = session_now(trading)
             market = (clock, calendar)
+            if args.regular_strategy is not None and clock.is_open:
+                args.strategy = args.regular_strategy  # the schedule names the strategy a part runs
             resolved, why = resolve_session(clock, calendar, args.strategy)
             if args.mover and resolved not in (None, "regular"):
                 resolved, why = None, f"{why}, and a mover window runs in the regular session only"

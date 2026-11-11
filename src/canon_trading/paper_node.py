@@ -114,13 +114,18 @@ class RiskLimits(TypedDict):
 
 
 def risk_limits(
-    instrument_id: InstrumentId, *, max_order_submit_rate: str = MAX_ORDER_SUBMIT_RATE
+    instrument_id: InstrumentId,
+    *,
+    max_order_submit_rate: str = MAX_ORDER_SUBMIT_RATE,
+    max_notional_per_order: Decimal = MAX_NOTIONAL_PER_ORDER_USD,
 ) -> RiskLimits:
     """The risk engine's settings for a run on `instrument_id`, as keywords of either risk config class.
 
     `max_order_submit_rate` is the ceiling unless a run sets a tighter budget of its own, as the paper
     test of `EmaCross` does (ADR 0037). The notional cap is one value for any symbol, which a
-    window checks one share against before it starts (`session_window.one_share_fits`).
+    window checks one share against before it starts (`session_window.one_share_fits`). A run whose
+    strategy sizes its own entries gives `max_notional_per_order` as an outer bound above them, since
+    the engine holds a sale to the cap as it does a buy (`mover_window`, ADR 0088).
 
     `LiveRiskEngineConfig` (the live node's) and `nautilus_trader.risk.RiskEngineConfig` (a backtest's)
     take the same keywords, so the offline proof of the throttle runs on exactly these values.
@@ -129,7 +134,7 @@ def risk_limits(
         "bypass": False,
         "max_order_submit_rate": max_order_submit_rate,
         "max_order_modify_rate": MAX_ORDER_MODIFY_RATE,
-        "max_notional_per_order": {str(instrument_id): MAX_NOTIONAL_PER_ORDER_USD},
+        "max_notional_per_order": {str(instrument_id): max_notional_per_order},
     }
 
 
@@ -149,6 +154,7 @@ def alpaca_paper_builder(
     *,
     trader_id: TraderId = TRADER_ID,
     max_order_submit_rate: str = MAX_ORDER_SUBMIT_RATE,
+    max_notional_per_order: Decimal = MAX_NOTIONAL_PER_ORDER_USD,
     delay_post_stop_secs: int = DELAY_POST_STOP_SECS,
 ) -> LiveNodeBuilder:
     """A builder with the Alpaca data and execution clients for `instrument_id`, `risk_limits`,
@@ -161,7 +167,11 @@ def alpaca_paper_builder(
         LiveNode.builder(name, trader_id, Environment.SANDBOX)
         .with_risk_engine_config(
             LiveRiskEngineConfig(
-                **risk_limits(instrument_id, max_order_submit_rate=max_order_submit_rate)
+                **risk_limits(
+                    instrument_id,
+                    max_order_submit_rate=max_order_submit_rate,
+                    max_notional_per_order=max_notional_per_order,
+                )
             )
         )
         .with_exec_engine_config(exec_engine_config(instrument_id))
