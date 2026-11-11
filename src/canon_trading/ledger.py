@@ -72,6 +72,10 @@ Before a trial is asked for, a sample whose ends NautilusTrader's daily series c
 registration on, the day before the start (`snapshot_day_start`, `crates/analysis/src/analyzer.rs` at
 the pinned commit), and no bar on the session day of the end, where the run's last fills are booked.
 Either made `record_trial` tell its own run `FAIL`.
+
+Another writer's keyed trial waiting in Optuna's queue is refused before `ask`, and
+`retire_queued` retires it, or one `record_trial` took before it refused, through Optuna's public
+`Study.ask`, `Trial.set_user_attr`, `Study.tell` and `Study.set_user_attr` (ADR 0054, 2026-11-10).
 """
 
 from __future__ import annotations
@@ -147,6 +151,14 @@ NOT_RUN = "not_run"
 NOT_RUN_WAITING = "not_run_waiting"
 # The error `record_trial` writes on a trial it took from Optuna's queue and ran nothing in.
 TAKEN_FROM_QUEUE = "taken from Optuna's queue by record_trial, which runs only in its own trial"
+# The study user attribute holding the numbers of another writer's queued keyed records that
+# `retire_queued` retired: never read as a run, each one's key still counted in N (ADR 0054).
+RETIRED = "retired"
+# The error `retire_queued` writes on a queued record it takes from Optuna's queue to retire it.
+RETIRED_NOTE = (
+    "another writer's queued trial, retired by retire_queued: it never ran here, and its key stays "
+    "counted in N"
+)
 STRATEGY_CLASS = f"{MaCross.__module__}:{MaCross.__qualname__}"
 # The fields of NautilusTrader's `Currency` (its constructor and `Debug` at the pinned commit), each
 # held for every currency an instrument holds (`instrument_digest`).
@@ -737,7 +749,8 @@ def record_trial(
     Sharpe ratio is not finite. The outcome is written last, so a record that has one ran to the end:
     a `tell` that fails after it leaves the outcome as it is, told `FAIL` with its error, or still
     `RUNNING` if that cannot be told either (`_tell_failed`). A config that is not a `MaCrossConfig`
-    itself is refused before anything is recorded (`trial_config`).
+    itself is refused before anything is recorded (`trial_config`), and so is a study where another
+    writer's keyed trial waits in Optuna's queue, unless it is retired (`_own_trial`, `retire_queued`).
     Every write after the trial is asked for, the outcome and the `tell` included, is inside the `try`
     that tells a failure, so an error or `KeyboardInterrupt` there is told `FAIL` with its error. Only
     a process killed outright, or a store that refuses the very first write, leaves a record with no
@@ -874,33 +887,231 @@ def _own_trial(study: optuna.Study) -> optuna.Trial:
     attribute (`Study.enqueue_trial` writes `fixed_params` on every trial it queues), a parameter or
     an intermediate value. Only the `WAITING` and `RUNNING` trials are read, not every series. An
     error reading the trial back tells it `FAIL`, as `record_trial` tells an error after `ask`.
-    A queued trial that holds a config key is taken like any other and keeps that key and any
-    outcome another writer gave it; the note written here is what `canon_trading.ranking` reads to
-    stop on it for good rather than read it as a run of that key (ADR 0054 term 6).
+    A queued trial that holds a config key and is not retired (`retire_queued`) is refused before
+    `ask`, naming it: taken, it would keep that key and any outcome another writer gave it, and only
+    its note would keep the ranking from reading it as a run of that key (ADR 0054, 2026-11-10). One
+    queued between that check and `ask` is still taken, with the note, and the ranking stops on it
+    naming `retire_queued`, which retires it; if that note is refused too, the error says so, naming
+    the trial (`_untold`).
     """
     while True:
-        queued = {t.number for t in study.get_trials(deepcopy=False, states=(TrialState.WAITING,))}
+        waiting = study.get_trials(deepcopy=False, states=(TrialState.WAITING,))
+        retired = _refuse_a_keyed_queue(study, waiting)
+        queued = {t.number for t in waiting}
         trial = study.ask()
         try:
-            [frozen] = [
-                t
-                for t in study.get_trials(deepcopy=False, states=(TrialState.RUNNING,))
-                if t.number == trial.number
-            ]
+            frozen = _asked(study, trial)
         except BaseException as error:
             _tell_failed(study, trial, error)
             raise
-        if trial.number not in queued and not (
-            frozen.user_attrs
-            or frozen.system_attrs
-            or frozen.distributions
-            or frozen.intermediate_values
-        ):
+        if not _from_the_queue(frozen, queued):
             return trial
+        _tell_taken(study, trial, TAKEN_FROM_QUEUE, _untold(frozen, retired))
+
+
+def _untold(frozen: FrozenTrial, retired: set[int]) -> str | None:
+    """What a refused note leaves on another writer's keyed trial taken from the queue, not retired:
+    the note added to the store's error (ADR 0054 term 7's named limit); for any other, nothing."""
+    if not has_key(frozen) or frozen.number in retired:
+        return None
+    return (
+        f"trial #{frozen.number}, queued by another writer with config key "
+        f"{frozen.user_attrs['config_key']}, was taken without its note, so the ranking may read it "
+        "as a run of that key (ADR 0054 term 7's named limit)"
+    )
+
+
+def _asked(study: optuna.Study, trial: optuna.Trial) -> FrozenTrial:
+    """The trial `Study.ask` just gave, read back as the store holds it."""
+    [frozen] = [
+        t
+        for t in study.get_trials(deepcopy=False, states=(TrialState.RUNNING,))
+        if t.number == trial.number
+    ]
+    return frozen
+
+
+def _from_the_queue(frozen: FrozenTrial, queued: set[int]) -> bool:
+    """Whether `Study.ask` took `frozen` from Optuna's queue rather than creating it: it was
+    `WAITING` before `ask` (`queued`), or holds what a created trial does not (`_own_trial`)."""
+    return frozen.number in queued or bool(
+        frozen.user_attrs
+        or frozen.system_attrs
+        or frozen.distributions
+        or frozen.intermediate_values
+    )
+
+
+def _tell_taken(study: optuna.Study, trial: optuna.Trial, note: str, limit: str | None) -> None:
+    """Write `note` as the `error` of `trial`, taken from the queue, and tell it `FAIL`.
+
+    If the note is refused, the trial is still told `FAIL`, and the store's error is raised with
+    `limit` added, if given, and the `tell`'s own error if that is refused too, so neither replaces it.
+    """
+    try:
+        trial.set_user_attr("error", note)
+    except BaseException as error:
+        if limit is not None:
+            error.add_note(limit)
         try:
-            trial.set_user_attr("error", TAKEN_FROM_QUEUE)
-        finally:
-            study.tell(trial, state=TrialState.FAIL)
+            study.tell(trial, state=TrialState.FAIL, skip_if_finished=True)
+        except Exception as telling:  # noqa: BLE001, the note's refusal is the error raised
+            error.add_note(f"trial #{trial.number} could not be told FAIL either: {telling!r}")
+        raise
+    # `skip_if_finished`: `retire_queued` may have told a taken trial `FAIL` between the two writes.
+    study.tell(trial, state=TrialState.FAIL, skip_if_finished=True)
+
+
+def _refuse_a_keyed_queue(study: optuna.Study, waiting: Sequence[FrozenTrial]) -> set[int]:
+    """Refuse to `ask` while another writer's keyed trial, not retired, waits in Optuna's queue;
+    otherwise give the numbers retired (`retired_numbers`, which refuses a list not in its form)."""
+    retired = retired_numbers(study)
+    keyed = [t for t in waiting if has_key(t) and t.number not in retired]
+    if keyed:
+        first = keyed[0]
+        raise ValueError(
+            f"study {study.study_name!r} holds trial #{first.number}, queued by another writer with "
+            f"config key {first.user_attrs['config_key']}: Study.ask takes the oldest queued trial, "
+            f"so record_trial would take it; retire_queued(study, {first.number}) retires it, its "
+            "key still counted in N, and record_trial then goes on (ADR 0054)",
+        )
+    return retired
+
+
+def retired_numbers(study: optuna.Study) -> set[int]:
+    """The numbers in `study`'s `retired` list, or `ValueError` if it is not in the form
+    `retire_queued` writes: then no record can be read as retired, and every reader refuses it
+    (`canon_trading.ranking` stops on it)."""
+    marked = study.user_attrs.get(RETIRED, [])
+    if not is_not_run_list(marked):
+        raise ValueError(
+            f"study user attribute {RETIRED} is {marked!r}, not a list of trial numbers in the form "
+            "retire_queued writes; another writer left it, and no record is read as retired until "
+            "it is",
+        )
+    return set(marked)
+
+
+def carries_a_queue_note(trial: FrozenTrial) -> bool:
+    """Whether `trial` was taken from Optuna's queue with a note this module writes, by `record_trial`
+    (`TAKEN_FROM_QUEUE`) or `retire_queued` (`RETIRED_NOTE`), and is `FAIL` or, its `tell` refused,
+    still `RUNNING`: the states that taking it leaves."""
+    return trial.state in (TrialState.FAIL, TrialState.RUNNING) and trial.user_attrs.get(
+        "error"
+    ) in (TAKEN_FROM_QUEUE, RETIRED_NOTE)
+
+
+def _trial_numbered(study: optuna.Study, number: int) -> FrozenTrial:
+    """Trial `number` of `study`, or `LookupError`."""
+    found = [trial for trial in study.get_trials(deepcopy=False) if trial.number == number]
+    if not found:
+        raise LookupError(f"study {study.study_name!r} has no trial #{number}")
+    [trial] = found
+    return trial
+
+
+def retire_queued(study: optuna.Study, number: int) -> None:
+    """Retire trial `number` of `study`, another writer's queued record with a config key (ADR 0054).
+
+    Such a record never ran here, and whatever results it holds came from its writer. Retired, it is
+    never read as a run, and its key stays counted in N as a configuration that was tried: the
+    strict side, as `not_run_waiting` keeps a keyless one (ADR 0053 term 3). Its number joins the
+    study user attribute `retired`; nothing is deleted. A record is retired once: a second retirement
+    is refused.
+
+    Two kinds of record are retired: one still `WAITING`, beside which `record_trial` refuses to
+    start, and one taken from the queue with a note this module writes (`carries_a_queue_note`), as
+    `record_trial` took one before it refused. A `FAIL` one is finished, and Optuna 5.0.0 writes
+    nothing on a finished trial (`check_trial_is_updatable`, `storages/_base.py`), so the list is its
+    retirement; a `RUNNING` one, whose `tell` was refused, is then told `FAIL`. A `WAITING` one is
+    taken from the queue through `Study.ask`, which takes the oldest `WAITING` trial
+    (`_pop_waiting_trial_id`, in order of trial ID): every older one is taken first, with the note
+    `record_trial` writes, and an older keyed one not retired is refused before anything is written,
+    naming it. Each taken trial is told `FAIL`, the retired one with `RETIRED_NOTE`. The list is
+    written first, so a process stopped between the two, or a note that is refused, leaves a record
+    the ranking reads as retired and never as a run; `record_trial` takes one left `WAITING`. The
+    record's other contents are not read.
+
+    A keyless record is refused (`mark_not_run` clears one), and so is any other keyed record: a
+    record `record_trial` wrote is a trial of its key, and only a later record of that key resolves
+    it. Everything is read and written under the ledger's lock (module header); a study not opened by
+    `create_ledger_study` or `open_study` raises `ValueError`. Retire a `RUNNING` record only once the
+    process that took it is gone, as with `mark_not_run`: `record_trial` takes a trial outside the lock,
+    and one retired between its note and its `tell` is told `FAIL` here first, which that `tell` then
+    skips (`skip_if_finished`).
+    """
+    with _ledger_lock(_opened_ledger(study, "retire a queued trial")):
+        trial = _trial_numbered(study, number)
+        if not has_key(trial):
+            raise ValueError(
+                f"trial #{number} has no config key; if it ran no backtest, mark_not_run clears it",
+            )
+        retired = retired_numbers(study)
+        if number in retired:
+            raise ValueError(
+                f"trial #{number} is retired already ({trial.state.name}); it is not read as a run "
+                "and its key stays counted in N",
+            )
+        if trial.state == TrialState.WAITING:
+            older = [
+                t.number
+                for t in study.get_trials(deepcopy=False, states=(TrialState.WAITING,))
+                if t.number < number and has_key(t) and t.number not in retired
+            ]
+            if older:
+                raise ValueError(
+                    f"trial #{older[0]}, keyed and queued before #{number}, would be taken from "
+                    f"Optuna's queue first; retire #{older[0]} first",
+                )
+        elif not carries_a_queue_note(trial):
+            raise ValueError(
+                f"trial #{number} ({trial.state.name}) is not another writer's queued record, "
+                "WAITING or taken from Optuna's queue with its note: a record record_trial wrote is "
+                "a trial of its key, and only a later record of that key resolves it",
+            )
+        retired = {*retired, number}
+        study.set_user_attr(RETIRED, sorted(retired))
+        if trial.state == TrialState.WAITING:
+            _take_retired(study, number, retired)
+        elif trial.state == TrialState.RUNNING:
+            study.tell(number, state=TrialState.FAIL, skip_if_finished=True)
+
+
+def _take_retired(study: optuna.Study, number: int, retired: set[int]) -> None:
+    """Take trials from Optuna's queue through `Study.ask` until retired trial `number` is taken.
+
+    Each taken is told `FAIL` (`_tell_taken`): a retired one with `RETIRED_NOTE`, any other with
+    `record_trial`'s note, which `retire_queued` accepts. A trial `ask` took from the queue is known
+    as `_own_trial` knows it (`_from_the_queue`). If `number` has left the queue, taken by another
+    process, it stays retired and nothing more is taken; a trial `ask` created because the queue
+    emptied meanwhile ran nothing, and is told `FAIL` keyless, for `mark_not_run` to clear.
+    """
+    while True:
+        queued = {t.number for t in study.get_trials(deepcopy=False, states=(TrialState.WAITING,))}
+        if number not in queued:
+            return
+        trial = study.ask()
+        try:
+            frozen = _asked(study, trial)
+        except BaseException as error:
+            # Noted as the queue before `ask` says, and told `FAIL`, so it is not left `RUNNING`.
+            error.add_note(f"trial #{trial.number}, asked by retire_queued, could not be read back")
+            _tell_taken(
+                study, trial, _note_for(trial.number, trial.number in queued, retired), None
+            )
+            raise
+        from_the_queue = _from_the_queue(frozen, queued)
+        note = _note_for(frozen.number, from_the_queue, retired)
+        _tell_taken(study, trial, note, _untold(frozen, retired))
+        if frozen.number == number or not from_the_queue:
+            return
+
+
+def _note_for(number: int, from_the_queue: bool, retired: set[int]) -> str:
+    """The note `_take_retired` writes on trial `number`, taken from the queue or created by `ask`."""
+    if not from_the_queue:
+        return "asked by retire_queued after its trial left Optuna's queue; ran nothing"
+    return RETIRED_NOTE if number in retired else TAKEN_FROM_QUEUE
 
 
 def _in_order(bars: Sequence[Bar]) -> list[Bar]:
@@ -931,10 +1142,7 @@ def mark_not_run(study: optuna.Study, number: int) -> None:
     told `FAIL`.
     """
     with _ledger_lock(_opened_ledger(study, "mark a trial not run")):
-        found = [trial for trial in study.get_trials(deepcopy=False) if trial.number == number]
-        if not found:
-            raise LookupError(f"study {study.study_name!r} has no trial #{number}")
-        [trial] = found
+        trial = _trial_numbered(study, number)
         if has_key(trial):
             raise ValueError(
                 f"trial #{number} has config key {trial.user_attrs['config_key']}: it was tried, and"

@@ -1452,3 +1452,141 @@ def test_a_value_told_where_record_trial_tells_none_stops(study: optuna.Study) -
 
     with pytest.raises(RankingStopped, match=r"third: #\d+ [^\n]*told 2\.5, not nan"):
         rank(study)
+
+
+# A recorded retirement of another writer's queued record (ADR 0054, 2026-11-10): each test failed
+# before its change.
+
+
+def test_a_retired_record_is_not_read_and_its_key_stays_counted(
+    study: optuna.Study, stated_n: Callable[[optuna.Study], int]
+) -> None:
+    """A record `record_trial` took from another writer's queue, its outcome and returns that
+    writer's and not the key's run, stops the ranking naming its remedy; retired, it is not read,
+    and N is what it was."""
+    write(study, "pick", PICK)
+    write(study, "second", SECOND)
+    write(study, "third", THIRD_CLOSE)
+    number = write(
+        study,
+        "pick",
+        SECOND,
+        told_complete=False,
+        attrs={"error": canon_trading.ledger.TAKEN_FROM_QUEUE},
+    )
+    with pytest.raises(
+        RankingStopped,
+        match=rf"\(N = 3\)[\s\S]*pick: #{number} \(traded\) was taken from Optuna's queue[^\n]*"
+        rf"retire_queued\(study, {number}\) retires it",
+    ):
+        rank(study)
+    before = stated_n(study)
+
+    canon_trading.ledger.retire_queued(study, number)
+
+    report = rank(study)
+    assert (before, report.n, report.records, report.all_records) == (3, 3, 3, 4)
+    assert number not in report.pick_trials
+
+
+def test_a_key_tried_only_in_a_retired_record_stays_counted_and_names_record_trial(
+    study: optuna.Study, stated_n: Callable[[optuna.Study], int]
+) -> None:
+    """A retired record alone on its key: N still counts the key, and the stop names `record_trial`,
+    which runs the configuration, as the remedy; once it has run, the study ranks at that N."""
+    write(study, "pick", PICK)
+    write(study, "second", SECOND)
+    number = write(
+        study,
+        "third",
+        PICK,
+        told_complete=False,
+        attrs={"error": canon_trading.ledger.TAKEN_FROM_QUEUE},
+    )
+    before = stated_n(study)
+
+    canon_trading.ledger.retire_queued(study, number)
+
+    with pytest.raises(
+        RankingStopped,
+        match=rf"\(N = 3\)[\s\S]*third: tried only in another writer's queued trial #{number}, "
+        r"retired[^\n]*record_trial of its configuration",
+    ):
+        rank(study)
+    after = stated_n(study)
+    write(study, "third", THIRD_CLOSE)
+    assert (before, after, rank(study).n) == (3, 3, 3)
+
+
+def test_a_waiting_keyed_record_names_retire_queued(study: optuna.Study) -> None:
+    """A keyed record queued through `Study.enqueue_trial`, which writes `fixed_params`, stops naming
+    `retire_queued`, the one remedy that keeps its key counted."""
+    write(study, "pick", PICK)
+    write(study, "second", SECOND)
+    study.enqueue_trial({}, user_attrs={"config_key": key_of("third"), "sample": 0})
+    [number] = [t.number for t in study.trials if t.state == TrialState.WAITING]
+
+    with pytest.raises(
+        RankingStopped,
+        match=rf"\(N = 3\)[\s\S]*third: #{number} \(waiting\) is WAITING[^\n]*"
+        rf"retire_queued\(study, {number}\) retires it",
+    ):
+        rank(study)
+
+
+def test_a_retired_list_not_in_its_form_stops(study: optuna.Study) -> None:
+    """A `retired` attribute another writer left in another form is read as no list, and stops."""
+    write(study, "pick", PICK)
+    write(study, "second", SECOND)
+    study.set_user_attr("retired", ["1"])
+
+    with pytest.raises(RankingStopped, match=r"study user attribute retired is \['1'\]"):
+        rank(study)
+
+
+def test_a_taken_record_left_running_is_retired_and_told_fail(study: optuna.Study) -> None:
+    """Code review: a keyed record taken from the queue with its note, its `tell` refused and so
+    left `RUNNING`, was sent to `retire_queued`, which refused it. It is now retired and told `FAIL`."""
+    write(study, "pick", PICK)
+    write(study, "second", SECOND)
+    left = study.ask()
+    left.set_user_attr("config_key", key_of("third"))
+    left.set_user_attr("error", canon_trading.ledger.TAKEN_FROM_QUEUE)
+    with pytest.raises(
+        RankingStopped, match=rf"third: #{left.number} [^\n]*retire_queued\(study, {left.number}\)"
+    ):
+        rank(study)
+
+    canon_trading.ledger.retire_queued(study, left.number)
+
+    assert study.trials[left.number].state == TrialState.FAIL
+    with pytest.raises(RankingStopped, match=r"\(N = 3\)[\s\S]*third: tried only in"):
+        rank(study)
+
+
+def test_a_queued_record_with_another_fault_still_names_retire_queued(study: optuna.Study) -> None:
+    """Second reader: a queued keyed record whose config is not in `record_trial`'s parts stopped
+    on that check first, and its stop named no remedy, though `retire_queued` takes it."""
+    write(study, "pick", PICK)
+    write(study, "second", SECOND)
+    study.enqueue_trial({}, user_attrs={"config_key": key_of("third"), "config": {"x": 1}})
+    [number] = [t.number for t in study.trials if t.state == TrialState.WAITING]
+
+    with pytest.raises(
+        RankingStopped,
+        match=rf"third: #{number} [^\n]*not the parts[^\n]*retire_queued\(study, {number}\)",
+    ):
+        rank(study)
+
+
+def test_no_remedy_is_named_while_the_retired_list_is_not_in_its_form(study: optuna.Study) -> None:
+    """Second review: with the `retired` list in another form, the stop on a queued record still
+    named `retire_queued`, which refuses that list; only the list's own stop names the cause."""
+    write(study, "pick", PICK)
+    write(study, "second", SECOND)
+    study.enqueue_trial({}, user_attrs={"config_key": key_of("third"), "sample": 0})
+    study.set_user_attr("retired", "none")
+
+    with pytest.raises(RankingStopped, match=r"study user attribute retired is 'none'") as stopped:
+        rank(study)
+    assert "retire_queued(study" not in str(stopped.value)

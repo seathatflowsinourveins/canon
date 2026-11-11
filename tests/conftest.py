@@ -17,6 +17,9 @@ bar, and each bar opens at the previous close.
 the window it asked for (`write_bars(start, end)`): from the UTC midnight of the first bar's open to
 the UTC midnight after the last bar's `ts_init`, 2025-03-10 to 2025-05-04 for the default series.
 
+`stated_n` reads N as `canon_trading.ranking.rank` states it, in its report or in the message it stops
+with, for the tests of what a retirement does to N (ADR 0054 term 7).
+
 `equations_one_and_two` works the DSR without skfolio, under the conventions ADR 0031 read in skfolio's
 source: the sample standard deviation in both Sharpe ratios, population skewness, raw kurtosis and
 sqrt(T - 1).
@@ -25,6 +28,7 @@ sqrt(T - 1).
 from __future__ import annotations
 
 import math
+import re
 import statistics
 from datetime import UTC
 from datetime import datetime
@@ -46,6 +50,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
     from pathlib import Path
 
+    import optuna
     from nautilus_trader.model import Bar
     from nautilus_trader.model import Equity
 
@@ -173,3 +178,21 @@ def equations_one_and_two(
 def worked_dsr() -> Callable[..., tuple[float, float]]:
     """`equations_one_and_two`, for a test to check skfolio or the gate against."""
     return equations_one_and_two
+
+
+@pytest.fixture
+def stated_n() -> Callable[[optuna.Study], int]:
+    """N as `rank` states it, whether it ranks the study or stops (`(N = n)` in its message)."""
+
+    def n_of(study: optuna.Study) -> int:
+        from canon_trading.ranking import RankingStopped
+        from canon_trading.ranking import rank
+
+        try:
+            return rank(study).n
+        except RankingStopped as stopped:
+            found = re.search(r"\(N = (\d+)\)", str(stopped))
+            assert found is not None, str(stopped)
+            return int(found.group(1))
+
+    return n_of

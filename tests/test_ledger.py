@@ -23,6 +23,7 @@ import dataclasses
 import enum
 import hashlib
 import math
+import re
 import shutil
 import subprocess
 import sys
@@ -80,6 +81,7 @@ from canon_trading.returns_matrix import daily_series
 from canon_trading.session_ma_cross import SessionMaCrossConfig
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Iterator
 
     from conftest import AlpacaBars
@@ -1846,36 +1848,339 @@ def test_starting_balances_are_keyed_one_per_currency_in_any_order() -> None:
     )
 
 
-def test_a_queued_trial_with_a_key_that_record_trial_takes_stops_the_ranking(
-    alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack
+def foreign_queued(
+    study: optuna.Study,
+    config: MaCrossConfig,
+    *,
+    state: TrialState = TrialState.WAITING,
+    attrs: dict[str, object] | None = None,
+) -> int:
+    """Another writer's queued record of `config`'s key, its outcome `traded` and its returns made up."""
+    user_attrs = {
+        "config_key": config_key(trial_config([config], starting_balances=BALANCES)),
+        "sample": 0,
+        OUTCOME: TRADED,
+        "returns_series": {str(DAY_NS * 20158): 0.5},
+        **(attrs or {}),
+    }
+    study.add_trial(optuna.trial.create_trial(state=state, user_attrs=user_attrs))
+    return study.trials[-1].number
+
+
+def refuse_the_note(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the store refuse every write of a trial's `error`, the note a taken trial carries."""
+    real = optuna.trial.Trial.set_user_attr
+
+    def refused(self: optuna.trial.Trial, key: str, value: Any) -> None:
+        if key == "error":
+            raise optuna.exceptions.StorageInternalError("the store refused the note")
+        real(self, key, value)
+
+    monkeypatch.setattr(optuna.trial.Trial, "set_user_attr", refused)
+
+
+def record_each(study: optuna.Study, catalog: Path, *periods: tuple[int, int]) -> None:
+    for fast, slow in periods:
+        record_trial(study, catalog, [strategy(fast=fast, slow=slow)], starting_balances=BALANCES)
+
+
+# A recorded retirement of another writer's queued record (ADR 0054, 2026-11-10): each test failed
+# before its change.
+
+
+def test_record_trial_refuses_beside_another_writer_s_keyed_queued_trial(
+    alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A third reader: `record_trial` took another writer's queued record of a key, outcome `traded`
-    and returns made up, and told it `FAIL`, which reads as a run that ran to the end; the ranking
-    then passed on returns no backtest gave. Taken with its note, it now stops the ranking for good."""
+    """`record_trial` took another writer's queued record of a key and wrote its note on it; with the
+    note refused, the record was left `FAIL` with that writer's outcome, read as a run of the key
+    (ADR 0054's known limit). It now refuses before `ask`, naming the remedy, so no note is needed:
+    the record stays `WAITING`, and the ranking names the remedy too."""
     alpaca_bars.write(tmp_path / "catalog")
     study = new_study(stack, tmp_path, "queued key")
-    key = config_key(trial_config([strategy()], starting_balances=BALANCES))
-    study.add_trial(
-        optuna.trial.create_trial(
-            state=TrialState.WAITING, user_attrs={"config_key": key, "sample": 0, OUTCOME: TRADED}
-        )
+    number = foreign_queued(study, strategy())
+    refuse_the_note(monkeypatch)
+
+    with pytest.raises(ValueError, match=rf"retire_queued\(study, {number}\) retires it"):
+        record_trial(study, tmp_path / "catalog", [strategy()], starting_balances=BALANCES)
+
+    monkeypatch.undo()
+    [queued] = study.trials
+    assert queued.state == TrialState.WAITING
+    with pytest.raises(
+        RankingStopped,
+        match=rf"#{number} \(traded\) is WAITING[^\n]*retire_queued\(study, {number}\)",
+    ):
+        rank(study)
+
+
+def test_a_retired_queued_record_keeps_its_key_counted_and_record_trial_goes_on(
+    alpaca_bars: AlpacaBars,
+    tmp_path: Path,
+    stack: ExitStack,
+    stated_n: Callable[[optuna.Study], int],
+) -> None:
+    """Retired, another writer's queued record is taken from the queue and told `FAIL` with its note;
+    its key stays counted, alone on the sample and once a later run of it is recorded, and a second
+    retirement is refused."""
+    alpaca_bars.write(tmp_path / "catalog")
+    study = new_study(stack, tmp_path, "retired")
+    number = foreign_queued(study, strategy(fast=2, slow=5))
+    before = stated_n(study)
+
+    canon_trading.ledger.retire_queued(study, number)
+
+    retired = study.trials[number]
+    assert (retired.state, retired.user_attrs["error"], study.user_attrs["retired"]) == (
+        TrialState.FAIL,
+        canon_trading.ledger.RETIRED_NOTE,
+        [number],
+    )
+    with pytest.raises(ValueError, match=rf"trial #{number} is retired already"):
+        canon_trading.ledger.retire_queued(study, number)
+    record_each(study, tmp_path / "catalog", (3, 8))
+    alone = stated_n(study)
+    with pytest.raises(
+        RankingStopped,
+        match=rf"tried only in another writer's queued trial #{number}, retired[^\n]*record_trial",
+    ):
+        rank(study)
+    record_each(study, tmp_path / "catalog", (2, 5))
+    report = rank(study)
+    assert (before, alone, report.n, report.records, report.all_records) == (1, 2, 2, 2, 3)
+
+
+def test_a_record_taken_by_the_code_before_is_retired_by_the_list_alone(
+    alpaca_bars: AlpacaBars,
+    tmp_path: Path,
+    stack: ExitStack,
+    stated_n: Callable[[optuna.Study], int],
+) -> None:
+    """A keyed record `record_trial` took from the queue before it refused, finished and so written
+    on by nothing (Optuna's `UpdateFinishedTrialError`), is retired by the study's list alone."""
+    alpaca_bars.write(tmp_path / "catalog")
+    study = new_study(stack, tmp_path, "taken before")
+    number = foreign_queued(
+        study,
+        strategy(fast=2, slow=5),
+        state=TrialState.FAIL,
+        attrs={"error": canon_trading.ledger.TAKEN_FROM_QUEUE},
+    )
+    record_each(study, tmp_path / "catalog", (3, 8), (2, 5))
+    with pytest.raises(
+        RankingStopped,
+        match=rf"#{number} \(traded\) was taken from Optuna's queue[^\n]*"
+        rf"retire_queued\(study, {number}\)",
+    ):
+        rank(study)
+    before = stated_n(study)
+    taken = study.trials[number]
+
+    canon_trading.ledger.retire_queued(study, number)
+
+    assert study.trials[number] == taken
+    assert study.user_attrs["retired"] == [number]
+    report = rank(study)
+    assert (before, report.n, report.records) == (2, 2, 2)
+
+
+@pytest.mark.parametrize("how", ["stopped before the take", "its note refused"])
+def test_a_retirement_cut_short_reads_as_retired_never_as_a_run(
+    alpaca_bars: AlpacaBars,
+    tmp_path: Path,
+    stack: ExitStack,
+    monkeypatch: pytest.MonkeyPatch,
+    stated_n: Callable[[optuna.Study], int],
+    how: str,
+) -> None:
+    """`retire_queued` writes the study's list under the ledger's lock before it takes the record, so
+    a process stopped between the two, or a note the store refuses, leaves a record read as retired:
+    left `WAITING`, `record_trial` takes it and goes on; left `FAIL` with the other writer's outcome
+    and no note, it is not read as a run of its key."""
+    alpaca_bars.write(tmp_path / "catalog")
+    study = new_study(stack, tmp_path, "cut short")
+    number = foreign_queued(study, strategy(fast=2, slow=5))
+    before = stated_n(study)
+    if how == "stopped before the take":
+
+        def stopped(*_: object, **__: object) -> None:
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(optuna.Study, "ask", stopped)
+    else:
+        refuse_the_note(monkeypatch)
+
+    with pytest.raises((KeyboardInterrupt, optuna.exceptions.StorageInternalError)):
+        canon_trading.ledger.retire_queued(study, number)
+
+    monkeypatch.undo()
+    left = study.trials[number]
+    assert study.user_attrs["retired"] == [number]
+    assert (left.state, left.user_attrs[OUTCOME], "error" in left.user_attrs) == (
+        TrialState.WAITING if how == "stopped before the take" else TrialState.FAIL,
+        TRADED,
+        False,
+    )
+    after = stated_n(study)
+    record_each(study, tmp_path / "catalog", (3, 8), (2, 5))
+    report = rank(study)
+    assert (before, after, report.n, report.records) == (1, 1, 2, 2)
+
+
+def test_retire_queued_retires_only_another_writer_s_queued_record_in_queue_order(
+    tmp_path: Path, stack: ExitStack
+) -> None:
+    """Optuna's `Study.ask` takes only the oldest queued trial, so an older keyed one is retired
+    first, and an older keyless one is taken with `record_trial`'s note; a keyless record, one
+    `record_trial` wrote and a number not there are refused, with nothing written."""
+    study = new_study(stack, tmp_path, "queue order")
+    study.enqueue_trial({})
+    first = foreign_queued(study, strategy(fast=2, slow=5))
+    second = foreign_queued(study, strategy(fast=4, slow=9))
+    own = foreign_queued(  # as `record_trial` leaves a run that raised
+        study, strategy(), state=TrialState.FAIL, attrs={OUTCOME: FAILED, "error": "RuntimeError"}
     )
 
-    for fast, slow in ((3, 8), (2, 5)):
-        record_trial(
-            study,
-            tmp_path / "catalog",
-            [strategy(fast=fast, slow=slow)],
-            starting_balances=BALANCES,
-        )
+    with pytest.raises(LookupError):
+        canon_trading.ledger.retire_queued(study, 99)
+    with pytest.raises(ValueError, match=r"no config key; if it ran no backtest, mark_not_run"):
+        canon_trading.ledger.retire_queued(study, 0)
+    with pytest.raises(ValueError, match=r"is not another writer's queued record"):
+        canon_trading.ledger.retire_queued(study, own)
+    with pytest.raises(ValueError, match=rf"retire #{first} first"):
+        canon_trading.ledger.retire_queued(study, second)
+    assert "retired" not in study.user_attrs
+    assert [t.state for t in study.trials[:3]] == [TrialState.WAITING] * 3
 
-    taken = study.trials[0]
-    assert (taken.state, taken.user_attrs["error"]) == (
+    canon_trading.ledger.retire_queued(study, first)
+    canon_trading.ledger.retire_queued(study, second)
+
+    assert [(t.state, t.user_attrs.get("error")) for t in study.trials[:3]] == [
+        (TrialState.FAIL, canon_trading.ledger.TAKEN_FROM_QUEUE),
+        (TrialState.FAIL, canon_trading.ledger.RETIRED_NOTE),
+        (TrialState.FAIL, canon_trading.ledger.RETIRED_NOTE),
+    ]
+    assert study.user_attrs["retired"] == [first, second]
+
+
+def test_a_retirement_that_finds_its_trial_gone_takes_the_next_with_record_trial_s_note(
+    tmp_path: Path, stack: ExitStack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Code review: another process took the retired trial from the queue between the snapshot and
+    `ask`, and a keyed trial was queued meanwhile; `ask` gave that one, which got a note of a trial
+    `ask` created, so `retire_queued` refused it and the ranking named no remedy. It is now known as
+    taken from the queue, as `_own_trial` knows one, and carries `record_trial`'s note."""
+    study = new_study(stack, tmp_path, "gone")
+    number = foreign_queued(study, strategy(fast=2, slow=5))
+    real_ask = optuna.Study.ask
+    later: list[int] = []
+
+    def raced(self: optuna.Study, *args: Any, **kwargs: Any) -> optuna.trial.Trial:
+        if not later:  # another process takes the target, and a writer queues a keyed trial
+            taken = real_ask(self)
+            self.tell(taken, state=TrialState.FAIL)
+            later.append(foreign_queued(self, strategy(fast=4, slow=9)))
+        return real_ask(self, *args, **kwargs)
+
+    monkeypatch.setattr(optuna.Study, "ask", raced)
+    canon_trading.ledger.retire_queued(study, number)
+    monkeypatch.undo()
+
+    [queued] = later
+    assert (study.trials[queued].state, study.trials[queued].user_attrs["error"]) == (
         TrialState.FAIL,
         canon_trading.ledger.TAKEN_FROM_QUEUE,
     )
-    with pytest.raises(RankingStopped, match=r"#0 \(traded\) was taken from Optuna's queue"):
-        rank(study)
+    canon_trading.ledger.retire_queued(study, queued)
+    assert study.user_attrs["retired"] == [number, queued]
+
+
+def test_a_keyed_trial_queued_after_the_check_names_itself_when_nothing_can_be_written(
+    alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Code review: in the race ADR 0054 term 7 names, a keyed trial queued after `record_trial`'s
+    check, a refused note's error carried a note naming the trial, which a refused `tell` then
+    replaced. Both refusals are now on the one error raised."""
+    alpaca_bars.write(tmp_path / "catalog")
+    study = new_study(stack, tmp_path, "race")
+    number = foreign_queued(study, strategy(fast=2, slow=5))
+    monkeypatch.setattr(canon_trading.ledger, "_refuse_a_keyed_queue", lambda *_: set())
+    refuse_the_note(monkeypatch)
+
+    def refused_tell(*_: object, **__: object) -> None:
+        raise optuna.exceptions.StorageInternalError("the store refused the tell")
+
+    monkeypatch.setattr(optuna.Study, "tell", refused_tell)
+
+    with pytest.raises(optuna.exceptions.StorageInternalError, match="refused the note") as raised:
+        record_trial(study, tmp_path / "catalog", [strategy()], starting_balances=BALANCES)
+
+    notes = "\n".join(raised.value.__notes__)
+    assert f"trial #{number}, queued by another writer with config key" in notes
+    assert "could not be told FAIL either" in notes
+
+
+def test_a_trial_retired_between_record_trial_s_note_and_its_tell_lets_record_trial_go_on(
+    alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Second review: `record_trial` takes a raced keyed trial outside the ledger's lock, and one
+    retired between its note and its `tell` was told `FAIL` first, so that `tell` raised and
+    `record_trial` stopped. The `tell` now skips a trial already finished, and the run goes on."""
+    alpaca_bars.write(tmp_path / "catalog")
+    study = new_study(stack, tmp_path, "between")
+    number = foreign_queued(study, strategy(fast=2, slow=5))
+    monkeypatch.setattr(canon_trading.ledger, "_refuse_a_keyed_queue", lambda *_: set())
+    real = optuna.trial.Trial.set_user_attr
+
+    def then_retired(self: optuna.trial.Trial, key: str, value: Any) -> None:
+        real(self, key, value)
+        if key == "error" and self.number == number:  # another process retires it now
+            canon_trading.ledger.retire_queued(study, number)
+
+    monkeypatch.setattr(optuna.trial.Trial, "set_user_attr", then_retired)
+    recorded = record_trial(study, tmp_path / "catalog", [strategy()], starting_balances=BALANCES)
+    monkeypatch.undo()
+
+    assert recorded.number == number + 1
+    assert (study.trials[number].state, study.user_attrs["retired"]) == (TrialState.FAIL, [number])
+
+
+def test_a_retired_trial_that_cannot_be_read_back_is_still_told_fail(
+    tmp_path: Path, stack: ExitStack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Second review: a store error reading back the trial `ask` took left it `RUNNING` with no
+    note; it is now noted as the queue before `ask` says and told `FAIL`, and the error raised."""
+    study = new_study(stack, tmp_path, "read back")
+    number = foreign_queued(study, strategy(fast=2, slow=5))
+
+    def unread(*_: object) -> None:
+        raise optuna.exceptions.StorageInternalError("the store refused the read")
+
+    monkeypatch.setattr(canon_trading.ledger, "_asked", unread)
+    with pytest.raises(optuna.exceptions.StorageInternalError, match="refused the read"):
+        canon_trading.ledger.retire_queued(study, number)
+    monkeypatch.undo()
+
+    assert (study.trials[number].state, study.trials[number].user_attrs["error"]) == (
+        TrialState.FAIL,
+        canon_trading.ledger.RETIRED_NOTE,
+    )
+
+
+def test_a_retired_list_not_in_its_form_is_refused_by_record_trial_and_retire_queued(
+    alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack
+) -> None:
+    """Code review: with the `retired` list in another form, `record_trial` read it as empty and
+    named `retire_queued`, which refused the list; both now name the list."""
+    alpaca_bars.write(tmp_path / "catalog")
+    study = new_study(stack, tmp_path, "list")
+    number = foreign_queued(study, strategy(fast=2, slow=5))
+    study.set_user_attr("retired", [str(number)])
+
+    named = re.escape(f"study user attribute retired is {[str(number)]!r}")
+    with pytest.raises(ValueError, match=named):
+        record_trial(study, tmp_path / "catalog", [strategy()], starting_balances=BALANCES)
+    with pytest.raises(ValueError, match=named):
+        canon_trading.ledger.retire_queued(study, number)
 
 
 def test_a_queued_record_marked_while_waiting_stays_cleared_once_record_trial_takes_it(

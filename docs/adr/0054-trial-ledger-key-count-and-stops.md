@@ -52,15 +52,55 @@ ADR 0035's numbers, 4 to 6; terms 1 to 3 (storage, recording, entry) are ADR 003
    A configuration that can never run to the end stops the ranking for as long as that study is used.
    That is the strict reading: a tried configuration is a trial, and no source read gives it a value.
    Like the idle trial, it is undecided, not solved.
+7. **Retiring another writer's queued record** (added 2026-11-10). A record with a config key that
+   another writer queued in Optuna (`WAITING`) never ran here, and whatever results it holds are that
+   writer's. `record_trial` refuses to ask for a trial while one waits, naming it and the remedy:
+   `retire_queued(study, n)`, an operator's action on that one record. Retired, a record is never read
+   as a run, and its key stays counted in N as a configuration that was tried: the strict side, which
+   is the gate's. It is kept, as a record in `not_run_waiting` is (ADR 0053 term 3), but unlike that
+   keyless record its key is known, and counted. Its number joins the study user attribute `retired`,
+   written under the ledger's lock before the record is taken from the queue (`Study.ask`) and told
+   `FAIL` with a note, so a retirement cut short reads as retired, never as a run; nothing is deleted,
+   and a second retirement is refused. A keyed record taken from the queue with a note before (as
+   `record_trial` took one before it refused) is retired by the list alone if it is `FAIL`, since
+   Optuna writes nothing on a finished trial, and told `FAIL` after the list if its `tell` was refused
+   and it is still `RUNNING`. A retired record is not read in any state: whatever another writer does
+   to it later, it gives the ranking no returns, and its key is counted either way. A key tried only
+   in retired records stops the ranking until `record_trial` runs it on the current sample; a key no
+   configuration `record_trial` runs hashes to therefore stops it for good, the strict side, and so does
+   one outside the study's plan (ADR 0048) for as long as the plan is kept. Only another writer's queued record is retired: a record
+   `record_trial` wrote is a trial of its key, and only a later record of that key resolves it. Every
+   stop on a record `retire_queued` takes names it; the stop on a key tried only in retired records
+   names `record_trial`. A `retired` list in another form is refused by `record_trial`, `retire_queued`
+   and the study's pass (`canon_trading.variant_study`), and stops the ranking.
+   Named limits. A keyed trial queued between `record_trial`'s check and its `ask` is still taken,
+   told `FAIL` with `record_trial`'s note, and the ranking stops on it naming `retire_queued`. If the
+   store refuses that note too, `record_trial` raises the store's error with a note naming the trial
+   and its key (and the refused `tell`, if that is refused as well); what the operator sees is that
+   error. The record is then `FAIL` (or `RUNNING`, if that `tell` is refused too) with the other
+   writer's outcome and no note: one queued through
+   `Study.enqueue_trial` holds the system attribute `fixed_params`, and the ranking stops on it for
+   good; one queued with no system attribute reads as a run of its key, as before (Evidence, sixth
+   review). `retire_queued` refuses either, since nothing on it tells it from `record_trial`'s own
+   `FAIL`, so the ledger offers no remedy for it. And a writer of the study's attributes other than
+   `retire_queued` could put a record of `record_trial`'s in the list, which hides it from every check
+   but not its key from N; like the queue, the ledger's writers are this repository's own sessions, so
+   this is stated, not defended against.
 
 Who decided. The orchestrator chose option 3 and the terms under the owner's delegation of 2026-11-10
-(ADR 0010's Evidence).
+(ADR 0010's Evidence). Term 7 was decided by the orchestrator under the same delegation, 2026-11-10, over a
+chain of studies (ADR 0041's option 3, not chosen) and over carrying N by key into a named successor
+study, a larger mechanism than one foreign record needs.
 
 ### Consequences
 
 * Good: N is read from the ledger, never typed.
 * Bad: the config key is local glue.
 * Bad: a configuration that fails every time, or never trades, blocks the study's ranking.
+* Good: another writer's queued record of a configuration the study runs no longer stops it for good;
+  retired, its key still counts, so the remedy never lowers N (term 7).
+* Bad: retirement is an operator's action; a retired key no configuration of the study runs stops it
+  for good, and the race term 7 names is left to the operator.
 
 ### Confirmation
 
@@ -92,6 +132,46 @@ Who decided. The orchestrator chose option 3 and the terms under the owner's del
   config not in `record_trial`'s three parts (`test_a_config_not_in_the_form_record_trial_writes_stops`)
   stop for good. `test_a_keyed_record_with_a_result_and_no_outcome_stops_for_good` now keys its record
   with the pick's own key, as the regression it names needs.
+* Term 7, tests that failed before their change: `record_trial` refuses beside a keyed queued record,
+  with its note refused too, and the record stays `WAITING`
+  (`test_record_trial_refuses_beside_another_writer_s_keyed_queued_trial`); N is the same or higher
+  after a retirement, on every path: a retired record alone on its key, then with a later run of its
+  key (`test_a_retired_queued_record_keeps_its_key_counted_and_record_trial_goes_on`,
+  `test_a_key_tried_only_in_a_retired_record_stays_counted_and_names_record_trial`), and a record the
+  code before took from the queue, retired by the list alone
+  (`test_a_record_taken_by_the_code_before_is_retired_by_the_list_alone`,
+  `test_a_retired_record_is_not_read_and_its_key_stays_counted`); a second retirement is refused and
+  `record_trial` goes on afterwards (the first of those); a retirement stopped between the list and the
+  take, or with its note refused, reads as retired and never as a run
+  (`test_a_retirement_cut_short_reads_as_retired_never_as_a_run`); the queue is retired in its order,
+  and every other record is refused (`test_retire_queued_retires_only_another_writer_s_queued_record_in_queue_order`);
+  the stops name the remedy (`test_a_waiting_keyed_record_names_retire_queued`, and the tests above);
+  a `retired` list in another form stops (`test_a_retired_list_not_in_its_form_stops`); the study's
+  pass runs a key whose only record is retired
+  (`tests/test_variant_study.py::test_a_key_whose_only_record_on_the_sample_is_retired_is_run`).
+  From the review of term 7, tests that failed before their fix: a retirement whose trial another
+  process took meanwhile gives the next trial `ask` takes `record_trial`'s note, and that one can be
+  retired (`test_a_retirement_that_finds_its_trial_gone_takes_the_next_with_record_trial_s_note`); in
+  the race, both refusals reach the error raised
+  (`test_a_keyed_trial_queued_after_the_check_names_itself_when_nothing_can_be_written`); a `retired`
+  list in another form is refused by `record_trial` and `retire_queued` alike
+  (`test_a_retired_list_not_in_its_form_is_refused_by_record_trial_and_retire_queued`); a taken record left `RUNNING` is
+  retired and told `FAIL` (`test_a_taken_record_left_running_is_retired_and_told_fail`); a queued
+  record that another check stops on still names the remedy
+  (`test_a_queued_record_with_another_fault_still_names_retire_queued`). From its second review, tests
+  that failed before their fix: a trial retired between `record_trial`'s note and its `tell` lets
+  `record_trial` go on
+  (`test_a_trial_retired_between_record_trial_s_note_and_its_tell_lets_record_trial_go_on`); a trial
+  `retire_queued` takes and cannot read back is still told `FAIL` with its note
+  (`test_a_retired_trial_that_cannot_be_read_back_is_still_told_fail`); no remedy is named while the
+  `retired` list is not in its form
+  (`test_no_remedy_is_named_while_the_retired_list_is_not_in_its_form`).
+* The trial count is per study (term 5): nothing in the code stops a new study of the same
+  configurations from starting at N = 0, and no record carries an earlier study's keys into it. What
+  holds that line is pre-registering every study in a record before its first run, as ADR 0048 does
+  for step 7. A study that repeats configurations of an earlier one says so in its pre-registration
+  and counts them in its N. Read in these records on 2026-11-10 (the Evidence below); no test can
+  assert it.
 
 ## Evidence
 
@@ -163,7 +243,7 @@ Term numbers are ADR 0035's.
   `Study.ask` takes the oldest queued trial, `_pop_waiting_trial_id`, `bundled`), it carries
   `record_trial`'s note, and the ranking stops on a keyed record with that note for good. Kept as a
   known limit: a refused write of the note leaves it `FAIL` with the other writer's outcome, read as a
-  run of its key; a refusal before `ask` would close that, and is not decided here (below). A value told against its returns, and a config holding only the data, passed. Under the
+  run of its key (narrowed by term 7: one holding a system attribute stops the ranking instead); a refusal before `ask` would close that, and is not decided here (below). A value told against its returns, and a config holding only the data, passed. Under the
   regression its docstring names, the test of a record with a result and no outcome passed, its key the
   text `pick` and not the pick's (run). No change of decision.
 * What a study stopped for good does to N, read in these records on 2026-11-10: N is the number of
@@ -174,7 +254,41 @@ Term numbers are ADR 0035's.
   study's keys into a successor. A refusal that leaves a new study as the only remedy would therefore
   be a way to lower N, which the protocol forbids (DSR paper, p. 10, fn. 1), and `record_trial` does
   not refuse a study that holds such a record; carrying N by key into a named successor, or a recorded
-  retirement of the foreign record with its key still counted, is undecided. Stated limit: any writer
+  retirement of the foreign record with its key still counted, is undecided (term 7 decides it). Stated limit: any writer
   to the ledger can queue a keyed trial (`Study.enqueue_trial`) and so stop a study for good. The
   ledger is a local file whose writers are this repository's own sessions, so this is stated, not
   defended against.
+* Term 7, added 2026-11-10, decides the remedy left open above: a recorded retirement of the foreign
+  record, its key still counted, and no chain of studies. Optuna 5.0.0, read in the installed package
+  (`v5.0.0`, `01ddd17ab9f3`): `Study.ask` takes the oldest `WAITING` trial before it creates one
+  (`study/study.py`, `_pop_waiting_trial_id`, over `get_all_trials` in order of trial ID), and no public
+  call takes a chosen one; `Study.tell` tells only a `RUNNING` trial (`study/_tell.py`); every write
+  of a trial attribute checks `check_trial_is_updatable` (`storages/_rdb/storage.py`,
+  `storages/_base.py`), so `Trial.set_user_attr` after `tell` raises `UpdateFinishedTrialError` (run).
+  So a record is taken through `ask` in queue order, and the retirement of a finished one is the study
+  user attribute (`Study.set_user_attr`), with no private storage call. `record_trial` now refuses
+  before `ask`, which closes the known limit above on its path: it no longer takes a keyed queued
+  record, so no note of its is needed to keep one from reading as a run, and `retire_queued` writes its
+  list before it takes one. What is left is the race term 7 names. Reproduced as failing tests on the
+  code before this change (Confirmation).
+* Review of term 7, 2026-11-10. Code review (`/code-review`, high): ten findings. Fixed, each shown by
+  a test that failed first: a retirement's own race took a newer queued trial with a note
+  `retire_queued` refused; a refused `tell` replaced the error naming a raced trial; a remedy named for
+  a taken record left `RUNNING`, which `retire_queued` refused; a `retired` list in another form read
+  three ways; and three cleanups (one take helper for `record_trial` and `retire_queued`, one lookup, one
+  helper in the tests). Corrected in this record: a retired key nothing runs stops for good, and a raced
+  record holding `fixed_params` stops rather than reading as a run. Not changed, stated in term 7: a
+  retired record is read in no state, since checking its state could not tell a retirement cut short
+  from `record_trial`'s own failure, and its key is counted either way. Second reader
+  (`evidence-verifier`): the Optuna claims hold against `v5.0.0` (the installed files are upstream's,
+  run), and so do the records cited; it corrected the race's wording, a stop that did not name the
+  remedy when another check fired first, the comparison with `not_run_waiting`, and a test that did not
+  measure N before a retirement. A second code review (`/code-review`, high) of those fixes: nine
+  findings. Fixed, each shown by a test that failed first: a `RUNNING` record retired while a live
+  `record_trial` held it made that `record_trial`'s `tell` raise (now `Study.tell(...,
+  skip_if_finished=True)`, Optuna 5.0.0 `study/_tell.py`, and `retire_queued` asks that a `RUNNING`
+  record's process be gone, as `mark_not_run` does); a trial `retire_queued` took and could not read
+  back stayed `RUNNING`; a remedy was named while the `retired` list was not in its form. Fixed with no
+  test: a refused note in a retirement's race now names the trial, a docstring, the pass's refusal of
+  such a list, a test fixture's import and a test's pattern. Not changed: two extra reads of the study
+  per retirement, which hold the lock a little longer and change nothing read.
