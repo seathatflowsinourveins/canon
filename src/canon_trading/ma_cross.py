@@ -49,7 +49,11 @@ Known limits:
 * It decides from its open positions at each bar and does not track its own working orders. In a
   backtest an order sent from `on_bar` fills before the next bar (concepts/backtesting/bar-execution,
   "Order submission timing"). On a venue, a bar that arrives while an order is still working would send
-  a second one. This must be closed before a paper run.
+  a second one, so this strategy is not run on paper: `SessionMaCross`, which has a working-order guard,
+  is the one for that. A backtest with a latency model does the same: the order waits for a later bar,
+  and on the test fixture's bars each cross was followed by a second order (6 fills and 1 rejected sell
+  where 4 fills were meant, observed at v2.0.0rc8, ADR 0067). Adding a guard here would be a new strategy
+  and so a new study, since the step 7 study keys on this one (ADR 0048).
 * `on_stop` flattens, so stopping a node sells whatever this strategy holds.
 """
 

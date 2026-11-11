@@ -88,6 +88,12 @@ has a deflated Sharpe ratio of 0.9338 and is rejected at 0.95, accepted on the c
   ranking; a study on another range is refused; nothing is created unless asked; the pass rule, the
   refusal, the second pass and a run that raises behave as stated above.
 * `mise run paper:test -k variant_study_bars`: the bars of the sample load (Evidence).
+* Known limit, recorded 2026-11-10: `MaCross` checks its position but not its orders in flight, so with
+  any delay between an order and its fill it sends a second order after each cross. On the test
+  fixture's 40 AAPL bars (3/8, 10 shares) with a latency model that gave 6 fills and 1 rejected sell
+  where 4 fills were meant (ADR 0067, offline). The study ran with no latency
+  model, so every order filled before the next bar and the limit did not arise in it. `SessionMaCross`
+  has a working-order guard; `MaCross` does not, and changing it would be a new strategy and a new study.
 * The run and its result: ADR 0052's Confirmation.
 * Since the run: a study is ranked only once every configuration of the plan has a record
   (`test_a_study_short_of_its_plan_is_not_ranked`), and a run whose failure could not be told stops the
