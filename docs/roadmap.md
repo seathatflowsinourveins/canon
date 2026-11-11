@@ -47,5 +47,6 @@ ADR 0009 keeps trading on paper at least until NautilusTrader v2.0.0 stable, a c
   (ADR 0029).
 * **OpenTelemetry dashboards** beyond the local Collector's event file (ADR 0007) and **an eval of this repo's own** for model routing
   (ADR 0005). For reviewers, the benchmark's cases and procedure are in `evals/review/` (ADR 0046); its
-  first run is scored there, its cases hold 21 confirmed defects (10 in `order-modify`), and its pending
+  first run is scored there, its cases hold 23 confirmed defects (10 in `order-modify`, 10 in
+  `trial-ledger-gate`), and its pending
   cases wait on fixes reaching `main`.

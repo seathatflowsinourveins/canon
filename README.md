@@ -228,6 +228,6 @@ here, community convergence, then anyone's recollection.
   not measured, and there are no dashboards (ADR 0007).
 * **No model-routing eval of our own has run.** Model routing rests on external measurements (ADR 0005). A reviewer
   benchmark is defined, with its cases, brief and procedure in `evals/review/` (ADR 0046); its first run
-  (2026-11-10) scored 10 confirmed defects, in `evals/review/runs/`. Its cases now hold 21, 10 in
-  `order-modify`, 9 in `trial-ledger-gate` and one each in two others, so with most bunched in two cases it
+  (2026-11-10) scored 10 confirmed defects, in `evals/review/runs/`. Its cases now hold 23, 10 in
+  `order-modify`, 10 in `trial-ledger-gate` and one each in three others, so with most bunched in two cases it
   can show only gross differences.
