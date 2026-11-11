@@ -164,6 +164,11 @@ fixes no state-file path, so the line points at the one the summary keeps. A thi
 the CLAUDE.md section already carries them. UNVERIFIED: how a 300,000 window
 changes summary quality against the default.
 
+On 2026-11-11 the owner set the auto-compact window for Fable 5.2 to 600,000 tokens with `/autocompact`, a
+per-model `modelSettings` entry that wins over the top-level key for that model. The template's default
+stays 300,000, and a per-model setting the owner makes stands: `scripts/bootstrap --user-config` adds only the
+top-level `autoCompactWindow` (its `CANON_KEYS`) and leaves `modelSettings` as it finds it.
+
 ## Addition, 2026-11-11: one generated machine manifest
 
 `scripts/manifest` joins exactly `scripts/bootstrap --check`, `scripts/automation status` and

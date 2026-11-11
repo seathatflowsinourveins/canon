@@ -102,6 +102,36 @@ The trial is in ADR 0025's Confirmation. UNVERIFIED: a cockpit start with these 
 throwaway keychain file's item was refused inside Codex's sandbox); DeepSeek Harness under
 `approval: never`.
 
+**Codex's profile in its config file, 2026-11-11.** `home/.codex/defaults.toml` now carries rule 1's three
+settings (`approval_policy = "never"`, `default_permissions = "canon-worker"` and the `canon-worker` profile),
+and `scripts/bootstrap --user-config` writes whichever of them `${CODEX_HOME:-~/.codex}/config.toml` lacks at
+its top, keeping a dated `.replaced-*` copy and leaving every other key, and a value the owner set otherwise,
+as it was. `scripts/bootstrap --check` has a `codex permissions` row: ok when the profile is present and the
+default, NOT SET naming what is missing, OWNER when a value differs or the file sets `sandbox_mode`, which
+Codex uses in place of `default_permissions`. Two runs of Codex 0.167.0 from an empty folder, `codex exec`
+with the three settings as `-c` overrides:
+
+* without a bypass flag: no prompt; `touch /tmp/<probe>` failed with "Operation not permitted" and the file
+  did not exist afterwards; a read of `~/.codex/auth.json` failed with "Operation not permitted" (the
+  command discarded its output, so nothing of the file was shown);
+* with `--dangerously-bypass-approvals-and-sandbox` added, the flag Orca pre-fills for Codex: the same
+  `/tmp` write succeeded. The flag wins over the profile, as Codex's precedence puts CLI flags first and a
+  `--sandbox` over `default_permissions`.
+
+So the profile holds for a Codex started without the bypass flag. An Orca-started Codex worker gets it
+once Orca stops pre-filling that flag for Codex (Settings → Agents → Agent Permissions, Codex from Yolo
+to Manual, the owner's switch); with approvals `never` from the config, Manual should add no prompt.
+Until then `AGENTS.md`'s sentence about the bypass flag stands.
+
+Three limits. Codex keeps its sign-in file in `CODEX_HOME`, so when that is set the profile written there
+denies `$CODEX_HOME/auth.json` in place of `~/.codex/auth.json`. Orca starts Codex with a `CODEX_HOME` of its
+own, a managed folder with its own `config.toml` and sign-in file. A run of `--user-config` without that
+variable writes `~/.codex/config.toml`, which an Orca-started Codex does not read unless Orca carries it
+over. The settings are user-level, so they also hold for a Codex the owner starts by hand. `--check`
+reads the user config only, and a project `.codex/config.toml` that sets `sandbox_mode` would still win.
+UNVERIFIED: whether Orca copies `~/.codex/config.toml` into its managed home; an Orca launch in Manual
+mode, and that it adds no prompt; the probes on Codex 0.167.1, which the machine moved to the same day.
+
 Antigravity's print form, for a run started by hand, uses absolute paths: `agy -p --sandbox --settings`.
 The settings set `enableTerminalSandbox` and `"toolPermission": "proceed-in-sandbox"`. They allow
 `read_file` of mise's installs, binary and config and of the checkout's common `.git`, which a worktree
@@ -113,6 +143,11 @@ run's temp folder and, for a builder, the workspace. They deny `write_file` of `
 
 Read 2026-11-11. `fetched`: downloaded whole with `curl` and searched; `run`: a command run here.
 
+* https://learn.chatgpt.com/docs/config-file/config-basic.md — the resolution order, "CLI flags and
+  `--config` overrides" first, user `config.toml` fourth; https://learn.chatgpt.com/docs/permissions.md —
+  "If `sandbox_mode` appears in any loaded config file, you pass `--sandbox`, ... Codex uses those older
+  sandbox settings instead of `default_permissions`"; the old developers.openai.com/codex address
+  redirects to learn.chatgpt.com (fetched 2026-11-11).
 * https://learn.chatgpt.com/docs/permissions.md — the built-in profiles, `:workspace`'s two sentences,
   `extends`, `:tmpdir` and `:slash_tmp`, "do not compose with the older sandbox settings"; on macOS
   Codex "refuses to run the command instead of silently running it unsandboxed" (fetched).

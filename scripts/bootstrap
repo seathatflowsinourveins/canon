@@ -37,8 +37,9 @@
 # "claude-fable-5-2", ADR 0059), keeping a copy of the previous file; a value the owner set otherwise is
 # left alone and named. It
 # appends home/.codex/otel.toml to ${CODEX_HOME:-~/.codex}/config.toml when that file has no otel table of its
-# own and its folder exists, and writes home/.codex/defaults.toml's keys (model, model_reasoning_effort) that
-# the file lacks at its top, keeping a copy of the previous file and changing nothing else in it; an otel
+# own and its folder exists, and writes home/.codex/defaults.toml's settings (model, model_reasoning_effort;
+# approval_policy, default_permissions and the canon-worker permissions profile, ADR 0034) that the file
+# lacks at its top, keeping a copy of the previous file and changing nothing else in it; an otel
 # table or a default that is not canon's is left alone and named (Codex: CODEX_HOME, codex-rs/utils/home-dir
 # at the pinned tag). It sets Antigravity's default model, the "model" key of
 # ~/.gemini/antigravity-cli/settings.json ("saved by its label", https://antigravity.google/docs/settings), to
@@ -542,19 +543,28 @@ agy_row() {
   else row "agy self-updater" absent "no agy on PATH"; fi
 }
 
-# codex_defaults <config.toml>: JSON naming the keys of home/.codex/defaults.toml the file lacks ("missing"),
-# sets to another value ("other"), and those an active profile sets ("profile_sets"; Codex: a profile's keys
-# override the top level, https://learn.chatgpt.com/docs/config-file/config-reference), or {"state":
-# "invalid"} when it is not TOML and {"state": "unknown"} when no python3 with tomllib is here. With a second
-# argument, it also writes to that path the file with the missing keys at its top, where TOML keeps keys of no
-# table, and fails unless the result reads as the old file plus exactly those keys.
+# codex_defaults <config.toml>: JSON naming the settings of home/.codex/defaults.toml the file lacks
+# ("missing"), sets to another value ("other"), and those an active profile sets ("profile_sets"; Codex: a
+# profile's keys override the top level, https://learn.chatgpt.com/docs/config-file/config-reference), or
+# {"state": "invalid"} when it is not TOML and {"state": "unknown"} when no python3 with tomllib is here. A
+# setting is a top-level key of the template, or one entry of a top-level table (permissions.canon-worker,
+# ADR 0034), compared as a whole. "sandbox" lists the older sandbox keys the file sets (top level or active
+# profile), which Codex uses instead of default_permissions (https://learn.chatgpt.com/docs/permissions). With
+# a second argument, it also writes to that path the file with the missing settings at its top, where TOML
+# keeps keys of no table, and fails (exit 3) unless the result reads as the old file plus exactly those.
 codex_defaults() {
   local py
   py=$(toml_python) || { echo '{"state": "unknown"}'; return; }
-  "$py" -I -c 'import json, sys, tomllib
+  CANON_CODEX_DIR="$CODEX_DIR" "$py" -I -c 'import json, os, re, sys, tomllib
 src, want_path = sys.argv[1], sys.argv[2]
 out = sys.argv[3] if len(sys.argv) > 3 else None
 want = tomllib.load(open(want_path, "rb"))
+# the sign-in file sits in CODEX_HOME (codex-rs/utils/home-dir), so a deny of the default one follows it
+cdir, ddir = os.environ.get("CANON_CODEX_DIR", ""), os.path.expanduser("~/.codex")
+for prof_t in (want.get("permissions") or {}).values():
+    fs = prof_t.get("filesystem") if isinstance(prof_t, dict) else None
+    if isinstance(fs, dict) and cdir and os.path.realpath(cdir) != os.path.realpath(ddir):
+        prof_t["filesystem"] = {(os.path.join(cdir, "auth.json") if k == "~/.codex/auth.json" else k): v for k, v in fs.items()}
 try:
     raw = open(src, "rb").read()
     have = tomllib.loads(raw.decode())
@@ -564,40 +574,103 @@ except OSError:
     print(json.dumps({"state": "unreadable"})); sys.exit()
 except (UnicodeDecodeError, tomllib.TOMLDecodeError):
     print(json.dumps({"state": "invalid"})); sys.exit()
-missing = [k for k in want if k not in have]
-other = [k for k in want if k in have and have[k] != want[k]]
+NONE = object()
+def get(d, path):
+    for k in path:
+        if not isinstance(d, dict) or k not in d:
+            return NONE
+        d = d[k]
+    return d
+def tkey(k):
+    return k if re.fullmatch(r"[A-Za-z0-9_-]+", k) else json.dumps(k)
+def tval(v):
+    if isinstance(v, bool): return "true" if v else "false"
+    if isinstance(v, (int, float)): return repr(v)
+    if isinstance(v, str): return json.dumps(v)
+    if isinstance(v, list): return "[" + ", ".join(tval(x) for x in v) + "]"
+    if isinstance(v, dict): return "{" + ", ".join(tkey(k) + " = " + tval(x) for k, x in v.items()) + "}"
+    raise TypeError(type(v))
+units = [u for k, v in want.items() for u in ([(k, c) for c in v] if isinstance(v, dict) else [(k,)])]
+name = lambda u: ".".join(u)
+missing = [u for u in units if get(have, u) is NONE]
+other = [u for u in units if get(have, u) is not NONE and get(have, u) != get(want, u)]
 prof = have.get("profile")
-pt = (have.get("profiles") or {}).get(prof) if isinstance(prof, str) else None
-psets = [k for k in want if isinstance(pt, dict) and k in pt and pt[k] != want[k]]
-if out and missing:
-    head = "# canon: native default model and effort (home/.codex/defaults.toml, docs/adr/0059-native-defaults-for-every-runtime.md)\n"
-    head += "".join(k + " = " + json.dumps(want[k]) + "\n" for k in missing)
+pts = have.get("profiles")
+pt = pts.get(prof) if isinstance(prof, str) and isinstance(pts, dict) else None
+pt = pt if isinstance(pt, dict) else {}
+psets = [u for u in units if get(pt, u) is not NONE and get(pt, u) != get(want, u)]
+sandbox = [k for k in ("sandbox_mode", "sandbox_workspace_write") if k in have] + ["profiles." + prof + "." + k for k in ("sandbox_mode", "sandbox_workspace_write") if k in pt]
+def merged(adds):
+    """the file with adds at its top, or None unless it reads as the old file plus exactly those"""
+    head = "# canon: native defaults and the worker permissions profile (home/.codex/defaults.toml, docs/adr/0059-native-defaults-for-every-runtime.md, docs/adr/0034-each-runtime-in-its-own-sandbox.md)\n"
+    head += "".join(".".join(tkey(k) for k in u) + " = " + tval(get(want, u)) + "\n" for u in adds)
     new = head.encode() + (b"\n" + raw if raw else b"")
-    got = tomllib.loads(new.decode())
-    if {k: v for k, v in got.items() if k not in missing} != have or any(got[k] != want[k] for k in missing):
+    try:
+        got = tomllib.loads(new.decode())
+    except tomllib.TOMLDecodeError:
+        return None
+    if any(get(got, u) != get(want, u) for u in adds):
+        return None
+    for u in adds:   # take the new settings out again: what is left must be the old file
+        d = got
+        for k in u[:-1]: d = d[k]
+        del d[u[-1]]
+        if len(u) > 1 and not d and get(have, u[:-1]) is NONE: del got[u[0]]
+    return new if got == have else None
+unwritten = []
+if out and missing:
+    # a table entry (permissions.canon-worker) cannot always join a table the file already declares; the
+    # top-level keys are then written without it, and it is named
+    new = merged(missing)
+    if new is None:
+        top = [u for u in missing if len(u) == 1]
+        new = merged(top) if top else None
+        unwritten = [name(u) for u in missing if len(u) > 1]
+    if new is None:
         sys.exit(3)
     open(out, "wb").write(new)
-effective = {k: pt[k] if isinstance(pt, dict) and k in pt else have.get(k) for k in want}
-sources = {k: "profiles." + prof + "." + k if isinstance(pt, dict) and k in pt else k for k in want}
-print(json.dumps({"state": "read", "missing": missing, "other": other, "profile": prof if isinstance(prof, str) else None, "profile_sets": psets, "effective": effective, "sources": sources}))' "$1" "$CODEX_DEFAULTS_SRC" ${2:+"$2"}
+effective = {name(u): get(pt, u) if get(pt, u) is not NONE else (None if get(have, u) is NONE else get(have, u)) for u in units}
+sources = {name(u): "profiles." + prof + "." + name(u) if get(pt, u) is not NONE else name(u) for u in units}
+print(json.dumps({"state": "read", "units": [name(u) for u in units], "missing": [name(u) for u in missing], "other": [name(u) for u in other], "profile": prof if isinstance(prof, str) else None, "profile_sets": [name(u) for u in psets], "unwritten": unwritten, "sandbox": sandbox, "effective": effective, "sources": sources}))' "$1" "$CODEX_DEFAULTS_SRC" ${2:+"$2"}
 }
-codex_defaults_row() {
-  local c="$CODEX_DIR/config.toml" j
-  if [ ! -d "$CODEX_DIR" ]; then row "codex defaults" absent "no $CODEX_DIR (Codex not installed)"; return; fi
+# the settings of home/.codex/defaults.toml that make up ADR 0034's worker profile; the rest are ADR 0059's
+CODEX_PERM_RE='^(approval_policy|default_permissions|permissions[.])'
+# codex_settings_row <row name> <jq filter selecting the settings> <what they are> <what NOT SET means>:
+# one --check row for some of home/.codex/defaults.toml's settings, read from the file
+codex_settings_row() {
+  local c="$CODEX_DIR/config.toml" j sel="$2" re="$CODEX_PERM_RE"
+  if [ ! -d "$CODEX_DIR" ]; then row "$1" absent "no $CODEX_DIR (Codex not installed)"; return; fi
   j=$(codex_defaults "$c") || j='{"state": "unknown"}'
   case "$(jq -r '.state' <<<"$j")" in
-    invalid) row "codex defaults" INVALID "$c is not valid TOML; Codex cannot read it either"; return ;;
-    unreadable) row "codex defaults" UNKNOWN "$c cannot be read"; return ;;
-    unknown) row "codex defaults" UNKNOWN "no python3 with tomllib to read $c; run: scripts/bootstrap --install"; return ;;
+    invalid) row "$1" INVALID "$c is not valid TOML; Codex cannot read it either"; return ;;
+    unreadable) row "$1" UNKNOWN "$c cannot be read"; return ;;
+    unknown) row "$1" UNKNOWN "no python3 with tomllib to read $c; run: scripts/bootstrap --install"; return ;;
   esac
-  local want; want=$(grep -v -e '^#' -e '^$' "$CODEX_DEFAULTS_SRC" | tr '\n' ' ')
+  # shellcheck disable=SC2016  # jq program, not shell
+  j=$(jq -c --arg re "$re" "def pick: map(select($sel)); .units |= pick | .missing |= pick | .other |= pick | .profile_sets |= pick" <<<"$j")
+  local want; want=$(jq -r '.units | join(", ")' <<<"$j")
   if [ "$(jq '.profile_sets | length' <<<"$j")" != 0 ]; then
-    row "codex defaults" OWNER "the active profile $(jq -r '.profile' <<<"$j") in $c sets $(jq -r '.profile_sets | join(", ")' <<<"$j") otherwise, which overrides $want"
+    row "$1" OWNER "the active profile $(jq -r '.profile' <<<"$j") in $c sets $(jq -r '.profile_sets | join(", ")' <<<"$j") otherwise, which overrides $3"
   elif [ "$(jq '.other | length' <<<"$j")" != 0 ]; then
-    row "codex defaults" OWNER "$c sets $(jq -r '.other | join(", ")' <<<"$j") to another value than home/.codex/defaults.toml ($want); left as the owner set it"
+    row "$1" OWNER "$c sets $(jq -r '.other | join(", ")' <<<"$j") to another value than home/.codex/defaults.toml ($want); left as the owner set it"
   elif [ "$(jq '.missing | length' <<<"$j")" != 0 ]; then
-    row "codex defaults" "NOT SET" "$c lacks $(jq -r '.missing | join(", ")' <<<"$j"), so Codex starts on its catalog default; run: scripts/bootstrap --user-config"
-  else row "codex defaults" ok "$want(home/.codex/defaults.toml, ADR 0059)"; fi
+    row "$1" "NOT SET" "$c lacks $(jq -r '.missing | join(", ")' <<<"$j"), so $4; run: scripts/bootstrap --user-config"
+  elif [ "$5" = perm ] && [ "$(jq '.sandbox | length' <<<"$j")" != 0 ]; then
+    row "$1" OWNER "$c sets $(jq -r '.sandbox | join(", ")' <<<"$j"), which Codex uses instead of default_permissions (learn.chatgpt.com/docs/permissions)"
+  elif [ "$5" = perm ]; then row "$1" ok "$want as home/.codex/defaults.toml$6"
+  else row "$1" ok "$(jq -r '[.units[] as $u | "\($u) = \(.effective[$u] | tojson)"] | join(" ")' <<<"$j") $6"; fi
+}
+codex_defaults_row() {
+  # shellcheck disable=SC2016  # jq filter, not shell
+  codex_settings_row "codex defaults" 'test($re) | not' "home/.codex/defaults.toml's model and effort" \
+    "Codex starts on its catalog default" model "(home/.codex/defaults.toml, ADR 0059)"
+}
+# the worker profile is in force for a launch with no --sandbox and no bypass flag; Orca's pre-filled
+# --dangerously-bypass-approvals-and-sandbox wins over it (ADR 0034, Confirmation)
+codex_permissions_row() {
+  # shellcheck disable=SC2016  # jq filter, not shell
+  codex_settings_row "codex permissions" 'test($re)' "the canon-worker profile" \
+    "the canon-worker profile is not set and not the default" perm "; canon-worker is the default profile in this user config (ADR 0034; a project .codex/config.toml is not read here)"
 }
 
 # codex_version_row: Codex's version (`codex --version`, "codex-cli <version>") against the pin main's
@@ -748,6 +821,7 @@ check() {
   note "Review-only workers (ADR 0045) and their defaults (ADR 0059), optional:"
   codex_version_row
   codex_defaults_row
+  codex_permissions_row
   agy_model_row
   dsh_row
   agy_row
@@ -991,13 +1065,15 @@ install_runtime_defaults() {
       invalid) note "  INVALID    $c is not valid TOML; left as it is, and no defaults added"; rc=1 ;;
       unknown) note "  UNKNOWN    no python3 with tomllib to read $c; left as it is (run: scripts/bootstrap --install)"; rc=1 ;;
       *)
-        if [ "$(jq '.missing | length' <<<"$j")" != 0 ]; then
+        if [ "$(jq '.missing - .unwritten | length' <<<"$j")" != 0 ]; then
           [ ! -s "$c" ] || keep_copy "$c"
           cat "$tmp" > "$c" || { rm -f "$tmp"; die "could not write $c; its previous content is in the copy kept above"; }
-          note "  added      $(jq -r '.missing | join(", ")' <<<"$j") to $c (home/.codex/defaults.toml, ADR 0059)"
+          note "  added      $(jq -r '.missing - .unwritten | join(", ")' <<<"$j") to $c (home/.codex/defaults.toml, ADR 0059, ADR 0034)"
+        elif [ "$(jq '.unwritten | length' <<<"$j")" != 0 ]; then :
         else
           note "  unchanged  Codex defaults in $c"
         fi
+        [ "$(jq '.unwritten | length' <<<"$j")" = 0 ] || { note "  FAILED     $(jq -r '.unwritten | join(", ")' <<<"$j") cannot be written at the top of $c beside the table it already declares; add it to that table by hand (home/.codex/defaults.toml)"; rc=1; }
         [ "$(jq '.other | length' <<<"$j")" = 0 ] || note "  KEPT       $c sets $(jq -r '.other | join(", ")' <<<"$j") to another value than home/.codex/defaults.toml; left as the owner set it"
         [ "$(jq '.profile_sets | length' <<<"$j")" = 0 ] || note "  KEPT       the active profile in $c sets $(jq -r '.profile_sets | join(", ")' <<<"$j") otherwise, which overrides the top level; left as the owner set it"
         ;;

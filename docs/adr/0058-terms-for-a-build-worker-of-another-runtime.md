@@ -49,6 +49,11 @@ ADR 0005's table rests on other people's workloads.
    another agent or a scheduled job, runs paper tests or reads a credential. A Claude lane or the
    coordinator checks that the branch changes only the task's paths and that nothing was pushed or left
    running, reproduces its tests, runs the review ADR 0017 requires and lands it with `scripts/land`.
+   *Pointer, 2026-11-11:* for a Codex build worker running under ADR 0034's `canon-worker` profile,
+   "commits on its branch" is superseded by ADR 0034 rule 1: its trial found that a builder under the
+   profile cannot commit, so the worker leaves its change in the working tree and the Claude lane that
+   reproduces its tests commits it. The profile is in force only for a Codex started without Orca's
+   bypass flag (ADR 0034, Confirmation).
 3. **Not gated.** A worker may be given build work before its label has a trial. ADR 0057's eval is
    the measure that keeps or retires it (its rule 8), and one broken term retires it at once.
 4. **Which paths stay with Claude is the owner's to say, and is not yet said.** The coordinator's
