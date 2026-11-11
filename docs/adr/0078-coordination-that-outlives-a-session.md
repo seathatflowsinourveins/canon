@@ -92,6 +92,9 @@ the records and the commit messages.
 
 ### Confirmation
 
+* 2026-11-11: item 5 is built. `.claude/hooks/session-brief.sh` and `.claude/hooks/compact-brief.sh` print
+  static lines naming item 4's reads, for coordinators only, and run none of them; `scripts/test-hooks`
+  checks both.
 * `scripts/automation status` lists every recurring duty; a coordinator starts no `/loop` and no
   recurring `CronCreate` (`CronList` alone cannot show it: a self-paced loop's wakeup lists as one-shot).
 * A coordinator's handover is `run-use` on its Run. That a new terminal takes over a Run another
