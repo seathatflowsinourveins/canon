@@ -51,7 +51,7 @@ window (`EXTENDED_READY`) until one has passed on paper and the disconnect-hang 
 | Start-up reconciliation | Scoped to the symbol and one minute of history: every run starts only once it has found the account flat, so history can only mislead, and 60 minutes could hold the last window's exit without its entry; open orders and positions are reported however old | The Lighter tutorial's `reconciliation_instrument_ids`; the minute is the adapter's own paper tests' (the tutorial uses 60; the docs' tip leaves it unset) |
 | The node | `LiveNode.builder(...)`, `with_risk_engine_config`, `with_exec_engine_config`, `with_delay_post_stop_secs(5)`; a regular window 65 s, since the managed stop's market exit (60 attempts a second apart) runs only inside that delay before the node disconnects | `examples/live/sandbox/exec_tester.py`, the Lighter tutorial; `LiveNode::stop` and `process_runner_for` in `crates/live/src/node/mod.rs` at the pin |
 | Exit at wind-down and stop, in the session | `market_exit()`, and `manage_stop=True` so `stop()` runs it; `market_exit_reduce_only=False`, `market_exit_time_in_force=DAY` | concepts/strategies, "Market exit" |
-| Start flat, confirm flat | Refuse to start unless flat in the symbol; after the node stops, read Alpaca and fail naming what is left (each poll for 60 s: cancel every open order the check did not send, again until it is gone; once none is open and while Alpaca's clock says the session is open, close at market, again while held; cancel a close that would only queue) | The Lighter tutorial: "Start with a flat target position", "confirm that no orders or positions from the run remain" |
+| Start flat, confirm flat | Refuse to start unless flat in the symbol; after the node stops, read Alpaca and fail naming what is left (each poll for 60 s: look up each request not yet seen ended, cancel every order that works but the check's own close, again until Alpaca shows it ended; once none works and while Alpaca's clock says the session is open, close with a market order under a client order ID of the check's own, and again only once Alpaca has refused the last or shown it ended; cancel a close that would only queue) | The Lighter tutorial: "Start with a flat target position", "confirm that no orders or positions from the run remain" |
 | The session | Alpaca's clock and calendar before anything is placed | Alpaca's paper-trading skill: "always check the clock/calendar endpoint" |
 | Bars | One-minute `INTERNAL` bars the data engine builds from trades; the adapter streams none | The data engine's bar aggregation |
 | A position over one share | `PositionCap`, a non-trading strategy in the node (a `DataActor` has no portfolio at the pin): the portfolio's net position every second, `shutdown_system` over one share | No upstream: no setting caps a position, and the trading state is not settable from Python |
@@ -70,19 +70,39 @@ a test queued behind a window outlasts it: a window is shortened so that it and 
 wait. After the window's end come the stop (`STOP_TIMEOUT_SECS`, about 115 s), the last of the node's
 worker calls (`ADAPTER_CALL_SECS`: alpaca-py's request and its three retries at the adapter's timeouts,
 three seconds apart, about 129 s) and the account check (60 s in which polls start; the poll begun
-before its end runs on, two reads, the clock and a cancel of each of up to two orders; then a last
-reading, the clock and a cancel of what it shows; about 360 s), about 605 s in all (`AFTER_END_SECS`); before its
+before its end runs on, at most two lookups, two reads, the clock and two cancels, seven requests; then
+a last reading and its cancels, as many; about 481 s), about 725 s in all (`AFTER_END_SECS`); before its
 start, 30 s of start-up and the first clock read, with alpaca-py's retries, 129 s; and the window is timed
 on the host's clock, which may run 60 s behind Alpaca's (`SKEW_SECS`). So a window runs at most
-3900 - 30 - 129 - 60 - 605, `LONGEST_WINDOW_SECS`, 3076 s (about 51 minutes); a `--minutes 60` window runs
+3900 - 30 - 129 - 60 - 725, `LONGEST_WINDOW_SECS`, 2955 s (about 49 minutes); a `--minutes 60` window runs
 that and its record says so (`shortened`). The reads after the clock read are inside the window, whose end
-is absolute, and a window whose start-up reads leave too little of it is skipped. Not counted: in each
-reading, one request for each order in doubt and one for a lost close's search, which only a lost answer
-brings. The timeouts' sums are not wall-clock bounds (the connect timeout applies per address tried, the read timeout
-between bytes, ADR 0039). A window also ends `END_MARGIN_SECS` (455 s) before its session: the check's last
-market close goes out at most about 394 s after the end (`LAST_CLOSE_SECS`), and a minute covers the skew,
+is absolute, and a window whose start-up reads leave too little of it is skipped. Every request of the
+check is counted: a reading looks up at most two requests (`LOOKUPS`), each in turn over the polls, and a
+step cancels at most two orders (`CANCELS`); what is not reached in the check's time is named in what is
+left. The timeouts' sums are not wall-clock bounds (the connect timeout applies per address tried, the read timeout
+between bytes, ADR 0039). A window also ends `END_MARGIN_SECS` (515 s) before its session: the check's last
+market close goes out at most about 455 s after the end (`LAST_CLOSE_SECS`), and a minute covers the skew,
 so it is sent while the session is open. The same sum with `paper:session`'s 900 s wait for the lock fits its 105-minute
 deadline. A test reads the 3900, the 900 and the 105 minutes from `mise.toml`.
+
+**The account check after the stop** asks one question: which requests does this window not yet know the
+end of, and has Alpaca shown each ended? They are one set: each order of the node's that the node did not
+see end (sent with no answer, still open in its cache, or ended only by its own reconciliation), and each
+close the check sends. One leaves the set only on Alpaca's word: an order under its client order ID in a
+status after which "no further updates will occur" (`filled`, `canceled`, `expired`, `rejected`), or, for
+a close, Alpaca's refusal of the request (403, 422) or a connect timeout that sent nothing. Flat is no
+open order, no position and the set empty.
+The close is a market order for the held quantity under a client order ID of the check's own, not
+`close_position`, which takes none: an order "can be queried using either the client-provided order ID or
+the system-assigned unique ID", so which order is the check's, and whether a close whose answer was lost
+was placed, are read, not inferred from side, size and type. **"Never placed" is concluded only from
+Alpaca's refusal or from a request that was never sent.** A lookup that finds nothing is not that: Alpaca documents no time by which a submitted
+order shows in a lookup or a listing, and of a submit that timed out says "The order may have been sent
+to the market for execution. You should not attempt to resend the order". So while a close, or a node
+order on the close's side, is sent and not found, no other close is sent; never found, the window is
+recorded failed naming the position and the request, and the next refuses to start. Departure from
+`close_position`: a market order is not refused for a position that has gone (it would sell short), so
+the close is sent only in a poll that has read no order working and no such request.
 
 ### Consequences
 
@@ -244,6 +264,57 @@ fill in the session; the scheduled run's clock read was timed after its calendar
 heartbeat failed lost its record; a failed last reading canceled again what had just been canceled; the
 header and the bounds' notes trailed the code; each fixed, the first three covered by a new test.
 
+Four independent reviews of the check as landed (2026-11-10), twelve claims on the window, each first shown
+by a failing test in the same file, those on the check against one stand-in for Alpaca's API and all
+answered by the one set of unsettled requests above, which replaces the search for a lost close among the
+orders since it was sent and its match by side, quantity and type:
+
+* A second close went out after two searches had not found the first, whose answer was lost: both could
+  sell (a short, bought back, recorded ok with no trace), and a first that arrived after the process had
+  gone was never resolved. No close is now sent while one is sent and not found, and each close and each
+  unsettled node order is in the record with what Alpaca showed of it (`closes`, `unsettled`).
+* A lost close found working after another order had flattened the account was dropped from the check:
+  it is tracked by its ID and canceled when it no longer closes what is held.
+* The bounds did not count a lookup for each order in doubt nor the search (twelve orders made the check
+  420 s): a reading now looks at most two up and a step cancels at most two, every request is counted,
+  and two tests put the last close and the check's end exactly at their bounds, every request, the
+  position read included, taking its full timeout.
+* A close sent in the last poll was in no reading when the reading after it failed, and stayed queued; an
+  order found by its lookup in a poll whose listing then failed was never canceled; one canceled in the
+  last poll was named working after it from a list the poll had kept: the last cancels go to every order
+  the check knows of, and an order Alpaca has shown ended is in none.
+* A clock that could not be read as the check ended was taken for a closed session, and the check's
+  working close canceled: the clock's last answer, open until the close it gave, now stands.
+* `close_position`'s 404 for a position another order had just closed was taken for a lost close, a flat
+  account recorded failed: there is no such call now, and no close while the node's own exit may fill.
+* A skip whose heartbeat could not be written exited 1 with a traceback: it now says why and exits 0.
+* A Ctrl-C during the wait for a worker call after a clean stop left the runner out of the abandoned, so
+  the node was disposed under a running thread and the process hung at exit: it is abandoned first.
+* The time left was measured from before the clock read, so that read's own retries were taken from a
+  window whose end is the timestamp it returned: it is measured from the clock's answer. The same claim's
+  other half is not changed: a host clock ahead of Alpaca's ends a window early, which its record shows
+  (`seconds` under `planned_seconds`); the 60 s allowance is for one behind, and nothing compares the
+  host's clock with Alpaca's (that the host keeps time is assumed, UNVERIFIED).
+* The bound's tests stubbed the position read at no time and held no order in doubt: the stand-in charges
+  every request, and refuses, fills and answers as Alpaca's documentation and error guide describe.
+
+Code review (`/code-review`, high) of that change: a connect timeout on the close's only attempt, which
+sent nothing, was kept as a close with no answer and held every later close back (now settled, as the
+adapter's `not_sent` reads it); the last cancels were cut to two (now every working order, while the step
+has time); an order the node had ended by its own reconciliation was not looked up (now any order with a
+`reconciliation` event is); an answer alpaca-py could not parse ended the check; an order listed open
+while its lookup answered 404 was named not found; a refused close added a record entry each poll (now
+counted, `closes_not_placed`); the account was read twice with nothing sent between; the adapter's
+refusal statuses and page limit were copied, not imported; each fixed, the first six covered by a new
+test. Left open: this record is past the length its rule sets, and the account check is the part to
+move to a record of its own.
+
+Also changed with them: `replaced` no longer settles an order (Alpaca does not say it gets no further
+updates; no window strategy replaces one), every node order still open in the node's cache, or ended by
+the node's own reconciliation, is looked up as one in doubt is, and the open-orders listing asks for 500,
+its maximum. Not shown on paper: all of this
+is offline until a window's stop leaves something to clear.
+
 On paper, 2026-11-10, after the close: a regular window refused, "the regular session is closed". An
 extended window started at 16:12 New York, before the adapter's extended-hours change was on `main`,
 against the condition for extended runs; the gate above now refuses that. The cap stopped it at its first
@@ -337,3 +408,44 @@ Read 2026-11-10. "raw": fetched with `curl` and read whole. NautilusTrader files
   reaches a state of either `filled`, `canceled`, or `expired`" (fetched, raw).
 * Four further independent reviews of the check (2026-11-10): their findings reproduced offline and fixed
   above, or shown not to hold (run).
+* 2026-11-10, a second reader's correction (four independent reviews of the check, twelve claims on the
+  window, all reproduced offline): the decision's account check, its row in the table and the lock's arithmetic are
+  rewritten above; `AFTER_END_SECS` 605 to 725, `LAST_CLOSE_SECS` 394 to 455, `END_MARGIN_SECS` 455 to
+  515, `LONGEST_WINDOW_SECS` 3076 to 2955 (run).
+* https://docs.alpaca.markets/us/docs/working-with-orders.md, "Using Client Order IDs": a
+  `MarketOrderRequest` with `client_order_id`, then `get_order_by_client_id`; "FAQ", "What should I do if I
+  receive a timeout message from Alpaca when submitting an order?": the two sentences quoted above, and
+  "Before taking any action on the timed-out order you should check the broker dashboard and contact
+  Alpaca support" (fetched, raw).
+* https://docs.alpaca.markets/us/docs/orders-at-alpaca.md, first paragraph: the sentence on querying by
+  either ID; "Order Lifecycle": `replaced` is "replaced by another order, or was updated due to a market
+  event", with no word on further updates (fetched, raw).
+* https://docs.alpaca.markets/us/reference/postorder.md: `client_order_id`, "A unique identifier for the
+  order. Automatically generated if not sent. (<= 128 characters)"; responses 200, 403 "Buying power or
+  shares is not sufficient", 422 "Input parameters are not recognized", nothing on a repeated ID.
+  https://docs.alpaca.markets/us/reference/getorderbyclientorderid.md: only a 200 is documented, so the
+  404 for an ID Alpaca does not hold stays UNVERIFIED.
+  https://docs.alpaca.markets/us/reference/deleteopenposition-1.md: `qty` and `percentage` only, no
+  client order ID; "Returns the order created to close out this position"; neither the order's type nor
+  a 404 is documented. https://docs.alpaca.markets/us/reference/getallorders-1.md: "Defaults to 50 and max
+  is 500" (each fetched, raw). No page read states when a submitted order becomes visible to a lookup
+  or a listing.
+* https://docs.alpaca.markets/us/docs/user-protection.md, "Preventing Wash Trades": a market order
+  against an open order of the other side is "always rejected", with a 403, on paper too (fetched, raw).
+* https://alpaca.markets/learn/how-to-fix-common-trading-api-errors-at-alpaca, Alpaca's own error guide,
+  undated (fetched, raw, read as text): "client_order_id must be unique (HTTP 422 Error) ... a duplicate
+  client_order_id was used for another active order", so a repeat of an ID is no documented way to send a
+  close once only; "Insufficient qty available for order (HTTP 403 Error)": shares an open sell holds
+  "cannot be used again", and after a cancel "wait for confirmation that the open orders are actually
+  canceled before sending the close request". The test stand-in's refusals follow these two pages.
+* alpaca-py 0.45.0 in `.venv`, `trading/requests.py` and `trading/client.py`: `OrderRequest.client_order_id`,
+  `MarketOrderRequest`, `submit_order` returning the `Order`, `ClosePositionRequest` with `qty` and
+  `percentage` only (`bundled`).
+* `crates/execution/src/reconciliation/orders.rs` at the pin: `create_reconciliation_rejected` and
+  `create_reconciliation_canceled` build their events with `true, // reconciliation` (fetched, raw);
+  nautilus-trader 2.0.0rc8 in `.venv`, `model/__init__.pyi`: `OrderRejected.reconciliation`,
+  `OrderCanceled.reconciliation` (`bundled`). `packages/canon-alpaca/src/canon_alpaca/providers.py`,
+  `counted` and `not_sent`: a connect timeout on a call's only attempt sent nothing (ADR 0039) (read).
+* Code review (`/code-review`, high), 2026-11-10, of the account check as one set: ten findings, eight
+  reproduced against the tests' stand-in and fixed above, one (a second record of the check's own
+  closes) removed, one (this record's length) left open (run).

@@ -2,7 +2,8 @@
 
 Contract: NautilusTrader v2.0.0rc8's `LiveNode.builder`, `LiveExecutionEngineConfig` and `LoggerConfig` with a
 `FileWriterConfig` (`live/__init__.pyi`, `common/__init__.pyi`); alpaca-py 0.45.0's `TradingClient` (paper)
-`get_clock`, `get_calendar`, `get_orders`, `get_open_position`. Read 2026-11-10 (ADR 0044):
+`get_clock`, `get_calendar`, `get_orders`, `get_open_position`, `get_order_by_client_id`,
+`cancel_order_by_id` and `submit_order` with a `MarketOrderRequest`. Read 2026-11-10 (ADR 0044):
 
 * https://nautilustrader.io/docs/md/latest/how_to/configure_live_trading.md, "Continuous reconciliation":
   `open_check_interval_secs` ("None or 0.0 disables. Recommended: 5-10s") and `position_check_interval_secs`
@@ -24,27 +25,51 @@ Contract: NautilusTrader v2.0.0rc8's `LiveNode.builder`, `LiveExecutionEngineCon
 * Python's `asyncio`: `loop.set_default_executor` takes a `ThreadPoolExecutor`, which `asyncio.to_thread`
   then runs its calls in; `concurrent.futures`: `Executor.shutdown(wait=False, cancel_futures=True)`
   cancels what has not started and refuses new work, and `wait(..., timeout=...)`.
+* https://docs.alpaca.markets/us/docs/working-with-orders.md, "Using Client Order IDs": a market order
+  submitted with a `client_order_id` and read back with `get_order_by_client_id`; its FAQ, on a submit
+  that timed out: "The order may have been sent to the market for execution. You should not attempt to
+  resend the order or mark the timed-out order as canceled until confirmed by Alpaca Support".
+* https://docs.alpaca.markets/us/docs/orders-at-alpaca.md: "Once an order is placed, it can be queried
+  using either the client-provided order ID or the system-assigned unique ID"; "Order Lifecycle": the four
+  statuses after which "no further updates will occur for the order".
+* https://docs.alpaca.markets/us/reference/postorder.md: 403 "Buying power or shares is not sufficient",
+  422 "Input parameters are not recognized". Not documented there or in the pages above: what Alpaca
+  answers a lookup of an ID it does not hold (a 404, as the adapter's lookup reads it; UNVERIFIED), and
+  how soon after a submit an order shows in a lookup or a listing.
 
 What one window is (one node, one process): the configured session and feed, checked against Alpaca's
 clock and calendar before anything starts; the paper account holding no open order and no position in the
 symbol; at least `GAP_SECS` since the last window ended; then the node runs for `minutes` (default 30, at
-most 60), clipped to the session's end and to `LONGEST_WINDOW_SECS` (about 51 minutes, so a paper test
+most 60), clipped to the session's end and to `LONGEST_WINDOW_SECS` (about 49 minutes, so a paper test
 waiting for the lock outlasts the window and its bounded end), the record saying so when it is. The strategy winds down `FLATTEN_SECS` before the end, the node
 stops, and the account is checked: no open order, no position. The wait for the stop is bounded by
 `STOP_TIMEOUT_SECS`, the node's own stop bounds summed; past it the window is recorded failed, the
 account is still checked, and `main` ends the process (`os._exit`), since the node's task can be neither
-awaited nor cancelled. A position still held once the cancels have landed is closed at market through
-alpaca-py while Alpaca's clock, read when the close is sent, says the regular session is open, and tried
-again each poll while Alpaca refuses it, as upstream's market exit closes again once nothing works, for
-at most `AFTER_STOP_SECS`. Otherwise the window fails and names it, and an order still open with the
-session closed (a close that would only queue for the next session) is canceled.
+awaited nor cancelled.
+
+The account check after the stop (`_flatten_after_stop`) answers one question: which requests does this
+window not yet know the end of, and has Alpaca shown each ended before the account is called flat? It
+keeps them in one set: each order of the node's that the node did not see end (`_unsettled`: sent with
+no answer, or still open in its cache), and each close the check itself sends. One leaves the set only on
+Alpaca's word, an order under its client order ID in a status after which "no further updates will
+occur", or Alpaca's own refusal of a close. Flat is no open order, no position and that set empty. A
+position still held once nothing works is closed by a market order for the held quantity under a client
+order ID of the check's own (Alpaca's "Using Client Order IDs"), not by `close_position`, which takes no
+ID: an order sent that way can be looked up whatever became of its answer. It is sent only while Alpaca's
+clock, read just before, says the regular session is open, as upstream's market exit closes again once
+nothing works, and never while a request that could close the same shares is sent and not found, since
+a lookup that finds nothing does not show the order was never placed and Alpaca says not to resend one
+that timed out; such a window is recorded failed, naming the position and the request. What a market
+order lacks that `close_position` had: Alpaca does not refuse it for a position that has gone, so it is
+sent only after every order the window knows of has been seen ended or canceled in the same poll.
 
 Two departures from upstream bound that check. In it, the window's alpaca-py client sends each request once
 (`_retry = 0`, the attribute `RESTClient` keeps its retry count in; the constructor cannot set 0): alpaca-py
 would repeat a 429 or 504 for up to `ADAPTER_CALL_SECS`, outside the check's deadline and after its reading
 of Alpaca's clock, so a market close could go out after the session closed. The check repeats each step
 itself, every poll, under one deadline that no poll starts after (a poll begun before it runs to its end,
-within the counted bound). And the node's loop runs its worker
+within the counted bound: a reading looks up at most `LOOKUPS` requests and a step sends at most `CANCELS`
+cancels, so every request is counted). And the node's loop runs its worker
 calls in an executor of the window's own (`Calls`): after an abandoned stop no new call can start in it,
 and the check waits, at most `ADAPTER_CALL_SECS`, for the ones the adapter left running (its `_call` is
 shielded), so an order one of them sends is in the account before the check reads it. The run's node log and a
@@ -69,6 +94,7 @@ import sys
 import tempfile
 import time
 import traceback
+from collections import deque
 from concurrent.futures import Future
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import wait
@@ -81,6 +107,8 @@ from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING
+from typing import Any
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from alpaca.common.constants import DEFAULT_RETRY_ATTEMPTS
@@ -88,18 +116,25 @@ from alpaca.common.constants import DEFAULT_RETRY_WAIT_SECONDS
 from alpaca.common.exceptions import APIError
 from alpaca.common.rest import RESTClient
 from alpaca.trading.client import TradingClient
+from alpaca.trading.enums import OrderSide as AlpacaOrderSide
 from alpaca.trading.enums import QueryOrderStatus
+from alpaca.trading.enums import TimeInForce as AlpacaTimeInForce
 from alpaca.trading.models import Calendar as AlpacaCalendar
 from alpaca.trading.models import Clock as AlpacaClock
 from alpaca.trading.models import Position as AlpacaPosition
 from alpaca.trading.requests import GetCalendarRequest
 from alpaca.trading.requests import GetOrdersRequest
+from alpaca.trading.requests import MarketOrderRequest
 from canon_alpaca.constants import ENV_API_KEY
 from canon_alpaca.constants import ENV_SECRET_KEY
 from canon_alpaca.constants import FEED
 from canon_alpaca.constants import VENUE
+from canon_alpaca.execution import DEFINITIVE_SUBMIT_REFUSALS
+from canon_alpaca.execution import ORDERS_PAGE_LIMIT
 from canon_alpaca.providers import CONNECT_TIMEOUT_SECS
 from canon_alpaca.providers import READ_TIMEOUT_SECS
+from canon_alpaca.providers import counted
+from canon_alpaca.providers import not_sent
 from canon_alpaca.providers import with_http_timeout
 from nautilus_trader.common import LogLevel
 from nautilus_trader.config import FileWriterConfig
@@ -121,6 +156,7 @@ from .session_ma_cross import SessionMaCross
 from .session_ma_cross import SessionMaCrossConfig
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
     from collections.abc import Sequence
 
 NEW_YORK = ZoneInfo("America/New_York")
@@ -139,10 +175,10 @@ EXTENDED_READY = False
 """Whether extended windows may run. The adapter sends `extended_hours` from the submit params (ADR 0038);
 a reviewed change turns this on once an extended window has passed on paper and the adapter's
 disconnect-hang fix is on `main` (ADR 0044)."""
-POLL_SECS = 2.0
-"""Between account reads after the stop: a lookup for each node order in doubt (usually none), two reads,
-then a cancel for each open order or a clock read and a close, well inside Alpaca's 200 a minute for the
-one or two orders a window has."""
+POLL_SECS = 2.5
+"""Between the account check's polls after the stop. A poll sends at most seven requests (`LOOKUPS`
+lookups, two reads, the clock, `CANCELS` cancels or one close), two when nothing is unsettled: at most
+168 a minute, inside the 200 a minute Alpaca's skill gives for the paper API (ADR 0044, Evidence)."""
 COMMIT_ENV = "CANON_COMMIT"
 """Set by the scheduled runner, `home/.claude/canon/paper-session.sh`, to the `origin/main` commit it checked
 out for this firing (ADR 0050)."""
@@ -188,25 +224,28 @@ ADAPTER_CALL_SECS = (
 """One adapter REST call at its longest (about 129 s): alpaca-py's first request and its retries, each at
 the adapter's timeouts, and the waits between them. A stream call the node runs in a worker thread has no
 such bound; one still running after this is recorded and the check goes on."""
-LAST_CLOSE_SECS = STOP_TIMEOUT_SECS + ADAPTER_CALL_SECS + AFTER_STOP_SECS + 3 * REQUEST_SECS
-"""From a window's end until the account check's last market close is sent, at most (about 394 s): the
-stop at its bound, the node's last worker calls, and the check's deadline with the poll begun before it,
-its two reads and the clock read. Not counted: one request in that poll for each node order in doubt and
-one for a lost close's search, which only a lost answer brings."""
-FINAL_CANCELS = 2
-"""The orders a reading of the check can show, counted in its bound: the strategy's one and the check's
-close."""
-AFTER_END_SECS = (
-    STOP_TIMEOUT_SECS
-    + ADAPTER_CALL_SECS
-    + AFTER_STOP_SECS
-    + 2 * (2 + 1 + FINAL_CANCELS) * REQUEST_SECS
+LOOKUPS = 2
+"""The requests still unsettled that one reading of the account check looks up, in turn: with more, each
+waits its turn over the polls, and one never reached is named in what is left."""
+CANCELS = 2
+"""The cancels one step of the account check sends, those not yet tried first: the strategy's one working
+order and the check's close; with more, the rest wait for the next poll."""
+READING_SECS = (LOOKUPS + 2) * REQUEST_SECS
+"""One reading of the account check at its longest: its lookups, the open orders and the position."""
+POLL_AT_LONGEST_SECS = READING_SECS + (1 + CANCELS) * REQUEST_SECS
+"""One poll of the account check at its longest: a reading, the clock, and its cancels (a close, sent
+instead of them, is one request)."""
+LAST_CLOSE_SECS = (
+    STOP_TIMEOUT_SECS + ADAPTER_CALL_SECS + AFTER_STOP_SECS + READING_SECS + REQUEST_SECS
 )
-"""From a window's end until its process is done with Alpaca, at most (about 605 s): the stop, the node's
-last worker calls, the check's deadline, the poll begun before it at its longest (two reads, the clock, a
-cancel of each order: no fewer than its close), then the last reading, the clock and a cancel of each order
-it shows. Not counted: in each reading, one request for each node order in doubt and one for a lost
-close's search, which only a lost answer brings."""
+"""From a window's end until the account check's last market close is sent, at most (about 455 s): the
+stop at its bound, the node's last worker calls, and the check's deadline with the poll begun before it,
+its reading and the clock read. Every request of that poll is counted."""
+AFTER_END_SECS = STOP_TIMEOUT_SECS + ADAPTER_CALL_SECS + AFTER_STOP_SECS + 2 * POLL_AT_LONGEST_SECS
+"""From a window's end until its process is done with Alpaca, at most (about 725 s): the stop, the node's
+last worker calls, the check's deadline, the poll begun before it at its longest, then the last reading,
+the clock and the last cancels, as long again. Every request is counted: a reading looks up no more than
+`LOOKUPS` orders and a step cancels no more than `CANCELS`, however many there are."""
 SKEW_SECS = 60
 """How far this host's clock may be from Alpaca's: the window runs to an end taken from Alpaca's clock, timed
 on this host's."""
@@ -221,7 +260,7 @@ START_UP_SECS = 30
 LONGEST_WINDOW_SECS = math.floor(
     PAPER_LOCK_WAIT_SECS - START_UP_SECS - ADAPTER_CALL_SECS - SKEW_SECS - AFTER_END_SECS
 )
-"""The longest a window runs (about 51 minutes): a paper test queued behind it gets the lock within its
+"""The longest a window runs (about 49 minutes): a paper test queued behind it gets the lock within its
 wait, after the start-up, the first clock read (with alpaca-py's retries, `ADAPTER_CALL_SECS`), the window
 timed on a host clock up to `SKEW_SECS` behind Alpaca's, and its bounded end (`AFTER_END_SECS`). The reads
 after the clock read are inside the window, whose end is absolute."""
@@ -412,6 +451,16 @@ class WindowReport:
     cap_tripped: str | None = None
     left: list[str] = field(default_factory=list)
     closed_after_stop: bool = False
+    """Whether a close the account check sent after the stop was placed at Alpaca."""
+    unsettled: dict[str, list[str]] = field(default_factory=dict)
+    """Each order of the node's that it did not see end, by client order ID: its side and why it is here,
+    then each status Alpaca showed for it after the stop, in order."""
+    closes: dict[str, list[str]] = field(default_factory=dict)
+    """Each close the account check sent that may have been placed, by its client order ID: what was
+    sent, then what came of it (`no answer: ...`, each status Alpaca showed), in order."""
+    closes_not_placed: int = 0
+    """The closes the account check sent that placed nothing: refused by Alpaca (403, 422), or never sent
+    (a connect timeout); `errors` holds what each was answered."""
     errors: list[str] = field(default_factory=list)
     warm_up_bars: int = 0
     warm_up_dropped: int = 0
@@ -500,13 +549,16 @@ def write_heartbeat(log_dir: Path, outcome: str) -> None:
     )
 
 
-def session_now(trading: TradingClient) -> tuple[AlpacaClock, AlpacaCalendar | None]:
-    """Alpaca's clock and today's calendar day (New York), read once per run."""
+def session_now(trading: TradingClient) -> tuple[AlpacaClock, AlpacaCalendar | None, float]:
+    """Alpaca's clock and today's calendar day (New York), read once per run, and the `time.monotonic()`
+    at which the clock's answer arrived: its timestamp is as old as the time since, whatever the read's
+    own retries took before it."""
     clock = trading.get_clock()
+    read_at = time.monotonic()
     assert isinstance(clock, AlpacaClock)
     today = clock.timestamp.astimezone(NEW_YORK).date()
     days = trading.get_calendar(GetCalendarRequest(start=today, end=today))
-    return clock, days[0] if isinstance(days, list) and days else None
+    return clock, days[0] if isinstance(days, list) and days else None, read_at
 
 
 def paper_trading() -> TradingClient:
@@ -528,7 +580,10 @@ def send_once(trading: TradingClient) -> None:
 
 
 def open_orders(trading: TradingClient, symbol: str) -> list:
-    orders = trading.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol]))
+    orders = trading.get_orders(
+        # the most one listing returns ("Defaults to 50 and max is 500"), as the adapter asks
+        GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol], limit=ORDERS_PAGE_LIMIT)
+    )
     assert isinstance(orders, list)
     return orders
 
@@ -586,17 +641,19 @@ def run_window(
 ) -> WindowReport:
     """Run one window as the module header describes; raise if it cannot start or is not left flat.
     `trading` and `market` (the clock and calendar) are read here unless the caller already has them, in
-    which case `market_read_at` is the `time.monotonic()` just before the caller read the clock."""
+    which case `market_read_at` is the `time.monotonic()` at which the clock's answer arrived
+    (`session_now`)."""
     config.log_dir.mkdir(parents=True, exist_ok=True)
     marker = config.log_dir / "last-window-end"
     # Dated by when it was written, so a marker cut short by a kill still counts.
     if marker.exists() and time.time() - marker.stat().st_mtime < GAP_SECS:
         raise WindowSkipped(f"the last window ended under {GAP_SECS} s ago")
     trading = trading or paper_trading()
-    read_at = (
-        market_read_at if market is not None and market_read_at is not None else time.monotonic()
-    )
-    clock, calendar = market or session_now(trading)
+    if market is None:
+        clock, calendar, read_at = session_now(trading)
+    else:
+        clock, calendar = market
+        read_at = time.monotonic() if market_read_at is None else market_read_at
     try:
         end_of_session = session_end(config, clock, calendar)
     except RuntimeError as e:
@@ -627,7 +684,7 @@ def run_window(
     failure: BaseException | None = None
     ran = False  # whether the node was run: only then is the gap marker written
     cache = None
-    events: dict[str, list[str]] = {}
+    unsettled: dict[str, tuple[str, str]] = {}
     try:
         node, strategy, cap = window_node(
             config, wind_down_at=ends - timedelta(seconds=FLATTEN_SECS), log_name=f"window-{stamp}"
@@ -648,7 +705,7 @@ def run_window(
             finally:
                 try:
                     # before the disposal, which clears the cache
-                    events = _events(cache)
+                    unsettled = _unsettled(cache)
                 finally:
                     if len(_ABANDONED) == abandoned_before:  # else its abandoned task owns it
                         node.dispose()
@@ -660,10 +717,14 @@ def run_window(
             _wait_for_calls(_ABANDONED[abandoned_before:], report)
             if cache is not None and len(_ABANDONED) > abandoned_before:
                 # after the wait: an abandoned node's last submits are in it
-                events = _events(cache)
-            doubtful = in_doubt(events)
+                unsettled = _unsettled(cache)
+            for client_order_id, (side, why) in unsettled.items():
+                report.unsettled[client_order_id] = [f"{side}: {why}"]
             report.left = _flatten_after_stop(
-                trading, config, report, in_doubt=doubtful, node_ids=list(events)
+                trading,
+                config,
+                report,
+                unsettled={c: side for c, (side, _) in unsettled.items()},
             )
         except BaseException as e:  # the account could not be checked: never recorded as ok
             failure = failure or e
@@ -689,56 +750,274 @@ def run_window(
     return report
 
 
-ANSWERED = frozenset(
-    {
-        "OrderAccepted",
-        "OrderRejected",
-        "OrderFilled",
-        "OrderCanceled",
-        "OrderExpired",
-        "OrderDenied",
-    }
-)
-"""The events by which the node has heard what became of an order it sent."""
-
-
-def in_doubt(orders: dict[str, list[str]]) -> list[str]:
-    """The node's orders that were sent and never answered: the adapter logs an unknown outcome and leaves
-    the order submitted when a submit's answer is lost (`_log_unknown_outcome`), and Alpaca may take it
-    after the account check has read the account."""
-    return [
-        client_order_id
-        for client_order_id, events in orders.items()
-        if "OrderSubmitted" in events and not ANSWERED.intersection(events)
-    ]
-
-
-TERMINAL = frozenset({"filled", "canceled", "expired", "rejected", "replaced"})
-"""Alpaca order statuses after which an order works no more: "no further updates will occur" for the
-first four, and a replaced one goes on as another order (orders-at-alpaca, "Order Lifecycle"). Every
-other status, `done_for_day`, `stopped`, `suspended` and `calculated` among them, can still be updated,
-and an order "may be canceled through the API up until" filled, canceled or expired, so the check cancels
-it as working."""
+TERMINAL = frozenset({"filled", "canceled", "expired", "rejected"})
+"""Alpaca order statuses after which an order works no more: the four of which its documentation says "no
+further updates will occur for the order" (orders-at-alpaca, "Order Lifecycle"). Every other status,
+`done_for_day`, `stopped`, `suspended`, `calculated` and `replaced` among them (a replaced order goes on
+as another, and no window strategy replaces one), is taken as working: an order "may be canceled through
+the API up until" filled, canceled or expired, so the check cancels it, and names it while it is there."""
+FAILED = (APIError, OSError, ValueError, TypeError)
+"""How a call to Alpaca through alpaca-py fails, as the adapter catches it: Alpaca's own error, an
+`OSError` (requests' errors, the adapter's timeouts among them), or an answer alpaca-py's models cannot
+read. After any of them but Alpaca's refusal of a submit (`DEFINITIVE_SUBMIT_REFUSALS`: 403 "Buying power
+or shares is not sufficient", 422 "Input parameters are not recognized") and a connect timeout on a
+call's only attempt (`not_sent`), a close may have been placed."""
+CLOSE_ID_PREFIX = "canon-close-"
+"""What the client order ID of a close the account check sends begins with; the window's start, a count
+and a random part follow, so no two closes share one."""
 
 
 def _value(field: object) -> str:
     return str(getattr(field, "value", field))
 
 
-def _matches_close(order, held: Decimal) -> bool:
-    """Whether `order` is the market close of `held` that `close_position` sends: opposite side, the held
-    quantity, a market order (`DELETE /v2/positions/{symbol}` liquidates at market). The order's `type`,
-    as the adapter reads it (alpaca-py marks `order_type` deprecated); a quantity that is not a number
-    (a notional order) is no close."""
-    try:
-        qty = Decimal(str(order.qty))
-    except ArithmeticError:
-        return False
-    return (
-        _value(order.side) == ("sell" if held > 0 else "buy")
-        and qty == abs(held)
-        and _value(getattr(order, "type", None)) == "market"
-    )
+@dataclass
+class _Unsettled:
+    """One request whose end this window does not yet know: an order of the node's that the node did not
+    see end, or a close the account check sent. It is settled only by what Alpaca says: an order under its
+    client order ID in a terminal status, or, for a close, Alpaca's refusal of the request itself."""
+
+    client_order_id: str
+    side: str
+    """`buy` or `sell`; empty when the node's order did not say."""
+    own: bool = False
+    """A close the check sent, not an order of the node's."""
+    order: Any = None
+    """Alpaca's order under the ID as last seen, still working; None until Alpaca shows one."""
+    asked: bool = False
+    """Whether Alpaca has answered a lookup of it at all."""
+
+    def missing(self) -> str:
+        what = "close" if self.own else "order"
+        sent = "sent with no answer" if self.own else "sent, not known to have ended"
+        where = "not found at Alpaca" if self.asked else "not looked up in the check's time"
+        return f"{what} {self.client_order_id}: {sent}, {where}"
+
+
+class _AccountCheck:
+    """The account as the check after the stop knows it, and the steps it takes (`_flatten_after_stop`)."""
+
+    def __init__(
+        self,
+        trading: TradingClient,
+        symbol: str,
+        report: WindowReport,
+        unsettled: Mapping[str, str],
+    ) -> None:
+        self.trading = trading
+        self.symbol = symbol
+        self.report = report
+        self.requests = {c: _Unsettled(c, side) for c, side in unsettled.items()}
+        self.turn = deque(self.requests)  # whose lookup comes next
+        self.closes_sent = 0
+        self.ended: set[str] = set()  # Alpaca's IDs of the orders it showed in a terminal status
+        self.listed: list = []  # the open orders of the last reading
+        self.held = Decimal(0)  # the position of the last reading
+        self.tried: dict[str, int] = {}  # the cancels sent for each order
+        self.open_until: float | None = None  # by the clock's last answer; None before any
+        for client_order_id, side in unsettled.items():
+            report.unsettled.setdefault(client_order_id, [side or "side not known"])
+
+    def read(self) -> list[str]:
+        """One reading: look up to `LOOKUPS` unsettled requests up, then read the open orders, which show
+        a request as its lookup does, and the position; return what is left (`left`). A lookup that
+        fails is recorded and the reading goes on; a failed read of the orders or the position raises."""
+        self._look_up()
+        self.listed = open_orders(self.trading, self.symbol)
+        for order in self.listed:  # the listing shows a request as its lookup does
+            if (request := self.requests.get(str(order.client_order_id))) is not None:
+                self._seen(request, order)
+        self.held = position_qty(self.trading, self.symbol)
+        return self.left()
+
+    def left(self) -> list[str]:
+        """What keeps the account from being flat, as last read: each working order, the position, and
+        each unsettled request Alpaca has not shown."""
+        return described(self.working(), self.held, self.symbol) + [
+            r.missing() for r in self.requests.values() if r.order is None
+        ]
+
+    def working(self) -> list:
+        """Every order known to work: the open orders last listed, and each unsettled request Alpaca
+        showed working that the listing lacks (the two need not agree); none Alpaca has shown ended."""
+        orders = {str(o.id): o for o in self.listed}
+        for request in self.requests.values():
+            if request.order is not None:
+                orders.setdefault(str(request.order.id), request.order)
+        return [o for order_id, o in orders.items() if order_id not in self.ended]
+
+    def _look_up(self) -> None:
+        for _ in range(min(LOOKUPS, len(self.turn))):
+            request = self.requests[self.turn[0]]
+            self.turn.rotate(-1)
+            try:
+                order = self.trading.get_order_by_client_id(request.client_order_id)
+            except FAILED as e:
+                if isinstance(e, APIError) and e.status_code == 404:
+                    request.asked = True  # as the adapter reads a 404; not in Alpaca's reference
+                else:
+                    _note(
+                        self.report,
+                        f"looking up {request.client_order_id}: {type(e).__name__}: {e}",
+                    )
+                continue
+            self._seen(request, order)
+
+    def _seen(self, request: _Unsettled, order: Any) -> None:
+        """Alpaca showed `order` under the request's ID: working, it is tracked; terminal, the request is
+        settled."""
+        request.asked = True
+        status = _value(getattr(order, "status", None))
+        log = (self.report.closes if request.own else self.report.unsettled)[
+            request.client_order_id
+        ]
+        if log[-1] != status:
+            log.append(status)
+        if request.own:
+            self.report.closed_after_stop = True
+        if status in TERMINAL:
+            self.ended.add(str(getattr(order, "id", "")))
+            self._settle(request)
+        else:
+            request.order = order
+
+    def _settle(self, request: _Unsettled) -> None:
+        del self.requests[request.client_order_id]
+        self.turn.remove(request.client_order_id)
+
+    def session_open(self, *, fresh: bool) -> bool:
+        """Whether Alpaca's clock says the regular session is open. If the read fails and `fresh` is not
+        asked for, the clock's last answer stands: open until the close it gave, closed if it said so; a
+        failed read is no evidence the session has closed. With no answer yet, or `fresh`, it raises."""
+        asked_at = time.monotonic()
+        try:
+            clock = self.trading.get_clock()
+        except FAILED as e:
+            if fresh or self.open_until is None:
+                raise
+            _note(self.report, f"reading Alpaca's clock: {type(e).__name__}: {e}")
+            return time.monotonic() < self.open_until
+        assert isinstance(clock, AlpacaClock)
+        if clock.is_open:
+            self.open_until = asked_at + (clock.next_close - clock.timestamp).total_seconds()
+        else:
+            self.open_until = asked_at
+        return bool(clock.is_open)
+
+    def cancel(self, *, final: bool = False) -> None:
+        """Cancel what works, those not yet tried first: `CANCELS` orders in a poll; as the check ends,
+        every one, a further cancel starting only while the step has taken under the time `CANCELS - 1`
+        requests may, so the step stays inside the `CANCELS` requests counted for it. A close of the
+        check's own is left to fill while it still closes the position held and the session is open."""
+        unwanted, wanted = [], []
+        for order in self.working():
+            request = self.requests.get(str(order.client_order_id))
+            closes = (
+                request is not None
+                and request.own
+                and self.held
+                and request.side == _closing_side(self.held)
+            )
+            (wanted if closes else unwanted).append(order)
+        if wanted:
+            try:
+                still_open = self.session_open(fresh=False)
+            except FAILED as e:
+                # no answer of the clock's at all: nothing says the session is open
+                _note(self.report, f"reading Alpaca's clock: {type(e).__name__}: {e}")
+                still_open = False
+            if not still_open:
+                unwanted += wanted  # it would only queue for the next session
+        when = " as the check ends" if final else ""
+        began = time.monotonic()
+        unwanted.sort(key=lambda o: self.tried.get(str(o.id), 0))
+        for sent, order in enumerate(unwanted):
+            in_time = time.monotonic() - began < (CANCELS - 1) * REQUEST_SECS
+            if sent >= CANCELS and not (final and in_time):
+                break
+            self.tried[str(order.id)] = self.tried.get(str(order.id), 0) + 1
+            try:
+                self.trading.cancel_order_by_id(order.id)
+            except FAILED as e:  # it filled or ended meanwhile, or the cancel was lost
+                _note(self.report, f"canceling {order.client_order_id}{when}: {e}")
+
+    def act(self) -> bool:
+        """One step toward a flat account after a reading; False once nothing is left to do or to look
+        for. With an order working, cancel (`cancel`) and send no close: a held order keeps its shares
+        from one. With none, close the position if nothing sent and not found could close it too and
+        Alpaca's clock, read now, says the session is open."""
+        if self.working():
+            self.cancel()
+            return True
+        if not self.held:
+            return True  # only requests Alpaca has not shown are left: look again
+        side = _closing_side(self.held)
+        if waiting := [
+            r.client_order_id
+            for r in self.requests.values()
+            if r.order is None and r.side in (side, "")
+        ]:
+            _note(
+                self.report,
+                f"not closing the position while {', '.join(waiting)}, sent and not found at Alpaca, "
+                f"may still be placed: a second {side} is not sent",
+            )
+            return True
+        if not self.session_open(fresh=True):
+            _note(
+                self.report,
+                "not closing the position: Alpaca's clock says the regular session is closed, "
+                "so a market close would only queue",
+            )
+            return bool(self.requests)
+        self._close(side)
+        return True
+
+    def _close(self, side: str) -> None:
+        """Send a market order for the held quantity under a client order ID of the check's own, which
+        finds it again whatever becomes of the answer. A close that placed nothing (Alpaca's refusal, or
+        a connect timeout on its only attempt) is settled at once and counted; any other failure leaves
+        it unsettled."""
+        qty = abs(self.held)
+        self.closes_sent += 1
+        client_order_id = (
+            f"{CLOSE_ID_PREFIX}{self.report.started}-{self.closes_sent}-{uuid4().hex[:8]}"
+        )
+        request = _Unsettled(client_order_id, side, own=True)
+        self.requests[client_order_id] = request
+        self.turn.appendleft(client_order_id)  # looked up first in the next reading
+        log = self.report.closes.setdefault(
+            client_order_id, [f"sent: {side} {qty} {self.symbol} at market"]
+        )
+        try:
+            order = counted(self.trading.submit_order)(
+                MarketOrderRequest(
+                    symbol=self.symbol,
+                    qty=float(qty),
+                    side=AlpacaOrderSide(side),
+                    time_in_force=AlpacaTimeInForce.DAY,
+                    client_order_id=client_order_id,
+                )
+            )
+        except FAILED as e:
+            refused = isinstance(e, APIError) and e.status_code in DEFINITIVE_SUBMIT_REFUSALS
+            if refused or not_sent(e):  # Alpaca's own answer, or nothing sent: nothing was placed
+                del self.report.closes[client_order_id]
+                self.report.closes_not_placed += 1
+                self._settle(request)
+            elif isinstance(e, APIError):
+                log.append(f"no answer: HTTP {e.status_code}")
+            else:
+                log.append(f"no answer: {type(e).__name__}")
+            raise
+        if getattr(order, "id", None) is None:
+            log.append("no answer: no order in the response")
+            return
+        self._seen(request, order)
+
+
+def _closing_side(held: Decimal) -> str:
+    return "sell" if held > 0 else "buy"
 
 
 def _flatten_after_stop(
@@ -746,249 +1025,75 @@ def _flatten_after_stop(
     config: WindowConfig,
     report: WindowReport,
     *,
-    in_doubt: Sequence[str] = (),
-    node_ids: Sequence[str] = (),
+    unsettled: Mapping[str, str] | None = None,
 ) -> list:
     """What the account holds in the symbol after the stop, once the check has worked at clearing it.
 
-    A poll each `POLL_SECS`, none starting once `AFTER_STOP_SECS` have gone; a poll begun before runs to its
-    end, so slow reads cannot leave it without its cancel or close (`AFTER_END_SECS` counts one such poll
-    past the deadline): read the open orders and the position, and if both are clear, stop. An open order the check did not send is canceled, on
-    every poll until it is gone, in any session; with one open no close is sent (a held order keeps its
-    shares from a close, which Alpaca refuses with a 403). With none open, a position still held is closed
-    at market if Alpaca's clock, read just before, says the regular session is open, and closed again on
-    a later poll while it is still held; with the session closed it is left and reported. A close the check
-    sent is left to fill while the session is open, and canceled once it is closed (it would only queue for
-    the next session). A failed call (Alpaca's `APIError`, or an `OSError`, which requests' errors are, the
-    adapter's timeouts included) is recorded once and the rest of the poll is skipped, or, for one cancel,
-    the next order's cancel
-    goes on. The check's own close is the order its close call returns. When that answer is lost (any
-    failure but Alpaca's refusal, 403 or 422), it is the first order with the close's side, quantity and
-    type (`_matches_close`) that is no order of the node's and was not known when the close was sent,
-    looked for among the open orders and then among all the symbol's orders since; the account is not
-    flat until it is found, no other close is sent until `LOST_CLOSE_SEARCHES` searches have not found
-    it, and a close answered later ends the wait (one the lost close becomes is then canceled). Any other
-    order is canceled.
-    Each node order `in_doubt` is looked up by its client order ID (`get_order_by_client_id`) each poll
-    until Alpaca holds it, and the account is not flat while one is not found; one never found is named
-    in the result. Every order the last reading shows is canceled as the check ends, so nothing the window
-    knows of is left working once its process has gone (it is still named in the result). The result is a reading taken after the check's last cancel or close (one more read,
-    past the deadline, if the last poll sent one); if no reading succeeded, `RuntimeError`."""
-    symbol = config.symbol
+    The check keeps one set of requests whose end the window does not know: each order of the node's in
+    `unsettled` (its client order ID and side; `_unsettled`), and each close the check itself sends. A
+    request leaves the set only on Alpaca's word: an order under its client order ID in a terminal status
+    (`get_order_by_client_id`), or, for a close, Alpaca's refusal of the request (403, 422). The account
+    is flat when no order is open, no position is held and the set is empty; nothing else is recorded ok.
+
+    A poll each `POLL_SECS`, none starting once `AFTER_STOP_SECS` have gone; one begun before runs to its
+    end. A poll reads (`_AccountCheck.read`: up to `LOOKUPS` lookups, in turn, then the open orders and
+    the position) and, if the account is not flat, acts (`act`): an order that works, listed or shown by
+    its lookup, is canceled, on every poll until Alpaca shows it ended, in any session, up to `CANCELS`
+    a poll; with none working, a position still held is closed by a market order for the held quantity
+    under a client order ID of the check's own, sent only if Alpaca's clock, read just before, says the
+    regular session is open. A close's answer that is lost (anything but Alpaca's refusal, or a connect
+    timeout that sent nothing) leaves the close unsettled: it is looked up by its ID in its turn, and no
+    other close is sent while it, or a node
+    order on its side, is sent and not found, since Alpaca may still place it (Alpaca: "You should not
+    attempt to resend the order"); one never found is named in the result, with the position. A close
+    of the check's own that works is left to fill while it still closes what is held and the session is
+    open, and canceled otherwise (it would only queue, or sell what is no longer held).
+
+    Past the deadline: one more reading, then every order still known to work is canceled while the step
+    has time (`cancel`), the check's own close too unless the clock, or its last answer if it cannot be
+    read, says the session is open. A failed call (`FAILED`) is recorded once and the poll's remaining
+    steps are skipped, or, for one lookup or one cancel, the next goes on. The result is the last reading; if the last reading failed, what the
+    one before it showed with what the check has sent since; if none succeeded, `RuntimeError`."""
     send_once(trading)
+    check = _AccountCheck(trading, config.symbol, report, unsettled or {})
     deadline = time.monotonic() + AFTER_STOP_SECS
-
-    known: set[str] = set()
-    sent: set[str] = set()
-    lost_close: Decimal | None = None  # the held quantity a close was sent for, its answer lost
-    lost_since: datetime | None = None  # a little before that close was sent, by this host's clock
-    before_close: set[str] = set()  # the orders known when it was sent: none of them is it
-    unseen = 0  # the searches that have not found the lost close
-    node_orders = set(node_ids) | set(in_doubt)  # the node's own: never the check's close
-    doubtful = list(in_doubt)
-    seen: list[str] | None = None
-    acted = False  # whether a cancel or close was sent after the last reading
-    last: list = []  # the open orders of the last reading
+    left: list[str] | None = None
     last_error = ""
-
-    def cancel(order, when: str = "") -> None:
-        nonlocal acted
-        acted = True
+    more = True
+    while more and time.monotonic() < deadline:  # a poll begun before the deadline runs to its end
         try:
-            trading.cancel_order_by_id(order.id)
-        except (APIError, OSError) as e:  # it filled or ended meanwhile
-            _note(report, f"canceling {order.client_order_id}{when}: {e}")
-
-    def lose(held: Decimal, attempt: tuple[set[str], datetime]) -> None:
-        """A close whose answer was lost: what it closed, and when, to know it again."""
-        nonlocal lost_close, lost_since, before_close, unseen
-        lost_close, unseen = held, 0
-        before_close, lost_since = attempt
-
-    def find_lost_close(working: list) -> None:
-        """Take the lost close from the open orders, else from every order since it was sent."""
-        nonlocal lost_close, unseen
-        for order in working:
-            if (order_id := str(order.id)) not in known:
-                known.add(order_id)
-                if lost_close is not None and _is_the_close(order, lost_close, node_orders):
-                    sent.add(order_id)
-                    lost_close = None
-        if lost_close is None or lost_since is None:
-            return
-        for order in _orders_since(trading, symbol, lost_since):
-            if str(order.id) not in before_close and _is_the_close(order, lost_close, node_orders):
-                sent.add(str(order.id))
-                known.add(str(order.id))
-                lost_close = None
-                return
-        unseen += 1
-
-    found: list = []
-    while time.monotonic() < deadline:  # a poll begun before the deadline runs to its end
-        try:
-            # before the reads, so one found is in them
-            found = _look_up(trading, doubtful, report)
-            working = open_orders(trading, symbol)
-            listed = {str(o.id) for o in working}
-            working += [o for o in found if str(o.id) not in listed]  # held, if not yet listed
-            held = position_qty(trading, symbol)
-            find_lost_close(working)
-            seen = (
-                described(working, held, symbol)
-                + _unfound(doubtful, found)
-                + _lost(lost_close, symbol)
-            )
-            last, acted = working, False
-            if not seen:
-                return seen
-            if others := [o for o in working if str(o.id) not in sent]:
-                for order in others:
-                    cancel(order)
-            elif working:  # only closes this check sent
-                if not _regular_session_open(trading):
-                    for order in working:
-                        cancel(order)
-            elif held and lost_close is not None and unseen < LOST_CLOSE_SEARCHES:
-                pass  # a close whose answer was lost may still be taken: look for it before another
-            elif held and _regular_session_open(trading):
-                acted = True
-                attempt = (set(known), datetime.now(UTC) - timedelta(seconds=SKEW_SECS))
-                try:
-                    close_order = trading.close_position(symbol)
-                except APIError as e:
-                    if e.status_code not in CLOSE_REFUSALS:  # it may have reached Alpaca
-                        lose(held, attempt)
-                    raise
-                except OSError:
-                    lose(held, attempt)
-                    raise
-                report.closed_after_stop = True
-                if (order_id := getattr(close_order, "id", None)) is not None:
-                    sent.add(str(order_id))
-                    known.add(str(order_id))
-                    # answered: an earlier lost close, if Alpaca takes it, is another's, canceled
-                    lost_close = lost_since = None
-                else:
-                    lose(held, attempt)
-            elif held:
-                _note(
-                    report,
-                    "not closing the position: Alpaca's clock says the regular session is closed, "
-                    "so a market close would only queue",
-                )
-                break
-        except (APIError, OSError) as e:
+            left = check.read()
+            if not left:
+                return left
+            more = check.act()
+        except FAILED as e:
             last_error = f"{type(e).__name__}: {e}"
             _note(report, f"checking the account after the stop: {last_error}")
-        if time.monotonic() >= deadline:
+        if not more or time.monotonic() >= deadline:
             break
         time.sleep(POLL_SECS)
-    if seen is None:
-        raise RuntimeError(
-            f"the account could not be read in {AFTER_STOP_SECS} s after the stop: {last_error}"
-        )
-    if acted:  # the last reading came before a cancel or close: read once more
-        try:
-            # no lookups here, so the bound holds: the last poll's findings stand
-            working = open_orders(trading, symbol)
-            listed = {str(o.id) for o in working}
-            working += [o for o in found if str(o.id) not in listed]
-            find_lost_close(working)
-            seen = (
-                described(working, position_qty(trading, symbol), symbol)
-                + _unfound(doubtful, found)
-                + _lost(lost_close, symbol)
-            )
-            last = working
-        except (APIError, OSError) as e:
-            _note(report, f"reading the account after the last step: {type(e).__name__}: {e}")
-            last = []  # its orders were just acted on; nothing newer is known
-    # The process is ending: leave nothing working that the check did not send, nor, once the session is
-    # closed, a close of its own (it would only queue); one of its own closes is left to fill in the session.
-    others = [o for o in last if str(o.id) not in sent]
-    own = [o for o in last if str(o.id) in sent]
+    if not more and left is not None:
+        return left  # nothing was sent after that reading, and nothing is left to do or to look for
     try:
-        if own and not _regular_session_open(trading):
-            others += own
-    except (APIError, OSError) as e:
-        _note(report, f"reading Alpaca's clock as the check ends: {type(e).__name__}: {e}")
-        others += own  # the session may have closed: nothing is left to queue
-    for order in others:
-        cancel(order, " as the check ends")
-    return seen
-
-
-LOST_CLOSE_SEARCHES = 2
-"""Polls that look for a close whose answer was lost before another close is sent, so that two closes do
-not both reach Alpaca (a second would open a short)."""
-CLOSE_REFUSALS = frozenset({403, 422})
-"""Statuses by which Alpaca refuses an order and places nothing (the adapter's
-`DEFINITIVE_SUBMIT_REFUSALS`, from "Create an Order"); after any other failure a close may have been placed."""
-
-
-def _look_up(trading: TradingClient, doubtful: list[str], report: WindowReport) -> list:
-    """Look each order in doubt up by its client order ID; one Alpaca holds is no longer in doubt once its
-    status is terminal, and is returned while it is not, to be taken as working. Alpaca's 404 for an ID
-    it does not hold, as the adapter's `_refused` reads it, is UNVERIFIED against its documentation; any
-    other failure is recorded and the ID stays in doubt."""
-    found = []
-    for client_order_id in list(doubtful):
-        try:
-            order = trading.get_order_by_client_id(client_order_id)
-        except APIError as e:
-            if e.status_code != 404:
-                _note(report, f"looking up {client_order_id}: {e}")
-            continue
-        except OSError as e:
-            _note(report, f"looking up {client_order_id}: {type(e).__name__}: {e}")
-            continue
-        if _value(getattr(order, "status", None)) in TERMINAL:
-            doubtful.remove(client_order_id)
-        else:
-            found.append(order)
-    return found
-
-
-def _is_the_close(order, held: Decimal, node_orders: set[str]) -> bool:
-    """Whether `order` is the check's close whose answer was lost: no order of the node's, and the close's
-    side, quantity and type (`_matches_close`)."""
-    return str(order.client_order_id) not in node_orders and _matches_close(order, held)
-
-
-def _orders_since(trading: TradingClient, symbol: str, since: datetime) -> list:
-    """Every order in `symbol` submitted after `since`, whatever its status (`GetOrdersRequest.after`)."""
-    orders = trading.get_orders(
-        GetOrdersRequest(status=QueryOrderStatus.ALL, symbols=[symbol], after=since)
-    )
-    assert isinstance(orders, list)
-    return orders
-
-
-def _lost(held: Decimal | None, symbol: str) -> list[str]:
-    """A close whose answer was lost and that is not found among the orders since it was sent."""
-    if held is None:
-        return []
-    return [f"a close of {abs(held)} {symbol} sent with no answer, not found at Alpaca"]
-
-
-def _unfound(doubtful: list[str], found: list) -> list[str]:
-    """The orders in doubt that Alpaca was not found to hold (one found is named as an open order)."""
-    held = {str(o.client_order_id) for o in found}
-    return [
-        f"order {c}: sent with no answer, not found at Alpaca" for c in doubtful if c not in held
-    ]
+        left = check.read()
+        if not left:
+            return left
+    except FAILED as e:
+        last_error = f"{type(e).__name__}: {e}"
+        _note(report, f"reading the account as the check ends: {last_error}")
+        if left is None:
+            raise RuntimeError(
+                f"the account could not be read in {AFTER_STOP_SECS} s after the stop: {last_error}"
+            ) from e
+        left = check.left()
+    # The process is ending: nothing the window knows of is left working, but a close that will fill.
+    check.cancel(final=True)
+    return left
 
 
 def _note(report: WindowReport, error: str) -> None:
     if error not in report.errors:
         report.errors.append(error)
-
-
-def _regular_session_open(trading: TradingClient) -> bool:
-    clock = trading.get_clock()
-    assert isinstance(clock, AlpacaClock)
-    return bool(clock.is_open)
 
 
 class Calls(ThreadPoolExecutor):
@@ -1091,9 +1196,15 @@ def _abandon(runner: asyncio.Runner, task: asyncio.Task | None, calls: Calls) ->
 
 def _close_runner(runner: asyncio.Runner, task: asyncio.Task | None, calls: Calls) -> bool:
     """Close the runner once its worker calls have ended, waiting at most `ADAPTER_CALL_SECS` for them
-    (`Runner.close` would wait up to 300 s, `THREAD_JOIN_TIMEOUT`); if one still runs, leave it as after
-    an abandoned stop and return False."""
-    if calls.settle():
+    (`Runner.close` would wait up to 300 s, `THREAD_JOIN_TIMEOUT`); if one still runs, or the wait is
+    interrupted, leave it as after an abandoned stop, and return False for the first."""
+    try:
+        still_running = calls.settle()
+    except BaseException:
+        # interrupted in the wait: a worker call may still run, as after a stop that hung
+        _ABANDONED.append((runner, task, calls))
+        raise
+    if still_running:
         _ABANDONED.append((runner, task, calls))
         return False
     runner.close()
@@ -1115,12 +1226,44 @@ def _event_name(event) -> str:
     return found
 
 
-def _events(cache) -> dict[str, list[str]]:
-    """Each of the strategy's orders in the node's cache, by client order ID, with its events' names."""
-    return {
-        order.client_order_id.value: [_event_name(e) for e in order.events()]
-        for order in cache.orders(strategy_id=STRATEGY_ID)
+ANSWERED = frozenset(
+    {
+        "OrderAccepted",
+        "OrderRejected",
+        "OrderFilled",
+        "OrderCanceled",
+        "OrderExpired",
+        "OrderDenied",
     }
+)
+"""The events by which the node has heard what became of an order it sent."""
+
+
+def _unsettled(cache) -> dict[str, tuple[str, str]]:
+    """The strategy's orders the node did not see end, by client order ID, each with its side and why it
+    is here: `sent with no answer` of Alpaca's (the adapter logs an unknown outcome and leaves the order
+    submitted when a submit's answer is lost, `_log_unknown_outcome`, and the node's own rejection of it
+    is no answer), answered and still `open at the node` (not `is_closed` in its cache), or `ended by the
+    node's own reconciliation`: an event that carries `reconciliation`, as the cancel or rejection the
+    node gives an order it could not find or hear of does (`create_reconciliation_canceled`,
+    `create_reconciliation_rejected` at the pin), is the node's reconstruction, not Alpaca's message.
+    Alpaca may hold any of them after the node has stopped; the account check looks each up
+    (`_flatten_after_stop`)."""
+    found: dict[str, tuple[str, str]] = {}
+    for order in cache.orders(strategy_id=STRATEGY_ID):
+        names = [_event_name(e) for e in order.events()]
+        if "OrderSubmitted" not in names:
+            continue
+        if not ANSWERED.intersection(names):
+            why = "sent with no answer"
+        elif not order.is_closed:
+            why = "open at the node"
+        elif any(getattr(e, "reconciliation", False) for e in order.events()):
+            why = "ended by the node's own reconciliation"
+        else:
+            continue
+        found[order.client_order_id.value] = (order.side.name.lower(), why)
+    return found
 
 
 def _fill(report: WindowReport, cache) -> None:
@@ -1187,13 +1330,18 @@ def _log_dir(argv: Sequence[str] | None) -> Path:
     return _parser().parse_args(argv).log_dir
 
 
-def _heard_failed(log_dir: Path, error: BaseException) -> None:
-    """The heartbeat for a failed run; a heartbeat that cannot be written (the error may be the log
-    directory's own) is said on stderr, so the run's own error and exit code stand."""
+def _heard(log_dir: Path, outcome: str) -> None:
+    """The heartbeat for a run that has said its outcome already; one that cannot be written (the log
+    directory may be the trouble) is said on stderr, so the run's own outcome and exit code stand."""
     try:
-        write_heartbeat(log_dir, f"failed: {type(error).__name__}: {error}")
+        write_heartbeat(log_dir, outcome)
     except OSError as e:
         print(f"paper:session: the heartbeat could not be written: {e}", file=sys.stderr)
+
+
+def _heard_failed(log_dir: Path, error: BaseException) -> None:
+    """The heartbeat for a failed run (`_heard`)."""
+    _heard(log_dir, f"failed: {type(error).__name__}: {error}")
 
 
 def _main(argv: Sequence[str] | None) -> int:
@@ -1204,12 +1352,12 @@ def _main(argv: Sequence[str] | None) -> int:
         market_read_at: float | None = None
         if session == "auto":
             trading = paper_trading()
-            market_read_at = time.monotonic()
-            market = session_now(trading)
-            resolved, why = resolve_session(*market)
+            clock, calendar, market_read_at = session_now(trading)
+            market = (clock, calendar)
+            resolved, why = resolve_session(clock, calendar)
             if resolved is None:
-                write_heartbeat(args.log_dir, f"nothing to run: {why}")
                 print(f"paper:session: nothing to run: {why}")
+                _heard(args.log_dir, f"nothing to run: {why}")
                 return 0
             session = resolved
         config = WindowConfig(
@@ -1218,15 +1366,12 @@ def _main(argv: Sequence[str] | None) -> int:
         write_heartbeat(args.log_dir, f"a {session} window")
         report = run_window(config, trading=trading, market=market, market_read_at=market_read_at)
     except WindowSkipped as e:
-        write_heartbeat(args.log_dir, f"skipped: {e}")
         print(f"paper:session: skipped: {e}")
+        _heard(args.log_dir, f"skipped: {e}")
         return 0
     except WindowRefused as e:
         print(f"paper:session: {e}", file=sys.stderr)
-        try:
-            write_heartbeat(args.log_dir, f"refused: {e}")
-        except OSError as written:  # the refusal stands, said above
-            print(f"paper:session: the heartbeat could not be written: {written}", file=sys.stderr)
+        _heard(args.log_dir, f"refused: {e}")  # the refusal stands, said above
         try:
             write_record(
                 args.log_dir,

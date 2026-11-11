@@ -61,7 +61,7 @@ login keychain without a dialog is UNVERIFIED until its first firing. A firing w
   lock wait (900), a start-up allowance (600: uv's sync after a uv.lock change measured 8 s from an empty
   cache, 464 MB), four Alpaca calls before the node at their longest with alpaca-py's retries (4 x
   `ADAPTER_CALL_SECS`, 517), a host clock behind Alpaca's (`SKEW_SECS`, 60), the longest window
-  (`LONGEST_WINDOW_SECS`, 3076) and its bounded end (`AFTER_END_SECS`, 605): 5758, 482 s spare; a test
+  (`LONGEST_WINDOW_SECS`, 2955) and its bounded end (`AFTER_END_SECS`, 725): 5757, 483 s spare; a test
   reads those bounds from `session_window`. From a
   person's terminal uv runs as before, with mise's `timeout` as the deadline: through timeout(1) one Ctrl-C
   reached Python twice (observed), which could cut a flatten short. A window run as it should holds the lock under
@@ -192,3 +192,5 @@ Read 2026-11-10. "raw": fetched with `curl` and read whole.
 * https://www.rfc-editor.org/rfc/rfc3986.txt, sections 3.4 and 3.5: the query and the fragment (fetched, raw).
 * Second reader (`evidence-verifier`), 2026-11-10, on this split: added the skill and clock lines, marked
   the weekend reading `UNVERIFIED`, narrowed the Good consequence and corrected the install line.
+* 2026-11-10: the deadline's sum follows ADR 0044's recounted account check (`LONGEST_WINDOW_SECS` 3076 to
+  2955, `AFTER_END_SECS` 605 to 725; the two move together, so the sum is 5757 where it was 5758) (run).

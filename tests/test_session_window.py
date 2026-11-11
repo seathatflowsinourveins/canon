@@ -13,6 +13,8 @@ import os
 import re
 import subprocess
 import tomllib
+from dataclasses import dataclass
+from dataclasses import field
 from datetime import UTC
 from datetime import datetime
 from datetime import timedelta
@@ -21,6 +23,8 @@ from itertools import pairwise
 from types import SimpleNamespace
 from typing import Any
 from typing import cast
+from uuid import UUID
+from uuid import uuid4
 
 import pytest
 import requests
@@ -28,6 +32,9 @@ from alpaca.common.exceptions import APIError
 from alpaca.trading.client import TradingClient
 from alpaca.trading.models import Calendar
 from alpaca.trading.models import Clock
+from alpaca.trading.models import Order
+from alpaca.trading.models import Position
+from alpaca.trading.requests import MarketOrderRequest
 from canon_alpaca.constants import PRICE_INCREMENT
 from canon_alpaca.constants import PRICE_PRECISION
 from canon_alpaca.constants import USD
@@ -510,73 +517,6 @@ def test_a_short_is_bought_back_not_added_to() -> None:
     probe = Probe(s, working=False, held=Decimal(-1))
     s.on_stop()
     assert probe.sent == [("BUY", Decimal(1))]
-
-
-class Holding:
-    """A paper account holding one open order and one share of SPY: a cancel takes a poll to land, and a
-    close is refused (403) while the order still holds the share, as Alpaca refuses it."""
-
-    def __init__(self) -> None:
-        self.orders = [SimpleNamespace(id="o-1", client_order_id="exit-1")]
-        self.canceling = False
-        self.qty = 1
-        self.calls: list[str] = []
-        self.is_open = True
-
-    def get_clock(self) -> Clock:
-        return clock(datetime(2026, 11, 10, 15, 0, tzinfo=NEW_YORK), is_open=self.is_open)
-
-    def get_orders(self, filter=None) -> list:
-        if self.canceling:
-            self.orders, self.canceling = [], False
-        return list(self.orders)
-
-    def get_open_position(self, symbol):
-        from alpaca.common.exceptions import APIError
-
-        if not self.qty:
-            raise APIError(
-                '{"code": 40410000, "message": "position does not exist"}',
-                SimpleNamespace(response=SimpleNamespace(status_code=404)),
-            )
-        return SimpleNamespace(qty=str(self.qty), side="long", __class__=object)
-
-    def cancel_order_by_id(self, order_id) -> None:
-        self.calls.append(f"cancel {order_id}")
-        self.canceling = True
-
-    def close_position(self, symbol):
-
-        if self.orders:
-            raise insufficient()
-        self.calls.append(f"close {symbol}")
-        self.qty = 0
-        return SimpleNamespace(id="c-0")
-
-
-def test_after_the_stop_the_cancels_land_before_the_close(monkeypatch) -> None:
-    monkeypatch.setattr(session_window, "POLL_SECS", 0.0)
-    monkeypatch.setattr(session_window, "position_qty", lambda t, s: Decimal(t.qty))
-    account = Holding()
-    report = session_window.WindowReport("regular", "SPY", started="t")
-    left = session_window._flatten_after_stop(cast(TradingClient, account), WindowConfig(), report)
-    assert account.calls == ["cancel o-1", "close SPY"]
-    assert left == [] and report.closed_after_stop and report.errors == []
-
-
-def test_outside_the_session_the_orders_are_canceled_and_the_position_reported(
-    monkeypatch, extended
-) -> None:
-    monkeypatch.setattr(session_window, "POLL_SECS", 0.0)
-    monkeypatch.setattr(session_window, "position_qty", lambda t, s: Decimal(t.qty))
-    account = Holding()
-    account.is_open = False  # outside the regular session
-    report = session_window.WindowReport("extended", "SPY", started="t")
-    left = session_window._flatten_after_stop(
-        cast(TradingClient, account), WindowConfig(session="extended"), report
-    )
-    assert account.calls == ["cancel o-1"]
-    assert left == ["position of 1 SPY"]
 
 
 def test_a_gap_marker_cut_short_still_dates_the_last_window(tmp_path) -> None:
@@ -1158,83 +1098,11 @@ class FakeTime:
         return time.time()
 
 
-class Clearing(Holding):
-    """`Holding`, whose cancel lands only `after` seconds of `FakeTime`, past one settle's 30 s; the
-    clock is open unless the test closes it; a close that would queue (session closed) stays open."""
-
-    def __init__(self, fake: FakeTime, *, after: float = 40.0, is_open: bool = True) -> None:
-        super().__init__()
-        self.fake = fake
-        self.after = after
-        self.canceled_at: float | None = None
-        self.is_open = is_open
-        self.queue_closes = False
-
-    def get_orders(self, filter=None) -> list:
-        if self.canceled_at is not None and self.fake.now - self.canceled_at >= self.after:
-            self.orders = [o for o in self.orders if o.id != "o-1"]
-        return list(self.orders)
-
-    def cancel_order_by_id(self, order_id) -> None:
-        self.calls.append(f"cancel {order_id}")
-        if order_id == "o-1":  # a cancel sent again while one is pending does not restart it
-            if self.canceled_at is None:
-                self.canceled_at = self.fake.now
-        else:
-            self.orders = [o for o in self.orders if o.id != order_id]
-
-    def close_position(self, symbol):
-
-        if any(o.id == "o-1" for o in self.orders):
-            self.calls.append("close refused")
-            raise insufficient()
-        self.calls.append(f"close {symbol}")
-        if self.queue_closes:  # a DAY market order after the close waits for the next session
-            self.orders.append(
-                SimpleNamespace(
-                    id="c-1", client_order_id="close-1", side="sell", qty="1", type="market"
-                )
-            )
-            self.is_open = False
-        else:
-            self.qty = 0
-        return SimpleNamespace(id="c-1")
-
-
 @pytest.fixture
 def fake_time(monkeypatch) -> FakeTime:
     fake = FakeTime()
     monkeypatch.setattr(session_window, "time", fake)
-    monkeypatch.setattr(session_window, "position_qty", lambda t, s: Decimal(t.qty))
     return fake
-
-
-def test_a_close_refused_while_a_cancel_clears_is_tried_again(fake_time) -> None:
-    """Finding 2: the market close was tried once; Alpaca's 403 while the cancel cleared ended it."""
-    account = Clearing(fake_time, after=40.0)
-    report = session_window.WindowReport("regular", "SPY", started="t")
-    left = session_window._flatten_after_stop(cast(TradingClient, account), WindowConfig(), report)
-    assert left == [] and report.closed_after_stop
-    assert account.calls[-1] == "close SPY"
-
-
-def test_no_market_close_is_sent_once_alpacas_clock_says_the_session_closed(fake_time) -> None:
-    """Finding 2: a regular window's close after 16:00 would only queue for the next session."""
-    account = Clearing(fake_time, after=0.0, is_open=False)
-    report = session_window.WindowReport("regular", "SPY", started="t")
-    left = session_window._flatten_after_stop(cast(TradingClient, account), WindowConfig(), report)
-    assert "close SPY" not in account.calls and not report.closed_after_stop
-    assert left == ["position of 1 SPY"]
-
-
-def test_a_close_that_would_only_queue_is_canceled(fake_time) -> None:
-    """Finding 2: a close sent as the session closed queued, and nothing canceled it."""
-    account = Clearing(fake_time, after=0.0)
-    account.queue_closes = True
-    report = session_window.WindowReport("regular", "SPY", started="t")
-    left = session_window._flatten_after_stop(cast(TradingClient, account), WindowConfig(), report)
-    assert account.calls[-1] == "cancel c-1"
-    assert left == ["position of 1 SPY"]
 
 
 def test_the_cap_stops_the_node_and_leaves_a_non_flattening_strategys_position(monkeypatch) -> None:
@@ -1538,51 +1406,6 @@ def test_a_signal_limit_is_forgotten_once_its_timeout_has_run() -> None:
 # Two second readers' reviews of the window (2026-11-10): each shown here before its fix.
 
 
-class Slow:
-    """A paper account whose every call takes `per_call` seconds of `FakeTime`, as a slow but live Alpaca
-    answering near the read timeout; it holds one share and one open order, and every cancel and close
-    is refused, so the check works until its deadline."""
-
-    def __init__(self, fake: FakeTime, per_call: float) -> None:
-        self.fake = fake
-        self.per_call = per_call
-        self.qty = 1
-        self.calls: list[tuple[float, str]] = []
-
-    def _took(self, name: str) -> None:
-        self.calls.append((self.fake.now, name))
-        self.fake.now += self.per_call
-
-    def get_clock(self) -> Clock:
-        self._took("clock")
-        return clock(datetime(2026, 11, 10, 15, 0, tzinfo=NEW_YORK), is_open=True)
-
-    def get_orders(self, filter=None) -> list:
-        self._took("orders")
-        return [SimpleNamespace(id="o-1", client_order_id="entry-1")]
-
-    def cancel_order_by_id(self, order_id) -> None:
-        self._took("cancel")
-        raise APIError('{"code": 42210000, "message": "order is not cancelable"}')
-
-    def close_position(self, symbol):
-        self._took("close")
-        raise insufficient()
-
-
-def test_the_account_check_ends_within_its_bound_however_slow_alpaca_is(fake_time) -> None:
-    """Calls before the check's deadline was set, and after it passed, were not counted in it: with each
-    call near the request timeout the check ran far past `AFTER_STOP_SECS`."""
-    account = Slow(fake_time, per_call=session_window.REQUEST_SECS)
-    report = session_window.WindowReport("regular", "SPY", started="t")
-    left = session_window._flatten_after_stop(cast(TradingClient, account), WindowConfig(), report)
-    w = session_window
-    # the poll begun before the deadline, then the last reading and a cancel of what it shows
-    assert fake_time.now <= w.AFTER_END_SECS - w.STOP_TIMEOUT_SECS - w.ADAPTER_CALL_SECS
-    assert all(at < w.AFTER_STOP_SECS for at, name in account.calls if name in {"clock", "close"})
-    assert left == ["open order entry-1", "position of 1 SPY"]
-
-
 class Answering(HTTPAdapter):
     """A requests adapter that answers every request with one status code and counts what it sent."""
 
@@ -1620,7 +1443,9 @@ def test_the_windows_own_alpaca_client_sends_a_request_once(monkeypatch) -> None
     session.mount("https://", answering)
     session_window.send_once(trading)
     with pytest.raises(APIError):
-        trading.close_position("SPY")
+        trading.submit_order(
+            MarketOrderRequest(symbol="SPY", qty=1, side="sell", time_in_force="day")
+        )
     assert answering.sent == 1 and slept == []
 
 
@@ -1730,241 +1555,6 @@ def test_a_call_after_the_stop_was_abandoned_cannot_start() -> None:
         loop.close()
 
 
-class Refusing(Holding):
-    """`Holding`, whose first `refusals` cancels fail (Alpaca's 422) or are taken and do not land; the
-    next one lands. Its entry order would fill while working."""
-
-    def __init__(self, *, refusals: int = 1, raises: bool = True) -> None:
-        super().__init__()
-        self.orders = [SimpleNamespace(id="o-1", client_order_id="entry-1")]
-        self.refusals = refusals
-        self.raises = raises
-
-    def get_orders(self, filter=None) -> list:
-        return list(self.orders)
-
-    def cancel_order_by_id(self, order_id) -> None:
-        self.calls.append(f"cancel {order_id}")
-        if self.refusals:
-            self.refusals -= 1
-            if self.raises:
-                raise APIError('{"code": 42210000, "message": "order is not cancelable"}')
-            return
-        self.orders = [o for o in self.orders if o.id != order_id]
-
-    def close_position(self, symbol):
-        super().close_position(symbol)
-        return SimpleNamespace(id="c-1")
-
-
-@pytest.mark.parametrize("raises", [True, False], ids=["refused", "taken-not-landed"])
-def test_a_working_order_whose_cancel_did_not_land_is_canceled_again(fake_time, raises) -> None:
-    """The open orders were canceled once; one whose cancel failed or did not land stayed working while
-    the session was open, could fill once the process had gone, and kept the position from its close."""
-    account = Refusing(refusals=2, raises=raises)
-    report = session_window.WindowReport("regular", "SPY", started="t")
-    left = session_window._flatten_after_stop(cast(TradingClient, account), WindowConfig(), report)
-    assert account.calls == ["cancel o-1", "cancel o-1", "cancel o-1", "close SPY"]
-    assert left == [] and report.closed_after_stop
-
-
-class TwoOrders(Holding):
-    """`Holding` with two open orders, whose first cancel fails as the adapter's timeout does."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.orders = [
-            SimpleNamespace(id="o-1", client_order_id="entry-1"),
-            SimpleNamespace(id="o-2", client_order_id="entry-2"),
-        ]
-        self.timeouts = 1
-
-    def get_orders(self, filter=None) -> list:
-        return list(self.orders)
-
-    def cancel_order_by_id(self, order_id) -> None:
-        self.calls.append(f"cancel {order_id}")
-        if self.timeouts:
-            self.timeouts -= 1
-            raise requests.ConnectTimeout("connect timed out")
-        self.orders = [o for o in self.orders if o.id != order_id]
-
-
-def test_a_timeout_on_one_cancel_does_not_skip_the_next_or_the_close(fake_time) -> None:
-    account = TwoOrders()
-    report = session_window.WindowReport("regular", "SPY", started="t")
-    left = session_window._flatten_after_stop(cast(TradingClient, account), WindowConfig(), report)
-    assert account.calls == ["cancel o-1", "cancel o-2", "cancel o-1", "close SPY"]
-    assert left == [] and len(report.errors) == 1
-
-
-class LateClose(Holding):
-    """`Holding` with no open order, whose close is refused until `FakeTime` reaches `at`."""
-
-    def __init__(self, fake: FakeTime, at: float) -> None:
-        super().__init__()
-        self.orders = []
-        self.fake = fake
-        self.at = at
-
-    def close_position(self, symbol):
-        if self.fake.now < self.at:
-            self.calls.append("close refused")
-            raise insufficient()
-        self.calls.append(f"close {symbol}")
-        self.qty = 0
-        return SimpleNamespace(id="c-0")
-
-
-def test_a_close_taken_in_the_last_poll_is_read_back_not_reported_held(fake_time) -> None:
-    """The result was the reading from before the last poll's close, so a window left flat was recorded
-    not flat."""
-    account = LateClose(fake_time, at=session_window.AFTER_STOP_SECS - 3)
-    report = session_window.WindowReport("regular", "SPY", started="t")
-    left = session_window._flatten_after_stop(cast(TradingClient, account), WindowConfig(), report)
-    assert account.calls[-1] == "close SPY" and left == []
-
-
-class Unanswered(Holding):
-    """`Holding` with no open order, whose close reaches Alpaca and is placed, but the answer times out;
-    the order stays open for a poll, then fills."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.orders = []
-        self.polls = 1
-
-    def get_orders(self, filter=None) -> list:
-        if self.orders:
-            if self.polls:
-                self.polls -= 1
-            else:
-                self.orders, self.qty = [], 0
-        return list(self.orders)
-
-    def close_position(self, symbol):
-        self.calls.append(f"close {symbol}")
-        self.orders = [
-            SimpleNamespace(
-                id="c-1", client_order_id="alpaca-made-1", side="sell", qty="1", type="market"
-            )
-        ]
-        raise requests.ReadTimeout("read timed out")
-
-
-def test_the_checks_own_close_is_known_even_when_its_answer_was_lost(fake_time) -> None:
-    """A close whose call failed after reaching Alpaca was taken for another's order and canceled."""
-    account = Unanswered()
-    report = session_window.WindowReport("regular", "SPY", started="t")
-    left = session_window._flatten_after_stop(cast(TradingClient, account), WindowConfig(), report)
-    assert account.calls == ["close SPY"] and left == []
-
-
-class Filling(Holding):
-    """`Holding` with no open order: the check's own market close stays open for `polls` reads, then
-    fills."""
-
-    def __init__(self, polls: int) -> None:
-        super().__init__()
-        self.orders = []
-        self.polls = polls
-
-    def get_orders(self, filter=None) -> list:
-        if self.orders:
-            if self.polls:
-                self.polls -= 1
-            else:
-                self.orders, self.qty = [], 0
-        return list(self.orders)
-
-    def close_position(self, symbol):
-        self.calls.append(f"close {symbol}")
-        self.orders = [SimpleNamespace(id="c-1", client_order_id="close-1")]
-        return SimpleNamespace(id="c-1")
-
-
-def test_the_checks_own_close_is_left_to_fill_while_the_session_is_open(fake_time) -> None:
-    """The documented exception: a close the check sent is not canceled while the session is open."""
-    account = Filling(polls=3)
-    report = session_window.WindowReport("regular", "SPY", started="t")
-    left = session_window._flatten_after_stop(cast(TradingClient, account), WindowConfig(), report)
-    assert account.calls == ["close SPY"] and left == []
-
-
-class Flaky(Holding):
-    """`Holding` with no open order, whose first read of `which` fails as a transient error does."""
-
-    def __init__(self, which: str, error: Exception) -> None:
-        super().__init__()
-        self.orders = []
-        self.failing = {which: error}
-
-    def _maybe_fail(self, which: str) -> None:
-        if error := self.failing.pop(which, None):
-            raise error
-
-    def get_clock(self) -> Clock:
-        self._maybe_fail("clock")
-        return super().get_clock()
-
-    def get_orders(self, filter=None) -> list:
-        self._maybe_fail("orders")
-        return super().get_orders(filter)
-
-
-@pytest.mark.parametrize(
-    ("which", "error"),
-    [
-        ("clock", APIError('{"code": 50000000, "message": "internal server error"}')),
-        ("orders", requests.ReadTimeout("read timed out")),
-    ],
-    ids=["clock-500", "orders-timeout"],
-)
-def test_one_transient_error_does_not_end_the_account_check(fake_time, which, error) -> None:
-    """Only the close's `APIError` was caught: an error from a read or the clock ended the check at
-    once, with its budget unused and a closable position left."""
-    account = Flaky(which, error)
-    report = session_window.WindowReport("regular", "SPY", started="t")
-    left = session_window._flatten_after_stop(cast(TradingClient, account), WindowConfig(), report)
-    assert left == [] and account.calls == ["close SPY"]
-    assert len(report.errors) == 1
-
-
-class Lagging(Holding):
-    """`Holding` whose order leaves the open list at once on its cancel, while Alpaca still holds the
-    share from a close for `refusals` more closes (a 403), as `qty_available` lags the cancel."""
-
-    def __init__(self, refusals: int) -> None:
-        super().__init__()
-        self.refusals = refusals
-
-    def get_orders(self, filter=None) -> list:
-        return list(self.orders)
-
-    def cancel_order_by_id(self, order_id) -> None:
-        self.calls.append(f"cancel {order_id}")
-        self.orders = []
-
-    def close_position(self, symbol):
-        if self.refusals:
-            self.refusals -= 1
-            self.calls.append("close refused")
-            raise insufficient()
-        self.calls.append(f"close {symbol}")
-        self.qty = 0
-        return SimpleNamespace(id="c-1")
-
-
-def test_a_close_refused_with_no_order_open_is_tried_again(fake_time) -> None:
-    """The retry test waited for the cancel to clear before its only close, so a check that dropped the
-    retry after a real 403 passed it; here the 403 comes, twice, after the order has gone."""
-    account = Lagging(refusals=2)
-    report = session_window.WindowReport("regular", "SPY", started="t")
-    left = session_window._flatten_after_stop(cast(TradingClient, account), WindowConfig(), report)
-    assert account.calls == ["cancel o-1", "close refused", "close refused", "close SPY"]
-    assert left == [] and report.closed_after_stop
-
-
 @pytest.mark.parametrize(
     ("dropped", "fast", "working", "held"),
     [
@@ -2003,9 +1593,11 @@ def test_the_post_end_bound_fits_the_end_margin_the_stale_record_and_the_paper_l
 
     w = session_window
     before = w.STOP_TIMEOUT_SECS + w.ADAPTER_CALL_SECS + w.AFTER_STOP_SECS
-    last_close = before + 3 * w.REQUEST_SECS  # the poll's two reads and its clock read
-    # that poll at its longest (two reads, the clock, a cancel of each order), then the same again
-    after_end = before + 2 * (2 + 1 + w.FINAL_CANCELS) * w.REQUEST_SECS
+    reading = (w.LOOKUPS + 2) * w.REQUEST_SECS  # its lookups, the open orders and the position
+    last_close = before + reading + w.REQUEST_SECS  # the last poll's reading and its clock read
+    assert last_close == w.LAST_CLOSE_SECS
+    # that poll at its longest (a reading, the clock, its cancels), then the last reading, as long
+    after_end = before + 2 * (reading + (1 + w.CANCELS) * w.REQUEST_SECS)
     assert after_end == w.AFTER_END_SECS
     assert w.END_MARGIN_SECS >= last_close + 60
     assert w.LONGEST_WINDOW_SECS + w.SKEW_SECS + after_end < w.STALE_RUNNING_SECS
@@ -2025,10 +1617,10 @@ def test_the_post_end_bound_fits_the_end_margin_the_stale_record_and_the_paper_l
 
 
 def test_a_window_is_shortened_to_fit_the_lock_wait_and_says_so() -> None:
-    """A window of the 60 minutes `--minutes` allows runs `LONGEST_WINDOW_SECS` (about 51 minutes), and
+    """A window of the 60 minutes `--minutes` allows runs `LONGEST_WINDOW_SECS` (about 49 minutes), and
     its record says why; one the session clips says that instead; a scheduled 30 is not shortened."""
     w = session_window
-    assert 50 * 60 < w.LONGEST_WINDOW_SECS < 60 * 60
+    assert 45 * 60 < w.LONGEST_WINDOW_SECS < 60 * 60
     seconds, why = w.window_seconds(60, session_left=4 * 3600)
     assert seconds == w.LONGEST_WINDOW_SECS
     assert why.startswith("shortened from 60 minutes") and "3900 s wait" in why
@@ -2209,121 +1801,95 @@ def test_a_worker_call_left_after_a_clean_stop_is_bounded(monkeypatch) -> None:
 # An independent review of the account check (2026-11-10): each shown here before its fix.
 
 
-def test_a_node_order_with_no_answer_is_in_doubt() -> None:
-    """An order the adapter sent and heard nothing back for (`_log_unknown_outcome`) stays submitted."""
-    orders = {
-        "lost": ["OrderInitialized", "OrderSubmitted"],
-        "taken": ["OrderInitialized", "OrderSubmitted", "OrderAccepted"],
-        "refused": ["OrderInitialized", "OrderSubmitted", "OrderRejected"],
-        "denied": ["OrderInitialized", "OrderDenied"],
-        "filled": ["OrderInitialized", "OrderSubmitted", "OrderFilled"],
-    }
-    assert session_window.in_doubt(orders) == ["lost"]
+class OrderInitialized: ...
 
 
-class LateAccept(Holding):
-    """A flat account where the node's submit `entry-late` timed out but reaches Alpaca `polls` lookups
-    later, as an open buy."""
-
-    def __init__(self, polls: int) -> None:
-        super().__init__()
-        self.orders, self.qty = [], 0
-        self.polls = polls
-
-    def get_order_by_client_id(self, client_id):
-        self.calls.append(f"lookup {client_id}")
-        if self.polls:
-            self.polls -= 1
-            raise APIError(
-                '{"code": 40410000, "message": "order not found"}',
-                SimpleNamespace(response=SimpleNamespace(status_code=404)),
-            )
-        canceled = "cancel n-1" in self.calls
-        if not canceled and not any(o.id == "n-1" for o in self.orders):
-            self.orders.append(SimpleNamespace(id="n-1", client_order_id=client_id))
-        status = "canceled" if canceled else "accepted"
-        return SimpleNamespace(id="n-1", client_order_id=client_id, status=status)
-
-    def get_orders(self, filter=None) -> list:
-        return list(self.orders)
-
-    def cancel_order_by_id(self, order_id) -> None:
-        self.calls.append(f"cancel {order_id}")
-        self.orders = [o for o in self.orders if o.id != order_id]
+class OrderSubmitted: ...
 
 
-def test_a_flat_reading_with_a_node_order_in_doubt_is_not_flat(fake_time) -> None:
-    """The check read no open order and no position and recorded ok, while a submit whose answer was
-    lost could still be taken by Alpaca after it: a live buy outside the check."""
-    account = LateAccept(polls=2)
-    report = session_window.WindowReport("regular", "SPY", started="t")
-    left = session_window._flatten_after_stop(
-        cast(TradingClient, account), WindowConfig(), report, in_doubt=["entry-late"]
+class OrderAccepted: ...
+
+
+class OrderFilled: ...
+
+
+class OrderDenied: ...
+
+
+class OrderCanceled:
+    def __init__(self, reconciliation: bool = False) -> None:
+        self.reconciliation = reconciliation
+
+
+class OrderRejected:
+    def __init__(self, reason: str = "HTTP 403: no", reconciliation: bool = False) -> None:
+        self.reason = reason
+        self.reconciliation = reconciliation
+
+
+def node_order(client_order_id: str, *events, side=OrderSide.BUY, is_closed: bool = False):
+    """An order as the node's cache holds it, as far as the window reads it: its ID, side, events and
+    whether it is closed (the pinned `MarketOrder` and `LimitOrder` have each)."""
+    return SimpleNamespace(
+        client_order_id=SimpleNamespace(value=client_order_id),
+        side=side,
+        is_closed=is_closed,
+        events=lambda: list(events),
     )
-    assert "cancel n-1" in account.calls and left == []
 
 
-def test_a_node_order_never_found_is_left_named(fake_time) -> None:
-    account = LateAccept(polls=10_000)
-    report = session_window.WindowReport("regular", "SPY", started="t")
-    left = session_window._flatten_after_stop(
-        cast(TradingClient, account), WindowConfig(), report, in_doubt=["entry-late"]
-    )
-    assert left == ["order entry-late: sent with no answer, not found at Alpaca"]
-
-
-class LostCloseAndLateBuy(Holding):
-    """One share held and no order open; the check's close is placed but its answer times out, and the
-    node's late buy appears with it."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.orders = []
-        self.polls = 3
-
-    def get_orders(self, filter=None) -> list:
-        if any(o.id == "c-1" for o in self.orders):
-            if self.polls:
-                self.polls -= 1
-            else:  # the close fills
-                self.orders, self.qty = [o for o in self.orders if o.id != "c-1"], 0
-        return list(self.orders)
-
-    def cancel_order_by_id(self, order_id) -> None:
-        self.calls.append(f"cancel {order_id}")
-        self.orders = [o for o in self.orders if o.id != order_id]
-
-    def close_position(self, symbol):
-        self.calls.append(f"close {symbol}")
-        self.orders = [
-            SimpleNamespace(
-                id="n-1", client_order_id="entry-late", side="buy", qty="1", type="market"
+def test_a_node_order_the_node_did_not_see_end_is_unsettled() -> None:
+    """An order the adapter sent and heard nothing back for (`_log_unknown_outcome`) stays submitted, and
+    one Alpaca accepted may still work when the node stops; either may be at Alpaca after the stop. The
+    node's own rejection of a submit never acknowledged (`INFLIGHT_TIMEOUT`, `NOT_FOUND_AT_VENUE`:
+    `create_reconciliation_rejected` at the pin) is not Alpaca's answer, and nor is any end the node
+    gave an order by its own reconciliation (`create_reconciliation_canceled`, and that rejection of an
+    accepted order): those events carry `reconciliation`."""
+    sent = (OrderInitialized(), OrderSubmitted())
+    cache = SimpleNamespace(
+        orders=lambda **kwargs: [
+            node_order("lost", *sent, side=OrderSide.SELL),
+            node_order("working", *sent, OrderAccepted()),
+            node_order("part-filled", *sent, OrderAccepted(), OrderFilled()),
+            node_order("timed-out", *sent, OrderRejected("INFLIGHT_TIMEOUT"), is_closed=True),
+            node_order("unseen", *sent, OrderRejected("NOT_FOUND_AT_VENUE"), is_closed=True),
+            node_order("refused", *sent, OrderRejected(), is_closed=True),
+            node_order("found-gone", *sent, OrderAccepted(), OrderCanceled(True), is_closed=True),
+            node_order("canceled", *sent, OrderAccepted(), OrderCanceled(), is_closed=True),
+            node_order(
+                "lost-after",
+                *sent,
+                OrderAccepted(),
+                OrderRejected("NOT_FOUND_AT_VENUE", reconciliation=True),
+                is_closed=True,
             ),
-            SimpleNamespace(
-                id="c-1", client_order_id="alpaca-1", side="sell", qty="1", type="market"
-            ),
+            node_order("denied", OrderInitialized(), OrderDenied(), is_closed=True),
+            node_order("filled", *sent, OrderFilled(), is_closed=True),
+            node_order("never-sent", OrderInitialized()),
         ]
-        raise requests.ReadTimeout("read timed out")
+    )
+    assert session_window._unsettled(cache) == {
+        "lost": ("sell", "sent with no answer"),
+        "working": ("buy", "open at the node"),
+        "part-filled": ("buy", "open at the node"),
+        "timed-out": ("buy", "sent with no answer"),
+        "unseen": ("buy", "sent with no answer"),
+        "found-gone": ("buy", "ended by the node's own reconciliation"),
+        "lost-after": ("buy", "ended by the node's own reconciliation"),
+    }
 
 
-def test_a_late_order_seen_after_a_lost_close_is_not_taken_for_the_close(fake_time) -> None:
-    """Every order first seen after a close attempt was taken for the check's own close, so a late buy
-    of the node's was left working; the close is now the order matching its side, size and type."""
-    account = LostCloseAndLateBuy()
-    report = session_window.WindowReport("regular", "SPY", started="t")
-    left = session_window._flatten_after_stop(cast(TradingClient, account), WindowConfig(), report)
-    assert account.calls == ["close SPY", "cancel n-1"] and left == []
+def test_a_real_order_of_the_pinned_node_has_what_the_window_reads() -> None:
+    """The stand-in above against the pinned library: a filled market order from the engine's cache is
+    closed, has a side with a name, and is not unsettled."""
+    eng = engine()
+    (first, *_) = run(eng, strategy())
+    assert first.is_closed is True and first.side.name in {"BUY", "SELL"}
+    assert session_window._unsettled(eng.cache) == {}
 
 
 def test_the_window_hands_the_nodes_orders_in_doubt_to_the_check(monkeypatch, tmp_path) -> None:
-    class OrderInitialized: ...
-
-    class OrderSubmitted: ...
-
-    lost = SimpleNamespace(
-        client_order_id=SimpleNamespace(value="entry-late"),
-        events=lambda: [OrderInitialized(), OrderSubmitted()],
-    )
+    lost = node_order("entry-late", OrderInitialized(), OrderSubmitted())
 
     class Ran:
         cache = SimpleNamespace(orders=lambda **kwargs: [lost])
@@ -2340,134 +1906,11 @@ def test_the_window_hands_the_nodes_orders_in_doubt_to_the_check(monkeypatch, tm
     monkeypatch.setattr(
         session_window,
         "_flatten_after_stop",
-        lambda trading, config, report, **kw: handed.append(kw["in_doubt"]) or [],
+        lambda trading, config, report, **kw: handed.append(kw["unsettled"]) or [],
     )
-    session_window.run_window(WindowConfig(log_dir=tmp_path))
-    assert handed == [["entry-late"]]
-
-
-class LostCloseNothingPlaced(Holding):
-    """One share held; the first close's answer is lost and nothing was placed, then a foreign buy
-    appears; the second close is answered and fills."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.orders = []
-        self.closes = 0
-
-    def get_orders(self, filter=None) -> list:
-        return list(self.orders)
-
-    def cancel_order_by_id(self, order_id) -> None:
-        self.calls.append(f"cancel {order_id}")
-        self.orders = [o for o in self.orders if o.id != order_id]
-
-    def close_position(self, symbol):
-        self.calls.append(f"close {symbol}")
-        self.closes += 1
-        if self.closes == 1:
-            self.orders = [
-                SimpleNamespace(
-                    id="n-1", client_order_id="entry-late", side="buy", qty="1", type="market"
-                )
-            ]
-            raise requests.ReadTimeout("read timed out")
-        self.qty = 0
-        return SimpleNamespace(id="c-2")
-
-
-def test_a_foreign_order_after_a_lost_close_that_placed_nothing_is_canceled(fake_time) -> None:
-    account = LostCloseNothingPlaced()
-    report = session_window.WindowReport("regular", "SPY", started="t")
-    left = session_window._flatten_after_stop(cast(TradingClient, account), WindowConfig(), report)
-    assert account.calls == ["close SPY", "cancel n-1", "close SPY"] and left == []
-
-
-class Unlisted(Holding):
-    """Flat by the listing and the position, while the lookup of the node's order in doubt finds it
-    accepted (the two endpoints not yet agreeing); its lookup fails first with a 500."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.orders, self.qty = [], 0
-        self.lookups = 0
-        self.canceled = False
-
-    def get_order_by_client_id(self, client_id):
-        self.lookups += 1
-        if self.lookups == 1:
-            raise APIError('{"code": 50000000, "message": "internal server error"}')
-        status = "canceled" if self.canceled else "accepted"
-        return SimpleNamespace(id="n-1", client_order_id=client_id, status=status)
-
-    def get_orders(self, filter=None) -> list:
-        return []
-
-    def cancel_order_by_id(self, order_id) -> None:
-        self.calls.append(f"cancel {order_id}")
-        self.canceled = True
-
-
-def test_an_order_found_by_its_lookup_but_not_listed_is_canceled_not_taken_as_flat(
-    fake_time,
-) -> None:
-    account = Unlisted()
-    report = session_window.WindowReport("regular", "SPY", started="t")
-    left = session_window._flatten_after_stop(
-        cast(TradingClient, account), WindowConfig(), report, in_doubt=["entry-late"]
-    )
-    assert account.calls == ["cancel n-1"] and left == []
-    assert any("looking up entry-late" in e for e in report.errors)
-
-
-class RefusedThenLateSell(Holding):
-    """One share held; the close is refused with Alpaca's 403 (nothing placed), and then the node's late
-    market sell of one share appears; the second close, once it has gone, fills."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.orders = []
-        self.closes = 0
-
-    def get_orders(self, filter=None) -> list:
-        return list(self.orders)
-
-    def cancel_order_by_id(self, order_id) -> None:
-        self.calls.append(f"cancel {order_id}")
-        self.orders = [o for o in self.orders if o.id != order_id]
-
-    def close_position(self, symbol):
-        self.closes += 1
-        if self.closes == 1:
-            self.calls.append("close refused")
-            self.orders = [
-                SimpleNamespace(
-                    id="n-1", client_order_id="exit-late", side="sell", qty="1", type="market"
-                )
-            ]
-            raise APIError(
-                '{"code": 40310000, "message": "insufficient qty available"}',
-                SimpleNamespace(response=SimpleNamespace(status_code=403)),
-            )
-        self.calls.append(f"close {symbol}")
-        self.qty = 0
-        return SimpleNamespace(id="c-2")
-
-
-def test_a_refused_close_is_not_a_lost_one(fake_time) -> None:
-    """A close Alpaca refused placed nothing, so a matching order seen after it is not the check's."""
-    account = RefusedThenLateSell()
-    report = session_window.WindowReport("regular", "SPY", started="t")
-    left = session_window._flatten_after_stop(cast(TradingClient, account), WindowConfig(), report)
-    assert account.calls == ["close refused", "cancel n-1", "close SPY"] and left == []
-
-
-def test_an_order_with_no_quantity_is_no_close() -> None:
-    notional = SimpleNamespace(side="sell", qty=None, type="market")
-    assert not session_window._matches_close(notional, Decimal(1))
-    assert session_window._matches_close(
-        SimpleNamespace(side="sell", qty="1", type="market"), Decimal(1)
-    )
+    report = session_window.run_window(WindowConfig(log_dir=tmp_path))
+    assert handed == [{"entry-late": "buy"}]
+    assert report.unsettled == {"entry-late": ["buy: sent with no answer"]}
 
 
 # An independent review of the in-doubt lookup as landed (2026-11-10): each shown here before its fix.
@@ -2477,14 +1920,7 @@ def test_the_orders_in_doubt_are_read_before_the_node_is_disposed(monkeypatch, t
     """On a clean stop the node was disposed, which clears its cache, before the orders in doubt were read
     from it, so none was looked up."""
 
-    class OrderInitialized: ...
-
-    class OrderSubmitted: ...
-
-    lost = SimpleNamespace(
-        client_order_id=SimpleNamespace(value="entry-late"),
-        events=lambda: [OrderInitialized(), OrderSubmitted()],
-    )
+    lost = node_order("entry-late", OrderInitialized(), OrderSubmitted())
     held = [lost]
 
     class Disposing:
@@ -2503,465 +1939,13 @@ def test_the_orders_in_doubt_are_read_before_the_node_is_disposed(monkeypatch, t
     monkeypatch.setattr(
         session_window,
         "_flatten_after_stop",
-        lambda trading, config, report, **kw: handed.append(kw["in_doubt"]) or [],
+        lambda trading, config, report, **kw: handed.append(kw["unsettled"]) or [],
     )
     session_window.run_window(WindowConfig(log_dir=tmp_path))
-    assert handed == [["entry-late"]]
-
-
-def test_a_local_in_flight_timeout_is_no_answer_from_alpaca(monkeypatch) -> None:
-    """The node's own in-flight check rejects a submit that was never acknowledged, with the reason
-    `INFLIGHT_TIMEOUT` (`create_reconciliation_rejected` at the pin); that is not Alpaca's answer, and
-    Alpaca can still take the order."""
-
-    class OrderInitialized: ...
-
-    class OrderSubmitted: ...
-
-    class OrderRejected:
-        def __init__(self, reason: str) -> None:
-            self.reason = reason
-
-    def order(client_order_id, *events):
-        return SimpleNamespace(
-            client_order_id=SimpleNamespace(value=client_order_id), events=lambda: list(events)
-        )
-
-    cache = SimpleNamespace(
-        orders=lambda **kwargs: [
-            order(
-                "timed-out", OrderInitialized(), OrderSubmitted(), OrderRejected("INFLIGHT_TIMEOUT")
-            ),
-            order("refused", OrderInitialized(), OrderSubmitted(), OrderRejected("HTTP 403: no")),
-        ]
-    )
-    assert session_window.in_doubt(session_window._events(cache)) == ["timed-out"]
-
-
-class LostCloseThenFlat(Holding):
-    """One share held; the check's close is placed but its answer is lost, and the next reading is flat
-    (another exit filled); the close itself is found only among all of today's orders, filled."""
-
-    def __init__(self, found: bool) -> None:
-        super().__init__()
-        self.orders = []
-        self.found = found
-        self.searches = 0
-
-    def get_orders(self, filter=None) -> list:
-        if getattr(filter, "status", None) is not None and _status(filter) == "all":
-            self.searches += 1
-            if self.found:
-                return [
-                    SimpleNamespace(
-                        id="c-1",
-                        client_order_id="alpaca-1",
-                        side="sell",
-                        qty="1",
-                        type="market",
-                        status="filled",
-                    )
-                ]
-            return []
-        return []
-
-    def close_position(self, symbol):
-        self.calls.append(f"close {symbol}")
-        self.qty = 0
-        raise requests.ReadTimeout("read timed out")
-
-
-def _status(filter) -> str:
-    return str(getattr(filter.status, "value", filter.status))
-
-
-@pytest.mark.parametrize("found", [True, False], ids=["found-filled", "never-found"])
-def test_a_close_whose_answer_was_lost_keeps_the_account_unconfirmed(fake_time, found) -> None:
-    """A lost close was left out of the flat test: an empty listing and no position read as flat while
-    the close could still be taken."""
-    account = LostCloseThenFlat(found)
-    report = session_window.WindowReport("regular", "SPY", started="t")
-    left = session_window._flatten_after_stop(cast(TradingClient, account), WindowConfig(), report)
-    assert account.searches >= 1
-    if found:
-        assert left == []
-    else:
-        assert left == ["a close of 1 SPY sent with no answer, not found at Alpaca"]
-
-
-class LostCloseNodeSellFirst(Holding):
-    """One share held; the close's answer is lost; the node's in-doubt one-share market sell is listed
-    ahead of the check's own close, which fills a few polls later."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.orders = []
-        self.polls = 2
-        self.gone: list = []  # canceled, still held by Alpaca as such
-
-    def get_order_by_client_id(self, client_id):
-        node = [o for o in self.orders + self.gone if o.client_order_id == client_id]
-        if not node:
-            raise APIError(
-                '{"code": 40410000, "message": "order not found"}',
-                SimpleNamespace(response=SimpleNamespace(status_code=404)),
-            )
-        return node[0]
-
-    def get_orders(self, filter=None) -> list:
-        if any(o.id == "c-1" for o in self.orders):
-            if self.polls:
-                self.polls -= 1
-            elif all(o.id != "n-1" for o in self.orders):
-                self.orders, self.qty = [], 0  # the close fills once the node's sell is gone
-        return list(self.orders)
-
-    def cancel_order_by_id(self, order_id) -> None:
-        self.calls.append(f"cancel {order_id}")
-        for o in self.orders:
-            if o.id == order_id:
-                o.status = "canceled"
-                self.gone.append(o)
-        self.orders = [o for o in self.orders if o.id != order_id]
-
-    def close_position(self, symbol):
-        self.calls.append(f"close {symbol}")
-        common = {"side": "sell", "qty": "1", "type": "market", "status": "accepted"}
-        self.orders = [
-            SimpleNamespace(id="n-1", client_order_id="exit-late", **common),
-            SimpleNamespace(id="c-1", client_order_id="alpaca-1", **common),
-        ]
-        raise requests.ReadTimeout("read timed out")
-
-
-def test_a_node_order_in_doubt_is_never_taken_for_the_checks_close(fake_time) -> None:
-    """The side, size and type match could take the node's own one-share sell, listed first, for the
-    check's close and cancel the real close instead."""
-    account = LostCloseNodeSellFirst()
-    report = session_window.WindowReport("regular", "SPY", started="t")
-    left = session_window._flatten_after_stop(
-        cast(TradingClient, account), WindowConfig(), report, in_doubt=["exit-late"]
-    )
-    assert "cancel n-1" in account.calls and "cancel c-1" not in account.calls
-    assert left == []
-
-
-class LostThenAnswered(Holding):
-    """One share held; the first close's answer is lost with nothing placed, the second is answered and
-    fills; then the first is taken late, a one-share market sell that would open a short."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.orders = []
-        self.closes = 0
-
-    def get_orders(self, filter=None) -> list:
-        return list(self.orders)
-
-    def cancel_order_by_id(self, order_id) -> None:
-        self.calls.append(f"cancel {order_id}")
-        self.orders = [o for o in self.orders if o.id != order_id]
-
-    def close_position(self, symbol):
-        self.closes += 1
-        self.calls.append(f"close {symbol}")
-        if self.closes == 1:
-            raise requests.ReadTimeout("read timed out")
-        self.qty = 0
-        self.orders = [
-            SimpleNamespace(
-                id="late-1", client_order_id="alpaca-0", side="sell", qty="1", type="market"
-            )
-        ]
-        return SimpleNamespace(id="c-2")
-
-
-def test_an_answered_close_ends_the_wait_for_a_lost_one(fake_time) -> None:
-    """A close answered after a lost one left the lost one pending, so a one-share sell seen after it was
-    taken for the check's own and never canceled."""
-    account = LostThenAnswered()
-    report = session_window.WindowReport("regular", "SPY", started="t")
-    left = session_window._flatten_after_stop(cast(TradingClient, account), WindowConfig(), report)
-    assert "cancel late-1" in account.calls and left == []
-
-
-class LostCloseTakenLate(Holding):
-    """One share held; the close's answer is lost and Alpaca lists it only two polls later, then it
-    fills; a second close meanwhile would sell the share twice."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.orders = []
-        self.reads = 0
-        self.closes = 0
-
-    def get_orders(self, filter=None) -> list:
-        if _status(filter) == "all":
-            return list(self.orders)
-        self.reads += 1
-        if self.closes and self.reads == 3:
-            self.orders = [
-                SimpleNamespace(
-                    id="c-1", client_order_id="alpaca-1", side="sell", qty="1", type="market"
-                )
-            ]
-        elif self.reads > 4:
-            self.orders, self.qty = [], 0
-        return list(self.orders)
-
-    def close_position(self, symbol):
-        self.closes += 1
-        self.calls.append(f"close {symbol}")
-        raise requests.ReadTimeout("read timed out")
-
-
-def test_no_second_close_while_a_lost_one_may_still_be_taken(fake_time) -> None:
-    account = LostCloseTakenLate()
-    report = session_window.WindowReport("regular", "SPY", started="t")
-    left = session_window._flatten_after_stop(cast(TradingClient, account), WindowConfig(), report)
-    assert account.calls == ["close SPY"] and left == []
-
-
-class LostInTheLastPoll(Holding):
-    """One share held; the only close is sent in the last poll, its answer lost; it fills at once."""
-
-    def __init__(self, fake: FakeTime) -> None:
-        super().__init__()
-        self.orders = []
-        self.fake = fake
-
-    def get_orders(self, filter=None) -> list:
-        if _status(filter) == "all" and not self.qty:
-            return [
-                SimpleNamespace(
-                    id="c-1",
-                    client_order_id="a-1",
-                    side="sell",
-                    qty="1",
-                    type="market",
-                    status="filled",
-                )
-            ]
-        return []
-
-    def close_position(self, symbol):
-        if self.fake.now < session_window.AFTER_STOP_SECS - 2:
-            raise insufficient()
-        self.calls.append(f"close {symbol}")
-        self.qty = 0
-        self.fake.now += 2
-        raise requests.ReadTimeout("read timed out")
-
-
-def test_the_last_reading_looks_for_a_close_whose_answer_was_lost(fake_time) -> None:
-    account = LostInTheLastPoll(fake_time)
-    report = session_window.WindowReport("regular", "SPY", started="t")
-    left = session_window._flatten_after_stop(cast(TradingClient, account), WindowConfig(), report)
-    assert account.calls == ["close SPY"] and left == []
-
-
-class NodeSellFilledBefore(Holding):
-    """Two shares were held; the node's answered exit sold one just before the check, so one is held; the
-    check's close is lost; only the node's sell is among the orders since."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.orders = []
-
-    def get_orders(self, filter=None) -> list:
-        if _status(filter) == "all":
-            return [
-                SimpleNamespace(
-                    id="n-9",
-                    client_order_id="exit-9",
-                    side="sell",
-                    qty="1",
-                    type="market",
-                    status="filled",
-                )
-            ]
-        return []
-
-    def close_position(self, symbol):
-        self.calls.append(f"close {symbol}")
-        raise requests.ReadTimeout("read timed out")
-
-
-def test_an_answered_node_order_is_not_taken_for_the_lost_close(fake_time) -> None:
-    account = NodeSellFilledBefore()
-    report = session_window.WindowReport("regular", "SPY", started="t")
-    left = session_window._flatten_after_stop(
-        cast(TradingClient, account), WindowConfig(), report, node_ids=["exit-9"]
-    )
-    assert "a close of 1 SPY sent with no answer, not found at Alpaca" in left
-
-
-def test_an_order_the_node_did_not_find_at_alpaca_is_still_in_doubt() -> None:
-    class OrderSubmitted: ...
-
-    class OrderRejected:
-        reason = "NOT_FOUND_AT_VENUE"
-
-    cache = SimpleNamespace(
-        orders=lambda **kwargs: [
-            SimpleNamespace(
-                client_order_id=SimpleNamespace(value="unseen"),
-                events=lambda: [OrderSubmitted(), OrderRejected()],
-            )
-        ]
-    )
-    assert session_window.in_doubt(session_window._events(cache)) == ["unseen"]
-
-
-class LostCloseFilledThenNodeSell(Holding):
-    """One share held; the check's close is placed and fills but its answer is lost; then the node's late
-    one-share market sell appears, which would open a short."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.orders = []
-        self.filled = [
-            SimpleNamespace(
-                id="c-1",
-                client_order_id="alpaca-1",
-                side="sell",
-                qty="1",
-                type="market",
-                status="filled",
-            )
-        ]
-
-    def get_orders(self, filter=None) -> list:
-        if _status(filter) == "all":
-            return list(self.filled) if not self.qty else []
-        return list(self.orders)
-
-    def cancel_order_by_id(self, order_id) -> None:
-        self.calls.append(f"cancel {order_id}")
-        self.orders = [o for o in self.orders if o.id != order_id]
-
-    def close_position(self, symbol):
-        self.calls.append(f"close {symbol}")
-        self.qty = 0
-        self.orders = [
-            SimpleNamespace(
-                id="n-2", client_order_id="exit-late", side="sell", qty="1", type="market"
-            )
-        ]
-        raise requests.ReadTimeout("read timed out")
-
-
-def test_a_late_node_sell_after_a_filled_lost_close_is_canceled(fake_time) -> None:
-    account = LostCloseFilledThenNodeSell()
-    report = session_window.WindowReport("regular", "SPY", started="t")
-    left = session_window._flatten_after_stop(
-        cast(TradingClient, account), WindowConfig(), report, node_ids=["exit-late"]
-    )
-    assert "cancel n-2" in account.calls and left == []
+    assert handed == [{"entry-late": "buy"}]
 
 
 # Four further independent reviews of the check (2026-11-10): each shown here before its fix.
-
-
-class SlowRefusing(Slow):
-    """`Slow`, holding one share and no order: every close is refused, so the check closes again on each
-    poll until its deadline."""
-
-    def get_orders(self, filter=None) -> list:
-        self._took("orders")
-        return []
-
-
-def test_the_last_close_and_the_whole_check_are_inside_the_counted_bounds(fake_time) -> None:
-    """The end margin's and the lock's arithmetic were asserted from the constants' own definitions, which
-    cannot fail; here they are measured against a check whose every call takes a full request."""
-    w = session_window
-    account = SlowRefusing(fake_time, per_call=w.REQUEST_SECS)
-    report = w.WindowReport("regular", "SPY", started="t")
-    w._flatten_after_stop(cast(TradingClient, account), WindowConfig(), report)
-    after_calls = w.STOP_TIMEOUT_SECS + w.ADAPTER_CALL_SECS  # before the check starts
-    closes = [at for at, name in account.calls if name == "close"]
-    assert closes and after_calls + max(closes) <= w.LAST_CLOSE_SECS
-    assert w.END_MARGIN_SECS >= w.LAST_CLOSE_SECS + 60
-    assert after_calls + fake_time.now <= w.AFTER_END_SECS
-
-
-class SlowReads(Holding):
-    """One share held and no order; each read takes `per_read` seconds of `FakeTime`, the close answers at
-    once and fills."""
-
-    def __init__(self, fake: FakeTime, per_read: float) -> None:
-        super().__init__()
-        self.orders = []
-        self.fake = fake
-        self.per_read = per_read
-
-    def get_clock(self) -> Clock:
-        self.fake.now += self.per_read
-        return super().get_clock()
-
-    def get_orders(self, filter=None) -> list:
-        self.fake.now += self.per_read
-        return []
-
-    def close_position(self, symbol):
-        self.calls.append(f"close {symbol}")
-        self.qty = 0
-        return SimpleNamespace(id="c-1")
-
-
-def test_three_slow_reads_do_not_starve_the_close(monkeypatch, fake_time) -> None:
-    """Reads of orders, position and clock at 21 s each used the 60 s up before the first close."""
-    monkeypatch.setattr(
-        session_window,
-        "position_qty",
-        lambda t, s: setattr(fake_time, "now", fake_time.now + 21) or Decimal(t.qty),
-    )
-    account = SlowReads(fake_time, per_read=21)
-    report = session_window.WindowReport("regular", "SPY", started="t")
-    left = session_window._flatten_after_stop(cast(TradingClient, account), WindowConfig(), report)
-    assert account.calls == ["close SPY"] and report.closed_after_stop
-    assert left == []
-
-
-class QueuedLate(Holding):
-    """One share held, no order; the check's close is taken in its last poll just as the session closes,
-    and queues as a DAY order; nothing after that is read before the deadline but the final reading."""
-
-    def __init__(self, fake: FakeTime) -> None:
-        super().__init__()
-        self.orders = []
-        self.fake = fake
-
-    def get_orders(self, filter=None) -> list:
-        return list(self.orders)
-
-    def cancel_order_by_id(self, order_id) -> None:
-        self.calls.append(f"cancel {order_id}")
-        self.orders = [o for o in self.orders if o.id != order_id]
-
-    def close_position(self, symbol):
-        if self.fake.now < session_window.AFTER_STOP_SECS - 3:
-            self.calls.append("close refused")
-            raise APIError(
-                '{"code": 40310000, "message": "insufficient qty available"}',
-                SimpleNamespace(response=SimpleNamespace(status_code=403)),
-            )
-        self.calls.append(f"close {symbol}")
-        self.orders = [SimpleNamespace(id="c-1", client_order_id="close-1")]
-        self.is_open = False
-        self.fake.now += 2  # past the deadline
-        return SimpleNamespace(id="c-1")
-
-
-def test_an_order_first_seen_in_the_final_reading_is_canceled(fake_time) -> None:
-    """The reading after the deadline was never acted on: a close that queued as the session closed,
-    first seen there, was left working after the process exited."""
-    account = QueuedLate(fake_time)
-    report = session_window.WindowReport("regular", "SPY", started="t")
-    left = session_window._flatten_after_stop(cast(TradingClient, account), WindowConfig(), report)
-    assert account.calls[-1] == "cancel c-1" and account.orders == []
-    assert left == ["open order close-1", "position of 1 SPY"]
 
 
 def test_a_window_whose_start_up_reads_ran_into_its_end_is_skipped(
@@ -3149,66 +2133,6 @@ def test_a_blocked_worker_after_a_clean_stop_ends_the_process_recorded_failed(tm
     assert latest["result"].startswith("failed: StopTimedOut: a worker call of the node still ran")
 
 
-def test_an_order_in_doubt_done_for_the_day_is_canceled_as_working(fake_time) -> None:
-    """`done_for_day` can still be updated and canceled (orders-at-alpaca, "Order Lifecycle"): the check
-    cancels it, and it is terminal once canceled."""
-
-    class DoneForDay(Holding):
-        def __init__(self) -> None:
-            super().__init__()
-            self.orders, self.qty = [], 0
-            self.status = "done_for_day"
-
-        def get_order_by_client_id(self, client_id):
-            return SimpleNamespace(id="n-1", client_order_id=client_id, status=self.status)
-
-        def get_orders(self, filter=None) -> list:
-            return []
-
-        def cancel_order_by_id(self, order_id) -> None:
-            self.calls.append(f"cancel {order_id}")
-            self.status = "canceled"
-
-    account = DoneForDay()
-    report = session_window.WindowReport("regular", "SPY", started="t")
-    left = session_window._flatten_after_stop(
-        cast(TradingClient, account), WindowConfig(), report, in_doubt=["entry-1"]
-    )
-    assert account.calls == ["cancel n-1"] and left == []
-
-
-class CloseInTheLastPoll(Holding):
-    """One share held; the check's close is answered in its last poll and is still open (unfilled) in the
-    reading after the deadline, with the session open."""
-
-    def __init__(self, fake: FakeTime) -> None:
-        super().__init__()
-        self.orders = []
-        self.fake = fake
-
-    def get_orders(self, filter=None) -> list:
-        return list(self.orders)
-
-    def cancel_order_by_id(self, order_id) -> None:
-        self.calls.append(f"cancel {order_id}")
-        self.orders = [o for o in self.orders if o.id != order_id]
-
-    def close_position(self, symbol):
-        if self.fake.now < session_window.AFTER_STOP_SECS - 3:
-            raise insufficient()
-        self.calls.append(f"close {symbol}")
-        self.orders = [SimpleNamespace(id="c-1", client_order_id="alpaca-1")]
-        self.fake.now += 2
-        return SimpleNamespace(id="c-1")
-
-
-def test_the_checks_own_close_seen_last_is_left_to_fill_in_the_session(fake_time) -> None:
-    account = CloseInTheLastPoll(fake_time)
-    report = session_window.WindowReport("regular", "SPY", started="t")
-    session_window._flatten_after_stop(cast(TradingClient, account), WindowConfig(), report)
-    assert "close SPY" in account.calls and "cancel c-1" not in account.calls
-
-
 def test_the_auto_paths_clock_read_counts_in_the_time_left(
     monkeypatch, fake_time, tmp_path
 ) -> None:
@@ -3223,8 +2147,11 @@ def test_the_auto_paths_clock_read_counts_in_the_time_left(
     market = (clock(closes - timedelta(seconds=left), is_open=True), CALENDAR)
 
     def slow_session_now(trading):
-        fake_time.now += 150  # the calendar read with alpaca-py's retries
-        return market
+        read_at = (
+            fake_time.now
+        )  # the clock answers; then the calendar read with alpaca-py's retries
+        fake_time.now += 150
+        return (*market, read_at)
 
     monkeypatch.setattr(session_window, "paper_trading", lambda: FlatAccount())
     monkeypatch.setattr(session_window, "session_now", slow_session_now)
@@ -3254,3 +2181,1206 @@ def test_a_refusal_is_recorded_though_its_heartbeat_cannot_be_written(
     assert session_window.main(["--log-dir", str(tmp_path)]) == 1
     latest = json.loads((tmp_path / "latest.json").read_text())
     assert latest["result"].startswith("refused: the paper account is not flat")
+
+
+# The account check after the stop, against one stand-in for Alpaca's paper Trading API (ADR 0044).
+
+
+def api_error(status: int, code: int, message: str) -> APIError:
+    """An `APIError` as alpaca-py raises it: the body's text, and the status on the HTTP error's response."""
+    return APIError(
+        json.dumps({"code": code, "message": message}),
+        SimpleNamespace(response=SimpleNamespace(status_code=status)),
+    )
+
+
+def no_answer() -> requests.ReadTimeout:
+    """The adapter's read timeout: the request was sent and no answer came."""
+    return requests.ReadTimeout("read timed out")
+
+
+TERMINAL = {"filled", "canceled", "expired", "rejected"}
+SESSION_STARTS = datetime(2026, 11, 10, 15, 0, tzinfo=NEW_YORK)
+"""What Alpaca's clock says at `FakeTime` 0: an hour of the regular session left."""
+
+
+@dataclass
+class Held:
+    """One order as the stand-in holds it; the times are `FakeTime`'s."""
+
+    client_order_id: str
+    side: str
+    qty: Decimal
+    type: str
+    placed_at: float
+    seen_at: float
+    """From when a lookup by either ID and the all-orders listing show it."""
+    listed_at: float
+    """From when the open-orders listing shows it."""
+    fills_at: float | None
+    cancel_after: float
+    status: str = "accepted"
+    cancel_lands_at: float | None = None
+    id: UUID = field(default_factory=uuid4)
+    submitted: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+    @property
+    def working(self) -> bool:
+        return self.status not in TERMINAL
+
+
+@dataclass
+class Fault:
+    """What one kind of request gets in place of its answer, `times` times (None: every time) while
+    `when` holds: `error` raised, or, with None, an answer as if all were well. The request has done
+    nothing at Alpaca unless `placed`: a close `placed` reaches it all the same, `arrives_after` seconds
+    later, as an order with `order`'s settings."""
+
+    kind: str
+    error: Exception | None
+    times: int | None = 1
+    when: Any = None
+    placed: bool = False
+    arrives_after: float = 0.0
+    order: dict = field(default_factory=dict)
+
+
+class Venue:
+    """A stand-in for Alpaca's paper Trading API as alpaca-py 0.45.0's `TradingClient` gives it to the
+    account check: its `Order`, `Position` and `Clock` models, and `APIError` with the status Alpaca
+    answers. One account, one symbol. Every request is logged with the `FakeTime` it began at and takes
+    `latency` seconds of it (a number, or one per kind of request); what a request does happens as it
+    arrives, its answer comes after. As Alpaca documents or its own error guide describes: a market order
+    placed in the regular session fills, outside it queues; a sell for shares an open sell already holds
+    is refused (403, "insufficient qty available for order"); a market order against an open order of
+    the other side is refused (403, wash trade); closing a position that is not there is a 404; an
+    order that is `filled` or `canceled` cannot be canceled (422). What Alpaca does not document, a test
+    sets: how long after it is placed an order fills (`fill_after`), shows in a lookup (`seen_after`) or
+    in the open listing (`listed_after`), and how long a cancel takes to land (`cancel_after`)."""
+
+    def __init__(
+        self, fake: FakeTime, *, qty: int = 0, is_open: bool = True, latency: Any = 0.0
+    ) -> None:
+        self.fake = fake
+        self.qty = Decimal(qty)
+        self.is_open = is_open
+        self.closes_at: float | None = None
+        self.latency = latency
+        self.fill_after: float | None = 0.0
+        self.seen_after = 0.0
+        self.listed_after: float | None = None
+        self.cancel_after = 0.0
+        self.held: list[Held] = []
+        self.arriving: list[tuple[float, dict[str, Any]]] = []
+        self.calls: list[tuple[float, str]] = []
+        self.faults: list[Fault] = []
+        self.before: dict[str, Any] = {}
+        self._closes: set[str] = set()
+
+    # What a test sets up.
+
+    def order(
+        self,
+        client_order_id: str,
+        side: str,
+        *,
+        qty: int = 1,
+        type: str = "market",
+        at: float | None = None,
+        fills: float | None = None,
+        seen_after: float | None = None,
+        listed_after: float | None = None,
+        cancel_after: float | None = None,
+        status: str = "accepted",
+    ) -> None:
+        """An order reaching Alpaca now, or at `FakeTime` `at`: one of the node's, or another's. It fills
+        `fills` seconds after it arrives (None: it stays working)."""
+        entry: dict[str, Any] = {
+            "client_order_id": client_order_id,
+            "side": side,
+            "qty": qty,
+            "type": type,
+            "fills": fills,
+            "seen_after": seen_after,
+            "listed_after": listed_after,
+            "cancel_after": cancel_after,
+            "status": status,
+        }
+        if at is None:
+            self._place(self.fake.now, **entry)
+        else:
+            self.arriving.append((at, entry))
+
+    def fail(self, kind: str, error: Exception | None, **how: Any) -> None:
+        self.faults.append(Fault(kind, error, **how))
+
+    def did(self, *kinds: str) -> list[str]:
+        """The requests of those kinds, in the order they were sent."""
+        return [name for _, name in self.calls if name.split()[0] in kinds]
+
+    def working(self) -> list[Held]:
+        self.settle()
+        return [h for h in self.held if h.working]
+
+    def closes(self) -> list[Held]:
+        """The closing orders that reached Alpaca through the API, whatever became of them."""
+        return [h for h in self.held if h.client_order_id in self._closes]
+
+    def later(self, seconds: float) -> None:
+        self.fake.now += seconds
+        self.settle()
+
+    # How the stand-in keeps its account.
+
+    def _session_open(self, at: float) -> bool:
+        return self.is_open and (self.closes_at is None or at < self.closes_at)
+
+    def _place(
+        self,
+        at: float,
+        *,
+        client_order_id: str,
+        side: str,
+        qty: int | Decimal,
+        type: str = "market",
+        fills: float | None = None,
+        seen_after: float | None = None,
+        listed_after: float | None = None,
+        cancel_after: float | None = None,
+        status: str = "accepted",
+    ) -> Held:
+        seen = at + (self.seen_after if seen_after is None else seen_after)
+        if listed_after is None:
+            listed_after = self.listed_after
+        held = Held(
+            client_order_id=client_order_id,
+            side=side,
+            qty=Decimal(qty),
+            type=type,
+            placed_at=at,
+            seen_at=seen,
+            listed_at=seen if listed_after is None else at + listed_after,
+            fills_at=None if fills is None else at + fills,
+            cancel_after=self.cancel_after if cancel_after is None else cancel_after,
+            status=status,
+        )
+        self.held.append(held)
+        return held
+
+    def settle(self) -> None:
+        """Bring the account to `FakeTime` now: orders that arrive, fill, or whose cancel lands."""
+        now = self.fake.now
+        for at, entry in [a for a in self.arriving if a[0] <= now]:
+            self.arriving.remove((at, entry))
+            self._place(at, **entry)
+        for held in self.held:
+            if not held.working:
+                continue
+            fills = held.fills_at
+            if fills is not None and held.type == "market" and not self._session_open(fills):
+                fills = None  # it queues for the next session
+            lands = held.cancel_lands_at
+            if fills is not None and fills <= now and (lands is None or fills <= lands):
+                held.status = "filled"
+                self.qty += held.qty if held.side == "buy" else -held.qty
+            elif lands is not None and lands <= now:
+                held.status = "canceled"
+
+    def _latency(self, kind: str) -> float:
+        if isinstance(self.latency, dict):
+            return self.latency.get(kind, self.latency.get("", 0.0))
+        return self.latency(self) if callable(self.latency) else self.latency
+
+    def _request(self, name: str) -> Fault | None:
+        """Log a request as it arrives and take the fault set for its kind, if one applies."""
+        kind = name.split()[0]
+        self._arrive(kind)
+        self.calls.append((self.fake.now, name))
+        for fault in self.faults:
+            if fault.kind == kind and (fault.when is None or fault.when(self)):
+                if fault.times is not None:
+                    fault.times -= 1
+                    if not fault.times:
+                        self.faults.remove(fault)
+                return fault
+        return None
+
+    def _arrive(self, kind: str) -> None:
+        """What a test set to happen just before the next request of this kind arrives, then the account
+        as it stands."""
+        if hook := self.before.pop(kind, None):
+            hook()
+        self.settle()
+
+    def _answer(self, kind: str, fault: Fault | None = None) -> None:
+        self.fake.now += self._latency(kind)
+        if fault is not None and fault.error is not None:
+            raise fault.error
+
+    def _snapshot(self, held: Held) -> Order:
+        return Order(
+            id=held.id,
+            client_order_id=held.client_order_id,
+            created_at=held.submitted,
+            updated_at=held.submitted,
+            submitted_at=held.submitted,
+            symbol="SPY",
+            qty=str(held.qty),
+            filled_qty=str(held.qty) if held.status == "filled" else "0",
+            type=held.type,
+            side=held.side,
+            time_in_force="day",
+            status=held.status,
+            extended_hours=False,
+        )
+
+    def _take(self, side: str, qty: Decimal, client_order_id: str, fault: Fault | None) -> Held:
+        """A closing order as it arrives through the API: refused as Alpaca refuses, else placed."""
+        working = [h for h in self.held if h.working]
+        if side == "sell" and self.qty > 0:
+            reserved = sum(h.qty for h in working if h.side == "sell")
+            if qty > self.qty - reserved:
+                raise api_error(
+                    403,
+                    40310000,
+                    f"insufficient qty available for order (requested: {qty}, "
+                    f"available: {self.qty - reserved})",
+                )
+        if any(h.side != side for h in working):
+            raise api_error(403, 40310000, "potential wash trade detected")
+        entry: dict[str, Any] = {"fills": self.fill_after, **(fault.order if fault else {})}
+        self._closes.add(client_order_id)
+        return self._place(
+            self.fake.now, client_order_id=client_order_id, side=side, qty=qty, **entry
+        )
+
+    def _close(self, side: str, qty: Decimal, client_order_id: str) -> Order:
+        fault = self._request(f"close {side} {qty}")
+        if fault is not None and not fault.placed:
+            self._answer("close", fault)
+        if fault is not None and fault.arrives_after:
+            self._closes.add(client_order_id)
+            entry: dict[str, Any] = {
+                "client_order_id": client_order_id,
+                "side": side,
+                "qty": qty,
+                "fills": self.fill_after,
+                **fault.order,
+            }
+            self.arriving.append((self.fake.now + fault.arrives_after, entry))
+            self._answer("close", fault)
+        try:
+            held = self._take(side, qty, client_order_id, fault)
+        except APIError:
+            self.fake.now += self._latency("close")
+            raise
+        self._answer("close", fault)
+        return self._snapshot(held)
+
+    # alpaca-py's `TradingClient`, as far as the window uses it.
+
+    def get_clock(self) -> Clock:
+        fault = self._request("clock")
+        now = SESSION_STARTS + timedelta(seconds=self.fake.now)
+        is_open = self._session_open(self.fake.now)
+        closes = SESSION_STARTS + timedelta(
+            seconds=3600 if self.closes_at is None else self.closes_at
+        )
+        found = Clock(
+            timestamp=now,
+            is_open=is_open,
+            next_open=SESSION_STARTS + timedelta(days=1),
+            next_close=closes if is_open else closes + timedelta(days=1),
+        )
+        self._answer("clock", fault)
+        return found
+
+    def get_orders(self, filter=None) -> list:
+        status = getattr(getattr(filter, "status", None), "value", None) or "open"
+        fault = self._request("orders" if status == "open" else f"orders {status}")
+        now = self.fake.now
+        if status == "open":
+            found = [h for h in self.held if h.working and h.listed_at <= now]
+        else:
+            after = getattr(filter, "after", None)
+            found = [
+                h
+                for h in self.held
+                if h.seen_at <= now
+                and (after is None or h.submitted > after)
+                and (status == "all" or not h.working)
+            ]
+        answer = [self._snapshot(h) for h in found]
+        self._answer("orders", fault)
+        return answer
+
+    def get_open_position(self, symbol) -> Position:
+        fault = self._request("position")
+        qty = self.qty
+        self._answer("position", fault)
+        if not qty:
+            raise api_error(404, 40410000, "position does not exist")
+        return Position(
+            asset_id=uuid4(),
+            symbol=symbol,
+            exchange="ARCA",
+            asset_class="us_equity",
+            avg_entry_price="750",
+            qty=str(qty),
+            side="long" if qty > 0 else "short",
+            cost_basis=str(750 * qty),
+        )
+
+    def get_order_by_client_id(self, client_id: str) -> Order:
+        fault = self._request(f"lookup {client_id}")
+        found = [
+            h for h in self.held if h.client_order_id == client_id and h.seen_at <= self.fake.now
+        ]
+        answer = self._snapshot(found[0]) if found else None
+        self._answer("lookup", fault)
+        if answer is None:
+            raise api_error(404, 40410000, "order not found")
+        return answer
+
+    def cancel_order_by_id(self, order_id) -> None:
+        found = [h for h in self.held if str(h.id) == str(order_id)]
+        fault = self._request(f"cancel {found[0].client_order_id if found else order_id}")
+        if fault is not None and not fault.placed:
+            self._answer("cancel", fault)
+            return  # answered as taken, and it did not land
+        if not found:
+            self.fake.now += self._latency("cancel")
+            raise api_error(404, 40410000, "order not found")
+        held = found[0]
+        if not held.working:
+            self.fake.now += self._latency("cancel")
+            raise api_error(422, 42210000, f'order is already in "{held.status}" state')
+        if held.cancel_lands_at is None:  # a cancel sent again does not restart one on its way
+            held.cancel_lands_at = self.fake.now + held.cancel_after
+        self.settle()
+        self._answer("cancel", fault)
+
+    def close_position(self, symbol_or_asset_id, close_options=None) -> Order:
+        self._arrive("close")
+        if not self.qty:
+            self._request("close position")
+            self.fake.now += self._latency("close")
+            raise api_error(404, 40410000, "position does not exist")
+        side = "sell" if self.qty > 0 else "buy"
+        return self._close(side, abs(self.qty), f"alpaca-made-{uuid4()}")
+
+    def submit_order(self, order_data) -> Order:
+        side = getattr(order_data.side, "value", order_data.side)
+        qty = Decimal(str(order_data.qty))
+        return self._close(side, qty.normalize(), order_data.client_order_id)
+
+
+def check(
+    venue: Venue, unsettled: dict[str, str] | None = None, *, session: str = "regular"
+) -> tuple[list, session_window.WindowReport]:
+    """Run the account check after the stop against `venue`; `unsettled` is the node's orders it must
+    see ended, each with its side."""
+    report = session_window.WindowReport(session, "SPY", started="t")
+    left = session_window._flatten_after_stop(
+        cast(TradingClient, venue), WindowConfig(session=session), report, unsettled=unsettled or {}
+    )
+    return left, report
+
+
+def ends_flat(venue: Venue) -> bool:
+    """Whether the account is flat ten minutes on, with nothing working: what a record saying ok claims."""
+    venue.later(600)
+    return venue.qty == 0 and not venue.working()
+
+
+LAST_POLL = (
+    session_window.AFTER_STOP_SECS
+    - session_window.AFTER_STOP_SECS % session_window.POLL_SECS
+    - session_window.POLL_SECS
+)
+"""When the check's last poll before its deadline begins, if every request before it answered at once."""
+
+
+def refused_until_the_LAST_POLL(venue: Venue) -> None:
+    """Every close is refused (403, nothing placed) until the check's last poll."""
+    venue.fail("close", insufficient(), times=None, when=lambda v: v.fake.now < LAST_POLL)
+
+
+def test_after_the_stop_the_cancels_land_before_the_close(fake_time) -> None:
+    venue = Venue(fake_time, qty=1)
+    venue.order("exit-1", "sell", type="limit", cancel_after=1.0)  # a cancel takes a poll to land
+    left, report = check(venue)
+    assert venue.did("cancel", "close") == ["cancel exit-1", "close sell 1"]
+    assert left == [] and report.closed_after_stop and report.errors == []
+    (close,) = report.closes.values()
+    assert close == ["sent: sell 1 SPY at market", "accepted", "filled"]
+
+
+def test_the_close_is_a_market_day_order_under_an_id_of_the_checks_own(fake_time) -> None:
+    """What the check sends to close: alpaca-py's `MarketOrderRequest` for the held quantity, DAY, with a
+    client order ID that names the window and is new for each close."""
+    venue = Venue(fake_time, qty=1)
+    sent: list = []
+    submit = venue.submit_order
+    venue.submit_order = lambda order_data: sent.append(order_data) or submit(order_data)
+    venue.fail("close", insufficient())
+    left, report = check(venue)
+    assert left == [] and len(sent) == 2
+    for request in sent:
+        assert isinstance(request, MarketOrderRequest)
+        assert request.to_request_fields() == {
+            "symbol": "SPY",
+            "qty": 1.0,
+            "side": "sell",
+            "type": "market",
+            "time_in_force": "day",
+            "client_order_id": request.client_order_id,
+        }
+        assert request.client_order_id.startswith("canon-close-t-")
+    assert len({r.client_order_id for r in sent}) == 2
+    assert [log[-1] for log in report.closes.values()] == ["filled"]
+    assert report.closes_not_placed == 1
+
+
+def test_a_short_is_closed_by_a_buy(fake_time) -> None:
+    venue = Venue(fake_time, qty=-1)
+    left, _ = check(venue)
+    assert venue.did("close") == ["close buy 1"] and left == [] and venue.qty == 0
+
+
+def test_outside_the_session_the_orders_are_canceled_and_the_position_reported(
+    fake_time, extended
+) -> None:
+    venue = Venue(fake_time, qty=1, is_open=False)  # outside the regular session
+    venue.order("exit-1", "sell", type="limit")
+    left, _ = check(venue, session="extended")
+    assert venue.did("cancel", "close") == ["cancel exit-1"]
+    assert left == ["position of 1 SPY"]
+
+
+def test_a_close_waits_for_a_cancel_that_is_slow_to_land(fake_time) -> None:
+    """Finding 2: the market close was tried once; Alpaca's 403 while the cancel cleared ended it."""
+    venue = Venue(fake_time, qty=1)
+    venue.order("exit-1", "sell", type="limit", cancel_after=40.0)
+    left, report = check(venue)
+    assert left == [] and report.closed_after_stop
+    assert venue.did("close") == ["close sell 1"] and set(venue.did("cancel")) == {"cancel exit-1"}
+
+
+def test_no_market_close_is_sent_once_alpacas_clock_says_the_session_closed(fake_time) -> None:
+    """Finding 2: a regular window's close after 16:00 would only queue for the next session."""
+    venue = Venue(fake_time, qty=1, is_open=False)
+    left, report = check(venue)
+    assert venue.did("close") == [] and not report.closed_after_stop
+    assert left == ["position of 1 SPY"]
+    assert any("would only queue" in e for e in report.errors)
+
+
+def test_a_close_that_would_only_queue_is_canceled(fake_time) -> None:
+    """Finding 2: a close sent as the session closed queued, and nothing canceled it."""
+    venue = Venue(fake_time, qty=1)
+    venue.fill_after = 1.0
+    venue.closes_at = 0.5  # the session closes between the clock read and the fill
+    left, report = check(venue)
+    (close,) = venue.closes()
+    assert venue.did("cancel") == [f"cancel {close.client_order_id}"]
+    assert left == ["position of 1 SPY"] and close.status == "canceled"
+    assert report.closes[close.client_order_id][-1] == "canceled"
+
+
+def test_the_account_check_ends_within_its_bound_however_slow_alpaca_is(fake_time) -> None:
+    """Calls before the check's deadline was set, and after it passed, were not counted in it: with each
+    call near the request timeout the check ran far past `AFTER_STOP_SECS`."""
+    w = session_window
+    venue = Venue(fake_time, qty=1, latency=SLOW)
+    venue.order("entry-1", "buy", type="limit")
+    venue.fail("cancel", api_error(422, 42210000, "order is not cancelable"), times=None)
+    left, _ = check(venue)
+    assert fake_time.now <= w.AFTER_END_SECS - w.STOP_TIMEOUT_SECS - w.ADAPTER_CALL_SECS
+    assert venue.did("cancel") == ["cancel entry-1"] * 2 and venue.did("close") == []
+    assert left == ["open order entry-1", "position of 1 SPY"]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [api_error(422, 42210000, "order is not cancelable"), None],
+    ids=["refused", "taken-not-landed"],
+)
+def test_a_working_order_whose_cancel_did_not_land_is_canceled_again(fake_time, error) -> None:
+    """The open orders were canceled once; one whose cancel failed or did not land stayed working while
+    the session was open, could fill once the process had gone, and kept the position from its close."""
+    venue = Venue(fake_time, qty=1)
+    venue.order("exit-1", "sell", type="limit")
+    venue.fail("cancel", error, times=2)
+    left, report = check(venue)
+    assert venue.did("cancel", "close") == ["cancel exit-1"] * 3 + ["close sell 1"]
+    assert left == [] and report.closed_after_stop
+
+
+def test_a_timeout_on_one_cancel_does_not_skip_the_next_or_the_close(fake_time) -> None:
+    venue = Venue(fake_time, qty=1)
+    venue.order("exit-1", "sell", type="limit")
+    venue.order("exit-2", "sell", type="limit")
+    venue.fail("cancel", requests.ConnectTimeout("connect timed out"))
+    left, report = check(venue)
+    assert venue.did("cancel", "close") == [
+        "cancel exit-1",
+        "cancel exit-2",
+        "cancel exit-1",
+        "close sell 1",
+    ]
+    assert left == [] and len(report.errors) == 1
+
+
+def test_more_working_orders_than_one_step_cancels_are_canceled_over_the_polls(fake_time) -> None:
+    """A step sends `CANCELS` cancels, so the bound can count them; with more orders working, those not
+    yet tried come first in the next poll."""
+    venue = Venue(fake_time, qty=0)
+    for n in range(5):
+        venue.order(f"entry-{n}", "buy", type="limit")
+    left, _ = check(venue)
+    assert left == [] and not venue.working()
+    cancels = [(at, name) for at, name in venue.calls if name.startswith("cancel")]
+    assert [sum(at == poll for at, _ in cancels) for poll in (0.0, 2.5, 5.0)] == [2, 2, 1]
+    assert sorted(name for _, name in cancels) == [f"cancel entry-{n}" for n in range(5)]
+
+
+def test_a_close_taken_in_the_LAST_POLL_is_read_back_not_reported_held(fake_time) -> None:
+    """The result was the reading from before the last poll's close, so a window left flat was recorded
+    not flat."""
+    venue = Venue(fake_time, qty=1)
+    refused_until_the_LAST_POLL(venue)
+    left, _ = check(venue)
+    assert [at for at, name in venue.calls if name == "close sell 1"][-1] == LAST_POLL
+    assert left == []
+
+
+def test_the_checks_own_close_is_known_even_when_its_answer_was_lost(fake_time) -> None:
+    """A close whose call failed after reaching Alpaca was taken for another's order and canceled. It is
+    known by its client order ID, whatever became of the answer."""
+    venue = Venue(fake_time, qty=1)
+    venue.fill_after = 4.0  # working for a poll, then filled
+    venue.fail("close", no_answer(), placed=True)
+    left, report = check(venue)
+    assert venue.did("close", "cancel") == ["close sell 1"] and left == []
+    (close,) = report.closes.values()
+    assert close == ["sent: sell 1 SPY at market", "no answer: ReadTimeout", "accepted", "filled"]
+    assert report.closed_after_stop
+
+
+def test_the_checks_own_close_is_left_to_fill_while_the_session_is_open(fake_time) -> None:
+    """The documented exception: a close the check sent is not canceled while the session is open."""
+    venue = Venue(fake_time, qty=1)
+    venue.fill_after = 9.0
+    left, _ = check(venue)
+    assert venue.did("close", "cancel") == ["close sell 1"] and left == []
+
+
+@pytest.mark.parametrize(
+    ("which", "error"),
+    [
+        ("clock", api_error(500, 50000000, "internal server error")),
+        ("orders", requests.ReadTimeout("read timed out")),
+        ("position", requests.ConnectionError("connection reset")),
+    ],
+    ids=["clock-500", "orders-timeout", "position-reset"],
+)
+def test_one_transient_error_does_not_end_the_account_check(fake_time, which, error) -> None:
+    """Only the close's `APIError` was caught: an error from a read or the clock ended the check at
+    once, with its budget unused and a closable position left."""
+    venue = Venue(fake_time, qty=1)
+    venue.fail(which, error)
+    left, report = check(venue)
+    assert left == [] and venue.did("close") == ["close sell 1"]
+    assert len(report.errors) == 1
+
+
+def test_a_close_refused_with_no_order_open_is_tried_again(fake_time) -> None:
+    """The retry test waited for the cancel to clear before its only close, so a check that dropped the
+    retry after a real 403 passed it; here the 403 comes, twice, after the order has gone. Alpaca's
+    refusal says nothing was placed, so each next close is a new request under a new ID."""
+    venue = Venue(fake_time, qty=1)
+    venue.order("exit-1", "sell", type="limit")
+    venue.fail("close", insufficient(), times=2)
+    left, report = check(venue)
+    assert venue.did("cancel", "close") == ["cancel exit-1"] + ["close sell 1"] * 3
+    assert left == [] and report.closed_after_stop
+    assert [log[-1] for log in report.closes.values()] == ["filled"]
+    assert report.closes_not_placed == 2
+
+
+def test_a_close_alpaca_shows_ended_unfilled_is_followed_by_another(fake_time) -> None:
+    """A close Alpaca took and then shows `rejected` or `canceled` is settled on Alpaca's word: it sold
+    nothing and never will, so the position still held is closed by a new order."""
+    venue = Venue(fake_time, qty=1)
+    venue.fail("close", None, placed=True, order={"fills": None, "status": "rejected"})
+    left, report = check(venue)
+    assert left == [] and len(venue.closes()) == 2
+    assert [log[-1] for log in report.closes.values()] == ["rejected", "filled"]
+
+
+def test_a_flat_reading_with_a_node_order_in_doubt_is_not_flat(fake_time) -> None:
+    """The check read no open order and no position and recorded ok, while a submit whose answer was
+    lost could still be taken by Alpaca after it: a live buy outside the check."""
+    venue = Venue(fake_time, qty=0)
+    venue.order("entry-late", "buy", type="limit", at=4.0)  # it reaches Alpaca two polls on
+    left, report = check(venue, {"entry-late": "buy"})
+    assert venue.did("cancel") == ["cancel entry-late"] and left == []
+    assert report.unsettled == {"entry-late": ["buy", "accepted", "canceled"]}
+
+
+def test_a_node_order_never_found_is_left_named(fake_time) -> None:
+    venue = Venue(fake_time, qty=0)
+    left, _ = check(venue, {"entry-late": "buy"})
+    assert left == ["order entry-late: sent, not known to have ended, not found at Alpaca"]
+
+
+def test_a_node_order_alpaca_shows_filled_is_settled(fake_time) -> None:
+    """The node's exit was sent with no answer and filled: Alpaca shows it filled under its client order
+    ID, the account is flat, and nothing is left."""
+    venue = Venue(fake_time, qty=1)
+    venue.order("exit-1", "sell", fills=0.0)
+    left, report = check(venue, {"exit-1": "sell"})
+    assert left == [] and venue.did("close", "cancel") == []
+    assert report.unsettled == {"exit-1": ["sell", "filled"]}
+
+
+def test_no_close_is_sent_while_a_node_order_on_its_side_is_not_found(fake_time) -> None:
+    """The node's exit, sent with no answer, is not found at Alpaca, which may still place it: a close
+    beside it could sell the share twice. The position is left and both are named."""
+    venue = Venue(fake_time, qty=1)
+    left, report = check(venue, {"exit-9": "sell"})
+    assert venue.did("close") == []
+    assert left == [
+        "position of 1 SPY",
+        "order exit-9: sent, not known to have ended, not found at Alpaca",
+    ]
+    assert any("not closing the position while exit-9" in e for e in report.errors)
+
+
+def test_a_node_order_on_the_other_side_does_not_hold_the_close_back(fake_time) -> None:
+    """A buy sent with no answer cannot close a long position a second time: the close goes out, and the
+    buy, never found, is still named."""
+    venue = Venue(fake_time, qty=1)
+    left, _ = check(venue, {"entry-9": "buy"})
+    assert venue.did("close") == ["close sell 1"] and venue.qty == 0
+    assert left == ["order entry-9: sent, not known to have ended, not found at Alpaca"]
+
+
+def test_a_node_order_whose_side_is_not_known_holds_the_close_back(fake_time) -> None:
+    venue = Venue(fake_time, qty=1)
+    left, _ = check(venue, {"order-9": ""})
+    assert venue.did("close") == [] and left[0] == "position of 1 SPY"
+
+
+def test_a_node_order_found_working_is_canceled_before_the_close(fake_time) -> None:
+    """The node's own sell, in doubt, reaches Alpaca and works: it is canceled as any other's order, and
+    the close goes out only once Alpaca shows it ended. Which order is the check's own is its client
+    order ID, never an order's side, size and type."""
+    venue = Venue(fake_time, qty=1)
+    venue.order("exit-late", "sell", type="limit")
+    left, _ = check(venue, {"exit-late": "sell"})
+    assert venue.did("cancel", "close") == ["cancel exit-late", "close sell 1"]
+    assert left == []
+
+
+def test_more_orders_than_one_reading_looks_up_are_each_looked_up_in_turn(fake_time) -> None:
+    """A reading looks `LOOKUPS` orders up, so the bound can count them; with more unsettled, each has
+    its turn over the polls."""
+    venue = Venue(fake_time, qty=0)
+    doubtful = {f"entry-{n}": "buy" for n in range(5)}
+    for client_order_id in doubtful:
+        venue.order(client_order_id, "buy", fills=0.0)  # each was placed and filled
+    venue.settle()
+    venue.qty = Decimal(0)  # and the node's exits sold what they bought
+    left, report = check(venue, doubtful)
+    assert left == []
+    lookups = [at for at, name in venue.calls if name.startswith("lookup")]
+    assert [lookups.count(at) for at in (0.0, 2.5, 5.0)] == [2, 2, 1]
+    assert all(log == ["buy", "filled"] for log in report.unsettled.values())
+
+
+def test_a_late_order_seen_after_a_lost_close_is_canceled_and_the_close_left(fake_time) -> None:
+    """Every order first seen after a close attempt was taken for the check's own close, so a late buy
+    of the node's was left working."""
+    venue = Venue(fake_time, qty=1)
+    venue.fill_after = 9.0
+    venue.fail("close", no_answer(), placed=True)
+    venue.order("entry-late", "buy", type="limit", at=1.0)
+    left, _ = check(venue)
+    assert venue.did("close", "cancel") == ["close sell 1", "cancel entry-late"] and left == []
+
+
+def test_a_close_with_no_answer_that_was_never_placed_is_not_sent_again(fake_time) -> None:
+    """What following Alpaca costs: a close whose answer was lost and which Alpaca never placed cannot be
+    told from one it has not shown yet, so no other is sent; another's order seen after it is still
+    canceled, and the window is recorded not flat, naming the position and the close."""
+    venue = Venue(fake_time, qty=1)
+    venue.fail("close", no_answer())
+    venue.order("entry-late", "buy", type="limit", at=1.0)
+    left, report = check(venue)
+    assert venue.did("close", "cancel") == ["close sell 1", "cancel entry-late"]
+    (client_order_id,) = report.closes
+    assert left == [
+        "position of 1 SPY",
+        f"close {client_order_id}: sent with no answer, not found at Alpaca",
+    ]
+
+
+def test_an_order_found_by_its_lookup_but_not_listed_is_canceled_not_taken_as_flat(
+    fake_time,
+) -> None:
+    """Flat by the listing and the position, while the lookup of the node's order finds it accepted (the
+    two endpoints not yet agreeing); its lookup fails first with a 500."""
+    venue = Venue(fake_time, qty=0)
+    venue.order("entry-late", "buy", type="limit", listed_after=10_000.0)
+    venue.fail("lookup", api_error(500, 50000000, "internal server error"))
+    left, report = check(venue, {"entry-late": "buy"})
+    assert venue.did("cancel") == ["cancel entry-late"] and left == []
+    assert any("looking up entry-late" in e for e in report.errors)
+
+
+def test_a_refused_close_is_not_a_lost_one(fake_time) -> None:
+    """A close Alpaca refused placed nothing: it is settled, and does not hold the next close back."""
+    venue = Venue(fake_time, qty=1)
+    venue.fail("close", insufficient())
+    venue.order("exit-late", "sell", type="limit", at=1.0)  # another's sell, seen after the refusal
+    left, _ = check(venue)
+    assert venue.did("close", "cancel") == ["close sell 1", "cancel exit-late", "close sell 1"]
+    assert left == []
+
+
+@pytest.mark.parametrize("placed", [True, False], ids=["found-filled", "never-found"])
+def test_a_close_whose_answer_was_lost_keeps_the_account_unconfirmed(fake_time, placed) -> None:
+    """A lost close was left out of the flat test: an empty listing and no position read as flat while
+    the close could still be taken. Here another exit flattens the account; it is flat only once Alpaca
+    shows the close ended."""
+    venue = Venue(fake_time, qty=1)
+    venue.fail("close", no_answer(), placed=placed, order={"fills": None})
+    venue.order("exit-9", "sell", at=1.0, fills=0.0)  # the node's answered exit, arriving late
+    left, report = check(venue)
+    (client_order_id,) = report.closes
+    if placed:  # found working with nothing left to close: canceled, then flat
+        assert left == [] and venue.did("cancel") == [f"cancel {client_order_id}"]
+    else:
+        assert left == [f"close {client_order_id}: sent with no answer, not found at Alpaca"]
+
+
+def test_the_last_reading_looks_for_a_close_whose_answer_was_lost(fake_time) -> None:
+    venue = Venue(fake_time, qty=1)
+    refused_until_the_LAST_POLL(venue)
+    venue.fail("close", no_answer(), placed=True, when=lambda v: v.fake.now >= LAST_POLL)
+    left, _ = check(venue)
+    assert len(venue.closes()) == 1 and left == []
+
+
+def test_a_late_node_sell_after_a_filled_lost_close_is_canceled(fake_time) -> None:
+    venue = Venue(fake_time, qty=1)
+    venue.fail("close", no_answer(), placed=True)
+    venue.order("exit-late", "sell", type="limit", at=1.0)
+    left, _ = check(venue)
+    assert venue.did("cancel") == ["cancel exit-late"] and left == [] and venue.qty == 0
+
+
+def test_three_slow_reads_do_not_starve_the_close(fake_time) -> None:
+    """Reads of orders, position and clock at 21 s each used the 60 s up before the first close."""
+    venue = Venue(fake_time, qty=1, latency={"orders": 21.0, "position": 21.0, "clock": 21.0})
+    left, report = check(venue)
+    assert venue.did("close") == ["close sell 1"] and report.closed_after_stop
+    assert left == []
+
+
+def test_an_order_first_seen_in_the_final_reading_is_canceled(fake_time) -> None:
+    """The reading after the deadline was never acted on: a close that queued as the session closed,
+    first seen there, was left working after the process exited."""
+    venue = Venue(fake_time, qty=1)
+    venue.fill_after = 5.0
+    venue.closes_at = LAST_POLL + 1.0  # the session closes a second after the last poll's close
+    refused_until_the_LAST_POLL(venue)
+    left, _ = check(venue)
+    (close,) = venue.closes()
+    assert venue.did("cancel") == [f"cancel {close.client_order_id}"] and not venue.working()
+    assert left == [f"open order {close.client_order_id}", "position of 1 SPY"]
+
+
+def test_an_order_in_doubt_done_for_the_day_is_canceled_as_working(fake_time) -> None:
+    """`done_for_day` can still be updated and canceled (orders-at-alpaca, "Order Lifecycle"): the check
+    cancels it, and it is terminal once canceled."""
+    venue = Venue(fake_time, qty=0)
+    venue.order("entry-1", "buy", type="limit", status="done_for_day", listed_after=10_000.0)
+    left, _ = check(venue, {"entry-1": "buy"})
+    assert venue.did("cancel") == ["cancel entry-1"] and left == []
+
+
+def test_a_replaced_order_is_not_taken_as_ended(fake_time) -> None:
+    """Alpaca says of `filled`, `canceled`, `expired` and `rejected` that "no further updates will occur";
+    of `replaced` only that the order "was replaced by another order". A node order shown replaced goes on
+    as another the window does not know: it stays unsettled and is named."""
+    venue = Venue(fake_time, qty=0)
+    venue.order("entry-1", "buy", type="limit", status="replaced", listed_after=10_000.0)
+    venue.fail("cancel", api_error(422, 42210000, "order is not cancelable"), times=None)
+    left, report = check(venue, {"entry-1": "buy"})
+    assert left == ["open order entry-1"]
+    assert report.unsettled == {"entry-1": ["buy", "replaced"]}
+
+
+def test_the_checks_own_close_seen_last_is_left_to_fill_in_the_session(fake_time) -> None:
+    venue = Venue(fake_time, qty=1)
+    venue.fill_after = 30.0  # still working in the reading after the deadline
+    refused_until_the_LAST_POLL(venue)
+    left, _ = check(venue)
+    assert len(venue.closes()) == 1 and venue.did("cancel") == []
+    assert left and ends_flat(venue)
+
+
+def test_the_stand_in_refuses_as_alpaca_does(fake_time) -> None:
+    """The stand-in's own rules, from Alpaca's documentation and error guide: a sell for shares an open
+    sell holds and a market order against an open order of the other side are refused with a 403, a
+    close of no position and a lookup of no order with a 404, a cancel of an ended order with a 422."""
+    venue = Venue(fake_time, qty=1)
+    venue.order("exit-1", "sell", type="limit")
+    sell = MarketOrderRequest(symbol="SPY", qty=1, side="sell", time_in_force="day")
+    with pytest.raises(APIError) as refused:
+        venue.submit_order(sell)
+    assert refused.value.status_code == 403 and "insufficient qty" in str(refused.value)
+    (held,) = venue.working()
+    venue.cancel_order_by_id(held.id)
+    with pytest.raises(APIError) as ended:
+        venue.cancel_order_by_id(held.id)
+    assert ended.value.status_code == 422
+    venue.order("entry-1", "buy", type="limit")
+    with pytest.raises(APIError) as wash:
+        venue.submit_order(sell)
+    assert wash.value.status_code == 403 and "wash trade" in str(wash.value)
+    with pytest.raises(APIError) as unknown:
+        venue.get_order_by_client_id("no-such-order")
+    assert unknown.value.status_code == 404
+    flat = Venue(fake_time, qty=0)
+    with pytest.raises(APIError) as gone:
+        flat.close_position("SPY")
+    assert gone.value.status_code == 404
+    assert session_window.position_qty(cast(TradingClient, flat), "SPY") == 0
+    assert session_window.position_qty(cast(TradingClient, venue), "SPY") == 1
+
+
+# Three independent reviews of the check as landed (2026-11-10): each shown here before its fix.
+
+
+def test_a_close_with_no_answer_that_arrives_after_the_check_is_never_called_flat(
+    fake_time,
+) -> None:
+    """The first close's answer was lost; two searches did not find it, a second close was answered and
+    filled, the account read flat and the record said ok; the first, taken by Alpaca after the process
+    had gone, then sold a share the account no longer held."""
+    venue = Venue(fake_time, qty=1)
+    venue.fail("close", no_answer(), placed=True, arrives_after=200.0)
+    left, report = check(venue)
+    assert len(venue.did("close")) == 1  # Alpaca: "You should not attempt to resend the order"
+    assert len(left) == 2 and left[0] == "position of 1 SPY"
+    assert "sent with no answer, not found at Alpaca" in left[1]
+    assert not report.closed_after_stop
+
+
+def test_a_close_with_no_answer_is_not_sent_again_while_it_may_still_be_placed(fake_time) -> None:
+    """A second close went out after two searches had not found the first, which Alpaca had only not
+    shown yet: both sold, the account went short, the check bought the share back and the record said
+    ok with no trace of the extra sell and buy."""
+    venue = Venue(fake_time, qty=1)
+    venue.fail("close", no_answer(), placed=True, arrives_after=10.0)
+    left, report = check(venue)
+    assert len(venue.did("close")) == 1 and len(venue.closes()) == 1
+    assert left == [] and ends_flat(venue)
+    (close,) = report.closes.values()
+    assert close[0] == "sent: sell 1 SPY at market" and close[-1] == "filled"
+    assert report.closed_after_stop
+
+
+def test_a_close_with_no_answer_found_working_with_nothing_to_close_is_canceled(fake_time) -> None:
+    """The lost close was found working after another order had flattened the account; the search
+    cleared the doubt without tracking the order, the account read flat, and the sell filled later."""
+    venue = Venue(fake_time, qty=1)
+    venue.listed_after = 10_000.0  # Alpaca holds it; the open listing does not show it
+    venue.fail("close", no_answer(), placed=True, order={"fills": 100.0})
+    venue.order("exit-9", "sell", at=1.0, fills=0.0)  # the node's own exit, answered, arriving late
+    left, _ = check(venue)
+    (close,) = venue.closes()
+    assert venue.did("cancel") == [f"cancel {close.client_order_id}"]
+    assert left == [] and close.status == "canceled" and ends_flat(venue)
+
+
+def test_a_close_sent_in_the_LAST_POLL_is_canceled_though_the_reading_after_it_fails(
+    fake_time,
+) -> None:
+    """The last poll sent a close as the session closed; the reading after it failed, so the close was in
+    no reading and nothing canceled it: a DAY order left queued for the next session."""
+    venue = Venue(fake_time, qty=1)
+    venue.fill_after = 5.0
+    venue.closes_at = LAST_POLL + 1.0  # the session closes a second after the last poll's close
+    refused_until_the_LAST_POLL(venue)
+    venue.fail("orders", no_answer(), times=None, when=lambda v: bool(v.closes()))
+    left, _ = check(venue)
+    (close,) = venue.closes()
+    assert venue.did("cancel") == [f"cancel {close.client_order_id}"]
+    assert close.status == "canceled"
+    assert left == [f"open order {close.client_order_id}", "position of 1 SPY"]
+
+
+def test_the_checks_close_is_left_to_fill_when_the_clock_cannot_be_read_as_it_ends(
+    fake_time,
+) -> None:
+    """A clock read that failed as the check ended was taken for a closed session, and the check's own
+    working close was canceled with the session open: the position stayed. The clock's last answer says
+    when the session closes; a failed read is not that."""
+    venue = Venue(fake_time, qty=1)
+    venue.fill_after = session_window.AFTER_STOP_SECS + 30
+    venue.fail("clock", no_answer(), times=None, when=lambda v: bool(v.closes()))
+    left, _ = check(venue)
+    assert venue.did("cancel") == []
+    assert left and ends_flat(venue)  # recorded not flat; the close then fills
+
+
+def test_a_node_exit_that_fills_as_the_check_reads_does_not_fail_a_flat_account(fake_time) -> None:
+    """The position was read held, the node's own exit, sent with no answer, then filled, and the check's
+    close, a `close_position` then, was answered 404 and taken for a close whose answer was lost: a flat
+    account recorded failed. No close is sent while an order on its side may still be placed; the exit
+    is found filled and the account flat."""
+    venue = Venue(fake_time, qty=1, latency=0.1)
+    venue.order("exit-9", "sell", at=0.25, fills=0.0)  # just after the first position read
+    left, report = check(venue, {"exit-9": "sell"})
+    assert left == [] and venue.did("close") == [] and not report.closed_after_stop
+    assert ends_flat(venue)
+
+
+def test_an_order_from_outside_the_window_that_fills_before_the_close_is_bought_back(
+    fake_time,
+) -> None:
+    """What a market order does not have that `close_position` had: Alpaca does not refuse it for a
+    position that has gone. An order the window knows nothing of (it is no order of the node's) that
+    fills between the position read and the close leaves the close selling short; the next poll buys
+    the share back, and the record shows both orders."""
+    venue = Venue(fake_time, qty=1)
+    venue.before["close"] = lambda: venue.order("by-hand", "sell", fills=0.0)
+    left, report = check(venue)
+    assert left == [] and ends_flat(venue)
+    assert [c[0] for c in report.closes.values()] == [
+        "sent: sell 1 SPY at market",
+        "sent: buy 1 SPY at market",
+    ]
+
+
+SLOW = session_window.REQUEST_SECS
+"""Every request answered just inside the adapter's timeouts."""
+
+
+def test_orders_in_doubt_do_not_carry_the_check_past_its_bounds(fake_time) -> None:
+    """Each poll looked every order in doubt up, uncounted: three put the last close past
+    `LAST_CLOSE_SECS`, six past the session's close, twelve made the check 420 s and the lock's
+    arithmetic wrong. A reading now looks at most `LOOKUPS` up, in turn, and the bounds count them."""
+    w = session_window
+    venue = Venue(fake_time, qty=1, latency=SLOW)
+    venue.fail("close", insufficient(), times=None)
+    doubtful = {f"entry-{n}": "buy" for n in range(12)}  # none ever found; none on the close's side
+    left, _ = check(venue, doubtful)
+    before = w.STOP_TIMEOUT_SECS + w.ADAPTER_CALL_SECS  # the stop and the node's last calls
+    closes = [at for at, name in venue.calls if name.startswith("close")]
+    assert closes and before + max(closes) <= w.LAST_CLOSE_SECS
+    assert before + fake_time.now <= w.AFTER_END_SECS
+    assert left[0] == "position of 1 SPY" and len(left) == 13
+    # two readings, two lookups each: four were asked for, the rest never reached
+    assert sum("not found at Alpaca" in what for what in left) == 4
+    assert sum("not looked up in the check's time" in what for what in left) == 8
+
+
+def test_the_last_close_goes_out_at_the_bound_counted_for_it(fake_time) -> None:
+    """The bound's tests stubbed the position read at no time and held no order in doubt, so they could
+    not see a request more. Here every request of the last poll takes its full timeout: the close is
+    sent exactly where `LAST_CLOSE_SECS` puts it, less the time the poll started before the deadline."""
+    w = session_window
+    venue = Venue(fake_time, qty=1, latency=lambda v: SLOW if v.fake.now >= LAST_POLL else 0.0)
+    venue.fail("close", insufficient(), times=None, when=lambda v: v.fake.now < LAST_POLL)
+    left, _ = check(venue, {"entry-1": "buy", "entry-2": "buy"})
+    (sent,) = [at for at, name in venue.calls if name.startswith("close sell") and at >= LAST_POLL]
+    before = w.STOP_TIMEOUT_SECS + w.ADAPTER_CALL_SECS
+    slack = w.AFTER_STOP_SECS - LAST_POLL
+    assert before + sent + slack == pytest.approx(w.LAST_CLOSE_SECS)
+    assert "position of 1 SPY" not in left
+
+
+def test_the_whole_check_ends_at_the_bound_counted_for_it(fake_time) -> None:
+    """The longest check: its last poll, begun just inside the deadline, and its last reading each look
+    two orders up, read the orders, the position and the clock, and send two cancels, every request at
+    its full timeout. It ends exactly where `AFTER_END_SECS` puts it, less the time the last poll started
+    before the deadline; a request more in either would pass it."""
+    w = session_window
+    venue = Venue(fake_time, qty=1, latency=lambda v: SLOW if v.fake.now >= LAST_POLL else 0.0)
+    venue.fill_after = None  # the check's close, sent in the first poll, works on
+    # the node's two buys, sent with no answer, reach Alpaca as the last poll begins
+    for late in ("entry-1", "entry-2"):
+        venue.order(late, "buy", type="limit", at=LAST_POLL - 1, cancel_after=10_000.0)
+    left, _ = check(venue, {"entry-1": "buy", "entry-2": "buy"})
+    assert len(left) == 4  # three orders working and the position
+    slack = w.AFTER_STOP_SECS - LAST_POLL
+    before = w.STOP_TIMEOUT_SECS + w.ADAPTER_CALL_SECS
+    assert before + fake_time.now + slack == pytest.approx(w.AFTER_END_SECS)
+
+
+def test_a_skip_whose_heartbeat_cannot_be_written_still_exits_0_and_says_why(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """A skip wrote its heartbeat before it printed, unguarded: an unwritable log folder turned a skip,
+    which exits 0, into a traceback and exit 1."""
+    heartbeat = session_window.write_heartbeat
+
+    def unwritable(log_dir, outcome):
+        if outcome.startswith(("skipped", "nothing to run")):
+            raise PermissionError("read-only file")
+        heartbeat(log_dir, outcome)
+
+    def skipped(config, **kwargs):
+        raise session_window.WindowSkipped("the last window ended under 300 s ago")
+
+    monkeypatch.setattr(session_window, "write_heartbeat", unwritable)
+    monkeypatch.setattr(session_window, "run_window", skipped)
+    assert session_window.main(["--log-dir", str(tmp_path)]) == 0
+    said = capsys.readouterr()
+    assert "skipped: the last window ended under 300 s ago" in said.out
+    assert "the heartbeat could not be written" in said.err
+
+
+# A fourth independent review of the check as landed (2026-11-10): each shown here before its fix.
+
+
+def test_an_order_canceled_in_the_last_poll_is_not_called_working_after_it(fake_time) -> None:
+    """An order in doubt, found and canceled in the last poll, was added again after the deadline from the
+    list the poll had kept, canceled a second time (a 422) and named as left: a flat window failed."""
+    venue = Venue(fake_time, qty=0)
+    venue.order("entry-1", "buy", type="limit", at=LAST_POLL - 0.5)
+    left, report = check(venue, {"entry-1": "buy"})
+    assert venue.did("cancel") == ["cancel entry-1"] and left == [] and report.errors == []
+
+
+def test_an_order_found_in_the_last_poll_is_canceled_though_the_listing_then_fails(
+    fake_time,
+) -> None:
+    """A lookup found the order in doubt working in the last poll, the open-orders read after it timed
+    out, and the last cancels went to the last listing that had been read, which did not hold it: it was
+    left working and the record said it was not found."""
+    venue = Venue(fake_time, qty=0)
+    venue.order("entry-1", "buy", type="limit", at=LAST_POLL - 0.5)
+    venue.fail("orders", no_answer(), times=None, when=lambda v: v.fake.now >= LAST_POLL)
+    left, _ = check(venue, {"entry-1": "buy"})
+    assert venue.did("cancel") == ["cancel entry-1"] and not venue.working()
+    assert left == ["open order entry-1"]
+
+
+def test_an_interrupt_while_a_worker_call_is_waited_for_leaves_the_runner_abandoned(
+    monkeypatch,
+) -> None:
+    """After a clean stop the runner was put with the abandoned only once the wait for its worker calls
+    had returned, so a Ctrl-C during that wait let the window dispose the node under a running worker
+    thread and `main` return without ending the process, which then hung at the interpreter's exit."""
+
+    def interrupted():
+        raise KeyboardInterrupt
+
+    calls = SimpleNamespace(settle=interrupted)
+    runner = SimpleNamespace(close=lambda: pytest.fail("the runner was closed"))
+    monkeypatch.setattr(session_window, "_ABANDONED", [])
+    with pytest.raises(KeyboardInterrupt):
+        session_window._close_runner(cast(Any, runner), None, cast(Any, calls))
+    assert session_window._ABANDONED == [(runner, None, calls)]
+
+
+def test_the_clock_reads_own_retries_are_not_taken_from_the_window(
+    monkeypatch, fake_time, tmp_path
+) -> None:
+    """The time left was measured from before the clock read, though the window's end is the timestamp
+    that read returns: a clock answered after 95 s of retries had 95 s taken from a window that had not
+    lost them, and a window with time enough was skipped."""
+
+    class NodeBuilt(Exception): ...
+
+    def built(*args, **kwargs):
+        raise NodeBuilt
+
+    closes = datetime(2026, 11, 10, 16, 0, tzinfo=NEW_YORK)
+    left = session_window.END_MARGIN_SECS + session_window.FLATTEN_SECS + 85  # 205 s of window
+
+    class SlowClock(Account):
+        def get_clock(self) -> Clock:
+            fake_time.now += 95  # alpaca-py's retries of a 504
+            return clock(closes - timedelta(seconds=left), is_open=True)
+
+    monkeypatch.setattr(session_window, "window_node", built)
+    with pytest.raises(NodeBuilt):
+        session_window.run_window(
+            WindowConfig(log_dir=tmp_path), trading=cast(TradingClient, SlowClock())
+        )
+
+
+# Code review of the account check as one set of unsettled requests (2026-11-10): each shown before its fix.
+
+
+def test_a_close_that_was_never_sent_is_followed_by_another(fake_time) -> None:
+    """A connect timeout on the close's only attempt proves nothing reached Alpaca (the adapter's
+    `not_sent`); taken for a lost answer, it held every later close back and left the position."""
+    venue = Venue(fake_time, qty=1)
+    never_sent = requests.ConnectTimeout("connect timed out")
+    never_sent.alpaca_sends = 1  # ty: ignore[missing-attribute] - as the adapter's `counted` leaves it
+    venue.fail("close", never_sent)
+    left, report = check(venue)
+    assert venue.did("close") == ["close sell 1"] * 2 and left == []
+    assert report.closes_not_placed == 1 and len(report.closes) == 1
+
+
+def test_every_working_order_is_canceled_as_the_check_ends(fake_time) -> None:
+    """The cancels as the check ends were cut to `CANCELS` like a poll's, so a third order working in the
+    last reading was left working when the process exited. They go on while the step has time."""
+    venue = Venue(fake_time, qty=0)
+    for n in range(5):
+        venue.order(f"late-{n}", "buy", type="limit", at=session_window.AFTER_STOP_SECS - 0.1)
+    left, _ = check(venue, {"entry-9": "buy"})  # never found, so the check polls to its deadline
+    assert len(left) == 6 and not venue.working()
+
+
+def test_the_cancels_as_the_check_ends_stay_inside_their_counted_time(fake_time) -> None:
+    w = session_window
+    venue = Venue(
+        fake_time, qty=0, latency=lambda v: SLOW if v.fake.now >= w.AFTER_STOP_SECS else 0.0
+    )
+    for n in range(5):
+        venue.order(f"late-{n}", "buy", type="limit", at=w.AFTER_STOP_SECS - 0.1)
+    check(venue, {"entry-9": "buy"})
+    assert len(venue.did("cancel")) == w.CANCELS
+    assert fake_time.now <= w.AFTER_STOP_SECS + w.POLL_AT_LONGEST_SECS
+
+
+def test_an_answer_alpaca_py_cannot_read_does_not_end_the_check(fake_time) -> None:
+    """Only `APIError` and `OSError` were caught: a response alpaca-py could not parse (a `ValueError`
+    from its model) left the check at once, its remaining polls and last cancels unrun."""
+    venue = Venue(fake_time, qty=0)
+    venue.order("exit-1", "sell", type="limit")
+    venue.fail("lookup", ValueError("1 validation error for Order"))
+    left, report = check(venue, {"exit-1": "sell"})
+    assert venue.did("cancel") == ["cancel exit-1"] and left == []
+    assert any("looking up exit-1: ValueError" in e for e in report.errors)
+
+
+def test_an_order_the_listing_shows_is_not_also_called_not_found(fake_time) -> None:
+    """An unsettled order was shown only by its lookup: listed open while its lookup still answered 404,
+    it was named both open and not found, and went on holding a close back after it was canceled."""
+    venue = Venue(fake_time, qty=1)
+    venue.order("exit-1", "sell", type="limit", seen_after=6.0, listed_after=0.0)
+    left, report = check(venue, {"exit-1": "sell"})
+    assert report.unsettled["exit-1"] == ["sell", "accepted", "canceled"]
+    assert not any("not found at Alpaca" in e for e in report.errors)
+    assert left == [] and venue.did("close") == ["close sell 1"]
+
+
+def test_a_position_that_can_only_be_reported_is_read_once(fake_time) -> None:
+    """With the session closed and nothing to look for, the check read the account a second time with
+    nothing sent in between, each read up to a full timeout under the paper lock."""
+    venue = Venue(fake_time, qty=1, is_open=False)
+    left, _ = check(venue)
+    assert [name for _, name in venue.calls] == ["orders", "position", "clock"]
+    assert left == ["position of 1 SPY"]
