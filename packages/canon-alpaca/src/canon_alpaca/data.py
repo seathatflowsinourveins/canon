@@ -19,9 +19,10 @@ Venue side, alpaca-py 0.45.0:
   any thread) and joined in `_disconnect`. The stream's handlers pass each message to the node's loop with
   `loop.call_soon_threadsafe`; conversion and output happen on the node's loop only, as the guide requires
   for cache and output access. Each handler is a coroutine function, which alpaca-py's `_subscribe`
-  requires, and holds the client only weakly (`weak_coroutine`), as does the thread itself. Alpaca sends trade cancels and corrections with the trades channel; alpaca-py passes them to
-  the handlers set with `register_trade_cancels` and `register_trade_corrections`, and this client logs
-  them as warnings.
+  requires (`relay`). Neither a handler nor the thread holds the client, even during a call, and a
+  handler names its stream, so what a stream the client no longer runs delivers is dropped. Alpaca sends
+  trade cancels and corrections with the trades channel; alpaca-py passes them to the handlers set with
+  `register_trade_cancels` and `register_trade_corrections`, and this client logs them as warnings.
 * alpaca-py's REST client is synchronous, so each call runs in a worker thread (`asyncio.to_thread`).
 
 Timestamps: Alpaca stamps a bar at its open (alpaca-py `Bar.timestamp`, "The opening timestamp of the
@@ -41,7 +42,8 @@ and NautilusTrader keeps the bars of a response whose `ts_init` lies in the requ
 applies no `limit` of its own. `alpaca_bars_window` sends both bounds one interval earlier, so a request
 returns exactly the bars whose `ts_init` lies in its window. It ends the window at the earlier of the
 requested end and the node clock's now, so a bar still forming, whose `ts_init` is in the future, is never
-returned; and with no `start` it starts the window at midnight New York of the current day. To get the
+returned; and with no `start` it starts the window at midnight New York of the day the window ends in.
+Both bounds move back in elapsed time (UTC), not on New York's wall clock. To get the
 bar for day or week D, ask for a window holding its open plus its length with hours to spare, for example
 from noon New York on the bar's last day to noon the next day; a window ending exactly at midnight misses
 a weekly bar that spans the spring change, and a window inside D's trading hours returns no daily bar. The
@@ -78,9 +80,12 @@ Known limits:
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import functools
 import math
 import threading
 import weakref
+from datetime import UTC
 from datetime import datetime
 from datetime import time
 from datetime import timedelta
@@ -197,11 +202,12 @@ class QuoteTradeStream(Protocol):
 
 
 def weak_coroutine[T](method: Callable[[T], Awaitable[None]]) -> Callable[[T], Awaitable[None]]:
-    """Return a coroutine function that calls `method` while its object is alive, holding it weakly.
+    """Return a coroutine function that calls `method` while its object is alive, holding it weakly
+    between calls.
 
-    The stream and its thread can outlive the client when `_disconnect` times out. NautilusTrader's
-    `Logger` and `Clock` are native objects that must not be dropped on another thread, so nothing the
-    stream thread holds may keep the client alive.
+    During a call the stream's thread holds the object, so if every other reference goes meanwhile, it
+    is freed on that thread when the call ends; `relay` does not have that window, and the data client
+    uses it. The execution client's trade update handler still uses this one.
     """
     ref = weakref.WeakMethod(method)
 
@@ -211,6 +217,36 @@ def weak_coroutine[T](method: Callable[[T], Awaitable[None]]) -> Callable[[T], A
             await bound(item)
 
     return call
+
+
+def relay[S, T](
+    loop: asyncio.AbstractEventLoop,
+    source: S,
+    kind: type[T],
+    method: Callable[[S, T], None],
+) -> Callable[[object], Awaitable[None]]:
+    """Return a coroutine handler for alpaca-py's stream that hands each message of type `kind` to
+    `method` on the node's loop, with the stream it came from.
+
+    The stream and its thread can outlive the client when `_disconnect` times out. NautilusTrader's
+    `Logger` and `Clock` are native objects that must not be dropped on another thread, so the stream's
+    thread never holds the client, not even for the length of a call: the handler holds the loop and weak
+    references to `method` and `source`, read only on the node's loop. `source` lets the client drop what
+    a stream it no longer runs still delivers; it is held weakly because the stream holds the handler.
+    """
+    ref = weakref.WeakMethod(method)
+    source_ref = weakref.ref(source)
+
+    def deliver(item: T) -> None:  # on the node's loop
+        bound, stream = ref(), source_ref()
+        if bound is not None and stream is not None:
+            bound(stream, item)
+
+    async def handle(item: object) -> None:  # on the stream's thread
+        if isinstance(item, kind):
+            post(loop, deliver, item)
+
+    return handle
 
 
 def weak_callback[T](method: Callable[[T], None]) -> Callable[[T], None]:
@@ -332,9 +368,9 @@ def is_power_of_ten(n: int) -> bool:
     return n == 1
 
 
-def start_of_day(now: datetime) -> datetime:
-    """Midnight New York time on the day `now` falls in, New York time."""
-    return datetime.combine(now.astimezone(NEW_YORK).date(), time(0), NEW_YORK)
+def start_of_day(moment: datetime) -> datetime:
+    """Midnight New York time on the day `moment` falls in, in UTC."""
+    return datetime.combine(moment.astimezone(NEW_YORK).date(), time(0), NEW_YORK).astimezone(UTC)
 
 
 def alpaca_bars_window(
@@ -345,13 +381,16 @@ def alpaca_bars_window(
     Alpaca filters on the open, inclusive at both ends, and `ts_init` is the open plus `interval`, so both
     bounds move back one interval. The end is the earlier of the requested end and `now`, so no bar whose
     `ts_init` is in the future (one still forming) is returned. With no start, the start is the beginning
-    of the current day, Alpaca's own documented default ("Default: the beginning of the current day",
-    https://docs.alpaca.markets/us/reference/stockbars.md), taken as midnight New York because the
-    reference names no time zone; supplying it here keeps the window sent from ending before it starts.
+    of the day the window ends in: today with no end or a later one, Alpaca's own documented default
+    ("Default: the beginning of the current day", https://docs.alpaca.markets/us/reference/stockbars.md),
+    taken as midnight New York because the reference names no time zone; with an end before today, that
+    end's day, so the window sent never ends before it starts. The bounds move back in elapsed time, in
+    UTC: on a New York time a `timedelta` moves the wall clock, which across a clock change is an hour
+    off the bar's fixed length.
     """
     end = now if end is None else min(end, now)
-    start = start_of_day(now) if start is None else start
-    return start - interval, end - interval
+    start = start_of_day(end) if start is None else start
+    return start.astimezone(UTC) - interval, end.astimezone(UTC) - interval
 
 
 def exact_price(instrument: Equity, value: float, field: str) -> Price:
@@ -400,11 +439,16 @@ class OneSidedQuoteError(ValueError):
 def parse_quote(quote: Quote, instrument: Equity, ts_init: int) -> QuoteTick:
     """Convert one alpaca-py quote into a NautilusTrader quote. Sizes stay in round lots.
 
-    A side priced at zero or less is refused: a `QuoteTick` holds both sides, and a one-sided quote would
-    otherwise carry a 0.0000 price for the missing side.
+    A side priced at zero or less is refused as one-sided: a `QuoteTick` holds both sides, and a one-sided
+    quote would otherwise carry a 0.0000 price for the missing side. A price that is not a finite number
+    is refused as malformed, not as one-sided.
     """
-    for side, price in (("bid", quote.bid_price), ("ask", quote.ask_price)):
-        if not price > 0:
+    sides = (("bid", quote.bid_price), ("ask", quote.ask_price))
+    for side, price in sides:  # both sides first: a malformed quote is not counted as one-sided
+        if not math.isfinite(price):
+            raise ValueError(f"{instrument.id} {side} price {price} is not a finite number")
+    for side, price in sides:
+        if price <= 0:
             raise OneSidedQuoteError(
                 f"{instrument.id} quote at {quote.timestamp} has {side} price {price}"
             )
@@ -490,7 +534,10 @@ class AlpacaDataClient(MarketDataClient):
         await logged_failure(self._log, "data client failed to connect", self._connect_venue())
 
     async def _connect_venue(self) -> None:
-        self._owner_loop = self.loop
+        loop = self.loop
+        if loop is None:
+            raise RuntimeError("Alpaca data client has no event loop to connect on")
+        self._owner_loop = loop
         self._stopping = False
         self._historical_lock = asyncio.Lock()
         if self._given_stream is not None and self._given_stream_used:
@@ -509,8 +556,11 @@ class AlpacaDataClient(MarketDataClient):
         with_http_timeout(
             self._historical
         )  # a client passed in too; refused without a session (ADR 0039)
-        self._stream.register_trade_cancels(weak_coroutine(self._on_trade_cancel))
-        self._stream.register_trade_corrections(weak_coroutine(self._on_trade_correction))
+        stream = self._stream
+        stream.register_trade_cancels(relay(loop, stream, TradeCancel, self._warn_trade_cancel))
+        stream.register_trade_corrections(
+            relay(loop, stream, TradeCorrection, self._warn_trade_correction)
+        )
         await self._provider.initialize()
         for instrument in self._provider.list_all():
             self._handle_instrument(instrument)
@@ -524,11 +574,21 @@ class AlpacaDataClient(MarketDataClient):
     async def _disconnect_stream(self) -> None:
         self._stopping = True
         thread = self._stream_thread
-        if thread is not None and self._stream is not None:
-            self._stream.stop()
-            await join_within(thread, STREAM_JOIN_TIMEOUT_SECS)
-        # Cleared whether or not the thread stopped, so a later connect builds a fresh stream (a given
-        # one serves one connect).
+        try:
+            if thread is not None and self._stream is not None:
+                self._stream.stop()
+                await join_within(thread, STREAM_JOIN_TIMEOUT_SECS)
+        finally:
+            # Cleared whether or not the thread stopped, and also when the wait is cancelled (a node
+            # whose disconnection timeout is shorter than STREAM_JOIN_TIMEOUT_SECS), so a later connect
+            # builds a fresh stream (a given one serves one connect).
+            self._clear_stream_state()
+        if thread is not None and thread.is_alive():
+            raise RuntimeError(
+                f"Alpaca stream thread did not stop within {STREAM_JOIN_TIMEOUT_SECS} s",
+            )
+
+    def _clear_stream_state(self) -> None:
         self._stream_thread = None
         self._stream = None
         self._historical = None
@@ -539,10 +599,6 @@ class AlpacaDataClient(MarketDataClient):
                 f"Dropped {count} one-sided Alpaca quotes for {symbol} since subscribing"
             )
         self._one_sided_quotes.clear()
-        if thread is not None and thread.is_alive():
-            raise RuntimeError(
-                f"Alpaca stream thread did not stop within {STREAM_JOIN_TIMEOUT_SECS} s",
-            )
 
     # -- subscriptions -----------------------------------------------------------------------------
 
@@ -551,11 +607,12 @@ class AlpacaDataClient(MarketDataClient):
         new = [s for s in self._serveable(command.instrument_ids) if s not in self._quote_symbols]
         if not new:
             return
-        stream = self._started_stream()
+        stream, loop = self._started_stream()
         # Tracked before the call and kept if it fails: alpaca-py records the handler before it sends,
         # so it re-sends the subscription on reconnect, and unsubscribe must still be able to remove it.
         self._quote_symbols.update(new)
-        await asyncio.to_thread(stream.subscribe_quotes, weak_coroutine(self._on_quote), *new)
+        handler = relay(loop, stream, Quote, self._emit_quote)
+        await asyncio.to_thread(stream.subscribe_quotes, handler, *new)
 
     @override
     async def _unsubscribe_quotes(self, command: live.UnsubscribeQuotes) -> None:
@@ -573,9 +630,10 @@ class AlpacaDataClient(MarketDataClient):
         new = [s for s in self._serveable(command.instrument_ids) if s not in self._trade_symbols]
         if not new:
             return
-        stream = self._started_stream()
+        stream, loop = self._started_stream()
         self._trade_symbols.update(new)  # kept if the call fails; see _subscribe_quotes
-        await asyncio.to_thread(stream.subscribe_trades, weak_coroutine(self._on_trade), *new)
+        handler = relay(loop, stream, Trade, self._emit_trade)
+        await asyncio.to_thread(stream.subscribe_trades, handler, *new)
 
     @override
     async def _unsubscribe_trades(self, command: live.UnsubscribeTrades) -> None:
@@ -599,11 +657,12 @@ class AlpacaDataClient(MarketDataClient):
         if historical is None:
             raise RuntimeError("Alpaca data client is not connected")
         symbol = instrument.id.symbol.value
+        timeframe = bar_timeframe(bar_type)  # first: it names what Alpaca serves (not a TICK bar)
         interval = timedelta(microseconds=bar_interval_ns(bar_type) // 1_000)
         start, end = alpaca_bars_window(request.start, request.end, self.clock.utc_now(), interval)
         params = StockBarsRequest(
             symbol_or_symbols=symbol,
-            timeframe=bar_timeframe(bar_type),
+            timeframe=timeframe,
             start=start,
             end=end,
             limit=request.limit,
@@ -633,14 +692,19 @@ class AlpacaDataClient(MarketDataClient):
         """Run `fn(arg)` in a worker thread, one call at a time, releasing the lock when the call returns.
 
         The worker's future is shielded, so cancelling the awaiting hook leaves the call running and the
-        lock held until it ends; the worker hands the release back to the node's loop. If the loop stops
-        before a queued call starts, the lock stays held, and `_connect` builds a new one.
+        lock held until it ends; the worker hands the release back to the node's loop. An executor that
+        refuses the work (one shut down) raises here, and the lock is released. If the loop stops before
+        a queued call starts, the lock stays held, and `_connect` builds a new one.
         """
         loop = asyncio.get_running_loop()
         lock = self._historical_lock
         await lock.acquire()
         try:
-            call = asyncio.ensure_future(asyncio.to_thread(release_after, loop, lock, fn, arg))
+            # What `asyncio.to_thread` does (CPython 3.14, `asyncio/threads.py`), called here so that an
+            # executor refusing the work raises before anything could release the lock.
+            context = contextvars.copy_context()
+            work = functools.partial(context.run, release_after, loop, lock, fn, arg)
+            call = loop.run_in_executor(None, work)
         except BaseException:
             lock.release()
             raise
@@ -672,7 +736,7 @@ class AlpacaDataClient(MarketDataClient):
             i.symbol.value for i in instrument_ids if i.venue == VENUE and i.symbol.value in current
         ]
 
-    def _started_stream(self) -> QuoteTradeStream:
+    def _started_stream(self) -> tuple[QuoteTradeStream, asyncio.AbstractEventLoop]:
         if self._stream is None or self._owner_loop is None:
             raise RuntimeError("Alpaca data client is not connected")
         if self._stream_thread is not None and not self._stream_thread.is_alive():
@@ -690,10 +754,17 @@ class AlpacaDataClient(MarketDataClient):
                 daemon=True,
             )
             self._stream_thread.start()
-        return self._stream
+        return self._stream, self._owner_loop
 
-    def _emit_quote(self, quote: Quote) -> None:
-        if self._stopping or quote.symbol not in self._quote_symbols:
+    def _current(self, stream: QuoteTradeStream) -> bool:
+        """Whether a message from `stream` is still wanted: the client runs it and is not stopping.
+
+        A stream left running by a timed-out disconnect delivers until its thread ends, and after a
+        reconnect the symbol sets hold the new stream's subscriptions."""
+        return stream is self._stream and not self._stopping
+
+    def _emit_quote(self, stream: QuoteTradeStream, quote: Quote) -> None:
+        if not self._current(stream) or quote.symbol not in self._quote_symbols:
             return
         try:
             instrument = self._equity(InstrumentId(Symbol(quote.symbol), VENUE))
@@ -718,8 +789,8 @@ class AlpacaDataClient(MarketDataClient):
             return
         self._handle_data(tick)
 
-    def _emit_trade(self, trade: Trade) -> None:
-        if self._stopping or trade.symbol not in self._trade_symbols:
+    def _emit_trade(self, stream: QuoteTradeStream, trade: Trade) -> None:
+        if not self._current(stream) or trade.symbol not in self._trade_symbols:
             return
         try:
             instrument = self._equity(InstrumentId(Symbol(trade.symbol), VENUE))
@@ -729,8 +800,8 @@ class AlpacaDataClient(MarketDataClient):
             return
         self._handle_data(tick)
 
-    def _warn_trade_cancel(self, cancel: TradeCancel) -> None:
-        if self._stopping or cancel.symbol not in self._trade_symbols:
+    def _warn_trade_cancel(self, stream: QuoteTradeStream, cancel: TradeCancel) -> None:
+        if not self._current(stream) or cancel.symbol not in self._trade_symbols:
             return
         action = "error" if cancel.action == "E" else "cancel"
         self._log.warning(
@@ -738,8 +809,8 @@ class AlpacaDataClient(MarketDataClient):
             "a trade tick already emitted is not withdrawn",
         )
 
-    def _warn_trade_correction(self, correction: TradeCorrection) -> None:
-        if self._stopping or correction.symbol not in self._trade_symbols:
+    def _warn_trade_correction(self, stream: QuoteTradeStream, correction: TradeCorrection) -> None:
+        if not self._current(stream) or correction.symbol not in self._trade_symbols:
             return
         self._log.warning(
             f"Alpaca trade correction for {correction.symbol} trade {correction.original_id} "
@@ -752,23 +823,5 @@ class AlpacaDataClient(MarketDataClient):
         stream, error = exit
         # Only the stream this client still runs counts: a thread left behind by a timed-out disconnect
         # can end after a reconnect, when `_stopping` is False again.
-        if stream is self._stream and not self._stopping:
+        if self._current(stream):
             self._log.error(f"Alpaca stream ended while subscribed: {error!r}")
-
-    # -- the stream's thread: reached through `weak_coroutine`, never holding the client -------------
-
-    async def _on_quote(self, quote: Quote | RawData) -> None:
-        if isinstance(quote, Quote) and self._owner_loop is not None:
-            post(self._owner_loop, self._emit_quote, quote)
-
-    async def _on_trade(self, trade: Trade | RawData) -> None:
-        if isinstance(trade, Trade) and self._owner_loop is not None:
-            post(self._owner_loop, self._emit_trade, trade)
-
-    async def _on_trade_cancel(self, cancel: TradeCancel | RawData) -> None:
-        if isinstance(cancel, TradeCancel) and self._owner_loop is not None:
-            post(self._owner_loop, self._warn_trade_cancel, cancel)
-
-    async def _on_trade_correction(self, correction: TradeCorrection | RawData) -> None:
-        if isinstance(correction, TradeCorrection) and self._owner_loop is not None:
-            post(self._owner_loop, self._warn_trade_correction, correction)

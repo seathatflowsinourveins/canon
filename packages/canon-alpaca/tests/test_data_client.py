@@ -263,11 +263,13 @@ def run_with_client(
     body: Callable[[AlpacaDataClient], Awaitable[None]],
     strategy: Strategy | None = None,
     max_workers: int | None = None,
+    executor: ThreadPoolExecutor | None = None,
 ):
     """Run a hosted node, await `body` with its connected Alpaca client, stop the node, return its cache.
 
-    With `max_workers`, the loop's default executor, which `asyncio.to_thread` uses, has that many threads.
-    The cache is taken before the run, as NautilusTrader requires for a node run by `run_async`.
+    With `max_workers`, the loop's default executor, which `asyncio.to_thread` uses, has that many threads;
+    with `executor`, it is that one. The cache is taken before the run, as NautilusTrader requires for a
+    node run by `run_async`.
     """
     clients: list[AlpacaDataClient] = []
     strategy = strategy or consumer(
@@ -280,7 +282,11 @@ def run_with_client(
 
     async def main() -> None:
         if max_workers is not None:
-            asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers))
+            executor_used = ThreadPoolExecutor(max_workers)
+        else:
+            executor_used = executor
+        if executor_used is not None:
+            asyncio.get_running_loop().set_default_executor(executor_used)
         async with asyncio.timeout(15):
             task = asyncio.ensure_future(nodes[0].run_async())
             try:
@@ -405,8 +411,10 @@ def test_failed_unsubscribe_can_be_retried(venue) -> None:
     ("start", "end", "limit", "closes"),
     [
         (START, START + 2 * HOUR, None, [START, START + HOUR, START + 2 * HOUR]),
-        (START, START + HOUR, 2, [START, START + HOUR]),
+        # Three bars close inside the window; `limit` keeps the earliest two.
+        (START, START + 2 * HOUR, 2, [START, START + HOUR]),
     ],
+    ids=["no limit", "limit cuts the window"],
 )
 def test_bar_window_holds_the_bars_that_close_inside_it(venue, alpaca, start, end, limit, closes):
     venue.historical.bars = alpaca.hourly_bars(START - 2 * HOUR, 6)  # opens 07:00 to 12:00
@@ -433,9 +441,13 @@ DAILY_BAR_TYPE = BarType.from_str("AAPL.ALPACA-1-DAY-LAST-EXTERNAL")
         (FRI + timedelta(hours=21), MON + timedelta(hours=21), [FRI + NY_MIDNIGHT]),
         # Inside Monday's session: Monday's bar is stamped at Tuesday midnight, so nothing.
         (MON + timedelta(hours=14, minutes=30), MON + timedelta(hours=21), []),
+        # From Monday's open, midnight New York, to the evening: the window holds the open, but Monday's
+        # bar is stamped at Tuesday midnight, so nothing. Alpaca is asked for Sunday, which has no bar.
+        (MON + NY_MIDNIGHT, MON + timedelta(hours=21), []),
         # Monday noon to Tuesday noon New York: Monday's bar.
         (MON + timedelta(hours=17), MON + timedelta(days=1, hours=17), [MON + NY_MIDNIGHT]),
     ],
+    ids=["friday to monday", "inside monday's session", "from monday's open", "noon to noon"],
 )
 def test_daily_bar_window_selects_by_open_plus_24_hours(venue, alpaca, start, end, opens):
     days = [FRI - timedelta(days=1), FRI, MON, MON + timedelta(days=1)]  # Thursday to Tuesday
@@ -451,6 +463,9 @@ def test_daily_bar_window_selects_by_open_plus_24_hours(venue, alpaca, start, en
     run(build_node(strategy), "hosted")
 
     assert strategy.seen_responses == [(strategy.request_id, None)]
+    # NautilusTrader drops a bar whose `ts_init` is outside the request, so an empty answer alone would
+    # also pass with no shift; the window sent shows the shift.
+    assert sent_window(venue) == (start - DAY, end - DAY)
     assert [b.ts_event for b in strategy.seen_bars] == [dt_to_unix_nanos(o) for o in opens]
     assert all(b.ts_init == b.ts_event + 86_400_000_000_000 for b in strategy.seen_bars)
 
@@ -635,6 +650,10 @@ def test_cancelled_bar_request_keeps_the_next_waiting_until_its_call_returns(ven
             # The first call is still inside get_stock_bars, so the lock is still held.
             assert client._historical_lock.locked()
             second = asyncio.ensure_future(client._request_bars(bars_request()))
+            # While the first call is held at the gate, the second must not reach the venue.
+            await asyncio.sleep(0.2)
+            assert len(venue.historical.requests) == 1
+            assert not second.done()
         finally:
             venue.historical.gate.set()
         await second
@@ -682,10 +701,10 @@ def test_one_sided_quote_count_restarts_after_resubscribing(venue, alpaca, capfd
     async def body(client) -> None:
         await client._subscribe_quotes(command(AAPL))
         for _ in range(2):
-            client._emit_quote(alpaca.quote(bp=0.0, bs=0))
+            client._emit_quote(client._stream, alpaca.quote(bp=0.0, bs=0))
         await client._unsubscribe_quotes(command(AAPL))
         await client._subscribe_quotes(command(AAPL))
-        client._emit_quote(alpaca.quote(bp=0.0, bs=0))
+        client._emit_quote(client._stream, alpaca.quote(bp=0.0, bs=0))
 
     run_with_client(body)
 
@@ -707,7 +726,8 @@ def test_logged_waits_for_lines_still_queued_after_a_run(venue, capfd) -> None:
 
 def test_quote_for_a_symbol_not_subscribed_is_dropped(venue, alpaca) -> None:
     async def body(client) -> None:
-        client._emit_quote(alpaca.quote())  # as a late message after an unsubscribe would arrive
+        # As a late message after an unsubscribe would arrive.
+        client._emit_quote(client._stream, alpaca.quote())
 
     cache = run_with_client(body)
 
@@ -942,3 +962,261 @@ def test_a_stream_given_at_construction_serves_one_connect(venue, monkeypatch) -
             await client._connect()
 
     run_with_client(body)
+
+
+# -- the data client's defects from the 2026-11-10 reviewer benchmark triage -----------------------------
+
+
+@pytest.mark.parametrize(
+    ("end", "now", "interval", "window"),
+    [
+        # No start, and an end before today: the window is the end's day so far, not today's.
+        (
+            datetime(2024, 12, 31, 23, tzinfo=UTC),
+            datetime(2026, 11, 10, 17, tzinfo=UTC),
+            HOUR,
+            (datetime(2024, 12, 31, 4, tzinfo=UTC), datetime(2024, 12, 31, 22, tzinfo=UTC)),
+        ),
+        # A week back from midnight 2026-11-02 EST is 168 hours, which lands at 01:00 EDT on 10-26.
+        (
+            None,
+            datetime(2026, 11, 2, 17, tzinfo=UTC),
+            WEEK,
+            (datetime(2026, 10, 26, 5, tzinfo=UTC), datetime(2026, 10, 26, 17, tzinfo=UTC)),
+        ),
+        # Half an hour into the Monday after the spring change: a day back from midnight EDT is 23:00
+        # EST on the Saturday, so the window is half an hour long, not inverted.
+        (
+            None,
+            datetime(2026, 3, 9, 4, 30, tzinfo=UTC),
+            DAY,
+            (datetime(2026, 3, 8, 4, tzinfo=UTC), datetime(2026, 3, 8, 4, 30, tzinfo=UTC)),
+        ),
+    ],
+    ids=["end before today", "week across the autumn change", "day after the spring change"],
+)
+def test_bars_window_with_no_start_is_the_end_days_window_in_elapsed_time(
+    end, now, interval, window
+):
+    start_sent, end_sent = canon_alpaca.data.alpaca_bars_window(None, end, now, interval)
+
+    assert (start_sent, end_sent) == window
+    assert start_sent <= end_sent
+
+
+def test_bar_request_with_no_start_and_a_past_end_returns_that_days_bars(venue, alpaca) -> None:
+    venue.historical.bars = alpaca.hourly_bars(START - 2 * HOUR, 6)  # opens 07:00 to 12:00 UTC
+    strategy = consumer(want_quotes=False, want_trades=False, bars_start=None, bars_end=END)
+
+    run(build_node(strategy), "hosted")
+
+    assert strategy.seen_responses == [(strategy.request_id, None)]
+    # From midnight New York (05:00 UTC) to END, 10:00 UTC: the bars that closed at 08:00, 09:00, 10:00.
+    assert [b.ts_init for b in strategy.seen_bars] == [
+        dt_to_unix_nanos(START - HOUR + h * HOUR) for h in range(3)
+    ]
+
+
+def test_old_streams_messages_after_a_reconnect_are_dropped(venue, alpaca, monkeypatch, capfd):
+    monkeypatch.setattr(canon_alpaca.data, "STREAM_JOIN_TIMEOUT_SECS", 0.05)
+    old = venue.stream
+    old.quotes, old.trades = [], []  # the old stream delivers only what the test hands its handlers
+    new = alpaca.Stream()
+    new.quotes, new.trades = [], []
+
+    async def body(client) -> None:
+        await client._subscribe_quotes(command(AAPL))
+        await client._subscribe_trades(command(AAPL))
+        await wait_until(old.running.is_set)
+        old.ignores_stop = True
+        handlers = [
+            (old.quote_handlers["AAPL"], alpaca.quote()),
+            (old.trade_handlers["AAPL"], alpaca.trade()),
+            (old.cancel_handlers["*"], alpaca.trade_cancel()),
+        ]
+        try:
+            with pytest.raises(RuntimeError, match="did not stop"):
+                await client._disconnect()
+            monkeypatch.setattr(canon_alpaca.data, "StockDataStream", lambda **_: new)
+            await client._connect()
+            await client._subscribe_quotes(command(AAPL))
+            await client._subscribe_trades(command(AAPL))
+            for handler, message in handlers:  # late messages on the old stream's thread
+                await asyncio.to_thread(asyncio.run, handler(message))
+            for _ in range(5):
+                await asyncio.sleep(0.01)
+        finally:
+            old.release.set()
+
+    cache = run_with_client(body)
+
+    assert cache.quote(AAPL) is None
+    assert cache.trade(AAPL) is None
+    assert "Alpaca trade cancel" not in logged(capfd)
+
+
+class RefusingExecutor(ThreadPoolExecutor):
+    """A default executor that, once told to, refuses a bar call's work as a shut-down executor does.
+
+    Only the call `asyncio.to_thread` and the client submit, `context.run(release_after, ...)`, is
+    refused, so the node's other work goes on."""
+
+    refuse = False
+
+    def submit(self, fn, /, *args, **kwargs):
+        bar_call = getattr(fn, "args", ())[:1] == (canon_alpaca.data.release_after,)
+        if self.refuse and bar_call:
+            raise RuntimeError("cannot schedule new futures after shutdown")
+        return super().submit(fn, *args, **kwargs)
+
+
+def test_a_bar_call_the_executor_refuses_releases_the_request_lock(venue) -> None:
+    executor = RefusingExecutor()
+
+    async def body(client) -> None:
+        executor.refuse = True
+        try:
+            with pytest.raises(RuntimeError, match="cannot schedule"):
+                await client._request_bars(bars_request())
+        finally:
+            executor.refuse = False
+        assert not client._historical_lock.locked()
+        await asyncio.wait_for(client._request_bars(bars_request()), 2)  # the next is served
+
+    run_with_client(body, executor=executor)
+
+    assert len(venue.historical.requests) == 1
+
+
+def test_the_stream_thread_holds_no_strong_reference_to_the_client_inside_a_handler(
+    venue, alpaca, monkeypatch
+) -> None:
+    from alpaca.data.models import Quote
+
+    monkeypatch.setattr(canon_alpaca.data, "STREAM_JOIN_TIMEOUT_SECS", 0.05)
+    inside, release = threading.Event(), threading.Event()
+    real_post = canon_alpaca.data.post
+
+    def post_held_on_the_stream_thread(loop, callback, item) -> None:
+        if isinstance(item, Quote) and threading.current_thread().name in venue.stream.run_threads:
+            inside.set()
+            release.wait(5)  # the stream thread is preempted here, inside the handler
+        real_post(loop, callback, item)
+
+    monkeypatch.setattr(canon_alpaca.data, "post", post_held_on_the_stream_thread)
+    refs = []
+
+    async def body(client) -> None:
+        refs.append(weakref.ref(client))
+        await client._subscribe_quotes(command(AAPL))
+        await wait_until(inside.is_set)
+        with pytest.raises(RuntimeError, match="did not stop"):
+            await client._disconnect()
+
+    try:
+        run_with_client(body)
+        while BUILT_NODES:
+            BUILT_NODES.pop().dispose()
+        gc.collect()
+        assert refs[0]() is None
+    finally:
+        release.set()
+        assert venue.stream.finished.wait(2)
+
+
+def test_a_disconnect_cancelled_by_the_node_still_clears_the_clients_state(venue, capfd) -> None:
+    async def body(client) -> None:
+        await client._subscribe_quotes(command(AAPL))
+        await wait_until(venue.stream.running.is_set)
+        client._one_sided_quotes["AAPL"] = 3
+        venue.stream.ignores_stop = True
+        try:
+            # As a node whose disconnection timeout is shorter than STREAM_JOIN_TIMEOUT_SECS cancels it.
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(client._disconnect(), 0.2)
+            assert client._stream is None
+            assert client._stream_thread is None
+            assert client._historical is None
+            assert client._quote_symbols == set()
+            assert client._one_sided_quotes == {}
+        finally:
+            venue.stream.release.set()
+
+    run_with_client(body)
+
+    assert "Dropped 3 one-sided Alpaca quotes for AAPL since subscribing" in logged(capfd)
+    assert venue.stream.finished.wait(2)
+
+
+def test_tick_bar_request_is_refused_with_the_adapters_reason(venue) -> None:
+    strategy = consumer(
+        want_quotes=False,
+        want_trades=False,
+        bar_type=BarType.from_str("AAPL.ALPACA-100-TICK-LAST-EXTERNAL"),
+    )
+
+    run(build_node(strategy), "hosted")
+
+    ((_, reason),) = strategy.seen_responses
+    assert "MINUTE, HOUR, DAY or WEEK" in reason
+    assert venue.historical.requests == []
+
+
+def test_a_quote_with_a_nan_price_is_dropped_as_an_error_not_counted_one_sided(
+    venue, alpaca, capfd
+) -> None:
+    venue.stream.quotes = [
+        lambda: alpaca.quote(bp=float("nan")),
+        lambda: alpaca.quote(
+            bp=0.0, ap=float("nan")
+        ),  # the other side NaN: malformed, not one-sided
+        alpaca.quote,
+    ]
+    strategy = consumer(want_trades=False, bar_type=None)
+
+    run(build_node(strategy), "hosted")
+
+    (tick,) = strategy.seen_quotes
+    assert tick.bid_price == Price.from_str("87.6600")
+    log = logged(capfd)
+    assert "one-sided" not in log
+    assert "Dropped Alpaca quote: AAPL.ALPACA bid price nan is not a finite number" in log
+    assert "Dropped Alpaca quote: AAPL.ALPACA ask price nan is not a finite number" in log
+
+
+def test_resubscribing_delivers_again(venue) -> None:
+    # The strategy's own subscription stays in the engine, so each quote the client emits reaches it.
+    strategy = consumer(want_trades=False, bar_type=None, auto_shutdown=False)
+
+    async def body(client) -> None:
+        await wait_until(lambda: len(strategy.seen_quotes) == 1)
+        await client._unsubscribe_quotes(command(AAPL))
+        await client._subscribe_quotes(command(AAPL))
+        await wait_until(lambda: len(strategy.seen_quotes) == 2)
+
+    run_with_client(body, strategy=strategy)
+
+
+@pytest.mark.parametrize("make", ["real", "stand-in"])
+def test_a_running_stream_connects_only_once_something_is_subscribed(make, alpaca) -> None:
+    # alpaca-py 0.45.0's `_drive_run` waits for a market subscription before it connects, and sets
+    # `_running`, which gates every send, only after connecting. Nothing is subscribed here, so the
+    # real stream opens no connection.
+    from alpaca.data.live.stock import StockDataStream
+
+    if make == "real":
+        stream = StockDataStream(api_key=PLACEHOLDER, secret_key=PLACEHOLDER)
+        connected = lambda: stream._running
+    else:
+        stream = alpaca.Stream()
+        connected = stream.running.is_set
+    thread = threading.Thread(target=stream.run, daemon=True)
+    thread.start()
+    try:
+        thread.join(0.2)
+        assert thread.is_alive()
+        assert not connected()
+    finally:
+        stream.stop()
+        thread.join(2)
+    assert not thread.is_alive()

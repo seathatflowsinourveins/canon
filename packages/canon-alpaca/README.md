@@ -121,7 +121,8 @@ Each is stated where it is implemented, with its source.
   finer than 0.0001 is refused, not rounded (`Instrument.make_price` would round it silently). The
   instrument does not stop a sub-penny order at or above $1.00; the execution client denies one (below).
 * **Quotes need both sides.** A quote with a zero or negative bid or ask price is dropped, since a
-  `QuoteTick` cannot hold a one-sided quote. Outside market hours and on thin names such quotes can be
+  `QuoteTick` cannot hold a one-sided quote. A price that is not a finite number is not one-sided: that
+  quote is dropped as malformed and logged as an error, as any other quote that cannot be converted. Outside market hours and on thin names such quotes can be
   most of them, so the first per symbol is logged as a warning with the reason, then the running count
   each time it reaches 10, 100, 1000 and so on, and the total on disconnect. The count restarts when the
   symbol is unsubscribed.
@@ -141,15 +142,19 @@ Each is stated where it is implemented, with its source.
 * **Feed:** IEX only, the feed a paper-only account is entitled to.
 * **Timestamps** lose sub-microsecond precision: alpaca-py parses them into `datetime`.
 * **No restart:** if alpaca-py's stream ends by itself, the client logs an error and does not restart it;
-  a later subscription fails with an error saying so, until the client is reconnected.
+  a later subscription fails with an error saying so, until the client is reconnected. Each stream
+  handler names the stream it serves, so what a stream the client no longer runs still delivers (one
+  left running by a timed-out disconnect, below) is dropped, after a reconnect too. The stream's thread
+  never holds the client, not even during a call, so the client is never freed on that thread.
   If the stream cannot authenticate, alpaca-py retries without ending and reports it only through Python
   `logging`, which the node does not show: subscriptions then deliver nothing, with no adapter error.
 * **Stream shutdown:** `_disconnect` waits `STREAM_JOIN_TIMEOUT_SECS` (10 s) for the stream thread. A
   connected alpaca-py stream sees the stop within its 5 s receive timeout and then closes the websocket,
   which `websockets` allows 10 s, so a slow close can exceed it; a stop during connect or auth waits for
   that to finish. When it is exceeded, the client clears its state and raises, the node logs the failed
-  disconnect, and the daemon thread finishes on its own with its websocket still open until then. A
-  later connect builds a new stream; whether Alpaca accepts it while the old connection is still open is
+  disconnect, and the daemon thread finishes on its own with its websocket still open until then. If
+  the node cancels the disconnect first (a disconnection timeout under 10 s), the state is cleared all
+  the same. A later connect builds a new stream; whether Alpaca accepts it while the old connection is still open is
   UNVERIFIED.
 * **Bar windows:** Alpaca filters bars on their open time, inclusive at both `start` and `end` (taken from
   its documentation, https://docs.alpaca.markets/us/reference/stockbars.md; checked against the live API
@@ -159,9 +164,11 @@ Each is stated where it is implemented, with its source.
   window; the response keeps the bounds as requested. The window ends at the earlier of the requested
   `end` and the node clock's current time (`now` when there is no `end`; NautilusTrader's `request_bars`
   itself refuses an `end` after now), so the bar still forming, whose `ts_init` is in the future, is
-  never returned. A request with no `start` starts at midnight New York of the current day: Alpaca's
-  reference gives "the beginning of the current day" as its own default but names no time zone, so the
-  adapter supplies the start itself, and the window sent never ends before it starts.
+  never returned. A request with no `start` starts at midnight New York of the day its window ends in,
+  today unless it names an earlier `end`: Alpaca's reference gives "the beginning of the current day" as
+  its own default but names no time zone, so the adapter supplies the start itself, and the window sent
+  never ends before it starts. Both bounds move back in elapsed time, in UTC, so a clock change does not
+  shift the window by an hour.
 * **Choosing a window:** to get the bar for a day or week, ask for one that holds its open plus its
   length with hours to spare: from noon New York on the bar's last day to noon the next day works on
   every day, clock changes included. A window ending exactly at midnight misses a weekly bar that spans
@@ -170,14 +177,16 @@ Each is stated where it is implemented, with its source.
   Alpaca sorts ascending by default. With no `start`, the window is today in New York so far: for MINUTE
   and HOUR, the first `limit` bars that closed since midnight; for DAY, the previous calendar day's bar,
   whose `ts_init` is this midnight, so none on a Monday or the day after a holiday; for WEEK, last
-  week's bar on a Monday (from 01:00 after the spring change) and none on other days. alpaca-py's
+  week's bar on a Monday (from 01:00 after the spring change; none on the Monday after the autumn
+  change, whose bar ends at 23:00 the Sunday before) and none on other days. alpaca-py's
   `sort` parameter (`Sort.DESC`) would return the latest instead; it is not adopted here. If
   any one bar in the response is refused (a fractional volume, a price finer than 0.0001), the whole
   request fails. A refused or failed request reaches the strategy as a response with a `failure_reason`
   and no bars. Requests are made one at a time, because alpaca-py's REST client holds one
   `requests.Session`; a waiting request holds an `asyncio.Lock` on the node's loop, not a worker thread,
   and the lock is released only when the HTTP call returns, so a request cancelled mid-call (as on
-  shutdown) still keeps the next one waiting.
+  shutdown) still keeps the next one waiting. A request the loop's executor refuses (one shut down)
+  fails and releases the lock.
 * **HTTP timeout:** alpaca-py sets none and offers no setting for one (`RESTClient._one_request` calls
   `requests.Session.request` without `timeout`). Every alpaca-py REST client the adapter builds, the
   provider's, the data client's and the execution client's, gets requests' own example timeout, 3.05 s to
@@ -355,13 +364,14 @@ Each is stated in `execution.py`'s header, with its source.
 
 `tests/` beside `src/`, run with pytest in `importlib` import mode from the repo root (`uv run --locked pytest`).
 Upstream's template is covered by integration tests for factory registration, a market fill and shutdown.
-This package has all three for each client, offline, plus a paper test for each:
+The execution client has all three, offline. The data client has registration and shutdown; it places no
+order, so it has no fill test, and its data delivery is tested instead. Each has paper tests:
 
 | File | Covers | Network |
 |---|---|---|
 | `test_parsing.py` | Asset to `Equity`; bar, quote and trade conversion; bar type support; missing credentials | None |
 | `test_provider.py` | Asset queries and filters, load by ID, failures named, other venues refused | None |
-| `test_data_client.py` | A real `LiveNode`: registration through config and builder, owned and hosted launch, bars, quotes and trades into strategy and cache, hourly and daily bar windows, `limit`, open-ended requests, concurrent and cancelled bar requests, request failures as `failure_reason`, unsubscribes that never subscribed or failed, late data for an unsubscribed symbol dropped, trade cancels and corrections logged, one-sided quotes dropped and counted, a stream ending by itself logged (and an abandoned one not) and a later subscription refused, clients given at construction kept across a reconnect, a cancelled bar call's later error read, shutdown joining the stream thread or clearing state when it does not stop, stream handlers not keeping the client alive, paper and IEX client construction | None |
+| `test_data_client.py` | A real `LiveNode`: registration through config and builder, owned and hosted launch, bars, quotes and trades into strategy and cache, hourly and daily bar windows, `limit`, open-ended requests, concurrent and cancelled bar requests, request failures as `failure_reason`, unsubscribes that never subscribed or failed, late data for an unsubscribed symbol dropped, late data from a stream left behind by a timed-out disconnect dropped after a reconnect, a resubscribe delivering again, trade cancels and corrections logged, one-sided quotes dropped and counted and a NaN price dropped as malformed, a TICK bar request refused with the adapter's reason, windows with no `start` (an earlier `end`, either clock change), a request the executor refuses releasing the lock, a disconnect cancelled by the node clearing state, the stream thread holding no reference to the client inside a handler, the stream stand-in connecting only once something is subscribed, as alpaca-py's does, a stream ending by itself logged (and an abandoned one not) and a later subscription refused, clients given at construction kept across a reconnect, a cancelled bar call's later error read, shutdown joining the stream thread or clearing state when it does not stop, stream handlers not keeping the client alive, paper and IEX client construction | None |
 | `test_paper_integration.py` | One asset and a week of daily bars from Alpaca's paper environment through a real node, from midday New York on a fixed trading day: the first bar must be the one that opened at that day's midnight, which Alpaca returns only because the adapter shifts the window | Paper only; skipped without `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` |
 | `test_execution_client.py` | A real `LiveNode` with both clients: registration through config and builder, owned and hosted launch, a market order that fills, partial fills, a limit order canceled, cancel-all by ID (side filter, a refused cancel, a failed cancel, nothing to cancel), rejections by HTTP status and by trade update, a cancel refused, a cancel refused for an order Alpaca canceled while the stream was down, a refusal whose lookup alpaca-py cannot build (submit, cancel, modify), a replacement rejected after `replaced`, fills listed before a replace, clients given at construction kept across a reconnect, a cancelled call's later error read, stop and stop-limit orders sent with their prices, modify (`OrderUpdated` only on Alpaca's `replaced`, a fill on the replacement reaching the node's order with the client's map full and emptied, two replaces in a row, reports of a replacement under the node's ID, refusals, a refused repeat, `order_replace_rejected`, a rejected replacement, local denials, a stop's trigger price, a replacement that cannot be read, a replacement whose prior order cannot be read, open or closed, two orders with an empty client order ID), orders denied before Alpaca (type, time in force, stop trigger type, sub-penny limit and stop prices, not tradable), an unknown submit outcome left `SUBMITTED`, an update for an unknown order dropped, start-up fills from Alpaca's fill activities (trade IDs and prices, paging, the window, one order, an activity it cannot map skipped, a page whose last activity has no `id`, a body that is not JSON, fills not all listed whatever their age or with no `cum_qty` and `leaves_qty`, the order read to check them and one alpaca-py cannot build, an activity listed twice), start-up reconciliation of an open order (older than 500 newer closed orders, or before an open-only check's window), a filled order, a position and open stop and stop-limit orders, an unmapped open order failing start-up, account state on connect, paper-only client construction, shutdown joining the trade stream thread; the config's paper-only refusals, and a node refusing a plain `ExecutionClientConfig`; HTTP timeouts (a local server that never answers: the call ends, the next is answered, the run ends; a connect timeout on the only attempt rejects a submit or cancel as not sent, a read timeout or a repeated attempt leaves it unknown; a session holding another timeout, or the adapter on HTTPS only, gets the package's on both schemes) | None |
 | `test_paper_execution.py` | DAY limit buys of 1 AAPL far below the market on Alpaca's paper Trading API through a real node: one submitted, accepted and canceled; upstream's `ExecTester` running rows of its Execution Testing Spec: TC-E41, a limit buy and a stop buy canceled by `CancelAllOrders` on stop, TC-E20 and TC-E22, a stop and a stop-limit buy accepted at the prices sent and reported back the same, and TC-E30, whose one-tick amend the client denies as sub-penny; a $1.00 buy modified to $1.01 through a node, then canceled; TC-E84, an open order placed with alpaca-py loaded by a node's start-up reconciliation; and TC-E44's venue side, a canceled order canceled again | Paper only; cancels every order it places; each places nothing and fails if the paper account already holds an open AAPL order or position; skipped without `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` |
