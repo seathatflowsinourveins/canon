@@ -44,13 +44,14 @@ Chosen: **option 3**.
    records that the seven plugins were installed by hand, and `scripts/bootstrap --install` writes the two
    `cordis.patch.yml` rows, not the plugins. A profile that differs from the record is a named configuration.
 2. **The review configuration** is stock plus one addition, `@deepseek-ai/dsh-experimental-terminal-bundle`
-   0.2.1-rc.3. It is chosen because it adds no network client and persists nothing outside the session;
+   0.2.1-rc.3. It is chosen because its own code has no network client and its sessions are process-local, though it gives the reviewer a persistent shell, which upstream says carries weaker contracts than one-shot bash;
    whether it opens a channel to another model or to earlier sessions was NOT read in its source
    (`UNVERIFIED`). It carries the `doublecheck` guard at `intensity: remind`: the plugin's `block` mode
    returns a denial and `warn` returns an approval request, which this host would auto-reject, so `remind`
    is the only mode that neither deadlocks an unattended run nor fails silently. Its `tdd` module is off
-   because the red gate refuses every non-test edit until a failing test is on record — read in the 0.9.30
-   source; whether 0.9.29, which stock carries, behaves the same is `UNVERIFIED`.
+   so that no red gate applies: at `remind` the guard only emits a reminder and lets the edit proceed, and the
+   gate refuses only under `warn` or `block` (read in the 0.9.30 source; the 0.9.29 guard code is identical
+   up to the projection registration).
 3. **The build configuration** is `dsh --profile headless -`, a one-shot runner carrying `aegis`,
    `dsh-doublecheck` 0.9.30, `dsh-memento` 0.5.30 with `writePolicy: auto`, and
    `dsh-subagent-codex` plus `dsh-subagent-claude-code` 0.2.1-rc.3. It re-enables the `credentials` row
@@ -60,8 +61,8 @@ Chosen: **option 3**.
    `dsh-tui` and then removed. Recording them individually is the adoption pass ADR 0072 rule 1 asks for and
    this record does not perform.
 5. **The advisor is inert in the review configuration.** It is in stock, and `dsh-advisor` 0.6.4 halts with
-   `no adapter registered for provider "deepseek-official"` when given a model. That failure was observed in
-   the headless profile, not the review one: whether the `dsh-tui` profile configures a model for it was not
+   `no adapter registered for provider "deepseek-official"` when given a model. That failure was reported in a
+   headless run, though the current `headless` profile no longer carries the advisor. Whether the `dsh-tui` profile configures a model for it was not
    read (`UNVERIFIED`). Rule 6 holds by configuration, not by construction.
 6. **ADR 0072 rules 1 and 5 are deferred, not satisfied.** No addition went through `adopt-upstream` with a
    source read for network use and persistence, and each was installed machine-level into the owner's

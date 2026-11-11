@@ -298,6 +298,13 @@ sec_evidence() {
   check "an ADR with CRLF line endings passes"               lacks "$out" "0997-crlf.md"
   check "an empty ADR is reported"                           has "$out" "0989-empty.md is empty"
   rm -f "$T"/docs/adr/09[89]*.md
+  # two records may not share a four-digit number
+  adr 0980-first  "---\nstatus: accepted\nreview-by: 2099-01-01\n---\n\n$E"
+  adr 0980-second "---\nstatus: accepted\nreview-by: 2099-01-01\n---\n\n$E"
+  out=$(canon lint); rc=$?
+  check "two ADRs sharing a number fail lint"                test "$rc" -eq 1
+  check "... naming both files"                              has "$out" "docs/adr/0980-first.md and docs/adr/0980-second.md share the number 0980"
+  rm -f "$T"/docs/adr/0980-*.md
   # an unreadable ADR is one lint error, and the later sections still run
   adr 0988-locked "---\nstatus: accepted\nreview-by: 2099-01-01\n---\n\n$E"; chmod 000 "$T/docs/adr/0988-locked.md"
   printf 'on: push\njobs:\n  a:\n    runs-on: ubuntu-24.04\n    steps:\n      - uses: actions/checkout@v4\n' > "$T/.github/workflows/extra.yml"
