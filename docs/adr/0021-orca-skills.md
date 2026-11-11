@@ -58,7 +58,8 @@ limits:
 5. **The repo's own lanes come first.** Research, record checks and code review stay subagents (ADR 0017).
    An Orca worker is for work that needs its own workspace or that the owner asks to watch, and it runs on
    the model `canon/models.json` gives that work, named with `--model` when Orca's default differs.
-   A Codex reviewer is an Orca worker, not a subagent, on Codex's own defaults: ADR 0043.
+   A Codex reviewer is an Orca worker, not a subagent, on Codex's own defaults: ADR 0043; since
+   2026-11-10 on the model and effort ADR 0045 rule 7 names instead.
 6. **Not used:** remote servers and SSH placement, the browser and desktop control, plugins, automations,
    session search, and the other skills Orca bundles.
 

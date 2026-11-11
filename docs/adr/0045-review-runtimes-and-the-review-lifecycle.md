@@ -94,6 +94,26 @@ owner's delegation of 2026-11-10.
    shows the patch ok, the coordinator starts no DeepSeek Harness review. Each review gets a new
    workspace, as rule 1 says (the two trial attempts shared one), and its brief says to write the report
    early, after a first attempt that stalled.
+7. **Codex reads on GPT-6.1 Sol at `max`** (the owner's instruction, 2026-11-10: GPT-6.1 Sol at maximum
+   quality). This replaces ADR 0043 rule 5, Codex's own default model and effort; the other three stay
+   on their defaults. The model is `gpt-6.1-sol` and the key `model_reasoning_effort`. The catalog
+   bundled with 0.167.0 lists `low`, `medium`, `high`, `xhigh`, `max` and `ultra` for it, `low` its
+   default. `max` is the most reasoning one task gets. `ultra` "uses subagents to handle separate parts
+   of a complex task in parallel"; a reader is one worker, and at 0.167.0 `ultra` sends the reader's own
+   requests at `xhigh`, so it is not used. The coordinator starts a review with `--agent codex --model
+   gpt-6.1-sol --effort max`. On the first such start (Orca 1.4.255) the receipt read ready, and the
+   process line carried `-m gpt-6.1-sol` and `-c model_reasoning_effort=max`. A signed-in session
+   fetches its own catalog and may list less; Codex sends any non-empty effort string unchanged without
+   checking it against the model's levels, and what the server does with one it does not list is
+   UNVERIFIED. So a report names the model and effort its session showed, and where `max` is not
+   offered the coordinator starts the next review at the highest level below `ultra` that is. If the
+   flags start no worker, the same two keys in the machine's Codex config do it: the owner's step, since
+   `scripts/bootstrap` writes only its own table there.
+   **Before this rule** every Codex review named no model or effort: both reviewer benchmark runs
+   (`evals/review/runs/2026-11-10-first` and `-second`; their sheets say "on its own defaults") and, by
+   ADR 0043 rule 5, the trials below. The machine's Codex config sets neither, so the catalog's defaults
+   applied: by the bundled catalog `gpt-6.1-sol` at `low`. A Codex score or finding from before this
+   rule is not comparable with one after it, and a sheet that holds both says so.
 
 ### Consequences
 
@@ -156,7 +176,9 @@ whether agy's background updater, started outside an interactive zsh, sees the `
 a running session honours the two rows (`--dump-config` shows them composed); whether another of the nine
 packages reads past sessions; how Orca applies its bypass-flag map; whether a dependent task becomes ready
 when its dependency fails; whether a reviewer's environment carries any key; Orca's fixture versions for
-DSH.
+DSH; which model and effort the Codex sessions before rule 7 were given by the catalog they fetched;
+whether the account's catalog offers `max`, which effort the first session under rule 7 applied (its
+flags were read, not its session), and what the server does with an effort the model does not list.
 
 ## Evidence
 
@@ -213,6 +235,38 @@ Read 2026-11-10. `fetched`: downloaded and searched. "Lane": a model summarised 
   as ADR 0043; `launchCmd:"muse --trust-workspace"`; `dsh` with `launchCmd:"dsh-tui ."` (read, `grep`).
 * The DeepSeek Harness profile's package files — the plugin versions and licences (read; no credential).
   https://github.com/pnpm/pnpm/releases/tag/v10.34.9 — MIT (`gh`); → `aa97047a81b4` (resolved).
+* Rule 7, read 2026-11-10. https://raw.githubusercontent.com/openai/codex/rust-v0.167.0/codex-rs/protocol/src/openai_models.rs
+  — `ReasoningEffort`: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`, `persistent`;
+  `from_str` turns any other non-empty string into `Custom` (fetched).
+  https://raw.githubusercontent.com/openai/codex/rust-v0.167.0/codex-rs/models-manager/models.json —
+  `gpt-6.1-sol`: `default_reasoning_level` `low`, six `supported_reasoning_levels`, `ultra` "Maximum
+  reasoning with automatic task delegation", `priority` 1, the lowest (fetched); `codex debug models
+  --bundled` on the installed 0.167.0 gives the same (run; it "dump[s] only the bundled catalog",
+  no sign-in used). `models-manager/src/manager.rs` and `mark_default_by_picker_visibility` in the file
+  above, at the tag — with no model named, the first the picker shows once sorted by `priority`
+  (fetched). `codex --help` — `-m, --model`, `-c key=value` (bundled). `protocol/src/openai_models/reasoning_effort.rs`
+  and `core/src/session/mod.rs` at the tag — the configured effort is copied into the session unchecked;
+  `ultra` resolves to the model's `multi_agent_reasoning_effort`, `xhigh` here (read by the second reader).
+* https://learn.chatgpt.com/docs/models — "Max gives the selected model more time to reason about a single
+  task"; "Ultra uses subagents to handle separate parts of a complex task in parallel"; "If you don't
+  specify a model, the ... Codex CLI ... uses a recommended model"; `codex --model gpt-6.1-sol` (fetched,
+  searched). https://learn.chatgpt.com/docs/config-file/config-reference — `model_reasoning_effort`:
+  "Reasoning effort advertised by the selected model, such as `low`, `medium`, `high`, `xhigh`, `max`, or
+  `ultra`. Available levels depend on the model and client" (fetched, searched).
+* Orca's bundle at 1.4.255, `shared/agent-session/options/agent-session-option-catalog-claude-codex.js` —
+  Codex's model applied with `-m`, its effort as `-c` with key `model_reasoning_effort`; the seed list has
+  no `gpt-6.1-sol`, and an unknown model is offered efforts up to `ultra`; its comments say both that
+  "unsupported efforts fall back to the model default instead of failing" and that "Codex can clamp
+  higher values", neither of which Codex's source at the tag shows (read; second reader). `orca
+  orchestration worker-start --help` — "`--effort` requires `--model`" (bundled). The machine's Codex
+  config — no `model`, `model_reasoning_effort` or profile key, and no profile file (key names read, no
+  value).
+* The first start under rule 7, 2026-11-10, Orca 1.4.255 and codex-cli 0.167.0 — the receipt "ready" with
+  the model and effort asked for (the coordinator's report); the worker's process line, of which only
+  the bypass flag, `-m gpt-6.1-sol` and `model_reasoning_effort=max` were read (`ps`).
+* Second reader of rule 7, 2026-11-10 (`evidence-verifier`): the levels, the default and the quotes held.
+  It found the fallback claim unsupported by Codex's source and what `ultra` sends, both corrected
+  above, and noted that this record is past the length at which a record is split.
 * Second reader, 2026-11-10 (`evidence-verifier`): it corrected the package count, the `/update` quote and
   the trial framing, and found Orca's flag map and the newer releases; all above.
 * Second reader, 2026-11-10, after the DSH trial (`evidence-verifier`): the configuration quotes held;
