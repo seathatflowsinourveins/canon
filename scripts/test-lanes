@@ -2370,6 +2370,35 @@ jq '.autoUpdatesChannel = "latest" | .env.ANTHROPIC_DEFAULT_FABLE_MODEL = "claud
 CLAUDE_CONFIG_DIR="$C3" bs --user-config
 check "values the owner set (latest by name, a pin canon never set) are left alone" \
       jqt "$C3/settings.json" '.autoUpdatesChannel == "latest" and .env.ANTHROPIC_DEFAULT_FABLE_MODEL == "claude-fable-5-1"'
+# A live settings.json that holds every key and hook entry the template sets, plus the owner's own keys and
+# another tool's hook entries, has nothing to merge: unchanged, untouched, no .canon-proposed copy
+C6="$TMP/cfg6"; CLAUDE_CONFIG_DIR="$C6" bs --user-config
+jq '.ownKey = 1 | .env.OWN_VAR = "x" | .hooks.Stop += [{hooks: [{type: "command", command: "/opt/cockpit/hook.sh"}]}]
+    | .hooks.Notification = [{matcher: "", hooks: [{type: "command", command: "/opt/cockpit/hook.sh"}]}]' \
+  "$C6/settings.json" > "$TMP/s6"; cp "$TMP/s6" "$C6/settings.json"
+CLAUDE_CONFIG_DIR="$C6" bs --user-config
+check "a superset of the template: unchanged, left as it is, no copy to merge by hand" \
+      eval 'grep -q "unchanged  $C6/settings.json\$" "$TMP/bs.out" && cmp -s "$C6/settings.json" "$TMP/s6" && [ ! -e "$C6/settings.json.canon-proposed" ]'
+jq '.hooks.Stop |= map(select(any(.hooks[]; .command | test("ledger")) | not))' "$TMP/s6" > "$C6/settings.json"
+CLAUDE_CONFIG_DIR="$C6" bs --user-config
+check "one missing a template hook entry: EXISTS, naming the event and the command, with a copy to merge" \
+      eval 'grep -q "EXISTS     $C6/settings.json differs from the template: hook Stop .*ledger.sh" "$TMP/bs.out" && [ -e "$C6/settings.json.canon-proposed" ]'
+cp "$TMP/s6" "$C6/settings.json"; CLAUDE_CONFIG_DIR="$C6" bs --user-config
+check "... and once it holds them again: unchanged, the earlier run's copy removed" \
+      eval 'grep -q "unchanged  $C6/settings.json\$" "$TMP/bs.out" && [ ! -e "$C6/settings.json.canon-proposed" ]'
+jq '(.hooks.Stop[] | select(any(.hooks[]; .command | test("ledger")))) |= (.matcher = "")' "$TMP/s6" > "$C6/settings.json"
+CLAUDE_CONFIG_DIR="$C6" bs --user-config
+check "a hook entry whose matcher is \"\" where the template gives none: the same, unchanged" \
+      eval 'grep -q "unchanged  $C6/settings.json\$" "$TMP/bs.out" && [ ! -e "$C6/settings.json.canon-proposed" ]'
+jq '(.hooks.Stop[].hooks[] | select(.command | test("ledger"))) |= del(.async)' "$TMP/s6" > "$C6/settings.json"
+CLAUDE_CONFIG_DIR="$C6" bs --user-config
+check "a template hook present by command but with a field changed: EXISTS, naming it" \
+      eval 'grep -q "EXISTS     $C6/settings.json differs from the template: hook Stop .*ledger.sh" "$TMP/bs.out" && [ -e "$C6/settings.json.canon-proposed" ]'
+rm -f "$C6/settings.json.canon-proposed"
+jq '.showThinkingSummaries = (.showThinkingSummaries | not)' "$TMP/s6" > "$C6/settings.json"
+CLAUDE_CONFIG_DIR="$C6" bs --user-config
+check "one with a template key set otherwise: EXISTS, naming the key" \
+      eval 'grep -q "EXISTS     $C6/settings.json differs from the template: showThinkingSummaries" "$TMP/bs.out" && [ -e "$C6/settings.json.canon-proposed" ]'
 
 # Antigravity's default model and self-updater (ADR 0059)
 # shellcheck disable=SC2034  # read by the eval'd checks below

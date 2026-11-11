@@ -27,7 +27,8 @@
 # the version it saw).
 # CLAUDE_CONFIG_DIR replaces ~/.claude. --user-config never overwrites settings.json, CLAUDE.md or
 # claude-hud.json (Claude HUD's settings, ADR 0023) there: a
-# differing one gets a <name>.canon-proposed copy beside it. It does add to an existing settings.json the
+# differing one gets a <name>.canon-proposed copy beside it, except a settings.json that already holds every
+# key and hook entry the template sets (settings_gaps), which is unchanged; an EXISTS line names each gap. It does add to an existing settings.json the
 # telemetry variables (CLAUDE_CODE_ENABLE_TELEMETRY, OTEL_*) of home/.claude/settings.json's env block that
 # it lacks (ADR 0007, tier 3; Claude Code reads them only from user or managed settings,
 # https://code.claude.com/docs/en/monitoring-usage.md), and the keys it lacks of CANON_KEYS (model,
@@ -437,6 +438,7 @@ OMNIROUTE_ANTHROPIC_RE='anthropic|claude'   # provider ids anthropic, claude, cl
 SQLITE3="${CANON_SQLITE3:-/usr/bin/sqlite3}"
 omniroute_version_row() {
   local pin v
+  OMNIROUTE_RUNTIME_VERSION="not reported (OmniRoute not installed or version check unavailable)"
   pin=$(jq -r '.upstreams[] | select(.id == "omniroute") | .track // empty' "$ROOT/canon/upstreams.json" 2>/dev/null)
   pin=${pin#tag:}; pin=${pin#v}
   if [ -z "$MISE" ]; then row "omniroute" UNKNOWN "no mise to ask; run: scripts/bootstrap --install"; return 1; fi
@@ -447,6 +449,7 @@ omniroute_version_row() {
      || ! dotted "$v"; then
     row "omniroute" UNKNOWN "installed, but omniroute --version gave '${v:-nothing}'"; return 1
   fi
+  OMNIROUTE_RUNTIME_VERSION="$v"
   if [ -z "$pin" ]; then row "omniroute" UNKNOWN "$v; no omniroute pin in canon/upstreams.json"; return 1; fi
   # the gateway's state as omniroute:check reports it (mise.gateway.toml): an inference route answers a made-up
   # key with 401 when the gateway runs requiring its API key (Apple's curl -q --noproxy '*', as every gateway
@@ -574,7 +577,9 @@ if out and missing:
     if {k: v for k, v in got.items() if k not in missing} != have or any(got[k] != want[k] for k in missing):
         sys.exit(3)
     open(out, "wb").write(new)
-print(json.dumps({"state": "read", "missing": missing, "other": other, "profile": prof if isinstance(prof, str) else None, "profile_sets": psets}))' "$1" "$CODEX_DEFAULTS_SRC" ${2:+"$2"}
+effective = {k: pt[k] if isinstance(pt, dict) and k in pt else have.get(k) for k in want}
+sources = {k: "profiles." + prof + "." + k if isinstance(pt, dict) and k in pt else k for k in want}
+print(json.dumps({"state": "read", "missing": missing, "other": other, "profile": prof if isinstance(prof, str) else None, "profile_sets": psets, "effective": effective, "sources": sources}))' "$1" "$CODEX_DEFAULTS_SRC" ${2:+"$2"}
 }
 codex_defaults_row() {
   local c="$CODEX_DIR/config.toml" j
@@ -615,6 +620,73 @@ agy_model_row() {
     invalid) row "agy default model" INVALID "$AGY_SETTINGS is not a JSON object" ;;
     *)       row "agy default model" absent "no $(dirname "$AGY_SETTINGS") (Antigravity not installed)" ;;
   esac
+}
+
+# Runtime TSV contract: seven tab-separated fields, one row per runtime, indented by two spaces.
+# These are configured defaults, not a claim about a running request or a launch override (ADR 0059).
+# Sources read 2026-11-11: Muse's install/configuration pages document --version and launch flags;
+# Antigravity settings.model is a label and may fall back, so its actual model is not reported here.
+# Orca's pinned docs/site/content/docs/cli/{overview,reference}.mdx document no version command.
+# UNVERIFIED fetches: https://www.onorca.dev/docs/cli and https://www.onorca.dev/docs/cli/orchestration
+# were inaccessible;
+# https://raw.githubusercontent.com/deepseek-ai/deepseek-harness/main/README.md returned 404.
+# The pinned Orca docs and DeepSeek apps/cli/{package.json,src/args.ts,src/dump-config.ts} were read instead.
+# runtime_version <command>: its --version, bounded to 10 s the way the maintenance agent bounds a step
+# (/usr/bin/timeout), with stdin closed, so a runtime that waits on a prompt or an update cannot hang --check
+runtime_version() {
+  local v t=()
+  [ -x /usr/bin/timeout ] && t=(/usr/bin/timeout -k 2 10)
+  if ! command -v "$1" >/dev/null 2>&1; then printf 'not reported (%s not on PATH)' "$1"
+  elif v=$(MISE_EXEC_AUTO_INSTALL=false ${t[@]+"${t[@]}"} "$1" --version 2>/dev/null </dev/null | first_line) && [ -n "$v" ]; then printf '%s' "$v"
+  else printf 'not reported (%s --version failed, timed out or returned no output)' "$1"; fi
+}
+runtime_row() {
+  # Keep one physical TSV row even when a settings value contains tabs or newlines.
+  local value
+  printf '  %s' "$1"; shift
+  for value in "$@"; do value=${value//$'\t'/ }; value=${value//$'\n'/ }; printf '\t%s' "$value"; done
+  printf '\n'
+}
+runtimes_rows() {
+  local j model effort ms es label fields v
+  note 'Runtimes (configured defaults; launch and session overrides are not observed):'
+  printf '  RUNTIME\tVERSION\tMODEL\tEFFORT\tVERSION SOURCE\tMODEL SOURCE\tEFFORT SOURCE\n'
+  # settings.json's own env block, which new sessions get, not this process's environment
+  j=$(jq -c '{model, effortLevel, em: (.env.ANTHROPIC_MODEL // null), ee: (.env.CLAUDE_CODE_EFFORT_LEVEL // null)}' \
+        "$CLAUDE_HOME/settings.json" 2>/dev/null) || j='{}'
+  model=$(jq -r '.em // .model // "not reported (settings.model unset or unreadable)"' <<<"$j")
+  effort=$(jq -r '.ee // .effortLevel // "not reported (effortLevel unset; runtime chooses the default)"' <<<"$j")
+  ms='user settings.json model; alias resolution and other scopes not observed'
+  es='user settings.json effortLevel; per-model modelSettings levels, the model default and other scopes not resolved (model-config.md)'
+  [ "$(jq -r '.em // empty' <<<"$j")" = "" ] || ms='user settings.json env.ANTHROPIC_MODEL'
+  [ "$(jq -r '.ee // empty' <<<"$j")" = "" ] || es='user settings.json env.CLAUDE_CODE_EFFORT_LEVEL'
+  v=$(claude_version)
+  [ -n "$v" ] || v='not reported (claude --version failed in ~/.local/bin and on PATH)'
+  runtime_row 'Claude Code' "$v" "$model" "$effort" 'claude --version (~/.local/bin first, then PATH)' "$ms" "$es"
+  j=$(codex_defaults "$CODEX_DIR/config.toml" 2>/dev/null) || j='{}'
+  [ -n "$j" ] || j='{}'
+  model=$(jq -r '.effective.model // "not reported (config model unset or unreadable)"' <<<"$j")
+  effort=$(jq -r '.effective.model_reasoning_effort // "not reported (config effort unset or unreadable)"' <<<"$j")
+  ms=$(jq -r '.sources.model // "model"' <<<"$j"); es=$(jq -r '.sources.model_reasoning_effort // "model_reasoning_effort"' <<<"$j")
+  runtime_row Codex "$(runtime_version codex)" "$model" "$effort" 'codex --version' "config.toml $ms (active profile applied; other scopes not observed)" "config.toml $es"
+  runtime_row 'Muse Code' "$(runtime_version muse)" 'not reported (model defaults key undocumented; per-launch --model)' \
+    'not reported (per-launch --reasoning-effort; no launch observed)' 'muse --version (dev.meta.ai/docs/muse-code)' \
+    'dev.meta.ai/docs/muse-code/configuration' 'dev.meta.ai/docs/muse-code/configuration'
+  if [ ! -e "$AGY_SETTINGS" ]; then label='none, no settings file'
+  else label=$(jq -r '.model // "unset"' "$AGY_SETTINGS" 2>/dev/null) || label=unreadable; fi
+  runtime_row Antigravity "$(runtime_version agy)" "not reported (configured label: $label; availability fallback not observed)" \
+    'not reported (label is not evidence of the selected request effort)' 'agy --version' \
+    'settings.json model; antigravity.google/docs/settings' 'antigravity.google/docs/settings'
+  # Even --dump-config rewrites cordis.yml through prepareProfile; --check must remain read-only.
+  fields='deepseek-harness 1f81c047fc48fa190a683e469daa699857e9afe8 apps/cli/src/profile-boot.ts:194-198'
+  model='not reported (--dump-config rewrites cordis.yml; read-only check does not run it)'
+  runtime_row 'DeepSeek Harness' "$(runtime_version dsh)" "$model" "$model" 'dsh --version' "$fields" "$fields"
+  runtime_row Orca 'not reported (no version command in pinned CLI reference)' 'not reported (host; per-agent launch override)' \
+    'not reported (host; per-agent launch override)' 'Orca pinned CLI overview/reference, read 2026-11-11' \
+    'Orca per-agent launch documentation' 'Orca per-agent launch documentation'
+  runtime_row OmniRoute "${OMNIROUTE_RUNTIME_VERSION:-not reported (version check unavailable)}" 'not applicable (gateway; model supplied by request)' \
+    'not applicable (gateway; effort supplied by request)' 'mise gateway exec -- omniroute --version (gateway row above)' \
+    'OmniRoute OpenAI-compatible request contract, ADR 0056' 'OmniRoute OpenAI-compatible request contract, ADR 0056'
 }
 
 check() {
@@ -667,6 +739,7 @@ check() {
   note "OmniRoute gateway (ADR 0056), optional:"
   omniroute_version_row || missing=1
   omniroute_row || missing=1
+  runtimes_rows
   return "$missing"
 }
 
@@ -943,8 +1016,33 @@ install_runtime_defaults() {
   return "$rc"
 }
 
+# settings_gaps <rendered settings.json> <live settings.json>: what the live file lacks of the template, one
+# per line; nothing when it holds every key the template sets with the same value (objects compared key by
+# key, so the owner's own keys and env variables are no gap) and every hook entry the template proposes,
+# present by event, matcher and command (another tool's entries beside them are no gap). When an event fires,
+# "its matching hooks run in parallel" (https://code.claude.com/docs/en/hooks.md, read 2026-11-11), so an
+# extra entry does not displace canon's. A proposed hook entry counts as present only with every field the
+# template gives it (command, type, async, timeout). Known limit: a hook entry a later template drops is left
+# in the live file and not named; retiring one is a RETIRED-style step of its own. Exits non-zero when the
+# live file is not a JSON object.
+settings_gaps() {
+  # shellcheck disable=SC2016  # jq program, not shell
+  jq -r --slurpfile w "$1" '
+    def gaps($t; $l; $p):
+      if ($t | type) == "object" and ($l | type) == "object"
+      then $t | to_entries[] | .key as $k | gaps(.value; $l[$k]; $p + [$k])
+      elif $t == $l then empty else $p | join(".") end;
+    def contains_all($x): all(to_entries[]; .key as $k | $x[$k] == .value);   # every field the template gives
+    if type != "object" then error("not a JSON object") else . end
+    | . as $l | $w[0] as $t
+    | gaps($t | del(.hooks); $l | del(.hooks); []),
+      ($t.hooks // {} | to_entries[] | .key as $ev | .value[] | (.matcher // "") as $m | .hooks[]? as $h
+       | select(any(($l.hooks[$ev] // [])[]?; (.matcher // "") == $m and any(.hooks[]?; . as $x | $h | contains_all($x))) | not)
+       | "hook \($ev)\(if $m != "" then " (matcher \($m))" else "" end) \($h.command)")' "$2"
+}
+
 install_user_config() {
-  local src="$ROOT/home/.claude" pending=0 f dst bak tmp
+  local src="$ROOT/home/.claude" pending=0 f dst bak tmp gaps
   case "$CLAUDE_HOME" in /*) ;; *) die "CLAUDE_CONFIG_DIR must be an absolute path (got: $CLAUDE_HOME)" ;; esac
   unquotable "$CLAUDE_HOME" && die "CLAUDE_CONFIG_DIR holds a quote, \$, backquote, backslash or newline, which the hook commands cannot quote: $CLAUDE_HOME"
   command -v jq >/dev/null 2>&1 || die "jq not found"
@@ -970,6 +1068,15 @@ install_user_config() {
       cp "$from" "$CLAUDE_HOME/$f"; note "  installed  $CLAUDE_HOME/$f"
     elif cmp -s "$from" "$CLAUDE_HOME/$f"; then
       note "  unchanged  $CLAUDE_HOME/$f"
+    elif [ "$f" = settings.json ] && gaps=$(settings_gaps "$from" "$CLAUDE_HOME/$f" 2>/dev/null) && [ -z "$gaps" ]; then
+      note "  unchanged  $CLAUDE_HOME/$f"   # a superset of the template: nothing to merge
+      if [ -e "$CLAUDE_HOME/$f.canon-proposed" ]; then
+        rm -f "${CLAUDE_HOME:?}/$f.canon-proposed"; note "  removed    $f.canon-proposed, an earlier run's copy, since nothing is left to merge"
+      fi
+    elif [ "$f" = settings.json ]; then
+      cp "$from" "$CLAUDE_HOME/$f.canon-proposed"; pending=1
+      [ -n "$gaps" ] || gaps="not a readable JSON object"
+      note "  EXISTS     $CLAUDE_HOME/$f differs from the template: $(printf '%s\n' "$gaps" | paste -sd ';' - | sed 's/;/; /g'); wrote $f.canon-proposed beside it. Merge by hand."
     else
       cp "$from" "$CLAUDE_HOME/$f.canon-proposed"; pending=1
       note "  EXISTS     $CLAUDE_HOME/$f differs; wrote $f.canon-proposed beside it. Merge by hand."
