@@ -309,3 +309,125 @@ def test_stream_stand_in_matches_alpaca_py(make, alpaca) -> None:
     stream.register_trade_cancels(handler)
     stream.register_trade_corrections(handler)
     stream.unsubscribe_trades("AAPL")
+
+
+def running_stream(make: str, alpaca, monkeypatch):
+    """A stream to drive on a thread of its own: alpaca-py's real one on a `MemorySocket`, or the
+    stand-in, with what each shows of the venue side and whether it counts as running."""
+    if make == "real":
+        stream, socket = alpaca.memory_stream(monkeypatch)
+        return stream, (lambda: socket.wire), (lambda: stream._running), socket
+    stream = alpaca.Stream()
+    stream.quotes, stream.trades = [], []
+    return stream, (lambda: stream.wire), stream.running.is_set, None
+
+
+def wait_for(condition, timeout: float = 5.0) -> None:
+    import time
+
+    deadline = time.monotonic() + timeout
+    while not condition():
+        assert time.monotonic() < deadline, "condition not met in time"
+        time.sleep(0.005)
+
+
+@pytest.mark.parametrize("make", ["real", "stand-in"])
+def test_stream_stand_in_sends_an_unsubscribe_only_while_running(make, alpaca, monkeypatch) -> None:
+    """alpaca-py's `_unsubscribe` sends only while running; before, it only deletes the handlers."""
+    stream, wire, _, socket = running_stream(make, alpaca, monkeypatch)
+
+    async def handler(_: object) -> None: ...
+
+    stream.subscribe_quotes(handler, "AAPL")
+    stream.unsubscribe_quotes("AAPL")
+
+    sent = socket.sent if socket is not None else stream.unsubscribed
+    assert sent == []
+    assert wire() == {"quotes": set(), "trades": set()}
+
+
+@pytest.mark.parametrize("make", ["real", "stand-in"])
+def test_stream_stand_in_stops_one_run_at_a_time(make, alpaca, monkeypatch) -> None:
+    """alpaca-py's `stop()` before any run keeps the first from starting; between runs it does nothing,
+    and the next `run()` starts and waits for a subscription."""
+    import threading
+
+    stream, _, _, _ = running_stream(make, alpaca, monkeypatch)
+    stream.stop()  # before the first run
+    first = threading.Thread(target=stream.run, daemon=True)
+    first.start()
+    first.join(2)
+    assert not first.is_alive()
+
+    stream.stop()  # between runs
+    second = threading.Thread(target=stream.run, daemon=True)
+    second.start()
+    try:
+        second.join(0.2)
+        assert second.is_alive()  # not stopped by the stop before it
+    finally:
+        stream.stop()
+        second.join(2)
+    assert not second.is_alive()
+
+
+@pytest.mark.parametrize("make", ["real", "stand-in"])
+def test_stream_stand_in_misses_a_subscribe_made_while_it_connects(
+    make, alpaca, monkeypatch
+) -> None:
+    """alpaca-py's `_drive_run` sends the handler maps as they are when it connects and only then counts
+    as running, and `_subscribe` sends only while running: a subscribe made in between is not sent
+    until a later subscribe sends the maps again."""
+    import threading
+
+    stream, wire, running, socket = running_stream(make, alpaca, monkeypatch)
+    gate = threading.Event()
+    if socket is not None:
+        socket.gate, held = gate, socket.holding
+    else:
+        stream.snapshot_gate, held = gate, stream.snapshot_taken
+
+    async def handler(_: object) -> None: ...
+
+    thread = threading.Thread(target=stream.run, daemon=True)
+    thread.start()
+    try:
+        stream.subscribe_quotes(handler, "AAPL")
+        wait_for(held.is_set)
+        stream.subscribe_trades(handler, "AAPL")  # after the maps were taken, before running
+        gate.set()
+        wait_for(running)
+        assert wire() == {"quotes": {"AAPL"}, "trades": set()}
+        stream.subscribe_quotes(handler, "MSFT")  # running: the maps are sent whole
+        assert wire() == {"quotes": {"AAPL", "MSFT"}, "trades": {"AAPL"}}
+    finally:
+        gate.set()
+        stream.stop()
+        thread.join(7)
+    assert not thread.is_alive()
+
+
+def test_stand_in_api_errors_carry_their_http_status(alpaca) -> None:
+    """The stand-ins raise `APIError` with the status alpaca-py reads from the HTTP error, as
+    `test_api_error_status_comes_from_the_http_error` shows the real client does: 404 for an asset not
+    found ("Get an Asset"), and a 422 for the bars stand-in's inverted window."""
+    from datetime import UTC
+    from datetime import datetime
+
+    from alpaca.common.exceptions import APIError
+    from alpaca.data.requests import StockBarsRequest
+    from alpaca.data.timeframe import TimeFrame
+
+    with pytest.raises(APIError) as missing:
+        alpaca.TradingClient().get_asset("MSFT")
+    assert (missing.value.status_code, missing.value.code) == (404, 40410000)
+
+    inverted = StockBarsRequest(
+        symbol_or_symbols="AAPL",
+        timeframe=TimeFrame.Hour,
+        start=datetime(2026, 1, 2, tzinfo=UTC),
+        end=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    with pytest.raises(APIError) as refused:
+        alpaca.HistoricalClient().get_stock_bars(inverted)
+    assert (refused.value.status_code, refused.value.code) == (422, 42210000)

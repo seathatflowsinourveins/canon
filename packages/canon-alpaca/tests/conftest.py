@@ -47,16 +47,20 @@ import traceback
 import uuid
 from collections.abc import Awaitable
 from collections.abc import Callable
+from collections.abc import Iterable
 from datetime import UTC
 from datetime import datetime
 from datetime import time
 from datetime import timedelta
 from types import SimpleNamespace
+from typing import Any
+from typing import cast
 from zoneinfo import ZoneInfo
 
 import pytest
 import requests
 from alpaca.common.exceptions import APIError
+from alpaca.data.live.stock import StockDataStream
 from alpaca.data.models import BarSet
 from alpaca.data.models import Quote
 from alpaca.data.models import Trade
@@ -392,7 +396,7 @@ class FakeTradingClient:
         for a in self.assets:
             if a["symbol"] == symbol_or_asset_id:
                 return Asset.model_validate(a)
-        raise APIError('{"code": 40410000, "message": "asset not found"}')
+        raise api_error(404, 40410000, "asset not found")
 
 
 class FakeOrdersClient(FakeTradingClient):
@@ -784,7 +788,7 @@ class FakeHistoricalClient:
             end = now.replace(tzinfo=None)
         if start > end:
             # The reference does not say what Alpaca answers; refusing makes an inverted window visible.
-            raise APIError('{"code": 42210000, "message": "start is after end (stand-in)"}')
+            raise api_error(422, 42210000, "start is after end (stand-in)")
         selected = []
         for raw in sorted(self.bars, key=lambda b: b["t"]):
             opened = datetime.fromisoformat(raw["t"]).replace(tzinfo=None)
@@ -796,22 +800,30 @@ class FakeHistoricalClient:
 class FakeStream:
     """Stands in for `StockDataStream`: `run()` blocks on its own asyncio loop until `stop()`.
 
-    While running, it sends each message in `quotes` to the handler subscribed for that message's symbol,
-    and each in `trades` (then, after them, those in `trade_events`, cancels and corrections) to the trade
-    handler, once per subscription, the way alpaca-py's stream awaits a coroutine handler per message.
-    Cancels and corrections go to the handlers set with `register_trade_cancels` and
-    `register_trade_corrections`, which alpaca-py keys under "*". With `ends_on_its_own`, `run()` returns
-    after its first delivery without a `stop()`, as alpaca-py's does after an insufficient-subscription
-    error. With `ignores_stop`, `run()` keeps going after `stop()` until `release` is set. With `refused`
-    set, `run()` logs it as alpaca-py's `_drive_run` logs an authentication error, on its stream logger
-    and thread, and returns without delivering, as it does for "insufficient subscription".
+    The venue side is modelled as Alpaca's stream documents it ("Streaming Market Data": the server
+    keeps the subscriptions each subscribe message adds and each unsubscribe removes): `wire` holds what
+    has been sent, and while running the stand-in sends each message in `quotes` to the handler for that
+    message's symbol, and each in `trades` (then, after them, those in `trade_events`, cancels and
+    corrections) to the trade handler, once per symbol on the wire per connection, the way alpaca-py's
+    `_dispatch` awaits a coroutine handler per message. Cancels and corrections go to the handlers set
+    with `register_trade_cancels` and `register_trade_corrections`, which alpaca-py keys under "*". With
+    `ends_on_its_own`, `run()` returns after its first delivery without a `stop()`, as alpaca-py's does
+    after an insufficient-subscription error. With `ignores_stop`, `run()` keeps going after `stop()`
+    until `release` is set. With `refused` set, `run()` logs it as alpaca-py's `_drive_run` logs an
+    authentication error, on its stream logger and thread, and returns without delivering, as it does
+    for "insufficient subscription".
 
-    As in alpaca-py 0.45.0 (`DataStream._subscribe`, `_unsubscribe`, `_ensure_coroutine`, `_drive_run`): a
-    handler that is not a coroutine function raises `ValueError`; a subscribe records its handlers and then
-    sends; an unsubscribe sends first and deletes its handlers only if the send succeeded, and deleting a
-    symbol never subscribed raises `KeyError`. `run()` connects, and `running` is set, only once something
-    is subscribed, and sends are made only while running. With `send_error` set, every send raises it. A
-    symbol unsubscribed and subscribed again is served again.
+    As in alpaca-py 0.45.0 (`DataStream._subscribe`, `_send_subscribe_msg`, `_unsubscribe`,
+    `_ensure_coroutine`, `_drive_run`, `stop`): a handler that is not a coroutine function raises
+    `ValueError`; a subscribe records its handlers and then, only while running, sends every handler map
+    whole; an unsubscribe sends only while running, and deletes its handlers only if that succeeded, and
+    deleting a symbol never subscribed raises `KeyError`. `run()` connects only once something is
+    subscribed, sends the maps as they are then, and only after that counts as running, so a subscribe
+    made between the two is not sent (`snapshot_gate` holds the stand-in there, as a slow send would
+    hold alpaca-py's). `stop()` stops the current run, or, before any run, the first; between runs it
+    does nothing, and a later `run()` starts again. With `send_gate`, each send while running sets
+    `sending` and waits for it. With `send_error` set, every send raises it. A symbol unsubscribed and
+    subscribed again is served again.
     """
 
     def __init__(self) -> None:
@@ -820,6 +832,10 @@ class FakeStream:
         self.ignores_stop = False
         self.release = threading.Event()
         self.send_error: Exception | None = None
+        self.send_gate: threading.Event | None = None
+        self.sending = threading.Event()
+        self.snapshot_gate: threading.Event | None = None
+        self.snapshot_taken = threading.Event()
         self.quotes: list[Callable[[], Message]] = [quote]
         self.trades: list[Callable[[], Message]] = [trade]
         self.trade_events: list[Callable[[], Message]] = []
@@ -827,31 +843,67 @@ class FakeStream:
         self.trade_handlers: dict[str, Handler] = {}
         self.cancel_handlers: dict[str, Handler] = {}
         self.correction_handlers: dict[str, Handler] = {}
-        self.unsubscribed: list[tuple[str, tuple[str, ...]]] = []
+        self.wire: dict[str, set[str]] = {"quotes": set(), "trades": set()}
+        self.unsubscribed: list[tuple[str, tuple[str, ...]]] = []  # unsubscribes sent
         self.run_threads: list[str] = []
         self.running = threading.Event()
         self.finished = threading.Event()
-        self.stopped = threading.Event()
+        self.stopped = threading.Event()  # stop() was called, for tests to read
+        self.max_active = 0  # the most subscribe or unsubscribe calls inside the stand-in at once
+        self._active = 0
+        self._lock = threading.Lock()
+        self._run_stop: threading.Event | None = None  # the current run's stop
+        self._started_once = False
+        self._stop_before_first_run = False
         self._changed = threading.Event()
-        self._sent: set[tuple[str, str]] = set()  # (channel, symbol) served since it was subscribed
+        self._sent: set[tuple[str, str]] = set()  # (channel, symbol) served on this connection
+
+    def _enter(self) -> None:
+        with self._lock:
+            self._active += 1
+            self.max_active = max(self.max_active, self._active)
+
+    def _leave(self) -> None:
+        with self._lock:
+            self._active -= 1
 
     def _send(self) -> None:
-        if self.running.is_set() and self.send_error is not None:
+        if self.send_gate is not None:
+            self.sending.set()
+            assert self.send_gate.wait(10), "send gate never opened"
+        if self.send_error is not None:
             raise self.send_error
+
+    def _snapshot(self) -> None:
+        """What `_send_subscribe_msg` sends: every handler map, whole; the server adds them."""
+        self.wire["quotes"].update(self.quote_handlers)
+        self.wire["trades"].update(self.trade_handlers)
 
     def _subscribe(self, handler: Handler, symbols: tuple[str, ...], handlers: dict) -> None:
         if not inspect.iscoroutinefunction(handler):
             raise ValueError("handler must be a coroutine function")
-        handlers.update(dict.fromkeys(symbols, handler))
-        self._changed.set()
-        self._send()
+        self._enter()
+        try:
+            handlers.update(dict.fromkeys(symbols, handler))
+            self._changed.set()
+            if self.running.is_set():
+                self._send()
+                self._snapshot()
+        finally:
+            self._leave()
 
     def _unsubscribe(self, channel: str, symbols: tuple[str, ...], handlers: dict) -> None:
-        self._send()
-        self.unsubscribed.append((channel, symbols))
-        for s in symbols:
-            del handlers[s]
-            self._sent.discard((channel, s))
+        self._enter()
+        try:
+            if self.running.is_set():
+                self._send()
+                self.unsubscribed.append((channel, symbols))
+                self.wire[channel].difference_update(symbols)
+            for s in symbols:
+                del handlers[s]
+                self._sent.discard((channel, s))
+        finally:
+            self._leave()
 
     def subscribe_quotes(self, handler: Handler, *symbols: str) -> None:
         self._subscribe(handler, symbols, self.quote_handlers)
@@ -872,15 +924,32 @@ class FakeStream:
         self._unsubscribe("trades", symbols, self.trade_handlers)
 
     def run(self) -> None:
+        stop = threading.Event()
+        with self._lock:
+            self._run_stop = stop
+            if self._stop_before_first_run:
+                stop.set()
+                self._stop_before_first_run = False
+            self._started_once = True
         self.run_threads.append(threading.current_thread().name)
         try:
-            asyncio.run(self._serve())
+            asyncio.run(self._serve(stop))
         finally:
             self.running.clear()
+            with self._lock:
+                if self._run_stop is stop:
+                    self._run_stop = None
             self.finished.set()
 
     def stop(self) -> None:
         self.stopped.set()
+        with self._lock:
+            run = self._run_stop
+            if run is None:
+                if not self._started_once:
+                    self._stop_before_first_run = True
+                return
+        run.set()
         self._changed.set()
 
     def _handler_for(self, message: Message) -> Handler | None:
@@ -893,11 +962,10 @@ class FakeStream:
         symbol = message.symbol
         return channel.get(symbol, channel.get("*"))
 
-    async def _serve(self) -> None:
-        sent = self._sent
-        # alpaca-py waits for a market subscription before it connects, and then counts as running.
+    async def _serve(self, stop: threading.Event) -> None:
+        # alpaca-py waits for a market subscription before it connects.
         while not (self.quote_handlers or self.trade_handlers):
-            if self.stopped.is_set():
+            if stop.is_set():
                 return
             self._changed.clear()
             await asyncio.to_thread(self._changed.wait, 0.05)
@@ -906,25 +974,112 @@ class FakeStream:
                 f"error during websocket communication: {self.refused}"
             )
             return
+        # A new connection: the server holds nothing until the maps are sent, then counts as running.
+        self.wire = {"quotes": set(), "trades": set()}
+        self._sent.clear()
+        self._snapshot()
+        self.snapshot_taken.set()
+        if self.snapshot_gate is not None:
+            assert await asyncio.to_thread(self.snapshot_gate.wait, 10), (
+                "snapshot gate never opened"
+            )
         self.running.set()
-        while not self.stopped.is_set() or (self.ignores_stop and not self.release.is_set()):
-            for channel, handlers, builders in (
-                ("quotes", self.quote_handlers, self.quotes),
-                ("trades", self.trade_handlers, self.trades + self.trade_events),
+        sent = self._sent
+        while not stop.is_set() or (self.ignores_stop and not self.release.is_set()):
+            for channel, builders in (
+                ("quotes", self.quotes),
+                ("trades", self.trades + self.trade_events),
             ):
-                for symbol in list(handlers):
+                for symbol in sorted(self.wire[channel]):
                     if (channel, symbol) in sent:
                         continue
-                    sent.add((channel, symbol))
+                    sent.add((channel, symbol))  # the server's messages for it, once
                     for build in builders:
                         message = build()
+                        if message.symbol != symbol:
+                            continue  # the server sends a symbol's messages only for it
                         handler = self._handler_for(message)
-                        if message.symbol == symbol and handler is not None:
+                        if handler is not None:
                             await handler(message)
             if self.ends_on_its_own and sent:
                 return
             self._changed.clear()
             await asyncio.to_thread(self._changed.wait, 0.05)
+
+
+class MemorySocket:
+    """In place of the websocket under alpaca-py 0.45.0's real `DataStream`, so its own `_drive_run`,
+    `_subscribe`, `_unsubscribe` and `_dispatch` run offline (`memory_stream`).
+
+    alpaca-py packs each message with msgpack; `memory_stream` swaps the module's `msgpack` for one
+    that passes the message through, so what alpaca-py sends is read as the dict it built. `sent` holds
+    each message in order; `wire` is what the server would hold from them. With `gate` set, the next send
+    sets `holding` and waits for it, after alpaca-py has built the message. `recv` hands over what
+    `deliver` queued, as a list of messages as the server batches them, or times out after 20 ms, which
+    `_consume` treats as no data and goes round again."""
+
+    def __init__(self) -> None:
+        self.sent: list[dict] = []
+        self.gate: threading.Event | None = None
+        self.holding = threading.Event()
+        self.closed = False
+        self._incoming: queue.Queue[list[dict]] = queue.Queue()
+
+    @property
+    def wire(self) -> dict[str, set[str]]:
+        held: dict[str, set[str]] = {"quotes": set(), "trades": set()}
+        for message in self.sent:
+            for channel, symbols in held.items():
+                if message["action"] == "subscribe":
+                    symbols.update(message.get(channel, []))
+                else:
+                    symbols.difference_update(message.get(channel, []))
+        return held
+
+    def deliver(self, *messages: dict) -> None:
+        self._incoming.put(list(messages))
+
+    async def send(self, frames: object) -> None:
+        messages: list[dict] = []
+        if isinstance(frames, list):  # `_send_unsubscribe_msg` sends one packed message
+            messages.extend(frames)
+        else:  # `_send_subscribe_msg` sends it as frames, each a slice of the packed message
+            for frame in cast("Iterable[list[dict]]", frames):
+                messages.extend(frame)
+        self.sent.extend(messages)
+        gate, self.gate = self.gate, None
+        if gate is not None:
+            self.holding.set()
+            assert await asyncio.to_thread(gate.wait, 10), "socket gate never opened"
+
+    async def recv(self) -> list[dict]:
+        try:
+            return self._incoming.get_nowait()
+        except queue.Empty:
+            await asyncio.sleep(0.02)
+            raise TimeoutError from None
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+def memory_stream(monkeypatch: pytest.MonkeyPatch) -> tuple[StockDataStream, MemorySocket]:
+    """alpaca-py's real `StockDataStream` on a `MemorySocket`: no network, no credentials.
+
+    Only the connection and authentication (`_start_ws`) and msgpack are replaced; everything that
+    subscribes, sends and dispatches is alpaca-py's."""
+    import alpaca.data.live.websocket
+
+    passthrough = SimpleNamespace(packb=lambda message: [dict(message)], unpackb=lambda raw: raw)
+    monkeypatch.setattr(alpaca.data.live.websocket, "msgpack", passthrough)
+    stream = StockDataStream(api_key="offline-placeholder", secret_key="offline-placeholder")
+    socket = MemorySocket()
+
+    async def start_ws() -> None:
+        stream._ws = cast("Any", socket)  # a websocket's `send`, `recv` and `close`, in memory
+
+    stream._start_ws = start_ws
+    return stream, socket
 
 
 @pytest.hookimpl(wrapper=True)
@@ -979,4 +1134,5 @@ def alpaca() -> SimpleNamespace:
         TradeStream=FakeTradeStream,
         HistoricalClient=FakeHistoricalClient,
         Stream=FakeStream,
+        memory_stream=memory_stream,
     )
