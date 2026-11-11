@@ -413,3 +413,41 @@ def test_a_key_of_another_writer_s_form_does_not_crash_the_plan_check(
 
     assert isinstance(outcome, RankingStopped), outcome
     assert f"#{odd.number} (running) has no config key" in str(outcome)
+
+
+def test_a_tell_refused_after_the_run_is_a_failure_the_pass_goes_on_from(
+    alpaca_bars: AlpacaBars, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A `tell` refused after a run's outcome now keeps that outcome, told `FAIL` with its error, and
+    a pass read it as a failure never written and stopped, leaving the rest of the grid unrecorded."""
+    write_both(alpaca_bars, tmp_path / "catalog")
+    configs = grid(periods=SHORT)
+    real_tell = optuna.Study.tell
+    refusals = [1]
+
+    def refused_once(self: optuna.Study, *args: Any, **kwargs: Any) -> object:
+        if refusals[0] and "state" not in kwargs:  # the first tell of a value, after a run
+            refusals[0] -= 1
+            raise OSError("database is locked")
+        return real_tell(self, *args, **kwargs)
+
+    monkeypatch.setattr(optuna.Study, "tell", refused_once)
+    recorded, _ = run_study(
+        tmp_path / "catalog",
+        name="s",
+        ledger_path=tmp_path / "trials.db",
+        configs=configs,
+        start=START,
+        end=END,
+        create=True,
+    )
+    monkeypatch.undo()
+
+    assert refusals == [0], "no value was told, so the refusal never fired"
+    assert recorded is not None
+    assert len(recorded.recorded) == len(configs) - 1
+    [failure] = recorded.failed
+    assert "database is locked" in failure
+    with open_study("s", tmp_path / "trials.db") as study:
+        [refused] = [t for t in study.trials if "error" in t.user_attrs]
+        assert (refused.state, refused.user_attrs[OUTCOME]) == (TrialState.FAIL, TRADED)

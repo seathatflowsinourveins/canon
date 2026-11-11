@@ -75,6 +75,12 @@ Who decided. The orchestrator chose option 3 and the terms under the owner's del
 * A keyed record in a state and outcome `record_trial` never leaves stops for good, and no later record
   resolves it (`test_a_keyed_record_with_a_result_and_no_outcome_stops_for_good`,
   `test_a_record_that_ran_in_a_state_the_writer_never_tells_stops`), tests that failed before their fix.
+* A fifth review's case, tests that failed before their fix: a record whose stored `config` does not
+  hash to its key, one that ran (as a fourth configuration under the first's key, or as the pick) or
+  one that failed, stops the ranking for good, named, on any sample
+  (`test_a_record_whose_config_is_not_the_one_its_key_hashes_stops`,
+  `test_a_pick_whose_config_is_another_configuration_s_stops`,
+  `test_a_failed_record_whose_config_is_not_its_key_s_stops`).
 
 ## Evidence
 
@@ -128,3 +134,9 @@ Term numbers are ADR 0035's.
   and outcome `record_trial` never leaves, a result (`COMPLETE`, `PRUNED`, a value or an intermediate
   value; Optuna 5.0.0 `trial/_state.py`, `bundled`) or a suggested parameter among them. Reproduced as
   failing tests. No change of decision.
+* A fifth review of the gate, 2026-11-10, by a second reader: term 4's key was never checked against
+  the `config` stored beside it, so another writer's record could take a configuration's place under
+  another's key and lower N (four configurations ranked as N = 3 and passed). The ranking now hashes
+  every stored `config` and stops on one that is not its key's. The eight step 7 records hash to their
+  keys (read from a backup copy of the shared ledger, run). Reproduced as failing tests. No change of
+  decision.

@@ -21,6 +21,7 @@ reported: the passing case's mean correlation between trials is 0.11226, so N̂ 
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import itertools
 import math
@@ -38,19 +39,22 @@ from optuna.trial import TrialState
 from skfolio import Portfolio
 from skfolio import measures
 
+from canon_trading import ranking
 from canon_trading.ledger import DAY_NS
 from canon_trading.ledger import FAILED
 from canon_trading.ledger import IDLE
 from canon_trading.ledger import OUTCOME
 from canon_trading.ledger import TRADED
+from canon_trading.ledger import config_key
 from canon_trading.ledger import create_ledger_study
 from canon_trading.ledger import current_sample
 from canon_trading.ledger import mark_not_run
 from canon_trading.ledger import move_sample
 from canon_trading.ledger import open_study
+from canon_trading.ranking import SHA256_HEX
 from canon_trading.ranking import THRESHOLD
+from canon_trading.ranking import RankingReport
 from canon_trading.ranking import RankingStopped
-from canon_trading.ranking import rank
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -77,9 +81,42 @@ def study(tmp_path: Path) -> Iterator[optuna.Study]:
         yield opened
 
 
+def config_of(label: str) -> dict[str, object]:
+    """A stored config for the configuration named `label`, in the part of its form the gate reads."""
+    return {"label": label, "data": {"data_type": "Bar", "bar_types": [f"bars of {label}"]}}
+
+
+# Each key `key_of` made, mapped back to its label, so a message reads "pick: ..." for the test.
+LABELS: dict[str, str] = {}
+
+
+def key_of(label: str) -> str:
+    """The key `record_trial` would write for `config_of(label)`: the hash of the config it stores."""
+    key = config_key(config_of(label))
+    LABELS[key] = label
+    return key
+
+
+def labelled(text: str) -> str:
+    """`text` with each key `key_of` made shown as its label (the keys are 64 hex digits, never a
+    word, so no other text is touched)."""
+    return SHA256_HEX.sub(lambda found: LABELS.get(found.group(), found.group()), text)
+
+
+def rank(study: optuna.Study) -> RankingReport:
+    """`canon_trading.ranking.rank`, its keys shown as the labels the tests wrote them under."""
+    try:
+        report = ranking.rank(study)
+    except RankingStopped as stopped:
+        raise RankingStopped(labelled(str(stopped))) from stopped
+    return dataclasses.replace(
+        report, pick=labelled(report.pick), tied=tuple(map(labelled, report.tied))
+    )
+
+
 def write(
     study: optuna.Study,
-    key: str | None,
+    label: str | None,
     returns: list[float] | None,
     *,
     outcome: str = TRADED,
@@ -91,11 +128,23 @@ def write(
     attrs: dict[str, object] | None = None,
     drop: tuple[str, ...] = (),
 ) -> int:
-    """Record one trial as the ledger does; `returns` start at day `first_day`.
+    """Record one trial of the configuration `label` as the ledger does; `returns` start at day `first_day`.
 
-    The run's bounds are the current sample's, as `record_trial` writes them. `attrs` then replaces
-    attributes and `drop` leaves some out, for a record not in that shape.
+    Its key is the hash of the config it stores, `config_of(label)` or the one `attrs` gives, shown
+    as `label` in what `rank` says, and the run's bounds are the current sample's, as `record_trial`
+    writes them. `attrs` then replaces attributes and `drop` leaves some out, for a record not in that
+    shape; a `config_key` in `attrs` replaces the key, for a record whose config is not its key's.
     """
+    key = None if label is None else key_of(label)
+    stored = (attrs or {}).get("config")
+    if (
+        label is not None
+        and isinstance(stored, dict)
+        and "config" not in drop
+        and "config_key" not in (attrs or {})
+    ):
+        key = config_key(stored)
+        LABELS[key] = label
     trial = study.ask()
     if key is not None:
         trial.set_user_attr("config_key", key)
@@ -116,8 +165,8 @@ def write(
         "backtest_end": bounds.end,
         "returns_series": {str(d): value for d, value in zip(days, returns or [], strict=True)},
         "session_days": [str(d) for d in calendar],
-        "data_digest": {f"bars of {key}": hashlib.sha256(str(key).encode()).hexdigest()},
-        "config": {"data": {"data_type": "Bar", "bar_types": [f"bars of {key}"]}},
+        "data_digest": {f"bars of {label}": hashlib.sha256(str(label).encode()).hexdigest()},
+        "config": config_of(str(label)),
     }
     written.update(attrs or {})
     for name, value in written.items():
@@ -632,7 +681,13 @@ def test_a_data_digest_not_in_the_writers_shape_stops_naming_it(study: optuna.St
         optuna.trial.create_trial(
             state=TrialState.COMPLETE,
             value=0.0,
-            user_attrs={**trial.user_attrs, "config_key": "other", "data_digest": {"BT": ["x"]}},
+            user_attrs={
+                **trial.user_attrs,
+                "config_key": key_of("other"),
+                "run_config_id": key_of("other"),
+                "config": config_of("other"),
+                "data_digest": {"BT": ["x"]},
+            },
         )
     )
 
@@ -1073,3 +1128,115 @@ def test_a_record_that_ran_with_no_config_in_the_writers_form_stops(
 
     with pytest.raises(RankingStopped, match=rf"third: #{number} [^\n]*config [^\n]*bar types"):
         rank(study)
+
+
+def test_a_record_whose_config_is_not_the_one_its_key_hashes_stops(study: optuna.Study) -> None:
+    """A second reader: four configurations, the fourth recorded under the first's key with its
+    returns, ranked as N = 3 and passed; nothing checked that a key is the hash of its config."""
+    write(study, "pick", PICK)
+    write(study, "second", SECOND)
+    write(study, "third", THIRD_CLOSE)
+    [first] = [t for t in study.trials if t.number == 0]
+    fourth = {**config_of("fourth"), "data": config_of("pick")["data"]}
+    number = write(
+        study,
+        "fourth",
+        PICK,
+        attrs={
+            "config_key": key_of("pick"),
+            "run_config_id": key_of("pick"),
+            "data_digest": first.user_attrs["data_digest"],
+            "config": fourth,
+        },
+    )
+
+    with pytest.raises(RankingStopped) as stopped:
+        rank(study)
+    assert re.search(
+        rf"\* pick: #{number} \(traded\) [^\n]*config [^\n]*hashes to "
+        rf"{config_key(fourth)}",
+        str(stopped.value),
+    ), stopped.value
+
+
+def test_a_pick_whose_config_is_another_configuration_s_stops(study: optuna.Study) -> None:
+    """A second reader: the pick's stored config replaced by another configuration's, with the bar
+    types its digest names kept, was accepted as the pick."""
+    write(study, "pick", PICK)
+    write(study, "second", SECOND)
+    other = {**config_of("other"), "data": config_of("pick")["data"]}
+    number = write(
+        study,
+        "pick",
+        PICK,
+        attrs={"config": other, "config_key": key_of("pick"), "run_config_id": key_of("pick")},
+    )
+
+    with pytest.raises(RankingStopped, match=rf"pick: #{number} [^\n]*hashes to"):
+        rank(study)
+
+
+def test_a_failed_record_whose_config_is_not_its_key_s_stops(study: optuna.Study) -> None:
+    """A failed record is resolved by a later one of its key, but one whose config is another
+    configuration's was not written by `record_trial`, and would drop that configuration from N."""
+    write(study, "pick", PICK)
+    write(study, "second", SECOND)
+    trial = study.ask()
+    trial.set_user_attr("config_key", key_of("pick"))
+    trial.set_user_attr("sample", 0)
+    trial.set_user_attr("config", config_of("third"))
+    trial.set_user_attr(OUTCOME, FAILED)
+    study.tell(trial, state=TrialState.FAIL)
+    write(study, "pick", PICK)
+
+    with pytest.raises(RankingStopped, match=rf"pick: #{trial.number} [^\n]*hashes to"):
+        rank(study)
+
+
+def test_a_record_left_running_after_its_outcome_ran_and_is_compared(study: optuna.Study) -> None:
+    """A second reader: a record whose `tell` failed after its outcome was written read as cut short,
+    so a later record of its key resolved it and the returns it had read were never compared."""
+    write(study, "second", SECOND)
+    later = write(study, "pick", PICK)
+    [done] = [t for t in study.trials if t.number == later]
+    left = study.ask()
+    for name, value in done.user_attrs.items():
+        left.set_user_attr(name, value)
+    left.set_user_attr("returns_series", {**done.user_attrs["returns_series"], str(DAY_0): 0.02})
+    write(study, "pick", PICK)
+
+    with pytest.raises(
+        RankingStopped, match=rf"pick: records #{later} \(traded\), #{left.number} \(traded\) ran"
+    ):
+        rank(study)
+
+
+@pytest.mark.parametrize(
+    ("state", "ran"),
+    [
+        (TrialState.COMPLETE, True),
+        (TrialState.FAIL, True),
+        (TrialState.RUNNING, True),
+        (TrialState.WAITING, False),
+        (TrialState.PRUNED, False),
+    ],
+)
+def test_an_outcome_is_a_run_only_in_a_state_the_writer_leaves(
+    state: TrialState, ran: bool
+) -> None:
+    """A traded record `WAITING` or `PRUNED` is no run of the writer's: read as one, a plan would
+    never run its key again, though the gate stops on it for good."""
+    trial = optuna.trial.FrozenTrial(
+        number=0,
+        state=state,
+        value=None,
+        datetime_start=None,
+        datetime_complete=None,
+        params={},
+        distributions={},
+        user_attrs={OUTCOME: TRADED},
+        system_attrs={},
+        intermediate_values={},
+        trial_id=0,
+    )
+    assert ranking.ran_to_the_end(trial) is ran

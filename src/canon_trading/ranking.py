@@ -24,9 +24,11 @@ pass undeflated. A return that is not finite is refused, for every trial, by
 `canon_trading.returns_matrix`.
 It also stops on what ADR 0054 terms 5 and 6, ADR 0041 and ADR 0053 add: a configuration with a failed or
 `RUNNING` record that no later record of it resolves (a record with a key and no sample number is
-read as on the current sample, unless it ran), an idle one, records of one configuration that
+read as on the current sample, unless it ran; one with outcome traded or idle ran, in any state
+`record_trial` leaves, `RUNNING` included, since the outcome is written last), an idle one, records of one configuration that
 disagree (their outcome included), one not run on the study's current sample, returns ADR 0010 step 2
-rejects or a record not in the shape `record_trial` writes, records that read one bar type as
+rejects or a record not in the shape `record_trial` writes (on any sample, a stored `config` that does
+not hash to its key), records that read one bar type as
 different bars, trials that do not cover the same session days over the sample, and a record with no
 key not marked by `mark_not_run`. A record that ran on the current sample is in `record_trial`'s shape
 only if its run's bounds are the sample's, its `run_config_id` is its key, its digest names at least
@@ -61,8 +63,10 @@ from .ledger import FAILED
 from .ledger import IDLE
 from .ledger import NOT_RUN
 from .ledger import OUTCOME
+from .ledger import RAN
 from .ledger import TRADED
 from .ledger import Sample
+from .ledger import config_key
 from .ledger import has_key
 from .ledger import is_not_run_list
 from .ledger import ran_something
@@ -149,16 +153,22 @@ def _describe(trial: FrozenTrial) -> str:
 
 
 def ran_to_the_end(trial: FrozenTrial) -> bool:
-    """Whether the record ran to the end: finished, with outcome traded or idle (ADR 0054 term 5).
+    """Whether the record ran to the end: it has outcome traded or idle (ADR 0054 term 5).
 
     Public, with `on_current_sample`, so that a caller deciding which configurations to run again
     (`canon_trading.variant_study`) applies the rule `rank` applies, and follows it if it changes.
 
-    The ledger writes the outcome last, so a record that has one of those finished its run. A traded
-    record told `FAIL` because its own Sharpe ratio is not finite ran to the end too; the gate stops
-    on it below, under ADR 0031, and no later record of its key resolves it.
+    The ledger writes the outcome last, after every result (ADR 0035 term 2), so a record that has one
+    of those finished its run in any state `record_trial` leaves it in: `COMPLETE` or `FAIL` as told,
+    `FAIL` too when its `tell` failed after the outcome, or still `RUNNING` if no `tell` could be
+    written (`canon_trading.ledger._tell_failed`). Its run is compared with every other record of its
+    key like any other; read as cut short, a later record of its key would resolve it and the returns
+    and data it read would never be compared. A traded record told `FAIL` because its own Sharpe ratio
+    is not finite ran to the end too; the gate stops on it below, under ADR 0031, and no later record
+    of its key resolves it. Such an outcome in another state (`WAITING`, `PRUNED`) is no run of the
+    writer's, and `_not_the_writers` stops on it.
     """
-    return trial.state.is_finished() and trial.user_attrs.get(OUTCOME) in (TRADED, IDLE)
+    return trial.state in _RAN_STATES and trial.user_attrs.get(OUTCOME) in RAN
 
 
 def on_current_sample(trial: FrozenTrial, sample: Sample, known: set[int]) -> bool:
@@ -176,6 +186,19 @@ def on_current_sample(trial: FrozenTrial, sample: Sample, known: set[int]) -> bo
     return not ran_to_the_end(trial)
 
 
+# The states `canon_trading.ledger.record_trial` leaves a record that ran to the end in, and each
+# (state, outcome, told a value) it leaves one in (`ran_to_the_end`, `_not_the_writers`).
+_RAN_AS_TOLD = frozenset(
+    {
+        (TrialState.COMPLETE, TRADED, True),
+        (TrialState.FAIL, TRADED, False),
+        (TrialState.FAIL, IDLE, False),
+        (TrialState.RUNNING, TRADED, False),
+        (TrialState.RUNNING, IDLE, False),
+    }
+)
+_RAN_STATES = frozenset(state for state, _, _ in _RAN_AS_TOLD)
+
 # The states `canon_trading.ledger.mark_not_run` leaves a record in. A marked record in another state
 # was started after its mark, by an `ask` that took it from Optuna's queue, and stops again.
 _LEFT_BY_A_MARK = (TrialState.FAIL, TrialState.WAITING)
@@ -184,9 +207,10 @@ _LEFT_BY_A_MARK = (TrialState.FAIL, TrialState.WAITING)
 def _not_the_writers(trial: FrozenTrial) -> str | None:
     """Why `trial`, a record with a key, is in no state and outcome `record_trial` leaves, if it is.
 
-    `record_trial` leaves a record that ran to the end `COMPLETE`, `traded`, with a value, or `FAIL`,
-    `traded` or `idle`, with none; one cut short `RUNNING` with any outcome or none, or `FAIL`,
-    `failed` or with none. It suggests no parameter and reports no intermediate value. Anything else
+    `record_trial` leaves a record that ran to the end `COMPLETE`, `traded`, with a value, or `FAIL` or
+    `RUNNING` (a `tell` that failed after the outcome), `traded` or `idle`, with none; one cut short
+    `RUNNING` or `FAIL`, `failed` or with no outcome. It suggests no parameter and reports no
+    intermediate value. Anything else
     was told by another writer: read as a failure it would be resolved by a later record and drop out
     of every check, and read as a run it would enter the matrix unchecked.
     """
@@ -196,15 +220,33 @@ def _not_the_writers(trial: FrozenTrial) -> str | None:
         return f"has outcome {outcome!r}, not one record_trial writes"
     if trial.intermediate_values or trial.distributions:
         return "holds an intermediate value or a parameter, which record_trial never writes"
-    if ran_to_the_end(trial):
-        told = (state, outcome, trial.values is not None)
-        if told in ((TrialState.COMPLETE, TRADED, True), (TrialState.FAIL, TRADED, False)) or (
-            told == (TrialState.FAIL, IDLE, False)
-        ):
+    if outcome in RAN:
+        if (state, outcome, trial.values is not None) in _RAN_AS_TOLD:
             return None
         return f"was told {state.name} with outcome {outcome!r}, as record_trial never tells one"
     if shows_an_evaluation(trial):
         return "shows a result Optuna keeps but no outcome record_trial writes for one"
+    return None
+
+
+def _config_fault(trial: FrozenTrial, key: str) -> str | None:
+    """Why `trial`'s stored `config` is not the configuration its key, `key`, names, if it is not.
+
+    `record_trial` writes `config` beside the key it hashed it to (ADR 0054 term 4), so a record whose
+    config hashes to another key, or to none, was written by another writer: counted under its key, it
+    would take that configuration's place in the matrix and lower N. A record with no `config` is what
+    an error after the key's write leaves, before any run; one that ran needs it (`_shape_faults`).
+    Checked on every sample, since N counts keys on every sample; like a record that ran with no
+    sample number of the study's (ADR 0041 term 5), it stops for good, and no move clears it.
+    """
+    if "config" not in trial.user_attrs:
+        return None
+    try:
+        hashed = config_key(trial.user_attrs["config"])
+    except (TypeError, ValueError) as error:
+        return f"has a config with no canonical form ({error})"
+    if hashed != key:
+        return f"has a config that hashes to {hashed}, not to its key"
     return None
 
 
@@ -267,6 +309,15 @@ def rank(study: optuna.Study) -> RankingReport:
     ] = {}  # of those, the ones that ran, for what names them
     read: list[FrozenTrial] = []  # every record on the current sample that ran to the end
     for key, every in by_key.items():
+        mislabelled = [(trial, why) for trial in every if (why := _config_fault(trial, key))]
+        if mislabelled:
+            # The key's records are not all of one configuration, so none of them is read as its.
+            stops.extend(
+                f"{key}: {_describe(trial)} {why}: not in the shape record_trial writes, so "
+                "another writer left it, and no later record resolves it (ADR 0054 term 4)"
+                for trial, why in mislabelled
+            )
+            continue
         records = []
         for trial in every:
             if on_current_sample(trial, sample, known):

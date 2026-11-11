@@ -101,6 +101,7 @@ from .backtest import VENUE_SETTINGS
 from .backtest import checked_run_config
 from .backtest import run_backtest_config
 from .ma_cross import MaCross
+from .ma_cross import MaCrossConfig
 from .returns_matrix import DAY_NS
 from .returns_matrix import NS_RANGE
 from .returns_matrix import ReturnsRejected
@@ -116,7 +117,6 @@ if TYPE_CHECKING:
     from optuna.trial import FrozenTrial
 
     from .backtest import BacktestRun
-    from .ma_cross import MaCrossConfig
 
 LEDGER_FILE = Path("ledger") / "trials.db"
 
@@ -125,6 +125,8 @@ OUTCOME = "outcome"
 TRADED = "traded"
 IDLE = "idle"
 FAILED = "failed"
+# The outcomes of a run that ran to the end; `record_trial` writes one last, after every result.
+RAN = (TRADED, IDLE)
 
 # The study user attributes holding the study's samples, oldest first, and the numbers of records
 # that ran no backtest (ADR 0041, ADR 0053 term 3).
@@ -463,7 +465,18 @@ def trial_config(
     default is left out, so a default config's key is what it was; a pin that changes a default moves
     the key of a config holding that field at either value (ADR 0053 term 2). The study's sample is
     not in it.
+
+    Each config must be a `MaCrossConfig` itself, not a subclass: `record_trial` builds `MaCross` from
+    every config and the key names that class, so a subclass's own fields (`SessionMaCrossConfig`'s
+    `limit_offset`, `wind_down_at`) would be keyed though no run reads them, and two configs that differ
+    only there would be two trials of one run. Such a config raises `TypeError`, naming its class.
     """
+    other = [type(config).__name__ for config in strategies if type(config) is not MaCrossConfig]
+    if other:
+        raise TypeError(
+            f"a trial runs MaCross, so each config is a MaCrossConfig itself: got {other[0]}, not "
+            "MaCrossConfig",
+        )
     bar_types = list(dict.fromkeys(str(config.bar_type) for config in strategies))
     return {
         "strategies": [
@@ -616,9 +629,13 @@ def record_trial(
     with the key as its `id`; its session days and data digest are those of the bars the run read, as
     the engine's cache kept them, and those must be the bars the coverage check read (module header).
     A run that raises, or whose result cannot be
-    recorded, is told `FAIL` with outcome `failed` and its error, and the exception passes through. A
+    recorded before its outcome, is told `FAIL` with outcome `failed` and its error, and the exception
+    passes through. A
     run with no filled order is told `FAIL` with outcome `idle`; any other `COMPLETE` with `traded`, or `FAIL`, still `traded`, if its
-    Sharpe ratio is not finite. The outcome is written last, so a record that has one ran to the end.
+    Sharpe ratio is not finite. The outcome is written last, so a record that has one ran to the end:
+    a `tell` that fails after it leaves the outcome as it is, told `FAIL` with its error, or still
+    `RUNNING` if that cannot be told either (`_tell_failed`). A config that is not a `MaCrossConfig`
+    itself is refused before anything is recorded (`trial_config`).
     Every write after the trial is asked for, the outcome and the `tell` included, is inside the `try`
     that tells a failure, so an error or `KeyboardInterrupt` there is told `FAIL` with its error. Only
     a process killed outright, or a store that refuses the very first write, leaves a record with no
@@ -836,12 +853,17 @@ def shows_an_evaluation(trial: FrozenTrial) -> bool:
 
 
 def _tell_failed(study: optuna.Study, trial: optuna.Trial, error: BaseException) -> None:
-    """Tell `trial` `FAIL` with outcome `failed`; if that cannot be written, say so on `error`.
+    """Tell `trial` `FAIL` with its error and outcome `failed`, or the outcome its run already ended
+    with; if that cannot be written, say so on `error`.
 
     A trial already told, as when an interrupt lands just after its `tell`, is left as it is, and the
     note says so. A trial whose key was never written started no run, so it is told `FAIL` with its
     error and no outcome: an outcome on a keyless record shows a run (ADR 0053 term 3), and
-    `mark_not_run` clears this one.
+    `mark_not_run` clears this one. A trial that already holds outcome `traded` or `idle` ran to the
+    end, every result written before it (`record_trial` writes the outcome last), and only its `tell`
+    failed: it keeps that outcome and is told `FAIL` with its error, so the ranking reads its run and
+    compares it with every other record of its key (ADR 0054 term 5). Overwritten `failed`, it would be
+    resolved by a later record of its key, and the returns and data it read never compared.
     """
     try:
         [frozen] = [t for t in study.get_trials(deepcopy=False) if t.number == trial.number]
@@ -851,7 +873,7 @@ def _tell_failed(study: optuna.Study, trial: optuna.Trial, error: BaseException)
             )
             return
         trial.set_user_attr("error", "".join(traceback.format_exception_only(error)).strip())
-        if has_key(frozen):
+        if has_key(frozen) and frozen.user_attrs.get(OUTCOME) not in RAN:
             trial.set_user_attr(OUTCOME, FAILED)
         study.tell(trial, state=TrialState.FAIL)
     except Exception as recording:  # noqa: BLE001, the run's own error is the one raised
