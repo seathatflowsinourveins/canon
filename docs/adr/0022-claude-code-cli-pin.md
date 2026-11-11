@@ -39,7 +39,8 @@ Chosen: **option 3**.
    is still below the pin or cannot be read. A CLI at or above the pin is left alone.
 2. **The settings template holds the floor.** `home/.claude/settings.json` sets `minimumVersion` to the
    pin, so that "moving to the `"stable"` channel does not downgrade you", and keeps `autoUpdatesChannel`
-   at `stable`. Both reach a machine only through the bootstrap's user-config step. Without it a machine
+   at `stable`. (Superseded in part 2026-11-10 by ADR 0065 rules 1 and 2: the template names `latest`,
+   and the floor stays.) Both reach a machine only through the bootstrap's user-config step. Without it a machine
    sits at the pin with no floor, on whatever channel the installer saved for a version argument, which
    the docs do not say.
 3. **`scripts/canon lint` holds the pin and the floor together.** It fails when the template's
@@ -47,7 +48,9 @@ Chosen: **option 3**.
    release tag of dotted numbers, the only shape the bootstrap can install.
 4. **`scripts/bootstrap --check` names a CLI below the pin `BEHIND`**, with the command that fixes it, and
    one whose version it cannot read `UNKNOWN`. Both exit non-zero.
-5. **The machine's default model is `fable`**, the owner's choice for the sessions they talk to. ADR 0005
+5. **The machine's default model is `fable`**, the owner's choice for the sessions they talk to.
+   (Superseded 2026-11-10 by ADR 0059 rule 3: the default is the build lane's `opus`, and the lead
+   starts with `--model claude-fable-5-2`.) ADR 0005
    gives that model to the orchestrator lane and sets no machine default, so this adds one: a session
    started with no model named, in any project on the machine, now runs on it. Build and bulk work name
    their lane's model.
@@ -68,10 +71,12 @@ channel. The rest of it stands.
   differ from the template gets the new floor as a proposal beside its file, for the owner to apply.
 * Bad: the floor stops a move below the pin only. Above it, the stable channel can still move the CLI
   down from a newer build, and the records were read at the pin, not at what stable serves later.
-* Bad: Fable is the costlier lane (ADR 0005), and it is now what an unnamed session runs on.
+* Bad: Fable is the costlier lane (ADR 0005), and it is now what an unnamed session runs on. (No longer
+  so from 2026-11-10: ADR 0059 rule 3.)
 * Bad: while the stable channel serves a version below the floor, each background update is refused and
   the session footer shows `Auto-update failed · Run claude doctor` in red. Nothing is wrong and nothing
-  is to be done: the line goes when stable reaches the pin.
+  is to be done: the line goes when stable reaches the pin. (From 2026-11-10 the channel is `latest`, ADR
+  0065, so this and the stable bullet above describe the record's original channel.)
 * The desktop app bundles its own Claude Code and is outside this decision.
 
 ### Confirmation

@@ -1,8 +1,8 @@
 {
   "schema": 1,
   "decided_by": "docs/adr/0005-model-routing.md",
-  "read_at": "2026-11-09",
-  "review_by": "2026-12-09",
+  "read_at": "2026-11-10",
+  "review_by": "2026-12-10",
   "lanes": [
     {
       "lane": "orchestrator",
@@ -51,6 +51,56 @@
       "alias": "opus",
       "model": "claude-opus-5-5",
       "effort": "high"
+    }
+  ],
+  "claude_code": {
+    "decided_by": "docs/adr/0059-native-defaults-for-every-runtime.md",
+    "session_default_lane": "build",
+    "alias_pins": "none: each alias resolves as the vendor ships it; a lane's model is what its alias resolved to on read_at",
+    "available_models": [
+      "opus",
+      "sonnet",
+      "haiku",
+      "claude-fable-5-2"
+    ],
+    "picker_rows": [
+      "claude-fable-5-2"
+    ],
+    "why_fable_by_id": "the picker's own Fable row was a server-provided claude-fable-5-1[1m]; an allowlist entry for the orchestrator lane's ID hides it, and the picker row names that ID",
+    "lead_session": "claude --model claude-fable-5-2; /status shows Model: claude-fable-5-2",
+    "update_channel": "latest (ADR 0065), set by name: with no key the settings reference says latest and the setup page the channel chosen at install time",
+    "update_floor": "minimumVersion = the registry's claude-code pin (ADR 0065)"
+  },
+  "runtimes": [
+    {
+      "runtime": "codex",
+      "model": "gpt-6.1-sol",
+      "effort": "max",
+      "set_in": "${CODEX_HOME:-~/.codex}/config.toml (model, model_reasoning_effort)",
+      "template": "home/.codex/defaults.toml",
+      "checked_by": "scripts/bootstrap --check, row codex defaults"
+    },
+    {
+      "runtime": "antigravity",
+      "model": "gemini-4-carbon-high",
+      "label": "Gemini 4 Carbon (High)",
+      "effort": "high (in the model slug; the highest agy models lists for it)",
+      "set_in": "~/.gemini/antigravity-cli/settings.json (model, saved by its label)",
+      "checked_by": "scripts/bootstrap --check, row agy default model"
+    },
+    {
+      "runtime": "muse",
+      "model": "muse-wonder-1.0",
+      "effort": "max",
+      "set_in": "launch flags --model and --reasoning-effort (Orca: --model, --effort); the settings key is not documented",
+      "checked_by": "the model and effort the session shows"
+    },
+    {
+      "runtime": "dsh",
+      "model": "deepseek-flash",
+      "effort": "max",
+      "set_in": "the dsh-tui bundle (agent-default-model row; dsh-tui row effort), unchanged",
+      "checked_by": "dsh --profile dsh-tui --dump-config"
     }
   ],
   "prices_usd_per_mtok": {

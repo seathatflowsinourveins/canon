@@ -87,8 +87,11 @@ defect-search runs also show Fable 5.2 alone scoring 1.6 to 5.9 points above Opu
 2.4 times the cost. The sources disagree because the workloads differ, which is why the table is a starting
 point.
 
-ADR 0022 adds a machine default, `fable`, for a session started with no model named. The lanes above are
-unchanged.
+ADR 0059 sets the default for a session started with no model named to the build lane's `opus` (ADR 0022
+had set `fable`), pins no alias, so each follows the vendor and a lane's model is what its alias resolved to
+on the table's `read_at`, and holds the picker to the four families with Fable at the orchestrator lane's ID.
+The table's `claude_code` section holds those settings and its `runtimes` section the other runtimes'
+defaults. The lanes above are unchanged.
 
 ### Consequences
 
@@ -100,14 +103,13 @@ unchanged.
 Subagent frontmatter pins `model` and `effort`. A raised build session (rule 7) is started with the
 orchestrator lane's model by its full ID, and `scripts/lanes` shows the model of each session that drew
 a status line; nothing yet measures the owner's condition on use. The status line records a model change inside a session to
-the event ledger, and `scripts/lanes` flags that session. The machine settings pin the `fable` alias with
-`env.ANTHROPIC_DEFAULT_FABLE_MODEL` = `claude-fable-5-2`. `scripts/bootstrap --check` compares every
-`ANTHROPIC_DEFAULT_<ALIAS>_MODEL` in the installed and template settings with `canon/models.json` and labels
-an absent pin MISSING, a different one MISMATCH and an unreadable table UNKNOWN; it labels MISMATCH a
-top-level `model` that `canon/models.json` does not name. `scripts/test-lanes` fails when the template's pin
-differs from the table, so the two move together. It was reported, not reproduced here (`UNVERIFIED`),
-that Claude Code 2.1.321's `/model` picker labelled its Fable row "Fable 5.1" and saved that model, with no
-Fable override or allowlist set; why is not known.
+the event ledger, and `scripts/lanes` flags that session. The machine settings pin no alias (ADR 0059).
+`scripts/bootstrap --check` labels an `ANTHROPIC_DEFAULT_<ALIAS>_MODEL` in the installed settings PINNED, or
+MISMATCH when it names another model than `canon/models.json`, and an unreadable table UNKNOWN; it labels
+MISMATCH a top-level `model` that `canon/models.json` does not name, and checks the allowlist and picker row
+against the template. `scripts/test-lanes` fails when the template's model keys differ from the table's
+`claude_code` section, so the two move together. The picker's "Fable 5.1" row was an extra option whose
+value was `claude-fable-5-1[1m]`; ADR 0059 shows the allowlist hiding it.
 
 ## Evidence
 
@@ -142,5 +144,7 @@ Read 2026-11-09.
 * Second reader of rule 7, 2026-11-10 (`evidence-verifier`): the quotation and the trailers held, and
   nothing that reads the table breaks. It regrouped the ten changes by what each fixed, and had the
   guide's effort sweep, the unrecorded effort and the narrowing of the owner's words stated; all above.
+* 2026-11-10, with ADR 0059: the machine default, the alias pins and the picker settings above, and the
+  table's `claude_code` and `runtimes` sections; the evidence is in that record.
 * Cost-optimisation guide bundled with Claude Code 2.1.321 (`claude-api` skill, `shared/cost-optimization.md`)
   — model selection comes after every lever that does not lower the intelligence ceiling (bundled).

@@ -159,7 +159,9 @@ export STUB="$TMP/stub"; mkdir -p "$STUB"
 export PATH="$B:$PATH"
 REAL_HOME="$HOME"   # the paper:store case needs the user's own login keychain, which security finds through HOME
 export HOME="$TMP/home"; mkdir -p "$HOME"
-unset CLAUDE_CONFIG_DIR CANON_LEDGER_HOME AUTOMATION_SKIP_LAUNCHD CANON_LAUNCHAGENTS_DIR CODEX_HOME DSH_HOME
+# a session Orca starts carries DISABLE_AUTOUPDATER (Orca 1.4.255 sets it), which bootstrap's update row reads
+unset CLAUDE_CONFIG_DIR CANON_LEDGER_HOME AUTOMATION_SKIP_LAUNCHD CANON_LAUNCHAGENTS_DIR CODEX_HOME DSH_HOME \
+      DISABLE_AUTOUPDATER DISABLE_UPDATES CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
 PINNED=$(sed -n 's/^MISE_VERSION="v\([^"]*\)".*/\1/p' "$ROOT/scripts/bootstrap")
 echo "$PINNED macos-arm64 (stub)" > "$STUB/mise-version"
 CCPIN="2.1.321"   # the claude-code pin the bootstrap fixture's registry sets, whatever the real one is
@@ -1194,7 +1196,8 @@ check "other mise version: OUTDATED, exit 1"      eval 'rowis "$TMP/bs.out" mise
 echo "$PINNED macos-arm64 (stub)" > "$STUB/mise-version"; bs --check
 check "claude CLI at the pin: ok, showing both"   eval 'rowis "$TMP/bs.out" "claude CLI" ok && grep -q "claude CLI .*$CCPIN; pinned $CCPIN" "$TMP/bs.out"'
 echo "9999.0.0 (Claude Code)" > "$STUB/claude-version"; bs --check
-check "claude CLI above the pin (9999.0.0): ok"   eval 'rowis "$TMP/bs.out" "claude CLI" ok && grep -q "claude CLI .*pinned $CCPIN" "$TMP/bs.out"'
+check "claude CLI above the pin (9999.0.0): ok, naming the version seen and the floor" \
+      eval 'rowis "$TMP/bs.out" "claude CLI" ok && grep -q "claude CLI .*9999.0.0, ahead of the pin $CCPIN" "$TMP/bs.out"'
 echo "2.2.0 (Claude Code)" > "$STUB/claude-version"; bs --check
 check "claude CLI above the pin with a lower last field (2.2.0): ok" rowis "$TMP/bs.out" "claude CLI" ok
 echo "0.0.1 (Claude Code)" > "$STUB/claude-version"; bs --check; rc=$?
@@ -1496,6 +1499,7 @@ check "identical scripts are not backed up again" test "$(find "$C/canon" -name 
 check "a new settings.json carries the telemetry env, content logging unset" \
       jqt "$C/settings.json" '.env.CLAUDE_CODE_ENABLE_TELEMETRY == "1" and .env.OTEL_LOGS_EXPORTER == "otlp" and .env.OTEL_EXPORTER_OTLP_ENDPOINT == "http://127.0.0.1:4317" and ([.env | keys[] | select(startswith("OTEL_LOG_"))] | length) == 0'
 CX="$HOME/.codex/config.toml"
+tomlis() { "$TOML_PY" -I -c 'import sys, tomllib; d = tomllib.load(open(sys.argv[1], "rb")); sys.exit(0 if eval(sys.argv[2]) else 1)' "$@"; }
 check "... and a new Codex config gets canon's [otel] table" \
       eval 'grep -qxF "[otel]" "$CX" && grep -qF "otlp-http = { endpoint = \"http://127.0.0.1:4318/v1/logs\"" "$CX" && grep -qxF "log_user_prompt = false" "$CX"'
 CLAUDE_CONFIG_DIR="$C" bs --check
@@ -1503,12 +1507,13 @@ check "check: telemetry settings and codex telemetry ok" \
       eval 'rowis "$TMP/bs.out" "telemetry settings" ok && rowis "$TMP/bs.out" "codex telemetry" ok'
 C3="$TMP/cfg3"; mkdir -p "$C3"
 echo '{"model":"mine","env":{"MY_VAR":"1","OTEL_METRICS_EXPORTER":"otlp"}}' > "$C3/settings.json"
+rm -f "$HOME/.codex/config.toml.replaced-"*   # so the copies counted below are this run's
 printf 'model = "o3"\n\n[profiles.fast]\nmodel = "x"' > "$CX"   # no newline at the end, as an editor may leave it
 CLAUDE_CONFIG_DIR="$C3" bs --user-config
 check "an existing settings.json gets the missing telemetry variables, keeping its own" \
       jqt "$C3/settings.json" '.model == "mine" and .env.MY_VAR == "1" and .env.CLAUDE_CODE_ENABLE_TELEMETRY == "1" and .env.OTEL_LOGS_EXPORTER == "otlp"'
-check "... and only those: the template's fable pin is not added" \
-      eval 'jqt "$ROOT/home/.claude/settings.json" ".env | has(\"ANTHROPIC_DEFAULT_FABLE_MODEL\")" && jqt "$C3/settings.json" ".env | has(\"ANTHROPIC_DEFAULT_FABLE_MODEL\") | not"'
+check "... and the model keys it lacks, the owner's model kept and named (ADR 0059)" \
+      eval 'jqt "$C3/settings.json" ".availableModels == $(jq -c .availableModels "$ROOT/home/.claude/settings.json") and .modelPicker == $(jq -c .modelPicker "$ROOT/home/.claude/settings.json") and (.env | has(\"ANTHROPIC_DEFAULT_FABLE_MODEL\") | not)" && grep -q "KEPT .*sets model to another value than home/.claude/settings.json" "$TMP/bs.out"'
 check "... leaves a value the owner set, and names it" \
       eval 'jqt "$C3/settings.json" ".env.OTEL_METRICS_EXPORTER == \"otlp\"" && grep -q "sets OTEL_METRICS_EXPORTER to another value" "$TMP/bs.out"'
 check "... keeping the previous file beside it" \
@@ -1516,15 +1521,21 @@ check "... keeping the previous file beside it" \
 check "an existing Codex config gets the table appended, its own lines kept" \
       eval 'grep -qxF "model = \"o3\"" "$CX" && grep -qxF "model = \"x\"" "$CX" && grep -qxF "[otel]" "$CX" && [ -n "$(find "$HOME/.codex" -name "config.toml.replaced-*")" ]'
 check "... on a line of its own after the last one"  grep -qxF '[profiles.fast]' "$CX"
+# Codex's default model and effort (ADR 0059): the key it lacks goes at the top, one it sets is the owner's
+check "... the default effort it lacked written at its top, its own model kept and named" \
+      eval 'tomlis "$CX" "d[\"model_reasoning_effort\"] == \"max\" and d[\"model\"] == \"o3\" and d[\"profiles\"][\"fast\"][\"model\"] == \"x\"" && grep -q "added      model_reasoning_effort to $CX" "$TMP/bs.out" && grep -q "KEPT       $CX sets model to another value" "$TMP/bs.out"'
+check "... with each step's copy of the file kept under its own name" \
+      test "$(find "$HOME/.codex" -name "config.toml.replaced-*" | wc -l | tr -d ' ')" = 2
 CLAUDE_CONFIG_DIR="$C3" bs --user-config
-check "a second run adds nothing again"           eval '[ "$(grep -c "^\[otel\]" "$CX")" = 1 ] && grep -q "unchanged  \[otel\]" "$TMP/bs.out"'
+check "a second run adds nothing again"           eval '[ "$(grep -c "^\[otel\]" "$CX")" = 1 ] && grep -q "unchanged  \[otel\]" "$TMP/bs.out" && [ "$(grep -c "^model_reasoning_effort" "$CX")" = 1 ]'
 CLAUDE_CONFIG_DIR="$C3" bs --check
 check "check names the owner's differing value, without failing on it" \
       eval 'rowis "$TMP/bs.out" "telemetry settings" OWNER && grep -q "sets OTEL_METRICS_EXPORTER to another value" "$TMP/bs.out"'
 echo '{"env":[]}' > "$C3/settings.json"; CLAUDE_CONFIG_DIR="$C3" bs --user-config; rc=$?
 check "an env that is not an object: named, the run finishes" \
       eval 'grep -q "not a JSON object with an object env" "$TMP/bs.out" && grep -q "New Claude Code sessions" "$TMP/bs.out"'
-printf '[otel]\nexporter = "none"\n' > "$CX"; cp "$CX" "$TMP/cx.before"
+CXDEF=$(grep -v -e '^#' -e '^$' "$ROOT/home/.codex/defaults.toml")   # canon's defaults, so the otel cases below change nothing else
+printf '%s\n[otel]\nexporter = "none"\n' "$CXDEF" > "$CX"; cp "$CX" "$TMP/cx.before"
 CLAUDE_CONFIG_DIR="$C3" bs --user-config
 check "a Codex config with its own otel table is left as it is, and named" \
       eval 'cmp -s "$CX" "$TMP/cx.before" && grep -q "sets otel itself; left as the owner set it" "$TMP/bs.out"'
@@ -1532,8 +1543,7 @@ CLAUDE_CONFIG_DIR="$C3" bs --check
 check "... and check calls it OWNER"              rowis "$TMP/bs.out" "codex telemetry" OWNER
 # Codex's config is read as TOML (claims of a second reader, 2026-11-10): a quoted key is the owner's otel
 # table, and an [otel] line inside a multi-line string is no table at all
-tomlis() { "$TOML_PY" -I -c 'import sys, tomllib; d = tomllib.load(open(sys.argv[1], "rb")); sys.exit(0 if eval(sys.argv[2]) else 1)' "$@"; }
-printf "model = \"o3\"\n['otel']\nexporter = 'none'\n" > "$CX"; cp "$CX" "$TMP/cx.before"
+printf "model = \"o3\"\nmodel_reasoning_effort = \"low\"\n['otel']\nexporter = 'none'\n" > "$CX"; cp "$CX" "$TMP/cx.before"
 CLAUDE_CONFIG_DIR="$C3" bs --user-config
 check "a quoted ['otel'] table is the owner's: left as it is, still valid TOML" \
       eval 'cmp -s "$CX" "$TMP/cx.before" && tomlis "$CX" "d[\"otel\"] == {\"exporter\": \"none\"}" && grep -q "sets otel itself" "$TMP/bs.out"'
@@ -1623,31 +1633,33 @@ C2="$TMP/cfg2"; mkdir -p "$C2/canon"; cp "$ROOT/home/.claude/canon/"*.sh "$C2/ca
 CLAUDE_CONFIG_DIR="$C2" bs --check
 check "check rejects hooks that call another directory" eval 'rowis "$TMP/bs.out" "event ledger hooks" MISSING && rowis "$TMP/bs.out" "status line" MISSING'
 
-# model alias pins (ADR 0005; https://code.claude.com/docs/en/model-config.md): the expected IDs come from
-# canon/models.json, the keys that must be there from home/.claude/settings.json
+# model settings (ADR 0005, ADR 0059; https://code.claude.com/docs/en/model-config.md): the template is held
+# to canon/models.json, and the installed settings to the template
 # shellcheck disable=SC2034  # read by the eval'd checks below
-fable_id=$(jq -r '[.lanes[] | select(.alias == "fable") | .model] | unique | .[0]' "$ROOT/canon/models.json")
-check "the template pins the fable alias to canon/models.json's fable model" \
-      eval '[ -n "$fable_id" ] && [ "$(jq -r ".env.ANTHROPIC_DEFAULT_FABLE_MODEL" "$ROOT/home/.claude/settings.json")" = "$fable_id" ]'
+fable_id=$(jq -r '[.lanes[] | select(.lane == "orchestrator") | .model] | .[0]' "$ROOT/canon/models.json")
+# shellcheck disable=SC2034
+build_alias=$(jq -r '.claude_code.session_default_lane as $l | [.lanes[] | select(.lane == $l) | .alias] | .[0]' "$ROOT/canon/models.json")
+check "the template pins no alias (ADR 0059)"     jqt "$ROOT/home/.claude/settings.json" '[.env // {} | keys[] | select(test("^ANTHROPIC_DEFAULT_.+_MODEL$"))] | length == 0'
+check "the template's allowlist and picker rows are canon/models.json's, naming the orchestrator lane's ID" \
+      eval 'jq -e --slurpfile m "$ROOT/canon/models.json" --arg f "$fable_id" ".availableModels == \$m[0].claude_code.available_models and [.modelPicker.options[].model] == \$m[0].claude_code.picker_rows and (.availableModels | index(\$f)) != null and \$m[0].claude_code.picker_rows == [\$f]" "$ROOT/home/.claude/settings.json" >/dev/null'
+check "... the allowlist admits each family alias but fable, so the picker's legacy Fable row is hidden" \
+      jqt "$ROOT/home/.claude/settings.json" '(.availableModels | index("fable")) == null and ([.availableModels[] | select(startswith("claude-fable-"))] | length) == 1'
+check "the template's default model is the session_default_lane's alias" \
+      eval '[ -n "$build_alias" ] && [ "$(jq -r .model "$ROOT/home/.claude/settings.json")" = "$build_alias" ]'
+check "the template names the latest channel (ADR 0065)" jqt "$ROOT/home/.claude/settings.json" '.autoUpdatesChannel == "latest"'
 CLAUDE_CONFIG_DIR="$C" bs --check
-check "installed settings pin fable as canon/models.json does: ok" \
-      eval 'rowis "$TMP/bs.out" "fable alias" ok && grep -q "ANTHROPIC_DEFAULT_FABLE_MODEL=$fable_id" "$TMP/bs.out"'
+check "installed settings as the template: no alias pinned, model keys ok" \
+      eval 'rowis "$TMP/bs.out" "model alias pins" ok && rowis "$TMP/bs.out" "default model" ok && rowis "$TMP/bs.out" "model allowlist" ok && rowis "$TMP/bs.out" "picker rows" ok && rowis "$TMP/bs.out" "update channel" ok'
 C3="$TMP/cfg3"; mkdir -p "$C3/canon"; cp "$C/canon/"*.sh "$C3/canon/"; cp "$C/CLAUDE.md" "$C3/"
 pin_settings() { jq "$1" "$C/settings.json" > "$C3/settings.json"; CLAUDE_CONFIG_DIR="$C3" bs --check; }
 pin_settings '.'; rc=$?
 check "... and the whole check passes: exit 0"     test "$rc" = 0
+pin_settings ".env.ANTHROPIC_DEFAULT_FABLE_MODEL = \"$fable_id\""; rc=$?
+check "fable pinned to canon/models.json's model: PINNED, it would not follow the vendor, exit 1" \
+      eval 'rowis "$TMP/bs.out" "fable alias" PINNED && grep -q "will not follow the vendor" "$TMP/bs.out" && [ "$rc" != 0 ]'
 pin_settings '.env.ANTHROPIC_DEFAULT_FABLE_MODEL = "claude-fable-5-1"'; rc=$?
 check "fable pinned to another model: MISMATCH naming the expected one, exit 1" \
       eval 'rowis "$TMP/bs.out" "fable alias" MISMATCH && grep -q "canon/models.json gives $fable_id" "$TMP/bs.out" && [ "$rc" != 0 ]'
-pin_settings 'del(.env)'; rc=$?
-check "installed settings without the fable pin: MISSING, exit 1" \
-      eval 'rowis "$TMP/bs.out" "fable alias" MISSING && grep -q "sets no env.ANTHROPIC_DEFAULT_FABLE_MODEL; set it to $fable_id" "$TMP/bs.out" && [ "$rc" != 0 ]'
-pin_settings '.env = "x"'; rc=$?
-check "env that is not an object: fable MISSING, exit 1" eval 'rowis "$TMP/bs.out" "fable alias" MISSING && [ "$rc" != 0 ]'
-opus_id=$(jq -r '[.lanes[] | select(.alias == "opus") | .model] | unique | .[0]' "$ROOT/canon/models.json")
-jq --arg o "$opus_id" '.env.ANTHROPIC_DEFAULT_OPUS_MODEL = $o' "$C/settings.json" > "$C3/settings.json"; CLAUDE_CONFIG_DIR="$C3" bs --check; rc=$?
-check "another alias pinned as canon/models.json says: its own row ok, exit 0" \
-      eval 'rowis "$TMP/bs.out" "opus alias" ok && rowis "$TMP/bs.out" "fable alias" ok && [ "$rc" = 0 ]'
 pin_settings '.env.ANTHROPIC_DEFAULT_SONNET_MODEL = "claude-sonnet-4-5"'; rc=$?
 check "another alias pinned to another model: MISMATCH, exit 1" eval 'rowis "$TMP/bs.out" "sonnet alias" MISMATCH && [ "$rc" != 0 ]'
 pin_settings '.env.ANTHROPIC_DEFAULT_WIDGET_MODEL = "claude-widget-1"'; rc=$?
@@ -1656,30 +1668,144 @@ check "an alias canon/models.json does not know: MISMATCH, exit 1" \
 pin_settings '.env.ANTHROPIC_DEFAULT_MODEL = "opus"'; rc=$?
 check "ANTHROPIC_DEFAULT_MODEL is not an alias pin: no row of its own, exit 0" \
       eval '! grep -q "^  default alias" "$TMP/bs.out" && ! grep -q "^  alias" "$TMP/bs.out" && [ "$rc" = 0 ]'
-cp "$BS/canon/models.json" "$TMP/models.keep"
-jq '(.lanes[] | select(.alias == "fable") | .model) = "claude-fable-9"' "$TMP/models.keep" > "$BS/canon/models.json"
-pin_settings '.'; rc=$?
-check "a model moved in canon/models.json: the check follows it (MISMATCH, expects the new ID)" \
-      eval 'rowis "$TMP/bs.out" "fable alias" MISMATCH && grep -q "canon/models.json gives claude-fable-9" "$TMP/bs.out" && [ "$rc" != 0 ]'
-echo '{' > "$BS/canon/models.json"; pin_settings '.'; rc=$?
-check "canon/models.json unreadable: UNKNOWN, exit 1" eval 'rowis "$TMP/bs.out" "model alias pins" UNKNOWN && [ "$rc" != 0 ]'
-cp "$TMP/models.keep" "$BS/canon/models.json"
+pin_settings '.env = "x"'; rc=$?
+check "env that is not an object: no pin read"   rowis "$TMP/bs.out" "model alias pins" ok
 pin_settings '.model = "claude-fable-5-1"'; rc=$?
 check "a default model canon/models.json does not name: MISMATCH, exit 1" \
       eval 'rowis "$TMP/bs.out" "default model" MISMATCH && grep -q "sets model to claude-fable-5-1" "$TMP/bs.out" && [ "$rc" != 0 ]'
-jq --arg f "$fable_id" '.model = $f' "$C/settings.json" > "$C3/settings.json"; CLAUDE_CONFIG_DIR="$C3" bs --check; rc=$?
-check "a default model canon/models.json names, as an ID: ok, exit 0" eval 'rowis "$TMP/bs.out" "default model" ok && [ "$rc" = 0 ]'
+pin_settings ".model = \"$fable_id\""; rc=$?
+check "a default model of another lane: OWNER, not a failure (the picker's Enter saves one)" \
+      eval 'rowis "$TMP/bs.out" "default model" OWNER && [ "$rc" = 0 ]'
 pin_settings 'del(.model)'; rc=$?
-check "no default model: no row for it, exit 0"   eval '! grep -q "^  default model" "$TMP/bs.out" && [ "$rc" = 0 ]'
+check "no default model: MISSING, exit 1"          eval 'rowis "$TMP/bs.out" "default model" MISSING && [ "$rc" != 0 ]'
+pin_settings 'del(.availableModels)'; rc=$?
+check "no allowlist: MISSING, exit 1"              eval 'rowis "$TMP/bs.out" "model allowlist" MISSING && [ "$rc" != 0 ]'
+pin_settings '.availableModels = ["opus", "sonnet", "haiku", "fable"]'; rc=$?
+check "an allowlist that readmits every Fable: MISMATCH, exit 1" eval 'rowis "$TMP/bs.out" "model allowlist" MISMATCH && [ "$rc" != 0 ]'
+pin_settings '.availableModels += ["claude-opus-4-6"]'; rc=$?
+check "an allowlist with one more model that admits no legacy Fable: OWNER, exit 0" \
+      eval 'rowis "$TMP/bs.out" "model allowlist" OWNER && [ "$rc" = 0 ]'
+pin_settings '.availableModels += ["claude-fable-5"]'; rc=$?
+check "... one with a version prefix that admits claude-fable-5-1: MISMATCH, exit 1" \
+      eval 'rowis "$TMP/bs.out" "model allowlist" MISMATCH && grep -q "admits claude-fable-5-1" "$TMP/bs.out" && [ "$rc" != 0 ]'
+pin_settings '.modelPicker = {"options": [{"model": "claude-fable-5-2", "label": "Lead"}]}'; rc=$?
+check "a picker the owner relabelled: OWNER, exit 0" eval 'rowis "$TMP/bs.out" "picker rows" OWNER && [ "$rc" = 0 ]'
+pin_settings '.model = "fable"'; rc=$?
+check "the earlier template's default model, fable, also a lane's alias: OWNER, named as such, exit 0" \
+      eval 'rowis "$TMP/bs.out" "default model" OWNER && grep -q "earlier canon template set" "$TMP/bs.out" && [ "$rc" = 0 ]'
+pin_settings '.availableModels += ["claude-fable-5-1[1m]"]'; rc=$?
+check "an allowlist naming the legacy row's own ID, with its [1m] suffix: MISMATCH, exit 1" \
+      eval 'rowis "$TMP/bs.out" "model allowlist" MISMATCH && grep -q "admits claude-fable-5-1" "$TMP/bs.out" && [ "$rc" != 0 ]'
+pin_settings '.availableModels = ["opus"]'; rc=$?
+check "an allowlist that drops lanes' models: MISMATCH naming them, exit 1" \
+      eval 'rowis "$TMP/bs.out" "model allowlist" MISMATCH && grep -q "does not admit claude-fable-5-2, claude-haiku-5-5, claude-sonnet-5-5" "$TMP/bs.out" && [ "$rc" != 0 ]'
+pin_settings '.modelPicker.options += [{"model": "claude-fable-5-1[1m]"}]'; rc=$?
+check "a picker with a legacy Fable row: MISMATCH, exit 1" eval 'rowis "$TMP/bs.out" "picker rows" MISMATCH && [ "$rc" != 0 ]'
+pin_settings '.modelPicker.options = [{"model": "sonnet"}]'; rc=$?
+check "a picker with no row for the orchestrator lane's model: MISMATCH, exit 1" \
+      eval 'rowis "$TMP/bs.out" "picker rows" MISMATCH && grep -q "no row for $fable_id" "$TMP/bs.out" && [ "$rc" != 0 ]'
+pin_settings '.availableModels |= reverse'; rc=$?
+check "the same allowlist in another order: ok"    eval 'rowis "$TMP/bs.out" "model allowlist" ok && [ "$rc" = 0 ]'
+pin_settings 'del(.modelPicker)'; rc=$?
+check "no picker row: MISSING, exit 1"             eval 'rowis "$TMP/bs.out" "picker rows" MISSING && [ "$rc" != 0 ]'
+pin_settings '.autoUpdatesChannel = "stable"'; rc=$?
+check "the stable channel: MISMATCH, exit 1"        eval 'rowis "$TMP/bs.out" "update channel" MISMATCH && [ "$rc" != 0 ]'
+jq '.autoUpdatesChannel = "stable"' "$C/settings.json" > "$C3/settings.json"; DISABLE_UPDATES=1 CLAUDE_CONFIG_DIR="$C3" bs --check
+check "... and an off switch in the environment is named in the same row" \
+      eval 'rowis "$TMP/bs.out" "update channel" MISMATCH && grep -q "this environment also sets DISABLE_UPDATES" "$TMP/bs.out"'
+pin_settings 'del(.autoUpdatesChannel)'; rc=$?
+check "no channel named: NOT SET, the install-time channel applies, exit 1" \
+      eval 'rowis "$TMP/bs.out" "update channel" "NOT SET" && grep -q "channel chosen at install time" "$TMP/bs.out" && [ "$rc" != 0 ]'
+pin_settings '.env.DISABLE_AUTOUPDATER = "1"'; rc=$?
+check "DISABLE_AUTOUPDATER in the settings: OFF, exit 1" \
+      eval 'rowis "$TMP/bs.out" "update channel" OFF && grep -q "sets DISABLE_AUTOUPDATER" "$TMP/bs.out" && [ "$rc" != 0 ]'
+jq '.' "$C/settings.json" > "$C3/settings.json"; DISABLE_AUTOUPDATER=1 CLAUDE_CONFIG_DIR="$C3" bs --check; rc=$?
+check "... in this environment only, as Orca sets it: OFF for this session, not a failure" \
+      eval 'rowis "$TMP/bs.out" "update channel" OFF && grep -q "this environment sets DISABLE_AUTOUPDATER" "$TMP/bs.out" && [ "$rc" = 0 ]'
+cp "$BS/canon/models.json" "$TMP/models.keep"
+jq '(.lanes[] | select(.alias == "fable") | .model) = "claude-fable-9"' "$TMP/models.keep" > "$BS/canon/models.json"
+pin_settings '.env.ANTHROPIC_DEFAULT_FABLE_MODEL = "claude-fable-9"'; rc=$?
+check "a model moved in canon/models.json: the pin check follows it (PINNED, not MISMATCH)" \
+      eval 'rowis "$TMP/bs.out" "fable alias" PINNED && [ "$rc" != 0 ]'
+echo '{' > "$BS/canon/models.json"; pin_settings '.'; rc=$?
+check "canon/models.json unreadable: UNKNOWN, exit 1" eval 'rowis "$TMP/bs.out" "model settings" UNKNOWN && [ "$rc" != 0 ]'
+jq 'del(.claude_code)' "$TMP/models.keep" > "$BS/canon/models.json"; pin_settings '.'; rc=$?
+check "canon/models.json with no session default lane: UNKNOWN, exit 1" eval 'rowis "$TMP/bs.out" "model settings" UNKNOWN && [ "$rc" != 0 ]'
+cp "$TMP/models.keep" "$BS/canon/models.json"
 cp "$BS/home/.claude/settings.json" "$TMP/template.keep"
 jq '.env.ANTHROPIC_DEFAULT_WIDGET_MODEL = "claude-widget-1"' "$TMP/template.keep" > "$BS/home/.claude/settings.json"
 pin_settings '.'; rc=$?
-check "the template pins an alias canon/models.json does not know: MISMATCH, not an empty fix" \
-      eval 'rowis "$TMP/bs.out" "widget alias" MISMATCH && ! grep -q "set it to  " "$TMP/bs.out" && [ "$rc" != 0 ]'
-jq 'del(.env)' "$TMP/template.keep" > "$BS/home/.claude/settings.json"; pin_settings '.'; rc=$?
-check "a template that pins no alias: UNKNOWN, exit 1, not a silent pass" \
-      eval 'rowis "$TMP/bs.out" "model alias pins" UNKNOWN && [ "$rc" != 0 ]'
+check "a template that pins an alias: MISMATCH, exit 1" \
+      eval 'rowis "$TMP/bs.out" "widget alias" MISMATCH && grep -q "home/.claude/settings.json pins ANTHROPIC_DEFAULT_WIDGET_MODEL" "$TMP/bs.out" && [ "$rc" != 0 ]'
+jq 'del(.availableModels)' "$TMP/template.keep" > "$BS/home/.claude/settings.json"; pin_settings '.'; rc=$?
+check "a template with no allowlist: UNKNOWN, exit 1, not a silent pass" \
+      eval 'rowis "$TMP/bs.out" "model settings" UNKNOWN && [ "$rc" != 0 ]'
 cp "$TMP/template.keep" "$BS/home/.claude/settings.json"
+# --user-config on settings an earlier template rendered: the values ADR 0059 and ADR 0065 retire go, the
+# owner's stay
+C5="$TMP/cfg5"; CLAUDE_CONFIG_DIR="$C5" bs --user-config   # canon's own render for this directory
+jq '.autoUpdatesChannel = "stable" | .env.ANTHROPIC_DEFAULT_FABLE_MODEL = "claude-fable-5-2" | del(.availableModels, .modelPicker)' \
+  "$C5/settings.json" > "$C3/settings.json"; cp "$C3/settings.json" "$C5/settings.json"; C3="$C5"
+CLAUDE_CONFIG_DIR="$C3" bs --user-config
+check "an earlier render: stable and the fable pin retired, latest, the allowlist and picker row in their place" \
+      eval 'jqt "$C3/settings.json" ".autoUpdatesChannel == \"latest\" and (.env | has(\"ANTHROPIC_DEFAULT_FABLE_MODEL\") | not)" && grep -q "retired    autoUpdatesChannel, env.ANTHROPIC_DEFAULT_FABLE_MODEL" "$TMP/bs.out"'
+check "... which is then the template's own render byte for byte: no copy to merge by hand" \
+      eval 'grep -q "unchanged  $C3/settings.json\$" "$TMP/bs.out" && [ ! -e "$C3/settings.json.canon-proposed" ]'
+C3="$TMP/cfg3"
+jq '.model = "fable"' "$C/settings.json" > "$C3/settings.json"; CLAUDE_CONFIG_DIR="$C3" bs --user-config
+check "the earlier template's model fable is kept, and named" \
+      eval 'jqt "$C3/settings.json" ".model == \"fable\"" && grep -q "KEPT .*sets model to another value" "$TMP/bs.out"'
+jq '.autoUpdatesChannel = "latest" | .env.ANTHROPIC_DEFAULT_FABLE_MODEL = "claude-fable-5-1"' "$C/settings.json" > "$C3/settings.json"
+CLAUDE_CONFIG_DIR="$C3" bs --user-config
+check "values the owner set (latest by name, a pin canon never set) are left alone" \
+      jqt "$C3/settings.json" '.autoUpdatesChannel == "latest" and .env.ANTHROPIC_DEFAULT_FABLE_MODEL == "claude-fable-5-1"'
+
+# Antigravity's default model and self-updater (ADR 0059)
+# shellcheck disable=SC2034  # read by the eval'd checks below
+agy_label=$(jq -r '.runtimes[] | select(.runtime == "antigravity") | .label' "$ROOT/canon/models.json")
+AS="$HOME/.gemini/antigravity-cli/settings.json"
+CLAUDE_CONFIG_DIR="$C" bs --user-config
+check "no Antigravity folder: its model skipped, nothing created" eval '[ ! -e "$HOME/.gemini" ] && grep -q "skipped    Antigravity default model" "$TMP/bs.out"'
+mkdir -p "$(dirname "$AS")"; CLAUDE_CONFIG_DIR="$C" bs --user-config
+check "an Antigravity folder with no settings: a file holding only the model, readable by its owner alone" \
+      eval 'jqt "$AS" ". == {\"model\": \"$agy_label\"}" && [ "$(ls -l "$AS" | cut -c1-10)" = "-rw-------" ]'
+echo '{"trustedWorkspaces": ["/w"]}' > "$AS"; CLAUDE_CONFIG_DIR="$C" bs --user-config
+check "settings with no model: the model added, the rest kept, a copy beside it" \
+      eval 'jqt "$AS" ".model == \"$agy_label\" and .trustedWorkspaces == [\"/w\"]" && [ -n "$(find "$(dirname "$AS")" -name "settings.json.replaced-*")" ]'
+CLAUDE_CONFIG_DIR="$C" bs --check
+check "... and check calls it ok"                   rowis "$TMP/bs.out" "agy default model" ok
+echo '{"model": "Gemini 3.8 Flash (High)"}' > "$AS"; cp "$AS" "$TMP/as.before"; CLAUDE_CONFIG_DIR="$C" bs --user-config
+check "a model the owner chose is left as it is, and named" \
+      eval 'cmp -s "$AS" "$TMP/as.before" && grep -q "KEPT       $AS sets model to Gemini 3.8 Flash (High)" "$TMP/bs.out"'
+CLAUDE_CONFIG_DIR="$C" bs --check
+check "... and check calls it OWNER"                rowis "$TMP/bs.out" "agy default model" OWNER
+echo '[]' > "$AS"; CLAUDE_CONFIG_DIR="$C" bs --user-config
+check "settings that are not a JSON object: INVALID, left as they are" eval 'jqt "$AS" ". == []" && grep -q "INVALID    $AS" "$TMP/bs.out"'
+rm -rf "$HOME/.gemini"
+jq 'del(.runtimes)' "$TMP/models.keep" > "$BS/canon/models.json"; mkdir -p "$(dirname "$AS")"; rm -f "$C/CLAUDE.md"
+CLAUDE_CONFIG_DIR="$C" bs --user-config; rc=$?
+check "no Antigravity label in canon/models.json: UNKNOWN, CLAUDE.md still installed, the run fails" \
+      eval 'grep -q "UNKNOWN    canon/models.json gives no label for antigravity" "$TMP/bs.out" && [ -f "$C/CLAUDE.md" ] && [ ! -e "$AS" ] && [ "$rc" != 0 ]'
+cp "$TMP/models.keep" "$BS/canon/models.json"; rm -rf "$HOME/.gemini"
+# codex defaults: an active profile that sets the model overrides the top level, so check names it
+mkdir -p "$HOME/.codex"
+printf '%s\nprofile = "fast"\n\n[profiles.fast]\nmodel = "o3"\n' "$CXDEF" > "$CX"
+CLAUDE_CONFIG_DIR="$C" bs --check
+check "codex defaults with an active profile setting another model: OWNER, naming the profile" \
+      eval 'rowis "$TMP/bs.out" "codex defaults" OWNER && grep -q "active profile fast" "$TMP/bs.out"'
+printf '%s\n' "$CXDEF" > "$CX"; CLAUDE_CONFIG_DIR="$C" bs --check
+check "codex defaults as home/.codex/defaults.toml: ok" rowis "$TMP/bs.out" "codex defaults" ok
+: > "$CX"; CLAUDE_CONFIG_DIR="$C" bs --check
+check "an empty Codex config: NOT SET, naming the fix" eval 'rowis "$TMP/bs.out" "codex defaults" "NOT SET" && grep -q "lacks model, model_reasoning_effort" "$TMP/bs.out"'
+if [ "$(id -u)" = 0 ]; then skip "an unreadable Codex config" "root reads a file whatever its mode"
+else
+  printf '%s\n' "$CXDEF" > "$CX"; chmod 000 "$CX"; CLAUDE_CONFIG_DIR="$C" bs --check; chmod 644 "$CX"
+  check "an unreadable Codex config: UNKNOWN, saying it cannot be read, not called invalid TOML" \
+        eval 'rowis "$TMP/bs.out" "codex defaults" UNKNOWN && grep -q "config.toml cannot be read" "$TMP/bs.out"'
+fi
+check "home/.codex/defaults.toml holds what canon/models.json gives Codex" \
+      eval 'tomlis "$ROOT/home/.codex/defaults.toml" "d == {\"model\": \"$(jq -r ".runtimes[] | select(.runtime == \"codex\") | .model" "$ROOT/canon/models.json")\", \"model_reasoning_effort\": \"$(jq -r ".runtimes[] | select(.runtime == \"codex\") | .effort" "$ROOT/canon/models.json")\"}"'
+rm -rf "$HOME/.codex"
 CLAUDE_CONFIG_DIR="$TMP/bad\$dir" bs --user-config; rc=$?
 check "unquotable config directory refused"       eval '[ "$rc" != 0 ] && [ ! -e "$TMP/bad\$dir" ]'
 
@@ -1691,6 +1817,24 @@ check "install writes the mise it used into ~/.zshrc" eval '[ "$rc" = 0 ] && gre
 check "install ran mise install with that mise"   grep -q '^mise install' "$STUB/mise.log"
 
 check "install with a claude CLI at the pin runs no installer" eval '[ "$rc" = 0 ] && grep -q "Claude Code CLI $CCPIN (pinned $CCPIN)" "$TMP/bs.out"'
+check "install writes no line turning Antigravity's self-updater off (ADR 0059)" eval '! grep -q AGY_CLI_DISABLE_AUTO_UPDATE "$HOME/.zshrc"'
+# canon's earlier pair, written by the ADR 0045 --install, comes out; an owner's line of the same name stays
+cp "$HOME/.zshrc" "$TMP/zshrc.keep"
+{ cat "$TMP/zshrc.keep"; echo ''; echo '# Antigravity CLI: background self-updater off, so agy stays at its pin (docs/adr/0045)'
+  echo 'export AGY_CLI_DISABLE_AUTO_UPDATE=true'; echo 'alias ll="ls -l"'; } > "$HOME/.zshrc"
+bs --check
+check "check with canon's earlier agy line: OFF, naming the fix" eval 'rowis "$TMP/bs.out" "agy self-updater" OFF && grep -q "run scripts/bootstrap --install" "$TMP/bs.out"'
+bs --install; rc=$?
+check "install removes canon's agy pair and the blank line before it, keeping every other line" \
+      eval '[ "$rc" = 0 ] && [ "$(cat "$HOME/.zshrc")" = "$(cat "$TMP/zshrc.keep"; echo '"'"'alias ll="ls -l"'"'"')" ] && grep -q "removed    canon'"'"'s AGY_CLI_DISABLE_AUTO_UPDATE=true" "$TMP/bs.out"'
+check "... keeping a copy of the previous ~/.zshrc"  eval 'f=$(find "$HOME" -maxdepth 1 -name ".zshrc.replaced-*" | awk "NR == 1"); [ -n "$f" ] && grep -q AGY_CLI_DISABLE_AUTO_UPDATE "$f"'
+echo 'export AGY_CLI_DISABLE_AUTO_UPDATE=true' >> "$HOME/.zshrc"; cp "$HOME/.zshrc" "$TMP/zshrc.owner"
+bs --install
+check "an owner's own AGY_CLI_DISABLE_AUTO_UPDATE line is left alone, and named" \
+      eval 'cmp -s "$HOME/.zshrc" "$TMP/zshrc.owner" && grep -q "KEPT       .*names AGY_CLI_DISABLE_AUTO_UPDATE in a line that is not canon" "$TMP/bs.out"'
+bs --check
+check "... and check calls it OWNER"                rowis "$TMP/bs.out" "agy self-updater" OWNER
+cp "$TMP/zshrc.keep" "$HOME/.zshrc"; rm -f "$HOME/.zshrc.replaced-"*
 
 # --install with no claude on PATH: a curl stub serves an installer stub that records its arguments and puts
 # a claude in ~/.local/bin that reports $STUB/installed-version, so nothing is downloaded

@@ -111,7 +111,8 @@ be used within these limits (ADR 0021):
   removes it. It is an additional reader, never ADR 0017's required review, and
   never blocks: only the coordinator starts one, after landing unless it names the change, and no lane
   waits on it. Its findings are claims the owning lane reproduces before changing anything. Codex runs
-  on the model and effort ADR 0045 names; the others run on their own defaults.
+  on the model and effort ADR 0045 names; the others run on the defaults ADR 0059 names: Antigravity's
+  is in its settings file, and Muse is started with `--model muse-wonder-1.0 --effort max`.
 * The review lifecycle (ADR 0045): a Claude lane builds, runs `/code-review` and lands. For a change on
   the paths that get `/code-review` at high effort, the coordinator creates the review as a task that
   depends on the build (`task-create --deps`) and starts it when `task-list --ready` shows it and the
