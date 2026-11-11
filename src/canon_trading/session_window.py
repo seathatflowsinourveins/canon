@@ -757,6 +757,12 @@ def window_node(
             warm_up_start=warm_up_start,  # in pre-market, the prior session's (`warm_up_start`)
             strategy_id=STRATEGY_ID,
             order_id_tag="001",
+            # What the node books in the instrument for a fill the strategy did not hear of (a submit
+            # never answered, filled later: claim 10) is this strategy's own, not `EXTERNAL`'s: "Claimed
+            # orders and fills use the claiming strategy ID, so the strategy can continue managing the
+            # recovered state" (concepts/execution/reconciliation, "Order ownership and tags"), as
+            # upstream's `exec_tester.py` examples claim theirs.
+            external_order_instrument_ids=[config.instrument_id],
             # In the session, `stop()` runs upstream's market exit, with closing orders Alpaca takes.
             manage_stop=not extended,
             market_exit_reduce_only=False,
@@ -786,7 +792,11 @@ class WindowReport:
     shortened: str = ""
     """Why the window runs shorter than the minutes asked for, if it does."""
     orders: dict[str, list[str]] = field(default_factory=dict)
+    """Each of the strategy's orders in the node's cache, by client order ID, with its events' names. One
+    with no `OrderSubmitted` was not sent by the strategy: the node's reconciliation booked it for a fill
+    the strategy did not hear of, and the strategy's claim on the instrument made it the strategy's."""
     fills: int = 0
+    """The `OrderFilled` events of those orders, those the node's reconciliation booked included."""
     denials: dict[str, str] = field(default_factory=dict)
     dropped: list[str] = field(default_factory=list)
     cap_checks: int = 0

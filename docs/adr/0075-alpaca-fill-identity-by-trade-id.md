@@ -211,6 +211,14 @@ fixed on its own branch after this one. Observed while building: a report return
 reconciled before the fills generated just before it, and the engine inferred a fill; so a report waits
 for the node's cached order.
 
+The in-flight-timeout external booking named under Consequences (session window claim 10) is closed for
+the paper nodes by two upstream settings, recorded in ADR 0044's Confirmation: the engine retains a submit
+never answered, and the window's strategy claims its instrument. On this model, the position check's fill
+report for such an order carries an Alpaca order ID the node never heard, and the engine makes it an
+external reduce-only order (`materialize_external_order_from_fill` at the pin). Retained, the order stays
+submitted. Claimed, the booking is the strategy's own (`test_retaining_alone_still_books_a_lost_fill_to_external`,
+`test_a_submit_never_answered_and_filled_later_is_the_strategys_own_with_both_settings`).
+
 ## Evidence
 
 Read 2026-11-11.

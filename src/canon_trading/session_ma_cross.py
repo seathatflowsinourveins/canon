@@ -381,7 +381,10 @@ class SessionMaCross(MaCross):
         )
 
     def held(self) -> Decimal:
-        """This strategy's signed open quantity in the instrument: positive long, negative short."""
+        """This strategy's signed open quantity in the instrument: positive long, negative short. A
+        window's strategy claims its instrument (`external_order_instrument_ids`, `window_node`), so a
+        position the node books for a fill the strategy did not hear of is counted here, by strategy ID,
+        as upstream's `market_exit` counts it."""
         return sum(
             (
                 p.signed_qty

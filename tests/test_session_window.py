@@ -5084,3 +5084,44 @@ def test_the_window_task_names_the_account_whose_pair_it_reads() -> None:
     assert task["env"][session_window.ACCOUNT_ENV] == "windows"
     for item in ("ALPACA_API_KEY", "ALPACA_SECRET_KEY"):
         assert f"-s canon-alpaca-paper-windows -a {item} -w" in task["env"][item]["value"]
+
+
+# The session window's claim 10 (ADR 0044, ADR 0075): a submit never answered that Alpaca fills later.
+
+
+@pytest.mark.parametrize("session", ["regular", "extended"])
+def test_the_window_strategy_claims_its_instrument(tmp_path, extended, session) -> None:
+    """The node's position check booked the fill of a submit the node had given up on to `EXTERNAL`,
+    which `SessionMaCross` does not read (`held`, by strategy ID): after a closing sell it sold a share it
+    no longer held, after an entry it bought a second. Claimed, what the node books in the instrument is
+    the strategy's own (the adapter's `test_retaining_alone_still_books_a_lost_fill_to_external` and
+    `..._is_the_strategys_own_with_both_settings`)."""
+    node, s, _ = session_window.window_node(
+        WindowConfig(session=session, log_dir=tmp_path),
+        wind_down_at=datetime(2026, 11, 10, 21, 30, tzinfo=UTC),
+        log_name="claim",
+        feed="iex",
+    )
+    try:
+        assert isinstance(s, SessionMaCross)
+        assert s.config is not None
+        assert s.config.external_order_instrument_ids == [SPY]
+    finally:
+        node.dispose()
+
+
+def test_the_paper_nodes_retain_a_submit_never_answered() -> None:
+    """With upstream's default the node rejects such an order itself once its in-flight queries run out
+    (`INFLIGHT_TIMEOUT`), though Alpaca may hold it and fill it, and a strategy that sends nothing while one
+    of its orders works then sends again (the adapter's
+    `test_the_claim_alone_leaves_the_order_closed_while_alpaca_may_still_fill_it`)."""
+    from nautilus_trader.live import SubmissionRecoveryPolicy
+
+    assert (
+        exec_engine_config(SPY).submission_recovery_policy
+        == SubmissionRecoveryPolicy.RETAIN_UNRESOLVED
+    )
+    assert (
+        LiveExecutionEngineConfig().submission_recovery_policy
+        == SubmissionRecoveryPolicy.RESOLVE_LOCALLY
+    )
