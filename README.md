@@ -33,6 +33,7 @@ previous copy of each.
 | `scripts/ci` | Every check in one run: registry, shell, self-tests and `scripts/test-*`, lockfile, ruff, ty, pytest, workflow, secrets |
 | `scripts/land` | Land the current branch on `main` once every check passes |
 | `scripts/canon lint` | Registry, lock and ADRs have the required evidence (offline) |
+| `scripts/canon src [id]` | Read an upstream's source at its pin: fetches the locked commit into a read-only folder under `~/.cache/canon/upstream-src/` and prints the path |
 | `scripts/canon check` | Compare pins with live upstream; warns if a release tag was re-pointed or the lock is stale |
 | `scripts/canon outdated` | Upstreams with a newer release than the one pinned |
 | `scripts/canon resolve` | Re-resolve pins and rewrite the lock |
