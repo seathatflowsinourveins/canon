@@ -129,11 +129,13 @@ mise run paper:long-only windows check  # print Alpaca's long-only setting (no_s
                         # on and off set it (tests names account A)
 mise run paper:account windows  # print account B, GET only: balances, positions, open orders
                         # marked ours or foreign by client order ID, and no_shorting
+mise run paper:close windows  # cancel and close only what our nodes opened on account B;
+                        # any symbol with something else in it is frozen and named
 ```
 
 There are two paper accounts ([ADR 0069](docs/adr/0069-two-paper-accounts.md)): account A, the default,
-whose pair only `paper:test`, the data-only `paper:data`, `paper:long-only tests` and `paper:account tests` read, and account B
-(`windows`), whose pair only `paper:session` and its schedule, `paper:long-only windows` and `paper:account windows` read. Each account has its own lock, so a test and a window do not wait for each other; the two
+whose pair only `paper:test`, the data-only `paper:data`, `paper:long-only tests`, `paper:account tests` and `paper:close tests` read, and account B
+(`windows`), whose pair only `paper:session` and its schedule, `paper:long-only windows`, `paper:account windows` and `paper:close windows` read. Each account has its own lock, so a test and a window do not wait for each other; the two
 pairs each have their own market-data stream lock too (ADR 0069), so a paper test that streams and a window
 do not wait for each other either; a paper test that streams and a streaming `paper:data` run, both on A's
 pair, take turns. `mise run paper:data sandbox [--minutes N]` runs NautilusTrader's sandbox execution client on

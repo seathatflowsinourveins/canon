@@ -624,3 +624,50 @@ export ALPACA_API_KEY ALPACA_SECRET_KEY CANON_PAPER_ACCOUNT="$usage_account" CAN
 echo "account: $usage_account"
 exec /usr/bin/timeout -s KILL 300 uv run --locked python -c 'from canon_trading.custody import account_task; raise SystemExit(account_task())'
 '''
+
+[tasks."paper:close"]
+description = "Cancel and close only what our nodes' lineage wrote on one paper account; freeze and report anything else"
+shell = "bash -c"
+timeout = "30m"
+usage = '''
+arg "<account>" help="tests: account A, which paper:test reads; windows: account B, which paper:session reads (ADR 0069)" {
+  choices "tests" "windows"
+}
+'''
+run = '''
+lockwait=900
+case "${usage_account:-}" in
+  tests) svc=canon-alpaca-paper; lock=canon-paper-test.lock ;;
+  windows) svc=canon-alpaca-paper-windows; lock=canon-paper-windows.lock ;;
+  *) echo "paper:close: no paper account named '${usage_account:-}'; the names are tests and windows; nothing was read" >&2; exit 3 ;;
+esac
+ALPACA_API_KEY="$(/usr/bin/timeout 30 /usr/bin/security find-generic-password -s "$svc" -a ALPACA_API_KEY -w)" || ALPACA_API_KEY=""
+ALPACA_SECRET_KEY="$(/usr/bin/timeout 30 /usr/bin/security find-generic-password -s "$svc" -a ALPACA_SECRET_KEY -w)" || ALPACA_SECRET_KEY=""
+[ -n "$ALPACA_API_KEY" ] && [ -n "$ALPACA_SECRET_KEY" ] || { echo "paper:close: account ${usage_account}'s pair is not in the login keychain (mise run paper:check ${usage_account}); nothing was read" >&2; exit 1; }
+export ALPACA_API_KEY ALPACA_SECRET_KEY CANON_PAPER_ACCOUNT="$usage_account"
+tmp="$(/usr/bin/getconf DARWIN_USER_TEMP_DIR)" || tmp=""
+case "$tmp" in /*/) ;; *) echo "paper:close: the per-user temporary folder is not known, so there is no paper lock to take; nothing was sent" >&2; exit 1 ;; esac
+# lock_wait <fd> <secs>: the exclusive lock on an open descriptor, waiting at most <secs>; 0 when held, 1 when the
+# bound ran out (a bound can run over by up to a second), or at once when lockf fails for any reason but the
+# lock being held (exit 75, EX_TEMPFAIL). lockf(1)'s descriptor form (`lockf -t <secs> <fd>`, man lockf) busy-loops while it waits, about
+# 71% of a core after 6 s (measured on this Mac), so this polls `lockf -t 0 <fd>`, which fails unless it can
+# take the lock at once, with a one-second sleep: about no CPU. The lock belongs to the open file description,
+# so every process the task starts still inherits it (the note above paper:test). The same text is in every
+# paper task that waits for a lock (scripts/test-lanes checks that).
+# Here tests/test_custody.py checks it against paper:test's.
+lock_wait() {
+  lw_end=$(( $(/bin/date +%s) + $2 ))
+  while :; do
+    /usr/bin/lockf -t 0 "$1" 2>/dev/null; lw_rc=$?
+    [ "$lw_rc" = 0 ] && return 0
+    [ "$lw_rc" = 75 ] || return 1
+    [ "$(/bin/date +%s)" -lt "$lw_end" ] || return 1
+    sleep 1
+  done
+}
+exec 9>>"${tmp}${lock}"
+lock_wait 9 "$lockwait" || { echo "paper:close: account ${usage_account}'s lock stayed held for $lockwait s; nothing was sent" >&2; exit 1; }
+echo "account: $usage_account"
+# TERM at 600 s lets the run cancel what it sent (custody.close_task); KILL 30 s later if it has not ended
+exec /usr/bin/timeout -s TERM -k 30 600 uv run --locked python -c 'from canon_trading.custody import close_task; raise SystemExit(close_task())'
+'''
