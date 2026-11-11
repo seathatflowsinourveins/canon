@@ -42,8 +42,11 @@ repository (UNVERIFIED here).
    at most 200 symbols, planned for at most `MAX_ROWS_PER_CALL` (100,000) bars. The count allows one bar
    per minute, or per 23 hours for daily bars: New York daily opens can be only 23 hours apart at
    spring DST, although `parse_bar` adds a fixed 24 hours to each open. It also counts a boundary row
-   returned again when alpaca-py truncates a gap's nanoseconds to microseconds. A window longer than
-   the bound for one symbol is cut into segments, each written over its own bounds. The returned row
+   returned again if a venue or test stand-in truncates a gap's nanoseconds to microseconds. The
+   stand-in's `datetime.fromisoformat` does this; alpaca-py preserves the request's nanoseconds via
+   `isoformat()` (`alpaca/common/requests.py:54` at `c42add7c0a70`). Alpaca's server-side query parsing
+   remains UNVERIFIED. A window longer than the bound for one symbol is cut into segments, each
+   written over its own bounds. The returned row
    count, including rows outside the gap, is checked before parsing or writing: an overfull response
    stops by name, and none of that response is written. The request is `StockBarsRequest(symbol_or_symbols=…, timeframe, start, end,
    feed=sip)`, with no limit and no adjustment, so Alpaca's default `raw` applies, as for `load_bars`.

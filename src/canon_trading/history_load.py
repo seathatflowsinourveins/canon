@@ -15,7 +15,9 @@ Contracts:
 * The adapter's own window and parsing (`canon_alpaca.data.alpaca_bars_window`, `parse_bar`,
   `bar_timeframe`), followed by the engine's inclusive `ts_init` filter, so a bar written here is the
   bar `canon_trading.bars_to_catalog.load_bars` would write. A gap starts one nanosecond after coverage;
-  alpaca-py's datetime truncation can return the boundary bar again, so the filter matters.
+  a venue or test stand-in truncating nanoseconds can return the boundary bar again. Here the stand-in's
+  `datetime.fromisoformat` truncates; alpaca-py keeps the request's nanoseconds via `isoformat()`
+  (`alpaca/common/requests.py:54` at `c42add7c0a70`). Alpaca's server-side parsing is UNVERIFIED.
   `bar_roundings` names rounded SIP prices with a count and the first example, as the adapter does.
 * NautilusTrader v2.0.0rc8 `ParquetDataCatalog.write_bars(data, start, end)`, the bounds overriding the
   file's interval as the node's catalog write-back gives them, and `get_missing_intervals_for_request`
@@ -207,8 +209,11 @@ def margin(spec: str) -> timedelta:
 def _segments(
     intervals: Sequence[tuple[int, int]], step: int, max_rows: int
 ) -> Iterator[tuple[int, int]]:
-    """Cut inclusive, disjoint parts using the minimum spacing `step` between bars. Allow for
-    alpaca-py's datetime truncation: the request can also return a bar just before `lo`."""
+    """Cut inclusive, disjoint parts using the minimum spacing `step` between bars. Allow for a venue
+    or test stand-in truncating nanoseconds and returning a bar just before `lo`. The stand-in does
+    this; alpaca-py preserves them (`alpaca/common/requests.py:54` at `c42add7c0a70`). Whether Alpaca's
+    server truncates is UNVERIFIED.
+    """
     for lo, hi in intervals:
         while lo <= hi:
             request_lo = lo // 1_000 * 1_000
