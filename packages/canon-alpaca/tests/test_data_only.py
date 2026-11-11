@@ -282,6 +282,9 @@ CONSTRUCTION_SITES = {
     ("canon_trading/movers_screener.py", "screener_client", "ScreenerClient"),
     ("canon_trading/movers_stream.py", "data_client", "StockHistoricalDataClient"),
     ("canon_trading/session_window.py", "paper_trading", "TradingClient"),
+    ("canon_trading/session_window.py", "window_actions", "CorporateActionsClient"),
+    ("canon_trading/session_window.py", "window_data", "StockHistoricalDataClient"),
+    ("canon_trading/session_window.py", "window_screener", "ScreenerClient"),
 }
 """Where this repository's source builds an alpaca-py REST client; each passes it to `with_http_timeout`."""
 

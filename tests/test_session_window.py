@@ -407,7 +407,6 @@ def test_the_native_runtime_checks_are_turned_on() -> None:
     ("changes", "message"),
     [
         ({"session": "overnight"}, "session"),
-        ({"symbol": "AAPL"}, "sized for SPY"),
         ({"minutes": 61}, "minutes"),
         ({"minutes": 2}, "wind-down"),
     ],
@@ -1053,19 +1052,14 @@ class Account:
     def get_orders(self, filter=None) -> list:
         return self.orders
 
-    def get_open_position(self, symbol):
-        from alpaca.common.exceptions import APIError
-
-        raise APIError(
-            '{"code": 40410000, "message": "position does not exist"}',
-            SimpleNamespace(response=SimpleNamespace(status_code=404)),
-        )
+    def get_all_positions(self) -> list:
+        return []
 
 
 def test_a_window_does_not_start_unless_the_account_is_flat(monkeypatch, tmp_path) -> None:
-    held = SimpleNamespace(client_order_id="someone-elses")
+    held = SimpleNamespace(client_order_id="someone-elses", symbol="SPY")
     monkeypatch.setattr(session_window, "paper_trading", lambda: Account(orders=[held]))
-    with pytest.raises(RuntimeError, match="not flat in SPY; not starting"):
+    with pytest.raises(RuntimeError, match="not flat; not starting"):
         session_window.run_window(WindowConfig(log_dir=tmp_path))
 
 
@@ -1528,7 +1522,7 @@ def test_auto_outside_every_session_runs_nothing_and_exits_0(monkeypatch, tmp_pa
 
 
 def test_a_refused_window_is_the_latest_record(monkeypatch, tmp_path) -> None:
-    held = SimpleNamespace(client_order_id="someone-elses")
+    held = SimpleNamespace(client_order_id="someone-elses", symbol="SPY")
     monkeypatch.setattr(session_window, "paper_trading", lambda: Account(orders=[held]))
     monkeypatch.setenv(session_window.COMMIT_ENV, "a" * 40)
     assert session_window.main(["--log-dir", str(tmp_path)]) == 1
@@ -1628,6 +1622,7 @@ def quiet_window(
     account=None,
     strategy="SessionMaCross",
     session="regular",
+    mover=False,
 ):
     """A window of `strategy` whose node runs at once, its strategy having seen `quotes`, `trades` and
     `live_bars`, and its node log holding the lines `log`; returns the report or the error, and the
@@ -1651,7 +1646,7 @@ def quiet_window(
     seen: dict = {}
 
     def node(config, **kw):
-        seen.update(kw)
+        seen.update(kw, config=config)
         (config.log_dir / f"{kw['log_name']}.log").write_text("\n".join(log))
         return Ran(), s, cap
 
@@ -1661,7 +1656,7 @@ def quiet_window(
     monkeypatch.setattr(session_window, "_flatten_after_stop", lambda *a, **k: [])
     try:
         outcome: Any = session_window.run_window(
-            WindowConfig(log_dir=tmp_path, strategy=strategy, session=session)
+            WindowConfig(log_dir=tmp_path, strategy=strategy, session=session, mover=mover)
         )
     except RuntimeError as e:
         outcome = e
@@ -2423,7 +2418,7 @@ def test_a_dropped_entry_is_not_chased_until_the_signal_changes(monkeypatch) -> 
 
 def test_a_refused_window_updates_the_heartbeat(monkeypatch, tmp_path) -> None:
     """Finding 6: the heartbeat still read 'a regular window' after a refusal."""
-    held = SimpleNamespace(client_order_id="someone-elses")
+    held = SimpleNamespace(client_order_id="someone-elses", symbol="SPY")
     monkeypatch.setattr(session_window, "paper_trading", lambda: Account(orders=[held]))
     assert session_window.main(["--log-dir", str(tmp_path)]) == 1
     heard = json.loads((tmp_path / "last-firing.json").read_text())
@@ -2721,7 +2716,9 @@ class Delayed:
         import time
 
         time.sleep(self.delay)
-        self.account.orders.append(SimpleNamespace(id="late-1", client_order_id="entry-late"))
+        self.account.orders.append(
+            SimpleNamespace(id="late-1", client_order_id="entry-late", symbol="SPY")
+        )
 
     async def run_async(self) -> None:
         import asyncio
@@ -3329,9 +3326,8 @@ class Flat:
         return []
     def get_orders(self, filter=None):
         return []
-    def get_open_position(self, symbol):
-        from alpaca.common.exceptions import APIError
-        raise APIError('{"code": 40410000}', SimpleNamespace(response=SimpleNamespace(status_code=404)))
+    def get_all_positions(self):
+        return []
     def get_account_configurations(self):
         from alpaca.trading.models import AccountConfiguration
         return AccountConfiguration(no_shorting=True, suspend_trade=False, fractional_trading=True,
@@ -3340,6 +3336,9 @@ class Flat:
 
 session_window.ADAPTER_CALL_SECS = 0.3
 session_window.paper_trading = lambda: Flat()
+session_window.window_data = lambda: SimpleNamespace(
+    get_stock_latest_trade=lambda r: {r.symbol_or_symbols: SimpleNamespace(price=750.0)}
+)
 s = SimpleNamespace(dropped=[], history_bars=0, history_dropped=0, quotes=1, trades=1, live_bars=0)
 cap = SimpleNamespace(checks=1, peak=Decimal(0), tripped=None)
 session_window.window_node = lambda config, **kw: (Clean(), s, cap)
@@ -3754,22 +3753,24 @@ class Venue:
         self._answer("orders", fault)
         return answer
 
-    def get_open_position(self, symbol) -> Position:
+    def get_all_positions(self) -> list[Position]:
         fault = self._request("position")
         qty = self.qty
         self._answer("position", fault)
         if not qty:
-            raise api_error(404, 40410000, "position does not exist")
-        return Position(
-            asset_id=uuid4(),
-            symbol=symbol,
-            exchange="ARCA",
-            asset_class="us_equity",
-            avg_entry_price="750",
-            qty=str(qty),
-            side="long" if qty > 0 else "short",
-            cost_basis=str(750 * qty),
-        )
+            return []
+        return [
+            Position(
+                asset_id=uuid4(),
+                symbol="SPY",
+                exchange="ARCA",
+                asset_class="us_equity",
+                avg_entry_price="750",
+                qty=str(qty),
+                side="long" if qty > 0 else "short",
+                cost_basis=str(750 * qty),
+            )
+        ]
 
     def get_order_by_client_id(self, client_id: str) -> Order:
         fault = self._request(f"lookup {client_id}")
@@ -4299,8 +4300,8 @@ def test_the_stand_in_refuses_as_alpaca_does(fake_time) -> None:
     with pytest.raises(APIError) as gone:
         flat.close_position("SPY")
     assert gone.value.status_code == 404
-    assert session_window.position_qty(cast(TradingClient, flat), "SPY") == 0
-    assert session_window.position_qty(cast(TradingClient, venue), "SPY") == 1
+    assert session_window.positions(cast(TradingClient, flat)) == {}
+    assert session_window.positions(cast(TradingClient, venue)) == {"SPY": 1}
 
 
 # Three independent reviews of the check as landed (2026-11-10): each shown here before its fix.
@@ -4736,6 +4737,7 @@ def test_a_window_starts_only_on_an_account_alpaca_holds_long_only(monkeypatch, 
     assert "paper:long-only" in str(refused.value)
     assert not (tmp_path / "latest.json").exists()
     monkeypatch.undo()
+    monkeypatch.setattr(session_window, "window_data", lambda: Data())
     _, latest, _ = quiet_window(monkeypatch, tmp_path / "held", quotes=5, trades=0)
     assert latest["result"] == "ok" and latest["no_shorting"] is True
 
@@ -4970,7 +4972,7 @@ def test_a_window_record_names_its_strategy(monkeypatch, tmp_path, ema_cross_run
 
 
 def test_a_refused_window_record_names_its_strategy(monkeypatch, tmp_path, ema_cross_runs) -> None:
-    held = SimpleNamespace(client_order_id="someone-elses")
+    held = SimpleNamespace(client_order_id="someone-elses", symbol="SPY")
     monkeypatch.setattr(session_window, "paper_trading", lambda: Account(orders=[held]))
     argv = ["--session", "regular", "--strategy", "EmaCross", "--log-dir", str(tmp_path)]
     assert session_window.main(argv) == 1
@@ -5084,3 +5086,610 @@ def test_the_window_task_names_the_account_whose_pair_it_reads() -> None:
     assert task["env"][session_window.ACCOUNT_ENV] == "windows"
     for item in ("ALPACA_API_KEY", "ALPACA_SECRET_KEY"):
         assert f"-s canon-alpaca-paper-windows -a {item} -w" in task["env"][item]["value"]
+
+
+# A window on today's top mover, as a check of the stack on a mover (ADR 0083, its dated line of
+# 2026-11-11): the symbol chosen once before the node is built, one share inside the cap for any symbol,
+# and the account checked whole at the start and after the stop.
+
+TODAY = date(2026, 11, 10)
+"""`Account`'s clock day: 11:00 New York, 90 minutes after `CALENDAR`'s regular open."""
+AT = datetime(2026, 11, 10, 11, 0, tzinfo=NEW_YORK)
+
+
+@dataclass
+class Name:
+    """One gainer as the fakes serve it: its last completed close, today's one bar (09:31 New York), its
+    latest sip trade and how old that is at `AT`, and whether Alpaca's asset is tradable."""
+
+    reference: float
+    close: float
+    volume: float
+    price: float
+    trade_age: float = 5.0
+    tradable: bool = True
+    name: str = "Example Inc. Common Stock"
+    action: str = ""
+    """A corporate action type Alpaca lists for it since the last session, if any."""
+
+
+NAMES = {
+    # score = (close / reference - 1) x (close x volume / 100), the normal being 100 dollars a session
+    "BBB": Name(1000.0, 1500.0, 10, 1500.0),  # 75: one share is over the cap
+    "AAA": Name(3.0, 4.5, 1000, 4.5, name="Example Acquisition Corp. Warrants"),  # 22.5
+    "CCC": Name(10.0, 15.0, 200, 15.0, tradable=False),  # 15
+    "DDD": Name(10.0, 15.0, 150, 15.0, trade_age=300.0),  # 11.25: no sip trade for 300 s
+    "KKK": Name(10.0, 15.0, 140, 15.0, action="reverse_splits"),  # 10.5
+    "LLL": Name(1.0, 1.5, 1200, 1.5),  # 9.0 at 1.50 USD: no price floor, so the pick
+    "EEE": Name(10.0, 12.0, 200, 12.0),  # 4.8
+    "FFF": Name(10.0, 11.0, 100, 11.0),  # 1.1
+    "GGG": Name(10.0, 9.0, 1000, 9.0),  # fallen: not ranked
+}
+
+
+def raw_bar(t: datetime, close: float, volume: float) -> dict:
+    stamp = t.astimezone(UTC).isoformat().replace("+00:00", "Z")
+    return {
+        "t": stamp,
+        "o": close,
+        "h": close,
+        "l": close,
+        "c": close,
+        "v": volume,
+        "n": 1,
+        "vw": close,
+    }
+
+
+class Data:
+    """A stand-in for alpaca-py's `StockHistoricalDataClient` (0.45.0): latest trades, snapshots and minute
+    bars of `names`; every request is kept."""
+
+    def __init__(self, names: dict[str, Name] | None = None, *, price: float = 750.0) -> None:
+        self.names = NAMES if names is None else names
+        self.price = price
+        self.requests: list = []
+
+    def get_stock_latest_trade(self, request_params) -> dict:
+        from alpaca.data.models.trades import Trade
+
+        self.requests.append(request_params)
+        symbol = request_params.symbol_or_symbols
+        raw = {"t": AT.astimezone(UTC).isoformat(), "p": self.price, "s": 1, "x": "V", "i": 1}
+        return {symbol: Trade(symbol, raw)}
+
+    def get_stock_snapshot(self, request_params) -> dict:
+        self.requests.append(request_params)
+        before = SimpleNamespace(timestamp=datetime(2026, 11, 9, 5, tzinfo=UTC), close=0.0)
+        return {
+            s: SimpleNamespace(
+                daily_bar=None,
+                previous_daily_bar=SimpleNamespace(timestamp=before.timestamp, close=n.reference),
+                latest_trade=SimpleNamespace(
+                    price=n.price, timestamp=AT - timedelta(seconds=n.trade_age)
+                ),
+            )
+            for s in request_params.symbol_or_symbols
+            if (n := self.names.get(s)) is not None
+        }
+
+    def get_stock_bars(self, request_params):
+        from alpaca.data.models.bars import BarSet
+
+        self.requests.append(request_params)
+        start = request_params.start.replace(tzinfo=UTC)
+        if start.astimezone(NEW_YORK).date() == TODAY:  # today's, from the open
+            bars = {
+                s: [raw_bar(start + timedelta(minutes=1), n.close, n.volume)]
+                for s, n in self.names.items()
+                if s in request_params.symbol_or_symbols
+            }
+        else:  # a prior session's same minutes: 100 dollars each
+            bars = {s: [raw_bar(start, 10.0, 10)] for s in request_params.symbol_or_symbols}
+        return BarSet(bars)
+
+
+class Screener:
+    """A stand-in for alpaca-py's `ScreenerClient`: Alpaca's movers, `names` as its gainers in order."""
+
+    def __init__(self, names: dict[str, Name] | None = None) -> None:
+        self.names = NAMES if names is None else names
+        self.requests: list = []
+
+    def get_market_movers(self, request_params):
+        from alpaca.data.models.screener import Mover
+        from alpaca.data.models.screener import Movers
+
+        self.requests.append(request_params)
+        gainers = [
+            Mover(
+                symbol=s,
+                percent_change=(n.close / n.reference - 1) * 100,
+                change=0.0,
+                price=n.price,
+            )
+            for s, n in self.names.items()
+        ]
+        return Movers(gainers=gainers, losers=[], market_type="stocks", last_updated=AT)
+
+
+class Actions:
+    """A stand-in for alpaca-py's `CorporateActionsClient`: each of `NAMES` with an `action` has one."""
+
+    def __init__(self) -> None:
+        self.requests: list = []
+
+    def get_corporate_actions(self, request_params):
+        from alpaca.data.models.corporate_actions import CorporateActionsSet
+
+        self.requests.append(request_params)
+        found: dict[str, list] = {}
+        for s in request_params.symbols:
+            if (n := NAMES.get(s)) is not None and n.action == "reverse_splits":
+                found.setdefault("reverse_splits", []).append(
+                    {
+                        "id": "00000000-0000-0000-0000-000000000000",
+                        "symbol": s,
+                        "old_cusip": "000000000",
+                        "new_cusip": "000000001",
+                        "new_rate": 1,
+                        "old_rate": 10,
+                        "process_date": "2026-11-10",
+                        "ex_date": "2026-11-10",
+                    }
+                )
+        return CorporateActionsSet(found)
+
+
+PRIOR_DAY = Calendar(
+    date="2026-11-09", open="09:30", close="16:00", session_open="0400", session_close="2000"
+)
+
+
+class Assets(Account):
+    """`Account` with Alpaca's assets for `NAMES`, active, tradable as each says; reads counted."""
+
+    def get_calendar(self, filters=None) -> list[Calendar]:
+        return [PRIOR_DAY, CALENDAR]
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.assets: list[str] = []
+
+    def get_asset(self, symbol):
+        from alpaca.trading.models import Asset
+
+        self.assets.append(symbol)
+        name = NAMES.get(symbol)
+        return Asset(
+            id=uuid4(),
+            **{"class": "us_equity"},
+            exchange="NASDAQ",
+            symbol=symbol,
+            name=name.name if name else "Example Inc. Common Stock",
+            status="active",
+            tradable=name.tradable if name else True,
+            marginable=True,
+            shortable=True,
+            fractionable=True,
+        )
+
+
+@pytest.fixture(autouse=True)
+def priced(monkeypatch):
+    """Every window reads one share's price before it starts: here SPY's at $750 unless a test says
+    otherwise; no test reads Alpaca's screener unless it hands one in."""
+    monkeypatch.setattr(session_window, "window_data", lambda: Data(), raising=False)
+    monkeypatch.setattr(
+        session_window,
+        "window_screener",
+        lambda: pytest.fail("the screener was read"),
+        raising=False,
+    )
+    monkeypatch.setattr(session_window, "window_actions", lambda: Actions(), raising=False)
+
+    def no_stream():
+        raise session_window.StreamSampleFailed("no stream in tests")
+
+    monkeypatch.setattr(session_window, "window_stream", no_stream, raising=False)
+
+
+def test_one_share_must_fit_the_cap_for_any_symbol(monkeypatch, tmp_path) -> None:
+    """The window took SPY only, because the notional cap is sized for SPY. Now any symbol runs whose one
+    share fits the per-order cap, read from its latest sip trade before the node is built."""
+    WindowConfig(symbol="AAPL")  # no longer refused by name
+    built: list = []
+
+    class Built(Exception):
+        pass
+
+    def node(config, **kw):
+        built.append(config)
+        raise Built
+
+    monkeypatch.setattr(session_window, "window_node", node)
+    monkeypatch.setattr(session_window, "_flatten_after_stop", lambda *a, **k: [])
+    monkeypatch.setattr(session_window, "window_data", lambda: Data(price=1000.01))
+    with pytest.raises(session_window.WindowRefused, match="one share of AAPL at 1000.01 USD"):
+        session_window.run_window(
+            WindowConfig(symbol="AAPL", log_dir=tmp_path), trading=cast(TradingClient, Account())
+        )
+    assert built == []
+    data = Data(price=250.0)
+    monkeypatch.setattr(session_window, "window_data", lambda: data)
+    with pytest.raises(Built):  # it got as far as building the node
+        session_window.run_window(
+            WindowConfig(symbol="AAPL", log_dir=tmp_path / "b"),
+            trading=cast(TradingClient, Account()),
+        )
+    assert [c.symbol for c in built] == ["AAPL"]
+    [asked] = data.requests
+    assert asked.symbol_or_symbols == "AAPL" and asked.feed.value == "sip"
+
+
+def test_the_start_check_reads_the_whole_account(monkeypatch, tmp_path) -> None:
+    """The start check read open orders and the position in the window's symbol only, so a window could
+    start beside an order or a position in another symbol."""
+
+    class Elsewhere(Account):
+        def get_all_positions(self) -> list:
+            return [held_position("QQQ", 3)]
+
+    monkeypatch.setattr(session_window, "window_node", lambda *a, **k: pytest.fail("built"))
+    with pytest.raises(session_window.WindowRefused, match=r"not flat; not starting.*3 QQQ"):
+        session_window.run_window(
+            WindowConfig(log_dir=tmp_path), trading=cast(TradingClient, Elsewhere())
+        )
+    order = SimpleNamespace(client_order_id="theirs", symbol="QQQ")
+    with pytest.raises(session_window.WindowRefused, match="open order theirs in QQQ"):
+        session_window.run_window(
+            WindowConfig(log_dir=tmp_path), trading=cast(TradingClient, Account(orders=[order]))
+        )
+
+
+def held_position(symbol: str, qty: int) -> Position:
+    return Position(
+        asset_id=uuid4(),
+        symbol=symbol,
+        exchange="NASDAQ",
+        asset_class="us_equity",
+        avg_entry_price="100",
+        qty=str(qty),
+        side="long" if qty > 0 else "short",
+        cost_basis=str(100 * qty),
+    )
+
+
+def test_the_check_after_the_stop_reads_the_whole_account_and_touches_only_its_symbol(
+    tmp_path,
+) -> None:
+    """After the stop the check read the window's symbol only, so an order or a position elsewhere was
+    called flat. It names them now, and sends nothing for them: they are not the window's."""
+    sent: list = []
+
+    class Elsewhere(Account):
+        def get_orders(self, filter=None) -> list:
+            assert getattr(filter, "symbols", None) is None  # the whole account
+            return [SimpleNamespace(id="o-1", client_order_id="theirs", symbol="QQQ", status="new")]
+
+        def get_all_positions(self) -> list:
+            return [held_position("QQQ", 2)]
+
+        def cancel_order_by_id(self, order_id) -> None:
+            sent.append(("cancel", order_id))
+
+        def submit_order(self, order_data) -> None:
+            sent.append(("submit", order_data))
+
+    report = session_window.WindowReport("regular", "SPY", started="20261110T160000Z")
+    left = session_window._flatten_after_stop(
+        cast(TradingClient, Elsewhere()), WindowConfig(log_dir=tmp_path), report
+    )
+    assert left == ["open order theirs in QQQ", "position of 2 QQQ"]
+    assert sent == []
+
+
+def test_a_mover_is_the_top_ranked_name_that_passes_every_filter() -> None:
+    """The pick is the first of the movers ranking (`movers_stream.rank`, UNCALIBRATED) over Alpaca's
+    gainers that is active and tradable, not a warrant, unit or right, with no corporate action since the
+    last session, a sip trade inside `FRESH_TRADE_SECS`, and one share inside the cap; no price floor.
+    Each name passed over is named with why."""
+    trading, data, screener, actions = Assets(), Data(), Screener(), Actions()
+    opens = datetime(2026, 11, 10, 9, 30, tzinfo=NEW_YORK)
+    pick = session_window.select_mover(
+        cast(TradingClient, trading),
+        cast(Any, data),
+        cast(Any, screener),
+        cast(Any, actions),
+        AT,
+        opens,
+        date(2026, 11, 9),
+    )
+    assert pick.symbol == "LLL" and pick.price == Decimal("1.5")
+    record = pick.record
+    assert record["symbol"] == "LLL" and record["source"] == "screener"
+    assert record["inputs"]["score"] == pytest.approx(9.0)
+    assert record["inputs"]["move"] == pytest.approx(0.5)
+    assert record["inputs"]["dvol_ratio"] == pytest.approx(18.0)
+    assert [g["symbol"] for g in record["screener"]] == list(NAMES)
+    ranked = ["BBB", "AAA", "CCC", "DDD", "KKK", "LLL", "EEE", "FFF"]
+    assert [r["symbol"] for r in record["ranked"]] == ranked
+    passed = record["passed_over"]
+    assert list(passed) == ["BBB", "AAA", "CCC", "DDD", "KKK"]
+    assert "cap" in passed["BBB"] and "warrant" in passed["AAA"]
+    assert "tradable" in passed["CCC"] and "300 s" in passed["DDD"]
+    assert "reverse_splits" in passed["KKK"]
+    assert record["elapsed_minutes"] == 90
+    assert trading.assets == ["AAA", "CCC", "KKK", "LLL"]  # only names fresh and inside the cap
+    [movers] = screener.requests
+    assert movers.top == 50
+    [asked] = actions.requests
+    assert asked.symbols == ranked
+    assert str(asked.start) == "2026-11-09" and str(asked.end) == "2026-11-10"
+    assert all(str(getattr(r, "feed", "")) in {"sip", "DataFeed.SIP"} for r in data.requests)
+
+
+def test_no_mover_qualifying_refuses_the_window_naming_each_name() -> None:
+    names = {"BBB": NAMES["BBB"], "AAA": NAMES["AAA"]}
+    opens = datetime(2026, 11, 10, 9, 30, tzinfo=NEW_YORK)
+    with pytest.raises(session_window.WindowRefused, match=r"no mover.*BBB.*AAA"):
+        session_window.select_mover(
+            cast(TradingClient, Assets()),
+            cast(Any, Data(names)),
+            cast(Any, Screener(names)),
+            cast(Any, Actions()),
+            AT,
+            opens,
+            date(2026, 11, 9),
+        )
+
+
+def test_a_mover_window_runs_the_pick_on_sip_and_records_the_selection(
+    monkeypatch, tmp_path
+) -> None:
+    """A mover window's symbol is chosen once, before the node is built, and the node is built on it,
+    streaming sip; the record names the symbol, its rank inputs and the screener's list."""
+    data, screener = Data(), Screener()
+    monkeypatch.setattr(session_window, "window_data", lambda: data)
+    monkeypatch.setattr(session_window, "window_screener", lambda: screener)
+    _, latest, seen = quiet_window(
+        monkeypatch, tmp_path, quotes=5, trades=5, account=Assets(), mover=True
+    )
+    assert latest["symbol"] == "LLL" and latest["feed"] == "sip"
+    assert latest["mover"]["inputs"]["score"] == pytest.approx(9.0)
+    assert latest["mover"]["source"] == "screener"
+    assert "no stream in tests" in latest["mover"]["stream_failed"]
+    assert [g["symbol"] for g in latest["mover"]["screener"]] == list(NAMES)
+    assert latest["share_price"] == "1.5"
+    assert seen["config"].symbol == "LLL" and seen["feed"] == "sip"
+
+
+def test_a_mover_window_runs_in_the_regular_session_only() -> None:
+    with pytest.raises(ValueError, match="regular session only"):
+        WindowConfig(mover=True, session="extended")
+
+
+def test_the_mover_flag_and_a_symbol_are_not_both_taken(capsys) -> None:
+    with pytest.raises(SystemExit):
+        session_window._args(["--mover", "--symbol", "AAPL", "--log-dir", "/tmp/x"])
+    assert session_window._args(["--mover", "--log-dir", "/tmp/x"]).mover is True
+
+
+def test_auto_runs_no_mover_window_outside_the_regular_session(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """The schedule fires `--session auto`; with `--mover` outside the regular session it has nothing to
+    run, rather than a refusal every evening and morning."""
+
+    class Evening(Account):
+        def get_clock(self) -> Clock:
+            return clock(datetime(2026, 11, 10, 17, 0, tzinfo=NEW_YORK), is_open=False)
+
+    monkeypatch.setattr(session_window, "paper_trading", lambda: Evening())
+    monkeypatch.setattr(session_window, "run_window", lambda *a, **k: pytest.fail("a window ran"))
+    argv = ["--session", "auto", "--mover", "--log-dir", str(tmp_path)]
+    assert session_window.main(argv) == 0
+    assert "regular session only" in capsys.readouterr().out
+
+
+def test_the_schedule_fires_the_mover_path() -> None:
+    """The scheduled windows run on the day's mover, not SPY (ADR 0083's dated line of 2026-11-11): the
+    plist `scripts/automation` writes passes `--mover` beside `--session auto`."""
+    automation = (session_window.SOURCE_ROOT / "scripts/automation").read_text()
+    assert "<string>auto</string>" in automation and "<string>--mover</string>" in automation
+
+
+def test_a_mover_window_enters_with_limits_never_a_market_order(tmp_path) -> None:
+    """An entry is never a market order: a mover window's `SessionMaCross` sends its marked DAY limit
+    through the touch in the regular session too, and its stop is the limit wind-down, not the managed
+    market exit; a regular SPY window keeps its market orders."""
+    node, strategy, _ = session_window.window_node(
+        WindowConfig(symbol="LLL", mover=True, log_dir=tmp_path),
+        wind_down_at=datetime(2026, 11, 10, 15, 0, tzinfo=UTC),
+        log_name="w",
+        feed="sip",
+    )
+    try:
+        assert isinstance(strategy, SessionMaCross)
+        assert strategy.extended_hours is True and strategy.manage_stop is False
+        assert str(strategy.bar_type) == "LLL.ALPACA-1-MINUTE-LAST-INTERNAL"
+    finally:
+        node.dispose()
+    assert not WindowConfig(log_dir=tmp_path).limits
+
+
+class SampleStream:
+    """A stand-in for alpaca-py's `StockDataStream` (0.45.0) for the mover sample: `run` hands each of
+    `names` one minute bar at `AT`, decoded as `raw_data=True` gives it, then blocks until `stop`, or
+    raises `fail` once the bars are sent."""
+
+    def __init__(self, names: dict[str, Name] | None = None, fail: str = "") -> None:
+        import threading
+
+        self.names = NAMES if names is None else names
+        self.fail = fail
+        self.fed, self.stopped = threading.Event(), threading.Event()
+        self.subscribed: list = []
+        self.handler = None
+
+    def subscribe_bars(self, handler, *symbols) -> None:
+        self.handler, self.subscribed = handler, [*self.subscribed, symbols]
+
+    def run(self) -> None:
+        import asyncio
+
+        assert self.handler is not None
+        for s, n in self.names.items():
+            asyncio.run(self.handler({"S": s, "t": AT, "c": n.close, "v": n.volume}))
+        self.fed.set()
+        if self.fail:
+            raise RuntimeError(self.fail)
+        self.stopped.wait(5)
+
+    def stop(self) -> None:
+        self.stopped.set()
+
+    def wait(self, _: float) -> None:
+        """The sample's sleep: until the bars are sent."""
+        self.fed.wait(5)
+
+
+def test_a_stream_sample_ranks_the_whole_market_and_picks_the_first_that_passes() -> None:
+    """The live ranking (ADR 0083's dated line of 2026-11-11): the whole market's sip minute bars for a
+    short sample, ranked by `movers_stream.rank` on `movers_stream.refresh`'s references and normals, then
+    the same filters as the screener's path; Alpaca's gainers are read for the record only."""
+    stream, trading, data, screener, actions = (
+        SampleStream(),
+        Assets(),
+        Data(),
+        Screener(),
+        Actions(),
+    )
+    pick = session_window.stream_mover(
+        cast(TradingClient, trading),
+        cast(Any, stream),
+        cast(Any, data),
+        cast(Any, screener),
+        cast(Any, actions),
+        date(2026, 11, 9),
+        minutes=1,
+        clock=lambda: AT.timestamp() + 30,
+        sleep=stream.wait,
+    )
+    assert stream.subscribed == [("*",)] and stream.stopped.is_set()
+    assert pick.symbol == "LLL" and pick.price == Decimal("1.5")
+    record = pick.record
+    assert record["source"] == "stream" and record["symbol"] == "LLL"
+    assert record["sample"]["elapsed_minutes"] == 1
+    assert record["sample"]["symbols"] == len(NAMES)
+    assert record["sample"]["references_unread"] == 0 and not record["sample"]["reads_failed"]
+    assert [r["symbol"] for r in record["ranked"]] == [
+        "BBB",
+        "AAA",
+        "CCC",
+        "DDD",
+        "KKK",
+        "LLL",
+        "EEE",
+        "FFF",
+    ]
+    assert list(record["passed_over"]) == ["BBB", "AAA", "CCC", "DDD", "KKK"]
+    assert [g["symbol"] for g in record["screener"]] == list(NAMES)
+
+
+def test_a_stream_that_stops_early_fails_the_sample() -> None:
+    stream = SampleStream(fail="connection closed")
+    with pytest.raises(session_window.StreamSampleFailed, match="connection closed"):
+        session_window.sample_stream(
+            cast(Any, stream), 1, clock=lambda: AT.timestamp() + 30, sleep=lambda _: time.sleep(0.3)
+        )
+    assert stream.stopped.is_set()
+
+
+def test_a_sample_with_no_bar_fails() -> None:
+    stream = SampleStream(names={})
+    with pytest.raises(session_window.StreamSampleFailed, match="no bar"):
+        session_window.sample_stream(
+            cast(Any, stream),
+            1,
+            clock=lambda: AT.timestamp() + 30,
+            sleep=stream.wait,
+        )
+
+
+def test_choose_mover_falls_back_to_the_screener_and_says_why(monkeypatch) -> None:
+    def refused(*a, **k):
+        raise session_window.WindowRefused("the stream sample ranked no name")
+
+    monkeypatch.setattr(session_window, "window_stream", lambda: SampleStream())
+    monkeypatch.setattr(session_window, "stream_mover", refused)
+    monkeypatch.setattr(session_window, "window_screener", lambda: Screener())
+    opens = datetime(2026, 11, 10, 9, 30, tzinfo=NEW_YORK)
+    pick = session_window.choose_mover(cast(TradingClient, Assets()), AT, opens, date(2026, 11, 9))
+    assert pick.symbol == "LLL" and pick.record["source"] == "screener"
+    assert "ranked no name" in pick.record["stream_failed"]
+
+
+def test_the_record_keeps_each_fill_and_the_worst_submit_delay() -> None:
+    """From each order's events: `OrderAccepted`'s `ts_init` less the first event's, and each
+    `OrderFilled`'s quantity, price and venue time."""
+
+    def event(name: str, ts_ms: int, **kw):
+        return type(name, (), {"ts_init": ts_ms * 1_000_000, "ts_event": ts_ms * 1_000_000, **kw})()
+
+    def order(cid: str, *events):
+        return SimpleNamespace(
+            client_order_id=SimpleNamespace(value=cid), events=lambda: list(events)
+        )
+
+    cache = SimpleNamespace(
+        orders=lambda strategy_id: [
+            order(
+                "O-1",
+                event("OrderInitialized", 1_000),
+                event("OrderSubmitted", 1_002),
+                event("OrderAccepted", 1_180),
+                event("OrderFilled", 1_400, last_qty=1, last_px="1.25"),
+            ),
+            order("O-2", event("OrderInitialized", 5_000), event("OrderAccepted", 5_090)),
+            order("O-3", event("OrderInitialized", 9_000), event("OrderDenied", 9_000, reason="x")),
+        ]
+    )
+    report = session_window.WindowReport("regular", "LLL", started="s")
+    session_window._fill(report, cache, StrategyId("SessionMaCross-001"))
+    assert report.submit_delays_ms == {"O-1": 180, "O-2": 90}
+    assert report.worst_submit_delay_ms == 180
+    assert report.fill_prices == {"O-1": ["1@1.25 1970-01-01T00:00:01.400000+00:00"]}
+    assert report.fills == 1
+
+
+def test_a_sample_whose_stream_logs_a_reconnect_fails() -> None:
+    """A reconnect drops minutes of bars: the sample fails (and `choose_mover` falls back) rather than
+    rank a partial dollar volume, as `movers_stream.run` fails on what alpaca-py's stream logs."""
+    import logging
+
+    stream = SampleStream()
+    original = stream.run
+
+    def run() -> None:
+        logging.getLogger("alpaca.data.live.websocket").warning("websocket error, restarting")
+        original()
+
+    stream.run = run
+    with pytest.raises(session_window.StreamSampleFailed, match="restarting"):
+        session_window.sample_stream(
+            cast(Any, stream), 1, clock=lambda: AT.timestamp() + 30, sleep=stream.wait
+        )
+
+
+def test_a_failure_of_both_sources_refuses_the_window_naming_each(monkeypatch) -> None:
+    def failed(*a, **k):
+        raise APIError("500 from the screener")
+
+    monkeypatch.setattr(session_window, "select_mover", failed)
+    monkeypatch.setattr(session_window, "window_screener", lambda: Screener())
+    opens = datetime(2026, 11, 10, 9, 30, tzinfo=NEW_YORK)
+    with pytest.raises(
+        session_window.WindowRefused, match=r"no stream in tests.*500 from the screener"
+    ):
+        session_window.choose_mover(cast(TradingClient, Assets()), AT, opens, date(2026, 11, 9))

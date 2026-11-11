@@ -402,6 +402,19 @@ check "a passing label holding FAILED is not a failure line" test "$(printf '%s\
 check "nor a quoted inner FAIL"                    test "$(printf '%s\n' "$OUT" | grep -c 'quoted inner output')" = 0
 }
 
+# --- scripts/ci lowers its own priority once (nice(1), increment 5), and its checks inherit it ---
+case_nice() {
+fresh nice
+printf '#!/bin/bash\nps -o nice= -p $$ | tr -d " " >"%s"\n' "$C.nice" >"$C/scripts/test-nice"
+chmod +x "$C/scripts/test-nice"
+gitq -C "$C" add -A; gitq -C "$C" commit -q -m nice
+base=$(ps -o nice= -p $$ | tr -d ' ')
+unset CANON_CI_NICED   # a run inside scripts/ci has it set; this case runs the copy as a first run
+runci
+check "a check of scripts/ci runs 5 above the caller's nice value" test "$(cat "$C.nice" 2>/dev/null)" = "$((base + 5))"
+check "... and the run passes"                     test "$RC" = 0
+}
+
 # --- scripts/ci waits for a machine-wide slot (lockf(1) on macOS, flock(1) where lockf is absent) ---
 # The waits are event-based: the stand-in holder signals with a file, and releases when another file appears.
 case_slots() {
@@ -468,7 +481,7 @@ check "a nested run skips the wait"                test "$RC" = 0
 }
 
 # Every case above works in its own copy, so they run concurrently; their output prints in this order.
-CASES="yaml noflows shell staged untracked tests testdir testgone notes skipsum died symlink deleted deleted2 lockfail hookenv parallel order missing pathorder strayconfig longfail slots"
+CASES="yaml noflows shell staged untracked tests testdir testgone notes skipsum died symlink deleted deleted2 lockfail hookenv parallel order missing pathorder strayconfig longfail slots nice"
 for c in $CASES; do ( "case_$c" ) >"$TMP/out.$c" 2>&1 & done
 wait
 for c in $CASES; do cat "$TMP/out.$c"; done

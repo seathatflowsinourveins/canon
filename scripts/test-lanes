@@ -692,9 +692,9 @@ if command -v plutil >/dev/null 2>&1; then
   fi
   PP="$TMP/agents/local.canon.paper-session.plist"
   pargs=""
-  for i in 0 1 2 3 4 5 6 7 8 9; do pargs="$pargs|$(plutil -extract "ProgramArguments.$i" raw -o - "$PP" 2>/dev/null)"; done
-  check "rehearsal writes the paper session agent: the runner, its clone and origin, --session auto --minutes 25" \
-        test "$pargs" = "|/bin/bash|$AH/canon/paper-session.sh|$B/mise|$CK|$OURL|--session|auto|--minutes|25|"
+  for i in 0 1 2 3 4 5 6 7 8 9 10; do pargs="$pargs|$(plutil -extract "ProgramArguments.$i" raw -o - "$PP" 2>/dev/null)"; done
+  check "rehearsal writes the paper session agent: the runner, its clone and origin, --session auto --minutes 25 --mover" \
+        test "$pargs" = "|/bin/bash|$AH/canon/paper-session.sh|$B/mise|$CK|$OURL|--session|auto|--minutes|25|--mover|"
   check "... the runner installed beside the watchdog" cmp -s "$ROOT/home/.claude/canon/paper-session.sh" "$AH/canon/paper-session.sh"
   check "... and its clone at origin's main, detached, marked as made by it" \
         eval '[ "$(git -C "$CK" rev-parse HEAD)" = "$(git -C "$O" rev-parse main)" ] && ! git -C "$CK" symbolic-ref -q HEAD >/dev/null && [ "$(git -C "$CK" config canon.paperCheckout)" = true ]'
@@ -702,7 +702,7 @@ if command -v plutil >/dev/null 2>&1; then
   # 20 s interval and a 15 s job started every 35 s), so the interval is the pause after a firing: at least
   # session_window.GAP_SECS, and with a 25-minute window and about two minutes of start-up and stop, a
   # window every 35 minutes or so
-  piv=$(plutil -extract StartInterval raw -o - "$PP"); pmin=$(plutil -extract ProgramArguments.9 raw -o - "$PP")
+  piv=$(plutil -extract StartInterval raw -o - "$PP"); pmin=$(plutil -extract ProgramArguments.8 raw -o - "$PP")
   pgap=$(sed -n 's/^GAP_SECS = \([0-9]*\).*/\1/p' "$ROOT/src/canon_trading/session_window.py")
   check "... 10 minutes after each firing ends (${piv} s): above session_window's gap (${pgap} s), a ${pmin}-minute window about every 35 minutes" \
         eval '[ "$piv" = 600 ] && [ -n "$pgap" ] && [ "$piv" -ge "$pgap" ] && [ $((pmin * 60 + 120 + piv)) -le 2300 ]'
@@ -1135,8 +1135,8 @@ check "... paper:session takes account B's stream lock on descriptor 7 after uv'
 db=$(task_part paper:data run)
 check "... paper:data, on account A's pair, takes account A's stream lock, and no task takes the one lock the login had" \
       eval 'grep -qF "exec 7>>\"\${tmp}canon-alpaca-stream-tests.lock\"" <<<"$db" && ! grep -q "canon-alpaca-stream\.lock" "$ROOT/mise.toml"'
-check "... each stream wait polls lockf -t 0 with a sleep (lockf -t <secs> on a descriptor spins a core), in paper:session and paper:data" \
-      eval '[ -z "$(grep -E "lockf -t [^0].* 7( |\$)" <<<"$sb$db")" ] && [ "$(grep -c "/usr/bin/lockf -t 0 7" <<<"$sb")" = 1 ] && [ "$(grep -c "/usr/bin/lockf -t 0 7" <<<"$db")" = 1 ]'
+check "... each stream wait is lock_wait on descriptor 7 (lockf -t <secs> on a descriptor spins a core), in paper:session and paper:data" \
+      eval '[ -z "$(grep -E "lockf -t [^0].* 7( |\$)" <<<"$sb$db")" ] && [ "$(grep -cE "^ *lock_wait 7 " <<<"$sb")" = 1 ] && [ "$(grep -cE "^ *lock_wait 7 " <<<"$db")" = 1 ]'
 RUNNER="$ROOT/home/.claude/canon/paper-session.sh"
 check "paper:session's timeout is scripts/automation's PAPER_DEADLINE and the runner's TASK_SECS" \
       eval '[ "$(num PAPER_DEADLINE "$ROOT/scripts/automation")" = "$(secs "$(task_part paper:session timeout)")" ] && [ "$(num TASK_SECS "$RUNNER")" = "$(num PAPER_DEADLINE "$ROOT/scripts/automation")" ]'
@@ -1152,6 +1152,44 @@ bt=$(task_part paper:test run | sed -n '/^bounded() {/,/^}/p')
 # shellcheck disable=SC2034  # read by the eval'd check
 bs=$(task_part paper:session run | sed -n '/^bounded() {/,/^}/p')
 check "paper:session and paper:test run uv through one and the same bounded()" eval '[ -n "$bt" ] && [ "$bt" = "$bs" ]'
+# Waiting for a paper lock must not spin: macOS lockf(1) in its descriptor form (`lockf -t <secs> <fd>`) busy-loops
+# while it waits (measured: about 71% of a core after 6 s). Every task that waits takes the lock through one
+# lock_wait() (a non-blocking try and a one-second sleep), the same text in each, and no task calls the
+# descriptor form with a wait.
+# shellcheck disable=SC2034  # read by the eval'd checks
+{ lw_t=$(task_part paper:test run | sed -n '/^lock_wait() {/,/^}/p'); n_lw=0; n_task=0; n_same=0; n_old=0
+  for t in paper:test paper:session paper:data paper:long-only; do
+    b=$(task_part "$t" run); n_task=$((n_task + 1))
+    [ "$(sed -n '/^lock_wait() {/,/^}/p' <<<"$b")" = "$lw_t" ] && n_same=$((n_same + 1))
+    grep -qE '^ *lock_wait [0-9] ' <<<"$b" && n_lw=$((n_lw + 1))
+    grep -qE '/usr/bin/lockf -t [^0 ]' <<<"$b" && n_old=$((n_old + 1))
+  done; }
+check "the four paper tasks that wait for a lock all call lock_wait, with the same text, and none the descriptor form of lockf -t" \
+      eval '[ -n "$lw_t" ] && [ "$n_task" = 4 ] && [ "$n_lw" = 4 ] && [ "$n_same" = 4 ] && [ "$n_old" = 0 ]'
+# A waiter on a held lock uses next to no CPU: lock_wait and the wait line, as paper:test has them, run in a
+# script of their own on a lock file of their own (never an account's lock) that another process holds. The
+# waiter waits out a 6 s bound and reports its own CPU time and its reaped children's (bash's `times`), so
+# every poll's lockf is counted; a spinning lockf has used 4 s and more by then. A second run, once the holder
+# has let go, takes the lock.
+# shellcheck disable=SC2034  # read by the eval'd checks
+if [ -x /usr/bin/lockf ]; then
+  LW="$TMP/lock-wait"; mkdir -p "$LW"
+  lw_line=$(task_part paper:test run | grep -E '(lock_wait 9 "\$lockwait"|/usr/bin/lockf -t "\$lockwait" 9)' | awk 'NR == 1')
+  printf '%s\n' 'lockwait=6' "$lw_t" 'trap '"'"'times >"$3"'"'"' EXIT' 'exec 9>>"$1"' "$lw_line" 'echo got >"$2"' > "$LW/waiter.sh"
+  /usr/bin/lockf -k "$LW/lock" sh -c 'echo held >"$1"; while [ ! -e "$2" ]; do sleep 0.1; done' sh "$LW/held" "$LW/release" & lw_holder=$!
+  for _ in $(seq 100); do [ -e "$LW/held" ] && break; sleep 0.1; done
+  bash "$LW/waiter.sh" "$LW/lock" "$LW/got" "$LW/times" >/dev/null 2>&1; lw_rc1=$?
+  lw_cpu=$(tr 'ms' '  ' <"$LW/times" 2>/dev/null | awk '{ for (i = 1; i <= NF; i += 2) t += $i * 60 + $(i + 1) } END { printf "%.2f", t }')
+  lw_got=0; [ -e "$LW/got" ] && lw_got=1
+  : >"$LW/release"; wait "$lw_holder"
+  bash "$LW/waiter.sh" "$LW/lock" "$LW/got" "$LW/times" >/dev/null 2>&1; lw_rc2=$?
+  check "the wait line is found in paper:test"   test -n "$lw_line"
+  check "a paper task that waited out a 6 s bound on a held lock used under 0.5 s of CPU (it used ${lw_cpu:-?} s), and failed without it" \
+        eval '[ -n "$lw_cpu" ] && [ "$lw_rc1" != 0 ] && [ "$lw_got" = 0 ] && awk -v c="$lw_cpu" "BEGIN { exit !(c < 0.5) }"'
+  check "... and took the lock once the holder let go" eval '[ "$lw_rc2" = 0 ] && [ -e "$LW/got" ]'
+else
+  skip "paper lock wait CPU" "no /usr/bin/lockf here (macOS only)"
+fi
 check "paper:session marks a run the schedule did not start, so its records go to by-hand/" \
       eval 'grep -qxF "[ \"\${CANON_PAPER_SCHEDULED:-}\" = 1 ] || [ -n \"\${CANON_COMMIT:-}\" ] || export CANON_PAPER_BY_HAND=1" <<<"$(task_part paper:session run)"'
 # mise appends a task's arguments to the last line of its script (observed with mise 2026.11.5 under a pty and
