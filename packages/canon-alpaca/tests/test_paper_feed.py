@@ -32,6 +32,13 @@ Upstream's `DataTester` cannot be used for TC-D71 here: v2.0.0rc8's Python `Data
   arrives, or a bar arrives for a symbol not listed; it reports the bars per minute, the symbols seen and
   each status received, which a calm market may leave at none.
 
+* `test_paper_boats_minute_bars_are_stamped_at_their_open_and_on_arrival` (ADR 0090, ADR 0055): minute
+  bars for `SYMBOLS` with `params={"feed": "boats"}`, overnight only, until two bars arrive or
+  `WILDCARD_SECS` pass. Each bar is the stream's one bar type, its `ts_event` the minute's open and its
+  `ts_init` the node's clock on arrival, at or after the minute's end; it prints each bar's delay past its
+  end. With the bar subscription confirmed and no bar in that time it skips, naming the wait: a quiet
+  market, not a defect.
+
 No paper test shows a feed refused: on 2026-11-10 at 20:46 New York the paper pair authenticated on
 `v2/sip` too, although "Paper Trading" (https://docs.alpaca.markets/us/docs/paper-trading.md) entitles a
 Paper Only account to IEX alone (ADR 0055). A refusal is tested offline only.
@@ -411,3 +418,72 @@ def test_paper_wildcard_bars_and_statuses_reach_the_strategy_for_listed_symbols(
     assert all(str(b.bar_type).endswith("-1-MINUTE-LAST-EXTERNAL") for b in strategy.bars)
     assert all(b.ts_init > b.ts_event for b in strategy.bars)  # stamped at its open, arrived after
     assert datetime.now(UTC) - started < timedelta(seconds=WILDCARD_SECS + 120)
+
+
+class OvernightBars(Strategy):
+    """Subscribe minute bars for `SYMBOLS` on boats, and record each with the node's clock on arrival."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.bars: list = []
+        self.arrived: list[int] = []
+
+    def on_start(self) -> None:
+        ids = [InstrumentId.from_str(f"{s}.ALPACA") for s in SYMBOLS]
+        bar_types = [BarType.from_str(f"{i}-1-MINUTE-LAST-EXTERNAL") for i in ids]
+        self.subscribe_bars(bar_types, params={"feed": "boats"})
+
+    def on_bar(self, bar) -> None:
+        self.bars.append(bar)
+        self.arrived.append(self.clock.timestamp_ns())
+
+
+def test_paper_boats_minute_bars_are_stamped_at_their_open_and_on_arrival(stream_log) -> None:
+    if not overnight_now():
+        pytest.skip("boats sent nothing outside the overnight session on paper; this test needs it")
+    strategy = OvernightBars()
+    node = LiveNode.build(
+        "CANON-ALPACA-PAPER-BOATS-BARS",
+        LiveNodeConfig(
+            environment=Environment.SANDBOX,
+            trader_id=TraderId("TESTER-001"),
+            timeout_connection_secs=20,
+            timeout_disconnection_secs=15,
+            delay_post_stop_secs=2,
+            data_clients={
+                "ALPACA": DataClientConfig(
+                    instrument_provider=InstrumentProviderConfig(
+                        load_ids=[f"{s}.ALPACA" for s in SYMBOLS]
+                    ),
+                ),
+            },
+        ),
+        data_factories={"ALPACA": AlpacaDataClientFactory},
+    )
+    node.add_strategy(strategy)
+    started = time.monotonic()
+
+    run_for(node, WILDCARD_SECS, until=lambda: len(strategy.bars) >= 2)
+
+    waited = time.monotonic() - started
+    minute = 60_000_000_000
+    for bar, arrived in zip(strategy.bars, strategy.arrived, strict=True):
+        late = (bar.ts_init - bar.ts_event - minute) / 1e9
+        print(
+            f"PAPER-BOATS-BARS {bar.bar_type} open={datetime.fromtimestamp(bar.ts_event / 1e9, UTC):%H:%M}Z "
+            f"after_end={late:.3f}s handled_after_init={(arrived - bar.ts_init) / 1e9:.3f}s"
+        )
+    connected = f"connected to {STREAM_HOST}/v1beta1/boats"
+    assert connected in stream_log.lines, stream_log.lines
+    boats = stream_log.of_thread_that_logged(connected)
+    troubles = [message for level, message in boats if level >= logging.WARNING]
+    assert not troubles, troubles
+    if not strategy.bars:
+        confirmed = any(m.startswith("subscribed to") and "bars: [" in m for _, m in boats)
+        assert confirmed, ("Alpaca never confirmed the boats bar subscription", boats)
+        pytest.skip(f"no boats minute bar for {SYMBOLS} in {waited:.0f} s subscribed")
+    assert all(str(b.bar_type).endswith("-1-MINUTE-LAST-EXTERNAL") for b in strategy.bars)
+    assert all(b.ts_event % minute == 0 for b in strategy.bars)  # the minute's open
+    # stamped on arrival: at or after the minute's end, and no later than the strategy saw it
+    assert all(b.ts_init >= b.ts_event + minute for b in strategy.bars)
+    assert all(b.ts_init <= at for b, at in zip(strategy.bars, strategy.arrived, strict=True))

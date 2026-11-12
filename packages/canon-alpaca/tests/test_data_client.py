@@ -3753,7 +3753,8 @@ def test_updated_bars_are_handed_on_only_when_asked(market, alpaca, asked) -> No
         ("T", MarketStatusAction.TRADING, True, None, None),
         ("Q", MarketStatusAction.QUOTING, False, True, None),
         ("5", MarketStatusAction.NEW_PRICE_INDICATION, None, None, None),
-        ("E", MarketStatusAction.SHORT_SELL_RESTRICTION_CHANGE, None, None, True),
+        # Alpaca names the code only "Short Sale Restriction"; CTA keeps whether it starts or ends apart
+        ("E", MarketStatusAction.SHORT_SELL_RESTRICTION_CHANGE, None, None, None),
         ("7", MarketStatusAction.NONE, None, None, None),
         ("F", MarketStatusAction.NONE, None, None, None),
     ],
@@ -3839,3 +3840,129 @@ def test_a_reconnect_sends_the_wildcard_again(market, alpaca, monkeypatch) -> No
     run_with_client(body, strategy, config=config)
 
     assert all(symbols == ["*"] for symbols in sent("bars"))
+
+
+def test_a_resend_under_the_wildcard_sends_the_wildcard_and_no_listed_symbol(
+    market, alpaca
+) -> None:
+    # Code review of M-a: the resend took a channel's first key, a listed symbol, which alpaca-py then
+    # held, and Alpaca with it, apart from `"*"`.
+    strategy = watcher(bar_types=[MINUTE], params={"wildcard": True})
+
+    async def body(client) -> None:
+        await wait_until(lambda: market.socket.held("bars") == {"*"})
+        sent = len(market.socket.sent)
+        client._stream_heard, client._resend_needed = False, True  # as after a lost subscribe
+        market.socket.deliver(alpaca.wire_bar())
+        await wait_until(lambda: not client._resend_needed)
+        assert len(market.socket.sent) > sent  # the resend went out
+        assert set(market.stream._handlers["bars"]) == {"*"}
+
+    run_with_client(body, strategy, config=market.config)
+
+    subscribed = [
+        m["bars"] for m in market.socket.sent if m["action"] == "subscribe" and "bars" in m
+    ]
+    assert all(symbols == ["*"] for symbols in subscribed), subscribed
+
+
+def test_the_mute_limit_counts_the_whole_markets_messages_under_the_wildcard(
+    market, alpaca, capfd
+) -> None:
+    # Code review of M-a: only a listed symbol's message reset the mute clock, so a busy wildcard
+    # stream with a quiet listed symbol was stopped as mute.
+    strategy = watcher(status_ids=[AAPL], params={"wildcard": True})
+
+    async def body(client) -> None:
+        await wait_until(lambda: market.socket.held("statuses") == {"*"})
+        # an unlisted status every 0.1 s for 0.8 s, past the limit four times over
+        for _ in range(8):
+            market.socket.deliver(alpaca.wire_status("H", symbol="MSFT"))
+            await asyncio.sleep(0.1)
+        assert client._stream_failure is None
+
+    config = AlpacaDataClientConfig(
+        instrument_provider=market.config.instrument_provider,
+        stream_data_timeout_secs=None,
+        stream_mute_limit_secs=0.2,
+    )
+    run_with_client(body, strategy, config=config)
+
+    assert "went mute" not in logged(capfd)
+    assert not strategy.seen_statuses
+
+
+def test_a_channel_whose_unsubscribe_was_sent_is_forgotten_when_a_later_one_fails(
+    market, monkeypatch, capfd
+) -> None:
+    # Code review of M-a: one command unsubscribes bars and updated bars; when the second failed,
+    # both stayed recorded, so every retry asked alpaca-py to drop bars it no longer held (KeyError).
+    strategy = watcher(bar_types=[MINUTE], params={"updated_bars": True})
+    unsubscribe = SimpleNamespace(bar_types=[MINUTE], params=None)
+
+    async def body(client) -> None:
+        await wait_until(lambda: market.socket.held("updatedBars") == {"AAPL"})
+        real = market.stream.unsubscribe_updated_bars
+
+        def fail_once(*symbols: str) -> None:
+            monkeypatch.setattr(market.stream, "unsubscribe_updated_bars", real)
+            raise OSError("the socket closed")
+
+        monkeypatch.setattr(market.stream, "unsubscribe_updated_bars", fail_once)
+        with pytest.raises(OSError, match="the socket closed"):
+            await client._unsubscribe_bars(unsubscribe)
+        assert market.socket.held("bars") == set()
+        await client._unsubscribe_bars(unsubscribe)  # the retry
+        assert market.socket.held("updatedBars") == set()
+        assert not client._bars.symbols and not client._updated_bars.symbols
+
+    run_with_client(body, strategy, config=market.config)
+
+    assert "KeyError" not in logged(capfd)
+
+
+def test_a_listed_symbol_dropped_under_a_kept_wildcard_has_its_count_logged_and_reset(
+    market, capfd
+) -> None:
+    # Code review of M-a: a symbol forgotten under a `"*"` others keep skipped the count's last line
+    # and its reset, so a later subscription went on from the old total.
+    strategy = watcher(bar_types=[MINUTE, MSFT_MINUTE], params={"wildcard": True})
+
+    async def body(client) -> None:
+        await wait_until(lambda: market.socket.held("bars") == {"*"})
+        client._rounded_bars["AAPL"] = 3
+        await client._unsubscribe_bars(SimpleNamespace(bar_types=[MINUTE], params=None))
+        assert "AAPL" not in client._rounded_bars
+        assert market.socket.held("bars") == {"*"}  # MSFT still listed
+
+    run_with_client(body, strategy, config=market.config)
+
+    assert "rounded 3 AAPL bars to the instrument's price precision" in logged(capfd)
+
+
+def test_a_mute_streams_error_counts_a_long_listing_rather_than_naming_every_symbol(
+    market, capfd
+) -> None:
+    # Code review of M-a: the error named every listed symbol, one line of thousands of names with a
+    # whole-market listing.
+    strategy = watcher(status_ids=[AAPL], params={"wildcard": True})
+
+    async def body(client) -> None:
+        await wait_until(lambda: market.socket.held("statuses") == {"*"})
+        star = client._statuses.symbols["*"]
+        client._statuses.symbols.update({f"S{n:04d}": star for n in range(2000)})
+        await wait_until(lambda: client._stream_failure is not None)
+        for n in range(2000):  # not subscribed by the engine, so not unsubscribed at the stop
+            del client._statuses.symbols[f"S{n:04d}"]
+
+    config = AlpacaDataClientConfig(
+        instrument_provider=market.config.instrument_provider,
+        stream_data_timeout_secs=None,
+        stream_mute_limit_secs=0.2,
+    )
+    run_with_client(body, strategy, config=config)
+
+    lines = [line for line in logged(capfd).splitlines() if "went mute" in line]
+    line = next(line for line in lines if "[ERROR]" in line and "no market data for" in line)
+    assert all(len(line) < 2000 for line in lines)
+    assert "statuses 2002 symbols" in line

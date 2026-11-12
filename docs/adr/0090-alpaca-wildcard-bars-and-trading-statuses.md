@@ -47,6 +47,9 @@ delivers data nobody subscribed to.
 * `params={"updated_bars": True}` also subscribes Alpaca's `updatedBars` and hands each to the engine
   as a bar of the same type. Off by default: a strategy then sees two bars for one minute, which
   NautilusTrader's sequence check lets through, as it refuses only an earlier `ts_event` or `ts_init`.
+  An update for a minute that arrives after the next minute's bar reaches the strategy as a bar with
+  an earlier `ts_event` and nothing marking it a revision; with `validate_data_sequence` on (off by
+  default) the engine drops it. A strategy that asks for updates handles both.
 * `_subscribe_instrument_status` hands the engine one `InstrumentStatus` per Alpaca status, with
   `trading_event` the status code and message, and `reason` the reason code and message:
 
@@ -57,15 +60,19 @@ delivers data nobody subscribed to.
   | `3` (CTA), `T` (UTP): resume | `TRADING` | trading |
   | `Q` (UTP): quotation resumption | `QUOTING` | quoting, not trading |
   | `5` (CTA): price indication | `NEW_PRICE_INDICATION` | none |
-  | `E` (CTA): short sale restriction | `SHORT_SELL_RESTRICTION_CHANGE` | restricted |
+  | `E` (CTA): short sale restriction | `SHORT_SELL_RESTRICTION_CHANGE` | none: Alpaca's status does not say whether it starts or ends |
   | any other (imbalances, range indications, `F`) | `NONE` | none |
 
 * An unsubscribe removes its symbols; the `"*"` subscription is unsubscribed when no listed symbol is
   left on its channel. Bars and statuses join quotes and trades in everything the client already does
-  per channel: one stream on one feed, the resend after a connect or reconnect, the mute limit.
+  per channel: one stream on one feed, the resend after a connect or reconnect (of `"*"` itself where
+  it is held, so no listed symbol is ever held apart from it), the mute limit (which any message on a
+  held `"*"` resets, a listed symbol's or not). One command's calls on several channels are each made
+  even if one fails, and each channel is recorded by its own call's outcome.
 * Gap 4's other half, Limit Up-Limit Down bands, stays open: alpaca-py has no subscription for them.
-* Trades are not taken by wildcard. The first ranking reads wildcard minute bars, whose volume Alpaca
-  builds by the tape's rules, so nothing here masks prints. Trades are subscribed per symbol, for the
+* Trades are not taken by wildcard. The first ranking reads wildcard minute bars, which Alpaca builds
+  following SIP guidance, their volume including almost all trades (Alpaca, "Stock minute bars"), so
+  nothing here masks prints. Trades are subscribed per symbol, for the
   top names and holdings, and a later change filters them before a `TradeTick` exists: a data-client
   field chooses prints eligible to update the last price or all prints, by a table read at start from
   Alpaca's conditions endpoint, never written from memory, with the dropped prints counted and logged.
@@ -89,8 +96,12 @@ delivers data nobody subscribed to.
 Offline tests in `scripts/ci` (`test_data_client.py`): bars reach a strategy from a stream subscription
 and from a `"*"` one, only for listed symbols; a bar type other than one-minute last is refused; updated
 bars only when asked; each status code row above; an unsubscribe of the last listed symbol unsubscribes
-`"*"`; a reconnect sends the wildcard again. Paper, `mise run paper:test`: a `"*"` bars subscription on
-`sip` reaches a strategy, with the bars per minute, the instruments seen and the statuses received named.
+`"*"`; a reconnect, and a resend, send the wildcard again and no listed symbol; a whole-market
+message keeps the stream from going mute; a channel whose unsubscribe went out is forgotten when the
+command's next channel fails; a long listing is counted in the mute error. Paper, `mise run paper:test`: a `"*"` bars subscription on
+`sip` reaches a strategy, with the bars per minute, the instruments seen and the statuses received named;
+minute bars on `boats`, overnight, are stamped at their open and on arrival, at or after the minute's
+end (2026-11-12 01:22Z: six symbols' bars, each 10 to 14 ms past its minute's end).
 
 ## Evidence
 
@@ -98,7 +109,12 @@ Read 2026-11-11.
 
 * https://docs.alpaca.markets/us/docs/real-time-stock-pricing-data.md: the `bars`, `updatedBars` and
   `statuses` channels and schemas; `"*"` shown for `bars` and `statuses`; the CTA and UTP status and reason
-  code tables; production statuses through sales (fetched, summarised by the fetch tool).
+  code tables; production statuses through sales (fetched, summarised by the fetch tool). The page names
+  status `E` "Short Sale Restriction" only; the CTA output specification keeps whether it is activated,
+  continued or deactivated in a separate indicator (from search summaries, not read in full), so the
+  code alone sets no flag.
+* https://alpaca.markets/learn/stock-minute-bars/ (Alpaca, 2022, linked from the page above): minute
+  bars follow SIP guidance and their volume includes almost all trades.
 * alpaca-py `c42add7c0a70`, `alpaca/data/live/stock.py` 99-145 (`subscribe_bars`,
   `subscribe_updated_bars`, `subscribe_trading_statuses`, each taking `"*"`) and
   `alpaca/data/live/websocket.py` 34-66 (bars, updated bars and statuses count as market data) and 385-391

@@ -54,7 +54,8 @@ As with quote history, the inclusive window is cut at now and each tick's `ts_in
 `crates/adapters/databento/src/decode/market_data.rs` at the pin). Conversion errors and page failures
 raise before any response is emitted. Trade history is gathered in memory, as bars and quotes are;
 tick conversion yields to the node's loop every `TRADES_PER_SLICE`, and rounded prices are counted
-and named once per request. The live paper endpoint remains UNVERIFIED for this hook.
+and named once per request. On paper, `test_paper_trades_history.py` reads a session's trades
+on `iex` and `sip` through a node (TC-D31).
 
 Venue side, alpaca-py 0.45.0:
 
@@ -203,10 +204,10 @@ Known limits:
   with the window; ADR 0066 has a load ask for an hour at a time, and enforcing that is the loader's.
   It shares the one HTTP session's lock with bar requests, so a bar request waits behind a long quote
   fetch.
-* A quote request written back with an end at or near now records the window as covered when the last
-  quotes may not yet be published, and they are never asked for again. ADR 0040's `load_bars` refuses
-  an end less than 15 minutes before now for bars; nothing does yet for quotes, so a caller of
-  `update_catalog` keeps that margin itself.
+* A quote or trade request written back with an end at or near now records the window as covered when
+  the last quotes or trades may not yet be published, and they are never asked for again. ADR 0040's
+  `load_bars` refuses an end less than 15 minutes before now for bars; nothing does yet for quotes or
+  trades, so a caller of `update_catalog` keeps that margin itself.
 * alpaca-py's REST client has no `close()`; `_disconnect` drops the reference.
 * If alpaca-py's stream ends on its own (for example after an insufficient-subscription error), or the
   client stops it for going mute, the client logs an error and does not restart it; later subscriptions
@@ -230,7 +231,7 @@ Known limits:
   observed on a live stream: a subscribe made from another thread while alpaca-py sends its first
   subscribe message, before it counts as running, is recorded and not sent (`_drive_run`, `_subscribe`).
   Subscribing and then running cannot meet it. The client sends its
-  subscriptions again on the first quote or trade of each stream run (`_resend_subscriptions`), which
+  subscriptions again on the first message of each stream run (`_resend_subscriptions`), which
   covers the start, and each reconnect alpaca-py makes by itself, which it announces with a warning
   before it connects again (`ALPACA_RECONNECT_LINES`), but not a stream whose sent subscriptions stay
   quiet, or an unsubscribe made in the same window, which alpaca-py does not send either.
@@ -349,14 +350,14 @@ or authenticating is seen only once that finishes: the handshake is bounded by `
 
 STREAM_DATA_TIMEOUT_SECS = 900.0
 """alpaca-py's `data_timeout` for the stream unless the config sets another (`AlpacaDataClientConfig`): a
-connection that sends no quote or trade for this long is closed and made again, with every subscription
+connection that sends no market data for this long is closed and made again, with every subscription
 sent again (README, "Mute stream"). 15 minutes: above the longest silence seen on a feed that then
 delivered, 513 s (`iex` subscribed to QQQ alone, pre-market 2026-11-11: one trade and no quote in 600 s), and
 far above any gap in the parts a window runs in (SPY on `iex` in the regular session, hundreds of quotes a
 minute; on `boats` overnight, 1,552 to 3,700 quotes a window, ADR 0044)."""
 
 STREAM_MUTE_LIMIT_SECS = 3600.0
-"""How long the stream may send no quote or trade, across alpaca-py's reconnects, while the client holds a
+"""How long the stream may send no market data, across alpaca-py's reconnects, while the client holds a
 subscription, before the client stops it and fails by name (`AlpacaDataClient._check_mute`): an hour, four
 data timeouts and seven times the longest healthy silence seen. A node that spans a part no feed serves
 (pre-market and after-hours, ADR 0044) sets it longer than that part, or None."""
@@ -693,7 +694,7 @@ class AlpacaDataClientConfig(DataClientConfig):
       `StockDataStream` as `data_timeout`: a connection that sends no market data for that long is closed
       and made again. None leaves alpaca-py's default, no timeout.
     * `stream_mute_limit_secs` (default `STREAM_MUTE_LIMIT_SECS`) is how long the stream may stay without a
-      quote or trade, while the client holds a subscription, before the client stops it and refuses later
+      message, while the client holds a subscription, before the client stops it and refuses later
       subscriptions, naming why. It must be longer than the data timeout, so alpaca-py reconnects at least
       once before the client gives up. None sets no limit.
 
@@ -816,10 +817,24 @@ def ignore_outcome(_: BaseException | None) -> None:
     """A `StreamCall.settle` for a call whose outcome changes nothing the client records."""
 
 
-def call_each(calls: Sequence[Callable[[], None]]) -> None:
-    """Make one planned stream call per channel, in order, as one `StreamCall.call`."""
-    for call in calls:
-        call()
+def call_each(calls: Sequence[Callable[[], None]], done: set[int] | None = None) -> None:
+    """Make one planned stream call per channel, in order, as one `StreamCall.call`, each even if one
+    before it raised, then raise the first error. alpaca-py records a subscribe's handlers before it
+    sends and drops unsubscribed ones only once sent (`_subscribe`, `_unsubscribe`), so each channel's
+    map is left as the client's record of that call expects; a call skipped would leave a symbol the
+    client records and alpaca-py does not, which alpaca-py's unsubscribe then fails on (KeyError).
+    `done` collects the index of each call that returned."""
+    first: Exception | None = None
+    for n, call in enumerate(calls):
+        try:
+            call()
+        except Exception as e:  # noqa: BLE001 - raised after the rest are made
+            first = first or e
+        else:
+            if done is not None:
+                done.add(n)
+    if first is not None:
+        raise first
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -838,6 +853,19 @@ class Channel:
     emit: str
     """The client's method that hands one message on, named so the client holds no bound method of its
     own (`relay` holds it weakly)."""
+
+
+HELD_NAMED = 10
+"""The most symbols of one channel a mute stream's error names; a longer listing, as under `"*"`, is
+counted, so the line stays one a session window reads."""
+
+
+def held_symbols(channel: Channel) -> str:
+    """`channel`'s name and its symbols, sorted, or their count and the first `HELD_NAMED`."""
+    names = sorted(channel.symbols)
+    if len(names) <= HELD_NAMED:
+        return f"{channel.name} {', '.join(names)}"
+    return f"{channel.name} {len(names)} symbols ({', '.join(names[:HELD_NAMED])}, ...)"
 
 
 async def logged_failure[R](log: Logger, what: str, step: Awaitable[R]) -> R:
@@ -1139,12 +1167,9 @@ STATUS_ACTIONS: dict[str, tuple[MarketStatusAction, bool | None, bool | None, bo
     "T": (MarketStatusAction.TRADING, True, None, None),  # UTP trading resumption
     "Q": (MarketStatusAction.QUOTING, False, True, None),  # UTP quotation resumption
     "5": (MarketStatusAction.NEW_PRICE_INDICATION, None, None, None),  # CTA price indication
-    "E": (
-        MarketStatusAction.SHORT_SELL_RESTRICTION_CHANGE,
-        None,
-        None,
-        True,
-    ),  # CTA short sale restriction
+    # CTA short sale restriction: Alpaca's page names the code only; whether the restriction starts or
+    # ends is CTA's own indicator, which Alpaca's status message does not carry, so no flag is set
+    "E": (MarketStatusAction.SHORT_SELL_RESTRICTION_CHANGE, None, None, None),
 }
 """Alpaca's status codes (CTA tapes A and B, UTP tapes C and O, its "Real-time Stock Data" page) as
 NautilusTrader's `MarketStatusAction` and `is_trading`, `is_quoting`, `is_short_sell_restricted`; any
@@ -1233,7 +1258,7 @@ class AlpacaDataClient(MarketDataClient):
         self._stream_log: StreamLogRelay | None = None
         self._stream_thread: threading.Thread | None = None
         self._stream_ended: threading.Event | None = None  # set once the stream's `run()` returned
-        self._stream_heard = False  # a quote or trade has arrived from this run of the stream
+        self._stream_heard = False  # a message has arrived from this run of the stream
         # A subscribe was made on this run after its thread started and before anything arrived, so
         # alpaca-py may not have sent it (`_resend_subscriptions`).
         self._resend_needed = False
@@ -1241,7 +1266,7 @@ class AlpacaDataClient(MarketDataClient):
         self._reconnects = 0  # alpaca-py's own reconnects, by their warnings (`_on_stream_log`)
         # alpaca-py's `data_timeout` for a stream the client builds, and the mute limit (`_check_mute`).
         self._data_timeout, self._mute_limit = stream_bounds(config)
-        self._last_heard = 0.0  # the loop time of this run's start or its last quote or trade
+        self._last_heard = 0.0  # the loop time of this run's start or its last message
         self._mute_timer: asyncio.TimerHandle | None = None
         self._stream_failure: str | None = None  # why the client stopped this run (`_check_mute`)
         self._owner_loop: asyncio.AbstractEventLoop | None = None
@@ -1698,11 +1723,10 @@ class AlpacaDataClient(MarketDataClient):
             star = channel.symbols.get(WILDCARD)
             send = [s for s, subscription in made.items() if subscription is not star]
             if star is not None and len(send) < len(made):
-                kept = [
-                    k
+                kept = any(
+                    v is star and k != WILDCARD and k not in made
                     for k, v in channel.symbols.items()
-                    if v is star and k != WILDCARD and k not in made
-                ]
+                )
                 if not kept:
                     send.append(WILDCARD)
                     made[WILDCARD] = star
@@ -1710,34 +1734,40 @@ class AlpacaDataClient(MarketDataClient):
                 plans.append((channel, made, send))
             else:  # listed under a `"*"` other symbols keep: nothing to send
                 for symbol in made:
-                    del channel.symbols[symbol]
+                    self._forget(channel, symbol)
         if not plans:
             return None
         calls = [
             functools.partial(getattr(stream, f"unsubscribe_{channel.method}"), *send)
             for channel, _, send in plans
         ]
+        done: set[int] = set()
 
         def settle(error: BaseException | None) -> None:
             # alpaca-py sends the unsubscribe first and drops its handlers only if the send succeeds,
-            # so the symbols are dropped only then, and a failed unsubscribe can be retried. A symbol
-            # subscribed afresh meanwhile, as after a reconnect, has another `Subscription` and stays.
-            if error is not None:
-                return
-            for channel, made, _ in plans:
+            # so after a failure a channel's symbols are dropped only if its own call returned
+            # (`call_each`), and a failed one can be retried; with none, all are (`_settle_locally`
+            # makes no call). A symbol subscribed afresh meanwhile, as after a reconnect, has another
+            # `Subscription` and stays.
+            for n, (channel, made, _send) in enumerate(plans):
+                if error is not None and n not in done:
+                    continue
                 for symbol, subscription in made.items():
-                    if channel.symbols.get(symbol) is not subscription:
-                        continue
-                    del channel.symbols[symbol]
-                    if channel.kind is TradingStatus or symbol == WILDCARD:
-                        continue
-                    # counted afresh after a new subscription, this kind's count so far logged first
-                    self._log_price_count(self._feed_name(), channel.kind, symbol)
-                    self._price_counts(channel.kind).pop(symbol, None)
-                    if channel.kind is Quote:
-                        self._one_sided_quotes.pop(symbol, None)
+                    if channel.symbols.get(symbol) is subscription:
+                        self._forget(channel, symbol)
 
-        return StreamCall(functools.partial(call_each, calls), nothing, settle)
+        return StreamCall(functools.partial(call_each, calls, done), nothing, settle)
+
+    def _forget(self, channel: Channel, symbol: str) -> None:
+        """Drop `symbol` from `channel`, its count of prices so far logged and then started afresh for a
+        new subscription."""
+        del channel.symbols[symbol]
+        if channel.kind is TradingStatus or symbol == WILDCARD:
+            return
+        self._log_price_count(self._feed_name(), channel.kind, symbol)
+        self._price_counts(channel.kind).pop(symbol, None)
+        if channel.kind is Quote:
+            self._one_sided_quotes.pop(symbol, None)
 
     # -- historical requests -----------------------------------------------------------------------
 
@@ -2109,7 +2139,7 @@ class AlpacaDataClient(MarketDataClient):
         self._mute_timer = loop.call_later(delay, call)
 
     def _check_mute(self) -> None:
-        """Stop a stream that has sent no quote or trade for `stream_mute_limit_secs` while the client
+        """Stop a stream that has sent no message for `stream_mute_limit_secs` while the client
         holds a subscription, and say why: an error that begins "Alpaca stream on feed", as every line about
         the stream does, and a refusal of each later subscription until the client reconnects.
 
@@ -2140,11 +2170,7 @@ class AlpacaDataClient(MarketDataClient):
         if silent < limit:
             self._arm_mute_check(limit - silent)
             return
-        held = [
-            f"{channel.name} {', '.join(sorted(channel.symbols))}"
-            for channel in self._channels
-            if channel.symbols
-        ]
+        held = [held_symbols(channel) for channel in self._channels if channel.symbols]
         self._stream_failure = (
             f"no market data for {silent:.1f} s, past stream_mute_limit_secs ({limit:g} s), while "
             f"subscribed to {'; '.join(held)}"
@@ -2173,6 +2199,12 @@ class AlpacaDataClient(MarketDataClient):
         holds for its symbol, which a reconnect, an unsubscribe and a resubscribe each replace, and the
         client is not stopping."""
         return not self._stopping and symbol in current and current[symbol] is subscription
+
+    def _heard_under_wildcard(self, subscription: Subscription, current: dict) -> None:
+        """An unlisted symbol's message from the `"*"` the client holds is not handed on, but shows the
+        stream is live, as any message does (`_heard`)."""
+        if not self._stopping and current.get(WILDCARD) is subscription:
+            self._heard()
 
     def _heard(self) -> None:
         """A message has arrived from the stream's current run. Once per run, if a subscribe was
@@ -2240,11 +2272,16 @@ class AlpacaDataClient(MarketDataClient):
         if stream is None or stream is not self._stream:
             return None
         for channel in self._channels:
-            for symbol, subscription in channel.symbols.items():  # the first held symbol is enough
-                assert subscription.handler is not None  # set where it is made (`_subscription`)
-                subscribe = getattr(stream, f"subscribe_{channel.method}")
-                call = functools.partial(subscribe, subscription.handler, symbol)
-                return StreamCall(call, nothing, ignore_outcome)
+            if not channel.symbols:
+                continue
+            # One held symbol is enough; `"*"` where it is held, since a listed symbol sent on its own
+            # would be held by alpaca-py, and by Alpaca, apart from `"*"`, and never unsubscribed.
+            symbol = WILDCARD if WILDCARD in channel.symbols else next(iter(channel.symbols))
+            subscription = channel.symbols[symbol]
+            assert subscription.handler is not None  # set where it is made (`_subscription`)
+            subscribe = getattr(stream, f"subscribe_{channel.method}")
+            call = functools.partial(subscribe, subscription.handler, symbol)
+            return StreamCall(call, nothing, ignore_outcome)
         return None
 
     def _emit_quote(self, subscription: Subscription, quote: Quote) -> None:
@@ -2310,6 +2347,7 @@ class AlpacaDataClient(MarketDataClient):
         """Hand on a streamed minute bar, or an updated one, as a bar of the stream's one type, its
         prices rounded as upstream rounds and each rounding counted as a trade price's is."""
         if not self._wanted(subscription, bar.symbol, channel.symbols):
+            self._heard_under_wildcard(subscription, channel.symbols)
             return
         self._heard()
         try:
@@ -2334,6 +2372,7 @@ class AlpacaDataClient(MarketDataClient):
 
     def _emit_status(self, subscription: Subscription, status: TradingStatus) -> None:
         if not self._wanted(subscription, status.symbol, self._statuses.symbols):
+            self._heard_under_wildcard(subscription, self._statuses.symbols)
             return
         self._heard()
         try:
