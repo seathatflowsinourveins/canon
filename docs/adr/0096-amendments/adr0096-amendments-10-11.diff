@@ -1,0 +1,125 @@
+--- a/docs/adr/0096-early-entry-fast-arms-by-data-source-and-one-holdout-opening.md	2026-11-12 02:10:24
++++ b/docs/adr/0096-early-entry-fast-arms-by-data-source-and-one-holdout-opening.md	2026-11-12 05:40:56
+@@ -412,3 +412,122 @@
+ defaults `set_trailing_sl(n_atr=6)` to six ATRs (read 2026-11-12). This adds no six-ATR arm and
+ changes none of amendment 8's trail rows. All replay results remain DIAGNOSTIC and the
+ development-only and no-holdout rules remain.
++
++## Amendment 10: the profile trail arm, 2026-11-12
++
++Before any replay result of this arm exists, the lead, on the owner's requirement, registers a
++fourth trail arm, **`profile`**, beside amendment 8's `fixed`, `atr` and `tier` rows. Its source and
++every base below are **lead, no primary source**; every number is **UNCALIBRATED**.
++
++* **Distance.** `profile = max(K × max(ATR, R), F) × V`, as a fraction of price.
++  * `ATR` is the live ATR over the slot's one-minute bars once warm (amendment 8's `atr_n`).
++  * `R` is the symbol's same-clock historical range: the **`PCTL`** of the one-minute true range,
++    as a fraction of the previous close, in the symbol's 15-minute clock segment.
++  * `F`, the pullback floor, is the symbol's surviving-pullback depth for that segment: the dip
++    inside a rising run that went on to a new high, so the stop outlasts the typical dip of a run
++    that continued.
++  * `V` is the live volume state's multiplier, by the symbol's **`RDc_1`** ratio (amendment 4) in
++    three buckets: **under 3**, **3 to under 10**, **10 and over**. 3 is the onset threshold
++    already registered for the sub-minute measure. An unknown ratio takes the first bucket's
++    multiplier.
++  * `R` and `F` are read from the trail profile file (`trail-profile-v1.json`, T5 step 1).
++* **Bases.** **`K = 2`**; **`PCTL = p75`**; **`F` at the median**; multipliers **1 / 1 / 1**.
++* **Bounds.** The distance is never under the spread floor and never over **0.02**. During a
++  holding it only tightens: a later, wider value never loosens a trail already set.
++* **Thin symbols.** A symbol with **fewer than 5 sessions** with a bar in that segment in the
++  profile's "recent" window does not get `profile`. It takes `atr`, then the cold fallback, and the
++  record names which in `trail_source`. The profile is the prior at slot time, so a symbol that is
++  not thin has a distance from its first bar.
++* **Tier-level settings.** `K`, `PCTL`, the floor and the multipliers are set **per tier**, never
++  per symbol. `R` and `F` are measured input from the profile file, not fitted settings.
++* **The top liquidity tier** keeps **`tier` 0.002** as its own arm beside `profile`. The 09:30
++  firing of 2026-11-12 runs `tier` there and `profile` at its base everywhere else.
++* **Re-entry in profile units.** Under this arm, amendment 7's `turn` measures `d` and `k` in units
++  of the base distance: `d` trail-distances means `d × profile`.
++
++**Eight arms, registered one at a time around the base; no grid:**
++
++| Arm | Change from the base |
++|---|---|
++| base | none |
++| K=1 | `K = 1` |
++| K=3 | `K = 3` |
++| PCTL=median | `PCTL` = median |
++| PCTL=p90 | `PCTL` = p90 |
++| floor=p75 | `F` at p75 |
++| floor=off | no pullback floor |
++| volume | multipliers 1 / 1.25 / 1.5 |
++
++**Comparators, not arms:** the fixed **0.02**; backtesting.py's `set_trailing_sl(n_atr=6)`, six
++ATRs (amendment 9's note); Lean's `TrailingStopRiskManagementModel`, whose
++`maximum_drawdown_percent` defaults to **0.05** (read 2026-11-12 in the primary
++[source](https://github.com/QuantConnect/Lean/blob/master/Algorithm.Framework/Risk/TrailingStopRiskManagementModel.py)).
++
++**R3 replays** the eight arms per symbol, reported by tier and by session part, on **development
++days only**. Each replayed day uses a profile built **as of that day**, from sessions before it
++only. Per-symbol tables stay **DIAGNOSTIC**, and the development-only and no-holdout rules of
++amendment 7 remain.
++
++*Clarification (a), 2026-11-12, the lead's, before R3 reads any result (first written 02:38 EST,
++made one ordered rule 02:40 EST):* where `R` and `F` come from, in this order.
++
++1. **Thin first.** A symbol with fewer than 5 sessions with a bar in that segment in the profile's
++   "recent" window is thin: it takes `atr`, then the cold fallback, named in `trail_source`.
++2. **Then, for a symbol that is not thin,** each of `R` and `F` is read from its **recent** row. A
++   recent statistic is null when its segment has fewer than **`MIN_SAMPLES = 20`** samples
++   (**UNCALIBRATED**); a null recent statistic is filled from the symbol's **long** row, and the
++   record names the window used for each value.
++3. **A null `R` in both rows** leaves the symbol without `profile`: it takes `atr`, then the cold
++   fallback, named. **A null `F` in both rows** means no pullback floor for that entry, named.
++
++*Clarification (b), 2026-11-12 03:52 EST, the lead's, before R3 reads any result (lead, no primary
++source):* the profile's age. A window that asks for `profile` refuses it by name when the trail
++profile's `as_of` is more than **5 sessions** behind the trade date (**UNCALIBRATED**), and it always
++records `as_of` and the number of sessions behind. This selects no arm and changes no registered base.
++The 09:30 firing of 2026-11-12 runs before the bound is built: it takes the profile at any age, with
++`as_of` and the sessions behind recorded. The bound is built in a later change.
++
++*Clarification (c), 2026-11-12, about 05:40 EST, the lead's, before R3 reads any result (lead, no primary
++source):* which sessions a trail profile reads.
++
++* **By default** the profile builder refuses, by name, any span that contains a registered holdout
++  date. A replay's as-of profiles always run under that default, and also never read a date on or after
++  the day replayed, with the per-session guard kept.
++* **The live profile file alone** may be built with an explicit flag (such as `--live-file`) that admits
++  holdout dates up to the last complete session. The replay path cannot set it, and the file's header
++  records the flag and lists every session read.
++* **The lead's reason:** the live baseline builder already reads those sessions nightly for the
++  ranking, no arm's outcome is read from the profile, and after this record's 09:30 opening those dates
++  are spent.
++
++## Amendment 11: the trail cap's policy and a re-entry bound, 2026-11-12
++
++Registered by the lead at about 05:20 EST. Their source is **lead, no primary source**; every number is
++**UNCALIBRATED**. What motivated them is the 04:33 paper firing on account B; **no replay or holdout
++result was read** before they were registered.
++
++* **`cap_policy`**: what a window does when a name's uncapped trail distance is over the cap
++  (amendment 10's **0.02**).
++  * **`clamp`**, the paired row: the distance is held at the cap, today's behaviour.
++  * **`refuse`**: no entry for that name; the refusal is recorded as `distance_over_cap` with the
++    uncapped distance. It passes over rather than blocks: a refused name takes no slot, and the slot goes
++    to the next ranked name that passes.
++  * **`scale_size`**: the trail takes the distance the name needs, up to **0.10**, and the quantity is
++    scaled by **cap / distance**, so the dollars lost at the stop equal those of a capped stop on a
++    full slot.
++
++  The 09:30 firing of 2026-11-12 runs **`refuse`**. Paper is never gated on a replay, so `scale_size`
++  is built the same day and fires on account B in a regular-session window around 13:00 EST, beside
++  that day's `refuse` result (the lead, about 05:25 EST). A replay of it runs in parallel, and its rows
++  join when they arrive.
++* **`reentry_max`**: at most this many re-entries per name per window, base **2**, alternates **1**
++  and **4**. It counts amendment 7's `turn` and `reclaim` alike; a re-entry refused by it is recorded
++  as `reentry_max`.
++
++These rows select no arm from a result and change no holdout opening; the development-only and
++no-holdout rules of amendment 7 remain.
++
++*Opening note on amendments 10 and 11, 2026-11-12, about 05:50 EST, the lead's:* if this record's
++holdout opens before amendments 10 and 11 are on `main`, the opening's manifest names their draft by
++path and SHA-256, and they land afterwards byte for byte. Amendments that land with any other SHA-256
++void the opening for the arms they cover.
