@@ -797,7 +797,8 @@ def test_the_pre_market_warm_up_span_is_counted_in_the_bar_types_interval(
     assert built["warm_up_start"] == datetime(2026, 11, 10, 13, 55, tzinfo=NEW_YORK)
 
 
-def test_the_calendar_read_reaches_back_a_week_for_the_prior_session() -> None:
+def test_the_calendar_read_reaches_back_two_weeks_for_the_prior_sessions() -> None:
+    """Two weeks since the ultra review of the composition, finding 4 (a week before it)."""
     asked = []
 
     class Reads(Account):
@@ -806,7 +807,7 @@ def test_the_calendar_read_reaches_back_a_week_for_the_prior_session() -> None:
             return [CALENDAR]
 
     session_window.session_now(cast(Any, Reads()))
-    assert (asked[0].start, asked[0].end) == (date(2026, 11, 3), date(2026, 11, 11))
+    assert (asked[0].start, asked[0].end) == (date(2026, 10, 27), date(2026, 11, 11))
 
 
 def test_a_pre_market_window_hands_the_warm_up_start_to_its_node(monkeypatch, tmp_path) -> None:
@@ -6692,7 +6693,9 @@ class EntryHistory:
 @pytest.mark.parametrize("feed", ["sip", "boats"])
 def test_the_registered_arm_gets_each_names_day_and_prior_history_without_future_bars(feed) -> None:
     data = EntryHistory()
-    calendar = [day("2026-11-06"), day("2026-11-09"), day("2026-11-10")]
+    calendar = [
+        day(d) for d in ("2026-11-03", "2026-11-04", "2026-11-05", "2026-11-06", "2026-11-09")
+    ] + [day("2026-11-10")]
     contexts = session_window.mover_entry_contexts(
         cast(Any, data),
         ("AAA", "BBB"),
@@ -6705,13 +6708,14 @@ def test_the_registered_arm_gets_each_names_day_and_prior_history_without_future
         assert context.symbol == instrument_id.symbol.value and context.day == TODAY
         assert [bar.start for bar in context.bars] == [240, 659]
         assert [bar.close for bar in context.bars] == [100.0, 110.0]
-        assert [session[0].close for session in context.earlier] == [90.0, 80.0]
+        assert len(context.earlier) == 5
+        assert [session[0].close for session in context.earlier if session] == [90.0, 80.0]
         assert context.reference == 100.0 and context.covered_to == 660
         assert context.missing is None
     minute, daily = data.requests
     assert minute.feed.value == feed and daily.feed.value == "sip"
     assert minute.adjustment.value == daily.adjustment.value == "split"
-    assert minute.start == datetime(2026, 11, 6, 4, 0, tzinfo=NEW_YORK).astimezone(UTC).replace(
+    assert minute.start == datetime(2026, 11, 3, 4, 0, tzinfo=NEW_YORK).astimezone(UTC).replace(
         tzinfo=None
     )
     assert minute.end < AT.astimezone(UTC).replace(tzinfo=None)
@@ -8877,3 +8881,35 @@ def test_the_chosen_names_raising_quote_read_refuses_and_is_recorded(monkeypatch
             mover=True,
             strategy="Mover",
         )
+
+
+THANKSGIVING = date(2026, 11, 26)
+
+
+@pytest.mark.parametrize("today", [date(2026, 11, 27), date(2026, 11, 30), date(2026, 12, 2)])
+def test_the_calendar_read_holds_five_earlier_sessions_after_a_holiday(today) -> None:
+    """ultra-3a8613a/4, the lead's ruling of 2026-11-12: the calendar is read far enough back that the
+    registered arm's five earlier sessions are held in the days after a market holiday."""
+    from canon_trading import early_entry_study as study
+
+    start = today - session_window.CALENDAR_BACK
+    held = [
+        start + timedelta(days=n)
+        for n in range((today - start).days)
+        if (start + timedelta(days=n)).weekday() < 5 and start + timedelta(days=n) != THANKSGIVING
+    ]
+    assert len(held) >= study.ARMS["registered"].baseline_sessions
+
+
+def test_an_entry_context_with_fewer_earlier_sessions_than_the_arm_takes_is_missing() -> None:
+    """ultra-3a8613a/4: a context holding fewer earlier sessions than the registered arm's five is
+    marked missing by name, never averaged over the fewer sessions it has."""
+    contexts = session_window.mover_entry_contexts(
+        cast(Any, EntryHistory()),
+        ("AAA",),
+        AT,
+        [day(d) for d in ("2026-11-04", "2026-11-05", "2026-11-06", "2026-11-09", "2026-11-10")],
+        feed="sip",
+    )
+    (context,) = contexts.values()
+    assert context.missing is not None and "4 earlier sessions" in context.missing

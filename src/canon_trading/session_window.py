@@ -360,8 +360,11 @@ evening and every morning by design; a part not yet probed on its feed runs, and
 (after-hours, and pre-market before 08:00, on `sip`); inside a part with a feed, a
 window that receives nothing still fails (`_data_failure`). The feed is named in the subscriptions' and the bars
 request's params, `{"feed": ...}` (ADR 0055); one not served fails loudly, never another."""
-CALENDAR_BACK = timedelta(days=7)
-"""How far back the calendar is read: past any run of weekend and holiday days before a trading day."""
+CALENDAR_BACK = timedelta(days=14)
+"""How far back the calendar is read: past any run of weekend and holiday days before a trading day, and
+far enough that the registered arm's five earlier sessions are held in the week after a market holiday
+(two weeks hold at least eight trading days in any year: the lead's ruling of 2026-11-12 on the ultra
+review of the composition, finding 4)."""
 DEFAULT_MINUTES = 30
 MAX_MINUTES = 60
 GAP_SECS = 60
@@ -2824,7 +2827,8 @@ def mover_entry_contexts(
     `data/historical/stock.py:75-99`) reads split-adjusted minute history on the part's feed in one
     paginated request, and the last completed regular daily reference on SIP in another. Current-day
     bars begin at 04:00 New York and end before this minute; earlier calendar sessions are latest first,
-    at most the registered arm's baseline length. Sparse minutes stay sparse. A failed read raises;
+    at most the registered arm's baseline length, and a name with fewer is missing. Sparse minutes stay
+    sparse. A failed read raises;
     missing reference/calendar input stays named in Day.missing and never borrows the startup sample's
     reference. A successful requested range supplies coverage, including minutes without a trade.
     """
@@ -2892,9 +2896,16 @@ def mover_entry_contexts(
             if b.timestamp.astimezone(NEW_YORK).date() == sessions[0]
         ]
         reference = None if not references else max(references, key=lambda b: b.timestamp).close
-        missing = (
-            None if reference is not None and reference > 0 else "no prior-session reference close"
-        )
+        wanted = study.ARMS["registered"].baseline_sessions
+        if reference is None or reference <= 0:
+            missing = "no prior-session reference close"
+        elif len(sessions) < wanted:  # never a normal over fewer sessions than the arm registered
+            missing = (
+                f"only {len(sessions)} earlier sessions on the calendar read; the registered arm "
+                f"takes {wanted}"
+            )
+        else:
+            missing = None
         contexts[InstrumentId.from_str(f"{symbol}.{VENUE}")] = study.Day(
             symbol,
             today,
