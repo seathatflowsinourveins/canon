@@ -48,6 +48,7 @@ cover every roster name at build. Runtime admission of names outside that roster
 | Paper size | Alpaca's startup account buying_power, limited by the CASH engine's cash, divided by configured slots, whole shares at the current entry limit through instrument.make_qty | `ap:alpaca/trading/models.py:565,616,627`; `nt:python/nautilus_trader/model/__init__.pyi`, make_qty; `crates/risk/src/engine/mod.rs:2733-2752` |
 | Legacy risk-sizing simulations | `FixedRiskSizer.calculate(entry, stop_loss, equity, risk, hard_limit=…)` | `nt:python/nautilus_trader/risk/__init__.pyi:16-29`; `crates/risk/src/sizing.rs:39-117` |
 | Protection | The order emulator holding `OrderFactory.trailing_stop_limit`, trigger `BID_ASK` or `LAST_PRICE`, released as a `LIMIT` | `nt:…/common/__init__.pyi:1523-1547`; `docs/concepts/orders/emulated.md:15-19`, `:129` |
+| Protection with a persistence arm on | `Strategy.on_trade`, the step timer, `OrderFactory.limit`; no order is emulated | ADR 0119 |
 | The mark outside the session | A release keeps the submit's params | `nt:crates/execution/src/order_emulator/emulator.rs:1368`, `:1522-1531`; its test, `:4513`, covers stop orders |
 | A re-price | `cancel_order`, then a new `OrderFactory.limit` | `nt:python/nautilus_trader/trading/__init__.pyi:571` |
 | Prices | `TieredTickScheme.next_ask_price`, `next_bid_price` | `nt:crates/model/src/instruments/tick_scheme.rs:525`, `:555` |
@@ -91,7 +92,8 @@ bar receipt/submit times for every entry.
 balance, `run_bars` 3, `entry_ticks` 0, `exit_ticks` 1, `trail` 0.02 of the entry price (a fixed offset
 under the highest bid), `exit_through` 0.005, `chase_cap` 0.02, `chase_secs` 5, `chase` `resend` (its one value),
 `flow_share` 0.05 of `flow_bars` 5, `entry_timeout_secs` 30, `cooldown_secs` 300, `rank_max_age_secs` 90,
-`soft_line` 140 requests in 60 s, `trigger` `BID_ASK`; `entry_arm` `registered` (a key of ADR 0092's
+`soft_line` 140 requests in 60 s, `trigger` `BID_ASK`; `breach_count` 1, `high_count` 1 and
+`confirm_gap_ms` 100 (ADR 0119's rows, both arms off); `entry_arm` `registered` (a key of ADR 0092's
 shared `ARMS`), `max_shares` and `entries` unbounded. A supplied `share_caps` map bounds each entry in
 that name's shares and refuses an unlisted name. ADR 0091 supplies every window name its own map entry
 and independent position monitor. An explicit global max_shares can tighten a name's bound and is
@@ -129,8 +131,13 @@ allows overnight limits with DAY or GTC, and its orders page requires the extend
 explicit `bridge_reason` says this class cannot run, the window records the part and reason and runs
 the `SessionMaCross` limit bridge on the same choice and feed. No default row needs that fallback.
 
-**Departures from the requirement, each not built:** a re-priced entry; the gain lock; a breach that must
-persist (in the replays here the emulator released on the first quote at the trigger); a broker-held
+**A breach that must persist** is ADR 0119's, proposed and off by default: with `breach_count` or
+`high_count` above one the strategy holds the stop itself and no order is emulated. The lines here
+that have the emulator hold the trailing sell (the Protection row above, the order-path rule on a
+changed quantity and, under Consequences, a further fill remaking that sell and the protection living
+in the emulator) then describe the arms-off path only.
+
+**Departures from the requirement, each not built:** a re-priced entry; the gain lock; a broker-held
 stop for an outage; slots reserved for the newest movers; the reclaim as a pullback, a held higher low
 and a hold (here: a rising run that closes above the sale's price, after the cooldown); no order into a
 halt (ADR 0083, gap 4); each exit's counterfactuals (the strategy keeps every fill with its time; a
@@ -157,7 +164,8 @@ replay computes them).
   asks for it.
 * Bad: the emulated trailing sell triggers on a single quote. In the second paper window (ADR 0091) it
   was armed at 14:26:02.30 and released at 14:26:07.19 at a bid of 0.8258, on a spike in the bid and
-  its reversal within a millisecond, 8 seconds after the entry. A breach that must persist is not built.
+  its reversal within a millisecond, 8 seconds after the entry. ADR 0119 is the answer, off until a
+  paper window has run it.
 * Bad: shares held with no filled entry of this strategy's have no price to size a sale from: they are
   named in the run's record and sold only at the wind-down (a window starts flat).
 * Bad: nothing bounds the time without a working sale when a replacement is refused again and again;
@@ -175,6 +183,7 @@ replay computes them).
   missing and prevents entry. The registered entry's qualifying bar receipt is preserved for diagnostics.
   The multi-name paper delivery and full CI are UNVERIFIED until the Claude lane runs them.
 
+* The persistence arms, 2026-11-12: ADR 0119's Confirmation.
 * `tests/test_mover.py`: 77 tests, the order-path cases through a real `BacktestEngine` on generated
   bars, trades and quotes, and six states the simulated venue does not reach on a stand-in. `tests/test_mover_day.py`: the replay and its shape checks on a generated tape.
 * UNVERIFIED at rc8, from rc9's release notes: `market_exit` "skipping emulated and active-local orders
@@ -229,3 +238,6 @@ Read 2026-11-11. Resolved means read in a local copy at the commit `canon/upstre
   eligibility and BOATS data. The session change's offline node builds and engine simulations are in
   `tests/test_mover_window.py`, `tests/test_mover.py` and `tests/test_session_window.py`; the marked
   orders of each new mover part on account B remain UNVERIFIED pending its paper run (ADR 0091).
+* 2026-11-12: the breach that must persist is decided in ADR 0119. An evidence-verifier pass on that
+  text while it stood here found three lines of this record stale under an arm; they are qualified in
+  the paragraph that points to ADR 0119.

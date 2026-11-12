@@ -153,6 +153,7 @@ from .ma_cross import MaCross
 from .ma_cross import MaCrossConfig
 from .ma_cross import check_as_built
 from .mover import OWN_FIELDS as MOVER_FIELDS
+from .mover import PERSISTENCE_FIELDS
 from .mover import MoverConfig
 from .returns_matrix import DAY_NS
 from .returns_matrix import NS_RANGE
@@ -892,6 +893,12 @@ def _strategy_fields(config: MaCrossConfig | MoverConfig) -> dict[str, Any]:
         value = _field(name, getattr(config, name))
         if value != default:  # a base field is a read-only pyo3 getter, never in `vars(config)`
             fields[name] = value
+    if isinstance(config, MoverConfig) and not config.persistence:
+        # With both arms off no run reads the persistence rows, so they are not in the key: a Mover
+        # configuration keyed before those rows existed keeps its key, and two that differ only in
+        # an unread gap are one trial.
+        for name in PERSISTENCE_FIELDS:
+            fields.pop(name, None)
     return dict(sorted(fields.items()))
 
 
