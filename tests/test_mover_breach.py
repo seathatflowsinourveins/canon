@@ -804,3 +804,25 @@ def test_a_sustained_drop_sends_a_day_limit_within_one_step_of_confirmation() ->
     assert all(row[-1] == {"extended_hours": True} for row in s.submissions)
     trailing, _ = offsets(Decimal("10.31"), s.settings.trail, s.settings.exit_through)
     assert HIGH - trailing == LEVEL
+
+
+def test_a_breach_sale_keeps_the_confirmed_level_beside_its_fill() -> None:
+    """The lead's ruling of 2026-11-12 17:43 under persistence: the sale a confirmed breach sends has
+    the level it crossed beside its fill in the record (`sell_triggers`), so a gap's loss past the
+    level can be read per exit (code review of the trigger record, 2026-11-12)."""
+    first = START + 100 * MS
+    s, orders, held = replay(
+        [
+            print_at(first, "10.35"),
+            quote_at(first + 50 * MS, "9.99", "10.01"),
+            print_at(first + 100 * MS, "10.00"),
+            print_at(first + 200 * MS, "10.00"),
+            quote_at(START + SECOND + 100 * MS, "9.99", "10.01"),
+        ],
+        end=first + 3 * SECOND,
+    )
+    sales = sells(orders)
+    assert held == 0 and len(sales) == 1
+    record = s.record()
+    trigger = record["sell_triggers"].get(sales[0].client_order_id.value)
+    assert trigger is not None and Decimal(trigger) == LEVEL, record["sell_triggers"]

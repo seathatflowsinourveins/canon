@@ -80,6 +80,7 @@ from requests.adapters import HTTPAdapter
 from canon_trading import price_step
 from canon_trading import session_ma_cross
 from canon_trading import session_window
+from canon_trading.mover import PAPER_LOSS_SHARE
 from canon_trading.paper_node import MAX_ORDER_SUBMIT_RATE
 from canon_trading.paper_node import exec_engine_config
 from canon_trading.paper_node import risk_limits
@@ -2287,6 +2288,7 @@ def test_the_rank_actor_ranks_without_a_baseline_overnight_only(
         part=part,
         pick=mover_pick(),
         entry_notional=Decimal(500),
+        loss_share=PAPER_LOSS_SHARE,
         ends=ends,
     )
     try:
@@ -2341,6 +2343,7 @@ def test_a_relative_baseline_path_is_resolved_against_the_repository(monkeypatch
         feed="sip",
         pick=mover_pick(),
         entry_notional=Decimal(500),
+        loss_share=PAPER_LOSS_SHARE,
         ends=ends,
     )
     node.dispose()
@@ -6252,7 +6255,9 @@ class SmallerAssets(Assets):
 @pytest.fixture(autouse=True)
 def priced(monkeypatch):
     """Every window reads one share's price before it starts: here SPY's at $750 unless a test says
-    otherwise; no test reads Alpaca's screener unless it hands one in."""
+    otherwise; no test reads Alpaca's screener unless it hands one in. Each runs on paper account B, the
+    windows' account, so a Mover window has its loss share; a test that names another account sets it."""
+    monkeypatch.setenv(session_window.ACCOUNT_ENV, "windows")
     monkeypatch.setattr(session_window, "window_data", lambda: Data(), raising=False)
     monkeypatch.setattr(
         session_window,
@@ -6923,6 +6928,28 @@ def test_invalid_allocation_slots_refuse_before_an_account_read(slots):
         session_window.mover_allocation(cast(TradingClient, account), slots)
 
 
+def test_a_mover_window_on_an_unnamed_account_refuses_before_its_allocation_read(
+    monkeypatch, tmp_path
+):
+    """Second review finding 8 (S2): the refusal of an account with no planned loss came after the
+    allocation's account read, a request spent on a window that cannot run."""
+    monkeypatch.delenv(session_window.ACCOUNT_ENV, raising=False)
+    monkeypatch.setattr(
+        session_window, "mover_allocation", lambda *a, **k: pytest.fail("allocation read")
+    )
+    with pytest.raises(session_window.WindowRefused, match="owner's figure"):
+        quiet_window(
+            monkeypatch,
+            tmp_path,
+            quotes=5,
+            trades=5,
+            account=Evening(17),
+            strategy="Mover",
+            session="extended",
+            mover=True,
+        )
+
+
 @pytest.mark.parametrize(
     ("part", "hour"),
     [("regular", 11), ("pre-market", 5), ("after-hours", 17), ("overnight", 21)],
@@ -7165,6 +7192,33 @@ def test_auto_runs_mover_in_every_extended_part(
         assert "nothing to run" in out and said in out
         heard = json.loads((tmp_path / "last-firing.json").read_text())
         assert heard["outcome"].startswith("nothing to run") and said in heard["outcome"]
+
+
+def test_an_auto_part_that_runs_another_strategy_names_the_trail_flags_it_does_not_run(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """Review finding 5 (/code-review high, S2): `--session auto --mover` with Mover's trail flags,
+    in a regular part that runs another strategy, ran with the defaults and said nothing."""
+    seen = []
+
+    class At(Account):
+        def get_clock(self) -> Clock:
+            return clock(datetime(2026, 11, 10, 11, 0, tzinfo=NEW_YORK), is_open=True)
+
+    def window(config, **_kwargs):
+        seen.append((config.strategy, config.arm, config.trail_cap))
+        raise session_window.WindowSkipped("the test stops here")
+
+    monkeypatch.setattr(session_window, "EXTENDED_READY", True)
+    monkeypatch.setattr(session_window, "paper_trading", lambda: At())
+    monkeypatch.setattr(session_window, "run_window", window)
+    argv = ["--session", "auto", "--mover", "--log-dir", str(tmp_path)]
+    flags = ["--trail-mode", "atr", "--trail-cap", "own", "--arm", "OWN1"]
+    assert session_window.main([*argv, *flags]) == 0
+    assert seen == [(session_window.DEFAULT_STRATEGY, None, "clamp")]
+    out = capsys.readouterr().out
+    assert "--trail-mode atr, --trail-cap own, --arm OWN1 not run" in out
+    assert f"runs {session_window.DEFAULT_STRATEGY}" in out
 
 
 def test_the_schedule_fires_the_mover_path() -> None:
@@ -7695,6 +7749,7 @@ def test_a_mover_strategy_window_builds_the_strategy_its_ranking_and_the_outer_b
         feed="sip",
         pick=mover_pick(),
         entry_notional=Decimal(500),
+        loss_share=PAPER_LOSS_SHARE,
         ends=ends,
         slots=4,
     )
@@ -7776,6 +7831,7 @@ def test_the_multiname_node_loads_the_roster_and_builds_its_actor_and_each_cap(
         feed="sip",
         pick=pick,
         entry_notional=Decimal(500),
+        loss_share=PAPER_LOSS_SHARE,
         ends=ends,
         entry_contexts=contexts,
     )
@@ -7821,6 +7877,7 @@ def test_the_window_uses_the_registered_arm_in_its_scope_and_an_explicit_bridge_
         part=part,
         pick=mover_pick(),
         entry_notional=Decimal(500),
+        loss_share=PAPER_LOSS_SHARE,
         ends=ends,
     )
     try:

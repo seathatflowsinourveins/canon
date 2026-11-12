@@ -46,7 +46,9 @@ from nautilus_trader.model import BarType
 from nautilus_trader.model import StrategyId
 from nautilus_trader.model import TimeInForce
 
+from .mover import PAPER_LOSS_SHARE
 from .mover import RANK_SIGNAL
+from .mover import TRAIL_CAP_DEFAULT
 from .mover import Mover
 from .mover import MoverConfig
 from .mover import format_rank
@@ -345,12 +347,17 @@ def mover_universe_parts(
     entry_notional: Decimal = ENTRY_NOTIONAL_USD,
     size_from_budget: bool = False,
     trail_rows: Mapping[str, Any] | None = None,
+    planned_loss: Decimal | None = None,
+    loss_share: Decimal | None = None,
+    trail_cap: str = TRAIL_CAP_DEFAULT,
 ) -> tuple[Mover, tuple[PositionCap, ...]]:
     """One strategy and independent position monitors on the loaded roster. The ranking arrives only
     on the bus; the startup order is not a substitute. Every name has an entry share bound, and a name
     outside the roster cannot enter. The default registered arm gets explicit per-name Day contexts.
     `trail_rows` (T1/T2's `TRAIL_SETTINGS`) go through `MoverConfig`'s own validation with this
-    window's `bar_spec`.
+    window's `bar_spec`. `planned_loss` is the loss at the stop each entry is sized for, or
+    `loss_share` the share of `entry_notional` it is measured from (`mover.share_loss`), one of which
+    `size_from_budget` requires; and `trail_cap` the arm for a trail over the cap (`mover.TRAIL_CAPS`).
     """
     if not prices:
         raise ValueError("a mover window needs at least one priced instrument")
@@ -365,6 +372,9 @@ def mover_universe_parts(
             else None,
             share_caps=shares,
             size_from_budget=size_from_budget,
+            planned_loss=planned_loss,
+            loss_share=loss_share,
+            trail_cap=trail_cap,
             entry_arm=entry_arm,
             entries=ENTRIES,
             slots=slots,
@@ -429,6 +439,8 @@ def mover_parts(
         entry_notional=entry_notional,
         size_from_budget=True,
         trail_rows=trail_rows,
+        # the paper row (`PAPER_LOSS_SHARE`): this bridge is a paper window's composition
+        loss_share=PAPER_LOSS_SHARE,
     )
     ranking = FixedRank()
     ranking.value = format_rank([(instrument_id, move)])

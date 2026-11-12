@@ -34,6 +34,7 @@ from nautilus_trader.risk import RiskEngineConfig
 
 from canon_trading import mover as mover_module
 from canon_trading import session_window
+from canon_trading.mover import PAPER_LOSS_SHARE
 from canon_trading.mover import Mover
 from canon_trading.mover_window import MOVER_ID
 from canon_trading.mover_window import OUTER_BOUND_MULTIPLE
@@ -125,6 +126,9 @@ def test_account_sizing_trades_and_flattens_in_each_part(
     volume = {"original": 100_000, "thin": 6842, "liquid": 1_000_000, "cash_falls": 100_000}[
         liquidity
     ]
+    # A cent each side of a 70-cent name is a spread wider than the 2% trail, and an entry whose bid is
+    # already at the stop it was sized for is refused (S2), so the thin name's quote is a tenth of a cent.
+    half = 0.001 if liquidity == "thin" else 0.01
     data = []
     for i, close in enumerate(closes):
         ts_close = ts_start + (i + 1) * minute
@@ -142,8 +146,8 @@ def test_account_sizing_trades_and_flattens_in_each_part(
         data.append(
             QuoteTick(
                 instrument.id,
-                Price(close - 0.01, 4),
-                Price(close + 0.01, 4),
+                Price(close - half, 4),
+                Price(close + half, 4),
                 Quantity.from_int(1_000_000),
                 Quantity.from_int(1_000_000),
                 ts_close - 1,
@@ -163,9 +167,9 @@ def test_account_sizing_trades_and_flattens_in_each_part(
         assert buy.price is not None
         price = buy.price.as_decimal()
         # The composition's Mover enters on the fourth bar after the ranking reaches its slot, at that
-        # close's ask (one cent over the close); the flow cap reads those four bars' dollar volume.
+        # close's ask (`half` over the close); the flow cap reads those four bars' dollar volume.
         [at] = [
-            i for i, close in enumerate(closes) if Decimal(str(close)) + Decimal("0.01") == price
+            i for i, close in enumerate(closes) if Decimal(str(close)) + Decimal(str(half)) == price
         ]
         flow_dollars = sum(Decimal(str(close)) for close in closes[at - 3 : at + 1]) * volume
         budget_shares = min(budget, entry_cash) // price
@@ -203,7 +207,7 @@ def test_account_sizing_trades_and_flattens_in_each_part(
         assert sizing["binding"] == ("flow" if liquidity == "thin" else "budget")
         assert sizing["quantity"] == str(expected)
         if liquidity == "thin":
-            assert flow_shares < budget_shares and expected == 1335
+            assert flow_shares < budget_shares and expected == 1352  # at the ask 0.726
     finally:
         eng.dispose()
 
@@ -276,6 +280,7 @@ def test_each_parts_startup_entry_sets_strategy_shares_and_engine_cap(
         pick=pick,
         ends=ends,
         entry_notional=Decimal(20000),
+        loss_share=PAPER_LOSS_SHARE,
     )
     try:
         assert isinstance(strategy, Mover)
@@ -328,6 +333,7 @@ def test_each_extended_part_builds_mover_with_the_configured_slots(
         part=part,
         pick=pick,
         entry_notional=Decimal(500),
+        loss_share=PAPER_LOSS_SHARE,
         ends=ends,
     )
     try:
@@ -382,6 +388,7 @@ def test_an_overnight_window_ranks_live_with_adr_0087s_actor_on_the_overnight_fe
         part="overnight",
         pick=picks,
         entry_notional=Decimal(500),
+        loss_share=PAPER_LOSS_SHARE,
         ends=ends,
     )
     try:
@@ -472,6 +479,7 @@ def test_an_extended_parts_slot_count_is_a_setting(monkeypatch, tmp_path) -> Non
         part="after-hours",
         pick=pick,
         entry_notional=Decimal(500),
+        loss_share=PAPER_LOSS_SHARE,
         ends=ends,
     )
     try:
@@ -508,6 +516,7 @@ def test_one_account_figure_reaches_every_mover_entry_and_the_engine(monkeypatch
         pick=MoverPick("LLL", Decimal(10), {"inputs": {}}, Decimal(10)),
         ends=ends,
         entry_notional=Decimal(10_000),
+        loss_share=PAPER_LOSS_SHARE,
     )
     try:
         assert isinstance(strategy, Mover) and not isinstance(cap, tuple)

@@ -31,12 +31,20 @@ BARS_REPLAY_FIXED_ROWS: dict[str, Any] = {
     "ratchet_r": Decimal(2),
     "ratchet_g": Decimal("0.5"),
     "ratchet_base": "atr",
+    "trail_cap": "clamp",
+    "planned_loss": None,
+    "loss_share": None,
 }
-"""Window-only settings excluded from bars trial keys; the study does not tune these rows."""
+"""Window-only settings excluded from bars trial keys; the study does not tune these rows. The cap arm
+and the planned loss (S2) act only on a non-fixed trail and on budget sizing, neither of which the bars
+replay runs, so a trial's key is what it was before them."""
 
 
 def check_bars_replay_modes(settings: MoverConfig) -> None:
     """The bars contract covers only the pre-port fixed trail and clock re-entry, by name."""
+    if settings.size_from_budget:
+        # the replay sizes buying_power / slots; budget sizing and its planned loss are the window's
+        raise ValueError("bars replay refuses size_from_budget=True; it sizes buying_power / slots")
     for name in ("trail_mode",):
         value = getattr(settings, name)
         if value != BARS_REPLAY_FIXED_ROWS[name]:

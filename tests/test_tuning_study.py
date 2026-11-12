@@ -11,6 +11,7 @@ from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import optuna
@@ -1557,8 +1558,16 @@ def test_p0_window_rows_do_not_move_the_trial_key_or_replay_settings() -> None:
     replay = BarsReplayMover(cfg.settings)
     expected = {name: getattr(replay.settings, name) for name in BARS_REPLAY_FIXED_ROWS}
     assert expected == BARS_REPLAY_FIXED_ROWS
+    from canon_trading.mover import PAPER_LOSS_SHARE
+    from canon_trading.mover import TRAIL_CAPS
+
+    window_only: dict[str, dict[str, Any]] = {
+        "trail_cap": {"arms": TRAIL_CAPS},
+        "planned_loss": {"alternates": (Decimal(20),)},
+        "loss_share": {"alternates": (PAPER_LOSS_SHARE,)},
+    }
     for name, pinned in BARS_REPLAY_FIXED_ROWS.items():
-        rows = TRAIL_SETTINGS[name]
+        rows = TRAIL_SETTINGS.get(name) or window_only[name]
         values = (pinned, *rows.get("alternates", rows.get("arms", ())))
         for value in values:
             from canon_trading.ma_cross import BASE_FIELDS
