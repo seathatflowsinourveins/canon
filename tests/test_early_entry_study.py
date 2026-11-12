@@ -115,6 +115,31 @@ def test_a_name_that_leaves_the_listing_loses_its_bars() -> None:
     assert run.entry == pytest.approx(10.7)
 
 
+def test_shared_entry_runs_keep_the_listing_clock_and_clear_unlisted_bars() -> None:
+    today = bars(OPEN, [10.4, 10.5, 10.2, 10.4, 10.5, 10.6, 10.7, 10.8])
+    candidates = list(study.entry_runs(a_day(today), REGISTERED))
+    assert [(index, listed_at) for index, _, listed_at in candidates] == [
+        (6, OPEN + 1),
+        (7, OPEN + 1),
+    ]
+    # Starting to watch late never lets historical rises warm the entry.
+    assert list(study.entry_runs(a_day(today), REGISTERED, start=OPEN + 5)) == []
+
+
+def test_shared_extension_refusal_is_independent_of_the_diagnostics_spread_model() -> None:
+    day = a_day(bars(OPEN, [10.4] * 17 + [10.5, 10.6, 10.7, 10.8]))
+    rows = study.ARMS["window-15"]
+    index, run, listed_at = next(study.entry_runs(day, rows))
+    assert index == 19 and listed_at == OPEN + 1
+    assert "past the first-leg window of 15" in (
+        study.entry_refusal(day, rows, index, run, listed_at) or ""
+    )
+    assert study.entry_refusal(day, REGISTERED, index, run, listed_at) is None
+    assert study.refusal(day, REGISTERED, Costs(0.03, 0.03), index, run, listed_at) == (
+        "its bid is under the planned stop"
+    )
+
+
 def test_a_name_with_no_normal_is_never_listed_and_says_why() -> None:
     assert replay_day(a_day(RISE, earlier=()), REGISTERED).never_listed == (
         "no earlier session to take a normal from"

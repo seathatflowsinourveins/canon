@@ -518,12 +518,8 @@ def test_partial_fills_are_reported_per_fill(venue) -> None:
             "post-only is not supported",
         ),
         (
-            {"order_type": "stop_limit", "price": "201.001", "trigger_price": "200.00"},
-            "limit price 201.001 has more than 2 decimals",
-        ),
-        (
-            {"order_type": "limit", "price": "150.123"},
-            "limit price 150.123 has more than 2 decimals",
+            {"order_type": "stop_limit", "price": "201.001", "trigger_price": "200.005"},
+            "stop price 200.005 has more than 2 decimals",
         ),
     ],
 )
@@ -535,6 +531,82 @@ def test_unsupported_order_is_denied_before_alpaca(venue, options, reason) -> No
     assert strategy.names() == ["OrderDenied"]
     assert reason in strategy.events[0].reason
     assert venue.trading.submitted == []
+
+
+@pytest.mark.parametrize(
+    ("side", "price", "sent"),
+    [
+        # The emulated trailing exit's release (cx-m-c-composition's REPORT.md, "ORB cross-check"): the
+        # emulator rounds to the instrument's 0.0001 increment, which Alpaca rejects at or above $1.
+        (OrderSide.SELL, "10.4237", "10.42"),
+        (OrderSide.BUY, "10.4237", "10.43"),
+        (OrderSide.SELL, "1.0001", "1.00"),
+    ],
+)
+def test_a_limit_finer_than_alpacas_increment_is_sent_on_it_never_less_marketable(
+    venue, side, price, sent
+) -> None:
+    strategy = trader(order_type="limit", side=side, price=price)
+
+    run(build_node(strategy))
+
+    (request,) = venue.trading.submitted
+    assert isinstance(request, LimitOrderRequest)
+    assert Decimal(str(request.limit_price)) == Decimal(sent)
+    # The price sent is the order's before Alpaca's acknowledgement, so a strategy that acts on
+    # `OrderAccepted` sees it (the second reader's finding 1, 2026-11-11).
+    assert strategy.names() == ["OrderSubmitted", "OrderUpdated", "OrderAccepted", "OrderFilled"]
+    updated = strategy.events[1]
+    assert updated.price.as_decimal() == Decimal(sent)
+    assert updated.venue_order_id == strategy.events[2].venue_order_id
+
+
+@pytest.mark.parametrize("price", ["0.7212", "10.42"])
+def test_a_limit_on_alpacas_increment_is_sent_as_it_is_with_no_update(venue, price) -> None:
+    strategy = trader(order_type="limit", side=OrderSide.SELL, price=price)
+
+    run(build_node(strategy))
+
+    (request,) = venue.trading.submitted
+    assert Decimal(str(request.limit_price)) == Decimal(price)
+    assert strategy.names() == ["OrderSubmitted", "OrderAccepted", "OrderFilled"]
+
+
+def test_a_stop_limits_limit_is_sent_on_alpacas_increment(venue) -> None:
+    venue.trading.script = "accept"
+    strategy = trader(
+        order_type="stop_limit",
+        side=OrderSide.SELL,
+        price="199.996",
+        trigger_price="200.00",
+        cancel_on="OrderAccepted",
+    )
+
+    run(build_node(strategy))
+
+    (request,) = venue.trading.submitted
+    assert (request.stop_price, request.limit_price) == (200.0, 199.99)
+    assert strategy.names()[:3] == ["OrderSubmitted", "OrderUpdated", "OrderAccepted"]
+
+
+def test_a_rounded_limit_reconciles_with_alpacas_order_unchanged(venue) -> None:
+    venue.trading.script = "accept"
+    strategy = trader(order_type="limit", side=OrderSide.SELL, price="10.4237")
+    seen: list = []
+
+    async def report(client) -> None:
+        async with asyncio.timeout(10):
+            while "OrderUpdated" not in strategy.names():
+                await asyncio.sleep(0.01)
+        await until_idle(client, venue)
+        by_id = SimpleNamespace(venue_order_id=None, client_order_id=strategy.client_order_id)
+        reported = await client._generate_order_status_report(by_id)
+        seen.append((reported.price, client.cache.order(strategy.client_order_id).price))
+
+    run_with_client(report, strategy)
+
+    ((reported, cached),) = seen
+    assert reported == cached == Price.from_str("10.4200")
 
 
 @pytest.mark.parametrize("trigger_type", [None, TriggerType.DEFAULT, TriggerType.LAST_PRICE])
@@ -1397,13 +1469,15 @@ def test_cancel_all_with_no_matching_order_sends_nothing(venue, capfd) -> None:
 
 class Modifier(Strategy):
     """Place one limit (or stop) buy on the first quote and, once Alpaca accepts it, modify it to each
-    price in `prices` in turn, each after the last `OrderUpdated`."""
+    price in `prices` in turn, each after the `OrderUpdated` that answers the last modify."""
 
     def __init__(self) -> None:
         super().__init__()
         self.order_type = "limit"
+        self.price = "150.00"  # the limit buy's price
         self.prices: list[str] = ["150.50"]
         self.field = "price"  # or "trigger_price", or "quantity"
+        self.awaiting = False  # a modify sent, its `OrderUpdated` not yet seen
         self.started = False
         self.client_order_id: ClientOrderId | None = None
         self.events: list = []
@@ -1422,7 +1496,7 @@ class Modifier(Strategy):
             )
         else:
             order = factory.limit(
-                AAPL, OrderSide.BUY, Quantity.from_int(2), Price.from_str("150.00")
+                AAPL, OrderSide.BUY, Quantity.from_int(2), Price.from_str(self.price)
             )
         self.client_order_id = order.client_order_id
         self.submit_order(order)
@@ -1432,10 +1506,13 @@ class Modifier(Strategy):
         if name == "OrderInitialized":
             return
         self.events.append(event)
+        if name == "OrderUpdated" and not self.awaiting:
+            return  # not the answer to a modify of ours
         if name in ("OrderAccepted", "OrderUpdated") and self.prices:
             if name == "OrderAccepted" and self.names().count("OrderAccepted") > 1:
                 return
             value = self.prices.pop(0)
+            self.awaiting = True
             assert self.client_order_id is not None
             if self.field == "quantity":
                 self.modify_order(self.client_order_id, quantity=Quantity.from_str(value))
@@ -1691,7 +1768,6 @@ def test_rejected_replacement_is_modify_rejected_not_order_rejected(venue) -> No
 @pytest.mark.parametrize(
     ("options", "reason"),
     [
-        ({"prices": ["150.505"]}, "limit price 150.505 has more than 2 decimals"),
         (
             {"order_type": "stop", "field": "trigger_price", "prices": ["210.125"]},
             "stop price 210.125 has more than 2 decimals",
@@ -1707,6 +1783,54 @@ def test_modify_the_client_can_prove_alpaca_refuses_is_rejected_before_alpaca(
     run_modify(venue, strategy, lambda: "OrderModifyRejected" in strategy.names())
 
     assert reason in strategy.last("OrderModifyRejected").reason
+    assert venue.trading.replace_requests == []
+
+
+def test_a_modify_finer_than_alpacas_increment_is_sent_on_it_as_a_submit_is(venue) -> None:
+    venue.trading.script = "accept"
+    strategy = modifier(prices=["150.505"])  # a buy: rounded up, never less marketable
+
+    run_modify(venue, strategy, lambda: "OrderUpdated" in strategy.names())
+
+    ((_, request),) = venue.trading.replace_requests
+    assert Decimal(str(request.limit_price)) == Decimal("150.51")
+    assert strategy.last("OrderUpdated").price == Price.from_str("150.5100")
+
+
+def test_a_modify_on_acceptance_is_answered_by_its_own_replace_not_the_rounding(venue) -> None:
+    """The second reader's finding 1 (2026-11-11): a strategy that modifies on `OrderAccepted`, as
+    upstream's `ExecTester` does, must not get the rounded price's `OrderUpdated` as its modify's
+    answer: that put the order back to `ACCEPTED` mid-replace, and a second modify went to the replaced
+    order and was lost."""
+    venue.trading.script = "accept"
+    strategy = modifier(price="150.0001", prices=["150.50", "150.60"])
+
+    run_modify(venue, strategy, lambda: strategy.names().count("OrderUpdated") >= 3)
+
+    updates = [(type(e).__name__, getattr(e, "price", None)) for e in strategy.events]
+    assert updates == [
+        ("OrderSubmitted", None),
+        ("OrderUpdated", Price.from_str("150.0100")),
+        ("OrderAccepted", None),
+        ("OrderPendingUpdate", None),
+        ("OrderUpdated", Price.from_str("150.5000")),
+        ("OrderPendingUpdate", None),
+        ("OrderUpdated", Price.from_str("150.6000")),
+    ]
+    (first, second) = [order_id for order_id, _ in venue.trading.replace_requests]
+    assert second == placed_order(venue, 1)["id"] != first
+
+
+def test_a_modify_whose_price_rounds_to_the_orders_own_is_refused_before_alpaca(venue) -> None:
+    """The second reader's finding 2 (2026-11-11): `ExecTester`'s one-tick amend of a whole-cent buy
+    (TC-E30) rounds back up to the price the order has, so the replace would change nothing."""
+    venue.trading.script = "accept"
+    strategy = modifier(prices=["149.9999"])
+
+    run_modify(venue, strategy, lambda: "OrderModifyRejected" in strategy.names())
+
+    reason = strategy.last("OrderModifyRejected").reason
+    assert "149.9999 on Alpaca's increment is 150.0000, the order's own" in reason
     assert venue.trading.replace_requests == []
 
 

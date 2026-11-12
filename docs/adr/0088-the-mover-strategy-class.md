@@ -32,11 +32,12 @@ and its paper runs are ADR 0091. It recommends no trade.
 ## Decision Outcome
 
 Proposed: **option 2**, `canon_trading.mover.Mover`. Option 3 has no strategy of this kind (ADR 0083).
-Option 1 is upstream's mechanism for a universe that changes and is UNVERIFIED in a live node. This
-departs from ADR 0083, whose gap 2 leans to option 1 and whose M2 ties re-entry and rotation to a paper
-run of `Controller`: here they are plain state of one strategy, built and switched off in stage one (one
-slot, one entry a run). The universe is the instruments the node loaded, today one name a window, so
-loading every tradable instrument at build is not built, and the node's cap map is still fixed at build.
+Option 1 is upstream's mechanism for runtime admission of new instruments and remains UNVERIFIED in
+this live node. Re-entry and rotation are state of one strategy over the fixed roster the window
+loaded (ADR 0091). The composition enables ten regular/after-hours slots and one in pre-market/overnight,
+overridable by the run, and no entry-count bound. A sale frees a slot for a ranked reclaim after the
+cooldown or another ranked name until wind-down. The node's instrument, reconciliation and risk maps
+cover every roster name at build. Runtime admission of names outside that roster is not built.
 
 **The parts** (`nt:` is `nautilus-trader@d53849b216e2`, v2.0.0rc8):
 
@@ -44,7 +45,8 @@ loading every tradable instrument at build is not built, and the node's cap map 
 |---|---|---|
 | The ranking | `Strategy.subscribe_signal`, `on_signal`; the value is a string | `nt:python/nautilus_trader/trading/__init__.pyi:696`, `:633`; `docs/concepts/message_bus.md:243-264` |
 | Entry | `OrderFactory.limit`, DAY, at the ask | `nt:python/nautilus_trader/common/__init__.pyi:1388` |
-| Size | `FixedRiskSizer.calculate(entry, stop_loss, equity, risk, hard_limit=…)` | `nt:python/nautilus_trader/risk/__init__.pyi:16-29`; `crates/risk/src/sizing.rs:39-117` |
+| Paper size | Alpaca's startup account buying_power, limited by the CASH engine's cash, divided by configured slots, whole shares at the current entry limit through instrument.make_qty | `ap:alpaca/trading/models.py:565,616,627`; `nt:python/nautilus_trader/model/__init__.pyi`, make_qty; `crates/risk/src/engine/mod.rs:2733-2752` |
+| Legacy risk-sizing simulations | `FixedRiskSizer.calculate(entry, stop_loss, equity, risk, hard_limit=…)` | `nt:python/nautilus_trader/risk/__init__.pyi:16-29`; `crates/risk/src/sizing.rs:39-117` |
 | Protection | The order emulator holding `OrderFactory.trailing_stop_limit`, trigger `BID_ASK` or `LAST_PRICE`, released as a `LIMIT` | `nt:…/common/__init__.pyi:1523-1547`; `docs/concepts/orders/emulated.md:15-19`, `:129` |
 | The mark outside the session | A release keeps the submit's params | `nt:crates/execution/src/order_emulator/emulator.rs:1368`, `:1522-1531`; its test, `:4513`, covers stop orders |
 | A re-price | `cancel_order`, then a new `OrderFactory.limit` | `nt:python/nautilus_trader/trading/__init__.pyi:571` |
@@ -77,23 +79,47 @@ and rotation rules; the chase's price and floor; the yield of entries to the req
   closes); the default is left on. A run that only a lower close restarts is another rule, for the
   gate to measure beside this one, and is not built.
 
-**The ranking's contract** with the ranking actor (ADR 0087, numbered and not yet on `main`): the signal
+**The ranking's contract** with the ranking actor (ADR 0107): the signal
 `movers-rank`, its value the ranked instrument IDs best first, at most 20, each with its move from the
 last regular close (`ID=move;ID=move`), its `ts_event` the time the ranking was computed. A ranking older
-than `rank_max_age_secs`, or one that does not parse, means no entry. The strategy reads no vendor's list.
+than `rank_max_age_secs`, one that does not parse, or no actor generation means no entry. The strategy
+reads no vendor's list, and the startup sample's order is never substituted for the actor. The record
+retains every valid signal's value and two stored clocks, each actor tick's result, and the qualifying
+bar receipt/submit times for every entry.
 
 **The rows** are `MoverConfig`'s defaults, all UNCALIBRATED: `slots` 1, `watch` 3, `risk` 0.01 of the
 balance, `run_bars` 3, `entry_ticks` 0, `exit_ticks` 1, `trail` 0.02 of the entry price (a fixed offset
 under the highest bid), `exit_through` 0.005, `chase_cap` 0.02, `chase_secs` 5, `chase` `resend` (its one value),
 `flow_share` 0.05 of `flow_bars` 5, `entry_timeout_secs` 30, `cooldown_secs` 300, `rank_max_age_secs` 90,
-`soft_line` 140 requests in 60 s, `trigger` `BID_ASK`; `max_shares` and `entries` unbounded;
+`soft_line` 140 requests in 60 s, `trigger` `BID_ASK`; `entry_arm` `registered` (a key of ADR 0092's
+shared `ARMS`), `max_shares` and `entries` unbounded. A supplied `share_caps` map bounds each entry in
+that name's shares and refuses an unlisted name. ADR 0091 supplies every window name its own map entry
+and independent position monitor. An explicit global max_shares can tighten a name's bound and is
+never rewritten during sizing. With size_from_budget=False FixedRiskSizer retains the legacy
+risk/flow/free-cash limits. Paper windows explicitly set
+size_from_budget=True: the startup min(buying_power, cash)/slots figure sizes whole shares at each
+current limit, bounded by available balance_free when present and an explicit global share cap,
+updating that name's share and position bounds before submission. The budget composition keeps the
+global setting unset so an initial-price bound cannot freeze later allocations. ADR 0091 records the
+native cash-engine denial behind the conditional cash limit; margin is not modelled. No fixed monetary
+amount bounds paper Mover entries, and missing buying_power refuses startup.
 `max_notional` (the largest entry) and `max_move` (the no-chase cap) have none and are stated by each
-run. A **hold-to-close** row is the same entry and size with `protect=False`: no trailing sell, sold at
+run. Each registered entry arm consumes its supplied per-name `Day`, including the prior reference,
+bars since 04:00 and earlier sessions latest first; missing, wrong-name/day or gapped context admits
+no entry. ADR 0091 supplies/maintains that prefix through native data actors, including while a name is
+unranked. The explicitly selected `bridge` arm retains the original run-only rule. A **hold-to-close**
+row is the same entry and size with `protect=False`: no trailing sell, sold at
 the wind-down; a study's baseline, since a trial that never trades stops a ranking (ADR 0010).
 
 **Sessions, updated by the lead on 2026-11-11:** ADR 0091's `--mover` windows run this class in
 pre-market, after-hours and overnight as well as in the regular session. The part's feed and slot
-count are settings (`session_window.MOVER_PARTS`), with one slot outside regular hours, UNCALIBRATED.
+count are settings (`session_window.MOVER_PARTS`), with ten regular/after-hours slots and one in
+pre-market/overnight until those parts are measured; `--slots` overrides the part and `--spares` adds
+startup roster names for rotation. The lead reported 15 requests per slot per rolling minute with
+20% reserve under 200; the composition builder did not measure that order cost.
+The default registered entry arm covers 04:00-16:00 New York. After-hours and overnight explicitly
+select the bridge entry arm and record the scope reason; absent context inside the registered scope
+never selects a substitute arm.
 Pre-market and after-hours use SIP, overnight BOATS for the live sample, current trades and quotes,
 and minute-bar normals; the consolidated daily reference close stays on SIP. In each extended part
 the entry, emulator release, chase and wind-down are DAY limits with `extended_hours=True`, and the
@@ -140,6 +166,14 @@ replay computes them).
   print at or above a dollar would still release a sub-penny limit (a window uses `BID_ASK`).
 
 ### Confirmation
+
+* Composition update, 2026-11-11: `tests/test_mover.py` verifies the default registered arm refuses
+  absent context and unlisted rising runs, two names trade under separate share/position caps, a real
+  `MoversRankActor` re-ranks a fixed roster and a freed slot rotates with only the known Day prefix,
+  and a missing/wrong-session baseline sends no order or substitute ranking. A startup history gap
+  is repaired only on the native request's successful completion; its failed response marks the Day
+  missing and prevents entry. The registered entry's qualifying bar receipt is preserved for diagnostics.
+  The multi-name paper delivery and full CI are UNVERIFIED until the Claude lane runs them.
 
 * `tests/test_mover.py`: 77 tests, the order-path cases through a real `BacktestEngine` on generated
   bars, trades and quotes, and six states the simulated venue does not reach on a stand-in. `tests/test_mover_day.py`: the replay and its shape checks on a generated tape.

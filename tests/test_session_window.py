@@ -22,6 +22,7 @@ from datetime import UTC
 from datetime import date
 from datetime import datetime
 from datetime import timedelta
+from decimal import ROUND_DOWN
 from decimal import Decimal
 from itertools import pairwise
 from pathlib import Path
@@ -41,6 +42,7 @@ from alpaca.trading.models import Calendar
 from alpaca.trading.models import Clock
 from alpaca.trading.models import Order
 from alpaca.trading.models import Position
+from alpaca.trading.models import TradeAccount
 from alpaca.trading.requests import LimitOrderRequest
 from alpaca.trading.requests import MarketOrderRequest
 from canon_alpaca.constants import PRICE_INCREMENT
@@ -795,7 +797,8 @@ def test_the_pre_market_warm_up_span_is_counted_in_the_bar_types_interval(
     assert built["warm_up_start"] == datetime(2026, 11, 10, 13, 55, tzinfo=NEW_YORK)
 
 
-def test_the_calendar_read_reaches_back_a_week_for_the_prior_session() -> None:
+def test_the_calendar_read_reaches_back_two_weeks_for_the_prior_sessions() -> None:
+    """Two weeks since the ultra review of the composition, finding 4 (a week before it)."""
     asked = []
 
     class Reads(Account):
@@ -804,7 +807,7 @@ def test_the_calendar_read_reaches_back_a_week_for_the_prior_session() -> None:
             return [CALENDAR]
 
     session_window.session_now(cast(Any, Reads()))
-    assert (asked[0].start, asked[0].end) == (date(2026, 11, 3), date(2026, 11, 11))
+    assert (asked[0].start, asked[0].end) == (date(2026, 10, 27), date(2026, 11, 11))
 
 
 def test_a_pre_market_window_hands_the_warm_up_start_to_its_node(monkeypatch, tmp_path) -> None:
@@ -1047,6 +1050,19 @@ class Account:
     def get_account_configurations(self) -> AccountConfiguration:
         return AccountConfiguration.model_validate({**LONG_ONLY, "no_shorting": self.no_shorting})
 
+    def get_account(self) -> TradeAccount:
+        return TradeAccount.model_validate(
+            {
+                "id": "00000000-0000-0000-0000-000000000001",
+                "account_number": "OFFLINE",
+                "status": "ACTIVE",
+                "crypto_status": "INACTIVE",
+                "created_at": "2026-11-09T00:00:00Z",
+                "cash": "40000",
+                "buying_power": "40000",
+            }
+        )
+
     def get_clock(self) -> Clock:
         return clock(datetime(2026, 11, 10, 11, 0, tzinfo=NEW_YORK), is_open=True)
 
@@ -1060,6 +1076,32 @@ class Account:
         return []
 
 
+def test_the_startup_account_figure_is_reread_and_divided_by_configured_slots():
+    class Changing(Account):
+        reads = 0
+
+        def get_account(self):
+            self.reads += 1
+            return (
+                super().get_account().model_copy(update={"buying_power": str(40000 // self.reads)})
+            )
+
+    account = Changing()
+    first = session_window.mover_allocation(cast(TradingClient, account), 4)
+    second = session_window.mover_allocation(cast(TradingClient, account), 4)
+    assert (first.entry_notional, second.entry_notional) == (Decimal(10000), Decimal(5000))
+    assert account.reads == 2
+
+
+@pytest.mark.parametrize("value", [None, "", "not a number", "NaN", "Infinity", "0", "-1"])
+def test_missing_or_unusable_buying_power_refuses_the_start_by_name(value):
+    account = Account().get_account().model_copy(update={"buying_power": value})
+    with pytest.raises(session_window.WindowRefused, match="buying_power"):
+        session_window.mover_allocation(
+            cast(TradingClient, SimpleNamespace(get_account=lambda: account)), 4
+        )
+
+
 def test_a_window_does_not_start_unless_the_account_is_flat(monkeypatch, tmp_path) -> None:
     held = SimpleNamespace(client_order_id="someone-elses", symbol="SPY")
     monkeypatch.setattr(session_window, "paper_trading", lambda: Account(orders=[held]))
@@ -1071,8 +1113,34 @@ def test_a_window_waits_out_the_gap_after_the_last_one(tmp_path) -> None:
     import time
 
     (tmp_path / "last-window-end").write_text(str(time.time() - 10))
-    with pytest.raises(RuntimeError, match="under 300 s ago"):
+    with pytest.raises(RuntimeError, match="under 60 s ago"):
         session_window.run_window(WindowConfig(log_dir=tmp_path))
+
+
+def test_a_window_a_minute_after_the_last_one_is_not_held_by_the_gap(tmp_path) -> None:
+    """The gap is one minute (the lead's ruling, 2026-11-11): the venue counts requests per minute, so a
+    minute lets the last window's stop and close leave the count before the next start. A window 61 s
+    after the last one goes on to read Alpaca's clock; one 50 s after is still skipped."""
+
+    class Read(RuntimeError):
+        pass
+
+    class Clockless:
+        def get_clock(self):
+            raise Read
+
+    marker = tmp_path / "last-window-end"
+    marker.write_text("")
+    os.utime(marker, (time.time() - 61, time.time() - 61))
+    with pytest.raises(Read):
+        session_window.run_window(
+            WindowConfig(log_dir=tmp_path), trading=cast(TradingClient, Clockless())
+        )
+    os.utime(marker, (time.time() - 50, time.time() - 50))
+    with pytest.raises(session_window.WindowSkipped, match="under 60 s ago"):
+        session_window.run_window(
+            WindowConfig(log_dir=tmp_path), trading=cast(TradingClient, Clockless())
+        )
 
 
 def test_the_regular_window_node_runs_upstreams_managed_stop(tmp_path) -> None:
@@ -1101,6 +1169,7 @@ def test_the_extended_window_node_builds_without_connecting(tmp_path, extended) 
         assert isinstance(s, SessionMaCross)
         assert s.extended_hours and not s.manage_stop and s.wind_down_at == at
         assert s.feed_params == {"feed": "boats"}
+        assert not isinstance(cap, tuple)
         assert cap.max_position == 1
         assert str(s.bar_type) == "SPY.ALPACA-1-MINUTE-LAST-INTERNAL"
         assert not node.is_running
@@ -1136,7 +1205,7 @@ def test_a_short_is_bought_back_not_added_to() -> None:
 
 def test_a_gap_marker_cut_short_still_dates_the_last_window(tmp_path) -> None:
     (tmp_path / "last-window-end").write_text("17628")  # cut short; written just now
-    with pytest.raises(RuntimeError, match="under 300 s ago"):
+    with pytest.raises(RuntimeError, match="under 60 s ago"):
         session_window.run_window(WindowConfig(log_dir=tmp_path))
 
 
@@ -1533,6 +1602,8 @@ def test_a_refused_window_is_the_latest_record(monkeypatch, tmp_path) -> None:
     latest = json.loads((tmp_path / "latest.json").read_text())
     assert latest["result"].startswith("refused: the paper account is not flat")
     assert latest["commit"] == "a" * 40
+    assert latest["request_budget"]["limit_per_minute"] == 200
+    assert latest["request_budget"]["minute_buckets_kept"] is False
 
 
 def test_the_commit_comes_from_the_runner_else_from_git_else_says_unknown(
@@ -1627,6 +1698,11 @@ def quiet_window(
     strategy="SessionMaCross",
     session="regular",
     mover=False,
+    slots=None,
+    published=True,
+    request_limit_per_minute=200,
+    check_fills=(),
+    baseline_file=True,
 ):
     """A window of `strategy` whose node runs at once, its strategy having seen `quotes`, `trades` and
     `live_bars`, and its node log holding the lines `log`; returns the report or the error, and the
@@ -1646,21 +1722,56 @@ def quiet_window(
         trades=trades,
         live_bars=live_bars,
     )
+    baseline = None
+    if mover:
+        from canon_trading.mover import MoverConfig
+        from canon_trading.movers_rank import write_baselines
+        from canon_trading.movers_rank_actor import trade_date
+
+        baseline = tmp_path / "offline-baseline.json"
+        if baseline_file:
+            write_baselines(
+                baseline,
+                trade_date(int((account or Account()).get_clock().timestamp.timestamp() * 1e9)),
+                {},
+            )
+        s = session_window.Mover(MoverConfig(max_notional=Decimal(500), max_move=Decimal(100)))
+        s.quotes, s.trades, s.live_bars = quotes, trades, live_bars
+        if published:
+            s.ranking_records.append({"published": True, "value": ""})
     cap = SimpleNamespace(checks=1, peak=Decimal(0), tripped=None)
     seen: dict = {}
 
     def node(config, **kw):
         seen.update(kw, config=config)
+        cap.instrument_id = config.instrument_id
+        cap.max_position = Decimal(1)
         (config.log_dir / f"{kw['log_name']}.log").write_text("\n".join(log))
         return Ran(), s, cap
 
     monkeypatch.setattr(session_window, "paper_trading", lambda: account or Account())
     monkeypatch.setattr(session_window, "window_node", node)
     monkeypatch.setattr(session_window, "_run_node", lambda node, ends: None)
-    monkeypatch.setattr(session_window, "_flatten_after_stop", lambda *a, **k: [])
+    monkeypatch.setattr(
+        session_window,
+        "_flatten_after_stop",
+        lambda *a, **k: (
+            seen.setdefault("checked", []).append(k.get("symbols"))
+            or a[2].check_fills.extend(check_fills)
+            or []
+        ),
+    )
     try:
         outcome: Any = session_window.run_window(
-            WindowConfig(log_dir=tmp_path, strategy=strategy, session=session, mover=mover)
+            WindowConfig(
+                log_dir=tmp_path,
+                strategy=strategy,
+                session=session,
+                mover=mover,
+                slots=slots,
+                baseline_path=baseline,
+                request_limit_per_minute=request_limit_per_minute,
+            )
         )
     except RuntimeError as e:
         outcome = e
@@ -1677,6 +1788,323 @@ def test_a_quiet_market_with_quotes_and_no_bar_is_ok_and_shows_it(monkeypatch, t
     assert (latest["quotes"], latest["trades"], latest["live_bars"]) == (40, 0, 0)
     assert (latest["part"], latest["feed"], seen["feed"]) == ("regular", "iex", "iex")
     assert latest["stream"] == [] and latest["errors"] == []
+
+
+def test_every_window_records_its_request_rate_peaks_and_limit(monkeypatch, tmp_path) -> None:
+    from canon_alpaca.providers import RequestCount
+
+    monkeypatch.setattr(
+        session_window,
+        "request_counts",
+        lambda: (RequestCount(1, "trading", 30, 20, AT, 25, 0, ()),),
+    )
+    _, latest, _ = quiet_window(monkeypatch, tmp_path, quotes=1, trades=0)
+    budget = latest.get("request_budget")
+    assert budget is not None, "every window needs a request-budget record"
+    assert budget["limit_per_minute"] == 200
+    assert budget["minute_buckets_kept"] is False
+    counted = budget["by_api"][0]
+    assert (counted["total"], counted["peak_minute"], counted["peak_60s"]) == (30, 20, 25)
+    assert counted["average_per_minute"] >= 0
+    assert (
+        counted["ceiling_60s"] == 180 and counted["headroom_60s"] == 155
+    )  # the 180 a window fails at
+    assert latest["requests_by_api"] == budget["by_api"]
+
+
+def test_a_running_window_names_the_budget_and_its_unavailable_minute_buckets(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setattr(session_window, "request_counts", lambda: ())
+    report = session_window.WindowReport("regular", "SPY", "request-budget")
+    session_window.write_record(tmp_path, report)
+    latest = json.loads((tmp_path / "latest.json").read_text())
+    budget = latest.get("request_budget")
+    assert budget is not None, "a running record also needs the request-budget setting"
+    assert budget["limit_per_minute"] == 200
+    assert budget["minute_buckets_kept"] is False
+    assert budget["by_api"] == []
+
+
+def test_the_running_record_includes_requests_already_sent_by_preflight(monkeypatch, tmp_path):
+    from dataclasses import asdict
+
+    from canon_alpaca.providers import RequestCount
+
+    snapshots = []
+    write = session_window.write_record
+
+    def capture(log_dir, report, **kwargs):
+        error = write(log_dir, report, **kwargs)
+        snapshots.append(asdict(report))
+        return error
+
+    monkeypatch.setattr(session_window, "write_record", capture)
+    monkeypatch.setattr(
+        session_window,
+        "request_counts",
+        lambda: (RequestCount(1, "trading", 30, 20, AT, 25, 0, ()),),
+    )
+    quiet_window(monkeypatch, tmp_path, quotes=1, trades=0)
+    assert snapshots[0]["result"] == "running"
+    assert snapshots[0]["request_budget"]["by_api"][0]["total"] == 30
+
+
+def test_a_window_records_the_configured_budget_without_raising_the_failure_ceiling(
+    monkeypatch, tmp_path
+) -> None:
+    _, latest, _ = quiet_window(
+        monkeypatch, tmp_path, quotes=1, trades=0, request_limit_per_minute=150
+    )
+    assert latest["request_budget"]["limit_per_minute"] == 150
+    assert session_window.REQUEST_CEILING == 180
+
+
+def test_each_record_write_refreshes_both_request_snapshots_and_keeps_running_data_uncalibrated(
+    monkeypatch, tmp_path
+):
+    from canon_alpaca.providers import RequestCount
+
+    sent = 3
+    monkeypatch.setattr(
+        session_window,
+        "request_counts",
+        lambda: (RequestCount(1, "trading", sent, sent, AT, sent, 0, ()),),
+    )
+    report = session_window.WindowReport("regular", "SPY", "snapshots")
+    session_window.write_record(tmp_path, report)
+    running = json.loads((tmp_path / "latest.json").read_text())
+    assert running["requests_by_api"][0]["total"] == 3
+    assert running["request_budget"]["measurement_status"] == "running"
+    assert running["request_budget"]["calibration_eligible"] is False
+    sent = 6
+    report.result = "ok"
+    session_window.write_record(tmp_path, report)
+    not_ended = json.loads((tmp_path / "latest.json").read_text())
+    assert not_ended["request_budget"]["measurement_status"] == "unfinalized"
+    assert not_ended["request_budget"]["calibration_eligible"] is False
+    sent = 9
+    report.ended = "20261111T210000Z"
+    session_window.write_record(tmp_path, report)
+    final = json.loads((tmp_path / "window-snapshots.json").read_text())
+    assert final["requests_by_api"][0]["total"] == 9
+    assert final["request_budget"]["by_api"] == final["requests_by_api"]
+    assert final["request_budget"]["measurement_status"] == "complete"
+    assert final["request_budget"]["calibration_eligible"] is True
+
+
+@pytest.mark.parametrize("stage", ["node", "cleanup", "record"])
+@pytest.mark.parametrize(
+    ("failure", "state"),
+    [
+        (KeyboardInterrupt, "interrupted"),
+        (SystemExit, "interrupted"),
+        (session_window.StopTimedOut, "interrupted"),
+        (RuntimeError, "failed"),
+    ],
+)
+def test_every_catchable_window_end_keeps_the_final_request_count_and_measurement_state(
+    monkeypatch, tmp_path, stage, failure, state
+):
+    from canon_alpaca.providers import RequestCount
+
+    sent = 0
+    monkeypatch.setattr(
+        session_window,
+        "request_counts",
+        lambda: (RequestCount(1, "trading", sent, sent, AT, sent, 0, ()),),
+    )
+    monkeypatch.setattr(session_window, "paper_trading", lambda: Account())
+    monkeypatch.setattr(session_window, "window_node", lambda *a, **k: ran_node(Hung()))
+    monkeypatch.setattr(session_window, "_run_node", lambda *a: None)
+    monkeypatch.setattr(session_window, "_flatten_after_stop", lambda *a, **k: [])
+    monkeypatch.setattr(session_window, "_read_stream_lines", lambda *a: None)
+
+    def end(*args, **kwargs):
+        nonlocal sent
+        sent = 37
+        raise failure("ended here")
+
+    target = {"node": "_run_node", "cleanup": "_flatten_after_stop", "record": "_read_stream_lines"}
+    monkeypatch.setattr(session_window, target[stage], end)
+    with pytest.raises(failure, match="ended here"):
+        session_window.run_window(WindowConfig(log_dir=tmp_path))
+    latest = json.loads((tmp_path / "latest.json").read_text())
+    assert latest["result"].startswith(f"failed: {failure.__name__}:")
+    assert latest["requests_by_api"][0]["total"] == 37
+    assert latest["request_budget"]["by_api"] == latest["requests_by_api"]
+    assert latest["request_budget"]["measurement_status"] == state
+    assert latest["request_budget"]["calibration_eligible"] is False
+    own = json.loads((tmp_path / f"window-{latest['started']}.json").read_text())
+    assert own == latest and latest["ended"]
+
+
+def test_a_successful_window_snapshot_includes_requests_that_finish_during_record_preparation(
+    monkeypatch, tmp_path
+):
+    from canon_alpaca.providers import RequestCount
+
+    sent = 0
+    monkeypatch.setattr(
+        session_window,
+        "request_counts",
+        lambda: (RequestCount(1, "trading", sent, sent, AT, sent, 0, ()),),
+    )
+
+    def after_log_flush(*args):
+        nonlocal sent
+        sent = 41
+
+    monkeypatch.setattr(session_window, "_read_stream_lines", after_log_flush)
+    _, latest, _ = quiet_window(monkeypatch, tmp_path, quotes=1, trades=0)
+    assert latest["requests_by_api"][0]["total"] == 41
+    assert latest["request_budget"]["measurement_status"] == "complete"
+    assert latest["request_budget"]["calibration_eligible"] is True
+
+
+@pytest.mark.parametrize("limit", [0, -1, True, 1.5])
+def test_request_limits_are_refused_when_constructing_the_window_config(limit):
+    with pytest.raises(ValueError, match="positive integer"):
+        WindowConfig(request_limit_per_minute=limit)
+
+
+@pytest.mark.parametrize("elapsed", [-1, float("nan"), float("inf")])
+def test_an_unusable_observation_clock_keeps_counts_but_cannot_calibrate(
+    monkeypatch, tmp_path, elapsed
+):
+    from canon_alpaca.providers import RequestCount
+
+    monkeypatch.setattr(session_window, "observation_seconds", lambda: elapsed)
+    monkeypatch.setattr(
+        session_window,
+        "request_counts",
+        lambda: (RequestCount(1, "trading", 23, 23, AT, 23, 0, ()),),
+    )
+    report = session_window.WindowReport("regular", "SPY", "bad-clock", result="ok", ended="ended")
+    session_window.write_record(tmp_path, report)
+    latest = json.loads((tmp_path / "latest.json").read_text())
+    assert latest["requests_by_api"][0]["total"] == 23
+    assert latest["request_budget"]["observation_seconds"] is None
+    assert latest["request_budget"]["by_api"][0]["average_per_minute"] is None
+    assert latest["request_budget"]["calibration_eligible"] is False
+    assert "observation" in latest["request_budget"]["observation_error"]
+
+
+@pytest.mark.parametrize("bad", [{"limit_per_minute": 0}, {"limit_per_minute": 1.5}])
+def test_a_malformed_budget_cannot_prevent_the_record_from_being_written(
+    monkeypatch, tmp_path, bad
+):
+    monkeypatch.setattr(session_window, "request_counts", lambda: ())
+    session_window.write_record(tmp_path, {"result": "ok", "request_budget": bad})
+    latest = json.loads((tmp_path / "latest.json").read_text())
+    assert latest["request_budget"]["calibration_eligible"] is False
+    assert "positive integer" in latest["request_budget"]["snapshot_error"]
+
+
+def test_a_nontext_result_is_persisted_without_claiming_a_completed_measurement(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(session_window, "request_counts", lambda: ())
+    session_window.write_record(tmp_path, {"result": None, "request_budget": {}})
+    latest = json.loads((tmp_path / "latest.json").read_text())
+    assert latest["result"] is None
+    assert latest["request_budget"]["measurement_status"] == "unfinalized"
+    assert latest["request_budget"]["calibration_eligible"] is False
+
+
+@pytest.mark.parametrize("primary", [RuntimeError, session_window.StopTimedOut])
+def test_a_failed_final_counter_read_preserves_the_primary_exception_and_prior_counts(
+    monkeypatch, tmp_path, primary
+):
+    from canon_alpaca.providers import RequestCount
+
+    ended = False
+
+    def counts():
+        if ended:
+            raise RuntimeError("counter unavailable")
+        return (RequestCount(1, "trading", 7, 7, AT, 7, 0, ()),)
+
+    def end(*args):
+        nonlocal ended
+        ended = True
+        raise primary("primary failure")
+
+    monkeypatch.setattr(session_window, "request_counts", counts)
+    monkeypatch.setattr(session_window, "paper_trading", lambda: Account())
+    monkeypatch.setattr(session_window, "window_node", lambda *a, **k: ran_node(Hung()))
+    monkeypatch.setattr(session_window, "_run_node", end)
+    monkeypatch.setattr(session_window, "_flatten_after_stop", lambda *a, **k: [])
+    monkeypatch.setattr(session_window, "_read_stream_lines", lambda *a: None)
+    with pytest.raises(primary, match="primary failure"):
+        session_window.run_window(WindowConfig(log_dir=tmp_path))
+    latest = json.loads((tmp_path / "latest.json").read_text())
+    assert latest["result"] == f"failed: {primary.__name__}: primary failure"
+    assert latest["requests_by_api"][0]["total"] == 7
+    assert "counter unavailable" in latest["request_budget"]["snapshot_error"]
+    assert latest["request_budget"]["calibration_eligible"] is False
+    assert latest["ended"]
+
+
+def test_a_final_counter_failure_fails_the_window_after_persisting_an_explicit_measurement_error(
+    monkeypatch, tmp_path
+):
+    from canon_alpaca.providers import RequestCount
+
+    ended = False
+
+    def counts():
+        if ended:
+            raise RuntimeError("counter unavailable")
+        return (RequestCount(1, "trading", 7, 7, AT, 7, 0, ()),)
+
+    def end(*args):
+        nonlocal ended
+        ended = True
+
+    monkeypatch.setattr(session_window, "request_counts", counts)
+    monkeypatch.setattr(session_window, "paper_trading", lambda: Account())
+    monkeypatch.setattr(session_window, "window_node", lambda *a, **k: ran_node(Hung()))
+    monkeypatch.setattr(session_window, "_run_node", end)
+    monkeypatch.setattr(session_window, "_flatten_after_stop", lambda *a, **k: [])
+    monkeypatch.setattr(session_window, "_read_stream_lines", lambda *a: None)
+    with pytest.raises(RuntimeError, match="counter unavailable"):
+        session_window.run_window(WindowConfig(log_dir=tmp_path))
+    latest = json.loads((tmp_path / "latest.json").read_text())
+    assert latest["result"].startswith("failed:")
+    assert "counter unavailable" in latest["request_budget"]["snapshot_error"]
+    assert latest["request_budget"]["calibration_eligible"] is False
+
+
+def test_shutdown_checks_and_persists_one_request_snapshot(monkeypatch, tmp_path):
+    from canon_alpaca.providers import RequestCount
+
+    ended = False
+    final_samples = 0
+
+    def counts():
+        nonlocal final_samples
+        if ended:
+            final_samples += 1
+        peak = 180 if final_samples > 1 else 179
+        return (RequestCount(1, "trading", peak, peak, AT, peak, int(peak == 180), ()),)
+
+    def end(*args):
+        nonlocal ended
+        ended = True
+
+    monkeypatch.setattr(session_window, "request_counts", counts)
+    monkeypatch.setattr(session_window, "_read_stream_lines", end)
+    monkeypatch.setattr(session_window, "window_data", lambda: Quoted())
+    monkeypatch.setattr(session_window, "choose_mover", lambda *a, **k: mover_pick())
+    outcome, latest, _ = quiet_window(
+        monkeypatch, tmp_path, quotes=1, trades=0, account=Assets(), mover=True, strategy="Mover"
+    )
+    assert not isinstance(outcome, Exception), outcome
+    assert final_samples == 1, "the checked snapshot must also be the persisted snapshot"
+    assert latest["request_budget"]["by_api"] == latest["requests_by_api"]
+    assert latest["requests_by_api"][0]["peak_60s"] == 179
+    assert latest["requests_by_api"][0]["rate_limited"] == 0
 
 
 def test_a_window_whose_stream_delivered_nothing_is_failed(monkeypatch, tmp_path) -> None:
@@ -1766,6 +2194,149 @@ def test_a_refused_subscription_fails_the_window_though_quotes_came(monkeypatch,
     _, latest, _ = quiet_window(monkeypatch, tmp_path, quotes=50, trades=0, log=refused)
     assert latest["result"].startswith("failed: the iex data stream reported an error: ")
     assert latest["stream"] == refused
+
+
+@pytest.mark.parametrize("method", ["_subscribe_bars", "_subscribe_instrument_status"])
+def test_an_unimplemented_data_subscription_fails_the_window(monkeypatch, tmp_path, method):
+    refused = [
+        (
+            "2026-11-11T03:00:01Z [ERROR] CANON-PAPER-SESSION.AlpacaDataClient: "
+            f"NotImplementedError: {method} must be implemented in subclass"
+        )
+    ]
+    error, latest, _ = quiet_window(monkeypatch, tmp_path, quotes=50, trades=10, log=refused)
+    assert isinstance(error, RuntimeError)
+    assert "NotImplementedError" in latest["result"]
+    assert latest["stream"] == refused
+
+
+def test_a_mover_window_without_a_published_rank_generation_fails_by_name():
+    report = session_window.WindowReport(
+        "regular", "LLL", started="20261110T160000Z", strategy="Mover", quotes=50, trades=10
+    )
+    report.mover = {"run": {"ranking_records": [{"published": False, "reasons": ["no bars"]}]}}
+    failure = session_window._data_failure(report)
+    assert failure is not None and "rank actor" in failure and "no published generation" in failure
+    assert "no bars" in failure
+    report.mover["run"]["ranking_records"].append({"published": True})
+    assert session_window._data_failure(report) is None
+
+
+@pytest.mark.parametrize(("hour", "part"), [(21, "overnight"), (2, "overnight"), (5, "pre-market")])
+def test_only_overnight_runs_with_no_baseline_file_and_says_its_rows_rank_on_dollars(
+    monkeypatch, tmp_path, hour, part
+):
+    """ultra-3a8613a/2, the lead's decision (A) of 2026-11-12: no writer makes boats.json, so overnight
+    with no file ranks on dollars under the move condition and says so; every other part still
+    refuses without its file."""
+    monkeypatch.setattr(session_window, "choose_mover", lambda *a, **k: a_pick())
+    monkeypatch.setattr(session_window, "window_data", lambda: Quoted())
+
+    def run():
+        return quiet_window(
+            monkeypatch,
+            tmp_path,
+            quotes=5,
+            trades=5,
+            account=Evening(hour),
+            session="extended",
+            mover=True,
+            strategy="Mover",
+            baseline_file=False,
+        )
+
+    if part == "overnight":
+        outcome, latest, _ = run()
+        assert not isinstance(outcome, Exception), outcome
+        assert latest["result"] == "ok" and latest["part"] == "overnight"
+        assert latest["mover"]["baseline"] == "no baseline: dollar tier under the move condition"
+    else:
+        with pytest.raises(session_window.WindowRefused, match="baseline"):
+            run()
+
+
+@pytest.mark.parametrize(("part", "expected"), [("overnight", True), ("after-hours", False)])
+def test_the_rank_actor_ranks_without_a_baseline_overnight_only(
+    monkeypatch, tmp_path, part, expected
+) -> None:
+    from canon_trading import mover_window
+
+    actors: list = []
+
+    def actor(config, records):
+        actors.append(config)
+        return mover_window.window_rank(config, records)
+
+    monkeypatch.setattr(session_window, "window_rank", actor, raising=False)
+    ends = AT + timedelta(minutes=30)
+    node, _, _ = session_window.window_node(
+        WindowConfig(
+            symbol="LLL", mover=True, strategy="Mover", session="extended", log_dir=tmp_path
+        ),
+        wind_down_at=ends - timedelta(seconds=session_window.FLATTEN_SECS),
+        log_name=f"baseline-{part}",
+        feed="boats" if part == "overnight" else "sip",
+        part=part,
+        pick=mover_pick(),
+        entry_notional=Decimal(500),
+        ends=ends,
+    )
+    try:
+        assert actors[0].rank_without_baseline is expected
+    finally:
+        node.dispose()
+
+
+@pytest.mark.parametrize("document", [None, "not json", '{"format":"other"}'])
+def test_a_mover_window_refuses_an_unusable_baseline_before_building_a_node(
+    monkeypatch, tmp_path, document
+):
+    baseline = tmp_path / "bad-baseline.json"
+    if document is not None:
+        baseline.write_text(document)
+    built = []
+    monkeypatch.setattr(session_window, "choose_mover", lambda *a, **k: mover_pick())
+    monkeypatch.setattr(session_window, "window_data", lambda: Quoted())
+    monkeypatch.setattr(session_window, "mover_entry_contexts", lambda *a, **k: {})
+    monkeypatch.setattr(session_window, "_flatten_after_stop", lambda *a, **k: [])
+
+    def node(*args, **kwargs):
+        built.append(True)
+        pytest.fail("a node was built before the unusable baseline was refused")
+
+    monkeypatch.setattr(session_window, "window_node", node)
+    with pytest.raises(session_window.WindowRefused, match="baseline") as failure:
+        session_window.run_window(
+            WindowConfig(strategy="Mover", mover=True, baseline_path=baseline, log_dir=tmp_path),
+            trading=cast(TradingClient, Assets()),
+        )
+    assert str(baseline) in str(failure.value) and not built
+
+
+def test_a_relative_baseline_path_is_resolved_against_the_repository(monkeypatch, tmp_path):
+    from canon_trading import mover_window
+
+    seen = []
+    real = mover_window.window_rank
+
+    def actor(config, records):
+        seen.append(config.baseline_path)
+        return real(config, records)
+
+    monkeypatch.setattr(session_window, "window_rank", actor)
+    monkeypatch.chdir(tmp_path)
+    ends = AT + timedelta(minutes=30)
+    node, _, _ = session_window.window_node(
+        WindowConfig(strategy="Mover", mover=True, baseline_path=Path("catalog/custom.json")),
+        wind_down_at=ends - timedelta(seconds=60),
+        log_name="baseline",
+        feed="sip",
+        pick=mover_pick(),
+        entry_notional=Decimal(500),
+        ends=ends,
+    )
+    node.dispose()
+    assert seen == [str(session_window.SOURCE_ROOT / "catalog/custom.json")]
 
 
 def test_a_warning_that_quotes_an_error_does_not_fail_the_window(monkeypatch, tmp_path) -> None:
@@ -1891,7 +2462,7 @@ def test_a_window_inside_the_gap_is_skipped_exit_0_and_the_last_result_kept(tmp_
     (tmp_path / "last-window-end").write_text("1")
     (tmp_path / "latest.json").write_text('{"result": "ok"}')
     assert session_window.main(["--log-dir", str(tmp_path)]) == 0
-    assert "skipped: the last window ended under 300 s ago" in capsys.readouterr().out
+    assert "skipped: the last window ended under 60 s ago" in capsys.readouterr().out
     assert json.loads((tmp_path / "latest.json").read_text()) == {"result": "ok"}
     heard = json.loads((tmp_path / "last-firing.json").read_text())
     assert heard["outcome"].startswith("skipped:")
@@ -2911,9 +3482,12 @@ def test_the_post_end_bound_fits_the_end_margin_the_stale_record_and_the_paper_l
     import tomllib
 
     w = session_window
-    before = w.STOP_TIMEOUT_SECS + w.ADAPTER_CALL_SECS + w.AFTER_STOP_SECS
+    # the check's deadline with the most names a window holds, two polls more for each past the first
+    deadline = w.AFTER_STOP_SECS + (w.PART_SLOTS - 1) * 2 * w.POLL_SECS
+    before = w.STOP_TIMEOUT_SECS + w.ADAPTER_CALL_SECS + deadline
     reading = (w.LOOKUPS + 2) * w.REQUEST_SECS  # its lookups, the open orders and the position
-    last_close = before + reading + w.REQUEST_SECS  # the last poll's reading and its clock read
+    # the last poll's reading, its clock read and, outside the regular session, the close's quote
+    last_close = before + reading + 2 * w.REQUEST_SECS
     assert last_close == w.LAST_CLOSE_SECS
     # that poll at its longest (a reading, the clock, its cancels), then the last reading, as long
     after_end = before + 2 * (reading + (1 + w.CANCELS) * w.REQUEST_SECS)
@@ -3151,6 +3725,7 @@ def node_order(client_order_id: str, *events, side=OrderSide.BUY, is_closed: boo
     whether it is closed (the pinned `MarketOrder` and `LimitOrder` have each)."""
     return SimpleNamespace(
         client_order_id=SimpleNamespace(value=client_order_id),
+        instrument_id=SPY,
         side=side,
         is_closed=is_closed,
         events=lambda: list(events),
@@ -4750,7 +5325,8 @@ def test_the_last_close_goes_out_at_the_bound_counted_for_it(fake_time) -> None:
     (sent,) = [at for at, name in venue.calls if name.startswith("close sell") and at >= LAST_POLL]
     before = w.STOP_TIMEOUT_SECS + w.ADAPTER_CALL_SECS
     slack = w.AFTER_STOP_SECS - LAST_POLL
-    assert before + sent + slack == pytest.approx(w.LAST_CLOSE_SECS)
+    # one name held; a market close reads no quote, the one request the bound counts for an extended one
+    assert before + sent + slack + w.REQUEST_SECS == pytest.approx(w.last_close_secs(1))
     assert "position of 1 SPY" not in left
 
 
@@ -4769,7 +5345,7 @@ def test_the_whole_check_ends_at_the_bound_counted_for_it(fake_time) -> None:
     assert len(left) == 4  # three orders working and the position
     slack = w.AFTER_STOP_SECS - LAST_POLL
     before = w.STOP_TIMEOUT_SECS + w.ADAPTER_CALL_SECS
-    assert before + fake_time.now + slack == pytest.approx(w.AFTER_END_SECS)
+    assert before + fake_time.now + slack == pytest.approx(w.after_end_secs(1))
 
 
 def test_a_skip_whose_heartbeat_cannot_be_written_still_exits_0_and_says_why(
@@ -4785,13 +5361,13 @@ def test_a_skip_whose_heartbeat_cannot_be_written_still_exits_0_and_says_why(
         heartbeat(log_dir, outcome)
 
     def skipped(config, **kwargs):
-        raise session_window.WindowSkipped("the last window ended under 300 s ago")
+        raise session_window.WindowSkipped("the last window ended under 60 s ago")
 
     monkeypatch.setattr(session_window, "write_heartbeat", unwritable)
     monkeypatch.setattr(session_window, "run_window", skipped)
     assert session_window.main(["--log-dir", str(tmp_path)]) == 0
     said = capsys.readouterr()
-    assert "skipped: the last window ended under 300 s ago" in said.out
+    assert "skipped: the last window ended under 60 s ago" in said.out
     assert "the heartbeat could not be written" in said.err
 
 
@@ -5206,6 +5782,7 @@ def test_the_ema_cross_window_node_adds_upstreams_builtin_beside_the_cap(
         ]
         assert calls[0][1]["delay_post_stop_secs"] == session_window.DELAY_POST_STOP_SECS
         assert calls[0][1]["max_order_submit_rate"] == session_window.EMA_CROSS_SUBMIT_RATE
+        assert not isinstance(cap, tuple)
         assert cap.max_position == 1 and not node.is_running
         assert (s.quotes, s.trades, s.live_bars, list(s.dropped)) == (0, 0, 0, [])
     finally:
@@ -5592,6 +6169,13 @@ class Assets(Account):
         )
 
 
+class SmallerAssets(Assets):
+    """`Assets` with 28000 of buying power: 4000 a slot at the seven slots a window holds at most."""
+
+    def get_account(self) -> TradeAccount:
+        return super().get_account().model_copy(update={"buying_power": "28000"})
+
+
 @pytest.fixture(autouse=True)
 def priced(monkeypatch):
     """Every window reads one share's price before it starts: here SPY's at $750 unless a test says
@@ -5675,6 +6259,287 @@ def held_position(symbol: str, qty: int) -> Position:
         side="long" if qty > 0 else "short",
         cost_basis=str(100 * qty),
     )
+
+
+class MultiWindowAccount(Account):
+    """An account with independently held symbols and immediate, quantity-checked market fills."""
+
+    def __init__(self, fake, quantities: dict[str, int], *, orders: list | None = None) -> None:
+        super().__init__(orders=orders)
+        self.fake = fake
+        self.quantities = {symbol: Decimal(qty) for symbol, qty in quantities.items()}
+        self.by_client = {o.client_order_id: o for o in self.orders}
+        self.sent: list = []
+        self.canceled: list[str] = []
+
+    def get_all_positions(self) -> list:
+        return [held_position(symbol, int(qty)) for symbol, qty in self.quantities.items() if qty]
+
+    def get_orders(self, filter=None) -> list:
+        return [o for o in self.orders if o.status not in TERMINAL]
+
+    def get_order_by_client_id(self, client_id: str):
+        if client_id not in self.by_client:
+            raise api_error(404, 40410000, "order not found")
+        return self.by_client[client_id]
+
+    def cancel_order_by_id(self, order_id) -> None:
+        order = next(o for o in self.orders if o.id == order_id)
+        order.status = "canceled"
+        self.canceled.append(order.client_order_id)
+
+    def submit_order(self, request):
+        assert isinstance(request, MarketOrderRequest)
+        symbol, qty = request.symbol, Decimal(str(request.qty))
+        held = self.quantities[symbol]
+        assert request.side.value == ("sell" if held > 0 else "buy")
+        assert qty == abs(held), "a close cannot exceed what this name holds"
+        self.sent.append((self.fake.now, request))
+        self.quantities[symbol] = Decimal(0)
+        result = SimpleNamespace(
+            id=uuid4(),
+            client_order_id=request.client_order_id,
+            symbol=symbol,
+            side=request.side,
+            status="filled",
+        )
+        self.by_client[request.client_order_id] = result
+        return result
+
+
+def test_the_account_check_cancels_and_closes_every_window_name_and_leaves_other_names(
+    fake_time, tmp_path
+) -> None:
+    orders = [
+        SimpleNamespace(id=uuid4(), client_order_id=f"sell-{s}", symbol=s, status="new")
+        for s in ("AAA", "BBB", "CCC")
+    ]
+    account = MultiWindowAccount(fake_time, {"AAA": 5, "BBB": 2, "CCC": 9}, orders=orders)
+    report = session_window.WindowReport("regular", "AAA", started="t")
+    left = session_window._flatten_after_stop(
+        cast(TradingClient, account),
+        WindowConfig(symbol="AAA", log_dir=tmp_path),
+        report,
+        symbols=("AAA", "BBB"),
+    )
+    assert account.canceled == ["sell-AAA", "sell-BBB"]
+    assert [(r.symbol, r.qty) for _, r in account.sent] == [("AAA", 5.0), ("BBB", 2.0)]
+    assert account.quantities == {"AAA": 0, "BBB": 0, "CCC": 9}
+    assert left == ["open order sell-CCC in CCC", "position of 9 CCC"]
+    assert len(report.closes) == 2 and report.closed_after_stop
+
+
+def test_a_missing_sale_blocks_its_name_but_another_window_name_can_be_closed(
+    fake_time, tmp_path
+) -> None:
+    account = MultiWindowAccount(fake_time, {"AAA": 5, "BBB": 2})
+    report = session_window.WindowReport("regular", "AAA", started="t")
+    left = session_window._flatten_after_stop(
+        cast(TradingClient, account),
+        WindowConfig(symbol="AAA", log_dir=tmp_path),
+        report,
+        symbols=("AAA", "BBB"),
+        unsettled={"missing-sale": "sell"},
+        unsettled_symbols={"missing-sale": "AAA"},
+    )
+    assert [r.symbol for _, r in account.sent] == ["BBB"]
+    assert account.quantities == {"AAA": 5, "BBB": 0}
+    assert any("missing-sale" in item and "not found" in item for item in left)
+    assert "position of 5 AAA" in left
+
+
+def test_a_missing_sale_without_a_known_symbol_blocks_every_window_name(
+    fake_time, tmp_path
+) -> None:
+    account = MultiWindowAccount(fake_time, {"AAA": 5, "BBB": 2})
+    report = session_window.WindowReport("regular", "AAA", started="t")
+    left = session_window._flatten_after_stop(
+        cast(TradingClient, account),
+        WindowConfig(symbol="AAA", log_dir=tmp_path),
+        report,
+        symbols=("AAA", "BBB"),
+        unsettled={"missing-sale": "sell"},
+    )
+    assert account.sent == []
+    assert "position of 5 AAA" in left and "position of 2 BBB" in left
+
+
+def test_a_multiname_account_check_keeps_one_market_close_per_poll(fake_time, tmp_path) -> None:
+    account = MultiWindowAccount(fake_time, {"AAA": 5, "BBB": 2, "CCC": 9})
+    report = session_window.WindowReport("regular", "AAA", started="t")
+    left = session_window._flatten_after_stop(
+        cast(TradingClient, account),
+        WindowConfig(symbol="AAA", log_dir=tmp_path),
+        report,
+        symbols=("AAA", "BBB", "CCC"),
+    )
+    assert left == []
+    assert [(at, r.symbol) for at, r in account.sent] == [
+        (0, "AAA"),
+        (session_window.POLL_SECS, "BBB"),
+        (2 * session_window.POLL_SECS, "CCC"),
+    ]
+
+
+class FillingAccount(MultiWindowAccount):
+    """`MultiWindowAccount` whose market close fills at 10.50, as Alpaca's order shows a fill; its
+    order's side may be None, as alpaca-py's `Order.side` is typed."""
+
+    def __init__(self, fake, quantities, *, side_shown: bool = True) -> None:
+        super().__init__(fake, quantities)
+        self.side_shown = side_shown
+
+    def submit_order(self, request):
+        result = super().submit_order(request)
+        result.filled_qty, result.filled_avg_price = str(request.qty), "10.50"
+        if not self.side_shown:
+            result.side = None
+        return result
+
+
+@pytest.mark.parametrize("side_shown", [True, False])
+def test_the_account_checks_own_fills_are_kept_for_the_windows_result(
+    fake_time, tmp_path, side_shown
+) -> None:
+    """Review of fire-m-c, finding 11 (the lead's ruling of 2026-11-12): the window's result was read
+    from the strategy's fills only, so a position the account check closed after the stop counted as
+    open and its sale was missing from `realized_usd`. An order whose side Alpaca shows as None keeps
+    the side the check sent (review of the slot commit, finding 4)."""
+    account = FillingAccount(fake_time, {"AAA": 5}, side_shown=side_shown)
+    report = session_window.WindowReport("regular", "AAA", started="t")
+    left = session_window._flatten_after_stop(
+        cast(TradingClient, account),
+        WindowConfig(symbol="AAA", log_dir=tmp_path),
+        report,
+        symbols=("AAA",),
+    )
+    assert left == []
+    ((cid, instrument, side, qty, px),) = report.check_fills
+    assert cid in report.closes and (instrument, side, qty, px) == (
+        "AAA.ALPACA",
+        "SELL",
+        "5.0",
+        "10.50",
+    )
+
+
+class ExtendedMultiAccount(MultiWindowAccount):
+    """`MultiWindowAccount` in after-hours: closes are DAY limits marked extended hours, and Alpaca
+    refuses those of the names in `refusing` (not tradable in the part)."""
+
+    def __init__(self, fake, quantities: dict[str, int], *, refusing: set[str]) -> None:
+        super().__init__(fake, quantities)
+        self.refusing = refusing
+        self.refused: list[str] = []
+
+    def get_clock(self) -> Clock:
+        return clock(AFTER_HOURS, is_open=False)
+
+    def get_calendar(self, filters=None) -> list[Calendar]:
+        return [CALENDAR]
+
+    def submit_order(self, request):
+        assert isinstance(request, LimitOrderRequest) and request.extended_hours
+        if request.symbol in self.refusing:
+            self.refused.append(request.symbol)
+            raise api_error(422, 42210000, "asset is not tradable in this session")
+        symbol, held = request.symbol, self.quantities[request.symbol]
+        assert Decimal(str(request.qty)) == abs(held)
+        self.sent.append((self.fake.now, request))
+        self.quantities[symbol] = Decimal(0)
+        result = SimpleNamespace(
+            id=uuid4(),
+            client_order_id=request.client_order_id,
+            symbol=symbol,
+            side=request.side,
+            status="filled",
+        )
+        self.by_client[request.client_order_id] = result
+        return result
+
+
+class AnyQuotes(Quotes):
+    def get_stock_latest_quote(self, request) -> dict:
+        self.asked.append(request)
+        symbol = request.symbol_or_symbols
+        return {symbol: SimpleNamespace(bid_price=10.0, ask_price=10.02, timestamp=AFTER_HOURS)}
+
+
+def test_an_extended_close_refused_for_one_name_leaves_the_other_names_closing(
+    fake_time, tmp_path
+) -> None:
+    """Ruling (ii), fire-m-c: the account check closes per name, so a close Alpaca refuses for one
+    name outside the session (not tradable there) stops that name only; before, one refusal stopped
+    every extended close of the check."""
+    account = ExtendedMultiAccount(fake_time, {"AAA": 5, "BBB": 2, "CCC": 3}, refusing={"AAA"})
+    report = session_window.WindowReport("regular", "AAA", started="t")
+    left = session_window._flatten_after_stop(
+        cast(TradingClient, account),
+        WindowConfig(symbol="AAA", log_dir=tmp_path),
+        report,
+        symbols=("AAA", "BBB", "CCC"),
+        calendar=[CALENDAR],
+        calendar_on=AFTER_HOURS.date(),
+        data=AnyQuotes(),
+    )
+    assert account.refused == ["AAA"], "a refused name is not sent again"
+    assert sorted(r.symbol for _, r in account.sent) == ["BBB", "CCC"]
+    assert account.quantities == {"AAA": 5, "BBB": 0, "CCC": 0}
+    assert left == ["position of 5 AAA"]
+    assert report.closes_not_placed == 1
+
+
+class UnfilledAAA(ExtendedMultiAccount):
+    """AAA's extended limit close rests unfilled; BBB's and CCC's fill at once."""
+
+    def submit_order(self, request):
+        if request.symbol != "AAA":
+            return super().submit_order(request)
+        self.sent.append((self.fake.now, request))
+        order = SimpleNamespace(
+            id=uuid4(),
+            client_order_id=request.client_order_id,
+            symbol="AAA",
+            side=request.side,
+            status="new",
+        )
+        self.orders.append(order)
+        self.by_client[request.client_order_id] = order
+        return order
+
+
+class NoBidForAAA(AnyQuotes):
+    def get_stock_latest_quote(self, request) -> dict:
+        self.asked.append(request)
+        symbol = request.symbol_or_symbols
+        bid = 0.0 if symbol == "AAA" else 10.0
+        return {symbol: SimpleNamespace(bid_price=bid, ask_price=10.02, timestamp=AFTER_HOURS)}
+
+
+@pytest.mark.parametrize("stuck", ["unfilled", "no bid"])
+def test_one_name_whose_extended_close_cannot_finish_never_starves_the_others(
+    fake_time, tmp_path, stuck
+) -> None:
+    """Review of fire-m-c, finding 2: the check stepped through the names in a fixed order and stopped
+    at the first, so a working close in AAA (an unfilled extended limit) or AAA's missing bid held every
+    other name's close for the whole check. A name with a working order or no price is passed for that
+    poll, and the names tried least come first."""
+    account = (UnfilledAAA if stuck == "unfilled" else ExtendedMultiAccount)(
+        fake_time, {"AAA": 5, "BBB": 2, "CCC": 3}, refusing=set()
+    )
+    report = session_window.WindowReport("regular", "AAA", started="t")
+    left = session_window._flatten_after_stop(
+        cast(TradingClient, account),
+        WindowConfig(symbol="AAA", log_dir=tmp_path),
+        report,
+        symbols=("AAA", "BBB", "CCC"),
+        calendar=[CALENDAR],
+        calendar_on=AFTER_HOURS.date(),
+        data=AnyQuotes() if stuck == "unfilled" else NoBidForAAA(),
+    )
+    assert {"BBB", "CCC"} <= {r.symbol for _, r in account.sent}
+    assert account.quantities["BBB"] == 0 and account.quantities["CCC"] == 0, left
+    assert "position of 5 AAA" in left
 
 
 def test_the_check_after_the_stop_reads_the_whole_account_and_touches_only_its_symbol(
@@ -5761,6 +6626,142 @@ def test_no_mover_qualifying_refuses_the_window_naming_each_name() -> None:
         )
 
 
+def test_a_startup_ranking_keeps_several_qualified_names_in_rank_order() -> None:
+    pick = session_window.select_mover(
+        cast(TradingClient, Assets()),
+        cast(Any, Data()),
+        cast(Any, Screener()),
+        cast(Any, Actions()),
+        AT,
+        datetime(2026, 11, 10, 9, 30, tzinfo=NEW_YORK),
+        date(2026, 11, 9),
+        count=3,
+    )
+    assert [p.symbol for p in pick.picks] == ["LLL", "EEE", "FFF"]
+    assert [p.price for p in pick.picks] == [Decimal("1.5"), Decimal(12), Decimal(11)]
+    assert [r["symbol"] for r in pick.record["roster"]] == ["LLL", "EEE", "FFF"]
+    assert list(pick.record["passed_over"]) == ["BBB", "AAA", "CCC", "DDD", "KKK"]
+
+
+def test_a_roster_keeps_the_qualified_names_when_fewer_than_requested_pass() -> None:
+    names = {"LLL": NAMES["LLL"], "EEE": NAMES["EEE"]}
+    pick = session_window.select_mover(
+        cast(TradingClient, Assets()),
+        cast(Any, Data(names)),
+        cast(Any, Screener(names)),
+        cast(Any, Actions()),
+        AT,
+        datetime(2026, 11, 10, 9, 30, tzinfo=NEW_YORK),
+        date(2026, 11, 9),
+        count=6,
+    )
+    assert [p.symbol for p in pick.picks] == ["LLL", "EEE"]
+    assert pick.record["roster_requested"] == 6
+
+
+def test_the_stream_choice_carries_the_roster_count_into_the_regular_fallback(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(session_window, "window_data", lambda: Data())
+    monkeypatch.setattr(session_window, "window_screener", lambda: Screener())
+    pick = session_window.choose_mover(
+        cast(TradingClient, Assets()),
+        AT,
+        datetime(2026, 11, 10, 9, 30, tzinfo=NEW_YORK),
+        date(2026, 11, 9),
+        regular_close=CLOSES,
+        count=3,
+    )
+    assert [p.symbol for p in pick.picks] == ["LLL", "EEE", "FFF"]
+    assert "no stream in tests" in pick.record["stream_failed"]
+
+
+class EntryHistory:
+    """Two sessions of minute bars and split-adjusted daily references, including unusable future bars."""
+
+    def __init__(self, *, reference: bool = True) -> None:
+        self.reference = reference
+        self.requests: list = []
+
+    def get_stock_bars(self, request):
+        from alpaca.data.models import BarSet
+
+        self.requests.append(request)
+        if request.timeframe.value == "1Day":
+            bars = (
+                [raw_bar(datetime(2026, 11, 9, tzinfo=NEW_YORK), 100, 1)] if self.reference else []
+            )
+            bars += [raw_bar(datetime(2026, 11, 10, tzinfo=NEW_YORK), 999, 1)]
+        else:
+            bars = [
+                raw_bar(datetime(2026, 11, 6, 4, 0, tzinfo=NEW_YORK), 80, 10),
+                raw_bar(datetime(2026, 11, 9, 4, 0, tzinfo=NEW_YORK), 90, 10),
+                raw_bar(datetime(2026, 11, 10, 4, 0, tzinfo=NEW_YORK), 100, 10),
+                raw_bar(datetime(2026, 11, 10, 10, 59, tzinfo=NEW_YORK), 110, 10),
+                raw_bar(datetime(2026, 11, 10, 11, 0, tzinfo=NEW_YORK), 888, 10),
+            ]
+        return BarSet({symbol: list(reversed(bars)) for symbol in request.symbol_or_symbols})
+
+
+@pytest.mark.parametrize("feed", ["sip", "boats"])
+def test_the_registered_arm_gets_each_names_day_and_prior_history_without_future_bars(feed) -> None:
+    data = EntryHistory()
+    calendar = [
+        day(d) for d in ("2026-11-03", "2026-11-04", "2026-11-05", "2026-11-06", "2026-11-09")
+    ] + [day("2026-11-10")]
+    contexts = session_window.mover_entry_contexts(
+        cast(Any, data),
+        ("AAA", "BBB"),
+        AT + timedelta(seconds=30),
+        calendar,
+        feed=feed,
+    )
+    assert set(map(str, contexts)) == {"AAA.ALPACA", "BBB.ALPACA"}
+    for instrument_id, context in contexts.items():
+        assert context.symbol == instrument_id.symbol.value and context.day == TODAY
+        assert [bar.start for bar in context.bars] == [240, 659]
+        assert [bar.close for bar in context.bars] == [100.0, 110.0]
+        assert len(context.earlier) == 5
+        assert [session[0].close for session in context.earlier if session] == [90.0, 80.0]
+        assert context.reference == 100.0 and context.covered_to == 660
+        assert context.missing is None
+    minute, daily = data.requests
+    assert minute.feed.value == feed and daily.feed.value == "sip"
+    assert minute.adjustment.value == daily.adjustment.value == "split"
+    assert minute.start == datetime(2026, 11, 3, 4, 0, tzinfo=NEW_YORK).astimezone(UTC).replace(
+        tzinfo=None
+    )
+    assert minute.end < AT.astimezone(UTC).replace(tzinfo=None)
+
+
+def test_a_missing_prior_reference_is_named_in_the_entry_context() -> None:
+    contexts = session_window.mover_entry_contexts(
+        cast(Any, EntryHistory(reference=False)),
+        ("AAA",),
+        AT,
+        [day("2026-11-09"), day("2026-11-10")],
+        feed="sip",
+    )
+    (context,) = contexts.values()
+    assert context.reference is None
+    assert context.missing is not None and "reference" in context.missing
+
+
+def test_a_failed_history_read_stops_the_entry_context_supply() -> None:
+    class Failed:
+        def get_stock_bars(self, request):
+            raise OSError("history unavailable")
+
+    with pytest.raises(OSError, match="history unavailable"):
+        session_window.mover_entry_contexts(
+            cast(Any, Failed()),
+            ("AAA",),
+            AT,
+            [day("2026-11-09"), day("2026-11-10")],
+            feed="sip",
+        )
+
+
 def test_a_mover_window_runs_the_pick_on_sip_and_records_the_selection(
     monkeypatch, tmp_path
 ) -> None:
@@ -5814,6 +6815,123 @@ def a_pick() -> session_window.MoverPick:
         "inputs": {"move": 2},
     }
     return session_window.MoverPick("LLL", Decimal("1.5"), record, Decimal("1.51"))
+
+
+def test_cash_below_buying_power_is_the_per_slot_entry_and_engine_funding_limit():
+    account = Account().get_account().model_copy(update={"buying_power": "80000", "cash": "30000"})
+    allocation = session_window.mover_allocation(
+        cast(TradingClient, SimpleNamespace(get_account=lambda: account)), 4
+    )
+    assert allocation.entry_notional == Decimal(7500)
+    assert allocation.record() == {
+        "buying_power": "80000",
+        "cash": "30000",
+        "slots": 4,
+        "entry_notional": "7500.00",
+        "engine_cash_limit": "30000",
+        "engine_order_cap": "75000.00",
+    }
+
+
+@pytest.mark.parametrize("field", ["buying_power", "cash"])
+@pytest.mark.parametrize("value", [None, "", "not a number", "NaN", "Infinity", "0", "-1"])
+def test_missing_or_unusable_startup_funds_refuse_the_start_by_name(field, value):
+    account = Account().get_account().model_copy(update={field: value})
+    with pytest.raises(session_window.WindowRefused, match=field):
+        session_window.mover_allocation(
+            cast(TradingClient, SimpleNamespace(get_account=lambda: account)), 4
+        )
+
+
+@pytest.mark.parametrize("slots", [0, -1, True, 1.5])
+def test_invalid_allocation_slots_refuse_before_an_account_read(slots):
+    account = SimpleNamespace(get_account=lambda: pytest.fail("account read"))
+    with pytest.raises(ValueError, match="slots must be a positive whole number"):
+        session_window.mover_allocation(cast(TradingClient, account), slots)
+
+
+@pytest.mark.parametrize(
+    ("part", "hour"),
+    [("regular", 11), ("pre-market", 5), ("after-hours", 17), ("overnight", 21)],
+)
+def test_each_mover_part_uses_its_startup_account_allocation(monkeypatch, tmp_path, part, hour):
+    account = Assets() if part == "regular" else Evening(hour)
+    reads = []
+
+    def read_account():
+        reads.append("account")
+        return Account().get_account().model_copy(update={"buying_power": "60000", "cash": "40000"})
+
+    monkeypatch.setattr(account, "get_account", read_account)
+    monkeypatch.setitem(
+        session_window.MOVER_PARTS, part, replace(session_window.MOVER_PARTS[part], slots=2)
+    )
+    choice = {}
+
+    def choose(*args, **kwargs):
+        choice.update(kwargs)
+        return replace(a_pick(), price=Decimal(1500), entry=Decimal(1500))
+
+    data = Quoted()
+    data.ask = 1600
+    monkeypatch.setattr(session_window, "choose_mover", choose)
+    monkeypatch.setattr(session_window, "window_data", lambda: data)
+    outcome, latest, seen = quiet_window(
+        monkeypatch,
+        tmp_path,
+        quotes=5,
+        trades=5,
+        account=account,
+        strategy="Mover",
+        session="regular" if part == "regular" else "extended",
+        mover=True,
+    )
+    assert not isinstance(outcome, Exception), outcome
+    assert latest["result"] == "ok" and latest["part"] == part
+    assert reads == ["account"]
+    assert choice["entry_notional"] == seen["entry_notional"] == Decimal(20000)
+    assert seen["pick"].price == Decimal(1600)
+    assert latest["mover"]["allocation"]["entry_notional"] == "20000.00"
+    assert latest["mover"]["allocation"]["engine_order_cap"] == "200000.00"
+
+
+@pytest.mark.parametrize(
+    ("part", "hour"),
+    [("regular", 11), ("pre-market", 5), ("after-hours", 17), ("overnight", 21)],
+)
+def test_a_failed_startup_account_read_refuses_each_part_before_selection_or_build(
+    monkeypatch, tmp_path, part, hour
+):
+    account = Assets() if part == "regular" else Evening(hour)
+
+    def unreadable():
+        raise OSError("account endpoint unavailable")
+
+    monkeypatch.setattr(account, "get_account", unreadable)
+    monkeypatch.setattr(
+        session_window, "choose_mover", lambda *a, **k: pytest.fail("selection started")
+    )
+    monkeypatch.setattr(session_window, "window_node", lambda *a, **k: pytest.fail("node built"))
+    # the composition reads ADR 0087's baseline before the account (overnight reads none), so a
+    # usable one is given and the account read is what refuses
+    from canon_trading.movers_rank import write_baselines
+    from canon_trading.movers_rank_actor import trade_date
+
+    baseline = tmp_path / "offline-baseline.json"
+    write_baselines(baseline, trade_date(int(account.get_clock().timestamp.timestamp() * 1e9)), {})
+    with pytest.raises(
+        session_window.WindowRefused, match="startup account could not be read.*account endpoint"
+    ):
+        session_window.run_window(
+            WindowConfig(
+                strategy="Mover",
+                mover=True,
+                session="regular" if part == "regular" else "extended",
+                log_dir=tmp_path,
+                baseline_path=baseline,
+            ),
+            trading=cast(TradingClient, account),
+        )
 
 
 @pytest.mark.parametrize(
@@ -6301,6 +7419,45 @@ def test_one_share_must_fit_the_cap_at_the_price_of_the_order_sent() -> None:
     assert pick.record["entry_limit"] == "1.55"
 
 
+def test_a_mover_ask_past_the_tick_schemes_top_passes_that_name_over_by_name() -> None:
+    """Antigravity's sizing reader, H1 (2026-11-11): `entry_price` raises for an ask at or above the top of
+    Alpaca's tick bands (`PRICES`, 5000), and the raise must not end the whole selection; such a name is
+    passed over by name and the next one is chosen."""
+    names = {
+        "HHH": Name(5000.0, 6000.0, 10, 6000.0, ask=6000.0),
+        "LLL": Name(1.0, 1.5, 1200, 1.5, ask=1.5),
+    }
+    opens = datetime(2026, 11, 10, 9, 30, tzinfo=NEW_YORK)
+    pick = session_window.select_mover(
+        cast(TradingClient, Assets()),
+        cast(Any, Data(names)),
+        cast(Any, Screener(names)),
+        cast(Any, Actions()),
+        AT,
+        opens,
+        date(2026, 11, 9),
+        for_mover=True,
+        entry_notional=Decimal(500),
+    )
+    assert pick.symbol == "LLL"
+    assert "no usable entry limit" in pick.record["passed_over"]["HHH"]
+
+
+def test_the_rosters_initial_filter_uses_its_account_entry_figure():
+    names = {"HHH": Name(1000.0, 2000.0, 1200, 2000.0, ask=2000.0)}
+    pick = session_window.select_mover(
+        cast(TradingClient, Assets()),
+        cast(Any, Data(names)),
+        cast(Any, Screener(names)),
+        cast(Any, Actions()),
+        AT,
+        datetime(2026, 11, 10, 9, 30, tzinfo=NEW_YORK),
+        date(2026, 11, 9),
+        order_cap=Decimal(10000),
+    )
+    assert pick.symbol == "HHH" and pick.record["bounds"]["cap_usd"] == "10000"
+
+
 def test_the_fallback_ranks_on_completed_minutes_only() -> None:
     """Muse's finding 2 (2026-11-11): a bar for the minute still in progress is not the close the move
     is measured on, since `minute_dollars` leaves that minute out of the dollar volume."""
@@ -6433,17 +7590,22 @@ def test_a_mover_strategy_window_builds_the_strategy_its_ranking_and_the_outer_b
         log_name="m",
         feed="sip",
         pick=mover_pick(),
+        entry_notional=Decimal(500),
         ends=ends,
+        slots=4,
     )
     try:
         assert isinstance(strategy, Mover)
         rows = strategy.settings
         assert seen[0]["max_notional_per_order"] == Decimal(5000)
         assert seen[0]["delay_post_stop_secs"] == session_window.MANAGED_DELAY_POST_STOP_SECS
-        assert (rows.max_notional, rows.max_shares, rows.entries) == (Decimal(500), 333, 1)
+        # the part's slots, and no bound on entries: a completed trade does not end the node
+        assert (rows.max_notional, rows.max_shares, rows.entries) == (Decimal(500), None, None)
+        assert (rows.slots, rows.watch) == (4, 4)
         assert rows.bar_spec == "1-MINUTE-LAST-INTERNAL" and rows.feed == "sip"
         assert rows.manage_stop is True and rows.extended_hours is False
-        assert rows.rank_max_age_secs == 33 * 60  # from the choice at 14:57 to the end at 15:30
+        assert rows.rank_max_age_secs == 90  # every actor generation must remain fresh
+        assert not isinstance(cap, tuple)
         assert cap.max_position == Decimal(333)
         assert session_window.WINDOW_STRATEGIES["Mover"].strategy_id == strategy.strategy_id
     finally:
@@ -6458,6 +7620,298 @@ def test_a_mover_strategy_window_is_refused_without_its_choice(tmp_path) -> None
             log_name="m",
             feed="sip",
         )
+
+
+def test_the_multiname_node_loads_the_roster_and_builds_its_actor_and_each_cap(
+    monkeypatch, tmp_path
+) -> None:
+    from canon_trading import mover_window
+    from canon_trading.mover import Mover
+
+    actors: list = []
+    loaded: list = []
+    original_builder = session_window.alpaca_paper_builder
+
+    def builder(name, instruments, **kwargs):
+        loaded.append(instruments)
+        return original_builder(name, instruments, **kwargs)
+
+    def actor(config, records):
+        actors.append(config)
+        return mover_window.window_rank(config, records)
+
+    monkeypatch.setattr(session_window, "alpaca_paper_builder", builder)
+    monkeypatch.setattr(session_window, "window_rank", actor, raising=False)
+    pick = replace(
+        mover_pick("1.6"),
+        others=(
+            session_window.MoverPick("EEE", Decimal(20), {"inputs": {"move": 0.2}}, Decimal(20)),
+        ),
+    )
+    ends = AT + timedelta(minutes=30)
+    baseline = tmp_path / "baseline.json"
+    contexts = session_window.mover_entry_contexts(
+        cast(Any, EntryHistory()),
+        ("LLL", "EEE"),
+        AT,
+        [day("2026-11-09"), day("2026-11-10")],
+        feed="sip",
+    )
+    node, strategy, caps = session_window.window_node(
+        WindowConfig(
+            symbol="LLL",
+            mover=True,
+            strategy="Mover",
+            slots=2,
+            spares=1,
+            baseline_path=baseline,
+            log_dir=tmp_path,
+        ),
+        wind_down_at=ends - timedelta(seconds=session_window.FLATTEN_SECS),
+        log_name="multi",
+        feed="sip",
+        pick=pick,
+        entry_notional=Decimal(500),
+        ends=ends,
+        entry_contexts=contexts,
+    )
+    try:
+        assert isinstance(strategy, Mover)
+        assert set(strategy.entry_contexts) == set(contexts)
+        assert [str(i) for i in loaded[0]] == ["LLL.ALPACA", "EEE.ALPACA"]
+        assert strategy.settings.share_caps == {
+            InstrumentId.from_str("LLL.ALPACA"): 312,
+            InstrumentId.from_str("EEE.ALPACA"): 25,
+        }
+        assert strategy.settings.entry_arm == "registered"
+        assert strategy.settings.rank_max_age_secs == 90 and strategy.settings.entries is None
+        assert isinstance(caps, tuple)
+        assert [c.max_position for c in caps] == [Decimal(312), Decimal(25)]
+        assert actors[0].baseline_path == str(baseline)
+        assert actors[0].order_cap == 500 and actors[0].feed == "sip"
+    finally:
+        node.dispose()
+
+
+@pytest.mark.parametrize(
+    ("part", "arm"),
+    [
+        ("regular", "registered"),
+        ("pre-market", "registered"),
+        ("after-hours", "bridge"),
+        ("overnight", "bridge"),
+    ],
+)
+def test_the_window_uses_the_registered_arm_in_its_scope_and_an_explicit_bridge_outside(
+    tmp_path, part, arm
+) -> None:
+    session = "regular" if part == "regular" else "extended"
+    feed = "boats" if part == "overnight" else "sip"
+    ends = AT + timedelta(minutes=30)
+    node, strategy, _ = session_window.window_node(
+        WindowConfig(symbol="LLL", mover=True, strategy="Mover", session=session, log_dir=tmp_path),
+        wind_down_at=ends - timedelta(seconds=session_window.FLATTEN_SECS),
+        log_name=f"arm-{part}",
+        feed=feed,
+        part=part,
+        pick=mover_pick(),
+        entry_notional=Decimal(500),
+        ends=ends,
+    )
+    try:
+        assert isinstance(strategy, session_window.Mover)
+        assert strategy.settings.entry_arm == arm
+    finally:
+        node.dispose()
+
+
+def test_the_roster_spares_and_baseline_path_reach_the_window_from_the_command_line(
+    tmp_path,
+) -> None:
+    args = session_window._args(
+        [
+            "--strategy",
+            "Mover",
+            "--mover",
+            "--slots",
+            "2",
+            "--spares",
+            "3",
+            "--baseline-path",
+            str(tmp_path / "custom.json"),
+            "--log-dir",
+            str(tmp_path),
+        ]
+    )
+    assert args.slots == 2 and args.spares == 3
+    assert args.baseline_path == tmp_path / "custom.json"
+    with pytest.raises(ValueError, match="spares"):
+        WindowConfig(strategy="Mover", mover=True, spares=-1)
+
+
+def test_the_window_supplies_every_roster_context_and_checks_every_symbol_after_the_stop(
+    monkeypatch, tmp_path
+) -> None:
+    class HistoryQuotes(EntryHistory):
+        def get_stock_latest_quote(self, request):
+            symbol = request.symbol_or_symbols
+            ask = 10.0 if symbol == "AAA" else 20.0
+            return {symbol: SimpleNamespace(ask_price=ask, bid_price=ask - 0.01)}
+
+    first = session_window.MoverPick(
+        "AAA",
+        Decimal(10),
+        {"at": AT.isoformat(), "inputs": {"move": 0.5}},
+        Decimal(10),
+        others=(
+            session_window.MoverPick("BBB", Decimal(20), {"inputs": {"move": 0.4}}, Decimal(20)),
+        ),
+    )
+    seen = {}
+
+    def choose(*args, **kwargs):
+        seen["choice"] = kwargs
+        return first
+
+    caps = tuple(
+        SimpleNamespace(
+            instrument_id=InstrumentId.from_str(f"{symbol}.ALPACA"),
+            max_position=Decimal(bound),
+            checks=checks,
+            peak=Decimal(0),
+            tripped=None,
+        )
+        for symbol, bound, checks in (("AAA", 1000, 2), ("BBB", 500, 3))
+    )
+
+    def node(config, **kwargs):
+        from canon_trading.mover import MoverConfig
+
+        seen["node"] = kwargs
+        (config.log_dir / f"{kwargs['log_name']}.log").write_text("")
+        strategy = session_window.Mover(
+            MoverConfig(max_notional=kwargs["entry_notional"], max_move=Decimal(100))
+        )
+        strategy.quotes = strategy.trades = 5
+        strategy.live_bars = 1
+        strategy.ranking_records.append({"published": True})
+        return (
+            SimpleNamespace(cache=SimpleNamespace(orders=lambda **_: []), dispose=lambda: None),
+            strategy,
+            caps,
+        )
+
+    def flatten(*args, **kwargs):
+        seen["check"] = kwargs
+        return []
+
+    monkeypatch.setattr(session_window, "choose_mover", choose)
+    monkeypatch.setattr(session_window, "window_data", lambda: HistoryQuotes())
+    monkeypatch.setattr(session_window, "window_node", node)
+    monkeypatch.setattr(session_window, "_run_node", lambda *args: None)
+    monkeypatch.setattr(session_window, "_flatten_after_stop", flatten)
+    from canon_trading.movers_rank import write_baselines
+
+    baseline = tmp_path / "baseline.json"
+    write_baselines(baseline, AT.date(), {})
+    report = session_window.run_window(
+        WindowConfig(
+            strategy="Mover",
+            mover=True,
+            slots=4,
+            spares=1,
+            baseline_path=baseline,
+            log_dir=tmp_path,
+        ),
+        trading=cast(TradingClient, Assets()),
+    )
+    assert seen["choice"]["count"] == 5 and seen["choice"]["order_cap"] == Decimal(10_000)
+    assert seen["node"]["entry_notional"] == Decimal(10_000)
+    assert [r["max_shares"] for r in report.mover["roster"]] == [1000, 500]
+    assert report.mover["allocation"]["entry_notional"] == "10000.00"  # floored to cents (L3)
+    assert set(map(str, seen["node"]["entry_contexts"])) == {"AAA.ALPACA", "BBB.ALPACA"}
+    assert [p.symbol for p in seen["node"]["pick"].picks] == ["AAA", "BBB"]
+    assert seen["check"]["symbols"] == ("AAA", "BBB")
+    assert [r["symbol"] for r in report.mover["roster"]] == ["AAA", "BBB"]
+    assert report.cap_checks == 5
+    assert set(report.mover["position_caps"]) == {"AAA.ALPACA", "BBB.ALPACA"}
+    assert report.mover["entry_arm"] == "registered" and report.result == "ok"
+
+
+def test_the_outside_scope_bridge_is_named_in_the_window_record(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(session_window, "choose_mover", lambda *a, **k: a_pick())
+    monkeypatch.setattr(session_window, "window_data", lambda: Quoted())
+    _, report, _ = quiet_window(
+        monkeypatch,
+        tmp_path,
+        quotes=5,
+        trades=5,
+        account=Evening(17),
+        session="extended",
+        mover=True,
+    )
+    assert report["strategy"] == "Mover" and report["mover"]["entry_arm"] == "bridge"
+    assert "04:00-16:00" in report["mover"]["entry_arm_reason"]
+
+
+@pytest.mark.parametrize("expensive_first", [False, True])
+@pytest.mark.parametrize("expensive_ask", [4500, 20000])
+def test_an_expensive_roster_name_is_dropped_and_named_while_other_names_run(
+    monkeypatch, tmp_path, expensive_first, expensive_ask
+):
+    cheap = mover_pick()
+    cheap = replace(cheap, record={**cheap.record, "last_trade_at": "LLL's last trade"})
+    expensive = session_window.MoverPick(
+        "EEE",
+        Decimal(expensive_ask),
+        {"inputs": {}, "last_trade_at": "EEE's last trade"},
+        Decimal(expensive_ask),
+    )
+    picks = [expensive, cheap] if expensive_first else [cheap, expensive]
+    picked = replace(picks[0], others=(picks[1],))
+
+    class Quotes(Quoted):
+        def get_stock_latest_quote(self, request_params):
+            ask = float(expensive_ask) if request_params.symbol_or_symbols == "EEE" else 1.6
+            return {request_params.symbol_or_symbols: SimpleNamespace(ask_price=ask)}
+
+    monkeypatch.setattr(session_window, "choose_mover", lambda *a, **k: picked)
+    monkeypatch.setattr(session_window, "window_data", lambda: Quotes())
+    monkeypatch.setattr(session_window, "mover_entry_contexts", lambda *a, **k: {})
+    outcome, report, seen = quiet_window(
+        monkeypatch,
+        tmp_path,
+        quotes=5,
+        trades=5,
+        account=SmallerAssets(),
+        mover=True,
+        strategy="Mover",
+        slots=7,
+    )
+    assert not isinstance(outcome, RuntimeError), str(outcome)
+    assert report["result"] == "ok" and report["symbol"] == "LLL"
+    assert [p.symbol for p in seen["pick"].picks] == ["LLL"]
+    assert str(expensive_ask) in report["mover"]["passed_over"]["EEE"]
+    assert "4000" in report["mover"]["passed_over"]["EEE"]
+    # the record's last trade is the priced name's, not a dropped first pick's (review of 3a8613a, cut)
+    assert report["mover"]["last_trade_at"] == "LLL's last trade"
+
+
+def test_unsettled_requests_keep_their_names_before_the_cache_is_disposed() -> None:
+    orders = [
+        SimpleNamespace(
+            client_order_id=SimpleNamespace(value=f"sale-{symbol}"),
+            instrument_id=InstrumentId.from_str(f"{symbol}.ALPACA"),
+        )
+        for symbol in ("AAA", "BBB")
+    ]
+    found = session_window._unsettled_symbols(
+        SimpleNamespace(orders=lambda **_: orders),
+        session_window.STRATEGY_ID,
+        {"sale-BBB": ("sell", "open")},
+    )
+    orders.clear()
+    assert found == {"sale-BBB": "BBB"}
 
 
 def test_a_mover_strategy_window_fails_by_name_over_its_request_ceiling_or_on_a_429() -> None:
@@ -6501,22 +7955,131 @@ def test_a_mover_strategy_window_hands_the_node_its_choice_and_its_end(
     data, screener = Quoted(), Screener()
     monkeypatch.setattr(session_window, "window_data", lambda: data)
     monkeypatch.setattr(session_window, "window_screener", lambda: screener)
+    monkeypatch.setattr(session_window, "choose_mover", lambda *a, **k: mover_pick())
     outcome, latest, seen = quiet_window(
         monkeypatch, tmp_path, quotes=5, trades=5, account=Assets(), mover=True, strategy="Mover"
     )
     assert not isinstance(outcome, Exception), outcome
     assert latest["strategy"] == "Mover" and latest["symbol"] == "LLL" and latest["result"] == "ok"
-    assert latest["share_price"] == "1.5" and latest["mover"]["entry_limit"] == "1.6000"
+    assert latest["share_price"] == "1.6000" and latest["mover"]["entry_limit"] == "1.6000"
     assert seen["pick"].symbol == "LLL" and seen["pick"].price == Decimal("1.6")
     assert seen["ends"] - seen["wind_down_at"] == timedelta(seconds=session_window.FLATTEN_SECS)
+    # the regular part's slots, as ADR 0083's budget carries them, unless the run sets its own
+    assert seen["slots"] == 7 and latest["mover"]["slots"] == 7
 
-    data.ask = 500.01  # the last trade is still 1.5: only the limit is over the largest entry
+    # at seven slots of 28000, only the current limit is over the account's 4000-per-slot figure
+    data.ask = 4500.01
     monkeypatch.setattr(session_window, "GAP_SECS", 0)
-    with pytest.raises(session_window.WindowRefused, match="at its entry limit of 500.0100"):
+    with pytest.raises(session_window.WindowRefused, match="at its entry limit of 4500.0100"):
         session_window.run_window(
-            WindowConfig(log_dir=tmp_path, strategy="Mover", mover=True),
-            trading=cast(TradingClient, Assets()),
+            replace(seen["config"], log_dir=tmp_path, slots=7),
+            trading=cast(TradingClient, SmallerAssets()),
         )
+
+
+def test_a_window_with_quotes_but_no_rank_generation_is_recorded_as_failed(monkeypatch, tmp_path):
+    monkeypatch.setattr(session_window, "choose_mover", lambda *a, **k: mover_pick())
+    monkeypatch.setattr(session_window, "window_data", lambda: Quoted())
+    error, report, _ = quiet_window(
+        monkeypatch,
+        tmp_path,
+        quotes=50,
+        trades=20,
+        account=Assets(),
+        strategy="Mover",
+        mover=True,
+        published=False,
+    )
+    assert isinstance(error, RuntimeError) and "rank actor" in str(error)
+    assert report["result"].startswith("failed:") and "no published generation" in report["result"]
+
+
+def test_slots_are_movers_and_a_positive_whole_number() -> None:
+    with pytest.raises(ValueError, match="slots are Mover's"):
+        WindowConfig(slots=2)
+    with pytest.raises(ValueError, match="slots must be a positive"):
+        WindowConfig(strategy="Mover", mover=True, slots=0)
+    assert WindowConfig(strategy="Mover", mover=True, slots=2).slots == 2
+
+
+def test_a_parts_resolved_slots_and_spares_must_fit_the_rank_interface_before_reads(
+    monkeypatch, tmp_path
+):
+    # every part holds seven slots, so the configuration refuses fourteen spares before any read
+    with pytest.raises(ValueError, match="slots plus spares must be at most 20"):
+        WindowConfig(session="extended", strategy="Mover", mover=True, spares=14, log_dir=tmp_path)
+    # and the window checks the part's own row, which a part could set above the default
+    row = session_window.MOVER_PARTS["after-hours"]
+    monkeypatch.setitem(session_window.MOVER_PARTS, "after-hours", replace(row, slots=10))
+    with pytest.raises(session_window.WindowRefused, match="10 slots.*11 spares.*20"):
+        session_window.run_window(
+            WindowConfig(
+                session="extended", strategy="Mover", mover=True, spares=11, log_dir=tmp_path
+            ),
+            trading=cast(TradingClient, Evening(17)),
+        )
+
+
+def test_the_slots_flag_needs_mover_named(tmp_path) -> None:
+    with pytest.raises(SystemExit):
+        session_window._args(["--slots", "2", "--log-dir", str(tmp_path)])
+    args = session_window._args(
+        ["--strategy", "Mover", "--mover", "--slots", "2", "--log-dir", str(tmp_path)]
+    )
+    assert args.slots == 2
+
+
+def test_a_mover_windows_entries_are_read_from_its_record_its_bars_and_its_choice() -> None:
+    """The record's diagnostics of each entry: the strategy's own entries and fills, the node's bars of
+    the name, and the reference close the window's choice read."""
+    t0 = 1_762_790_400_000_000_000
+    bars = [
+        SimpleNamespace(ts_init=t0 + 60 * 10**9 * i, high=Price.from_str(f"{1.5 + 0.1 * i:.4f}"))
+        for i in range(5)
+    ]
+    asked: list = []
+
+    def cached_bars(bar_type):
+        asked.append(str(bar_type))
+        return list(reversed(bars))
+
+    run = {
+        "entries": [
+            {
+                "client_order_id": "O-1",
+                "instrument_id": "LLL.ALPACA",
+                "qualified_ns": t0,
+                "run_close": "1.5",
+                "submitted_ns": t0 + 250_000_000,
+            }
+        ],
+        "fills": [["O-1", "BUY", "300", "1.6", t0 + 10**9]],
+    }
+    pick = mover_pick()
+    pick.record["inputs"]["reference"] = 0.5
+    (got,) = session_window.mover_entries(run, SimpleNamespace(bars=cached_bars), pick)
+    assert asked == ["LLL.ALPACA-1-MINUTE-LAST-INTERNAL"]
+    assert got["qualified_to_submit_ms"] == 250
+    assert got["high_after"] == "1.9000" and got["rise_left"] == "0.1875"
+    assert got["ahead"] == "0.2143"  # (1.9 - 1.6) / (1.9 - 0.5)
+
+
+def test_entry_diagnostics_use_the_reference_of_each_roster_name() -> None:
+    first = mover_pick()
+    first.record["inputs"]["reference"] = 1.0
+    second = session_window.MoverPick(
+        "BBB", Decimal(20), {"inputs": {"reference": 10.0}}, Decimal(20)
+    )
+    pick = replace(first, others=(second,))
+    run = {
+        "entries": [{"client_order_id": "B-1", "instrument_id": "BBB.ALPACA"}],
+        "fills": [["B-1", "BUY", "2", "20", 100]],
+    }
+    cache = SimpleNamespace(
+        bars=lambda _: [SimpleNamespace(ts_init=200, high=Price.from_str("30"))]
+    )
+    (entry,) = session_window.mover_entries(run, cache, pick)
+    assert entry["ahead"] == "0.5000"  # (30 - 20) / (30 - BBB's reference 10)
 
 
 def test_overnight_ranking_reads_boats_normals_and_trades_but_sip_reference_closes() -> None:
@@ -6713,11 +8276,13 @@ def selected_window(monkeypatch, tmp_path, *, part, names, actions=None, attribu
 
 
 @pytest.mark.parametrize("part", ["after-hours", "overnight", "pre-market"])
-@pytest.mark.parametrize("ask", [None, 0, 501])
+@pytest.mark.parametrize("ask", [None, 0, 40001])
 def test_mover_passes_over_a_candidate_without_an_affordable_ask(
     monkeypatch, tmp_path, part, ask
 ) -> None:
-    """Antigravity 2: a bad first choice must not discard the next usable mover."""
+    """Antigravity 2: a bad first choice must not discard the next usable mover. The cap is the
+    startup account's entry figure (40,000 dollars over this account's slots in the part), which
+    replaced the fixed 500-dollar row in the composition; 40,001 is over it in every part."""
     names = {
         "FIRST": Name(1, 4, 1000, 4, ask=ask),
         "NEXT": Name(1, 3, 100, 3, ask=3),
@@ -6725,8 +8290,53 @@ def test_mover_passes_over_a_candidate_without_an_affordable_ask(
     _, latest, _, _, _ = selected_window(monkeypatch, tmp_path, part=part, names=names)
     assert latest["result"] == "ok" and latest["symbol"] == "NEXT"
     assert "FIRST" in latest["mover"]["passed_over"]
-    assert latest["mover"]["bounds"]["cap_usd"] == "500"
+    assert latest["mover"]["bounds"]["cap_usd"] == latest["mover"]["allocation"]["entry_notional"]
     assert latest["mover"]["entry_limit"] == "3.0000"
+
+
+@pytest.mark.parametrize("part", ["pre-market", "after-hours", "overnight"])
+def test_stream_selection_uses_account_funds_above_the_old_entry_cap(monkeypatch, tmp_path, part):
+    monkeypatch.setattr(
+        Account,
+        "get_account",
+        lambda self: SimpleNamespace(buying_power="60000", cash="30000"),
+    )
+    names = {"FIRST": Name(1000, 1500, 1000, 1500, ask=1600)}
+    _, latest, seen, _, _ = selected_window(monkeypatch, tmp_path, part=part, names=names)
+    assert latest["symbol"] == "FIRST" and latest["result"] == "ok"
+    # the cash over the part's slots (the composition's `part_slots`), above the old 500/1,000 caps
+    figure = (Decimal(30000) / latest["mover"]["allocation"]["slots"]).quantize(
+        Decimal("0.01"), rounding=ROUND_DOWN
+    )
+    assert figure > 1600
+    assert Decimal(latest["mover"]["bounds"]["cap_usd"]) == figure
+    assert latest["mover"]["entry_limit"] == "1600.0000"
+    assert seen["entry_notional"] == figure
+
+
+def test_regular_screener_selection_uses_startup_account_funds(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        Account,
+        "get_account",
+        lambda self: SimpleNamespace(buying_power="60000", cash="30000"),
+    )
+    data = Quoted()
+    data.ask = 1600
+    monkeypatch.setattr(session_window, "window_data", lambda: data)
+    monkeypatch.setattr(session_window, "window_screener", lambda: Screener())
+    outcome, latest, seen = quiet_window(
+        monkeypatch, tmp_path, quotes=5, trades=5, account=Assets(), mover=True, strategy="Mover"
+    )
+    assert not isinstance(outcome, Exception), outcome
+    assert latest["symbol"] == "BBB" and latest["result"] == "ok"
+    # the cash over the regular part's slots, above the old 500/1,000 caps
+    figure = (Decimal(30000) / latest["mover"]["allocation"]["slots"]).quantize(
+        Decimal("0.01"), rounding=ROUND_DOWN
+    )
+    assert figure > 1600
+    assert Decimal(latest["mover"]["bounds"]["cap_usd"]) == figure
+    assert Decimal(latest["mover"]["allocation"]["entry_notional"]) == figure
+    assert seen["entry_notional"] == figure
 
 
 def test_sunday_overnight_filters_actions_effective_on_mondays_trade_date(
@@ -6817,3 +8427,747 @@ def test_overnight_normals_include_sunday_evenings_and_skip_closed_fridays(
     ]
     assert latest["result"] == "ok"
     assert dates == [date(2026, 11, d) for d in days]
+
+
+def test_a_request_snapshot_error_never_hides_a_window_not_left_flat(monkeypatch, tmp_path):
+    """A clean node whose final request snapshot fails, with a position left: the record and the raise
+    say the account was not left flat, and the snapshot error is kept beside it."""
+    ended = False
+
+    def counts():
+        if ended:
+            raise RuntimeError("counter unavailable")
+        return ()
+
+    def end(*args):
+        nonlocal ended
+        ended = True
+
+    monkeypatch.setattr(session_window, "request_counts", counts)
+    monkeypatch.setattr(session_window, "paper_trading", lambda: Account())
+    monkeypatch.setattr(session_window, "window_node", lambda *a, **k: ran_node(Hung()))
+    monkeypatch.setattr(session_window, "_run_node", lambda *a: None)
+    monkeypatch.setattr(session_window, "_flatten_after_stop", lambda *a, **k: ["SPY 1"])
+    monkeypatch.setattr(session_window, "_read_stream_lines", end)
+    with pytest.raises(RuntimeError, match="not left flat"):
+        session_window.run_window(WindowConfig(log_dir=tmp_path))
+    latest = json.loads((tmp_path / "latest.json").read_text())
+    assert latest["result"].startswith("failed: not left flat"), latest["result"]
+    assert "counter unavailable" in latest["request_budget"]["snapshot_error"]
+    assert latest["request_budget"]["calibration_eligible"] is False
+
+
+def test_a_clean_window_whose_request_snapshot_fails_is_failed_by_it(monkeypatch, tmp_path):
+    ended = False
+
+    def counts():
+        if ended:
+            raise RuntimeError("counter unavailable")
+        return ()
+
+    def end(*args):
+        nonlocal ended
+        ended = True
+
+    monkeypatch.setattr(session_window, "request_counts", counts)
+    monkeypatch.setattr(session_window, "paper_trading", lambda: Account())
+    monkeypatch.setattr(session_window, "window_node", lambda *a, **k: ran_node(Hung()))
+    monkeypatch.setattr(session_window, "_run_node", lambda *a: None)
+    monkeypatch.setattr(session_window, "_flatten_after_stop", lambda *a, **k: [])
+    monkeypatch.setattr(session_window, "_read_stream_lines", end)
+    with pytest.raises(RuntimeError, match="counter unavailable"):
+        session_window.run_window(WindowConfig(log_dir=tmp_path))
+    latest = json.loads((tmp_path / "latest.json").read_text())
+    assert latest["result"] == "failed: RuntimeError: counter unavailable", latest["result"]
+
+
+def test_a_node_abandoned_on_its_own_error_is_an_interrupted_measurement(monkeypatch, tmp_path):
+    """The node fails with an ordinary error while a worker call still runs, so it is abandoned: its
+    requests can still go out after the snapshot, so the measurement is interrupted, not complete or
+    merely failed."""
+    monkeypatch.setattr(session_window, "_ABANDONED", [])
+    monkeypatch.setattr(session_window, "request_counts", lambda: ())
+    monkeypatch.setattr(session_window, "paper_trading", lambda: Account())
+    monkeypatch.setattr(session_window, "window_node", lambda *a, **k: ran_node(Hung()))
+    monkeypatch.setattr(session_window, "_wait_for_calls", lambda *a: None)
+    monkeypatch.setattr(session_window, "_flatten_after_stop", lambda *a, **k: [])
+    monkeypatch.setattr(session_window, "_read_stream_lines", lambda *a: None)
+
+    def abandoned(*args):
+        session_window._ABANDONED.append((None, None, None))
+        raise ValueError("node error")
+
+    monkeypatch.setattr(session_window, "_run_node", abandoned)
+    with pytest.raises(ValueError, match="node error"):
+        session_window.run_window(WindowConfig(log_dir=tmp_path))
+    latest = json.loads((tmp_path / "latest.json").read_text())
+    assert latest["request_budget"]["measurement_status"] == "interrupted"
+
+
+def test_an_interrupt_during_a_record_snapshot_is_raised_after_the_record_is_written(
+    monkeypatch, tmp_path
+):
+    def interrupted():
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(session_window, "request_counts", interrupted)
+    record = {"result": "refused: no", "request_budget": session_window.request_record(())}
+    with pytest.raises(KeyboardInterrupt):
+        session_window.write_record(tmp_path, record)
+    latest = json.loads((tmp_path / "latest.json").read_text())
+    assert latest["request_budget"]["snapshot_error"].startswith("KeyboardInterrupt")
+
+
+@pytest.mark.parametrize("part", ["pre-market", "regular", "after-hours", "overnight"])
+def test_every_part_holds_seven_slots_unless_a_run_sets_its_own(part: str) -> None:
+    """The lead's ruling of 2026-11-12: seven slots in every part, since the worst measured minute is
+    175 requests against the 180 throttle and ten would pass it. The rows read 10/10/1/1, so a
+    scheduled window, which passes no `--slots`, held ten names in the regular part."""
+    from canon_trading.mover_window import part_slots
+
+    assert session_window.MOVER_PARTS[part].slots == 7
+    assert part_slots(part) == 7 and part_slots(part, 3) == 3
+
+
+def test_a_sale_with_no_buy_in_the_windows_fills_is_never_booked_as_profit() -> None:
+    """Review of the slot commit, finding 2: a close of the check's own may sell shares the node bought
+    with an answer it never saw, so the window's fills hold a sale with no buy; at an average cost of
+    zero its whole proceeds were realized. That name's result is named incomplete instead."""
+    result = session_window.trade_result(
+        [
+            ("O-1", "AAA.ALPACA", "BUY", "10", "49"),
+            ("canon-close-1", "AAA.ALPACA", "SELL", "100", "50"),
+            ("O-2", "BBB.ALPACA", "BUY", "10", "1.00"),
+            ("O-3", "BBB.ALPACA", "SELL", "10", "1.10"),
+        ],
+        [],
+        entry_figure=Decimal(1000),
+    )
+    assert result["realized_usd"] == "1.00"
+    assert result["by_instrument"]["AAA.ALPACA"]["realized"].startswith("unavailable")
+    assert result["incomplete"] == [
+        "AAA.ALPACA: sold 90 shares more than the window's fills bought"
+    ]
+
+
+def test_a_result_that_cannot_be_read_never_fails_a_flat_window(monkeypatch, tmp_path) -> None:
+    """Review of the slot commit, finding 3: the recompute with the check's closes ran inside the
+    account check's handler, so a fill that would not parse failed a flat window as unchecked."""
+    bad = ("O-1", "LLL.ALPACA", "BUY", "not a number", "1.60")
+    monkeypatch.setattr(session_window, "strategy_fills", lambda cache, strategy_id: [bad])
+    monkeypatch.setattr(session_window, "choose_mover", lambda *a, **k: mover_pick())
+    monkeypatch.setattr(session_window, "window_data", lambda: Quoted())
+    monkeypatch.setattr(session_window, "mover_entry_contexts", lambda *a, **k: {})
+    outcome, latest, _ = quiet_window(
+        monkeypatch,
+        tmp_path,
+        quotes=5,
+        trades=5,
+        account=Assets(),
+        mover=True,
+        strategy="Mover",
+        check_fills=[("canon-close-1", "LLL.ALPACA", "SELL", "10", "1.70")],
+    )
+    assert not isinstance(outcome, Exception), outcome
+    assert latest["result"] == "ok" and latest["mover"]["result"].startswith("not read")
+
+
+def test_a_movers_result_counts_the_account_checks_closes(monkeypatch, tmp_path) -> None:
+    """Review of fire-m-c, finding 11: the record's `flat` and `realized_usd` came from the strategy's
+    own fills, so a forced close after the stop left the window open and its result short."""
+    entry = ("O-1", "LLL.ALPACA", "BUY", "10", "1.60")
+    monkeypatch.setattr(session_window, "strategy_fills", lambda cache, strategy_id: [entry])
+    monkeypatch.setattr(session_window, "choose_mover", lambda *a, **k: mover_pick())
+    monkeypatch.setattr(session_window, "window_data", lambda: Quoted())
+    monkeypatch.setattr(session_window, "mover_entry_contexts", lambda *a, **k: {})
+    _, latest, _ = quiet_window(
+        monkeypatch,
+        tmp_path,
+        quotes=5,
+        trades=5,
+        account=Assets(),
+        mover=True,
+        strategy="Mover",
+        check_fills=[("canon-close-1", "LLL.ALPACA", "SELL", "10", "1.70")],
+    )
+    result = latest["mover"]["result"]
+    assert result["flat"] is True and result["realized_usd"] == "1.00"
+    assert result["check_closes"] == 1
+
+
+def test_a_mover_window_running_the_bridge_checks_the_chosen_name_after_the_stop(
+    monkeypatch, tmp_path
+) -> None:
+    """Review of fire-m-c, finding 1: the window's symbols were set before the mover was chosen and
+    replaced only on `Mover`'s path, so a `--mover` window running SessionMaCross checked SPY after the
+    stop and left the chosen name's position and orders open."""
+    data, screener = Data(), Screener()
+    monkeypatch.setattr(session_window, "window_data", lambda: data)
+    monkeypatch.setattr(session_window, "window_screener", lambda: screener)
+    _, latest, seen = quiet_window(
+        monkeypatch, tmp_path, quotes=5, trades=5, account=Assets(), mover=True
+    )
+    assert latest["symbol"] == "LLL"
+    assert seen["checked"][0] == ("LLL",)
+
+
+@pytest.mark.parametrize("value", ["", "OFFROSTER.ALPACA=0.25"])
+def test_a_mover_with_no_opened_slot_uses_a_published_generation_as_stream_proof(value):
+    report = session_window.WindowReport(
+        "regular", "PRIMARY", started="20261110T160000Z", strategy="Mover"
+    )
+    report.mover = {
+        "run": {"ranking_records": [{"published": True, "value": value}], "opened_slots": []}
+    }
+    assert session_window._data_failure(report) is None
+
+
+def test_a_movers_empty_slot_stream_names_every_symbol_it_opened():
+    report = session_window.WindowReport(
+        "regular", "PRIMARY", started="20261110T160000Z", strategy="Mover"
+    )
+    report.mover = {
+        "run": {
+            "ranking_records": [{"published": True}],
+            "opened_slots": ["AAA.ALPACA", "BBB.ALPACA"],
+        }
+    }
+    failure = session_window._data_failure(report)
+    assert failure is not None and "AAA" in failure and "BBB" in failure
+    assert "PRIMARY" not in failure
+
+
+@pytest.mark.parametrize(
+    ("ask", "last", "expected"),
+    [
+        ("99.98", "99.98", "99.98"),
+        ("99.98", "100.20", "99.98"),
+        ("99.9817", "99.98", "99.99"),
+    ],
+)
+def test_the_mover_snapshot_screen_uses_the_actual_ask_without_the_bridge_offset(
+    ask, last, expected
+):
+    """M-c builder, finding 9: Mover's entry is its own limit at the ask, not the bridge's offset."""
+    snapshot = SimpleNamespace(latest_quote=SimpleNamespace(ask_price=ask))
+    assert session_window.entry_limit(snapshot, Decimal(last)) == Decimal(expected)
+
+
+@pytest.mark.parametrize("ask", [None, "0"])
+def test_a_mover_snapshot_without_a_positive_ask_has_no_entry_limit(ask):
+    """Ruling (i), fire-m-c: main's positive-ask rule; a Mover entry is never priced from the last
+    trade."""
+    snapshot = SimpleNamespace(latest_quote=SimpleNamespace(ask_price=ask))
+    with pytest.raises(ValueError, match="positive ask"):
+        session_window.entry_limit(snapshot, Decimal("99.98"))
+
+
+def test_the_mover_roster_screen_keeps_a_share_just_below_its_entry_figure():
+    names = {"HHH": Name(20.0, 99.98, 1200, 99.98, ask=99.98)}
+    pick = session_window.select_mover(
+        cast(TradingClient, Assets()),
+        cast(Any, Data(names)),
+        cast(Any, Screener(names)),
+        cast(Any, Actions()),
+        AT,
+        datetime(2026, 11, 10, 9, 30, tzinfo=NEW_YORK),
+        date(2026, 11, 9),
+        order_cap=Decimal(100),
+        for_mover=True,
+    )
+    assert pick.symbol == "HHH" and pick.entry == Decimal("99.98")
+
+
+def test_the_stream_roster_screen_uses_the_movers_price_at_the_budget_boundary():
+    names = {"HHH": Name(20.0, 99.98, 1200, 99.98, ask=99.98)}
+    stream = SampleStream(names)
+    pick = session_window.stream_mover(
+        cast(TradingClient, Assets()),
+        cast(Any, stream),
+        cast(Any, Data(names)),
+        cast(Any, Screener(names)),
+        cast(Any, Actions()),
+        date(2026, 11, 9),
+        minutes=1,
+        clock=lambda: AT.timestamp() + 30,
+        sleep=stream.wait,
+        order_cap=Decimal(100),
+        for_mover=True,
+    )
+    assert pick.symbol == "HHH" and pick.entry == Decimal("99.98")
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+def test_the_mover_pricing_choice_reaches_the_stream_and_startup_fallback(monkeypatch, fallback):
+    seen = []
+
+    def sample(*args, **kwargs):
+        seen.append(("stream", kwargs["for_mover"]))
+        if fallback:
+            raise session_window.StreamSampleFailed("offline sample unavailable")
+        return mover_pick()
+
+    def select(*args, **kwargs):
+        seen.append(("fallback", kwargs["for_mover"]))
+        return mover_pick()
+
+    for name in ("window_data", "window_screener", "window_actions", "window_stream"):
+        monkeypatch.setattr(session_window, name, lambda **kwargs: object())
+    monkeypatch.setattr(session_window, "stream_mover", sample)
+    monkeypatch.setattr(session_window, "select_mover", select)
+    session_window.choose_mover(
+        cast(TradingClient, Assets()),
+        AT,
+        AT - timedelta(hours=1),
+        date(2026, 11, 9),
+        regular_close=AT + timedelta(hours=1),
+        for_mover=True,
+    )
+    assert seen == [("stream", True)] + ([("fallback", True)] if fallback else [])
+
+
+@pytest.mark.parametrize("ask", [6000.0, 0.0])
+def test_an_unpriceable_mover_snapshot_does_not_hide_the_next_ranked_name(ask):
+    """M-c builder, finding 9, restated to main's positive-ask rule (ruling (i), fire-m-c): a name
+    whose ask has no valid limit, or that has no positive ask, is passed over by name, with no
+    last-price fallback, and the next ranked name is chosen."""
+    names = {
+        "HHH": Name(1000.0, 6000.0, 1200, 6000.0, ask=ask),
+        "LLL": replace(NAMES["LLL"], ask=1.5),
+    }
+    pick = session_window.select_mover(
+        cast(TradingClient, Assets()),
+        cast(Any, Data(names)),
+        cast(Any, Screener(names)),
+        cast(Any, Actions()),
+        AT,
+        datetime(2026, 11, 10, 9, 30, tzinfo=NEW_YORK),
+        date(2026, 11, 9),
+        order_cap=Decimal(10000),
+        for_mover=True,
+    )
+    why = pick.record["passed_over"]["HHH"]
+    assert pick.symbol == "LLL"
+    assert ("no positive ask" in why) if not ask else ("no usable entry limit" in why)
+
+
+@pytest.mark.parametrize("ask", [None, 0, "missing"])
+def test_a_spare_without_an_ask_is_recorded_and_does_not_abort_the_affordable_name(
+    monkeypatch, tmp_path, ask
+):
+    picked = replace(
+        mover_pick(),
+        others=(session_window.MoverPick("EEE", Decimal(2), {"inputs": {}}, Decimal(2)),),
+    )
+
+    class Quotes(Quoted):
+        def get_stock_latest_quote(self, request_params):
+            if request_params.symbol_or_symbols == "EEE":
+                return {} if ask == "missing" else {"EEE": SimpleNamespace(ask_price=ask)}
+            return super().get_stock_latest_quote(request_params)
+
+    monkeypatch.setattr(session_window, "choose_mover", lambda *a, **k: picked)
+    monkeypatch.setattr(session_window, "window_data", lambda: Quotes())
+    monkeypatch.setattr(session_window, "mover_entry_contexts", lambda *a, **k: {})
+    outcome, report, seen = quiet_window(
+        monkeypatch, tmp_path, quotes=5, trades=5, account=Assets(), mover=True, strategy="Mover"
+    )
+    assert not isinstance(outcome, RuntimeError), str(outcome)
+    assert report["result"] == "ok" and [p.symbol for p in seen["pick"].picks] == ["LLL"]
+    assert "no ask" in report["mover"]["passed_over"]["EEE"]
+
+
+def a_spare(symbol: str = "EEE") -> session_window.MoverPick:
+    """`mover_pick`'s LLL chosen, with one spare."""
+    return replace(
+        mover_pick(),
+        others=(session_window.MoverPick(symbol, Decimal(2), {"inputs": {}}, Decimal(2)),),
+    )
+
+
+class Night(Evening):
+    """`Evening` whose asset read for `failing` says `failure`: halted overnight, or a read that raises."""
+
+    def __init__(self, hour: int, failing: str, failure: str, **kwargs) -> None:
+        super().__init__(hour, **kwargs)
+        self.failing, self.failure = failing, failure
+
+    def get(self, path):
+        if path == f"/assets/{self.failing}":
+            if self.failure == "unreadable":
+                raise OSError("Read timed out")
+            return {
+                "symbol": self.failing,
+                "attributes": ["overnight_tradable", "overnight_halted"],
+            }
+        return super().get(path)
+
+
+@pytest.mark.parametrize("failure", ["halted", "unreadable"])
+def test_overnight_a_spare_that_fails_its_re_check_is_passed_over_by_name(
+    monkeypatch, tmp_path, failure
+):
+    """ultra-3a8613a/7, the lead's ruling of 2026-11-12: overnight, a spare that fails its eligibility
+    re-check, halted or unread, is passed over by name; the chosen name runs."""
+    monkeypatch.setattr(session_window, "choose_mover", lambda *a, **k: a_spare())
+    monkeypatch.setattr(session_window, "window_data", lambda: Quoted())
+    monkeypatch.setattr(session_window, "mover_entry_contexts", lambda *a, **k: {})
+    outcome, latest, seen = quiet_window(
+        monkeypatch,
+        tmp_path,
+        quotes=5,
+        trades=5,
+        account=Night(21, "EEE", failure),
+        session="extended",
+        mover=True,
+        strategy="Mover",
+    )
+    assert not isinstance(outcome, Exception), outcome
+    assert latest["result"] == "ok" and [p.symbol for p in seen["pick"].picks] == ["LLL"]
+    assert "overnight" in latest["mover"]["passed_over"]["EEE"]
+    assert [r["symbol"] for r in latest["mover"]["roster"]] == ["LLL"]
+
+
+@pytest.mark.parametrize("failure", ["halted", "unreadable"])
+def test_overnight_the_chosen_names_failed_re_check_still_refuses(monkeypatch, tmp_path, failure):
+    """ultra-3a8613a/7: only the chosen name's failed re-check refuses the window."""
+    monkeypatch.setattr(session_window, "choose_mover", lambda *a, **k: a_spare())
+    monkeypatch.setattr(session_window, "window_data", lambda: Quoted())
+    monkeypatch.setattr(session_window, "mover_entry_contexts", lambda *a, **k: {})
+    with pytest.raises(session_window.WindowRefused, match="LLL"):
+        quiet_window(
+            monkeypatch,
+            tmp_path,
+            quotes=5,
+            trades=5,
+            account=Night(21, "LLL", failure),
+            session="extended",
+            mover=True,
+            strategy="Mover",
+        )
+
+
+class RaisingQuotes(Quoted):
+    """`Quoted` whose latest-quote read for `failing` raises `error`."""
+
+    def __init__(self, failing: str, error: Exception) -> None:
+        super().__init__()
+        self.failing, self.error = failing, error
+
+    def get_stock_latest_quote(self, request_params) -> dict:
+        if request_params.symbol_or_symbols == self.failing:
+            raise self.error
+        return super().get_stock_latest_quote(request_params)
+
+
+QUOTE_ERRORS = [
+    pytest.param(
+        lambda: APIError('{"code": 50010000, "message": "internal server error"}'), id="api"
+    ),
+    pytest.param(lambda: OSError("Read timed out"), id="timeout"),
+]
+
+
+@pytest.mark.parametrize("error", QUOTE_ERRORS)
+def test_a_spare_whose_quote_read_raises_is_passed_over_by_name(monkeypatch, tmp_path, error):
+    """ultra-3a8613a/8, the lead's ruling of 2026-11-12: a spare whose latest-quote read raises (an
+    Alpaca error after alpaca-py's retries, or a timeout) is passed over by name; the chosen name runs."""
+    monkeypatch.setattr(session_window, "choose_mover", lambda *a, **k: a_spare())
+    monkeypatch.setattr(session_window, "window_data", lambda: RaisingQuotes("EEE", error()))
+    monkeypatch.setattr(session_window, "mover_entry_contexts", lambda *a, **k: {})
+    outcome, latest, seen = quiet_window(
+        monkeypatch, tmp_path, quotes=5, trades=5, account=Assets(), mover=True, strategy="Mover"
+    )
+    assert not isinstance(outcome, Exception), outcome
+    assert latest["result"] == "ok" and [p.symbol for p in seen["pick"].picks] == ["LLL"]
+    assert "could not be read" in latest["mover"]["passed_over"]["EEE"]
+
+
+@pytest.mark.parametrize("error", QUOTE_ERRORS)
+def test_the_chosen_names_raising_quote_read_refuses_and_is_recorded(monkeypatch, tmp_path, error):
+    """ultra-3a8613a/8: the chosen name's raising quote read refuses the window with `WindowRefused`,
+    which `_main` records as the latest result, so it is this window's, not the one before it."""
+    monkeypatch.setattr(session_window, "choose_mover", lambda *a, **k: a_spare())
+    monkeypatch.setattr(session_window, "window_data", lambda: RaisingQuotes("LLL", error()))
+    monkeypatch.setattr(session_window, "mover_entry_contexts", lambda *a, **k: {})
+    with pytest.raises(session_window.WindowRefused, match="LLL"):
+        quiet_window(
+            monkeypatch,
+            tmp_path,
+            quotes=5,
+            trades=5,
+            account=Assets(),
+            mover=True,
+            strategy="Mover",
+        )
+
+
+THANKSGIVING = date(2026, 11, 26)
+
+
+@pytest.mark.parametrize("today", [date(2026, 11, 27), date(2026, 11, 30), date(2026, 12, 2)])
+def test_the_calendar_read_holds_five_earlier_sessions_after_a_holiday(today) -> None:
+    """ultra-3a8613a/4, the lead's ruling of 2026-11-12: the calendar is read far enough back that the
+    registered arm's five earlier sessions are held in the days after a market holiday."""
+    from canon_trading import early_entry_study as study
+
+    start = today - session_window.CALENDAR_BACK
+    held = [
+        start + timedelta(days=n)
+        for n in range((today - start).days)
+        if (start + timedelta(days=n)).weekday() < 5 and start + timedelta(days=n) != THANKSGIVING
+    ]
+    assert len(held) >= study.ARMS["registered"].baseline_sessions
+
+
+def test_an_entry_context_with_fewer_earlier_sessions_than_the_arm_takes_is_missing() -> None:
+    """ultra-3a8613a/4: a context holding fewer earlier sessions than the registered arm's five is
+    marked missing by name, never averaged over the fewer sessions it has."""
+    contexts = session_window.mover_entry_contexts(
+        cast(Any, EntryHistory()),
+        ("AAA",),
+        AT,
+        [day(d) for d in ("2026-11-04", "2026-11-05", "2026-11-06", "2026-11-09", "2026-11-10")],
+        feed="sip",
+    )
+    (context,) = contexts.values()
+    assert context.missing is not None and "4 earlier sessions" in context.missing
+
+
+class CountingAccount(MultiWindowAccount):
+    """`MultiWindowAccount` that records each trading request at the time it is sent, and makes each
+    take `latency` seconds."""
+
+    def __init__(self, fake, quantities, *, orders=None, latency: float = 0.0) -> None:
+        super().__init__(fake, quantities, orders=orders)
+        self.latency = latency
+        self.requests: list[tuple[float, str]] = []
+
+    def _request(self, name: str) -> None:
+        self.requests.append((self.fake.now, name))
+        self.fake.now += self.latency
+
+    def get_clock(self) -> Clock:
+        self._request("clock")
+        return super().get_clock()
+
+    def get_orders(self, filter=None) -> list:
+        self._request("orders")
+        return super().get_orders(filter)
+
+    def get_all_positions(self) -> list:
+        self._request("positions")
+        return super().get_all_positions()
+
+    def get_order_by_client_id(self, client_id: str):
+        self._request("lookup")
+        return super().get_order_by_client_id(client_id)
+
+    def cancel_order_by_id(self, order_id) -> None:
+        self._request("cancel")
+        super().cancel_order_by_id(order_id)
+
+    def submit_order(self, request):
+        self._request("close")
+        return super().submit_order(request)
+
+
+def polls(requests: list[tuple[float, str]]) -> list[list[str]]:
+    """The requests of each poll: a poll begins with its reading, the lookups and then the open orders."""
+    found: list[list[str]] = []
+    for _, name in requests:
+        after_lookup = bool(found) and found[-1][-1] == "lookup"
+        if name in ("lookup", "orders") and not after_lookup:
+            found.append([])
+        found[-1].append(name)
+    return found
+
+
+def test_a_multiname_poll_that_cancels_sends_no_close_and_stays_inside_seven_requests(
+    fake_time, tmp_path
+) -> None:
+    """Review of 3a8613a, finding 11 (the lead's ruling of 2026-11-12): `act` canceled a name's
+    working orders and, in the same poll, read the clock and sent a close in another name, so a poll
+    sent nine trading requests against the seven `POLL_SECS` counts. A poll that cancels now sends no
+    close: the close goes out in the next poll."""
+    orders = [
+        SimpleNamespace(id=uuid4(), client_order_id=f"sell-AAA-{n}", symbol="AAA", status="new")
+        for n in range(2)
+    ]
+    account = CountingAccount(fake_time, {"AAA": 5, "BBB": 2}, orders=orders)
+    report = session_window.WindowReport("regular", "AAA", started="t")
+    left = session_window._flatten_after_stop(
+        cast(TradingClient, account),
+        WindowConfig(symbol="AAA", log_dir=tmp_path),
+        report,
+        symbols=("AAA", "BBB"),
+        unsettled={"entry-1": "buy", "entry-2": "buy"},
+        unsettled_symbols={"entry-1": "AAA", "entry-2": "AAA"},
+    )
+    every = polls(account.requests)
+    assert every[0][:4] == ["lookup", "lookup", "orders", "positions"]
+    assert max(len(poll) for poll in every) <= 7, every
+    assert not any("cancel" in poll and "close" in poll for poll in every), every
+    assert account.quantities == {"AAA": 0, "BBB": 0}, left
+
+
+def test_the_account_checks_deadline_grows_with_the_names_held(fake_time, tmp_path) -> None:
+    """Review of 3a8613a, finding 11 (the lead's ruling of 2026-11-12): the check closes one name a
+    poll, and its 60 s deadline did not grow with the names held, so seven names each answered in 2 s
+    left the last two unclosed. The deadline gives each name held after the first two polls more."""
+    w = session_window
+    names = {f"N{n}": n + 1 for n in range(w.PART_SLOTS)}
+    account = CountingAccount(fake_time, names, latency=2.0)
+    report = session_window.WindowReport("regular", "N0", started="t")
+    left = session_window._flatten_after_stop(
+        cast(TradingClient, account),
+        WindowConfig(symbol="N0", log_dir=tmp_path),
+        report,
+        symbols=tuple(names),
+    )
+    assert left == [] and not any(account.quantities.values()), left
+    closes = [at for at, name in account.requests if name == "close"]
+    assert len(closes) == w.PART_SLOTS and max(closes) > w.AFTER_STOP_SECS
+    assert w.after_stop_secs(1) == w.AFTER_STOP_SECS
+    assert (
+        w.after_stop_secs(w.PART_SLOTS) == w.AFTER_STOP_SECS + (w.PART_SLOTS - 1) * 2 * w.POLL_SECS
+    )
+    assert w.after_stop_secs(w.PART_SLOTS + 5) == w.after_stop_secs(w.PART_SLOTS)
+
+
+class TimedQuotes(NoBidForAAA):
+    """`NoBidForAAA` that records when each quote is asked for."""
+
+    def __init__(self, fake) -> None:
+        super().__init__()
+        self.fake = fake
+        self.at: list[float] = []
+
+    def get_stock_latest_quote(self, request) -> dict:
+        self.at.append(self.fake.now)
+        return super().get_stock_latest_quote(request)
+
+
+class CountingExtended(ExtendedMultiAccount):
+    def __init__(self, fake, quantities, *, refusing) -> None:
+        super().__init__(fake, quantities, refusing=refusing)
+        self.calendar_at: list[float] = []
+        self.closes_at: list[float] = []
+
+    def get_calendar(self, filters=None) -> list[Calendar]:
+        self.calendar_at.append(self.fake.now)
+        return super().get_calendar(filters)
+
+    def submit_order(self, request):
+        self.closes_at.append(self.fake.now)
+        return super().submit_order(request)
+
+
+def test_an_extended_poll_reads_the_calendar_or_one_quote_and_closes_at_most_once(
+    fake_time, tmp_path
+) -> None:
+    """Review of 3a8613a, finding 11: outside the regular session a poll could read the calendar, then a
+    quote for every name whose quote failed, then send a close: more requests than a poll's bound
+    counts. A poll that reads the calendar sends no quote, and a failed quote ends the poll."""
+    account = CountingExtended(fake_time, {"AAA": 5, "BBB": 2}, refusing=set())
+    quotes = TimedQuotes(fake_time)
+    report = session_window.WindowReport("regular", "AAA", started="t")
+    left = session_window._flatten_after_stop(
+        cast(TradingClient, account),
+        WindowConfig(symbol="AAA", log_dir=tmp_path),
+        report,
+        symbols=("AAA", "BBB"),
+        data=quotes,
+    )
+    assert account.calendar_at == [0.0]
+    assert 0.0 not in quotes.at and 0.0 not in account.closes_at
+    assert len(quotes.at) == len(set(quotes.at)), "one quote a poll"
+    assert account.quantities["BBB"] == 0 and "position of 5 AAA" in left
+
+
+@pytest.mark.parametrize("slots", [8, 10, 20])
+def test_slots_above_the_seven_the_bounds_count_are_refused_by_name(slots: int) -> None:
+    """Review of 3a8613a, finding 11 (the lead's ruling of 2026-11-12): the account check's deadline,
+    `END_MARGIN_SECS` and the longest window count `PART_SLOTS` names at most, so a run with more
+    `--slots` is refused by name until slots become a setting those bounds scale from."""
+    from canon_trading.mover_window import part_slots
+
+    with pytest.raises(ValueError, match=f"at most {session_window.PART_SLOTS}.*account check"):
+        WindowConfig(strategy="Mover", mover=True, slots=slots)
+    with pytest.raises(ValueError, match="at most 7"):
+        part_slots("regular", slots)
+    assert part_slots("regular", session_window.PART_SLOTS) == session_window.PART_SLOTS
+
+
+def test_the_extended_slots_flag_is_taken_where_the_window_runs_mover(tmp_path) -> None:
+    """Review of 3a8613a (cut list): `--session extended --mover` runs Mover, yet `--slots` was refused
+    there for want of `--strategy Mover`."""
+    for session in ("extended", "auto"):
+        args = session_window._args(
+            ["--session", session, "--mover", "--slots", "3", "--log-dir", str(tmp_path)]
+        )
+        assert args.slots == 3
+    with pytest.raises(SystemExit):
+        session_window._args(["--session", "regular", "--slots", "3", "--log-dir", str(tmp_path)])
+
+
+def test_an_order_that_never_ends_does_not_hold_another_names_close(fake_time, tmp_path) -> None:
+    """Review of the composition's fixes, high round, finding 2: a poll that canceled sent no close, and
+    an order Alpaca keeps showing working (pending cancel) was canceled again every poll, so another
+    name's close was never sent. Cancels and closes now take turns, each poll inside seven requests."""
+
+    class Sticky(CountingAccount):
+        def cancel_order_by_id(self, order_id) -> None:
+            self._request("cancel")  # Alpaca takes the cancel and keeps showing the order
+
+    stuck = SimpleNamespace(
+        id=uuid4(), client_order_id="sell-AAA", symbol="AAA", status="pending_cancel"
+    )
+    account = Sticky(fake_time, {"AAA": 5, "BBB": 2}, orders=[stuck])
+    report = session_window.WindowReport("regular", "AAA", started="t")
+    left = session_window._flatten_after_stop(
+        cast(TradingClient, account),
+        WindowConfig(symbol="AAA", log_dir=tmp_path),
+        report,
+        symbols=("AAA", "BBB"),
+    )
+    assert account.quantities["BBB"] == 0, left
+    assert "position of 5 AAA" in left
+    every = polls(account.requests)
+    assert max(len(poll) for poll in every) <= 7, every
+    assert not any("cancel" in poll and "close" in poll for poll in every), every
+
+
+def test_overnight_a_spare_after_a_chosen_name_passed_over_on_price_is_passed_over_too(
+    monkeypatch, tmp_path
+) -> None:
+    """Review of the composition's fixes, high round, finding 3: with the chosen name passed over on
+    its price, a spare's failed overnight re-check refused the whole window, though the next spare
+    qualified; only the chosen name's failure refuses, as for a quote that cannot be read."""
+    dear = session_window.MoverPick("XXX", Decimal(20000), {"inputs": {}}, Decimal(20000))
+    halted = session_window.MoverPick("EEE", Decimal(2), {"inputs": {}}, Decimal(2))
+    picked = replace(dear, others=(halted, mover_pick()))
+
+    class Quotes(Quoted):
+        def get_stock_latest_quote(self, request_params):
+            symbol = request_params.symbol_or_symbols
+            ask = 20000.0 if symbol == "XXX" else 1.6
+            return {symbol: SimpleNamespace(ask_price=ask)}
+
+    monkeypatch.setattr(session_window, "choose_mover", lambda *a, **k: picked)
+    monkeypatch.setattr(session_window, "window_data", lambda: Quotes())
+    monkeypatch.setattr(session_window, "mover_entry_contexts", lambda *a, **k: {})
+    outcome, latest, seen = quiet_window(
+        monkeypatch,
+        tmp_path,
+        quotes=5,
+        trades=5,
+        account=Night(21, "EEE", "halted"),
+        session="extended",
+        mover=True,
+        strategy="Mover",
+    )
+    assert not isinstance(outcome, Exception), outcome
+    assert [p.symbol for p in seen["pick"].picks] == ["LLL"]
+    assert "overnight" in latest["mover"]["passed_over"]["EEE"]
+    assert "entry figure" in latest["mover"]["passed_over"]["XXX"]

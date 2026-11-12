@@ -7,6 +7,8 @@ review-by: 2026-12-10
 
 # Paper session windows: `MaCross` guarded for live use, native runtime checks, a one-share cap in the node
 
+*Amended in part 2026-11-12 by ADR 0106 (proposed), which carries the Mover composition's changes to this record.*
+
 ## Context and Problem Statement
 
 The owner wants the end-to-end paper run to go around the clock on weekdays. ADR 0037 showed upstream's

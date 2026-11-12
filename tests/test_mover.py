@@ -5,12 +5,14 @@ file: each minute a bar, and a quote a nanosecond before the bar closes, a cent 
 so a decision taken on a bar finds the quote of that close in the cache. The simulated venue fills on
 quotes only (`bar_execution=False`): with bars and quotes together it also fills a resting limit from the
 bar's earlier path (measured at the pin, ADR 0088). The ranking comes from a test component that publishes
-the `movers-rank` signal each minute, as the ranking actor will (ADR 0087): nothing of a vendor's list
+the `movers-rank` signal each minute, as the ranking actor does (ADR 0107): nothing of a vendor's list
 reaches the strategy.
 """
 
 from __future__ import annotations
 
+from collections import deque
+from dataclasses import replace
 from datetime import UTC
 from datetime import datetime
 from datetime import timedelta
@@ -23,6 +25,7 @@ from typing import cast
 
 import pytest
 from canon_alpaca.execution import sub_penny_denial
+from canon_alpaca.execution import venue_limit_price
 from nautilus_trader.backtest import BacktestEngine
 from nautilus_trader.config import BacktestEngineConfig
 from nautilus_trader.config import StrategyConfig
@@ -31,6 +34,7 @@ from nautilus_trader.model import AccountType
 from nautilus_trader.model import AggressorSide
 from nautilus_trader.model import Bar
 from nautilus_trader.model import BarType
+from nautilus_trader.model import ClientOrderId
 from nautilus_trader.model import Currency
 from nautilus_trader.model import Equity
 from nautilus_trader.model import InstrumentId
@@ -52,7 +56,10 @@ from nautilus_trader.risk import FixedRiskSizer
 from nautilus_trader.risk import RiskEngineConfig
 from nautilus_trader.trading import Strategy
 
+from canon_trading import early_entry_study as study
 from canon_trading import mover
+from canon_trading import mover_window
+from canon_trading import movers_rank
 from canon_trading.mover import EXTENDED_HOURS
 from canon_trading.mover import RANK_SIGNAL
 from canon_trading.mover import Mover
@@ -60,8 +67,13 @@ from canon_trading.mover import MoverConfig
 from canon_trading.mover import format_rank
 from canon_trading.mover import tick
 from canon_trading.mover_window import OUTER_BOUND_USD
+from canon_trading.mover_window import entry_diagnostics
 from canon_trading.mover_window import max_shares
 from canon_trading.mover_window import mover_parts
+from canon_trading.mover_window import part_slots
+from canon_trading.mover_window import window_bars
+from canon_trading.movers_rank_actor import MoversRankActorConfig
+from canon_trading.movers_rank_actor import ReferenceRead
 from canon_trading.movers_rank_signal import SIGNAL_NAME
 from canon_trading.movers_rank_signal import RankEntry
 from canon_trading.movers_rank_signal import decode_ranking
@@ -86,7 +98,9 @@ FALL = [10.46, 10.00, 9.90, 9.80]
 (10.42), and lower still."""
 
 
-def engine(*, order_cap: Decimal | None = None, liquid: bool = False) -> BacktestEngine:
+def engine(
+    *, order_cap: Decimal | None = None, liquid: bool = False, cash: Decimal = Decimal(100_000)
+) -> BacktestEngine:
     """The engine; with `order_cap`, the risk engine's per-order notional cap on AAA, as a node sets it
     (`paper_node.risk_limits`); with `liquid`, a fill takes no more than the quote's size."""
     risk = (
@@ -99,7 +113,7 @@ def engine(*, order_cap: Decimal | None = None, liquid: bool = False) -> Backtes
         VENUE,
         OmsType.NETTING,
         AccountType.CASH,
-        [Money(100_000, USD)],
+        [Money(float(cash), USD)],
         fee_model=MakerTakerFeeModel(maker_rate=Decimal(0), taker_rate=Decimal(0)),
         bar_execution=False,
         liquidity_consumption=liquid,
@@ -114,6 +128,7 @@ def engine(*, order_cap: Decimal | None = None, liquid: bool = False) -> Backtes
                 price_increment=Price.from_str("0.0001"),
                 ts_event=0,
                 ts_init=0,
+                info={"name": "Example Inc. Common Stock", "status": "active", "tradable": True},
             )
         )
     return eng
@@ -219,6 +234,7 @@ def strategy(**changes: object) -> Recording:
     settings: dict = {
         "max_notional": Decimal(50_000),
         "max_move": Decimal(5),
+        "entry_arm": "bridge",  # order-path cases; registered-arm cases select their row explicitly
         "strategy_id": MOVER_ID,
         "order_id_tag": "001",
     }
@@ -320,11 +336,14 @@ def test_the_strategy_refuses_what_the_shared_ranking_contract_refuses(bad: str)
         cast(
             Any,
             SimpleNamespace(
-                name=SIGNAL_NAME, value=encode_ranking([RankEntry(AAA, 0.25)]), ts_event=5
+                name=SIGNAL_NAME,
+                value=encode_ranking([RankEntry(AAA, 0.25)]),
+                ts_event=5,
+                ts_init=5,
             ),
         )
     )
-    s.on_signal(cast(Any, SimpleNamespace(name=SIGNAL_NAME, value=bad, ts_event=6)))
+    s.on_signal(cast(Any, SimpleNamespace(name=SIGNAL_NAME, value=bad, ts_event=6, ts_init=6)))
     assert s.rank == []
     assert s.rank_faults == 1 and s.rank_ns == 5
 
@@ -339,13 +358,36 @@ def test_a_ranking_signal_that_is_not_text_is_a_fault_not_an_error(bad: object) 
         cast(
             Any,
             SimpleNamespace(
-                name=SIGNAL_NAME, value=encode_ranking([RankEntry(AAA, 0.25)]), ts_event=5
+                name=SIGNAL_NAME,
+                value=encode_ranking([RankEntry(AAA, 0.25)]),
+                ts_event=5,
+                ts_init=5,
             ),
         )
     )
-    s.on_signal(cast(Any, SimpleNamespace(name=SIGNAL_NAME, value=bad, ts_event=6)))
+    s.on_signal(cast(Any, SimpleNamespace(name=SIGNAL_NAME, value=bad, ts_event=6, ts_init=6)))
     assert s.rank == []
     assert s.rank_faults == 1 and s.rank_ns == 5
+
+
+def test_a_malformed_ranking_counts_as_stale_not_as_a_fresh_empty_one() -> None:
+    """Review of fire-m-c, finding 7: a malformed ranking emptied the ranking but kept the last good
+    one's time, so for up to `rank_max_age_secs` the strategy took it as a fresh ranking naming nobody
+    and unwatched every idle slot, which a stale ranking never does. Until one parses it is stale."""
+    s = strategy()
+
+    def heard(value: object, at: int) -> None:
+        s.on_signal(
+            cast(Any, SimpleNamespace(name=SIGNAL_NAME, value=value, ts_event=at, ts_init=at))
+        )
+
+    heard(encode_ranking([RankEntry(AAA, 0.25)]), 5)
+    assert s._fresh(6)
+    heard("AAA.NASDAQ=0.25", 6)
+    assert not s._fresh(7)
+    assert s._refusal(cast(Any, None), None, {}, 0, 7) == "the last ranking was malformed"
+    heard(encode_ranking([RankEntry(AAA, 0.25)]), 8)
+    assert s._fresh(9)
 
 
 def test_the_ranking_signal_round_trips_and_a_malformed_one_is_refused() -> None:
@@ -354,7 +396,9 @@ def test_the_ranking_signal_round_trips_and_a_malformed_one_is_refused() -> None
     s = strategy()
 
     def hear(value: str) -> None:
-        s.on_signal(cast(Any, SimpleNamespace(name=SIGNAL_NAME, value=value, ts_event=5)))
+        s.on_signal(
+            cast(Any, SimpleNamespace(name=SIGNAL_NAME, value=value, ts_event=5, ts_init=5))
+        )
 
     hear(value)
     assert s.rank == [(AAA, Decimal("0.25")), (BBB, Decimal("0.1"))]
@@ -423,6 +467,322 @@ def test_a_setting_of_another_type_is_refused() -> None:
 
 
 # --- entry -------------------------------------------------------------------------------------------
+
+
+def entry_day(closes: list[float], normal_dollars: float = 1000.0) -> study.Day:
+    """The same generated minute bars as `tape`, with an explicit pre-watch baseline."""
+    opened = datetime.fromtimestamp(T0 / SECOND, study.NEW_YORK)
+    start = opened.hour * 60 + opened.minute
+    bars = tuple(study.Minute(start + i, c, c, c, c, 100_000.0) for i, c in enumerate(closes))
+    earlier = tuple(
+        (study.Minute(study.PART_START, 10.0, 10.0, 10.0, 10.0, normal_dollars / 10.0),)
+        for _ in range(20)
+    )
+    return study.Day("AAA", opened.date(), bars, earlier, 10.0)
+
+
+def entry_tape(closes: list[float]) -> list:
+    """A quote at the window's start lets the watch timer subscribe before the first bar closes."""
+    return [
+        QuoteTick(
+            AAA,
+            Price(9.99, 4),
+            Price(10.01, 4),
+            Quantity.from_int(10_000),
+            Quantity.from_int(10_000),
+            T0,
+            T0,
+        ),
+        *tape(AAA, closes),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("closes", "normal_dollars"),
+    [([10.0, 10.01, 10.02, 10.03, 10.04], 1000.0), ([10.4, 10.5, 10.6, 10.7, 10.8], 10_000_000.0)],
+)
+def test_the_registered_entry_needs_both_listing_thresholds(
+    closes: list[float], normal_dollars: float
+) -> None:
+    """Task M gap 5: the bridge buys even though the study never lists this name."""
+    day = entry_day(closes, normal_dollars)
+    assert study.replay(day, study.REGISTERED).entry is None
+    s = strategy()
+    # Assign the requested state after construction so the original bridge actually runs RED.
+    s.settings.entry_arm = "registered"
+    s.entry_contexts = {AAA: day}
+    orders = run(engine(), s, ranker(rank((AAA, "0.01"))), entry_tape(closes))
+    assert [o for o in orders if o.side == OrderSide.BUY] == []
+
+
+def test_a_registered_arm_without_context_refuses_entry_by_name() -> None:
+    s = strategy()
+    s.settings.entry_arm = "registered"
+    orders = run(engine(), s, ranker(rank((AAA, "0.25"))), tape(AAA, RISING))
+    assert [o for o in orders if o.side == OrderSide.BUY] == []
+    assert any("entry context" in why for why in s.dropped)
+
+
+def test_the_default_entry_arm_never_trades_without_its_listing_context() -> None:
+    eng = engine()
+    s = Recording(
+        MoverConfig(
+            max_notional=Decimal(500),
+            max_move=Decimal(100),
+            strategy_id=MOVER_ID,
+            order_id_tag="001",
+        )
+    )
+    orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, RISING))
+    eng.dispose()
+    assert not any(o.side == OrderSide.BUY for o in orders)
+    assert any("entry context" in why for why in s.dropped)
+
+
+def test_the_default_entry_arm_requires_listing_even_when_a_run_rises() -> None:
+    closes = [10.0, 10.01, 10.02, 10.03, 10.04]
+    eng = engine()
+    s = Recording(
+        MoverConfig(
+            max_notional=Decimal(500),
+            max_move=Decimal(100),
+            strategy_id=MOVER_ID,
+            order_id_tag="001",
+        )
+    )
+    s.entry_contexts[AAA] = entry_day(closes, 1000)
+    orders = run(eng, s, ranker(rank((AAA, "0.25"))), entry_tape(closes))
+    eng.dispose()
+    assert not any(o.side == OrderSide.BUY for o in orders)
+    assert any("not listed" in why for why in s.dropped)
+
+
+def test_a_registered_entry_keeps_the_qualifying_bar_receipt_for_its_diagnostic() -> None:
+    s, buys = registered_orders(entry_day(RISING, 1000), "registered", RISING)
+    assert buys
+    entry = s.entries_sent[0]
+    qualifying = next(
+        b
+        for b in tape(AAA, RISING)
+        if isinstance(b, Bar) and b.close.as_decimal() == Decimal(entry["run_close"])
+    )
+    assert entry["qualified_ns"] == qualifying.ts_init
+    assert 0 <= entry["submitted_ns"] - entry["qualified_ns"] <= SECOND
+
+
+def registered_orders(day: study.Day, arm: str, closes: list[float]) -> tuple[Recording, list]:
+    s = strategy(entry_arm=arm, protect=False, entries=1)
+    s.entry_contexts[AAA] = day
+    orders = run(engine(), s, ranker(rank((AAA, "0.25"))), entry_tape([*closes, closes[-1]]))
+    return s, [o for o in orders if o.side == OrderSide.BUY]
+
+
+@pytest.mark.parametrize(
+    ("arm", "minute"),
+    [
+        ("registered", 6),
+        ("move-2", 5),
+        ("move-5", 7),
+        ("ratio-2", 6),
+        ("ratio-5", 6),
+        ("baseline-10", 6),
+        ("baseline-20", 6),
+        ("run-1", 4),
+        ("run-2", 5),
+        ("window-15", 6),
+        ("window-60", 6),
+        ("quiet-10", 6),
+        ("quiet-25", 6),
+        ("window-15-pullback", 6),
+        ("quiet-10-pullback", 6),
+    ],
+)
+def test_each_registered_arm_agrees_with_the_study_on_the_same_bars(arm: str, minute: int) -> None:
+    """Literal minutes catch listing-before-run and run-length drift, not just equal implementations."""
+    closes = [10.1, 10.2, 10.4, 10.5, 10.6, 10.7, 10.8, 10.9]
+    day = entry_day(closes)
+    replay = study.replay(day, study.ARMS[arm])
+    assert replay.entry_minute == day.bars[0].start + minute
+    s, buys = registered_orders(day, arm, closes)
+    assert len(buys) == 1
+    assert (buys[0].ts_init - T0) // MINUTE == minute
+    assert buys[0].price.as_decimal() == Decimal(str(closes[minute - 1])) + Decimal("0.01")
+    assert s.record()["rows"]["entry_arm"] == arm
+
+
+@pytest.mark.parametrize("internal", [False, True])
+def test_the_registered_clock_uses_the_minute_open_not_bar_receipt_time(internal: bool) -> None:
+    """External streamed bars can arrive late; internal time bars stamp their close at this pin."""
+    closes = [10.1, 10.2, 10.4, 10.5, 10.6, 10.7, 10.8, 10.9]
+    day = entry_day(closes)
+    s = strategy(
+        entry_arm="registered",
+        protect=False,
+        entries=1,
+        bar_spec=f"1-MINUTE-LAST-{'INTERNAL' if internal else 'EXTERNAL'}",
+    )
+    s.entry_contexts[AAA] = replace(day, bars=())
+    data = [entry_tape(closes)[0], *trade_tape(AAA, closes)] if internal else entry_tape(closes)
+    if not internal:
+        data = [
+            Bar(
+                item.bar_type,
+                item.open,
+                item.high,
+                item.low,
+                item.close,
+                item.volume,
+                item.ts_event,
+                item.ts_init + 123_000_000,
+            )
+            if isinstance(item, Bar)
+            else item
+            for item in data
+        ]
+    orders = run(engine(), s, ranker(rank((AAA, "0.25"))), data)
+    buys = [o for o in orders if o.side == OrderSide.BUY]
+    assert len(buys) == 1 and (buys[0].ts_init - T0) // MINUTE == 6
+    assert s.entry_contexts[AAA].bars[0].start == day.bars[0].start + int(internal)
+
+
+@pytest.mark.parametrize(("arm", "minute"), [("ratio-2", 6), ("registered", 8), ("ratio-5", 11)])
+def test_an_arms_ratio_uses_cumulative_dollars_since_four_am(arm: str, minute: int) -> None:
+    closes = [10.1, 10.2, 10.4, 10.5, 10.6, 10.7, 10.8, 10.9, 11.0, 11.1, 11.2]
+    day = entry_day(closes, normal_dollars=1_500_000.0)
+    assert study.replay(day, study.ARMS[arm]).entry_minute == day.bars[0].start + minute
+    _, buys = registered_orders(day, arm, closes)
+    assert len(buys) == 1 and (buys[0].ts_init - T0) // MINUTE == minute
+
+
+@pytest.mark.parametrize("arm", ["baseline-10", "baseline-20"])
+def test_baseline_arms_take_their_registered_number_of_earlier_sessions(arm: str) -> None:
+    closes = [10.4, 10.5, 10.6, 10.7, 10.8, 10.9]
+    day = entry_day(closes)
+    busy = entry_day(closes, normal_dollars=20_000_000.0).earlier
+    day = replace(day, earlier=(*day.earlier[:5], *busy[5:]))
+    assert study.replay(day, study.REGISTERED).entry_minute == day.bars[0].start + 4
+    assert study.replay(day, study.ARMS[arm]).entry is None
+    _, buys = registered_orders(day, arm, closes)
+    assert buys == []
+
+
+@pytest.mark.parametrize(
+    ("closes", "arm", "minute"),
+    [
+        ([10.4] * 17 + [10.5, 10.6, 10.7, 10.8], "window-15", None),
+        ([10.4] * 17 + [10.5, 10.6, 10.7, 10.8], "window-60", 20),
+        ([10.4] * 17 + [10.5, 10.6, 10.7, 10.8], "window-15-pullback", None),
+        ([10.4] * 16 + [11.5, 10.4, 10.5, 10.6, 10.7, 10.8], "window-15", None),
+        ([10.4] * 16 + [11.5, 10.4, 10.5, 10.6, 10.7, 10.8], "window-15-pullback", 21),
+        ([10.0] * 30 + [10.4, 10.8, 11.2, 11.6, 11.7], "quiet-10", None),
+        ([10.0] * 30 + [10.4, 10.8, 11.2, 11.6, 11.7], "quiet-25", 34),
+        ([10.0] * 30 + [10.4, 10.8, 11.2, 11.6, 11.7], "quiet-10-pullback", None),
+        ([10.0] * 30 + [13.0, 11.5, 11.6, 11.7, 11.8, 11.9], "quiet-10", None),
+        ([10.0] * 30 + [13.0, 11.5, 11.6, 11.7, 11.8, 11.9], "quiet-10-pullback", 35),
+    ],
+)
+def test_registered_extension_arms_agree_with_the_study(
+    closes: list[float], arm: str, minute: int | None
+) -> None:
+    day = entry_day(closes)
+    assert study.replay(day, study.ARMS[arm]).entry_minute == (
+        None if minute is None else day.bars[0].start + minute
+    )
+    s, buys = registered_orders(day, arm, closes)
+    if minute is None:
+        assert buys == []
+        assert any("extended" in why for why in s.dropped)
+    else:
+        assert len(buys) == 1 and (buys[0].ts_init - T0) // MINUTE == minute
+
+
+def test_an_unlisted_bar_clears_the_registered_run() -> None:
+    closes = [10.4, 10.5, 10.2, 10.4, 10.5, 10.6, 10.7, 10.8]
+    day = entry_day(closes)
+    assert study.replay(day, study.REGISTERED).entry_minute == day.bars[0].start + 7
+    _, buys = registered_orders(day, "registered", closes)
+    assert len(buys) == 1 and (buys[0].ts_init - T0) // MINUTE == 7
+
+
+def test_pre_watch_history_sets_the_original_listing_clock_but_never_warms_a_run() -> None:
+    closes = [10.7, 10.8, 10.9, 11.0, 11.1]
+    day = entry_day(closes)
+    history = (
+        study.Minute(study.PART_START, 10.4, 10.4, 10.4, 10.4, 100_000.0),
+        study.Minute(day.bars[0].start - 2, 10.5, 10.5, 10.5, 10.5, 100_000.0),
+        study.Minute(day.bars[0].start - 1, 10.6, 10.6, 10.6, 10.6, 100_000.0),
+    )
+    day = replace(day, bars=(*history, *day.bars))
+    _, buys = registered_orders(day, "window-15", closes)
+    assert buys == []  # already listed at 04:01, not when this watch began
+    _, buys = registered_orders(day, "registered", closes)
+    assert len(buys) == 1 and (buys[0].ts_init - T0) // MINUTE == 4
+
+
+@pytest.mark.parametrize(
+    ("changes", "why"),
+    [
+        ({"symbol": "BBB"}, "another symbol"),
+        ({"day": datetime(2025, 11, 7).date()}, "New York day"),
+        ({"missing": "incomplete coverage"}, "incomplete coverage"),
+        ({"covered_to": study.PART_START + 1}, "coverage"),
+        ({"reference": None}, "not listed"),
+        ({"earlier": ()}, "volume ratio unknown"),
+    ],
+)
+def test_a_registered_arm_refuses_unusable_context(changes: dict, why: str) -> None:
+    day = replace(entry_day(RISING), **changes)
+    s, buys = registered_orders(day, "registered", RISING)
+    assert buys == []
+    assert any(why in dropped for dropped in s.dropped)
+
+
+def test_a_new_day_context_starts_a_new_watch_clock() -> None:
+    """Replacing yesterday's context must not keep yesterday afternoon's minute as today's start."""
+    closes = [10.4, 10.5, 10.6, 10.7, 10.8]
+    day = entry_day(closes)
+    old_day = replace(day, day=day.day - timedelta(days=1), bars=())
+    slot = mover.Slot(AAA, bar_type(AAA), deque(), deque())
+    stand_in: Any = SimpleNamespace(
+        settings=SimpleNamespace(entry_arm="registered"),
+        entry_contexts={AAA: old_day},
+        _note=lambda _slot, _why: None,
+        _say=lambda _text: None,
+    )
+    first = next(item for item in entry_tape(closes) if isinstance(item, Bar))
+    yesterday = T0 - 24 * 60 * MINUTE + 4 * 60 * MINUTE
+    Mover._registered_run(
+        stand_in,
+        slot,
+        Bar(
+            first.bar_type,
+            first.open,
+            first.high,
+            first.low,
+            first.close,
+            first.volume,
+            yesterday,
+            yesterday + MINUTE,
+        ),
+    )
+    stand_in.entry_contexts[AAA] = day
+    for item in entry_tape(closes):
+        if isinstance(item, Bar):
+            Mover._registered_run(stand_in, slot, item)
+    assert slot.run_ns == T0 + 4 * MINUTE
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"entry_arm": "unregistered"},
+        {"entry_arm": "registered", "run_bars": 4},
+        {"entry_arm": "registered", "bar_spec": "5-MINUTE-LAST-EXTERNAL"},
+    ],
+)
+def test_registered_arms_refuse_unregistered_rules(changes: dict) -> None:
+    with pytest.raises(ValueError):
+        strategy(**changes)
 
 
 def test_with_no_ranking_nothing_is_watched_and_nothing_is_sent() -> None:
@@ -542,6 +902,589 @@ def test_two_slots_take_both() -> None:
     assert bought == [BBB, AAA]
 
 
+def test_budget_composition_does_not_freeze_a_global_share_cap_at_the_initial_price():
+    strategy, _ = mover_window.mover_universe_parts(
+        {AAA: Decimal(20)},
+        extended=False,
+        feed="sip",
+        wind_down_at=at(T0 + 20 * MINUTE),
+        market_exit_interval_ms=1000,
+        market_exit_max_attempts=60,
+        slots=1,
+        entry_notional=Decimal(1000),
+        size_from_budget=True,
+    )
+    assert strategy.settings.max_shares is None
+    assert strategy.settings.share_caps == {AAA: 50}
+
+
+def test_a_budget_entry_after_a_30_percent_price_fall_is_clamped_to_its_start_time_cap():
+    """ultra-3a8613a/14, the lead's change of 2026-11-12: price drift must not trip the guard. An entry
+    is sized min(budget / price, start-time cap), recorded as `cap_bound` when the cap binds, and the
+    name's share cap and its monitor's cap stay at the start-time bound."""
+    start = Decimal("14.30")  # the name's price when the window chose it; the tape trades 30% under
+    (cap,) = mover_window.mover_position_caps({AAA: start}, Decimal(10_000))
+    start_cap = int(cap.max_position)
+    eng = engine(order_cap=Decimal(100_000))
+    s = strategy(
+        max_notional=Decimal(10_000),
+        share_caps={AAA: start_cap},
+        risk=Decimal("0.00000001"),
+        flow_share=Decimal(1),  # wide, so the budget and the cap are what bind
+        protect=False,
+    )
+    s.settings.size_from_budget = True
+    s.position_caps = {AAA: cap}
+    eng.add_strategy(cap)
+    orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, RISING))
+    buys = [order for order in orders if order.side == OrderSide.BUY]
+    eng.dispose()
+    assert len(buys) == 1
+    assert Decimal(10_000) // buys[0].price.as_decimal() > start_cap, "the budget alone buys more"
+    assert buys[0].filled_qty.as_decimal() == start_cap
+    assert s.entries_sent[0]["sizing"]["binding"] == "cap_bound"
+    assert s.settings.share_caps == {AAA: start_cap}
+    assert cap.max_position == start_cap and cap.tripped is None
+
+
+@pytest.mark.parametrize("clamped", [True, False])
+def test_a_forced_20x_sizing_fault_is_clamped_and_trips_the_monitor_if_it_gets_past(clamped):
+    """ultra-3a8613a/14: a sizing fault twenty times the start figure is clamped to the start-time cap;
+    with no share cap to clamp it, it reaches the venue and the monitor, whose cap was not rewritten,
+    trips."""
+    (cap,) = mover_window.mover_position_caps({AAA: Decimal(10)}, Decimal(1_000))
+    start_cap = int(cap.max_position)
+    eng = engine(order_cap=Decimal(100_000))
+    s = strategy(
+        max_notional=Decimal(
+            20_000
+        ),  # the fault: twenty times the 1000 USD the window started with
+        share_caps={AAA: start_cap} if clamped else None,
+        risk=Decimal("0.00000001"),
+        flow_share=Decimal(1),
+        protect=False,
+    )
+    s.settings.size_from_budget = True
+    s.position_caps = {AAA: cap}
+    eng.add_strategy(cap)
+    orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, RISING))
+    buys = [order for order in orders if order.side == OrderSide.BUY]
+    eng.dispose()
+    assert buys and cap.max_position == start_cap
+    if clamped:
+        assert buys[0].quantity.as_decimal() == start_cap and cap.tripped is None
+    else:
+        assert buys[0].quantity.as_decimal() > 10 * start_cap
+        assert cap.tripped is not None
+
+
+def test_a_budget_entry_after_a_loss_fits_the_remaining_free_cash():
+    eng = engine(cash=Decimal(1000))
+    s = strategy(
+        max_notional=Decimal(1000),
+        size_from_budget=True,
+        entries=2,
+        cooldown_secs=0,
+    )
+    closes = [*RISING[:5], 10.1, 10.0, 9.9, 9.8, *RECLAIM, 10.8]
+    orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, closes))
+    eng.dispose()
+    assert not any("NOTIONAL_EXCEEDS_FREE_BALANCE" in reason for _, reason in s.refused), s.refused
+    bought = [
+        order for order in orders if order.side == OrderSide.BUY and order.filled_qty.is_positive()
+    ]
+    assert len(bought) == 2
+    assert bought[1].filled_qty.as_decimal() < Decimal(1000) // bought[1].price.as_decimal()
+
+
+def test_two_entries_sent_in_one_step_share_the_free_cash_neither_has_locked_yet():
+    """Review of fire-m-c, finding 6: entries sent in the same step were each sized from the same free
+    cash, since the account locks an entry's cash only once the venue takes it, so the second was
+    denied for exceeding the free balance and its run was lost. An entry not yet taken is now counted
+    against the free cash the next one is sized from."""
+    eng = engine(cash=Decimal(1500))
+    s = strategy(
+        max_notional=Decimal(1000),
+        size_from_budget=True,
+        slots=2,
+        watch=2,
+        flow_share=Decimal(1),
+        protect=False,
+    )
+    orders = run(
+        eng, s, ranker(rank((BBB, "0.4"), (AAA, "0.25"))), tape(AAA, RISING), tape(BBB, RISING)
+    )
+    buys = [order for order in orders if order.side == OrderSide.BUY]
+    eng.dispose()
+    assert not s.refused, s.refused
+    assert [o.instrument_id for o in buys[:2]] == [BBB, AAA]
+    first, second = (o.quantity.as_decimal() * o.price.as_decimal() for o in buys[:2])
+    assert first + second <= Decimal(1500)
+    assert Decimal(s.entries_sent[1]["sizing"]["unlocked_entries"]) == first
+
+
+def test_budget_sizing_preserves_the_configured_global_share_cap_for_each_slot():
+    eng = engine()
+    s = strategy(
+        slots=2,
+        watch=2,
+        max_notional=Decimal(10_000),
+        max_shares=7,
+        size_from_budget=True,
+        protect=False,
+    )
+    orders = run(
+        eng,
+        s,
+        ranker(rank((AAA, "0.25"), (BBB, "0.3"))),
+        tape(AAA, RISING),
+        tape(BBB, [price + 10 for price in RISING]),
+    )
+    eng.dispose()
+    bought = [order for order in orders if order.side == OrderSide.BUY]
+    assert s.settings.max_shares == 7
+    assert [order.filled_qty.as_decimal() for order in bought] == [Decimal(7), Decimal(7)]
+
+
+def test_the_cash_engines_funding_limit_is_explicit_in_a_buying_power_allocation():
+    from alpaca.trading.models import TradeAccount
+
+    from canon_trading import session_window
+
+    account = TradeAccount.model_validate(
+        {
+            "id": "00000000-0000-0000-0000-000000000001",
+            "account_number": "OFFLINE",
+            "status": "ACTIVE",
+            "cash": "100",
+            "buying_power": "200",
+        }
+    )
+    allocation = session_window.mover_allocation(
+        cast(Any, SimpleNamespace(get_account=lambda: account)), 1
+    )
+    eng = engine(cash=Decimal(100), order_cap=allocation.entry_notional * 10)
+    s = strategy(max_notional=allocation.entry_notional, size_from_budget=True, protect=False)
+    orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, RISING))
+    buys = [order for order in orders if order.side == OrderSide.BUY]
+    eng.dispose()
+    assert buys and buys[0].status.name == "FILLED", s.refused
+    assert allocation.entry_notional == Decimal(100)
+    assert allocation.record()["engine_cash_limit"] == "100"
+
+
+def test_the_record_keeps_every_opened_slot_even_after_unwatching():
+    eng = engine()
+    s = strategy(slots=1, watch=1)
+    run(
+        eng,
+        s,
+        ranker(rank((AAA, "0.25")), values={3: rank((BBB, "0.3")), 6: ""}),
+        tape(AAA, [10.0] * 9),
+        tape(BBB, [20.0] * 9),
+    )
+    eng.dispose()
+    assert not s.slots
+    assert s.record()["opened_slots"] == ["AAA.ALPACA", "BBB.ALPACA"]
+
+
+def test_each_name_uses_its_own_share_cap_under_the_entry_notional_bound() -> None:
+    eng = engine(order_cap=OUTER_BOUND_USD)
+    s = strategy(
+        slots=2,
+        watch=2,
+        max_notional=Decimal(500),
+        share_caps={AAA: 7, BBB: 13},
+    )
+    orders = run(
+        eng, s, ranker(rank((BBB, "0.4"), (AAA, "0.25"))), tape(AAA, RISING), tape(BBB, RISING)
+    )
+    buys = {o.instrument_id: o for o in orders if o.side == OrderSide.BUY}
+    eng.dispose()
+    assert {i: o.filled_qty.as_decimal() for i, o in buys.items()} == {
+        AAA: Decimal(7),
+        BBB: Decimal(13),
+    }
+    assert all(o.quantity.as_decimal() * o.price.as_decimal() <= 500 for o in buys.values())
+
+
+def test_a_global_share_cap_can_tighten_each_names_own_cap() -> None:
+    eng = engine()
+    s = strategy(slots=2, watch=2, max_shares=5, share_caps={AAA: 7, BBB: 3})
+    orders = run(
+        eng, s, ranker(rank((BBB, "0.4"), (AAA, "0.25"))), tape(AAA, RISING), tape(BBB, RISING)
+    )
+    buys = {o.instrument_id: o.filled_qty.as_decimal() for o in orders if o.side == OrderSide.BUY}
+    eng.dispose()
+    assert buys == {AAA: Decimal(5), BBB: Decimal(3)}
+
+
+def test_a_ranked_name_without_a_window_share_cap_cannot_enter() -> None:
+    eng = engine()
+    s = strategy(share_caps={AAA: 7})
+    orders = run(eng, s, ranker(rank((BBB, "0.4"))), tape(BBB, RISING))
+    eng.dispose()
+    assert not any(o.side == OrderSide.BUY for o in orders)
+    assert any("no share cap" in why for why in s.dropped)
+
+
+@pytest.mark.parametrize("caps", [{AAA: 0}, {AAA: -1}, {AAA: True}, {AAA: 1.5}, {"AAA": 7}])
+def test_a_names_share_cap_requires_an_instrument_and_positive_whole_shares(caps) -> None:
+    with pytest.raises(
+        ValueError, match="share_caps must map instrument IDs to positive whole shares"
+    ):
+        strategy(share_caps=caps)
+
+
+def test_each_window_name_has_an_independent_position_cap_in_the_same_node() -> None:
+    eng = engine(order_cap=OUTER_BOUND_USD)
+    caps = mover_window.mover_position_caps({AAA: Decimal(10), BBB: Decimal(20)})
+    s = strategy(slots=2, watch=2, max_notional=Decimal(500), share_caps={AAA: 50, BBB: 25})
+    for cap in caps:
+        eng.add_strategy(cap)
+    orders = run(
+        eng,
+        s,
+        ranker(rank((BBB, "0.4"), (AAA, "0.25"))),
+        tape(AAA, RISING),
+        tape(BBB, [2 * close for close in RISING]),
+    )
+    quantities = {
+        o.instrument_id: o.filled_qty.as_decimal() for o in orders if o.side == OrderSide.BUY
+    }
+    eng.dispose()
+    assert quantities == {AAA: Decimal(48), BBB: Decimal(24)}
+    assert [cap.max_position for cap in caps] == [Decimal(50), Decimal(25)]
+    assert all(cap.checks > 1 and cap.tripped is None for cap in caps)
+
+
+def test_the_second_names_position_cap_stops_an_oversized_position() -> None:
+    eng = engine()
+    caps = mover_window.mover_position_caps({AAA: Decimal(10), BBB: Decimal(20)})
+    s = strategy(share_caps={BBB: 30})
+    for cap in caps:
+        eng.add_strategy(cap)
+    run(eng, s, ranker(rank((BBB, "0.4"))), tape(BBB, [2 * close for close in RISING]))
+    eng.dispose()
+    assert caps[0].tripped is None
+    assert caps[1].tripped == "net position 30 in BBB.ALPACA is over the cap of 25"
+
+
+def test_the_multiname_window_parts_trade_both_names_with_the_registered_arm() -> None:
+    eng = engine(order_cap=OUTER_BOUND_USD)
+    bbb_closes = [2 * close for close in RISING]
+    s, caps = mover_window.mover_universe_parts(
+        {AAA: Decimal(10), BBB: Decimal(20)},
+        extended=False,
+        feed="sip",
+        wind_down_at=at(T0 + 10 * MINUTE),
+        market_exit_interval_ms=1000,
+        market_exit_max_attempts=60,
+        slots=2,
+        bar_spec="1-MINUTE-LAST-EXTERNAL",
+        entry_contexts={
+            AAA: entry_day(RISING, 1000),
+            BBB: replace(entry_day(bbb_closes, 1000), symbol="BBB", reference=20.0),
+        },
+    )
+    for cap in caps:
+        eng.add_strategy(cap)
+    orders = run(
+        eng,
+        s,
+        ranker(rank((AAA, "0.25"), (BBB, "0.4"))),
+        entry_tape(RISING),
+        tape(BBB, bbb_closes),
+    )
+    eng.dispose()
+    buys = {o.instrument_id: o for o in orders if o.side == OrderSide.BUY}
+    assert set(buys) == {AAA, BBB}
+    assert s.settings.entry_arm == "registered" and s.settings.entries is None
+    assert s.settings.share_caps == {AAA: 50, BBB: 25}
+    assert s.settings.rank_max_age_secs == 90
+    assert all(o.quantity.as_decimal() * o.price.as_decimal() <= 500 for o in buys.values())
+    assert all(cap.checks > 0 and cap.tripped is None for cap in caps)
+
+
+def test_every_published_rerank_keeps_its_value_and_both_clocks_in_the_record() -> None:
+    eng = engine()
+    s = strategy()
+    first, second = rank((AAA, "0.25")), rank((BBB, "0.4"), (AAA, "0.25"))
+    run(eng, s, ranker(first, until_minute=2, values={2: second}), tape(AAA, RISING))
+    rankings = s.record()["rankings"]
+    eng.dispose()
+    assert [r["value"] for r in rankings] == [first, first, second]
+    assert all(r["received_ns"] >= r["computed_ns"] > 0 for r in rankings)
+
+
+def live_ranking(tmp_path, records, *, baseline: str = "valid"):
+    session = at(T0).astimezone(study.NEW_YORK).date()
+    previous = session - timedelta(days=3)
+    path = tmp_path / "sip.json"
+    if baseline != "missing":
+        movers_rank.write_baselines(
+            path,
+            session if baseline == "valid" else previous,
+            {
+                # established in every segment (ADR 0087): five earlier sessions, a trade in each
+                symbol: movers_rank.Baseline(
+                    cumulative=tuple(1000.0 * (i + 1) for i in range(movers_rank.SEGMENTS)),
+                    sessions=tuple(
+                        previous - timedelta(days=d)
+                        for d in reversed(range(movers_rank.BASELINE_SESSIONS))
+                    ),
+                    traded_sessions=(movers_rank.BASELINE_SESSIONS,) * movers_rank.SEGMENTS,
+                )
+                for symbol in ("AAA", "BBB")
+            },
+        )
+
+    def references(symbols, cutoff, session):
+        return ReferenceRead(
+            cutoff,
+            {symbol: movers_rank.Reference(10.0, previous) for symbol in symbols},
+            movers_rank.SplitRead(previous, session, ()),
+            T0,
+        )
+
+    return mover_window.window_rank(
+        MoversRankActorConfig(
+            feed="sip",
+            order_cap=500.0,
+            baseline_path=str(path),
+            reference_reader=references,
+            inline_reads=True,
+        ),
+        records,
+    )
+
+
+def test_the_actor_reranks_the_loaded_roster_and_a_freed_slot_rotates(tmp_path) -> None:
+    eng = engine(order_cap=OUTER_BOUND_USD)
+    aaa = [*RISING, *FALL, *[9.8] * 12]
+    bbb = [*[10.0] * 13, *[10.0 + 0.1 * i for i in range(1, 9)], *[10.8] * 3]
+    s, caps = mover_window.mover_universe_parts(
+        {AAA: Decimal(10), BBB: Decimal(10)},
+        extended=False,
+        feed="sip",
+        wind_down_at=at(T0 + 22 * MINUTE),
+        market_exit_interval_ms=1000,
+        market_exit_max_attempts=60,
+        slots=1,
+        bar_spec="1-MINUTE-LAST-EXTERNAL",
+        entry_contexts={
+            AAA: replace(entry_day(aaa, 1000), bars=(), covered_to=660),
+            BBB: replace(entry_day(bbb, 1000), symbol="BBB", bars=(), covered_to=660),
+        },
+    )
+    ranking = live_ranking(tmp_path, s.ranking_records)
+    eng.add_strategy(s)
+    eng.add_actor(ranking)
+    for context_feed in mover_window.mover_context_feeds(s, "sip"):
+        eng.add_actor(context_feed)
+    for cap in caps:
+        eng.add_strategy(cap)
+    eng.add_data(tape(AAA, aaa))
+    eng.add_data(tape(BBB, bbb))
+    eng.run()
+    buys = sorted(
+        (o for o in eng.cache.orders(strategy_id=MOVER_ID) if o.side == OrderSide.BUY),
+        key=lambda o: o.init_event.ts_init,
+    )
+    flat = not eng.cache.positions_open(strategy_id=MOVER_ID)
+    eng.dispose()
+    assert [o.instrument_id for o in buys] == [AAA, BBB], s.dropped
+    assert any(
+        str(r["value"]).startswith("AAA.ALPACA") for r in s.ranking_records if r["published"]
+    )
+    assert any(
+        str(r["value"]).startswith("BBB.ALPACA") for r in s.ranking_records if r["published"]
+    )
+    assert len(s.ranking_records) > 2 and len(s.rankings) > 2
+    assert flat and all(cap.tripped is None for cap in caps)
+
+
+@pytest.mark.parametrize("failed", ["never", "always", "once"])
+def test_startup_context_gaps_use_the_nodes_history_and_a_failed_read_is_retried(
+    monkeypatch, failed
+) -> None:
+    """ultra-3a8613a/5, the lead's ruling of 2026-11-12: a failed native history read leaves the
+    name's coverage unchanged and is asked again at the next refresh, so one 5xx, timeout or 429
+    does not take the name out of registered-arm entries for the rest of the window; while it keeps
+    failing, an entry is refused as not covered, and it is asked again once a minute, not each tick."""
+    eng = engine()
+    s = strategy(entry_arm="registered", protect=False, entries=1)
+    s.entry_contexts[AAA] = replace(entry_day(RISING, 1000), bars=(), covered_to=659)
+    (context_feed,) = mover_window.mover_context_feeds(s, "sip")
+    requests: list = []
+
+    def history(bar_type, **kwargs):
+        requests.append((str(bar_type), kwargs))
+        fails = failed == "always" or (failed == "once" and len(requests) == 1)
+        context_feed.on_data_response(
+            cast(
+                Any,
+                SimpleNamespace(completed=True, failure_reason="history failed" if fails else None),
+            )
+        )
+        return "context-request"
+
+    monkeypatch.setattr(context_feed, "request_bars", history)
+    eng.add_actor(context_feed)
+    orders = run(eng, s, ranker(rank((AAA, "0.25"))), entry_tape(RISING))
+    eng.dispose()
+    bar_type, request = requests[0]
+    assert bar_type == "AAA.ALPACA-1-MINUTE-LAST-EXTERNAL"
+    assert request["params"] == {"feed": "sip"}
+    assert request["start"] == at(T0 - MINUTE)
+    assert request["end"] == at(T0)
+    buys = [o for o in orders if o.side == OrderSide.BUY]
+    context = s.record()["entry_contexts"][str(AAA)]
+    assert context["missing"] is None
+    if failed == "never":
+        assert len(requests) == 1 and buys
+    elif failed == "once":
+        assert len(requests) == 2 and buys
+        assert requests[1][1]["start"] == at(T0 - MINUTE), "coverage moved on a failed read"
+    else:
+        assert len(requests) > 2 and not buys
+        ends = [r[1]["end"] for r in requests]
+        assert len(set(ends)) == len(ends), "a failed read was asked again inside one minute"
+        assert any("coverage does not reach" in why for why in s.dropped)
+    if buys:
+        assert context["covered_to"] >= 668
+
+
+@pytest.mark.parametrize("baseline", ["missing", "other-session"])
+def test_without_a_current_baseline_the_actor_records_the_problem_and_never_substitutes_a_rank(
+    tmp_path, baseline
+) -> None:
+    eng = engine()
+    s = strategy()
+    ranking = live_ranking(tmp_path, s.ranking_records, baseline=baseline)
+    eng.add_strategy(s)
+    eng.add_actor(ranking)
+    eng.add_data(tape(AAA, RISING))
+    eng.run()
+    orders = eng.cache.orders(strategy_id=MOVER_ID)
+    eng.dispose()
+    assert not orders and s.rankings == []
+    assert s.ranking_records and not any(r["published"] for r in s.ranking_records)
+    assert any("baseline" in str(r["reasons"]) for r in s.ranking_records)
+
+
+def test_an_unranked_names_context_is_refreshed_by_time_without_external_bars(monkeypatch) -> None:
+    closes = [10.0 + i / 10 for i in range(16)]
+    history = [item for item in tape(AAA, closes) if isinstance(item, Bar)]
+    eng = engine()
+    s = strategy(
+        entry_arm="registered", bar_spec="1-MINUTE-LAST-INTERNAL", protect=False, entries=1
+    )
+    s.entry_contexts[AAA] = replace(entry_day(closes, 1000), bars=(), covered_to=660)
+    (context_feed,) = mover_window.mover_context_feeds(s, "sip")
+    requested: list = []
+
+    def read(bar_type, **kwargs):
+        requested.append(kwargs)
+        context_feed.on_historical_bars(
+            [bar for bar in history if kwargs["start"] <= at(bar.ts_event) < kwargs["end"]]
+        )
+        context_feed.on_data_response(
+            cast(Any, SimpleNamespace(completed=True, failure_reason=None))
+        )
+        return "context-request"
+
+    monkeypatch.setattr(context_feed, "request_bars", read)
+    eng.add_actor(context_feed)
+    orders = run(eng, s, ranker("", values={5: rank((AAA, "0.25"))}), trade_tape(AAA, closes))
+    eng.dispose()
+    assert any(o.side == OrderSide.BUY for o in orders), s.dropped
+    ends = [request["end"] for request in requested]
+    assert len(ends) >= 5 and len(ends) == len(set(ends))
+    assert sum(end <= at(T0 + 5 * MINUTE) for end in ends) == 5
+    assert all(request["end"] - request["start"] <= timedelta(minutes=1) for request in requested)
+
+
+@pytest.mark.parametrize("has_history", [True, False])
+def test_a_mid_minute_subscription_never_replaces_context_with_a_partial_bar(has_history):
+    eng = engine()
+    s = strategy(entry_arm="registered", bar_spec="1-MINUTE-LAST-INTERNAL", protect=False)
+    original = study.Minute(660, 10.0, 11.0, 9.0, 10.2, 123_456.0)
+    s.entry_contexts[AAA] = replace(
+        entry_day([10.2]),
+        bars=(original,) if has_history else (),
+        covered_to=661 if has_history else 660,
+    )
+    quote = QuoteTick(
+        AAA,
+        Price(10.39, 4),
+        Price(10.41, 4),
+        Quantity.from_int(10000),
+        Quantity.from_int(10000),
+        T0 + MINUTE // 2,
+        T0 + MINUTE // 2,
+    )
+    tail = QuoteTick(
+        AAA,
+        Price(10.39, 4),
+        Price(10.41, 4),
+        Quantity.from_int(10000),
+        Quantity.from_int(10000),
+        T0 + MINUTE + SECOND,
+        T0 + MINUTE + SECOND,
+    )
+    run(eng, s, ranker(rank((AAA, "0.25"))), [quote, *trade_tape(AAA, [10.4]), tail])
+    eng.dispose()
+    known = {bar.start: bar for bar in s.entry_contexts[AAA].bars}
+    if has_history:
+        assert known[660] == original
+    else:
+        assert 660 not in known
+
+
+def test_a_registered_watch_starts_at_the_first_full_minute_after_subscription():
+    closes = [10.1, 10.2, 10.3, 10.4, 10.5, 10.6]
+    eng = engine()
+    s = strategy(
+        entry_arm="registered", bar_spec="1-MINUTE-LAST-INTERNAL", protect=False, entries=1
+    )
+    context = entry_day(closes)
+    s.entry_contexts[AAA] = replace(context, reference=9.0, bars=context.bars[:1], covered_to=661)
+    orders = run(
+        eng,
+        s,
+        ranker(rank((AAA, "0.25"))),
+        [quote(30, 10.09, 10.11), *trade_tape(AAA, closes)],
+    )
+    eng.dispose()
+    assert s.slots[AAA].entry_start == 661
+    buys = [order for order in orders if order.side == OrderSide.BUY]
+    assert buys and (buys[0].init_event.ts_init - T0) // MINUTE == 5
+
+
+@pytest.mark.parametrize("arm", ["bridge", "registered"])
+def test_a_partial_internal_bar_never_counts_as_a_watched_close_or_flow(arm):
+    closes = [10.1, 10.2, 10.3, 10.4, 10.5, 10.6]
+    eng = engine()
+    s = strategy(entry_arm=arm, bar_spec="1-MINUTE-LAST-INTERNAL", protect=False, entries=1)
+    context = entry_day(closes)
+    s.entry_contexts[AAA] = replace(context, reference=9.0, bars=context.bars[:1], covered_to=661)
+    orders = run(
+        eng,
+        s,
+        ranker(rank((AAA, "0.25"))),
+        [quote(30, 10.09, 10.11), *trade_tape(AAA, closes)],
+    )
+    eng.dispose()
+    assert s.live_bars == 4
+    assert len(s.slots[AAA].dollars) == 4
+    assert sum(s.slots[AAA].dollars) == Decimal(100_000) * sum(
+        map(Decimal, ("10.2", "10.3", "10.4", "10.5"))
+    )
+    buys = [order for order in orders if order.side == OrderSide.BUY]
+    assert buys and (buys[0].init_event.ts_init - T0) // MINUTE == 5
+
+
 def test_an_entry_not_filled_in_time_is_canceled(monkeypatch) -> None:
     monkeypatch.setattr(mover, "entry_price", lambda ask, ticks: ask - 1)  # far below the market
     eng = engine()
@@ -620,6 +1563,32 @@ def test_a_release_that_rests_is_chased_down_to_the_bid_but_not_below_its_cap() 
     eng.dispose()
     assert facts == ("LIMIT", "CANCELED", Decimal("10.22"))
     assert count == 3
+
+
+def test_a_resting_sale_is_not_chased_at_the_soft_line_and_its_release_still_goes(
+    monkeypatch,
+) -> None:
+    """The lead's backstop of 2026-11-11: near the request ceiling the node stops chases as it stops
+    entries, and lets exits and cancels through. Once the sale is released the adapter's count of the
+    last 60 seconds is over the soft line: the released limit (10.42) is sent and rests above the bid,
+    and it is never canceled and sent again lower, until the run's stop cancels it."""
+    total = {"n": 0}
+    s = strategy(chase_secs=5)
+
+    def counted() -> int:
+        if any(slot.exiting for slot in s.slots.values()):
+            total["n"] += 1000  # a thousand a step once the sale is out: over any line
+        return total["n"]
+
+    monkeypatch.setattr(mover, "requests_sent", counted)
+    eng = engine()
+    orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, [*RISING, 10.30, 10.30]))
+    summary = sides(orders)
+    sale = orders[-1].price.as_decimal()
+    eng.dispose()
+    assert summary == ["BUY LIMIT FILLED", "SELL LIMIT CANCELED"]
+    assert sale == Decimal("10.42")
+    assert any("not chased" in reason for reason in s.dropped), s.dropped
 
 
 def test_a_chase_inside_the_cap_follows_the_bid_and_fills() -> None:
@@ -953,7 +1922,29 @@ def test_a_trailing_sell_made_under_a_dollar_releases_a_price_alpaca_takes_over_
     assert mover.exit_price(Decimal("10.29"), 1, None) == Decimal("10.28")
 
 
-# --- findings of the review before landing (`/code-review`, 2026-11-11) --------------------------------
+def test_a_fractional_cent_bid_never_releases_a_sub_penny_limit_above_one_dollar() -> None:
+    """The coordinator's cross-check on the adapter's 0.0001 Equity increment (cx-m-c-composition's
+    REPORT.md, "ORB cross-check"): a highest bid of 10.6937, then a fall through the trigger between
+    timer steps. NautilusTrader's emulator rounds the trailing limit only to the instrument's increment
+    (`trailing.rs`), so it releases LIMIT 10.4237, which Alpaca rejects; the adapter sends it at 10.42,
+    a sell rounded down (`venue_limit_price`, ADR 0030), which Alpaca takes."""
+    eng = engine()
+    s = strategy(max_notional=Decimal(1000))
+    data = [
+        *tape(AAA, RISING[:5]),
+        quote(302.1, 10.6937, 10.7037),
+        quote(302.2, 10.46, 10.47),
+        quote(304, 10.46, 10.47),
+    ]
+    orders = run(eng, s, ranker(rank((AAA, "0.25"))), data)
+    sold = [order for order in orders if order.side == OrderSide.SELL]
+    eng.dispose()
+    assert sold
+    released = [order.price.as_decimal() for order in sold]
+    assert any(sub_penny_denial(order.price) is not None for order in sold), released
+    sent = [venue_limit_price(order.price, order.side) for order in sold]
+    assert all(sub_penny_denial(price) is None for price in sent), released
+    assert all(s.as_decimal() <= r for s, r in zip(sent, released, strict=True))
 
 
 def test_a_trailing_sell_made_again_keeps_the_trigger_it_had_reached() -> None:
@@ -1065,7 +2056,8 @@ def test_a_malformed_and_a_good_ranking_between_two_steps_are_both_said() -> Non
 
     def hear(value: str, at: int) -> None:
         Mover.on_signal(
-            stand_in, cast(Any, SimpleNamespace(name=RANK_SIGNAL, value=value, ts_event=at))
+            stand_in,
+            cast(Any, SimpleNamespace(name=RANK_SIGNAL, value=value, ts_event=at, ts_init=at)),
         )
 
     hear("?", 1)
@@ -1144,6 +2136,19 @@ def test_a_full_sale_after_a_rise_passes_the_engines_cap_set_as_the_outer_bound(
         ("BUY", "LIMIT", "FILLED", Decimal(96)),
         ("SELL", "LIMIT", "FILLED", Decimal(96)),
     ]
+    assert flat
+
+
+def test_an_account_budget_sale_after_a_rise_passes_the_outer_engine_bound():
+    entry = Decimal(40_000) / 4
+    eng = engine(order_cap=entry * mover_window.OUTER_BOUND_MULTIPLE)
+    s = strategy(max_notional=entry, size_from_budget=True)
+    orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, RISING + FALL))
+    flat = not eng.cache.positions_open(strategy_id=MOVER_ID)
+    eng.dispose()
+    assert s.refused == []
+    sold = [order for order in orders if order.side == OrderSide.SELL and order.is_closed]
+    assert sold and sold[0].quantity.as_decimal() * sold[0].price.as_decimal() > entry
     assert flat
 
 
@@ -1251,10 +2256,12 @@ class Borrowed:
     def __init__(self) -> None:
         self.released: set[str] = set()
         self.fills: list = []
+        self.fills_to_report: list = []
         self.refused: list = []
         self.rank: list = []
         self.rank_ns = 0
         self.rank_faults = 0
+        self.rankings: list = []
         self.quotes = 0
         self.trades = 0
 
@@ -1284,7 +2291,7 @@ def test_no_order_event_handler_reads_the_engine() -> None:
     borrowed = Borrowed()
     for name in own:
         payload = (
-            SimpleNamespace(name=RANK_SIGNAL, value=rank((AAA, "0.25")), ts_event=5)
+            SimpleNamespace(name=RANK_SIGNAL, value=rank((AAA, "0.25")), ts_event=5, ts_init=5)
             if name == "on_signal"
             else event
         )
@@ -1359,7 +2366,7 @@ def window_parts(**changes: object) -> tuple:
 def test_a_windows_parts_trade_one_name_from_a_ranking_fixed_before_the_node_was_built() -> None:
     """The window's choice is published by `FixedRank` with the time it was computed, three minutes
     before the node started; the strategy builds its bars from trades, buys the first rising run inside
-    the largest entry (500 // 10.41 = 48 shares), holds it under the trailing sell while the name
+    the largest entry (500 // 10.51 = 47 shares), holds it under the trailing sell while the name
     rises, and sells at the wind-down by upstream's market exit. The risk engine's cap is the outer
     bound, and the position cap the shares the largest entry buys at the choice's price."""
     eng = engine(order_cap=OUTER_BOUND_USD)
@@ -1379,7 +2386,7 @@ def test_a_windows_parts_trade_one_name_from_a_ranking_fixed_before_the_node_was
     eng.dispose()
     assert s.rank_ns == T0 - 3 * MINUTE and s.rank_faults == 0
     assert ranking.published > 0
-    assert summary[0] == ("BUY", "LIMIT", "FILLED") and bought == Decimal(48)
+    assert summary[0] == ("BUY", "LIMIT", "FILLED") and bought == Decimal(47)
     assert [side for side, *_ in summary].count("BUY") == 1
     assert summary[-1] == ("SELL", "MARKET", "FILLED") and flat
     assert s.refused == [] and cap.tripped is None
@@ -1389,9 +2396,12 @@ def test_a_windows_parts_trade_one_name_from_a_ranking_fixed_before_the_node_was
 def test_a_windows_rows_are_the_first_runs() -> None:
     s, _, cap = window_parts(price=Decimal("2.40"))
     rows = s.settings
-    assert (rows.max_notional, rows.slots, rows.watch, rows.entries) == (Decimal(500), 1, 1, 1)
+    # one slot by default, as outside the regular part; no bound on entries (`ENTRIES`)
+    assert (rows.max_notional, rows.slots, rows.watch, rows.entries) == (Decimal(500), 1, 1, None)
     assert OUTER_BOUND_USD == Decimal(5000)
-    assert rows.max_shares == max_shares(Decimal("2.40")) == 208
+    assert rows.max_shares is None
+    assert "max_shares" not in s.record()["rows"]
+    assert max_shares(Decimal("2.40")) == 208
     assert cap.max_position == Decimal(208)
     assert rows.bar_spec == "1-MINUTE-LAST-INTERNAL"
     assert rows.chase == "resend"  # no order of a mover node is modified at the venue
@@ -1425,7 +2435,7 @@ def test_each_extended_windows_orders_are_marked_day_limits(part) -> None:
         assert {o.side.name for o in orders} == {"BUY", "SELL"}
         assert {(o.order_type.name, o.time_in_force.name) for o in orders} == {("LIMIT", "DAY")}
         assert s.params and all(params == EXTENDED_HOURS for params in s.params)
-        assert s.settings.slots == 1 and cap.tripped is None
+        assert s.settings.slots == part_slots(part) and cap.tripped is None
         assert not eng.cache.positions_open(strategy_id=MOVER_ID)
     finally:
         eng.dispose()
@@ -1436,6 +2446,138 @@ def test_a_name_whose_one_share_is_over_the_largest_entry_is_refused_before_the_
 ):
     with pytest.raises(ValueError, match="over the largest entry"):
         window_parts(price=Decimal("500.01"))
+
+
+def test_a_session_parts_slots_follow_the_named_per_part_settings_unless_overridden() -> None:
+    """Seven in every part (the lead's ruling of 2026-11-12), unless the run sets its own."""
+    assert part_slots("regular") == 7
+    assert [part_slots(p) for p in ("pre-market", "after-hours", "overnight")] == [7, 7, 7]
+    assert part_slots("regular", 2) == 2 and part_slots("overnight", 3) == 3
+    with pytest.raises(ValueError, match="slots"):
+        part_slots("regular", 0)
+    rows = window_parts(slots=4)[0].settings
+    assert (rows.slots, rows.watch, rows.entries) == (4, 4, None)
+
+
+SOLD_THEN_RECLAIMED = [
+    *RISING,
+    *FALL,
+    *[9.80] * 5,  # the cooldown of 300 s, flat
+    *[10.00, 10.20, 10.40, 10.60, 10.80, 11.00, 11.20],  # a new run closing above the sale's price
+    *[11.20] * 4,
+]
+
+
+def test_a_windows_parts_buy_back_after_a_sale_until_the_part_ends() -> None:
+    """A completed trade does not end the node (the lead's decision of 2026-11-11, Task M's gap 6): the
+    name is sold on the fall, and after the cooldown a reclaim above the sale's price is bought again.
+    Before, the window allowed one entry and named the reclaim as the entry allowance used."""
+    eng = engine(order_cap=OUTER_BOUND_USD)
+    minutes = len(SOLD_THEN_RECLAIMED)
+    s, ranking, cap = window_parts(
+        ends=at(T0 + (minutes + 2) * MINUTE), wind_down_at=at(T0 + minutes * MINUTE)
+    )
+    eng.add_data(trade_tape(AAA, SOLD_THEN_RECLAIMED))
+    eng.add_strategy(s)
+    eng.add_actor(ranking)
+    eng.add_strategy(cap)
+    eng.run()
+    orders = sorted(
+        eng.cache.orders(strategy_id=MOVER_ID),
+        key=lambda o: int(o.client_order_id.value.rsplit("-", 1)[1]),
+    )
+    buys = [o for o in orders if o.side == OrderSide.BUY and o.filled_qty.as_decimal() > 0]
+    flat = not eng.cache.positions_open(strategy_id=MOVER_ID)
+    eng.dispose()
+    assert len(buys) == 2, s.dropped
+    assert not any("entr" in why and "used" in why for why in s.dropped)
+    assert flat and cap.tripped is None
+
+
+def test_each_entry_keeps_its_qualifying_bar_and_its_submit_for_the_record() -> None:
+    """What the diagnostics are read from: the bar whose close completed the run (its `ts_init`, when
+    the node had it) and the order's own creation time, on the node's clock."""
+    eng = engine(order_cap=OUTER_BOUND_USD)
+    s, ranking, cap = window_parts()
+    eng.add_data(trade_tape(AAA, [round(10 + 0.1 * i, 2) for i in range(22)]))
+    eng.add_strategy(s)
+    eng.add_actor(ranking)
+    eng.add_strategy(cap)
+    eng.run()
+    entry = s.record()["entries"][0]
+    order = eng.cache.order(ClientOrderId(entry["client_order_id"]))
+    assert order is not None
+    eng.dispose()
+    assert entry["instrument_id"] == str(AAA)
+    # The slot opens mid-minute 1: skip that partial, then full minutes 2..5 are the four closes.
+    assert entry["qualified_ns"] == T0 + 6 * MINUTE and entry["run_close"] == "10.5000"
+    assert entry["submitted_ns"] == order.init_event.ts_init
+    assert 0 <= entry["submitted_ns"] - entry["qualified_ns"] <= SECOND
+
+
+def test_a_windows_entry_diagnostics_are_read_from_the_bars_its_node_built() -> None:
+    """The same run as above, read as a window reads it after the stop: the entry at 10.51 on the bar
+    that closed at 10.50, the delay under a step, and the bars built from trades after the fill up to
+    the wind-down's sale as the move still ahead."""
+    eng = engine(order_cap=OUTER_BOUND_USD)
+    s, ranking, cap = window_parts()
+    eng.add_data(trade_tape(AAA, [round(10 + 0.1 * i, 2) for i in range(22)]))
+    eng.add_strategy(s)
+    eng.add_actor(ranking)
+    eng.add_strategy(cap)
+    eng.run()
+    record = s.record()
+    bars = window_bars(eng.cache, [str(AAA)])
+    eng.dispose()
+    (got,) = entry_diagnostics(record["entries"], record["fills"], bars, {str(AAA): Decimal(8)})
+    assert 0 <= got["qualified_to_submit_ms"] <= 1000
+    assert got["entry_px"] == "10.5100"
+    highs = [high for _, high in bars[str(AAA)]]
+    assert highs == sorted(highs) and got["high_after"] == str(highs[-1])
+    high = highs[-1]
+    assert got["rise_left"] == str((high / Decimal("10.51") - 1).quantize(Decimal("0.0001")))
+    assert got["ahead"] == str(((high - Decimal("10.51")) / (high - 8)).quantize(Decimal("0.0001")))
+
+
+def test_the_entry_diagnostics_read_the_delay_and_the_move_still_ahead_from_the_tape() -> None:
+    """From the window's own bars: the time from the qualifying bar to the submit, and how much of the
+    move was still ahead at the fill, as a return on the entry and as a share of the move from the
+    reference close to the highest high the window saw after the entry (ADR 0092's measure on the
+    window's tape)."""
+    entries = [
+        {
+            "client_order_id": "O-1",
+            "instrument_id": "AAA.ALPACA",
+            "qualified_ns": T0,
+            "run_close": "10.4",
+            "submitted_ns": T0 + 400_000_000,
+        },
+        {
+            "client_order_id": "O-3",
+            "instrument_id": "BBB.ALPACA",
+            "qualified_ns": T0,
+            "run_close": "20",
+            "submitted_ns": T0 + 2 * SECOND,
+        },
+    ]
+    fills = [["O-1", "BUY", "48", "10.41", T0 + SECOND], ["O-1", "BUY", "2", "10.43", T0 + SECOND]]
+    bars = {
+        "AAA.ALPACA": [
+            (T0, Decimal("10.40")),
+            (T0 + MINUTE, Decimal("11.00")),
+            (T0 + 9 * MINUTE, Decimal("12.42")),
+        ],
+    }
+    got = entry_diagnostics(entries, fills, bars, {"AAA.ALPACA": Decimal("8.42")})
+    first, second = got
+    assert first["qualified_to_submit_ms"] == 400
+    assert first["entry_px"] == "10.4108"  # the fills' mean, weighted
+    assert first["high_after"] == "12.42"
+    assert first["rise_left"] == "0.1930"  # (12.42 - 10.4108) / 10.4108
+    assert first["ahead"] == "0.5023"  # (12.42 - 10.4108) / (12.42 - 8.42)
+    # an entry that never filled has a delay and nothing after it
+    assert second["qualified_to_submit_ms"] == 2000
+    assert second["entry_px"] is None and second["ahead"] is None and second["rise_left"] is None
 
 
 # --- states the simulated venue does not reach: the sale path's own methods on a stand-in -----------------
@@ -1610,3 +2752,239 @@ def test_an_entry_whose_cancel_failed_during_the_exit_is_canceled_again_after_ch
     assert seam.canceled == ["E-1"]
     cast(Any, seam)._time_out(slot, entry, T0 + 5 * SECOND)
     assert seam.canceled == ["E-1", "E-1"]
+
+
+class ReportedAccount:
+    """The Alpaca adapter's account as NautilusTrader holds it live, with its calculation off: the free
+    cash is the cash Alpaca last reported (the adapter reports cash as total and free, nothing locked,
+    `canon_alpaca.execution._report_account`), and it changes only when a report arrives. A report
+    asked for lands before the next read, with the backtest's cash then, as a GET /account sent after
+    the fill reads it."""
+
+    calculate_account_state = False
+
+    def __init__(self, real) -> None:
+        self.real, self.id = real, real.id
+        self.cash = real.balance_total(USD)
+        self.count, self.asked = 1, 0
+
+    def _land(self) -> None:
+        if self.asked:
+            self.cash, self.count, self.asked = (
+                self.real.balance_total(USD),
+                self.count + self.asked,
+                0,
+            )
+
+    @property
+    def event_count(self) -> int:
+        self._land()
+        return self.count
+
+    def balance_free(self, currency=None):
+        self._land()
+        return self.cash
+
+    def balance_total(self, currency=None):
+        self._land()
+        return self.cash
+
+    def balance_locked(self, currency=None):
+        return Money(0, USD)
+
+
+class Reporting(Recording):
+    """`Recording` on a `ReportedAccount`; each `query_account` is kept and, with `deliver`, answered
+    with a report before the next read."""
+
+    deliver = True
+
+    def __init__(self, config: MoverConfig) -> None:
+        super().__init__(config)
+        self.reported: ReportedAccount | None = None
+        self.queries: list = []
+
+    def _trading_account(self, venue):
+        real = super()._trading_account(venue)  # a copy at the pin, so taken again at each read
+        if real is not None and self.reported is None:
+            self.reported = ReportedAccount(real)
+        elif real is not None and self.reported is not None:
+            self.reported.real = real
+        return self.reported
+
+    def query_account(self, account_id, client_id=None, params=None) -> None:
+        self.queries.append(account_id)
+        if self.deliver and self.reported is not None:
+            self.reported.asked += 1
+
+
+@pytest.mark.parametrize("deliver", [True, False])
+def test_a_reported_account_is_queried_on_each_fill_and_buys_since_its_report_are_subtracted(
+    deliver,
+):
+    """ultra-3a8613a/3, the lead's ruling of 2026-11-12: live, the account is reported with its
+    calculation off, so its free cash stood at the connect-time cash all window. Each fill now asks for
+    the account (the adapter's `_query_account`, one GET /account), and a buy filled since the last
+    report is subtracted from the free cash the next entry is sized from; a sale's proceeds count only
+    once a report has them."""
+    eng = engine(cash=Decimal(1000))
+    s = Reporting(
+        MoverConfig(
+            max_notional=Decimal(1000),
+            max_move=Decimal(5),
+            entry_arm="bridge",
+            strategy_id=MOVER_ID,
+            order_id_tag="001",
+            size_from_budget=True,
+            entries=2,
+            cooldown_secs=0,
+        )
+    )
+    s.deliver = deliver
+    closes = [*RISING[:5], 10.1, 10.0, 9.9, 9.8, *RECLAIM, 10.8]
+    orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, closes))
+    eng.dispose()
+    assert s.fills and s.queries
+    if deliver:
+        assert len(s.queries) <= len(s.fills), "answered at once: at most one account query a fill"
+    first = s.entries_sent[0]
+    assert first["sizing"]["unreported_fills"] == "0"
+    assert first["sizing"]["account_query_wait_secs"] == "0.0"
+    bought = [o for o in orders if o.side == OrderSide.BUY and o.filled_qty.is_positive()]
+    spent = bought[0].filled_qty.as_decimal() * Decimal(str(bought[0].avg_px))
+    assert not any("NOTIONAL_EXCEEDS_FREE_BALANCE" in reason for _, reason in s.refused), s.refused
+    if deliver:
+        # the report after the sale has the cash the loss left, and nothing is held back
+        assert len(bought) == 2
+        [second] = [
+            e["sizing"]
+            for e in s.entries_sent
+            if e["client_order_id"] == bought[1].client_order_id.value
+        ]
+        assert second["unreported_fills"] == "0"
+        assert Decimal(second["free_cash"]) < Decimal(1000)
+    else:
+        # no report came: the first buy is still subtracted and the sale's proceeds do not count
+        # yet, so the cash left cannot fund a second entry
+        assert len(bought) == 1
+        assert all(e["sizing"]["unreported_fills"] == str(spent) for e in s.entries_sent[1:])
+        # the lead's bound: no sale waits on the query outstanding; the due sale went out and filled
+        sold = [o for o in orders if o.side == OrderSide.SELL and o.filled_qty.is_positive()]
+        assert sold and sold[0].ts_init > bought[0].ts_last, (
+            "the sale went out with the query unanswered"
+        )
+
+
+def test_a_reported_account_counts_an_accepted_unfilled_buy_against_free_cash() -> None:
+    """ultra-3a8613a/3: a reported account locks nothing, so an entry the venue took and has not filled
+    is counted against the free cash at its open quantity; a calculated account locks it itself."""
+    from nautilus_trader.model import OrderStatus
+
+    def order(status, quantity, leaves, price):
+        return SimpleNamespace(
+            status=status,
+            quantity=Quantity.from_int(quantity),
+            leaves_qty=Quantity.from_int(leaves),
+            price=Price.from_str(price),
+        )
+
+    working = [
+        order(OrderStatus.SUBMITTED, 10, 10, "5.00"),
+        order(OrderStatus.ACCEPTED, 20, 20, "5.00"),
+        order(OrderStatus.PARTIALLY_FILLED, 30, 10, "5.00"),
+        order(OrderStatus.FILLED, 40, 0, "5.00"),
+    ]
+    assert mover.entry_reserve(working, reported=False) == Decimal(50)
+    assert mover.entry_reserve(working, reported=True) == Decimal(200)
+
+
+class OneAccount(Recording):
+    """`Recording` with a reported account it reads directly, its queries kept and its clock set."""
+
+    def __init__(self, account) -> None:
+        super().__init__(
+            MoverConfig(
+                max_notional=Decimal(1000),
+                max_move=Decimal(5),
+                strategy_id=MOVER_ID,
+                order_id_tag="001",
+            )
+        )
+        self.account, self.queries, self.now_ns = account, [], 0
+
+    def _trading_account(self, venue):
+        return self.account
+
+    def query_account(self, account_id, client_id=None, params=None) -> None:
+        self.queries.append(account_id)
+
+    def _now_ns(self) -> int:
+        return self.now_ns
+
+
+def test_a_reported_account_has_one_query_in_flight_and_a_fill_waits_for_a_query_sent_after_it():
+    """Review of the composition's fixes, high round, findings 4 and 5: every fill sent its own GET
+    /account, partial fills and sales included, against the same request budget the entries are held
+    to; and with several queries in flight, an older reply applied last moved the event count past a
+    buy its balance did not have. One query is in flight at a time, for every fill since the last."""
+    account = SimpleNamespace(calculate_account_state=False, event_count=1, id="A")
+    s = OneAccount(account)
+    buy, sell = OrderSide.BUY, OrderSide.SELL
+    s.fills_to_report = [
+        (VENUE, buy, Decimal(100)),
+        (VENUE, buy, Decimal(50)),
+        (VENUE, sell, Decimal(70)),
+    ]
+    s._ask_for_the_account()
+    assert len(s.queries) == 1, "one query for the step's fills"
+    assert s._unreported_buys(account) == Decimal(150)
+    s.fills_to_report = [(VENUE, buy, Decimal(30))]
+    s._ask_for_the_account()
+    assert len(s.queries) == 1, "none while the first is unanswered"
+    assert s._unreported_buys(account) == Decimal(180)
+    s.now_ns = 2 * mover.SECOND_NS
+    assert s._query_wait_secs(account) == 2.0, "what a buy sized now records it waited"
+    s.now_ns = 0
+    account.event_count = 2  # the first query's report: it was sent before the 30 filled
+    assert s._unreported_buys(account) == Decimal(30)
+    assert s._query_wait_secs(account) == 0.0
+    s._ask_for_the_account()
+    assert len(s.queries) == 2
+    account.event_count = 3
+    assert s._unreported_buys(account) == Decimal(0)
+    # a query never answered is asked again once the adapter's longest call has passed
+    s.fills_to_report = [(VENUE, buy, Decimal(10))]
+    s._ask_for_the_account()
+    assert len(s.queries) == 3
+    s.fills_to_report = [(VENUE, buy, Decimal(5))]
+    s.now_ns = (mover.QUERY_WAIT_SECS - 1) * mover.SECOND_NS
+    s._ask_for_the_account()
+    assert len(s.queries) == 3
+    s.now_ns = mover.QUERY_WAIT_SECS * mover.SECOND_NS
+    s._ask_for_the_account()
+    assert len(s.queries) == 4
+    assert s._unreported_buys(account) == Decimal(15)
+
+
+def test_a_lost_account_query_is_sent_again_on_expiry_without_another_fill():
+    """Second read of the high round (53269f4): a query that is lost (the adapter's `_query_account`
+    fails and reports nothing) was sent again only when another fill came, so with a position held and
+    no other fill every later buy was sized with that buy still held back until the position's own sale.
+    It is sent again once `QUERY_WAIT_SECS` has passed, fill or none."""
+    account = SimpleNamespace(calculate_account_state=False, event_count=1, id="A")
+    s = OneAccount(account)
+    s.fills_to_report = [(VENUE, OrderSide.BUY, Decimal(500))]
+    s._ask_for_the_account()
+    assert len(s.queries) == 1
+    s.now_ns = (mover.QUERY_WAIT_SECS - 1) * mover.SECOND_NS
+    s._ask_for_the_account()
+    assert len(s.queries) == 1, "not before it has had its time"
+    s.now_ns = mover.QUERY_WAIT_SECS * mover.SECOND_NS
+    s._ask_for_the_account()
+    assert len(s.queries) == 2, "sent again with no other fill"
+    assert s._unreported_buys(account) == Decimal(500)
+    account.event_count = 2  # the second query's report
+    assert s._unreported_buys(account) == Decimal(0)
+    s.now_ns = 10 * mover.QUERY_WAIT_SECS * mover.SECOND_NS
+    s._ask_for_the_account()
+    assert len(s.queries) == 2, "an answered query is not sent again"

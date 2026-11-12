@@ -64,6 +64,20 @@ Limits found while building it, beyond the whole-share limit above:
   price finer than 0.0001 is rounded as upstream rounds and named, and such a quote dropped; ADR 0055,
   "Prices finer than the instrument's precision".) That
   leaves the $1.00 rule to the execution slice. The owner should ratify this choice.
+* The execution slice denied a limit price finer than the $1.00 rule allows until 2026-11-11. Since then
+  it sends such a limit on Alpaca's increment, a buy rounded up and a sell down, so never less marketable,
+  on a submit and a modify alike, and generates `OrderUpdated` with the price sent just before
+  `OrderAccepted`, so the node's order and a status report of Alpaca's agree, and a strategy that
+  modifies on acceptance does not take that update for its modify's answer. A modify whose limit rounds
+  to the order's own price, with nothing else changed, is refused before Alpaca. Why: NautilusTrader's order emulator
+  releases a triggered stop-limit or trailing stop-limit at the instrument's fixed increment
+  (`crates/execution/src/order_emulator/emulator.rs` builds its matching core with `price_increment`;
+  `crates/execution/src/trailing.rs` rounds the trailing price to it), so a strategy holding its prices in
+  cents still has a released limit like 10.4237 above $1.00, which the denial turned into an unprotected
+  position (`tests/test_mover.py::test_a_fractional_cent_bid_never_releases_a_sub_penny_limit_above_one_dollar`).
+  Stop prices finer than the increment are still denied: which way a trigger rounds is the strategy's
+  call. Paper proof of a released exit above $1.00 accepted at the rounded price: UNVERIFIED until the
+  first firing on such a name.
 * Alpaca's stream schema gives quote sizes in round lots, with no lot size to convert by. They pass through
   unconverted.
 * alpaca-py 0.45.0 reads no credential environment variable; `RESTClient._validate_credentials` uses its

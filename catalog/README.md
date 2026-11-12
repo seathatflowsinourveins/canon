@@ -18,7 +18,56 @@ One feed a root. The catalog keys bars by bar type, not by Alpaca's feed, so `lo
 it loaded into `alpaca-feed` in the root and refuses another feed there. This folder holds IEX; SIP bars
 go in `catalog/sip/` (ADR 0077).
 
-Source: https://nautilustrader.io/docs/md/latest/concepts/data/catalog.md (read 2026-11-09 and 2026-11-10).
+`mise run paper:history <tests|windows>` loads a bounded list of symbols' `sip` minute/day bars, GET
+only, through `canon_trading.history_load` (ADR 0093). It requires the asset definitions already in
+the chosen root, paces at ADR 0093's row, and takes one catalog lock without taking an account or
+stream lock. A refused feed or rate limit stops by name. Give it `--catalog catalog/sip` for SIP.
+
+The nightly movers baseline writer (ADR 0087) reads every ALPACA equity definition in the chosen
+root and its last five sessions' minute bars. Load the whole asset list and history before calling
+this a whole-market baseline; this job cannot establish completeness of the asset list. Run, for
+example:
+
+```sh
+mise run paper:history tests baseline --session 2026-11-12 \
+  --sessions-file /path/to/exchange-sessions.txt --feed sip
+```
+
+`--catalog` defaults to `catalog/<feed>`. The calendar file is an operator-supplied exchange-session
+calendar, one ISO date per line in ascending order, including the coming trade date and at least five
+prior sessions. Blank lines and lines beginning with `#` are ignored. Extra earlier dates are allowed:
+only the latest five before `--session` are used. Verify the calendar against the exchange; weekdays
+and missing bars cannot establish holidays. No calendar provider is fetched by this command. An
+early-close date must still be covered through 20:00 New York, so build after its 20:00 bars are
+published.
+
+This mode runs `python -m canon_trading.movers_baseline` before any account pair is read, and refuses
+a load flag (`--symbols`, `--start`, `--bars` and the like); load mode refuses a baseline flag
+(`--feed`, `--session` and the like). It uses the same catalog lock as `history_load`. A name is
+written when the root covers its minute ends from 04:01 through 20:00 New York on each selected
+session; a covered session with no trades counts zero. A name missing a session is left out and listed
+in the file's `excluded` with the feed, the session and the missing range: `history_load` marks no
+coverage for an empty answer, so a name with no trade in a loaded range can never be covered. The
+write stops by name, keeping the previous file, only when the share of distinct equities left out is
+above `--max-excluded-share` (default 0.5, UNCALIBRATED). The file's header carries `source` (writer,
+feed, catalog, sessions, equities, time written), `feeds`, `excluded_share`, `excluded`
+and `lookback_sessions`, and each name its `traded_sessions` per segment. Legacy writers that do not take
+the history lock must run separately; a root the recorder writes is best kept apart from the history
+load's.
+
+The arithmetic and atomic JSON replacement are `movers_rank.segment_baseline` and
+`movers_rank.write_baselines`: typical-price dollar volume, cumulative over 96 15-minute segments
+from 20:00 New York the evening before to 20:00 on the trade date, averaged over five sessions. SIP
+has no overnight session, so a SIP baseline counts and checks only 04:01 through 20:00: its segments
+0-31 (20:00-04:00) are zero, a night with no SIP bars never makes a session read as uncovered, and its
+header's `feeds` is `["sip"]`, so `read_baselines` reports `overnight` false and the ranking counts
+its day ratio from 04:00. The actor reads the result for exactly the coming date with
+`read_baselines`. The default output is `catalog/movers-baseline/sip.json`; `--baseline-dir` sets its
+directory, and the actor's `baseline_path` should name that file. `--feed boats` is refused by name:
+the overnight part's baseline waits on a BOATS history loader, and ADR 0093's loader supports SIP only.
+
+This is an explicit job invocation; it installs no schedule. The coordinator performs the first
+credential-backed load and paper verification.
 
 `mise run paper:history <tests|windows> --data trades --symbols AAPL --start <ISO time with zone>
 --end <ISO time with zone> --catalog <existing SIP root>` loads individual SIP prints through the
@@ -57,3 +106,6 @@ holding IEX data, including this default root, refuses SIP; give SIP its own roo
 First evidence to be run by the Claude lane (UNVERIFIED here): one AAPL night, 2026-11-10 21:00 UTC
 through 2026-11-11 09:00 UTC, into a separate root holding its definition, then repeat the same command
 and verify zero GETs and zero writes. The tests for this path use offline stand-ins.
+
+Source: https://nautilustrader.io/docs/md/latest/concepts/data/catalog.md (read 2026-11-09 and 2026-11-10);
+the pinned v2.0.0rc8 catalog bindings, `movers_rank` and `history_load` (read 2026-11-11).

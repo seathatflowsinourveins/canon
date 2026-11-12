@@ -167,8 +167,15 @@ Known limits:
   that cancel sends is not documented.
 * Cancel-all sends one cancel per order, one at a time, in no specified order, an order already pending
   cancel included; an order placed after the command was read from the cache is not canceled by it.
-* A limit price at or above $1.00 with more than 2 decimals, or below $1.00 with more than 4, is denied
-  here: Alpaca rejects it ("Sub-penny increments for limit orders", same page).
+* A limit price at or above $1.00 with more than 2 decimals, or below $1.00 with more than 4, which Alpaca
+  rejects ("Sub-penny increments for limit orders", same page), is sent on that increment instead, a buy
+  rounded up and a sell down, so never less marketable (`venue_limit_price`), on a submit and a modify
+  alike. NautilusTrader's emulator releases a triggered stop-limit or trailing stop-limit at the
+  instrument's 0.0001 increment, so a strategy cannot keep its released limit in cents (ADR 0030). When
+  Alpaca acknowledges the order, `OrderUpdated` with the price sent comes just before `OrderAccepted`, so
+  the node's order and Alpaca's agree. A modify whose price rounds to the order's own, with nothing else
+  changed, is refused before Alpaca: the replace would change nothing. A stop price finer than that increment is still denied: which way to round a trigger is the
+  strategy's choice, not the venue's.
 * The account is a NautilusTrader cash account holding Alpaca's `cash` as its USD balance, all of it free,
   read at connect and on `QueryAccount` (a strategy's `query_account`), as upstream's Kraken spot,
   Coinbase, Binance spot and Bybit adapters fetch their venue's account on a query; Alpaca's stream pushes
@@ -249,6 +256,8 @@ import dataclasses
 import re
 import threading
 from datetime import datetime
+from decimal import ROUND_CEILING
+from decimal import ROUND_FLOOR
 from decimal import Decimal
 from enum import Enum
 from typing import TYPE_CHECKING
@@ -709,6 +718,18 @@ def wire_price(price: Price) -> float:
 def fill_price(value: float) -> Price:
     """The fill price exactly as Alpaca sent it: the shortest decimal form of alpaca-py's float."""
     return Price.from_str(repr(float(value)))
+
+
+def venue_limit_price(price: Price, side: OrderSide) -> Price:
+    """The limit price as sent to Alpaca: on its increment, 2 decimals at or above $1.00 and 4 below
+    ("Sub-penny increments for limit orders"), a buy rounded up and a sell down, so never less marketable;
+    `price` itself when it is on the increment already."""
+    amount = Decimal(str(price))
+    step = Decimal(1).scaleb(-(2 if amount >= 1 else 4))
+    rounded = amount.quantize(
+        step, rounding=ROUND_CEILING if side == OrderSide.BUY else ROUND_FLOOR
+    )
+    return price if rounded == amount else Price(float(rounded), PRICE_PRECISION)
 
 
 def sub_penny_denial(price: Price, what: str = "limit price") -> str | None:
@@ -1721,7 +1742,9 @@ class AlpacaExecutionClient(ExecutionClient):
             qty=int(command.quantity.as_double()) if command.quantity is not None else None,
             # "Required if original order's `type` field was `limit` or `stop_limit`" (Replace Order by
             # ID), so the current price is sent when the command does not change it.
-            limit_price=wire_price(command.price or order.price)
+            # On Alpaca's increment, as a submit is (`venue_limit_price`); the `replaced` update's
+            # `OrderUpdated` then carries the replacement's price, the one sent.
+            limit_price=wire_price(venue_limit_price(command.price or order.price, order.side))
             if order.order_type in LIMIT_PRICED
             else None,
             stop_price=wire_price(command.trigger_price or order.trigger_price)
@@ -1840,9 +1863,13 @@ class AlpacaExecutionClient(ExecutionClient):
             "update or reconciliation resolves it",
         )
 
-    @staticmethod
+    def _replace_in_flight(self, order: Any) -> bool:
+        """Whether a replace of this order was sent and Alpaca's `replaced` for it is not yet applied."""
+        record = self._records.get(order.client_order_id)
+        return record is not None and any(count > 0 for count in record.pending.values())
+
     def _modify_denial(
-        order: Any, command: live.ModifyOrder, venue_order_id: VenueOrderId | None
+        self, order: Any, command: live.ModifyOrder, venue_order_id: VenueOrderId | None
     ) -> str | None:
         """Why the client will not send this modify, or None: only what it can prove. What Alpaca alone
         knows, such as an order in `accepted` that "cannot be replaced", is left to Alpaca's answer."""
@@ -1860,12 +1887,21 @@ class AlpacaExecutionClient(ExecutionClient):
         ):
             if value is not None and not value.as_double() > 0:
                 return f"{field} {value} is not positive"
-        if command.price is not None:
-            if order.order_type not in LIMIT_PRICED:
-                return f"a {order.order_type.name} order has no limit price to change"
-            denial = sub_penny_denial(command.price)
-            if denial is not None:
-                return denial
+        if command.price is not None and order.order_type not in LIMIT_PRICED:
+            return f"a {order.order_type.name} order has no limit price to change"
+        if (
+            command.price is not None
+            and not self._replace_in_flight(order)  # one in flight may change what the order holds
+            and (sent := venue_limit_price(command.price, order.side)) == order.price
+            and command.quantity in (None, order.quantity)
+            and command.trigger_price in (None, getattr(order, "trigger_price", None))
+        ):
+            # A replace that changes nothing: `ExecTester`'s one-tick amend of a whole-cent buy (TC-E30)
+            # rounds back to the order's own price (the second reader's finding 2, 2026-11-11).
+            return (
+                f"limit price {command.price} on Alpaca's increment is {sent}, the order's own; "
+                "nothing to change"
+            )
         if command.trigger_price is not None:
             if order.order_type not in STOP_TYPES:
                 return f"a {order.order_type.name} order has no stop price to change"
@@ -1915,10 +1951,8 @@ class AlpacaExecutionClient(ExecutionClient):
             denial = sub_penny_denial(order.trigger_price, "stop price")
             if denial is not None:
                 return denial
-        if order.order_type in LIMIT_PRICED:
-            if order.is_post_only:
-                return "post-only is not supported"
-            return sub_penny_denial(order.price)
+        if order.order_type in LIMIT_PRICED and order.is_post_only:
+            return "post-only is not supported"
         return None
 
     @staticmethod
@@ -1933,14 +1967,16 @@ class AlpacaExecutionClient(ExecutionClient):
         if extended_hours:
             fields["extended_hours"] = True  # only ever with a limit order, `DAY` or `GTC`
         if order.order_type == OrderType.LIMIT:
-            return LimitOrderRequest(**fields, limit_price=wire_price(order.price))
+            return LimitOrderRequest(
+                **fields, limit_price=wire_price(venue_limit_price(order.price, order.side))
+            )
         if order.order_type == OrderType.STOP_MARKET:
             return StopOrderRequest(**fields, stop_price=wire_price(order.trigger_price))
         if order.order_type == OrderType.STOP_LIMIT:
             return StopLimitOrderRequest(
                 **fields,
                 stop_price=wire_price(order.trigger_price),
-                limit_price=wire_price(order.price),
+                limit_price=wire_price(venue_limit_price(order.price, order.side)),
             )
         return MarketOrderRequest(**fields)
 
@@ -1969,6 +2005,7 @@ class AlpacaExecutionClient(ExecutionClient):
         if current.status in (OrderStatus.INITIALIZED, OrderStatus.SUBMITTED, OrderStatus.RELEASED):
             self._accepted.add(client_order_id)
             self._acknowledged.pop(client_order_id, None)
+            self._sent_price_updated(current, venue_order_id, ts_event)
             self.generate_order_accepted(current, venue_order_id, ts_event)
         elif (
             current.status in (OrderStatus.PENDING_CANCEL, OrderStatus.PENDING_UPDATE)
@@ -1992,7 +2029,33 @@ class AlpacaExecutionClient(ExecutionClient):
         if current.venue_order_id is not None or current.filled_qty.as_double() > 0:
             return  # acknowledged already, as the engine holds it (a query report, a fill)
         self._accepted.add(order.client_order_id)
+        self._sent_price_updated(current, *acknowledged)
         self.generate_order_accepted(order, *acknowledged)
+
+    def _sent_price_updated(self, order: Any, venue_order_id: VenueOrderId, ts_event: int) -> None:
+        """`OrderUpdated` with the limit price sent, just before `OrderAccepted`, when it was moved onto
+        Alpaca's increment (`venue_limit_price`): the node's order then holds what Alpaca holds, and a
+        report of the order reconciles with no difference. Before, not after: a strategy that modifies on
+        `OrderAccepted` (upstream's `ExecTester` does) would otherwise take this update for its modify's
+        answer (the second reader's finding 1, 2026-11-11). NautilusTrader applies `OrderUpdated` to a
+        submitted or released order in place (`crates/model/src/orders/mod.rs`)."""
+        if order.order_type not in LIMIT_PRICED:
+            return
+        sent = venue_limit_price(order.price, order.side)
+        if sent == order.price:
+            return
+        self._log.info(
+            f"{order.client_order_id} was sent at {sent}, its limit {order.price} on Alpaca's increment",
+        )
+        self.generate_order_updated(
+            order,
+            venue_order_id,
+            order.quantity,
+            sent,
+            order.trigger_price if order.order_type in STOP_TYPES else None,
+            None,
+            ts_event,
+        )
 
     def _known_venue_id(
         self,

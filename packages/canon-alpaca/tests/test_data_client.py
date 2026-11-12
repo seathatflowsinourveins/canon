@@ -3238,8 +3238,13 @@ def test_alpaca_py_reconnects_a_mute_stream_and_sends_its_subscriptions_again(
 
     assert all(m["quotes"] == ["AAPL"] for m in subscribes())
     assert cache.quote(AAPL) is not None
-    lines = [line for line in logged(capfd).splitlines() if "no data received" in line]
-    assert lines, "alpaca-py's reconnect was not relayed to the node's log"
+    lines: list[str] = []
+
+    def reconnect_logged() -> bool:
+        lines.extend(line for line in logged(capfd).splitlines() if "no data received" in line)
+        return bool(lines)
+
+    asyncio.run(wait_until(reconnect_logged))
     assert re.search(r"Alpaca stream on feed iex \(ALPACA-stream-\d+\): no data received", lines[0])
     assert "[ERROR]" not in lines[0]  # a reconnect is a warning: a quiet feed fails nothing
 

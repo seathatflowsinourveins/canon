@@ -15,6 +15,7 @@ MAX_ORDER_MODIFY_RATE"; an order over `max_notional_per_order` gets `OrderDenied
 `NOTIONAL_EXCEEDS_MAX_PER_ORDER: max=..., notional=...`. A denied order does not use up the rate.
 """
 
+import inspect
 import math
 from decimal import Decimal
 from itertools import pairwise
@@ -47,6 +48,7 @@ from canon_trading.paper_node import EMA_CROSS_ID
 from canon_trading.paper_node import MAX_NOTIONAL_PER_ORDER_USD
 from canon_trading.paper_node import MAX_ORDER_MODIFY_RATE
 from canon_trading.paper_node import MAX_ORDER_SUBMIT_RATE
+from canon_trading.paper_node import REQUEST_CEILING
 from canon_trading.paper_node import RiskLimits
 from canon_trading.paper_node import ema_cross_config
 from canon_trading.paper_node import ema_cross_paper_node
@@ -148,8 +150,8 @@ def test_the_configs_report_the_values_set() -> None:
         RiskEngineConfig(**risk_limits(SPY)),
     ):
         assert config.bypass is False
-        assert config.max_order_submit_rate == MAX_ORDER_SUBMIT_RATE == "50/00:01:00"
-        assert config.max_order_modify_rate == MAX_ORDER_MODIFY_RATE == "25/00:01:00"
+        assert config.max_order_submit_rate == MAX_ORDER_SUBMIT_RATE == "180/00:01:00"
+        assert config.max_order_modify_rate == MAX_ORDER_MODIFY_RATE == "180/00:01:00"
         assert {k: Decimal(str(v)) for k, v in config.max_notional_per_order.items()} == {
             "SPY.ALPACA": MAX_NOTIONAL_PER_ORDER_USD
         }
@@ -159,17 +161,42 @@ def test_the_configs_report_the_values_set() -> None:
 
 
 def test_submits_over_the_rate_are_denied_before_the_venue() -> None:
-    """51 submits at one instant: 50 reach the venue, the 51st is denied. 70 s later the window has moved
-    and a submit passes again."""
+    """181 submits at one instant: 180 reach the venue, the 181st is denied. 70 s later the window has
+    moved and a submit passes again."""
     eng = engine(risk_limits(SPY))
     eng.add_data(quotes(800))
-    eng.add_strategy(Script({1: lambda s: s.buy_far_below(51), 701: lambda s: s.buy_far_below()}))
+    eng.add_strategy(Script({1: lambda s: s.buy_far_below(181), 701: lambda s: s.buy_far_below()}))
     eng.run()
     result = outcomes(eng)
     eng.dispose()
-    assert result[:50] == [("OrderAccepted", "")] * 50
-    assert result[50] == ("OrderDenied", "RATE_LIMIT_EXCEEDED")
-    assert result[51] == ("OrderAccepted", "")
+    assert result[:180] == [("OrderAccepted", "")] * 180
+    assert result[180] == ("OrderDenied", "RATE_LIMIT_EXCEEDED")
+    assert result[181] == ("OrderAccepted", "")
+
+
+def test_seven_mover_slots_at_full_turnover_are_never_throttled_by_the_engine() -> None:
+    """The lead's decision of 2026-11-11: the engine's throttle can never be what refuses a sale. Seven
+    slots at Mover's real cadence (entry, sale, buy-back and flat ending, and a re-priced sale every
+    six seconds: 14 submits a slot) send 98 submits in one minute, spread over it; none is denied.
+    What holds entries back is the request count: Mover's soft line sits under the window's request
+    ceiling, which is the submit limit, and every submit is at least one request."""
+    from canon_trading import mover
+    from canon_trading import session_window
+
+    per_slot, slots = 14, 7
+    eng = engine(risk_limits(SPY))
+    eng.add_data(quotes(700))
+    # a submit for every slot every 4.2 s, 14 times: 98 within 55 s of quotes 100 ms apart
+    steps = {1 + i * 42: lambda s: s.buy_far_below(slots) for i in range(per_slot)}
+    eng.add_strategy(Script(steps))
+    eng.run()
+    result = outcomes(eng)
+    eng.dispose()
+    assert len(result) == slots * per_slot
+    assert result == [("OrderAccepted", "")] * (slots * per_slot)
+    soft_line = inspect.signature(mover.MoverConfig).parameters["soft_line"].default
+    submits = int(MAX_ORDER_SUBMIT_RATE.split("/")[0])
+    assert soft_line < session_window.REQUEST_CEILING == REQUEST_CEILING == submits
 
 
 def test_the_paper_runs_budget_lets_one_order_through() -> None:
@@ -212,11 +239,11 @@ def test_an_order_over_the_notional_cap_is_denied_and_does_not_use_the_rate() ->
 
 
 def test_modifies_over_the_rate_are_rejected() -> None:
-    """26 modifies of one resting order at one instant: 25 apply, the 26th is rejected."""
+    """181 modifies of one resting order at one instant: 180 apply, the 181st is rejected."""
 
     def modify(s: Script) -> None:
         [order] = s.cache.orders_open(instrument_id=SPY)
-        for i in range(26):
+        for i in range(181):
             s.modify_order(order.client_order_id, price=Price.from_str(f"{1.01 + i / 100:.2f}"))
 
     eng = engine(risk_limits(SPY))
@@ -227,7 +254,7 @@ def test_modifies_over_the_rate_are_rejected() -> None:
     names = [type(e).__name__ for e in order.events()]
     reasons = [str(e.reason) for e in order.events() if type(e).__name__ == "OrderModifyRejected"]
     eng.dispose()
-    assert names.count("OrderUpdated") == 25, names
+    assert names.count("OrderUpdated") == 180, names
     assert reasons == ["Exceeded MAX_ORDER_MODIFY_RATE"], names
 
 

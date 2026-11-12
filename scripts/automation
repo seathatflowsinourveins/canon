@@ -68,7 +68,7 @@ PAPER_LABEL="local.canon.paper-session"
 PAPER_PLIST="$AGENTS_DIR/$PAPER_LABEL.plist"
 # launchd counts StartInterval from the end of the last firing, not its start (observed on macOS 27.2: a 20 s
 # interval and a 15 s job started every 35 s, with ProcessType Background and Standard alike), so the interval
-# is the pause after each firing: above the 300 s gap (session_window.GAP_SECS), and with a 25-minute window
+# is the pause after each firing: above the 60 s gap (session_window.GAP_SECS), and with a 25-minute window
 # and its start-up, stop and account check, a window about every 35 minutes (ADR 0050, 2026-11-11)
 PAPER_INTERVAL=600
 PAPER_MINUTES=25

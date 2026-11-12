@@ -7,6 +7,8 @@ review-by: 2026-12-11
 
 # Strategy focus: extreme movers, built from upstream parts in four steps; the ranking score, the adapter's part of a changing universe, the strategy class and halts each wait on a record of their own
 
+*Amended in part 2026-11-12 by ADR 0106 (proposed), which carries the Mover composition's changes to this record.*
+
 ## Context and Problem Statement
 
 The owner decided on 2026-11-11 that strategy work in this repository concerns extreme movers only. The

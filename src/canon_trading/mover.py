@@ -6,18 +6,26 @@ A composition of upstream parts (ADR 0083, ADR 0088). What each part is, at Naut
 * **The ranking** reaches the strategy as upstream's signal: `subscribe_signal(name)` and `on_signal`
   (`python/nautilus_trader/trading/__init__.pyi:696`, `:633`; concepts/message_bus, "Signal
   publish/subscribe": "The value is converted to a string on publish"). The ranking actor publishes
-  `RANK_SIGNAL` each minute (ADR 0087); its value is `movers_rank_signal.encode_ranking`'s string, read
+  `RANK_SIGNAL` each minute (ADR 0107); its value is `movers_rank_signal.encode_ranking`'s string, read
   by the shared `decode_ranking`: the ranked instrument IDs best first, each with its move from the last
   regular close, and its `ts_event` the time the ranking was computed. Nothing here ranks, and no
   vendor's list is read.
 * **The entry** is `OrderFactory.limit` (`python/nautilus_trader/common/__init__.pyi:1388`), time in force
   DAY, at the ask of the latest quote in the cache (`entry_ticks` through it, none by default), in every
   session; it is never a market order and is not re-priced: it rests until `entry_timeout_secs`.
-* **The size** is `FixedRiskSizer.calculate(entry, stop_loss, equity, risk, hard_limit=...)`
+* **Paper size** (`size_from_budget=True`) is whole shares of the supplied startup entry figure at
+  the current entry limit, through instrument.make_qty (`model/__init__.pyi`). session_window resolves
+  that figure once from Alpaca's reported buying_power and the CASH engine's cash funding limit,
+  divided by configured slots. Free cash read at entry clamps that startup figure, and a missing free
+  balance refuses the entry by name. `flow_share` of the last `flow_bars` bars' dollar volume caps that
+  size; each entry records both caps and which bound it. An explicit global max_shares can tighten the
+  entry; the per-name share and position monitor follow its resolved current limit.
+  **Legacy risk sizing** is `FixedRiskSizer.calculate(entry, stop_loss, equity, risk, hard_limit=...)`
   (`python/nautilus_trader/risk/__init__.pyi:16-29`; `crates/risk/src/sizing.rs:39-117`): `risk` of the
   account's total balance over the distance from the entry to the lowest price the first sale is planned
   at (`planned_stop`: the first trigger, less the released limit's give, less the chase's cap), in whole
-  shares, capped by `hard_limit`: the largest entry (`max_notional`, and `max_shares`), the free balance
+  shares, capped by `hard_limit`: the largest entry (`max_notional`, `max_shares`, and each name's
+  `share_caps` where the window sets them), the free balance
   and `flow_share` of the dollar volume of the last `flow_bars` bars. No entry is sent into a quote whose
   bid is already under that planned sale: the quote is then wider than the plan the size rests on.
 * **The protection** is the engine's order emulator holding a `TRAILING_STOP_LIMIT` sell
@@ -35,6 +43,9 @@ A composition of upstream parts (ADR 0083, ADR 0088). What each part is, at Naut
   moment with no working sale.
 * **Prices** are ticks of upstream's `TieredTickScheme` stating Alpaca's two bands (`PRICES`;
   `crates/model/src/instruments/tick_scheme.rs`), through `next_ask_price` and `next_bid_price`.
+  Native trailing releases use the instrument's fixed increment instead: a fractional-cent basis
+  can release a sub-penny limit above $1. The observed regression is handed to the lead for a
+  Claude-owned release-price contract; these helpers alone do not guarantee that native price.
 * **The end** in the session is upstream's `market_exit()` (concepts/strategies, "Market exit"), as
   `session_ma_cross` uses it; outside the session a market close would only queue, so it is a limit.
 * **Timers** are the clock's `set_timer` and `set_time_alert` with a callback (concepts/strategies,
@@ -67,13 +78,20 @@ to the request budget. Every number of them is a registered row, UNCALIBRATED (A
    first sale price, kept whether that first sale filled, rests or was refused. Below it the sale rests.
    A sale the risk engine or the venue refuses is sent again every `chase_secs`.
 3. *Entries.* A slot whose bars have just closed `run_bars` times in a row above the close before is a
-   candidate. Candidates are taken best-ranked first while a slot is free, each refused by name
+   candidate under the explicitly selected `entry_arm="bridge"`. The default `registered` arm is
+   selected from `early_entry_study.ARMS`: listing needs both move and cumulative dollar-volume
+   ratio, and its run/extension rules are that module's `entry_runs` and `entry_refusal`.
+   ADR 0092's table rows are :73 (move), :74 (ratio), :75 (baseline sessions), :76 (rises),
+   :77 (first-leg window), :78 (quiet price) and :79 (pullback). No row is tuned here.
+   Registered arms require a supplied `Day` in `entry_contexts`; no context, no entry. The strategy
+   makes no data request: live composition supplies history and selects the arm (M-c).
+   Candidates are taken best-ranked first while a slot is free, each refused by name
    (`dropped`) when the ranking is older than `rank_max_age_secs`, the name is no longer in it, its move
    is over `max_move` (the no-chase cap), no quote is in the cache, the size comes to nothing, or the
-   requests of the last 60 seconds have reached `soft_line`. A name sold before is bought back only
+   requests of the last 60 seconds have reached `soft_line`, which holds a chase's re-price too. A name sold before is bought back only
    after `cooldown_secs` and on a run whose last close is above the sale's price (a reclaim).
 
-Exits never wait for the ranking or the budget. The strategy is long only: a sell is sized from what is
+Exits never wait for the ranking or the budget; only their re-price waits at `soft_line`. The strategy is long only: a sell is sized from what is
 held, one sell works at a time for a name, and nothing is sold while flat.
 
 **Order events.** At the pin, an event that the strategy's own `submit_order`, `cancel_order` or
@@ -107,6 +125,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+from dataclasses import replace
 from datetime import datetime
 from datetime import timedelta
 from decimal import ROUND_CEILING
@@ -142,11 +161,16 @@ from .movers_rank_signal import decode_ranking
 from .movers_rank_signal import encode_ranking
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
     from collections.abc import Sequence
+    from datetime import date
 
     from nautilus_trader.common import Signal
     from nautilus_trader.common import TimeEvent
     from nautilus_trader.model import Bar
+
+    from . import early_entry_study as entry_study
+    from .position_cap import PositionCap
 
 EXTENDED_HOURS = {"extended_hours": True}
 """The submit params that mark an order as extended-hours eligible for the adapter (ADR 0038)."""
@@ -158,11 +182,43 @@ CENT = Decimal("0.01")
 SUB_DOLLAR = Decimal("0.0001")
 SECOND_NS = 1_000_000_000
 BUDGET_SPAN_NS = 60 * SECOND_NS
+QUERY_WAIT_SECS = 130
+"""How long an account query may go unanswered before another is sent: one adapter REST call at its
+longest, alpaca-py's first request and three retries at the adapter's timeouts and the waits between
+them (`session_window.ADAPTER_CALL_SECS`, about 129 s). A reply later than this can arrive after the
+next query's, the one case in which a report could count a buy its balance does not have."""
 CHASES = ("resend",)
 TRIGGERS = (TriggerType.BID_ASK, TriggerType.LAST_PRICE)
 """The triggers the local emulator accepts for an order it holds (concepts/orders/emulated)."""
 REFUSED = (OrderStatus.DENIED, OrderStatus.REJECTED)
 """An order the risk engine denied or the venue rejected."""
+UNLOCKED = (OrderStatus.INITIALIZED, OrderStatus.SUBMITTED)
+"""An order's states before the venue has taken it, so before the account locks its cash."""
+WORKING = (
+    OrderStatus.ACCEPTED,
+    OrderStatus.PARTIALLY_FILLED,
+    OrderStatus.PENDING_UPDATE,
+    OrderStatus.PENDING_CANCEL,
+    OrderStatus.TRIGGERED,
+)
+"""An order's states after the venue took it and before it is done, in which a buy can still fill."""
+
+
+def entry_reserve(orders: Iterable[Any], *, reported: bool) -> Decimal:
+    """What the other slots' entry `orders` hold against the free cash the next entry is sized from.
+
+    A calculated account locks an order's cash once the venue takes it, so only an order not yet taken
+    (`UNLOCKED`) is counted, at its quantity. A reported account locks nothing (the Alpaca adapter
+    reports cash as total and free), so every entry still working is counted at its open quantity: the
+    filled part is counted as a fill since the last report (ultra review of the composition, finding 3).
+    """
+    held = Decimal(0)
+    for order in orders:
+        if order.status in UNLOCKED:
+            held += order.quantity.as_decimal() * order.price.as_decimal()
+        elif reported and order.status in WORKING:
+            held += order.leaves_qty.as_decimal() * order.price.as_decimal()
+    return held
 
 
 def format_rank(entries: Sequence[tuple[InstrumentId, Decimal]]) -> str:
@@ -237,12 +293,13 @@ def offsets(entry: Decimal, trail: Decimal, exit_through: Decimal) -> tuple[Deci
     """The trailing offset and the limit offset, as prices. The trailing offset is `trail` of the entry
     up to the entry's step: it places the trigger, which the emulator keeps to itself. The limit offset
     is that plus `exit_through` of the entry, up to a whole cent and a cent over the trailing offset at
-    least: it places the released limit, the one price that reaches the venue. A whole number of cents
-    under the highest bid is a price Alpaca takes in either band, since a bid at or above a dollar is
-    in cents and under a dollar any four-decimal price is taken; so the release is valid when the bid
-    has crossed a dollar between two steps (the emulator prices it on the instrument's own 0.0001
-    increment, `crates/execution/src/trailing.rs:182`). The cost is a release up to a cent lower than
-    `exit_through` asks for a name under a dollar, which `planned_stop` and so the size take in."""
+    least: it places the released limit, the one price that reaches the venue. This preserves cents
+    when the highest bid is in cents, including across a dollar between steps. A fractional-cent
+    basis retains its residue: the native calculation uses the instrument's fixed 0.0001 increment
+    (`crates/execution/src/trailing.rs:182-220`), not PRICES. That observed invalid release above $1 is
+    handed off to the lead's Claude lane; these offsets do not fix it. The cost under a dollar is a
+    release up to a cent lower than `exit_through` asks, included in `planned_stop` for legacy sizing.
+    """
     step = tick(entry)
     trailing = max((entry * trail).quantize(step, rounding=ROUND_CEILING), step)
     limit = (trailing + entry * exit_through).quantize(CENT, rounding=ROUND_CEILING)
@@ -268,12 +325,15 @@ OWN_FIELDS: dict[str, type | tuple[type, ...]] = {
     "max_notional": Decimal,
     "max_move": Decimal,
     "max_shares": (int, NoneType),
+    "share_caps": (dict, NoneType),
+    "size_from_budget": bool,
     "entries": (int, NoneType),
     "bar_spec": str,
     "slots": int,
     "watch": int,
     "risk": Decimal,
     "run_bars": int,
+    "entry_arm": str,
     "trail": Decimal,
     "exit_through": Decimal,
     "chase_cap": Decimal,
@@ -304,14 +364,28 @@ class MoverConfig(StrategyConfig):
     where it is sized; the risk engine's own per-order cap is the node's outer bound, a multiple of
     `max_notional`, since that cap holds for a sale as for a buy and no cap shapes or refuses a sale
     (ADR 0088). `max_shares` bounds an entry in shares, and `entries` how many entries a run may fill
-    (None: no bound). `bar_spec`
+    (None: no bound). `share_caps`, when set, bounds each named instrument's entry in shares; a name
+    outside that map cannot enter. Paper windows select size_from_budget=True: whole shares of the
+    supplied max_notional at the current entry limit, clamped to the name's start-time share cap
+    (`binding` `cap_bound` when it binds); neither that cap nor the name's position monitor is
+    rewritten, so a monitor trip means a real fault, not a price drift. This path clamps the startup
+    allocation to balance_free read at each entry (a missing free balance refuses the entry), and
+    `flow_share` of the last `flow_bars` bars' dollar volume caps the size; it preserves any explicit global max_shares cap without rewriting it, and does not use
+    risk sizing. The startup allocation names the initial cash-engine funding limit; later losses can
+    reduce free funds. With size_from_budget=False the
+    legacy FixedRiskSizer and optional tighter share caps remain for explicit simulations. `bar_spec`
     is the bars' specification and source after the instrument ID, `1-MINUTE-LAST-EXTERNAL` in a replay
-    and `1-MINUTE-LAST-INTERNAL` on the adapter, which serves quotes and trades and no bars. `slots` is
+    and `1-MINUTE-LAST-INTERNAL` for live entry bars built from trades. `slots` is
     how many names are held at once and `watch` how many of the ranking's top are followed. `risk` is
     `FixedRiskSizer`'s fraction of the balance. `trail`, `exit_through` and `chase_cap` are fractions of
     a price; `flow_share` of the last `flow_bars` bars' dollar volume caps the size. `protect=False` is
     the hold-to-close row: no trailing sell, sold at the wind-down. `wind_down_at` is an aware
     `datetime`. Any other keyword must be a base `StrategyConfig` field, and each field takes one type.
+
+    `entry_arm` defaults to `registered`, or is `bridge` (the existing run-only rule) or another key
+    of ADR 0092's `ARMS`. Registered
+    arms take their run length from that table; `run_bars` overrides apply only to the bridge.
+    Each registered arm needs an explicit `Day` history context in `Mover.entry_contexts`.
     """
 
     def __init__(
@@ -320,12 +394,15 @@ class MoverConfig(StrategyConfig):
         max_notional: Decimal,
         max_move: Decimal,
         max_shares: int | None = None,
+        share_caps: dict[InstrumentId, int] | None = None,
+        size_from_budget: bool = False,
         entries: int | None = None,
         bar_spec: str = "1-MINUTE-LAST-EXTERNAL",
         slots: int = 1,
         watch: int = 3,
         risk: Decimal = Decimal("0.01"),
         run_bars: int = 3,
+        entry_arm: str = "registered",
         trail: Decimal = Decimal("0.02"),
         exit_through: Decimal = Decimal("0.005"),
         chase_cap: Decimal = Decimal("0.02"),
@@ -359,6 +436,11 @@ class MoverConfig(StrategyConfig):
         for name in ("max_shares", "entries"):
             if fields[name] is not None and fields[name] <= 0:
                 raise ValueError(f"{name} must be positive, got {fields[name]}")
+        if share_caps is not None and any(
+            not isinstance(instrument, InstrumentId) or type(shares) is not int or shares < 1
+            for instrument, shares in share_caps.items()
+        ):
+            raise ValueError("share_caps must map instrument IDs to positive whole shares")
         if not risk.is_finite() or not 0 < risk < 1:
             raise ValueError(f"risk must be a fraction over 0 and under 1, got {risk}")
         if trail >= 1:
@@ -372,6 +454,17 @@ class MoverConfig(StrategyConfig):
                 raise ValueError(f"{name} must not be negative, got {fields[name]}")
         if not slots <= watch <= RANK_MOST:
             raise ValueError(f"watch must be from slots ({slots}) to {RANK_MOST}, got {watch}")
+        if entry_arm != "bridge":
+            from . import early_entry_study
+
+            if entry_arm not in early_entry_study.ARMS:
+                raise ValueError(
+                    f"entry_arm must be bridge or one of {tuple(early_entry_study.ARMS)}"
+                )
+            if run_bars != 3:
+                raise ValueError("run_bars overrides apply only to entry_arm='bridge'")
+            if bar_spec not in ("1-MINUTE-LAST-EXTERNAL", "1-MINUTE-LAST-INTERNAL"):
+                raise ValueError("a registered entry_arm requires 1-MINUTE-LAST bars")
         if chase == "modify":
             raise ValueError(
                 "chase='modify' is refused: no order is modified until the adapter's replace chain "
@@ -394,12 +487,17 @@ class MoverConfig(StrategyConfig):
         self.max_notional = max_notional
         self.max_move = max_move
         self.max_shares = max_shares
+        self.share_caps = None if share_caps is None else dict(share_caps)
+        self.size_from_budget = size_from_budget
         self.entries = entries
         self.bar_spec = bar_spec
         self.slots = slots
         self.watch = watch
         self.risk = risk
+        self.entry_arm = entry_arm
         self.run_bars = run_bars
+        if entry_arm != "bridge":
+            self.run_bars = early_entry_study.ARMS[entry_arm].run_bars
         self.trail = trail
         self.exit_through = exit_through
         self.chase_cap = chase_cap
@@ -431,6 +529,9 @@ class Slot:
     run_ns: int | None = None
     """When the last rising run completed (the bar's `ts_event`), until an entry has been decided on."""
     run_close: Decimal | None = None
+    run_seen_ns: int | None = None
+    """When the node had the bar that completed the run (its `ts_init`): the qualifying market event as
+    the strategy can know it, from which an entry's delay is measured (`mover_window.entry_diagnostics`)."""
     entry_id: ClientOrderId | None = None
     entry_cancel_ns: int = 0
     protect_id: ClientOrderId | None = None
@@ -445,6 +546,12 @@ class Slot:
     from it, so the trigger never falls."""
     priced_ns: int = 0
     was_held: bool = False
+    entry_start: int | None = None
+    """First minute watched by a registered arm; history never warms its rising run."""
+    entry_day: date | None = None
+    """The watch-start minute belongs to this New York day, and resets with a new day."""
+    subscribed_ns: int = 0
+    """When the slot started receiving bars; its first internal minute may be partial."""
 
 
 class Mover(Strategy):
@@ -460,10 +567,19 @@ class Mover(Strategy):
         self.wind_down_at = config.wind_down_at
         self.manage_stop_set = config.manage_stop
         self.slots: dict[InstrumentId, Slot] = {}
+        self.opened_slots: set[InstrumentId] = set()
+        """Every slot subscribed during the run, including names since unwatched, for stream checks."""
         self.rank: list[tuple[InstrumentId, Decimal]] = []
         """The latest ranking, best first; empty until one arrives and after a malformed one."""
         self.rank_ns = 0
         self.rank_faults = 0
+        self.rank_malformed = False
+        """Whether the last ranking heard failed to parse; the ranking is stale until one parses."""
+        self.rankings: list[dict[str, Any]] = []
+        """Every valid published generation, its value and its event/receipt clocks, for the window record."""
+        self.ranking_records: list[dict[str, object]] = []
+        """Every ranking actor tick's result, including why it published nothing; supplied by composition."""
+        self.position_caps: dict[InstrumentId, PositionCap] = {}
         self.rank_said: tuple[int, str, int] | None = None
         """The ranking the log last named: its time, its value and the malformed ones counted then."""
         self.released: set[str] = set()
@@ -471,6 +587,22 @@ class Mover(Strategy):
         self.fills: list[tuple[str, str, str, str, int]] = []
         """Each fill as its event gave it: client order ID, side, quantity, price, time. The session's
         reflection reads a sale's counterfactuals (held on, flat, managed) from these and the tape."""
+        self.unreported: list[tuple[int, Decimal]] = []
+        """Each buy filled on a reported account, asked for and not yet in a report: the account's
+        event count that has it, and its notional (ultra review of the composition, finding 3)."""
+        self.unasked: list[Decimal] = []
+        """Each buy filled on a reported account while a query was in flight: its notional, until a
+        query sent after it."""
+        self.unasked_venue: Any = None
+        """The venue of a reported account with a fill no query has been sent for yet, or None."""
+        self.query_venue: Any = None
+        """The venue of the reported account the last query was sent to, or None before the first."""
+        self.fills_to_report: list[tuple[Any, OrderSide, Decimal]] = []
+        """Each fill since the last step: its venue, side and notional (`on_order_filled`)."""
+        self.query_awaits: int | None = None
+        """The event count the account query in flight brings the account to, or None."""
+        self.query_sent_ns = 0
+        """When the account query in flight was sent, on the node's clock."""
         self.refused: list[tuple[str, str]] = []
         self.dropped: list[str] = []
         """Why each candidate entry was not sent, for the run's report."""
@@ -480,15 +612,35 @@ class Mover(Strategy):
         self.history_bars = 0
         self.history_dropped = 0
         """It requests no history: a window's report reads these of every strategy."""
+        self.entry_contexts: dict[InstrumentId, entry_study.Day] = {}
+        """Explicit per-name ADR 0092 history, supplied by composition before registered-arm entry.
+
+        A Day names its New York date, reference close, earlier sessions latest first, and covered
+        bars since 04:00 (the study's Day contract). Callers supply complete history, with `missing`
+        naming any coverage fault; Mover fetches nothing and refuses absent, wrong-name/day or
+        missing contexts. `covered_to` must reach the incoming minute's open: after a data gap the
+        caller supplies the missing prefix or marks it missing. Completed live bars extend coverage
+        to that minute's end and replace that minute in the context; future minutes
+        are discarded, and pre-watch history informs listing/extension only, never the rising run.
+        Context survives unwatching so the listing clock is the day's, not a new slot's.
+        """
         self.sold: dict[InstrumentId, tuple[int, Decimal | None]] = {}
         """When each name was last sold, and at what price: the name's, until its next sale, so that
         neither a slot closed and opened again nor an entry that never filled loses the cooldown and
         the price the next run must close above."""
         self.notes: dict[InstrumentId, list[str]] = {}
         """What was noted of each name, for the run's report; kept when its slot is closed."""
+        self.entries_sent: list[dict[str, Any]] = []
+        """Each entry sent, as plain values: its client order ID, its instrument, when the node had the
+        bar that qualified it (`qualified_ns`) and that bar's close, and the order's creation time
+        (`submitted_ns`), both on the node's clock. A window reads its diagnostics from these and its
+        own bars (`mover_window.entry_diagnostics`)."""
         self.winding_down = False
         self.sent: deque[tuple[int, int]] = deque()
         """(time, the adapter's request total) at each step of the last 60 seconds."""
+        self.recent = 0
+        """The adapter's requests over the last 60 seconds at this step, which `soft_line` holds
+        entries and chases against."""
 
     # --- handlers that only store what they are given (module header, "Order events") ---------------
 
@@ -507,8 +659,17 @@ class Mover(Strategy):
         except ValueError, TypeError:
             self.rank = []
             self.rank_faults += 1
+            self.rank_malformed = True
             return
         self.rank_ns = signal.ts_event
+        self.rank_malformed = False
+        self.rankings.append(
+            {
+                "value": format_rank(self.rank),
+                "computed_ns": signal.ts_event,
+                "received_ns": signal.ts_init,
+            }
+        )
 
     def on_order_released(self, event: Any) -> None:
         self.released.add(event.client_order_id.value)
@@ -523,6 +684,79 @@ class Mover(Strategy):
                 event.ts_event,
             )
         )
+        # plain attributes only: the handler can run while the strategy is borrowed (see the class
+        # note), so the account is asked for at the next step or before the next buy is sized
+        self.fills_to_report.append(
+            (
+                event.instrument_id.venue,
+                event.order_side,
+                event.last_qty.as_decimal() * event.last_px.as_decimal(),
+            )
+        )
+
+    def _trading_account(self, venue: Any) -> Any:
+        """The venue's account as the portfolio holds it."""
+        return self.portfolio.account(venue)
+
+    def _now_ns(self) -> int:
+        return self.clock.timestamp_ns()
+
+    def _ask_for_the_account(self) -> None:
+        """Ask for a reported account after fills, one query in flight at a time, before any later buy
+        is sized: the adapter's `_query_account`, one GET /account, through upstream's
+        `Strategy.query_account` (the lead's rulings of 2026-11-12 on the ultra review of the
+        composition, finding 3, and on the high round's findings 4 and 5). A calculated account has
+        every fill already and is not asked.
+
+        A query is sent for every fill since the last one, so a step's partial fills cost one request,
+        not one each; while it is unanswered no other is sent, so its report, the account's next
+        event, is taken after every buy it was sent for. A buy filled while it is in flight waits for
+        the next query. One unanswered for `QUERY_WAIT_SECS` is taken as lost and another sent, with
+        or without a fill since (the second read of the high round). A buy's notional is subtracted from
+        the free cash until a report has it; sales never wait on a query.
+        """
+        taken, self.fills_to_report = self.fills_to_report, []
+        for venue, side, notional in taken:
+            account = self._trading_account(venue)
+            if account is None or account.calculate_account_state:
+                continue
+            if side == OrderSide.BUY:
+                self.unasked.append(notional)
+            self.unasked_venue = venue
+        venue = self.unasked_venue or self.query_venue
+        if venue is None:
+            return
+        account = self._trading_account(venue)
+        if account is None:
+            return
+        now = self._now_ns()
+        in_flight = self._in_flight(account)
+        if self.unasked_venue is None and not in_flight:
+            return  # the last query was answered and no fill has come since
+        if in_flight and now - self.query_sent_ns < QUERY_WAIT_SECS * SECOND_NS:
+            return
+        self.query_awaits, self.query_sent_ns = account.event_count + 1, now
+        self.query_venue = venue
+        self.unreported += [(self.query_awaits, notional) for notional in self.unasked]
+        self.unasked, self.unasked_venue = [], None
+        self.query_account(account.id)
+
+    def _in_flight(self, account: Any) -> bool:
+        """Whether the last account query sent is still unanswered: the account has had no report since."""
+        return self.query_awaits is not None and account.event_count < self.query_awaits
+
+    def _unreported_buys(self, account: Any) -> Decimal:
+        """The buys filled that the reported account does not have yet, dropping those it has."""
+        self.unreported = [(n, v) for n, v in self.unreported if account.event_count < n]
+        waiting = sum(self.unasked, Decimal(0))
+        return sum((v for _, v in self.unreported), waiting)
+
+    def _query_wait_secs(self, account: Any) -> float:
+        """How long the account query in flight has gone unanswered, in seconds; 0 with none: what a
+        buy sized now holds back on it (the lead's ruling of 2026-11-12)."""
+        if not self._in_flight(account):
+            return 0.0
+        return max(0, self._now_ns() - self.query_sent_ns) / SECOND_NS
 
     def on_order_denied(self, event: Any) -> None:
         self.refused.append((event.client_order_id.value, str(event.reason)))
@@ -540,14 +774,31 @@ class Mover(Strategy):
         """What a run's report keeps of the strategy, in plain values: its rows, the ranking it last
         had, each fill, each order refused, the orders the emulator released, and each slot's notes."""
         return {
-            "rows": {name: str(getattr(self.settings, name)) for name in OWN_FIELDS},
+            "rows": {
+                name: str(getattr(self.settings, name))
+                for name in OWN_FIELDS
+                if name != "max_shares" or not self.settings.size_from_budget
+            },
             "rank": format_rank(self.rank),
             "rank_ns": self.rank_ns,
+            "rankings": [dict(ranking) for ranking in self.rankings],
+            "ranking_records": [dict(record) for record in self.ranking_records],
+            "opened_slots": sorted(str(instrument) for instrument in self.opened_slots),
             "rank_faults": self.rank_faults,
             "fills": [list(fill) for fill in self.fills],
             "refused": [list(refused) for refused in self.refused],
             "released": sorted(self.released),
             "notes": {str(i): list(notes) for i, notes in self.notes.items()},
+            "entries": [dict(entry) for entry in self.entries_sent],
+            "entry_contexts": {
+                str(instrument): {
+                    "day": context.day.isoformat(),
+                    "bars": len(context.bars),
+                    "covered_to": context.covered_to,
+                    "missing": context.missing,
+                }
+                for instrument, context in self.entry_contexts.items()
+            },
         }
 
     # --- start, bars, the step -------------------------------------------------------------------------
@@ -565,11 +816,22 @@ class Mover(Strategy):
         slot = self.slots.get(bar.bar_type.instrument_id)
         if slot is None or bar.bar_type != slot.bar_type:
             return
+        # rc8 internal minute bars stamp their close at ts_init. The first one can begin before
+        # subscription; neither entry arm may count its partial close, volume or live-bar total.
+        if (
+            bar.bar_type.is_internally_aggregated()
+            and bar.ts_init - 60 * SECOND_NS < slot.subscribed_ns
+        ):
+            self._note(slot, f"{slot.instrument_id}: skipping the first partial INTERNAL minute")
+            return
         self.live_bars += 1
         close = bar.close.as_decimal()
         before = slot.closes[-1] if slot.closes else None
         slot.closes.append(close)
         slot.dollars.append(close * bar.volume.as_decimal())
+        if self.settings.entry_arm != "bridge":
+            self._registered_run(slot, bar)
+            return
         rising = 0  # the closes in a row, to this one, each above the one before
         for later, earlier in pairwise(reversed(slot.closes)):
             if not later > earlier:
@@ -577,7 +839,7 @@ class Mover(Strategy):
             rising += 1
         wanted = self.settings.run_bars
         if rising >= wanted:
-            slot.run_ns, slot.run_close = bar.ts_event, close
+            slot.run_ns, slot.run_close, slot.run_seen_ns = bar.ts_event, close, bar.ts_init
             self._say(f"{slot.instrument_id}: run qualified, {wanted} rising closes to {close}")
         elif before is not None and rising == 0:
             self._say(f"{slot.instrument_id}: run restarted, {close} is not above {before}")
@@ -587,6 +849,82 @@ class Mover(Strategy):
                 f"{slot.instrument_id}: run building, {rising} of {wanted} rising closes "
                 f"({close}{after})"
             )
+
+    def _registered_run(self, slot: Slot, bar: Bar) -> None:
+        """Use the study's listing clock, rising run and extension rule on this bar's known prefix."""
+        from . import early_entry_study as entry_study
+
+        slot.run_ns = slot.run_close = slot.run_seen_ns = None
+        arm = self.settings.entry_arm
+        rows = entry_study.ARMS[arm]
+        # At the pin internal time bars' ts_init is the close regardless of ts_event configuration
+        # (aggregation.rs:1735); adapter EXTERNAL bars' ts_event is their open (parse_bar).
+        opened_ns = (
+            bar.ts_init - entry_study.MINUTE_NS
+            if bar.bar_type.is_internally_aggregated()
+            else bar.ts_event
+        )
+        opened = datetime.fromtimestamp(opened_ns / SECOND_NS, entry_study.NEW_YORK)
+        minute = opened.hour * 60 + opened.minute
+        context = self.entry_contexts.get(slot.instrument_id)
+        if bar.bar_type.is_internally_aggregated() and opened_ns < slot.subscribed_ns:
+            # History owns this minute if it exists. An INTERNAL bar contains only trades received
+            # since this subscription, so it must not overwrite a complete history bar or grant
+            # coverage for the missing part of its minute.
+            self._note(slot, f"{slot.instrument_id}: skipping the first partial INTERNAL minute")
+            return
+        if slot.entry_day != opened.date():
+            slot.entry_day = opened.date()
+            slot.entry_start = minute
+        why = None
+        if context is None:
+            why = "no entry context supplied"
+        elif context.symbol != slot.instrument_id.symbol.value or context.day != opened.date():
+            why = "entry context names another symbol or New York day"
+        elif context.missing is not None:
+            why = f"entry context missing: {context.missing}"
+        elif not entry_study.PART_START <= minute < entry_study.WINDOW_END:
+            why = "outside the entry study's 04:00-16:00 New York window"
+        elif context.covered_to < minute:
+            why = "entry context coverage does not reach this minute's open"
+        if why is not None:
+            self._note(slot, f"{slot.instrument_id}: entry arm {arm}: {why}")
+            return
+        assert context is not None
+        assert slot.entry_start is not None
+        known = {b.start: b for b in context.bars if b.start <= minute}
+        known[minute] = entry_study.Minute(
+            minute,
+            float(bar.open.as_decimal()),
+            float(bar.high.as_decimal()),
+            float(bar.low.as_decimal()),
+            float(bar.close.as_decimal()),
+            float(bar.volume.as_decimal()),
+        )
+        day = replace(context, bars=tuple(known[m] for m in sorted(known)), covered_to=minute + 1)
+        self.entry_contexts[slot.instrument_id] = day
+        seen = entry_study.listing(day, rows)
+        if not seen[-1].listed:
+            ratio = "unknown" if seen[-1].ratio is None else f"{seen[-1].ratio:.3g}"
+            self._note(
+                slot,
+                f"{slot.instrument_id}: entry arm {arm}: not listed "
+                f"(move {seen[-1].move:.1%}, volume ratio {ratio})",
+            )
+            return
+        for index, run, listed_at in entry_study.entry_runs(day, rows, start=slot.entry_start):
+            if index != len(day.bars) - 1:
+                continue
+            why = entry_study.entry_refusal(day, rows, index, run, listed_at)
+            if why is not None:
+                self._note(slot, f"{slot.instrument_id}: entry arm {arm}: {why}")
+                return
+            slot.run_ns, slot.run_close, slot.run_seen_ns = (
+                bar.ts_event,
+                bar.close.as_decimal(),
+                bar.ts_init,
+            )
+            self._say(f"{slot.instrument_id}: entry arm {arm}: run qualified at {slot.run_close}")
 
     def _wind_down(self, event: TimeEvent) -> None:  # the alert only marks it; the step acts
         self.winding_down = True
@@ -612,8 +950,9 @@ class Mover(Strategy):
 
     def _on_step(self, event: TimeEvent) -> None:
         now = event.ts_event
+        self._ask_for_the_account()
         self._say_ranking(now)
-        recent = self._recent_requests(now)
+        recent = self.recent = self._recent_requests(now)
         self._watch(now)
         for slot in list(self.slots.values()):
             self._manage(slot, now)
@@ -668,7 +1007,9 @@ class Mover(Strategy):
     def _fresh(self, now: int) -> bool:
         """Whether a ranking has arrived and is no older than `rank_max_age_secs`."""
         return (
-            bool(self.rank_ns) and now - self.rank_ns <= self.settings.rank_max_age_secs * SECOND_NS
+            not self.rank_malformed
+            and bool(self.rank_ns)
+            and now - self.rank_ns <= self.settings.rank_max_age_secs * SECOND_NS
         )
 
     def _ranked(self, now: int) -> dict[InstrumentId, tuple[int, Decimal]]:
@@ -696,11 +1037,13 @@ class Mover(Strategy):
 
     def _open_slot(self, instrument_id: InstrumentId) -> None:
         bar_type = BarType.from_str(f"{instrument_id}-{self.spec_suffix}")
+        self.opened_slots.add(instrument_id)
         self.slots[instrument_id] = Slot(
             instrument_id=instrument_id,
             bar_type=bar_type,
             closes=deque(maxlen=self.settings.run_bars + 1),
             dollars=deque(maxlen=self.settings.flow_bars),
+            subscribed_ns=self.clock.timestamp_ns(),
         )
         # Quotes and trades first, on the feed: the data engine hands the client only an instrument's
         # first subscription (ADR 0055), and the emulator's own subscription names no feed.
@@ -771,7 +1114,7 @@ class Mover(Strategy):
             slot.floor = slot.trail_trigger = None
             slot.entry_id = slot.protect_id = None
             slot.entry_cancel_ns = slot.priced_ns = 0
-            slot.run_ns = slot.run_close = None
+            slot.run_ns = slot.run_close = slot.run_seen_ns = None
 
     def _protect(self, slot: Slot, held: Decimal, now: int) -> None:
         order = self._order(slot.protect_id)
@@ -869,7 +1212,8 @@ class Mover(Strategy):
         self, slot: Slot, order: Any, held: Decimal, now: int, floor: Decimal | None
     ) -> None:
         """Re-price a sell limit that still rests after `chase_secs`: `exit_ticks` through the bid, not
-        below `floor`, and only downwards."""
+        below `floor`, and only downwards; not while the last 60 seconds' requests are at `soft_line`,
+        where the sale keeps working at its price until the count falls."""
         if not order.is_open or order.is_pending_update or order.is_pending_cancel:
             return
         if order.leaves_qty.as_decimal() < held:
@@ -884,6 +1228,14 @@ class Mover(Strategy):
             return
         price = exit_price(quote.bid_price.as_decimal(), self.settings.exit_ticks, floor)
         if price >= order.price.as_decimal():
+            return
+        if self.recent >= self.settings.soft_line:
+            # the lead's backstop (ADR 0083): near the ceiling a re-price waits, the sale keeps working
+            self._note(
+                slot,
+                f"{slot.instrument_id}: sale not chased while the last 60 s's requests are at the "
+                f"soft line of {self.settings.soft_line}",
+            )
             return
         slot.priced_ns = now
         self.cancel_order(
@@ -931,7 +1283,13 @@ class Mover(Strategy):
     # --- the end -------------------------------------------------------------------------------------
 
     def _end(self) -> None:
-        """The wind-down in the session: upstream's market exit, once, for every slot."""
+        """The wind-down in the session: upstream's market exit, once, for every slot.
+
+        Pinned rc8 strategies.md:768-774 documents that a managed stop requested at backtest end
+        cannot complete: engine.rs:1041-1083 already flushed timers before stop_trader, and the
+        completion check is later. A flat strategy may remain RUNNING in that simulation. Live time
+        continues advancing; the coordinator's 2026-11-11 ruling keeps this wind-down unchanged.
+        """
         if self.settings.extended_hours or self.is_exiting():
             return
         if any(self._held(slot) or self._working(slot) for slot in self.slots.values()):
@@ -947,13 +1305,13 @@ class Mover(Strategy):
         ranked = self._ranked(now)
         candidates.sort(key=lambda slot: ranked.get(slot.instrument_id, (RANK_MOST, 0))[0])
         for slot in candidates:
-            run_close = slot.run_close
-            slot.run_ns = slot.run_close = None  # a run is decided on once
+            run_close, seen = slot.run_close, slot.run_seen_ns
+            slot.run_ns = slot.run_close = slot.run_seen_ns = None  # a run is decided on once
             if slot.was_held or self._working(slot) or self._held(slot):
                 continue
             why = self._refusal(slot, run_close, ranked, recent, now)
             if why is None:
-                why = self._buy(slot, ranked[slot.instrument_id][1])
+                why = self._buy(slot, ranked[slot.instrument_id][1], seen, run_close)
             if why is not None:
                 self.dropped.append(f"{slot.instrument_id}: {why}")
                 self._say(f"{slot.instrument_id}: no entry: {why}")
@@ -981,6 +1339,8 @@ class Mover(Strategy):
         """Why this candidate is not entered now, or None."""
         settings = self.settings
         if not self._fresh(now):
+            if self.rank_malformed:
+                return "the last ranking was malformed"
             return "the ranking is stale" if self.rank_ns else "no ranking yet"
         if slot.instrument_id not in ranked:
             return "no longer ranked"
@@ -1009,14 +1369,23 @@ class Mover(Strategy):
             self.sent.popleft()
         return total - self.sent[0][1]
 
-    def _buy(self, slot: Slot, move: Decimal) -> str | None:
-        """Send the entry; return why not, if it was not sent."""
+    def _buy(
+        self,
+        slot: Slot,
+        move: Decimal,
+        seen: int | None = None,
+        run_close: Decimal | None = None,
+    ) -> str | None:
+        """Send the entry; return why not, if it was not sent. `seen` and `run_close` are the
+        qualifying bar's `ts_init` and close, kept with the entry for the run's record."""
         settings = self.settings
+        if settings.share_caps is not None and slot.instrument_id not in settings.share_caps:
+            return "no share cap for this window instrument"
         quote = self.cache.quote(slot.instrument_id)
         if quote is None:
             return "no quote yet"
         instrument = self._instrument(slot.instrument_id)
-        account = self.portfolio.account(instrument.id.venue)
+        account = self._trading_account(instrument.id.venue)
         balance = None if account is None else account.balance_total(instrument.quote_currency)
         if balance is None:
             return "no account balance to size from"
@@ -1033,24 +1402,87 @@ class Mover(Strategy):
                 f"the bid {bid} is under the planned stop {stop} of an entry at {price}: the quote "
                 "is wider than the plan"
             )
-        free = account.balance_free(instrument.quote_currency)
-        if free is None:
-            return "no free balance to size from"
-        cap = min(settings.max_notional, free.as_decimal()) // price
-        if len(slot.dollars) > 0:
-            cap = min(cap, (settings.flow_share * sum(slot.dollars)) // price)
-        if settings.max_shares is not None:
-            cap = min(cap, Decimal(settings.max_shares))
-        if cap < 1:
-            return f"the caps leave no share at {price}"
         precision = instrument.price_precision
-        quantity = FixedRiskSizer(instrument).calculate(
-            Price.from_str(f"{price:.{precision}f}"),
-            Price.from_str(f"{stop:.{precision}f}"),
-            balance,
-            settings.risk,
-            hard_limit=cap,
-        )
+        sizing: dict[str, str | None] | None = None
+        if settings.size_from_budget:
+            free = account.balance_free(instrument.quote_currency)
+            if free is None:
+                return "no free balance to size from"
+            # the account locks an entry's cash once the venue takes it: one sent and not yet taken
+            # (in this step, say) still counts against what the next entry is sized from; a
+            # reported account locks nothing, so every working entry counts (`entry_reserve`)
+            reported = not account.calculate_account_state
+            unlocked = entry_reserve(
+                (
+                    order
+                    for other in self.slots.values()
+                    if other is not slot and (order := self._order(other.entry_id)) is not None
+                ),
+                reported=reported,
+            )
+            # a buy filled since the last report is not in the reported cash yet, and a sale's
+            # proceeds count only once a report has them (the lead's ruling of 2026-11-12)
+            self._ask_for_the_account()  # a fill this step, before this buy is sized
+            unreported = self._unreported_buys(account) if reported else Decimal(0)
+            query_wait = self._query_wait_secs(account) if reported else 0.0
+            entry_budget = min(settings.max_notional, free.as_decimal() - unlocked - unreported)
+            budget_shares = entry_budget // price
+            flow_dollars = sum(slot.dollars, Decimal(0))
+            flow_shares = settings.flow_share * flow_dollars // price
+            cap = min(budget_shares, flow_shares)
+            binding = "flow" if flow_shares < budget_shares else "budget"
+            if settings.max_shares is not None and Decimal(settings.max_shares) < cap:
+                cap, binding = Decimal(settings.max_shares), "max_shares"
+            # the name's start-time share cap bounds the entry and is never rewritten, so a price
+            # that drifted since the start does not trip the monitor and a trip means a real fault
+            # (the lead's change of 2026-11-12, ultra review of the composition, finding 14)
+            start_cap = (
+                None if settings.share_caps is None else settings.share_caps.get(slot.instrument_id)
+            )
+            if start_cap is not None and Decimal(start_cap) < cap:
+                cap, binding = Decimal(start_cap), "cap_bound"
+            if cap < 1:
+                return f"the budget or flow cap leaves no share at {price}"
+            quantity = instrument.make_qty(int(cap))
+            sizing = {
+                "startup_budget_notional": str(settings.max_notional),
+                "free_cash": str(free.as_decimal()),
+                "unlocked_entries": str(unlocked),
+                "unreported_fills": str(unreported),
+                "account_query_wait_secs": str(round(query_wait, 3)),
+                "budget_notional": str(entry_budget),
+                "budget_shares": str(budget_shares),
+                "flow_dollars": str(flow_dollars),
+                "flow_shares": str(flow_shares),
+                "start_cap": None if start_cap is None else str(start_cap),
+                "binding": binding,
+                "quantity": str(quantity),
+            }
+            self._say(
+                f"{slot.instrument_id}: size budget {entry_budget} USD "
+                f"({budget_shares} shares), flow cap {flow_shares} shares from {flow_dollars} USD, "
+                f"binding {sizing['binding']}, quantity {quantity}"
+            )
+        else:
+            free = account.balance_free(instrument.quote_currency)
+            if free is None:
+                return "no free balance to size from"
+            cap = min(settings.max_notional, free.as_decimal()) // price
+            if len(slot.dollars) > 0:
+                cap = min(cap, (settings.flow_share * sum(slot.dollars)) // price)
+            if settings.max_shares is not None:
+                cap = min(cap, Decimal(settings.max_shares))
+            if settings.share_caps is not None:
+                cap = min(cap, Decimal(settings.share_caps[slot.instrument_id]))
+            if cap < 1:
+                return f"the caps leave no share at {price}"
+            quantity = FixedRiskSizer(instrument).calculate(
+                Price.from_str(f"{price:.{precision}f}"),
+                Price.from_str(f"{stop:.{precision}f}"),
+                balance,
+                settings.risk,
+                hard_limit=cap,
+            )
         if not quantity.is_positive():
             return f"the size from risk came to nothing at {price}"
         order = self.order_factory.limit(
@@ -1062,6 +1494,16 @@ class Mover(Strategy):
         )
         slot.entry_id = order.client_order_id
         slot.entry_cancel_ns = 0
+        self.entries_sent.append(
+            {
+                "client_order_id": order.client_order_id.value,
+                "instrument_id": str(slot.instrument_id),
+                "qualified_ns": seen,
+                "run_close": None if run_close is None else str(run_close),
+                "submitted_ns": order.init_event.ts_init,
+                "sizing": sizing,
+            }
+        )
         self.notes.setdefault(slot.instrument_id, []).append(f"entered at move {move}")
         self._say(
             f"{slot.instrument_id}: BUY {quantity} limit {price} (bid {bid}, planned stop {stop}, "

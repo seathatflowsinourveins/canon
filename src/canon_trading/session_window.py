@@ -3,7 +3,7 @@
 Contract: NautilusTrader v2.0.0rc8's `LiveNode.builder`, `LiveNode.add_builtin_strategy`, `Cache.quote_count`
 and `trade_count`, `LiveExecutionEngineConfig` and `LoggerConfig` with a `FileWriterConfig`
 (`live/__init__.pyi`, `common/__init__.pyi`); alpaca-py 0.45.0's `TradingClient` (paper)
-`get_clock`, `get_calendar`, `get_orders`, `get_all_positions`, `get_asset`, `get_order_by_client_id`,
+`get_account`, `get_clock`, `get_calendar`, `get_orders`, `get_all_positions`, `get_asset`, `get_order_by_client_id`,
 `cancel_order_by_id` and `submit_order` with a `MarketOrderRequest` or, after the stop outside the regular
 session, a `LimitOrderRequest`, `StockHistoricalDataClient.get_stock_latest_quote`, and `get_account_configurations` and
 `set_account_configurations` with an `AccountConfiguration`; for a mover window, `ScreenerClient`
@@ -45,6 +45,10 @@ check's sources, ADR 0060), and the long-only sources 2026-11-11:
   configuration); https://docs.alpaca.markets/us/reference/patchaccountconfig-1.md ("If true, account
   becomes long-only mode", served from the paper host too). What Alpaca answers an order that would sell
   short on such an account is not on either page (UNVERIFIED until `tests/test_paper_long_only.py` runs).
+* alpaca-py 0.45.0, `trading/client.py:465-479`, `get_account` reads `GET /account` into `TradeAccount`;
+  `trading/models.py:565-574` documents `buying_power` (already including the account multiplier) and
+  `cash`. Each Mover node's entry is `min(buying_power, cash) / slots` from one startup read, with its
+  engine's per-order cap at `OUTER_BOUND_MULTIPLE` times that figure (lead's rule, 2026-11-11).
 * https://docs.alpaca.markets/us/reference/postorder.md: 403 "Buying power or shares is not sufficient",
   422 "Input parameters are not recognized". Not documented there or in the pages above: what Alpaca
   answers a lookup of an ID it does not hold (a 404, as the adapter's lookup reads it; UNVERIFIED), and
@@ -124,7 +128,7 @@ or ended stream only there (ADR 0055).
 A mover window (`--mover`, ADR 0083, ADR 0091) chooses its name once. In the regular session its strategy
 is the one named by the arguments: `Mover` for the schedule, or the one-share `SessionMaCross` bridge
 in its marked limit form. By the lead's decision of 2026-11-11, outside the regular session `--mover`
-runs `Mover` too: `MOVER_PARTS` states each part's feed and slot count, one by default. Every venue order
+runs `Mover` too: `MOVER_PARTS` states each part's feed and configured slot count. Every venue order
 there is a DAY limit marked `extended_hours=True`; the trailing stop-limit is held locally and releases
 a marked limit (ADR 0088). Its wind-down is a limit sale and its stop cancels; regular-session market
 exits are unchanged. A part's explicit `bridge_reason` runs the bridge on the same choice and feed,
@@ -164,6 +168,7 @@ import tempfile
 import threading
 import time
 import traceback
+from collections import Counter
 from collections import deque
 from concurrent.futures import Future
 from concurrent.futures import ThreadPoolExecutor
@@ -178,6 +183,7 @@ from datetime import datetime
 from datetime import time as dt_time
 from datetime import timedelta
 from decimal import Decimal
+from decimal import InvalidOperation
 from pathlib import Path
 from typing import TYPE_CHECKING
 from typing import Any
@@ -189,6 +195,7 @@ from alpaca.common.constants import DEFAULT_RETRY_ATTEMPTS
 from alpaca.common.constants import DEFAULT_RETRY_WAIT_SECONDS
 from alpaca.common.exceptions import APIError
 from alpaca.common.rest import RESTClient
+from alpaca.data.enums import Adjustment
 from alpaca.data.enums import DataFeed
 from alpaca.data.historical.corporate_actions import CorporateActionsClient
 from alpaca.data.historical.screener import ScreenerClient
@@ -242,11 +249,17 @@ from nautilus_trader.model import TimeInForce
 
 from .mover import Mover
 from .mover import entry_price
-from .mover_window import ENTRY_NOTIONAL_USD
 from .mover_window import MOVER
 from .mover_window import MOVER_ID
-from .mover_window import OUTER_BOUND_USD
-from .mover_window import mover_parts
+from .mover_window import OUTER_BOUND_MULTIPLE
+from .mover_window import PART_SLOTS
+from .mover_window import RANK_MAX_AGE_SECS
+from .mover_window import entry_diagnostics
+from .mover_window import mover_context_feeds
+from .mover_window import mover_universe_parts
+from .mover_window import part_slots
+from .mover_window import window_bars
+from .mover_window import window_rank
 from .movers_screener import MOVERS_TOP
 from .movers_screener import movers_line
 from .movers_stream import STREAM_LOGGER
@@ -265,12 +278,20 @@ from .paper_node import EMA_CROSS
 from .paper_node import EMA_CROSS_ID
 from .paper_node import MAX_NOTIONAL_PER_ORDER_USD
 from .paper_node import MAX_ORDER_SUBMIT_RATE
+from .paper_node import REQUEST_CEILING as PAPER_REQUEST_CEILING
 from .paper_node import TIMEOUT_DISCONNECTION_SECS
 from .paper_node import TIMEOUT_SHUTDOWN_SECS
 from .paper_node import alpaca_paper_builder
 from .paper_node import ema_cross_config
 from .position_cap import PositionCap
 from .position_cap import position_cap_config
+from .rank_shared import NOT_COMMON
+from .rank_shared import write_atomically
+from .request_budget import TRADING_REQUEST_LIMIT_PER_MINUTE
+from .request_budget import calibration_eligible
+from .request_budget import check_limit
+from .request_budget import observation_seconds
+from .request_budget import request_record
 from .session_ma_cross import LIMIT_OFFSET
 from .session_ma_cross import LIMIT_TIMEOUT_SECS
 from .session_ma_cross import WARM_UP_SPARE_BARS
@@ -285,11 +306,14 @@ if TYPE_CHECKING:
 
     from nautilus_trader.common import Cache
 
+    from .early_entry_study import Day
     from .movers_stream import Historical
     from .movers_stream import Stream
 
 NEW_YORK = ZoneInfo("America/New_York")
 SESSIONS = ("regular", "extended")
+MOVER_SPARES = 2
+"""Startup roster names beyond the held slots (UNCALIBRATED); watched so a free slot can rotate."""
 OVERNIGHT_STARTS = dt_time(20, 0)
 """The overnight session's start in New York, "8:00 PM - 4:00 AM ET", on the evening before its trade date
 (Alpaca's 24/5 page); its end is the trade date's `session_open`."""
@@ -337,12 +361,19 @@ evening and every morning by design; a part not yet probed on its feed runs, and
 (after-hours, and pre-market before 08:00, on `sip`); inside a part with a feed, a
 window that receives nothing still fails (`_data_failure`). The feed is named in the subscriptions' and the bars
 request's params, `{"feed": ...}` (ADR 0055); one not served fails loudly, never another."""
-CALENDAR_BACK = timedelta(days=7)
-"""How far back the calendar is read: past any run of weekend and holiday days before a trading day."""
+CALENDAR_BACK = timedelta(days=14)
+"""How far back the calendar is read: past any run of weekend and holiday days before a trading day, and
+far enough that the registered arm's five earlier sessions are held in the week after a market holiday
+(two weeks hold at least eight trading days in any year: the lead's ruling of 2026-11-12 on the ultra
+review of the composition, finding 4)."""
 DEFAULT_MINUTES = 30
 MAX_MINUTES = 60
-GAP_SECS = 300
-"""Between one window's end and the next one's start."""
+GAP_SECS = 60
+"""Between one window's end and the next one's start: one minute, by the lead's ruling of 2026-11-11. It was
+300 s so that a paper test waiting for the shared stream lock got it; that reason lapsed when each account
+got its own stream lock (#238). Requests are counted per minute (the window's own budget, any 60 s, ADR
+0091; Alpaca's 200 a minute, ADR 0049), so a minute lets the last window's stop and account check leave the
+count before the next start reads and orders (ADR 0044)."""
 FLATTEN_SECS = 120
 """`SessionMaCross` winds down this long before the window ends. A built-in has no wind-down: `EmaCross`
 trades until the stop, and an order it sent then is the account check's to settle (ADR 0060)."""
@@ -401,12 +432,11 @@ WINDOW_STRATEGIES = {
     MOVER: WindowStrategy(
         MOVER_ID,
         SESSIONS,
-        max_notional_per_order=OUTER_BOUND_USD,
     ),
 }
-"""`Mover` (ADR 0088) runs only in a mover window (`--mover`), on the one name `choose_mover` gives, which
-`mover_window.FixedRank` publishes as the ranking; it sizes its own entries (`mover_window`'s rows), so its
-node's per-order cap is the outer bound and its position cap the shares the largest entry buys.
+"""`Mover` (ADR 0088) runs on the loaded startup roster, re-ranked by ADR 0107's actor. Each start
+resolves an account-derived per-slot entry figure for its strategy, actor, share/position monitors and
+the engine's larger per-order outer bound; the generic table cap is not used for a Mover node.
 
 The strategies a window runs, by the name `--strategy` takes (ADR 0068, step 3): the repo's
 `SessionMaCross`, a Python strategy, and upstream's built-in `EmaCross`, added by its type name through
@@ -444,9 +474,13 @@ it a feed (every part has one; a part given none is skipped). The adapter sends
 `extended_hours` from the submit params (ADR 0038), its disconnect is bounded (ADR 0039), and an overnight
 window passed on paper before this was turned on (ADR 0044, Confirmation)."""
 POLL_SECS = 2.5
-"""Between the account check's polls after the stop. A poll sends at most seven requests (`LOOKUPS`
-lookups, two reads, the clock, `CANCELS` cancels or one close), two when nothing is unsettled: at most
-168 a minute, inside the 200 a minute Alpaca's skill gives for the paper API (ADR 0044, Evidence)."""
+"""Between the account check's polls after the stop. A poll sends at most seven trading requests,
+whatever the names held: a reading (`LOOKUPS` lookups, the open orders and the position), then the
+clock and either `CANCELS` cancels, or one close, or outside the regular session the calendar when it
+must be read again; a poll that cancels sends no close, and one that reads the calendar sends no quote
+and no close. An extended close's quote is one market-data request, and a quote that fails ends the
+poll. So at most 168 trading requests a minute, inside the 200 a minute Alpaca's skill gives for the
+paper API (ADR 0044, Evidence), and a poll is never longer than `POLL_AT_LONGEST_SECS`."""
 COMMIT_ENV = "CANON_COMMIT"
 """Set by the scheduled runner, `home/.claude/canon/paper-session.sh`, to the `origin/main` commit it checked
 out for this firing (ADR 0050)."""
@@ -483,8 +517,21 @@ STOP_TIMEOUT_SECS = (
 the node's own stop bounds (`paper_node`), and one Alpaca request at the adapter's timeouts (ADR 0039),
 which a call in flight at the disconnect can outlast it by."""
 AFTER_STOP_SECS = 60
-"""How long the account check after the stop starts polls: a poll begun before it runs to its end, then a
-last reading and a cancel of what it shows (`AFTER_END_SECS`)."""
+"""How long the account check after the stop starts polls with one name held (`after_stop_secs`): a poll
+begun before it runs to its end, then a last reading and a cancel of what it shows (`AFTER_END_SECS`)."""
+
+
+def after_stop_secs(names: int) -> float:
+    """How long the account check starts polls with `names` held: `AFTER_STOP_SECS`, and two poll
+    intervals more (2 x `POLL_SECS`, 5 s) for each name past the first, since the check closes one name a
+    poll and sees it closed in the next (review of 3a8613a, finding 11, the lead's ruling of 2026-11-12).
+    It is wall-clock time, not a count of polls: a poll whose requests answer slowly takes longer than
+    `POLL_SECS`, so slower answers fit fewer polls in it, a limit the deadline accepts. Names past
+    `PART_SLOTS`, the names a window holds at once, add nothing: a run with more `--slots` is refused by
+    name (`part_slots`, the lead's ruling of 2026-11-12), so the bounds below hold for every window."""
+    return AFTER_STOP_SECS + (min(max(names, 1), PART_SLOTS) - 1) * 2 * POLL_SECS
+
+
 REQUEST_SECS = CONNECT_TIMEOUT_SECS + READ_TIMEOUT_SECS
 """One request at the adapter's timeouts (ADR 0039), sent once, as the account check sends it. The two
 timeouts' sum, not a wall-clock bound: the connect timeout applies per address tried and the read timeout
@@ -505,19 +552,37 @@ order and the check's close; with more, the rest wait for the next poll."""
 READING_SECS = (LOOKUPS + 2) * REQUEST_SECS
 """One reading of the account check at its longest: its lookups, the open orders and the position."""
 POLL_AT_LONGEST_SECS = READING_SECS + (1 + CANCELS) * REQUEST_SECS
-"""One poll of the account check at its longest: a reading, the clock, and its cancels (a close, sent
-instead of them, is one request)."""
-LAST_CLOSE_SECS = (
-    STOP_TIMEOUT_SECS + ADAPTER_CALL_SECS + AFTER_STOP_SECS + READING_SECS + REQUEST_SECS
-)
-"""From a window's end until the account check's last market close is sent, at most (about 455 s): the
-stop at its bound, the node's last worker calls, and the check's deadline with the poll begun before it,
-its reading and the clock read. Every request of that poll is counted."""
-AFTER_END_SECS = STOP_TIMEOUT_SECS + ADAPTER_CALL_SECS + AFTER_STOP_SECS + 2 * POLL_AT_LONGEST_SECS
-"""From a window's end until its process is done with Alpaca, at most (about 725 s): the stop, the node's
-last worker calls, the check's deadline, the poll begun before it at its longest, then the last reading,
-the clock and the last cancels, as long again. Every request is counted: a reading looks up no more than
-`LOOKUPS` orders and a step cancels no more than `CANCELS`, however many there are."""
+"""One poll of the account check at its longest: a reading, the clock, and its cancels (the calendar, or
+a quote and a close, sent instead of them, are one request or two)."""
+
+
+def last_close_secs(names: int) -> float:
+    """From a window's end until the account check's last close is sent, with `names` held, at most: the
+    stop at its bound, the node's last worker calls, and the check's deadline (`after_stop_secs`) with
+    the poll begun before it, its reading, the clock read and, outside the regular session, the quote
+    the limit is priced from. Every request of that poll is counted."""
+    return (
+        STOP_TIMEOUT_SECS
+        + ADAPTER_CALL_SECS
+        + after_stop_secs(names)
+        + READING_SECS
+        + 2 * REQUEST_SECS
+    )
+
+
+def after_end_secs(names: int) -> float:
+    """From a window's end until its process is done with Alpaca, with `names` held, at most: the stop,
+    the node's last worker calls, the check's deadline (`after_stop_secs`), the poll begun before it at
+    its longest, then the last reading, the clock and the last cancels, as long again. Every request is
+    counted: a reading looks up no more than `LOOKUPS` orders and a step cancels no more than
+    `CANCELS`, however many there are."""
+    return STOP_TIMEOUT_SECS + ADAPTER_CALL_SECS + after_stop_secs(names) + 2 * POLL_AT_LONGEST_SECS
+
+
+LAST_CLOSE_SECS = last_close_secs(PART_SLOTS)
+"""`last_close_secs` with the most names a window holds (about 515 s)."""
+AFTER_END_SECS = after_end_secs(PART_SLOTS)
+"""`after_end_secs` with the most names a window holds (about 755 s)."""
 SKEW_SECS = 60
 """How far this host's clock may be from Alpaca's: the window runs to an end taken from Alpaca's clock, timed
 on this host's."""
@@ -617,10 +682,19 @@ class WindowConfig:
     strategy: str = DEFAULT_STRATEGY
     """A name of `WINDOW_STRATEGIES`."""
     mover: bool = False
-    """Run on the name `choose_mover` gives at the start, in place of `symbol`, on the part's feed and
-    slot row (`MOVER_PARTS`); `symbol` is then the one chosen."""
+    """Choose at startup on the part's feed (`MOVER_PARTS`). Mover loads a roster with spares and
+    re-ranks it in the node; `symbol` labels the primary name. The compatibility bridge takes one."""
+    slots: int | None = None
+    """`Mover`'s slots, where the run sets them; else the session part's (`mover_window.part_slots`)."""
+    spares: int = MOVER_SPARES
+    """Additional qualified startup names watched by Mover, beyond its held slots."""
+    baseline_path: Path | None = None
+    """ADR 0087's baseline file; None selects catalog/movers-baseline/<feed>.json for the part."""
+    request_limit_per_minute: int = TRADING_REQUEST_LIMIT_PER_MINUTE
+    """Documented Trading API budget setting for the record, not a reported account limit."""
 
     def __post_init__(self) -> None:
+        check_limit(self.request_limit_per_minute)
         if self.session not in SESSIONS:
             raise ValueError(f"session must be one of {SESSIONS}, got {self.session!r}")
         if (runs := WINDOW_STRATEGIES.get(self.strategy)) is None:
@@ -640,6 +714,17 @@ class WindowConfig:
             raise ValueError(
                 f"{MOVER} trades the name the ranking gives, not a given symbol: run it with --mover"
             )
+        if self.slots is not None:
+            if self.strategy != MOVER:
+                raise ValueError(f"slots are {MOVER}'s; {self.strategy} has none")
+            part_slots(self.session, self.slots)  # refuses what is not a positive whole number
+        if type(self.spares) is not int or self.spares < 0:
+            raise ValueError(f"spares must be a nonnegative whole number, got {self.spares!r}")
+        if (
+            self.strategy == MOVER
+            and part_slots(self.session, self.slots) + self.spares > MOVER_CHECKS
+        ):
+            raise ValueError(f"slots plus spares must be at most {MOVER_CHECKS}")
         if not 1 <= self.minutes <= MAX_MINUTES:
             raise ValueError(f"minutes must be 1 to {MAX_MINUTES}, got {self.minutes}")
         if self.minutes * 60 <= FLATTEN_SECS:
@@ -815,6 +900,272 @@ class CachedData:
         return self._cache.trade_count(self._instrument_id)
 
 
+RANKED_TABLE_ROWS = 10
+
+
+def ranked_table(
+    record: Mapping[str, Any], run: Mapping[str, Any], *, tier: str
+) -> list[dict[str, Any]]:
+    """The lead's decision of 2026-11-11: a firing record's top ten ranked names, each with its move since
+    the reference close, dollar volume so far, normal dollar volume for the same clock minutes (the
+    sample's ratio's denominator), the ratio and the clock minutes it spans (the lead's ruling of
+    2026-11-11), its tier and whether it held a slot. A column the sample
+    lacks is marked unavailable by name."""
+    held = set(run.get("opened_slots", ()))
+    sample = record.get("sample") or {}
+    span = (
+        f"the stream sample's {sample['elapsed_minutes']} clock minutes from {sample['from']}"
+        if "elapsed_minutes" in sample and "from" in sample
+        else "unavailable: the record names no sample span"
+    )
+    rows = []
+    for n, scored in enumerate(record.get("ranked", ())[:RANKED_TABLE_ROWS], start=1):
+        ratio, dvol = scored["dvol_ratio"], scored["dvol"]
+        rows.append(
+            {
+                "rank": n,
+                "symbol": scored["symbol"],
+                "move": scored["move"],
+                "dollar_volume": dvol,
+                "normal_dollar_volume": dvol / ratio
+                if ratio > 0
+                else "unavailable: the sample's ratio is not positive",
+                "ratio": ratio,
+                "ratio_span": span,
+                "tier": tier,
+                "held_slot": f"{scored['symbol']}.{VENUE}" in held,
+            }
+        )
+    return rows
+
+
+CENT = Decimal("0.01")
+
+
+def trade_result(
+    fills: Sequence[tuple[str, str, str, str, str]],
+    sent: Sequence[Mapping[str, Any]],
+    *,
+    entry_figure: Decimal,
+) -> dict[str, Any]:
+    """The lead's order of 2026-11-11: each entry's filled size in dollars, with the figure and the bound
+    that set it (the entry's own `sizing` record: budget, flow cap or share bound), and the window's
+    realized result in dollars. `fills` are (client order ID, instrument,
+    side, quantity, price) from the strategy's own fill events; realized is each instrument's sales less
+    their shares at its average buy price, so an open remainder carries no result."""
+    by_order: dict[str, list[tuple[str, Decimal, Decimal]]] = {}
+    totals: dict[str, dict[str, Decimal]] = {}
+    for cid, instrument, side, qty, px in fills:
+        quantity, price = Decimal(qty), Decimal(px)
+        by_order.setdefault(cid, []).append((instrument, quantity, price))
+        t = totals.setdefault(
+            instrument, {"bq": Decimal(0), "bd": Decimal(0), "sq": Decimal(0), "sd": Decimal(0)}
+        )
+        key = "b" if side == "BUY" else "s"
+        t[key + "q"] += quantity
+        t[key + "d"] += quantity * price
+    entries = []
+    for entry in sent:
+        cid = str(entry["client_order_id"])
+        sizing = entry.get("sizing") or {}
+        if parts := by_order.get(cid):
+            entries.append(
+                {
+                    "client_order_id": cid,
+                    "instrument_id": parts[0][0],
+                    "shares": str(sum(q for _, q, _ in parts)),
+                    "dollars": str(sum((q * p for _, q, p in parts), Decimal(0)).quantize(CENT)),
+                    "entry_figure": str(entry_figure),
+                    "budget_notional": sizing.get(
+                        "budget_notional", "unavailable: no sizing record"
+                    ),
+                    "flow_dollars": sizing.get("flow_dollars", "unavailable: no sizing record"),
+                    "bound": sizing.get("binding", "unavailable: no sizing record"),
+                }
+            )
+    by_instrument = {}
+    realized_total = Decimal(0)
+    incomplete = []
+    for instrument, t in totals.items():
+        row = {
+            "bought": str(t["bd"].quantize(CENT)),
+            "sold": str(t["sd"].quantize(CENT)),
+            "open_shares": str(t["bq"] - t["sq"]),
+        }
+        if t["sq"] > t["bq"]:
+            # a sale of shares bought by an order whose fill the window never saw: its cost is unknown,
+            # so nothing in the name is booked (review of the slot commit, finding 2)
+            why = f"sold {t['sq'] - t['bq']} shares more than the window's fills bought"
+            incomplete.append(f"{instrument}: {why}")
+            row["realized"] = f"unavailable: {why}"
+        else:
+            average = t["bd"] / t["bq"] if t["bq"] else Decimal(0)
+            realized = (t["sd"] - t["sq"] * average).quantize(CENT)
+            realized_total += realized
+            row["realized"] = str(realized)
+        by_instrument[instrument] = row
+    return {
+        "entries": entries,
+        "by_instrument": by_instrument,
+        "realized_usd": str(realized_total),
+        "incomplete": incomplete,
+        "flat": all(t["bq"] == t["sq"] for t in totals.values()),
+        "basis": "fill prices at average cost; Alpaca charges no commission on these orders, none counted",
+    }
+
+
+def strategy_fills(cache, strategy_id: StrategyId) -> list[tuple[str, str, str, str, str]]:
+    """(client order ID, instrument, side, quantity, price) for each of the strategy's fill events."""
+    return [
+        (
+            order.client_order_id.value,
+            str(order.instrument_id),
+            order.side.name,
+            str(event.last_qty),
+            str(event.last_px),
+        )
+        for order in cache.orders(strategy_id=strategy_id)
+        for event in order.events()
+        if type(event).__name__ == "OrderFilled"
+    ]
+
+
+LIVE_OPEN_FINDINGS = (
+    (
+        "entries and rotation are confined to the startup roster: an instrument and its position cap "
+        "exist only for the names loaded at node start; on-demand loading for any ranked name is not built"
+    ),
+    (
+        "no boats baseline exists until Wave 2's overnight baseline, so overnight every name ranks in the "
+        "zero-baseline dollar tier under the move condition, recorded in each tick's record and the "
+        "window's mover record; regular and pre-market still refuse to start with no baseline file"
+    ),
+    "Antigravity's M-c findings 1 and 8 are deferred to ADR 0087's no-file rule and part-start seeding",
+    (
+        "its entries are not age-limited: a ranked name is entered whenever its run completes, however long "
+        "after ignition (the lead's words, 2026-11-11; the ignition build adds the limit)"
+    ),
+    (
+        "the actor is not seeded with the part's earlier minutes: a window started mid-part tallies "
+        "dollars from the node's start only, while a row's ratio_span names the part's clock minutes"
+    ),
+    (
+        "a streamed bar is stamped at its receipt, so one handled after a tick's scheduled instant and "
+        "before its callback voids that minute's ranking for every name (ultra review of the "
+        "composition, finding 9, PLAUSIBLE)"
+    ),
+    (
+        "an Alpaca updated bar for a counted minute is refused by the tally as a duplicate and voids "
+        "the next minute's ranking, and the run completing then is refused as stale (finding 10, "
+        "PLAUSIBLE; how often updated bars come is UNVERIFIED)"
+    ),
+    (
+        "a completed history response marks every minute to the current one covered, so a just-closed "
+        "minute Alpaca has not yet published stays a hole in the name's day before its watch (finding "
+        "15, PLAUSIBLE)"
+    ),
+)
+"""What a live-ranking firing's record names as open (the lead's decision of 2026-11-11)."""
+
+
+def _records(run: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    return [r for r in run.get("ranking_records", ()) if isinstance(r, dict)]
+
+
+def live_ranked_table(run: Mapping[str, Any]) -> list[dict[str, Any]] | str:
+    """The last published generation's best ten (`movers_rank_actor.top_rows`), each marked with whether
+    its name held a slot in the window."""
+    published = [r for r in _records(run) if r.get("published") is True and "top" in r]
+    if not published:
+        return "names ranked: none (no generation was published)"
+    held = set(run.get("opened_slots", ()))
+    return [
+        {**row, "held_slot": f"{row['symbol']}.{VENUE}" in held} for row in published[-1]["top"]
+    ]
+
+
+def stream_symbols(run: Mapping[str, Any], *, sampled: object) -> dict[str, Any]:
+    """Distinct symbols the actor's stream had delivered over the window and by its first minute (the
+    first record at least 60 s after the first), beside the stream sample's count."""
+    counted = [
+        (int(r["latency_ns"]["generation"]), int(r["symbols"]))
+        for r in _records(run)
+        if "symbols" in r and isinstance(r.get("latency_ns"), dict)
+    ]
+    if not counted:
+        return {"window": "unavailable: no generation counted symbols", "sample": sampled}
+    first = counted[0][0]
+    later = [n for t, n in counted if t - first >= 60 * 1_000_000_000]
+    return {
+        "window": max(n for _, n in counted),
+        "first_minute": later[0] if later else "unavailable: the window ranked under a minute",
+        "sample": sampled,
+    }
+
+
+def mover_baseline_path(config: WindowConfig, feed: str) -> Path:
+    """Keep the actor's input relative to the checkout, regardless of the caller's directory."""
+    path = config.baseline_path or Path("catalog/movers-baseline") / f"{feed}.json"
+    return (SOURCE_ROOT / path).resolve()
+
+
+@dataclass(frozen=True)
+class MoverAllocation:
+    """One startup account read, shared by selection, entries, monitors, actor and engine."""
+
+    buying_power: Decimal
+    cash: Decimal
+    slots: int
+    entry_notional: Decimal
+
+    def record(self) -> dict[str, Any]:
+        return {
+            "buying_power": str(self.buying_power),
+            "cash": str(self.cash),
+            "slots": self.slots,
+            "entry_notional": str(self.entry_notional),
+            "engine_cash_limit": str(self.cash) if self.cash < self.buying_power else None,
+            "engine_order_cap": str(self.entry_notional * OUTER_BOUND_MULTIPLE),
+        }
+
+
+def mover_allocation(trading: TradingClient, slots: int) -> MoverAllocation:
+    """Alpaca TradeAccount.buying_power already includes its multiplier (alpaca-py models.py:565).
+
+    Read once at each node start. The adapter currently reports CASH with cash as free funds; the
+    allocation and its record keep that engine funding limit explicit rather than modelling margin.
+    """
+    from decimal import ROUND_FLOOR
+
+    part_slots("regular", slots)
+    try:
+        account = trading.get_account()
+    except FAILED as error:
+        raise WindowRefused(
+            f"the startup account could not be read: {type(error).__name__}: {error}"
+        ) from error
+
+    def amount(field: str) -> Decimal:
+        raw = getattr(account, field, None)
+        try:
+            value = Decimal(str(raw))
+        except InvalidOperation as error:
+            raise WindowRefused(
+                f"the startup account's {field} is missing or unparsable"
+            ) from error
+        if not value.is_finite() or value <= 0:
+            raise WindowRefused(f"the startup account's {field} must be positive and finite")
+        return value
+
+    buying_power, cash = amount("buying_power"), amount("cash")
+    entry_notional = (min(buying_power, cash) / slots).quantize(
+        Decimal("0.01"), rounding=ROUND_FLOOR
+    )
+    if entry_notional <= 0:
+        raise WindowRefused("the startup account entry notional is below one cent per slot")
+    return MoverAllocation(buying_power, cash, slots, entry_notional)
+
+
 def window_node(
     config: WindowConfig,
     *,
@@ -824,13 +1175,19 @@ def window_node(
     warm_up_start: datetime | None = None,
     pick: MoverPick | None = None,
     ends: datetime | None = None,
+    slots: int | None = None,
     part: str = "regular",
-) -> tuple[LiveNode, SessionMaCross | Mover | CachedData, PositionCap]:
-    """The node, Alpaca's clients, the native risk limits and runtime checks, with the strategy and the cap
-    it runs (returned too: the node does not hand its Python strategies back; for a built-in, what the
+    entry_contexts: Mapping[InstrumentId, Day] | None = None,
+    entry_notional: Decimal | None = None,
+) -> tuple[LiveNode, SessionMaCross | Mover | CachedData, PositionCap | tuple[PositionCap, ...]]:
+    """The node, Alpaca's clients, the native risk limits and runtime checks, with the strategy and its
+    position caps (one monitor, or a tuple for several names). They are returned too: the node does not
+    hand its Python strategies back; for a built-in, what the
     record reads of it, `CachedData`). `feed` is named in `SessionMaCross`'s subscriptions and its warm-up
     request (ADR 0055); `EmaCross` subscribes with no params, so it runs only where the feed is the
-    adapter's default."""
+    adapter's default. `slots` are `Mover`'s, the session part's (`mover_window.part_slots`); with none,
+    `config.slots`, else the part's row. The actor's baseline is read from the configured path or the
+    per-feed catalog default; no startup ranking is substituted when it cannot publish."""
     runs = WINDOW_STRATEGIES[config.strategy]
     if runs.builtin is not None and feed != FEED.value:
         # holds while `SESSION_FEEDS` gives a built-in's sessions the adapter's default feed
@@ -843,14 +1200,43 @@ def window_node(
     # `SessionMaCross`'s managed stop runs a market exit inside the post-stop delay; a built-in has none.
     # `Mover`'s orders in the session are unmarked, so its stop there is the managed market exit too.
     managed = (not extended) if config.strategy == MOVER else (runs.builtin is None and not limits)
+    instruments: InstrumentId | tuple[InstrumentId, ...] = config.instrument_id
+    mover: Mover | None = None
+    caps: tuple[PositionCap, ...] = ()
+    order_cap = runs.max_notional_per_order
+    if config.strategy == MOVER:
+        if pick is None or ends is None:
+            raise RuntimeError(
+                f"{MOVER} is built on the window's choice and its end; none was given"
+            )
+        if entry_notional is None:
+            raise RuntimeError("a Mover node requires its startup account entry figure")
+        order_cap = entry_notional * OUTER_BOUND_MULTIPLE
+        prices = {InstrumentId.from_str(f"{p.symbol}.{VENUE}"): p.price for p in pick.picks}
+        instruments = tuple(prices)
+        selected_slots = config.slots if slots is None else slots
+        mover, caps = mover_universe_parts(
+            prices,
+            extended=extended,
+            feed=feed,
+            wind_down_at=wind_down_at,
+            market_exit_interval_ms=MARKET_EXIT_INTERVAL_MS,
+            market_exit_max_attempts=MARKET_EXIT_MAX_ATTEMPTS,
+            slots=MOVER_PARTS[part].slots if selected_slots is None else selected_slots,
+            entry_arm=mover_entry_arm(part)[0],
+            entry_contexts=entry_contexts,
+            entry_notional=entry_notional,
+            size_from_budget=True,
+            rank_max_age_secs=RANK_MAX_AGE_SECS,
+        )
     node = (
         alpaca_paper_builder(
             "CANON-PAPER-SESSION",
-            config.instrument_id,
+            instruments,
             # the managed stop's market exit runs inside the post-stop delay
             delay_post_stop_secs=MANAGED_DELAY_POST_STOP_SECS if managed else DELAY_POST_STOP_SECS,
             max_order_submit_rate=runs.max_order_submit_rate,
-            max_notional_per_order=runs.max_notional_per_order,
+            max_notional_per_order=order_cap,
         )
         .with_logging(
             LoggerConfig(
@@ -865,28 +1251,28 @@ def window_node(
         cap = PositionCap(position_cap_config(config.instrument_id))
         node.add_strategy(cap)
         return node, CachedData(node.cache, config.instrument_id), cap
-    if config.strategy == MOVER:
-        if pick is None or ends is None:
-            raise RuntimeError(
-                f"{MOVER} is built on the window's choice and its end; none was given"
-            )
-        mover, ranking, cap = mover_parts(
-            config.instrument_id,
-            price=pick.price,
-            move=Decimal(str(round(float(pick.record["inputs"]["move"]), 6))),
-            computed_at=datetime.fromisoformat(pick.record["at"]),
-            ends=ends,
-            extended=extended,
-            feed=feed,
-            wind_down_at=wind_down_at,
-            market_exit_interval_ms=MARKET_EXIT_INTERVAL_MS,
-            market_exit_max_attempts=MARKET_EXIT_MAX_ATTEMPTS,
-            slots=MOVER_PARTS[part].slots,
+    if mover is not None:
+        from .movers_rank_actor import MoversRankActorConfig
+
+        assert entry_notional is not None and pick is not None
+        # live in every part, overnight included (the lead's decision of 2026-11-11, on the owner's word)
+        ranking = window_rank(
+            MoversRankActorConfig(
+                feed=feed,
+                order_cap=float(entry_notional),
+                baseline_path=str(mover_baseline_path(config, feed)),
+                # with no baseline file, overnight only ranks on dollars (ultra review, finding 2)
+                rank_without_baseline=part == "overnight",
+            ),
+            mover.ranking_records,
         )
         node.add_strategy(mover)
+        for context_feed in mover_context_feeds(mover, feed):
+            node.add_actor(context_feed)
         node.add_actor(ranking)
-        node.add_strategy(cap)
-        return node, mover, cap
+        for cap in caps:
+            node.add_strategy(cap)
+        return node, mover, caps[0] if len(caps) == 1 else caps
     strategy = SessionMaCross(
         SessionMaCrossConfig(
             bar_type=config.bar_type,
@@ -944,6 +1330,10 @@ class WindowReport:
     closes: dict[str, list[str]] = field(default_factory=dict)
     """Each close the account check sent that may have been placed, by its client order ID: what was
     sent, then what came of it (`no answer: ...`, each status Alpaca showed), in order."""
+    check_fills: list[tuple[str, str, str, str, str]] = field(default_factory=list)
+    """Each close of the account check's own that Alpaca showed ended with shares filled, as
+    `strategy_fills` gives the strategy's: (client order ID, instrument, side, quantity, average price);
+    a Mover window's result counts them (`trade_result`)."""
     closes_not_placed: int = 0
     """The closes the account check sent that placed nothing: refused by Alpaca (403, 422), or never sent
     (a connect timeout); `errors` holds what each was answered."""
@@ -989,6 +1379,10 @@ class WindowReport:
     requests_by_api: list[dict[str, Any]] = field(default_factory=list)
     """What the process sent to Alpaca's REST APIs by the window's end, per account and API, as the
     adapter counts it (`canon_alpaca.providers.request_counts`); the account is a number, never a key."""
+    request_budget: dict[str, Any] = field(default_factory=lambda: request_record(()))
+    """Process-average RPM, fixed-minute/rolling peaks and headroom against a limit setting. The
+    adapter retains no minute buckets; `minute_buckets_kept` explicitly records that limit. Only a
+    completed measurement is calibration-eligible; an interruption is preserved across snapshots."""
     fill_prices: dict[str, list[str]] = field(default_factory=dict)
     """Each fill of the strategy's orders, by client order ID: `qty@price` and the venue's time
     (`OrderFilled`'s `last_qty`, `last_px`, `ts_event`). A close the account check sends after the stop is
@@ -1027,19 +1421,6 @@ class WindowSkipped(RuntimeError):
     result; the run exits 0."""
 
 
-def write_atomically(path: Path, body: str) -> None:
-    """Replace `path` whole (`os.replace`), so a reader or a kill never sees half a record, through a
-    temporary file of this writer's own (`tempfile.mkstemp`), so two writers never share one."""
-    fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
-    try:
-        with os.fdopen(fd, "w") as out:
-            out.write(body)
-        os.replace(temporary, path)
-    except BaseException:
-        Path(temporary).unlink(missing_ok=True)
-        raise
-
-
 def records_dir(log_dir: Path) -> Path:
     """Where this run's records go: `log_dir`, or its `by-hand/` for a run by hand (`BY_HAND_ENV`)."""
     if os.environ.get(BY_HAND_ENV, "") == "1":
@@ -1048,14 +1429,110 @@ def records_dir(log_dir: Path) -> Path:
     return log_dir
 
 
-def write_record(log_dir: Path, report: WindowReport | dict) -> None:
+def write_record(
+    log_dir: Path, report: WindowReport | dict, *, refresh_requests: bool = True
+) -> BaseException | None:
     """Write `latest.json`, the one record `scripts/automation status` reads, and, for a window that ran,
-    its own `window-<stamp>.json`, in `records_dir`."""
+    its own `window-<stamp>.json`, in `records_dir`. A final snapshot already checked by the caller is
+    persisted without refreshing it. A snapshot error is recorded and returned after serialization;
+    it never prevents the primary window failure from being written. An interruption (Ctrl-C,
+    SystemExit) during the snapshot is raised once the record is written, never returned."""
+    snapshot_error = _snapshot_requests(report) if refresh_requests else None
+    if (
+        snapshot_error is not None
+        and isinstance(report, WindowReport)
+        and report.result == "running"
+    ):
+        report.result = f"failed: {type(snapshot_error).__name__}: {snapshot_error}"
+        report.ended = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    _finish_request_measurement(report)
     log_dir = records_dir(log_dir)
     body = json.dumps(asdict(report) if isinstance(report, WindowReport) else report, indent=2)
     if isinstance(report, WindowReport):
         write_atomically(log_dir / f"window-{report.started}.json", body)
     write_atomically(log_dir / "latest.json", body)
+    if snapshot_error is not None and not isinstance(snapshot_error, Exception):
+        raise snapshot_error
+    return snapshot_error
+
+
+def _request_measurement_status(fields: dict, budget: dict) -> str:
+    result = fields.get("result")
+    if budget.get("measurement_status") == "interrupted":
+        return "interrupted"
+    if budget.get("snapshot_error"):
+        return "unfinalized"
+    if result == "running":
+        return "running"
+    if result == "ok" and fields.get("ended"):
+        return "complete"
+    if isinstance(result, str) and result.startswith("refused:"):
+        return "refused"
+    if isinstance(result, str) and result.startswith("failed:"):
+        return "failed"
+    return "unfinalized"
+
+
+def _finish_request_measurement(report: WindowReport | dict) -> None:
+    """Update finality only; counts and their observation interval remain the checked snapshot's."""
+    fields = vars(report) if isinstance(report, WindowReport) else report
+    budget = fields.get("request_budget")
+    if not isinstance(budget, dict):
+        return
+    state = _request_measurement_status(fields, budget)
+    elapsed = budget.get("observation_seconds")
+    budget["measurement_status"] = state
+    budget["calibration_eligible"] = calibration_eligible(state, elapsed)
+
+
+def _snapshot_requests(report: WindowReport | dict) -> BaseException | None:
+    """Refresh both request record forms, preserving an interruption through any later write.
+
+    A running record is incomplete even if the process dies without a finalizer. Only an `ok` window
+    with an end timestamp can supply a completed request measurement; generic dictionaries without
+    request-budget fields retain their existing form.
+    """
+    fields = vars(report) if isinstance(report, WindowReport) else report
+    if (prior := fields.get("request_budget")) is None:
+        return None
+    budget = prior if isinstance(prior, dict) else {}
+    try:
+        elapsed = observation_seconds()
+        observation_error = None
+        if not math.isfinite(elapsed) or elapsed < 0:
+            observation_error = "request observation interval is not finite and nonnegative"
+            elapsed = None
+        snapshot = request_record(
+            request_counts(),
+            elapsed_seconds=elapsed,
+            limit_per_minute=budget.get("limit_per_minute", TRADING_REQUEST_LIMIT_PER_MINUTE),
+            measurement_status=_request_measurement_status(fields, budget),
+            ceiling=REQUEST_CEILING,
+        )
+        if observation_error:
+            snapshot["observation_error"] = observation_error
+        fields["request_budget"] = snapshot
+        fields["requests_by_api"] = snapshot["by_api"]
+        return None
+    except BaseException as error:  # noqa: BLE001 - returned to the caller after recording, not discarded
+        # Preserve the prior counts as explicitly stale data, not a replacement measurement. The
+        # caller can still serialize the record and rethrow its primary error instead of this one.
+        budget = dict(budget)
+        budget["snapshot_error"] = f"{type(error).__name__}: {error}"
+        if budget.get("measurement_status") != "interrupted":
+            budget["measurement_status"] = "unfinalized"
+        budget["calibration_eligible"] = False
+        fields["request_budget"] = budget
+        if isinstance(report, WindowReport):
+            _mark_request_interrupted(report, error)
+            report.errors.append(f"request snapshot failed: {type(error).__name__}: {error}")
+        return error
+
+
+def _mark_request_interrupted(report: WindowReport, error: BaseException) -> None:
+    """System interruption or a node left running cannot supply a calibration measurement."""
+    if not isinstance(error, Exception) or isinstance(error, StopTimedOut):
+        report.request_budget["measurement_status"] = "interrupted"
 
 
 def write_heartbeat(log_dir: Path, outcome: str) -> None:
@@ -1228,17 +1705,13 @@ def window_seconds(minutes: int, session_left: float) -> tuple[float, str]:
     return seconds, f"shortened from {minutes} minutes to {seconds:.0f} s: {why}"
 
 
-NOT_COMMON = re.compile(r"\b(warrants?|units?|rights?)\b", re.IGNORECASE)
-"""What in Alpaca's asset `name` marks a warrant, a unit or a right, which a mover window passes over; common
-shares and depositary receipts are kept. A proxy with no upstream behind it: alpaca-py 0.45.0's `Asset` and
-Alpaca's assets page give `class` `us_equity` and no security type."""
 FRESH_TRADE_SECS = 120
 """A mover's latest sip trade must be at most this old at its selection (UNCALIBRATED): a proxy for not
 halted, with no upstream behind it. alpaca-py 0.45.0 reads no halt over REST (`Asset` has `status` and
 `tradable`; Alpaca's asset `attributes` has `overnight_halted` only), and halts come on the stream's
 statuses channel (`subscribe_trading_statuses`), whose page does not say a subscription is sent the current
 status (ADR 0083, gap 4)."""
-MOVER_CHECKS = 10
+MOVER_CHECKS = 20
 """The ranked names checked, best first, before a mover window is refused: each priced and fresh one costs
 one asset read."""
 MOVER_FEED = DataFeed.SIP.value
@@ -1277,14 +1750,21 @@ class MoverPart:
 
 
 MOVER_PARTS = {
-    "regular": MoverPart(DataFeed.SIP.value),
-    "pre-market": MoverPart(DataFeed.SIP.value),
-    "after-hours": MoverPart(DataFeed.SIP.value),
-    "overnight": MoverPart(DataFeed.BOATS.value),
+    "regular": MoverPart(DataFeed.SIP.value, slots=part_slots("regular")),
+    "pre-market": MoverPart(DataFeed.SIP.value, slots=part_slots("pre-market")),
+    "after-hours": MoverPart(DataFeed.SIP.value, slots=part_slots("after-hours")),
+    "overnight": MoverPart(DataFeed.BOATS.value, slots=part_slots("overnight")),
 }
 """The mover choice and node's feed, and Mover's slot row, for each part. Alpaca's Trading API 24/5
 page puts overnight quotes, trades, snapshots and historical bars on `boats` for the account's plan;
 the reference close remains the consolidated regular-session close on `sip`."""
+
+
+def mover_entry_arm(part: str) -> tuple[str, str]:
+    """The registered study's 04:00-16:00 scope; the lead's explicit bridge in other session parts."""
+    if part in ("regular", "pre-market"):
+        return "registered", ""
+    return "bridge", f"{part} is outside the registered arm's 04:00-16:00 New York scope"
 
 
 def no_mover_form(part: str) -> str | None:
@@ -1309,13 +1789,21 @@ class StreamSampleFailed(RuntimeError):
 
 @dataclass(frozen=True)
 class MoverPick:
-    """The name a mover window runs on, its latest price, and what its record keeps of the choice."""
+    """The primary qualified name and any additional startup names, with each name's price and inputs.
+
+    The single-name bridge reads the primary fields; Mover's composition uses `picks`, in rank order.
+    """
 
     symbol: str
     price: Decimal
     record: dict[str, Any]
     entry: Decimal
     """The entry limit one share would be sent at (`entry_limit`), which the cap is checked against."""
+    others: tuple[MoverPick, ...] = ()
+
+    @property
+    def picks(self) -> tuple[MoverPick, ...]:
+        return (self, *self.others)
 
 
 def window_data() -> StockHistoricalDataClient:
@@ -1376,9 +1864,12 @@ def select_mover(
     regular_open: datetime,
     since: date,
     *,
-    strategy: str = DEFAULT_STRATEGY,
+    count: int = 1,
+    order_cap: Decimal = MAX_NOTIONAL_PER_ORDER_USD,
+    for_mover: bool = False,
     part: str = "regular",
     trade_date: date | None = None,
+    entry_notional: Decimal | None = None,
 ) -> MoverPick:
     """The top name of the movers ranking at `at` among Alpaca's gainers that Alpaca reports active and
     tradable, whose latest sip trade is inside `FRESH_TRADE_SECS`, whose one share fits the cap, which is
@@ -1436,7 +1927,7 @@ def select_mover(
         "ranked": [asdict(r) for r in ranked[:MOVER_CHECKS]],
         "passed_over": {},
         "bounds": {
-            "cap_usd": str(MAX_NOTIONAL_PER_ORDER_USD),
+            "cap_usd": str(order_cap),
             "fresh_trade_secs": FRESH_TRADE_SECS,
         },
     }
@@ -1449,9 +1940,12 @@ def select_mover(
         at,
         since,
         len(symbols),
-        strategy=strategy,
+        count=count,
+        order_cap=order_cap,
+        for_mover=for_mover,
         part=part,
         trade_date=trade_date,
+        entry_notional=entry_notional,
     )
 
 
@@ -1465,16 +1959,23 @@ def first_qualified(
     since: date,
     listed: int,
     *,
-    strategy: str = DEFAULT_STRATEGY,
+    count: int = 1,
+    order_cap: Decimal = MAX_NOTIONAL_PER_ORDER_USD,
+    for_mover: bool = False,
     part: str = "regular",
     trade_date: date | None = None,
+    entry_notional: Decimal | None = None,
 ) -> MoverPick:
-    """The first of `ranked`'s best `MOVER_CHECKS` that passes every filter `select_mover` names, with
-    `record` completed; or `WindowRefused` naming why each was passed over. `snapshots` holds each one's
-    latest trade on the selected feed (alpaca-py's `get_stock_snapshot`). For Mover the entry ask must
-    be positive and fit its largest entry; an overnight candidate must be eligible there before it is
-    chosen. The window rechecks both after the choice."""
+    """The first `count` of `ranked`'s best `MOVER_CHECKS` that pass every filter `select_mover` names,
+    in rank order, with `record` completed from the first; or `WindowRefused` naming why each was passed
+    over. `snapshots` holds each one's latest trade on the selected feed (alpaca-py's
+    `get_stock_snapshot`). For Mover the entry ask must be positive and its entry limit fit `order_cap`;
+    an overnight candidate must be eligible there before it is chosen. The window rechecks both after
+    the choice."""
+    if type(count) is not int or not 1 <= count <= MOVER_CHECKS:
+        raise ValueError(f"roster count must be from 1 to {MOVER_CHECKS}, got {count!r}")
     passed: dict[str, str] = record["passed_over"]
+    picks: list[MoverPick] = []
     feed = record.get("feed", MOVER_FEED)
     acted = corporate_actions(
         actions,
@@ -1483,8 +1984,6 @@ def first_qualified(
         at,
         trade_date=trade_date,
     )
-    if strategy == MOVER:
-        record["bounds"]["cap_usd"] = str(ENTRY_NOTIONAL_USD)
     for scored in ranked[:MOVER_CHECKS]:
         symbol = scored.symbol
         trade = getattr(snapshots.get(symbol), "latest_trade", None)
@@ -1496,21 +1995,21 @@ def first_qualified(
         if age > FRESH_TRADE_SECS:
             passed[symbol] = f"its latest {feed} trade is {age:.0f} s old (halted, by the proxy)"
             continue
-        if strategy == MOVER:
+        if for_mover:
             quote = getattr(snapshots.get(symbol), "latest_quote", None)
             ask = Decimal(str(getattr(quote, "ask_price", 0) or 0))
             if not ask.is_finite() or ask <= 0:
                 passed[symbol] = f"no positive ask in its latest {feed} quote"
                 continue
-            entry = entry_price(ask, 0)
-            cap = ENTRY_NOTIONAL_USD
-        else:
-            entry = entry_limit(snapshots.get(symbol), price)
-            cap = MAX_NOTIONAL_PER_ORDER_USD
-        if entry > cap:
+        try:
+            entry = entry_limit(snapshots.get(symbol), price, for_mover=for_mover)
+        except ValueError as error:
+            passed[symbol] = f"no usable entry limit: {error}"
+            continue
+        if entry > order_cap:
             passed[symbol] = (
                 f"one share's entry limit of {entry} USD (last trade {price}) is over the cap of "
-                f"{cap} USD"
+                f"{order_cap} USD"
             )
             continue
         try:
@@ -1536,27 +2035,46 @@ def first_qualified(
             except WindowRefused as e:
                 passed[symbol] = str(e)
                 continue
-        record.update(
-            symbol=symbol,
-            inputs=asdict(scored),
-            price=str(price),
-            entry_limit=str(entry),
-            last_trade_at=trade.timestamp.isoformat(),
-        )
-        return MoverPick(symbol, price, record, entry)
+        inputs = {
+            "symbol": symbol,
+            "inputs": asdict(scored),
+            "price": str(price),
+            "entry_limit": str(entry),
+            "last_trade_at": trade.timestamp.isoformat(),
+        }
+        picks.append(MoverPick(symbol, price, {**record, **inputs}, entry))
+        if len(picks) == count:
+            break
+    if picks:
+        record.update(picks[0].record)
+        record["roster_requested"] = count
+        record["roster"] = [
+            {
+                "symbol": p.symbol,
+                "price": str(p.price),
+                "entry_limit": str(p.entry),
+                "inputs": p.record["inputs"],
+            }
+            for p in picks
+        ]
+        return replace(picks[0], record=record, others=tuple(picks[1:]))
     raise WindowRefused(
         f"no mover qualified among the {len(ranked)} ranked of {listed} listed: "
         + ("; ".join(f"{s}: {why}" for s, why in passed.items()) or "none ranked")
     )
 
 
-def entry_limit(snapshot: object, last: Decimal) -> Decimal:
-    """The limit one share of a mover would be bought at: `SessionMaCross`'s through the touch
-    (`through_the_touch`, the ask plus `LIMIT_OFFSET`), on the snapshot's latest sip quote's ask, or the
-    last trade where that is higher or there is no ask; the risk engine prices a limit order at its limit
-    (Muse's finding 1, 2026-11-11), so this is the notional the per-order cap is checked on."""
+def entry_limit(snapshot: object, last: Decimal, *, for_mover: bool = True) -> Decimal:
+    """Mover's actual ask limit; `ValueError` without a positive ask, since a Mover entry is never
+    priced from the last trade (main's positive-ask rule, ruling (i) of the composition landing).
+    Explicit compatibility callers retain SessionMaCross's through-the-touch offset and
+    max(ask, last) screen."""
     quote = getattr(snapshot, "latest_quote", None)
     ask = Decimal(str(getattr(quote, "ask_price", 0) or 0))
+    if for_mover:
+        if not ask.is_finite() or ask <= 0:
+            raise ValueError("no positive ask in the snapshot's latest quote")
+        return entry_price(ask, 0)
     return through_the_touch(OrderSide.BUY, Decimal(0), max(ask, last), LIMIT_OFFSET)
 
 
@@ -1711,9 +2229,12 @@ def stream_mover(
     sleep: Callable[[float], None] = time.sleep,
     now: Callable[[], datetime] | None = None,
     feed: str = MOVER_FEED,
-    strategy: str = DEFAULT_STRATEGY,
+    count: int = 1,
+    order_cap: Decimal = MAX_NOTIONAL_PER_ORDER_USD,
+    for_mover: bool = False,
     part: str = "regular",
     trade_date: date | None = None,
+    entry_notional: Decimal | None = None,
 ) -> MoverPick:
     """The top name of the movers ranking over a `minutes` sample of the whole market's bars on `feed` that
     passes `first_qualified`'s filters, or `WindowRefused`/`StreamSampleFailed`. The sample is
@@ -1764,7 +2285,7 @@ def stream_mover(
         "ranked": [asdict(r) for r in ranked],
         "passed_over": {},
         "bounds": {
-            "cap_usd": str(MAX_NOTIONAL_PER_ORDER_USD),
+            "cap_usd": str(order_cap),
             "fresh_trade_secs": FRESH_TRADE_SECS,
         },
     }
@@ -1784,9 +2305,12 @@ def stream_mover(
         at,
         since,
         len(close),
-        strategy=strategy,
+        count=count,
+        order_cap=order_cap,
+        for_mover=for_mover,
         part=part,
         trade_date=trade_date,
+        entry_notional=entry_notional,
     )
 
 
@@ -1798,9 +2322,12 @@ def choose_mover(
     *,
     regular_close: datetime,
     feed: str = MOVER_FEED,
-    strategy: str = DEFAULT_STRATEGY,
+    count: int = 1,
+    order_cap: Decimal = MAX_NOTIONAL_PER_ORDER_USD,
+    for_mover: bool = False,
     part: str = "regular",
     trade_date: date | None = None,
+    entry_notional: Decimal | None = None,
 ) -> MoverPick:
     """A mover window's name, chosen once before the node is built: `stream_mover` over a short sample of
     the window's own stream on `feed`; if that fails or qualifies no name, `select_mover` over Alpaca's movers
@@ -1825,9 +2352,12 @@ def choose_mover(
             since,
             now=alpaca_now,
             feed=feed,
-            strategy=strategy,
+            count=count,
+            order_cap=order_cap,
+            for_mover=for_mover,
             part=part,
             trade_date=trade_date,
+            entry_notional=entry_notional,
         )
     except (StreamSampleFailed, WindowRefused, *FAILED) as e:
         failed = f"{type(e).__name__}: {e}"
@@ -1846,9 +2376,12 @@ def choose_mover(
             now,
             regular_open,
             since,
-            strategy=strategy,
+            count=count,
+            order_cap=order_cap,
+            for_mover=for_mover,
             part=part,
             trade_date=trade_date,
+            entry_notional=entry_notional,
         )
     except (
         WindowRefused,
@@ -1897,6 +2430,13 @@ def run_window(
         feed = row.feed
         if config.session == "extended" or config.strategy == MOVER:
             config = replace(config, strategy=DEFAULT_STRATEGY if row.bridge_reason else MOVER)
+        if config.strategy == MOVER:
+            slots_in_use = row.slots if config.slots is None else config.slots
+            if slots_in_use + config.spares > MOVER_CHECKS:
+                raise WindowRefused(
+                    f"{part}'s {slots_in_use} slots plus {config.spares} spares exceed the "
+                    f"ranking interface's {MOVER_CHECKS} names"
+                )
     try:  # the slow average's bars and the spare ones, in the bar type's own interval
         history_from = warm_up_start(
             part,
@@ -1916,7 +2456,11 @@ def run_window(
             f"{account if (account := paper_account()) in PAPER_ACCOUNTS else 'windows'} on"
         )
     mover: dict[str, Any] = {}
+    basis: str | None = None
     pick: MoverPick | None = None
+    entry_contexts: dict[InstrumentId, Day] = {}
+    allocation: MoverAllocation | None = None
+    window_symbols = (config.symbol,)
     if config.mover:  # chosen once, before the node is built (ADR 0083's dated line of 2026-11-11)
         at = clock.timestamp + timedelta(seconds=time.monotonic() - read_at)
         days = _trading_days(calendar)
@@ -1929,6 +2473,23 @@ def run_window(
                 "the trade date and a trading day before it are not both on Alpaca's calendar read, so the "
                 "open and the last completed session are not known"
             )
+        if config.strategy == MOVER:
+            from .movers_rank import NO_BASELINE
+            from .movers_rank import read_baselines
+
+            baseline = mover_baseline_path(config, feed)
+            read = read_baselines(baseline, trade_date)
+            if read.absent and part == "overnight":
+                # overnight ranks in the dollar tier with no file, until Wave 2's overnight baseline
+                # exists; a file that cannot be used still refuses (the lead's ruling, 2026-11-12)
+                basis = NO_BASELINE
+            elif read.problem:
+                raise WindowRefused(
+                    f"the rank actor baseline {baseline} is unusable: {read.problem}"
+                )
+            allocation = mover_allocation(
+                trading, row.slots if config.slots is None else config.slots
+            )
         pick = choose_mover(
             trading,
             at,
@@ -1936,38 +2497,147 @@ def run_window(
             max(earlier),
             regular_close=in_new_york(days[trade_date].close),
             feed=feed,
-            strategy=config.strategy,
+            count=(row.slots if config.slots is None else config.slots) + config.spares
+            if config.strategy == MOVER
+            else 1,
+            order_cap=allocation.entry_notional
+            if allocation is not None
+            else MAX_NOTIONAL_PER_ORDER_USD,
+            for_mover=config.strategy == MOVER,
             part=part,
             trade_date=trade_date,
+            entry_notional=allocation.entry_notional if allocation is not None else None,
         )
         config, price, mover = (
             replace(config, symbol=pick.symbol),
             pick.price,
             pick.record,
         )
+        window_symbols = (pick.symbol,)  # `Mover`'s path below widens it to every priced name
         mover["feed"] = feed
+        if allocation is not None:
+            mover["allocation"] = allocation.record()
         if row.bridge_reason:
             mover["fallback"] = {
                 "part": part,
                 "strategy": DEFAULT_STRATEGY,
                 "reason": row.bridge_reason,
             }
-        one_share_fits(config.symbol, pick.entry)
+        if config.strategy != MOVER:
+            for chosen in pick.picks:
+                one_share_fits(chosen.symbol, chosen.entry)
     else:
         price = share_price(window_data(), config.symbol)
         one_share_fits(config.symbol, price)
     if config.strategy == MOVER and pick is not None:
+        assert allocation is not None
+        entry_notional = allocation.entry_notional
         # at the limit `Mover` itself would send, which is what the risk engine values its order at; the
         # record's `entry_limit` is then this strategy's, not the bridge's through the touch
-        limit = mover_entry_limit(window_data(), config.symbol, feed=feed)
-        if limit > ENTRY_NOTIONAL_USD:
+        data = window_data()
+        priced: list[MoverPick] = []
+        overnight_said: list[str] = []
+        for chosen in pick.picks:
+            try:
+                limit = mover_entry_limit(data, chosen.symbol, feed=feed)
+            except (ValueError, WindowRefused) as error:
+                mover.setdefault("passed_over", {})[chosen.symbol] = (
+                    f"no usable entry limit under the entry figure of {entry_notional} USD: {error}"
+                )
+                continue
+            except FAILED as error:
+                # a spare whose read raises is passed over by name; the chosen name's refuses (the
+                # lead's ruling of 2026-11-12 on the ultra review of the composition, finding 8)
+                if chosen is pick.picks[0]:
+                    raise WindowRefused(
+                        f"the latest quote of the chosen name {chosen.symbol} could not be read "
+                        f"({type(error).__name__}: {error}); not starting"
+                    ) from error
+                mover.setdefault("passed_over", {})[chosen.symbol] = (
+                    f"its latest quote could not be read: {type(error).__name__}: {error}"
+                )
+                continue
+            if limit > entry_notional:
+                mover.setdefault("passed_over", {})[chosen.symbol] = (
+                    f"one share of {chosen.symbol} at its entry limit of {limit} USD is over {MOVER}'s "
+                    f"entry figure of {entry_notional} USD"
+                )
+                continue
+            if part == "overnight":
+                # re-checked by name: a spare that fails is passed over, the chosen name's failure
+                # refuses (the same ruling, finding 7)
+                try:
+                    overnight_said.append(overnight_eligibility(trading, chosen.symbol))
+                except WindowRefused as error:
+                    if chosen is pick.picks[0]:
+                        raise
+                    mover.setdefault("passed_over", {})[chosen.symbol] = (
+                        f"the overnight re-check failed: {error}"
+                    )
+                    continue
+            priced.append(replace(chosen, price=limit, entry=limit, others=()))
+        if not priced:
             raise WindowRefused(
-                f"one share of {config.symbol} at its entry limit of {limit} USD is over {MOVER}'s "
-                f"largest entry of {ENTRY_NOTIONAL_USD} USD; not starting"
+                f"no mover name remains within the entry figure: {mover['passed_over']}"
             )
-        mover["entry_limit"] = str(limit)
-        pick = replace(pick, price=limit)  # the shares the largest entry buys are counted at it
-    overnight = overnight_eligibility(trading, config.symbol) if part == "overnight" else ""
+        pick = replace(priced[0], record=mover, others=tuple(priced[1:]))
+        config, price = replace(config, symbol=pick.symbol), pick.price
+        # the priced name's last trade, not a dropped first pick's (review of 3a8613a, cut list)
+        mover.update(
+            symbol=pick.symbol,
+            inputs=priced[0].record["inputs"],
+            price=str(pick.price),
+            last_trade_at=priced[0].record.get("last_trade_at"),
+        )
+        window_symbols = tuple(p.symbol for p in priced)
+        mover["entry_limit"] = str(pick.price)
+        mover["slots"] = row.slots if config.slots is None else config.slots
+        mover["allocation"] = allocation.record()
+        mover["spares"] = config.spares
+        mover["roster_requested"] = mover["slots"] + config.spares
+        mover["roster"] = [
+            {
+                "symbol": p.symbol,
+                "instrument_id": f"{p.symbol}.{VENUE}",
+                "entry_limit": str(p.price),
+                "max_shares": int(entry_notional // p.price),
+                "inputs": p.record["inputs"],
+            }
+            for p in priced
+        ]
+        arm, reason = mover_entry_arm(part)
+        mover["entry_arm"], mover["entry_arm_reason"] = arm, reason
+        mover["baseline_path"] = str(mover_baseline_path(config, feed))
+        if basis is not None:
+            mover["baseline"] = basis
+        mover["ranking_source"] = f"live: ADR 0107's actor over the wildcard stream on {feed}"
+        mover["open_findings"] = list(LIVE_OPEN_FINDINGS)
+        if arm == "registered":
+            entry_contexts = mover_entry_contexts(
+                data,
+                window_symbols,
+                clock.timestamp + timedelta(seconds=time.monotonic() - read_at),
+                calendar,
+                feed=feed,
+            )
+        mover["entry_contexts"] = {
+            str(instrument_id): {
+                "day": context.day.isoformat(),
+                "bars": len(context.bars),
+                "earlier_sessions": len(context.earlier),
+                "reference": context.reference,
+                "reference_from": context.reference_from,
+                "covered_to": context.covered_to,
+                "missing": context.missing,
+            }
+            for instrument_id, context in entry_contexts.items()
+        }
+    if part != "overnight":
+        overnight = ""
+    elif config.strategy == MOVER and pick is not None:
+        overnight = "; ".join(overnight_said)  # re-checked name by name above
+    else:
+        overnight = "; ".join(overnight_eligibility(trading, symbol) for symbol in window_symbols)
 
     now = clock.timestamp.astimezone(NEW_YORK)
     seconds, shortened = window_seconds(config.minutes, (end_of_session - now).total_seconds())
@@ -1992,17 +2662,23 @@ def run_window(
         no_shorting=no_shorting,
         share_price=str(price),
         mover=mover,
+        request_budget=request_record(
+            (),
+            limit_per_minute=config.request_limit_per_minute,
+        ),
     )
-    write_record(
-        config.log_dir, report
-    )  # `running`: a window killed from here on leaves this behind
+    initial_snapshot_error = write_record(config.log_dir, report)
+    if initial_snapshot_error is not None:
+        raise initial_snapshot_error  # the failed record is already on disk; no node was started
     started = time.monotonic()
     started_wall = datetime.now(UTC)
     abandoned_before = len(_ABANDONED)
     failure: BaseException | None = None
     ran = False  # whether the node was run: only then is the gap marker written
     cache = None
+    result_inputs: tuple[list, list, Decimal] | None = None  # a Mover's fills, entries and figure
     unsettled: dict[str, tuple[str, str]] = {}
+    unsettled_symbols: dict[str, str] = {}
     strategy_id = WINDOW_STRATEGIES[config.strategy].strategy_id
     try:
         node, strategy, cap = window_node(
@@ -2013,7 +2689,12 @@ def run_window(
             warm_up_start=history_from,
             pick=pick,
             ends=ends,
+            slots=(row.slots if config.slots is None else config.slots)
+            if config.strategy == MOVER
+            else None,
             part=part,
+            entry_contexts=entry_contexts,
+            entry_notional=None if allocation is None else allocation.entry_notional,
         )
         cache = node.cache
         try:
@@ -2029,19 +2710,55 @@ def run_window(
                 report.warm_up_dropped = strategy.history_dropped
                 report.quotes, report.trades = strategy.quotes, strategy.trades
                 report.live_bars = strategy.live_bars
-                report.cap_checks, report.cap_peak = cap.checks, str(cap.peak)
-                report.cap_tripped = cap.tripped
+                caps = cap if isinstance(cap, tuple) else (cap,)
+                report.cap_checks = sum(c.checks for c in caps)
+                report.cap_peak = str(max((c.peak for c in caps), default=Decimal(0)))
+                report.cap_tripped = next((c.tripped for c in caps if c.tripped), None)
+                if config.strategy == MOVER:
+                    report.mover["position_caps"] = {
+                        str(c.instrument_id): {
+                            "max_position": str(c.max_position),
+                            "checks": c.checks,
+                            "peak": str(c.peak),
+                            "tripped": c.tripped,
+                        }
+                        for c in caps
+                    }
                 if isinstance(strategy, Mover):
-                    report.mover["run"] = strategy.record()
+                    report.mover["run"] = run = strategy.record()
+                    try:  # the lead's order of 2026-11-11; one that cannot be read is named
+                        result_inputs = (
+                            strategy_fills(cache, strategy_id),
+                            run["entries"],
+                            strategy.settings.max_notional,
+                        )
+                        report.mover["result"] = trade_result(
+                            result_inputs[0], result_inputs[1], entry_figure=result_inputs[2]
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        report.mover["result"] = f"not read: {type(e).__name__}: {e}"
+                    report.mover["sample_ranked_table"] = ranked_table(
+                        report.mover, run, tier="unavailable: the stream sample records no tier"
+                    )
+                    report.mover["ranked_table"] = live_ranked_table(run)
+                    report.mover["stream_symbols"] = stream_symbols(
+                        run, sampled=(report.mover.get("sample") or {}).get("symbols")
+                    )
+                    try:  # diagnostics: one that cannot be read is named, and fails nothing
+                        report.mover["entries"] = mover_entries(run, cache, pick)
+                    except Exception as e:  # noqa: BLE001
+                        report.mover["entries"] = f"not read: {type(e).__name__}: {e}"
             finally:
                 try:
                     # before the disposal, which clears the cache
                     unsettled = _unsettled(cache, strategy_id)
+                    unsettled_symbols = _unsettled_symbols(cache, strategy_id, unsettled)
                 finally:
                     if len(_ABANDONED) == abandoned_before:  # else its abandoned task owns it
                         node.dispose()
     except BaseException as e:
         failure = e
+        _mark_request_interrupted(report, e)
         raise
     finally:
         try:
@@ -2049,6 +2766,7 @@ def run_window(
             if cache is not None and len(_ABANDONED) > abandoned_before:
                 # after the wait: an abandoned node's last submits are in it
                 unsettled = _unsettled(cache, strategy_id)
+                unsettled_symbols = _unsettled_symbols(cache, strategy_id, unsettled)
             for client_order_id, (side, why) in unsettled.items():
                 report.unsettled[client_order_id] = [f"{side}: {why}"]
             report.left = _flatten_after_stop(
@@ -2059,46 +2777,77 @@ def run_window(
                 calendar=calendar,
                 calendar_on=clock.timestamp.astimezone(NEW_YORK).date(),
                 data=window_data,
+                symbols=window_symbols,
+                unsettled_symbols=unsettled_symbols,
             )
         except BaseException as e:  # the account could not be checked: never recorded as ok
             failure = failure or e
+            _mark_request_interrupted(report, e)
             report.errors.append(f"checking the account after the stop: {type(e).__name__}: {e}")
             raise
+        else:
+            if result_inputs is not None and report.check_fills:
+                # the check's own closes are the window's too (review of fire-m-c, finding 11); a
+                # result that cannot be read is named and fails nothing, as the first reading
+                fills, sent, figure = result_inputs
+                try:
+                    report.mover["result"] = trade_result(
+                        [*fills, *report.check_fills], sent, entry_figure=figure
+                    )
+                    report.mover["result"]["check_closes"] = len(report.check_fills)
+                except Exception as e:  # noqa: BLE001
+                    report.mover["result"] = f"not read: {type(e).__name__}: {e}"
         finally:
-            report.ended = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-            report.requests_by_api = [
-                {
-                    "account": c.account,
-                    "api": c.api,
-                    "total": c.total,
-                    "peak_minute": c.peak,
-                    "peak_60s": c.peak_60s,
-                    "rate_limited": c.rate_limited_total,
-                }
-                for c in request_counts()
-            ]
-            if ran:
-                marker.write_text(str(time.time()))
-                _read_stream_lines(report, config.log_dir / f"window-{stamp}.log")
-            no_data = _data_failure(report) if ran else None
-            over_budget = request_failure(report) if config.strategy == MOVER else None
-            if failure is not None:
+            snapshot_taken = False
+            if len(_ABANDONED) > abandoned_before:
+                # an abandoned node's calls may still send after the snapshot: not a full measurement
+                report.request_budget["measurement_status"] = "interrupted"
+            try:
+                if ran:
+                    marker.write_text(str(time.time()))
+                    _read_stream_lines(report, config.log_dir / f"window-{stamp}.log")
+                snapshot_error = _snapshot_requests(report)
+                snapshot_taken = True
+                if snapshot_error is not None and not isinstance(snapshot_error, Exception):
+                    raise snapshot_error  # Ctrl-C or SystemExit during the snapshot
+                no_data = _data_failure(report) if ran else None
+                over_budget = (
+                    request_failure(report)
+                    if config.strategy == MOVER and snapshot_error is None
+                    else None
+                )
+                if failure is not None:
+                    report.result = f"failed: {type(failure).__name__}: {failure}"
+                elif report.left:
+                    report.result = f"failed: not left flat: {report.left}"
+                elif report.cap_tripped:
+                    report.result = f"failed: {report.cap_tripped}"
+                elif snapshot_error is not None:
+                    # the account's outcome above outranks a bookkeeping error; it is raised below
+                    failure = snapshot_error
+                    report.result = f"failed: {type(failure).__name__}: {failure}"
+                elif no_data:
+                    report.result = f"failed: {no_data}"
+                elif over_budget:
+                    report.result = f"failed: {over_budget}"
+                else:
+                    report.result = "ok"
+            except BaseException as e:
+                failure = failure or e
+                _mark_request_interrupted(report, e)
                 report.result = f"failed: {type(failure).__name__}: {failure}"
-            elif report.left:
-                report.result = f"failed: not left flat: {report.left}"
-            elif report.cap_tripped:
-                report.result = f"failed: {report.cap_tripped}"
-            elif no_data:
-                report.result = f"failed: {no_data}"
-            elif over_budget:
-                report.result = f"failed: {over_budget}"
-            else:
-                report.result = "ok"
-            write_record(config.log_dir, report)
+                raise
+            finally:
+                report.ended = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+                if not snapshot_taken:
+                    _snapshot_requests(report)  # preserve the primary preparation failure, if any
+                write_record(config.log_dir, report, refresh_requests=False)
     if report.left:
         raise RuntimeError(f"the paper account was not left flat: {report.left}")
     if report.cap_tripped:
         raise RuntimeError(f"the position cap stopped the window: {report.cap_tripped}")
+    if snapshot_error is not None:
+        raise snapshot_error
     if no_data:
         raise RuntimeError(f"the window ran without market data: {no_data}")
     if over_budget:
@@ -2122,6 +2871,126 @@ def overrun(started_wall: datetime, ran: float, ends: datetime) -> str:
     return f"the process was suspended for about {slept:.0f} s (a machine sleep); {when}"
 
 
+def mover_entry_contexts(
+    data: StockHistoricalDataClient,
+    symbols: Sequence[str],
+    at: datetime,
+    calendar: AlpacaCalendar | Sequence[AlpacaCalendar] | None,
+    *,
+    feed: str,
+) -> dict[InstrumentId, Day]:
+    """Supply ADR 0092's registered arm with each name's known Day, before the node's bars.
+
+    alpaca-py 0.45.0 `StockBarsRequest`/`get_stock_bars` (`data/requests.py:85-106`,
+    `data/historical/stock.py:75-99`) reads split-adjusted minute history on the part's feed in one
+    paginated request, and the last completed regular daily reference on SIP in another. Current-day
+    bars begin at 04:00 New York and end before this minute; earlier calendar sessions are latest first,
+    at most the registered arm's baseline length, and a name with fewer is missing. Sparse minutes stay
+    sparse. A failed read raises;
+    missing reference/calendar input stays named in Day.missing and never borrows the startup sample's
+    reference. A successful requested range supplies coverage, including minutes without a trade.
+    """
+    from . import early_entry_study as study
+
+    now = at.astimezone(NEW_YORK)
+    today = now.date()
+    covered_to = min(study.WINDOW_END, max(study.PART_START, now.hour * 60 + now.minute))
+    sessions = sorted((d for d in _trading_days(calendar) if d < today), reverse=True)[
+        : study.ARMS["registered"].baseline_sessions
+    ]
+    if not sessions:
+        return {
+            InstrumentId.from_str(f"{symbol}.{VENUE}"): study.Day(
+                symbol,
+                today,
+                (),
+                (),
+                None,
+                covered_to=covered_to,
+                missing="no earlier calendar session",
+            )
+            for symbol in symbols
+        }
+    minute = data.get_stock_bars(
+        StockBarsRequest(
+            symbol_or_symbols=list(symbols),
+            timeframe=TimeFrame.Minute,
+            start=datetime.combine(sessions[-1], dt_time(4), NEW_YORK),
+            end=now.replace(second=0, microsecond=0) - timedelta(microseconds=1),
+            feed=DataFeed(feed),
+            adjustment=Adjustment.SPLIT,
+        )
+    )
+    daily = data.get_stock_bars(
+        StockBarsRequest(
+            symbol_or_symbols=list(symbols),
+            timeframe=TimeFrame.Day,
+            start=datetime.combine(sessions[0], dt_time(0), NEW_YORK),
+            end=datetime.combine(today, dt_time(0), NEW_YORK) - timedelta(microseconds=1),
+            feed=DataFeed.SIP,
+            adjustment=Adjustment.SPLIT,
+        )
+    )
+    if not isinstance(minute, BarSet) or not isinstance(daily, BarSet):
+        raise TypeError("alpaca-py returned raw history data; the client must use raw_data=False")
+    contexts: dict[InstrumentId, Day] = {}
+    for symbol in symbols:
+        by_day: dict[date, list[study.Minute]] = {}
+        for bar in sorted(minute.data.get(symbol, ()), key=lambda b: b.timestamp):
+            opened = bar.timestamp.astimezone(NEW_YORK)
+            clock_minute = opened.hour * 60 + opened.minute
+            if (
+                opened.date() not in (*sessions, today)
+                or not study.PART_START <= clock_minute < study.WINDOW_END
+                or opened + timedelta(minutes=1) > now.replace(second=0, microsecond=0)
+            ):
+                continue
+            by_day.setdefault(opened.date(), []).append(
+                study.Minute(clock_minute, bar.open, bar.high, bar.low, bar.close, bar.volume)
+            )
+        references = [
+            b
+            for b in daily.data.get(symbol, ())
+            if b.timestamp.astimezone(NEW_YORK).date() == sessions[0]
+        ]
+        reference = None if not references else max(references, key=lambda b: b.timestamp).close
+        wanted = study.ARMS["registered"].baseline_sessions
+        if reference is None or reference <= 0:
+            missing = "no prior-session reference close"
+        elif len(sessions) < wanted:  # never a normal over fewer sessions than the arm registered
+            missing = (
+                f"only {len(sessions)} earlier sessions on the calendar read; the registered arm "
+                f"takes {wanted}"
+            )
+        else:
+            missing = None
+        contexts[InstrumentId.from_str(f"{symbol}.{VENUE}")] = study.Day(
+            symbol,
+            today,
+            tuple(by_day.get(today, ())),
+            tuple(tuple(by_day.get(session, ())) for session in sessions),
+            reference,
+            covered_to=covered_to,
+            missing=missing,
+            reference_from=f"split-adjusted SIP daily bar of {sessions[0]}",
+        )
+    return contexts
+
+
+def mover_entries(run: Mapping[str, Any], cache, pick: MoverPick | None) -> list[dict[str, Any]]:
+    """Each entry's two diagnostics (`mover_window.entry_diagnostics`), from the strategy's record, the
+    bars the node built (read before the node is disposed, which clears its cache) and the reference
+    close the window's choice read for its name (`movers_stream.Scored.reference`)."""
+    entries = run.get("entries", [])
+    references = {}
+    for chosen in () if pick is None else pick.picks:
+        reference = chosen.record.get("inputs", {}).get("reference")
+        if reference is not None:
+            references[f"{chosen.symbol}.{VENUE}"] = Decimal(str(reference))
+    bars = window_bars(cache, [str(e["instrument_id"]) for e in entries])
+    return entry_diagnostics(entries, run.get("fills", []), bars, references)
+
+
 def mover_entry_limit(
     data: StockHistoricalDataClient, symbol: str, *, feed: str = MOVER_FEED
 ) -> Decimal:
@@ -2142,7 +3011,7 @@ def mover_entry_limit(
     return entry_price(Decimal(str(ask)), 0)
 
 
-REQUEST_CEILING = 180
+REQUEST_CEILING = PAPER_REQUEST_CEILING
 """The most requests a mover node may send Alpaca's trading API in any 60 seconds (UNCALIBRATED, ADR 0088):
 under Alpaca's 200 a minute for an account; a window at or over it fails by name, as one that met a 429
 does."""
@@ -2162,7 +3031,7 @@ def request_failure(report: WindowReport) -> str | None:
     return None
 
 
-STREAM_LINES = ("Alpaca stream on feed ", "Cannot subscribe: ")
+STREAM_LINES = ("Alpaca stream on feed ", "Cannot subscribe: ", "NotImplementedError")
 """How the adapter's data client begins each line it logs about its stream: alpaca-py's own warnings and
 errors, relayed from the stream's thread, the stream's end by itself, and a subscription it refused, a
 feed other than its stream's among them (`canon_alpaca.data`, ADR 0055; the package README)."""
@@ -2194,17 +3063,32 @@ def _data_failure(report: WindowReport) -> str | None:
     """Why the window's market data cannot be trusted, or None: the adapter logged an error about its
     stream (it ended by itself, or Alpaca refused it), or the stream delivered no quote and no trade for
     the symbol in the whole window. A window with quotes but no trade, and so no bar, is a quiet market,
-    not a failure: overnight that is normal (the record's `live_bars` shows it)."""
+    not a failure: overnight that is normal (the record's `live_bars` shows it). Mover always needs a
+    published actor generation; with no slot ever opened that proves delivery without quote/trade
+    subscriptions, otherwise an empty slot stream names all the symbols actually subscribed.
+    """
     if errors := [
         line
         for line in report.stream
         if (level := LOG_LEVEL.match(line)) is not None and level["level"] == "ERROR"
     ]:
         return f"the {report.feed} data stream reported an error: {errors[0]}"
+    if unsupported := next((line for line in report.stream if "NotImplementedError" in line), None):
+        return f"an unimplemented data subscription: {unsupported}"
+    symbols = report.symbol
+    if report.strategy == MOVER:
+        run = report.mover.get("run", {})
+        records = run.get("ranking_records", [])
+        if not any(record.get("published") is True for record in records):
+            reasons = records[-1].get("reasons", []) if records else ["the actor recorded no tick"]
+            return f"the rank actor produced no published generation: {reasons}"
+        if not (opened := run.get("opened_slots", [])):
+            return None  # the actor saw bars, but the strategy never subscribed to quotes/trades
+        symbols = ", ".join(InstrumentId.from_str(instrument).symbol.value for instrument in opened)
     if not report.quotes and not report.trades:
         return (
             f"no market data: the {report.feed} stream delivered no quote and no trade for "
-            f"{report.symbol} in {report.seconds} s"
+            f"{symbols} in {report.seconds} s"
         )
     return None
 
@@ -2281,6 +3165,8 @@ class _Unsettled:
     check's end."""
     sent_at: float = 0.0
     """When the check sent it (`time.monotonic`)."""
+    symbol: str = ""
+    """The window name this request belongs to; empty until known, so it can block any name's close."""
 
     def missing(self) -> str:
         what = "close" if self.own else "order"
@@ -2295,38 +3181,46 @@ class _AccountCheck:
     def __init__(
         self,
         trading: TradingClient,
-        symbol: str,
+        symbol: str | Sequence[str],
         report: WindowReport,
         unsettled: Mapping[str, str],
         *,
         calendar: AlpacaCalendar | Sequence[AlpacaCalendar] | None = None,
         calendar_on: date | None = None,
         data: Any = None,
+        unsettled_symbols: Mapping[str, str] | None = None,
     ) -> None:
         self.trading = trading
-        self.symbol = symbol
+        self.symbols = tuple(dict.fromkeys((symbol,) if isinstance(symbol, str) else symbol))
         self.report = report
         self.calendar = calendar
         """Alpaca's calendar as the window read it at its start, which places the extended session's
         parts (`session_part`); read here only if a close outside the regular session needs it and the
         clock's day is not the one it was read on (`calendar_on`; a window that slept into another day)."""
         self.calendar_on = calendar_on
-        self.extended_refused = False
-        """Whether Alpaca refused a close outside the session (an asset not tradable overnight, say): no
-        other is sent in this check."""
+        self.extended_refused: set[str] = set()
+        """The names whose close outside the session Alpaca refused (an asset not tradable overnight,
+        say): no other is sent for them in this check."""
         self.data = data
         """alpaca-py's market data client, or a callable that builds one, for the quote a close outside
         the regular session is priced from; built on the first such close."""
         self.clock: AlpacaClock | None = None  # the clock's last answer
-        self.requests = {c: _Unsettled(c, side) for c, side in unsettled.items()}
+        known_symbols = unsettled_symbols or {}
+        self.requests = {
+            c: _Unsettled(c, side, symbol=known_symbols.get(c, "")) for c, side in unsettled.items()
+        }
         self.turn = deque(self.requests)  # whose lookup comes next
         self.closes_sent = 0
+        self.close_turn = False
+        """Whether the next poll with an order working closes instead of canceling: polls alternate, so
+        an order that never ends cannot hold another name's close (the lead's ruling of 2026-11-12)."""
         self.ended: set[str] = set()  # Alpaca's IDs of the orders it showed in a terminal status
-        self.listed: list = []  # the open orders in the symbol of the last reading
-        self.held = Decimal(0)  # the position in the symbol of the last reading
+        self.listed: list = []  # the open orders in the window symbols of the last reading
+        self.held = dict.fromkeys(self.symbols, Decimal(0))
         self.others: list = []  # the open orders in other symbols of the last reading
         self.others_held: dict[str, Decimal] = {}  # the positions in other symbols, likewise
         self.tried: dict[str, int] = {}  # the cancels sent for each order
+        self.close_tries: Counter[str] = Counter()  # the closes sent or left unpriced in each name
         self.open_until: float | None = None  # by the clock's last answer; None before any
         for client_order_id, side in unsettled.items():
             report.unsettled.setdefault(client_order_id, [side or "side not known"])
@@ -2334,37 +3228,41 @@ class _AccountCheck:
     def read(self) -> list[str]:
         """One reading: look up to `LOOKUPS` unsettled requests up, then read the account's open orders,
         which show a request as its lookup does, and its positions; return what is left (`left`). The
-        reading is of the whole account; only the symbol's orders and position are the check's to act
+        reading is of the whole account; only the window symbols' orders and positions are the check's to act
         on. A lookup that fails is recorded and the reading goes on; a failed read of the orders or the
         positions raises."""
         self._look_up()
         listed = open_orders(self.trading)
-        self.listed = [o for o in listed if o.symbol == self.symbol]
-        self.others = [o for o in listed if o.symbol != self.symbol]
+        self.listed = [o for o in listed if o.symbol in self.symbols]
+        self.others = [o for o in listed if o.symbol not in self.symbols]
         for order in self.listed:  # the listing shows a request as its lookup does
             if (request := self.requests.get(str(order.client_order_id))) is not None:
                 self._seen(request, order)
         self.others_held = positions(self.trading)
-        self.held = self.others_held.pop(self.symbol, Decimal(0))
+        self.held = {s: self.others_held.pop(s, Decimal(0)) for s in self.symbols}
         return self.left()
 
     def left(self) -> list[str]:
         """What keeps the account from being flat, as last read: each working order and the position in
         the symbol, each unsettled request Alpaca has not shown, then what other symbols hold."""
         return (
-            described(self.working(), self.held, self.symbol)
+            [item for s, qty in self.held.items() for item in described(self.working(s), qty, s)]
             + [r.missing() for r in self.requests.values() if r.order is None]
             + elsewhere(self.others, self.others_held)
         )
 
-    def working(self) -> list:
+    def working(self, symbol: str | None = None) -> list:
         """Every order known to work: the open orders last listed, and each unsettled request Alpaca
         showed working that the listing lacks (the two need not agree); none Alpaca has shown ended."""
         orders = {str(o.id): o for o in self.listed}
         for request in self.requests.values():
             if request.order is not None:
                 orders.setdefault(str(request.order.id), request.order)
-        return [o for order_id, o in orders.items() if order_id not in self.ended]
+        return [
+            o
+            for order_id, o in orders.items()
+            if order_id not in self.ended and (symbol is None or o.symbol == symbol)
+        ]
 
     def _look_up(self) -> None:
         for _ in range(min(LOOKUPS, len(self.turn))):
@@ -2387,6 +3285,7 @@ class _AccountCheck:
         """Alpaca showed `order` under the request's ID: working, it is tracked; terminal, the request is
         settled."""
         request.asked = True
+        request.symbol = str(getattr(order, "symbol", "")) or request.symbol
         status = _value(getattr(order, "status", None))
         log = (self.report.closes if request.own else self.report.unsettled)[
             request.client_order_id
@@ -2398,6 +3297,20 @@ class _AccountCheck:
         if status in TERMINAL:
             self.ended.add(str(getattr(order, "id", "")))
             self._settle(request)
+            filled, price = (
+                getattr(order, "filled_qty", None),
+                getattr(order, "filled_avg_price", None),
+            )
+            if request.own and filled and price and Decimal(str(filled)) > 0:
+                self.report.check_fills.append(
+                    (
+                        request.client_order_id,
+                        f"{request.symbol}.{VENUE}",
+                        str(_value(getattr(order, "side", None) or request.side)).upper(),
+                        str(filled),
+                        str(price),
+                    )
+                )
         else:
             request.order = order
 
@@ -2425,6 +3338,13 @@ class _AccountCheck:
             self.open_until = asked_at
         return bool(clock.is_open)
 
+    def calendar_due(self) -> bool:
+        """Whether `extended_part` must read the calendar: none is held, or it was read on another day than
+        the clock's last answer."""
+        assert self.clock is not None
+        today = self.clock.timestamp.astimezone(NEW_YORK).date()
+        return self.calendar is None or (self.calendar_on is not None and self.calendar_on != today)
+
     def extended_part(self) -> str:
         """The part of the extended session open by the clock's last answer (`session_part`): `pre-market`,
         `after-hours` or `overnight`, or "" with the reason noted. The calendar is the window's own while
@@ -2444,22 +3364,20 @@ class _AccountCheck:
             _note(self.report, f"not closing the position: no part of a session is open: {e}")
             return ""
 
-    def cancel(self, *, final: bool = False) -> None:
+    def cancel(self, *, final: bool = False) -> int:
         """Cancel what works, those not yet tried first: `CANCELS` orders in a poll; as the check ends,
         every one, a further cancel starting only while the step has taken under the time `CANCELS - 1`
         requests may, so the step stays inside the `CANCELS` requests counted for it. A close of the
         check's own is left to fill while it still closes the position held and the session is open; one
         sent outside the regular session (`extended`) for `LIMIT_TIMEOUT_SECS`, as the strategy leaves
         its own limits, then canceled, so the next is priced from a fresh quote, and canceled as the check
-        ends, so none Alpaca has shown works once the process has gone."""
+        ends, so none Alpaca has shown works once the process has gone. Returns the cancels sent."""
         unwanted, wanted = [], []
         for order in self.working():
             request = self.requests.get(str(order.client_order_id))
+            held = self.held.get(order.symbol, Decimal(0))
             closes = (
-                request is not None
-                and request.own
-                and self.held
-                and request.side == _closing_side(self.held)
+                request is not None and request.own and held and request.side == _closing_side(held)
             )
             if closes and request is not None and request.extended:
                 if final or time.monotonic() - request.sent_at >= LIMIT_TIMEOUT_SECS:
@@ -2478,92 +3396,141 @@ class _AccountCheck:
         when = " as the check ends" if final else ""
         began = time.monotonic()
         unwanted.sort(key=lambda o: self.tried.get(str(o.id), 0))
-        for sent, order in enumerate(unwanted):
+        sent = 0
+        for order in unwanted:
             in_time = time.monotonic() - began < (CANCELS - 1) * REQUEST_SECS
             if sent >= CANCELS and not (final and in_time):
                 break
             self.tried[str(order.id)] = self.tried.get(str(order.id), 0) + 1
+            sent += 1
             try:
                 self.trading.cancel_order_by_id(order.id)
             except FAILED as e:  # it filled or ended meanwhile, or the cancel was lost
                 _note(self.report, f"canceling {order.client_order_id}{when}: {e}")
+        return sent
 
     def act(self) -> bool:
         """One step toward a flat account after a reading; False once nothing is left to do or to look
-        for. With an order working, cancel (`cancel`) and send no close: a held order keeps its shares
-        from one. With none, close the position if nothing sent and not found could close it too and
-        Alpaca's clock, read now, says the session is open."""
-        if self.working():
-            self.cancel()
+        for. With an order working, cancel (`cancel`) and send no close in its symbol: a held order keeps
+        its shares from one. Close another name's position if nothing sent and not found could close it
+        too and Alpaca's clock, read now, says the session is open; outside it, through a limit priced from
+        the name's quote. A name with a working order or no price is passed for this poll, and the names
+        tried least come first, so one name that cannot finish never holds the others' closes. A poll
+        sends at most seven trading requests (`POLL_SECS`): one that sent a cancel sends no close, one
+        that read the calendar no quote and no close, and a quote that fails ends the poll. With an order
+        working and another name to close, polls alternate between canceling and closing (`close_turn`),
+        so an order whose cancel never takes cannot hold every other name's close."""
+        working = self.working()
+        busy = {o.symbol for o in working}
+        closable = any(
+            held and symbol not in busy and symbol not in self.extended_refused
+            for symbol, held in self.held.items()
+        )
+        if working and not (self.close_turn and closable) and self.cancel():
+            # no close in a poll that canceled: its clock read and close would pass the seven requests
+            # a poll counts (`POLL_SECS`); the close goes out in the next poll
+            self.close_turn = True
             return True
-        if not self.held:
+        self.close_turn = False
+        pending = bool(working)
+        if not any(self.held.values()):
             # requests Alpaca has not shown: look again; else only other symbols' are left, not the
             # window's to act on
-            return bool(self.requests)
-        side = _closing_side(self.held)
-        if waiting := [
-            r.client_order_id
-            for r in self.requests.values()
-            if r.order is None and r.side in (side, "")
-        ]:
-            _note(
-                self.report,
-                f"not closing the position while {', '.join(waiting)}, sent and not found at Alpaca, "
-                f"may still be placed: a second {side} is not sent",
-            )
+            return pending or bool(self.requests)
+        open_now: bool | None = None
+        part: str | None = None
+        for symbol, held in sorted(self.held.items(), key=lambda item: self.close_tries[item[0]]):
+            if not held or symbol in self.extended_refused:
+                continue
+            if symbol in busy:
+                continue
+            side = _closing_side(held)
+            if waiting := [
+                r.client_order_id
+                for r in self.requests.values()
+                if r.order is None and r.side in (side, "") and r.symbol in ("", symbol)
+            ]:
+                _note(
+                    self.report,
+                    f"not closing the position while {', '.join(waiting)}, sent and not found at Alpaca, "
+                    f"may still be placed: a second {side} is not sent ({symbol})",
+                )
+                continue
+            # one fresh clock read and at most one close per poll, for every universe size
+            if open_now is None:
+                open_now = self.session_open(fresh=True)
+            if open_now:
+                self.close_tries[symbol] += 1
+                self._close(symbol, side)
+                return True
+            # Outside the regular session a market order would only queue: Alpaca takes a limit order
+            # marked extended hours, DAY or GTC, in pre-market, after-hours and overnight (module header).
+            if part is None:
+                calendar_read = self.calendar_due()
+                part = self.extended_part()
+                if part and calendar_read:
+                    # the calendar took this poll's request; the quote and close come next
+                    return True
+                if part:
+                    try:
+                        window_feed(part)
+                    except RuntimeError as e:  # no feed set for the part, so no quote to price from
+                        _note(self.report, f"not closing the position: {e}")
+                        part = ""
+            if not part:
+                return pending or bool(self.requests)
+            if self.data is None or callable(self.data):
+                self.data = (self.data or window_data)()
+                send_once(self.data)
+            try:
+                limit, quote = close_limit(self.data, symbol, side, part)
+            except FAILED as e:  # looked for again in the next poll, after the other names
+                _note(
+                    self.report, f"no price for a {part} close: {type(e).__name__}: {e} ({symbol})"
+                )
+                self.close_tries[symbol] += 1
+                return True  # one quote a poll (`POLL_SECS`); the names tried least come first next
+            self.close_tries[symbol] += 1
+            self._close(symbol, side, limit=limit, quote=f"{part}, {quote}")
             return True
-        if self.session_open(fresh=True):
-            self._close(side)
-            return True
-        # Outside the regular session a market order would only queue: Alpaca takes a limit order
-        # marked extended hours, DAY or GTC, in pre-market, after-hours and overnight (module header).
-        if self.extended_refused or not (part := self.extended_part()):
-            return bool(self.requests)
-        try:
-            window_feed(part)
-        except RuntimeError as e:  # no feed set for the part, so no quote to price a close from
-            _note(self.report, f"not closing the position: {e}")
-            return bool(self.requests)
-        if self.data is None or callable(self.data):
-            self.data = (self.data or window_data)()
-            send_once(self.data)
-        try:
-            limit, quote = close_limit(self.data, self.symbol, side, part)
-        except FAILED as e:  # looked for again in the next poll
-            _note(self.report, f"no price for a {part} close: {type(e).__name__}: {e}")
-            return True
-        self._close(side, limit=limit, quote=f"{part}, {quote}")
-        return True
+        return pending or bool(self.requests)
 
-    def _close(self, side: str, *, limit: Decimal | None = None, quote: str = "") -> None:
-        """Send a close for the held quantity under a client order ID of the check's own, which finds it
-        again whatever becomes of the answer: in the regular session a DAY market order; outside it a DAY
-        limit at `limit`, marked `extended_hours`. A close that placed nothing (Alpaca's refusal, or a
-        connect timeout on its only attempt) is settled at once and counted; any other failure leaves it
-        unsettled."""
-        qty = abs(self.held)
+    def _close(
+        self, symbol: str, side: str, *, limit: Decimal | None = None, quote: str = ""
+    ) -> None:
+        """Send a close for the held quantity in `symbol` under a client order ID of the check's own,
+        which finds it again whatever becomes of the answer: in the regular session a DAY market order;
+        outside it a DAY limit at `limit`, marked `extended_hours`. A close that placed nothing (Alpaca's
+        refusal, or a connect timeout on its only attempt) is settled at once and counted; any other
+        failure leaves it unsettled."""
+        qty = abs(self.held[symbol])
         self.closes_sent += 1
         client_order_id = (
             f"{CLOSE_ID_PREFIX}{self.report.started}-{self.closes_sent}-{uuid4().hex[:8]}"
         )
         request = _Unsettled(
-            client_order_id, side, own=True, extended=limit is not None, sent_at=time.monotonic()
+            client_order_id,
+            side,
+            own=True,
+            extended=limit is not None,
+            sent_at=time.monotonic(),
+            symbol=symbol,
         )
         self.requests[client_order_id] = request
         self.turn.appendleft(client_order_id)  # looked up first in the next reading
         if limit is None:
-            what = f"sent: {side} {qty} {self.symbol} at market"
+            what = f"sent: {side} {qty} {symbol} at market"
             order_request: MarketOrderRequest | LimitOrderRequest = MarketOrderRequest(
-                symbol=self.symbol,
+                symbol=symbol,
                 qty=float(qty),
                 side=AlpacaOrderSide(side),
                 time_in_force=AlpacaTimeInForce.DAY,
                 client_order_id=client_order_id,
             )
         else:
-            what = f"sent: {side} {qty} {self.symbol} limit {limit}, DAY, extended hours ({quote})"
+            what = f"sent: {side} {qty} {symbol} limit {limit}, DAY, extended hours ({quote})"
             order_request = LimitOrderRequest(
-                symbol=self.symbol,
+                symbol=symbol,
                 qty=float(qty),
                 side=AlpacaOrderSide(side),
                 time_in_force=AlpacaTimeInForce.DAY,
@@ -2582,7 +3549,8 @@ class _AccountCheck:
                 self._settle(request)
                 # nothing works, so the refusal is of the close itself (an asset not tradable in the
                 # part): sending it again each poll would be refused again
-                self.extended_refused = self.extended_refused or (refused and request.extended)
+                if refused and request.extended:
+                    self.extended_refused.add(request.symbol)
             elif isinstance(e, APIError):
                 log.append(f"no answer: HTTP {e.status_code}")
             else:
@@ -2638,9 +3606,14 @@ def _flatten_after_stop(
     calendar: AlpacaCalendar | Sequence[AlpacaCalendar] | None = None,
     calendar_on: date | None = None,
     data: Any = None,
+    symbols: Sequence[str] | None = None,
+    unsettled_symbols: Mapping[str, str] | None = None,
 ) -> list:
-    """What the account holds after the stop, once the check has worked at clearing the symbol: the
-    reading is of the whole account, and what another symbol holds is named and left alone.
+    """What the account holds after the stop, once the check has worked at clearing every window
+    symbol (`symbols`, or `config.symbol` for a single-name run): the reading is of the whole account,
+    and what another symbol holds is named and left alone. Each poll sends at most one close, so the
+    request bound is independent of the window's size. `unsettled_symbols` attributes each node request
+    to its name; a request without a known name blocks any position its side could close.
 
     The check keeps one set of requests whose end the window does not know: each order of the node's in
     `unsettled` (its client order ID and side; `_unsettled`), and each close the check itself sends. A
@@ -2648,8 +3621,9 @@ def _flatten_after_stop(
     (`get_order_by_client_id`), or, for a close, Alpaca's refusal of the request (403, 422). The account
     is flat when no order is open, no position is held and the set is empty; nothing else is recorded ok.
 
-    A poll each `POLL_SECS`, none starting once `AFTER_STOP_SECS` have gone; one begun before runs to its
-    end. A poll reads (`_AccountCheck.read`: up to `LOOKUPS` lookups, in turn, then the open orders and
+    A poll each `POLL_SECS`, none starting once `after_stop_secs` of the most window names a reading has
+    shown held have gone (`AFTER_STOP_SECS` for one, two polls more for each further name up to
+    `PART_SLOTS`); one begun before runs to its end. A poll reads (`_AccountCheck.read`: up to `LOOKUPS` lookups, in turn, then the open orders and
     the position) and, if the account is not flat, acts (`act`): an order that works, listed or shown by
     its lookup, is canceled, on every poll until Alpaca shows it ended, in any session, up to `CANCELS`
     a poll; with none working, a position still held is closed for the held quantity under a client
@@ -2676,14 +3650,16 @@ def _flatten_after_stop(
     send_once(trading)
     check = _AccountCheck(
         trading,
-        config.symbol,
+        (config.symbol,) if symbols is None else symbols,
         report,
         unsettled or {},
         calendar=calendar,
         calendar_on=calendar_on,
         data=data,
+        unsettled_symbols=unsettled_symbols,
     )
-    deadline = time.monotonic() + AFTER_STOP_SECS
+    started = time.monotonic()
+    deadline = started + after_stop_secs(1)
     left: list[str] | None = None
     last_error = ""
     more = True
@@ -2692,6 +3668,8 @@ def _flatten_after_stop(
             left = check.read()
             if not left:
                 return left
+            names = sum(1 for held in check.held.values() if held)
+            deadline = max(deadline, started + after_stop_secs(names))
             more = check.act()
         except FAILED as e:
             last_error = f"{type(e).__name__}: {e}"
@@ -2710,7 +3688,7 @@ def _flatten_after_stop(
         _note(report, f"reading the account as the check ends: {last_error}")
         if left is None:
             raise RuntimeError(
-                f"the account could not be read in {AFTER_STOP_SECS} s after the stop: {last_error}"
+                f"the account could not be read in {deadline - started:g} s after the stop: {last_error}"
             ) from e
         left = check.left()
     # The process is ending: nothing the window knows of is left working, but a close that will fill.
@@ -2875,6 +3853,17 @@ ANSWERED = frozenset(
 """The events by which the node has heard what became of an order it sent."""
 
 
+def _unsettled_symbols(
+    cache, strategy_id: StrategyId, unsettled: Mapping[str, tuple[str, str]]
+) -> dict[str, str]:
+    """Copy each unsettled order's instrument symbol before native disposal clears the cache."""
+    return {
+        order.client_order_id.value: order.instrument_id.symbol.value
+        for order in cache.orders(strategy_id=strategy_id)
+        if order.client_order_id.value in unsettled
+    }
+
+
 def _unsettled(cache, strategy_id: StrategyId) -> dict[str, tuple[str, str]]:
     """The strategy's orders the node did not see end, by client order ID, each with its side and why it
     is here: `sent with no answer` of Alpaca's (the adapter logs an unknown outcome and leaves the order
@@ -3004,6 +3993,15 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="run on the session's top mover, chosen at the start; Mover in every extended part",
     )
+    parser.add_argument(
+        "--slots",
+        type=int,
+        help=f"{MOVER}'s slots; default: seven in every part",
+    )
+    parser.add_argument("--spares", type=int, default=MOVER_SPARES, help="extra Mover roster names")
+    parser.add_argument(
+        "--baseline-path", type=Path, help="default: catalog/movers-baseline/<feed>.json"
+    )
     parser.add_argument("--log-dir", type=Path, help="default: `default_log_dir()`")
     return parser
 
@@ -3018,6 +4016,14 @@ def _args(argv: Sequence[str] | None) -> argparse.Namespace:
         parser.error("--regular-strategy names a part's strategy, so it needs --session auto")
     if args.regular_strategy == MOVER and not args.mover:
         parser.error(f"--regular-strategy {MOVER} trades the day's mover, so it needs --mover")
+    runs_mover = MOVER in (args.strategy, args.regular_strategy) or (
+        args.mover and args.session in ("extended", "auto")  # an extended part runs Mover with it
+    )
+    if args.slots is not None and not runs_mover:
+        parser.error(
+            f"--slots are {MOVER}'s, so they need --strategy or --regular-strategy {MOVER}, or "
+            "--mover outside the regular session"
+        )
     if args.log_dir is None:
         args.log_dir = default_log_dir()
     elif not args.log_dir.is_absolute():
@@ -3065,6 +4071,9 @@ def _main(args: argparse.Namespace) -> int:
             log_dir=args.log_dir,
             strategy=args.strategy,
             mover=args.mover,
+            slots=args.slots if args.strategy == MOVER else None,
+            spares=args.spares,
+            baseline_path=args.baseline_path,
         )
         write_heartbeat(args.log_dir, f"a {session} window of {args.strategy}")
         report = run_window(config, trading=trading, market=market, market_read_at=market_read_at)
@@ -3076,7 +4085,7 @@ def _main(args: argparse.Namespace) -> int:
         print(f"paper:session: {e}", file=sys.stderr)
         _heard(args.log_dir, f"refused: {e}")  # the refusal stands, said above
         try:
-            write_record(
+            unrecorded = write_record(
                 args.log_dir,
                 {
                     "session": session,
@@ -3087,8 +4096,14 @@ def _main(args: argparse.Namespace) -> int:
                     "stale_after": STALE_RUNNING_SECS,
                     "commit": running_commit(),
                     "account": paper_account(),
+                    "request_budget": request_record(()),
                 },
             )
+            if unrecorded is not None:
+                print(
+                    f"paper:session: the refused record's request snapshot failed: {unrecorded}",
+                    file=sys.stderr,
+                )
         except OSError as written:
             print(f"paper:session: the record could not be written: {written}", file=sys.stderr)
         return 1
