@@ -121,8 +121,9 @@ locally on the data client's live data; nothing in `src/` builds one yet (ADR 00
 * **Paper only.** `AlpacaExecutionClientConfig` refuses `paper` other than `True`, any `url_override`
   and any value naming Alpaca's live host, and the client builds alpaca-py's clients with `paper=True`
   whatever the config holds; `test_upstream_contract.py` asserts alpaca-py's trading clients default to
-  paper (package README, ADR 0009, ADR 0030). Agents never place, modify or cancel a live order, and
-  the record keeps trading on paper at least until NautilusTrader v2.0.0 stable (ADR 0009).
+  paper (package README, ADR 0009, ADR 0030). Live orders go only through the live lane's `live:*`
+  tasks, with a configuration class apart from this one; nothing trades live until ADR 0110 is accepted
+  and its live order tasks are on `main` (ADR 0103).
 * **The key pairs** are in the login keychain: account A's, service `canon-alpaca-paper`, which only
   `mise run paper:test` and, in data-only mode with every request but GET refused, `mise run paper:data`
   put in an environment (ADR 0070), and account B's, service `canon-alpaca-paper-windows`, which

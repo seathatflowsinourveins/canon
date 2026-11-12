@@ -65,6 +65,9 @@ code that builds a live URL at run time; keeping live credentials off this machi
 
 The paragraph above is superseded by ADR 0020 (2026-11-10): the guard is removed. Both safety rules stand.
 
+The two safety rules above and "paper trading only until v2.0.0 stable" are superseded by ADR 0103
+(2026-11-12): live orders go through one live lane's landed tasks only. The pins and the rest stand.
+
 ### Consequences
 
 * Good: backtest and live parity on one engine; official sources at every foundation.

@@ -23,8 +23,12 @@ dependency, pattern and practice traces to a pinned upstream or a dated source. 
 6. **Pins move deliberately.** Only `scripts/canon resolve` writes the lock, after reading the upstream
    changelog. Never edit `canon/upstreams.lock.json` by hand.
 7. **Decisions expire.** An ADR past its `review-by` date is re-verified before you rely on it.
-8. **Paper trading only.** Agents never place, modify or cancel live orders, and live credentials never enter
-   this repo or an agent's context (ADR 0009).
+8. **Paper for every session but the live lane.** Every session but the live lane trades on paper alone.
+   The live lane, one Claude Code session started for it, may place, modify and cancel live orders, and only
+   through its `mise run live:*` tasks. Nothing trades live until ADR 0110 is accepted and its live order
+   tasks are on `main`. There is no other path: no direct alpaca-py call, CLI, MCP server or connector. No
+   session ever reads, prints, logs or commits a credential, paper or live, and nothing about the owner's
+   account enters a tracked file (ADR 0103).
 9. **One model per conversation.** Switching model mid-session discards the prompt cache; delegate bulky or
    cheap work to a subagent instead. Changing effort is fine (ADR 0005, ADR 0006).
 10. **Proportion and evidence.** The north star is the trading work: before starting anything outside it,
@@ -104,17 +108,18 @@ workflow's actions; the session brief lists the open ones (ADR 0016).
 
 No hook runs before a tool call (ADR 0020). The rules are held where they cannot be skipped: GitHub merges
 nothing that has not passed `scripts/ci` and does not carry the `signoff` status `scripts/land` posts,
-`scripts/ci` fails when `uv.lock` is out of date, and live credentials never enter this repo or an agent's
-context. `.claude/settings.json` pre-approves a short list of commands, among them `scripts/land`,
-`scripts/canon resolve <id>` for one pin and `uv add name==version` pinned exactly, so a lane following a
-skill is not stopped. What rewrites everything or reaches outside the checkout asks the owner first:
-`scripts/canon resolve` with no id, every `uv sync` (a lane syncs with `uv run --locked`), `uv add` with a
-range, a URL or an upgrade flag, the installers, a direct `git push`, and a direct `gh` write of the
-kinds ADR 0028 lists. If a prompt or a check stops you, do not look for another route: say what you
-wanted to do and why.
+and `scripts/ci` fails when `uv.lock` is out of date. No credential enters this repo or an agent's context;
+that is a rule in text, held by where the pairs are stored and which tasks read them, the live pair only
+the live lane's `live:*` tasks (ADR 0103). `.claude/settings.json` pre-approves a short list of commands,
+among them `scripts/land`, `scripts/canon resolve <id>` for one pin and `uv add name==version` pinned
+exactly, so a lane following a skill is not stopped. What rewrites everything or reaches outside the
+checkout asks the owner first: `scripts/canon resolve` with no id, every `uv sync` (a lane syncs with
+`uv run --locked`), `uv add` with a range, a URL or an upgrade flag, the installers, a direct `git push`,
+and a direct `gh` write of the kinds ADR 0028 lists. If a prompt or a check stops you, do not look for
+another route: say what you wanted to do and why.
 
-This is the same for every runtime, Claude Code or not: use no credentials, and leave landing to
-`scripts/land` (ADR 0018).
+This is the same for every runtime, Claude Code or not: use no credentials, leave live to the live lane,
+and leave landing to `scripts/land` (ADR 0018, ADR 0103).
 
 ## Orca
 
