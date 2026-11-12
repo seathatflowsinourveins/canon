@@ -15,6 +15,7 @@ import subprocess
 import sys
 import time
 import tomllib
+from dataclasses import asdict
 from dataclasses import dataclass
 from dataclasses import field
 from dataclasses import replace
@@ -7392,6 +7393,37 @@ def test_the_record_keeps_each_fill_and_the_worst_submit_delay() -> None:
     assert report.worst_submit_delay_ms == 180
     assert report.fill_prices == {"O-1": ["1@1.25 1970-01-01T00:00:01.400000+00:00"]}
     assert report.fills == 1
+
+
+def test_the_record_counts_the_instrument_notifications_upstream_refused_apart_from_the_stream(
+    tmp_path,
+) -> None:
+    """A whole-market start logs one error for each instrument past the 1,024 its execution client's
+    command queue holds (NautilusTrader `d53849b216e2`, `crates/live/src/python/runtime.rs:39`,
+    `:187-192`; `crates/live/src/python/client/mod.rs:1960-1972`; the adapter's README, "Instrument load
+    and the command queue"). The record keeps their number in a field of its own; they are not stream
+    lines, so they neither fail the window nor crowd out a line that should, and the other notification
+    a full queue refuses, an external order's registration (`client/mod.rs:1953-1957`), is not among
+    them. That the node logs the instrument line in this form is held on a real node's log by the
+    adapter's `test_instrument_load.py`, through the same `INSTRUMENT_REFUSAL`."""
+    refusal = (
+        "2026-11-12T15:56:11.000000000Z [ERROR] B-001.nautilus_live::python::client: Client ALPACA "
+        "instrument update failed: RuntimeError: Client ALPACA command queue is full"
+    )
+    other = (
+        "2026-11-12T15:56:12.000000000Z [ERROR] B-001.nautilus_live::python::client: Client ALPACA "
+        "external order registration failed: RuntimeError: Client ALPACA command queue is full"
+    )
+    stream = "2026-11-12T15:56:13.000000000Z [ERROR] B-001.ALPACA: Alpaca stream on feed sip ended"
+    log = tmp_path / "window.log"
+    log.write_text("\n".join([*([refusal] * 13_389), other, stream]) + "\n")
+    report = session_window.WindowReport("regular", "LLL", started="s")
+
+    session_window._read_stream_lines(report, log)
+
+    assert report.instrument_refusals == 13_389
+    assert report.stream == [stream]
+    assert json.loads(json.dumps(asdict(report)))["instrument_refusals"] == 13_389
 
 
 def test_a_sample_whose_stream_logs_a_reconnect_fails() -> None:

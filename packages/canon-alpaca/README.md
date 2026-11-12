@@ -478,6 +478,42 @@ Each is stated where it is implemented, with its source.
 
 Each is stated in `execution.py`'s header, with its source.
 
+* **Instrument load and the command queue:** a node that loads more than 1,024 instruments at its start
+  (`load_all`, the whole market) logs one error for each instrument past the first 1,024, `Client ALPACA
+  instrument update failed: RuntimeError: Client ALPACA command queue is full`. It is an upstream limit,
+  not a load that failed. NautilusTrader gives a Python client one "FIFO queue with capacity for 1,024
+  waiting operations", says "A full queue rejects further admission", and admits each published
+  instrument's notification, `_on_instrument`, to the execution client's queue
+  (`docs/developer_guide/python_adapters.md:168-170`, `:408`; `crates/live/src/python/runtime.rs:39`,
+  `:187-192`; `crates/live/src/python/client/mod.rs:1960-1972`, at the pinned `d53849b216e2`). The node's
+  start connects the data clients, then puts every instrument they buffered into the cache in one
+  synchronous loop, then connects the execution clients (`crates/live/src/node/mod.rs:35-48`,
+  `:484-493`; `crates/live/src/runner.rs:375-411`); nothing can drain the queue inside that loop, so no
+  pacing in an adapter lifts the limit, and upstream documents no setting for the capacity (the base
+  client builds its runtime with the default, `nautilus_trader/live/clients.py:160`). v2.0.0rc9 and
+  upstream's development branch on 2026-11-12 have the same code.
+  What is refused is only the notification, a hook this client does not override. The data engine
+  adds an instrument to the cache before it publishes it (`crates/data/src/engine/dispatch.rs:29-43`),
+  so every instrument is in the cache, and the queue is empty again, when a strategy starts; and an
+  order sent at the start is admitted and fills. The execution client hands the node only the
+  instruments the cache does not hold, on upstream's order of start ("so that instruments are in the
+  cache before execution clients read them"), so an instrument both clients load is refused once, not
+  twice. Each of the two bursts, the data clients' and what the execution client still hands on, is
+  refused past 1,024 by itself: where the data client's load covers the execution client's, as in a
+  paper node with a ranking (`canon_trading.paper_node`, `data_load_all`), the refusals are the
+  instruments loaded less 1,024. `test_instrument_load.py` holds each of these on a real node, in that
+  shape and with both clients loading 3,079, and counts the refusals exactly by the text
+  `execution.INSTRUMENT_REFUSAL`, so a change upstream, in the limit or in its wording, fails a test by
+  name. A window's record counts the lines by the same text in `instrument_refusals`, apart from its
+  stream lines and errors (`canon_trading.session_window`). Those tests on a real node, offline, are
+  this change's simulation run (ADR 0074). Limits: the record's number is the whole window's, so a
+  notification refused later, while the queue held real commands, is in it and is told apart only by
+  comparing it with the instruments loaded less 1,024; a provider loads once
+  (`InstrumentProvider.initialize` returns at once when it has loaded,
+  `python/nautilus_trader/live/providers.py:62-68`), so a reconnect hands on the definitions of the
+  start, and the execution client none of those the cache holds; and a whole-market start on paper has
+  not been run on this change, so that the node's log file carries the line as the tests read it off
+  the console is UNVERIFIED until a window's record shows the count.
 * **Order types:** market, limit, stop and stop-limit, `DAY` or `GTC`, whole shares, simple orders.
   Alpaca marks IOC, FOK, OPG and CLS for whole-share market and limit orders "Yes*", "contact the sales
   team", and for stop and stop-limit orders "No"
@@ -830,6 +866,15 @@ Each is stated in `execution.py`'s header, with its source.
 Upstream's template is covered by integration tests for factory registration, a market fill and shutdown.
 The execution client has all three, offline. The data client has registration and shutdown; it places no
 order, so it has no fill test, and its data delivery is tested instead. Each has paper tests:
+
+`test_instrument_load.py` runs a real node on the stand-ins with more instruments than the execution
+client's command queue holds (Known limits of the execution slice, "Instrument load and the command
+queue"): a paper node's shape, the data client loading everything and the execution client one
+instrument, with the refusals equal to the instruments less the capacity, the only error lines, and an
+order at the start filled; both clients loading everything, each instrument refused once and the queue
+empty when the strategy starts; a load of exactly the capacity notified in full with no refusal; the
+execution client handing on what the data client did not load, and its own burst past the capacity
+refused in turn.
 
 `test_external_orders.py` checks the default reduce-only denial for BUY and SELL on all four supported
 types, the opt-in sell_to_close requests and BUY refusal, strict settings and their named errors,
