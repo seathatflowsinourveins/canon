@@ -22,9 +22,14 @@ vwap. No typical-price substitute exists. Its absence refuses the VWAP arm by na
 Only development dates from the registered sessions file and their earlier lookback
 dates can be read; 2026-10-16 onward is refused before constructing a catalog.
 
-One share per entry, summed dollars without compounding, slots, tick rounding, fees,
-or liquidity/impact simulation. h is charged on entry and exit prices only, so the path is
-the same at every h but for the entry guard. Shards (--shard k/n) partition the symbols and
+It is also the gate for the lead's three registered trail arms (F2, OWN1, OWN3) with fixed 3, 5 and
+8% columns: every entry is sized by S1 (sizing.size_for_loss) for one planned loss from the
+--slot-budget parameter (default 20000), and its entry and sale are charged on Alpaca's step. One
+share per entry is left only to ReplayContext's callers with no slot budget, such as the tests.
+Summed dollars without compounding, slots, tick rounding of the walk, fees, or liquidity/impact
+simulation. h is charged on entry and exit prices. The walk is the same at every h, but the entry
+guard and S1's size at the stepped entry can refuse a bar at one h and not another, and the arm then
+scans on to a later bar. Shards (--shard k/n) partition the symbols and
 --merge sums their tier aggregates into one summary.
 """
 
@@ -40,15 +45,26 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date
 from datetime import datetime
+from decimal import ROUND_FLOOR
+from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING
 from typing import Any
 
 from nautilus_trader.indicators import AverageTrueRange
+from nautilus_trader.model import Currency
+from nautilus_trader.model import Equity
+from nautilus_trader.model import InstrumentId
 from nautilus_trader.model import NautilusDataType
+from nautilus_trader.model import Price
+from nautilus_trader.model import Symbol
 from nautilus_trader.persistence import ParquetDataCatalog
 
 from canon_trading import early_entry_study as study
+from canon_trading.price_step import down_on_step
+from canon_trading.price_step import entry_price
+from canon_trading.price_step import stop_trigger_price
+from canon_trading.sizing import size_for_loss
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -60,7 +76,39 @@ HALF_SPREAD_BPS = (0, 5, 25, 100)
 ORDERS = ("ohlc", "adaptive")
 BIN_BPS = 10
 BIN_EDGE_BPS = 10_000
-EXITS = ("fixed", "atr-1", "atr-2", "atr-3", "tier")
+EXITS = (
+    "fixed",
+    "atr-1",
+    "atr-2",
+    "atr-3",
+    "tier",
+    "fixed-3",
+    "fixed-5",
+    "fixed-8",
+    "own-1",
+    "own-3",
+)
+"""`fixed` is the gate's F2, `own-1` and `own-3` its OWN1 and OWN3: the ATR mode with the cap own."""
+MAIN_FIXED = {"exit_through": 0.005, "chase_cap": 0.02}
+"""Main's fixed mode sends the configured give and chase at any trail (`Mover._entry_trail`, mover.py:2089-2097;
+`MoverConfig` defaults :660-661); only the ATR mode derives them from the trail (:2140-2145)."""
+SLOT_BUDGET = Decimal(20_000)
+"""The lead's slot parameter for the gate, in USD: one round figure of the order B's windows use."""
+FLOW_SHARE, FLOW_BARS = Decimal("0.05"), 5
+"""Main's `flow_share` and `flow_bars` defaults: the share of the last bars' dollar volume an entry may take."""
+GATE_LOSS_TRAIL = Decimal("0.02")
+"""The lead's A/B rule: the planned loss is the slot budget's shares times entry less the stepped 2% stop."""
+CENT = Decimal("0.01")
+SIZED = Equity(
+    instrument_id=InstrumentId.from_str("R3.ALPACA"),
+    raw_symbol=Symbol("R3"),
+    currency=Currency.from_str("USD"),
+    price_precision=4,
+    price_increment=Price.from_str("0.0001"),
+    ts_event=0,
+    ts_init=0,
+)
+"""An Alpaca equity on the finest step S1 accepts; S1 reads only its quote currency and lot rules."""
 REENTRIES = ("reclaim", *(f"turn-{k}-{d}" for k in (1, 2, 3) for d in (1, 2)), "vwap")
 
 
@@ -129,10 +177,11 @@ def protection(
     fraction: float,
     *,
     adaptive: bool = False,
+    rows: dict[str, float] | None = None,
 ) -> study.Exit | None:
     """The study's own walk with the trail's rows; a released limit never filled is an exit."""
     return study.protect(
-        bars, entry, bid, costs, **plan(fraction), adaptive=adaptive, unfilled=True
+        bars, entry, bid, costs, **(rows or plan(fraction)), adaptive=adaptive, unfilled=True
     )
 
 
@@ -146,14 +195,29 @@ def atr_values(bars: Sequence[study.Minute]) -> tuple[float | None, ...]:
 
 
 def trail_fraction(exit_arm: str, entry: float, atr: float | None, top: bool) -> float | None:
+    """The arm's trail as a fraction of `entry`. ATR arms cap at main's 0.02; `own-k` keeps its own
+    width (the cap arm own, as S2 builds it, not on main until S2 lands). A cold ATR, fewer than 14
+    complete bars, takes main's fixed plan (`cold_atr_fallback`). A zero ATR has no trail: main would
+    take the spread floor, and there are no quotes here."""
     if exit_arm == "fixed":
         return 0.02
+    if exit_arm.startswith("fixed-"):
+        return int(exit_arm.removeprefix("fixed-")) / 100
     if exit_arm == "tier" and top:
         return 0.002
-    if atr is None or atr <= 0:
+    if atr is None:
+        return 0.02
+    if atr <= 0:
         return None
+    if exit_arm.startswith("own-"):
+        return int(exit_arm.removeprefix("own-")) * atr / entry
     k = 1 if exit_arm == "tier" else int(exit_arm.removeprefix("atr-"))
     return min(0.02, k * atr / entry)
+
+
+def cold(exit_arm: str, atr: float | None, top: bool) -> bool:
+    """Whether the arm's trail at this bar is main's fixed plan for want of a warm ATR."""
+    return atr is None and not exit_arm.startswith("fixed") and not (exit_arm == "tier" and top)
 
 
 def session_vwap(bars: Sequence[study.Minute], own_vw: dict[int, float]) -> tuple[float, ...]:
@@ -167,6 +231,16 @@ def session_vwap(bars: Sequence[study.Minute], own_vw: dict[int, float]) -> tupl
             volume += b.volume
         out.append(dollars / volume if volume else float("nan"))
     return tuple(out)
+
+
+def tally(result: dict[str, Any]) -> None:
+    """Count a replay's skips by kind: the guard's, and S1's refusals by their names."""
+    result["guard_skips_count"] = sum(s["kind"] == "guard_skip" for s in result["guard_skips"])
+    refusals: dict[str, int] = {}
+    for skip in result["guard_skips"]:
+        if skip["kind"] == "size_refused":
+            refusals[skip["reason"]] = refusals.get(skip["reason"], 0) + 1
+    result["size_refusals"] = refusals
 
 
 @dataclass(frozen=True)
@@ -265,8 +339,17 @@ def opening_diagnostic(bars: Sequence[study.Minute], minutes: int) -> dict[str, 
 class ReplayContext:
     """One symbol-day: causal indicators and sale results shared across diagnostic arms."""
 
-    def __init__(self, day: study.Day, own_vw: dict[int, float], top: bool):
+    def __init__(
+        self,
+        day: study.Day,
+        own_vw: dict[int, float],
+        top: bool,
+        *,
+        slot_budget: Decimal | None = None,
+    ):
         self.day, self.bars, self.top = day, day.bars, top
+        self.slot_budget = slot_budget
+        self._shares: dict[tuple[str, int, int], tuple[int, str] | str] = {}
         self.atr = atr_values(self.bars)
         self.seen = study.listing(day, study.REGISTERED)
         # Whether the name had listed by each bar's close: a gate may read this, never the day's
@@ -292,6 +375,66 @@ class ReplayContext:
             tuple[Signal | None, tuple[dict[str, Any], ...]],
         ] = {}
 
+    def rows(self, exit_arm: str, fraction: float) -> dict[str, float]:
+        """The rows main sends with this trail: its fixed mode's configured give and chase for a fixed
+        arm, the ATR mode's trail/4 and max(trail, 0.02) for every other."""
+        if exit_arm.startswith("fixed"):
+            return {"trail": fraction, **MAIN_FIXED}
+        return plan(fraction)
+
+    def shares(self, exit_arm: str, index: int, h: int) -> int | str:
+        sized = self.sized(exit_arm, index, h)
+        return sized if isinstance(sized, str) else sized[0]
+
+    def sized(self, exit_arm: str, index: int, h: int) -> tuple[int, str] | str:
+        """Whole shares for an entry at bar `index`'s close plus h, or S1's refusal name. With no
+        slot budget, one share. Otherwise S1 (`size_for_loss`) sizes the entry on Alpaca's step at
+        the trail's distance, for the lead's planned loss, under main's flow cap and the budget."""
+        if self.slot_budget is None:
+            return 1, "one share"
+        key = exit_arm, index, h
+        if key in self._shares:
+            return self._shares[key]
+        b = self.bars[index]
+        fraction = trail_fraction(exit_arm, b.close, self.atr[index], self.top)
+        try:
+            entry = entry_price(Decimal(repr(b.close * (1 + h / 10_000))), 0)
+        except ValueError:
+            self._shares[key] = "entry_above_top_tier"  # price_step's refusal, not S1's
+            return self._shares[key]
+        try:
+            loss_shares = self.slot_budget // entry
+            planned = loss_shares * (entry - stop_trigger_price(entry * (1 - GATE_LOSS_TRAIL)))
+            window = self.bars[max(0, index - FLOW_BARS + 1) : index + 1]
+            dollars = sum(
+                (Decimal(repr(x.close)) * Decimal(repr(x.volume)) for x in window), Decimal(0)
+            )
+            distance = None if fraction is None else Decimal(repr(fraction))
+            planned = planned.quantize(CENT, rounding=ROUND_FLOOR)
+            flow = FLOW_SHARE * dollars // entry
+            quantity = int(
+                size_for_loss(
+                    instrument=SIZED,
+                    entry=Price.from_str(str(entry)),
+                    distance=distance,
+                    planned_loss=planned,
+                    flow_cap=flow,
+                    budget=self.slot_budget,
+                ).as_decimal()
+            )
+            assert distance is not None  # S1 refused a missing distance above
+            bounds = {
+                "budget": self.slot_budget // entry,
+                "flow cap": flow,
+                "planned loss": planned // (entry - stop_trigger_price(entry * (1 - distance))),
+            }
+            self._shares[key] = quantity, "+".join(n for n, v in bounds.items() if v == quantity)
+        except ValueError as error:
+            if not str(error).replace("_", "").isalpha():
+                raise  # not one of S1's refusal names: an error, never a count
+            self._shares[key] = str(error)
+        return self._shares[key]
+
     def watched(self, index: int) -> bool:
         """A run may count bar `index`: a listed bar, or for a top-tier name one before it first
         listed (its scaffold). An other-tier name is watched only while listed."""
@@ -305,7 +448,7 @@ class ReplayContext:
         fraction = trail_fraction(exit_arm, b.close, self.atr[index], self.top)
         if fraction is None:
             return None  # readiness is handled by the signal and sale paths
-        floor = study.planned_stop(entry, **plan(fraction))
+        floor = study.planned_stop(entry, **self.rows(exit_arm, fraction))
         if bid >= floor:
             return None
         return {
@@ -319,11 +462,30 @@ class ReplayContext:
         }
 
     def entry_valid(self, exit_arm: str, index: int, h: int, skips: list[dict[str, Any]]) -> bool:
+        """Whether an entry at bar `index` may be sent. A bar with no trail (a zero ATR) is not
+        ready, as in the initial scan's distances; a guard skip and an S1 refusal are recorded in
+        `skips`, each by its kind."""
+        if self.distances(exit_arm)[index] is None:
+            return False
         skip = self.guard_skip(exit_arm, index, h)
-        if skip is None:
-            return True
-        skips.append(skip)
-        return False
+        if skip is not None:
+            skips.append(skip)
+            return False
+        size = self.shares(exit_arm, index, h)
+        if isinstance(size, str):
+            b = self.bars[index]
+            skips.append(
+                {
+                    "kind": "size_refused",
+                    "symbol": self.day.symbol,
+                    "day": str(self.day.day),
+                    "minute": b.start + 1,
+                    "time": study.clock(b.start + 1),
+                    "reason": size,
+                }
+            )
+            return False
+        return True
 
     def distances(self, exit_arm: str) -> tuple[float | None, ...]:
         if exit_arm in self._distances:
@@ -384,9 +546,15 @@ class ReplayContext:
         close = self.bars[index].close
         fraction = trail_fraction(exit_arm, close, self.atr[index], self.top)
         if fraction is None:
-            return {"refusal": "atr refused: fewer than 14 complete bars or zero ATR"}
+            return {"refusal": "atr refused: a zero ATR, and no quoted spread floor"}
         out = protection(
-            self.bars[index + 1 :], close, close, study.GROSS, fraction, adaptive=adaptive
+            self.bars[index + 1 :],
+            close,
+            close,
+            study.GROSS,
+            fraction,
+            adaptive=adaptive,
+            rows=self.rows(exit_arm, fraction),
         )
         sold_index = (
             len(self.bars) - 1
@@ -422,11 +590,21 @@ class ReplayContext:
         walked = self.path(exit_arm, index, adaptive)
         if "refusal" in walked:
             return walked
+        size = self.sized(exit_arm, index, h)
+        if isinstance(size, str):
+            return {"refusal": f"size refused: {size}"}
         half = h / 10_000
+        entry, sold = self.bars[index].close * (1 + half), walked["price"] * (1 - half)
+        if self.slot_budget is not None:
+            # The prices an order is sent on: the buy S1 sized at, the sale on Alpaca's step under it.
+            entry = float(entry_price(Decimal(repr(entry)), 0))
+            sold = float(down_on_step(Decimal(repr(sold))))
         return {
             **walked,
-            "entry": self.bars[index].close * (1 + half),
-            "sold": walked["price"] * (1 - half),
+            "shares": size[0],
+            "bound": size[1],
+            "entry": entry,
+            "sold": sold,
             "given_back": max(0.0, walked["peak"] - walked["price"]) * (1 - half),
         }
 
@@ -446,6 +624,11 @@ class ReplayContext:
             "entries": 0,
             "entry_minutes": [],
             "entry_returns_bps": [],
+            "shares": [],
+            "per_share_dollars": [],
+            "cold_atr_fallbacks": 0,
+            "size_refusals": {},
+            "size_bounds": {},
             "stop_outs": 0,
             "reentries": 0,
             "net_dollars": 0.0,
@@ -465,11 +648,13 @@ class ReplayContext:
             return result
         signal = self.initial(exit_arm, run, h, opening)
         result["guard_skips"].extend(self.initial_skips[exit_arm, run, h, opening])
-        result["guard_skips_count"] = len(result["guard_skips"])
+        tally(result)
         if signal is None:
             result["refusal"] = (
                 "no guard-valid initial signal"
-                if result["guard_skips"]
+                if result["guard_skips_count"]
+                else "no initial signal S1 could size"
+                if result["size_refusals"]
                 else "no initial signal with a ready trail"
             )
             return result
@@ -484,15 +669,20 @@ class ReplayContext:
             if "refusal" in sold:
                 result["refusal"] = sold["refusal"]
                 break
+            n = sold["shares"]
             result["entries"] += 1
             result["entry_minutes"].append(self.bars[signal.index].start + 1)
             result["entry_returns_bps"].append(
                 10_000 * (sold["sold"] - sold["entry"]) / sold["entry"]
             )
+            result["shares"].append(n)
+            result["size_bounds"][sold["bound"]] = result["size_bounds"].get(sold["bound"], 0) + 1
+            result["per_share_dollars"].append(sold["sold"] - sold["entry"])
+            result["cold_atr_fallbacks"] += cold(exit_arm, self.atr[signal.index], self.top)
             result["stop_outs"] += sold["stop"]
-            result["net_dollars"] += sold["sold"] - sold["entry"]
-            result["turnover_dollars"] += sold["sold"] + sold["entry"]
-            result["given_back_dollars"] += sold["given_back"]
+            result["net_dollars"] += n * (sold["sold"] - sold["entry"])
+            result["turnover_dollars"] += n * (sold["sold"] + sold["entry"])
+            result["given_back_dollars"] += n * sold["given_back"]
             if result["entries"] > 1:
                 result["falls"].append(
                     {
@@ -522,7 +712,7 @@ class ReplayContext:
             signal, skipped = self.next_signals[key]
             result["guard_skips"].extend(skipped)
         result["reentries"] = max(0, result["entries"] - 1)
-        result["guard_skips_count"] = len(result["guard_skips"])
+        tally(result)
         if h == 0 and result["turnover_dollars"]:
             value = 10_000 * result["net_dollars"] / result["turnover_dollars"]
             result["breakeven_half_spread_bps_frozen_path"] = value if value >= 0 else None
@@ -684,6 +874,9 @@ SUMMED = (
     "returns_count",
     "returns_bps_sum",
     "returns_bps_sumsq",
+    "cold_atr_fallbacks",
+    "size_refusals_count",
+    "shares",
 )
 
 
@@ -692,6 +885,8 @@ def new_aggregate(*, histogram: bool = False) -> dict[str, Any]:
     for field in ("net_dollars", "given_back_dollars", "turnover_dollars", "depth_sum"):
         aggregate[field] = 0.0
     aggregate["returns_bps_sum"] = aggregate["returns_bps_sumsq"] = 0.0
+    aggregate["size_refusals"] = {}
+    aggregate["size_bounds"] = {}
     if histogram:
         aggregate["returns_bps_bins"] = {}
     return aggregate
@@ -716,8 +911,15 @@ def add_to_aggregate(aggregate: dict[str, Any], result: dict[str, Any]) -> None:
         "given_back_dollars",
         "turnover_dollars",
         "guard_skips_count",
+        "cold_atr_fallbacks",
     ):
         aggregate[field] += result[field]
+    aggregate["shares"] += sum(result["shares"])
+    for bound, count in result["size_bounds"].items():
+        aggregate["size_bounds"][bound] = aggregate["size_bounds"].get(bound, 0) + count
+    for reason, count in result["size_refusals"].items():
+        aggregate["size_refusals_count"] += count
+        aggregate["size_refusals"][reason] = aggregate["size_refusals"].get(reason, 0) + count
     for fall in result["falls"]:
         aggregate["falls"] += 1
         aggregate["depth_sum"] += fall["depth_trails"]
@@ -739,6 +941,9 @@ def merge_aggregates(parts: Sequence[dict[str, Any]]) -> dict[str, Any]:
     for part in parts:
         for field in SUMMED:
             merged[field] += part.get(field, 0)
+        for field in ("size_refusals", "size_bounds"):
+            for name, count in part.get(field, {}).items():
+                merged[field][name] = merged[field].get(name, 0) + count
         for edge, count in part.get("returns_bps_bins", {}).items():
             merged["returns_bps_bins"][int(edge)] = (
                 merged["returns_bps_bins"].get(int(edge), 0) + count
@@ -759,22 +964,49 @@ def median_bin(bins: dict[int, int]) -> int | None:
     return None
 
 
-def report_header(commit: str, days: Sequence[date]) -> str:
+def report_header(
+    commit: str,
+    days: Sequence[date],
+    *,
+    slot_budget: Decimal | None = None,
+) -> str:
+    sizing = (
+        "One share per entry, summed dollars without compounding."
+        if slot_budget is None
+        else f"Every entry is sized by S1 (`sizing.size_for_loss`) on Alpaca's step, at the trail's "
+        f"distance, for the lead's planned loss: the {slot_budget} USD slot parameter's shares times "
+        "entry less the stepped 2% stop, about 2% of it. Each entry is charged at the stepped buy "
+        "S1 sized it at, and each sale stepped down onto Alpaca's step. Main's flow cap (0.05 of the last 5 bars' "
+        "dollar volume) and the budget bound it, and each entry counts the bound that set its size "
+        "(budget, flow cap, planned loss; a tie names both). An entry S1 refuses is counted by its "
+        "name and the arm scans on; a price past the top tier is entry_above_top_tier. A skip list "
+        "holds guard skips and S1 refusals, each by its kind. Summed dollars are without compounding."
+    )
     return (
         f"# R3 per-symbol replay — DIAGNOSTIC\n\nCode base: `{commit}`; module hashes in JSONL.\n\n"
         "Per-symbol tables never feed a fitted per-symbol setting. Settings are chosen per tier, "
         "with per-name scaling through ATR. No setting is selected or adopted by this report.\n\n"
         "All rows are UNCALIBRATED: fixed 0.02; ATR(14), Wilder, k=1/2/3, cap 0.02; "
         "tier 0.002 above $1,000,000 baseline dollars/minute, otherwise ATR k=1. "
+        "The gate's arms, registered by the lead before any result, source the lead, no primary "
+        "source: F2 is `fixed`; OWN1 and OWN3 are `own-1` and `own-3`, the ATR mode at k=1 and 3 with "
+        "the cap own (as S2 builds it; not on main until S2 lands); fixed 3, 5 and 8% are "
+        "`fixed-3`, `fixed-5` and `fixed-8`. No order price is the replay's own: every arm takes main's "
+        "rows at its trail. The fixed arms send main's fixed-mode give 0.005 and chase 0.02 at any trail "
+        "(`Mover._entry_trail`, mover.py:2089-2097); ATR and own arms send trail/4 and max(trail, 0.02) "
+        "(:2140-2145), so a fixed arm differs from F2 only in its distance. "
+        "A cold ATR (fewer than 14 complete bars) enters on main's fixed plan, counted as a cold ATR "
+        "entry (`cold_atr_fallback`); a zero ATR has no trail. "
         "Baseline = mean 04:00–16:00 close×volume of up to 5 covered prior sessions / 720 clock minutes. "
         "This is a stand-in for size. ATR uses completed current-day minutes from 04:00 and freezes at entry.\n\n"
         "Reference = latest prior session's daily close when available, otherwise its last regular minute "
         "only if that session's minutes are covered to 16:00. Daily-bar New York dating retains ADR 0092's "
         "UNVERIFIED vendor timestamp convention. Queries never reach holdout dates.\n\n"
-        "Release give=trail/4, chase cap=max(trail, 0.02) as the Mover sets it. Spread floor not applied: "
-        "no quotes. Costs h=0/5/25/100 bps per side are a sensitivity grid, UNCALIBRATED, not measured "
-        "spreads: h is charged on the entry and exit prices only, so stops and re-entries are the same "
-        "at every h and only the entry guard (bid under the planned stop) can differ. Breakeven "
+        "Spread floor not applied: "
+        "no quotes, so ATR and own trails lean narrow against a live window's. Costs h=0/5/25/100 bps per side are a sensitivity grid, UNCALIBRATED, not measured "
+        "spreads: h is charged on the entry and exit prices. The walk is the same at every h, but the entry "
+        "guard (bid under the planned stop) and S1's size at the h-loaded stepped entry can refuse a bar "
+        "at one h and not another, so entries can differ across h. Breakeven "
         "half-spread is the zero-cost path's net dollars / turnover.\n\n"
         "Gates read only what was known at each bar's close: a top-tier name runs on its scaffold until "
         "it first lists and on its listing after; an other-tier name enters, opening arms included, only "
@@ -795,10 +1027,10 @@ def report_header(commit: str, days: Sequence[date]) -> str:
         "rises on the same bar's high; a real released limit fills at or under its trigger, so stop "
         "prices lean in the strategy's favour under either path. A released limit never filled is "
         "a stop sold at the last close.\n\n"
-        "One share per entry, summed dollars without compounding. Per-entry returns in bps (sale less "
+        f"{sizing} Per-entry returns in bps (sale less "
         "entry over entry, after h) are kept as a count, a sum, a sum of squares and 10 bps bins, so "
         "the equal-entry mean and median per arm and tier can be read. No paper fills, impact, quoted "
-        "size, tick rounding, fees, slot limits, split adjustment or delisted assets. Minute bars are "
+        "size, tick rounding of the walk, fees, slot limits, split adjustment or delisted assets. Minute bars are "
         "not actual intraminute order. Population coverage below counts the available symbol-days, "
         "not evidence of a whole-market edge. Missing/empty/short-history arms are counted.\n\n"
         f"Requested development days ({len(days)}): {', '.join(map(str, days))}\n\n"
@@ -809,8 +1041,8 @@ TABLE_HEADER = (
     "Each figure after Days reads `OHLC; adaptive`: the default bar path, then the adaptive one.\n\n"
     "| Group | Exit | Re-entry | h bps | Days | Entries | Stops | Re-entries | Net $ | "
     "Mean bps/entry | Median bin bps | Given back $ | Mean depth/trails | Fall min | Turn min | "
-    "Breakeven h bps | Refusals | Guard skips |\n"
-    "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n"
+    "Breakeven h bps | Refusals | Guard skips | S1 refusals | Cold ATR entries |\n"
+    "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n"
 )
 
 Key = tuple[str, str, str, str, int, int, str]
@@ -867,6 +1099,8 @@ PAIRED = (
     ("breakeven_half_spread_bps_frozen_path", 3),
     ("refusals", None),
     ("guard_skips_count", None),
+    ("size_refusals_count", None),
+    ("cold_atr_fallbacks", None),
 )
 
 
@@ -934,14 +1168,21 @@ def merge(paths: Sequence[Path], output: Path, name: str) -> Path:
     if len(ns) != 1 or sorted(k for k, _ in specs) != list(range(ns.pop())):
         raise ValueError(f"shards {[m['shard'] for m in metadata]} are not 0/n to n-1/n once each")
     for field in MERGE_SAME:
-        if len({json.dumps(m[field], sort_keys=True) for m in metadata}) != 1:
+        if len({json.dumps(m.get(field), sort_keys=True) for m in metadata}) != 1:
             raise ValueError(f"shards differ in {field}")
     hashes = {json.dumps(m["code_sha256"], sort_keys=True) for m in metadata}
     merged = {key: merge_aggregates(parts) for key, parts in sums.items()}
     summary = output / f"{name}-summary.md"
     development = [date.fromisoformat(d) for d in metadata[0]["development"]]
     with summary.open("x") as out:
-        out.write(report_header(metadata[0]["base_commit"], development))
+        budget = metadata[0]["slot_budget"]
+        out.write(
+            report_header(
+                metadata[0]["base_commit"],
+                development,
+                slot_budget=None if budget is None else Decimal(budget),
+            )
+        )
         out.write(
             f"Shards: {', '.join(f'`{p}`' for p in paths)}; module hashes {hashes.pop()}.\n\n"
         )
@@ -960,6 +1201,7 @@ MERGE_SAME = (
     "development",
     "lookback",
     "catalog",
+    "slot_budget",
 )
 KEY_FIELDS = ("group", "initial", "exit", "reentry", "run", "half_spread_bps", "order")
 
@@ -972,6 +1214,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--name", required=True)
     parser.add_argument("--shard", default="0/1", help="k/n: every nth symbol from the kth")
     parser.add_argument("--merge", type=Path, nargs="+", help="shard JSONL files to sum")
+    parser.add_argument(
+        "--slot-budget",
+        type=Decimal,
+        default=SLOT_BUDGET,
+        help="USD per slot, the lead's parameter: every entry is sized by S1 for 2%% of it",
+    )
     args = parser.parse_args(argv)
     args.output.mkdir(parents=True, exist_ok=True)
     if args.merge:
@@ -996,7 +1244,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     destination = args.output / f"{args.name}.jsonl"
     symbol_path = args.output / f"{args.name}-symbols.md"
     with destination.open("x") as stream, symbol_path.open("x") as symbol_table:
-        symbol_table.write(report_header(commit, development) + TABLE_HEADER)
+        header = report_header(commit, development, slot_budget=args.slot_budget)
+        symbol_table.write(header + TABLE_HEADER)
         stream.write(
             json.dumps(
                 {
@@ -1008,7 +1257,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "sessions_sha256": hashlib.sha256(args.sessions.read_bytes()).hexdigest(),
                     "development": list(map(str, development)),
                     "lookback": list(map(str, lookback)),
-                    "settings": report_header(commit, development),
+                    "settings": header,
+                    "slot_budget": str(args.slot_budget),
                     "catalog": str(args.catalog),
                     "snapshot_started_utc": datetime.now(study.UTC).isoformat(),
                     "symbols": len(symbols),
@@ -1030,7 +1280,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 counts["selected_symbol_days"] += 1
                 counts["top_symbol_days"] += pop["top_tier"]
                 counts["ignited_symbol_days"] += pop["ignition"] is not None
-                context = ReplayContext(day, vw, pop["top_tier"])
+                context = ReplayContext(
+                    day,
+                    vw,
+                    pop["top_tier"],
+                    slot_budget=args.slot_budget,
+                )
                 base = {
                     "symbol": symbol,
                     "day": str(day.day),
@@ -1126,7 +1381,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     summary = args.output / f"{args.name}-summary.md"
     with summary.open("x") as out:
-        out.write(report_header(commit, development))
+        out.write(header)
         out.write(
             f"JSONL: `{destination}`; module SHA-256 `{json.dumps(hashes, sort_keys=True)}`.\n\n"
         )
@@ -1136,8 +1391,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         out.write(
             "Full per-symbol, per-tier, opening and re-entry fall diagnostics are in JSONL. "
-            "The following base run-2 table is the tier summary. Dollar sums weight every symbol by one share, "
-            "so price levels differ; the per-entry mean and median weight every entry equally. These are "
+            "The following base run-2 table is the tier summary. Dollar sums are of entries sized by S1 "
+            "for one planned loss; the per-entry mean and median weight every entry equally. These are "
             "diagnostics, not portfolio returns.\n\n"
         )
         write_tier_table(out, sums)

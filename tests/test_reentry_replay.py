@@ -77,7 +77,7 @@ def test_atr_uses_only_completed_bars_and_waits_fourteen() -> None:
     assert r3.trail_fraction("atr-1", 10, values[13], False) == pytest.approx(0.4 / 140)
     assert r3.trail_fraction("atr-3", 10, 1, False) == 0.02
     assert r3.trail_fraction("tier", 10, None, True) == 0.002
-    assert r3.trail_fraction("atr-1", 10, None, False) is None
+    assert r3.trail_fraction("atr-1", 10, None, False) == 0.02  # main's cold_atr_fallback
 
 
 def test_reclaim_has_no_cooldown_but_never_enters_the_sale_bar() -> None:
@@ -497,6 +497,7 @@ def shard_file(path: Path, spec: str, **metadata) -> Path:
         "development": [str(DAY)],
         "lookback": [],
         "catalog": "c",
+        "slot_budget": None,
         **metadata,
     }
     tail = {"kind": "completion", "counts": {"symbols_scanned": 1}, "days_used": {str(DAY): 1}}
@@ -623,4 +624,139 @@ def test_an_adaptive_replay_line_keeps_its_own_guard_skips(
     adaptive = [c for x in lines if x["kind"] == "replay" for c in x["costs"]]
     adaptive = [c for c in adaptive if c["order"] == "adaptive" and c["guard_skips_count"]]
     assert adaptive
-    assert all(len(c["guard_skips"]) == c["guard_skips_count"] for c in adaptive)
+    assert all(
+        sum(s["kind"] == "guard_skip" for s in c["guard_skips"]) == c["guard_skips_count"]
+        for c in adaptive
+    )
+    assert r3.main([*common, "--name", "sized", "--slot-budget", "1000"]) == 0
+    head = json.loads((tmp_path / "sized.jsonl").read_text().splitlines()[0])
+    assert head["slot_budget"] == "1000"
+    summary = (tmp_path / "sized-summary.md").read_text()
+    assert "sized by S1" in summary and "one share" not in summary
+
+
+# The gate (the lead, 2026-11-12): F2, OWN1, OWN3 and fixed 3/5/8% columns, sized by S1 at one
+# planned loss, under both bar orders.
+
+
+def test_the_gate_arms_have_their_own_trails() -> None:
+    # The replay had no fixed 3/5/8% column and capped every ATR arm at 0.02, so OWN3 read as F2.
+    assert [r3.trail_fraction(f"fixed-{n}", 10, None, False) for n in (3, 5, 8)] == [
+        0.03,
+        0.05,
+        0.08,
+    ]
+    assert r3.trail_fraction("own-3", 10, 1, False) == pytest.approx(0.3)
+    assert r3.trail_fraction("own-1", 10, 0.15, False) == pytest.approx(0.015)
+    assert r3.trail_fraction("atr-3", 10, 1, False) == 0.02
+    assert {"fixed", "own-1", "own-3", "fixed-3", "fixed-5", "fixed-8"} <= set(r3.EXITS)
+
+
+def test_a_cold_atr_enters_on_the_fixed_plan_by_name() -> None:
+    # Main enters a cold ATR on the fixed plan (cold_atr_fallback); the replay refused the arm.
+    today = day([10.4, 10.5, 10.6, 10.3, 10.25])
+    result = r3.ReplayContext(today, {}, False).replay("own-1", "reclaim", 2, 0)
+    assert result["entries"] == 1 and result["cold_atr_fallbacks"] == 1
+    assert result["refusal"] is None
+
+
+def test_every_arm_sends_mains_own_rows_at_its_trail() -> None:
+    # Main's fixed mode sends the configured give and chase at any trail (mover.py:2089-2097); the
+    # replay scaled them with the trail, an order price main never sends.
+    context = r3.ReplayContext(day([10]), {}, False)
+    sent = context.rows("fixed-8", 0.08)
+    assert (sent["trail"], sent["exit_through"], sent["chase_cap"]) == (0.08, 0.005, 0.02)
+    assert context.rows("own-1", 0.03) == r3.plan(0.03)
+
+
+def test_each_entry_is_sized_by_s1_at_the_slot_budgets_two_percent_loss() -> None:
+    # One share per entry weighted every arm by price, not by the loss it plans.
+    from decimal import Decimal
+
+    # Heavy volume keeps main's flow cap (0.05 of the last 5 bars' dollars) from binding.
+    tape = tuple(
+        study.Minute(570 + i, c, c, c, c, 100_000)
+        for i, c in enumerate([10.4, 10.5, 10.6, 10.3, 10.25, 10.35, 10.5])
+    )
+    today = replace(day([]), bars=tape)
+    context = r3.ReplayContext(today, {}, True, slot_budget=Decimal(1060))
+    # 1060 // 10.60 = 100 shares at the stepped 2% stop 10.38: a planned loss of 22.00.
+    assert context.sized("fixed", 2, 0) == (100, "budget+planned loss")
+    assert context.sized("fixed-5", 2, 0) == (41, "planned loss")  # 22.00 // (10.60 - 10.07)
+    thin = r3.ReplayContext(day([10.4, 10.5, 10.6]), {}, True, slot_budget=Decimal(1060))
+    assert thin.sized("fixed", 2, 0) == (14, "flow cap")  # 0.05 x 3150 dollars // 10.60
+    result = context.replay("fixed-5", "reclaim", 2, 0)
+    single = r3.ReplayContext(today, {}, True).replay("fixed-5", "reclaim", 2, 0)
+    assert result["shares"][0] == 41 and result["size_bounds"] == {"planned loss": 1}
+    assert result["net_dollars"] == pytest.approx(
+        sum(n * r for n, r in zip(result["shares"], single["per_share_dollars"], strict=True))
+    )
+
+
+def test_a_size_s1_refuses_is_counted_by_its_name_and_scanning_goes_on() -> None:
+    # An OWN trail over S1's 0.10 ceiling cannot be sent; the entry is refused by name.
+    from decimal import Decimal
+
+    # ATR 1.5 on a 10 close: an own-1 trail of 0.15. Closes rise only once the ATR is warm.
+    closes = [10] * 14 + [10.01, 10.02]
+    tape = tuple(study.Minute(570 + i, c, 11.5, 10, c, 100_000) for i, c in enumerate(closes))
+    context = r3.ReplayContext(replace(day([]), bars=tape), {}, True, slot_budget=Decimal(1000))
+    assert context.shares("own-1", 15, 0) == "distance_over_ceiling"
+    result = context.replay("own-1", "reclaim", 1, 0)
+    assert result["entries"] == 0
+    assert result["size_refusals"] == {"distance_over_ceiling": 2}
+
+
+def test_a_merge_refuses_shards_sized_from_another_slot_budget(tmp_path) -> None:
+    zero = shard_file(tmp_path / "0.jsonl", "0/2", slot_budget="20000")
+    other = shard_file(tmp_path / "1.jsonl", "1/2", slot_budget="1000")
+    with pytest.raises(ValueError, match="slot_budget"):
+        r3.merge([zero, other], tmp_path, "budget")
+
+
+# The code review of the gate (2026-11-12): each test names the bias it removes.
+
+
+def test_a_sized_entry_pays_the_stepped_price_s1_sized_it_at() -> None:
+    # S1 sized at the stepped entry but the P&L charged the unstepped close plus h: up to a tick a
+    # share uncharged, times the shares, in the strategy's favour.
+    from decimal import Decimal
+
+    tape = tuple(study.Minute(570 + i, 2, 2, 2, 2, 10_000_000) for i in range(4))
+    context = r3.ReplayContext(replace(day([]), bars=tape), {}, True, slot_budget=Decimal(20_000))
+    sold = context.sale("fixed", 1, 5)
+    assert sold["entry"] == pytest.approx(2.01)  # 2.001 up onto the cent
+    assert sold["sold"] == pytest.approx(1.99)  # 1.999 down onto the cent
+
+
+def test_only_s1s_own_refusals_are_counted_as_s1_refusals() -> None:
+    # A price_step refusal above the top tier was booked as an S1 refusal, keyed by its price.
+    from decimal import Decimal
+
+    tape = tuple(study.Minute(570 + i, 6002, 6002, 6002, 6002, 100) for i in range(3))
+    context = r3.ReplayContext(replace(day([]), bars=tape), {}, True, slot_budget=Decimal(20_000))
+    assert context.sized("fixed", 2, 0) == "entry_above_top_tier"
+
+
+def test_a_bar_with_no_trail_is_not_a_sizing_refusal() -> None:
+    # A zero ATR (no trail) in a re-entry scan was booked as S1's distance_unknown.
+    from decimal import Decimal
+
+    tape = tuple(study.Minute(570 + i, 10, 10, 10, 10, 100_000) for i in range(20))
+    context = r3.ReplayContext(replace(day([]), bars=tape), {}, False, slot_budget=Decimal(20_000))
+    skips: list = []
+    assert context.entry_valid("atr-1", 19, 0, skips) is False
+    assert skips == []
+
+
+def test_a_merge_names_a_shard_written_without_a_slot_budget(tmp_path) -> None:
+    # A shard from before sizing raised a bare KeyError instead of a named refusal.
+    old = tmp_path / "1.jsonl"
+    shard_file(old, "1/2")
+    lines = old.read_text().splitlines()
+    head = json.loads(lines[0])
+    del head["slot_budget"]
+    old.write_text(json.dumps(head) + "\n" + lines[1] + "\n")
+    zero = shard_file(tmp_path / "0.jsonl", "0/2", slot_budget="20000")
+    with pytest.raises(ValueError, match="slot_budget"):
+        r3.merge([zero, old], tmp_path, "old")
