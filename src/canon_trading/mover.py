@@ -6,9 +6,10 @@ A composition of upstream parts (ADR 0083, ADR 0088). What each part is, at Naut
 * **The ranking** reaches the strategy as upstream's signal: `subscribe_signal(name)` and `on_signal`
   (`python/nautilus_trader/trading/__init__.pyi:696`, `:633`; concepts/message_bus, "Signal
   publish/subscribe": "The value is converted to a string on publish"). The ranking actor publishes
-  `RANK_SIGNAL` each minute (ADR 0087); its value is `format_rank`'s string, the ranked instrument IDs best
-  first, each with its move from the last regular close, and its `ts_event` the time the ranking was
-  computed. Nothing here ranks, and no vendor's list is read.
+  `RANK_SIGNAL` each minute (ADR 0087); its value is `movers_rank_signal.encode_ranking`'s string, read
+  by the shared `decode_ranking`: the ranked instrument IDs best first, each with its move from the last
+  regular close, and its `ts_event` the time the ranking was computed. Nothing here ranks, and no
+  vendor's list is read.
 * **The entry** is `OrderFactory.limit` (`python/nautilus_trader/common/__init__.pyi:1388`), time in force
   DAY, at the ask of the latest quote in the cache (`entry_ticks` through it, none by default), in every
   session; it is never a market order and is not re-priced: it rests until `entry_timeout_secs`.
@@ -111,7 +112,6 @@ from datetime import timedelta
 from decimal import ROUND_CEILING
 from decimal import ROUND_FLOOR
 from decimal import Decimal
-from decimal import InvalidOperation
 from itertools import pairwise
 from types import NoneType
 from typing import TYPE_CHECKING
@@ -135,6 +135,11 @@ from nautilus_trader.trading import Strategy
 
 from .ma_cross import refuse_another_type
 from .ma_cross import refuse_unknown_keywords
+from .movers_rank_signal import MAX_ENTRIES as RANK_MOST
+from .movers_rank_signal import SIGNAL_NAME as RANK_SIGNAL
+from .movers_rank_signal import RankEntry
+from .movers_rank_signal import decode_ranking
+from .movers_rank_signal import encode_ranking
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -143,10 +148,6 @@ if TYPE_CHECKING:
     from nautilus_trader.common import TimeEvent
     from nautilus_trader.model import Bar
 
-RANK_SIGNAL = "movers-rank"
-"""The signal the ranking actor publishes (ADR 0087): `format_rank`'s string, `ts_event` when computed."""
-RANK_MOST = 20
-"""The most names a ranking carries."""
 EXTENDED_HOURS = {"extended_hours": True}
 """The submit params that mark an order as extended-hours eligible for the adapter (ADR 0038)."""
 STEP_SECS = 1
@@ -165,40 +166,23 @@ REFUSED = (OrderStatus.DENIED, OrderStatus.REJECTED)
 
 
 def format_rank(entries: Sequence[tuple[InstrumentId, Decimal]]) -> str:
-    """The ranking as the signal's one string: `ID=move` joined by `;`, best first."""
-    return ";".join(f"{instrument_id}={move}" for instrument_id, move in entries)
+    """Adapt Decimal moves to the shared encoder, retaining the window and replay callers' API.
 
-
-def parse_rank(value: str) -> list[tuple[InstrumentId, Decimal]]:
-    """The ranking a `RANK_SIGNAL` value carries, best first; `ValueError` naming what is wrong with it.
-
-    An empty value is an empty ranking. A name twice, a move that is no number, more than `RANK_MOST`
-    names or an ID without a venue is refused whole: a ranking read in part would rank other names.
+    A move must be finite and preserved by the float's shortest text; otherwise a `ValueError` names
+    the instrument and move. The shared codec also refuses duplicate names, more than `RANK_MOST`
+    entries, and instrument IDs outside ALPACA before a value can be published.
     """
-    if not value:
-        return []
-    parts = value.split(";")
-    if len(parts) > RANK_MOST:
-        raise ValueError(
-            f"{RANK_SIGNAL}: {len(parts)} names, where a ranking carries at most {RANK_MOST}"
-        )
-    ranked: list[tuple[InstrumentId, Decimal]] = []
-    for part in parts:
-        name, eq, move = part.partition("=")
-        symbol, dot, venue = name.rpartition(".")
-        if not (eq and symbol and dot and venue):
-            raise ValueError(f"{RANK_SIGNAL}: {part!r} is not <symbol>.<venue>=<move>")
-        try:
-            moved = Decimal(move)
-        except InvalidOperation:
-            raise ValueError(f"{RANK_SIGNAL}: the move in {part!r} is not a number") from None
-        if not moved.is_finite():
-            raise ValueError(f"{RANK_SIGNAL}: the move in {part!r} is not finite")
-        instrument_id = InstrumentId.from_str(name)
-        if any(instrument_id == seen for seen, _ in ranked):
-            raise ValueError(f"{RANK_SIGNAL}: {name} is ranked twice")
-        ranked.append((instrument_id, moved))
-    return ranked
+    ranked = []
+    for instrument_id, move in entries:
+        if not move.is_finite():
+            raise ValueError(f"{instrument_id} has a move that is not finite: {move}")
+        converted = float(move)
+        if Decimal(str(converted)) != move:
+            raise ValueError(
+                f"{instrument_id} has a move that cannot round-trip as a float: {move}"
+            )
+        ranked.append(RankEntry(instrument_id, converted))
+    return encode_ranking(ranked)
 
 
 def tick(price: Decimal) -> Decimal:
@@ -511,9 +495,16 @@ class Mover(Strategy):
     def on_signal(self, signal: Signal) -> None:
         if signal.name != RANK_SIGNAL:
             return
+        # Upstream's `publish_signal` takes a value of any type (`value: typing.Any`); the shared
+        # contract is text, so anything else is a fault like a malformed text, never an error.
         try:
-            self.rank = parse_rank(signal.value)
-        except ValueError:
+            if not isinstance(signal.value, str):
+                raise TypeError(f"a ranking is text, not {type(signal.value).__name__}")
+            self.rank = [
+                (entry.instrument_id, Decimal(str(entry.move)))
+                for entry in decode_ranking(signal.value)
+            ]
+        except ValueError, TypeError:
             self.rank = []
             self.rank_faults += 1
             return

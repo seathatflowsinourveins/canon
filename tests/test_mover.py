@@ -58,11 +58,14 @@ from canon_trading.mover import RANK_SIGNAL
 from canon_trading.mover import Mover
 from canon_trading.mover import MoverConfig
 from canon_trading.mover import format_rank
-from canon_trading.mover import parse_rank
 from canon_trading.mover import tick
 from canon_trading.mover_window import OUTER_BOUND_USD
 from canon_trading.mover_window import max_shares
 from canon_trading.mover_window import mover_parts
+from canon_trading.movers_rank_signal import SIGNAL_NAME
+from canon_trading.movers_rank_signal import RankEntry
+from canon_trading.movers_rank_signal import decode_ranking
+from canon_trading.movers_rank_signal import encode_ranking
 
 if TYPE_CHECKING:
     from nautilus_trader.common import TimeEvent
@@ -224,7 +227,7 @@ def strategy(**changes: object) -> Recording:
 
 
 def rank(*entries: tuple[InstrumentId, str]) -> str:
-    return format_rank([(i, Decimal(m)) for i, m in entries])
+    return encode_ranking([RankEntry(i, float(m)) for i, m in entries])
 
 
 def run(eng: BacktestEngine, s: Mover, ranking: Ranker | None, *tapes: list) -> list:
@@ -247,14 +250,120 @@ def sides(orders: list) -> list[str]:
 # --- the contract's small parts ---------------------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    "text",
+    ["0.1234567890123456789", "123456789.123456789", "1E+400", "1E-400"],
+)
+def test_format_rank_refuses_a_decimal_that_cannot_round_trip_as_a_float(text: str) -> None:
+    with pytest.raises(ValueError, match=r"AAA[.]ALPACA.*round-trip.*float") as refusal:
+        format_rank([(AAA, Decimal(text))])
+    assert text in str(refusal.value)
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["0", "-0.0", "0.2500", "1E-7", "9.5094", "-1.3639", "1.7976931348623157E+308", "5E-324"],
+)
+def test_format_rank_preserves_a_decimal_the_shared_codec_can_carry(text: str) -> None:
+    move = Decimal(text)
+    entries = decode_ranking(format_rank([(AAA, move)]))
+    assert len(entries) == 1 and entries[0].instrument_id == AAA
+    carried = Decimal(str(entries[0].move))
+    assert carried == move and carried.is_signed() == move.is_signed()
+
+
+@pytest.mark.parametrize(
+    ("entries", "message"),
+    [
+        ([(AAA, Decimal("0.1")), (AAA, Decimal("0.2"))], r"AAA[.]ALPACA twice"),
+        (
+            [
+                (InstrumentId.from_str(f"NAME{i}.ALPACA"), Decimal("0.1"))
+                for i in range(mover.RANK_MOST + 1)
+            ],
+            "at most 20",
+        ),
+        ([(InstrumentId.from_str("AAA.XNAS"), Decimal("0.1"))], r"AAA[.]XNAS.*not ALPACA"),
+        *[
+            ([(AAA, Decimal(text))], r"AAA[.]ALPACA.*not finite")
+            for text in ("NaN", "sNaN", "Infinity", "-Infinity")
+        ],
+    ],
+)
+def test_format_rank_names_its_refusal_before_a_ranking_can_be_published(
+    entries: list[tuple[InstrumentId, Decimal]], message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        format_rank(entries)
+
+
+def test_the_strategy_reads_and_records_what_encode_ranking_writes() -> None:
+    entries = (RankEntry(AAA, 1e-7), RankEntry(BBB, 0.25))
+    value = encode_ranking(entries)
+    eng = engine()
+    s = strategy()
+    run(eng, s, ranker(value), tape(AAA, RISING), tape(BBB, [20.0] * len(RISING)))
+    record = s.record()
+    eng.dispose()
+    assert RANK_SIGNAL == SIGNAL_NAME
+    assert s.rank == [(AAA, Decimal("1e-7")), (BBB, Decimal("0.25"))]
+    assert s.rank_ns >= T0 and s.rank_faults == 0
+    assert record["rank"] == value
+    assert decode_ranking(record["rank"]) == entries
+    assert any(f"Ranking: {value};" in line for line in s.said)
+
+
+@pytest.mark.parametrize("bad", ["AAA.NASDAQ=0.25", "AAA.ALPACA=0.250", "AAA.ALPACA=1E-7"])
+def test_the_strategy_refuses_what_the_shared_ranking_contract_refuses(bad: str) -> None:
+    s = strategy()
+    s.on_signal(
+        cast(
+            Any,
+            SimpleNamespace(
+                name=SIGNAL_NAME, value=encode_ranking([RankEntry(AAA, 0.25)]), ts_event=5
+            ),
+        )
+    )
+    s.on_signal(cast(Any, SimpleNamespace(name=SIGNAL_NAME, value=bad, ts_event=6)))
+    assert s.rank == []
+    assert s.rank_faults == 1 and s.rank_ns == 5
+
+
+@pytest.mark.parametrize("bad", [0.25, 1, None, b"AAA.ALPACA=0.25"])
+def test_a_ranking_signal_that_is_not_text_is_a_fault_not_an_error(bad: object) -> None:
+    # Upstream's `publish_signal` takes a value of any type (`value: typing.Any`); the shared
+    # contract is text, so anything else empties the ranking and counts a fault, as a malformed
+    # text does, instead of raising out of the strategy's handler.
+    s = strategy()
+    s.on_signal(
+        cast(
+            Any,
+            SimpleNamespace(
+                name=SIGNAL_NAME, value=encode_ranking([RankEntry(AAA, 0.25)]), ts_event=5
+            ),
+        )
+    )
+    s.on_signal(cast(Any, SimpleNamespace(name=SIGNAL_NAME, value=bad, ts_event=6)))
+    assert s.rank == []
+    assert s.rank_faults == 1 and s.rank_ns == 5
+
+
 def test_the_ranking_signal_round_trips_and_a_malformed_one_is_refused() -> None:
     value = rank((AAA, "0.25"), (BBB, "0.1"))
     assert value == "AAA.ALPACA=0.25;BBB.ALPACA=0.1"
-    assert parse_rank(value) == [(AAA, Decimal("0.25")), (BBB, Decimal("0.1"))]
-    assert parse_rank("") == []
+    s = strategy()
+
+    def hear(value: str) -> None:
+        s.on_signal(cast(Any, SimpleNamespace(name=SIGNAL_NAME, value=value, ts_event=5)))
+
+    hear(value)
+    assert s.rank == [(AAA, Decimal("0.25")), (BBB, Decimal("0.1"))]
+    hear("")
+    assert s.rank == [] and s.rank_faults == 0
     for bad in ("AAA.ALPACA", "AAA.ALPACA=x", "=0.1", "AAA.ALPACA=0.1;AAA.ALPACA=0.2", "AAA=0.1"):
-        with pytest.raises(ValueError, match="movers-rank"):
-            parse_rank(bad)
+        hear(bad)
+        assert s.rank == []
+    assert s.rank_faults == 5
 
 
 def test_a_price_has_two_decimals_at_or_above_a_dollar_and_four_below() -> None:
