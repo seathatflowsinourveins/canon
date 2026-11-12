@@ -2988,3 +2988,92 @@ def test_a_lost_account_query_is_sent_again_on_expiry_without_another_fill():
     s.now_ns = 10 * mover.QUERY_WAIT_SECS * mover.SECOND_NS
     s._ask_for_the_account()
     assert len(s.queries) == 2, "an answered query is not sent again"
+
+
+class StoppedMidway(Recording):
+    """`Recording` that asks for the strategy's stop at `stop_at`, as a window's end does in the session."""
+
+    stop_at: datetime | None = None
+    stop_ns = 0
+    managed_exiting = 0
+
+    def _manage(self, slot, now: int) -> None:
+        self.managed_exiting += self.is_exiting()
+        super()._manage(slot, now)
+
+    def on_start(self) -> None:
+        super().on_start()
+        if self.stop_at is not None:
+            self.clock.set_time_alert("test-stop", self.stop_at, self._request_stop)
+
+    def _request_stop(self, event: TimeEvent) -> None:
+        self.stop_ns = event.ts_event
+        self.stop()
+
+
+def test_no_trailing_sell_is_remade_while_upstreams_managed_stop_exits_in_the_session() -> None:
+    """code-review-high-d04/5: a stop asked for in the session, before the wind-down, runs upstream's
+    market exit, which cancels the emulated trailing sell. While that exit is unfilled the step must not
+    take the canceled sell for one to remake: upstream denies such an order (`MARKET_EXIT_IN_PROGRESS`,
+    crates/trading/src/strategy/mod.rs:2396-2402 at the pin), so making it only adds a denied order each
+    `chase_secs`. The step still manages each slot meanwhile, since upstream's exit never cancels an
+    order a second time and the step's own cancels must go on."""
+    eng = engine(liquid=True)
+    s = StoppedMidway(
+        MoverConfig(
+            max_notional=Decimal(50_000),
+            max_move=Decimal(5),
+            entry_arm="bridge",
+            strategy_id=MOVER_ID,
+            order_id_tag="001",
+            manage_stop=True,
+            market_exit_reduce_only=False,
+            market_exit_time_in_force=TimeInForce.DAY,
+        )
+    )
+    after = T0 + 7 * MINUTE
+    s.stop_at = datetime.fromtimestamp((after + 200_000_000) / 1e9, tz=UTC)
+    # no bid to sell into for four seconds after the stop, then one
+    unfilled = [
+        QuoteTick(
+            AAA,
+            Price(10.59, 4),
+            Price(10.61, 4),
+            Quantity.from_int(0),
+            Quantity.from_int(10_000),
+            after + 100_000_000 + i * 250_000_000,
+            after + 100_000_000 + i * 250_000_000,
+        )
+        for i in range(17)
+    ]
+    sized = QuoteTick(
+        AAA,
+        Price(10.59, 4),
+        Price(10.61, 4),
+        Quantity.from_int(10_000),
+        Quantity.from_int(10_000),
+        after + 6_000_000_000,
+        after + 6_000_000_000,
+    )
+    orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, RISING[:7]), [*unfilled, sized])
+    flat = not eng.cache.positions_open(strategy_id=MOVER_ID)
+    eng.dispose()
+    # upstream's market exit sends its MARKET sell again after each refusal; nothing else may follow
+    sent_after = {
+        f"{o.side.name} {o.order_type.name} {list(o.tags or [])}"
+        for o in orders
+        if o.ts_init >= s.stop_ns
+    }
+    # the case needs a trailing sell still emulated when the stop is asked for, canceled by the exit
+    working_at_stop = [
+        o
+        for o in orders
+        if o.order_type.name == "TRAILING_STOP_LIMIT"
+        and o.ts_init < s.stop_ns <= o.ts_last
+        and o.status.name == "CANCELED"
+    ]
+    assert working_at_stop
+    assert s.managed_exiting
+    assert s.stop_ns
+    assert sent_after == {"SELL MARKET ['MARKET_EXIT']"}
+    assert flat
