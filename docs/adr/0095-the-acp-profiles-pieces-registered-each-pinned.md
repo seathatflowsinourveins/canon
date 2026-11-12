@@ -61,6 +61,18 @@ Chosen: **option 1**. Option 2 hides which piece moved; option 3 pins nothing.
    settings. Which login, mode and sandbox `build-acp` gets is `UNVERIFIED`. It sends a task, not the
    transcript, so ADR 0072 rule 6 places it by extension: another family answers, and it edits the
    workspace.
+6. **`dsh-subagent-claude-code`** (`packages/subagent/subagent-claude-code`, MIT), `tool`, at
+   `dsh-v0.2.1-rc.3`, build arm only: delegates one task to a fresh Claude Code session in the parent
+   workspace through its own Agent SDK (0.3.263, which bundles Claude Code 2.1.263, behind the
+   `claude-code` pin) and never falls back to the host `claude`. It reads the host's user, project and
+   local Claude settings, hooks and allow rules included. The child's environment is the profile's `env`
+   over the parent's with key-like and `DSH_` names scrubbed, so its login is the Claude configuration
+   directory (`CLAUDE_CONFIG_DIR`, else `~/.claude`) and its Keychain entry, unless a surviving provider
+   variable or a settings `apiKeyHelper` outranks it. `permissionMode` defaults to `dontAsk`: what the
+   host's allow rules and read-only defaults permit runs, the rest is denied. Which login and mode
+   `build-acp` gets is `UNVERIFIED`. It sends a task, not the transcript, so ADR 0072 rule 6 places it by
+   extension: another family answers, and it edits the workspace. It may also read and write the host's
+   auto memory, which would be state across sessions under rule 6 directly (`UNVERIFIED`).
 
 ### Consequences
 
@@ -133,6 +145,21 @@ Read 2026-11-11.
   `scrubbedParentEnv()` — drops variables whose names contain `KEY`, `PASSWORD`, `SECRET` or `TOKEN`;
   `HOME` and `CODEX_HOME` pass (a second reader, 2026-11-11, resolved). It also found that an
   Orca-started session's `CODEX_HOME` is an Orca-managed home, not `~/.codex` (path names only).
+* `deepseek-harness` at `dsh-v0.2.1-rc.3`, `packages/subagent/subagent-claude-code` — `package.json`
+  (MIT; `@anthropic-ai/claude-agent-sdk` `0.3.263`), README Summary ("never falls back to the host
+  `claude` executable"), options (`permissionMode` default `dontAsk`) and "Native settings are
+  authoritative" (resolved). https://registry.npmjs.org/@deepseek-ai/dsh-subagent-claude-code/0.2.1-rc.3
+  (fetched; no `gitHead`, so its match to
+  the tag is by content only).
+* `packages/subagent/subagent-claude-code/src/process.ts` and `src/index.ts` at the same pin — the
+  child environment is the configured `env` over `scrubbedParentEnv()`, which the SDK composes from;
+  `inheritsParentContext = false` (resolved). https://registry.npmjs.org/@anthropic-ai/claude-agent-sdk/0.3.263
+  (fetched; `claudeCodeVersion` 2.1.263). https://code.claude.com/docs/en/authentication.md,
+  https://code.claude.com/docs/en/permission-modes.md and https://code.claude.com/docs/en/memory.md
+  (fetched 2026-11-11; current docs, not checked against 2.1.263).
+* A second reader of item 6, 2026-11-11, named the bundled Claude Code version, replaced `HOME` with the
+  configuration directory and Keychain, widened what `dontAsk` permits, and raised auto memory as a
+  possible direct rule 6 ground; all are in. The SDK's own licence is not MIT; MIT covers the package.
 * A second reader checked this record on 2026-11-11: it settled the SDK's schema minor, corrected how
   the profiles are started and what the `line` holds off, and asked for the scope note; all are in. A
   second reader of item 2 corrected the entry count from 10,584 to 10,581 and asked that the list's
