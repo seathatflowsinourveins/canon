@@ -39,6 +39,7 @@ from alpaca.trading.models import Calendar
 from alpaca.trading.models import Clock
 from alpaca.trading.models import Order
 from alpaca.trading.models import Position
+from alpaca.trading.requests import LimitOrderRequest
 from alpaca.trading.requests import MarketOrderRequest
 from canon_alpaca.constants import PRICE_INCREMENT
 from canon_alpaca.constants import PRICE_PRECISION
@@ -3600,6 +3601,10 @@ class Venue:
         self.faults: list[Fault] = []
         self.before: dict[str, Any] = {}
         self._closes: set[str] = set()
+        self.starts = SESSION_STARTS
+        """What Alpaca's clock says at `FakeTime` 0."""
+        self.calendar: list[Calendar] = []
+        """Alpaca's calendar as `get_calendar` answers it: no trading day unless a test sets one."""
 
     # What a test sets up.
 
@@ -3758,7 +3763,14 @@ class Venue:
             extended_hours=False,
         )
 
-    def _take(self, side: str, qty: Decimal, client_order_id: str, fault: Fault | None) -> Held:
+    def _take(
+        self,
+        side: str,
+        qty: Decimal,
+        client_order_id: str,
+        fault: Fault | None,
+        type: str = "market",
+    ) -> Held:
         """A closing order as it arrives through the API: refused as Alpaca refuses, else placed."""
         working = [h for h in self.held if h.working]
         if side == "sell" and self.qty > 0:
@@ -3772,13 +3784,17 @@ class Venue:
                 )
         if any(h.side != side for h in working):
             raise api_error(403, 40310000, "potential wash trade detected")
-        entry: dict[str, Any] = {"fills": self.fill_after, **(fault.order if fault else {})}
+        entry: dict[str, Any] = {
+            "fills": self.fill_after,
+            "type": type,
+            **(fault.order if fault else {}),
+        }
         self._closes.add(client_order_id)
         return self._place(
             self.fake.now, client_order_id=client_order_id, side=side, qty=qty, **entry
         )
 
-    def _close(self, side: str, qty: Decimal, client_order_id: str) -> Order:
+    def _close(self, side: str, qty: Decimal, client_order_id: str, type: str = "market") -> Order:
         fault = self._request(f"close {side} {qty}")
         if fault is not None and not fault.placed:
             self._answer("close", fault)
@@ -3789,12 +3805,13 @@ class Venue:
                 "side": side,
                 "qty": qty,
                 "fills": self.fill_after,
+                "type": type,
                 **fault.order,
             }
             self.arriving.append((self.fake.now + fault.arrives_after, entry))
             self._answer("close", fault)
         try:
-            held = self._take(side, qty, client_order_id, fault)
+            held = self._take(side, qty, client_order_id, fault, type)
         except APIError:
             self.fake.now += self._latency("close")
             raise
@@ -3805,19 +3822,22 @@ class Venue:
 
     def get_clock(self) -> Clock:
         fault = self._request("clock")
-        now = SESSION_STARTS + timedelta(seconds=self.fake.now)
+        now = self.starts + timedelta(seconds=self.fake.now)
         is_open = self._session_open(self.fake.now)
-        closes = SESSION_STARTS + timedelta(
-            seconds=3600 if self.closes_at is None else self.closes_at
-        )
+        closes = self.starts + timedelta(seconds=3600 if self.closes_at is None else self.closes_at)
         found = Clock(
             timestamp=now,
             is_open=is_open,
-            next_open=SESSION_STARTS + timedelta(days=1),
+            next_open=self.starts + timedelta(days=1),
             next_close=closes if is_open else closes + timedelta(days=1),
         )
         self._answer("clock", fault)
         return found
+
+    def get_calendar(self, filters=None) -> list[Calendar]:
+        fault = self._request("calendar")
+        self._answer("calendar", fault)
+        return list(self.calendar)
 
     def get_orders(self, filter=None) -> list:
         status = getattr(getattr(filter, "status", None), "value", None) or "open"
@@ -3898,17 +3918,27 @@ class Venue:
     def submit_order(self, order_data) -> Order:
         side = getattr(order_data.side, "value", order_data.side)
         qty = Decimal(str(order_data.qty))
-        return self._close(side, qty.normalize(), order_data.client_order_id)
+        kind = getattr(order_data.type, "value", order_data.type)
+        return self._close(side, qty.normalize(), order_data.client_order_id, kind)
 
 
 def check(
-    venue: Venue, unsettled: dict[str, str] | None = None, *, session: str = "regular"
+    venue: Venue,
+    unsettled: dict[str, str] | None = None,
+    *,
+    session: str = "regular",
+    data: Any = None,
 ) -> tuple[list, session_window.WindowReport]:
     """Run the account check after the stop against `venue`; `unsettled` is the node's orders it must
-    see ended, each with its side."""
+    see ended, each with its side; `data`, the market data client a close outside the session is priced
+    from."""
     report = session_window.WindowReport(session, "SPY", started="t")
     left = session_window._flatten_after_stop(
-        cast(TradingClient, venue), WindowConfig(session=session), report, unsettled=unsettled or {}
+        cast(TradingClient, venue),
+        WindowConfig(session=session),
+        report,
+        unsettled=unsettled or {},
+        data=data,
     )
     return left, report
 
@@ -3994,12 +4024,199 @@ def test_a_close_waits_for_a_cancel_that_is_slow_to_land(fake_time) -> None:
 
 
 def test_no_market_close_is_sent_once_alpacas_clock_says_the_session_closed(fake_time) -> None:
-    """Finding 2: a regular window's close after 16:00 would only queue for the next session."""
+    """Finding 2: a regular window's close after 16:00 would only queue for the next session. With no part
+    of a session open either (no trading day on the calendar), nothing is sent and the position is named."""
     venue = Venue(fake_time, qty=1, is_open=False)
     left, report = check(venue)
     assert venue.did("close") == [] and not report.closed_after_stop
     assert left == ["position of 1 SPY"]
-    assert any("would only queue" in e for e in report.errors)
+    assert any("no part of a session is open" in e for e in report.errors)
+
+
+AFTER_HOURS = datetime(2026, 11, 10, 16, 25, tzinfo=NEW_YORK)
+"""Twenty-five minutes into after-hours on `CALENDAR`'s day."""
+
+
+class Quotes:
+    """alpaca-py's `StockHistoricalDataClient.get_stock_latest_quote`, as far as the check uses it."""
+
+    def __init__(self, bid: str = "749.90", ask: str = "750.10") -> None:
+        self.bid, self.ask = bid, ask
+        self.asked: list = []
+
+    def get_stock_latest_quote(self, request) -> dict:
+        self.asked.append(request)
+        return {
+            "SPY": SimpleNamespace(
+                bid_price=float(self.bid), ask_price=float(self.ask), timestamp=AFTER_HOURS
+            )
+        }
+
+
+def after_hours(fake_time, **kw: Any) -> Venue:
+    venue = Venue(fake_time, is_open=False, **kw)
+    venue.starts = AFTER_HOURS
+    venue.calendar = [CALENDAR]
+    return venue
+
+
+def test_after_the_regular_close_the_position_is_closed_by_an_extended_hours_limit(
+    fake_time,
+) -> None:
+    """Change A (late wake): the check sent no close once the regular session had closed, so a window
+    that woke after 16:00 holding a share left it. Outside the session Alpaca takes only a limit marked
+    extended hours, DAY or GTC: the check sends a DAY one, `LIMIT_OFFSET` through the latest sip quote."""
+    venue = after_hours(fake_time, qty=1)
+    venue.order("exit-1", "sell", type="limit", cancel_after=1.0)
+    sent: list = []
+    submit = venue.submit_order
+    venue.submit_order = lambda order_data: sent.append(order_data) or submit(order_data)
+    quotes = Quotes()
+    left, report = check(venue, data=quotes)
+    assert left == [] and venue.qty == 0 and report.closed_after_stop
+    assert venue.did("cancel", "close") == ["cancel exit-1", "close sell 1"]
+    (request,) = sent
+    assert isinstance(request, LimitOrderRequest)
+    assert request.to_request_fields() == {
+        "symbol": "SPY",
+        "qty": 1.0,
+        "side": "sell",
+        "type": "limit",
+        "time_in_force": "day",
+        "limit_price": 749.85,
+        "extended_hours": True,
+        "client_order_id": request.client_order_id,
+    }
+    assert request.client_order_id.startswith("canon-close-t-")
+    assert (
+        getattr(quotes.asked[0].feed, "value", None) == "sip"
+    )  # after-hours' feed (SESSION_FEEDS)
+    (log,) = report.closes.values()
+    assert log[0] == (
+        "sent: sell 1 SPY limit 749.85, DAY, extended hours "
+        "(after-hours, sip quote at 21:25:00 UTC, bid 749.9, ask 750.1)"
+    )
+    assert log[-1] == "filled"
+
+
+def test_an_extended_hours_close_that_does_not_fill_is_priced_again_and_canceled_as_the_check_ends(
+    fake_time,
+) -> None:
+    """Bounded in time: each limit works `LIMIT_TIMEOUT_SECS` (code review: one priced once and left the
+    whole check never filled once the bid moved), then is canceled and the next is priced from a fresh
+    quote; the last is canceled as the check ends and the position is named, so no order of the window's
+    that Alpaca has shown works after its process has gone."""
+    venue = after_hours(fake_time, qty=1)
+    venue.fill_after = None  # nobody takes it
+    quotes = Quotes()
+    left, _report = check(venue, data=quotes)
+    closes = venue.closes()
+    timeout = session_window.LIMIT_TIMEOUT_SECS
+    assert len(closes) == math.ceil(session_window.AFTER_STOP_SECS / (timeout + 2.5))
+    assert len(quotes.asked) == len(closes)  # each priced from its own quote
+    assert all(c.status == "canceled" for c in closes) and venue.qty == 1
+    assert venue.did("cancel") == [f"cancel {c.client_order_id}" for c in closes]
+    sent = [at for at, name in venue.calls if name.startswith("close")]
+    assert all(b - a >= timeout for a, b in pairwise(sent))
+    assert left == [f"open order {closes[-1].client_order_id}", "position of 1 SPY"]
+
+
+def test_no_extended_hours_close_is_sent_without_a_bid(fake_time) -> None:
+    venue = after_hours(fake_time, qty=1)
+    left, report = check(venue, data=Quotes(bid="0"))
+    assert venue.did("close") == [] and left == ["position of 1 SPY"]
+    assert any("has no bid" in e for e in report.errors)
+
+
+def test_a_quote_that_fails_once_is_asked_again_in_the_next_poll(fake_time) -> None:
+    """Code review: a failed quote ended the check at once, its other polls unused."""
+    venue = after_hours(fake_time, qty=1)
+    quotes = Quotes()
+    answer = quotes.get_stock_latest_quote
+    failures = [requests.ReadTimeout("read timed out")]
+
+    def flaky(request):
+        if failures:
+            raise failures.pop()
+        return answer(request)
+
+    quotes.get_stock_latest_quote = flaky  # type: ignore[method-assign]
+    left, report = check(venue, data=quotes)
+    assert left == [] and venue.did("close") == ["close sell 1"]
+    assert any("no price for a after-hours close: ReadTimeout" in e for e in report.errors)
+
+
+def test_a_part_with_no_feed_sends_no_close_and_still_ends_the_check(
+    fake_time, monkeypatch
+) -> None:
+    """Code review: `window_feed`'s error for a part with no feed escaped the check, skipping its last
+    cancels, and `main` read it as a skip."""
+    monkeypatch.setitem(
+        session_window.SESSION_FEEDS, "after-hours", session_window.SessionFeed(None, "nothing")
+    )
+    venue = after_hours(fake_time, qty=1)
+    left, report = check(venue, data=Quotes())
+    assert venue.did("close") == [] and left == ["position of 1 SPY"]
+    assert any("no after-hours window: nothing" in e for e in report.errors)
+
+
+def test_a_close_alpaca_refuses_outside_the_session_is_not_sent_again(fake_time) -> None:
+    """Code review: a symbol not tradable overnight had its close refused, settled, and sent again every
+    poll."""
+    venue = after_hours(fake_time, qty=1)
+    venue.fail("close", api_error(422, 42210000, "asset is not tradable overnight"), times=None)
+    left, report = check(venue, data=Quotes())
+    assert venue.did("close") == ["close sell 1"] and left == ["position of 1 SPY"]
+    assert report.closes_not_placed == 1
+
+
+def test_a_check_woken_on_another_day_reads_the_calendar_again(fake_time) -> None:
+    """Code review: a window's calendar runs to the day after its start; one that slept into another
+    day found no part open on it and sent no close."""
+    venue = after_hours(fake_time, qty=1)
+    venue.starts = AFTER_HOURS + timedelta(days=3)  # a Friday window woke on Monday after-hours
+    monday = Calendar(
+        date="2026-11-13", open="09:30", close="16:00", session_open="0400", session_close="2000"
+    )
+    venue.calendar = [monday]
+    report = session_window.WindowReport("regular", "SPY", started="t")
+    left = session_window._flatten_after_stop(
+        cast(TradingClient, venue),
+        WindowConfig(),
+        report,
+        calendar=[CALENDAR],
+        calendar_on=date(2026, 11, 10),
+        data=Quotes(),
+    )
+    assert venue.did("calendar") == ["calendar"] and venue.did("close") == ["close sell 1"]
+    assert left == []
+
+
+def test_the_calendar_given_is_not_read_again(fake_time) -> None:
+    """The window's calendar, read at its start, places the part; the check reads none of its own, so a
+    close step outside the session is three requests, as one inside it is with its cancels."""
+    venue = after_hours(fake_time, qty=1)
+    report = session_window.WindowReport("regular", "SPY", started="t")
+    left = session_window._flatten_after_stop(
+        cast(TradingClient, venue),
+        WindowConfig(),
+        report,
+        calendar=[CALENDAR],
+        calendar_on=date(2026, 11, 10),
+        data=Quotes(),
+    )
+    assert left == [] and venue.did("calendar") == []
+
+
+def test_a_suspension_is_named_in_the_record_with_where_the_stop_ended() -> None:
+    """Change A: a window that woke 20 minutes past its end in the session ended flat and said nothing of
+    why its stop came late; `overrun` says so when the wall clock ran ahead of the monotonic one."""
+    ends = datetime(2026, 11, 10, 15, 30, tzinfo=UTC)
+    began = datetime.now(UTC) - timedelta(seconds=3000)
+    found = session_window.overrun(began, 1.0, datetime.now(UTC) - timedelta(seconds=1200))
+    assert found.startswith("the process was suspended for about 2999 s (a machine sleep)")
+    assert found.endswith("its stop ended 1200 s past the window's end")
+    assert session_window.overrun(datetime.now(UTC), 0.0, ends) == ""
 
 
 def test_a_close_that_would_only_queue_is_canceled(fake_time) -> None:
@@ -4705,10 +4922,11 @@ def test_an_order_the_listing_shows_is_not_also_called_not_found(fake_time) -> N
 
 def test_a_position_that_can_only_be_reported_is_read_once(fake_time) -> None:
     """With the session closed and nothing to look for, the check read the account a second time with
-    nothing sent in between, each read up to a full timeout under the paper lock."""
+    nothing sent in between, each read up to a full timeout under the paper lock. With no calendar given
+    (a window passes its own), the check reads one, once, for a part of the session to close in."""
     venue = Venue(fake_time, qty=1, is_open=False)
     left, _ = check(venue)
-    assert [name for _, name in venue.calls] == ["orders", "position", "clock"]
+    assert [name for _, name in venue.calls] == ["orders", "position", "clock", "calendar"]
     assert left == ["position of 1 SPY"]
 
 

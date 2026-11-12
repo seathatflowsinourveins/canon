@@ -65,6 +65,21 @@ Every request of the check is counted: a reading looks up at most two requests (
 over the polls, and a step cancels at most two orders (`CANCELS`); what is not reached in the check's time
 is named in what is left.
 
+**Outside the regular session (2026-11-11, the resume work's change A).** A window that woke past its end
+after the regular close sent no close, so a held share stayed, and the next window refused to start.
+Alpaca takes for extended hours "Only limit orders with `time_in_force` set to `day` or `gtc`" marked
+`extended_hours`, and queues for the next day an order not so marked sent after 4:00pm. So, where the clock
+says the regular session is closed and a part of the extended session is open by it and the window's
+calendar, the close is a DAY limit marked `extended_hours`, five cents through the latest quote on the
+part's feed (the strategy's own `LIMIT_OFFSET`), under the same client order ID scheme and the same rules
+for a lost answer. Each works `LIMIT_TIMEOUT_SECS` (the strategy's own) and is canceled, and the next is
+priced from a fresh quote; the last is canceled as the check ends, so nothing of the window's that Alpaca
+has shown works once its process has gone. With no part open or no price, none is sent and the position
+is named; a quote that fails is asked again in the next poll; a close Alpaca refuses is not sent again.
+The window's calendar is reused, so a close step is a clock and a close on the trading API and one quote
+on the market-data API, inside the counted bounds; a check given no calendar, or woken on another day,
+reads one more. The record's `overrun` says when the process was suspended across the node's run.
+
 ### Consequences
 
 * Good: a close whose answer was lost is looked up by its own ID, never resolved by sending another.
@@ -213,6 +228,14 @@ is offline until a window's stop leaves something to clear.
 ## Evidence
 
 Read 2026-11-10. "raw": fetched with `curl` and read whole. NautilusTrader files at the pin, `d53849b216e2`.
+
+* https://docs.alpaca.markets/us/docs/orders-at-alpaca.md, 2026-11-11: "Only limit orders with
+  `time_in_force` set to `day` or `gtc` orders are accepted as extended hours eligible", the
+  `extended_hours` flag, the three extended parts, and "Orders not eligible for extended hours submitted
+  after 4:00pm ET will be queued up for release the next trading day" (fetched; summarised by the fetch
+  tool, quoted lines checked as quoted).
+* Python 3.14.10 in the toolchain, `time.get_clock_info("monotonic")`: `mach_absolute_time()` on this
+  host, which #250's record shows stopped while the machine slept (run, 2026-11-11).
 
 * alpaca-py 0.45.0 in `.venv`, `common/rest.py` and `common/constants.py`: `RESTClient._request` sends a
   request answered 429 or 504 again, `DEFAULT_RETRY_ATTEMPTS` 3 times, `DEFAULT_RETRY_WAIT_SECONDS` 3 apart,
