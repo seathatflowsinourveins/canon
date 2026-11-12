@@ -90,9 +90,10 @@ A, 2026-11-11), a market order would only queue ("Orders not eligible for extend
 4:00pm ET will be queued up for release the next trading day"), and Alpaca takes for extended hours "Only
 limit orders with `time_in_force` set to `day` or `gtc`" with `extended_hours` true (orders-at-alpaca); so,
 in a part of the extended session open by that clock and the window's calendar (`session_part`), the close
-is a DAY limit so marked, `LIMIT_OFFSET` through the latest quote on the part's feed, as the strategy and
-`custody`'s close-only form price theirs. It works only while the check runs and is canceled as it ends;
-with no part open none is sent. Either close is never sent while a request that could close the same
+is a DAY limit so marked, `LIMIT_OFFSET` through the latest quote on the part's feed, put on Alpaca's step
+by `close_limit` as `custody`'s close-only form puts theirs (the strategy's own still go through
+`through_the_touch`, in whole cents). It works only while the check runs and is canceled as it ends; with
+no part open none is sent. Either close is never sent while a request that could close the same
 shares is sent and not found, since
 a lookup that finds nothing does not show the order was never placed and Alpaca says not to resend one
 that timed out; such a window is recorded failed, naming the position and the request. What a market
@@ -182,6 +183,7 @@ from datetime import date
 from datetime import datetime
 from datetime import time as dt_time
 from datetime import timedelta
+from decimal import ROUND_CEILING
 from decimal import Decimal
 from decimal import InvalidOperation
 from pathlib import Path
@@ -249,6 +251,7 @@ from nautilus_trader.model import Quantity
 from nautilus_trader.model import StrategyId
 from nautilus_trader.model import TimeInForce
 
+from . import price_step
 from .mover import TRAIL_SETTINGS
 from .mover import Mover
 from .mover import MoverConfig
@@ -3819,12 +3822,25 @@ class _AccountCheck:
         self._seen(request, order)
 
 
+class QuoteTooWide(ValueError):
+    """`close_limit`'s refusal of a quote too wide to close on. Its text is the window's own (the bid,
+    the ask, the symbol), never an answer's body, so a report may print it."""
+
+
+PENNY_NAME_ASK = Decimal("0.10")
+"""A sell close under Alpaca's finest step goes at the lowest step only when the ask is also under
+this: a name truly worth pennies. With a higher ask the bid alone pulls the limit far under the
+market, so the close is refused as a quote too wide to close on (the lead, 2026-11-12)."""
+
+
 def close_limit(data: Any, symbol: str, side: str, part: str) -> tuple[Decimal, str]:
     """The limit of a close of `side` in `part` outside the regular session: `LIMIT_OFFSET` through the
-    touch of alpaca-py's latest quote on the part's feed (`get_stock_latest_quote`, `window_feed`), as the
-    strategy prices its own (`through_the_touch`), and the quote it came from, with its time, for the
-    record. `ValueError` with no price on the side the close takes; `window_feed`'s error for a part with
-    no feed. The account check after a stop and `custody`'s close-only form both price this way."""
+    touch of alpaca-py's latest quote on the part's feed (`get_stock_latest_quote`, `window_feed`),
+    put on Alpaca's step by `price_step` (a sell down, a buy up), and the quote it came from, with its
+    time, for the record. A sell under the finest step goes at 0.0001 and the record says so, when the
+    ask is under `PENNY_NAME_ASK`; with a higher ask, or none, it is refused as too wide a quote.
+    `ValueError` with no price on the side the close takes; `window_feed`'s error for a part with no
+    feed. The account check after a stop and `custody`'s close-only form both price this way."""
     feed = window_feed(part)
     found = data.get_stock_latest_quote(
         StockLatestQuoteRequest(symbol_or_symbols=symbol, feed=DataFeed(feed))
@@ -3837,17 +3853,34 @@ def close_limit(data: Any, symbol: str, side: str, part: str) -> tuple[Decimal, 
     touch, name = (bid, "bid") if side == "sell" else (ask, "ask")
     if touch <= 0:
         raise ValueError(f"the latest {feed} quote in {symbol} has no {name} ({touch})")
-    limit = through_the_touch(
-        OrderSide.SELL if side == "sell" else OrderSide.BUY, bid, ask, LIMIT_OFFSET
-    )
-    if limit <= 0:
-        raise ValueError(f"the {name} {touch} less {LIMIT_OFFSET} is not a price")
+    raw = touch - LIMIT_OFFSET if side == "sell" else touch + LIMIT_OFFSET
+    # a sell down and a buy up onto Alpaca's step, above the tick scheme's top too: a close is never
+    # refused there (the lead's ruling (ii), 2026-11-12), where a buy's entry is
+    if side == "buy":
+        # up to the finest step first: `up_on_step`'s nudge would take a finer value to the tick under it
+        limit = price_step.up_on_step(raw.quantize(price_step.SUB_DOLLAR, rounding=ROUND_CEILING))
+    else:
+        limit = price_step.down_on_step(raw) if raw > 0 else Decimal(0)
+    clamp = ""
+    if limit < price_step.SUB_DOLLAR:
+        under = f"the {name} {touch} less {LIMIT_OFFSET} is {raw}, under Alpaca's finest step"
+        if not 0 < ask < PENNY_NAME_ASK:
+            # the bid alone says pennies, the ask does not: refused, and the next poll asks again
+            raise QuoteTooWide(
+                f"{under}, and the ask {ask} is not under {PENNY_NAME_ASK}: a quote too wide to "
+                f"close on ({symbol})"
+            )
+        # a name worth pennies: a close exists to close, so it goes at the lowest step and says so
+        limit = price_step.SUB_DOLLAR
+        clamp = f"; {under}, so the close is sent at the lowest, {limit}"
+    # Already on the step: express that step's decimal places in the close record.
+    limit = limit.quantize(price_step.tick(limit))
     at = getattr(quote, "timestamp", None)
     if isinstance(at, datetime):  # alpaca-py's are aware; a naive one is taken as UTC
         when = f"at {(at.astimezone(UTC) if at.tzinfo else at):%H:%M:%S} UTC"
     else:
         when = "with no time given"
-    return limit, f"{feed} quote {when}, bid {bid}, ask {ask}"
+    return limit, f"{feed} quote {when}, bid {bid}, ask {ask}{clamp}"
 
 
 def _closing_side(held: Decimal) -> str:

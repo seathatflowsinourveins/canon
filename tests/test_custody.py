@@ -718,6 +718,33 @@ def test_outside_the_regular_session_a_limit_that_fills_leaves_the_account_flat(
     assert report.flat and venue.canceled == []
 
 
+def test_a_holding_under_five_cents_is_closed_at_the_lowest_step_and_the_record_says_so() -> None:
+    """The lead, 2026-11-12: a close exists to close. A bid of 0.04 less the five-cent offset is under
+    Alpaca's finest step, so paper:close sends its sell at 0.0001, names that in its record, and the
+    account is left flat; refusing it would leave the position open."""
+    venue = Venue(AFTER_HOURS, limits_fill=True)
+    venue.hold("SPY", 1)
+    report = close(venue, Quotes(bid="0.04", ask="0.05"))
+    (sent,) = venue.sent
+    assert sent.limit_price == 0.0001
+    log = report.closes[sent.client_order_id]
+    assert "less 0.05 is -0.01, under Alpaca's finest step" in log[0]
+    assert "sent at the lowest, 0.0001" in log[0]
+    assert report.flat
+
+
+def test_a_bid_in_pennies_with_an_ask_that_is_not_sends_no_close_and_names_the_refusal() -> None:
+    """The lead, 2026-11-12: a bid of 0.04 with an ask of 52.10 is a quote too wide to close on.
+    paper:close sends nothing for it and names why; the position stays, by name."""
+    venue = Venue(AFTER_HOURS, limits_fill=True)
+    venue.hold("SPY", 1)
+    report = close(venue, Quotes(bid="0.04", ask="52.10"))
+    assert venue.sent == []
+    (error,) = report.errors
+    assert "a quote too wide to close on" in error and "ask 52.1" in error
+    assert not report.flat
+
+
 def test_no_bid_sends_no_close_and_says_why() -> None:
     venue = Venue(AFTER_HOURS)
     venue.hold("SPY", 1)
