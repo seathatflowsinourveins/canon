@@ -3480,9 +3480,12 @@ def test_the_post_end_bound_fits_the_end_margin_the_stale_record_and_the_paper_l
     import tomllib
 
     w = session_window
-    before = w.STOP_TIMEOUT_SECS + w.ADAPTER_CALL_SECS + w.AFTER_STOP_SECS
+    # the check's deadline with the most names a window holds, two polls more for each past the first
+    deadline = w.AFTER_STOP_SECS + (w.PART_SLOTS - 1) * 2 * w.POLL_SECS
+    before = w.STOP_TIMEOUT_SECS + w.ADAPTER_CALL_SECS + deadline
     reading = (w.LOOKUPS + 2) * w.REQUEST_SECS  # its lookups, the open orders and the position
-    last_close = before + reading + w.REQUEST_SECS  # the last poll's reading and its clock read
+    # the last poll's reading, its clock read and, outside the regular session, the close's quote
+    last_close = before + reading + 2 * w.REQUEST_SECS
     assert last_close == w.LAST_CLOSE_SECS
     # that poll at its longest (a reading, the clock, its cancels), then the last reading, as long
     after_end = before + 2 * (reading + (1 + w.CANCELS) * w.REQUEST_SECS)
@@ -5320,7 +5323,8 @@ def test_the_last_close_goes_out_at_the_bound_counted_for_it(fake_time) -> None:
     (sent,) = [at for at, name in venue.calls if name.startswith("close sell") and at >= LAST_POLL]
     before = w.STOP_TIMEOUT_SECS + w.ADAPTER_CALL_SECS
     slack = w.AFTER_STOP_SECS - LAST_POLL
-    assert before + sent + slack == pytest.approx(w.LAST_CLOSE_SECS)
+    # one name held; a market close reads no quote, the one request the bound counts for an extended one
+    assert before + sent + slack + w.REQUEST_SECS == pytest.approx(w.last_close_secs(1))
     assert "position of 1 SPY" not in left
 
 
@@ -5339,7 +5343,7 @@ def test_the_whole_check_ends_at_the_bound_counted_for_it(fake_time) -> None:
     assert len(left) == 4  # three orders working and the position
     slack = w.AFTER_STOP_SECS - LAST_POLL
     before = w.STOP_TIMEOUT_SECS + w.ADAPTER_CALL_SECS
-    assert before + fake_time.now + slack == pytest.approx(w.AFTER_END_SECS)
+    assert before + fake_time.now + slack == pytest.approx(w.after_end_secs(1))
 
 
 def test_a_skip_whose_heartbeat_cannot_be_written_still_exits_0_and_says_why(
@@ -8913,3 +8917,154 @@ def test_an_entry_context_with_fewer_earlier_sessions_than_the_arm_takes_is_miss
     )
     (context,) = contexts.values()
     assert context.missing is not None and "4 earlier sessions" in context.missing
+
+
+class CountingAccount(MultiWindowAccount):
+    """`MultiWindowAccount` that records each trading request at the time it is sent, and makes each
+    take `latency` seconds."""
+
+    def __init__(self, fake, quantities, *, orders=None, latency: float = 0.0) -> None:
+        super().__init__(fake, quantities, orders=orders)
+        self.latency = latency
+        self.requests: list[tuple[float, str]] = []
+
+    def _request(self, name: str) -> None:
+        self.requests.append((self.fake.now, name))
+        self.fake.now += self.latency
+
+    def get_clock(self) -> Clock:
+        self._request("clock")
+        return super().get_clock()
+
+    def get_orders(self, filter=None) -> list:
+        self._request("orders")
+        return super().get_orders(filter)
+
+    def get_all_positions(self) -> list:
+        self._request("positions")
+        return super().get_all_positions()
+
+    def get_order_by_client_id(self, client_id: str):
+        self._request("lookup")
+        return super().get_order_by_client_id(client_id)
+
+    def cancel_order_by_id(self, order_id) -> None:
+        self._request("cancel")
+        super().cancel_order_by_id(order_id)
+
+    def submit_order(self, request):
+        self._request("close")
+        return super().submit_order(request)
+
+
+def polls(requests: list[tuple[float, str]]) -> list[list[str]]:
+    """The requests of each poll: a poll begins with its reading, the lookups and then the open orders."""
+    found: list[list[str]] = []
+    for _, name in requests:
+        after_lookup = bool(found) and found[-1][-1] == "lookup"
+        if name in ("lookup", "orders") and not after_lookup:
+            found.append([])
+        found[-1].append(name)
+    return found
+
+
+def test_a_multiname_poll_that_cancels_sends_no_close_and_stays_inside_seven_requests(
+    fake_time, tmp_path
+) -> None:
+    """Review of 3a8613a, finding 11 (the lead's ruling of 2026-11-12): `act` canceled a name's
+    working orders and, in the same poll, read the clock and sent a close in another name, so a poll
+    sent nine trading requests against the seven `POLL_SECS` counts. A poll that cancels now sends no
+    close: the close goes out in the next poll."""
+    orders = [
+        SimpleNamespace(id=uuid4(), client_order_id=f"sell-AAA-{n}", symbol="AAA", status="new")
+        for n in range(2)
+    ]
+    account = CountingAccount(fake_time, {"AAA": 5, "BBB": 2}, orders=orders)
+    report = session_window.WindowReport("regular", "AAA", started="t")
+    left = session_window._flatten_after_stop(
+        cast(TradingClient, account),
+        WindowConfig(symbol="AAA", log_dir=tmp_path),
+        report,
+        symbols=("AAA", "BBB"),
+        unsettled={"entry-1": "buy", "entry-2": "buy"},
+        unsettled_symbols={"entry-1": "AAA", "entry-2": "AAA"},
+    )
+    every = polls(account.requests)
+    assert every[0][:4] == ["lookup", "lookup", "orders", "positions"]
+    assert max(len(poll) for poll in every) <= 7, every
+    assert not any("cancel" in poll and "close" in poll for poll in every), every
+    assert account.quantities == {"AAA": 0, "BBB": 0}, left
+
+
+def test_the_account_checks_deadline_grows_with_the_names_held(fake_time, tmp_path) -> None:
+    """Review of 3a8613a, finding 11 (the lead's ruling of 2026-11-12): the check closes one name a
+    poll, and its 60 s deadline did not grow with the names held, so seven names each answered in 2 s
+    left the last two unclosed. The deadline gives each name held after the first two polls more."""
+    w = session_window
+    names = {f"N{n}": n + 1 for n in range(w.PART_SLOTS)}
+    account = CountingAccount(fake_time, names, latency=2.0)
+    report = session_window.WindowReport("regular", "N0", started="t")
+    left = session_window._flatten_after_stop(
+        cast(TradingClient, account),
+        WindowConfig(symbol="N0", log_dir=tmp_path),
+        report,
+        symbols=tuple(names),
+    )
+    assert left == [] and not any(account.quantities.values()), left
+    closes = [at for at, name in account.requests if name == "close"]
+    assert len(closes) == w.PART_SLOTS and max(closes) > w.AFTER_STOP_SECS
+    assert w.after_stop_secs(1) == w.AFTER_STOP_SECS
+    assert (
+        w.after_stop_secs(w.PART_SLOTS) == w.AFTER_STOP_SECS + (w.PART_SLOTS - 1) * 2 * w.POLL_SECS
+    )
+    assert w.after_stop_secs(w.PART_SLOTS + 5) == w.after_stop_secs(w.PART_SLOTS)
+
+
+class TimedQuotes(NoBidForAAA):
+    """`NoBidForAAA` that records when each quote is asked for."""
+
+    def __init__(self, fake) -> None:
+        super().__init__()
+        self.fake = fake
+        self.at: list[float] = []
+
+    def get_stock_latest_quote(self, request) -> dict:
+        self.at.append(self.fake.now)
+        return super().get_stock_latest_quote(request)
+
+
+class CountingExtended(ExtendedMultiAccount):
+    def __init__(self, fake, quantities, *, refusing) -> None:
+        super().__init__(fake, quantities, refusing=refusing)
+        self.calendar_at: list[float] = []
+        self.closes_at: list[float] = []
+
+    def get_calendar(self, filters=None) -> list[Calendar]:
+        self.calendar_at.append(self.fake.now)
+        return super().get_calendar(filters)
+
+    def submit_order(self, request):
+        self.closes_at.append(self.fake.now)
+        return super().submit_order(request)
+
+
+def test_an_extended_poll_reads_the_calendar_or_one_quote_and_closes_at_most_once(
+    fake_time, tmp_path
+) -> None:
+    """Review of 3a8613a, finding 11: outside the regular session a poll could read the calendar, then a
+    quote for every name whose quote failed, then send a close: more requests than a poll's bound
+    counts. A poll that reads the calendar sends no quote, and a failed quote ends the poll."""
+    account = CountingExtended(fake_time, {"AAA": 5, "BBB": 2}, refusing=set())
+    quotes = TimedQuotes(fake_time)
+    report = session_window.WindowReport("regular", "AAA", started="t")
+    left = session_window._flatten_after_stop(
+        cast(TradingClient, account),
+        WindowConfig(symbol="AAA", log_dir=tmp_path),
+        report,
+        symbols=("AAA", "BBB"),
+        data=quotes,
+    )
+    assert account.calendar_at == [0.0]
+    assert 0.0 not in quotes.at and 0.0 not in account.closes_at
+    assert len(quotes.at) == len(set(quotes.at)), "one quote a poll"
+    assert account.quantities["BBB"] == 0 and "position of 5 AAA" in left

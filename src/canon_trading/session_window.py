@@ -252,6 +252,7 @@ from .mover import entry_price
 from .mover_window import MOVER
 from .mover_window import MOVER_ID
 from .mover_window import OUTER_BOUND_MULTIPLE
+from .mover_window import PART_SLOTS
 from .mover_window import RANK_MAX_AGE_SECS
 from .mover_window import entry_diagnostics
 from .mover_window import mover_context_feeds
@@ -473,9 +474,13 @@ it a feed (every part has one; a part given none is skipped). The adapter sends
 `extended_hours` from the submit params (ADR 0038), its disconnect is bounded (ADR 0039), and an overnight
 window passed on paper before this was turned on (ADR 0044, Confirmation)."""
 POLL_SECS = 2.5
-"""Between the account check's polls after the stop. A poll sends at most seven requests (`LOOKUPS`
-lookups, two reads, the clock, `CANCELS` cancels or one close), two when nothing is unsettled: at most
-168 a minute, inside the 200 a minute Alpaca's skill gives for the paper API (ADR 0044, Evidence)."""
+"""Between the account check's polls after the stop. A poll sends at most seven trading requests,
+whatever the names held: a reading (`LOOKUPS` lookups, the open orders and the position), then the
+clock and either `CANCELS` cancels, or one close, or outside the regular session the calendar when it
+must be read again; a poll that cancels sends no close, and one that reads the calendar sends no quote
+and no close. An extended close's quote is one market-data request, and a quote that fails ends the
+poll. So at most 168 trading requests a minute, inside the 200 a minute Alpaca's skill gives for the
+paper API (ADR 0044, Evidence), and a poll is never longer than `POLL_AT_LONGEST_SECS`."""
 COMMIT_ENV = "CANON_COMMIT"
 """Set by the scheduled runner, `home/.claude/canon/paper-session.sh`, to the `origin/main` commit it checked
 out for this firing (ADR 0050)."""
@@ -512,8 +517,19 @@ STOP_TIMEOUT_SECS = (
 the node's own stop bounds (`paper_node`), and one Alpaca request at the adapter's timeouts (ADR 0039),
 which a call in flight at the disconnect can outlast it by."""
 AFTER_STOP_SECS = 60
-"""How long the account check after the stop starts polls: a poll begun before it runs to its end, then a
-last reading and a cancel of what it shows (`AFTER_END_SECS`)."""
+"""How long the account check after the stop starts polls with one name held (`after_stop_secs`): a poll
+begun before it runs to its end, then a last reading and a cancel of what it shows (`AFTER_END_SECS`)."""
+
+
+def after_stop_secs(names: int) -> float:
+    """How long the account check starts polls with `names` held: `AFTER_STOP_SECS`, and two polls more
+    for each name past the first, since the check closes one name a poll and sees it closed in the next
+    (review of 3a8613a, finding 11, the lead's ruling of 2026-11-12). Names past `PART_SLOTS`, the names
+    a window holds at once, add nothing: a run with more `--slots` gets the seven-name deadline, so the
+    bounds below hold for every window."""
+    return AFTER_STOP_SECS + (min(max(names, 1), PART_SLOTS) - 1) * 2 * POLL_SECS
+
+
 REQUEST_SECS = CONNECT_TIMEOUT_SECS + READ_TIMEOUT_SECS
 """One request at the adapter's timeouts (ADR 0039), sent once, as the account check sends it. The two
 timeouts' sum, not a wall-clock bound: the connect timeout applies per address tried and the read timeout
@@ -534,19 +550,37 @@ order and the check's close; with more, the rest wait for the next poll."""
 READING_SECS = (LOOKUPS + 2) * REQUEST_SECS
 """One reading of the account check at its longest: its lookups, the open orders and the position."""
 POLL_AT_LONGEST_SECS = READING_SECS + (1 + CANCELS) * REQUEST_SECS
-"""One poll of the account check at its longest: a reading, the clock, and its cancels (a close, sent
-instead of them, is one request)."""
-LAST_CLOSE_SECS = (
-    STOP_TIMEOUT_SECS + ADAPTER_CALL_SECS + AFTER_STOP_SECS + READING_SECS + REQUEST_SECS
-)
-"""From a window's end until the account check's last market close is sent, at most (about 455 s): the
-stop at its bound, the node's last worker calls, and the check's deadline with the poll begun before it,
-its reading and the clock read. Every request of that poll is counted."""
-AFTER_END_SECS = STOP_TIMEOUT_SECS + ADAPTER_CALL_SECS + AFTER_STOP_SECS + 2 * POLL_AT_LONGEST_SECS
-"""From a window's end until its process is done with Alpaca, at most (about 725 s): the stop, the node's
-last worker calls, the check's deadline, the poll begun before it at its longest, then the last reading,
-the clock and the last cancels, as long again. Every request is counted: a reading looks up no more than
-`LOOKUPS` orders and a step cancels no more than `CANCELS`, however many there are."""
+"""One poll of the account check at its longest: a reading, the clock, and its cancels (the calendar, or
+a quote and a close, sent instead of them, are one request or two)."""
+
+
+def last_close_secs(names: int) -> float:
+    """From a window's end until the account check's last close is sent, with `names` held, at most: the
+    stop at its bound, the node's last worker calls, and the check's deadline (`after_stop_secs`) with
+    the poll begun before it, its reading, the clock read and, outside the regular session, the quote
+    the limit is priced from. Every request of that poll is counted."""
+    return (
+        STOP_TIMEOUT_SECS
+        + ADAPTER_CALL_SECS
+        + after_stop_secs(names)
+        + READING_SECS
+        + 2 * REQUEST_SECS
+    )
+
+
+def after_end_secs(names: int) -> float:
+    """From a window's end until its process is done with Alpaca, with `names` held, at most: the stop,
+    the node's last worker calls, the check's deadline (`after_stop_secs`), the poll begun before it at
+    its longest, then the last reading, the clock and the last cancels, as long again. Every request is
+    counted: a reading looks up no more than `LOOKUPS` orders and a step cancels no more than
+    `CANCELS`, however many there are."""
+    return STOP_TIMEOUT_SECS + ADAPTER_CALL_SECS + after_stop_secs(names) + 2 * POLL_AT_LONGEST_SECS
+
+
+LAST_CLOSE_SECS = last_close_secs(PART_SLOTS)
+"""`last_close_secs` with the most names a window holds (about 515 s)."""
+AFTER_END_SECS = after_end_secs(PART_SLOTS)
+"""`after_end_secs` with the most names a window holds (about 755 s)."""
 SKEW_SECS = 60
 """How far this host's clock may be from Alpaca's: the window runs to an end taken from Alpaca's clock, timed
 on this host's."""
@@ -3277,6 +3311,13 @@ class _AccountCheck:
             self.open_until = asked_at
         return bool(clock.is_open)
 
+    def calendar_due(self) -> bool:
+        """Whether `extended_part` must read the calendar: none is held, or it was read on another day than
+        the clock's last answer."""
+        assert self.clock is not None
+        today = self.clock.timestamp.astimezone(NEW_YORK).date()
+        return self.calendar is None or (self.calendar_on is not None and self.calendar_on != today)
+
     def extended_part(self) -> str:
         """The part of the extended session open by the clock's last answer (`session_part`): `pre-market`,
         `after-hours` or `overnight`, or "" with the reason noted. The calendar is the window's own while
@@ -3296,14 +3337,14 @@ class _AccountCheck:
             _note(self.report, f"not closing the position: no part of a session is open: {e}")
             return ""
 
-    def cancel(self, *, final: bool = False) -> None:
+    def cancel(self, *, final: bool = False) -> int:
         """Cancel what works, those not yet tried first: `CANCELS` orders in a poll; as the check ends,
         every one, a further cancel starting only while the step has taken under the time `CANCELS - 1`
         requests may, so the step stays inside the `CANCELS` requests counted for it. A close of the
         check's own is left to fill while it still closes the position held and the session is open; one
         sent outside the regular session (`extended`) for `LIMIT_TIMEOUT_SECS`, as the strategy leaves
         its own limits, then canceled, so the next is priced from a fresh quote, and canceled as the check
-        ends, so none Alpaca has shown works once the process has gone."""
+        ends, so none Alpaca has shown works once the process has gone. Returns the cancels sent."""
         unwanted, wanted = [], []
         for order in self.working():
             request = self.requests.get(str(order.client_order_id))
@@ -3328,15 +3369,18 @@ class _AccountCheck:
         when = " as the check ends" if final else ""
         began = time.monotonic()
         unwanted.sort(key=lambda o: self.tried.get(str(o.id), 0))
-        for sent, order in enumerate(unwanted):
+        sent = 0
+        for order in unwanted:
             in_time = time.monotonic() - began < (CANCELS - 1) * REQUEST_SECS
             if sent >= CANCELS and not (final and in_time):
                 break
             self.tried[str(order.id)] = self.tried.get(str(order.id), 0) + 1
+            sent += 1
             try:
                 self.trading.cancel_order_by_id(order.id)
             except FAILED as e:  # it filled or ended meanwhile, or the cancel was lost
                 _note(self.report, f"canceling {order.client_order_id}{when}: {e}")
+        return sent
 
     def act(self) -> bool:
         """One step toward a flat account after a reading; False once nothing is left to do or to look
@@ -3344,10 +3388,14 @@ class _AccountCheck:
         its shares from one. Close another name's position if nothing sent and not found could close it
         too and Alpaca's clock, read now, says the session is open; outside it, through a limit priced from
         the name's quote. A name with a working order or no price is passed for this poll, and the names
-        tried least come first, so one name that cannot finish never holds the others' closes."""
+        tried least come first, so one name that cannot finish never holds the others' closes. A poll
+        sends at most seven trading requests (`POLL_SECS`): one that sent a cancel sends no close, one
+        that read the calendar no quote and no close, and a quote that fails ends the poll."""
         working = self.working()
-        if working:
-            self.cancel()
+        if working and self.cancel():
+            # no close in a poll that canceled: its clock read and close would pass the seven requests
+            # a poll counts (`POLL_SECS`); the close goes out in the next poll
+            return True
         busy = {o.symbol for o in working}
         pending = bool(working)
         if not any(self.held.values()):
@@ -3383,7 +3431,11 @@ class _AccountCheck:
             # Outside the regular session a market order would only queue: Alpaca takes a limit order
             # marked extended hours, DAY or GTC, in pre-market, after-hours and overnight (module header).
             if part is None:
+                calendar_read = self.calendar_due()
                 part = self.extended_part()
+                if part and calendar_read:
+                    # the calendar took this poll's request; the quote and close come next
+                    return True
                 if part:
                     try:
                         window_feed(part)
@@ -3402,8 +3454,7 @@ class _AccountCheck:
                     self.report, f"no price for a {part} close: {type(e).__name__}: {e} ({symbol})"
                 )
                 self.close_tries[symbol] += 1
-                pending = True
-                continue
+                return True  # one quote a poll (`POLL_SECS`); the names tried least come first next
             self.close_tries[symbol] += 1
             self._close(symbol, side, limit=limit, quote=f"{part}, {quote}")
             return True
@@ -3535,8 +3586,9 @@ def _flatten_after_stop(
     (`get_order_by_client_id`), or, for a close, Alpaca's refusal of the request (403, 422). The account
     is flat when no order is open, no position is held and the set is empty; nothing else is recorded ok.
 
-    A poll each `POLL_SECS`, none starting once `AFTER_STOP_SECS` have gone; one begun before runs to its
-    end. A poll reads (`_AccountCheck.read`: up to `LOOKUPS` lookups, in turn, then the open orders and
+    A poll each `POLL_SECS`, none starting once `after_stop_secs` of the most window names a reading has
+    shown held have gone (`AFTER_STOP_SECS` for one, two polls more for each further name up to
+    `PART_SLOTS`); one begun before runs to its end. A poll reads (`_AccountCheck.read`: up to `LOOKUPS` lookups, in turn, then the open orders and
     the position) and, if the account is not flat, acts (`act`): an order that works, listed or shown by
     its lookup, is canceled, on every poll until Alpaca shows it ended, in any session, up to `CANCELS`
     a poll; with none working, a position still held is closed for the held quantity under a client
@@ -3571,7 +3623,8 @@ def _flatten_after_stop(
         data=data,
         unsettled_symbols=unsettled_symbols,
     )
-    deadline = time.monotonic() + AFTER_STOP_SECS
+    started = time.monotonic()
+    deadline = started + after_stop_secs(1)
     left: list[str] | None = None
     last_error = ""
     more = True
@@ -3580,6 +3633,8 @@ def _flatten_after_stop(
             left = check.read()
             if not left:
                 return left
+            names = sum(1 for held in check.held.values() if held)
+            deadline = max(deadline, started + after_stop_secs(names))
             more = check.act()
         except FAILED as e:
             last_error = f"{type(e).__name__}: {e}"
@@ -3598,7 +3653,7 @@ def _flatten_after_stop(
         _note(report, f"reading the account as the check ends: {last_error}")
         if left is None:
             raise RuntimeError(
-                f"the account could not be read in {AFTER_STOP_SECS} s after the stop: {last_error}"
+                f"the account could not be read in {deadline - started:g} s after the stop: {last_error}"
             ) from e
         left = check.left()
     # The process is ending: nothing the window knows of is left working, but a close that will fill.
