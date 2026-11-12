@@ -44,8 +44,9 @@ add a second pinning mechanism. Option 1 is where the upstreams converge and is 
 
 Rules:
 
-1. **One entry point.** `.githooks/pre-commit` runs `scripts/ci --staged`; the workflow and `scripts/land`
-   run `scripts/ci`.
+1. **One entry point.** `.githooks/pre-commit` runs `scripts/ci --staged`; the workflow runs `scripts/ci`
+   and `scripts/land` runs `scripts/ci --landing`, which takes the last of several CI slots first, so a
+   landing starts ahead of waiting hooks (2026-11-11).
 2. **A missing tool is a failure**, never a skipped check.
 3. **Ruff:** its default rules plus import sorting. Line length 100 and single-line imports follow
    NautilusTrader's own config, so adapter code reads like upstream. (NautilusTrader itself selects every
