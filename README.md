@@ -41,6 +41,7 @@ previous copy of each.
 | `scripts/lanes --selftest` | Prove the lane report's flags fire |
 | `scripts/lanes --rates` | Every running worker of every runtime, with output tokens per second or why not measured |
 | `scripts/automation status` | Every standing automation and whether it is healthy |
+| `scripts/manifest` | Joined machine reports (`--json`); `--html <out-file> --run <run-id>` saves a local status page; `--digest --run <run-id> [--since <ISO time>]` prints ten lines (default: 24 hours), with failures named, cached drift and read-only GitHub GETs |
 | `scripts/survey-github report canon/github-practice.json` | What a measured sample of repositories converges on for pull requests and GitHub automation |
 
 ## Run the first backtest
