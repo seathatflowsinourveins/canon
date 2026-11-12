@@ -436,7 +436,7 @@ finish_dry() {
 }
 
 note "$branch is $ahead commit(s) ahead of main. Running every check."
-"$ROOT/scripts/ci" || die "checks failed; nothing landed"
+"$ROOT/scripts/ci" --landing || die "checks failed; nothing landed"
 
 if [ -z "$remote" ]; then
   [ "$DRY" -eq 0 ] || finish_dry "fast-forward main to $(git rev-parse --short HEAD) (no origin remote)"

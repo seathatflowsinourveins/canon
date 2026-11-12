@@ -480,8 +480,85 @@ check "a nested run skips the wait"                test "$RC" = 0
 : >"$S/release"; wait "$HOLDER" 2>/dev/null
 }
 
+# --- hooks leave the final slot free, so a landing starts while an earlier hook is waiting ---
+case_priority() {
+fresh priority
+local S="$C.signals" staged_pid landing_pid holder_pid plain_pid
+mkdir -p "$S" "$C.tmp"
+cat >"$C/scripts/test-priority" <<'EOF'
+#!/bin/bash
+touch "$SIGNALS/$RUN_KIND.started"
+while [ ! -e "$SIGNALS/$RUN_KIND.release" ]; do sleep 0.05; done
+EOF
+chmod +x "$C/scripts/test-priority"
+gitq -C "$C" add -A; gitq -C "$C" commit -q -m priority
+# shellcheck disable=SC2016  # expanded by the holder's own shell
+local hold='touch "$1/held"; while [ ! -e "$1/holder.release" ]; do sleep 0.05; done'
+if command -v lockf >/dev/null 2>&1; then lockf -k -s -t 0 "$C.tmp/canon-ci-slot.1" sh -c "$hold" sh "$S" &
+else flock -n -E 75 "$C.tmp/canon-ci-slot.1" sh -c "$hold" sh "$S" & fi
+holder_pid=$!
+for _ in $(seq 400); do [ -e "$S/held" ] && break; sleep 0.05; done
+(cd "$C" && env -u CANON_CI_SLOT_HELD CANON_CI_SLOTS=2 PATH="$FAKE:$PATH" TOOLS="$TMP/tools" \
+  UV_LOG="$C.staged.uv.log" TMPDIR="$C.tmp" SIGNALS="$S" RUN_KIND=staged scripts/ci --staged >"$C.staged.out" 2>&1) &
+staged_pid=$!
+for _ in $(seq 400); do
+  grep -q '^ci: waiting for a slot$' "$C.staged.out" 2>/dev/null && break
+  [ -e "$S/staged.started" ] && break
+  sleep 0.05
+done
+OUT=$(cat "$C.staged.out")
+check "a staged run waits though the last slot is free" has '^ci: waiting for a slot$'
+check "the staged run has not started a check"      test ! -e "$S/staged.started"
+(cd "$C" && env -u CANON_CI_SLOT_HELD CANON_CI_SLOTS=2 PATH="$FAKE:$PATH" TOOLS="$TMP/tools" \
+  UV_LOG="$C.plain.uv.log" TMPDIR="$C.tmp" SIGNALS="$S" RUN_KIND=plain scripts/ci >"$C.plain.out" 2>&1) &
+plain_pid=$!
+for _ in $(seq 400); do
+  grep -q '^ci: waiting for a slot$' "$C.plain.out" 2>/dev/null && break
+  [ -e "$S/plain.started" ] && break
+  sleep 0.05
+done
+check "plain CI also leaves the landing slot free"  test ! -e "$S/plain.started"
+(cd "$C" && env -u CANON_CI_SLOT_HELD CANON_CI_SLOTS=2 PATH="$FAKE:$PATH" TOOLS="$TMP/tools" \
+  UV_LOG="$C.landing.uv.log" TMPDIR="$C.tmp" SIGNALS="$S" RUN_KIND=landing scripts/ci --landing >"$C.landing.out" 2>&1) &
+landing_pid=$!
+for _ in $(seq 400); do [ -e "$S/landing.started" ] && break; sleep 0.05; done
+OUT=$(cat "$C.landing.out")
+check "landing starts ahead of the waiting staged run" test -e "$S/landing.started"
+check "the waiting staged run still has not started" test ! -e "$S/staged.started"
+# Always release every stand-in, including when an assertion fails.
+: >"$S/landing.release"; : >"$S/staged.release"; : >"$S/holder.release"; : >"$S/plain.release"
+wait "$holder_pid"; wait "$landing_pid"; RC=$?
+check "the landing run passes"                     test "$RC" = 0
+wait "$staged_pid"; RC=$?
+check "the staged run passes after release"         test "$RC" = 0
+wait "$plain_pid"
+}
+
+case_prioritycapacity() {
+fresh prioritycapacity
+local S="$C.signals" landing_pid staged_pid
+mkdir -p "$S" "$C.tmp"; cat >"$C/scripts/test-priority" <<'EOF'
+#!/bin/bash
+touch "$SIGNALS/$RUN_KIND.started"
+while [ ! -e "$SIGNALS/release" ]; do sleep 0.05; done
+EOF
+chmod +x "$C/scripts/test-priority"
+gitq -C "$C" add -A; gitq -C "$C" commit -q -m capacity
+(cd "$C" && env -u CANON_CI_SLOT_HELD CANON_CI_SLOTS=2 PATH="$FAKE:$PATH" TOOLS="$TMP/tools" \
+  UV_LOG="$C.landing.uv.log" TMPDIR="$C.tmp" SIGNALS="$S" RUN_KIND=landing scripts/ci --landing >"$C.landing.out" 2>&1) &
+landing_pid=$!
+for _ in $(seq 400); do [ -e "$S/landing.started" ] && break; sleep 0.05; done
+(cd "$C" && env -u CANON_CI_SLOT_HELD CANON_CI_SLOTS=2 PATH="$FAKE:$PATH" TOOLS="$TMP/tools" \
+  UV_LOG="$C.staged.uv.log" TMPDIR="$C.tmp" SIGNALS="$S" RUN_KIND=staged scripts/ci --staged >"$C.staged.out" 2>&1) &
+staged_pid=$!
+for _ in $(seq 400); do [ -e "$S/staged.started" ] && break; sleep 0.05; done
+OUT=$(cat "$C.staged.out")
+check "a landing leaves shared capacity for a staged run" test -e "$S/staged.started"
+: >"$S/release"; wait "$landing_pid"; wait "$staged_pid"
+}
+
 # Every case above works in its own copy, so they run concurrently; their output prints in this order.
-CASES="yaml noflows shell staged untracked tests testdir testgone notes skipsum died symlink deleted deleted2 lockfail hookenv parallel order missing pathorder strayconfig longfail slots nice"
+CASES="yaml noflows shell staged untracked tests testdir testgone notes skipsum died symlink deleted deleted2 lockfail hookenv parallel order missing pathorder strayconfig longfail slots nice priority prioritycapacity"
 for c in $CASES; do ( "case_$c" ) >"$TMP/out.$c" 2>&1 & done
 wait
 for c in $CASES; do cat "$TMP/out.$c"; done
