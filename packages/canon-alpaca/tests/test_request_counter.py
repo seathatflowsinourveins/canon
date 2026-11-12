@@ -304,3 +304,55 @@ def test_counts_are_snapshots(clock, answers) -> None:
     assert before[0].total == 1 and one("trading").total == 2
     with pytest.raises(AttributeError):
         before[0].total = 5  # ty: ignore[invalid-assignment] - frozen
+
+
+def test_an_endpoint_folds_symbols_and_ids_and_drops_the_query() -> None:
+    assert providers.endpoint("get", "https://paper-api.alpaca.markets/v2/assets/AAPL") == (
+        "GET paper-api.alpaca.markets/v2/assets/{symbol}"
+    )
+    assert providers.endpoint(
+        "DELETE",
+        "https://paper-api.alpaca.markets/v2/orders/0b5c6f0e-1d2a-4c3b-9e8f-7a6b5c4d3e2f",
+    ) == ("DELETE paper-api.alpaca.markets/v2/orders/{id}")
+    assert providers.endpoint(
+        "GET", "https://data.alpaca.markets/v2/stocks/BRK.B/quotes/latest?feed=sip"
+    ) == ("GET data.alpaca.markets/v2/stocks/{symbol}/quotes/latest")
+    assert providers.endpoint("GET", "https://data.alpaca.markets/v2/stocks/bars?symbols=A,B") == (
+        "GET data.alpaca.markets/v2/stocks/bars"
+    )
+
+
+def test_each_request_the_adapter_sends_is_counted_by_endpoint(clock, answers) -> None:
+    """One tally: the adapter's own, so the endpoint counts and `request_counts` agree, a retry
+    counting as the attempt it is (code-review-high/universe-10)."""
+    client = trading()
+    client.get("/assets/AAPL")
+    client.get("/assets/BRK.B")
+    answers.append(429)
+    client.get("/clock")  # alpaca-py retries the 429: two attempts
+    client.delete("/orders/0b5c6f0e-1d2a-4c3b-9e8f-7a6b5c4d3e2f")
+    assert providers.endpoint_counts() == {
+        "DELETE paper-api.alpaca.markets/v2/orders/{id}": 1,
+        "GET paper-api.alpaca.markets/v2/assets/{symbol}": 2,
+        "GET paper-api.alpaca.markets/v2/clock": 2,
+    }
+    assert sum(providers.endpoint_counts().values()) == one("trading").total
+
+
+def test_a_rate_limited_path_is_folded_like_its_endpoint(clock, answers) -> None:
+    """A 429 keeps its endpoint's folded path, not the order ID it was sent for
+    (code-review-high/universe-2-4)."""
+    client = trading()
+    answers.append(429)
+    client.delete("/orders/0b5c6f0e-1d2a-4c3b-9e8f-7a6b5c4d3e2f")
+    (limited,) = one("trading").rate_limited
+    assert limited.path == "/v2/orders/{id}"
+
+
+def test_an_endpoints_host_and_encoded_symbol_fold_to_one_key() -> None:
+    """The host is normalized as the API is (`_key`'s final dot) and an encoded symbol folds too
+    (code-review-high/universe-2-5, -6)."""
+    assert providers.endpoint("GET", "https://data.alpaca.markets./v2/stocks/BTC%2FUSD/bars") == (
+        "GET data.alpaca.markets/v2/stocks/{symbol}/bars"
+    )
+    assert providers.endpoint("GET", "/v2/clock") == "GET unknown-host/v2/clock"

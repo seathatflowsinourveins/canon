@@ -42,6 +42,7 @@ from canon_alpaca.execution import AlpacaExecutionClient
 from canon_alpaca.factories import AlpacaDataClientFactory
 from canon_alpaca.providers import DATA_ONLY_ENV
 from canon_alpaca.providers import data_only
+from canon_alpaca.providers import endpoint_counts
 from nautilus_trader.adapters.sandbox import SandboxExecutionClientConfig
 from nautilus_trader.adapters.sandbox import SandboxExecutionClientFactory
 from nautilus_trader.common import Environment
@@ -154,7 +155,8 @@ def rank_check(feed: str, baseline_path: str, minutes: int) -> dict[str, object]
     """The whole-market check of 2026-11-12 (the lead's order for the 04:00 firing): the sandbox node's
     data client loads every active US equity, ADR 0087's actor ranks them from the wildcard stream on
     `feed`, and no strategy runs. Measured: build and start seconds, peak RSS, instruments in the cache,
-    and each generation's symbols, rows, eligible and bars received."""
+    and each generation's symbols, rows, eligible and bars received, and the HTTP requests by endpoint to
+    the node's start and to the end (`canon_alpaca.providers.endpoint_counts`)."""
     import resource
     import time
 
@@ -186,6 +188,7 @@ def rank_check(feed: str, baseline_path: str, minutes: int) -> dict[str, object]
     )
     node.add_actor(actor)
     cache = node.cache
+    to_node_start = endpoint_counts()
     try:
         asyncio.run(run_for(node, minutes * 60))
         instruments = len(cache.instruments(venue=VENUE))
@@ -193,6 +196,7 @@ def rank_check(feed: str, baseline_path: str, minutes: int) -> dict[str, object]
         node.dispose()
     rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     return {
+        "http_requests": {"to_node_start": to_node_start, "to_end": endpoint_counts()},
         "pre_read_wait_secs": round(pre_read_wait, 1),
         "reference_read": notes,
         "first_publication_secs": first_publication_secs({"ranking_records": records}),

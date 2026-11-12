@@ -860,3 +860,51 @@ def test_the_record_times_the_first_publication_from_the_actors_start() -> None:
     assert session_window.first_publication_secs(run) == 61.2
     unavailable = session_window.first_publication_secs({"ranking_records": []})
     assert isinstance(unavailable, str) and unavailable.startswith("unavailable")
+
+
+def test_the_record_names_each_ratios_dollar_basis_on_this_tree() -> None:
+    assert session_window.dollar_basis() == {
+        "day_ratio_0087": "typical_x_volume",
+        "rdc_1": "absent: not built on this tree",
+    }
+
+
+def test_the_record_counts_roster_and_non_roster_entries_with_each_non_roster_bound() -> None:
+    """The lead's ruling of 2026-11-12: (ii-a.1) lets a name outside the start-up roster enter, bounded
+    by Mover's sizing alone, so the record counts entries both ways and keeps each non-roster entry's
+    dollars and the bound that held; an entry sized without the budget path is counted as unrecorded."""
+    run = {
+        "entries": [
+            {"instrument_id": "AAA.ALPACA", "sizing": {"roster": True, "held_by": "start_cap"}},
+            {
+                "instrument_id": "BBB.ALPACA",
+                "sizing": {"roster": False, "held_by": "flow_share", "notional": "998.40"},
+            },
+            {
+                "instrument_id": "CCC.ALPACA",
+                "sizing": {"roster": False, "held_by": "free_balance", "notional": "512.00"},
+            },
+            {"instrument_id": "DDD.ALPACA"},
+        ]
+    }
+    assert session_window.roster_entries(run) == {
+        "roster": 1,
+        "non_roster": 2,
+        "unrecorded": 1,
+        "non_roster_entries": [
+            {"instrument_id": "BBB.ALPACA", "dollars": "998.40", "held_by": "flow_share"},
+            {"instrument_id": "CCC.ALPACA", "dollars": "512.00", "held_by": "free_balance"},
+        ],
+    }
+
+
+def test_the_window_end_request_count_is_refreshed_at_the_final_snapshot(monkeypatch) -> None:
+    """The endpoint count at the window's end is taken where the request budget is, after the stop's
+    flattening, not before it (code-review-high/universe-2-1)."""
+    monkeypatch.setattr(session_window, "endpoint_counts", lambda: {"DELETE a/v2/orders/{id}": 1})
+    report = {"mover": {"http_requests": {"to_node_start": {}, "to_window_end": {}}}}
+    session_window._snapshot_requests(report)
+    assert report["mover"]["http_requests"] == {
+        "to_node_start": {},
+        "to_window_end": {"DELETE a/v2/orders/{id}": 1},
+    }

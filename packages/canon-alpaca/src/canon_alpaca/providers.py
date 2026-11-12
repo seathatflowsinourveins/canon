@@ -38,7 +38,8 @@ Known limits:
   cannot submit, replace, cancel or close through any client this package builds. It guards this
   package's clients only, not other code that holds the pair.
 * Request count (`request_counts`): the `TimeoutAdapter` counts what it hands to requests' transport, per
-  key pair and per API, in UTC wall-clock minutes, and records each 429 by name, time and path. This is
+  key pair and per API, in UTC wall-clock minutes, and records each 429 by name, time and path; and, for a
+  window's record, by method and endpoint (`endpoint_counts`). This is
   glue around alpaca-py's session, on the same transport-adapter hook. NautilusTrader's own quota code is
   a GCRA rate limiter shared by its Rust HTTP clients (nautilus_trader@d53849b216e2:
   crates/network/src/ratelimiter/mod.rs:155, crates/network/src/http/mod.rs:25), with Python bindings for
@@ -53,9 +54,11 @@ import asyncio
 import hashlib
 import hmac
 import os
+import re
 import secrets
 import threading
 import time
+from collections import Counter
 from collections import deque
 from dataclasses import dataclass
 from datetime import UTC
@@ -164,6 +167,35 @@ class _Tally:
         self.rate_limited: deque[RateLimited] = deque(maxlen=RATE_LIMITED_KEPT)
 
 
+UUID_SEGMENT = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+SYMBOL_SEGMENT = re.compile(r"^[A-Z][A-Z0-9.%\-]*$")
+"""An upper-case path segment, percent-encoded or not: Alpaca's paths are lower case, and a symbol is
+upper case. An upper-case enum in a path (an activity type) folds with them; nothing kept is an ID."""
+
+
+def host_of(url: str) -> str:
+    """`url`'s host as the counter keys it: without a final dot, so `data.alpaca.markets.` is the same
+    host (`DATA_HOSTS`)."""
+    return (urlsplit(url).hostname or "").rstrip(".")
+
+
+def folded_path(path: str) -> str:
+    """`path` with every symbol segment folded to `{symbol}` and every UUID segment to `{id}`, so no order
+    ID or account number is kept."""
+    return "/".join(
+        "{id}" if UUID_SEGMENT.match(s) else "{symbol}" if SYMBOL_SEGMENT.match(s) else s
+        for s in path.split("/")
+    )
+
+
+def endpoint(method: str, url: str) -> str:
+    """`method`, `url`'s host (`host_of`) and its folded path (`folded_path`); the query is dropped."""
+    host = host_of(url) or "unknown-host"
+    return f"{method.upper()} {host}{folded_path(urlsplit(url).path)}"
+
+
 class RequestCounter:
     """Requests sent through every `TimeoutAdapter` in this process, per account and per API, in
     wall-clock minutes, and the 429s Alpaca answered. Thread-safe: alpaca-py calls run in worker threads.
@@ -184,6 +216,7 @@ class RequestCounter:
         self._lock = threading.Lock()
         self._accounts: dict[bytes, int] = {}
         self._tallies: dict[tuple[int, str], _Tally] = {}
+        self._endpoints: Counter[str] = Counter()
 
     def _key(self, request: requests.PreparedRequest) -> tuple[bytes, str]:
         """`request`'s account, as a keyed digest, and its API."""
@@ -192,7 +225,7 @@ class RequestCounter:
         if isinstance(credential, str):
             credential = credential.encode()
         digest = hmac.digest(self._salt, credential, hashlib.sha256)
-        host = (urlsplit(request.url or "").hostname or "").rstrip(".")
+        host = host_of(request.url or "")
         api = DATA_API if host in DATA_HOSTS else TRADING_API
         return digest, api
 
@@ -205,7 +238,9 @@ class RequestCounter:
     def sent(self, request: requests.PreparedRequest) -> None:
         """Count `request`, handed to requests' transport now."""
         key = self._key(request)
+        path = endpoint(request.method or "", request.url or "")
         with self._lock:
+            self._endpoints[path] += 1
             tally = self._tally(key)
             now = max(self._clock(), tally.last)
             tally.last = now
@@ -226,7 +261,7 @@ class RequestCounter:
         if status != HTTPStatus.TOO_MANY_REQUESTS:
             return
         key = self._key(request)
-        path = urlsplit(request.url or "").path
+        path = folded_path(urlsplit(request.url or "").path)  # no order ID kept
         with self._lock:
             tally = self._tally(key)
             record = RateLimited(
@@ -236,6 +271,11 @@ class RequestCounter:
             )
             tally.rate_limited_total += 1
             tally.rate_limited.append(record)
+
+    def endpoint_counts(self) -> dict[str, int]:
+        """Every request counted so far, by method and endpoint (`endpoint`), in key order."""
+        with self._lock:
+            return dict(sorted(self._endpoints.items()))
 
     def counts(self) -> tuple[RequestCount, ...]:
         """A snapshot of every account's and API's counts, by account, then trading before data."""
@@ -267,6 +307,12 @@ def request_counts() -> tuple[RequestCount, ...]:
     """What this process has sent to Alpaca's REST APIs through this package's clients so far, per account
     and API (`RequestCount`), for a node or a session window to read at its end. Read-only: a snapshot."""
     return REQUESTS.counts()
+
+
+def endpoint_counts() -> dict[str, int]:
+    """What this process has sent through this package's clients so far, by method and endpoint, for a
+    window's record: the same requests `request_counts` counts, a retry counted as its own attempt."""
+    return REQUESTS.endpoint_counts()
 
 
 CONNECT_TIMEOUT_SECS = 3.05
