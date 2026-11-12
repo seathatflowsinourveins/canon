@@ -231,6 +231,36 @@ The sub-penny case: Answered later on 2026-11-11: the adapter now sends such a l
 * A failed native history response leaves the name's coverage where it was and is asked again in a later
   minute, at most once a minute (ultra review of the composition, finding 5, 2026-11-12).
 
+### Which buying power a buy is checked against, paper, 2026-11-12
+
+Alpaca's order documentation says only that an order's value "is then compared against your available
+buying power", taken in the core session at the far side of the NBBO ("Orders at Alpaca", "Buying Power",
+read 2026-11-12). Its margin page sets initial margin at 100% for non-marginable securities and lists a
+long under $2.50 at 100% of market value ("Margin and Short Selling", updated 2026-09-17), and a post on
+Alpaca's forum (July 2024) treats a stock whose last close is under $2.50 as non-marginable whatever its
+asset flag. Neither page names the figure a buy is checked against. A paper probe on account A asked the
+venue once, in the regular session of 2026-11-12, with one name on each side of that line
+(`packages/canon-alpaca/tests/test_paper_margin_probe.py`). Each name was sent one DAY limit buy whose
+value at its limit price, in whole shares, was 1.05 times `non_marginable_buying_power`, and whose value at
+the ask was below both `buying_power` and `regt_buying_power`. Nothing filled, and the account was flat
+before and after.
+
+* A name Alpaca flags marginable, whose last close was under $2.50, was refused with HTTP 403 and code
+  40310000, and no figure moved. The order never rested. The refusal shows only that the limit it met is
+  below the order's checked value (at the ask, at least 1.05 times `non_marginable_buying_power`) and is not
+  the lower of `buying_power` and `regt_buying_power`.
+* A name whose last close was at least $5 was accepted and rested. `buying_power` and `regt_buying_power`
+  each fell by the order's value and `non_marginable_buying_power` by half of it, and all three came back
+  in full when it was canceled.
+
+In that run, a marginable entry drew `non_marginable_buying_power` at half its value, and an entry under
+$2.50 worth more than `non_marginable_buying_power` was refused despite its asset flag. The run did not show
+that an entry at or below that figure is accepted, and it did not read `daytrading_buying_power`, so which
+figure the venue checks is UNVERIFIED. A name under $2.50 is therefore sized at no more than
+`non_marginable_buying_power`, read from a report after the last entry, as a cautious ceiling the refusal
+fits rather than a mechanism it proved. This is one run with one name each, so how general it is also stays
+UNVERIFIED, and the record keeps no account figure.
+
 ### Consequences
 
 * Bad: seven slots in every part (2026-11-11) rest on single-name windows, the measured fixture and
@@ -276,3 +306,8 @@ archived documentation, `nautilus-trader` and `alpaca-py`) were read 2026-11-11.
 * `alpaca-py@c42add7c0a70`: `alpaca/trading/client.py` (`submit_order`, `cancel_order_by_id`,
   `get_orders`, `get_all_positions`), `alpaca/common/rest.py` (`_request`) and `common/constants.py`
   (three retries). Resolved; the installed pinned packages run in `tests/test_request_budget.py`.
+* The margin probe's run, 2026-11-12 14:26 New York on paper account A: one run, one name each, flat before
+  and after (`paper:account`); its relations are above. Alpaca, https://docs.alpaca.markets/us/docs/orders-at-alpaca.md
+  ("Buying Power", read 2026-11-12), https://docs.alpaca.markets/us/docs/margin-and-short-selling.md
+  (updated 2026-09-17), and https://forum.alpaca.markets/t/insufficient-day-trading-buying-power/14691
+  (July 2024, not documentation).
