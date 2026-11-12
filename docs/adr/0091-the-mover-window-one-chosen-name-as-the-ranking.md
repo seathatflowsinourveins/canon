@@ -61,7 +61,9 @@ does not need in order to be tested.
   account check after the stop are the window's own (ADR 0044, ADR 0060).
 * **The schedule** (the lead's decision of 2026-11-11): the scheduled agent's arguments name the
   strategy of the regular session, `--regular-strategy Mover` beside `--session auto --mover`, and
-  none for any other part, which runs the window's default or nothing (ADR 0050, ADR 0083). It runs
+  none for any other part, which runs the window's default or nothing (ADR 0050, ADR 0083): since the
+  lead's decision of 2026-11-11 the bridge (ADR 0083's dated lines) in pre-market and after-hours, and
+  nothing overnight. It runs
   on the second paper account (ADR 0069), where this strategy had not run when this was written.
 
 **The replay before paper** (`tests/test_mover_day.py`, `tests/test_paper_mover_day.py`) runs the

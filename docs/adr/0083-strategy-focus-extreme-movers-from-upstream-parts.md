@@ -206,6 +206,22 @@ landed steps stand, and it carries a dated pointer. ADR 0077's quote study is he
   stream path measures trade age on Alpaca's clock, and a symbol is ranked on the sample only with a bar
   in every one of its minutes. Recorded, not fixed: a close the account check sends has its status in the
   record and not its fill price, and an order denied before Alpaca accepted it has no submit delay.
+* 2026-11-11, the mover window outside the regular session (the lead's decision of that day, in place of
+  "regular session only" above): under the schedule's `mover` value the regular part runs `Mover`
+  (ADR 0091), and pre-market and after-hours run this bridge as an extended window: `SessionMaCross` on
+  the name `choose_mover` gives, one share, every order its marked DAY limit with `extended_hours`
+  (ADR 0038), on `sip`, which carries both parts (`session_window.MOVER_PARTS`). It has no overnight form:
+  the choice's sample, latest trades and quotes are read on `sip`, and Alpaca's 24/5 page puts the
+  overnight session's data on `boats` and `overnight`; a scheduled firing there has nothing to run and
+  says why, and a run by hand is refused by name. The screener fallback ranks the regular session's
+  minutes only: before the open it has none, and after the close today's close would leave it the
+  after-hours drift against the whole day's volume, so outside the regular session the stream sample is
+  the only source, and a window whose sample fails is refused naming both causes (a refused firing, exit
+  1, not a skip). UNVERIFIED until a paper firing in each part shows it: that a sample outside the
+  regular session ranks a name, that Alpaca takes an `extended_hours` limit on the name chosen, and that
+  the bridge's limit exit fills there. A position it leaves is named by the account check after the
+  stop (ADR 0060), which cannot close at market outside the regular session, and every later window
+  is then refused as not flat until `mise run paper:close windows` (recorded, not fixed).
 
 ## Evidence
 
@@ -267,3 +283,7 @@ the commit `canon/upstreams.lock.json` records.
 * Second reader of the mover window's code, 2026-11-11: the cap was checked at the last trade, not at
   the entry limit the risk engine prices (`nt:crates/risk/src/engine/mod.rs`, `order_price`), plus three
   ranking findings and one record gap. Applied in the mover window's dated line (Confirmation).
+* Code review of the mover window outside the regular session, 2026-11-11: the fallback ranked an
+  after-hours move against the whole day's volume, and the part's other windows' feed decided whether
+  the bridge ran; both fixed with failing tests first. The leftover position after 20:00, a sample-only
+  pre-market and an `extended_hours` limit on the chosen name are recorded in that dated line.
