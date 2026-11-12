@@ -440,3 +440,118 @@ def test_reader_checks_values_not_only_presence(tmp_path, alpaca_bars, corruptio
     path.write_text(json.dumps(doc))
     with pytest.raises(history_load.HistoryStopped, match="header/data refused"):
         p.read_profile(path, as_of=AS_OF)
+
+
+def build_recent_only(tmp_path, alpaca_bars, **kwargs):
+    roots = catalogs(tmp_path, alpaca_bars)
+    path = writer().build_profile(
+        sessions=[DAY, AS_OF],
+        as_of=AS_OF,
+        recent_root=roots["recent"],
+        long_root=None,
+        overnight_root=roots["overnight"],
+        baseline_dir=tmp_path / "out",
+        **kwargs,
+    )
+    return path, roots
+
+
+def test_an_absent_long_is_written_and_read_as_recent_only(tmp_path, alpaca_bars):
+    p = writer()
+    path, roots = build_recent_only(tmp_path, alpaca_bars)
+    doc = p.read_profile(path, as_of=AS_OF)
+    assert doc["windows"] == "recent only; long absent"
+    assert doc["sessions"] == {"recent": ["2026-10-15"]}
+    assert doc["roots"] == {"recent": [str(roots["recent"]), str(roots["overnight"])]}
+    assert doc["symbols"]["AAPL"]["long"] is None
+    rows = doc["symbols"]["AAPL"]["recent"]
+    assert sum(row["bars"] for row in rows) == 3 and rows[32]["true_range"]["count"] == 2
+
+
+def test_an_absent_long_never_takes_or_reads_the_dev_root(tmp_path, alpaca_bars, monkeypatch):
+    p = writer()
+    roots = catalogs(tmp_path, alpaca_bars)
+    locked = []
+    original = history_load._catalog_lock
+
+    def lock(path):
+        locked.append(path)
+        return original(path)
+
+    monkeypatch.setattr(history_load, "_catalog_lock", lock)
+    with original(roots["long"]):  # dev held by another process: an absent long must not wait on it
+        p.build_profile(
+            sessions=[DAY, AS_OF],
+            as_of=AS_OF,
+            recent_root=roots["recent"],
+            long_root=None,
+            overnight_root=roots["overnight"],
+            baseline_dir=tmp_path / "out",
+        )
+    assert locked == [roots["recent"], roots["overnight"]]
+
+
+def test_the_cli_writes_an_absent_long_only_when_asked(tmp_path, alpaca_bars):
+    roots = catalogs(tmp_path, alpaca_bars)
+    calendar = tmp_path / "sessions.txt"
+    calendar.write_text("2026-10-15\n2026-10-16\n")
+    common = ["--sessions-file", str(calendar), "--as-of", str(AS_OF)]
+    common += ["--recent-root", str(roots["recent"]), "--overnight-root", str(roots["overnight"])]
+    common += ["--baseline-dir", str(tmp_path / "out")]
+    assert writer().main([*common, "--long-absent"]) == 0
+    doc = writer().read_profile(tmp_path / "out" / "trail-profile-v1.json", as_of=AS_OF)
+    assert doc["windows"] == "recent only; long absent"
+    with pytest.raises(SystemExit):
+        writer().main([*common, "--long-absent", "--long-root", str(roots["long"])])
+
+
+@pytest.mark.parametrize(
+    ("corruption", "reason"),
+    [
+        ("full-header-null-long", "invalid symbol sets for AAPL"),
+        ("absent-header-with-long-rows", "invalid symbol sets for AAPL"),
+        ("absent-header-with-long-sessions", "header sessions must name recent alone"),
+        ("absent-header-with-long-roots", "header roots must name the windows present"),
+        ("other-windows-value", "header windows must be"),
+        ("absent-header-over-20-sessions", "header sessions violate"),
+    ],
+)
+def test_the_reader_refuses_every_mixed_long_shape(tmp_path, alpaca_bars, corruption, reason):
+    p = writer()
+    (tmp_path / "full").mkdir()
+    (tmp_path / "absent").mkdir()
+    full = json.loads(build(tmp_path / "full", alpaca_bars).read_text())
+    path, _ = build_recent_only(tmp_path / "absent", alpaca_bars)
+    doc = json.loads(path.read_text())
+    if corruption == "full-header-null-long":
+        doc = full
+        doc["symbols"]["AAPL"]["long"] = None
+    elif corruption == "absent-header-with-long-rows":
+        doc["symbols"]["AAPL"]["long"] = full["symbols"]["AAPL"]["long"]
+    elif corruption == "absent-header-with-long-sessions":
+        doc["sessions"]["long"] = full["sessions"]["long"]
+    elif corruption == "absent-header-with-long-roots":
+        doc["roots"]["long"] = full["roots"]["long"]
+    elif corruption == "other-windows-value":
+        doc["windows"] = "recent and long"
+    else:
+        doc["sessions"]["recent"] = [
+            str(DAY - timedelta(days=i)) for i in range(p.RECENT_SESSIONS, -1, -1)
+        ]
+    path.write_text(json.dumps(doc))
+    with pytest.raises(history_load.HistoryStopped, match=f"header/data refused: {reason}"):
+        p.read_profile(path, as_of=AS_OF)
+
+
+def test_the_full_shape_has_no_windows_field_and_still_needs_long(tmp_path, alpaca_bars):
+    p = writer()
+    path = build(tmp_path, alpaca_bars)
+    doc = json.loads(path.read_text())
+    assert "windows" not in doc
+    assert set(doc["sessions"]) == set(doc["roots"]) == {"recent", "long"}
+    del doc["sessions"]["long"]
+    path.write_text(json.dumps(doc))
+    with pytest.raises(
+        history_load.HistoryStopped, match="header sessions must name recent and long"
+    ):
+        p.read_profile(path, as_of=AS_OF)

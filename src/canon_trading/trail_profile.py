@@ -13,6 +13,10 @@ and the overnight root. Long means all supplied earlier dates, read from sip-his
 2026-10-15 unless it is in that recent window; never query dev after that cutoff, even for the recent
 exception. Queries cover individual allowed sessions, never a span over a holdout or as_of date.
 For a replay the reader requires a target as_of and refuses a profile whose as_of is later.
+An explicit absent long (long_root None, CLI --long-absent; the coordinator's order of 2026-11-12) writes
+the header field windows = "recent only; long absent", sessions and roots with recent alone, and a null
+long for every symbol; it locks and reads only the recent and overnight roots. The full shape carries
+no windows field, and the reader refuses any mix of the two.
 The live default is the first supplied session whose 20:00 New York end is still in the future.
 
 Price basis is the previous observed minute close within the same 20:00-to-20:00 session, including
@@ -91,6 +95,7 @@ HOLDOUT_RULE = (
     "dev never queried after 2026-10-15; all sets strictly before as_of"
 )
 PERCENTILE_METHOD = "CPython statistics.quantiles(n=100, method='inclusive')"
+LONG_ABSENT = "recent only; long absent"
 
 
 def _calendar(sessions: Sequence[date]) -> tuple[date, ...]:
@@ -257,25 +262,36 @@ def build_profile(
     sessions: Sequence[date],
     as_of: date | None = None,
     recent_root: Path = DEFAULT_RECENT_ROOT,
-    long_root: Path = DEFAULT_LONG_ROOT,
+    long_root: Path | None = DEFAULT_LONG_ROOT,
     overnight_root: Path = DEFAULT_OVERNIGHT_ROOT,
     baseline_dir: Path = movers_baseline.DEFAULT_BASELINE_DIR,
 ) -> Path:
-    """Write the dated v1 profile under all catalog locks, or stop with the old file intact."""
+    """Write the dated v1 profile under the locks of the roots it reads, or stop with the old file
+    intact. long_root None is an explicit absent long: no dev lock, read or long row."""
     target = as_of or coming_session(sessions)
     days = select_sessions(sessions, as_of=target)  # refusal BEFORE catalog construction/query
-    roots = [movers_baseline._outside_ledger(p) for p in (recent_root, long_root, overnight_root)]
-    output = movers_baseline._outside_ledger(baseline_dir) / "trail-profile-v1.json"
-    if len(set(roots)) != 3:
-        raise history_load.HistoryStopped(
-            "recent, long and overnight need three distinct catalog roots"
+    long_absent = long_root is None
+    if long_absent:
+        del days["long"]
+    sources = [
+        (movers_baseline._outside_ledger(path), feed, dev)
+        for path, feed, dev in (
+            (recent_root, "sip", False),
+            (long_root, "sip", True),
+            (overnight_root, "boats", False),
         )
+        if path is not None
+    ]
+    roots = [root for root, _, _ in sources]
+    output = movers_baseline._outside_ledger(baseline_dir) / "trail-profile-v1.json"
+    if len(set(roots)) != len(roots):
+        raise history_load.HistoryStopped("recent, long and overnight need distinct catalog roots")
     operation = "opening trail-profile catalogs"
     try:
         with ExitStack() as stack:
             catalogs = []
             instruments = []
-            for root, feed in zip(roots, ("sip", "sip", "boats"), strict=True):
+            for root, feed, _ in sources:
                 if not root.is_dir():
                     raise history_load.HistoryStopped(
                         f"catalog {root} must be an existing directory"
@@ -296,11 +312,12 @@ def build_profile(
                 catalogs.append(catalog)
                 instruments.append(versions)
             symbols: dict[str, Any] = {}
+            read_days = days.get("long", days["recent"])
             ids = sorted(set().union(*(set(versions) for versions in instruments)))
             # Preserve the baseline's approximate batch bar bound over a longer history.
             batch_size = max(
                 1,
-                movers_baseline.QUERY_SYMBOLS * movers_rank.BASELINE_SESSIONS // len(days["long"]),
+                movers_baseline.QUERY_SYMBOLS * movers_rank.BASELINE_SESSIONS // len(read_days),
             )
             for first in range(0, len(ids), batch_size):
                 batch = ids[first : first + batch_size]
@@ -308,20 +325,16 @@ def build_profile(
                     name: {identifier: {day: {} for day in selected} for identifier in batch}
                     for name, selected in days.items()
                 }
-                plan = (
-                    days["recent"],
-                    tuple(day for day in days["long"] if day <= LONG_CUTOFF),
-                    days["long"],
-                )
-                for source_index, (catalog, versions, selected, feed, root) in enumerate(
-                    zip(
-                        catalogs,
-                        instruments,
-                        plan,
-                        ("sip", "sip", "boats"),
-                        roots,
-                        strict=True,
-                    )
+                plan = [
+                    tuple(day for day in days["long"] if day <= LONG_CUTOFF)
+                    if dev
+                    else days["recent"]
+                    if feed == "sip"
+                    else read_days
+                    for _, feed, dev in sources
+                ]
+                for catalog, versions, selected, (root, feed, dev) in zip(
+                    catalogs, instruments, plan, sources, strict=True
                 ):
                     identifiers = [
                         f"{identifier}-1-MINUTE-LAST-EXTERNAL"
@@ -346,9 +359,7 @@ def build_profile(
                                     f"{operation}: bar outside feed hours"
                                 )
                             for name, selected_days in days.items():
-                                if day not in selected_days or (
-                                    name == "recent" and source_index == 1
-                                ):
+                                if day not in selected_days or (name == "recent" and dev):
                                     continue
                                 held = histories[name][identifier][day]
                                 if start in held and held[start] != bar:
@@ -368,6 +379,8 @@ def build_profile(
                         )
                         for name, history in histories.items()
                     }
+                    if long_absent:
+                        symbols[symbol]["long"] = None
             document = {
                 "format": FORMAT,
                 "as_of": target.isoformat(),
@@ -376,8 +389,12 @@ def build_profile(
                     name: [day.isoformat() for day in selected] for name, selected in days.items()
                 },
                 "roots": {
-                    "recent": [str(roots[0]), str(roots[2])],
-                    "long": [str(roots[1]), str(roots[0]), str(roots[2])],
+                    "recent": [str(roots[0]), str(roots[-1])],
+                    **(
+                        {}
+                        if long_absent
+                        else {"long": [str(roots[1]), str(roots[0]), str(roots[2])]}
+                    ),
                 },
                 "feeds": ["sip", "boats"],
                 "price_basis": "previous close",
@@ -392,7 +409,9 @@ def build_profile(
                 "timezone": "America/New_York",
                 "symbols": symbols,
             }
-            for root, feed in zip(roots, ("sip", "sip", "boats"), strict=True):
+            if long_absent:
+                document = {"windows": LONG_ABSENT, **document}
+            for root, feed, _ in sources:
                 if catalog_feed(root) != feed:
                     raise history_load.HistoryStopped(f"catalog feed changed during {operation}")
             operation = f"writing trail profile {output}"
@@ -438,20 +457,30 @@ def read_profile(path: Path, *, as_of: date) -> dict[str, Any]:
             raise ValueError(f"header as_of {built_for} is later than replay date {as_of}")
         if datetime.fromisoformat(document["written_at"]).tzinfo is None:
             raise ValueError("header written_at needs a timezone")
+        long_absent = "windows" in document
+        if long_absent and document["windows"] != LONG_ABSENT:
+            raise ValueError(f"header windows must be {LONG_ABSENT!r} or absent")
+        names = {"recent"} if long_absent else {"recent", "long"}
         sessions = document["sessions"]
-        if not isinstance(sessions, dict) or set(sessions) != {"recent", "long"}:
-            raise ValueError("header sessions must name recent and long")
+        if not isinstance(sessions, dict) or set(sessions) != names:
+            raise ValueError(
+                "header sessions must name recent alone"
+                if long_absent
+                else "header sessions must name recent and long"
+            )
         parsed = {
             name: tuple(date.fromisoformat(day) for day in selected)
             for name, selected in sessions.items()
         }
-        selected = select_sessions(parsed["long"], as_of=built_for)
+        selected = select_sessions(parsed.get("long", parsed["recent"]), as_of=built_for)
+        if long_absent:
+            del selected["long"]
         if parsed != selected:
             raise ValueError("header sessions violate as_of, recent window or holdout rule")
         roots = document["roots"]
-        if not isinstance(roots, dict) or set(roots) != {"recent", "long"}:
-            raise ValueError("header roots must name recent and long")
-        for name, count in (("recent", 2), ("long", 3)):
+        if not isinstance(roots, dict) or set(roots) != names:
+            raise ValueError("header roots must name the windows present")
+        for name, count in (("recent", 2), ("long", 3))[: len(names)]:
             if (
                 not isinstance(roots[name], list)
                 or len(roots[name]) != count
@@ -461,7 +490,7 @@ def read_profile(path: Path, *, as_of: date) -> dict[str, Any]:
                 )
             ):
                 raise ValueError(f"header roots.{name} needs {count} absolute local paths")
-        _check_symbols(document["symbols"], parsed)
+        _check_symbols(document["symbols"], parsed, long_absent=long_absent)
         return document
     except (OSError, ValueError, TypeError, KeyError, history_load.HistoryStopped) as exc:
         raise history_load.HistoryStopped(
@@ -469,13 +498,22 @@ def read_profile(path: Path, *, as_of: date) -> dict[str, Any]:
         ) from exc
 
 
-def _check_symbols(symbols: Any, sessions: Mapping[str, Sequence[date]]) -> None:
+def _check_symbols(
+    symbols: Any, sessions: Mapping[str, Sequence[date]], *, long_absent: bool = False
+) -> None:
     if not isinstance(symbols, dict) or not symbols:
         raise ValueError("symbols must be a nonempty object")
     for symbol, sets in symbols.items():
-        if not isinstance(symbol, str) or not isinstance(sets, dict) or set(sets) != set(sessions):
+        if (
+            not isinstance(symbol, str)
+            or not isinstance(sets, dict)
+            or set(sets) != {"recent", "long"}
+            or (sets["long"] is None) != long_absent
+        ):
             raise ValueError(f"invalid symbol sets for {symbol}")
         for name, rows in sets.items():
+            if name not in sessions:
+                continue
             if not isinstance(rows, list) or len(rows) != movers_rank.SEGMENTS:
                 raise ValueError(f"{symbol}/{name} needs 96 segments")
             for row in rows:
@@ -529,7 +567,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--as-of", type=date.fromisoformat, help="default: coming supplied trade date"
     )
     parser.add_argument("--recent-root", type=Path, default=DEFAULT_RECENT_ROOT)
-    parser.add_argument("--long-root", type=Path, default=DEFAULT_LONG_ROOT)
+    long = parser.add_mutually_exclusive_group()
+    long.add_argument("--long-root", type=Path, default=DEFAULT_LONG_ROOT)
+    long.add_argument(
+        "--long-absent",
+        action="store_true",
+        help=f"write '{LONG_ABSENT}': no dev root locked or read, a null long per symbol",
+    )
     parser.add_argument("--overnight-root", type=Path, default=DEFAULT_OVERNIGHT_ROOT)
     parser.add_argument("--baseline-dir", type=Path, default=movers_baseline.DEFAULT_BASELINE_DIR)
     args = parser.parse_args(argv)
@@ -543,7 +587,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             sessions=sessions,
             as_of=args.as_of,
             recent_root=args.recent_root,
-            long_root=args.long_root,
+            long_root=None if args.long_absent else args.long_root,
             overnight_root=args.overnight_root,
             baseline_dir=args.baseline_dir,
         )
