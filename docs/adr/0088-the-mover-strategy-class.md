@@ -91,6 +91,18 @@ under the highest bid), `exit_through` 0.005, `chase_cap` 0.02, `chase_secs` 5, 
 run. A **hold-to-close** row is the same entry and size with `protect=False`: no trailing sell, sold at
 the wind-down; a study's baseline, since a trial that never trades stops a ranking (ADR 0010).
 
+**Sessions, updated by the lead on 2026-11-11:** ADR 0091's `--mover` windows run this class in
+pre-market, after-hours and overnight as well as in the regular session. The part's feed and slot
+count are settings (`session_window.MOVER_PARTS`), with one slot outside regular hours, UNCALIBRATED.
+Pre-market and after-hours use SIP, overnight BOATS for the live sample, current trades and quotes,
+and minute-bar normals; the consolidated daily reference close stays on SIP. In each extended part
+the entry, emulator release, chase and wind-down are DAY limits with `extended_hours=True`, and the
+stop cancels; the regular part's managed market exit is unchanged. Alpaca's 24/5 Trading API page
+allows overnight limits with DAY or GTC, and its orders page requires the extended-hours mark.
+`Mover`'s local emulator is what holds the trailing order; no venue trailing stop is sent. If a part's
+explicit `bridge_reason` says this class cannot run, the window records the part and reason and runs
+the `SessionMaCross` limit bridge on the same choice and feed. No default row needs that fallback.
+
 **Departures from the requirement, each not built:** a re-priced entry; the gain lock; a breach that must
 persist (in the replays here the emulator released on the first quote at the trigger); a broker-held
 stop for an outage; slots reserved for the newest movers; the reclaim as a pullback, a held higher low
@@ -177,3 +189,9 @@ Read 2026-11-11. Resolved means read in a local copy at the commit `canon/upstre
   time and reads trigger events from cached order histories, including stops released during submit.
   The one-instrument limit remains; the sizing difference and evidence are in ADR 0091.
 * The owner's requirement of 2026-11-11 — an instruction, not evidence: each number is UNCALIBRATED.
+* https://docs.alpaca.markets/us/docs/orders-at-alpaca and
+  https://docs.alpaca.markets/us/docs/245-trading-for-trading-api — read 2026-11-11 through the index at
+  https://docs.alpaca.markets/llms.txt: each extended part's order rules, overnight's trade date,
+  eligibility and BOATS data. The session change's offline node builds and engine simulations are in
+  `tests/test_mover_window.py`, `tests/test_mover.py` and `tests/test_session_window.py`; the marked
+  orders of each new mover part on account B remain UNVERIFIED pending its paper run (ADR 0091).

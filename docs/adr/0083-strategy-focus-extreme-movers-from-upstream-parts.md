@@ -206,7 +206,8 @@ landed steps stand, and it carries a dated pointer. ADR 0077's quote study is he
   stream path measures trade age on Alpaca's clock, and a symbol is ranked on the sample only with a bar
   in every one of its minutes. Recorded, not fixed: a close the account check sends has its status in the
   record and not its fill price, and an order denied before Alpaca accepted it has no submit delay.
-* 2026-11-11, the mover window outside the regular session (the lead's decision of that day, in place of
+* 2026-11-11, the mover window outside the regular session (the lead's earlier decision of that day,
+  superseded by the later decision in ADR 0088 and ADR 0091, below, in place of
   "regular session only" above): under the schedule's `mover` value the regular part runs `Mover`
   (ADR 0091), and pre-market and after-hours run this bridge as an extended window: `SessionMaCross` on
   the name `choose_mover` gives, one share, every order its marked DAY limit with `extended_hours`
@@ -222,6 +223,31 @@ landed steps stand, and it carries a dated pointer. ADR 0077's quote study is he
   the bridge's limit exit fills there. A position it leaves is named by the account check after the
   stop (ADR 0060), which cannot close at market outside the regular session, and every later window
   is then refused as not flat until `mise run paper:close windows` (recorded, not fixed).
+* Later 2026-11-11, the lead lifted the regular-only limit for `Mover` itself (ADR 0088, ADR 0091):
+  `--mover` runs it in pre-market and after-hours on SIP and overnight on BOATS, each with one slot
+  as a run setting and every venue order a marked DAY limit. A part's explicit `bridge_reason`
+  records why `SessionMaCross` runs there instead. The regular part keeps the strategy its arguments
+  name. Overnight normals use the preceding evening of each prior weekday trade date; action checks
+  include the overnight trade date, and candidates need an affordable ask and overnight eligibility.
+  The screener fallback remains regular-only. Its overnight form ran on paper that night (Evidence);
+  `Mover` in pre-market and after-hours has not yet run on paper (UNVERIFIED).
+  Recorded, not fixed (code review of that day, finding 1; the lead kept it): outside the regular part
+  `Mover` enters as ADR 0091 sizes it, up to 500 USD under the engine's cap, not the bridge's one
+  share, and its only exit there is the marked-limit wind-down, after which the stop cancels. What is
+  left goes to the account check after the stop, which outside the regular session sends marked DAY
+  limits through the latest quote on the part's feed and cancels the last as it ends (ADR 0060's
+  paragraph of that day); on a thin book those can go unfilled, the window is then not flat, and every
+  later window is refused. What covers that until account B's repair makes the close automatic: on any
+  window that ends not flat, or a firing refused for what is left, the coordinator runs
+  `mise run paper:close windows` at once. A per-part entry size, its default unchanged, is the next
+  round's.
+  Recorded with it, not fixed (a builder's regression, the lead's ruling of that day): above $1 the
+  emulator can release the trailing exit as a limit with fractional cents, since NautilusTrader's native
+  emulator rounds the trailing price only to the instrument's 0.0001 increment
+  (`crates/execution/src/order_emulator/emulator.rs`, `crates/execution/src/trailing.rs`), and the
+  adapter's `sub_penny_denial` refuses it. On such a name the protection is refused at release and the
+  wind-down is the exit, until the adapter rounds to the venue's tick at submit (ADR 0030). Not yet seen
+  on paper (UNVERIFIED there).
 
 ## Evidence
 
@@ -287,3 +313,10 @@ the commit `canon/upstreams.lock.json` records.
   after-hours move against the whole day's volume, and the part's other windows' feed decided whether
   the bridge ran; both fixed with failing tests first. The leftover position after 20:00, a sample-only
   pre-market and an `extended_hours` limit on the chosen name are recorded in that dated line.
+* `Mover` overnight on paper account B, by hand, 2026-11-11, 20:20 to 20:47 New York, on `boats`:
+  the stream sample ranked 10 names and chose PLCE; one entry of 694 shares by a marked DAY limit,
+  filled at 0.7202; the wind-down canceled the emulated stop and sold 694 by a marked DAY limit, filled
+  at 0.7212; record `ok`, nothing left, no denial, no error, the trading API's peak 16 requests in any
+  60 seconds; `paper:account windows` afterwards flat.
+* Code review of `Mover` in every part, 2026-11-11: nine findings. The first is recorded in the later
+  dated line above; the other eight, and a per-part entry size, are the next round's.

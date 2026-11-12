@@ -1401,6 +1401,36 @@ def test_a_windows_rows_are_the_first_runs() -> None:
     assert outside.settings.manage_stop is False and outside.settings.extended_hours is True
 
 
+def test_a_windows_slot_row_is_forwarded_to_the_strategy() -> None:
+    outside, _, _ = window_parts(extended=True, slots=2)
+    assert outside.settings.slots == outside.settings.watch == 2
+
+
+@pytest.mark.parametrize("part", ["after-hours", "overnight", "pre-market"])
+def test_each_extended_windows_orders_are_marked_day_limits(part) -> None:
+    """Run the window's actual rows through the engine, including the emulator's released sell."""
+    from canon_trading.session_window import MOVER_PARTS
+
+    row = MOVER_PARTS[part]
+    made, ranking, cap = window_parts(extended=True, feed=row.feed, slots=row.slots)
+    s = Recording(made.settings)
+    eng = engine(order_cap=OUTER_BOUND_USD)
+    eng.add_data(trade_tape(AAA, RISING + FALL))
+    eng.add_strategy(s)
+    eng.add_actor(ranking)
+    eng.add_strategy(cap)
+    try:
+        eng.run()
+        orders = eng.cache.orders(strategy_id=MOVER_ID)
+        assert {o.side.name for o in orders} == {"BUY", "SELL"}
+        assert {(o.order_type.name, o.time_in_force.name) for o in orders} == {("LIMIT", "DAY")}
+        assert s.params and all(params == EXTENDED_HOURS for params in s.params)
+        assert s.settings.slots == 1 and cap.tripped is None
+        assert not eng.cache.positions_open(strategy_id=MOVER_ID)
+    finally:
+        eng.dispose()
+
+
 def test_a_name_whose_one_share_is_over_the_largest_entry_is_refused_before_the_node_is_built() -> (
     None
 ):
