@@ -65,7 +65,6 @@ from canon_trading.mover import RANK_SIGNAL
 from canon_trading.mover import Mover
 from canon_trading.mover import MoverConfig
 from canon_trading.mover import format_rank
-from canon_trading.mover import tick
 from canon_trading.mover_window import OUTER_BOUND_USD
 from canon_trading.mover_window import entry_diagnostics
 from canon_trading.mover_window import max_shares
@@ -78,6 +77,9 @@ from canon_trading.movers_rank_signal import SIGNAL_NAME
 from canon_trading.movers_rank_signal import RankEntry
 from canon_trading.movers_rank_signal import decode_ranking
 from canon_trading.movers_rank_signal import encode_ranking
+from canon_trading.price_step import entry_price
+from canon_trading.price_step import exit_price
+from canon_trading.price_step import tick
 
 if TYPE_CHECKING:
     from nautilus_trader.common import TimeEvent
@@ -2120,9 +2122,9 @@ def test_a_trailing_sell_made_under_a_dollar_releases_a_price_alpaca_takes_over_
     fast = [(o.status.name, o.price.as_decimal(), sub_penny_denial(o.price)) for o in sells]
     eng.dispose()
     assert fast == [("FILLED", Decimal("1.07"), None)]  # 1.10 less 0.03
-    assert mover.entry_price(Decimal("0.9999"), 2) == Decimal("1.01")
-    assert mover.exit_price(Decimal("1.00"), 1, None) == Decimal("0.9999")
-    assert mover.exit_price(Decimal("10.29"), 1, None) == Decimal("10.28")
+    assert entry_price(Decimal("0.9999"), 2) == Decimal("1.01")
+    assert exit_price(Decimal("1.00"), 1, None) == Decimal("0.9999")
+    assert exit_price(Decimal("10.29"), 1, None) == Decimal("10.28")
 
 
 def test_a_fractional_cent_bid_never_releases_a_sub_penny_limit_above_one_dollar() -> None:
@@ -2164,6 +2166,51 @@ def test_a_trailing_sell_made_again_keeps_the_trigger_it_had_reached() -> None:
     assert sizes == [Decimal(1), Decimal(3)]
     assert Decimal("10.38") in s.triggers
     assert all(a <= b for a, b in pairwise(s.triggers)) and s.triggers[-1] == Decimal("10.38")
+
+
+def test_an_off_step_trailing_trigger_stays_in_the_emulator_and_its_remake_is_on_step() -> None:
+    """An off-step trigger cannot reach the adapter today: the trailing stop-limit is emulated, and at
+    the pin `crates/execution/src/order_emulator/emulator.rs:1283-1285,1355-1364,1394-1415` releases it
+    as a plain LIMIT with no trigger, so the adapter's stop-price denial never sees one. The line moves
+    anyway (the price-step unit, 2026-11-12): every price the Mover hands upstream is put on Alpaca's
+    step by one function, and a long's stop rounds down. A partial entry remakes the trailing sell from
+    the reached 10.4237; it is submitted at 10.42. Later moves of the trigger are the emulator's, at the
+    instrument's 0.0001, and stay inside it.
+    """
+    submitted: list[Decimal | None] = []
+
+    class Remakes(Recording):
+        def submit_order(self, order, position_id=None, client_id=None, params=None) -> None:
+            if order.order_type.name == "TRAILING_STOP_LIMIT":
+                assert order.emulation_trigger == TriggerType.BID_ASK
+                submitted.append(
+                    None if order.trigger_price is None else order.trigger_price.as_decimal()
+                )
+            super().submit_order(order, position_id, client_id, params)
+
+    eng = engine(liquid=True)
+    s = Remakes(
+        MoverConfig(
+            max_notional=Decimal("31.5"),
+            max_move=Decimal(5),
+            entry_arm="bridge",
+            entry_ticks=5,
+            strategy_id=MOVER_ID,
+            order_id_tag="001",
+        )
+    )
+    data = [*thin_entry(), quote(302, 10.6337, 10.6537), quote(304, 10.43, 10.44, ask_size=2)]
+    data += [quote(306, 10.41, 10.43), quote(310, 10.41, 10.43)]
+    try:
+        orders = run(eng, s, ranker(rank((AAA, "0.25"))), data)
+        sells = [o for o in orders if o.side == OrderSide.SELL]
+        assert Decimal("10.4237") in s.triggers  # upstream trails at the instrument's 0.0001
+        assert [o.order_type.name for o in sells] == ["TRAILING_STOP_LIMIT", "LIMIT"]
+        assert not any(type(e).__name__ == "OrderSubmitted" for e in sells[0].events())
+        assert not sells[1].has_trigger_price and sells[1].status.name == "FILLED"
+        assert submitted == [None, Decimal("10.42")]
+    finally:
+        eng.dispose()
 
 
 def test_a_name_sold_while_unranked_keeps_its_cooldown() -> None:

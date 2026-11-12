@@ -78,6 +78,16 @@ Limits found while building it, beyond the whole-share limit above:
   Stop prices finer than the increment are still denied: which way a trigger rounds is the strategy's
   call. Paper proof of a released exit above $1.00 accepted at the rounded price: UNVERIFIED until the
   first firing on such a name.
+* A gap, recorded 2026-11-12: two senders place a limit through alpaca-py directly and skip these
+  checks: paper:close (`src/canon_trading/custody.py`, `_CloseOnly._close`) and the window's close
+  after a stop (`src/canon_trading/session_window.py`, `_AccountCheck._close`). They are on the step
+  only because `through_the_touch` quantizes to whole cents; nothing checks it. The step is held in
+  more than one place. It is in this slice's `venue_limit_price` and `sub_penny_denial`. It is in the
+  tiered tick scheme with its `tick`, now in `src/canon_trading/price_step.py`. It is in the Mover's
+  trailing-limit offset, which quantizes to a cent itself (`mover.offsets`), and in `through_the_touch`.
+  `session_ma_cross.py` and `session_window.py` each define their own `CENT`. `price_step` is the
+  function every sender is to price through before the adapter. Each sender moves to it in a change
+  of its own.
 * Alpaca's stream schema gives quote sizes in round lots, with no lot size to convert by. They pass through
   unconverted.
 * alpaca-py 0.45.0 reads no credential environment variable; `RESTClient._validate_credentials` uses its
