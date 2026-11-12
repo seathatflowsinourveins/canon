@@ -110,6 +110,13 @@ replay computes them).
   window nothing sells: the position stays until the window's own account check, if its process still
   runs, the next window's start check, which refuses to start while the account is not flat and names
   what is left, or a person. The requirement's backstop, a wide stop held by the broker, is not built.
+* Bad: a node does not resume across a machine sleep (resume is parked, the lead's decision on the owner's
+  word, 2026-11-11). What a sleep does today: on a late wake the window reads its wall-clock end again
+  (`session_window._run_until`), stops the node and closes what is ours, by an extended-hours limit
+  outside the regular session; nothing continues; a scheduled firing that falls during the sleep is
+  missed. The answer is an always-on host of the owner's, not more code here. Hosting is noted and not
+  started: remote placement is listed as not used (ADR 0021), so it needs its own record when the owner
+  asks for it.
 * Bad: the emulated trailing sell triggers on a single quote. In the second paper window (ADR 0091) it
   was armed at 14:26:02.30 and released at 14:26:07.19 at a bid of 0.8258, on a spike in the bid and
   its reversal within a millisecond, 8 seconds after the entry. A breach that must persist is not built.
