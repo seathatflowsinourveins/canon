@@ -3118,6 +3118,36 @@ def test_query_account_reports_alpacas_account_again(venue) -> None:
     assert balances == ["100000.00 USD"]
 
 
+@pytest.mark.parametrize("available", ["321.45", None])
+def test_account_report_carries_non_marginable_buying_power(venue, available) -> None:
+    """The account's `info` carries Alpaca's `non_marginable_buying_power` unchanged, at connect and on a query.
+
+    alpaca-py c42add7c `alpaca/trading/models.py:626` declares the field as an optional string;
+    NautilusTrader d53849b2 `crates/model/src/events/account/state.rs:29-32,63-65` keeps venue fields in `info`.
+    """
+    venue.trading.account = {**venue.trading.account, "non_marginable_buying_power": available}
+    strategy = trader(idle=True)
+    seen: list[object] = []
+
+    async def body(client) -> None:
+        def info() -> dict:
+            account = client.cache.account(ACCOUNT_ID)
+            assert account is not None
+            return account.last_event.info
+
+        seen.append(info()["non_marginable_buying_power"])
+        venue.trading.account = {**venue.trading.account, "non_marginable_buying_power": "12.34"}
+        strategy.query_account(ACCOUNT_ID, ClientId("ALPACA"))
+        async with asyncio.timeout(10):
+            while info()["non_marginable_buying_power"] != "12.34":
+                await asyncio.sleep(0.01)
+        seen.append(info()["non_marginable_buying_power"])
+
+    run_with_client(body, strategy)
+
+    assert seen == [available, "12.34"]
+
+
 @pytest.mark.parametrize(
     ("failure", "logged_as"),
     [

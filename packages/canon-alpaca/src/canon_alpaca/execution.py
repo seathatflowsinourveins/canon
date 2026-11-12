@@ -15,6 +15,11 @@ joined and the task ended in `_disconnect`, each wait bounded by a deadline on t
 task drain at disconnect; a wait that runs out fails the disconnect, logged with its reason. Hooks not overridden here
 raise `NotImplementedError`.
 
+Account metadata contract: alpaca-py c42add7c `alpaca/trading/models.py:626` declares
+`TradeAccount.non_marginable_buying_power`; NautilusTrader d53849b2
+`crates/model/src/events/account/state.rs:29-32,63-65` preserves venue-specific fields in
+`AccountState.info`. The account report carries this optional value unchanged beside buying_power.
+
 Modify (ADR 0042) rests on Alpaca's "Replace Order by ID"
 (https://docs.alpaca.markets/us/reference/patchorderbyorderid-1.md) and on a paper observation of
 2026-11-10, 3 of 3 runs, for what that page does not state. The PATCH answer is "The new Order object with
@@ -1398,6 +1403,7 @@ class AlpacaExecutionClient(ExecutionClient):
                 "status": account.status.value,
                 "equity": account.equity,
                 "buying_power": account.buying_power,
+                "non_marginable_buying_power": account.non_marginable_buying_power,
                 "trading_blocked": account.trading_blocked,
             },
         )
