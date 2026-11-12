@@ -7,9 +7,15 @@ loads one recorded symbol-day and runs the same two on it.
 `nautilus-trader@d53849b216e2`): a `BacktestEngine` with one simulated venue, NETTING and CASH, zero fees
 (ADR 0067), and `bar_execution=False`, since with bars and quotes together the simulated venue also fills
 a resting limit from the bar's earlier path (measured at the pin, `canon_trading.mover`'s header); fills
-come from quotes. `canon_trading.mover.Mover` runs as shipped, with `Recording` keeping, beside it, each
-trailing order's trigger at each step and each release's time, as plain values its handlers may store
-(`canon_trading.mover`, "Order events"). The ranking is upstream's signal (`publish_signal`,
+come from quotes. `canon_trading.mover.Mover` runs as shipped, with `Recording` keeping each release's
+time as a plain event value (`canon_trading.mover`, "Order events"). After the run, the replay reads each
+trigger from the cached order's `events()` (`nt:python/nautilus_trader/model/__init__.pyi`,
+`OrderInitialized.trigger_price`, `OrderUpdated.trigger_price`, `LimitOrder.events`): the emulator
+stores every update, but sends it to the risk engine's logging-only handler rather than the strategy
+(`nt:crates/execution/src/order_emulator/emulator.rs:1676-1686,1823-1826`,
+`crates/risk/src/engine/mod.rs:1991-1997`). Order creation time is the original `init_event.ts_init`,
+which survives the emulator's release transformation (`nt:crates/execution/src/order_emulator/emulator.rs:1404,1480`,
+`crates/model/src/orders/mod.rs:1649-1656`). The ranking is upstream's signal (`publish_signal`,
 concepts/message_bus, "Signal publish/subscribe"), published once a minute by `MoveRanker` with
 `format_rank`: the one name and its move from the prior day's close, `close / prior - 1`, from the latest
 minute bar. That is the score's move term only; the score itself is gap 1 of ADR 0083, unbuilt.
@@ -20,10 +26,10 @@ same shares held on to the replay's last close, and flat (no trade, zero). The s
 (`Mover.fills`); their arithmetic here is this file's, unregistered and UNCALIBRATED, for a reader.
 
 **Stage one's shape** (`stage_one`), each a check of the day's orders and fills: every buy is a DAY
-limit; every trailing sell's trigger only rises; each released sell leaves the position flat within
-`FAST_EXIT_SECS`; every round trip that lasted beyond `FAST_EXIT_SECS` was protected by a trailing sell;
-nothing is sold beyond what is held; flat at the end. A day with no entry says so and is not a failure
-of the harness.
+limit; every trailing sell's trigger only rises, across remakes until flat; each released sell leaves
+the position flat within `FAST_EXIT_SECS`; every round trip that lasted beyond `FAST_EXIT_SECS` was
+protected by a trailing sell; nothing is sold beyond what is held; flat at the end. A day with no entry
+says so and is not a failure of the harness.
 
 Registered rows of this file, UNCALIBRATED: `BALANCE`, `FAST_EXIT_SECS`; `MAX_NOTIONAL`, `MAX_MOVE` and
 the one entry a run are a session window's (`canon_trading.mover_window`), and the strategy's other rows
@@ -42,6 +48,7 @@ from itertools import pairwise
 from typing import TYPE_CHECKING
 from typing import Any
 
+import pytest
 from canon_alpaca.data import NEW_YORK
 from nautilus_trader.backtest import BacktestEngine
 from nautilus_trader.config import BacktestEngineConfig
@@ -55,6 +62,9 @@ from nautilus_trader.model import Equity
 from nautilus_trader.model import InstrumentId
 from nautilus_trader.model import Money
 from nautilus_trader.model import OmsType
+from nautilus_trader.model import OrderInitialized
+from nautilus_trader.model import OrderSide
+from nautilus_trader.model import OrderUpdated
 from nautilus_trader.model import Price
 from nautilus_trader.model import Quantity
 from nautilus_trader.model import QuoteTick
@@ -62,6 +72,7 @@ from nautilus_trader.model import StrategyId
 from nautilus_trader.model import Symbol
 from nautilus_trader.model import TimeInForce
 from nautilus_trader.model import TraderId
+from nautilus_trader.model import TriggerType
 from nautilus_trader.model import Venue
 from nautilus_trader.risk import RiskEngineConfig
 from nautilus_trader.trading import Strategy
@@ -137,25 +148,15 @@ def move_ranker(bar_type: BarType, prior_close: Decimal) -> MoveRanker:
 
 
 class Recording(Mover):
-    """`Mover` as shipped, keeping each trailing sell's trigger at each step and each release's time."""
+    """`Mover` as shipped, keeping each release's time; the cache holds its trigger events."""
 
     def __init__(self, config: MoverConfig) -> None:
         super().__init__(config)
-        self.triggers: dict[str, list[Decimal]] = {}
         self.release_ns: dict[str, int] = {}
 
     def on_order_released(self, event: Any) -> None:
         super().on_order_released(event)
         self.release_ns[event.client_order_id.value] = event.ts_event
-
-    def _on_step(self, event: TimeEvent) -> None:
-        super()._on_step(event)
-        for slot in self.slots.values():
-            order = self._order(slot.protect_id)
-            if order is not None and order.is_emulated and order.trigger_price is not None:
-                self.triggers.setdefault(order.client_order_id.value, []).append(
-                    order.trigger_price.as_decimal()
-                )
 
 
 @dataclass(frozen=True)
@@ -169,6 +170,7 @@ class OrderLine:
     qty: Decimal
     filled: Decimal
     ts_init: int
+    """Original initialization time, before the emulator transforms a released order."""
     tags: tuple[str, ...]
 
 
@@ -282,6 +284,7 @@ def replay(
         settings: dict[str, Any] = {
             "max_notional": MAX_NOTIONAL,
             "max_move": MAX_MOVE,
+            "max_shares": None,
             "entries": ENTRIES,
             "wind_down_at": wind_down_at,
             "strategy_id": MOVER_ID,
@@ -312,11 +315,25 @@ def replay(
                 price=None if getattr(o, "price", None) is None else o.price.as_decimal(),
                 qty=o.quantity.as_decimal(),
                 filled=o.filled_qty.as_decimal(),
-                ts_init=o.ts_init,
+                # The emulator gives the transformed limit a new ts_init; prepended events keep
+                # the original (nt:emulator.rs:1404,1455-1480; orders/mod.rs:1649-1656).
+                ts_init=o.init_event.ts_init,
                 tags=tuple(o.tags or ()),
             )
             for o in orders
         ]
+        # Antigravity 2: the cache retains sub-second updates and the seed of a stop that releases
+        # during submit. Timer samples and on_order_updated do not cover these at this pin.
+        triggers: dict[str, list[Decimal]] = {}
+        for order in orders:
+            values = [
+                event.trigger_price.as_decimal()
+                for event in order.events()
+                if isinstance(event, (OrderInitialized, OrderUpdated))
+                and event.trigger_price is not None
+            ]
+            if values:
+                triggers[order.client_order_id.value] = values
         flat = not cache.positions_open(strategy_id=MOVER_ID)
         open_orders = sum(1 for o in orders if not o.is_closed)
     finally:
@@ -328,7 +345,7 @@ def replay(
         fills=list(strategy.fills),
         dropped=list(strategy.dropped),
         refused=list(strategy.refused),
-        triggers=strategy.triggers,
+        triggers=triggers,
         exits=exits,
         flat=flat,
         open_orders=open_orders,
@@ -408,6 +425,23 @@ def stage_one(result: Replay) -> list[str]:
         fell = [(a, b) for a, b in pairwise(triggers) if b < a]
         if fell:
             broken.append(f"{order_id}: the trigger fell, {fell[0][0]} to {fell[0][1]}")
+    # Muse's finding 6 at b28f12c: a remake has a new ID, but its trigger belongs to the same
+    # holding. This replay has one instrument; a completed trip starts a new trigger history.
+    last_by_trip: dict[int, tuple[str, Decimal]] = {}
+    for order in sorted(result.orders, key=lambda o: o.ts_init):
+        triggers = result.triggers.get(order.id, [])
+        if not triggers:
+            continue
+        # A stop can be created, released and filled at the same timestamp: its own flat belongs
+        # to this holding, not the next one (Antigravity 1).
+        trip = sum(e.flat_ns < order.ts_init for e in result.exits)
+        previous = last_by_trip.get(trip)
+        if previous is not None and triggers[0] < previous[1]:
+            broken.append(
+                f"{order.id}: the trigger fell across the remake, {previous[1]} to {triggers[0]} "
+                f"after {previous[0]}"
+            )
+        last_by_trip[trip] = (order.id, triggers[-1])
     for e in result.exits:
         when = stamp(e.opened_ns)
         secs = e.release_to_flat_secs
@@ -511,6 +545,218 @@ def test_a_day_with_no_rising_run_gives_no_entry_and_says_so() -> None:
     assert result.orders == []
     assert stage_one(result) == []
     assert "no entry on this day" in result.report()
+
+
+@pytest.mark.parametrize(
+    ("remade_trigger", "flat_between", "fell", "flat_second"),
+    [
+        ("10.30", False, True, 10),
+        ("10.40", False, False, 10),
+        ("10.45", False, False, 10),
+        ("10.30", True, False, 10),
+        ("10.30", False, True, 4),  # created, released and filled at the same timestamp
+    ],
+)
+def test_stage_one_checks_a_remade_sells_trigger_until_the_position_is_flat(
+    remade_trigger: str, flat_between: bool, fell: bool, flat_second: int
+) -> None:
+    """Muse's finding 6 at b28f12c: each order's trigger only rises, but the remake can start
+    below its predecessor's last trigger. A new entry after flat starts a separate history."""
+    orders = [
+        OrderLine(
+            id=order_id,
+            side="SELL",
+            kind="TRAILING_STOP_LIMIT",
+            status="CANCELED",
+            tif="DAY",
+            price=None,
+            qty=Decimal(1),
+            filled=Decimal(0),
+            ts_init=T0 + second * SECOND_NS,
+            tags=(),
+        )
+        for order_id, second in (("S-2", 4), ("S-1", 1))
+    ]
+    trips = ((0, 3), (4, flat_second)) if flat_between else ((0, flat_second),)
+    result = Replay(
+        orders=orders,
+        fills=[],
+        dropped=[],
+        refused=[],
+        # The order list and this mapping are deliberately not chronological.
+        triggers={
+            "S-2": [Decimal(remade_trigger), Decimal("10.50")],
+            "S-1": [Decimal("10.35"), Decimal("10.40")],
+        },
+        exits=[
+            Exit(
+                opened_ns=T0 + opened * SECOND_NS,
+                flat_ns=T0 + flat * SECOND_NS,
+                qty=Decimal(1),
+                bought_px=Decimal("10.00"),
+                sold_px=Decimal("10.50"),
+                how="released",
+                release_to_flat_secs=1.0,
+                protected=True,
+                held_on=Decimal("10.50"),
+                high_after=None,
+            )
+            for opened, flat in trips
+        ],
+        flat=True,
+        open_orders=0,
+    )
+    broken = stage_one(result)
+    if fell:
+        assert len(broken) == 1, broken
+        assert "the trigger fell" in broken[0]
+        assert all(value in broken[0] for value in ("S-1", "S-2", "10.40", "10.30"))
+    else:
+        assert broken == []
+
+
+def test_a_released_sell_keeps_its_original_creation_time_in_the_replay() -> None:
+    """Antigravity 1: the emulator replaces the cached order at release; its init event keeps
+    creation time even when the released limit fills on that same quote."""
+    result = replay(
+        generated_instrument(), generated_tape(RISING + FALL + AFTER), Decimal(8), wind_down_at=None
+    )
+    (exit_,) = result.exits
+    sell = result.orders[-1]
+    assert sell.kind == "LIMIT" and sell.status == "FILLED"
+    assert exit_.release_to_flat_secs == 0
+    assert sell.ts_init < exit_.flat_ns
+
+
+def test_a_released_sell_does_not_put_its_trigger_in_the_next_holding() -> None:
+    """Antigravity 1: the first sale releases and fills at once; the next holding starts lower
+    than its trigger, and ends by wind-down, with no fall inside either holding."""
+    closes = [10.0, 10.1, 10.2, 10.3, 10.4, 11.0, 11.8, 12.0, 11.76, 11.4]
+    closes += [11.45, 11.5, 11.6, 11.7, 11.8, 11.9, 12.0, 12.1]
+    wind_down = datetime.fromtimestamp((T0 + (len(closes) - 1) * MINUTE_NS) / 1e9, tz=UTC)
+    result = replay(
+        generated_instrument(),
+        generated_tape(closes),
+        Decimal(8),
+        wind_down_at=wind_down,
+        entries=2,
+        cooldown_secs=60,
+    )
+    assert len(result.exits) == 2, result.report()
+    assert result.exits[0].release_to_flat_secs == 0
+    assert result.exits[1].how == "wind-down"
+    assert stage_one(result) == [], result.report()
+
+
+@pytest.fixture
+def liquid_replay(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The real engine with the venue's documented liquidity consumption enabled for partial fills
+    (`nt:python/nautilus_trader/backtest/__init__.pyi`, `BacktestEngine.add_venue`)."""
+    engine_type = BacktestEngine
+
+    class LiquidEngine:
+        def __init__(self, config: BacktestEngineConfig) -> None:
+            self.engine = engine_type(config)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self.engine, name)
+
+        def add_venue(self, *args: Any, **kwargs: Any) -> None:
+            self.engine.add_venue(*args, **kwargs, liquidity_consumption=True)
+
+    monkeypatch.setitem(replay.__globals__, "BacktestEngine", LiquidEngine)
+
+
+def generated_quote(seconds: float, bid: str, ask: str, *, ask_size: int = 10_000) -> QuoteTick:
+    ns = T0 + int(seconds * SECOND_NS)
+    return QuoteTick(
+        AAA,
+        Price.from_str(f"{Decimal(bid):.4f}"),
+        Price.from_str(f"{Decimal(ask):.4f}"),
+        Quantity.from_int(10_000),
+        Quantity.from_int(ask_size),
+        ns,
+        ns,
+    )
+
+
+@pytest.mark.parametrize(
+    ("peak_at", "refill_at", "bad_seed"),
+    [(302.0, 304.0, None), (302.2, 302.4, Decimal("10.25"))],
+    ids=["sampled-peak", "between-steps-peak"],
+)
+def test_the_replay_names_a_lower_remake_that_releases_and_fills_at_once(
+    liquid_replay: None,
+    monkeypatch: pytest.MonkeyPatch,
+    peak_at: float,
+    refill_at: float,
+    bad_seed: Decimal | None,
+) -> None:
+    """Antigravity 1/2: real partial entry fills force a remake. Inject a lost or lowered kept
+    trigger; the replay must catch it even if the last peak happened between timer steps."""
+    trail = Recording._trail
+
+    def lower_seed(self: Recording, slot: Any, held: Decimal, now: int) -> None:
+        if slot.trail_trigger is not None:
+            slot.trail_trigger = bad_seed
+        trail(self, slot, held, now)
+
+    monkeypatch.setattr(Recording, "_trail", lower_seed)
+    data = generated_tape(RISING[:5])
+    data[-1] = generated_quote(300 - 1e-9, "10.39", "10.41", ask_size=1)
+    data += [
+        generated_quote(peak_at, "10.59", "10.61"),
+        generated_quote(refill_at, "10.39", "10.41", ask_size=2),
+        generated_quote(306, "10.39", "10.60"),
+        generated_quote(308, "10.17" if bad_seed is None else "10.24", "10.60"),
+        generated_quote(310, "10.00", "10.60"),
+    ]
+    result = replay(
+        generated_instrument(), data, Decimal(8), wind_down_at=None, max_notional=Decimal("31.5")
+    )
+    sells = [o for o in result.orders if o.side == "SELL"]
+    assert len(sells) == 2, result.report()
+    first, remade = sells
+    assert (first.qty, remade.qty) == (Decimal(1), Decimal(3)), result.report()
+    assert remade.kind == "LIMIT" and remade.status == "FILLED"
+    assert result.exits[0].release_to_flat_secs == 0
+    assert result.triggers[first.id][-1] == Decimal("10.38"), result.report()
+    broken = stage_one(result)
+    assert len(broken) == 1 and "the trigger fell" in broken[0], result.report()
+    assert first.id in broken[0] and remade.id in broken[0]
+
+
+def test_the_replay_records_a_seeded_trigger_released_during_submit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Antigravity 2: an emulator stop that matches during submit is never seen as emulated by
+    the next timer sample; its initialization event still carries its seed."""
+
+    def seeded_trail(self: Recording, slot: Any, held: Decimal, now: int) -> None:
+        order = self.order_factory.trailing_stop_limit(
+            slot.instrument_id,
+            OrderSide.SELL,
+            Quantity.from_int(int(held)),
+            None,
+            limit_offset=Decimal("0.27"),
+            trailing_offset=Decimal("0.21"),
+            trigger_price=Price.from_str("10.40"),
+            trigger_type=TriggerType.BID_ASK,
+            time_in_force=TimeInForce.DAY,
+            emulation_trigger=TriggerType.BID_ASK,
+        )
+        slot.protect_id = order.client_order_id
+        self.submit_order(order)
+
+    monkeypatch.setattr(Recording, "_trail", seeded_trail)
+    data = generated_tape(RISING[:5]) + [generated_quote(303, "10.39", "10.60")]
+    result = replay(
+        generated_instrument(), data, Decimal(8), wind_down_at=None, max_notional=Decimal("31.5")
+    )
+    sell = result.orders[-1]
+    assert sell.side == "SELL" and sell.kind == "LIMIT" and sell.status == "FILLED"
+    assert result.exits[0].release_to_flat_secs == 0
+    assert Decimal("10.40") in result.triggers.get(sell.id, []), result.report()
 
 
 def test_stage_one_names_a_falling_trigger_a_slow_exit_and_an_open_position() -> None:
