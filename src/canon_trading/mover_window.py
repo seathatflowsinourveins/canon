@@ -344,10 +344,13 @@ def mover_universe_parts(
     rank_max_age_secs: int = RANK_MAX_AGE_SECS,
     entry_notional: Decimal = ENTRY_NOTIONAL_USD,
     size_from_budget: bool = False,
+    trail_rows: Mapping[str, Any] | None = None,
 ) -> tuple[Mover, tuple[PositionCap, ...]]:
     """One strategy and independent position monitors on the loaded roster. The ranking arrives only
     on the bus; the startup order is not a substitute. Every name has an entry share bound, and a name
     outside the roster cannot enter. The default registered arm gets explicit per-name Day contexts.
+    `trail_rows` (T1/T2's `TRAIL_SETTINGS`) go through `MoverConfig`'s own validation with this
+    window's `bar_spec`.
     """
     if not prices:
         raise ValueError("a mover window needs at least one priced instrument")
@@ -379,6 +382,7 @@ def mover_universe_parts(
             market_exit_time_in_force=TimeInForce.DAY,
             market_exit_interval_ms=market_exit_interval_ms,
             market_exit_max_attempts=market_exit_max_attempts,
+            **dict(trail_rows or {}),
         )
     )
     strategy.entry_contexts.update(entry_contexts or {})

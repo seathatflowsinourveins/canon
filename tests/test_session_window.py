@@ -7996,6 +7996,15 @@ def test_a_window_with_quotes_but_no_rank_generation_is_recorded_as_failed(monke
     assert report["result"].startswith("failed:") and "no published generation" in report["result"]
 
 
+def test_trail_rows_are_movers_and_refused_by_name_for_another_strategy() -> None:
+    with pytest.raises(ValueError, match="trail_mode is Mover's"):
+        WindowConfig(trail_mode="atr")
+    with pytest.raises(ValueError, match="flow_share is Mover's"):
+        WindowConfig(flow_share=Decimal("0.01"))
+    assert WindowConfig(strategy="Mover", mover=True, trail_mode="atr").trail_mode == "atr"
+    assert WindowConfig().trail_mode == "fixed"
+
+
 def test_slots_are_movers_and_a_positive_whole_number() -> None:
     with pytest.raises(ValueError, match="slots are Mover's"):
         WindowConfig(slots=2)

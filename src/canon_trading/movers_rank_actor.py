@@ -64,7 +64,14 @@ Each tick's outcome is one log line, `movers-rank record {json}`, with the laten
 and stay null here.
 
 Rows, all UNCALIBRATED: `PUBLISH_INTERVAL_SECS`, `PUBLISH_OFFSET_SECS`, `MAX_DATA_AGE_SECS`,
-`REFERENCE_LOOKBACK_DAYS`. `REF_BATCH` is a choice, not a documented limit.
+`REFERENCE_LOOKBACK_DAYS`, `REFERENCE_READ_BOUND_SECS`, `PRE_READ_WAIT_SECS`. `REF_BATCH` and
+`UNUSABLE_READS_REFUSED` are choices, not documented limits.
+
+Each reference read says what it did as it happens: every daily-bars batch and the splits read write one
+line each from the read's own thread (`READ_LOG`), with the time, the duration and the outcome; each
+attempt's outcome is a `movers-rank reference read {json}` line at the first tick that sees it finished,
+and every record names the attempt in flight, the last attempt's failure, an attempt past
+`REFERENCE_READ_BOUND_SECS`, or the refusal after `UNUSABLE_READS_REFUSED` unusable reads.
 
 Limits (ADR 0087): the move from the regular open is not known (no opens are passed); trade corrections and
 cancels come only on the trade channel, which the actor does not read, and it no longer takes revised bars
@@ -85,6 +92,7 @@ from datetime import datetime
 from datetime import time
 from datetime import timedelta
 from pathlib import Path
+from time import monotonic
 from time import time_ns
 from typing import TYPE_CHECKING
 from typing import Protocol
@@ -136,12 +144,27 @@ REFERENCE_LOOKBACK_DAYS = 10
 """Calendar days of daily bars read for each symbol's latest completed regular close (UNCALIBRATED)."""
 REF_BATCH = 500
 """Symbols a daily-bars request names (a choice: the page's limit is on data points, 10,000)."""
+REFERENCE_READ_BOUND_SECS = 300.0
+"""How long one attempt at the references and splits may run before every record names it as unread by
+this bound, rather than "not read yet" (UNCALIBRATED; the whole market's pre-read took about 90 s on
+2026-11-12, and a window whose read never answered said only "not read yet" for 12 minutes). The bound
+names the attempt; it does not stop it, since the one read worker cannot be interrupted mid-request."""
+PRE_READ_WAIT_SECS = 180.0
+"""How long the actor's first call waits for the pre-read before reading afresh (UNCALIBRATED; twice
+the pre-read's measured 90 s)."""
+UNUSABLE_READS_REFUSED = 2
+"""Whole-market reads in a row that come back unusable (no reference close, or no split read), after
+which the references are refused by name for the trade date and not read again (the lead's order of
+2026-11-12: never a silent retry loop). A read that raises is retried each tick and named."""
 SPLITS_LIMIT = 1000
 """alpaca-py's `CorporateActionsRequest.limit` default; a read that reaches it is incomplete, so unknown."""
 STALE_NAMED = 20
 """Stale symbols a record names; the rest are counted (a choice, for a whole-market universe)."""
 TIMER = "movers-rank"
 RECORD_PREFIX = "movers-rank record "
+READ_PREFIX = "movers-rank reference read "
+READ_LOG = "MoversRankReads"
+"""The logger name of the lines the read threads write: each batch, and each note of the pre-read."""
 
 
 def trade_date(ts_ns: int) -> date:
@@ -206,7 +229,9 @@ class MoversRankActorConfig(DataActorConfig):
     a generation with no bar inside the bound publishes nothing. Default: `MAX_DATA_AGE_SECS`.
     `rank_without_baseline` lets a missing baseline file rank every name in the zero-baseline tier on
     its dollars, under the move condition (`movers_rank.rank`'s `no_baseline`), and each record says so;
-    a file that exists and cannot be used still publishes nothing. The window sets it overnight only,
+    a file that exists and cannot be used still publishes nothing. `reference_read_bound_secs` is how
+    long one reference attempt may run before the record names it by that bound; default
+    `REFERENCE_READ_BOUND_SECS`. The window sets `rank_without_baseline` overnight only,
     until Wave 2's overnight baseline exists (the lead's ruling, 2026-11-12; ultra review of the
     composition, finding 2).
     """
@@ -221,6 +246,7 @@ class MoversRankActorConfig(DataActorConfig):
         inline_reads: bool = False,
         max_data_age_secs: float = MAX_DATA_AGE_SECS,
         rank_without_baseline: bool = False,
+        reference_read_bound_secs: float = REFERENCE_READ_BOUND_SECS,
         **_kwargs: object,
     ) -> None:
         super().__init__()
@@ -240,8 +266,13 @@ class MoversRankActorConfig(DataActorConfig):
         self.baseline_path = baseline_path
         self.reference_reader = reference_reader
         self.inline_reads = inline_reads
+        if not math.isfinite(reference_read_bound_secs) or reference_read_bound_secs <= 0:
+            raise ValueError(
+                f"the reference read bound must be finite and positive, got {reference_read_bound_secs!r}"
+            )
         self.max_data_age_secs = max_data_age_secs
         self.rank_without_baseline = rank_without_baseline
+        self.reference_read_bound_secs = reference_read_bound_secs
 
 
 class MoversRankActor(DataActor):
@@ -269,6 +300,17 @@ class MoversRankActor(DataActor):
         stand-in for the event loop's lag, which the pin exposes no gauge of (the lead's note, 2026-11-12)."""
         self._refs: Future[ReferenceRead] | None = None
         self._refs_key: tuple[date, date] | None = None
+        self._read_bound_ns = int(config.reference_read_bound_secs * 1_000_000_000)
+        self._refs_attempt = 0
+        self._refs_started_ns: int | None = None
+        self._refs_seen: Future[ReferenceRead] | None = None
+        """The attempt whose outcome was last logged, so each attempt's outcome is logged once."""
+        self._refs_last_failure: str | None = None
+        self._refs_unusable_run = 0
+        self._refs_refused: str | None = None
+        """The problem the reads came back with once `UNUSABLE_READS_REFUSED` in a row refuse the key."""
+        self.reference_reads: list[dict[str, object]] = []
+        """Each finished attempt's outcome, as its `movers-rank reference read` line logs it."""
         self._baseline: Future[movers_rank.BaselineRead] | None = None
         self._baseline_session: date | None = None
         self.last_record: dict[str, object] | None = None
@@ -386,9 +428,7 @@ class MoversRankActor(DataActor):
             },
         }
         reasons = self._take_invalid()
-        refs = self._result(self._refs, "references and splits", reasons)
-        if refs is not None and (problem := reference_problem(refs)) is not None:
-            reasons.append(f"references and splits not usable: {problem}")
+        refs = self._refs_result(now, reasons)
         baseline = self._result(self._baseline, "baseline", reasons)
         no_baseline = baseline is not None and baseline.absent and self._rank_without_baseline
         if no_baseline:
@@ -456,19 +496,104 @@ class MoversRankActor(DataActor):
 
     def _ensure_reads(self, now: int) -> None:
         """Start each read this tick needs and retry one that failed or came back unusable; a read keyed
-        to another `(cutoff, session)` pair, or a baseline read for another trade date, is never reused."""
+        to another `(cutoff, session)` pair, or a baseline read for another trade date, is never reused.
+        `UNUSABLE_READS_REFUSED` unusable reads in a row refuse the key's references by name."""
         session = trade_date(now)
         cutoff = reference_cutoff(now)
         key = (cutoff, session)
-        if self._refs_key != key or self._refs_unusable(self._refs):
+        self._log_refs_outcome(now)
+        if self._refs_key != key:
+            if self._refs is not None and not self._refs.done():
+                # the new key's attempt queues behind this one on the one worker; say so once
+                self._log_refs_entry(now, f"unfinished when the reads moved to {key[1]}")
+            self._refs_attempt, self._refs_last_failure = 0, None
+            self._refs_unusable_run, self._refs_refused = 0, None
+        if self._refs_key != key or (
+            self._refs_refused is None and self._refs_unusable(self._refs)
+        ):
             self._refs_key = key
             symbols = sorted(self._assets)
-            self._refs = self._submit(lambda: self._reference_reader(symbols, cutoff, session))
+            self._refs_attempt += 1
+            self._refs_started_ns = now
+            # neither read holds a reference to the actor: an attempt still running at stop finishes on
+            # the worker after the node drops the actor, and an unsendable native actor must not be
+            # freed there
+            reader = self._reference_reader
+            self._refs = self._submit(lambda: reader(symbols, cutoff, session))
+            self._log_refs_outcome(now)  # an inline read is already finished
         if self._baseline_session != session or self._baseline_unusable(self._baseline):
             self._baseline_session = session
-            self._baseline = self._submit(
-                lambda: movers_rank.read_baselines(self._baseline_path, session)
+            path = self._baseline_path
+            self._baseline = self._submit(lambda: movers_rank.read_baselines(path, session))
+
+    def _log_refs_outcome(self, now: int) -> None:
+        """Log the current attempt's outcome once, at the first tick that sees it finished, and keep what
+        the next records name: the last failure, the unusable run, and the refusal it reaches."""
+        future = self._refs
+        if future is None or not future.done() or future is self._refs_seen:
+            return
+        self._refs_seen = future
+        problem = None
+        if future.cancelled():
+            outcome = "cancelled"
+        elif (error := future.exception()) is not None:
+            outcome = f"failed: {type(error).__name__}: {error}"
+        elif (problem := reference_problem(future.result())) is not None:
+            outcome = f"unusable: {problem}"
+        else:
+            outcome = f"read: {len(future.result().references)} references and the splits"
+        self._refs_unusable_run = self._refs_unusable_run + 1 if problem is not None else 0
+        if problem is not None and self._refs_unusable_run >= UNUSABLE_READS_REFUSED:
+            self._refs_refused = problem
+        self._refs_last_failure = None if outcome.startswith("read: ") else outcome
+        self._log_refs_entry(now, outcome)
+
+    def _log_refs_entry(self, now: int, outcome: str) -> None:
+        entry: dict[str, object] = {
+            "attempt": self._refs_attempt,
+            "asked_ns": self._refs_started_ns,
+            "seen_ns": now,
+            "outcome": outcome,
+        }
+        self.reference_reads.append(entry)
+        line = READ_PREFIX + json.dumps(entry, sort_keys=True)
+        if outcome.startswith("read: "):
+            self.log.info(line)
+        else:
+            self.log.warning(line)
+
+    def _refs_result(self, now: int, reasons: list[str]) -> ReferenceRead | None:
+        """The references for this tick, or None with a reason that names the attempt, never a bare
+        wait: the refusal, an attempt past the bound, or the attempt in flight and the last failure.
+        An attempt's time is when it was asked for: on the one worker it may wait behind another."""
+        name = "references and splits"
+        future = self._refs
+        if self._refs_refused is not None:
+            reasons.append(
+                f"{name} not usable: refused: {UNUSABLE_READS_REFUSED} reads in a row came back "
+                f"unusable ({self._refs_refused}); not read again for trade date {self._session}"
             )
+            return None
+        if future is not None and not future.done() and self._refs_started_ns is not None:
+            asked = _iso(self._refs_started_ns)
+            last = (
+                f"; attempt {self._refs_attempt - 1} {self._refs_last_failure}"
+                if self._refs_last_failure is not None and self._refs_attempt > 1
+                else ""
+            )
+            attempt = f"attempt {self._refs_attempt} asked for at {asked} has not returned{last}"
+            if now - self._refs_started_ns > self._read_bound_ns:
+                reasons.append(
+                    f"{name} could not be read within {self._read_bound_ns / 1e9:g} s: {attempt}"
+                )
+            else:
+                reasons.append(f"{name} not read yet: {attempt}")
+            return None
+        refs = self._result(future, name, reasons)
+        if refs is not None and (problem := reference_problem(refs)) is not None:
+            reasons.append(f"{name} not usable: {problem}")
+            return None
+        return refs
 
     @staticmethod
     def _refs_unusable(future: Future[ReferenceRead] | None) -> bool:
@@ -525,6 +650,15 @@ class MoversRankActor(DataActor):
             self.log.info(line)
         else:
             self.log.warning(line)
+
+
+def _iso(ts_ns: int) -> str:
+    """`ts_ns` as an ISO 8601 UTC instant to the millisecond, for a reason or a log line."""
+    return (
+        datetime.fromtimestamp(ts_ns / 1e9, UTC)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
 
 
 TOP_ROWS = 10
@@ -603,6 +737,7 @@ def prefetched_reference_reader(
     key: tuple[date, date],
     notes: list[str],
     fallback: ReferenceReader | None = None,
+    wait_secs: float = PRE_READ_WAIT_SECS,
 ) -> ReferenceReader:
     """A `ReferenceReader` that hands the actor a read started before the node, so its first generation
     need not wait for the whole market's references (the owner's plan of 2026-11-12, Wave 0 (b)).
@@ -610,34 +745,49 @@ def prefetched_reference_reader(
     `read` is `alpaca_reference_reader` over `symbols` for `key` = (cutoff, session), already running. The
     actor's first call for that key waits for it on the actor's worker thread. A call for another key, a
     retry after the pre-read was handed over, or a call after the pre-read failed or found no reference,
-    reads afresh through `fallback` (default `alpaca_reference_reader`). Each call appends
-    one line to `notes` saying which happened, and how many asked-for symbols the pre-read did not cover
-    (those have no reference, so they are unknown, as any symbol `read_references` finds no close for)."""
+    reads afresh through `fallback` (default `alpaca_reference_reader`), as does a first call whose wait for
+    the pre-read passes `wait_secs`; a later call uses a pre-read that finished after that wait, so a slow
+    pre-read is not thrown away (the fresh read and the pre-read then overlap, two reads at once). Each call appends one line to `notes` saying which happened, and how
+    many asked-for symbols the pre-read did not cover (those have no reference, so they are unknown, as any
+    symbol `read_references` finds no close for), and logs the same line as it happens (`READ_LOG`)."""
     read_fresh = fallback or alpaca_reference_reader
     covered = frozenset(symbols)
     handed: list[bool] = []
+    used: list[bool] = []
+
+    def note(line: str) -> None:
+        notes.append(line)
+        read_log()(line)
 
     def reader(symbols: Sequence[str], cutoff: date, session: date) -> ReferenceRead:
         if (cutoff, session) != key:
-            notes.append(
+            note(
                 f"read at the actor's call: its key {(cutoff, session)} is not the pre-read's {key}"
             )
             return read_fresh(symbols, cutoff, session)
         if handed:
-            notes.append("read at the actor's call: a retry after the pre-read was handed over")
+            if not used and read.done() and read.exception() is None and read.result().references:
+                # the pre-read the first call stopped waiting for has since finished: use it
+                used.append(True)
+                note("read at the actor's call: the pre-read finished after its wait and is used")
+                return read.result()
+            note("read at the actor's call: a retry after the pre-read was handed over")
             return read_fresh(symbols, cutoff, session)
         handed.append(True)
-        error = read.exception()  # waits for the pre-read
+        try:
+            error = read.exception(timeout=wait_secs)  # waits for the pre-read, at most `wait_secs`
+        except TimeoutError:
+            note(f"read at the actor's call: the pre-read did not finish within {wait_secs:g} s")
+            return read_fresh(symbols, cutoff, session)
         if error is not None:
-            notes.append(
-                f"read at the actor's call: the pre-read failed ({type(error).__name__}: {error})"
-            )
+            note(f"read at the actor's call: the pre-read failed ({type(error).__name__}: {error})")
             return read_fresh(symbols, cutoff, session)
         if not read.result().references:
-            notes.append("read at the actor's call: the pre-read found no reference")
+            note("read at the actor's call: the pre-read found no reference")
             return read_fresh(symbols, cutoff, session)
+        used.append(True)
         missing = sum(1 for s in symbols if s not in covered)
-        notes.append(
+        note(
             f"pre-read before the node: {len(covered)} symbols; {missing} of the {len(symbols)} asked for "
             "were not in it"
         )
@@ -649,16 +799,18 @@ def prefetched_reference_reader(
 def alpaca_reference_reader(symbols: Sequence[str], cutoff: date, session: date) -> ReferenceRead:
     """Each symbol's latest completed regular close before `cutoff` from Alpaca's split-adjusted daily
     `sip` bars, and the forward and reverse splits from the earliest of those closes to `session`, on
-    GET-only clients built from the environment's pair. Runs on the actor's worker thread."""
+    GET-only clients built from the environment's pair. Runs on the actor's worker thread, or the window's
+    pre-read thread, and logs each batch from there (`read_log`)."""
     api_key, secret_key = credentials_from_env()
     bars = with_http_timeout(StockHistoricalDataClient(api_key=api_key, secret_key=secret_key))
     actions = with_http_timeout(CorporateActionsClient(api_key=api_key, secret_key=secret_key))
     require_get_only(bars, actions)
-    references = read_references(bars, symbols, cutoff)
+    log = read_log()
+    references = read_references(bars, symbols, cutoff, log=log)
     return ReferenceRead(
         cutoff=cutoff,
         references=references,
-        splits=read_splits(actions, references, session),
+        splits=read_splits(actions, references, session, log=log),
         read_ns=time_ns(),
     )
 
@@ -671,27 +823,58 @@ class CorporateActions(Protocol):
     def get_corporate_actions(self, request_params: CorporateActionsRequest) -> object: ...
 
 
+def read_log() -> Callable[[str], None]:
+    """Log a line from the calling thread under `READ_LOG`. NautilusTrader's Python `Logger` is
+    `unsendable` (`crates/common/src/python/logging.rs:434-439` at the pin), so each thread makes its own,
+    and each line names that thread, so the pre-read's batches and the actor's are told apart;
+    it forwards to the one global logger (`logger::log`), whose writer runs on its own thread. Before a
+    node has started its logging the line goes nowhere, which leaves the pre-read's notes in `notes`."""
+    import threading
+
+    from nautilus_trader.common import Logger
+
+    info, thread = Logger(READ_LOG).info, threading.current_thread().name
+    return lambda line: info(f"[{thread}] {line}")
+
+
 def read_references(
-    client: DailyBars, symbols: Sequence[str], cutoff: date
+    client: DailyBars,
+    symbols: Sequence[str],
+    cutoff: date,
+    log: Callable[[str], None] | None = None,
 ) -> dict[str, movers_rank.Reference]:
     """Each symbol's split-adjusted daily close of the latest New York date before `cutoff` within
-    `REFERENCE_LOOKBACK_DAYS`; a symbol with none is left out, so unknown."""
+    `REFERENCE_LOOKBACK_DAYS`; a symbol with none is left out, so unknown. `log` is handed one line a
+    batch as it ends: its number, the time, its symbols, how many had a close, and its duration, or the
+    error it failed with, which is raised."""
     start = datetime.combine(cutoff - timedelta(days=REFERENCE_LOOKBACK_DAYS), time(0), NEW_YORK)
     end = datetime.combine(cutoff, time(0), NEW_YORK) - timedelta(microseconds=1)
     found: dict[str, movers_rank.Reference] = {}
-    for i in range(0, len(symbols), REF_BATCH):
-        result = client.get_stock_bars(
-            StockBarsRequest(
-                symbol_or_symbols=list(symbols[i : i + REF_BATCH]),
-                timeframe=TimeFrame.Day,
-                start=start,
-                end=end,
-                adjustment=Adjustment.SPLIT,
-                feed=DataFeed.SIP,
+    batches = math.ceil(len(symbols) / REF_BATCH)
+    for n, i in enumerate(range(0, len(symbols), REF_BATCH), start=1):
+        batch = list(symbols[i : i + REF_BATCH])
+        began = monotonic()
+        try:
+            result = client.get_stock_bars(
+                StockBarsRequest(
+                    symbol_or_symbols=batch,
+                    timeframe=TimeFrame.Day,
+                    start=start,
+                    end=end,
+                    adjustment=Adjustment.SPLIT,
+                    feed=DataFeed.SIP,
+                )
             )
-        )
+        except Exception as error:
+            if log is not None:
+                log(
+                    f"reference batch {n}/{batches} {_iso(time_ns())} {len(batch)} symbols failed "
+                    f"after {monotonic() - began:.2f} s: {type(error).__name__}: {error}"
+                )
+            raise
         if not isinstance(result, BarSet):
             raise TypeError("alpaca-py returned raw bar data; the client must use raw_data=False")
+        before = len(found)
         for symbol, daily in result.data.items():
             done = [b for b in daily if b.timestamp.astimezone(NEW_YORK).date() < cutoff]
             if done:
@@ -699,25 +882,45 @@ def read_references(
                 found[symbol] = movers_rank.Reference(
                     close=last.close, session=last.timestamp.astimezone(NEW_YORK).date()
                 )
+        if log is not None:
+            log(
+                f"reference batch {n}/{batches} {_iso(time_ns())} {len(batch)} symbols, "
+                f"{len(found) - before} with a close, {monotonic() - began:.2f} s"
+            )
     return found
 
 
 def read_splits(
-    client: CorporateActions, references: Mapping[str, movers_rank.Reference], session: date
+    client: CorporateActions,
+    references: Mapping[str, movers_rank.Reference],
+    session: date,
+    log: Callable[[str], None] | None = None,
 ) -> movers_rank.SplitRead | None:
     """Forward and reverse splits from the earliest reference session to `session`, for every symbol;
-    None (unknown) with no reference, or when the read reaches `SPLITS_LIMIT` and may be cut short."""
+    None (unknown) with no reference, or when the read reaches `SPLITS_LIMIT` and may be cut short. `log`
+    is handed one line as the read ends, as `read_references` hands one a batch."""
     if not references:
         return None
     start = min(r.session for r in references.values())
-    result = client.get_corporate_actions(
-        CorporateActionsRequest(
-            types=[CorporateActionsType.FORWARD_SPLIT, CorporateActionsType.REVERSE_SPLIT],
-            start=start,
-            end=session,
-            limit=SPLITS_LIMIT,
+    began = monotonic()
+    try:
+        result = client.get_corporate_actions(
+            CorporateActionsRequest(
+                types=[CorporateActionsType.FORWARD_SPLIT, CorporateActionsType.REVERSE_SPLIT],
+                start=start,
+                end=session,
+                limit=SPLITS_LIMIT,
+            )
         )
-    )
+    except Exception as error:
+        if log is not None:
+            log(
+                f"splits read {_iso(time_ns())} failed after {monotonic() - began:.2f} s: "
+                f"{type(error).__name__}: {error}"
+            )
+        raise
+    if log is not None:
+        log(f"splits read {_iso(time_ns())} answered in {monotonic() - began:.2f} s")
     data = getattr(result, "data", None)
     if not isinstance(data, dict):
         raise TypeError(

@@ -72,6 +72,10 @@ the change. `tests/test_custody.py`: `paper:account protect` reads C's service
 only, in data-only mode, and prints neither value (two cases failed before). After the owner stores the
 pair: `mise run paper:check protect` and `mise run paper:account protect`, recorded here with the date.
 
+2026-11-12, 10:09:58 New York, from the main checkout at `1c096ad` (the lead's read, after the owner
+stored the pair): `mise run paper:check protect` found both items in the login keychain, and
+`mise run paper:account protect` was answered by the account.
+
 ## Evidence
 
 Read 2026-11-12.

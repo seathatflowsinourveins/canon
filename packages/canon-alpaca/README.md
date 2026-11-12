@@ -124,7 +124,11 @@ From upstream's Python adapter guide (`developer_guide/python_adapters`):
 * Name classes `Alpaca<Role>`: `AlpacaDataClient`, `AlpacaDataClientConfig`, `AlpacaDataClientFactory`, and
   the same for execution. No `Live` prefix. `AlpacaDataClientConfig` has two adapter fields, the stream's
   silence bounds (Known limits, "Mute stream"); a plain `DataClientConfig` gets their defaults.
-  `AlpacaExecutionClientConfig` has none; it exists to refuse what is not paper trading.
+  `AlpacaExecutionClientConfig` has `report_external_orders`, `report_external_trailing_stops`,
+  `sell_to_close_on_long_exits` and `reduce_only_sells`, all off by default, with
+  `sell_to_close_order_types` scoping the last two, and refuses what is not paper trading. With
+  `report_external_orders` true, trade updates report outside orders and their real trade-ID
+  fills through `_handle_report(report, fills)` (the same guide's typed output contract).
 * Execution clients take `trader_id`, `venue`, `account_id`, `account_type` and `oms_type` at
   construction, implement the four reconciliation hooks, and emit events through `generate_*`. Here the
   account is `ALPACA-PAPER`, a `CASH` account with `NETTING` positions.
@@ -144,6 +148,30 @@ by `tests/test_upstream_contract.py`. If that test fails after a pin moves, re-r
 
 Known limits of custom Python clients upstream: no Redis or PostgreSQL cache backing; clients emit
 `CustomData` only (no component `publish_message` or topic subscription).
+
+Reduce-only follows upstream's [send-or-reject contract](https://github.com/nautechsystems/nautilus_trader/blob/d53849b216e20f2c122ca01b4dd0da377638b186/docs/concepts/adapters.md#reduce-only-execution-contract),
+which permits an equivalent enforcing venue instruction. Alpaca's [order schema](https://docs.alpaca.markets/us/reference/postorder.md)
+has a `position_intent` field. By default every reduce-only order is denied before transport with
+`reduce-only is not supported`. With `AlpacaExecutionClientConfig(reduce_only_sells=True)`, a reduce-only
+SELL carries `position_intent=sell_to_close` and a reduce-only BUY is denied before transport. The field is
+present at the pin in [OrderRequest, requests.py:388](https://github.com/alpacahq/alpaca-py/blob/c42add7c0a70/alpaca/trading/requests.py#L388),
+inherited by all four supported request classes, with [PositionIntent.SELL_TO_CLOSE](https://github.com/alpacahq/alpaca-py/blob/c42add7c0a70/alpaca/trading/enums.py#L598).
+No account configuration is read or cached, at connect, on a query or on any order.
+
+`AlpacaExecutionClientConfig(sell_to_close_on_long_exits=True)` also adds the field to an ordinary SELL
+when the cached net position for its account and instrument is long (the sum of the matching open
+positions' `signed_qty` is positive). It is off by default and independent of `reduce_only_sells`.
+
+Both settings act only on the order types in `sell_to_close_order_types`, by default a limit, a stop and
+a stop-limit: the types for which a paper run shows Alpaca refusing the field when the sell would open a
+short (ADR 0111). A market order is outside it until that is shown: with `reduce_only_sells` a reduce-only
+market SELL is denied before transport, naming the order type, and with `sell_to_close_on_long_exits` a
+market SELL of a long is a plain sell. A type the adapter does not submit is refused when the
+configuration is built.
+A BUY or a SELL from cached flat/short is
+unchanged by this setting; the venue resolves any position change after that cached view. The adapter
+never sets the order's Nautilus `reduce_only` flag or changes a strategy's exit settings. No adapter
+setting is enabled in a node by this change.
 
 ## Known limits of this slice
 
@@ -449,7 +477,7 @@ Each is stated in `execution.py`'s header, with its source.
   Alpaca marks IOC, FOK, OPG and CLS for whole-share market and limit orders "Yes*", "contact the sales
   team", and for stop and stop-limit orders "No"
   (https://docs.alpaca.markets/us/docs/orders-at-alpaca.md, "Order Types vs Supported Time in Force"), so
-  they are denied. So are trailing, post-only, reduce-only, quote-quantity and display quantity orders (a stop-market's
+  they are denied. So are trailing, post-only, quote-quantity and display quantity orders (a stop-market's
   display quantity included), a
   stop trigger type other than `DEFAULT` or `LAST_PRICE` (Alpaca elects a stop "on the consolidated
   print"), a stop price at or above $1.00 with more than 2 decimals or below $1.00 with more than
@@ -462,6 +490,31 @@ Each is stated in `execution.py`'s header, with its source.
   since Alpaca's order has none, the trigger type of the node's order, or `DEFAULT` for one the node does
   not hold ([ADR 0036](../../docs/adr/0036-alpaca-adapter-order-management.md)). Denied orders never
   reach Alpaca. Not implemented: order lists.
+  With `report_external_trailing_stops` off, the default, an open `trailing_stop` placed outside the
+  node fails the start by name, `order type trailing_stop`, as every unmapped order type does. With it
+  on, an outside `trailing_stop` is mapped for reports and reconciliation only: its `trail_price` is a
+  `PRICE` offset, or its `trail_percent` multiplied by 100 is a `BASIS_POINTS` offset (100 means 1%);
+  its `stop_price` is the advisory current trigger, absent when Alpaca gives none or the value is not
+  representable at the instrument's four decimals (one warning), with `DEFAULT` trigger type
+  unless the cached order supplies one. This uses [Alpaca's trailing-stop fields](https://docs.alpaca.markets/us/docs/orders-at-alpaca.md#trailing-stop-orders)
+  and the pinned [trailing model](https://github.com/nautechsystems/nautilus_trader/blob/d53849b216e20f2c122ca01b4dd0da377638b186/docs/concepts/orders/trailing_stop_market.md)
+  and [offset units](https://github.com/nautechsystems/nautilus_trader/blob/d53849b216e20f2c122ca01b4dd0da377638b186/docs/concepts/orders/index.md#trailing-offset-type).
+  No high-water mark or activation price is required. Exactly one positive finite offset must be
+  present, otherwise an open order still fails by name. No trailing submission or local trailing logic
+  is added; updates of Alpaca's moving trigger between reports remain unavailable on its stream.
+* **Reduce-only:** all reduce-only orders are denied with `reduce-only is not supported` by default.
+  With `reduce_only_sells=True`, a SELL of an order type in `sell_to_close_order_types` carries
+  `position_intent=sell_to_close`; a reduce-only market SELL (outside the default scope) and every
+  reduce-only BUY are denied. A modify that raises the quantity of a resting reduce-only SELL is
+  rejected before transport: Alpaca's replace carries no position intent, and what it checks when such
+  an order grows is not shown on paper; a smaller quantity or another price is sent. The scope is kept
+  on the config as the order types in the order of their names, so the config serialises.
+  Every other order check still applies. The independent optional long-exit setting above adds this
+  intent to ordinary closing SELLs and changes no Nautilus flag. A 422 `position intent mismatch` with
+  body code 42210000 reaches the strategy
+  as `OrderRejected` with the code and text once Alpaca confirms it does not hold the order. Venue
+  enforcement of position_intent is shown on paper only for the cases ADR 0111's Confirmation lists; every
+  other session and order-type combination is **UNVERIFIED**. There is no account-configuration read or cache.
 * **Queries:** NautilusTrader's in-flight check sends `QueryOrder` for an order left `SUBMITTED`,
   `PENDING_CANCEL` or `PENDING_UPDATE` (on by default: from 10 s after start, every 2 s, for an order in
   flight 5 s, 5 retries), and its open-order check, off by default, for an accepted order Alpaca's open
@@ -547,6 +600,11 @@ Each is stated in `execution.py`'s header, with its source.
   that cancel or modify unless a fill came first. An update for an order the engine has ended from a
   query's report is dropped, fills included, since that report reaches the engine only once the node's
   order holds every fill it shows (ADR 0075).
+* **Refusal reasons:** when Alpaca's error body includes a code, the bounded venue text keeps it before
+  the message, for example `Alpaca refused the order (403): 40310000: insufficient qty available ...`.
+  Submit, modify and cancel use the same formatter, reading the pinned alpaca-py's `APIError.code`
+  and `APIError.message`; a body with no code keeps its previous message or raw-text fallback. The HTTP
+  status and the rest of the reason's wording are unchanged.
 * **Wash trades:** Alpaca rejects an order that "could potentially interact" with one of the account's
   own open orders on the other side, "with the HTTP status code 403 (Forbidden)", and says the protection
   "also applies to your paper trading account" ("User Protection", "Preventing Wash Trades",
@@ -690,8 +748,31 @@ Each is stated in `execution.py`'s header, with its source.
   update was lost is re-checked only with the open-order check on, else at the next start. A node that
   holds orders for long enough to lose an update sets `LiveExecutionEngineConfig(open_check_interval_secs=...)`
   within upstream's recommended "5-10s" (how_to/configure_live_trading), as the paper node does at 10 s
-  (`src/canon_trading/paper_node.py`); it costs one open-orders read per interval. Updates for orders the node does not hold are logged and
-  dropped, and one alpaca-py hands over unparsed is logged as an error. Events this slice does not map
+  (`src/canon_trading/paper_node.py`); it costs one open-orders read per interval. Updates for orders the
+  node does not hold are logged and dropped by default, naming the symbol and event without the venue
+  order ID. `AlpacaExecutionClientConfig(report_external_orders=True)` instead sends a mapped status
+  report with its stream fills, each under Alpaca's trade ID, through the same report output as queries.
+  The pinned runtime [creates an external order and applies companion fills before any residual inference](https://github.com/nautechsystems/nautilus_trader/blob/d53849b216e20f2c122ca01b4dd0da377638b186/crates/execution/src/engine/mod.rs#L1679),
+  assigning the strategy's active [external instrument claim](https://github.com/nautechsystems/nautilus_trader/blob/d53849b216e20f2c122ca01b4dd0da377638b186/docs/concepts/execution/reconciliation.md#external-order-creation).
+  Before creation, the client keeps observed fills by trade ID and sends a snapshot only when those
+  fills account for every filled share it shows: no remainder can be inferred. This also covers two
+  updates queued before the engine creates the order, including observed fills from its traced
+  replace chain, reported on the replacement. The pinned runtime can retain the earlier cached venue
+  order ID when two outside replacement reports are queued before creation and no quantity or price
+  changes; the real trade IDs and filled state still apply. Once the node holds it, later updates use the
+  ordinary event path and deduplicate against the cache and record. The complete fills stay bundled
+  with their status even if the order materializes during a mapping await, without a REST fill read.
+  Completed closed orders release their stored fills immediately, and pending fills move off
+  superseded legs onto their replacement. An unmapped type, status or client order ID is warned about
+  and not stored or reported. An unloaded instrument is skipped with one warning per symbol.
+  A missing trade ID, failed trace or incomplete stream fill set leaves the order to reconciliation:
+  one warning names its symbol, side, type and client lineage, stored fills are dropped, and later
+  outside updates send no partial fill set and repeat no warning. Outside-path messages omit venue
+  order IDs. This path makes no extra reads to fill that gap. Its request cost is
+  `_send_report`'s existing mapping cost: zero REST requests for a simple hand-placed market fill, with
+  replace-chain reads only when that existing mapping needs them. The field stays off on the A and B
+  windows unless their configuration changes. An update alpaca-py hands over unparsed is logged as an
+  error. Events this slice does not map
   (`done_for_day`, `stopped`, `suspended` and the rest) are logged as warnings. If alpaca-py's `run()`
   returns, the client logs an error and does not start the stream again, and shutdown waits `STREAM_JOIN_TIMEOUT_SECS` for the stream thread and, at the same time,
   the task applying updates: up to 1 s for an update being applied to finish, then up to 2 s after its
@@ -699,6 +780,27 @@ Each is stated in `execution.py`'s header, with its source.
   `asyncio.to_thread` needs a free worker of the executor every alpaca-py call runs in), as upstream's
   Coinbase adapter bounds its task drain (`TaskGroup::finish_shutdown`, 1 s and 2 s). A wait that runs
   out fails the disconnect, and the client logs why, which NautilusTrader's own message does not say.
+* **`report_external_orders` is not to be turned on yet.** The second review of that path (2026-11-12)
+  found, from the code and from two scratch tests, defects that its tests do not cover; they are open:
+  - an update for a replacement of an outside order the node has since materialized is dropped with no
+    log, so its fills wait for the open-order or position check;
+  - a report that is skipped (a late update on a replaced leg, a rejected replacement that did not take
+    over) discards the chain's stored trade-ID fills, and the chain is then left to reconciliation
+    although the stream delivered every fill;
+  - one failed trace, or one update in a status this slice does not map, leaves the chain out of stream
+    reports for the whole connection, with no retry; that includes a leg of an order the node holds,
+    replaced twice outside it, whose later updates are then dropped without a line where `main` logged
+    an error for each (the third review, 2026-11-12);
+  - a normal `replaced` event is logged at warning level, and the sets that remember left chains and
+    warned triggers only grow until disconnect.
+  No node sets it; a node that adopts outside positions uses the engine's position check instead.
+  It needs these fixed, each with a test, and a paper run before it is anyone's setting.
+* **A failed trace or report names its cause sparsely.** When an order's replace chain cannot be traced
+  or reported, the log names Alpaca's HTTP status and numeric body code, or the adapter's own named
+  limit (`ChainTooLong`), and for any other error its class only. The error's text can carry a venue
+  order ID, so it is left out, and with it the adapter's own words for a `ValueError` or `TypeError` of
+  its making, which `main` printed. A refused submit, cancel or replace is unchanged: Alpaca's code
+  and words.
 * **Retries:** alpaca-py retries a request answered 429 or 504 up to three times, a submit, replace or
   cancel included (`RESTClient._request`), and `TradingClient` cannot be told not to. The client sends
   each order command once, as NautilusTrader's policies do ("Once, unless the safety test holds") and
@@ -723,6 +825,21 @@ Each is stated in `execution.py`'s header, with its source.
 Upstream's template is covered by integration tests for factory registration, a market fill and shutdown.
 The execution client has all three, offline. The data client has registration and shutdown; it places no
 order, so it has no fill test, and its data delivery is tested instead. Each has paper tests:
+
+`test_external_orders.py` checks the default reduce-only denial for BUY and SELL on all four supported
+types, the opt-in sell_to_close requests and BUY refusal, strict settings and their named errors,
+ordinary requests unchanged with the setting off, opt-in intent on ordinary long-closing
+SELLs without changing their flags, and no configuration read at connect, on queries or on any order.
+It also checks opt-in outside reports and real trade-ID fills,
+instrument-claim position adoption, updates queued before cache creation, duplicates and replace-chain
+fills, pending-fill cleanup, cache materialization during mapping, unmapped and unloaded instruments,
+and incomplete evidence left to reconciliation once, all without extra fill reads. Venue refusal
+messages and enforcement on that path still need a paper run on account A.
+It checks that an outside trailing stop fails the start by name while `report_external_trailing_stops`
+is off and, with it on, trailing stop reports by price and percent, their startup materialization with and without
+Alpaca's current stop price (including a fine advisory trigger reported as None), unchanged trailing
+submission refusal, and the remaining class/time-in-force
+and malformed-offset failures by name.
 
 | File | Covers | Network |
 |---|---|---|
@@ -776,7 +893,7 @@ Tester settings that differ from upstream's defaults, and why: resting orders si
 (`tob_offset_ticks=500_000`, since the instrument's price increment is 0.0001); one side per run, because
 Alpaca refuses an opposite-side order while the tester's opening market order is open (403 "potential
 wash trade detected"; see "Wash trades"); no
-reduce-only on stop, which this slice lacks; start-up reconciliation looks back one
+reduce-only on stop, which the adapter refused during these earlier runs; start-up reconciliation looks back one
 minute on the shared account (see the reconciliation finding below); and the node keeps a post-stop grace
 period, since disconnection "discards queued commands" (python adapter guide, "Disconnect and drain
 tasks"): with none, a queued unsubscribe was discarded and logged as an error once.
