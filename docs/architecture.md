@@ -60,6 +60,7 @@ flowchart LR
 | Local data | `ParquetDataCatalog` of bars and instruments, ignored by git, filled from Alpaca by `load_bars` | NautilusTrader v2.0.0rc8 | `catalog/`, `canon_trading/bars_to_catalog.py` | ADR 0012, 0040 |
 | Trial ledger | One Optuna trial per backtest, in a SQLite study over a fixed sample, in the main checkout and shared by every worktree, ignored by git | Optuna v5.0.0 | `canon_trading/ledger.py`, `ledger/` | ADR 0010, 0035, 0041, 0053, 0054, 0081 |
 | Returns matrix | T daily rows, the session days every trial covers over the sample, one column per configuration | pandas v3.1.1; skfolio v1.12.9 `Population` | `canon_trading/returns_matrix.py` | ADR 0010, 0041, 0080 |
+| Arm comparison diagnostic | SPA p-values and StepM's superior set for mean per-session-day loss differentials against a named benchmark, on a strict daily return CSV; explicit stationary bootstrap settings, input hash and DSR availability, reported outside the checkout | arch v9.0.0 `SPA` and `StepM` | `canon_trading/arm_comparison.py` | ADR 0104; ADR 0010's gate is unchanged |
 | Gate | The pick's deflated Sharpe ratio against 0.95, N = every trial | skfolio v1.12.9 | `canon_trading/ranking.py` | ADR 0010, 0031, 0054, 0080, 0081 |
 
 Pins are in `canon/upstreams.json` and `pyproject.toml`, commits in `canon/upstreams.lock.json`. The
