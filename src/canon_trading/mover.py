@@ -41,7 +41,7 @@ A composition of upstream parts (ADR 0083, ADR 0088). What each part is, at Naut
   `Strategy.modify_order` (concepts/strategies, "Modifying orders") is not called, and the row that
   would ask for it, `chase="modify"`, is refused by name. The cost of a re-price is two requests and a
   moment with no working sale.
-* **Prices** are ticks of upstream's `TieredTickScheme` stating Alpaca's two bands (`PRICES`;
+* **Prices** are ticks of upstream's `TieredTickScheme` stating Alpaca's two bands (`price_step.PRICES`;
   `crates/model/src/instruments/tick_scheme.rs`), through `next_ask_price` and `next_bid_price`.
   Native trailing releases use the instrument's fixed increment instead: a fractional-cent basis
   can release a sub-penny limit above $1. The observed regression is handed to the lead for a
@@ -163,7 +163,6 @@ from nautilus_trader.model import OrderSide
 from nautilus_trader.model import OrderStatus
 from nautilus_trader.model import OrderUpdated
 from nautilus_trader.model import Price
-from nautilus_trader.model import TieredTickScheme
 from nautilus_trader.model import TimeInForce
 from nautilus_trader.model import TrailingOffsetType
 from nautilus_trader.model import TriggerType
@@ -178,6 +177,13 @@ from .movers_rank_signal import RankEntry
 from .movers_rank_signal import decode_ranking
 from .movers_rank_signal import encode_ranking
 from .paper_node import REQUEST_CEILING
+from .price_step import CENT
+from .price_step import NUDGE
+from .price_step import PRICES
+from .price_step import SUB_DOLLAR
+from .price_step import entry_price
+from .price_step import exit_price
+from .price_step import tick
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -359,8 +365,6 @@ STEP_SECS = 1
 """How often the strategy steps: reads the cache and acts."""
 STEP_TIMER = "mover-step"
 WIND_DOWN_ALERT = "mover-wind-down"
-CENT = Decimal("0.01")
-SUB_DOLLAR = Decimal("0.0001")
 SECOND_NS = 1_000_000_000
 BUDGET_SPAN_NS = 60 * SECOND_NS
 QUERY_WAIT_SECS = 130
@@ -425,47 +429,6 @@ def format_rank(entries: Sequence[tuple[InstrumentId, Decimal]]) -> str:
             )
         ranked.append(RankEntry(instrument_id, converted))
     return encode_ranking(ranked)
-
-
-def tick(price: Decimal) -> Decimal:
-    """Alpaca's smallest limit-price step at `price`: a cent at or above $1.00, a hundredth of one below."""
-    return CENT if price >= 1 else SUB_DOLLAR
-
-
-PRICES = TieredTickScheme(
-    "ALPACA_US_EQUITY_LIMIT",
-    [(0.0001, 1.0, 0.0001), (1.0, 5000.0, 0.01)],
-    4,
-    1_000_000,
-)
-"""Alpaca's limit prices as upstream's tiered tick scheme (`nautilus_trader.model.TieredTickScheme`,
-`crates/model/src/instruments/tick_scheme.rs`): four decimals under a dollar, two from a dollar up, to
-5,000 dollars. Every limit price this strategy computes is one of its ticks, so a price that crosses a
-dollar lands on the other band's step. The adapter's instrument has one increment, the finer, and no
-scheme of its own (`canon_alpaca.constants.PRICE_INCREMENT`)."""
-
-
-NUDGE = 0.00001
-"""A tenth of the finest tick. The scheme takes a float, and the float nearest a four-decimal price can
-sit a hair under it (10.29 is 10.28999...), which the scheme would read as between two ticks. A price
-is moved this much toward its own side first: up for a bid, which is then floored, down for an ask."""
-
-
-def entry_price(ask: Decimal, ticks: int) -> Decimal:
-    """A buy limit `ticks` ticks through the ask: the ask, or the next price above it Alpaca takes, and
-    `ticks` more (`TieredTickScheme.next_ask_price`)."""
-    price = PRICES.next_ask_price(float(ask) - NUDGE, ticks)
-    if price is None:
-        raise ValueError(f"no limit price {ticks} ticks above {ask} in {PRICES.name}")
-    return price.as_decimal()
-
-
-def exit_price(bid: Decimal, ticks: int, floor: Decimal | None) -> Decimal:
-    """A sell limit `ticks` ticks through the bid: the bid, or the next price below it Alpaca takes, and
-    `ticks` more (`TieredTickScheme.next_bid_price`), the lowest tick at least; never below `floor`."""
-    found = PRICES.next_bid_price(float(bid) + NUDGE, ticks)
-    price = PRICES.min_price.as_decimal() if found is None else found.as_decimal()
-    return price if floor is None else max(price, floor)
 
 
 def chase_floor(first: Decimal, chase_cap: Decimal) -> Decimal:

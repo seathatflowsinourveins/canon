@@ -65,7 +65,6 @@ from canon_trading.mover import RANK_SIGNAL
 from canon_trading.mover import Mover
 from canon_trading.mover import MoverConfig
 from canon_trading.mover import format_rank
-from canon_trading.mover import tick
 from canon_trading.mover_window import OUTER_BOUND_USD
 from canon_trading.mover_window import entry_diagnostics
 from canon_trading.mover_window import max_shares
@@ -78,6 +77,9 @@ from canon_trading.movers_rank_signal import SIGNAL_NAME
 from canon_trading.movers_rank_signal import RankEntry
 from canon_trading.movers_rank_signal import decode_ranking
 from canon_trading.movers_rank_signal import encode_ranking
+from canon_trading.price_step import entry_price
+from canon_trading.price_step import exit_price
+from canon_trading.price_step import tick
 
 if TYPE_CHECKING:
     from nautilus_trader.common import TimeEvent
@@ -2120,9 +2122,9 @@ def test_a_trailing_sell_made_under_a_dollar_releases_a_price_alpaca_takes_over_
     fast = [(o.status.name, o.price.as_decimal(), sub_penny_denial(o.price)) for o in sells]
     eng.dispose()
     assert fast == [("FILLED", Decimal("1.07"), None)]  # 1.10 less 0.03
-    assert mover.entry_price(Decimal("0.9999"), 2) == Decimal("1.01")
-    assert mover.exit_price(Decimal("1.00"), 1, None) == Decimal("0.9999")
-    assert mover.exit_price(Decimal("10.29"), 1, None) == Decimal("10.28")
+    assert entry_price(Decimal("0.9999"), 2) == Decimal("1.01")
+    assert exit_price(Decimal("1.00"), 1, None) == Decimal("0.9999")
+    assert exit_price(Decimal("10.29"), 1, None) == Decimal("10.28")
 
 
 def test_a_fractional_cent_bid_never_releases_a_sub_penny_limit_above_one_dollar() -> None:
