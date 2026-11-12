@@ -75,6 +75,7 @@ from nautilus_trader.trading import Strategy
 from requests import Response
 from requests.adapters import HTTPAdapter
 
+from canon_trading import price_step
 from canon_trading import session_ma_cross
 from canon_trading import session_window
 from canon_trading.paper_node import MAX_ORDER_SUBMIT_RATE
@@ -4631,6 +4632,71 @@ class Quotes:
                 bid_price=float(self.bid), ask_price=float(self.ask), timestamp=AFTER_HOURS
             )
         }
+
+
+@pytest.mark.parametrize(
+    ("side", "bid", "ask", "raw", "expected"),
+    [
+        ("sell", "0.2737", "0.2763", "0.2237", "0.2237"),
+        ("buy", "0.2737", "0.2763", "0.3263", "0.3263"),
+        ("sell", "6000.237", "6000.241", "6000.187", "6000.18"),
+        ("buy", "6000.237", "6000.241", "6000.291", "6000.30"),
+        ("sell", "1.0537", "1.0563", "1.0037", "1.00"),
+        ("buy", "0.9437", "0.9463", "0.9963", "0.9963"),
+        ("sell", "0.055", "0.06", "0.005", "0.0050"),
+        # a quote finer than the step: a buy close is never under the price it asks for
+        ("buy", "0.2737", "0.27371", "0.3238", "0.3238"),
+        ("buy", "2.26", "2.270005", "2.3201", "2.33"),
+    ],
+)
+def test_close_limits_use_the_shared_venue_step_for_each_side(
+    monkeypatch, side: str, bid: str, ask: str, raw: str, expected: str
+) -> None:
+    """Both direct alpaca-py closers (the account check after a stop, and `custody`'s close-only form
+    for paper:close) price through `close_limit`, and it through `price_step`: four decimals below a
+    dollar, cents from a dollar up, and cents above the tick scheme's top too, where a buy's entry is
+    refused but a close is not (the lead's ruling (ii), 2026-11-12)."""
+    calls: list[tuple[str, Decimal]] = []
+    up, down = price_step.up_on_step, price_step.down_on_step
+
+    def buy(at: Decimal) -> Decimal:
+        calls.append(("buy", at))
+        return up(at)
+
+    def sell(at: Decimal) -> Decimal:
+        calls.append(("sell", at))
+        return down(at)
+
+    monkeypatch.setattr(price_step, "up_on_step", buy)
+    monkeypatch.setattr(price_step, "down_on_step", sell)
+    quotes = Quotes(bid, ask)
+    limit, source = session_window.close_limit(quotes, "SPY", side, "after-hours")
+    assert calls == [(side, Decimal(raw))]
+    assert str(limit) == expected
+    assert limit <= Decimal(raw) if side == "sell" else limit >= Decimal(raw)
+    assert "sip quote" in source and len(quotes.asked) == 1
+
+
+@pytest.mark.parametrize(("bid", "raw"), [("0.05005", "0.00005"), ("0.04", "-0.01")])
+def test_a_close_sell_under_the_finest_step_goes_at_the_lowest_and_says_so(
+    bid: str, raw: str
+) -> None:
+    """The lead, 2026-11-12: a close exists to close. A bid less the five-cent offset under Alpaca's
+    finest step is sent at the lowest step, 0.0001, and the record names that; it is not refused."""
+    limit, source = session_window.close_limit(Quotes(bid, "0.06"), "SPY", "sell", "after-hours")
+    assert limit == Decimal("0.0001")
+    assert f"less 0.05 is {raw}, under Alpaca's finest step" in source
+    assert "sent at the lowest, 0.0001" in source
+
+
+@pytest.mark.parametrize("ask", ["52.10", "0.10", "0"])
+def test_a_close_sell_under_the_finest_step_with_an_ask_not_in_pennies_is_refused_by_name(
+    ask: str,
+) -> None:
+    """The lead, 2026-11-12: the clamp is for a name truly worth pennies. A bid of 0.04 with an ask of
+    52.10 (or none) is a quote too wide to close on: refused by name, and the next poll asks again."""
+    with pytest.raises(ValueError, match="a quote too wide to close on"):
+        session_window.close_limit(Quotes("0.04", ask), "SPY", "sell", "after-hours")
 
 
 def after_hours(fake_time, **kw: Any) -> Venue:
