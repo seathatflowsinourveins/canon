@@ -151,6 +151,10 @@ which list on prints alone.
 * The later holdout's session dates are entered here before any of them is read.
 * `proposed` until `history_load` keeps `vwap` and `trade_count`, and the prints loader and the recorder's
   baseline sessions exist.
+* Amendments 10 and 11 to this record (the `profile` trail arm and the cap policy) are not on `main` at the
+  freeze; their draft's SHA-256 is `f5f8ac1737ccb9aef76ee3a8fd6ec398130ac369b7e9d2e45c987cb6804f2241`. That
+  draft applies on top of amendments 1 to 9, also not yet on `main`, which land with it in one unit. It
+  lands byte for byte as hashed here, or the opening is void for the arms it covers.
 
 ## Evidence
 
