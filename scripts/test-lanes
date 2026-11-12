@@ -2458,6 +2458,42 @@ check "... and a new Codex config gets canon's [otel] table" \
 CLAUDE_CONFIG_DIR="$C" bs --check
 check "check: telemetry settings and codex telemetry ok" \
       eval 'rowis "$TMP/bs.out" "telemetry settings" ok && rowis "$TMP/bs.out" "codex telemetry" ok'
+# the status line's refreshInterval (ADR 0007): added to canon's command without one, an owner's left alone
+# and not named as a gap; and a claude-hud.json canon wrote is updated, one the owner edited is not
+check "a new settings.json's status line refreshes on canon's interval" \
+      eval 'jqt "$C/settings.json" ".statusLine.refreshInterval == $(jq .statusLine.refreshInterval "$ROOT/home/.claude/settings.json")"'
+C4="$TMP/cfg4"; mkdir -p "$C4"
+for case_ in canon mine owner30; do
+  rm -f "$C4"/settings.json*
+  case "$case_" in
+    canon)   sl='{"type":"command","command":"\"'"$C4"'\"/canon/statusline.sh"}' ;;
+    mine)    sl='{"type":"command","command":"/x/mine.sh"}' ;;
+    owner30) sl='{"type":"command","command":"\"'"$C4"'\"/canon/statusline.sh","refreshInterval":30}' ;;
+  esac
+  printf '{"statusLine":%s}\n' "$sl" > "$C4/settings.json"
+  CLAUDE_CONFIG_DIR="$C4" bs --user-config
+  case "$case_" in
+    mine)    check "a status line of the owner's own gets no refreshInterval" jqt "$C4/settings.json" '.statusLine | has("refreshInterval") | not' ;;
+    owner30) check "an owner's refreshInterval on canon's command is kept, and not named as a gap" \
+                   eval 'jqt "$C4/settings.json" ".statusLine.refreshInterval == 30" && ! grep -q "statusLine.refreshInterval" "$TMP/bs.out"' ;;
+    canon)   check "canon's command with no refreshInterval gets the template's, named under ADR 0007" \
+                   eval 'jqt "$C4/settings.json" ".statusLine.refreshInterval == $(jq .statusLine.refreshInterval "$ROOT/home/.claude/settings.json")" && grep -q "added      statusLine.refreshInterval to .*(ADR 0007)" "$TMP/bs.out"' ;;
+  esac
+done
+# a history for the bootstrap copy: an earlier claude-hud.json, then the template's
+printf '{"lineLayout":"expanded"}\n' > "$C4/claude-hud.json"
+bsgit() { git -C "$BS" -c user.name=test -c user.email=test@example.com "$@" >/dev/null 2>&1; }
+cp "$BS/home/.claude/claude-hud.json" "$TMP/hud-template.json"
+bsgit init -q; cp "$C4/claude-hud.json" "$BS/home/.claude/claude-hud.json"
+bsgit add home/.claude/claude-hud.json; bsgit commit -q -m earlier
+cp "$TMP/hud-template.json" "$BS/home/.claude/claude-hud.json"; bsgit commit -q -am template
+CLAUDE_CONFIG_DIR="$C4" bs --user-config
+check "a claude-hud.json canon wrote and nobody edited is updated, the previous one kept" \
+      eval 'cmp -s "$C4/claude-hud.json" "$TMP/hud-template.json" && [ -n "$(find "$C4" -name "claude-hud.json.replaced-*")" ] && [ ! -e "$C4/claude-hud.json.canon-proposed" ]'
+printf '{"lineLayout":"compact"}\n' > "$C4/claude-hud.json"
+CLAUDE_CONFIG_DIR="$C4" bs --user-config
+check "a claude-hud.json the owner edited is left, with a proposal beside it" \
+      eval 'jqt "$C4/claude-hud.json" ".lineLayout == \"compact\"" && [ -e "$C4/claude-hud.json.canon-proposed" ]'
 C3="$TMP/cfg3"; mkdir -p "$C3"
 echo '{"model":"mine","env":{"MY_VAR":"1","OTEL_METRICS_EXPORTER":"otlp"}}' > "$C3/settings.json"
 rm -f "$HOME/.codex/config.toml.replaced-"*   # so the copies counted below are this run's

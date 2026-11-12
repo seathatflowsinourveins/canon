@@ -18,6 +18,11 @@ use, hidden errors, silent fallbacks. Which data sources and tools?
 * Work on this Mac today, with no container runtime installed.
 * Record names and counts, never prompt or tool content.
 
+Amended 2026-11-12, the owner's decision: these drivers govern what canon records and parses. Canon
+itself still parses no transcript and records no prompt or tool content. The status line, which is
+shown and not recorded, may show what the pinned Claude HUD reads from the transcript (below, "the
+session's activity"), with that dependence on an internal format named as its limit.
+
 ## Considered Options
 
 1. Parse session transcripts directly.
@@ -291,9 +296,25 @@ sets the HUD's options at v0.15.0 (`src/config.ts`, `src/schema.ts`). The choice
   `showProvider`, `showSessionName` (free text), `showLaunchDir`, `showAddedDirs` (other paths),
   `showWorktree` (its name repeats the folder), `showModelScopedUsage` (it would read an undocumented stdin
   field), and `externalUsagePath` and `externalUsageWritePath` (canon keeps its own reading).
-* **Off, for undocumented sources.** Tools, skills, MCP, agents, todos, advisor, compactions, session start,
-  last response and agent effort all come from the session transcript, whose format the docs call internal.
-  `modelSource` stays `stdin`.
+* **Shown since 2026-11-12, the owner's decision: the session's activity.** Running subagents with their
+  model and effort, todo progress, the tools in use and their counts, the skills and MCP servers invoked
+  (one line), and the compaction count. On screen this includes prompt-derived text: a running subagent's
+  description (up to 40 characters) and the todo in progress (up to 50) (`src/render/activity.ts` at
+  v0.15.0), shown only, never recorded. These come from the session transcript, whose format the docs
+  call internal, so the HUD's own parser carries them (it followed a format change in v0.12.1) and a
+  change in Claude Code can blank or misread them until the HUD follows; nothing else rests on them.
+  The line runs again every 5 s (`statusLine.refreshInterval`, statusline.md: "Set this when your status
+  line shows time-based data ... or when background subagents change git state while the main session
+  is idle"), so a coordinator waiting on its agents sees them progress, at the cost of one render of
+  about 0.24 s per open session every 5 s; `scripts/bootstrap --user-config` adds the interval only to
+  canon's own status line that sets none, and an interval the owner set is left and not called a gap.
+  It also replaces an installed `claude-hud.json` that is byte for byte a version committed in canon's
+  history, keeping the previous copy, so a display change reaches the machine without a hand merge; one
+  the owner edited still gets a `.canon-proposed` copy beside it. Measured 2026-11-12 against a real
+  transcript: about 0.24 s a render, which the HUD keeps flat by reading the transcript incrementally
+  (v0.12.0).
+* **Off, for undocumented sources or identifiers.** Advisor, session start and last response, from the
+  same transcript, add nothing a lane acts on. `modelSource` stays `stdin`.
 * **Shown since 2026-11-12: the prompt cache.** One line, `Cache ⏱ until 11:25 │ Cache hit 97.3%`: the clock
   time the cache goes cold and the session's hit rate, from the input's documented `prompt_cache` object
   (statusline.md, read 2026-11-12) and nothing from the transcript

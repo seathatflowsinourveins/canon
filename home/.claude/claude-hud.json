@@ -1,7 +1,7 @@
 {
   "lineLayout": "expanded",
   "pathLevels": 1,
-  "elementOrder": ["project", "context", "usage", "promptCache", "cacheHitRate"],
+  "elementOrder": ["project", "context", "usage", "promptCache", "cacheHitRate", "agents", "todos", "tools", "skills", "mcp"],
   "gitStatus": {
     "enabled": true,
     "showDirty": true,
@@ -45,12 +45,12 @@
     "usagePace": false,
     "externalUsagePath": "",
     "externalUsageWritePath": "",
-    "showTools": false,
-    "showSkills": false,
-    "showMcp": false,
-    "showAgents": false,
-    "showAgentEffort": false,
-    "showTodos": false,
+    "showTools": true,
+    "showSkills": true,
+    "showMcp": true,
+    "showAgents": true,
+    "showAgentEffort": true,
+    "showTodos": true,
     "showSessionName": false,
     "showSessionTokens": false,
     "showConfigCounts": false,
@@ -63,9 +63,9 @@
     "showOutputStyle": false,
     "showSessionStartDate": false,
     "showLastResponseAt": false,
-    "showCompactions": false,
+    "showCompactions": true,
     "showAdvisor": false,
     "customLine": "",
-    "mergeGroups": [["context", "usage"], ["promptCache", "cacheHitRate"]]
+    "mergeGroups": [["context", "usage"], ["promptCache", "cacheHitRate"], ["skills", "mcp"]]
   }
 }

@@ -972,7 +972,10 @@ keep_copy() {
 # keys (CANON_KEYS) it lacks, and loses a RETIRED value it still holds; when that leaves it the same JSON as
 # the rendered canon settings, it takes the rendered file's bytes, so the copy step after finds it unchanged.
 # A value the owner set otherwise, and an otel setting of Codex's that is not canon's, are left alone and
-# named, as the owner's choice. Codex's config is written only when its folder exists (Codex installed).
+# named, as the owner's choice. The template's statusLine.refreshInterval is added the same way, only to a status
+# line that runs canon's command, spelled as the template spells it, and sets no interval (ADR 0007); an interval
+# already there is the owner's and is neither changed nor named as a gap. Codex's config is written only when its folder
+# exists (Codex installed).
 # Returns 1 only when settings.json cannot be read as settings.
 install_telemetry() {
   local s="$CLAUDE_HOME/settings.json" plan differ tmp c="$CODEX_DIR/config.toml" rc=0
@@ -989,14 +992,18 @@ install_telemetry() {
       | [$ret[] | select(. as $r | $in | getpath($r.path) == $r.value)] as $gone
       | (reduce $gone[] as $r ($in; delpaths([$r.path]))) as $kept
       | [$mk[] | select($kept[.] == null and $t[.] != null)] as $top
+      | ($t.statusLine.refreshInterval? // null) as $ri
+      | (if $ri != null and ($kept.statusLine | type) == "object" and $kept.statusLine.command == $t.statusLine.command
+            and ($kept.statusLine | has("refreshInterval") | not) then ["statusLine.refreshInterval"] else [] end) as $sl
       | (($kept | if ($env | length) > 0 then .env = ((.env // {}) + $env) else . end)
-         | reduce $top[] as $k (.; .[$k] = $t[$k])) as $doc
-      | {doc: $doc, env: ($env | keys), top: $top, gone: [$gone[] | .path | join(".")],
+         | reduce $top[] as $k (.; .[$k] = $t[$k])
+         | if ($sl | length) > 0 then .statusLine.refreshInterval = $ri else . end) as $doc
+      | {doc: $doc, env: ($env | keys), top: $top, sl: $sl, gone: [$gone[] | .path | join(".")],
          kept: [($t.env // {} | telemetry | to_entries[] | select(($in.env // {})[.key] != null and $in.env[.key] != .value) | .key)],
          kept_top: [$mk[] | select($kept[.] != null and $t[.] != null and $kept[.] != $t[.])]}' "$s") \
       || die "could not read $s"
     differ=$(jq -r '.kept | join(" ")' <<<"$plan")
-    if [ "$(jq '(.env + .top + .gone) | length' <<<"$plan")" != 0 ]; then
+    if [ "$(jq '(.env + .top + .sl + .gone) | length' <<<"$plan")" != 0 ]; then
       tmp=$(mktemp)
       jq '.doc' <<<"$plan" > "$tmp" || { rm -f "$tmp"; die "could not merge the settings into $s"; }
       [ "$(jq -S . "$tmp")" != "$(jq -S . "$1")" ] || cat "$1" > "$tmp"
@@ -1005,6 +1012,7 @@ install_telemetry() {
       rm -f "$tmp"
       [ "$(jq '.env | length' <<<"$plan")" = 0 ] || note "  added      $(jq -r '.env | join(", ")' <<<"$plan") to the env of $s"
       [ "$(jq '.top | length' <<<"$plan")" = 0 ] || note "  added      $(jq -r '.top | join(", ")' <<<"$plan") to $s (ADR 0059, ADR 0065)"
+      [ "$(jq '.sl | length' <<<"$plan")" = 0 ] || note "  added      statusLine.refreshInterval to $s (ADR 0007)"
       [ "$(jq '.gone | length' <<<"$plan")" = 0 ] || note "  retired    $(jq -r '.gone | join(", ")' <<<"$plan") in $s, values an earlier canon template set (ADR 0059, ADR 0065); a key retired here is then added from the template"
     else
       note "  unchanged  telemetry and model settings in $s"
@@ -1127,10 +1135,22 @@ settings_gaps() {
     def contains_all($x): all(to_entries[]; .key as $k | $x[$k] == .value);   # every field the template gives
     if type != "object" then error("not a JSON object") else . end
     | . as $l | $w[0] as $t
-    | gaps($t | del(.hooks); $l | del(.hooks); []),
+    | gaps($t | del(.hooks) | if ($l.statusLine.refreshInterval? | type) == "number" then del(.statusLine.refreshInterval) else . end;
+           $l | del(.hooks); []),
       ($t.hooks // {} | to_entries[] | .key as $ev | .value[] | (.matcher // "") as $m | .hooks[]? as $h
        | select(any(($l.hooks[$ev] // [])[]?; (.matcher // "") == $m and any(.hooks[]?; . as $x | $h | contains_all($x))) | not)
        | "hook \($ev)\(if $m != "" then " (matcher \($m))" else "" end) \($h.command)")' "$2"
+}
+
+# canon_wrote <repository path> <file>: whether the file is byte for byte a version of that path committed on
+# this checkout's history, so a file the owner edited is never replaced
+canon_wrote() {
+  local live c
+  live=$(git -C "$ROOT" hash-object "$2" 2>/dev/null) || return 1
+  while IFS= read -r c; do
+    [ "$(git -C "$ROOT" rev-parse "${c}:$1" 2>/dev/null)" = "$live" ] && return 0
+  done < <(git -C "$ROOT" rev-list HEAD -- "$1" 2>/dev/null)
+  return 1
 }
 
 install_user_config() {
@@ -1165,6 +1185,9 @@ install_user_config() {
       if [ -e "$CLAUDE_HOME/$f.canon-proposed" ]; then
         rm -f "${CLAUDE_HOME:?}/$f.canon-proposed"; note "  removed    $f.canon-proposed, an earlier run's copy, since nothing is left to merge"
       fi
+    elif [ "$f" = claude-hud.json ] && canon_wrote "home/.claude/$f" "$CLAUDE_HOME/$f"; then
+      keep_copy "$CLAUDE_HOME/$f"
+      cp "$from" "$CLAUDE_HOME/$f"; note "  updated    $CLAUDE_HOME/$f, a version canon wrote and nobody edited (ADR 0007)"
     elif [ "$f" = settings.json ]; then
       cp "$from" "$CLAUDE_HOME/$f.canon-proposed"; pending=1
       [ -n "$gaps" ] || gaps="not a readable JSON object"
