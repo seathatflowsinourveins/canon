@@ -67,20 +67,27 @@ and nothing on the order path needs the holdout tonight; the walk-forward traini
 run meanwhile. It opens for every arm whose inputs cover the training dates at that moment: the fifteen; the
 bar-derived rows, once `history_load` keeps `vwap` and `trade_count`; `L_H-S` and `L_H-N`, if the prints
 loader has landed; and the opening-range arms `orb5-rank-all` and `orb5-rank-bullish`, if their registration
-has landed. The recorder-sum arms and the arms that list through `C0` or `C15` cannot cover sessions before
-2026-11-11, so they are never ready at the opening. An arm whose data does not exist when the holdout opens,
-or that is registered after it opens, is judged later, on a holdout drawn only from sessions recorded after
-2026-11-11, with its dates fixed before they are read. The walk-forward training folds may run once the
-population is loaded; only the holdout waits. At the opening, ADR 0092's method, costs, fill model and
-DIAGNOSTIC claim apply unchanged. Ties break in this order: the fifteen, `BV1`, `BD1`, `BV3`, `BD3`, `BV5`,
-`BD5`, `BEV1`, `BED1`, `BEV3`, `BED3`, `BEV5`, `BED5`, then the two opening-range arms, then `L1-S`, `L1-N`,
-`L3-S`, `L3-N`, `L5-S`, `L5-N`. A fold with any ready arm's training input missing reports **no selection;
-input-incomplete**, names the input, and never falls back to a subset.
+has landed. ADR 0100's `F-all` and seven bar factor arms join it too if that record is on `main` before it
+opens, as registered arms whose replay may follow the opening on the same dates, with nothing about them
+changed after any result is read, reported outside this record's selection and tie order (the lead,
+2026-11-11); otherwise they take ADR 0100's own later holdout. ADR 0100's `rdb5` and `vwap` arms take that
+later holdout in either case. The recorder-sum arms and the arms that list through `C0` or `C15` cannot cover
+sessions before 2026-11-11, so they are never ready at the opening. An arm whose data does not exist when the
+holdout opens, or that is registered after it opens, is judged later, on a holdout drawn only from sessions
+recorded after 2026-11-11, with its dates fixed before they are read. The walk-forward training folds may run
+once the population is loaded; only the holdout waits. At the opening, for every arm in this record's
+selection, ADR 0092's method, costs, fill model and DIAGNOSTIC claim apply unchanged; ADR 0100's arms take
+that record's. Ties break in this order: the fifteen, `BV1`, `BD1`, `BV3`, `BD3`, `BV5`, `BD5`, `BEV1`,
+`BED1`, `BEV3`, `BED3`, `BEV5`, `BED5`, then the two opening-range arms, then `L1-S`, `L1-N`, `L3-S`, `L3-N`,
+`L5-S`, `L5-N`. A fold with any ready arm's training input missing reports **no selection; input-incomplete**,
+names the input, and never falls back to a subset.
 
-Two departures from ADR 0092, the lead's decision: its one holdout replays the winner among up to 35
-arms, not 15; and the later holdout is a second one, on sessions after 2026-11-11 rather than ADR 0092's
-population, where ADR 0092 refuses a second opening. The second is drawn for arms that could not be
-ready at the first and never reopens the first.
+Departures from ADR 0092, the lead's decisions: its one holdout replays the winner among up to 35 arms, not
+15; and the later holdout is a second one, on sessions after 2026-11-11 rather than ADR 0092's population,
+where ADR 0092 refuses a second opening. The second is drawn for arms that could not be ready at the first and
+never reopens the first. A third, the lead's decision of the same evening: ADR 0100's arms may be replayed on
+the first holdout's dates after its other results are read, outside the selection, with nothing about them
+changed.
 
 **Arms.** Every listing also requires the unchanged daily test: `C(T) / reference_close - 1 >= 3%`,
 where `C(T)` is the close of the latest completed bar since 04:00 at or before `T`, carried through
