@@ -288,10 +288,9 @@ EOF
 
 # The session window agent runs ~/.claude/canon/paper-session.sh, which brings its own clone to the main the
 # origin has at that firing, or fails the firing, and runs `mise run paper:session --session auto --mover
-# --regular-strategy Mover` there, a window of the mover strategy on the day's top mover in the regular
-# session; in pre-market and after-hours the bridge, SessionMaCross in its limit form on the day's mover;
-# and nothing overnight, where the bridge has no form (ADR 0083, ADR 0091; the strategy is named for each
-# part of the day, and a part that names none runs the window's default):
+# --regular-strategy Mover` there, Mover on the day's top mover in the regular part and every extended
+# part, overnight included; a part's explicit bridge_reason runs the named SessionMaCross limit bridge
+# instead (ADR 0083, ADR 0091). --regular-strategy names the regular part; --mover selects the others:
 # the task reads the paper pair from the login keychain, takes the paper lock and runs one window, or prints
 # "nothing to run" when Alpaca's clock says no session is open (weekends and holidays included). Not run at
 # load. No checkout a person uses is read or written (ADR 0050). CANON_PAPER_SCHEDULED=1 (launchd.plist(5),

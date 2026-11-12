@@ -17,6 +17,7 @@ import time
 import tomllib
 from dataclasses import dataclass
 from dataclasses import field
+from dataclasses import replace
 from datetime import UTC
 from datetime import date
 from datetime import datetime
@@ -33,6 +34,7 @@ from uuid import uuid4
 import pytest
 import requests
 from alpaca.common.exceptions import APIError
+from alpaca.data.enums import DataFeed
 from alpaca.trading.client import TradingClient
 from alpaca.trading.models import AccountConfiguration
 from alpaca.trading.models import Calendar
@@ -86,6 +88,7 @@ from canon_trading.session_ma_cross import through_the_touch
 from canon_trading.session_window import NEW_YORK
 from canon_trading.session_window import WindowConfig
 from canon_trading.session_window import session_part
+from canon_trading.session_window import window_stream as REAL_WINDOW_STREAM
 
 
 def insufficient() -> APIError:
@@ -1661,6 +1664,8 @@ def quiet_window(
         )
     except RuntimeError as e:
         outcome = e
+        if not (tmp_path / "latest.json").exists():
+            raise
     return outcome, json.loads((tmp_path / "latest.json").read_text()), seen
 
 
@@ -5600,7 +5605,7 @@ def priced(monkeypatch):
     )
     monkeypatch.setattr(session_window, "window_actions", lambda: Actions(), raising=False)
 
-    def no_stream():
+    def no_stream(*, feed: str = DataFeed.SIP.value):
         raise session_window.StreamSampleFailed("no stream in tests")
 
     monkeypatch.setattr(session_window, "window_stream", no_stream, raising=False)
@@ -5776,13 +5781,9 @@ def test_a_mover_window_runs_the_pick_on_sip_and_records_the_selection(
     assert seen["config"].symbol == "LLL" and seen["feed"] == "sip"
 
 
-def test_a_mover_window_outside_the_regular_session_is_the_bridge_in_its_limit_form() -> None:
-    """Outside the regular session a mover window is the bridge, `SessionMaCross` with every order its
-    marked limit; the mover strategy itself stays the regular session's (`WINDOW_STRATEGIES`)."""
-    bridge = WindowConfig(mover=True, session="extended")
-    assert (bridge.strategy, bridge.limits) == (session_window.DEFAULT_STRATEGY, True)
-    with pytest.raises(ValueError, match="Mover runs in regular windows only"):
-        WindowConfig(mover=True, session="extended", strategy="Mover")
+def test_mover_is_allowed_outside_the_regular_session_in_its_limit_form() -> None:
+    config = WindowConfig(mover=True, session="extended", strategy="Mover")
+    assert config.strategy == "Mover" and config.limits
 
 
 class Evening(Assets):
@@ -5799,19 +5800,37 @@ class Evening(Assets):
     def get_calendar(self, filters=None) -> list[Calendar]:
         return [PRIOR_DAY, CALENDAR, day("2026-11-11")]
 
+    def get(self, path):
+        assert path.startswith("/assets/")
+        return {"symbol": path.removeprefix("/assets/"), "attributes": ["overnight_tradable"]}
+
 
 def a_pick() -> session_window.MoverPick:
-    record = {"source": "stream", "symbol": "LLL", "passed_over": {}}
+    record = {
+        "source": "stream",
+        "symbol": "LLL",
+        "passed_over": {},
+        "at": "2026-11-10T00:00:00+00:00",
+        "inputs": {"move": 2},
+    }
     return session_window.MoverPick("LLL", Decimal("1.5"), record, Decimal("1.51"))
 
 
-@pytest.mark.parametrize(("hour", "part"), [(5, "pre-market"), (17, "after-hours")])
-def test_a_mover_window_runs_the_bridge_on_the_pick_before_and_after_the_regular_session(
-    monkeypatch, tmp_path, hour, part
+@pytest.mark.parametrize(
+    ("hour", "part", "feed"),
+    [
+        (5, "pre-market", "sip"),
+        (17, "after-hours", "sip"),
+        (2, "overnight", "boats"),
+        (21, "overnight", "boats"),
+    ],
+)
+def test_a_mover_window_runs_mover_on_the_pick_in_every_extended_part(
+    monkeypatch, tmp_path, hour, part, feed
 ) -> None:
-    """In pre-market and after-hours, both on sip, the feed the choice reads, a mover window chooses its
-    name as in the session and runs `SessionMaCross` on it in the extended session's limit form."""
+    """The same selected name reaches Mover with the session part's feed and its window bounds."""
     monkeypatch.setattr(session_window, "choose_mover", lambda *a, **k: a_pick())
+    monkeypatch.setattr(session_window, "window_data", lambda: Quoted())
     _, latest, seen = quiet_window(
         monkeypatch,
         tmp_path,
@@ -5822,28 +5841,42 @@ def test_a_mover_window_runs_the_bridge_on_the_pick_before_and_after_the_regular
         mover=True,
     )
     assert (latest["result"], latest["part"], latest["symbol"]) == ("ok", part, "LLL")
-    assert latest["feed"] == "sip" and latest["mover"]["source"] == "stream"
+    assert latest["feed"] == feed and latest["mover"]["source"] == "stream"
     config = seen["config"]
-    assert (config.symbol, config.session, config.strategy) == ("LLL", "extended", "SessionMaCross")
-    assert config.limits and seen["feed"] == "sip"
+    assert (config.symbol, config.session, config.strategy) == ("LLL", "extended", "Mover")
+    assert latest["strategy"] == "Mover" and seen["part"] == part
+    assert config.limits and seen["feed"] == feed
 
 
-@pytest.mark.parametrize("hour", [2, 21])
-def test_a_mover_window_is_refused_by_name_in_the_overnight_session(
-    monkeypatch, tmp_path, hour
+@pytest.mark.parametrize(
+    ("hour", "part"), [(5, "pre-market"), (17, "after-hours"), (21, "overnight")]
+)
+def test_a_part_without_a_mover_form_runs_the_bridge_and_records_why(
+    monkeypatch, tmp_path, hour, part
 ) -> None:
-    """The bridge has no overnight form: its choice reads sip, and the overnight session's feed is
-    boats. Refused by name before anything is chosen or built."""
-    monkeypatch.setattr(
-        session_window, "choose_mover", lambda *a, **k: pytest.fail("a mover was chosen")
+    monkeypatch.setitem(
+        session_window.MOVER_PARTS,
+        part,
+        replace(session_window.MOVER_PARTS[part], bridge_reason="Mover's order path unavailable"),
     )
-    monkeypatch.setattr(session_window, "window_node", lambda *a, **k: pytest.fail("a node"))
-    with pytest.raises(session_window.WindowRefused, match="no overnight form") as refused:
-        session_window.run_window(
-            WindowConfig(log_dir=tmp_path, session="extended", mover=True),
-            trading=cast(TradingClient, Evening(hour)),
-        )
-    assert "boats" in str(refused.value) and "sip" in str(refused.value)
+    monkeypatch.setattr(session_window, "choose_mover", lambda *a, **k: a_pick())
+    _, latest, seen = quiet_window(
+        monkeypatch,
+        tmp_path,
+        quotes=5,
+        trades=5,
+        account=Evening(hour),
+        session="extended",
+        mover=True,
+        strategy="Mover",
+    )
+    assert latest["result"] == "ok" and latest["strategy"] == "SessionMaCross"
+    assert seen["config"].strategy == "SessionMaCross" and seen["config"].limits
+    assert latest["mover"]["fallback"] == {
+        "part": part,
+        "strategy": "SessionMaCross",
+        "reason": "Mover's order path unavailable",
+    }
 
 
 def no_feed_outside_the_regular_session(monkeypatch) -> None:
@@ -5856,7 +5889,7 @@ def no_feed_outside_the_regular_session(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize(
-    ("hour", "expected"), [(5, "extended"), (17, "extended"), (2, None), (21, None)]
+    ("hour", "expected"), [(5, "extended"), (17, "extended"), (2, "extended"), (21, "extended")]
 )
 def test_auto_decides_a_mover_window_by_the_parts_its_own_feed_carries(
     monkeypatch, hour, expected
@@ -5873,7 +5906,7 @@ def test_auto_decides_a_mover_window_by_the_parts_its_own_feed_carries(
     assert found == expected
     if expected is None:
         assert "no overnight form" in why and "boats" in why
-    else:  # the same part with no feed for its other windows: one of them has nothing to run
+    elif hour in (5, 17):  # only these other windows had their feeds switched off above
         assert (
             session_window.resolve_session(evening.get_clock(), evening.get_calendar())[0] is None
         )
@@ -5886,6 +5919,7 @@ def test_a_mover_window_streams_its_own_feed_where_the_parts_other_windows_have_
     bridge, which streams `MOVER_FEED` there."""
     no_feed_outside_the_regular_session(monkeypatch)
     monkeypatch.setattr(session_window, "choose_mover", lambda *a, **k: a_pick())
+    monkeypatch.setattr(session_window, "window_data", lambda: Quoted())
     _, latest, seen = quiet_window(
         monkeypatch,
         tmp_path,
@@ -5913,19 +5947,16 @@ def test_the_mover_flag_and_a_symbol_are_not_both_taken(capsys) -> None:
 @pytest.mark.parametrize(
     ("hour", "ran", "said"),
     [
-        (5, [("SessionMaCross", "extended", True)], ""),  # pre-market
-        (17, [("SessionMaCross", "extended", True)], ""),  # after-hours
-        (2, [], "no overnight form"),
-        (21, [], "no overnight form"),
+        (5, [("Mover", "extended", True)], ""),
+        (17, [("Mover", "extended", True)], ""),
+        (2, [("Mover", "extended", True)], ""),
+        (21, [("Mover", "extended", True)], ""),
     ],
 )
-def test_auto_runs_the_bridge_outside_the_regular_session_and_nothing_overnight(
+def test_auto_runs_mover_in_every_extended_part(
     monkeypatch, tmp_path, capsys, hour, ran, said
 ) -> None:
-    """The schedule fires `--session auto --mover --regular-strategy Mover` (`scripts/automation`). In
-    pre-market and after-hours that firing runs the bridge, `SessionMaCross` in its limit form on the
-    day's mover; overnight, where the bridge cannot run, it has nothing to run and says why, rather than
-    a refusal every night."""
+    """The existing schedule's --mover flag runs the strategy in each extended part too."""
     seen = []
 
     def window(config, **_kwargs):
@@ -5956,7 +5987,7 @@ def test_the_schedule_fires_the_mover_path() -> None:
     ("named", "hour", "is_open", "mover", "ran"),
     [
         ("Mover", 11, True, True, [("Mover", "regular", True)]),
-        ("Mover", 17, False, True, [("SessionMaCross", "extended", True)]),  # the bridge
+        ("Mover", 17, False, True, [("Mover", "extended", True)]),
         ("EmaCross", 17, False, False, [(session_window.DEFAULT_STRATEGY, "extended", False)]),
     ],
 )
@@ -6135,7 +6166,7 @@ def test_choose_mover_falls_back_to_the_screener_and_says_why(monkeypatch) -> No
     def refused(*a, **k):
         raise session_window.WindowRefused("the stream sample ranked no name")
 
-    monkeypatch.setattr(session_window, "window_stream", lambda: SampleStream())
+    monkeypatch.setattr(session_window, "window_stream", lambda **_kwargs: SampleStream())
     monkeypatch.setattr(session_window, "stream_mover", refused)
     monkeypatch.setattr(session_window, "window_screener", lambda: Screener())
     opens = datetime(2026, 11, 10, 9, 30, tzinfo=NEW_YORK)
@@ -6373,8 +6404,7 @@ def mover_pick(price: str = "1.5") -> session_window.MoverPick:
 def test_mover_runs_only_on_the_name_the_ranking_gives() -> None:
     with pytest.raises(ValueError, match="run it with --mover"):
         WindowConfig(strategy="Mover")
-    with pytest.raises(ValueError, match="regular"):
-        WindowConfig(strategy="Mover", mover=True, session="extended")
+    assert WindowConfig(strategy="Mover", mover=True, session="extended").strategy == "Mover"
     assert WindowConfig(strategy="Mover", mover=True).strategy == "Mover"
 
 
@@ -6446,6 +6476,14 @@ class Quoted(Data):
 
     ask = 1.6
 
+    def get_stock_snapshot(self, request_params) -> dict:
+        snapshots = super().get_stock_snapshot(request_params)
+        for symbol, snapshot in snapshots.items():
+            name = self.names[symbol]
+            ask = name.ask if name.ask is not None else name.price + 0.01
+            snapshot.latest_quote = SimpleNamespace(ask_price=ask, bid_price=name.price)
+        return snapshots
+
     def get_stock_latest_quote(self, request_params) -> dict:
         self.requests.append(request_params)
         symbol = request_params.symbol_or_symbols
@@ -6479,3 +6517,303 @@ def test_a_mover_strategy_window_hands_the_node_its_choice_and_its_end(
             WindowConfig(log_dir=tmp_path, strategy="Mover", mover=True),
             trading=cast(TradingClient, Assets()),
         )
+
+
+def test_overnight_ranking_reads_boats_normals_and_trades_but_sip_reference_closes() -> None:
+    from alpaca.data.requests import StockBarsRequest
+    from alpaca.data.requests import StockSnapshotRequest
+
+    stream, data = SampleStream(), Data()
+    pick = session_window.stream_mover(
+        cast(TradingClient, Assets()),
+        cast(Any, stream),
+        cast(Any, data),
+        cast(Any, Screener()),
+        cast(Any, Actions()),
+        date(2026, 11, 9),
+        minutes=1,
+        clock=lambda: AT.timestamp() + 30,
+        sleep=stream.wait,
+        feed="boats",
+    )
+    assert pick.symbol == "LLL" and pick.record["feed"] == "boats"
+    snapshots = [r for r in data.requests if isinstance(r, StockSnapshotRequest)]
+    normals = [r for r in data.requests if isinstance(r, StockBarsRequest)]
+    assert [r.feed.value for r in snapshots] == ["sip", "boats"]
+    assert normals and all(r.feed.value == "boats" for r in normals)
+
+
+@pytest.mark.parametrize("feed", ["sip", "boats"])
+def test_the_entry_share_bound_reads_the_parts_quote_feed(feed) -> None:
+    data = Quoted()
+    assert session_window.mover_entry_limit(cast(Any, data), "LLL", feed=feed) == Decimal("1.6000")
+    assert data.requests[-1].feed.value == feed
+
+
+def test_the_choice_passes_its_feed_to_the_stream_factory_and_ranking(monkeypatch) -> None:
+    seen = {}
+
+    def stream(**kwargs):
+        seen["stream"] = kwargs
+        return SimpleNamespace()
+
+    def ranking(*args, **kwargs):
+        seen["ranking"] = kwargs
+        return a_pick()
+
+    monkeypatch.setattr(session_window, "window_stream", stream)
+    monkeypatch.setattr(session_window, "stream_mover", ranking)
+    monkeypatch.setattr(session_window, "window_screener", lambda: Screener())
+    pick = session_window.choose_mover(
+        cast(TradingClient, Assets()),
+        AT,
+        AT,
+        TODAY,
+        regular_close=CLOSES,
+        feed="boats",
+    )
+    assert pick.symbol == "LLL"
+    assert seen["stream"] == {"feed": "boats"} and seen["ranking"]["feed"] == "boats"
+
+
+def test_sunday_overnight_uses_mondays_trade_date_and_fridays_last_session(
+    monkeypatch, tmp_path
+) -> None:
+    class Sunday(Evening):
+        def get_clock(self) -> Clock:
+            return clock(datetime(2026, 11, 8, 21, tzinfo=NEW_YORK), is_open=False)
+
+        def get_calendar(self, filters=None) -> list[Calendar]:
+            return [day("2026-11-06"), day("2026-11-09")]
+
+    seen_choice = {}
+
+    def choose(trading, at, regular_open, since, **kwargs):
+        seen_choice.update(regular_open=regular_open, since=since, **kwargs)
+        return a_pick()
+
+    monkeypatch.setattr(session_window, "choose_mover", choose)
+    monkeypatch.setattr(session_window, "window_data", lambda: Quoted())
+    _, latest, _ = quiet_window(
+        monkeypatch,
+        tmp_path,
+        quotes=5,
+        trades=5,
+        account=Sunday(21),
+        session="extended",
+        mover=True,
+    )
+    assert latest["result"] == "ok" and latest["part"] == "overnight"
+    assert seen_choice["regular_open"].date() == date(2026, 11, 9)
+    assert seen_choice["since"] == date(2026, 11, 6) and seen_choice["feed"] == "boats"
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [({}, DataFeed.SIP), ({"feed": DataFeed.BOATS.value}, DataFeed.BOATS)],
+)
+def test_the_window_stream_takes_its_feed_and_defaults_to_sip(
+    monkeypatch, kwargs, expected
+) -> None:
+    """`window_stream(feed=...)` reaches alpaca-py's `StockDataStream(..., feed=DataFeed(feed))`, sip
+    unless named; a stand-in stream records the call, so no socket opens."""
+    calls: list[tuple[tuple, dict]] = []
+
+    def stand_in(*args: object, **kw: object) -> object:
+        calls.append((args, kw))
+        return SimpleNamespace()
+
+    monkeypatch.setattr(session_window, "StockDataStream", stand_in)
+    monkeypatch.setenv(session_window.ENV_API_KEY, "stand-in-key")
+    monkeypatch.setenv(session_window.ENV_SECRET_KEY, "stand-in-secret")
+    REAL_WINDOW_STREAM(**kwargs)  # the autouse `priced` fixture stands `window_stream` in
+    assert calls == [(("stand-in-key", "stand-in-secret"), {"raw_data": True, "feed": expected})]
+
+
+def selected_window(monkeypatch, tmp_path, *, part, names, actions=None, attributes=None, at=None):
+    """Run the real choice and ranking, with decoded market data and the node's I/O stood in."""
+    at = at or datetime(
+        2026, 11, 10, {"pre-market": 5, "after-hours": 17, "overnight": 21}[part], tzinfo=NEW_YORK
+    )
+    monkeypatch.setattr(sys.modules[__name__], "AT", at)
+
+    class SelectionData(Data):
+        def get_stock_bars(self, request_params):
+            start = request_params.start.replace(tzinfo=UTC).astimezone(NEW_YORK)
+            if (
+                request_params.feed == DataFeed.BOATS
+                and start.hour >= 20
+                and start.weekday() in (4, 5)
+            ):
+                from alpaca.data.models.bars import BarSet
+
+                self.requests.append(request_params)
+                return BarSet({})
+            return super().get_stock_bars(request_params)
+
+        def get_stock_snapshot(self, request_params) -> dict:
+            snapshots = super().get_stock_snapshot(request_params)
+            previous = at.date() - timedelta(days=1)
+            while previous.weekday() >= 5:
+                previous -= timedelta(days=1)
+            for snapshot in snapshots.values():
+                snapshot.previous_daily_bar.timestamp = datetime.combine(
+                    previous, datetime.min.time(), NEW_YORK
+                )
+            return snapshots
+
+        def get_stock_latest_quote(self, request_params) -> dict:
+            self.requests.append(request_params)
+            symbol = request_params.symbol_or_symbols
+            return {symbol: SimpleNamespace(ask_price=names[symbol].ask, bid_price=1)}
+
+    class SelectionAccount(Evening):
+        def get_clock(self) -> Clock:
+            return clock(at, is_open=False)
+
+        def get_calendar(self, filters=None) -> list[Calendar]:
+            return [day(d) for d in ("2026-11-06", "2026-11-09", "2026-11-10", "2026-11-11")]
+
+        def get(self, path):
+            symbol = path.removeprefix("/assets/")
+            return {
+                "symbol": symbol,
+                "attributes": (attributes or {}).get(symbol, ["overnight_tradable"]),
+            }
+
+    data = SelectionData(names=names)
+    actions = actions or Actions()
+    monkeypatch.setattr(session_window, "window_data", lambda: data)
+    monkeypatch.setattr(session_window, "window_screener", lambda: Screener(names=names))
+    monkeypatch.setattr(session_window, "window_actions", lambda: actions)
+    monkeypatch.setattr(session_window, "window_stream", lambda **_kwargs: SimpleNamespace())
+    monkeypatch.setattr(
+        session_window,
+        "sample_stream",
+        lambda *a, **kw: (
+            {s: n.close for s, n in names.items()},
+            {s: n.close * n.volume for s, n in names.items()},
+            at,
+            1,
+            {"bars": len(names)},
+            0,
+        ),
+    )
+    result = quiet_window(
+        monkeypatch,
+        tmp_path,
+        quotes=5,
+        trades=5,
+        account=SelectionAccount(at.hour),
+        strategy="Mover",
+        session="extended",
+        mover=True,
+    )
+    return (*result, data, actions)
+
+
+@pytest.mark.parametrize("part", ["after-hours", "overnight", "pre-market"])
+@pytest.mark.parametrize("ask", [None, 0, 501])
+def test_mover_passes_over_a_candidate_without_an_affordable_ask(
+    monkeypatch, tmp_path, part, ask
+) -> None:
+    """Antigravity 2: a bad first choice must not discard the next usable mover."""
+    names = {
+        "FIRST": Name(1, 4, 1000, 4, ask=ask),
+        "NEXT": Name(1, 3, 100, 3, ask=3),
+    }
+    _, latest, _, _, _ = selected_window(monkeypatch, tmp_path, part=part, names=names)
+    assert latest["result"] == "ok" and latest["symbol"] == "NEXT"
+    assert "FIRST" in latest["mover"]["passed_over"]
+    assert latest["mover"]["bounds"]["cap_usd"] == "500"
+    assert latest["mover"]["entry_limit"] == "3.0000"
+
+
+def test_sunday_overnight_filters_actions_effective_on_mondays_trade_date(
+    monkeypatch, tmp_path
+) -> None:
+    """Antigravity 1: Sunday's overnight execution belongs to Monday's corporate-action date."""
+    from alpaca.data.models.corporate_actions import CorporateActionsSet
+
+    class MondayAction(Actions):
+        def get_corporate_actions(self, request_params):
+            self.requests.append(request_params)
+            if request_params.end < date(2026, 11, 9):
+                return CorporateActionsSet({})
+            return CorporateActionsSet(
+                {
+                    "reverse_splits": [
+                        {
+                            "id": "00000000-0000-0000-0000-000000000000",
+                            "symbol": "FIRST",
+                            "old_cusip": "000000000",
+                            "new_cusip": "000000001",
+                            "new_rate": 1,
+                            "old_rate": 10,
+                            "process_date": "2026-11-09",
+                            "ex_date": "2026-11-09",
+                        }
+                    ]
+                }
+            )
+
+    names = {"FIRST": Name(1, 4, 1000, 4, ask=4), "NEXT": Name(1, 3, 100, 3, ask=3)}
+    _, latest, _, _, actions = selected_window(
+        monkeypatch,
+        tmp_path,
+        part="overnight",
+        names=names,
+        actions=MondayAction(),
+        at=datetime(2026, 11, 8, 21, tzinfo=NEW_YORK),
+    )
+    assert actions.requests[0].end == date(2026, 11, 9)
+    assert latest["result"] == "ok" and latest["symbol"] == "NEXT"
+    assert "corporate action" in latest["mover"]["passed_over"]["FIRST"]
+
+
+@pytest.mark.parametrize("attributes", [[], ["overnight_tradable", "overnight_halted"]])
+def test_overnight_selection_passes_over_ineligible_candidates(
+    monkeypatch, tmp_path, attributes
+) -> None:
+    """Antigravity 4: retain the final eligibility recheck but try the next eligible candidate first."""
+    names = {"FIRST": Name(1, 4, 1000, 4, ask=4), "NEXT": Name(1, 3, 100, 3, ask=3)}
+    _, latest, _, _, _ = selected_window(
+        monkeypatch,
+        tmp_path,
+        part="overnight",
+        names=names,
+        attributes={"FIRST": attributes},
+    )
+    assert latest["result"] == "ok" and latest["symbol"] == "NEXT"
+    assert "overnight" in latest["mover"]["passed_over"]["FIRST"]
+
+
+@pytest.mark.parametrize(
+    ("part", "at", "days"),
+    [
+        ("overnight", datetime(2026, 11, 9, 21, tzinfo=NEW_YORK), (8, 5, 4, 3, 2)),
+        ("overnight", datetime(2026, 11, 10, 2, tzinfo=NEW_YORK), (9, 6, 5, 4, 3)),
+        ("after-hours", datetime(2026, 11, 10, 17, tzinfo=NEW_YORK), (9, 6, 5, 4, 3)),
+    ],
+)
+def test_overnight_normals_include_sunday_evenings_and_skip_closed_fridays(
+    monkeypatch, tmp_path, part, at, days
+) -> None:
+    """Antigravity 5: the weekday belongs to the trade date, not the preceding evening."""
+    from alpaca.data.requests import StockBarsRequest
+
+    names = {"FIRST": Name(1, 4, 1000, 4, ask=4)}
+    _, latest, _, data, _ = selected_window(
+        monkeypatch,
+        tmp_path,
+        part=part,
+        names=names,
+        at=at,
+    )
+    dates = [
+        r.start.replace(tzinfo=UTC).astimezone(NEW_YORK).date()
+        for r in data.requests
+        if isinstance(r, StockBarsRequest)
+    ]
+    assert latest["result"] == "ok"
+    assert dates == [date(2026, 11, d) for d in days]
