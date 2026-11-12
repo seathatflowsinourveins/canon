@@ -450,6 +450,15 @@
       "sha": "3dcc6fbbbebc5e85dd3e83fe49b382ca7735cae1",
       "track": "tag:v3.1.1"
     },
+    "plotly": {
+      "default_branch": "main",
+      "default_sha": "3c1aeba0a90ef6f7a32fd35a48338ef7ee349d93",
+      "ref": "refs/tags/v7.1.0",
+      "repo": "plotly/plotly.py",
+      "resolved_at": "2026-11-12T07:46:23Z",
+      "sha": "243bfd0fa5c0a5c29a185e4034a1ab5b111695a5",
+      "track": "tag:v7.1.0"
+    },
     "pnpm": {
       "default_branch": "main",
       "default_sha": "3ec9a44cda892f46bcab1ebd52ab12293d1cdbc6",
