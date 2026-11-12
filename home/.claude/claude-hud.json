@@ -1,7 +1,7 @@
 {
   "lineLayout": "expanded",
   "pathLevels": 1,
-  "elementOrder": ["project", "context", "usage"],
+  "elementOrder": ["project", "context", "usage", "promptCache", "cacheHitRate"],
   "gitStatus": {
     "enabled": true,
     "showDirty": true,
@@ -58,13 +58,14 @@
     "showAuthUser": false,
     "showClaudeCodeVersion": true,
     "showMemoryUsage": false,
-    "showPromptCache": false,
-    "showCacheHitRate": false,
+    "showPromptCache": true,
+    "showCacheHitRate": true,
     "showOutputStyle": false,
     "showSessionStartDate": false,
     "showLastResponseAt": false,
     "showCompactions": false,
     "showAdvisor": false,
-    "customLine": ""
+    "customLine": "",
+    "mergeGroups": [["context", "usage"], ["promptCache", "cacheHitRate"]]
   }
 }

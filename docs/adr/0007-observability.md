@@ -294,8 +294,15 @@ sets the HUD's options at v0.15.0 (`src/config.ts`, `src/schema.ts`). The choice
 * **Off, for undocumented sources.** Tools, skills, MCP, agents, todos, advisor, compactions, session start,
   last response and agent effort all come from the session transcript, whose format the docs call internal.
   `modelSource` stays `stdin`.
+* **Shown since 2026-11-12: the prompt cache.** One line, `Cache ⏱ until 11:25 │ Cache hit 97.3%`: the clock
+  time the cache goes cold and the session's hit rate, from the input's documented `prompt_cache` object
+  (`warm`, `expires_at`, `hit_ratio`; statusline.md, read 2026-11-12) and nothing from the transcript
+  (`src/render/lines.ts` at v0.15.0). The status line refreshes when a warm cache reaches `expires_at`.
+  The cache's TTL decides what a returning session pays to re-cache its context, and idle compaction
+  runs just before a one-hour cache expires (settings-reference.md, `idleCompaction`), so the time is
+  when an idle lane's next message gets dearer or its context gets summarised.
 * **Off, for cost or space.** Memory (it runs `vm_stat`), daily and weekly cost, speed, the token breakdown,
-  config counts, prompt cache and hit rate, output style, the custom line and jj.
+  config counts, output style, the custom line and jj.
 
 Checked on 2026-11-11 at 60 and 100 columns, through `statusline.sh` with the pinned HUD placed in a
 temporary config folder's plugin cache: five lines at 60, three at 100, about 0.2 s a render, no hyperlink
