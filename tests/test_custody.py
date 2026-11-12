@@ -319,7 +319,11 @@ def _run_task(tmp_path: Path, account: str) -> tuple[subprocess.CompletedProcess
 @pytest.mark.skipif(not Path("/usr/bin/timeout").exists(), reason="no /usr/bin/timeout here")
 @pytest.mark.parametrize(
     ("account", "service"),
-    [("tests", "canon-alpaca-paper"), ("windows", "canon-alpaca-paper-windows")],
+    [
+        ("tests", "canon-alpaca-paper"),
+        ("windows", "canon-alpaca-paper-windows"),
+        ("protect", "canon-alpaca-paper-protect"),
+    ],
 )
 def test_the_task_reads_one_named_accounts_pair_in_data_only_mode_and_prints_neither_value(
     tmp_path, account, service
@@ -348,10 +352,10 @@ def test_the_task_refuses_any_other_account_before_asking_the_keychain(tmp_path)
     assert "no paper account named 'live'" in done.stderr
 
 
-def test_the_task_takes_no_lock_and_names_its_two_accounts() -> None:
+def test_the_task_takes_no_lock_and_names_its_three_accounts() -> None:
     """GET only, so no lock (the task's note); mise's own `choices` refuses any other account."""
     task = tomllib.loads((ROOT / "mise.toml").read_text())["tasks"]["paper:account"]
-    assert 'choices "tests" "windows"' in task["usage"]
+    assert 'choices "tests" "windows" "protect"\n' in task["usage"]
     assert "lockf" not in task["run"]
     assert not re.search(r"\b(echo|printf)\b[^\n]*\$ALPACA_", task["run"])
 

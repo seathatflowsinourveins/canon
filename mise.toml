@@ -33,7 +33,10 @@ actionlint = "1.7.12"   # canon/upstreams.json: actionlint
 # `exec()` (https://mise.jdx.dev/tasks/task-configuration.html#env, https://mise.jdx.dev/templates.html).
 # Task scripts are Tera templates too, so they must not contain "{{", "{%" or "{#".
 # Two paper accounts (docs/adr/0069-two-paper-accounts.md): `tests`, account A, the service above, and
-# `windows`, account B, service "canon-alpaca-paper-windows", the same two item names. paper:store, paper:check
+# `windows`, account B, service "canon-alpaca-paper-windows", the same two item names. A third on ADR 0069's
+# pattern (the owner's requirement, 2026-11-12): `protect`, account C, service "canon-alpaca-paper-protect",
+# which paper:store, paper:check, paper:remove and paper:account take; no task trades on it yet.
+# paper:store, paper:check
 # and paper:remove take the account as an argument, `tests` when none is given; mise refuses any other name
 # before the script starts (the `usage` spec's `choices`, https://mise.jdx.dev/tasks/task-arguments.html,
 # tried with mise 2026.11.5), and each script's `case` refuses it again. paper:test reads account A's pair and
@@ -51,17 +54,18 @@ description = "Enter an Alpaca paper account's key pair at a hidden prompt; stor
 interactive = true
 shell = "bash -c"
 usage = '''
-arg "[account]" help="tests: account A, the default, which paper:test reads; windows: account B, which paper:session reads (ADR 0069)" default="tests" {
-  choices "tests" "windows"
+arg "[account]" help="tests: account A, the default, which paper:test reads; windows: account B, which paper:session reads; protect: account C (ADR 0069's pattern)" default="tests" {
+  choices "tests" "windows" "protect"
 }
 '''
 run = '''
 set -euo pipefail
-# the account (ADR 0069): its service, the other account's, its items' label, and the argument that names it
+# the account (ADR 0069's pattern): its service, the two others', its items' label, and the argument that names it
 case "${usage_account:-tests}" in
-  tests) svc=canon-alpaca-paper; other=canon-alpaca-paper-windows; label=Alpaca-paper; arg="" ;;
-  windows) svc=canon-alpaca-paper-windows; other=canon-alpaca-paper; label=Alpaca-paper-windows; arg=" windows" ;;
-  *) echo "paper:store: no paper account named ${usage_account}; the names are tests and windows. Nothing stored." >&2; exit 1 ;;
+  tests) svc=canon-alpaca-paper; others="canon-alpaca-paper-windows canon-alpaca-paper-protect"; label=Alpaca-paper; arg="" ;;
+  windows) svc=canon-alpaca-paper-windows; others="canon-alpaca-paper canon-alpaca-paper-protect"; label=Alpaca-paper-windows; arg=" windows" ;;
+  protect) svc=canon-alpaca-paper-protect; others="canon-alpaca-paper canon-alpaca-paper-windows"; label=Alpaca-paper-protect; arg=" protect" ;;
+  *) echo "paper:store: no paper account named ${usage_account}; the names are tests, windows and protect. Nothing stored." >&2; exit 1 ;;
 esac
 [ -t 0 ] || { echo "paper:store: needs a terminal to ask for the pair; run it in your own terminal" >&2; exit 1; }
 # Exit statuses: 0 found, 44 absent (errSecItemNotFound, observed; ADR 0029). security documents none, and
@@ -76,15 +80,21 @@ for a in ALPACA_API_KEY ALPACA_SECRET_KEY; do
     *) echo "paper:store: could not check whether $a is in the login keychain (security exit $rc); nothing stored" >&2; exit 1 ;;
   esac
 done
-# The two accounts never hold one pair (ADR 0069): the other account's stored key ID, compared below with the
-# one entered. It is read here, before either prompt, so a failure stops the task before anything is typed,
+# No two accounts hold one pair (ADR 0069): each other account's stored key ID, compared below with the
+# one entered. They are read here, before either prompt, so a failure stops the task before anything is typed,
 # and under timeout(1) for 30 s, as paper:test's reads are, so a read waiting at a dialog does not hold it
-# (exit 124). security writes it to a pipe into this shell; its secret is never read. 44: none stored there.
-orc=0; okey=$(/usr/bin/timeout 30 /usr/bin/security find-generic-password -s "$other" -a ALPACA_API_KEY -w 2>/dev/null) || orc=$?
-case "$orc" in
-  0|44) ;;
-  *) echo "paper:store: could not read the other paper account's key ID to compare (security exit $orc, 124 if no answer in 30 s); nothing stored" >&2; exit 1 ;;
-esac
+# (exit 124). security writes each to a pipe into this shell; no secret is read. 44: none stored there, kept
+# as an empty entry, which no key ID entered can equal (an empty one is refused before the comparison).
+okeys=()
+for other in $others; do
+  orc=0; okey=$(/usr/bin/timeout 30 /usr/bin/security find-generic-password -s "$other" -a ALPACA_API_KEY -w 2>/dev/null) || orc=$?
+  case "$orc" in
+    0) okeys+=("$okey") ;;
+    44) okeys+=("") ;;
+    *) okey=""; echo "paper:store: could not read the other paper account's key ID to compare (security exit $orc, 124 if no answer in 30 s) from service $other; nothing stored" >&2; exit 1 ;;
+  esac
+done
+okey=""
 # Echo off before either prompt shows: a silent read turns it off only after its prompt, so a value typed
 # or pasted at once could show (observed with bash 3.2; ADR 0033). It is back on however the task ends.
 trap 'stty echo' EXIT; trap 'exit 130' INT TERM HUP; stty -echo
@@ -95,16 +105,22 @@ if [ -z "$key" ] || [ -z "$secret" ]; then echo "paper:store: both values are ne
 # Alpaca: "Live keys with an AK... prefix, these prefixes are visual hints" (alpaca.markets/learn,
 # api-key-security-best-practices-for-alpaca-builders). A hint can refuse a key, never accept one.
 case "$key" in AK*) echo "paper:store: refused. The key ID starts with AK, which Alpaca uses for live keys. Nothing stored." >&2; exit 1 ;; esac
-# Two equal pairs have equal key IDs, so a key ID equal to the other account's stored one is refused, before
+# Two equal pairs have equal key IDs, so a key ID equal to one stored for another account is refused, before
 # the paper API is asked. bash's `[`, a builtin, compares them, so neither value is in a process's arguments.
-if [ "$orc" = 0 ] && [ "$okey" = "$key" ]; then
-  okey=""; echo "paper:store: refused. This key ID is the one stored for the other paper account (service $other); each account has its own pair. Nothing stored." >&2; exit 1
-fi
-okey=""
+i=0
+for other in $others; do
+  if [ -n "${okeys[$i]}" ] && [ "${okeys[$i]}" = "$key" ]; then
+    okeys=(); echo "paper:store: refused. This key ID is the one stored for the other paper account (service $other); each account has its own pair. Nothing stored." >&2; exit 1
+  fi
+  i=$((i + 1))
+done
+okeys=()
 # Alpaca: "you cannot use your live account's credentials with the paper API" (us/docs/authentication.md).
-# The headers go to curl on stdin (-H @-), so neither value is in a command line.
+# The headers go to curl on stdin (-H @-), so neither value is in a command line. -q first: curl reads no
+# curlrc ("unless -q, --disable is used", curl(1)). That is all -q does: a proxy named in the environment
+# and the curl first on PATH still apply (ADR 0114 records it as a limit).
 code=$(printf 'APCA-API-KEY-ID: %s\nAPCA-API-SECRET-KEY: %s\n' "$key" "$secret" \
-  | curl -sS -o /dev/null -w '%{http_code}' --max-time 20 -H @- https://paper-api.alpaca.markets/v2/account) || code="no answer"
+  | curl -q -sS -o /dev/null -w '%{http_code}' --max-time 20 -H @- https://paper-api.alpaca.markets/v2/account) || code="no answer"
 case "$code" in
   200) ;;
   401|403) echo "paper:store: refused. Alpaca's paper API answered $code: this is not a working paper pair (a live pair is refused there). Nothing stored." >&2; exit 1 ;;
@@ -140,20 +156,21 @@ fi
 description = "Say whether both keychain items of a paper account exist, without reading either value"
 shell = "bash -c"
 usage = '''
-arg "[account]" help="tests: account A, the default, which paper:test reads; windows: account B, which paper:session reads (ADR 0069)" default="tests" {
-  choices "tests" "windows"
+arg "[account]" help="tests: account A, the default, which paper:test reads; windows: account B, which paper:session reads; protect: account C (ADR 0069's pattern)" default="tests" {
+  choices "tests" "windows" "protect"
 }
 '''
 run = '''
 case "${usage_account:-tests}" in
   tests) svc=canon-alpaca-paper ;;
   windows) svc=canon-alpaca-paper-windows ;;
-  *) echo "paper:check: no paper account named ${usage_account}; the names are tests and windows" >&2; exit 3 ;;
+  protect) svc=canon-alpaca-paper-protect ;;
+  *) echo "paper:check: no paper account named ${usage_account}; the names are tests, windows and protect" >&2; exit 3 ;;
 esac
 echo "paper account ${usage_account:-tests}, service $svc:"
 # exit 0 when both are there, 1 when one is absent (44, as paper:store reads it), 2 when security failed
 # otherwise, which says nothing about whether the item is there (a locked keychain, a refused access), and 3
-# when the account named is neither of the two (ADR 0069)
+# when the account named is none of the three (ADR 0069's pattern)
 missing=0
 for a in ALPACA_API_KEY ALPACA_SECRET_KEY; do
   rc=0; /usr/bin/security find-generic-password -s "$svc" -a "$a" >/dev/null 2>&1 || rc=$?
@@ -168,15 +185,16 @@ exit "$missing"
 description = "Delete both keychain items of a paper account"
 shell = "bash -c"
 usage = '''
-arg "[account]" help="tests: account A, the default, which paper:test reads; windows: account B, which paper:session reads (ADR 0069)" default="tests" {
-  choices "tests" "windows"
+arg "[account]" help="tests: account A, the default, which paper:test reads; windows: account B, which paper:session reads; protect: account C (ADR 0069's pattern)" default="tests" {
+  choices "tests" "windows" "protect"
 }
 '''
 run = '''
 case "${usage_account:-tests}" in
   tests) svc=canon-alpaca-paper ;;
   windows) svc=canon-alpaca-paper-windows ;;
-  *) echo "paper:remove: no paper account named ${usage_account}; the names are tests and windows. Nothing removed." >&2; exit 1 ;;
+  protect) svc=canon-alpaca-paper-protect ;;
+  *) echo "paper:remove: no paper account named ${usage_account}; the names are tests, windows and protect. Nothing removed." >&2; exit 1 ;;
 esac
 echo "paper account ${usage_account:-tests}, service $svc:"
 # 44 is an absent item (as paper:store reads it; scripts/test-lanes observes it for a deletion too); any other
@@ -707,15 +725,16 @@ description = "Print one paper account: balances, positions, open orders with th
 shell = "bash -c"
 timeout = "10m"
 usage = '''
-arg "<account>" help="tests: account A, which paper:test reads; windows: account B, which paper:session reads (ADR 0069)" {
-  choices "tests" "windows"
+arg "<account>" help="tests: account A, which paper:test reads; windows: account B, which paper:session reads; protect: account C (ADR 0069's pattern)" {
+  choices "tests" "windows" "protect"
 }
 '''
 run = '''
 case "${usage_account:-}" in
   tests) svc=canon-alpaca-paper ;;
   windows) svc=canon-alpaca-paper-windows ;;
-  *) echo "paper:account: no paper account named '${usage_account:-}'; the names are tests and windows; nothing was read" >&2; exit 3 ;;
+  protect) svc=canon-alpaca-paper-protect ;;
+  *) echo "paper:account: no paper account named '${usage_account:-}'; the names are tests, windows and protect; nothing was read" >&2; exit 3 ;;
 esac
 ALPACA_API_KEY="$(/usr/bin/timeout 30 /usr/bin/security find-generic-password -s "$svc" -a ALPACA_API_KEY -w)" || ALPACA_API_KEY=""
 ALPACA_SECRET_KEY="$(/usr/bin/timeout 30 /usr/bin/security find-generic-password -s "$svc" -a ALPACA_SECRET_KEY -w)" || ALPACA_SECRET_KEY=""

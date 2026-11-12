@@ -43,7 +43,7 @@ account A, the paper tests' own orders that carry IDs of another form (a test's 
 or another strategy tag) read foreign too: the rule names what our window and paper nodes write, and nothing
 else is treated as theirs.
 
-`mise run paper:account <tests|windows>` prints the account through `account_task`: equity, cash and buying
+`mise run paper:account <tests|windows|protect>` prints the account through `account_task`: equity, cash and buying
 power, each position, each open order with its lineage, and `no_shorting`. It reads only: the task and
 `account_task` set data-only mode (`CANON_ALPACA_DATA_ONLY=1`, ADR 0070), so the client
 `session_window.paper_trading` builds refuses every method but GET before anything is sent. No account
@@ -243,7 +243,7 @@ def account_lines(trading: TradingClient) -> list[str]:
 
 
 def account_task(trading: TradingClient | None = None) -> int:
-    """`mise run paper:account <tests|windows>`: print `account_lines` in data-only mode; 0, or 1 naming
+    """`mise run paper:account <tests|windows|protect>`: print `account_lines` in data-only mode; 0, or 1 naming
     the read that failed (`ReadFailed`), or the client that would send more than GET. The client, built
     here or given, is checked to refuse every method but GET before anything is read (`require_get_only`,
     as the data-only modules check theirs)."""

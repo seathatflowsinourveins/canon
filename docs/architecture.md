@@ -131,7 +131,8 @@ locally on the data client's live data; nothing in `src/` builds one yet (ADR 00
   put in an environment (ADR 0070), and account B's, service `canon-alpaca-paper-windows`, which
   only `mise run paper:session` does, each in its own and under its own account's lock; a paper test that
   streams and a streaming `paper:data` run also take account A's stream lock, and a window account B's (`mise.toml`, ADR 0029, ADR 0044,
-  ADR 0069, ADR 0070).
+  ADR 0069, ADR 0070). Account C's, service `canon-alpaca-paper-protect`, is read only by
+  `mise run paper:account protect`, GET only (ADR 0114).
   Each pair is checked against the paper API before it is stored (ADR 0033).
 * **A session window** holds a position of at most one share: `PositionCap` reads the portfolio every second
   inside the node and shuts the system down over it; the window starts flat, ends flat or fails, and lasts
