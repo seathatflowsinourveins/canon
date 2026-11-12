@@ -1079,7 +1079,10 @@ class Mover(Strategy):
         if self.winding_down:
             if self.settings.extended_hours:
                 self._sell_out(slot, held, now)
-        elif self.settings.protect or slot.exiting:
+        elif (self.settings.protect or slot.exiting) and not self.is_exiting():
+            # While upstream's market exit runs it alone sells: a sell made here would be denied, being
+            # neither reduce-only nor the exit's own (MARKET_EXIT_IN_PROGRESS, pinned
+            # crates/trading/src/strategy/mod.rs:2396-2402). Cancels and bookkeeping go on.
             self._protect(slot, held, now)
 
     def _time_out(self, slot: Slot, entry: Any, now: int) -> None:
