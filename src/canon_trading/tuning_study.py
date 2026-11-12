@@ -87,9 +87,9 @@ from .ledger import record_trial
 from .mover import Mover
 from .mover import MoverConfig
 from .mover import Slot
-from .mover import entry_price
 from .mover import offsets
 from .mover import planned_stop
+from .price_step import entry_price
 from .ranking import RankingStopped
 from .ranking import rank
 from .tuning_contract import RankedConfiguration

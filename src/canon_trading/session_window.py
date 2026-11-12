@@ -249,7 +249,6 @@ from nautilus_trader.model import StrategyId
 from nautilus_trader.model import TimeInForce
 
 from .mover import Mover
-from .mover import entry_price
 from .mover import protection_diagnostics
 from .mover_window import MOVER
 from .mover_window import MOVER_ID
@@ -287,6 +286,7 @@ from .paper_node import alpaca_paper_builder
 from .paper_node import ema_cross_config
 from .position_cap import PositionCap
 from .position_cap import position_cap_config
+from .price_step import entry_price
 from .rank_shared import NOT_COMMON
 from .rank_shared import write_atomically
 from .request_budget import TRADING_REQUEST_LIMIT_PER_MINUTE
@@ -3216,7 +3216,7 @@ def mover_entry_limit(
     data: StockHistoricalDataClient, symbol: str, *, feed: str = MOVER_FEED
 ) -> Decimal:
     """The limit `Mover` would enter `symbol` at now: the ask of its latest quote on `feed` (alpaca-py's
-    `get_stock_latest_quote`) as `mover.entry_price` makes it a price Alpaca takes; or `WindowRefused`.
+    `get_stock_latest_quote`) as `price_step.entry_price` makes it a price Alpaca takes; or `WindowRefused`.
     The risk engine values a limit order at its limit price, not at the last trade, so this is the
     price one share is checked at and the shares of an entry are counted at."""
     found = data.get_stock_latest_quote(
