@@ -66,17 +66,17 @@ cancels each open order of ours in every symbol (a cancel touches only ours, and
 could add to a position nobody closes) and waits, at most `CANCEL_WAIT_SECS`, for Alpaca to show each ended,
 then reads the account again. In each symbol nothing froze, it closes the long ours opened: in the regular
 session with a DAY market sell, outside it with a DAY limit sell marked `extended_hours`, priced
-`session_ma_cross.LIMIT_OFFSET` through the touch (`session_ma_cross.through_the_touch`, as the strategy
-prices its own) from alpaca-py's latest quote on the part's feed (`session_window.window_feed`). Each close is
-one attempt under a client order ID of our lineage, sent once (`session_window.send_once`), left working for
-`CLOSE_WAIT_SECS`, looked up by its ID, and canceled at the end if it has not ended; a close whose answer was
-lost is looked up, never sent again, and one never found is named `unfound`, since Alpaca may yet show it
-working. SIGTERM (the task's `timeout`) or Ctrl-C stops the run as a failure and cancels each close it
+`session_ma_cross.LIMIT_OFFSET` through the touch from alpaca-py's latest quote on the part's feed
+(`session_window.window_feed`) and put on Alpaca's step by `session_window.close_limit`, as the account
+check after a stop prices its own; a sell under the finest step goes at 0.0001, named in the record. Each
+close is one attempt under a client order ID of our lineage, sent once (`session_window.send_once`), left
+working for `CLOSE_WAIT_SECS`, looked up by its ID, and canceled at the end if it has not ended; a close whose
+answer was lost is looked up, never sent again, and one never found is named `unfound`, since Alpaca may yet
+show it working. SIGTERM (the task's `timeout`) or Ctrl-C stops the run as a failure and cancels each close it
 sent first. What of ours is left is reported by name, and every frozen symbol with why. With no session part
-open it sends no close. It writes no window record and no gap marker. Not
-documented by Alpaca, so UNVERIFIED until a paper run shows it: what the latest-quote endpoint answers while
-the feed's session is closed, and how fresh its quote is.
-"""
+open it sends no close. It writes no window record and no gap marker. Not documented by Alpaca, so UNVERIFIED
+until a paper run shows it: what the latest-quote endpoint answers while the feed's session is closed, and how
+fresh its quote is."""
 
 from __future__ import annotations
 
@@ -686,7 +686,7 @@ class _CloseOnly:
 def _failure(e: BaseException) -> str:
     """An error by name: a `ReadFailed` by its own text, which names the read; any other by its type and
     Alpaca's status, never its body, which could carry an identifier."""
-    if isinstance(e, ReadFailed):
+    if isinstance(e, (ReadFailed, session_window.QuoteTooWide)):
         return str(e)
     status = getattr(e, "status_code", None)
     return f"{type(e).__name__}" + (f" (HTTP {status})" if status is not None else "")
