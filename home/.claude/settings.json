@@ -16,7 +16,8 @@
   "autoCompactWindow": 300000,
   "statusLine": {
     "type": "command",
-    "command": "~/.claude/canon/statusline.sh"
+    "command": "~/.claude/canon/statusline.sh",
+    "refreshInterval": 5
   },
   "hooks": {
     "SessionStart":       [{ "hooks": [{ "type": "command", "command": "\"$HOME\"/.claude/canon/ledger.sh", "async": true }] }],
