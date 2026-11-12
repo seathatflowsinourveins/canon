@@ -663,6 +663,21 @@
       "adr": "0095"
     },
     {
+      "id": "awesome-dsh-plugin",
+      "field": "agent-extensions",
+      "repo": "awesome-dsh-plugin/awesome-dsh-plugin",
+      "track": "default",
+      "role": "reference",
+      "license": "CC0-1.0",
+      "why": "The community index of DeepSeek Harness plugins (10,581 entries at the pin), which lists every plugin ADR 0094 adopts or excludes. A reference, never a source of trust (ADR 0072 rule 3): its own notice says \"Being on this list is not a security review\" and \"Tool approvals don't sandbox plugin code\", and its disclaimer that listing \"is not an endorsement\". Nothing is installed from it: each plugin it names gets its own entry, pin and source read through adopt-upstream (ADR 0094, ADR 0095). It publishes no tags, so it tracks the default branch.",
+      "evidence": [
+        "https://github.com/awesome-dsh-plugin/awesome-dsh-plugin",
+        "https://raw.githubusercontent.com/awesome-dsh-plugin/awesome-dsh-plugin/f613760b0ecc1f1dc61da874d3fd10d3584385f7/README.md",
+        "https://api.github.com/repos/awesome-dsh-plugin/awesome-dsh-plugin"
+      ],
+      "adr": "0095"
+    },
+    {
       "id": "pnpm",
       "field": "toolchain",
       "repo": "pnpm/pnpm",
