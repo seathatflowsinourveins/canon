@@ -115,7 +115,9 @@ it), is sent once the stream's first quote or trade arrives, when
 the client sends its subscriptions again, if a subscribe was made after the stream started; a start
 whose sent subscriptions stay quiet and an unsubscribe lost in the same window (alpaca-py does not
 send it either, and a subscribe does not undo it) are not covered; a reconnect alpaca-py makes by itself,
-which it announces with a warning before connecting, is covered the same way (2026-11-11, below).
+which it announces with a warning before connecting, is covered by marking every held subscription to
+be sent again on the next message, since that warning can reach the node after a subscribe it preceded
+(2026-11-11, below).
 
 What a caller sees when the stream fails: a stream that ends by itself is not restarted (alpaca-py
 reconnects and resubscribes by itself after a websocket error and after any error while connecting, and
@@ -136,17 +138,21 @@ the longest silence seen on a feed that then delivered (513 s: `iex` with QQQ al
 2026-11-11, one trade and no quote in 600 s); a window's parts are far busier (SPY on `iex` in the regular
 session, hundreds of quotes a minute; on `boats` overnight, 1,552 to 3,700 quotes a window, ADR 0044). Its
 reconnect reaches the log as a warning naming the feed, so a quiet feed fails nothing. As alpaca-py
-reconnects without end, the client counts the silence too: no quote or trade for
-`stream_mute_limit_secs` (3,600 s by default, and longer than the data timeout) while it holds a
+reconnects without end, the client counts the silence too: no market data (a quote or trade, a
+trade's correction or cancel, and since ADR 0090 a bar or status, a symbol's that is subscribed or
+any under a held `"*"`) for `stream_mute_limit_secs` (3,600 s by default, and longer than the data timeout) while it holds a
 subscription, and it stops the stream, logs an error beginning "Alpaca stream on feed <feed> went mute",
 which a session window reads as its stream's error, and refuses later subscriptions until it reconnects,
 the same say-so as a stream that ended, and as upstream's Databento feed handler gives up reconnecting
 after `reconnect_timeout_mins` with an error. The limit counts from the stream's start, so a stream
 alpaca-py never gets connected meets it too. It cannot tell a dead stream from a feed with nothing to
 send, so a node spanning a part no feed serves sets it longer than that part, or `None`; it outlasts
-every window this repository runs (an hour at most), so it matters to longer nodes. A subscribe made
-after alpaca-py's reconnect warning and before the next message is sent again on that message, as at
-the stream's start. A client
+every window this repository runs (an hour at most), so it matters to longer nodes. After alpaca-py's
+reconnect warning reaches the node, the client's subscriptions are sent again on the next message, once
+per reconnect: the warning crosses threads, so the node can run a subscribe after alpaca-py dropped the
+connection and before the warning arrives, and that subscribe, recorded and not sent, must be covered
+too (corrected 2026-11-11, when a second reader showed the earlier rule, a subscribe made after the
+warning, missed it). A client
 forgets its subscriptions at disconnect while the engine keeps its own record of them until a reset, but
 a client belongs to one node run and a stopped node refuses to run again, so none is owed to a later
 connect. Offline, in `scripts/ci` (`test_data_client.py`): the stream is built with the configured
@@ -157,7 +163,8 @@ the subscription sent again, a later quote reaches the cache, and the reconnect 
 a mute stand-in past the limit is stopped, its error names the feed and the limit, and a later
 subscription is refused; quotes inside the limit keep it running and the count starts from the last one;
 silence with nothing subscribed, before a later subscription, and after a disconnect fails nothing; a
-subscribe held in the window of a `data_timeout` reconnect on the real stream is sent on the next quote;
+subscribe held in the window of a `data_timeout` reconnect on the real stream is sent on the next quote,
+and so is one the node ran before the reconnect warning reached it;
 a bound too large for a float is refused by name; a stopped node cannot run
 again (fails if upstream allows it). UNVERIFIED: how long a healthy feed can stay silent beyond the one
 10-minute sample; a mute connection on a live stream.
@@ -290,5 +297,11 @@ Read 2026-11-10; "raw": fetched with `curl` and read, not summarised.
   `crates/adapters/bybit/src/common/parse.rs` (`parse_trade_tick` 912, `parse_kline_bar` 1049-1052,
   `parse_price_with_precision` 1361-1369). Offline at the pin, `Equity.make_price` at precision 4:
   747.086488 to 747.0865, 1.00025 to 1.0002, 1.00015 to 1.0002, 0.12345 to 0.1234 (ran).
+* Second reader, 2026-11-11 (Codex, reading the mute-stream change): a subscribe the node runs after
+  alpaca-py drops a mute connection and before its relayed warning arrives was left unsent; reproduced
+  offline on alpaca-py's real stream (`test_a_subscribe_made_before_a_late_reconnect_warning_is_sent_on_the_next_message`),
+  fixed, and the reconnect sentences above corrected. The fix's code review added one: a resend
+  planned before such a warning, and finished after it, no longer clears the mark the warning set
+  (`test_a_resend_planned_before_a_reconnect_warning_leaves_the_next_connection_owed_one`).
 * Second reader, 2026-11-10 (`evidence-verifier`): B stands; corrected above: Databento's refusal cited
   from source, the data hooks' sentence quoted, the after-hours claim narrowed, the per-endpoint limit.

@@ -800,6 +800,10 @@ class FakeHistoricalClient:
     `start` and `end` (https://docs.alpaca.markets/us/reference/stockquotes-1.md), from `quotes`, raw JSON
     parsed with alpaca-py's `QuoteSet`. alpaca-py has already made `start` and `end` naive UTC. With `gate`
     set, each call sets `entered` and then waits for `gate`.
+
+    `get` serves empty AAPL trade history only, using the single-symbol endpoint's required response
+    fields (https://docs.alpaca.markets/us/reference/stocktradesingle-1). Nonempty and paginated trade
+    histories use the real SDK with a fake HTTP session in `test_data_client.py`.
     """
 
     def __init__(
@@ -840,6 +844,13 @@ class FakeHistoricalClient:
         finally:
             with self._count_lock:
                 self._active -= 1
+
+    def get(self, path: str, data: dict | None = None) -> dict:
+        if path != "/stocks/AAPL/trades":
+            raise NotImplementedError(f"Historical stand-in serves empty AAPL trades only: {path}")
+        if self.error is not None:
+            raise self.error
+        return {"symbol": "AAPL", "trades": [], "next_page_token": None}
 
     def _answer(self, request_params: StockBarsRequest) -> BarSet:
         symbol = request_params.symbol_or_symbols
@@ -1118,6 +1129,16 @@ class MemorySocket:
                     symbols.difference_update(message.get(channel, []))
         return held
 
+    def held(self, channel: str) -> set[str]:
+        """What the server would hold on any channel (`bars`, `updatedBars`, `statuses` among them)."""
+        symbols: set[str] = set()
+        for message in self.sent:
+            if message["action"] == "subscribe":
+                symbols.update(message.get(channel, []))
+            else:
+                symbols.difference_update(message.get(channel, []))
+        return symbols
+
     def deliver(self, *messages: dict) -> None:
         self._incoming.put(list(messages))
 
@@ -1150,6 +1171,27 @@ def wire_quote() -> dict:
     whose `to_datetime()` gives the fixture's `datetime`."""
     moment = QUOTE_AAPL["t"]
     return {**QUOTE_AAPL, "t": SimpleNamespace(to_datetime=lambda: moment)}
+
+
+def wire_bar(kind: str = "b", symbol: str = "AAPL", **changes: object) -> dict:
+    """A minute bar as the stream sends it (`b`, or `u` for an updated one), with the docs' bar fields
+    (`BAR_AAPL`) and `t` as a msgpack timestamp opening at 2022-01-03 09:00 UTC."""
+    moment = datetime(2022, 1, 3, 9, tzinfo=UTC)
+    fields = {**BAR_AAPL, **changes}
+    return {**fields, "T": kind, "S": symbol, "t": SimpleNamespace(to_datetime=lambda: moment)}
+
+
+def wire_status(code: str, reason: str = "", symbol: str = "AAPL", **changes: object) -> dict:
+    """A trading status as the stream sends it, with the schema's fields (`sc`, `sm`, `rc`, `rm`, `z`)."""
+    moment = datetime(2022, 1, 3, 15, 30, tzinfo=UTC)
+    fields = {"sc": code, "sm": f"status {code}", "rc": reason, "rm": f"reason {reason}", "z": "C"}
+    return {
+        "T": "s",
+        "S": symbol,
+        **fields,
+        **changes,
+        "t": SimpleNamespace(to_datetime=lambda: moment),
+    }
 
 
 def memory_stream(monkeypatch: pytest.MonkeyPatch) -> tuple[StockDataStream, MemorySocket]:
@@ -1242,6 +1284,8 @@ def alpaca() -> SimpleNamespace:
         Stream=FakeStream,
         memory_stream=memory_stream,
         wire_quote=wire_quote,
+        wire_bar=wire_bar,
+        wire_status=wire_status,
     )
 
 

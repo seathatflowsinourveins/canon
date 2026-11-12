@@ -216,6 +216,15 @@
       "sha": "de277ef139da42a7953b888c70c69e4c625caf35",
       "track": "branch:main"
     },
+    "dsh-acp-app": {
+      "default_branch": "master",
+      "default_sha": "e8f7b93a344964de3dca1ace9e72b6e4d6de87cb",
+      "ref": "refs/tags/dsh-v0.2.1-rc.3",
+      "repo": "deepseek-ai/deepseek-harness",
+      "resolved_at": "2026-11-12T01:13:00Z",
+      "sha": "1f81c047fc48fa190a683e469daa699857e9afe8",
+      "track": "tag:dsh-v0.2.1-rc.3"
+    },
     "dsh-ci-context": {
       "default_branch": "main",
       "default_sha": "7d814e3def47e257de0aa4b12e2d57572eb63d6a",
@@ -224,6 +233,33 @@
       "resolved_at": "2026-11-11T22:11:23Z",
       "sha": "7d814e3def47e257de0aa4b12e2d57572eb63d6a",
       "track": "tag:v0.1.1"
+    },
+    "dsh-experimental-terminal-bundle": {
+      "default_branch": "master",
+      "default_sha": "e8f7b93a344964de3dca1ace9e72b6e4d6de87cb",
+      "ref": "refs/tags/dsh-v0.2.1-rc.3",
+      "repo": "deepseek-ai/deepseek-harness",
+      "resolved_at": "2026-11-12T01:23:32Z",
+      "sha": "1f81c047fc48fa190a683e469daa699857e9afe8",
+      "track": "tag:dsh-v0.2.1-rc.3"
+    },
+    "dsh-subagent-claude-code": {
+      "default_branch": "master",
+      "default_sha": "e8f7b93a344964de3dca1ace9e72b6e4d6de87cb",
+      "ref": "refs/tags/dsh-v0.2.1-rc.3",
+      "repo": "deepseek-ai/deepseek-harness",
+      "resolved_at": "2026-11-12T02:33:11Z",
+      "sha": "1f81c047fc48fa190a683e469daa699857e9afe8",
+      "track": "tag:dsh-v0.2.1-rc.3"
+    },
+    "dsh-subagent-codex": {
+      "default_branch": "master",
+      "default_sha": "e8f7b93a344964de3dca1ace9e72b6e4d6de87cb",
+      "ref": "refs/tags/dsh-v0.2.1-rc.3",
+      "repo": "deepseek-ai/deepseek-harness",
+      "resolved_at": "2026-11-12T01:38:39Z",
+      "sha": "1f81c047fc48fa190a683e469daa699857e9afe8",
+      "track": "tag:dsh-v0.2.1-rc.3"
     },
     "dsh-tui": {
       "default_branch": "main",

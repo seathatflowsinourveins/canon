@@ -1,0 +1,281 @@
+#!/usr/bin/env node
+// Contract: ACP v1 stdio transcripts, using Node's documented vm/child_process APIs.
+// https://agentclientprotocol.com/protocol/v1/transports (rules cited in scripts/acp-probe.mjs)
+// https://nodejs.org/docs/latest-v24.x/api/vm.html
+// https://nodejs.org/docs/latest-v24.x/api/child_process.html
+// Runs the real probe with only spawn replaced; each transcript has its own Node process so
+// process.exit and uncaught callback errors are observable. Never starts dsh or reads a profile.
+// Inventory fixtures were checked against the four permitted profile files on 2026-11-11;
+// they describe that dated snapshot, not the current state of a CI runner's home directory.
+
+const assert = require('node:assert/strict');
+const { spawnSync } = require('node:child_process');
+const { EventEmitter } = require('node:events');
+const { readFileSync } = require('node:fs');
+const { resolve } = require('node:path');
+const { runInNewContext } = require('node:vm');
+
+const root = resolve(__dirname, '..');
+const probePath = resolve(root, 'scripts/acp-probe.mjs');
+
+if (process.argv[2] === '--transcript') {
+  const fixture = JSON.parse(process.argv[3]);
+  const stdout = new EventEmitter();
+  const receive = (frame) => stdout.emit('data', Buffer.from(JSON.stringify(frame) + '\n'));
+  const respond = (request, result, error) => receive(error
+    ? { jsonrpc: '2.0', id: request.id, error }
+    : { jsonrpc: '2.0', id: request.id, result });
+  const child = {
+    stdout,
+    stderr: new EventEmitter(),
+    kill: (signal) => console.log('KILL', signal),
+    stdin: {
+      write(line) {
+        const request = JSON.parse(line);
+        console.log('SENT', JSON.stringify(request));
+        queueMicrotask(() => {
+          if (request.method === 'initialize') {
+            respond(request, { protocolVersion: 1, agentCapabilities: fixture.capabilities
+              ?? { sessionCapabilities: { close: {} } } });
+          } else if (request.method === 'session/new') {
+            respond(request, { sessionId: 's1' });
+          } else if (request.method === 'session/prompt') {
+            for (const line of fixture.rawLines ?? []) stdout.emit('data', Buffer.from(line + '\n'));
+            for (const frame of fixture.frames ?? []) receive(frame);
+            respond(request, { stopReason: fixture.stopReason ?? 'end_turn' }, fixture.promptError);
+          } else if (request.method === 'session/close') {
+            respond(request, {}, fixture.closeError);
+          }
+        });
+        return true;
+      },
+    },
+  };
+  const source = readFileSync(probePath, 'utf8');
+  const importLine = "import { spawn } from 'node:child_process';";
+  assert(source.includes(importLine), 'update the transcript harness for the probe import');
+  process.argv = [process.execPath, probePath, ...(fixture.args ?? [])];
+  runInNewContext(source.replace(importLine, ''), {
+    spawn: () => child, process, console, setTimeout, clearTimeout,
+  }, { filename: probePath });
+} else {
+  let passed = 0;
+  let failed = 0;
+  const test = (name, run) => {
+    try { run(); console.log('  ok   ', name); passed += 1; }
+    catch (error) { console.log('  FAIL ', name, '\n       ', error.message); failed += 1; }
+  };
+  const transcript = (fixture = {}) => {
+    const result = spawnSync(process.execPath, [__filename, '--transcript', JSON.stringify(fixture)], {
+      cwd: root, encoding: 'utf8', timeout: 15000, env: {},
+    });
+    assert.ifError(result.error);
+    assert.equal(result.signal, null, result.stderr);
+    const sent = result.stdout.split('\n').filter((line) => line.startsWith('SENT '))
+      .map((line) => JSON.parse(line.slice(5)));
+    return { ...result, sent };
+  };
+  const successful = (result) => {
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    assert.match(result.stdout, /PROBE PASSED/);
+  };
+  const rejected = (result) => {
+    assert.equal(result.status, 1, result.stdout + result.stderr);
+    assert.match(result.stdout, /PROBE FAILED:/, result.stderr);
+    assert.match(result.stdout, /KILL SIGTERM/);
+    assert.doesNotMatch(result.stderr, /TypeError|uncaught/i);
+  };
+  const permission = (options) => ({
+    jsonrpc: '2.0', id: 3, method: 'session/request_permission',
+    params: { sessionId: 's1', toolCall: { toolCallId: 'c1', title: 'Read a file', kind: 'read' }, options },
+  });
+
+  test('reports a skipped non-JSON stdout line and its count', () => {
+    const result = transcript({ rawLines: ['not json'] });
+    successful(result);
+    assert.match(result.stdout, /skipped non-JSON stdout line 3 \(#1\): "not json"/);
+    assert.match(result.stdout, /skipped non-JSON stdout lines: 1/);
+  });
+  test('counts only non-JSON lines and names their physical stdout line numbers', () => {
+    const result = transcript({ rawLines: ['', 'plugin boot message', '   ', '[not-json'] });
+    successful(result);
+    assert.match(result.stdout, /skipped non-JSON stdout line 4 \(#1\): "plugin boot message"/);
+    assert.match(result.stdout, /skipped non-JSON stdout line 6 \(#2\): "\[not-json"/);
+    assert.match(result.stdout, /skipped non-JSON stdout lines: 2/);
+  });
+  for (const [name, envelope] of [
+    ['missing', {}], ['null', { jsonrpc: null }],
+    ['1.0', { jsonrpc: '1.0' }], ['number', { jsonrpc: 2 }],
+  ]) {
+    test(`rejects a response with ${name} jsonrpc before settling its pending request`, () => {
+      const result = transcript({ frames: [{ ...envelope, id: 3, result: { stopReason: 'end_turn' } }] });
+      rejected(result);
+      assert(!result.sent.some((frame) => frame.method === 'session/close'), result.stdout);
+    });
+  }
+  test('rejects a notification without jsonrpc 2.0', () => {
+    rejected(transcript({ frames: [{ method: 'session/update', params: { sessionId: 's1', update: {
+      sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'ACP-OK' },
+    } } }] }));
+  });
+  test('rejects a peer request without jsonrpc 2.0 before replying', () => {
+    const frame = permission([{ kind: 'allow_once', name: 'Allow once', optionId: 'opaque-allow-17' }]);
+    delete frame.jsonrpc;
+    const result = transcript({ frames: [frame] });
+    rejected(result);
+    assert(!result.sent.some((sent) => sent.method === undefined), result.stdout);
+  });
+
+  test('advertised close is sent after the prompt', () => {
+    const result = transcript();
+    successful(result);
+    assert.deepEqual(result.sent.map((frame) => frame.method), [
+      'initialize', 'session/new', 'session/prompt', 'session/close',
+    ]);
+    assert.deepEqual(result.sent[3].params, { sessionId: 's1' });
+  });
+  for (const [name, capabilities] of [
+    ['missing sessionCapabilities', {}],
+    ['missing close', { sessionCapabilities: {} }],
+    ['null close', { sessionCapabilities: { close: null } }],
+  ]) {
+    test(`does not close with ${name}`, () => {
+      const result = transcript({ capabilities });
+      successful(result);
+      assert(!result.sent.some((frame) => frame.method === 'session/close'), result.stdout);
+    });
+  }
+  test('unknown session on advertised close is success', () => {
+    const result = transcript({ closeError: { code: -32002, message: 'Unknown session' } });
+    successful(result);
+    assert.equal(result.sent.filter((frame) => frame.method === 'session/close').length, 1);
+  });
+  test('other close errors still fail', () => {
+    rejected(transcript({ closeError: { code: -32603, message: 'Internal error' } }));
+  });
+  test('unknown session on prompt still fails', () => {
+    rejected(transcript({ promptError: { code: -32002, message: 'Unknown session' } }));
+  });
+
+  for (const frame of [null, [], 1, true, 'message']) {
+    test(`rejects non-object frame ${JSON.stringify(frame)} cleanly`, () => {
+      rejected(transcript({ frames: [frame] }));
+    });
+  }
+  for (const options of [undefined, null, {}, [null], [[]]]) {
+    test(`rejects malformed permission options ${JSON.stringify(options)} cleanly`, () => {
+      const result = transcript({ frames: [permission(options)] });
+      rejected(result);
+      assert(!result.sent.some((frame) => frame.method === undefined), result.stdout);
+    });
+  }
+  for (const deny of [false, true]) {
+    const kind = deny ? 'reject_once' : 'allow_once';
+    for (const optionId of [undefined, null, 17]) {
+      test(`${kind} rejects invalid selected optionId ${JSON.stringify(optionId)}`, () => {
+        const result = transcript({
+          args: deny ? ['--deny'] : [],
+          frames: [permission([{ kind, name: 'Once', optionId }])],
+        });
+        rejected(result);
+        assert(!result.sent.some((frame) => frame.method === undefined), result.stdout);
+      });
+    }
+    test(`${kind} accepts the empty string id allowed by PermissionOptionId`, () => {
+      const result = transcript({
+        args: deny ? ['--deny'] : [], frames: [permission([{ kind, name: 'Once', optionId: '' }])],
+      });
+      successful(result);
+      assert.deepEqual(result.sent.find((frame) => frame.method === undefined).result,
+        { outcome: { outcome: 'selected', optionId: '' } });
+    });
+    test(`${kind} echoes the opaque id when the peer request reuses our pending id`, () => {
+      const result = transcript({
+        args: deny ? ['--deny'] : [],
+        frames: [permission([
+          { kind: 'allow_once', name: 'Allow once', optionId: 'opaque-allow-17' },
+          { kind: 'reject_once', name: 'Reject once', optionId: 'opaque-reject-91' },
+        ])],
+      });
+      successful(result);
+      const replies = result.sent.filter((frame) => frame.method === undefined);
+      assert.deepEqual(replies, [{ jsonrpc: '2.0', id: 3, result: {
+        outcome: { outcome: 'selected', optionId: deny ? 'opaque-reject-91' : 'opaque-allow-17' },
+      } }]);
+    });
+  }
+  const gatedUpdates = [
+    { sessionUpdate: 'notice', severity: 'info', title: 'Note' },
+    { sessionUpdate: 'compaction_update', compactionId: 'cmp1', status: 'completed' },
+    { sessionUpdate: 'compaction_summary_chunk', compactionId: 'cmp1', content: { type: 'text', text: 'Summary' } },
+  ];
+  for (const update of gatedUpdates) {
+    test(`rejects unadvertised ${update.sessionUpdate}`, () => {
+      const result = transcript({ frames: [{
+        jsonrpc: '2.0', method: 'session/update', params: { sessionId: 's1', update },
+      }] });
+      rejected(result);
+      assert.equal(result.sent[0].params.clientCapabilities.session, undefined);
+    });
+  }
+  test('ordinary agent and tool updates remain accepted', () => {
+    const result = transcript({ args: ['--require-tool'], frames: [
+      { jsonrpc: '2.0', method: 'session/update', params: { sessionId: 's1', update: {
+        sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'ACP-OK' },
+      } } },
+      { jsonrpc: '2.0', method: 'session/update', params: { sessionId: 's1', update: {
+        sessionUpdate: 'tool_call', toolCallId: 'c1', title: 'Read', kind: 'read', status: 'completed',
+      } } },
+    ] });
+    successful(result);
+    assert.match(result.stdout, /assistant text: "ACP-OK"/);
+    assert.match(result.stdout, /tool updates: 1/);
+  });
+
+  const adr = readFileSync(resolve(root,
+    'docs/adr/0086-what-stock-is-for-deepseek-harness-and-the-two-configurations.md'), 'utf8');
+  const table = (header) => {
+    const start = adr.indexOf(header);
+    assert(start >= 0, `missing table ${header}`);
+    return adr.slice(start).split('\n\n')[0].split('\n').slice(2)
+      .map((line) => line.split('|').slice(1, -1).map((cell) => cell.trim().replaceAll('`', '')));
+  };
+  test('ADR direct dependencies match the dated manifest and lock fixture', () => {
+    assert.deepEqual(table('| Package | `review-acp` | `build-acp` |'), [
+      ['@deepseek-ai/dsh-acp-app', '0.2.1-rc.3', '0.2.1-rc.3'],
+      ['@deepseek-ai/dsh-experimental-terminal-bundle', '0.2.1-rc.3', '0.2.1-rc.3'],
+      ['@deepseek-ai/dsh-hook-protocol', '0.2.1-rc.3', '0.2.1-rc.3'],
+      ['@deepseek-ai/dsh-hooks-claude-code', '0.2.1-rc.3', '0.2.1-rc.3'],
+      ['@deepseek-ai/dsh-subagent-claude-code', '—', '0.2.1-rc.3'],
+      ['@deepseek-ai/dsh-subagent-codex', '—', '0.2.1-rc.3'],
+      ['aegis', '2.15.0', '2.15.0'],
+      ['dsh-doublecheck', '0.9.30', '0.9.30'],
+      ['dsh-fail-guard', '0.2.1', '0.2.1'],
+      ['dsh-memento', '—', '0.5.30'],
+    ]);
+  });
+  test('ADR aegis resolution matches the dated lock fixture', () => {
+    const note = adr.slice(adr.indexOf('For `aegis`'), adr.indexOf('### Bundle selection'));
+    assert(note.includes('e5f43c548a06c3f302c521a4c23f258296ccc947'), note);
+    assert(note.includes('version 2.15.0'), note);
+  });
+  test('ADR ordered bundles match the dated manifest fixture', () => {
+    assert.deepEqual(table('| Position | `review-acp` bundle | `build-acp` bundle |'), [
+      ['1', '@deepseek-ai/dsh-base', '@deepseek-ai/dsh-base'],
+      ['2', '@deepseek-ai/dsh-acp-app', '@deepseek-ai/dsh-acp-app'],
+      ['3', '@deepseek-ai/dsh-experimental-terminal-bundle', '@deepseek-ai/dsh-experimental-terminal-bundle'],
+      ['4', 'dsh-doublecheck', '@deepseek-ai/dsh-subagent-claude-code'],
+      ['5', 'aegis', '@deepseek-ai/dsh-subagent-codex'],
+      ['6', 'dsh-fail-guard', 'aegis'],
+      ['7', '—', 'dsh-doublecheck'],
+      ['8', '—', 'dsh-memento'],
+      ['9', '—', 'dsh-fail-guard'],
+    ]);
+  });
+  test('ADR names the fail-guard package source', () => {
+    assert(adr.includes('https://registry.npmjs.org/dsh-fail-guard/0.2.1'));
+  });
+
+  console.log(`test-acp-probe: ${passed} passed, ${failed} failed`);
+  process.exitCode = failed ? 1 : 0;
+}

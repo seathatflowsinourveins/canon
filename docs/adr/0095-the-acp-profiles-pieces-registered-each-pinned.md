@@ -45,6 +45,34 @@ Chosen: **option 1**. Option 2 hides which piece moved; option 3 pins nothing.
    default branch because it publishes no tags. It lists every plugin ADR 0094 names (10,581 entries at the pin), and is
    nothing more: its own notice says "Being on this list is not a security review", so no plugin is
    installed on its strength (ADR 0072 rule 3).
+3. **`dsh-acp-app`** (DeepSeek Harness's `packages/bundle/acp-app`, MIT), `tool`, pinned with the engine
+   at `dsh-v0.2.1-rc.3`: the bundle both profiles carry, which starts `dsh-acp` on stdio with a default
+   model route. Its own source makes no network, file or subprocess call.
+4. **`dsh-experimental-terminal-bundle`** (`packages/experimental/terminal-bundle`, MIT), `tool`, at
+   `dsh-v0.2.1-rc.3`: persistent shells as six tools, in both profiles, and the one addition of ADR
+   0086's review configuration on the `dsh-tui` profile (`review-acp` is not that configuration). The
+   bundle's own code is empty; its dependency `dsh-terminal-bash` spawns the shells, confined by the
+   host sandbox unless its mode is `danger-full-access`. The profiles' sandbox mode is `UNVERIFIED`.
+5. **`dsh-subagent-codex`** (`packages/subagent/subagent-codex`, MIT), `tool`, at `dsh-v0.2.1-rc.3`,
+   build arm only: delegates one task to a fresh Codex thread in the parent workspace through its own
+   `@openai/codex` 0.153.4, outside the `codex-cli` pin. Key-like variables are scrubbed from the child's
+   environment, so it runs under whatever login `CODEX_HOME` and `HOME` point to where `dsh` started.
+   `permissionMode` defaults to `never`, which declines approvals and leaves the sandbox to Codex's
+   settings. Which login, mode and sandbox `build-acp` gets is `UNVERIFIED`. It sends a task, not the
+   transcript, so ADR 0072 rule 6 places it by extension: another family answers, and it edits the
+   workspace.
+6. **`dsh-subagent-claude-code`** (`packages/subagent/subagent-claude-code`, MIT), `tool`, at
+   `dsh-v0.2.1-rc.3`, build arm only: delegates one task to a fresh Claude Code session in the parent
+   workspace through its own Agent SDK (0.3.263, which bundles Claude Code 2.1.263, behind the
+   `claude-code` pin) and never falls back to the host `claude`. It reads the host's user, project and
+   local Claude settings, hooks and allow rules included. The child's environment is the profile's `env`
+   over the parent's with key-like and `DSH_` names scrubbed, so its login is the Claude configuration
+   directory (`CLAUDE_CONFIG_DIR`, else `~/.claude`) and its Keychain entry, unless a surviving provider
+   variable or a settings `apiKeyHelper` outranks it. `permissionMode` defaults to `dontAsk`: what the
+   host's allow rules and read-only defaults permit runs, the rest is denied. Which login and mode
+   `build-acp` gets is `UNVERIFIED`. It sends a task, not the transcript, so ADR 0072 rule 6 places it by
+   extension: another family answers, and it edits the workspace. It may also read and write the host's
+   auto memory, which would be state across sessions under rule 6 directly (`UNVERIFIED`).
 
 ### Consequences
 
@@ -90,6 +118,48 @@ Read 2026-11-11.
   same count, three commits behind the pin (a second reader's fetch, 2026-11-11). ADR 0072 rule 3's
   10,426 is an earlier count.
 * https://api.github.com/repos/awesome-dsh-plugin/awesome-dsh-plugin — licence CC0-1.0; no tags (fetched).
+* `deepseek-harness` at `dsh-v0.2.1-rc.3`, `packages/bundle/acp-app` — `package.json` (MIT; depends
+  on `dsh-acp`, `dsh-cmdline`, `commander`), README Summary and `cordis.patch.yml` (persona, provider
+  `deepseek-official`, model `deepseek-v4-flash`, `session-title-llm` disabled); a search of its `src`
+  for `fetch(`, `node:http`, `node:fs`, `writeFile`, `child_process` and `spawn(` found none (resolved).
+  https://registry.npmjs.org/@deepseek-ai/dsh-acp-app/0.2.1-rc.3 — MIT, that directory, no `gitHead`
+  (fetched); a second reader found its tarball's patch and READMEs byte-identical to the pinned source,
+  a match by content, not provenance. Both profiles carry 0.2.1-rc.3 (commit `62ccb4c`, read).
+* `deepseek-harness` at `dsh-v0.2.1-rc.3`, `packages/experimental/terminal-bundle` — `package.json`
+  (MIT; "Keep shell processes alive across tool calls"), README Summary (six tools, isolated registry,
+  off by default in Web and Desktop) and `cordis.patch.yml`; a search of its `src` for network, file and
+  subprocess calls found none (resolved). https://registry.npmjs.org/@deepseek-ai/dsh-experimental-terminal-bundle/0.2.1-rc.3
+  (fetched; no `gitHead`, so its match to
+  the tag is by content only).
+* A second reader of item 4 (2026-11-11) found no model call in the bundle or its three dependencies,
+  terminal sessions process-local and owner-scoped, and the shell spawned in
+  `packages/terminal/terminal-bash/src/index.ts` under `ctx.sandbox.confine` except in
+  `danger-full-access` (resolved): a channel to another model or to earlier sessions exists only
+  through what a shell can reach.
+* `deepseek-harness` at `dsh-v0.2.1-rc.3`, `packages/subagent/subagent-codex` — `package.json` (MIT;
+  `@openai/codex` `0.153.4`), README Summary and options table (`permissionMode` default `never`;
+  native configuration and authentication authoritative) (resolved).
+  https://registry.npmjs.org/@deepseek-ai/dsh-subagent-codex/0.2.1-rc.3 (fetched; no `gitHead`, so its match to
+  the tag is by content only).
+* `deepseek-harness` at `dsh-v0.2.1-rc.3`, `packages/subprocess/subprocess/src/index.ts`,
+  `scrubbedParentEnv()` — drops variables whose names contain `KEY`, `PASSWORD`, `SECRET` or `TOKEN`;
+  `HOME` and `CODEX_HOME` pass (a second reader, 2026-11-11, resolved). It also found that an
+  Orca-started session's `CODEX_HOME` is an Orca-managed home, not `~/.codex` (path names only).
+* `deepseek-harness` at `dsh-v0.2.1-rc.3`, `packages/subagent/subagent-claude-code` — `package.json`
+  (MIT; `@anthropic-ai/claude-agent-sdk` `0.3.263`), README Summary ("never falls back to the host
+  `claude` executable"), options (`permissionMode` default `dontAsk`) and "Native settings are
+  authoritative" (resolved). https://registry.npmjs.org/@deepseek-ai/dsh-subagent-claude-code/0.2.1-rc.3
+  (fetched; no `gitHead`, so its match to
+  the tag is by content only).
+* `packages/subagent/subagent-claude-code/src/process.ts` and `src/index.ts` at the same pin — the
+  child environment is the configured `env` over `scrubbedParentEnv()`, which the SDK composes from;
+  `inheritsParentContext = false` (resolved). https://registry.npmjs.org/@anthropic-ai/claude-agent-sdk/0.3.263
+  (fetched; `claudeCodeVersion` 2.1.263). https://code.claude.com/docs/en/authentication.md,
+  https://code.claude.com/docs/en/permission-modes.md and https://code.claude.com/docs/en/memory.md
+  (fetched 2026-11-11; current docs, not checked against 2.1.263).
+* A second reader of item 6, 2026-11-11, named the bundled Claude Code version, replaced `HOME` with the
+  configuration directory and Keychain, widened what `dontAsk` permits, and raised auto memory as a
+  possible direct rule 6 ground; all are in. The SDK's own licence is not MIT; MIT covers the package.
 * A second reader checked this record on 2026-11-11: it settled the SDK's schema minor, corrected how
   the profiles are started and what the `line` holds off, and asked for the scope note; all are in. A
   second reader of item 2 corrected the entry count from 10,584 to 10,581 and asked that the list's

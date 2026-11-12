@@ -5,7 +5,7 @@ things it adds for `--strategy Mover`:
 
 * **The rows of a window's run**, each UNCALIBRATED (ADR 0088): the largest entry notional
   (`ENTRY_NOTIONAL_USD`), the risk engine's per-order cap as an outer bound at a multiple of it
-  (`OUTER_BOUND_MULTIPLE`), one slot, one entry a window (`ENTRIES`), and a no-chase cap set so that it
+  (`OUTER_BOUND_MULTIPLE`), the session part's slot row (one by default), one entry a window (`ENTRIES`), and a no-chase cap set so that it
   does not bind (`NO_CHASE_CAP`). The risk engine's per-order notional cap holds for every order whatever
   its side (`nautilus-trader@d53849b216e2`, `crates/risk/src/engine/mod.rs:2491-2507`), so a cap at the
   entry's own notional would deny the sale of a position that rose. The entry is therefore bounded where
@@ -118,13 +118,15 @@ def mover_parts(
     wind_down_at: datetime,
     market_exit_interval_ms: int,
     market_exit_max_attempts: int,
+    slots: int = 1,
 ) -> tuple[Mover, FixedRank, PositionCap]:
     """`Mover` on the one name a window chose, the actor that publishes that choice as the ranking, and
     the position cap at the shares the largest entry buys at `price`. `move` is the name's move from its
     last close at `computed_at`, as the choice measured it; the staleness row reaches from then to
     `ends`, the window's end, since the choice is made once. In the session the wind-down and the stop are upstream's market
     exit with DAY orders that Alpaca takes; outside it every order is a marked limit and the stop
-    cancels."""
+    cancels. `slots` is the session part's run setting; the same number are watched, although the fixed
+    ranking still carries only one name."""
     shares = max_shares(price)
     if shares < 1:
         raise ValueError(
@@ -137,8 +139,8 @@ def mover_parts(
             max_move=NO_CHASE_CAP,
             max_shares=shares,
             entries=ENTRIES,
-            slots=1,
-            watch=1,
+            slots=slots,
+            watch=slots,
             bar_spec=LIVE_BARS,
             chase=CHASE,
             rank_max_age_secs=max(1, math.ceil((ends - computed_at).total_seconds())),

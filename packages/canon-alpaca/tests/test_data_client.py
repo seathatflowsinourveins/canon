@@ -17,7 +17,9 @@ thread that does not stop.
 
 import asyncio
 import concurrent.futures
+import functools
 import gc
+import json
 import logging
 import re
 import threading
@@ -37,14 +39,18 @@ import canon_alpaca.data
 import canon_alpaca.factories
 import canon_alpaca.providers
 import pytest
+import requests
 from alpaca.common.exceptions import APIError
 from alpaca.data.enums import DataFeed
+from alpaca.data.historical.stock import StockHistoricalDataClient
+from alpaca.data.requests import StockTradesRequest
 from alpaca.data.timeframe import TimeFrameUnit
 from canon_alpaca.constants import ENV_API_KEY
 from canon_alpaca.constants import ENV_SECRET_KEY
 from canon_alpaca.data import AlpacaDataClient
 from canon_alpaca.data import AlpacaDataClientConfig
 from canon_alpaca.factories import AlpacaDataClientFactory
+from nautilus_trader.common import Clock
 from nautilus_trader.common import Environment
 from nautilus_trader.common import Logger
 from nautilus_trader.common import logging_sync_to_disk
@@ -55,9 +61,12 @@ from nautilus_trader.core import UUID4
 from nautilus_trader.core.datetime import dt_to_unix_nanos
 from nautilus_trader.core.datetime import unix_nanos_to_dt
 from nautilus_trader.live import LiveNode
+from nautilus_trader.live import TradesResponse
+from nautilus_trader.model import AggressorSide
 from nautilus_trader.model import BarType
 from nautilus_trader.model import Equity
 from nautilus_trader.model import InstrumentId
+from nautilus_trader.model import MarketStatusAction
 from nautilus_trader.model import NautilusDataType
 from nautilus_trader.model import Price
 from nautilus_trader.model import TradeId
@@ -1613,8 +1622,11 @@ def test_the_engine_passes_on_only_the_first_subscription_to_an_instrument(venue
 
 
 def stream_call_name(fn: object) -> str:
-    """The alpaca-py stream method a submitted worker call makes, through the partials around it."""
+    """The alpaca-py stream method a submitted worker call makes first, through the partials around it
+    and `call_each`, which makes one call per channel."""
     target = (getattr(fn, "args", ()) or (None,))[0]
+    if isinstance(target, functools.partial) and target.func is canon_alpaca.data.call_each:
+        target = target.args[0][0]
     target = getattr(target, "func", target)
     return getattr(target, "__name__", "")
 
@@ -2168,6 +2180,617 @@ def test_a_stream_call_that_returns_at_once_is_recorded_before_its_hook_returns(
     run_with_client(body, executor=InlineStreamExecutor())
 
 
+# -- historical trades: the single-symbol HTTP endpoint --------------------------------------------
+
+
+@pytest.fixture
+def trades_http(venue, monkeypatch) -> SimpleNamespace:
+    """Real alpaca-py GET handling, with its HTTP session answered entirely offline.
+
+    Alpaca documents `trades` and `next_page_token` for GET /v2/stocks/{symbol}/trades:
+    https://docs.alpaca.markets/us/reference/stocktradesingle-1.
+    """
+    historical = StockHistoricalDataClient(PLACEHOLDER, PLACEHOLDER)
+    ns = SimpleNamespace(
+        pages=[],
+        calls=[],
+        historical=historical,
+        url="https://data.alpaca.markets/v2/stocks/AAPL/trades",
+    )
+
+    def answer(method: str, url: str, **kwargs) -> requests.Response:
+        assert method == "GET"
+        assert url == ns.url
+        ns.calls.append(dict(kwargs["params"]))
+        assert ns.pages, "unexpected HTTP request"
+        page = ns.pages.pop(0)
+        if isinstance(page, Exception):
+            raise page
+        response = requests.Response()
+        response.status_code = 200
+        response._content = json.dumps(page).encode()
+        return response
+
+    monkeypatch.setattr(historical._session, "request", answer)
+    monkeypatch.setattr(canon_alpaca.data, "StockHistoricalDataClient", lambda **_: historical)
+    return ns
+
+
+def historical_trade(second: int, **changes) -> dict:
+    return {
+        "t": (START + timedelta(seconds=second)).isoformat(),
+        "p": 182.12,
+        "s": 100,
+        "i": second + 1000,
+        "x": "V",
+        "c": ["@"],
+        "z": "C",
+        **changes,
+    }
+
+
+def trade_page(trades: list | None, token: str | None = None, symbol: str = "AAPL") -> dict:
+    """The endpoint's required fields, including its required response symbol."""
+    return {"symbol": symbol, "trades": trades, "next_page_token": token}
+
+
+class TradeRequester(Strategy):
+    """Drive the real request/response bridge and record its historical trade callback."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.params: dict | None = None
+        self.limit: int | None = None
+        self.trades_start: datetime | None = START
+        self.trades_end: datetime | None = END
+        self.instrument_ids = [AAPL]
+        self.seen: list = []
+        self.responses: list = []
+        self.request_id = None
+
+    def on_start(self) -> None:
+        ids = self.instrument_ids[0] if len(self.instrument_ids) == 1 else self.instrument_ids
+        self.request_id = self.request_trades(
+            ids, start=self.trades_start, end=self.trades_end, limit=self.limit, params=self.params
+        )
+
+    def on_historical_trades(self, trades) -> None:
+        self.seen.extend(trades)
+
+    def on_data_response(self, response) -> None:
+        if response.failure_reason or response.completed:
+            self.responses.append(response)
+            self.shutdown_system("Alpaca historical trades checked")
+
+
+def test_historical_trades_follow_every_page_and_reach_the_strategy(trades_http) -> None:
+    trades_http.pages = [
+        trade_page([historical_trade(0)], "second"),
+        trade_page([], "third"),
+        trade_page([historical_trade(3600)]),
+    ]
+    strategy = TradeRequester()
+
+    run(build_node(strategy), "hosted")
+
+    assert [r.failure_reason for r in strategy.responses] == [None]
+    assert str(strategy.responses[0].correlation_id) == str(strategy.request_id)
+    assert [t.trade_id for t in strategy.seen] == [TradeId("1000"), TradeId("4600")]
+    assert [t.ts_event for t in strategy.seen] == [dt_to_unix_nanos(START), dt_to_unix_nanos(END)]
+    assert [t.ts_init for t in strategy.seen] == [t.ts_event for t in strategy.seen]
+    first = strategy.seen[0]
+    assert first.instrument_id == AAPL
+    assert first.price == Price.from_str("182.1200")
+    assert int(first.size) == 100
+    assert first.aggressor_side == AggressorSide.NO_AGGRESSOR
+    assert [c.get("page_token") for c in trades_http.calls] == [None, "second", "third"]
+    for call in trades_http.calls:
+        assert call["feed"] == "iex"
+        assert call["sort"] == "asc"
+        assert call["limit"] == 10_000
+        assert datetime.fromisoformat(call["start"]) == START
+        assert datetime.fromisoformat(call["end"]) == END
+        assert "symbols" not in call
+
+
+def test_a_trade_limit_counts_across_pages_and_stops_without_an_extra_fetch(trades_http):
+    trades_http.pages = [
+        trade_page([historical_trade(0), historical_trade(1)], "second"),
+        trade_page([historical_trade(2)], "unneeded"),
+    ]
+    strategy = TradeRequester()
+    strategy.limit = 3
+
+    run(build_node(strategy), "hosted")
+
+    assert [r.failure_reason for r in strategy.responses] == [None]
+    assert [t.trade_id for t in strategy.seen] == [TradeId(str(n)) for n in (1000, 1001, 1002)]
+    assert [c["limit"] for c in trades_http.calls] == [3, 1]
+
+
+@pytest.mark.parametrize("feed", ["iex", "sip", "boats", "otc"])
+def test_trade_history_sends_the_named_feed_and_preserves_response_metadata(
+    venue, trades_http, monkeypatch, feed
+):
+    trades_http.pages = [trade_page([historical_trade(1)])]
+    responses = []
+    request = quotes_request(AAPL, start=START, end=END)
+    request.params = {"feed": feed, "update_catalog": True}
+    # Response bounds retain the exact nanoseconds, not the datetime's truncation.
+    request.start_ns += 17
+    request.end_ns += 23
+
+    async def body(client) -> None:
+        monkeypatch.setattr(client, "_handle_response", responses.append)
+        await client._request_trades(request)
+
+    run_with_client(body)
+
+    (response,) = responses
+    assert isinstance(response, TradesResponse)
+    assert response.client_id.value == "ALPACA"
+    assert response.instrument_id == AAPL
+    assert response.correlation_id == request.request_id
+    assert (response.start, response.end) == (request.start_ns, request.end_ns)
+    assert response.params == request.params == {"feed": feed, "update_catalog": True}
+    assert len(response.data) == 1
+    assert trades_http.calls[0]["feed"] == feed
+
+
+@pytest.mark.parametrize("feed", ["overnight", "delayed_sip", "other", None, 1])
+def test_trade_history_refuses_an_unsupported_feed_before_http(trades_http, feed):
+    strategy = TradeRequester()
+    strategy.params = {"feed": feed}
+
+    run(build_node(strategy), "hosted")
+
+    (response,) = strategy.responses
+    assert response.failure_reason is not None and "feed" in response.failure_reason
+    assert strategy.seen == []
+    assert trades_http.calls == []
+
+
+@pytest.mark.parametrize("trades", [[], None])
+def test_empty_trade_history_completes_with_one_empty_response(trades_http, trades):
+    trades_http.pages = [trade_page(trades)]
+    strategy = TradeRequester()
+
+    run(build_node(strategy), "hosted")
+
+    assert [r.failure_reason for r in strategy.responses] == [None]
+    assert strategy.seen == []
+    assert len(trades_http.calls) == 1
+
+
+def test_a_later_trade_page_failure_does_not_emit_partial_history(trades_http):
+    trades_http.pages = [
+        trade_page([historical_trade(1)], "second"),
+        APIError('{"code": 42210000, "message": "trade page failed"}'),
+    ]
+    strategy = TradeRequester()
+
+    run(build_node(strategy), "hosted")
+
+    (response,) = strategy.responses
+    assert response.failure_reason is not None and "trade page failed" in response.failure_reason
+    assert strategy.seen == []
+    assert len(trades_http.calls) == 2
+
+
+@pytest.mark.parametrize(
+    ("changes", "reason"),
+    [
+        ({"i": None}, "no trade ID"),
+        ({"s": 1.5}, "fractional"),
+        ({"p": float("nan")}, "not a finite number"),
+        ({"p": 0.00001}, "rounds to zero"),
+    ],
+)
+def test_an_unconvertible_historical_trade_fails_the_whole_request(trades_http, changes, reason):
+    trades_http.pages = [trade_page([historical_trade(1), historical_trade(2, **changes)])]
+    strategy = TradeRequester()
+
+    run(build_node(strategy), "hosted")
+
+    (response,) = strategy.responses
+    assert response.failure_reason is not None and reason in response.failure_reason
+    assert strategy.seen == []
+
+
+def test_historical_trade_rounding_is_counted_and_named(trades_http, capfd):
+    trades_http.pages = [trade_page([historical_trade(1, p=0.12345), historical_trade(2)])]
+    strategy = TradeRequester()
+
+    run(build_node(strategy), "hosted")
+
+    assert [r.failure_reason for r in strategy.responses] == [None]
+    assert [t.price for t in strategy.seen] == [
+        Price.from_str("0.1234"),
+        Price.from_str("182.1200"),
+    ]
+    log = logged(capfd)
+    assert "Rounded 1 of 2 Alpaca trades for AAPL" in log
+    assert "0.12345" in log
+
+
+def test_trade_history_refuses_multiple_instruments_before_http(venue, trades_http):
+    async def body(client) -> None:
+        with pytest.raises(ValueError, match="one instrument, got 2"):
+            await client._request_trades(quotes_request(AAPL, AAPL, start=START, end=END))
+
+    run_with_client(body)
+
+    assert trades_http.calls == []
+
+
+def test_trade_history_caps_each_page_at_the_documented_maximum(trades_http):
+    trades_http.pages = [trade_page([historical_trade(1)])]
+    strategy = TradeRequester()
+    strategy.limit = 10_001
+
+    run(build_node(strategy), "hosted")
+
+    assert [r.failure_reason for r in strategy.responses] == [None]
+    assert len(strategy.seen) == 1
+    assert trades_http.calls[0]["limit"] == 10_000
+
+
+def test_trade_history_starting_after_now_completes_without_http(venue, trades_http, monkeypatch):
+    responses = []
+
+    async def body(client) -> None:
+        now = datetime.now(UTC)
+        monkeypatch.setattr(client, "_handle_response", responses.append)
+        await client._request_trades(quotes_request(AAPL, start=now + HOUR, end=now + 2 * HOUR))
+
+    run_with_client(body)
+
+    (response,) = responses
+    assert isinstance(response, TradesResponse) and response.data == []
+    assert trades_http.calls == []
+
+
+def test_historical_trades_let_the_node_loop_run_between_conversion_slices(
+    venue, trades_http, monkeypatch
+):
+    trades_http.pages = [trade_page([historical_trade(n) for n in range(4)])]
+    # Set without requiring the constant to exist yet, so the unimplemented hook is the before failure.
+    monkeypatch.setattr(canon_alpaca.data, "TRADES_PER_SLICE", 2, raising=False)
+    turns = [0]
+    seen_at: list[int] = []
+    parse = canon_alpaca.data.parse_trade
+
+    def counting_parse(*args, **kwargs):
+        seen_at.append(turns[0])
+        return parse(*args, **kwargs)
+
+    monkeypatch.setattr(canon_alpaca.data, "parse_trade", counting_parse)
+
+    async def body(client) -> None:
+        async def count() -> None:
+            while True:
+                turns[0] += 1
+                await asyncio.sleep(0)
+
+        counter = asyncio.ensure_future(count())
+        try:
+            await client._request_trades(quotes_request(AAPL, start=START, end=END))
+        finally:
+            counter.cancel()
+
+    run_with_client(body)
+
+    assert len(seen_at) == 4
+    assert seen_at[0] == seen_at[1] < seen_at[2] == seen_at[3]
+
+
+def test_trade_history_filters_canceled_and_incorrect_prints_before_the_sdk_drops_u(
+    trades_http, capfd
+):
+    trades_http.pages = [
+        trade_page(
+            [historical_trade(0, u="canceled"), historical_trade(1, u="incorrect")], "valid"
+        ),
+        trade_page([historical_trade(2, c=["I"]), historical_trade(3, u="corrected")]),
+    ]
+    strategy = TradeRequester()
+    strategy.limit = 2
+
+    run(build_node(strategy), "hosted")
+
+    assert [r.failure_reason for r in strategy.responses] == [None]
+    assert [t.trade_id for t in strategy.seen] == [TradeId("1002"), TradeId("1003")]
+    assert [c["limit"] for c in trades_http.calls] == [2, 2]
+    log = logged(capfd)
+    assert "Dropped 2 invalid Alpaca trades for AAPL" in log
+    assert "canceled=1, incorrect=1" in log
+
+
+@pytest.mark.parametrize("tokens", [["same", "same"], ["a", "b", "a"], [""]])
+def test_trade_history_refuses_empty_or_repeated_page_tokens(trades_http, tokens):
+    # A final page stops the unfixed implementation too, so a before run cannot spin forever.
+    trades_http.pages = [trade_page([], token) for token in tokens] + [trade_page([])]
+    strategy = TradeRequester()
+
+    run(build_node(strategy), "hosted")
+
+    (response,) = strategy.responses
+    assert response.failure_reason is not None
+    assert "AAPL" in response.failure_reason and "page token" in response.failure_reason
+    assert len(trades_http.calls) == len(tokens)
+    assert strategy.seen == []
+
+
+def test_a_repeated_trade_token_is_refused_even_when_the_page_fills_the_limit(trades_http):
+    trades_http.pages = [
+        trade_page([historical_trade(0)], "same"),
+        trade_page([historical_trade(1)], "same"),
+    ]
+    strategy = TradeRequester()
+    strategy.limit = 2
+
+    run(build_node(strategy), "hosted")
+
+    (response,) = strategy.responses
+    assert response.failure_reason is not None and "repeated page token" in response.failure_reason
+    assert strategy.seen == []
+
+
+def test_trade_history_page_cap_fails_without_partial_data_and_releases_the_http_lock(
+    venue, trades_http, monkeypatch
+):
+    monkeypatch.setattr(canon_alpaca.data, "TRADES_MAX_PAGES", 2, raising=False)
+    trades_http.pages = [
+        trade_page([historical_trade(0)], "a"),
+        trade_page([historical_trade(1)], "b"),
+        trade_page([historical_trade(2)]),
+    ]
+    responses = []
+
+    async def body(client) -> None:
+        monkeypatch.setattr(client, "_handle_response", responses.append)
+        request = quotes_request(AAPL, start=START, end=END)
+        with pytest.raises(ValueError, match="AAPL.*exceeded 2 pages"):
+            await client._request_trades(request)
+        assert len(trades_http.calls) == 2
+        assert responses == []
+        await asyncio.wait_for(client._request_trades(request), 2)
+
+    run_with_client(body)
+
+    (response,) = responses
+    assert [t.trade_id for t in response.data] == [TradeId("1002")]
+    assert len(trades_http.calls) == 3
+
+
+@pytest.mark.parametrize("first_page_size", [1, 3])
+def test_trade_history_enforces_its_total_limit_even_when_a_page_over_returns(
+    trades_http, first_page_size
+):
+    trades_http.pages = [
+        trade_page([historical_trade(n) for n in range(first_page_size)], "second"),
+        trade_page([historical_trade(3), historical_trade(4)]),
+    ]
+    strategy = TradeRequester()
+    strategy.limit = 2
+
+    run(build_node(strategy), "hosted")
+
+    assert [r.failure_reason for r in strategy.responses] == [None]
+    expected_ids = ("1000", "1003") if first_page_size == 1 else ("1000", "1001")
+    assert [t.trade_id for t in strategy.seen] == [TradeId(i) for i in expected_ids]
+
+
+@pytest.mark.parametrize(
+    ("symbol", "encoded"),
+    [("BRK/B", "BRK%2FB"), ("A?B", "A%3FB"), ("A#B", "A%23B"), ("A%B", "A%25B")],
+)
+def test_trade_history_quotes_the_symbol_as_one_url_path_segment(trades_http, symbol, encoded):
+    trades_http.url = f"https://data.alpaca.markets/v2/stocks/{encoded}/trades"
+    trades_http.pages = [trade_page([], symbol=symbol)]
+
+    canon_alpaca.data.fetch_trades(
+        trades_http.historical, StockTradesRequest(symbol_or_symbols=symbol, feed=DataFeed.IEX)
+    )
+
+    assert len(trades_http.calls) == 1
+
+
+def test_trade_history_refuses_a_page_for_another_symbol(trades_http):
+    trades_http.pages = [trade_page([historical_trade(0)], symbol="MSFT")]
+    strategy = TradeRequester()
+
+    run(build_node(strategy), "hosted")
+
+    (response,) = strategy.responses
+    assert response.failure_reason is not None
+    assert "AAPL" in response.failure_reason and "MSFT" in response.failure_reason
+    assert strategy.seen == []
+
+
+@pytest.mark.parametrize(
+    "page",
+    [
+        None,
+        [],
+        {"symbol": "AAPL", "next_page_token": None},
+        {"trades": [], "next_page_token": None},
+        {"symbol": "AAPL", "trades": []},
+        {**trade_page([]), "trades": {}},
+        {**trade_page([]), "trades": "not an array"},
+        trade_page([None]),
+        trade_page(["not an object"]),
+        trade_page([{}]),
+        trade_page([historical_trade(0, u="unknown")]),
+        {**trade_page([]), "next_page_token": 123},
+    ],
+)
+def test_malformed_trade_pages_fail_with_the_symbol_and_page_context(trades_http, page):
+    trades_http.pages = [page]
+    strategy = TradeRequester()
+
+    run(build_node(strategy), "hosted")
+
+    (response,) = strategy.responses
+    assert response.failure_reason is not None
+    assert "AAPL" in response.failure_reason and "page 1" in response.failure_reason
+    assert strategy.seen == []
+
+
+@pytest.mark.parametrize("params", [{"asof": "2022-01-01"}, {"currency": "EUR"}])
+def test_trade_history_refuses_unsupported_mapping_and_currency_params_before_http(
+    trades_http, params
+):
+    trades_http.pages = [trade_page([historical_trade(0)])]
+    strategy = TradeRequester()
+    strategy.params = params
+
+    run(build_node(strategy), "hosted")
+
+    (response,) = strategy.responses
+    assert response.failure_reason is not None
+    assert next(iter(params)) in response.failure_reason
+    assert "not supported" in response.failure_reason
+    assert trades_http.calls == []
+    assert strategy.seen == []
+
+
+def test_the_shared_historical_stand_in_can_answer_an_empty_trade_request(venue):
+    strategy = TradeRequester()
+
+    run(build_node(strategy), "hosted")
+
+    assert [r.failure_reason for r in strategy.responses] == [None]
+    assert strategy.seen == []
+
+
+def test_trade_history_preserves_nanosecond_bounds_and_raw_trade_timestamps(
+    venue, trades_http, monkeypatch
+):
+    trades_http.pages = [
+        trade_page([historical_trade(0, t="2022-01-03T09:00:00.000000500Z")], "unneeded")
+    ]
+    request = quotes_request(AAPL, start=START, end=START)
+    request.start_ns += 17
+    request.end_ns += 800
+    request.limit = 1
+    responses = []
+
+    async def body(client) -> None:
+        monkeypatch.setattr(client, "_handle_response", responses.append)
+        await client._request_trades(request)
+
+    run_with_client(body)
+
+    (sent,) = trades_http.calls
+    assert dt_to_unix_nanos(sent["start"]) == request.start_ns
+    assert dt_to_unix_nanos(sent["end"]) == request.end_ns
+    (response,) = responses
+    (trade,) = response.data
+    assert trade.ts_event == trade.ts_init == dt_to_unix_nanos(START) + 500
+    assert (response.start, response.end) == (request.start_ns, request.end_ns)
+
+
+def test_out_of_window_trade_rows_do_not_consume_the_exact_window_limit(
+    venue, trades_http, monkeypatch
+):
+    trades_http.pages = [
+        trade_page([historical_trade(0)], "inside"),
+        trade_page([historical_trade(1, t="2022-01-03T09:00:00.000000500Z")]),
+    ]
+    request = quotes_request(AAPL, start=START, end=START)
+    request.start_ns += 17
+    request.end_ns += 800
+    request.limit = 1
+    responses = []
+
+    async def body(client) -> None:
+        monkeypatch.setattr(client, "_handle_response", responses.append)
+        await client._request_trades(request)
+
+    run_with_client(body)
+
+    (response,) = responses
+    assert [t.trade_id for t in response.data] == [TradeId("1001")]
+    assert [c["limit"] for c in trades_http.calls] == [1, 1]
+
+
+def test_a_trade_catalog_gap_starting_one_nanosecond_after_coverage_keeps_its_first_trade(
+    trades_http, tmp_path
+):
+    boundary = START + timedelta(seconds=1)
+    trades_http.pages = [trade_page([historical_trade(1)])]
+    first = TradeRequester()
+    first.trades_end = boundary
+    first.params = {"update_catalog": True}
+
+    run(build_node(first, catalog=tmp_path), "hosted")
+
+    assert [r.failure_reason for r in first.responses] == [None]
+    assert [t.trade_id for t in first.seen] == [TradeId("1001")]
+    BUILT_NODES.pop().dispose()
+    trades_http.pages = [trade_page([historical_trade(2, t="2022-01-03T09:00:01.000000500Z")])]
+    second = TradeRequester()
+    second.trades_end = START + timedelta(seconds=2)
+    second.params = {"update_catalog": True}
+
+    run(build_node(second, catalog=tmp_path), "hosted")
+
+    assert [r.failure_reason for r in second.responses] == [None]
+    assert [t.trade_id for t in second.seen] == [TradeId("1001"), TradeId("1002")]
+    assert [t.ts_init for t in second.seen] == [
+        dt_to_unix_nanos(boundary),
+        dt_to_unix_nanos(boundary) + 500,
+    ]
+    assert dt_to_unix_nanos(trades_http.calls[1]["start"]) == dt_to_unix_nanos(boundary) + 1
+    catalog = ParquetDataCatalog(str(tmp_path))
+    assert [t.ts_init for t in catalog.query_trade_ticks([str(AAPL)])] == [
+        t.ts_init for t in second.seen
+    ]
+    BUILT_NODES.pop().dispose()
+    again = TradeRequester()
+    again.trades_end = second.trades_end
+    again.params = {"update_catalog": True}
+
+    run(build_node(again, catalog=tmp_path), "hosted")
+
+    assert [r.failure_reason for r in again.responses] == [None]
+    assert [t.ts_init for t in again.seen] == [t.ts_init for t in second.seen]
+    assert len(trades_http.calls) == 2
+
+
+def test_trade_catalog_reads_ignore_feed_unless_skip_catalog_data_is_set(trades_http, tmp_path):
+    trades_http.pages = [trade_page([historical_trade(0)])]
+    first = TradeRequester()
+    first.params = {"feed": "iex", "update_catalog": True}
+
+    run(build_node(first, catalog=tmp_path), "hosted")
+
+    assert [r.failure_reason for r in first.responses] == [None]
+    BUILT_NODES.pop().dispose()
+    trades_http.pages = [trade_page([historical_trade(1, p=999)])]
+    catalog_read = TradeRequester()
+    catalog_read.params = {"feed": "sip"}  # no write-back: the registered catalog still answers
+
+    run(build_node(catalog_read, catalog=tmp_path), "hosted")
+
+    assert [r.failure_reason for r in catalog_read.responses] == [None]
+    assert [t.trade_id for t in catalog_read.seen] == [TradeId("1000")]
+    assert len(trades_http.calls) == 1
+    BUILT_NODES.pop().dispose()
+    bypass = TradeRequester()
+    bypass.params = {"feed": "sip", "skip_catalog_data": True}
+
+    run(build_node(bypass, catalog=tmp_path), "hosted")
+
+    assert [r.failure_reason for r in bypass.responses] == [None]
+    assert [t.price for t in bypass.seen] == [Price.from_str("999.0000")]
+    assert len(trades_http.calls) == 2
+    assert trades_http.calls[1]["feed"] == "sip"
+    assert dt_to_unix_nanos(trades_http.calls[1]["start"]) == dt_to_unix_nanos(START)
+    assert dt_to_unix_nanos(trades_http.calls[1]["end"]) == dt_to_unix_nanos(END)
+
+
 # -- historical quotes (ADR 0066) ------------------------------------------------------------------
 
 Q_START = datetime(2022, 1, 3, 15, tzinfo=UTC)
@@ -2621,6 +3244,84 @@ def test_alpaca_py_reconnects_a_mute_stream_and_sends_its_subscriptions_again(
     assert "[ERROR]" not in lines[0]  # a reconnect is a warning: a quiet feed fails nothing
 
 
+def test_a_subscribe_made_before_a_late_reconnect_warning_is_sent_on_the_next_message(
+    venue, alpaca, monkeypatch
+) -> None:
+    # Found by a second reader of the change: the node loop may run a subscribe hook after alpaca-py has
+    # dropped a mute connection and before the relayed warning reaches the loop. The hook still sees the
+    # old connection heard from, so marks nothing, and alpaca-py records the subscribe without sending it
+    # while it reconnects (`_subscribe` sends only while `_running`). The warning, processed later, must
+    # still have the next message send the client's subscriptions again.
+    stream, socket = alpaca.memory_stream(monkeypatch)  # alpaca-py's own backoff, 0.5 to 1 s
+
+    def build(**kwargs: object) -> object:
+        stream._data_timeout = kwargs["data_timeout"]
+        return stream
+
+    monkeypatch.setattr(canon_alpaca.data, "StockDataStream", build)
+    gate = threading.Event()
+
+    async def body(client) -> None:
+        await client._subscribe_quotes(command(AAPL))
+        socket.deliver(alpaca.wire_quote())
+        await wait_until(lambda: client._stream_heard)
+        socket.gate = gate
+        try:
+            # Blocking this loop stands in for a busy node: the reconnect's first send is held after
+            # alpaca-py snapshotted its maps, with `_running` still false, and the warning that came
+            # before it waits behind this coroutine.
+            assert socket.holding.wait(5), "alpaca-py did not reconnect"
+            # No second reconnect, whose replay of every handler map would send the trades by itself
+            # (`_consume` reads `_data_timeout` on each pass); set while the reconnect is held.
+            stream._data_timeout = None
+            assert client._stream_heard
+            await client._subscribe_trades(command(AAPL))
+        finally:
+            gate.set()
+        await wait_until(lambda: stream._running)
+        assert "AAPL" in stream._handlers["trades"]
+        assert socket.wire["trades"] == set()  # the subscribe was recorded and not sent
+        socket.deliver(alpaca.wire_quote())
+        await wait_until(lambda: socket.wire["trades"] == {"AAPL"})
+
+    config = data_config(stream_data_timeout_secs=0.2, stream_mute_limit_secs=None)
+    run_with_client(body, config=config)
+
+
+def test_a_resend_planned_before_a_reconnect_warning_leaves_the_next_connection_owed_one(
+    venue, alpaca
+) -> None:
+    # Found by the change's code review: a resend still waiting for the call ahead of it when alpaca-py
+    # drops the connection may reach alpaca-py while it reconnects, recorded and not sent. Finishing it
+    # must not clear what the reconnect warning marked.
+    stream = venue.stream
+    stream.trades = []
+
+    async def body(client) -> None:
+        await client._subscribe_quotes(command(AAPL))
+        await wait_until(lambda: client._stream_heard)
+        await client._stream_calls.acquire()  # as a subscribe still inside alpaca-py
+        try:
+            client._stream_heard, client._resend_needed = False, True  # as after a lost subscribe
+            handler = stream.quote_handlers["AAPL"]
+            await asyncio.to_thread(
+                asyncio.run, handler(alpaca.quote())
+            )  # plans the resend; it waits
+            await wait_until(lambda: client._resend_tries == 1)
+            assert client._stream_thread is not None
+            warning = "no data received on stock data stream for 900.0s, reconnecting"
+            client._on_stream_log((client._stream_thread.name, "iex", logging.WARNING, warning))
+        finally:
+            client._stream_calls.release()
+        await wait_until(
+            lambda: stream.subscribes_sent == 1
+        )  # the resend planned before the warning
+        await asyncio.sleep(0.05)
+        assert client._resend_needed  # the next connection's first message sends them again
+
+    run_with_client(body)
+
+
 def test_a_stream_mute_past_the_limit_is_stopped_and_named(venue, capfd) -> None:
     venue.stream.quotes, venue.stream.trades = [], []  # connected, subscribed, and sending nothing
 
@@ -2637,7 +3338,7 @@ def test_a_stream_mute_past_the_limit_is_stopped_and_named(venue, capfd) -> None
     log = logged(capfd)
     (line,) = [line for line in log.splitlines() if "went mute" in line and "[ERROR]" in line][:1]
     # What a session window reads as its stream's error: a line that begins with the feed.
-    assert "Alpaca stream on feed iex went mute: no quote or trade for" in line
+    assert "Alpaca stream on feed iex went mute: no market data for" in line
     assert "stream_mute_limit_secs" in line
     assert "ended by itself" not in log
 
@@ -2879,3 +3580,389 @@ def test_unsubscribing_quotes_logs_the_quote_count_and_leaves_the_trade_count(
     log = logged(capfd)
     assert len(stream_lines(log, "dropped 1 AAPL quotes")) == 1  # at the unsubscribe, not again
     assert len(stream_lines(log, "rounded 2 AAPL trade prices")) == 1  # at disconnect only
+
+
+# -- whole-market minute bars and trading statuses on the stream (ADR 0090) -----------------------------
+
+MINUTE = BarType.from_str("AAPL.ALPACA-1-MINUTE-LAST-EXTERNAL")
+MSFT = InstrumentId.from_str("MSFT.ALPACA")
+MSFT_MINUTE = BarType.from_str("MSFT.ALPACA-1-MINUTE-LAST-EXTERNAL")
+
+
+class Watcher(Strategy):
+    """Subscribe bars and statuses as configured, and record what arrives."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.bar_types: list[BarType] = []
+        self.status_ids: list[InstrumentId] = []
+        self.params: dict | None = None
+        self.seen_bars: list = []
+        self.seen_statuses: list = []
+
+    def on_start(self) -> None:
+        if self.bar_types:
+            self.subscribe_bars(self.bar_types, params=self.params)
+        if self.status_ids:
+            self.subscribe_instrument_status(self.status_ids, params=self.params)
+
+    def on_bar(self, bar) -> None:
+        self.seen_bars.append(bar)
+
+    def on_instrument_status(self, status) -> None:
+        self.seen_statuses.append(status)
+
+
+def watcher(**options: object) -> Watcher:
+    strategy = Watcher()
+    for name, value in options.items():
+        assert hasattr(strategy, name), name
+        setattr(strategy, name, value)
+    return strategy
+
+
+@pytest.fixture
+def market(venue, alpaca, monkeypatch) -> SimpleNamespace:
+    """alpaca-py's real stream on an in-memory socket, with AAPL and MSFT both loaded."""
+    stream, socket = alpaca.memory_stream(monkeypatch)
+    monkeypatch.setattr(canon_alpaca.data, "StockDataStream", lambda **_: stream)
+    msft = {**alpaca.ASSET_AAPL, "symbol": "MSFT", "id": "4ce9353c-66d1-46c2-898f-fce867ab0247"}
+    venue.trading.assets = [alpaca.ASSET_AAPL, msft]
+    config = AlpacaDataClientConfig(
+        instrument_provider=InstrumentProviderConfig(load_ids=["AAPL.ALPACA", "MSFT.ALPACA"])
+    )
+    return SimpleNamespace(stream=stream, socket=socket, config=config)
+
+
+def test_a_minute_bar_subscription_hands_the_engine_the_streamed_bar(market, alpaca) -> None:
+    strategy = watcher(bar_types=[MINUTE])
+
+    async def body(client) -> None:
+        await wait_until(lambda: market.socket.held("bars") == {"AAPL"})
+        market.socket.deliver(alpaca.wire_bar())
+        await wait_until(lambda: strategy.seen_bars)
+
+    run_with_client(body, strategy, config=market.config)
+
+    (bar,) = strategy.seen_bars
+    assert bar.bar_type == MINUTE
+    assert str(bar.open) == "178.2600" and str(bar.close) == "178.2100"
+    assert bar.ts_event == dt_to_unix_nanos(datetime(2022, 1, 3, 9, tzinfo=UTC))  # at its open
+
+
+def test_consecutive_streamed_bars_keep_receipt_times_separate_from_interval_ends(
+    market, alpaca, monkeypatch
+) -> None:
+    # Arrival is 100 ms after each minute ends. The next minute still opens at
+    # the previous interval's end, before its receipt; ts_init cannot be used as that boundary.
+    strategy = watcher(bar_types=[MINUTE])
+    clock = Clock.new_test()
+    opens = [
+        datetime(2022, 1, 3, 14, 30, tzinfo=UTC),
+        datetime(2022, 1, 3, 14, 31, tzinfo=UTC),
+    ]
+    receipts = [
+        dt_to_unix_nanos(datetime(2022, 1, 3, 14, 31, 0, 100_000, tzinfo=UTC)),
+        dt_to_unix_nanos(datetime(2022, 1, 3, 14, 32, 0, 100_000, tzinfo=UTC)),
+    ]
+
+    async def body(client) -> None:
+        await wait_until(lambda: market.socket.held("bars") == {"AAPL"})
+        # Keep the real stream, handler and engine; restore the adapter's live clock before shutdown.
+        with monkeypatch.context() as stamp:
+            stamp.setattr(client, "clock", clock)
+            for count, (opened, received) in enumerate(zip(opens, receipts, strict=True), start=1):
+                clock.set_time(received)
+                message = alpaca.wire_bar()
+                message["t"] = SimpleNamespace(to_datetime=lambda at=opened: at)
+                market.socket.deliver(message)
+                await wait_until(lambda count=count: len(strategy.seen_bars) == count)
+
+    cache = run_with_client(body, strategy, config=market.config)
+
+    bars = strategy.seen_bars
+    assert len(bars) == 2
+    assert [bar.ts_event for bar in bars] == [dt_to_unix_nanos(opened) for opened in opens]
+    assert [bar.ts_init for bar in bars] == receipts
+    assert bars[0].ts_event + 60_000_000_000 == bars[1].ts_event < bars[0].ts_init
+    cached = cache.bar(MINUTE)
+    assert cached is not None and cached.ts_init == receipts[1]
+
+
+def test_a_wildcard_bar_subscription_sends_star_and_hands_on_only_listed_symbols(
+    market, alpaca
+) -> None:
+    strategy = watcher(bar_types=[MINUTE], params={"wildcard": True})
+
+    async def body(client) -> None:
+        await wait_until(lambda: market.socket.held("bars") == {"*"})
+        market.socket.deliver(alpaca.wire_bar(symbol="MSFT"), alpaca.wire_bar(symbol="ZZZZ"))
+        market.socket.deliver(alpaca.wire_bar())
+        await wait_until(lambda: strategy.seen_bars)
+        await asyncio.sleep(0.1)
+
+    cache = run_with_client(body, strategy, config=market.config)
+
+    assert [b.bar_type for b in strategy.seen_bars] == [MINUTE]
+    assert not cache.has_bars(MSFT_MINUTE)  # loaded, but not listed: nobody subscribed to it
+
+
+def test_a_bar_type_the_stream_does_not_carry_is_refused_by_name(market, capfd) -> None:
+    hourly = BarType.from_str("AAPL.ALPACA-1-HOUR-LAST-EXTERNAL")
+    strategy = watcher(bar_types=[hourly])
+
+    async def body(client) -> None:
+        await asyncio.sleep(0.2)
+
+    run_with_client(body, strategy, config=market.config)
+
+    assert market.socket.held("bars") == set()
+    log = logged(capfd)
+    assert "Cannot subscribe: AAPL.ALPACA-1-HOUR-LAST-EXTERNAL" in log
+    assert "1-MINUTE-LAST-EXTERNAL" in log
+
+
+@pytest.mark.parametrize("asked", [False, True])
+def test_updated_bars_are_handed_on_only_when_asked(market, alpaca, asked) -> None:
+    strategy = watcher(bar_types=[MINUTE], params={"updated_bars": True} if asked else None)
+
+    async def body(client) -> None:
+        await wait_until(lambda: market.socket.held("bars") == {"AAPL"})
+        assert market.socket.held("updatedBars") == ({"AAPL"} if asked else set())
+        market.socket.deliver(alpaca.wire_bar())
+        await wait_until(lambda: strategy.seen_bars)
+        market.socket.deliver(alpaca.wire_bar("u", c=178.3, h=178.3))
+        if asked:
+            await wait_until(lambda: len(strategy.seen_bars) == 2)
+        else:
+            await asyncio.sleep(0.1)
+
+    run_with_client(body, strategy, config=market.config)
+
+    closes = [str(b.close) for b in strategy.seen_bars]
+    assert closes == (["178.2100", "178.3000"] if asked else ["178.2100"])
+
+
+@pytest.mark.parametrize(
+    ("code", "action", "trading", "quoting", "restricted"),
+    [
+        ("2", MarketStatusAction.HALT, False, None, None),
+        ("H", MarketStatusAction.HALT, False, None, None),
+        ("P", MarketStatusAction.PAUSE, False, None, None),
+        ("3", MarketStatusAction.TRADING, True, None, None),
+        ("T", MarketStatusAction.TRADING, True, None, None),
+        ("Q", MarketStatusAction.QUOTING, False, True, None),
+        ("5", MarketStatusAction.NEW_PRICE_INDICATION, None, None, None),
+        # Alpaca names the code only "Short Sale Restriction"; CTA keeps whether it starts or ends apart
+        ("E", MarketStatusAction.SHORT_SELL_RESTRICTION_CHANGE, None, None, None),
+        ("7", MarketStatusAction.NONE, None, None, None),
+        ("F", MarketStatusAction.NONE, None, None, None),
+    ],
+)
+def test_each_alpaca_status_code_becomes_an_instrument_status(
+    market, alpaca, code, action, trading, quoting, restricted
+) -> None:
+    strategy = watcher(status_ids=[AAPL])
+
+    async def body(client) -> None:
+        await wait_until(lambda: market.socket.held("statuses") == {"AAPL"})
+        market.socket.deliver(alpaca.wire_status(code, "T1"))
+        await wait_until(lambda: strategy.seen_statuses)
+
+    run_with_client(body, strategy, config=market.config)
+
+    (status,) = strategy.seen_statuses
+    assert status.instrument_id == AAPL
+    assert status.action == action
+    assert (status.is_trading, status.is_quoting, status.is_short_sell_restricted) == (
+        trading,
+        quoting,
+        restricted,
+    )
+    assert status.trading_event == f"{code} status {code}"
+    assert status.reason == "T1 reason T1"
+    assert status.ts_event == dt_to_unix_nanos(datetime(2022, 1, 3, 15, 30, tzinfo=UTC))
+
+
+def test_a_wildcard_status_subscription_hands_on_only_listed_symbols(market, alpaca) -> None:
+    strategy = watcher(status_ids=[AAPL], params={"wildcard": True})
+
+    async def body(client) -> None:
+        await wait_until(lambda: market.socket.held("statuses") == {"*"})
+        market.socket.deliver(alpaca.wire_status("H", symbol="MSFT"))
+        market.socket.deliver(alpaca.wire_status("H"))
+        await wait_until(lambda: strategy.seen_statuses)
+        await asyncio.sleep(0.1)
+
+    run_with_client(body, strategy, config=market.config)
+
+    assert [s.instrument_id for s in strategy.seen_statuses] == [AAPL]
+
+
+def test_unsubscribing_the_last_listed_symbol_unsubscribes_the_wildcard(market) -> None:
+    strategy = watcher(bar_types=[MINUTE, MSFT_MINUTE], params={"wildcard": True})
+
+    async def body(client) -> None:
+        await wait_until(lambda: market.socket.held("bars") == {"*"})
+        strategy.unsubscribe_bars(MINUTE, params={"wildcard": True})
+        await asyncio.sleep(0.1)
+        assert market.socket.held("bars") == {"*"}  # MSFT is still listed
+        strategy.unsubscribe_bars(MSFT_MINUTE, params={"wildcard": True})
+        await wait_until(lambda: market.socket.held("bars") == set())
+
+    run_with_client(body, strategy, config=market.config)
+
+
+def test_a_reconnect_sends_the_wildcard_again(market, alpaca, monkeypatch) -> None:
+    market.stream._reconnect_min_backoff = 0.01  # alpaca-py waits 0.5 to 1 s first; shortened here
+
+    def build(**kwargs: object) -> object:
+        market.stream._data_timeout = kwargs["data_timeout"]
+        return market.stream
+
+    monkeypatch.setattr(canon_alpaca.data, "StockDataStream", build)
+    strategy = watcher(bar_types=[MINUTE], status_ids=[AAPL], params={"wildcard": True})
+
+    def sent(channel: str) -> list:
+        return [
+            m[channel] for m in market.socket.sent if m["action"] == "subscribe" and channel in m
+        ]
+
+    async def body(client) -> None:
+        await wait_until(lambda: market.socket.held("statuses") == {"*"})
+        await wait_until(lambda: len(sent("bars")) >= 3)  # a reconnect replays both maps
+
+    config = AlpacaDataClientConfig(
+        instrument_provider=market.config.instrument_provider,
+        stream_data_timeout_secs=0.1,
+        stream_mute_limit_secs=None,
+    )
+    run_with_client(body, strategy, config=config)
+
+    assert all(symbols == ["*"] for symbols in sent("bars"))
+
+
+def test_a_resend_under_the_wildcard_sends_the_wildcard_and_no_listed_symbol(
+    market, alpaca
+) -> None:
+    # Code review of M-a: the resend took a channel's first key, a listed symbol, which alpaca-py then
+    # held, and Alpaca with it, apart from `"*"`.
+    strategy = watcher(bar_types=[MINUTE], params={"wildcard": True})
+
+    async def body(client) -> None:
+        await wait_until(lambda: market.socket.held("bars") == {"*"})
+        sent = len(market.socket.sent)
+        client._stream_heard, client._resend_needed = False, True  # as after a lost subscribe
+        market.socket.deliver(alpaca.wire_bar())
+        await wait_until(lambda: not client._resend_needed)
+        assert len(market.socket.sent) > sent  # the resend went out
+        assert set(market.stream._handlers["bars"]) == {"*"}
+
+    run_with_client(body, strategy, config=market.config)
+
+    subscribed = [
+        m["bars"] for m in market.socket.sent if m["action"] == "subscribe" and "bars" in m
+    ]
+    assert all(symbols == ["*"] for symbols in subscribed), subscribed
+
+
+def test_the_mute_limit_counts_the_whole_markets_messages_under_the_wildcard(
+    market, alpaca, capfd
+) -> None:
+    # Code review of M-a: only a listed symbol's message reset the mute clock, so a busy wildcard
+    # stream with a quiet listed symbol was stopped as mute.
+    strategy = watcher(status_ids=[AAPL], params={"wildcard": True})
+
+    async def body(client) -> None:
+        await wait_until(lambda: market.socket.held("statuses") == {"*"})
+        # an unlisted status every 0.1 s for 0.8 s, past the limit four times over
+        for _ in range(8):
+            market.socket.deliver(alpaca.wire_status("H", symbol="MSFT"))
+            await asyncio.sleep(0.1)
+        assert client._stream_failure is None
+
+    config = AlpacaDataClientConfig(
+        instrument_provider=market.config.instrument_provider,
+        stream_data_timeout_secs=None,
+        stream_mute_limit_secs=0.2,
+    )
+    run_with_client(body, strategy, config=config)
+
+    assert "went mute" not in logged(capfd)
+    assert not strategy.seen_statuses
+
+
+def test_a_channel_whose_unsubscribe_was_sent_is_forgotten_when_a_later_one_fails(
+    market, monkeypatch, capfd
+) -> None:
+    # Code review of M-a: one command unsubscribes bars and updated bars; when the second failed,
+    # both stayed recorded, so every retry asked alpaca-py to drop bars it no longer held (KeyError).
+    strategy = watcher(bar_types=[MINUTE], params={"updated_bars": True})
+    unsubscribe = SimpleNamespace(bar_types=[MINUTE], params=None)
+
+    async def body(client) -> None:
+        await wait_until(lambda: market.socket.held("updatedBars") == {"AAPL"})
+        real = market.stream.unsubscribe_updated_bars
+
+        def fail_once(*symbols: str) -> None:
+            monkeypatch.setattr(market.stream, "unsubscribe_updated_bars", real)
+            raise OSError("the socket closed")
+
+        monkeypatch.setattr(market.stream, "unsubscribe_updated_bars", fail_once)
+        with pytest.raises(OSError, match="the socket closed"):
+            await client._unsubscribe_bars(unsubscribe)
+        assert market.socket.held("bars") == set()
+        await client._unsubscribe_bars(unsubscribe)  # the retry
+        assert market.socket.held("updatedBars") == set()
+        assert not client._bars.symbols and not client._updated_bars.symbols
+
+    run_with_client(body, strategy, config=market.config)
+
+    assert "KeyError" not in logged(capfd)
+
+
+def test_a_listed_symbol_dropped_under_a_kept_wildcard_has_its_count_logged_and_reset(
+    market, capfd
+) -> None:
+    # Code review of M-a: a symbol forgotten under a `"*"` others keep skipped the count's last line
+    # and its reset, so a later subscription went on from the old total.
+    strategy = watcher(bar_types=[MINUTE, MSFT_MINUTE], params={"wildcard": True})
+
+    async def body(client) -> None:
+        await wait_until(lambda: market.socket.held("bars") == {"*"})
+        client._rounded_bars["AAPL"] = 3
+        await client._unsubscribe_bars(SimpleNamespace(bar_types=[MINUTE], params=None))
+        assert "AAPL" not in client._rounded_bars
+        assert market.socket.held("bars") == {"*"}  # MSFT still listed
+
+    run_with_client(body, strategy, config=market.config)
+
+    assert "rounded 3 AAPL bars to the instrument's price precision" in logged(capfd)
+
+
+def test_a_mute_streams_error_counts_a_long_listing_rather_than_naming_every_symbol(
+    market, capfd
+) -> None:
+    # Code review of M-a: the error named every listed symbol, one line of thousands of names with a
+    # whole-market listing.
+    strategy = watcher(status_ids=[AAPL], params={"wildcard": True})
+
+    async def body(client) -> None:
+        await wait_until(lambda: market.socket.held("statuses") == {"*"})
+        star = client._statuses.symbols["*"]
+        client._statuses.symbols.update({f"S{n:04d}": star for n in range(2000)})
+        await wait_until(lambda: client._stream_failure is not None)
+        for n in range(2000):  # not subscribed by the engine, so not unsubscribed at the stop
+            del client._statuses.symbols[f"S{n:04d}"]
+
+    config = AlpacaDataClientConfig(
+        instrument_provider=market.config.instrument_provider,
+        stream_data_timeout_secs=None,
+        stream_mute_limit_secs=0.2,
+    )
+    run_with_client(body, strategy, config=config)
+
+    lines = [line for line in logged(capfd).splitlines() if "went mute" in line]
+    line = next(line for line in lines if "[ERROR]" in line and "no market data for" in line)
+    assert all(len(line) < 2000 for line in lines)
+    assert "statuses 2002 symbols" in line

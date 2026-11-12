@@ -293,16 +293,23 @@ def read_normals(
     symbols: Sequence[str],
     window_start: datetime,
     minutes: int,
+    *,
+    overnight: bool = False,
 ) -> dict[str, list[list[float]]]:
     """For each symbol, `NORMAL_SESSIONS` lists of dollar volume by minute of the run's clock window
     (`window_start` for `minutes`, New York time) in the last sessions before today: one bars read per
-    weekday, until that many weekdays had a bar for any symbol of the batch, at most `LOOKBACK_WEEKDAYS`."""
+    weekday, until that many weekdays had a bar for any symbol of the batch, at most `LOOKBACK_WEEKDAYS`.
+    Overnight from 20:00 ET uses each weekday trade date's preceding evening (Sunday–Thursday), as
+    Alpaca's 24/5 Trading API page assigns it; before 20:00 the clock date is the trade date."""
     start_ny = window_start.astimezone(NEW_YORK)
+    evening = overnight and start_ny.hour >= 20
+    trade_date = start_ny.date() + timedelta(days=int(evening))
     sessions: dict[str, list[list[float]]] = {s: [] for s in symbols}
     held = 0
-    for day in prior_weekdays(start_ny.date()):
+    for trade_day in prior_weekdays(trade_date):
         if held == NORMAL_SESSIONS:
             break
+        day = trade_day - timedelta(days=int(evening))
         begin = datetime.combine(day, start_ny.timetz().replace(tzinfo=None), NEW_YORK)
         bars = client.get_stock_bars(
             StockBarsRequest(
@@ -420,6 +427,8 @@ def refresh(
     minutes: int,
     clock: Callable[[], float],
     until: float,
+    *,
+    overnight: bool = False,
 ) -> int:
     """Read references for symbols not yet looked up, then normals for the top `CANDIDATES` by move not yet
     read, each within its bound per minute, starting no read at or after `until` on `clock`. References are
@@ -446,7 +455,9 @@ def refresh(
             break
         if not reads.read(
             f"normals ({len(batch)})",
-            lambda b=batch: reads.normals.update(read_normals(client, b, window_start, minutes)),
+            lambda b=batch: reads.normals.update(
+                read_normals(client, b, window_start, minutes, overnight=overnight)
+            ),
         ):
             reads.normals.update({s: [] for s in batch})
     return len(reads.failed) - before
