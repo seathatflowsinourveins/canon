@@ -766,15 +766,59 @@ def test_no_query_spans_the_excluded_dates_between_dev_and_recent(
     assert windows and not any(start <= excluded <= end for start, end in windows)
 
 
-def test_a_bar_outside_its_feeds_hours_on_an_allowed_session_is_refused(tmp_path, alpaca_bars):
+@pytest.mark.parametrize(
+    ("root", "clock", "feed"),
+    [
+        ("recent", time(21), "sip"),  # a sip bar in boats hours
+        ("recent", time(20), "sip"),  # a sip bar opening at 20:00, as Alpaca's sip serves one
+        ("overnight", time(10), "boats"),  # a boats bar in sip hours
+    ],
+)
+def test_a_bar_outside_its_feeds_hours_is_left_out_and_counted(
+    tmp_path, alpaca_bars, monkeypatch, root, clock, feed
+):
+    """The per-session read bounded each query to the feed's hours, so such a bar never came back; the
+    span read leaves it out the same way and counts it in the header, instead of stopping the build."""
+    p = writer()
+    monkeypatch.setattr(p, "MAX_OUTSIDE_SHARE", 1.0)
+    roots = catalogs(tmp_path, alpaca_bars)
+    equity = alpaca_bars.equity()
+    sessions = [DAY, AS_OF, date(2026, 10, 19)]
+    kwargs = {
+        "as_of": date(2026, 10, 19),
+        "holdout_file": holdout_file(tmp_path, FAR),
+        "recent_root": roots["recent"],
+        "long_root": roots["long"],
+        "overnight_root": roots["overnight"],
+    }
+    clean = json.loads(
+        p.build_profile(sessions=sessions, baseline_dir=tmp_path / "clean", **kwargs).read_text()
+    )
+    # Inside the read span, in a supplied session, outside the feed's own hours.
+    ParquetDataCatalog(str(roots[root])).write_bars([minute(equity, DAY, clock, 101, 99, 100)])
+    path = p.build_profile(sessions=sessions, baseline_dir=tmp_path / "out", **kwargs)
+    doc = json.loads(path.read_text())
+    for name in ("sip", "boats"):
+        before, after = clean["outside_feed_hours"][name], doc["outside_feed_hours"][name]
+        assert before["left_out"] == 0
+        assert after["left_out"] == (1 if name == feed else 0)
+        assert after["read"] == before["read"] + (1 if name == feed else 0)
+    assert doc["symbols"] == clean["symbols"]
+    p.read_profile(path, as_of=date(2026, 10, 19))
+
+
+def test_too_many_bars_outside_their_feeds_hours_stop_the_build(tmp_path, alpaca_bars):
+    """A shifted clock would push a share of every session out of hours: above the bound, stop."""
     p = writer()
     roots = catalogs(tmp_path, alpaca_bars)
     equity = alpaca_bars.equity()
-    # A sip bar at 21:00 on DAY falls in AS_OF's part, inside the read span, in boats hours.
     ParquetDataCatalog(str(roots["recent"])).write_bars(
-        [minute(equity, DAY, time(21), 101, 99, 100)]
+        [minute(equity, DAY, time(21, m), 101, 99, 100) for m in range(30)]
     )
-    with pytest.raises(history_load.HistoryStopped, match="outside feed hours"):
+    out = tmp_path / "out"
+    with pytest.raises(
+        history_load.HistoryStopped, match="sip bars read fall outside.*clock suspect"
+    ):
         p.build_profile(
             sessions=[DAY, AS_OF, date(2026, 10, 19)],
             as_of=date(2026, 10, 19),
@@ -782,8 +826,52 @@ def test_a_bar_outside_its_feeds_hours_on_an_allowed_session_is_refused(tmp_path
             recent_root=roots["recent"],
             long_root=roots["long"],
             overnight_root=roots["overnight"],
-            baseline_dir=tmp_path / "out",
+            baseline_dir=out,
         )
+    assert not (out / "trail-profile-v1.json").exists()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        {"sip": {"left_out": -1, "read": 5}, "boats": {"left_out": 0, "read": 5}},
+        {"sip": {"left_out": 0, "read": 5}},
+        {"sip": {"left_out": 0, "read": 5}, "boats": {"left_out": 0}},
+        {"sip": {"left_out": True, "read": 5}, "boats": {"left_out": 0, "read": 5}},
+        {"sip": {"left_out": 5, "read": 5}, "boats": {"left_out": 0, "read": 5}},
+        {"sip": 0, "boats": 0},
+        [],
+    ],
+)
+def test_the_reader_checks_the_outside_hours_count(tmp_path, alpaca_bars, value):
+    p = writer()
+    path = build(tmp_path, alpaca_bars)
+    doc = json.loads(path.read_text())
+    doc["outside_feed_hours"] = value
+    path.write_text(json.dumps(doc))
+    with pytest.raises(
+        history_load.HistoryStopped, match="header/data refused: header outside_feed_hours"
+    ):
+        p.read_profile(path, as_of=AS_OF)
+
+
+@pytest.mark.parametrize(
+    ("written_at", "reads"),
+    [("2026-11-12T11:00:45+00:00", True), ("2026-11-12T16:00:00+00:00", False)],
+)
+def test_only_a_file_written_before_the_count_may_lack_it(tmp_path, alpaca_bars, written_at, reads):
+    p = writer()
+    path = build(tmp_path, alpaca_bars)
+    doc = json.loads(path.read_text())
+    del doc["outside_feed_hours"]
+    if written_at:
+        doc["written_at"] = written_at
+    path.write_text(json.dumps(doc))
+    if reads:
+        p.read_profile(path, as_of=AS_OF)
+    else:
+        with pytest.raises(history_load.HistoryStopped, match="outside_feed_hours"):
+            p.read_profile(path, as_of=AS_OF)
 
 
 @pytest.mark.parametrize("content", [None, "2026-13-01\n", "# only a comment\n"])

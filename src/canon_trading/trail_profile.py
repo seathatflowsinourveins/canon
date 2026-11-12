@@ -50,7 +50,11 @@ Each statistic uses CPython's inclusive linear percentiles, with no smoothing or
 than MIN_SAMPLES observations makes that metric thin and all its percentiles null; a segment is thin
 if either metric is thin. Counts remain visible, including bars without a previous close and distinct
 sessions with a bar. Missing catalog coverage is never declared a zero observation or borrowed from
-another name/segment. Both feeds are required and restricted to their own clock hours. Overlapping
+another name/segment. Both feeds are required and restricted to their own clock hours: a bar a span
+query returns in a supplied session but outside its feed's hours (Alpaca's sip serves a minute bar
+opening at 20:00) is left out, as the per-session query's bounds left it out, and the header's
+`outside_feed_hours` gives, per feed, the bars left out and the bars read, counted per root read. Above
+MAX_OUTSIDE_SHARE of a feed's bars left out, the build stops and keeps the old file. Overlapping
 dev/recent bars must agree exactly; identical duplicates count once. A failed read keeps the old file.
 """
 
@@ -89,6 +93,11 @@ RECENT_SESSIONS = 20
 MIN_SAMPLES = 20
 """Minimum observations per metric and segment (UNCALIBRATED), not a calibrated trading threshold."""
 LONG_CUTOFF = date(2026, 10, 15)
+MAX_OUTSIDE_SHARE = 0.01
+"""The most of a feed's bars read that may fall outside its clock hours (UNCALIBRATED): above it the
+catalog's clock is suspect (a shifted timezone, a mislabelled root), and nothing is written."""
+OUTSIDE_COUNT_SINCE = datetime(2026, 11, 12, 15, 30, tzinfo=UTC)
+"""A file written from this time on must carry `outside_feed_hours`; one written before may lack it."""
 DEFAULT_RECENT_ROOT = movers_baseline.DEFAULT_CATALOG / "sip-history-20"
 DEFAULT_LONG_ROOT = movers_baseline.DEFAULT_CATALOG / "sip-history-dev"
 DEFAULT_OVERNIGHT_ROOT = movers_baseline.DEFAULT_CATALOG / "boats-history-20"
@@ -292,12 +301,15 @@ def _read_bars(
     days: Sequence[date],
     feed: str,
     recent: Sequence[date],
-) -> list[tuple[date, Bar]]:
+) -> tuple[list[tuple[date, Bar]], int, int]:
     """One query per run of `days` (sorted) over its span, each bar paired with the session whose part
-    (20:00 to 20:00 New York) holds its open. A bar in an allowed session outside the feed's hours is
-    refused; a bar in a session not allowed, such as a date not supplied, is dropped."""
+    (20:00 to 20:00 New York) holds its open. A bar in a session not allowed, such as a date not
+    supplied, is dropped uncounted. A bar in an allowed session outside the feed's hours, such as a sip
+    bar opening at 20:00, is left out as the per-session query's bounds left it out. Returns the bars
+    held, the number left out and the number read (held plus left out)."""
     allowed = set(days)
     held = []
+    left_out = 0
     for run in _runs(days, recent):
         for bar in catalog.query_bars(
             identifiers=identifiers,
@@ -311,11 +323,10 @@ def _read_bars(
                 continue
             lo, hi = _session_bounds(day, feed)
             if not lo <= start < end <= hi:
-                raise history_load.HistoryStopped(
-                    f"{feed} bar {bar.bar_type} opened {opened.isoformat()}: bar outside feed hours"
-                )
+                left_out += 1
+                continue
             held.append((day, bar))
-    return held
+    return held, left_out, len(held) + left_out
 
 
 def build_profile(
@@ -443,6 +454,7 @@ def _build(
                 catalogs.append(catalog)
                 instruments.append(versions)
             symbols: dict[str, Any] = {}
+            outside = {feed: {"left_out": 0, "read": 0} for feed in movers_baseline.FEEDS}
             ids = sorted(set().union(*(set(versions) for versions in instruments)))
             # Preserve the baseline's approximate batch bar bound over a longer history.
             batch_size = max(
@@ -467,9 +479,12 @@ def _build(
                     if not identifiers or not selected:
                         continue
                     operation = f"reading {feed} sessions {selected[0]}..{selected[-1]} in {root}"
-                    for day, bar in _read_bars(
+                    bars, left_out, read = _read_bars(
                         catalog, identifiers, selected, feed, days["recent"]
-                    ):
+                    )
+                    outside[feed]["left_out"] += left_out
+                    outside[feed]["read"] += read
+                    for day, bar in bars:
                         identifier = str(bar.bar_type.instrument_id)
                         start, _ = movers_rank.bar_bounds_ns(bar)
                         for name, selected_days in days.items():
@@ -512,6 +527,7 @@ def _build(
                 },
                 "feeds": ["sip", "boats"],
                 "live_file": live_file,
+                "outside_feed_hours": outside,
                 "holdout": {
                     "path": str(holdout_file),
                     "sha256": holdout_sha256,
@@ -532,6 +548,12 @@ def _build(
                 "timezone": "America/New_York",
                 "symbols": symbols,
             }
+            for feed, count in outside.items():
+                if count["left_out"] > MAX_OUTSIDE_SHARE * count["read"]:
+                    raise history_load.HistoryStopped(
+                        f"{count['left_out']} of {count['read']} {feed} bars read fall outside the "
+                        f"feed's hours, above MAX_OUTSIDE_SHARE {MAX_OUTSIDE_SHARE}: catalog clock suspect"
+                    )
             if long_absent:
                 document = {"windows": LONG_ABSENT, **document}
             for root, feed, _ in sources:
@@ -595,11 +617,29 @@ def read_profile(path: Path, *, as_of: date) -> dict[str, Any]:
             or (holdout["dates_read"] and not document["live_file"])
         ):
             raise ValueError("header holdout must name its file, sha256 and the dates read")
+        written = datetime.fromisoformat(document["written_at"])
+        if written.tzinfo is None:
+            raise ValueError("header written_at needs a timezone")
+        if "outside_feed_hours" in document or written >= OUTSIDE_COUNT_SINCE:
+            outside = document.get("outside_feed_hours")
+            if (
+                not isinstance(outside, dict)
+                or set(outside) != set(movers_baseline.FEEDS)
+                or any(
+                    not isinstance(count, dict)
+                    or set(count) != {"left_out", "read"}
+                    or any(type(n) is not int or n < 0 for n in count.values())
+                    or count["left_out"] > MAX_OUTSIDE_SHARE * count["read"]
+                    for count in outside.values()
+                )
+            ):
+                raise ValueError(
+                    "header outside_feed_hours must give each feed's bars left out and read, "
+                    f"left out at most MAX_OUTSIDE_SHARE {MAX_OUTSIDE_SHARE}"
+                )
         built_for = date.fromisoformat(document["as_of"])
         if built_for > as_of:
             raise ValueError(f"header as_of {built_for} is later than replay date {as_of}")
-        if datetime.fromisoformat(document["written_at"]).tzinfo is None:
-            raise ValueError("header written_at needs a timezone")
         long_absent = "windows" in document
         if long_absent and document["windows"] != LONG_ABSENT:
             raise ValueError(f"header windows must be {LONG_ABSENT!r} or absent")
