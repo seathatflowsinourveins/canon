@@ -73,6 +73,56 @@ def test_percentiles_are_inclusive_linear_interpolation():
     }
 
 
+def test_percentiles_preserve_a_constant_thirty_sample_plateau_exactly():
+    # ABEV's tied endpoints; float weighted sums round p75 up and p90 down.
+    value = 0.0035842293906809273
+    result = writer().percentiles([value] * 30)
+    assert result == {"median": value, "p75": value, "p90": value}
+    assert all(type(cut) is float for cut in result.values())
+
+
+def test_abev_asof_true_range_samples_write_ordered_percentiles_before_json():
+    # 2026-08-20 as-of profile, only 08-18/08-19, segment 65; n=30.
+    samples = [
+        0.0034704830053667412,
+        0.0035842293906809273,
+        0.0035842293906809273,
+        0.003577817531305827,
+        0.0035842293906809273,
+        0.0035842293906809273,
+        0.0035842293906809273,
+        0.0035842293906809273,
+        0.0035842293906809273,
+        0.0035842293906809273,
+        0.0035714285714284954,
+        0.0017889087656529135,
+        0.003577817531305827,
+        0.0035714285714284954,
+        0.003577817531305827,
+        0.0035460992907800663,
+        0.0035460992907800663,
+        0.0035460992907800663,
+        0.0035460992907800663,
+        0.0035460992907800663,
+        0.0035587188612098883,
+        0.005338078291814991,
+        0.0035650623885918825,
+        0.003571428571428654,
+        0.0035650623885918825,
+        0.003571428571428654,
+        0.0035650623885918825,
+        0.0017857142857144064,
+        0.0035650623885918825,
+        0.0035650623885918825,
+    ]
+    result = writer()._metric(samples)
+    assert result["count"] == 30 and result["thin"] is False
+    assert result["median"] == 0.0035714285714284954
+    assert result["p75"] == result["p90"] == 0.0035842293906809273
+    assert result["median"] <= result["p75"] <= result["p90"]
+    assert json.loads(json.dumps(result)) == result
+
+
 def test_completed_rising_run_counts_its_largest_close_to_low_dip(alpaca_bars):
     p = writer()
     equity = alpaca_bars.equity()
