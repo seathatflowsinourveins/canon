@@ -678,6 +678,20 @@
       "adr": "0095"
     },
     {
+      "id": "dsh-acp-app",
+      "field": "agent-harness",
+      "repo": "deepseek-ai/deepseek-harness",
+      "track": "tag:dsh-v0.2.1-rc.3",
+      "role": "tool",
+      "license": "MIT",
+      "why": "@deepseek-ai/dsh-acp-app 0.2.1-rc.3, DeepSeek Harness's own profile bundle (packages/bundle/acp-app) that serves the Agent Client Protocol over stdio through @deepseek-ai/dsh-acp, over dsh-base. Its patch sets the coding-agent persona and a default provider deepseek-official and model deepseek-v4-flash, disables the session-title model call, and starts dsh-acp only after its command provider accepts the invocation. Both the review-acp and build-acp profiles carry it (ADR 0095). Its own source has no network, file or subprocess call; what dsh-acp does is the protocol (acp-spec). Shares the deepseek-harness pin and moves with it. Running either profile is UNVERIFIED.",
+      "evidence": [
+        "https://github.com/deepseek-ai/deepseek-harness/tree/dsh-v0.2.1-rc.3/packages/bundle/acp-app",
+        "https://registry.npmjs.org/@deepseek-ai/dsh-acp-app/0.2.1-rc.3"
+      ],
+      "adr": "0095"
+    },
+    {
       "id": "pnpm",
       "field": "toolchain",
       "repo": "pnpm/pnpm",

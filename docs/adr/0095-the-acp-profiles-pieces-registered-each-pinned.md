@@ -45,6 +45,9 @@ Chosen: **option 1**. Option 2 hides which piece moved; option 3 pins nothing.
    default branch because it publishes no tags. It lists every plugin ADR 0094 names (10,581 entries at the pin), and is
    nothing more: its own notice says "Being on this list is not a security review", so no plugin is
    installed on its strength (ADR 0072 rule 3).
+3. **`dsh-acp-app`** (DeepSeek Harness's `packages/bundle/acp-app`, MIT), `tool`, pinned with the engine
+   at `dsh-v0.2.1-rc.3`: the bundle both profiles carry, which starts `dsh-acp` on stdio with a default
+   model route. Its own source makes no network, file or subprocess call.
 
 ### Consequences
 
@@ -90,6 +93,13 @@ Read 2026-11-11.
   same count, three commits behind the pin (a second reader's fetch, 2026-11-11). ADR 0072 rule 3's
   10,426 is an earlier count.
 * https://api.github.com/repos/awesome-dsh-plugin/awesome-dsh-plugin — licence CC0-1.0; no tags (fetched).
+* `deepseek-harness` at `dsh-v0.2.1-rc.3`, `packages/bundle/acp-app` — `package.json` (MIT; depends
+  on `dsh-acp`, `dsh-cmdline`, `commander`), README Summary and `cordis.patch.yml` (persona, provider
+  `deepseek-official`, model `deepseek-v4-flash`, `session-title-llm` disabled); a search of its `src`
+  for `fetch(`, `node:http`, `node:fs`, `writeFile`, `child_process` and `spawn(` found none (resolved).
+  https://registry.npmjs.org/@deepseek-ai/dsh-acp-app/0.2.1-rc.3 — MIT, that directory, no `gitHead`
+  (fetched); a second reader found its tarball's patch and READMEs byte-identical to the pinned source,
+  a match by content, not provenance. Both profiles carry 0.2.1-rc.3 (commit `62ccb4c`, read).
 * A second reader checked this record on 2026-11-11: it settled the SDK's schema minor, corrected how
   the profiles are started and what the `line` holds off, and asked for the scope note; all are in. A
   second reader of item 2 corrected the entry count from 10,584 to 10,581 and asked that the list's
