@@ -271,6 +271,8 @@ from .paper_node import alpaca_paper_builder
 from .paper_node import ema_cross_config
 from .position_cap import PositionCap
 from .position_cap import position_cap_config
+from .rank_shared import NOT_COMMON
+from .rank_shared import write_atomically
 from .session_ma_cross import LIMIT_OFFSET
 from .session_ma_cross import LIMIT_TIMEOUT_SECS
 from .session_ma_cross import WARM_UP_SPARE_BARS
@@ -1027,19 +1029,6 @@ class WindowSkipped(RuntimeError):
     result; the run exits 0."""
 
 
-def write_atomically(path: Path, body: str) -> None:
-    """Replace `path` whole (`os.replace`), so a reader or a kill never sees half a record, through a
-    temporary file of this writer's own (`tempfile.mkstemp`), so two writers never share one."""
-    fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
-    try:
-        with os.fdopen(fd, "w") as out:
-            out.write(body)
-        os.replace(temporary, path)
-    except BaseException:
-        Path(temporary).unlink(missing_ok=True)
-        raise
-
-
 def records_dir(log_dir: Path) -> Path:
     """Where this run's records go: `log_dir`, or its `by-hand/` for a run by hand (`BY_HAND_ENV`)."""
     if os.environ.get(BY_HAND_ENV, "") == "1":
@@ -1228,10 +1217,6 @@ def window_seconds(minutes: int, session_left: float) -> tuple[float, str]:
     return seconds, f"shortened from {minutes} minutes to {seconds:.0f} s: {why}"
 
 
-NOT_COMMON = re.compile(r"\b(warrants?|units?|rights?)\b", re.IGNORECASE)
-"""What in Alpaca's asset `name` marks a warrant, a unit or a right, which a mover window passes over; common
-shares and depositary receipts are kept. A proxy with no upstream behind it: alpaca-py 0.45.0's `Asset` and
-Alpaca's assets page give `class` `us_equity` and no security type."""
 FRESH_TRADE_SECS = 120
 """A mover's latest sip trade must be at most this old at its selection (UNCALIBRATED): a proxy for not
 halted, with no upstream behind it. alpaca-py 0.45.0 reads no halt over REST (`Asset` has `status` and
