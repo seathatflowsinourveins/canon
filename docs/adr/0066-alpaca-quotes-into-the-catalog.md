@@ -30,6 +30,18 @@ the paper pair, how large is a load, which feed may a load use, and by what path
 
 ## Decision Outcome
 
+**Implementation status, 2026-11-11:** the bounded, paced historical IEX quote load now exists as
+`paper:history --data quotes` (ADR 0093, clause 10). It uses the adapter's quote conversion and the
+pinned catalog's typed quote writer, under the history catalog lock, rather than the node write-back
+used for condition 1. It enforces a start in 2025 or later, a conservative quarter ceiling of 90
+elapsed days, and at most hourly request pieces; small probes are allowed. It takes this record's
+start-after option for size units: all starts before 2025-11-04 00:00 New York are refused, including the entire
+cutover day, and existing roots with earlier quote coverage are refused. ADR 0093's data-only task
+is condition 2's own record for the REST-only load, with each actual GET paced by its row. The
+measurement condition 2 also asks for, whether the 200 a minute is shared, is still open: ADR 0093's
+row and the combined rate across loads are UNCALIBRATED. Its first paper load, PLCE on 2026-11-11, is in
+`catalog/README.md`; the condition-1 write-back evidence below is for the node path, not this loader.
+
 Chosen: **option 1, on IEX only, over a window of weeks to a quarter of 2025 or later**. It is ADR
 0040's path for bars and keeps its conventions (window, coverage, re-runs). The catalog guide's rules
 apply as written: a request with a record limit or a source `schema` is refused for write-back, and a
@@ -192,6 +204,24 @@ Alpaca's real-time page gives the stream's sizes "in round lots": fetched 2026-1
 measurement the same day. History before 2025-11-03 is in round lots by those references (UNVERIFIED
 here: only today's quotes were measured), so a load spanning that date multiplies its earlier sizes by
 100 or starts after it.
+
+The historical loader added 2026-11-11 takes the **starts-after** option, refusing any start before
+2025-11-04 00:00 New York and keeping sizes in shares unchanged. The historical reference
+https://docs.alpaca.markets/us/reference/stockquotes-1.md is the source for the unit date quoted
+above, and it was fetched again on 2026-11-12: it gives sizes "in shares (round lots prior to November
+3, 2025)". The page gives no time of day for the switch, so the exact intraday switch and per-symbol historical round-lot sizes
+remain UNVERIFIED. No uniform lot-size multiplier is assumed. The whole cutover day is excluded;
+under the catalog lock, a root with any earlier quote coverage is refused even when a different
+symbol is requested, so two runs cannot mix historical units in one root. It follows the adapter's
+`parse_quote`: one-sided quotes and prices finer than instrument precision are dropped and counted;
+other malformed quotes stop the run. The SDK's microsecond timestamp loses sub-microsecond digits.
+The loader expands request and coverage bounds to whole microsecond buckets (start rounded down,
+end rounded up to its bucket's last nanosecond) so hourly pieces and incremental extensions do not
+discard unseen boundary quotes. Legacy quote coverage not aligned to those buckets is refused;
+use a separate clean root. `QuoteTick` also loses conditions, bid/ask exchanges and tape, without
+condition filtering. These losses apply to the new load; the adapter's older write-back behavior
+remains as observed above. The loader bounds every piece to 1,000 successful pages and refuses
+repeated page tokens, without writing incomplete coverage.
 
 `UNVERIFIED`: a full SIP day (not counted, to keep the lock short); whether HTTP compression shrinks the
 133 bytes on the wire; whether a full day compresses like one page; how long a backtest takes over a

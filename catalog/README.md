@@ -109,3 +109,42 @@ and verify zero GETs and zero writes. The tests for this path use offline stand-
 
 Source: https://nautilustrader.io/docs/md/latest/concepts/data/catalog.md (read 2026-11-09 and 2026-11-10);
 the pinned v2.0.0rc8 catalog bindings, `movers_rank` and `history_load` (read 2026-11-11).
+
+`mise run paper:history <tests|windows> --data quotes --symbols AAPL --start <ISO time with zone>
+--end <ISO time with zone> --catalog <existing IEX root>` loads historical IEX quotes as
+`QuoteTick` under `data/quotes/<instrument>/`. The root must hold definitions; SIP roots are refused.
+ADR 0066's bounds apply: IEX only, start at or after 2025-11-04 00:00 New York, at most 90 elapsed days (a conservative
+quarter ceiling); small probes are allowed. Both bounds are inclusive, `start < end`, and the end
+must be 15 minutes before now, as for prints. Request/coverage bounds expand to complete microsecond buckets (start rounded
+down, end rounded up to the bucket's last nanosecond), matching the SDK's timestamp precision without
+losing quotes on extensions. Each missing interval is split into at most hourly pieces, the endpoint's microsecond joining the
+last, each asking to the first nanosecond after its last bucket; over 100,000 quotes
+in one piece load in parts, each cut before its answer's last microsecond; more than 100,000 in one
+microsecond stops by name. Reruns skip covered
+pieces. Empty or dropped-only pieces write no coverage. A piece reaching 1,000 successful pages with
+more pages remaining, or returning a repeated page token, stops before any of it is written.
+The shared catalog lock, GET-only transport,
+150 data GETs/minute, zero trading GETs and first-429/refused-feed stops apply; every page and SDK
+504 retry is paced from its actual send. Roots do not share a rate limiter.
+
+The conversion follows the adapter's `parse_quote`: `ts_init = ts_event`, timestamps truncated by
+the SDK to microseconds, one-sided and finer-than-instrument prices dropped and counted, malformed
+quotes refused by name. Quotes sharing a truncated timestamp stay separate. Conditions,
+bid/ask exchanges and tape are lost, without filtering by condition flags. Sizes stay in shares:
+starts before 2025-11-04 00:00 New York are refused, excluding the entire cutover day (ADR 0066). The reader
+verified the calendar date from Alpaca's REST schemas; the venue's exact intraday cutover and
+per-symbol historical lot sizes remain UNVERIFIED. No lot-size multiplier is assumed. Under the
+catalog lock, all quote identifiers are checked: roots with earlier quotes or non-bucket-aligned
+coverage are refused before fetching, even when those symbols were not requested. Use a separate
+clean root. The adapter itself is unchanged. Invalid CLI quote bounds are refused before client setup.
+Source: the pinned SDK's `QuoteSet`/`QUOTE_MAPPING`, the adapter's quote request and parser, and the
+pinned `write_quote_ticks`/`QuoteTick` contract (ADR 0093 clause 10, read 2026-11-11).
+Paper, 2026-11-11, account A's pair: PLCE's IEX quotes for that day's regular session (14:30Z to
+21:00Z) loaded 2,156 quotes in seven hourly pieces, in time order, `ts_init = ts_event`, on whole
+microseconds, with contiguous coverage; the rerun sent no request and wrote nothing. Paper, 2026-11-12, the same pair, one whole hour,
+2026-11-11 14:30Z to 15:30Z: SPY held more than the row bound and loaded in seven parts, six of
+100,000 quotes in 11 requests each, each next part starting at the microsecond its predecessor's
+answer was cut before, and 42,672 in 5: 642,672 quotes in 71 requests, in time order, `ts_init = ts_event`, on whole
+microseconds, none crossed, in seven contiguous coverage intervals. PLCE's 148 quotes came in one
+piece that held the endpoint's microsecond. The rerun sent no request and wrote nothing. An hour
+with no quote (a night, a weekend) writes no coverage, so a rerun across one asks for it again.

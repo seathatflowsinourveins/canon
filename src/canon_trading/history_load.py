@@ -1,4 +1,4 @@
-"""Alpaca's historical `sip` bars or trade prints into a `ParquetDataCatalog`, GET only and paced (ADR 0093).
+"""Alpaca's historical SIP bars/trades or IEX quotes into a catalog, GET only and paced (ADR 0093).
 
 `mise run paper:history <account>` runs this module with one paper account's pair in data-only mode
 (ADR 0070): it sends market data GETs and nothing else, and takes neither the account's lock nor a
@@ -87,6 +87,48 @@ invalid prints; it fails rather than returning incomplete history. Empty or inva
 no coverage. An interval once written is covered for good: a print Alpaca marks canceled or incorrect,
 or reports late, after the load is not picked up by a rerun (how late Alpaca does so is UNVERIFIED), so
 a load waits at least `PUBLICATION_DELAY`, and a root reloaded from empty takes later corrections.
+
+Quotes (2026-11-11): `--data quotes` follows the adapter's `get_stock_quotes(StockQuotesRequest)` /
+`QuoteSet` / `parse_quote` contract (alpaca-py `stock.py`, `models/quotes.py` at c42add7c0a70), then
+NautilusTrader `write_quote_ticks(ticks, start, end)` (the same catalog bindings as trades, at
+d53849b216e2). Coverage uses `NautilusDataType.QuoteTick` and instrument ID. ADR 0066's IEX-only,
+2025-or-later window is enforced, with a conservative quarter ceiling of 90 elapsed days; tiny probes
+are allowed. The size-unit limit below further restricts starts to 2025-11-04 00:00 New York or later.
+Each missing interval is split into pieces of at most one hour (the endpoint's microsecond joins the
+last, so no piece is that microsecond alone), fetching at most
+`MAX_ROWS_PER_CALL + 1` quotes; an overfull answer is loaded in parts, as prints are: each part keeps
+the whole microseconds before its answer's last, is covered to the end of the bucket before it, and the
+next part starts at that microsecond, so no bucket is split; more than `MAX_ROWS_PER_CALL` quotes in
+one microsecond stops by name. There is no assumed quote rate. Pages and SDK retries use the trades transport pace,
+and the same lock and per-feed marker rules apply; SIP and IEX need separate roots. The end must be
+`PUBLICATION_DELAY` before now, as for prints: covered is covered for good, and how soon Alpaca's
+historical store holds an IEX quote is UNVERIFIED.
+
+As in the adapter, one-sided quotes and prices finer than the instrument precision are dropped and
+named, while other conversion errors stop by name. Empty or dropped-only pieces write no coverage.
+The SDK truncates event timestamps to microseconds; `ts_init = ts_event`. Request and coverage
+bounds expand to whole microsecond buckets: floor(start / 1000) * 1000 through
+floor(end / 1000) * 1000 + 999 nanoseconds, inclusively. This fetches the entire first/last bucket
+and preserves unseen boundary quotes through hourly pieces and extensions. Each piece asks to the
+first nanosecond after its last bucket and keeps only its own quotes, so its completeness does not
+rest on Alpaca reading the end's nanoseconds (code-review-high-quotes2/2). Sub-microsecond timestamp
+distinctions are lost, but equal-timestamp quotes are retained. The QuoteTick drops conditions (`c`),
+bid/ask exchanges (`bx`, `ax`) and tape (`z`), without condition filtering (`QUOTE_MAPPING` and
+`crates/model/src/data/quote.rs`). ADR 0066 cites
+https://docs.alpaca.markets/us/reference/stockquotes-1.md for sizes in shares, round lots before
+November 3, 2025. That page, fetched again on 2026-11-12, gives the calendar date; neither the exact intraday switch nor per-symbol historical lot sizes is verified. Take ADR
+0066's start-after branch: refuse all starts before 2025-11-04 00:00 New York, including the entire cutover day,
+and keep share sizes unchanged. Under the common catalog lock, `list_instruments(QuoteTick)` and
+`get_intervals` reject any root with earlier quotes or coverage not aligned to whole microsecond
+buckets, even for unrequested symbols: use a clean separate root, with no inferred unit conversion.
+These are pinned catalog methods (`persistence/__init__.pyi` at d53849b216e2).
+For every piece, requests' documented response-hook contract (`docs/user/advanced.rst` at
+6e83187b8feb) checks successful quote pages for repeated tokens and a 1,000-page ceiling (the
+adapter's `fetch_trades` precedent). Incomplete history stops before writing any of that piece.
+504 attempts do not count as successful pages; their pacing/retry policy remains unchanged. The
+piece's hook is removed on success or failure. CLI bounds are checked before building a client.
+The adapter itself is unchanged. Paper loads on account A's pair, PLCE in hourly pieces and SPY over
+the row bound in parts, are recorded in catalog/README.md.
 """
 
 from __future__ import annotations
@@ -107,21 +149,29 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo
 
 import requests
+from alpaca.common.enums import Sort
 from alpaca.common.exceptions import APIError
 from alpaca.data.enums import DataFeed
 from alpaca.data.historical.stock import StockHistoricalDataClient
 from alpaca.data.models import BarSet
+from alpaca.data.models import QuoteSet
 from alpaca.data.requests import StockBarsRequest
+from alpaca.data.requests import StockQuotesRequest
 from alpaca.data.requests import StockTradesRequest
 from canon_alpaca.constants import VENUE
+from canon_alpaca.data import TRADES_MAX_PAGES
+from canon_alpaca.data import FinePriceError
+from canon_alpaca.data import OneSidedQuoteError
 from canon_alpaca.data import alpaca_bars_window
 from canon_alpaca.data import bar_interval_ns
 from canon_alpaca.data import bar_roundings
 from canon_alpaca.data import bar_timeframe
 from canon_alpaca.data import fetch_trades
 from canon_alpaca.data import parse_bar
+from canon_alpaca.data import parse_quote
 from canon_alpaca.data import parse_trade
 from canon_alpaca.data import was_rounded
 from canon_alpaca.providers import DATA_API
@@ -182,6 +232,14 @@ memory estimate before the run stops."""
 
 BAR_SPECS = {"1-MINUTE": "1-MINUTE-LAST-EXTERNAL", "1-DAY": "1-DAY-LAST-EXTERNAL"}
 """The bar specifications this module loads, by the name `--bars` takes."""
+
+QUOTES_START = datetime(2025, 11, 4, tzinfo=ZoneInfo("America/New_York"))
+"""ADR 0066's start-after option: refuse earlier units and the entire ambiguous cutover day, the
+trading day 2025-11-03 in New York, which ends at 05:00 UTC on 2025-11-04 (its evening session at
+01:00 UTC)."""
+
+QUOTES_MAX_PAGES = TRADES_MAX_PAGES
+"""The adapter's fetch_trades page ceiling; never treat capped pagination as complete."""
 
 LEDGER = SOURCE_ROOT / "ledger"
 
@@ -296,23 +354,23 @@ def _catalog_lock(path: Path) -> Generator[None]:
             fcntl.flock(held, fcntl.LOCK_UN)
 
 
-def _check_feed(path: Path) -> None:
+def _check_feed(path: Path, feed: DataFeed = FEED) -> None:
     held = catalog_feed(path)
-    if held is not None and held != FEED.value:
+    if held is not None and held != feed.value:
         raise HistoryStopped(
-            f"the catalog at {path} holds {held} data and this load is {FEED.value}: give each feed its own "
+            f"the catalog at {path} holds {held} data and this load is {feed.value}: give each feed its own "
             "root (bars_to_catalog's header)"
         )
 
 
-def _claim_feed(path: Path) -> bool:
+def _claim_feed(path: Path, feed: DataFeed = FEED) -> bool:
     """Recheck and exclusively create the marker under the lock; return whether this load created it."""
-    _check_feed(path)
+    _check_feed(path, feed)
     try:
         with (path / FEED_FILE).open("x", encoding="ascii") as marker:
-            marker.write(f"{FEED.value}\n")
+            marker.write(f"{feed.value}\n")
     except FileExistsError:
-        _check_feed(path)
+        _check_feed(path, feed)
         return False
     return True
 
@@ -785,6 +843,265 @@ def _load_trade_part(
     return len(ticks), following
 
 
+def _quote_bounds(start: datetime, end: datetime, now: datetime) -> tuple[int, int]:
+    """Validate ADR 0066's window, then enclose complete SDK microsecond buckets.
+
+    Quote.timestamp truncates to microseconds; the pinned catalog's inclusive interval API must
+    cover whole buckets so extending coverage cannot lose a previously unseen boundary quote.
+    """
+    for name, value in (("start", start), ("end", end)):
+        if value.tzinfo is None:
+            raise HistoryStopped(f"{name} must carry a time zone, got {value}")
+    if start >= end:
+        raise HistoryStopped(f"start {start} is not before end {end}")
+    if start < datetime(2025, 1, 1, tzinfo=UTC):
+        raise HistoryStopped("quote start must be in 2025 or later (ADR 0066)")
+    if end - start > timedelta(days=90):
+        raise HistoryStopped("quote span exceeds 90 days, the quarter bound (ADR 0066)")
+    if end > now - PUBLICATION_DELAY:
+        raise HistoryStopped(
+            f"quote end {end} must be at least {PUBLICATION_DELAY} before now: covered is covered "
+            "for good, and how soon the historical store holds a quote is UNVERIFIED (ADR 0066)"
+        )
+    if start < QUOTES_START:
+        raise HistoryStopped(
+            "quote start must be at or after 2025-11-04 00:00 New York: pre-2025-11-03 sizes and the "
+            "intraday cutover are UNVERIFIED (ADR 0066); this load accepts shares only"
+        )
+    return dt_to_unix_nanos(start) // 1_000 * 1_000, dt_to_unix_nanos(end) // 1_000 * 1_000 + 999
+
+
+def _check_quote_coverage(catalog: ParquetDataCatalog) -> None:
+    """Pinned catalog list_instruments/get_intervals: refuse legacy units or partial buckets."""
+    for identifier in catalog.list_instruments(NautilusDataType.QuoteTick):
+        for lo, hi in catalog.get_intervals(NautilusDataType.QuoteTick, identifier):
+            if lo < dt_to_unix_nanos(QUOTES_START) or lo % 1_000 or hi % 1_000 != 999:
+                raise HistoryStopped(
+                    f"legacy quote coverage for {identifier} has unverified units or unaligned "
+                    "microseconds; use a separate root with post-2025-11-03 whole-microsecond quotes"
+                )
+
+
+@contextmanager
+def _quote_pages(client: Any, what: str) -> Generator[None]:
+    """requests' response-hook contract: bound successful pages and reject repeated tokens.
+
+    The SDK's total-row limit does not bound empty pages. Ignore failed HTTP attempts so SDK 504
+    retries keep their normal policy and per-send pacing. Remove only this piece's hook on exit.
+    """
+    session = session_of(client)
+    if session is None:
+        raise HistoryStopped(f"the {what} client has no requests.Session; cannot bound pages")
+    pages = 0
+    tokens: set[str] = set()
+
+    def check(response: requests.Response, *args: object, **kwargs: object) -> requests.Response:
+        nonlocal pages
+        if response.status_code == 200:
+            pages += 1
+            token = response.json().get("next_page_token")
+            if token is not None:
+                if token in tokens:
+                    raise HistoryStopped(f"the {what} request returned a repeated page token")
+                tokens.add(token)
+                if pages >= QUOTES_MAX_PAGES:
+                    raise HistoryStopped(
+                        f"the {what} request reached the {QUOTES_MAX_PAGES} page bound; "
+                        "none of this incomplete interval was written"
+                    )
+        return response
+
+    session.hooks["response"].append(check)
+    try:
+        yield
+    finally:
+        session.hooks["response"].remove(check)
+
+
+def load_quotes(
+    client: Any,
+    symbols: Sequence[str],
+    start: datetime,
+    end: datetime,
+    catalog_path: Path = DEFAULT_CATALOG,
+    *,
+    feed: DataFeed = DataFeed.IEX,
+    pace: Pace = PACE,
+    max_rows: int = MAX_ROWS_PER_CALL,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+    now: Callable[[], datetime] = utc_now,
+    out: Callable[[str], None] = print,
+) -> int:
+    """ADR 0066 quotes via StockQuotesRequest/QuoteSet, parse_quote and write_quote_ticks.
+
+    Fetch complete missing intervals in pieces of at most an hour (the endpoint's microsecond joins
+    the last); the row sentinel detects an overfull piece, which loads in parts, and more quotes in
+    one microsecond than the bound stop the piece before any of it is written. The SDK's microsecond
+    timestamps and adapter's dropped-quote rules apply; start after the ambiguous 2025-11-03 unit
+    cutover (ADR 0066).
+    """
+    try:
+        start_ns, end_ns = _quote_bounds(start, end, now())
+        if feed != DataFeed.IEX:
+            raise HistoryStopped(f"quote feed {feed} is refused; iex only (ADR 0066)")
+        if not symbols or any(not symbol.strip() for symbol in symbols):
+            raise HistoryStopped("at least one nonempty symbol is required")
+        if max_rows < 1:
+            raise HistoryStopped(f"the quote row bound must be positive, got {max_rows}")
+        path = Path(catalog_path).resolve()
+        if (
+            path == LEDGER.resolve()
+            or LEDGER.resolve() in path.parents
+            or "ledger" in Path(catalog_path).parts
+        ):
+            raise HistoryStopped(
+                f"the catalog at {catalog_path} is under ledger/, which holds the trial ledger only"
+            )
+        if not path.is_dir():
+            raise HistoryStopped(f"the catalog at {path} must be an existing directory")
+        _check_feed(path, feed)
+        catalog = ParquetDataCatalog(str(path))
+        ids = [f"{s}.{VENUE}" for s in dict.fromkeys(s.strip() for s in symbols)]
+        instruments = {str(i.id): i for i in catalog.instruments(instrument_ids=ids)}
+        if absent := [i for i in ids if i not in instruments]:
+            raise HistoryStopped(
+                f"no instrument definition in {path} for {', '.join(absent[:20])}: "
+                "the asset list load writes them (ADR 0093); nothing was requested"
+            )
+        written = 0
+        with _catalog_lock(path), _paced_trade_gets(client, pace, clock, sleep):
+            _check_feed(path, feed)
+            _check_quote_coverage(catalog)
+            for identifier in ids:
+                instrument = instruments[identifier]
+                symbol = instrument.id.symbol.value
+                missing = catalog.get_missing_intervals_for_request(
+                    start_ns, end_ns, NautilusDataType.QuoteTick, identifier
+                )
+                for gap_lo, gap_hi in missing:
+                    lo = gap_lo
+                    while lo <= gap_hi:
+                        hi = min(gap_hi, lo + 3_600_000_000_000 - 1)
+                        if gap_hi - hi <= 1_000:
+                            # the endpoint's one microsecond joins the last hour: alone it is an
+                            # always-empty piece that writes no coverage, so every rerun asked it
+                            hi = gap_hi
+                        what = f"quotes of {symbol}, feed {feed.value}, interval [{lo}, {hi}]"
+                        before = _sent()
+                        try:
+                            with _quote_pages(client, what):
+                                result = client.get_stock_quotes(
+                                    StockQuotesRequest(
+                                        symbol_or_symbols=symbol,
+                                        start=unix_nanos_to_dt(lo),
+                                        # ask to the next bucket's first nanosecond, so a
+                                        # server reading the end to the microsecond still
+                                        # answers the last bucket; the filter below keeps
+                                        # only this piece's own quotes
+                                        end=unix_nanos_to_dt(hi + 1),
+                                        feed=feed,
+                                        sort=Sort.ASC,
+                                        limit=max_rows + 1,
+                                    )
+                                )
+                        except HistoryStopped:
+                            raise
+                        except APIError as e:
+                            raise HistoryStopped(
+                                f"Alpaca refused the {what} request (HTTP {e.status_code}): {e}; "
+                                "nothing falls back to another feed"
+                            ) from e
+                        except Exception as e:
+                            raise HistoryStopped(
+                                f"the {what} request failed ({type(e).__name__}): {e}"
+                            ) from e
+                        after = _sent()
+                        if after.limited > before.limited:
+                            raise RateLimited(
+                                f"Alpaca answered 429 Too Many Requests during the {what} request"
+                            )
+                        trading = after.trading - before.trading
+                        if trading and not pace.trading_per_minute:
+                            raise HistoryStopped(
+                                f"the {what} request sent {trading} trading API request(s); "
+                                "this load sends none (ADR 0093)"
+                            )
+                        gets = after.data - before.data
+                        if not isinstance(result, QuoteSet):
+                            raise HistoryStopped(
+                                "alpaca-py returned raw quote data; the client must use raw_data=False"
+                            )
+                        # The pinned writer refuses ticks out of time order; the sort is stable.
+                        answered = sorted(result.data.get(symbol, []), key=lambda q: q.timestamp)
+                        covered_to, following = hi, hi + 1
+                        if len(answered) > max_rows:
+                            # Over the bound: keep every whole microsecond before the answer's
+                            # last (SDK timestamps are whole microseconds), cover to the end of
+                            # the bucket before it, and start the next part at it.
+                            last = dt_to_unix_nanos(answered[-1].timestamp)
+                            answered = [q for q in answered if dt_to_unix_nanos(q.timestamp) < last]
+                            if not answered:
+                                raise HistoryStopped(
+                                    f"the {what} request has more than {max_rows} quotes at one "
+                                    f"microsecond, {last}; none of this interval was written"
+                                )
+                            covered_to, following = last - 1, last
+                        ticks = []
+                        one_sided = fine = 0
+                        first_fine = ""
+                        try:
+                            for quote in answered:
+                                try:
+                                    tick = parse_quote(quote, instrument)
+                                except OneSidedQuoteError:
+                                    one_sided += 1
+                                    continue
+                                except FinePriceError as e:
+                                    fine += 1
+                                    first_fine = first_fine or str(e)
+                                    continue
+                                if lo <= tick.ts_init <= covered_to:
+                                    ticks.append(tick)
+                        except Exception as e:
+                            raise HistoryStopped(
+                                f"parsing {what} failed ({type(e).__name__}): {e}"
+                            ) from e
+                        if one_sided:
+                            out(f"paper:history: Dropped {one_sided} one-sided {what}")
+                        if fine:
+                            out(
+                                f"paper:history: Dropped {fine} {what} with a price finer than "
+                                f"the instrument's precision; the first: {first_fine}"
+                            )
+                        if ticks:
+                            claimed = _claim_feed(path, feed)
+                            try:
+                                catalog.write_quote_ticks(ticks, start=lo, end=covered_to)
+                            except Exception as e:
+                                if (
+                                    claimed
+                                    and not _holds_data(path)
+                                    and catalog_feed(path) == feed.value
+                                ):
+                                    (path / FEED_FILE).unlink(missing_ok=True)
+                                raise HistoryStopped(
+                                    f"writing {what} into {path} failed ({type(e).__name__}): {e}"
+                                ) from e
+                        written += len(ticks)
+                        covered = f" to {covered_to}" if ticks else ""
+                        out(f"paper:history: {what}: {len(ticks)} quotes{covered}, {gets} GET(s)")
+                        lo = following
+        return written
+    except HistoryStopped:
+        raise
+    except Exception as e:
+        raise HistoryStopped(
+            f"the quote history load of {', '.join(symbols[:20])} into {catalog_path} "
+            f"failed ({type(e).__name__}): {e}"
+        ) from e
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m canon_trading.history_load", description=__doc__
@@ -798,7 +1115,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--bars", default="1-MINUTE,1-DAY", help="1-MINUTE, 1-DAY or both, comma-separated"
     )
     parser.add_argument("--catalog", type=Path, default=DEFAULT_CATALOG, help="the catalog root")
-    parser.add_argument("--data", choices=("bars", "trades"), default="bars")
+    parser.add_argument("--data", choices=("bars", "trades", "quotes"), default="bars")
     args = parser.parse_args(argv)
     for name in ("start", "end"):
         if getattr(args, name).tzinfo is None:
@@ -811,6 +1128,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.data == "bars" and (not specs or any(s not in BAR_SPECS for s in specs)):
         parser.error(f"--bars takes {', '.join(BAR_SPECS)}, got {args.bars!r}")
     now = utc_now()
+    if args.data == "quotes":
+        try:
+            _quote_bounds(args.start, args.end, now)
+        except HistoryStopped as e:
+            parser.error(str(e))
     if args.data == "trades" and args.end > now - PUBLICATION_DELAY:
         parser.error(
             f"--end must be at least {PUBLICATION_DELAY} before now for published SIP trades"
@@ -846,6 +1168,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         client = history_client()
         if args.data == "trades":
             written = load_trades(client, symbols, args.start, args.end, args.catalog, now=utc_now)
+        elif args.data == "quotes":
+            written = load_quotes(client, symbols, args.start, args.end, args.catalog, now=utc_now)
         else:
             written = load_history(
                 client, symbols, specs, args.start, args.end, args.catalog, now=utc_now
