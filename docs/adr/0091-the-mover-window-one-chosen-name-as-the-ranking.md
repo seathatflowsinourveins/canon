@@ -59,6 +59,27 @@ does not need in order to be tested.
   denies the sale of a position that rose (ADR 0088). It is there to stop a runaway order. The limit
   that leaves: a position worth ten times its entry is not sold in one order; its sale is sent again
   every `chase_secs`, and the window's account check closes what is left.
+* **Paper sizing, superseding the two figures above for paper.** On the owner's decision, 2026-11-11, as the
+  lead (canon-fa) recorded it under ADR 0074 rule 1, with the lead's figures of the same evening: the paper
+  accounts carry no risk limit. The entry size is the smaller of the account's buying power and its cash at
+  the node's start, divided by the slots in use, read again at each start. Cash keeps a margin account's
+  buying power, up to 2x overnight and 4x intraday at Alpaca, from sizing an entry above 1x until the
+  margin-account build lands (a Codex build the coordinator started on 2026-11-11). The engine's per-order
+  notional cap is the entry times the existing outer multiple (`mover_window.OUTER_BOUND_MULTIPLE`, 10), so
+  the sale of a position that rose is never denied (ADR 0088). The slots are 7 in the regular session and 7
+  after hours (the lead, 2026-11-11), raised only after two paper firings show room, and 7 in pre-market and
+  overnight too, by the same worst-minute count (the lead, 2026-11-11); going above that count needs two
+  records that agree. What the rule does to `max_shares` and the position cap is settled when it is built. One
+  limit: a paper fill takes any size at the quote (Alpaca's paper page: "Your order quantity is not checked
+  against the NBBO quantities"), so a size far beyond a name's traded volume teaches less than it seems to.
+  The comparison of fills against a replay is where that shows. It is a learning note, not a cap. Alpaca's
+  paper page says eligible orders "receive partial fills for a random size 10% of the time", and that paper
+  trading does not account for the "market impact of your orders" or "price slippage due to latency"
+  (https://docs.alpaca.markets/us/docs/paper-trading.md, read 2026-11-11). `FixedRiskSizer` is not used for
+  this rule, since it needs a risk fraction and a stop distance. Live is untouched and stays the owner's. The
+  500 and 5,000 dollars above stand as the first windows' record. Not built yet: on 2026-11-11 the window
+  sizes by `FixedRiskSizer` at `risk` 0.01 (`mover.py`) under a 500-dollar entry bound
+  (`mover_window.ENTRY_NOTIONAL_USD`, applied as `max_shares`) and a 5,000-dollar engine cap.
 * **The request budget**: a window whose node sent 180 or more requests to the trading API in any 60
   seconds, or met a 429, fails by name; the strategy's own soft line (140) stops entries first.
 * **Sessions**, by the lead's later decision of 2026-11-11: `--mover` runs `Mover` in every extended
@@ -196,8 +217,8 @@ Read 2026-11-11. Resolved means read in a local copy at the commit `canon/upstre
   params when transforming the order. Read locally 2026-11-11; resolved.
 * That a signal is not replayed to a later subscriber: the ranking lane's finding at the pin on
   2026-11-11, not reproduced here. UNVERIFIED in this record; the actor repeats its ranking either way.
-* The 200 requests a minute an account that the ceiling sits under is ADR 0083's figure, taken from
-  that record and not read again here. UNVERIFIED in this record.
+* https://alpaca.markets/support/usage-limit-api-calls — "currently 200 requests per minute, per
+  account", the figure the ceiling sits under. Fetched by the evidence-verifier, 2026-11-11.
 * `src/canon_trading/mover_window.py`, `src/canon_trading/session_window.py` and their tests — as
   described, read in this tree.
 * The three replay runs and each window's record and node log (`window-<start>.json`, `.log`), read
@@ -212,3 +233,6 @@ Read 2026-11-11. Resolved means read in a local copy at the commit `canon/upstre
   reproduced by failing tests before their fixes in `tests/test_session_window.py`; inherited comments
   in ADR 0083 and the scheduler were corrected. The final quote and eligibility rechecks remain in
   place. All of this evidence is offline; each extended-part firing on account B is still UNVERIFIED.
+* evidence-verifier on the sizing edits, 2026-11-11: the cap at the entry contradicted this record's
+  driver and ADR 0088, and the window sizes by `FixedRiskSizer` under the 500. Corrected above, with the
+  lead's figures of the same evening.
