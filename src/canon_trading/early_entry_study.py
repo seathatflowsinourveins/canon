@@ -55,8 +55,12 @@ cost and at twice it; `--from HH:MM` replays a window that starts watching then;
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
+import json
+import os
 import statistics
+import subprocess
 import sys
 from dataclasses import dataclass
 from dataclasses import replace
@@ -70,6 +74,7 @@ from itertools import accumulate
 from itertools import pairwise
 from pathlib import Path
 from typing import TYPE_CHECKING
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -79,8 +84,10 @@ from nautilus_trader.persistence import ParquetDataCatalog
 from skfolio.model_selection import WalkForward
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Iterable
     from collections.abc import Iterator
+    from collections.abc import Mapping
     from collections.abc import Sequence
 
 NEW_YORK = ZoneInfo("America/New_York")
@@ -106,6 +113,23 @@ DEVELOPMENT_TENTHS = 7
 BLOCKS = 5
 """A walk-forward block is one in this many of the development dates, rounded down."""
 HOLDOUT_MARK = ".holdout-opened"
+REPOSITORY = Path(__file__).resolve().parents[2]
+"""The checkout this module runs from, whose HEAD a registration commit must be or precede."""
+REPLAYED = "replayed"
+ADMITTED = "admitted"
+"""An arm a freeze admits to the opening, replayed at the one read against it (the lead's decision of
+2026-11-12 on ADR 0096's opening)."""
+NOT_ADMITTED = "not admitted"
+"""An arm a freeze names and leaves out of the opening, each with its reason and the record's line."""
+FREEZE_FORMAT = "canon.holdout-freeze.v1"
+NOTHING_READ = (
+    "No process has read an outcome on a holdout date: this freeze fixes which arms are admitted, and "
+    "the one read of holdout outcomes comes later, against it, after verifying its hashes."
+)
+"""The statement every freeze carries (the lead's decision of 2026-11-12 on ADR 0096's opening)."""
+PENDING = "registered, replay pending"
+"""An arm an opening lists without having replayed it: it may replay on that opening's dates once, at
+its registration commit, and nothing else may (the lead's ruling of 2026-11-12, ADR 0100)."""
 
 
 @dataclass(frozen=True)
@@ -227,6 +251,8 @@ class Day:
     missing: str | None = None
     uncovered: int = 0
     reference_from: str = "given"
+    start: int = PART_START
+    end: int = WINDOW_END
 
 
 @dataclass(frozen=True)
@@ -288,11 +314,13 @@ class Replay:
         return self.done_at_entry is None or self.done_at_entry > LATE
 
 
-def minute_dollars(bars: Iterable[Minute]) -> list[float]:
+def minute_dollars(
+    bars: Iterable[Minute], *, start: int = PART_START, end: int = WINDOW_END
+) -> list[float]:
     """Dollar volume by minute of the window, from `PART_START`."""
-    by_minute = [0.0] * (WINDOW_END - PART_START)
+    by_minute = [0.0] * (end - start)
     for bar in bars:
-        by_minute[bar.start - PART_START] += bar.dollars
+        by_minute[bar.start - start] += bar.dollars
     return by_minute
 
 
@@ -308,14 +336,16 @@ def listing(day: Day, rows: Rows) -> tuple[Listed, ...]:
 @lru_cache(maxsize=4096)
 def _listing(day: Day, list_move: float, list_ratio: float, sessions: int) -> tuple[Listed, ...]:
     taken = day.earlier[:sessions]
-    normals = [0.0] * (WINDOW_END - PART_START + 1)  # the mean dollar volume by each minute's end
+    normals = [0.0] * (day.end - day.start + 1)
     for session in taken:
-        for elapsed, total in enumerate(accumulate(minute_dollars(session)), 1):
+        for elapsed, total in enumerate(
+            accumulate(minute_dollars(session, start=day.start, end=day.end)), 1
+        ):
             normals[elapsed] += total / len(taken)
     out, dollars = [], 0.0
     for bar in day.bars:
         dollars += bar.dollars
-        base = normals[bar.start + 1 - PART_START] or None
+        base = normals[bar.start + 1 - day.start] or None
         move = bar.close / day.reference - 1.0 if day.reference else float("nan")
         ratio = None if base is None else dollars / base
         listed = bool(
@@ -629,23 +659,360 @@ def walk_forward(
     return out
 
 
+def default_holdout_root() -> Path:
+    from .ledger import default_ledger_path
+
+    return default_ledger_path().parent / "holdouts"
+
+
+def _listed_holdout_dates(list_path: Path) -> tuple[date, ...]:
+    try:
+        days = [
+            date.fromisoformat(line.split(",", 1)[0].strip())
+            for line in list_path.read_text().splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        _, held = split_dates(days)
+    except ValueError, FileNotFoundError:
+        return ()  # preserve the historical standalone one-line marker API
+    return tuple(held)
+
+
 def holdout_marker(list_path: Path) -> Path:
-    """The file beside the list that says its holdout was opened."""
+    """The file beside the list that said, before per-date markers, that its holdout was opened."""
     return list_path.with_name(list_path.name + HOLDOUT_MARK)
 
 
-def open_holdout(list_path: Path) -> Path:
-    """Mark the holdout of the list at `list_path` as opened and refuse a second opening: the marker is
-    created exclusively, so it cannot be made twice."""
-    marker = holdout_marker(list_path)
+def _held(list_path: Path, dates: Sequence[date] | None) -> tuple[date, ...]:
+    return tuple(sorted(set(dates))) if dates is not None else _listed_holdout_dates(list_path)
+
+
+def _date_marker(root: Path, day: date) -> Path:
+    return root / f"{day.isoformat()}{HOLDOUT_MARK}"
+
+
+def opened_holdout(
+    list_path: Path, *, dates: Sequence[date] | None = None, root: Path | None = None
+) -> list[str]:
+    """What already opened this holdout: the list's own marker from before per-date markers, then
+    each held date already opened under `root` (the default ledger's `holdouts`), by any list or
+    registered tuning plan. Empty when the holdout is unopened."""
+    found = [holdout_marker(list_path).name] if holdout_marker(list_path).exists() else []
+    base = default_holdout_root() if root is None else root
+    held = _held(list_path, dates)
+    return found + [day.isoformat() for day in held if _date_marker(base, day).exists()]
+
+
+def _manifest(root: Path, held: Sequence[date]) -> Path:
+    return root / f"{held[0].isoformat()}..{held[-1].isoformat()}.manifest.json"
+
+
+def _git(*args: str) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        ["git", "-C", str(REPOSITORY), *args], capture_output=True, text=False, check=False
+    )
+
+
+def registered_commit(commit: str) -> str:
+    """`commit` as a full SHA, if it names a commit that is this checkout's HEAD or an ancestor of it:
+    the code an arm was registered at must be code the checkout holds. Refused otherwise, by name."""
+
+    def git(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", "-C", str(REPOSITORY), *args], capture_output=True, text=True, check=False
+        )
+
+    found = git("rev-parse", "--verify", "--quiet", "--end-of-options", f"{commit}^{{commit}}")
+    if found.returncode != 0:
+        raise ValueError(f"{commit} names no commit in {REPOSITORY}")
+    sha = found.stdout.strip()
+    if git("merge-base", "--is-ancestor", sha, "HEAD").returncode != 0:
+        raise ValueError(f"{commit} is not the checkout's HEAD or an ancestor of it")
+    return sha
+
+
+def _arms_record(arms: Mapping[str, Mapping[str, str]]) -> dict[str, dict[str, str]]:
+    record = {}
+    for name, arm in arms.items():
+        commit, status = arm.get("commit"), arm.get("status")
+        if not isinstance(commit, str) or not commit:
+            raise ValueError(f"arm {name} names no registration commit")
+        if status not in (REPLAYED, PENDING):
+            raise ValueError(
+                f"arm {name}'s status must be {REPLAYED!r} or {PENDING!r}, not {status!r}"
+            )
+        try:
+            record[name] = {"commit": registered_commit(commit), "status": status}
+        except ValueError as e:
+            raise ValueError(f"arm {name}: {e}") from None
+    return record
+
+
+def _committed(path: str, commit: str) -> bytes | None:
+    """The bytes of `path` (relative to the checkout) at `commit`, or None if it is not tracked there."""
+    shown = _git("show", f"{commit}:{path}")
+    return shown.stdout if shown.returncode == 0 else None
+
+
+def _frozen_file(path: Path, commit: str) -> dict[str, str]:
+    """A freeze's record of one input: its path in the checkout and its SHA-256, which must be its form
+    at `commit`, so a later read can find it in history and check it again."""
+    resolved = path.resolve()
     try:
-        with marker.open("x", encoding="utf-8") as out:
-            out.write(f"opened {datetime.now(UTC).isoformat()}\n")
-    except FileExistsError:
-        raise PermissionError(
-            f"the holdout was already opened ({marker.name} exists beside the list): it is opened once"
-        ) from None
-    return marker
+        relative = resolved.relative_to(REPOSITORY.resolve()).as_posix()
+    except ValueError:
+        raise ValueError(f"{path} is not in the checkout: a freeze names tracked files") from None
+    data = resolved.read_bytes()
+    committed = _committed(relative, commit)
+    if committed is None:
+        raise ValueError(f"{relative} is not tracked at {commit}: commit it before the freeze")
+    if committed != data:
+        raise ValueError(f"{relative} differs from its form at {commit}: commit it first")
+    return {"path": relative, "sha256": hashlib.sha256(data).hexdigest()}
+
+
+def freeze_opening(
+    out: Path,
+    *,
+    holdout_list: Path,
+    amendments: Path,
+    population_rule: str,
+    admitted: Mapping[str, str],
+    pending: Mapping[str, str],
+    bars_read: Path,
+    not_admitted: Mapping[str, str] | None = None,
+    reasons: Mapping[str, str] | None = None,
+) -> Path:
+    """Freeze ADR 0096's opening (the lead's decision of 2026-11-12): HEAD's commit, the holdout list's
+    and the amendment's hashes at it, the population rule by citation, every admitted arm and every arm
+    pending replay with its registration commit, the statement that no outcome on a holdout date was
+    read, and what read holdout bars. Each arm left out is named with its reason (`not_admitted`), and
+    `reasons` gives the "admitted" and "pending" groups theirs. It reads no catalog and no list of
+    names, and is written once."""
+    left_out, why = dict(not_admitted or {}), dict(reasons or {})
+    named = [*admitted, *pending, *left_out]
+    twice = sorted({name for name in named if named.count(name) > 1})
+    if twice:
+        raise ValueError(f"{', '.join(twice)} is named in more than one group")
+    if set(why) - {"admitted", "pending"}:
+        raise ValueError(f"a reason is for 'admitted' or 'pending', not {sorted(set(why))}")
+    if any(not reason.strip() for reason in left_out.values()):
+        raise ValueError("an arm left out of the opening is named with its reason")
+    if not population_rule.strip():
+        raise ValueError("a freeze cites the population rule")
+    commit = registered_commit("HEAD")
+    arms: dict[str, dict[str, str]] = {}
+    for status, group, members in ((ADMITTED, "admitted", admitted), (PENDING, "pending", pending)):
+        for name, registered in members.items():
+            try:
+                arms[name] = {"commit": registered_commit(registered), "status": status}
+            except ValueError as e:
+                raise ValueError(f"arm {name}: {e}") from None
+            if why.get(group, "").strip():
+                arms[name]["reason"] = why[group].strip()
+    for name, reason in left_out.items():
+        arms[name] = {"status": NOT_ADMITTED, "reason": reason.strip()}
+    read_bytes = bars_read.read_bytes()
+    record = {
+        "format": FREEZE_FORMAT,
+        "commit": commit,
+        "frozen": datetime.now(UTC).isoformat(),
+        "holdout_list": _frozen_file(holdout_list, commit),
+        "amendments": _frozen_file(amendments, commit),
+        "population_rule": population_rule.strip(),
+        "arms": arms,
+        "nothing_read": NOTHING_READ,
+        "bars_read": [
+            line.rstrip() for line in read_bytes.decode("utf-8").splitlines() if line.strip()
+        ],
+        "bars_read_sha256": hashlib.sha256(read_bytes).hexdigest(),
+    }
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if out.exists():
+        raise FileExistsError(f"{out} exists: a freeze is written once")
+    # whole or not at all: written beside it, then linked into place, which refuses an existing file
+    # (review of the freeze, finding 7)
+    tmp = out.with_name(f".{out.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        os.link(tmp, out)
+    finally:
+        tmp.unlink(missing_ok=True)
+    return out
+
+
+def verify_freeze(path: Path) -> dict[str, Any]:
+    """A freeze, once it holds: the freeze file itself is tracked, unchanged in the checkout and
+    committed once, so its arms, rule and bars-read lines are what was frozen; its commit is a full SHA
+    that is the checkout's HEAD or an ancestor of it, as is each admitted or pending arm's, and every arm
+    has a known status; the holdout list hashes as frozen both at that commit and in the checkout now,
+    since the read takes its dates from it; the amendment hashes as frozen at that commit, since its
+    record may be edited later. The one read of holdout outcomes is to call this first; any mismatch is
+    refused by name (the lead's decision of 2026-11-12; review of the freeze, findings 1, 3, 4, 6, and
+    its second read, findings 1-3)."""
+    name = path.name
+    resolved = path.resolve()
+    try:
+        relative = resolved.relative_to(REPOSITORY.resolve()).as_posix()
+    except ValueError:
+        raise PermissionError(f"{name} is not in the checkout, so it is not tracked") from None
+    data = resolved.read_bytes()
+    at_head = _committed(relative, "HEAD")
+    if at_head is None:
+        raise PermissionError(f"{relative} is not tracked: a freeze is read from main")
+    if at_head != data:
+        raise PermissionError(f"{relative} differs from its committed form")
+    touched = _git("log", "--format=%H", "--", f":(literal){relative}").stdout.split()
+    if len(touched) != 1:
+        raise PermissionError(f"{relative} was committed more than once: a freeze is written once")
+    try:
+        record = json.loads(data)
+        if record["format"] != FREEZE_FORMAT:
+            raise PermissionError(f"{name} is not a {FREEZE_FORMAT} freeze")
+        commit = record["commit"]
+        files = [
+            (key, record[key]["path"], record[key]["sha256"])
+            for key in ("holdout_list", "amendments")
+        ]
+        arms = record["arms"].items()
+        if not all(isinstance(text, str) for _, *pair in files for text in pair):
+            raise TypeError("a frozen file's path and sha256 are text")
+    except (KeyError, TypeError, ValueError, AttributeError) as e:
+        raise PermissionError(f"{name} is malformed: {type(e).__name__}: {e}") from None
+    try:
+        if registered_commit(commit) != commit:
+            raise ValueError(f"its commit {commit} is not a full SHA")
+        for arm, entry in arms:
+            status = entry.get("status")
+            if status == NOT_ADMITTED:
+                continue
+            if status not in (ADMITTED, PENDING):
+                raise ValueError(f"arm {arm} has an unknown status {status!r}")
+            if registered_commit(entry["commit"]) != entry["commit"]:
+                raise ValueError(f"arm {arm}'s commit {entry['commit']} is not a full SHA")
+    except (KeyError, TypeError, AttributeError) as e:
+        raise PermissionError(f"{name} is malformed: {type(e).__name__}: {e}") from None
+    except ValueError as e:
+        raise PermissionError(f"{name}: {e}") from None
+    for key, relative_path, digest in files:
+        forms = [(f"at {commit}", _committed(relative_path, commit))]
+        if key == "holdout_list":
+            current = REPOSITORY / relative_path
+            forms.append(("in the checkout", current.read_bytes() if current.is_file() else None))
+        for form, found in forms:
+            if found is None or hashlib.sha256(found).hexdigest() != digest:
+                raise PermissionError(
+                    f"{name}: {relative_path} {form} does not hash to the frozen {digest}"
+                )
+    return record
+
+
+def _write_json(path: Path, value: object) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def open_holdout(
+    list_path: Path,
+    *,
+    dates: Sequence[date] | None = None,
+    root: Path | None = None,
+    replay: Callable[[], object] | None = None,
+    arms: Mapping[str, Mapping[str, str]] | None = None,
+) -> Path:
+    """Serialize replay for held dates and mark each date opened only after successful replay.
+
+    Each held date is opened once, under one root shared by every list and registered tuning plan, so
+    a subset, superset or overlap of dates already opened is refused (ADR 0092). Returns that root.
+    A standalone caller with no parseable dates keeps the one marker beside its list, and may omit
+    replay. Study callers put all held-date evaluation in the callback so an exception leaves the
+    opening available.
+    """
+    held = _held(list_path, dates)
+    if arms is not None and not held:
+        raise ValueError("an opening's arm manifest needs its held dates")
+    record = None if arms is None else _arms_record(arms)
+    base = default_holdout_root() if root is None else root
+    target = base if held else holdout_marker(list_path)
+    (base if held else target.parent).mkdir(parents=True, exist_ok=True)
+    lock_path = base / ".lock" if held else target.with_name(target.name + ".lock")
+    with lock_path.open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            opened = opened_holdout(list_path, dates=held, root=base)
+            if opened:
+                raise PermissionError(
+                    f"the holdout was already opened ({', '.join(opened)}): it is opened once"
+                )
+            if replay is not None:
+                replay()
+            opened_at = datetime.now(UTC).isoformat()
+            named = "" if record is None else f", manifest {_manifest(base, held).name}"
+            for marker in [_date_marker(base, day) for day in held] or [target]:
+                with marker.open("x", encoding="utf-8") as out:
+                    out.write(f"opened {opened_at} for {list_path.name}{named}\n")
+            # After the markers, which are what opens the dates, and replaced whole: a failed marker
+            # leaves no manifest to block the next attempt, and a failed manifest leaves the dates
+            # opened with no arm pending, so every late arm goes to the later holdout.
+            if record is not None:
+                _write_json(
+                    _manifest(base, held),
+                    {
+                        "dates": [day.isoformat() for day in held],
+                        "list": list_path.name,
+                        "opened": opened_at,
+                        "arms": record,
+                    },
+                )
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+    return target
+
+
+def replay_pending_arm(
+    arm: str,
+    *,
+    commit: str,
+    dates: Sequence[date],
+    replay: Callable[[], object],
+    root: Path | None = None,
+) -> Path:
+    """Replay one arm on an opened holdout's dates, once, where that opening's manifest lists it as
+    `PENDING` at `commit`; then mark it replayed. Anything else (another commit, an arm the opening
+    replayed or never named, dates that are not exactly one opening's) is refused and goes to the later
+    holdout (the lead's ruling of 2026-11-12, ADR 0100). A replay that raises leaves the arm pending."""
+    held = tuple(sorted(set(dates)))
+    base = default_holdout_root() if root is None else root
+    manifest = _manifest(base, held) if held else base / "none"
+    later = "it goes to the later holdout"
+    if not base.is_dir():
+        raise PermissionError(f"no holdout was ever opened under {base}: {later}")
+    try:
+        commit = registered_commit(commit)
+    except ValueError as e:
+        raise PermissionError(f"{e}: {later}") from None
+    with (base / ".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            if not manifest.is_file():
+                raise PermissionError(f"no opening's manifest covers exactly these dates: {later}")
+            record = json.loads(manifest.read_text(encoding="utf-8"))
+            if record.get("dates") != [day.isoformat() for day in held]:
+                raise PermissionError(f"{manifest.name} names other dates: {later}")
+            entry = record.get("arms", {}).get(arm)
+            if entry is None or entry.get("status") != PENDING:
+                raise PermissionError(f"{arm} is not pending in {manifest.name}: {later}")
+            if entry.get("commit") != commit:
+                raise PermissionError(
+                    f"{arm} was registered at {entry.get('commit')}, not {commit}: {later}"
+                )
+            replay()
+            entry["status"] = f"{REPLAYED} later, {datetime.now(UTC).isoformat()}"
+            _write_json(manifest, record)
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+    return manifest
 
 
 # --- reading the catalog ---------------------------------------------------------------------------
@@ -971,8 +1338,12 @@ def _listed_days(args: argparse.Namespace, costs: Costs | None) -> int:
     names in the catalog, leaves it unopened; a holdout already opened is refused before anything runs."""
     listed = read_days(args.days_file, args.sha256)
     development, holdout = split_dates(d for d, _ in listed)
-    if args.open_holdout and holdout_marker(args.days_file).exists():
-        open_holdout(args.days_file)  # raises: it is opened once
+    if args.open_holdout and opened_holdout(args.days_file, dates=holdout):
+        open_holdout(args.days_file, dates=holdout)  # raises: it is opened once
+    pending = {
+        name: {"commit": registered_commit(commit), "status": PENDING}
+        for name, commit in args.pending_arm or ()
+    }
     cost = costs or GROSS
     print(
         f"## Early-entry walk-forward (DIAGNOSTIC: changes no row): {len(listed)} name-days on "
@@ -993,17 +1364,66 @@ def _listed_days(args: argparse.Namespace, costs: Costs | None) -> int:
         f"**Chosen on all development dates**: `{chosen}`\n\n" + "\n".join(arms_table(days, cost))
     )
     if args.open_holdout:
-        held_out = [load_day(args.catalog, s, d) for d, s in listed if d in holdout]
-        if all(day.missing is not None for day in held_out):
-            raise LookupError(
-                "none of the holdout's names is in the catalog, so the holdout stays unopened"
-            )
-        report = _at_each_cost(held_out, ARMS[chosen], costs)
-        marker = open_holdout(args.days_file)
+        if chosen in pending:
+            raise ValueError(f"{chosen} is the arm this opening replays, so it is not pending")
+        arms = None
+        if pending:
+            arms = {chosen: {"commit": registered_commit("HEAD"), "status": REPLAYED}, **pending}
+        reports = []
+
+        def evaluate() -> None:
+            held_out = [load_day(args.catalog, s, d) for d, s in listed if d in holdout]
+            if all(day.missing is not None for day in held_out):
+                raise LookupError(
+                    "none of the holdout's names is in the catalog, so the holdout stays unopened"
+                )
+            reports.append(_at_each_cost(held_out, ARMS[chosen], costs))
+
+        marker = open_holdout(args.days_file, dates=holdout, replay=evaluate, arms=arms)
+        report = reports[0]
+        manifest = "" if arms is None else f"; its arms in {_manifest(marker, holdout).name}"
         print(
-            f"\n**Holdout, opened once ({marker.name} written beside the list)**: `{chosen}`\n\n"
+            f"\n**Holdout, opened once (each held date marked in {marker}{manifest})**: `{chosen}`\n\n"
             + report
         )
+    return 0
+
+
+def _pending_arg(text: str) -> tuple[str, str]:
+    name, equals, commit = (part.strip() for part in text.partition("="))
+    if not equals or not name or not commit:
+        raise argparse.ArgumentTypeError(f"{text!r} is not ARM=COMMIT")
+    return name, commit
+
+
+def _freeze(args: argparse.Namespace) -> int:
+    for flag, named in (
+        ("--admitted", args.admitted),
+        ("--pending-arm", args.pending_arm),
+        ("--not-admitted", args.not_admitted),
+        ("--reason", args.reason),
+    ):
+        names = [name for name, _ in named or ()]
+        if len(set(names)) != len(names):
+            raise ValueError(f"{flag} names an arm twice")
+    out = freeze_opening(
+        args.freeze,
+        holdout_list=args.holdout_list,
+        amendments=args.amendments,
+        population_rule=args.population_rule,
+        admitted=dict(args.admitted or ()),
+        pending=dict(args.pending_arm or ()),
+        bars_read=args.bars_read,
+        not_admitted=dict(args.not_admitted or ()),
+        reasons=dict(args.reason or ()),
+    )
+    record = json.loads(out.read_text(encoding="utf-8"))
+    statuses = [arm["status"] for arm in record["arms"].values()]
+    print(
+        f"frozen: {out} at {record['commit']}: {statuses.count(ADMITTED)} arms admitted, "
+        f"{statuses.count(PENDING)} pending replay, {statuses.count(NOT_ADMITTED)} left out; "
+        "nothing read"
+    )
     return 0
 
 
@@ -1012,7 +1432,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         prog="python -m canon_trading.early_entry_study",
         description=(__doc__ or "").split("\n\n")[0],
     )
-    parser.add_argument("--catalog", type=Path, required=True, help="a catalog root of one feed")
+    parser.add_argument("--catalog", type=Path, help="a catalog root of one feed")
     parser.add_argument("--day", type=date.fromisoformat, help="one day, with --symbols")
     parser.add_argument("--symbols", help="comma-separated")
     parser.add_argument(
@@ -1022,6 +1442,50 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--sha256", help="the list's registered SHA-256")
     parser.add_argument(
         "--open-holdout", action="store_true", help="replay the chosen arm on the holdout, once"
+    )
+    parser.add_argument(
+        "--pending-arm",
+        action="append",
+        type=_pending_arg,
+        metavar="ARM=COMMIT",
+        help="with --open-holdout or --freeze: an arm registered at COMMIT (HEAD or an ancestor of "
+        "it) whose replay on these dates is pending; the opening lists it (ADR 0100)",
+    )
+    parser.add_argument(
+        "--freeze",
+        type=Path,
+        metavar="OUT",
+        help="freeze ADR 0096's opening into OUT, written once: the arms admitted and pending, the "
+        "holdout list's and the amendment's hashes; reads no catalog and no list of names",
+    )
+    parser.add_argument("--holdout-list", type=Path, help="with --freeze: the tracked held dates")
+    parser.add_argument("--amendments", type=Path, help="with --freeze: the tracked amendment")
+    parser.add_argument("--population-rule", help="with --freeze: the population rule, by citation")
+    parser.add_argument(
+        "--admitted",
+        action="append",
+        type=_pending_arg,
+        metavar="ARM=COMMIT",
+        help="with --freeze: an arm admitted to the opening, registered at COMMIT",
+    )
+    parser.add_argument(
+        "--not-admitted",
+        action="append",
+        type=_pending_arg,
+        metavar="ARM=REASON",
+        help="with --freeze: an arm left out of the opening, with its reason and the record's line",
+    )
+    parser.add_argument(
+        "--reason",
+        action="append",
+        type=_pending_arg,
+        metavar="GROUP=TEXT",
+        help="with --freeze: the reason and line for the 'admitted' or 'pending' group",
+    )
+    parser.add_argument(
+        "--bars-read",
+        type=Path,
+        help="with --freeze: what has read holdout bars and why, one line each",
     )
     parser.add_argument(
         "--half-spread-bps",
@@ -1040,12 +1504,44 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="the minute the strategy starts watching (default 04:00), for one day",
     )
     args = parser.parse_args(argv)
+    freeze_only = (
+        args.holdout_list,
+        args.amendments,
+        args.population_rule,
+        args.admitted,
+        args.not_admitted,
+        args.reason,
+    )
+    if args.freeze is not None:
+        others = (args.catalog, args.day, args.symbols, args.days_file, args.sha256)
+        if (
+            any(value is not None for value in others)
+            or args.open_holdout
+            or args.arms
+            or args.start != PART_START
+            or args.half_spread_bps is not None
+        ):
+            parser.error("--freeze reads no catalog and no list: give it only its own options")
+        if None in (args.holdout_list, args.amendments, args.population_rule, args.bars_read):
+            parser.error(
+                "--freeze needs --holdout-list, --amendments, --population-rule and --bars-read"
+            )
+        return _freeze(args)
+    if any(value is not None for value in freeze_only) or args.bars_read is not None:
+        parser.error("--freeze's own options go with --freeze")
+    if args.catalog is None:
+        parser.error("--catalog is required")
     one_day = args.day is not None and bool(args.symbols)
     a_list = args.days_file is not None and bool(args.sha256)
     if one_day == a_list or (a_list and (args.day or args.symbols or args.arms)):
         parser.error("give --day with --symbols, or --days-file with --sha256, and not both")
     if args.open_holdout and not a_list:
         parser.error("--open-holdout goes with --days-file")
+    if args.pending_arm and not args.open_holdout:
+        parser.error("--pending-arm goes with --open-holdout")
+    names = [name for name, _ in args.pending_arm or ()]
+    if len(set(names)) != len(names):
+        parser.error("--pending-arm names an arm twice")
     if a_list and args.start != PART_START:
         parser.error("--from goes with --day: a list is replayed from 04:00")
     if not PART_START <= args.start < WINDOW_END:

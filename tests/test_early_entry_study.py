@@ -8,6 +8,8 @@ Offline. The catalog tests write Alpaca-shaped minute bars through the adapter's
 from __future__ import annotations
 
 import hashlib
+import json
+import subprocess
 from dataclasses import replace
 from datetime import UTC
 from datetime import date
@@ -336,6 +338,13 @@ def test_the_arms_are_the_fifteen_the_record_registers() -> None:
 # --- the list, the split and the walk-forward ------------------------------------------------------
 
 DATES = [date(2026, 9, 1) + timedelta(days=i) for i in range(10)]
+
+
+@pytest.fixture(autouse=True)
+def isolated_holdout_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(study, "default_holdout_root", lambda: tmp_path / "holdouts")
+
+
 SLOW = [
     RISE[0],
     *bars(OPEN + 1, [10.4, 10.5, 10.5, 10.6, 10.6, 10.7, 10.7, 10.8, 10.9], first=10.1),
@@ -403,6 +412,27 @@ def test_the_holdout_opens_once(tmp_path: Path) -> None:
     assert marker.name == "days.csv.holdout-opened" and marker.exists()
     with pytest.raises(PermissionError, match="opened once"):
         study.open_holdout(path)
+
+
+def test_shared_dates_holdout_is_consumed_only_after_success(tmp_path: Path) -> None:
+    first, second = tmp_path / "a.json", tmp_path / "b.json"
+    first.write_text("{}")
+    second.write_text("{}")
+    held = tuple(DATES[-3:])
+    root = tmp_path / "holdouts"
+
+    def failure():
+        raise RuntimeError("replay failed")
+
+    with pytest.raises(RuntimeError, match="replay failed"):
+        study.open_holdout(first, dates=held, root=root, replay=failure)
+    assert not list(root.glob("*.holdout-opened"))
+    marker = study.open_holdout(second, dates=held, root=root, replay=lambda: None)
+    assert sorted(path.name for path in marker.glob("*.holdout-opened")) == [
+        f"{day.isoformat()}.holdout-opened" for day in held
+    ]
+    with pytest.raises(PermissionError, match="opened once"):
+        study.open_holdout(first, dates=held, root=root, replay=lambda: None)
 
 
 def test_the_command_walks_the_list_forward_and_opens_the_holdout_only_when_asked(
@@ -565,13 +595,350 @@ def test_a_holdout_that_cannot_be_replayed_stays_unopened_and_one_that_can_is_pr
     argv = ["--catalog", str(tmp_path), "--days-file", str(path), "--sha256", digest]
     with pytest.raises(LookupError, match="stays unopened"):
         study.main([*argv, "--open-holdout"])
-    assert not study.holdout_marker(path).exists()
+    assert not study.opened_holdout(path)
     monkeypatch.setattr(study, "load_day", lambda catalog, symbol, day: on(day, SLOW))
     capsys.readouterr()
     assert study.main([*argv, "--open-holdout", "--half-spread-bps", "20", "10"]) == 0
     out = capsys.readouterr().out
     holdout = out[out.index("**Holdout, opened once") :]
     assert all(label in holdout for label in ("*gross*", "*costs x1*", "*costs x2*"))
-    assert study.holdout_marker(path).exists()
+    assert study.opened_holdout(path) == [d.isoformat() for d in DATES[7:]]
     with pytest.raises(SystemExit):
         study.main([*argv, "--from", "09:40"])
+
+
+def test_an_overlapping_holdout_is_refused_by_each_date_already_opened(tmp_path: Path) -> None:
+    """code-review-high-n2b/holdout-per-date: a subset, superset or overlap of dates already opened
+    is refused; the once-only key is each held date, not a digest of one date set."""
+    root = tmp_path / "holdouts"
+    study.open_holdout(tmp_path / "a.csv", dates=DATES[-3:], root=root, replay=lambda: None)
+    for held in (DATES[-2:], DATES[-4:-1], DATES[-4:]):
+        with pytest.raises(PermissionError, match=DATES[-2].isoformat()):
+            study.open_holdout(tmp_path / "b.csv", dates=held, root=root, replay=lambda: None)
+    study.open_holdout(tmp_path / "c.csv", dates=DATES[:2], root=root, replay=lambda: None)
+
+
+def test_an_arm_pending_at_an_opening_replays_once_at_its_commit_and_nothing_else_does(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The lead's ruling of 2026-11-12 (ADR 0100): an opening writes a manifest of its arms, each with
+    its registration commit, and may list one as registered with its replay pending. Only such an arm,
+    at that commit, on exactly those dates, may replay later, once; anything else goes to the later
+    holdout, and a replay that fails leaves the arm pending."""
+    root, held = tmp_path / "holdouts", DATES[-3:]
+    c1, c2, c3 = checkout(tmp_path / "repo", monkeypatch)
+    arms = {
+        "F-all": {"commit": c1, "status": study.REPLAYED},
+        "move": {"commit": c2, "status": study.PENDING},
+    }
+    study.open_holdout(tmp_path / "a.csv", dates=held, root=root, replay=lambda: None, arms=arms)
+    (manifest,) = root.glob("*.manifest.json")
+    assert json.loads(manifest.read_text())["arms"] == arms
+
+    def refused(arm: str, commit: str, dates=held) -> None:
+        with pytest.raises(PermissionError, match="later holdout"):
+            study.replay_pending_arm(
+                arm, commit=commit, dates=dates, root=root, replay=lambda: None
+            )
+
+    refused("move", c3)  # a commit the checkout does not hold
+    refused("move", c1)  # another commit the checkout holds
+    refused("F-all", c1)  # replayed at the opening
+    refused("rdb5", c2)  # never named
+    refused("move", c2, DATES[-2:])  # not exactly the opening's dates
+
+    def failure():
+        raise RuntimeError("replay failed")
+
+    with pytest.raises(RuntimeError, match="replay failed"):
+        study.replay_pending_arm("move", commit=c2, dates=held, root=root, replay=failure)
+    ran = []
+    study.replay_pending_arm(
+        "move", commit=c2[:12], dates=held, root=root, replay=lambda: ran.append(1)
+    )
+    assert ran == [1]
+    assert json.loads(manifest.read_text())["arms"]["move"]["status"].startswith("replayed later")
+    refused("move", c2)  # once
+
+
+def test_an_opening_manifest_refuses_an_arm_with_no_commit_or_an_unknown_status(
+    tmp_path: Path,
+) -> None:
+    root, ran = tmp_path / "holdouts", []
+    for bad in ({"status": study.PENDING}, {"commit": "c1", "status": "waiting"}):
+        with pytest.raises(ValueError, match="arm move"):
+            study.open_holdout(
+                tmp_path / "a.csv",
+                dates=DATES[-3:],
+                root=root,
+                replay=lambda: ran.append(1),
+                arms={"move": bad},
+            )
+    assert ran == [] and not list(root.glob("*"))
+
+
+def test_a_holdout_opened_beside_its_list_by_the_old_code_stays_opened(tmp_path: Path) -> None:
+    """code-review-high-n2b/legacy-marker: a `<list>.holdout-opened` file from before per-date
+    markers still refuses a second opening of that list's holdout."""
+    path = tmp_path / "days.csv"
+    write_list(path, [f"{d},TEST" for d in DATES])
+    path.with_name(path.name + ".holdout-opened").write_text("opened earlier\n")
+    _, held = study.split_dates(DATES)
+    with pytest.raises(PermissionError, match="days.csv.holdout-opened"):
+        study.open_holdout(path, dates=held, replay=lambda: None)
+    assert study.opened_holdout(path, dates=held) == ["days.csv.holdout-opened"]
+
+
+def git(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), "-c", "user.name=test", "-c", "user.email=test@example.com",
+         "-c", "commit.gpgsign=false", *args],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()  # fmt: skip
+
+
+def checkout(repo: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[str, str, str]:
+    """A checkout whose HEAD is its second commit, and a third commit on a branch HEAD does not hold;
+    the study reads it as its own checkout."""
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "main")
+    shas = []
+    for name in ("first", "second"):
+        git(repo, "commit", "-q", "--allow-empty", "-m", name)
+        shas.append(git(repo, "rev-parse", "HEAD"))
+    git(repo, "checkout", "-q", "-b", "side")
+    git(repo, "commit", "-q", "--allow-empty", "-m", "side")
+    shas.append(git(repo, "rev-parse", "HEAD"))
+    git(repo, "checkout", "-q", "main")
+    monkeypatch.setattr(study, "REPOSITORY", repo)
+    return shas[0], shas[1], shas[2]
+
+
+def test_the_command_lists_pending_arms_at_commits_the_checkout_holds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The lead's ruling of 2026-11-12 (ADR 0100): `--open-holdout` takes the arms registered with their
+    replay pending, each at a commit that is the checkout's HEAD or an ancestor of it, and writes them
+    with the chosen arm, replayed at HEAD, into the opening's manifest."""
+    first, second, side = checkout(tmp_path / "repo", monkeypatch)
+    monkeypatch.setattr(study, "load_day", lambda catalog, symbol, day: on(day, SLOW))
+
+    def argv(name: str) -> list[str]:
+        path = tmp_path / f"{name}.csv"
+        digest = write_list(path, [f"{d},TEST" for d in DATES])
+        return ["--catalog", str(tmp_path), "--days-file", str(path), "--sha256", digest]
+
+    for pending, why in (
+        (f"move={side}", "not the checkout's HEAD or an ancestor"),
+        ("move=0000000", "names no commit"),
+        (f"run-1={first}", "run-1 is the arm this opening replays"),
+    ):
+        with pytest.raises(ValueError, match=why):
+            study.main([*argv("refused"), "--open-holdout", "--pending-arm", pending])
+        assert not study.opened_holdout(tmp_path / "refused.csv")
+    for wrong in (["--open-holdout", "--pending-arm", "move"], ["--pending-arm", f"move={first}"]):
+        with pytest.raises(SystemExit):
+            study.main([*argv("refused"), *wrong])
+    capsys.readouterr()
+    assert study.main(
+        [*argv("days"), "--open-holdout", "--pending-arm", f"move={first[:10]}",
+         "--pending-arm", "F-all=HEAD"]
+    ) == 0  # fmt: skip
+    assert "manifest" in capsys.readouterr().out
+    (manifest,) = study.default_holdout_root().glob("*.manifest.json")
+    assert json.loads(manifest.read_text())["arms"] == {
+        "run-1": {"commit": second, "status": study.REPLAYED},
+        "move": {"commit": first, "status": study.PENDING},
+        "F-all": {"commit": second, "status": study.PENDING},
+    }
+
+
+def test_an_opening_whose_markers_failed_can_be_opened_again_with_its_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """code-review-high-n2c/2: a manifest written before a date marker failed made every later
+    attempt raise FileExistsError, so the holdout could never be marked opened."""
+    root, held = tmp_path / "holdouts", DATES[-3:]
+    _, head, _ = checkout(tmp_path / "repo", monkeypatch)
+    arms = {"move": {"commit": head, "status": study.PENDING}}
+    real = study._date_marker
+    monkeypatch.setattr(
+        study, "_date_marker", lambda base, day: tmp_path / "gone" / day.isoformat()
+    )
+    with pytest.raises(FileNotFoundError):
+        study.open_holdout(
+            tmp_path / "a.csv", dates=held, root=root, replay=lambda: None, arms=arms
+        )
+    monkeypatch.setattr(study, "_date_marker", real)
+    study.open_holdout(tmp_path / "a.csv", dates=held, root=root, replay=lambda: None, arms=arms)
+    (manifest,) = root.glob("*.manifest.json")
+    assert json.loads(manifest.read_text())["arms"] == arms
+
+
+def test_a_pending_replay_where_nothing_was_ever_opened_goes_to_the_later_holdout(
+    tmp_path: Path,
+) -> None:
+    """code-review-high-n2c/8: a root no opening made raised FileNotFoundError, not the refusal."""
+    with pytest.raises(PermissionError, match="later holdout"):
+        study.replay_pending_arm(
+            "move", commit="HEAD", dates=DATES[-3:], root=tmp_path / "none", replay=lambda: None
+        )
+
+
+def frozen_checkout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, str, str]:
+    """A checkout holding a holdout list and an amendment at HEAD, and the commit before them."""
+    repo = tmp_path / "repo"
+    first, _, _ = checkout(repo, monkeypatch)
+    (repo / "canon").mkdir()
+    (repo / "canon" / "holdout.txt").write_text("# ADR 0092's held dates\n2026-10-16\n2026-11-10\n")
+    (repo / "amend.md").write_text("the opening is a freeze, then one read\n")
+    git(repo, "add", "canon/holdout.txt", "amend.md")
+    git(repo, "commit", "-q", "-m", "list and amendment")
+    return repo, first, git(repo, "rev-parse", "HEAD")
+
+
+def freeze_argv(repo: Path, out: Path, first: str, bars: Path) -> list[str]:
+    bars.write_text("the nightly baseline read held-date bars for its baselines\n")
+    return [
+        "--freeze", str(out),
+        "--holdout-list", str(repo / "canon" / "holdout.txt"),
+        "--amendments", str(repo / "amend.md"),
+        "--population-rule", "ADR 0092's measure and window over 60 sessions",
+        "--admitted", f"run-1={first}",
+        "--pending-arm", f"F-all={first}",
+        "--pending-arm", "F-move=HEAD",
+        "--bars-read", str(bars),
+        "--not-admitted", "BV1=registered, not ready at the opening (ADR 0096:63-64)",
+        "--reason", "pending=ADR 0100's arms, replay pending at their registration",
+    ]  # fmt: skip
+
+
+def test_a_freeze_names_the_admitted_arms_and_hashes_without_a_list_or_a_catalog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The lead's decision of 2026-11-12 (05:4x, the 09:30 freeze): the opening freezes which arms are
+    admitted, with HEAD's commit, the holdout list's and the amendment's hashes, the population rule by
+    citation and what read holdout bars; it takes no --days-file and reads no catalog, and is written
+    once."""
+    repo, first, head = frozen_checkout(tmp_path, monkeypatch)
+
+    def no_catalog(*_: object) -> None:
+        raise AssertionError("a freeze reads no catalog")
+
+    monkeypatch.setattr(study, "load_day", no_catalog)
+    out = tmp_path / "freeze.json"
+    argv = freeze_argv(repo, out, first, tmp_path / "bars.txt")
+    assert study.main(argv) == 0
+    assert "frozen" in capsys.readouterr().out
+    record = json.loads(out.read_text())
+    listed = (repo / "canon" / "holdout.txt").read_bytes()
+    assert record["commit"] == head
+    assert record["holdout_list"] == {
+        "path": "canon/holdout.txt",
+        "sha256": hashlib.sha256(listed).hexdigest(),
+    }
+    assert record["amendments"]["path"] == "amend.md"
+    assert record["population_rule"] == "ADR 0092's measure and window over 60 sessions"
+    pending = "ADR 0100's arms, replay pending at their registration"
+    assert record["arms"] == {
+        "run-1": {"commit": first, "status": study.ADMITTED},
+        "F-all": {"commit": first, "status": study.PENDING, "reason": pending},
+        "F-move": {"commit": head, "status": study.PENDING, "reason": pending},
+        "BV1": {
+            "status": study.NOT_ADMITTED,
+            "reason": "registered, not ready at the opening (ADR 0096:63-64)",
+        },
+    }
+    assert record["nothing_read"] == study.NOTHING_READ
+    assert record["bars_read"] == ["the nightly baseline read held-date bars for its baselines"]
+    assert (
+        record["bars_read_sha256"]
+        == hashlib.sha256((tmp_path / "bars.txt").read_bytes()).hexdigest()
+    )
+    with pytest.raises(FileExistsError):
+        study.main(argv)  # written once
+    for wrong in (
+        ["--admitted", f"F-all={first}"],  # admitted and pending at once
+        ["--not-admitted", "F-move=late"],  # pending and left out at once
+        ["--reason", "other=text"],
+        ["--days-file", str(out), "--sha256", "0" * 64],
+        ["--catalog", str(tmp_path)],
+        ["--from", "05:00"],  # review of the freeze, finding 5: taken and ignored
+        ["--half-spread-bps", "1", "2"],
+    ):
+        with pytest.raises((SystemExit, ValueError)):
+            study.main([*freeze_argv(repo, tmp_path / "other.json", first, tmp_path / "b"), *wrong])
+    assert not (tmp_path / "other.json").exists()
+    (repo / "amend.md").write_text("changed after its commit\n")
+    with pytest.raises(ValueError, match="amend.md differs from its form at"):
+        study.main(freeze_argv(repo, tmp_path / "third.json", first, tmp_path / "b"))
+
+
+def test_the_later_read_verifies_the_freezes_hashes_and_refuses_a_mismatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The lead's decision of 2026-11-12 (the 09:30 freeze): the one read of holdout outcomes verifies
+    the freeze first and refuses on any mismatch: the freeze must be tracked, unchanged and committed
+    once, its commit a full SHA the checkout holds, every arm of a known status, and the holdout list
+    must hash as frozen both at the commit and now; the amendment is checked at the commit, since its
+    record may be edited later (review of the freeze, findings 1, 3, 4 and 6)."""
+    repo, first, _ = frozen_checkout(tmp_path, monkeypatch)
+    out = repo / "canon" / "freeze.json"
+    assert study.main(freeze_argv(repo, out, first, tmp_path / "bars.txt")) == 0
+    with pytest.raises(PermissionError, match="not tracked"):
+        study.verify_freeze(out)
+    git(repo, "add", "canon/freeze.json")
+    git(repo, "commit", "-q", "-m", "the freeze")
+    assert study.verify_freeze(out)["arms"]["F-all"]["status"] == study.PENDING
+    (repo / "amend.md").write_text("a later routine edit of the amended record\n")
+    assert study.verify_freeze(out)["commit"]  # the amendment is checked at the commit
+    (repo / "amend.md").write_text("the opening is a freeze, then one read\n")
+    kept = out.read_text()
+
+    def refused(record: dict, match: str) -> None:
+        out.write_text(json.dumps(record))
+        with pytest.raises(PermissionError, match=match):
+            study.verify_freeze(out)
+        out.write_text(kept)
+
+    record = json.loads(kept)
+    refused({**record, "arms": {**record["arms"], "BV1": {"status": "admitted", "commit": first}}},
+            "differs from its committed form")  # fmt: skip
+    out.write_text(json.dumps({**record, "population_rule": "another"}))
+    git(repo, "commit", "-q", "-am", "an edited freeze")
+    with pytest.raises(PermissionError, match="committed more than once"):
+        study.verify_freeze(out)
+    before = git(repo, "rev-parse", "HEAD~2")  # the list and amendment, before the freeze
+    for change, match in (
+        ({"commit": "HEAD"}, "not a full SHA"),
+        ({"arms": {"X": {"status": "maybe", "commit": first}}}, "unknown status"),
+        ({"holdout_list": None}, "malformed"),
+        ({"arms": []}, "malformed"),  # second read of the freeze fixes, 1
+        ({"holdout_list": {"path": 5, "sha256": "0" * 64}}, "malformed"),  # second read, 2
+        ({"amendments": {**record["amendments"], "sha256": "0" * 64}}, "amend.md"),
+    ):
+        git(repo, "reset", "-q", "--hard", before)
+        out.write_text(json.dumps({**record, **change}))
+        git(repo, "add", "canon/freeze.json")
+        git(repo, "commit", "-q", "-m", "a malformed freeze")
+        with pytest.raises(PermissionError, match=match):
+            study.verify_freeze(out)
+    git(repo, "reset", "-q", "--hard", before)
+    out.write_text(kept)
+    git(repo, "add", "canon/freeze.json")
+    git(repo, "commit", "-q", "-m", "the freeze")
+    assert study.verify_freeze(out)
+    listed = repo / "canon" / "holdout.txt"
+    listed.write_text(listed.read_text() + "2026-11-11\n")
+    with pytest.raises(PermissionError, match="canon/holdout.txt in the checkout"):
+        study.verify_freeze(out)
+    listed.write_text("# ADR 0092's held dates\n2026-10-16\n2026-11-10\n")
+    # second read of the freeze fixes, 3: a path git would read as a glob counts only its own commits
+    globbed = repo / "canon" / "freeze[1].json"
+    globbed.write_text(kept)
+    git(repo, "add", "canon/freeze[1].json")
+    git(repo, "commit", "-q", "-m", "a freeze whose name has brackets")
+    (repo / "canon" / "freeze1.json").write_text("another file\n")
+    git(repo, "add", "canon/freeze1.json")
+    git(repo, "commit", "-q", "-m", "a file the glob would match")
+    assert study.verify_freeze(globbed)

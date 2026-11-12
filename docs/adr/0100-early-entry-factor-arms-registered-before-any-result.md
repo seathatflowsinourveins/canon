@@ -92,8 +92,24 @@ a holdout cut is the 67th percentile of every development event. Which holdout, 
 2026-11-11: if this record is on `main` before ADR 0096's holdout opens (09:30 New York on 2026-11-12 at
 the latest), `F-all` and the seven bar factor arms (`move` to `repeat`) are registered arms of that opening,
 on ADR 0092's holdout dates. Their replay runs once the factor computation lands, on those same dates, with
-nothing about an arm changed after any result of that opening is read. They are reported beside ADR 0096's
-selection, not in it, and its tie order is unchanged. `rdb5` and `vwap` go in every case, and the other
+nothing about an arm changed after any result of that opening is read. An opening given its arms writes
+a manifest of them, each with its registration commit, and may list an arm as "registered, replay
+pending"; a later replay on those dates is allowed once, only for an arm the manifest names pending, at
+that commit, and anything else is refused and goes to the later holdout (the lead's ruling of 2026-11-12;
+`early_entry_study.open_holdout(arms=)` and `replay_pending_arm`). `--open-holdout` takes each pending
+arm as `--pending-arm ARM=COMMIT` and lists the chosen arm as replayed at HEAD; every commit, at the
+opening and at the later replay, must be the checkout's HEAD or an ancestor of it. An opening given no
+pending arm writes no manifest, and then every late arm goes to the later holdout. They are reported beside ADR 0096's
+selection, not in it, and its tie order is unchanged. By the lead's decision of 2026-11-12 (05:4x), ADR 0096's opening is a freeze at
+09:30 and one read later, and the freeze, not an `--open-holdout` manifest, is that opening's list of
+arms. `--freeze OUT`, with no list of names and no catalog read, writes once: HEAD's commit, run from
+`main`; the SHA-256 at that commit of the tracked holdout list and of the tracked amendment to ADR 0096;
+the population rule by citation; each arm admitted or pending with its registration commit, and each arm
+left out with its reason; the statement that no outcome on a holdout date was read; and what read holdout
+bars (`early_entry_study.freeze_opening`). The file is committed to `main` before 09:30. The read, not
+yet built, is to call `verify_freeze` first, which refuses unless the freeze is tracked, unchanged and
+committed once, its commits are held, and the holdout list hashes as frozen at its commit and in the
+checkout, and the amendment at its commit. `rdb5` and `vwap` go in every case, and the other
 eight if this record is not on `main` before the opening, to this record's later holdout: the first 20
 regular sessions after 2026-11-11 (the calendar UNVERIFIED), loaded as bars through `paper:history`, its
 dates entered here before any is read, and opened once for the arms that take it. It is not ADR 0096's
