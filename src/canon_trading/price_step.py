@@ -11,6 +11,7 @@ the `TickScheme` dispatch to it, `:595-600`). Moved unchanged from `mover.py`; e
 is to price through it (ADR 0030).
 """
 
+from decimal import ROUND_FLOOR
 from decimal import Decimal
 
 from nautilus_trader.model import TieredTickScheme
@@ -58,3 +59,20 @@ def exit_price(bid: Decimal, ticks: int, floor: Decimal | None) -> Decimal:
     found = PRICES.next_bid_price(float(bid) + NUDGE, ticks)
     price = PRICES.min_price.as_decimal() if found is None else found.as_decimal()
     return price if floor is None else max(price, floor)
+
+
+def stop_trigger_price(trigger: Decimal) -> Decimal:
+    """A long's stop trigger rounded down to Alpaca's step: `next_bid_price` at zero ticks inside the
+    scheme's expansion. The trigger is first floored to the finest step, so the nudge cannot lift a
+    finer Decimal onto the tick above it. Outside the expansion it is floored on Alpaca's step there,
+    never clamped to the scheme's last or lowest tick: a cent above `PRICES.max_price`, the finest step
+    at or below `PRICES.min_price`."""
+    exact = trigger.quantize(SUB_DOLLAR, rounding=ROUND_FLOOR)
+    if exact > PRICES.max_price.as_decimal():
+        return exact.quantize(CENT, rounding=ROUND_FLOOR)
+    if exact <= PRICES.min_price.as_decimal():
+        return exact
+    found = PRICES.next_bid_price(float(exact) + NUDGE, 0)
+    if found is None:
+        raise ValueError(f"no stop trigger at or under {trigger} in {PRICES.name}")
+    return found.as_decimal()
