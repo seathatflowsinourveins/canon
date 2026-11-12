@@ -2890,7 +2890,14 @@ class Seam:
         )
 
     def _trailing(self, _id: Any, _side: Any, qty: Any, _price: Any, **kw: Any) -> SimpleNamespace:
-        return self._new("TRAILING", quantity=qty, trigger_price=kw["trigger_price"], price=None)
+        return self._new(
+            "TRAILING",
+            quantity=qty,
+            trigger_price=kw["trigger_price"],
+            price=None,
+            trailing_offset=kw["trailing_offset"],
+            limit_offset=kw["limit_offset"],
+        )
 
     def _limit(self, _id: Any, _side: Any, qty: Any, price: Any, **_kw: Any) -> SimpleNamespace:
         return self._new("LIMIT", quantity=qty, leaves_qty=qty, price=price, trigger_price=None)

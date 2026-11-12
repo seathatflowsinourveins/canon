@@ -248,7 +248,10 @@ from nautilus_trader.model import Quantity
 from nautilus_trader.model import StrategyId
 from nautilus_trader.model import TimeInForce
 
+from .mover import TRAIL_SETTINGS
 from .mover import Mover
+from .mover import MoverConfig
+from .mover import baseline_per_minute
 from .mover import protection_diagnostics
 from .mover_window import MOVER
 from .mover_window import MOVER_ID
@@ -694,10 +697,27 @@ class WindowConfig:
     """Additional qualified startup names watched by Mover, beyond its held slots."""
     baseline_path: Path | None = None
     """ADR 0087's baseline file; None selects catalog/movers-baseline/<feed>.json for the part."""
+    trail_mode: str = "fixed"
+    atr_k: Decimal = Decimal(1)
+    atr_n: int = 14
+    spread_floor_m: Decimal = Decimal(2)
+    liquidity_tier_cut: Decimal = Decimal(1_000_000)
+    ratchet_r: Decimal = Decimal(2)
+    ratchet_g: Decimal = Decimal("0.5")
+    ratchet_base: str = "atr"
+    flow_share: Decimal = Decimal("0.05")
+    """T1/T2's UNCALIBRATED window rows; fixed trail and clock cooldown remain the defaults.
+    ATR multiples and the spread floor: lead, no primary source; fixed 0.02 remains a paired arm.
+    The liquidity cut is baseline dollar volume per minute, a stand-in for size, not market cap."""
     request_limit_per_minute: int = TRADING_REQUEST_LIMIT_PER_MINUTE
     """Documented Trading API budget setting for the record, not a reported account limit."""
 
     def __post_init__(self) -> None:
+        MoverConfig(
+            max_notional=Decimal(1),
+            max_move=Decimal(1),
+            **{name: getattr(self, name) for name in TRAIL_SETTINGS},
+        )
         check_limit(self.request_limit_per_minute)
         if self.session not in SESSIONS:
             raise ValueError(f"session must be one of {SESSIONS}, got {self.session!r}")
@@ -722,6 +742,10 @@ class WindowConfig:
             if self.strategy != MOVER:
                 raise ValueError(f"slots are {MOVER}'s; {self.strategy} has none")
             part_slots(self.session, self.slots)  # refuses what is not a positive whole number
+        if self.strategy != MOVER:
+            for name, row in TRAIL_SETTINGS.items():
+                if getattr(self, name) != row["default"]:
+                    raise ValueError(f"{name} is {MOVER}'s trail row; {self.strategy} has none")
         if type(self.spares) is not int or self.spares < 0:
             raise ValueError(f"spares must be a nonnegative whole number, got {self.spares!r}")
         if (
@@ -1378,12 +1402,20 @@ def window_node(
             entry_notional=entry_notional,
             size_from_budget=True,
             rank_max_age_secs=RANK_MAX_AGE_SECS,
+            trail_rows={name: getattr(config, name) for name in TRAIL_SETTINGS},
         )
         # Paper opt-in: every name outside the startup roster (with `data_load_all`, the whole market;
         # a name missing from the cache by a native instrument request) may enter under the upstream
         # absent-cap default, bounded by the Mover's sizing alone: no start-time cap, no position
         # monitor. The builder below still caps exactly the startup roster at entry x the multiple.
         mover.settings.load_instruments = True
+        # The T1/T2 rows went through MoverConfig's validation above; reuse the startup ranking's
+        # normal, so no new history or market-cap request is made.
+        mover.baseline_dollar_volume_per_minute = {
+            InstrumentId.from_str(f"{p.symbol}.{VENUE}"): normal
+            for p in pick.picks
+            if (normal := baseline_per_minute(p.record)) is not None
+        }
     node = (
         alpaca_paper_builder(
             "CANON-PAPER-SESSION",

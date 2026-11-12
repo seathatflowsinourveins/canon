@@ -84,6 +84,8 @@ from .ledger import create_ledger_study
 from .ledger import data_digest
 from .ledger import instrument_digest
 from .ledger import record_trial
+from .ma_cross import BASE_FIELDS
+from .mover import OWN_FIELDS
 from .mover import Mover
 from .mover import MoverConfig
 from .mover import Slot
@@ -92,8 +94,10 @@ from .mover import planned_stop
 from .price_step import entry_price
 from .ranking import RankingStopped
 from .ranking import rank
+from .tuning_contract import BARS_REPLAY_FIXED_ROWS
 from .tuning_contract import RankedConfiguration
 from .tuning_contract import RankedPayload
+from .tuning_contract import check_bars_replay_modes
 
 NY = ZoneInfo("America/New_York")
 MINUTE_NS = 60_000_000_000
@@ -488,7 +492,12 @@ class BarsReplayMover(Mover):
     """
 
     def __init__(self, config: MoverConfig) -> None:
-        super().__init__(config)
+        check_bars_replay_modes(config)
+        own = {name: getattr(config, name) for name in OWN_FIELDS}
+        base = {name: getattr(config, name) for name in BASE_FIELDS}
+        # Only inactive numeric rows are normalized after the selected modes have been checked.
+        # This own-and-base copy keeps callers' settings and all pre-port rows unchanged.
+        super().__init__(MoverConfig(**(own | BARS_REPLAY_FIXED_ROWS), **base))
 
     def prepare(self, config: MoverTrialConfig, data: ReplayData) -> None:
         """Build indexed days and registered prefix listing once; each on-bar lookup is O(1)."""
