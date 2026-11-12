@@ -5180,6 +5180,7 @@ def test_the_window_task_names_the_account_whose_pair_it_reads() -> None:
 TODAY = date(2026, 11, 10)
 """`Account`'s clock day: 11:00 New York, 90 minutes after `CALENDAR`'s regular open."""
 AT = datetime(2026, 11, 10, 11, 0, tzinfo=NEW_YORK)
+CLOSES = datetime(2026, 11, 10, 16, 0, tzinfo=NEW_YORK)
 
 
 @dataclass
@@ -5557,9 +5558,132 @@ def test_a_mover_window_runs_the_pick_on_sip_and_records_the_selection(
     assert seen["config"].symbol == "LLL" and seen["feed"] == "sip"
 
 
-def test_a_mover_window_runs_in_the_regular_session_only() -> None:
-    with pytest.raises(ValueError, match="regular session only"):
-        WindowConfig(mover=True, session="extended")
+def test_a_mover_window_outside_the_regular_session_is_the_bridge_in_its_limit_form() -> None:
+    """Outside the regular session a mover window is the bridge, `SessionMaCross` with every order its
+    marked limit; the mover strategy itself stays the regular session's (`WINDOW_STRATEGIES`)."""
+    bridge = WindowConfig(mover=True, session="extended")
+    assert (bridge.strategy, bridge.limits) == (session_window.DEFAULT_STRATEGY, True)
+    with pytest.raises(ValueError, match="Mover runs in regular windows only"):
+        WindowConfig(mover=True, session="extended", strategy="Mover")
+
+
+class Evening(Assets):
+    """`Assets` outside the regular session on Tuesday 2026-11-10, or in the overnight session around
+    it, with Monday and Wednesday on the calendar."""
+
+    def __init__(self, hour: int, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.hour = hour
+
+    def get_clock(self) -> Clock:
+        return clock(datetime(2026, 11, 10, self.hour, 0, tzinfo=NEW_YORK), is_open=False)
+
+    def get_calendar(self, filters=None) -> list[Calendar]:
+        return [PRIOR_DAY, CALENDAR, day("2026-11-11")]
+
+
+def a_pick() -> session_window.MoverPick:
+    record = {"source": "stream", "symbol": "LLL", "passed_over": {}}
+    return session_window.MoverPick("LLL", Decimal("1.5"), record, Decimal("1.51"))
+
+
+@pytest.mark.parametrize(("hour", "part"), [(5, "pre-market"), (17, "after-hours")])
+def test_a_mover_window_runs_the_bridge_on_the_pick_before_and_after_the_regular_session(
+    monkeypatch, tmp_path, hour, part
+) -> None:
+    """In pre-market and after-hours, both on sip, the feed the choice reads, a mover window chooses its
+    name as in the session and runs `SessionMaCross` on it in the extended session's limit form."""
+    monkeypatch.setattr(session_window, "choose_mover", lambda *a, **k: a_pick())
+    _, latest, seen = quiet_window(
+        monkeypatch,
+        tmp_path,
+        quotes=5,
+        trades=5,
+        account=Evening(hour),
+        session="extended",
+        mover=True,
+    )
+    assert (latest["result"], latest["part"], latest["symbol"]) == ("ok", part, "LLL")
+    assert latest["feed"] == "sip" and latest["mover"]["source"] == "stream"
+    config = seen["config"]
+    assert (config.symbol, config.session, config.strategy) == ("LLL", "extended", "SessionMaCross")
+    assert config.limits and seen["feed"] == "sip"
+
+
+@pytest.mark.parametrize("hour", [2, 21])
+def test_a_mover_window_is_refused_by_name_in_the_overnight_session(
+    monkeypatch, tmp_path, hour
+) -> None:
+    """The bridge has no overnight form: its choice reads sip, and the overnight session's feed is
+    boats. Refused by name before anything is chosen or built."""
+    monkeypatch.setattr(
+        session_window, "choose_mover", lambda *a, **k: pytest.fail("a mover was chosen")
+    )
+    monkeypatch.setattr(session_window, "window_node", lambda *a, **k: pytest.fail("a node"))
+    with pytest.raises(session_window.WindowRefused, match="no overnight form") as refused:
+        session_window.run_window(
+            WindowConfig(log_dir=tmp_path, session="extended", mover=True),
+            trading=cast(TradingClient, Evening(hour)),
+        )
+    assert "boats" in str(refused.value) and "sip" in str(refused.value)
+
+
+def no_feed_outside_the_regular_session(monkeypatch) -> None:
+    """Pre-market and after-hours as a part the feeds were probed in and none delivered: the documented
+    skip of a non-mover window (`SESSION_FEEDS`)."""
+    for part in ("pre-market", "after-hours"):
+        monkeypatch.setitem(
+            session_window.SESSION_FEEDS, part, session_window.SessionFeed(None, "none delivered")
+        )
+
+
+@pytest.mark.parametrize(
+    ("hour", "expected"), [(5, "extended"), (17, "extended"), (2, None), (21, None)]
+)
+def test_auto_decides_a_mover_window_by_the_parts_its_own_feed_carries(
+    monkeypatch, hour, expected
+) -> None:
+    """Code review of 2026-11-11, findings 2 and 3: whether `--session auto` runs a mover window is
+    `resolve_session`'s answer from `MOVER_PARTS`, not from the feed `SESSION_FEEDS` gives the part's
+    other windows, since a mover window streams `MOVER_FEED` whatever that row says."""
+    monkeypatch.setattr(session_window, "EXTENDED_READY", True)
+    no_feed_outside_the_regular_session(monkeypatch)
+    evening = Evening(hour)
+    found, why = session_window.resolve_session(
+        evening.get_clock(), evening.get_calendar(), mover=True
+    )
+    assert found == expected
+    if expected is None:
+        assert "no overnight form" in why and "boats" in why
+    else:  # the same part with no feed for its other windows: one of them has nothing to run
+        assert (
+            session_window.resolve_session(evening.get_clock(), evening.get_calendar())[0] is None
+        )
+
+
+def test_a_mover_window_streams_its_own_feed_where_the_parts_other_windows_have_none(
+    monkeypatch, tmp_path
+) -> None:
+    """Code review of 2026-11-11, finding 2: a part with no feed for its other windows does not skip the
+    bridge, which streams `MOVER_FEED` there."""
+    no_feed_outside_the_regular_session(monkeypatch)
+    monkeypatch.setattr(session_window, "choose_mover", lambda *a, **k: a_pick())
+    _, latest, seen = quiet_window(
+        monkeypatch,
+        tmp_path,
+        quotes=5,
+        trades=5,
+        account=Evening(17),
+        session="extended",
+        mover=True,
+    )
+    assert (latest["result"], latest["part"], seen["feed"]) == ("ok", "after-hours", "sip")
+
+
+def test_no_mover_form_names_a_part_the_feed_table_does_not_hold() -> None:
+    """Code review of 2026-11-11, finding 8: a part missing from `SESSION_FEEDS`, or with no feed there,
+    is named, not a `KeyError` or "on None"."""
+    assert "None" not in str(session_window.no_mover_form("nowhere"))
 
 
 def test_the_mover_flag_and_a_symbol_are_not_both_taken(capsys) -> None:
@@ -5568,21 +5692,39 @@ def test_the_mover_flag_and_a_symbol_are_not_both_taken(capsys) -> None:
     assert session_window._args(["--mover", "--log-dir", "/tmp/x"]).mover is True
 
 
-def test_auto_runs_no_mover_window_outside_the_regular_session(
-    monkeypatch, tmp_path, capsys
+@pytest.mark.parametrize(
+    ("hour", "ran", "said"),
+    [
+        (5, [("SessionMaCross", "extended", True)], ""),  # pre-market
+        (17, [("SessionMaCross", "extended", True)], ""),  # after-hours
+        (2, [], "no overnight form"),
+        (21, [], "no overnight form"),
+    ],
+)
+def test_auto_runs_the_bridge_outside_the_regular_session_and_nothing_overnight(
+    monkeypatch, tmp_path, capsys, hour, ran, said
 ) -> None:
-    """The schedule fires `--session auto`; with `--mover` outside the regular session it has nothing to
-    run, rather than a refusal every evening and morning."""
+    """The schedule fires `--session auto --mover --regular-strategy Mover` (`scripts/automation`). In
+    pre-market and after-hours that firing runs the bridge, `SessionMaCross` in its limit form on the
+    day's mover; overnight, where the bridge cannot run, it has nothing to run and says why, rather than
+    a refusal every night."""
+    seen = []
 
-    class Evening(Account):
-        def get_clock(self) -> Clock:
-            return clock(datetime(2026, 11, 10, 17, 0, tzinfo=NEW_YORK), is_open=False)
+    def window(config, **_kwargs):
+        seen.append((config.strategy, config.session, config.mover))
+        raise session_window.WindowSkipped("the test stops here")
 
-    monkeypatch.setattr(session_window, "paper_trading", lambda: Evening())
-    monkeypatch.setattr(session_window, "run_window", lambda *a, **k: pytest.fail("a window ran"))
-    argv = ["--session", "auto", "--mover", "--log-dir", str(tmp_path)]
-    assert session_window.main(argv) == 0
-    assert "regular session only" in capsys.readouterr().out
+    monkeypatch.setattr(session_window, "EXTENDED_READY", True)
+    monkeypatch.setattr(session_window, "paper_trading", lambda: Evening(hour))
+    monkeypatch.setattr(session_window, "run_window", window)
+    argv = ["--session", "auto", "--mover", "--regular-strategy", "Mover"]
+    assert session_window.main([*argv, "--log-dir", str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+    assert seen == ran
+    if said:
+        assert "nothing to run" in out and said in out
+        heard = json.loads((tmp_path / "last-firing.json").read_text())
+        assert heard["outcome"].startswith("nothing to run") and said in heard["outcome"]
 
 
 def test_the_schedule_fires_the_mover_path() -> None:
@@ -5596,7 +5738,7 @@ def test_the_schedule_fires_the_mover_path() -> None:
     ("named", "hour", "is_open", "mover", "ran"),
     [
         ("Mover", 11, True, True, [("Mover", "regular", True)]),
-        ("Mover", 17, False, True, []),  # a mover window runs in the regular session only
+        ("Mover", 17, False, True, [("SessionMaCross", "extended", True)]),  # the bridge
         ("EmaCross", 17, False, False, [(session_window.DEFAULT_STRATEGY, "extended", False)]),
     ],
 )
@@ -5779,7 +5921,9 @@ def test_choose_mover_falls_back_to_the_screener_and_says_why(monkeypatch) -> No
     monkeypatch.setattr(session_window, "stream_mover", refused)
     monkeypatch.setattr(session_window, "window_screener", lambda: Screener())
     opens = datetime(2026, 11, 10, 9, 30, tzinfo=NEW_YORK)
-    pick = session_window.choose_mover(cast(TradingClient, Assets()), AT, opens, date(2026, 11, 9))
+    pick = session_window.choose_mover(
+        cast(TradingClient, Assets()), AT, opens, date(2026, 11, 9), regular_close=CLOSES
+    )
     assert pick.symbol == "LLL" and pick.record["source"] == "screener"
     assert "ranked no name" in pick.record["stream_failed"]
 
@@ -5846,7 +5990,45 @@ def test_a_failure_of_both_sources_refuses_the_window_naming_each(monkeypatch) -
     with pytest.raises(
         session_window.WindowRefused, match=r"no stream in tests.*500 from the screener"
     ):
-        session_window.choose_mover(cast(TradingClient, Assets()), AT, opens, date(2026, 11, 9))
+        session_window.choose_mover(
+            cast(TradingClient, Assets()), AT, opens, date(2026, 11, 9), regular_close=CLOSES
+        )
+
+
+def test_a_refusal_of_the_fallback_names_the_streams_failure_too(monkeypatch) -> None:
+    """Before the regular open the fallback has no minute to rank on, so in pre-market the stream sample
+    is the only source: when it fails, the refusal names both, not the fallback's reason alone."""
+    monkeypatch.setattr(session_window, "window_screener", lambda: Screener())
+    opens = datetime(2026, 11, 10, 9, 30, tzinfo=NEW_YORK)
+    early = datetime(2026, 11, 10, 5, 0, tzinfo=NEW_YORK)
+    with pytest.raises(
+        session_window.WindowRefused,
+        match=r"no stream in tests.*no minute of the regular session has passed",
+    ):
+        session_window.choose_mover(
+            cast(TradingClient, Assets()), early, opens, date(2026, 11, 9), regular_close=CLOSES
+        )
+
+
+def test_the_fallback_ranks_the_regular_session_only(monkeypatch) -> None:
+    """Code review of 2026-11-11, finding 1: after the regular close `reference_close` gives today's
+    close, so the fallback's move would be the after-hours drift alone, set against the whole day's
+    dollar volume. It ranks the regular session's minutes only, and after its close the window is refused
+    naming both sources, with nothing of Alpaca's movers read."""
+    monkeypatch.setattr(session_window, "window_screener", lambda: Screener())
+    monkeypatch.setattr(
+        session_window, "select_mover", lambda *a, **k: pytest.fail("the fallback ranked")
+    )
+    opens = datetime(2026, 11, 10, 9, 30, tzinfo=NEW_YORK)
+    closes = datetime(2026, 11, 10, 16, 0, tzinfo=NEW_YORK)
+    late = datetime(2026, 11, 10, 17, 5, tzinfo=NEW_YORK)
+    with pytest.raises(
+        session_window.WindowRefused,
+        match=r"no stream in tests.*ranks the regular session only, which closed at 16:00",
+    ):
+        session_window.choose_mover(
+            cast(TradingClient, Assets()), late, opens, date(2026, 11, 9), regular_close=closes
+        )
 
 
 def test_one_share_must_fit_the_cap_at_the_price_of_the_order_sent() -> None:

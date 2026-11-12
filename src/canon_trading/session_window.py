@@ -114,9 +114,14 @@ or ended stream only there (ADR 0055).
 
 A mover window (`--mover`, ADR 0083's dated line of 2026-11-11) is a one-day bridge and a check of the
 stack on a mover (its spreads, halts and feed), not the practice's strategy: the same `SessionMaCross`, one
-share, in the regular session only, streaming `sip`, with every order in the strategy's limit form (a
+share, streaming `sip`, with every order in the strategy's limit form (a
 marked DAY limit through the touch, `WindowConfig.limits`), since an entry is never a market order; the
-account check after the stop may still close at market in the session. Its name is chosen once before the
+account check after the stop may still close at market in the session. It runs in the regular session
+and, by the lead's decision of 2026-11-11, in pre-market and after-hours, which `sip` carries too
+(`MOVER_PARTS`), as an extended window of the same strategy; it has no overnight form, so a
+scheduled firing has nothing to run overnight and a run by hand there is refused by name. `Mover` itself
+(`--strategy Mover`, or the schedule's `--regular-strategy`) stays the regular session's
+(`WINDOW_STRATEGIES`). Its name is chosen once before the
 node is built (`choose_mover`) and loaded by NautilusTrader's instrument provider at connect
 (`InstrumentProviderConfig(load_ids=...)`, `paper_node.alpaca_paper_builder`). The name comes from
 `stream_mover`: a `SAMPLE_MINUTES` sample of the whole market's sip minute bars on the window's own pair
@@ -599,8 +604,8 @@ class WindowConfig:
     strategy: str = DEFAULT_STRATEGY
     """A name of `WINDOW_STRATEGIES`."""
     mover: bool = False
-    """Run on the name `choose_mover` gives at the start, in place of `symbol` (`MOVER_FEED`, regular
-    session only); `symbol` is then the one chosen."""
+    """Run on the name `choose_mover` gives at the start, in place of `symbol`, in a part of the session
+    `MOVER_FEED` carries (`MOVER_PARTS`); `symbol` is then the one chosen."""
 
     def __post_init__(self) -> None:
         if self.session not in SESSIONS:
@@ -617,11 +622,6 @@ class WindowConfig:
         if self.session not in runs.sessions:
             raise ValueError(
                 f"{_runs_only(self.strategy, runs)}, not in the {self.session} session: {runs.why}"
-            )
-        if self.mover and self.session != "regular":
-            raise ValueError(
-                "a mover window runs in the regular session only (marked DAY limits on sip), not in "
-                f"the {self.session} session"
             )
         if self.strategy == MOVER and not self.mover:
             raise ValueError(
@@ -1244,6 +1244,28 @@ REFRESH_SECS = 60.0
 """The longest one `refresh` pass starts reads for."""
 
 
+MOVER_PARTS = ("regular", "pre-market", "after-hours")
+"""The parts of a session a mover window runs in: those `MOVER_FEED` carries. The overnight session is
+not one: Alpaca's 24/5 page puts its data on `boats` and `overnight` (module header), and the choice's
+sample, latest trades and quotes are all read on `sip`."""
+
+
+def no_mover_form(part: str) -> str | None:
+    """Why a mover window cannot run in `part` of a session, or None where it can (`MOVER_PARTS`): its
+    name is chosen on `MOVER_FEED` (the sample's bars, each candidate's latest trade and quote) and the
+    node streams it, whatever feed `SESSION_FEEDS` gives the part's other windows, so that row decides
+    nothing for it; a mover window asks this in place of `window_feed`."""
+    if part in MOVER_PARTS:
+        return None
+    found = SESSION_FEEDS.get(part)
+    other = (
+        f"the {part} part's data is on {found.feed}"
+        if found is not None and found.feed is not None
+        else f"no feed is set for the {part} part (SESSION_FEEDS)"
+    )
+    return f"a mover window has no {part} form: its name is chosen and streamed on {MOVER_FEED}, and {other}"
+
+
 class StreamSampleFailed(RuntimeError):
     """The stream sample could not rank: the stream stopped or failed, or no bar came."""
 
@@ -1629,12 +1651,20 @@ def stream_mover(
 
 
 def choose_mover(
-    trading: TradingClient, at: datetime, regular_open: datetime, since: date
+    trading: TradingClient,
+    at: datetime,
+    regular_open: datetime,
+    since: date,
+    *,
+    regular_close: datetime,
 ) -> MoverPick:
     """A mover window's name, chosen once before the node is built: `stream_mover` over a short sample of
     the window's own sip stream; if that fails or qualifies no name, `select_mover` over Alpaca's movers
     (`MOVER_SOURCE`), and the record says why (`stream_failed`). `at` is Alpaca's clock at the start; the
-    fallback's is moved on by the time the sample took."""
+    fallback's is moved on by the time the sample took. The fallback ranks the regular session's minutes
+    from `regular_open`, so it runs only inside that session: after `regular_close` `reference_close`
+    gives today's close, and its move would be the after-hours drift alone against the whole day's
+    dollar volume (code review, 2026-11-11); before the open it has no minute to rank on."""
     began = time.monotonic()
 
     def alpaca_now() -> datetime:
@@ -1653,9 +1683,18 @@ def choose_mover(
         )
     except (StreamSampleFailed, WindowRefused, *FAILED) as e:
         failed = f"{type(e).__name__}: {e}"
+    if (now := alpaca_now()) >= regular_close:
+        raise WindowRefused(
+            f"no mover: the stream sample failed ({failed}), and Alpaca's movers are not read: the "
+            "fallback ranks the regular session only, which closed at "
+            f"{regular_close.astimezone(NEW_YORK):%H:%M} New York"
+        )
     try:
-        pick = select_mover(trading, data, screener, actions, alpaca_now(), regular_open, since)
-    except FAILED as e:
+        pick = select_mover(trading, data, screener, actions, now, regular_open, since)
+    except (
+        WindowRefused,
+        *FAILED,
+    ) as e:  # a refusal too: before the open it has no minute to rank on
         raise WindowRefused(
             f"no mover: the stream sample failed ({failed}), then Alpaca's movers did: "
             f"{type(e).__name__}: {e}"
@@ -1690,7 +1729,12 @@ def run_window(
         end_of_session, part = session_part(config.session, clock, calendar)
     except RuntimeError as e:
         raise WindowRefused(str(e)) from e
-    feed = window_feed(part)
+    if not config.mover:
+        feed = window_feed(part)
+    elif (no_form := no_mover_form(part)) is not None:
+        raise WindowRefused(no_form)
+    else:
+        feed = MOVER_FEED  # the part's other windows' feed decides nothing here (`no_mover_form`)
     try:  # the slow average's bars and the spare ones, in the bar type's own interval
         history_from = warm_up_start(
             part,
@@ -1720,7 +1764,13 @@ def run_window(
                 "today and a trading day before it are not both on Alpaca's calendar read, so the "
                 "open and the last completed session are not known"
             )
-        pick = choose_mover(trading, at, in_new_york(days[today].open), max(earlier))
+        pick = choose_mover(
+            trading,
+            at,
+            in_new_york(days[today].open),
+            max(earlier),
+            regular_close=in_new_york(days[today].close),
+        )
         config, price, mover, feed = (
             replace(config, symbol=pick.symbol),
             pick.price,
@@ -2554,11 +2604,15 @@ def resolve_session(
     clock: AlpacaClock,
     calendar: AlpacaCalendar | Sequence[AlpacaCalendar] | None,
     strategy: str = DEFAULT_STRATEGY,
+    *,
+    mover: bool = False,
 ) -> tuple[str | None, str]:
     """The session `--session auto` runs, from Alpaca's clock and calendar, or None and why not: the
     regular session when the clock says it is open; else the extended one, if `EXTENDED_READY`, it is
-    open now and `strategy` runs in it (`WINDOW_STRATEGIES`); else nothing. The schedule fires on a timer
-    and leaves this choice to Alpaca's clock."""
+    open now and `strategy` runs in it (`WINDOW_STRATEGIES`), in a part with a feed for the window: for a
+    `mover` window one of `MOVER_PARTS` (`no_mover_form`), whatever `SESSION_FEEDS` gives the part's
+    other windows, so a part the bridge cannot run in has nothing to run rather than a refusal at every
+    firing; else nothing. The schedule fires on a timer and leaves this choice to Alpaca's clock."""
     if clock.is_open:
         return "regular", "Alpaca's clock says the regular session is open"
     if "extended" not in (runs := WINDOW_STRATEGIES[strategy]).sessions:
@@ -2570,9 +2624,12 @@ def resolve_session(
         )
     try:
         _, part = session_part("extended", clock, calendar)
-        window_feed(part)
+        if not mover:
+            window_feed(part)
     except RuntimeError as e:  # `WindowSkipped` among them: a part with no feed (`SESSION_FEEDS`)
         return None, str(e)
+    if mover and (no_form := no_mover_form(part)) is not None:
+        return None, f"the regular session is closed, and {no_form}"
     return "extended", f"outside the regular session, in its {part} part"
 
 
@@ -2620,7 +2677,7 @@ def _parser() -> argparse.ArgumentParser:
     chosen.add_argument(
         "--mover",
         action="store_true",
-        help="run on today's top mover, chosen at the start (regular session only)",
+        help="run on today's top mover, chosen at the start (not in the overnight session)",
     )
     parser.add_argument("--log-dir", type=Path, help="default: `default_log_dir()`")
     return parser
@@ -2668,9 +2725,7 @@ def _main(args: argparse.Namespace) -> int:
             market = (clock, calendar)
             if args.regular_strategy is not None and clock.is_open:
                 args.strategy = args.regular_strategy  # the schedule names the strategy a part runs
-            resolved, why = resolve_session(clock, calendar, args.strategy)
-            if args.mover and resolved not in (None, "regular"):
-                resolved, why = None, f"{why}, and a mover window runs in the regular session only"
+            resolved, why = resolve_session(clock, calendar, args.strategy, mover=args.mover)
             if resolved is None:
                 print(f"paper:session: nothing to run: {why}")
                 _heard(args.log_dir, f"nothing to run: {why}")
