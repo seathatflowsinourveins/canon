@@ -161,6 +161,7 @@ from .movers_rank_signal import decode_ranking
 from .movers_rank_signal import encode_ranking
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
     from collections.abc import Sequence
     from datetime import date
 
@@ -187,7 +188,32 @@ TRIGGERS = (TriggerType.BID_ASK, TriggerType.LAST_PRICE)
 REFUSED = (OrderStatus.DENIED, OrderStatus.REJECTED)
 UNLOCKED = (OrderStatus.INITIALIZED, OrderStatus.SUBMITTED)
 """An order's states before the venue has taken it, so before the account locks its cash."""
+WORKING = (
+    OrderStatus.ACCEPTED,
+    OrderStatus.PARTIALLY_FILLED,
+    OrderStatus.PENDING_UPDATE,
+    OrderStatus.PENDING_CANCEL,
+    OrderStatus.TRIGGERED,
+)
+"""An order's states after the venue took it and before it is done, in which a buy can still fill."""
 """An order the risk engine denied or the venue rejected."""
+
+
+def entry_reserve(orders: Iterable[Any], *, reported: bool) -> Decimal:
+    """What the other slots' entry `orders` hold against the free cash the next entry is sized from.
+
+    A calculated account locks an order's cash once the venue takes it, so only an order not yet taken
+    (`UNLOCKED`) is counted, at its quantity. A reported account locks nothing (the Alpaca adapter
+    reports cash as total and free), so every entry still working is counted at its open quantity: the
+    filled part is counted as a fill since the last report (ultra review of the composition, finding 3).
+    """
+    held = Decimal(0)
+    for order in orders:
+        if order.status in UNLOCKED:
+            held += order.quantity.as_decimal() * order.price.as_decimal()
+        elif reported and order.status in WORKING:
+            held += order.leaves_qty.as_decimal() * order.price.as_decimal()
+    return held
 
 
 def format_rank(entries: Sequence[tuple[InstrumentId, Decimal]]) -> str:
@@ -556,6 +582,12 @@ class Mover(Strategy):
         self.fills: list[tuple[str, str, str, str, int]] = []
         """Each fill as its event gave it: client order ID, side, quantity, price, time. The session's
         reflection reads a sale's counterfactuals (held on, flat, managed) from these and the tape."""
+        self.unreported: list[tuple[int, Decimal]] = []
+        """Each buy filled on a reported account and not yet in a report: the account's event count
+        that has it, and its notional (ultra review of the composition, finding 3)."""
+        self.report_base: int | None = None
+        self.fills_to_report: list[tuple[Any, OrderSide, Decimal]] = []
+        self.account_queries = 0
         self.entries_sent: list[dict[str, Any]] = []
         self.refused: list[tuple[str, str]] = []
         self.dropped: list[str] = []
@@ -638,6 +670,47 @@ class Mover(Strategy):
                 event.ts_event,
             )
         )
+        # plain attributes only: the handler can run while the strategy is borrowed (see the class
+        # note), so the account is asked for at the next step or before the next buy is sized
+        self.fills_to_report.append(
+            (
+                event.instrument_id.venue,
+                event.order_side,
+                event.last_qty.as_decimal() * event.last_px.as_decimal(),
+            )
+        )
+
+    def _trading_account(self, venue: Any) -> Any:
+        """The venue's account as the portfolio holds it."""
+        return self.portfolio.account(venue)
+
+    def _ask_for_the_account(self) -> None:
+        """Ask for a reported account once for each fill since the last step, before any later buy is
+        sized: the adapter's `_query_account`, one GET /account, through upstream's
+        `Strategy.query_account` (the lead's ruling of 2026-11-12, ultra review of the composition,
+        finding 3). A calculated account has every fill already and is not asked.
+
+        Each query brings at most one report, in the order asked, and each is read after the fill
+        that asked for it, so the n-th query's fill is in the account once the account has had n
+        reports since the first query; a failed query brings none, which only holds a buy back
+        longer. A buy's notional is subtracted from the free cash until then.
+        """
+        taken, self.fills_to_report = self.fills_to_report, []
+        for venue, side, notional in taken:
+            account = self._trading_account(venue)
+            if account is None or account.calculate_account_state:
+                continue
+            if self.report_base is None:
+                self.report_base = account.event_count
+            self.account_queries += 1
+            if side == OrderSide.BUY:
+                self.unreported.append((self.report_base + self.account_queries, notional))
+            self.query_account(account.id)
+
+    def _unreported_buys(self, account: Any) -> Decimal:
+        """The buys filled that the reported account does not have yet, dropping those it has."""
+        self.unreported = [(n, v) for n, v in self.unreported if account.event_count < n]
+        return sum((v for _, v in self.unreported), Decimal(0))
 
     def on_order_denied(self, event: Any) -> None:
         self.refused.append((event.client_order_id.value, str(event.reason)))
@@ -831,6 +904,7 @@ class Mover(Strategy):
 
     def _on_step(self, event: TimeEvent) -> None:
         now = event.ts_event
+        self._ask_for_the_account()
         self._say_ranking(now)
         recent = self.recent = self._recent_requests(now)
         self._watch(now)
@@ -1265,7 +1339,7 @@ class Mover(Strategy):
         if quote is None:
             return "no quote yet"
         instrument = self._instrument(slot.instrument_id)
-        account = self.portfolio.account(instrument.id.venue)
+        account = self._trading_account(instrument.id.venue)
         balance = None if account is None else account.balance_total(instrument.quote_currency)
         if balance is None:
             return "no account balance to size from"
@@ -1289,18 +1363,22 @@ class Mover(Strategy):
             if free is None:
                 return "no free balance to size from"
             # the account locks an entry's cash once the venue takes it: one sent and not yet taken
-            # (in this step, say) still counts against what the next entry is sized from
-            unlocked = sum(
+            # (in this step, say) still counts against what the next entry is sized from; a
+            # reported account locks nothing, so every working entry counts (`entry_reserve`)
+            reported = not account.calculate_account_state
+            unlocked = entry_reserve(
                 (
-                    order.quantity.as_decimal() * order.price.as_decimal()
+                    order
                     for other in self.slots.values()
-                    if other is not slot
-                    and (order := self._order(other.entry_id)) is not None
-                    and order.status in UNLOCKED
+                    if other is not slot and (order := self._order(other.entry_id)) is not None
                 ),
-                Decimal(0),
+                reported=reported,
             )
-            entry_budget = min(settings.max_notional, free.as_decimal() - unlocked)
+            # a buy filled since the last report is not in the reported cash yet, and a sale's
+            # proceeds count only once a report has them (the lead's ruling of 2026-11-12)
+            self._ask_for_the_account()  # a fill this step, before this buy is sized
+            unreported = self._unreported_buys(account) if reported else Decimal(0)
+            entry_budget = min(settings.max_notional, free.as_decimal() - unlocked - unreported)
             budget_shares = entry_budget // price
             flow_dollars = sum(slot.dollars, Decimal(0))
             flow_shares = settings.flow_share * flow_dollars // price
@@ -1323,6 +1401,7 @@ class Mover(Strategy):
                 "startup_budget_notional": str(settings.max_notional),
                 "free_cash": str(free.as_decimal()),
                 "unlocked_entries": str(unlocked),
+                "unreported_fills": str(unreported),
                 "budget_notional": str(entry_budget),
                 "budget_shares": str(budget_shares),
                 "flow_dollars": str(flow_dollars),

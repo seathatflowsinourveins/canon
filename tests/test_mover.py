@@ -2256,6 +2256,7 @@ class Borrowed:
     def __init__(self) -> None:
         self.released: set[str] = set()
         self.fills: list = []
+        self.fills_to_report: list = []
         self.refused: list = []
         self.rank: list = []
         self.rank_ns = 0
@@ -2751,3 +2752,139 @@ def test_an_entry_whose_cancel_failed_during_the_exit_is_canceled_again_after_ch
     assert seam.canceled == ["E-1"]
     cast(Any, seam)._time_out(slot, entry, T0 + 5 * SECOND)
     assert seam.canceled == ["E-1", "E-1"]
+
+
+class ReportedAccount:
+    """The Alpaca adapter's account as NautilusTrader holds it live, with its calculation off: the free
+    cash is the cash Alpaca last reported (the adapter reports cash as total and free, nothing locked,
+    `canon_alpaca.execution._report_account`), and it changes only when a report arrives. A report
+    asked for lands before the next read, with the backtest's cash then, as a GET /account sent after
+    the fill reads it."""
+
+    calculate_account_state = False
+
+    def __init__(self, real) -> None:
+        self.real, self.id = real, real.id
+        self.cash = real.balance_total(USD)
+        self.count, self.asked = 1, 0
+
+    def _land(self) -> None:
+        if self.asked:
+            self.cash, self.count, self.asked = (
+                self.real.balance_total(USD),
+                self.count + self.asked,
+                0,
+            )
+
+    @property
+    def event_count(self) -> int:
+        self._land()
+        return self.count
+
+    def balance_free(self, currency=None):
+        self._land()
+        return self.cash
+
+    def balance_total(self, currency=None):
+        self._land()
+        return self.cash
+
+    def balance_locked(self, currency=None):
+        return Money(0, USD)
+
+
+class Reporting(Recording):
+    """`Recording` on a `ReportedAccount`; each `query_account` is kept and, with `deliver`, answered
+    with a report before the next read."""
+
+    deliver = True
+
+    def __init__(self, config: MoverConfig) -> None:
+        super().__init__(config)
+        self.reported: ReportedAccount | None = None
+        self.queries: list = []
+
+    def _trading_account(self, venue):
+        real = super()._trading_account(venue)  # a copy at the pin, so taken again at each read
+        if real is not None and self.reported is None:
+            self.reported = ReportedAccount(real)
+        elif real is not None and self.reported is not None:
+            self.reported.real = real
+        return self.reported
+
+    def query_account(self, account_id, client_id=None, params=None) -> None:
+        self.queries.append(account_id)
+        if self.deliver and self.reported is not None:
+            self.reported.asked += 1
+
+
+@pytest.mark.parametrize("deliver", [True, False])
+def test_a_reported_account_is_queried_on_each_fill_and_buys_since_its_report_are_subtracted(
+    deliver,
+):
+    """ultra-3a8613a/3, the lead's ruling of 2026-11-12: live, the account is reported with its
+    calculation off, so its free cash stood at the connect-time cash all window. Each fill now asks for
+    the account (the adapter's `_query_account`, one GET /account), and a buy filled since the last
+    report is subtracted from the free cash the next entry is sized from; a sale's proceeds count only
+    once a report has them."""
+    eng = engine(cash=Decimal(1000))
+    s = Reporting(
+        MoverConfig(
+            max_notional=Decimal(1000),
+            max_move=Decimal(5),
+            entry_arm="bridge",
+            strategy_id=MOVER_ID,
+            order_id_tag="001",
+            size_from_budget=True,
+            entries=2,
+            cooldown_secs=0,
+        )
+    )
+    s.deliver = deliver
+    closes = [*RISING[:5], 10.1, 10.0, 9.9, 9.8, *RECLAIM, 10.8]
+    orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, closes))
+    eng.dispose()
+    assert s.fills and len(s.queries) == len(s.fills), "one account query a fill"
+    first = s.entries_sent[0]
+    assert first["sizing"]["unreported_fills"] == "0"
+    bought = [o for o in orders if o.side == OrderSide.BUY and o.filled_qty.is_positive()]
+    spent = bought[0].filled_qty.as_decimal() * Decimal(str(bought[0].avg_px))
+    assert not any("NOTIONAL_EXCEEDS_FREE_BALANCE" in reason for _, reason in s.refused), s.refused
+    if deliver:
+        # the report after the sale has the cash the loss left, and nothing is held back
+        assert len(bought) == 2
+        [second] = [
+            e["sizing"]
+            for e in s.entries_sent
+            if e["client_order_id"] == bought[1].client_order_id.value
+        ]
+        assert second["unreported_fills"] == "0"
+        assert Decimal(second["free_cash"]) < Decimal(1000)
+    else:
+        # no report came: the first buy is still subtracted and the sale's proceeds do not count
+        # yet, so the cash left cannot fund a second entry
+        assert len(bought) == 1
+        assert all(e["sizing"]["unreported_fills"] == str(spent) for e in s.entries_sent[1:])
+
+
+def test_a_reported_account_counts_an_accepted_unfilled_buy_against_free_cash() -> None:
+    """ultra-3a8613a/3: a reported account locks nothing, so an entry the venue took and has not filled
+    is counted against the free cash at its open quantity; a calculated account locks it itself."""
+    from nautilus_trader.model import OrderStatus
+
+    def order(status, quantity, leaves, price):
+        return SimpleNamespace(
+            status=status,
+            quantity=Quantity.from_int(quantity),
+            leaves_qty=Quantity.from_int(leaves),
+            price=Price.from_str(price),
+        )
+
+    working = [
+        order(OrderStatus.SUBMITTED, 10, 10, "5.00"),
+        order(OrderStatus.ACCEPTED, 20, 20, "5.00"),
+        order(OrderStatus.PARTIALLY_FILLED, 30, 10, "5.00"),
+        order(OrderStatus.FILLED, 40, 0, "5.00"),
+    ]
+    assert mover.entry_reserve(working, reported=False) == Decimal(50)
+    assert mover.entry_reserve(working, reported=True) == Decimal(200)
