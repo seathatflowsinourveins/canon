@@ -661,7 +661,7 @@ def test_paper_history_reads_one_named_pair_takes_no_lock_and_runs_data_only() -
     assert re.search(r"^\s*windows\) svc=canon-alpaca-paper-windows ;;$", run_, re.MULTILINE)
     assert "lockf" not in run_ and ".lock" not in run_
     assert "CANON_ALPACA_DATA_ONLY=1" in run_
-    assert "python -m canon_trading.history_load" in run_
+    assert 'python -m "${module:-canon_trading.history_load}"' in run_
     assert '"tests" "windows"' in task["usage"]
     assert '"bars" "trades"' in task["usage"]
 

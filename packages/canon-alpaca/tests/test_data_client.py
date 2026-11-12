@@ -17,6 +17,7 @@ thread that does not stop.
 
 import asyncio
 import concurrent.futures
+import contextlib
 import functools
 import gc
 import json
@@ -30,6 +31,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC
 from datetime import datetime
 from datetime import timedelta
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Literal
@@ -48,9 +50,15 @@ from alpaca.data.timeframe import TimeFrameUnit
 from alpaca.trading.client import TradingClient
 from canon_alpaca.constants import ENV_API_KEY
 from canon_alpaca.constants import ENV_SECRET_KEY
+from canon_alpaca.constants import VENUE
 from canon_alpaca.data import AlpacaDataClient
 from canon_alpaca.data import AlpacaDataClientConfig
 from canon_alpaca.factories import AlpacaDataClientFactory
+from canon_alpaca.trade_conditions import CONDITIONS_PATH
+from canon_alpaca.trade_conditions import TABLE
+from canon_alpaca.trade_conditions import condition_counts
+from nautilus_trader.adapters.sandbox import SandboxExecutionClientConfig
+from nautilus_trader.adapters.sandbox import SandboxExecutionClientFactory
 from nautilus_trader.common import Clock
 from nautilus_trader.common import Environment
 from nautilus_trader.common import Logger
@@ -61,15 +69,20 @@ from nautilus_trader.config import LiveNodeConfig
 from nautilus_trader.core import UUID4
 from nautilus_trader.core.datetime import dt_to_unix_nanos
 from nautilus_trader.core.datetime import unix_nanos_to_dt
+from nautilus_trader.execution import MakerTakerFeeModel
 from nautilus_trader.live import InstrumentResponse
 from nautilus_trader.live import LiveNode
 from nautilus_trader.live import TradesResponse
+from nautilus_trader.model import AccountType
 from nautilus_trader.model import AggressorSide
 from nautilus_trader.model import BarType
+from nautilus_trader.model import Currency
 from nautilus_trader.model import Equity
 from nautilus_trader.model import InstrumentId
 from nautilus_trader.model import MarketStatusAction
+from nautilus_trader.model import Money
 from nautilus_trader.model import NautilusDataType
+from nautilus_trader.model import OmsType
 from nautilus_trader.model import Price
 from nautilus_trader.model import TradeId
 from nautilus_trader.model import TraderId
@@ -2360,6 +2373,12 @@ def trades_http(venue, monkeypatch) -> SimpleNamespace:
 
     def answer(method: str, url: str, **kwargs) -> requests.Response:
         assert method == "GET"
+        if url.endswith(CONDITIONS_PATH):  # the trade-condition filter's connect: the venue's map
+            response = requests.Response()
+            response.status_code = 200
+            codes = TABLE[kwargs["params"]["tape"]]
+            response._content = json.dumps(dict.fromkeys(codes, "name")).encode()
+            return response
         assert url == ns.url
         ns.calls.append(dict(kwargs["params"]))
         assert ns.pages, "unexpected HTTP request"
@@ -3362,6 +3381,7 @@ def test_the_defaults_outlast_the_quietest_feed_seen_delivering() -> None:
             "longer than stream_data_timeout_secs",
         ),
         ({"feed": "sip"}, "no setting 'feed'"),
+        ({"trade_condition_filter": "yes"}, "trade_condition_filter must be True or False"),
     ],
 )
 def test_the_config_refuses_a_bound_it_cannot_use(fields, error) -> None:
@@ -4131,3 +4151,253 @@ def test_a_mute_streams_error_counts_a_long_listing_rather_than_naming_every_sym
     line = next(line for line in lines if "[ERROR]" in line and "no market data for" in line)
     assert all(len(line) < 2000 for line in lines)
     assert "statuses 2002 symbols" in line
+
+
+# -- the trade-condition filter: the venue's bars rule (canon_alpaca.trade_conditions) ------------------
+
+
+class LastTrade(Consumer):
+    """Records every trade and stops at the one whose trade ID is `LAST_ID`."""
+
+    def on_trade(self, trade) -> None:
+        self.seen_trades.append(trade)
+        if str(trade.trade_id) == LAST_ID and not self.finished:
+            self.finished = True
+            self.shutdown_system("the last trade arrived")
+
+
+LAST_ID = "999"
+
+
+def filtered_config(*, trade_condition_filter: bool = False) -> AlpacaDataClientConfig:
+    return AlpacaDataClientConfig(
+        instrument_provider=InstrumentProviderConfig(load_ids=["AAPL.ALPACA"]),
+        trade_condition_filter=trade_condition_filter,
+    )
+
+
+def last_trade() -> LastTrade:
+    strategy = LastTrade()
+    strategy.want_quotes, strategy.bar_type, strategy.auto_shutdown = False, None, False
+    return strategy
+
+
+def prints(alpaca, *changes: dict) -> list:
+    return [functools.partial(alpaca.trade, **c) for c in changes]
+
+
+USD = Currency.from_str("USD")
+SIP = {"feed": "sip"}
+"""The filter is measured on SIP prints only, so a filtered client's trades come from the sip feed."""
+
+
+def sip_trades() -> LastTrade:
+    strategy = last_trade()
+    strategy.subscribe_params = SIP
+    return strategy
+
+
+def grown(before: dict[str, dict[str, int]], source: str) -> dict[str, int]:
+    """What `condition_counts` gained for `source` since `before` (the tally is the process's)."""
+    after = condition_counts().get(source, {})
+    was = before.get(source, {})
+    return {k: v - was.get(k, 0) for k, v in after.items() if v != was.get(k, 0)}
+
+
+def test_the_trade_condition_filter_is_named_and_off_by_default(venue, alpaca) -> None:
+    assert AlpacaDataClientConfig().trade_condition_filter is False
+    assert AlpacaDataClientConfig().dict()["trade_condition_filter"] is False
+    venue.stream.trades = prints(alpaca, {"c": ["@", "I"], "z": "C", "i": int(LAST_ID)})
+    strategy = last_trade()
+    run(build_node(strategy, config=filtered_config()), "hosted")
+    assert [str(t.trade_id) for t in strategy.seen_trades] == [LAST_ID], "off: an odd lot is a tick"
+
+
+def test_with_the_filter_on_only_prints_the_minute_bars_take_become_ticks(
+    venue, alpaca, capfd
+) -> None:
+    venue.stream.trades = prints(
+        alpaca,
+        {"c": ["@", "I"], "z": "C", "i": 1},  # odd lot
+        {"c": ["B"], "z": "A", "i": 2},  # average price, tape A
+        {"c": ["@", "W"], "z": "C", "i": 3},  # average price, tape C
+        {"c": ["@", "Z"], "z": "C", "i": 4},  # sold out of sequence
+        {"c": ["@"], "z": "C", "i": 5},  # regular
+        {"c": ["T"], "z": "A", "i": 6},  # extended hours, tape A
+        {"c": ["@", "T"], "z": "C", "i": 7},  # extended hours, tape C
+        {"c": [" "], "z": "B", "i": int(LAST_ID)},
+    )
+    strategy = sip_trades()
+    node = build_node(strategy, config=filtered_config(trade_condition_filter=True))
+    run(node, "hosted")
+    assert [str(t.trade_id) for t in strategy.seen_trades] == ["5", "6", "7", LAST_ID]
+    log = logged(capfd)
+    assert "trade-condition filter: AAPL print with I (tape C) is no tick" in log
+
+
+def test_with_the_filter_on_dropped_prints_are_counted_by_code(venue, alpaca) -> None:
+    venue.stream.trades = prints(
+        alpaca,
+        {"c": ["@", "I"], "z": "C", "i": 1},
+        {"c": ["@", "I"], "z": "C", "i": 2},
+        {"c": ["@", "4", "I"], "z": "C", "i": 3},
+        {"c": ["@", "?"], "z": "C", "i": 4},
+        {"c": ["@"], "z": "C", "i": None},  # judged, but parse_trade makes no tick of it
+        {"c": ["@"], "z": "C", "i": int(LAST_ID)},
+    )
+    strategy = sip_trades()
+    before = condition_counts()
+    config = filtered_config(trade_condition_filter=True)
+    run(build_node(strategy, config=config), "hosted")
+    assert [str(t.trade_id) for t in strategy.seen_trades] == [LAST_ID]
+    assert grown(before, "stream") == {"kept": 1, "I": 3, "4": 1, "unknown:?": 1}
+    assert grown(before, "request") == {}
+
+
+def test_with_the_filter_on_a_code_the_venue_shows_that_the_table_does_not_know_refuses_the_connect(
+    venue, alpaca, capfd
+) -> None:
+    venue.historical.conditions["C"]["?"] = "Something New"
+    strategy = StartedLastTrade()
+    strategy.want_quotes, strategy.bar_type, strategy.auto_shutdown = False, None, False
+    strategy.subscribe_params = SIP
+    node = filtered_node_with_execution(strategy)
+    with pytest.raises(RuntimeError, match="readiness timeout"):
+        run(node, "hosted")
+    log = logged(capfd)
+    assert "tape C '?' (Something New)" in log
+    assert [p for p, _ in venue.historical.gets] == ["/stocks/meta/conditions/trade"] * 3
+    assert strategy.started == [], "the strategy never started"
+    assert venue.stream.wire == {"quotes": set(), "trades": set()}, "nothing was subscribed"
+
+
+def test_with_the_filter_off_the_connect_asks_nothing_of_the_conditions_map(venue, alpaca) -> None:
+    venue.stream.trades = prints(alpaca, {"c": ["@"], "z": "C", "i": int(LAST_ID)})
+    strategy = last_trade()
+    run(build_node(strategy, config=filtered_config()), "hosted")
+    assert venue.historical.gets == []
+
+
+class StartedLastTrade(LastTrade):
+    """`LastTrade` that records each start, so a test can show the node never started it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.started: list[bool] = []
+
+    def on_start(self) -> None:
+        self.started.append(True)
+        super().on_start()
+
+
+def test_a_started_strategy_records_its_start(venue, alpaca) -> None:
+    """The recorder the refusal test relies on does record a start."""
+    venue.stream.trades = prints(alpaca, {"c": ["@"], "z": "C", "i": int(LAST_ID)})
+    strategy = StartedLastTrade()
+    strategy.want_quotes, strategy.bar_type, strategy.auto_shutdown = False, None, False
+    strategy.subscribe_params = SIP
+    run(build_node(strategy, config=filtered_config(trade_condition_filter=True)), "hosted")
+    assert strategy.started == [True]
+
+
+def filtered_node_with_execution(strategy: Strategy) -> LiveNode:
+    """A node like the sandbox node: the filtered data client and upstream's sandbox execution client."""
+    node = (
+        LiveNode.builder("CANON-ALPACA", TRADER, Environment.SANDBOX)
+        .with_delay_post_stop_secs(0)
+        .with_timeout_connection(2)
+        .with_timeout_disconnection_secs(5)
+        .add_data_client(
+            "ALPACA", AlpacaDataClientFactory, filtered_config(trade_condition_filter=True)
+        )
+        .add_simulated_exec_client(
+            "ALPACA",
+            SandboxExecutionClientFactory(),
+            SandboxExecutionClientConfig(
+                venue=VENUE,
+                starting_balances=[Money(100_000, USD)],
+                base_currency=USD,
+                oms_type=OmsType.NETTING,
+                account_type=AccountType.CASH,
+                fee_model=MakerTakerFeeModel(maker_rate=Decimal(0), taker_rate=Decimal(0)),
+            ),
+        )
+        .build()
+    )
+    node.add_strategy(strategy)
+    BUILT_NODES.append(node)
+    return node
+
+
+@pytest.mark.parametrize("feed", ["iex", None])
+def test_with_the_filter_on_a_trade_subscription_on_any_feed_but_sip_is_refused(
+    venue, alpaca, capfd, feed
+) -> None:
+    venue.stream.trades = prints(alpaca, {"c": ["@"], "z": "C", "i": int(LAST_ID)})
+    strategy = last_trade()
+    strategy.subscribe_params = None if feed is None else {"feed": feed}
+    strategy.auto_shutdown = True
+    with contextlib.suppress(Exception):
+        run(build_node(strategy, config=filtered_config(trade_condition_filter=True)), "hosted")
+    assert "trade_condition_filter is measured on the sip feed only" in logged(capfd)
+    assert venue.stream.wire["trades"] == set()
+    assert strategy.seen_trades == []
+
+
+def test_with_the_filter_on_a_trade_request_keeps_only_prints_the_bars_take(trades_http) -> None:
+    trades_http.pages = [
+        trade_page(
+            [
+                historical_trade(0, c=["@", "I"]),  # odd lot
+                historical_trade(1, c=["@", "W"]),  # average price
+                historical_trade(2, c=["@"]),  # regular
+            ],
+            "second",
+        ),
+        trade_page([historical_trade(3, c=["@", "T"]), historical_trade(4, c=["@", "Z"])]),
+    ]
+    strategy = TradeRequester()
+    strategy.params = SIP
+    before = condition_counts()
+    run(build_node(strategy, config=filtered_config(trade_condition_filter=True)), "hosted")
+    assert [r.failure_reason for r in strategy.responses] == [None]
+    assert [t.trade_id for t in strategy.seen] == [TradeId("1002"), TradeId("1003")]
+    assert grown(before, "request") == {"kept": 2, "I": 1, "W": 1, "Z": 1}
+    assert grown(before, "stream") == {}
+
+
+def test_with_the_filter_on_a_left_out_print_uses_none_of_a_requests_limit(trades_http) -> None:
+    trades_http.pages = [
+        trade_page(
+            [
+                historical_trade(0, c=["@", "I"]),
+                historical_trade(1),
+                historical_trade(2, c=["@", "I"]),
+            ],
+            "second",
+        ),
+        trade_page([historical_trade(3)], "unneeded"),
+    ]
+    strategy = TradeRequester()
+    strategy.params, strategy.limit = SIP, 2
+    run(build_node(strategy, config=filtered_config(trade_condition_filter=True)), "hosted")
+    assert [r.failure_reason for r in strategy.responses] == [None]
+    assert [t.trade_id for t in strategy.seen] == [TradeId("1001"), TradeId("1003")]
+    assert [c["limit"] for c in trades_http.calls] == [2, 1]
+
+
+@pytest.mark.parametrize(
+    ("params", "refusal"),
+    [
+        ({"feed": "iex"}, "measured on the sip feed only"),
+        ({"feed": "sip", "update_catalog": True}, "request with update_catalog off"),
+    ],
+)
+def test_with_the_filter_on_a_trade_request_off_sip_or_into_the_catalog_is_refused(
+    trades_http, params, refusal
+) -> None:
+    strategy = TradeRequester()
+    strategy.params = params
+    run(build_node(strategy, config=filtered_config(trade_condition_filter=True)), "hosted")
+    assert [refusal in (r.failure_reason or "") for r in strategy.responses] == [True]
+    assert trades_http.calls == [], "no trade was asked for"

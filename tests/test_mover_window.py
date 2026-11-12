@@ -910,6 +910,23 @@ def test_the_window_end_request_count_is_refreshed_at_the_final_snapshot(monkeyp
     }
 
 
+def test_the_window_end_carries_the_trade_condition_counts_by_code(monkeypatch) -> None:
+    """The lead's ruling of 2026-11-12: once the trade-condition filter runs, its counts by code are in
+    the window's record from the first window."""
+    counts = {"stream": {"I": 1067, "kept": 727}, "request": {"kept": 3}}
+    monkeypatch.setattr(session_window, "condition_counts", lambda: counts)
+    report = {"mover": {"http_requests": {"to_node_start": {}, "to_window_end": {}}}}
+    session_window._snapshot_requests(report)
+    assert report["mover"]["trade_conditions"] == counts
+
+
+def test_a_window_with_the_filter_off_has_no_trade_condition_field(monkeypatch) -> None:
+    monkeypatch.setattr(session_window, "condition_counts", dict)
+    report = {"mover": {"http_requests": {"to_node_start": {}, "to_window_end": {}}}}
+    session_window._snapshot_requests(report)
+    assert "trade_conditions" not in report["mover"]
+
+
 @pytest.mark.parametrize("part", ["regular", "pre-market", "after-hours", "overnight"])
 @pytest.mark.parametrize("liquidity", ["original", "thin", "liquid", "cash_falls"])
 def test_selected_tier_account_sizing_trades_and_flattens_in_each_part(
