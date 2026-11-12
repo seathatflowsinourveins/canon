@@ -25,7 +25,7 @@ What it reads, and from whom:
   for every clock minute, pauses included, unless `time_bars_build_with_no_updates` is off
   (`crates/data/src/engine/config.rs:36-38`). The actor never opens a stream; one stream an account is
   the data client's.
-  Bars name `params={"feed": feed, "wildcard": True, "updated_bars": True}` and statuses name
+  Bars name `params={"feed": feed, "wildcard": True}` (no revised bars, 2026-11-12) and statuses name
   `params={"feed": feed, "wildcard": True}`: NautilusTrader preserves adapter params, `feed` is ADR 0055's,
   and the two channel keys are ADR 0090's adapter contract (pending on main; ADR 0107).
 * Statuses: `InstrumentStatus` for the same ids, kept by symbol; until the adapter publishes them a halt
@@ -67,8 +67,8 @@ Rows, all UNCALIBRATED: `PUBLISH_INTERVAL_SECS`, `PUBLISH_OFFSET_SECS`, `MAX_DAT
 `REFERENCE_LOOKBACK_DAYS`. `REF_BATCH` is a choice, not a documented limit.
 
 Limits (ADR 0087): the move from the regular open is not known (no opens are passed); trade corrections and
-cancels come only on the trade channel, which the actor does not read, so it sees a late trade only as an
-updated bar; whether Alpaca's daily bar close is the official closing price is UNVERIFIED.
+cancels come only on the trade channel, which the actor does not read, and it no longer takes revised bars
+(the owner's plan of 2026-11-12), so a late trade is missed until it falls in a later minute; whether Alpaca's daily bar close is the official closing price is UNVERIFIED.
 """
 
 from __future__ import annotations
@@ -138,6 +138,8 @@ REF_BATCH = 500
 """Symbols a daily-bars request names (a choice: the page's limit is on data points, 10,000)."""
 SPLITS_LIMIT = 1000
 """alpaca-py's `CorporateActionsRequest.limit` default; a read that reaches it is incomplete, so unknown."""
+STALE_NAMED = 20
+"""Stale symbols a record names; the rest are counted (a choice, for a whole-market universe)."""
 TIMER = "movers-rank"
 RECORD_PREFIX = "movers-rank record "
 
@@ -262,15 +264,23 @@ class MoversRankActor(DataActor):
         self._statuses: dict[str, MarketStatusAction] = {}
         self._invalid: list[str] = []
         self._receipt_ns: int | None = None
+        self._last_bar_open_ns: int | None = None
+        """The latest bar opening received: the gap from its minute's end to publication is the record's
+        stand-in for the event loop's lag, which the pin exposes no gauge of (the lead's note, 2026-11-12)."""
         self._refs: Future[ReferenceRead] | None = None
         self._refs_key: tuple[date, date] | None = None
         self._baseline: Future[movers_rank.BaselineRead] | None = None
         self._baseline_session: date | None = None
         self.last_record: dict[str, object] | None = None
+        self.bars_received = 0
+        self.started_ns: int | None = None
+        """The actor's start, so a record can say how long the first publication took."""
+        """Every bar `on_bar` was handed, counted for the record (the whole-market check of 2026-11-12)."""
 
     def on_start(self) -> None:
         """Subscribe to every cached Alpaca equity's minute bars and statuses, start the reads, set the
         timer."""
+        self.started_ns = self.clock.timestamp_ns()
         equities = [i for i in self.cache.instruments(venue=VENUE) if isinstance(i, Equity)]
         if not equities:
             raise RuntimeError("MoversRankActor cannot start: no equity is in the cache")
@@ -278,7 +288,10 @@ class MoversRankActor(DataActor):
         self._security_types = movers_rank.security_types_from_names(self._assets)
         self.subscribe_bars(
             [BarType.from_str(f"{i.id}-{BAR_SPEC}") for i in equities],
-            params={"feed": self._feed, "wildcard": True, "updated_bars": True},
+            # no revised bars (the owner's plan of 2026-11-12): a `Tally` refuses a revised bar, which
+            # repeats its minute, and that voided the whole market's generation; each minute keeps its
+            # first emission, and a late trade is missed until the next minute (the limits below)
+            params={"feed": self._feed, "wildcard": True},
         )
         self.subscribe_instrument_status(
             [i.id for i in equities], params={"feed": self._feed, "wildcard": True}
@@ -311,8 +324,10 @@ class MoversRankActor(DataActor):
 
     def on_bar(self, bar: Bar) -> None:
         """Add `bar` to its symbol's `Tally`; a bar `Tally` refuses invalidates this interval's generation."""
+        self.bars_received += 1
         symbol = bar.bar_type.instrument_id.symbol.value
         self._receipt_ns = self.clock.timestamp_ns()
+        self._last_bar_open_ns = max(self._last_bar_open_ns or 0, bar.ts_event)
         session = trade_date(bar.ts_event)
         clock_session = trade_date(self._receipt_ns)
         if session > clock_session:
@@ -348,6 +363,7 @@ class MoversRankActor(DataActor):
 
     def on_tick(self, event: TimeEvent) -> None:
         """Compute one generation and publish its top 20, or publish nothing and say why."""
+        handled = self.clock.timestamp_ns()
         now = event.ts_event
         session = trade_date(now)
         if self._session is None or session > self._session:
@@ -358,9 +374,12 @@ class MoversRankActor(DataActor):
             "max_data_age_secs": self._max_data_age_secs,
             "session": session.isoformat(),
             "published": False,
+            "started_ns": self.started_ns,
             "latency_ns": {
                 "publication": None,
                 "receipt": self._receipt_ns,
+                "last_bar_open": self._last_bar_open_ns,
+                "handled": handled,
                 "generation": now,
                 "entry_eligible": None,
                 "submission": None,
@@ -405,11 +424,16 @@ class MoversRankActor(DataActor):
         record["latency_ns"]["publication"] = generation.published_ns  # type: ignore[index]
         record["rows"] = len(generation.rows)
         record["eligible"] = sum(1 for r in generation.rows if r.eligible)
-        record["stale_symbols"] = [
+        stale = [
             r.instrument_id.symbol.value
             for r in generation.rows
             if "last_bar:stale" in r.excluded_by
         ]
+        # bounded, so a whole-market universe keeps each minute's record small
+        record["stale_symbols"] = stale[:STALE_NAMED]
+        record["stale_count"] = len(stale)
+        record["assets"] = len(self._assets)
+        record["bars"] = self.bars_received
         record["references_read_ns"] = refs.read_ns
         record["symbols"] = len(self._tallies)
         record["top"] = top_rows(generation, now)
@@ -535,6 +559,91 @@ def top_rows(
             }
         )
     return found
+
+
+BAR_NS = 60_000_000_000
+"""One minute bar's span: a bar stamped at its opening ends one minute later."""
+
+
+def publication_lags(records: Sequence[Mapping[str, object]]) -> dict[str, object]:
+    """Over the published generations, the timer's lag (from a tick's scheduled time to its handler) and
+    the gap from the latest bar's minute end to the actor's receipt of the latest bar, in seconds: the
+    record's measure of the event loop's backlog, since the pin exposes no queue depth or loop lag (the
+    lead's note of 2026-11-12; NautilusTrader's runner channels apply no backpressure). A generation's
+    `publication` stamp is its computed minute, not a wall clock, so it measures no delay."""
+    timer: list[float] = []
+    bar_gap: list[float] = []
+    for record in records:
+        latency = record.get("latency_ns")
+        if record.get("published") is not True or not isinstance(latency, dict):
+            continue
+        handled, generated = latency.get("handled"), latency.get("generation")
+        received, bar_open = latency.get("receipt"), latency.get("last_bar_open")
+        if isinstance(handled, int) and isinstance(generated, int):
+            timer.append((handled - generated) / 1e9)
+        if isinstance(received, int) and isinstance(bar_open, int):
+            bar_gap.append((received - bar_open - BAR_NS) / 1e9)
+
+    def spread(values: list[float]) -> dict[str, object] | str:
+        if not values:
+            return "unavailable: no published generation carries it"
+        ordered = sorted(values)
+        return {
+            "n": len(ordered),
+            "median": round(ordered[len(ordered) // 2], 3),
+            "max": round(ordered[-1], 3),
+        }
+
+    return {"timer_lag_secs": spread(timer), "bar_end_to_receipt_secs": spread(bar_gap)}
+
+
+def prefetched_reference_reader(
+    read: Future[ReferenceRead],
+    symbols: Sequence[str],
+    key: tuple[date, date],
+    notes: list[str],
+    fallback: ReferenceReader | None = None,
+) -> ReferenceReader:
+    """A `ReferenceReader` that hands the actor a read started before the node, so its first generation
+    need not wait for the whole market's references (the owner's plan of 2026-11-12, Wave 0 (b)).
+
+    `read` is `alpaca_reference_reader` over `symbols` for `key` = (cutoff, session), already running. The
+    actor's first call for that key waits for it on the actor's worker thread. A call for another key, a
+    retry after the pre-read was handed over, or a call after the pre-read failed or found no reference,
+    reads afresh through `fallback` (default `alpaca_reference_reader`). Each call appends
+    one line to `notes` saying which happened, and how many asked-for symbols the pre-read did not cover
+    (those have no reference, so they are unknown, as any symbol `read_references` finds no close for)."""
+    read_fresh = fallback or alpaca_reference_reader
+    covered = frozenset(symbols)
+    handed: list[bool] = []
+
+    def reader(symbols: Sequence[str], cutoff: date, session: date) -> ReferenceRead:
+        if (cutoff, session) != key:
+            notes.append(
+                f"read at the actor's call: its key {(cutoff, session)} is not the pre-read's {key}"
+            )
+            return read_fresh(symbols, cutoff, session)
+        if handed:
+            notes.append("read at the actor's call: a retry after the pre-read was handed over")
+            return read_fresh(symbols, cutoff, session)
+        handed.append(True)
+        error = read.exception()  # waits for the pre-read
+        if error is not None:
+            notes.append(
+                f"read at the actor's call: the pre-read failed ({type(error).__name__}: {error})"
+            )
+            return read_fresh(symbols, cutoff, session)
+        if not read.result().references:
+            notes.append("read at the actor's call: the pre-read found no reference")
+            return read_fresh(symbols, cutoff, session)
+        missing = sum(1 for s in symbols if s not in covered)
+        notes.append(
+            f"pre-read before the node: {len(covered)} symbols; {missing} of the {len(symbols)} asked for "
+            "were not in it"
+        )
+        return read.result()
+
+    return reader
 
 
 def alpaca_reference_reader(symbols: Sequence[str], cutoff: date, session: date) -> ReferenceRead:

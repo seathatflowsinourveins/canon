@@ -63,8 +63,14 @@ to the request budget. Every number of them is a registered row, UNCALIBRATED (A
 
 **How it runs.** `on_signal` keeps the latest ranking. Once a second (`STEP_SECS`) a timer steps:
 
-1. *Watch.* The top `watch` names of a fresh ranking whose instruments are in the cache get a slot:
-   quotes and trades are subscribed first, on `feed` (ADR 0055), then the bars (`bar_spec`). A name that
+1. *Watch.* The top `watch` names of a fresh ranking get a slot: paper composition opts into
+   `load_instruments`, requests missing definitions through upstream's `request_instrument`
+   (`trading/__init__.pyi:916-924`), and waits for their response and cache insertion on later steps.
+   One request may be outstanding, at most `RANK_MOST` per rolling minute, with all asset-GET retries
+   reserved under the request soft line. The provider's actual GET attempts enter the adapter's
+   ordinary request tally. On-demand paper names use the engine's absent-cap default
+   (`crates/risk/src/engine/mod.rs:1448-1454`, `:2491-2505`); startup roster caps stay configured.
+   Quotes and trades are subscribed first, on `feed` (ADR 0055), then the bars (`bar_spec`). A name that
    has left the ranking loses its slot once it holds nothing and nothing of it works.
 2. *Each slot.* An entry not filled within `entry_timeout_secs` is canceled. What is held is protected:
    the emulated trailing stop-limit is submitted for the held quantity once a quote (or a trade, for
@@ -84,7 +90,7 @@ to the request budget. Every number of them is a registered row, UNCALIBRATED (A
    ADR 0092's table rows are :73 (move), :74 (ratio), :75 (baseline sessions), :76 (rises),
    :77 (first-leg window), :78 (quiet price) and :79 (pullback). No row is tuned here.
    Registered arms require a supplied `Day` in `entry_contexts`; no context, no entry. The strategy
-   makes no data request: live composition supplies history and selects the arm (M-c).
+   makes no history request: live composition supplies history and selects the arm (M-c).
    Candidates are taken best-ranked first while a slot is free, each refused by name
    (`dropped`) when the ranking is older than `rank_max_age_secs`, the name is no longer in it, its move
    is over `max_move` (the no-chase cap), no quote is in the cache, the size comes to nothing, or the
@@ -131,19 +137,31 @@ from datetime import timedelta
 from decimal import ROUND_CEILING
 from decimal import ROUND_FLOOR
 from decimal import Decimal
+from itertools import groupby
 from itertools import pairwise
 from types import NoneType
 from typing import TYPE_CHECKING
 from typing import Any
 
+from alpaca.common.constants import DEFAULT_RETRY_ATTEMPTS
 from canon_alpaca.providers import TRADING_API
 from canon_alpaca.providers import request_counts
 from nautilus_trader.config import StrategyConfig
 from nautilus_trader.model import BarType
 from nautilus_trader.model import ClientOrderId
 from nautilus_trader.model import InstrumentId
+from nautilus_trader.model import OrderAccepted
+from nautilus_trader.model import OrderCanceled
+from nautilus_trader.model import OrderDenied
+from nautilus_trader.model import OrderEmulated
+from nautilus_trader.model import OrderExpired
+from nautilus_trader.model import OrderFilled
+from nautilus_trader.model import OrderInitialized
+from nautilus_trader.model import OrderRejected
+from nautilus_trader.model import OrderReleased
 from nautilus_trader.model import OrderSide
 from nautilus_trader.model import OrderStatus
+from nautilus_trader.model import OrderUpdated
 from nautilus_trader.model import Price
 from nautilus_trader.model import TieredTickScheme
 from nautilus_trader.model import TimeInForce
@@ -159,9 +177,11 @@ from .movers_rank_signal import SIGNAL_NAME as RANK_SIGNAL
 from .movers_rank_signal import RankEntry
 from .movers_rank_signal import decode_ranking
 from .movers_rank_signal import encode_ranking
+from .paper_node import REQUEST_CEILING
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
+    from collections.abc import Mapping
     from collections.abc import Sequence
     from datetime import date
 
@@ -171,6 +191,167 @@ if TYPE_CHECKING:
 
     from . import early_entry_study as entry_study
     from .position_cap import PositionCap
+
+
+@dataclass
+class _ProtectionHolding:
+    row: dict[str, Any]
+    held: Decimal = Decimal(0)
+    first_fill: int | None = None
+    first_protection: int | None = None
+    gap: int | None = None
+    longest: int = 0
+
+
+@dataclass
+class _ProtectionSale:
+    quantity: Decimal
+    filled: Decimal = Decimal(0)
+    working: bool = False
+
+
+def protection_diagnostics(
+    entries: Sequence[Mapping[str, Any]],
+    orders: Sequence[Any],
+    *,
+    part: str,
+    end_ns: int,
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    """Add protection evidence to the window's entry diagnostics, without touching an order.
+
+    Contract: nt@d53849b216e2 `Order.events`, `OrderInitialized.quantity`,
+    `OrderUpdated.quantity`, `OrderFilled.last_qty/ts_event` (model/__init__.pyi),
+    orders/mod.rs's open states and emulator.rs:1394-1411,1530-1588: a transformed limit keeps
+    the trail's events. Read before disposal, inside the window's named diagnostics try.
+
+    Emulated and venue-accepted sells cover their remaining quantity. Release ends emulator
+    coverage; the limit covers again on acceptance (or a partial fill proving it works).
+    Pending cancels/updates retain coverage until a terminal event; initialization alone covers
+    nothing. Every held share needs a working sale. Sales and coverage are allocated FIFO across
+    entries of the same instrument, in first-fill order; Mover normally enters only when flat.
+    All durations use event clocks, with equal timestamps one instant, and stop at end_ns.
+    `first_fill_to_protection_ms` is None if never filled or never protected; `first_fill_ns`
+    and the summary's never-protected count distinguish them. An open gap ends at the window's
+    actual observation time, not its planned end. Milliseconds retain nanosecond precision;
+    the one-second count is compared in integer nanoseconds, strictly greater than one second.
+    """
+    holdings = {str(e["client_order_id"]): _ProtectionHolding(dict(e, part=part)) for e in entries}
+    known = {o.client_order_id.value for o in orders}
+    missing = holdings.keys() - known
+    if missing:
+        raise ValueError(f"protection: entry orders absent from cache: {sorted(missing)}")
+    by_instrument: dict[str, list[tuple[int, Any, Any]]] = {}
+    instruments = {str(e["instrument_id"]) for e in entries}
+    for order in orders:
+        instrument = str(order.instrument_id)
+        if instrument in instruments:
+            by_instrument.setdefault(instrument, []).extend(
+                (event.ts_event, order, event)
+                for event in order.events()
+                if event.ts_event <= end_ns
+            )
+
+    def coverage(
+        sales: dict[str, _ProtectionSale], active: dict[str, _ProtectionHolding]
+    ) -> list[tuple[_ProtectionHolding, Decimal]]:
+        left = sum(
+            (max(Decimal(0), s.quantity - s.filled) for s in sales.values() if s.working),
+            Decimal(0),
+        )
+        covered = []
+        for holding in active.values():
+            amount = min(holding.held, left)
+            covered.append((holding, amount))
+            left -= amount
+        return covered
+
+    def first_protection(now: int, covered: Sequence[tuple[_ProtectionHolding, Decimal]]) -> None:
+        for holding, amount in covered:
+            if amount > 0 and holding.first_protection is None:
+                holding.first_protection = now
+
+    for timeline in by_instrument.values():
+        sales: dict[str, _ProtectionSale] = {}
+        active: dict[str, _ProtectionHolding] = {}  # insertion order is first-fill order
+
+        for now, grouped in groupby(sorted(timeline, key=lambda item: item[0]), key=lambda x: x[0]):
+            batch = list(grouped)
+            # All same-clock buys precede sales for allocation, independent of cache iteration order.
+            for _, order, event in batch:
+                if order.side != OrderSide.BUY or not isinstance(event, OrderFilled):
+                    continue
+                cid = order.client_order_id.value
+                if cid not in holdings:
+                    raise ValueError(f"protection: filled buy absent from entries: {cid}")
+                holding = holdings[cid]
+                active.setdefault(cid, holding)
+                holding.held += event.last_qty.as_decimal()
+                if holding.first_fill is None:
+                    holding.first_fill = now
+            first_protection(now, coverage(sales, active))
+            for _, order, event in batch:
+                if order.side != OrderSide.SELL:
+                    continue
+                sale = sales.setdefault(
+                    order.client_order_id.value,
+                    _ProtectionSale(order.init_event.quantity.as_decimal()),
+                )
+                if isinstance(event, OrderInitialized):
+                    continue  # transformed limits prepend the trail's original initialization
+                if isinstance(event, OrderUpdated):
+                    sale.quantity = event.quantity.as_decimal()
+                elif isinstance(event, (OrderEmulated, OrderAccepted)):
+                    sale.working = True
+                elif isinstance(
+                    event, (OrderReleased, OrderCanceled, OrderDenied, OrderRejected, OrderExpired)
+                ):
+                    sale.working = False
+                elif isinstance(event, OrderFilled):
+                    sold = event.last_qty.as_decimal()
+                    sale.filled += sold
+                    sale.working = sale.filled < sale.quantity
+                    for holding in active.values():
+                        take = min(sold, holding.held)
+                        holding.held -= take
+                        sold -= take
+                    if sold:
+                        raise ValueError("protection: sale exceeds the recorded entries' holdings")
+                first_protection(now, coverage(sales, active))
+            for holding, amount in coverage(sales, active):
+                uncovered = holding.held > amount
+                if uncovered and holding.gap is None:
+                    holding.gap = now
+                elif not uncovered and holding.gap is not None:
+                    holding.longest = max(holding.longest, now - holding.gap)
+                    holding.gap = None
+        for holding in active.values():
+            if holding.gap is not None:
+                holding.longest = max(holding.longest, end_ns - holding.gap)
+
+    delays = []
+    filled = [h for h in holdings.values() if h.first_fill is not None]
+    for holding in holdings.values():
+        delay = None
+        if holding.first_fill is not None and holding.first_protection is not None:
+            delay = holding.first_protection - holding.first_fill
+            delays.append(delay)
+        holding.row.update(
+            first_fill_ns=holding.first_fill,
+            first_protection_ns=holding.first_protection,
+            first_fill_to_protection_ms=None if delay is None else delay / 1_000_000,
+            max_unprotected_ms=None if holding.first_fill is None else holding.longest / 1_000_000,
+        )
+    return [h.row for h in holdings.values()], {
+        part: {
+            "entries": len(holdings),
+            "filled_entries": len(filled),
+            "entries_never_protected": sum(h.first_protection is None for h in filled),
+            "worst_first_fill_to_protection_ms": max(delays) / 1_000_000 if delays else None,
+            "worst_unprotected_ms": max(h.longest for h in filled) / 1_000_000 if filled else None,
+            "entries_over_one_second": sum(h.longest > 1_000_000_000 for h in filled),
+        }
+    }
+
 
 EXTENDED_HOURS = {"extended_hours": True}
 """The submit params that mark an order as extended-hours eligible for the adapter (ADR 0038)."""
@@ -187,6 +368,11 @@ QUERY_WAIT_SECS = 130
 longest, alpaca-py's first request and three retries at the adapter's timeouts and the waits between
 them (`session_window.ADAPTER_CALL_SECS`, about 129 s). A reply later than this can arrive after the
 next query's, the one case in which a report could count a buy its balance does not have."""
+INSTRUMENT_REQUEST_LIMIT = RANK_MOST
+"""At most one ranking's worth of instrument requests per rolling minute (20); one outstanding.
+Asset GETs use alpaca-py's existing retry policy; every HTTP attempt is counted by the adapter."""
+INSTRUMENT_REQUEST_RESERVE = DEFAULT_RETRY_ATTEMPTS + 1
+"""Reserve all attempts of an outstanding asset GET (alpaca-py common/constants.py:11-13)."""
 CHASES = ("resend",)
 TRIGGERS = (TriggerType.BID_ASK, TriggerType.LAST_PRICE)
 """The triggers the local emulator accepts for an order it holds (concepts/orders/emulated)."""
@@ -327,6 +513,7 @@ OWN_FIELDS: dict[str, type | tuple[type, ...]] = {
     "max_shares": (int, NoneType),
     "share_caps": (dict, NoneType),
     "size_from_budget": bool,
+    "load_instruments": bool,
     "entries": (int, NoneType),
     "bar_spec": str,
     "slots": int,
@@ -361,11 +548,14 @@ class MoverConfig(StrategyConfig):
 
     `max_notional` (the largest notional of an entry, in dollars) and `max_move` (the no-chase cap on
     the ranking's move, a fraction) have no default: the run states them. The entry is bounded here,
-    where it is sized; the risk engine's own per-order cap is the node's outer bound, a multiple of
-    `max_notional`, since that cap holds for a sale as for a buy and no cap shapes or refuses a sale
+    where it is sized; the startup roster's engine per-order cap is the node's outer bound, a multiple
+    of `max_notional`, since that cap holds for a sale as for a buy and no cap shapes or refuses a sale
     (ADR 0088). `max_shares` bounds an entry in shares, and `entries` how many entries a run may fill
     (None: no bound). `share_caps`, when set, bounds each named instrument's entry in shares; a name
-    outside that map cannot enter. Paper windows select size_from_budget=True: whole shares of the
+    outside that map cannot enter, except under load_instruments with size_from_budget: there any name
+    outside the map that is in the cache or loaded on demand may enter (with the data client's
+    `load_all`, the whole market), bounded only by the sizing below. It has no start-time cap, no
+    position monitor and no engine per-order cap, and none is written for it. Paper windows select size_from_budget=True: whole shares of the
     supplied max_notional at the current entry limit, clamped to the name's start-time share cap
     (`binding` `cap_bound` when it binds); neither that cap nor the name's position monitor is
     rewritten, so a monitor trip means a real fault, not a price drift. This path clamps the startup
@@ -396,6 +586,7 @@ class MoverConfig(StrategyConfig):
         max_shares: int | None = None,
         share_caps: dict[InstrumentId, int] | None = None,
         size_from_budget: bool = False,
+        load_instruments: bool = False,
         entries: int | None = None,
         bar_spec: str = "1-MINUTE-LAST-EXTERNAL",
         slots: int = 1,
@@ -489,6 +680,7 @@ class MoverConfig(StrategyConfig):
         self.max_shares = max_shares
         self.share_caps = None if share_caps is None else dict(share_caps)
         self.size_from_budget = size_from_budget
+        self.load_instruments = load_instruments
         self.entries = entries
         self.bar_spec = bar_spec
         self.slots = slots
@@ -516,6 +708,17 @@ class MoverConfig(StrategyConfig):
         self.extended_hours = extended_hours
         self.wind_down_at = wind_down_at
         self.feed = feed
+
+
+@dataclass
+class InstrumentLoad:
+    """One native instrument request; a timed-out request retains its budget reserve until answered."""
+
+    requested_ns: int
+    request_id: str | None = None
+    completed: bool = False
+    ready: bool = False
+    reason: str | None = None
 
 
 @dataclass
@@ -571,6 +774,10 @@ class Mover(Strategy):
         """Every slot subscribed during the run, including names since unwatched, for stream checks."""
         self.rank: list[tuple[InstrumentId, Decimal]] = []
         """The latest ranking, best first; empty until one arrives and after a malformed one."""
+        self.instrument_loads: dict[InstrumentId, InstrumentLoad] = {}
+        self.instrument_responses: dict[str, str | None] = {}
+        self.instrument_requests = 0
+        self.instrument_sent: deque[int] = deque()
         self.rank_ns = 0
         self.rank_faults = 0
         self.rank_malformed = False
@@ -617,7 +824,7 @@ class Mover(Strategy):
 
         A Day names its New York date, reference close, earlier sessions latest first, and covered
         bars since 04:00 (the study's Day contract). Callers supply complete history, with `missing`
-        naming any coverage fault; Mover fetches nothing and refuses absent, wrong-name/day or
+        naming any coverage fault; Mover fetches no history and refuses absent, wrong-name/day or
         missing contexts. `covered_to` must reach the incoming minute's open: after a data gap the
         caller supplies the missing prefix or marks it missing. Completed live bars extend coverage
         to that minute's end and replace that minute in the context; future minutes
@@ -639,8 +846,8 @@ class Mover(Strategy):
         self.sent: deque[tuple[int, int]] = deque()
         """(time, the adapter's request total) at each step of the last 60 seconds."""
         self.recent = 0
-        """The adapter's requests over the last 60 seconds at this step, which `soft_line` holds
-        entries and chases against."""
+        """The adapter's requests over the last 60 seconds plus outstanding instrument-GET reserves,
+        which `soft_line` holds entries and chases against."""
 
     # --- handlers that only store what they are given (module header, "Order events") ---------------
 
@@ -673,6 +880,11 @@ class Mover(Strategy):
 
     def on_order_released(self, event: Any) -> None:
         self.released.add(event.client_order_id.value)
+
+    def on_data_response(self, response: Any) -> None:
+        """Only retain the response; the next step checks the cache and subscribes outside reentry."""
+        if response.failure_reason is not None or response.completed:
+            self.instrument_responses[str(response.correlation_id)] = response.failure_reason
 
     def on_order_filled(self, event: Any) -> None:
         self.fills.append(
@@ -784,6 +996,21 @@ class Mover(Strategy):
             "rankings": [dict(ranking) for ranking in self.rankings],
             "ranking_records": [dict(record) for record in self.ranking_records],
             "opened_slots": sorted(str(instrument) for instrument in self.opened_slots),
+            "instrument_loads": {
+                str(instrument): {
+                    "request_id": load.request_id,
+                    "requested_ns": load.requested_ns,
+                    "completed": load.completed,
+                    "ready": load.ready,
+                    "reason": load.reason,
+                    "engine_cap": None,
+                }
+                for instrument, load in self.instrument_loads.items()
+            },
+            "instrument_requests": self.instrument_requests,
+            "instrument_request_limit": INSTRUMENT_REQUEST_LIMIT,
+            "instrument_request_reserve": INSTRUMENT_REQUEST_RESERVE,
+            "dropped": list(self.dropped),
             "rank_faults": self.rank_faults,
             "fills": [list(fill) for fill in self.fills],
             "refused": [list(refused) for refused in self.refused],
@@ -954,12 +1181,15 @@ class Mover(Strategy):
         self._say_ranking(now)
         recent = self.recent = self._recent_requests(now)
         self._watch(now)
+        # Reserve every possible retry while the asynchronous GET is outstanding. Its actual HTTP
+        # attempts already enter requests_sent through the provider's existing transport, not here.
+        self.recent = recent + self._instrument_reserve()
         for slot in list(self.slots.values()):
             self._manage(slot, now)
         if self.winding_down:
             self._end()
         else:
-            self._enter(now, recent)
+            self._enter(now, self.recent)
 
     def on_stop(self) -> None:
         """Cancel what works; what is then still held is the window's to find and report. With
@@ -1024,16 +1254,111 @@ class Mover(Strategy):
 
     def _watch(self, now: int) -> None:
         ranked = self._ranked(now)
-        top = [i for i in ranked if self.cache.instrument(i) is not None][: self.settings.watch]
+        if self.settings.load_instruments:
+            self._finish_instruments(now)
+            top = list(ranked)[: self.settings.watch]
+        else:
+            top = [i for i in ranked if self.cache.instrument(i) is not None][: self.settings.watch]
         if not self.winding_down:
             for instrument_id in top:
-                if instrument_id not in self.slots:
+                if instrument_id not in self.slots and (
+                    not self.settings.load_instruments or self._instrument_ready(instrument_id, now)
+                ):
                     self._open_slot(instrument_id)
+                    if (
+                        self.settings.entry_arm != "bridge"
+                        and instrument_id not in self.entry_contexts
+                    ):
+                        self._note(
+                            self.slots[instrument_id],
+                            f"{instrument_id}: entry arm {self.settings.entry_arm}: no entry context supplied",
+                        )
         for instrument_id, slot in list(self.slots.items()):
             if instrument_id in top or self._working(slot) or self._held(slot) or slot.was_held:
                 continue  # `was_held`: its sale is recorded by `_flat` before the slot may go
             if self._fresh(now) or self.winding_down:  # a stale ranking unwatches nothing
                 self._close_slot(slot)
+
+    def _instrument_reserve(self) -> int:
+        return INSTRUMENT_REQUEST_RESERVE * sum(
+            not load.completed for load in self.instrument_loads.values()
+        )
+
+    def _instrument_drop(self, instrument_id: InstrumentId, why: str) -> None:
+        text = f"{instrument_id}: {why}"
+        if text not in self.dropped:
+            self.dropped.append(text)
+            self._say(text)
+
+    def _finish_instruments(self, now: int) -> None:
+        """Read a completed request's cache result on the timer, never in its response handler."""
+        for instrument_id, load in self.instrument_loads.items():
+            if load.completed:
+                continue
+            request_id = load.request_id
+            if request_id is not None and request_id in self.instrument_responses:
+                load.completed = True
+                reason = self.instrument_responses.pop(request_id)
+                if load.reason is not None:  # a timeout remains a named refusal for this window
+                    continue
+                if reason is not None:
+                    load.reason = f"instrument request refused: {reason}"
+                elif self.cache.instrument(instrument_id) is None:
+                    load.reason = "instrument response completed without a cached definition"
+                else:
+                    load.ready = True
+            elif (
+                load.reason is None
+                and now - load.requested_ns >= self.settings.rank_max_age_secs * SECOND_NS
+            ):
+                load.reason = (
+                    f"instrument request timeout after {self.settings.rank_max_age_secs} s"
+                )
+            if load.reason is not None:
+                self._instrument_drop(instrument_id, load.reason)
+
+    def _instrument_ready(self, instrument_id: InstrumentId, now: int) -> bool:
+        """Paper opt-in: native request_instrument -> provider -> cache, then the ordinary subscriptions.
+
+        rc8 trading/__init__.pyi:916-924, live/providers.py:110-115; the adapter's hook sends an
+        InstrumentResponse. No live risk setter is exposed to Python: on-demand paper names use
+        upstream's absent-map-entry default (risk/engine/mod.rs:1448-1454, :2491-2505; ADR 0091).
+        """
+        if load := self.instrument_loads.get(instrument_id):
+            return load.ready
+        if self.cache.instrument(instrument_id) is not None:
+            if (
+                self.settings.share_caps is not None
+                and instrument_id not in self.settings.share_caps
+            ):
+                self.instrument_loads[instrument_id] = InstrumentLoad(
+                    now, completed=True, ready=True
+                )
+            return True
+        while self.instrument_sent and now - self.instrument_sent[0] > BUDGET_SPAN_NS:
+            self.instrument_sent.popleft()
+        if self._instrument_reserve():
+            self._instrument_drop(instrument_id, "waiting for the outstanding instrument request")
+            return False
+        if len(self.instrument_sent) >= INSTRUMENT_REQUEST_LIMIT:
+            self._instrument_drop(
+                instrument_id, "instrument request held at the rolling minute limit"
+            )
+            return False
+        line = min(self.settings.soft_line, REQUEST_CEILING)
+        if self.recent + INSTRUMENT_REQUEST_RESERVE >= line:
+            self._instrument_drop(instrument_id, "instrument request held at the request soft line")
+            return False
+        load = self.instrument_loads[instrument_id] = InstrumentLoad(now)
+        self.instrument_sent.append(now)
+        self.instrument_requests += 1
+        try:
+            load.request_id = self.request_instrument(instrument_id)
+        except (RuntimeError, ValueError, TypeError) as e:
+            load.completed = True
+            load.reason = f"instrument request refused: {type(e).__name__}: {e}"
+            self._instrument_drop(instrument_id, load.reason)
+        return False
 
     def _open_slot(self, instrument_id: InstrumentId) -> None:
         bar_type = BarType.from_str(f"{instrument_id}-{self.spec_suffix}")
@@ -1367,6 +1692,9 @@ class Mover(Strategy):
     def _recent_requests(self, now: int) -> int:
         """The adapter's requests over the last 60 seconds, from its running total sampled each step."""
         total = requests_sent()
+        if self.settings.load_instruments and not self.sent:
+            # Include startup asset/reconciliation traffic conservatively for the first minute.
+            self.sent.append((now, 0))
         self.sent.append((now, total))
         while self.sent and now - self.sent[0][0] > BUDGET_SPAN_NS:
             self.sent.popleft()
@@ -1382,7 +1710,11 @@ class Mover(Strategy):
         """Send the entry; return why not, if it was not sent. `seen` and `run_close` are the
         qualifying bar's `ts_init` and close, kept with the entry for the run's record."""
         settings = self.settings
-        if settings.share_caps is not None and slot.instrument_id not in settings.share_caps:
+        if (
+            settings.share_caps is not None
+            and slot.instrument_id not in settings.share_caps
+            and not (settings.load_instruments and settings.size_from_budget)
+        ):
             return "no share cap for this window instrument"
         quote = self.cache.quote(slot.instrument_id)
         if quote is None:

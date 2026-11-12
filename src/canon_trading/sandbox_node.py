@@ -94,7 +94,25 @@ class DataOnlyRefused(RuntimeError):
     """The node would hold a client that can trade at Alpaca, or the process is not in data-only mode."""
 
 
-def sandbox_node(name: str = "CANON-SANDBOX") -> LiveNode:
+def sandbox_execution_config(*, load_all: bool) -> SandboxExecutionClientConfig:
+    """Upstream's example's sandbox account. For the whole-market check (`load_all`) bar and trade
+    execution are off: otherwise the client builds and steps a matching engine for every bar's
+    instrument (nt@d53849b216e2 crates/adapters/sandbox/src/execution.rs:1095-1107; the flags,
+    python/config.rs:57-58), and the check would measure that load as the ranking actor's."""
+    return SandboxExecutionClientConfig(
+        venue=VENUE,
+        starting_balances=[STARTING_BALANCE],
+        account_id=ACCOUNT_ID,
+        base_currency=STARTING_BALANCE.currency,
+        oms_type=OmsType.NETTING,
+        account_type=AccountType.CASH,
+        fee_model=MakerTakerFeeModel(maker_rate=Decimal(0), taker_rate=Decimal(0)),
+        bar_execution=not load_all,
+        trade_execution=not load_all,
+    )
+
+
+def sandbox_node(name: str = "CANON-SANDBOX", *, load_all: bool = False) -> LiveNode:
     """The node of upstream's example with Alpaca's data client, the sandbox execution client on venue
     `ALPACA` and `ExecTester` on SPY. Refused unless the process is in data-only mode, and checked after
     the build by `refuse_alpaca_execution`."""
@@ -102,7 +120,12 @@ def sandbox_node(name: str = "CANON-SANDBOX") -> LiveNode:
         raise DataOnlyRefused(
             f"the sandbox node runs in data-only mode only ({DATA_ONLY_ENV}=1, ADR 0070); nothing was built"
         )
-    provider = InstrumentProviderConfig(load_ids=[str(INSTRUMENT_ID)])
+    # `load_all`: every active US equity (`AlpacaInstrumentProvider.load_all_async`), for `--rank`
+    provider = (
+        InstrumentProviderConfig(load_all=True)
+        if load_all
+        else InstrumentProviderConfig(load_ids=[str(INSTRUMENT_ID)])
+    )
     node = (
         LiveNode.builder(name, TRADER_ID, Environment.SANDBOX)
         .with_reconciliation(reconciliation=False)
@@ -117,21 +140,85 @@ def sandbox_node(name: str = "CANON-SANDBOX") -> LiveNode:
         .add_simulated_exec_client(
             ALPACA,
             SandboxExecutionClientFactory(),
-            SandboxExecutionClientConfig(
-                venue=VENUE,
-                starting_balances=[STARTING_BALANCE],
-                account_id=ACCOUNT_ID,
-                base_currency=STARTING_BALANCE.currency,
-                oms_type=OmsType.NETTING,
-                account_type=AccountType.CASH,
-                fee_model=MakerTakerFeeModel(maker_rate=Decimal(0), taker_rate=Decimal(0)),
-            ),
+            sandbox_execution_config(load_all=load_all),
         )
         .build()
     )
     refuse_alpaca_execution(node)
-    node.add_builtin_strategy("ExecTester", exec_tester_config())
+    if not load_all:
+        node.add_builtin_strategy("ExecTester", exec_tester_config())
     return node
+
+
+def rank_check(feed: str, baseline_path: str, minutes: int) -> dict[str, object]:
+    """The whole-market check of 2026-11-12 (the lead's order for the 04:00 firing): the sandbox node's
+    data client loads every active US equity, ADR 0087's actor ranks them from the wildcard stream on
+    `feed`, and no strategy runs. Measured: build and start seconds, peak RSS, instruments in the cache,
+    and each generation's symbols, rows, eligible and bars received."""
+    import resource
+    import time
+
+    from .mover_window import window_rank
+    from .movers_rank_actor import MoversRankActorConfig
+    from .movers_rank_actor import publication_lags
+    from .session_window import SAMPLE_MINUTES
+    from .session_window import first_publication_secs
+    from .session_window import paper_trading
+    from .session_window import start_reference_read
+
+    # The window's start-up (the owner's plan of 2026-11-12, Wave 0 (b)): the references are read before
+    # the node, for at most the stream sample's span, which is what a window gives the pre-read.
+    notes: list[str] = []
+    reading = time.monotonic()
+    reader = start_reference_read(paper_trading(), notes)
+    while not notes and time.monotonic() - reading < SAMPLE_MINUTES * 60:
+        time.sleep(1)
+    pre_read_wait = time.monotonic() - reading
+    began = time.monotonic()
+    node = sandbox_node(load_all=True)
+    built = time.monotonic() - began
+    records: list[dict[str, object]] = []
+    actor = window_rank(
+        MoversRankActorConfig(
+            feed=feed, order_cap=10_000.0, baseline_path=baseline_path, reference_reader=reader
+        ),
+        records,
+    )
+    node.add_actor(actor)
+    cache = node.cache
+    try:
+        asyncio.run(run_for(node, minutes * 60))
+        instruments = len(cache.instruments(venue=VENUE))
+    finally:
+        node.dispose()
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return {
+        "pre_read_wait_secs": round(pre_read_wait, 1),
+        "reference_read": notes,
+        "first_publication_secs": first_publication_secs({"ranking_records": records}),
+        "build_secs": round(built, 1),
+        "instruments_in_cache": instruments,
+        "peak_rss_mb": round(rss / 1_048_576, 1),  # bytes on macOS (getrusage(2))
+        "bars_received": actor.bars_received,
+        "publication_lags": publication_lags(records),
+        "generations": [
+            {
+                k: r.get(k)
+                for k in (
+                    "at",
+                    "published",
+                    "assets",
+                    "symbols",
+                    "bars",
+                    "rows",
+                    "eligible",
+                    "stale_count",
+                )
+            }
+            | {"latency_ns": r.get("latency_ns")}
+            for r in records
+        ],
+    }
 
 
 def exec_tester_config() -> ExecTesterConfig:
@@ -214,12 +301,35 @@ def main(argv: Sequence[str] | None = None) -> int:
         prog="python -m canon_trading.sandbox_node", description=__doc__
     )
     parser.add_argument("--minutes", type=int, default=10, help=f"run length, 1 to {MAX_MINUTES}")
+    parser.add_argument(
+        "--rank",
+        choices=("sip", "boats"),
+        help="whole-market ranking check on this feed, no strategy",
+    )
+    parser.add_argument(
+        "--baseline-path", help="default: catalog/movers-baseline/<the --rank feed>.json"
+    )
     args = parser.parse_args(argv)
     if not 1 <= args.minutes <= MAX_MINUTES:
         parser.error(f"--minutes must be 1 to {MAX_MINUTES}")
     os.environ[DATA_ONLY_ENV] = (
         "1"  # the task sets it too; the module does not rely on that (ADR 0070)
     )
+    if args.rank:
+        import json
+
+        print(
+            "rank check:",
+            json.dumps(
+                rank_check(
+                    args.rank,
+                    args.baseline_path or f"catalog/movers-baseline/{args.rank}.json",
+                    args.minutes,
+                )
+            ),
+            flush=True,
+        )
+        return 0
     node = sandbox_node()
     cache = (
         node.cache

@@ -7678,6 +7678,7 @@ def test_the_multiname_node_loads_the_roster_and_builds_its_actor_and_each_cap(
     try:
         assert isinstance(strategy, Mover)
         assert set(strategy.entry_contexts) == set(contexts)
+        assert strategy.settings.load_instruments is True
         assert [str(i) for i in loaded[0]] == ["LLL.ALPACA", "EEE.ALPACA"]
         assert strategy.settings.share_caps == {
             InstrumentId.from_str("LLL.ALPACA"): 312,
@@ -7795,6 +7796,7 @@ def test_the_window_supplies_every_roster_context_and_checks_every_symbol_after_
         strategy.quotes = strategy.trades = 5
         strategy.live_bars = 1
         strategy.ranking_records.append({"published": True})
+        strategy.opened_slots.add(InstrumentId.from_str("EEE.ALPACA"))
         return (
             SimpleNamespace(cache=SimpleNamespace(orders=lambda **_: []), dispose=lambda: None),
             strategy,
@@ -7831,7 +7833,7 @@ def test_the_window_supplies_every_roster_context_and_checks_every_symbol_after_
     assert report.mover["allocation"]["entry_notional"] == "10000.00"  # floored to cents (L3)
     assert set(map(str, seen["node"]["entry_contexts"])) == {"AAA.ALPACA", "BBB.ALPACA"}
     assert [p.symbol for p in seen["node"]["pick"].picks] == ["AAA", "BBB"]
-    assert seen["check"]["symbols"] == ("AAA", "BBB")
+    assert seen["check"]["symbols"] == ("AAA", "BBB", "EEE")
     assert [r["symbol"] for r in report.mover["roster"]] == ["AAA", "BBB"]
     assert report.cap_checks == 5
     assert set(report.mover["position_caps"]) == {"AAA.ALPACA", "BBB.ALPACA"}

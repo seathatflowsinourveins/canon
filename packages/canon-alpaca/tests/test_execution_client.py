@@ -709,6 +709,105 @@ def test_untradable_asset_is_denied(venue, alpaca) -> None:
     assert "not tradable on Alpaca" in strategy.events[0].reason
 
 
+MSFT = InstrumentId.from_str("MSFT.ALPACA")
+
+
+class OnDemandTrader(Trader):
+    """Load a new name through the data client, then submit on the next timer tick."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.quantity = 1
+        self.definition_ready = False
+
+    def on_start(self) -> None:
+        self.started = True
+        self.request_instrument(MSFT)
+        self.clock.set_timer(
+            "on-demand-entry", timedelta(milliseconds=10), callback=self._enter_loaded
+        )
+
+    def on_data_response(self, response) -> None:
+        self.definition_ready = response.completed and response.failure_reason is None
+
+    def _enter_loaded(self, event) -> None:
+        if not self.definition_ready or self.client_order_id is not None:
+            return
+        order = self.order_factory.limit(
+            MSFT,
+            OrderSide.BUY,
+            Quantity.from_int(1),
+            Price.from_str("10.00"),
+            time_in_force=TimeInForce.DAY,
+        )
+        self.client_order_id = order.client_order_id
+        self.submit_order(order)
+
+
+def test_an_equity_loaded_only_by_the_data_client_can_be_submitted(venue, alpaca) -> None:
+    venue.trading.assets.append({**alpaca.ASSET_AAPL, "symbol": "MSFT"})
+    venue.trading.fill_price = "10.00"
+    clients: list[AlpacaExecutionClient] = []
+
+    class Capturing(AlpacaExecutionClientFactory):
+        @staticmethod
+        def create(**kwargs):
+            client = AlpacaExecutionClientFactory.create(**kwargs)
+            clients.append(client)
+            return client
+
+    strategy = OnDemandTrader()
+    node = build_node(strategy, exec_factory=Capturing)
+    assert node.cache.instrument(MSFT) is None
+
+    run(node)
+
+    assert clients[0]._provider.find(MSFT) is None  # the providers were not merged
+    assert node.cache.instrument(MSFT) is not None
+    assert strategy.names() == ["OrderSubmitted", "OrderAccepted", "OrderFilled"]
+    assert len(venue.trading.submitted) == 1 and venue.trading.submitted[0].symbol == "MSFT"
+
+
+@pytest.mark.parametrize("case", ["non-equity", "wrong-venue", "non-tradable", "absent"])
+def test_shared_cache_instrument_lookup_keeps_every_asset_refusal(venue, alpaca, monkeypatch, case):
+    instrument_id = InstrumentId.from_str("MSFT.OTHER") if case == "wrong-venue" else MSFT
+    cached: Any = canon_alpaca.providers.parse_equity(
+        alpaca.asset(symbol="MSFT", tradable=case != "non-tradable"), 0
+    )
+    if case == "non-equity":
+        cached = object()
+    elif case == "absent":
+        cached = None
+    strategy = trader(idle=True)
+    lookups: list[InstrumentId] = []
+
+    async def body(client):
+        assert client._provider.find(instrument_id) is None
+        order = strategy.order_factory.limit(
+            instrument_id,
+            OrderSide.BUY,
+            Quantity.from_int(1),
+            Price.from_str("10.00"),
+            time_in_force=TimeInForce.DAY,
+        )
+
+        def instrument(name):
+            lookups.append(name)
+            return cached
+
+        with monkeypatch.context() as patch:
+            patch.setattr(client, "cache", SimpleNamespace(instrument=instrument))
+            reason = client._denial(order)
+        if case == "non-tradable":
+            assert reason == f"{instrument_id} is not tradable on Alpaca (asset tradable=false)"
+        else:
+            assert reason == f"{instrument_id} is not a loaded ALPACA equity"
+
+    run_with_client(body, strategy)
+    assert venue.trading.submitted == []
+    assert lookups == ([] if case == "wrong-venue" else [instrument_id])
+
+
 def test_submit_without_an_answer_stays_submitted(venue, capfd) -> None:
     venue.trading.submit_error = ConnectionError("connection reset")
     strategy = trader(order_type="limit")

@@ -249,6 +249,7 @@ from nautilus_trader.model import TimeInForce
 
 from .mover import Mover
 from .mover import entry_price
+from .mover import protection_diagnostics
 from .mover_window import MOVER
 from .mover_window import MOVER_ID
 from .mover_window import OUTER_BOUND_MULTIPLE
@@ -307,6 +308,8 @@ if TYPE_CHECKING:
     from nautilus_trader.common import Cache
 
     from .early_entry_study import Day
+    from .movers_rank_actor import ReferenceRead
+    from .movers_rank_actor import ReferenceReader
     from .movers_stream import Historical
     from .movers_stream import Stream
 
@@ -1046,8 +1049,18 @@ LIVE_OPEN_FINDINGS = (
         "after ignition (the lead's words, 2026-11-11; the ignition build adds the limit)"
     ),
     (
-        "the actor is not seeded with the part's earlier minutes: a window started mid-part tallies "
-        "dollars from the node's start only, while a row's ratio_span names the part's clock minutes"
+        "the actor is not seeded with the part's earlier minutes: its tallies count from the node's start "
+        "only, after the 3-minute stream sample (a window launched at 04:00 counts from about 04:03), while "
+        "a row's ratio_span names the part's clock minutes"
+    ),
+    (
+        "no revised bars: the actor subscribes without updated bars, so each minute keeps its first "
+        "emission and a late trade is missed until a later minute (the owner's plan of 2026-11-12, (a))"
+    ),
+    (
+        "Alpaca paper fills check no quantity against the quoted size, model no impact or queue position, "
+        "and fill partially at random: on thin names paper overstates what would fill, and only the flow "
+        "cap gives size any realism"
     ),
     (
         "a streamed bar is stamped at its receipt, so one handled after a tick's scheduled instant and "
@@ -1096,11 +1109,112 @@ def stream_symbols(run: Mapping[str, Any], *, sampled: object) -> dict[str, Any]
         return {"window": "unavailable: no generation counted symbols", "sample": sampled}
     first = counted[0][0]
     later = [n for t, n in counted if t - first >= 60 * 1_000_000_000]
+    published = [r for r in _records(run) if r.get("published") is True]
+    last = published[-1] if published else {}
     return {
+        "assets_loaded": next(
+            (r["assets"] for r in _records(run) if "assets" in r),
+            "unavailable: no record counted the assets",
+        ),
         "window": max(n for _, n in counted),
         "first_minute": later[0] if later else "unavailable: the window ranked under a minute",
         "sample": sampled,
+        "first_publication_secs": first_publication_secs(run),
+        "rows_ranked": last.get("rows", "unavailable: no generation was published"),
+        "eligible": last.get("eligible", "unavailable: no generation was published"),
     }
+
+
+def subscriptions(run: Mapping[str, Any], feed: str, assets: object) -> list[dict[str, Any]]:
+    """The window's market-data subscriptions, each with its feed, channel, whether it is the wildcard and
+    how many instruments it covers: the actor's wildcard bars and statuses over every loaded asset, and
+    Mover's listed quotes and trades for each name it opened a slot for (its bars are INTERNAL, built from
+    those trades, so no feed carries them)."""
+    slots = len(run.get("opened_slots") or ())
+    return [
+        {
+            "by": "MoversRankActor",
+            "feed": feed,
+            "channel": c,
+            "wildcard": True,
+            "instruments": assets,
+        }
+        for c in ("bars", "statuses")
+    ] + [
+        {"by": "Mover", "feed": feed, "channel": c, "wildcard": False, "instruments": slots}
+        for c in ("quotes", "trades")
+    ]
+
+
+def start_reference_read(trading: TradingClient, notes: list[str]) -> ReferenceReader:
+    """Start the rank actor's reference read for the whole market before the node exists, so it runs
+    during the stream sample and the first generation does not wait for it (the owner's plan of
+    2026-11-12, Wave 0 (b); measured at about 90 s for 14,406 symbols on 2026-11-12). The symbols are the
+    assets the data client's `load_all` loads (one GET, `assets_request`'s default filter); the key is the
+    actor's own (`reference_cutoff`, `trade_date`) for now. The read runs on its own thread with the
+    environment's pair, GET only (`alpaca_reference_reader`)."""
+    import threading
+    from concurrent.futures import Future
+
+    from canon_alpaca.providers import assets_request
+
+    from .movers_rank_actor import alpaca_reference_reader
+    from .movers_rank_actor import prefetched_reference_reader
+    from .movers_rank_actor import reference_cutoff
+    from .movers_rank_actor import trade_date as rank_trade_date
+
+    assets = trading.get_all_assets(assets_request(None))
+    if not isinstance(assets, list):
+        raise TypeError("alpaca-py returned raw asset data; the client must use raw_data=False")
+    symbols = sorted({asset.symbol for asset in assets})
+    now = time.time_ns()
+    key = (reference_cutoff(now), rank_trade_date(now))
+    started = time.monotonic()
+    future: Future[ReferenceRead] = Future()
+
+    def read() -> None:
+        # A daemon thread, not a ThreadPoolExecutor, whose workers the interpreter joins at exit: a
+        # window refused after this starts must not wait out the read holding its locks. A failure is
+        # noted too, so a caller waiting on `notes` is not left to its timeout.
+        try:
+            done = alpaca_reference_reader(symbols, *key)
+        except BaseException as e:  # noqa: BLE001 - handed to the actor through the future
+            notes.append(f"pre-read failed: {type(e).__name__}: {e}")
+            future.set_exception(e)
+            return
+        notes.append(f"pre-read took {time.monotonic() - started:.1f} s")
+        future.set_result(done)
+
+    future.set_running_or_notify_cancel()
+    threading.Thread(target=read, name="reference-pre-read", daemon=True).start()
+    return prefetched_reference_reader(future, symbols, key, notes)
+
+
+NO_CONTEXT = "no entry context supplied"
+"""The note `Mover._watch` makes for a ranked name with no registered day context (`mover.py`)."""
+
+
+def first_publication_secs(run: Mapping[str, Any]) -> float | str:
+    """Seconds from the actor's start to its first published generation (the owner's plan, Wave 0)."""
+    for record in _records(run):
+        started = record.get("started_ns")
+        generated = (record.get("latency_ns") or {}).get("generation")
+        if (
+            record.get("published") is True
+            and isinstance(started, int)
+            and isinstance(generated, int)
+        ):
+            return round((generated - started) / 1e9, 1)
+    return "unavailable: no published generation with the actor's start"
+
+
+def passed_over_without_context(run: Mapping[str, Any]) -> dict[str, Any]:
+    """The ranked names a registered arm could not enter because no day context was supplied for them."""
+    notes = run.get("notes") or {}
+    names = sorted(
+        str(i) for i, said in notes.items() if any(NO_CONTEXT in str(n) for n in said or ())
+    )
+    return {"count": len(names), "names": names}
 
 
 def mover_baseline_path(config: WindowConfig, feed: str) -> Path:
@@ -1179,6 +1293,7 @@ def window_node(
     part: str = "regular",
     entry_contexts: Mapping[InstrumentId, Day] | None = None,
     entry_notional: Decimal | None = None,
+    reference_reader: ReferenceReader | None = None,
 ) -> tuple[LiveNode, SessionMaCross | Mover | CachedData, PositionCap | tuple[PositionCap, ...]]:
     """The node, Alpaca's clients, the native risk limits and runtime checks, with the strategy and its
     position caps (one monitor, or a tuple for several names). They are returned too: the node does not
@@ -1229,6 +1344,11 @@ def window_node(
             size_from_budget=True,
             rank_max_age_secs=RANK_MAX_AGE_SECS,
         )
+        # Paper opt-in: every name outside the startup roster (with `data_load_all`, the whole market;
+        # a name missing from the cache by a native instrument request) may enter under the upstream
+        # absent-cap default, bounded by the Mover's sizing alone: no start-time cap, no position
+        # monitor. The builder below still caps exactly the startup roster at entry x the multiple.
+        mover.settings.load_instruments = True
     node = (
         alpaca_paper_builder(
             "CANON-PAPER-SESSION",
@@ -1237,6 +1357,7 @@ def window_node(
             delay_post_stop_secs=MANAGED_DELAY_POST_STOP_SECS if managed else DELAY_POST_STOP_SECS,
             max_order_submit_rate=runs.max_order_submit_rate,
             max_notional_per_order=order_cap,
+            data_load_all=mover is not None,
         )
         .with_logging(
             LoggerConfig(
@@ -1263,6 +1384,7 @@ def window_node(
                 baseline_path=str(mover_baseline_path(config, feed)),
                 # with no baseline file, overnight only ranks on dollars (ultra review, finding 2)
                 rank_without_baseline=part == "overnight",
+                reference_reader=reference_reader,
             ),
             mover.ranking_records,
         )
@@ -2458,6 +2580,8 @@ def run_window(
     mover: dict[str, Any] = {}
     basis: str | None = None
     pick: MoverPick | None = None
+    reference_reader: ReferenceReader | None = None
+    reference_notes: list[str] = []
     entry_contexts: dict[InstrumentId, Day] = {}
     allocation: MoverAllocation | None = None
     window_symbols = (config.symbol,)
@@ -2490,6 +2614,10 @@ def run_window(
             allocation = mover_allocation(
                 trading, row.slots if config.slots is None else config.slots
             )
+            try:  # a pre-read that cannot start is named, and the actor reads at its own call
+                reference_reader = start_reference_read(trading, reference_notes)
+            except Exception as e:  # noqa: BLE001
+                reference_notes.append(f"not pre-read: {type(e).__name__}: {e}")
         pick = choose_mover(
             trading,
             at,
@@ -2695,6 +2823,7 @@ def run_window(
             part=part,
             entry_contexts=entry_contexts,
             entry_notional=None if allocation is None else allocation.entry_notional,
+            reference_reader=reference_reader,
         )
         cache = node.cache
         try:
@@ -2704,6 +2833,17 @@ def run_window(
             try:
                 report.seconds = round(time.monotonic() - started, 1)
                 report.overrun = overrun(started_wall, time.monotonic() - started, ends)
+                if isinstance(strategy, Mover):
+                    # Before any cache read can fail or disposal can clear it: the account check
+                    # must include names that this strategy subscribed after node startup.
+                    window_symbols = tuple(
+                        dict.fromkeys(
+                            (
+                                *window_symbols,
+                                *(i.symbol.value for i in sorted(strategy.opened_slots, key=str)),
+                            )
+                        )
+                    )
                 _fill(report, cache, strategy_id)
                 report.dropped = list(strategy.dropped)
                 report.warm_up_bars = strategy.history_bars
@@ -2744,10 +2884,38 @@ def run_window(
                     report.mover["stream_symbols"] = stream_symbols(
                         run, sampled=(report.mover.get("sample") or {}).get("symbols")
                     )
-                    try:  # diagnostics: one that cannot be read is named, and fails nothing
+                    report.mover["passed_over_no_context"] = passed_over_without_context(run)
+                    from .movers_rank_actor import publication_lags
+
+                    report.mover["publication_lags"] = publication_lags(_records(run))
+                    report.mover["reference_read"] = list(reference_notes)
+                    report.mover["subscriptions"] = subscriptions(
+                        run, feed, report.mover["stream_symbols"].get("assets_loaded")
+                    )
+                    # diagnostics: one that cannot be read is named, and fails nothing; the entry
+                    # rows stand on their own, so a protection failure does not discard them
+                    try:
                         report.mover["entries"] = mover_entries(run, cache, pick)
                     except Exception as e:  # noqa: BLE001
                         report.mover["entries"] = f"not read: {type(e).__name__}: {e}"
+                    if isinstance(report.mover["entries"], str):
+                        report.mover["protection_by_part"] = (
+                            "not read: the entry rows were not read"
+                        )
+                    else:
+                        try:
+                            report.mover["entries"], report.mover["protection_by_part"] = (
+                                protection_diagnostics(
+                                    report.mover["entries"],
+                                    cache.orders(strategy_id=strategy_id),
+                                    part=part,
+                                    end_ns=strategy.clock.timestamp_ns(),
+                                )
+                            )
+                        except Exception as e:  # noqa: BLE001
+                            report.mover["protection_by_part"] = (
+                                f"not read: {type(e).__name__}: {e}"
+                            )
             finally:
                 try:
                     # before the disposal, which clears the cache

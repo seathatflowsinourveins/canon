@@ -356,7 +356,9 @@ def test_task_m_gap_3_subscriptions_name_the_feed_and_wildcard_channels(
     assert len(bar_commands) == len(status_commands) == 1
     bar_types, bar_params = bar_commands[0]
     instrument_ids, status_params = status_commands[0]
-    assert bar_params == {"feed": feed, "wildcard": True, "updated_bars": True}
+    # the owner's plan of 2026-11-12: no revised bars, so one revised bar anywhere no longer voids the
+    # whole market's generation; each minute keeps its first emission
+    assert bar_params == {"feed": feed, "wildcard": True}
     assert status_params == {"feed": feed, "wildcard": True}
     for params in (bar_params, status_params):
         parsed, explicit = named_feed(params, STREAM_FEEDS, "subscriptions")
@@ -381,6 +383,11 @@ def test_task_m_gap_4_a_fresh_symbol_does_not_refresh_a_stale_name(tmp_path: Pat
     assert actor.last_record is not None
     assert actor.last_record["rows"] == len(NAMES)
     assert actor.last_record["stale_symbols"] == ["UPA"]
+    # the whole-market check of 2026-11-12: the record counts the stale, the assets and the bars received
+    assert actor.last_record["stale_count"] == 1
+    assert actor.last_record["assets"] == len(NAMES)
+    counted = actor.last_record["bars"]
+    assert isinstance(counted, int) and 0 < counted <= actor.bars_received
 
 
 @pytest.mark.parametrize(("bound", "ranked_names"), [(10.0, ("UPB",)), (600.0, ("UPB", "UPA"))])
@@ -586,11 +593,20 @@ def test_every_record_carries_the_latency_labels_and_leaves_the_strategys_unknow
     assert record["published"] is True
     labels = record["latency_ns"]
     assert isinstance(labels, dict)
-    assert set(labels) == {"publication", "receipt", "generation", "entry_eligible", "submission"}
+    assert set(labels) == {
+        "publication",
+        "receipt",
+        "last_bar_open",
+        "handled",
+        "generation",
+        "entry_eligible",
+        "submission",
+    }
     assert labels["entry_eligible"] is None
     assert labels["submission"] is None
     assert labels["publication"] <= labels["generation"]
     assert labels["receipt"] is not None
+    assert labels["last_bar_open"] is not None and labels["handled"] >= labels["generation"]
     assert record["feed"] == "sip"
 
 
@@ -688,6 +704,26 @@ def test_a_failed_read_and_an_unusable_baseline_are_retried(tmp_path: Path) -> N
     assert subscriber.signals, actor.last_record
     assert actor.last_record is not None
     assert actor.last_record["published"] is True, actor.last_record
+
+
+def test_an_empty_reference_read_publishes_nothing_and_is_read_again(tmp_path: Path) -> None:
+    """The lead's ruling of 2026-11-12: a reference read that finds no reference at all is retried at the
+    next tick like a failed one, and no generation is published from it."""
+    write_stub_baseline(tmp_path)
+    calls: list[tuple[date, date]] = []
+
+    def empty_first(symbols: Sequence[str], cutoff: date, session: date) -> ReferenceRead:
+        calls.append((cutoff, session))
+        if len(calls) == 1:
+            return ReferenceRead(cutoff=cutoff, references={}, splits=None, read_ns=0)
+        return stub_reader()(symbols, cutoff, session)
+
+    actor, subscriber = run(
+        market(5), baseline_path=tmp_path / "baselines.json", reader=empty_first
+    )
+    assert len(calls) >= 2, "the empty reference read was not retried"
+    assert subscriber.signals, actor.last_record
+    assert actor.last_record is not None and actor.last_record["published"] is True
 
 
 class StubBars:
@@ -1098,3 +1134,91 @@ def test_an_absent_baseline_is_kept_on_the_worker_and_the_night_still_ranks(tmp_
     )
     assert subscriber.signals, actor.last_record
     assert actor.last_record is not None and actor.last_record["published"] is True
+
+
+PRE_READ_KEY = (date(2026, 11, 12), date(2026, 11, 12))
+
+
+def test_a_pre_read_answers_the_actors_call_for_its_key_and_counts_what_it_missed() -> None:
+    pre = actor_module.ReferenceRead(
+        PRE_READ_KEY[0], {"AAA": movers_rank.Reference(close=1.0, session=PREVIOUS)}, None, 1
+    )
+    done: Future[actor_module.ReferenceRead] = Future()
+    done.set_result(pre)
+    fresh: list[tuple[tuple[str, ...], date, date]] = []
+
+    def read_fresh(symbols, cutoff: date, session: date) -> actor_module.ReferenceRead:
+        fresh.append((tuple(symbols), cutoff, session))
+        return actor_module.ReferenceRead(cutoff, {}, None, 2)
+
+    notes: list[str] = []
+    reader = actor_module.prefetched_reference_reader(
+        done, ["AAA", "BBB"], PRE_READ_KEY, notes, read_fresh
+    )
+    assert reader(["AAA", "CCC"], *PRE_READ_KEY) is pre
+    assert not fresh
+    assert notes == ["pre-read before the node: 2 symbols; 1 of the 2 asked for were not in it"]
+    later = (date(2026, 11, 13), date(2026, 11, 13))
+    assert reader(["AAA"], *later).read_ns == 2
+    assert fresh == [(("AAA",), *later)]
+    assert "is not the pre-read's" in notes[-1]
+    assert reader(["AAA"], *PRE_READ_KEY).read_ns == 2, "a retry is read afresh"
+    assert notes[-1] == "read at the actor's call: a retry after the pre-read was handed over"
+
+
+def test_a_pre_read_that_found_no_reference_is_read_again_at_the_actors_call() -> None:
+    empty: Future[actor_module.ReferenceRead] = Future()
+    empty.set_result(actor_module.ReferenceRead(PRE_READ_KEY[0], {}, None, 1))
+    notes: list[str] = []
+    reader = actor_module.prefetched_reference_reader(
+        empty,
+        ["AAA"],
+        PRE_READ_KEY,
+        notes,
+        lambda symbols, cutoff, session: actor_module.ReferenceRead(cutoff, {}, None, 4),
+    )
+    assert reader(["AAA"], *PRE_READ_KEY).read_ns == 4
+    assert notes == ["read at the actor's call: the pre-read found no reference"]
+
+
+def test_a_failed_pre_read_falls_back_to_a_read_at_the_actors_call_and_says_why() -> None:
+    failed: Future[actor_module.ReferenceRead] = Future()
+    failed.set_exception(RuntimeError("refused"))
+    notes: list[str] = []
+    reader = actor_module.prefetched_reference_reader(
+        failed,
+        ["AAA"],
+        PRE_READ_KEY,
+        notes,
+        lambda symbols, cutoff, session: actor_module.ReferenceRead(cutoff, {}, None, 3),
+    )
+    assert reader(["AAA"], *PRE_READ_KEY).read_ns == 3
+    assert notes == ["read at the actor's call: the pre-read failed (RuntimeError: refused)"]
+
+
+def test_the_record_measures_timer_lag_and_the_gap_from_a_bars_end_to_its_receipt() -> None:
+    second = 1_000_000_000
+    minute = 60 * second
+
+    def record(published: bool, handled: int, bar_open: int | None) -> dict[str, object]:
+        latency = {
+            "generation": 10 * minute,
+            "handled": 10 * minute + handled,
+            "publication": 10 * minute,
+            "receipt": 10 * minute + handled + second,
+            "last_bar_open": bar_open,
+        }
+        return {"published": published, "latency_ns": latency}
+
+    lags = actor_module.publication_lags(
+        [
+            record(False, 9 * second, 9 * minute),
+            record(True, second // 2, 9 * minute),
+            record(True, 2 * second, 8 * minute),
+            record(True, 3 * second, None),
+        ]
+    )
+    assert lags["timer_lag_secs"] == {"n": 3, "median": 2.0, "max": 3.0}
+    assert lags["bar_end_to_receipt_secs"] == {"n": 2, "median": 63.0, "max": 63.0}
+    none = actor_module.publication_lags([])
+    assert none["timer_lag_secs"] == "unavailable: no published generation carries it"

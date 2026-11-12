@@ -5,6 +5,7 @@ from __future__ import annotations
 from decimal import Decimal
 
 import pytest
+from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.model import InstrumentId
 
 from canon_trading import paper_node
@@ -57,3 +58,33 @@ def test_both_client_providers_load_every_window_name(monkeypatch, instruments) 
 def test_an_empty_window_universe_is_refused(configure) -> None:
     with pytest.raises(ValueError, match="at least one instrument"):
         configure(())
+
+
+def test_a_whole_market_data_client_loads_every_equity_and_execution_keeps_the_window(
+    monkeypatch,
+) -> None:
+    """The lead's order for the 04:00 firing (2026-11-12): the data client loads every active US equity
+    (`load_all`), so the ranking actor's wildcard bars are tallied for the whole market; the execution
+    client keeps the window's instruments."""
+    providers: dict[str, InstrumentProviderConfig] = {}
+    for kind, factory in (
+        ("data", paper_node.AlpacaDataClientFactory),
+        ("exec", paper_node.AlpacaExecutionClientFactory),
+    ):
+        original = factory.create
+
+        def create(*, _original=original, _kind=kind, **kwargs):
+            providers[_kind] = kwargs["config"].instrument_provider
+            return _original(**kwargs)
+
+        monkeypatch.setattr(factory, "create", staticmethod(create))
+    node = paper_node.alpaca_paper_builder(
+        "CANON-WHOLE-MARKET-TEST", (AAA, BBB), data_load_all=True
+    ).build()
+    try:
+        data, execution = providers["data"], providers["exec"]
+        assert data.load_all is True
+        assert execution.load_all is False
+        assert execution.load_ids == [str(AAA), str(BBB)]
+    finally:
+        node.dispose()

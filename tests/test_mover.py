@@ -263,6 +263,174 @@ def sides(orders: list) -> list[str]:
     return [f"{o.side.name} {o.order_type.name} {o.status.name}" for o in orders]
 
 
+class DeferredInstruments(Recording):
+    """The real risk engine has the definitions; this strategy sees a delayed data-client reply.
+
+    The adapter's own real-node test covers inserting an initially absent definition. This view lets
+    a backtest exercise Mover's wait and real orders without inventing a backtest instrument server.
+    """
+
+    def __init__(self, config: MoverConfig) -> None:
+        super().__init__(config)
+        self.settings.load_instruments = True
+        self.available = {AAA}
+        self.load_delay: int | None = SECOND
+        self.load_failure: str | None = None
+        self.asked: list[tuple[InstrumentId, int]] = []
+        self.answers: list[tuple[int, InstrumentId, str]] = []
+        self.subscriptions: list[tuple[str, InstrumentId, dict | None]] = []
+        self.steps: list[int] = []
+
+    @property
+    def cache(self) -> Any:
+        native = super().cache
+        available = self.available
+
+        class View:
+            def instrument(self, instrument_id):
+                return native.instrument(instrument_id) if instrument_id in available else None
+
+            def __getattr__(self, name):
+                return getattr(native, name)
+
+        return View()
+
+    def request_instrument(
+        self, instrument_id, start=None, end=None, client_id=None, params=None, callback=None
+    ):
+        now = self.clock.timestamp_ns()
+        self.asked.append((instrument_id, now))
+        request_id = f"asset-{len(self.asked)}"
+        if self.load_delay is not None:
+            self.answers.append((now + self.load_delay, instrument_id, request_id))
+        return request_id
+
+    def subscribe_quotes(self, instrument_id, client_id=None, params=None):
+        self.subscriptions.append(("quotes", instrument_id, params))
+        super().subscribe_quotes(instrument_id, client_id=client_id, params=params)
+
+    def subscribe_trades(self, instrument_id, client_id=None, params=None):
+        self.subscriptions.append(("trades", instrument_id, params))
+        super().subscribe_trades(instrument_id, client_id=client_id, params=params)
+
+    def subscribe_bars(self, bar_type, client_id=None, params=None):
+        self.subscriptions.append(("bars", bar_type.instrument_id, params))
+        super().subscribe_bars(bar_type, client_id=client_id, params=params)
+
+    def _on_step(self, event):
+        self.steps.append(event.ts_event)
+        for due, instrument, request_id in list(self.answers):
+            if due <= event.ts_event:
+                self.answers.remove((due, instrument, request_id))
+                if self.load_failure is None:
+                    self.available.add(instrument)
+                self.on_data_response(
+                    SimpleNamespace(
+                        correlation_id=request_id,
+                        completed=True,
+                        failure_reason=self.load_failure,
+                    )
+                )
+        super()._on_step(event)
+
+
+def deferred_strategy(**changes: object) -> DeferredInstruments:
+    original = strategy(**changes)
+    return DeferredInstruments(original.settings)
+
+
+def test_an_on_demand_buy_and_sale_after_a_rise_pass_without_a_roster_engine_cap():
+    # The real risk engine caps only AAA at $1; BBB must pass with its absent map entry, both ways.
+    eng = engine(order_cap=Decimal(1))
+    s = deferred_strategy(
+        max_notional=Decimal(1000), size_from_budget=True, share_caps={AAA: 1}, watch=1
+    )
+    orders = run(eng, s, ranker(rank((BBB, "0.4"))), tape(BBB, RISING + FALL))
+    flat = not eng.cache.positions_open(strategy_id=MOVER_ID)
+    eng.dispose()
+    assert s.asked and [instrument for instrument, _ in s.asked] == [BBB]
+    buy, sale = orders
+    assert buy.side == OrderSide.BUY and sale.side == OrderSide.SELL
+    assert buy.status.name == sale.status.name == "FILLED"
+    assert buy.quantity.as_decimal() * buy.price.as_decimal() <= 1000
+    assert sale.quantity.as_decimal() * sale.price.as_decimal() > 1000
+    assert flat and not s.refused
+    assert s.record()["instrument_loads"][str(BBB)]["engine_cap"] is None
+
+
+def test_an_on_demand_name_waits_without_blocking_and_subscribes_on_its_feed():
+    eng = engine()
+    s = deferred_strategy(watch=1, feed="sip", protect=False)
+    s.load_delay = 3 * SECOND
+    run(eng, s, ranker(rank((BBB, "0.4"), (AAA, "0.2"))), tape(BBB, RISING))
+    eng.dispose()
+    assert [instrument for instrument, _ in s.asked] == [BBB]
+    assert len(s.steps) >= 4 and all(b - a == SECOND for a, b in pairwise(s.steps[:4]))
+    assert s.subscriptions[:3] == [
+        ("quotes", BBB, {"feed": "sip"}),
+        ("trades", BBB, {"feed": "sip"}),
+        ("bars", BBB, None),
+    ]
+    assert AAA not in s.opened_slots
+    assert s.slots[BBB].subscribed_ns >= s.asked[0][1] + 3 * SECOND
+
+
+@pytest.mark.parametrize("answer", ["unknown asset", "timeout"])
+def test_an_on_demand_instrument_failure_is_named_once_and_never_qualifies(answer):
+    eng = engine()
+    s = deferred_strategy(watch=1)
+    if answer == "timeout":
+        s.load_delay = None
+    else:
+        s.load_failure = answer
+    orders = run(eng, s, ranker(rank((BBB, "0.4"))), tape(BBB, RISING))
+    eng.dispose()
+    assert len(s.asked) == 1 and not orders and BBB not in s.opened_slots
+    assert any(str(BBB) in why and answer in why for why in s.record()["dropped"])
+
+
+def test_on_demand_registered_names_with_no_history_are_passed_over_by_name():
+    eng = engine()
+    s = deferred_strategy(entry_arm="registered", watch=1)
+    orders = run(eng, s, ranker(rank((BBB, "0.4"))), tape(BBB, RISING))
+    eng.dispose()
+    assert s.asked and not orders and BBB in s.opened_slots
+    assert any(str(BBB) in why and "context" in why for why in s.record()["dropped"])
+    assert BBB not in s.entry_contexts
+
+
+def test_on_demand_requests_are_bounded_in_a_rolling_minute_and_counted():
+    eng = engine()
+    s = deferred_strategy(watch=mover.RANK_MOST)
+    s.load_failure = "unknown asset"
+    generations = [
+        rank(*[(InstrumentId.from_str(f"N{generation:02}{i:02}.ALPACA"), "0.4") for i in range(20)])
+        for generation in range(3)
+    ]
+    run(
+        eng,
+        s,
+        ranker(generations[0], values={1: generations[1], 2: generations[2]}),
+        tape(AAA, [10.0] * 4),
+    )
+    eng.dispose()
+    assert len(s.asked) > mover.RANK_MOST
+    times = [when for _, when in s.asked]
+    assert max(sum(start <= when <= start + MINUTE for when in times) for start in times) <= 20
+    assert len({instrument for instrument, _ in s.asked}) == len(s.asked)
+    assert s.record()["instrument_requests"] == len(s.asked)
+
+
+def test_on_demand_requests_reserve_retries_and_include_startup_request_traffic(monkeypatch):
+    monkeypatch.setattr(mover, "requests_sent", lambda: 138)
+    eng = engine()
+    s = deferred_strategy(watch=1)
+    run(eng, s, ranker(rank((BBB, "0.4"))), tape(AAA, [10.0, 10.0]))
+    eng.dispose()
+    assert not s.asked
+    assert any(str(BBB) in why and "request" in why for why in s.record()["dropped"])
+
+
 # --- the contract's small parts ---------------------------------------------------------------------
 
 
