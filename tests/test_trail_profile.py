@@ -1,0 +1,442 @@
+"""The owner's T5 profile contract, using synthetic minute bars and local temporary catalogs only."""
+
+from __future__ import annotations
+
+import importlib
+import json
+from datetime import date
+from datetime import datetime
+from datetime import time
+from datetime import timedelta
+
+import pytest
+from nautilus_trader.model import Bar
+from nautilus_trader.model import BarType
+from nautilus_trader.persistence import ParquetDataCatalog
+
+from canon_trading import history_load
+from canon_trading import movers_rank
+from canon_trading.bars_to_catalog import FEED_FILE
+
+DAY = date(2026, 10, 15)
+AS_OF = date(2026, 10, 16)
+
+
+def writer():
+    return importlib.import_module("canon_trading.trail_profile")
+
+
+def minute(equity, day, clock, high, low, close):
+    start = movers_rank.ny_ns(day, clock)
+    return Bar(
+        bar_type=BarType.from_str(f"{equity.id}-1-MINUTE-LAST-EXTERNAL"),
+        open=equity.make_price(close),
+        high=equity.make_price(high),
+        low=equity.make_price(low),
+        close=equity.make_price(close),
+        volume=equity.make_qty(100),
+        ts_event=start,
+        ts_init=start + 60_000_000_000,
+    )
+
+
+def bars(equity, prices, day=DAY, first=time(4)):
+    start = datetime.combine(day, first)
+    return [
+        minute(
+            equity,
+            (start + timedelta(minutes=i)).date(),
+            (start + timedelta(minutes=i)).time(),
+            *values,
+        )
+        for i, values in enumerate(prices)
+    ]
+
+
+def test_true_range_uses_previous_close_including_gaps(alpaca_bars):
+    p = writer()
+    equity = alpaca_bars.equity()
+    sample = bars(equity, [(100, 100, 100), (112, 108, 110), (102, 98, 100)])
+    result = p.segment_profile({DAY: sample}, as_of=AS_OF)[32]
+    assert result["bars"] == 3 and result["sessions"] == 1
+    assert result["true_range"]["count"] == 2  # first bar has no previous close
+    assert p.true_range_fraction(sample[1], 100) == pytest.approx(0.12)
+    assert p.true_range_fraction(sample[2], 110) == pytest.approx(12 / 110)
+
+
+def test_percentiles_are_inclusive_linear_interpolation():
+    assert writer().percentiles([1, 2, 3, 4, 5]) == {
+        "median": 3,
+        "p75": 4,
+        "p90": 4.6,
+    }
+
+
+def test_completed_rising_run_counts_its_largest_close_to_low_dip(alpaca_bars):
+    p = writer()
+    equity = alpaca_bars.equity()
+    # Anchor 100, rise to 110, dip to 103/close 105, then a high above 111.
+    sample = bars(equity, [(100, 100, 100), (111, 100, 110), (109, 103, 105), (112, 106, 111)])
+    result = p.segment_profile({DAY: sample}, as_of=AS_OF)[32]
+    assert result["pullback"]["count"] == 1
+    assert p.pullback_samples(sample) == [(3, pytest.approx(7 / 110))]
+
+
+@pytest.mark.parametrize("last", [(110, 104, 108), (109, 98, 99)])
+def test_a_dip_without_a_new_high_is_not_counted(alpaca_bars, last):
+    p = writer()
+    sample = bars(alpaca_bars.equity(), [(100, 100, 100), (111, 100, 110), (109, 103, 105), last])
+    assert p.pullback_samples(sample) == []
+
+
+def test_pullback_uses_running_close_peak_and_previous_close_basis(alpaca_bars):
+    sample = bars(
+        alpaca_bars.equity(),
+        [(100, 100, 100), (111, 100, 110), (109, 103, 105), (108, 102, 104), (112, 106, 111)],
+    )
+    assert writer().pullback_samples(sample) == [(4, pytest.approx(8 / 105))]
+
+
+def test_thin_has_no_borrowed_or_smoothed_values(alpaca_bars):
+    p = writer()
+    sample = bars(alpaca_bars.equity(), [(100, 100, 100), (102, 99, 101)])
+    rows = p.segment_profile({DAY: sample}, as_of=AS_OF)
+    assert p.MIN_SAMPLES > 2
+    assert rows[32]["thin"] is True
+    assert rows[32]["true_range"] == {
+        "count": 1,
+        "thin": True,
+        "median": None,
+        "p75": None,
+        "p90": None,
+    }
+    assert rows[33]["bars"] == rows[33]["sessions"] == 0
+    assert rows[33]["true_range"]["median"] is None
+
+
+def test_statistics_appear_at_the_named_minimum(alpaca_bars):
+    p = writer()
+    equity = alpaca_bars.equity()
+    days = [DAY - timedelta(days=i) for i in range(p.MIN_SAMPLES)]
+    sample = {day: bars(equity, [(100, 100, 100), (102, 99, 101)], day) for day in days}
+    row = p.segment_profile(sample, as_of=AS_OF)[32]
+    assert row["true_range"]["thin"] is False
+    assert row["true_range"]["median"] == pytest.approx(0.03)
+    assert row["sessions"] == p.MIN_SAMPLES
+
+
+def test_clock_has_96_segments_and_a_new_high_belongs_to_its_confirmation(alpaca_bars):
+    p = writer()
+    sample = bars(
+        alpaca_bars.equity(),
+        [(100, 100, 100), (111, 100, 110), (109, 103, 105), (112, 106, 111)],
+        first=time(4, 12),
+    )
+    rows = p.segment_profile({DAY: sample}, as_of=AS_OF)
+    assert len(rows) == 96
+    assert rows[32]["pullback"]["count"] == 0
+    assert rows[33]["pullback"]["count"] == 1
+    assert rows[32]["bars"] == 3 and rows[33]["bars"] == 1
+
+
+def test_sessions_reset_previous_close_and_runs(alpaca_bars):
+    p = writer()
+    equity = alpaca_bars.equity()
+    earlier = DAY - timedelta(days=1)
+    history = {
+        earlier: bars(equity, [(100, 100, 100), (111, 100, 110), (109, 103, 105)], earlier),
+        DAY: bars(equity, [(112, 106, 111)]),
+    }
+    row = p.segment_profile(history, as_of=AS_OF)[32]
+    assert row["bars"] == 4 and row["sessions"] == 2
+    assert row["true_range"]["count"] == 2 and row["pullback"]["count"] == 0
+
+
+def test_holdout_date_outside_recent_window_is_refused_before_opening_catalog(tmp_path):
+    p = writer()
+    days = [date(2026, 10, 16) + timedelta(days=i) for i in range(p.RECENT_SESSIONS + 1)]
+    with pytest.raises(history_load.HistoryStopped, match="holdout.*2026-10-16"):
+        p.build_profile(
+            sessions=days,
+            as_of=days[-1] + timedelta(days=1),
+            recent_root=tmp_path / "absent",
+            long_root=tmp_path / "absent-dev",
+            overnight_root=tmp_path / "absent-boats",
+            baseline_dir=tmp_path / "out",
+        )
+    assert not (tmp_path / "absent").exists()
+
+
+def test_recent_window_exception_is_explicit_in_both_sets():
+    p = writer()
+    days = [DAY, AS_OF, date(2026, 10, 19)]
+    selected = p.select_sessions(days, as_of=date(2026, 10, 20))
+    assert selected == {"recent": tuple(days), "long": tuple(days)}
+
+
+def test_as_of_excludes_its_date_and_all_later_sessions(alpaca_bars):
+    p = writer()
+    equity = alpaca_bars.equity()
+    days = [DAY, AS_OF, date(2026, 10, 19)]
+    selected = p.select_sessions(days, as_of=AS_OF)
+    assert selected == {"recent": (DAY,), "long": (DAY,)}
+    row = p.segment_profile(
+        {day: bars(equity, [(100, 100, 100), (102, 99, 101)], day) for day in days}, as_of=AS_OF
+    )[32]
+    assert row["sessions"] == 1 and row["bars"] == 2
+
+
+def catalogs(tmp_path, alpaca_bars):
+    equity = alpaca_bars.equity()
+    roots = {}
+    for name, feed in (("recent", "sip"), ("long", "sip"), ("overnight", "boats")):
+        root = tmp_path / name
+        root.mkdir()
+        (root / FEED_FILE).write_text(feed + "\n", encoding="ascii")
+        catalog = ParquetDataCatalog(str(root))
+        catalog.write_instruments([equity])
+        for day in (DAY, AS_OF):
+            sample = bars(equity, [(100, 100, 100), (102, 99, 101)], day)
+            if name == "overnight":
+                sample = bars(equity, [(99, 99, 99)], day - timedelta(days=1), time(20))
+            catalog.write_bars(sample)
+        roots[name] = root
+    return roots
+
+
+def build(tmp_path, alpaca_bars):
+    roots = catalogs(tmp_path, alpaca_bars)
+    return writer().build_profile(
+        sessions=[DAY, AS_OF],
+        as_of=AS_OF,
+        recent_root=roots["recent"],
+        long_root=roots["long"],
+        overnight_root=roots["overnight"],
+        baseline_dir=tmp_path / "out",
+    )
+
+
+def test_catalog_round_trip_header_and_no_double_count(tmp_path, alpaca_bars):
+    p = writer()
+    path = build(tmp_path, alpaca_bars)
+    assert path == tmp_path / "out" / "trail-profile-v1.json"
+    doc = p.read_profile(path, as_of=AS_OF)
+    assert doc["format"] == "canon-trail-profile/1"
+    assert doc["as_of"] == "2026-10-16"
+    assert doc["sessions"] == {"recent": ["2026-10-15"], "long": ["2026-10-15"]}
+    assert doc["feeds"] == ["sip", "boats"]
+    assert doc["roots"]["recent"] == [str(tmp_path / "recent"), str(tmp_path / "overnight")]
+    assert doc["roots"]["long"] == [
+        str(tmp_path / "long"),
+        str(tmp_path / "recent"),
+        str(tmp_path / "overnight"),
+    ]
+    assert doc["price_basis"] == "previous close"
+    assert doc["true_range_definition"] == p.TRUE_RANGE_DEFINITION
+    assert doc["pullback_definition"] == p.PULLBACK_DEFINITION
+    assert doc["thin_rule"]["minimum_samples"] == p.MIN_SAMPLES
+    assert doc["thin_rule"]["calibration"] == "UNCALIBRATED"
+    assert doc["segments"] == 96 and doc["segment_minutes"] == 15
+    assert doc["part_start"] == "20:00" and doc["timezone"] == "America/New_York"
+    assert datetime.fromisoformat(doc["written_at"]).tzinfo is not None
+    for name in ("recent", "long"):
+        rows = doc["symbols"]["AAPL"][name]
+        assert sum(row["bars"] for row in rows) == 3
+        assert rows[0]["bars"] == 1
+        assert rows[32]["bars"] == 2 and rows[32]["true_range"]["count"] == 2
+
+
+def test_reader_refuses_unmarked_file_by_name(tmp_path):
+    path = tmp_path / "unmarked.json"
+    path.write_text('{"symbols": {}}')
+    with pytest.raises(history_load.HistoryStopped, match="unmarked.json.*header"):
+        writer().read_profile(path, as_of=AS_OF)
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "format",
+        "as_of",
+        "written_at",
+        "sessions",
+        "roots",
+        "feeds",
+        "price_basis",
+        "true_range_definition",
+        "pullback_definition",
+        "thin_rule",
+        "segments",
+        "segment_minutes",
+        "part_start",
+        "timezone",
+        "holdout_rule",
+        "percentile_method",
+    ],
+)
+def test_reader_requires_each_header_field(tmp_path, alpaca_bars, key):
+    p = writer()
+    path = build(tmp_path, alpaca_bars)
+    doc = json.loads(path.read_text())
+    del doc[key]
+    path.write_text(json.dumps(doc))
+    with pytest.raises(history_load.HistoryStopped, match="header"):
+        p.read_profile(path, as_of=AS_OF)
+
+
+def test_reader_refuses_a_profile_from_the_replays_future(tmp_path, alpaca_bars):
+    path = build(tmp_path, alpaca_bars)
+    with pytest.raises(history_load.HistoryStopped, match="as_of.*2026-10-16"):
+        writer().read_profile(path, as_of=DAY)
+
+
+def test_cli_uses_supplied_roots_sessions_and_as_of(tmp_path, alpaca_bars):
+    roots = catalogs(tmp_path, alpaca_bars)
+    calendar = tmp_path / "sessions.txt"
+    calendar.write_text("# explicit calendar\n2026-10-15\n2026-10-16\n")
+    assert (
+        writer().main(
+            [
+                "--sessions-file",
+                str(calendar),
+                "--as-of",
+                str(AS_OF),
+                "--recent-root",
+                str(roots["recent"]),
+                "--long-root",
+                str(roots["long"]),
+                "--overnight-root",
+                str(roots["overnight"]),
+                "--baseline-dir",
+                str(tmp_path / "out"),
+            ]
+        )
+        == 0
+    )
+    assert writer().read_profile(tmp_path / "out" / "trail-profile-v1.json", as_of=AS_OF)
+
+
+def test_default_as_of_is_next_unfinished_supplied_session():
+    p = writer()
+    sessions = [DAY, AS_OF, date(2026, 10, 19)]
+    now = datetime(2026, 10, 16, 21, tzinfo=movers_rank.NEW_YORK)
+    assert p.coming_session(sessions, now=now) == date(2026, 10, 19)
+    now = datetime(2026, 10, 16, 3, tzinfo=movers_rank.NEW_YORK)
+    assert p.coming_session(sessions, now=now) == AS_OF
+
+
+def test_recent_never_borrows_a_bar_from_dev(tmp_path, alpaca_bars):
+    p = writer()
+    roots = catalogs(tmp_path, alpaca_bars)
+    equity = alpaca_bars.equity()
+    # An extra dev bar within recent's dates is legitimate in long alone.
+    ParquetDataCatalog(str(roots["long"])).write_bars(
+        [minute(equity, DAY, time(4, 2), 103, 100, 102)]
+    )
+    path = p.build_profile(
+        sessions=[DAY, AS_OF],
+        as_of=AS_OF,
+        recent_root=roots["recent"],
+        long_root=roots["long"],
+        overnight_root=roots["overnight"],
+        baseline_dir=tmp_path / "out",
+    )
+    symbol = p.read_profile(path, as_of=AS_OF)["symbols"]["AAPL"]
+    assert symbol["recent"][32]["bars"] == 2
+    assert symbol["long"][32]["bars"] == 3
+
+
+def test_queries_never_reach_as_of_or_dev_holdout(tmp_path, alpaca_bars, monkeypatch):
+    p = writer()
+    roots = catalogs(tmp_path, alpaca_bars)
+    original = p.ParquetDataCatalog
+    original_read = p._read_bars
+    seen = []
+    paths = {}
+
+    def catalog(root):
+        instance = original(root)
+        paths[id(instance)] = root
+        return instance
+
+    def read(instance, identifiers, day, feed):
+        seen.append((paths[id(instance)], day, feed))
+        return original_read(instance, identifiers, day, feed)
+
+    monkeypatch.setattr(p, "ParquetDataCatalog", catalog)
+    monkeypatch.setattr(p, "_read_bars", read)
+    target = date(2026, 10, 19)
+    path = p.build_profile(
+        sessions=[DAY, AS_OF, target],
+        as_of=target,
+        recent_root=roots["recent"],
+        long_root=roots["long"],
+        overnight_root=roots["overnight"],
+        baseline_dir=tmp_path / "out",
+    )
+    assert all(day < target for _, day, _ in seen)
+    assert all(day <= DAY for root, day, _ in seen if root == str(roots["long"]))
+    assert (str(roots["recent"]), AS_OF, "sip") in seen
+    assert p.read_profile(path, as_of=target)["sessions"]["long"] == [str(DAY), str(AS_OF)]
+
+
+def test_atomic_replace_failure_keeps_previous_profile(tmp_path, alpaca_bars, monkeypatch):
+    from canon_trading import rank_shared
+
+    p = writer()
+    roots = catalogs(tmp_path, alpaca_bars)
+    output = tmp_path / "out"
+    output.mkdir()
+    path = output / "trail-profile-v1.json"
+    path.write_text("previous")
+
+    def fail(*args):
+        raise OSError("synthetic replace failure")
+
+    monkeypatch.setattr(rank_shared.os, "replace", fail)
+    with pytest.raises(history_load.HistoryStopped, match="synthetic replace failure"):
+        p.build_profile(
+            sessions=[DAY, AS_OF],
+            as_of=AS_OF,
+            recent_root=roots["recent"],
+            long_root=roots["long"],
+            overnight_root=roots["overnight"],
+            baseline_dir=output,
+        )
+    assert path.read_text() == "previous"
+    assert list(output.iterdir()) == [path]
+
+
+def test_pullback_statistics_at_minimum_are_raw_depths(alpaca_bars):
+    p = writer()
+    equity = alpaca_bars.equity()
+    history = {
+        day: bars(equity, [(100, 100, 100), (111, 100, 110), (109, 103, 105), (112, 106, 111)], day)
+        for day in (DAY - timedelta(days=i) for i in range(p.MIN_SAMPLES))
+    }
+    row = p.segment_profile(history, as_of=AS_OF)[32]
+    assert row["thin"] is False
+    assert row["pullback"]["count"] == p.MIN_SAMPLES
+    for key in ("median", "p75", "p90"):
+        assert row["pullback"][key] == pytest.approx(7 / 110)
+
+
+@pytest.mark.parametrize(
+    "corruption", ["future-session", "borrowed-value", "wrong-basis", "bad-thin"]
+)
+def test_reader_checks_values_not_only_presence(tmp_path, alpaca_bars, corruption):
+    p = writer()
+    path = build(tmp_path, alpaca_bars)
+    doc = json.loads(path.read_text())
+    row = doc["symbols"]["AAPL"]["recent"][32]
+    if corruption == "future-session":
+        doc["sessions"]["long"].append(str(AS_OF))
+    elif corruption == "borrowed-value":
+        row["true_range"]["median"] = 0.1
+    elif corruption == "wrong-basis":
+        doc["price_basis"] = "current close"
+    else:
+        row["thin"] = False
+    path.write_text(json.dumps(doc))
+    with pytest.raises(history_load.HistoryStopped, match="header/data refused"):
+        p.read_profile(path, as_of=AS_OF)
