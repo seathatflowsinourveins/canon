@@ -591,11 +591,11 @@ data "$@"
 # account's pair may serve it (ADR 0093, the decision of 2026-11-11). It runs canon_trading.history_load in
 # data-only mode (ADR 0070): every request but GET is refused before it is sent. It places nothing and opens
 # no stream, so it takes no account's lock and no stream lock. The module paces its GETs by ADR 0093's
-# row, stops by name at a 429, names `sip` on every request and never falls back to another feed. The run is
+# row, stops by name at a 429, names `sip` for bars/trades or `iex` for quotes and never falls back. The run is
 # held to `deadline` seconds by timeout(1) -s KILL. Trades use the adapter's historical prints fetch and
 # the catalog's trade-tick writer, with the same catalog lock, feed marker and pace as bars.
 [tasks."paper:history"]
-description = "Load historical sip bars or trades for listed symbols with one paper account's pair, GET only, paced; or write a feed's nightly movers baseline from the catalog"
+description = "Load historical sip bars or trades, or IEX quotes, for listed symbols with one paper account's pair, GET only, paced; or write a feed's nightly movers baseline from the catalog"
 shell = "bash -c"
 timeout = "6h"
 usage = '''
@@ -615,11 +615,11 @@ flag "--baseline-dir <root>" help="baseline mode: write <feed>.json in this dire
 flag "--symbols <symbols>" help="symbols, comma-separated (or --symbols-file)"
 flag "--symbols-file <file>" help="a file of symbols, one a line"
 flag "--start <start>" help="ISO 8601 with a time zone; required"
-flag "--end <end>" help="ISO 8601 with a time zone; required, at least 15 minutes (trades or 1-MINUTE bars) or a day (1-DAY bars) before now"
+flag "--end <end>" help="ISO 8601 with a time zone; required, at least 15 minutes (trades, quotes or 1-MINUTE bars) or a day (1-DAY bars) before now"
 flag "--bars <bars>" help="1-MINUTE, 1-DAY or both, comma-separated; default both"
 flag "--catalog <root>" help="the catalog root, never under ledger/; default catalog, or catalog/<feed> in baseline mode"
-flag "--data <kind>" help="bars (the default) or individual trade prints, on sip (ADR 0093's pace and catalog lock); --bars applies only to bars" {
-  choices "bars" "trades"
+flag "--data <kind>" help="bars (the default) or individual trade prints, on sip (ADR 0093's pace and catalog lock), or IEX quotes from 2025-11-04 New York on over at most 90 days (ADR 0066); --bars applies only to bars" {
+  choices "bars" "trades" "quotes"
 }
 '''
 run = '''

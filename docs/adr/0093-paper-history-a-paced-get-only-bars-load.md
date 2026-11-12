@@ -5,7 +5,7 @@ decision-makers: the lead for the pairs the task may read (2026-11-11); master o
 review-by: 2026-12-11
 ---
 
-# paper:history: a paced, GET-only load of historical `sip` bars and trade prints into the catalog
+# paper:history: a paced, GET-only load of SIP bars and trades or IEX quotes into the catalog
 
 ## Context and Problem Statement
 
@@ -97,7 +97,7 @@ repository (UNVERIFIED here).
    one account do not share a rate limiter. Their combined rate is UNCALIBRATED, and a 429 stops each
    affected run by name.
 
-   Trades (amended 2026-11-11, clause 9) pace every actual GET through requests' documented transport
+   Trades and quotes (amended 2026-11-11, clauses 9 and 10) pace every actual GET through requests' documented transport
    adapter hook, including pages and SDK 504 retries. Each send starts at least `60 / 150` seconds
    after the previous actual send; idle time and retry backoffs earn no later burst. The wrapper
    delegates to the existing GET-only timeout/counter adapters and restores them when the load exits.
@@ -122,7 +122,7 @@ repository (UNVERIFIED here).
    name (exit 4). A 504 is still retried three times, as alpaca-py does it, and each retry is
    counted. The adapter's execution client is the precedent: it ends an order command at its first
    error (`execution.py`, `end_at_first_error`), as an `APIError` on any error rather than a 429 alone. The counter's 429 count is checked after each request as well.
-   For bars these retries remain unpaced; trades apply the per-send spacing of clause 5 (2026-11-11).
+   For bars these retries remain unpaced; trades and quotes apply the per-send spacing of clause 5 (2026-11-11).
 7. **Failures.** A refused request, a 403 on `sip` included, stops the run by name, with the HTTP
    status. Nothing falls back to another feed. Whatever an earlier request wrote stays, and a rerun asks
    only for what is missing. Client setup errors (missing credentials, timeout or GET-only session
@@ -161,6 +161,50 @@ repository (UNVERIFIED here).
    without filtering by condition flags; `aggressor_side` is `NO_AGGRESSOR`, with no side inferred.
    A real SIP load of one named symbol over one night, then a zero-request rerun, remains for the
    Claude lane (UNVERIFIED here).
+
+10. **Quotes, amended 2026-11-11.** `--data quotes` now loads historical IEX quotes for `--symbols`
+    or `--symbols-file`, using alpaca-py's `get_stock_quotes(StockQuotesRequest)` / `QuoteSet` and the
+    adapter's `parse_quote`, then NautilusTrader's `write_quote_ticks(ticks, start, end)`. This extends
+    the typed-writer choice here to ADR 0066's quotes. The same existing-root/definition preflight,
+    catalog lock, GET-only transport, 150 data GETs/minute and zero trading GETs, first-429 and
+    refused-feed stops apply. The root is IEX: a SIP root is refused by name; feeds never mix.
+
+    ADR 0066's bounds are enforced by name: IEX only, start in 2025 or later, at most 90 elapsed days
+    as a conservative quarter ceiling. Its start-after size-unit option further restricts starts to
+    2025-11-04 00:00 New York or later, excluding the entire cutover day. Tiny probes are allowed. The end
+    must be the prints' publication delay before now, since covered is covered for good and how soon the
+    historical store holds an IEX quote is UNVERIFIED. Each symbol's missing intervals use `NautilusDataType.QuoteTick`
+    and instrument ID; pieces are at most one hour, the endpoint's microsecond joining the last, fetched in ascending pages with each actual send
+    paced, including SDK 504 retries. A limit of 100,001 detects more than 100,000 quotes in a piece,
+    which is then loaded in parts as prints are, each cut before its answer's last microsecond and
+    covered to the end of the bucket before it; more than 100,000 quotes in one microsecond stops by name.
+    Empty or dropped-only pieces write no coverage. Reruns ask only for missing intervals. Every
+    piece also has a 1,000-successful-page ceiling and repeated-token refusal through requests'
+    response hook; incomplete history stops before writing, including on empty/sparse pages.
+    504 attempts retain their retry policy and per-send pacing and do not count as successful pages.
+
+    Conversion follows the adapter: `ts_init = ts_event`; one-sided quotes and finer-than-instrument
+    prices are dropped and counted, other malformed quotes stop. The SDK truncates nanoseconds to
+    microseconds, losing sub-microsecond timestamp distinctions. Request and coverage bounds expand
+    to whole microsecond buckets: start rounded down, end rounded up to the last nanosecond of its
+    bucket. The requests sent cover whole boundary buckets, which prevents hourly or incremental losses.
+    Each piece asks to the first nanosecond after its last bucket and keeps only its own quotes, so it
+    does not rely on Alpaca comparing the end at nanosecond precision (UNVERIFIED). Quotes
+    sharing a truncated timestamp stay separate. The `QuoteTick` drops conditions (`c`), bid/ask
+    exchanges (`bx`, `ax`) and tape (`z`), without filtering by conditions. Sizes stay in shares,
+    with all earlier starts and the entire 2025-11-03 cutover day refused (ADR 0066, citing
+    https://docs.alpaca.markets/us/reference/stockquotes-1.md). That page, fetched again on
+    2026-11-12, gives the calendar date; the exact intraday switch and per-symbol historical lot sizes
+    remain UNVERIFIED. No lot-size multiplier is assumed. Under the catalog lock all quote
+    identifiers, including unrequested ones, are checked for earlier or non-bucket-aligned coverage;
+    refuse such legacy roots and ask for a separate clean root. CLI quote bounds are checked before
+    client setup (invalid CLI bounds exit 2). The adapter itself is unchanged. Offline stand-ins exercise this
+    path in `tests/test_quotes_load.py`. One paper load ran on 2026-11-11 with account A's pair: PLCE's
+    IEX quotes for that day's regular session, 2,156 quotes in seven hourly pieces, and a rerun that sent
+    no request. A second, on 2026-11-12, loaded the whole hour 2026-11-11 14:30Z to 15:30Z: SPY over the
+    row bound in seven parts (642,672 quotes, 71 requests), PLCE in one piece holding the endpoint's
+    microsecond, and its rerun sent no request
+    (`catalog/README.md`). The pace's calibration remains UNVERIFIED.
 
 ### Consequences
 
@@ -247,6 +291,22 @@ DeepSeek Harness's review of `0bcca05` found that the record named the wrong com
 the gap's nanosecond, since the pinned stack keeps it; the text is corrected.
 
 ## Evidence
+
+Quotes amendment, source check 2026-11-11: cached alpaca-py `c42add7c0a70`
+`alpaca/data/historical/stock.py` (`get_stock_quotes`, page size 10,000), `alpaca/common/rest.py`
+(`_get_marketdata`, total limit and page tokens), `alpaca/data/requests.py` (`StockQuotesRequest`),
+`alpaca/data/models/quotes.py` (`QuoteSet` / `Quote`) and `alpaca/data/mappings.py` (`QUOTE_MAPPING`);
+NautilusTrader `d53849b216e2` `python/nautilus_trader/persistence/__init__.pyi` (`write_quote_ticks`,
+coverage queries) and `crates/model/src/data/quote.rs` (`QuoteTick` fields); the adapter's
+`_request_quotes` and `parse_quote`. Read, without changing or running upstream sources.
+The size-unit requirement and its measured/UNVERIFIED boundary are ADR 0066's 2026-11-11 confirmation.
+Antigravity's reader verified Alpaca's calendar date from the three REST quote schemas, but not an
+intraday/time-zone boundary or uniform historical lot size. Its four findings were reproduced with
+failing regressions in `tests/test_quotes_load.py`: microsecond boundary losses, historical-unit
+assumptions/root mixing, unbounded quote pagination, and CLI validation after client setup. The fixes
+use the pinned catalog's `list_instruments`/`get_intervals` and inclusive coverage, alpaca-py's
+`Quote.timestamp`/request serialization, and requests `6e83187b8feb` response hooks. No NautilusTrader
+docs-site content was used for this amendment.
 
 Fix-forward source check, 2026-11-11, without network access: cached alpaca-py `c42add7c0a70`
 `get_stock_bars` and `_get_marketdata` (page following, including short pages); NautilusTrader

@@ -628,7 +628,7 @@ def test_main_names_missing_credentials_and_returns_one(
                 "--end",
                 "2026-11-10T15:00:00Z",
                 "--data",
-                "quotes",
+                "news",
             ],
             "invalid choice",
         ),
