@@ -22,7 +22,8 @@ what has no upstream, and in what order does the work start? Nothing here recomm
      a ratio against the symbol's own normal for that time of day, not an amount of dollar volume. A
      stale ranking means no entry.
   2. **Enter early.** Buy the first rising run of the first leg with a limit order, in every session;
-     an extended move only on a pullback and reclaim. Size comes from risk.
+     an extended move only on a pullback and reclaim. Size comes from risk (on paper, replaced 2026-11-11;
+  Paper sizing below).
   3. **Protect.** A sell trigger below the entry, outside the tape's noise, that only rises with the
      high; a gain lock once the gain covers its costs; a breach must persist before the fast sell, a
      limit that chases within a cap. A broker stop is the backstop for an outage only.
@@ -101,7 +102,7 @@ no upstream ships those parts, and none is written here.
 **Starting rows, all UNCALIBRATED**, registered and not argued, with no source claimed for a number
 beyond the owner's practice: every NMS common stock and ADR at any price; entries from 04:00 New York;
 move at least 3%, volume ratio at least 3, trade acceleration at least 1.5; five names at once, two for
-movers; planned risk 1% a trade, capped at 5% of the prior five minutes' dollar volume; limit orders
+movers; planned risk 1% a trade (on paper, replaced 2026-11-11; Paper sizing below), capped at 5% of the prior five minutes' dollar volume; limit orders
 only outside the regular session; the broker stop under 3%.
 
 **The adoption test.** A rule is adopted only when it beats both the incumbent and holding flat at
@@ -125,7 +126,8 @@ the gate counts no round trips, so M3's pre-registration fixes what each term me
   memory for 15 minutes; the screener polled each minute beside it; the score for the top 50; how many
   of the screener's gainers it finds, and how early.
 * **M1.** One mover a window on paper through the window runner's `--strategy` (ADR 0044), its name
-  fixed before the node is built, so gap 2 does not bind it. Sized by `FixedRiskSizer`, protected by the
+  fixed before the node is built, so gap 2 does not bind it. Sized by `FixedRiskSizer` (on paper, replaced 2026-11-11;
+  Paper sizing below), protected by the
   emulated trailing stop-limit, ending flat, in every session. It needs gaps 1 and 3 recorded, the
   window's SPY-only refusal and $1,000 cap replaced (`session_window.py:531`, `paper_node.py:58`), and
   flat checked across the account.
@@ -138,11 +140,42 @@ the gate counts no round trips, so M3's pre-registration fixes what each term me
 M1 and M2 are checks of the stack, as ADR 0068 reads a paper window, not trials: nothing they earn
 enters a ranking.
 
-**The request budget** (ADR 0076, numbered and not yet on `main`; its figures UNVERIFIED here until it
-lands): the engine's checks cost 7 trading-API requests a minute whatever the count of names, one order
-at worst 19 in the regular session and 47 outside it, and a run fails at 100 in any 60 seconds on an
-account that allows 200. With N names each sending one order in a minute, the worst minute is 7 + 19N
-and 7 + 47N:
+**Paper sizing, dated 2026-11-11.** By the owner's decision, 2026-11-11, as the lead (canon-fa) recorded it
+under ADR 0074 rule 1, with the lead's figures of the same evening: the paper accounts carry no risk limit.
+The entry size is the smaller of the account's buying power and its cash at the node's start, divided by the
+slots in use, read again at each start. Cash keeps a margin account's buying power, up to 2x overnight and 4x
+intraday at Alpaca, from sizing an entry above 1x until the margin-account build lands (a Codex build the
+coordinator started on 2026-11-11). The engine's per-order notional cap is the entry times the existing outer
+multiple (`mover_window.OUTER_BOUND_MULTIPLE`, 10), so the sale of a position that rose is never denied (ADR
+0088). The slots are 7 in the regular session and 7 after hours (the lead, 2026-11-11), raised only after two
+paper firings show room, and 7 in pre-market and overnight too, by the same worst-minute count (the lead,
+2026-11-11); going above that count needs two records that agree. What the rule does to `max_shares` and the
+position cap is settled when it is built. One limit: a paper fill takes any size at the quote (Alpaca's paper
+page: "Your order quantity is not checked against the NBBO quantities"), so a size far beyond a name's traded
+volume teaches less than it seems to. The comparison of fills against a replay is where that shows. It is a
+learning note, not a cap. Live is untouched and stays the owner's. This replaces the window's present sizing
+(`mover.py`) on paper; ADR 0091 carries the same text for the window. Not built yet: on 2026-11-11 the window
+sizes by `FixedRiskSizer` at `risk` 0.01 (`mover.py`) under a 500-dollar entry bound
+(`mover_window.ENTRY_NOTIONAL_USD`, applied as `max_shares`) and a 5,000-dollar engine cap.
+
+**Slots measured, dated 2026-11-11.** A reader of the night's instrumented paper windows found the worst count
+of trading-API requests in any 60 seconds of one window at 14 to 15, in the regular session and after hours
+alike, and the two windows of each part agree within one request. The after-hours windows ran
+`SessionMaCross`, not `Mover`, and the runner runs one window at a time under its locks. With 40 of the
+account's 200 a minute held in reserve, floor(160 / 15) = 10. The lead set **7 slots in the regular session
+and 7 after hours** the same evening, a reserve under ADR 0091's 180 and not a risk limit, from a worst-minute
+count per slot this record states separately. Both are conditional: they count one window's peak once per
+slot, no window has run with several names at once, and the first firing that composes several names measures
+it. Under `Mover`'s soft line of 140 in one process the same arithmetic gives 9. Pre-market and overnight had
+no instrumented round trip, so their slots are not measured; the per-order model below gives 3 names outside
+the regular session at 160 (1 at the old 100), and the lead set them at 7 by the same count.
+
+**The request budget, historical as of 2026-11-11**: a `Mover` window now fails at 180, not the 100 below
+(`session_window.REQUEST_CEILING`; ADR 0091's request budget). The per-order figures stay UNVERIFIED. As
+first written (ADR 0076, numbered and not yet on `main`; its figures UNVERIFIED here until it lands): the
+engine's checks cost 7 trading-API requests a minute whatever the count of names, one order at worst 19 in
+the regular session and 47 outside it, and a run fails at 100 in any 60 seconds on an account that allows
+200. With N names each sending one order in a minute, the worst minute is 7 + 19N and 7 + 47N:
 
 | N | 1 | 2 | 3 | 4 | 5 |
 |---|---|---|---|---|---|
@@ -163,8 +196,8 @@ landed steps stand, and it carries a dated pointer. ADR 0077's quote study is he
   invented.
 * Bad: nothing trades until gaps 1 and 3 are recorded, and whether the practice beats holding is not
   known until M3.
-* Bad: the budget carries four names in the regular session and one outside it until the worst order
-  is smaller.
+* Bad: slots are conditional arithmetic from single-name windows (7 in every part, 2026-11-11); pre-market and
+  overnight have no measured figure of their own.
 
 ### Confirmation
 
@@ -320,3 +353,16 @@ the commit `canon/upstreams.lock.json` records.
   60 seconds; `paper:account windows` afterwards flat.
 * Code review of `Mover` in every part, 2026-11-11: nine findings. The first is recorded in the later
   dated line above; the other eight, and a per-part entry size, are the next round's.
+* A reader's budget report on the night's paper windows, 2026-11-11, its table of slots: the worst
+  rolling 60-second trading count 15 in the regular session and after hours, floor(160 / 15) = 10 with a
+  40-request reserve (the lead set 7 on 2026-11-11), pre-market and overnight not measured; and its
+  finding that the 100-request line here was stale against `REQUEST_CEILING = 180`. Read; its raw window
+  records were not re-read here.
+* https://alpaca.markets/support/usage-limit-api-calls — "currently 200 requests per minute, per account".
+  https://docs.alpaca.markets/us/docs/paper-trading.md — the random partial fills, no market impact or
+  latency slippage, and quantity not checked against the NBBO. https://docs.alpaca.markets/us/docs/margin-and-short-selling.md
+  — buying power up to 2x overnight and 4x intraday on a margin account. Fetched by the evidence-verifier
+  on the sizing edits, 2026-11-11.
+* evidence-verifier on the sizing and slot edits, 2026-11-11: the cap at the entry contradicted ADR 0088,
+  the window sizes by `FixedRiskSizer` under the 500, the after-hours peaks came from `SessionMaCross`,
+  and four lines were stale. Corrected above, with the lead's figures of the same evening.
