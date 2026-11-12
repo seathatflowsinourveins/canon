@@ -15,6 +15,23 @@ joined and the task ended in `_disconnect`, each wait bounded by a deadline on t
 task drain at disconnect; a wait that runs out fails the disconnect, logged with its reason. Hooks not overridden here
 raise `NotImplementedError`.
 
+Reduce-only follows the send-or-reject contract in `docs/concepts/adapters.md` at
+`nautilus-trader@d53849b216e2`: an equivalent enforcing venue instruction may replace the literal flag.
+`reduce_only_sells` is false by default: every reduce-only order is denied before transport with
+`reduce-only is not supported`. With it true, a reduce-only SELL sends
+`position_intent=PositionIntent.SELL_TO_CLOSE`; a reduce-only BUY is denied before transport. This
+field is declared by the pinned alpaca-py's `OrderRequest` (`alpaca/trading/requests.py:388`) and inherited
+by every supported request type; the enum value is in `alpaca/trading/enums.py:598`. Alpaca's order
+schema describes position_intent (https://docs.alpaca.markets/us/reference/postorder.md). No account
+configuration is read or retained. `sell_to_close_on_long_exits`, off by default, also sets that field
+for an ordinary SELL when the cache's net position for this account and instrument is long
+(`ClientCache.positions_open`, `Position.signed_qty`, in the pinned model/live stubs). It changes no
+Nautilus reduce-only flag or strategy default. Both settings act only on the order types in
+`sell_to_close_order_types`, by default a limit, a stop and a stop-limit: the types for which a paper run
+shows Alpaca refusing the field when the sell would open a short (ADR 0111's Confirmation). A market
+order is not among them until that is shown for it: with `reduce_only_sells` a reduce-only market SELL is
+denied before transport, and with `sell_to_close_on_long_exits` a market SELL of a long stays a plain sell.
+
 Modify (ADR 0042) rests on Alpaca's "Replace Order by ID"
 (https://docs.alpaca.markets/us/reference/patchorderbyorderid-1.md) and on a paper observation of
 2026-11-10, 3 of 3 runs, for what that page does not state. The PATCH answer is "The new Order object with
@@ -122,6 +139,21 @@ kept when the live order's `filled_qty`, and its newest listed activity's `cum_q
 them under `FILLED_READING`, the reading observed on paper (ADR 0042); when they show it counts only its
 own, which paper did not show, its own fills are kept and the earlier ones left to the engine.
 
+With `report_external_trailing_stops`, off by default, an outside Alpaca `trailing_stop` maps to a
+NautilusTrader `TRAILING_STOP_MARKET` report only; submitting one is still denied. With the setting off
+an open one fails start-up by name, as any open order this slice does not map does: an outside order is
+never taken on unasked. Alpaca's trailing-stop fields (`trail_price`, `trail_percent`,
+`stop_price`, https://docs.alpaca.markets/us/docs/orders-at-alpaca.md, "Trailing Stop Orders") give its
+offset and current trigger. `trail_price` is a PRICE offset; `trail_percent` is multiplied by 100 for
+BASIS_POINTS (NautilusTrader's pinned `docs/concepts/orders/index.md`, "Trailing offset type": 100 is
+1%). `OrderStatusReport`'s trailing_offset, trailing_offset_type, trigger_price and trigger_type are
+documented in `python/nautilus_trader/model/__init__.pyi` at the pin. A missing or unrepresentable
+advisory stop_price stays None (one warning per order for an unrepresentable value): the trailing model
+permits a trigger not materialized yet; no activation price or high-water mark is
+required (`docs/concepts/orders/trailing_stop_market.md`). Exactly one positive finite trailing offset
+is required, else the report fails by name, as any unmapped open order does. This mapping adds no
+trailing order command or local trailing logic, and no stream reports of a changing high-water mark.
+
 Venue side, alpaca-py 0.45.0:
 
 * `TradingClient(api_key, secret_key, paper=True)` for `submit_order`, `cancel_order_by_id`,
@@ -152,8 +184,12 @@ Known limits:
   "Extended hours"). The stop price and a stop-limit's limit price follow the sub-penny rule ("Sub-penny
   increments for stop orders"). Alpaca documents no status or trade update for a stop's election, so no
   `OrderTriggered` is generated: an elected stop-limit stays `ACCEPTED` until it fills or ends. Trailing
-  stops stay denied: their stop price moves with Alpaca's high-water mark and no update reports it.
-* Post-only, reduce-only, quote-quantity, display quantity (on any order type, a stop-market's
+  stop submissions stay denied: their stop price moves with Alpaca's high-water mark and no update reports it.
+* Reduce-only orders are denied by default. Opting into `reduce_only_sells` sends a reduce-only SELL
+  with `position_intent=sell_to_close`; BUY is always denied. No account configuration is read. The
+  independent optional long-exit intent setting adds the same field to ordinary closing SELLs without
+  setting their Nautilus reduce-only flag (sources and cache definition above).
+* Post-only, quote-quantity, display quantity (on any order type, a stop-market's
   included), contingent orders and order lists are denied or not implemented.
 * `QueryOrder`, which NautilusTrader's in-flight and open-order checks send, is answered with the order's
   status report, as upstream's Binance spot, Bybit, Coinbase, Kraken spot and OKX adapters answer it
@@ -190,7 +226,20 @@ Known limits:
   define. A fill without one is not emitted; it is logged, and the client's read of the order's fill
   activities brings it (`_catch_up`).
 * A fill price is kept exactly, at whatever precision Alpaca sends; the paper example has seven decimals.
-* Trade updates for orders this node does not hold are logged and dropped; reconciliation creates them.
+* Trade updates for orders this node does not hold are logged and dropped by default, without the venue
+  order ID. With `report_external_orders=True`, `_send_report` sends mapped status and companion fills
+  through the adapter guide's `_handle_report(report, fills)` contract. The runtime creates the order,
+  assigns its external instrument claim and applies real fills before any residual inference
+  (`crates/execution/src/engine/mod.rs:1679`, at the pin). Every fill keeps its trade ID; a snapshot is
+  sent only when all its filled shares are accounted for by those IDs, so no residual is inferred.
+  Updates queued before creation retain their fills by trade ID. Once the cache holds the order,
+  updates use the normal event path. Unmapped orders and unloaded symbols are warned about and not reported. No additional
+  read is made beyond `_send_report`'s own mapping: a simple hand-placed market fill costs zero REST
+  requests. Incomplete or unreadable stream fills leave the order to reconciliation, logged once with
+  their stored fills dropped; later outside updates cannot infer the missing fill. Complete closed
+  reports release their fills immediately; pending replace-chain fills move off superseded legs.
+  Companion fills stay bundled even if the order materializes during mapping's await: the pinned
+  `reconcile_order_with_fills` handles both existing and new orders without a second REST fill read.
 * An Alpaca order event this slice does not map (`pending_cancel`, `done_for_day`, `stopped`,
   `calculated`, `suspended`, `held`, `restated`) is logged as a warning; `pending_replace` is ignored.
   NautilusTrader generates `OrderPendingCancel` and `OrderPendingUpdate` itself when a command is sent.
@@ -238,9 +287,10 @@ Known limits:
   one ("instrument missing from cache", observed), and upstream's Coinbase adapter keeps its reports to
   the instruments it loaded. A position in another symbol is not read for a report asked for one.
 * Start-up fails, by design, on an open order or position this slice cannot represent: a fractional
-  position in a loaded instrument, or an open order that is not a simple whole-share US equity market, limit, stop or stop-limit
-  order. An open stop is reported with its stop price as the trigger price and the node's trigger type, else
-  `DEFAULT`.
+  position in a loaded instrument, or an open order that is not a simple whole-share US equity market,
+  limit, stop, stop-limit or trailing stop order with mapped fields. An open stop is reported with its
+  stop price as the trigger price and the node's trigger type, else `DEFAULT`; trailing reports also
+  carry their offset and type, as above.
 * Timestamps lose sub-microsecond precision: alpaca-py parses them into `datetime`.
 * A trading client given to the constructor is the caller's: every connect uses it, a disconnect does not
   drop it, and nothing is built from the environment in its place (the adapter guide closes in
@@ -277,6 +327,7 @@ from alpaca.trading.enums import OrderClass as AlpacaOrderClass
 from alpaca.trading.enums import OrderSide as AlpacaOrderSide
 from alpaca.trading.enums import OrderStatus as AlpacaOrderStatus
 from alpaca.trading.enums import OrderType as AlpacaOrderType
+from alpaca.trading.enums import PositionIntent
 from alpaca.trading.enums import PositionSide as AlpacaPositionSide
 from alpaca.trading.enums import QueryOrderStatus
 from alpaca.trading.enums import TimeInForce as AlpacaTimeInForce
@@ -316,6 +367,7 @@ from nautilus_trader.model import Quantity
 from nautilus_trader.model import Symbol
 from nautilus_trader.model import TimeInForce
 from nautilus_trader.model import TradeId
+from nautilus_trader.model import TrailingOffsetType
 from nautilus_trader.model import TriggerType
 from nautilus_trader.model import VenueOrderId
 
@@ -429,10 +481,18 @@ ORDER_TYPES_FROM_ALPACA = {
     AlpacaOrderType.LIMIT: OrderType.LIMIT,
     AlpacaOrderType.STOP: OrderType.STOP_MARKET,
     AlpacaOrderType.STOP_LIMIT: OrderType.STOP_LIMIT,
+    AlpacaOrderType.TRAILING_STOP: OrderType.TRAILING_STOP_MARKET,
 }
 
-ORDER_TYPES = frozenset(ORDER_TYPES_FROM_ALPACA.values())
+ORDER_TYPES = frozenset(
+    {OrderType.MARKET, OrderType.LIMIT, OrderType.STOP_MARKET, OrderType.STOP_LIMIT}
+)
+"""Submission types: reporting an outside trailing stop does not allow submitting one."""
 STOP_TYPES = frozenset({OrderType.STOP_MARKET, OrderType.STOP_LIMIT})
+SELL_TO_CLOSE_PROVEN = frozenset({OrderType.LIMIT, OrderType.STOP_MARKET, OrderType.STOP_LIMIT})
+"""The order types on which `position_intent=sell_to_close` is shown, on paper, to be refused by Alpaca
+when the sell would open a short (ADR 0111). The default of `sell_to_close_order_types`."""
+REPORT_TRIGGER_TYPES = STOP_TYPES | {OrderType.TRAILING_STOP_MARKET}
 LIMIT_PRICED = frozenset({OrderType.LIMIT, OrderType.STOP_LIMIT})
 
 STOP_TRIGGER_TYPES = frozenset({TriggerType.DEFAULT, TriggerType.LAST_PRICE})
@@ -469,10 +529,21 @@ class PaperOnlyError(ValueError):
 
 
 class AlpacaExecutionClientConfig(ExecutionClientConfig):
-    """Configuration of the Alpaca execution client: the common fields only, and paper trading only.
+    """Paper execution configuration, with opt-in stream reports for orders the node does not hold.
 
     The adapter guide asks for adapter fields as keyword arguments of a Python `__init__`, with `**kwargs`
-    for the common fields ("Define adapter configuration"). This config has no adapter fields: the client
+    for the common fields ("Define adapter configuration"). `report_external_orders` defaults to false;
+    true reports outside orders and their complete trade-ID fills from the stream.
+    `sell_to_close_on_long_exits` also defaults to false; true adds SELL_TO_CLOSE to an ordinary SELL
+    when this account's cached net position in the instrument is long. `reduce_only_sells`, also false
+    by default, enables SELL_TO_CLOSE for reduce-only SELLs; otherwise all reduce-only orders are denied.
+    None of these settings sets reduce_only. `report_external_trailing_stops`, false by default,
+    reports an open trailing stop placed outside the node as an external order; with it false such an
+    order fails start-up by name, since an outside order is never taken on unasked.
+    `sell_to_close_order_types` scopes `sell_to_close_on_long_exits` and `reduce_only_sells`: the order
+    types that may carry the field, by default `SELL_TO_CLOSE_PROVEN`; a type the adapter does not submit
+    is refused.
+    The client
     always builds alpaca-py's clients with `paper=True` and no `url_override`. Its `__init__` refuses what
     would mean otherwise, naming the rule:
 
@@ -485,7 +556,16 @@ class AlpacaExecutionClientConfig(ExecutionClientConfig):
     COMMON_FIELDS: ClassVar[frozenset[str]] = frozenset({"instrument_provider", "routing"})
 
     def __init__(
-        self, *, paper: object = True, url_override: object = None, **kwargs: object
+        self,
+        *,
+        paper: object = True,
+        url_override: object = None,
+        report_external_orders: bool = False,
+        sell_to_close_on_long_exits: bool = False,
+        reduce_only_sells: bool = False,
+        sell_to_close_order_types: object = None,
+        report_external_trailing_stops: bool = False,
+        **kwargs: object,
     ) -> None:
         if paper is not True:
             raise PaperOnlyError(
@@ -497,6 +577,39 @@ class AlpacaExecutionClientConfig(ExecutionClientConfig):
                 f"AlpacaExecutionClientConfig refuses url_override={url_override!r} ({where}): the client "
                 f"connects to Alpaca's paper Trading API only; {PAPER_ONLY_RULE}",
             )
+        if not isinstance(report_external_orders, bool):
+            raise TypeError("report_external_orders must be a bool")
+        self.report_external_orders = report_external_orders
+        if not isinstance(sell_to_close_on_long_exits, bool):
+            raise TypeError("sell_to_close_on_long_exits must be a bool")
+        self.sell_to_close_on_long_exits = sell_to_close_on_long_exits
+        if not isinstance(reduce_only_sells, bool):
+            raise TypeError("reduce_only_sells must be a bool")
+        self.reduce_only_sells = reduce_only_sells
+        if sell_to_close_order_types is None:
+            scope = SELL_TO_CLOSE_PROVEN
+        else:
+            if isinstance(sell_to_close_order_types, str) or not isinstance(
+                sell_to_close_order_types, collections.abc.Iterable
+            ):
+                raise TypeError("sell_to_close_order_types must be a collection of OrderType")
+            scope = frozenset(sell_to_close_order_types)
+            if not all(isinstance(kind, OrderType) for kind in scope):
+                raise TypeError("sell_to_close_order_types must be a collection of OrderType")
+            unsupported = sorted(kind.name for kind in scope - ORDER_TYPES)
+            if unsupported:
+                raise ValueError(
+                    f"sell_to_close_order_types names {', '.join(unsupported)}, which this adapter "
+                    "does not submit; market, limit, stop and stop-limit only"
+                )
+        # A tuple in the order of the types' names: instance fields are serialised with the config, and
+        # the pinned serialiser takes a tuple of order types and no frozenset.
+        self.sell_to_close_order_types = tuple(
+            sorted(scope, key=lambda order_type: order_type.name)
+        )
+        if not isinstance(report_external_trailing_stops, bool):
+            raise TypeError("report_external_trailing_stops must be a bool")
+        self.report_external_trailing_stops = report_external_trailing_stops
         for key, value in kwargs.items():
             if key in self.COMMON_FIELDS:
                 continue
@@ -507,7 +620,11 @@ class AlpacaExecutionClientConfig(ExecutionClientConfig):
                 )
             raise TypeError(
                 f"AlpacaExecutionClientConfig has no setting {key!r}: it takes only "
-                f"{sorted(self.COMMON_FIELDS)}, and NautilusTrader would drop an unknown one silently",
+                "report_external_orders, sell_to_close_on_long_exits, reduce_only_sells, "
+                "sell_to_close_order_types, report_external_trailing_stops "
+                f"and {sorted(self.COMMON_FIELDS)}, "
+                "and NautilusTrader would "
+                "drop an unknown one silently",
             )
 
 
@@ -669,12 +786,53 @@ def bounded(text: str) -> str:
     return text if len(text) <= REASON_MAX_CHARS else text[: REASON_MAX_CHARS - 1] + "…"
 
 
+class ChainTooLong(ValueError):
+    """A replace chain that needs more reads than `MAX_REPLACE_CHAIN`. Its words are the adapter's own
+    and name no venue order ID, so `failure_cause` keeps them."""
+
+
+def failure_cause(error: BaseException) -> str:
+    """What failed, for a log line that must not name a venue order ID: the exception's class and, for
+    Alpaca's own error, its HTTP status and body code, so a rate limit, a missing order and a server
+    error read differently. The exception's text is left out: it can carry an order ID. Two exceptions:
+    the adapter's own `ChainTooLong` keeps its words, and a body code that is not a number is left out,
+    since only a number is sure to carry no ID."""
+    if isinstance(error, ChainTooLong):
+        return str(error)
+    if not isinstance(error, APIError):
+        return type(error).__name__
+    try:
+        status = error.status_code
+    except AttributeError, ValueError, KeyError, TypeError:
+        status = None
+    try:
+        code = error.code
+    except ValueError, KeyError, TypeError:
+        code = None
+    if not (
+        isinstance(code, int) or (isinstance(code, str) and code.isdecimal() and len(code) <= 12)
+    ):
+        code = None
+    parts = [str(part) for part in (status, code) if part is not None]
+    return f"APIError {': '.join(parts)}" if parts else "APIError"
+
+
 def api_error_text(error: APIError) -> str:
-    """Alpaca's error message, without its JSON wrapper when it has one, bounded."""
+    """Alpaca's optional body code and message, without its JSON wrapper, bounded.
+
+    The pinned alpaca-py's `APIError.code` reads the JSON body's `code` and raises when it is absent;
+    the HTTP status is separate. A code-free body keeps the existing message or raw-text fallback.
+    """
     try:
         message = str(error.message)
     except ValueError, KeyError, TypeError:
         message = str(error)
+    try:
+        code = error.code
+    except ValueError, KeyError, TypeError:
+        code = None
+    if code is not None:
+        message = f"{code}: {message}"
     return bounded(message)
 
 
@@ -718,6 +876,19 @@ def wire_price(price: Price) -> float:
 def fill_price(value: float) -> Price:
     """The fill price exactly as Alpaca sent it: the shortest decimal form of alpaca-py's float."""
     return Price.from_str(repr(float(value)))
+
+
+def update_fill_values(update: TradeUpdate) -> tuple[str, Quantity, Price]:
+    """The trade ID and exact per-event quantity and price (Alpaca's Websocket Streaming contract)."""
+    if update.execution_id is None:
+        raise ValueError("it has no execution_id to use as the trade ID")
+    if update.qty is None or update.price is None:
+        raise ValueError("it has no qty or price")
+    return (
+        str(update.execution_id),
+        whole_quantity(update.qty, "fill quantity"),
+        fill_price(update.price),
+    )
 
 
 def venue_limit_price(price: Price, side: OrderSide) -> Price:
@@ -782,6 +953,15 @@ def holdable_id(value: str) -> ClientOrderId | None:
         return ClientOrderId(value)
     except ValueError:
         return None
+
+
+def order_description(order: AlpacaOrder) -> str:
+    """Name an order's terms and client lineage without its venue order ID."""
+    side = getattr(order.side, "value", order.side)
+    kind = getattr(order.type, "value", order.type)
+    return (
+        f"Alpaca order for {order.symbol} {side} {kind} (client lineage {order.client_order_id!r})"
+    )
 
 
 def replaces_as_asked(replacement: AlpacaOrder, request: ReplaceOrderRequest, order: Any) -> bool:
@@ -935,24 +1115,37 @@ def order_status_report(
     status: OrderStatus | None = None,
     filled: Decimal | None = None,
     quantity: Decimal | None = None,
+    advisory_trigger: Callable[[str], None] | None = None,
+    *,
+    trailing: bool = False,
 ) -> OrderStatusReport | None:
     """An `OrderStatusReport` for one Alpaca order, None for a closed one this slice does not map, whose
-    reason `skipped` is given.
+    reason `skipped` is given. A trailing stop is mapped only when `trailing` is true
+    (`report_external_trailing_stops`); otherwise it is an order type this slice does not map.
 
     An open order this slice does not map raises, so reconciliation fails rather than leaving a working
     order unknown to the node. `replaced` is skipped: the order replacing it is reported in its own right,
     under `client_order_id` when the client has traced it back to the node's order. A stop's trigger type
     is `trigger_type` when the node holds the order, else `DEFAULT`: Alpaca's order has no trigger type
-    field. `status`, `filled` and `quantity` stand in for what Alpaca's order shows when the client judges
+    field. A trailing stop also carries its PRICE or BASIS_POINTS offset; it remains unsupported for
+    submission. `status`, `filled` and `quantity` stand in for what Alpaca's order shows when the client judges
     a replace chain as a whole (`AlpacaExecutionClient._order_report`, `chain_filled`).
     """
     try:
         return mapped_order_report(
-            order, ts_init, trigger_type, client_order_id, status, filled, quantity
+            order,
+            ts_init,
+            trigger_type,
+            client_order_id,
+            status,
+            filled,
+            quantity,
+            advisory_trigger,
+            trailing=trailing,
         )
     except ValueError as e:
         if is_open_order(order):
-            raise ValueError(f"Alpaca order {order.id} ({order.symbol}) is open with {e}") from e
+            raise ValueError(f"{order_description(order)} is open with {e}") from e
         if skipped is not None:
             skipped(str(e))
         return None
@@ -966,6 +1159,9 @@ def mapped_order_report(
     status: OrderStatus | None = None,
     filled: Decimal | None = None,
     quantity: Decimal | None = None,
+    advisory_trigger: Callable[[str], None] | None = None,
+    *,
+    trailing: bool = False,
 ) -> OrderStatusReport:
     """`order_status_report`'s report, raising `ValueError` with what this slice does not map, open or
     closed."""
@@ -979,7 +1175,7 @@ def mapped_order_report(
     if order.order_class not in (AlpacaOrderClass.SIMPLE, AlpacaOrderClass.EMPTY):
         raise ValueError(f"order class {order.order_class.value}")
     order_type = ORDER_TYPES_FROM_ALPACA.get(order.type) if order.type is not None else None
-    if order_type is None:
+    if order_type is None or (order_type == OrderType.TRAILING_STOP_MARKET and not trailing):
         raise ValueError(f"order type {getattr(order.type, 'value', order.type)}")
     time_in_force = TIMES_IN_FORCE_FROM_ALPACA.get(order.time_in_force)
     if time_in_force is None:
@@ -991,6 +1187,34 @@ def mapped_order_report(
         filled if filled is not None else order.filled_qty or 0, "filled quantity"
     )
     any_filled = filled_qty.as_double() > 0
+    trailing_offset: Decimal | None = None
+    trailing_offset_type: TrailingOffsetType | None = None
+    if order_type == OrderType.TRAILING_STOP_MARKET:
+        if (order.trail_price is None) == (order.trail_percent is None):
+            raise ValueError("trailing_stop needs exactly one of trail_price or trail_percent")
+        field = "trail_price" if order.trail_price is not None else "trail_percent"
+        trailing_offset = decimal_value(getattr(order, field), field)
+        if trailing_offset <= 0:
+            raise ValueError(f"{field} {trailing_offset} must be positive")
+        if order.trail_price is not None:
+            trailing_offset_type = TrailingOffsetType.PRICE
+        else:
+            # Alpaca trail_percent=1.0 is 1%; Nautilus BASIS_POINTS=100 is 1% (sources in header).
+            trailing_offset *= 100
+            trailing_offset_type = TrailingOffsetType.BASIS_POINTS
+    trigger_price = None
+    if order_type in REPORT_TRIGGER_TYPES and (
+        order.stop_price is not None or order_type in STOP_TYPES
+    ):
+        try:
+            trigger_price = exact_report_price(order.stop_price)
+        except (ValueError, ArithmeticError, OverflowError) as e:
+            if order_type != OrderType.TRAILING_STOP_MARKET:
+                raise
+            # Alpaca's moving trigger is advisory; the pinned trailing model permits None. Offset
+            # validation above is required and remains a named failure (sources in the header).
+            if advisory_trigger is not None:
+                advisory_trigger(str(e))
     if status is None:
         # Open with fills is partly filled, as `pending_replace` with fills is at its own terms and as a
         # replacement of a partly filled order shows its chain's fills.
@@ -1014,8 +1238,12 @@ def mapped_order_report(
         ts_init=ts_init,
         client_order_id=client_order_id or own_client_id(order),
         price=exact_report_price(order.limit_price) if order_type in LIMIT_PRICED else None,
-        trigger_price=exact_report_price(order.stop_price) if order_type in STOP_TYPES else None,
-        trigger_type=(trigger_type or TriggerType.DEFAULT) if order_type in STOP_TYPES else None,
+        trigger_price=trigger_price,
+        trigger_type=(trigger_type or TriggerType.DEFAULT)
+        if order_type in REPORT_TRIGGER_TYPES
+        else None,
+        trailing_offset=trailing_offset,
+        trailing_offset_type=trailing_offset_type,
         avg_px=decimal_value(order.filled_avg_price, "average fill price")
         if any_filled and order.filled_avg_price
         else None,
@@ -1189,6 +1417,17 @@ class AlpacaExecutionClient(ExecutionClient):
             instrument_provider=instrument_provider,
         )
         self._provider = instrument_provider
+        self._report_external_orders = config.report_external_orders
+        self._sell_to_close_on_long_exits = config.sell_to_close_on_long_exits
+        self._reduce_only_sells = config.reduce_only_sells
+        self._sell_to_close_order_types = frozenset(config.sell_to_close_order_types)
+        self._report_external_trailing_stops = config.report_external_trailing_stops
+        # Companion fills while the core has not yet materialized an outside order. They are not
+        # marked applied: only the engine's cache can confirm a report's fills (ADR 0075).
+        self._external_fills: dict[str, dict[str, FillReport]] = {}
+        self._external_reconciliation: set[str] = set()
+        self._external_unloaded_symbols: set[str] = set()
+        self._advisory_trigger_warned: set[str] = set()
         # Clients given here are the caller's: used on every connect, never replaced by ones built from
         # the environment, and not dropped at disconnect (the adapter guide closes what the adapter
         # creates in `_connect`). The live fields below are set in `_connect` and cleared on disconnect.
@@ -1333,6 +1572,10 @@ class AlpacaExecutionClient(ExecutionClient):
             cid: record.end for cid, record in self._records.items() if record.end is not None
         }
         self._records.clear()
+        self._external_fills.clear()
+        self._external_reconciliation.clear()
+        self._external_unloaded_symbols.clear()
+        self._advisory_trigger_warned.clear()
         self._index.clear()
         self._acknowledged.clear()
         catching_up, self._catching_up = list(self._catching_up.values()), {}
@@ -1414,7 +1657,22 @@ class AlpacaExecutionClient(ExecutionClient):
         if denial is not None:
             self.generate_order_denied(order, denial)
             return
-        request = self._order_request(order, extended_hours)
+        long_exit = (
+            self._sell_to_close_on_long_exits
+            and order.side == OrderSide.SELL
+            and order.order_type in self._sell_to_close_order_types
+            and sum(
+                (
+                    position.signed_qty
+                    for position in self.cache.positions_open(
+                        instrument_id=order.instrument_id, account_id=ACCOUNT_ID
+                    )
+                ),
+                Decimal(0),
+            )
+            > 0
+        )
+        request = self._order_request(order, extended_hours, sell_to_close=long_exit)
         venue = self._venue()  # raises before `OrderSubmitted` when not connected: nothing was sent
         self.generate_order_submitted(order)
         try:
@@ -1890,6 +2148,20 @@ class AlpacaExecutionClient(ExecutionClient):
         if command.price is not None and order.order_type not in LIMIT_PRICED:
             return f"a {order.order_type.name} order has no limit price to change"
         if (
+            order.is_reduce_only
+            and order.side == OrderSide.SELL
+            and command.quantity is not None
+            and command.quantity > order.quantity
+        ):
+            # Alpaca's replace carries no position intent, and what it checks when a `sell_to_close`
+            # order grows is not shown on paper, so the reduce-only contract (send an enforcing
+            # instruction or reject before transport) is kept by rejecting; a smaller quantity cannot
+            # open a short and is sent.
+            return (
+                "raising the quantity of a reduce-only SELL is not supported: Alpaca's replace carries "
+                "no position intent"
+            )
+        if (
             command.price is not None
             and not self._replace_in_flight(order)  # one in flight may change what the order holds
             and (sent := venue_limit_price(command.price, order.side)) == order.price
@@ -1935,7 +2207,17 @@ class AlpacaExecutionClient(ExecutionClient):
         if order.is_quote_quantity:
             return "quote quantity is not supported; whole shares only"
         if order.is_reduce_only:
-            return "reduce-only is not supported"
+            if not self._reduce_only_sells:
+                return "reduce-only is not supported"
+            if order.side == OrderSide.BUY:
+                return (
+                    "reduce-only BUY is not supported: Alpaca has no instruction that enforces it"
+                )
+            if order.order_type not in self._sell_to_close_order_types:
+                return (
+                    f"reduce-only {order.order_type.name} SELL is not supported: sell_to_close is "
+                    "not shown to be enforced for that order type"
+                )
         if (
             order.order_list_id is not None
             or order.linked_order_ids
@@ -1964,7 +2246,9 @@ class AlpacaExecutionClient(ExecutionClient):
         return None
 
     @staticmethod
-    def _order_request(order: Any, extended_hours: bool = False) -> OrderRequest:
+    def _order_request(
+        order: Any, extended_hours: bool = False, *, sell_to_close: bool = False
+    ) -> OrderRequest:
         fields: dict[str, Any] = {
             "symbol": order.instrument_id.symbol.value,
             "qty": float(int(order.quantity.as_double())),
@@ -1974,6 +2258,8 @@ class AlpacaExecutionClient(ExecutionClient):
         }
         if extended_hours:
             fields["extended_hours"] = True  # only ever with a limit order, `DAY` or `GTC`
+        if order.side == OrderSide.SELL and (order.is_reduce_only or sell_to_close):
+            fields["position_intent"] = PositionIntent.SELL_TO_CLOSE
         if order.order_type == OrderType.LIMIT:
             return LimitOrderRequest(
                 **fields, limit_price=wire_price(venue_limit_price(order.price, order.side))
@@ -2216,9 +2502,8 @@ class AlpacaExecutionClient(ExecutionClient):
             prior = (known or {}).get(prior_id)
             if prior is None:
                 if reads == MAX_REPLACE_CHAIN:
-                    raise ValueError(
-                        f"Alpaca order {order_id}'s replace chain needs more than {MAX_REPLACE_CHAIN} "
-                        "reads to trace"
+                    raise ChainTooLong(
+                        f"replace chain needs more than {MAX_REPLACE_CHAIN} reads to trace"
                     )
                 reads += 1
                 prior = await self._call(self._venue().get_order_by_id, prior_id)
@@ -2236,6 +2521,115 @@ class AlpacaExecutionClient(ExecutionClient):
         self._index[order_id] = root
         return root
 
+    def _external_keys(self, order: AlpacaOrder) -> set[str]:
+        """The known leg and client lineage of an outside order left to reconciliation."""
+        keys = {f"order:{order.id}"}
+        if order.replaces is not None:
+            keys.add(f"order:{order.replaces}")
+        root = self._index.get(str(order.id))
+        if root is not None:
+            keys.add(f"client:{root.value}")
+        return keys
+
+    def _external_legs(self, order: AlpacaOrder) -> set[str]:
+        """Pending fill buckets belonging to this order's traced chain, including this leg."""
+        order_id = str(order.id)
+        root = self._index.get(order_id)
+        return {order_id} | {
+            leg_id
+            for leg_id in self._external_fills
+            if root is not None and self._index.get(leg_id) == root
+        }
+
+    def _leave_external_to_reconciliation(self, order: AlpacaOrder, reason: str) -> None:
+        """Drop an incomplete stream fill set and name the order once; reconciliation owns it now."""
+        keys = self._external_keys(order)
+        if not self._external_reconciliation.intersection(keys):
+            self._log.warning(
+                f"{order_description(order)} left to reconciliation: {reason}; "
+                "stored stream fills dropped, no fill inferred and no extra read"
+            )
+        self._external_reconciliation.update(keys)
+        for leg_id in self._external_legs(order):
+            self._external_reconciliation.add(f"order:{leg_id}")
+            self._external_fills.pop(leg_id, None)
+
+    async def _report_external_update(self, update: TradeUpdate) -> None:
+        """Bootstrap an outside order through `_handle_report(report, fills)` (Python adapter guide).
+
+        Every companion fill keeps the stream's trade ID, exact price, quantity and time. Pending
+        reports can overtake Python cache reads, so retain complete open snapshots' fills until the
+        engine holds the order. Closed snapshots release them immediately, and superseded buckets move
+        to the replacement. A missing fill leaves the chain to reconciliation once, never a partial
+        bundle. Nothing here fetches a missing fill or marks a report applied (ADR 0075).
+        """
+        order_id = str(update.order.id)
+        event = getattr(update.event, "value", update.event)
+        if event == "replaced":
+            # The replacement is the reportable order. Move its predecessor's pending fills without
+            # retaining a bucket for every old leg while the native engine creates the order.
+            pending = self._external_fills.pop(order_id, {})
+            if pending and update.order.replaced_by is not None:
+                target = str(update.order.replaced_by)
+                self._index[target] = self._index.get(order_id)
+                pending.update(self._external_fills.get(target, {}))
+                self._external_fills[target] = pending
+            self._log.warning(
+                f"{order_description(update.order)} is not reported: status replaced: "
+                "its replacement is reported instead"
+            )
+            return
+        # Do not mutate the stored set until mapping succeeds and the complete report is sent.
+        pending = dict(self._external_fills.get(order_id, {}))
+        if event in FILL_EVENTS:
+            try:
+                trade_id, last_qty, last_px = update_fill_values(update)
+                symbol = update.order.symbol
+                if symbol is None:
+                    raise ValueError("no symbol")
+                report = FillReport(
+                    account_id=ACCOUNT_ID,
+                    instrument_id=InstrumentId(Symbol(symbol), VENUE),
+                    venue_order_id=VenueOrderId(order_id),
+                    trade_id=TradeId(trade_id),
+                    order_side=alpaca_side(update.order),
+                    last_qty=last_qty,
+                    last_px=last_px,
+                    commission=Money(0, USD),
+                    liquidity_side=LiquiditySide.NO_LIQUIDITY_SIDE,
+                    ts_event=dt_to_unix_nanos(update.timestamp),
+                    ts_init=self.clock.timestamp_ns(),
+                )
+            except ValueError as e:
+                self._leave_external_to_reconciliation(update.order, str(e))
+                return
+            previous = pending.get(trade_id)
+            if previous is not None and fill_terms(previous) != fill_terms(report):
+                self._leave_external_to_reconciliation(
+                    update.order, "a repeated trade ID has different quantity, price or time"
+                )
+                return
+            pending[trade_id] = report
+        # `_node_order_id` has already traced this leg through `_root_id`. Fills from the same
+        # outside replace chain must travel together, just as held-order catch-up groups its legs.
+        legs = self._external_legs(update.order)
+        observed: dict[str, FillReport] = dict(pending)
+        for leg_id in legs - {order_id}:
+            for trade_id, fill in self._external_fills.get(leg_id, {}).items():
+                previous = observed.get(trade_id)
+                if previous is not None and fill_terms(previous) != fill_terms(fill):
+                    self._leave_external_to_reconciliation(
+                        update.order,
+                        "a repeated trade ID has different quantity, price or time in its replace chain",
+                    )
+                    return
+                observed[trade_id] = fill
+        sent = await self._send_report(update.order, list(observed.values()))
+        for leg_id in legs:
+            self._external_fills.pop(leg_id, None)
+        if sent is not None and is_open_order(update.order) and observed:
+            self._external_fills[order_id] = observed
+
     async def _apply(self, update: TradeUpdate) -> None:
         """Apply one trade update through the node order's record.
 
@@ -2252,14 +2646,58 @@ class AlpacaExecutionClient(ExecutionClient):
         replacement was one a later replace left behind.
         """
         alpaca_order = update.order
-        client_order_id = await self._node_order_id(alpaca_order)
+        if self._report_external_orders:
+            symbol = alpaca_order.symbol
+            if (
+                symbol is not None
+                and self._provider.find(InstrumentId(Symbol(symbol), VENUE)) is None
+            ):
+                if symbol not in self._external_unloaded_symbols:
+                    self._external_unloaded_symbols.add(symbol)
+                    self._log.warning(
+                        f"{order_description(alpaca_order)} is in an instrument this client has not "
+                        "loaded; not reported"
+                    )
+                for leg_id in self._external_legs(alpaca_order):
+                    self._external_fills.pop(leg_id, None)
+                return
+            keys = self._external_keys(alpaca_order)
+            if self._external_reconciliation.intersection(keys):
+                # A later reconciliation may have materialized it; then use the normal event path.
+                candidates = (
+                    holdable_id(alpaca_order.client_order_id),
+                    self._index.get(str(alpaca_order.id)),
+                    self._held_by_venue_id(str(alpaca_order.id)),
+                )
+                if not any(
+                    cid is not None and self.cache.order(cid) is not None for cid in candidates
+                ):
+                    self._external_reconciliation.update(keys)
+                    return
+        try:
+            client_order_id = await self._node_order_id(alpaca_order)
+        except (APIError, OSError, ValueError, TypeError, RuntimeError) as e:
+            if not self._report_external_orders:
+                raise
+            # The fill has not been stored yet. A lost trace must not poison every later snapshot,
+            # and a transport exception's text may contain the venue ID or request URL.
+            self._leave_external_to_reconciliation(
+                alpaca_order, f"tracing failed ({failure_cause(e)})"
+            )
+            return
         order = self.cache.order(client_order_id) if client_order_id is not None else None
         if client_order_id is None or order is None:
+            if self._report_external_orders:
+                await self._report_external_update(update)
+                return
             self._log.info(
-                f"Alpaca trade update {update.event} for order {alpaca_order.id} ({alpaca_order.symbol}), "
+                f"Alpaca trade update {update.event} for {alpaca_order.symbol}, "
                 "which this node does not hold; reconciliation reports it",
             )
             return
+        for leg_id in self._external_legs(alpaca_order):
+            self._external_fills.pop(leg_id, None)
+        self._external_reconciliation.difference_update(self._external_keys(alpaca_order))
         event = getattr(update.event, "value", update.event)
         leg_id = str(alpaca_order.id)
         venue_order_id = VenueOrderId(leg_id)
@@ -2562,6 +3000,7 @@ class AlpacaExecutionClient(ExecutionClient):
             order.trigger_type if order.order_type in STOP_TYPES else None,
             order.client_order_id,
             quantity=chain_quantity(qty, earlier) if qty is not None else None,
+            trailing=self._report_external_trailing_stops,
         )
         if report is None:
             raise ValueError(f"replacement {replacement_id} is not an order this slice maps")
@@ -2599,12 +3038,7 @@ class AlpacaExecutionClient(ExecutionClient):
         A fill the update cannot carry is logged and ends nothing; its order's next read brings it. The
         order Alpaca shows filled counts its whole quantity, whatever `filled_qty` the update carries."""
         try:
-            if update.execution_id is None:
-                raise ValueError("it has no execution_id to use as the trade ID")
-            if update.qty is None or update.price is None:
-                raise ValueError("it has no qty or price")
-            last_qty = whole_quantity(update.qty, "fill quantity")
-            last_px = fill_price(update.price)
+            trade_id, last_qty, last_px = update_fill_values(update)
         except ValueError as e:
             self._log.error(
                 f"Alpaca {update.event} for {order.client_order_id} not applied: {e}; the order's next "
@@ -2615,7 +3049,7 @@ class AlpacaExecutionClient(ExecutionClient):
                 order,
                 record,
                 venue_order_id,
-                str(update.execution_id),
+                trade_id,
                 last_qty,
                 last_px,
                 ts_event,
@@ -3138,16 +3572,42 @@ class AlpacaExecutionClient(ExecutionClient):
         if report is not None:
             self._handle_report(report)
 
-    async def _send_report(self, held: AlpacaOrder) -> None:
-        """Hand Alpaca's read of an order to the engine as its status report, as `_query_order` does."""
+    async def _send_report(
+        self, held: AlpacaOrder, fills: list[FillReport] | None = None
+    ) -> OrderStatusReport | None:
+        """Send a mapped report, with complete companion fills kept in the same engine delivery."""
         try:
             report = await self._order_report(held)
         except (APIError, OSError, ValueError, TypeError, RuntimeError) as e:
-            self._log.warning(f"Alpaca order {held.id} could not be reported ({e!r})")
-            return
+            cause = e.__cause__ or e
+            # Mapping ValueErrors name the unsupported field. Transport and SDK exceptions can
+            # contain order IDs in their body, URL or model input: name their class only.
+            reason = str(cause) if type(cause) is ValueError else failure_cause(cause)
+            reason = reason.replace(str(held.id), "[venue order]")
+            if held.replaces is not None:
+                reason = reason.replace(str(held.replaces), "[prior venue order]")
+            if fills is not None:
+                self._leave_external_to_reconciliation(held, reason)
+            else:
+                self._log.warning(f"{order_description(held)} could not be reported ({reason})")
+            return None
+        if report is not None and fills is not None:
+            fills = [moved_report(fill, report.venue_order_id) for fill in fills]
+            if fills_count(fills) != report.filled_qty.as_decimal():
+                self._leave_external_to_reconciliation(
+                    held,
+                    f"shows {report.filled_qty} filled, stream trade IDs account for {fills_count(fills)}",
+                )
+                return None
+            # The pinned engine handles both held and new orders in reconcile_order_with_fills,
+            # applying real trade IDs before the snapshot. Keep the bundle even if mapping yielded
+            # while another report materialized the order; _settled_report would fetch them twice.
+            self._handle_report(report, fills or None)
+            return report
         report = await self._settled_report(report) if report is not None else None
         if report is not None:
             self._handle_report(report)
+        return report
 
     async def _settled_report(self, report: OrderStatusReport) -> OrderStatusReport | None:
         """`report`, once the node's order has applied every fill it shows, or None to hold it back.
@@ -3913,9 +4373,11 @@ class AlpacaExecutionClient(ExecutionClient):
         except (APIError, OSError, ValueError, TypeError) as e:
             if is_open_order(order):
                 raise ValueError(
-                    f"Alpaca order {order.id} ({order.symbol}) is open and tracing it failed ({e!r})"
+                    f"{order_description(order)} is open and tracing it failed ({failure_cause(e)})"
                 ) from e
-            self._log.warning(f"Alpaca order {order.id} is not reported: tracing it failed ({e!r})")
+            self._log.warning(
+                f"{order_description(order)} is not reported: tracing it failed ({failure_cause(e)})"
+            )
             return None
 
         # Reported under the chain's first client order ID, the node's, held or not: after a restart
@@ -3944,11 +4406,11 @@ class AlpacaExecutionClient(ExecutionClient):
             except (APIError, OSError, ValueError, TypeError) as e:
                 if is_open_order(order):
                     raise ValueError(
-                        f"Alpaca order {order.id} ({order.symbol}) is open and its chain's fills could "
-                        f"not be read ({e!r})"
+                        f"{order_description(order)} is open and its chain's fills could "
+                        f"not be read ({failure_cause(e)})"
                     ) from e
                 self._log.warning(
-                    f"Alpaca order {order.id} is not reported: its chain's fills ({e!r})"
+                    f"{order_description(order)} is not reported: its chain's fills ({failure_cause(e)})"
                 )
                 return None
             chained = chain_filled(own, earlier)
@@ -3976,7 +4438,9 @@ class AlpacaExecutionClient(ExecutionClient):
         # As upstream's Coinbase adapter patches a report from what the node sent: the trigger type
         # the node's order holds, which Alpaca's order does not carry.
         trigger_type = (
-            held.trigger_type if held is not None and held.order_type in STOP_TYPES else None
+            held.trigger_type
+            if held is not None and held.order_type in REPORT_TRIGGER_TYPES
+            else None
         )
         renamed = (
             node_id if node_id is not None and node_id.value != order.client_order_id else None
@@ -3987,12 +4451,23 @@ class AlpacaExecutionClient(ExecutionClient):
             trigger_type,
             renamed,
             lambda reason: self._log.warning(
-                f"Alpaca order {order.id} ({order.symbol}, {order.status.value}) is not reported: "
-                f"{reason}",
+                f"{order_description(order)} ({order.status.value}) is not reported: {reason}",
             ),
             status,
             filled,
             quantity,
+            lambda reason: self._warn_advisory_trigger(order, reason),
+            trailing=self._report_external_trailing_stops,
+        )
+
+    def _warn_advisory_trigger(self, order: AlpacaOrder, reason: str) -> None:
+        """Name an unrepresentable advisory trailing trigger once per venue order, without its ID."""
+        order_id = str(order.id)
+        if order_id in self._advisory_trigger_warned:
+            return
+        self._advisory_trigger_warned.add(order_id)
+        self._log.warning(
+            f"{order_description(order)} advisory trailing trigger omitted ({reason}); reported as None"
         )
 
     async def _earlier_filled(
@@ -4008,7 +4483,7 @@ class AlpacaExecutionClient(ExecutionClient):
             prior = (known or {}).get(prior_id)
             if prior is None:
                 if reads == MAX_REPLACE_CHAIN:
-                    raise ValueError(
+                    raise ChainTooLong(
                         f"more than {MAX_REPLACE_CHAIN} reads to sum the chain's fills"
                     )
                 reads += 1
@@ -4050,8 +4525,8 @@ class AlpacaExecutionClient(ExecutionClient):
                 prior = await self._call(self._venue().get_order_by_id, str(replacement.replaces))
             except (APIError, OSError, ValueError, TypeError) as e:
                 self._log.warning(
-                    f"Alpaca order {replacement.replaces}, which the rejected {replacement.id} replaces, "
-                    f"could not be read ({e!r}); the replacement is taken not to have taken over"
+                    f"{order_description(replacement)}: the order it replaces could not be read "
+                    f"({failure_cause(e)}); the replacement is taken not to have taken over"
                 )
                 return False
         if isinstance(prior, AlpacaOrder) and record is not None:

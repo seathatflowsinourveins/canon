@@ -63,7 +63,7 @@ until this record is accepted and its live order tasks are on `main` (ADR 0103, 
 
 **Gaps, and what would close each.**
 
-* **(i) Stopping entries while exits keep working.** The switch is the strategies' own (ADR 0111, `proposed`, not on `main` yet): Mover
+* **(i) Stopping entries while exits keep working.** The switch is the strategies' own (ADR 0115, `proposed`): Mover
   and the protector read the arming file at each decision and submit no buy while it says off, re-entries
   included; sells are untouched. Closed by a paper proof that with the switch off a qualifying entry is not
   submitted and is recorded as `entries_off`, and a due protective sell goes out. Upstream's `REDUCING`
@@ -80,7 +80,12 @@ until this record is accepted and its live order tasks are on `main` (ADR 0103, 
   orders as exceeding the available position quantity". So a stop held by Alpaca for the full quantity and
   the emulator's released sell cannot both work: in the regular session it is one or the other, with a
   hand-over at the session's edges. Closed by measuring the unprotected gap of that hand-over on the third
-  paper account.
+  paper account. A limit while such a stop rests (the lead, 2026-11-12): Alpaca's wash-trade protection
+  rejects a new order when an opposite-side market or stop order is open on the name, with HTTP 403, on
+  paper as on live, so a buy of that name is refused until the stop is gone, the owner's own buy
+  included. An option to verify, not a decision: the same page excepts trailing stop orders, with
+  bracket and OCO orders, from that protection; whether a trailing stop held by Alpaca could carry a
+  saved level is unread.
 * **(iii) Whether the live node configures a cache database**, which decides whether emulated orders come
   back after a restart. Closed by the node's configuration and a paper restart.
 * **(iv) The per-name trail distance.** No record on `main` registers one; ADR 0088, `proposed`, has one
@@ -104,6 +109,12 @@ Read 2026-11-12.
   row and the `HALTED` sentence quoted above. Fetched raw. The same text is at the pin, `v2.0.0rc8`
   (`d53849b216e2`), `docs/concepts/execution/index.md:276-298`, in `scripts/canon src nautilus-trader`'s
   copy. Fetched at the pin.
+* https://docs.alpaca.markets/us/docs/user-protection.md — "Market and stop orders" on the opposite
+  side are "always rejected"; the rejection is "an error message with the HTTP status code 403
+  (Forbidden)"; "These complex orders and trailing stop orders are exceptions to our wash trade
+  protection"; "Our wash trade protection also applies to your paper trading account". Fetched
+  2026-11-12 through a summarising fetch, so the quotations may not be exact; the rejection's body
+  code is not on the page.
 * https://docs.alpaca.markets/us/docs/orders-at-alpaca.md — the two conditional closing orders sentence, in
   its bracket orders section; no reduce-only parameter found on the page. Fetched raw.
 * https://docs.alpaca.markets/us/reference/getaccountconfig-1.md — `suspend_trade`: "If true, new orders are

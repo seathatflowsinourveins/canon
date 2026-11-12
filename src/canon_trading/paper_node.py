@@ -236,7 +236,9 @@ def ema_cross_paper_node(
     native setting caps a position, and `EmaCross` stacks one when Alpaca refuses an opposite order (ADR
     0037). When the cap trips it stops the node and nothing flattens: `EmaCross` does not on stop, and its
     config at the pin exposes neither `manage_stop` nor the market-exit keys, whose default exit is
-    reduce-only, which the adapter denies (ADR 0036). The caller closes what is left, as the paper test's
+    reduce-only, which the adapter denies unless `reduce_only_sells` is set and its order-type scope
+    includes the market order, which the default scope does not (ADR 0036, ADR 0111). The caller closes
+    what is left, as the paper test's
     `left_as_found` does. The node is not started: the caller runs it and owns its lifetime. The key pair
     is read from the environment by the clients when they connect (ADR 0029).
     """
