@@ -34,7 +34,8 @@ Alpaca's response schema documents `u`: `canceled` and `incorrect` invalidate a 
 `corrected` identifies a valid replacement and an absent `u` an ordinary valid print (the historical
 trades reference above, response `stock_trade`). The raw field is checked before alpaca-py's
 `TRADE_MAPPING` drops it (`alpaca/data/mappings.py` at `c42add7c0a70`); invalid prints are dropped,
-counted and logged once per request. Trade condition flags are not validity flags and are not filtered.
+counted and logged once per request. Trade condition flags are not validity flags; with `trade_condition_filter` on, a print becomes a tick only if
+Alpaca's minute bars take its price (`canon_alpaca.trade_conditions`), and is otherwise counted by code.
 Only `feed` is supported from the venue's optional params; `asof` and `currency` are refused rather
 than ignored. Alpaca's default current-day symbol mapping and USD prices apply, matching the
 adapter's USD equities; the engine's params, such as `update_catalog`, are preserved as before.
@@ -252,6 +253,7 @@ import math
 import threading
 import weakref
 from dataclasses import dataclass
+from dataclasses import field
 from datetime import UTC
 from datetime import datetime
 from datetime import time
@@ -317,6 +319,10 @@ from .providers import AlpacaInstrumentProvider
 from .providers import credentials_from_env
 from .providers import require_get_only
 from .providers import with_http_timeout
+from .trade_conditions import count_print
+from .trade_conditions import excluded_by
+from .trade_conditions import read_condition_map
+from .trade_conditions import unknown_codes
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable
@@ -416,6 +422,9 @@ class TradeHistory:
     """Each SDK trade and the exact nanosecond timestamp from its raw `t` string."""
     canceled: int = 0
     incorrect: int = 0
+    left_out: list[tuple[Trade, list[str]]] = field(default_factory=list)
+    """With the condition filter on, each print it left out and the codes that did, in order; none of them
+    used up the request's limit. Counted and logged on the node's loop, not in the worker."""
 
 
 def fetch_trades(
@@ -424,9 +433,13 @@ def fetch_trades(
     *,
     start_ns: int | None = None,
     end_ns: int | None = None,
+    condition_filter: bool = False,
 ) -> TradeHistory:
     """Fetch the single-symbol trade endpoint through alpaca-py's public GET transport, with the
     historical trades reference's pagination contract (URL in the module header).
+
+    With `condition_filter`, a print Alpaca's minute bars would not take (`excluded_by`) goes to
+    `left_out` before it can use up the limit.
 
     Called in a worker thread under the HTTP session's lock. `get_stock_trades` at alpaca-py 0.45.0
     uses `/stocks/trades`, so it cannot call this single-symbol endpoint. Its request serializer and
@@ -490,6 +503,11 @@ def fetch_trades(
                 end_ns is not None and ts_event > end_ns
             ):
                 continue  # the engine would trim it: it must not consume the result limit
+            if condition_filter:
+                excluded = excluded_by(trade.tape, trade.conditions)
+                if excluded:
+                    history.left_out.append((trade, excluded))
+                    continue  # no tick, so it must not consume the result limit either
             history.trades.append((trade, ts_event))
             if remaining is not None:
                 remaining -= 1
@@ -698,6 +716,14 @@ class AlpacaDataClientConfig(DataClientConfig):
       message, while the client holds a subscription, before the client stops it and refuses later
       subscriptions, naming why. It must be longer than the data timeout, so alpaca-py reconnects at least
       once before the client gives up. None sets no limit.
+    * `trade_condition_filter` (default False): when True, a trade print, streamed or requested, becomes a
+      tick only if Alpaca's own minute bars take its price (`canon_alpaca.trade_conditions`); every other
+      print is counted by its codes, apart for the stream and for requests
+      (`canon_alpaca.trade_conditions.condition_counts`); a request's limit counts ticks, not left-out
+      prints. Its connect first reads Alpaca's condition map for tapes A, B and C and refuses a code the
+      table does not know. It is measured on SIP prints only, so a trade subscription or request on any
+      other feed is refused, as is a trade request with `update_catalog`, whose ticks would go under the
+      unfiltered key. For a strategy that elects on prints.
 
     Any other keyword is refused, since NautilusTrader's native `DataClientConfig` drops an unknown one
     without a word (as `AlpacaExecutionClientConfig` does). A plain `DataClientConfig` gets the defaults.
@@ -712,13 +738,15 @@ class AlpacaDataClientConfig(DataClientConfig):
         *,
         stream_data_timeout_secs: float | None = STREAM_DATA_TIMEOUT_SECS,
         stream_mute_limit_secs: float | None = STREAM_MUTE_LIMIT_SECS,
+        trade_condition_filter: bool = False,
         **kwargs: object,
     ) -> None:
         for key in kwargs:
             if key not in self.COMMON_FIELDS:
                 raise TypeError(
                     f"AlpacaDataClientConfig has no setting {key!r}: it takes "
-                    f"stream_data_timeout_secs, stream_mute_limit_secs and {sorted(self.COMMON_FIELDS)}, "
+                    "stream_data_timeout_secs, stream_mute_limit_secs, trade_condition_filter and "
+                    f"{sorted(self.COMMON_FIELDS)}, "
                     "and NautilusTrader would drop an unknown one silently"
                 )
         timeout = bound_secs("stream_data_timeout_secs", stream_data_timeout_secs)
@@ -728,8 +756,30 @@ class AlpacaDataClientConfig(DataClientConfig):
                 f"stream_mute_limit_secs ({limit:g}) must be longer than stream_data_timeout_secs "
                 f"({timeout:g}), so alpaca-py reconnects a silent stream before the client gives it up"
             )
+        if not isinstance(trade_condition_filter, bool):
+            raise TypeError(
+                f"trade_condition_filter must be True or False, not {trade_condition_filter!r}"
+            )
         self.stream_data_timeout_secs = timeout
         self.stream_mute_limit_secs = limit
+        self.trade_condition_filter = trade_condition_filter
+
+
+def check_condition_map(historical: object) -> None:
+    """Read Alpaca's trade-condition map for tapes A, B and C (three GETs through alpaca-py's
+    `RESTClient.get`, checked by `read_condition_map`) and refuse the connect if it shows a code
+    `canon_alpaca.trade_conditions.TABLE` does not know, or answers anything but a map of one-character
+    codes to names."""
+    try:
+        answers = read_condition_map(cast(StockHistoricalDataClient, historical).get)
+    except ValueError as e:
+        raise RuntimeError(f"trade_condition_filter: {e}") from e
+    unknown = unknown_codes(answers)
+    if unknown:
+        raise RuntimeError(
+            "trade_condition_filter: Alpaca's condition map shows codes the adapter's table does not "
+            f"know, so no print could be judged: {', '.join(unknown)}"
+        )
 
 
 def stream_bounds(config: DataClientConfig) -> tuple[float | None, float | None]:
@@ -1267,6 +1317,11 @@ class AlpacaDataClient(MarketDataClient):
         self._reconnects = 0  # alpaca-py's own reconnects, by their warnings (`_on_stream_log`)
         # alpaca-py's `data_timeout` for a stream the client builds, and the mute limit (`_check_mute`).
         self._data_timeout, self._mute_limit = stream_bounds(config)
+        # The venue's bars rule for prints (`AlpacaDataClientConfig.trade_condition_filter`); what it
+        # keeps and leaves out is counted for the process (`condition_counts`).
+        self._condition_filter = isinstance(config, AlpacaDataClientConfig) and bool(
+            config.trade_condition_filter
+        )
         self._last_heard = 0.0  # the loop time of this run's start or its last message
         self._mute_timer: asyncio.TimerHandle | None = None
         self._stream_failure: str | None = None  # why the client stopped this run (`_check_mute`)
@@ -1349,11 +1404,48 @@ class AlpacaDataClient(MarketDataClient):
         # data-only mode: refused before anything is sent unless the client sends GET only; the provider
         # checks its own client the same way each time it fetches it (ADR 0070)
         require_get_only(self._historical)
+        if self._condition_filter:
+            await self._one_historical_call(check_condition_map, self._historical)
         if self._stream is not None:
             self._register_trade_events(self._stream, loop)
         await self._provider.initialize()
         for instrument in self._provider.list_all():
             self._handle_instrument(instrument)
+
+    def _left_out(self, trade: Trade, source: str) -> bool:
+        """With the filter on, whether this print is no tick; one left out is counted for `source` by its
+        codes and named the first time and at each power of ten of its first code's count."""
+        if not self._condition_filter:
+            return False
+        excluded = excluded_by(trade.tape, trade.conditions)
+        if not excluded:
+            return False
+        self._name_left_out(trade, excluded, source)
+        return True
+
+    def _name_left_out(self, trade: Trade, excluded: list[str], source: str) -> None:
+        count = count_print(source, excluded)
+        if count == 1 or is_power_of_ten(count):
+            log = self._log.error if excluded[0].startswith("unknown:") else self._log.info
+            log(
+                f"trade-condition filter: {trade.symbol} print with {' '.join(excluded)} "
+                f"(tape {trade.tape}) is no tick; {count} so far with {excluded[0]} ({source})"
+            )
+
+    def _kept(self, source: str) -> None:
+        """Count a print the filter let through once its tick is made."""
+        if self._condition_filter:
+            count_print(source, [])
+
+    def _sip_only(self, feed: DataFeed, what: str) -> None:
+        """The filter's table is measured on SIP prints only: refuse it on any other feed."""
+        if self._condition_filter and feed != DataFeed.SIP:
+            message = (
+                f"trade_condition_filter is measured on the sip feed only, and these {what} are on "
+                f"{feed.value}"
+            )
+            self._log.error(message)
+            raise ValueError(message)
 
     @override
     async def _disconnect(self) -> None:
@@ -1640,6 +1732,8 @@ class AlpacaDataClient(MarketDataClient):
         A command whose symbols are all subscribed already still has its feed and the stream checked, so
         it is refused as a new one would be."""
         feed, named = self._subscription_feed(params)
+        if self._trades in channels:
+            self._sip_only(feed, "trade subscriptions")
         wildcard = self._flag(params, WILDCARD_PARAM, wildcard_ok)
         serveable = self._serveable(instrument_ids)  # those it cannot serve are logged
         if not serveable:
@@ -1949,7 +2043,15 @@ class AlpacaDataClient(MarketDataClient):
             raise RuntimeError("Alpaca data client is not connected")
         symbol = instrument.id.symbol.value
         feed, _ = named_feed(request.params, TRADES_FEEDS, "trade requests")
+        self._sip_only(feed, "trade requests")
         options = request.params or {}
+        if self._condition_filter and options.get("update_catalog"):
+            message = (
+                "trade_condition_filter leaves prints out, so its ticks cannot go into the catalog "
+                "under the unfiltered trades key: request with update_catalog off"
+            )
+            self._log.error(message)
+            raise ValueError(message)
         unsupported = [key for key in ("asof", "currency") if key in options]
         if unsupported:
             raise ValueError(
@@ -1966,9 +2068,17 @@ class AlpacaDataClient(MarketDataClient):
             start, end = unix_nanos_to_iso8601(start_ns), unix_nanos_to_iso8601(end_ns)
             params = StockTradesRequest(symbol_or_symbols=symbol, limit=request.limit, feed=feed)
             history = await self._one_historical_call(
-                functools.partial(fetch_trades, historical, start_ns=start_ns, end_ns=end_ns),
+                functools.partial(
+                    fetch_trades,
+                    historical,
+                    start_ns=start_ns,
+                    end_ns=end_ns,
+                    condition_filter=self._condition_filter,
+                ),
                 params,
             )
+            for trade, excluded in history.left_out:
+                self._name_left_out(trade, excluded, "request")
             dropped = history.canceled + history.incorrect
             if dropped:
                 self._log.warning(
@@ -1980,6 +2090,7 @@ class AlpacaDataClient(MarketDataClient):
             for n, (trade, ts_event) in enumerate(history.trades, 1):
                 tick = parse_trade(trade, instrument, ts_event, ts_event=ts_event)
                 ticks.append(tick)
+                self._kept("request")
                 if was_rounded(tick.price, trade.price):
                     rounded += 1
                     first_rounded = first_rounded or f"{trade.timestamp} trade price {trade.price}"
@@ -2357,12 +2468,15 @@ class AlpacaDataClient(MarketDataClient):
         if not self._wanted(subscription, trade.symbol, self._trade_symbols):
             return
         self._heard()
+        if self._left_out(trade, "stream"):
+            return
         try:
             instrument = self._equity(InstrumentId(Symbol(trade.symbol), VENUE))
             tick = parse_trade(trade, instrument, self.clock.timestamp_ns())
         except (ValueError, TypeError) as e:
             self._log.error(f"Dropped Alpaca trade: {e}")
             return
+        self._kept("stream")
         if was_rounded(tick.price, trade.price):
             # The consolidated tape carries prices finer than the instrument's: rounded as upstream
             # rounds (`rounded_price`), and named.

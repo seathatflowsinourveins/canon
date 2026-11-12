@@ -595,15 +595,15 @@ data "$@"
 # held to `deadline` seconds by timeout(1) -s KILL. Trades use the adapter's historical prints fetch and
 # the catalog's trade-tick writer, with the same catalog lock, feed marker and pace as bars.
 [tasks."paper:history"]
-description = "Load historical sip bars or trades, or IEX quotes, for listed symbols with one paper account's pair, GET only, paced; or write a feed's nightly movers baseline from the catalog"
+description = "Load historical sip bars or trades, or IEX quotes, for listed symbols with one paper account's pair, GET only, paced; read Alpaca's trade-condition codes per tape; or write a feed's nightly movers baseline from the catalog"
 shell = "bash -c"
 timeout = "6h"
 usage = '''
 arg "<account>" help="tests: account A's pair; windows: account B's pair (ADR 0069, ADR 0093)" {
   choices "tests" "windows"
 }
-arg "[mode]" help="baseline: write from the catalog without reading an account pair" {
-  choices "baseline"
+arg "[mode]" help="baseline: write from the catalog without reading an account pair; conditions: GET Alpaca's trade-condition codes for tapes A, B and C into <catalog>/conditions/trade.json, and with --symbols, --start and --end each symbol's raw prints with their conditions beside it" {
+  choices "baseline" "conditions"
 }
 flag "--session <date>" help="baseline mode: coming trade date, ISO date"
 flag "--sessions-file <file>" help="baseline mode: ordered session calendar including the trade date and five prior sessions"
@@ -632,6 +632,7 @@ esac
 # Each mode refuses the other's flags by name, before any pair is read: `--feed boats` in load mode
 # would load sip into a boats root. Flags carry no usage default, so an unset one is empty here.
 named() { for v in "$@"; do eval "[ -z \"\${usage_$v:-}\" ]" || printf ' --%s' "${v//_/-}"; done; }
+module=  # set by a mode that runs its own module; an inherited value is not used
 case "${usage_mode:-}" in
   baseline)
     wrong=$(named symbols symbols_file start end bars data)
@@ -643,20 +644,29 @@ case "${usage_mode:-}" in
     [ -z "${usage_max_excluded_share:-}" ] || set -- "$@" --max-excluded-share "$usage_max_excluded_share"
     exec /usr/bin/timeout -s KILL "$deadline" uv run --locked python -m canon_trading.movers_baseline "$@"
     ;;
+  conditions)
+    wrong=$(named session sessions_file feed max_excluded_share baseline_dir symbols_file bars data)
+    [ -z "$wrong" ] || { echo "paper:history: conditions mode takes no flag but --catalog, --symbols, --start and --end:$wrong; nothing was read" >&2; exit 3; }
+    set -- --out "${usage_catalog:-catalog}/conditions/trade.json"
+    [ -z "${usage_symbols:-}" ] || set -- "$@" --symbols "$usage_symbols"
+    [ -z "${usage_start:-}" ] || set -- "$@" --start "$usage_start"  # the module refuses one without the others
+    [ -z "${usage_end:-}" ] || set -- "$@" --end "$usage_end"
+    module=canon_trading.trade_conditions
+    ;;
   "")
     wrong=$(named session sessions_file feed max_excluded_share baseline_dir)
     [ -z "$wrong" ] || { echo "paper:history: load mode takes no baseline flag:$wrong; give the baseline mode for those; nothing was read" >&2; exit 3; }
     ;;
   *) echo "paper:history: unknown mode '${usage_mode}'; nothing was read" >&2; exit 3 ;;
 esac
-set -- --start "${usage_start:-}" --end "${usage_end:-}" --bars "${usage_bars:-1-MINUTE,1-DAY}" --catalog "${usage_catalog:-catalog}" --data "${usage_data:-bars}"
-[ -z "${usage_symbols:-}" ] || set -- "$@" --symbols "$usage_symbols"
-[ -z "${usage_symbols_file:-}" ] || set -- "$@" --symbols-file "$usage_symbols_file"
+[ -n "${module:-}" ] || set -- --start "${usage_start:-}" --end "${usage_end:-}" --bars "${usage_bars:-1-MINUTE,1-DAY}" --catalog "${usage_catalog:-catalog}" --data "${usage_data:-bars}"
+[ -n "${module:-}" ] || [ -z "${usage_symbols:-}" ] || set -- "$@" --symbols "$usage_symbols"
+[ -n "${module:-}" ] || [ -z "${usage_symbols_file:-}" ] || set -- "$@" --symbols-file "$usage_symbols_file"
 ALPACA_API_KEY="$(/usr/bin/timeout 30 /usr/bin/security find-generic-password -s "$svc" -a ALPACA_API_KEY -w)" || ALPACA_API_KEY=""
 ALPACA_SECRET_KEY="$(/usr/bin/timeout 30 /usr/bin/security find-generic-password -s "$svc" -a ALPACA_SECRET_KEY -w)" || ALPACA_SECRET_KEY=""
 [ -n "$ALPACA_API_KEY" ] && [ -n "$ALPACA_SECRET_KEY" ] || { echo "paper:history: account ${usage_account}'s pair is not in the login keychain (mise run paper:check ${usage_account}); nothing was read" >&2; exit 1; }
 export ALPACA_API_KEY ALPACA_SECRET_KEY CANON_ALPACA_DATA_ONLY=1
-exec /usr/bin/timeout -s KILL "$deadline" uv run --locked python -m canon_trading.history_load "$@"
+exec /usr/bin/timeout -s KILL "$deadline" uv run --locked python -m "${module:-canon_trading.history_load}" "$@"
 '''
 
 # Alpaca's long-only account setting on one paper account (`no_shorting`, "If true, account becomes long-only

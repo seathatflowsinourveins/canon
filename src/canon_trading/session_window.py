@@ -236,6 +236,7 @@ from canon_alpaca.providers import endpoint_counts
 from canon_alpaca.providers import not_sent
 from canon_alpaca.providers import request_counts
 from canon_alpaca.providers import with_http_timeout
+from canon_alpaca.trade_conditions import condition_counts
 from nautilus_trader.common import LogLevel
 from nautilus_trader.common import logging_sync_to_disk
 from nautilus_trader.config import FileWriterConfig
@@ -1686,6 +1687,9 @@ def _snapshot_requests(report: WindowReport | dict) -> BaseException | None:
     http = mover.get("http_requests") if isinstance(mover, dict) else None
     if isinstance(http, dict):  # the endpoint count at the window's true end, as the budget's
         http["to_window_end"] = endpoint_counts()
+    # the prints a client's trade-condition filter kept and left out, by code: only with one on
+    if isinstance(mover, dict) and (counts := condition_counts()):
+        mover["trade_conditions"] = counts
     if (prior := fields.get("request_budget")) is None:
         return None
     budget = prior if isinstance(prior, dict) else {}

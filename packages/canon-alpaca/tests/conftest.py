@@ -88,6 +88,8 @@ from alpaca.trading.requests import OrderRequest
 from canon_alpaca.constants import ENV_API_KEY
 from canon_alpaca.constants import ENV_SECRET_KEY
 from canon_alpaca.providers import timeout_adapter
+from canon_alpaca.trade_conditions import CONDITIONS_PATH
+from canon_alpaca.trade_conditions import TABLE as CONDITION_TABLE
 
 type Handler = Callable[[object], Awaitable[None]]
 type Message = Quote | Trade | TradeCancel | TradeCorrection
@@ -822,6 +824,12 @@ class FakeHistoricalClient:
         self.max_active = 0  # the most calls that were inside `get_stock_bars` at once
         self._active = 0
         self._count_lock = threading.Lock()
+        # Alpaca's trade-condition map per tape, as the adapter's table knows it; a test adds a code.
+        self.conditions: dict[str, dict[str, str]] = {
+            tape: {code: rule.source for code, rule in rules.items()}
+            for tape, rules in CONDITION_TABLE.items()
+        }
+        self.gets: list[tuple[str, dict | None]] = []
 
     def get_stock_bars(self, request_params: StockBarsRequest) -> BarSet:
         with self._count_lock:
@@ -846,6 +854,9 @@ class FakeHistoricalClient:
                 self._active -= 1
 
     def get(self, path: str, data: dict | None = None) -> dict:
+        self.gets.append((path, data))
+        if path == CONDITIONS_PATH and data is not None:
+            return self.conditions[data["tape"]]
         if path != "/stocks/AAPL/trades":
             raise NotImplementedError(f"Historical stand-in serves empty AAPL trades only: {path}")
         if self.error is not None:
