@@ -23,7 +23,7 @@
     "showAddedDirs": false,
     "showContextBar": true,
     "contextValue": "both",
-    "autoCompactWindow": 300000,
+    "autoCompactWindow": null,
     "contextWarningThreshold": 70,
     "contextCriticalThreshold": 85,
     "showTokenBreakdown": false,

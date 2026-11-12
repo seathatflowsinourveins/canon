@@ -272,8 +272,13 @@ sets the HUD's options at v0.15.0 (`src/config.ts`, `src/schema.ts`). The choice
 * **Shown.** The model with effort as text: the ID in use and its effort. The project, one path level: the
   lane's folder, never a full path. The git branch with `*` for uncommitted changes and ahead/behind counts:
   a branch is unsafe to leave until it is pushed. A context bar and value as `40% (120k/300k)`: tokens and
-  percent. `autoCompactWindow` 300000: the bar measures against canon's compaction point (ADR 0059), with
-  the warning colour at 70% and critical at 85% of it. The session cost: `cost.total_cost_usd`. The
+  percent. The bar measures against the session's own compaction point, with the warning colour at 70% and
+  critical at 85% of it: `autoCompactWindow` is left `null` here, since one value would serve every model,
+  and `statusline.sh` sets the input's `context_window_size` to the window Claude Code documents for the
+  session (`CLAUDE_CODE_AUTO_COMPACT_WINDOW`, else the user settings' `modelSettings.<model>`, which
+  `/autocompact` writes, else `autoCompactWindow`, capped at the model's window; model-config.md, read
+  2026-11-12) and drops `used_percentage`, which measures the full window. Amended 2026-11-12: a fixed
+  300000 pinned a model compacting at 600000 at a red 100% from 300k on. The session cost: `cost.total_cost_usd`. The
   duration: the elapsed session time. Usage compact, always, both windows, with countdown and 24-hour reset
   time: one short line at any width. The Claude Code version: the running CLI. A newer installed version
   waiting on a restart is not available, since no documented input field or command gives it.

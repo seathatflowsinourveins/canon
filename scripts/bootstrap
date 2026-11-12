@@ -318,9 +318,10 @@ compact_row() {
   [ -z "$per" ] || over="$over; per model (modelSettings, /autocompact): $per"
   [ -z "$envv" ] || over="$over; $s sets CLAUDE_CODE_AUTO_COMPACT_WINDOW=$envv, which wins"
   [ -z "${CLAUDE_CODE_AUTO_COMPACT_WINDOW:-}" ] || over="$over; this environment sets CLAUDE_CODE_AUTO_COMPACT_WINDOW=$CLAUDE_CODE_AUTO_COMPACT_WINDOW, which wins"
-  # Claude HUD measures its context bar against its own copy of the window (claude-hud.json, ADR 0007)
+  # the status line gives Claude HUD each session's own window; a window in claude-hud.json would replace it with
+  # one for every model (ADR 0007)
   local hud; hud=$(jq -r '.display.autoCompactWindow // empty | tostring' "$CLAUDE_HOME/claude-hud.json" 2>/dev/null)
-  [ -z "$hud" ] || [ "$hud" = "${have:-$want}" ] || over="$over; claude-hud.json measures the context bar against $hud, not ${have:-$want}"
+  [ -z "$hud" ] || over="$over; claude-hud.json measures every model's context bar against $hud, not each session's window"
   if [ -z "$want" ]; then row "auto-compact window" UNKNOWN "home/.claude/settings.json sets no autoCompactWindow"; return 1
   elif [ "$have" = "$want" ]; then row "auto-compact window" ok "$have tokens, as home/.claude/settings.json sets it$over"
   elif [ -z "$have" ]; then row "auto-compact window" "NOT SET" "$s sets no autoCompactWindow, so the model's default applies (about 967K for a 1M window); run: scripts/bootstrap --user-config$over"; return 1
