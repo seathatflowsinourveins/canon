@@ -97,8 +97,6 @@ from typing import Any
 from uuid import uuid4
 
 from alpaca.common.exceptions import APIError
-from alpaca.data.enums import DataFeed
-from alpaca.data.requests import StockLatestQuoteRequest
 from alpaca.trading.enums import OrderSide as AlpacaOrderSide
 from alpaca.trading.enums import QueryOrderStatus
 from alpaca.trading.enums import TimeInForce as AlpacaTimeInForce
@@ -116,12 +114,9 @@ from canon_alpaca.providers import MethodRefused
 from canon_alpaca.providers import counted
 from canon_alpaca.providers import not_sent
 from canon_alpaca.providers import require_get_only
-from nautilus_trader.model import OrderSide
 
 from . import session_window
 from .paper_node import TRADER_ID
-from .session_ma_cross import LIMIT_OFFSET
-from .session_ma_cross import through_the_touch
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -631,23 +626,11 @@ class _CloseOnly:
         return client_order_id
 
     def _price(self, symbol: str) -> tuple[Decimal, str]:
-        """The close's limit, `limit_offset` through the touch from alpaca-py's latest quote on the part's
-        feed (`session_window.window_feed`), and the quote it came from, for the log."""
-        feed = session_window.window_feed(self.report.part)
+        """The close's limit and the quote it came from, for the log: `session_window.close_limit`, which
+        the account check after a window's stop prices its own by too."""
         if self.client is None:
             self.client = self.data() if callable(self.data) else self.data
-        data = self.client
-        quotes = data.get_stock_latest_quote(
-            StockLatestQuoteRequest(symbol_or_symbols=symbol, feed=DataFeed(feed))
-        )
-        quote = quotes[symbol]
-        bid, ask = Decimal(str(quote.bid_price or 0)), Decimal(str(quote.ask_price or 0))
-        if bid <= 0:
-            raise ValueError(f"the latest {feed} quote has no bid ({bid})")
-        price = through_the_touch(OrderSide.SELL, bid, ask, LIMIT_OFFSET)
-        if price <= 0:
-            raise ValueError(f"the bid {bid} less {LIMIT_OFFSET} is not a price")
-        return price, f"{feed} quote at {quote.timestamp:%H:%M:%S} UTC, bid {bid}, ask {ask}"
+        return session_window.close_limit(self.client, symbol, "sell", self.report.part)
 
     def _work(self, sent: list[str]) -> None:
         """Leave each close working for `CLOSE_WAIT_SECS`, looking it up by its ID each poll; cancel any

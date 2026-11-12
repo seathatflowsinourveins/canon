@@ -4,7 +4,8 @@ Contract: NautilusTrader v2.0.0rc8's `LiveNode.builder`, `LiveNode.add_builtin_s
 and `trade_count`, `LiveExecutionEngineConfig` and `LoggerConfig` with a `FileWriterConfig`
 (`live/__init__.pyi`, `common/__init__.pyi`); alpaca-py 0.45.0's `TradingClient` (paper)
 `get_clock`, `get_calendar`, `get_orders`, `get_all_positions`, `get_asset`, `get_order_by_client_id`,
-`cancel_order_by_id` and `submit_order` with a `MarketOrderRequest`, and `get_account_configurations` and
+`cancel_order_by_id` and `submit_order` with a `MarketOrderRequest` or, after the stop outside the regular
+session, a `LimitOrderRequest`, `StockHistoricalDataClient.get_stock_latest_quote`, and `get_account_configurations` and
 `set_account_configurations` with an `AccountConfiguration`; for a mover window, `ScreenerClient`
 `get_market_movers`, `CorporateActionsClient.get_corporate_actions`, `StockHistoricalDataClient`
 `get_stock_latest_trade`, `get_stock_snapshot` and `get_stock_bars`, and `StockDataStream.subscribe_bars`
@@ -78,9 +79,17 @@ Alpaca's word, an order under its client order ID in a status after which "no fu
 occur", or Alpaca's own refusal of a close. Flat is no open order, no position and that set empty. A
 position still held once nothing works is closed by a market order for the held quantity under a client
 order ID of the check's own (Alpaca's "Using Client Order IDs"), not by `close_position`, which takes no
-ID: an order sent that way can be looked up whatever became of its answer. It is sent only while Alpaca's
-clock, read just before, says the regular session is open, as upstream's market exit closes again once
-nothing works, and never while a request that could close the same shares is sent and not found, since
+ID: an order sent that way can be looked up whatever became of its answer. It is a market order only while
+Alpaca's clock, read just before, says the regular session is open, as upstream's market exit closes again
+once nothing works. Outside it (a window that woke after its end, past the close: the resume work's change
+A, 2026-11-11), a market order would only queue ("Orders not eligible for extended hours submitted after
+4:00pm ET will be queued up for release the next trading day"), and Alpaca takes for extended hours "Only
+limit orders with `time_in_force` set to `day` or `gtc`" with `extended_hours` true (orders-at-alpaca); so,
+in a part of the extended session open by that clock and the window's calendar (`session_part`), the close
+is a DAY limit so marked, `LIMIT_OFFSET` through the latest quote on the part's feed, as the strategy and
+`custody`'s close-only form price theirs. It works only while the check runs and is canceled as it ends;
+with no part open none is sent. Either close is never sent while a request that could close the same
+shares is sent and not found, since
 a lookup that finds nothing does not show the order was never placed and Alpaca says not to resend one
 that timed out; such a window is recorded failed, naming the position and the request. What a market
 order lacks that `close_position` had: Alpaca does not refuse it for a position that has gone, so it is
@@ -201,6 +210,7 @@ from alpaca.trading.models import Clock as AlpacaClock
 from alpaca.trading.models import Position as AlpacaPosition
 from alpaca.trading.requests import GetCalendarRequest
 from alpaca.trading.requests import GetOrdersRequest
+from alpaca.trading.requests import LimitOrderRequest
 from alpaca.trading.requests import MarketOrderRequest
 from canon_alpaca.constants import ENV_API_KEY
 from canon_alpaca.constants import ENV_SECRET_KEY
@@ -259,6 +269,7 @@ from .paper_node import ema_cross_config
 from .position_cap import PositionCap
 from .position_cap import position_cap_config
 from .session_ma_cross import LIMIT_OFFSET
+from .session_ma_cross import LIMIT_TIMEOUT_SECS
 from .session_ma_cross import WARM_UP_SPARE_BARS
 from .session_ma_cross import SessionMaCross
 from .session_ma_cross import SessionMaCrossConfig
@@ -333,6 +344,11 @@ FLATTEN_SECS = 120
 trades until the stop, and an order it sent then is the account check's to settle (ADR 0060)."""
 END_TICK_SECS = 1.0
 """How often the node's run reads the wall clock against the window's end (`_run_until`)."""
+SLEPT_SECS = 10.0
+"""How far the wall clock may run ahead of the monotonic one over a node's run before the record says the
+process was suspended (`WindowReport.overrun`). On this host `time.monotonic` is `mach_absolute_time`
+(`time.get_clock_info`), which stops while the machine sleeps, as the wall clock does not (#250's record).
+UNCALIBRATED: it only has to be above what a clock adjustment makes, which is not measured here."""
 STRATEGY_ID = StrategyId("SessionMaCross-001")
 
 
@@ -983,6 +999,10 @@ class WindowReport:
     `ts_init` less the order's first event's (`OrderInitialized`), both on the node's clock. An order denied
     or rejected before Alpaca accepted it has none; it is in `denials` (Muse's finding 5)."""
     worst_submit_delay_ms: int | None = None
+    overrun: str = ""
+    """Set when the process was suspended during the node's run (a machine sleep, `SLEPT_SECS`): for how
+    long, and how far past the window's end its stop ended; the account check after it is what makes the
+    account flat, in whichever part of the session it woke."""
 
 
 class WindowRefused(RuntimeError):
@@ -1090,7 +1110,7 @@ def paper_trading() -> TradingClient:
     )
 
 
-def send_once(trading: TradingClient) -> None:
+def send_once(trading: object) -> None:
     """Make alpaca-py send each of `trading`'s requests once (module header): `RESTClient._request` then
     raises a 429 or 504 as an `APIError` instead of repeating it outside the account check's deadline.
     The start-up reads keep alpaca-py's retries; a stand-in client is left as it is."""
@@ -1772,6 +1792,7 @@ def run_window(
         config.log_dir, report
     )  # `running`: a window killed from here on leaves this behind
     started = time.monotonic()
+    started_wall = datetime.now(UTC)
     abandoned_before = len(_ABANDONED)
     failure: BaseException | None = None
     ran = False  # whether the node was run: only then is the gap marker written
@@ -1795,6 +1816,7 @@ def run_window(
         finally:
             try:
                 report.seconds = round(time.monotonic() - started, 1)
+                report.overrun = overrun(started_wall, time.monotonic() - started, ends)
                 _fill(report, cache, strategy_id)
                 report.dropped = list(strategy.dropped)
                 report.warm_up_bars = strategy.history_bars
@@ -1828,6 +1850,9 @@ def run_window(
                 config,
                 report,
                 unsettled={c: side for c, (side, _) in unsettled.items()},
+                calendar=calendar,
+                calendar_on=clock.timestamp.astimezone(NEW_YORK).date(),
+                data=window_data,
             )
         except BaseException as e:  # the account could not be checked: never recorded as ok
             failure = failure or e
@@ -1873,6 +1898,22 @@ def run_window(
     if over_budget:
         raise RuntimeError(f"the window went over its request budget: {over_budget}")
     return report
+
+
+def overrun(started_wall: datetime, ran: float, ends: datetime) -> str:
+    """What `WindowReport.overrun` says of a node run that began at `started_wall` and ran `ran` seconds
+    of the monotonic clock: "" unless the wall clock ran more than `SLEPT_SECS` ahead of it."""
+    now = datetime.now(UTC)
+    slept = (now - started_wall).total_seconds() - ran
+    if slept <= SLEPT_SECS:
+        return ""
+    past = (now - ends).total_seconds()
+    when = (
+        f"its stop ended {past:.0f} s past the window's end"
+        if past > 0
+        else f"it woke {-past:.0f} s before the window's end"
+    )
+    return f"the process was suspended for about {slept:.0f} s (a machine sleep); {when}"
 
 
 def mover_entry_limit(data: StockHistoricalDataClient, symbol: str) -> Decimal:
@@ -2026,6 +2067,12 @@ class _Unsettled:
     """Alpaca's order under the ID as last seen, still working; None until Alpaca shows one."""
     asked: bool = False
     """Whether Alpaca has answered a lookup of it at all."""
+    extended: bool = False
+    """A close of the check's own sent outside the regular session: a marketable DAY limit marked
+    `extended_hours` (`_AccountCheck._close`), left to work `LIMIT_TIMEOUT_SECS` and never past the
+    check's end."""
+    sent_at: float = 0.0
+    """When the check sent it (`time.monotonic`)."""
 
     def missing(self) -> str:
         what = "close" if self.own else "order"
@@ -2043,10 +2090,26 @@ class _AccountCheck:
         symbol: str,
         report: WindowReport,
         unsettled: Mapping[str, str],
+        *,
+        calendar: AlpacaCalendar | Sequence[AlpacaCalendar] | None = None,
+        calendar_on: date | None = None,
+        data: Any = None,
     ) -> None:
         self.trading = trading
         self.symbol = symbol
         self.report = report
+        self.calendar = calendar
+        """Alpaca's calendar as the window read it at its start, which places the extended session's
+        parts (`session_part`); read here only if a close outside the regular session needs it and the
+        clock's day is not the one it was read on (`calendar_on`; a window that slept into another day)."""
+        self.calendar_on = calendar_on
+        self.extended_refused = False
+        """Whether Alpaca refused a close outside the session (an asset not tradable overnight, say): no
+        other is sent in this check."""
+        self.data = data
+        """alpaca-py's market data client, or a callable that builds one, for the quote a close outside
+        the regular session is priced from; built on the first such close."""
+        self.clock: AlpacaClock | None = None  # the clock's last answer
         self.requests = {c: _Unsettled(c, side) for c, side in unsettled.items()}
         self.turn = deque(self.requests)  # whose lookup comes next
         self.closes_sent = 0
@@ -2147,17 +2210,40 @@ class _AccountCheck:
             _note(self.report, f"reading Alpaca's clock: {type(e).__name__}: {e}")
             return time.monotonic() < self.open_until
         assert isinstance(clock, AlpacaClock)
+        self.clock = clock
         if clock.is_open:
             self.open_until = asked_at + (clock.next_close - clock.timestamp).total_seconds()
         else:
             self.open_until = asked_at
         return bool(clock.is_open)
 
+    def extended_part(self) -> str:
+        """The part of the extended session open by the clock's last answer (`session_part`): `pre-market`,
+        `after-hours` or `overnight`, or "" with the reason noted. The calendar is the window's own while
+        the clock's day is the one it was read on, else read here, as `session_now` reads it."""
+        assert self.clock is not None
+        today = self.clock.timestamp.astimezone(NEW_YORK).date()
+        if self.calendar is not None and self.calendar_on is None:
+            self.calendar_on = today  # given with no day: taken as today's
+        if self.calendar is None or self.calendar_on != today:
+            days = self.trading.get_calendar(
+                GetCalendarRequest(start=today - CALENDAR_BACK, end=today + timedelta(days=1))
+            )
+            self.calendar, self.calendar_on = (list(days) if isinstance(days, list) else []), today
+        try:
+            return session_part("extended", self.clock, self.calendar)[1]
+        except RuntimeError as e:
+            _note(self.report, f"not closing the position: no part of a session is open: {e}")
+            return ""
+
     def cancel(self, *, final: bool = False) -> None:
         """Cancel what works, those not yet tried first: `CANCELS` orders in a poll; as the check ends,
         every one, a further cancel starting only while the step has taken under the time `CANCELS - 1`
         requests may, so the step stays inside the `CANCELS` requests counted for it. A close of the
-        check's own is left to fill while it still closes the position held and the session is open."""
+        check's own is left to fill while it still closes the position held and the session is open; one
+        sent outside the regular session (`extended`) for `LIMIT_TIMEOUT_SECS`, as the strategy leaves
+        its own limits, then canceled, so the next is priced from a fresh quote, and canceled as the check
+        ends, so none Alpaca has shown works once the process has gone."""
         unwanted, wanted = [], []
         for order in self.working():
             request = self.requests.get(str(order.client_order_id))
@@ -2167,6 +2253,10 @@ class _AccountCheck:
                 and self.held
                 and request.side == _closing_side(self.held)
             )
+            if closes and request is not None and request.extended:
+                if final or time.monotonic() - request.sent_at >= LIMIT_TIMEOUT_SECS:
+                    unwanted.append(order)
+                continue
             (wanted if closes else unwanted).append(order)
         if wanted:
             try:
@@ -2214,48 +2304,77 @@ class _AccountCheck:
                 f"may still be placed: a second {side} is not sent",
             )
             return True
-        if not self.session_open(fresh=True):
-            _note(
-                self.report,
-                "not closing the position: Alpaca's clock says the regular session is closed, "
-                "so a market close would only queue",
-            )
+        if self.session_open(fresh=True):
+            self._close(side)
+            return True
+        # Outside the regular session a market order would only queue: Alpaca takes a limit order
+        # marked extended hours, DAY or GTC, in pre-market, after-hours and overnight (module header).
+        if self.extended_refused or not (part := self.extended_part()):
             return bool(self.requests)
-        self._close(side)
+        try:
+            window_feed(part)
+        except RuntimeError as e:  # no feed set for the part, so no quote to price a close from
+            _note(self.report, f"not closing the position: {e}")
+            return bool(self.requests)
+        if self.data is None or callable(self.data):
+            self.data = (self.data or window_data)()
+            send_once(self.data)
+        try:
+            limit, quote = close_limit(self.data, self.symbol, side, part)
+        except FAILED as e:  # looked for again in the next poll
+            _note(self.report, f"no price for a {part} close: {type(e).__name__}: {e}")
+            return True
+        self._close(side, limit=limit, quote=f"{part}, {quote}")
         return True
 
-    def _close(self, side: str) -> None:
-        """Send a market order for the held quantity under a client order ID of the check's own, which
-        finds it again whatever becomes of the answer. A close that placed nothing (Alpaca's refusal, or
-        a connect timeout on its only attempt) is settled at once and counted; any other failure leaves
-        it unsettled."""
+    def _close(self, side: str, *, limit: Decimal | None = None, quote: str = "") -> None:
+        """Send a close for the held quantity under a client order ID of the check's own, which finds it
+        again whatever becomes of the answer: in the regular session a DAY market order; outside it a DAY
+        limit at `limit`, marked `extended_hours`. A close that placed nothing (Alpaca's refusal, or a
+        connect timeout on its only attempt) is settled at once and counted; any other failure leaves it
+        unsettled."""
         qty = abs(self.held)
         self.closes_sent += 1
         client_order_id = (
             f"{CLOSE_ID_PREFIX}{self.report.started}-{self.closes_sent}-{uuid4().hex[:8]}"
         )
-        request = _Unsettled(client_order_id, side, own=True)
+        request = _Unsettled(
+            client_order_id, side, own=True, extended=limit is not None, sent_at=time.monotonic()
+        )
         self.requests[client_order_id] = request
         self.turn.appendleft(client_order_id)  # looked up first in the next reading
-        log = self.report.closes.setdefault(
-            client_order_id, [f"sent: {side} {qty} {self.symbol} at market"]
-        )
-        try:
-            order = counted(self.trading.submit_order)(
-                MarketOrderRequest(
-                    symbol=self.symbol,
-                    qty=float(qty),
-                    side=AlpacaOrderSide(side),
-                    time_in_force=AlpacaTimeInForce.DAY,
-                    client_order_id=client_order_id,
-                )
+        if limit is None:
+            what = f"sent: {side} {qty} {self.symbol} at market"
+            order_request: MarketOrderRequest | LimitOrderRequest = MarketOrderRequest(
+                symbol=self.symbol,
+                qty=float(qty),
+                side=AlpacaOrderSide(side),
+                time_in_force=AlpacaTimeInForce.DAY,
+                client_order_id=client_order_id,
             )
+        else:
+            what = f"sent: {side} {qty} {self.symbol} limit {limit}, DAY, extended hours ({quote})"
+            order_request = LimitOrderRequest(
+                symbol=self.symbol,
+                qty=float(qty),
+                side=AlpacaOrderSide(side),
+                time_in_force=AlpacaTimeInForce.DAY,
+                limit_price=float(limit),
+                extended_hours=True,
+                client_order_id=client_order_id,
+            )
+        log = self.report.closes.setdefault(client_order_id, [what])
+        try:
+            order = counted(self.trading.submit_order)(order_request)
         except FAILED as e:
             refused = isinstance(e, APIError) and e.status_code in DEFINITIVE_SUBMIT_REFUSALS
             if refused or not_sent(e):  # Alpaca's own answer, or nothing sent: nothing was placed
                 del self.report.closes[client_order_id]
                 self.report.closes_not_placed += 1
                 self._settle(request)
+                # nothing works, so the refusal is of the close itself (an asset not tradable in the
+                # part): sending it again each poll would be refused again
+                self.extended_refused = self.extended_refused or (refused and request.extended)
             elif isinstance(e, APIError):
                 log.append(f"no answer: HTTP {e.status_code}")
             else:
@@ -2265,6 +2384,37 @@ class _AccountCheck:
             log.append("no answer: no order in the response")
             return
         self._seen(request, order)
+
+
+def close_limit(data: Any, symbol: str, side: str, part: str) -> tuple[Decimal, str]:
+    """The limit of a close of `side` in `part` outside the regular session: `LIMIT_OFFSET` through the
+    touch of alpaca-py's latest quote on the part's feed (`get_stock_latest_quote`, `window_feed`), as the
+    strategy prices its own (`through_the_touch`), and the quote it came from, with its time, for the
+    record. `ValueError` with no price on the side the close takes; `window_feed`'s error for a part with
+    no feed. The account check after a stop and `custody`'s close-only form both price this way."""
+    feed = window_feed(part)
+    found = data.get_stock_latest_quote(
+        StockLatestQuoteRequest(symbol_or_symbols=symbol, feed=DataFeed(feed))
+    )
+    quote = found.get(symbol) if isinstance(found, dict) else None
+    if quote is None:
+        raise ValueError(f"no latest {feed} quote in {symbol}")
+    bid = Decimal(str(getattr(quote, "bid_price", None) or 0))
+    ask = Decimal(str(getattr(quote, "ask_price", None) or 0))
+    touch, name = (bid, "bid") if side == "sell" else (ask, "ask")
+    if touch <= 0:
+        raise ValueError(f"the latest {feed} quote in {symbol} has no {name} ({touch})")
+    limit = through_the_touch(
+        OrderSide.SELL if side == "sell" else OrderSide.BUY, bid, ask, LIMIT_OFFSET
+    )
+    if limit <= 0:
+        raise ValueError(f"the {name} {touch} less {LIMIT_OFFSET} is not a price")
+    at = getattr(quote, "timestamp", None)
+    if isinstance(at, datetime):  # alpaca-py's are aware; a naive one is taken as UTC
+        when = f"at {(at.astimezone(UTC) if at.tzinfo else at):%H:%M:%S} UTC"
+    else:
+        when = "with no time given"
+    return limit, f"{feed} quote {when}, bid {bid}, ask {ask}"
 
 
 def _closing_side(held: Decimal) -> str:
@@ -2277,6 +2427,9 @@ def _flatten_after_stop(
     report: WindowReport,
     *,
     unsettled: Mapping[str, str] | None = None,
+    calendar: AlpacaCalendar | Sequence[AlpacaCalendar] | None = None,
+    calendar_on: date | None = None,
+    data: Any = None,
 ) -> list:
     """What the account holds after the stop, once the check has worked at clearing the symbol: the
     reading is of the whole account, and what another symbol holds is named and left alone.
@@ -2291,9 +2444,15 @@ def _flatten_after_stop(
     end. A poll reads (`_AccountCheck.read`: up to `LOOKUPS` lookups, in turn, then the open orders and
     the position) and, if the account is not flat, acts (`act`): an order that works, listed or shown by
     its lookup, is canceled, on every poll until Alpaca shows it ended, in any session, up to `CANCELS`
-    a poll; with none working, a position still held is closed by a market order for the held quantity
-    under a client order ID of the check's own, sent only if Alpaca's clock, read just before, says the
-    regular session is open. A close's answer that is lost (anything but Alpaca's refusal, or a connect
+    a poll; with none working, a position still held is closed for the held quantity under a client
+    order ID of the check's own: by a market order if Alpaca's clock, read just before, says the regular
+    session is open; else, if a part of the extended session is open by that clock and the window's
+    `calendar` (`session_part`), by a DAY limit marked `extended_hours`, `LIMIT_OFFSET` through the touch
+    of the latest quote on the part's feed (`close_limit`; `data`, alpaca-py's market data client or a
+    callable that builds one, `window_data` when not given), left `LIMIT_TIMEOUT_SECS` and then canceled,
+    so the next is priced afresh, and canceled as the check ends; one Alpaca refuses is not sent again in
+    the check; with no part open, none is sent and the position is named in the result. The calendar is
+    the window's, read on `calendar_on`, and read again for a clock on another day. A close's answer that is lost (anything but Alpaca's refusal, or a connect
     timeout that sent nothing) leaves the close unsettled: it is looked up by its ID in its turn, and no
     other close is sent while it, or a node
     order on its side, is sent and not found, since Alpaca may still place it (Alpaca: "You should not
@@ -2307,7 +2466,15 @@ def _flatten_after_stop(
     steps are skipped, or, for one lookup or one cancel, the next goes on. The result is the last reading; if the last reading failed, what the
     one before it showed with what the check has sent since; if none succeeded, `RuntimeError`."""
     send_once(trading)
-    check = _AccountCheck(trading, config.symbol, report, unsettled or {})
+    check = _AccountCheck(
+        trading,
+        config.symbol,
+        report,
+        unsettled or {},
+        calendar=calendar,
+        calendar_on=calendar_on,
+        data=data,
+    )
     deadline = time.monotonic() + AFTER_STOP_SECS
     left: list[str] | None = None
     last_error = ""
