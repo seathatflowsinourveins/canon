@@ -53,6 +53,14 @@ Chosen: **option 1**. Option 2 hides which piece moved; option 3 pins nothing.
    0086's review configuration on the `dsh-tui` profile (`review-acp` is not that configuration). The
    bundle's own code is empty; its dependency `dsh-terminal-bash` spawns the shells, confined by the
    host sandbox unless its mode is `danger-full-access`. The profiles' sandbox mode is `UNVERIFIED`.
+5. **`dsh-subagent-codex`** (`packages/subagent/subagent-codex`, MIT), `tool`, at `dsh-v0.2.1-rc.3`,
+   build arm only: delegates one task to a fresh Codex thread in the parent workspace through its own
+   `@openai/codex` 0.153.4, outside the `codex-cli` pin. Key-like variables are scrubbed from the child's
+   environment, so it runs under whatever login `CODEX_HOME` and `HOME` point to where `dsh` started.
+   `permissionMode` defaults to `never`, which declines approvals and leaves the sandbox to Codex's
+   settings. Which login, mode and sandbox `build-acp` gets is `UNVERIFIED`. It sends a task, not the
+   transcript, so ADR 0072 rule 6 places it by extension: another family answers, and it edits the
+   workspace.
 
 ### Consequences
 
@@ -116,6 +124,15 @@ Read 2026-11-11.
   `packages/terminal/terminal-bash/src/index.ts` under `ctx.sandbox.confine` except in
   `danger-full-access` (resolved): a channel to another model or to earlier sessions exists only
   through what a shell can reach.
+* `deepseek-harness` at `dsh-v0.2.1-rc.3`, `packages/subagent/subagent-codex` — `package.json` (MIT;
+  `@openai/codex` `0.153.4`), README Summary and options table (`permissionMode` default `never`;
+  native configuration and authentication authoritative) (resolved).
+  https://registry.npmjs.org/@deepseek-ai/dsh-subagent-codex/0.2.1-rc.3 (fetched; no `gitHead`, so its match to
+  the tag is by content only).
+* `deepseek-harness` at `dsh-v0.2.1-rc.3`, `packages/subprocess/subprocess/src/index.ts`,
+  `scrubbedParentEnv()` — drops variables whose names contain `KEY`, `PASSWORD`, `SECRET` or `TOKEN`;
+  `HOME` and `CODEX_HOME` pass (a second reader, 2026-11-11, resolved). It also found that an
+  Orca-started session's `CODEX_HOME` is an Orca-managed home, not `~/.codex` (path names only).
 * A second reader checked this record on 2026-11-11: it settled the SDK's schema minor, corrected how
   the profiles are started and what the `line` holds off, and asked for the scope note; all are in. A
   second reader of item 2 corrected the entry count from 10,584 to 10,581 and asked that the list's
