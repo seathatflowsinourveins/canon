@@ -7,6 +7,8 @@ review-by: 2026-12-11
 
 # Strategy focus: extreme movers, built from upstream parts in four steps; the ranking score, the adapter's part of a changing universe, the strategy class and halts each wait on a record of their own
 
+*Amended 2026-11-12 by ADR 0106, which carries the Mover composition's changes to this record.*
+
 ## Context and Problem Statement
 
 The owner decided on 2026-11-11 that strategy work in this repository concerns extreme movers only. The
@@ -22,9 +24,8 @@ what has no upstream, and in what order does the work start? Nothing here recomm
      a ratio against the symbol's own normal for that time of day, not an amount of dollar volume. A
      stale ranking means no entry.
   2. **Enter early.** Buy the first rising run of the first leg with a limit order, in every session;
-     an extended move only on a pullback and reclaim. Paper size follows the startup account allocation
-     (Paper sizing below, replacing risk sizing on paper 2026-11-11); the original risk-sizing row remains a
-     legacy simulation setting.
+     an extended move only on a pullback and reclaim. Size comes from risk (on paper, replaced 2026-11-11;
+  Paper sizing below).
   3. **Protect.** A sell trigger below the entry, outside the tape's noise, that only rises with the
      high; a gain lock once the gain covers its costs; a breach must persist before the fast sell, a
      limit that chases within a cap. A broker stop is the backstop for an outage only.
@@ -64,8 +65,7 @@ no upstream ships those parts, and none is written here.
 | Ranking score | None | **Gap 1** |
 | A universe that changes in a session | Subscriptions take one id or a list (`nt:python/nautilus_trader/common/__init__.pyi:818-835`, `docs/concepts/actors.md:559`); `request_instrument` (`:989-997`); `Controller` creates and removes strategies at run time, in a live node and a backtest (`nt:python/nautilus_trader/trading/__init__.pyi:97-118`, `live/__init__.pyi:1164`; `BacktestEngineConfig(controller=…)`, `backtest/__init__.pyi:159`) | **Gap 2** |
 | Entry | `OrderFactory.limit` (`nt:…/common/__init__.pyi:1388`); the adapter's `extended_hours` param (ADR 0038) | Exists |
-| Paper size | Alpaca TradeAccount.buying_power and cash, divided by configured slots, whole shares through instrument.make_qty | ADR 0091; cash funding limit reproduced against pinned rc8; no margin model |
-| Legacy size from risk | `FixedRiskSizer.calculate(entry, stop_loss, equity, risk, …, hard_limit)` (`nt:python/nautilus_trader/risk/__init__.pyi:16-29`, `crates/risk/src/sizing.rs:87-89`) | Explicit simulations only |
+| Size from risk | `FixedRiskSizer.calculate(entry, stop_loss, equity, risk, …, hard_limit)` (`nt:python/nautilus_trader/risk/__init__.pyi:16-29`, `crates/risk/src/sizing.rs:87-89`) | To adopt at M1 |
 | Rising trigger, fast exit | The order emulator: `TRAILING_STOP_LIMIT` on `BID_ASK` or `LAST_PRICE`, released as a `LIMIT` through the risk engine (`nt:docs/concepts/orders/emulated.md:15-19`, `:71-73`, `:129`; `…/common/__init__.pyi:1523-1541`) | UNVERIFIED on paper: M1 |
 | Backstop | Alpaca's stop and trailing stop (`ap:alpaca/trading/requests.py:496`, `:624`) | Regular session only: a trailing stop "will not trigger outside of the regular market hours", and extended hours take limit orders only |
 | Halts | Trading-status messages (`ap:…/live/stock.py:135-145`) into `InstrumentStatus` (`nt:python/nautilus_trader/live/clients.py:267`, `docs/developer_guide/python_adapters.md:246`) | **Gap 4** |
@@ -75,9 +75,12 @@ no upstream ships those parts, and none is written here.
 
 **The gaps.** Each stops the work it names until a `proposed` record of its own lands, before any code.
 
-1. **The ranking score.** ADR 0087 records the score, its pure inputs and the actor that publishes
-   `movers-rank`; ADR 0091 composes it with a fixed startup roster. Paper delivery is UNVERIFIED until
-   the baseline artifact and adapter's external data are present.
+1. **The ranking score.** No upstream ships it. The requirement names move times unusual volume and no
+   more is fixed here: M0's probe takes the ratio of dollar volume to its own normal
+   (`canon_trading.movers_stream`), UNCALIBRATED. The score's own record states the formula, sources
+   each factor's definition at an upstream or a vendor's page, or registers it UNCALIBRATED, and says
+   whether the ratio is of dollars or of shares. Its code is arithmetic over upstream bars and
+   snapshots, nothing more.
 2. **A changing universe.** The mechanism is upstream and this adapter's part is unbuilt. Upstream's
    Polymarket adapter loads a missing instrument at run time on a subscription or `request_instrument`,
    and its Hyperliquid adapter passes new definitions to the execution client without a restart
@@ -91,10 +94,6 @@ no upstream ships those parts, and none is written here.
    cap is a map fixed at node build, an instrument outside it has no limit, and its setter has no Python
    binding (`nt:crates/risk/src/engine/mod.rs:1448-1454`, `:441-446`): an instrument without an entry is
    not traded, and a late one has an entry only if the map is filled from the asset list at build.
-   **Composition update, 2026-11-11 (ADR 0091):** the startup sample supplies several qualified names,
-   loaded into both providers and the reconciliation/risk maps before the node starts. One Mover
-   rotates within that fixed roster; each name has its own entry share cap and position monitor.
-   This enables several slots without Controller; runtime admission of a new name remains unbuilt.
 3. **The strategy class.** The pin ships five example strategies, none of this kind
    (`nt:crates/trading/src/examples/strategies`). It is the one piece written here, a composition of the
    rows above, in a record of its own before any code.
@@ -107,12 +106,6 @@ beyond the owner's practice: every NMS common stock and ADR at any price; entrie
 move at least 3%, volume ratio at least 3, trade acceleration at least 1.5; five names at once, two for
 movers; planned risk 1% a trade (on paper, replaced 2026-11-11; Paper sizing below), capped at 5% of the prior five minutes' dollar volume; limit orders
 only outside the regular session; the broker stop under 3%.
-The lead's later 2026-11-11 paper instruction supersedes that size row: read reported buying_power at
-each startup and divide by actual configured slots. The adapter models CASH, so after reproducing its
-free-balance denial the instructed conditional engine limit makes the figure min(buying_power, cash)/slots,
-named in the record. This uses no numeric monetary policy constant, extra multiplier, DTBP or PDT field.
-Paper Mover does not use FixedRiskSizer, risk or volume clamps to size; the older rule remains explicit
-in simulations. ADR 0091 carries the shared figure through selection, entries, caps and the rank actor.
 
 **The adoption test.** A rule is adopted only when it beats both the incumbent and holding flat at
 doubled costs, with a deflated Sharpe ratio at 0.95 or above; merit on paper has a floor of at least 30
@@ -140,12 +133,8 @@ the gate counts no round trips, so M3's pre-registration fixes what each term me
   emulated trailing stop-limit, ending flat, in every session. It needs gaps 1 and 3 recorded, the
   window's SPY-only refusal and $1,000 cap replaced (`session_window.py:531`, `paper_node.py:58`), and
   flat checked across the account.
-* **M2.** A fixed startup roster, re-entry and rotation in one Mover (ADRs 0088/0091). The current
-  paper rows are seven held slots in every part (ten and one before 2026-11-12), configurable by `--slots`,
-  with `--spares` additional names (default 2, UNCALIBRATED). Entries have no count bound; a sale
-  frees its slot for a reclaim after the cooldown or another ranked name until wind-down. ADR 0087's
-  actor re-ranks the loaded roster; missing/stale/invalid ranking means no entry. A paper run of this
-  composition is UNVERIFIED; Controller is reserved for future runtime admission outside the roster.
+* **M2.** Five names with two mover slots, re-entry and rotation. It needs gap 2 closed and a paper run
+  of `Controller` first.
 * **M3.** A pre-registered replay study through the gate: the starting rows as configurations, against
   holding flat at 1x and 2x costs. A replay cannot read the screener, so it rebuilds the universe from
   bars of every symbol, and the provider loads active assets only, so the delisted are missing.
@@ -162,15 +151,14 @@ coordinator started on 2026-11-11). The engine's per-order notional cap is the e
 multiple (`mover_window.OUTER_BOUND_MULTIPLE`, 10), so the sale of a position that rose is never denied (ADR
 0088). The slots are 7 in the regular session and 7 after hours (the lead, 2026-11-11), raised only after two
 paper firings show room, and 7 in pre-market and overnight too, by the same worst-minute count (the lead,
-2026-11-11); going above that count needs two records that agree. One limit: a paper fill takes any size at
-the quote (Alpaca's paper page: "Your order quantity is not checked against the NBBO quantities"), so a size far beyond a name's traded
+2026-11-11); going above that count needs two records that agree. What the rule does to `max_shares` and the
+position cap is settled when it is built. One limit: a paper fill takes any size at the quote (Alpaca's paper
+page: "Your order quantity is not checked against the NBBO quantities"), so a size far beyond a name's traded
 volume teaches less than it seems to. The comparison of fills against a replay is where that shows. It is a
-learning note, not a cap. Live is untouched and stays the owner's. This replaces the window's former sizing
-(`mover.py`) on paper; ADR 0091 carries the same text for the window. Built with the composition
-(2026-11-12): each Mover node's entry is `min(buying_power, cash) / slots` from one startup account read
-(`session_window`), taken in whole shares by `Mover` with `size_from_budget=True`, and the engine's per-order
-cap is that entry times `OUTER_BOUND_MULTIPLE`. `FixedRiskSizer` at `risk` 0.01 remains only for explicit
-simulations.
+learning note, not a cap. Live is untouched and stays the owner's. This replaces the window's present sizing
+(`mover.py`) on paper; ADR 0091 carries the same text for the window. Not built yet: on 2026-11-11 the window
+sizes by `FixedRiskSizer` at `risk` 0.01 (`mover.py`) under a 500-dollar entry bound
+(`mover_window.ENTRY_NOTIONAL_USD`, applied as `max_shares`) and a 5,000-dollar engine cap.
 
 **Slots measured, dated 2026-11-11.** A reader of the night's instrumented paper windows found the worst count
 of trading-API requests in any 60 seconds of one window at 14 to 15, in the regular session and after hours
@@ -184,90 +172,22 @@ it. Under `Mover`'s soft line of 140 in one process the same arithmetic gives 9.
 no instrumented round trip, so their slots are not measured; the per-order model below gives 3 names outside
 the regular session at 160 (1 at the old 100), and the lead set them at 7 by the same count.
 
-**The request budget, measured 2026-11-11 (Task M gap 7).** The earlier 19/47-per-order planning
-coefficients were UNVERIFIED; ADR 0076 is absent, and they are replaced by the following offline
-measurement, not promoted to a worst-case guarantee. Alpaca's own archived Trading API documentation
-(Evidence, "Rate Limit") states 200 requests a minute per key, including paper. That is the default
-`request_limit_per_minute` setting, never a value obtained from an account. ADR 0088's 180-in-60-s
-failure ceiling and Mover's existing entry soft line stay in force. Current paper/live enforcement
-and per-key versus per-account scope are UNVERIFIED, as ADRs 0049 and 0069 record.
+**The request budget, historical as of 2026-11-11**: a `Mover` window now fails at 180, not the 100 below
+(`session_window.REQUEST_CEILING`; ADR 0091's request budget). The per-order figures stay UNVERIFIED. As
+first written (ADR 0076, numbered and not yet on `main`; its figures UNVERIFIED here until it lands): the
+engine's checks cost 7 trading-API requests a minute whatever the count of names, one order at worst 19 in
+the regular session and 47 outside it, and a run fails at 100 in any 60 seconds on an account that allows
+200. With N names each sending one order in a minute, the worst minute is 7 + 19N and 7 + 47N:
 
-`mise exec -- uv run --locked pytest tests/test_request_budget.py` runs a scripted workload on the
-pinned NautilusTrader `BacktestEngine`, cash/netting with quotes and the native 50 submits/minute
-setting. In each slot a limit buy fills, a limit sell fills, a buy-back fills, and a fourth limit
-ends flat, all within one minute. With chasing enabled, the first sale rests, is canceled after five
-seconds and resubmitted on the following quote, eight times before filling; every replacement's
-price comes down. The generated submit/cancel commands are then replayed through the actual
-`AlpacaExecutionClient` and alpaca-py to an in-memory `HTTPAdapter.send` boundary. The backtest checks
-fills and final positions; the second stage counts HTTP attempts, including the SDK's retries, with
-regular and extended-hours flags. A fresh instance of the normal request counter on the simulation
-clock independently confirms totals and both peaks without adding synthetic traffic to other tests.
-It does not replay Mover's ranking, cooldown or entry decisions.
+| N | 1 | 2 | 3 | 4 | 5 |
+|---|---|---|---|---|---|
+| Regular session | 26 | 45 | 64 | 83 | 102 |
+| Outside it | 54 | 101 | 148 | 195 | 242 |
 
-For this fixture's HTTP 200 submits and HTTP 204 cancels with a known venue order ID, a submit costs
-one POST and a cancel/resubmit pair one DELETE plus one POST, in either session.
-Entry/sale/re-entry therefore costs three requests per slot; the flat ending adds one. Six open-order
-checks and one position check add seven GETs. For N slots and C chase pairs per slot this fixture
-measures **7 + N × (4 + 2C)** requests in its minute, including the flat ending. Injecting three 504
-responses before success on every check measures **28 + N × (4 + 2C)**: each of the seven GETs really
-makes four transport attempts. Order commands are sent once. The fixture counts its own minute
-buckets; it also verifies that every fill and attempt is in that minute, so its rolling peak agrees.
-
-| Measured workload (either order flag) | 1 slot | 2 slots | 3 slots | 4 slots |
-|---|---:|---:|---:|---:|
-| Cycle and flat ending, no chase | 11 | 15 | 19 | 23 |
-| Same, three retries per check | 32 | 36 | 40 | 44 |
-| Eight chase pairs per slot | 27 | 47 | 67 | 87 |
-| Same, three retries per check | 48 | 68 | 88 | 108 |
-
-Four slots use 48 submits in the chase fixture, below the unchanged native 50; the measured peak of
-108 is below both 180 and the 200 setting, so this measurement requires no slot reduction. If a
-broader workload exceeds its configured budget, reduce the slot setting and repeat it; never raise
-the checks to admit it. These rows exclude startup, post-stop account checks, missing-fill catch-up,
-reconciliation beyond the periodic open/position checks, replace-chain reads, partial fills, submit
-403/422 refusal lookups (`_refused`), cancel 422/fill-race lookups (`_cancel_refused`), unknown-venue-ID
-cancel lookups (`_cancel`), all retries of those GETs, and other processes using the same account.
-Their aggregate maximum and a reservation for exit headroom before
-entry remain UNVERIFIED; the sampled soft line and post-run failure check are not such a reservation.
-
-Every window record now names its budget setting, average requests/minute over the process observation
-(module import before preflight through cleanup), UTC-minute peak and its timestamp, rolling 60-s peak,
-and remaining rolling headroom, per sanitized account number and API. Market-data requests are retained
-without applying the Trading API limit to them. Running and refused records name the setting too.
-The provider keeps peaks but **no minute buckets**: the record says `minute_buckets_kept: false`, and
-the average is not a minute-by-minute reconstruction. Adding sanitized buckets later belongs to the
-Claude lane; this change neither wraps nor edits the credential-handling provider.
-
-**Interrupted measurements (budget reader P2-2, 2026-11-11).** A record write normally refreshes both
-request representations from the sanitized counter. Shutdown captures one final snapshot after
-cleanup and log preparation, checks that snapshot and persists it without re-sampling. A preparation
-error still attempts one final snapshot before writing the failure. `request_budget.measurement_status`
-distinguishes running, complete, interrupted, failed,
-refused and unfinalized snapshots. `calibration_eligible` is true only for an explicitly completed
-measurement with a known positive observation interval; the window additionally needs an `ok` result
-and an end timestamp. Ctrl-C, SystemExit and an abandoned/timed-out node mark it interrupted even
-after cleanup takes a final snapshot. A process killed without running Python finalizers cannot
-produce a final count; its last running snapshot already carries `calibration_eligible: false` and
-must not be treated as a full-window observation. No minute history or missing final traffic is
-reconstructed from it.
-An unavailable counter leaves prior counts explicitly marked with `snapshot_error` and excluded
-from calibration, while the primary window failure is preserved. A bad observation clock retains
-the counted attempts with an unknown average, `observation_error`, and no calibration eligibility.
-
-**Seven slots in every part, and the backstop (the lead's decisions of 2026-11-11).** `Mover`'s own chase
-cadence is `chase_secs` 5 plus the one-second step: about ten cancel/resubmit pairs a minute for a slot
-whose sale rests the whole minute, so C = 10 and a slot costs 4 + 2 × 10 = 24 requests in its worst
-minute. Seven slots give 7 + 7 × 24 = **175** in the measured fixture's terms, under the 180 failure
-ceiling and the 200 setting; with three retries per check, 28 + 168 = 196, still under 200 but over 180,
-so a minute of retries at full chase is the failure the record names, not a budget. The lead set seven
-slots in every part, overnight and pre-market included (L3 carries the numbers); a raise comes only
-from two firings' measured peaks. NautilusTrader's own throttle is raised to the same 180 a minute for
-submits and modifies on paper nodes (ADR 0049's dated line), since at 50 its failure handler denies an
-over-limit submit, an exit included (`crates/common/src/throttler.rs`, `crates/risk/src/engine/mod.rs` at
-the pin). No separate Mover submit gate is added. The backstop: at `soft_line` (140 in the last 60 s)
-`Mover` sends no new entry and no chase; exits and cancels still go. **Limit:** failing a window only
-when an exit is refused for rate is not built; `request_failure` (a rolling peak of 180 or any 429)
-stays the failure for the first firings.
+M1 is one name. M2's five need the worst order reduced first, to 18 or less in either session on one
+account (7 + 5 × 18 = 97): from 19 in the regular session, where five give 102, and from 47 outside it.
+Splitting three and two across the two paper accounts still gives 148 and 101 outside the regular
+session, and account A is the tests' (ADR 0069), so the split is not taken.
 
 **Earlier records.** This supersedes ADR 0068's direction, which strategies run; its lanes, bounds and
 landed steps stand, and it carries a dated pointer. ADR 0077's quote study is held unrun.
@@ -278,21 +198,10 @@ landed steps stand, and it carries a dated pointer. ADR 0077's quote study is he
   invented.
 * Bad: nothing trades until gaps 1 and 3 are recorded, and whether the practice beats holding is not
   known until M3.
-* Bad: seven slots in every part (2026-11-11) rest on single-name windows, the measured fixture and
-  `Mover`'s chase cadence, not on a firing's measured peak; pre-market and overnight have no measured figure
-  of their own, and two firings' peaks come before any raise.
-* Bad: the measured four-slot workload is bounded, but does not establish a maximum for missing-fill
-  catch-up, startup, shutdown or all traffic on the account; admission with reserved exit headroom is
-  still unbuilt.
+* Bad: slots are conditional arithmetic from single-name windows (7 in every part, 2026-11-11); pre-market and
+  overnight have no measured figure of their own.
 
 ### Confirmation
-
-* Composition update, 2026-11-11: ADR 0091 replaces the single-name/one-entry window with a fixed
-  qualified roster and actor generations, per-name share/position bounds and all-symbol account
-  checking. The registered listing arm is the default in its 04:00-16:00 scope with explicit Day
-  history; outside it the window records its bridge entry arm and reason. Simulations exercise
-  several held names, re-entry, rotation and failed/missing input refusal. Paper delivery of the
-  composition is UNVERIFIED; no performance or calibration claim follows from these checks.
 
 * No strategy code lands under this record; each gap's record or change names it.
 * When a gap's record lands, that gap's paragraph here shrinks to one line and a pointer.
@@ -373,25 +282,12 @@ landed steps stand, and it carries a dated pointer. ADR 0077's quote study is he
   (`crates/execution/src/order_emulator/emulator.rs`, `crates/execution/src/trailing.rs`), and the
   adapter's `sub_penny_denial` refuses it. On such a name the protection is refused at release and the
   wind-down is the exit, until the adapter rounds to the venue's tick at submit (ADR 0030). Not yet seen
-  on paper (UNVERIFIED there). Answered later on 2026-11-11: the adapter now sends such a limit on
-  Alpaca's cent, a sell rounded down (ADR 0030), and the regression above passes through it.
+  on paper (UNVERIFIED there).
 
 ## Evidence
 
 Read 2026-11-11. Fetched means read in this session as raw text; resolved means read in a local copy at
 the commit `canon/upstreams.lock.json` records.
-
-* https://raw.githubusercontent.com/alpacahq/alpaca-docs/master/content/api-references/trading-api/_index.md
-  — Alpaca's archived documentation, "Paper Trading" and "Rate Limit": 200 requests every minute per
-  API key, 429 on excess. Fetched for Task M gap 7; current paper/live enforcement and per-account
-  versus per-key scope are UNVERIFIED, not measured here (ADRs 0049/0069).
-* `nautilus-trader@d53849b216e2`: `python/nautilus_trader/backtest/__init__.pyi` (`BacktestEngine`,
-  `add_venue`, `add_data`), `trading/__init__.pyi` (`Strategy`), `live/clients.py` (execution hooks),
-  `live/providers.py` (`InstrumentProvider.add`) and `common/__init__.pyi` (`Clock.new_test`). Resolved
-  for the fast-cycle simulation; no upstream code was run from the read-only source copy.
-* `alpaca-py@c42add7c0a70`: `alpaca/trading/client.py` (`submit_order`, `cancel_order_by_id`,
-  `get_orders`, `get_all_positions`), `alpaca/common/rest.py` (`_request`) and `common/constants.py`
-  (three retries). Resolved; the installed pinned packages run in `tests/test_request_budget.py`.
 
 * The owner's practice — the requirement, the starting rows and the adoption terms, restated in this
   record on 2026-11-11 from the owner's own records, which are not part of this repository. An

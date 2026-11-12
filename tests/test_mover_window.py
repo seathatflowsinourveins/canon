@@ -345,7 +345,7 @@ def test_an_overnight_window_ranks_live_with_adr_0087s_actor_on_the_overnight_fe
     monkeypatch, tmp_path
 ) -> None:
     """The lead's decision of 2026-11-11, on the owner's word: the ranking is live in every part,
-    overnight included. The overnight node builds ADR 0087's actor on the overnight feed, with the
+    overnight included. The overnight node builds ADR 0107's actor on the overnight feed, with the
     window's baseline, its records kept for the window, and no startup ranking substituted."""
     built: list[tuple[object, object]] = []
     real = session_window.window_rank

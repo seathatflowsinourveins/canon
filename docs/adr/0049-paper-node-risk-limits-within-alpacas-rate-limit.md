@@ -7,6 +7,8 @@ review-by: 2026-12-10
 
 # The paper node's risk limits: 50 submits and 25 modifies a minute against Alpaca's 200 calls, $1,000 an order
 
+*Amended 2026-11-12 by ADR 0106, which carries the Mover composition's changes to this record.*
+
 ## Context and Problem Statement
 
 The owner asked (2026-11-10) for paper trading on native features, capped at 200 orders a minute. The paper
@@ -57,16 +59,6 @@ implements no query, so they do not reach Alpaca today. It sends a modify as Alp
 MAX_ORDER_MODIFY_RATE" (the docs say `OrderModifyDenied`); a denied order does not use up the rate.
 
 A paper test may set a tighter budget of its own; `EmaCross`'s is ADR 0037's.
-
-**2026-11-11, paper nodes only: both rates are now 180 a minute.** The lead decided, under the owner's
-decision of 2026-11-11 that paper carries no risk limit, that the engine's throttle may never be what
-refuses a sale: it denies an over-limit submit, and at 50 a Mover node of several slots at its real
-re-pricing cadence (about 14 submits a slot a minute) met it before its request gate. Both rates take the
-request ceiling the window records already hold (`paper_node.REQUEST_CEILING`, 180, ADRs 0088/0091), so
-Mover's soft line and then that ceiling bind first. No new number is introduced; a paper test's tighter
-budget, `EmaCross`'s among them, is unchanged. The table above and the reasoning under it are the
-2026-11-10 values. `tests/test_risk_limits.py` checks 180 and 181, and that seven slots' 98 submits in a
-minute are never denied.
 
 ### Consequences
 

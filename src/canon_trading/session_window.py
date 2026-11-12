@@ -434,7 +434,7 @@ WINDOW_STRATEGIES = {
         SESSIONS,
     ),
 }
-"""`Mover` (ADR 0088) runs on the loaded startup roster, re-ranked by ADR 0087's actor. Each start
+"""`Mover` (ADR 0088) runs on the loaded startup roster, re-ranked by ADR 0107's actor. Each start
 resolves an account-derived per-slot entry figure for its strategy, actor, share/position monitors and
 the engine's larger per-order outer bound; the generic table cap is not used for a Mover node.
 
@@ -1046,6 +1046,21 @@ LIVE_OPEN_FINDINGS = (
     (
         "the actor is not seeded with the part's earlier minutes: a window started mid-part tallies "
         "dollars from the node's start only, while a row's ratio_span names the part's clock minutes"
+    ),
+    (
+        "a streamed bar is stamped at its receipt, so one handled after a tick's scheduled instant and "
+        "before its callback voids that minute's ranking for every name (ultra review of the "
+        "composition, finding 9, PLAUSIBLE)"
+    ),
+    (
+        "an Alpaca updated bar for a counted minute is refused by the tally as a duplicate and voids "
+        "the next minute's ranking, and the run completing then is refused as stale (finding 10, "
+        "PLAUSIBLE; how often updated bars come is UNVERIFIED)"
+    ),
+    (
+        "a completed history response marks every minute to the current one covered, so a just-closed "
+        "minute Alpaca has not yet published stays a hole in the name's day before its watch (finding "
+        "15, PLAUSIBLE)"
     ),
 )
 """What a live-ranking firing's record names as open (the lead's decision of 2026-11-11)."""
@@ -2592,7 +2607,7 @@ def run_window(
         mover["baseline_path"] = str(mover_baseline_path(config, feed))
         if basis is not None:
             mover["baseline"] = basis
-        mover["ranking_source"] = f"live: ADR 0087's actor over the wildcard stream on {feed}"
+        mover["ranking_source"] = f"live: ADR 0107's actor over the wildcard stream on {feed}"
         mover["open_findings"] = list(LIVE_OPEN_FINDINGS)
         if arm == "registered":
             entry_contexts = mover_entry_contexts(

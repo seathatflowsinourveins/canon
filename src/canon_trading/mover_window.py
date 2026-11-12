@@ -3,7 +3,7 @@
 Contract: NautilusTrader v2.0.0rc8 at d53849b216e2, DataActor's signal API, subscribe_bars,
 request_bars/on_historical_bars/on_data_response and clock timers (common/__init__.pyi); distinct actor
 and strategy IDs (concepts/strategies); Mover's explicit Day input contract from ADR 0092. Read
-2026-11-11. The ranking is ADR 0087's actor, constructed only after session_window initializes because
+2026-11-11. The ranking is ADR 0107's actor, constructed only after session_window initializes because
 its arithmetic module reads that module's time helpers.
 
 mover_universe_parts builds one strategy and a position monitor per loaded roster name. Paper callers
@@ -14,7 +14,7 @@ is a larger multiple because it caps sells too. Legacy FixedRank simulations ret
 have no bound and continue after sales until wind-down, under cooldown and reclaim rules. The window's
 spares setting adds watched names for rotation.
 
-window_rank retains every tick's public record from ADR 0087's actor. No actor generation means no
+window_rank retains every tick's public record from ADR 0107's actor. No actor generation means no
 entry; the startup roster's order is never substituted. mover_context_feeds keeps each roster name's
 Day prefix current even while it is unranked, through the node's existing data client and external
 minute bars; a completed native history request repairs a gap, and a failed one leaves coverage where
@@ -228,7 +228,7 @@ def _context_feed(
 
 
 def window_rank(config: MoversRankActorConfig, records: list[dict[str, object]]) -> MoversRankActor:
-    """ADR 0087's actor, with every tick's public last_record retained in `records` for the window.
+    """ADR 0107's actor, with every tick's public last_record retained in `records` for the window.
 
     The base actor's on_tick performs all ranking and publication; this wrapper only keeps its result.
     Import at construction: the ranking module also reads session_window's time helpers.

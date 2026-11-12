@@ -6,7 +6,7 @@ A composition of upstream parts (ADR 0083, ADR 0088). What each part is, at Naut
 * **The ranking** reaches the strategy as upstream's signal: `subscribe_signal(name)` and `on_signal`
   (`python/nautilus_trader/trading/__init__.pyi:696`, `:633`; concepts/message_bus, "Signal
   publish/subscribe": "The value is converted to a string on publish"). The ranking actor publishes
-  `RANK_SIGNAL` each minute (ADR 0087); its value is `movers_rank_signal.encode_ranking`'s string, read
+  `RANK_SIGNAL` each minute (ADR 0107); its value is `movers_rank_signal.encode_ranking`'s string, read
   by the shared `decode_ranking`: the ranked instrument IDs best first, each with its move from the last
   regular close, and its `ts_event` the time the ranking was computed. Nothing here ranks, and no
   vendor's list is read.

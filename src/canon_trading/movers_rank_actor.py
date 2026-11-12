@@ -1,5 +1,5 @@
 """The movers ranking actor: the whole market's minute bars in, one ranking generation at most each publish
-interval, its top 20 out on the message bus as the signal `movers-rank` (ADR 0087).
+interval, its top 20 out on the message bus as the signal `movers-rank` (ADR 0107; the score is ADR 0087's).
 
 Contract: NautilusTrader v2.0.0rc8 (`nautilus-trader@d53849b216e2`), `nautilus_trader.common.DataActor` as
 shipped (`python/nautilus_trader/common/__init__.pyi:688`; there is no `Actor` class at the pin), used only
@@ -27,7 +27,7 @@ What it reads, and from whom:
   the data client's.
   Bars name `params={"feed": feed, "wildcard": True, "updated_bars": True}` and statuses name
   `params={"feed": feed, "wildcard": True}`: NautilusTrader preserves adapter params, `feed` is ADR 0055's,
-  and the two channel keys are ADR 0090's adapter contract (pending on main; ADR 0087).
+  and the two channel keys are ADR 0090's adapter contract (pending on main; ADR 0107).
 * Statuses: `InstrumentStatus` for the same ids, kept by symbol; until the adapter publishes them a halt
   is unknown, which `movers_rank` keeps eligible and records (its `HALT_UNKNOWN_ELIGIBLE` row).
 * Reference closes and splits, the actor's only reads of its own, both GET on Alpaca's market data API
@@ -59,7 +59,7 @@ config `max_data_age_secs`
 before. Each name uses that same bound: a stale price and its derived figures become unknown, its row
 and bar timestamp stay in the universe, and it cannot enter the top entries. The record names the bound
 and the stale symbols; `MAX_DATA_AGE_SECS` is the UNCALIBRATED default.
-Each tick's outcome is one log line, `movers-rank record {json}`, with the latency labels of ADR 0087:
+Each tick's outcome is one log line, `movers-rank record {json}`, with the latency labels of ADR 0107:
 `publication`, `receipt`, `generation`, and `entry_eligible` and `submission`, which are the strategy's
 and stay null here.
 

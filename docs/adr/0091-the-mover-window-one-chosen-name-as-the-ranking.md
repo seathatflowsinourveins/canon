@@ -12,7 +12,7 @@ review-by: 2026-12-11
 ADR 0088's strategy needs a node, a ranking on its bus and the rows of a run. The first bridge ran one
 chosen name and one trade. The lead's decisions of 2026-11-11 enable several names, rotation and
 re-entry until the part ends, in every session part. This composition loads a fixed startup roster and
-uses ADR 0087's actor to re-rank those loaded names. Its paper delivery remains UNVERIFIED until the
+uses ADR 0107's actor to re-rank those loaded names. Its paper delivery remains UNVERIFIED until the
 Claude lane reads a firing of this version.
 
 ## Decision Drivers
@@ -29,7 +29,7 @@ Claude lane reads a firing of this version.
 1. Wait for the ranking actor.
 2. Publish one startup choice repeatedly as the ranking (the original bridge).
 3. Let the strategy read the vendor's movers list.
-4. Load several qualified startup names and re-rank them in the node through ADR 0087's actor.
+4. Load several qualified startup names and re-rank them in the node through ADR 0107's actor.
 
 ## Decision Outcome
 
@@ -46,7 +46,7 @@ composition instruction of 2026-11-11. Option 2 remains an explicit compatibilit
   `mover.roster`; the primary name remains the report's `symbol`. The startup screener fallback,
   available only during the regular session, supplies candidate names; it never supplies a live
   actor generation. This roster stays fixed for the window. New instruments outside it are not traded.
-* **The ranking** is ADR 0087's `MoversRankActor`, through `window_rank`, on the same node and feed.
+* **The ranking** is ADR 0107's `MoversRankActor`, through `window_rank`, on the same node and feed.
   It re-ranks the cached roster and publishes `movers-rank`. The ordinary 90-second reader age row
   applies. Every actor tick, including a reason for publishing nothing, is kept in the run's
   `ranking_records`; every received valid signal keeps its value, `ts_event` and `ts_init` in

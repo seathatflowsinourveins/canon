@@ -79,7 +79,7 @@ and rotation rules; the chase's price and floor; the yield of entries to the req
   closes); the default is left on. A run that only a lower close restarts is another rule, for the
   gate to measure beside this one, and is not built.
 
-**The ranking's contract** with the ranking actor (ADR 0087): the signal
+**The ranking's contract** with the ranking actor (ADR 0107): the signal
 `movers-rank`, its value the ranked instrument IDs best first, at most 20, each with its move from the
 last regular close (`ID=move;ID=move`), its `ts_event` the time the ranking was computed. A ranking older
 than `rank_max_age_secs`, one that does not parse, or no actor generation means no entry. The strategy
