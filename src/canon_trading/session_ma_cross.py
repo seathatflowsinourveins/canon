@@ -32,8 +32,9 @@ Two departures from `MaCross`, both for live use:
   buy-back and the wind-down's close are not signals and are not held back. With no quote yet the signal is dropped for that bar.
 
 * **Closes are not reduce-only.** `MaCross` exits with `close_all_positions`, which sends a reduce-only
-  market order (observed at v2.0.0rc8); the adapter denies reduce-only orders (ADR 0036), so that exit
-  would never reach Alpaca. Here a close is a plain DAY market order in the session.
+  market order (observed at v2.0.0rc8); the adapter denies a reduce-only order unless `reduce_only_sells`
+  is set and its order-type scope includes the market order, which the default scope does not (ADR 0036,
+  ADR 0111), so that exit would not reach Alpaca. Here a close is a plain DAY market order in the session.
 
 `wind_down_at`, when set, is when the run's flatten starts, with no new entries after it. In the session it
 is upstream's `market_exit()` (concepts/strategies, "Market exit": cancel the strategy's orders, close its

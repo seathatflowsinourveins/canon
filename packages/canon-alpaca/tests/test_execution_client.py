@@ -464,7 +464,9 @@ def test_order_refused_by_alpaca_is_rejected(venue, alpaca) -> None:
     run(build_node(strategy))
 
     assert strategy.names() == ["OrderSubmitted", "OrderRejected"]
-    assert strategy.events[-1].reason == "Alpaca refused the order (403): insufficient buying power"
+    assert strategy.events[-1].reason == (
+        "Alpaca refused the order (403): 40310000: insufficient buying power"
+    )
 
 
 def test_order_rejected_on_the_stream_is_rejected(venue) -> None:
@@ -1412,7 +1414,9 @@ def test_cancel_refused_by_alpaca_is_a_cancel_rejection(venue, alpaca) -> None:
         FINAL_EVENTS.discard("OrderCancelRejected")
 
     assert strategy.names()[-1] == "OrderCancelRejected"
-    assert strategy.events[-1].reason == "Alpaca refused the cancel (422): order is not cancelable"
+    assert strategy.events[-1].reason == (
+        "Alpaca refused the cancel (422): 42210000: order is not cancelable"
+    )
 
 
 class CancelAll(Strategy):
@@ -1537,7 +1541,7 @@ def test_cancel_all_rejects_the_cancel_alpaca_refuses_and_cancels_the_rest(venue
     first, second = (c.value for c in strategy.placed)
     assert strategy.final() == {first: "OrderCancelRejected", second: "OrderCanceled"}
     rejection = next(e for e in strategy.events if type(e).__name__ == "OrderCancelRejected")
-    assert rejection.reason == "Alpaca refused the cancel (422): order is not cancelable"
+    assert rejection.reason == "Alpaca refused the cancel (422): 42210000: order is not cancelable"
     assert len(venue.trading.cancels) == 2
 
 
@@ -1792,7 +1796,7 @@ def test_modify_alpaca_refuses_is_modify_rejected(venue, alpaca) -> None:
 
     assert strategy.names()[-2:] == ["OrderPendingUpdate", "OrderModifyRejected"]
     reason = strategy.last("OrderModifyRejected").reason
-    assert reason == "Alpaca refused the replace (422): order is not replaceable"
+    assert reason == "Alpaca refused the replace (422): 42210000: order is not replaceable"
 
 
 def test_modify_whose_connection_timed_out_is_modify_rejected(venue) -> None:
@@ -2270,7 +2274,7 @@ def test_open_order_with_a_client_id_nautilus_cannot_hold_fails_startup_by_name(
         run(node)
 
     assert (
-        f"Alpaca order {alpaca.ORDER_AAPL['id']} (AAPL) is open with a client order ID NautilusTrader "
+        "Alpaca order for AAPL buy limit (client lineage '') is open with a client order ID NautilusTrader "
         "cannot hold (invalid string"
     ) in logged(capfd)
 
@@ -2341,7 +2345,11 @@ def test_update_for_an_order_the_node_does_not_hold_is_dropped(venue, alpaca, ca
     run(build_node(strategy))
 
     assert strategy.names() == ["OrderSubmitted", "OrderAccepted", "OrderFilled"]
-    assert "which this node does not hold; reconciliation reports it" in logged(capfd)
+    line = next(
+        line for line in logged(capfd).splitlines() if "which this node does not hold" in line
+    )
+    assert "which this node does not hold; reconciliation reports it" in line
+    assert other["id"] not in line
 
 
 def test_startup_reconciliation_reports_orders_and_positions(venue, alpaca) -> None:
@@ -3037,7 +3045,11 @@ def test_open_order_placed_before_the_window_is_reported(venue, alpaca) -> None:
     assert [r.venue_order_id.value for r in reports] == [alpaca.ORDER_AAPL["id"]]
 
 
-def test_open_order_outside_this_slice_fails_startup(venue, alpaca, capfd) -> None:
+def test_an_open_trailing_stop_placed_outside_the_node_fails_startup_by_name(
+    venue, alpaca, capfd
+) -> None:
+    """With every setting off an outside order is never taken on unasked (custody's rule; the lead,
+    2026-11-12): the node's start fails by name, as before `report_external_trailing_stops` existed."""
     venue.trading.orders = [
         alpaca.alpaca_order(
             type="trailing_stop", order_type="trailing_stop", trail_price="1", limit_price=None
@@ -3049,6 +3061,16 @@ def test_open_order_outside_this_slice_fails_startup(venue, alpaca, capfd) -> No
         run(node)
 
     assert "is open with order type trailing_stop" in logged(capfd)
+
+
+def test_open_order_outside_this_slice_fails_startup(venue, alpaca, capfd) -> None:
+    venue.trading.orders = [alpaca.alpaca_order(type=None, order_type=None)]
+    node = build_node(trader(submit=False))
+
+    with pytest.raises(Exception):  # noqa: B017 - the node's own startup failure type
+        run(node)
+
+    assert "is open with order type None" in logged(capfd)
 
 
 def test_startup_reconciliation_reports_open_stop_orders(venue, alpaca) -> None:
@@ -3568,7 +3590,12 @@ def test_a_working_replacement_whose_trace_fails_fails_startup_by_name(
     with pytest.raises(RuntimeError, match="Failed to get mass status"):
         run(node)
 
-    assert f"Alpaca order {replacement['id']} (AAPL) is open and tracing it failed" in logged(capfd)
+    log = logged(capfd)
+    assert (
+        "Alpaca order for AAPL buy limit (client lineage 'alpaca-made-2') is open and tracing it failed"
+        in log
+    )
+    assert replacement["id"] not in log
 
 
 @pytest.mark.parametrize("error", TRACE_FAILURES, ids=TRACE_FAILURE_IDS)
@@ -3579,7 +3606,12 @@ def test_a_closed_replacement_whose_trace_fails_is_skipped(venue, alpaca, capfd,
     run(node)
 
     assert node.cache.orders_open() == []
-    assert f"Alpaca order {replacement['id']} is not reported: tracing it failed" in logged(capfd)
+    log = logged(capfd)
+    assert (
+        "Alpaca order for AAPL buy limit (client lineage 'alpaca-made-2') is not reported: tracing it failed"
+        in log
+    )
+    assert replacement["id"] not in log
 
 
 def test_cancel_refused_for_an_order_alpaca_canceled_unseen_cancels_it(venue, alpaca) -> None:
@@ -3794,9 +3826,10 @@ def test_closed_order_skipped_for_its_client_id_is_logged_with_that_reason(
 
     log = logged(capfd)
     assert (
-        f"Alpaca order {order['id']} (AAPL, canceled) is not reported: a client order ID "
+        "Alpaca order for AAPL buy limit (client lineage '') (canceled) is not reported: a client order ID "
         "NautilusTrader cannot hold (invalid string for 'value', was empty)"
     ) in log
+    assert order["id"] not in log
     assert "its type, side, class, quantity or time in force" not in log
 
 
@@ -5413,7 +5446,12 @@ def test_a_chain_that_needs_more_lookups_than_the_limit_is_not_traced_to_another
     run_with_client(with_the_chain, strategy)
 
     (failure,) = failures
-    assert f"Alpaca order {chain[-1]['id']} (AAPL) is open and tracing it failed" in failure
+    assert (
+        "Alpaca order for AAPL buy limit" in failure and "is open and tracing it failed" in failure
+    )
+    # the reason start-up failed is in the message, not only the exception's class
+    assert f"replace chain needs more than {MAX_REPLACE_CHAIN} reads to trace" in failure
+    assert chain[-1]["id"] not in failure
 
 
 def test_an_order_the_node_holds_is_its_own_however_often_it_was_replaced(venue) -> None:
