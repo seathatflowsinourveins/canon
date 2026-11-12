@@ -275,11 +275,19 @@ RANK_MAX_AGE_SECS = 90
 
 def part_slots(part: str, slots: int | None = None) -> int:
     """The names a session part's node holds at once: `slots` where the run sets it, else
-    `PART_SLOTS`, the same in every part."""
+    `PART_SLOTS`, the same in every part. More than `PART_SLOTS` is refused by name: the window's
+    account check's deadline, its end margin and its longest window count that many names at most
+    (`session_window.after_stop_secs`), until slots become a setting those bounds scale from (the
+    lead's ruling of 2026-11-12)."""
     if slots is None:
         return PART_SLOTS
     if isinstance(slots, bool) or not isinstance(slots, int) or slots < 1:
         raise ValueError(f"slots must be a positive whole number, got {slots!r}")
+    if slots > PART_SLOTS:
+        raise ValueError(
+            f"slots must be at most {PART_SLOTS}, got {slots}: the account check's deadline and the "
+            f"window's end margin count {PART_SLOTS} names at most"
+        )
     return slots
 
 

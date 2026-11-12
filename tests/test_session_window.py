@@ -6167,6 +6167,13 @@ class Assets(Account):
         )
 
 
+class SmallerAssets(Assets):
+    """`Assets` with 28000 of buying power: 4000 a slot at the seven slots a window holds at most."""
+
+    def get_account(self) -> TradeAccount:
+        return super().get_account().model_copy(update={"buying_power": "28000"})
+
+
 @pytest.fixture(autouse=True)
 def priced(monkeypatch):
     """Every window reads one share's price before it starts: here SPY's at $750 unless a test says
@@ -7870,10 +7877,10 @@ def test_an_expensive_roster_name_is_dropped_and_named_while_other_names_run(
         tmp_path,
         quotes=5,
         trades=5,
-        account=Assets(),
+        account=SmallerAssets(),
         mover=True,
         strategy="Mover",
-        slots=10,
+        slots=7,
     )
     assert not isinstance(outcome, RuntimeError), str(outcome)
     assert report["result"] == "ok" and report["symbol"] == "LLL"
@@ -7952,13 +7959,13 @@ def test_a_mover_strategy_window_hands_the_node_its_choice_and_its_end(
     # the regular part's slots, as ADR 0083's budget carries them, unless the run sets its own
     assert seen["slots"] == 7 and latest["mover"]["slots"] == 7
 
-    # at ten slots, only the current limit is over the account's 4000-per-slot figure
+    # at seven slots of 28000, only the current limit is over the account's 4000-per-slot figure
     data.ask = 4500.01
     monkeypatch.setattr(session_window, "GAP_SECS", 0)
     with pytest.raises(session_window.WindowRefused, match="at its entry limit of 4500.0100"):
         session_window.run_window(
-            replace(seen["config"], log_dir=tmp_path, slots=10),
-            trading=cast(TradingClient, Assets()),
+            replace(seen["config"], log_dir=tmp_path, slots=7),
+            trading=cast(TradingClient, SmallerAssets()),
         )
 
 
@@ -9068,3 +9075,17 @@ def test_an_extended_poll_reads_the_calendar_or_one_quote_and_closes_at_most_onc
     assert 0.0 not in quotes.at and 0.0 not in account.closes_at
     assert len(quotes.at) == len(set(quotes.at)), "one quote a poll"
     assert account.quantities["BBB"] == 0 and "position of 5 AAA" in left
+
+
+@pytest.mark.parametrize("slots", [8, 10, 20])
+def test_slots_above_the_seven_the_bounds_count_are_refused_by_name(slots: int) -> None:
+    """Review of 3a8613a, finding 11 (the lead's ruling of 2026-11-12): the account check's deadline,
+    `END_MARGIN_SECS` and the longest window count `PART_SLOTS` names at most, so a run with more
+    `--slots` is refused by name until slots become a setting those bounds scale from."""
+    from canon_trading.mover_window import part_slots
+
+    with pytest.raises(ValueError, match=f"at most {session_window.PART_SLOTS}.*account check"):
+        WindowConfig(strategy="Mover", mover=True, slots=slots)
+    with pytest.raises(ValueError, match="at most 7"):
+        part_slots("regular", slots)
+    assert part_slots("regular", session_window.PART_SLOTS) == session_window.PART_SLOTS

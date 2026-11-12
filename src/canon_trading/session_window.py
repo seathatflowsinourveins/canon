@@ -525,8 +525,8 @@ def after_stop_secs(names: int) -> float:
     """How long the account check starts polls with `names` held: `AFTER_STOP_SECS`, and two polls more
     for each name past the first, since the check closes one name a poll and sees it closed in the next
     (review of 3a8613a, finding 11, the lead's ruling of 2026-11-12). Names past `PART_SLOTS`, the names
-    a window holds at once, add nothing: a run with more `--slots` gets the seven-name deadline, so the
-    bounds below hold for every window."""
+    a window holds at once, add nothing: a run with more `--slots` is refused by name (`part_slots`, the
+    lead's ruling of 2026-11-12), so the bounds below hold for every window."""
     return AFTER_STOP_SECS + (min(max(names, 1), PART_SLOTS) - 1) * 2 * POLL_SECS
 
 
