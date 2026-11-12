@@ -1701,6 +1701,7 @@ def quiet_window(
     published=True,
     request_limit_per_minute=200,
     check_fills=(),
+    baseline_file=True,
 ):
     """A window of `strategy` whose node runs at once, its strategy having seen `quotes`, `trades` and
     `live_bars`, and its node log holding the lines `log`; returns the report or the error, and the
@@ -1727,11 +1728,12 @@ def quiet_window(
         from canon_trading.movers_rank_actor import trade_date
 
         baseline = tmp_path / "offline-baseline.json"
-        write_baselines(
-            baseline,
-            trade_date(int((account or Account()).get_clock().timestamp.timestamp() * 1e9)),
-            {},
-        )
+        if baseline_file:
+            write_baselines(
+                baseline,
+                trade_date(int((account or Account()).get_clock().timestamp.timestamp() * 1e9)),
+                {},
+            )
         s = session_window.Mover(MoverConfig(max_notional=Decimal(500), max_move=Decimal(100)))
         s.quotes, s.trades, s.live_bars = quotes, trades, live_bars
         if published:
@@ -2215,6 +2217,71 @@ def test_a_mover_window_without_a_published_rank_generation_fails_by_name():
     assert "no bars" in failure
     report.mover["run"]["ranking_records"].append({"published": True})
     assert session_window._data_failure(report) is None
+
+
+@pytest.mark.parametrize(("hour", "part"), [(21, "overnight"), (2, "overnight"), (5, "pre-market")])
+def test_only_overnight_runs_with_no_baseline_file_and_says_its_rows_rank_on_dollars(
+    monkeypatch, tmp_path, hour, part
+):
+    """ultra-3a8613a/2, the lead's decision (A) of 2026-11-12: no writer makes boats.json, so overnight
+    with no file ranks on dollars under the move condition and says so; every other part still
+    refuses without its file."""
+    monkeypatch.setattr(session_window, "choose_mover", lambda *a, **k: a_pick())
+    monkeypatch.setattr(session_window, "window_data", lambda: Quoted())
+
+    def run():
+        return quiet_window(
+            monkeypatch,
+            tmp_path,
+            quotes=5,
+            trades=5,
+            account=Evening(hour),
+            session="extended",
+            mover=True,
+            strategy="Mover",
+            baseline_file=False,
+        )
+
+    if part == "overnight":
+        outcome, latest, _ = run()
+        assert not isinstance(outcome, Exception), outcome
+        assert latest["result"] == "ok" and latest["part"] == "overnight"
+        assert latest["mover"]["baseline"] == "no baseline: dollar tier under the move condition"
+    else:
+        with pytest.raises(session_window.WindowRefused, match="baseline"):
+            run()
+
+
+@pytest.mark.parametrize(("part", "expected"), [("overnight", True), ("after-hours", False)])
+def test_the_rank_actor_ranks_without_a_baseline_overnight_only(
+    monkeypatch, tmp_path, part, expected
+) -> None:
+    from canon_trading import mover_window
+
+    actors: list = []
+
+    def actor(config, records):
+        actors.append(config)
+        return mover_window.window_rank(config, records)
+
+    monkeypatch.setattr(session_window, "window_rank", actor, raising=False)
+    ends = AT + timedelta(minutes=30)
+    node, _, _ = session_window.window_node(
+        WindowConfig(
+            symbol="LLL", mover=True, strategy="Mover", session="extended", log_dir=tmp_path
+        ),
+        wind_down_at=ends - timedelta(seconds=session_window.FLATTEN_SECS),
+        log_name=f"baseline-{part}",
+        feed="boats" if part == "overnight" else "sip",
+        part=part,
+        pick=mover_pick(),
+        entry_notional=Decimal(500),
+        ends=ends,
+    )
+    try:
+        assert actors[0].rank_without_baseline is expected
+    finally:
+        node.dispose()
 
 
 @pytest.mark.parametrize("document", [None, "not json", '{"format":"other"}'])

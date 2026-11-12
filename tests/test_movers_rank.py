@@ -170,8 +170,11 @@ def ranked(
     zero_baseline_dollar_floor: float | None = None,
     zero_baseline_arm: str = "relative-floor",
     overnight_baseline: bool = False,
+    no_baseline: bool = False,
 ) -> movers_rank.Generation:
-    age_kwargs = {} if max_data_age_secs is None else {"max_data_age_secs": max_data_age_secs}
+    age_kwargs: dict[str, float] = (
+        {} if max_data_age_secs is None else {"max_data_age_secs": max_data_age_secs}
+    )
     if computed_ns is None:  # M-b: five seconds after the last bar, inside the age bound
         computed_ns = max(
             (bar.ts_init for items in today.values() for bar in items), default=COMPUTED_NS
@@ -198,6 +201,7 @@ def ranked(
         zero_baseline_dollar_floor=zero_baseline_dollar_floor,
         zero_baseline_arm=zero_baseline_arm,
         **age_kwargs,
+        no_baseline=no_baseline,
         overnight_baseline=overnight_baseline,
     )
 
@@ -690,6 +694,32 @@ def test_an_overnight_name_without_an_overnight_baseline_ranks_in_the_tier() -> 
     assert night.dollar_volume == pytest.approx(22_000.0)
     assert night.established is False and night.ratio == math.inf
     assert [e.instrument_id.symbol.value for e in top_entries(generation)] == ["NIGHT", "SMALL"]
+
+
+def test_with_no_baseline_file_every_name_ranks_in_the_dollar_tier() -> None:
+    """ultra-3a8613a/2, the lead's ruling of 2026-11-11 (21:49): a part with no baseline file ranks every
+    name as not established, on dollars under the move condition; with no file named absent, a name
+    with no baseline stays a hole and is not ranked."""
+    today = {
+        "NIGHT": bars("NIGHT", PRIOR, time(21, 0), [11.0], volume=2_000),
+        "SMALL": bars("SMALL", PRIOR, time(21, 0), [11.0], volume=1_000),
+    }
+    generation = ranked(["NIGHT", "SMALL"], today, baselines={}, no_baseline=True)
+    night = row(generation, "NIGHT")
+    assert night.established is False and night.ratio == math.inf
+    assert [e.instrument_id.symbol.value for e in top_entries(generation)] == ["NIGHT", "SMALL"]
+    assert not top_entries(ranked(["NIGHT", "SMALL"], today, baselines={}))
+    with pytest.raises(ValueError, match="no baseline"):
+        ranked(["NIGHT"], today, no_baseline=True)
+
+
+def test_a_missing_baseline_file_is_named_absent_and_an_unreadable_one_is_not(
+    tmp_path: Path,
+) -> None:
+    missing = read_baselines(tmp_path / "boats.json", SESSION)
+    assert missing.absent and missing.problem and missing.baselines == {}
+    (tmp_path / "bad.json").write_text("{")
+    assert not read_baselines(tmp_path / "bad.json", SESSION).absent
 
 
 def test_an_overnight_clock_never_makes_the_regular_open_known() -> None:

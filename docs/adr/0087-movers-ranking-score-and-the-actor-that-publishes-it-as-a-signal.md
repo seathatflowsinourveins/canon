@@ -153,9 +153,12 @@ repeated id, more than 20 entries, and whitespace or a separator in an id.
   name is established. The preflight passes by name ("no baseline for this part: ranked on dollars and
   move"), recorded in each window, and never passes overnight on the `sip` file. "Missing baseline, no
   entry" now means only a hole: a name or segment absent from a file that exists and should cover it.
-  **UNBUILT:** a window still refuses to start on an unusable baseline file for its part, and a name
-  absent from the baseline mapping is a hole. Overnight only, the stream sample's startup ranking stands
-  in for the actor and reads no baseline (the lead's decision (C) of 2026-11-11, ADR 0091).
+  **Built overnight only** (the lead's decision (A) of 2026-11-12, on the owner's review of the
+  composition, finding 2): with no `boats` file, an overnight window starts and its actor ranks every
+  name in the dollar tier under the move condition, and the window's record states "no baseline:
+  dollar tier under the move condition" as each row's basis until Wave 2's overnight baseline exists.
+  Regular and pre-market still refuse to start with no file; a file that exists and cannot be used
+  still refuses in every part, and in a file that exists a name absent from it is a hole.
 * The score is `move × ratio`; the tie-break, trade acceleration, is unknown for now and breaks no tie.
   The first ranking uses the wildcard minute bars only: no wildcard trades and no condition masking.
 * Filters: `tradable` from the asset; a halt from `InstrumentStatus`, each status folded with

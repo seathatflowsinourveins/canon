@@ -997,8 +997,9 @@ LIVE_OPEN_FINDINGS = (
         "exist only for the names loaded at node start; on-demand loading for any ranked name is not built"
     ),
     (
-        "the sip baseline holds no overnight dollars, so overnight every name is in the zero-baseline "
-        "dollar tier with the move condition; no boats baseline exists until a boats history loader"
+        "no boats baseline exists until Wave 2's overnight baseline, so overnight every name ranks in the "
+        "zero-baseline dollar tier under the move condition, recorded as each row's basis; regular and "
+        "pre-market still refuse to start with no baseline file"
     ),
     "Antigravity's M-c findings 1 and 8 are deferred to ADR 0087's no-file rule and part-start seeding",
     (
@@ -1206,6 +1207,8 @@ def window_node(
                 feed=feed,
                 order_cap=float(entry_notional),
                 baseline_path=str(mover_baseline_path(config, feed)),
+                # with no baseline file, overnight only ranks on dollars (ultra review, finding 2)
+                rank_without_baseline=part == "overnight",
             ),
             mover.ranking_records,
         )
@@ -2398,6 +2401,7 @@ def run_window(
             f"{account if (account := paper_account()) in PAPER_ACCOUNTS else 'windows'} on"
         )
     mover: dict[str, Any] = {}
+    basis: str | None = None
     pick: MoverPick | None = None
     entry_contexts: dict[InstrumentId, Day] = {}
     allocation: MoverAllocation | None = None
@@ -2415,11 +2419,19 @@ def run_window(
                 "open and the last completed session are not known"
             )
         if config.strategy == MOVER:
+            from .movers_rank import NO_BASELINE
             from .movers_rank import read_baselines
 
             baseline = mover_baseline_path(config, feed)
-            if problem := read_baselines(baseline, trade_date).problem:
-                raise WindowRefused(f"the rank actor baseline {baseline} is unusable: {problem}")
+            read = read_baselines(baseline, trade_date)
+            if read.absent and part == "overnight":
+                # overnight ranks in the dollar tier with no file, until Wave 2's overnight baseline
+                # exists; a file that cannot be used still refuses (the lead's ruling, 2026-11-12)
+                basis = NO_BASELINE
+            elif read.problem:
+                raise WindowRefused(
+                    f"the rank actor baseline {baseline} is unusable: {read.problem}"
+                )
             allocation = mover_allocation(
                 trading, row.slots if config.slots is None else config.slots
             )
@@ -2510,6 +2522,8 @@ def run_window(
         arm, reason = mover_entry_arm(part)
         mover["entry_arm"], mover["entry_arm_reason"] = arm, reason
         mover["baseline_path"] = str(mover_baseline_path(config, feed))
+        if basis is not None:
+            mover["baseline"] = basis
         mover["ranking_source"] = f"live: ADR 0087's actor over the wildcard stream on {feed}"
         mover["open_findings"] = list(LIVE_OPEN_FINDINGS)
         if arm == "registered":

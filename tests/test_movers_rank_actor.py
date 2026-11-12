@@ -264,6 +264,7 @@ def run(
     inline_reads: bool = True,
     feed: str = "sip",
     max_data_age_secs: float | None = None,
+    rank_without_baseline: bool = False,
 ) -> tuple[MoversRankActor, Reader]:
     engine = BacktestEngine(
         BacktestEngineConfig(logging=LoggerConfig(bypass_logging=True), run_analysis=False)
@@ -290,7 +291,9 @@ def run(
     engine.add_actor(subscriber)
     for helper in before:
         engine.add_actor(helper)
-    age_kwargs = {} if max_data_age_secs is None else {"max_data_age_secs": max_data_age_secs}
+    age_kwargs: dict[str, float] = (
+        {} if max_data_age_secs is None else {"max_data_age_secs": max_data_age_secs}
+    )
     actor = MoversRankActor(
         MoversRankActorConfig(
             feed=feed,
@@ -299,6 +302,7 @@ def run(
             reference_reader=reader or stub_reader(),
             inline_reads=inline_reads,
             **age_kwargs,
+            rank_without_baseline=rank_without_baseline,
         )
     )
     engine.add_actor(actor)
@@ -533,6 +537,25 @@ def test_a_missing_baseline_publishes_nothing(tmp_path: Path) -> None:
     reasons = actor.last_record["reasons"]
     assert isinstance(reasons, list)
     assert any("baseline not usable" in r for r in reasons)
+
+
+def test_with_no_baseline_file_a_part_that_ranks_without_one_publishes_on_dollars(
+    tmp_path: Path,
+) -> None:
+    """ultra-3a8613a/2: overnight (boats) has no baseline writer, so with `rank_without_baseline` a
+    missing file ranks every name in the dollar tier and each record says so; an unreadable file
+    still publishes nothing."""
+    actor, subscriber = run(
+        market(5), baseline_path=tmp_path / "absent.json", rank_without_baseline=True
+    )
+    assert subscriber.signals
+    assert actor.last_record is not None and actor.last_record["published"] is True
+    assert actor.last_record["baseline"] == "no baseline: dollar tier under the move condition"
+    (tmp_path / "bad.json").write_text("{")
+    actor, subscriber = run(
+        market(5), baseline_path=tmp_path / "bad.json", rank_without_baseline=True
+    )
+    assert subscriber.signals == []
 
 
 def test_a_gap_in_the_bars_makes_the_generation_stale_and_nothing_is_published(

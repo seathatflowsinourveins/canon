@@ -191,6 +191,11 @@ class MoversRankActorConfig(DataActorConfig):
     `inline_reads` runs both reads on the caller's thread, for a backtest, whose clock does not wait for a
     worker. `max_data_age_secs` is the inclusive age bound for each name's last bar at compute time;
     a generation with no bar inside the bound publishes nothing. Default: `MAX_DATA_AGE_SECS`.
+    `rank_without_baseline` lets a missing baseline file rank every name in the zero-baseline tier on
+    its dollars, under the move condition (`movers_rank.rank`'s `no_baseline`), and each record says so;
+    a file that exists and cannot be used still publishes nothing. The window sets it overnight only,
+    until Wave 2's overnight baseline exists (the lead's ruling, 2026-11-12; ultra review of the
+    composition, finding 2).
     """
 
     def __init__(
@@ -202,6 +207,7 @@ class MoversRankActorConfig(DataActorConfig):
         reference_reader: ReferenceReader | None = None,
         inline_reads: bool = False,
         max_data_age_secs: float = MAX_DATA_AGE_SECS,
+        rank_without_baseline: bool = False,
         **_kwargs: object,
     ) -> None:
         super().__init__()
@@ -222,6 +228,7 @@ class MoversRankActorConfig(DataActorConfig):
         self.reference_reader = reference_reader
         self.inline_reads = inline_reads
         self.max_data_age_secs = max_data_age_secs
+        self.rank_without_baseline = rank_without_baseline
 
 
 class MoversRankActor(DataActor):
@@ -232,6 +239,7 @@ class MoversRankActor(DataActor):
         self._feed = config.feed
         self._order_cap = config.order_cap
         self._max_data_age_secs = config.max_data_age_secs
+        self._rank_without_baseline = config.rank_without_baseline
         self._baseline_path = Path(config.baseline_path)
         self._reference_reader = config.reference_reader or alpaca_reference_reader
         self._inline = config.inline_reads
@@ -350,7 +358,10 @@ class MoversRankActor(DataActor):
         reasons = self._take_invalid()
         refs = self._result(self._refs, "references and splits", reasons)
         baseline = self._result(self._baseline, "baseline", reasons)
-        if baseline is not None and baseline.problem is not None:
+        no_baseline = baseline is not None and baseline.absent and self._rank_without_baseline
+        if no_baseline:
+            record["baseline"] = movers_rank.NO_BASELINE
+        elif baseline is not None and baseline.problem is not None:
             reasons.append(f"baseline not usable: {baseline.problem}")
         if reasons:
             self._finish(record, reasons)
@@ -373,6 +384,7 @@ class MoversRankActor(DataActor):
                 # the day ratio counts from 04:00 unless the file's header lists the overnight feed
                 # (ADR 0087, the lead's numerator rule of 2026-11-11)
                 overnight_baseline=baseline.overnight,
+                no_baseline=no_baseline,
             )
         except movers_rank.InvalidGeneration as error:
             self._finish(record, [f"invalid generation: {error}"])

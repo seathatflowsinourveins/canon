@@ -519,6 +519,10 @@ def baseline_at(baseline: Baseline, clock: time) -> float | None:
     return before + share * (baseline.cumulative[k] - before)
 
 
+NO_BASELINE = "no baseline: dollar tier under the move condition"
+"""Each row's stated basis when a part ranks with no baseline file (`rank`'s `no_baseline`)."""
+
+
 @dataclass(frozen=True)
 class BaselineRead:
     baselines: Mapping[str, Baseline]
@@ -527,6 +531,9 @@ class BaselineRead:
     overnight: bool = False
     """Whether the writer's header lists the overnight feed among its `feeds`, so the baselines hold the
     night's dollars; the caller passes it to `rank` as `overnight_baseline`."""
+    absent: bool = False
+    """Whether the file does not exist, which a part ranking without a baseline may pass (`rank`'s
+    `no_baseline`); a file that exists and cannot be used is never absent."""
 
 
 def write_baselines(
@@ -632,6 +639,8 @@ def read_baselines(path: Path, session: date) -> BaselineRead:
         late = sorted(s for s, b in baselines.items() if b.sessions and b.sessions[-1] >= session)
         if late:
             return BaselineRead({}, f"{path} has sessions on or after {session} for {late[:5]}")
+    except FileNotFoundError as e:
+        return BaselineRead({}, f"{path} could not be read: {type(e).__name__}: {e}", absent=True)
     except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError) as e:
         return BaselineRead({}, f"{path} could not be read: {type(e).__name__}: {e}")
     feeds = document.get("feeds", [])
@@ -930,6 +939,7 @@ def rank(
     zero_baseline_dollar_floor: float | None = None,
     zero_baseline_arm: ZeroBaselineArm | str = ZeroBaselineArm.RELATIVE_FLOOR,
     overnight_baseline: bool = False,
+    no_baseline: bool = False,
 ) -> Generation:
     """One generation over the universe, with each symbol's baseline and open gate at its own data time.
 
@@ -951,7 +961,15 @@ def rank(
     `overnight_baseline` is `BaselineRead.overnight`: true only when the baselines hold the overnight
     feed, and then the caller's tallies must hold it too, or the night's minutes are counted on one side
     only (code review of the span, finding 3: the caller's duty, not checked here).
+
+    `no_baseline` is the lead's ruling of 2026-11-11 (21:49) for a part with no baseline file: every
+    name is not established and ranks in the zero-baseline tier on its dollars, under the move
+    condition. It goes with empty `baselines`; without it a name with no baseline is a hole.
     """
+    if no_baseline and baselines:
+        raise ValueError(
+            "no_baseline ranks a part that has no baseline file, so it takes no baselines"
+        )
     if type(computed_ns) is not int or computed_ns < 0:
         raise InvalidGeneration("compute time must be a nonnegative integer nanosecond clock")
     if not is_finite_number(order_cap) or order_cap <= 0:
@@ -1052,6 +1070,8 @@ def rank(
             # a name last seen by 04:00 has no day minutes on either side
             base = max(0.0, base - before_day)
         established = None if b is None or clock is None else b.established(clock)
+        if no_baseline and clock is not None:
+            base, established = 0.0, False
         ratio, score = volume_score(
             move, dvol, base, zero_baseline_dollar_floor, established=established
         )
