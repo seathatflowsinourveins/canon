@@ -43,7 +43,6 @@ import requests
 from alpaca.common.exceptions import APIError
 from alpaca.data.enums import DataFeed
 from alpaca.data.historical.stock import StockHistoricalDataClient
-from alpaca.data.models.bars import Bar as AlpacaBar
 from alpaca.data.requests import StockTradesRequest
 from alpaca.data.timeframe import TimeFrameUnit
 from canon_alpaca.constants import ENV_API_KEY
@@ -51,6 +50,7 @@ from canon_alpaca.constants import ENV_SECRET_KEY
 from canon_alpaca.data import AlpacaDataClient
 from canon_alpaca.data import AlpacaDataClientConfig
 from canon_alpaca.factories import AlpacaDataClientFactory
+from nautilus_trader.common import Clock
 from nautilus_trader.common import Environment
 from nautilus_trader.common import Logger
 from nautilus_trader.common import logging_sync_to_disk
@@ -3650,10 +3650,13 @@ def test_a_minute_bar_subscription_hands_the_engine_the_streamed_bar(market, alp
     assert bar.ts_event == dt_to_unix_nanos(datetime(2022, 1, 3, 9, tzinfo=UTC))  # at its open
 
 
-def test_consecutive_streamed_bars_keep_receipt_times_separate_from_interval_ends(alpaca) -> None:
+def test_consecutive_streamed_bars_keep_receipt_times_separate_from_interval_ends(
+    market, alpaca, monkeypatch
+) -> None:
     # Arrival is 100 ms after each minute ends. The next minute still opens at
     # the previous interval's end, before its receipt; ts_init cannot be used as that boundary.
-    equity = canon_alpaca.providers.parse_equity(alpaca.asset(), 0)
+    strategy = watcher(bar_types=[MINUTE])
+    clock = Clock.new_test()
     opens = [
         datetime(2022, 1, 3, 14, 30, tzinfo=UTC),
         datetime(2022, 1, 3, 14, 31, tzinfo=UTC),
@@ -3662,16 +3665,28 @@ def test_consecutive_streamed_bars_keep_receipt_times_separate_from_interval_end
         dt_to_unix_nanos(datetime(2022, 1, 3, 14, 31, 0, 100_000, tzinfo=UTC)),
         dt_to_unix_nanos(datetime(2022, 1, 3, 14, 32, 0, 100_000, tzinfo=UTC)),
     ]
-    bars = [
-        canon_alpaca.data.parse_bar(
-            AlpacaBar("AAPL", {**alpaca.BAR_AAPL, "t": opened}), MINUTE, equity, received
-        )
-        for opened, received in zip(opens, receipts, strict=True)
-    ]
 
+    async def body(client) -> None:
+        await wait_until(lambda: market.socket.held("bars") == {"AAPL"})
+        # Keep the real stream, handler and engine; restore the adapter's live clock before shutdown.
+        with monkeypatch.context() as stamp:
+            stamp.setattr(client, "clock", clock)
+            for count, (opened, received) in enumerate(zip(opens, receipts, strict=True), start=1):
+                clock.set_time(received)
+                message = alpaca.wire_bar()
+                message["t"] = SimpleNamespace(to_datetime=lambda at=opened: at)
+                market.socket.deliver(message)
+                await wait_until(lambda count=count: len(strategy.seen_bars) == count)
+
+    cache = run_with_client(body, strategy, config=market.config)
+
+    bars = strategy.seen_bars
+    assert len(bars) == 2
     assert [bar.ts_event for bar in bars] == [dt_to_unix_nanos(opened) for opened in opens]
     assert [bar.ts_init for bar in bars] == receipts
     assert bars[0].ts_event + 60_000_000_000 == bars[1].ts_event < bars[0].ts_init
+    cached = cache.bar(MINUTE)
+    assert cached is not None and cached.ts_init == receipts[1]
 
 
 def test_a_wildcard_bar_subscription_sends_star_and_hands_on_only_listed_symbols(
