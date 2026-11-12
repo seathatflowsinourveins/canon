@@ -720,6 +720,20 @@
       "adr": "0095"
     },
     {
+      "id": "dsh-subagent-claude-code",
+      "field": "agent-harness",
+      "repo": "deepseek-ai/deepseek-harness",
+      "track": "tag:dsh-v0.2.1-rc.3",
+      "role": "tool",
+      "license": "MIT",
+      "why": "@deepseek-ai/dsh-subagent-claude-code 0.2.1-rc.3 (packages/subagent/subagent-claude-code): a subagent_claude_code tool that runs one self-contained task as a fresh unattended Claude Code session in the parent workspace through @anthropic-ai/claude-agent-sdk 0.3.263 (SEE LICENSE IN README.md, not MIT), which bundles Claude Code 2.1.263, behind the claude-code pin, and never falls back to the host claude. Native Claude settings and authentication stay authoritative: it reads the host's user, project and local settings, and the child gets the profile's env option over the parent environment with key-like and DSH_ variables scrubbed, so it runs under the Claude configuration directory (CLAUDE_CONFIG_DIR, else ~/.claude) and its Keychain login unless a surviving provider variable or apiKeyHelper outranks it. permissionMode defaults to dontAsk: the host's allow rules and read-only defaults run, the rest is denied. It may read and write the host's auto memory (UNVERIFIED). The login and mode build-acp gets are UNVERIFIED. Another model family answers and it edits the parent workspace, so it is build arm only, by extension of ADR 0072 rule 6 (it sends a task, not the transcript): build-acp carries it and review-acp does not. Shares the deepseek-harness pin and moves with it.",
+      "evidence": [
+        "https://github.com/deepseek-ai/deepseek-harness/tree/dsh-v0.2.1-rc.3/packages/subagent/subagent-claude-code",
+        "https://registry.npmjs.org/@deepseek-ai/dsh-subagent-claude-code/0.2.1-rc.3"
+      ],
+      "adr": "0095"
+    },
+    {
       "id": "pnpm",
       "field": "toolchain",
       "repo": "pnpm/pnpm",

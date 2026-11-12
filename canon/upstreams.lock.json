@@ -243,6 +243,15 @@
       "sha": "1f81c047fc48fa190a683e469daa699857e9afe8",
       "track": "tag:dsh-v0.2.1-rc.3"
     },
+    "dsh-subagent-claude-code": {
+      "default_branch": "master",
+      "default_sha": "e8f7b93a344964de3dca1ace9e72b6e4d6de87cb",
+      "ref": "refs/tags/dsh-v0.2.1-rc.3",
+      "repo": "deepseek-ai/deepseek-harness",
+      "resolved_at": "2026-11-12T02:33:11Z",
+      "sha": "1f81c047fc48fa190a683e469daa699857e9afe8",
+      "track": "tag:dsh-v0.2.1-rc.3"
+    },
     "dsh-subagent-codex": {
       "default_branch": "master",
       "default_sha": "e8f7b93a344964de3dca1ace9e72b6e4d6de87cb",
