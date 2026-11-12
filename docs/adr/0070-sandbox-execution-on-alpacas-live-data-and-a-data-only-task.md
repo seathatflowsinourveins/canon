@@ -116,9 +116,13 @@ asked, and whether a `data`-only token reads `/v2/assets` is UNVERIFIED.
 * Good: live-data runs with no account and many strategies on one stream; the proof ran on `main`'s code.
 * Good: a data-only process cannot send an order through this repository's clients: two checks in code,
   shown offline by term 4's test (Confirmation).
-* Bad: a sandbox run holds the stream lock for its whole run, up to an hour, and a window waits at most
-  900 s for that lock (ADR 0050), so a window that starts during a longer sandbox run fails placing
-  nothing. Runs by hand are chosen around the schedule until an unattended sandbox lane exists (ADR 0068).
+* Bad, updated 2026-11-11: a sandbox or `movers-stream` run holds A's stream lock for its run, up to
+  60 minutes plus start-up and stop. Another streaming `paper:data` task waits at most 900 s for that
+  lock; if it stays held, the waiter exits 1 without running its module while the holder continues.
+  Windows on B use B's stream lock and no longer wait for these data runs (ADR 0069). The data task's
+  headless deadline is 5,940 s, with a 100-minute outer timeout; a streaming paper test's at-most-3,900 s wait can run out
+  behind it. That wait fails the marked test's setup; pytest continues by default while keeping A's
+  paper lock (ADR 0069, "Bounds checked 2026-11-11").
 * Bad: the guard does not reach code that builds its own HTTP client with the pair.
 * Bad: the stream is one connection on many plans, so a sandbox node and a streaming paper test take turns; Alpaca's own
   rules are not simulated.
@@ -216,3 +220,9 @@ Read 2026-11-10. Fetched means read in this session as raw text or source; run m
 * NautilusTrader v2.0.0rc8 in `.venv` — `LiveNode` exposes no list of its clients; `nautilus_trader.adapters.sandbox`
   is the example's import path at the pin; a data client whose connect fails leaves the hosted run ending
   with "readiness timeout while waiting for engine connections". Run, 2026-11-11.
+* Correction, 2026-11-11: the consequence now names the account whose stream is held and the waiter
+  that fails. Read at `7d28f77`: `mise.toml:393,458,469-479,506-535` (B's separate stream lock, A's
+  streaming modules, the 900 s wait and data deadlines), `src/canon_trading/sandbox_node.py:86-88`
+  and `src/canon_trading/movers_stream.py:88` (60-minute runs), and `tests/conftest.py:323-365`
+  (failure of one marked test's setup). ADR 0069 records the remaining waiters and pytest's default
+  continuation. The limits are checked in source; actual paper durations remain UNVERIFIED here.

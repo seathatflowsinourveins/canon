@@ -228,6 +228,60 @@ connections across the login stay UNVERIFIED (clause 3). The window's longest ru
 one shared lock; it is left as it was. A streaming test's 3,900 s wait for A's stream lock can run out
 behind a `paper:data` stream of 60 minutes run to its deadline; it is not changed here.
 
+**Bounds checked 2026-11-11.** The kept window cap is 2,955 s; the old model totals 3,899.15 s including
+start-up, the first clock read, skew and the bounded end (`src/canon_trading/session_window.py:474-500`).
+The cap bounds B's window; A's data modules have their own durations.
+`paper:data` waits 900 s for A's stream lock (`mise.toml:471,509`), deliberately allowing the waiter
+to fail before a 60-minute holder ends (`scripts/test-lanes:1930`, read). Its headless deadline is
+5,940 s, with a 100-minute outer timeout (`mise.toml:458,469,530-535`), so the streaming test's 3,900 s
+wait need not cover that holder. The test actually waits `min(3900, deadline - now - 900)`
+(`tests/conftest.py:228,232,332`; `packages/canon-alpaca/tests/conftest.py:1266,1270,1370`): after a
+3,900 s account-lock wait, at most `7140 - 3900 - 900 = 2340` s remain for the stream wait
+(`mise.toml:228-229`). If the stream wait expires, its descriptor is closed and that marked test fails
+during setup; the holder continues. With the repository's defaults, pytest continues the remaining
+items, including unmarked tests, while retaining A's account lock. Each later marked item computes a
+new wait from the same task deadline. With no initial account wait, a 3,900 s stream wait likewise
+leaves at most 2,340 s for the next marked item's wait, less other elapsed work. A negative computed wait fails
+before opening a descriptor; exactly zero tries the lock once without blocking
+(`tests/conftest.py:251-286,323-365`, `mise.toml:281-285`,
+`pytest.toml`). An explicit `-x` or `--maxfail` can end pytest earlier. A stream outliving teardown keeps
+its descriptor in `KEPT_LOCKS` until pytest exits (`tests/conftest.py:370-378`), so a data task's 900 s
+wait can expire behind that holder too. These are source bounds; actual run durations remain
+UNVERIFIED here.
+
+**Other lock waiters, checked 2026-11-11 at `7d28f77`.** The waits on each account's paper lock also
+need not outlast its holder. `paper:test` waits 3,900 s for A's lock; its whole body has a 7,140 s
+headless deadline and a two-hour outer timeout (`mise.toml:223,228-229,261-262,281-285`). A second
+`paper:session` waits for B's account lock and then B's stream lock with one 900 s lock-wait budget;
+the second wait is `max(0, 900 - waited)` after the account wait, with environment preparation in
+between. Its body deadline is 6,240 s, with a 105-minute outer timeout, so a waiter can fail while an
+earlier window still runs (`mise.toml:314,319-321,391-395,416-436`). `paper:long-only tests|windows
+on|off` waits 900 s for the chosen account's paper lock, then bounds the change command at 600 s;
+`check` takes no lock (`mise.toml:562-596`). A lock timeout exits the waiting shell task with status 1,
+closing its descriptors, before that window, test run or setting change starts; it does not stop the
+holder. The 900 s wait also need not outlast a maintenance install holding B's lock (ADR 0065).
+
+Maintenance uses the same account locks and A's stream lock (`home/.claude/canon/maintenance.sh` at
+`7d28f77`; ADR 0065):
+
+* A normal round tries B's paper lock, A's paper lock and A's stream lock without waiting. A held A
+  lock ends the round with outcome `waited`, exit 0. With A's locks free, a held B lock defers the paper
+  section and differing pins while the rest runs. Its own `maintenance.lock` is also nonblocking; a
+  held one ends the round without changing its record (`:164-175,197-213`). It does not take B's stream
+  lock.
+* One detached waiter at most holds `maintenance-boundary.lock`, acquired without waiting. It waits
+  32,400 s for B's paper lock; expiry records `timed out` in `maintenance-boundary.json` without
+  signalling the holder (`:80-81,378-407`).
+* After taking B's lock, that waiter waits 300 s for `paper-checkout.lock`; expiry is logged, that
+  descriptor closes, and the boundary round continues, with install leaving the busy clone alone
+  (`:393-399`). The runner itself tries the clone lock without waiting: a regular firing fails on
+  contention, while install's prepare-only check leaves the clone alone after checking the origin
+  (`home/.claude/canon/paper-session.sh:128-134`).
+* The boundary round waits another 300 s for `maintenance.lock`; expiry records `failed` in the
+  boundary record and exits 0 without running the round (`maintenance.sh:164-168`). The default 900 s
+  `STEP_SECS` bounds each installer, with a five-second termination grace; it is not a whole-round
+  bound on holding B's lock (`:75,155-157,449-469`).
+
 **The open ends, checked 2026-11-11.** Each clause marked UNVERIFIED above, and what came of it:
 
 * The stream limit (clause 3). On paper, 2026-11-11, from 15:21:05 to 15:21:49 UTC, at 349fc9e with a
@@ -311,3 +365,8 @@ Read 2026-11-10.
   `paper:session` to B, and one map per body, each checked by a `windows` case. Second reader
   (`evidence-verifier`): it corrected "no task reads account B", "as before", the request limit, a pair
   reaching one account, the window's symbol and the mise source line, and found option 3. All fixed above.
+* Lock waits and expiry, 2026-11-11: the task bodies, both conftests and the maintenance and paper
+  runners at `7d28f77`, as cited in the bounds above, read. pytest 9.2.0 at its pin
+  `ae1d0ff57b8bd4252da9ade7353523ac0ac73281`, `src/_pytest/main.py:60-76,400-416,701-706` and
+  `src/_pytest/runner.py:123-151`, read: default `maxfail=0` continues after an item's setup failure;
+  `-x` or `--maxfail` changes that. No paper runtime was exercised for this source check.
