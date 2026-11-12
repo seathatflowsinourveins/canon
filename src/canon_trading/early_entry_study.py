@@ -393,9 +393,19 @@ def pulled_back(day: Day, run_start: int, pullback: float) -> bool:
     return min(b.close for b in before[peak:]) <= before[peak].close * (1 - pullback)
 
 
-def planned_stop(entry: float) -> float:
-    """`Mover`'s planned stop at `660b37e`: the first trigger, less the limit's give, less the chase."""
-    return (entry - entry * (TRAIL + EXIT_THROUGH)) * (1 - CHASE_CAP)
+def planned_stop(
+    entry: float,
+    *,
+    trail: float | None = None,
+    exit_through: float | None = None,
+    chase_cap: float | None = None,
+) -> float:
+    """`Mover`'s planned stop at `660b37e`: the first trigger, less the limit's give, less the chase.
+    The rows default to `TRAIL`, `EXIT_THROUGH` and `CHASE_CAP`, read at the call."""
+    trail = TRAIL if trail is None else trail
+    exit_through = EXIT_THROUGH if exit_through is None else exit_through
+    chase_cap = CHASE_CAP if chase_cap is None else chase_cap
+    return (entry - entry * (trail + exit_through)) * (1 - chase_cap)
 
 
 def entry_runs(
@@ -466,7 +476,18 @@ def refusal(
     return None
 
 
-def protect(bars: Sequence[Minute], entry: float, bid: float, costs: Costs) -> Exit | None:
+def protect(
+    bars: Sequence[Minute],
+    entry: float,
+    bid: float,
+    costs: Costs,
+    *,
+    trail: float | None = None,
+    exit_through: float | None = None,
+    chase_cap: float | None = None,
+    adaptive: bool = False,
+    unfilled: bool = False,
+) -> Exit | None:
     """The trailing sell over the bars after the entry's bar, each walked open, high, low, close.
 
     The trigger starts `TRAIL` of the entry under `bid`, the bid at the entry, and follows the highest
@@ -474,10 +495,23 @@ def protect(bars: Sequence[Minute], entry: float, bid: float, costs: Costs) -> E
     bid if that is within the released limit's give and the chase's cap, and otherwise rests at the
     cap's floor until a bid reaches it: at a later open's bid if that is above the floor, else at the
     floor. None if nothing sold by the last bar: the position is closed at the window's end.
+
+    The keyword rows default to `TRAIL`, `EXIT_THROUGH` and `CHASE_CAP`, read at the call. The order
+    is NautilusTrader's default bar path, open, high, low, close (docs/concepts/backtesting/
+    bar-execution.md at v2.0.0rc8). `adaptive` is its other documented path,
+    `bar_adaptive_high_low_ordering`: the low first unless the open is strictly nearer the high
+    (crates/execution/src/matching_engine/mod.rs:2400-2402), then the close; a sale on that low,
+    before the bar's high is reached, is why "trail-low". `unfilled` returns a
+    limit still resting at the floor after the last bar as an Exit at that bar's close bid, why
+    "unfilled", instead of None.
     """
-    trailing = entry * TRAIL
+    trail = TRAIL if trail is None else trail
+    exit_through = EXIT_THROUGH if exit_through is None else exit_through
+    chase_cap = CHASE_CAP if chase_cap is None else chase_cap
+    trailing = entry * trail
     first = trigger = bid - trailing
     raises, floor = 0, None
+    bids: list[float] = []
     for bar in bars:
         half = costs.half(bar.start + 1)
         bids = [p * (1 - half) for p in (bar.open, bar.high, bar.low, bar.close)]
@@ -488,16 +522,26 @@ def protect(bars: Sequence[Minute], entry: float, bid: float, costs: Costs) -> E
                 return Exit(bar.start + 1, floor, "floor", first, trigger, raises)
             continue
         if bids[0] <= trigger:  # opened under the trigger: the limit is released into a gap
-            floor = (trigger - entry * EXIT_THROUGH) * (1 - CHASE_CAP)
+            floor = (trigger - entry * exit_through) * (1 - chase_cap)
             if bids[0] >= floor:
                 return Exit(bar.start + 1, bids[0], "gap", first, trigger, raises)
             if bids[1] >= floor:
                 return Exit(bar.start + 1, floor, "floor", first, trigger, raises)
             continue
+        if adaptive and not bar.high - bar.open < bar.open - bar.low:  # open, low, high, close
+            if bids[2] <= trigger:
+                return Exit(bar.start + 1, trigger, "trail-low", first, trigger, raises)
+            if bids[1] - trailing > trigger:
+                trigger, raises = bids[1] - trailing, raises + 1
+            if bids[3] <= trigger:
+                return Exit(bar.start + 1, trigger, "trail", first, trigger, raises)
+            continue
         if bids[1] - trailing > trigger:
             trigger, raises = bids[1] - trailing, raises + 1
         if bids[2] <= trigger:
             return Exit(bar.start + 1, trigger, "trail", first, trigger, raises)
+    if unfilled and floor is not None:
+        return Exit(bars[-1].start + 1, bids[3], "unfilled", first, trigger, raises)
     return None
 
 
