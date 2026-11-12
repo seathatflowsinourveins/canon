@@ -1,0 +1,26 @@
+# ADR 0096's holdout: the last 18 of the 60 regular sessions before 2026-11-11 (ADR 0092 on main, docs/adr/0092-early-entry-study-measures-fixed-before-any-result.md:88-89
+# 'every trading day in the 60 regular sessions before 2026-11-11' and :105-106 'The population's dates are split
+# in order: the earliest 70% are development, the rest a holdout'); 70% of 60 is 42, so sessions 43 to 60.
+# A session is a weekday NYSE is open: NYSE Group's holiday calendar (https://www.nyse.com/markets/hours-calendars,
+# read 2026-11-12) closes only Labor Day, 2026-09-07, between 2026-08-18 and 2026-11-10; the same calendar is
+# cited at tests/test_paper_quote_study_bars.py:110 and ADR 0077's Evidence.
+# The SHA-256 of the 18 date lines below, each ending in a newline, without these comments:
+# 218be5de189f5458caf5502ebe5fbd26317606dc43fd84d70efbc2f63791c5aa
+2026-10-16
+2026-10-19
+2026-10-20
+2026-10-21
+2026-10-22
+2026-10-23
+2026-10-26
+2026-10-27
+2026-10-28
+2026-10-29
+2026-10-30
+2026-11-02
+2026-11-03
+2026-11-04
+2026-11-05
+2026-11-06
+2026-11-09
+2026-11-10

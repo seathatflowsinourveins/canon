@@ -379,3 +379,17 @@ def alpaca_stream_lock(
 
 
 # --- End of the stream lock block. ---
+
+
+@pytest.fixture(autouse=True)
+def no_holdout_opened_in_the_main_checkout(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A holdout opened at the default root marks a folder of its own, never the main checkout's
+    `ledger/holdouts`."""
+    from canon_trading import early_entry_study
+
+    ledger = tmp_path_factory.mktemp("ledger") / "trials.db"
+    monkeypatch.setattr(
+        early_entry_study, "default_holdout_root", lambda: ledger.parent / "holdouts"
+    )

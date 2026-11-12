@@ -156,6 +156,149 @@ def keys(study: optuna.Study) -> set[str]:
     return {trial.user_attrs["config_key"] for trial in study.trials}
 
 
+def test_mover_config_is_recorded_with_named_bars_costs_and_data(
+    alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack
+) -> None:
+    """ADR 0092 extension, pending: the bars replay is a Mover trial, with a ranking-readable key."""
+    from datetime import date
+
+    from canon_trading.early_entry_study import REGISTERED
+    from canon_trading.ledger import MoverTrialConfig
+    from canon_trading.mover import MoverConfig
+
+    path = tmp_path / "catalog"
+    alpaca_bars.write(path)
+    (path / "alpaca-feed").write_text("sip\n")
+    config = MoverTrialConfig(
+        settings=MoverConfig(
+            max_notional=Decimal(500),
+            max_move=Decimal(1),
+            bar_spec="1-DAY-LAST-EXTERNAL",
+            run_bars=1,
+            entry_arm="bridge",
+        ),
+        symbols=("AAPL",),
+        part="regular",
+        sessions=(),
+        history_start=date(2025, 1, 1),
+        buying_power=Decimal(1000),
+        arm="bars-registered",
+        rows=REGISTERED,
+    )
+    # Minute bars are deliberately required: a daily execution replay would mix session parts.
+    study = new_study(stack, tmp_path, "mover-bars")
+    with pytest.raises(ValueError, match="1-MINUTE"):
+        record_trial(study, path, [config], starting_balances=BALANCES)
+    assert study.trials == []
+
+
+def test_mover_trials_round_trip_and_rank_with_buying_power_sizing(
+    alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack
+) -> None:
+    """Actual engine returns reach rank unchanged; the cap is buying power divided by slots."""
+    from datetime import date
+    from datetime import timedelta
+
+    from nautilus_trader.config import LoggerConfig
+    from nautilus_trader.model import Bar
+    from nautilus_trader.model import OrderSide
+    from nautilus_trader.model import Price
+    from nautilus_trader.model import TriggerType
+
+    from canon_trading.early_entry_study import REGISTERED
+    from canon_trading.ledger import MoverTrialConfig
+    from canon_trading.mover import MoverConfig
+
+    path = tmp_path / "catalog"
+    daily = alpaca_bars.write(path)
+    (path / "alpaca-feed").write_text("sip\n")
+    minute = 60_000_000_000
+    minute_type = BarType.from_str("AAPL.ALPACA-1-MINUTE-LAST-EXTERNAL")
+    bars = []
+    for n, bar in enumerate(daily):
+        previous = daily[n - 1].close.as_decimal() if n else Decimal(100)
+        start = bar.ts_event + 570 * minute
+        for i in range(8):
+            close = previous * (1 + Decimal("0.003") * (i + 1) * (1 + Decimal(n % 7) / 10))
+            price = Price(float(close), 4)
+            bars.append(
+                Bar(
+                    minute_type,
+                    price,
+                    price,
+                    price,
+                    price,
+                    Quantity.from_int(100_000),
+                    start + i * minute,
+                    start + (i + 1) * minute,
+                )
+            )
+    sessions = tuple(datetime.fromtimestamp(bar.ts_event / 10**9, NEW_YORK).date() for bar in daily)
+    sample_start = (
+        int(datetime.combine(sessions[0], datetime.min.time(), NEW_YORK).timestamp()) * 10**9
+        + 570 * minute
+    )
+    sample_end = (
+        int(datetime.combine(sessions[-1], datetime.min.time(), NEW_YORK).timestamp()) * 10**9
+        + 960 * minute
+    )
+    # The generated tape defines no later prints; record the full requested session window.
+    ParquetDataCatalog(str(path)).write_bars(bars, start=sample_start, end=sample_end)
+    study = stack.enter_context(
+        create_ledger_study(
+            "mover-round-trip", start=sample_start, end=sample_end, path=tmp_path / "trials.db"
+        )
+    )
+    for run in (1, 3):
+        rows = dataclasses.replace(
+            REGISTERED, list_move=0.001, list_ratio=0.1, baseline_sessions=1, run_bars=run
+        )
+        cfg = MoverTrialConfig(
+            settings=MoverConfig(
+                max_notional=Decimal(500),
+                max_move=Decimal(1),
+                slots=2,
+                run_bars=run,
+                protect=False,
+                trigger=TriggerType.LAST_PRICE,
+                entry_arm="bridge",
+            ),
+            symbols=("AAPL",),
+            part="regular",
+            sessions=sessions,
+            history_start=date(2025, 3, 10) - timedelta(days=5),
+            buying_power=Decimal(1000),
+            arm="bars-registered",
+            rows=rows,
+        )
+        recorded = record_trial(
+            study,
+            path,
+            [cfg],
+            starting_balances=BALANCES,
+            logging=LoggerConfig(bypass_logging=True),
+        )
+        buys = [order for order in recorded.run.orders if order.side == OrderSide.BUY]
+        assert buys
+        assert all(
+            order.quantity.as_decimal() == Decimal(500) // order.price.as_decimal()
+            for order in buys
+        )
+    reopened = stack.enter_context(open_study("mover-round-trip", tmp_path / "trials.db"))
+    assert len(reopened.trials) == 2
+    for trial in reopened.trials:
+        assert trial.user_attrs["outcome"] == TRADED
+        assert trial.user_attrs["config_key"] == config_key(trial.user_attrs["config"])
+        held = trial.user_attrs["config"]
+        assert "digest" not in held["data"]
+        assert trial.user_attrs["mover_sample"]["history_digest"]
+        assert held["strategies"][0]["config"]["bar_type"] == str(minute_type)
+        assert held["strategies"][0]["config"]["bar_spec"] == "1-MINUTE-LAST-EXTERNAL"
+    ranked = rank(reopened)
+    assert ranked.n == 2
+    assert math.isfinite(ranked.dsr)
+
+
 def test_a_trial_round_trips_through_the_sqlite_file(
     alpaca_bars: AlpacaBars, tmp_path: Path, stack: ExitStack
 ) -> None:
@@ -3148,3 +3291,15 @@ def test_a_catalog_without_the_instrument_is_refused_before_a_trial(
         record_trial(study, tmp_path / "catalog", [strategy()], starting_balances=BALANCES)
 
     assert study.get_trials() == []
+
+
+def test_importing_the_ledger_does_not_import_the_early_entry_study() -> None:
+    """code-review-high-n2c/6: `Rows` is an annotation only, so every importer of the ledger need not
+    load the study and its catalog reader."""
+    code = (
+        "import sys, canon_trading.ledger; print('canon_trading.early_entry_study' in sys.modules)"
+    )
+    loaded = subprocess.run(
+        [sys.executable, "-c", code], check=True, capture_output=True, text=True
+    ).stdout.strip()
+    assert loaded == "False"

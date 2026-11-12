@@ -121,11 +121,17 @@ import weakref
 from contextlib import ExitStack
 from contextlib import contextmanager
 from contextlib import suppress
+from dataclasses import asdict
 from dataclasses import dataclass
+from dataclasses import field
+from dataclasses import replace
+from datetime import date
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import cast
 from urllib.parse import quote
 
 import optuna
@@ -146,12 +152,15 @@ from .ma_cross import BASE_FIELDS
 from .ma_cross import MaCross
 from .ma_cross import MaCrossConfig
 from .ma_cross import check_as_built
+from .mover import OWN_FIELDS as MOVER_FIELDS
+from .mover import MoverConfig
 from .returns_matrix import DAY_NS
 from .returns_matrix import NS_RANGE
 from .returns_matrix import ReturnsRejected
 from .returns_matrix import session_returns
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Generator
     from collections.abc import Iterable
     from collections.abc import Sequence
@@ -163,6 +172,8 @@ if TYPE_CHECKING:
 
     from .backtest import BacktestRun
     from .backtest import BuiltBacktest
+    from .early_entry_study import Rows
+    from .tuning_study import ReplayData
 
 LEDGER_FILE = Path("ledger") / "trials.db"
 
@@ -217,6 +228,32 @@ class Sample:
 
     def describe(self) -> str:
         return f"sample {self.number} ({_date(self.start)} to {_date(self.end)})"
+
+
+@dataclass(frozen=True)
+class MoverTrialConfig:
+    """A catalog-bars Mover replay (proposed bars replay record, ADR 0101).
+
+    ``settings`` remains MoverConfig. The replay reconciles its bar_spec with ranking's explicit
+    per-instrument bar_type, and names its execution/sizing departure and costs in the key.
+    Its sample and history digest are recorded beside the key. One instance runs a universe
+    together in Mover's shared slots, never one account per
+    symbol. Only the named bars replay in tuning_study is built, never a live Mover/client.
+    """
+
+    settings: MoverConfig
+    symbols: tuple[str, ...]
+    part: str
+    sessions: tuple[date, ...]
+    history_start: date
+    buying_power: Decimal
+    arm: str
+    rows: Rows
+    parameters: dict[str, Any] = field(default_factory=dict)
+    cost_name: str = "zero-fees-bar-close"
+    maker_rate: Decimal = Decimal(0)
+    taker_rate: Decimal = Decimal(0)
+    calibration: str = "UNCALIBRATED"
 
 
 def default_ledger_path() -> Path:
@@ -662,7 +699,9 @@ def _canonical(value: object) -> Any:
 
 
 def trial_config(
-    strategies: Sequence[MaCrossConfig], *, starting_balances: Sequence[str]
+    strategies: Sequence[MaCrossConfig | MoverTrialConfig],
+    *,
+    starting_balances: Sequence[str],
 ) -> dict[str, Any]:
     """The object ADR 0054 term 4 hashes: what this repo sets for a run, normalised.
 
@@ -674,6 +713,9 @@ def trial_config(
     the key of a config holding that field at either value (ADR 0053 term 2). The study's sample is
     not in it.
 
+    One MoverTrialConfig instead uses the named bars replay and reconciles bar_spec/bar_type;
+    its sample and input/history identity remain trial attributes under ADR 0041 and ADR 0053.
+
     Each config must be a `MaCrossConfig` itself, not a subclass: `record_trial` builds `MaCross` from
     every config and the key names that class, so a subclass's own fields (`SessionMaCrossConfig`'s
     `limit_offset`, `wind_down_at`) would be keyed though no run reads them, and two configs that differ
@@ -682,12 +724,15 @@ def trial_config(
     `ValueError` one whose values its constructor would refuse (`ma_cross.check_as_built`): a value
     changed or added after it was built would be keyed though the run does not read it as keyed.
     """
+    if len(strategies) == 1 and type(strategies[0]) is MoverTrialConfig:
+        return _mover_trial_config(strategies[0], starting_balances)
     other = [type(config).__name__ for config in strategies if type(config) is not MaCrossConfig]
     if other:
         raise TypeError(
             f"a trial runs MaCross, so each config is a MaCrossConfig itself: got {other[0]}, not "
             "MaCrossConfig",
         )
+    strategies = cast("Sequence[MaCrossConfig]", strategies)
     for config in strategies:
         check_as_built(config)
     bar_types = data_bar_types(str(config.bar_type) for config in strategies)
@@ -720,6 +765,82 @@ def data_bar_types(traded: Iterable[str]) -> list[str]:
     return list(dict.fromkeys(traded))
 
 
+def _mover_trial_config(
+    trial: MoverTrialConfig,
+    balances: Sequence[str],
+) -> dict[str, Any]:
+    """Ranking-readable Mover configuration, named costs and execution model, excluding sample data."""
+    from .tuning_study import ARMS
+    from .tuning_study import BAR_SPEC
+    from .tuning_study import EXECUTION
+    from .tuning_study import PARTS
+
+    settings = trial.settings
+    if type(settings) is not MoverConfig or set(vars(settings)) != set(MOVER_FIELDS):
+        raise TypeError("a Mover trial needs an unextended MoverConfig with its declared fields")
+    own = {name: getattr(settings, name) for name in MOVER_FIELDS}
+    base = {name: getattr(settings, name) for name in BASE_FIELDS}
+    MoverConfig(**own, **base)  # validate fields changed after construction, before a trial
+    if settings.bar_spec != BAR_SPEC:
+        raise ValueError("Mover tuning requires 1-MINUTE-LAST-EXTERNAL bars")
+    if trial.part not in PARTS or trial.arm not in ARMS:
+        raise ValueError("a Mover trial must name a registered runnable arm and session part")
+    if not trial.symbols or len(set(trial.symbols)) != len(trial.symbols):
+        raise ValueError("a Mover trial must name unique symbols")
+    if not trial.sessions or tuple(sorted(set(trial.sessions))) != trial.sessions:
+        raise ValueError("a Mover trial must name unique chronological sessions")
+    if not trial.buying_power.is_finite() or trial.buying_power <= 0:
+        raise ValueError("buying_power must be positive")
+    if settings.max_notional != trial.buying_power / settings.slots:
+        raise ValueError("max_notional must equal the named buying_power / slots")
+    if (
+        trial.cost_name != "zero-fees-bar-close"
+        or trial.maker_rate != 0
+        or trial.taker_rate != 0
+        or trial.calibration != "UNCALIBRATED"
+    ):
+        raise ValueError("the supported cost model is zero-fees-bar-close, explicitly UNCALIBRATED")
+    types = [f"{symbol}.ALPACA-{settings.bar_spec}" for symbol in trial.symbols]
+    # MoverConfig has a suffix, not an instrument. Each stored entry names bar_type as rank requires;
+    # the one engine runs ONE BarsReplayMover over this whole universe.
+    fields = _strategy_fields(settings)
+    fields["replay"] = {
+        "execution": EXECUTION,
+        "base_strategy": "canon_trading.mover:Mover",
+        "sizing": "buying_power / slots",
+        "buying_power": _canonical(trial.buying_power),
+        "flow": "bars-close-volume",
+        "protection_settlement_delay_ns": 1,
+        "native_activation": "post-submit-iteration-before-next-bar",
+        "arm": trial.arm,
+        "rows": asdict(trial.rows),
+        "parameters": trial.parameters,
+        "part": trial.part,
+    }
+    return {
+        "strategies": [
+            {
+                "class": "canon_trading.tuning_study:BarsReplayMover",
+                "config": {**fields, "bar_type": bar_type},
+            }
+            for bar_type in types
+        ],
+        "venue": {
+            "name": str(VENUE),
+            **{name: _canonical(value) for name, value in VENUE_SETTINGS.items()},
+            "fee_model": {
+                "class": "MakerTakerFeeModel",
+                "name": trial.cost_name,
+                "maker_rate": _canonical(trial.maker_rate),
+                "taker_rate": _canonical(trial.taker_rate),
+                "calibration": trial.calibration,
+            },
+            "starting_balances": _balances(balances),
+        },
+        "data": {"data_type": "Bar", "bar_types": types},
+    }
+
+
 def _balances(starting_balances: Sequence[str]) -> list[str]:
     """The starting balance as the key holds it, as `Money` prints it: one, in the account's base
     currency, or `ValueError` by name (`canon_trading.backtest.account_balances`, the refusal the
@@ -749,7 +870,7 @@ def _base_config_defaults() -> dict[str, Any]:
     return {name: _field(name, getattr(default, name)) for name in sorted(BASE_FIELDS)}
 
 
-def _strategy_fields(config: MaCrossConfig) -> dict[str, Any]:
+def _strategy_fields(config: MaCrossConfig | MoverConfig) -> dict[str, Any]:
     """A strategy config's fields as the key holds them (ADR 0053 term 2).
 
     Its own fields, and each base `StrategyConfig` field whose value is not its default at the pin
@@ -758,7 +879,7 @@ def _strategy_fields(config: MaCrossConfig) -> dict[str, Any]:
     base fields were read, and an upstream default moves no key of a config that keeps it.
     """
     fields = {
-        name: _field(name, value)
+        name: (_field(name, value) if not isinstance(value, datetime) else value.isoformat())
         for name, value in vars(config).items()
         if not name.startswith("_")
     }
@@ -909,13 +1030,19 @@ class RecordedTrial:
 def record_trial(
     study: optuna.Study,
     catalog_path: Path,
-    strategies: Sequence[MaCrossConfig],
+    strategies: Sequence[MaCrossConfig | MoverTrialConfig],
     *,
     starting_balances: Sequence[str],
     logging: LoggerConfig | None = None,
     on_sample: Sample | None = None,
+    replay_data: ReplayData | None = None,
 ) -> RecordedTrial:
-    """Build a `MaCross` from each config and run them over the study's sample, as one trial.
+    """Build strategies from their configs and run the study's sample as one trial.
+
+    MaCrossConfig follows the original path below, unchanged. One MoverTrialConfig uses the
+    catalog-only bars replay (proposed bars record, ADR 0101); its bar_spec/bar_type mapping,
+    named costs and buying-power sizing are in the key, with input/history digests beside it.
+    That path builds a BacktestEngine from the exact catalog objects identified before asking.
 
     ADR 0035 terms 2 and 3, ADR 0041 and ADR 0053. The key is computed from the configs first, and
     the strategies are built from them here, so what is hashed is what runs: a config changed
@@ -963,6 +1090,7 @@ def record_trial(
                 logging=logging,
                 on_sample=on_sample,
                 asked=asked,
+                replay_data=replay_data,
             )
     except BaseException as error:
         _name_the_trial(error, asked[0] if asked else None)
@@ -999,12 +1127,13 @@ def trial_asked_for(error: BaseException) -> int | None:
 def _record(
     study: optuna.Study,
     catalog_path: Path,
-    strategies: Sequence[MaCrossConfig],
+    strategies: Sequence[MaCrossConfig | MoverTrialConfig],
     *,
     starting_balances: Sequence[str],
     logging: LoggerConfig | None,
     on_sample: Sample | None,
     asked: list[int],
+    replay_data: ReplayData | None = None,
 ) -> RecordedTrial:
     """`record_trial`'s attempt, under the study's write lock; `asked` takes its trial's number."""
     sample = current_sample(study)
@@ -1014,9 +1143,13 @@ def _record(
     # these, so a sequence its caller changes afterwards changes neither the key nor the run.
     configs = tuple(strategies)
     balances = tuple(starting_balances)
+    if len(configs) == 1 and type(configs[0]) is MoverTrialConfig:
+        return _record_mover(
+            study, catalog_path, configs[0], balances, logging, sample, asked, replay_data
+        )
     config = trial_config(configs, starting_balances=balances)
     key = config_key(config)
-    built = [MaCross(strategy) for strategy in configs]
+    built = [MaCross(strategy) for strategy in cast("Sequence[MaCrossConfig]", configs)]
     if config_key(trial_config(configs, starting_balances=balances)) != key:
         raise RuntimeError("a strategy config changed while its strategies were built")
     checked = checked_run_config(
@@ -1053,9 +1186,66 @@ def _record(
         )
 
 
+def _record_mover(
+    study: optuna.Study,
+    catalog_path: Path,
+    config: MoverTrialConfig,
+    balances: Sequence[str],
+    logging: LoggerConfig | None,
+    sample: Sample,
+    asked: list[int],
+    replay_data: ReplayData | None = None,
+) -> RecordedTrial:
+    """Snapshot bars, build and record one Mover run under ADR 0101's proposed bars record."""
+    from .tuning_study import built_mover_replay
+    from .tuning_study import check_replay_data
+    from .tuning_study import load_replay
+
+    # ADR 0041/0053: the key is configuration, with the sample and actual digests beside it.
+    trial_config([config], starting_balances=balances)
+    own = {name: getattr(config.settings, name) for name in MOVER_FIELDS}
+    base = {name: getattr(config.settings, name) for name in BASE_FIELDS}
+    config = replace(
+        config,
+        settings=MoverConfig(**own, **base),
+        parameters=json.loads(canonical_json(config.parameters)),
+    )
+    data = load_replay(catalog_path, config, sample) if replay_data is None else replay_data
+    check_replay_data(config, sample, data)
+    _refuse_unbooked_ends(data.bars, sample)
+    history = data.history_digest
+    for previous in study.get_trials(deepcopy=False):
+        if previous.user_attrs.get("sample") != sample.number:
+            continue
+        held = previous.user_attrs.get("mover_sample", {}).get("history_digest", {})
+        if any(held[kind] != history[kind] for kind in held.keys() & history.keys()):
+            raise ValueError(
+                "Mover history changed on the current sample; move_sample and replay every configuration"
+            )
+    frozen = trial_config([config], starting_balances=balances)
+    key = config_key(frozen)
+    with built_mover_replay(config, data, sample, key, balances, logging) as replay:
+        return _run_as_a_trial(
+            study,
+            None,
+            sample=sample,
+            key=key,
+            config=frozen,
+            bar_types=list(data.bar_types),
+            checked_digest=bars_digest(data.bars, data.bar_types),
+            asked=asked,
+            replay=replay,
+            mover_sample={
+                "sessions": [day.isoformat() for day in config.sessions],
+                "history_start": config.history_start.isoformat(),
+                "history_digest": history,
+            },
+        )
+
+
 def _run_as_a_trial(
     study: optuna.Study,
-    node: BuiltBacktest,
+    node: BuiltBacktest | None,
     *,
     sample: Sample,
     key: str,
@@ -1063,6 +1253,8 @@ def _run_as_a_trial(
     bar_types: list[str],
     checked_digest: dict[str, str],
     asked: list[int],
+    replay: Callable[[], BacktestRun] | None = None,
+    mover_sample: dict[str, Any] | None = None,
 ) -> RecordedTrial:
     """Ask for the attempt's trial, run `node` in it, write what the run left and tell it.
 
@@ -1080,7 +1272,13 @@ def _run_as_a_trial(
         trial.set_user_attr("config_key", key)
         trial.set_user_attr("sample", sample.number)
         trial.set_user_attr("config", config)
-        run = run_built(node)
+        if mover_sample is not None:
+            trial.set_user_attr("mover_sample", mover_sample)
+        if replay is not None:
+            run = replay()
+        else:
+            assert node is not None
+            run = run_built(node)
         result = run.result
         returns = {str(ns): value for ns, value in sorted(result.returns_series.items())}
         bars = _in_order(run.bars)
@@ -1391,6 +1589,7 @@ WRITTEN = frozenset(
         "returns_series",
         "session_days",
         "data_digest",
+        "mover_sample",
         OUTCOME,
         "error",
     }
