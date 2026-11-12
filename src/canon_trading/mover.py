@@ -183,6 +183,7 @@ from .price_step import PRICES
 from .price_step import SUB_DOLLAR
 from .price_step import entry_price
 from .price_step import exit_price
+from .price_step import stop_trigger_price
 from .price_step import tick
 
 if TYPE_CHECKING:
@@ -1456,11 +1457,16 @@ class Mover(Strategy):
             return
         if at is None:
             return  # no quote or trade yet for the trigger to start from: the next step asks again
-        kept = slot.trail_trigger
+        # the reached trigger on Alpaca's step, one value for the check below and for the remade sell
+        reached = slot.trail_trigger
+        kept = None if reached is None else stop_trigger_price(reached)
         if kept is not None and at <= kept:
             # the market is at the trigger the canceled sell had reached: its sale is due now
             slot.exiting, slot.trail_trigger = True, None
-            self._say(f"{slot.instrument_id}: at {at}, the trigger {kept} is met; selling by limit")
+            self._say(
+                f"{slot.instrument_id}: at {at}, the trigger {kept} (reached {reached}) is met; "
+                "selling by limit"
+            )
             self._limit_sell(slot, held, now, slot.floor)
             return
         instrument = self._instrument(slot.instrument_id)
@@ -1469,7 +1475,7 @@ class Mover(Strategy):
         self._say(
             f"{slot.instrument_id}: trailing SELL {held}, its trigger {trailing} under the highest "
             f"{'bid' if trigger == TriggerType.BID_ASK else 'trade'}, its limit {limit} under it"
-            + ("" if kept is None else f", from the trigger {kept} already reached")
+            + ("" if kept is None else f", from the trigger {kept} (reached {reached}) on the step")
         )
         order = self.order_factory.trailing_stop_limit(
             slot.instrument_id,
