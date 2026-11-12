@@ -20,6 +20,7 @@ from canon_trading.bars_to_catalog import FEED_FILE
 
 DAY = date(2026, 10, 15)
 AS_OF = date(2026, 10, 16)
+FAR = date(2026, 12, 24)  # a holdout date outside every test span
 
 
 def writer():
@@ -158,6 +159,7 @@ def test_holdout_date_outside_recent_window_is_refused_before_opening_catalog(tm
     with pytest.raises(history_load.HistoryStopped, match="holdout.*2026-10-16"):
         p.build_profile(
             sessions=days,
+            holdout_file=holdout_file(tmp_path, FAR),
             as_of=days[-1] + timedelta(days=1),
             recent_root=tmp_path / "absent",
             long_root=tmp_path / "absent-dev",
@@ -208,6 +210,7 @@ def build(tmp_path, alpaca_bars):
     roots = catalogs(tmp_path, alpaca_bars)
     return writer().build_profile(
         sessions=[DAY, AS_OF],
+        holdout_file=holdout_file(tmp_path, FAR),
         as_of=AS_OF,
         recent_root=roots["recent"],
         long_root=roots["long"],
@@ -309,6 +312,8 @@ def test_cli_uses_supplied_roots_sessions_and_as_of(tmp_path, alpaca_bars):
                 str(roots["overnight"]),
                 "--baseline-dir",
                 str(tmp_path / "out"),
+                "--holdout-file",
+                str(holdout_file(tmp_path, FAR)),
             ]
         )
         == 0
@@ -335,6 +340,7 @@ def test_recent_never_borrows_a_bar_from_dev(tmp_path, alpaca_bars):
     )
     path = p.build_profile(
         sessions=[DAY, AS_OF],
+        holdout_file=holdout_file(tmp_path, FAR),
         as_of=AS_OF,
         recent_root=roots["recent"],
         long_root=roots["long"],
@@ -359,15 +365,16 @@ def test_queries_never_reach_as_of_or_dev_holdout(tmp_path, alpaca_bars, monkeyp
         paths[id(instance)] = root
         return instance
 
-    def read(instance, identifiers, day, feed):
-        seen.append((paths[id(instance)], day, feed))
-        return original_read(instance, identifiers, day, feed)
+    def read(instance, identifiers, days, feed):
+        seen.extend((paths[id(instance)], day, feed) for day in days)
+        return original_read(instance, identifiers, days, feed)
 
     monkeypatch.setattr(p, "ParquetDataCatalog", catalog)
     monkeypatch.setattr(p, "_read_bars", read)
     target = date(2026, 10, 19)
     path = p.build_profile(
         sessions=[DAY, AS_OF, target],
+        holdout_file=holdout_file(tmp_path, FAR),
         as_of=target,
         recent_root=roots["recent"],
         long_root=roots["long"],
@@ -397,6 +404,7 @@ def test_atomic_replace_failure_keeps_previous_profile(tmp_path, alpaca_bars, mo
     with pytest.raises(history_load.HistoryStopped, match="synthetic replace failure"):
         p.build_profile(
             sessions=[DAY, AS_OF],
+            holdout_file=holdout_file(tmp_path, FAR),
             as_of=AS_OF,
             recent_root=roots["recent"],
             long_root=roots["long"],
@@ -446,6 +454,7 @@ def build_recent_only(tmp_path, alpaca_bars, **kwargs):
     roots = catalogs(tmp_path, alpaca_bars)
     path = writer().build_profile(
         sessions=[DAY, AS_OF],
+        holdout_file=holdout_file(tmp_path, FAR),
         as_of=AS_OF,
         recent_root=roots["recent"],
         long_root=None,
@@ -482,6 +491,7 @@ def test_an_absent_long_never_takes_or_reads_the_dev_root(tmp_path, alpaca_bars,
     with original(roots["long"]):  # dev held by another process: an absent long must not wait on it
         p.build_profile(
             sessions=[DAY, AS_OF],
+            holdout_file=holdout_file(tmp_path, FAR),
             as_of=AS_OF,
             recent_root=roots["recent"],
             long_root=None,
@@ -498,6 +508,7 @@ def test_the_cli_writes_an_absent_long_only_when_asked(tmp_path, alpaca_bars):
     common = ["--sessions-file", str(calendar), "--as-of", str(AS_OF)]
     common += ["--recent-root", str(roots["recent"]), "--overnight-root", str(roots["overnight"])]
     common += ["--baseline-dir", str(tmp_path / "out")]
+    common += ["--holdout-file", str(holdout_file(tmp_path, FAR))]
     assert writer().main([*common, "--long-absent"]) == 0
     doc = writer().read_profile(tmp_path / "out" / "trail-profile-v1.json", as_of=AS_OF)
     assert doc["windows"] == "recent only; long absent"
@@ -555,3 +566,144 @@ def test_the_full_shape_has_no_windows_field_and_still_needs_long(tmp_path, alpa
         history_load.HistoryStopped, match="header sessions must name recent and long"
     ):
         p.read_profile(path, as_of=AS_OF)
+
+
+def holdout_file(tmp_path, *days):
+    path = tmp_path / "holdout.txt"
+    path.write_text("# registered holdout\n" + "".join(f"{day}\n" for day in days))
+    return path
+
+
+def counting_catalogs(p, monkeypatch):
+    """Count catalog.query_bars calls per root."""
+    original = p.ParquetDataCatalog
+    calls: dict[str, int] = {}
+
+    class Counting:
+        def __init__(self, root):
+            self.root, self.catalog = root, original(root)
+
+        def __getattr__(self, name):
+            return getattr(self.catalog, name)
+
+        def query_bars(self, *args, **kwargs):
+            calls[self.root] = calls.get(self.root, 0) + 1
+            return self.catalog.query_bars(*args, **kwargs)
+
+    def make(root):
+        return Counting(root)
+
+    monkeypatch.setattr(p, "ParquetDataCatalog", make)
+    return calls
+
+
+def test_each_root_is_read_once_per_batch_over_its_span(tmp_path, alpaca_bars, monkeypatch):
+    p = writer()
+    roots = catalogs(tmp_path, alpaca_bars)
+    calls = counting_catalogs(p, monkeypatch)
+    target = date(2026, 10, 19)
+    p.build_profile(
+        sessions=[DAY, AS_OF, target],
+        as_of=target,
+        holdout_file=holdout_file(tmp_path, date(2026, 12, 24)),
+        recent_root=roots["recent"],
+        long_root=roots["long"],
+        overnight_root=roots["overnight"],
+        baseline_dir=tmp_path / "out",
+    )
+    assert calls == {str(roots[name]): 1 for name in ("recent", "long", "overnight")}
+
+
+def test_a_bar_on_a_date_not_supplied_is_never_counted(tmp_path, alpaca_bars):
+    p = writer()
+    roots = catalogs(tmp_path, alpaca_bars)
+    equity = alpaca_bars.equity()
+    between = date(2026, 10, 17)  # inside the recent root's span, not a supplied session
+    ParquetDataCatalog(str(roots["recent"])).write_bars(
+        bars(equity, [(100, 100, 100), (150, 90, 140)], between)
+    )
+    monday, target = date(2026, 10, 19), date(2026, 10, 20)
+    path = p.build_profile(
+        sessions=[DAY, monday, target],  # AS_OF (10-16) and 10-17 lie inside the span, not supplied
+        as_of=target,
+        holdout_file=holdout_file(tmp_path, date(2026, 12, 24)),
+        recent_root=roots["recent"],
+        long_root=roots["long"],
+        overnight_root=roots["overnight"],
+        baseline_dir=tmp_path / "out",
+    )
+    rows = p.read_profile(path, as_of=target)["symbols"]["AAPL"]["recent"]
+    assert sum(row["bars"] for row in rows) == 3  # DAY's two sip bars and its night's one, only
+
+
+def test_a_span_containing_a_holdout_date_is_refused_before_any_query(
+    tmp_path, alpaca_bars, monkeypatch
+):
+    p = writer()
+    roots = catalogs(tmp_path, alpaca_bars)
+    calls = counting_catalogs(p, monkeypatch)
+    target = date(2026, 10, 19)
+    with pytest.raises(history_load.HistoryStopped, match="holdout date 2026-10-16.*--live-file"):
+        p.build_profile(
+            sessions=[DAY, AS_OF, target],
+            as_of=target,
+            holdout_file=holdout_file(tmp_path, AS_OF),
+            recent_root=roots["recent"],
+            long_root=roots["long"],
+            overnight_root=roots["overnight"],
+            baseline_dir=tmp_path / "out",
+        )
+    assert calls == {}
+    assert not (tmp_path / "out").exists()
+
+
+def test_only_the_live_builder_reads_holdout_dates_and_its_header_says_so(tmp_path, alpaca_bars):
+    p = writer()
+    roots = catalogs(tmp_path, alpaca_bars)
+    registered = holdout_file(tmp_path, AS_OF)
+    target = date(2026, 10, 19)
+    path = p.build_live_profile(
+        sessions=[DAY, AS_OF, target],
+        as_of=target,
+        holdout_file=registered,
+        recent_root=roots["recent"],
+        long_root=roots["long"],
+        overnight_root=roots["overnight"],
+        baseline_dir=tmp_path / "out",
+    )
+    doc = p.read_profile(path, as_of=target)
+    assert doc["live_file"] is True
+    assert doc["holdout"] == {
+        "path": str(registered),
+        "sha256": __import__("hashlib").sha256(registered.read_bytes()).hexdigest(),
+        "dates_read": [str(AS_OF)],
+    }
+    assert doc["sessions"]["recent"] == [str(DAY), str(AS_OF)]
+
+
+def test_the_replay_builder_cannot_be_given_the_live_flag(tmp_path):
+    p = writer()
+    with pytest.raises(TypeError, match="live_file"):
+        p.build_profile(sessions=[DAY, AS_OF], holdout_file=tmp_path / "h.txt", live_file=True)
+
+
+def test_a_default_build_records_no_live_flag_and_reads_no_holdout(tmp_path, alpaca_bars):
+    p = writer()
+    path = build(tmp_path, alpaca_bars)
+    doc = p.read_profile(path, as_of=AS_OF)
+    assert doc["live_file"] is False
+    assert doc["holdout"]["dates_read"] == []
+
+
+def test_the_cli_needs_a_holdout_file_and_takes_live_file(tmp_path, alpaca_bars):
+    roots = catalogs(tmp_path, alpaca_bars)
+    calendar = tmp_path / "sessions.txt"
+    calendar.write_text("2026-10-15\n2026-10-16\n2026-10-19\n")
+    common = ["--sessions-file", str(calendar), "--as-of", "2026-10-19"]
+    common += ["--recent-root", str(roots["recent"]), "--long-root", str(roots["long"])]
+    common += ["--overnight-root", str(roots["overnight"]), "--baseline-dir", str(tmp_path / "out")]
+    with pytest.raises(SystemExit):
+        writer().main(common)
+    registered = holdout_file(tmp_path, AS_OF)
+    assert writer().main([*common, "--holdout-file", str(registered)]) == 1
+    assert writer().main([*common, "--holdout-file", str(registered), "--live-file"]) == 0

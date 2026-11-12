@@ -11,7 +11,14 @@ only dates strictly before as_of. Recent means its latest RECENT_SESSIONS dates,
 and the overnight root. Long means all supplied earlier dates, read from sip-history-dev through
 2026-10-15, together with the recent root's window and overnight. Refuse any long date after
 2026-10-15 unless it is in that recent window; never query dev after that cutoff, even for the recent
-exception. Queries cover individual allowed sessions, never a span over a holdout or as_of date.
+exception. Each root is read with one query per symbol batch, over the span from its first allowed
+session's start to its last's end; a bar is counted only in the allowed session whose part holds it, so a
+bar on a date not supplied is never counted. A span never crosses as_of. The registered holdout list
+(--holdout-file, its path and sha256 in the header) makes the default builder, the one any replay uses,
+refuse by name, before any query, a span that contains a holdout date: a span over a holdout is never
+issued. Only build_live_profile (CLI --live-file), for the live file that sizes stops on later trading
+days, may read holdout dates; its header records live_file true and the holdout dates it read
+(the lead's ruling of 2026-11-12).
 For a replay the reader requires a target as_of and refuses a profile whose as_of is later.
 An explicit absent long (long_root None, CLI --long-absent; the coordinator's order of 2026-11-12) writes
 the header field windows = "recent only; long absent", sessions and roots with recent alone, and a null
@@ -49,6 +56,8 @@ dev/recent bars must agree exactly; identical duplicates count once. A failed re
 from __future__ import annotations
 
 import argparse
+import bisect
+import hashlib
 import json
 import math
 import sys
@@ -238,28 +247,102 @@ def _thin_rule() -> dict[str, Any]:
     }
 
 
+def _session_bounds(day: date, feed: str) -> tuple[int, int]:
+    """The feed's clock hours of one session: sip 04:00-20:00, boats the night before until 04:00."""
+    boundary = movers_rank.ny_ns(day, movers_rank.DAY_START)
+    if feed == "sip":
+        return boundary, movers_rank.ny_ns(day, movers_rank.PART_END)
+    return movers_rank.part_start_ns(day), boundary
+
+
+def read_holdout(path: Path) -> tuple[frozenset[date], str]:
+    """The registered holdout dates, one ISO date a line ('#' comments allowed), and the file's sha256."""
+    raw = path.read_bytes()
+    dates = frozenset(
+        date.fromisoformat(line.strip())
+        for line in raw.decode("utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    )
+    if not dates:
+        raise history_load.HistoryStopped(f"holdout file {path} lists no date")
+    return dates, hashlib.sha256(raw).hexdigest()
+
+
 def _read_bars(
     catalog: ParquetDataCatalog,
     identifiers: Sequence[str],
-    day: date,
+    days: Sequence[date],
     feed: str,
-) -> list[Bar]:
-    boundary = movers_rank.ny_ns(day, movers_rank.DAY_START)
-    start, end = (
-        (boundary, movers_rank.ny_ns(day, movers_rank.PART_END))
-        if feed == "sip"
-        else (movers_rank.part_start_ns(day), boundary)
-    )
-    return catalog.query_bars(
+) -> list[tuple[date, Bar]]:
+    """One query over the span of `days` (sorted), each bar paired with the allowed session whose feed
+    hours hold it; a bar in no allowed session, such as one on a date not supplied, is dropped."""
+    bounds = [_session_bounds(day, feed) for day in days]
+    starts = [lo for lo, _ in bounds]
+    held = []
+    for bar in catalog.query_bars(
         identifiers=identifiers,
-        start=start + movers_baseline.MINUTE_NS,
-        end=end,
-    )
+        start=bounds[0][0] + movers_baseline.MINUTE_NS,
+        end=bounds[-1][1],
+    ):
+        start, end = movers_rank.bar_bounds_ns(bar)
+        index = bisect.bisect_right(starts, start) - 1
+        if index >= 0 and end <= bounds[index][1]:
+            held.append((days[index], bar))
+    return held
 
 
 def build_profile(
     *,
     sessions: Sequence[date],
+    holdout_file: Path,
+    as_of: date | None = None,
+    recent_root: Path = DEFAULT_RECENT_ROOT,
+    long_root: Path | None = DEFAULT_LONG_ROOT,
+    overnight_root: Path = DEFAULT_OVERNIGHT_ROOT,
+    baseline_dir: Path = movers_baseline.DEFAULT_BASELINE_DIR,
+) -> Path:
+    """The default and replay builder: refuses any span that contains a registered holdout date."""
+    return _build(
+        sessions=sessions,
+        holdout_file=holdout_file,
+        as_of=as_of,
+        recent_root=recent_root,
+        long_root=long_root,
+        overnight_root=overnight_root,
+        baseline_dir=baseline_dir,
+        live_file=False,
+    )
+
+
+def build_live_profile(
+    *,
+    sessions: Sequence[date],
+    holdout_file: Path,
+    as_of: date | None = None,
+    recent_root: Path = DEFAULT_RECENT_ROOT,
+    long_root: Path | None = DEFAULT_LONG_ROOT,
+    overnight_root: Path = DEFAULT_OVERNIGHT_ROOT,
+    baseline_dir: Path = movers_baseline.DEFAULT_BASELINE_DIR,
+) -> Path:
+    """The live file only: may read holdout dates, as it sizes stops on later trading days; its header
+    says so and names each holdout date it read."""
+    return _build(
+        sessions=sessions,
+        holdout_file=holdout_file,
+        as_of=as_of,
+        recent_root=recent_root,
+        long_root=long_root,
+        overnight_root=overnight_root,
+        baseline_dir=baseline_dir,
+        live_file=True,
+    )
+
+
+def _build(
+    *,
+    sessions: Sequence[date],
+    holdout_file: Path,
+    live_file: bool,
     as_of: date | None = None,
     recent_root: Path = DEFAULT_RECENT_ROOT,
     long_root: Path | None = DEFAULT_LONG_ROOT,
@@ -273,6 +356,26 @@ def build_profile(
     long_absent = long_root is None
     if long_absent:
         del days["long"]
+    holdout, holdout_sha256 = read_holdout(holdout_file)
+    read_days = days.get("long", days["recent"])
+    spans = {
+        "sip": days["recent"],
+        "dev": tuple(day for day in read_days if day <= LONG_CUTOFF),
+        "boats": read_days,
+    }
+    holdout_read = sorted(
+        {
+            day
+            for selected in spans.values()
+            for day in holdout
+            if selected and selected[0] <= day <= selected[-1]
+        }
+    )
+    if holdout_read and not live_file:
+        raise history_load.HistoryStopped(
+            f"a span would contain holdout date {holdout_read[0]} (holdout file {holdout_file}); "
+            "only the live file (--live-file) may read a holdout date"
+        )
     sources = [
         (movers_baseline._outside_ledger(path), feed, dev)
         for path, feed, dev in (
@@ -312,7 +415,6 @@ def build_profile(
                 catalogs.append(catalog)
                 instruments.append(versions)
             symbols: dict[str, Any] = {}
-            read_days = days.get("long", days["recent"])
             ids = sorted(set().union(*(set(versions) for versions in instruments)))
             # Preserve the baseline's approximate batch bar bound over a longer history.
             batch_size = max(
@@ -325,14 +427,7 @@ def build_profile(
                     name: {identifier: {day: {} for day in selected} for identifier in batch}
                     for name, selected in days.items()
                 }
-                plan = [
-                    tuple(day for day in days["long"] if day <= LONG_CUTOFF)
-                    if dev
-                    else days["recent"]
-                    if feed == "sip"
-                    else read_days
-                    for _, feed, dev in sources
-                ]
+                plan = [spans["dev" if dev else feed] for _, feed, dev in sources]
                 for catalog, versions, selected, (root, feed, dev) in zip(
                     catalogs, instruments, plan, sources, strict=True
                 ):
@@ -341,32 +436,21 @@ def build_profile(
                         for identifier in batch
                         if identifier in versions
                     ]
-                    if not identifiers:
+                    if not identifiers or not selected:
                         continue
-                    for day in selected:
-                        operation = f"reading {feed} session {day} in catalog {root}"
-                        for bar in _read_bars(catalog, identifiers, day, feed):
-                            identifier = str(bar.bar_type.instrument_id)
-                            start, end = movers_rank.bar_bounds_ns(bar)
-                            boundary = movers_rank.ny_ns(day, movers_rank.DAY_START)
-                            lo, hi = (
-                                (boundary, movers_rank.ny_ns(day, movers_rank.PART_END))
-                                if feed == "sip"
-                                else (movers_rank.part_start_ns(day), boundary)
-                            )
-                            if not lo <= start < end <= hi:
+                    operation = f"reading {feed} sessions {selected[0]}..{selected[-1]} in {root}"
+                    for day, bar in _read_bars(catalog, identifiers, selected, feed):
+                        identifier = str(bar.bar_type.instrument_id)
+                        start, _ = movers_rank.bar_bounds_ns(bar)
+                        for name, selected_days in days.items():
+                            if day not in selected_days or (name == "recent" and dev):
+                                continue
+                            held = histories[name][identifier][day]
+                            if start in held and held[start] != bar:
                                 raise history_load.HistoryStopped(
-                                    f"{operation}: bar outside feed hours"
+                                    f"{operation}: conflicting duplicate {identifier} at {start}"
                                 )
-                            for name, selected_days in days.items():
-                                if day not in selected_days or (name == "recent" and dev):
-                                    continue
-                                held = histories[name][identifier][day]
-                                if start in held and held[start] != bar:
-                                    raise history_load.HistoryStopped(
-                                        f"{operation}: conflicting duplicate {identifier} at {start}"
-                                    )
-                                held[start] = bar
+                            held[start] = bar
                 for identifier in batch:
                     symbol = identifier.removesuffix(f".{VENUE}")
                     symbols[symbol] = {
@@ -397,6 +481,12 @@ def build_profile(
                     ),
                 },
                 "feeds": ["sip", "boats"],
+                "live_file": live_file,
+                "holdout": {
+                    "path": str(holdout_file),
+                    "sha256": holdout_sha256,
+                    "dates_read": [day.isoformat() for day in holdout_read],
+                },
                 "price_basis": "previous close",
                 "true_range_definition": TRUE_RANGE_DEFINITION,
                 "pullback_definition": PULLBACK_DEFINITION,
@@ -449,9 +539,19 @@ def read_profile(path: Path, *, as_of: date) -> dict[str, Any]:
         for key, value in expected.items():
             if document.get(key) != value:
                 raise ValueError(f"header {key} missing or incompatible")
-        for key in ("as_of", "written_at", "sessions", "roots"):
+        for key in ("as_of", "written_at", "sessions", "roots", "live_file", "holdout"):
             if key not in document:
                 raise ValueError(f"header {key} missing")
+        if type(document["live_file"]) is not bool:
+            raise ValueError("header live_file must be true or false")
+        holdout = document["holdout"]
+        if (
+            not isinstance(holdout, dict)
+            or set(holdout) != {"path", "sha256", "dates_read"}
+            or not isinstance(holdout["dates_read"], list)
+            or (holdout["dates_read"] and not document["live_file"])
+        ):
+            raise ValueError("header holdout must name its file, sha256 and the dates read")
         built_for = date.fromisoformat(document["as_of"])
         if built_for > as_of:
             raise ValueError(f"header as_of {built_for} is later than replay date {as_of}")
@@ -566,6 +666,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--as-of", type=date.fromisoformat, help="default: coming supplied trade date"
     )
+    parser.add_argument(
+        "--holdout-file",
+        type=Path,
+        required=True,
+        help="the registered holdout dates, one a line; a span containing one is refused",
+    )
+    parser.add_argument(
+        "--live-file",
+        action="store_true",
+        help="the live file only: may read holdout dates, and its header says so (never a replay)",
+    )
     parser.add_argument("--recent-root", type=Path, default=DEFAULT_RECENT_ROOT)
     long = parser.add_mutually_exclusive_group()
     long.add_argument("--long-root", type=Path, default=DEFAULT_LONG_ROOT)
@@ -583,8 +694,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             for line in args.sessions_file.read_text(encoding="utf-8").splitlines()
             if line.strip() and not line.lstrip().startswith("#")
         ]
-        output = build_profile(
+        output = (build_live_profile if args.live_file else build_profile)(
             sessions=sessions,
+            holdout_file=args.holdout_file,
             as_of=args.as_of,
             recent_root=args.recent_root,
             long_root=None if args.long_absent else args.long_root,
