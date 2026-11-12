@@ -570,9 +570,10 @@ data "$@"
 # data-only mode (ADR 0070): every request but GET is refused before it is sent. It places nothing and opens
 # no stream, so it takes no account's lock and no stream lock. The module paces its GETs by ADR 0093's
 # row, stops by name at a 429, names `sip` on every request and never falls back to another feed. The run is
-# held to `deadline` seconds by timeout(1) -s KILL. Trades are refused until the adapter can request them.
+# held to `deadline` seconds by timeout(1) -s KILL. Trades use the adapter's historical prints fetch and
+# the catalog's trade-tick writer, with the same catalog lock, feed marker and pace as bars.
 [tasks."paper:history"]
-description = "Load historical sip bars for listed symbols into a catalog root with one paper account's pair, GET only, paced"
+description = "Load historical sip bars or trades for listed symbols into a catalog root with one paper account's pair, GET only, paced"
 shell = "bash -c"
 timeout = "6h"
 usage = '''
@@ -582,10 +583,10 @@ arg "<account>" help="tests: account A's pair; windows: account B's pair (ADR 00
 flag "--symbols <symbols>" help="symbols, comma-separated (or --symbols-file)"
 flag "--symbols-file <file>" help="a file of symbols, one a line"
 flag "--start <start>" help="ISO 8601 with a time zone; required"
-flag "--end <end>" help="ISO 8601 with a time zone; required, at least 15 minutes (1-MINUTE) or a day (1-DAY) before now"
+flag "--end <end>" help="ISO 8601 with a time zone; required, at least 15 minutes (trades or 1-MINUTE bars) or a day (1-DAY bars) before now"
 flag "--bars <bars>" help="1-MINUTE, 1-DAY or both, comma-separated" default="1-MINUTE,1-DAY"
 flag "--catalog <root>" help="the catalog root; never under ledger/" default="catalog"
-flag "--data <kind>" help="bars; trades is not built yet (ADR 0093)" default="bars" {
+flag "--data <kind>" help="bars or individual trade prints, on sip (ADR 0093's pace and catalog lock); --bars applies only to bars" default="bars" {
   choices "bars" "trades"
 }
 '''
