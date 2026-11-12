@@ -1,0 +1,329 @@
+{
+  "amendments": {
+    "path": "docs/adr/0096-early-entry-fast-arms-by-data-source-and-one-holdout-opening.md",
+    "sha256": "5eeeed0048a52d236868f8e7b391c7004b25c7ace5e463a5778bbbfa061a56e0"
+  },
+  "arms": {
+    "BD1": {
+      "reason": "registered at e3b89301d2debcfe0aa6346cc679dba40ca223c6, not ready at the opening: its inputs (history_load keeping vwap and trade_count) are not on main (ADR 0096:63-64, 67-68; the lead's ruling of 2026-11-12); it takes the later holdout",
+      "status": "not admitted"
+    },
+    "BD3": {
+      "reason": "registered at e3b89301d2debcfe0aa6346cc679dba40ca223c6, not ready at the opening: its inputs (history_load keeping vwap and trade_count) are not on main (ADR 0096:63-64, 67-68; the lead's ruling of 2026-11-12); it takes the later holdout",
+      "status": "not admitted"
+    },
+    "BD5": {
+      "reason": "registered at e3b89301d2debcfe0aa6346cc679dba40ca223c6, not ready at the opening: its inputs (history_load keeping vwap and trade_count) are not on main (ADR 0096:63-64, 67-68; the lead's ruling of 2026-11-12); it takes the later holdout",
+      "status": "not admitted"
+    },
+    "BED1": {
+      "reason": "registered at e3b89301d2debcfe0aa6346cc679dba40ca223c6, not ready at the opening: its inputs (history_load keeping vwap and trade_count) are not on main (ADR 0096:63-64, 67-68; the lead's ruling of 2026-11-12); it takes the later holdout",
+      "status": "not admitted"
+    },
+    "BED3": {
+      "reason": "registered at e3b89301d2debcfe0aa6346cc679dba40ca223c6, not ready at the opening: its inputs (history_load keeping vwap and trade_count) are not on main (ADR 0096:63-64, 67-68; the lead's ruling of 2026-11-12); it takes the later holdout",
+      "status": "not admitted"
+    },
+    "BED5": {
+      "reason": "registered at e3b89301d2debcfe0aa6346cc679dba40ca223c6, not ready at the opening: its inputs (history_load keeping vwap and trade_count) are not on main (ADR 0096:63-64, 67-68; the lead's ruling of 2026-11-12); it takes the later holdout",
+      "status": "not admitted"
+    },
+    "BEV1": {
+      "reason": "registered at e3b89301d2debcfe0aa6346cc679dba40ca223c6, not ready at the opening: its inputs (history_load keeping vwap and trade_count) are not on main (ADR 0096:63-64, 67-68; the lead's ruling of 2026-11-12); it takes the later holdout",
+      "status": "not admitted"
+    },
+    "BEV3": {
+      "reason": "registered at e3b89301d2debcfe0aa6346cc679dba40ca223c6, not ready at the opening: its inputs (history_load keeping vwap and trade_count) are not on main (ADR 0096:63-64, 67-68; the lead's ruling of 2026-11-12); it takes the later holdout",
+      "status": "not admitted"
+    },
+    "BEV5": {
+      "reason": "registered at e3b89301d2debcfe0aa6346cc679dba40ca223c6, not ready at the opening: its inputs (history_load keeping vwap and trade_count) are not on main (ADR 0096:63-64, 67-68; the lead's ruling of 2026-11-12); it takes the later holdout",
+      "status": "not admitted"
+    },
+    "BV1": {
+      "reason": "registered at e3b89301d2debcfe0aa6346cc679dba40ca223c6, not ready at the opening: its inputs (history_load keeping vwap and trade_count) are not on main (ADR 0096:63-64, 67-68; the lead's ruling of 2026-11-12); it takes the later holdout",
+      "status": "not admitted"
+    },
+    "BV3": {
+      "reason": "registered at e3b89301d2debcfe0aa6346cc679dba40ca223c6, not ready at the opening: its inputs (history_load keeping vwap and trade_count) are not on main (ADR 0096:63-64, 67-68; the lead's ruling of 2026-11-12); it takes the later holdout",
+      "status": "not admitted"
+    },
+    "BV5": {
+      "reason": "registered at e3b89301d2debcfe0aa6346cc679dba40ca223c6, not ready at the opening: its inputs (history_load keeping vwap and trade_count) are not on main (ADR 0096:63-64, 67-68; the lead's ruling of 2026-11-12); it takes the later holdout",
+      "status": "not admitted"
+    },
+    "C0-E1": {
+      "reason": "never ready at the opening: recorder sums and arms that list through C0 or C15 cannot cover sessions before 2026-11-11 (ADR 0096:74-75)",
+      "status": "not admitted"
+    },
+    "C0-E3": {
+      "reason": "never ready at the opening: recorder sums and arms that list through C0 or C15 cannot cover sessions before 2026-11-11 (ADR 0096:74-75)",
+      "status": "not admitted"
+    },
+    "C0-E5": {
+      "reason": "never ready at the opening: recorder sums and arms that list through C0 or C15 cannot cover sessions before 2026-11-11 (ADR 0096:74-75)",
+      "status": "not admitted"
+    },
+    "C0-F": {
+      "reason": "never ready at the opening: recorder sums and arms that list through C0 or C15 cannot cover sessions before 2026-11-11 (ADR 0096:74-75)",
+      "status": "not admitted"
+    },
+    "C0-N": {
+      "reason": "never ready at the opening: recorder sums and arms that list through C0 or C15 cannot cover sessions before 2026-11-11 (ADR 0096:74-75)",
+      "status": "not admitted"
+    },
+    "C0-S": {
+      "reason": "never ready at the opening: recorder sums and arms that list through C0 or C15 cannot cover sessions before 2026-11-11 (ADR 0096:74-75)",
+      "status": "not admitted"
+    },
+    "C15-E1": {
+      "reason": "never ready at the opening: recorder sums and arms that list through C0 or C15 cannot cover sessions before 2026-11-11 (ADR 0096:74-75)",
+      "status": "not admitted"
+    },
+    "C15-E3": {
+      "reason": "never ready at the opening: recorder sums and arms that list through C0 or C15 cannot cover sessions before 2026-11-11 (ADR 0096:74-75)",
+      "status": "not admitted"
+    },
+    "C15-E5": {
+      "reason": "never ready at the opening: recorder sums and arms that list through C0 or C15 cannot cover sessions before 2026-11-11 (ADR 0096:74-75)",
+      "status": "not admitted"
+    },
+    "C15-F": {
+      "reason": "never ready at the opening: recorder sums and arms that list through C0 or C15 cannot cover sessions before 2026-11-11 (ADR 0096:74-75)",
+      "status": "not admitted"
+    },
+    "C15-N": {
+      "reason": "never ready at the opening: recorder sums and arms that list through C0 or C15 cannot cover sessions before 2026-11-11 (ADR 0096:74-75)",
+      "status": "not admitted"
+    },
+    "C15-S": {
+      "reason": "never ready at the opening: recorder sums and arms that list through C0 or C15 cannot cover sessions before 2026-11-11 (ADR 0096:74-75)",
+      "status": "not admitted"
+    },
+    "ED1": {
+      "reason": "never ready at the opening: recorder sums and arms that list through C0 or C15 cannot cover sessions before 2026-11-11 (ADR 0096:74-75)",
+      "status": "not admitted"
+    },
+    "ED3": {
+      "reason": "never ready at the opening: recorder sums and arms that list through C0 or C15 cannot cover sessions before 2026-11-11 (ADR 0096:74-75)",
+      "status": "not admitted"
+    },
+    "ED5": {
+      "reason": "never ready at the opening: recorder sums and arms that list through C0 or C15 cannot cover sessions before 2026-11-11 (ADR 0096:74-75)",
+      "status": "not admitted"
+    },
+    "EV1": {
+      "reason": "never ready at the opening: recorder sums and arms that list through C0 or C15 cannot cover sessions before 2026-11-11 (ADR 0096:74-75)",
+      "status": "not admitted"
+    },
+    "EV3": {
+      "reason": "never ready at the opening: recorder sums and arms that list through C0 or C15 cannot cover sessions before 2026-11-11 (ADR 0096:74-75)",
+      "status": "not admitted"
+    },
+    "EV5": {
+      "reason": "never ready at the opening: recorder sums and arms that list through C0 or C15 cannot cover sessions before 2026-11-11 (ADR 0096:74-75)",
+      "status": "not admitted"
+    },
+    "F-all": {
+      "commit": "0e8542fe29d823d5096563959b7f9d3234bf870e",
+      "reason": "ADR 0100 is on main before the freeze: F-all and the seven bar factor arms are registered arms of this opening, replay pending at its registration commit (ADR 0096:70-73, ADR 0100:90-95). ADR 0096's amendments 1 to 9 and 10 to 11 are not on main at the freeze and the opening rests on their drafts: the record with amendments 1 to 9, SHA-256 6cddb5d2c0d74152fb40d992a7be2c78506b53c0b5b72a7f49528760816dd556, and amendments 10 and 11 applied on top of it, a diff with SHA-256 f5f8ac1737ccb9aef76ee3a8fd6ec398130ac369b7e9d2e45c987cb6804f2241; they land on main byte for byte as hashed here, or the opening is void for the arms they cover. Amendments 1 to 9 were written between about 23:30 on 2026-11-11 and 01:18 on 2026-11-12 New York in an uncommitted file, each with its diff hashed in the coordinator log when written (the first at 23:34, amendment 9 at 01:18); the file as last modified at 02:11 is the one hashed above, the earliest hash of the whole text. No development-window replay output existed before 01:18: the tape curve of 23:55 was of 2026-11-11, outside the 60 sessions, and the development root was complete only at 02:21 (from the coordinator log, UNVERIFIED here); no amendment was written after development output existed, and none registers an arm of this freeze, so no arm here is marked registered after development output existed. No process has read an outcome on a holdout date, then or since",
+      "status": "registered, replay pending"
+    },
+    "F-gap": {
+      "commit": "0e8542fe29d823d5096563959b7f9d3234bf870e",
+      "reason": "ADR 0100 is on main before the freeze: F-all and the seven bar factor arms are registered arms of this opening, replay pending at its registration commit (ADR 0096:70-73, ADR 0100:90-95). ADR 0096's amendments 1 to 9 and 10 to 11 are not on main at the freeze and the opening rests on their drafts: the record with amendments 1 to 9, SHA-256 6cddb5d2c0d74152fb40d992a7be2c78506b53c0b5b72a7f49528760816dd556, and amendments 10 and 11 applied on top of it, a diff with SHA-256 f5f8ac1737ccb9aef76ee3a8fd6ec398130ac369b7e9d2e45c987cb6804f2241; they land on main byte for byte as hashed here, or the opening is void for the arms they cover. Amendments 1 to 9 were written between about 23:30 on 2026-11-11 and 01:18 on 2026-11-12 New York in an uncommitted file, each with its diff hashed in the coordinator log when written (the first at 23:34, amendment 9 at 01:18); the file as last modified at 02:11 is the one hashed above, the earliest hash of the whole text. No development-window replay output existed before 01:18: the tape curve of 23:55 was of 2026-11-11, outside the 60 sessions, and the development root was complete only at 02:21 (from the coordinator log, UNVERIFIED here); no amendment was written after development output existed, and none registers an arm of this freeze, so no arm here is marked registered after development output existed. No process has read an outcome on a holdout date, then or since",
+      "status": "registered, replay pending"
+    },
+    "F-move": {
+      "commit": "0e8542fe29d823d5096563959b7f9d3234bf870e",
+      "reason": "ADR 0100 is on main before the freeze: F-all and the seven bar factor arms are registered arms of this opening, replay pending at its registration commit (ADR 0096:70-73, ADR 0100:90-95). ADR 0096's amendments 1 to 9 and 10 to 11 are not on main at the freeze and the opening rests on their drafts: the record with amendments 1 to 9, SHA-256 6cddb5d2c0d74152fb40d992a7be2c78506b53c0b5b72a7f49528760816dd556, and amendments 10 and 11 applied on top of it, a diff with SHA-256 f5f8ac1737ccb9aef76ee3a8fd6ec398130ac369b7e9d2e45c987cb6804f2241; they land on main byte for byte as hashed here, or the opening is void for the arms they cover. Amendments 1 to 9 were written between about 23:30 on 2026-11-11 and 01:18 on 2026-11-12 New York in an uncommitted file, each with its diff hashed in the coordinator log when written (the first at 23:34, amendment 9 at 01:18); the file as last modified at 02:11 is the one hashed above, the earliest hash of the whole text. No development-window replay output existed before 01:18: the tape curve of 23:55 was of 2026-11-11, outside the 60 sessions, and the development root was complete only at 02:21 (from the coordinator log, UNVERIFIED here); no amendment was written after development output existed, and none registers an arm of this freeze, so no arm here is marked registered after development output existed. No process has read an outcome on a holdout date, then or since",
+      "status": "registered, replay pending"
+    },
+    "F-newhigh": {
+      "commit": "0e8542fe29d823d5096563959b7f9d3234bf870e",
+      "reason": "ADR 0100 is on main before the freeze: F-all and the seven bar factor arms are registered arms of this opening, replay pending at its registration commit (ADR 0096:70-73, ADR 0100:90-95). ADR 0096's amendments 1 to 9 and 10 to 11 are not on main at the freeze and the opening rests on their drafts: the record with amendments 1 to 9, SHA-256 6cddb5d2c0d74152fb40d992a7be2c78506b53c0b5b72a7f49528760816dd556, and amendments 10 and 11 applied on top of it, a diff with SHA-256 f5f8ac1737ccb9aef76ee3a8fd6ec398130ac369b7e9d2e45c987cb6804f2241; they land on main byte for byte as hashed here, or the opening is void for the arms they cover. Amendments 1 to 9 were written between about 23:30 on 2026-11-11 and 01:18 on 2026-11-12 New York in an uncommitted file, each with its diff hashed in the coordinator log when written (the first at 23:34, amendment 9 at 01:18); the file as last modified at 02:11 is the one hashed above, the earliest hash of the whole text. No development-window replay output existed before 01:18: the tape curve of 23:55 was of 2026-11-11, outside the 60 sessions, and the development root was complete only at 02:21 (from the coordinator log, UNVERIFIED here); no amendment was written after development output existed, and none registers an arm of this freeze, so no arm here is marked registered after development output existed. No process has read an outcome on a holdout date, then or since",
+      "status": "registered, replay pending"
+    },
+    "F-pmadv": {
+      "commit": "0e8542fe29d823d5096563959b7f9d3234bf870e",
+      "reason": "ADR 0100 is on main before the freeze: F-all and the seven bar factor arms are registered arms of this opening, replay pending at its registration commit (ADR 0096:70-73, ADR 0100:90-95). ADR 0096's amendments 1 to 9 and 10 to 11 are not on main at the freeze and the opening rests on their drafts: the record with amendments 1 to 9, SHA-256 6cddb5d2c0d74152fb40d992a7be2c78506b53c0b5b72a7f49528760816dd556, and amendments 10 and 11 applied on top of it, a diff with SHA-256 f5f8ac1737ccb9aef76ee3a8fd6ec398130ac369b7e9d2e45c987cb6804f2241; they land on main byte for byte as hashed here, or the opening is void for the arms they cover. Amendments 1 to 9 were written between about 23:30 on 2026-11-11 and 01:18 on 2026-11-12 New York in an uncommitted file, each with its diff hashed in the coordinator log when written (the first at 23:34, amendment 9 at 01:18); the file as last modified at 02:11 is the one hashed above, the earliest hash of the whole text. No development-window replay output existed before 01:18: the tape curve of 23:55 was of 2026-11-11, outside the 60 sessions, and the development root was complete only at 02:21 (from the coordinator log, UNVERIFIED here); no amendment was written after development output existed, and none registers an arm of this freeze, so no arm here is marked registered after development output existed. No process has read an outcome on a holdout date, then or since",
+      "status": "registered, replay pending"
+    },
+    "F-rdb5": {
+      "reason": "not admitted: reads vwap and trade_count, which history_load does not keep on main; takes ADR 0100's own later holdout (ADR 0096:73-74)",
+      "status": "not admitted"
+    },
+    "F-rdv": {
+      "commit": "0e8542fe29d823d5096563959b7f9d3234bf870e",
+      "reason": "ADR 0100 is on main before the freeze: F-all and the seven bar factor arms are registered arms of this opening, replay pending at its registration commit (ADR 0096:70-73, ADR 0100:90-95). ADR 0096's amendments 1 to 9 and 10 to 11 are not on main at the freeze and the opening rests on their drafts: the record with amendments 1 to 9, SHA-256 6cddb5d2c0d74152fb40d992a7be2c78506b53c0b5b72a7f49528760816dd556, and amendments 10 and 11 applied on top of it, a diff with SHA-256 f5f8ac1737ccb9aef76ee3a8fd6ec398130ac369b7e9d2e45c987cb6804f2241; they land on main byte for byte as hashed here, or the opening is void for the arms they cover. Amendments 1 to 9 were written between about 23:30 on 2026-11-11 and 01:18 on 2026-11-12 New York in an uncommitted file, each with its diff hashed in the coordinator log when written (the first at 23:34, amendment 9 at 01:18); the file as last modified at 02:11 is the one hashed above, the earliest hash of the whole text. No development-window replay output existed before 01:18: the tape curve of 23:55 was of 2026-11-11, outside the 60 sessions, and the development root was complete only at 02:21 (from the coordinator log, UNVERIFIED here); no amendment was written after development output existed, and none registers an arm of this freeze, so no arm here is marked registered after development output existed. No process has read an outcome on a holdout date, then or since",
+      "status": "registered, replay pending"
+    },
+    "F-repeat": {
+      "commit": "0e8542fe29d823d5096563959b7f9d3234bf870e",
+      "reason": "ADR 0100 is on main before the freeze: F-all and the seven bar factor arms are registered arms of this opening, replay pending at its registration commit (ADR 0096:70-73, ADR 0100:90-95). ADR 0096's amendments 1 to 9 and 10 to 11 are not on main at the freeze and the opening rests on their drafts: the record with amendments 1 to 9, SHA-256 6cddb5d2c0d74152fb40d992a7be2c78506b53c0b5b72a7f49528760816dd556, and amendments 10 and 11 applied on top of it, a diff with SHA-256 f5f8ac1737ccb9aef76ee3a8fd6ec398130ac369b7e9d2e45c987cb6804f2241; they land on main byte for byte as hashed here, or the opening is void for the arms they cover. Amendments 1 to 9 were written between about 23:30 on 2026-11-11 and 01:18 on 2026-11-12 New York in an uncommitted file, each with its diff hashed in the coordinator log when written (the first at 23:34, amendment 9 at 01:18); the file as last modified at 02:11 is the one hashed above, the earliest hash of the whole text. No development-window replay output existed before 01:18: the tape curve of 23:55 was of 2026-11-11, outside the 60 sessions, and the development root was complete only at 02:21 (from the coordinator log, UNVERIFIED here); no amendment was written after development output existed, and none registers an arm of this freeze, so no arm here is marked registered after development output existed. No process has read an outcome on a holdout date, then or since",
+      "status": "registered, replay pending"
+    },
+    "F-streak": {
+      "commit": "0e8542fe29d823d5096563959b7f9d3234bf870e",
+      "reason": "ADR 0100 is on main before the freeze: F-all and the seven bar factor arms are registered arms of this opening, replay pending at its registration commit (ADR 0096:70-73, ADR 0100:90-95). ADR 0096's amendments 1 to 9 and 10 to 11 are not on main at the freeze and the opening rests on their drafts: the record with amendments 1 to 9, SHA-256 6cddb5d2c0d74152fb40d992a7be2c78506b53c0b5b72a7f49528760816dd556, and amendments 10 and 11 applied on top of it, a diff with SHA-256 f5f8ac1737ccb9aef76ee3a8fd6ec398130ac369b7e9d2e45c987cb6804f2241; they land on main byte for byte as hashed here, or the opening is void for the arms they cover. Amendments 1 to 9 were written between about 23:30 on 2026-11-11 and 01:18 on 2026-11-12 New York in an uncommitted file, each with its diff hashed in the coordinator log when written (the first at 23:34, amendment 9 at 01:18); the file as last modified at 02:11 is the one hashed above, the earliest hash of the whole text. No development-window replay output existed before 01:18: the tape curve of 23:55 was of 2026-11-11, outside the 60 sessions, and the development root was complete only at 02:21 (from the coordinator log, UNVERIFIED here); no amendment was written after development output existed, and none registers an arm of this freeze, so no arm here is marked registered after development output existed. No process has read an outcome on a holdout date, then or since",
+      "status": "registered, replay pending"
+    },
+    "F-vwap": {
+      "reason": "not admitted: reads vwap and trade_count, which history_load does not keep on main; takes ADR 0100's own later holdout (ADR 0096:73-74)",
+      "status": "not admitted"
+    },
+    "L1-N": {
+      "reason": "not admitted: the trades loader on main (#283, 55e256a) drops the conditions, exchange, tape and correction flag u that this record's prints must keep (ADR 0096:55-57), so no catalog root holds prints as it needs them (ADR 0096:68-69)",
+      "status": "not admitted"
+    },
+    "L1-S": {
+      "reason": "not admitted: the trades loader on main (#283, 55e256a) drops the conditions, exchange, tape and correction flag u that this record's prints must keep (ADR 0096:55-57), so no catalog root holds prints as it needs them (ADR 0096:68-69)",
+      "status": "not admitted"
+    },
+    "L3-N": {
+      "reason": "not admitted: the trades loader on main (#283, 55e256a) drops the conditions, exchange, tape and correction flag u that this record's prints must keep (ADR 0096:55-57), so no catalog root holds prints as it needs them (ADR 0096:68-69)",
+      "status": "not admitted"
+    },
+    "L3-S": {
+      "reason": "not admitted: the trades loader on main (#283, 55e256a) drops the conditions, exchange, tape and correction flag u that this record's prints must keep (ADR 0096:55-57), so no catalog root holds prints as it needs them (ADR 0096:68-69)",
+      "status": "not admitted"
+    },
+    "L5-N": {
+      "reason": "not admitted: the trades loader on main (#283, 55e256a) drops the conditions, exchange, tape and correction flag u that this record's prints must keep (ADR 0096:55-57), so no catalog root holds prints as it needs them (ADR 0096:68-69)",
+      "status": "not admitted"
+    },
+    "L5-S": {
+      "reason": "not admitted: the trades loader on main (#283, 55e256a) drops the conditions, exchange, tape and correction flag u that this record's prints must keep (ADR 0096:55-57), so no catalog root holds prints as it needs them (ADR 0096:68-69)",
+      "status": "not admitted"
+    },
+    "LD1": {
+      "reason": "never ready at the opening: recorder sums and arms that list through C0 or C15 cannot cover sessions before 2026-11-11 (ADR 0096:74-75)",
+      "status": "not admitted"
+    },
+    "LD3": {
+      "reason": "never ready at the opening: recorder sums and arms that list through C0 or C15 cannot cover sessions before 2026-11-11 (ADR 0096:74-75)",
+      "status": "not admitted"
+    },
+    "LD5": {
+      "reason": "never ready at the opening: recorder sums and arms that list through C0 or C15 cannot cover sessions before 2026-11-11 (ADR 0096:74-75)",
+      "status": "not admitted"
+    },
+    "LV1": {
+      "reason": "never ready at the opening: recorder sums and arms that list through C0 or C15 cannot cover sessions before 2026-11-11 (ADR 0096:74-75)",
+      "status": "not admitted"
+    },
+    "LV3": {
+      "reason": "never ready at the opening: recorder sums and arms that list through C0 or C15 cannot cover sessions before 2026-11-11 (ADR 0096:74-75)",
+      "status": "not admitted"
+    },
+    "LV5": {
+      "reason": "never ready at the opening: recorder sums and arms that list through C0 or C15 cannot cover sessions before 2026-11-11 (ADR 0096:74-75)",
+      "status": "not admitted"
+    },
+    "baseline-10": {
+      "commit": "bb601e8b34dbabe0e66629a2010049fcc53a9c33",
+      "reason": "ADR 0092's fifteen arms, rows registered at bb601e8b34dbabe0e66629a2010049fcc53a9c33 and window and split at 1e790c73400c3816eb85daec050f44c80b113a3b; their inputs cover the training dates at the freeze (ADR 0096:67). ADR 0096's amendments 1 to 9 and 10 to 11 are not on main at the freeze and the opening rests on their drafts: the record with amendments 1 to 9, SHA-256 6cddb5d2c0d74152fb40d992a7be2c78506b53c0b5b72a7f49528760816dd556, and amendments 10 and 11 applied on top of it, a diff with SHA-256 f5f8ac1737ccb9aef76ee3a8fd6ec398130ac369b7e9d2e45c987cb6804f2241; they land on main byte for byte as hashed here, or the opening is void for the arms they cover. Amendments 1 to 9 were written between about 23:30 on 2026-11-11 and 01:18 on 2026-11-12 New York in an uncommitted file, each with its diff hashed in the coordinator log when written (the first at 23:34, amendment 9 at 01:18); the file as last modified at 02:11 is the one hashed above, the earliest hash of the whole text. No development-window replay output existed before 01:18: the tape curve of 23:55 was of 2026-11-11, outside the 60 sessions, and the development root was complete only at 02:21 (from the coordinator log, UNVERIFIED here); no amendment was written after development output existed, and none registers an arm of this freeze, so no arm here is marked registered after development output existed. No process has read an outcome on a holdout date, then or since",
+      "status": "admitted"
+    },
+    "baseline-20": {
+      "commit": "bb601e8b34dbabe0e66629a2010049fcc53a9c33",
+      "reason": "ADR 0092's fifteen arms, rows registered at bb601e8b34dbabe0e66629a2010049fcc53a9c33 and window and split at 1e790c73400c3816eb85daec050f44c80b113a3b; their inputs cover the training dates at the freeze (ADR 0096:67). ADR 0096's amendments 1 to 9 and 10 to 11 are not on main at the freeze and the opening rests on their drafts: the record with amendments 1 to 9, SHA-256 6cddb5d2c0d74152fb40d992a7be2c78506b53c0b5b72a7f49528760816dd556, and amendments 10 and 11 applied on top of it, a diff with SHA-256 f5f8ac1737ccb9aef76ee3a8fd6ec398130ac369b7e9d2e45c987cb6804f2241; they land on main byte for byte as hashed here, or the opening is void for the arms they cover. Amendments 1 to 9 were written between about 23:30 on 2026-11-11 and 01:18 on 2026-11-12 New York in an uncommitted file, each with its diff hashed in the coordinator log when written (the first at 23:34, amendment 9 at 01:18); the file as last modified at 02:11 is the one hashed above, the earliest hash of the whole text. No development-window replay output existed before 01:18: the tape curve of 23:55 was of 2026-11-11, outside the 60 sessions, and the development root was complete only at 02:21 (from the coordinator log, UNVERIFIED here); no amendment was written after development output existed, and none registers an arm of this freeze, so no arm here is marked registered after development output existed. No process has read an outcome on a holdout date, then or since",
+      "status": "admitted"
+    },
+    "move-2": {
+      "commit": "bb601e8b34dbabe0e66629a2010049fcc53a9c33",
+      "reason": "ADR 0092's fifteen arms, rows registered at bb601e8b34dbabe0e66629a2010049fcc53a9c33 and window and split at 1e790c73400c3816eb85daec050f44c80b113a3b; their inputs cover the training dates at the freeze (ADR 0096:67). ADR 0096's amendments 1 to 9 and 10 to 11 are not on main at the freeze and the opening rests on their drafts: the record with amendments 1 to 9, SHA-256 6cddb5d2c0d74152fb40d992a7be2c78506b53c0b5b72a7f49528760816dd556, and amendments 10 and 11 applied on top of it, a diff with SHA-256 f5f8ac1737ccb9aef76ee3a8fd6ec398130ac369b7e9d2e45c987cb6804f2241; they land on main byte for byte as hashed here, or the opening is void for the arms they cover. Amendments 1 to 9 were written between about 23:30 on 2026-11-11 and 01:18 on 2026-11-12 New York in an uncommitted file, each with its diff hashed in the coordinator log when written (the first at 23:34, amendment 9 at 01:18); the file as last modified at 02:11 is the one hashed above, the earliest hash of the whole text. No development-window replay output existed before 01:18: the tape curve of 23:55 was of 2026-11-11, outside the 60 sessions, and the development root was complete only at 02:21 (from the coordinator log, UNVERIFIED here); no amendment was written after development output existed, and none registers an arm of this freeze, so no arm here is marked registered after development output existed. No process has read an outcome on a holdout date, then or since",
+      "status": "admitted"
+    },
+    "move-5": {
+      "commit": "bb601e8b34dbabe0e66629a2010049fcc53a9c33",
+      "reason": "ADR 0092's fifteen arms, rows registered at bb601e8b34dbabe0e66629a2010049fcc53a9c33 and window and split at 1e790c73400c3816eb85daec050f44c80b113a3b; their inputs cover the training dates at the freeze (ADR 0096:67). ADR 0096's amendments 1 to 9 and 10 to 11 are not on main at the freeze and the opening rests on their drafts: the record with amendments 1 to 9, SHA-256 6cddb5d2c0d74152fb40d992a7be2c78506b53c0b5b72a7f49528760816dd556, and amendments 10 and 11 applied on top of it, a diff with SHA-256 f5f8ac1737ccb9aef76ee3a8fd6ec398130ac369b7e9d2e45c987cb6804f2241; they land on main byte for byte as hashed here, or the opening is void for the arms they cover. Amendments 1 to 9 were written between about 23:30 on 2026-11-11 and 01:18 on 2026-11-12 New York in an uncommitted file, each with its diff hashed in the coordinator log when written (the first at 23:34, amendment 9 at 01:18); the file as last modified at 02:11 is the one hashed above, the earliest hash of the whole text. No development-window replay output existed before 01:18: the tape curve of 23:55 was of 2026-11-11, outside the 60 sessions, and the development root was complete only at 02:21 (from the coordinator log, UNVERIFIED here); no amendment was written after development output existed, and none registers an arm of this freeze, so no arm here is marked registered after development output existed. No process has read an outcome on a holdout date, then or since",
+      "status": "admitted"
+    },
+    "orb5-rank-all": {
+      "reason": "not admitted: its registration is not on main (ADR 0096:69-70)",
+      "status": "not admitted"
+    },
+    "orb5-rank-bullish": {
+      "reason": "not admitted: its registration is not on main (ADR 0096:69-70)",
+      "status": "not admitted"
+    },
+    "quiet-10": {
+      "commit": "bb601e8b34dbabe0e66629a2010049fcc53a9c33",
+      "reason": "ADR 0092's fifteen arms, rows registered at bb601e8b34dbabe0e66629a2010049fcc53a9c33 and window and split at 1e790c73400c3816eb85daec050f44c80b113a3b; their inputs cover the training dates at the freeze (ADR 0096:67). ADR 0096's amendments 1 to 9 and 10 to 11 are not on main at the freeze and the opening rests on their drafts: the record with amendments 1 to 9, SHA-256 6cddb5d2c0d74152fb40d992a7be2c78506b53c0b5b72a7f49528760816dd556, and amendments 10 and 11 applied on top of it, a diff with SHA-256 f5f8ac1737ccb9aef76ee3a8fd6ec398130ac369b7e9d2e45c987cb6804f2241; they land on main byte for byte as hashed here, or the opening is void for the arms they cover. Amendments 1 to 9 were written between about 23:30 on 2026-11-11 and 01:18 on 2026-11-12 New York in an uncommitted file, each with its diff hashed in the coordinator log when written (the first at 23:34, amendment 9 at 01:18); the file as last modified at 02:11 is the one hashed above, the earliest hash of the whole text. No development-window replay output existed before 01:18: the tape curve of 23:55 was of 2026-11-11, outside the 60 sessions, and the development root was complete only at 02:21 (from the coordinator log, UNVERIFIED here); no amendment was written after development output existed, and none registers an arm of this freeze, so no arm here is marked registered after development output existed. No process has read an outcome on a holdout date, then or since",
+      "status": "admitted"
+    },
+    "quiet-10-pullback": {
+      "commit": "bb601e8b34dbabe0e66629a2010049fcc53a9c33",
+      "reason": "ADR 0092's fifteen arms, rows registered at bb601e8b34dbabe0e66629a2010049fcc53a9c33 and window and split at 1e790c73400c3816eb85daec050f44c80b113a3b; their inputs cover the training dates at the freeze (ADR 0096:67). ADR 0096's amendments 1 to 9 and 10 to 11 are not on main at the freeze and the opening rests on their drafts: the record with amendments 1 to 9, SHA-256 6cddb5d2c0d74152fb40d992a7be2c78506b53c0b5b72a7f49528760816dd556, and amendments 10 and 11 applied on top of it, a diff with SHA-256 f5f8ac1737ccb9aef76ee3a8fd6ec398130ac369b7e9d2e45c987cb6804f2241; they land on main byte for byte as hashed here, or the opening is void for the arms they cover. Amendments 1 to 9 were written between about 23:30 on 2026-11-11 and 01:18 on 2026-11-12 New York in an uncommitted file, each with its diff hashed in the coordinator log when written (the first at 23:34, amendment 9 at 01:18); the file as last modified at 02:11 is the one hashed above, the earliest hash of the whole text. No development-window replay output existed before 01:18: the tape curve of 23:55 was of 2026-11-11, outside the 60 sessions, and the development root was complete only at 02:21 (from the coordinator log, UNVERIFIED here); no amendment was written after development output existed, and none registers an arm of this freeze, so no arm here is marked registered after development output existed. No process has read an outcome on a holdout date, then or since",
+      "status": "admitted"
+    },
+    "quiet-25": {
+      "commit": "bb601e8b34dbabe0e66629a2010049fcc53a9c33",
+      "reason": "ADR 0092's fifteen arms, rows registered at bb601e8b34dbabe0e66629a2010049fcc53a9c33 and window and split at 1e790c73400c3816eb85daec050f44c80b113a3b; their inputs cover the training dates at the freeze (ADR 0096:67). ADR 0096's amendments 1 to 9 and 10 to 11 are not on main at the freeze and the opening rests on their drafts: the record with amendments 1 to 9, SHA-256 6cddb5d2c0d74152fb40d992a7be2c78506b53c0b5b72a7f49528760816dd556, and amendments 10 and 11 applied on top of it, a diff with SHA-256 f5f8ac1737ccb9aef76ee3a8fd6ec398130ac369b7e9d2e45c987cb6804f2241; they land on main byte for byte as hashed here, or the opening is void for the arms they cover. Amendments 1 to 9 were written between about 23:30 on 2026-11-11 and 01:18 on 2026-11-12 New York in an uncommitted file, each with its diff hashed in the coordinator log when written (the first at 23:34, amendment 9 at 01:18); the file as last modified at 02:11 is the one hashed above, the earliest hash of the whole text. No development-window replay output existed before 01:18: the tape curve of 23:55 was of 2026-11-11, outside the 60 sessions, and the development root was complete only at 02:21 (from the coordinator log, UNVERIFIED here); no amendment was written after development output existed, and none registers an arm of this freeze, so no arm here is marked registered after development output existed. No process has read an outcome on a holdout date, then or since",
+      "status": "admitted"
+    },
+    "ratio-2": {
+      "commit": "bb601e8b34dbabe0e66629a2010049fcc53a9c33",
+      "reason": "ADR 0092's fifteen arms, rows registered at bb601e8b34dbabe0e66629a2010049fcc53a9c33 and window and split at 1e790c73400c3816eb85daec050f44c80b113a3b; their inputs cover the training dates at the freeze (ADR 0096:67). ADR 0096's amendments 1 to 9 and 10 to 11 are not on main at the freeze and the opening rests on their drafts: the record with amendments 1 to 9, SHA-256 6cddb5d2c0d74152fb40d992a7be2c78506b53c0b5b72a7f49528760816dd556, and amendments 10 and 11 applied on top of it, a diff with SHA-256 f5f8ac1737ccb9aef76ee3a8fd6ec398130ac369b7e9d2e45c987cb6804f2241; they land on main byte for byte as hashed here, or the opening is void for the arms they cover. Amendments 1 to 9 were written between about 23:30 on 2026-11-11 and 01:18 on 2026-11-12 New York in an uncommitted file, each with its diff hashed in the coordinator log when written (the first at 23:34, amendment 9 at 01:18); the file as last modified at 02:11 is the one hashed above, the earliest hash of the whole text. No development-window replay output existed before 01:18: the tape curve of 23:55 was of 2026-11-11, outside the 60 sessions, and the development root was complete only at 02:21 (from the coordinator log, UNVERIFIED here); no amendment was written after development output existed, and none registers an arm of this freeze, so no arm here is marked registered after development output existed. No process has read an outcome on a holdout date, then or since",
+      "status": "admitted"
+    },
+    "ratio-5": {
+      "commit": "bb601e8b34dbabe0e66629a2010049fcc53a9c33",
+      "reason": "ADR 0092's fifteen arms, rows registered at bb601e8b34dbabe0e66629a2010049fcc53a9c33 and window and split at 1e790c73400c3816eb85daec050f44c80b113a3b; their inputs cover the training dates at the freeze (ADR 0096:67). ADR 0096's amendments 1 to 9 and 10 to 11 are not on main at the freeze and the opening rests on their drafts: the record with amendments 1 to 9, SHA-256 6cddb5d2c0d74152fb40d992a7be2c78506b53c0b5b72a7f49528760816dd556, and amendments 10 and 11 applied on top of it, a diff with SHA-256 f5f8ac1737ccb9aef76ee3a8fd6ec398130ac369b7e9d2e45c987cb6804f2241; they land on main byte for byte as hashed here, or the opening is void for the arms they cover. Amendments 1 to 9 were written between about 23:30 on 2026-11-11 and 01:18 on 2026-11-12 New York in an uncommitted file, each with its diff hashed in the coordinator log when written (the first at 23:34, amendment 9 at 01:18); the file as last modified at 02:11 is the one hashed above, the earliest hash of the whole text. No development-window replay output existed before 01:18: the tape curve of 23:55 was of 2026-11-11, outside the 60 sessions, and the development root was complete only at 02:21 (from the coordinator log, UNVERIFIED here); no amendment was written after development output existed, and none registers an arm of this freeze, so no arm here is marked registered after development output existed. No process has read an outcome on a holdout date, then or since",
+      "status": "admitted"
+    },
+    "registered": {
+      "commit": "bb601e8b34dbabe0e66629a2010049fcc53a9c33",
+      "reason": "ADR 0092's fifteen arms, rows registered at bb601e8b34dbabe0e66629a2010049fcc53a9c33 and window and split at 1e790c73400c3816eb85daec050f44c80b113a3b; their inputs cover the training dates at the freeze (ADR 0096:67). ADR 0096's amendments 1 to 9 and 10 to 11 are not on main at the freeze and the opening rests on their drafts: the record with amendments 1 to 9, SHA-256 6cddb5d2c0d74152fb40d992a7be2c78506b53c0b5b72a7f49528760816dd556, and amendments 10 and 11 applied on top of it, a diff with SHA-256 f5f8ac1737ccb9aef76ee3a8fd6ec398130ac369b7e9d2e45c987cb6804f2241; they land on main byte for byte as hashed here, or the opening is void for the arms they cover. Amendments 1 to 9 were written between about 23:30 on 2026-11-11 and 01:18 on 2026-11-12 New York in an uncommitted file, each with its diff hashed in the coordinator log when written (the first at 23:34, amendment 9 at 01:18); the file as last modified at 02:11 is the one hashed above, the earliest hash of the whole text. No development-window replay output existed before 01:18: the tape curve of 23:55 was of 2026-11-11, outside the 60 sessions, and the development root was complete only at 02:21 (from the coordinator log, UNVERIFIED here); no amendment was written after development output existed, and none registers an arm of this freeze, so no arm here is marked registered after development output existed. No process has read an outcome on a holdout date, then or since",
+      "status": "admitted"
+    },
+    "run-1": {
+      "commit": "bb601e8b34dbabe0e66629a2010049fcc53a9c33",
+      "reason": "ADR 0092's fifteen arms, rows registered at bb601e8b34dbabe0e66629a2010049fcc53a9c33 and window and split at 1e790c73400c3816eb85daec050f44c80b113a3b; their inputs cover the training dates at the freeze (ADR 0096:67). ADR 0096's amendments 1 to 9 and 10 to 11 are not on main at the freeze and the opening rests on their drafts: the record with amendments 1 to 9, SHA-256 6cddb5d2c0d74152fb40d992a7be2c78506b53c0b5b72a7f49528760816dd556, and amendments 10 and 11 applied on top of it, a diff with SHA-256 f5f8ac1737ccb9aef76ee3a8fd6ec398130ac369b7e9d2e45c987cb6804f2241; they land on main byte for byte as hashed here, or the opening is void for the arms they cover. Amendments 1 to 9 were written between about 23:30 on 2026-11-11 and 01:18 on 2026-11-12 New York in an uncommitted file, each with its diff hashed in the coordinator log when written (the first at 23:34, amendment 9 at 01:18); the file as last modified at 02:11 is the one hashed above, the earliest hash of the whole text. No development-window replay output existed before 01:18: the tape curve of 23:55 was of 2026-11-11, outside the 60 sessions, and the development root was complete only at 02:21 (from the coordinator log, UNVERIFIED here); no amendment was written after development output existed, and none registers an arm of this freeze, so no arm here is marked registered after development output existed. No process has read an outcome on a holdout date, then or since",
+      "status": "admitted"
+    },
+    "run-2": {
+      "commit": "bb601e8b34dbabe0e66629a2010049fcc53a9c33",
+      "reason": "ADR 0092's fifteen arms, rows registered at bb601e8b34dbabe0e66629a2010049fcc53a9c33 and window and split at 1e790c73400c3816eb85daec050f44c80b113a3b; their inputs cover the training dates at the freeze (ADR 0096:67). ADR 0096's amendments 1 to 9 and 10 to 11 are not on main at the freeze and the opening rests on their drafts: the record with amendments 1 to 9, SHA-256 6cddb5d2c0d74152fb40d992a7be2c78506b53c0b5b72a7f49528760816dd556, and amendments 10 and 11 applied on top of it, a diff with SHA-256 f5f8ac1737ccb9aef76ee3a8fd6ec398130ac369b7e9d2e45c987cb6804f2241; they land on main byte for byte as hashed here, or the opening is void for the arms they cover. Amendments 1 to 9 were written between about 23:30 on 2026-11-11 and 01:18 on 2026-11-12 New York in an uncommitted file, each with its diff hashed in the coordinator log when written (the first at 23:34, amendment 9 at 01:18); the file as last modified at 02:11 is the one hashed above, the earliest hash of the whole text. No development-window replay output existed before 01:18: the tape curve of 23:55 was of 2026-11-11, outside the 60 sessions, and the development root was complete only at 02:21 (from the coordinator log, UNVERIFIED here); no amendment was written after development output existed, and none registers an arm of this freeze, so no arm here is marked registered after development output existed. No process has read an outcome on a holdout date, then or since",
+      "status": "admitted"
+    },
+    "window-15": {
+      "commit": "bb601e8b34dbabe0e66629a2010049fcc53a9c33",
+      "reason": "ADR 0092's fifteen arms, rows registered at bb601e8b34dbabe0e66629a2010049fcc53a9c33 and window and split at 1e790c73400c3816eb85daec050f44c80b113a3b; their inputs cover the training dates at the freeze (ADR 0096:67). ADR 0096's amendments 1 to 9 and 10 to 11 are not on main at the freeze and the opening rests on their drafts: the record with amendments 1 to 9, SHA-256 6cddb5d2c0d74152fb40d992a7be2c78506b53c0b5b72a7f49528760816dd556, and amendments 10 and 11 applied on top of it, a diff with SHA-256 f5f8ac1737ccb9aef76ee3a8fd6ec398130ac369b7e9d2e45c987cb6804f2241; they land on main byte for byte as hashed here, or the opening is void for the arms they cover. Amendments 1 to 9 were written between about 23:30 on 2026-11-11 and 01:18 on 2026-11-12 New York in an uncommitted file, each with its diff hashed in the coordinator log when written (the first at 23:34, amendment 9 at 01:18); the file as last modified at 02:11 is the one hashed above, the earliest hash of the whole text. No development-window replay output existed before 01:18: the tape curve of 23:55 was of 2026-11-11, outside the 60 sessions, and the development root was complete only at 02:21 (from the coordinator log, UNVERIFIED here); no amendment was written after development output existed, and none registers an arm of this freeze, so no arm here is marked registered after development output existed. No process has read an outcome on a holdout date, then or since",
+      "status": "admitted"
+    },
+    "window-15-pullback": {
+      "commit": "bb601e8b34dbabe0e66629a2010049fcc53a9c33",
+      "reason": "ADR 0092's fifteen arms, rows registered at bb601e8b34dbabe0e66629a2010049fcc53a9c33 and window and split at 1e790c73400c3816eb85daec050f44c80b113a3b; their inputs cover the training dates at the freeze (ADR 0096:67). ADR 0096's amendments 1 to 9 and 10 to 11 are not on main at the freeze and the opening rests on their drafts: the record with amendments 1 to 9, SHA-256 6cddb5d2c0d74152fb40d992a7be2c78506b53c0b5b72a7f49528760816dd556, and amendments 10 and 11 applied on top of it, a diff with SHA-256 f5f8ac1737ccb9aef76ee3a8fd6ec398130ac369b7e9d2e45c987cb6804f2241; they land on main byte for byte as hashed here, or the opening is void for the arms they cover. Amendments 1 to 9 were written between about 23:30 on 2026-11-11 and 01:18 on 2026-11-12 New York in an uncommitted file, each with its diff hashed in the coordinator log when written (the first at 23:34, amendment 9 at 01:18); the file as last modified at 02:11 is the one hashed above, the earliest hash of the whole text. No development-window replay output existed before 01:18: the tape curve of 23:55 was of 2026-11-11, outside the 60 sessions, and the development root was complete only at 02:21 (from the coordinator log, UNVERIFIED here); no amendment was written after development output existed, and none registers an arm of this freeze, so no arm here is marked registered after development output existed. No process has read an outcome on a holdout date, then or since",
+      "status": "admitted"
+    },
+    "window-60": {
+      "commit": "bb601e8b34dbabe0e66629a2010049fcc53a9c33",
+      "reason": "ADR 0092's fifteen arms, rows registered at bb601e8b34dbabe0e66629a2010049fcc53a9c33 and window and split at 1e790c73400c3816eb85daec050f44c80b113a3b; their inputs cover the training dates at the freeze (ADR 0096:67). ADR 0096's amendments 1 to 9 and 10 to 11 are not on main at the freeze and the opening rests on their drafts: the record with amendments 1 to 9, SHA-256 6cddb5d2c0d74152fb40d992a7be2c78506b53c0b5b72a7f49528760816dd556, and amendments 10 and 11 applied on top of it, a diff with SHA-256 f5f8ac1737ccb9aef76ee3a8fd6ec398130ac369b7e9d2e45c987cb6804f2241; they land on main byte for byte as hashed here, or the opening is void for the arms they cover. Amendments 1 to 9 were written between about 23:30 on 2026-11-11 and 01:18 on 2026-11-12 New York in an uncommitted file, each with its diff hashed in the coordinator log when written (the first at 23:34, amendment 9 at 01:18); the file as last modified at 02:11 is the one hashed above, the earliest hash of the whole text. No development-window replay output existed before 01:18: the tape curve of 23:55 was of 2026-11-11, outside the 60 sessions, and the development root was complete only at 02:21 (from the coordinator log, UNVERIFIED here); no amendment was written after development output existed, and none registers an arm of this freeze, so no arm here is marked registered after development output existed. No process has read an outcome on a holdout date, then or since",
+      "status": "admitted"
+    }
+  },
+  "bars_read": [
+    "# What has read minute bars on ADR 0096's holdout dates (2026-10-16..2026-11-10) before the 09:30 freeze, and why.",
+    "# Bars only: nothing listed read an arm's outcome on a holdout date. Paths are under catalog/.",
+    "# Sources: the coordinator's log of 2026-11-11 and 2026-11-12 and the catalog's file names and headers; the profile's build and the tape's refusal test are taken from that log, UNVERIFIED here.",
+    "load: paper:history into catalog/sip-history-20 (2026-11-11 22:20-23:15 New York, sessions 2026-10-15..2026-11-11), sip minute and day bars with vwap and trade_count: to hold the recent window for baselines and the trail profile; a load, no study output.",
+    "load: paper:history into catalog/boats-history-20 (2026-11-11 after 23:15), the overnight feed for the same sessions: overnight baselines and the trail profile; a load, no study output.",
+    "load: catalog/sip-history, sessions 2026-11-05..2026-11-11 (2026-11-05, 06, 09 and 10 are holdout dates): the movers baseline's lookback; a load, no study output.",
+    "baseline: catalog/movers-baseline/sip.json, sip-v2.json and sip-v3.json, each over the 5 sessions 2026-11-05..2026-11-11: the live ranking's per-segment normal for the 2026-11-12 firings (ADR 0087); per-symbol dollar normals only.",
+    "tape: the ignition tape and its 2026-11-11 mechanics replay read holdout sessions as earlier-session baselines only, with a refusal of holdout outcomes in replay, summary and curve and a test of it (the lead, 2026-11-11 23:31): no holdout date was judged.",
+    "profile: catalog/movers-baseline/trail-profile-v1.json, built from the recent roots (sip-history-20, boats-history-20) with the live-file flag that admits holdout dates (ADR 0096 amendment 10, clarification (c)): one-minute ranges and pullback depths that size live stops after those dates; no arm's outcome.",
+    "not read: the development population build (mover_population on catalog/sip-history-dev, sessions 2026-08-18..2026-10-15) reads no holdout date."
+  ],
+  "bars_read_sha256": "6c9ee3bb959434a6fa0ee93e5a08fb512cc06bcc7b6691f18aa7408c4805cb76",
+  "commit": "7b39a1afdfba96a30bdafe7f2f9e8484b8520491",
+  "format": "canon.holdout-freeze.v1",
+  "frozen": "2026-11-12T12:58:23.360400+00:00",
+  "holdout_list": {
+    "path": "canon/holdout-adr0096.txt",
+    "sha256": "6836dcf036e8cc9e2151661654028b78c152451de6054f3a4976f02c1d88946f"
+  },
+  "nothing_read": "No process has read an outcome on a holdout date: this freeze fixes which arms are admitted, and the one read of holdout outcomes comes later, against it, after verifying its hashes.",
+  "population_rule": "ADR 0092 (docs/adr/0092-early-entry-study-measures-fixed-before-any-result.md) lines 88-89, 'every trading day in the 60 regular sessions before 2026-11-11', and lines 105-106, 'The population's dates are split in order: the earliest 70% are development, the rest a holdout': the 60 sessions 2026-08-18 to 2026-11-10, 42 development and 18 holdout"
+}
