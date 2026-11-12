@@ -117,13 +117,16 @@ nothing is sent and a warning says why, as the guide has unsubscribe hooks "tole
 subscription failed" ("Queue admission and failures").
 
 Timestamps: Alpaca stamps a bar at its open (alpaca-py `Bar.timestamp`, "The opening timestamp of the
-bar"), so `ts_event` is the open and `ts_init = ts_event + interval`, the rule NautilusTrader gives for bars
-timestamped at the open (concepts/backtesting/bar-execution, "Bar timestamp convention"). alpaca-py parses
-timestamps into `datetime`, so sub-microsecond precision is lost except for trade history, which parses
-the raw timestamp separately.
+bar"), so `ts_event` is the open. Historical bars use `ts_init = ts_event + interval`, NautilusTrader's
+execution-simulation convention for open-stamped bars (docs/concepts/backtesting/bar-execution.md,
+"Bar timestamp convention", at the pin). Streamed bars keep local receipt/normalization time as `ts_init`
+(docs/concepts/data/index.md, "Timestamps", at the pin). Their interval end is
+`ts_event + bar_interval_ns(bar_type)`, independent of `ts_init`; receipt time must not serve as the
+previous interval's end. alpaca-py parses timestamps into `datetime`, so sub-microsecond precision is
+lost except for trade history, which parses the raw timestamp separately.
 
-Bar windows: a bar's `ts_init` is its open plus the bar's fixed length (`get_interval_ns`: 24 hours for a
-day, 168 for a week), not the end of trading. Alpaca opens daily and weekly bars at midnight New York time
+Historical bar windows: a bar's `ts_init` is its open plus the bar's fixed length (`get_interval_ns`:
+24 hours for a day, 168 for a week), not the end of trading. Alpaca opens daily and weekly bars at midnight New York time
 (UNVERIFIED: not checked against the live API), so a daily bar's `ts_init` is 24 hours after that, hours
 after the 16:00 close. Across a clock change the fixed length does not land on midnight: a bar spanning the
 autumn change ends at 23:00 New York, one spanning the spring change at 01:00 the next day. US clock
@@ -1033,8 +1036,10 @@ def parse_bar(
     bar: AlpacaBar, bar_type: BarType, instrument: Equity, ts_init: int | None = None
 ) -> Bar:
     """Convert one alpaca-py bar, timestamped at its open, into a NautilusTrader bar, its prices rounded
-    as upstream rounds (`rounded_price`; `bar_roundings` names what was). A requested bar is initialised
-    at its close, a streamed one when it arrived (`ts_init`)."""
+    as upstream rounds (`rounded_price`; `bar_roundings` names what was). A requested bar uses its
+    interval close as `ts_init` for execution simulation. A streamed bar keeps its supplied local receipt
+    time as `ts_init` (NautilusTrader's docs/concepts/data/index.md, "Timestamps", at the pin); derive
+    its interval end from `ts_event + bar_interval_ns(bar_type)`, never from `ts_init`."""
     ts_event = dt_to_unix_nanos(bar.timestamp)
     return Bar(
         bar_type=bar_type,

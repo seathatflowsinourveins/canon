@@ -197,9 +197,10 @@ Each is stated where it is implemented, with its source.
   `limit` is answered and not written back. The catalog encodes a file whole, writes it as
   `<name>#<n>` and renames it into place, so a process killed while writing leaves either no data file
   or the complete one, and at most that staging file, which the catalog does not read.
-* **Bars:** `LAST`, `EXTERNAL`, MINUTE, HOUR, DAY or WEEK (DAY and WEEK at step 1 only); stamped at the
-  open by Alpaca, so `ts_event` is the open and `ts_init = ts_event + interval`, per NautilusTrader's bar
-  timestamp convention, where `interval` is the bar's fixed length: 24 hours for a day, 168 for a week.
+* **Historical bars:** `LAST`, `EXTERNAL`, MINUTE, HOUR, DAY or WEEK (DAY and WEEK at step 1 only);
+  stamped at the open by Alpaca, so `ts_event` is the open and `ts_init = ts_event + interval`, per
+  NautilusTrader's bar execution-simulation convention, where `interval` is the bar's fixed length:
+  24 hours for a day, 168 for a week.
   `ts_init` is not the end of trading. Alpaca opens daily and weekly bars at midnight New York time
   (UNVERIFIED until the paper test runs), so a daily bar's `ts_init` is 24 hours later, hours after the
   16:00 close. Across a clock change that is not midnight: a bar spanning the autumn change ends at 23:00
@@ -207,8 +208,12 @@ Each is stated where it is implemented, with its source.
   trading-day daily bars never span a change; weekly bars do.
 * **Streamed bars and trading statuses (2026-11-11, ADR 0090):** `subscribe_bars` takes
   `<SYMBOL>.ALPACA-1-MINUTE-LAST-EXTERNAL`, the one bar Alpaca's stream carries, and refuses any other bar
-  type with `Cannot subscribe:`. A streamed bar is stamped at its open like a requested one, initialised
-  when it arrives, and its prices rounded and counted as a trade's are. `params={"updated_bars": True}`
+  type with `Cannot subscribe:`. A streamed bar's `ts_event` is its open and `ts_init` its local
+  receipt/normalization time, following NautilusTrader's pinned
+  [timestamp semantics](https://github.com/nautechsystems/nautilus_trader/blob/d53849b216e20f2c122ca01b4dd0da377638b186/docs/concepts/data/index.md#timestamps).
+  Its interval end is `ts_event + bar_type.spec.get_interval_ns()`; consumers must derive that boundary
+  rather than compare the next open with the preceding receipt time. Its prices are rounded and counted
+  as a trade's are. `params={"updated_bars": True}`
   also hands on Alpaca's `updatedBars`, sent after a late trade, as a second bar of the same type for that
   minute; off by default. `subscribe_instrument_status` hands on one `InstrumentStatus` per Alpaca status,
   its code mapped to a `MarketStatusAction` (`STATUS_ACTIONS`: halt, pause, resume, quotation resumption,

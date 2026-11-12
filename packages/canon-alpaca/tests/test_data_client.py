@@ -43,6 +43,7 @@ import requests
 from alpaca.common.exceptions import APIError
 from alpaca.data.enums import DataFeed
 from alpaca.data.historical.stock import StockHistoricalDataClient
+from alpaca.data.models.bars import Bar as AlpacaBar
 from alpaca.data.requests import StockTradesRequest
 from alpaca.data.timeframe import TimeFrameUnit
 from canon_alpaca.constants import ENV_API_KEY
@@ -3647,6 +3648,30 @@ def test_a_minute_bar_subscription_hands_the_engine_the_streamed_bar(market, alp
     assert bar.bar_type == MINUTE
     assert str(bar.open) == "178.2600" and str(bar.close) == "178.2100"
     assert bar.ts_event == dt_to_unix_nanos(datetime(2022, 1, 3, 9, tzinfo=UTC))  # at its open
+
+
+def test_consecutive_streamed_bars_keep_receipt_times_separate_from_interval_ends(alpaca) -> None:
+    # Arrival is 100 ms after each minute ends. The next minute still opens at
+    # the previous interval's end, before its receipt; ts_init cannot be used as that boundary.
+    equity = canon_alpaca.providers.parse_equity(alpaca.asset(), 0)
+    opens = [
+        datetime(2022, 1, 3, 14, 30, tzinfo=UTC),
+        datetime(2022, 1, 3, 14, 31, tzinfo=UTC),
+    ]
+    receipts = [
+        dt_to_unix_nanos(datetime(2022, 1, 3, 14, 31, 0, 100_000, tzinfo=UTC)),
+        dt_to_unix_nanos(datetime(2022, 1, 3, 14, 32, 0, 100_000, tzinfo=UTC)),
+    ]
+    bars = [
+        canon_alpaca.data.parse_bar(
+            AlpacaBar("AAPL", {**alpaca.BAR_AAPL, "t": opened}), MINUTE, equity, received
+        )
+        for opened, received in zip(opens, receipts, strict=True)
+    ]
+
+    assert [bar.ts_event for bar in bars] == [dt_to_unix_nanos(opened) for opened in opens]
+    assert [bar.ts_init for bar in bars] == receipts
+    assert bars[0].ts_event + 60_000_000_000 == bars[1].ts_event < bars[0].ts_init
 
 
 def test_a_wildcard_bar_subscription_sends_star_and_hands_on_only_listed_symbols(
