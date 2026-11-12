@@ -1,7 +1,7 @@
 {
   "lineLayout": "expanded",
   "pathLevels": 1,
-  "elementOrder": ["project", "context", "usage", "promptCache", "cacheHitRate", "agents", "todos", "tools", "skills", "mcp"],
+  "elementOrder": ["project", "context", "usage", "promptCache", "cacheHitRate", "agents", "todos", "tools", "skills", "mcp", "sessionTime"],
   "gitStatus": {
     "enabled": true,
     "showDirty": true,
@@ -31,7 +31,7 @@
     "showDailyCost": false,
     "showWeeklyCost": false,
     "showDuration": true,
-    "showSpeed": false,
+    "showSpeed": true,
     "showUsage": true,
     "usageValue": "percent",
     "usageBarEnabled": false,
@@ -51,7 +51,7 @@
     "showAgents": true,
     "showAgentEffort": true,
     "showTodos": true,
-    "showSessionName": false,
+    "showSessionName": true,
     "showSessionTokens": false,
     "showConfigCounts": false,
     "showAuth": false,
@@ -62,9 +62,9 @@
     "showCacheHitRate": true,
     "showOutputStyle": false,
     "showSessionStartDate": false,
-    "showLastResponseAt": false,
+    "showLastResponseAt": true,
     "showCompactions": true,
-    "showAdvisor": false,
+    "showAdvisor": true,
     "customLine": "",
     "mergeGroups": [["context", "usage"], ["promptCache", "cacheHitRate"], ["skills", "mcp"]]
   }

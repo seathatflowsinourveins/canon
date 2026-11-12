@@ -293,7 +293,7 @@ sets the HUD's options at v0.15.0 (`src/config.ts`, `src/schema.ts`). The choice
   waiting on a restart is not available, since no documented input field or command gives it.
 * **Off, for identifiers.** `showAuth` and `showAuthUser` (plan and account; v0.15.0 has no other
   account key, and an unknown key is dropped),
-  `showProvider`, `showSessionName` (free text), `showLaunchDir`, `showAddedDirs` (other paths),
+  `showProvider`, `showLaunchDir`, `showAddedDirs` (other paths),
   `showWorktree` (its name repeats the folder), `showModelScopedUsage` (it would read an undocumented stdin
   field), and `externalUsagePath` and `externalUsageWritePath` (canon keeps its own reading).
 * **Shown since 2026-11-12, the owner's decision: the session's activity.** Running subagents with their
@@ -313,8 +313,13 @@ sets the HUD's options at v0.15.0 (`src/config.ts`, `src/schema.ts`). The choice
   the owner edited still gets a `.canon-proposed` copy beside it. Measured 2026-11-12 against a real
   transcript: about 0.24 s a render, which the HUD keeps flat by reading the transcript incrementally
   (v0.12.0).
-* **Off, for undocumented sources or identifiers.** Advisor, session start and last response, from the
-  same transcript, add nothing a lane acts on. `modelSource` stays `stdin`.
+* **Shown since 2026-11-12, the owner's decision: the rest of the session's state.** The session name
+  (the `/rename` name or the title Claude Code generated: free text, on screen only), the latest response's
+  output speed, how long ago the last response was written, and the advisor model `/advisor` set. The last
+  three come from the transcript like the activity lines and carry the same caveat. The account identity
+  segments stay off.
+* **Off, for undocumented sources or identifiers.** The session start, from the same transcript, adds
+  nothing a lane acts on. `modelSource` stays `stdin`.
 * **Shown since 2026-11-12: the prompt cache.** One line, `Cache ⏱ until 11:25 │ Cache hit 97.3%`: the clock
   time the cache goes cold and the session's hit rate, from the input's documented `prompt_cache` object
   (statusline.md, read 2026-11-12) and nothing from the transcript
@@ -325,7 +330,7 @@ sets the HUD's options at v0.15.0 (`src/config.ts`, `src/schema.ts`). The choice
   The cache's TTL decides what a returning session pays to re-cache its context, and idle compaction
   runs just before a one-hour cache expires (settings-reference.md, `idleCompaction`), so the time is
   when an idle lane's next message gets dearer or its context gets summarised.
-* **Off, for cost or space.** Memory (it runs `vm_stat`), daily and weekly cost, speed, the token breakdown,
+* **Off, for cost or space.** Memory (it runs `vm_stat`), daily and weekly cost, the token breakdown,
   config counts, output style, the custom line and jj.
 
 Checked on 2026-11-11 at 60 and 100 columns, through `statusline.sh` with the pinned HUD placed in a
