@@ -263,7 +263,12 @@ Each is stated where it is implemented, with its source.
   request, and malformed pages or rows fail with the symbol, page number and token named. Symbols
   are quoted as one URL path segment. Alpaca's documented `u` field is checked before the SDK drops it:
   `canceled` and `incorrect` prints are excluded, counted and logged, while ordinary trades and
-  `corrected` replacements are kept; condition flags alone do not invalidate a print. Results are
+  `corrected` replacements are kept; condition flags alone do not invalidate a print. With
+  `trade_condition_filter` on, a print, streamed or requested, becomes a tick only if Alpaca's minute
+  bars take its price, by the per-tape table in `canon_alpaca/trade_conditions.py`; the rest are counted
+  by code and use none of a request's limit, and a code Alpaca's map shows that the table does not know
+  refuses the connect (ADR 0118). It is for the `sip` feed only, and refuses a trade request with
+  `update_catalog`. The setting is off by default. Corrections and cancels are not applied to ticks already sent. Results are
   requested in ascending timestamp order and delivered in one `TradesResponse`, preserving the request
   ID, bounds and params. The inclusive window is cut at now, and a missing start uses midnight New York
   of the end's day, as quotes do. Bounds and raw trade timestamps retain nanoseconds, including the
