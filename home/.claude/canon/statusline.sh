@@ -32,7 +32,9 @@
 # https://code.claude.com/docs/en/model-config.md ("Set the auto-compact window"): CLAUDE_CODE_AUTO_COMPACT_WINDOW
 # when usable (a token count, or with k or M, held to 100K to 1M), else the user settings.json's
 # modelSettings.<model.id>.autoCompactWindow (what /autocompact writes), else its autoCompactWindow, capped at the
-# input's context_window_size. A --autocompact flag and other settings scopes are not visible here. Its
+# input's context_window_size. Not visible here, so not followed: a --autocompact flag, the project, local and
+# managed settings scopes, and the tuned window when none is set ("auto" or nothing), where the bar measures the
+# full window, as canon's own line and the snapshot's ctx_pct always do. Its
 # output loses its terminal hyperlinks (they carry the repository owner and absolute paths), and every line
 # shown, the HUD's or canon's, is scrubbed of e-mail addresses, the input's workspace.repo.owner and the home
 # folder's user name. CANON_STATUSLINE_RENDERER, when set, names another executable to use in the HUD's place.
@@ -152,27 +154,33 @@ scrub() {
 }
 
 canon_writes
-# one read: the repository owner (to scrub) and the HUD's input, the same with model.display_name = model.id and
-# the session's compaction window as the context window's size (above)
-owner="" hud_input="" user_settings="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
+# the repository owner, to scrub, read apart from the settings so that nothing about them can stop the scrub
+owner=$(printf '%s' "$input" | jq -r '.workspace.repo.owner? | strings // "" | gsub("\n"; " ")' 2>/dev/null)
+# the HUD's input: the same with model.display_name = model.id and the session's compaction window as the context
+# window's size (above). The model's entry is the one under its canonical name, which Claude Code also matches to
+# the model's [1m], date-suffixed and provider IDs (settings-reference.md, modelSettings); "auto" there means the
+# window tuned for the model, which this does not know, so the input is left as it came.
+hud_input="" user_settings="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
 [ -r "$user_settings" ] || user_settings=/dev/null
-{ IFS= read -r owner; IFS= read -r hud_input; } < <(printf '%s' "$input" | jq -r \
-    --arg envw "${CLAUDE_CODE_AUTO_COMPACT_WINDOW:-}" --rawfile s "$user_settings" '
+hud_input=$(printf '%s' "$input" | jq -c --arg envw "${CLAUDE_CODE_AUTO_COMPACT_WINDOW:-}" --rawfile s "$user_settings" '
     def usable: if type == "number" and . > 0 then ([[., 100000] | max, 1000000] | min | floor) else null end;
-    def envwin: ($envw | ascii_downcase | capture("^(?<n>[0-9]+(\\.[0-9]+)?)(?<u>[km]?)$")?
-                 | (.n | tonumber) * ({"": 1, "k": 1000, "m": 1000000}[.u]) | usable) // null;
+    def envwin: ($envw | capture("^(?<n>[0-9]+)(?<u>k|M)?$")?
+                 | (.n | tonumber) * ({"k": 1000, "M": 1000000}[.u // ""] // 1) | usable) // null;
+    def canonical: sub("\\[[^]]*\\]$"; "") | sub("^([a-z]+\\.)?anthropic\\."; "") | sub("-v[0-9]+:[0-9]+$"; "")
+                   | sub("[-@][0-9]{8}$"; "");
     ((try ($s | fromjson) catch {}) | if type == "object" then . else {} end) as $set
-    | (.workspace.repo.owner? | strings // "" | gsub("\n"; " ")),
-    (if type == "object" and (.model | type) == "object" and (.model.id | type) == "string"
-     then .model.display_name = .model.id else . end
-     | (.model.id? | strings // "") as $m
-     | (envwin // (($set.modelSettings? | objects | .[$m]? | objects | .autoCompactWindow) | usable)
-              // ($set.autoCompactWindow | usable)) as $w
-     | if $w != null and type == "object" and (.context_window | type) == "object" then
-         .context_window |= ((.context_window_size | if type == "number" and . > 0 then [., $w] | min else $w end) as $z
-                            | .context_window_size = $z | del(.used_percentage, .remaining_percentage))
-       else . end
-     | tojson)' 2>/dev/null)
+    | if type == "object" and (.model | type) == "object" and (.model.id | type) == "string"
+      then .model.display_name = .model.id else . end
+    | (.model.id? | strings // "") as $m
+    | (($set.modelSettings? | objects) // {}) as $ms
+    | ((($ms[$m] // $ms[$m | canonical]) | objects | .autoCompactWindow) // null) as $per
+    | (if envwin != null then envwin
+       elif $per == "auto" then null
+       else ($per | usable) // ($set.autoCompactWindow | usable) end) as $w
+    | if $w != null and (.context_window | type) == "object" then
+        .context_window |= ((.context_window_size | if type == "number" and . > 0 then [., $w] | min else $w end) as $z
+                           | .context_window_size = $z | del(.used_percentage, .remaining_percentage))
+      else . end' 2>/dev/null)
 [ -n "$hud_input" ] || hud_input="$input"
 cmd=()
 while IFS= read -r part; do cmd+=("$part"); done < <(hud_command)

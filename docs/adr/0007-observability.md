@@ -276,9 +276,13 @@ sets the HUD's options at v0.15.0 (`src/config.ts`, `src/schema.ts`). The choice
   critical at 85% of it: `autoCompactWindow` is left `null` here, since one value would serve every model,
   and `statusline.sh` sets the input's `context_window_size` to the window Claude Code documents for the
   session (`CLAUDE_CODE_AUTO_COMPACT_WINDOW`, else the user settings' `modelSettings.<model>`, which
-  `/autocompact` writes, else `autoCompactWindow`, capped at the model's window; model-config.md, read
-  2026-11-12) and drops `used_percentage`, which measures the full window. Amended 2026-11-12: a fixed
-  300000 pinned a model compacting at 600000 at a red 100% from 300k on. The session cost: `cost.total_cost_usd`. The
+  `/autocompact` writes under the canonical name that `[1m]`, date-suffixed and provider IDs also match,
+  else `autoCompactWindow`, capped at the model's window; model-config.md and settings-reference.md, read
+  2026-11-12) and drops `used_percentage`, which measures the full window. Not followed, since the status
+  line cannot see them: a `--autocompact` flag, the project, local and managed settings scopes, and the
+  window tuned for the model when none is set or the model's entry is `"auto"`; there the bar, like
+  canon's own line and `ctx_pct`, measures the full window. Amended 2026-11-12: a fixed 300000 pinned a
+  model compacting at 600000 at a red 100% from 300k on. The session cost: `cost.total_cost_usd`. The
   duration: the elapsed session time. Usage compact, always, both windows, with countdown and 24-hour reset
   time: one short line at any width. The Claude Code version: the running CLI. A newer installed version
   waiting on a restart is not available, since no documented input field or command gives it.
