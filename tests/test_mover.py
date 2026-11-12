@@ -2295,7 +2295,7 @@ def test_a_price_over_the_schemes_top_is_refused_by_name_and_the_step_goes_on() 
     )
     eng.dispose()
     assert orders == []
-    assert any("no limit price" in why for why in s.dropped)
+    assert any("above the top tier of ALPACA_US_EQUITY_LIMIT" in why for why in s.dropped)
 
 
 def test_a_malformed_and_a_good_ranking_between_two_steps_are_both_said() -> None:
@@ -2947,6 +2947,32 @@ def test_a_position_with_no_entry_of_the_strategys_is_named_as_unprotected() -> 
     assert seam.sent == []
     assert len(seam.notes[AAA]) == 1
     assert "no filled entry of this strategy" in seam.notes[AAA][0]
+
+
+def test_a_holding_above_the_schemes_top_exits_chases_and_closes_on_the_cent() -> None:
+    """The lead's ruling (ii), 2026-11-12: a name bought under $5,000 that trades above the tick
+    scheme's last tick (4999.99) is still sold on Alpaca's step there, a cent. Its exit by limit, once
+    the reached trigger is met, goes at the bid; its chase floor is `chase_cap` under that, on the cent,
+    so a falling bid re-prices the sale; and its close at the wind-down outside the session goes at the
+    bid. None is the scheme's last tick or its lowest, and the floor is not the sale's own price."""
+    exit_seam = Seam("6000.2370", exit_ticks=0)
+    cast(Any, exit_seam).recent = 0
+    slot = seam_slot(exit_seam, bought="4990.00")
+    slot.trail_trigger = Decimal("6100.00")
+    cast(Any, exit_seam)._protect(slot, Decimal(3), T0)
+    assert [(o.kind, o.price) for o in exit_seam.sent] == [("LIMIT", Price.from_str("6000.2300"))]
+
+    cast(Any, exit_seam)._protect(slot, Decimal(3), T0 + SECOND)
+    assert slot.floor == Decimal("5880.23")  # 6000.23 x 0.98 = 5880.2254, up to the cent
+    exit_seam.bid = "5940.2370"
+    cast(Any, exit_seam)._protect(slot, Decimal(3), T0 + 6 * SECOND)
+    assert exit_seam.canceled == [exit_seam.sent[0].client_order_id.value]
+
+    close_seam = Seam("6000.2370", exit_ticks=0, extended_hours=True)
+    close_seam.winding_down = True
+    slot = seam_slot(close_seam, bought="4990.00")
+    cast(Any, close_seam)._sell_out(slot, Decimal(3), T0)
+    assert [(o.kind, o.price) for o in close_seam.sent] == [("LIMIT", Price.from_str("6000.2300"))]
 
 
 def test_a_config_that_modifies_orders_is_refused_by_name() -> None:
