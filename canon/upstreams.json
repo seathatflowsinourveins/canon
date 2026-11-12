@@ -643,6 +643,26 @@
       "adr": "0094"
     },
     {
+      "id": "acp-spec",
+      "field": "agent-harness",
+      "repo": "agentclientprotocol/agent-client-protocol",
+      "track": "tag:schema-v1.31.0",
+      "line": "schema-v1.",
+      "role": "standard",
+      "license": "Apache-2.0",
+      "why": "The Agent Client Protocol, v1: JSON-RPC 2.0 over stdio between a client and an agent (initialize, session setup, session/prompt with session/update notifications, session/cancel). DeepSeek Harness serves it with `dsh --profile acp` through @deepseek-ai/dsh-acp 0.2.1-rc.3, which says it exposes only the standard ACP v1 surface, leaves out session/load, and builds on @agentclientprotocol/sdk 1.4.0, generated from schema-v1.21.0; the review-acp and build-acp profiles a worker is driven through stand on it (ADR 0095). Tracked by the schema release tags and held to the schema-v1. line, so a schema-v2 release does not move it. The wire version is the integer 1, raised only for a breaking change. Whether dsh conforms is UNVERIFIED: no conformance run exists.",
+      "evidence": [
+        "https://agentclientprotocol.com/llms.txt",
+        "https://agentclientprotocol.com/protocol/v1/overview.md",
+        "https://agentclientprotocol.com/protocol/v1/initialization.md",
+        "https://agentclientprotocol.com/protocol/v1/transports.md",
+        "https://api.github.com/repos/agentclientprotocol/agent-client-protocol/releases",
+        "https://registry.npmjs.org/@agentclientprotocol/sdk/1.4.0",
+        "https://raw.githubusercontent.com/agentclientprotocol/typescript-sdk/e6463f444093ed7c5f1cc937c3f32afb5853e906/scripts/generate.js"
+      ],
+      "adr": "0095"
+    },
+    {
       "id": "pnpm",
       "field": "toolchain",
       "repo": "pnpm/pnpm",

@@ -1,5 +1,14 @@
 {
   "pins": {
+    "acp-spec": {
+      "default_branch": "main",
+      "default_sha": "f3ed0fca2fd6d85ef7ae77cfd074cc8605e490dc",
+      "ref": "refs/tags/schema-v1.31.0",
+      "repo": "agentclientprotocol/agent-client-protocol",
+      "resolved_at": "2026-11-11T23:41:01Z",
+      "sha": "0849001ca66fb975fc01111ddab9093bc8304e98",
+      "track": "tag:schema-v1.31.0"
+    },
     "actionlint": {
       "default_branch": "main",
       "default_sha": "011a6d15e749bb3f2d771eed9c7aa0e7e3e10ee7",
