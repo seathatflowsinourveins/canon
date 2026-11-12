@@ -306,6 +306,11 @@ def check_bars(
     return checked
 
 
+DOLLAR_BASIS = "typical_x_volume"
+"""What `bar_dollars` multiplies volume by: upstream's VWAP indicator over one bar, its typical price
+(high + low + close) / 3; the window record names it (the lead's ruling of 2026-11-12)."""
+
+
 def bar_dollars(bar: Bar) -> float:
     """One bar's dollars using a fresh upstream VWAP indicator; nested or concurrent calls share no state."""
     vwap = VolumeWeightedAveragePrice()

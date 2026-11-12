@@ -1738,7 +1738,7 @@ class Mover(Strategy):
                 "is wider than the plan"
             )
         precision = instrument.price_precision
-        sizing: dict[str, str | None] | None = None
+        sizing: dict[str, str | bool | None] | None = None
         if settings.size_from_budget:
             free = account.balance_free(instrument.quote_currency)
             if free is None:
@@ -1760,14 +1760,23 @@ class Mover(Strategy):
             self._ask_for_the_account()  # a fill this step, before this buy is sized
             unreported = self._unreported_buys(account) if reported else Decimal(0)
             query_wait = self._query_wait_secs(account) if reported else 0.0
-            entry_budget = min(settings.max_notional, free.as_decimal() - unlocked - unreported)
+            spendable = free.as_decimal() - unlocked - unreported
+            entry_budget = min(settings.max_notional, spendable)
             budget_shares = entry_budget // price
             flow_dollars = sum(slot.dollars, Decimal(0))
             flow_shares = settings.flow_share * flow_dollars // price
             cap = min(budget_shares, flow_shares)
             binding = "flow" if flow_shares < budget_shares else "budget"
+            # which bound held, for the record (the lead's ruling of 2026-11-12 on non-roster entries)
+            held_by = (
+                "flow_share"
+                if binding == "flow"
+                else "entry_notional"
+                if settings.max_notional <= spendable
+                else "free_balance"
+            )
             if settings.max_shares is not None and Decimal(settings.max_shares) < cap:
-                cap, binding = Decimal(settings.max_shares), "max_shares"
+                cap, binding, held_by = Decimal(settings.max_shares), "max_shares", "max_shares"
             # the name's start-time share cap bounds the entry and is never rewritten, so a price
             # that drifted since the start does not trip the monitor and a trip means a real fault
             # (the lead's change of 2026-11-12, ultra review of the composition, finding 14)
@@ -1775,7 +1784,7 @@ class Mover(Strategy):
                 None if settings.share_caps is None else settings.share_caps.get(slot.instrument_id)
             )
             if start_cap is not None and Decimal(start_cap) < cap:
-                cap, binding = Decimal(start_cap), "cap_bound"
+                cap, binding, held_by = Decimal(start_cap), "cap_bound", "start_cap"
             if cap < 1:
                 return f"the budget or flow cap leaves no share at {price}"
             quantity = instrument.make_qty(int(cap))
@@ -1791,7 +1800,13 @@ class Mover(Strategy):
                 "flow_shares": str(flow_shares),
                 "start_cap": None if start_cap is None else str(start_cap),
                 "binding": binding,
+                "held_by": held_by,
+                # None: no start-up roster to be in or outside of
+                "roster": None
+                if settings.share_caps is None
+                else slot.instrument_id in settings.share_caps,
                 "quantity": str(quantity),
+                "notional": str(quantity.as_decimal() * price),
             }
             self._say(
                 f"{slot.instrument_id}: size budget {entry_budget} USD "

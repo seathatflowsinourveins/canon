@@ -330,6 +330,17 @@ def test_window_records_protection_and_names_a_diagnostic_failure(monkeypatch, t
     monkeypatch.setattr(session_window, "mover_entry_contexts", lambda *a, **k: {})
     monkeypatch.setattr(session_window, "mover_entries", lambda *a: sent)
     monkeypatch.setattr(session_window, "protection_diagnostics", protection)
+    tallies = iter([{"GET a/v2/clock": 1}, {"GET a/v2/clock": 3}])
+    monkeypatch.setattr(
+        session_window, "endpoint_counts", lambda: next(tallies, {"GET a/v2/clock": 3})
+    )
+
+    def roster(run):
+        if broken:
+            raise KeyError("instrument_id")
+        return {"read_from": sorted(run)}
+
+    monkeypatch.setattr(session_window, "roster_entries", roster)
     _, report, _ = quiet_window(
         monkeypatch,
         tmp_path,
@@ -341,6 +352,17 @@ def test_window_records_protection_and_names_a_diagnostic_failure(monkeypatch, t
     )
     assert report["result"] == "ok"
     assert observed == [{"part": "regular", "end_ns": T0 + 20 * SECOND}]
+    assert report["mover"]["http_requests"] == {
+        "to_node_start": {"GET a/v2/clock": 1},
+        "to_window_end": {"GET a/v2/clock": 3},
+    }
+    # read from the strategy's own record; a failure is named and fails nothing
+    # (code-review-high/universe-2-2, -8)
+    assert report["mover"]["entries_by_roster"] == (
+        "not read: KeyError: 'instrument_id'"
+        if broken
+        else {"read_from": ["entries", "ranking_records"]}
+    )
     if broken:  # the entry rows are read on their own, so a protection failure keeps them
         assert report["mover"]["entries"] == sent
         assert (

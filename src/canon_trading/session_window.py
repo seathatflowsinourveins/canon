@@ -232,6 +232,7 @@ from canon_alpaca.providers import CONNECT_TIMEOUT_SECS
 from canon_alpaca.providers import READ_TIMEOUT_SECS
 from canon_alpaca.providers import TRADING_API
 from canon_alpaca.providers import counted
+from canon_alpaca.providers import endpoint_counts
 from canon_alpaca.providers import not_sent
 from canon_alpaca.providers import request_counts
 from canon_alpaca.providers import with_http_timeout
@@ -1190,6 +1191,40 @@ def start_reference_read(trading: TradingClient, notes: list[str]) -> ReferenceR
     return prefetched_reference_reader(future, symbols, key, notes)
 
 
+def dollar_basis() -> dict[str, str]:
+    """Each ratio's dollar basis on this tree, for the record (the lead's ruling of 2026-11-12): ADR 0087's
+    day ratio takes `movers_rank.bar_dollars`, and RDc_1 is not built here."""
+    from .movers_rank import DOLLAR_BASIS
+
+    return {"day_ratio_0087": DOLLAR_BASIS, "rdc_1": "absent: not built on this tree"}
+
+
+def roster_entries(run: Mapping[str, Any]) -> dict[str, Any]:
+    """Entries counted as in or outside the start-up roster, with each non-roster entry's dollars (its
+    quantity at its limit) and the bound that held (`held_by`), from Mover's sizing record (the lead's
+    ruling of 2026-11-12: a non-roster name is bounded by Mover's sizing alone). An entry with no such
+    record (sized off the budget path, or with no start-up roster) is counted as unrecorded."""
+    tally: dict[str, Any] = {"roster": 0, "non_roster": 0, "unrecorded": 0}
+    outside: list[dict[str, Any]] = []
+    for entry in run.get("entries", []):
+        roster = (entry.get("sizing") or {}).get("roster")
+        if roster is None:
+            tally["unrecorded"] += 1
+        elif roster:
+            tally["roster"] += 1
+        else:
+            tally["non_roster"] += 1
+            outside.append(
+                {
+                    "instrument_id": entry["instrument_id"],
+                    "dollars": entry["sizing"].get("notional"),
+                    "held_by": entry["sizing"].get("held_by"),
+                }
+            )
+    tally["non_roster_entries"] = outside
+    return tally
+
+
 NO_CONTEXT = "no entry context supplied"
 """The note `Mover._watch` makes for a ranked name with no registered day context (`mover.py`)."""
 
@@ -1615,6 +1650,10 @@ def _snapshot_requests(report: WindowReport | dict) -> BaseException | None:
     request-budget fields retain their existing form.
     """
     fields = vars(report) if isinstance(report, WindowReport) else report
+    mover = fields.get("mover")
+    http = mover.get("http_requests") if isinstance(mover, dict) else None
+    if isinstance(http, dict):  # the endpoint count at the window's true end, as the budget's
+        http["to_window_end"] = endpoint_counts()
     if (prior := fields.get("request_budget")) is None:
         return None
     budget = prior if isinstance(prior, dict) else {}
@@ -2525,6 +2564,8 @@ def run_window(
     market_read_at: float | None = None,
 ) -> WindowReport:
     """Run one window as the module header describes; raise if it cannot start or is not left flat.
+    The Mover record carries the process's requests by endpoint at the node's start and at the window's
+    end (`canon_alpaca.providers.endpoint_counts`).
     `trading` and `market` (the clock and calendar) are read here unless the caller already has them, in
     which case `market_read_at` is the `time.monotonic()` at which the clock's answer arrived
     (`session_now`)."""
@@ -2826,6 +2867,7 @@ def run_window(
             reference_reader=reference_reader,
         )
         cache = node.cache
+        startup_requests = endpoint_counts()
         try:
             ran = True
             _run_node(node, ends)
@@ -2885,6 +2927,17 @@ def run_window(
                         run, sampled=(report.mover.get("sample") or {}).get("symbols")
                     )
                     report.mover["passed_over_no_context"] = passed_over_without_context(run)
+                    report.mover["dollar_basis"] = dollar_basis()
+                    # the window's end count is taken again at the final snapshot, after the stop's
+                    # flattening (`_snapshot_requests`)
+                    report.mover["http_requests"] = {
+                        "to_node_start": startup_requests,
+                        "to_window_end": endpoint_counts(),
+                    }
+                    try:  # a record that cannot be read is named, and fails nothing
+                        report.mover["entries_by_roster"] = roster_entries(run)
+                    except Exception as e:  # noqa: BLE001
+                        report.mover["entries_by_roster"] = f"not read: {type(e).__name__}: {e}"
                     from .movers_rank_actor import publication_lags
 
                     report.mover["publication_lags"] = publication_lags(_records(run))

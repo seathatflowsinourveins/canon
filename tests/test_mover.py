@@ -356,6 +356,10 @@ def test_an_on_demand_buy_and_sale_after_a_rise_pass_without_a_roster_engine_cap
     assert sale.quantity.as_decimal() * sale.price.as_decimal() > 1000
     assert flat and not s.refused
     assert s.record()["instrument_loads"][str(BBB)]["engine_cap"] is None
+    sizing = s.entries_sent[0]["sizing"]  # the lead's ruling of 2026-11-12 on non-roster entries
+    assert sizing["roster"] is False
+    assert sizing["held_by"] in ("entry_notional", "free_balance", "flow_share")
+    assert Decimal(sizing["notional"]) == buy.quantity.as_decimal() * buy.price.as_decimal()
 
 
 def test_an_on_demand_name_waits_without_blocking_and_subscribes_on_its_feed():
@@ -1111,8 +1115,39 @@ def test_a_budget_entry_after_a_30_percent_price_fall_is_clamped_to_its_start_ti
     assert Decimal(10_000) // buys[0].price.as_decimal() > start_cap, "the budget alone buys more"
     assert buys[0].filled_qty.as_decimal() == start_cap
     assert s.entries_sent[0]["sizing"]["binding"] == "cap_bound"
+    assert s.entries_sent[0]["sizing"]["roster"] is True
+    assert s.entries_sent[0]["sizing"]["held_by"] == "start_cap"
     assert s.settings.share_caps == {AAA: start_cap}
     assert cap.max_position == start_cap and cap.tripped is None
+
+
+@pytest.mark.parametrize(
+    ("free", "flow_share", "held_by"),
+    [
+        (Decimal(100_000), Decimal(1), "entry_notional"),
+        (Decimal(500), Decimal(1), "free_balance"),
+        (Decimal(100_000), Decimal("0.0001"), "flow_share"),
+    ],
+)
+def test_an_entry_with_no_roster_records_which_bound_held_and_no_roster_flag(
+    free, flow_share, held_by
+):
+    """The lead's ruling of 2026-11-12: the record names the bound that held. With no start-up roster
+    (`share_caps` None) an entry is neither in nor outside one (code-review-high/universe-2-3)."""
+    eng = engine(order_cap=Decimal(100_000), cash=free)
+    s = strategy(
+        max_notional=Decimal(1000),
+        risk=Decimal("0.00000001"),
+        flow_share=flow_share,
+        protect=False,
+    )
+    s.settings.size_from_budget = True
+    orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, RISING))
+    eng.dispose()
+    assert [o.side for o in orders][:1] == [OrderSide.BUY]
+    sizing = s.entries_sent[0]["sizing"]
+    assert sizing["roster"] is None
+    assert sizing["held_by"] == held_by
 
 
 @pytest.mark.parametrize("clamped", [True, False])
