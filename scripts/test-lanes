@@ -1199,15 +1199,22 @@ check "... and it is mover only in a tree whose plist gives the firing --mover (
 # lock_wait() (a non-blocking try and a one-second sleep), the same text in each, and no task calls the
 # descriptor form with a wait.
 # shellcheck disable=SC2034  # read by the eval'd checks
+lw_tasks="paper:test paper:session paper:data paper:long-only paper:close"
 { lw_t=$(task_part paper:test run | sed -n '/^lock_wait() {/,/^}/p'); n_lw=0; n_task=0; n_same=0; n_old=0
-  for t in paper:test paper:session paper:data paper:long-only; do
+  for t in $lw_tasks; do
     b=$(task_part "$t" run); n_task=$((n_task + 1))
     [ "$(sed -n '/^lock_wait() {/,/^}/p' <<<"$b")" = "$lw_t" ] && n_same=$((n_same + 1))
     grep -qE '^ *lock_wait [0-9] ' <<<"$b" && n_lw=$((n_lw + 1))
     grep -qE '/usr/bin/lockf -t [^0 ]' <<<"$b" && n_old=$((n_old + 1))
   done; }
-check "the four paper tasks that wait for a lock all call lock_wait, with the same text, and none the descriptor form of lockf -t" \
-      eval '[ -n "$lw_t" ] && [ "$n_task" = 4 ] && [ "$n_lw" = 4 ] && [ "$n_same" = 4 ] && [ "$n_old" = 0 ]'
+check "the five paper tasks that wait for a lock all call lock_wait, with the same text, and none the descriptor form of lockf -t" \
+      eval '[ -n "$lw_t" ] && [ "$n_task" = 5 ] && [ "$n_lw" = 5 ] && [ "$n_same" = 5 ] && [ "$n_old" = 0 ]'
+# Every task that defines lock_wait is one of those the check above reads, so a new paper task that waits for a
+# lock cannot be left out of it.
+lw_defs=$(awk '/^\[[a-z]/ { t = "?" $0 } /^\[tasks\."/ { t = $0 } /^lock_wait\(\) \{/ { sub(/^\[tasks\."/, "", t); sub(/"\]$/, "", t); print t }' "$ROOT/mise.toml" | sort | tr '\n' ' ')
+lw_list=$(tr ' ' '\n' <<<"$lw_tasks" | sort | tr '\n' ' ')
+check "... and every mise task that defines lock_wait is in that list (defined in: $lw_defs; listed: $lw_list)" \
+      eval '[ -n "$lw_defs" ] && [ "$lw_defs" = "$lw_list" ]'
 # A waiter on a held lock uses next to no CPU: lock_wait and the wait line, as paper:test has them, run in a
 # script of their own on a lock file of their own (never an account's lock) that another process holds. The
 # waiter waits out a 6 s bound and reports its own CPU time and its reaped children's (bash's `times`), so
