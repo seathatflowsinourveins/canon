@@ -27,7 +27,8 @@ paths:
   `mise run paper:account tests` and `mise run paper:close tests`;
   account B's, stored beside it with `paper:store windows`, reaches only `mise run paper:session`, by hand
   or from the scheduled agent (ADR 0044, ADR 0050, ADR 0069), `mise run paper:long-only windows`,
-  `mise run paper:account windows` and `mise run paper:close windows`.
+  `mise run paper:account windows` and `mise run paper:close windows`;
+  account C's, stored with `paper:store protect`, reaches only `mise run paper:account protect` (ADR 0114).
   `mise run paper:history <tests|windows>` reads either one, GET only in data-only mode, a historical
   load that neither trades nor streams (ADR 0093).
   No task reads both pairs. `paper:long-only <account> <check|on|off>` reads, or sets, Alpaca's long-only

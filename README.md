@@ -134,7 +134,7 @@ mise run paper:close windows  # cancel and close only what our nodes opened on a
                         # any symbol with something else in it is frozen and named
 ```
 
-There are two paper accounts ([ADR 0069](docs/adr/0069-two-paper-accounts.md)): account A, the default,
+There are two paper accounts that trade ([ADR 0069](docs/adr/0069-two-paper-accounts.md)), and a third, account C (`protect`), whose pair `paper:store protect` holds and only `paper:account protect` reads so far (ADR 0114): account A, the default,
 whose pair only `paper:test`, the data-only `paper:data`, `paper:long-only tests`, `paper:account tests` and `paper:close tests` read, and account B
 (`windows`), whose pair only `paper:session` and its schedule, `paper:long-only windows`, `paper:account windows` and `paper:close windows` read. Each account has its own lock, so a test and a window do not wait for each other; the two
 pairs each have their own market-data stream lock too (ADR 0069), so a paper test that streams and a window
@@ -145,8 +145,9 @@ Alpaca's live data with account A's pair, every request but GET refused and no A
 
 `paper:store` refuses a key ID starting with `AK`, Alpaca's hint for a live key, then sends the pair to
 Alpaca's paper API (`GET /v2/account`) and stores nothing unless it is accepted there; a live pair is
-refused there. Each value then sits in the login keychain, service `canon-alpaca-paper` for account A and
-`canon-alpaca-paper-windows` for account B. Of this repo's commands, only `paper:test` (A) and
+refused there. Each value then sits in the login keychain, service `canon-alpaca-paper` for account A,
+`canon-alpaca-paper-windows` for account B and `canon-alpaca-paper-protect` for account C; a key ID already
+stored for another account is refused. Of this repo's commands, only `paper:test` (A) and
 `paper:session` (B) put a pair in an environment, each its own, when it starts (`paper:store` reads it
 back once to confirm the write, and reads the other account's key ID to refuse the same pair twice); no
 file, shell, `mise env` or `scripts/ci` gets it. The keychain does not stop other
