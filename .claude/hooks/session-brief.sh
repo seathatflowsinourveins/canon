@@ -3,8 +3,8 @@
 # Contract: https://code.claude.com/docs/en/hooks.md
 #   plain stdout on SessionStart is added to Claude's context (capped at 10,000 characters).
 # Prints a few short lines: the pins, a static line of a coordinator's cold-start reads (ADR 0078),
-# ADRs past review-by or proposed, the landscape watch, and a toolchain
-# line only when it has something to say. Offline: reads files in this repo and asks mise for one path,
+# ADRs past review-by or proposed, the landscape watch, the nightly study's last night once there is one
+# (ADR 0089), and a toolchain line only when it has something to say. Offline: reads files in this repo and asks mise for one path,
 # bounded at 3 seconds so the hook's 10 s (.claude/settings.json) is never spent there.
 # Pins, ADRs and the landscape watch result are all read from the tree the session is working in (a
 # worktree has its own canon/, docs/adr/ and .canon/). A watch result is printed only when its `registry`
@@ -83,6 +83,38 @@ elif [ -f "$watch" ]; then
   ' "$watch" 2>/dev/null || echo "landscape watch: .canon/watch.json is unreadable."
 else
   echo "landscape watch: no result yet; the first check runs in the background now."
+fi
+
+# The nightly study's last night (ADR 0089), the morning line: the driver's own one-line record (its date, N,
+# T, the pick's Sharpe ratio and DSR, passed or not yet, and the paper windows to that night's end), read from
+# ledger/nightly/latest.json in the main checkout, the folder that holds the clone's common git directory,
+# so every worktree's session reads the same record. A second line counts the nights whose entry
+# (ledger/nightly/<study>/<day>.md) is not yet in docs/handbook/nights.md of that main checkout, which the
+# maintenance agent keeps on main, under the heading the driver gives an entry, "## <day>, <study>": a session
+# lands them, since the scheduled job commits nothing, and the line is for a coordinator, so a worker's
+# session does not act on it. Nothing is printed before a first record. CANON_NIGHTLY_DIR replaces the
+# records' folder and CANON_HANDBOOK_NIGHTS the page: tests only.
+common=$(git -C "$root" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || common=""
+case "$common" in /*) mainroot=$(dirname "$common") ;; *) mainroot="" ;; esac
+nd=${CANON_NIGHTLY_DIR:-${mainroot:+$mainroot/ledger/nightly}}
+npage=${CANON_HANDBOOK_NIGHTS:-${mainroot:+$mainroot/docs/handbook/nights.md}}
+if [ -n "$nd" ] && [ -f "$nd/latest.json" ]; then
+  if nline=$(jq -er '.line | select(type == "string" and . != "")' "$nd/latest.json" 2>/dev/null); then echo "$nline"
+  else echo "nightly study: its last record is unreadable or has no line; see scripts/automation status."; fi
+fi
+if [ -n "$nd" ] && [ -d "$nd" ]; then
+  nwait=""; ncount=0
+  for f in "$nd"/*/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].md; do
+    [ -f "$f" ] || continue
+    nday=$(basename "$f" .md); nstudy=$(basename "$(dirname "$f")")
+    if [ -z "$npage" ] || ! grep -qxF "## $nday, $nstudy" "$npage" 2>/dev/null; then
+      ncount=$((ncount + 1)); [ "$ncount" -gt 5 ] || nwait="$nwait${nwait:+, }$nday"
+    fi
+  done
+  if [ "$ncount" -gt 0 ]; then
+    [ "$ncount" -le 5 ] || nwait="$nwait and $((ncount - 5)) more"
+    echo "nightly study: $ncount night(s) with an entry not in docs/handbook/nights.md on main yet ($nwait). Coordinators only: one session lands them from ledger/nightly/<study>/<day>.md of the main checkout (ADR 0089)."
+  fi
 fi
 
 # A toolchain line, only when a bare `python3` in this session is not the toolchain's (mise.toml, through

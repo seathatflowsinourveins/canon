@@ -740,3 +740,26 @@ echo "account: $usage_account"
 # TERM at 600 s lets the run cancel what it sent (custody.close_task); KILL 30 s later if it has not ended
 exec /usr/bin/timeout -s TERM -k 30 600 uv run --locked python -c 'from canon_trading.custody import close_task; raise SystemExit(close_task())'
 '''
+
+# The nightly study (docs/adr/0089-the-nightly-study-loop.md): one firing of canon_trading.nightly_study in
+# this checkout, which studies the latest recorded night once and does nothing when there is none: the
+# registered rows replayed on the recorder's catalog (catalog/sip in the main checkout), each a trial in the
+# ledger, ranked through the gate. It reads no credential, opens no stream, places nothing and takes no paper
+# lock. Its records go beside the ledger, in ledger/nightly/ of the main checkout; the paper windows' records
+# it counts are the scheduled ones, as paper:session above keeps them in <config>/canon/watch/windows/, which a
+# restart leaves, else in the per-user temporary folder, and with neither folder it says so in its record and
+# studies all the same. `scripts/automation install` fires it every half
+# hour from the main checkout; by hand, `mise run study:nightly`. The timeout is scripts/automation's
+# STUDY_DEADLINE.
+[tasks."study:nightly"]
+description = "Study the latest recorded night once: the registered rows replayed on the recorder's catalog and ranked through the gate"
+shell = "bash -c"
+timeout = "60m"
+run = '''
+k="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/canon/watch/windows"
+tmp="$(/usr/bin/getconf DARWIN_USER_TEMP_DIR 2>/dev/null)" || tmp=""
+if [ -d "$k" ]; then set -- --windows "$k" "$@"
+else case "$tmp" in /*/) set -- --windows "${tmp}canon-paper-session" "$@" ;; esac
+fi
+exec uv run --locked python -m canon_trading.nightly_study "$@"
+'''

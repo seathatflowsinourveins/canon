@@ -459,6 +459,11 @@ cp "$R/home/.claude/canon/paper-session.sh" "$AH/canon/paper-session.sh"   # ins
 # covers its row)
 cp "$R/home/.claude/canon/maintenance.sh" "$AH/canon/maintenance.sh"
 jq -n --arg at "$(iso "$NOW")" --argjson e "$NOW" '{at: $at, at_epoch: $e, outcome: "ok", ff: "at origin/main 0123456789ab", found: [], installed: [], failed: [], note: "", install: null, last_change: null}' > "$AH/canon/watch/maintenance-status.json"
+# the nightly study's last night, settled, and its last firing, fresh, beside the ledger of the clone status
+# runs in (scripts/test-maintenance covers its row)
+mkdir -p "$R/ledger/nightly"
+jq -n --argjson e "$NOW" '{status: "not yet", line: "nightly study 2026-11-11 (s): N=8, T=6, pick SPY 5/20, DSR 0.4100, not yet: the pick is below 0.95", end_ns: ($e * 1000000000)}' > "$R/ledger/nightly/latest.json"
+jq -n --argjson e "$NOW" '{epoch: $e, status: "nothing new"}' > "$R/ledger/nightly/last-firing.json"
 status() { CLAUDE_CONFIG_DIR="$AH" CANON_PAPER_SESSION_DIR="$PD" CANON_LAUNCHCTL_SECS="${LCS:-30}" "$R/scripts/automation" status > "$TMP/status.out" 2>&1; }
 watchjson 60 true; runs completed '{conclusion: "success"}'
 status; rc=$?
@@ -775,14 +780,15 @@ if command -v plutil >/dev/null 2>&1; then
   mv "$STUB/launchctl-print" "$STUB/kept-print"; : > "$STUB/track-bootstrap"; echo 4 > "$STUB/slow-bootout"
   for l in local.canon.lanes-watch local.canon.paper-session local.canon.otel-collector local.canon.maintenance; do printf '\tstate = running\n' > "$STUB/launchctl-print-$l"; done
   : > "$STUB/launchctl.log"; unkeep; linst 5; rc=$?
-  check "an install over running agents waits for each to stop, then loads it: exit 0, three loaded, the maintenance agent's unchanged job kept" \
-        eval '[ "$rc" = 0 ] && [ "$(grep -c "^  loaded     local.canon" "$TMP/install.out")" = 3 ] && grep -q "^  kept       local.canon.maintenance loaded: its plist is unchanged" "$TMP/install.out" && ! grep -q "Bootstrap failed" "$TMP/install.out" && grep -q "state = running" "$STUB/launchctl-print-local.canon.otel-collector"'
+  # (the nightly study's agent, ADR 0089, was not loaded, so it is loaded too: four in all)
+  check "an install over running agents waits for each to stop, then loads it: exit 0, three loaded again and the nightly study's for the first time, the maintenance agent's unchanged job kept" \
+        eval '[ "$rc" = 0 ] && [ "$(grep -c "^  loaded     local.canon" "$TMP/install.out")" = 4 ] && grep -q "^  loaded     local.canon.nightly-study" "$TMP/install.out" && grep -q "^  kept       local.canon.maintenance loaded: its plist is unchanged" "$TMP/install.out" && ! grep -q "Bootstrap failed" "$TMP/install.out" && grep -q "state = running" "$STUB/launchctl-print-local.canon.otel-collector"'
   # only the collector loaded now, and it does not stop in time
   echo 100 > "$STUB/slow-bootout"; rm -f "$STUB/stopping-"* "$STUB/launchctl-print-local.canon."*; printf '\tstate = running\n' > "$OTL"
   : > "$STUB/launchctl.log"; unkeep; linst 1; rc=$?
   check "... one that does not stop in time: exit 1, nothing new loaded for it, said after the status table" \
         eval '[ "$rc" != 0 ] && grep -q "the earlier local.canon.otel-collector was still stopping after 1 s" "$TMP/install.out" && ! grep -q "bootstrap .*otel-collector.plist" "$STUB/launchctl.log" && grep -q "still stopping" <<<"$(tail -n 3 "$TMP/install.out")" && grep -q "^install: FAILED (exit 1):" "$TMP/install.out"'
-  check "... the other three loaded meanwhile"       test "$(grep -c "^  loaded     local.canon" "$TMP/install.out")" = 3
+  check "... the other four loaded meanwhile"        test "$(grep -c "^  loaded     local.canon" "$TMP/install.out")" = 4
   # the paper agent alone does not stop: said once, nothing booted over it, and (claim of a second reader) its
   # runner, clone and plist not replaced under it, where a firing of the old job would run the new runner
   rm -f "$STUB/stopping-"* "$STUB/launchctl-print-local.canon."*; printf '\tstate = running\n' > "$STUB/launchctl-print-local.canon.paper-session"
@@ -1028,7 +1034,7 @@ if [ ! -x "$UL" ]; then UL="$B/lockf-finds-it-free"; printf '#!/bin/bash\nexit 0
 uninst() { CLAUDE_CONFIG_DIR="$UH" CANON_LAUNCHAGENTS_DIR="$UA" CANON_UNLOAD_SECS=1 CANON_LAUNCHCTL_SECS="${LCS:-30}" CANON_LOCKF="${CANON_LOCKF:-$UL}" "$R/scripts/automation" uninstall > "$TMP/uninstall.out" 2>&1; }
 mkdir -p "$UH/canon/otel" "$UA"; : > "$UH/canon/lanes"; : > "$UH/canon/lanes-watch.sh"; : > "$UA/local.canon.lanes-watch.plist"
 : > "$UA/local.canon.otel-collector.plist"; : > "$UH/canon/otel/config.yaml"; : > "$UH/canon/otel/logs.jsonl"
-: > "$UA/local.canon.paper-session.plist"; : > "$UH/canon/paper-session.sh"
+: > "$UA/local.canon.paper-session.plist"; : > "$UH/canon/paper-session.sh"; : > "$UA/local.canon.nightly-study.plist"
 if [ -x /usr/bin/lockf ] && [ -x /usr/bin/timeout ]; then fire --checkout-only "$B/mise" "$UH/canon/paper-checkout" "$OURL"
 else git clone -q "$OURL" "$UH/canon/paper-checkout" && git -C "$UH/canon/paper-checkout" config canon.paperCheckout true; fi
 printf '\tstate = not running\n' > "$STUB/launchctl-print"; rm -f "$STUB/bootout-fails"; : > "$STUB/mise.log"; : > "$STUB/launchctl.log"
@@ -1037,6 +1043,8 @@ check "uninstall removes everything: exit 0"      eval '[ "$rc" = 0 ] && [ ! -e 
 check "... the collector agent and its config, keeping the events it wrote" \
       eval '[ ! -e "$UA/local.canon.otel-collector.plist" ] && [ ! -e "$UH/canon/otel/config.yaml" ] && [ -e "$UH/canon/otel/logs.jsonl" ]'
 check "... and unloads the collector"             grep -q "bootout gui/[0-9]*/local.canon.otel-collector" "$STUB/launchctl.log"
+check "... the nightly study's agent, unloaded first" \
+      eval '[ ! -e "$UA/local.canon.nightly-study.plist" ] && grep -q "bootout gui/[0-9]*/local.canon.nightly-study" "$STUB/launchctl.log"'
 check "... boots out each of the three agents"   test "$(grep -cE "^launchctl bootout gui/[0-9]+/local.canon.(lanes-watch|paper-session|otel-collector)\$" "$STUB/launchctl.log")" = 3
 check "... the paper runner, its clone, and the trust mise gave the clone's mise.toml" \
       eval '[ ! -e "$UH/canon/paper-session.sh" ] && [ ! -e "$UH/canon/paper-checkout" ] && grep -qF "mise trust --untrust $UH/canon/paper-checkout/mise.toml" "$STUB/mise.log"'
@@ -1152,6 +1160,21 @@ check "... each stream wait is lock_wait on descriptor 7 (lockf -t <secs> on a d
 RUNNER="$ROOT/home/.claude/canon/paper-session.sh"
 check "paper:session's timeout is scripts/automation's PAPER_DEADLINE and the runner's TASK_SECS" \
       eval '[ "$(num PAPER_DEADLINE "$ROOT/scripts/automation")" = "$(secs "$(task_part paper:session timeout)")" ] && [ "$(num TASK_SECS "$RUNNER")" = "$(num PAPER_DEADLINE "$ROOT/scripts/automation")" ]'
+check "study:nightly's timeout is scripts/automation's STUDY_DEADLINE, and the task reads no keychain item and takes no lock" \
+      eval '[ -n "$(num STUDY_DEADLINE "$ROOT/scripts/automation")" ] && [ "$(num STUDY_DEADLINE "$ROOT/scripts/automation")" = "$(secs "$(task_part study:nightly timeout)")" ] && [ -z "$(task_env study:nightly)" ] && ! grep -Eq "security|lockf|ALPACA" <<<"$(task_part study:nightly run)" && grep -q "python -m canon_trading.nightly_study" <<<"$(task_part study:nightly run)"'
+# study:nightly's body under bash with a uv stand-in that prints its arguments: the windows it counts are the
+# kept copies paper:session makes (<config>/canon/watch/windows, which a restart leaves), else the temp folder's
+mkdir -p "$TMP/sn/bin" "$TMP/sn/cfg"
+printf '#!/bin/sh\nprintf "%%s|" "$@"\n' >"$TMP/sn/bin/uv"; chmod +x "$TMP/sn/bin/uv"
+sn() { PATH="$TMP/sn/bin:$PATH" CLAUDE_CONFIG_DIR="$TMP/sn/cfg" bash -c "$(task_part study:nightly run)" study; }
+# shellcheck disable=SC2034  # read by the eval'd checks
+{ sn_temp=$(sn); mkdir -p "$TMP/sn/cfg/canon/watch/windows"; sn_kept=$(sn); }
+# the temp folder's, as the task finds it: macOS's per-user one, and none where getconf has no such name (Linux)
+sn_tmp=$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null) || sn_tmp=""
+# shellcheck disable=SC2034  # read by the eval'd check
+case "$sn_tmp" in /*/) sn_want="--windows|${sn_tmp}canon-paper-session|" ;; *) sn_want="" ;; esac
+check "study:nightly counts the kept window records when paper:session has kept them, else the temp folder's" \
+      eval '[ "$sn_kept" = "run|--locked|python|-m|canon_trading.nightly_study|--windows|$TMP/sn/cfg/canon/watch/windows|" ] && [ "$sn_temp" = "run|--locked|python|-m|canon_trading.nightly_study|$sn_want" ]'
 check "scripts/automation's longest firing is the runner's fetch bound, the task's timeout and mise's start" \
       eval 'grep -q "^PAPER_FIRING=\$((120 + PAPER_DEADLINE + 300))" "$ROOT/scripts/automation" && grep -q "^FETCH_SECS=\${CANON_PAPER_FETCH_SECS:-120}\$" "$RUNNER" && [ "$(num START_SECS "$RUNNER")" = 300 ]'
 check "... mise's start covers its two keychain reads"   test "$(num START_SECS "$RUNNER")" -ge 60

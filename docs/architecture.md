@@ -85,6 +85,14 @@ adapter is a uv workspace member of its own, kept apart from strategies as upstr
 `variant_study.py` runs steps 3 to 5 for one pre-registered plan, eight `MaCross` variants on Alpaca's
 daily bars (ADR 0048).
 
+`nightly_study.py` runs them each night for a plan on the recorded data: one firing finds the range the
+recorder's catalog (`catalog/sip/`) covers up to the last 20:00 New York, moves the study's sample to it,
+runs every configuration again through `variant_study.run_study` and writes the gate's figures and a verdict
+beside the ledger, in `ledger/nightly/`. Its verdict only narrows the gate's: fewer than five sessions, a
+rejected pick or a stopped ranking read `not yet`. The plan there is today is a dry run of `MaCross` on
+1-minute bars of SPY and QQQ that adopts nothing. `fill_gap.py` reads paper fills against a replay's, minute
+by minute, and the spread at entry; it is tested offline and not yet wired to a window's record (ADR 0089).
+
 ## A paper run, from stream to fill
 
 1. A `LiveNode` gets the adapter's factories, both or the data one alone in its paper tests, or both through `ema_cross_paper_node`,
@@ -197,7 +205,7 @@ lists; "system" is `/usr/bin` or `/bin`. Secret variables are named, never shown
 | An agent Orca types into an existing workspace's pane, or a tab the owner opens (interactive `zsh -l`, `mise activate` in `~/.zshrc`) | mise's | mise's 3.14 | mise's | system; bash 3.2 | `~/.claude` | as above |
 | Claude Code subagent, Bash tool, hooks in `.claude/hooks/` | as its session | as its session | as its session | system | as its session | the session; settings `env` pins no alias (ADR 0059), Claude Code adds `CLAUDE_EFFORT` and `CLAUDE_CODE_*` |
 | `.githooks/pre-commit`, `pre-push`, `scripts/ci` and `scripts/land` by hand | git's own `libexec/git-core` (in a hook), then the caller's; `scripts/ci` then puts mise's first for its checks | caller's; mise's inside `scripts/ci` | mise's (`land` calls `gh` through `mise exec`) | system | caller's | not used |
-| launchd agents `scripts/automation` installs: lane watchdog, OTLP collector, paper session, maintenance, OmniRoute gateway | `/usr/bin:/bin:/usr/sbin:/sbin`, set by each script, by the gateway's plist, and by the maintenance agent after mise's own folder; mise named by absolute path, and `mise run` adds its own | mise's inside `mise run paper:session` | mise's, through mise | system | the watchdog's and the maintenance agent's plists set `CLAUDE_CONFIG_DIR` to the folder at install | not used |
+| launchd agents `scripts/automation` installs: lane watchdog, OTLP collector, paper session, maintenance, OmniRoute gateway, nightly study | `/usr/bin:/bin:/usr/sbin:/sbin`, set by each script, by the gateway's and the nightly study's plists, and by the maintenance agent after mise's own folder; mise named by absolute path, and `mise run` adds its own | mise's inside `mise run paper:session` and `mise run study:nightly` | mise's, through mise | system | the watchdog's and the maintenance agent's plists set `CLAUDE_CONFIG_DIR` to the folder at install | not used |
 | Hosted workflow (`.github/workflows/ci.yml`, `ubuntu-24.04`) | mise's (mise-action adds each to `GITHUB_PATH`) | mise's 3.14 | mise's | runner's; git 2.56, bash at `/usr/bin/bash` | none | not used |
 | Hosted workflow's macOS job (`xcode-27`, macOS 27, two self-tests only) | mise's (mise-action) | mise's 3.14 | mise's | system; scripts run `/bin/bash` 3.2 (the image readme: Bash 3.2.57) | none | not used |
 

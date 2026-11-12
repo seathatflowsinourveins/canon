@@ -18,6 +18,9 @@
 #                                                            (home/.claude/canon/maintenance.sh, ADR 0065)
 #   OmniRoute gateway      always, Mac awake, once OmniRoute  launchd user agent running mise.gateway.toml's
 #                          is installed                      omniroute:serve in this clone (ADR 0056)
+#   nightly study          every 30 minutes, Mac awake       launchd user agent running mise.toml's study:nightly
+#                                                            in this clone: the latest recorded night studied
+#                                                            once, nothing when there is none (ADR 0089)
 #
 # Usage: scripts/automation status | install [--defer-paper] | uninstall | differs | mark-user-config
 # `install --defer-paper` installs everything but the paper session's runner, plist and clone, and leaves its
@@ -25,8 +28,8 @@
 # to the session boundary (home/.claude/canon/maintenance.sh, ADR 0065).
 # `install` uses no sudo and touches: this clone's git config, ~/.claude/canon/ (the paper session's
 # runner and its clone of origin's main, ~/.claude/canon/paper-checkout, the maintenance agent's script and the
-# collector's config, ~/.claude/canon/otel/config.yaml, included), and four files in ~/Library/LaunchAgents/,
-# five once OmniRoute is installed. It reloads the maintenance and gateway agents only when a plist changed or
+# collector's config, ~/.claude/canon/otel/config.yaml, included), and five files in ~/Library/LaunchAgents/,
+# six once OmniRoute is installed. It reloads the maintenance and gateway agents only when a plist changed or
 # the job is not loaded, so a reinstall the maintenance agent starts does not stop that agent's own job (a new
 # script reaches its next round, which runs the file anew), and the gateway is not restarted for nothing.
 # `differs` changes nothing: it prints one line per thing an installer manages that differs from this tree,
@@ -107,6 +110,19 @@ MAINT_BOUNDARY=32400
 UC_MARK="$CANON_HOME/watch/user-config.applied"        # the sources' checksum at the last --user-config it ran
 GW_LABEL="local.canon.omniroute"
 GW_PLIST="$AGENTS_DIR/$GW_LABEL.plist"
+STUDY_LABEL="local.canon.nightly-study"
+STUDY_PLIST="$AGENTS_DIR/$STUDY_LABEL.plist"
+STUDY_INTERVAL=1800                                   # every 30 minutes; a firing with no new night does nothing
+STUDY_DEADLINE=3600                                   # mise.toml's study:nightly timeout, 60 minutes
+# launchd counts the interval from the end of a firing (above), so with no heartbeat for the longest firing,
+# an interval and 300 s more, the schedule has stopped
+STUDY_SILENT=$((STUDY_DEADLINE + STUDY_INTERVAL + 300))
+STUDY_STALE_DAYS=5                                    # a long weekend is four days without a new night
+# the study's records: beside the ledger, in the main checkout (canon_trading.ledger.default_ledger_path: the
+# folder that holds the clone's common git directory), whichever worktree asks (CANON_NIGHTLY_DIR: tests only)
+STUDY_MAIN=$(git -C "$ROOT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || STUDY_MAIN=""
+case "$STUDY_MAIN" in /*) STUDY_MAIN=$(dirname "$STUDY_MAIN") ;; *) STUDY_MAIN="$ROOT" ;; esac
+STUDY_DIR="${CANON_NIGHTLY_DIR:-$STUDY_MAIN/ledger/nightly}"
 # jq: a commit as status shows it, the first 12 of a full id plus what follows it ("with uncommitted
 # changes"), or the text a record gives in its place ("unknown: <why>")
 # shellcheck disable=SC2016  # jq program, not shell
@@ -544,6 +560,63 @@ install_gw() {
   load_if_changed "$GW_LABEL" "$t" "$GW_PLIST" "the gateway keeps running" "(kept running on 127.0.0.1:20128, its API key required)"
 }
 
+# The nightly study agent (ADR 0089) runs mise.toml's own task, `mise run study:nightly`, in this clone, every
+# STUDY_INTERVAL and not at load: one firing of canon_trading.nightly_study, which studies the latest recorded
+# night once it is recorded whole and does nothing otherwise, so a Mac asleep at one firing loses nothing. It
+# reads no credential, opens no stream and takes no paper lock. PATH and MISE_TASK_RUN_AUTO_INSTALL as for the
+# gateway agent above. Its records are in STUDY_DIR, beside the ledger.
+# write_study_plist <mise> [file, else STUDY_PLIST]
+write_study_plist() {
+  local c; c=$(xml "$CANON_HOME")
+  cat > "${2:-$STUDY_PLIST}" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$STUDY_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$(xml "$1")</string>
+    <string>run</string>
+    <string>study:nightly</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>MISE_TASK_RUN_AUTO_INSTALL</key>
+    <string>false</string>
+  </dict>
+  <key>WorkingDirectory</key>
+  <string>$(xml "$ROOT")</string>
+  <key>StartInterval</key>
+  <integer>$STUDY_INTERVAL</integer>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>LowPriorityIO</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>$c/watch/nightly-study.log</string>
+  <key>StandardErrorPath</key>
+  <string>$c/watch/nightly-study.log</string>
+</dict>
+</plist>
+EOF
+}
+# install_study: writes the nightly study's agent; its job is reloaded only when the plist changed or it is not
+# loaded, so a reinstall does not restart its interval (the task itself is read from mise.toml at each firing)
+install_study() {
+  local m t
+  if ! m=$(find_mise 2>&1); then note "  FAILED: $m"; return 1; fi
+  t=$(mktemp "$AGENTS_DIR/.$STUDY_LABEL.XXXXXX") || { note "  FAILED: could not write $STUDY_PLIST"; return 1; }
+  write_study_plist "$m" "$t" || { rm -f "$t"; note "  FAILED: could not write $STUDY_PLIST"; return 1; }
+  load_if_changed "$STUDY_LABEL" "$t" "$STUDY_PLIST" "the next firing runs the task as mise.toml has it" \
+    "(every $((STUDY_INTERVAL / 60)) minutes; a night is studied once, after 20:05 New York and the recorder's consolidation)"
+}
+
 # install_otel: installs the collector's config and agent; returns 1 naming what failed. The config is
 # validated before it replaces the installed one, so a refused config never reaches a running agent; on a
 # failure before the plist is written, an agent loaded by an earlier install is left as it was, and says so.
@@ -659,6 +732,8 @@ do_install() {
   install_otel || ok=1
   note "OmniRoute gateway:"
   install_gw || ok=1
+  note "Nightly study:"
+  install_study || ok=1
   note "Landing:"
   local mise_bin
   if ! git -C "$ROOT" remote get-url origin >/dev/null 2>&1; then
@@ -686,7 +761,7 @@ do_install() {
 # were gone (a second reader's claim), and a retry would find nothing to tell it what to unload.
 do_uninstall() {
   local left="" f l rc still="" fs
-  for l in "$MAINT_LABEL" "$LABEL" "$PAPER_LABEL" "$OTEL_LABEL" "$GW_LABEL"; do
+  for l in "$MAINT_LABEL" "$LABEL" "$PAPER_LABEL" "$OTEL_LABEL" "$GW_LABEL" "$STUDY_LABEL"; do
     unload "$l"; rc=$?
     case "$rc" in
       0) if [ "$UNLOAD_ABSENT" = 1 ]; then note "  $l was not loaded"; else note "  unloaded   $l"; fi; continue ;;
@@ -697,12 +772,13 @@ do_uninstall() {
     still="$still $l "; left="$left
   launchd job $l"
   done
-  for l in "$MAINT_LABEL" "$LABEL" "$PAPER_LABEL" "$OTEL_LABEL" "$GW_LABEL"; do
+  for l in "$MAINT_LABEL" "$LABEL" "$PAPER_LABEL" "$OTEL_LABEL" "$GW_LABEL" "$STUDY_LABEL"; do
     case "$l" in
       "$LABEL") fs="$PLIST|$CANON_HOME/lanes|$CANON_HOME/lanes-watch.sh" ;;
       "$PAPER_LABEL") fs="$PAPER_PLIST|$CANON_HOME/paper-session.sh" ;;
       "$MAINT_LABEL") fs="$MAINT_PLIST|$CANON_HOME/maintenance.sh|$CANON_HOME/maintenance.lock" ;;
       "$GW_LABEL") fs="$GW_PLIST" ;;
+      "$STUDY_LABEL") fs="$STUDY_PLIST" ;;
       *) fs="$OTEL_PLIST|$OTEL_DIR/config.yaml" ;;
     esac
     if [[ "$still" == *" $l "* ]]; then
@@ -810,6 +886,7 @@ do_differs() {
   else
     write_plist "$t/w" && { cmp -s "$t/w" "$PLIST" || say automation "$PLIST differs from what install writes"; }
     write_maint_plist "$m" "$t/m" && { cmp -s "$t/m" "$MAINT_PLIST" || say automation "$MAINT_PLIST differs from what install writes"; }
+    write_study_plist "$m" "$t/s" && { cmp -s "$t/s" "$STUDY_PLIST" || say automation "$STUDY_PLIST differs from what install writes"; }
     if url=$(git -C "$ROOT" remote get-url origin 2>/dev/null) && [ -n "$url" ]; then
       write_paper_plist "$m" "$url" "$t/p" && { cmp -s "$t/p" "$PAPER_PLIST" || say automation "$PAPER_PLIST differs from what install writes"; }
       [ "$(git -C "$ROOT" config --local --get-all credential.https://github.com.helper 2>/dev/null | tail -n 1)" = "!\"$m\" exec -- gh auth git-credential" ] \
@@ -831,7 +908,7 @@ do_differs() {
   fi
   rm -rf "${t:?}"
   if [ "${AUTOMATION_SKIP_LAUNCHD:-0}" != "1" ]; then
-    for l in "$LABEL" "$PAPER_LABEL" "$OTEL_LABEL" "$MAINT_LABEL" "$GW_LABEL"; do
+    for l in "$LABEL" "$PAPER_LABEL" "$OTEL_LABEL" "$MAINT_LABEL" "$GW_LABEL" "$STUDY_LABEL"; do
       [ "$l" != "$GW_LABEL" ] || [ "$gw" = 1 ] || continue
       loaded "$l"; st=$?
       if [ "$st" = 1 ]; then say automation "$l is not loaded"; elif [ "$st" = 2 ]; then say unknown "launchctl did not answer about $l"; fi
@@ -1179,6 +1256,59 @@ do_status() {
     elif no_answer "$prc"; then check_row "omniroute gateway" UNKNOWN "launchctl did not answer within ${LAUNCHCTL_SECS} s, so whether it is loaded is not known"
     else check_row "omniroute gateway" OFF "run: scripts/automation install"; fi
   fi
+
+  # The nightly study (ADR 0089): the last night it studied, in one line the driver wrote (its date, N, T, the
+  # pick's DSR, passed or not yet, and the paper windows of that day), and whether the schedule still fires.
+  # FAILED for a night that failed, or a last firing that failed or exited non-zero; UNKNOWN until a first
+  # night is studied; STALE when no firing left its heartbeat for the longest firing and an interval, or the
+  # last night studied is older than a long weekend. A firing that waited (for the recorder, or for the gate's
+  # fix) or failed is shown with its own line, which says why, beside the last night studied. A check can only
+  # make the row's label worse (study_worse).
+  prc=0; pr=$(lc print "$DOMAIN/$STUDY_LABEL" 2>/dev/null) || prc=$?
+  if [ "$prc" = 0 ]; then
+    local sl="$STUDY_DIR/latest.json" sf="$STUDY_DIR/last-firing.json" slab stxt sfired sage sword sline
+    study_worse() { [ "$(paper_rank "$1")" -le "$(paper_rank "$slab")" ] || slab=$1; }
+    last=$(printf '%s\n' "$pr" | awk -F' = ' '/^\tlast exit code = / && s == "" { s = $2 } END { print s }')
+    sage=""
+    if [ -f "$sl" ]; then
+      # shellcheck disable=SC2016  # jq program, not shell
+      v=$(jq -r '(.status // "") as $s
+                 | (if $s == "failed" then "FAILED" elif $s == "passed" or $s == "not yet" then "ok" else "UNKNOWN" end)
+                   + "\t" + (if (.line // "") == "" then "its record has no line" else .line end)' "$sl" 2>/dev/null)
+      [ -n "$v" ] || v=$(printf 'UNKNOWN\t%s is unreadable' "$sl")
+      # shellcheck disable=SC2016  # jq program, not shell
+      sage=$(jq -r --argjson now "$(date -u +%s)" 'if (.end_ns | type) == "number" then (($now - .end_ns / 1e9) / 86400 | floor) else "" end' "$sl" 2>/dev/null) || sage=""
+    else
+      v=$(printf 'UNKNOWN\tno night studied yet')
+    fi
+    slab=${v%%$'\t'*} stxt=${v#*$'\t'}
+    if [[ "$sage" =~ ^[0-9]+$ ]] && [ "$sage" -gt "$STUDY_STALE_DAYS" ]; then
+      study_worse STALE; stxt="$stxt | the last night studied ended $sage days ago (the recorder, or its consolidation, may have stopped)"
+    fi
+    if [ -f "$sf" ]; then
+      sfired=$(jq -r '(.epoch | floor | tostring) + "\t" + (.status // "?")' "$sf" 2>/dev/null) || sfired=""
+      if [[ "${sfired%%$'\t'*}" =~ ^[0-9]+$ ]]; then
+        sage=$(( $(date -u +%s) - ${sfired%%$'\t'*} )); sword=${sfired#*$'\t'}
+        sline=$(jq -r '.line // ""' "$sf" 2>/dev/null) || sline=""
+        case "$sword" in
+          waiting|failed) stxt="$stxt | last firing $((sage / 60)) min ago: ${sline:-$sword}" ;;
+          *) stxt="$stxt | last firing $((sage / 60)) min ago: $sword" ;;
+        esac
+        [ "$sword" != failed ] || study_worse FAILED
+        if [ "$sage" -gt "$STUDY_SILENT" ]; then study_worse STALE; stxt="$stxt (the Mac asleep, or the job not running)"; fi
+      else
+        study_worse UNKNOWN; stxt="$stxt | $sf is unreadable, so whether the schedule fires is not known"
+      fi
+    else
+      study_worse UNKNOWN; stxt="$stxt | no firing recorded yet (the first comes $((STUDY_INTERVAL / 60)) minutes after install)"
+    fi
+    case "$last" in
+      0|''|*[!0-9-]*) ;;
+      *) study_worse FAILED; stxt="$stxt; the last firing exited $last" ;;
+    esac
+    check_row "nightly study" "$slab" "$stxt | log $CANON_HOME/watch/nightly-study.log"
+  elif no_answer "$prc"; then check_row "nightly study" UNKNOWN "launchctl did not answer within ${LAUNCHCTL_SECS} s, so whether it is loaded is not known"
+  else check_row "nightly study" OFF "run: scripts/automation install"; fi
 
   if [ -f "$CLAUDE_HOME/scheduled-tasks/$TASK_ID/SKILL.md" ]; then
     row "weekly refresh" ok "task file present at $CLAUDE_HOME/scheduled-tasks/$TASK_ID; whether it is still scheduled shows only in the desktop app"
