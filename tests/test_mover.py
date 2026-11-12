@@ -2844,7 +2844,9 @@ def test_a_reported_account_is_queried_on_each_fill_and_buys_since_its_report_ar
     closes = [*RISING[:5], 10.1, 10.0, 9.9, 9.8, *RECLAIM, 10.8]
     orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, closes))
     eng.dispose()
-    assert s.fills and 1 <= len(s.queries) <= len(s.fills), "at most one account query a fill"
+    assert s.fills and s.queries
+    if deliver:
+        assert len(s.queries) <= len(s.fills), "answered at once: at most one account query a fill"
     first = s.entries_sent[0]
     assert first["sizing"]["unreported_fills"] == "0"
     assert first["sizing"]["account_query_wait_secs"] == "0.0"
@@ -2962,3 +2964,27 @@ def test_a_reported_account_has_one_query_in_flight_and_a_fill_waits_for_a_query
     s._ask_for_the_account()
     assert len(s.queries) == 4
     assert s._unreported_buys(account) == Decimal(15)
+
+
+def test_a_lost_account_query_is_sent_again_on_expiry_without_another_fill():
+    """Second read of the high round (53269f4): a query that is lost (the adapter's `_query_account`
+    fails and reports nothing) was sent again only when another fill came, so with a position held and
+    no other fill every later buy was sized with that buy still held back until the position's own sale.
+    It is sent again once `QUERY_WAIT_SECS` has passed, fill or none."""
+    account = SimpleNamespace(calculate_account_state=False, event_count=1, id="A")
+    s = OneAccount(account)
+    s.fills_to_report = [(VENUE, OrderSide.BUY, Decimal(500))]
+    s._ask_for_the_account()
+    assert len(s.queries) == 1
+    s.now_ns = (mover.QUERY_WAIT_SECS - 1) * mover.SECOND_NS
+    s._ask_for_the_account()
+    assert len(s.queries) == 1, "not before it has had its time"
+    s.now_ns = mover.QUERY_WAIT_SECS * mover.SECOND_NS
+    s._ask_for_the_account()
+    assert len(s.queries) == 2, "sent again with no other fill"
+    assert s._unreported_buys(account) == Decimal(500)
+    account.event_count = 2  # the second query's report
+    assert s._unreported_buys(account) == Decimal(0)
+    s.now_ns = 10 * mover.QUERY_WAIT_SECS * mover.SECOND_NS
+    s._ask_for_the_account()
+    assert len(s.queries) == 2, "an answered query is not sent again"

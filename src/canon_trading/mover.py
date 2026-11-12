@@ -595,6 +595,8 @@ class Mover(Strategy):
         query sent after it."""
         self.unasked_venue: Any = None
         """The venue of a reported account with a fill no query has been sent for yet, or None."""
+        self.query_venue: Any = None
+        """The venue of the reported account the last query was sent to, or None before the first."""
         self.fills_to_report: list[tuple[Any, OrderSide, Decimal]] = []
         """Each fill since the last step: its venue, side and notional (`on_order_filled`)."""
         self.query_awaits: int | None = None
@@ -709,8 +711,9 @@ class Mover(Strategy):
         A query is sent for every fill since the last one, so a step's partial fills cost one request,
         not one each; while it is unanswered no other is sent, so its report, the account's next
         event, is taken after every buy it was sent for. A buy filled while it is in flight waits for
-        the next query. One unanswered for `QUERY_WAIT_SECS` is taken as lost and another sent. A buy's
-        notional is subtracted from the free cash until a report has it; sales never wait on a query.
+        the next query. One unanswered for `QUERY_WAIT_SECS` is taken as lost and another sent, with
+        or without a fill since (the second read of the high round). A buy's notional is subtracted from
+        the free cash until a report has it; sales never wait on a query.
         """
         taken, self.fills_to_report = self.fills_to_report, []
         for venue, side, notional in taken:
@@ -720,13 +723,20 @@ class Mover(Strategy):
             if side == OrderSide.BUY:
                 self.unasked.append(notional)
             self.unasked_venue = venue
-        if self.unasked_venue is None:
+        venue = self.unasked_venue or self.query_venue
+        if venue is None:
             return
-        account = self._trading_account(self.unasked_venue)
+        account = self._trading_account(venue)
+        if account is None:
+            return
         now = self._now_ns()
-        if self._in_flight(account) and now - self.query_sent_ns < QUERY_WAIT_SECS * SECOND_NS:
+        in_flight = self._in_flight(account)
+        if self.unasked_venue is None and not in_flight:
+            return  # the last query was answered and no fill has come since
+        if in_flight and now - self.query_sent_ns < QUERY_WAIT_SECS * SECOND_NS:
             return
         self.query_awaits, self.query_sent_ns = account.event_count + 1, now
+        self.query_venue = venue
         self.unreported += [(self.query_awaits, notional) for notional in self.unasked]
         self.unasked, self.unasked_venue = [], None
         self.query_account(account.id)
