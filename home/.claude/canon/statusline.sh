@@ -30,7 +30,8 @@
 # the HUD measures its bar against the point where this session compacts (its config sets no autoCompactWindow
 # of its own, which would be one window for every model). The window, per
 # https://code.claude.com/docs/en/model-config.md ("Set the auto-compact window"): CLAUDE_CODE_AUTO_COMPACT_WINDOW
-# when usable (a token count, or with k or M, held to 100K to 1M), else the user settings.json's
+# when usable (a token count, or with k or M in either case, which the docs do not settle (UNVERIFIED), held to
+# 100K to 1M), else the user settings.json's
 # modelSettings.<model.id>.autoCompactWindow (what /autocompact writes), else its autoCompactWindow, capped at the
 # input's context_window_size. Not visible here, so not followed: a --autocompact flag, the project, local and
 # managed settings scopes, and the tuned window when none is set ("auto" or nothing), where the bar measures the
@@ -164,17 +165,18 @@ hud_input="" user_settings="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
 [ -r "$user_settings" ] || user_settings=/dev/null
 hud_input=$(printf '%s' "$input" | jq -c --arg envw "${CLAUDE_CODE_AUTO_COMPACT_WINDOW:-}" --rawfile s "$user_settings" '
     def usable: if type == "number" and . > 0 then ([[., 100000] | max, 1000000] | min | floor) else null end;
-    def envwin: ($envw | capture("^(?<n>[0-9]+)(?<u>k|M)?$")?
-                 | (.n | tonumber) * ({"k": 1000, "M": 1000000}[.u // ""] // 1) | usable) // null;
-    def canonical: sub("\\[[^]]*\\]$"; "") | sub("^([a-z]+\\.)?anthropic\\."; "") | sub("-v[0-9]+:[0-9]+$"; "")
+    def envwin: ($envw | capture("^(?<n>[0-9]+)(?<u>[kKmM])?$")?
+                 | (.n | tonumber) * ({"k": 1000, "m": 1000000}[.u // "" | ascii_downcase] // 1) | usable) // null;
+    def canonical: sub("^.*/"; "") | sub("\\[[^]]*\\]$"; "") | sub("^([a-z]+\\.)?anthropic\\."; "") | sub("-v[0-9]+:[0-9]+$"; "")
                    | sub("[-@][0-9]{8}$"; "");
     ((try ($s | fromjson) catch {}) | if type == "object" then . else {} end) as $set
     | if type == "object" and (.model | type) == "object" and (.model.id | type) == "string"
       then .model.display_name = .model.id else . end
     | (.model.id? | strings // "") as $m
     | (($set.modelSettings? | objects) // {}) as $ms
-    | ((($ms[$m] // $ms[$m | canonical]) | objects | .autoCompactWindow) // null) as $per
-    | (if envwin != null then envwin
+    | (([$ms[$m], $ms[$m | canonical]] | map(objects | .autoCompactWindow | select(. != null)) | first) // null) as $per
+    | envwin as $e
+    | (if $e != null then $e
        elif $per == "auto" then null
        else ($per | usable) // ($set.autoCompactWindow | usable) end) as $w
     | if $w != null and (.context_window | type) == "object" then

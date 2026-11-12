@@ -185,14 +185,17 @@ check "the environment's window wins over both, read with its k suffix" \
 check "an environment window that is not a size is ignored" \
   '[ "$(ctx 1000000 env CLAUDE_CODE_AUTO_COMPACT_WINDOW=junk)" = "{\"context_window_size\":600000}" ]'
 check "the window is capped at the model's" '[ "$(ctx 200000 env)" = "{\"context_window_size\":200000}" ]'
-sess() { printf '%s' "{$(session s9 1.234),\"model\":{\"id\":\"$1\"},\"context_window\":{\"context_window_size\":1000000,\"used_percentage\":40}}" \
+sess() { rm -f "$STUBS/hud.in"; printf '%s' "{$(session s9 1.234),\"model\":{\"id\":\"$1\"},\"context_window\":{\"context_window_size\":1000000,\"used_percentage\":40}}" \
   | CLAUDE_CONFIG_DIR="$CFG" CANON_STATUSLINE_RENDERER="$STUBS/hud" env -u CLAUDE_CODE_AUTO_COMPACT_WINDOW \
     "$ROOT/home/.claude/canon/statusline.sh" >/dev/null 2>&1; jq -c '.context_window' "$STUBS/hud.in"; }
-for id in 'claude-opus-5-5[1m]' claude-opus-5-5-20261101 us.anthropic.claude-opus-5-5-v1:0 claude-opus-5-5@20261101; do
+for id in 'claude-opus-5-5[1m]' claude-opus-5-5-20261101 us.anthropic.claude-opus-5-5-v1:0 claude-opus-5-5@20261101 \
+  arn:aws:bedrock:us-east-1:000000000000:inference-profile/us.anthropic.claude-opus-5-5-v1:0; do
   check "the model's entry is found under its canonical name for $id" '[ "$(sess "$id")" = "{\"context_window_size\":600000}" ]'
 done
-check "an environment window in capitals or with a fraction is not read" \
-  '[ "$(ctx 1000000 env CLAUDE_CODE_AUTO_COMPACT_WINDOW=200K)" = "{\"context_window_size\":600000}" ] && [ "$(ctx 1000000 env CLAUDE_CODE_AUTO_COMPACT_WINDOW=1.5M)" = "{\"context_window_size\":600000}" ]'
+check "an environment window's suffix is read in either case, and a fraction is not read" \
+  '[ "$(ctx 1000000 env CLAUDE_CODE_AUTO_COMPACT_WINDOW=200K)" = "{\"context_window_size\":200000}" ] && [ "$(ctx 1000000 env CLAUDE_CODE_AUTO_COMPACT_WINDOW=1.5M)" = "{\"context_window_size\":600000}" ]'
+printf '{"autoCompactWindow":300000,"modelSettings":{"claude-opus-5-5[1m]":{"effortLevel":"high"},"claude-opus-5-5":{"autoCompactWindow":600000}}}\n' > "$CFG/settings.json"
+check "an entry under the exact ID without a window does not hide the canonical entry's" '[ "$(sess 'claude-opus-5-5[1m]')" = "{\"context_window_size\":600000}" ]'
 printf '{"autoCompactWindow":300000,"modelSettings":{"claude-opus-5-5":{"autoCompactWindow":"auto"}}}\n' > "$CFG/settings.json"
 check "the model's \"auto\" (the tuned window) is not replaced by the window for every model" \
   '[ "$(ctx 1000000 env)" = "{\"context_window_size\":1000000,\"used_percentage\":40}" ]'
