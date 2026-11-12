@@ -388,8 +388,12 @@ def test_the_scope_defaults_to_the_three_proven_types_and_refuses_what_the_adapt
     wider = AlpacaExecutionClientConfig(sell_to_close_order_types=[OrderType.MARKET, *proven])
     assert frozenset(wider.sell_to_close_order_types) == proven | {OrderType.MARKET}
     assert AlpacaExecutionClientConfig(sell_to_close_order_types=()).sell_to_close_order_types == ()
-    with pytest.raises(ValueError, match="TRAILING_STOP_MARKET"):
-        AlpacaExecutionClientConfig(sell_to_close_order_types=[OrderType.TRAILING_STOP_MARKET])
+    trailing = AlpacaExecutionClientConfig(
+        sell_to_close_order_types=[OrderType.TRAILING_STOP_MARKET]
+    )
+    assert trailing.sell_to_close_order_types == (OrderType.TRAILING_STOP_MARKET,)
+    with pytest.raises(ValueError, match="TRAILING_STOP_LIMIT"):
+        AlpacaExecutionClientConfig(sell_to_close_order_types=[OrderType.TRAILING_STOP_LIMIT])
     for value in ("LIMIT", ["LIMIT"], 3):
         with pytest.raises(TypeError, match="sell_to_close_order_types"):
             AlpacaExecutionClientConfig(sell_to_close_order_types=cast("Any", value))
