@@ -969,6 +969,23 @@
       ],
       "adr": "0104",
       "pypi": "arch"
+    },
+    {
+      "id": "plotly",
+      "field": "strategy-evaluation",
+      "repo": "plotly/plotly.py",
+      "track": "tag:v7.1.0",
+      "role": "tool",
+      "license": "MIT",
+      "why": "Draws NautilusTrader's tearsheet: nautilus_trader.analysis.tearsheet imports plotly and raises ImportError without it, and its create_tearsheet writes one self-contained HTML file from a BacktestResult (ADR 0109). Declared directly at 7.1.0, the version uv.lock already held through skfolio and inside the 7.x range of NautilusTrader's visualization extra, so that code here does not rest on another package's dependency. One consumer, the replay tearsheet, one HTML file per symbol replay in a folder git ignores, which is not built yet; this repository draws no figure of its own. Kaleido, which the extra also lists and only a static image needs, is not adopted. A move touches pyproject.toml and uv.lock (uv add plotly==<version>) and must stay inside the range the pinned NautilusTrader and skfolio accept.",
+      "evidence": [
+        "https://pypi.org/pypi/plotly/json",
+        "https://github.com/plotly/plotly.py/releases/tag/v7.1.0",
+        "https://raw.githubusercontent.com/nautechsystems/nautilus_trader/d53849b216e20f2c122ca01b4dd0da377638b186/python/nautilus_trader/analysis/tearsheet.py",
+        "https://raw.githubusercontent.com/nautechsystems/nautilus_trader/d53849b216e20f2c122ca01b4dd0da377638b186/docs/concepts/visualization.md"
+      ],
+      "adr": "0109",
+      "pypi": "plotly"
     }
   ]
 }
