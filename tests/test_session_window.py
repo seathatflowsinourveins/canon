@@ -9182,3 +9182,436 @@ def test_overnight_a_spare_after_a_chosen_name_passed_over_on_price_is_passed_ov
     assert [p.symbol for p in seen["pick"].picks] == ["LLL"]
     assert "overnight" in latest["mover"]["passed_over"]["EEE"]
     assert "entry figure" in latest["mover"]["passed_over"]["XXX"]
+
+
+# A node on the host's loop, as `LiveNode.run_async` documents it at the pin (`crates/live/src/python/
+# node.rs`): "The host owns the loop and its signal handling, so this installs no signal handlers. Stop
+# the node through the handle from `handle()`". The child runs `_run_node` on such a node and says what
+# happened; the test signals it as an operator or a supervisor would.
+_SIGNAL_CHILD = """
+import asyncio, json, os, sys, time
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from canon_trading import session_window
+
+MODE, STOP_SECS, RECORD = os.environ["MODE"], float(os.environ["STOP_SECS"]), os.environ.get("RECORD")
+
+class Node:
+    stopped = None
+    async def run_async(self):
+        Node.stopped = asyncio.Event()
+        if MODE == "node":
+            print("running", flush=True)
+        await Node.stopped.wait()
+    def handle(self):
+        class Handle:
+            def stop(self):
+                print("stop requested", flush=True)
+                asyncio.get_running_loop().call_later(STOP_SECS, Node.stopped.set)
+        return Handle()
+
+with session_window.window_signals():
+    try:
+        if RECORD:
+            report = session_window.WindowReport("regular", "SPY", "signalled", result="running")
+            session_window.write_record(Path(RECORD), report, refresh_requests=False)
+            session_window._SIGNALS.record = (Path(RECORD), report)
+        if MODE == "before":
+            print("running", flush=True)
+            time.sleep(30)
+        session_window._run_node(Node(), datetime.now(UTC) + timedelta(seconds=0.2 if MODE == "after" else 60))
+        if MODE == "after":
+            print("running", flush=True)  # the wind-down: flatten, account check, record
+            end = time.monotonic() + 3
+            while time.monotonic() < end:
+                time.sleep(0.05)
+            print(f"wind-down finished, {session_window._SIGNALS.first} noted", flush=True)
+        else:
+            print("ran to its end", flush=True)
+    except KeyboardInterrupt as e:
+        print(f"interrupted ({type(e).__name__}: {e}), and the window's finally ran", flush=True)
+    print(f"abandoned: {len(session_window._ABANDONED)}", flush=True)
+"""
+
+
+def _read_line(stream, secs: float) -> str:
+    """One line of the child's output, or "" if none came within `secs` (a bare readline could hang)."""
+    import select
+
+    ready, _, _ = select.select([stream], [], [], secs)
+    return stream.readline() if ready else ""
+
+
+def _signalled_child(
+    *signums: int,
+    ignore_int: bool = False,
+    mode: str = "node",
+    stop_secs: float = 0.0,
+    record: Path | None = None,
+    then_kill: bool = False,
+) -> tuple[int | None, str]:
+    """Start the child as a non-interactive shell would, wait for its "running", send `signums` in turn
+    (two copies of one stand for `timeout(1)` and uv each passing it on), and return its exit and
+    output; `then_kill` sends SIGKILL once the first signal's mark is written, as `bounded()`'s deadline
+    does."""
+    import signal as signal_module
+
+    # `trap "" INT` is what a non-interactive shell does for a command it starts with &: SIGINT ignored,
+    # which `exec` keeps (POSIX, "Shell Command Language", 2.11 and the `trap` utility)
+    trap = 'trap "" INT; ' if ignore_int else ""
+    env = {**os.environ, "MODE": mode, "STOP_SECS": str(stop_secs)}
+    if record is not None:
+        env["RECORD"] = str(record)
+    child = subprocess.Popen(
+        ["/bin/sh", "-c", trap + 'exec "$0" -c "$1"', sys.executable, _SIGNAL_CHILD],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=env,
+    )
+    assert child.stdout is not None
+    before = ""  # in "after" mode the node's stop is asked for before the wind-down says "running"
+    while (line := _read_line(child.stdout, 30)).strip() != "running":
+        before += line
+        if not line:
+            child.kill()
+            out, _ = child.communicate()
+            raise AssertionError(f"the child did not start: {before}{out}")
+    for signum in signums:
+        child.send_signal(signum)
+        time.sleep(0.1)
+    if then_kill:
+        assert record is not None
+        end = time.monotonic() + 10
+        while time.monotonic() < end and "stopping" not in _latest_result(record):
+            time.sleep(0.05)
+        child.send_signal(signal_module.SIGKILL)
+    try:
+        out, _ = child.communicate(timeout=15)
+    except subprocess.TimeoutExpired:
+        child.kill()
+        out, _ = child.communicate()
+        return None, before + out
+    return child.returncode, before + out
+
+
+def _latest_result(record: Path) -> str:
+    try:
+        return json.loads((session_window.records_dir(record) / "latest.json").read_text())[
+            "result"
+        ]
+    except OSError, ValueError, KeyError:
+        return ""
+
+
+def test_an_interrupt_stops_the_window_node_even_when_the_window_was_started_with_int_ignored() -> (
+    None
+):
+    """A window started in the background by a non-interactive shell inherits SIGINT ignored, and Python
+    keeps an inherited SIG_IGN, so INT did nothing (guard window of 2026-11-12, 53 s until a TERM)."""
+    import signal as signal_module
+
+    code, out = _signalled_child(signal_module.SIGINT, ignore_int=True)
+    assert code is not None, f"INT ignored: the node was still running 15 s later\n{out}"
+    assert "stop requested" in out, out
+    assert "(WindowSignalled: stopped by SIGINT), and the window's finally ran" in out, out
+
+
+def test_a_terminate_stops_the_window_node_and_runs_the_windows_finally() -> None:
+    """TERM ended the same window with its record still `running`: Python's default for SIGTERM ends
+    the process at once, so no stop is asked of the node and the window's `finally` never writes."""
+    import signal as signal_module
+
+    code, out = _signalled_child(signal_module.SIGTERM)
+    assert "stop requested" in out, (code, out)
+    assert "(WindowSignalled: stopped by SIGTERM), and the window's finally ran" in out, (code, out)
+
+
+def test_a_terminate_passed_on_twice_while_the_node_stops_slowly_leaves_the_stop_graceful() -> None:
+    """`timeout(1)` passes a TERM to its group and uv passes it on again (module header), so python gets
+    two or three: the copies are ignored, the stop is waited for and nothing is abandoned."""
+    import signal as signal_module
+
+    term = signal_module.SIGTERM
+    code, out = _signalled_child(term, term, term, stop_secs=1.0)
+    assert out.count("stop requested") == 1, (code, out)
+    assert "(WindowSignalled: stopped by SIGTERM), and the window's finally ran" in out, (code, out)
+    assert "abandoned: 0" in out, (code, out)
+
+
+def test_a_terminate_before_the_node_starts_ends_the_window_with_its_name() -> None:
+    import signal as signal_module
+
+    code, out = _signalled_child(signal_module.SIGTERM, mode="before")
+    assert "stop requested" not in out, (code, out)
+    assert "(WindowSignalled: stopped by SIGTERM), and the window's finally ran" in out, (code, out)
+
+
+def test_a_signal_after_the_node_stopped_is_noted_and_the_wind_down_finishes() -> None:
+    import signal as signal_module
+
+    code, out = _signalled_child(signal_module.SIGINT, signal_module.SIGTERM, mode="after")
+    assert code == 0, (code, out)
+    assert "wind-down finished, SIGINT noted" in out, out
+    assert "interrupted" not in out, out
+
+
+def test_a_signal_marks_the_record_stopping_at_once_and_a_kill_in_the_wind_down_leaves_that(
+    tmp_path: Path,
+) -> None:
+    """After any signal the record never reads `running` again: the handler marks it stopping, naming the
+    signal, before the wind-down starts; `bounded()`'s KILL at its deadline leaves that mark."""
+    import signal as signal_module
+
+    code, out = _signalled_child(
+        signal_module.SIGTERM, mode="after", record=tmp_path, then_kill=True
+    )
+    assert code == -signal_module.SIGKILL, (code, out)
+    result = _latest_result(tmp_path)
+    assert result == "stopping: SIGTERM received; the window has not finished", (result, out)
+    stamped = json.loads(
+        (session_window.records_dir(tmp_path) / "window-signalled.json").read_text()
+    )
+    assert stamped["result"] == result
+
+
+def test_the_window_sets_int_and_term_for_its_span_and_restores_them() -> None:
+    """The handlers found are put back when the window ends, including one Python did not set (None from
+    `signal.signal`, put back as the default); during the window both are the window's own."""
+    import signal as signal_module
+
+    def mine(signum, frame) -> None:  # stands for a handler set before the window
+        pass
+
+    found_int = signal_module.signal(signal_module.SIGINT, signal_module.SIG_IGN)
+    found_term = signal_module.signal(signal_module.SIGTERM, mine)
+    try:
+        with session_window.window_signals():
+            assert signal_module.getsignal(signal_module.SIGINT) == session_window._SIGNALS.handle
+            assert signal_module.getsignal(signal_module.SIGTERM) == session_window._SIGNALS.handle
+        assert signal_module.getsignal(signal_module.SIGINT) is signal_module.SIG_IGN
+        assert signal_module.getsignal(signal_module.SIGTERM) is mine
+
+        real = signal_module.signal
+
+        def none_found(signum, handler):  # a handler not set from Python reads back as None
+            previous = real(signum, handler)
+            return None if handler == session_window._SIGNALS.handle else previous
+
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(session_window.signal, "signal", none_found)
+            with session_window.window_signals():
+                pass
+        assert signal_module.getsignal(signal_module.SIGINT) is signal_module.SIG_DFL
+        assert signal_module.getsignal(signal_module.SIGTERM) is signal_module.SIG_DFL
+    finally:
+        signal_module.signal(signal_module.SIGINT, found_int)
+        signal_module.signal(signal_module.SIGTERM, found_term)
+
+
+def _paper_session_bounded() -> tuple[str, str]:
+    """paper:session's `bounded()` as mise.toml has it, and its `grace=` value."""
+    run = tomllib.loads((session_window.SOURCE_ROOT / "mise.toml").read_text())["tasks"][
+        "paper:session"
+    ]["run"]
+    found = re.search(r"^bounded\(\) \{\n.*?^\}$", run, re.MULTILINE | re.DOTALL)
+    grace = re.search(r"^grace=(\d+)$", run, re.MULTILINE)
+    assert found is not None and grace is not None
+    assert re.search(r'^  stopgrace=\$grace\n  bounded "\$left" uv run ', run, re.MULTILINE), (
+        "the window's own run, and only it, is given the grace"
+    )
+    return found.group(0), grace.group(1)
+
+
+def test_paper_session_gives_a_stop_the_windows_longest_wind_down_before_it_kills() -> None:
+    _, grace = _paper_session_bounded()
+    assert int(grace) == session_window.STOP_GRACE_SECS
+    assert session_window.STOP_GRACE_SECS >= session_window.AFTER_END_SECS
+
+
+_TERM_CHILD = """
+import signal, sys, time
+def wind_down(signum, frame):
+    print("wind-down started", flush=True)
+    time.sleep(1)
+    print("wind-down finished", flush=True)
+    sys.exit(0)
+signal.signal(signal.SIGTERM, wind_down)
+print("running", flush=True)
+time.sleep(30)
+"""
+
+
+@pytest.mark.parametrize("stopgrace", ["37", ""])
+def test_bounded_passes_a_stop_on_as_terminate_and_waits_its_grace_only_when_given_one(
+    stopgrace: str,
+) -> None:
+    """The first rework's tenth finding: `bounded()` answered a stop with KILL to the whole group, so the
+    window's handler never ran when the firing was stopped. With `stopgrace` the command gets TERM and the
+    grace to end; without it (paper:test) the kill is at once, as before."""
+    import signal as signal_module
+
+    body, _ = _paper_session_bounded()
+    script = (
+        f"{body}\nstopgrace={stopgrace}\n"
+        'bounded 60 "$0" -c "$1"\n'  # sh -c's $0 and $1: the python and its script
+    )
+    shell = subprocess.Popen(
+        ["/bin/sh", "-c", script, sys.executable, _TERM_CHILD],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    assert shell.stdout is not None
+    line = _read_line(shell.stdout, 30)
+    assert line.strip() == "running", line
+    started = time.monotonic()
+    shell.send_signal(signal_module.SIGTERM)
+    if stopgrace:
+        # a second stop in the grace, as mise passes one on: noted, and the grace still runs (bash 3.2, the
+        # /bin/sh here, killed itself when the trap was changed from inside it)
+        time.sleep(0.3)
+        shell.send_signal(signal_module.SIGTERM)
+    out, _ = shell.communicate(timeout=30)
+    assert shell.returncode == 143, (shell.returncode, out)
+    if stopgrace:
+        assert "wind-down finished" in out, out
+        assert time.monotonic() - started < 10, "the grace's sleeper held the task's output"
+    else:
+        assert "wind-down" not in out, out
+        assert time.monotonic() - started < 1, out
+    time.sleep(0.3)
+    left = subprocess.run(
+        ["/usr/bin/pgrep", "-fx", f"sleep {stopgrace}"], check=False, capture_output=True
+    )
+    assert left.returncode == 1, f"the grace's sleeper outlived the task: {left.stdout!r}"
+
+
+def test_a_signal_after_the_result_is_set_leaves_the_record_as_it_is(tmp_path: Path) -> None:
+    """Review: the handler overwrote a finished result (`ok`, or a reason) with `stopping`."""
+    import signal as signal_module
+
+    report = session_window.WindowReport(
+        "regular", "SPY", "done", result="failed: not left flat: AAPL"
+    )
+    with session_window.window_signals():
+        session_window.write_record(tmp_path, report, refresh_requests=False)
+        session_window._SIGNALS.record = (tmp_path, report)
+        session_window._SIGNALS.left_node()
+        session_window._SIGNALS.handle(signal_module.SIGTERM, None)
+    assert report.result == "failed: not left flat: AAPL"
+    assert _latest_result(tmp_path) == "failed: not left flat: AAPL"
+
+
+def test_a_signal_in_the_wind_down_of_a_window_whose_node_never_ran_is_noted_not_raised(
+    monkeypatch, tmp_path
+) -> None:
+    """Review: with no node run the phase stayed `before`, so a signal raised inside the flatten."""
+    import signal as signal_module
+
+    def broken(config, **kwargs):
+        raise RuntimeError("the node could not be built")
+
+    flattened: list[str] = []
+
+    def flatten(trading, config, report, **kwargs):
+        session_window._SIGNALS.handle(signal_module.SIGTERM, None)
+        flattened.append(_latest_result(tmp_path))
+        return []
+
+    monkeypatch.setattr(session_window, "paper_trading", lambda: Account())
+    monkeypatch.setattr(session_window, "window_node", broken)
+    monkeypatch.setattr(session_window, "_flatten_after_stop", flatten)
+    with session_window.window_signals(), pytest.raises(RuntimeError, match="could not be built"):
+        session_window.run_window(WindowConfig(log_dir=tmp_path))
+    assert flattened == ["stopping: SIGTERM received; the window has not finished"]
+    latest = json.loads((tmp_path / "latest.json").read_text())
+    assert latest["result"] == "failed: RuntimeError: the node could not be built"
+    assert "SIGTERM received; the wind-down finished" in latest["errors"]
+
+
+def test_a_signal_during_the_first_record_write_leaves_it_stopping(monkeypatch, tmp_path) -> None:
+    """Review: the record was registered after its first write and outside the `try`, so a signal there
+    left it `running`."""
+    import signal as signal_module
+
+    real = session_window._snapshot_requests
+
+    def snapshot(report):
+        if isinstance(report, session_window.WindowReport) and report.result == "running":
+            session_window._SIGNALS.handle(signal_module.SIGTERM, None)
+        return real(report)
+
+    monkeypatch.setattr(session_window, "paper_trading", lambda: Account())
+    monkeypatch.setattr(session_window, "_snapshot_requests", snapshot)
+    monkeypatch.setattr(
+        session_window, "window_node", lambda *a, **k: pytest.fail("a node was built")
+    )
+    with session_window.window_signals(), pytest.raises(session_window.WindowSignalled):
+        session_window.run_window(WindowConfig(log_dir=tmp_path))
+    assert _latest_result(tmp_path) == "stopping: SIGTERM received; the window has not finished"
+
+
+class _Stoppable:
+    def __init__(self) -> None:
+        self.stops = 0
+
+    def handle(self):
+        return SimpleNamespace(stop=self._stop)
+
+    def _stop(self) -> None:
+        self.stops += 1
+        self.stopped.set()
+
+    async def run_async(self) -> None:
+        import asyncio
+
+        self.stopped = asyncio.Event()
+        await self.stopped.wait()
+
+
+def test_a_signal_before_the_nodes_loop_runs_is_held_and_the_node_stopped() -> None:
+    """Review: until `_run_until`'s first step the phase was `before`, so a signal raised inside the loop
+    and the node's task was abandoned with no stop."""
+    import signal as signal_module
+
+    node = _Stoppable()
+    with session_window.window_signals():
+        session_window._SIGNALS.node_starts()
+        session_window._SIGNALS.handle(signal_module.SIGTERM, None)  # held: nothing raised
+        with pytest.raises(session_window.WindowSignalled, match="^stopped by SIGTERM$"):
+            session_window._run_node(cast("Any", node), datetime.now(UTC) + timedelta(seconds=60))
+    assert node.stops == 1
+
+
+def test_a_signals_stop_past_its_bound_names_the_node_left_running(monkeypatch) -> None:
+    """Review: on the cancel path a stop that timed out was reported only as stopped by the signal."""
+    import signal as signal_module
+
+    class Signalled(Hung):
+        async def run_async(self) -> None:
+            session_window._SIGNALS.handle(signal_module.SIGTERM, None)
+            await super().run_async()
+
+    monkeypatch.setattr(session_window, "_ABANDONED", [])
+    monkeypatch.setattr(session_window, "STOP_TIMEOUT_SECS", 0.2)
+    node = Signalled()
+    with (
+        session_window.window_signals(),
+        pytest.raises(session_window.WindowSignalled, match="left running"),
+    ):
+        session_window._run_node(cast("Any", node), datetime.now(UTC) + timedelta(seconds=60))
+    assert node.stops == 1 and len(session_window._ABANDONED) == 1
+
+
+def test_a_window_stopped_by_a_signal_exits_as_a_shell_would_for_it(monkeypatch, tmp_path) -> None:
+    """Review: `WindowSignalled` is a KeyboardInterrupt, which CPython ends by killing itself with SIGINT,
+    whatever the signal was; the window exits 128 + the signal's number instead."""
+    import signal as signal_module
+
+    def signalled(config, **kwargs):
+        session_window._SIGNALS.handle(signal_module.SIGTERM, None)
+
+    monkeypatch.setattr(session_window, "_ABANDONED", [])
+    monkeypatch.setattr(session_window, "run_window", signalled)
+    assert session_window.main(["--log-dir", str(tmp_path)]) == 128 + signal_module.SIGTERM

@@ -282,11 +282,28 @@ lock_wait 9 "$lockwait" || { echo "paper:test: account A's lock stayed held for 
 # TEST_ROOM_SECS would be left (the conftests' stream-lock block)
 export CANON_ALPACA_STREAM_LOCK="${tmp}canon-alpaca-stream-tests.lock" CANON_PAPER_TEST_DEADLINE=$((start + deadline))
 # bounded <secs> <command...>: the command under timeout(1) -s KILL, in the process group timeout leads, with
-# its whole group killed on a stop and once it ends (the note above paper:test)
+# its whole group killed on a stop and once it ends (the note above paper:test). With `stopgrace` set, a stop is
+# first passed on as SIGTERM to timeout, which passes a signal it gets to its group (`man timeout`), and the
+# group gets `stopgrace` s to end before the kill, so a window's own stop and wind-down run (session_window,
+# `STOP_GRACE_SECS`); further stops are ignored meanwhile, and nothing is started to time the grace.
 bounded() {
-  b=$1; shift; g=""
+  b=$1; shift; g=""; stopping=""
   # traps first, so a stop at any point after this ends what has started; `g` is timeout's pid, and its group's
-  stop() { [ -z "$g" ] || kill -KILL -- "-$g" 2>/dev/null || kill -KILL "$g" 2>/dev/null; exit "$1"; }
+  stop() {
+    # a stop while one is under way is only noted: the traps stay as they are, since /bin/sh (bash 3.2) kills
+    # itself with a trap changed from inside that trap ("run_pending_traps: bad value", seen 2026-11-12)
+    [ -z "$stopping" ] || return 0; stopping=1
+    if [ -n "$g" ] && [ -n "${stopgrace:-}" ]; then
+      kill -TERM "$g" 2>/dev/null || :
+      # until timeout has ended: gone, or its zombie (ps STAT Z), which `kill -0` would count as running
+      se=$(( $(/bin/date +%s) + stopgrace ))
+      while [ "$(/bin/date +%s)" -lt "$se" ]; do
+        case "$(/bin/ps -o stat= -p "$g" 2>/dev/null)" in ""|Z*) break ;; esac
+        sleep 1
+      done
+    fi
+    [ -z "$g" ] || kill -KILL -- "-$g" 2>/dev/null || kill -KILL "$g" 2>/dev/null; exit "$1"
+  }
   trap 'stop 143' TERM; trap 'stop 129' HUP; trap 'stop 130' INT
   /usr/bin/timeout -s KILL "$b" "$@" & g=$!
   rc=0; wait "$g" || rc=$?
@@ -337,6 +354,8 @@ run = '''
 deadline=6240
 sync=600
 lockwait=900
+# grace: how long a stop gives the window's wind-down before its group is killed (session_window.STOP_GRACE_SECS)
+grace=785
 start=$(/bin/date +%s)
 tmp="$(/usr/bin/getconf DARWIN_USER_TEMP_DIR)" || tmp=""
 case "$tmp" in /*/) ;; *) echo "paper:session: the per-user temporary folder is not known (DARWIN_USER_TEMP_DIR gave '$tmp'), so there is no paper lock or log folder; nothing was placed" >&2; exit 1 ;; esac
@@ -412,11 +431,28 @@ stream() {
   lock_wait 7 "$s" || { echo "paper:session: the market-data stream lock stayed held ($lockwait s for both locks); nothing was placed" >&2; exit 1; }
 }
 # bounded <secs> <command...>: the command under timeout(1) -s KILL, in the process group timeout leads, with
-# its whole group killed on a stop and once it ends (the note above paper:test)
+# its whole group killed on a stop and once it ends (the note above paper:test). With `stopgrace` set, a stop is
+# first passed on as SIGTERM to timeout, which passes a signal it gets to its group (`man timeout`), and the
+# group gets `stopgrace` s to end before the kill, so a window's own stop and wind-down run (session_window,
+# `STOP_GRACE_SECS`); further stops are ignored meanwhile, and nothing is started to time the grace.
 bounded() {
-  b=$1; shift; g=""
+  b=$1; shift; g=""; stopping=""
   # traps first, so a stop at any point after this ends what has started; `g` is timeout's pid, and its group's
-  stop() { [ -z "$g" ] || kill -KILL -- "-$g" 2>/dev/null || kill -KILL "$g" 2>/dev/null; exit "$1"; }
+  stop() {
+    # a stop while one is under way is only noted: the traps stay as they are, since /bin/sh (bash 3.2) kills
+    # itself with a trap changed from inside that trap ("run_pending_traps: bad value", seen 2026-11-12)
+    [ -z "$stopping" ] || return 0; stopping=1
+    if [ -n "$g" ] && [ -n "${stopgrace:-}" ]; then
+      kill -TERM "$g" 2>/dev/null || :
+      # until timeout has ended: gone, or its zombie (ps STAT Z), which `kill -0` would count as running
+      se=$(( $(/bin/date +%s) + stopgrace ))
+      while [ "$(/bin/date +%s)" -lt "$se" ]; do
+        case "$(/bin/ps -o stat= -p "$g" 2>/dev/null)" in ""|Z*) break ;; esac
+        sleep 1
+      done
+    fi
+    [ -z "$g" ] || kill -KILL -- "-$g" 2>/dev/null || kill -KILL "$g" 2>/dev/null; exit "$1"
+  }
   trap 'stop 143' TERM; trap 'stop 129' HUP; trap 'stop 130' INT
   /usr/bin/timeout -s KILL "$b" "$@" & g=$!
   rc=0; wait "$g" || rc=$?
@@ -473,6 +509,7 @@ window() {
   left=$((deadline - ($(/bin/date +%s) - start)))
   [ "$left" -gt 0 ] || { echo "paper:session: no time left before the deadline" >&2; exit 1; }
   wrc=0
+  stopgrace=$grace
   bounded "$left" uv run --locked ${CANON_COMMIT:+--exact} python -m canon_trading.session_window --log-dir "${tmp}canon-paper-session" "$@" || wrc=$?
   kept logs
   exit "$wrc"
