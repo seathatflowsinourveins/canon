@@ -54,6 +54,7 @@ cat > "$B/mise" <<'EOF'
 echo "mise $* | env=${MISE_ENV:-}" >> "$STUB/mise.log"
 gf() { printf '%s/global/%s' "$STUB" "$(printf '%s' "$1" | tr '/:@' '___')"; }
 case "$1" in
+  trust) exit "$(cat "$STUB/untrust-rc" 2>/dev/null || echo 0)" ;;
   --version) cat "$STUB/mise-version" 2>/dev/null || echo "2026.11.5 macos-arm64 (2026-11-09)"; exit 0 ;;
   self-update) [ ! -f "$STUB/self-update-rc" ] || { echo "mise ERROR stand-in self-update failed" >&2; exit "$(cat "$STUB/self-update-rc")"; }
                echo "${!#} macos-arm64 (stand-in)" > "$STUB/mise-version"; exit 0 ;;
@@ -78,8 +79,9 @@ cat > "$B/launchctl" <<'EOF'
 echo "launchctl $*" >> "$STUB/launchctl.log"
 mkdir -p "$STUB/loaded"
 case "${1:-}" in
-  print) [ -f "$STUB/loaded/${2##*/}" ] || exit 113; printf '\tstate = %s\n\tlast exit code = 0\n' "$(cat "$STUB/loaded/${2##*/}")" ;;
+  print) [ -f "$STUB/loaded/${2##*/}" ] || exit 113; printf '\tstate = %s\n\tlast exit code = %s\n' "$(cat "$STUB/loaded/${2##*/}")" "$(cat "$STUB/last-exit-${2##*/}" 2>/dev/null || echo 0)" ;;
   bootout) l=${2##*/}; [ -f "$STUB/loaded/$l" ] || { echo "Boot-out failed: 3: No such process" >&2; exit 3; }
+           if [ "$l" = local.canon.movers-recorder ] && [ -f "$STUB/refuse-recorder-bootout" ]; then echo 'Boot-out refused (stand-in)' >&2; exit 5; fi
            if [ -f "$STUB/pgid-$l" ]; then kill -TERM -- "-$(cat "$STUB/pgid-$l")" 2>/dev/null; fi
            rm -f "$STUB/loaded/$l" ;;
   bootstrap) l=$(basename "${3:-}" .plist); [ ! -f "$STUB/loaded/$l" ] || { echo "Bootstrap failed: 5: Input/output error" >&2; exit 5; }
@@ -128,6 +130,7 @@ cat > "$OW/scripts/automation" <<'EOF'
 #!/bin/bash
 echo "automation $* | pgid=$(ps -o pgid= -p $$ | tr -d ' ') | cfg=${CLAUDE_CONFIG_DIR:-}" >> "$STUB/installers.log"
 case "$1" in
+  recorder-lock-path) cat "$STUB/recorder-lock-path" 2>/dev/null || echo "$CLAUDE_CONFIG_DIR/canon/movers-checkout.recorder.lock"; exit 0 ;;
   differs) [ ! -f "$STUB/differs-slow" ] || sleep 5
            [ ! -f "$STUB/differs-takes-lock" ] || "$STUB/takelock" "$(cat "$STUB/differs-takes-lock")"
            cat "$STUB/differs-out" 2>/dev/null; exit "$(cat "$STUB/differs-rc" 2>/dev/null || echo 0)" ;;
@@ -143,7 +146,7 @@ case "$1" in
     if /usr/bin/lockf -k -t 0 "$CLAUDE_CONFIG_DIR/canon/paper-checkout.lock" true 2>/dev/null; then echo "install: paper-checkout lock free" >> "$STUB/installers.log"
     else echo "install: paper-checkout lock held" >> "$STUB/installers.log"; fi
     d="gui/$(id -u)"
-    for l in local.canon.maintenance local.canon.lanes-watch local.canon.paper-session local.canon.otel-collector local.canon.omniroute; do
+    for l in local.canon.maintenance local.canon.lanes-watch local.canon.paper-session local.canon.movers-recorder local.canon.otel-collector local.canon.omniroute; do
       [ "${2:-}" != --defer-paper ] || [ "$l" != local.canon.paper-session ] || continue
       launchctl bootout "$d/$l" 2>/dev/null
       sleep "$(cat "$STUB/install-secs" 2>/dev/null || echo 0)"
@@ -267,7 +270,7 @@ rm -f "$STUB/bootstrap-rc" "$STUB/bootstrap-out"
 # the reinstall the agent starts: it unloads the agent's own job (whose process group the stand-in launchctl
 # kills) and the round's group is killed once it ends; the reinstall must still finish and load all five
 mkdir -p "$STUB/loaded"
-for l in local.canon.maintenance local.canon.lanes-watch local.canon.paper-session local.canon.otel-collector local.canon.omniroute; do echo running > "$STUB/loaded/$l"; done
+for l in local.canon.maintenance local.canon.lanes-watch local.canon.paper-session local.canon.movers-recorder local.canon.otel-collector local.canon.omniroute; do echo running > "$STUB/loaded/$l"; done
 printf 'automation: %s/Library/LaunchAgents/local.canon.maintenance.plist differs from what install writes\n' "$H" > "$STUB/differs-out"
 # the stand-in reinstall waits for install-go, so "at once" means before it ends, however loaded the machine;
 # the compare takes 5 s, as on a loaded machine
@@ -277,8 +280,8 @@ check "the reinstall started by the agent: the round ends at once, with the rein
 : > "$STUB/install-go"; settled; rm -f "$STUB/install-waits" "$STUB/install-go"
 check "... it completes, though its own job was booted out and the round's process group killed" \
       eval 'grep -q "^install finished" "$STUB/installers.log" && jqt "$MS" ".install.state == \"done\" and (.installed | index(\"automation install\")) != null"'
-check "... and leaves all five agents loaded" \
-      eval '[ "$(ls "$STUB/loaded" | wc -l | tr -d " ")" = 5 ]'
+check "... and leaves all six agents loaded" \
+      eval '[ "$(ls "$STUB/loaded" | wc -l | tr -d " ")" = 6 ]'
 check "... holding the windows' lock while it installs, so no window starts meanwhile, and no other paper lock" \
       eval 'grep -qx "install: paper-windows lock held" "$STUB/installers.log" && grep -qx "install: paper-test lock free" "$STUB/installers.log" && grep -qx "install: alpaca-stream-tests lock free" "$STUB/installers.log" && grep -qx "install: alpaca-stream-windows lock free" "$STUB/installers.log"'
 check "... and letting it go once it ends" freed "${LT}canon-paper-windows.lock"
@@ -313,9 +316,22 @@ check "a compare that failed: FAILED, and the install tried is not forgotten" jq
 mv "$TMP/differs-out.kept" "$STUB/differs-out"; echo 1 > "$STUB/differs-rc"
 echo 3c > "$OW/tracked"; ocommit timed-out; echo 1 > "$STUB/install-secs"; logs_clear; STEP_SECS=2 round; settled
 check "an install that timed out: FAILED, timeout named" jqt "$MS" '.install.state == "failed" and .tried.timeout == true and (.failed | index("automation install (timeout after 2 s)")) != null'
-rm -f "$STUB/install-secs"; for l in local.canon.maintenance local.canon.lanes-watch local.canon.paper-session local.canon.otel-collector local.canon.omniroute; do echo running > "$STUB/loaded/$l"; done
+rm -f "$STUB/install-secs"; for l in local.canon.maintenance local.canon.lanes-watch local.canon.paper-session local.canon.movers-recorder local.canon.otel-collector local.canon.omniroute; do echo running > "$STUB/loaded/$l"; done
 logs_clear; round; settled
 check "... retried at the next round, at the same origin/main" eval 'grep -q "^automation install" "$STUB/installers.log" && jqt "$MS" ".install.state == \"done\""'
+echo 'automation: movers recorder differs' > "$STUB/differs-out"
+echo 3-recorder > "$OW/tracked"; ocommit recorder-deferral
+printf '  deferred   movers recorder: a recorder is running; retry at a later maintenance round\n' > "$STUB/install-out"
+logs_clear; round; settled
+check "recorder deferred by install: recorded as unfinished, eligible for another maintenance round" \
+      jqt "$MS" '.install.state == "done" and .tried.result == "deferred" and .install.deferred == ["movers recorder"] and .outcome == "ok"'
+logs_clear; round; settled
+check "recorder still busy: maintenance retries the same main and differences within the day" \
+      eval 'grep -q "^automation install" "$STUB/installers.log" && jqt "$MS" '\''.tried.result == "deferred"'\'''
+rm -f "$STUB/install-out"; logs_clear; round; settled
+check "recorder becomes idle: maintenance retries, finishes and clears the deferral" \
+      eval 'grep -q "^automation install" "$STUB/installers.log" && jqt "$MS" '\''.tried.result == "done" and .install.deferred == []'\'''
+printf 'automation: %s/Library/LaunchAgents/local.canon.maintenance.plist differs from what install writes\n' "$H" > "$STUB/differs-out"
 echo 3d > "$OW/tracked"; ocommit window-meanwhile; echo "${LT}canon-paper-windows.lock" > "$STUB/differs-takes-lock"; logs_clear; round
 settled
 check "a window that took its lock during the compare: the install runs at once without the paper section, nothing deferred" \
@@ -467,6 +483,14 @@ check "... and mise's own pin: mise self-update to that version, plugins left al
 check "... the tools already at their pins left alone" eval '[ "$(grep -c "^mise use " "$STUB/mise.log")" = 1 ]'
 logs_clear; round
 check "... and the next round, at the pins, updates nothing" eval '! grep -Eq "^mise (use|self-update)" "$STUB/mise.log" && jqt "$MS" ".pins[0:2] == [\"mise: at 2026.11.6\", \"codex: at 0.167.1\"]"'
+echo '2026.11.5 macos-arm64 (stand-in)' > "$STUB/mise-version"
+echo "$AH/canon/renamed-recorder.lock" > "$STUB/recorder-lock-path"
+"$STUB/takelock" "$AH/canon/renamed-recorder.lock"; logs_clear; round
+check "recorder running: maintenance leaves the mise binary at its current pin" \
+      eval '! grep -q "^mise self-update" "$STUB/mise.log" && jqt "$MS" '\''(.pins | map(test("^mise: .*recorder")) | any)'\'''
+release "$AH/canon/renamed-recorder.lock"; logs_clear; round
+check "recorder ended: maintenance applies the waiting mise pin" \
+      grep -q '^mise self-update --yes --no-plugins 2026.11.6 ' "$STUB/mise.log"
 oreg pnpm tag:v10.35.0; echo 8 > "$OW/tracked"; ocommit pnpm-moved; echo 1 > "$STUB/use-rc"; logs_clear; round
 check "an update that fails: FAILED by name, with mise's message" \
       eval 'jqt "$MS" ".outcome == \"failed\" and (.failed | index(\"pin pnpm: mise use pnpm@10.35.0 exited 1: mise ERROR stand-in could not install pnpm@10.35.0\")) != null"'
@@ -636,6 +660,429 @@ echo running > "$STUB/loaded/local.canon.omniroute"; rm -f "$STUB/gw-code"; asta
 check "... nothing answering: FAILED, naming the log" eval 'rowis "$TMP/stat.out" "omniroute gateway" FAILED && grep -q "omniroute.log" "$TMP/stat.out"'
 rm -f "$GP"; astat
 check "... no agent written: absent, not counted against status" rowis "$TMP/stat.out" "omniroute gateway" absent
+
+# The movers recorder uses the existing data-only screener, never an execution client. Both launchctl and
+# mise below are stand-ins; the checkout helper fetches only the local bare origin made above.
+echo "movers recorder:"
+RP="$LA/local.canon.movers-recorder.plist"; RS="$W/movers-recorder.json"
+ainst AUTOMATION_SKIP_LAUNCHD=1; rc=$?
+check "recorder install: its runner and launchd plist are written" \
+      eval '[ "$rc" = 0 ] && [ -f "$RP" ] && cmp -s "$ROOT/scripts/automation" "$AH/canon/movers-recorder.sh"'
+check "recorder plist: an interval, with the installed runner, its own checkout and the origin" \
+      eval '[ "$(plutil -extract StartInterval raw -o - "$RP" 2>/dev/null)" = 60 ] && [ "$(plutil -extract RunAtLoad raw -o - "$RP" 2>/dev/null)" = false ] && [ "$(plutil -extract ProgramArguments.1 raw -o - "$RP" 2>/dev/null)" = "$AH/canon/movers-recorder.sh" ] && [ "$(plutil -extract ProgramArguments.2 raw -o - "$RP" 2>/dev/null)" = record-movers ] && [ "$(plutil -extract ProgramArguments.4 raw -o - "$RP" 2>/dev/null)" = "$AH/canon/movers-checkout" ] && [ "$(plutil -extract ProgramArguments.5 raw -o - "$RP" 2>/dev/null)" = "$O" ]'
+adiff AUTOMATION_SKIP_LAUNCHD=1
+check "recorder just installed: no recorder difference" \
+      eval '! grep -q "^automation: .*movers-" "$TMP/diff.out"'
+if [ -f "$AH/canon/movers-recorder.sh" ]; then
+  echo '# changed on main' >> "$A/scripts/automation"
+  adiff AUTOMATION_SKIP_LAUNCHD=1
+  check "recorder changed on main: maintenance sees its runner difference" \
+        grep -q '^automation: .*movers-recorder.sh differs' "$TMP/diff.out"
+  cp "$ROOT/scripts/automation" "$A/scripts/automation"
+  mkdir -p "$STUB/loaded"; ainst; logs_clear; ainst
+  check "recorder reinstall: an unchanged job is kept running" \
+        eval 'grep -q "kept .*local.canon.movers-recorder loaded" "$TMP/inst.out" && ! grep -q "bootout.*local.canon.movers-recorder" "$STUB/launchctl.log"'
+  rm -f "$RP"; git -C "$A" remote set-url origin 'https://example.invalid/canon.git?query=fixture'
+  ainst AUTOMATION_SKIP_LAUNCHD=1; rc=$?
+  check "recorder install rejects an origin the checkout helper refuses, without writing its plist" \
+        eval '[ "$rc" != 0 ] && [ ! -f "$RP" ]'
+  git -C "$A" remote set-url origin "$O"; ainst
+  echo '# force a recorder update' >> "$A/scripts/automation"
+  : > "$STUB/refuse-recorder-bootout"; : > "$AH/canon/movers-checkout/keep-until-unloaded"
+  rsum=$(cksum < "$AH/canon/movers-recorder.sh"); psum=$(cksum < "$RP")
+  ainst; rc=$?
+  check "recorder refused unload: runner, plist and clone are untouched before replacement" \
+        eval '[ "$rc" != 0 ] && [ "$(cksum < "$AH/canon/movers-recorder.sh")" = "$rsum" ] && [ "$(cksum < "$RP")" = "$psum" ] && [ -f "$AH/canon/movers-checkout/keep-until-unloaded" ]'
+  rm -f "$STUB/refuse-recorder-bootout"; cp "$ROOT/scripts/automation" "$A/scripts/automation"; ainst
+  git -C "$A" remote set-url origin 'https://example.invalid/canon.git?query=fixture'
+  ainst; rc=$?
+  check "recorder refused origin: an earlier plist is removed and its job unloaded" \
+        eval '[ "$rc" != 0 ] && [ ! -e "$RP" ] && [ ! -e "$STUB/loaded/local.canon.movers-recorder" ]'
+  git -C "$A" remote set-url origin "$O"; ainst
+  mv "$AH/canon/paper-session.sh" "$TMP/shared-helper.saved"
+  rm -f "$AH/canon/movers-checkout.sh"
+  env -i HOME="$H" PATH="$B:/usr/bin:/bin:/usr/sbin:/sbin" STUB="$STUB" CLAUDE_CONFIG_DIR="$AH" CANON_GETCONF="$B/getconf" \
+      "$A/scripts/automation" install --defer-paper > "$TMP/inst.out" 2>&1; rc=$?
+  check "recorder install with paper deferred: its checkout helper is installed independently" \
+        eval '[ "$rc" = 0 ] && cmp -s "$A/home/.claude/canon/paper-session.sh" "$AH/canon/movers-checkout.sh"'
+  mv "$TMP/shared-helper.saved" "$AH/canon/paper-session.sh"; ainst
+
+  # date has a controlled epoch but still performs the real America/New_York conversion. The mise stand-in
+  # advances that clock by the number of polls requested, so a whole day's loop takes no real minutes.
+  cat > "$B/recorder-date" <<'EOF'
+#!/bin/bash
+if [ "${1:-}" = -j ]; then exec /bin/date "$@"; fi
+[ ! -f "$STUB/recorder-date-fails" ] || exit 1
+exec /bin/date -r "$(cat "$STUB/recorder-clock")" "$@"
+EOF
+  cat > "$B/recorder-mise" <<'EOF'
+#!/bin/bash
+printf '%s | cwd=%s | auto=%s | ceiling=%s\n' "$*" "$PWD" "${MISE_TASK_RUN_AUTO_INSTALL:-}" "${MISE_CEILING_PATHS:-}" >> "$STUB/recorder-calls"
+case "$*" in *'paper:data movers-screener --minutes '*) ;; *) exit 92 ;; esac
+n=${!#}
+if [ -f "$STUB/recorder-probe-fd" ]; then
+  if { true >&9; } 2>/dev/null; then echo batch-inherited >> "$STUB/recorder-fds"
+  else echo batch-closed >> "$STUB/recorder-fds"; fi
+fi
+if [ -f "$STUB/recorder-leave-uv" ]; then
+  /bin/sleep 2 < /dev/null > /dev/null 2>&1 &
+  echo $! > "$STUB/recorder-leftover-pid"
+  exit 7
+fi
+if [ -f "$STUB/recorder-observe-term" ]; then
+  trap 'echo stopped > "$STUB/recorder-term-seen"; exit 143' TERM HUP INT
+fi
+if [ -f "$STUB/recorder-block" ]; then
+  echo $$ > "$STUB/recorder-batch-pid"
+  for _ in $(seq 1 600); do [ ! -f "$STUB/recorder-block" ] && break; sleep 0.05; done
+  [ ! -f "$STUB/recorder-block" ] || exit 93
+fi
+elapsed=$((n * 60))
+if [ -f "$STUB/recorder-overhead" ]; then
+  elapsed=$(((n - 1) * 60 + $(cat "$STUB/recorder-overhead")))
+  last=""; limit=""
+  for a in "$@"; do [ "$last" != --timeout ] || { limit=${a%s}; break; }; last=$a; done
+  [ -n "$limit" ] || exit 95
+  if [ "$elapsed" -gt "$limit" ]; then
+    echo "$(( $(cat "$STUB/recorder-clock") + limit ))" > "$STUB/recorder-clock"; exit 124
+  fi
+fi
+echo "$(( $(cat "$STUB/recorder-clock") + elapsed ))" > "$STUB/recorder-clock"
+if [ -f "$STUB/recorder-restore-origin" ]; then
+  origin=$(cat "$STUB/recorder-restore-origin")
+  mv "$origin.offline" "$origin" || exit 96
+  rm "$STUB/recorder-restore-origin"
+fi
+[ ! -f "$STUB/recorder-date-after-batch" ] || : > "$STUB/recorder-date-fails"
+exit "$(cat "$STUB/recorder-rc" 2>/dev/null || echo 0)"
+EOF
+  chmod +x "$B/recorder-date" "$B/recorder-mise"
+  rclock() { TZ=America/New_York /bin/date -j -f '%Y-%m-%d %H:%M:%S' "$1" +%s > "$STUB/recorder-clock"; }
+  rrun() { env -i HOME="$H" PATH=/usr/bin:/bin:/usr/sbin:/sbin TZ=UTC STUB="$STUB" CLAUDE_CONFIG_DIR="$AH" CANON_RECORDER_DATE="$B/recorder-date" CANON_LOCKF="${RECORDER_TEST_LOCKF:-/usr/bin/lockf}" \
+                 CANON_RECORDER_LOCK_SECS="${RECORDER_TEST_LOCK_SECS:-3}" \
+                 /bin/bash "$AH/canon/movers-recorder.sh" record-movers "$B/recorder-mise" "${RECORDER_TEST_DIR:-$AH/canon/movers-checkout}" "${1:-$O}" > "$TMP/recorder.out" 2>&1; }
+  rreset() { rm -f "$RS" "$STUB/recorder-calls" "$STUB/recorder-rc" "$STUB/recorder-date-fails" "$STUB/recorder-date-after-batch"; }
+  recorder_ceiling=$(cd "$AH/canon" && pwd -P)
+  rwait() { local i; for i in $(seq 1 600); do [ -s "$STUB/recorder-batch-pid" ] && return 0; sleep 0.05; done; return 1; }
+  rholders="$HOLDERS"
+  rreset; rclock '2026-11-11 17:10:00'; echo 7 > "$STUB/recorder-rc"; : > "$STUB/recorder-block"
+  env -i HOME="$H" PATH=/usr/bin:/bin:/usr/sbin:/sbin TZ=UTC STUB="$STUB" CLAUDE_CONFIG_DIR="$AH" CANON_RECORDER_DATE="$B/recorder-date" \
+      /usr/bin/timeout 120 /bin/bash "$AH/canon/movers-recorder.sh" record-movers "$B/recorder-mise" "$AH/canon/movers-checkout" "$O" > "$TMP/recorder.out" 2>&1 &
+  recorder_pid=$!; HOLDERS="$HOLDERS $recorder_pid"
+  rwait || t_fail "recorder batch reached its controlled wait"
+  HOLDERS="$HOLDERS $(cat "$STUB/recorder-batch-pid" 2>/dev/null)"
+  echo "$recorder_pid" > "$STUB/pgid-local.canon.movers-recorder"
+  echo '# changed during an active recorder batch' >> "$A/scripts/automation"
+  rsum=$(cksum < "$AH/canon/movers-recorder.sh"); psum=$(cksum < "$RP"); logs_clear
+  ainst; rc=$?
+  check "recorder install during a batch: deferred, runner and plist untouched, job never unloaded" \
+        eval '[ "$rc" = 0 ] && [ "$(cksum < "$AH/canon/movers-recorder.sh")" = "$rsum" ] && [ "$(cksum < "$RP")" = "$psum" ] && ! grep -q "bootout.*local.canon.movers-recorder" "$STUB/launchctl.log" && grep -q "deferred .*movers recorder" "$TMP/inst.out"'
+  rm -f "$STUB/pgid-local.canon.movers-recorder" "$STUB/recorder-block"; rc=0; wait "$recorder_pid" || rc=$?
+  freed "$AH/canon/movers-checkout.recorder.lock" 300 || t_fail "recorder batch released its inherited lock"
+  HOLDERS="$rholders"
+  check "recorder install leaves the wrapper alive to record a failed batch and end its firing" \
+        eval '[ "$rc" = 7 ] && jqt "$RS" '\''.outcome == "failed" and .exit_code == 7'\'''
+  rrun; rc=$?
+  check "recorder after concurrent install: the next firing tries the batch again" \
+        eval '[ "$rc" = 7 ] && [ "$(wc -l < "$STUB/recorder-calls" | tr -d " ")" = 2 ]'
+  ainst; rc=$?
+  check "recorder install after the loop ends: pending runner update is installed" \
+        eval '[ "$rc" = 0 ] && cmp -s "$A/scripts/automation" "$AH/canon/movers-recorder.sh"'
+  cp "$ROOT/scripts/automation" "$A/scripts/automation"; ainst
+  rm -f "$STUB/recorder-batch-pid"
+
+  # Pause install's existing checkout helper, then try a firing from the other side of the race. The
+  # wrapper must skip without a failed-day record while install owns the shared recorder lock.
+  cp "$A/home/.claude/canon/paper-session.sh" "$TMP/paper-helper.saved"
+  cat > "$A/home/.claude/canon/paper-session.sh" <<'EOF'
+#!/bin/bash
+case "$3" in
+  */movers-checkout)
+    if [ -f "$STUB/recorder-preflight-block" ]; then
+      exec 8>>"$3.lock"; /usr/bin/lockf -t 0 8 || exit 94
+      : > "$STUB/recorder-preflight-started"
+      for _ in $(seq 1 600); do [ ! -f "$STUB/recorder-preflight-block" ] && break; sleep 0.05; done
+      exit 0
+    fi ;;
+esac
+exec /bin/bash "$STUB/../paper-helper.saved" "$@"
+EOF
+  rreset; rclock '2026-11-11 19:58:00'; : > "$STUB/recorder-preflight-block"
+  rholders="$HOLDERS"
+  env -i HOME="$H" PATH="$B:/usr/bin:/bin:/usr/sbin:/sbin" STUB="$STUB" CLAUDE_CONFIG_DIR="$AH" CANON_GETCONF="$B/getconf" \
+      "$A/scripts/automation" install --defer-paper > "$TMP/inst.out" 2>&1 &
+  install_pid=$!; HOLDERS="$HOLDERS $install_pid"
+  for _ in $(seq 1 600); do [ -f "$STUB/recorder-preflight-started" ] && break; sleep 0.05; done
+  [ -f "$STUB/recorder-preflight-started" ] || t_fail "recorder install preflight reached its controlled wait"
+  rrun; rc=$?
+  check "recorder firing during install preflight: named recorder lock failure without a data task" \
+        eval '[ "$rc" != 0 ] && [ ! -s "$STUB/recorder-calls" ] && jqt "$RS" '\''.outcome == "failed" and (.note | contains("recorder_lock_held"))'\'''
+  rm -f "$STUB/recorder-preflight-block"; wait "$install_pid" || t_fail "recorder install preflight completed"
+  HOLDERS="$rholders"
+  cp "$TMP/paper-helper.saved" "$A/home/.claude/canon/paper-session.sh"; ainst
+  # Outside the window a held recorder lock (maintenance's mise self-update, an install) is no failure: the
+  # firing has nothing to record, so it ends idle and adds nothing to the failure count.
+  rreset; rclock '2026-11-14 10:00:00'
+  /usr/bin/lockf -k "$AH/canon/movers-checkout.recorder.lock" /bin/sleep 30 & lholder=$!
+  for _ in $(seq 1 100); do /usr/bin/lockf -t 0 "$AH/canon/movers-checkout.recorder.lock" /usr/bin/true || break; sleep 0.05; done
+  rrun; rc=$?
+  check "recorder lock held on a weekend: the firing ends idle, not failed, with no failure counted" \
+        eval '[ "$rc" = 0 ] && [ ! -s "$STUB/recorder-calls" ] && jqt "$RS" '\''.outcome == "idle" and ((.consecutive_failed_firings // 0) == 0)'\'''
+  kill "$lholder" 2>/dev/null; wait "$lholder" 2>/dev/null
+  rreset; rclock '2026-11-11 03:59:00'; rrun; rc=$?
+  check "recorder before 04:00 New York: no task, even with a UTC caller" \
+        eval '[ "$rc" = 0 ] && [ ! -s "$STUB/recorder-calls" ] && jqt "$RS" '\''.outcome == "idle"'\'''
+  rreset; rclock '2026-11-11 04:00:00'; echo 7 > "$STUB/recorder-rc"; rrun; rc=$?
+  check "recorder at 04:00: at most 80 polls, data-only choice, its own main checkout; failure stops it" \
+        eval '[ "$rc" = 7 ] && [ "$(wc -l < "$STUB/recorder-calls" | tr -d " ")" = 1 ] && grep -q "paper:data movers-screener --minutes 80 | cwd=$AH/canon/movers-checkout | auto=false | ceiling=$recorder_ceiling" "$STUB/recorder-calls" && jqt "$RS" '\''.outcome == "failed" and .exit_code == 7 and (.commit | length) == 40'\'''
+  rrun; rc=$?
+  check "recorder failure: later interval firings restart it that New York day" \
+        eval '[ "$rc" = 7 ] && [ "$(wc -l < "$STUB/recorder-calls" | tr -d " ")" = 2 ]'
+  rm -f "$STUB/recorder-rc"; rclock '2026-11-12 19:20:00'; rrun; rc=$?
+  check "recorder next weekday: resumes, shortens its final batch and logs the reserved tail" \
+        eval '[ "$rc" = 0 ] && [ "$(wc -l < "$STUB/recorder-calls" | tr -d " ")" = 3 ] && grep -q "paper:data movers-screener --minutes 18 " <<<"$(tail -1 "$STUB/recorder-calls")" && jqt "$RS" '\''.outcome == "ok" and .day == "2026-11-12"'\'' && grep -q "recording gap" "$TMP/recorder.out"'
+  rreset; rclock '2026-11-11 17:10:00'; rrun; rc=$?
+  check "recorder successful batches run back to back, then a shortened final batch" \
+        eval '[ "$rc" = 0 ] && [ "$(wc -l < "$STUB/recorder-calls" | tr -d " ")" = 2 ] && [ "$(grep -c "screener --minutes 80 " "$STUB/recorder-calls")" = 1 ] && grep -q "screener --minutes 68 " <<<"$(tail -1 "$STUB/recorder-calls")"'
+  # These fixtures are an hour boundary and weekends, not market-holiday coverage.
+  for when in '2026-11-11 20:00:00' '2026-11-14 12:00:00' '2026-07-04 12:00:00'; do
+    rreset; rclock "$when"; rrun; rc=$?
+    check "recorder outside its weekday window ($when): no task" \
+          eval '[ "$rc" = 0 ] && [ ! -s "$STUB/recorder-calls" ]'
+  done
+  holiday='2026-11-26'
+  check "recorder holiday fixture names a weekday, rather than the original Saturday" \
+        eval '[ "$(TZ=America/New_York /bin/date -j -f %Y-%m-%d "$holiday" +%u)" -lt 6 ]'
+  rreset; rclock "$holiday 04:00:00"; rrun; rc=$?
+  check "recorder weekday holiday: the stated weekday policy records the full window without a calendar gate" \
+        eval '[ "$rc" = 0 ] && [ -f "$STUB/recorder-calls" ] && [ "$(wc -l < "$STUB/recorder-calls" | tr -d " ")" = 12 ] && jqt "$RS" '\''.outcome == "ok"'\'''
+  # The fixture represents an early-close afternoon; the recorder intentionally has no calendar input.
+  rreset; rclock '2026-11-27 17:10:00'; rrun; rc=$?
+  check "recorder early-close afternoon keeps the weekday polling policy" \
+        eval '[ "$rc" = 0 ] && [ -s "$STUB/recorder-calls" ]'
+  rreset; rclock '2026-11-11 19:20:00'
+  saved_head=$(git -C "$AH/canon/movers-checkout" rev-parse HEAD)
+  mv "$O" "$O.offline"; rrun; rc=$?; mv "$O.offline" "$O"
+  check "recorder fetch failure: runs the last good commit and names fetch_failed in its status" \
+        eval '[ "$rc" = 0 ] && [ -s "$STUB/recorder-calls" ] && [ "$(git -C "$AH/canon/movers-checkout" rev-parse HEAD)" = "$saved_head" ] && jqt "$RS" ".commit == \"$saved_head\" and (.note | contains(\"fetch_failed, ran at ${saved_head:0:12}\"))"'
+  rreset; rclock '2026-11-11 19:20:00'; RECORDER_TEST_DIR="$TMP/no-good-clone" rrun "$TMP/missing-origin"; rc=$?
+  check "recorder fetch failure without a good clone: named failure ends the firing" \
+        eval '[ "$rc" != 0 ] && [ ! -s "$STUB/recorder-calls" ] && jqt "$RS" '\''.outcome == "failed" and (.note | contains("checkout_failed"))'\'''
+  rreset; rclock '2026-11-11 19:20:00'
+  "$STUB/takelock" "$AH/canon/movers-checkout.lock"
+  (sleep 1; : > "$STUB/release") & release_pid=$!
+  rrun; rc=$?; wait "$release_pid"; release "$AH/canon/movers-checkout.lock"
+  check "recorder checkout lock: waits for a leftover uv and then runs" \
+        eval '[ "$rc" = 0 ] && [ -s "$STUB/recorder-calls" ]'
+  rreset; rclock '2026-11-11 19:20:00'
+  "$STUB/takelock" "$AH/canon/movers-checkout.lock"
+  s0=$(date +%s); RECORDER_TEST_LOCK_SECS=1 rrun; rc=$?; took=$(( $(date +%s) - s0 ))
+  release "$AH/canon/movers-checkout.lock"
+  check "recorder checkout lock: bounded wait ends the firing by name" \
+        eval '[ "$rc" != 0 ] && [ "$took" -ge 1 ] && [ "$took" -lt 15 ] && [ ! -s "$STUB/recorder-calls" ] && jqt "$RS" '\''.outcome == "failed" and (.note | contains("checkout_lock_timeout"))'\'''
+  rclock '2026-11-11 19:20:00'; rrun; rc=$?
+  check "recorder checkout lock: next firing starts fresh after the lock is released" \
+        eval '[ "$rc" = 0 ] && [ -s "$STUB/recorder-calls" ]'
+  for moment in initial after-batch; do
+    rreset; rclock '2026-11-11 19:20:00'; wall_start=$(date +%s)
+    if [ "$moment" = initial ]; then : > "$STUB/recorder-date-fails"
+    else : > "$STUB/recorder-date-after-batch"; fi
+    rrun; rc=$?
+    check "recorder time failure ($moment): fresh named status is written without New York time" \
+          eval '[ "$rc" != 0 ] && jqt "$RS" ".outcome == \"failed\" and .at_epoch >= $wall_start and (.note | contains(\"time_failed\"))"'
+  done
+  rreset; echo 7 > "$STUB/recorder-rc"
+  for attempt in 1 2 3 4; do
+    rclock '2026-11-11 19:20:00'; rrun
+  done
+  check "recorder repeated failures: UNCALIBRATED bound saturates at three without preventing retries" \
+        eval '[ "$(wc -l < "$STUB/recorder-calls" | tr -d " ")" = 4 ] && jqt "$RS" '\''.consecutive_failed_firings == 3 and .failure_bound == 3 and (.note | contains("consecutive_failed_firings_bound (UNCALIBRATED)"))'\'''
+  astat
+  check "recorder repeated failure bound is visible in automation status" \
+        eval 'rowis "$TMP/stat.out" "movers recorder" FAILED && grep -q "consecutive_failed_firings_bound (UNCALIBRATED)" "$TMP/stat.out"'
+  for when in '2026-11-11 19:51:00' '2026-11-11 20:00:00'; do
+    rclock "$when"; rrun; rc=$?
+    check "AGY-1: zero-batch firing ($when) preserves the prior failed outcome and count" \
+          eval '[ "$rc" = 0 ] && jqt "$RS" '\''.outcome == "failed" and .exit_code == 7 and .consecutive_failed_firings == 3'\'''
+  done
+  rm "$STUB/recorder-rc"; rclock '2026-11-11 19:20:00'; rrun; rc=$?
+  check "recorder successful retry: clears the consecutive failure count on the same date" \
+        eval '[ "$rc" = 0 ] && jqt "$RS" '\''.outcome == "ok" and .consecutive_failed_firings == 0'\'''
+  rreset; rclock '2026-11-11 19:58:00'; RECORDER_TEST_LOCKF="$TMP/no-lockf" rrun; rc=$?
+  check "recorder missing lock tool: failed, never reported as an overlapping successful skip" \
+        eval '[ "$rc" != 0 ] && [ ! -s "$STUB/recorder-calls" ] && jqt "$RS" '\''.outcome == "failed"'\'''
+  cp "$ROOT/home/.claude/canon/paper-session.sh" "$STUB/helper-real"
+  for helper in paper-session.sh movers-checkout.sh; do
+    [ -f "$AH/canon/$helper" ] || continue
+    cp "$AH/canon/$helper" "$TMP/$helper.setup-saved"
+    cat > "$AH/canon/$helper" <<'EOF'
+#!/bin/bash
+/bin/bash "$STUB/helper-real" "$@" || exit $?
+case "$(cat "$STUB/setup-fault" 2>/dev/null)" in
+  lock) rm -f "$3.lock"; mkdir "$3.lock" ;;
+  head) rm -f "$3/.git/HEAD" ;;
+esac
+EOF
+  done
+  for fault in lock head; do
+    rreset; rclock '2026-11-11 17:10:00'; echo "$fault" > "$STUB/setup-fault"; rrun; rc=$?
+    check "recorder setup $fault failure is recorded and ends the firing" \
+          eval '[ "$rc" != 0 ] && [ ! -s "$STUB/recorder-calls" ] && jqt "$RS" '\''.outcome == "failed" and .exit_code != 0'\'''
+    [ "$fault" != lock ] || rmdir "$AH/canon/movers-checkout.lock"
+  done
+  rm -f "$STUB/setup-fault"
+  for helper in paper-session.sh movers-checkout.sh; do
+    [ ! -f "$TMP/$helper.setup-saved" ] || cp "$TMP/$helper.setup-saved" "$AH/canon/$helper"
+  done
+  rreset; rclock '2026-11-11 17:10:00'; echo 7 > "$STUB/recorder-rc"; rrun
+  check "recorder failure time is refreshed after an 80-minute batch" \
+        jqt "$RS" ".outcome == \"failed\" and .at_epoch == $(cat "$STUB/recorder-clock")"
+  rreset; rclock '2026-11-11 17:10:00'
+  printf '{"day":"2026-11-11","outcome":"failed","exit_code":0}\n' > "$RS"; rrun; rc=$?
+  check "recorder legacy failed outcome with exit zero does not latch a later firing" \
+        eval '[ "$rc" = 0 ] && [ -s "$STUB/recorder-calls" ]'
+  ln -s "$AH/canon" "$TMP/recorder-parent-link"
+  rreset; rclock '2026-11-11 17:10:00'; RECORDER_TEST_DIR="$TMP/recorder-parent-link/movers-checkout" rrun; rc=$?
+  check "recorder resolves the mise ceiling to the physical parent directory" \
+        eval '[ "$rc" = 0 ] && grep -q "ceiling=$recorder_ceiling$" "$STUB/recorder-calls"'
+  rreset; rclock '2026-11-11 17:10:00'; RECORDER_TEST_DIR="$TMP/recorder:parent/movers-checkout" rrun; rc=$?
+  check "recorder refuses a ceiling path containing a mise list separator" \
+        eval '[ "$rc" != 0 ] && [ ! -s "$STUB/recorder-calls" ] && jqt "$RS" '\''.outcome == "failed"'\'''
+  rreset; rclock '2026-11-11 19:40:00'; rrun; rc=$?
+  check "recorder close boundary: insufficient startup/HTTP room skips cleanly and logs the gap's endpoints" \
+        eval '[ "$rc" = 0 ] && [ ! -s "$STUB/recorder-calls" ] && jqt "$RS" '\''.outcome == "ok"'\'' && grep -q "recording gap.*2026-11-11 19:40:00.*2026-11-11 20:00:00" "$TMP/recorder.out"'
+  rreset; rclock '2026-11-11 20:00:00'; recorder_close=$(cat "$STUB/recorder-clock")
+  rclock '2026-11-11 18:40:00'; echo 1318 > "$STUB/recorder-overhead"; rrun; rc=$?
+  check "recorder final batch budgets cold startup and the final three HTTP reads before the strict close" \
+        eval '[ "$rc" = 0 ] && [ "$(cat "$STUB/recorder-clock")" -lt "$recorder_close" ] && [ "$(wc -l < "$STUB/recorder-calls" | tr -d " ")" = 1 ] && grep -q "screener --minutes 58 " "$STUB/recorder-calls" && jqt "$RS" '\''.outcome == "ok"'\'' && grep -q "recording gap.*2026-11-11 20:00:00" "$TMP/recorder.out"'
+  rm -f "$STUB/recorder-overhead"
+
+  # Antigravity's last fix round: reproduce every claim through the actual wrapper/helper.
+  rreset; rclock '2026-11-11 19:20:00'; : > "$STUB/recorder-leave-uv"
+  rrun; rm "$STUB/recorder-leave-uv"; rclock '2026-11-11 19:20:00'; rrun; rc=$?
+  check "AGY-3: a real batch descendant holds only the clone lock and the next firing waits for it" \
+        eval '[ "$rc" = 0 ] && [ "$(wc -l < "$STUB/recorder-calls" | tr -d " ")" = 2 ]'
+  freed "$AH/canon/movers-checkout.recorder.lock" 100 || t_fail "leftover recorder loop lock was released"
+  freed "$AH/canon/movers-checkout.lock" 100 || t_fail "leftover checkout lock was released"
+
+  cp "$AH/canon/movers-checkout.sh" "$STUB/ag-helper-real"
+  cat > "$AH/canon/movers-checkout.sh" <<'EOF'
+#!/bin/bash
+if [ -f "$STUB/recorder-probe-fd" ]; then
+  if { true >&9; } 2>/dev/null; then echo helper-inherited >> "$STUB/recorder-fds"
+  else echo helper-closed >> "$STUB/recorder-fds"; fi
+fi
+/bin/bash "$STUB/ag-helper-real" "$@" || exit $?
+[ ! -f "$STUB/recorder-after-fetch-clock" ] || cat "$STUB/recorder-after-fetch-clock" > "$STUB/recorder-clock"
+EOF
+  rreset; rclock '2026-11-11 19:20:00'; : > "$STUB/recorder-probe-fd"; rrun; rc=$?
+  check "AGY-3: both checkout helper and batch children have descriptor 9 closed" \
+        eval '[ "$rc" = 0 ] && [ "$(cat "$STUB/recorder-fds")" = "$(printf "helper-closed\nbatch-closed")" ]'
+  rm "$STUB/recorder-probe-fd"
+
+  rreset; rclock '2026-11-11 19:51:00'; cp "$STUB/recorder-clock" "$STUB/recorder-after-fetch-clock"
+  rclock '2026-11-11 19:20:00'; mv "$O" "$O.offline"; rrun; rc=$?; mv "$O.offline" "$O"
+  check "AGY-4: cached fetch followed by a close gap never claims a batch or commit ran" \
+        eval '[ "$rc" = 0 ] && [ ! -s "$STUB/recorder-calls" ] && jqt "$RS" '\''.commit == "none: nothing ran" and (.note | contains("ran at") | not)'\'''
+  rm "$STUB/recorder-after-fetch-clock"
+  cp "$STUB/ag-helper-real" "$AH/canon/movers-checkout.sh"
+
+  rreset; rclock '2026-11-11 17:10:00'
+  echo next-recorder-main > "$OW/tracked"; ocommit next-recorder-main
+  next_main=$(git -C "$O" rev-parse main)
+  echo "$O" > "$STUB/recorder-restore-origin"; mv "$O" "$O.offline"; rrun; rc=$?
+  [ ! -d "$O.offline" ] || mv "$O.offline" "$O"
+  check "AGY-4: a later successful fetch clears the previous batch's fetch failure note" \
+        eval '[ "$rc" = 0 ] && [ "$(wc -l < "$STUB/recorder-calls" | tr -d " ")" = 2 ] && jqt "$RS" ".commit == \"$next_main\" and (.note | contains(\"fetch_failed\") | not)"'
+
+  rreset; rclock '2026-11-11 19:20:00'
+  echo unreviewed-local > "$AH/canon/movers-checkout/tracked"
+  git -C "$AH/canon/movers-checkout" -c core.hooksPath=/dev/null -c user.name=t -c user.email=t@example.com commit -qam unreviewed-local
+  mkdir -p "$TMP/foreign-venv"; echo keep > "$TMP/foreign-venv/marker"
+  rm -rf "$AH/canon/movers-checkout/.venv"; ln -s "$TMP/foreign-venv" "$AH/canon/movers-checkout/.venv"
+  mv "$O" "$O.offline"; rrun; rc=$?; mv "$O.offline" "$O"
+  check "AGY-5: a failed fetch uses the fetched main ref instead of a local HEAD commit" \
+        eval '[ "$rc" = 0 ] && jqt "$RS" ".commit == \"$next_main\""'
+  check "AGY-5: cached checkout removes a venv symlink without touching its target" \
+        eval '[ ! -L "$AH/canon/movers-checkout/.venv" ] && [ -f "$TMP/foreign-venv/marker" ]'
+
+  rreset; rclock '2026-11-11 19:20:00'; echo file > "$TMP/not-a-recorder-dir"
+  RECORDER_TEST_DIR="$TMP/not-a-recorder-dir/sub/checkout" rrun; rc=$?
+  check "AGY-6: checkout-parent creation failure writes a fresh named failure status" \
+        eval '[ "$rc" != 0 ] && [ ! -s "$STUB/recorder-calls" ] && jqt "$RS" '\''.outcome == "failed" and .exit_code != 0 and (.note | contains("checkout_parent_failed"))'\'''
+
+  rreset; rclock '2026-11-11 17:10:00'
+  rm -f "$STUB/recorder-batch-pid" "$STUB/recorder-term-seen"
+  : > "$STUB/recorder-block"; : > "$STUB/recorder-observe-term"
+  set -m
+  env -i HOME="$H" PATH=/usr/bin:/bin:/usr/sbin:/sbin TZ=UTC STUB="$STUB" CLAUDE_CONFIG_DIR="$AH" CANON_RECORDER_DATE="$B/recorder-date" \
+      /bin/bash "$AH/canon/movers-recorder.sh" record-movers "$B/recorder-mise" "$AH/canon/movers-checkout" "$O" > "$TMP/recorder-stop.out" 2>&1 &
+  stop_pid=$!; set +m
+  rwait || t_fail "AGY-2 controlled batch reached its wait"
+  batch_pid=$(cat "$STUB/recorder-batch-pid"); HOLDERS="$HOLDERS $stop_pid $batch_pid"
+  kill -TERM -- "-$stop_pid"; rc=0; wait "$stop_pid" || rc=$?
+  check "AGY-2: bootout-style TERM reaches the batch and the wrapper waits for its exit" \
+        eval '[ "$rc" = 143 ] && [ -f "$STUB/recorder-term-seen" ] && ! kill -0 "$batch_pid" 2>/dev/null'
+  rm -f "$STUB/recorder-block" "$STUB/recorder-observe-term"
+  freed "$AH/canon/movers-checkout.lock" 100 || t_fail "AGY-2 stopped batch releases checkout lock"
+  freed "$AH/canon/movers-checkout.recorder.lock" 100 || t_fail "AGY-2 stopped wrapper releases loop lock"
+
+  echo running > "$STUB/loaded/local.canon.movers-recorder"
+  now=$(date +%s)
+  jq -n --argjson e "$now" '{at_epoch: $e, outcome: "running", day: "2026-11-11", commit: "0123456789abcdef0123456789abcdef01234567", exit_code: 0, note: "80 polls"}' > "$RS"
+  astat
+  check "recorder status: a fresh batch and its commit are visible" \
+        eval 'rowis "$TMP/stat.out" "movers recorder" ok && grep -q "0123456789ab" "$TMP/stat.out"'
+  echo '(never exited)' > "$STUB/last-exit-local.canon.movers-recorder"; astat
+  check "recorder first loop has never exited: fresh running status remains ok" rowis "$TMP/stat.out" "movers recorder" ok
+  cp "$RS" "$RS.saved"; rm "$RS"; astat
+  check "recorder before its first firing has never exited: UNKNOWN, not FAILED" rowis "$TMP/stat.out" "movers recorder" UNKNOWN
+  mv "$RS.saved" "$RS"; echo 7 > "$STUB/last-exit-local.canon.movers-recorder"; astat
+  check "recorder numeric nonzero launchd exit remains FAILED" rowis "$TMP/stat.out" "movers recorder" FAILED
+  rm "$STUB/last-exit-local.canon.movers-recorder"
+  env -i HOME="$H" PATH="$B:/usr/bin:/bin:/usr/sbin:/sbin" STUB="$STUB" CLAUDE_CONFIG_DIR="$TMP/other-config" CANON_GETCONF="$B/getconf" \
+      "$A/scripts/automation" status > "$TMP/other-status.out" 2>&1
+  check "recorder status reads the config directory its installed plist names" rowis "$TMP/other-status.out" "movers recorder" ok
+  jq '.outcome = "failed" | .exit_code = 7' "$RS" > "$RS.t" && mv "$RS.t" "$RS"; astat
+  check "recorder status: a failed batch is FAILED with its exit" \
+        eval 'rowis "$TMP/stat.out" "movers recorder" FAILED && grep -q "exit 7" "$TMP/stat.out"'
+  jq '.outcome = "running" | .exit_code = 0 | .at_epoch -= 8000' "$RS" > "$RS.t" && mv "$RS.t" "$RS"; astat
+  check "recorder status: a batch that stopped reporting is STALE" rowis "$TMP/stat.out" "movers recorder" STALE
+  echo '# stale and outdated' >> "$AH/canon/movers-recorder.sh"; astat
+  check "recorder status: an outdated installed runner cannot hide STALE" \
+        eval 'rowis "$TMP/stat.out" "movers recorder" STALE && grep -q "installed recorder differs" "$TMP/stat.out"'
+  cp "$A/scripts/automation" "$AH/canon/movers-recorder.sh"
+  printf 'broken\n' > "$RS"; astat
+  check "recorder status: unreadable record is UNKNOWN" rowis "$TMP/stat.out" "movers recorder" UNKNOWN
+  rm -f "$RS"; astat
+  check "recorder status: no firing yet is UNKNOWN" rowis "$TMP/stat.out" "movers recorder" UNKNOWN
+  rm -f "$STUB/loaded/local.canon.movers-recorder"; astat
+  check "recorder status: unloaded job is OFF" rowis "$TMP/stat.out" "movers recorder" OFF
+  echo running > "$STUB/loaded/local.canon.movers-recorder"; : > "$STUB/refuse-recorder-bootout"; printf '{}\n' > "$RS"
+  env -i HOME="$H" PATH="$B:/usr/bin:/bin:/usr/sbin:/sbin" STUB="$STUB" CLAUDE_CONFIG_DIR="$AH" CANON_GETCONF="$B/getconf" \
+      "$A/scripts/automation" uninstall > "$TMP/uninstall.out" 2>&1; rc=$?
+  check "recorder cannot unload: its private helper stays and the independent paper helper is removed" \
+        eval '[ "$rc" != 0 ] && [ ! -e "$AH/canon/paper-session.sh" ] && [ -f "$AH/canon/movers-checkout.sh" ] && [ -f "$AH/canon/movers-recorder.sh" ] && [ -d "$AH/canon/movers-checkout" ]'
+  rm -f "$STUB/refuse-recorder-bootout"
+  env -i HOME="$H" PATH="$B:/usr/bin:/bin:/usr/sbin:/sbin" STUB="$STUB" CLAUDE_CONFIG_DIR="$AH" CANON_GETCONF="$B/getconf" \
+      "$A/scripts/automation" uninstall > "$TMP/uninstall.out" 2>&1; rc=$?
+  check "recorder uninstall: its job, runner, clone and locks are removed, records remain" \
+        eval '[ "$rc" = 0 ] && [ ! -e "$RP" ] && [ ! -e "$AH/canon/movers-recorder.sh" ] && [ ! -e "$AH/canon/movers-checkout" ] && [ ! -e "$AH/canon/movers-checkout.lock" ] && [ ! -e "$AH/canon/movers-checkout.recorder.lock" ] && [ -f "$RS" ] && grep -q "bootout.*local.canon.movers-recorder" "$STUB/launchctl.log"'
+  ainst; : > "$AH/canon/movers-checkout/mise.toml"; echo 7 > "$STUB/untrust-rc"
+  env -i HOME="$H" PATH="$B:/usr/bin:/bin:/usr/sbin:/sbin" STUB="$STUB" CLAUDE_CONFIG_DIR="$AH" CANON_GETCONF="$B/getconf" \
+      "$A/scripts/automation" uninstall > "$TMP/uninstall.out" 2>&1; rc=$?
+  check "recorder untrust failure is reported while its stopped clone is still removed" \
+        eval '[ "$rc" != 0 ] && [ ! -e "$AH/canon/movers-checkout" ] && grep -q "mise trust of .*movers-checkout" "$TMP/uninstall.out"'
+  check "recorder uninstall names the preserved canon-paper-data folder" grep -q 'canon-paper-data' "$TMP/uninstall.out"
+  rm "$STUB/untrust-rc"
+else
+  t_fail "recorder runner is available for the weekday, boundary and failure cases"
+fi
+
+check "recorder standing layer is listed for the owner and for agents" \
+      eval 'grep -Eq "^\\| Movers recorder.*ADR 0070" "$ROOT/README.md" && grep -Eq "movers recorder.*ADR 0070" "$ROOT/AGENTS.md"'
+check "recorder schedule has a dated decision entry in ADR 0070" \
+      grep -Eq '^\*\*Addition, 2026-11-11: the scheduled movers recorder' "$ROOT/docs/adr/0070-sandbox-execution-on-alpacas-live-data-and-a-data-only-task.md"
 
 # the nightly study row (ADR 0089): the driver's own line for the last night it studied, from the records
 # beside the ledger of the clone status runs in, and the schedule's heartbeat

@@ -194,6 +194,7 @@ by hand holds the port, so stop it first.
 | Landscape watch | Once a day, at session start | No |
 | Lane watchdog | Every 10 minutes while the Mac is awake | No |
 | Paper session | About every 35 minutes while the Mac is awake (launchd fires it 10 minutes after each firing ends); a window only when Alpaca's clock says a session is open, on the `main` GitHub has then (ADR 0050) | No |
+| Movers recorder | Weekdays 04:00–20:00 New York while the Mac is awake; back-to-back data-only screener batches, at most 80 polls each, on its own clone of `main`; a failed batch ends its firing and the next one starts fresh (ADR 0070) | No |
 | Maintenance | Every 30 minutes while the Mac is awake, unless the paper lock is held. It fast-forwards the main checkout and reinstalls whatever differs from `main`. Once a day it runs `claude update` and `agy update` (ADR 0065) | No |
 | OmniRoute gateway | Always, once OmniRoute is installed: `omniroute:serve` on 127.0.0.1 (ADR 0056) | No |
 | OTLP collector | Always, while the Mac is awake: the pinned OpenTelemetry Collector on 127.0.0.1, writing the events `scripts/lanes --rates` reads (ADR 0007) | No |
@@ -201,12 +202,15 @@ by hand holds the port, so stop it first.
 | Dependency bot (Dependabot) | Weekly, on GitHub | Only when a session lands its pull request |
 
 `scripts/automation install` turns on the commit gate, the address check, the lane watchdog, the paper
-session agent, whose runner keeps its own clone of `main` in `~/.claude/canon/`, the OTLP collector, the
+session agent, whose runner keeps its own clone of `main` in `~/.claude/canon/`, the movers recorder
+with a separate clone and the weekday window above (ADR 0070), the OTLP collector, the
 OmniRoute gateway once it is installed, and the maintenance agent, which from then on reinstalls
 whatever `main` changes. The edit
 checks and the landscape watch are hooks in `.claude/settings.json`. The weekly refresh is a
 scheduled task in the Claude desktop app, and the dependency bot is `.github/dependabot.yml`, which GitHub
 runs.
+The recorder reserves startup and HTTP time before its strict 20:00 close; its log names any resulting
+recording gap and gives its start and end times (ADR 0070).
 `scripts/automation uninstall` reverses the install. The reasoning is in [ADR 0011](docs/adr/0011-automation.md) and
 [ADR 0026](docs/adr/0026-weekly-model-run.md).
 

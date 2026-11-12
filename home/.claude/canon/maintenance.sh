@@ -349,12 +349,25 @@ if [ "$at_main" = 1 ]; then
   elif cur=$(mise_version) && [ "$cur" = "$v" ]; then add PINRES "mise: at $v"
   elif [ "$PW" = 1 ]; then add PINRES "mise: ${cur:-no version} -> $v at the session boundary"; PINWAIT=1
   else
-    o=$(cd "$HOME" && bounded "$UPDATE_SECS" "$mise" self-update --yes --no-plugins "$v" 2>&1); rc=$?
-    printf '%s\n' "$o" | sed 's/^/  /'
-    if timed_out "$rc"; then pin_fail "mise: self-update to $v did not finish within $UPDATE_SECS s"
-    elif [ "$rc" != 0 ]; then pin_fail "mise: self-update to $v exited $rc: $(printf '%s' "$o" | tail -n 1)"
-    elif [ "$(mise_version)" != "$v" ]; then pin_fail "mise: self-update to $v exited 0, but mise reports ${cur:-no version} still"
-    else add PINRES "mise: ${cur:-no version} -> $v"; log "(d) mise: ${cur:-no version} -> $v"; fi
+    # The recorder also invokes this binary between batches. Share its loop lock through replacement;
+    # the update command gets no copy of descriptor 4, so only this round owns the guard.
+    recorder_lock=$(bounded 30 "$root/scripts/automation" recorder-lock-path 2>/dev/null) || recorder_lock=""
+    if [[ "$recorder_lock" != /* || "$recorder_lock" == *$'\n'* ]]; then pin_fail "mise: could not read the recorder lock path from automation"
+    elif ! exec 4>>"$recorder_lock"; then pin_fail "mise: could not open the recorder lock"
+    else
+      recorder_lock_rc=0; /usr/bin/lockf -t 0 4 2>/dev/null || recorder_lock_rc=$?
+      if [ "$recorder_lock_rc" = 75 ]; then add PINRES "mise: ${cur:-no version} -> $v after the recorder ends"
+      elif [ "$recorder_lock_rc" != 0 ]; then pin_fail "mise: could not take the recorder lock (exit $recorder_lock_rc)"
+      else
+        o=$(cd "$HOME" && bounded "$UPDATE_SECS" "$mise" self-update --yes --no-plugins "$v" 4>&- 2>&1); rc=$?
+        printf '%s\n' "$o" | sed 's/^/  /'
+        if timed_out "$rc"; then pin_fail "mise: self-update to $v did not finish within $UPDATE_SECS s"
+        elif [ "$rc" != 0 ]; then pin_fail "mise: self-update to $v exited $rc: $(printf '%s' "$o" | tail -n 1)"
+        elif [ "$(mise_version)" != "$v" ]; then pin_fail "mise: self-update to $v exited 0, but mise reports ${cur:-no version} still"
+        else add PINRES "mise: ${cur:-no version} -> $v"; log "(d) mise: ${cur:-no version} -> $v"; fi
+      fi
+      exec 4>&-
+    fi
   fi
   for spec in $PINS; do
     IFS='|' read -r tool id pre <<<"$spec"
@@ -457,11 +470,15 @@ set -m
   if timed_out "$rc"; then st=failed to=true; fl='["automation install (timeout after '"$STEP_SECS"' s)"]'
   elif [ "$rc" != 0 ]; then st=failed; [ "$fl" != '[]' ] || fl='["automation install (exit '"$rc"')"]'
   else st="done"; fl='[]'; fi
+  # A recorder owns its loop lock until the firing finishes or fails. Its explicit deferral is
+  # unfinished work, unlike an install that completed but left an unfixable difference: retry next round.
+  deferred=$(printf '%s\n' "$io" | sed -n 's/^  deferred   movers recorder:.*$/movers recorder/p' \
+      | jq -Rsc 'split("\n") | map(select(length > 0)) | unique')
   cur=$(jq -c 'objects' "$STATUS" 2>/dev/null) || cur='{}'
   [ -n "$cur" ] || cur='{}'
-  put "$STATUS" "$(jq -c --arg s "$st" --argjson fl "$fl" --argjson rc "$rc" --argjson to "$to" '
-      .install = {state: $s, at_epoch: now, exit: $rc, failed: $fl}
-      | if .tried != null then .tried.result = $s | .tried.timeout = $to else . end
+  put "$STATUS" "$(jq -c --arg s "$st" --argjson fl "$fl" --argjson rc "$rc" --argjson to "$to" --argjson d "$deferred" '
+      .install = {state: $s, at_epoch: now, exit: $rc, failed: $fl, deferred: $d}
+      | if .tried != null then .tried.result = (if $s == "done" and ($d | length) > 0 then "deferred" else $s end) | .tried.timeout = $to else . end
       | if $s == "done" then .installed += ["automation install"] else .failed += $fl | .outcome = "failed" end
       | .last_change = {at: .at, found: .found, installed: .installed, failed: .failed}' <<<"$cur")" \
     || log "could not write $STATUS"

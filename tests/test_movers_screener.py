@@ -190,9 +190,10 @@ def test_a_run_is_1_to_85_polls_into_an_absolute_folder(argv) -> None:
         movers_screener.main(argv)
 
 
-def test_the_log_is_named_for_the_module_and_its_utc_start(tmp_path) -> None:
+def test_the_log_is_named_for_the_module_utc_start_and_process(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(movers_screener.os, "getpid", lambda: 4321)
     path = movers_screener.log_path(tmp_path, datetime(2026, 11, 11, 9, 5, 7, tzinfo=UTC))
-    assert path == Path(tmp_path) / "movers-screener-20261111T090507Z.jsonl"
+    assert path == Path(tmp_path) / "movers-screener-20261111T090507Z-4321.jsonl"
 
 
 def test_paper_data_runs_the_screener_without_the_stream_lock_inside_its_deadline() -> None:

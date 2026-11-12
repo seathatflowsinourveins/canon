@@ -4,6 +4,12 @@
 #
 # Usage: paper-session.sh <mise> <checkout> <origin url> [paper:session arguments...]
 #        paper-session.sh --checkout-only <mise> <checkout> <origin url>
+#        paper-session.sh --recorder-checkout <mise> <checkout> <origin url>
+# The recorder-only mode reuses its marked, matching clone (actions/checkout's existing-directory
+# contract, src/git-directory-helper.ts at 3d3c42e5aac5). A failed fetch restores refs/remotes/origin/main;
+# force checkout and clean -ffdx -e .venv restore that commit before use (git-checkout(1), git-clean(1)).
+# It waits at most CANON_RECORDER_LOCK_SECS (default 60, UNCALIBRATED) for leftover uv descendants.
+# Ordinary paper firings and install's --checkout-only retain their fresh-checkout contract.
 #
 # Each firing runs exactly the main that the origin has at that moment, in a clone used by nothing else:
 #   1. make <checkout> a new clone of origin's main at every firing, by the path actions/checkout v7.0.1 takes
@@ -60,8 +66,10 @@ TASK_SECS=6300                 # mise.toml's paper:session timeout, 105 minutes 
 START_SECS=300                 # mise's start: a tool install, and the two keychain reads at 30 s each (mise.toml)
 RUN_SECS=${CANON_PAPER_RUN_SECS:-$((TASK_SECS + START_SECS))}
 only=0
+recorder=0
 if [ "${1:-}" = "--checkout-only" ]; then only=1; shift; fi
-if [ $# -lt 3 ]; then echo "usage: paper-session.sh [--checkout-only] <mise> <checkout> <origin url> [arguments...]" >&2; exit 2; fi
+if [ "${1:-}" = "--recorder-checkout" ]; then only=1; recorder=1; shift; fi
+if [ $# -lt 3 ]; then echo "usage: paper-session.sh [--checkout-only | --recorder-checkout] <mise> <checkout> <origin url> [arguments...]" >&2; exit 2; fi
 mise=$1 dir=$2 url=$3; shift 3
 # the records folder is in the per-user temporary folder (getconf(1)); a getconf that gives none stops a
 # firing here, before anything runs, rather than write records under a relative name that status never reads.
@@ -126,7 +134,18 @@ bg() { /usr/bin/timeout -k 5 "$FETCH_SECS" git -c core.hooksPath=/dev/null -c ht
 # bootout did not reach: the task's deadline puts uv in a process group of its own, mise.toml).
 mkdir -p "$(dirname "$dir")" || fail "cannot create the folder of $dir"
 exec 8>>"$dir.lock" || fail "cannot open $dir.lock"
-if ! /usr/bin/lockf -t 0 8 2>/dev/null; then
+if [ "$recorder" = 1 ]; then
+  lock_secs=${CANON_RECORDER_LOCK_SECS:-60}
+  [[ "$lock_secs" =~ ^[1-9][0-9]*$ ]] || fail "invalid recorder checkout wait bound"
+  end=$((SECONDS + lock_secs))
+  while :; do
+    rc=0; "${CANON_LOCKF:-/usr/bin/lockf}" -t 0 8 2>/dev/null || rc=$?
+    [ "$rc" != 0 ] || break
+    [ "$rc" = 75 ] || fail "checkout_lock_failed: lockf exited $rc"
+    [ "$SECONDS" -lt "$end" ] || fail "checkout_lock_timeout: still held after $lock_secs s (UNCALIBRATED); firing ended"
+    sleep 1
+  done
+elif ! /usr/bin/lockf -t 0 8 2>/dev/null; then
   [ "$only" = 1 ] || fail "a window is still running from $dir; nothing was run"
   # install's one check of the origin still runs, outside the clone
   out=$(bg ls-remote --exit-code "$url" refs/heads/main 2>&1) || fail "could not reach main at $where: $(printf '%s' "$out" | tr '\n' ' ')"
@@ -161,17 +180,33 @@ fresh() {
   mv "$dir/.git.new" "$dir/.git" && rm -rf "$dir/.git.old" || return 1
   [ -z "$(find "$dir" -mindepth 1 -maxdepth 1 ! -name .venv ! -name .git -print | head -n 1)" ]
 }
-fresh || fail "could not make a new clone in $dir"
+last_good=""; fetch_note=""
+if [ "$recorder" = 1 ] && marked "$dir/.git" \
+   && [ "$(g config --get remote.origin.url)" = "$url" ] \
+   && g rev-parse --verify -q HEAD >/dev/null; then
+  last_good=$(g rev-parse --verify -q refs/remotes/origin/main) || last_good=""
+fi
+if [ -z "$last_good" ]; then fresh || fail "could not make a new clone in $dir"; fi
+if [ "$recorder" = 1 ]; then
+  [ ! -L "$dir/.venv" ] || rm -f "$dir/.venv" || fail "could not remove the recorder venv symlink"
+fi
 out=$(bg -C "$dir" fetch -q --no-tags --prune --no-recurse-submodules --depth=1 origin +refs/heads/main:refs/remotes/origin/main 2>&1); rc=$?
-[ "$rc" != 124 ] && [ "$rc" != 137 ] || fail "the fetch of main from $where did not finish within $FETCH_SECS s (or was killed)"
-[ "$rc" = 0 ] || fail "could not fetch main from $where: $(printf '%s' "$out" | tr '\n' ' ')"
-want=$(g rev-parse --verify -q refs/remotes/origin/main) || fail "the fetch left no origin/main in $dir"
-out=$(g checkout -q --force --detach refs/remotes/origin/main 2>&1) || fail "could not check out $want: $(printf '%s' "$out" | tr '\n' ' ')"
+if [ "$rc" != 0 ] && [ -n "$last_good" ]; then
+  want=$last_good
+  fetch_note="fetch_failed, checkout at ${want:0:12}"
+  echo "paper-session: fetch_failed (exit $rc); reusing last good main $want" >&2
+else
+  [ "$rc" != 124 ] && [ "$rc" != 137 ] || fail "the fetch of main from $where did not finish within $FETCH_SECS s (or was killed)"
+  [ "$rc" = 0 ] || fail "could not fetch main from $where: $(printf '%s' "$out" | tr '\n' ' ')"
+  want=$(g rev-parse --verify -q refs/remotes/origin/main) || fail "the fetch left no origin/main in $dir"
+fi
+out=$(g checkout -q --force --detach "$want" 2>&1) || fail "could not check out $want: $(printf '%s' "$out" | tr '\n' ' ')"
+if [ "$recorder" = 1 ]; then g clean -q -ffdx -e .venv || fail "could not clean the recorder checkout"; fi
 head=$(g rev-parse --verify -q HEAD)
 [ "$head" = "$want" ] || fail "HEAD is ${head:-nothing}, not origin/main $want"
 [ -z "$(g status --porcelain -uno 2>&1)" ] || fail "tracked files differ from $want in $dir"
 
-if [ "$only" = 1 ]; then echo "paper-session: $dir is at origin/main $want"; exit 0; fi
+if [ "$only" = 1 ]; then echo "paper-session: $dir is at origin/main $want${fetch_note:+; $fetch_note}"; exit 0; fi
 cd "$dir" || fail "cannot enter $dir"
 # mise reads every config from the folder it runs in up to the root, here the automation folder, the Claude
 # config folder and HOME above the clone; it searches no higher than MISE_CEILING_PATHS, "which is not
