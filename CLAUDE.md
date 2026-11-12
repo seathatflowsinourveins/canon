@@ -10,6 +10,7 @@
   runs ruff on it. Fix what they report before moving on. No hook runs before a tool call (ADR 0020); a
   permission prompt is the owner's to answer, so do not route around one. ADR 0028 lists what still asks.
   Session start prints the pin count, any ADR past review and the last upstream check.
+- **Context:** claude.ai connectors (a brokerage among them, rule 8) and the Artifact tool are off here.
 - **Before saying a change is done:** run `scripts/ci`.
 - **Models:** run orchestration on `fable`, build sessions on `opus` (table in `canon/models.json`). Pick the
   model when the session starts.

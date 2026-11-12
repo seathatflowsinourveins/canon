@@ -30,6 +30,10 @@ done
 check "no PreToolUse hook is registered"     test "$(jq -r '.hooks | has("PreToolUse")' "$SETTINGS")" = "false"
 check "no hook blocks when it fails"         test "$(jq -r '[.hooks // {} | .[] | .[]? | .hooks[]? | select(.onFailure == "block")] | length' "$SETTINGS")" = "0"
 
+# --- no claude.ai connector (a brokerage among them, rule 8) and no Artifact tool in this repository ---
+check "settings turn off claude.ai connectors" test "$(jq -r '.disableClaudeAiConnectors' "$SETTINGS")" = "true"
+check "settings turn off the Artifact tool"    test "$(jq -r '.enableArtifact' "$SETTINGS")" = "false"
+
 # --- uv run never rewrites uv.lock ---
 # An allow entry that would pre-approve `uv run` without --locked: `uv run ...` itself, or all of uv.
 unlocked=$(jq -r '[.permissions.allow[]? | strings
