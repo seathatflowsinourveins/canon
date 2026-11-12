@@ -986,6 +986,27 @@
       ],
       "adr": "0109",
       "pypi": "plotly"
+    },
+    {
+      "id": "edgartools",
+      "field": "mover-data-and-filings",
+      "repo": "dgunning/edgartools",
+      "track": "tag:v6.0.0",
+      "role": "tool",
+      "license": "MIT",
+      "why": "Reads SEC EDGAR filings (current filings, a company's submissions, 8-K items) and waits at 9 requests a second by default, under the 10 a second the SEC states; the limiter is per process, so one process at a time uses it. Adopted for one consumer, a GET-only filings recorder for the names the ranking lists, with its records outside the repository (ADR 0108); the recorder is not built yet. Installed in a project of its own, filings/, with its own uv.lock and environment, and never in the shared one: it requires pyarrow, and with pyarrow installed pandas backs its text columns with Arrow, which changes the environment the gate and the studies run in. The identity the SEC asks a client to declare is entered locally by the owner in a setting git does not track; the recorder passes it to set_identity() before any request, on every request path, and refuses to start with none, because at the pin a request with EDGAR_IDENTITY unset can reach a terminal prompt. The value is never written to a tracked file, a log or a record. Pinned to 6.0.0, not 5.62.1: until 6.0 set_identity() wrote the identity to the INFO log. edgar.ai is never imported (its install_skill() writes into ~/.claude/skills) and the two console scripts the install adds, edgartools and edgartools-mcp, are never run: neither a skill nor an MCP server from it is an adopted extension (ADR 0004). A filing is a label and changes no order. A move is uv add edgartools==<version> run from filings/, with this entry, ADR 0108's title and the row in docs/architecture.md; filings/tests/test_upstream_contract.py holds those and the installed version to one, since the lint's pypi comparison reads the root's uv.lock only.",
+      "evidence": [
+        "https://pypi.org/pypi/edgartools/json",
+        "https://github.com/dgunning/edgartools/releases/tag/v6.0.0",
+        "https://raw.githubusercontent.com/dgunning/edgartools/1ce77f9903e06ec58609a40d01797331e4ead460/CHANGELOG.md",
+        "https://raw.githubusercontent.com/dgunning/edgartools/1ce77f9903e06ec58609a40d01797331e4ead460/edgar/httpclient.py",
+        "https://raw.githubusercontent.com/dgunning/edgartools/1ce77f9903e06ec58609a40d01797331e4ead460/edgar/settings.py",
+        "https://raw.githubusercontent.com/dgunning/edgartools/1ce77f9903e06ec58609a40d01797331e4ead460/LICENSE.txt",
+        "https://www.sec.gov/os/accessing-edgar-data",
+        "https://docs.astral.sh/uv/concepts/projects/workspaces/",
+        "https://pandas.pydata.org/docs/whatsnew/v3.0.0.html"
+      ],
+      "adr": "0108"
     }
   ]
 }

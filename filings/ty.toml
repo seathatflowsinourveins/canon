@@ -1,0 +1,4 @@
+# ty's configuration for this project alone, deliberately empty: its presence is what matters. Without
+# a `ty.toml` or a `[tool.ty]` table in this folder ty goes on up the folders (ty's docs,
+# configuration.md) and takes the root's ty.toml, which is for the root's environment and leaves this
+# folder out.

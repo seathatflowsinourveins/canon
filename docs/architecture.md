@@ -62,6 +62,7 @@ flowchart LR
 | Returns matrix | T daily rows, the session days every trial covers over the sample, one column per configuration | pandas v3.1.1; skfolio v1.12.9 `Population` | `canon_trading/returns_matrix.py` | ADR 0010, 0041, 0080 |
 | Arm comparison diagnostic | SPA p-values and StepM's superior set for mean per-session-day loss differentials against a named benchmark, on a strict daily return CSV; explicit stationary bootstrap settings, input hash and DSR availability, reported outside the checkout | arch v9.0.0 `SPA` and `StepM` | `canon_trading/arm_comparison.py` | ADR 0104; ADR 0010's gate is unchanged |
 | Gate | The pick's deflated Sharpe ratio against 0.95, N = every trial | skfolio v1.12.9 | `canon_trading/ranking.py` | ADR 0010, 0031, 0054, 0080, 0081 |
+| Filings | SEC filings for ranked names; the recorder is not built. A project of its own, outside the workspace, with its own lock and environment, so that what it requires (pyarrow) stays out of the environment every row above runs in | edgartools v6.0.0, in `filings/uv.lock` | `filings/` | ADR 0108 |
 
 Pins are in `canon/upstreams.json` and `pyproject.toml`, commits in `canon/upstreams.lock.json`. The
 adapter is a uv workspace member of its own, kept apart from strategies as upstream keeps them
