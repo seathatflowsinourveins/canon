@@ -706,6 +706,20 @@
       "adr": "0095"
     },
     {
+      "id": "dsh-subagent-codex",
+      "field": "agent-harness",
+      "repo": "deepseek-ai/deepseek-harness",
+      "track": "tag:dsh-v0.2.1-rc.3",
+      "role": "tool",
+      "license": "MIT",
+      "why": "@deepseek-ai/dsh-subagent-codex 0.2.1-rc.3 (packages/subagent/subagent-codex): a subagent_codex tool that runs one self-contained task in a fresh unattended Codex thread in the parent workspace and returns the answer. It bundles its own @openai/codex 0.153.4, outside the codex-cli pin. Native Codex configuration and authentication stay authoritative: key-like variables are scrubbed from the child's environment, so it runs under whatever login CODEX_HOME and HOME point to where dsh started (in an Orca-started session, an Orca-managed home). permissionMode defaults to never, which declines approvals and leaves the sandbox to Codex's settings; the login, mode and sandbox build-acp gets are UNVERIFIED. Another model family answers and it edits the parent workspace, so it is build arm only, by extension of ADR 0072 rule 6 (it sends a task, not the transcript): build-acp carries it and review-acp does not. A result that used it belongs to that family (ADR 0086). Shares the deepseek-harness pin and moves with it.",
+      "evidence": [
+        "https://github.com/deepseek-ai/deepseek-harness/tree/dsh-v0.2.1-rc.3/packages/subagent/subagent-codex",
+        "https://registry.npmjs.org/@deepseek-ai/dsh-subagent-codex/0.2.1-rc.3"
+      ],
+      "adr": "0095"
+    },
+    {
       "id": "pnpm",
       "field": "toolchain",
       "repo": "pnpm/pnpm",
