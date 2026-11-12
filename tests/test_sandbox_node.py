@@ -141,3 +141,31 @@ def test_a_run_that_does_not_end_flat_fails(monkeypatch, left, status) -> None:
     monkeypatch.setattr(sandbox_node, "summary", lambda cache: {"orders": 2, "filled": 1, **left})
     assert sandbox_node.main(["--minutes", "1"]) == status
     assert disposed == [True]
+
+
+@pytest.mark.parametrize("load_all", [False, True])
+def test_the_whole_market_check_builds_no_matching_engine_per_bar(load_all) -> None:
+    """Upstream's sandbox client builds a matching engine for each bar's instrument unless bar and trade
+    execution are off (nt@d53849b216e2 crates/adapters/sandbox/src/execution.rs:1095-1107, config
+    python/config.rs:57-58); the whole-market check turns both off, so its figures are the actor's."""
+    config = sandbox_node.sandbox_execution_config(load_all=load_all)
+    assert config.bar_execution is (not load_all)
+    assert config.trade_execution is (not load_all)
+
+
+def test_the_rank_check_reads_the_baseline_of_its_own_feed(monkeypatch) -> None:
+    monkeypatch.setenv(DATA_ONLY_ENV, "1")
+    seen: list[tuple[str, str, int]] = []
+    monkeypatch.setattr(
+        sandbox_node,
+        "rank_check",
+        lambda feed, path, minutes: seen.append((feed, path, minutes)) or {},
+    )
+    for feed in ("sip", "boats"):
+        assert sandbox_node.main(["--rank", feed, "--minutes", "1"]) == 0
+    sandbox_node.main(["--rank", "boats", "--minutes", "1", "--baseline-path", "x.json"])
+    assert seen == [
+        ("sip", "catalog/movers-baseline/sip.json", 1),
+        ("boats", "catalog/movers-baseline/boats.json", 1),
+        ("boats", "x.json", 1),
+    ]

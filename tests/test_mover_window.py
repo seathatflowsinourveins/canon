@@ -1,6 +1,7 @@
 """The mover window's session rows, native node build and generated-data replays (ADR 0091)."""
 
 import json
+import time
 from dataclasses import replace
 from datetime import UTC
 from datetime import datetime
@@ -430,10 +431,21 @@ def test_a_live_record_names_its_ranked_table_and_the_streams_symbols() -> None:
         {"rank": 2, "symbol": "MMM", "held_slot": True},
     ]
     assert session_window.stream_symbols(run, sampled=21) == {
+        "assets_loaded": "unavailable: no record counted the assets",
         "window": 120,
         "first_minute": 90,
         "sample": 21,
+        "rows_ranked": "unavailable: no generation was published",
+        "eligible": "unavailable: no generation was published",
+        "first_publication_secs": "unavailable: no published generation with the actor's start",
     }
+    run["ranking_records"][3] |= {"assets": 12000, "rows": 110, "eligible": 7}
+    counted = session_window.stream_symbols(run, sampled=21)
+    assert (counted["assets_loaded"], counted["rows_ranked"], counted["eligible"]) == (
+        12000,
+        110,
+        7,
+    )
     empty = session_window.live_ranked_table({"ranking_records": []})
     assert isinstance(empty, str) and empty.startswith("names ranked: none")
 
@@ -477,6 +489,7 @@ def test_one_account_figure_reaches_every_mover_entry_and_the_engine(monkeypatch
 
     def builder(*args, **kwargs):
         seen["engine"] = kwargs["max_notional_per_order"]
+        seen["load_all"] = kwargs.get("data_load_all")
         return real_builder(*args, **kwargs)
 
     def ranking(config, records):
@@ -506,6 +519,7 @@ def test_one_account_figure_reaches_every_mover_entry_and_the_engine(monkeypatch
         assert seen == {
             "engine": Decimal(10_000) * mover_window.OUTER_BOUND_MULTIPLE,
             "rank": 10_000.0,
+            "load_all": True,
         }
     finally:
         node.dispose()
@@ -608,9 +622,7 @@ def test_the_live_node_routes_rank_subscriptions_through_the_real_alpaca_client(
 
     class Probe(Strategy):
         def on_start(self):
-            self.subscribe_bars(
-                [bars], params={"feed": "sip", "wildcard": True, "updated_bars": True}
-            )
+            self.subscribe_bars([bars], params={"feed": "sip", "wildcard": True})
             self.subscribe_instrument_status(
                 [instrument_id], params={"feed": "sip", "wildcard": True}
             )
@@ -639,7 +651,7 @@ def test_the_live_node_routes_rank_subscriptions_through_the_real_alpaca_client(
         node.dispose()
         historical._session.close()
     assert stream.registrations == 2  # the real _connect ran with the injected transport
-    assert stream.calls == {"bars": ("*",), "updatedBars": ("*",), "statuses": ("*",)}
+    assert stream.calls == {"bars": ("*",), "statuses": ("*",)}  # no revised bars (2026-11-12)
     assert built["stream"]["feed"] == DataFeed.SIP
 
 
@@ -738,3 +750,113 @@ def test_a_firing_record_carries_each_entrys_dollars_and_the_realized_result():
     assert result["realized_usd"] == "24.50"
     assert result["flat"] is False
     assert "commission" in result["basis"]
+
+
+def test_the_record_counts_ranked_names_a_registered_arm_could_not_enter_for_no_day_context() -> (
+    None
+):
+    """The lead's order for the 04:00 firing (2026-11-12): a ranked name with no day context is passed over
+    by name, and the record counts them."""
+    run = {
+        "notes": {
+            "BBB.ALPACA": ["BBB.ALPACA: entry arm registered: no entry context supplied"],
+            "AAA.ALPACA": ["AAA.ALPACA: entry arm registered: no entry context supplied"],
+            "CCC.ALPACA": ["entered at move 0.3"],
+        }
+    }
+    assert session_window.passed_over_without_context(run) == {
+        "count": 2,
+        "names": ["AAA.ALPACA", "BBB.ALPACA"],
+    }
+
+
+def test_the_record_lists_each_market_data_subscription() -> None:
+    """The manifest's feeds section (2026-11-12): each subscription's feed, channel, wildcard or listed, and
+    instruments."""
+    listed = session_window.subscriptions({"opened_slots": ["A.ALPACA", "B.ALPACA"]}, "sip", 12000)
+    assert [(s["channel"], s["wildcard"], s["instruments"]) for s in listed] == [
+        ("bars", True, 12000),
+        ("statuses", True, 12000),
+        ("quotes", False, 2),
+        ("trades", False, 2),
+    ]
+    assert {s["feed"] for s in listed} == {"sip"}
+
+
+def test_the_reference_pre_read_reads_every_loaded_asset_for_the_actors_key(monkeypatch) -> None:
+    from canon_trading import movers_rank_actor
+
+    asked: list[tuple[tuple[str, ...], object, object]] = []
+
+    def read(symbols, cutoff, session):
+        asked.append((tuple(symbols), cutoff, session))
+        found = {
+            s: movers_rank_actor.movers_rank.Reference(close=1.0, session=cutoff) for s in symbols
+        }
+        return movers_rank_actor.ReferenceRead(cutoff, found, None, 7)
+
+    monkeypatch.setattr(movers_rank_actor, "alpaca_reference_reader", read)
+    requests_seen: list[object] = []
+
+    def get_all_assets(request):
+        requests_seen.append(request)
+        return [SimpleNamespace(symbol="BBB"), SimpleNamespace(symbol="AAA")]
+
+    notes: list[str] = []
+    reader = session_window.start_reference_read(
+        cast("TradingClient", SimpleNamespace(get_all_assets=get_all_assets)), notes
+    )
+    now = time.time_ns()
+    key = (movers_rank_actor.reference_cutoff(now), movers_rank_actor.trade_date(now))
+    assert reader(["AAA", "BBB"], *key).read_ns == 7
+    assert asked == [(("AAA", "BBB"), *key)] and len(requests_seen) == 1
+    assert notes[0].startswith("pre-read took ")
+    assert notes[1] == "pre-read before the node: 2 symbols; 0 of the 2 asked for were not in it"
+
+
+def test_the_reference_pre_read_runs_on_a_daemon_thread_and_names_a_failure(monkeypatch) -> None:
+    """A window refused after the pre-read starts is not held at exit by it, and a failed pre-read
+    leaves a note, which is what the whole-market check waits on (code-review-high/universe-6, -7)."""
+    import threading
+
+    from canon_trading import movers_rank_actor
+
+    release = Event()
+
+    def read(symbols, cutoff, session):
+        release.wait(10)
+        raise RuntimeError("refused")
+
+    monkeypatch.setattr(movers_rank_actor, "alpaca_reference_reader", read)
+    notes: list[str] = []
+    session_window.start_reference_read(
+        cast(
+            "TradingClient",
+            SimpleNamespace(get_all_assets=lambda request: [SimpleNamespace(symbol="AAA")]),
+        ),
+        notes,
+    )
+    try:
+        (thread,) = [t for t in threading.enumerate() if t.name.startswith("reference-pre-read")]
+        assert thread.daemon
+    finally:
+        release.set()
+    thread.join(10)
+    assert notes == ["pre-read failed: RuntimeError: refused"]
+
+
+def test_the_record_times_the_first_publication_from_the_actors_start() -> None:
+    start = 1_000_000_000_000
+    run = {
+        "ranking_records": [
+            {"published": False, "started_ns": start, "latency_ns": {"generation": start + 10**9}},
+            {
+                "published": True,
+                "started_ns": start,
+                "latency_ns": {"generation": start + 61_250_000_000},
+            },
+        ]
+    }
+    assert session_window.first_publication_secs(run) == 61.2
+    unavailable = session_window.first_publication_secs({"ranking_records": []})
+    assert isinstance(unavailable, str) and unavailable.startswith("unavailable")

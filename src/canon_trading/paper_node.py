@@ -183,6 +183,7 @@ def alpaca_paper_builder(
     max_order_submit_rate: str = MAX_ORDER_SUBMIT_RATE,
     max_notional_per_order: Decimal = MAX_NOTIONAL_PER_ORDER_USD,
     delay_post_stop_secs: int = DELAY_POST_STOP_SECS,
+    data_load_all: bool = False,
 ) -> LiveNodeBuilder:
     """A builder with the Alpaca data and execution clients for one or several `instrument_id`s, `risk_limits`,
     `exec_engine_config` and the timeouts every paper node here uses; the caller adds logging and builds.
@@ -190,6 +191,10 @@ def alpaca_paper_builder(
     runs only inside that delay (`session_window.MANAGED_DELAY_POST_STOP_SECS`).
     The calls are the ones upstream's live examples make (`examples/live/sandbox/exec_tester.py`)."""
     provider = InstrumentProviderConfig(load_ids=_instrument_ids(instrument_id))
+    # `data_load_all`: the data client loads every active US equity (`AlpacaInstrumentProvider.load_all_async`,
+    # one GET of the asset list), so a ranking actor's wildcard bars are tallied for the whole market; the
+    # execution client keeps the listed instruments (the lead's order of 2026-11-12 for the 04:00 firing).
+    data_provider = InstrumentProviderConfig(load_all=True) if data_load_all else provider
     return (
         LiveNode.builder(name, trader_id, Environment.SANDBOX)
         .with_risk_engine_config(
@@ -207,7 +212,7 @@ def alpaca_paper_builder(
         .with_timeout_disconnection_secs(TIMEOUT_DISCONNECTION_SECS)
         .with_delay_shutdown_secs(TIMEOUT_SHUTDOWN_SECS)
         .add_data_client(
-            "ALPACA", AlpacaDataClientFactory, DataClientConfig(instrument_provider=provider)
+            "ALPACA", AlpacaDataClientFactory, DataClientConfig(instrument_provider=data_provider)
         )
         .add_exec_client(
             "ALPACA",

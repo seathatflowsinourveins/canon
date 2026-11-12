@@ -1909,10 +1909,18 @@ class AlpacaExecutionClient(ExecutionClient):
         return None
 
     def _denial(self, order: Any) -> str | None:
-        """Why this slice will not send the order, or None. Checked before anything reaches Alpaca."""
+        """Why this slice will not send the order, or None. Checked before anything reaches Alpaca.
+
+        rc8's ExecutionClient retains the owning node's ClientCache (live/clients.py:389-416).
+        ClientCache.instrument is its read-only instrument lookup (crates/live/src/python/client/
+        mod.rs:131-156); native Lighter submission checks use the shared cache too (crates/adapters/
+        lighter/src/execution.rs:2049-2059). A data-only load need not be in this client's provider.
+        """
         instrument = (
             self._provider.find(order.instrument_id) if order.instrument_id.venue == VENUE else None
         )
+        if instrument is None and order.instrument_id.venue == VENUE:
+            instrument = self.cache.instrument(order.instrument_id)
         if not isinstance(instrument, Equity):
             return f"{order.instrument_id} is not a loaded {VENUE} equity"
         if not instrument.info.get("tradable", False):

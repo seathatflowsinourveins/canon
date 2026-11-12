@@ -507,6 +507,8 @@ arg "<module>" help="sandbox: the sandbox node on Alpaca's data (ADR 0070); move
   choices "sandbox" "movers-stream" "movers-screener" "quotes" "bars-list"
 }
 flag "--minutes <minutes>" help="how long the module runs: 1 to 60 for sandbox and movers-stream, 1 to 85 polls for movers-screener, 1 to 60 for bars-list (no load starts after it)" default="10"
+flag "--rank <feed>" help="sandbox only: the whole-market ranking check on sip or boats, no strategy (2026-11-12)"
+flag "--baseline-path <path>" help="sandbox --rank only: the movers baseline the actor reads"
 '''
 run = '''
 deadline=5940
@@ -527,6 +529,8 @@ esac
 tmp="$(/usr/bin/getconf DARWIN_USER_TEMP_DIR)" || tmp=""
 case "$tmp" in /*/) ;; *) echo "paper:data: the per-user temporary folder is not known (DARWIN_USER_TEMP_DIR gave '$tmp'), so there is no stream lock to take or log folder to write; nothing was run" >&2; exit 1 ;; esac
 set -- --minutes "${usage_minutes:-10}"
+[ -z "${usage_rank:-}" ] || { [ "${usage_module:-}" = sandbox ] || { echo "paper:data: --rank is for sandbox only" >&2; exit 3; }; set -- "$@" --rank "$usage_rank"; }
+[ -z "${usage_baseline_path:-}" ] || set -- "$@" --baseline-path "$usage_baseline_path"
 [ "$logs" = 0 ] || set -- "$@" --log-dir "${tmp}canon-paper-data"
 # lock_wait <fd> <secs>: the exclusive lock on an open descriptor, waiting at most <secs>; 0 when held, 1 when the
 # bound ran out (a bound can run over by up to a second), or at once when lockf fails for any reason but the

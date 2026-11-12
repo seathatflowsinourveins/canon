@@ -287,6 +287,7 @@ from nautilus_trader.core.datetime import dt_to_unix_nanos
 from nautilus_trader.core.datetime import unix_nanos_to_dt
 from nautilus_trader.core.datetime import unix_nanos_to_iso8601
 from nautilus_trader.live import BarsResponse
+from nautilus_trader.live import InstrumentResponse
 from nautilus_trader.live import QuotesResponse
 from nautilus_trader.live import TradesResponse
 from nautilus_trader.live.clients import MarketDataClient
@@ -1770,6 +1771,43 @@ class AlpacaDataClient(MarketDataClient):
             self._one_sided_quotes.pop(symbol, None)
 
     # -- historical requests -----------------------------------------------------------------------
+
+    @override
+    async def _request_instrument(self, request: live.RequestInstrument) -> None:
+        """Load one definition, publish it, then answer its request (NautilusTrader rc8).
+
+        Contract: live/clients.py:327 and live/providers.py:110-115; the provider-load/response pattern
+        is crates/adapters/coinbase/src/data/mod.rs:894-930 at d53849b216e2. InstrumentResponse preserves
+        request identity, bounds and params. ClientOutput.request_failed completes a named refusal
+        (crates/live/src/python/client/mod.rs:504-527), without raising into the node.
+        """
+        instrument_id = request.instrument_id
+        try:
+            if self._historical is None:
+                raise RuntimeError("Alpaca data client is not connected")
+            await self._provider.load_async(instrument_id)
+            instrument = self._provider.find(instrument_id)
+            if instrument is None:
+                raise RuntimeError("Alpaca instrument provider returned no definition")
+        except (OSError, RuntimeError, ValueError, TypeError) as e:
+            self._output.request_failed(
+                request.request_id,
+                f"{instrument_id}: instrument request refused: {type(e).__name__}: {e}",
+            )
+            return
+        self._handle_instrument(instrument)
+        self._handle_response(
+            InstrumentResponse(
+                client_id=self.client_id,
+                instrument_id=instrument_id,
+                data=instrument,
+                correlation_id=request.request_id,
+                ts_init=self.clock.timestamp_ns(),
+                start=request.start_ns,
+                end=request.end_ns,
+                params=request.params,
+            )
+        )
 
     @override
     async def _request_bars(self, request: live.RequestBars) -> None:

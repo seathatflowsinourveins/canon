@@ -38,6 +38,13 @@ composition instruction of 2026-11-11. Option 2 remains an explicit compatibilit
 `FixedRank`/`mover_parts`. A live `--strategy Mover --mover` window uses `window_rank` and
 `mover_universe_parts`. Option 3 remains refused by ADR 0088.
 
+On paper nodes, every name outside the start-up roster may enter: with the data client's `load_all` that
+is the whole market, and a name missing from the cache is requested on demand. Such a name carries no
+per-instrument max-notional cap (upstream's default), no start-time share cap and no position monitor;
+its order is bounded by the Mover's size (the entry notional and free balance at the current limit, and
+the flow share) and the request ceiling, and a name without registered history is passed over by name
+until the asynchronous context task lands.
+
 * **The roster** comes from `choose_mover`'s startup ranking sample, under the same freshness, asset,
   action and price filters as the original bridge. The requested count is the part's slots plus
   `spares` (default 2, UNCALIBRATED), bounded by the actor's 20-name ranking interface. The old 10-name

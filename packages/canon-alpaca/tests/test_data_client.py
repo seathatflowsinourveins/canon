@@ -45,6 +45,7 @@ from alpaca.data.enums import DataFeed
 from alpaca.data.historical.stock import StockHistoricalDataClient
 from alpaca.data.requests import StockTradesRequest
 from alpaca.data.timeframe import TimeFrameUnit
+from alpaca.trading.client import TradingClient
 from canon_alpaca.constants import ENV_API_KEY
 from canon_alpaca.constants import ENV_SECRET_KEY
 from canon_alpaca.data import AlpacaDataClient
@@ -60,6 +61,7 @@ from nautilus_trader.config import LiveNodeConfig
 from nautilus_trader.core import UUID4
 from nautilus_trader.core.datetime import dt_to_unix_nanos
 from nautilus_trader.core.datetime import unix_nanos_to_dt
+from nautilus_trader.live import InstrumentResponse
 from nautilus_trader.live import LiveNode
 from nautilus_trader.live import TradesResponse
 from nautilus_trader.model import AggressorSide
@@ -74,6 +76,7 @@ from nautilus_trader.model import TraderId
 from nautilus_trader.persistence import DataCatalogConfig
 from nautilus_trader.persistence import ParquetDataCatalog
 from nautilus_trader.trading import Strategy
+from requests.adapters import HTTPAdapter
 
 AAPL = InstrumentId.from_str("AAPL.ALPACA")
 BAR_TYPE = BarType.from_str("AAPL.ALPACA-1-HOUR-LAST-EXTERNAL")
@@ -397,6 +400,163 @@ def test_alpaca_clients_are_built_for_paper_and_iex(venue) -> None:
         "feed": DataFeed.IEX,
         "data_timeout": canon_alpaca.data.STREAM_DATA_TIMEOUT_SECS,
     }
+
+
+MSFT = InstrumentId.from_str("MSFT.ALPACA")
+
+
+class InstrumentRequester(Strategy):
+    """Request a name outside the startup roster and stop after the routed response."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.request_id: str | None = None
+        self.responses: list[tuple[str, str | None]] = []
+
+    def on_start(self) -> None:
+        self.request_id = self.request_instrument(MSFT)
+
+    def on_data_response(self, response) -> None:
+        self.responses.append((str(response.correlation_id), response.failure_reason))
+        self.shutdown_system("Alpaca instrument request checked")
+
+
+def test_instrument_request_reaches_a_name_outside_the_startup_roster(venue, alpaca) -> None:
+    venue.trading.assets.append({**alpaca.ASSET_AAPL, "symbol": "MSFT"})
+    strategy = InstrumentRequester()
+    node = build_node(strategy)
+    assert node.cache.instrument(MSFT) is None
+
+    run(node, "hosted")
+
+    assert strategy.responses == [(strategy.request_id, None)]
+    assert isinstance(node.cache.instrument(MSFT), Equity)
+    assert venue.trading.symbol_requests == ["AAPL", "MSFT"]
+    assert venue.trading.all_requests == []
+
+
+def test_on_demand_asset_gets_enter_the_existing_trading_request_tally(venue, alpaca, monkeypatch):
+    # The real alpaca-py GET and TimeoutAdapter run; only requests' final transport is answered here.
+    counter = canon_alpaca.providers.RequestCounter()
+    monkeypatch.setattr(canon_alpaca.providers, "REQUESTS", counter)
+    assets = TradingClient(api_key=PLACEHOLDER, secret_key=PLACEHOLDER, paper=True)
+    monkeypatch.setattr(canon_alpaca.providers, "TradingClient", lambda **kwargs: assets)
+    sent: list[tuple[str, str]] = []
+
+    def send(self, request, **kwargs):
+        symbol = request.url.rsplit("/", 1)[-1]
+        sent.append((request.method, symbol))
+        response = requests.Response()
+        response.status_code = 200
+        response._content = json.dumps({**alpaca.ASSET_AAPL, "symbol": symbol}).encode()
+        response.request, response.url = request, request.url
+        return response
+
+    monkeypatch.setattr(HTTPAdapter, "send", send)
+    strategy = InstrumentRequester()
+    run(build_node(strategy), "hosted")
+
+    assert strategy.responses == [(strategy.request_id, None)]
+    assert sent == [("GET", "AAPL"), ("GET", "MSFT")]
+    (count,) = canon_alpaca.providers.request_counts()
+    assert count.api == canon_alpaca.providers.TRADING_API and count.total == count.peak_60s == 2
+
+
+def instrument_request(instrument_id: InstrumentId = MSFT) -> SimpleNamespace:
+    """The documented single-instrument request fields, including response metadata."""
+    return SimpleNamespace(
+        instrument_id=instrument_id,
+        request_id=UUID4(),
+        start_ns=dt_to_unix_nanos(START),
+        end_ns=dt_to_unix_nanos(END),
+        params={"probe": "instrument-response"},
+    )
+
+
+def test_instrument_request_publishes_before_answering_and_keeps_query_metadata(
+    venue, alpaca, monkeypatch
+) -> None:
+    venue.trading.assets.append({**alpaca.ASSET_AAPL, "symbol": "MSFT"})
+    request = instrument_request()
+    delivered: list[tuple[str, object]] = []
+
+    async def body(client) -> None:
+        monkeypatch.setattr(
+            client,
+            "_handle_instrument",
+            lambda instrument: delivered.append(("instrument", instrument)),
+        )
+        monkeypatch.setattr(
+            client, "_handle_response", lambda response: delivered.append(("response", response))
+        )
+        await client._request_instrument(request)
+        await client._request_instrument(request)  # the provider keeps a definition already loaded
+
+    run_with_client(body)
+
+    assert [kind for kind, _ in delivered] == ["instrument", "response"] * 2
+    instrument = delivered[0][1]
+    response = delivered[1][1]
+    assert isinstance(instrument, Equity)
+    assert isinstance(response, InstrumentResponse)
+    assert response.data == instrument
+    assert response.instrument_id == MSFT
+    assert str(response.client_id) == "ALPACA"
+    assert response.correlation_id == request.request_id
+    assert (response.start, response.end, response.params) == (
+        request.start_ns,
+        request.end_ns,
+        request.params,
+    )
+    assert venue.trading.symbol_requests == ["AAPL", "MSFT"]
+
+
+@pytest.mark.parametrize("failure", ["unknown", "inactive", "transport", "foreign"])
+def test_instrument_request_refusal_names_the_symbol_without_raising(
+    venue, alpaca, monkeypatch, failure
+) -> None:
+    instrument_id = InstrumentId.from_str("MSFT.OTHER") if failure == "foreign" else MSFT
+    request = instrument_request(instrument_id)
+    if failure == "inactive":
+        venue.trading.assets.append({**alpaca.ASSET_AAPL, "symbol": "MSFT", "status": "inactive"})
+    elif failure == "transport":
+        venue.trading.errors["MSFT"] = OSError("offline asset transport failed")
+    failures: list[tuple[UUID4, str]] = []
+
+    async def body(client) -> None:
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                client,
+                "_output",
+                SimpleNamespace(request_failed=lambda *args: failures.append(args)),
+            )
+            await client._request_instrument(request)
+        assert client._provider.find(instrument_id) is None
+
+    cache = run_with_client(body)
+
+    assert len(failures) == 1
+    assert failures[0][0] == request.request_id
+    assert str(instrument_id) in failures[0][1]
+    assert cache.instrument(instrument_id) is None
+    assert venue.trading.symbol_requests == (["AAPL"] if failure == "foreign" else ["AAPL", "MSFT"])
+
+
+@pytest.mark.parametrize("failure", ["unknown", "inactive", "transport"])
+def test_instrument_request_refusal_reaches_the_requester(venue, alpaca, failure) -> None:
+    if failure == "inactive":
+        venue.trading.assets.append({**alpaca.ASSET_AAPL, "symbol": "MSFT", "status": "inactive"})
+    elif failure == "transport":
+        venue.trading.errors["MSFT"] = OSError("offline asset transport failed")
+    strategy = InstrumentRequester()
+    node = build_node(strategy)
+
+    run(node, "hosted")
+
+    ((request_id, reason),) = strategy.responses
+    assert request_id == strategy.request_id
+    assert reason is not None and str(MSFT) in reason
+    assert node.cache.instrument(MSFT) is None
 
 
 def test_shutdown_stops_and_joins_the_stream_thread(venue) -> None:
