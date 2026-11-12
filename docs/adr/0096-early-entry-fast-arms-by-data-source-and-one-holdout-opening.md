@@ -220,3 +220,24 @@ means before the freeze.
 
 Nothing was read: no holdout outcome had been computed or seen when this was decided. The development
 population build, still running, is an input to the read, not to the freeze.
+
+## Amendment, 2026-11-12: the freeze's stamp, amendments 1 to 11 as tracked drafts, and when text is registered
+
+* **The freeze.** `canon/holdout-adr0096-freeze.json` landed as pull request #295, merge commit
+  `a76622148056be06ce1f44cb73696d3ef0014217`, merged by GitHub at 2026-11-12T13:31:24Z (08:31 New York),
+  before 09:30. It names `main` at `7b39a1afdfba96a30bdafe7f2f9e8484b8520491`, whose files it hashes; the
+  one commit between that and its merge (#294) changes none of them.
+* **Amendments 1 to 11, as drafted.** The text the freeze binds (its admitted and pending arms' reasons, and its
+  commit's message, name both hashes; its own `amendments` hash is of this file at `7b39a1a`) is tracked in
+  `docs/adr/0096-amendments/`,
+  byte for byte as hashed: `adr0096-with-amendments-1-9.md`, this record with amendments 1 to 9 as last
+  written on 2026-11-12 at 02:11 New York (SHA-256
+  `6cddb5d2c0d74152fb40d992a7be2c78506b53c0b5b72a7f49528760816dd556`), and `adr0096-amendments-10-11.diff`,
+  amendments 10 and 11 as a diff that applies on top of it (SHA-256
+  `f5f8ac1737ccb9aef76ee3a8fd6ec398130ac369b7e9d2e45c987cb6804f2241`). They are kept as written, a
+  working label included, because byte-identity is what the freeze binds. Their front matter and their
+  place differ from this file's, so they are an appendix to it, not merged into its text; they bind as
+  this record's amendments from this landing.
+* **When text is registered** (the lead's standing rule, 2026-11-12): an arm, a base or a clarification
+  is registered when its text is hashed and the hash is written, with its time, in a tracked file or the
+  coordinator's dated digest, in the same step. Text that exists only in a worktree is a draft.
