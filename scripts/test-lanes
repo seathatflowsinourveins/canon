@@ -1169,8 +1169,12 @@ printf '#!/bin/sh\nprintf "%%s|" "$@"\n' >"$TMP/sn/bin/uv"; chmod +x "$TMP/sn/bi
 sn() { PATH="$TMP/sn/bin:$PATH" CLAUDE_CONFIG_DIR="$TMP/sn/cfg" bash -c "$(task_part study:nightly run)" study; }
 # shellcheck disable=SC2034  # read by the eval'd checks
 { sn_temp=$(sn); mkdir -p "$TMP/sn/cfg/canon/watch/windows"; sn_kept=$(sn); }
+# the temp folder's, as the task finds it: macOS's per-user one, and none where getconf has no such name (Linux)
+sn_tmp=$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null) || sn_tmp=""
+# shellcheck disable=SC2034  # read by the eval'd check
+case "$sn_tmp" in /*/) sn_want="--windows|${sn_tmp}canon-paper-session|" ;; *) sn_want="" ;; esac
 check "study:nightly counts the kept window records when paper:session has kept them, else the temp folder's" \
-      eval '[ "$sn_kept" = "run|--locked|python|-m|canon_trading.nightly_study|--windows|$TMP/sn/cfg/canon/watch/windows|" ] && [ "$sn_temp" = "run|--locked|python|-m|canon_trading.nightly_study|--windows|$(getconf DARWIN_USER_TEMP_DIR)canon-paper-session|" ]'
+      eval '[ "$sn_kept" = "run|--locked|python|-m|canon_trading.nightly_study|--windows|$TMP/sn/cfg/canon/watch/windows|" ] && [ "$sn_temp" = "run|--locked|python|-m|canon_trading.nightly_study|$sn_want" ]'
 check "scripts/automation's longest firing is the runner's fetch bound, the task's timeout and mise's start" \
       eval 'grep -q "^PAPER_FIRING=\$((120 + PAPER_DEADLINE + 300))" "$ROOT/scripts/automation" && grep -q "^FETCH_SECS=\${CANON_PAPER_FETCH_SECS:-120}\$" "$RUNNER" && [ "$(num START_SECS "$RUNNER")" = 300 ]'
 check "... mise's start covers its two keychain reads"   test "$(num START_SECS "$RUNNER")" -ge 60
