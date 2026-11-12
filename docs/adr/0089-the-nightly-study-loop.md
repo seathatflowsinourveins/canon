@@ -103,7 +103,7 @@ search and not with what was registered.
 | Sample | from the first instant on or after 2026-11-11 00:00 New York that the catalog covers for both, to the last common bar at or before each night's cutoff | term 3 |
 | Costs | zero rates, as every trial key holds | ADR 0067 |
 
-**UNCALIBRATED rows** (for `docs/handbook/rows.md`, not yet on `main`): five sessions; the five minutes
+**UNCALIBRATED rows** (in `docs/handbook/rows.md`): five sessions; the five minutes
 after the close; three attempts; a quote no older than one minute at an entry; a firing every 30 minutes;
 the cost shape above. Five sessions is where the measured false-pass rate falls under 5% (Confirmation),
 and the lead confirmed it as the starting row on 2026-11-11. Two records disagree with it and are not
