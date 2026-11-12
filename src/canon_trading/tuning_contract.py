@@ -19,6 +19,7 @@ from nautilus_trader.model import TriggerType
 
 from .early_entry_study import Rows
 from .mover import OWN_FIELDS
+from .mover import PERSISTENCE_FIELDS
 from .mover import MoverConfig
 
 BARS_REPLAY_FIXED_ROWS: dict[str, Any] = {
@@ -88,6 +89,8 @@ class RankedConfiguration:
             if name in BARS_REPLAY_FIXED_ROWS and name not in self.fields:
                 decoded[name] = BARS_REPLAY_FIXED_ROWS[name]
                 continue
+            if name in PERSISTENCE_FIELDS and name not in self.fields:
+                continue  # keyed with both arms off, which leaves the rows out: `MoverConfig`'s off
             value = self.fields[name]
             if kind is Decimal:
                 if not isinstance(value, str):
