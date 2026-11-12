@@ -742,8 +742,9 @@ Each is stated in `execution.py`'s header, with its source.
   ([ADR 0036](../../docs/adr/0036-alpaca-adapter-order-management.md)); cash finer than a cent is reported to the cent, with a warning. An answer
   without `cash` or `currency` is refused naming the field: a connect fails, a query leaves the state as
   it was. Buying power, margin and
-  shorting are not modelled; `equity`, `buying_power` and the
-  account number are kept in the account state's `info`.
+  shorting are not modelled; the account number, `status`, `equity`, `buying_power`,
+  `non_marginable_buying_power` (as Alpaca sends it, or `None`) and `trading_blocked` are kept in the
+  account state's `info`.
 * **Stream:** alpaca-py does not expose the stream's `listening` acknowledgement, so updates sent before
   it is listening are missed. alpaca-py reconnects the stream by itself after a websocket or connection
   error, with backoff, logging only through Python `logging`, and updates sent while it was down are not

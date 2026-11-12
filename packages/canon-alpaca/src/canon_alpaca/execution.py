@@ -32,6 +32,11 @@ shows Alpaca refusing the field when the sell would open a short (ADR 0111's Con
 order is not among them until that is shown for it: with `reduce_only_sells` a reduce-only market SELL is
 denied before transport, and with `sell_to_close_on_long_exits` a market SELL of a long stays a plain sell.
 
+Account metadata contract: alpaca-py c42add7c `alpaca/trading/models.py:626` declares
+`TradeAccount.non_marginable_buying_power`; NautilusTrader d53849b2
+`crates/model/src/events/account/state.rs:29-32,63-65` preserves venue-specific fields in
+`AccountState.info`. The account report carries this optional value unchanged beside buying_power.
+
 Modify (ADR 0042) rests on Alpaca's "Replace Order by ID"
 (https://docs.alpaca.markets/us/reference/patchorderbyorderid-1.md) and on a paper observation of
 2026-11-10, 3 of 3 runs, for what that page does not state. The PATCH answer is "The new Order object with
@@ -1641,6 +1646,7 @@ class AlpacaExecutionClient(ExecutionClient):
                 "status": account.status.value,
                 "equity": account.equity,
                 "buying_power": account.buying_power,
+                "non_marginable_buying_power": account.non_marginable_buying_power,
                 "trading_blocked": account.trading_blocked,
             },
         )
