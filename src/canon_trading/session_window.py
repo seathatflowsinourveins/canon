@@ -2481,6 +2481,7 @@ def run_window(
         # record's `entry_limit` is then this strategy's, not the bridge's through the touch
         data = window_data()
         priced: list[MoverPick] = []
+        overnight_said: list[str] = []
         for chosen in pick.picks:
             try:
                 limit = mover_entry_limit(data, chosen.symbol, feed=feed)
@@ -2489,12 +2490,36 @@ def run_window(
                     f"no usable entry limit under the entry figure of {entry_notional} USD: {error}"
                 )
                 continue
+            except FAILED as error:
+                # a spare whose read raises is passed over by name; the chosen name's refuses (the
+                # lead's ruling of 2026-11-12 on the ultra review of the composition, finding 8)
+                if chosen is pick.picks[0]:
+                    raise WindowRefused(
+                        f"the latest quote of the chosen name {chosen.symbol} could not be read "
+                        f"({type(error).__name__}: {error}); not starting"
+                    ) from error
+                mover.setdefault("passed_over", {})[chosen.symbol] = (
+                    f"its latest quote could not be read: {type(error).__name__}: {error}"
+                )
+                continue
             if limit > entry_notional:
                 mover.setdefault("passed_over", {})[chosen.symbol] = (
                     f"one share of {chosen.symbol} at its entry limit of {limit} USD is over {MOVER}'s "
                     f"entry figure of {entry_notional} USD"
                 )
                 continue
+            if part == "overnight":
+                # re-checked by name: a spare that fails is passed over, the chosen name's failure
+                # refuses (the same ruling, finding 7)
+                try:
+                    overnight_said.append(overnight_eligibility(trading, chosen.symbol))
+                except WindowRefused as error:
+                    if not priced:
+                        raise
+                    mover.setdefault("passed_over", {})[chosen.symbol] = (
+                        f"the overnight re-check failed: {error}"
+                    )
+                    continue
             priced.append(replace(chosen, price=limit, entry=limit, others=()))
         if not priced:
             raise WindowRefused(
@@ -2546,11 +2571,12 @@ def run_window(
             }
             for instrument_id, context in entry_contexts.items()
         }
-    overnight = (
-        "; ".join(overnight_eligibility(trading, symbol) for symbol in window_symbols)
-        if part == "overnight"
-        else ""
-    )
+    if part != "overnight":
+        overnight = ""
+    elif config.strategy == MOVER and pick is not None:
+        overnight = "; ".join(overnight_said)  # re-checked name by name above
+    else:
+        overnight = "; ".join(overnight_eligibility(trading, symbol) for symbol in window_symbols)
 
     now = clock.timestamp.astimezone(NEW_YORK)
     seconds, shortened = window_seconds(config.minutes, (end_of_session - now).total_seconds())

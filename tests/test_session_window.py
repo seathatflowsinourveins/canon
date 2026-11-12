@@ -8752,3 +8752,128 @@ def test_a_spare_without_an_ask_is_recorded_and_does_not_abort_the_affordable_na
     assert not isinstance(outcome, RuntimeError), str(outcome)
     assert report["result"] == "ok" and [p.symbol for p in seen["pick"].picks] == ["LLL"]
     assert "no ask" in report["mover"]["passed_over"]["EEE"]
+
+
+def a_spare(symbol: str = "EEE") -> session_window.MoverPick:
+    """`mover_pick`'s LLL chosen, with one spare."""
+    return replace(
+        mover_pick(),
+        others=(session_window.MoverPick(symbol, Decimal(2), {"inputs": {}}, Decimal(2)),),
+    )
+
+
+class Night(Evening):
+    """`Evening` whose asset read for `failing` says `failure`: halted overnight, or a read that raises."""
+
+    def __init__(self, hour: int, failing: str, failure: str, **kwargs) -> None:
+        super().__init__(hour, **kwargs)
+        self.failing, self.failure = failing, failure
+
+    def get(self, path):
+        if path == f"/assets/{self.failing}":
+            if self.failure == "unreadable":
+                raise OSError("Read timed out")
+            return {
+                "symbol": self.failing,
+                "attributes": ["overnight_tradable", "overnight_halted"],
+            }
+        return super().get(path)
+
+
+@pytest.mark.parametrize("failure", ["halted", "unreadable"])
+def test_overnight_a_spare_that_fails_its_re_check_is_passed_over_by_name(
+    monkeypatch, tmp_path, failure
+):
+    """ultra-3a8613a/7, the lead's ruling of 2026-11-12: overnight, a spare that fails its eligibility
+    re-check, halted or unread, is passed over by name; the chosen name runs."""
+    monkeypatch.setattr(session_window, "choose_mover", lambda *a, **k: a_spare())
+    monkeypatch.setattr(session_window, "window_data", lambda: Quoted())
+    monkeypatch.setattr(session_window, "mover_entry_contexts", lambda *a, **k: {})
+    outcome, latest, seen = quiet_window(
+        monkeypatch,
+        tmp_path,
+        quotes=5,
+        trades=5,
+        account=Night(21, "EEE", failure),
+        session="extended",
+        mover=True,
+        strategy="Mover",
+    )
+    assert not isinstance(outcome, Exception), outcome
+    assert latest["result"] == "ok" and [p.symbol for p in seen["pick"].picks] == ["LLL"]
+    assert "overnight" in latest["mover"]["passed_over"]["EEE"]
+    assert [r["symbol"] for r in latest["mover"]["roster"]] == ["LLL"]
+
+
+@pytest.mark.parametrize("failure", ["halted", "unreadable"])
+def test_overnight_the_chosen_names_failed_re_check_still_refuses(monkeypatch, tmp_path, failure):
+    """ultra-3a8613a/7: only the chosen name's failed re-check refuses the window."""
+    monkeypatch.setattr(session_window, "choose_mover", lambda *a, **k: a_spare())
+    monkeypatch.setattr(session_window, "window_data", lambda: Quoted())
+    monkeypatch.setattr(session_window, "mover_entry_contexts", lambda *a, **k: {})
+    with pytest.raises(session_window.WindowRefused, match="LLL"):
+        quiet_window(
+            monkeypatch,
+            tmp_path,
+            quotes=5,
+            trades=5,
+            account=Night(21, "LLL", failure),
+            session="extended",
+            mover=True,
+            strategy="Mover",
+        )
+
+
+class RaisingQuotes(Quoted):
+    """`Quoted` whose latest-quote read for `failing` raises `error`."""
+
+    def __init__(self, failing: str, error: Exception) -> None:
+        super().__init__()
+        self.failing, self.error = failing, error
+
+    def get_stock_latest_quote(self, request_params) -> dict:
+        if request_params.symbol_or_symbols == self.failing:
+            raise self.error
+        return super().get_stock_latest_quote(request_params)
+
+
+QUOTE_ERRORS = [
+    pytest.param(
+        lambda: APIError('{"code": 50010000, "message": "internal server error"}'), id="api"
+    ),
+    pytest.param(lambda: OSError("Read timed out"), id="timeout"),
+]
+
+
+@pytest.mark.parametrize("error", QUOTE_ERRORS)
+def test_a_spare_whose_quote_read_raises_is_passed_over_by_name(monkeypatch, tmp_path, error):
+    """ultra-3a8613a/8, the lead's ruling of 2026-11-12: a spare whose latest-quote read raises (an
+    Alpaca error after alpaca-py's retries, or a timeout) is passed over by name; the chosen name runs."""
+    monkeypatch.setattr(session_window, "choose_mover", lambda *a, **k: a_spare())
+    monkeypatch.setattr(session_window, "window_data", lambda: RaisingQuotes("EEE", error()))
+    monkeypatch.setattr(session_window, "mover_entry_contexts", lambda *a, **k: {})
+    outcome, latest, seen = quiet_window(
+        monkeypatch, tmp_path, quotes=5, trades=5, account=Assets(), mover=True, strategy="Mover"
+    )
+    assert not isinstance(outcome, Exception), outcome
+    assert latest["result"] == "ok" and [p.symbol for p in seen["pick"].picks] == ["LLL"]
+    assert "could not be read" in latest["mover"]["passed_over"]["EEE"]
+
+
+@pytest.mark.parametrize("error", QUOTE_ERRORS)
+def test_the_chosen_names_raising_quote_read_refuses_and_is_recorded(monkeypatch, tmp_path, error):
+    """ultra-3a8613a/8: the chosen name's raising quote read refuses the window with `WindowRefused`,
+    which `_main` records as the latest result, so it is this window's, not the one before it."""
+    monkeypatch.setattr(session_window, "choose_mover", lambda *a, **k: a_spare())
+    monkeypatch.setattr(session_window, "window_data", lambda: RaisingQuotes("LLL", error()))
+    monkeypatch.setattr(session_window, "mover_entry_contexts", lambda *a, **k: {})
+    with pytest.raises(session_window.WindowRefused, match="LLL"):
+        quiet_window(
+            monkeypatch,
+            tmp_path,
+            quotes=5,
+            trades=5,
+            account=Assets(),
+            mover=True,
+            strategy="Mover",
+        )
