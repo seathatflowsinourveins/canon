@@ -17,8 +17,8 @@ spares setting adds watched names for rotation.
 window_rank retains every tick's public record from ADR 0087's actor. No actor generation means no
 entry; the startup roster's order is never substituted. mover_context_feeds keeps each roster name's
 Day prefix current even while it is unranked, through the node's existing data client and external
-minute bars; a completed native history request repairs a gap, and a failed one marks the context
-missing. The strategy itself requests no data. entry_diagnostics reads qualification delay and the move
+minute bars; a completed native history request repairs a gap, and a failed one leaves coverage where
+it was and is asked again in a later minute. The strategy itself requests no data. entry_diagnostics reads qualification delay and the move
 still ahead from the window's own orders, bars and per-name reference closes.
 
 FixedRank/mover_parts remain the explicit single-name bridge used by compatibility simulations. They
@@ -107,7 +107,8 @@ def mover_context_feeds(strategy: Mover, feed: str) -> tuple[DataActor, ...]:
     Contract: rc8 DataActor.subscribe_bars/request_bars, on_historical_bars/on_data_response and clock
     timers (`common/__init__.pyi:830,1066-1086`); the request/response pair is also bars_to_catalog's.
     A native request fills a startup or stream gap; only its successful completion grants coverage,
-    including sparse no-trade minutes. A failed read marks Day.missing and admits no entry. No client,
+    including sparse no-trade minutes. A failed read leaves coverage unchanged, so no entry passes past
+    it, and is asked again at the first refresh of a later minute. No client,
     stream or credential is created here. Each actor has at most one request outstanding.
     """
     return tuple(
@@ -129,6 +130,7 @@ def _context_feed(
         pending = False
         need_history = True
         target = 0
+        failed_target: int | None = None
 
         def on_start(self) -> None:
             self.subscribe_bars(bar_type, params=params)
@@ -149,6 +151,8 @@ def _context_feed(
                 self.clock.timestamp_ns() // 1_000_000_000, UTC
             ).astimezone(study.NEW_YORK)
             self.target = min(study.WINDOW_END, max(study.PART_START, now.hour * 60 + now.minute))
+            if self.failed_target is not None and self.target <= self.failed_target:
+                return  # a failed read is asked again once the minute moves, not every tick
             if self.target <= day.covered_to:
                 self.need_history = False
                 return
@@ -206,13 +210,18 @@ def _context_feed(
                 return
             day = contexts[instrument]
             if response.failure_reason:
-                contexts[instrument] = replace(
-                    day, missing=f"native history: {response.failure_reason}"
+                # coverage stays where it was and a later minute asks again, so one failed
+                # response does not end the name's entries (the lead's ruling of 2026-11-12 on the
+                # ultra review of the composition, finding 5)
+                self.log.warning(
+                    f"native history for {instrument} failed, asked again in a later minute: "
+                    f"{response.failure_reason}"
                 )
-                self.pending = False
+                self.pending, self.need_history = False, True
+                self.failed_target = self.target
             elif response.completed:
                 contexts[instrument] = replace(day, covered_to=max(day.covered_to, self.target))
-                self.pending = False
+                self.pending, self.failed_target = False, None
                 self._advance()
 
     return ContextFeed(DataActorConfig(actor_id=ActorId(f"EntryContext-{index:03}")))

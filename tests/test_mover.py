@@ -1268,10 +1268,14 @@ def test_the_actor_reranks_the_loaded_roster_and_a_freed_slot_rotates(tmp_path) 
     assert flat and all(cap.tripped is None for cap in caps)
 
 
-@pytest.mark.parametrize("failed", [False, True])
-def test_startup_context_gaps_use_the_nodes_history_and_failed_reads_refuse_entry(
+@pytest.mark.parametrize("failed", ["never", "always", "once"])
+def test_startup_context_gaps_use_the_nodes_history_and_a_failed_read_is_retried(
     monkeypatch, failed
 ) -> None:
+    """ultra-3a8613a/5, the lead's ruling of 2026-11-12: a failed native history read leaves the
+    name's coverage unchanged and is asked again at the next refresh, so one 5xx, timeout or 429
+    does not take the name out of registered-arm entries for the rest of the window; while it keeps
+    failing, an entry is refused as not covered, and it is asked again once a minute, not each tick."""
     eng = engine()
     s = strategy(entry_arm="registered", protect=False, entries=1)
     s.entry_contexts[AAA] = replace(entry_day(RISING, 1000), bars=(), covered_to=659)
@@ -1280,12 +1284,11 @@ def test_startup_context_gaps_use_the_nodes_history_and_failed_reads_refuse_entr
 
     def history(bar_type, **kwargs):
         requests.append((str(bar_type), kwargs))
+        fails = failed == "always" or (failed == "once" and len(requests) == 1)
         context_feed.on_data_response(
             cast(
                 Any,
-                SimpleNamespace(
-                    completed=True, failure_reason="history failed" if failed else None
-                ),
+                SimpleNamespace(completed=True, failure_reason="history failed" if fails else None),
             )
         )
         return "context-request"
@@ -1294,19 +1297,26 @@ def test_startup_context_gaps_use_the_nodes_history_and_failed_reads_refuse_entr
     eng.add_actor(context_feed)
     orders = run(eng, s, ranker(rank((AAA, "0.25"))), entry_tape(RISING))
     eng.dispose()
-    assert len(requests) == 1
     bar_type, request = requests[0]
     assert bar_type == "AAA.ALPACA-1-MINUTE-LAST-EXTERNAL"
     assert request["params"] == {"feed": "sip"}
     assert request["start"] == at(T0 - MINUTE)
     assert request["end"] == at(T0)
     buys = [o for o in orders if o.side == OrderSide.BUY]
-    assert bool(buys) is not failed
-    if failed:
-        assert any("history failed" in why for why in s.dropped)
-        assert "history failed" in s.record()["entry_contexts"][str(AAA)]["missing"]
+    context = s.record()["entry_contexts"][str(AAA)]
+    assert context["missing"] is None
+    if failed == "never":
+        assert len(requests) == 1 and buys
+    elif failed == "once":
+        assert len(requests) == 2 and buys
+        assert requests[1][1]["start"] == at(T0 - MINUTE), "coverage moved on a failed read"
     else:
-        assert s.record()["entry_contexts"][str(AAA)]["covered_to"] >= 668
+        assert len(requests) > 2 and not buys
+        ends = [r[1]["end"] for r in requests]
+        assert len(set(ends)) == len(ends), "a failed read was asked again inside one minute"
+        assert any("coverage does not reach" in why for why in s.dropped)
+    if buys:
+        assert context["covered_to"] >= 668
 
 
 @pytest.mark.parametrize("baseline", ["missing", "other-session"])

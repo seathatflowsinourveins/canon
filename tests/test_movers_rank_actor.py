@@ -21,6 +21,7 @@ import json
 import threading
 import time
 from concurrent.futures import Future
+from dataclasses import replace
 from datetime import UTC
 from datetime import date
 from datetime import datetime
@@ -1033,3 +1034,42 @@ def test_each_generation_record_carries_its_ranked_table_and_symbol_count(tmp_pa
     assert {row["tier"] for row in top} <= {"ratio", "dollar"}
     assert all(row["data_age_secs"] is not None and row["data_age_secs"] >= 0 for row in top)
     json.dumps(record, allow_nan=False)
+
+
+@pytest.mark.parametrize("unusable", ["no references", "no splits"])
+def test_an_empty_or_unusable_reference_read_is_retried_and_publishes_nothing_meanwhile(
+    tmp_path: Path, unusable: str
+) -> None:
+    """ultra-3a8613a/12, the lead's ruling of 2026-11-12: a reference or split read that comes back
+    empty or unusable without raising counts as failed: it is retried, and the ranking is unpublished
+    with a reason, never an empty ranking published as fresh."""
+    calls: list[tuple[date, date]] = []
+
+    def empty(symbols: Sequence[str], cutoff: date, session: date) -> ReferenceRead:
+        calls.append((cutoff, session))
+        good = stub_reader()(symbols, cutoff, session)
+        if unusable == "no references":
+            return replace(good, references={})
+        return replace(good, splits=None)
+
+    actor, subscriber = run(market(5), baseline_path=write_stub_baseline(tmp_path), reader=empty)
+    assert subscriber.signals == []
+    assert len(calls) >= 2, "the unusable read was not retried"
+    assert actor.last_record is not None and actor.last_record["published"] is False
+    reasons = actor.last_record["reasons"]
+    assert isinstance(reasons, list)
+    assert any("references and splits not usable" in r for r in reasons), reasons
+
+
+def test_an_unusable_reference_read_that_comes_back_usable_publishes(tmp_path: Path) -> None:
+    """ultra-3a8613a/12: once the retried read is usable, the actor publishes."""
+    calls: list[tuple[date, date]] = []
+
+    def late(symbols: Sequence[str], cutoff: date, session: date) -> ReferenceRead:
+        calls.append((cutoff, session))
+        good = stub_reader()(symbols, cutoff, session)
+        return replace(good, references={}) if len(calls) == 1 else good
+
+    actor, subscriber = run(market(5), baseline_path=write_stub_baseline(tmp_path), reader=late)
+    assert len(calls) >= 2 and subscriber.signals
+    assert actor.last_record is not None and actor.last_record["published"] is True

@@ -168,6 +168,17 @@ class ReferenceRead:
     read_ns: int
 
 
+def reference_problem(read: ReferenceRead) -> str | None:
+    """Why a reference read that returned is not usable, or None: no reference close, or no split read.
+    Such a read counts as failed and is retried, and the ranking is unpublished meanwhile (the lead's
+    ruling of 2026-11-12 on the ultra review of the composition, finding 12)."""
+    if not read.references:
+        return "no reference close was read"
+    if read.splits is None:
+        return "the splits were not read"
+    return None
+
+
 class ReferenceReader(Protocol):
     def __call__(self, symbols: Sequence[str], cutoff: date, session: date) -> ReferenceRead: ...
 
@@ -357,6 +368,8 @@ class MoversRankActor(DataActor):
         }
         reasons = self._take_invalid()
         refs = self._result(self._refs, "references and splits", reasons)
+        if refs is not None and (problem := reference_problem(refs)) is not None:
+            reasons.append(f"references and splits not usable: {problem}")
         baseline = self._result(self._baseline, "baseline", reasons)
         no_baseline = baseline is not None and baseline.absent and self._rank_without_baseline
         if no_baseline:
@@ -423,7 +436,7 @@ class MoversRankActor(DataActor):
         session = trade_date(now)
         cutoff = reference_cutoff(now)
         key = (cutoff, session)
-        if self._refs_key != key or self._read_failed(self._refs):
+        if self._refs_key != key or self._refs_unusable(self._refs):
             self._refs_key = key
             symbols = sorted(self._assets)
             self._refs = self._submit(lambda: self._reference_reader(symbols, cutoff, session))
@@ -434,11 +447,13 @@ class MoversRankActor(DataActor):
             )
 
     @staticmethod
-    def _read_failed[T](future: Future[T] | None) -> bool:
-        """Whether a finished read failed; a pending or cancelled read is not retried here."""
+    def _refs_unusable(future: Future[ReferenceRead] | None) -> bool:
+        """Whether a finished reference read failed or returned one `reference_problem` names."""
         if future is None or not future.done() or future.cancelled():
             return False
-        return future.exception() is not None
+        if future.exception() is not None:
+            return True
+        return reference_problem(future.result()) is not None
 
     @staticmethod
     def _baseline_unusable(future: Future[movers_rank.BaselineRead] | None) -> bool:
