@@ -3,7 +3,7 @@
 An out-of-tree NautilusTrader adapter for Alpaca, built on `alpaca-py`.
 
 **Status: data slice and first execution slice, paper only.** It loads US equities as instruments, serves
-historical bars and quotes on request and streams quotes and trades, all against Alpaca's paper data. Its execution
+historical bars, quotes and trades on request and streams quotes and trades, all against Alpaca's paper data. Its execution
 client sends market, limit, stop and stop-limit orders for US equities to Alpaca's **paper** Trading API, cancels them one
 at a time or all of an instrument's at once, turns Alpaca's trade updates into order events and fills, and
 reports orders and positions for reconciliation at start-up. Its config refuses anything but paper
@@ -23,7 +23,7 @@ Follows upstream's adapter template, `examples/live/_template/` at the pinned Na
 |---|---|---|
 | `constants.py` | Venue identity (`ALPACA`), credential variable names, feed, price increment, each with its source | Built |
 | `providers.py` | `AlpacaInstrumentProvider`: US equities from Alpaca's `/v2/assets` as `Equity` instruments | Built |
-| `data.py` | `AlpacaDataClient` (`MarketDataClient`): `_request_bars`, `_request_quotes`, `_subscribe_quotes`, `_subscribe_trades` and their unsubscribes; `AlpacaDataClientConfig`, the stream's silence bounds | Built |
+| `data.py` | `AlpacaDataClient` (`MarketDataClient`): `_request_bars`, `_request_quotes`, `_request_trades`, `_subscribe_quotes`, `_subscribe_trades` and their unsubscribes; `AlpacaDataClientConfig`, the stream's silence bounds | Built |
 | `factories.py` | `AlpacaDataClientFactory`, `AlpacaExecutionClientFactory` | Built |
 | `execution.py` | `AlpacaExecutionClient` (`ExecutionClient`): account state on connect, `_submit_order`, `_modify_order`, `_cancel_order` and `_cancel_all_orders` for market, limit, stop and stop-limit orders, trade updates as order events and fills, order and position status reports; `AlpacaExecutionClientConfig`, which refuses anything but paper trading | Built (first slice) |
 
@@ -67,6 +67,18 @@ into it, as ADR 0040 does for bars
 ```python
 self.request_quotes(instrument_id, start=start, end=end, params={"update_catalog": True})
 ```
+
+Historical trades use the same default IEX feed as bars and subscriptions. A request may name `iex`,
+`sip`, `otc` or `boats`, the feeds Alpaca documents for its
+[single-symbol historical trades endpoint](https://docs.alpaca.markets/us/reference/stocktradesingle-1):
+
+```python
+self.request_trades(instrument_id, start=start, end=end, params={"feed": "iex"})
+```
+
+Only `feed` is supported as a venue option on trade requests. `asof` and `currency` in params are
+refused explicitly: Alpaca's current-day symbol mapping and default USD prices apply. The engine's
+own params, such as `update_catalog`, are preserved; they are not sent to Alpaca.
 
 Register the execution client the same way, with its own config class:
 
@@ -185,17 +197,61 @@ Each is stated where it is implemented, with its source.
   `limit` is answered and not written back. The catalog encodes a file whole, writes it as
   `<name>#<n>` and renames it into place, so a process killed while writing leaves either no data file
   or the complete one, and at most that staging file, which the catalog does not read.
-* **Bars:** `LAST`, `EXTERNAL`, MINUTE, HOUR, DAY or WEEK (DAY and WEEK at step 1 only); stamped at the
-  open by Alpaca, so `ts_event` is the open and `ts_init = ts_event + interval`, per NautilusTrader's bar
-  timestamp convention, where `interval` is the bar's fixed length: 24 hours for a day, 168 for a week.
+* **Historical bars:** `LAST`, `EXTERNAL`, MINUTE, HOUR, DAY or WEEK (DAY and WEEK at step 1 only);
+  stamped at the open by Alpaca, so `ts_event` is the open and `ts_init = ts_event + interval`, per
+  NautilusTrader's bar execution-simulation convention, where `interval` is the bar's fixed length:
+  24 hours for a day, 168 for a week.
   `ts_init` is not the end of trading. Alpaca opens daily and weekly bars at midnight New York time
   (UNVERIFIED until the paper test runs), so a daily bar's `ts_init` is 24 hours later, hours after the
   16:00 close. Across a clock change that is not midnight: a bar spanning the autumn change ends at 23:00
   New York, one spanning the spring change at 01:00 the next day. US clocks change early on Sundays, so
   trading-day daily bars never span a change; weekly bars do.
+* **Streamed bars and trading statuses (2026-11-11, ADR 0090):** `subscribe_bars` takes
+  `<SYMBOL>.ALPACA-1-MINUTE-LAST-EXTERNAL`, the one bar Alpaca's stream carries, and refuses any other bar
+  type with `Cannot subscribe:`. A streamed bar's `ts_event` is its open and `ts_init` its local
+  receipt/normalization time, following NautilusTrader's pinned
+  [timestamp semantics](https://github.com/nautechsystems/nautilus_trader/blob/d53849b216e20f2c122ca01b4dd0da377638b186/docs/concepts/data/index.md#timestamps).
+  Its interval end is `ts_event + bar_type.spec.get_interval_ns()`; consumers must derive that boundary
+  rather than compare the next open with the preceding receipt time. Its prices are rounded and counted
+  as a trade's are. `params={"updated_bars": True}`
+  also hands on Alpaca's `updatedBars`, sent after a late trade, as a second bar of the same type for that
+  minute; off by default. `subscribe_instrument_status` hands on one `InstrumentStatus` per Alpaca status,
+  its code mapped to a `MarketStatusAction` (`STATUS_ACTIONS`: halt, pause, resume, quotation resumption,
+  price indication, short sale restriction; any other code `NONE`). `params={"wildcard": True}` on either
+  subscribes `"*"` once per channel and hands on only the listed symbols; the last listed symbol's
+  unsubscribe unsubscribes `"*"`. Quotes and trades refuse it. Bars carry no trade count or VWAP, since
+  NautilusTrader's `Bar` has none; whether the paper data subscription serves `statuses` is `UNVERIFIED`.
 * **Trades** carry no aggressor side (`NO_AGGRESSOR`). Alpaca's trade cancels, errors and corrections
   are logged as warnings naming the symbol and trade ID; a trade tick already emitted cannot be withdrawn
   or corrected.
+* **Trade history** (`_request_trades`): one loaded instrument per request, using
+  `GET /v2/stocks/{symbol}/trades` through alpaca-py's existing HTTP session. Every page is read,
+  including a short or empty page with a `next_page_token`, until the token ends or the request's total
+  `limit` of valid trades is reached; each page asks for at most 10,000 records and the remaining limit,
+  which is enforced even if the server over-returns. An empty string, malformed token or repeated
+  page token fails the request. A collection is capped at 1,000 pages, the pinned NautilusTrader Derive client's collection
+  cap; if more history remains it fails, and the caller shortens the window. This bounds page count,
+  with the existing HTTP timeouts still applying to each call. The response symbol must match the
+  request, and malformed pages or rows fail with the symbol, page number and token named. Symbols
+  are quoted as one URL path segment. Alpaca's documented `u` field is checked before the SDK drops it:
+  `canceled` and `incorrect` prints are excluded, counted and logged, while ordinary trades and
+  `corrected` replacements are kept; condition flags alone do not invalidate a print. Results are
+  requested in ascending timestamp order and delivered in one `TradesResponse`, preserving the request
+  ID, bounds and params. The inclusive window is cut at now, and a missing start uses midnight New York
+  of the end's day, as quotes do. Bounds and raw trade timestamps retain nanoseconds, including the
+  `+1 ns` legs the catalog creates after existing coverage; only in-window valid trades consume a
+  request's limit. Each tick's `ts_init` equals its own `ts_event`; trade IDs and whole-share
+  sizes are preserved. Prices are rounded half to even and any rounding counted and named, as on the
+  trade stream. A failed page or unconvertible trade fails the whole request; no partial response is
+  emitted. The HTTP lock covers every page and history is gathered in memory, so callers keep windows
+  small; tick conversion yields to the node's loop every 10,000 trades. Catalog keys do not distinguish
+  feeds, so callers must keep one feed per instrument for both reading and writing a registered
+  catalog. Covered `request_trades` ranges are read from that catalog regardless of `params["feed"]`,
+  even without `update_catalog`; an uncovered range may therefore merge stored IEX prints with
+  newly requested SIP prints. `params={"feed": "sip", "skip_catalog_data": True}` bypasses catalog
+  reads and requests the full window from SIP, but a write-back still uses the same instrument key.
+  Offline HTTP and node
+  tests verify this path; its response from the paper data API remains **UNVERIFIED**.
 * **Feed:** named in a subscription's or bars request's params, `{"feed": "boats"}`, the channel the
   adapter guide documents for adapter-specific options, as upstream's Databento (`schema`) and OKX
   (`rpi`) adapters choose a venue channel there; IEX when the params name none, so nothing that names
@@ -217,7 +273,8 @@ Each is stated where it is implemented, with its source.
   documented as entitled to IEX alone, so none of this is an entitlement (ADR 0055). In pre-market
   `iex` and `boats` delivered nothing before 05:00 on 2026-11-11; the sip feed authenticated on paper on
   2026-11-10, and authenticated and delivered on 2026-11-11, from 08:23 in that pre-market (ADR 0055).
-* **Timestamps** lose sub-microsecond precision: alpaca-py parses them into `datetime`.
+* **Timestamps** lose sub-microsecond precision where alpaca-py parses them into `datetime`.
+  Trade history preserves the raw timestamp's nanoseconds separately, along with exact request bounds.
 * **No restart:** if alpaca-py's stream ends by itself, the client logs an error and does not restart it;
   a later subscription fails with an error saying so, until the client is reconnected. The end counts
   from the moment alpaca-py's `run()` returns, marked on the stream's thread before it is reported or
@@ -255,8 +312,14 @@ Each is stated where it is implemented, with its source.
   cover a start where everything sent stays quiet (the lost one is sent with the next subscribe, or not
   at all), nor an unsubscribe made in the same window, which alpaca-py does not send either and a
   subscribe does not undo. A reconnect alpaca-py makes by itself opens the same window, and alpaca-py
-  logs a warning before it (after `data_timeout`, a websocket error or a failed connect), so the client
-  treats a subscribe made after that warning and before the next message the same way.
+  logs a warning before it (after `data_timeout`, a websocket error or a failed connect). That warning
+  reaches the node's loop from alpaca-py's thread, so the loop can run a subscribe after the connection
+  dropped and before the warning arrives; the client therefore marks every held subscription when the
+  warning arrives, and sends them again on the next message, one subscribe per reconnect (corrected
+  2026-11-11 after a second reader's finding). A resend planned before such a warning and finished
+  after it leaves the mark set, since it may have reached alpaca-py while it reconnected. Marking
+  every held subscription, rather than counting subscribes since the last message, also covers a
+  subscribe the loop ran while a message from the old connection still waited behind it.
 * **Mute stream:** a connection that is up but sends nothing is closed and made again by alpaca-py's
   own `data_timeout` (`StockDataStream(data_timeout=...)`, seconds, `None` by default, which disables it).
   At the pin (`alpaca/data/live/websocket.py`, alpaca-py `c42add7c0a70`): only market data resets the
@@ -272,7 +335,7 @@ Each is stated where it is implemented, with its source.
   a window, ADR 0044). On a feed that sends nothing for hours (`iex` before about 08:00, a part ADR 0044
   skips), it reconnects every 15 minutes with nothing to lose. A reconnect is relayed as a warning naming
   the feed, so a quiet feed fails nothing. alpaca-py reconnects without end, so the client also counts the
-  silence itself: once no quote or trade has arrived for `stream_mute_limit_secs` (3,600 s by default,
+  silence itself: once no quote, trade, bar or status has arrived for `stream_mute_limit_secs` (3,600 s by default,
   longer than the data timeout, which the config enforces) while it holds a subscription, it stops the
   stream, logs an error that begins "Alpaca stream on feed <feed> went mute", which a session window
   reads as its stream's error, and refuses later subscriptions, naming why, until it reconnects: the
@@ -659,8 +722,8 @@ order, so it has no fill test, and its data delivery is tested instead. Each has
 |---|---|---|
 | `test_parsing.py` | Asset to `Equity`; bar, quote and trade conversion; bar type support; missing credentials | None |
 | `test_provider.py` | Asset queries and filters, load by ID, failures named, other venues refused | None |
-| `test_data_client.py` | A real `LiveNode`: registration through config and builder, owned and hosted launch, bars, quotes and trades into strategy and cache, hourly and daily bar windows, `limit`, open-ended requests, concurrent and cancelled bar requests, request failures as `failure_reason`, unsubscribes that never subscribed or failed, late data for an unsubscribed symbol dropped, late data from a stream left behind by a timed-out disconnect dropped after a reconnect, a resubscribe delivering again, trade cancels and corrections logged, one-sided quotes dropped and counted and a NaN price dropped as malformed, a TICK bar request refused with the adapter's reason, the feed named in params (the default IEX, a named feed on the stream and the bars request, other keys left alone, a second feed refused, a name or value Alpaca does not take refused before anything is sent, a feed Alpaca refuses logged naming it and later subscriptions refused), a repeat subscription after the stream ended refused, concurrent unsubscribes sending one, a reconnect waiting for a bar call a cancelled request left running, a given stream that never ran serving the next connect, windows with no `start` (an earlier `end`, either clock change), a request the executor refuses releasing the lock, a disconnect cancelled by the node clearing state, the stream thread holding no reference to the client inside a handler, the stream stand-in connecting only once something is subscribed, as alpaca-py's does, a stream ending by itself logged (and an abandoned one not) and a later subscription refused, clients given at construction kept across a reconnect, a cancelled bar call's later error read, shutdown joining the stream thread or clearing state when it does not stop, stream handlers not keeping the client alive, paper and IEX client construction; a cancelled stream call holding the next until alpaca-py returns and a refused one recording nothing, a subscription after the stream's `run()` returned refused while its thread winds down, a connect that fails or is cancelled part way and a stream thread that cannot start leaving nothing behind, `feed: None` refused, an unsubscribe's feed read as a subscription's (and the engine passing it the subscription's params), a window starting after now sending nothing, another client's abandoned stream's log lines not taken for this one's, a quote from before an unsubscribe dropped after a resubscribe, an unsubscribe after a subscription refused for its feed tolerated, a subscription while disconnecting refused as such, no hook waiting on a call stuck in an ended stream, a window inverted in the past still sent, a subscription lost while the stream connects sent on its first message (on alpaca-py's real stream and the stand-in), once per run and only when a later subscribe could have been lost, a failed resend logged and tried again on the next message, a stream call waiting through a reconnect taking the new connect's lock, a stream call that returns at once recorded before its hook returns; historical quotes (ADR 0066): stamped when Alpaca stamped them in an inclusive window sent on IEX, written back into a catalog and a covered request served from it, an empty response recording nothing and asked for again, a staging file a killed write leaves not read and the window written again, a request with a `limit` answered and not written back, one-sided quotes and quotes finer than four decimals dropped and counted, a NaN quote failing the request, sip trade and bar prices finer than four decimals rounded and counted (747.086488 and 0.12345) and such a quote dropped and named, each on a warning the session window keeps, a feed other than `iex` refused before sending, a fetch failure as `failure_reason`, two instruments refused, a window after now sending nothing and one ending after now cut at now | None |
-| `test_paper_feed.py` | ADR 0055 through a real node: a subscription naming `boats` streams on `v1beta1/boats` and its quotes and trades reach the strategy (overnight only, from Alpaca's calendar; it waits up to 120 s for a trade, and skips, naming the counts, when quotes came and Alpaca confirmed the trade subscription but no trade came); while the market is open, trades and quotes naming `sip` stream on `v2/sip` for 60 s, no trade is dropped, every price keeps four decimals, and the rounded prices and dropped quotes the client names are counted; one naming none streams on `v2/iex`, as before (any hour). Shaped on TC-D20, TC-D30 and TC-D71, by a small strategy, since v2.0.0rc8's Python `DataTesterConfig` takes no `subscribe_params` | Paper only; places nothing; skipped without `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` |
+| `test_data_client.py` | A real `LiveNode`: registration through config and builder, owned and hosted launch, bars, quotes and trades into strategy and cache, hourly and daily bar windows, `limit`, open-ended requests, concurrent and cancelled bar requests, request failures as `failure_reason`, unsubscribes that never subscribed or failed, late data for an unsubscribed symbol dropped, late data from a stream left behind by a timed-out disconnect dropped after a reconnect, a resubscribe delivering again, trade cancels and corrections logged, one-sided quotes dropped and counted and a NaN price dropped as malformed, a TICK bar request refused with the adapter's reason, the feed named in params (the default IEX, a named feed on the stream and the bars request, other keys left alone, a second feed refused, a name or value Alpaca does not take refused before anything is sent, a feed Alpaca refuses logged naming it and later subscriptions refused), a repeat subscription after the stream ended refused, concurrent unsubscribes sending one, a reconnect waiting for a bar call a cancelled request left running, a given stream that never ran serving the next connect, windows with no `start` (an earlier `end`, either clock change), a request the executor refuses releasing the lock, a disconnect cancelled by the node clearing state, the stream thread holding no reference to the client inside a handler, the stream stand-in connecting only once something is subscribed, as alpaca-py's does, a stream ending by itself logged (and an abandoned one not) and a later subscription refused, clients given at construction kept across a reconnect, a cancelled bar call's later error read, shutdown joining the stream thread or clearing state when it does not stop, stream handlers not keeping the client alive, paper and IEX client construction; a cancelled stream call holding the next until alpaca-py returns and a refused one recording nothing, a subscription after the stream's `run()` returned refused while its thread winds down, a connect that fails or is cancelled part way and a stream thread that cannot start leaving nothing behind, `feed: None` refused, an unsubscribe's feed read as a subscription's (and the engine passing it the subscription's params), a window starting after now sending nothing, another client's abandoned stream's log lines not taken for this one's, a quote from before an unsubscribe dropped after a resubscribe, an unsubscribe after a subscription refused for its feed tolerated, a subscription while disconnecting refused as such, no hook waiting on a call stuck in an ended stream, a window inverted in the past still sent, a subscription lost while the stream connects sent on its first message (on alpaca-py's real stream and the stand-in, and one the node made before a reconnect warning reached it, a resend finished after that warning leaving the next connection owed one), once per run and only when a later subscribe could have been lost, a failed resend logged and tried again on the next message, a stream call waiting through a reconnect taking the new connect's lock, a stream call that returns at once recorded before its hook returns; historical quotes (ADR 0066): stamped when Alpaca stamped them in an inclusive window sent on IEX, written back into a catalog and a covered request served from it, an empty response recording nothing and asked for again, a staging file a killed write leaves not read and the window written again, a request with a `limit` answered and not written back, one-sided quotes and quotes finer than four decimals dropped and counted, a NaN quote failing the request, sip trade and bar prices finer than four decimals rounded and counted (747.086488 and 0.12345) and such a quote dropped and named, each on a warning the session window keeps, streamed minute bars and trading statuses (ADR 0090: a stream subscription and a wildcard one handing on only listed symbols, another bar type refused, updated bars only when asked, each status code's action and flags, the last listed symbol's unsubscribe unsubscribing the wildcard, a reconnect sending it again), a feed other than `iex` refused before sending, a fetch failure as `failure_reason`, two instruments refused, a window after now sending nothing and one ending after now cut at now | None |
+| `test_paper_feed.py` | ADR 0055 through a real node: a subscription naming `boats` streams on `v1beta1/boats` and its quotes and trades reach the strategy (overnight only, from Alpaca's calendar; it waits up to 120 s for a trade, and skips, naming the counts, when quotes came and Alpaca confirmed the trade subscription but no trade came); while the market is open, trades and quotes naming `sip` stream on `v2/sip` for 60 s, no trade is dropped, every price keeps four decimals, and the rounded prices and dropped quotes the client names are counted; one naming none streams on `v2/iex`, as before (any hour). ADR 0090: minute bars and trading statuses for eight listed symbols subscribed with `params={"feed": "sip", "wildcard": True}` for 150 s while sip is in session on Alpaca's calendar; Alpaca must confirm `"*"` on both channels, a bar must arrive and every bar must be a listed symbol's one-minute last bar, and the bars per minute, symbols seen and statuses received are printed. Shaped on TC-D20, TC-D30 and TC-D71, by a small strategy, since v2.0.0rc8's Python `DataTesterConfig` takes no `subscribe_params` | Paper only; places nothing; skipped without `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` |
 | `test_paper_sip_bars.py` | ADR 0055, prices finer than four decimals, through a real node: SPY bars on `sip`, one-minute for three days and daily for a year to 20 minutes ago, each request answered with every price at four decimals and the bars the client rounded counted from its warning (TC-D50's shape, a small strategy); any hour, and no stream lock, since a bars request opens no stream | Paper only; places nothing; skipped without `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` |
 | `test_paper_integration.py` | One asset and a week of daily bars from Alpaca's paper environment through a real node, from midday New York on a fixed trading day: the first bar must be the one that opened at that day's midnight, which Alpaca returns only because the adapter shifts the window | Paper only; skipped without `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` |
 | `test_execution_client.py` | A real `LiveNode` with both clients: registration through config and builder, owned and hosted launch, a market order that fills, partial fills, a limit order canceled, cancel-all by ID (side filter, a refused cancel, a failed cancel, nothing to cancel), rejections by HTTP status and by trade update, a cancel refused, a cancel refused for an order Alpaca canceled while the stream was down, a refusal whose lookup alpaca-py cannot build (submit, cancel, modify), a replacement rejected after `replaced`, fills listed before a replace, clients given at construction kept across a reconnect, a cancelled call's later error read, stop and stop-limit orders sent with their prices, modify (`OrderUpdated` only on Alpaca's `replaced`, a fill on the replacement reaching the node's order with the client's record full and dropped, two replaces in a row, reports of a replacement under the node's ID, refusals, a refused repeat, `order_replace_rejected`, a rejected replacement, local denials, a stop's trigger price, a replacement that cannot be read, a replacement whose prior order cannot be read, open or closed, two orders with an empty client order ID), orders denied before Alpaca (type, time in force, stop trigger type, sub-penny limit and stop prices, not tradable), an unknown submit outcome left `SUBMITTED`, an update for an unknown order dropped, start-up fills from Alpaca's fill activities (trade IDs and prices, paging, the window, one order, an activity it cannot map skipped, a page whose last activity has no `id`, a body that is not JSON, fills not all listed whatever their age or with no `cum_qty` and `leaves_qty`, the order read to check them and one alpaca-py cannot build, an activity listed twice), start-up reconciliation of an open order (older than 500 newer closed orders, or before an open-only check's window), a filled order, a position and open stop and stop-limit orders, an unmapped open order failing start-up, account state on connect (and an answer without `cash` or `currency` refused naming it, at connect and on a query), order commands answered 504 or meeting a connect or read timeout sent once by alpaca-py's own `TradingClient` over a stand-in network (submit, replace, cancel; a read still repeated, as alpaca-py repeats a request unguarded), the trading client's transport retrying nothing, and a POST that never gets an answer reaching a local server once, paper-only client construction, shutdown joining the trade stream thread; the config's paper-only refusals, and a node refusing a plain `ExecutionClientConfig`; HTTP timeouts (a local server that never answers: the call ends, the next is answered, the run ends; a connect timeout on the only attempt rejects a submit or cancel as not sent, a read timeout or a repeated attempt leaves it unknown; a session holding another timeout, or the adapter on HTTPS only, gets the package's on both schemes); `QueryOrder` from the engine's in-flight check (a submit Alpaca took with no answer, a cancel answered 204 for an order Alpaca canceled unseen), an acknowledgement during a pending cancel, a refused submit Alpaca holds closed, one rejection from the stream and the answer, no cancel rejection after a fill, a fill that cannot be applied, positions in another or an unloaded symbol, values that are not numbers, a late fill on a replaced order, a replacement rejected before `replaced`, replaced again before it was read, or adopted and then rejected, an order replaced between the two reads, one order's fill reports over its chain, a given client across a reconnect with a call still running, a given stream after a connect that failed early, a modify to zero, a held stop's trigger type; the replace chain as one record (a takeover rejected after a fill ending canceled, on the stream and at start-up; a late rejection of a replacement a later replace left behind; fills across two replaces, in bulk and asked for by each order; a reconnect, after which a fill on the replacement needs no read and a late cancel of the replaced order is ignored; a rejected replacement of an outside order with no client order ID; chains past 16 links read or traced, and a trace needing more reads failing by name; `order_replace_rejected` after a successful answer; a fill delivered twice; a fill a status report showed (a `QueryOrder` answer, on the same connect and after a reconnect, and an order since replaced) brought by its trade ID and not counted again from the stream, and the order's next fill still counted; a stream fill after a fill report for a later share, and a `partial_fill` whose order shows the count before it, each counted; a fill report and stream fills interleaved, each counted once; one identity by trade ID (ADR 0075: a report and its fill's update in one loop turn, a larger fill after a smaller one, two prices out of order, a lost update under the paper node's checks with no `EXTERNAL` order, a report held back while the activities lag, a fill on a chain order the node never held, a replacement's fill after a reconnect under either reading, a full-history check, and an open order whose fills are not listed failing start-up by name or listed on a second read); both readings of a replacement's quantities, on the stream and at start-up, and the partly filled replace paper showed); a failed test not failing the next at `build_node` | None |
@@ -720,7 +783,8 @@ tasks"): with none, a queued unsubscribe was discarded and logged as an error on
 | TC-D30 subscribe trades | Passed, except the aggressor side: 5 to 28 trades in 30 s; Alpaca sends no aggressor, so every trade is `NO_AGGRESSOR` |
 | TC-D41 historical bars | Passed: 60 one-minute bars, valid OHLC, no duplicate timestamps |
 | TC-D70 unsubscribe on stop | Passed with the grace period: quotes and trades unsubscribed, no tick after, no warning or error |
-| TC-D01, D02, D31, D40, D60, D61, D73 | Not in this slice: no instrument requests or subscriptions, no historical trades, no bar subscriptions, no status or close; D73 not run |
+| TC-D31 historical trades | Implemented and tested offline through a real node and fake HTTP pages (`test_data_client.py`): pagination, limits, feed selection, timestamps, IDs, whole shares, rounding, response metadata and failure propagation; paper API response UNVERIFIED |
+| TC-D01, D02, D40, D60, D61, D73 | Not in this slice: no instrument requests or subscriptions, no bar subscriptions, no status or close; D73 not run |
 | TC-D10 to D14, D50 to D53, D62, D63, D71, D72, D74, D75 | Do not apply: no order book in Alpaca's stock stream, no derivatives or options here, no custom parameters, no DeFi |
 | TC-E01 market buy, TC-E80 open on start | Passed: submitted, accepted, filled; the fill's trade ID is Alpaca's `execution_id` |
 | TC-E06, TC-E82 close position on stop | Passed: a market sell, filled, position closed |
