@@ -90,6 +90,9 @@ on the owner's sign-in (5; not tried).
    The question is asked again at each `review-by`, on the workers' records and refreshed cases. The
    same pruning applies to readers on ADR 0046's benchmark, whose retire rule that record has yet to
    state.
+   *Superseded in part 2026-11-11 by ADR 0079:* the levels are set after three counted rounds, relative
+   to the Claude Opus worker on the same cases, not by the first run; no runtime is retired or promoted
+   on one wave. A broken term still retires at once.
 9. **The terms a worker builds under** are ADR 0058's: its own workspace, a task that names its paths,
    no landing, a Claude lane or the coordinator checking, reviewing and landing. A trial runs under the
    brief's terms, which are stricter.
@@ -116,8 +119,13 @@ repository. `harness.py admit` showed each ready case sound on three runs on 202
 `admitted`): two of them before the code review's changes to the harness, when `admit` did not yet ask
 that the listed tests pass on the fix, and two after. For the first two, a tree holding the fix's own
 files then graded resolved, and for one a change that fixes nothing graded unresolved with its four
-tests failed. No trial has run: the bar's levels, the readers' marks and three runs per case are
-untried, and how the cockpit starts a worker in a folder that is not a worktree is UNVERIFIED.
+tests failed. The first trial's first wave ran from 03:17 to 04:14 UTC on 2026-11-11 (the trial is
+labelled 2026-11-10), each worker in its tree as a folder of its own; how the cockpit started it is not
+recorded (UNVERIFIED). It is scored in `evals/build/runs/2026-11-10-first/scores.md`: all sixteen runs
+resolved; settled marks 3 `land`, 8 `fix`, 5 `no` (one disputed); the readers agreed on 9 of 16 marks
+before rereading. Waves 2 and 3 are scored in `scores-waves-2-3.md` beside it, and `scores.md` joins
+the three waves; the reference worker fails rule 8's bar in every wave, so that sheet gives no
+verdict, and the levels are ADR 0079's to state.
 
 ## Evidence
 

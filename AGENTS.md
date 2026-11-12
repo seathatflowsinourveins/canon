@@ -120,9 +120,9 @@ be used within these limits (ADR 0021):
 
 * Handoffs use `--agent claude`. A worker that builds is a Claude worker or, under ADR 0058's terms, a
   worker of another adopted runtime (the agent ids below). Such a worker has its own workspace and a
-  task that names the paths it may change; it commits on its branch and reports, and never lands,
-  pushes, installs anything, runs paper tests or reads a credential; a Claude lane or the coordinator
-  reproduces its tests, runs the review ADR 0017 requires and lands it. The build eval (ADR 0057) is
+  task that names the paths it may change; it leaves its work in its tree and reports, and never
+  commits, lands, pushes, installs anything, runs paper tests or reads a credential; the Claude lane
+  that reproduces its tests commits it, runs the review ADR 0017 requires and lands it (ADR 0079). The build eval (ADR 0057) is
   the measure that keeps or retires it. A reviewer may be Codex (`--agent codex`),
   Muse Code (`--agent muse`) or Antigravity (`--agent antigravity`); DeepSeek Harness (`--agent dsh`) may
   stand in like Antigravity once `scripts/bootstrap --check` shows its review patch ok (ADR 0043, ADR 0045).

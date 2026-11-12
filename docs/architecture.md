@@ -169,7 +169,8 @@ locally on the data client's live data; nothing in `src/` builds one yet (ADR 00
   `order-modify` and 10 in `trial-ledger-gate`.
 * **Build eval.** A past fix's parent tree with the fix's failing tests, in a one-commit copy with no
   history; a harness that grades the worker's files out of its reach, then two readers who say whether
-  the change would land (`evals/build/`, ADR 0057). Four cases; no trial has run. It is the measure
+  the change would land (`evals/build/`, ADR 0057). Four cases; the first trial's three waves are
+  scored in `evals/build/runs/2026-11-10-first/`; the reference failed the bar, so no level is set yet (ADR 0079). It is the measure
   that keeps or retires a runtime, model, effort and configuration that builds here, not a gate: an
   adopted runtime other than Claude Code builds in its own workspace, and a Claude lane or the
   coordinator reviews and lands its change (ADR 0058).

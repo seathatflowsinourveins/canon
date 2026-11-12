@@ -54,6 +54,10 @@ ADR 0005's table rests on other people's workloads.
    profile cannot commit, so the worker leaves its change in the working tree and the Claude lane that
    reproduces its tests commits it. The profile is in force only for a Codex started without Orca's
    bypass flag (ADR 0034, Confirmation).
+   *Superseded in part 2026-11-11 by ADR 0079*, for every runtime and every profile: the worker does not
+   commit. It leaves its work in its workspace's tree, runs the offline checks its task names and
+   reports; the Claude lane that reproduces its tests commits it, so every commit runs all of
+   `scripts/ci`.
 3. **Not gated.** A worker may be given build work before its label has a trial. ADR 0057's eval is
    the measure that keeps or retires it (its rule 8), and one broken term retires it at once.
 4. **Which paths stay with Claude is the owner's to say, and is not yet said.** The coordinator's
@@ -61,6 +65,10 @@ ADR 0005's table rests on other people's workloads.
    paper runner stay with Claude lanes until the eval has a result. This record adds one of its own:
    dot-directories, `AGENTS.md` and `CLAUDE.md`, since a repository file can configure a runtime (OMP's
    settings have a project layer, and its "built-in default is `yolo`").
+   *Superseded 2026-11-11 by ADR 0079:* until three rounds of the build eval are counted, Claude keeps
+   the adapter's order and connection paths, the gate, anything that handles a credential, the paper
+   runner, the session window, the node, and this rule's own exclusions; everything else may go to
+   another runtime now.
 5. **What no sandbox means for a worker that edits.** Each term is text; a reader was already so
    (ADR 0043 rule 2), but an editor has reason to run commands and write files, so a breach looks like
    work until someone reads what it did. The merge gate holds the hosted run of `scripts/ci`, but not
