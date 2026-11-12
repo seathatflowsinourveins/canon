@@ -279,6 +279,15 @@
       "sha": "103834cb1000a84569a71646fec7162f18a058c8",
       "track": "tag:v0.17.0"
     },
+    "edgartools": {
+      "default_branch": "main",
+      "default_sha": "479d350d453ce7676e6fd0d8e745e5423c182135",
+      "ref": "refs/tags/v6.0.0",
+      "repo": "dgunning/edgartools",
+      "resolved_at": "2026-11-12T10:47:02Z",
+      "sha": "1ce77f9903e06ec58609a40d01797331e4ead460",
+      "track": "tag:v6.0.0"
+    },
     "gascity": {
       "default_branch": "main",
       "default_sha": "607e3570e3fa2409cb6d216c36a243b35a99d6fb",

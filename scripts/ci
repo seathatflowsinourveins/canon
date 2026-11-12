@@ -17,6 +17,16 @@
 #   skipped cases a test script's skipped cases are listed under its `ok` line, and counted and named again
 #                 in one line before the last (on GitHub also as a warning annotation), so a green run
 #                 does not read as a check of them
+#   projects apart  every tracked uv.lock below the root is a project of its own, outside the workspace,
+#                 with its own lock and environment (uv's documentation, concepts/projects/workspaces.md,
+#                 "When (not) to use workspaces": a member that wants "a separate virtual environment"
+#                 is "its own independent project", and "commands must be run from the relevant
+#                 package directory"; `uv --directory`, "Change to the given directory prior to running
+#                 the command", `uv --help`). From its folder: `uv lock --check`, `uv run --locked`,
+#                 then its own ty and pytest, so it carries both in its dev group. They start after the
+#                 supply-chain checks, since a first run installs that project's environment. The
+#                 root's ty leaves such a folder out through the root's ty.toml, since what the folder
+#                 imports is not in the root's environment (ADR 0108)
 #   mise configs  before anything runs: a config mise loads from a folder above the checkout (anything but
 #                 the checkout's, the global one and /etc/mise) stops the run, naming the file
 #
@@ -269,6 +279,18 @@ else
   list_ok=0
 fi
 list_failed() { echo "git ls-files failed:"; cat "$WORK/files.err"; return 1; }
+
+# Projects kept apart (header): the folder of each uv.lock below the root in that same listing, so staged
+# ones are included, a path is taken once also during a merge, and a failed listing is the failure above.
+APART=()
+if [ "$list_ok" -eq 1 ]; then
+  prev=""
+  while IFS= read -r -d '' entry; do
+    f=${entry#*$'\t'}
+    [ "$f" = "$prev" ] && continue; prev=$f
+    case "$f" in */uv.lock) APART+=("${f%/uv.lock}") ;; esac
+  done <"$WORK/files"
+fi
 syntax() {
   [ "${#SHELL_FILES[@]}" -gt 0 ] || { echo "no shell files found"; return 1; }
   local f rc=0; for f in "${SHELL_FILES[@]}"; do bash -n "$f" || rc=1; done; return "$rc"
@@ -363,6 +385,31 @@ if [ "$STAGED" -eq 1 ]; then
 else
   job "gitleaks (git history)"           tool gitleaks git --no-banner --redact
   job "gitleaks (working tree)"          tool gitleaks dir . --no-banner --redact
+fi
+
+# Projects kept apart come last: each one's lock check and environment run in the foreground, and on a
+# first run the environment is installed, which the checks above do not wait for.
+if [ "$list_ok" -eq 0 ]; then
+  head_line "Projects apart:"
+  skip_line "projects apart (the file list failed, see the shell file list)"
+elif [ "${#APART[@]}" -gt 0 ]; then
+  for p in "${APART[@]}"; do
+    head_line "Project apart, $p (its own lock and environment):"
+    why=""
+    if now "$p/uv.lock matches its manifest"  tool uv --directory "$p" lock --check; then
+      now "$p environment (uv run --locked)"  tool uv --directory "$p" run --locked python -c pass \
+        || why="the $p environment could not be created"
+    else
+      why="$p/uv.lock does not match its manifest"
+      skip_line "$p environment ($why)"
+    fi
+    if [ -z "$why" ]; then
+      job "ty type check in $p"            tool uv --directory "$p" run --locked ty check
+      job --skips "pytest in $p"           tool uv --directory "$p" run --locked pytest -q -rfEs --no-fold-skipped
+    else
+      for label in "ty type check in $p" "pytest in $p"; do skip_line "$label ($why)"; done
+    fi
+  done
 fi
 
 wait

@@ -1,0 +1,5 @@
+# pytest configuration for this project alone; the root's pytest.toml does not collect it.
+# Source: https://docs.pytest.org/en/stable/explanation/goodpractices.html
+[pytest]
+addopts = ["--import-mode=importlib"]
+testpaths = ["tests"]

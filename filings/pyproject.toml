@@ -1,0 +1,23 @@
+# A project of its own, kept apart from the workspace at the repository root (docs/adr/0108): its own
+# uv.lock and its own environment, so that what the filings reader requires, pyarrow among it, never
+# enters the environment the gate, the ledger and the studies run in.
+# Layout: uv's documentation, concepts/projects/workspaces.md, "When (not) to use workspaces": members
+# that "desire a separate virtual environment" are each defined "as its own independent project", and
+# "commands must be run from the relevant package directory". The root's workspace members are
+# `packages/*`, so this folder is not one, and uv run from here finds no workspace above it.
+# Run from this folder: `uv run --locked pytest`. scripts/ci does the same for every uv.lock below the root.
+[project]
+name = "canon-filings"
+version = "0.1.0"
+description = "SEC filings for ranked names, read through edgartools (GET only; the recorder is not built yet)"
+readme = "README.md"
+requires-python = ">=3.14,<3.15"
+dependencies = [
+    "edgartools==6.0.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest==9.2.0",
+    "ty==0.0.101",
+]

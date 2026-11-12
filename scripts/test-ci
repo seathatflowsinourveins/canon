@@ -45,7 +45,10 @@ mkdir -p "$TMP/tools"
 cat >"$TMP/tools/uv" <<'EOF'
 #!/bin/bash
 echo "$*" >>"$UV_LOG"
-if [ "$1 $2" = "lock --check" ] && [ -n "${FAKE_LOCK_FAIL:-}" ]; then echo "uv.lock needs to be updated"; exit 1; fi
+# `--directory <folder>` first is a project kept apart; FAKE_APART_LOCK_FAIL fails its lock check alone
+dir=""; if [ "$1" = "--directory" ]; then dir=$2; shift 2; fi
+if [ "$1 $2" = "lock --check" ] && [ -z "$dir" ] && [ -n "${FAKE_LOCK_FAIL:-}" ]; then echo "uv.lock needs to be updated"; exit 1; fi
+if [ "$1 $2" = "lock --check" ] && [ -n "$dir" ] && [ -n "${FAKE_APART_LOCK_FAIL:-}" ]; then echo "$dir/uv.lock needs to be updated"; exit 1; fi
 if [ "$1 $2 $3" = "run --locked pytest" ]; then
   for a in "$@"; do
     case "$a" in -r*s*) echo "SKIPPED tests/test_x.py::test_net - Skipped: no credentials" ;; esac
@@ -66,6 +69,9 @@ cp "$ROOT/scripts/test-ci" "$BASE/scripts/test-ci"
 stub() { printf '#!/bin/bash\nexit 0\n' >"$1"; chmod +x "$1"; }
 for s in canon lanes survey-github; do stub "$BASE/scripts/$s"; done
 for s in "$BASE"/scripts/test-*; do [ -f "$s" ] && [ "${s##*/}" != test-ci ] && stub "$s"; done
+# The repository's own projects apart (a uv.lock below the root) are left out of the copy: the cases
+# plant their own, so what they expect does not change when this repository gains or loses one.
+while IFS= read -r f; do [ -n "$f" ] && rm -f "$BASE/$f"; done <<<"$(git -C "$ROOT" ls-files -- '*/uv.lock')"
 if git -C "$BASE" rev-parse --git-dir >/dev/null 2>&1; then
   echo "test-ci: $BASE is already inside a repository; stopping"; exit 1
 fi
@@ -97,6 +103,11 @@ line_after() {
   [ "$(printf '%s\n' "$OUT" | awk -v a="$1" -v b="$2" 'prev && $0 ~ b { n = 1 } { prev = ($0 ~ a) } END { print n + 0 }')" = 1 ]
 }
 
+# line_before <regex a> <regex b>: the first line matching a comes before the first matching b, and both exist
+line_before() {
+  [ "$(printf '%s\n' "$OUT" | awk -v a="$1" -v b="$2" '!x && $0 ~ a { x = NR } !y && $0 ~ b { y = NR } END { print (x && y && x < y) + 0 }')" = 1 ]
+}
+
 # --- the unchanged copy passes ---
 fresh plain; runci
 check "unchanged copy passes"                      test "$RC" = 0
@@ -113,6 +124,10 @@ check "skip reason follows ok pytest"              line_after '^  ok    pytest$'
 first2=$(awk 'NR <= 2' "$C.uv.log" | tr '\n' '|')
 check "uv lock --check, then uv run --locked first" test "$first2" = "lock --check|run --locked python -c pass|"
 check "Python jobs ran after them"                 test "$(grep -cE '^run --locked (ruff|ty|pytest)' "$C.uv.log")" = 4
+
+# --- with no uv.lock below the root there is no project apart, and the root's ty checks everything ---
+check "no project apart, no heading"               test "$(printf '%s\n' "$OUT" | grep -c '^Project apart')" = 0
+check "nothing ran from another folder"            test "$(grep -c -- '^--directory ' "$C.uv.log")" = 0
 
 # --- recursion guard ---
 check "test-ci is skipped inside test-ci"          has '^  skip  test-ci \(running inside scripts/test-ci\)$'
@@ -262,6 +277,40 @@ unset FAKE_LOCK_FAIL
 check "the lock check fails"                       has '^  FAIL  uv.lock matches the manifests$'
 check "the environment step is skipped with why"   has '^  skip  Python environment \(uv.lock does not match the manifests\)$'
 check "so are the Python checks"                   has '^  skip  pytest \(uv.lock does not match the manifests\)$'
+}
+
+# --- a project kept apart (a tracked uv.lock below the root): its own lock, environment, ty and pytest ---
+apart_copy() {
+fresh "$1"
+mkdir -p "$C/apart/tests"
+printf '[project]\nname = "apart"\nversion = "0"\n' >"$C/apart/pyproject.toml"
+: >"$C/apart/uv.lock"
+gitq -C "$C" add -A; gitq -C "$C" commit -q -m apart
+}
+case_apart() {
+apart_copy apart
+runci
+check "a project apart passes"                     test "$RC" = 0
+check "its heading names it"                       has '^Project apart, apart \(its own lock and environment\):$'
+check "its lock is checked from its folder"        test "$(grep -cx -- '--directory apart lock --check' "$C.uv.log")" = 1
+check "its environment is its own"                 test "$(grep -cx -- '--directory apart run --locked python -c pass' "$C.uv.log")" = 1
+check "its ty runs from its folder"                test "$(grep -cx -- '--directory apart run --locked ty check' "$C.uv.log")" = 1
+check "its pytest runs from its folder"            test "$(grep -c -- '^--directory apart run --locked pytest .*-rfEs' "$C.uv.log")" = 1
+check "its pytest skips are listed"                line_after '^  ok    pytest in apart$' '^        SKIPPED .*no credentials'
+check "the root's own checks are unchanged"        test "$(grep -cE '^run --locked (ruff|ty|pytest)' "$C.uv.log")" = 4
+check "it comes after the supply-chain checks"     line_before '^Supply chain:$' '^Project apart, apart '
+}
+case_apartlock() {
+apart_copy apartlock
+FAKE_APART_LOCK_FAIL=1; export FAKE_APART_LOCK_FAIL
+runci
+unset FAKE_APART_LOCK_FAIL
+check "a stale lock apart fails the run"           test "$RC" = 1
+check "the lock apart is named"                    has '^  FAIL  apart/uv.lock matches its manifest$'
+check "its environment is skipped with why"        has '^  skip  apart environment \(apart/uv.lock does not match its manifest\)$'
+check "so are its checks"                          has '^  skip  pytest in apart \(apart/uv.lock does not match its manifest\)$'
+check "nothing ran from its folder after that"     test "$(grep -c -- '^--directory apart run ' "$C.uv.log")" = 0
+check "the root's lock and pytest still pass"      has '^  ok    pytest$'
 }
 
 # --- run from a commit hook, test scripts do not see git's repository variables ---
@@ -558,7 +607,7 @@ check "a landing leaves shared capacity for a staged run" test -e "$S/staged.sta
 }
 
 # Every case above works in its own copy, so they run concurrently; their output prints in this order.
-CASES="yaml noflows shell staged untracked tests testdir testgone notes skipsum died symlink deleted deleted2 lockfail hookenv parallel order missing pathorder strayconfig longfail slots nice priority prioritycapacity"
+CASES="yaml noflows shell staged untracked tests testdir testgone notes skipsum died symlink deleted deleted2 lockfail apart apartlock hookenv parallel order missing pathorder strayconfig longfail slots nice priority prioritycapacity"
 for c in $CASES; do ( "case_$c" ) >"$TMP/out.$c" 2>&1 & done
 wait
 for c in $CASES; do cat "$TMP/out.$c"; done

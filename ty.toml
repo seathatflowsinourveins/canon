@@ -1,0 +1,8 @@
+# ty's configuration for the root workspace. ty reads a `ty.toml` beside the `pyproject.toml`
+# (ty's docs, configuration.md); `src.exclude` is anchored at the project root and adds to ty's default
+# exclusions (reference/configuration.md).
+# filings/ is a project of its own, with its own environment (docs/adr/0108): what it imports is not
+# installed in the root's environment, so the root's check leaves the folder out, and scripts/ci runs ty
+# from that folder in that folder's environment.
+[src]
+exclude = ["filings/"]
