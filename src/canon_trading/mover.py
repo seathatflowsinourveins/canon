@@ -178,13 +178,12 @@ from .movers_rank_signal import decode_ranking
 from .movers_rank_signal import encode_ranking
 from .paper_node import REQUEST_CEILING
 from .price_step import CENT
-from .price_step import NUDGE
-from .price_step import PRICES
 from .price_step import SUB_DOLLAR
 from .price_step import entry_price
 from .price_step import exit_price
 from .price_step import stop_trigger_price
 from .price_step import tick
+from .price_step import up_on_step
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -435,8 +434,7 @@ def format_rank(entries: Sequence[tuple[InstrumentId, Decimal]]) -> str:
 def chase_floor(first: Decimal, chase_cap: Decimal) -> Decimal:
     """The lowest price a position's sale is chased to: `chase_cap` under its first sale price, up to
     the next price Alpaca takes."""
-    price = PRICES.next_ask_price(float(first * (1 - chase_cap)) - NUDGE, 0)
-    return first if price is None else price.as_decimal()
+    return up_on_step(first * (1 - chase_cap))
 
 
 def offsets(entry: Decimal, trail: Decimal, exit_through: Decimal) -> tuple[Decimal, Decimal]:
