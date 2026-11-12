@@ -493,6 +493,13 @@ class BarsReplayMover(Mover):
 
     def __init__(self, config: MoverConfig) -> None:
         check_bars_replay_modes(config)
+        if config.persistence:
+            # Only this class's `_trail` protects here, and with an arm on `Mover._protect` never
+            # reaches it; bars deliver no trade print for the strategy-held stop to count.
+            raise ValueError(
+                "the bars replay cannot run a persistence arm (breach_count or high_count above "
+                "one): it delivers no trade print, so the strategy-held stop would never sell"
+            )
         own = {name: getattr(config, name) for name in OWN_FIELDS}
         base = {name: getattr(config, name) for name in BASE_FIELDS}
         # Only inactive numeric rows are normalized after the selected modes have been checked.
