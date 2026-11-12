@@ -3,37 +3,107 @@
 # ADR 0059: no checks are reimplemented here. Runtime rows follow bootstrap's documented seven-field TSV
 # contract; all three original reports and exit codes are retained, including unavailable checks.
 # --json emits {bootstrap, automation, canon, runtimes}; text prints the same reports and source statuses.
-# Emails, UUIDs (an account folder's name), home paths and local login names are redacted in both
+# --html FILE --run ID adds read-only sources and renders a local snapshot. Orca task/gate JSON follows
+# src/cli/handlers/orchestration/{task-agent-views,gate-handlers,agent-view}.ts at its canon pin;
+# lanes --rates --json and .canon/watch.json follow the lane report and landscape watch contracts.
+# --digest --run ID [--since ISO] prints ten lines; the default interval is the preceding 24 hours.
+# Added reads follow Orca's pinned full task/worker lists, git's porcelain/log/rev-list contracts and
+# https://cli.github.com/manual/gh_api (GET only, paginated). Active main rules use one GET of
+# https://docs.github.com/en/rest/repos/rules#get-rules-for-a-branch (read 2026-11-11).
+# Main snapshots follow https://git-scm.com/docs/git-show and /docs/gitrevisions (read 2026-11-11).
+# The renderer ports the lead's 2026-11-11 status/build.py and template.html, using Python's pinned
+# stdlib html.escape, json and pathlib contracts. No quota, spend, account paths or starred-list input.
+# Emails, UUIDs (an account folder's name), home paths and local login names are redacted in all
 # formats, including source diagnostics.
-# Exit 0 when all sources succeed, 1 when a source fails, 2 for usage. Nothing installs or changes config.
+# Exit 0 when all sources succeed, 1 when a source fails, 2 for usage. Only HTML writes its requested file.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-JSON=0
-usage() { echo 'usage: scripts/manifest [--json]' >&2; exit 2; }
-case "$#:${1:-}" in
-  0:) ;;
-  1:--json) JSON=1 ;;
-  *) usage ;;
-esac
+JSON=0 DIGEST=0
+HTML='' RUN='' SINCE=''
+usage() { echo 'usage: scripts/manifest [--json | --html <out-file> --run <run-id> | --digest --run <run-id> [--since <ISO time>]]' >&2; exit 2; }
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --json) [ "$JSON" = 0 ] && [ "$DIGEST" = 0 ] && [ -z "$HTML" ] || usage; JSON=1; shift ;;
+    --digest) [ "$JSON" = 0 ] && [ "$DIGEST" = 0 ] && [ -z "$HTML" ] || usage; DIGEST=1; shift ;;
+    --html)
+      [ "$JSON" = 0 ] && [ "$DIGEST" = 0 ] && [ -z "$HTML" ] && [ -n "${2:-}" ] || usage
+      case "$2" in --*) usage ;; esac
+      HTML="$2"; shift 2 ;;
+    --run)
+      [ -z "$RUN" ] && [ -n "${2:-}" ] || usage
+      case "$2" in --*) usage ;; esac
+      RUN="$2"; shift 2 ;;
+    --since)
+      [ -z "$SINCE" ] && [ -n "${2:-}" ] || usage
+      SINCE="$2"; shift 2 ;;
+    *) usage ;;
+  esac
+done
+if [ -n "$HTML" ] || [ "$DIGEST" = 1 ]; then [ -n "$RUN" ] || usage
+else [ -z "$RUN" ] || usage; fi
+[ -z "$SINCE" ] || [ "$DIGEST" = 1 ] || usage
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
 rc=0
 collect() {
   local key="$1" command="$2" status=0; shift 2
-  "$@" > "$T/$key.out" 2>&1 || status=$?
+  if [ -n "$HTML" ] || [ "$DIGEST" = 1 ]; then
+    "$@" > "$T/$key.out" 2> "$T/$key.err" || status=$?
+  else
+    "$@" > "$T/$key.out" 2>&1 || status=$?
+    : > "$T/$key.err"
+  fi
   [ "$status" = 0 ] || rc=1
   jq -n --arg command "$command" --argjson status "$status" --rawfile report "$T/$key.out" \
-    '{command: $command, exit_code: $status, report: (if $report == "" then "not reported (command returned no output)\n" else $report end)}' > "$T/$key.json"
+    --rawfile diagnostic "$T/$key.err" --argjson extended "$([ -n "$HTML" ] || [ "$DIGEST" = 1 ]; echo $?)" \
+    '({command: $command, exit_code: $status, report: (if $report == "" then "not reported (command returned no output)\n" else $report end)}
+      + (if $extended == 0 then {diagnostic: $diagnostic} else {} end))' > "$T/$key.json"
 }
 collect bootstrap 'scripts/bootstrap --check' "$ROOT/scripts/bootstrap" --check
 collect automation 'scripts/automation status' "$ROOT/scripts/automation" status
 collect canon 'scripts/canon list' "$ROOT/scripts/canon" list
+printf '{}\n' > "$T/extra.json"
+if [ -n "$HTML" ] || [ "$DIGEST" = 1 ]; then
+  collect rates 'scripts/lanes --rates --json' "$ROOT/scripts/lanes" --rates --json
+  orca_cli=$(printf '%s' "${ORCA_CLI_COMMAND:-}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+  if [ -n "$orca_cli" ]; then :
+  elif [ -n "${ORCA_DEV_REPO_ROOT:-}" ]; then orca_cli=orca-dev; fi
+  if [ -z "$orca_cli" ]; then
+    case "$(uname -s)" in Linux) orca_cli=orca-ide ;; *) orca_cli=orca ;; esac
+  fi
+  collect tasks "orca orchestration task-list --run $RUN --json --full" "$orca_cli" orchestration task-list --run "$RUN" --json --full
+  if [ -n "$HTML" ]; then
+  collect drift 'cached landscape watch (.canon/watch.json)' cat "$ROOT/.canon/watch.json"
+  collect gates "orca orchestration gate-list --run $RUN --json" "$orca_cli" orchestration gate-list --run "$RUN" --json
+  collect main 'git show -s --format=%H%n%s main' git -C "$ROOT" show -s '--format=%H%n%s' main
+  # Pin both file reads to the captured main commit, even if maintenance advances main during collection.
+  main_ref=$(sed -n '1p' "$T/main.out")
+  if [ "$(jq -r .exit_code "$T/main.json")" = 0 ] && [[ "$main_ref" =~ ^[0-9a-f]{40}$ ]]; then
+    collect schedule "git show $main_ref:canon/paper-schedule" git -C "$ROOT" show "$main_ref:canon/paper-schedule"
+    collect roadmap "git show $main_ref:docs/roadmap.md" git -C "$ROOT" show "$main_ref:docs/roadmap.md"
+  else
+    # shellcheck disable=SC2329  # invoked through collect
+    unavailable_main() { echo 'not reported: main snapshot unavailable; file not read'; return 1; }
+    collect schedule 'git show main:canon/paper-schedule' unavailable_main
+    collect roadmap 'git show main:docs/roadmap.md' unavailable_main
+  fi
+  fi
+  jq -n --arg run "$RUN" --arg since "$SINCE" --argjson digest "$DIGEST" --arg orca "$orca_cli" \
+    '{html_run: $run, since: $since, digest: $digest, orca: $orca, html: {}}' > "$T/extra.json"
+  for key in rates tasks drift gates main schedule roadmap; do
+    if [ -f "$T/$key.json" ]; then
+      jq --arg key "$key" --slurpfile row "$T/$key.json" '.html[$key] = $row[0]' "$T/extra.json" > "$T/extra.next"
+      mv "$T/extra.next" "$T/extra.json"
+    fi
+  done
+fi
 # Identity is used only for redaction, never as a report input. Literal split/join handles regex characters
 # in a home path; a login name is regex-escaped and replaced only as a whole word, so a short name such as
-# 'code' leaves 'Claude Code' and 'codex' alone. Run the filter before either renderer so diagnostics are
+# 'code' leaves 'Claude Code' and 'codex' alone. Run the filter before each renderer so diagnostics are
 # covered too.
 login=$(id -un)
 jq -n --slurpfile b "$T/bootstrap.json" --slurpfile a "$T/automation.json" --slurpfile c "$T/canon.json" \
+  --slurpfile extra "$T/extra.json" \
   --arg home "$HOME" --arg login "$login" --arg user "${USER:-}" --arg logname "${LOGNAME:-}" '
   def private_text:
     (if ($home | length) > 1 then split($home) | join("~") else . end)
@@ -42,7 +112,7 @@ jq -n --slurpfile b "$T/bootstrap.json" --slurpfile a "$T/automation.json" --slu
     | reduce ([$login, $user, $logname, ($home | split("/") | last)] | unique[] | select(. != "" and . != null)
               | gsub("(?<c>[^A-Za-z0-9_])"; "\\\(.c)")) as $name
         (.; gsub("(?<![A-Za-z0-9])" + $name + "(?![A-Za-z0-9])"; "[account]"));
-  {bootstrap: $b[0], automation: $a[0], canon: $c[0]}
+  ({bootstrap: $b[0], automation: $a[0], canon: $c[0]} + $extra[0])
   | walk(if type == "string" then private_text else . end)
   | .runtimes = [.bootstrap.report | split("\n")[] | select(startswith("  ")) | ltrimstr("  ") | split("\t")
       | select(length == 7 and .[0] != "RUNTIME")
@@ -52,6 +122,625 @@ jq -n --slurpfile b "$T/bootstrap.json" --slurpfile a "$T/automation.json" --slu
   ' > "$T/report.json"
 if jq -e '.runtime_parse_error != null' "$T/report.json" >/dev/null; then rc=1; fi
 if [ "$JSON" = 1 ]; then cat "$T/report.json"
+elif [ -n "$HTML" ] || [ "$DIGEST" = 1 ]; then
+  python3 - "$T/report.json" "$HTML" "$rc" "$ROOT" "$login" "$orca_cli" <<'PY'
+import html
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+from collections import Counter
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+report = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+run_id = report["html_run"]
+sources = {key: report[key] for key in ("bootstrap", "automation", "canon")}
+sources.update(report["html"])
+errors = {}
+root = sys.argv[4]
+digest = bool(report["digest"])
+now = datetime.now(timezone.utc)
+
+
+def private(value):
+    text = "not reported" if value is None else str(value)
+    home = os.environ.get("HOME", "")
+    if len(home) > 1:
+        text = text.replace(home, "~")
+    text = re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "[email]", text)
+    text = re.sub(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", "[id]", text)
+    for name in {sys.argv[5], os.environ.get("USER", ""), os.environ.get("LOGNAME", ""), os.path.basename(home)} - {""}:
+        text = re.sub(r"(?<![A-Za-z0-9])" + re.escape(name) + r"(?![A-Za-z0-9])", "[account]", text)
+    return text
+
+
+def public(value):
+    text = private(value)
+    text = re.sub(r"\b(?:allowance|usage|spend|spent|used_pct)(?:\b|_)[^;|\n]*", "[detail omitted]", text, flags=re.I)
+    # Spaces within paths are valid; field separators, diagnostics and flags remain readable.
+    return re.sub(r"""(?<![A-Za-z0-9:/])(?:~[A-Za-z0-9_.-]*[/\\]|/(?:Users|home|private|tmp|var|opt|Applications)/|[A-Za-z]:[/\\]|accounts?/)(?:(?!:\s|\s+--)[^<>"'\n;,)|])+""", "[path]", text)
+
+
+def esc(value):
+    return html.escape(public(value), quote=True)
+
+
+def md(value):
+    return re.sub(r"`([^`]+)`", r"<code>\1</code>", esc(value))
+
+
+def chip(value):
+    kind = "good" if str(value).lower() in {"ok", "on", "done", "completed", "current"} else "warn"
+    return f'<span class="chip c-{kind}">{esc(value)}</span>'
+
+
+def table(headers, rows):
+    # Cells are already escaped, or markup assembled exclusively by this renderer.
+    head = "".join(f"<th>{esc(header)}</th>" for header in headers)
+    body = "".join("<tr>" + "".join(f"<td>{cell}</td>" for cell in row) + "</tr>" for row in rows)
+    return f'<div class="scroll"><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>'
+
+
+def source_note(key):
+    source = sources[key]
+    issue = errors.get(key, "source failed; report may be incomplete" if source["exit_code"] else "")
+    state = f' <strong class="unv">UNVERIFIED</strong> {esc(issue)}' if issue else ""
+    if source.get("diagnostic", "").strip():
+        state += " Diagnostics: " + esc(source["diagnostic"].strip())
+    return f'<p class="src">Source: <code>{esc(source["command"])}</code> · exit {source["exit_code"]}.{state}</p>'
+
+
+def section(key, title, body, source):
+    return f'<section id="{key}"><h2>{esc(title)}</h2><div class="card">{body}{source_note(source)}</div></section>'
+
+
+def structured(key, field=None):
+    try:
+        value = json.loads(sources[key]["report"])
+        if field is not None:
+            if not isinstance(value, dict) or value.get("ok") is not True or not isinstance(value.get("result"), dict):
+                raise ValueError("expected an ok Orca result")
+            if value["result"].get("runId", run_id) != run_id:
+                raise ValueError("response names a different Run")
+            value = value["result"].get(field)
+        if not isinstance(value, (list, dict)):
+            raise ValueError("expected a structured report")
+        return value
+    except (ValueError, TypeError) as error:
+        errors.setdefault(key, f"not reported: invalid JSON report ({error})")
+        return None
+
+
+def records(key, value, fields):
+    if not isinstance(value, list) or not all(
+        isinstance(row, dict) and all(isinstance(row.get(field), str) for field in fields) for row in value
+    ):
+        errors.setdefault(key, "not reported: rows are outside the documented report contract")
+        return []
+    return value
+
+
+def report_rows(key, stop=None):
+    rows = []
+    # Tokens emitted by bootstrap's row() and automation's row()/paper_rank()/watch status.
+    tokens = r"NOT SET|INCOMPLETE|STALE-LOCK|OUTDATED|UNKNOWN|MISSING|REFUSED|FAILED|OWNER|BEHIND|STALE|DIED|DIFF|OFF|on|ok"
+    for line in sources[key]["report"].splitlines():
+        if stop and line.startswith(stop):
+            break
+        if line.startswith("  "):
+            width = 24 if key == "bootstrap" else 18
+            name, tail = line[2:2 + width], line[2 + width:]
+            match = re.fullmatch(r" +(" + tokens + r")(?: +(.*))?", tail)
+            if match:
+                rows.append([name.rstrip(), match[1], (match[2] or "").strip()])
+            elif name and not name.endswith(" ") and tail and not tail.startswith(" "):
+                overflow = re.fullmatch(r"(.+?) (" + tokens + r")(?: +(.*))?", tail)
+                if overflow:
+                    rows.append([name + overflow[1], overflow[2], (overflow[3] or "").strip()])
+                else:
+                    errors.setdefault(key, "not reported: unparsed status row")
+            elif line.strip():
+                errors.setdefault(key, "not reported: unparsed status row")
+    if not rows:
+        errors.setdefault(key, "not reported: no documented status rows")
+    return rows
+
+
+def empty(key, message):
+    return "<p>Not reported.</p>" if key in errors or sources[key]["exit_code"] else f"<p>{esc(message)}</p>"
+
+
+def read_command(key, argv, input_text=None):
+    """Capture read-only CLI output independently of diagnostics; retain every failure."""
+    label = argv[:]
+    if label[0] == sys.argv[6]:
+        label[0] = "orca"
+    if "-C" in label:
+        position = label.index("-C")
+        del label[position:position + 2]
+    try:
+        # GIT_OPTIONAL_LOCKS=0 (git(1)): git status reads without refreshing a worktree's index under
+        # its index.lock, so a snapshot never trips a lane committing in that worktree.
+        env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
+        result = subprocess.run(argv, cwd=root, env=env, text=True, input=input_text, capture_output=True, timeout=60, check=False)
+        source = {"command": " ".join(label), "exit_code": result.returncode,
+                  "report": result.stdout, "diagnostic": result.stderr}
+    except (OSError, subprocess.TimeoutExpired) as error:
+        source = {"command": " ".join(label), "exit_code": 1, "report": "", "diagnostic": str(error)}
+    sources[key] = source
+    return source["report"]
+
+
+def failed(*keys):
+    return [key for key in keys if key in errors or sources.get(key, {}).get("exit_code", 1)]
+
+
+def unavailable(*keys):
+    return "UNVERIFIED (" + ", ".join(failed(*keys) or keys) + ")"
+
+
+def iso_time(value, sqlite=False):
+    value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if value.tzinfo is None:
+        if not sqlite:
+            raise ValueError("ISO time needs a timezone")
+        value = value.replace(tzinfo=timezone.utc)  # Orca's SQLite CURRENT_TIMESTAMP is UTC.
+    return value.astimezone(timezone.utc)
+
+
+try:
+    since = iso_time(report["since"]) if report["since"] else now - timedelta(days=1)
+except (ValueError, TypeError):
+    print("usage: scripts/manifest --digest --run <run-id> [--since <ISO time with timezone>]", file=sys.stderr)
+    sys.exit(2)
+
+# worker-list is paginated at its pin. Never turn an omitted or repeated cursor into a complete count.
+orca_workers = []
+worker_sources = []
+cursor = None
+cursors = set()
+
+
+def worker_record(value):
+    if not isinstance(value, dict) or not isinstance(value.get("taskId"), str):
+        return False
+    if value.get("dispatchId") is not None and not isinstance(value["dispatchId"], str):
+        return False
+    for name in ("projection", "resource"):
+        if value.get(name) is not None and not isinstance(value[name], dict):
+            return False
+    projection = value.get("projection") or {}
+    for name in ("provider", "liveness", "workspace", "stage"):
+        if projection.get(name) is not None and not isinstance(projection[name], dict):
+            return False
+    for nested, fields in ((projection.get("provider") or {}, ("id",)), (projection.get("liveness") or {}, ("verdict", "reason")), (projection.get("workspace") or {}, ("id",)), (value.get("resource") or {}, ("worktreeId",))):
+        if any(nested.get(field) is not None and not isinstance(nested[field], str) for field in fields):
+            return False
+    return True
+
+
+while True:
+    key = "orca_workers" if not worker_sources else f"orca_workers_{len(worker_sources) + 1}"
+    argv = [sys.argv[6], "orchestration", "worker-list", "--run", run_id, "--json", "--full", "--limit", "100"]
+    if cursor:
+        argv += ["--cursor", cursor]
+    read_command(key, argv)
+    worker_sources.append(key)
+    value = structured(key)
+    result = value.get("result", {}) if isinstance(value, dict) else {}
+    if not isinstance(result, dict):
+        errors.setdefault(key, "not reported: invalid worker result")
+        break
+    page = result.get("page", {})
+    scope = result.get("scope")
+    if not isinstance(value, dict) or value.get("ok") is not True or not isinstance(page, dict) or not isinstance(result.get("workers"), list) or not all(worker_record(worker) for worker in result["workers"]) or not isinstance(scope, dict) or scope.get("run") != run_id:
+        errors.setdefault(key, "not reported: invalid worker inventory or Run scope")
+        break
+    orca_workers.extend(result["workers"])
+    warnings = result.get("warnings", [])
+    if not isinstance(warnings, list) or not all(isinstance(warning, str) for warning in warnings):
+        errors.setdefault(key, "worker inventory has invalid warnings")
+        warnings = []
+    warnings = [warning for warning in warnings if not (page.get("hasMore") is True and re.fullmatch(
+        r"Showing \d+ of \d+ Dispatches, newest first; more are on later pages\. Follow page\.nextCursor with --cursor\.", warning))]
+    if result.get("partialHostErrors") or warnings:
+        errors.setdefault(key, "worker inventory incomplete: " + str(result.get("partialHostErrors") or warnings))
+    if failed(key):
+        break
+    if page.get("hasMore") is False:
+        break
+    cursor = page.get("nextCursor")
+    if not isinstance(cursor, str) or not cursor or cursor in cursors:
+        errors.setdefault(key, "not reported: worker pagination incomplete")
+        break
+    cursors.add(cursor)
+
+read_command("pulls", ["gh", "api", "--method", "GET", "repos/{owner}/{repo}/pulls?state=all&per_page=100", "--paginate", "--slurp"])
+pages = structured("pulls")
+pulls = []
+if isinstance(pages, list) and all(isinstance(page, list) for page in pages):
+    pulls = [pr for page in pages for pr in page]
+    if not all(isinstance(pr, dict) and isinstance(pr.get("number"), int) and pr.get("state") in {"open", "closed"} and isinstance(pr.get("head"), dict) for pr in pulls):
+        errors.setdefault("pulls", "not reported: invalid pull request rows")
+        pulls = []
+else:
+    errors.setdefault("pulls", "not reported: invalid paginated pull request response")
+open_prs = [pr for pr in pulls if pr["state"] == "open"]
+pr_checks = {}
+pr_sources = ["pulls"]
+for pr in open_prs:
+    sha = pr["head"].get("sha", "")
+    key = f'pr_{pr["number"]}_checks'
+    status_key = f'pr_{pr["number"]}_statuses'
+    if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
+        errors.setdefault("pulls", "not reported: pull request head is not a commit SHA")
+        pr_checks[pr["number"]] = unavailable("pulls")
+        continue
+    pr_sources += [key, status_key]
+    read_command(key, ["gh", "api", "--method", "GET", f"repos/{{owner}}/{{repo}}/commits/{sha}/check-runs?per_page=100", "--paginate", "--slurp"])
+    read_command(status_key, ["gh", "api", "--method", "GET", f"repos/{{owner}}/{{repo}}/commits/{sha}/status?per_page=100", "--paginate", "--slurp"])
+    checks, statuses = structured(key), structured(status_key)
+    states = []
+    for source_key, data, field in ((key, checks, "check_runs"), (status_key, statuses, "statuses")):
+        if not isinstance(data, list) or not all(isinstance(page, dict) and isinstance(page.get(field), list) for page in data):
+            errors.setdefault(source_key, "not reported: invalid check/status pages")
+            continue
+        for page in data:
+            for check in page[field]:
+                if not isinstance(check, dict):
+                    errors.setdefault(source_key, "not reported: invalid check/status row")
+                    continue
+                name = check.get("name") if field == "check_runs" else check.get("context")
+                state = (check.get("conclusion") or check.get("status")) if field == "check_runs" else check.get("state")
+                if not isinstance(name, str) or not isinstance(state, str):
+                    errors.setdefault(source_key, "not reported: missing check/status name or state")
+                else:
+                    states.append(f"{public(name)}={public(state)}")
+    pr_checks[pr["number"]] = "; ".join(states) or (unavailable(key, status_key) if failed(key, status_key) else "no checks reported")
+    if states and failed(key, status_key):
+        pr_checks[pr["number"]] += "; " + unavailable(key, status_key)
+
+origin_sha = read_command("origin_main", ["git", "-C", root, "rev-parse", "--verify", "refs/remotes/origin/main"]).strip()
+if not re.fullmatch(r"[0-9a-f]{40}", origin_sha):
+    errors.setdefault("origin_main", "not reported: origin/main is not available")
+worktree_text = read_command("worktrees", ["git", "-C", root, "worktree", "list", "--porcelain", "-z"])
+worktrees = []
+current = None
+for item in worktree_text.split("\0"):
+    if item.startswith("worktree "):
+        current = {"path": item[9:]}
+        worktrees.append(current)
+    elif current is not None and item:
+        name, _, value = item.partition(" ")
+        current[name] = value or True
+if not worktrees and not failed("worktrees"):
+    errors.setdefault("worktrees", "not reported: no worktree records")
+
+
+def same_repo(pr):
+    head_repo = pr.get("head", {}).get("repo") or {}
+    base_repo = pr.get("base", {}).get("repo") or {}
+    return bool(head_repo.get("full_name") and head_repo.get("full_name") == base_repo.get("full_name"))
+
+
+dirty_sources, ahead_sources = [], []
+for index, tree in enumerate(worktrees):
+    status_key, ahead_key = f"worktree_status_{index}", f"worktree_ahead_{index}"
+    if tree.get("prunable"):
+        # git worktree list's own mark: the folder is gone, so there is nothing to read. It is
+        # counted, protected from removal below, and not shelled into.
+        tree["dirty"], tree["ahead"] = False, None
+        continue
+    dirty_sources.append(status_key)
+    tree["dirty"] = bool(read_command(status_key, ["git", "-C", tree["path"], "status", "--porcelain", "--untracked-files=all"]).strip())
+    head = tree.get("HEAD", "")
+    tree["ahead"] = None
+    if not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head):
+        errors.setdefault("worktrees", "not reported: invalid worktree HEAD")
+    elif not failed("origin_main"):
+        ahead_sources.append(ahead_key)
+        ahead = read_command(ahead_key, ["git", "-C", root, "rev-list", "--count", f"{origin_sha}..{head}"]).strip()
+        if ahead.isdigit():
+            tree["ahead"] = int(ahead)
+        else:
+            errors.setdefault(ahead_key, "not reported: invalid ahead count")
+
+
+task_data = structured("tasks", "tasks")
+if isinstance(task_data, list):
+    for task in task_data:
+        if isinstance(task, dict):
+            task["title"] = task.get("title") or task.get("display_name") or task.get("task_title") or str(task.get("spec", ""))[:60]
+tasks = records("tasks", task_data, ("id", "status", "title"))
+if not digest:
+    watch = structured("drift") if not sources["drift"]["exit_code"] else None
+    if isinstance(watch, dict) and isinstance(watch.get("checked_at"), str) and isinstance(watch.get("newer"), list):
+        drift = records("drift", watch["newer"], ("id", "role", "pinned", "status"))
+        for item in records("drift", watch.get("unparseable", []), ("id", "pinned")):
+            drift.append({**item, "role": "not reported", "status": "UNPARSEABLE"})
+        cache_notes = []
+        # Same bytes and POSIX cksum as canon-watch.sh, session-brief.sh and automation status.
+        try:
+            registry = (Path(root, "canon/upstreams.json").read_bytes() + Path(root, "canon/upstreams.lock.json").read_bytes()).decode("utf-8")
+            checksum = read_command("registry_checksum", ["cksum"], input_text=registry).split()
+            fingerprint = "-".join(checksum[:2]) if len(checksum) == 2 and all(part.isdigit() for part in checksum) else None
+            sources["registry_checksum"]["command"] = "cksum of canon/upstreams.json + canon/upstreams.lock.json"
+            if fingerprint is None or failed("registry_checksum"):
+                cache_notes.append("registry checksum could not be read")
+            elif watch.get("registry") != fingerprint:
+                cache_notes.append("cached registry checksum differs from this checkout")
+        except (OSError, UnicodeError) as error:
+            cache_notes.append("registry could not be read: " + str(error))
+        for field, status in (("retagged", "RETAGGED"), ("stale", "STALE")):
+            ids = watch.get(field, [])
+            if not isinstance(ids, list) or not all(isinstance(item, str) for item in ids):
+                cache_notes.append("invalid cached " + field + " list")
+            elif ids:
+                cache_notes.append(field + ": " + ", ".join(ids))
+                drift.extend({"id": item, "role": "not reported", "pinned": "not reported", "newest": None, "status": status} for item in ids)
+        watch_errors = watch.get("errors")
+        if not isinstance(watch_errors, list) or not all(isinstance(item, str) for item in watch_errors):
+            cache_notes.append("invalid cached errors list")
+        else:
+            cache_notes.extend(watch_errors)
+        if watch.get("ok") is not True:
+            cache_notes.append("cached watch failed")
+        if cache_notes:
+            errors.setdefault("drift", "; ".join(cache_notes))
+    else:
+        drift = []
+        errors.setdefault("drift", "not run: no readable dated landscape watch cache")
+    gates = records("gates", structured("gates", "gates"), ("id", "taskId", "status", "question"))
+rates = structured("rates")
+workers = records("rates", rates.get("workers") if isinstance(rates, dict) else None, ("lane", "runtime", "state"))
+window = rates.get("window_min") if isinstance(rates, dict) else None
+if not isinstance(window, (int, float)) or isinstance(window, bool) or not math.isfinite(window) or window <= 0:
+    errors.setdefault("rates", "not reported: no valid measurement window")
+    window = None
+for worker in workers:
+    value = worker.get("tok_s")
+    if value is not None and (not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or value < 0):
+        errors.setdefault("rates", "not reported: invalid worker rate")
+        worker["tok_s"] = None
+
+if isinstance(rates, dict):
+    warnings = rates.get("warnings", [])
+    if not isinstance(warnings, list) or not all(isinstance(warning, str) for warning in warnings):
+        errors.setdefault("rates", "not reported: invalid rate warnings")
+        warnings = []
+    notes = list(warnings)
+    if rates.get("ledger_present") is False:
+        notes.append("ledger: " + str(rates.get("ledger_note", "not reported")))
+    if rates.get("otlp_unreadable_lines", 0):
+        notes.append(f'{rates["otlp_unreadable_lines"]} unreadable OTLP lines')
+    if notes:
+        errors.setdefault("rates", "; ".join(map(str, notes)))
+
+automation = report_rows("automation", "Recent alerts:")
+toolchain = report_rows("bootstrap", "Runtimes")
+paper = next((row for row in automation if row[0] == "paper session"), None)
+if paper is None:
+    errors["automation"] = "not reported: paper session row missing"
+if report.get("runtime_parse_error"):
+    errors["bootstrap"] = report["runtime_parse_error"]
+
+if digest:
+    main_lines = []
+else:
+    main_lines = sources["main"]["report"].strip().splitlines()
+if not digest and (not main_lines or not re.fullmatch(r"[0-9a-f]{40}", main_lines[0])):
+    errors["main"] = "not reported: no main commit"
+main_head = main_lines[0][:12] if main_lines and "main" not in errors else "not reported"
+main_subject = " ".join(main_lines[1:]) if "main" not in errors else ""
+schedule_lines = sources.get("schedule", {}).get("report", "").splitlines()
+schedule = schedule_lines[0].strip() if schedule_lines else ""
+if not digest and (schedule not in {"off", "mover"} or sources["schedule"]["exit_code"]):
+    errors.setdefault("schedule", "not reported: schedule first line must be off or mover and its source must succeed")
+    schedule = "not reported"
+
+steps = []
+for line in sources.get("roadmap", {}).get("report", "").splitlines():
+    if re.match(r"\|\s*\d+\s*\|", line):
+        cells = [cell.strip() for cell in line.strip().strip("|").split(" | ")]
+        if len(cells) >= 5:
+            steps.append((cells[0], cells[1], cells[2], " | ".join(cells[3:-1]), cells[-1]))
+if not digest and not steps:
+    errors["roadmap"] = "not reported: no roadmap table rows"
+
+open_tasks = [task for task in tasks if task["status"] in {"ready", "pending", "dispatched", "blocked"}]
+tasks_by_id = {task["id"]: task for task in tasks}
+tree_counts = Counter()
+for tree in worktrees:
+    branch = str(tree.get("branch", "")).removeprefix("refs/heads/")
+    tree_open_prs = [pr for pr in open_prs if same_repo(pr) and pr["head"].get("ref") == branch]
+    branch_names = {branch, private(branch)} if branch else set()
+    tree_open_tasks = any(re.search(r"\b(?:branch|on)\s+[`\"\x27]?" + re.escape(name) + r"(?![A-Za-z0-9_/-])", str(task.get("spec", "")), re.I) for task in open_tasks for name in branch_names)
+    for worker in orca_workers:
+        workspace = (worker.get("projection") or {}).get("workspace") or {}
+        workspace_id = workspace.get("id") or (worker.get("resource") or {}).get("worktreeId") or ""
+        if workspace_id and os.path.realpath(workspace_id.split("::")[-1]) == os.path.realpath(tree["path"]) and worker.get("taskId") in {task["id"] for task in open_tasks}:
+            tree_open_tasks = True
+    tree_counts["dirty"] += tree["dirty"]
+    tree_counts["review"] += bool(tree["ahead"] and (tree_open_prs or tree_open_tasks))
+    protected = branch == "main" or os.path.realpath(tree["path"]) == os.path.realpath(root) or tree.get("locked") or tree.get("prunable") or tree.get("detached") or os.path.basename(tree["path"]) in {"paper-checkout", "wt-main"}
+    merged_head = any(same_repo(pr) and pr.get("merged_at") and pr["head"].get("ref") == branch and pr["head"].get("sha") == tree.get("HEAD") for pr in pulls)
+    if not protected and not tree["dirty"] and not tree_open_prs and not tree_open_tasks and (tree["ahead"] == 0 or merged_head):
+        tree_counts["removable"] += 1
+
+tree_deps = ["worktrees", "origin_main", "tasks", "pulls", *worker_sources, *dirty_sources, *ahead_sources]
+if failed("worktrees"):
+    worktree_line = "Worktrees: " + unavailable("worktrees")
+else:
+    dirty_count = unavailable(*dirty_sources) if failed(*dirty_sources) else str(tree_counts["dirty"])
+    review_count = unavailable(*tree_deps) if failed(*tree_deps) else str(tree_counts["review"])
+    removable_count = unavailable(*tree_deps) if failed(*tree_deps) else str(tree_counts["removable"])
+    worktree_line = f"Worktrees: total={len(worktrees)}; uncommitted={dirty_count}; awaiting review={review_count} (rule: ahead + open task/PR, includes active builds); removable={removable_count} (clean, no open work, merged at same head or nothing ahead; main/current/locked/paper excluded)"
+
+landing = next((row for row in automation if row[0] == "landing"), None)
+
+
+def automation_line(label, row):
+    if row is None:
+        errors.setdefault("automation", f"not reported: {label} row missing")
+        return label + ": " + unavailable("automation")
+    suffix = "; " + unavailable("automation") if failed("automation") else ""
+    return label + ": " + " | ".join(public(value) for value in row) + suffix
+
+
+paper_line = automation_line("Paper session", paper)
+gate_line = automation_line("Gate", landing)
+pr_line = "Open PRs: " + (unavailable("pulls") if failed("pulls") else ("; ".join(f'#{pr["number"]} {pr_checks.get(pr["number"], "not reported")}' for pr in open_prs) or "none"))
+
+if digest:
+    queued = []
+    for task in tasks:
+        if task["status"] not in {"ready", "dispatched"} or not re.search(r"\b(?:review|landing|land)\b", task["title"], re.I):
+            continue
+        if task["status"] == "dispatched":
+            assigned = [worker for worker in orca_workers if worker.get("taskId") == task["id"] and worker.get("dispatchId") == task.get("dispatch_id") and task.get("dispatch_id")]
+            agents = {((worker.get("projection") or {}).get("provider") or {}).get("id") for worker in assigned}
+            if not agents or not agents <= {"claude", "claude-code"}:
+                continue
+        queued.append(task)
+    age = "none"
+    if queued:
+        try:
+            oldest = min(iso_time(task["created_at"], sqlite=True) for task in queued)
+            age = str(max(0, int((now - oldest).total_seconds() // 60))) + " min since creation"
+        except (ValueError, TypeError, KeyError):
+            errors.setdefault("tasks", "not reported: review task creation time missing or invalid")
+            age = unavailable("tasks")
+    review_line = "Review queue (Claude/unassigned; title review/land): " + (unavailable("tasks", *worker_sources) if failed("tasks", *worker_sources) else f"{len(queued)}; oldest={age}")
+    read_command("landings", ["git", "-C", root, "log", "--first-parent", "--format=%H%x09%ct%x09%s", "--since=" + since.isoformat(), "origin/main"])
+    commits = [line.split("\t", 2) for line in sources["landings"]["report"].splitlines() if line]
+    if not all(len(commit) == 3 and re.fullmatch(r"[0-9a-f]{40}", commit[0]) and commit[1].isdigit() for commit in commits):
+        errors.setdefault("landings", "not reported: invalid git log rows")
+    numbers = sorted({int(number) for commit in commits if len(commit) == 3 for number in re.findall(r"\(#(\d+)\)", commit[2])})
+    landings_line = f"Landings on origin/main since {since.isoformat()}: " + (unavailable("landings") if failed("landings") else f'{len(commits)} commits; PRs ' + (", ".join(f"#{number}" for number in numbers) or "not present in commit subjects"))
+    counts = Counter(task["status"] for task in tasks)
+    tasks_line = "Tasks: " + (unavailable("tasks") if failed("tasks") else "; ".join(f"{status}={count}" for status, count in sorted(counts.items())) or "none")
+    returned = [task for task in tasks if re.search(r"\b(?:returned to builder|sent back)\b", str(task.get("result") or ""), re.I)]
+    returned_line = "Returned (rule: result text contains returned to builder or sent back): " + (unavailable("tasks") if failed("tasks") else str(len(returned)))
+    agents = {}
+    for worker in orca_workers:
+        projection = worker.get("projection") or {}
+        agent = (projection.get("provider") or {}).get("id") or "unknown"
+        liveness = projection.get("liveness") or {}
+        state = liveness.get("verdict")
+        category = "stalled" if state == "unverifiable" and liveness.get("reason") == "stale_status" else state if state in {"live", "exited"} else "unknown"
+        agents.setdefault(agent, Counter())[category] += 1
+    workers_line = "Workers: " + (unavailable(*worker_sources) if failed(*worker_sources) else ("; ".join(agent + " " + "/".join(f"{state}={counts[state]}" for state in ("live", "stalled", "exited", "unknown")) for agent, counts in sorted(agents.items())) or "none"))
+    workers_line += "; stalled=stale_status proxy; tok/s (all lanes): "
+    if failed("rates"):
+        workers_line += unavailable("rates")
+    else:
+        rate_groups = {}
+        for worker in workers:
+            rate_groups.setdefault(worker["runtime"], []).append(worker.get("tok_s"))
+        workers_line += ", ".join(runtime + "=" + (f"{sum(rate for rate in values if rate is not None):g}" if any(rate is not None for rate in values) else "not measured") for runtime, values in sorted(rate_groups.items())) or "none reported"
+    failed_sources = [key for key in sources if failed(key)]
+    lines = [review_line, landings_line, tasks_line, returned_line, workers_line, worktree_line, pr_line, paper_line, gate_line, "Sources failed: " + (", ".join(failed_sources) or "none")]
+    print("\n".join(" ".join(public(line).split()) for line in lines))
+    sys.exit(1 if int(sys.argv[3]) or errors or failed_sources else 0)
+
+read_command("rules", ["gh", "api", "--method", "GET", "repos/{owner}/{repo}/rules/branches/main?per_page=100"])
+rules = records("rules", structured("rules"), ("type",))
+if len(rules) == 100:
+    errors.setdefault("rules", "one GET reached the page limit; rule inventory may be incomplete")
+
+parts = []
+main_body = f'<div class="grid"><div><div class="k">Main</div><div class="v">{esc(main_head)}</div><p>{esc(main_subject)}</p></div>'
+main_body += f'<div><div class="k">Paper schedule on main</div><div class="v">{esc(schedule)}</div>{source_note("schedule")}</div></div>'
+parts.append(section("main", "Main and paper schedule", main_body, "main"))
+paper_body = table(("Automation", "Status", "Last report"), [[esc(paper[0]), chip(paper[1]), esc(paper[2])]]) if paper else "<p>Not reported.</p>"
+parts.append(section("paper", "Paper session", paper_body, "automation"))
+
+counts = Counter(task["status"] for task in tasks)
+summary = " · ".join(f"{count} {status}" for status, count in sorted(counts.items()))
+task_count = "Task count not reported." if "tasks" in errors or sources["tasks"]["exit_code"] else f"{len(tasks)} tasks. {summary}"
+task_body = f'<p>Run <code>{esc(run_id)}</code>: {esc(task_count)}</p>'
+task_body += table(("Task", "Status", "Title"), [[esc(row["id"]), chip(row["status"]), esc(row["title"])] for row in tasks]) if tasks else empty("tasks", "No tasks in this Run.")
+parts.append(section("tasks", "Tasks", task_body, "tasks"))
+gate_body = table(("Gate", "Task", "Status", "Question"), [[esc(row["id"]), esc(row["taskId"]), chip(row["status"]), esc(row["question"])] for row in gates]) if gates else empty("gates", "No decision gates in this Run.")
+parts.append(section("gates", "Decision gates", gate_body, "gates"))
+rule_body = table(("Ruleset", "Rule applying to main", "Parameters"), [[esc(row.get("ruleset_id")), esc(row["type"]), esc(json.dumps(row.get("parameters", {}), sort_keys=True))] for row in rules]) if rules else empty("rules", "No active rules reported for main.")
+rule_body = "<p>" + esc(gate_line) + "</p>" + rule_body
+rule_body += '<p class="src">Active rules applying to main, from one GitHub GET; disabled and evaluate-only rulesets are outside this response.</p>'
+parts.append(section("gate", "Repository gate", rule_body, "rules"))
+pull_body = table(("PR", "Title", "Checks"), [[esc("#" + str(pr["number"])), esc(pr.get("title")), esc(pr_checks.get(pr["number"], "not reported"))] for pr in open_prs]) if open_prs else empty("pulls", "No open pull requests.")
+pull_body += "".join(source_note(key) for key in pr_sources if key != "pulls")
+parts.append(section("pulls", "Open pull requests", pull_body, "pulls"))
+parts.append(section("worktrees", "Worktrees", "<p>" + esc(worktree_line) + "</p>" + "".join(source_note(key) for key in tree_deps if key != "worktrees" and failed(key)), "worktrees"))
+
+roadmap = "<ol class=\"steps\">" + "".join(
+    f'<li><span class="num">{esc(number)}</span><strong>{md(name)}</strong>'
+    f'<span class="detail">Done means: {md(done)}</span><details class="detail"><summary>State on main</summary>{md(state)}</details>'
+    f'<span class="detail src">{md(record)}</span></li>' for number, name, done, state, record in steps
+) + "</ol>" if steps else "<p>Not reported.</p>"
+parts.append(section("roadmap", "Roadmap", roadmap, "roadmap"))
+drift_body = table(("Upstream", "Role", "Pinned", "Newest", "Status"), [
+    [esc(row["id"]), esc(row["role"]), esc(row["pinned"]), esc(row.get("newest_stable") if row["status"] == "STABLE-AVAILABLE" else row.get("newest")), chip(row["status"])] for row in drift
+]) if drift else empty("drift", "No tag-tracked upstreams reported.")
+parts.append(section("drift", "Drift", drift_body, "drift"))
+if isinstance(watch, dict) and watch.get("checked_at"):
+    parts[-1] = parts[-1].replace('</div></section>', '<p class="src">Cached landscape watch: ' + esc(watch["checked_at"]) + '. No upstream polling.</p></div></section>')
+for key, title, rows, source in (("automation", "Standing automation", automation, "automation"), ("toolchain", "Bootstrap and toolchain", toolchain, "bootstrap")):
+    body = table(("Name", "Status", "Detail"), [[esc(name), chip(status), esc(detail)] for name, status, detail in rows]) if rows else "<p>Not reported.</p>"
+    parts.append(section(key, title, body, source))
+
+measured = [worker for worker in workers if worker.get("tok_s") is not None]
+top = max((worker["tok_s"] for worker in measured), default=1) or 1
+worker_rows = []
+conversations = 0
+for worker in workers:
+    label = worker["lane"]
+    if label == "-":
+        conversations += 1
+        label = f'{worker["runtime"]} conversation {conversations}'
+    rate = worker.get("tok_s")
+    meter = f'<span class="track"><i style="width:{100 * rate / top:.1f}%"></i></span> {rate:g}' if rate is not None else "not measured"
+    worker_rows.append([esc(label), esc(worker["runtime"]), esc(worker.get("model")), esc(worker["state"]), meter, esc(worker.get("note", ""))])
+rates_body = f'<p>Output tokens per second over the last {window:g} minutes.</p>' if window is not None else "<p>Measurement window not reported.</p>"
+rates_body += table(("Worker", "Runtime", "Model", "State", "tok/s", "Note"), worker_rows) if workers else empty("rates", "No workers reported.")
+parts.append(section("workers", "Tokens per second by worker", rates_body, "rates"))
+runtimes = table(("Runtime", "Version", "Model", "Effort"), [[esc(row[key]) for key in ("name", "version", "model", "effort")] for row in report["runtimes"]])
+runtimes += "<p class=\"src\">Configured defaults; launch and session overrides are not observed.</p>"
+parts.append(section("runtimes", "Runtimes", runtimes, "bootstrap"))
+
+source_rows = []
+for key, source in sources.items():
+    state = '<strong class="unv">UNVERIFIED</strong> ' + esc(errors.get(key, "source failed")) if source["exit_code"] or key in errors else "reported"
+    source_rows.append(f'<tr data-source="{key}"><td><code>{esc(source["command"])}</code></td><td>exit {source["exit_code"]}</td><td>{state}</td></tr>')
+parts.append('<section id="sources"><h2>Sources</h2><div class="card scroll"><table><thead><tr><th>Command</th><th>Exit</th><th>Report</th></tr></thead><tbody>' + "".join(source_rows) + '</tbody></table></div></section>')
+read_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+nav = "".join(f'<a href="#{key}">{label}</a>' for key, label in (("main", "Main"), ("tasks", "Tasks"), ("gates", "Gates"), ("roadmap", "Roadmap"), ("drift", "Drift"), ("automation", "Readiness"), ("workers", "tok/s"), ("runtimes", "Runtimes"), ("sources", "Sources")))
+page = '''<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Canon command view</title><style>
+:root{--plane:#f9f9f7;--surface:#fcfcfb;--ink:#0b0b0b;--ink2:#52514e;--grid:#e1e0d9;--axis:#c3c2b7;--s1:#2a78d6;--chip:#f0efec}
+@media(prefers-color-scheme:dark){:root{--plane:#0d0d0d;--surface:#1a1a19;--ink:#f0efec;--ink2:#c3c2b7;--grid:#2c2c2a;--axis:#383835;--s1:#3987e5;--chip:#2c2c2a}}
+*{box-sizing:border-box}body{margin:0;background:var(--plane);color:var(--ink);font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
+main{max-width:1180px;margin:0 auto;padding:32px 24px 64px}h1{font-size:28px;margin:0 0 4px}h2{font-size:18px;margin:36px 0 8px}
+p{margin:6px 0 12px}nav{display:flex;flex-wrap:wrap;gap:6px 14px;margin-top:14px}nav a,summary{color:var(--ink2)}
+.card{background:var(--surface);border:1px solid var(--grid);border-radius:10px;padding:16px 18px;min-width:0}.scroll{overflow-x:auto}
+.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px}.k,.src{color:var(--ink2);font-size:12px}.v{font-size:30px;font-weight:650;overflow-wrap:anywhere}
+table{border-collapse:collapse;width:100%;font-size:13px}th{text-align:left;color:var(--ink2);border-bottom:1px solid var(--axis)}
+th,td{padding:7px 12px 7px 0;vertical-align:top;overflow-wrap:anywhere}td{border-bottom:1px solid var(--grid)}tr:last-child td{border-bottom:0}
+code{font:12px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--chip);padding:1px 4px;border-radius:4px}
+.chip{display:inline-block;background:var(--chip);border-radius:99px;padding:2px 9px;font-size:12px}.c-good{color:#168019}.c-warn,.unv{color:#ae5b19}.unv{font-size:12px}
+.steps{list-style:none;margin:0;padding:0}.steps li{display:grid;grid-template-columns:30px minmax(0,1fr);gap:6px 12px;padding:12px 0;border-bottom:1px solid var(--grid)}
+.num{border:1px solid var(--axis);border-radius:50%;width:26px;height:26px;text-align:center}.detail{grid-column:2}.steps li:last-child{border:0}summary{cursor:pointer}
+.track{display:inline-block;width:90px;height:10px;background:var(--chip);vertical-align:middle}.track i{display:block;height:10px;background:var(--s1);border-radius:0 4px 4px 0}
+footer{margin-top:36px;color:var(--ink2);font-size:12px}@media(max-width:700px){.grid{grid-template-columns:1fr}main{padding:24px 14px}}
+</style></head><body><main>'''
+page += f'<header><h1>Canon command view</h1><p>Read {esc(read_at)}. Run <code>{esc(run_id)}</code>. A saved snapshot; rebuild to refresh.</p><nav>{nav}</nav></header>'
+page += "".join(parts) + '<footer>Generated by scripts/manifest. Every panel names its report source.</footer></main></body></html>\n'
+Path(sys.argv[2]).write_text(page, encoding="utf-8")
+sys.exit(1 if int(sys.argv[3]) or errors or any(source["exit_code"] for source in sources.values()) else 0)
+PY
 else
   jq -r '[.bootstrap, .automation, .canon][] | "Source: " + .command + " (exit " + (.exit_code | tostring) + ")\n" + .report' "$T/report.json"
   jq -r '.runtime_parse_error // empty' "$T/report.json"

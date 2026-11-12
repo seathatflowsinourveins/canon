@@ -1,22 +1,24 @@
 #!/bin/bash
-# Offline contracts: scripts/bootstrap's runtime TSV, scripts/manifest's three command reports,
-# and ps(1)/lsof(1) process rows (ADR 0059). No installed runtime or credential store is queried.
+# Offline contracts: scripts/bootstrap's runtime TSV, scripts/manifest's command reports,
+# Orca's pinned task/gate JSON and ps(1)/lsof(1) rows (ADR 0059). No network, Orca or credentials.
 # shellcheck disable=SC2016  # the stub evaluates its own positional parameters
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
 mkdir -p "$T/repo/scripts" "$T/repo/canon" "$T/bin" "$T/login-fixture/.codex"
+mkdir -p "$T/repo/.canon" "$T/trees/dirty" "$T/trees/review" "$T/trees/merged" "$T/trees/idle"
 cp "$ROOT/scripts/bootstrap" "$T/repo/scripts/"
 cp -R "$ROOT/home" "$T/repo/home"
 cp "$ROOT/canon/models.json" "$ROOT/canon/upstreams.json" "$T/repo/canon/"
+cp "$ROOT/canon/upstreams.lock.json" "$T/repo/canon/"
 for tool in jq python3; do
   ln -s "$(command -v "$tool")" "$T/bin/$tool"
 done
 export HOME="$T/login-fixture" CODEX_HOME="$T/login-fixture/.codex"
 export CLAUDE_CONFIG_DIR="$HOME/.claude"
 export PATH="$T/bin:/usr/bin:/bin" USER=login-fixture LOGNAME=login-fixture
-unset DSH_HOME
+unset DSH_HOME ORCA_CLI_COMMAND ORCA_DEV_REPO_ROOT
 for tool in security xcode-select; do printf '#!/bin/bash\nexit 1\n' > "$T/bin/$tool"; done
 for tool in claude codex agy muse dsh; do
   printf '#!/bin/bash\n[ "$1" = --version ] && { echo "7.8.9"; exit; }; exit 1\n' > "$T/bin/$tool"
@@ -63,25 +65,32 @@ mv "$T/bin/codex" "$T/codex-away"
 grep -q "$(printf '  Codex\tnot reported')" "$T/bootstrap"
 grep -q 'codex not on PATH' "$T/bootstrap"
 mv "$T/codex-away" "$T/bin/codex"
-# Run the real manifest with source commands as stand-ins; its only inputs must be those three commands.
+# Text and JSON keep their three original report inputs, supplied here by stand-ins.
 test -x "$ROOT/scripts/manifest" || { echo 'FAIL: scripts/manifest missing'; exit 1; }
 cp "$ROOT/scripts/manifest" "$T/repo/scripts/"
 mv "$T/repo/scripts/bootstrap" "$T/bootstrap-real"
 cat > "$T/repo/scripts/bootstrap" <<'STUB'
 #!/bin/bash
 [ "$*" = --check ] || exit 90
-cat "$HOME/../bootstrap"
+cat "${BOOTSTRAP_FILE:-$HOME/../bootstrap}"
 exit "${BOOTSTRAP_RC:-0}"
 STUB
 cat > "$T/repo/scripts/automation" <<'STUB'
 #!/bin/bash
 [ "$*" = status ] || exit 90
+if [ "${HTML_FIXTURE:-0}" = 1 ]; then
+  cat "${AUTOMATION_FILE:-$HOME/../html-automation}"
+  exit "${AUTOMATION_RC:-0}"
+fi
 printf 'Automation (ADR 0011):\n  maintenance  ok  %s/log; owner %s; contact fixture@example.com\n  codex  ok  accounts/16b71170-7ca8-4b90-b1a8-f22eb93aaff5/home\n' "$HOME" "$(id -un)"
 STUB
 cat > "$T/repo/scripts/canon" <<'STUB'
 #!/bin/bash
-[ "$*" = list ] || exit 90
-printf 'FIELD ID ROLE PIN SOURCE\nagent codex tool 0123456789ab example/project\n'
+case "$*" in
+  list) printf 'FIELD ID ROLE PIN SOURCE\nagent codex tool 0123456789ab example/project\n'; exit "${CANON_RC:-0}" ;;
+  'outdated --json') cat "$HOME/../html-drift"; exit "${DRIFT_RC:-0}" ;;
+  *) exit 90 ;;
+esac
 STUB
 chmod +x "$T/repo/scripts/"*
 "$T/repo/scripts/manifest" > "$T/text"
@@ -129,4 +138,471 @@ jq -e '[.workers[] | select(.runtime == "deepseek-harness")] | length == 2 and (
 CANON_LEDGER_HOME="$T/absent" "$ROOT/scripts/lanes" --rates > "$T/rates-text"
 grep -q 'deepseek-harness.*not measured' "$T/rates-text"
 grep -q 'deepseek-harness: process table only' "$T/rates-text"
+# HTML is a snapshot of read-only reports, scoped by an explicit Run. Stand-ins reject
+# every other command, including run-use, network access and reading the working branch.
+export HTML_FIXTURE=1 EXPECTED_RUN='run_fixture'
+{
+  printf 'Toolchain:\n  %-24s %-9s %s\n' mise ok 'toolchain fixture'
+  printf '  %-24s %-9s %s\n' 'account config' OWNER '/Users/another-login/.codex/accounts/16b71170-7ca8-4b90-b1a8-f22eb93aaff5/home/config.toml'
+  printf '  %-24s %-9s %s\n' allowance ok 'ALLOWANCE_CANARY 91%'
+  printf '  %-24s %-9s %s\n' 'paper key pair (windows)' ok 'FULL_WIDTH_CANARY'
+  printf '  %-24s %-9s %s\n' 'user CLAUDE.md' ok ''
+  printf '  %-24s %-9s %s\n' 'curl' MISSING ''
+  printf 'Machine-level config:\n  %-24s %-9s %s\n' 'settings' ok 'OTHER_SECTION_CANARY'
+  sed -n '/^Runtimes/,$p' "$T/bootstrap"
+} > "$T/html-bootstrap"
+mv "$T/html-bootstrap" "$T/bootstrap"
+cat > "$T/html-automation" <<'FIXTURE'
+Automation:
+  maintenance         ok        main snapshot checked
+  paper session       ok        last window ended flat; next window scheduled
+  landing             ok        local sign-off and GitHub checks
+  OTLP collector      ok        /Users/another-login/.claude/canon/otel/logs.jsonl
+FIXTURE
+cat > "$T/repo/scripts/lanes" <<'STUB'
+#!/bin/bash
+[ "$*" = '--rates --json' ] || exit 90
+cat "${RATES_FILE:-$HOME/../html-rates}"
+exit "${RATES_RC:-0}"
+STUB
+cat > "$T/html-rates" <<'FIXTURE'
+{"generated_at":"2026-11-11T20:00:00Z","window_min":10,"otlp_file":"/Users/another-login/private/ACCOUNT_PATH_CANARY","workers":[{"lane":"builder <one>","runtime":"claude-code","model":"fixture-model","state":"working","tok_s":12.5,"measured":true,"note":"","out_tokens":7500,"spend_window_usd":987.65},{"lane":"-","runtime":"codex","model":"fixture-codex","state":"events in window","tok_s":0,"measured":true,"note":"per conversation","spend_session_usd":654.32},{"lane":"reviewer","runtime":"muse-code","model":null,"state":"running 00:30","tok_s":null,"measured":false,"note":"not measured: no token telemetry"}],"usage":{"ALLOWANCE_CANARY":91}}
+FIXTURE
+cat > "$T/html-drift" <<'FIXTURE'
+[{"id":"foundation-fixture","role":"foundation","pinned":"v1.0","newest":"v1.1","newest_stable":"v1.1","status":"NEWER"},{"id":"stable-fixture","role":"tool","pinned":"v2rc1","newest":"v2.0","newest_stable":"v2.0","status":"STABLE-AVAILABLE"},{"id":"unparseable-fixture","role":"tool","pinned":"v3.0.post1","newest":null,"newest_stable":null,"status":"UNPARSEABLE"}]
+FIXTURE
+cat > "$T/bin/orca" <<'STUB'
+#!/bin/bash
+[ "$1" = orchestration ] && [ "$3" = --run ] && [ "$4" = "$EXPECTED_RUN" ] && [ "$5" = --json ] || exit 90
+case "$2" in
+  task-list)
+    [ "$#" = 6 ] && [ "$6" = --full ] || exit 90
+    if [ "${SOURCE_WARN:-0}" = 1 ]; then echo 'ORCA_WARNING_CANARY' >&2; fi
+    if [ "${TASKS_BAD:-0}" = 1 ]; then echo '{broken'; exit 0; fi
+    if [ "${WRONG_RUN:-0}" = 1 ]; then echo '{"ok":true,"result":{"runId":"other_run","tasks":[]}}'; exit 0; fi
+    if [ -n "${TASKS_FILE:-}" ]; then cat "$TASKS_FILE"; else cat "$HOME/../html-tasks"; fi
+    exit "${TASKS_RC:-0}" ;;
+  gate-list)
+    printf '{"ok":true,"result":{"runId":"run_fixture","gates":[{"id":"gate_fixture","taskId":"task_blocked","status":"open","question":"Choose <safe> & quoted option"}]}}\n'
+    exit "${GATES_RC:-0}" ;;
+  worker-list)
+    case "$*" in
+      'orchestration worker-list --run run_fixture --json --full --limit 100') cat "${WORKERS_FILE:-$HOME/../html-workers}" ;;
+      'orchestration worker-list --run run_fixture --json --full --limit 100 --cursor second-page') cat "$HOME/../html-workers-2" ;;
+      *) exit 90 ;;
+    esac
+    exit "${WORKERS_RC:-0}" ;;
+  *) exit 90 ;;
+esac
+STUB
+cat > "$T/bin/git" <<'STUB'
+#!/bin/bash
+[ "$1" = -C ] || exit 90
+target="$2"; shift 2
+case "$*" in
+  'status --porcelain --untracked-files=all')
+    [ "${GIT_OPTIONAL_LOCKS:-}" = 0 ] || touch "$HOME/../status-took-lock"
+    case "$target" in */trees/idle) [ "${PRUNABLE_TREE:-0}" = 1 ] && { echo "fatal: cannot change to '$target'" >&2; exit 128; } ;; esac
+    case "$target" in */trees/dirty) echo ' M strategy.py' ;; esac
+    exit "${WORKTREE_STATUS_RC:-0}" ;;
+esac
+[ "$target" = "$(cd "$HOME/../repo" && pwd)" ] || exit 90
+case "$*" in
+  'show -s --format=%H%n%s main')
+    if [ "${SOURCE_WARN:-0}" = 1 ]; then echo 'GIT_WARNING_CANARY' >&2; fi
+    printf '0123456789abcdef0123456789abcdef01234567\nMain <fixture> & subject\n'; exit "${MAIN_RC:-0}" ;;
+  'show 0123456789abcdef0123456789abcdef01234567:canon/paper-schedule')
+    printf '%s\n# SCHEDULE_COMMENT_CANARY\n' "${SCHEDULE_VALUE:-mover}"; exit "${SCHEDULE_RC:-0}" ;;
+  'show 0123456789abcdef0123456789abcdef01234567:docs/roadmap.md')
+    if [ "${ROADMAP_BAD:-0}" = 1 ]; then echo 'no table'; else
+      printf '| # | Step | Done means | State | Record |\n|---|---|---|---|---|\n| 1 | The `fixture` harness | Evidence <safe> | Done | ADR 0001 |\n| 8 | Paper comparison | Complete a paper trial | Not started | ADR 0010 |\n'
+    fi
+    exit "${ROADMAP_RC:-0}" ;;
+  'rev-parse --verify refs/remotes/origin/main') echo 0123456789abcdef0123456789abcdef01234567; exit "${ORIGIN_RC:-0}" ;;
+  'worktree list --porcelain -z')
+    printf 'worktree %s\0HEAD 0123456789abcdef0123456789abcdef01234567\0branch refs/heads/main\0\0' "$target"
+    for branch in dirty review merged idle; do
+      case "$branch" in dirty) sha=1111111111111111111111111111111111111111 ;; review) sha=2222222222222222222222222222222222222222 ;; merged) sha=3333333333333333333333333333333333333333 ;; idle) sha=4444444444444444444444444444444444444444 ;; esac
+      if [ "$branch" = idle ] && [ "${WORKTREE_HEAD_BAD:-0}" = 1 ]; then sha=not-a-sha; fi
+      branch_name="$branch"
+      if [ "$branch" = merged ]; then branch_name="${MERGED_BRANCH:-$branch}"; fi
+      if [ "$branch" = idle ] && [ "${PRUNABLE_TREE:-0}" = 1 ]; then
+        printf 'worktree %s/../trees/%s\0HEAD %s\0branch refs/heads/%s\0prunable gitdir file points to non-existent location\0\0' "$HOME" "$branch" "$sha" "$branch_name"; continue
+      fi
+      printf 'worktree %s/../trees/%s\0HEAD %s\0branch refs/heads/%s\0\0' "$HOME" "$branch" "$sha" "$branch_name"
+    done
+    exit "${WORKTREES_RC:-0}" ;;
+  'rev-list --count 0123456789abcdef0123456789abcdef01234567..0123456789abcdef0123456789abcdef01234567'|'rev-list --count 0123456789abcdef0123456789abcdef01234567..1111111111111111111111111111111111111111'|'rev-list --count 0123456789abcdef0123456789abcdef01234567..4444444444444444444444444444444444444444') echo 0; exit "${AHEAD_RC:-0}" ;;
+  'rev-list --count 0123456789abcdef0123456789abcdef01234567..'*) echo 2; exit "${AHEAD_RC:-0}" ;;
+  log*)
+    case "$*" in *'--since=2026-11-11T00:00:00+00:00 origin/main') ;; *) exit 90 ;; esac
+    printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\t1794391200\tLand fixture one (#101)\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\t1794394800\tLand fixture two (#102)\n'
+    exit "${LANDINGS_RC:-0}" ;;
+  *) exit 90 ;;
+esac
+STUB
+for tool in curl wget; do printf '#!/bin/bash\ntouch "$HOME/../network-called"\nexit 90\n' > "$T/bin/$tool"; done
+cat > "$T/bin/gh" <<'STUB'
+#!/bin/bash
+[ "$1" = api ] && [ "$2" = --method ] && [ "$3" = GET ] || exit 90
+case "$4" in
+  'repos/{owner}/{repo}/pulls?state=all&per_page=100')
+    [ "$5" = --paginate ] && [ "$6" = --slurp ] || exit 90
+    cat "${PULLS_FILE:-$HOME/../html-pulls}"; exit "${PULLS_RC:-0}" ;;
+  'repos/{owner}/{repo}/commits/2222222222222222222222222222222222222222/check-runs?per_page=100')
+    if [ "${CHECKS_EMPTY:-0}" = 1 ]; then echo 'checks unavailable' >&2; exit 7; fi
+    jq -n --arg name "${CHECK_NAME:-ci}" '[{check_runs:[{name:$name,status:"completed",conclusion:"success"}]}]'; exit "${CHECKS_RC:-0}" ;;
+  'repos/{owner}/{repo}/commits/2222222222222222222222222222222222222222/status?per_page=100')
+    if [ "${CHECKS_EMPTY:-0}" = 1 ]; then echo 'statuses unavailable' >&2; exit 7; fi
+    echo '[{"state":"pending","statuses":[{"context":"review","state":"pending"}]}]'; exit "${STATUSES_RC:-0}" ;;
+  'repos/{owner}/{repo}/rules/branches/main?per_page=100')
+    [ "$#" = 4 ] || exit 90
+    echo rules >> "$HOME/../rules-reads"
+    echo '[{"type":"required_status_checks","ruleset_id":42,"ruleset_source_type":"Repository","ruleset_source":"fixture/repo","parameters":{"required_status_checks":[{"context":"ci"},{"context":"review"},{"context":"signoff"}]}}]'
+    exit "${RULES_RC:-0}" ;;
+  *) exit 90 ;;
+esac
+STUB
+cat > "$T/html-tasks" <<'FIXTURE'
+{"ok":true,"result":{"runId":"run_fixture","tasks":[{"id":"task_ready","status":"ready","task_title":"Build <img src=x onerror=alert(1)> & inspect","spec":"Build fixture","created_at":"2026-11-11 00:00:00","result":null},{"id":"task_review","status":"ready","task_title":"Claude review and land review branch","spec":"branch review","created_at":"2026-11-10 00:00:00","result":null},{"id":"task_landing","status":"dispatched","task_title":"Claude landing","spec":"Land tested work","created_at":"2026-11-11 01:00:00","result":null},{"id":"task_blocked","status":"blocked","task_title":"Wait for fixture","spec":"Wait","created_at":"2026-11-11 00:00:00","result":null},{"id":"task_returned","status":"failed","task_title":"Build again","spec":"Implement","created_at":"2026-11-11 00:00:00","result":"Returned to builder: fix the fixture"}]}}
+FIXTURE
+cat > "$T/html-workers" <<'FIXTURE'
+{"ok":true,"result":{"scope":{"run":"run_fixture","source":"flag"},"workers":[{"taskId":"task_landing","workerState":"running","projection":{"provider":{"id":"claude","model":"fixture"},"liveness":{"verdict":"live"},"stage":{"activity":"working"}}},{"taskId":"task_ready","workerState":"running","projection":{"provider":{"id":"codex","model":"fixture"},"liveness":{"verdict":"unverifiable","reason":"stale_status"},"stage":{"activity":"unknown"}}}],"page":{"hasMore":true,"nextCursor":"second-page","total":3},"warnings":["Showing 2 of 3 Dispatches, newest first; more are on later pages. Follow page.nextCursor with --cursor."]}}
+FIXTURE
+cat > "$T/html-workers-2" <<'FIXTURE'
+{"ok":true,"result":{"scope":{"run":"run_fixture","source":"flag"},"workers":[{"taskId":"old_task","workerState":"succeeded","projection":{"provider":{"id":"muse","model":"fixture"},"liveness":{"verdict":"exited"},"stage":{"activity":"done"}}}],"page":{"hasMore":false,"nextCursor":null,"total":3}}}
+FIXTURE
+cat > "$T/html-pulls" <<'FIXTURE'
+[[{"number":101,"state":"open","title":"Review fixture","head":{"sha":"2222222222222222222222222222222222222222","ref":"review","repo":{"full_name":"fixture/repo"}},"base":{"repo":{"full_name":"fixture/repo"}},"merged_at":null},{"number":99,"state":"closed","title":"Merged fixture","head":{"sha":"3333333333333333333333333333333333333333","ref":"merged","repo":{"full_name":"fixture/repo"}},"base":{"repo":{"full_name":"fixture/repo"}},"merged_at":"2026-11-11T01:00:00Z"}]]
+FIXTURE
+jq -n --slurpfile rows "$T/html-drift" '{checked_at:"2026-11-11T12:34:00Z",ok:true,newer:[$rows[0][] | select(.status != "UNPARSEABLE")],unparseable:[$rows[0][] | select(.status == "UNPARSEABLE") | {id,pinned}],errors:[]}' > "$T/repo/.canon/watch.json"
+watch_fp=$(cat "$T/repo/canon/upstreams.json" "$T/repo/canon/upstreams.lock.json" | cksum | awk '{print $1 "-" $2}')
+jq --arg fp "$watch_fp" '.registry=$fp | .retagged=[] | .stale=[]' "$T/repo/.canon/watch.json" > "$T/watch-fp"
+mv "$T/watch-fp" "$T/repo/.canon/watch.json"
+jq '.result.tasks |= map(if .id=="task_landing" then .dispatch_id="dispatch_landing" else . end)' "$T/html-tasks" > "$T/tasks-ids"
+mv "$T/tasks-ids" "$T/html-tasks"
+jq '.result.workers[0].dispatchId="dispatch_landing" | .result.workers[1].dispatchId="dispatch_builder"' "$T/html-workers" > "$T/worker-ids"
+mv "$T/worker-ids" "$T/html-workers"
+jq '.result.workers[0].dispatchId="dispatch_old"' "$T/html-workers-2" > "$T/worker-ids"
+mv "$T/worker-ids" "$T/html-workers-2"
+chmod +x "$T/repo/scripts/lanes" "$T/bin/orca" "$T/bin/git" "$T/bin/curl" "$T/bin/wget" "$T/bin/gh"
+ln -s orca "$T/bin/orca-ide"
+html_cached_drift() {
+  local status=0
+  mv "$T/repo/scripts/canon" "$T/canon-stub"
+  cp "$ROOT/scripts/canon" "$T/repo/scripts/canon"
+  "$T/repo/scripts/manifest" --html "$T/no-network.html" --run "$EXPECTED_RUN" || status=$?
+  mv "$T/canon-stub" "$T/repo/scripts/canon"
+  if [ -e "$T/network-called" ]; then
+    echo 'FAIL: HTML polled upstream tags through the real canon command'; return 1
+  fi
+  [ "$status" = 0 ] || { echo 'FAIL: cached drift render failed'; return 1; }
+}
+html_cached_drift
+echo '  pass  cached drift does not poll upstream through real canon'
+html_contract() {
+  "$T/repo/scripts/manifest" --html "$T/status page.html" --run "$EXPECTED_RUN" || {
+    echo 'FAIL: HTML fixture render rejected or source failed'
+    if [ -f "$T/status page.html" ]; then
+      python3 - "$T/status page.html" <<'PY'
+import re
+import sys
+from pathlib import Path
+for row in re.findall(r'<tr data-source="[^\"]+">.*?</tr>', Path(sys.argv[1]).read_text()):
+    if "UNVERIFIED" in row:
+        print(row)
+PY
+    fi
+    return 1
+  }
+  python3 - "$T/status page.html" <<'PY'
+import re
+import sys
+from html.parser import HTMLParser
+from pathlib import Path
+
+page = Path(sys.argv[1]).read_text()
+
+class Snapshot(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.ids = set()
+        self.text = []
+
+    def handle_starttag(self, tag, attrs):
+        assert tag not in {"script", "link", "iframe", "img", "object", "embed"}, tag
+        attrs = dict(attrs)
+        self.ids.add(attrs.get("id"))
+        for name, value in attrs.items():
+            assert not name.startswith("on"), name
+            if name in {"src", "href"}:
+                assert value.startswith("#"), value
+
+    def handle_data(self, data):
+        self.text.append(data)
+
+snapshot = Snapshot()
+snapshot.feed(page)
+assert {"tasks", "gates", "main", "paper", "roadmap", "drift", "automation", "toolchain", "workers", "runtimes", "sources"} <= snapshot.ids
+text = " ".join(snapshot.text)
+for value in ("run_fixture", "Build <img src=x onerror=alert(1)> & inspect", "task_blocked", "Choose <safe> & quoted option", "Main <fixture> & subject", "mover", "last window ended flat", "The ", "fixture", "Not started", "foundation-fixture", "STABLE-AVAILABLE", "UNPARSEABLE", "toolchain fixture", "builder <one>", "12.5", "not measured: no token telemetry", "Codex", "profile-model"):
+    assert value in text, value
+for private in ("ALLOWANCE_CANARY", "ACCOUNT_PATH_CANARY", "another-login", "/Users/", "accounts/", "login-fixture", "987.65", "654.32", "7500", "Spend", "Output tokens</th>"):
+    assert private not in page, private
+assert "<style>" in page and not re.search(r"@import|url\s*\(", page, re.I)
+assert "{{" not in page
+PY
+}
+html_contract
+echo '  pass  HTML panels, escaping, privacy and local assets from fixtures'
+# A failed source still produces a page and names the failing source with its exit code.
+for source in BOOTSTRAP AUTOMATION CANON RATES TASKS GATES MAIN SCHEDULE ROADMAP; do
+  if env "${source}_RC=7" "$T/repo/scripts/manifest" --run "$EXPECTED_RUN" --html "$T/failed.html"; then
+    echo "FAIL: HTML swallowed $source failure"; exit 1
+  fi
+  grep -qF 'UNVERIFIED' "$T/failed.html"
+  source_key=$(printf '%s' "$source" | tr '[:upper:]' '[:lower:]')
+  grep -Eq "data-source=\"$source_key\".*exit 7.*UNVERIFIED" "$T/failed.html"
+done
+echo '  pass  HTML names all failing report sources and returns nonzero'
+# Malformed tasks are unavailable; a count of zero would falsely say the Run was empty.
+html_unavailable_tasks() {
+  if TASKS_BAD=1 "$T/repo/scripts/manifest" --html "$T/bad-tasks.html" --run "$EXPECTED_RUN"; then
+    echo 'FAIL: malformed HTML tasks accepted'; return 1
+  fi
+  grep -qF 'UNVERIFIED' "$T/bad-tasks.html"
+  if grep -qF '0 tasks' "$T/bad-tasks.html"; then
+    echo 'FAIL: unavailable tasks presented as an empty Run'; return 1
+  fi
+}
+html_unavailable_tasks
+echo '  pass  unavailable HTML tasks do not claim a zero count'
+# Empty or malformed structured reports are unavailable, never an empty success panel.
+cp "$T/html-rates" "$T/html-rates-good"
+printf '{broken\n' > "$T/html-rates"
+if "$T/repo/scripts/manifest" --html "$T/malformed.html" --run "$EXPECTED_RUN"; then
+  echo 'FAIL: malformed HTML rates accepted'; exit 1
+fi
+grep -qF 'UNVERIFIED' "$T/malformed.html"
+mv "$T/html-rates-good" "$T/html-rates"
+if ROADMAP_BAD=1 "$T/repo/scripts/manifest" --html "$T/malformed.html" --run "$EXPECTED_RUN"; then
+  echo 'FAIL: missing HTML roadmap table accepted'; exit 1
+fi
+grep -qF 'UNVERIFIED' "$T/malformed.html"
+usage_refused --html "$T/missing-run.html"
+usage_refused --run "$EXPECTED_RUN"
+usage_refused --html "$T/out.html" --run ''
+usage_refused --json --html "$T/out.html" --run "$EXPECTED_RUN"
+usage_refused --html "$T/out.html" --html "$T/out2.html" --run "$EXPECTED_RUN"
+echo '  pass  HTML malformed reports and argument validation'
+# Reader regressions are checked independently so the red run names every reproduced defect.
+html_reader_regressions() {
+  SOURCE_WARN=1 "$T/repo/scripts/manifest" --html "$T/reader.html" --run "$EXPECTED_RUN" || true
+  "$T/repo/scripts/manifest" --html "$T/plain.html" --run "$EXPECTED_RUN"
+  sed 's/last window ended flat; next window scheduled/usage: bad flag; ALLOWANCE_CANARY 91%/; s/paper session       ok/paper session       FAILED/' "$T/html-automation" > "$T/usage-automation"
+  printf 'Recent alerts:\n  ALERT_ROW_CANARY  split  lane: warning\n' >> "$T/usage-automation"
+  AUTOMATION_FILE="$T/usage-automation" "$T/repo/scripts/manifest" --html "$T/usage-row.html" --run "$EXPECTED_RUN" || true
+  cat > "$T/path-tasks" <<'FIXTURE'
+{"ok":true,"result":{"runId":"run_fixture","tasks":[{"id":"paths","title":"Inspect https://example.com/a /code-review /model /autocompact </tag> and /Users/Jane Doe/Library/Application Support/orca/claude-profiles/PROFILE_CANARY/settings.json; done","status":"ready","created_at":"2026-11-11 00:00:00"}]}}
+FIXTURE
+  TASKS_FILE="$T/path-tasks" "$T/repo/scripts/manifest" --html "$T/paths.html" --run "$EXPECTED_RUN"
+  WRONG_RUN=1 "$T/repo/scripts/manifest" --html "$T/wrong-run.html" --run "$EXPECTED_RUN" || true
+  jq '.workers=[] | .ledger_present=false | .ledger_note="LEDGER_DIAGNOSTIC_CANARY" | .otlp_unreadable_lines=2 | .warnings=["RATE_WARNING_CANARY"]' "$T/html-rates" > "$T/partial-rates"
+  RATES_FILE="$T/partial-rates" "$T/repo/scripts/manifest" --html "$T/partial.html" --run "$EXPECTED_RUN" || true
+  SCHEDULE_VALUE=WRONG_SCHEDULE_CANARY "$T/repo/scripts/manifest" --html "$T/bad-schedule.html" --run "$EXPECTED_RUN" || true
+  mv "$T/repo/.canon/watch.json" "$T/watch-away"
+  "$T/repo/scripts/manifest" --html "$T/no-watch.html" --run "$EXPECTED_RUN" || true
+  mv "$T/watch-away" "$T/repo/.canon/watch.json"
+  cp "$T/bin/orca" "$HOME/fake-cli"
+  ORCA_CLI_COMMAND=" $HOME/fake-cli " "$T/repo/scripts/manifest" --html "$T/cli.html" --run "$EXPECTED_RUN" || true
+  python3 - "$T" <<'PY'
+import sys
+from html import unescape
+from pathlib import Path
+root = Path(sys.argv[1])
+def read(name):
+    return unescape((root / name).read_text())
+page = read("reader.html")
+checks = {
+    "full-width status row": "FULL_WIDTH_CANARY" in page,
+    "empty-detail row": "user CLAUDE.md" in page and "MISSING" in page,
+    "schedule first line": "SCHEDULE_COMMENT_CANARY" not in read("plain.html"),
+    "stderr preserves JSON": "Build <img" in page and "ORCA_WARNING_CANARY" in page,
+    "stderr preserves main hash": "Main <fixture>" in page and "GIT_WARNING_CANARY" in page,
+    "bootstrap label covers sections": "Bootstrap and toolchain" in page and "OTHER_SECTION_CANARY" in page,
+    "failed row mentioning usage retained": "FAILED" in read("usage-row.html") and "ALLOWANCE_CANARY" not in read("usage-row.html"),
+    "recent alerts are not automation rows": "ALERT_ROW_CANARY" not in read("usage-row.html"),
+    "URL, slash command and escaped closing tag survive": all(value in read("paths.html") for value in ("https://example.com/a", "/code-review", "/model", "/autocompact", "</tag>")),
+    "spaced account path removed": all(value not in read("paths.html") for value in ("Jane", "Doe", "PROFILE_CANARY", "Support/orca")),
+    "original wrong-Run diagnostic retained": "response names a different Run" in read("wrong-run.html"),
+    "rates sub-source diagnostics retained": all(value in read("partial.html") for value in ("LEDGER_DIAGNOSTIC_CANARY", "RATE_WARNING_CANARY", "2 unreadable OTLP lines", "UNVERIFIED")),
+    "invalid schedule is not a hero value": "WRONG_SCHEDULE_CANARY" not in read("bad-schedule.html") and "UNVERIFIED" in read("bad-schedule.html"),
+    "dated cache replaces live drift": "2026-11-11T12:34:00Z" in read("plain.html") and "scripts/canon outdated" not in read("plain.html"),
+    "missing watch is not run": "not run: no readable dated landscape watch cache" in read("no-watch.html"),
+    "explicit CLI is trimmed and can live under HOME": 'data-source="orca_workers"' in read("cli.html") and 'exit 1' not in read("cli.html") and 'exit 127' not in read("cli.html"),
+    "real canon list stays offline": not (root / "network-called").exists() and "foundation-fixture" in read("no-network.html"),
+    "gate panel with rules and checks": all(value in read("plain.html") for value in ('id="gate"', 'id="pulls"', 'id="worktrees"', "required_status_checks", "signoff", "ci=success", "review=pending", "total=5")),
+}
+for name, passed in checks.items():
+    print(("  pass  " if passed else "  FAIL  ") + name)
+assert all(checks.values()), "reader regressions"
+PY
+}
+html_reader_regressions
+digest_contract() {
+  "$T/repo/scripts/manifest" --digest --run "$EXPECTED_RUN" --since 2026-11-11T00:00:00Z > "$T/digest" || {
+    cat "$T/digest"; echo 'FAIL: digest fixture render rejected or source failed'; return 1;
+  }
+  python3 - "$T/digest" <<'PY'
+import sys
+from pathlib import Path
+lines = Path(sys.argv[1]).read_text().splitlines()
+assert len(lines) == 10, lines
+for index, terms in enumerate((('Review queue', '2', 'oldest'), ('Landings', '2', '#101', '#102'), ('Tasks', 'ready=2', 'dispatched=1', 'blocked=1', 'failed=1'), ('Returned', '1', 'result text'), ('Workers', 'claude', 'codex', 'muse', 'stalled=1', 'exited=1', '12.5', 'all lanes'), ('Worktrees', 'total=5', 'uncommitted=1', 'awaiting review=1', 'removable=2'), ('Open PRs', '#101', 'ci=success', 'review=pending'), ('Paper session', 'last window ended flat'), ('Gate', 'landing', 'ok'), ('Sources failed', 'none'))):
+    for term in terms:
+        assert term in lines[index], (index, term, lines[index])
+for private in ('987.65', '654.32', 'ALLOWANCE_CANARY', 'ACCOUNT_PATH_CANARY', '/Users/', 'login-fixture'):
+    assert private not in '\n'.join(lines), private
+PY
+}
+digest_contract
+echo '  pass  digest ten-line contract from read-only fixture sources'
+digest_failures() {
+  for fixture in 'TASKS:3:tasks' 'WORKERS:5:orca_workers' 'RATES:5:rates' 'PULLS:7:pulls' 'CHECKS:7:pr_101_checks' 'STATUSES:7:pr_101_statuses' 'ORIGIN:6:origin_main' 'WORKTREES:6:worktrees' 'WORKTREE_STATUS:6:worktree_status_0' 'AHEAD:6:worktree_ahead_0' 'LANDINGS:2:landings' 'AUTOMATION:8:automation'; do
+    source=${fixture%%:*}; rest=${fixture#*:}; line=${rest%%:*}; key=${rest#*:}
+    if env "${source}_RC=7" "$T/repo/scripts/manifest" --digest --run "$EXPECTED_RUN" --since 2026-11-11T00:00:00Z > "$T/failed-digest"; then
+      echo "FAIL: digest swallowed $source failure"; return 1
+    fi
+    python3 - "$T/failed-digest" "$line" "$key" <<'PY'
+import sys
+from pathlib import Path
+lines = Path(sys.argv[1]).read_text().splitlines()
+assert len(lines) == 10, lines
+assert "UNVERIFIED" in lines[int(sys.argv[2]) - 1] and sys.argv[3] in lines[int(sys.argv[2]) - 1], lines
+assert sys.argv[3] in lines[9], lines[9]
+PY
+  done
+}
+digest_failures
+echo '  pass  digest source failures stay on their lines and never become zero'
+jq '.[0][1].head.sha="9999999999999999999999999999999999999999"' "$T/html-pulls" > "$T/moved-pulls"
+PULLS_FILE="$T/moved-pulls" "$T/repo/scripts/manifest" --digest --run "$EXPECTED_RUN" --since 2026-11-11T00:00:00Z > "$T/moved-digest"
+sed -n '6p' "$T/moved-digest" > "$T/moved-worktree-line"
+grep -qF 'removable=1' "$T/moved-worktree-line"
+# git status refreshes a worktree's index under its index.lock unless optional locks are off (git(1),
+# GIT_OPTIONAL_LOCKS), which a lane committing there at the same moment would trip over
+if [ -e "$T/status-took-lock" ]; then echo 'FAIL: git status ran with optional locks on'; exit 1; fi
+echo '  pass  worktree status reads take no index lock'
+# a prunable worktree (its folder gone) is protected and not read: one stale tree never voids the line
+PRUNABLE_TREE=1 "$T/repo/scripts/manifest" --digest --run "$EXPECTED_RUN" --since 2026-11-11T00:00:00Z > "$T/prunable-digest" \
+  || { echo 'FAIL: a prunable worktree failed the digest'; exit 1; }
+sed -n '6p' "$T/prunable-digest" > "$T/prunable-line"
+if grep -qF UNVERIFIED "$T/prunable-line" || ! grep -qF 'total=5' "$T/prunable-line"; then
+  echo 'FAIL: a prunable worktree voided the worktree line'; cat "$T/prunable-line"; exit 1
+fi
+echo '  pass  a prunable worktree is counted, not read, and leaves the line verified'
+rules_before=$(wc -l < "$T/rules-reads")
+if RULES_RC=7 "$T/repo/scripts/manifest" --html "$T/failed-rules.html" --run "$EXPECTED_RUN"; then
+  echo 'FAIL: failed rules GET accepted'; exit 1
+fi
+grep -Eq 'data-source="rules".*exit 7.*UNVERIFIED' "$T/failed-rules.html"
+rules_after=$(wc -l < "$T/rules-reads")
+test "$((rules_after - rules_before))" = 1
+echo '  pass  merged-head identity and one failing rules GET'
+usage_refused --digest
+usage_refused --since 2026-11-11T00:00:00Z
+usage_refused --digest --json --run "$EXPECTED_RUN"
+usage_refused --digest --html "$T/out.html" --run "$EXPECTED_RUN"
+usage_refused --html "$T/out.html" --run "$EXPECTED_RUN" --since 2026-11-11T00:00:00Z
+usage_refused --digest --run "$EXPECTED_RUN" --since yesterday
+html_v2_high_regressions() {
+  AUTOMATION_FILE="$T/usage-automation" AUTOMATION_RC=7 "$T/repo/scripts/manifest" --digest --run "$EXPECTED_RUN" --since 2026-11-11T00:00:00Z > "$T/v2-usage" || true
+  CHECK_NAME=memory-usage CHECKS_RC=7 "$T/repo/scripts/manifest" --digest --run "$EXPECTED_RUN" --since 2026-11-11T00:00:00Z > "$T/v2-checks" || true
+  jq '.[0][0].head.sha="not-a-sha"' "$T/html-pulls" > "$T/bad-head-pulls"
+  PULLS_FILE="$T/bad-head-pulls" "$T/repo/scripts/manifest" --html "$T/v2-bad-head.html" --run "$EXPECTED_RUN" > "$T/v2-bad-head.out" 2> "$T/v2-bad-head.err" || true
+  python3 - "$T" <<'PY'
+import sys
+from pathlib import Path
+root = Path(sys.argv[1])
+paper = (root / "v2-usage").read_text().splitlines()[7]
+checks = (root / "v2-checks").read_text().splitlines()[6]
+bad = (root / "v2-bad-head.html").read_text() if (root / "v2-bad-head.html").exists() else ""
+results = {
+    "quota redaction preserves paper failure marker": "UNVERIFIED (automation)" in paper and "91%" not in paper,
+    "quota redaction preserves PR failure marker": "UNVERIFIED (pr_101_checks)" in checks,
+    "invalid PR head writes a named failure page": 'data-source="pulls"' in bad and "UNVERIFIED" in bad and "pull request head is not a commit SHA" in bad,
+}
+for name, result in results.items():
+    print(("  pass  " if result else "  FAIL  ") + name)
+assert all(results.values()), "round-2 high findings"
+PY
+}
+html_v2_high_regressions
+html_v2_medium_regressions() {
+  {
+    printf 'Toolchain:\n  %-24s %-9s %s\n' 'auto-compact window' 'NOT SET' 'not configured'
+    sed -n '/^Runtimes/,$p' "$T/bootstrap"
+  } > "$T/v2-bootstrap"
+  cp "$T/html-automation" "$T/v2-automation"
+  printf '  %-18s %-9s %s\n' 'landscape watch' INCOMPLETE 'last checked: 0 newer, 0 advanced, 0 retagged' >> "$T/v2-automation"
+  printf '  %-18s %-9s %s\n' 'watch lock' STALE-LOCK 'lock needs inspection' >> "$T/v2-automation"
+  BOOTSTRAP_FILE="$T/v2-bootstrap" AUTOMATION_FILE="$T/v2-automation" "$T/repo/scripts/manifest" --html "$T/v2-statuses.html" --run "$EXPECTED_RUN" || true
+  sed 's/last window ended flat; next window scheduled/\/var\/folders\/fixture\/latest.json is unreadable | LAST_RUN_CANARY ok | LAST_EXIT_CANARY 0; log ~\/Library\/Application Support\/private.log/' "$T/html-automation" > "$T/v2-path-automation"
+  AUTOMATION_FILE="$T/v2-path-automation" "$T/repo/scripts/manifest" --html "$T/v2-paths.html" --run "$EXPECTED_RUN" || true
+  CHECKS_EMPTY=1 "$T/repo/scripts/manifest" --digest --run "$EXPECTED_RUN" --since 2026-11-11T00:00:00Z > "$T/v2-no-checks" || true
+  cp "$T/repo/.canon/watch.json" "$T/watch-good"
+  jq '.registry="wrong"' "$T/watch-good" > "$T/repo/.canon/watch.json"
+  "$T/repo/scripts/manifest" --html "$T/v2-stale-watch.html" --run "$EXPECTED_RUN" || true
+  jq '.newer=[] | .unparseable=[] | .retagged=["RETAGGED_CANARY"] | .stale=["STALE_PIN_CANARY"]' "$T/watch-good" > "$T/repo/.canon/watch.json"
+  "$T/repo/scripts/manifest" --html "$T/v2-retagged.html" --run "$EXPECTED_RUN" || true
+  jq '.ok=false | .newer=[] | .unparseable=[{id:"incomplete"}] | .errors=null' "$T/watch-good" > "$T/repo/.canon/watch.json"
+  "$T/repo/scripts/manifest" --html "$T/v2-bad-watch.html" --run "$EXPECTED_RUN" > "$T/v2-bad-watch.out" 2> "$T/v2-bad-watch.err" || true
+  mv "$T/watch-good" "$T/repo/.canon/watch.json"
+  jq '.warnings=null' "$T/html-rates" > "$T/v2-bad-rates"
+  RATES_FILE="$T/v2-bad-rates" "$T/repo/scripts/manifest" --digest --run "$EXPECTED_RUN" --since 2026-11-11T00:00:00Z > "$T/v2-bad-rates.out" 2> "$T/v2-bad-rates.err" || true
+  jq '.result.workers=[null]' "$T/html-workers" > "$T/v2-bad-workers"
+  WORKERS_FILE="$T/v2-bad-workers" "$T/repo/scripts/manifest" --digest --run "$EXPECTED_RUN" --since 2026-11-11T00:00:00Z > "$T/v2-bad-workers.out" 2> "$T/v2-bad-workers.err" || true
+  WORKTREE_HEAD_BAD=1 "$T/repo/scripts/manifest" --digest --run "$EXPECTED_RUN" --since 2026-11-11T00:00:00Z > "$T/v2-bad-tree" || true
+  jq '.result.workers[0].projection.provider=null' "$T/html-workers" > "$T/v2-unknown-reviewer"
+  WORKERS_FILE="$T/v2-unknown-reviewer" "$T/repo/scripts/manifest" --digest --run "$EXPECTED_RUN" --since 2026-11-11T00:00:00Z > "$T/v2-unknown-reviewer.out" || true
+  jq '.result.workers += [{dispatchId:"old_dispatch",taskId:"task_landing",workerState:"succeeded",projection:{provider:{id:"codex",model:"old"},liveness:{verdict:"exited"}}}]' "$T/html-workers" > "$T/v2-history-workers"
+  WORKERS_FILE="$T/v2-history-workers" "$T/repo/scripts/manifest" --digest --run "$EXPECTED_RUN" --since 2026-11-11T00:00:00Z > "$T/v2-history-reviewer.out" || true
+  jq '.result.tasks += [{id:"review_target",status:"ready",task_title:"Claude review target",spec:"Base: commit 3333333333333333333333333333333333333333 on login-fixture/merged",created_at:"2026-11-11 00:00:00"}]' "$T/html-tasks" > "$T/v2-branch-tasks"
+  jq '.[0][1].head.ref="login-fixture/merged"' "$T/html-pulls" > "$T/v2-branch-pulls"
+  MERGED_BRANCH=login-fixture/merged TASKS_FILE="$T/v2-branch-tasks" PULLS_FILE="$T/v2-branch-pulls" "$T/repo/scripts/manifest" --digest --run "$EXPECTED_RUN" --since 2026-11-11T00:00:00Z > "$T/v2-branch-match" || true
+  python3 - "$T" <<'PY'
+import re
+import sys
+from html import unescape
+from pathlib import Path
+root = Path(sys.argv[1])
+def read(name):
+    path = root / name
+    return unescape(path.read_text()) if path.exists() else ""
+def line(name, number):
+    values = read(name).splitlines()
+    return values[number - 1] if len(values) == 10 else ""
+statuses = read("v2-statuses.html")
+results = {
+    "multi-word and overflowing status tokens": all(re.search(name + r'</td><td><span[^>]*>' + status + '</span>', statuses) for name, status in (("auto-compact window", "NOT SET"), ("landscape watch", "INCOMPLETE"), ("watch lock", "STALE-LOCK"))),
+    "path removal preserves neighboring status fields": all(value in read("v2-paths.html") for value in ("LAST_RUN_CANARY", "LAST_EXIT_CANARY")),
+    "worker source command stays identifiable": 'data-source="orca_workers"><td><code>orca orchestration worker-list' in read("cli.html"),
+    "failed empty check endpoints do not claim no checks": "UNVERIFIED" in line("v2-no-checks", 7) and "no checks reported" not in line("v2-no-checks", 7),
+    "watch checksum mismatch is unverified": "UNVERIFIED" in read("v2-stale-watch.html") and "registry" in read("v2-stale-watch.html"),
+    "watch retagged and stale pins remain visible": all(value in read("v2-retagged.html") for value in ("RETAGGED_CANARY", "STALE_PIN_CANARY", "UNVERIFIED")),
+    "malformed cache writes a failure page": 'data-source="drift"' in read("v2-bad-watch.html") and "UNVERIFIED" in read("v2-bad-watch.html"),
+    "null rate warnings stay a named failure": "UNVERIFIED (rates)" in line("v2-bad-rates.out", 5),
+    "invalid worker row stays a named failure": "UNVERIFIED" in line("v2-bad-workers.out", 5) and "orca_workers" in line("v2-bad-workers.out", 5),
+    "invalid worktree head does not become zero": "UNVERIFIED" in line("v2-bad-tree", 6) and "worktrees" in line("v2-bad-tree", 6),
+    "unknown assigned runtime is not counted as Claude": ": 1; oldest=" in line("v2-unknown-reviewer.out", 1),
+    "review queue uses the current dispatch": ": 2; oldest=" in line("v2-history-reviewer.out", 1),
+    "redacted on-branch specs retain open work": "awaiting review=2" in line("v2-branch-match", 6) and "removable=1" in line("v2-branch-match", 6),
+    "awaiting review rule is explicit": "ahead + open task/PR" in line("v2-branch-match", 6),
+}
+for name, result in results.items():
+    print(("  pass  " if result else "  FAIL  ") + name)
+assert all(results.values()), "round-2 medium and low findings"
+PY
+}
+html_v2_medium_regressions
 echo 'manifest: all offline cases passed'
