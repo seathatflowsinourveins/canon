@@ -79,3 +79,5 @@ rows. The defaults remain the fixed trail and the 300-second clock cooldown (the
 | `RATCHET_R` | 2 initial trail distances of gain; alternates 1, 3 | UNCALIBRATED | Source b01f4c4; lead's once-only ratchet | 2026-11-12 |
 | `RATCHET_G` | 0.5 of the initial trail; alternates 0.25, 0.75 | UNCALIBRATED | Source b01f4c4; lead's once-only ratchet, subject to spread floor | 2026-11-12 |
 | `RATCHET_BASE` | atr; alternate tier | UNCALIBRATED | Source b01f4c4; paired window arm | 2026-11-12 |
+| `HOLD_MOST_SECS` | 60 seconds without a followed price before an unpriced limit exit | UNCALIBRATED | Source b01f4c4; lead's held-stop decision (b), 2026-11-12 | 2026-11-12 |
+| `FLOOR_WAIT_SECS` | 60 seconds at the chase floor with the bid through it before releasing the floor | UNCALIBRATED | Source b01f4c4; lead's chase-floor decision (b), 2026-11-12 | 2026-11-12 |

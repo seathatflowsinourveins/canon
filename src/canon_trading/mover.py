@@ -35,6 +35,24 @@ A composition of upstream parts (ADR 0083, ADR 0088). What each part is, at Naut
   keeps the submit command's params (`crates/execution/src/order_emulator/emulator.rs:1368` and
   `:1522-1531`; upstream's test of it, `:4513`, covers stop orders), so the `extended_hours` mark is given
   once, on the submit.
+  T1 (owner/lead, 2026-11-12) selects a fixed entry-price offset, or rc8's
+  `AverageTrueRange(period).handle_bar` / `initialized` / `value`
+  (`indicators/__init__.pyi:155-185`, `crates/indicators/src/python/volatility/atr.rs`). The engine's
+  default is Wilder smoothing with the previous close. Each slot feeds only complete one-minute
+  bars. The dollar-volume tier is a stand-in for size, never market capitalization. `ratchet_base`
+  pairs ratchet with plain ATR or tier: at r initial trails of gain it tightens once to g of the initial trail, subject to
+  the latest spread floor, canceling and remaking the emulator order while retaining its trigger.
+  All arms keep PRICE offsets frozen from entry; BASIS_POINTS is supported upstream
+  (`docs/concepts/orders/index.md:236`) but would change the offset as the followed price rises.
+  If the entry order has no filled price, `Cache.positions_open` and `Position.avg_px_open`
+  (`common/__init__.pyi:568`, `model/__init__.pyi:5868`) supply the held position's average;
+  otherwise the current bid anchors protection. Each use is counted by name in the window record.
+  Exit timing uses `OrderReleased.ts_event/released_price` and `OrderFilled.ts_event/last_qty/last_px`
+  (`model/__init__.pyi:4822-4853`, `:4436-4498`). The release price is the observed bid when triggered
+  (`crates/execution/src/order_emulator/emulator.rs:1424-1427`), not the sale's limit price.
+  Re-entry is the lead's state rule (owner, 2026-11-12): reclaim, turn or tape-only VWAP;
+  lead, no primary source, UNCALIBRATED. No arm waits for a time cooldown. Live bars have no
+  session VWAP, so that arm refuses by name unless the exact completed bar's tape supplies it.
 * **The chase** of a released limit that rests is `cancel_order`, the cancel seen terminal at a later
   step, then a new limit for all that is held (`chase="resend"`, the default). No order is modified: the
   lead's decision of 2026-11-11, until the adapter's replace chain has passed two clean outside reviews.
@@ -94,10 +112,9 @@ to the request budget. Every number of them is a registered row, UNCALIBRATED (A
    Candidates are taken best-ranked first while a slot is free, each refused by name
    (`dropped`) when the ranking is older than `rank_max_age_secs`, the name is no longer in it, its move
    is over `max_move` (the no-chase cap), no quote is in the cache, the size comes to nothing, or the
-   requests of the last 60 seconds have reached `soft_line`, which holds a chase's re-price too. A name sold before is bought back only
-   after `cooldown_secs` and on a run whose last close is above the sale's price (a reclaim).
+   requests of the last 60 seconds have reached `soft_line`, which holds entries and chase re-prices. A name sold before uses the clock cooldown and reclaim by default, or a reclaim above its sale. The existing clock cooldown and reclaim are unchanged.
 
-Exits never wait for the ranking or the budget; only their re-price waits at `soft_line`. The strategy is long only: a sell is sized from what is
+Exits never wait for ranking or entry budgets; chase re-prices wait at `soft_line`. The strategy is long only: a sell is sized from what is
 held, one sell works at a time for a name, and nothing is sold while flat.
 
 **Order events.** At the pin, an event that the strategy's own `submit_order`, `cancel_order` or
@@ -125,11 +142,6 @@ releases on the first quote at the trigger); a broker-held stop as an outage bac
 the same shares is refused while the first works); slots reserved for the newest movers; no order into
 a halt (ADR 0083, gap 4). Known limits: the strategy does not know the session calendar (the run checks
 it); a partly filled entry is protected only from the next step.
-Selectable trail modes (source b01f4c4, lead's ruling 2026-11-12): the fixed trail remains the
-main default. ATR uses rc8 AverageTrueRange(period).handle_bar / initialized / value
-(indicators/__init__.pyi:155-185); tier selects by baseline dollars per minute, and ratchet tightens
-once. PRICE offsets remain frozen at entry. Window settings and all alternates are UNCALIBRATED;
-the bars replay refuses a non-fixed mode by its field and value.
 """
 
 from __future__ import annotations
@@ -391,8 +403,14 @@ REFUSED = (OrderStatus.DENIED, OrderStatus.REJECTED)
 UNLOCKED = (OrderStatus.INITIALIZED, OrderStatus.SUBMITTED)
 """An order's states before the venue has taken it, so before the account locks its cash."""
 TRAIL_CAP = Decimal("0.02")
+"""The widest a non-fixed trail may be, as a fraction of the price; a spread floor over it refuses the
+entry by name (the lead's (ii), 2026-11-12). UNCALIBRATED."""
+HOLD_MOST_SECS = 60
 """The lead's bound (2026-11-12, decision (b)) on a held stop: with no two-sided quote within this many
 seconds of the fill, the holding is sold by limit and counted as an `unpriced_exit`. UNCALIBRATED."""
+FLOOR_WAIT_SECS = 60
+"""The lead's (b), 2026-11-12: a sale resting at its chase floor with the bid through it for this many
+seconds drops the floor and follows the bid (`floor_released`). UNCALIBRATED."""
 TIER_TRAIL = Decimal("0.002")
 TRAIL_SETTINGS: dict[str, dict[str, Any]] = {
     "trail_mode": {
@@ -811,6 +829,75 @@ class TrailPlan:
     """Where the trail came from when that is not its bound: `cold_atr_fallback` (the lead's (ii))."""
 
 
+@dataclass
+class ExitRecord:
+    """One holding across every replacement sale; event clocks and bid marks, never timer estimates.
+
+    Slippage is positive for a worse fill: trigger bid less fill VWAP, divided by the trigger bid
+    or multiplied by sold shares. Peak giveback uses the highest observed held bid, for sold shares.
+    A still-open holding has no final-fill clock; amounts describe only the shares already sold.
+    """
+
+    instrument_id: InstrumentId
+    entry_client_order_id: str | None
+    quantity: Decimal
+    filled: Decimal = Decimal(0)
+    notional: Decimal = Decimal(0)
+    bought_notional: Decimal = Decimal(0)
+    trail_distance: Decimal | None = None
+    peak: Decimal | None = None
+    trigger_ns: int | None = None
+    trigger_price: Decimal | None = None
+    trigger_reason: str | None = None
+    final_fill_ns: int | None = None
+    wind_down_wait_ns: int | None = None
+    """From the decision to sell to the wind-down, for a sale still unfilled when it began: a gap deeper
+    than the chase floor rests until the wind-down's floorless sale (the coordinator, 2026-11-12)."""
+    floor_wait_ns: int | None = None
+    """How long the sale rested at its chase floor before the floor was released, if it was."""
+
+    def record(self) -> dict[str, Any]:
+        vwap = self.notional / self.filled if self.filled else None
+        slip = None if vwap is None or self.trigger_price is None else self.trigger_price - vwap
+        giveback = None if vwap is None or self.peak is None else max(Decimal(0), self.peak - vwap)
+        return {
+            "instrument_id": str(self.instrument_id),
+            "entry_client_order_id": self.entry_client_order_id,
+            "quantity": str(self.quantity),
+            "filled_quantity": str(self.filled),
+            "trail_distance": None if self.trail_distance is None else str(self.trail_distance),
+            "peak_price": None if self.peak is None else str(self.peak),
+            "trigger_ns": self.trigger_ns,
+            "trigger_price": None if self.trigger_price is None else str(self.trigger_price),
+            "trigger_reason": self.trigger_reason,
+            "final_fill_ns": self.final_fill_ns,
+            "floor_released": self.floor_wait_ns is not None,
+            "floor_wait_secs": None if self.floor_wait_ns is None else self.floor_wait_ns / 1e9,
+            "waited_for_wind_down": self.wind_down_wait_ns is not None,
+            "wind_down_wait_minutes": (
+                None if self.wind_down_wait_ns is None else self.wind_down_wait_ns / 60_000_000_000
+            ),
+            "trigger_to_final_fill_ms": (
+                None
+                if self.trigger_ns is None or self.final_fill_ns is None
+                else (self.final_fill_ns - self.trigger_ns) / 1_000_000
+            ),
+            "fill_vwap": None if vwap is None else str(vwap),
+            "slip_fraction": (
+                None
+                if slip is None or self.trigger_price is None or self.trigger_price <= 0
+                else str(slip / self.trigger_price)
+            ),
+            "slip_beyond_trail_pct": (
+                None
+                if slip is None or self.trigger_price is None or self.trigger_price <= 0
+                else str(slip / self.trigger_price * 100)
+            ),
+            "slip_dollars": None if slip is None else str(slip * self.filled),
+            "peak_giveback_dollars": None if giveback is None else str(giveback * self.filled),
+        }
+
+
 def baseline_per_minute(record: dict[str, Any]) -> Decimal | None:
     """The startup ranking's existing normal / clock minutes, without another history read.
 
@@ -889,8 +976,22 @@ class Slot:
     initial_trail: TrailPlan | None = None
     ratcheted: bool = False
     entry_record: dict[str, Any] | None = None
+    exit_record: ExitRecord | None = None
     last_bid: Decimal | None = None
     protection_anchor: Decimal | None = None
+    held_stop: Decimal | None = None
+    """With no followed price, the level a held stop sells through: the average fill, else the entry's
+    limit, less the trail distance in force. Checked each step on the last trade, else the minute close."""
+    held_since: int | None = None
+    """When the held stop began: the entry's first fill, else the step that found no followed price."""
+    floor_since: int | None = None
+    """When the sale was first seen resting at its floor with the bid through it."""
+    floor_released: bool = False
+    """The floor was dropped after `FLOOR_WAIT_SECS`: later sales of this holding follow the bid."""
+    trailed: bool = False
+    """An emulated trailing sell has been placed for this holding: a later hold counts from its own start."""
+    last_sale: Decimal | None = None
+    """The price of this holding's last plain sale: a remake with no bid is never priced above it."""
     run_ns: int | None = None
     """When the last rising run completed (the bar's `ts_event`), until an entry has been decided on."""
     run_close: Decimal | None = None
@@ -972,6 +1073,10 @@ class Mover(Strategy):
         """The event count the account query in flight brings the account to, or None."""
         self.query_sent_ns = 0
         """When the account query in flight was sent, on the node's clock."""
+        self.exits: list[ExitRecord] = []
+        self.protection_fallbacks = {"position average price": 0, "current bid": 0}
+        self.protect_paths = {"held_stop": 0, "unpriced_exit": 0, "trail": 0}
+        """How each held stop ended: sold through its level, sold after `HOLD_MOST_SECS`, or released."""
         self.refused: list[tuple[str, str]] = []
         self.dropped: list[str] = []
         """Why each candidate entry was not sent, for the run's report."""
@@ -1043,6 +1148,11 @@ class Mover(Strategy):
 
     def on_order_released(self, event: Any) -> None:
         self.released.add(event.client_order_id.value)
+        slot = self.slots.get(event.instrument_id)
+        if slot is not None and slot.protect_id == event.client_order_id:
+            self._mark_exit(
+                slot, event.ts_event, event.released_price.as_decimal(), "trailing stop"
+            )
 
     def on_data_response(self, response: Any) -> None:
         """Only retain the response; the next step checks the cache and subscribes outside reentry."""
@@ -1068,6 +1178,34 @@ class Mover(Strategy):
                 event.last_qty.as_decimal() * event.last_px.as_decimal(),
             )
         )
+
+        slot = self.slots.get(event.instrument_id)
+        if slot is None:
+            return
+        quantity = event.last_qty.as_decimal()
+        if event.order_side == OrderSide.BUY:
+            row = (
+                self._ensure_exit(slot, Decimal(0))
+                if slot.exit_record is None
+                else slot.exit_record
+            )
+            row.quantity += quantity
+            row.bought_notional += quantity * event.last_px.as_decimal()
+            row.final_fill_ns = None
+            plan = slot.trail_plan
+            row.trail_distance = offsets(
+                row.bought_notional / row.quantity,
+                self.settings.trail if plan is None else plan.trail,
+                self.settings.exit_through if plan is None else plan.exit_through,
+            )[0]
+            if slot.last_bid is not None:
+                row.peak = max(row.peak or slot.last_bid, slot.last_bid)
+        elif slot.exit_record is not None:
+            row = slot.exit_record
+            row.filled += quantity
+            row.notional += quantity * event.last_px.as_decimal()
+            if row.filled >= row.quantity:
+                row.final_fill_ns = event.ts_event
 
     def _trading_account(self, venue: Any) -> Any:
         """The venue's account as the portfolio holds it."""
@@ -1141,6 +1279,14 @@ class Mover(Strategy):
 
     def on_quote(self, quote: Any) -> None:
         self.quotes += 1
+        slot = self.slots.get(quote.instrument_id)
+        if slot is not None:
+            bid = quote.bid_price.as_decimal()
+            if bid > 0:  # a one-sided quote's zero bid is no price: keep the last real one
+                slot.last_bid = bid
+            row = slot.exit_record
+            if bid > 0 and row is not None and row.filled < row.quantity:
+                row.peak = max(row.peak or bid, bid)
 
     def on_trade(self, trade: Any) -> None:
         self.trades += 1
@@ -1178,7 +1324,10 @@ class Mover(Strategy):
             "fills": [list(fill) for fill in self.fills],
             "refused": [list(refused) for refused in self.refused],
             "released": sorted(self.released),
+            "protection_fallbacks": dict(self.protection_fallbacks),
+            "protect_paths": dict(self.protect_paths),
             "trail_notes": [PAPER_TRAIL_LIMIT, TRAIL_SOURCE_LIMIT, SHIPPED_ATR_NOTE],
+            "exits": [row.record() for row in self.exits],
             "notes": {str(i): list(notes) for i, notes in self.notes.items()},
             "entries": [dict(entry) for entry in self.entries_sent],
             "entry_contexts": {
@@ -1321,6 +1470,10 @@ class Mover(Strategy):
 
     def _wind_down(self, event: TimeEvent) -> None:  # the alert only marks it; the step acts
         self.winding_down = True
+        for slot in self.slots.values():
+            row = slot.exit_record
+            if row is not None and row.trigger_ns is not None and row.final_fill_ns is None:
+                row.wind_down_wait_ns = event.ts_event - row.trigger_ns
 
     def _say(self, text: str) -> None:
         """One line in the node's log, from which a run's record reads which rule decided. Called from
@@ -1553,6 +1706,28 @@ class Mover(Strategy):
 
     # --- one slot ------------------------------------------------------------------------------------
 
+    def _ensure_exit(self, slot: Slot, held: Decimal) -> ExitRecord:
+        """Start a holding's record before any synchronous release/fill; keep it through re-prices."""
+        if slot.exit_record is None:
+            slot.exit_record = ExitRecord(
+                slot.instrument_id,
+                None if slot.entry_record is None else slot.entry_record["client_order_id"],
+                held,
+            )
+            self.exits.append(slot.exit_record)
+        else:
+            slot.exit_record.quantity = held + slot.exit_record.filled
+        return slot.exit_record
+
+    def _mark_exit(self, slot: Slot, now: int, price: Decimal | None, reason: str) -> None:
+        """Store the first decision to sell. Safe in an event handler: plain values only."""
+        row = slot.exit_record
+        if row is not None and row.trigger_ns is None:
+            row.trigger_ns, row.trigger_price, row.trigger_reason = now, price, reason
+        stops = ("trailing stop", "retained trigger", "held stop")
+        if slot.entry_record is not None and reason.startswith(stops):
+            slot.entry_record["stopped_out"] = True
+
     def _manage(self, slot: Slot, now: int) -> None:
         if slot.protect_id is not None and slot.protect_id.value in self.released:
             slot.exiting = True
@@ -1570,6 +1745,10 @@ class Mover(Strategy):
             self._flat(slot, now)
             return
         slot.was_held = True
+        row = self._ensure_exit(slot, held)
+        quote = self.cache.quote(slot.instrument_id)
+        if quote is not None and (bid := quote.bid_price.as_decimal()) > 0:
+            row.peak = max(row.peak or bid, bid)
         if self.winding_down:
             if self.settings.extended_hours:
                 self._sell_out(slot, held, now)
@@ -1614,11 +1793,21 @@ class Mover(Strategy):
             slot.run_ns = slot.run_close = slot.run_seen_ns = None
             slot.trail_plan = slot.initial_trail = None
             slot.ratcheted, slot.entry_record = False, None
-            slot.protection_anchor = None
+            slot.exit_record = None
+            slot.protection_anchor = slot.held_stop = slot.held_since = None
+            slot.floor_since, slot.floor_released = None, False
+            slot.trailed, slot.last_sale = False, None
 
     def _protect(self, slot: Slot, held: Decimal, now: int) -> None:
+        self._ensure_exit(slot, held)
         order = self._order(slot.protect_id)
-        if slot.exiting and slot.floor is None and order is not None and order.price is not None:
+        if (
+            slot.exiting
+            and slot.floor is None
+            and not slot.floor_released
+            and order is not None
+            and order.price is not None
+        ):
             # the released sale's own price, whether it is open, filled or was refused
             cap = self.settings.chase_cap if slot.trail_plan is None else slot.trail_plan.chase_cap
             slot.floor = chase_floor(order.price.as_decimal(), cap)
@@ -1655,26 +1844,33 @@ class Mover(Strategy):
             self._chase(slot, order, held, now, slot.floor)
 
     def _trail(self, slot: Slot, held: Decimal, now: int) -> None:
-        """Submit the emulated trailing stop-limit for what is held, once the emulator has a price to
-        start from (a quote for `BID_ASK`, a trade for `LAST_PRICE`)."""
+        """Protect what is held, using the cache average or bid when the entry fill is unknown.
+
+        Arm the emulator from its followed quote/trade, or hold a stop at the known anchor
+        while the followed market price is unavailable.
+        """
         trigger = self.settings.trigger
         at = self._followed(slot)
-        entry = self._order(slot.entry_id)
-        if entry is None or entry.avg_px is None:
-            self._note(
-                slot,
-                f"{slot.instrument_id}: {held} held with no filled entry of this strategy to size a "
-                "trailing sell from; not protected, and sold only at the wind-down",
-            )
+        if at is None or at <= 0:
+            # The emulator cannot arm without a market price: hold a stop the strategy checks itself
+            # (the lead's decision (b), 2026-11-12), not a sale at once.
+            self._hold(slot, held, now)
             return
-        if at is None:
-            return  # no quote or trade yet for the trigger to start from: the next step asks again
+        try:
+            bought = slot.protection_anchor = self._trail_anchor(slot)
+        except RuntimeError as error:
+            # Raised from the step timer this would stop every slot; it is named and retried next step.
+            self._note(slot, str(error))
+            return
+        if slot.held_since is not None:
+            self._end_hold(slot, now, "trail")
         # the reached trigger on Alpaca's step, one value for the check below and for the remade sell
         reached = slot.trail_trigger
         kept = None if reached is None else stop_trigger_price(reached)
         if kept is not None and at <= kept:
             # the market is at the trigger the canceled sell had reached: its sale is due now
             slot.exiting, slot.trail_trigger = True, None
+            self._mark_exit(slot, now, at, "retained trigger")
             self._say(
                 f"{slot.instrument_id}: at {at}, the trigger {kept} (reached {reached}) is met; "
                 "selling by limit"
@@ -1682,13 +1878,14 @@ class Mover(Strategy):
             self._limit_sell(slot, held, now, slot.floor)
             return
         instrument = self._instrument(slot.instrument_id)
-        bought = slot.protection_anchor = Decimal(str(entry.avg_px))
         plan = slot.trail_plan
         trailing, limit = offsets(
             bought,
             self.settings.trail if plan is None else plan.trail,
             self.settings.exit_through if plan is None else plan.exit_through,
         )
+        if slot.exit_record is not None:
+            slot.exit_record.trail_distance = trailing
         self._say(
             f"{slot.instrument_id}: trailing SELL {held}, its trigger {trailing} under the highest "
             f"{'bid' if trigger == TriggerType.BID_ASK else 'trade'}, its limit {limit} under it"
@@ -1708,10 +1905,150 @@ class Mover(Strategy):
             emulation_trigger=trigger,
         )
         slot.protect_id = order.client_order_id
+        slot.trailed = True
         slot.priced_ns = (
             now  # the trigger is kept: a remake that is refused starts the next from it
         )
         self.submit_order(order, params=self.submit_params)
+
+    def _hold(self, slot: Slot, held: Decimal, now: int) -> None:
+        """The lead's decision (b), 2026-11-12: with no followed price, hold a stop at the average fill,
+        else the entry's limit, less the trail distance in force. It sells at once only when the last
+        known price (the last trade the cache has, else the latest minute close) is through that level,
+        so it does not depend on the missing side and adds no subscription. With no two-sided quote
+        within `HOLD_MOST_SECS` of the fill it sells by limit as an `unpriced_exit`."""
+        if slot.held_since is None:
+            entry = self._order(slot.entry_id)
+            fills = [
+                at
+                for cid, side, *_, at in self.fills
+                if entry is not None
+                and cid == entry.client_order_id.value
+                and side == OrderSide.BUY.name
+            ]
+            # 60 s from the fill (the lead's bound); a hold after the holding was trailed, from now
+            slot.held_since = now if slot.trailed else min(fills, default=now)
+            anchor = self._held_anchor(slot)
+            if anchor is not None:
+                plan = slot.trail_plan
+                distance = offsets(
+                    anchor,
+                    self.settings.trail if plan is None else plan.trail,
+                    self.settings.exit_through if plan is None else plan.exit_through,
+                )[0]
+                slot.held_stop = anchor - distance
+                slot.protection_anchor = anchor
+            if slot.trail_trigger is not None:
+                # a trailed sale had reached this trigger: the hold keeps it, on Alpaca's step (#312)
+                kept = stop_trigger_price(slot.trail_trigger)
+                slot.held_stop = kept if slot.held_stop is None else max(slot.held_stop, kept)
+            if slot.entry_record is not None:
+                slot.entry_record["protect_path"] = "held_stop"
+                slot.entry_record["held_stop_level"] = (
+                    None if slot.held_stop is None else str(slot.held_stop)
+                )
+            self._note(
+                slot,
+                f"{slot.instrument_id}: no followed price; holding a stop at {slot.held_stop}",
+            )
+        self._ensure_exit(slot, held)
+        last, source = self._last_known(slot)
+        if slot.held_stop is not None and last is not None and last <= slot.held_stop:
+            slot.exiting = True
+            self._mark_exit(slot, now, last, f"held stop ({source})")
+            if slot.entry_record is not None:
+                slot.entry_record["held_stop_trigger"] = source
+            self._end_hold(slot, now, "held_stop")
+            self._limit_sell(slot, held, now, slot.floor, anchor=last)
+            return
+        if now - slot.held_since >= HOLD_MOST_SECS * SECOND_NS:
+            anchor = last if last is not None else slot.protection_anchor
+            slot.exiting = True
+            self._mark_exit(slot, now, last, "unpriced_exit")
+            self._end_hold(slot, now, "unpriced_exit")
+            self._limit_sell(slot, held, now, slot.floor, anchor=anchor)
+
+    def _end_hold(self, slot: Slot, now: int, path: str) -> None:
+        """Record how the held stop ended and for how long it held; clear it."""
+        if slot.held_since is None:
+            return
+        if slot.entry_record is not None:
+            slot.entry_record["protect_path"] = path
+            slot.entry_record["held_stop_secs"] = (now - slot.held_since) / SECOND_NS
+        self.protect_paths[path] += 1
+        slot.held_stop = slot.held_since = None
+
+    def _held_anchor(self, slot: Slot) -> Decimal | None:
+        """The average fill (the entry's, else the cache's position average), else the entry's limit."""
+        entry = self._order(slot.entry_id)
+        if entry is not None and entry.avg_px is not None:
+            filled = Decimal(str(entry.avg_px))
+            if filled.is_finite() and filled > 0:
+                return filled
+        average = self._position_average(slot)
+        if average is not None:
+            return average
+        price = None if entry is None else getattr(entry, "price", None)
+        return None if price is None else price.as_decimal()
+
+    def _last_known(self, slot: Slot) -> tuple[Decimal | None, str]:
+        """The last trade the cache has, else the latest minute close: what the held stop reads."""
+        trade = self.cache.trade(slot.instrument_id)
+        if trade is not None:
+            return trade.price.as_decimal(), "last trade"
+        if slot.closes:
+            return slot.closes[-1], "minute close"
+        return None, "none"
+
+    def _position_average(self, slot: Slot) -> Decimal | None:
+        """The cache's quantity-weighted average of this strategy's open long positions, or None."""
+        positions = self.cache.positions_open(
+            instrument_id=slot.instrument_id, strategy_id=self.strategy_id
+        )
+        quantity, notional = Decimal(0), Decimal(0)
+        for position in positions:
+            average = position.avg_px_open
+            if average is None:
+                return None
+            average = Decimal(str(average))
+            if not average.is_finite() or average <= 0 or position.signed_qty <= 0:
+                return None
+            quantity += position.signed_qty
+            notional += position.signed_qty * average
+        return notional / quantity if quantity else None
+
+    def _trail_anchor(self, slot: Slot) -> Decimal:
+        """Entry fill, else the cache's quantity-weighted position average, else the current bid.
+
+        `Cache.positions_open(instrument_id, strategy_id)` and `Position.avg_px_open/signed_qty`
+        are pinned rc8's contracts. Missing or non-positive/non-finite averages cannot anchor a sale.
+        Each fallback use (including a refused remake) is counted, without changing entry gating.
+        """
+        entry = self._order(slot.entry_id)
+        if entry is not None and entry.avg_px is not None:
+            filled = Decimal(str(entry.avg_px))
+            if filled.is_finite() and filled > 0:
+                return filled
+        average = self._position_average(slot)
+        source = "position average price" if average is not None else "current bid"
+        quote = self.cache.quote(slot.instrument_id)
+        anchor = (
+            average
+            if average is not None
+            else None
+            if quote is None
+            else quote.bid_price.as_decimal()
+        )
+        if anchor is None or not anchor.is_finite() or anchor <= 0:
+            raise RuntimeError(
+                f"{slot.instrument_id}: no entry, position average price or positive current bid to protect held shares"
+            )
+        self.protection_fallbacks[source] += 1
+        self._note(
+            slot,
+            f"{slot.instrument_id}: no filled entry price; trailing sell anchored on {source} {anchor}",
+        )
+        return anchor
 
     def _followed(self, slot: Slot) -> Decimal | None:
         """The price the trailing sell's trigger follows, as the cache has it now: the bid for `BID_ASK`,
@@ -1726,8 +2063,7 @@ class Mover(Strategy):
         self, slot: Slot, order: Any, held: Decimal, now: int, floor: Decimal | None
     ) -> None:
         """Re-price a sell limit that still rests after `chase_secs`: `exit_ticks` through the bid, not
-        below `floor`, and only downwards; not while the last 60 seconds' requests are at `soft_line`,
-        where the sale keeps working at its price until the count falls."""
+        below `floor`, and only downwards. A re-price waits at the entry soft line."""
         if not order.is_open or order.is_pending_update or order.is_pending_cancel:
             return
         if order.leaves_qty.as_decimal() < held:
@@ -1740,7 +2076,23 @@ class Mover(Strategy):
         quote = self.cache.quote(slot.instrument_id)
         if quote is None or order.price is None:
             return
-        price = exit_price(quote.bid_price.as_decimal(), self.settings.exit_ticks, floor)
+        bid = quote.bid_price.as_decimal()
+        if bid <= 0:
+            return  # a one-sided quote is no price to chase to, nor a bid through the floor
+        price = exit_price(bid, self.settings.exit_ticks, floor)
+        through = exit_price(bid, self.settings.exit_ticks, None)
+        if floor is None or price < order.price.as_decimal() or through >= floor:
+            slot.floor_since = None  # not resting at the floor with the bid through it: restart
+        else:
+            # resting at its floor with the bid through it: after FLOOR_WAIT_SECS, the lead's (b)
+            if slot.floor_since is None:
+                slot.floor_since = now
+            if now - slot.floor_since < FLOOR_WAIT_SECS * SECOND_NS:
+                return
+            if slot.exit_record is not None:
+                slot.exit_record.floor_wait_ns = now - slot.floor_since
+            slot.floor, slot.floor_since, slot.floor_released = None, None, True
+            price = through
         if price >= order.price.as_decimal():
             return
         if self.recent >= self.settings.soft_line:
@@ -1756,13 +2108,34 @@ class Mover(Strategy):
             order.client_order_id
         )  # the next step finds it closed and sends the new limit
 
-    def _limit_sell(self, slot: Slot, held: Decimal, now: int, floor: Decimal | None) -> None:
-        """A plain DAY limit for what is held, `exit_ticks` through the bid and not below `floor`."""
+    def _limit_sell(
+        self,
+        slot: Slot,
+        held: Decimal,
+        now: int,
+        floor: Decimal | None,
+        *,
+        anchor: Decimal | None = None,
+    ) -> None:
+        """A plain DAY limit for what is held, `exit_ticks` through the bid, not below `floor`.
+
+        An unarmable trail supplies its known anchor so that no quote still leaves a working sale.
+        """
         quote = self.cache.quote(slot.instrument_id)
-        if quote is None:
+        bid = None if quote is None else quote.bid_price.as_decimal()
+        quoted = bid is not None and bid > 0
+        if not quoted:
+            # no bid: the given anchor, else the last trade or minute close, else the entry's anchor
+            bid = anchor if anchor is not None else self._last_known(slot)[0]
+            if bid is None:
+                bid = slot.protection_anchor
+        if bid is None:
             return
         instrument = self._instrument(slot.instrument_id)
-        price = exit_price(quote.bid_price.as_decimal(), self.settings.exit_ticks, floor)
+        price = exit_price(bid, self.settings.exit_ticks, floor)
+        if not quoted and slot.last_sale is not None:
+            price = min(price, slot.last_sale)  # a remake with no bid never re-prices upwards
+        slot.last_sale = price
         order = self.order_factory.limit(
             slot.instrument_id,
             OrderSide.SELL,
@@ -1780,6 +2153,11 @@ class Mover(Strategy):
         is held with a limit through the bid, re-priced every `chase_secs`, with no floor."""
         # `_time_out` cancels a working entry at once; what it still buys is covered by `_chase`, which
         # re-sends for all that is held
+        self._ensure_exit(slot, held)
+        quote = self.cache.quote(slot.instrument_id)
+        self._mark_exit(
+            slot, now, None if quote is None else quote.bid_price.as_decimal(), "wind-down"
+        )
         begun, slot.exiting = slot.exiting, True
         chase = self.settings.chase_secs * SECOND_NS
         order = self._order(slot.protect_id)
@@ -1807,6 +2185,16 @@ class Mover(Strategy):
         if self.settings.extended_hours or self.is_exiting():
             return
         if any(self._held(slot) or self._working(slot) for slot in self.slots.values()):
+            for slot in self.slots.values():
+                if held := self._held(slot):
+                    self._ensure_exit(slot, held)
+                    quote = self.cache.quote(slot.instrument_id)
+                    self._mark_exit(
+                        slot,
+                        self.clock.timestamp_ns(),
+                        None if quote is None else quote.bid_price.as_decimal(),
+                        "wind-down",
+                    )
             self._say("Winding down: upstream's market exit for what is held and what works")
             self.market_exit()
 
