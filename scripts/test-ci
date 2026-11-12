@@ -170,7 +170,7 @@ check "a new test script runs as its own check"    has '^  FAIL  test-aaa$'
 check "its output is shown"                        line_after '^  FAIL  test-aaa$' '^        boom$'
 check "a test script that is not executable fails" has '^  FAIL  test-bbb \(not executable\)$'
 check "saying so"                                  line_after '^  FAIL  test-bbb' 'mode 100644, not 100755'
-check "test scripts run in name order"             test "$(printf '%s\n' "$OUT" | sed -n 's/^  [a-zA-Z]*  *\(test-[a-z]*\).*/\1/p' | tr '\n' ' ')" = "$(cd "$C" && git ls-files -s 'scripts/test-*' | awk '$4 !~ /^scripts\/.*\// { sub(".*/", "", $4); printf "%s ", $4 }')"
+check "test scripts run in name order"             test "$(printf '%s\n' "$OUT" | sed -n 's/^  [a-zA-Z]*  *\(test-[a-z-]*\).*/\1/p' | tr '\n' ' ')" = "$(cd "$C" && git ls-files -s 'scripts/test-*' | awk '$4 !~ /^scripts\/.*\// { sub(".*/", "", $4); printf "%s ", $4 }')"
 check "a failing test script fails the run"        test "$RC" = 1
 }
 case_testdir() {

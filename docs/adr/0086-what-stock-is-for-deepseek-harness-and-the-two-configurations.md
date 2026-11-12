@@ -112,6 +112,27 @@ Read and run 2026-11-11.
 * The build configuration's two newer versions, from their registry documents:
   https://registry.npmjs.org/dsh-doublecheck/0.9.30 and https://registry.npmjs.org/dsh-memento/0.5.30
   (read). Stock's recorded pins stay 0.9.29 and 0.5.28; the build configuration is what carries these.
+* ACP profile app `@deepseek-ai/dsh-acp-app` 0.2.1-rc.3:
+  https://registry.npmjs.org/@deepseek-ai/dsh-acp-app/0.2.1-rc.3 — registry metadata **UNVERIFIED**:
+  the web tool reported this URL inaccessible on 2026-11-11. Its name and version were read in the
+  pinned source's `packages/bundle/acp-app/package.json`; the app and EOF/shutdown contract were read
+  in [the bundle README at the DSH pin](https://github.com/deepseek-ai/deepseek-harness/blob/1f81c047fc48fa190a683e469daa699857e9afe8/packages/bundle/acp-app/README.md).
+* ACP v1 [initialization](https://agentclientprotocol.com/protocol/v1/initialization),
+  [prompt turns](https://agentclientprotocol.com/protocol/v1/prompt-turn),
+  [tool permissions](https://agentclientprotocol.com/protocol/v1/tool-calls) and
+  [transports](https://agentclientprotocol.com/protocol/v1/transports) (read 2026-11-11), and
+  [profile bundle resolution at the DSH pin](https://github.com/deepseek-ai/deepseek-harness/blob/1f81c047fc48fa190a683e469daa699857e9afe8/packages/boot/app-boot/src/profile.ts)
+  (read: the ordered manifest list and installation-first bundle resolution).
+* ACP probe rules rechecked 2026-11-11: [stdio messages](https://agentclientprotocol.com/protocol/v1/transports)
+  are individual JSON-RPC objects; the [permission schema](https://agentclientprotocol.com/protocol/v1/schema)
+  requires an options array and a string selected `optionId`;
+  [prompt turns](https://agentclientprotocol.com/protocol/v1/prompt-turn) gate notices and compaction
+  updates on client capabilities; [session setup](https://agentclientprotocol.com/protocol/v1/session-setup)
+  gates closing on the agent's `sessionCapabilities.close` and treats `-32002` on close as success (read).
+* The ACP manifests and lockfiles also name `dsh-fail-guard` 0.2.1:
+  https://registry.npmjs.org/dsh-fail-guard/0.2.1 — published metadata and implementation source
+  **UNVERIFIED**: the web tool reported this URL inaccessible on 2026-11-11. Its version below comes
+  only from the two profiles' `package.json` and `pnpm-lock.yaml`, not from registry metadata.
 * `dsh --profile dsh-tui --dump-config` and `dsh --profile headless --dump-config` (run 2026-11-11, both
   exit 0): 125 and 106 rows, no duplicate id, and the second carries both cross-model providers while the
   first carries neither. This is the only support for the review arm being clean.
@@ -133,3 +154,63 @@ Read and run 2026-11-11.
 * Versions from each profile's installed `package.json`; nothing was read beyond them. Licences for the
   four new additions are `UNVERIFIED` — their licence files were not read.
 * The eval verdict for either configuration: **UNVERIFIED — no run exists.**
+
+## Amendment — 2026-11-11: ACP profile composition
+
+The `review-acp` and `build-acp` profiles have the direct package composition below. Checked
+2026-11-11 against only `package.json` and `pnpm-lock.yaml` in each of
+`~/.dsh/profiles/review-acp/` and `~/.dsh/profiles/build-acp/`: each manifest declaration agrees with
+its lockfile's root importer, and the table gives the resolved package versions. An em dash means
+the package is absent from that profile's declared direct dependencies and root importer.
+
+| Package | `review-acp` | `build-acp` |
+|---|---|---|
+| `@deepseek-ai/dsh-acp-app` | 0.2.1-rc.3 | 0.2.1-rc.3 |
+| `@deepseek-ai/dsh-experimental-terminal-bundle` | 0.2.1-rc.3 | 0.2.1-rc.3 |
+| `@deepseek-ai/dsh-hook-protocol` | 0.2.1-rc.3 | 0.2.1-rc.3 |
+| `@deepseek-ai/dsh-hooks-claude-code` | 0.2.1-rc.3 | 0.2.1-rc.3 |
+| `@deepseek-ai/dsh-subagent-claude-code` | — | 0.2.1-rc.3 |
+| `@deepseek-ai/dsh-subagent-codex` | — | 0.2.1-rc.3 |
+| `aegis` | 2.15.0 | 2.15.0 |
+| `dsh-doublecheck` | 0.9.30 | 0.9.30 |
+| `dsh-fail-guard` | 0.2.1 | 0.2.1 |
+| `dsh-memento` | — | 0.5.30 |
+
+For `aegis`, both manifests and both lockfile resolutions select git commit
+`e5f43c548a06c3f302c521a4c23f258296ccc947`; both lockfiles' package entries report version 2.15.0
+for that commit. Peer-dependency suffixes in the root importers are omitted from the package versions
+above.
+
+### Bundle selection checked 2026-11-11
+
+Those same two `package.json` files declare the following `dsh.profile.bundles` order. These are
+manifest selections; the versions of the direct dependencies remain as recorded above.
+
+| Position | `review-acp` bundle | `build-acp` bundle |
+|---|---|---|
+| 1 | `@deepseek-ai/dsh-base` | `@deepseek-ai/dsh-base` |
+| 2 | `@deepseek-ai/dsh-acp-app` | `@deepseek-ai/dsh-acp-app` |
+| 3 | `@deepseek-ai/dsh-experimental-terminal-bundle` | `@deepseek-ai/dsh-experimental-terminal-bundle` |
+| 4 | `dsh-doublecheck` | `@deepseek-ai/dsh-subagent-claude-code` |
+| 5 | `aegis` | `@deepseek-ai/dsh-subagent-codex` |
+| 6 | `dsh-fail-guard` | `aegis` |
+| 7 | — | `dsh-doublecheck` |
+| 8 | — | `dsh-memento` |
+| 9 | — | `dsh-fail-guard` |
+
+The running installation's resolved version of `@deepseek-ai/dsh-base` is **UNVERIFIED** from the
+four permitted profile files. The pinned upstream's `profile.ts`, `resolveBundleDir`, resolves each
+bundle from the running DSH installation first, then the profile directory. The manifests' declared
+order and locked direct dependency versions do not establish which bundle versions a launch loads.
+
+### Adoption gap recorded 2026-11-11
+
+ADR 0095 now registers the ACP v1 standard as `acp-spec` in `canon/upstreams.json` at
+`schema-v1.31.0`. Adoption of `@deepseek-ai/dsh-acp-app` and the remaining unregistered profile
+components stays **deferred**, under Decision Outcome item 6; the manifest inventory and upstream
+contract evidence here do not complete `adopt-upstream`. Registry changes are outside this amendment's
+scope. The app and fail-guard npm evidence URLs are above, with registry confirmation explicitly
+**UNVERIFIED** after the failed fetches.
+
+Enabled plugin composition, effective configuration, installation state and profile execution remain
+**UNVERIFIED**: only the four manifest and lock files were read, and neither profile was executed.
