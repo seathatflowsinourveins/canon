@@ -48,6 +48,11 @@ Chosen: **option 1**. Option 2 hides which piece moved; option 3 pins nothing.
 3. **`dsh-acp-app`** (DeepSeek Harness's `packages/bundle/acp-app`, MIT), `tool`, pinned with the engine
    at `dsh-v0.2.1-rc.3`: the bundle both profiles carry, which starts `dsh-acp` on stdio with a default
    model route. Its own source makes no network, file or subprocess call.
+4. **`dsh-experimental-terminal-bundle`** (`packages/experimental/terminal-bundle`, MIT), `tool`, at
+   `dsh-v0.2.1-rc.3`: persistent shells as six tools, in both profiles, and the one addition of ADR
+   0086's review configuration on the `dsh-tui` profile (`review-acp` is not that configuration). The
+   bundle's own code is empty; its dependency `dsh-terminal-bash` spawns the shells, confined by the
+   host sandbox unless its mode is `danger-full-access`. The profiles' sandbox mode is `UNVERIFIED`.
 
 ### Consequences
 
@@ -100,6 +105,17 @@ Read 2026-11-11.
   https://registry.npmjs.org/@deepseek-ai/dsh-acp-app/0.2.1-rc.3 — MIT, that directory, no `gitHead`
   (fetched); a second reader found its tarball's patch and READMEs byte-identical to the pinned source,
   a match by content, not provenance. Both profiles carry 0.2.1-rc.3 (commit `62ccb4c`, read).
+* `deepseek-harness` at `dsh-v0.2.1-rc.3`, `packages/experimental/terminal-bundle` — `package.json`
+  (MIT; "Keep shell processes alive across tool calls"), README Summary (six tools, isolated registry,
+  off by default in Web and Desktop) and `cordis.patch.yml`; a search of its `src` for network, file and
+  subprocess calls found none (resolved). https://registry.npmjs.org/@deepseek-ai/dsh-experimental-terminal-bundle/0.2.1-rc.3
+  (fetched; no `gitHead`, so its match to
+  the tag is by content only).
+* A second reader of item 4 (2026-11-11) found no model call in the bundle or its three dependencies,
+  terminal sessions process-local and owner-scoped, and the shell spawned in
+  `packages/terminal/terminal-bash/src/index.ts` under `ctx.sandbox.confine` except in
+  `danger-full-access` (resolved): a channel to another model or to earlier sessions exists only
+  through what a shell can reach.
 * A second reader checked this record on 2026-11-11: it settled the SDK's schema minor, corrected how
   the profiles are started and what the `line` holds off, and asked for the scope note; all are in. A
   second reader of item 2 corrected the entry count from 10,584 to 10,581 and asked that the list's

@@ -692,6 +692,20 @@
       "adr": "0095"
     },
     {
+      "id": "dsh-experimental-terminal-bundle",
+      "field": "agent-harness",
+      "repo": "deepseek-ai/deepseek-harness",
+      "track": "tag:dsh-v0.2.1-rc.3",
+      "role": "tool",
+      "license": "MIT",
+      "why": "@deepseek-ai/dsh-experimental-terminal-bundle 0.2.1-rc.3 (packages/experimental/terminal-bundle): six experimental global terminal tools that keep shell processes alive across tool calls, in an isolated terminal registry; shipped switched off in Web and Desktop. Both review-acp and build-acp carry it, and ADR 0086 chose it as the one addition of its review configuration on the dsh-tui profile (review-acp is not that configuration). The bundle's own code is empty; its dependency dsh-terminal-bash spawns the shells, confined by the host sandbox unless its mode is danger-full-access, and the profiles' sandbox mode is UNVERIFIED. No code in it or its dependencies calls a model, and its terminal sessions do not survive a restart; a channel to another model or to earlier sessions exists only through what a shell can reach. Shares the deepseek-harness pin and moves with it.",
+      "evidence": [
+        "https://github.com/deepseek-ai/deepseek-harness/tree/dsh-v0.2.1-rc.3/packages/experimental/terminal-bundle",
+        "https://registry.npmjs.org/@deepseek-ai/dsh-experimental-terminal-bundle/0.2.1-rc.3"
+      ],
+      "adr": "0095"
+    },
+    {
       "id": "pnpm",
       "field": "toolchain",
       "repo": "pnpm/pnpm",
