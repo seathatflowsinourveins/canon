@@ -266,6 +266,7 @@ def run(
     feed: str = "sip",
     max_data_age_secs: float | None = None,
     rank_without_baseline: bool = False,
+    reference_read_bound_secs: float = actor_module.REFERENCE_READ_BOUND_SECS,
 ) -> tuple[MoversRankActor, Reader]:
     engine = BacktestEngine(
         BacktestEngineConfig(logging=LoggerConfig(bypass_logging=True), run_analysis=False)
@@ -304,6 +305,7 @@ def run(
             inline_reads=inline_reads,
             **age_kwargs,
             rank_without_baseline=rank_without_baseline,
+            reference_read_bound_secs=reference_read_bound_secs,
         )
     )
     engine.add_actor(actor)
@@ -1116,15 +1118,6 @@ def test_an_absent_baseline_is_kept_on_the_worker_and_the_night_still_ranks(tmp_
     unusable, so with the reads on the worker (`inline_reads=False`, the live node's path) it was read
     again at every tick and the tick found the new read still pending: overnight never published."""
 
-    class Sleeper(DataActor):
-        """Each bar leaves the worker time to finish a read before the next tick."""
-
-        def on_start(self) -> None:
-            self.subscribe_bars([BarType.from_str(f"{equity('UPA').id}-1-MINUTE-LAST-EXTERNAL")])
-
-        def on_bar(self, bar: Bar) -> None:
-            time.sleep(0.05)
-
     actor, subscriber = run(
         market(5),
         baseline_path=tmp_path / "absent.json",
@@ -1222,3 +1215,210 @@ def test_the_record_measures_timer_lag_and_the_gap_from_a_bars_end_to_its_receip
     assert lags["bar_end_to_receipt_secs"] == {"n": 2, "median": 63.0, "max": 63.0}
     none = actor_module.publication_lags([])
     assert none["timer_lag_secs"] == "unavailable: no published generation carries it"
+
+
+# --- The reference read's stall (the b0bba6e window of 2026-11-12, 15:56Z): its reads thread sat in an SSL
+# read for 12 minutes while every record said only "not read yet", a failed attempt was retried before any
+# record named it, and the pre-read was waited for with no bound. ---
+
+
+class Sleeper(DataActor):
+    """Each bar leaves the actor's worker time to finish what it can before the next tick."""
+
+    def on_start(self) -> None:
+        self.subscribe_bars([BarType.from_str(f"{equity('UPA').id}-1-MINUTE-LAST-EXTERNAL")])
+
+    def on_bar(self, bar: Bar) -> None:
+        time.sleep(0.05)
+
+
+def test_read_references_logs_each_batch_with_its_time_duration_and_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(actor_module, "REF_BATCH", 2)
+    client = StubBars({"UPA": [daily(PREVIOUS, 10.0)], "UPB": [daily(PREVIOUS, 7.0)]})
+    lines: list[str] = []
+    read_references(client, ["UPA", "UPB", "FLAT"], SESSION, log=lines.append)
+    assert len(lines) == 2, lines
+    assert lines[0].startswith("reference batch 1/2 ") and "2 symbols" in lines[0], lines
+    assert "2 with a close" in lines[0] and " s" in lines[0], lines
+    assert lines[1].startswith("reference batch 2/2 ") and "1 symbols" in lines[1], lines
+    assert all("T" in line.split()[3] and line.split()[3].endswith("Z") for line in lines), lines
+
+    class Failing(StubBars):
+        def get_stock_bars(self, request_params: StockBarsRequest) -> BarSet:
+            if self.requests:
+                raise TimeoutError("read timed out")
+            return super().get_stock_bars(request_params)
+
+    lines.clear()
+    with pytest.raises(TimeoutError):
+        read_references(Failing({}), ["UPA", "UPB", "FLAT"], SESSION, log=lines.append)
+    assert "failed after" in lines[-1] and "TimeoutError: read timed out" in lines[-1], lines
+
+
+def test_a_reference_read_past_its_bound_is_named_in_the_record(tmp_path: Path) -> None:
+    release = threading.Event()
+
+    def stuck(symbols: Sequence[str], cutoff: date, session: date) -> ReferenceRead:
+        release.wait(timeout=10)
+        return stub_reader()(symbols, cutoff, session)
+
+    engine_bound = 120.0
+    try:
+        actor, subscriber = run_bounded(
+            market(6), tmp_path, stuck, before=[Sleeper()], bound_secs=engine_bound
+        )
+    finally:
+        release.set()
+    assert subscriber.signals == []
+    assert actor.last_record is not None
+    reasons = actor.last_record["reasons"]
+    assert isinstance(reasons, list)
+    assert any(
+        r.startswith("references and splits could not be read within 120 s") for r in reasons
+    ), reasons
+    assert not any(r == "references and splits not read yet" for r in reasons), reasons
+
+
+def test_a_failed_reference_read_is_named_while_its_retry_runs(tmp_path: Path) -> None:
+    release = threading.Event()
+    calls: list[int] = []
+
+    def fails_then_hangs(symbols: Sequence[str], cutoff: date, session: date) -> ReferenceRead:
+        calls.append(1)
+        if len(calls) == 1:
+            raise ConnectionError("no route")
+        release.wait(timeout=10)
+        return stub_reader()(symbols, cutoff, session)
+
+    try:
+        actor, _ = run_bounded(market(3), tmp_path, fails_then_hangs, before=[Sleeper()])
+    finally:
+        release.set()
+    assert actor.last_record is not None
+    reasons = actor.last_record["reasons"]
+    assert isinstance(reasons, list)
+    assert any(
+        "attempt 2" in r and "attempt 1 failed: ConnectionError: no route" in r for r in reasons
+    ), reasons
+    outcomes = actor.reference_reads
+    assert outcomes and outcomes[0]["attempt"] == 1, outcomes
+    assert outcomes[0]["outcome"] == "failed: ConnectionError: no route", outcomes
+
+
+def test_two_empty_whole_market_reads_in_a_row_are_a_named_refusal(tmp_path: Path) -> None:
+    calls: list[tuple[date, date]] = []
+
+    def empty(symbols: Sequence[str], cutoff: date, session: date) -> ReferenceRead:
+        calls.append((cutoff, session))
+        return ReferenceRead(cutoff=cutoff, references={}, splits=None, read_ns=0)
+
+    actor, subscriber = run(market(6), baseline_path=write_stub_baseline(tmp_path), reader=empty)
+    assert len(calls) == 2, "an empty whole-market read was read again after the second"
+    assert subscriber.signals == []
+    assert actor.last_record is not None
+    reasons = actor.last_record["reasons"]
+    assert isinstance(reasons, list)
+    assert any(
+        "refused: 2 reads in a row came back unusable (no reference close was read)" in r
+        for r in reasons
+    ), reasons
+    assert [o["outcome"] for o in actor.reference_reads] == [
+        "unusable: no reference close was read"
+    ] * 2
+
+
+def test_two_reads_in_a_row_without_the_splits_are_a_named_refusal(tmp_path: Path) -> None:
+    """Review of the stall unit, finding 3: a read whose splits were cut short at `SPLITS_LIMIT` fails
+    the same way each time, so it is refused like an empty one, not read again each minute."""
+    calls: list[int] = []
+
+    def no_splits(symbols: Sequence[str], cutoff: date, session: date) -> ReferenceRead:
+        calls.append(1)
+        return replace(stub_reader()(symbols, cutoff, session), splits=None)
+
+    actor, _ = run(market(6), baseline_path=write_stub_baseline(tmp_path), reader=no_splits)
+    assert len(calls) == 2
+    assert actor.last_record is not None
+    reasons = actor.last_record["reasons"]
+    assert isinstance(reasons, list)
+    assert any("(the splits were not read)" in r for r in reasons), reasons
+
+
+def test_the_first_attempt_in_flight_is_named_with_when_it_was_asked_for(tmp_path: Path) -> None:
+    """Review of the stall unit, finding 1: even the first attempt is never a bare "not read yet"."""
+    release = threading.Event()
+
+    def stuck(symbols: Sequence[str], cutoff: date, session: date) -> ReferenceRead:
+        release.wait(timeout=10)
+        return stub_reader()(symbols, cutoff, session)
+
+    try:
+        actor, _ = run_bounded(market(2), tmp_path, stuck, before=[Sleeper()])
+    finally:
+        release.set()
+    assert actor.last_record is not None
+    reasons = actor.last_record["reasons"]
+    assert isinstance(reasons, list)
+    assert any(
+        r.startswith("references and splits not read yet: attempt 1 asked for at ") for r in reasons
+    ), reasons
+
+
+def test_a_pre_read_that_finishes_after_its_wait_is_used_by_the_next_call() -> None:
+    """Review of the stall unit, finding 4: a slow pre-read is not thrown away once the wait ran out."""
+    late: Future[actor_module.ReferenceRead] = Future()
+    pre = actor_module.ReferenceRead(
+        PRE_READ_KEY[0], {"AAA": movers_rank.Reference(close=1.0, session=PREVIOUS)}, None, 9
+    )
+    notes: list[str] = []
+    reader = actor_module.prefetched_reference_reader(
+        late,
+        ["AAA"],
+        PRE_READ_KEY,
+        notes,
+        lambda symbols, cutoff, session: actor_module.ReferenceRead(cutoff, {}, None, 5),
+        wait_secs=0.01,
+    )
+    assert reader(["AAA"], *PRE_READ_KEY).read_ns == 5
+    late.set_result(pre)
+    assert reader(["AAA"], *PRE_READ_KEY) is pre
+    assert notes[-1] == "read at the actor's call: the pre-read finished after its wait and is used"
+    assert reader(["AAA"], *PRE_READ_KEY).read_ns == 5, "used once, then read afresh"
+
+
+def test_a_pre_read_that_does_not_finish_within_its_wait_is_read_afresh_and_named() -> None:
+    pending: Future[actor_module.ReferenceRead] = Future()
+    notes: list[str] = []
+    reader = actor_module.prefetched_reference_reader(
+        pending,
+        ["AAA"],
+        PRE_READ_KEY,
+        notes,
+        lambda symbols, cutoff, session: actor_module.ReferenceRead(cutoff, {}, None, 5),
+        wait_secs=0.05,
+    )
+    started = time.monotonic()
+    assert reader(["AAA"], *PRE_READ_KEY).read_ns == 5
+    assert time.monotonic() - started < 5
+    assert notes == ["read at the actor's call: the pre-read did not finish within 0.05 s"]
+
+
+def run_bounded(
+    bars: Sequence[object],
+    tmp_path: Path,
+    reader: ReferenceReader,
+    *,
+    before: Sequence[DataActor] = (),
+    bound_secs: float = actor_module.REFERENCE_READ_BOUND_SECS,
+) -> tuple[MoversRankActor, Reader]:
+    """`run` with the reads on the worker, as the live node runs them, and the read bound set."""
+    return run(
+        bars,
+        baseline_path=write_stub_baseline(tmp_path),
+        reader=reader,
+        before=before,
+        inline_reads=False,
+        reference_read_bound_secs=bound_secs,
+    )
