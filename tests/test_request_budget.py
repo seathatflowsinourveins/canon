@@ -89,6 +89,7 @@ def test_request_record_keeps_both_peaks_and_measures_the_average_over_its_obser
             "peak_minute_at": "2026-11-11T00:00:00+00:00",
             "peak_60s": 25,
             "limit_per_minute": 200,
+            "ceiling_60s": None,
             "headroom_60s": 175,
             "rate_limited": 0,
         }
@@ -466,3 +467,15 @@ def test_a_machine_sleep_counts_in_the_observation_interval(monkeypatch) -> None
     monkeypatch.setattr(request_budget, "time", asleep)
     monkeypatch.setattr(request_budget, "_OBSERVATION_STARTED", start)
     assert request_budget.observation_seconds() == 1200.0
+
+
+def test_headroom_is_measured_against_the_ceiling_a_window_fails_at():
+    """Review of 3a8613a (cut list): headroom was measured against Alpaca's 200 while a window fails at
+    the 180 ceiling, so a failed window with a peak of 185 recorded 15 of headroom."""
+    budget = budget_module()
+    record = budget.request_record([count(peak_60s=185)], elapsed_seconds=60, ceiling=180)
+    (trading,) = record["by_api"]
+    assert trading["limit_per_minute"] == 200 and trading["ceiling_60s"] == 180
+    assert trading["headroom_60s"] == -5
+    data = budget.request_record([count(api="data")], elapsed_seconds=60, ceiling=180)["by_api"][0]
+    assert data["ceiling_60s"] is None and data["headroom_60s"] is None

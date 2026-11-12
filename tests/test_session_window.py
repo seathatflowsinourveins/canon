@@ -1806,7 +1806,9 @@ def test_every_window_records_its_request_rate_peaks_and_limit(monkeypatch, tmp_
     counted = budget["by_api"][0]
     assert (counted["total"], counted["peak_minute"], counted["peak_60s"]) == (30, 20, 25)
     assert counted["average_per_minute"] >= 0
-    assert counted["headroom_60s"] == 175
+    assert (
+        counted["ceiling_60s"] == 180 and counted["headroom_60s"] == 155
+    )  # the 180 a window fails at
     assert latest["requests_by_api"] == budget["by_api"]
 
 
@@ -7858,8 +7860,12 @@ def test_an_expensive_roster_name_is_dropped_and_named_while_other_names_run(
     monkeypatch, tmp_path, expensive_first, expensive_ask
 ):
     cheap = mover_pick()
+    cheap = replace(cheap, record={**cheap.record, "last_trade_at": "LLL's last trade"})
     expensive = session_window.MoverPick(
-        "EEE", Decimal(expensive_ask), {"inputs": {}}, Decimal(expensive_ask)
+        "EEE",
+        Decimal(expensive_ask),
+        {"inputs": {}, "last_trade_at": "EEE's last trade"},
+        Decimal(expensive_ask),
     )
     picks = [expensive, cheap] if expensive_first else [cheap, expensive]
     picked = replace(picks[0], others=(picks[1],))
@@ -7887,6 +7893,8 @@ def test_an_expensive_roster_name_is_dropped_and_named_while_other_names_run(
     assert [p.symbol for p in seen["pick"].picks] == ["LLL"]
     assert str(expensive_ask) in report["mover"]["passed_over"]["EEE"]
     assert "4000" in report["mover"]["passed_over"]["EEE"]
+    # the record's last trade is the priced name's, not a dropped first pick's (review of 3a8613a, cut)
+    assert report["mover"]["last_trade_at"] == "LLL's last trade"
 
 
 def test_unsettled_requests_keep_their_names_before_the_cache_is_disposed() -> None:
@@ -9089,3 +9097,15 @@ def test_slots_above_the_seven_the_bounds_count_are_refused_by_name(slots: int) 
     with pytest.raises(ValueError, match="at most 7"):
         part_slots("regular", slots)
     assert part_slots("regular", session_window.PART_SLOTS) == session_window.PART_SLOTS
+
+
+def test_the_extended_slots_flag_is_taken_where_the_window_runs_mover(tmp_path) -> None:
+    """Review of 3a8613a (cut list): `--session extended --mover` runs Mover, yet `--slots` was refused
+    there for want of `--strategy Mover`."""
+    for session in ("extended", "auto"):
+        args = session_window._args(
+            ["--session", session, "--mover", "--slots", "3", "--log-dir", str(tmp_path)]
+        )
+        assert args.slots == 3
+    with pytest.raises(SystemExit):
+        session_window._args(["--session", "regular", "--slots", "3", "--log-dir", str(tmp_path)])

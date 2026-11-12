@@ -186,6 +186,7 @@ CHASES = ("resend",)
 TRIGGERS = (TriggerType.BID_ASK, TriggerType.LAST_PRICE)
 """The triggers the local emulator accepts for an order it holds (concepts/orders/emulated)."""
 REFUSED = (OrderStatus.DENIED, OrderStatus.REJECTED)
+"""An order the risk engine denied or the venue rejected."""
 UNLOCKED = (OrderStatus.INITIALIZED, OrderStatus.SUBMITTED)
 """An order's states before the venue has taken it, so before the account locks its cash."""
 WORKING = (
@@ -196,7 +197,6 @@ WORKING = (
     OrderStatus.TRIGGERED,
 )
 """An order's states after the venue took it and before it is done, in which a buy can still fill."""
-"""An order the risk engine denied or the venue rejected."""
 
 
 def entry_reserve(orders: Iterable[Any], *, reported: bool) -> Decimal:
@@ -588,7 +588,6 @@ class Mover(Strategy):
         self.report_base: int | None = None
         self.fills_to_report: list[tuple[Any, OrderSide, Decimal]] = []
         self.account_queries = 0
-        self.entries_sent: list[dict[str, Any]] = []
         self.refused: list[tuple[str, str]] = []
         self.dropped: list[str] = []
         """Why each candidate entry was not sent, for the run's report."""

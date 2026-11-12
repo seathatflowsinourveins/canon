@@ -1490,6 +1490,7 @@ def _snapshot_requests(report: WindowReport | dict) -> BaseException | None:
             elapsed_seconds=elapsed,
             limit_per_minute=budget.get("limit_per_minute", TRADING_REQUEST_LIMIT_PER_MINUTE),
             measurement_status=_request_measurement_status(fields, budget),
+            ceiling=REQUEST_CEILING,
         )
         if observation_error:
             snapshot["observation_error"] = observation_error
@@ -2565,6 +2566,11 @@ def run_window(
         pick = replace(priced[0], record=mover, others=tuple(priced[1:]))
         config, price = replace(config, symbol=pick.symbol), pick.price
         mover.update(symbol=pick.symbol, inputs=priced[0].record["inputs"], price=str(pick.price))
+        # the priced name's last trade, not a dropped first pick's (review of 3a8613a, cut list)
+        if "last_trade_at" in priced[0].record:
+            mover["last_trade_at"] = priced[0].record["last_trade_at"]
+        else:
+            mover.pop("last_trade_at", None)
         window_symbols = tuple(p.symbol for p in priced)
         mover["entry_limit"] = str(pick.price)
         mover["slots"] = row.slots if config.slots is None else config.slots
@@ -3981,9 +3987,13 @@ def _args(argv: Sequence[str] | None) -> argparse.Namespace:
         parser.error("--regular-strategy names a part's strategy, so it needs --session auto")
     if args.regular_strategy == MOVER and not args.mover:
         parser.error(f"--regular-strategy {MOVER} trades the day's mover, so it needs --mover")
-    if args.slots is not None and MOVER not in (args.strategy, args.regular_strategy):
+    runs_mover = MOVER in (args.strategy, args.regular_strategy) or (
+        args.mover and args.session in ("extended", "auto")  # an extended part runs Mover with it
+    )
+    if args.slots is not None and not runs_mover:
         parser.error(
-            f"--slots are {MOVER}'s, so they need --strategy or --regular-strategy {MOVER}"
+            f"--slots are {MOVER}'s, so they need --strategy or --regular-strategy {MOVER}, or "
+            "--mover outside the regular session"
         )
     if args.log_dir is None:
         args.log_dir = default_log_dir()

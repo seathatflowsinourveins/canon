@@ -55,6 +55,7 @@ def request_record(
     elapsed_seconds: float | None = None,
     limit_per_minute: int = TRADING_REQUEST_LIMIT_PER_MINUTE,
     measurement_status: str = "unfinalized",
+    ceiling: int | None = None,
 ) -> dict[str, Any]:
     """Record the adapter's sanitized snapshots against a setting; never infer missing minute bins.
 
@@ -63,8 +64,13 @@ def request_record(
     API row is retained but is never compared with the Trading API's budget. Only an explicitly
     completed measurement with a known positive observation interval is eligible for request-budget
     calibration; a running or interrupted snapshot still describes traffic, not a completed window.
+    `ceiling`, the count in any 60 seconds at which a window fails (`session_window.REQUEST_CEILING`),
+    is what the Trading API's headroom is measured against when given, else the limit setting (review
+    of 3a8613a, cut list: a failed window's peak of 185 recorded 15 of headroom against 200).
     """
     check_limit(limit_per_minute)
+    if ceiling is not None:
+        check_limit(ceiling)
     if elapsed_seconds is not None and (not math.isfinite(elapsed_seconds) or elapsed_seconds < 0):
         raise ValueError("request observation seconds must be finite and nonnegative")
     rows = []
@@ -82,7 +88,8 @@ def request_record(
                 "peak_minute_at": count.peak_minute.isoformat() if count.peak_minute else None,
                 "peak_60s": count.peak_60s,
                 "limit_per_minute": limit,
-                "headroom_60s": limit - count.peak_60s if limit is not None else None,
+                "ceiling_60s": ceiling if limit is not None else None,
+                "headroom_60s": (ceiling or limit) - count.peak_60s if limit is not None else None,
                 "rate_limited": count.rate_limited_total,
             }
         )
