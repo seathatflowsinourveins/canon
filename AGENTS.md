@@ -61,7 +61,7 @@ dependency, pattern and practice traces to a pinned upstream or a dated source. 
 | `mise run paper:account tests\|windows` | Print one paper account, GET only: equity, cash, buying power, each position, each open order with whether its client order ID is of our nodes' lineage or foreign, and `no_shorting`; no account number or order ID (`src/canon_trading/custody.py`) |
 | `mise run paper:close tests\|windows` | By hand, under the account's lock: cancel each open order of our nodes' lineage and close, one attempt each, the long our orders opened (a DAY market sell in the regular session, else a DAY limit marked extended hours through the latest quote, canceled after 60 s); a symbol with a foreign order, a short or a quantity ours did not open is frozen and named, and nothing in it but our own open orders is touched; exit 0 flat, 1 something of ours left, 2 only frozen symbols (`src/canon_trading/custody.py`) |
 | `mise run paper:data sandbox` | Run the sandbox node (`--minutes`, at most 60): NautilusTrader's sandbox execution client on Alpaca's live data with account A's pair, every request but GET refused and no Alpaca execution client; `quotes` is listed and refused until it is built (ADR 0070) |
-| `mise run paper:history <tests\|windows>` | Load historical `sip` minute and day bars for `--symbols` or `--symbols-file` over a bounded `--start`/`--end` into a catalog root (`--catalog`, default `catalog/`), with one account's pair, GET only, paced by ADR 0093's row, with no account or stream lock but one catalog lock per root; a 429 or a refused feed stops it by name (ADR 0093) |
+| `mise run paper:history <tests\|windows>` | Load historical `sip` minute and day bars, or with `--data trades` `sip` trade prints, for `--symbols` or `--symbols-file` over a bounded `--start`/`--end` into a catalog root (`--catalog`, default `catalog/`), with one account's pair, GET only, paced by ADR 0093's row, with no account or stream lock but one catalog lock per root; a 429 or a refused feed stops it by name (ADR 0093) |
 
 ## Layout
 
@@ -89,7 +89,10 @@ and keeps one locked `canon-drift` issue in step with what has drifted, which th
 A background watchdog raises a macOS notification when a session
 stalls or fails repeatedly. A local OpenTelemetry Collector on 127.0.0.1 keeps the token events `scripts/lanes --rates` reads (ADR 0007). Once the owner installs it, a second agent runs a paper session window every
 35 minutes when Alpaca's clock says a session is open and `canon/paper-schedule` on main says to, and
-`scripts/automation status` shows its last result (ADR 0050). A maintenance agent keeps this machine on main by itself (ADR 0065). Every 30
+`scripts/automation status` shows its last result (ADR 0050). The movers recorder (ADR 0070) runs the
+data-only screener on weekdays 04:00–20:00 New York from its own clone of `main`, in back-to-back batches of
+at most 80 polls; a failed batch ends that firing by name and the next firing starts fresh, and its status row reports the result.
+A maintenance agent keeps this machine on main by itself (ADR 0065). Every 30
 minutes, unless a paper run holds its lock, it fast-forwards the main checkout and runs the installer
 for whatever differs from main: `scripts/automation install` or `scripts/bootstrap --user-config`. Once
 a day it runs `claude update` and `agy update`. The same install keeps the OmniRoute gateway running,

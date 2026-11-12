@@ -1,4 +1,4 @@
-"""Alpaca's historical `sip` bars for many symbols into a `ParquetDataCatalog`, GET only and paced (ADR 0093).
+"""Alpaca's historical `sip` bars or trade prints into a `ParquetDataCatalog`, GET only and paced (ADR 0093).
 
 `mise run paper:history <account>` runs this module with one paper account's pair in data-only mode
 (ADR 0070): it sends market data GETs and nothing else, and takes neither the account's lock nor a
@@ -33,7 +33,7 @@ Contracts:
   exclusive feed-marker creation. The feed is checked again before each write. Legacy writers
   (`load_bars` and quote write-back) do not take this lock: use separate roots or run them separately.
 
-The pace: `PACE`, the row of ADR 0093's table. After each call the adapter's request counter
+The pace: `PACE`, the row of ADR 0093's table. After each bar call the adapter's request counter
 (`canon_alpaca.providers.request_counts`) gives the data and trading GETs the call sent; the next call
 starts no sooner than the data GETs allow at `PACE.data_per_minute`. A call that sent any trading
 request stops the run, since `PACE.trading_per_minute` is 0: this module needs no trading GET, as the
@@ -52,7 +52,41 @@ What stops a run, by name, keeping what was written: a 429 on any API; a request
 on `sip` included; nothing falls back to another feed); a root that holds another feed's data
 (`bars_to_catalog.catalog_feed`); and any other failure. A rerun asks only for what the root lacks.
 
-Trades: `--data trades` is refused until the adapter's `_request_trades` exists (ADR 0093).
+Trades: `--data trades` uses the adapter's `fetch_trades` and `parse_trade`, on Alpaca's documented
+GET /v2/stocks/{symbol}/trades (https://docs.alpaca.markets/us/reference/stocktradesingle-1, read
+2026-11-11), through alpaca-py 0.45.0's public `RESTClient.get`. Each symbol and missing interval is
+fetched in ascending pages, retaining exact raw nanoseconds and excluding canceled/incorrect prints
+as the adapter does. Trades at one timestamp keep their separate IDs; none are aggregated into bars.
+The `TradeTick` representation drops Alpaca's conditions (`c`), exchange (`x`) and tape (`z`), without
+filtering by those condition flags. It sets `aggressor_side` to `NO_AGGRESSOR`; it does not infer a side
+(`parse_trade` and `crates/model/src/data/trade.rs` at d53849b216e2).
+`ts_init` equals `ts_event`, as on the adapter's historical response. An end must be at least
+`PUBLICATION_DELAY` before now, as the bars loader requires for published SIP history.
+Both bounds are inclusive, but this loader requires `start < end` and refuses a start before
+1970-01-01 UTC, the catalog's epoch, before creating a lock or requesting data.
+The CLI validates ISO 8601 and time-zone presence, then uses the pinned core datetime converters
+(`python/nautilus_trader/core/datetime.py`) to retain nanoseconds in the supplied bounds too.
+
+The writer is NautilusTrader v2.0.0rc8 `ParquetDataCatalog.write_trade_ticks(ticks, start, end)`:
+`python/nautilus_trader/persistence/__init__.pyi:168` and `docs/concepts/data/catalog.md`, "Writing data",
+at d53849b216e2. Each write contains one instrument, ordered by `ts_init`, with inclusive nanosecond
+bounds; coverage uses `NautilusDataType.TradeTick` and the instrument ID. The same catalog lock,
+feed marker, 429 hook and ADR 0093 pace apply. For trades a requests transport adapter spaces every
+actual GET start by at least `60 / PACE.data_per_minute` seconds, including pages and SDK 504 retries.
+The schedule starts from each actual send, so slow responses and retry backoffs earn no later burst.
+It delegates to the existing GET-only timeout/counter adapters and restores them after the load
+(requests 2.34.2 `docs/user/advanced.rst`, "Transport Adapters", `BaseAdapter.send` and `Session.mount`
+at 6e83187b8feb). The SDK's retry policy and the first-429 stop remain in force.
+There is no upper bound on prints per time unit. Fetching at most `MAX_ROWS_PER_CALL + 1` valid prints
+detects an overfull answer without treating a truncated result as complete: the interval is loaded in
+parts, each cut before the last timestamp its answer reached, written with coverage ending one
+nanosecond before that timestamp, and the next part starts there, so no timestamp is split across parts.
+More than `MAX_ROWS_PER_CALL` prints at one timestamp stops by name. Prints are written in time order
+(the pinned writer refuses others), the sort stable. The adapter's page cap still applies, including to
+invalid prints; it fails rather than returning incomplete history. Empty or invalid-only history writes
+no coverage. An interval once written is covered for good: a print Alpaca marks canceled or incorrect,
+or reports late, after the load is not picked up by a rerun (how late Alpaca does so is UNVERIFIED), so
+a load waits at least `PUBLICATION_DELAY`, and a root reloaded from empty takes later corrections.
 """
 
 from __future__ import annotations
@@ -80,12 +114,16 @@ from alpaca.data.enums import DataFeed
 from alpaca.data.historical.stock import StockHistoricalDataClient
 from alpaca.data.models import BarSet
 from alpaca.data.requests import StockBarsRequest
+from alpaca.data.requests import StockTradesRequest
 from canon_alpaca.constants import VENUE
 from canon_alpaca.data import alpaca_bars_window
 from canon_alpaca.data import bar_interval_ns
 from canon_alpaca.data import bar_roundings
 from canon_alpaca.data import bar_timeframe
+from canon_alpaca.data import fetch_trades
 from canon_alpaca.data import parse_bar
+from canon_alpaca.data import parse_trade
+from canon_alpaca.data import was_rounded
 from canon_alpaca.providers import DATA_API
 from canon_alpaca.providers import DATA_ONLY_ENV
 from canon_alpaca.providers import TRADING_API
@@ -100,6 +138,7 @@ from nautilus_trader.core.datetime import unix_nanos_to_dt
 from nautilus_trader.model import BarType
 from nautilus_trader.model import NautilusDataType
 from nautilus_trader.persistence import ParquetDataCatalog
+from requests.adapters import BaseAdapter
 
 from canon_trading.bars_to_catalog import DEFAULT_CATALOG
 from canon_trading.bars_to_catalog import FEED_FILE
@@ -276,6 +315,52 @@ def _claim_feed(path: Path) -> bool:
         _check_feed(path)
         return False
     return True
+
+
+@contextmanager
+def _paced_trade_gets(
+    client: Any,
+    pace: Pace,
+    clock: Callable[[], float],
+    sleep: Callable[[float], None],
+) -> Generator[None]:
+    """requests 2.34.2's Transport Adapters contract (`BaseAdapter.send`, `Session.mount`): pace
+    each actual send, including SDK 504 retries. Delegate to the existing GET-only timeout/counter
+    adapters and restore them on exit. All URL prefixes share one schedule; idle time earns no burst.
+    """
+    session = session_of(client)
+    if session is None:
+        raise HistoryStopped(
+            "the trade history client has no requests.Session; cannot pace its GETs"
+        )
+    next_at = clock()
+
+    def wait() -> None:
+        nonlocal next_at
+        delay = next_at - clock()
+        if delay > 0:
+            sleep(delay)
+        next_at = clock() + 60 / pace.data_per_minute
+
+    class PacedAdapter(BaseAdapter):
+        def __init__(self, delegate: BaseAdapter):
+            self.delegate = delegate
+
+        def send(self, request, *args, **kwargs) -> requests.Response:
+            wait()
+            return self.delegate.send(request, *args, **kwargs)
+
+        def close(self) -> None:
+            self.delegate.close()
+
+    mounted = list(session.adapters.items())
+    try:
+        for prefix, adapter in mounted:
+            session.mount(prefix, PacedAdapter(adapter))
+        yield
+    finally:
+        for prefix, adapter in mounted:
+            session.mount(prefix, adapter)
 
 
 def load_history(
@@ -517,9 +602,187 @@ def _load_history(
 
 def _when(text: str) -> datetime:
     try:
-        return datetime.fromisoformat(text)
+        when = datetime.fromisoformat(text)
+        # Keep naive values naive for the CLI's time-zone refusal; aware bounds go through the
+        # pinned core converter from the original string, before Python discards its nanoseconds.
+        return when if when.tzinfo is None else unix_nanos_to_dt(dt_to_unix_nanos(text))
     except ValueError as e:
         raise argparse.ArgumentTypeError(f"{text!r} is not an ISO 8601 time") from e
+
+
+def load_trades(
+    client: Any,
+    symbols: Sequence[str],
+    start: datetime,
+    end: datetime,
+    catalog_path: Path = DEFAULT_CATALOG,
+    *,
+    pace: Pace = PACE,
+    max_rows: int = MAX_ROWS_PER_CALL,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+    now: Callable[[], datetime] = utc_now,
+    out: Callable[[str], None] = print,
+) -> int:
+    """Load complete missing intervals of SIP prints through the adapter and the pinned trade-tick
+    writer (contracts in this module's header), an overfull interval in parts.
+    """
+    try:
+        for name, value in (("start", start), ("end", end)):
+            if value.tzinfo is None:
+                raise HistoryStopped(f"{name} must carry a time zone, got {value}")
+        if start >= end:
+            raise HistoryStopped(f"start {start} is not before end {end}")
+        if not symbols or any(not symbol.strip() for symbol in symbols):
+            raise HistoryStopped("at least one nonempty symbol is required")
+        if end > now() - PUBLICATION_DELAY:
+            raise HistoryStopped(
+                f"end {end} must be at least {PUBLICATION_DELAY} before now for published SIP trades"
+            )
+        if max_rows < 1:
+            raise HistoryStopped(f"the trade row bound must be positive, got {max_rows}")
+        start_ns, end_ns = dt_to_unix_nanos(start), dt_to_unix_nanos(end)
+        if start_ns < 0:
+            raise HistoryStopped(f"start {start} precedes 1970-01-01 UTC, the catalog's epoch")
+        path = Path(catalog_path).resolve()
+        if (
+            path == LEDGER.resolve()
+            or LEDGER.resolve() in path.parents
+            or "ledger" in Path(catalog_path).parts
+        ):
+            raise HistoryStopped(
+                f"the catalog at {catalog_path} is under ledger/, which holds the trial ledger only"
+            )
+        if not path.is_dir():
+            raise HistoryStopped(f"the catalog at {path} must be an existing directory")
+        _check_feed(path)
+        catalog = ParquetDataCatalog(str(path))
+        ids = [f"{s}.{VENUE}" for s in dict.fromkeys(s.strip() for s in symbols)]
+        instruments = {str(i.id): i for i in catalog.instruments(instrument_ids=ids)}
+        if absent := [i for i in ids if i not in instruments]:
+            raise HistoryStopped(
+                f"no instrument definition in {path} for {', '.join(absent[:20])}: "
+                "the asset list load writes them (ADR 0093); nothing was requested"
+            )
+        written = 0
+        with _catalog_lock(path), _paced_trade_gets(client, pace, clock, sleep):
+            _check_feed(path)
+            for identifier in ids:
+                instrument = instruments[identifier]
+                missing = catalog.get_missing_intervals_for_request(
+                    start_ns, end_ns, NautilusDataType.TradeTick, identifier
+                )
+                for lo, hi in missing:
+                    part: int | None = lo
+                    while part is not None:
+                        loaded, part = _load_trade_part(
+                            client, catalog, path, instrument, part, hi, pace, max_rows, out
+                        )
+                        written += loaded
+        return written
+    except HistoryStopped:
+        raise
+    except Exception as e:
+        raise HistoryStopped(
+            f"the trade history load of {', '.join(symbols[:20])} into {catalog_path} "
+            f"failed ({type(e).__name__}): {e}"
+        ) from e
+
+
+def _load_trade_part(
+    client: Any,
+    catalog: ParquetDataCatalog,
+    path: Path,
+    instrument: Any,
+    lo: int,
+    hi: int,
+    pace: Pace,
+    max_rows: int,
+    out: Callable[[str], None],
+) -> tuple[int, int | None]:
+    """Fetch and write one part of a missing interval, from `lo` to `hi`: the trades written, and
+    where the next part starts, or `None` once the interval is done. An answer over `max_rows` valid
+    prints is cut before its last timestamp, so no timestamp is split across parts, the coverage
+    written ends one nanosecond before it, and the next part starts there."""
+    symbol = instrument.id.symbol.value
+    what = f"trades of {symbol}, feed {FEED.value}, interval [{lo}, {hi}]"
+    before = _sent()
+    try:
+        history = fetch_trades(
+            client,
+            StockTradesRequest(symbol_or_symbols=symbol, feed=FEED, limit=max_rows + 1),
+            start_ns=lo,
+            end_ns=hi,
+        )
+    except HistoryStopped:
+        raise
+    except APIError as e:
+        raise HistoryStopped(
+            f"Alpaca refused the {what} request (HTTP {e.status_code}): {e}; "
+            "nothing falls back to another feed"
+        ) from e
+    except Exception as e:
+        raise HistoryStopped(f"the {what} request failed ({type(e).__name__}): {e}") from e
+    after = _sent()
+    if after.limited > before.limited:
+        raise RateLimited(f"Alpaca answered 429 Too Many Requests during the {what} request")
+    trading = after.trading - before.trading
+    if trading and not pace.trading_per_minute:
+        raise HistoryStopped(
+            f"the {what} request sent {trading} trading API request(s); "
+            "this load sends none (ADR 0093)"
+        )
+    gets = after.data - before.data
+    # The pinned writer refuses ticks out of time order; the sort is stable, so prints at one
+    # timestamp keep the answer's order.
+    answered = sorted(history.trades, key=lambda row: row[1])
+    covered_to, following = hi, None
+    if len(answered) > max_rows:
+        last = answered[-1][1]
+        answered = [row for row in answered if row[1] < last]
+        if not answered:
+            raise HistoryStopped(
+                f"the {what} request has more than {max_rows} trades at one timestamp, "
+                f"{last}; none of this interval was written"
+            )
+        covered_to, following = last - 1, last
+    if dropped := history.canceled + history.incorrect:
+        out(
+            f"paper:history: Dropped {dropped} invalid {what}: "
+            f"canceled={history.canceled}, incorrect={history.incorrect} "
+            "(historical u field)"
+        )
+    ticks = []
+    rounded = 0
+    first_rounding = ""
+    try:
+        for trade, ts_event in answered:
+            tick = parse_trade(trade, instrument, ts_event, ts_event=ts_event)
+            ticks.append(tick)
+            if was_rounded(tick.price, trade.price):
+                rounded += 1
+                first_rounding = first_rounding or (f"{trade.timestamp} trade price {trade.price}")
+    except Exception as e:
+        raise HistoryStopped(f"parsing {what} failed ({type(e).__name__}): {e}") from e
+    if not ticks:
+        out(f"paper:history: {what}: 0 trades, {gets} GET(s)")
+        return 0, None
+    if rounded:
+        out(
+            f"paper:history: Rounded {rounded} of {len(ticks)} Alpaca trades "
+            f"for {symbol} on feed {FEED.value} to price precision "
+            f"{instrument.price_precision}, half to even as NautilusTrader's "
+            f"Instrument.make_price rounds; the first: {first_rounding}"
+        )
+    claimed = _claim_feed(path)
+    try:
+        catalog.write_trade_ticks(ticks, start=lo, end=covered_to)
+    except Exception as e:
+        if claimed and not _holds_data(path) and catalog_feed(path) == FEED.value:
+            (path / FEED_FILE).unlink(missing_ok=True)
+        raise HistoryStopped(f"writing {what} into {path} failed ({type(e).__name__}): {e}") from e
+    out(f"paper:history: {what}: {len(ticks)} trades to {covered_to}, {gets} GET(s)")
+    return len(ticks), following
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -537,20 +800,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--catalog", type=Path, default=DEFAULT_CATALOG, help="the catalog root")
     parser.add_argument("--data", choices=("bars", "trades"), default="bars")
     args = parser.parse_args(argv)
-    if args.data == "trades":
-        parser.error(
-            "--data trades waits for the adapter's _request_trades (ADR 0093); nothing was run"
-        )
     for name in ("start", "end"):
         if getattr(args, name).tzinfo is None:
             parser.error(f"--{name} must carry a time zone")
     if args.start >= args.end:
         parser.error(f"--start {args.start} is not before --end {args.end}")
+    if args.data == "trades" and dt_to_unix_nanos(args.start) < 0:
+        parser.error("--start precedes 1970-01-01 UTC, the catalog's epoch")
     specs = [s.strip() for s in args.bars.split(",") if s.strip()]
-    if not specs or any(s not in BAR_SPECS for s in specs):
+    if args.data == "bars" and (not specs or any(s not in BAR_SPECS for s in specs)):
         parser.error(f"--bars takes {', '.join(BAR_SPECS)}, got {args.bars!r}")
     now = utc_now()
-    for spec in specs:
+    if args.data == "trades" and args.end > now - PUBLICATION_DELAY:
+        parser.error(
+            f"--end must be at least {PUBLICATION_DELAY} before now for published SIP trades"
+        )
+    for spec in specs if args.data == "bars" else []:
         if args.end > now - margin(spec):
             parser.error(
                 f"--end must be at least {margin(spec)} before now for {spec} bars (bars_to_catalog's rule); "
@@ -579,16 +844,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     symbols = list(dict.fromkeys(symbols))
     try:
         client = history_client()
-        written = load_history(
-            client, symbols, specs, args.start, args.end, args.catalog, now=utc_now
-        )
+        if args.data == "trades":
+            written = load_trades(client, symbols, args.start, args.end, args.catalog, now=utc_now)
+        else:
+            written = load_history(
+                client, symbols, specs, args.start, args.end, args.catalog, now=utc_now
+            )
     except RateLimited as e:
         print(f"paper:history: {e}", file=sys.stderr, flush=True)
         return 4
     except HistoryStopped as e:
         print(f"paper:history: {e}", file=sys.stderr, flush=True)
         return 1
-    print(f"paper:history: done, {written} bars written to {args.catalog}", flush=True)
+    print(f"paper:history: done, {written} {args.data} written to {args.catalog}", flush=True)
     return 0
 
 

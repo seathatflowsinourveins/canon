@@ -455,6 +455,9 @@ fired() { # fired <age in seconds>: the stamp the runner writes as each schedule
 }
 paper ok 600; heartbeat 60; fired 60
 cp "$R/home/.claude/canon/paper-session.sh" "$AH/canon/paper-session.sh"   # installed as the tree has it
+cp "$R/scripts/automation" "$AH/canon/movers-recorder.sh"
+cp "$R/home/.claude/canon/paper-session.sh" "$AH/canon/movers-checkout.sh"
+jq -n --argjson e "$(date +%s)" '{at_epoch: $e, outcome: "idle", day: "2026-11-11", commit: "none: nothing ran", exit_code: 0, note: "outside its weekday window"}' > "$AH/canon/watch/movers-recorder.json"
 # the maintenance agent installed as the tree has it, its last round fresh and ok (scripts/test-maintenance
 # covers its row)
 cp "$R/home/.claude/canon/maintenance.sh" "$AH/canon/maintenance.sh"
@@ -776,19 +779,19 @@ if command -v plutil >/dev/null 2>&1; then
   linst() { CLAUDE_CONFIG_DIR="$AH" CANON_LAUNCHAGENTS_DIR="$TMP/agents" CANON_UNLOAD_SECS="$1" "$R/scripts/automation" install > "$TMP/install.out" 2>&1; }
   # install keeps a loaded paper or collector agent whose files are unchanged (scripts/test-maintenance);
   # these cases rehearse the reload, so the plists go first
-  unkeep() { rm -f "$TMP/agents/local.canon.paper-session.plist" "$TMP/agents/local.canon.otel-collector.plist"; }
+  unkeep() { rm -f "$TMP/agents/local.canon.paper-session.plist" "$TMP/agents/local.canon.movers-recorder.plist" "$TMP/agents/local.canon.otel-collector.plist"; }
   mv "$STUB/launchctl-print" "$STUB/kept-print"; : > "$STUB/track-bootstrap"; echo 4 > "$STUB/slow-bootout"
-  for l in local.canon.lanes-watch local.canon.paper-session local.canon.otel-collector local.canon.maintenance; do printf '\tstate = running\n' > "$STUB/launchctl-print-$l"; done
+  for l in local.canon.lanes-watch local.canon.paper-session local.canon.movers-recorder local.canon.otel-collector local.canon.maintenance; do printf '\tstate = running\n' > "$STUB/launchctl-print-$l"; done
   : > "$STUB/launchctl.log"; unkeep; linst 5; rc=$?
-  # (the nightly study's agent, ADR 0089, was not loaded, so it is loaded too: four in all)
-  check "an install over running agents waits for each to stop, then loads it: exit 0, three loaded again and the nightly study's for the first time, the maintenance agent's unchanged job kept" \
-        eval '[ "$rc" = 0 ] && [ "$(grep -c "^  loaded     local.canon" "$TMP/install.out")" = 4 ] && grep -q "^  loaded     local.canon.nightly-study" "$TMP/install.out" && grep -q "^  kept       local.canon.maintenance loaded: its plist is unchanged" "$TMP/install.out" && ! grep -q "Bootstrap failed" "$TMP/install.out" && grep -q "state = running" "$STUB/launchctl-print-local.canon.otel-collector"'
+  # (the nightly study's agent, ADR 0089, was not loaded, so it is loaded too: five in all)
+  check "an install over running agents waits for each to stop, then loads it: exit 0, four loaded again and the nightly study's for the first time, the maintenance agent's unchanged job kept" \
+        eval '[ "$rc" = 0 ] && [ "$(grep -c "^  loaded     local.canon" "$TMP/install.out")" = 5 ] && grep -q "^  loaded     local.canon.nightly-study" "$TMP/install.out" && grep -q "^  loaded     local.canon.movers-recorder" "$TMP/install.out" && grep -q "^  kept       local.canon.maintenance loaded: its plist is unchanged" "$TMP/install.out" && ! grep -q "Bootstrap failed" "$TMP/install.out" && grep -q "state = running" "$STUB/launchctl-print-local.canon.otel-collector"'
   # only the collector loaded now, and it does not stop in time
   echo 100 > "$STUB/slow-bootout"; rm -f "$STUB/stopping-"* "$STUB/launchctl-print-local.canon."*; printf '\tstate = running\n' > "$OTL"
   : > "$STUB/launchctl.log"; unkeep; linst 1; rc=$?
   check "... one that does not stop in time: exit 1, nothing new loaded for it, said after the status table" \
         eval '[ "$rc" != 0 ] && grep -q "the earlier local.canon.otel-collector was still stopping after 1 s" "$TMP/install.out" && ! grep -q "bootstrap .*otel-collector.plist" "$STUB/launchctl.log" && grep -q "still stopping" <<<"$(tail -n 3 "$TMP/install.out")" && grep -q "^install: FAILED (exit 1):" "$TMP/install.out"'
-  check "... the other four loaded meanwhile"        test "$(grep -c "^  loaded     local.canon" "$TMP/install.out")" = 4
+  check "... the other five loaded meanwhile"        test "$(grep -c "^  loaded     local.canon" "$TMP/install.out")" = 5
   # the paper agent alone does not stop: said once, nothing booted over it, and (claim of a second reader) its
   # runner, clone and plist not replaced under it, where a firing of the old job would run the new runner
   rm -f "$STUB/stopping-"* "$STUB/launchctl-print-local.canon."*; printf '\tstate = running\n' > "$STUB/launchctl-print-local.canon.paper-session"
@@ -2237,6 +2240,34 @@ EOF
   gw_reset
 fi
 
+# Compile only the production filename function, whose inputs are stdlib types: no SDK, client or
+# credential is built. Two live child processes at the same UTC instant must choose distinct logs.
+"$TOML_PY" -I - "$ROOT/src/canon_trading/movers_screener.py" <<'PY'
+import subprocess
+import sys
+
+child = r'''
+import ast, os, sys
+from datetime import datetime, timezone
+from pathlib import Path
+tree = ast.parse(Path(sys.argv[1]).read_text())
+fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "log_path")
+space = {"Path": Path, "datetime": datetime, "os": os, "LOG_PREFIX": "movers-screener"}
+exec(compile(ast.Module(body=[fn], type_ignores=[]), sys.argv[1], "exec"), space)
+print(space["log_path"](Path("/logs"), datetime(2026, 11, 11, 9, 5, 7, tzinfo=timezone.utc)), flush=True)
+sys.stdin.read()
+'''
+children = [subprocess.Popen([sys.executable, "-I", "-c", child, sys.argv[1]], stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, text=True) for _ in range(2)]
+try:
+    paths = [p.stdout.readline().strip() for p in children]
+    assert all(paths) and paths[0] != paths[1], paths
+finally:
+    for p in children:
+        p.communicate(timeout=10)
+PY
+check "screener simultaneous runs in the same UTC second choose distinct log files" test "$?" = 0
+
 # ---------- paper:store on a terminal, against the real security ----------
 # The stub above cannot see how Apple's security behaves on a terminal (ADR 0033: with -w last it prompts on
 # the terminal and never reads a pipe). So paper:store's own body, taken from mise.toml with only the
@@ -2822,6 +2853,40 @@ check "install that leaves an unreadable version: exit 1, saying so" \
 inst_cli 9999.0.0 0.0.1; rc=$?
 check "install with a CLI above the pin runs no installer" eval '[ "$rc" = 0 ] && [ ! -s "$STUB/installer.log" ]'
 rm -f "$HOME/.local/bin/claude"
+
+# A firing can have successful batches before its final failed batch. Only a successful firing
+# clears the consecutive-firing count (ADR 0070); all commands here use a local origin and stand-ins.
+if [ -x /usr/bin/lockf ] && [ -x /usr/bin/timeout ]; then
+  CR="$TMP/recorder-firing-count"; mkdir -p "$CR/source" "$CR/config/canon"
+  git -C "$CR/source" init -q -b main
+  echo fixture > "$CR/source/tracked"
+  git -C "$CR/source" add tracked
+  git -C "$CR/source" -c core.hooksPath=/dev/null -c user.name=t -c user.email=t@example.com commit -qm fixture
+  cp "$ROOT/home/.claude/canon/paper-session.sh" "$CR/config/canon/movers-checkout.sh"
+  cat > "$CR/date" <<'EOF'
+#!/bin/bash
+if [ "${1:-}" = -j ]; then exec /bin/date "$@"; fi
+exec /bin/date -r "$(cat "$STUB/clock")" "$@"
+EOF
+  cat > "$CR/mise" <<'EOF'
+#!/bin/bash
+echo batch >> "$STUB/calls"
+n=${!#}
+echo "$(( $(cat "$STUB/clock") + n * 60 ))" > "$STUB/clock"
+[ "$n" = 80 ] || exit 7
+EOF
+  chmod +x "$CR/date" "$CR/mise"
+  for attempt in 1 2 3; do
+    TZ=America/New_York /bin/date -j -f '%Y-%m-%d %H:%M:%S' '2026-11-11 17:10:00' +%s > "$CR/clock"
+    env -i HOME="$CR/home" STUB="$CR" CLAUDE_CONFIG_DIR="$CR/config" CANON_RECORDER_DATE="$CR/date" \
+      /bin/bash "$ROOT/scripts/automation" record-movers "$CR/mise" "$CR/checkout" "$CR/source" > "$CR/out" 2>&1; rc=$?
+    check "recorder firing $attempt: an 80-poll success followed by a failed final batch ends with exit 7" test "$rc" = 7
+  done
+  check "recorder consecutive failed firings accumulate despite a successful batch inside each firing" \
+        eval '[ "$(wc -l < "$CR/calls" | tr -d " ")" = 6 ] && jqt "$CR/config/canon/watch/movers-recorder.json" '\''.consecutive_failed_firings == 3 and (.note | contains("consecutive_failed_firings_bound (UNCALIBRATED)"))'\'''
+else
+  skip "recorder consecutive failed firings after successful batches" "no macOS lockf or timeout"
+fi
 
 check "this clone's own git config is as the run found it (core.hooksPath, the github.com credential helper)" \
       eval '[ "$(real_git core.hooksPath)" = "$REAL_HOOKS" ] && [ "$(real_git credential.https://github.com.helper)" = "$REAL_HELPER" ]'
