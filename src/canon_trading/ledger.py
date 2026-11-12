@@ -770,6 +770,8 @@ def _mover_trial_config(
     balances: Sequence[str],
 ) -> dict[str, Any]:
     """Ranking-readable Mover configuration, named costs and execution model, excluding sample data."""
+    from .tuning_contract import BARS_REPLAY_FIXED_ROWS
+    from .tuning_contract import check_bars_replay_modes
     from .tuning_study import ARMS
     from .tuning_study import BAR_SPEC
     from .tuning_study import EXECUTION
@@ -781,6 +783,7 @@ def _mover_trial_config(
     own = {name: getattr(settings, name) for name in MOVER_FIELDS}
     base = {name: getattr(settings, name) for name in BASE_FIELDS}
     MoverConfig(**own, **base)  # validate fields changed after construction, before a trial
+    check_bars_replay_modes(settings)
     if settings.bar_spec != BAR_SPEC:
         raise ValueError("Mover tuning requires 1-MINUTE-LAST-EXTERNAL bars")
     if trial.part not in PARTS or trial.arm not in ARMS:
@@ -804,6 +807,8 @@ def _mover_trial_config(
     # MoverConfig has a suffix, not an instrument. Each stored entry names bar_type as rank requires;
     # the one engine runs ONE BarsReplayMover over this whole universe.
     fields = _strategy_fields(settings)
+    for name in BARS_REPLAY_FIXED_ROWS:
+        fields.pop(name)
     fields["replay"] = {
         "execution": EXECUTION,
         "base_strategy": "canon_trading.mover:Mover",

@@ -21,6 +21,29 @@ from .early_entry_study import Rows
 from .mover import OWN_FIELDS
 from .mover import MoverConfig
 
+BARS_REPLAY_FIXED_ROWS: dict[str, Any] = {
+    "trail_mode": "fixed",
+    "atr_k": Decimal(1),
+    "atr_n": 14,
+    "spread_floor_m": Decimal(2),
+    "liquidity_tier_cut": Decimal(1_000_000),
+    "ratchet_r": Decimal(2),
+    "ratchet_g": Decimal("0.5"),
+    "ratchet_base": "atr",
+}
+"""Window-only settings excluded from bars trial keys; the study does not tune these rows."""
+
+
+def check_bars_replay_modes(settings: MoverConfig) -> None:
+    """The bars contract covers only the pre-port fixed trail and clock re-entry, by name."""
+    for name in ("trail_mode",):
+        value = getattr(settings, name)
+        if value != BARS_REPLAY_FIXED_ROWS[name]:
+            raise ValueError(
+                f"bars replay refuses {name}={value!r}; requires {BARS_REPLAY_FIXED_ROWS[name]!r}"
+            )
+
+
 SCHEMA: Literal["canon.mover-ranked.v1"] = "canon.mover-ranked.v1"
 
 
@@ -62,6 +85,9 @@ class RankedConfiguration:
         and a consumer must name it as a row it cannot apply (N3's window, which is not built yet)."""
         decoded: dict[str, Any] = {}
         for name, kind in OWN_FIELDS.items():
+            if name in BARS_REPLAY_FIXED_ROWS and name not in self.fields:
+                decoded[name] = BARS_REPLAY_FIXED_ROWS[name]
+                continue
             value = self.fields[name]
             if kind is Decimal:
                 if not isinstance(value, str):
@@ -72,7 +98,9 @@ class RankedConfiguration:
             elif name == "wind_down_at" and value is not None:
                 value = datetime.fromisoformat(value)
             decoded[name] = value
-        return MoverConfig(**decoded)
+        settings = MoverConfig(**decoded)
+        check_bars_replay_modes(settings)
+        return settings
 
     @property
     def rows(self) -> Rows:

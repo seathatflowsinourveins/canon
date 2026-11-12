@@ -1479,3 +1479,94 @@ def test_a_trial_frames_only_its_own_sessions_and_hashes_the_history_once(
     once = replace(data, history=history)
     assert once.history_digest == once.history_digest
     assert len(hashed) == 1
+
+
+def p0_trial():
+    from canon_trading.early_entry_study import REGISTERED
+    from canon_trading.ledger import MoverTrialConfig
+    from canon_trading.mover import MoverConfig
+
+    return MoverTrialConfig(
+        settings=MoverConfig(
+            max_notional=Decimal(1000),
+            max_move=Decimal(1000),
+            run_bars=1,
+            protect=False,
+            entry_arm="bridge",
+        ),
+        symbols=("AAPL",),
+        part="regular",
+        sessions=(date(2025, 3, 10),),
+        history_start=date(2025, 2, 8),
+        buying_power=Decimal(1000),
+        arm="bars-registered",
+        rows=REGISTERED,
+    )
+
+
+def test_p0_existing_mover_trial_keeps_its_literal_key() -> None:
+    from canon_trading.ledger import config_key
+    from canon_trading.ledger import trial_config
+
+    cfg = p0_trial()
+    assert config_key(trial_config([cfg], starting_balances=["100000 USD"])) == (
+        "213b37b6d3bba04c68c7c7d5b8bb91b73e74a8476c6f5a46179c18b0eec2cf88"
+    )
+
+
+@pytest.mark.parametrize("mode", ["atr", "tier", "ratchet"])
+def test_p0_bars_replay_refuses_non_fixed_trail_by_name(mode: str) -> None:
+    from canon_trading.mover import MoverConfig
+    from canon_trading.tuning_study import BarsReplayMover
+
+    config = MoverConfig(max_notional=Decimal(1000), max_move=Decimal(1000), trail_mode=mode)
+    with pytest.raises(ValueError, match=f"trail_mode.*{mode}"):
+        BarsReplayMover(config)
+
+
+def test_p0_window_rows_do_not_move_the_trial_key_or_replay_settings() -> None:
+    from canon_trading.ledger import config_key
+    from canon_trading.ledger import trial_config
+    from canon_trading.mover import TRAIL_SETTINGS
+    from canon_trading.tuning_contract import BARS_REPLAY_FIXED_ROWS
+    from canon_trading.tuning_contract import RankedConfiguration
+    from canon_trading.tuning_study import BarsReplayMover
+
+    cfg = p0_trial()
+    original = trial_config([cfg], starting_balances=["100000 USD"])
+    replay = BarsReplayMover(cfg.settings)
+    expected = {name: getattr(replay.settings, name) for name in BARS_REPLAY_FIXED_ROWS}
+    assert expected == BARS_REPLAY_FIXED_ROWS
+    for name, pinned in BARS_REPLAY_FIXED_ROWS.items():
+        rows = TRAIL_SETTINGS[name]
+        values = (pinned, *rows.get("alternates", rows.get("arms", ())))
+        for value in values:
+            from canon_trading.ma_cross import BASE_FIELDS
+            from canon_trading.mover import OWN_FIELDS
+            from canon_trading.mover import MoverConfig
+
+            own = {field: getattr(cfg.settings, field) for field in OWN_FIELDS}
+            base = {field: getattr(cfg.settings, field) for field in BASE_FIELDS}
+            settings = MoverConfig(**(own | {name: value}), **base)
+            if name in ("trail_mode", "reentry_arm") and value != pinned:
+                with pytest.raises(ValueError, match=f"{name}.*{value}"):
+                    BarsReplayMover(settings)
+                with pytest.raises(ValueError, match=f"{name}.*{value}"):
+                    trial_config(
+                        [replace(cfg, settings=settings)], starting_balances=["100000 USD"]
+                    )
+                continue
+            changed = trial_config(
+                [replace(cfg, settings=settings)], starting_balances=["100000 USD"]
+            )
+            assert changed == original and config_key(changed) == config_key(original)
+            replay = BarsReplayMover(settings)
+            assert {
+                field: getattr(replay.settings, field) for field in BARS_REPLAY_FIXED_ROWS
+            } == expected
+            # The caller's own/base configuration was copied, preserving its selected inactive row.
+            assert getattr(settings, name) == value
+    decoded = RankedConfiguration.decode(RankedConfiguration.from_config(original).encode())
+    assert {
+        name: getattr(decoded.mover_config, name) for name in BARS_REPLAY_FIXED_ROWS
+    } == expected

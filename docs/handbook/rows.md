@@ -63,3 +63,19 @@ on `main`, and open until the record is accepted.
 | `MAX_ORDER_MODIFY_RATE` | 25 a minute; 180 a minute on paper nodes | UNCALIBRATED | ADR 0049, an eighth of `ALPACA_CALLS_PER_MINUTE`; ADR 0106 for paper nodes | 2026-11-11 |
 | `MAX_NOTIONAL_PER_ORDER` | $1,000 for the symbol | UNCALIBRATED | ADR 0049; a Mover window bounds each order at its entry figure times 10 instead (`mover_window.OUTER_BOUND_MULTIPLE`; ADR 0091, ADR 0106) | 2026-11-10 |
 | `WINDOW_MAX_MINUTES` | 60, clipped further to the session's end and to the longest window the account allows | UNCALIBRATED | ADR 0044 | 2026-11-10 |
+
+The selectable trail and re-entry rows below are a window's settings, not tuned by the bars study.
+The bars replay accepts only the fixed trail and the existing clock cooldown; another mode is refused
+by its field and value. These window rows are excluded from its trial keys and decode as the fixed
+rows. The defaults remain the fixed trail and the 300-second clock cooldown (the lead, 2026-11-12).
+
+| Row | Value | Status | Source or study | Date |
+|---|---|---|---|---|
+| `TRAIL_MODE` | fixed by default; atr, tier or ratchet by explicit window selection | UNCALIBRATED | Source b01f4c4; lead's ruling, 2026-11-12, preserves main's default | 2026-11-12 |
+| `ATR_K` | 1; alternates 2, 3 | UNCALIBRATED | Source b01f4c4; lead, no primary source | 2026-11-12 |
+| `ATR_N` | 14 complete one-minute bars; alternates 7, 28 | UNCALIBRATED | Source b01f4c4; NautilusTrader AverageTrueRange at d53849b216e2; window selection | 2026-11-12 |
+| `SPREAD_FLOOR_M` | 2 quoted spreads; alternates 1, 3 | UNCALIBRATED | Source b01f4c4; lead, no primary source | 2026-11-12 |
+| `LIQUIDITY_TIER_CUT` | 1,000,000 baseline dollars a minute; alternates 500,000, 2,000,000 | UNCALIBRATED | Source b01f4c4; owner's tier stand-in, not market capitalization | 2026-11-12 |
+| `RATCHET_R` | 2 initial trail distances of gain; alternates 1, 3 | UNCALIBRATED | Source b01f4c4; lead's once-only ratchet | 2026-11-12 |
+| `RATCHET_G` | 0.5 of the initial trail; alternates 0.25, 0.75 | UNCALIBRATED | Source b01f4c4; lead's once-only ratchet, subject to spread floor | 2026-11-12 |
+| `RATCHET_BASE` | atr; alternate tier | UNCALIBRATED | Source b01f4c4; paired window arm | 2026-11-12 |
