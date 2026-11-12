@@ -951,6 +951,41 @@
         "https://github.com/gastownhall/gascity/releases"
       ],
       "adr": "0018"
+    },
+    {
+      "id": "arch",
+      "field": "strategy-evaluation",
+      "repo": "bashtage/arch",
+      "track": "tag:v9.0.0",
+      "role": "tool",
+      "license": "NCSA (the text of LICENSE.md at the pin and PyPI's license_expression; GitHub reports NOASSERTION)",
+      "why": "Ships SPA (White's reality check as refined by Hansen) and StepM (Romano and Wolf) with a stationary bootstrap: tests of each registered arm's mean outcome against a base arm's with the number of arms counted. They compare mean loss differentials, not Sharpe ratios, so the Sharpe-against-Sharpe test ADR 0010 leaves out of scope stays out. Adopted for one consumer, an arm comparison report beside the gate that calls arch.bootstrap.SPA and StepM on one row per session day (ADR 0104); the report is not built yet, and until it lands nothing imports arch. Pinned to 9.0.0 and no earlier: its notes say the default studentize=True had no effect in SPA and StepM before it. MCS, the volatility models and the unit-root tests are not used. The gate is unchanged. A move touches pyproject.toml and uv.lock (uv add arch==<version>) and ADR 0104's version lines.",
+      "evidence": [
+        "https://pypi.org/pypi/arch/json",
+        "https://github.com/bashtage/arch/releases/tag/v9.0.0",
+        "https://bashtage.github.io/arch/changes/9.0.html",
+        "https://bashtage.github.io/arch/multiple-comparison/generated/arch.bootstrap.StepM.html",
+        "https://raw.githubusercontent.com/bashtage/arch/ef63ff467d329320f5e03fcf426df95214648539/LICENSE.md"
+      ],
+      "adr": "0104",
+      "pypi": "arch"
+    },
+    {
+      "id": "plotly",
+      "field": "strategy-evaluation",
+      "repo": "plotly/plotly.py",
+      "track": "tag:v7.1.0",
+      "role": "tool",
+      "license": "MIT",
+      "why": "Draws NautilusTrader's tearsheet: nautilus_trader.analysis.tearsheet imports plotly and raises ImportError without it, and its create_tearsheet writes one self-contained HTML file from a BacktestResult (ADR 0109). Declared directly at 7.1.0, the version uv.lock already held through skfolio and inside the 7.x range of NautilusTrader's visualization extra, so that code here does not rest on another package's dependency. One consumer, the replay tearsheet, one HTML file per symbol replay in a folder git ignores, which is not built yet; this repository draws no figure of its own. Kaleido, which the extra also lists and only a static image needs, is not adopted. A move touches pyproject.toml and uv.lock (uv add plotly==<version>) and must stay inside the range the pinned NautilusTrader and skfolio accept.",
+      "evidence": [
+        "https://pypi.org/pypi/plotly/json",
+        "https://github.com/plotly/plotly.py/releases/tag/v7.1.0",
+        "https://raw.githubusercontent.com/nautechsystems/nautilus_trader/d53849b216e20f2c122ca01b4dd0da377638b186/python/nautilus_trader/analysis/tearsheet.py",
+        "https://raw.githubusercontent.com/nautechsystems/nautilus_trader/d53849b216e20f2c122ca01b4dd0da377638b186/docs/concepts/visualization.md"
+      ],
+      "adr": "0109",
+      "pypi": "plotly"
     }
   ]
 }

@@ -117,6 +117,15 @@
       "sha": "3e9fbcc9773e46659f2d21b7ede1ba5906e71eb8",
       "track": "tag:1.5.5"
     },
+    "arch": {
+      "default_branch": "main",
+      "default_sha": "ef63ff467d329320f5e03fcf426df95214648539",
+      "ref": "refs/tags/v9.0.0",
+      "repo": "bashtage/arch",
+      "resolved_at": "2026-11-12T07:31:07Z",
+      "sha": "ef63ff467d329320f5e03fcf426df95214648539",
+      "track": "tag:v9.0.0"
+    },
     "awesome-dsh-plugin": {
       "default_branch": "main",
       "default_sha": "f613760b0ecc1f1dc61da874d3fd10d3584385f7",
@@ -440,6 +449,15 @@
       "resolved_at": "2026-11-10T18:41:24Z",
       "sha": "3dcc6fbbbebc5e85dd3e83fe49b382ca7735cae1",
       "track": "tag:v3.1.1"
+    },
+    "plotly": {
+      "default_branch": "main",
+      "default_sha": "3c1aeba0a90ef6f7a32fd35a48338ef7ee349d93",
+      "ref": "refs/tags/v7.1.0",
+      "repo": "plotly/plotly.py",
+      "resolved_at": "2026-11-12T07:46:23Z",
+      "sha": "243bfd0fa5c0a5c29a185e4034a1ab5b111695a5",
+      "track": "tag:v7.1.0"
     },
     "pnpm": {
       "default_branch": "main",

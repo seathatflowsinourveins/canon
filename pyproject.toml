@@ -8,10 +8,12 @@ version = "0.1.0"
 description = "Strategies and node configuration for NautilusTrader on Alpaca (paper trading only)"
 requires-python = ">=3.14,<3.15"
 dependencies = [
+    "arch==9.0.0",
     "canon-alpaca",
     "nautilus-trader==2.0.0rc8",
     "optuna==5.0.0",
     "pandas==3.1.1",
+    "plotly==7.1.0",
     "skfolio==1.12.9",
 ]
 
