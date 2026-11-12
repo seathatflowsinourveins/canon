@@ -300,7 +300,7 @@ def test_a_mover_node_without_startup_allocation_refuses_before_builder(monkeypa
 
 @pytest.mark.parametrize(
     ("part", "feed", "slots"),
-    [("after-hours", "sip", 10), ("overnight", "boats", 1), ("pre-market", "sip", 1)],
+    [("after-hours", "sip", 7), ("overnight", "boats", 7), ("pre-market", "sip", 7)],
 )
 def test_each_extended_part_builds_mover_with_the_configured_slots(
     tmp_path, part, feed, slots

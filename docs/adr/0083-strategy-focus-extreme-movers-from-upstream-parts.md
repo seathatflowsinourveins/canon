@@ -141,7 +141,7 @@ the gate counts no round trips, so M3's pre-registration fixes what each term me
   window's SPY-only refusal and $1,000 cap replaced (`session_window.py:531`, `paper_node.py:58`), and
   flat checked across the account.
 * **M2.** A fixed startup roster, re-entry and rotation in one Mover (ADRs 0088/0091). The current
-  paper rows are ten held slots in regular/after-hours and one in pre-market/overnight, configurable by `--slots`,
+  paper rows are seven held slots in every part (ten and one before 2026-11-12), configurable by `--slots`,
   with `--spares` additional names (default 2, UNCALIBRATED). Entries have no count bound; a sale
   frees its slot for a reclaim after the cooldown or another ranked name until wind-down. ADR 0087's
   actor re-ranks the loaded roster; missing/stale/invalid ranking means no entry. A paper run of this

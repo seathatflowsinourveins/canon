@@ -946,20 +946,30 @@ def trade_result(
             )
     by_instrument = {}
     realized_total = Decimal(0)
+    incomplete = []
     for instrument, t in totals.items():
-        average = t["bd"] / t["bq"] if t["bq"] else Decimal(0)
-        realized = (t["sd"] - t["sq"] * average).quantize(CENT)
-        realized_total += realized
-        by_instrument[instrument] = {
+        row = {
             "bought": str(t["bd"].quantize(CENT)),
             "sold": str(t["sd"].quantize(CENT)),
             "open_shares": str(t["bq"] - t["sq"]),
-            "realized": str(realized),
         }
+        if t["sq"] > t["bq"]:
+            # a sale of shares bought by an order whose fill the window never saw: its cost is unknown,
+            # so nothing in the name is booked (review of the slot commit, finding 2)
+            why = f"sold {t['sq'] - t['bq']} shares more than the window's fills bought"
+            incomplete.append(f"{instrument}: {why}")
+            row["realized"] = f"unavailable: {why}"
+        else:
+            average = t["bd"] / t["bq"] if t["bq"] else Decimal(0)
+            realized = (t["sd"] - t["sq"] * average).quantize(CENT)
+            realized_total += realized
+            row["realized"] = str(realized)
+        by_instrument[instrument] = row
     return {
         "entries": entries,
         "by_instrument": by_instrument,
         "realized_usd": str(realized_total),
+        "incomplete": incomplete,
         "flat": all(t["bq"] == t["sq"] for t in totals.values()),
         "basis": "fill prices at average cost; Alpaca charges no commission on these orders, none counted",
     }
@@ -985,11 +995,6 @@ LIVE_OPEN_FINDINGS = (
     (
         "entries and rotation are confined to the startup roster: an instrument and its position cap "
         "exist only for the names loaded at node start; on-demand loading for any ranked name is not built"
-    ),
-    (
-        "the part rows hold 10 slots in regular and after-hours, not the owner's 7, unless a run passes "
-        "--slots; the window's result leaves out the account check's own closes (ADR 0091's review "
-        "of 2026-11-12)"
     ),
     (
         "the sip baseline holds no overnight dollars, so overnight every name is in the zero-baseline "
@@ -1268,6 +1273,10 @@ class WindowReport:
     closes: dict[str, list[str]] = field(default_factory=dict)
     """Each close the account check sent that may have been placed, by its client order ID: what was
     sent, then what came of it (`no answer: ...`, each status Alpaca showed), in order."""
+    check_fills: list[tuple[str, str, str, str, str]] = field(default_factory=list)
+    """Each close of the account check's own that Alpaca showed ended with shares filled, as
+    `strategy_fills` gives the strategy's: (client order ID, instrument, side, quantity, average price);
+    a Mover window's result counts them (`trade_result`)."""
     closes_not_placed: int = 0
     """The closes the account check sent that placed nothing: refused by Alpaca (403, 422), or never sent
     (a connect timeout); `errors` holds what each was answered."""
@@ -1684,9 +1693,9 @@ class MoverPart:
 
 MOVER_PARTS = {
     "regular": MoverPart(DataFeed.SIP.value, slots=part_slots("regular")),
-    "pre-market": MoverPart(DataFeed.SIP.value),
+    "pre-market": MoverPart(DataFeed.SIP.value, slots=part_slots("pre-market")),
     "after-hours": MoverPart(DataFeed.SIP.value, slots=part_slots("after-hours")),
-    "overnight": MoverPart(DataFeed.BOATS.value),
+    "overnight": MoverPart(DataFeed.BOATS.value, slots=part_slots("overnight")),
 }
 """The mover choice and node's feed, and Mover's slot row, for each part. Alpaca's Trading API 24/5
 page puts overnight quotes, trades, snapshots and historical bars on `boats` for the account's plan;
@@ -2566,6 +2575,7 @@ def run_window(
     failure: BaseException | None = None
     ran = False  # whether the node was run: only then is the gap marker written
     cache = None
+    result_inputs: tuple[list, list, Decimal] | None = None  # a Mover's fills, entries and figure
     unsettled: dict[str, tuple[str, str]] = {}
     unsettled_symbols: dict[str, str] = {}
     strategy_id = WINDOW_STRATEGIES[config.strategy].strategy_id
@@ -2616,10 +2626,13 @@ def run_window(
                 if isinstance(strategy, Mover):
                     report.mover["run"] = run = strategy.record()
                     try:  # the lead's order of 2026-11-11; one that cannot be read is named
-                        report.mover["result"] = trade_result(
+                        result_inputs = (
                             strategy_fills(cache, strategy_id),
                             run["entries"],
-                            entry_figure=strategy.settings.max_notional,
+                            strategy.settings.max_notional,
+                        )
+                        report.mover["result"] = trade_result(
+                            result_inputs[0], result_inputs[1], entry_figure=result_inputs[2]
                         )
                     except Exception as e:  # noqa: BLE001
                         report.mover["result"] = f"not read: {type(e).__name__}: {e}"
@@ -2671,6 +2684,18 @@ def run_window(
             _mark_request_interrupted(report, e)
             report.errors.append(f"checking the account after the stop: {type(e).__name__}: {e}")
             raise
+        else:
+            if result_inputs is not None and report.check_fills:
+                # the check's own closes are the window's too (review of fire-m-c, finding 11); a
+                # result that cannot be read is named and fails nothing, as the first reading
+                fills, sent, figure = result_inputs
+                try:
+                    report.mover["result"] = trade_result(
+                        [*fills, *report.check_fills], sent, entry_figure=figure
+                    )
+                    report.mover["result"]["check_closes"] = len(report.check_fills)
+                except Exception as e:  # noqa: BLE001
+                    report.mover["result"] = f"not read: {type(e).__name__}: {e}"
         finally:
             snapshot_taken = False
             if len(_ABANDONED) > abandoned_before:
@@ -3160,6 +3185,20 @@ class _AccountCheck:
         if status in TERMINAL:
             self.ended.add(str(getattr(order, "id", "")))
             self._settle(request)
+            filled, price = (
+                getattr(order, "filled_qty", None),
+                getattr(order, "filled_avg_price", None),
+            )
+            if request.own and filled and price and Decimal(str(filled)) > 0:
+                self.report.check_fills.append(
+                    (
+                        request.client_order_id,
+                        f"{request.symbol}.{VENUE}",
+                        str(_value(getattr(order, "side", None) or request.side)).upper(),
+                        str(filled),
+                        str(price),
+                    )
+                )
         else:
             request.order = order
 
@@ -3816,7 +3855,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--slots",
         type=int,
-        help=f"{MOVER}'s slots; default: ten regular/after-hours, one pre-market/overnight",
+        help=f"{MOVER}'s slots; default: seven in every part",
     )
     parser.add_argument("--spares", type=int, default=MOVER_SPARES, help="extra Mover roster names")
     parser.add_argument(

@@ -82,10 +82,10 @@ ENTRIES: int | None = None
 """Entries a window may fill: no bound. A completed trade does not end the node; it re-enters or
 rotates until the part ends (the lead's decision of 2026-11-11, Task M's gap 6), under `Mover`'s
 cooldown and reclaim rows."""
-REGULAR_SLOTS = 10
-AFTER_HOURS_SLOTS = 10
-OUTSIDE_SLOTS = 1
-"""The lead's per-part settings: ten regular/after-hours, one in the two unmeasured parts."""
+PART_SLOTS = 7
+"""The names a window's node holds at once in every part (the lead's ruling of 2026-11-12): the worst
+measured minute is 175 trading requests against the 180 throttle, and ten slots would pass it (ADR
+0083). A run's `--slots` sets its own."""
 CHASE = "resend"
 """How a window re-prices a resting sale: cancel, see the cancel's terminal state at the next step, then
 send the new limit for what is held. No order of a mover node is modified at the venue (the lead's
@@ -266,9 +266,9 @@ RANK_MAX_AGE_SECS = 90
 
 def part_slots(part: str, slots: int | None = None) -> int:
     """The names a session part's node holds at once: `slots` where the run sets it, else
-    the named regular/after-hours row or `OUTSIDE_SLOTS` in the other parts."""
+    `PART_SLOTS`, the same in every part."""
     if slots is None:
-        return {"regular": REGULAR_SLOTS, "after-hours": AFTER_HOURS_SLOTS}.get(part, OUTSIDE_SLOTS)
+        return PART_SLOTS
     if isinstance(slots, bool) or not isinstance(slots, int) or slots < 1:
         raise ValueError(f"slots must be a positive whole number, got {slots!r}")
     return slots
@@ -381,7 +381,7 @@ def mover_parts(
     wind_down_at: datetime,
     market_exit_interval_ms: int,
     market_exit_max_attempts: int,
-    slots: int = OUTSIDE_SLOTS,
+    slots: int = 1,
     entry_notional: Decimal = ENTRY_NOTIONAL_USD,
 ) -> tuple[Mover, FixedRank, PositionCap]:
     """`Mover` on the one name a window chose, the actor that publishes that choice as the ranking, and

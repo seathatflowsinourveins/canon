@@ -58,11 +58,11 @@ composition instruction of 2026-11-11. Option 2 remains an explicit compatibilit
   quotes/trades arrived; a base-class NotImplementedError also fails it. A current baseline and
   external-bar delivery are prerequisites for publication. Paper delivery,
   including trading statuses, is UNVERIFIED here.
-* **Slots and entries**: ten held names in regular and after-hours, one in pre-market and overnight,
-  from `MOVER_PARTS`; `WindowConfig.slots`/`--slots` overrides the row. Spares add watched names, not
+* **Slots and entries**: seven held names in every part (`PART_SLOTS`, the lead's ruling of 2026-11-12;
+  ten and one before it), from `MOVER_PARTS`; `WindowConfig.slots`/`--slots` overrides the row. Spares add watched names, not
   held slots. The lead's 2026-11-11 setting uses its reported measurement of 15 requests per rolling
-  minute per slot, with 20% reserve under 200; this builder did not measure that order cost. The other
-  parts retain their prior row until measured. `entries=None` imposes no count of completed entries: a sale frees the slot, a reclaim
+  minute per slot, with 20% reserve under 200; this builder did not measure that order cost.
+  Pre-market and overnight are not measured, and hold seven by the same count (ADR 0083). `entries=None` imposes no count of completed entries: a sale frees the slot, a reclaim
   after the cooldown may buy the same name again, or the strategy rotates into another ranked name,
   until wind-down. Completion of one trade does not end the node.
 * **Account-derived size**, superseding the 500/5,000 paper row on the lead's 2026-11-11 instruction:
@@ -90,9 +90,9 @@ composition instruction of 2026-11-11. Option 2 remains an explicit compatibilit
   account-derived size above is that decision, built. Cash keeps a margin account's buying power, up to 2x
   overnight and 4x intraday at Alpaca, from sizing an entry above 1x until the margin-account build lands (a
   Codex build the coordinator started on 2026-11-11). The lead set 7 slots in every part (ADR 0083), raised
-  only after two paper firings show room; going above that count needs two records that agree. The rows in
-  `mover_window` still read ten in the regular session and after hours and one in pre-market and overnight,
-  so a run passes `--slots 7` until they change. One limit: a paper fill takes any size at the quote
+  only after two paper firings show room; going above that count needs two records that agree. Since
+  2026-11-12 `mover_window.PART_SLOTS` holds 7 for every part, so a window that passes no `--slots`, a
+  scheduled one included, holds seven names. One limit: a paper fill takes any size at the quote
   (Alpaca's paper page: "Your order quantity is not checked against the NBBO quantities"), so a size far
   beyond a name's traded volume teaches less than it seems to; the comparison of fills against a replay is
   where that shows, a learning note, not a cap. Alpaca's paper page says eligible orders "receive partial
@@ -179,20 +179,21 @@ fixed, each with a test that failed first: a `--mover` window running `SessionMa
 configured symbol, not the chosen name, after the stop; one name's unfilled extended close or missing
 bid held every other name's close; entries sent in one step were each sized from the same free cash,
 since the account locks an entry's cash only once the venue takes it, so the second was denied; a
-malformed ranking counted as a fresh empty one and unwatched every idle slot. Recorded, not fixed:
+malformed ranking counted as a fresh empty one and unwatched every idle slot. In a following commit, on
+the lead's ruling: the part rows, which read 10/10/1/1 slots, hold 7 in every part, since ten would pass
+the 180 throttle at the measured worst minute (ADR 0083); and the window's `flat` and `realized_usd`
+count the account check's own closes, which they left out. A name whose fills hold more shares sold
+than bought (a close of shares bought by an order whose answer the node never saw) is named
+`incomplete` and books nothing, so a sale is never counted whole as profit. Recorded, not fixed:
 * the actor is not seeded with the part's earlier minutes, so a window started after the part's start
   compares partial dollars with the part's full baseline and can invert the order (ADR 0087; the
   plan's mid-part seeding);
 * `catalog/` is not tracked, so a scheduled clone has no baseline file unless one is written there, and
   a scheduled Mover window is refused for it: UNVERIFIED on a scheduled run;
-* the part rows still read 10/10/1/1 slots while the owner's figure is 7 in every part; a run passes
-  `--slots 7`, and the scheduled agent passes none, so its windows hold 10 names until the dated
-  settings file carries the figure;
 * a late-updated bar on any roster name voids that minute's publish (`updated_bars`), an empty
   reference read is not retried, and the soft line counts neither the startup reads nor the context
   feeds' history requests: rates UNVERIFIED;
-* a released sale may be repriced one second after it starts working (on `main` before this change);
-* the record leaves out the account check's own closes from `flat` and `realized_usd`.
+* a released sale may be repriced one second after it starts working (on `main` before this change).
 
 ### Consequences
 

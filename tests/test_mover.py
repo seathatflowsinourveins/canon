@@ -2402,9 +2402,9 @@ def test_a_name_whose_one_share_is_over_the_largest_entry_is_refused_before_the_
 
 
 def test_a_session_parts_slots_follow_the_named_per_part_settings_unless_overridden() -> None:
-    """The lead's measured regular/after-hours row is ten; the unmeasured parts retain one."""
-    assert part_slots("regular") == 10
-    assert [part_slots(p) for p in ("pre-market", "after-hours", "overnight")] == [1, 10, 1]
+    """Seven in every part (the lead's ruling of 2026-11-12), unless the run sets its own."""
+    assert part_slots("regular") == 7
+    assert [part_slots(p) for p in ("pre-market", "after-hours", "overnight")] == [7, 7, 7]
     assert part_slots("regular", 2) == 2 and part_slots("overnight", 3) == 3
     with pytest.raises(ValueError, match="slots"):
         part_slots("regular", 0)
