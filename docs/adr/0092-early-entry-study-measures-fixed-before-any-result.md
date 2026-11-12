@@ -5,7 +5,7 @@ decision-makers: the owner for the requirement (2026-11-11); master orchestrator
 review-by: 2026-12-11
 ---
 
-# Early-entry study: four measures, fifteen arms and a walk-forward with a holdout opened once, fixed before any result is read; every figure a diagnostic until the ledger takes Mover trials; open until the list of mover days and the gate's cost model arrive
+# Early-entry study: four measures, fifteen arms and a walk-forward with a holdout opened once, fixed before any result is read; population derived from a fixed window; every figure a diagnostic until the ledger takes Mover trials; open until the population is derived and the gate's cost model arrives
 
 ## Context and Problem Statement
 
@@ -34,7 +34,7 @@ without hindsight, and what may a result claim? This record fixes all four befor
 ## Decision Outcome
 
 Chosen: **option 1**. Option 3 is tuning by hindsight and is refused. Option 2 measures nothing until
-the strategy and the ranking are on `main`, and its protection cannot run on the history there is: the
+the ranking is on `main`, and its protection cannot run on the history there is: the
 emulated trailing stop needs a quote or a trade to activate (measured in `mover.py`'s header at
 `660b37e`), and historical quotes through the adapter are IEX only (ADR 0066).
 
@@ -85,9 +85,25 @@ default, so `Mover` never runs without one; no value of it is registered, so it 
 That is a run `Mover` cannot make, and a departure: an arm is replayed again with a cap once a record
 registers its value.
 
-**The method.** The owner supplies a fixed list of mover days, kept outside the repository; this record
-names neither its contents nor its origin, and its SHA-256 is entered under Confirmation when it
-arrives. Its dates are split in order: the earliest 70% are development, the rest a holdout. Skfolio's
+**The method.** On 2026-11-11 the master orchestrator fixes a derived population: every trading day in
+the 60 regular sessions before 2026-11-11, and on each day every symbol that meets the registered
+listing condition, taken from Alpaca's history through `paper:history` (ADR 0093,
+on `main` since #257). 60 is this record's choice, UNCALIBRATED; it changes only by an amendment
+committed before any result is read. The load covers the window and the 20 regular sessions before it,
+for the reference close and the longest baseline; only the window's days enter the population.
+
+`paper:history` loads catalog `sip` bars for a named symbol list; the study derives qualifying
+symbol-days from those bars. A whole-market load first needs the separate asset-list load to write
+catalog `Equity` definitions (ADR 0093, clause 4). That load is not built: no task on `main` sends
+`get_all_assets` and writes the catalog's definitions, so the whole-market population waits for it.
+ADR 0093 specifies no session-count cap: requests hold at most 200 symbols and
+100,000 possible bars (`MAX_ROWS_PER_CALL`); long windows are segmented, and the pace is 150 data GETs
+a minute, UNCALIBRATED. A refused request, a 429 or 403 among them, stops the load.
+
+A list of days later supplied by the owner is an additional labelled set and a lead, never the
+population. It is kept outside the repository; this record names neither its contents nor its origin,
+and its SHA-256 is entered under Confirmation when it arrives. The population's dates are split in
+order: the earliest 70% are development, the rest a holdout. Skfolio's
 `WalkForward` with an expanding training set walks the development dates in blocks of a fifth of them,
 rounded down (four folds where the count divides by five, more where it does not, and dates past the
 last whole block judged by no fold); in each fold the arm with the largest share of names entered not
@@ -96,12 +112,16 @@ then to the arm listed first) is judged on the next block, at every cost. The ar
 all development days is replayed on the holdout once, at every cost; a second opening is refused, and
 a run that fails or finds none of its names leaves it unopened. Nothing is tuned on the holdout. This
 choice is not a ranking under ADR 0010 and adopts nothing: it picks which arm is reported on later
-days. Once the ledger takes Mover trials, arms are ranked only by ADR 0010's protocol. Until the list arrives, the code is built and tested on generated bars and the day's tape.
+days. Once the ledger takes Mover trials, arms are ranked only by ADR 0010's protocol. Until history supplies the derived population, the code is built and tested on generated bars and the day's tape.
 
-**Claims.** A list of known mover days answers "given a mover, was it entered early", not "was it found
-among all names": a name's rank in the whole market is not computed, and "listed" means it met the
-thresholds. The second question waits for whole-market days from the recorder. Outcomes on a list
-chosen for having moved are biased upward and show no edge. Until the ledger takes Mover trials with a
+**Claims.** A selected history of events is not a ranking population. The study's population is derived
+from every day in the fixed window and every symbol meeting the registered listing condition on that
+day, whether or not it later moved. The question of finding a mover among all names waits for the
+whole-market days loaded through `paper:history`; these replace the recorder's days. A name's rank in
+the whole market is not computed, and "listed" means it met the thresholds. A list from the owner is
+reported apart as an additional labelled set and
+a lead; it cannot replace or narrow the population. Outcomes on a list chosen for having moved are
+biased upward and show no edge. Until the ledger takes Mover trials with a
 cost model, every figure is a DIAGNOSTIC: labelled, counted, and it changes no row. After that each arm
 is a trial, and a row changes only through the gate.
 
@@ -112,24 +132,34 @@ before a live window is from minute bars, which count only minutes with a trade 
 bar is dated by the New York day of its open, which rests on Alpaca opening daily bars at midnight New
 York (UNVERIFIED, as the adapter marks it). Prices are raw: a split between the reference close and the
 day is not checked. Pre-market coverage of
-old days is checked for each name, not assumed. A delisted name may have no bars (the provider loads
-active assets, ADR 0083) and is counted missing. Prices are not rounded to Alpaca's tick; the size, the
+old days is checked for each name, not assumed. The asset list holds active assets only
+(`assets_request`, ADR 0083), and `paper:history` refuses a symbol with no definition, so a name
+delisted since the window is absent from the population, not counted missing. The population carries
+survivorship bias, and its counts say so. Prices are not rounded to Alpaca's tick; the size, the
 free slot and the request budget are not modelled; the after-hours session is outside the window.
 
 ### Consequences
 
 * Good: "early" is three numbers and a count, fixed before today's tape or any listed day is read.
-* Bad: the entry rule is mirrored from a commit not on `main`, so it can drift until it is imported.
-* Bad: fifteen arms on a list of movers can pick the loosest listing; only whole-market days can price
-  the entries it would also take on names that did not move.
+* Bad: the entry rule is mirrored from `660b37e`; `Mover` is on `main` since #247 with the same
+  defaults but is not yet imported, so it can drift until it is.
+* Bad: fifteen arms on the derived population can still pick the loosest listing across the fixed
+  window, including entries on qualifying names that did not later move. The population is filtered
+  by the registered listing rows, so it omits symbols that only a looser or longer-baseline arm would
+  list; comparisons of those arms have that limit. An owner list never picks an arm.
 
 ### Confirmation
 
 * `tests/test_early_entry_study.py` holds each measure and the bar model on generated bars.
-* The list's SHA-256, the split's dates as counts, each fold's choice and the one holdout run are added
-  here as they happen, with the command and its exit.
-* This record is `proposed` until the list arrives and the ledger takes Mover trials with a cost model;
-  ADR 0087 (the ranking) and ADR 0088 (the strategy) are numbered and not on `main`, UNVERIFIED here.
+* The fixed window's session count and dates and the derived population's counts of symbols and
+  symbol-days are added here once the catalog bars yield that population, with the command and its exit.
+* The SHA-256 of any list from the owner, the population split's dates as counts, each fold's choice
+  and the one holdout run are added here as they happen, with the command and its exit.
+* This record is `proposed` until the fixed window's population is derived from the catalog `sip`
+  bars loaded through `paper:history` after the asset-list prerequisite is met,
+  and the ledger takes Mover trials with a cost model;
+  ADR 0087 (the ranking) is not on `main` (checked 2026-11-11), and its content is UNVERIFIED here; ADR 0088 (the strategy) and
+  ADR 0093 (the history load) are on `main`.
 
 ## Evidence
 
@@ -141,8 +171,14 @@ Read 2026-11-11. Resolved means read in a local copy at the commit `canon/upstre
 * https://github.com/skfolio/skfolio/blob/7721090537634a549008a546c8968cdec0eaf69a/src/skfolio/model_selection/_walk_forward.py
   — `WalkForward`: "In each split, test indices must be higher than the previous ones"; `test_size`,
   `train_size`, `expand_train`. Resolved, and run here on generated dates (the tests); its split of the
-  owner's list is UNVERIFIED until the list arrives. The registry's entry for skfolio names the gate's
-  three measures only, so this use is added there in the registry's next change.
+  population's dates is UNVERIFIED until the population is derived. The registry's entry for skfolio
+  names the gate's three measures only, so this use is added there in the registry's next change.
+* `docs/adr/0093-paper-history-a-paced-get-only-bars-load.md` and `src/canon_trading/history_load.py`
+  on `main` at `232e5c5` (#257) — the
+  explicit symbol list, the separate asset-list prerequisite (clause 4), the 200-symbol and 100,000-bar
+  request limits and segmentation (clause 1), the 150 data GETs a minute, UNCALIBRATED (clause 5), and
+  the 429 and 403 stops (clauses 6 and 7). Read at that commit on 2026-11-11, where the asset list load is
+  not built; a whole-market load and the population's derivation are UNVERIFIED here.
 * `src/canon_trading/mover.py` at commit `660b37e` (a branch, not `main`) — the rising run
   (`run_bars` 3, closes each above the one before), `trail` 0.02, `exit_through` 0.005, `chase_cap`
   0.02, `max_move` required and without a default; "on bars alone the emulator cannot activate a
@@ -165,3 +201,14 @@ Read 2026-11-11. Resolved means read in a local copy at the commit `canon/upstre
   the costs of the walk-forward, three unmarked facts and the Evidence labels. Applied above.
 * `/code-review`, 2026-11-11, on the study's code: the holdout was marked before it was replayed, and
   reported at one cost; the tie-break left out names not entered. Fixed in the code, and worded here.
+* Second reader (Muse), 2026-11-11, on the population draft: the optional list's non-disclosure, the history
+  replacing the recorder, the derived population in Consequences, Confirmation and the split's
+  Evidence, and the off-`main` status of ADR 0093. Reproduced and corrected above.
+* Second reader (Antigravity), 2026-11-11, on the population draft and its Muse fixes: ADR 0093's
+  Evidence entry, the asset-list prerequisite, the bar loader and derivation as separate steps, its
+  loading limits, the window and population counts, and the registered listing filter's omissions.
+  Reproduced and corrected above; its other findings were covered by the Muse corrections.
+* evidence-verifier, 2026-11-11, on the population edit: every added claim held; it found survivorship
+  in the delisted-name line, no stated load range before the window, a session-count allowance
+  contradicting ADR 0093's lack of a cap, and lines made stale by ADR 0088 and `Mover` reaching `main`.
+  Corrected above.
