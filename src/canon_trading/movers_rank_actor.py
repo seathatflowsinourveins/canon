@@ -455,14 +455,15 @@ class MoversRankActor(DataActor):
             return True
         return reference_problem(future.result()) is not None
 
-    @staticmethod
-    def _baseline_unusable(future: Future[movers_rank.BaselineRead] | None) -> bool:
-        """Whether a finished baseline read failed or read a file it would not use."""
+    def _baseline_unusable(self, future: Future[movers_rank.BaselineRead] | None) -> bool:
+        """Whether a finished baseline read failed or read a file it would not use. A file found absent
+        on a part that ranks without a baseline is kept for the session, not read again each tick."""
         if future is None or not future.done() or future.cancelled():
             return False
         if future.exception() is not None:
             return True
-        return future.result().problem is not None
+        result = future.result()
+        return result.problem is not None and not (result.absent and self._rank_without_baseline)
 
     def _submit[T](self, read: Callable[[], T]) -> Future[T]:
         if self._executor is not None:

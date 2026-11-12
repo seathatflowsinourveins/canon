@@ -9109,3 +9109,65 @@ def test_the_extended_slots_flag_is_taken_where_the_window_runs_mover(tmp_path) 
         assert args.slots == 3
     with pytest.raises(SystemExit):
         session_window._args(["--session", "regular", "--slots", "3", "--log-dir", str(tmp_path)])
+
+
+def test_an_order_that_never_ends_does_not_hold_another_names_close(fake_time, tmp_path) -> None:
+    """Review of the composition's fixes, high round, finding 2: a poll that canceled sent no close, and
+    an order Alpaca keeps showing working (pending cancel) was canceled again every poll, so another
+    name's close was never sent. Cancels and closes now take turns, each poll inside seven requests."""
+
+    class Sticky(CountingAccount):
+        def cancel_order_by_id(self, order_id) -> None:
+            self._request("cancel")  # Alpaca takes the cancel and keeps showing the order
+
+    stuck = SimpleNamespace(
+        id=uuid4(), client_order_id="sell-AAA", symbol="AAA", status="pending_cancel"
+    )
+    account = Sticky(fake_time, {"AAA": 5, "BBB": 2}, orders=[stuck])
+    report = session_window.WindowReport("regular", "AAA", started="t")
+    left = session_window._flatten_after_stop(
+        cast(TradingClient, account),
+        WindowConfig(symbol="AAA", log_dir=tmp_path),
+        report,
+        symbols=("AAA", "BBB"),
+    )
+    assert account.quantities["BBB"] == 0, left
+    assert "position of 5 AAA" in left
+    every = polls(account.requests)
+    assert max(len(poll) for poll in every) <= 7, every
+    assert not any("cancel" in poll and "close" in poll for poll in every), every
+
+
+def test_overnight_a_spare_after_a_chosen_name_passed_over_on_price_is_passed_over_too(
+    monkeypatch, tmp_path
+) -> None:
+    """Review of the composition's fixes, high round, finding 3: with the chosen name passed over on
+    its price, a spare's failed overnight re-check refused the whole window, though the next spare
+    qualified; only the chosen name's failure refuses, as for a quote that cannot be read."""
+    dear = session_window.MoverPick("XXX", Decimal(20000), {"inputs": {}}, Decimal(20000))
+    halted = session_window.MoverPick("EEE", Decimal(2), {"inputs": {}}, Decimal(2))
+    picked = replace(dear, others=(halted, mover_pick()))
+
+    class Quotes(Quoted):
+        def get_stock_latest_quote(self, request_params):
+            symbol = request_params.symbol_or_symbols
+            ask = 20000.0 if symbol == "XXX" else 1.6
+            return {symbol: SimpleNamespace(ask_price=ask)}
+
+    monkeypatch.setattr(session_window, "choose_mover", lambda *a, **k: picked)
+    monkeypatch.setattr(session_window, "window_data", lambda: Quotes())
+    monkeypatch.setattr(session_window, "mover_entry_contexts", lambda *a, **k: {})
+    outcome, latest, seen = quiet_window(
+        monkeypatch,
+        tmp_path,
+        quotes=5,
+        trades=5,
+        account=Night(21, "EEE", "halted"),
+        session="extended",
+        mover=True,
+        strategy="Mover",
+    )
+    assert not isinstance(outcome, Exception), outcome
+    assert [p.symbol for p in seen["pick"].picks] == ["LLL"]
+    assert "overnight" in latest["mover"]["passed_over"]["EEE"]
+    assert "entry figure" in latest["mover"]["passed_over"]["XXX"]

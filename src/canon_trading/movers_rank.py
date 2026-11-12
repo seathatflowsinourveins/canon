@@ -967,7 +967,7 @@ def rank(
     condition. It goes with empty `baselines`; without it a name with no baseline is a hole.
     """
     if no_baseline and baselines:
-        raise ValueError(
+        raise InvalidGeneration(
             "no_baseline ranks a part that has no baseline file, so it takes no baselines"
         )
     if type(computed_ns) is not int or computed_ns < 0:

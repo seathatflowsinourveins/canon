@@ -5,7 +5,7 @@ file: each minute a bar, and a quote a nanosecond before the bar closes, a cent 
 so a decision taken on a bar finds the quote of that close in the cache. The simulated venue fills on
 quotes only (`bar_execution=False`): with bars and quotes together it also fills a resting limit from the
 bar's earlier path (measured at the pin, ADR 0088). The ranking comes from a test component that publishes
-the `movers-rank` signal each minute, as the ranking actor will (ADR 0087): nothing of a vendor's list
+the `movers-rank` signal each minute, as the ranking actor does (ADR 0107): nothing of a vendor's list
 reaches the strategy.
 """
 
@@ -2844,9 +2844,10 @@ def test_a_reported_account_is_queried_on_each_fill_and_buys_since_its_report_ar
     closes = [*RISING[:5], 10.1, 10.0, 9.9, 9.8, *RECLAIM, 10.8]
     orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, closes))
     eng.dispose()
-    assert s.fills and len(s.queries) == len(s.fills), "one account query a fill"
+    assert s.fills and 1 <= len(s.queries) <= len(s.fills), "at most one account query a fill"
     first = s.entries_sent[0]
     assert first["sizing"]["unreported_fills"] == "0"
+    assert first["sizing"]["account_query_wait_secs"] == "0.0"
     bought = [o for o in orders if o.side == OrderSide.BUY and o.filled_qty.is_positive()]
     spent = bought[0].filled_qty.as_decimal() * Decimal(str(bought[0].avg_px))
     assert not any("NOTIONAL_EXCEEDS_FREE_BALANCE" in reason for _, reason in s.refused), s.refused
@@ -2865,6 +2866,11 @@ def test_a_reported_account_is_queried_on_each_fill_and_buys_since_its_report_ar
         # yet, so the cash left cannot fund a second entry
         assert len(bought) == 1
         assert all(e["sizing"]["unreported_fills"] == str(spent) for e in s.entries_sent[1:])
+        # the lead's bound: no sale waits on the query outstanding; the due sale went out and filled
+        sold = [o for o in orders if o.side == OrderSide.SELL and o.filled_qty.is_positive()]
+        assert sold and sold[0].ts_init > bought[0].ts_last, (
+            "the sale went out with the query unanswered"
+        )
 
 
 def test_a_reported_account_counts_an_accepted_unfilled_buy_against_free_cash() -> None:
@@ -2888,3 +2894,71 @@ def test_a_reported_account_counts_an_accepted_unfilled_buy_against_free_cash() 
     ]
     assert mover.entry_reserve(working, reported=False) == Decimal(50)
     assert mover.entry_reserve(working, reported=True) == Decimal(200)
+
+
+class OneAccount(Recording):
+    """`Recording` with a reported account it reads directly, its queries kept and its clock set."""
+
+    def __init__(self, account) -> None:
+        super().__init__(
+            MoverConfig(
+                max_notional=Decimal(1000),
+                max_move=Decimal(5),
+                strategy_id=MOVER_ID,
+                order_id_tag="001",
+            )
+        )
+        self.account, self.queries, self.now_ns = account, [], 0
+
+    def _trading_account(self, venue):
+        return self.account
+
+    def query_account(self, account_id, client_id=None, params=None) -> None:
+        self.queries.append(account_id)
+
+    def _now_ns(self) -> int:
+        return self.now_ns
+
+
+def test_a_reported_account_has_one_query_in_flight_and_a_fill_waits_for_a_query_sent_after_it():
+    """Review of the composition's fixes, high round, findings 4 and 5: every fill sent its own GET
+    /account, partial fills and sales included, against the same request budget the entries are held
+    to; and with several queries in flight, an older reply applied last moved the event count past a
+    buy its balance did not have. One query is in flight at a time, for every fill since the last."""
+    account = SimpleNamespace(calculate_account_state=False, event_count=1, id="A")
+    s = OneAccount(account)
+    buy, sell = OrderSide.BUY, OrderSide.SELL
+    s.fills_to_report = [
+        (VENUE, buy, Decimal(100)),
+        (VENUE, buy, Decimal(50)),
+        (VENUE, sell, Decimal(70)),
+    ]
+    s._ask_for_the_account()
+    assert len(s.queries) == 1, "one query for the step's fills"
+    assert s._unreported_buys(account) == Decimal(150)
+    s.fills_to_report = [(VENUE, buy, Decimal(30))]
+    s._ask_for_the_account()
+    assert len(s.queries) == 1, "none while the first is unanswered"
+    assert s._unreported_buys(account) == Decimal(180)
+    s.now_ns = 2 * mover.SECOND_NS
+    assert s._query_wait_secs(account) == 2.0, "what a buy sized now records it waited"
+    s.now_ns = 0
+    account.event_count = 2  # the first query's report: it was sent before the 30 filled
+    assert s._unreported_buys(account) == Decimal(30)
+    assert s._query_wait_secs(account) == 0.0
+    s._ask_for_the_account()
+    assert len(s.queries) == 2
+    account.event_count = 3
+    assert s._unreported_buys(account) == Decimal(0)
+    # a query never answered is asked again once the adapter's longest call has passed
+    s.fills_to_report = [(VENUE, buy, Decimal(10))]
+    s._ask_for_the_account()
+    assert len(s.queries) == 3
+    s.fills_to_report = [(VENUE, buy, Decimal(5))]
+    s.now_ns = (mover.QUERY_WAIT_SECS - 1) * mover.SECOND_NS
+    s._ask_for_the_account()
+    assert len(s.queries) == 3
+    s.now_ns = mover.QUERY_WAIT_SECS * mover.SECOND_NS
+    s._ask_for_the_account()
+    assert len(s.queries) == 4
+    assert s._unreported_buys(account) == Decimal(15)

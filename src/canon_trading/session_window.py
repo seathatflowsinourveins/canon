@@ -522,11 +522,13 @@ begun before it runs to its end, then a last reading and a cancel of what it sho
 
 
 def after_stop_secs(names: int) -> float:
-    """How long the account check starts polls with `names` held: `AFTER_STOP_SECS`, and two polls more
-    for each name past the first, since the check closes one name a poll and sees it closed in the next
-    (review of 3a8613a, finding 11, the lead's ruling of 2026-11-12). Names past `PART_SLOTS`, the names
-    a window holds at once, add nothing: a run with more `--slots` is refused by name (`part_slots`, the
-    lead's ruling of 2026-11-12), so the bounds below hold for every window."""
+    """How long the account check starts polls with `names` held: `AFTER_STOP_SECS`, and two poll
+    intervals more (2 x `POLL_SECS`, 5 s) for each name past the first, since the check closes one name a
+    poll and sees it closed in the next (review of 3a8613a, finding 11, the lead's ruling of 2026-11-12).
+    It is wall-clock time, not a count of polls: a poll whose requests answer slowly takes longer than
+    `POLL_SECS`, so slower answers fit fewer polls in it, a limit the deadline accepts. Names past
+    `PART_SLOTS`, the names a window holds at once, add nothing: a run with more `--slots` is refused by
+    name (`part_slots`, the lead's ruling of 2026-11-12), so the bounds below hold for every window."""
     return AFTER_STOP_SECS + (min(max(names, 1), PART_SLOTS) - 1) * 2 * POLL_SECS
 
 
@@ -1035,8 +1037,8 @@ LIVE_OPEN_FINDINGS = (
     ),
     (
         "no boats baseline exists until Wave 2's overnight baseline, so overnight every name ranks in the "
-        "zero-baseline dollar tier under the move condition, recorded as each row's basis; regular and "
-        "pre-market still refuse to start with no baseline file"
+        "zero-baseline dollar tier under the move condition, recorded in each tick's record and the "
+        "window's mover record; regular and pre-market still refuse to start with no baseline file"
     ),
     "Antigravity's M-c findings 1 and 8 are deferred to ADR 0087's no-file rule and part-start seeding",
     (
@@ -2567,7 +2569,7 @@ def run_window(
                 try:
                     overnight_said.append(overnight_eligibility(trading, chosen.symbol))
                 except WindowRefused as error:
-                    if not priced:
+                    if chosen is pick.picks[0]:
                         raise
                     mover.setdefault("passed_over", {})[chosen.symbol] = (
                         f"the overnight re-check failed: {error}"
@@ -2580,12 +2582,13 @@ def run_window(
             )
         pick = replace(priced[0], record=mover, others=tuple(priced[1:]))
         config, price = replace(config, symbol=pick.symbol), pick.price
-        mover.update(symbol=pick.symbol, inputs=priced[0].record["inputs"], price=str(pick.price))
         # the priced name's last trade, not a dropped first pick's (review of 3a8613a, cut list)
-        if "last_trade_at" in priced[0].record:
-            mover["last_trade_at"] = priced[0].record["last_trade_at"]
-        else:
-            mover.pop("last_trade_at", None)
+        mover.update(
+            symbol=pick.symbol,
+            inputs=priced[0].record["inputs"],
+            price=str(pick.price),
+            last_trade_at=priced[0].record.get("last_trade_at"),
+        )
         window_symbols = tuple(p.symbol for p in priced)
         mover["entry_limit"] = str(pick.price)
         mover["slots"] = row.slots if config.slots is None else config.slots
@@ -3208,6 +3211,9 @@ class _AccountCheck:
         }
         self.turn = deque(self.requests)  # whose lookup comes next
         self.closes_sent = 0
+        self.close_turn = False
+        """Whether the next poll with an order working closes instead of canceling: polls alternate, so
+        an order that never ends cannot hold another name's close (the lead's ruling of 2026-11-12)."""
         self.ended: set[str] = set()  # Alpaca's IDs of the orders it showed in a terminal status
         self.listed: list = []  # the open orders in the window symbols of the last reading
         self.held = dict.fromkeys(self.symbols, Decimal(0))
@@ -3411,13 +3417,21 @@ class _AccountCheck:
         the name's quote. A name with a working order or no price is passed for this poll, and the names
         tried least come first, so one name that cannot finish never holds the others' closes. A poll
         sends at most seven trading requests (`POLL_SECS`): one that sent a cancel sends no close, one
-        that read the calendar no quote and no close, and a quote that fails ends the poll."""
+        that read the calendar no quote and no close, and a quote that fails ends the poll. With an order
+        working and another name to close, polls alternate between canceling and closing (`close_turn`),
+        so an order whose cancel never takes cannot hold every other name's close."""
         working = self.working()
-        if working and self.cancel():
+        busy = {o.symbol for o in working}
+        closable = any(
+            held and symbol not in busy and symbol not in self.extended_refused
+            for symbol, held in self.held.items()
+        )
+        if working and not (self.close_turn and closable) and self.cancel():
             # no close in a poll that canceled: its clock read and close would pass the seven requests
             # a poll counts (`POLL_SECS`); the close goes out in the next poll
+            self.close_turn = True
             return True
-        busy = {o.symbol for o in working}
+        self.close_turn = False
         pending = bool(working)
         if not any(self.held.values()):
             # requests Alpaca has not shown: look again; else only other symbols' are left, not the

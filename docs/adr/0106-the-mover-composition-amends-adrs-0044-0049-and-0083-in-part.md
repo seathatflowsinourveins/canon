@@ -12,7 +12,8 @@ review-by: 2026-12-12
 The Mover composition (ADRs 0088 and 0091) changes decisions that ADRs 0044, 0049 and 0083 record, and
 those three are `accepted`. An accepted record is not rewritten to change its decision
 (`.claude/rules/adr.md`), so their text stays as it is on `main` (`9a1eef5`) and this record carries the
-changes, moved word for word from the composition branch (`fire-m-c@6e54014`).
+changes, moved word for word from the composition branch (`fire-m-c@6e54014`), plus the 2026-11-12
+review changes (findings 3, 4, 5, 11 and 14), each dated where it stands.
 
 ## Decision Drivers
 
@@ -31,7 +32,8 @@ Chosen: **option 3**. The rule's `superseded by` marks a whole decision replaced
 change and the rest stands, so each record carries a dated pointer instead, as ADR 0083 records doing for
 ADR 0068. ADR 0049's title still names 50 submits a minute; on paper nodes the figure below governs. The
 text below is the composition branch's, unchanged, except that a reference to ADR 0087's actor now reads
-ADR 0107's (ADR 0087's split, 2026-11-12).
+ADR 0107's (ADR 0087's split, 2026-11-12), and the 2026-11-12 review changes (findings 3, 4, 5, 11 and
+14) are new.
 
 ### ADR 0044
 
@@ -86,8 +88,8 @@ The table's size rows replace "Size from risk":
 
 Gaps 1 and 2:
 
-1. **The ranking score.** ADR 0087 records the score, its pure inputs and the actor that publishes
-   `movers-rank`; ADR 0091 composes it with a fixed startup roster. Paper delivery is UNVERIFIED until
+1. **The ranking score.** ADR 0087 records the score and its pure inputs; ADR 0107 the actor that
+   publishes `movers-rank`; ADR 0091 composes it with a fixed startup roster. Paper delivery is UNVERIFIED until
    the baseline artifact and adapter's external data are present.
    **Composition update, 2026-11-11 (ADR 0091):** the startup sample supplies several qualified names,
    loaded into both providers and the reconciliation/risk maps before the node starts. One Mover
@@ -100,7 +102,7 @@ The lead's later 2026-11-11 paper instruction supersedes that size row: read rep
 each startup and divide by actual configured slots. The adapter models CASH, so after reproducing its
 free-balance denial the instructed conditional engine limit makes the figure min(buying_power, cash)/slots,
 named in the record. This uses no numeric monetary policy constant, extra multiplier, DTBP or PDT field.
-Paper Mover does not use FixedRiskSizer, risk or volume clamps to size; the older rule remains explicit
+Paper Mover does not use FixedRiskSizer or risk to size, and the `flow_share` clamp still applies; the older rule remains explicit
 in simulations. ADR 0091 carries the shared figure through selection, entries, caps and the rank actor.
 
 Step M2:
@@ -120,9 +122,10 @@ This replaces the window's former sizing
 (`session_window`), taken in whole shares by `Mover` with `size_from_budget=True`, and the engine's per-order
 cap is that entry times `OUTER_BOUND_MULTIPLE`. `FixedRiskSizer` at `risk` 0.01 remains only for explicit
 simulations.
-A budget-sized entry is min(budget / price, the name's start-time share cap), recorded as `cap_bound` when the
+A budget-sized entry is min(budget / price, `flow_share` of the last `flow_bars` bars' dollars / price,
+the name's start-time share cap) (`mover.py`; `flow_share` 0.05 by default, kept on paper), recorded as `cap_bound` when the
 cap binds; neither the share cap nor the name's position monitor is rewritten after the start, so a price
-that drifted since the start sizes at the cap and does not trip the monitor, and a trip means a real fault
+that fell since the start sizes at the cap and does not trip the monitor, and a trip means a real fault
 (the lead's change; ultra review of the composition, finding 14, 2026-11-12).
 On a reported account each fill asks for the account (`Strategy.query_account`, the adapter's
 `_query_account`, one `GET /account`) before the next buy is sized; a buy filled since the last report is
@@ -237,6 +240,9 @@ The sub-penny case: Answered later on 2026-11-11: the adapter now sends such a l
   catch-up, startup, shutdown or all traffic on the account; admission with reserved exit headroom is
   still unbuilt.
 * Bad: a reader of ADRs 0044, 0049 or 0083 must follow the pointer here for the paper values.
+* Bad: this record runs past the ~130 lines after which `.claude/rules/adr.md` splits one. It is kept whole
+  because it moves one branch's changes to three records together; a split into one record per amended
+  ADR is the remedy if it grows.
 
 ### Confirmation
 
@@ -251,11 +257,14 @@ The sub-penny case: Answered later on 2026-11-11: the adapter now sends such a l
 
 ## Evidence
 
-Read 2026-11-12, except where a line says otherwise. Resolved means read in a local copy at the commit
+Read 2026-11-12, except where a line says otherwise; the three lines carried from ADR 0083 (Alpaca's
+archived documentation, `nautilus-trader` and `alpaca-py`) were read 2026-11-11. Resolved means read in a local copy at the commit
 `canon/upstreams.lock.json` records.
 
 * ADRs 0044, 0049 and 0083 at `main` `9a1eef5`, and the composition's edits to them at `fire-m-c@6e54014` —
-  the text moved here. Read with `git diff`; an evidence-verifier pass compared the two, 2026-11-12.
+  the text moved here. Read with `git diff`.
+* The 2026-11-12 statements (findings 3, 4, 5, 11 and 14) — `fire-m-c` commits `6e54014..60d4ad2` and
+  `bdd0e95`; their shas on `main` follow the landing. Read.
 * https://raw.githubusercontent.com/alpacahq/alpaca-docs/master/content/api-references/trading-api/_index.md
   — Alpaca's archived documentation, "Paper Trading" and "Rate Limit": 200 requests every minute per
   API key, 429 on excess. Fetched for Task M gap 7; current paper/live enforcement and per-account

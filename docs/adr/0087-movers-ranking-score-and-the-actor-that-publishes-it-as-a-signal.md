@@ -144,8 +144,9 @@ catalog computes what paper did. The reads are ADR 0107's actor's.
   entry" now means only a hole: a name or segment absent from a file that exists and should cover it.
   **Built overnight only** (the lead's decision (A) of 2026-11-12, on the owner's review of the
   composition, finding 2): with no `boats` file, an overnight window starts and its actor ranks every
-  name in the dollar tier under the move condition, and the window's record states "no baseline:
-  dollar tier under the move condition" as each row's basis until Wave 2's overnight baseline exists.
+  name in the dollar tier under the move condition, and the basis "no baseline: dollar tier under the
+  move condition" is recorded in each tick's record (`baseline`) and the window's mover record until
+  Wave 2's overnight baseline exists.
   Regular and pre-market still refuse to start with no file; a file that exists and cannot be used
   still refuses in every part, and in a file that exists a name absent from it is a hole.
 * The score is `move × ratio`; the tie-break, trade acceleration, is unknown for now and breaks no tie.

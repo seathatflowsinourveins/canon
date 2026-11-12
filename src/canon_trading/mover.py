@@ -182,6 +182,11 @@ CENT = Decimal("0.01")
 SUB_DOLLAR = Decimal("0.0001")
 SECOND_NS = 1_000_000_000
 BUDGET_SPAN_NS = 60 * SECOND_NS
+QUERY_WAIT_SECS = 130
+"""How long an account query may go unanswered before another is sent: one adapter REST call at its
+longest, alpaca-py's first request and three retries at the adapter's timeouts and the waits between
+them (`session_window.ADAPTER_CALL_SECS`, about 129 s). A reply later than this can arrive after the
+next query's, the one case in which a report could count a buy its balance does not have."""
 CHASES = ("resend",)
 TRIGGERS = (TriggerType.BID_ASK, TriggerType.LAST_PRICE)
 """The triggers the local emulator accepts for an order it holds (concepts/orders/emulated)."""
@@ -583,11 +588,19 @@ class Mover(Strategy):
         """Each fill as its event gave it: client order ID, side, quantity, price, time. The session's
         reflection reads a sale's counterfactuals (held on, flat, managed) from these and the tape."""
         self.unreported: list[tuple[int, Decimal]] = []
-        """Each buy filled on a reported account and not yet in a report: the account's event count
-        that has it, and its notional (ultra review of the composition, finding 3)."""
-        self.report_base: int | None = None
+        """Each buy filled on a reported account, asked for and not yet in a report: the account's
+        event count that has it, and its notional (ultra review of the composition, finding 3)."""
+        self.unasked: list[Decimal] = []
+        """Each buy filled on a reported account while a query was in flight: its notional, until a
+        query sent after it."""
+        self.unasked_venue: Any = None
+        """The venue of a reported account with a fill no query has been sent for yet, or None."""
         self.fills_to_report: list[tuple[Any, OrderSide, Decimal]] = []
-        self.account_queries = 0
+        """Each fill since the last step: its venue, side and notional (`on_order_filled`)."""
+        self.query_awaits: int | None = None
+        """The event count the account query in flight brings the account to, or None."""
+        self.query_sent_ns = 0
+        """When the account query in flight was sent, on the node's clock."""
         self.refused: list[tuple[str, str]] = []
         self.dropped: list[str] = []
         """Why each candidate entry was not sent, for the run's report."""
@@ -683,33 +696,57 @@ class Mover(Strategy):
         """The venue's account as the portfolio holds it."""
         return self.portfolio.account(venue)
 
-    def _ask_for_the_account(self) -> None:
-        """Ask for a reported account once for each fill since the last step, before any later buy is
-        sized: the adapter's `_query_account`, one GET /account, through upstream's
-        `Strategy.query_account` (the lead's ruling of 2026-11-12, ultra review of the composition,
-        finding 3). A calculated account has every fill already and is not asked.
+    def _now_ns(self) -> int:
+        return self.clock.timestamp_ns()
 
-        Each query brings at most one report, in the order asked, and each is read after the fill
-        that asked for it, so the n-th query's fill is in the account once the account has had n
-        reports since the first query; a failed query brings none, which only holds a buy back
-        longer. A buy's notional is subtracted from the free cash until then.
+    def _ask_for_the_account(self) -> None:
+        """Ask for a reported account after fills, one query in flight at a time, before any later buy
+        is sized: the adapter's `_query_account`, one GET /account, through upstream's
+        `Strategy.query_account` (the lead's rulings of 2026-11-12 on the ultra review of the
+        composition, finding 3, and on the high round's findings 4 and 5). A calculated account has
+        every fill already and is not asked.
+
+        A query is sent for every fill since the last one, so a step's partial fills cost one request,
+        not one each; while it is unanswered no other is sent, so its report, the account's next
+        event, is taken after every buy it was sent for. A buy filled while it is in flight waits for
+        the next query. One unanswered for `QUERY_WAIT_SECS` is taken as lost and another sent. A buy's
+        notional is subtracted from the free cash until a report has it; sales never wait on a query.
         """
         taken, self.fills_to_report = self.fills_to_report, []
         for venue, side, notional in taken:
             account = self._trading_account(venue)
             if account is None or account.calculate_account_state:
                 continue
-            if self.report_base is None:
-                self.report_base = account.event_count
-            self.account_queries += 1
             if side == OrderSide.BUY:
-                self.unreported.append((self.report_base + self.account_queries, notional))
-            self.query_account(account.id)
+                self.unasked.append(notional)
+            self.unasked_venue = venue
+        if self.unasked_venue is None:
+            return
+        account = self._trading_account(self.unasked_venue)
+        now = self._now_ns()
+        if self._in_flight(account) and now - self.query_sent_ns < QUERY_WAIT_SECS * SECOND_NS:
+            return
+        self.query_awaits, self.query_sent_ns = account.event_count + 1, now
+        self.unreported += [(self.query_awaits, notional) for notional in self.unasked]
+        self.unasked, self.unasked_venue = [], None
+        self.query_account(account.id)
+
+    def _in_flight(self, account: Any) -> bool:
+        """Whether the last account query sent is still unanswered: the account has had no report since."""
+        return self.query_awaits is not None and account.event_count < self.query_awaits
 
     def _unreported_buys(self, account: Any) -> Decimal:
         """The buys filled that the reported account does not have yet, dropping those it has."""
         self.unreported = [(n, v) for n, v in self.unreported if account.event_count < n]
-        return sum((v for _, v in self.unreported), Decimal(0))
+        waiting = sum(self.unasked, Decimal(0))
+        return sum((v for _, v in self.unreported), waiting)
+
+    def _query_wait_secs(self, account: Any) -> float:
+        """How long the account query in flight has gone unanswered, in seconds; 0 with none: what a
+        buy sized now holds back on it (the lead's ruling of 2026-11-12)."""
+        if not self._in_flight(account):
+            return 0.0
+        return max(0, self._now_ns() - self.query_sent_ns) / SECOND_NS
 
     def on_order_denied(self, event: Any) -> None:
         self.refused.append((event.client_order_id.value, str(event.reason)))
@@ -1377,6 +1414,7 @@ class Mover(Strategy):
             # proceeds count only once a report has them (the lead's ruling of 2026-11-12)
             self._ask_for_the_account()  # a fill this step, before this buy is sized
             unreported = self._unreported_buys(account) if reported else Decimal(0)
+            query_wait = self._query_wait_secs(account) if reported else 0.0
             entry_budget = min(settings.max_notional, free.as_decimal() - unlocked - unreported)
             budget_shares = entry_budget // price
             flow_dollars = sum(slot.dollars, Decimal(0))
@@ -1401,6 +1439,7 @@ class Mover(Strategy):
                 "free_cash": str(free.as_decimal()),
                 "unlocked_entries": str(unlocked),
                 "unreported_fills": str(unreported),
+                "account_query_wait_secs": str(round(query_wait, 3)),
                 "budget_notional": str(entry_budget),
                 "budget_shares": str(budget_shares),
                 "flow_dollars": str(flow_dollars),

@@ -9,8 +9,9 @@ review-by: 2026-12-12
 
 ## Context and Problem Statement
 
-Split from ADR 0087 on 2026-11-12, with its text moved unchanged. ADR 0087 decides the score, its inputs
-and rows; this record decides the actor that computes it in the node and the bus contract between the
+Split from ADR 0087 on 2026-11-12, with its text moved unchanged, apart from its context, a shortened
+practices driver, and the 2026-11-12 paragraph on reference reads (finding 12). ADR 0087 decides the
+score, its inputs and rows; this record decides the actor that computes it in the node and the bus contract between the
 actor and the strategy that reads it (M1b, ADR 0088). The ranking must reach a strategy in the same node,
 be computed from what the node's data client hands the engine, and never offer an entry from a guess.
 

@@ -7,7 +7,7 @@ review-by: 2026-12-10
 
 # The paper node's risk limits: 50 submits and 25 modifies a minute against Alpaca's 200 calls, $1,000 an order
 
-*Amended 2026-11-12 by ADR 0106, which carries the Mover composition's changes to this record.*
+*Amended in part 2026-11-12 by ADR 0106 (proposed), which carries the Mover composition's changes to this record.*
 
 ## Context and Problem Statement
 

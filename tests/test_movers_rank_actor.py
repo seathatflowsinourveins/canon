@@ -1,6 +1,6 @@
 """The movers ranking actor on a `BacktestEngine`: what it publishes on the bus, and when it publishes nothing.
 
-Contract: `canon_trading.movers_rank_actor.MoversRankActor` (ADR 0087), a `DataActor` added to upstream's
+Contract: `canon_trading.movers_rank_actor.MoversRankActor` (ADR 0107), a `DataActor` added to upstream's
 `BacktestEngine` with `add_actor`, beside a second `DataActor` that reads the signal with
 `subscribe_signal` and `on_signal`, as upstream's own `examples/backtest/callback_borrow_reentrancy.py` pairs
 them at the pin (`nautilus-trader@d53849b216e2`). Instruments come from an Alpaca asset payload through
@@ -1072,4 +1072,29 @@ def test_an_unusable_reference_read_that_comes_back_usable_publishes(tmp_path: P
 
     actor, subscriber = run(market(5), baseline_path=write_stub_baseline(tmp_path), reader=late)
     assert len(calls) >= 2 and subscriber.signals
+    assert actor.last_record is not None and actor.last_record["published"] is True
+
+
+def test_an_absent_baseline_is_kept_on_the_worker_and_the_night_still_ranks(tmp_path: Path) -> None:
+    """Review of the composition's fixes, high round, finding 1: an absent baseline file read as
+    unusable, so with the reads on the worker (`inline_reads=False`, the live node's path) it was read
+    again at every tick and the tick found the new read still pending: overnight never published."""
+
+    class Sleeper(DataActor):
+        """Each bar leaves the worker time to finish a read before the next tick."""
+
+        def on_start(self) -> None:
+            self.subscribe_bars([BarType.from_str(f"{equity('UPA').id}-1-MINUTE-LAST-EXTERNAL")])
+
+        def on_bar(self, bar: Bar) -> None:
+            time.sleep(0.05)
+
+    actor, subscriber = run(
+        market(5),
+        baseline_path=tmp_path / "absent.json",
+        rank_without_baseline=True,
+        before=[Sleeper()],
+        inline_reads=False,
+    )
+    assert subscriber.signals, actor.last_record
     assert actor.last_record is not None and actor.last_record["published"] is True

@@ -117,7 +117,7 @@ class MoveRankerConfig(StrategyConfig):
 
 
 class MoveRanker(Strategy):
-    """Publishes `RANK_SIGNAL` once a minute, as the ranking actor will (ADR 0087): one name and its move
+    """Publishes `RANK_SIGNAL` once a minute, as the ranking actor does (ADR 0107): one name and its move
     from `prior_close` at the latest minute bar's close, in `format_rank`'s string. Nothing before the
     first bar. Build it with `move_ranker`."""
 

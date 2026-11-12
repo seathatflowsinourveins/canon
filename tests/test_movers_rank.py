@@ -709,7 +709,8 @@ def test_with_no_baseline_file_every_name_ranks_in_the_dollar_tier() -> None:
     assert night.established is False and night.ratio == math.inf
     assert [e.instrument_id.symbol.value for e in top_entries(generation)] == ["NIGHT", "SMALL"]
     assert not top_entries(ranked(["NIGHT", "SMALL"], today, baselines={}))
-    with pytest.raises(ValueError, match="no baseline"):
+    # an input refused like every other, so the actor records an unpublished tick (high round, cut)
+    with pytest.raises(InvalidGeneration, match="no baseline"):
         ranked(["NIGHT"], today, no_baseline=True)
 
 
