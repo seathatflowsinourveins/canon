@@ -62,7 +62,7 @@ composition instruction of 2026-11-11. Option 2 remains an explicit compatibilit
   ten and one before it), from `MOVER_PARTS`; `WindowConfig.slots`/`--slots` overrides the row. Spares add watched names, not
   held slots. The lead's 2026-11-11 setting uses its reported measurement of 15 requests per rolling
   minute per slot, with 20% reserve under 200; this builder did not measure that order cost.
-  Pre-market and overnight are not measured, and hold seven by the same count (ADR 0083). `entries=None` imposes no count of completed entries: a sale frees the slot, a reclaim
+  Pre-market and overnight are not measured, and hold seven by the same count (ADR 0083). An explicit `--slots` above seven is admitted up to the measured bound ADR 0083 states (2026-11-12); the default stays seven. `entries=None` imposes no count of completed entries: a sale frees the slot, a reclaim
   after the cooldown may buy the same name again, or the strategy rotates into another ranked name,
   until wind-down. Completion of one trade does not end the node.
 * **Account-derived size**, superseding the 500/5,000 paper row on the lead's 2026-11-11 instruction:

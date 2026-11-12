@@ -526,10 +526,19 @@ def after_stop_secs(names: int) -> float:
     intervals more (2 x `POLL_SECS`, 5 s) for each name past the first, since the check closes one name a
     poll and sees it closed in the next (review of 3a8613a, finding 11, the lead's ruling of 2026-11-12).
     It is wall-clock time, not a count of polls: a poll whose requests answer slowly takes longer than
-    `POLL_SECS`, so slower answers fit fewer polls in it, a limit the deadline accepts. Names past
-    `PART_SLOTS`, the names a window holds at once, add nothing: a run with more `--slots` is refused by
-    name (`part_slots`, the lead's ruling of 2026-11-12), so the bounds below hold for every window."""
-    return AFTER_STOP_SECS + (min(max(names, 1), PART_SLOTS) - 1) * 2 * POLL_SECS
+    `POLL_SECS`, so slower answers fit fewer polls in it, a limit the deadline accepts. A Mover run
+    reserves this time for its configured slots, including slots whose orders remain unsettled. The
+    caller caps `names` at `reserved_names` of the run, the names its bounds below were sized for."""
+    return AFTER_STOP_SECS + (max(names, 1) - 1) * 2 * POLL_SECS
+
+
+def reserved_names(slots: int) -> int:
+    """The names a run's bounds reserve: its slots, and never fewer than `PART_SLOTS`, since a run of
+    fewer slots can still hold more names at the stop (an entry's cancel racing its fill while it
+    rotates), as every window could before slots were a setting. The account check's deadline grows
+    with the names a reading shows held up to this count, and the window's end margin and longest
+    duration reserve the same count (review of the slots unit, findings 3, 4 and 6)."""
+    return max(slots, PART_SLOTS)
 
 
 REQUEST_SECS = CONNECT_TIMEOUT_SECS + READ_TIMEOUT_SECS
@@ -580,15 +589,21 @@ def after_end_secs(names: int) -> float:
 
 
 LAST_CLOSE_SECS = last_close_secs(PART_SLOTS)
-"""`last_close_secs` with the most names a window holds (about 515 s)."""
+"""`last_close_secs` for the default seven slots (about 515 s)."""
 AFTER_END_SECS = after_end_secs(PART_SLOTS)
-"""`after_end_secs` with the most names a window holds (about 755 s)."""
+"""`after_end_secs` for the default seven slots (about 755 s)."""
 SKEW_SECS = 60
 """How far this host's clock may be from Alpaca's: the window runs to an end taken from Alpaca's clock, timed
 on this host's."""
-END_MARGIN_SECS = math.ceil(LAST_CLOSE_SECS + SKEW_SECS)
-"""A window ends at least this long before its session does, so the account check's last market close is
-sent while the session is open, with a minute for skew between Alpaca's clock and this host's."""
+
+
+def end_margin_secs(slots: int) -> int:
+    """Reserve the run's last-close bound and host-clock skew before the session ends (ADR 0060)."""
+    return math.ceil(last_close_secs(slots) + SKEW_SECS)
+
+
+END_MARGIN_SECS = end_margin_secs(PART_SLOTS)
+"""The default seven-slot margin; each run uses end_margin_secs with its own slots."""
 PAPER_LOCK_WAIT_SECS = 3900
 """How long a paper test that streams waits for account A's market-data stream lock (the conftests'
 `STREAM_LOCK_WAIT_SECS`; a window holds account B's, not that one, since 2026-11-11), and how long
@@ -596,9 +611,16 @@ PAPER_LOCK_WAIT_SECS = 3900
 since windows run on account B under their own (ADR 0069). Tests read both, so the three cannot drift."""
 START_UP_SECS = 30
 """The process's start before Alpaca's clock is first read (`uv run`, the imports)."""
-LONGEST_WINDOW_SECS = math.floor(
-    PAPER_LOCK_WAIT_SECS - START_UP_SECS - ADAPTER_CALL_SECS - SKEW_SECS - AFTER_END_SECS
-)
+
+
+def longest_window_secs(slots: int) -> int:
+    """The run and its slot-scaled cleanup must fit the existing lock wait (ADRs 0044/0060)."""
+    return math.floor(
+        PAPER_LOCK_WAIT_SECS - START_UP_SECS - ADAPTER_CALL_SECS - SKEW_SECS - after_end_secs(slots)
+    )
+
+
+LONGEST_WINDOW_SECS = longest_window_secs(PART_SLOTS)
 """The longest a window runs (about 49 minutes): sized so that a paper test queued behind it for one shared
 stream lock would get the lock within its wait (`PAPER_LOCK_WAIT_SECS`); each account's pair has had its own
 stream lock since 2026-11-11 (ADR 0069), and the bound is kept as it was. It counts the start-up, the first
@@ -1311,7 +1333,7 @@ class WindowReport:
     seconds: float = 0.0
     planned_seconds: float = 0.0
     """From Alpaca's clock at the start to the window's end, the wind-down included; the stop and the
-    account check come after it (`AFTER_END_SECS` at most)."""
+    account check come after it (`after_end_secs` of the run's `reserved_names` at most)."""
     shortened: str = ""
     """Why the window runs shorter than the minutes asked for, if it does."""
     orders: dict[str, list[str]] = field(default_factory=dict)
@@ -1686,20 +1708,22 @@ def elsewhere(orders: list, held: Mapping[str, Decimal]) -> list[str]:
     ]
 
 
-def window_seconds(minutes: int, session_left: float) -> tuple[float, str]:
+def window_seconds(minutes: int, session_left: float, slots: int = PART_SLOTS) -> tuple[float, str]:
     """How long a window of `minutes` runs with `session_left` seconds of its session to go, and why it
-    is shorter, if it is: it ends `END_MARGIN_SECS` before the session does, and runs at most
-    `LONGEST_WINDOW_SECS`."""
+    is shorter, if it is: its margin before the session's end and its longest duration both reserve
+    the cleanup time for this run's `slots`. Defaults retain the seven-slot figures."""
     asked = minutes * 60
-    by_session = session_left - END_MARGIN_SECS
-    seconds = min(asked, LONGEST_WINDOW_SECS, by_session)
+    reserved = reserved_names(slots)
+    margin, longest = end_margin_secs(reserved), longest_window_secs(reserved)
+    by_session = session_left - margin
+    seconds = min(asked, longest, by_session)
     if seconds >= asked:
         return seconds, ""
     if seconds == by_session:
-        why = f"ends {END_MARGIN_SECS} s before the session does"
+        why = f"ends {margin} s before the session does"
     else:
         why = (
-            f"at most {LONGEST_WINDOW_SECS} s, the longest window, so it and its bounded end fit a "
+            f"at most {longest} s, the longest window, so it and its bounded end fit a "
             f"{PAPER_LOCK_WAIT_SECS} s wait"
         )
     return seconds, f"shortened from {minutes} minutes to {seconds:.0f} s: {why}"
@@ -2421,6 +2445,7 @@ def run_window(
         end_of_session, part = session_part(config.session, clock, calendar)
     except RuntimeError as e:
         raise WindowRefused(str(e)) from e
+    slots_in_use = PART_SLOTS
     if not config.mover:
         feed = window_feed(part)
     elif (no_form := no_mover_form(part)) is not None:
@@ -2431,12 +2456,13 @@ def run_window(
         if config.session == "extended" or config.strategy == MOVER:
             config = replace(config, strategy=DEFAULT_STRATEGY if row.bridge_reason else MOVER)
         if config.strategy == MOVER:
-            slots_in_use = row.slots if config.slots is None else config.slots
+            slots_in_use = part_slots(part, row.slots if config.slots is None else config.slots)
             if slots_in_use + config.spares > MOVER_CHECKS:
                 raise WindowRefused(
                     f"{part}'s {slots_in_use} slots plus {config.spares} spares exceed the "
                     f"ranking interface's {MOVER_CHECKS} names"
                 )
+            config = replace(config, slots=slots_in_use)
     try:  # the slow average's bars and the spare ones, in the bar type's own interval
         history_from = warm_up_start(
             part,
@@ -2487,9 +2513,7 @@ def run_window(
                 raise WindowRefused(
                     f"the rank actor baseline {baseline} is unusable: {read.problem}"
                 )
-            allocation = mover_allocation(
-                trading, row.slots if config.slots is None else config.slots
-            )
+            allocation = mover_allocation(trading, slots_in_use)
         pick = choose_mover(
             trading,
             at,
@@ -2640,9 +2664,13 @@ def run_window(
         overnight = "; ".join(overnight_eligibility(trading, symbol) for symbol in window_symbols)
 
     now = clock.timestamp.astimezone(NEW_YORK)
-    seconds, shortened = window_seconds(config.minutes, (end_of_session - now).total_seconds())
+    seconds, shortened = window_seconds(
+        config.minutes, (end_of_session - now).total_seconds(), slots=slots_in_use
+    )
     if seconds <= FLATTEN_SECS + 1:
-        raise WindowSkipped(f"under {FLATTEN_SECS + END_MARGIN_SECS} s left in the session")
+        raise WindowSkipped(
+            f"under {FLATTEN_SECS + end_margin_secs(reserved_names(slots_in_use))} s left in the session"
+        )
     # Absolute times, taken from Alpaca's clock: start-up eats into the window, not into the wind-down.
     ends = clock.timestamp.astimezone(UTC) + timedelta(seconds=seconds)
     seconds -= time.monotonic() - read_at  # what the reads since the clock read have left
@@ -3621,9 +3649,10 @@ def _flatten_after_stop(
     (`get_order_by_client_id`), or, for a close, Alpaca's refusal of the request (403, 422). The account
     is flat when no order is open, no position is held and the set is empty; nothing else is recorded ok.
 
-    A poll each `POLL_SECS`, none starting once `after_stop_secs` of the most window names a reading has
-    shown held have gone (`AFTER_STOP_SECS` for one, two polls more for each further name up to
-    `PART_SLOTS`); one begun before runs to its end. A poll reads (`_AccountCheck.read`: up to `LOOKUPS` lookups, in turn, then the open orders and
+    A poll each `POLL_SECS`, none starting once `after_stop_secs` has gone of the run's configured Mover
+    slots, or of the most window names a reading has shown held if more, up to `reserved_names`
+    (`AFTER_STOP_SECS` for one, two polls more for each further name). A poll begun before runs to its
+    end. A poll reads (`_AccountCheck.read`: up to `LOOKUPS` lookups, in turn, then the open orders and
     the position) and, if the account is not flat, acts (`act`): an order that works, listed or shown by
     its lookup, is canceled, on every poll until Alpaca shows it ended, in any session, up to `CANCELS`
     a poll; with none working, a position still held is closed for the held quantity under a client
@@ -3659,7 +3688,9 @@ def _flatten_after_stop(
         unsettled_symbols=unsettled_symbols,
     )
     started = time.monotonic()
-    deadline = started + after_stop_secs(1)
+    slots = part_slots(report.part, config.slots) if config.strategy == MOVER else 1
+    reserved = reserved_names(slots)
+    deadline = started + after_stop_secs(slots)
     left: list[str] | None = None
     last_error = ""
     more = True
@@ -3669,7 +3700,7 @@ def _flatten_after_stop(
             if not left:
                 return left
             names = sum(1 for held in check.held.values() if held)
-            deadline = max(deadline, started + after_stop_secs(names))
+            deadline = max(deadline, started + after_stop_secs(min(names, reserved)))
             more = check.act()
         except FAILED as e:
             last_error = f"{type(e).__name__}: {e}"

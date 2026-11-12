@@ -52,7 +52,10 @@ The table row "A window's length and schedule" reads, for the gap: "60 s between
   a quote that fails ends the poll. Its deadline is `AFTER_STOP_SECS` (60 s) and two polls (5 s) more for
   each window name held past the first, counted up to `PART_SLOTS` (seven), and a run with `--slots` above
   seven is refused by name (the lead's ruling, 2026-11-12) until slots become a setting, from which the
-  deadline, `END_MARGIN_SECS` and the longest window then scale. The bounds count seven names and the extended close's quote:
+  deadline, `END_MARGIN_SECS` and the longest window then scale. Slots became a setting the same day (ADR
+  0083, "Slots as a measured setting"): a run's bounds now reserve its slots and never fewer than seven
+  (`reserved_names`), and the deadline still grows with the names held up to that count, so a run of seven
+  or fewer keeps the figures below. The bounds count seven names and the extended close's quote:
   `LAST_CLOSE_SECS` 455 to 515 s, `AFTER_END_SECS` 725 to 755 s, `END_MARGIN_SECS` 515 to 575 s,
   `LONGEST_WINDOW_SECS` 2955 to 2925 s (about 49 minutes still), so ADR 0050's deadline sum
   (`LONGEST_WINDOW_SECS` + `AFTER_END_SECS`) is unchanged and ADR 0050 is not amended. Computed by

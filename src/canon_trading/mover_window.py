@@ -10,7 +10,7 @@ mover_universe_parts builds one strategy and a position monitor per loaded roste
 pass the startup account's entry figure and select whole-share budget sizing; each name's share cap
 and position monitor follow that figure at its current entry limit. The engine's per-order outer bound
 is a larger multiple because it caps sells too. Legacy FixedRank simulations retain their explicit
-500/5,000 row. Slots default to ten in regular/after-hours and one in pre-market/overnight; entries
+500/5,000 row. Slots default to seven in every part; a measured request rate bounds overrides. Entries
 have no bound and continue after sales until wind-down, under cooldown and reclaim rules. The window's
 spares setting adds watched names for rotation.
 
@@ -47,6 +47,7 @@ from nautilus_trader.model import StrategyId
 from nautilus_trader.model import TimeInForce
 
 from .mover import RANK_SIGNAL
+from .mover import SOFT_LINE
 from .mover import Mover
 from .mover import MoverConfig
 from .mover import format_rank
@@ -83,9 +84,17 @@ ENTRIES: int | None = None
 rotates until the part ends (the lead's decision of 2026-11-11, Task M's gap 6), under `Mover`'s
 cooldown and reclaim rows."""
 PART_SLOTS = 7
-"""The names a window's node holds at once in every part (the lead's ruling of 2026-11-12): the worst
-measured minute is 175 trading requests against the 180 throttle, and ten slots would pass it (ADR
-0083). A run's `--slots` sets its own."""
+"""The default names a window's node holds at once in every part (the lead's ruling of 2026-11-12,
+ADR 0083). A run's `--slots` sets its own, within the measured request bound below."""
+MEASURED_PEAK_TRADING_REQUESTS = 55
+MEASURED_SLOTS = 7
+PEAK_TRADING_REQUESTS_PER_SLOT = Decimal(MEASURED_PEAK_TRADING_REQUESTS) / MEASURED_SLOTS
+"""PROVISIONAL, IDLE LOAD: window-20261112T133923Z.json, 2026-11-12 08:39:23 New York, tree e5fdbe2.
+The numerator is request_budget.by_api[api=trading].peak_60s; the denominator is mover.slots.
+L6's measurement, sent by the deputy at 09:26 New York on 2026-11-12: highest of six records from
+06:03-08:39, all censored with zero entries and zero orders, every peak in the node's first minute.
+This measures startup load, not order traffic; replace it with an active record before review.
+The slot bound is floor(SOFT_LINE / this ratio), rather than the worst-case chase cost (ADR 0083)."""
 CHASE = "resend"
 """How a window re-prices a resting sale: cancel, see the cancel's terminal state at the next step, then
 send the new limit for what is held. No order of a mover node is modified at the venue (the lead's
@@ -275,18 +284,18 @@ RANK_MAX_AGE_SECS = 90
 
 def part_slots(part: str, slots: int | None = None) -> int:
     """The names a session part's node holds at once: `slots` where the run sets it, else
-    `PART_SLOTS`, the same in every part. More than `PART_SLOTS` is refused by name: the window's
-    account check's deadline, its end margin and its longest window count that many names at most
-    (`session_window.after_stop_secs`), until slots become a setting those bounds scale from (the
-    lead's ruling of 2026-11-12)."""
+    `PART_SLOTS`, the same in every part. Overrides fit floor(the strategy's soft line / the measured
+    peak trading requests per slot); session_window scales its cleanup bounds from the run's slots.
+    Contract: Alpaca's per-account Trading API rate limit, as ADR 0083 cites it."""
     if slots is None:
         return PART_SLOTS
     if isinstance(slots, bool) or not isinstance(slots, int) or slots < 1:
         raise ValueError(f"slots must be a positive whole number, got {slots!r}")
-    if slots > PART_SLOTS:
+    bound = math.floor(Decimal(SOFT_LINE) / PEAK_TRADING_REQUESTS_PER_SLOT)
+    if slots > bound:
         raise ValueError(
-            f"slots must be at most {PART_SLOTS}, got {slots}: the account check's deadline and the "
-            f"window's end margin count {PART_SLOTS} names at most"
+            f"slots must be at most {bound}, got {slots}: floor(soft_line {SOFT_LINE} / "
+            f"PEAK_TRADING_REQUESTS_PER_SLOT {PEAK_TRADING_REQUESTS_PER_SLOT})"
         )
     return slots
 

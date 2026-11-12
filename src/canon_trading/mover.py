@@ -182,6 +182,9 @@ CENT = Decimal("0.01")
 SUB_DOLLAR = Decimal("0.0001")
 SECOND_NS = 1_000_000_000
 BUDGET_SPAN_NS = 60 * SECOND_NS
+SOFT_LINE = 140
+"""The default rolling-minute request count that holds entries and chase re-prices (ADR 0083).
+Exits and cancels pass; mover_window uses the same row to bound configured slots."""
 QUERY_WAIT_SECS = 130
 """How long an account query may go unanswered before another is sent: one adapter REST call at its
 longest, alpaca-py's first request and three retries at the adapter's timeouts and the waits between
@@ -415,7 +418,7 @@ class MoverConfig(StrategyConfig):
         entry_timeout_secs: int = 30,
         cooldown_secs: int = 300,
         rank_max_age_secs: int = 90,
-        soft_line: int = 140,
+        soft_line: int = SOFT_LINE,
         protect: bool = True,
         trigger: TriggerType = TriggerType.BID_ASK,
         extended_hours: bool = False,

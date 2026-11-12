@@ -4008,7 +4008,7 @@ session_window.window_data = lambda: SimpleNamespace(
 s = SimpleNamespace(dropped=[], history_bars=0, history_dropped=0, quotes=1, trades=1, live_bars=0)
 cap = SimpleNamespace(checks=1, peak=Decimal(0), tripped=None)
 session_window.window_node = lambda config, **kw: (Clean(), s, cap)
-session_window.window_seconds = lambda minutes, left: (130.0, "")
+session_window.window_seconds = lambda minutes, left, **kwargs: (130.0, "")
 session_window.FLATTEN_SECS = 1
 real = session_window._run_node
 session_window._run_node = lambda node, ends: real(node, datetime.now(UTC))
@@ -9011,6 +9011,77 @@ def test_a_multiname_poll_that_cancels_sends_no_close_and_stays_inside_seven_req
     assert account.quantities == {"AAA": 0, "BBB": 0}, left
 
 
+def test_after_stop_secs_scales_past_seven_names() -> None:
+    w = session_window
+    assert w.after_stop_secs(14) > w.after_stop_secs(7)
+    assert w.after_stop_secs(14) == w.AFTER_STOP_SECS + 13 * 2 * w.POLL_SECS
+
+
+@pytest.mark.parametrize("slots", [1, 7, 14])
+def test_the_longest_window_reserves_its_own_slots_cleanup(slots) -> None:
+    w = session_window
+    seconds, reason = w.window_seconds(60, session_left=4 * 3600, slots=slots)
+    reserved = w.reserved_names(slots)
+    assert seconds == w.longest_window_secs(reserved)
+    assert str(seconds) in reason and "3900 s wait" in reason
+    assert (
+        w.START_UP_SECS + w.ADAPTER_CALL_SECS + seconds + w.SKEW_SECS + w.after_end_secs(reserved)
+        <= w.PAPER_LOCK_WAIT_SECS
+    )
+    assert seconds + w.SKEW_SECS + w.after_end_secs(reserved) < w.STALE_RUNNING_SECS
+    assert w.longest_window_secs(14) < w.longest_window_secs(7)
+
+
+def test_end_margin_and_account_deadline_follow_the_runs_slots(
+    monkeypatch, fake_time, tmp_path
+) -> None:
+    """The run passes its slots through to its session margin and clears fourteen simulated holdings
+    after the seven-slot deadline, with each request taking 1.5 seconds."""
+    w = session_window
+    flatten = w._flatten_after_stop
+
+    class NearClose(Assets):
+        def get_clock(self):
+            return clock(datetime(2026, 11, 10, 15, 40, tzinfo=NEW_YORK), is_open=True)
+
+    monkeypatch.setattr(w, "choose_mover", lambda *a, **k: a_pick())
+    monkeypatch.setattr(w, "window_data", lambda: Quoted())
+    monkeypatch.setattr(w, "mover_entry_contexts", lambda *a, **k: {})
+    planned = {}
+    for slots in (7, 14):
+        folder = tmp_path / str(slots)
+        folder.mkdir()
+        outcome, record, _ = quiet_window(
+            monkeypatch,
+            folder,
+            quotes=5,
+            trades=5,
+            account=NearClose(),
+            strategy="Mover",
+            mover=True,
+            slots=slots,
+        )
+        assert not isinstance(outcome, Exception), outcome
+        planned[slots] = record["planned_seconds"]
+    extra = 7 * 2 * w.POLL_SECS
+    assert planned[7] - planned[14] == extra
+    assert w.last_close_secs(14) - w.last_close_secs(7) == extra
+    assert w.after_end_secs(14) - w.after_end_secs(7) == extra
+    names = {f"N{n}": n + 1 for n in range(14)}
+    account = CountingAccount(fake_time, names, latency=1.5)
+    report = w.WindowReport("regular", "N0", started="t", part="regular", strategy="Mover")
+    left = flatten(
+        cast(TradingClient, account),
+        WindowConfig(strategy="Mover", mover=True, slots=14, log_dir=tmp_path),
+        report,
+        symbols=tuple(names),
+    )
+    closes = [at for at, name in account.requests if name == "close"]
+    assert left == [] and len(closes) == 14
+    assert max(closes) > w.after_stop_secs(7)
+    assert fake_time.now <= w.after_stop_secs(14) + 2 * w.POLL_AT_LONGEST_SECS
+
+
 def test_the_account_checks_deadline_grows_with_the_names_held(fake_time, tmp_path) -> None:
     """Review of 3a8613a, finding 11 (the lead's ruling of 2026-11-12): the check closes one name a
     poll, and its 60 s deadline did not grow with the names held, so seven names each answered in 2 s
@@ -9032,7 +9103,29 @@ def test_the_account_checks_deadline_grows_with_the_names_held(fake_time, tmp_pa
     assert (
         w.after_stop_secs(w.PART_SLOTS) == w.AFTER_STOP_SECS + (w.PART_SLOTS - 1) * 2 * w.POLL_SECS
     )
-    assert w.after_stop_secs(w.PART_SLOTS + 5) == w.after_stop_secs(w.PART_SLOTS)
+    assert (
+        w.after_stop_secs(w.PART_SLOTS + 5) == w.after_stop_secs(w.PART_SLOTS) + 5 * 2 * w.POLL_SECS
+    )
+
+
+@pytest.mark.parametrize("slots", [None, 7, 14])
+def test_the_mover_account_deadline_reserves_slots_before_holdings_are_known(
+    fake_time, tmp_path, slots
+) -> None:
+    """A lost entry's missing position cannot shrink the configured run's lookup deadline."""
+    w = session_window
+    account = CountingAccount(fake_time, {"N0": 0})
+    report = w.WindowReport("regular", "N0", started="t", part="regular", strategy="Mover")
+    left = w._flatten_after_stop(
+        cast(TradingClient, account),
+        WindowConfig(strategy="Mover", mover=True, slots=slots, log_dir=tmp_path),
+        report,
+        symbols=("N0",),
+        unsettled={"missing-entry": "buy"},
+    )
+    assert len(left) == 1 and "missing-entry" in left[0]
+    assert fake_time.now == w.after_stop_secs(7 if slots is None else slots)
+    assert not account.sent
 
 
 class TimedQuotes(NoBidForAAA):
@@ -9085,17 +9178,13 @@ def test_an_extended_poll_reads_the_calendar_or_one_quote_and_closes_at_most_onc
     assert account.quantities["BBB"] == 0 and "position of 5 AAA" in left
 
 
-@pytest.mark.parametrize("slots", [8, 10, 20])
-def test_slots_above_the_seven_the_bounds_count_are_refused_by_name(slots: int) -> None:
-    """Review of 3a8613a, finding 11 (the lead's ruling of 2026-11-12): the account check's deadline,
-    `END_MARGIN_SECS` and the longest window count `PART_SLOTS` names at most, so a run with more
-    `--slots` is refused by name until slots become a setting those bounds scale from."""
+@pytest.mark.parametrize("slots", [8, 10, 14])
+def test_slots_above_seven_reach_the_window_config_within_the_measured_bound(slots: int) -> None:
+    """The lead's slots-setting build of 2026-11-12 scales the cleanup bounds from the run's slots."""
     from canon_trading.mover_window import part_slots
 
-    with pytest.raises(ValueError, match=f"at most {session_window.PART_SLOTS}.*account check"):
-        WindowConfig(strategy="Mover", mover=True, slots=slots)
-    with pytest.raises(ValueError, match="at most 7"):
-        part_slots("regular", slots)
+    assert WindowConfig(strategy="Mover", mover=True, slots=slots).slots == slots
+    assert part_slots("regular", slots) == slots
     assert part_slots("regular", session_window.PART_SLOTS) == session_window.PART_SLOTS
 
 
@@ -9171,3 +9260,49 @@ def test_overnight_a_spare_after_a_chosen_name_passed_over_on_price_is_passed_ov
     assert [p.symbol for p in seen["pick"].picks] == ["LLL"]
     assert "overnight" in latest["mover"]["passed_over"]["EEE"]
     assert "entry figure" in latest["mover"]["passed_over"]["XXX"]
+
+
+def test_a_mover_runs_check_still_grows_with_names_held_past_its_slots(fake_time, tmp_path) -> None:
+    """Review of the slots unit, finding 3: a run of two slots can hold three names at the stop (an
+    entry's cancel racing its fill while the run rotates). The check's deadline grows with the names a
+    reading shows held, as it did before, up to the seven names every window reserves."""
+    w = session_window
+    names = {f"N{n}": n + 1 for n in range(3)}
+    account = CountingAccount(fake_time, names, latency=8.0)
+    report = w.WindowReport("regular", "N0", started="t", part="regular", strategy="Mover")
+    left = w._flatten_after_stop(
+        cast(TradingClient, account),
+        WindowConfig(strategy="Mover", mover=True, slots=2, log_dir=tmp_path),
+        report,
+        symbols=tuple(names),
+    )
+    closes = [at for at, name in account.requests if name == "close"]
+    assert left == [] and len(closes) == 3, (left, closes)
+
+
+def test_a_compatibility_runs_check_grows_no_further_than_the_seven_names_reserved(
+    fake_time, tmp_path
+) -> None:
+    """Review of the slots unit, finding 4: names held past `PART_SLOTS` in a run that reserves seven
+    add no time, so its last poll still starts inside the end margin and the lock wait."""
+    w = session_window
+    names = {f"N{n}": n + 1 for n in range(w.PART_SLOTS + 4)}
+    account = CountingAccount(fake_time, names, latency=2.0)
+    report = w.WindowReport("regular", "N0", started="t")
+    w._flatten_after_stop(
+        cast(TradingClient, account),
+        WindowConfig(symbol="N0", log_dir=tmp_path),
+        report,
+        symbols=tuple(names),
+    )
+    starts = [at for at, name in account.requests if name == "clock"]
+    assert max(starts) < w.after_stop_secs(w.PART_SLOTS)
+
+
+def test_a_run_of_fewer_slots_reserves_the_seven_name_bounds() -> None:
+    """Review of the slots unit, findings 3 and 6: a run below seven slots still reserves the seven-name
+    end margin and longest window, the bounds the check above can use, and the documented figures."""
+    w = session_window
+    assert w.window_seconds(60, 10_000, slots=1) == w.window_seconds(60, 10_000)
+    assert w.window_seconds(60, 1_000, slots=3) == w.window_seconds(60, 1_000)
+    assert w.window_seconds(60, 10_000, slots=14)[0] < w.window_seconds(60, 10_000)[0]

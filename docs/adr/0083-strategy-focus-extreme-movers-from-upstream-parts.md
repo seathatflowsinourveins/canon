@@ -172,6 +172,19 @@ it. Under `Mover`'s soft line of 140 in one process the same arithmetic gives 9.
 no instrumented round trip, so their slots are not measured; the per-order model below gives 3 names outside
 the regular session at 160 (1 at the old 100), and the lead set them at 7 by the same count.
 
+**Slots as a measured setting, dated 2026-11-12.** The default stays 7 in every part
+(`mover_window.PART_SLOTS`), and the two agreeing records above still govern raising it. A run's explicit
+`--slots` may go up to floor(soft line / per-slot peak), with the soft line at 140
+(`mover.SOFT_LINE`). The per-slot peak is the highest count of trading-API requests in any rolling 60
+seconds of a named window record (`request_budget.by_api[api=trading].peak_60s`), divided by that record's
+slots. The row in force is **PROVISIONAL**: 55 over 7, giving a bound of 17, from a pre-market record of
+2026-11-12, 08:39 New York, with no entry and no order. It measures start-up load and sizes nothing (the
+lead, 2026-11-12). The next step is set from the first record that has fills. The window's last-close and
+after-end bounds, its end margin, its longest duration and its account-check deadline follow the run's
+slots. Entries and chase re-prices wait at the soft line; exits and cancels pass it, under the engine's
+180 ceiling and Alpaca's 200 a minute per account. The first step is 14 on account B in a composed firing,
+once reviewed.
+
 **The request budget, historical as of 2026-11-11**: a `Mover` window now fails at 180, not the 100 below
 (`session_window.REQUEST_CEILING`; ADR 0091's request budget). The per-order figures stay UNVERIFIED. As
 first written (ADR 0076, numbered and not yet on `main`; its figures UNVERIFIED here until it lands): the

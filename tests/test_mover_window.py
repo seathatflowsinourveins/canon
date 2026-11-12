@@ -31,6 +31,7 @@ from nautilus_trader.model import TradeTick
 from nautilus_trader.risk import RiskEngineConfig
 
 from canon_trading import mover as mover_module
+from canon_trading import mover_window
 from canon_trading import session_window
 from canon_trading.mover import Mover
 from canon_trading.mover_window import MOVER_ID
@@ -40,6 +41,40 @@ from canon_trading.movers_rank_actor import MoversRankActorConfig
 from canon_trading.paper_node import risk_limits
 from canon_trading.session_window import MoverPick
 from canon_trading.session_window import WindowConfig
+
+
+def test_part_slots_accepts_fourteen_within_the_measured_bound() -> None:
+    for part in session_window.MOVER_PARTS:
+        assert mover_window.part_slots(part, 14) == 14
+
+
+def test_part_slots_refuses_above_the_measured_bound_by_name() -> None:
+    with pytest.raises(ValueError) as refused:
+        mover_window.part_slots("regular", 1000)
+    message = str(refused.value)
+    assert "PEAK_TRADING_REQUESTS_PER_SLOT" in message
+    assert "soft_line" in message
+    peak = mover_window.PEAK_TRADING_REQUESTS_PER_SLOT
+    soft_line = mover_module.MoverConfig(max_notional=Decimal(500), max_move=Decimal(5)).soft_line
+    bound = int(Decimal(soft_line) // peak)
+    assert str(peak) in message and str(soft_line) in message
+    assert f"at most {bound}" in message
+    assert mover_window.part_slots("regular", bound) == bound
+    with pytest.raises(ValueError, match=f"at most {bound}"):
+        mover_window.part_slots("regular", bound + 1)
+
+
+def test_part_slots_default_stays_seven() -> None:
+    for part in session_window.MOVER_PARTS:
+        assert mover_window.part_slots(part) == 7
+
+
+@pytest.mark.parametrize("peak,bound", [("9.5", 14), ("10.01", 13), ("7.25", 19)])
+def test_part_slots_floors_the_bound_from_the_measured_row(monkeypatch, peak, bound) -> None:
+    monkeypatch.setattr(mover_window, "PEAK_TRADING_REQUESTS_PER_SLOT", Decimal(peak))
+    assert mover_window.part_slots("regular", bound) == bound
+    with pytest.raises(ValueError, match=f"at most {bound}"):
+        mover_window.part_slots("regular", bound + 1)
 
 
 @pytest.mark.parametrize("part", ["regular", "pre-market", "after-hours", "overnight"])

@@ -1565,6 +1565,35 @@ def test_a_release_that_rests_is_chased_down_to_the_bid_but_not_below_its_cap() 
     assert count == 3
 
 
+def test_soft_line_holds_entries_and_chases_and_passes_exits_and_cancels_at_fourteen_slots(
+    monkeypatch,
+) -> None:
+    """At exactly the soft line, BBB's later rising run cannot enter, AAA's released exit still
+    reaches the simulated venue, its chase waits, and the stop cancels the resting sale."""
+    slots = part_slots("regular", 14)
+    s = strategy(slots=slots, watch=slots, max_notional=Decimal(1000), chase_secs=5)
+    monkeypatch.setattr(
+        s, "_recent_requests", lambda now: s.settings.soft_line if now >= T0 + 7 * MINUTE else 0
+    )
+    eng = engine()
+    try:
+        orders = run(
+            eng,
+            s,
+            ranker(rank((AAA, "0.25"), (BBB, "0.20"))),
+            tape(AAA, [*RISING, 10.30, 10.30, 10.30, 10.30]),
+            tape(BBB, [20.0] * 7 + [20.1, 20.2, 20.3, 20.4, 20.5]),
+        )
+        assert s.settings.slots == 14 and s.recent == s.settings.soft_line == 140
+        assert sides(orders) == ["BUY LIMIT FILLED", "SELL LIMIT CANCELED"]
+        assert all(o.instrument_id == AAA for o in orders)
+        assert orders[-1].price.as_decimal() == Decimal("10.42")
+        assert any("BBB.ALPACA" in reason and "soft line" in reason for reason in s.dropped)
+        assert any("AAA.ALPACA" in reason and "not chased" in reason for reason in s.dropped)
+    finally:
+        eng.dispose()
+
+
 def test_a_resting_sale_is_not_chased_at_the_soft_line_and_its_release_still_goes(
     monkeypatch,
 ) -> None:
