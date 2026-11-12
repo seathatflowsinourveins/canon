@@ -62,6 +62,10 @@ Chosen: **option 3**, decided by the lead on 2026-11-11.
    it keeps ADR 0074's evidence tier for the trading path, whoever builds it. Everything else may go to
    a worker of another runtime now, under ADR 0058's terms. ADR 0074 rule 1 keeps risk limits with the
    owner; the lead reads this choice as one of means, which the owner may reverse.
+   2026-11-11, evening: the owner directed that every open gap be built by workers of the other runtimes
+   at maximum parallel; the lead reads this as reversing rule 3 for building, with Claude keeping the high
+   review, the paper firing, the landing and credential-handling code; reversed again by one word from
+   the owner or by a build on these paths that a Claude lane has to redo.
 4. **Widening.** After three counted rounds, moving a trading path to another runtime is decided by the
    lead on the scored evidence and reported to the owner before the first such lane starts.
 5. **A builder of another runtime does not commit** (supersedes ADR 0058 rule 2's "It commits on its
