@@ -23,8 +23,9 @@ from `nightly_study.py`, `fill_gap.py` and ADR 0089.
 
 ## Not planned
 
-Live trading. No record plans it. Agents work on paper only, and going live is a human action;
-ADR 0009 keeps trading on paper at least until NautilusTrader v2.0.0 stable, a condition, not a plan.
+Live trading beyond one lane. Since 2026-11-12 live orders go only through the live lane's `live:*` tasks,
+and every other session stays on paper (ADR 0103). Nothing trades live until ADR 0110 is accepted and its
+live order tasks are on `main`; ADR 0110 lists the mechanism and its open gaps.
 
 The routing plan, order-type access and rate limits on a live account are the account holder's
 arrangement with Alpaca, and outside what agents decide.
@@ -57,7 +58,8 @@ arrangement with Alpaca, and outside what agents decide.
   position Alpaca did not hold; the client now reports each loaded instrument without a position as flat,
   which removes it offline, and on paper this waits for a regular session (package README; ADR 0024).
   Option 3 of ADR 0024 replaces the generic `get` when an alpaca-py release carries the call.
-* **Re-pinning NautilusTrader at v2.0.0 stable**, which ADR 0009 requires and ties paper only to.
+* **Re-pinning NautilusTrader at v2.0.0 stable**, which ADR 0009 requires; live no longer waits for it
+  (ADR 0103).
 * **The price increment.** The adapter uses 0.0001 for every US equity; ADR 0030 asks the owner to
   ratify it.
 * **The sandbox.** Part of it is adopted, and nothing is on until a trial costs no lane a stop
