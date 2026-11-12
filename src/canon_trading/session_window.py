@@ -229,6 +229,7 @@ from canon_alpaca.constants import ENV_SECRET_KEY
 from canon_alpaca.constants import FEED
 from canon_alpaca.constants import VENUE
 from canon_alpaca.execution import DEFINITIVE_SUBMIT_REFUSALS
+from canon_alpaca.execution import INSTRUMENT_REFUSAL
 from canon_alpaca.execution import ORDERS_PAGE_LIMIT
 from canon_alpaca.providers import CONNECT_TIMEOUT_SECS
 from canon_alpaca.providers import READ_TIMEOUT_SECS
@@ -1549,6 +1550,14 @@ class WindowReport:
     stream: list[str] = field(default_factory=list)
     """The adapter's own log lines about its stream (`STREAM_LINES`): alpaca-py's warnings and errors,
     the stream's end by itself and a subscription it refused. An error among them fails the window."""
+    instrument_refusals: int = 0
+    """The instrument notifications the node's log shows refused for a full command queue
+    (`canon_alpaca.execution.INSTRUMENT_REFUSAL`): an upstream limit at a whole-market start, one line
+    for each instrument past the 1,024 the execution client's queue holds, counted here so that they are
+    one known number and not read as the window's errors. The instruments themselves are in the cache
+    (the adapter's README, "Instrument load and the command queue"). It is the whole window's count: a
+    notification refused later, while the queue held real commands, is in it too, so compare it with the
+    instruments the data client loaded less 1,024."""
     warm_up_bars: int = 0
     warm_up_dropped: int = 0
     result: str = "running"
@@ -3303,8 +3312,9 @@ MAX_STREAM_LINES = 20
 def _read_stream_lines(report: WindowReport, log: Path) -> None:
     """Copy the adapter's stream lines from the node's log (`STREAM_LINES`, at most `MAX_STREAM_LINES`,
     then a count) into `report.stream`: the log is where the adapter reports a stream Alpaca refused or
-    that ended, since the subscription has returned by then (ADR 0055). A log that cannot be read is
-    noted in `errors`."""
+    that ended, since the subscription has returned by then (ADR 0055). Count, apart from them, the
+    instrument notifications upstream refused for a full queue (`report.instrument_refusals`). A log
+    that cannot be read is noted in `errors`."""
     # The node's logger writes on its own thread; wait until what it was sent is on disk
     # (`logging_sync_to_disk`, as the adapter's tests do).
     logging_sync_to_disk()
@@ -3313,6 +3323,9 @@ def _read_stream_lines(report: WindowReport, log: Path) -> None:
     except OSError as e:
         _note(report, f"reading the node log for the stream's own lines: {type(e).__name__}: {e}")
         return
+    report.instrument_refusals = sum(
+        all(mark in line for mark in INSTRUMENT_REFUSAL) for line in lines
+    )
     found = [line for line in lines if any(mark in line for mark in STREAM_LINES)]
     report.stream = found[:MAX_STREAM_LINES]
     if len(found) > MAX_STREAM_LINES:
