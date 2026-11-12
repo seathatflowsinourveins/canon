@@ -5,7 +5,7 @@ decision-makers: the lead for the pairs the task may read (2026-11-11); master o
 review-by: 2026-12-11
 ---
 
-# paper:history: a paced, GET-only load of historical `sip` bars for many symbols into the catalog
+# paper:history: a paced, GET-only load of historical `sip` bars and trade prints into the catalog
 
 ## Context and Problem Statement
 
@@ -87,7 +87,7 @@ repository (UNVERIFIED here).
    A symbol with no definition is refused by name before any request. Definitions alone are not a
    feed's data, so `catalog_feed` no longer reads a root holding only `data/equity/` as IEX. Until this
    change, such a root refused every `sip` load.
-5. **The pace.** One constant, `history_load.PACE`, holds this table's row. After each request the
+5. **The pace.** One constant, `history_load.PACE`, holds this table's row. After each bar request the
    adapter's request counter (`canon_alpaca.providers.request_counts`) gives the GETs it sent to each
    API. The next request starts no sooner than its data GETs allow at the row's data rate. The trading
    column is a guard: a request that sent any trading GET stops the run. Inside one request, alpaca-py
@@ -96,6 +96,11 @@ repository (UNVERIFIED here).
    requests, not inside one. Each process paces itself; simultaneous loads into different roots using
    one account do not share a rate limiter. Their combined rate is UNCALIBRATED, and a 429 stops each
    affected run by name.
+
+   Trades (amended 2026-11-11, clause 9) pace every actual GET through requests' documented transport
+   adapter hook, including pages and SDK 504 retries. Each send starts at least `60 / 150` seconds
+   after the previous actual send; idle time and retry backoffs earn no later burst. The wrapper
+   delegates to the existing GET-only timeout/counter adapters and restores them when the load exits.
 
    | Task | Data API GETs a minute | Trading API GETs a minute | State |
    |---|---|---|---|
@@ -114,9 +119,10 @@ repository (UNVERIFIED here).
 6. **429.** alpaca-py retries 429 and 504 three times, 3 s apart. Its data client takes no retry
    setting, and a `retry_attempts` of 0 keeps the default. So a requests response hook on the client's
    session raises at Alpaca's first 429, before alpaca-py sends the request again, and the run stops by
-   name (exit 4). A 504 is still retried three times, unpaced, as alpaca-py does it, and each retry is
+   name (exit 4). A 504 is still retried three times, as alpaca-py does it, and each retry is
    counted. The adapter's execution client is the precedent: it ends an order command at its first
    error (`execution.py`, `end_at_first_error`), as an `APIError` on any error rather than a 429 alone. The counter's 429 count is checked after each request as well.
+   For bars these retries remain unpaced; trades apply the per-send spacing of clause 5 (2026-11-11).
 7. **Failures.** A refused request, a 403 on `sip` included, stops the run by name, with the HTTP
    status. Nothing falls back to another feed. Whatever an earlier request wrote stays, and a rerun asks
    only for what is missing. Client setup errors (missing credentials, timeout or GET-only session
@@ -127,8 +133,34 @@ repository (UNVERIFIED here).
    `tests` (A) or `windows` (B). It reads market data and nothing of the account. ADR 0069's rule on who
    reads B's pair governs who trades and streams on B, and a GET-only history load does neither. The
    task reads one pair, never both (ADR 0069, clause 2's refusal). It runs in data-only mode (ADR 0070).
-9. **Trades.** `--data trades` is refused by name until the adapter's `_request_trades` exists. The
-   argument holds its place.
+9. **Trades, amended 2026-11-11.** `--data trades` now loads individual historical SIP prints for
+   `--symbols` or `--symbols-file` through the adapter's `fetch_trades` and `parse_trade`, using
+   Alpaca's GET `/v2/stocks/{symbol}/trades` and alpaca-py's public `RESTClient.get`. Each symbol's
+   complete missing interval is fetched in ascending pages, with exact raw event nanoseconds and
+   separate IDs retained for prints sharing a timestamp. `ts_init = ts_event`, as on the adapter's
+   historical response. The writer is the pinned NautilusTrader v2.0.0rc8
+   `ParquetDataCatalog.write_trade_ticks(ticks, start, end)`, with inclusive nanosecond bounds;
+   coverage is keyed by `NautilusDataType.TradeTick` and instrument ID. No bars are synthesized.
+   The existing root, definitions, feed marker, catalog lock, GET-only transport, zero trading GETs,
+   first-429/refused-feed stops and publication delay apply. Bounds require `start < end`, though
+   both are inclusive; the CLI preserves nanoseconds and a start before 1970-01-01 UTC is refused
+   before lock creation. The 150 data-GET row applies to each actual send, including every page and
+   504 retry (clause 5); its live calibration remains UNVERIFIED.
+
+   There is no assumed upper rate of prints per time unit. Fetching at most
+   `MAX_ROWS_PER_CALL + 1` valid prints detects an overfull answer: the interval is then loaded in
+   parts, each written up to one nanosecond before the last timestamp its answer reached and the next
+   started there, so a timestamp is never split; more than 100,000 prints at one timestamp stops by
+   name. Prints are written in time order, as the pinned writer requires. Coverage once written is
+   kept: a print Alpaca cancels, corrects or reports after the load is not picked up by a rerun (how
+   late is UNVERIFIED). The
+   adapter's page cap still fails incomplete history, including on invalid-only pages. Empty or
+   invalid-only intervals write no coverage. Canceled and incorrect prints are excluded by the raw
+   `u` field, corrected prints are kept, and exclusions and rounded prices are named.
+   The `TradeTick` representation drops Alpaca's conditions (`c`), exchange (`x`) and tape (`z`),
+   without filtering by condition flags; `aggressor_side` is `NO_AGGRESSOR`, with no side inferred.
+   A real SIP load of one named symbol over one night, then a zero-request rerun, remains for the
+   Claude lane (UNVERIFIED here).
 
 ### Consequences
 
@@ -186,6 +218,17 @@ adapter and counter, with requests' transport answered by a stand-in of the bars
 * the arguments refusing an open-ended or unplaced range;
 * `PACE` equal to this record's row;
 * the task reading one named pair, with no account or stream lock, in data-only mode.
+
+Trades amendment, 2026-11-11: `tests/test_trades_load.py` exercises the real SDK and trade-tick
+catalog with a stand-in HTTP transport. It covers nanoseconds and same-timestamp IDs across pages
+and gap extensions, empty history, the row bound, 429/403 stops, invalid prints, rounding, feed/lock
+and write failures, CLI symbols/files, and pre-epoch refusal before lock creation. The pacing
+regression covers seven pages with three 504 retries each, then fast one-print pages and a second
+symbol: 221 actual GETs, each separated by the row's minimum spacing. Both the SDK's normal 3-second
+retry wait and a stand-in zero wait are covered; original transport adapters are restored on success
+and exhausted retries. Antigravity's review of `5a86570` identified the pacing, pre-epoch and
+documentation findings; the behavioral regressions failed before the fixes. The SIP night remains
+UNVERIFIED until its paper firing.
 
 `tests/test_bars_to_catalog.py` shows a root holding only definitions taking a `sip` load. One paper run
 on 2026-11-11, on account A's pair in data-only mode, loaded SPY and QQQ 1-minute `sip` bars for
@@ -249,3 +292,12 @@ source cache.
 * Second reader, 2026-11-11: an evidence check of this record found the trading budget's figure unlabelled,
   the engine-filter claim uncited and the execution-client precedent loosely stated; each is corrected
   above, and the DeepSeek Harness review is named.
+* Trades amendment, source check 2026-11-11: NautilusTrader `d53849b216e2`
+  `python/nautilus_trader/persistence/__init__.pyi` (`write_trade_ticks`, coverage queries),
+  `crates/persistence/src/python/backend/parquet/catalog.rs` (`start: u64`),
+  `crates/model/src/data/trade.rs` (`TradeTick` fields) and `python/nautilus_trader/core/datetime.py`;
+  alpaca-py `c42add7c0a70` `alpaca/data/mappings.py` (`TRADE_MAPPING`) and `alpaca/common/rest.py`
+  (`_request` / `_one_request` and the 504 retry loop); requests `6e83187b8feb`
+  `docs/user/advanced.rst`, Transport Adapters, and `src/requests/adapters.py` / `sessions.py`
+  (`BaseAdapter.send`, `Session.mount`, longest-prefix selection). Read from the pinned source cache.
+  The adapter's `fetch_trades` and `parse_trade` were read without changing them.
