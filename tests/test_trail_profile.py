@@ -365,9 +365,9 @@ def test_queries_never_reach_as_of_or_dev_holdout(tmp_path, alpaca_bars, monkeyp
         paths[id(instance)] = root
         return instance
 
-    def read(instance, identifiers, days, feed):
+    def read(instance, identifiers, days, feed, recent):
         seen.extend((paths[id(instance)], day, feed) for day in days)
-        return original_read(instance, identifiers, days, feed)
+        return original_read(instance, identifiers, days, feed, recent)
 
     monkeypatch.setattr(p, "ParquetDataCatalog", catalog)
     monkeypatch.setattr(p, "_read_bars", read)
@@ -676,6 +676,7 @@ def test_only_the_live_builder_reads_holdout_dates_and_its_header_says_so(tmp_pa
     assert doc["holdout"] == {
         "path": str(registered),
         "sha256": __import__("hashlib").sha256(registered.read_bytes()).hexdigest(),
+        "dates_sha256": __import__("hashlib").sha256(f"{AS_OF}\n".encode()).hexdigest(),
         "dates_read": [str(AS_OF)],
     }
     assert doc["sessions"]["recent"] == [str(DAY), str(AS_OF)]
@@ -707,3 +708,135 @@ def test_the_cli_needs_a_holdout_file_and_takes_live_file(tmp_path, alpaca_bars)
     registered = holdout_file(tmp_path, AS_OF)
     assert writer().main([*common, "--holdout-file", str(registered)]) == 1
     assert writer().main([*common, "--holdout-file", str(registered), "--live-file"]) == 0
+
+
+def test_the_header_carries_the_holdout_dates_hash_beside_the_whole_file_hash(
+    tmp_path, alpaca_bars
+):
+    import hashlib
+
+    p = writer()
+    path = build(tmp_path, alpaca_bars)
+    doc = p.read_profile(path, as_of=AS_OF)
+    dates_only = "".join(f"{day}\n" for day in [FAR]).encode()
+    assert doc["holdout"]["dates_sha256"] == hashlib.sha256(dates_only).hexdigest()
+
+
+def test_a_file_written_before_the_dates_hash_still_reads(tmp_path, alpaca_bars):
+    p = writer()
+    path = build(tmp_path, alpaca_bars)
+    doc = json.loads(path.read_text())
+    del doc["holdout"]["dates_sha256"]
+    path.write_text(json.dumps(doc))
+    assert "dates_sha256" not in p.read_profile(path, as_of=AS_OF)["holdout"]
+
+
+def test_no_query_spans_the_excluded_dates_between_dev_and_recent(
+    tmp_path, alpaca_bars, monkeypatch
+):
+    p = writer()
+    roots = catalogs(tmp_path, alpaca_bars)
+    monkeypatch.setattr(p, "RECENT_SESSIONS", 1)
+    original = p.ParquetDataCatalog
+    windows = []
+
+    class Recording:
+        def __init__(self, root):
+            self.catalog = original(root)
+
+        def __getattr__(self, name):
+            return getattr(self.catalog, name)
+
+        def query_bars(self, *args, **kwargs):
+            windows.append((kwargs["start"], kwargs["end"]))
+            return self.catalog.query_bars(*args, **kwargs)
+
+    monkeypatch.setattr(p, "ParquetDataCatalog", Recording)
+    recent, target = date(2026, 10, 27), date(2026, 10, 28)
+    p.build_profile(
+        sessions=[DAY, recent, target],  # long = DAY and 10-27; 10-16..10-26 are excluded from long
+        as_of=target,
+        holdout_file=holdout_file(tmp_path, FAR),
+        recent_root=roots["recent"],
+        long_root=roots["long"],
+        overnight_root=roots["overnight"],
+        baseline_dir=tmp_path / "out",
+    )
+    excluded = movers_rank.ny_ns(date(2026, 10, 20), time(0))
+    assert windows and not any(start <= excluded <= end for start, end in windows)
+
+
+def test_a_bar_outside_its_feeds_hours_on_an_allowed_session_is_refused(tmp_path, alpaca_bars):
+    p = writer()
+    roots = catalogs(tmp_path, alpaca_bars)
+    equity = alpaca_bars.equity()
+    # A sip bar at 21:00 on DAY falls in AS_OF's part, inside the read span, in boats hours.
+    ParquetDataCatalog(str(roots["recent"])).write_bars(
+        [minute(equity, DAY, time(21), 101, 99, 100)]
+    )
+    with pytest.raises(history_load.HistoryStopped, match="outside feed hours"):
+        p.build_profile(
+            sessions=[DAY, AS_OF, date(2026, 10, 19)],
+            as_of=date(2026, 10, 19),
+            holdout_file=holdout_file(tmp_path, FAR),
+            recent_root=roots["recent"],
+            long_root=roots["long"],
+            overnight_root=roots["overnight"],
+            baseline_dir=tmp_path / "out",
+        )
+
+
+@pytest.mark.parametrize("content", [None, "2026-13-01\n", "# only a comment\n"])
+def test_a_bad_holdout_file_is_refused_by_name(tmp_path, content):
+    p = writer()
+    path = tmp_path / "holdout.txt"
+    if content is not None:
+        path.write_text(content)
+    with pytest.raises(history_load.HistoryStopped, match="holdout file .*holdout.txt"):
+        p.build_profile(sessions=[DAY, AS_OF], as_of=AS_OF, holdout_file=path)
+
+
+@pytest.mark.parametrize("corruption", ["dates-read-not-dates", "sha256-not-hex", "path-not-text"])
+def test_the_reader_checks_the_holdout_fields_values(tmp_path, alpaca_bars, corruption):
+    p = writer()
+    path = build(tmp_path, alpaca_bars)
+    doc = json.loads(path.read_text())
+    if corruption == "dates-read-not-dates":
+        doc["live_file"] = True
+        doc["holdout"]["dates_read"] = [42]
+    elif corruption == "sha256-not-hex":
+        doc["holdout"]["sha256"] = None
+    else:
+        doc["holdout"]["path"] = 7
+    path.write_text(json.dumps(doc))
+    with pytest.raises(history_load.HistoryStopped, match="header/data refused: header holdout"):
+        p.read_profile(path, as_of=AS_OF)
+
+
+def test_a_live_file_never_reaches_a_replay_of_a_holdout_date(tmp_path, alpaca_bars):
+    p = writer()
+    roots = catalogs(tmp_path, alpaca_bars)
+    target = date(2026, 10, 19)
+    path = p.build_live_profile(
+        sessions=[DAY, AS_OF, target],
+        as_of=target,
+        holdout_file=holdout_file(tmp_path, AS_OF),
+        recent_root=roots["recent"],
+        long_root=roots["long"],
+        overnight_root=roots["overnight"],
+        baseline_dir=tmp_path / "out",
+    )
+    with pytest.raises(history_load.HistoryStopped, match="as_of 2026-10-19 is later"):
+        p.read_profile(path, as_of=AS_OF)  # replaying the holdout date itself
+
+
+def test_the_default_roots_are_relative_to_the_checkout() -> None:
+    """A default root under someone's home would publish that path and fail on every other machine."""
+    trail_profile = writer()
+    for root in (
+        trail_profile.DEFAULT_RECENT_ROOT,
+        trail_profile.DEFAULT_LONG_ROOT,
+        trail_profile.DEFAULT_OVERNIGHT_ROOT,
+    ):
+        assert not root.is_absolute(), root
+        assert root.parts[0] == "catalog", root

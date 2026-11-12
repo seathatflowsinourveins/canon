@@ -14,7 +14,8 @@ and the overnight root. Long means all supplied earlier dates, read from sip-his
 exception. Each root is read with one query per symbol batch, over the span from its first allowed
 session's start to its last's end; a bar is counted only in the allowed session whose part holds it, so a
 bar on a date not supplied is never counted. A span never crosses as_of. The registered holdout list
-(--holdout-file, its path and sha256 in the header) makes the default builder, the one any replay uses,
+(--holdout-file; its path, whole-file sha256 and dates-only sha256, the sorted ISO dates each ending
+in a newline, in the header) makes the default builder, the one any replay uses,
 refuse by name, before any query, a span that contains a holdout date: a span over a holdout is never
 issued. Only build_live_profile (CLI --live-file), for the live file that sizes stops on later trading
 days, may read holdout dates; its header records live_file true and the holdout dates it read
@@ -56,7 +57,6 @@ dev/recent bars must agree exactly; identical duplicates count once. A failed re
 from __future__ import annotations
 
 import argparse
-import bisect
 import hashlib
 import json
 import math
@@ -67,6 +67,7 @@ from contextlib import ExitStack
 from datetime import UTC
 from datetime import date
 from datetime import datetime
+from datetime import timedelta
 from pathlib import Path
 from statistics import quantiles
 from typing import Any
@@ -257,15 +258,32 @@ def _session_bounds(day: date, feed: str) -> tuple[int, int]:
 
 def read_holdout(path: Path) -> tuple[frozenset[date], str]:
     """The registered holdout dates, one ISO date a line ('#' comments allowed), and the file's sha256."""
-    raw = path.read_bytes()
-    dates = frozenset(
-        date.fromisoformat(line.strip())
-        for line in raw.decode("utf-8").splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
-    )
+    try:
+        raw = path.read_bytes()
+        dates = frozenset(
+            date.fromisoformat(line.strip())
+            for line in raw.decode("utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        )
+    except (OSError, ValueError) as exc:
+        raise history_load.HistoryStopped(f"holdout file {path} unreadable: {exc}") from exc
     if not dates:
         raise history_load.HistoryStopped(f"holdout file {path} lists no date")
     return dates, hashlib.sha256(raw).hexdigest()
+
+
+def _runs(days: Sequence[date], recent: Sequence[date]) -> list[tuple[date, ...]]:
+    """`days` (sorted) cut into those before the recent window and the window itself: a run never spans
+    the dates between dev's end and a later recent window, which select_sessions excludes from long."""
+    window = set(recent)
+    return [
+        run
+        for run in (
+            tuple(d for d in days if d not in window),
+            tuple(d for d in days if d in window),
+        )
+        if run
+    ]
 
 
 def _read_bars(
@@ -273,21 +291,30 @@ def _read_bars(
     identifiers: Sequence[str],
     days: Sequence[date],
     feed: str,
+    recent: Sequence[date],
 ) -> list[tuple[date, Bar]]:
-    """One query over the span of `days` (sorted), each bar paired with the allowed session whose feed
-    hours hold it; a bar in no allowed session, such as one on a date not supplied, is dropped."""
-    bounds = [_session_bounds(day, feed) for day in days]
-    starts = [lo for lo, _ in bounds]
+    """One query per run of `days` (sorted) over its span, each bar paired with the session whose part
+    (20:00 to 20:00 New York) holds its open. A bar in an allowed session outside the feed's hours is
+    refused; a bar in a session not allowed, such as a date not supplied, is dropped."""
+    allowed = set(days)
     held = []
-    for bar in catalog.query_bars(
-        identifiers=identifiers,
-        start=bounds[0][0] + movers_baseline.MINUTE_NS,
-        end=bounds[-1][1],
-    ):
-        start, end = movers_rank.bar_bounds_ns(bar)
-        index = bisect.bisect_right(starts, start) - 1
-        if index >= 0 and end <= bounds[index][1]:
-            held.append((days[index], bar))
+    for run in _runs(days, recent):
+        for bar in catalog.query_bars(
+            identifiers=identifiers,
+            start=_session_bounds(run[0], feed)[0] + movers_baseline.MINUTE_NS,
+            end=_session_bounds(run[-1], feed)[1],
+        ):
+            start, end = movers_rank.bar_bounds_ns(bar)
+            opened = movers_rank.ny_time(start)
+            day = opened.date() + timedelta(days=opened.time() >= movers_rank.PART_START)
+            if day not in allowed:
+                continue
+            lo, hi = _session_bounds(day, feed)
+            if not lo <= start < end <= hi:
+                raise history_load.HistoryStopped(
+                    f"{feed} bar {bar.bar_type} opened {opened.isoformat()}: bar outside feed hours"
+                )
+            held.append((day, bar))
     return held
 
 
@@ -367,8 +394,9 @@ def _build(
         {
             day
             for selected in spans.values()
+            for run in _runs(selected, days["recent"])
             for day in holdout
-            if selected and selected[0] <= day <= selected[-1]
+            if run[0] <= day <= run[-1]
         }
     )
     if holdout_read and not live_file:
@@ -439,7 +467,9 @@ def _build(
                     if not identifiers or not selected:
                         continue
                     operation = f"reading {feed} sessions {selected[0]}..{selected[-1]} in {root}"
-                    for day, bar in _read_bars(catalog, identifiers, selected, feed):
+                    for day, bar in _read_bars(
+                        catalog, identifiers, selected, feed, days["recent"]
+                    ):
                         identifier = str(bar.bar_type.instrument_id)
                         start, _ = movers_rank.bar_bounds_ns(bar)
                         for name, selected_days in days.items():
@@ -485,6 +515,9 @@ def _build(
                 "holdout": {
                     "path": str(holdout_file),
                     "sha256": holdout_sha256,
+                    "dates_sha256": hashlib.sha256(
+                        "".join(f"{day.isoformat()}\n" for day in sorted(holdout)).encode()
+                    ).hexdigest(),
                     "dates_read": [day.isoformat() for day in holdout_read],
                 },
                 "price_basis": "previous close",
@@ -547,8 +580,18 @@ def read_profile(path: Path, *, as_of: date) -> dict[str, Any]:
         holdout = document["holdout"]
         if (
             not isinstance(holdout, dict)
-            or set(holdout) != {"path", "sha256", "dates_read"}
+            # dates_sha256 is optional: the 2026-11-12 09:30 file was written before it existed.
+            or not {"path", "sha256", "dates_read"} <= set(holdout)
+            or not set(holdout) <= {"path", "sha256", "dates_sha256", "dates_read"}
+            or not isinstance(holdout["path"], str)
+            or any(
+                not isinstance(holdout.get(key, "0" * 64), str)
+                or len(holdout.get(key, "0" * 64)) != 64
+                or any(c not in "0123456789abcdef" for c in holdout.get(key, "0" * 64))
+                for key in ("sha256", "dates_sha256")
+            )
             or not isinstance(holdout["dates_read"], list)
+            or not all(isinstance(day, str) for day in holdout["dates_read"])
             or (holdout["dates_read"] and not document["live_file"])
         ):
             raise ValueError("header holdout must name its file, sha256 and the dates read")
