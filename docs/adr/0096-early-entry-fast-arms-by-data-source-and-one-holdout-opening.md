@@ -180,3 +180,39 @@ Read 2026-11-11. The thresholds, masks, names and pairings are this record's cho
 * evidence-verifier on this record, 2026-11-11: the claims held but two; it found the `u` field's
   source, the `vwap` subset, the holdout rule's reading, the gap rule's reach into the print arms, the
   mask's other codes and two unstated departures from ADR 0092. Corrected above.
+
+## Amendment, 2026-11-12: the opening is a freeze at 09:30 and one read later
+
+The lead's decision at about 05:45 New York, before any holdout outcome is read. This record said the holdout
+opens once, at 09:30 New York on 2026-11-12 at the latest. At about 05:40 the study command's inputs were
+found not to exist: no name-day list of the population (`early_entry_study --days-file` takes
+`YYYY-MM-DD,SYMBOL` lines and their registered SHA-256, and splits that one list 70/30 itself), no registered
+hash for one, and no catalog root holding both windows (the development sessions are in one root and the
+holdout's in another, and the command reads one `--catalog`). So the opening is two steps.
+
+* **The freeze, on `main` before 09:30.** Its time of record is the merge time GitHub sets on its pull
+  request (`mergedAt`), not a local commit time; if that comes out after 09:30, the freeze says so and the
+  opening is late, and either way nothing registered after the freeze's content is admitted. It fixes
+  `main`'s commit; the SHA-256 of this record as committed there, with its amendments, and of the draft of
+  any amendment to it not yet on `main`, each named in the freeze; the holdout's 18 dates in
+  `canon/holdout-adr0096.txt` and their SHA-256, derived from ADR 0092's rule (the 60 regular sessions
+  before 2026-11-11, 2026-08-18 to 2026-11-10, split in order 42 and 18); every admitted arm with the commit
+  that registered it, with ADR 0100's `F-all` and the seven bar factor arms as registered arms with replay
+  pending at `0e8542fe29d823d5096563959b7f9d3234bf870e`; every registered arm left out, with its reason;
+  and the statement that no process has read an outcome on a holdout date, with what has read holdout bars
+  and why. Nothing registered after the freeze's commit is admitted to this opening.
+* **The read, later and exactly once,** when the population's `YYYY-MM-DD,SYMBOL` list exists for all 60
+  sessions by ADR 0092's rule (its SHA-256 then recorded in a second entry that names the freeze) and one
+  catalog access covers both windows. The read checks the freeze's hashes first and refuses on any
+  mismatch. The study splits on the dates its list holds, so 42 and 18 hold only if every one of the 60
+  sessions carries at least one name: the read refuses, by date, a session with none. Until then the
+  development replays read no holdout date, guarded by the tracked day list and a test, whichever root
+  they read.
+
+Where this record says an arm joins if "its inputs cover the training dates at that moment", the moment
+is the freeze: an arm not ready then, such as the bar-derived rows, waits for the later holdout. Where
+this record's Confirmation and ADR 0100 say "before the holdout opens" or "before it opens", that now
+means before the freeze.
+
+Nothing was read: no holdout outcome had been computed or seen when this was decided. The development
+population build, still running, is an input to the read, not to the freeze.
