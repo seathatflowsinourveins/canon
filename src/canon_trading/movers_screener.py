@@ -17,7 +17,8 @@ window or a streaming run is never kept waiting by it.
 Bounds: one poll a minute (three GETs to the market data API), at most `MAX_MINUTES` polls a run, so a run
 ends inside the task's deadline; a person or a schedule starts the next. Each poll is one JSON line in the log
 folder `mise run paper:data` passes, outside the repository. A failed read is logged and counted, the run goes
-on, and the run exits 1 if any read failed; a refused method ends it at once.
+on, and the run exits 1 if any read failed; a refused method ends it at once. The filename includes
+`os.getpid()` (CPython's process-ID contract), so simultaneous scheduled and manual runs keep separate logs.
 
 UNVERIFIED (Alpaca's pages do not say, so a run's lines are the measurement): how often the screener updates,
 whether pre-market and after-hours trades move it, and what it shows before the open.
@@ -143,7 +144,8 @@ def poll(client: Screener) -> tuple[dict[str, object], int]:
 
 
 def log_path(log_dir: Path, now: datetime) -> Path:
-    return log_dir / f"{LOG_PREFIX}-{now.strftime('%Y%m%dT%H%M%SZ')}.jsonl"
+    stamp = now.strftime("%Y%m%dT%H%M%SZ")
+    return log_dir / f"{LOG_PREFIX}-{stamp}-{os.getpid()}.jsonl"
 
 
 def run(

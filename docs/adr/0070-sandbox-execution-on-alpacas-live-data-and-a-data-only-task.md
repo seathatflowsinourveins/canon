@@ -104,6 +104,106 @@ without the stream lock (`tests/test_movers_*.py`, `scripts/test-lanes`, offline
 no upstream, so its arithmetic is in the module header, and its parameters are UNCALIBRATED. Whether one
 `sip` connection carries `*` for bars and trades, and at what rate, is UNVERIFIED until a run measures it.
 
+**Addition, 2026-11-11: the scheduled movers recorder.** On the owner's weekday-window instruction,
+`scripts/automation install` adds `local.canon.movers-recorder`, reported by `status`, compared by `differs`
+and removed by `uninstall`. It runs the existing `paper:data movers-screener` choice, not another module.
+Launchd's `StartInterval` is 60 seconds, not at load; while a loop runs it misses those firings
+(`launchd.plist(5)`). The wrapper gates every firing with `TZ=America/New_York date`, independent of the
+machine's zone, and runs back-to-back batches on weekdays from 04:00 inclusive to 20:00 exclusive.
+Each batch is at most 80 polls, as the by-hand loop used, below the module's 85-poll bound; the last batch
+is shortened to fit the time remaining after startup and HTTP headroom, and `timeout(1)` plus mise's
+`run --timeout` bound the whole invocation by the close. The hand loop's extra five minutes after 20:00
+are not part of this window. Weekday holidays and early-close afternoons follow the same policy: no
+market calendar is consulted. The weekday-holiday test uses
+2026-11-26 (Thursday); the screener's actual holiday responses remain UNVERIFIED.
+
+The installed copy of `scripts/automation` runs its `record-movers` command and installs a private
+`movers-checkout.sh` copy of the existing `paper-session.sh --checkout-only` contract, independently of
+the paper agent's installer or deferral, for its own `~/.claude/canon/movers-checkout` clone of
+origin's `main`, refreshed before each batch. Its recorder-only `--recorder-checkout` mode reuses a matching
+marked clone, following actions/checkout's existing-directory contract; the paper job and installer keep
+the fresh `--checkout-only` contract. It takes no account or stream lock: the screener reads REST
+only. Logs remain in the per-user temporary folder outside the clone; its status record under
+`~/.claude/canon/watch/` names the commit, outcome and exit code. **Review amendment, 2026-11-11:** the
+Claude lane's medium-effort review of c10 (`37b986e`) found that a transient failure latched the whole
+New York day, contrary to the owner's automatic recovery requirement after sleep and network loss.
+The lead replaced that latch: a failed batch or setup ends the current firing by name; the next firing
+starts fresh on the same date. `RECORDER_FAILURE_BOUND=3` is UNCALIBRATED: the consecutive failed-firing
+counter saturates at three and writes `consecutive_failed_firings_bound (UNCALIBRATED)` in the status
+row, without suppressing another attempt. A firing clears that count only after completing at least
+one batch successfully and ending without a failure. A zero-batch close gap or outside-window firing
+keeps the prior failed status and count, without preventing the next eligible firing from trying.
+
+On the coordinator's clarification of the same review, a failed per-batch fetch is the exception:
+if a marked clone matching the origin has a last good commit in `refs/remotes/origin/main`, restore
+and clean that checkout, retain `.venv` (removing a symlink without touching its target), run its batch
+and record `fetch_failed, ran at <short sha>`. A local HEAD commit is not the cached main commit.
+Without such a commit,
+end the firing with `checkout_failed`. Both checkout-lock acquisitions wait up to
+`RECORDER_LOCK_SECS=60` each (UNCALIBRATED), trying between one-second sleeps for a leftover uv to exit;
+`checkout_lock_timeout` ends the firing when the bound expires. A held recorder/installer lock records
+`recorder_lock_held` and also ends only that firing; outside the window the firing ends idle instead,
+since there is nothing to record and maintenance's `mise self-update` holds that lock by design. A failure reading New York time still writes
+`time_failed` with a fresh epoch from jq's `now`, marking the time source and preserving the last known
+New York day, or `unknown` if none was read. Uninstall preserves the recorded data and status history.
+Each batch starts with fresh commit and fetch metadata; a prepared checkout is not recorded as code
+that ran until the batch is starting. Before that, a failed fetch is named `fetch_failed, checkout at`.
+The landing lane's medium review of round two (2026-11-11) left as limits: a full 80-poll batch's
+budget (6,058 s) exceeds `paper:data`'s own `deadline=5940`, so a batch slowed that far ends by the
+task's bound as `batch_failed`; a signal during the checkout helper leaves the record `running`; a
+deferred recorder install reruns the whole install each maintenance round until the loop ends; firings
+outside the window still rewrite the status every minute.
+
+Installation and the loop share the recorder's exclusive lock (`lockf(1)`), held for the entire loop,
+including the gaps between batches. A running loop defers replacement of its runner and plist, the
+preflight included, to a later maintenance round (ADR 0065); installation holds the same lock through
+preflight and reload, so a firing during installation records its named lock failure and can retry.
+`scripts/automation recorder-lock-path` supplies that lock's path to maintenance, instead of a second
+hard-coded path. The recorder owns its private installed `movers-checkout.sh`; it does not depend on
+the paper job's installed `paper-session.sh`, which uninstall removes when the paper job is stopped,
+even if the recorder refuses to unload.
+Within a firing, only the wrapper holds the recorder's loop lock; checkout helpers and batch children close its
+descriptor 9. Batch descendants inherit the separate checkout lock, so a leftover uv causes the next
+firing to wait for that lock within its named bound. TERM, HUP or INT to the wrapper forwards TERM to
+the batch's timeout and waits for it before exiting with a named `firing_interrupted` status. The local
+timeout contract forwards that signal to its group, and pinned mise forwards it to its task groups;
+`paper:data`'s existing trap kills its uv group. This also stops a batch on uninstall instead of leaving
+it detached from the unloaded job.
+Maintenance records this explicit deferral as unfinished work and retries at its next round instead of
+caching it as a completed install for a day. This can defer a recorder update until the current loop
+ends, normally at 20:00 or at its first failed batch; other automation still installs. A stale record
+keeps the STALE label when the installed runner is also outdated, using the paper row's severity order.
+
+The strict close is retained on the deputy's reversible decision of 2026-11-11, reported to the lead.
+The final batch reserves 300 seconds for mise's start (the keychain reads included), the task's 600-second
+environment sync, the module's 30-second startup allowance and 388 seconds for its final three REST reads
+(three times 129.2 seconds at the adapter's timeouts and retries, rounded up). It also leaves 60 seconds
+for launch and cleanup. Polls start immediately then wait one minute each; only the polls fitting that
+budget run, capped at 80. Mise's global timeout receives the run budget plus 5 seconds; its documented
+command-tree termination has a 5-second grace. The outer timeout sends TERM at the budget plus 30 seconds
+and KILL 5 seconds later, before 20:00. No fitting poll, or the end of a shortened final batch, records
+a named `recording gap` with its start and 20:00 end in New York time, in the runner's log and status.
+This conservative reservation can leave the last part of the data window uncaptured; it adds no grace
+after the close. The caller is bounded even when a read exceeds its per-address or between-byte timeout.
+
+Installer preflight runs only after the idle job is unloaded; a refused unload leaves the runner, helper,
+plist and clone untouched. An invalid or unavailable origin removes the stopped job's old plist.
+Status reads the directory named in that plist and ignores launchd's nonnumeric `(never exited)` marker.
+Every setup failure is recorded with a fresh timestamp and ends that firing. The mise ceiling is
+the physical checkout parent and rejects list separators. Uninstall reports a failed mise untrust while
+still removing its stopped clone, and names the preserved `canon-paper-data` directory. Mise's own pin
+update shares the recorder lock and waits for its loop to end. Screener filenames include the process ID
+(`os.getpid()`), keeping concurrent scheduled and manual runs in distinct files even in the same second.
+
+Verified offline in `scripts/test-maintenance`: a simulated bootout during a batch loses its failure
+before the lock fix; afterward installation leaves the wrapper alive to record the failure and end
+the firing. Antigravity's round-2 review (2026-11-11, `xr-agy-c10-r2/REPORT.md`) found zero-batch status
+clearing, detached batches on stop, inherited loop locks, stale or premature run metadata, cached HEAD
+provenance and a missing setup-failure record; all six have failing-before offline regressions.
+The reverse preflight race, maintenance retries, weekday holiday, status order and document
+listing have failing-before cases. Actual launchd scheduling, a real paper-data run and real installation
+remain UNVERIFIED; the coordinator reproduces and reviews, and maintenance installs from `main`.
+
 The next step after the transport refusal, not built now: instruments read from the catalog would keep the
 process off the trading host altogether, an adapter change.
 

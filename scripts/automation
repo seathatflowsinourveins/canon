@@ -8,6 +8,8 @@
 #   paper session          10 min after each firing, awake   launchd user agent running one window, if Alpaca's
 #                                                            clock says a session is open and main's
 #                                                            canon/paper-schedule says to (ADR 0050)
+#   movers recorder        weekdays 04:00-20:00 New York     launchd user agent: back-to-back data-only
+#                                                            movers-screener runs, at most 80 polls each
 #   OTLP collector         always, Mac awake                 launchd user agent running the pinned otelcol on
 #                                                            127.0.0.1, writing ~/.claude/canon/otel/logs.jsonl
 #                                                            for scripts/lanes --rates (ADR 0007)
@@ -27,9 +29,9 @@
 # agent loaded as it is: the maintenance agent's round while a window runs from them, which defers that part
 # to the session boundary (home/.claude/canon/maintenance.sh, ADR 0065).
 # `install` uses no sudo and touches: this clone's git config, ~/.claude/canon/ (the paper session's
-# runner and its clone of origin's main, ~/.claude/canon/paper-checkout, the maintenance agent's script and the
-# collector's config, ~/.claude/canon/otel/config.yaml, included), and five files in ~/Library/LaunchAgents/,
-# six once OmniRoute is installed. It reloads the maintenance and gateway agents only when a plist changed or
+# runner and its clone of origin's main, ~/.claude/canon/paper-checkout, the recorder's runner and main clone,
+# ~/.claude/canon/movers-checkout, the maintenance script and the collector's config included), and six files
+# in ~/Library/LaunchAgents/, seven once OmniRoute is installed. It reloads the maintenance and gateway agents only when a plist changed or
 # the job is not loaded, so a reinstall the maintenance agent starts does not stop that agent's own job (a new
 # script reaches its next round, which runs the file anew), and the gateway is not restarted for nothing.
 # `differs` changes nothing: it prints one line per thing an installer manages that differs from this tree,
@@ -110,6 +112,21 @@ MAINT_BOUNDARY=32400
 UC_MARK="$CANON_HOME/watch/user-config.applied"        # the sources' checksum at the last --user-config it ran
 GW_LABEL="local.canon.omniroute"
 GW_PLIST="$AGENTS_DIR/$GW_LABEL.plist"
+RECORDER_LABEL="local.canon.movers-recorder"
+RECORDER_PLIST="$AGENTS_DIR/$RECORDER_LABEL.plist"
+RECORDER_RUNNER="$CANON_HOME/movers-recorder.sh"
+RECORDER_HELPER="$CANON_HOME/movers-checkout.sh"
+RECORDER_CHECKOUT="$CANON_HOME/movers-checkout"
+recorder_lock_path() { printf '%s.recorder.lock\n' "${1:-$RECORDER_CHECKOUT}"; }
+RECORDER_STATUS="$CANON_HOME/watch/movers-recorder.json"
+RECORDER_INTERVAL=60
+RECORDER_FAILURE_BOUND=3                             # UNCALIBRATED; alert/count bound, never a retry latch
+RECORDER_LOCK_SECS=${CANON_RECORDER_LOCK_SECS:-60}     # UNCALIBRATED; wait for leftover uv's checkout lock
+# paper-session.sh's 300 s mise start (the two keychain reads included), paper:data's 600 s sync,
+# session_window.START_UP_SECS (30), and the last poll's 3 x ADAPTER_CALL_SECS (129.2), rounded up.
+RECORDER_HEADROOM=$((300 + 600 + 30 + 388))
+RECORDER_STOP_ROOM=60                                # staggered cleanup bounds plus launching the command
+RECORDER_SILENT=6600                                  # longest outer bound (6093), fetch (120), interval and margin
 STUDY_LABEL="local.canon.nightly-study"
 STUDY_PLIST="$AGENTS_DIR/$STUDY_LABEL.plist"
 STUDY_INTERVAL=1800                                   # every 30 minutes; a firing with no new night does nothing
@@ -341,6 +358,316 @@ write_paper_plist() {
 </dict>
 </plist>
 EOF
+}
+
+# launchd.plist(5) StartInterval misses firings while a job runs. A short interval lets the wrapper gate
+# every start in America/New_York (including DST), independently of the machine's calendar time zone.
+# The wrapper is this script's record-movers command. Its private copy of paper-session.sh's documented
+# --checkout-only mode supplies its own origin/main clone, independently of a deferred paper install.
+# No new paper:data choice is needed: ADR 0070's
+# movers-screener is the existing REST-only recorder (ADR 0070, scheduled-recorder addition of 2026-11-11).
+# The checksum makes a runner change reload its job once the running loop has let its lock go.
+write_recorder_plist() {
+  cat > "${3:-$RECORDER_PLIST}" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$RECORDER_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>$(xml "$RECORDER_RUNNER")</string>
+    <string>record-movers</string>
+    <string>$(xml "$1")</string>
+    <string>$(xml "$RECORDER_CHECKOUT")</string>
+    <string>$(xml "$2")</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CLAUDE_CONFIG_DIR</key><string>$(xml "$CLAUDE_HOME")</string>
+    <key>CANON_RECORDER_CODE</key><string>$(cksum < "$ROOT/scripts/automation" | awk '{ print $1 "-" $2 }')</string>
+  </dict>
+  <key>WorkingDirectory</key><string>$(xml "$CANON_HOME")</string>
+  <key>StartInterval</key><integer>$RECORDER_INTERVAL</integer>
+  <key>RunAtLoad</key><false/>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>$(xml "$CANON_HOME/watch/movers-recorder.log")</string>
+  <key>StandardErrorPath</key><string>$(xml "$CANON_HOME/watch/movers-recorder.log")</string>
+</dict>
+</plist>
+EOF
+}
+
+install_recorder() {
+  local rc=0
+  # The loop holds this lock before touching its clone, including the gaps between batches. Install
+  # holds it through preflight and reload, so neither side can strand a batch during replacement.
+  exec 6>>"$(recorder_lock_path)" || { note "  FAILED: could not open the recorder install lock"; return 1; }
+  "$LOCKF" -t 0 6 2>/dev/null || rc=$?
+  case "$rc" in
+    0) install_recorder_files; rc=$? ;;
+    75) note "  deferred   movers recorder: a recorder is running; retry at a later maintenance round"; rc=0 ;;
+    *) note "  FAILED: could not take the recorder install lock (exit $rc)"; rc=1 ;;
+  esac
+  exec 6>&-
+  return "$rc"
+}
+
+# Called only with the recorder's loop lock held; note() stays in the installer shell so failures are
+# repeated after its table as for the other jobs. Closing descriptor 6 above releases it on every path.
+install_recorder_files() {
+  local m url t out
+  m=$(find_mise 2>&1) || { note "  FAILED: $m"; return 1; }
+  url=$(git -C "$ROOT" remote get-url origin 2>/dev/null) && [ -n "$url" ] \
+    || { reject_recorder_origin "no origin remote for the movers recorder"; return 1; }
+  # paper-session.sh's origin contract, checked before even a temporary plist can hold a URL with user
+  # information, a query or a fragment. The helper still checks and fetches the actual origin below.
+  case "$url" in https://*|/*) ;; *) reject_recorder_origin "the recorder origin must be https"; return 1 ;; esac
+  if [[ "$url" =~ ^https://[^/?#]*@ ]]; then reject_recorder_origin "the recorder origin carries credentials"; return 1; fi
+  case "$url" in *[?#]*) reject_recorder_origin "the recorder origin has a query or fragment"; return 1 ;; esac
+  t=$(mktemp "$AGENTS_DIR/.$RECORDER_LABEL.XXXXXX") || { note "  FAILED: could not write $RECORDER_PLIST"; return 1; }
+  if ! write_recorder_plist "$m" "$url" "$t" || ! plutil -lint "$t" >/dev/null; then
+    rm -f "$t"; note "  FAILED: could not write $RECORDER_PLIST"; return 1
+  fi
+  if cmp -s "$ROOT/scripts/automation" "$RECORDER_RUNNER" \
+     && cmp -s "$ROOT/home/.claude/canon/paper-session.sh" "$RECORDER_HELPER" && cmp -s "$t" "$RECORDER_PLIST"; then
+    if [ "${AUTOMATION_SKIP_LAUNCHD:-0}" = 1 ] || loaded "$RECORDER_LABEL"; then
+      rm -f "$t"; note "  kept       $RECORDER_LABEL loaded: its runner, helper and plist are unchanged"; return 0
+    fi
+  fi
+  # Unload before replacing anything the job runs, or refreshing its clone. A refusal leaves all three
+  # installed files and the checkout as they were. The loop lock excludes a firing throughout this step.
+  stop_recorder || { rm -f "$t"; return 1; }
+  /usr/bin/install -m 755 "$ROOT/home/.claude/canon/paper-session.sh" "$RECORDER_HELPER" \
+    || { rm -f "$t"; note "  FAILED: could not install $RECORDER_HELPER"; return 1; }
+  if ! out=$(/bin/bash "$RECORDER_HELPER" --checkout-only "$m" "$RECORDER_CHECKOUT" "$url" 2>&1); then
+    rm -f "$t" "$RECORDER_PLIST"
+    note "  FAILED: ${out//$'\n'/; } (recorder not loaded; its plist removed)"; return 1
+  fi
+  /usr/bin/install -m 755 "$ROOT/scripts/automation" "$RECORDER_RUNNER" \
+    || { rm -f "$t"; note "  FAILED: could not install $RECORDER_RUNNER"; return 1; }
+  mv -f "$t" "$RECORDER_PLIST" || { rm -f "$t"; note "  FAILED: could not write $RECORDER_PLIST"; return 1; }
+  note "  wrote      $RECORDER_PLIST"
+  if [ "${AUTOMATION_SKIP_LAUNCHD:-0}" = 1 ]; then note "  not loaded (AUTOMATION_SKIP_LAUNCHD=1)"; return 0; fi
+  boot "$RECORDER_LABEL" "$RECORDER_PLIST" "(weekdays 04:00-20:00 America/New_York; first check in $RECORDER_INTERVAL s)"
+}
+
+stop_recorder() {
+  local rc=0
+  [ "${AUTOMATION_SKIP_LAUNCHD:-0}" != 1 ] || return 0
+  unload "$RECORDER_LABEL" || rc=$?
+  [ "$rc" = 0 ] || { unload_note "$RECORDER_LABEL" "$rc"; return 1; }
+}
+
+reject_recorder_origin() {
+  stop_recorder || return 1
+  rm -f "$RECORDER_PLIST" || { note "  FAILED: could not remove $RECORDER_PLIST"; return 1; }
+  note "  FAILED: $1 (recorder not loaded; its plist removed)"
+  return 1
+}
+
+# record-movers <mise> <checkout> <origin>: the former hand-run screener loop, bounded by New York's
+# weekday window. Contracts: date(1) TZ and +formats; lockf(1) descriptor locks; paper-session.sh's
+# --recorder-checkout; mise v2026.11.6 run --timeout (docs/cli/run.md), task.run_auto_install and ceiling_paths;
+# timeout(1) -k and signal forwarding; mise.toml's bounded() trap/wait cleanup contract. The task retains
+# all credential access and ADR 0070's GET-only guard; this wrapper reads
+# no credential. A failure ends this firing; the next firing starts fresh. A failed fetch alone can use
+# the last good main commit, named in status. CANON_RECORDER_DATE replaces date for offline tests,
+# and CANON_LOCKF replaces lockf as above.
+do_record_movers() {
+  [ "$#" = 3 ] || { echo "usage: automation record-movers <mise> <checkout> <origin>" >&2; return 2; }
+  local m=$1 dir=$2 url=$3 date_bin=${CANON_RECORDER_DATE:-/bin/date}
+  local epoch=0 weekday day="unknown" hour minute second stamp left polls rc commit="none: nothing ran" t ceiling close_epoch run_budget gap_start
+  local failed_firings=0 fetch_note="" out wait_end prepared_commit="" completed_batches=0 prior_failure="" batch_pid=""
+  export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+  recorder_time() {
+    local next_epoch next_weekday next_day next_hour next_minute next_second
+    stamp=$(TZ=America/New_York "$date_bin" '+%s %u %Y-%m-%d %H %M %S') || return 1
+    read -r next_epoch next_weekday next_day next_hour next_minute next_second <<< "$stamp"
+    [[ "$next_epoch" =~ ^[0-9]+$ && "$next_weekday" =~ ^[1-7]$ && "$next_hour" =~ ^[0-2][0-9]$ \
+       && "$next_minute" =~ ^[0-5][0-9]$ && "$next_second" =~ ^[0-5][0-9]$ ]] || return 1
+    epoch=$next_epoch; weekday=$next_weekday; day=$next_day
+    hour=$((10#$next_hour)); minute=$((10#$next_minute)); second=$((10#$next_second))
+  }
+  recorder_store() {
+    mkdir -p "${RECORDER_STATUS%/*}" && t=$(mktemp "$RECORDER_STATUS.XXXXXX") || return 1
+    if printf '%s\n' "$1" > "$t" && mv -f "$t" "$RECORDER_STATUS"; then return 0; fi
+    rm -f "$t"; return 1
+  }
+  recorder_write() {
+    local message=$3
+    local record
+    [ -z "$fetch_note" ] || message="$message; $fetch_note"
+    if [ "$failed_firings" -ge "$RECORDER_FAILURE_BOUND" ]; then
+      message="consecutive_failed_firings_bound (UNCALIBRATED): at least $RECORDER_FAILURE_BOUND; $message"
+    fi
+    record=$(jq -n --argjson e "$epoch" --arg d "$day" --arg o "$1" --argjson r "$2" --arg n "$message" --arg c "$commit" \
+         --argjson f "$failed_firings" --argjson b "$RECORDER_FAILURE_BOUND" \
+         '{at_epoch: $e, day: $d, outcome: $o, exit_code: $r, note: $n, commit: $c,
+           consecutive_failed_firings: $f, failure_bound: $b}') || return 1
+    recorder_store "$record"
+  }
+  recorder_fail() {
+    local message="$2; firing ended; next firing retries"
+    echo "movers-recorder: $message" >&2
+    if ! recorder_time; then
+      # jq's documented now gives a fresh epoch even when date cannot supply New York fields.
+      epoch=$(jq -nr 'now | floor') || return 1
+      message="time_failed: New York time unavailable; timestamp from jq now; $message"
+    fi
+    [ "$failed_firings" -ge "$RECORDER_FAILURE_BOUND" ] || failed_firings=$((failed_firings + 1))
+    recorder_write failed "$1" "$message" || return 1
+    return "$1"
+  }
+  recorder_finish() {
+    if [ "$completed_batches" = 0 ] && [ -n "$prior_failure" ]; then
+      echo "movers-recorder: no batch completed; previous failed status retained"
+      recorder_store "$prior_failure"
+    else
+      failed_firings=0
+      recorder_write "$1" 0 "$2"
+    fi
+  }
+  recorder_stop() {
+    # timeout(1) forwards TERM to its command group; pinned mise forwards it to its task groups,
+    # whose paper:data bounded() trap kills uv. Keep the wrapper/clone lock until wait completes.
+    trap '' TERM HUP INT
+    if [ -n "$batch_pid" ]; then
+      kill -TERM "$batch_pid" 2>/dev/null || :
+      wait "$batch_pid" 2>/dev/null || :
+    fi
+    exec 8>&-
+    recorder_fail "$1" "firing_interrupted: received $2; batch stopped"
+    exit "$1"
+  }
+  # This is a weekday data-collection policy: market holidays and early-close afternoons still poll.
+  recorder_open() { [ "$weekday" -lt 6 ] && [ "$hour" -ge 4 ] && [ "$hour" -lt 20 ]; }
+  recorder_budget() {
+    close_epoch=$(TZ=America/New_York "$date_bin" -j -f '%Y-%m-%d %H:%M:%S' "$day 20:00:00" +%s) || return 1
+    [[ "$close_epoch" =~ ^[0-9]+$ ]] || return 1
+    left=$((close_epoch - epoch)); polls=0
+    if [ "$left" -ge $((RECORDER_HEADROOM + RECORDER_STOP_ROOM)) ]; then
+      polls=$(((left - RECORDER_HEADROOM - RECORDER_STOP_ROOM) / 60 + 1))
+      [ "$polls" -le 80 ] || polls=80
+    fi
+  }
+  recorder_gap() {
+    printf -v gap_start '%s %02d:%02d:%02d America/New_York' "$day" "$hour" "$minute" "$second"
+    stamp="recording gap: from $gap_start to $day 20:00:00 America/New_York; startup, HTTP and cleanup headroom reserved"
+    echo "movers-recorder: $stamp"
+    recorder_finish ok "$stamp"
+  }
+  if [ -f "$RECORDER_STATUS" ]; then
+    failed_firings=$(jq -er --argjson b "$RECORDER_FAILURE_BOUND" '(.consecutive_failed_firings // 0)
+      | if type == "number" and . >= 0 and floor == . then [., $b] | min else 0 end' "$RECORDER_STATUS") \
+      || { failed_firings=0; recorder_fail 1 "status_unreadable: previous recorder status"; return $?; }
+    prior_failure=$(jq -ce 'select(.outcome == "failed")' "$RECORDER_STATUS") || prior_failure=""
+  fi
+  recorder_time || { recorder_fail 1 "time_failed: could not read New York time; nothing was run"; return $?; }
+  case "$dir" in /*) ;; *) recorder_fail 1 "the checkout must be absolute"; return $? ;; esac
+  mkdir -p "$(dirname "$dir")" || { recorder_fail 1 "checkout_parent_failed: could not create the checkout parent"; return $?; }
+  exec 9>>"$(recorder_lock_path "$dir")" || { recorder_fail 1 "recorder_lock_failed: could not open the recorder lock"; return $?; }
+  rc=0; "$LOCKF" -t 0 9 2>/dev/null || rc=$?
+  # Outside the window there is nothing to record, so a lock held then (maintenance's mise self-update, an
+  # install) ends the firing idle rather than counting a failure.
+  if [ "$rc" = 75 ] && ! recorder_open; then
+    recorder_finish idle "outside weekdays 04:00-20:00 America/New_York (the recorder lock was held)"; return $?
+  fi
+  case "$rc" in
+    0) ;;
+    75) recorder_fail 1 "recorder_lock_held: another recorder or installer holds the checkout; nothing was run"; return $? ;;
+    *) recorder_fail 1 "could not take the recorder lock (exit $rc); nothing was run"; return $? ;;
+  esac
+  if ! recorder_open; then recorder_finish idle "outside weekdays 04:00-20:00 America/New_York"; return $?; fi
+  ceiling=$(cd "$(dirname "$dir")" && pwd -P) || { recorder_fail 1 "could not resolve the checkout parent"; return $?; }
+  case "$ceiling" in *:*|*,*) recorder_fail 1 "the checkout parent holds a mise ceiling list separator"; return $? ;; esac
+  while recorder_open; do
+    fetch_note=""; commit="none: nothing ran"; prepared_commit=""
+    recorder_budget || { recorder_fail 1 "could not compute the New York close"; return $?; }
+    [ "$polls" -gt 0 ] || { recorder_gap; return $?; }
+    # The helper and the run use separate locks: 9 excludes other recorders for the entire loop; the
+    # helper and each batch hold the clone's descriptor-8 lock so no checkout refresh removes a live run.
+    recorder_write running 0 "preparing origin/main" || return 1
+    out=$(CANON_RECORDER_LOCK_SECS="$RECORDER_LOCK_SECS" /bin/bash "$RECORDER_HELPER" --recorder-checkout "$m" "$dir" "$url" 9>&- 2>&1) \
+      || { rc=$?; recorder_fail "$rc" "checkout_failed: ${out//$'\n'/; } (exit $rc); nothing was run"; return $?; }
+    echo "$out"
+    if [[ "$out" == *"fetch_failed, checkout at "* ]]; then
+      fetch_note="fetch_failed, checkout at ${out##*fetch_failed, checkout at }; no batch started"
+    fi
+    exec 8>>"$dir.lock" || { recorder_fail 1 "could not open the checkout lock"; return $?; }
+    [[ "$RECORDER_LOCK_SECS" =~ ^[1-9][0-9]*$ ]] || { recorder_fail 1 "invalid recorder checkout wait bound"; return $?; }
+    wait_end=$((SECONDS + RECORDER_LOCK_SECS))
+    while :; do
+      rc=0; "$LOCKF" -t 0 8 2>/dev/null || rc=$?
+      [ "$rc" != 0 ] || break
+      [ "$rc" = 75 ] || { recorder_fail 1 "checkout_lock_failed: lockf exited $rc"; return $?; }
+      [ "$SECONDS" -lt "$wait_end" ] || { recorder_fail 1 "checkout_lock_timeout: still held after $RECORDER_LOCK_SECS s (UNCALIBRATED)"; return $?; }
+      sleep 1
+    done
+    prepared_commit=$(git -C "$dir" -c core.hooksPath=/dev/null rev-parse --verify HEAD) \
+      || { recorder_fail 1 "could not read the checkout commit"; return $?; }
+    recorder_time || { recorder_fail 1 "could not read New York time"; return $?; }
+    recorder_open || break
+    recorder_budget || { recorder_fail 1 "could not compute the New York close"; return $?; }
+    [ "$polls" -gt 0 ] || { recorder_gap; return $?; }
+    run_budget=$((RECORDER_HEADROOM + (polls - 1) * 60))
+    commit=$prepared_commit
+    [ -z "$fetch_note" ] || fetch_note="fetch_failed, ran at ${commit:0:12}"
+    recorder_write running 0 "$polls polls" || return 1
+    echo "movers-recorder: $day running origin/main $commit, $polls polls"
+    rc=0
+    # mise's global timeout terminates its command trees with a 5 s grace (pinned run.rs/terminate_all).
+    # It fires before the outer TERM/KILL bound; both fit before the close, with launch time reserved.
+    trap 'recorder_stop 143 TERM' TERM
+    trap 'recorder_stop 129 HUP' HUP
+    trap 'recorder_stop 130 INT' INT
+    (cd "$dir" && MISE_CEILING_PATHS="$ceiling" MISE_TASK_RUN_AUTO_INSTALL=false CANON_COMMIT="$commit" \
+      exec /usr/bin/timeout -k 5 "$((run_budget + 30))" "$m" run --timeout "$((run_budget + 5))s" paper:data movers-screener --minutes "$polls" < /dev/null) 9>&- &
+    batch_pid=$!
+    wait "$batch_pid" || rc=$?
+    batch_pid=""
+    trap - TERM HUP INT
+    exec 8>&-
+    [ "$rc" = 0 ] || { recorder_fail "$rc" "batch_failed: paper:data movers-screener exited $rc"; return $?; }
+    completed_batches=$((completed_batches + 1))
+    recorder_time || { recorder_fail 1 "could not read New York time"; return $?; }
+    if [ "$polls" -lt 80 ] && recorder_open; then recorder_gap; return $?; fi
+  done
+  recorder_finish ok "weekday recording window finished"
+}
+
+show_recorder_status() {
+  local pr rc=0 v label state last sig cfg recorder_canon status
+  cfg=$(plutil -extract EnvironmentVariables.CLAUDE_CONFIG_DIR raw -o - "$RECORDER_PLIST" 2>/dev/null) || cfg=""
+  recorder_canon="${cfg:-$CLAUDE_HOME}/canon"; status="$recorder_canon/watch/movers-recorder.json"
+  pr=$(lc print "$DOMAIN/$RECORDER_LABEL" 2>/dev/null) || rc=$?
+  if no_answer "$rc"; then check_row "movers recorder" UNKNOWN "launchctl did not answer within ${LAUNCHCTL_SECS} s"; return; fi
+  if [ "$rc" != 0 ]; then check_row "movers recorder" OFF "run: scripts/automation install"; return; fi
+  # shellcheck disable=SC2016  # jq program, not shell
+  v=$(jq -er --argjson now "$(date +%s)" --argjson silent "$RECORDER_SILENT" "$PAPER_COMMIT"'
+      select(type == "object" and (.at_epoch | type) == "number"
+             and (.exit_code | type) == "number"
+             and (.outcome == "idle" or .outcome == "running" or .outcome == "ok" or .outcome == "failed"))
+      | (if .outcome == "failed" then "FAILED" elif $now - .at_epoch > $silent then "STALE" else "ok" end)
+        + "\t" + .outcome + "; " + (.note // "") + "; exit " + (.exit_code | tostring)
+        + "; origin/main " + (.commit | short)' "$status" 2>/dev/null) || v=""
+  if [ -n "$v" ]; then label=${v%%$'\t'*}; v=${v#*$'\t'}
+  else label=UNKNOWN; v="no readable recorder status at $status (first check $RECORDER_INTERVAL s after install)"; fi
+  state=$(printf '%s\n' "$pr" | awk -F' = ' '/^\tstate = / { print $2; exit }')
+  last=$(printf '%s\n' "$pr" | awk -F' = ' '/^\tlast exit code = / { print $2; exit }')
+  sig=$(lc list 2>/dev/null | awk -v l="$RECORDER_LABEL" '$3 == l { print $2; exit }')
+  case "$last" in ''|0|*[!0-9-]*) ;; *) label=FAILED; v="$v; last firing exit $last" ;; esac
+  if [[ "$sig" =~ ^-[0-9]+$ ]]; then label=FAILED; v="$v; last firing stopped by signal ${sig#-}"; fi
+  if [[ "$v" == running\;* ]] && [ "$state" != running ] && [ "$label" = ok ]; then
+    label=FAILED; v="$v; record says running, launchd state=${state:-unknown}"
+  fi
+  if ! cmp -s "$ROOT/scripts/automation" "$recorder_canon/movers-recorder.sh" \
+     || ! cmp -s "$ROOT/home/.claude/canon/paper-session.sh" "$recorder_canon/movers-checkout.sh"; then
+    [ "$(paper_rank OUTDATED)" -le "$(paper_rank "$label")" ] || label=OUTDATED
+    v="$v; installed recorder differs from this tree: run scripts/automation install"
+  fi
+  check_row "movers recorder" "$label" "$v | weekdays 04:00-20:00 New York; log $recorder_canon/watch/movers-recorder.log"
 }
 
 # The collector agent runs otelcol with the config from home/.claude/canon/otel/, kept alive by launchd
@@ -728,6 +1055,8 @@ do_install() {
       fi
     fi
   fi
+  note "Movers recorder:"
+  install_recorder || ok=1
   note "OTLP collector:"
   install_otel || ok=1
   note "OmniRoute gateway:"
@@ -761,7 +1090,7 @@ do_install() {
 # were gone (a second reader's claim), and a retry would find nothing to tell it what to unload.
 do_uninstall() {
   local left="" f l rc still="" fs
-  for l in "$MAINT_LABEL" "$LABEL" "$PAPER_LABEL" "$OTEL_LABEL" "$GW_LABEL" "$STUDY_LABEL"; do
+  for l in "$MAINT_LABEL" "$LABEL" "$PAPER_LABEL" "$RECORDER_LABEL" "$OTEL_LABEL" "$GW_LABEL" "$STUDY_LABEL"; do
     unload "$l"; rc=$?
     case "$rc" in
       0) if [ "$UNLOAD_ABSENT" = 1 ]; then note "  $l was not loaded"; else note "  unloaded   $l"; fi; continue ;;
@@ -772,10 +1101,11 @@ do_uninstall() {
     still="$still $l "; left="$left
   launchd job $l"
   done
-  for l in "$MAINT_LABEL" "$LABEL" "$PAPER_LABEL" "$OTEL_LABEL" "$GW_LABEL" "$STUDY_LABEL"; do
+  for l in "$MAINT_LABEL" "$LABEL" "$PAPER_LABEL" "$RECORDER_LABEL" "$OTEL_LABEL" "$GW_LABEL" "$STUDY_LABEL"; do
     case "$l" in
       "$LABEL") fs="$PLIST|$CANON_HOME/lanes|$CANON_HOME/lanes-watch.sh" ;;
       "$PAPER_LABEL") fs="$PAPER_PLIST|$CANON_HOME/paper-session.sh" ;;
+      "$RECORDER_LABEL") fs="$RECORDER_PLIST|$RECORDER_RUNNER|$RECORDER_HELPER" ;;
       "$MAINT_LABEL") fs="$MAINT_PLIST|$CANON_HOME/maintenance.sh|$CANON_HOME/maintenance.lock" ;;
       "$GW_LABEL") fs="$GW_PLIST" ;;
       "$STUDY_LABEL") fs="$STUDY_PLIST" ;;
@@ -834,6 +1164,33 @@ do_uninstall() {
   $PAPER_CHECKOUT"; fi
     fi
   fi
+  # The recorder has a separate clone, prepared by paper-session.sh's --checkout-only contract. Keep it
+  # whenever its job or either clone lock is still held; recorded market data lives outside this clone.
+  if [ -e "$RECORDER_CHECKOUT" ]; then
+    if [[ "$still" == *" $RECORDER_LABEL "* ]] || [ ! -x "$LOCKF" ] \
+       || ! "$LOCKF" -k -t 0 "$(recorder_lock_path)" true 2>/dev/null \
+       || ! "$LOCKF" -k -t 0 "$RECORDER_CHECKOUT.lock" true 2>/dev/null; then
+      note "  FAILED: movers recorder may still run from $RECORDER_CHECKOUT; not removing it"; left="$left
+  $RECORDER_CHECKOUT"
+    elif ! marked "$RECORDER_CHECKOUT/.git" && ! marked "$RECORDER_CHECKOUT/.git.old" && ! marked "$RECORDER_CHECKOUT/.git.new"; then
+      note "  FAILED: $RECORDER_CHECKOUT is not the clone the recorder made; not touching it"; left="$left
+  $RECORDER_CHECKOUT"
+    else
+      local recorder_mise
+      if [ ! -e "$RECORDER_CHECKOUT/mise.toml" ]; then :
+      elif ! recorder_mise=$(find_mise 2>&1); then
+        note "  FAILED: $recorder_mise, so the recorder clone's mise trust stays"; left="$left
+  mise trust of $RECORDER_CHECKOUT/mise.toml"
+      elif ! "$recorder_mise" trust --untrust "$RECORDER_CHECKOUT/mise.toml" >/dev/null 2>&1; then
+        note "  FAILED: could not remove mise trust of $RECORDER_CHECKOUT/mise.toml"; left="$left
+  mise trust of $RECORDER_CHECKOUT/mise.toml"
+      fi
+      if rm -rf "$RECORDER_CHECKOUT" "$RECORDER_CHECKOUT.lock" "$(recorder_lock_path)" && [ ! -e "$RECORDER_CHECKOUT" ]; then
+        note "  removed    $RECORDER_CHECKOUT"
+      else note "  FAILED: could not remove $RECORDER_CHECKOUT"; left="$left
+  $RECORDER_CHECKOUT"; fi
+    fi
+  fi
   if [ "$(git -C "$ROOT" config --local --get core.hooksPath 2>/dev/null)" = ".githooks" ]; then
     if git -C "$ROOT" config --local --unset core.hooksPath; then note "  unset      core.hooksPath"
     else note "  FAILED: could not unset core.hooksPath"; left="$left
@@ -847,6 +1204,8 @@ do_uninstall() {
   fi
   note "Left in place: $CANON_HOME/ledger, $CANON_HOME/watch (alert history), the session windows' records"
   note "in ${PAPER_DIR:-the per-user temporary folder}, $OTEL_DIR/logs.jsonl (and its rotated copies) and the weekly scheduled task."
+  if [ -n "$PAPER_TMP" ]; then note "The data-only logs stay in ${PAPER_TMP}canon-paper-data."
+  else note "The data-only logs stay in the per-user temporary folder's canon-paper-data."; fi
   note "Remove the weekly task from the desktop app's Scheduled list."
   if [ -n "$left" ]; then note "uninstall: not removed:$left"; return 1; fi
 }
@@ -877,7 +1236,8 @@ do_differs() {
   t=$(mktemp -d "${TMPDIR:-/tmp}/automation-differs.XXXXXX") || { say unknown "cannot create a temporary folder"; return 2; }
   [ "$(git -C "$ROOT" config --local --get core.hooksPath 2>/dev/null)" = ".githooks" ] || say automation "commit gate: core.hooksPath is not .githooks"
   for f in "scripts/lanes:lanes" "home/.claude/canon/lanes-watch.sh:lanes-watch.sh" \
-           "home/.claude/canon/paper-session.sh:paper-session.sh" "home/.claude/canon/maintenance.sh:maintenance.sh"; do
+           "home/.claude/canon/paper-session.sh:paper-session.sh" "home/.claude/canon/maintenance.sh:maintenance.sh" \
+           "scripts/automation:movers-recorder.sh" "home/.claude/canon/paper-session.sh:movers-checkout.sh"; do
     cmp -s "$ROOT/${f%%:*}" "$CANON_HOME/${f#*:}" || say automation "$CANON_HOME/${f#*:} differs from ${f%%:*}"
   done
   cmp -s "$ROOT/home/.claude/canon/otel/config.yaml" "$OTEL_DIR/config.yaml" || say automation "$OTEL_DIR/config.yaml differs from home/.claude/canon/otel/config.yaml"
@@ -889,6 +1249,7 @@ do_differs() {
     write_study_plist "$m" "$t/s" && { cmp -s "$t/s" "$STUDY_PLIST" || say automation "$STUDY_PLIST differs from what install writes"; }
     if url=$(git -C "$ROOT" remote get-url origin 2>/dev/null) && [ -n "$url" ]; then
       write_paper_plist "$m" "$url" "$t/p" && { cmp -s "$t/p" "$PAPER_PLIST" || say automation "$PAPER_PLIST differs from what install writes"; }
+      write_recorder_plist "$m" "$url" "$t/r" && { cmp -s "$t/r" "$RECORDER_PLIST" || say automation "$RECORDER_PLIST differs from what install writes"; }
       [ "$(git -C "$ROOT" config --local --get-all credential.https://github.com.helper 2>/dev/null | tail -n 1)" = "!\"$m\" exec -- gh auth git-credential" ] \
         || say automation "landing: the git sign-in helper is not the one install sets"
     else
@@ -908,7 +1269,7 @@ do_differs() {
   fi
   rm -rf "${t:?}"
   if [ "${AUTOMATION_SKIP_LAUNCHD:-0}" != "1" ]; then
-    for l in "$LABEL" "$PAPER_LABEL" "$OTEL_LABEL" "$MAINT_LABEL" "$GW_LABEL" "$STUDY_LABEL"; do
+    for l in "$LABEL" "$PAPER_LABEL" "$RECORDER_LABEL" "$OTEL_LABEL" "$MAINT_LABEL" "$GW_LABEL" "$STUDY_LABEL"; do
       [ "$l" != "$GW_LABEL" ] || [ "$gw" = 1 ] || continue
       loaded "$l"; st=$?
       if [ "$st" = 1 ]; then say automation "$l is not loaded"; elif [ "$st" = 2 ]; then say unknown "launchctl did not answer about $l"; fi
@@ -1120,6 +1481,8 @@ do_status() {
     check_row "paper session" "$lab" "$txt"
   elif no_answer "$prc"; then check_row "paper session" UNKNOWN "launchctl did not answer within ${LAUNCHCTL_SECS} s, so whether it is loaded is not known"
   else check_row "paper session" OFF "run: scripts/automation install"; fi
+
+  show_recorder_status
 
   # The collector: launchd must show it running (KeepAlive restarts it); the file's age is shown, not judged,
   # since a quiet hour with no session writes nothing.
@@ -1361,6 +1724,8 @@ do_status() {
 }
 
 case "${1:-}" in
+  recorder-lock-path) recorder_lock_path ;;
+  record-movers) shift; do_record_movers "$@" ;;
   status)    do_status ;;
   # the failures again after the status table, the last lines the owner sees, and the exit code with them
   install)   case "${2:-}" in --defer-paper) DEFER_PAPER=1 ;; '') ;; *) note "usage: scripts/automation install [--defer-paper]"; exit 2 ;; esac
