@@ -335,10 +335,11 @@ class MoverConfig(StrategyConfig):
     (ADR 0088). `max_shares` bounds an entry in shares, and `entries` how many entries a run may fill
     (None: no bound). `share_caps`, when set, bounds each named instrument's entry in shares; a name
     outside that map cannot enter. Paper windows select size_from_budget=True: whole shares of the
-    supplied max_notional at the current entry limit, with that name's share and position cap updated
-    before submission. This path clamps the startup allocation to balance_free read at each entry (a
-    missing free balance refuses the entry), and `flow_share` of the last `flow_bars` bars' dollar volume
-    caps the size; it preserves any explicit global max_shares cap without rewriting it, and does not use
+    supplied max_notional at the current entry limit, clamped to the name's start-time share cap
+    (`binding` `cap_bound` when it binds); neither that cap nor the name's position monitor is
+    rewritten, so a monitor trip means a real fault, not a price drift. This path clamps the startup
+    allocation to balance_free read at each entry (a missing free balance refuses the entry), and
+    `flow_share` of the last `flow_bars` bars' dollar volume caps the size; it preserves any explicit global max_shares cap without rewriting it, and does not use
     risk sizing. The startup allocation names the initial cash-engine funding limit; later losses can
     reduce free funds. With size_from_budget=False the
     legacy FixedRiskSizer and optional tighter share caps remain for explicit simulations. `bar_spec`
@@ -1282,7 +1283,7 @@ class Mover(Strategy):
                 "is wider than the plan"
             )
         precision = instrument.price_precision
-        sizing: dict[str, str] | None = None
+        sizing: dict[str, str | None] | None = None
         if settings.size_from_budget:
             free = account.balance_free(instrument.quote_currency)
             if free is None:
@@ -1307,6 +1308,14 @@ class Mover(Strategy):
             binding = "flow" if flow_shares < budget_shares else "budget"
             if settings.max_shares is not None and Decimal(settings.max_shares) < cap:
                 cap, binding = Decimal(settings.max_shares), "max_shares"
+            # the name's start-time share cap bounds the entry and is never rewritten, so a price
+            # that drifted since the start does not trip the monitor and a trip means a real fault
+            # (the lead's change of 2026-11-12, ultra review of the composition, finding 14)
+            start_cap = (
+                None if settings.share_caps is None else settings.share_caps.get(slot.instrument_id)
+            )
+            if start_cap is not None and Decimal(start_cap) < cap:
+                cap, binding = Decimal(start_cap), "cap_bound"
             if cap < 1:
                 return f"the budget or flow cap leaves no share at {price}"
             quantity = instrument.make_qty(int(cap))
@@ -1318,6 +1327,7 @@ class Mover(Strategy):
                 "budget_shares": str(budget_shares),
                 "flow_dollars": str(flow_dollars),
                 "flow_shares": str(flow_shares),
+                "start_cap": None if start_cap is None else str(start_cap),
                 "binding": binding,
                 "quantity": str(quantity),
             }
@@ -1326,12 +1336,6 @@ class Mover(Strategy):
                 f"({budget_shares} shares), flow cap {flow_shares} shares from {flow_dollars} USD, "
                 f"binding {sizing['binding']}, quantity {quantity}"
             )
-            # Each entry is flat-to-long. Its current limit resolves the share cap before any fill,
-            # including after a price fall; an initial-price cap must not reduce this allocation.
-            if settings.share_caps is not None:
-                settings.share_caps[slot.instrument_id] = int(cap)
-            if monitor := self.position_caps.get(slot.instrument_id):
-                monitor.max_position = cap
         else:
             free = account.balance_free(instrument.quote_currency)
             if free is None:

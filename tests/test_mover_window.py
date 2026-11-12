@@ -64,12 +64,15 @@ def test_account_sizing_trades_and_flattens_in_each_part(
 
     monkeypatch.setattr(mover_module, "FixedRiskSizer", risk_sizer)
     instrument = alpaca_bars.equity("LLL")
+    start = Decimal("0.700") if liquidity == "thin" else Decimal(10)
     starts = datetime(2025, 11, 10, 16, tzinfo=UTC)
     minute = 60_000_000_000
     ts_start = int(starts.timestamp() * 1_000_000_000)
     strategy, ranking, cap = mover_parts(
         instrument.id,
-        price=Decimal(20),  # startup price falls before entry; the share/position cap must follow
+        # the tape's first price: since the ultra review of the composition (finding 14) a price that
+        # fell after the start leaves the cap where it was, which test_mover's clamp cases cover
+        price=start,
         move=Decimal("0.25"),
         computed_at=starts - timedelta(minutes=3),
         ends=starts + timedelta(minutes=20),
@@ -170,7 +173,8 @@ def test_account_sizing_trades_and_flattens_in_each_part(
             f"FixedRiskSizer used: {buy.filled_qty} shares instead of the budget's {expected}"
         )
         assert buy.filled_qty.as_decimal() == Decimal(expected)
-        assert strategy.settings.max_shares is None and cap.max_position == Decimal(expected)
+        assert strategy.settings.max_shares is None
+        assert cap.max_position == allocation.entry_notional // start >= Decimal(expected)
         assert buy.filled_qty.as_decimal() * buy.price.as_decimal() > Decimal(500)
         assert not eng.cache.positions_open(strategy_id=MOVER_ID)
         assert strategy.refused == [] and cap.tripped is None

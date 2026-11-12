@@ -918,28 +918,64 @@ def test_budget_composition_does_not_freeze_a_global_share_cap_at_the_initial_pr
     assert strategy.settings.share_caps == {AAA: 50}
 
 
-def test_a_paper_entry_uses_the_startup_figure_at_its_current_limit_and_updates_its_cap():
+def test_a_budget_entry_after_a_30_percent_price_fall_is_clamped_to_its_start_time_cap():
+    """ultra-3a8613a/14, the lead's change of 2026-11-12: price drift must not trip the guard. An entry
+    is sized min(budget / price, start-time cap), recorded as `cap_bound` when the cap binds, and the
+    name's share cap and its monitor's cap stay at the start-time bound."""
+    start = Decimal("14.30")  # the name's price when the window chose it; the tape trades 30% under
+    (cap,) = mover_window.mover_position_caps({AAA: start}, Decimal(10_000))
+    start_cap = int(cap.max_position)
     eng = engine(order_cap=Decimal(100_000))
     s = strategy(
         max_notional=Decimal(10_000),
-        share_caps={AAA: 2},
+        share_caps={AAA: start_cap},
         risk=Decimal("0.00000001"),
-        # the flow cap (sizing's flow follow-up) set wide, so the startup figure is what binds here
-        flow_share=Decimal(1),
+        flow_share=Decimal(1),  # wide, so the budget and the cap are what bind
         protect=False,
     )
     s.settings.size_from_budget = True
-    (cap,) = mover_window.mover_position_caps({AAA: Decimal(20)})
     s.position_caps = {AAA: cap}
     eng.add_strategy(cap)
     orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, RISING))
     buys = [order for order in orders if order.side == OrderSide.BUY]
     eng.dispose()
     assert len(buys) == 1
-    expected = Decimal(10_000) // buys[0].price.as_decimal()
-    assert buys[0].filled_qty.as_decimal() == expected
-    assert s.settings.share_caps == {AAA: int(expected)}
-    assert cap.max_position == expected and cap.tripped is None
+    assert Decimal(10_000) // buys[0].price.as_decimal() > start_cap, "the budget alone buys more"
+    assert buys[0].filled_qty.as_decimal() == start_cap
+    assert s.entries_sent[0]["sizing"]["binding"] == "cap_bound"
+    assert s.settings.share_caps == {AAA: start_cap}
+    assert cap.max_position == start_cap and cap.tripped is None
+
+
+@pytest.mark.parametrize("clamped", [True, False])
+def test_a_forced_20x_sizing_fault_is_clamped_and_trips_the_monitor_if_it_gets_past(clamped):
+    """ultra-3a8613a/14: a sizing fault twenty times the start figure is clamped to the start-time cap;
+    with no share cap to clamp it, it reaches the venue and the monitor, whose cap was not rewritten,
+    trips."""
+    (cap,) = mover_window.mover_position_caps({AAA: Decimal(10)}, Decimal(1_000))
+    start_cap = int(cap.max_position)
+    eng = engine(order_cap=Decimal(100_000))
+    s = strategy(
+        max_notional=Decimal(
+            20_000
+        ),  # the fault: twenty times the 1000 USD the window started with
+        share_caps={AAA: start_cap} if clamped else None,
+        risk=Decimal("0.00000001"),
+        flow_share=Decimal(1),
+        protect=False,
+    )
+    s.settings.size_from_budget = True
+    s.position_caps = {AAA: cap}
+    eng.add_strategy(cap)
+    orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, RISING))
+    buys = [order for order in orders if order.side == OrderSide.BUY]
+    eng.dispose()
+    assert buys and cap.max_position == start_cap
+    if clamped:
+        assert buys[0].quantity.as_decimal() == start_cap and cap.tripped is None
+    else:
+        assert buys[0].quantity.as_decimal() > 10 * start_cap
+        assert cap.tripped is not None
 
 
 def test_a_budget_entry_after_a_loss_fits_the_remaining_free_cash():
