@@ -72,6 +72,7 @@ from datetime import UTC
 from datetime import date
 from datetime import datetime
 from datetime import timedelta
+from fractions import Fraction
 from pathlib import Path
 from statistics import quantiles
 from typing import Any
@@ -150,8 +151,13 @@ def select_sessions(sessions: Sequence[date], *, as_of: date) -> dict[str, tuple
 
 
 def percentiles(values: Sequence[float]) -> dict[str, float]:
-    cuts = quantiles(values, n=100, method="inclusive")
-    return {"median": cuts[49], "p75": cuts[74], "p90": cuts[89]}
+    """CPython statistics.py:1203-1209 inclusive interpolation, rounded once per cut.
+
+    Fraction inputs preserve the binary samples exactly and prevent weighted float
+    sums at tied endpoints from reversing percentile order. The reader stays strict.
+    """
+    cuts = quantiles(map(Fraction, sorted(values)), n=100, method="inclusive")
+    return {"median": float(cuts[49]), "p75": float(cuts[74]), "p90": float(cuts[89])}
 
 
 def true_range_fraction(bar: Bar, previous_close: float) -> float:
