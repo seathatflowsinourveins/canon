@@ -117,6 +117,15 @@
       "sha": "3e9fbcc9773e46659f2d21b7ede1ba5906e71eb8",
       "track": "tag:1.5.5"
     },
+    "awesome-dsh-plugin": {
+      "default_branch": "main",
+      "default_sha": "f613760b0ecc1f1dc61da874d3fd10d3584385f7",
+      "ref": "refs/heads/main",
+      "repo": "awesome-dsh-plugin/awesome-dsh-plugin",
+      "resolved_at": "2026-11-12T00:31:04Z",
+      "sha": "f613760b0ecc1f1dc61da874d3fd10d3584385f7",
+      "track": "default"
+    },
     "ccusage": {
       "default_branch": "main",
       "default_sha": "d06f55bb8937479fea5014fd36a0e7b9286fb630",
