@@ -18,14 +18,16 @@ What is upstream's, and what is mirrored:
   volume is close x volume, as `movers_stream` takes it. The ranking functions of ADR 0087 are not on
   `main`; when they are, this module calls them instead of `movers_stream`'s, and a difference in a
   listing minute is a finding (their dollar volume is VWAP x volume, which a catalog `Bar` does not carry).
-* **The entry** mirrors `canon_trading.mover.Mover` as committed at `660b37e` (not on `main`): a watched
+* **The entry** is shared with `canon_trading.mover.Mover` by `entry_runs` and `entry_refusal`:
+  ADR 0092's table rows 73-79 fix the listing, run and extension rules. A watched
   name's bars are kept from the minute it is listed, a run is `run_bars` closes in a row each above the
   one before (a repeated close is not a rise), a run is decided on once, and the buy is a limit at the
-  ask. One refusal is not at that commit: an entry whose bid is under the planned stop, which the paper
-  window's working copy makes (UNVERIFIED here until it is committed). The exit mirrors its protection: a trailing trigger `TRAIL` of the entry under the highest bid
+  ask. The strategy checks the cached bid against its planned stop; the diagnostic checks its
+  spread-adjusted bid. The exit mirrors the strategy's protection: a trailing trigger `TRAIL` of the entry under the highest bid
   since the entry, a released limit `EXIT_THROUGH` of the entry under the trigger, and a chase that
-  never prices below `CHASE_CAP` under that first limit. Those three are `MoverConfig`'s defaults there,
-  not arms here. When `Mover` is on `main` the rule is imported, not mirrored.
+  never prices below `CHASE_CAP` under that first limit. Those three are `MoverConfig`'s defaults,
+  not arms here. The strategy's bridge remains separately selectable; its registered arms use
+  this module's listing, run and extension implementation, with explicitly supplied day history.
 * **The bar model** is NautilusTrader's own for bar execution (docs/concepts/backtesting/bar-execution.md
   at the pin): each bar is walked open, high, low, close (`bar_adaptive_high_low_ordering` at its default),
   and an order sent on a bar's close settles "against the book left at bar N's close". So an entry
@@ -78,6 +80,7 @@ from skfolio.model_selection import WalkForward
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
+    from collections.abc import Iterator
     from collections.abc import Sequence
 
 NEW_YORK = ZoneInfo("America/New_York")
@@ -365,11 +368,34 @@ def planned_stop(entry: float) -> float:
     return (entry - entry * (TRAIL + EXIT_THROUGH)) * (1 - CHASE_CAP)
 
 
-def refusal(
-    day: Day, rows: Rows, costs: Costs, index: int, run: Sequence[Minute], listed_at: int
+def entry_runs(
+    day: Day, rows: Rows, *, start: int = PART_START
+) -> Iterator[tuple[int, Sequence[Minute], int]]:
+    """Listed rising runs, shared with Mover (ADR 0092:51, :73-76).
+
+    Yield the completing bar's index, the run and the day's first listing minute. Earlier bars
+    establish the listing clock and cumulative dollars, but only bars watched from `start` count
+    towards a run. Losing the listing clears the run, not the day's first listing clock.
+    """
+    seen = listing(day, rows)
+    listed_at = first_listed(seen)
+    if listed_at is None:
+        return
+    closes: list[Minute] = []
+    for index, (bar, now) in enumerate(zip(day.bars, seen, strict=True)):
+        if not now.listed or bar.start < start:
+            closes.clear()
+            continue
+        closes.append(bar)
+        run = closes[-(rows.run_bars + 1) :]
+        if len(run) > rows.run_bars and all(a.close < b.close for a, b in pairwise(run)):
+            yield index, run, listed_at
+
+
+def entry_refusal(
+    day: Day, rows: Rows, index: int, run: Sequence[Minute], listed_at: int
 ) -> str | None:
-    """Why the run that `day.bars[index]` completes is not entered, or None. The order follows `Mover`'s
-    own refusals where it has one."""
+    """No-chase and extension refusal shared with Mover (ADR 0092:77-79); no spread/exit model."""
     bar = day.bars[index]
     known = bar.start + 1
     assert day.reference is not None
@@ -392,6 +418,18 @@ def refusal(
         return f"extended ({extended})" + (
             "" if rows.pullback is None else f" with no pullback of {rows.pullback:.0%}"
         )
+    return None
+
+
+def refusal(
+    day: Day, rows: Rows, costs: Costs, index: int, run: Sequence[Minute], listed_at: int
+) -> str | None:
+    """The shared entry rule, then the diagnostic's spread against its planned stop."""
+    why = entry_refusal(day, rows, index, run, listed_at)
+    if why is not None:
+        return why
+    bar = day.bars[index]
+    known = bar.start + 1
     half = costs.half(known)
     if bar.close * (1 - half) < planned_stop(bar.close * (1 + half)):
         return "its bid is under the planned stop"
@@ -463,15 +501,8 @@ def replay(day: Day, rows: Rows, costs: Costs = GROSS, *, start: int = PART_STAR
     if listed_at is None:
         return replace(base, never_listed=why_never_listed(day, seen, rows))
     refusals: list[tuple[int, str]] = []
-    closes: list[Minute] = []
-    for index, (bar, now) in enumerate(zip(day.bars, seen, strict=True)):
-        if not now.listed or bar.start < start:
-            closes.clear()  # an unranked name loses its slot, and its bars with it
-            continue
-        closes.append(bar)
-        run = closes[-(rows.run_bars + 1) :]
-        if len(run) <= rows.run_bars or not all(a.close < b.close for a, b in pairwise(run)):
-            continue
+    for index, run, listed_at in entry_runs(day, rows, start=start):
+        bar, now = day.bars[index], seen[index]
         why = refusal(day, rows, costs, index, run, listed_at)
         if why is not None:
             refusals.append((now.minute, why))

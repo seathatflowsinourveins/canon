@@ -57,7 +57,7 @@ paper, pre-market and after-hours so far (Sessions, feeds and what paper has sho
 | The session | Alpaca's clock and calendar before anything is placed | Alpaca's paper-trading skill: "always check the clock/calendar endpoint" |
 | Bars | One-minute `INTERNAL` bars the data engine builds from trades; the adapter streams none | The data engine's bar aggregation |
 | A position over one share | `PositionCap`, a non-trading strategy in the node (a `DataActor` has no portfolio at the pin): the portfolio's net position every second, `shutdown_system` over one share | No upstream: no setting caps a position, and the trading state is not settable from Python |
-| A window's length and schedule | `minutes` (default 30, at most 60), clipped to the session's end and to `LONGEST_WINDOW_SECS` (Sharing the account), timed from Alpaca's clock; wind-down 120 s before; 300 s between windows; the session from configuration | No upstream |
+| A window's length and schedule | `minutes` (default 30, at most 60), clipped to the session's end and to `LONGEST_WINDOW_SECS` (Sharing the account), timed from Alpaca's clock; wind-down 120 s before; 60 s between windows (300 s until 2026-11-11); the session from configuration | No upstream |
 | The extended session's parts | Pre-market and after-hours from the calendar day's `session_open` and `session_close`, refused when either is absent; overnight from 20:00 on the evening before a trade date on Alpaca's calendar to that date's `session_open`, so none before a weekend or holiday | Alpaca's 24/5 page: 8:00 PM - 4:00 AM ET, "on the evening before the trade date", "follows the NYSE holiday calendar" |
 | The feed | `boats` overnight, IEX in the regular session, `sip` in pre-market and after-hours (below), the part deciding (each streams and serves bars; `sip` bars over REST seen on paper in the first pre-market window, ADR 0055), named in the strategy's quote and trade subscriptions, made before its bars, and its warm-up request | ADR 0055: params `{"feed": ...}`; the data engine hands the client an instrument's first subscription |
 | Overnight eligibility | An overnight window starts only on an asset Alpaca marks `overnight_tradable` and not `overnight_halted`, read raw (alpaca-py 0.45.0's `Asset` has no such field), as a boolean (the 24/5 page's "boolean attributes") or a value of `attributes` (the asset reference; what paper showed), else refused by name | Alpaca's 24/5 page: "Assets tradable in the overnight session can be identified via the `overnight_tradable` attribute" |
@@ -325,6 +325,12 @@ Confirmation).
 
 Read 2026-11-10. "raw": fetched with `curl` and read whole. NautilusTrader files at the pin, `d53849b216e2`.
 
+* 2026-11-11, the gap between windows (`GAP_SECS`) cut from 300 s to 60 s by the lead's ruling, so back-to-
+  back windows lose less of a session to waiting. 300 s was for a paper test waiting on the shared stream
+  lock (the constant's docstring until #238), a reason that lapsed when each account got its own stream
+  lock. A minute lets the last window's stop and account check leave the per-minute request count (the
+  window's own budget is any 60 s, ADR 0091; Alpaca's 200 a minute, ADR 0049) before the next start. If a window started a minute after the last draws a refused stream or a
+  rate refusal at start, that is the reason the minute lacked, and the gap goes back with it recorded.
 * 2026-11-11, the warm-up fed once: NautilusTrader `crates/common/src/python/response.rs` lines 357-363,
   `crates/common/src/actor/indicators.rs` lines 171-178 and 241-246, `crates/model/src/data/bar.rs` lines
   910-921 at `d53849b216e2` (read in the local copy at the pin); `SimpleMovingAverage.reset` in `.venv`

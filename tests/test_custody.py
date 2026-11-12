@@ -375,16 +375,15 @@ def test_the_account_checks_own_close_ids_read_as_ours(monkeypatch) -> None:
     stamp = datetime(2026, 11, 11, 15, 4, 24, tzinfo=UTC).strftime("%Y%m%dT%H%M%SZ")
     sent: list = []
     check = SimpleNamespace(
-        held=Decimal(1),
+        held={"SPY": Decimal(1)},
         closes_sent=0,
-        symbol="SPY",
         requests={},
         turn=deque(),
         report=SimpleNamespace(started=stamp, closes={}, closes_not_placed=0),
         trading=SimpleNamespace(submit_order=lambda r: sent.append(r) or SimpleNamespace(id=None)),
     )
     for _ in range(3):
-        session_window._AccountCheck._close(check, "sell")  # ty: ignore[invalid-argument-type]
+        session_window._AccountCheck._close(check, "SPY", "sell")  # ty: ignore[invalid-argument-type]
     ids = [r.client_order_id for r in sent]
     assert len(set(ids)) == 3 and all(custody.lineage(i) == custody.OURS for i in ids)
     source = (ROOT / "src/canon_trading/session_window.py").read_text()

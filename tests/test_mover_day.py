@@ -101,7 +101,7 @@ BALANCE = 100_000
 """The simulated account's cash."""
 MAX_NOTIONAL = ENTRY_NOTIONAL_USD
 """The largest entry: a session window's row (`canon_trading.mover_window`), with the risk engine's
-per-order cap at that window's outer bound (`OUTER_BOUND_USD`) and its one entry a run (`ENTRIES`)."""
+per-order cap at that window's outer bound (`OUTER_BOUND_USD`) and its entries, which have no bound (`ENTRIES`)."""
 MAX_MOVE = NO_CHASE_CAP
 """The no-chase cap on the ranking's move: a session window's row, which does not bind."""
 FAST_EXIT_SECS = 60
@@ -285,6 +285,7 @@ def replay(
             "max_notional": MAX_NOTIONAL,
             "max_move": MAX_MOVE,
             "max_shares": None,
+            "entry_arm": "bridge",  # this order/protection replay has no prior-session Day context
             "entries": ENTRIES,
             "wind_down_at": wind_down_at,
             "strategy_id": MOVER_ID,

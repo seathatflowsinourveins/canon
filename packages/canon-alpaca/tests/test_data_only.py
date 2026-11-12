@@ -281,6 +281,8 @@ CONSTRUCTION_SITES = {
     ("canon_alpaca/providers.py", "_client", "TradingClient"),
     ("canon_trading/history_load.py", "history_client", "StockHistoricalDataClient"),
     ("canon_trading/movers_screener.py", "screener_client", "ScreenerClient"),
+    ("canon_trading/movers_rank_actor.py", "alpaca_reference_reader", "CorporateActionsClient"),
+    ("canon_trading/movers_rank_actor.py", "alpaca_reference_reader", "StockHistoricalDataClient"),
     ("canon_trading/movers_stream.py", "data_client", "StockHistoricalDataClient"),
     ("canon_trading/session_window.py", "paper_trading", "TradingClient"),
     ("canon_trading/session_window.py", "window_actions", "CorporateActionsClient"),

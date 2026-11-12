@@ -11,7 +11,7 @@ The first places a DAY limit buy of 1 AAPL at $1.00 and cancels it once Alpaca h
 run rows of upstream's Execution Testing Spec through upstream's `ExecTester` (ADR 0036): TC-E41, a limit
 buy $50 below the bid and a stop buy $50 above the ask, canceled by `CancelAllOrders` on stop; TC-E20 and
 TC-E22, a stop and a stop-limit buy $50 above the ask, accepted at the prices sent and canceled on stop.
-Modify (ADR 0042): TC-E30 through the tester, whose one-tick amend the client denies as sub-penny, and a
+Modify (ADR 0042): TC-E30 through the tester, whose one-tick amend rounds back to the order's own price and is refused, and a
 $1.00 buy modified to $1.01 through a node, then canceled.
 Two run with any session closed and need no node event for the order: TC-E84, a $1.00 buy placed with
 alpaca-py, as a prior session would leave it, which a node's start-up reconciliation must load open; and
@@ -332,9 +332,11 @@ def test_paper_limit_order_is_modified_through_a_node() -> None:
 
 def test_paper_modify_limit_buy_tc_e30() -> None:
     """TC-E30 ("Modify limit BUY price") through `ExecTester`, as the card configures it: the one-shot amend
-    moves the limit "one tick more passive". The adapter's tick is 0.0001 (ADR 0030), so above $1.00 that
-    price breaks Alpaca's sub-penny rule and the client denies the modify before Alpaca:
-    `OrderModifyRejected`, not `OrderUpdated`. The order is then canceled on stop."""
+    moves the limit "one tick more passive". The adapter's tick is 0.0001 (ADR 0030), finer than Alpaca's
+    cent above $1.00. The client sends a limit on Alpaca's increment, a buy rounded up (ADR 0030,
+    2026-11-11), which puts this amend back at the order's own price; a replace that changes nothing is
+    refused before Alpaca: `OrderModifyRejected`, not `OrderUpdated`. Until 2026-11-11 the amend was
+    denied as sub-penny instead. The order is then canceled on stop."""
     reasons: list[str] = []
 
     def modify_rejected(orders: list) -> bool:
@@ -366,7 +368,7 @@ def test_paper_modify_limit_buy_tc_e30() -> None:
     assert cleaned == {"orders": 0, "positions": 0}, cleaned
     (names,) = events.values()
     assert "OrderModifyRejected" in names, names
-    assert any("has more than 2 decimals" in r for r in reasons), reasons
+    assert any("the order's own; nothing to change" in r for r in reasons), reasons
     assert names[-1] == "OrderCanceled", names
 
 

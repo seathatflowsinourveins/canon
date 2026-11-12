@@ -18,6 +18,12 @@ Read 2026-11-10 (ADR 0037, ADR 0049):
   `"limit/HH:MM:SS"`, default `100/00:00:01` for both; a submit over the limit is denied with reason
   `RATE_LIMIT_EXCEEDED`, a modify over it is rejected with "Exceeded MAX_ORDER_MODIFY_RATE".
 
+Read 2026-11-11 at the same pin: `crates/live/src/python/config.rs`
+(`InstrumentProviderConfig.load_ids`, a list), `crates/live/src/execution/config.rs`
+(`reconciliation_instrument_ids`, an instrument set), and `crates/risk/src/engine/config.rs`
+(`max_notional_per_order`, a map by instrument): one node loads, reconciles and caps every window name,
+with one shared submit and modify budget.
+
 The numbers and why each was chosen are ADR 0049's. This is an end-to-end check of the stack on paper,
 not a strategy evaluation; ADR 0010 governs that, and nothing here ranks or recommends a strategy.
 
@@ -39,6 +45,7 @@ from nautilus_trader.config import InstrumentProviderConfig
 from nautilus_trader.config import LiveExecutionEngineConfig
 from nautilus_trader.live import LiveNode
 from nautilus_trader.live import LiveRiskEngineConfig
+from nautilus_trader.model import InstrumentId
 from nautilus_trader.model import Quantity
 from nautilus_trader.model import StrategyId
 from nautilus_trader.model import TraderId
@@ -48,13 +55,20 @@ from .position_cap import PositionCap
 from .position_cap import position_cap_config
 
 if TYPE_CHECKING:
-    from nautilus_trader.live import LiveNodeBuilder
-    from nautilus_trader.model import InstrumentId
+    from collections.abc import Sequence
 
-MAX_ORDER_SUBMIT_RATE = "50/00:01:00"
-"""At most 50 submits in any minute: a quarter of Alpaca's 200 calls a minute (ADR 0049)."""
-MAX_ORDER_MODIFY_RATE = "25/00:01:00"
-"""At most 25 modifies in any minute (ADR 0049)."""
+    from nautilus_trader.live import LiveNodeBuilder
+
+REQUEST_CEILING = 180
+"""The most requests a node may send Alpaca's trading API in any 60 seconds, a working reserve under
+Alpaca's 200 a minute (UNCALIBRATED, ADRs 0088/0091); `session_window.REQUEST_CEILING` is this one."""
+MAX_ORDER_SUBMIT_RATE = f"{REQUEST_CEILING}/00:01:00"
+"""At most `REQUEST_CEILING` submits in any minute. Paper nodes only: the lead's decision of 2026-11-11,
+under the owner's that paper carries no risk limit, so the request gate (Mover's soft line, then the
+ceiling) binds first and the engine's throttle, which denies an over-limit submit, never refuses a sale.
+It was 50, a quarter of Alpaca's 200 (ADR 0049)."""
+MAX_ORDER_MODIFY_RATE = f"{REQUEST_CEILING}/00:01:00"
+"""At most `REQUEST_CEILING` modifies in any minute, on the same terms; it was 25 (ADR 0049)."""
 MAX_NOTIONAL_PER_ORDER_USD = Decimal(1000)
 """Per order, in the instrument's quote currency (ADR 0049), first sized for SPY near $750: one share passes,
 two do not. A session window runs on any symbol whose one share fits it, read from the latest sip trade
@@ -91,13 +105,24 @@ not hold (ADR 0037); and any window as long as a run (upstream's Lighter tutoria
 hold the last run's exit without its entry. Open orders and positions are reported however old."""
 
 
-def exec_engine_config(instrument_id: InstrumentId) -> LiveExecutionEngineConfig:
+def _instrument_ids(instrument_id: InstrumentId | Sequence[InstrumentId]) -> list[str]:
+    """One name or a window's names, in order and once each; an empty scope is never a window."""
+    instruments = (instrument_id,) if isinstance(instrument_id, InstrumentId) else instrument_id
+    ids = list(dict.fromkeys(str(instrument) for instrument in instruments))
+    if not ids:
+        raise ValueError("a paper node needs at least one instrument")
+    return ids
+
+
+def exec_engine_config(
+    instrument_id: InstrumentId | Sequence[InstrumentId],
+) -> LiveExecutionEngineConfig:
     """The execution engine with its open-order and position checks against the venue turned on, and
-    start-up reconciliation scoped to the instrument, as upstream's Lighter tutorial scopes it to its
+    start-up reconciliation scoped to every window instrument, as upstream's Lighter tutorial scopes it to its
     target, and to `RECONCILIATION_LOOKBACK_MINS` of history."""
     return LiveExecutionEngineConfig(
         reconciliation=True,
-        reconciliation_instrument_ids=[str(instrument_id)],
+        reconciliation_instrument_ids=_instrument_ids(instrument_id),
         reconciliation_lookback_mins=RECONCILIATION_LOOKBACK_MINS,
         open_check_interval_secs=OPEN_CHECK_INTERVAL_SECS,
         position_check_interval_secs=POSITION_CHECK_INTERVAL_SECS,
@@ -114,7 +139,7 @@ class RiskLimits(TypedDict):
 
 
 def risk_limits(
-    instrument_id: InstrumentId,
+    instrument_id: InstrumentId | Sequence[InstrumentId],
     *,
     max_order_submit_rate: str = MAX_ORDER_SUBMIT_RATE,
     max_notional_per_order: Decimal = MAX_NOTIONAL_PER_ORDER_USD,
@@ -134,7 +159,9 @@ def risk_limits(
         "bypass": False,
         "max_order_submit_rate": max_order_submit_rate,
         "max_order_modify_rate": MAX_ORDER_MODIFY_RATE,
-        "max_notional_per_order": {str(instrument_id): max_notional_per_order},
+        "max_notional_per_order": {
+            instrument: max_notional_per_order for instrument in _instrument_ids(instrument_id)
+        },
     }
 
 
@@ -150,19 +177,19 @@ def ema_cross_config(instrument_id: InstrumentId) -> EmaCrossConfig:
 
 def alpaca_paper_builder(
     name: str,
-    instrument_id: InstrumentId,
+    instrument_id: InstrumentId | Sequence[InstrumentId],
     *,
     trader_id: TraderId = TRADER_ID,
     max_order_submit_rate: str = MAX_ORDER_SUBMIT_RATE,
     max_notional_per_order: Decimal = MAX_NOTIONAL_PER_ORDER_USD,
     delay_post_stop_secs: int = DELAY_POST_STOP_SECS,
 ) -> LiveNodeBuilder:
-    """A builder with the Alpaca data and execution clients for `instrument_id`, `risk_limits`,
+    """A builder with the Alpaca data and execution clients for one or several `instrument_id`s, `risk_limits`,
     `exec_engine_config` and the timeouts every paper node here uses; the caller adds logging and builds.
     `delay_post_stop_secs` is longer for a strategy whose managed stop runs a market exit, which the node
     runs only inside that delay (`session_window.MANAGED_DELAY_POST_STOP_SECS`).
     The calls are the ones upstream's live examples make (`examples/live/sandbox/exec_tester.py`)."""
-    provider = InstrumentProviderConfig(load_ids=[str(instrument_id)])
+    provider = InstrumentProviderConfig(load_ids=_instrument_ids(instrument_id))
     return (
         LiveNode.builder(name, trader_id, Environment.SANDBOX)
         .with_risk_engine_config(
