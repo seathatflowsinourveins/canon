@@ -121,3 +121,29 @@ ten fields as list lines, in this order, each with a value:
 * status: open
 * supersedes: none
 * source: lead
+
+### L0007: The account read could not show what a protective stop did once it ended
+
+* area: exits
+* session: 2026-11-13
+* result: The paper account read showed only open orders, so a protective stop that had sold or been canceled left no trace in it; with the ended orders added, one read of a paper account listed 58 ended orders for the trade date, among them two canceled protective stops with their trail and high-water mark; that first read, walking the whole order history, took about four of its five allowed minutes
+* evidence: `src/canon_trading/custody.py` and `tests/test_custody.py`; the paper read's output, kept outside the repository
+* lesson: A stop's result has to be readable from the venue's ended orders, chosen by the time of the final event rather than of submission, and a walk over the venue's history needs a bound the venue documents (its 90-day cancel of an aged GTC order), with what must not be lost printed before it
+* change: the account read prints the trade date's ended orders after the flat read, bounded 92 days back
+* next: Read the trade date's protective stops from this section when judging a window, not from the dashboard
+* status: adopted
+* supersedes: none
+* source: review
+
+### L0008: The default window sells on one quote because persistence is refused on its arm
+
+* area: exits
+* session: 2026-11-13
+* result: The default paper window's trailing stop, triggered on the bid, elects on the first quote at its level, because the strategy refuses a breach count above one unless the trigger is the trade print, the trail is fixed, the size is not from the budget and protection is on; on paper account B, 31 of 34 windows exited by the trailing stop, 8 of them within 60 seconds of the first fill
+* evidence: ADR 0119's amendment of 2026-11-13; the by-hand window records, kept outside the repository
+* lesson: A rule the handbook states (a breach is a count over a span, never one quote) has to be checked against the default arm as it runs, not only against the arm its tests built
+* change: ADR 0119 amended to count spaced two-sided quotes under the default arm, its rows uncalibrated, nothing lifted in code yet
+* next: A failing test on shaped quote tapes, then the paper count per arm of exits by the stop, exits within 60 seconds and re-entries
+* status: open
+* supersedes: none
+* source: review
