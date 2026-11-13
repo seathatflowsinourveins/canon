@@ -154,16 +154,29 @@ def check_nights(text: str) -> list[str]:
 
 
 def check_rows(text: str) -> list[str]:
+    """Check every rows table with shared names, refusing pipe lines outside those tables."""
     lines = text.splitlines()
     if ROWS_HEADER not in lines:
         return [f"no header {ROWS_HEADER!r}"]
-    start = lines.index(ROWS_HEADER) + 2
+    errors: list[str] = []
     rows = []
-    for line in lines[start:]:
-        if not line.startswith("|"):
-            break
-        rows.append(line)
-    errors: list[str] = [] if rows else ["the table has no row"]
+    table_lines: set[int] = set()
+    for index, line in enumerate(lines):
+        if line != ROWS_HEADER:
+            continue
+        table_lines.update((index, index + 1))  # the header and separator
+        before = len(rows)
+        for row_index in range(index + 2, len(lines)):
+            row = lines[row_index]
+            if not row.startswith("|") or row == ROWS_HEADER:
+                break
+            rows.append(row)
+            table_lines.add(row_index)
+        if len(rows) == before:
+            errors.append("the table has no row")
+    for index, line in enumerate(lines):
+        if line.startswith("|") and index not in table_lines:
+            errors.append(f"row outside a headered table: {line!r}")
     names: set[str] = set()
     for line in rows:
         cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
@@ -406,3 +419,56 @@ def test_practices_check_refuses_an_unsourced_line() -> None:
     assert check_practices(page + "* A practice; not yet built (roadmap step 7).\n", steps) == []
     assert check_practices(page + "* A practice.\n", steps) != []
     assert check_practices(page + "* A practice; not yet built (roadmap step 9).\n", steps) != []
+
+
+def test_check_rows_validates_every_rows_table_in_rows_md() -> None:
+    bad = (
+        HANDBOOK / "rows.md"
+    ).read_text() + "\n| `TRAIL_CAP` | duplicate | guessed | | bad-date |\n"
+    assert check_rows(bad) != []
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "complaint"),
+    [
+        ("`TRAIL_CAP`", "`MIN_MOVE`", "second row"),
+        ("`TRAIL_CAP`", "trail_cap", "upper-case name"),
+        ("0.02", "", "no value"),
+        ("UNCALIBRATED", "guessed", "state"),
+        ("The owner's requirement", "", "no source"),
+        ("UNCALIBRATED", "calibrated", "names no record"),
+        ("2026-11-11", "bad-date", "not a date"),
+        ("2026-11-11", "2026-02-30", "not a date"),
+        (" | 2026-11-11", "", "expected 5"),
+    ],
+)
+def test_rows_check_validates_later_tables(old: str, new: str, complaint: str) -> None:
+    table = f"{ROWS_HEADER}\n|---|---|---|---|---|\n"
+    first = "| `MIN_MOVE` | 3 per cent | UNCALIBRATED | The owner's requirement | 2026-11-11 |"
+    second = "| `TRAIL_CAP` | 0.02 | UNCALIBRATED | The owner's requirement | 2026-11-11 |"
+    page = table + first + "\n\nWindow settings.\n\n" + table
+    assert check_rows(page + second) == []
+    errors = check_rows(page + second.replace(old, new))
+    assert any(complaint in error for error in errors), errors
+
+
+@pytest.mark.parametrize("position", ["before", "between", "after"])
+def test_rows_check_refuses_rows_outside_a_headered_table(position: str) -> None:
+    table = f"{ROWS_HEADER}\n|---|---|---|---|---|\n"
+    first = table + "| `MIN_MOVE` | 3 per cent | UNCALIBRATED | Requirement | 2026-11-11 |"
+    second = table + "| `TRAIL_CAP` | 0.02 | UNCALIBRATED | Requirement | 2026-11-11 |"
+    stray = "| `ATR_K` | 1 | UNCALIBRATED | Requirement | 2026-11-11 |"
+    pages = {
+        "before": f"{stray}\n\n{first}\n\n{second}",
+        "between": f"{first}\n\n{stray}\n\n{second}",
+        "after": f"{first}\n\n{second}\n\n{stray}",
+    }
+    errors = check_rows(pages[position])
+    assert any("outside a headered table" in error for error in errors), errors
+
+
+def test_rows_check_refuses_an_empty_later_table() -> None:
+    table = f"{ROWS_HEADER}\n|---|---|---|---|---|\n"
+    first = "| `MIN_MOVE` | 3 per cent | UNCALIBRATED | Requirement | 2026-11-11 |"
+    errors = check_rows(table + first + "\n\n" + table)
+    assert "the table has no row" in errors
