@@ -5,4 +5,5 @@ mover
 # `mise run paper:session` reads it at every scheduled firing, from the main that firing cloned, before it
 # takes a lock; a run by hand does not read it. `scripts/automation status` shows each firing's outcome.
 # The first line is the value and nothing else: any other first line, or no file, fails every scheduled
-# firing by name. `mover` goes with a plist that carries --mover (scripts/automation), in one change.
+# firing by name. `mover` needs a plist that carries --mover; scripts/test-lanes checks that the one
+# scripts/automation writes does.

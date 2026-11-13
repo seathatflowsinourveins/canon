@@ -241,16 +241,28 @@ row keeps the label of the last window's record; and a skip's heartbeat names no
 `running` reads as died only once it is stale, as after a runner's own failure.
 The first firing launchd started after the landing, at 20:52:21 UTC on 2026-11-11 from the main of that
 minute, skipped by name with its heartbeat written; the installed plist was still the one without `--mover`.
+
 **Turned on (2026-11-13).** The owner directed on 2026-11-13 that account B be in a window whenever Alpaca's
 clock says a session is open, with no lane holding a timer for it, and that a proof take its turn through
 account B's lock. Main's value is `mover` from this change, which #289 had set to `off` on 2026-11-12 until the
-universe landed. Nothing is installed with it: the plist `scripts/automation` writes already fires every 600 s
-with `--session auto --minutes 25 --mover --regular-strategy Mover`, and each firing reads the switch from the
-main it clones. It lands after the per-symbol trail became the Mover window's default, so a scheduled window,
-which passes no trail flag, runs that default. A run by hand waits for account B's lock as a firing does, and
-`paper:session` skips a window that would start within 60 s of the last one's end. A firing launchd starts
-after this landing is UNVERIFIED until the first one. Limit: ADR 0093's history load takes no account lock, so
-with the schedule on it runs on account A, not B.
+universe landed. Nothing is installed with it: the plist `scripts/automation` writes already runs
+`--session auto --minutes 25 --mover --regular-strategy Mover` 600 s after each firing ends (above), so a
+window starts about every 35 minutes while a session is open, and each firing reads the switch from the main it
+clones. This change lands only after the one that makes the per-symbol trail the Mover window's default, so a
+scheduled window, which passes no trail flag, runs that default. A firing launchd starts after this landing is
+UNVERIFIED until the first one. Limits:
+
+* **Account B is idle between windows.** Of each 35 minutes, about 10 are the pause and a window's start and
+  stop; a run by hand may fill them. A shorter interval is a change to `scripts/automation` and its install,
+  not made here.
+* **A proof waits at most 900 s.** A run by hand waits for account B's lock as a firing does, at most
+  `lockwait` (900 s), and a scheduled window holds it for about 27 minutes. A run started early in a scheduled
+  window therefore fails by name with nothing placed, and is started again after that window's end;
+  `paper:session` skips a window that would start within 60 s of the last one's end. A firing that waits out
+  900 s behind a longer run by hand fails the same way, and the next firing comes 600 s later.
+* **The history load moves to account A.** ADR 0093's history load takes no account lock; with the schedule
+  on, it runs on account A, not B. Nothing enforces this; it is a rule for the lane that runs a load.
+
 **The records kept (2026-11-11).** A window's records and logs are written only under the per-user temporary
 folder, which a restart empties (whether the system also clears it while running is UNVERIFIED). `paper:session`
 therefore copies them with macOS's `/usr/bin/rsync` into `<config>/canon/watch/windows/`, beside the runner's
