@@ -58,7 +58,8 @@ power, each position, each open order with its lineage, and `no_shorting`. It re
 `account_task` set data-only mode (`CANON_ALPACA_DATA_ONLY=1`, ADR 0070), so the client
 `session_window.paper_trading` builds refuses every method but GET before anything is sent. No account
 number, account ID, order ID or client order ID is printed; an order is named by its symbol, side,
-quantity, type, limit, status and lineage.
+quantity, type, limit, time in force, position intent, status and lineage. Time in force and position
+intent are Alpaca's returned values, or `not shown` when absent, never inferred from the order's lineage.
 
 Quantity (`read_holdings`). Alpaca's position carries no client order ID, so the quantity ours opened is read
 from the venue's orders: the net fill (buys add, sells take away) of every order of our lineage in the
@@ -233,11 +234,17 @@ LINEAGE_NAMES = {PROTECT: "ours (a protect stop)"}
 
 
 def order_line(order: Order) -> str:
-    """One open order as `paper:account` names it: symbol, side, quantity, type, limit, status, lineage."""
+    """One open order with its returned time in force, position intent and lineage; no identifiers."""
     qty = _quantity_named(order)
     kind = _value(order.type if order.type is not None else order.order_type)
+    # Contract: alpaca-py 0.45.0 at c42add7c0a70, alpaca/trading/models.py:292,301,312-324
+    # (read 2026-11-13): Order.time_in_force is TimeInForce, position_intent is optional
+    # PositionIntent, and an empty intent becomes None. Show only what the order returns.
+    time_in_force = _value(getattr(order, "time_in_force", None) or "not shown")
+    position_intent = _value(getattr(order, "position_intent", None) or "not shown")
     return (
         f"{order.symbol or NO_SYMBOL} {_value(order.side)} {qty} {kind} limit {_value(order.limit_price)} "
+        f"time_in_force {time_in_force} position_intent {position_intent} "
         f"status {_value(order.status)} {LINEAGE_NAMES.get(found := lineage(order.client_order_id), found)}"
     )
 
