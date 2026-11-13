@@ -222,17 +222,23 @@ def test_c2_new_prints_and_late_prints_are_ordered_only_by_venue_time(
 
 
 @pytest.mark.parametrize("offset", OFFSETS, ids=OFFSET_IDS)
-def test_c2_a_venue_older_breach_does_not_sell_a_hold(offset: int) -> None:
+def test_c2_a_venue_older_breach_of_the_holding_sells_a_hold_at_any_offset(offset: int) -> None:
+    # Amended for the lead's ruling of 2026-11-13 (09:27, F1 (b)), which replaced the spec line this
+    # case was written from: a print of the holding set aside as late counts toward the hold's low,
+    # so the hold's end sells, at every offset alike. It never becomes the newest price: the
+    # followed price stays the 9.90. The tester asserted a trail at the stop.
     seam = ClockSeam(offset, bid="9.89", ask="9.91")
     seam.slot.held_since = FILLED + SECOND + seam.offset_ns
     seam.slot.held_stop = STOP
     seam.deliver("9.90", FILLED + 3 * SECOND)
     seam.deliver("9.70", FILLED + 2 * SECOND, FILLED + 4 * SECOND)
+    assert seam.slot.newest_print is not None
+    assert seam.slot.newest_print.price == Decimal("9.90")
     seam.protect(FILLED + 5 * SECOND)
-    assert not seam.slot.exiting, "a late breach elected a sale"
-    assert [order.kind for order in seam.sent] == ["TRAILING"]
-    assert seam.sent[0].trigger_price is not None
-    assert seam.sent[0].trigger_price.as_decimal() == STOP
+    assert seam.slot.exiting
+    assert [order.kind for order in seam.sent] == ["LIMIT"]
+    row = seam.slot.exit_record
+    assert row is not None and row.trigger_reason == "held stop (followed price)"
 
 
 def recorded_window(monkeypatch: pytest.MonkeyPatch, root: Path, offset: int) -> dict[str, Any]:
