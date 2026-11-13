@@ -765,6 +765,16 @@ class WindowConfig:
     trade, which can be minutes old outside the regular session, and none from before the entry's fill).
     Overnight it is refused: the part streams boats, not sip. It turns the data client's trade-condition filter on
     (`PRINT_TRIGGERS`)."""
+    validate_trade_sequence: bool = False
+    """Turn on the data client's check that sets aside a streamed print older than the newest one passed
+    on (`AlpacaDataClientConfig.validate_trade_sequence`, ADR 0134). Chosen per window by
+    --validate-trade-sequence and off unless given; Mover's, since its record carries the check's tally
+    (`late_prints_set_aside_by_the_adapter`). Refused together with a print trigger: there Mover judges
+    a late print itself (one counts toward a held stop's low) and must see every print, which the
+    data client's check would set aside first. Under `bid_ask` no print feeds a hold's low, but the check
+    still changes what Mover reads: its own late-print tally, the minute bars built from ticks, and,
+    while the check's bound is measured against receipt and not Mover's quote reference, the newest
+    trade a held stop or a sale with no bid reads (ADR 0134 names the limit)."""
     spares: int = MOVER_SPARES
     """Additional qualified startup names watched by Mover, beyond its held slots."""
     baseline_path: Path | None = None
@@ -841,6 +851,18 @@ class WindowConfig:
         if self.trigger != "bid_ask" and self.strategy != MOVER:
             raise ValueError(
                 f"trigger {self.trigger} elects Mover's trailing sell; {self.strategy} has none"
+            )
+        if self.validate_trade_sequence and self.strategy != MOVER:
+            raise ValueError(
+                f"validate_trade_sequence is recorded in Mover's record; {self.strategy} has none"
+            )
+        if self.validate_trade_sequence and self.trigger in PRINT_TRIGGERS:
+            # The lead's ruling, 2026-11-13: under a print trigger Mover counts a late print toward
+            # a held stop's low, so it must see every print; the adapter's check would hide them.
+            raise ValueError(
+                f"validate_trade_sequence with trigger {self.trigger} is refused: Mover judges a "
+                "late print itself under a print trigger, and the data client's check would set "
+                "that print aside before Mover saw it"
             )
         if self.session not in SESSIONS:
             raise ValueError(f"session must be one of {SESSIONS}, got {self.session!r}")
@@ -1704,6 +1726,7 @@ def window_node(
             max_notional_per_order=order_cap,
             data_load_all=mover is not None,
             trade_condition_filter=mover is not None and config.trigger in PRINT_TRIGGERS,
+            validate_trade_sequence=mover is not None and config.validate_trade_sequence,
         )
         .with_logging(
             LoggerConfig(
@@ -3169,6 +3192,7 @@ def run_window(
         # the window's selection by its --trigger name; `run.rows.trigger` is Mover's own spelling
         mover["trigger"] = config.trigger
         mover["trade_condition_filter"] = config.trigger in PRINT_TRIGGERS
+        mover["validate_trade_sequence"] = config.validate_trade_sequence
         mover["roster_requested"] = mover["slots"] + config.spares
         mover["roster"] = [
             {
@@ -4835,6 +4859,13 @@ def _parser() -> argparse.ArgumentParser:
         "last_price, a trade print (persistence step 1)",
     )
     parser.add_argument(
+        "--validate-trade-sequence",
+        action="store_true",
+        help="set aside a streamed trade print older than the newest one passed on (the data client's "
+        f"check, ADR 0134); off unless given, and {MOVER}'s, whose record carries its tally; refused "
+        f"with --trigger last_price, under which {MOVER} judges a late print itself",
+    )
+    parser.add_argument(
         "--baseline-path", type=Path, help="default: catalog/movers-baseline/<feed>.json"
     )
     parser.add_argument(
@@ -4896,6 +4927,7 @@ def window_config(args: argparse.Namespace, session: str) -> WindowConfig:
             **profile,
             trail_profile_path=args.trail_profile_path,
             trigger=args.trigger,
+            validate_trade_sequence=args.validate_trade_sequence,
         )
         for name in ARM_FLAGS:
             if (arm := getattr(args, name)) is None:
@@ -4979,6 +5011,17 @@ def _args(argv: Sequence[str] | None) -> argparse.Namespace:
         parser.error(
             f"--trigger elects {MOVER}'s trailing sell, so it needs --strategy or --regular-strategy "
             f"{MOVER}, or --mover outside the regular session"
+        )
+    if args.validate_trade_sequence and not runs_mover:
+        parser.error(
+            f"--validate-trade-sequence is recorded in {MOVER}'s record, so it needs --strategy or "
+            f"--regular-strategy {MOVER}, or --mover outside the regular session"
+        )
+    if args.validate_trade_sequence and args.trigger in PRINT_TRIGGERS:
+        parser.error(
+            f"--validate-trade-sequence with --trigger {args.trigger} is refused: {MOVER} judges a "
+            "late print itself under a print trigger, and the data client's check would set that "
+            "print aside before it saw it"
         )
     # where Mover runs: the regular session under `--regular-strategy Mover`, or `--strategy Mover`
     # where no regular strategy is named; every extended part under `--mover`
@@ -5090,6 +5133,7 @@ def _main(args: argparse.Namespace) -> int:
             if args.strategy == MOVER
             else _trail_flags_given(args)
             + ([] if args.trigger == WindowConfig.trigger else [f"--trigger {args.trigger}"])
+            + (["--validate-trade-sequence"] if args.validate_trade_sequence else [])
         )
         if unrun:
             print(
@@ -5117,7 +5161,14 @@ def _main(args: argparse.Namespace) -> int:
                     "session": session,
                     "strategy": args.strategy,
                     "result": f"refused: {e}",
-                    **({} if config is None else {"trigger": config.trigger}),
+                    **(
+                        {}
+                        if config is None
+                        else {
+                            "trigger": config.trigger,
+                            "validate_trade_sequence": config.validate_trade_sequence,
+                        }
+                    ),
                     "started_epoch": time.time(),
                     "started": datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ"),
                     "stale_after": STALE_RUNNING_SECS,

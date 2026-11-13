@@ -1496,6 +1496,73 @@ def close(venue: Venue, data: Any = None):
     )
 
 
+PROTECT_STOP = "canon-protect-20261111T150000Z-1-6168c4fe"
+"""A trailing stop the protect task sent (`canon_trading.protect`)."""
+
+
+def protect_stop(venue: Venue, **fields: Any) -> Order:
+    return venue.open(
+        **{
+            "client_order_id": PROTECT_STOP,
+            "symbol": "SPY",
+            "side": "sell",
+            "qty": "10",
+            "type": "trailing_stop",
+            "order_type": "trailing_stop",
+            "limit_price": None,
+            "time_in_force": "gtc",
+            "extended_hours": False,
+            "submitted_at": (venue.now - timedelta(minutes=5)).isoformat(),
+            **fields,
+        }
+    )
+
+
+def test_a_protect_stop_is_a_lineage_of_its_own_neither_ours_to_cancel_nor_foreign() -> None:
+    assert custody.lineage(PROTECT_STOP) == custody.PROTECT
+    assert custody.PROTECT not in (custody.OURS, custody.FOREIGN, custody.MISSING)
+    for other in ("canon-protect-", "canon-protect-manual", "canon-protect-20261111T150000Z-1"):
+        assert custody.lineage(other) == custody.FOREIGN
+
+
+@pytest.mark.parametrize("opened_by", [None, NODE_BUY], ids=["somebody-elses-long", "our-own-long"])
+def test_the_close_never_cancels_a_protect_stop_and_leaves_its_symbol_alone(opened_by) -> None:
+    """The stop guards a long that need not be ours: a close-only run that canceled it would leave
+    that long with nothing. So the symbol is frozen and named, whoever opened the long, and the stop
+    stays; to close such a long, its stop is taken off first, on purpose."""
+    venue = Venue(REGULAR)
+    venue.hold("SPY", 10, client_order_id=opened_by)
+    stop = protect_stop(venue)
+    report = close(venue)
+    assert venue.sent == [] and venue.canceled == []
+    why = report.frozen["SPY"][0]
+    assert why.startswith(f"open a protect stop of ours, {PROTECT_STOP} (sell 10 SPY trailing_stop")
+    assert "never cancels" in why
+    assert any(
+        o.client_order_id == stop.client_order_id and _value(o.status) == "new"
+        for o in venue.history
+    )
+
+
+def test_a_protect_stop_that_triggered_is_not_a_sale_by_our_orders() -> None:
+    """Ten of somebody else's shares were sold by a protect stop, and a node of ours then bought 5:
+    our orders opened 5 and 5 are held, so they are ours to close. Counted as a sale of ours, the
+    stop's fill would put ours at minus 5 and freeze them."""
+    venue = Venue(REGULAR)
+    venue.hold("SPY", 5)
+    protect_stop(venue, filled_qty="10", status="filled")
+    report = close(venue)
+    assert report.frozen == {}
+    (sent,) = venue.sent
+    assert (sent.symbol, sent.qty) == ("SPY", 5)
+
+
+def test_the_account_read_names_a_protect_stop_as_ours() -> None:
+    venue = Venue(REGULAR)
+    line = custody.order_line(protect_stop(venue))
+    assert line.endswith("status new ours (a protect stop)") and PROTECT_STOP not in line
+
+
 def test_in_the_regular_session_ours_is_closed_at_market_and_the_account_left_flat() -> None:
     venue = Venue(REGULAR)
     venue.hold("SPY", 1)

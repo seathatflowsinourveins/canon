@@ -73,6 +73,9 @@ Not adopted:
 * **Advisor pairings.** For the current-generation pairs measured (Opus 5.5 with a Fable 5.1 advisor; Haiku
   or Sonnet 5.5 with an Opus 5.5 advisor) the gain was at the edge of noise or negative, at about twice the
   cost. A weak executor can gain a lot (a low-effort Sonnet 5 gained 23 points), but no lane here is one.
+  ADR 0141 supersedes this bullet: on the owner's requirement of 2026-11-13 it adopts an advisor, Opus for
+  every session and Fable 5.2 for a lane landing a trading-path change. The measurement above stands, and
+  that record states it as the case against.
 * **A second model provider for runtime workers.** Artificial Analysis shows GPT-6.1 Sol (xhigh) at index 52
   for $0.76 per task and Gemini 4 Carbon (high) at index 60. A second provider adds a second SDK, cache
   namespace and set of failure modes; it is adopted only after an eval on our own tasks shows it wins.
@@ -90,8 +93,8 @@ point.
 ADR 0059 sets the default for a session started with no model named to the build lane's `opus` (ADR 0022
 had set `fable`), pins no alias, so each follows the vendor and a lane's model is what its alias resolved to
 on the table's `read_at`, and holds the picker to the four families with Fable at the orchestrator lane's ID.
-The table's `claude_code` section holds those settings and its `runtimes` section the other runtimes'
-defaults. The lanes above are unchanged.
+The table's `claude_code` section holds those settings, with the advisor ADR 0141 adds under `advisor`, and
+its `runtimes` section the other runtimes' defaults. The lanes above are unchanged.
 
 ### Codex service tier (2026-11-12)
 

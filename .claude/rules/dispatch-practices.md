@@ -1,6 +1,6 @@
 # Dispatch practices
 
-A coordinator's brief to a builder or reader follows these seven. The first six are read from superpowers at
+A coordinator's brief to a builder or reader follows these eight. The first six are read from superpowers at
 `22f0b463` (registry `reference`, read for patterns; `scripts/canon src superpowers`; `SDD` below is
 `skills/subagent-driven-development/`).
 
@@ -24,6 +24,19 @@ A coordinator's brief to a builder or reader follows these seven. The first six 
    runs on the session's model, or on Opus when the session runs Fable
    (https://code.claude.com/docs/en/sub-agents.md, "Built-in subagents"), so a dispatch to Explore
    names the smaller model too.
+8. A change on `scripts/land`'s `TRADING_PATHS` is landed by a Claude lane started for the landing, in
+   the change's workspace, on the build lane's model; the builder, Claude or another runtime, stops at
+   its report. Before that lane starts, the coordinator merges `advisorModel`, set to `canon/models.json`'s
+   `claude_code.advisor.final_landing`, into the `.claude/settings.local.json` at the workspace's own root,
+   never the main checkout's, which every canon session reads and which wins where both set a key; that
+   Claude Code reads the worktree's own file beside it rests on one probe (ADR 0141). Once the lane runs,
+   the coordinator reads the advisor model its first request carried, from the transcript's request-shape
+   entry, that field alone, and names in its report a lane whose request carried another or none. The
+   lane reproduces the builder's tests, runs the review ADR 0017 requires and lands; its subagents
+   inherit the advisor. When it has landed or stopped, the coordinator removes the key before any other
+   lane starts in that workspace. No session runs `/advisor`, which saves its pick to the user settings
+   every session reads (ADR 0141; https://code.claude.com/docs/en/advisor.md, settings.md and
+   settings-reference.md, read 2026-11-13).
 
 Where Canon differs, its own limit holds: one fix round, then the task returns to its builder (ADR 0045
 and the lead's order), not superpowers' five (`SDD/references/fix-loop.md:21`). No skill is enabled:

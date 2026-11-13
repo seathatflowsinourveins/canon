@@ -36,7 +36,13 @@ open order in the window's symbol (ADR 0060, "Bad", 2026-11-11). Our nodes are b
 `001` (`SessionMaCross` in `session_window`, `EmaCross` in `paper_node`), so they write
 `O-YYYYMMDD-HHMMSS-001-001-N`; the account check after a window's stop writes
 `canon-close-YYYYMMDDTHHMMSSZ-N-<8 hex>` (`session_window.CLOSE_ID_PREFIX`, ADR 0060), and the close-only
-form the same with `hand-` after the prefix. An ID of any other form is foreign, and an order with no ID
+form the same with `hand-` after the prefix. The protect task's trailing stop writes
+`canon-protect-YYYYMMDDTHHMMSSZ-N-<8 hex>` (`protect.py`) and is a class of its own, `PROTECT`: it is ours
+by name in the account read, and counts as cover on the protect task's next run, but it guards a long that
+need not be one our orders opened. So the close-only form never cancels it and never counts its fills in
+what our orders opened: a symbol with one open is frozen and named, like any symbol the form must not
+touch, and a close-only run cannot take the stop off a long somebody else opened.
+An ID of any other form is foreign, and an order with no ID
 is never ours either (`MISSING`), since nothing shows it is ours. A replacement is read by its own ID like
 any order: whose it is never follows from what it replaces. One our adapter sent carries the replaced
 order's ID with a clock stamp after its count (`canon_alpaca.execution.replacement_client_order_id`, ADR
@@ -190,16 +196,28 @@ CLOSE_CLIENT_ORDER_ID = re.compile(
 )
 """The whole of a close's client order ID: the prefix, the form, the run's UTC stamp, a count and eight hex
 digits, as `session_window._AccountCheck._close` writes it; not the prefix alone, which anyone could type."""
+PROTECT_PREFIX = "canon-protect-"
+"""What the client order ID of a trailing stop `protect`'s task sends begins with."""
+PROTECT_CLIENT_ORDER_ID = re.compile(
+    rf"{re.escape(PROTECT_PREFIX)}[0-9]{{8}}T[0-9]{{6}}Z-[0-9]+-[0-9a-f]{{8}}", re.ASCII
+)
+"""The whole of a protect stop's client order ID, in a close's shape: the prefix, the run's UTC stamp, a
+count and eight hex digits (`protect._Protect._protect`)."""
+PROTECT = "protect"
+"""The lineage of a trailing stop the protect task sent: ours to name, never this module's to cancel."""
 
 
 def lineage(client_order_id: object) -> str:
-    """`OURS` for a client order ID our nodes or checks write, `MISSING` for none (None or empty), else
-    `FOREIGN`. Only `OURS` may ever be canceled or closed."""
+    """`OURS` for a client order ID our nodes or checks write, `PROTECT` for one the protect task
+    writes, `MISSING` for none (None or empty), else `FOREIGN`. Only `OURS` may ever be canceled or
+    closed."""
     if client_order_id is None or not str(client_order_id).strip():
         return MISSING
     found = str(client_order_id)
     if NODE_CLIENT_ORDER_ID.fullmatch(found) or CLOSE_CLIENT_ORDER_ID.fullmatch(found):
         return OURS
+    if PROTECT_CLIENT_ORDER_ID.fullmatch(found):
+        return PROTECT
     return FOREIGN
 
 
@@ -210,13 +228,17 @@ def _value(field: object) -> str:
     return str(getattr(field, "value", field))
 
 
+LINEAGE_NAMES = {PROTECT: "ours (a protect stop)"}
+"""How `paper:account` names a lineage that is not its own word."""
+
+
 def order_line(order: Order) -> str:
     """One open order as `paper:account` names it: symbol, side, quantity, type, limit, status, lineage."""
     qty = _quantity_named(order)
     kind = _value(order.type if order.type is not None else order.order_type)
     return (
         f"{order.symbol or NO_SYMBOL} {_value(order.side)} {qty} {kind} limit {_value(order.limit_price)} "
-        f"status {_value(order.status)} {lineage(order.client_order_id)}"
+        f"status {_value(order.status)} {LINEAGE_NAMES.get(found := lineage(order.client_order_id), found)}"
     )
 
 
@@ -443,9 +465,15 @@ def describe(order: Order) -> str:
     ID, which may be the owner's)."""
     qty = _quantity_named(order)
     what = f"{_value(order.side)} {qty} {order.symbol or NO_SYMBOL} {_value(order.type or order.order_type)}"
-    if lineage(order.client_order_id) == OURS:
+    found = lineage(order.client_order_id)
+    if found == OURS:
         return f"{order.client_order_id} ({what}, {_value(order.status)})"
-    return f"a {lineage(order.client_order_id)} order: {what}, {_value(order.status)}"
+    if found == PROTECT:
+        return (
+            f"a protect stop of ours, {order.client_order_id} ({what}, {_value(order.status)}), which "
+            "this form never cancels"
+        )
+    return f"a {found} order: {what}, {_value(order.status)}"
 
 
 @dataclass

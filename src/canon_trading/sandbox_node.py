@@ -9,6 +9,10 @@ starting_balances=..., account_id=..., fee_model=...))`, then the built-in `Exec
 `add_builtin_strategy` (v2.0.0rc8, `nautilus_trader.adapters.sandbox` and `nautilus_trader.testkit`). Here
 the data client is `canon_alpaca`'s, on venue `ALPACA`, so the sandbox fills on Alpaca's quotes and trades.
 
+Read 2026-11-13 at the same pin: `docs/developer_guide/python_adapters.md:87-109`:
+adapter fields are keyword arguments of a `DataClientConfig` subclass, and the factory receives that
+original subclass instance; instance fields participate in serialization.
+
 How it is kept from trading (ADR 0070, terms 3 and 6):
 
 * It runs in data-only mode, which `mise run paper:data` sets and `main` sets again: every alpaca-py REST
@@ -38,6 +42,7 @@ from decimal import Decimal
 from typing import TYPE_CHECKING
 
 from canon_alpaca.constants import VENUE
+from canon_alpaca.data import AlpacaDataClientConfig
 from canon_alpaca.execution import AlpacaExecutionClient
 from canon_alpaca.factories import AlpacaDataClientFactory
 from canon_alpaca.providers import DATA_ONLY_ENV
@@ -113,10 +118,17 @@ def sandbox_execution_config(*, load_all: bool) -> SandboxExecutionClientConfig:
     )
 
 
-def sandbox_node(name: str = "CANON-SANDBOX", *, load_all: bool = False) -> LiveNode:
+def sandbox_node(
+    name: str = "CANON-SANDBOX", *, load_all: bool = False, validate_trade_sequence: bool = False
+) -> LiveNode:
     """The node of upstream's example with Alpaca's data client, the sandbox execution client on venue
     `ALPACA` and `ExecTester` on SPY. Refused unless the process is in data-only mode, and checked after
-    the build by `refuse_alpaca_execution`."""
+    the build by `refuse_alpaca_execution`. `validate_trade_sequence` opts into ADR 0134's adapter
+    check; False keeps the plain data config."""
+    if not isinstance(validate_trade_sequence, bool):
+        raise TypeError(
+            f"validate_trade_sequence must be True or False, not {validate_trade_sequence!r}"
+        )
     if not data_only():
         raise DataOnlyRefused(
             f"the sandbox node runs in data-only mode only ({DATA_ONLY_ENV}=1, ADR 0070); nothing was built"
@@ -127,6 +139,11 @@ def sandbox_node(name: str = "CANON-SANDBOX", *, load_all: bool = False) -> Live
         if load_all
         else InstrumentProviderConfig(load_ids=[str(INSTRUMENT_ID)])
     )
+    data_config = (
+        AlpacaDataClientConfig(instrument_provider=provider, validate_trade_sequence=True)
+        if validate_trade_sequence
+        else DataClientConfig(instrument_provider=provider)
+    )
     node = (
         LiveNode.builder(name, TRADER_ID, Environment.SANDBOX)
         .with_reconciliation(reconciliation=False)
@@ -135,9 +152,7 @@ def sandbox_node(name: str = "CANON-SANDBOX", *, load_all: bool = False) -> Live
         .with_timeout_connection(TIMEOUT_CONNECTION_SECS)
         .with_timeout_disconnection_secs(TIMEOUT_DISCONNECTION_SECS)
         .with_delay_shutdown_secs(TIMEOUT_SHUTDOWN_SECS)
-        .add_data_client(
-            ALPACA, AlpacaDataClientFactory, DataClientConfig(instrument_provider=provider)
-        )
+        .add_data_client(ALPACA, AlpacaDataClientFactory, data_config)
         .add_simulated_exec_client(
             ALPACA,
             SandboxExecutionClientFactory(),

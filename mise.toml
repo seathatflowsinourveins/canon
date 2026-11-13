@@ -862,6 +862,50 @@ echo "account: $usage_account"
 exec /usr/bin/timeout -s TERM -k 30 600 uv run --locked python -c 'from canon_trading.custody import close_task; raise SystemExit(close_task())'
 '''
 
+# One trailing stop Alpaca holds, GTC and marked sell_to_close, for each long no working sell covers, in the regular
+# session on one paper account, then exit (src/canon_trading/protect.py, ADR 0142, ADR 0129). Accounts A (tests) and C
+# (protect); windows is refused by name for now. --plan-only makes every read and names what each stop would be
+# under every registered row, and sends nothing: an account's first run. A run that sends names its row with
+# --row (the Mover's registered trail arms; there is no default). It reads one account's pair and takes that account's lock without
+# waiting: a lock held refuses the run, so the go it was started on is not spent later. Exit 0 each long covered
+# (or planned), 1 a read or send failed, 2 a long left uncovered by name, 3 refused by name.
+[tasks."paper:protect"]
+description = "Send one GTC trailing stop Alpaca holds, marked sell_to_close, for each long no working sell covers, on paper account A or C, in the regular session, then exit; --plan-only sends nothing"
+shell = "bash -c"
+timeout = "10m"
+usage = '''
+arg "<account>" help="tests: account A; protect: account C (ADR 0142); windows (B) is refused by name for now" {
+  choices "tests" "windows" "protect"
+}
+flag "--plan-only" help="make every read, print what each stop would be under every registered row (the distance as a share of the price, the level it opens at, what bound it), and send nothing"
+flag "--row <row>" help="the registered trail row a sending run plans on: F2 the fixed trail, OWN1 and OWN3 one and three one-minute ATRs; no default, and a send without one is refused" {
+  choices "F2" "OWN1" "OWN3"
+}
+'''
+run = '''
+case "${usage_account:-}" in
+  tests) svc=canon-alpaca-paper; lock=canon-paper-test.lock ;;
+  windows) echo "paper:protect: account windows (B) is refused by name for now; nothing was read" >&2; exit 3 ;;
+  protect) svc=canon-alpaca-paper-protect; lock=canon-paper-protect.lock ;;
+  *) echo "paper:protect: no paper account named '${usage_account:-}'; the names are tests and protect; nothing was read" >&2; exit 3 ;;
+esac
+ALPACA_API_KEY="$(/usr/bin/timeout 30 /usr/bin/security find-generic-password -s "$svc" -a ALPACA_API_KEY -w)" || ALPACA_API_KEY=""
+ALPACA_SECRET_KEY="$(/usr/bin/timeout 30 /usr/bin/security find-generic-password -s "$svc" -a ALPACA_SECRET_KEY -w)" || ALPACA_SECRET_KEY=""
+[ -n "$ALPACA_API_KEY" ] && [ -n "$ALPACA_SECRET_KEY" ] || { echo "paper:protect: account ${usage_account}'s pair is not in the login keychain (mise run paper:check ${usage_account}); nothing was read" >&2; exit 1; }
+export ALPACA_API_KEY ALPACA_SECRET_KEY CANON_PAPER_ACCOUNT="$usage_account"
+tmp="$(/usr/bin/getconf DARWIN_USER_TEMP_DIR)" || tmp=""
+case "$tmp" in /*/) ;; *) echo "paper:protect: the per-user temporary folder is not known, so there is no paper lock to take; nothing was sent" >&2; exit 1 ;; esac
+exec 9>>"${tmp}${lock}"
+/usr/bin/lockf -t 0 9 2>/dev/null; held=$?
+case "$held" in
+  0) ;;
+  75) echo "paper:protect: refused: account ${usage_account}'s lock is held (a paper run is on it); nothing was sent" >&2; exit 3 ;;
+  *) echo "paper:protect: account ${usage_account}'s lock could not be taken (lockf exit $held); nothing was sent" >&2; exit 1 ;;
+esac
+echo "account: $usage_account"
+exec /usr/bin/timeout -s TERM -k 30 300 uv run --locked python -c 'import sys; from canon_trading.protect import task_from_flags; raise SystemExit(task_from_flags(sys.argv[1], sys.argv[2]))' "${usage_plan_only:-false}" "${usage_row:-}"
+'''
+
 # The nightly study (docs/adr/0089-the-nightly-study-loop.md): one firing of canon_trading.nightly_study in
 # this checkout, which studies the latest recorded night once and does nothing when there is none: the
 # registered rows replayed on the recorder's catalog (catalog/sip in the main checkout), each a trial in the

@@ -5,13 +5,15 @@
   "model": "opus",
   "availableModels": ["opus", "sonnet", "haiku", "claude-fable-5-2"],
   "modelPicker": { "options": [{ "model": "claude-fable-5-2" }] },
+  "advisorModel": "opus",
   "env": {
     "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
     "OTEL_LOGS_EXPORTER": "otlp",
     "OTEL_METRICS_EXPORTER": "none",
     "OTEL_EXPORTER_OTLP_PROTOCOL": "grpc",
     "OTEL_EXPORTER_OTLP_ENDPOINT": "http://127.0.0.1:4317",
-    "DO_NOT_TRACK": "0"
+    "DO_NOT_TRACK": "0",
+    "CLAUDE_CODE_RETRY_WATCHDOG": "1"
   },
   "showThinkingSummaries": true,
   "syncClaudeAiSkills": false,
