@@ -217,6 +217,13 @@ def test_p1_finite_nonnegative_fills_are_accepted(role: str, value: str | float)
     venue, at, _ = order_case(role)
     venue.history[at] = order_count(venue.history[at], "filled_qty", value)
     filled = Decimal(str(value))
+    if role == "foreign-successor" and 0 < filled < 18:
+        # Added by the owning lane after the tester's hand, on the lead's ruling of 2026-11-13: a
+        # foreign replacement that shows fewer fills than our 18 before it leaves the count not
+        # established. The tester's case required 18. Zero still counts nothing.
+        count, why = standins.opened(venue)
+        assert count is None and "not established" in why, (count, why)
+        return
     if role in ("foreign-predecessor", "own-sell-successor"):
         expected = Decimal(20) - filled
     elif role in ("foreign-successor", "foreign-unrelated"):
@@ -420,7 +427,15 @@ def test_p4_well_formed_chains_keep_the_base_result(
     else:
         raise AssertionError(scenario)
     venue.held["SPY"] = Decimal(held)
-    assert standins.opened(venue) == (Decimal(expected), "")
+    if scenario == "sell-chain":
+        # Turned by the owning lane after the tester's hand, on the lead's ruling of 2026-11-13: a
+        # sell chain of ours with fills on two orders running (5, then 8) is not counted, since
+        # whether the 8 carries the 5 is not established. The tester's case required 12 and a close.
+        count, why = standins.opened(venue)
+        assert count is None and "not established" in why, (count, why)
+        sell = None
+    else:
+        assert standins.opened(venue) == (Decimal(expected), "")
     report = standins.close(venue)
     assert not report.failed, report.lines()
     if sell is None:
