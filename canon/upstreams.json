@@ -126,6 +126,18 @@
       "adr": "0145"
     },
     {
+      "id": "google-sre-workbook-postmortem",
+      "field": "decision-records",
+      "url": "https://sre.google/workbook/postmortem-culture/",
+      "role": "reference",
+      "license": "CC BY-NC-ND 4.0",
+      "why": "Postmortem action items with an owner and a verifiable end state: the pattern behind the journal entry's owner and closes fields. Read only; nothing copied beyond short quotations.",
+      "evidence": [
+        "https://sre.google/workbook/postmortem-culture/"
+      ],
+      "adr": "0145"
+    },
+    {
       "id": "spec-kit",
       "field": "agent-extensions",
       "repo": "github/spec-kit",
