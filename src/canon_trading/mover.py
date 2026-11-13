@@ -1257,6 +1257,10 @@ class ExitRecord:
     notional: Decimal = Decimal(0)
     bought_notional: Decimal = Decimal(0)
     trail_distance: Decimal | None = None
+    held_stop_kept: Decimal | None = None
+    """The level a held stop keeps; a cheaper fill never lowers it (the lead, 2026-11-13 08:24)."""
+    held_stop_from_average: Decimal | None = None
+    """The average fill less that kept level: negative when a cheaper fill left the stop over it."""
     peak: Decimal | None = None
     trigger_ns: int | None = None
     trigger_price: Decimal | None = None
@@ -1282,6 +1286,10 @@ class ExitRecord:
             "quantity": str(self.quantity),
             "filled_quantity": str(self.filled),
             "trail_distance": None if self.trail_distance is None else str(self.trail_distance),
+            "held_stop_kept": None if self.held_stop_kept is None else str(self.held_stop_kept),
+            "held_stop_from_average": (
+                None if self.held_stop_from_average is None else str(self.held_stop_from_average)
+            ),
             "peak_price": None if self.peak is None else str(self.peak),
             "trigger_ns": self.trigger_ns,
             "trigger_price": None if self.trigger_price is None else str(self.trigger_price),
@@ -3781,6 +3789,10 @@ class Mover(Strategy):
         slot.protection_anchor = anchor
         if slot.exit_record is not None:
             slot.exit_record.trail_distance = distance
+            # the kept level and its distance from the average, which a cheaper fill can make
+            # negative: the stop then sits over the average and the next price through it sells (H1)
+            slot.exit_record.held_stop_kept = slot.held_stop
+            slot.exit_record.held_stop_from_average = anchor - slot.held_stop
         if slot.entry_record is not None:
             slot.entry_record["held_stop_level"] = str(slot.held_stop)
 
