@@ -371,3 +371,49 @@ def test_under_a_print_trigger_a_held_stop_counts_a_print_from_alpacas_acceptanc
     seam._protect(slot, Decimal(3), filled + 3 * SECOND)
     assert [o.kind for o in seam.sent] == ["LIMIT"] and slot.exiting
     assert slot.exit_record.trigger_reason == "held stop (followed price)"
+
+
+def test_a_late_print_does_not_hide_a_print_that_already_met_the_held_stop() -> None:
+    """Held at 9.80; between steps a print of the holding at 9.70 (after Alpaca's acceptance) arrives,
+    then a late print stamped before the entry, which the cache keeps as its last trade. The step has
+    no followed price, so `_hold` runs; it must still count the 9.70 in `held_low` and sell through the
+    stop rather than wait for another print (the xr4 reader's F2, carried into `_hold`)."""
+    seam, slot, filled, last = holding(TriggerType.LAST_PRICE, bid="9.89", ask="9.91")
+    seam.orders["E-1"].ts_accepted = filled - 500 * MS
+    seam.slots, seam.trades = {slot.instrument_id: slot}, 0
+    last.append(stamped("10.0000", filled - SECOND, filled - SECOND))
+    seam._protect(slot, Decimal(3), filled + SECOND)
+    assert slot.held_stop == Decimal("9.80") and seam.sent == []
+    through = SimpleNamespace(
+        instrument_id=slot.instrument_id,
+        price=Price.from_str("9.7000"),
+        ts_event=filled + 2 * SECOND,
+        ts_init=filled + 2 * SECOND,
+    )
+    late = SimpleNamespace(
+        instrument_id=slot.instrument_id,
+        price=Price.from_str("10.0000"),
+        ts_event=filled - 600 * MS,  # before the entry: not of this holding
+        ts_init=filled + 2 * SECOND + 1,  # but received last, so the cache's last trade
+    )
+    for trade in (through, late):
+        last.append(trade)
+        seam.on_trade(trade)
+    seam._protect(slot, Decimal(3), filled + 4 * SECOND)
+    assert [o.kind for o in seam.sent] == ["LIMIT"] and slot.exiting
+    assert slot.exit_record.trigger_reason == "held stop (followed price)"
+
+
+def test_an_entry_whose_acceptance_time_is_unset_does_not_own_a_print_from_before_it() -> None:
+    """The DeepSeek reader of the successor, P3 (defensive): the pinned order reads `ts_accepted` as None
+    until accepted, but an own-book copy defaults it to 0, and a stand-in or restored order may carry
+    that. Read as a time, 0 would make every cached print the holding's own, so a print stamped an
+    hour before the entry at 9.70 would meet the 9.80 held stop and sell. An unset time is no boundary:
+    the holding is taken from its fill, the stale print is not followed, and the stop holds."""
+    seam, slot, filled, last = holding(TriggerType.LAST_PRICE, bid="9.89", ask="9.91")
+    seam.orders["E-1"].ts_accepted = 0
+    last.append(stamped("9.7000", filled - 3600 * SECOND, filled - 3600 * SECOND))
+    seam._protect(slot, Decimal(3), filled + SECOND)
+    assert slot.held_stop == Decimal("9.80")
+    assert seam.sent == []
+    assert slot.exiting is False

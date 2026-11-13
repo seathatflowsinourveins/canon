@@ -3731,6 +3731,11 @@ class Mover(Strategy):
         self._ensure_exit(slot, held)
         self._held_at_l(slot)
         last, source = self._last_known(slot)
+        if slot.held_low is not None and (last is None or slot.held_low < last):
+            # a followed price since the last step already met or neared the stop: a later print the
+            # holding does not own (a late one stamped before the entry) must not hide it, as `_trail`
+            # reads it (the DeepSeek reader of the successor, P2; the xr4 reader's F2 carried here)
+            last, source = slot.held_low, "followed price"
         if slot.held_stop is not None and last is not None and last <= slot.held_stop:
             slot.exiting = True
             self._mark_exit(slot, now, last, f"held stop ({source})")
@@ -3933,7 +3938,11 @@ class Mover(Strategy):
             return None
         entry = self._order(slot.entry_id)
         accepted = None if entry is None else getattr(entry, "ts_accepted", None)
-        return filled if accepted is None else min(filled, int(accepted))
+        # a 0 is an unset time, no boundary: the pinned order reads None until accepted and the first
+        # fill sets it if acceptance did not (NautilusTrader d53849b216e2, crates/model/src/python/orders/
+        # mod.rs:188-190, crates/model/src/orders/mod.rs:1413-1414), but an own-book copy defaults it to 0
+        # (orders/mod.rs:539) and a stand-in or restored order may carry that
+        return filled if not accepted else min(filled, int(accepted))
 
     def _entry_filled_ns(self, slot: Slot) -> int | None:
         """The venue's time of the entry's first fill on record, or None."""
