@@ -30,3 +30,6 @@ dist/
 
 # macOS
 .DS_Store
+
+# a Codex worker's own tier, written into its workspace by the dispatch (ADR 0005)
+/.codex/

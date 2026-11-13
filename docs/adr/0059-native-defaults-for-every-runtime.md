@@ -50,9 +50,17 @@ Chosen: **option 2**.
 3. **The lead and every Fable session start by full ID**, `claude --model claude-fable-5-2`, never from a
    picker row; `/status` then shows `Model: claude-fable-5-2`. New sessions default to the build lane's
    `opus`, as the owner's settings hold. This supersedes ADR 0022 rule 5 (`fable`).
-4. **Codex: `gpt-6.1-sol` at `max`** in `config.toml` (`home/.codex/defaults.toml`), so a session with no
-   flags runs as ADR 0045 rule 7 starts a review. This is the owner's choice and departs from OpenAI's
-   page three ways: Astra is "Our most capable model for complex work across code, apps, and research";
+4. **Codex: `gpt-6-astra` at `max`** in `config.toml` (`home/.codex/defaults.toml`), so a session with no
+   flags runs as ADR 0045 rule 7 starts a review, with `notice.hide_rate_limit_model_nudge = true` so the
+   TUI's rate-limit prompt cannot move a session to `gpt-6-luna` (ADR 0005, amendment of 2026-11-12).
+   From 2026-11-12 this follows the owner's standing instruction that the GPT lane runs the most capable
+   current model at a high effort; `scripts/bootstrap --check` fails when the installed model, effort or
+   tier differs from the template. Until then the rule named `gpt-6.1-sol`, the owner's choice of
+   2026-11-10, which departed from OpenAI's page three ways; the page's sentences stand as the evidence
+   for the move. `max` departs from the same page's advice for Astra, "Start with High for Luna or Light
+   for Astra", where "Astra's Light setting is low": the owner's instruction asks for a high effort, and a
+   worker's review or build is the kind of task the page sends to Max, "the hardest problems, when depth
+   matters more than speed or usage". The page's sentences on Sol, quoted when Sol was chosen: Astra is "Our most capable model for complex work across code, apps, and research";
    Sol is "Near-Astra performance for complex work at a lower cost than Astra"; and "For GPT-6.1 Sol,
    start with the reasoning effort available by default in your client", since "Most tasks do not need Max
    or Ultra"; Max is for "the hardest problems, when depth matters more than speed or usage". Naming
@@ -85,7 +93,7 @@ Rules 4 to 7 replace ADR 0045 rule 7's "the other three stay on their defaults".
 | Claude Code, new session | `opus` (Opus 5.5) | model default, `medium` | settings `model` | `--check` row default model |
 | Claude Code, lead | `claude-fable-5-2` | per lane | `--model` at launch | `/status` |
 | Claude Code, picker | three families and Fable 5.2 | — | `availableModels`, `modelPicker` | `--check` rows model allowlist, picker rows |
-| Codex | `gpt-6.1-sol` | `max` | `config.toml` `model`, `model_reasoning_effort` | `--check` row codex defaults |
+| Codex | `gpt-6-astra` | `max` | `config.toml` `model`, `model_reasoning_effort`, `notice.hide_rate_limit_model_nudge`; `service_tier` `default`, Fast per dispatch (ADR 0005) | `--check` rows codex defaults, codex service tier; `scripts/lanes --rates` OFF-MODEL |
 | Antigravity | Gemini 4 Carbon (High) | in the label | `settings.json` `model` | `--check` row agy default model |
 | Muse Code | `muse-wonder-1.0` | `max` | launch flags | the session's model line |
 | DeepSeek Harness | `deepseek-flash` | `max` | dsh-tui bundle | `dsh --profile dsh-tui --dump-config` |

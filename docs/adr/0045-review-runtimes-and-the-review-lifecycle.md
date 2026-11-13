@@ -113,7 +113,11 @@ owner's delegation of 2026-11-10.
    `scripts/bootstrap` writes only its own table there. (From 2026-11-10, ADR 0059 rule 4:
    `scripts/bootstrap --user-config` writes both keys there, from `home/.codex/defaults.toml`, so flags
    and config agree; its rules 5 and 6 give Antigravity and Muse a default of their own, and rule 7 keeps
-   DeepSeek Harness on its bundle's.)
+   DeepSeek Harness on its bundle's.) From 2026-11-12 the model is `gpt-6-astra`, still at `max`, by the owner's
+   standing instruction that the GPT lane runs the most capable current model at a high effort (ADR 0005,
+   amendment of 2026-11-12; ADR 0059 rule 4): the coordinator starts a review with `--agent codex --model
+   gpt-6-astra --effort max`, and a report from a session that ran another model, `gpt-6-luna` after the
+   rate-limit prompt included, says so.
    **Before this rule** every Codex review named no model or effort: both reviewer benchmark runs
    (`evals/review/runs/2026-11-10-first` and `-second`; their sheets say "on its own defaults") and, by
    ADR 0043 rule 5, the trials below. The machine's Codex config sets neither, so the catalog's defaults
