@@ -999,6 +999,23 @@ def test_a_window_with_the_filter_off_has_no_trade_condition_field(monkeypatch) 
     assert "trade_conditions" not in report["mover"]
 
 
+def test_the_window_end_carries_the_late_prints_the_adapter_set_aside(monkeypatch) -> None:
+    """A streamed print the data client's sequence check set aside is counted by name with its
+    lateness, and the window's record carries the count, per symbol."""
+    late = {"AAPL": {"count": 3, "most_late_ms": 1250}, "MSFT": {"count": 1, "most_late_ms": 1}}
+    monkeypatch.setattr(session_window, "late_prints_set_aside", lambda: late)
+    report = {"mover": {"http_requests": {"to_node_start": {}, "to_window_end": {}}}}
+    session_window._snapshot_requests(report)
+    assert report["mover"]["late_prints_set_aside_by_the_adapter"] == late
+
+
+def test_a_window_whose_adapter_set_no_print_aside_has_no_such_field(monkeypatch) -> None:
+    monkeypatch.setattr(session_window, "late_prints_set_aside", dict)
+    report = {"mover": {"http_requests": {"to_node_start": {}, "to_window_end": {}}}}
+    session_window._snapshot_requests(report)
+    assert "late_prints_set_aside_by_the_adapter" not in report["mover"]
+
+
 @pytest.mark.parametrize("part", ["regular", "pre-market", "after-hours", "overnight"])
 @pytest.mark.parametrize("liquidity", ["original", "thin", "liquid", "cash_falls"])
 def test_selected_tier_account_sizing_trades_and_flattens_in_each_part(

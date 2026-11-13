@@ -244,6 +244,7 @@ from canon_alpaca.constants import ENV_API_KEY
 from canon_alpaca.constants import ENV_SECRET_KEY
 from canon_alpaca.constants import FEED
 from canon_alpaca.constants import VENUE
+from canon_alpaca.data import late_prints_set_aside
 from canon_alpaca.execution import DEFINITIVE_SUBMIT_REFUSALS
 from canon_alpaca.execution import INSTRUMENT_REFUSAL
 from canon_alpaca.execution import ORDERS_PAGE_LIMIT
@@ -1957,6 +1958,10 @@ def _snapshot_requests(report: WindowReport | dict) -> BaseException | None:
     # the prints a client's trade-condition filter kept and left out, by code: only with one on
     if isinstance(mover, dict) and (counts := condition_counts()):
         mover["trade_conditions"] = counts
+    # the streamed prints a client's sequence check set aside, per symbol with how many and the most any
+    # was behind: only with one on, and only once one was
+    if isinstance(mover, dict) and (late := late_prints_set_aside()):
+        mover["late_prints_set_aside_by_the_adapter"] = late
     if (prior := fields.get("request_budget")) is None:
         return None
     budget = prior if isinstance(prior, dict) else {}

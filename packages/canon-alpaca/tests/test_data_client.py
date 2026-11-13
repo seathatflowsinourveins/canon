@@ -35,6 +35,7 @@ from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Literal
+from typing import cast
 from zoneinfo import ZoneInfo
 
 import canon_alpaca.data
@@ -51,8 +52,13 @@ from alpaca.trading.client import TradingClient
 from canon_alpaca.constants import ENV_API_KEY
 from canon_alpaca.constants import ENV_SECRET_KEY
 from canon_alpaca.constants import VENUE
+from canon_alpaca.data import STAMP_AHEAD_MOST_NS
 from canon_alpaca.data import AlpacaDataClient
 from canon_alpaca.data import AlpacaDataClientConfig
+from canon_alpaca.data import TradeSequence
+from canon_alpaca.data import late_ms
+from canon_alpaca.data import late_prints_set_aside
+from canon_alpaca.data import trade_stamp
 from canon_alpaca.factories import AlpacaDataClientFactory
 from canon_alpaca.trade_conditions import CONDITIONS_PATH
 from canon_alpaca.trade_conditions import TABLE
@@ -86,6 +92,7 @@ from nautilus_trader.model import OmsType
 from nautilus_trader.model import Price
 from nautilus_trader.model import TradeId
 from nautilus_trader.model import TraderId
+from nautilus_trader.model import TradeTick
 from nautilus_trader.persistence import DataCatalogConfig
 from nautilus_trader.persistence import ParquetDataCatalog
 from nautilus_trader.trading import Strategy
@@ -3382,6 +3389,7 @@ def test_the_defaults_outlast_the_quietest_feed_seen_delivering() -> None:
         ),
         ({"feed": "sip"}, "no setting 'feed'"),
         ({"trade_condition_filter": "yes"}, "trade_condition_filter must be True or False"),
+        ({"validate_trade_sequence": 1}, "validate_trade_sequence must be True or False"),
     ],
 )
 def test_the_config_refuses_a_bound_it_cannot_use(fields, error) -> None:
@@ -4401,3 +4409,276 @@ def test_with_the_filter_on_a_trade_request_off_sip_or_into_the_catalog_is_refus
     run(build_node(strategy, config=filtered_config(trade_condition_filter=True)), "hosted")
     assert [refusal in (r.failure_reason or "") for r in strategy.responses] == [True]
     assert trades_http.calls == [], "no trade was asked for"
+
+
+# -- late streamed prints set aside (`validate_trade_sequence`) ------------------------------------------
+
+PRINT_BASE = datetime(2021, 2, 22, 15, 51, 44, tzinfo=UTC)
+SEQUENCE_LINE = "Alpaca trade sequence on feed "
+
+
+def at(ms: int, trade_id: int, **changes: object) -> dict:
+    """A streamed print's fields: stamped by Alpaca `ms` after `PRINT_BASE`, with its own trade ID."""
+    return {"t": PRINT_BASE + timedelta(milliseconds=ms), "i": trade_id, **changes}
+
+
+def sequenced_config(*, trade_condition_filter: bool = False) -> AlpacaDataClientConfig:
+    return AlpacaDataClientConfig(
+        instrument_provider=InstrumentProviderConfig(load_ids=["AAPL.ALPACA"]),
+        validate_trade_sequence=True,
+        trade_condition_filter=trade_condition_filter,
+    )
+
+
+def emit_trades(client, alpaca, *fields: dict) -> None:
+    """Hand the client streamed prints of AAPL in this order, as its subscription's handler does."""
+    for changes in fields:
+        client._emit_trade(client._trade_symbols["AAPL"], alpaca.trade(**changes))
+
+
+def sequence_lines(log: str, mark: str) -> list[str]:
+    return [line for line in log.splitlines() if SEQUENCE_LINE in line and mark in line]
+
+
+def trades_only() -> Consumer:
+    return consumer(want_quotes=False, bar_type=None, auto_shutdown=False)
+
+
+@pytest.fixture(autouse=True)
+def own_late_tally(monkeypatch) -> None:
+    """Each test starts with an empty tally of prints set aside, and leaves none to the next: the tally
+    is the process's, and a window's record takes whatever it holds."""
+    monkeypatch.setattr(canon_alpaca.data, "_LATE_PRINTS", {})
+
+
+def test_the_trade_sequence_check_is_named_and_off_by_default(venue, alpaca, capfd) -> None:
+    assert AlpacaDataClientConfig().validate_trade_sequence is False
+    assert AlpacaDataClientConfig().dict()["validate_trade_sequence"] is False
+    venue.stream.trades = []
+    strategy = trades_only()
+
+    async def body(client) -> None:
+        await wait_until(lambda: "AAPL" in client._trade_symbols)
+        emit_trades(client, alpaca, at(2000, 1), at(1000, 2))
+        await wait_until(lambda: len(strategy.seen_trades) == 2)
+
+    run_with_client(body, strategy)
+
+    # off: every print is a tick in the order it arrived, as NautilusTrader's data engine takes trades
+    assert [str(t.trade_id) for t in strategy.seen_trades] == ["1", "2"]
+    assert late_prints_set_aside() == {}
+    assert sequence_lines(logged(capfd), "") == []
+
+
+def test_with_the_check_on_a_print_stamped_before_the_newest_passed_on_is_set_aside_and_counted(
+    venue, alpaca, capfd
+) -> None:
+    venue.stream.trades = []
+    strategy = trades_only()
+
+    async def body(client) -> None:
+        await wait_until(lambda: "AAPL" in client._trade_symbols)
+        emit_trades(
+            client,
+            alpaca,
+            at(0, 1),
+            at(2000, 2),
+            at(750, 3, s=300),  # 1250 ms behind the newest passed on
+            at(2000, 4),  # the newest's own time: passed on
+            at(1999, 5, s=25),  # 1 ms behind
+            at(3000, 6),
+        )
+        await wait_until(lambda: len(strategy.seen_trades) == 4)
+
+    cache = run_with_client(body, strategy, config=sequenced_config())
+
+    assert [str(t.trade_id) for t in strategy.seen_trades] == ["1", "2", "4", "6"]
+    # nothing downstream saw the two: not the strategy, and not the cache the emulator and Mover read
+    assert sorted(str(t.trade_id) for t in cache.trades(AAPL)) == ["1", "2", "4", "6"]
+    assert str(cache.trade(AAPL).trade_id) == "6"
+    # by name, with the lateness, and with the shares a bar built from ticks will not hold
+    assert late_prints_set_aside() == {
+        "AAPL": {"count": 2, "most_late_ms": 1250, "shares": 325, "stamped_ahead": 0}
+    }
+    log = logged(capfd)
+    (first,) = sequence_lines(log, "set aside a late AAPL print")
+    assert "1250 ms before the newest passed on" in first
+    assert "[ERROR]" not in first  # never an error: a session window fails on one
+    (summary,) = sequence_lines(log, "2 late AAPL prints set aside")  # at disconnect
+    assert "at most 1250 ms" in summary
+    assert "[ERROR]" not in summary
+    # not among the lines a session window keeps about the stream: it keeps twenty, and looks for the
+    # stream's own errors only in those
+    assert stream_lines(log, "late AAPL print") == []
+
+
+def test_the_late_print_count_restarts_with_the_subscription_and_the_newest_stamp_does_not(
+    venue, alpaca, capfd
+) -> None:
+    venue.stream.trades = []
+
+    async def body(client) -> None:
+        await client._subscribe_trades(command(AAPL))
+        emit_trades(client, alpaca, at(5000, 1), *[at(n, 10 + n) for n in range(10)])
+        await client._unsubscribe_trades(command(AAPL))
+        await wait_until(lambda: "AAPL" not in client._trade_symbols)
+        await client._subscribe_trades(command(AAPL))
+        # stamped before what was passed on under the first subscription: still late
+        emit_trades(client, alpaca, at(4000, 30), at(6000, 31))
+
+    run_with_client(body, config=sequenced_config())
+
+    assert late_prints_set_aside()["AAPL"]["count"] == 11
+    log = logged(capfd)
+    assert (
+        len(sequence_lines(log, "set aside a late AAPL print")) == 2
+    )  # the first of each subscription
+    assert (
+        len(sequence_lines(log, "10 late AAPL prints set aside")) == 2
+    )  # at ten, at the unsubscribe
+    assert len(sequence_lines(log, " 1 late AAPL prints set aside")) == 1  # at disconnect, afresh
+
+
+def test_prints_are_ordered_by_their_own_time_when_the_clock_runs_behind_alpacas(
+    venue, alpaca
+) -> None:
+    """A node clock behind Alpaca's stamps puts every print's own time ahead of its receipt. Ordered by
+    the earlier of the two, prints would be ordered by receipt, which only rises, and none would ever
+    be late."""
+    venue.stream.trades = []
+    strategy = trades_only()
+
+    async def body(client) -> None:
+        await wait_until(lambda: "AAPL" in client._trade_symbols)
+        now = datetime.now(UTC)
+        emit_trades(
+            client,
+            alpaca,
+            {"t": now + timedelta(milliseconds=800), "i": 1},
+            {
+                "t": now + timedelta(milliseconds=300),
+                "i": 2,
+            },  # older by its own time, received later
+            {"t": now + timedelta(milliseconds=900), "i": 3},
+        )
+        await wait_until(lambda: len(strategy.seen_trades) == 2)
+
+    run_with_client(body, strategy, config=sequenced_config())
+
+    assert [str(t.trade_id) for t in strategy.seen_trades] == ["1", "3"]
+    assert late_prints_set_aside()["AAPL"] == {
+        "count": 1,
+        "most_late_ms": 500,
+        "shares": 1,
+        "stamped_ahead": 0,
+    }
+
+
+def test_a_print_stamped_far_ahead_of_the_clock_is_passed_on_counted_and_never_the_newest(
+    venue, alpaca, capfd
+) -> None:
+    venue.stream.trades = []
+    strategy = trades_only()
+
+    async def body(client) -> None:
+        await wait_until(lambda: "AAPL" in client._trade_symbols)
+        in_flight = datetime.now(UTC)  # a print made before the next one is received
+        emit_trades(client, alpaca, {"t": datetime(2099, 1, 1, tzinfo=UTC), "i": 1})
+        emit_trades(client, alpaca, {"t": in_flight, "i": 2})
+        await asyncio.sleep(0.02)
+        emit_trades(client, alpaca, {"t": datetime.now(UTC), "i": 3})
+        await wait_until(lambda: len(strategy.seen_trades) == 3)
+
+    run_with_client(body, strategy, config=sequenced_config())
+
+    # it has no usable time: it goes out as with the check off, and holds back neither the print that
+    # was already on its way nor the ones after
+    assert [str(t.trade_id) for t in strategy.seen_trades] == ["1", "2", "3"]
+    assert late_prints_set_aside() == {
+        "AAPL": {"count": 0, "most_late_ms": 0, "shares": 0, "stamped_ahead": 1}
+    }
+    log = logged(capfd)
+    (line,) = sequence_lines(log, "ahead of its receipt")
+    assert "AAPL" in line
+    assert "[ERROR]" not in line
+    (summary,) = sequence_lines(log, "1 stamped ahead of the clock")  # at disconnect
+    assert "0 late AAPL prints set aside" in summary
+
+
+def test_a_print_the_condition_filter_leaves_out_does_not_move_the_newest_stamp(
+    venue, alpaca
+) -> None:
+    venue.stream.trades = prints(
+        alpaca,
+        at(
+            5000, 1, c=["@", "I"]
+        ),  # an odd lot: no tick with the filter on, so nothing was passed on
+        at(1000, 2, c=["@"]),
+        at(2000, int(LAST_ID), c=["@"]),
+    )
+    strategy = sip_trades()
+
+    run(build_node(strategy, config=sequenced_config(trade_condition_filter=True)), "hosted")
+
+    assert [str(t.trade_id) for t in strategy.seen_trades] == ["2", LAST_ID]
+    assert late_prints_set_aside() == {}
+
+
+def test_the_condition_tally_counts_as_kept_only_the_prints_that_became_ticks(
+    venue, alpaca
+) -> None:
+    before = condition_counts()
+    venue.stream.trades = prints(
+        alpaca,
+        at(2000, 1, c=["@"]),
+        at(1000, 2, c=["@"]),  # the filter takes it, the sequence check sets it aside: no tick
+        at(3000, int(LAST_ID), c=["@"]),
+    )
+    strategy = sip_trades()
+
+    run(build_node(strategy, config=sequenced_config(trade_condition_filter=True)), "hosted")
+
+    assert [str(t.trade_id) for t in strategy.seen_trades] == ["1", LAST_ID]
+    assert grown(before, "stream") == {"kept": 2}
+    assert late_prints_set_aside()["AAPL"]["count"] == 1
+
+
+def test_prints_are_late_only_against_their_own_symbol() -> None:
+    sequence = TradeSequence()
+    assert sequence.late_by("AAPL", 5_000_000) is None
+    assert sequence.late_by("MSFT", 3_000_000) is None  # older than AAPL's newest, and MSFT's first
+    assert sequence.late_by("AAPL", 4_999_999) == 1
+    assert sequence.late_by("AAPL", 5_000_000) is None  # the newest's own stamp
+    assert sequence.late_by("MSFT", 2_000_000) == 1_000_000
+    assert sequence.late_by("AAPL", 4_000_000) == 1_000_000  # a late one never becomes the newest
+
+
+@pytest.mark.parametrize(
+    ("ts_event", "ts_init", "stamp"),
+    [
+        (10, 20, 10),
+        (20, 10, 20),
+        (7, 7, 7),
+        (10 + STAMP_AHEAD_MOST_NS, 10, 10 + STAMP_AHEAD_MOST_NS),
+        (11 + STAMP_AHEAD_MOST_NS, 10, None),
+    ],
+    ids=[
+        "its own time",
+        "its own time, when the clock runs behind Alpaca's",
+        "either",
+        "its own time at the bound",
+        "none beyond the bound",
+    ],
+)
+def test_a_prints_stamp_is_its_own_time_unless_that_is_far_ahead_of_its_receipt(
+    ts_event, ts_init, stamp
+) -> None:
+    tick = cast("TradeTick", SimpleNamespace(ts_event=ts_event, ts_init=ts_init))
+    assert trade_stamp(tick) == stamp
+
+
+def test_the_tally_shows_a_lateness_under_a_millisecond_as_one() -> None:
+    assert late_ms(1) == 1
+    assert late_ms(1_000_000) == 1
+    assert late_ms(1_000_001) == 2
+    assert late_ms(1_250_000_000) == 1250

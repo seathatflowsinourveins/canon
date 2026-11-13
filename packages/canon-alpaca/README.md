@@ -325,7 +325,20 @@ Each is stated where it is implemented, with its source.
   bars take its price, by the per-tape table in `canon_alpaca/trade_conditions.py`; the rest are counted
   by code and use none of a request's limit, and a code Alpaca's map shows that the table does not know
   refuses the connect (ADR 0118). It is for the `sip` feed only, and refuses a trade request with
-  `update_catalog`. The setting is off by default. Corrections and cancels are not applied to ticks already sent. Results are
+  `update_catalog`. The setting is off by default. With `validate_trade_sequence` on
+  (ADR 0134), a streamed print whose own time is before the newest one passed on for its symbol is set
+  aside and is no tick, so the cache, a strategy and the order emulator do not act on an older print
+  that arrived late; a print with the newest's own time passes. It is the first comparison of the bar
+  check NautilusTrader's `validate_data_sequence` turns on, which the data engine has for bars only
+  (`crates/data/src/engine/dispatch.rs:117-128`, `:444-446`, `:471-496` at the pin). A print stamped
+  more than five seconds ahead of its receipt has no usable time: it is passed on as with the setting
+  off and never becomes the newest. Each is counted by name: on log lines that begin
+  `Alpaca trade sequence on feed `, and for the process in `canon_alpaca.data.late_prints_set_aside`
+  (per symbol the count, the most any was behind in milliseconds, their shares, and the prints passed
+  on unordered), which a Mover window's record carries as `late_prints_set_aside_by_the_adapter`. A
+  bar built from ticks does not hold a print set aside; Alpaca's own bars are not affected. A request's
+  trades are not checked. Off by default, and no node sets it yet.
+  Corrections and cancels are not applied to ticks already sent. Results are
   requested in ascending timestamp order and delivered in one `TradesResponse`, preserving the request
   ID, bounds and params. The inclusive window is cut at now, and a missing start uses midnight New York
   of the end's day, as quotes do. Bounds and raw trade timestamps retain nanoseconds, including the
