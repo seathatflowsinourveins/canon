@@ -134,3 +134,16 @@ ten fields as list lines, in this order, each with a value:
 * status: adopted
 * supersedes: none
 * source: lead
+
+### L0008: A window run by hand from a fresh worktree is refused at start until its baseline is named
+
+* area: data
+* session: 2026-11-13
+* result: Of two by-hand regular-session Mover windows on paper account B from one worktree, the first was refused about 40 s in, before any node or order. The ranking baseline defaults to `catalog/movers-baseline/<feed>.json` under the checkout, and a worktree's ignored `catalog/` holds none. The second named a dated baseline with `--baseline-path`, ran 781 s to `ok` and ended flat with 0 orders. Each of its 11 entry notes was "entry arm registered: no entry context supplied" (`NO_CONTEXT`): no day context was registered for those names
+* evidence: the two window records of 2026-11-13 on the windows account, kept outside the repository; `mover_baseline_path` in src/canon_trading/session_window.py
+* lesson: A path relative to the checkout that names an ignored folder works only in the checkout that made that folder. A run from any other tree names its inputs or is refused at start, which the window does by name and before trading. That run proved the arm's naming and the record's fallback counts, not an entry: L0004's gap stands for it
+* change: the pull request that names the trail arm in every heartbeat and refusal record states this run and the on-demand gap as its paper evidence
+* next: Each later by-hand proof from a worktree names `--baseline-path` or `--baseline-dir` in its command; a new entry once a by-hand window from a worktree enters on paper
+* status: open
+* supersedes: none
+* source: review
