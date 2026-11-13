@@ -86,6 +86,20 @@ The count, with `breach_count` or `high_count` above one, on trade prints only (
   picks, of how often each prints on boats and its longest gap (a print trigger sells nothing while a
   name does not print), of the condition codes boats prints carry and which of them Alpaca's boats
   minute bars take, and of how often a boats quote is one-sided.
+  * 2026-11-13: account B need not stand idle overnight, and overnight protection runs on the `boats` bid;
+    shown so far by hand. At `05905849` the overnight part streams `boats` (`session_window.py:2358`,
+    `MOVER_PARTS`), the Mover's trailing sell is elected by the bid of every quote by default (`bid_ask`,
+    `:759-767`), and a print trigger is refused there by name (`:3043-3047`). The schedule's overnight
+    entries: each scheduled firing runs `--session auto --mover`, the Mover in every part, overnight
+    included (`scripts/automation:307-311`, its arguments at `:338-342`), on account B (#252), while
+    `canon/paper-schedule` reads `mover`; overnight ranks on dollars with no baseline (`:316`,
+    `session_window.py:1792`). No scheduled firing has run a Mover window overnight: on the night into
+    2026-11-12 the firings placed nothing (no overnight Mover form yet, a held lock, or a skip), the
+    schedule was off from #289 to #350, and the next overnight part opens Sunday 2026-11-15 at 20:00 New
+    York; that first scheduled overnight window is `UNVERIFIED` on paper. On the night into 2026-11-13, by
+    hand on account B on `boats` at commits from `bf5742e0` to `efd37edb`, thirteen Mover windows from 22:01
+    to 03:40 New York ended `ok`, and three before them were stopped by a signal. Whether the idle line was
+    a ruling never taken up or one withdrawn is not established.
 * **The protector does not use it, and the Mover only on the fixed trail.** A trail plan's distance,
   its tighten and its chase cap (ADR 0088's `trail_mode`) are
   not carried into the held level. Closed by that change in each, with its tests.
@@ -199,3 +213,9 @@ Read 2026-11-12. Resolved means read in a local copy at the commit `canon/upstre
   entry, stated above. evidence-verifier, the same day, on this text while it was part of ADR 0088:
   the two print-time rules, the floor's reference, the delay's two exceptions, what a record gains
   with the arms off, the counts of the cases, the labels, and the three sources added above. Applied.
+* 2026-11-13, the overnight line: code at `05905849` read in the tree; the schedule's history from
+  `git log -- canon/paper-schedule`; the windows from their by-hand records and the scheduled runner's
+  log, kept outside the repository; the overnight part's hours from
+  https://docs.alpaca.markets/us/docs/245-trading-for-trading-api.md ("8:00 PM ET Sunday to 4:00 AM ET
+  Friday"), `fetched` by the evidence-verifier. Its pass corrected the line's cause for no scheduled
+  overnight firing, tied the windows to their commits and counted the whole night. Applied.

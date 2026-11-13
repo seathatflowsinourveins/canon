@@ -256,11 +256,21 @@ BBB_BOOK = ("19.95", "20.00", "20.00", "0.02")
 """ATR 0.02 on a $20 name: 0.001, under the spread floor (two 5-cent spreads, 0.005), so the floor binds."""
 
 
-def _planned(book: tuple[str, str, str, str]) -> tuple[Decimal, mover.TrailPlan]:
+def _planned(
+    book: tuple[str, str, str, str], *, row: str | None = None, size_from_budget: bool = False
+) -> tuple[Decimal, mover.TrailPlan]:
     """The distance the Mover's own planning gives for `book`, computed here apart from the task: the
     Mover's `_entry_trail` on an ATR warmed with the same bars, then `sizing.sized_stop`."""
     bid, ask, mid, width = book
-    planner = mover.Mover(mover.MoverConfig(max_notional=D(1), max_move=D(1), trail_mode="atr"))
+    planner = mover.Mover(
+        mover.MoverConfig(
+            max_notional=D(1),
+            max_move=D(1),
+            size_from_budget=size_from_budget,
+            loss_share=mover.PAPER_LOSS_SHARE if size_from_budget else None,
+            **({"trail_mode": "atr"} if row is None else protect.ROWS[row]),
+        )
+    )
     atr = AverageTrueRange(planner.settings.atr_n)
     for _ in range(20):
         atr.update_raw(float(D(mid) + D(width) / 2), float(D(mid) - D(width) / 2), float(mid))
@@ -546,26 +556,143 @@ def test_the_stop_goes_out_at_the_named_rows_distance(capsys, row, distance, sha
     assert f"{share} of 10.00" in line and bound in line
 
 
-WIDE_BOOK = ("9.99", "10.00", "10.00", "0.08")
-"""ATR 0.08 on a $10 name: three of them are 2.4% of the price, over the 2% cap."""
+OWN_BOOK = ("9.99", "10.00", "10.00", "0.25")
+"""Synthetic ATR 0.25 at 10.00: OWN1 plans 0.025 of entry, OWN3 plans 0.075."""
 
 
-def test_a_row_whose_distance_is_over_the_cap_sends_no_stop_and_says_so(capsys) -> None:
-    """The ATR rows are registered with the cap arm `own`, which the Mover lets stand only for an entry
-    it sizes; nothing is sized here, so its planning refuses a distance over the cap by name, and the
-    long gets no stop under that row. Plan-only shows it beside the rows that do give one."""
+@pytest.mark.parametrize(
+    ("row", "book", "distance", "bound"),
+    [
+        ("OWN1", OWN_BOOK, "0.25", "atr"),
+        ("OWN1", ("9.85", "10.00", "10.00", "0.25"), "0.30", "spread floor"),
+        ("OWN1", ("9.88", "10.00", "10.00", "0.0625"), "0.24", "spread floor"),
+        ("OWN3", OWN_BOOK, "0.75", "atr"),
+        ("OWN3", ("9.60", "10.00", "10.00", "0.25"), "0.80", "spread floor"),
+    ],
+    ids=["own1-atr", "own1-floor", "own1-floor-only", "own3-atr", "own3-floor"],
+)
+def test_a_found_long_keeps_its_own_distance_over_the_entry_cap(
+    capsys, row, book, distance, bound
+) -> None:
+    """A holding has no entry size left to choose: retain its ATR, raised to the spread floor,
+    under either registered own-cap row (the lead's ruling, 2026-11-13)."""
+    assert protect.ROWS[row]["trail_cap"] == "own"
     paper = Paper(positions=[_position("AAA", "10")])
-    code, lines = _run(paper, Data({"AAA": WIDE_BOOK}), capsys, row="OWN3")
-    assert code == 2 and paper.submitted == []
-    (line,) = [x for x in lines if x.startswith("unprotected AAA:")]
-    assert "under OWN3" in line and "over the 0.02 cap" in line
+    code, lines = _run(paper, Data({"AAA": book}), capsys, row=row)
+    assert code == 0, lines
+    (request,) = paper.submitted
+    assert D(str(request.trail_price)) == D(distance)
+    assert request.qty == 10
+    (line,) = [x for x in lines if x.startswith("sent AAA:")]
+    assert f"row {row}" in line and f"from {bound}" in line
+    assert f"distance {distance}" in line and "fixed trail fallback" not in line
+    _no_sale_open_or_cancel(paper)
+
+
+def test_plan_only_keeps_f2_and_names_the_found_longs_own_atr_distance(capsys) -> None:
+    """F2 keeps its main behavior; OWN3 shares OWN1's own-cap policy, with its registered k=3."""
     paper = Paper(positions=[_position("AAA", "10")])
-    assert protect.protect_task(cast(Any, paper), Data({"AAA": WIDE_BOOK}), plan_only=True) == 0
+    assert protect.protect_task(cast(Any, paper), Data({"AAA": OWN_BOOK}), plan_only=True) == 0
     out = capsys.readouterr().out.splitlines()
-    (refused,) = [x for x in out if x.startswith("no stop for AAA under OWN3:")]
-    assert "over the 0.02 cap" in refused
-    assert [x for x in out if x.startswith("would send AAA under F2:")]
-    assert [x for x in out if x.startswith("would send AAA under OWN1:")]
+    (fixed,) = [x for x in out if x.startswith("would send AAA under F2:")]
+    assert "distance 0.2000 (row F2, 2.0000% of 10.0000" in fixed
+    assert "the fixed row (2% of the price)" in fixed
+    (own1,) = [x for x in out if x.startswith("would send AAA under OWN1:")]
+    assert (
+        "trailing stop sell 10 AAA, GTC, sell_to_close, distance 0.2500 "
+        "(row OWN1, 2.5000% of 10.0000, stop opens about 9.7400 "
+        "(the bid 9.99 less the distance; Alpaca sets it from its own mark), from atr, "
+        "trail 0.025000 of entry 10.0000, spread 0.01, floor 0.02 (2 spreads), ATR 0.250000"
+    ) in own1
+    (own3,) = [x for x in out if x.startswith("would send AAA under OWN3:")]
+    assert "distance 0.7500 (row OWN3, 7.5000% of 10.0000" in own3
+    assert "from atr" in own3
+    assert paper.submitted == []
+    assert out[-1] == "plan only: nothing was sent"
+
+
+@pytest.mark.parametrize("row", ["OWN1", "OWN3"])
+@pytest.mark.parametrize(
+    ("book", "source"),
+    [
+        (("9.99", "10.00", "10.00", "1.25"), "atr"),
+        (("9.40", "10.00", "10.00", "0.25"), "spread floor"),
+    ],
+    ids=["atr", "floor"],
+)
+def test_an_own_distance_over_the_ceiling_is_named_and_sends_no_stop(
+    capsys, row, book, source
+) -> None:
+    """Refuse the symbol by the sizing ceiling's name, never substitute a fixed fraction."""
+    paper = Paper(positions=[_position("AAA", "10"), _position("BBB", "5")])
+    code, lines = _run(paper, Data({"AAA": book, "BBB": BBB_BOOK}), capsys, row=row)
+    assert code == 2
+    assert [r.symbol for r in paper.submitted] == ["BBB"]
+    (line,) = [x for x in lines if x.startswith("unprotected AAA:")]
+    assert f"under {row}" in line
+    assert "distance_over_ceiling" in line and "0.10" in line and source in line
+    paper = Paper(positions=[_position("AAA", "10")])
+    code = protect.protect_task(cast(Any, paper), Data({"AAA": book}), plan_only=True)
+    out = capsys.readouterr().out.splitlines()
+    if source == "spread floor":
+        # F2 is below this floor too: every row is refused, as at main.
+        assert code == 2
+        (refused,) = [x for x in out if x.startswith("unprotected AAA:")]
+        assert f"under {row}: distance_over_ceiling" in refused
+    else:
+        assert code == 0  # F2 still supplies a plan.
+        (refused,) = [x for x in out if x.startswith(f"no stop for AAA under {row}:")]
+    assert "distance_over_ceiling" in refused and "0.10" in refused
+    assert paper.submitted == []
+
+
+@pytest.mark.parametrize(
+    "book",
+    [("9.99", "10.00", "10.00", "1.00"), ("9.50", "10.00", "10.00", "0.25")],
+    ids=["atr", "floor"],
+)
+def test_an_own_distance_at_the_ceiling_stands(capsys, book) -> None:
+    """The same inclusive ceiling as sizing: equality is allowed."""
+    paper = Paper(positions=[_position("AAA", "10")])
+    code, lines = _run(paper, Data({"AAA": book}), capsys)
+    assert code == 0, lines
+    assert D(str(paper.submitted[0].trail_price)) == D("1.00")
+
+
+def test_an_own_distance_stepped_over_the_ceiling_is_refused(capsys) -> None:
+    """Check the stepped distance as well as the fraction, as sizing does."""
+    paper = Paper(positions=[_position("AAA", "10")])
+    # 0.125 ATR / 1.26 is under the ceiling, but the stop steps down to 1.13:
+    # the 0.13 distance exceeds 0.126. The synthetic bars have an exact binary range.
+    code, lines = _run(paper, Data({"AAA": ("1.25", "1.26", "1.25", "0.125")}), capsys)
+    assert code == 2 and paper.submitted == [], lines
+    (line,) = [x for x in lines if x.startswith("unprotected AAA:")]
+    assert "distance_over_ceiling" in line
+
+
+@pytest.mark.parametrize(
+    ("book", "distance", "bound", "refusal"),
+    [
+        (OWN_BOOK, "0.25", "atr", "distance_over_cap"),
+        (("9.85", "10.00", "10.00", "0.25"), "0.30", "spread floor", "floor_over_cap"),
+    ],
+    ids=["atr", "floor"],
+)
+def test_found_holding_matches_sized_entry_and_leaves_unsized_entry_refused(
+    book, distance, bound, refusal
+) -> None:
+    """The entry defaults stay as at main, before and after planning a found holding."""
+    entry_distance, entry_plan = _planned(book, row="OWN1", size_from_budget=True)
+    assert entry_distance == D(distance) and entry_plan.bound == bound
+    with pytest.raises(mover.DistanceRefusal) as before:
+        _planned(book, row="OWN1")
+    assert before.value.cause == refusal
+    held_distance, held = protect.plan_distance(Data({"AAA": book}), "AAA", NOW, "OWN1")
+    assert held_distance == entry_distance and held.plan == entry_plan
+    assert _planned(book, row="OWN1", size_from_budget=True) == (entry_distance, entry_plan)
+    with pytest.raises(mover.DistanceRefusal) as after:
+        _planned(book, row="OWN1")
+    assert after.value.cause == refusal
 
 
 def test_a_holding_that_turned_short_since_the_read_gets_no_stop(capsys) -> None:
@@ -1015,16 +1142,24 @@ def test_a_full_page_of_open_orders_is_refused_since_a_covering_sell_may_be_miss
         (("10.00", "10.00", "10.00", "0.04"), {}, "no usable sip spread"),
         (("0", "10.00", "10.00", "0.04"), {}, "no usable sip spread"),
         (("9.99", "0", "10.00", "0.04"), {}, "has no ask"),
-        (("9.80", "10.00", "10.00", "0.04"), {}, "floor"),
+        (("9.40", "10.00", "10.00", "0.04"), {}, "distance_over_ceiling"),
         (None, {}, "no latest sip quote"),
     ],
-    ids=["stale-quote", "crossed", "locked", "no-bid", "no-ask", "floor-over-the-cap", "no-quote"],
+    ids=[
+        "stale-quote",
+        "crossed",
+        "locked",
+        "no-bid",
+        "no-ask",
+        "floor-over-the-ceiling",
+        "no-quote",
+    ],
 )
 def test_a_long_with_no_sound_distance_gets_no_stop_and_is_named(
     capsys, book, data_kw, why
 ) -> None:
     """A stop is never sent at a distance the planning could not stand behind: an old quote, a
-    crossed, locked or one-sided one, none at all, or a spread whose floor is over the cap."""
+    crossed, locked or one-sided one, none at all, or a spread whose floor is over the ceiling."""
     paper = Paper(positions=[_position("AAA", "10")])
     data = Data({} if book is None else {"AAA": book}, **data_kw)
     code, lines = _run(paper, data, capsys)
@@ -1821,3 +1956,22 @@ def test_an_open_sell_whose_fill_count_is_not_shown_is_not_counted_as_unfilled_c
     code, lines = _run(paper, Data({"AAA": AAA_BOOK}), capsys)
     assert code == 2 and paper.submitted == [], (code, paper.submitted, lines)
     assert [x for x in lines if x.startswith("unprotected AAA:")], lines
+
+
+def test_the_paper_tests_checks_of_what_is_working_leave_out_a_listed_order_that_has_ended(
+    monkeypatch, capsys
+) -> None:
+    """Alpaca's open-orders listing can still show an order a second after it filled (seen on paper,
+    2026-11-13, with the paper test's own buy): the test's checks of what is working go by each
+    order's own read, and the listed status of such an order is printed."""
+    paper_test = _paper_test()
+    buy = _order("SPY", "1", f"{paper_test.PREFIX}0123456789abcdef0123-buy", side="buy")
+    stop = _stop("SPY", "1", PROTECT_STOP)
+    paper = Cancelable(orders=[buy, stop])
+    filled = buy.model_copy(update={"status": "filled", "filled_qty": "1"})
+    monkeypatch.setattr(
+        paper, "get_order_by_id", lambda order_id: filled if str(order_id) == str(buy.id) else stop
+    )
+    working = paper_test._working(paper)
+    assert [str(o.id) for o in working] == [str(stop.id)]
+    assert "listed as open though ended: listed new, its own read filled" in capsys.readouterr().out

@@ -4063,6 +4063,46 @@ def test_the_window_hands_the_nodes_orders_in_doubt_to_the_check(monkeypatch, tm
     assert report.unsettled == {"entry-late": ["buy: sent with no answer"]}
 
 
+def test_a_retained_submit_fails_the_window_and_is_handed_to_the_check(
+    monkeypatch, tmp_path
+) -> None:
+    """The paper nodes retain a submit never answered (`RETAIN_UNRESOLVED`, claim 10): if nothing resolves
+    it, the node's run ends with upstream's error naming it ("Submission recovery at shutdown",
+    concepts/live at the pin). The window is recorded failed with that error, and the order still goes to
+    the account check as one sent with no answer."""
+    retained = node_order("entry-late", OrderInitialized(), OrderSubmitted())
+    error = "Submission recovery incomplete at shutdown: unresolved client order IDs [entry-late]"
+
+    class Ran:
+        cache = SimpleNamespace(orders=lambda **kwargs: [retained])
+
+        def dispose(self) -> None: ...
+
+    def run_node(node, ends) -> None:
+        raise RuntimeError(error)
+
+    s = SimpleNamespace(
+        dropped=[], history_bars=0, history_dropped=0, quotes=1, trades=1, live_bars=0
+    )
+    cap = SimpleNamespace(checks=1, peak=Decimal(0), tripped=None)
+    handed: list = []
+    monkeypatch.setattr(session_window, "_ABANDONED", [])
+    monkeypatch.setattr(session_window, "paper_trading", lambda: Account())
+    monkeypatch.setattr(session_window, "window_node", lambda config, **kw: (Ran(), s, cap))
+    monkeypatch.setattr(session_window, "_run_node", run_node)
+    monkeypatch.setattr(
+        session_window,
+        "_flatten_after_stop",
+        lambda trading, config, report, **kw: handed.append(kw["unsettled"]) or [],
+    )
+    with pytest.raises(RuntimeError, match="Submission recovery incomplete"):
+        session_window.run_window(WindowConfig(log_dir=tmp_path))
+    assert handed == [{"entry-late": "buy"}]
+    latest = json.loads((tmp_path / "latest.json").read_text())
+    assert latest["result"].startswith(f"failed: RuntimeError: {error}"), latest["result"]
+    assert latest["unsettled"] == {"entry-late": ["buy: sent with no answer"]}
+
+
 # An independent review of the in-doubt lookup as landed (2026-11-10): each shown here before its fix.
 
 
@@ -6290,6 +6330,49 @@ def test_the_window_task_names_the_account_whose_pair_it_reads() -> None:
     assert task["env"][session_window.ACCOUNT_ENV] == "windows"
     for item in ("ALPACA_API_KEY", "ALPACA_SECRET_KEY"):
         assert f"-s canon-alpaca-paper-windows -a {item} -w" in task["env"][item]["value"]
+
+
+# The session window's claim 10 (ADR 0044, ADR 0075): a submit never answered that Alpaca fills later.
+
+
+@pytest.mark.parametrize("session", ["regular", "extended"])
+def test_the_window_strategy_leaves_unidentified_orders_external(
+    tmp_path, extended, session
+) -> None:
+    """Ownership follows the retained order's confirmed client ID, never the whole symbol: a claim
+    would also give the strategy foreign activity arriving after the flat startup check."""
+    node, s, _ = session_window.window_node(
+        WindowConfig(session=session, log_dir=tmp_path),
+        wind_down_at=datetime(2026, 11, 10, 21, 30, tzinfo=UTC),
+        log_name="claim",
+        feed="iex",
+    )
+    try:
+        assert isinstance(s, SessionMaCross)
+        assert s.config is not None
+        claims = s.config.external_order_instrument_ids
+    finally:
+        node.dispose()
+        del node  # a failed assertion's traceback must not keep the thread's LiveNode alive
+    assert claims is None
+
+
+@pytest.mark.parametrize("instruments", [SPY, (SPY, InstrumentId.from_str("AAPL.ALPACA"), SPY)])
+def test_the_paper_nodes_retain_a_submit_never_answered(instruments) -> None:
+    """With upstream's default the node rejects such an order itself once its in-flight queries run out
+    (`INFLIGHT_TIMEOUT`), though Alpaca may hold it and fill it, and a strategy that sends nothing while one
+    of its orders works then sends again (the adapter's
+    `test_the_claim_alone_leaves_the_order_closed_while_alpaca_may_still_fill_it`)."""
+    from nautilus_trader.live import SubmissionRecoveryPolicy
+
+    assert (
+        exec_engine_config(instruments).submission_recovery_policy
+        == SubmissionRecoveryPolicy.RETAIN_UNRESOLVED
+    )
+    assert (
+        LiveExecutionEngineConfig().submission_recovery_policy
+        == SubmissionRecoveryPolicy.RESOLVE_LOCALLY
+    )
 
 
 # A window on today's top mover, as a check of the stack on a mover (ADR 0083, its dated line of
@@ -10465,6 +10548,34 @@ def test_a_signal_during_the_first_record_write_leaves_it_stopping(monkeypatch, 
     assert _latest_result(tmp_path) == "stopping: SIGTERM received; the window has not finished"
 
 
+def test_main_ends_a_record_signalled_in_its_first_write_failed_not_stopping(
+    monkeypatch, tmp_path
+) -> None:
+    """Review of the #323 fixes, finding 1: a signal in the first record write, after the record is
+    registered and before run_window's `try`, left `stopping` as the window's last record; `main` ends it
+    `failed: WindowSignalled`, as ADR 0050 says a window stopped before its node ends."""
+    import signal as signal_module
+
+    real = session_window._snapshot_requests
+
+    def snapshot(report):
+        if isinstance(report, session_window.WindowReport) and report.result == "running":
+            session_window._SIGNALS.handle(signal_module.SIGTERM, None)
+        return real(report)
+
+    monkeypatch.setattr(session_window, "_ABANDONED", [])
+    monkeypatch.setattr(session_window, "paper_trading", lambda: Account())
+    monkeypatch.setattr(session_window, "_snapshot_requests", snapshot)
+    monkeypatch.setattr(
+        session_window, "window_node", lambda *a, **k: pytest.fail("a node was built")
+    )
+    code = session_window.main(["--session", "regular", "--log-dir", str(tmp_path)])
+    assert code == 128 + signal_module.SIGTERM
+    assert _latest_result(tmp_path) == "failed: WindowSignalled: stopped by SIGTERM"
+    beat = json.loads((session_window.records_dir(tmp_path) / "last-firing.json").read_text())
+    assert beat["outcome"] == "failed: WindowSignalled: stopped by SIGTERM"
+
+
 class _Stoppable:
     def __init__(self) -> None:
         self.stops = 0
@@ -11067,3 +11178,193 @@ def test_a_trade_sequence_flag_a_part_does_not_run_is_said(monkeypatch, tmp_path
     out = capsys.readouterr().out
     assert "--validate-trade-sequence not run" in out
     assert f"runs {session_window.DEFAULT_STRATEGY}" in out
+
+
+# A second reader of #323 (sr-c-323), P2
+@pytest.mark.parametrize("final_result", ["ok", "failed: not left flat: SPY"])
+def test_signal_after_result_selection_before_persistence_never_leaves_running(
+    tmp_path, final_result
+):
+    import json
+    import signal
+
+    from canon_trading import session_window
+
+    report = session_window.WindowReport("regular", "SPY", "20261113T143000Z", result="running")
+    with session_window.window_signals():
+        session_window.write_record(tmp_path, report, refresh_requests=False)
+        session_window._SIGNALS.record = (tmp_path, report)
+        session_window._SIGNALS.left_node()
+
+        # run_window has selected its result and end time, but has not yet
+        # reached its final write_record call (in its `finally`).
+        report.result = final_result
+        report.ended = "20261113T143100Z"
+        session_window._SIGNALS.handle(signal.SIGTERM, None)
+
+        # These are the files an immediate subsequent SIGKILL would leave.
+        directory = session_window.records_dir(tmp_path)
+        latest = json.loads((directory / "latest.json").read_text())
+        stamped = json.loads((directory / f"window-{report.started}.json").read_text())
+        assert report.result == final_result
+        assert latest["result"] == final_result
+        assert stamped["result"] == final_result
+
+
+# A second reader of #323 (sr-a-323), Finding 1
+def test_main_records_window_signalled_in_latest_and_heartbeat_before_and_during_node(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import signal as signal_module
+
+    rec_dir = session_window.records_dir(tmp_path)
+    rec_dir.mkdir(parents=True, exist_ok=True)
+    (rec_dir / "latest.json").write_text(json.dumps({"result": "ok", "started": "earlier"}))
+
+    def signalled_before_report(*args: object, **kwargs: object) -> object:
+        # inside run_window before its report is registered, as a signal in choose_mover's sample is
+        session_window._SIGNALS.handle(signal_module.SIGTERM, None)
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(session_window, "_ABANDONED", [])
+    monkeypatch.setattr(session_window, "paper_trading", lambda: Account())
+    monkeypatch.setattr(session_window, "run_window", signalled_before_report)
+    code = session_window.main(["--mover", "--session", "regular", "--log-dir", str(tmp_path)])
+    assert code == 128 + signal_module.SIGTERM
+    latest = json.loads((rec_dir / "latest.json").read_text())
+    heartbeat = json.loads((rec_dir / "last-firing.json").read_text())
+    assert latest["result"] == "failed: WindowSignalled: stopped by SIGTERM"
+    assert heartbeat["outcome"] == "failed: WindowSignalled: stopped by SIGTERM"
+
+    sub = tmp_path / "during-node"
+    sub.mkdir()
+    sub_rec = session_window.records_dir(sub)
+
+    class SignalledNode(_Stoppable):
+        cache = SimpleNamespace(orders=lambda **kwargs: [])
+
+        def dispose(self) -> None:
+            pass
+
+        async def run_async(self) -> None:
+            session_window._SIGNALS.handle(signal_module.SIGTERM, None)
+            await super().run_async()
+
+    strat = SimpleNamespace(
+        dropped=[], history_bars=0, history_dropped=0, quotes=1, trades=1, live_bars=0
+    )
+    cap = SimpleNamespace(checks=1, peak=Decimal(0), tripped=None)
+    monkeypatch.setattr(
+        session_window, "window_node", lambda config, **kw: (SignalledNode(), strat, cap)
+    )
+    monkeypatch.setattr(session_window, "_flatten_after_stop", lambda *a, **kw: [])
+    code2 = session_window.main(["--session", "regular", "--log-dir", str(sub)])
+    assert code2 == 128 + signal_module.SIGTERM
+    heartbeat2 = json.loads((sub_rec / "last-firing.json").read_text())
+    assert heartbeat2["outcome"] == "failed: WindowSignalled: stopped by SIGTERM"
+    # the record is the final one, not the handler's stopping mark (review of the #323 fixes, finding 10)
+    latest2 = json.loads((sub_rec / "latest.json").read_text())
+    assert latest2["result"].startswith("failed: WindowSignalled")
+
+
+# Review of the #323 fixes, finding 2
+def test_a_signal_after_an_ok_result_before_its_end_is_set_writes_no_complete_or_running_measurement(
+    tmp_path,
+) -> None:
+    import json
+    import signal
+
+    report = session_window.WindowReport("regular", "SPY", "20261113T143000Z", result="running")
+    report.request_budget = {"measurement_status": "running", "observation_seconds": 600}
+    with session_window.window_signals():
+        session_window._SIGNALS.record = (tmp_path, report)
+        session_window._SIGNALS.left_node()
+        report.result = "ok"  # chosen, and `ended` not yet set
+        session_window._SIGNALS.handle(signal.SIGTERM, None)
+        latest = json.loads((session_window.records_dir(tmp_path) / "latest.json").read_text())
+    assert latest["result"] == "ok" and not latest["ended"]
+    assert latest["request_budget"]["measurement_status"] == "unfinalized"
+    assert latest["request_budget"]["calibration_eligible"] is False
+    assert (
+        report.request_budget["measurement_status"] == "running"
+    )  # the report itself is not changed
+
+
+# Review of the #323 fixes, finding 3
+def test_a_signal_after_an_ok_result_leaves_a_heartbeat_that_names_it(
+    monkeypatch, tmp_path
+) -> None:
+    import signal as signal_module
+
+    def ok_then_signalled(config, **kwargs):
+        session_window._SIGNALS.left_node()
+        session_window._SIGNALS.handle(signal_module.SIGTERM, None)
+        return session_window.WindowReport("regular", "SPY", "20261113T143000Z", result="ok")
+
+    monkeypatch.setattr(session_window, "_ABANDONED", [])
+    monkeypatch.setattr(session_window, "run_window", ok_then_signalled)
+    code = session_window.main(["--session", "regular", "--log-dir", str(tmp_path)])
+    assert code == 128 + signal_module.SIGTERM
+    beat = json.loads((session_window.records_dir(tmp_path) / "last-firing.json").read_text())
+    assert beat["outcome"] == "ok; SIGTERM received; the wind-down finished"
+
+
+# sr-a-323, Finding 2
+def test_paper_session_copies_window_record_and_log_when_stopped_by_sigterm(
+    tmp_path: Path,
+) -> None:
+    import signal as signal_module
+
+    run = tomllib.loads((session_window.SOURCE_ROOT / "mise.toml").read_text())["tasks"][
+        "paper:session"
+    ]["run"]
+    bounded_fn = re.search(r"^bounded\(\) \{\n.*?^\}$", run, re.MULTILINE | re.DOTALL)
+    kept_fn = re.search(r"^kept\(\) \{\n.*?^\}$", run, re.MULTILINE | re.DOTALL)
+    tail = re.search(r"^  wrc=0\n.*?^  exit \"\$wrc\"$", run, re.MULTILINE | re.DOTALL)
+    assert bounded_fn is not None and kept_fn is not None and tail is not None
+
+    child_code = """
+import pathlib, signal, sys, time
+out = pathlib.Path(sys.argv[1])
+out.mkdir(parents=True, exist_ok=True)
+def stop(signum, frame):
+    (out / "window-20261112T004500Z.json").write_text('{"result": "failed: WindowSignalled: stopped by SIGTERM", "fills": 0}')
+    (out / "window-20261112T004500Z.log").write_text("wind-down complete\\n")
+    sys.exit(143)
+signal.signal(signal.SIGTERM, stop)
+print("running", flush=True)
+time.sleep(30)
+"""
+    invoked = re.sub(
+        r'uv run --locked \$\{CANON_COMMIT:\+--exact\} python -m canon_trading\.session_window --log-dir "\$\{tmp\}canon-paper-session" "\$@"',
+        '"$0" -c "$1" "${tmp}canon-paper-session"',
+        tail.group(0),
+    )
+    temp_root = tmp_path / "darwin-tmp"
+    temp_root.mkdir()
+    cfg_root = tmp_path / "claude-cfg"
+    cfg_root.mkdir()
+    script = (
+        f'tmp="{temp_root}/"\n'
+        f'export CLAUDE_CONFIG_DIR="{cfg_root}"\n'
+        "grace=10\nleft=60\n"
+        f"{bounded_fn.group(0)}\n{kept_fn.group(0)}\n"
+        f'window() {{\n{invoked}\n}}\nwindow "$@"\n'
+    )
+    shell = subprocess.Popen(
+        ["/bin/sh", "-c", script, sys.executable, child_code],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    assert shell.stdout is not None
+    try:
+        assert _read_line(shell.stdout, 10).strip() == "running"
+        shell.send_signal(signal_module.SIGTERM)
+        out, _ = shell.communicate(timeout=15)
+    finally:
+        shell.kill()
+    assert shell.returncode == 143, out
+    watch = cfg_root / "canon" / "watch" / "windows"
+    assert (watch / "window-20261112T004500Z.json").is_file(), out
+    assert (watch / "window-20261112T004500Z.log").is_file(), out

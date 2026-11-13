@@ -160,6 +160,16 @@ this record. "Far over the ask" in the probe is the probe's own choice of limit,
   the three tests of `tests/test_paper_sell_to_close.py`, 3 passed, the refused plain sell now asserted
   by its reason, "position intent mismatch". `mise run paper:account tests` at 11:34:31: positions 0,
   open orders 0, `no_shorting: true`.
+* 2026-11-13, 14:29 and 14:33 New York, account A, regular session, two runs of a one-off probe that
+  is not kept in the repository, `no_shorting` turned off inside each `mise run paper:test` and restored
+  in a `finally`: the same answers for a TRAILING STOP sell (`DAY`, a 20% trail) as for the limit sells
+  of 2026-11-12, Alpaca's answer at the submit. Long 1, 2 shares, `sell_to_close`: "403 40310000
+  insufficient qty available for order (requested: 2, available: 1)"; the same with no intent: the same
+  403. Flat, 1 share, `sell_to_close`: "422 42210000 position intent mismatch, inferred: sell_to_open,
+  specified: sell_to_close". Not sent: a trailing stop with no intent while flat. Before and after each
+  run `mise run paper:long-only tests check` printed `no_shorting: true` and `mise run paper:account
+  tests` positions 0, open orders 0 (the last reads at 14:29:42 and 14:33:10). One observation each, one
+  symbol; the `GTC` form is not shown.
 
 ## Evidence
 

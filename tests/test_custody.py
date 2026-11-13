@@ -8,6 +8,7 @@ import os
 import re
 import signal
 import subprocess
+import sys
 import tomllib
 from collections import deque
 from datetime import UTC
@@ -300,7 +301,7 @@ def test_a_replacement_whose_replaced_order_is_not_listed_freezes_the_symbol() -
     quantity, why = opened(venue)
     assert quantity is None
     assert why == (
-        "an order of ours in SPY replaces one the listing of the last 1 day, 0:00:00 does not hold, "
+        "an order of ours in SPY replaces one the listing of the current trading week does not hold, "
         "whose fills it carries, so the quantity ours opened is not established"
     )
     report = close(venue)
@@ -822,7 +823,7 @@ def test_a_chain_never_counts_more_than_it_filled_so_a_foreign_share_is_not_sold
     report = close(venue)
     assert venue.sent == []
     assert report.frozen["SPY"] == [
-        "38 SPY held, but our orders opened 20 in the last 1 day, 0:00:00"
+        "38 SPY held, but our orders opened 20 in the current trading week"
     ]
 
 
@@ -865,7 +866,7 @@ def test_a_replacement_a_hand_made_takes_none_of_our_replaced_orders_fills() -> 
     report = close(venue)
     assert venue.sent == []
     assert report.frozen["SPY"] == [
-        "20 SPY held, but our orders opened 18 in the last 1 day, 0:00:00"
+        "20 SPY held, but our orders opened 18 in the current trading week"
     ]
 
 
@@ -961,7 +962,20 @@ class Paper:
 
     def get_orders(self, filter: Any = None):
         self.calls.append(("get_orders", filter))
+        if filter is not None and _value(filter.status) == "closed":
+            return []
         return self.orders
+
+    def get_clock(self):
+        self.calls.append(("get_clock", None))
+        return Clock.model_validate(
+            {
+                "timestamp": "2026-11-11T18:00:00Z",
+                "is_open": True,
+                "next_open": "2026-11-12T14:30:00Z",
+                "next_close": "2026-11-11T21:00:00Z",
+            }
+        )
 
     def get_account_configurations(self):
         self.calls.append(("get_account_configurations", None))
@@ -1003,15 +1017,68 @@ def test_the_account_read_names_balances_positions_orders_lineage_and_no_shortin
         "positions: 1",
         "  SPY long 1 avg_entry 680.12 market_value 681.00 unrealized_pl 0.88",
         "open orders: 3",
-        "  AAPL buy 1 market limit - status new foreign",
-        "  AAPL sell 1 limit limit 680.05 status new missing",
-        "  SPY sell 1 limit limit 679.95 status new ours",
+        "  AAPL buy 1 market limit - time_in_force day position_intent not shown status new foreign",
+        "  AAPL sell 1 limit limit 680.05 time_in_force day position_intent not shown status new missing",
+        "  SPY sell 1 limit limit 679.95 time_in_force day position_intent not shown status new ours",
         "no_shorting: true",
+        "ended orders for 2026-11-11 (New York trade date): none",
     ]
     for identifier in (ACCOUNT_NUMBER, ACCOUNT_ID, str(ours.id), *OURS[:1], FOREIGN[0]):
         assert identifier not in out
     (_, request), *_ = [c for c in paper.calls if c[0] == "get_orders"]
     assert request.status.value == "open" and request.limit == 500
+
+
+@pytest.mark.parametrize("intent", ["sell_to_close", "sell_to_open"])
+def test_the_account_read_shows_a_gtc_stops_returned_position_intent(
+    capsys, monkeypatch, intent: str
+) -> None:
+    """A protect lineage must not substitute its intended intent for Alpaca's returned value."""
+    data_only_unset(monkeypatch)
+    monkeypatch.setattr(custody, "require_get_only", lambda client: None)
+    stop = _order(
+        client_order_id=PROTECT_STOP,
+        side="sell",
+        type="trailing_stop",
+        order_type="trailing_stop",
+        time_in_force="gtc",
+        position_intent=intent,
+        limit_price=None,
+        trail_price="1.00",
+        extended_hours=False,
+    )
+    assert custody.account_task(cast(Any, Paper(orders=[stop]))) == 0
+    captured = capsys.readouterr()
+    assert (
+        "  SPY sell 1 trailing_stop limit - time_in_force gtc "
+        f"position_intent {intent} status new ours (a protect stop)"
+    ) in captured.out.splitlines()
+    assert captured.err == ""
+    for identifier in (ACCOUNT_NUMBER, ACCOUNT_ID, str(stop.id), stop.client_order_id):
+        assert identifier not in captured.out
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [{}, {"position_intent": None}, {"position_intent": ""}],
+    ids=["omitted", "null", "empty"],
+)
+def test_an_unreturned_position_intent_is_not_shown_not_inferred(fields: dict[str, Any]) -> None:
+    stop = _order(client_order_id=PROTECT_STOP, side="sell", time_in_force="gtc", **fields)
+    assert stop.position_intent is None
+    line = custody.order_line(stop)
+    assert "time_in_force gtc position_intent not shown status new ours (a protect stop)" in line
+    assert "sell_to_close" not in line and PROTECT_STOP not in line
+
+
+@pytest.mark.parametrize("field", ["time_in_force", "position_intent"])
+def test_an_absent_order_field_is_not_shown(field: str) -> None:
+    """Defensive model case: the pinned SDK requires time_in_force on validated payloads."""
+    order = _order(time_in_force="gtc", position_intent="sell_to_close")
+    delattr(order, field)
+    line = custody.order_line(order)
+    assert f"{field} not shown" in line
+    assert line.endswith("status new ours")
 
 
 def test_a_failed_read_is_named_without_its_body_and_exits_1(capsys, monkeypatch) -> None:
@@ -1184,6 +1251,313 @@ def test_a_listing_with_something_other_than_orders_is_a_named_read_failure(
     assert (
         "the open orders answered something other than a list of Order" in capsys.readouterr().err
     )
+
+
+class EndedPaper(Paper):
+    """GET-only history stand-in: the SDK's submission bounds and sort, not ending-time bounds.
+
+    Everything stays in memory. The account's clock is fixed; no real task, credential, or state path.
+    The end statuses here come from Alpaca's Order Lifecycle, including a replaced order.
+    """
+
+    def __init__(self, *ended: Order, now: str = "2026-11-11T18:00:00Z", inclusive=False):
+        super().__init__()
+        self.ended = list(ended)
+        self.now = now
+        self.inclusive = inclusive
+
+    def get_clock(self):
+        return (
+            super().get_clock().model_copy(update={"timestamp": datetime.fromisoformat(self.now)})
+        )
+
+    def get_orders(self, filter: Any = None):
+        if _value(filter.status) != "closed":
+            return super().get_orders(filter)
+        self.calls.append(("get_orders", filter))
+        found = [
+            order
+            for order in self.ended
+            if (filter.after is None or order.submitted_at > filter.after)
+            and (
+                filter.until is None
+                or order.submitted_at < filter.until
+                or (self.inclusive and order.submitted_at == filter.until)
+            )
+        ]
+        found.sort(key=lambda order: order.submitted_at, reverse=_value(filter.direction) != "asc")
+        return found[: filter.limit or 50]
+
+
+def _ended(**fields: Any) -> Order:
+    return _order(
+        **{
+            "client_order_id": PROTECT_STOP,
+            "side": "sell",
+            "type": "trailing_stop",
+            "order_type": "trailing_stop",
+            "time_in_force": "gtc",
+            "limit_price": None,
+            "qty": "3",
+            "filled_qty": "3",
+            "filled_avg_price": "679.21",
+            "status": "filled",
+            "submitted_at": "2026-11-09T15:00:00Z",
+            "filled_at": "2026-11-11T17:02:03Z",
+            "trail_price": "1.25",
+            "hwm": "680.46",
+            **fields,
+        }
+    )
+
+
+@pytest.fixture
+def account_read(monkeypatch, capsys):
+    data_only_unset(monkeypatch)
+    monkeypatch.setattr(custody, "require_get_only", lambda client: None)
+    monkeypatch.setattr(custody.time, "sleep", lambda seconds: None)
+
+    def read(paper: Paper, expected: int = 0):
+        assert custody.account_task(cast(Any, paper)) == expected
+        captured = capsys.readouterr()
+        if expected == 0:
+            assert captured.err == ""
+        return captured
+
+    return read
+
+
+def test_an_ended_filled_trailing_stop_prints_its_times_price_trail_and_high_water_mark(
+    account_read,
+) -> None:
+    """A GTC stop submitted on Monday and sold on Wednesday belongs to Wednesday's result."""
+    out = account_read(EndedPaper(_ended())).out
+    assert "ended orders for 2026-11-11 (New York trade date): 1" in out
+    assert "SPY sell 3 trailing_stop status filled filled_qty 3 filled_avg_price 679.21" in out
+    assert "submitted_at 2026-11-09T15:00:00+00:00" in out
+    assert "filled_at 2026-11-11T17:02:03+00:00" in out
+    assert "trail_price 1.25 trail_percent not shown hwm 680.46" in out
+    assert "ours (a protect stop)" in out
+
+
+def test_an_ended_canceled_order_prints_its_canceled_time(account_read) -> None:
+    out = account_read(
+        EndedPaper(
+            _ended(
+                status="canceled",
+                filled_at=None,
+                filled_qty="0",
+                filled_avg_price=None,
+                canceled_at="2026-11-11T17:05:06Z",
+            )
+        )
+    ).out
+    assert "status canceled filled_qty 0 filled_avg_price not shown" in out
+    assert "filled_at not shown canceled_at 2026-11-11T17:05:06+00:00" in out
+
+
+def test_a_foreign_ended_order_is_named_foreign(account_read) -> None:
+    out = account_read(EndedPaper(_ended(client_order_id=FOREIGN[0]))).out
+    assert "status filled" in out and "foreign" in out
+    assert "ours" not in out
+
+
+@pytest.mark.parametrize("inclusive", [False, True])
+def test_ended_orders_page_with_ties_and_print_only_the_trade_date(
+    account_read, monkeypatch, inclusive: bool
+) -> None:
+    ended = [
+        _ended(
+            submitted_at=(
+                datetime(2026, 11, 11, 17, tzinfo=UTC) - timedelta(seconds=n)
+            ).isoformat(),
+            symbol=f"DAY{n}",
+        )
+        for n in range(502)
+    ]
+    # The first page cuts through three tied submissions. An exclusive cursor without overlap
+    # would lose two of them. Distinct older submissions can also end today (GTC).
+    for n in (499, 500, 501):
+        ended[n] = ended[n].model_copy(update={"submitted_at": ended[499].submitted_at})
+    before = _ended(symbol="PREVIOUS", filled_at="2026-11-11T00:59:59.999999Z")
+    after = _ended(symbol="FOLLOWING", filled_at="2026-11-12T01:00:00Z")
+    oldest = _ended(symbol="OLDER_GTC", submitted_at="2026-10-01T15:00:00Z")
+    paper = EndedPaper(*ended, before, after, oldest, inclusive=inclusive)
+    sleeps: list[float] = []
+    monkeypatch.setattr(custody.time, "sleep", sleeps.append)
+
+    out = account_read(paper).out
+    assert "ended orders for 2026-11-11 (New York trade date): 503" in out
+    assert out.count("status filled") == 503
+    assert "DAY499 sell" in out and "DAY500 sell" in out and "DAY501 sell" in out
+    assert "OLDER_GTC sell" in out
+    assert "PREVIOUS" not in out and "FOLLOWING" not in out
+    requests = [
+        r for name, r in paper.calls if name == "get_orders" and _value(r.status) == "closed"
+    ]
+    assert len(requests) == 2
+    assert all(
+        _value(r.direction) == "desc" and r.limit == 500 and r.nested is False for r in requests
+    )
+    assert requests[0].until == datetime(2026, 11, 12, 1, tzinfo=UTC)
+    # The endpoint's bounds are submission times. A lower bound at today's start would lose
+    # the older GTC; the final ending-time filter, not an invented SDK filter, bounds the date.
+    assert all(
+        r.after == datetime(2026, 11, 11, 1, tzinfo=UTC) - custody.GTC_AGE_LIMIT for r in requests
+    )
+    assert requests[1].until == ended[499].submitted_at + timedelta(microseconds=1)
+    assert sleeps == [session_window.POLL_SECS]
+
+
+def test_no_ended_order_or_account_identifier_appears_in_any_output(account_read) -> None:
+    ended = _ended(replaced_by=str(uuid4()), replaces=str(uuid4()), group_id=str(uuid4()))
+    paper = EndedPaper(ended, _ended(client_order_id=FOREIGN[0], symbol="AAPL"))
+    captured = account_read(paper)
+    output = captured.out + captured.err
+    assert "ended orders for 2026-11-11 (New York trade date): 2" in output
+    for identifier in (
+        ACCOUNT_ID,
+        ACCOUNT_NUMBER,
+        *(str(o.id) for o in paper.ended),
+        *(o.client_order_id for o in paper.ended),
+        str(ended.replaced_by),
+        str(ended.replaces),
+        str(ended.group_id),
+        str(ended.asset_id),
+    ):
+        assert identifier not in output
+
+
+def test_an_empty_trade_date_prints_one_ended_orders_line(account_read) -> None:
+    paper = EndedPaper(_ended(filled_at="2026-11-10T17:02:03Z"))
+    out = account_read(paper).out
+    assert [line for line in out.splitlines() if line.startswith("ended orders")] == [
+        "ended orders for 2026-11-11 (New York trade date): none"
+    ]
+    assert "status filled" not in out
+
+
+def test_an_ended_percent_trail_without_a_high_water_mark_does_not_invent_one(account_read) -> None:
+    out = account_read(EndedPaper(_ended(trail_price=None, trail_percent="0.75", hwm=None))).out
+    assert "trail_price not shown trail_percent 0.75 hwm not shown" in out
+
+
+@pytest.mark.parametrize(
+    ("now", "start", "end", "trade_date"),
+    [
+        ("2026-11-11T01:00:00Z", "2026-11-11T01:00:00Z", "2026-11-12T01:00:00Z", "2026-11-11"),
+        ("2026-07-08T00:00:00Z", "2026-07-08T00:00:00Z", "2026-07-09T00:00:00Z", "2026-07-08"),
+    ],
+    ids=["new-york-winter", "new-york-summer"],
+)
+def test_ended_orders_use_new_yorks_overnight_trade_date(
+    account_read, now: str, start: str, end: str, trade_date: str
+) -> None:
+    first = datetime.fromisoformat(start)
+    last = datetime.fromisoformat(end)
+    submitted = (first - timedelta(days=2)).isoformat()
+    paper = EndedPaper(
+        _ended(symbol="INCLUDED", submitted_at=submitted, filled_at=start),
+        _ended(
+            symbol="TOO_EARLY",
+            submitted_at=submitted,
+            filled_at=(first - timedelta(microseconds=1)).isoformat(),
+        ),
+        _ended(symbol="TOO_LATE", submitted_at=submitted, filled_at=end),
+        now=now,
+    )
+    out = account_read(paper).out
+    assert f"ended orders for {trade_date} (New York trade date): 1" in out
+    assert "INCLUDED sell" in out and "TOO_EARLY" not in out and "TOO_LATE" not in out
+    requests = [
+        r for name, r in paper.calls if name == "get_orders" and _value(r.status) == "closed"
+    ]
+    assert requests[0].until == last
+
+
+@pytest.mark.parametrize(
+    ("status", "field"),
+    [("expired", "expired_at"), ("rejected", "failed_at"), ("replaced", "replaced_at")],
+)
+def test_other_ended_statuses_show_their_returned_ending_time(account_read, status, field) -> None:
+    out = account_read(
+        EndedPaper(_ended(status=status, filled_at=None, **{field: "2026-11-11T17:05:06Z"}))
+    ).out
+    assert f"status {status}" in out
+    assert f"{field} 2026-11-11T17:05:06+00:00" in out
+
+
+def test_an_ended_order_without_its_ending_time_fails_without_an_empty_day_claim(
+    account_read,
+) -> None:
+    captured = account_read(EndedPaper(_ended(filled_at=None)), expected=1)
+    assert "ending time" in captured.err and "not shown" in captured.err
+    assert PROTECT_STOP not in captured.err
+
+
+def test_a_full_page_of_tied_ended_orders_fails_without_truncating_or_looping(account_read) -> None:
+    paper = EndedPaper(*(_ended() for _ in range(501)))
+    captured = account_read(paper, expected=1)
+    assert "ended orders" in captured.err and "cannot advance" in captured.err
+    assert (
+        len([r for name, r in paper.calls if name == "get_orders" and _value(r.status) == "closed"])
+        == 2
+    )
+
+
+def test_an_ended_orders_read_failure_does_not_print_an_identifier_from_the_body(
+    account_read,
+) -> None:
+    class RefusedHistory(EndedPaper):
+        def get_orders(self, filter: Any = None):
+            if _value(filter.status) == "closed":
+                raise APIError(
+                    f'{{"code": 50010000, "message": "{ACCOUNT_NUMBER} {PROTECT_STOP}"}}'
+                )
+            return super().get_orders(filter)
+
+    captured = account_read(RefusedHistory(), expected=1)
+    assert "the ended orders failed: APIError" in captured.err
+    assert ACCOUNT_NUMBER not in captured.err and PROTECT_STOP not in captured.err
+
+
+def test_a_failed_history_read_keeps_the_account_read_printed_before_it(account_read) -> None:
+    """The flat read (positions and open orders) is printed before the history walk starts, so a
+    history failure, or the task's timeout killing a long walk, cannot take it away."""
+
+    class RefusedHistory(EndedPaper):
+        def get_orders(self, filter: Any = None):
+            if _value(filter.status) == "closed":
+                self.printed_before = cast(Any, sys.stdout).getvalue()
+                raise APIError('{"code": 50010000, "message": "refused"}')
+            return super().get_orders(filter)
+
+    paper = RefusedHistory()
+    captured = account_read(paper, expected=1)
+    for line in ("positions: 0", "open orders: 0", "no_shorting: true"):
+        assert line in paper.printed_before and line in captured.out
+    assert "ended orders" not in captured.out
+    assert "the ended orders failed: APIError" in captured.err
+    assert "nothing else was read" not in captured.err
+    assert "the account, positions, open orders and configuration above were read" in captured.err
+
+
+def test_the_history_walk_stops_at_the_age_alpaca_cancels_a_gtc_order(account_read) -> None:
+    """Alpaca cancels a GTC order 90 days after creation, so no order submitted earlier than that
+    before the trade date can end inside it; the walk asks for nothing older."""
+    old = _ended(
+        submitted_at="2026-08-01T15:00:00Z",
+        filled_at=None,
+        status="canceled",
+        canceled_at="2026-11-11T17:00:00Z",
+    )
+    paper = EndedPaper(_ended(), old)
+    out = account_read(paper).out
+    assert "ended orders for 2026-11-11 (New York trade date): 1" in out
+    start = datetime(2026, 11, 11, 1, 0, tzinfo=UTC)  # 2026-11-10 20:00 New York
+    closed = [r for name, r in paper.calls if name == "get_orders" and _value(r.status) == "closed"]
+    assert closed and all(r.after == start - custody.GTC_AGE_LIMIT for r in closed)
+    assert custody.GTC_AGE_LIMIT >= timedelta(days=90)
 
 
 @pytest.mark.parametrize("answer", [None, {"client_order_id": "foreign-id-not-to-print"}, []])
@@ -1748,9 +2122,221 @@ def test_a_quantity_ours_did_not_open_freezes_the_symbol() -> None:
     report = close(venue)
     assert venue.sent == [] and venue.canceled == []
     assert report.frozen == {
-        "AAPL": ["5 AAPL held, but our orders opened 0 in the last 1 day, 0:00:00"],
-        "SPY": ["3 SPY held, but our orders opened 1 in the last 1 day, 0:00:00"],
+        "AAPL": ["5 AAPL held, but our orders opened 0 in the current trading week"],
+        "SPY": ["3 SPY held, but our orders opened 1 in the current trading week"],
     }
+
+
+def test_our_long_opened_three_days_ago_in_this_trading_week_is_ours() -> None:
+    venue = Venue(datetime(2026, 11, 13, 15, tzinfo=UTC))
+    venue.hold("SPY", 3)
+    venue.history[-1] = venue.history[-1].model_copy(
+        update={"submitted_at": venue.now - timedelta(days=3)}
+    )
+
+    (holding,) = custody.read_holdings(cast(Any, venue), venue.now)
+    assert holding.opened == Decimal(3)
+    assert holding.frozen == []
+    assert holding.ours_left() == ["position of 3 SPY (ours opened 3)"]
+
+
+def test_our_long_opened_eight_trading_days_ago_stays_frozen_and_named() -> None:
+    venue = Venue(datetime(2026, 11, 13, 15, tzinfo=UTC))
+    venue.hold("SPY", 3)
+    # Tuesday Nov 3 to Friday Nov 13: eight weekday sessions, ten calendar days.
+    venue.history[-1] = venue.history[-1].model_copy(
+        update={"submitted_at": datetime(2026, 11, 3, 15, tzinfo=UTC)}
+    )
+
+    (holding,) = custody.read_holdings(cast(Any, venue), venue.now)
+    assert holding.opened == 0
+    assert holding.frozen and "3 SPY held, but our orders opened 0" in holding.frozen[0]
+    assert holding.ours_left() == []
+    report = close(venue)
+    assert "SPY" in report.frozen
+    assert venue.sent == [] and venue.canceled == []
+
+
+def test_a_three_day_mixed_lineage_long_still_freezes_its_whole_symbol() -> None:
+    venue = Venue(datetime(2026, 11, 13, 15, tzinfo=UTC))
+    venue.hold("SPY", 2)
+    venue.hold("SPY", 1, client_order_id=FOREIGN[0])
+    venue.history = [
+        order.model_copy(update={"submitted_at": venue.now - timedelta(days=3)})
+        for order in venue.history
+    ]
+
+    (holding,) = custody.read_holdings(cast(Any, venue), venue.now)
+    assert holding.opened == 2 and holding.held == 3
+    assert holding.frozen and "3 SPY held, but our orders opened 2" in holding.frozen[0]
+    report = close(venue)
+    assert "SPY" in report.frozen
+    assert venue.sent == [] and venue.canceled == []
+
+
+@pytest.mark.parametrize(
+    ("now", "start"),
+    [
+        ("2026-11-13T15:00:00+00:00", "2026-11-09T01:00:00+00:00"),
+        ("2026-11-09T00:30:00+00:00", "2026-11-02T01:00:00+00:00"),
+        ("2026-11-09T01:30:00+00:00", "2026-11-09T01:00:00+00:00"),
+        ("2026-03-09T00:30:00+00:00", "2026-03-09T00:00:00+00:00"),
+        ("2026-03-08T23:30:00+00:00", "2026-03-02T01:00:00+00:00"),
+    ],
+)
+def test_lineage_never_reads_before_the_current_sunday_evening_open(now, start) -> None:
+    """The 24/5 week starts Sunday 20:00 New York, including either side of the DST change."""
+    venue = Venue(datetime.fromisoformat(now))
+    venue.hold("SPY", 1)
+    venue.history[-1] = venue.history[-1].model_copy(
+        update={"submitted_at": datetime.fromisoformat(start) + timedelta(minutes=1)}
+    )
+
+    (holding,) = custody.read_holdings(cast(Any, venue), venue.now)
+    (request,) = [
+        request
+        for name, request in venue.calls
+        if name == "get_orders" and _value(request.status) == "all"
+    ]
+    assert request.after == datetime.fromisoformat(start)
+    assert holding.opened == 1 and holding.frozen == []
+
+
+class PagedVenue(Venue):
+    """The pinned GetOrdersRequest's bounds, submission-time sort and 500-row limit.
+
+    The SDK says 'until' without specifying equality; exercise both interpretations. The older
+    Venue deliberately preserves listing order for the replacement-chain permutation tests.
+    """
+
+    def __init__(self, now: datetime, *, until_inclusive: bool = True) -> None:
+        super().__init__(now)
+        self.until_inclusive = until_inclusive
+
+    def get_orders(self, filter: Any = None):
+        self.calls.append(("get_orders", filter))
+        found = [
+            order
+            for order in self.history
+            if (
+                _value(filter.status) == "all"
+                or _value(order.status) not in session_window.TERMINAL
+            )
+            and (not filter.symbols or order.symbol in filter.symbols)
+            and (filter.after is None or order.submitted_at > filter.after)
+            and (
+                filter.until is None
+                or order.submitted_at < filter.until
+                or (self.until_inclusive and order.submitted_at == filter.until)
+            )
+        ]
+        found.sort(key=lambda order: order.submitted_at, reverse=_value(filter.direction) != "asc")
+        return found[: filter.limit or 50]
+
+
+@pytest.mark.parametrize("until_inclusive", [True, False])
+@pytest.mark.parametrize("foreign_first", [False, True])
+def test_a_week_of_fills_across_three_pages_is_read_whole_and_paced(
+    monkeypatch, until_inclusive: bool, foreign_first: bool
+) -> None:
+    venue = PagedVenue(datetime(2026, 11, 13, 15, tzinfo=UTC), until_inclusive=until_inclusive)
+    venue.held["SPY"] = Decimal(1003)
+    for n in range(1003):
+        venue.open(
+            client_order_id=FOREIGN[0]
+            if foreign_first and n == 0
+            else f"O-20261109-150000-001-001-{n}",
+            qty="1",
+            filled_qty="1",
+            status="filled",
+            submitted_at=(
+                datetime(2026, 11, 9, 15, tzinfo=UTC) + timedelta(minutes=4 * n)
+            ).isoformat(),
+        )
+    sleeps: list[float] = []
+    monkeypatch.setattr(custody.time, "sleep", sleeps.append)
+
+    (holding,) = custody.read_holdings(cast(Any, venue), venue.now)
+    assert holding.opened == (1002 if foreign_first else 1003)
+    assert bool(holding.frozen) == foreign_first
+    requests = [
+        request
+        for name, request in venue.calls
+        if name == "get_orders" and _value(request.status) == "all"
+    ]
+    assert len(requests) == 3
+    assert all(request.after == datetime(2026, 11, 9, 1, tzinfo=UTC) for request in requests)
+    assert sleeps == [session_window.POLL_SECS, session_window.POLL_SECS]
+
+
+def test_a_full_page_of_equal_timestamps_cannot_hide_more_fills(monkeypatch) -> None:
+    venue = PagedVenue(REGULAR)
+    venue.held["SPY"] = Decimal(501)
+    for n in range(501):
+        venue.open(
+            client_order_id=f"O-20261111-145000-001-001-{n}",
+            qty="1",
+            filled_qty="1",
+            status="filled",
+            submitted_at=(venue.now - timedelta(minutes=10)).isoformat(),
+        )
+    monkeypatch.setattr(custody.time, "sleep", lambda seconds: None)
+
+    (holding,) = custody.read_holdings(cast(Any, venue), venue.now)
+    assert holding.opened is None and holding.frozen
+    assert "pagination" in holding.frozen[0]
+    assert holding.ours_left() == []
+
+
+@pytest.mark.parametrize("until_inclusive", [True, False])
+def test_recent_fills_with_the_same_submission_time_cross_a_page_without_loss(
+    monkeypatch, until_inclusive: bool
+) -> None:
+    """Under either reading of `until`: Alpaca's reference calls it exclusive, and then only the
+    microsecond added to the page's earliest time brings the tied fills onto the next page."""
+    venue = PagedVenue(REGULAR, until_inclusive=until_inclusive)
+    venue.hold("SPY", 3, client_order_id=None)
+    for n in range(499):
+        venue.open(
+            client_order_id=f"O-20261111-145500-001-001-{n}",
+            status="canceled",
+            submitted_at=(venue.now - timedelta(minutes=5)).isoformat(),
+        )
+    for n in range(3):
+        venue.open(
+            client_order_id=f"O-20261111-145000-001-001-{n}",
+            status="filled",
+            filled_qty="1",
+            submitted_at=(venue.now - timedelta(minutes=10)).isoformat(),
+        )
+    monkeypatch.setattr(custody.time, "sleep", lambda seconds: None)
+
+    (holding,) = custody.read_holdings(cast(Any, venue), venue.now)
+    assert holding.opened == 3 and holding.frozen == []
+
+
+def test_a_failed_later_history_page_never_uses_the_partial_net(monkeypatch) -> None:
+    venue = PagedVenue(REGULAR)
+    venue.hold("SPY", 1)
+    for n in range(500):
+        venue.open(
+            client_order_id=f"O-20261111-145500-001-001-{n}",
+            status="canceled",
+            submitted_at=(venue.now - timedelta(seconds=n)).isoformat(),
+        )
+    get_orders = venue.get_orders
+
+    def fail_later(filter):
+        if filter.until is not None:
+            raise APIError('{"code": 42910000, "message": "do not print this body"}', _status(429))
+        return get_orders(filter)
+
+    monkeypatch.setattr(venue, "get_orders", fail_later)
+    monkeypatch.setattr(custody.time, "sleep", lambda seconds: None)
+
+    with pytest.raises(custody.ReadFailed, match="the orders in SPY failed: APIError") as failed:
+        custody.read_holdings(cast(Any, venue), venue.now)
+    assert "429" in str(failed.value) and "do not print" not in str(failed.value)
 
 
 def test_a_short_is_never_bought_back() -> None:
@@ -1763,7 +2349,9 @@ def test_a_short_is_never_bought_back() -> None:
     assert all(_value(f.status) == "open" for f in listed)  # a frozen symbol's history is not read
 
 
-def test_a_full_listing_of_the_symbols_orders_freezes_it() -> None:
+def test_a_full_listing_that_cannot_advance_freezes_the_symbol(monkeypatch) -> None:
+    # This stand-in ignores `until`, so the truncated history never becomes a complete listing.
+    monkeypatch.setattr(custody.time, "sleep", lambda seconds: None)
     venue = Venue(REGULAR)
     venue.hold("SPY", 1)
     for n in range(2, custody.ORDERS_PAGE_LIMIT + 1):
@@ -2179,3 +2767,168 @@ def test_a_hands_own_sell_chain_with_fills_on_two_links_running_leaves_our_count
             submitted_at=(venue.now - timedelta(minutes=10 - n)).isoformat(),
         )
     assert opened(venue) == (Decimal(10), "")
+
+
+class OddVenue(PagedVenue):
+    """A venue that does not do what the request asks: it answers oldest first, keeps only whole
+    seconds of `until`, or ignores `after`."""
+
+    oldest_first = False
+    until_to_seconds = False
+    ignores_after = False
+
+    def get_orders(self, filter: Any = None):
+        if filter is not None and _value(filter.status) == "all":
+            changed: dict[str, Any] = {}
+            if self.until_to_seconds and filter.until is not None:
+                changed["until"] = filter.until.replace(microsecond=0)
+            if self.oldest_first:
+                changed["direction"] = "asc"
+            if self.ignores_after:
+                changed["after"] = None
+            filter = filter.model_copy(update=changed)
+        return super().get_orders(filter)
+
+
+WEEK_NOW = datetime(2026, 11, 13, 15, tzinfo=UTC)
+"""Friday 10:00 New York; the trading week began Sunday 2026-11-08 20:00 New York."""
+
+
+def _a_week_with_a_hands_buy(venue: Venue, sell_at: datetime) -> None:
+    """Ours buys 10, a hand buys 5, ours sells 5 at `sell_at`, and 500 orders of ours fill nothing:
+    10 are held and only 5 of them are ours, so the symbol must freeze."""
+    monday = datetime(2026, 11, 9, 15, tzinfo=UTC)
+    venue.held["SPY"] = Decimal(10)
+    venue.open(
+        client_order_id="O-20261109-150000-001-001-1",
+        qty="10",
+        filled_qty="10",
+        status="filled",
+        submitted_at=monday.isoformat(),
+    )
+    venue.open(
+        client_order_id=FOREIGN[0],
+        qty="5",
+        filled_qty="5",
+        status="filled",
+        submitted_at=(monday + timedelta(hours=1)).isoformat(),
+    )
+    venue.open(
+        client_order_id="O-20261111-150000-001-001-9",
+        qty="5",
+        filled_qty="5",
+        side="sell",
+        status="filled",
+        submitted_at=sell_at.isoformat(),
+    )
+    edge = datetime(2026, 11, 12, 15, 0, 0, 900000, tzinfo=UTC)
+    for n in range(500):
+        venue.open(
+            client_order_id=f"O-20261112-150000-001-001-{n + 100}",
+            qty="1",
+            filled_qty="0",
+            status="canceled",
+            submitted_at=(edge + timedelta(microseconds=n)).isoformat(),
+        )
+
+
+def test_a_week_with_a_hands_buy_read_in_two_pages_counts_only_ours(monkeypatch) -> None:
+    """The scene the next three cases bend, on a venue that does as asked: the net is ours' 5."""
+    venue = OddVenue(WEEK_NOW)
+    _a_week_with_a_hands_buy(venue, datetime(2026, 11, 11, 15, tzinfo=UTC))
+    monkeypatch.setattr(custody.time, "sleep", lambda seconds: None)
+
+    (holding,) = custody.read_holdings(cast(Any, venue), venue.now)
+    assert holding.opened == 5 and holding.held == 10
+    assert holding.frozen == ["10 SPY held, but our orders opened 5 in the current trading week"]
+
+
+def test_a_history_answered_oldest_first_is_not_counted(monkeypatch) -> None:
+    """A venue that ignores `direction`: the first page is the oldest 500, the walk would stop
+    after it with our later sell unread, and every held share would read as ours (a reviewer's
+    reproduction, 2026-11-13)."""
+    venue = OddVenue(WEEK_NOW)
+    venue.oldest_first = True
+    _a_week_with_a_hands_buy(venue, datetime(2026, 11, 13, 14, tzinfo=UTC))
+    monkeypatch.setattr(custody.time, "sleep", lambda seconds: None)
+
+    (holding,) = custody.read_holdings(cast(Any, venue), venue.now)
+    assert holding.opened is None and holding.frozen
+    assert "not newest first" in holding.frozen[0]
+
+
+@pytest.mark.parametrize("until_inclusive", [True, False])
+def test_a_history_whose_next_page_drops_the_orders_at_the_edge_is_not_counted(
+    monkeypatch, until_inclusive: bool
+) -> None:
+    """A venue that keeps only whole seconds of `until`: our sell, in the edge's second and older
+    than the page's oldest order, is on no page, and every held share would read as ours (the same
+    reviewer). The orders at a page's earliest time must come back on the next page."""
+    venue = OddVenue(WEEK_NOW, until_inclusive=until_inclusive)
+    venue.until_to_seconds = True
+    _a_week_with_a_hands_buy(venue, datetime(2026, 11, 12, 15, 0, 0, 300000, tzinfo=UTC))
+    monkeypatch.setattr(custody.time, "sleep", lambda seconds: None)
+
+    (holding,) = custody.read_holdings(cast(Any, venue), venue.now)
+    assert holding.opened is None and holding.frozen
+    assert "does not hold the orders at the edge" in holding.frozen[0]
+
+
+def test_a_later_history_page_with_an_order_from_before_the_week_is_not_counted(
+    monkeypatch,
+) -> None:
+    venue = OddVenue(WEEK_NOW)
+    venue.ignores_after = True
+    _a_week_with_a_hands_buy(venue, datetime(2026, 11, 11, 15, tzinfo=UTC))
+    venue.open(
+        client_order_id="O-20261030-150000-001-001-1",
+        qty="5",
+        filled_qty="5",
+        status="filled",
+        submitted_at=datetime(2026, 10, 30, 15, tzinfo=UTC).isoformat(),
+    )
+    monkeypatch.setattr(custody.time, "sleep", lambda seconds: None)
+
+    (holding,) = custody.read_holdings(cast(Any, venue), venue.now)
+    assert holding.opened is None and holding.frozen
+    assert "outside the time asked for" in holding.frozen[0]
+
+
+def test_an_order_that_changed_between_two_history_pages_is_not_counted(monkeypatch) -> None:
+    """The order at a page's edge is read on both pages; a fill arriving between them shows as a
+    row that differs, and neither count is taken."""
+    venue = PagedVenue(WEEK_NOW)
+    _a_week_with_a_hands_buy(venue, datetime(2026, 11, 11, 15, tzinfo=UTC))
+    get_orders = venue.get_orders
+
+    def filling(filter):
+        found = get_orders(filter)
+        if _value(filter.status) == "all" and filter.until is not None:
+            found[0] = found[0].model_copy(update={"filled_qty": "1"})
+        return found
+
+    monkeypatch.setattr(venue, "get_orders", filling)
+    monkeypatch.setattr(custody.time, "sleep", lambda seconds: None)
+
+    (holding,) = custody.read_holdings(cast(Any, venue), venue.now)
+    assert holding.opened is None and holding.frozen
+    assert "changed across history pages" in holding.frozen[0]
+
+
+def test_a_full_history_page_with_an_undated_order_is_not_counted(monkeypatch) -> None:
+    venue = PagedVenue(WEEK_NOW)
+    _a_week_with_a_hands_buy(venue, datetime(2026, 11, 11, 15, tzinfo=UTC))
+    get_orders = venue.get_orders
+
+    def undated(filter):
+        found = get_orders(filter)
+        if _value(filter.status) == "all":
+            found[3] = found[3].model_copy(update={"submitted_at": None})
+        return found
+
+    monkeypatch.setattr(venue, "get_orders", undated)
+    monkeypatch.setattr(custody.time, "sleep", lambda seconds: None)
+
+    (holding,) = custody.read_holdings(cast(Any, venue), venue.now)
+    assert holding.opened is None and holding.frozen
+    assert "no dated submission boundary" in holding.frozen[0]

@@ -114,6 +114,23 @@ def _open_orders(trading: Any) -> list[Any]:
     return list(trading.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=500)))
 
 
+def _working(trading: Any) -> list[Any]:
+    """The listed open orders whose own read does not show them ended. Alpaca's open-orders listing
+    can still show an order a second after it filled or was canceled (seen on paper, 2026-11-13: this
+    test's own filled buy), so the body's checks of what is working go by each order's own read. One
+    still listed though ended is printed with the status the listing gave it."""
+    working = []
+    for order in _open_orders(trading):
+        own = trading.get_order_by_id(order.id)
+        if _status(own) in ENDED:
+            print(
+                f"listed as open though ended: listed {_status(order)}, its own read {_status(own)}"
+            )
+        else:
+            working.append(own)
+    return working
+
+
 def _held(trading: Any) -> dict[str, Decimal]:
     """Each position signed by its side (`session_window.positions`): alpaca-py's `Position` carries
     the side apart from the count, so a short may list a positive quantity."""
@@ -361,14 +378,14 @@ def test_paper_protect_task_on_an_account_that_allows_shorting(capsys: Any) -> N
         assert planned.exit_code == 0 and planned.planned, planned.lines()
         named = {row for row in protect.ROWS for line in planned.said if f"under {row}:" in line}
         assert named == set(protect.ROWS), f"plan-only left a row unnamed: {sorted(named)}"
-        assert not planned.sent and not _open_orders(trading), "plan-only sent an order"
+        assert not planned.sent and not _working(trading), "plan-only sent an order"
 
         unnamed = protect.protect_longs(trading, session_window.window_data, print)
-        assert unnamed.exit_code == 3 and not _open_orders(trading), "a send with no row went out"
+        assert unnamed.exit_code == 3 and not _working(trading), "a send with no row went out"
 
         sent = protect.protect_longs(trading, session_window.window_data, print, row=ROW)
         assert sent.exit_code == 0 and len(sent.sent) == 1, sent.lines()
-        (listed,) = _open_orders(trading)
+        (listed,) = _working(trading)
         stop = _until(
             lambda: trading.get_order_by_id(listed.id), lambda found: found.hwm is not None
         )
@@ -400,11 +417,11 @@ def test_paper_protect_task_on_an_account_that_allows_shorting(capsys: Any) -> N
         again = protect.protect_longs(trading, session_window.window_data, print, row=ROW)
         assert again.exit_code == 0 and not again.sent, again.lines()
         assert len(again.left_alone) == 1 and "fully covered" in again.left_alone[0]
-        assert len(_open_orders(trading)) == 1, "the second run sent or lost an order"
+        assert len(_working(trading)) == 1, "the second run sent or lost an order"
 
         would = protect.cancel_stops(trading, print, SYMBOL, plan_only=True)
         assert would.exit_code == 0 and len(would.planned) == 1, would.lines()
-        (resting,) = _open_orders(trading)
+        (resting,) = _working(trading)
         assert _status(trading.get_order_by_id(resting.id)) in ("new", "accepted"), (
             "the plan-only cancel canceled"
         )

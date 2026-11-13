@@ -718,7 +718,9 @@ Each is stated in `execution.py`'s header, with its source.
   (offline). What the regular session answers is UNVERIFIED. An outcome found after an `await` (an
   answer, a lookup) is checked against what the stream applied meanwhile: an order that has ended gets
   no second rejection and no cancel rejection, and a cancel refused for an order Alpaca shows filled is
-  settled by its fill. An acknowledgement that comes while a cancel or modify sent before it is pending
+  settled by its fill. If the order was never acknowledged, the filled read is passed through the
+  existing report/catch-up path to book its actual trade-ID fills: a retained submit has no further
+  automatic query budget. An acknowledgement that comes while a cancel or modify sent before it is pending
   is kept, gives a later cancel or modify Alpaca's order ID, and `OrderAccepted` follows a refusal of
   that cancel or modify unless a fill came first. An update for an order the engine has ended from a
   query's report is dropped, fills included, since that report reaches the engine only once the node's
@@ -766,15 +768,104 @@ Each is stated in `execution.py`'s header, with its source.
   later reads. A
   `canceled` or `expired` update or report showing more filled than the node holds brings the missing
   fills first and then ends the order, waiting with the later reads while the activities lag; after
-  them it ends with what the node holds, with an error. At start-up there is no exit to inference for
+  them it ends with what the node holds, with an error. Ending an order removes its later-read target.
+  An outstanding read remains tracked until it returns, and a sleeping retry exits when it wakes,
+  without another read or crediting a stream fill as caught up on that read; disconnect cancels any
+  still outstanding. A read that itself brought the ending fill retains its catch-up log.
+
+  An already finished order waits for actual cache closure at three sites: `_settled_report` for
+  single and bulk return hooks (including mass/open-order reports), `_query_order` for `QueryOrder`,
+  and `_send_report` for stream snapshots and companion fills. They share `_hold_report` and its
+  `HELD_REPORT_TIMEOUT_SECS` (0.5 s, an adapter choice). That bounds mapping inside the send hold,
+  cache closure, chain orders, activity pages, newer snapshot reads and the cache application of
+  recovered fills needed by return hooks. A continuous report's delivery ends its hold immediately;
+  no later cache wait can label that delivery failed. Only an actual cache wait logs an INFO
+  held/released pair, naming the order and reason. Initial query/bulk reads and mapping precede
+  settlement, outside the stream consumer. Earlier identification of an unknown replacement keeps
+  its existing chain lookup. A canceled REST await releases the consumer at the bound; its shielded
+  worker retains the REST lock until the actual call ends.
+
+  Expiry raises a named error. `_report_hold_failures` keeps the entry cache state, a monotonic retry
+  time, a log deadline and the error. `HELD_REPORT_RETRY_SECS` (5 s, an adapter choice) spaces retries
+  after a timeout on an unchanged closed order: a later update, query or report tries again after
+  that spacing even if no fills have reached the cache. Cache closure/progress can unblock it sooner.
+  A burst inside the spacing is refused immediately; the timeout names the omission and spacing,
+  and repeated refusals share that one line. If the cache never closes, no more holds start, and
+  omissions are logged at most once per spacing. Successful settlement drops the failure; disconnect
+  replaces the state so an old hold cannot restore it; completed chain reads also check their
+  session before writing the index, and settlement checks before delivery.
+
+  A stream update of a finished order whose hold fails, by a timeout, because Alpaca's activities
+  do not list the fills it shows yet, or because a read for its mapping failed (an `APIError` or an
+  `OSError`), is read again by the client itself: Alpaca sends an ended
+  order no further update, and the engine's open-order check reads open orders only by default, so
+  nothing else would. `_reread_report_later` reads the order afresh `HELD_REPORT_REREADS` (3) times
+  at most, `HELD_REPORT_RETRY_SECS` apart, through the same hold and the same delivery; one task per
+  order, canceled at disconnect. Past the last read it logs an error that leaves the order to the
+  next start-up. A re-read and a later update can each queue the same fills before the cache shows
+  them; the engine's bundle path drops a fill whose trade ID the order already holds
+  (`reconciliation/orders.rs:785-791`, called per fill at `engine/mod.rs:1769`, at `d53849b216e2`).
+  Limits: whether start-up reconciliation then brings such a fill is UNVERIFIED; an
+  update that fails while a re-read waits adds no reads; a `QueryOrder` or report hook whose hold
+  fails arms none, since the engine asks again on its own schedule; and each re-read's first
+  request to Alpaca is outside the hold's bound, in its own task, off the stream consumer.
+
+  Bulk reports omit each held order by name and return the reports available, including `[]` when
+  every candidate is held or awaiting catch-up. Listing failures still raise. The engine follows a
+  missing bulk entry with a targeted lookup (`crates/live/src/execution/manager.rs:2457-2472` at
+  `d53849b216e2`); that lookup raises for a held order, marking coverage incomplete
+  (`reconciliation.rs:530-556`). The manager then logs "Deferring" and keeps that order unresolved
+  (`manager.rs:2590-2597`), without suppressing reconciliation of every other missing order as a
+  failed bulk listing would (`manager.rs:2076-2079,2457-2466`). `QueryOrder` and a refused submit's
+  report consume an already logged hold error; the latter also logs an API mapping error once,
+  without raising it to the command worker.
+
+  `_finished` alone does not prove an end reached the engine. Additional filled shares come by real
+  trade ID from companion fills or the chain's activities. When those fills exceed a snapshot's
+  total, the order is read again; the resulting report must account for every new fill delivered.
+  If the snapshot is ahead of the activities, or remains behind them after that read, the request
+  fails by name without sending an incomplete bundle or inferring a fill. Continuous send/query
+  paths deliver the report and new fills once through `_handle_report(report, fills)`; a late
+  update showing no new shares is not forwarded to the engine. Single/bulk
+  return hooks send only the individual FillReports, wait for their cache application, then return
+  the status once. The continuous bundle path applies fills and then an authoritative snapshot,
+  which can void fills if its total is older (`crates/execution/src/engine/mod.rs:1679-1800` and
+  `crates/execution/src/reconciliation/orders.rs:117-157,596-670` at `d53849b216e2`). The model preserves
+  cancellation/expiry for a late partial fill below the order quantity
+  (`crates/model/src/orders/mod.rs:1355-1376`). The bound's suitability under paper load is
+  **UNVERIFIED**. A request that starts catch-up on an unfinished order keeps the earlier
+  suppression behavior above, even when that request itself generates the ending fill; its missing-order
+  limits below remain.
+
+  `_finished` can be populated before startup mass status when the cache already contains orders:
+  connect starts the stream consumer and resumes waiting ends before the node requests mass status
+  (`_connect_venue`, `_resume_waiting_ends`; upstream `crates/live/src/node/mod.rs:502-535,945-982`).
+  This is a source-based reachability inference, not a fresh empty-cache startup observation.
+  Startup reconciliation uses `is_snapshot=true` (`manager.rs:980-988`), so a return hook refreshes
+  a snapshot below the cache's filled total and refuses it if it remains older. It also checks the
+  total again after waiting for recovered fills; it never returns a finished snapshot below the
+  cache's then-current total.
+
+  At start-up there is no exit to inference for
   an open order the node does not hold that shows fills: its chain's fills, at any age and its older
   ones outside the engine's window included, are reported by trade ID when they add up to what its
   status report counts, or the fill reports fail by name after 3 reads (each fill reports request
   reads the open orders for this, one request more). Known limits: an order still `SUBMITTED`, `PENDING_UPDATE` or
   `PENDING_CANCEL` whose fills the activities do not list through all the engine's in-flight queries is
-  resolved locally by the engine (`INFLIGHT_TIMEOUT` for a submit, canceled for the others), and a fill
-  Alpaca makes on it afterwards is booked to an `EXTERNAL` order (the session window's claim 10, ADR
-  0044); with `open_check_open_only` off, an open order whose report is held back past
+  resolved locally by the engine under upstream's default (`INFLIGHT_TIMEOUT` for a submit, canceled for
+  the others), and a fill Alpaca makes on it afterwards is booked to an `EXTERNAL` order (the session
+  window's claim 10, ADR 0044); the paper nodes' engine retains a submit instead (`RETAIN_UNRESOLVED`),
+  and a fill report for an Alpaca order the node does not know carries the client order ID Alpaca's
+  read of it shows when that is an order in flight the node holds with no Alpaca order ID, of the same
+  instrument and side (`_unanswered_named`, as upstream's OKX adapter sets the one its venue echoes), so
+  the fill reaches the order. The window makes no whole-instrument claim: proven foreign orders and
+  fills stay EXTERNAL. A retained order whose read fails, whose ancestor trace fails, or whose fill activities lag is
+  asked again on each check until it is named or the node stops: an unread order's fill reports are
+  withheld, never booked `EXTERNAL`, and the fill request reports its coverage incomplete so the engine
+  does not infer a position in their place, while the identified fills are delivered; a refused cancel
+  that reads the retained order FILLED keeps reading its activities past `FILL_READ_TRIES`. Each failed
+  naming read is counted and logged by class and status/code rather than raw exception text. Without
+  confirmed ownership the retained submit can still fail shutdown. With `open_check_open_only` off, an open order whose report is held back past
   `open_check_missing_retries` and a targeted query is resolved locally too (an accepted one rejected
   `NOT_FOUND_AT_VENUE`, a partly filled one canceled). A fill report the engine has not applied yet
   when the stream's update for the same fill arrives is counted once: the record adds a fill to the
@@ -981,7 +1072,7 @@ and malformed-offset failures by name.
 | `test_paper_feed.py` | ADR 0055 through a real node: a subscription naming `boats` streams on `v1beta1/boats` and its quotes and trades reach the strategy (overnight only, from Alpaca's calendar; it waits up to 120 s for a trade, and skips, naming the counts, when quotes came and Alpaca confirmed the trade subscription but no trade came); while the market is open, trades and quotes naming `sip` stream on `v2/sip` for 60 s, no trade is dropped, every price keeps four decimals, and the rounded prices and dropped quotes the client names are counted; one naming none streams on `v2/iex`, as before (any hour). ADR 0090: minute bars and trading statuses for eight listed symbols subscribed with `params={"feed": "sip", "wildcard": True}` for 150 s while sip is in session on Alpaca's calendar; Alpaca must confirm `"*"` on both channels, a bar must arrive and every bar must be a listed symbol's one-minute last bar, and the bars per minute, symbols seen and statuses received are printed. Shaped on TC-D20, TC-D30 and TC-D71, by a small strategy, since v2.0.0rc8's Python `DataTesterConfig` takes no `subscribe_params` | Paper only; places nothing; skipped without `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` |
 | `test_paper_sip_bars.py` | ADR 0055, prices finer than four decimals, through a real node: SPY bars on `sip`, one-minute for three days and daily for a year to 20 minutes ago, each request answered with every price at four decimals and the bars the client rounded counted from its warning (TC-D50's shape, a small strategy); any hour, and no stream lock, since a bars request opens no stream | Paper only; places nothing; skipped without `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` |
 | `test_paper_integration.py` | One asset and a week of daily bars from Alpaca's paper environment through a real node, from midday New York on a fixed trading day: the first bar must be the one that opened at that day's midnight, which Alpaca returns only because the adapter shifts the window | Paper only; skipped without `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` |
-| `test_execution_client.py` | A real `LiveNode` with both clients: registration through config and builder, owned and hosted launch, a market order that fills, partial fills, a limit order canceled, cancel-all by ID (side filter, a refused cancel, a failed cancel, nothing to cancel), rejections by HTTP status and by trade update, a cancel refused, a cancel refused for an order Alpaca canceled while the stream was down, a refusal whose lookup alpaca-py cannot build (submit, cancel, modify), a replacement rejected after `replaced`, fills listed before a replace, clients given at construction kept across a reconnect, a cancelled call's later error read, stop and stop-limit orders sent with their prices, modify (`OrderUpdated` only on Alpaca's `replaced`, a fill on the replacement reaching the node's order with the client's record full and dropped, two replaces in a row, reports of a replacement under the node's ID, refusals, a refused repeat, `order_replace_rejected`, a rejected replacement, local denials, a stop's trigger price, a replacement that cannot be read, a replacement whose prior order cannot be read, open or closed, two orders with an empty client order ID), orders denied before Alpaca (type, time in force, stop trigger type, sub-penny stop prices, not tradable), a limit finer than Alpaca's increment sent on it (a buy up, a sell down, a submit and a modify, a stop-limit's limit) with `OrderUpdated` carrying the price sent and a status report agreeing, an unknown submit outcome left `SUBMITTED`, an update for an unknown order dropped, start-up fills from Alpaca's fill activities (trade IDs and prices, paging, the window, one order, an activity it cannot map skipped, a page whose last activity has no `id`, a body that is not JSON, fills not all listed whatever their age or with no `cum_qty` and `leaves_qty`, the order read to check them and one alpaca-py cannot build, an activity listed twice), start-up reconciliation of an open order (older than 500 newer closed orders, or before an open-only check's window), a filled order, a position and open stop and stop-limit orders, an unmapped open order failing start-up, account state on connect (and an answer without `cash` or `currency` refused naming it, at connect and on a query), order commands answered 504 or meeting a connect or read timeout sent once by alpaca-py's own `TradingClient` over a stand-in network (submit, replace, cancel; a read still repeated, as alpaca-py repeats a request unguarded), the trading client's transport retrying nothing, and a POST that never gets an answer reaching a local server once, paper-only client construction, shutdown joining the trade stream thread; the config's paper-only refusals, and a node refusing a plain `ExecutionClientConfig`; HTTP timeouts (a local server that never answers: the call ends, the next is answered, the run ends; a connect timeout on the only attempt rejects a submit or cancel as not sent, a read timeout or a repeated attempt leaves it unknown; a session holding another timeout, or the adapter on HTTPS only, gets the package's on both schemes); `QueryOrder` from the engine's in-flight check (a submit Alpaca took with no answer, a cancel answered 204 for an order Alpaca canceled unseen), an acknowledgement during a pending cancel, a refused submit Alpaca holds closed, one rejection from the stream and the answer, no cancel rejection after a fill, a fill that cannot be applied, positions in another or an unloaded symbol, values that are not numbers, a late fill on a replaced order, a replacement rejected before `replaced`, replaced again before it was read, or adopted and then rejected, an order replaced between the two reads, one order's fill reports over its chain, a given client across a reconnect with a call still running, a given stream after a connect that failed early, a modify to zero, a held stop's trigger type; the replace chain as one record (a takeover rejected after a fill ending canceled, on the stream and at start-up; a late rejection of a replacement a later replace left behind; fills across two replaces, in bulk and asked for by each order; a reconnect, after which a fill on the replacement needs no read and a late cancel of the replaced order is ignored; a rejected replacement of an outside order with no client order ID; chains past 16 links read or traced, and a trace needing more reads failing by name; `order_replace_rejected` after a successful answer; a fill delivered twice; a fill a status report showed (a `QueryOrder` answer, on the same connect and after a reconnect, and an order since replaced) brought by its trade ID and not counted again from the stream, and the order's next fill still counted; a stream fill after a fill report for a later share, and a `partial_fill` whose order shows the count before it, each counted; a fill report and stream fills interleaved, each counted once; one identity by trade ID (ADR 0075: a report and its fill's update in one loop turn, a larger fill after a smaller one, two prices out of order, a lost update under the paper node's checks with no `EXTERNAL` order, a report held back while the activities lag, a fill on a chain order the node never held, a replacement's fill after a reconnect under either reading, a full-history check, and an open order whose fills are not listed failing start-up by name or listed on a second read); both readings of a replacement's quantities, on the stream and at start-up, and the partly filled replace paper showed); a failed test not failing the next at `build_node` | None |
+| `test_execution_client.py` | A real `LiveNode` with both clients: registration through config and builder, owned and hosted launch, a market order that fills, partial fills, a limit order canceled, cancel-all by ID (side filter, a refused cancel, a failed cancel, nothing to cancel), rejections by HTTP status and by trade update, a cancel refused, a cancel refused for an order Alpaca canceled while the stream was down, a refusal whose lookup alpaca-py cannot build (submit, cancel, modify), a replacement rejected after `replaced`, fills listed before a replace, clients given at construction kept across a reconnect, a cancelled call's later error read, stop and stop-limit orders sent with their prices, modify (`OrderUpdated` only on Alpaca's `replaced`, a fill on the replacement reaching the node's order with the client's record full and dropped, two replaces in a row, reports of a replacement under the node's ID, refusals, a refused repeat, `order_replace_rejected`, a rejected replacement, local denials, a stop's trigger price, a replacement that cannot be read, a replacement whose prior order cannot be read, open or closed, two orders with an empty client order ID), orders denied before Alpaca (type, time in force, stop trigger type, sub-penny stop prices, not tradable), a limit finer than Alpaca's increment sent on it (a buy up, a sell down, a submit and a modify, a stop-limit's limit) with `OrderUpdated` carrying the price sent and a status report agreeing, an unknown submit outcome left `SUBMITTED`, an update for an unknown order dropped, start-up fills from Alpaca's fill activities (trade IDs and prices, paging, the window, one order, an activity it cannot map skipped, a page whose last activity has no `id`, a body that is not JSON, fills not all listed whatever their age or with no `cum_qty` and `leaves_qty`, the order read to check them and one alpaca-py cannot build, an activity listed twice), start-up reconciliation of an open order (older than 500 newer closed orders, or before an open-only check's window), a filled order, a position and open stop and stop-limit orders, an unmapped open order failing start-up, account state on connect (and an answer without `cash` or `currency` refused naming it, at connect and on a query), order commands answered 504 or meeting a connect or read timeout sent once by alpaca-py's own `TradingClient` over a stand-in network (submit, replace, cancel; a read still repeated, as alpaca-py repeats a request unguarded), the trading client's transport retrying nothing, and a POST that never gets an answer reaching a local server once, paper-only client construction, shutdown joining the trade stream thread; the config's paper-only refusals, and a node refusing a plain `ExecutionClientConfig`; HTTP timeouts (a local server that never answers: the call ends, the next is answered, the run ends; a connect timeout on the only attempt rejects a submit or cancel as not sent, a read timeout or a repeated attempt leaves it unknown; a session holding another timeout, or the adapter on HTTPS only, gets the package's on both schemes); `QueryOrder` from the engine's in-flight check (a submit Alpaca took with no answer, a cancel answered 204 for an order Alpaca canceled unseen), an acknowledgement during a pending cancel, a refused submit Alpaca holds closed, one rejection from the stream and the answer, no cancel rejection after a fill, a fill that cannot be applied, positions in another or an unloaded symbol, values that are not numbers, a late fill on a replaced order, a replacement rejected before `replaced`, replaced again before it was read, or adopted and then rejected, an order replaced between the two reads, one order's fill reports over its chain, a given client across a reconnect with a call still running, a given stream after a connect that failed early, a modify to zero, a held stop's trigger type; the replace chain as one record (a takeover rejected after a fill ending canceled, on the stream and at start-up; a late rejection of a replacement a later replace left behind; fills across two replaces, in bulk and asked for by each order; a reconnect, after which a fill on the replacement needs no read and a late cancel of the replaced order is ignored; a rejected replacement of an outside order with no client order ID; chains past 16 links read or traced, and a trace needing more reads failing by name; `order_replace_rejected` after a successful answer; a fill delivered twice; a fill a status report showed (a `QueryOrder` answer, on the same connect and after a reconnect, and an order since replaced) brought by its trade ID and not counted again from the stream, and the order's next fill still counted; a stream fill after a fill report for a later share, and a `partial_fill` whose order shows the count before it, each counted; a fill report and stream fills interleaved, each counted once; one identity by trade ID (ADR 0075: a report and its fill's update in one loop turn, a larger fill after a smaller one, two prices out of order, a lost update under the paper node's checks with no `EXTERNAL` order, a report held back while the activities lag, a fill on a chain order the node never held, a replacement's fill after a reconnect under either reading, a full-history check, and an open order whose fills are not listed failing start-up by name or listed on a second read); both readings of a replacement's quantities, on the stream and at start-up, and the partly filled replace paper showed); a submit never answered that Alpaca fills later (the session window's claim 10, ADR 0044: an entry and a closing sell, the update delivered or lost, with the engine retaining the submit and the strategy claiming its instrument, each alone and neither; a lost update's fill reaching the retained order by its client order ID; a submit Alpaca never placed, retained or resolved locally); a failed test not failing the next at `build_node` | None |
 | `test_paper_execution.py` | DAY limit buys of 1 AAPL far below the market on Alpaca's paper Trading API through a real node: one submitted, accepted and canceled; upstream's `ExecTester` running rows of its Execution Testing Spec: TC-E41, a limit buy and a stop buy canceled by `CancelAllOrders` on stop, TC-E20 and TC-E22, a stop and a stop-limit buy accepted at the prices sent and reported back the same, and TC-E30, whose one-tick amend the client denies as sub-penny; a $1.00 buy modified to $1.01 through a node, then canceled; TC-E84, an open order placed with alpaca-py loaded by a node's start-up reconciliation; TC-E44's venue side, a canceled order canceled again; and a resting buy's `client_order_id` submitted again, refused 422 with one order held | Paper only; cancels every order it places; each places nothing and fails if the paper account already holds an open AAPL order or position; skipped without `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` |
 | `test_paper_overnight_fill.py` | ADR 0038 and ADR 0055 overnight through a real node with both clients: a DAY limit buy of 1 AAPL marked `extended_hours`, priced 0.2% through the ask of the `boats` quote the node receives, filled, and its share sold 0.2% through the bid; overnight only, and only while AAPL's asset `attributes` list `overnight_tradable` and not `overnight_halted`. No row of the Execution Testing Spec covers it (TC-E13 is IOC, which the overnight session does not take) and `ExecTesterConfig` names no feed, so a small strategy runs it; an unfilled order is reported `xfail` with what Alpaca held | Paper only; trades a real paper share; places nothing and fails if the account holds an open AAPL order or position; cancels what it opened and closes the position with an eligible limit priced from `boats`; skipped without `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` |
 | `test_paper_fill_ids.py` | ADR 0024's test, with alpaca-py directly, not through a node: a market buy of 2 AAPL and a market sell of 2 on Alpaca's paper Trading API; every fill and partial fill update's `execution_id` must be the UUID after `::` in one of the order's `FILL` activity `id`s | Paper only; needs the regular session and skips outside it; stops if the account holds any open order or position; sells what it bought; skipped without `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` |
@@ -1006,6 +1097,18 @@ passed on 2026-11-10, ADR 0024); `mise run paper:test` runs it, and
 Through the adapter, `test_paper_matrix.py` runs upstream's test matrices (below). Not yet tested against
 Alpaca: the asset list at `load_all` scale, and a partial fill through the adapter (each tester order is
 one share).
+
+A limit, not reproduced: on 2026-11-11, under a machine load of about 60, one full run spun for 22 minutes
+in `test_execution_client.py` near `test_a_report_whose_replacement_alpaca_does_not_find_is_none`. The
+report path under that test is bounded: the replace chain walk by `MAX_REPLACE_CHAIN`, alpaca-py's
+retries by `DEFAULT_RETRY_ATTEMPTS`, each read by the package's HTTP timeout (ADR 0039), and every test's
+run by `run_with_client`'s 15 s timeout. The one wait the harness leaves unbounded is the node's own end
+after that timeout fires and the node is stopped (`await task`); a stop sent while the node starts is
+kept, not lost (`test_handle_stop_blocks_running_transition` in `crates/live/src/node/mod.rs` at the
+pin), and whether every stop ends the run in bounded time is UNVERIFIED.
+Rerun with the test and its neighbours at a load of about 27, under `-o faulthandler_timeout=120` (which
+dumps every thread's stack if a test outlives it), it passed in 3 s. If it spins again, that dump names
+the wait.
 
 ### Upstream's test matrices against paper
 

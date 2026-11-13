@@ -5,6 +5,8 @@ import sqlite3
 from dataclasses import replace
 from datetime import date
 from datetime import datetime
+from decimal import Decimal
+from math import isfinite
 from pathlib import Path
 
 import pytest
@@ -1032,3 +1034,194 @@ def test_a_bar_as_far_from_its_high_as_its_low_takes_the_low_first() -> None:
     # first; in floats 0.0999...64 < 0.1000...14 took the high first and stopped on the low.
     bar = study.Minute(600, 10.3, 10.4, 10.2, 10.3, 100)
     assert study.protect((bar,), 10.0, 10.0, study.GROSS, adaptive=True) is None
+
+
+def test_a_decayed_positive_atr_does_not_make_reentry_divide_by_zero(monkeypatch) -> None:
+    # sr-c-335 F1: Wilder's ATR on a flat tape decays by 13/14 a bar to a positive value under
+    # 5e-10, whose trail snaps to 0.0; that bar is not ready, never a zero-width walk.
+    tape = (
+        *(study.Minute(570 + i, 10.0, 10.01, 10.0, 10.0, 100_000) for i in range(14)),
+        study.Minute(584, 10.01, 10.01, 10.01, 10.01, 100_000),
+        study.Minute(585, 9.99, 10.0, 9.99, 10.0, 100_000),
+        *(study.Minute(586 + i, 10.0, 10.0, 10.0, 10.0, 100) for i in range(287)),
+    )
+
+    def listing(day, rows):
+        return tuple(
+            study.Listed(b.start + 1, 0.0, 0.0, None, None, b.start <= 585 or b.start >= 870)
+            for b in day.bars
+        )
+
+    monkeypatch.setattr(study, "listing", listing)
+    today = study.Day("TEST", date(2026, 8, 18), tape, (), 10.0)
+    context = r3.ReplayContext(today, {}, True, slot_budget=Decimal(1000))
+    atr = context.atr[300]
+    assert atr is not None and 0 < atr < 5e-10
+    assert context.distances("own-1")[300] is None
+    result = context.replay("own-1", "reclaim", 1, 0)
+    assert result["entry_minutes"][0] == 585
+    assert isfinite(result["net_dollars"])
+
+
+@pytest.mark.parametrize("distance", [0.0, -0.01, float("inf"), float("nan")])
+def test_a_reentry_signal_refuses_a_trail_with_no_width(distance) -> None:
+    tape = bars([10.0, 9.8, 10.2])
+    with pytest.raises(ValueError, match="positive trail"):
+        r3.reentry_signal(tape, 0, 10, distance, "reclaim", None)
+
+
+def test_a_merge_refuses_a_file_with_completion_but_no_metadata(tmp_path) -> None:
+    # sr-c-335 F2: a file's counts are taken only on its own metadata record.
+    whole = shard_file(tmp_path / "whole.jsonl", "0/1")
+    headless = tmp_path / "headless.jsonl"
+    headless.write_text(whole.read_text().split("\n", 1)[1])
+    with pytest.raises(ValueError, match="metadata"):
+        r3.merge([whole, headless], tmp_path, "merged")
+
+
+def test_a_merge_refuses_a_shard_with_two_completion_records(tmp_path) -> None:
+    whole = shard_file(tmp_path / "whole.jsonl", "0/1")
+    lines = whole.read_text().splitlines()
+    completion = next(line for line in lines if '"completion"' in line)
+    whole.write_text("\n".join([*lines, completion]) + "\n")
+    with pytest.raises(ValueError, match="completion"):
+        r3.merge([whole], tmp_path, "merged")
+
+
+@pytest.mark.parametrize("ticks", [float("nan"), float("inf"), float("-inf"), 0.0, -1.0])
+def test_a_tick_bucket_refuses_a_non_finite_or_non_positive_trail(ticks) -> None:
+    # sr-a-329 P3-1: NaN and infinity compared false into "over 10", nothing into "under 3".
+    with pytest.raises(ValueError, match="tick"):
+        r3.tick_bucket(ticks)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_a_return_that_is_not_finite_is_refused_without_a_histogram(value) -> None:
+    # sr-a-329 P3-1: without bins a NaN return gave a NaN mean beside a 0.0 deviation.
+    aggregate = r3.new_aggregate(histogram=False)
+    with pytest.raises(ValueError, match="return"):
+        r3.add_return(aggregate, value)
+
+
+def test_a_trail_that_snaps_to_nothing_leaves_its_bar_not_ready() -> None:
+    # sr-c-335 F1 without the indicator's numbers: an ATR whose trail snaps to 0.0 is no trail.
+    tape = tuple(study.Minute(570 + i, 10.0, 10.0, 10.0, 10.0, 100) for i in range(3))
+    context = r3.ReplayContext(replace(day([]), bars=tape), {}, False)
+    context.atr = (None, 4e-10, 0.05)
+    assert context.distances("own-1") == (0.2, None, 0.05)  # a cold ATR takes the fixed trail
+
+
+def test_a_merge_refuses_a_shard_that_holds_nan(tmp_path) -> None:
+    # sr-a-329 P3-1: a shard written before the aggregate lines refused NaN may hold one.
+    whole = shard_file(tmp_path / "whole.jsonl", "0/1")
+    head, tail = whole.read_text().splitlines()
+    aggregate = {"kind": "aggregate", "group": "tier:top", "returns_bps_sum": float("nan")}
+    whole.write_text("\n".join([head, json.dumps(aggregate), tail]) + "\n")
+    with pytest.raises(ValueError, match="NaN"):
+        r3.merge([whole], tmp_path, "merged")
+
+
+# The replay keeps S1's exact boundary and refuses a long trail wider than its entry.
+
+
+@pytest.mark.parametrize(
+    ("close", "atr", "arm", "budget", "expected"),
+    [
+        (0.70, 0.07, "own-1", "140", (40, "planned loss")),
+        (2.10, 0.07, "own-3", "420", (47, "planned loss")),
+        (11.20, 1.12, "own-1", "1120", (20, "planned loss")),
+        (1.40, 0.07, "own-1", "1400", (428, "planned loss")),
+        (1.09, 0.03, "own-1", "1090", (1000, "budget+planned loss")),
+        (1.01, 0.03, "own-1", "1010", (673, "planned loss")),
+        (0.70, 0.070000001, "own-1", "140", "distance_over_ceiling"),
+    ],
+)
+def test_sizing_keeps_exact_decimal_trails_and_s1s_own_stop(
+    close, atr, arm, budget, expected
+) -> None:
+    tape = (study.Minute(570, close, close, close, close, 10_000_000),)
+    context = r3.ReplayContext(replace(day([]), bars=tape), {}, True, slot_budget=Decimal(budget))
+    context.atr = (atr,)
+    assert context.sized(arm, 0, 0) == expected
+
+
+@pytest.mark.parametrize("slot_budget", [None, Decimal(20_000)])
+@pytest.mark.parametrize("atr", [0.8, 1.22])
+def test_a_trail_wider_than_entry_is_refused_before_the_guard_and_walk(slot_budget, atr) -> None:
+    context = r3.ReplayContext(day([2.00, 2.01, 2.02]), {}, True, slot_budget=slot_budget)
+    context.atr = (atr,) * 3
+    out = context.replay("own-3", "reclaim", 2, 0)
+    assert out["guard_skips_count"] == 0
+    assert out["size_refusals"] == {"distance_over_ceiling": 1}
+    assert out["entries"] == 0
+    assert out["refusal"] == "no initial signal S1 could size"
+    assert context.sale("own-3", 2, 0)["refusal"] == "trail refused: distance_over_ceiling"
+    assert context.path("own-3", 2)["refusal"] == "trail refused: distance_over_ceiling"
+
+
+@pytest.mark.parametrize("fraction", [1.2, 1.82])
+@pytest.mark.parametrize("explicit_rows", [False, True])
+def test_the_replay_protection_refuses_a_trail_wider_than_entry(fraction, explicit_rows) -> None:
+    walk = (
+        study.Minute(571, 2.00, 2.50, 2.00, 2.40, 100),
+        study.Minute(572, 0.09, 0.09, 0.08, 0.08, 100),
+    )
+    rows = {"trail": fraction, "exit_through": 0.30, "chase_cap": 1.20} if explicit_rows else None
+    with pytest.raises(ValueError, match="^distance_over_ceiling$"):
+        r3.protection(walk, 2.00, 2.00, study.GROSS, fraction, rows=rows)
+
+
+@pytest.mark.parametrize("fraction", [float("nan"), float("inf"), float("-inf"), 0.0, -0.1])
+@pytest.mark.parametrize("explicit_rows", [False, True])
+def test_the_replay_protection_names_a_nonfinite_or_nonpositive_trail(
+    fraction, explicit_rows
+) -> None:
+    rows = {"trail": fraction, "exit_through": 0.005, "chase_cap": 0.02} if explicit_rows else None
+    with pytest.raises(ValueError, match="^distance_unknown$"):
+        r3.protection(bars([2.0], 571), 2.0, 2.0, study.GROSS, fraction, rows=rows)
+
+
+def test_a_full_entry_trail_is_not_rounded_over_its_range() -> None:
+    # 3 * 0.07 / 0.21 is exactly 1, but the float quotient is 1.0000000000000002.
+    context = r3.ReplayContext(day([0.21]), {}, True)
+    context.atr = (0.07,)
+    assert r3.trail_fraction("own-3", 0.21, 0.07, True) == 1.0
+    assert context.path("own-3", 0)["trail"] == 1.0
+    assert context.sized("own-3", 0, 0) == (1, "one share")
+
+
+@pytest.mark.parametrize("opening", [False, True])
+@pytest.mark.parametrize(
+    ("low", "expected_depth"),
+    [(4000.0001, 1.0), (4000.000100001, None), (4000.000099999, 1.00001)],
+)
+def test_a_sub_penny_turn_uses_the_decimal_fall_before_division(
+    opening, low, expected_depth
+) -> None:
+    tape = bars([4000.0002, low, 4000.0002])
+    signal = (
+        r3.opening_signal(tape, 15, 1, 1, [0.0001] * 3)
+        if opening
+        else r3.reentry_signal(tape, 0, 4000.0002, 0.0001, "turn-1-1", None)
+    )
+    if expected_depth is None:
+        assert signal is None
+    else:
+        assert signal is not None and (signal.index, signal.depth_trails) == (2, expected_depth)
+
+
+@pytest.mark.parametrize("atr", [float("nan"), float("inf")])
+@pytest.mark.parametrize("arm", ["atr-1", "tier", "own-1"])
+def test_a_trail_from_an_atr_that_is_not_finite_is_not_ready(arm, atr) -> None:
+    assert r3.trail_fraction(arm, 2.0, atr, False) is None
+
+
+@pytest.mark.parametrize("slot_budget", [None, Decimal(20_000)])
+def test_a_zero_atr_is_refused_by_the_walk_not_counted_as_a_size_refusal(slot_budget) -> None:
+    context = r3.ReplayContext(day([2.00, 2.01]), {}, True, slot_budget=slot_budget)
+    context.atr = (0.0, 0.0)
+    assert context.sale("atr-1", 0, 0) == {
+        "refusal": "atr refused: a zero ATR, and no quoted spread floor"
+    }
+    if slot_budget is None:
+        assert context.sized("atr-1", 0, 0) == (1, "one share")

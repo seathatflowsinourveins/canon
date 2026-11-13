@@ -405,7 +405,9 @@ def planned_stop(
     trail = TRAIL if trail is None else trail
     exit_through = EXIT_THROUGH if exit_through is None else exit_through
     chase_cap = CHASE_CAP if chase_cap is None else chase_cap
-    return (entry - entry * (trail + exit_through)) * (1 - chase_cap)
+    # A trail or chase over the whole price leaves no room under the entry: each factor stops at
+    # zero, so two negative factors never multiply back into a stop above the entry.
+    return max(0.0, entry - entry * (trail + exit_through)) * max(0.0, 1 - chase_cap)
 
 
 def entry_runs(
@@ -537,7 +539,7 @@ def protect(
                 return Exit(bar.start + 1, floor, "floor", first, trigger, raises)
             continue
         if bids[0] <= trigger:  # opened under the trigger: the limit is released into a gap
-            floor = snap((trigger - entry * exit_through) * (1 - chase_cap))
+            floor = snap(max(0.0, trigger - entry * exit_through) * max(0.0, 1 - chase_cap))
             if bids[0] >= floor:
                 return Exit(bar.start + 1, bids[0], "gap", first, trigger, raises)
             if bids[1] >= floor:

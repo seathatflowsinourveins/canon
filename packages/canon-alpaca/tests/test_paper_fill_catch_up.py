@@ -10,13 +10,22 @@ which holds the paper account's lock. It needs the regular session, from 09:35 N
 checked before each order. Never write the keys to a file.
 
 What it does, on Alpaca's paper Trading API only (`paper=True` throughout): a node with the execution client
-places `ORDERS` DAY market orders of 1 AAPL, `SPACING_SECS` apart, each a buy when Alpaca shows no AAPL
-position and a sell of the one share when it shows one, so the account is never short. For each fill, a hook
+places `ORDERS` DAY limit orders of 1 AAPL priced to fill, `SPACING_SECS` apart, each a buy when Alpaca shows
+no AAPL position and a sell of the one share when it shows one, so the account is never short. Each is
+priced `THROUGH` past the latest IEX quote, read once per order from Alpaca's market data API with alpaca-py's
+`StockHistoricalDataClient` (a GET, no stream): the node has no data client, and NautilusTrader's risk engine
+denies a market order it has no price for (`MARKET_PRICE_UNAVAILABLE`, seen on paper 2026-11-13), which a
+limit order's own price avoids. For each fill, a hook
 in this test hands the client the stream's trade update without its `execution_id`: the client cannot apply
 the fill from the stream ("a fill without one is logged, and the order's fill activities bring it", package
 README), the update's order shows more filled than the node holds, and the client's catch-up reads Alpaca's
 real fill activities (`_catch_up`, then `_catch_up_later`, `FILL_READ_TRIES` reads `FILL_READ_RETRY_SECS`
 apart). Nothing in the adapter changes; the hook, the read log and the counts live here.
+
+Also recorded per order: each time a report on it went through the client's hold for an ended order
+(`_hold_report`), how that hold ended, and each report settled there (`_finished_report`) with what it showed
+filled and how many fills came with it. The summary counts the orders with a hold and with a held report that
+showed a fill: whether a fill is reported through the hold on the real venue is an observation, not asserted.
 
 Recorded per order, and printed as one JSON line each (run with `-s`): the read that brought the fill (its
 "caught up on read n of 3" line, so n - 1 extra reads), or that the reads ran out; and the seconds from the
@@ -40,6 +49,8 @@ from collections import Counter
 from datetime import UTC
 from datetime import datetime
 from datetime import timedelta
+from decimal import ROUND_CEILING
+from decimal import ROUND_FLOOR
 from decimal import Decimal
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -47,6 +58,9 @@ from zoneinfo import ZoneInfo
 import canon_alpaca.execution
 import pytest
 from alpaca.common.exceptions import APIError
+from alpaca.data.enums import DataFeed
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockLatestQuoteRequest
 from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import QueryOrderStatus
 from alpaca.trading.models import Clock
@@ -66,6 +80,7 @@ from nautilus_trader.live import LiveNode
 from nautilus_trader.model import ClientOrderId
 from nautilus_trader.model import InstrumentId
 from nautilus_trader.model import OrderSide
+from nautilus_trader.model import Price
 from nautilus_trader.model import Quantity
 from nautilus_trader.model import TimeInForce
 from nautilus_trader.model import TraderId
@@ -98,6 +113,10 @@ FILL_WAIT_SECS = 60.0
 OUTCOME_WAIT_SECS = 30.0
 """For the client's catch-up to bring the fill or run out: its reads take
 `FILL_READ_TRIES * FILL_READ_RETRY_SECS` (9 s at 3 and 3 s) and each read Alpaca's answer time."""
+THROUGH = Decimal("0.005")
+"""How far past the quote an order is priced so that it fills: a buy over the ask, a sell under the bid."""
+QUOTE_MOST = timedelta(minutes=1)
+"""The oldest IEX quote an order is priced on."""
 EARLIEST = (9, 35)
 LATEST_BEFORE_CLOSE = timedelta(minutes=10)
 """Checked before each order: one order's fill wait, outcome wait and spacing are under two minutes."""
@@ -114,9 +133,9 @@ class Placer(Strategy):
     def on_start(self) -> None:
         self.started = True
 
-    def place(self, side: OrderSide) -> ClientOrderId:
-        order = self.order_factory.market(
-            AAPL, side, Quantity.from_int(1), time_in_force=TimeInForce.DAY
+    def place(self, side: OrderSide, price: str) -> ClientOrderId:
+        order = self.order_factory.limit(
+            AAPL, side, Quantity.from_int(1), Price.from_str(price), time_in_force=TimeInForce.DAY
         )
         self.submit_order(order)
         return order.client_order_id
@@ -131,6 +150,25 @@ def paper_trading() -> TradingClient:
             api_key=os.environ[ENV_API_KEY], secret_key=os.environ[ENV_SECRET_KEY], paper=True
         )
     )
+
+
+def priced_to_fill(side: OrderSide) -> str | None:
+    """A limit price in cents `THROUGH` past the latest IEX quote for AAPL, or None when a side of the
+    quote is missing or it is older than `QUOTE_MOST`. One GET of Alpaca's market data API; no stream."""
+    quote = with_http_timeout(
+        StockHistoricalDataClient(
+            api_key=os.environ[ENV_API_KEY], secret_key=os.environ[ENV_SECRET_KEY]
+        )
+    ).get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=SYMBOL, feed=DataFeed.IEX))
+    assert isinstance(quote, dict)
+    q = quote[SYMBOL]
+    bid, ask = Decimal(str(q.bid_price)), Decimal(str(q.ask_price))
+    if not (bid > 0 and ask > 0) or datetime.now(UTC) - q.timestamp > QUOTE_MOST:
+        return None
+    cent = Decimal("0.01")
+    if side == OrderSide.BUY:
+        return str((ask * (1 + THROUGH)).quantize(cent, rounding=ROUND_CEILING))
+    return str((bid * (1 - THROUGH)).quantize(cent, rounding=ROUND_FLOOR))
 
 
 def aapl_shares(trading: TradingClient) -> int:
@@ -208,6 +246,30 @@ def instrument(client: AlpacaExecutionClient, measured: dict[str, dict[str, Any]
     code is unchanged."""
     apply, read = client._apply, client._fill_activities
     caught, ran_out = client._caught_up, client._ran_out
+    hold, finished = client._hold_report, client._finished_report
+
+    async def logged_hold(client_order_id, request):
+        entry = measured.get(str(client_order_id))
+        if entry is not None:
+            entry["holds"] = entry.get("holds", 0) + 1
+        try:
+            return await hold(client_order_id, request)
+        except BaseException as e:
+            if entry is not None:
+                entry.setdefault("hold_errors", []).append(type(e).__name__)
+            raise
+
+    async def logged_finished(report, companion_fills=None, *, deliver=False):
+        entry = measured.get(str(report.client_order_id))
+        if entry is not None:
+            entry.setdefault("held_reports", []).append(
+                {
+                    "shown_filled": str(report.filled_qty),
+                    "fills_with_it": len(companion_fills or ()),
+                    "deliver": deliver,
+                }
+            )
+        return await finished(report, companion_fills, deliver=deliver)
 
     async def withheld(update: TradeUpdate) -> None:
         event = getattr(update.event, "value", update.event)
@@ -256,6 +318,8 @@ def instrument(client: AlpacaExecutionClient, measured: dict[str, dict[str, Any]
     client._fill_activities = logged_read
     client._caught_up = logged_caught
     client._ran_out = logged_ran_out
+    client._hold_report = logged_hold
+    client._finished_report = logged_finished
 
 
 def seconds_between(earlier: str | None, later: str | None) -> float | None:
@@ -299,7 +363,14 @@ def test_paper_fill_catch_up_reads_are_counted() -> None:
                     return
                 held = await asyncio.to_thread(aapl_shares, trading)
                 side = OrderSide.SELL if held > 0 else OrderSide.BUY
-                cid = strategy.place(side)
+                price = await asyncio.to_thread(priced_to_fill, side)
+                if price is None:
+                    stopped.append(
+                        f"stopped after {len(measured)} orders: no two-sided IEX quote from the "
+                        "last minute to price an order on"
+                    )
+                    return
+                cid = strategy.place(side, price)
                 entry = measured.setdefault(str(cid), {"side": side.name})
                 deadline = time.monotonic() + FILL_WAIT_SECS
                 while time.monotonic() < deadline:
@@ -392,6 +463,15 @@ def test_paper_fill_catch_up_reads_are_counted() -> None:
                 "lag_secs": lags,
                 "reads_allowed": canon_alpaca.execution.FILL_READ_TRIES,
                 "retry_secs": canon_alpaca.execution.FILL_READ_RETRY_SECS,
+                "orders_with_a_hold": sum(1 for e in measured.values() if e.get("holds")),
+                "orders_with_a_held_report_showing_a_fill": sum(
+                    1
+                    for e in measured.values()
+                    if any(Decimal(r["shown_filled"]) > 0 for r in e.get("held_reports", ()))
+                ),
+                "hold_errors": sorted(
+                    {name for e in measured.values() for name in e.get("hold_errors", ())}
+                ),
             }
         ),
     )

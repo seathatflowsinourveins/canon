@@ -5,7 +5,7 @@ decision-makers: lead orchestrator (Claude) for the unit and its properties; rep
 review-by: 2026-12-12
 ---
 
-# A streamed trade print older than the newest one passed on is set aside by the Alpaca data client, behind `validate_trade_sequence`, off by default; open: how often the tape is out of order, and a window that runs with it
+# A streamed trade print older than the newest one passed on is set aside by the Alpaca data client, behind `validate_trade_sequence`, off by default; open: how often the tape is out of order
 
 ## Context and Problem Statement
 
@@ -67,10 +67,10 @@ The request assumed a drop by "stamp"; the evidence corrects which stamp, as abo
   shows how much.
 * Bad: prints of one symbol from different exchanges may reach the stream slightly out of time order as a
   matter of course. How many would be set aside is not measured (UNVERIFIED).
-* Open, and what closes each: the rate of out-of-order prints on `sip` (one window's tally with the
-  setting on); a paper or sandbox window with the setting on (a session window now takes
-  `--validate-trade-sequence`; one run with it, read into this record); the bound of five seconds (a
-  measured spread of own time against receipt) and its move to the reference Mover measures against;
+* Open, and what closes each: the rate of out-of-order prints on `sip` (windows' tallies with the
+  setting on; the one window run so far, under Confirmation, set none aside); the bound of five
+  seconds (a measured spread of own time against receipt) and its move to the reference Mover measures
+  against;
   upstream extending `validate_data_sequence` to trades, which would replace this setting.
 
 ### Confirmation
@@ -86,7 +86,15 @@ The request assumed a drop by "stamp"; the evidence corrects which stamp, as abo
   build. A session window turns it on with `--validate-trade-sequence`, which is Mover's, since Mover's
   record carries the check's tally, and says so in the record (`validate_trade_sequence`), a refused
   window's record included (`tests/test_session_window.py`). No window runs it unless told; no task
-  passes it. A window run with it remains UNVERIFIED until one is read into this record.
+  passes it.
+* 2026-11-13, one paper window ran with it, from a tip that held the wiring before it landed: a
+  regular-session Mover window of fifteen minutes on the default trigger, ended 16:52:11 UTC, result
+  `ok`, 775.6 s, nothing left, flat. Its record says `validate_trade_sequence: true` and
+  `trigger: bid_ask`, and carries no `late_prints_set_aside_by_the_adapter`, a field the record has
+  only once a print was set aside or passed on unordered. So a live Mover node ran and ended flat with
+  the setting on, and no print arrived out of time order in that window. Not shown by it, and still
+  UNVERIFIED: a print set aside live (the offline cases cover that path), and any rate, which one
+  window of fifteen minutes does not give.
 * `--validate-trade-sequence` together with `--trigger last_price` is refused by name, by the window's
   config and when the arguments are read (the lead's ruling, 2026-11-13). Under a print trigger Mover
   judges a late print itself: one counts toward a held stop's low though it is never the newest price

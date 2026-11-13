@@ -1,0 +1,7 @@
+{
+  "about": "What the DeepSeek Harness desktop profile should hold. Read by scripts/dsh-desktop-check.",
+  "app_version": "0.2.2-rc.2",
+  "update_channel": "nightly",
+  "bundles_absent": ["@deepseek-ai/dsh-experimental-inspector-profile"],
+  "rows_off": ["session-log-deepseek", "product-analytics"]
+}

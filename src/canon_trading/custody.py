@@ -20,6 +20,19 @@ NautilusTrader's client order ID generator at the pin (`d53849b216e2`). Sources,
 * https://docs.alpaca.markets/us/reference/getallorders-1.md: `status=open`, "Defaults to 50 and max is 500";
   alpaca-py's `GetOrdersRequest`: `status` "open, closed or all", `after` "only ones submitted after this
   timestamp", `symbols`; `Order.filled_qty` and `side`.
+* alpaca-py at `c42add7c0a70`, `trading/client.py:107-131`, `trading/requests.py:205-226`, read
+  2026-11-13: `get_orders` makes one GET, with no automatic pagination or page token. `direction`
+  sorts by submission time, and `until` bounds that time. History pages here descend with a fixed
+  `after` at the current trading week's start; each full page's earliest timestamp plus one microsecond
+  is the next `until`, overlapping the boundary so tied submissions are not skipped. Order IDs deduplicate
+  that overlap; a changed row or a full page that cannot advance freezes the symbol. The reference
+  above calls `after` and `until` "(exclusive.)" (read 2026-11-13); it states no precision. Once a
+  walk pages, every page must hold only rows inside `after` and `until`, newest first, and list again
+  the orders at the last page's earliest time, or the symbol freezes: a venue that answers oldest first
+  or cuts `until` to whole seconds would otherwise end the walk with orders of ours unread. A full page of
+  submissions in one microsecond cannot be proven complete through this API and remains frozen.
+  Each further page waits `session_window.POLL_SECS`, the existing trading-read poll pace (2.5 s;
+  `session_window.py`, ADR 0044), through the same client and its timeout/request counter.
 * https://docs.alpaca.markets/us/docs/orders-at-alpaca.md, "Extended Hours Trading", and the 24/5 page
   (https://docs.alpaca.markets/us/docs/245-trading-for-trading-api.md): outside the regular session only a
   limit order marked `extended_hours`, `day` or `gtc`, is taken (ADR 0044, ADR 0055).
@@ -58,11 +71,45 @@ power, each position, each open order with its lineage, and `no_shorting`. It re
 `account_task` set data-only mode (`CANON_ALPACA_DATA_ONLY=1`, ADR 0070), so the client
 `session_window.paper_trading` builds refuses every method but GET before anything is sent. No account
 number, account ID, order ID or client order ID is printed; an order is named by its symbol, side,
-quantity, type, limit, status and lineage.
+quantity, type, limit, time in force, position intent, status and lineage. Time in force and position
+intent are Alpaca's returned values, or `not shown` when absent, never inferred from the order's lineage.
+
+The same read also prints ended orders for the current New York trade date, from the preceding 20:00
+inclusive to 20:00 exclusive (Alpaca's 24/5 trade-date rule, below), dated by Alpaca's clock. Each row
+shows the returned status, filled quantity, average fill price, submitted/filled/canceled times and
+lineage; an expired, rejected or replaced order also shows its corresponding ending time. Trailing
+stops show `trail_price`, `trail_percent` and `hwm`, or `not shown`. No value is inferred. Sources,
+read 2026-11-13:
+
+* alpaca-py at `c42add7c0a70`, `alpaca/trading/models.py:217-303`: the Order fields;
+  `alpaca/trading/client.py:107-131,422-437`: orders and clock are GETs;
+  `alpaca/trading/requests.py:205-226`: `closed`, the submission bounds, sort and limit.
+* https://docs.alpaca.markets/us/reference/getallorders-1 (from llms.txt): `after` and `until`
+  bound submission, not ending. A GTC stop submitted before today can sell today, so the walk's
+  `after` is not the date's start but `GTC_AGE_LIMIT` before it: Alpaca's aged order policy cancels
+  a GTC order 90 days after creation (orders-at-alpaca, below), so nothing submitted earlier can end
+  inside the date. `until` starts at the trade date's end and moves backwards, with the
+  overlap/checks/pacing described above. Only ending times inside the trade date are printed.
+  Incomplete pagination or a missing ending time is a named read failure, never a claim that the
+  date is empty. The account, positions, open orders and configuration are printed before the walk
+  starts, so a failed walk, or the task's 300-second timeout killing a long one, leaves them shown.
+* https://docs.alpaca.markets/us/docs/orders-at-alpaca, Order Lifecycle and Trailing Stop Orders:
+  filled/canceled/expired/rejected orders have ended; replaced orders have a replacement timestamp.
+  `done_for_day` can resume next day and is excluded. Time in Force: "Alpaca implements an aged
+  order policy that will automatically cancel GTC orders 90 days after creation", by a cancel request
+  at 4:15 pm ET on `expires_at` that may stay `pending_cancel` until the venue cancels it. The GET's optional `hwm` is documented, but
+  whether paper returns it on an ended trailing stop is UNVERIFIED until the owning lane's read.
+* https://docs.alpaca.markets/us/docs/245-trading-for-trading-api, session hours and settlement:
+  an execution from 20:00 New York belongs to the next date. These are wall-clock date bounds,
+  not a claim that every date has an exchange session; no session or calendar is needed for this read.
 
 Quantity (`read_holdings`). Alpaca's position carries no client order ID, so the quantity ours opened is read
 from the venue's orders: the net fill (buys add, sells take away) of every order of our lineage in the
-symbol submitted in the last `LINEAGE_LOOKBACK` (`status=all`, so a partly filled open order counts). An
+symbol submitted since the current trading week's start (`status=all`, so a partly filled open order counts).
+The week starts Sunday at 20:00 New York, the overnight open of the 24/5 week (alpaca-skills at
+`0e7c35163ae4`, `skills/trading-api/paper-trading/SKILL.md:590-598`, read 2026-11-13;
+`session_window.OVERNIGHT_STARTS`). It is not a rolling seven-day read: orders before that start are
+not read, and an older long whose entry is absent stays frozen by name. An
 order that replaces another counts only what it filled beyond the earlier fills in its chain: Alpaca's
 replacement "carries the order on", its filled quantity counting the fills before it (ADR 0042, paper,
 2026-11-10, overnight; the regular session is UNVERIFIED), so a chain of ours is counted once, and the fills
@@ -99,8 +146,9 @@ is ours to close only when it is exactly that net. On an account held long-only,
 is not negative, so the net over the lookback is never more than what ours holds now, and a match never takes
 a foreign share; a lookback too short to hold our entry gives a mismatch, which freezes the symbol rather than
 closing it. So the form reads Alpaca's `no_shorting` with the account, and on an account that is not held
-long-only it freezes every position. A listing that returns its maximum (`ORDERS_PAGE_LIMIT`) may not hold
-every order, so it freezes the symbol too. A short is frozen: the form never buys.
+long-only it freezes every position. A history listing is counted only after every page is read; an
+incomplete listing freezes the symbol. The open-order read still freezes at its maximum
+(`ORDERS_PAGE_LIMIT`), since it may not hold every open order. A short is frozen: the form never buys.
 
 An open order with no symbol is kept under `(no symbol)`, ours still canceled and any other left alone.
 Since its effect cannot be attributed, every listed symbol is frozen for that run, including a position
@@ -139,15 +187,18 @@ from datetime import UTC
 from datetime import datetime
 from datetime import timedelta
 from decimal import Decimal
+from itertools import pairwise
 from typing import TYPE_CHECKING
 from typing import Any
 from uuid import uuid4
 
+from alpaca.common.enums import Sort
 from alpaca.common.exceptions import APIError
 from alpaca.trading.enums import OrderSide as AlpacaOrderSide
 from alpaca.trading.enums import QueryOrderStatus
 from alpaca.trading.enums import TimeInForce as AlpacaTimeInForce
 from alpaca.trading.models import AccountConfiguration
+from alpaca.trading.models import Clock
 from alpaca.trading.models import Order
 from alpaca.trading.models import Position
 from alpaca.trading.models import TradeAccount
@@ -233,11 +284,17 @@ LINEAGE_NAMES = {PROTECT: "ours (a protect stop)"}
 
 
 def order_line(order: Order) -> str:
-    """One open order as `paper:account` names it: symbol, side, quantity, type, limit, status, lineage."""
+    """One open order with its returned time in force, position intent and lineage; no identifiers."""
     qty = _quantity_named(order)
     kind = _value(order.type if order.type is not None else order.order_type)
+    # Contract: alpaca-py 0.45.0 at c42add7c0a70, alpaca/trading/models.py:292,301,312-324
+    # (read 2026-11-13): Order.time_in_force is TimeInForce, position_intent is optional
+    # PositionIntent, and an empty intent becomes None. Show only what the order returns.
+    time_in_force = _value(getattr(order, "time_in_force", None) or "not shown")
+    position_intent = _value(getattr(order, "position_intent", None) or "not shown")
     return (
         f"{order.symbol or NO_SYMBOL} {_value(order.side)} {qty} {kind} limit {_value(order.limit_price)} "
+        f"time_in_force {time_in_force} position_intent {position_intent} "
         f"status {_value(order.status)} {LINEAGE_NAMES.get(found := lineage(order.client_order_id), found)}"
     )
 
@@ -282,8 +339,135 @@ def open_orders(trading: TradingClient) -> list[Order]:
     return _read("the open orders", lambda: trading.get_orders(request), list, Order)
 
 
+ENDED_AT = {
+    "filled": "filled_at",
+    "canceled": "canceled_at",
+    "expired": "expired_at",
+    "rejected": "failed_at",
+    "replaced": "replaced_at",
+}
+"""Final statuses and their returned ending times (module header, Order Lifecycle)."""
+
+
+def _dated(value: object, name: str) -> datetime:
+    """A returned timestamp with its offset, or a named failure without the returned body."""
+    if not isinstance(value, datetime) or value.utcoffset() is None:
+        raise ReadFailed(f"{name} is not shown with a timezone; the trade date is not established")
+    return value
+
+
+def _ended_at(order: Order) -> datetime | None:
+    """The returned final event's time, never submitted_at or updated_at in its place."""
+    field = ENDED_AT.get(_value(order.status))
+    if field is None:
+        return None
+    return _dated(getattr(order, field), "an ended order's ending time")
+
+
+def _returned(value: object) -> str:
+    """A returned value, with offsets on timestamps and an explicit label for absent fields."""
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return "not shown" if value in (None, "") else _value(value)
+
+
+def ended_order_line(order: Order) -> str:
+    """An ended order's result and returned times, with no identifiers or inferred trail values."""
+    kind = _value(order.type if order.type is not None else order.order_type)
+    fields = ["submitted_at", "filled_at", "canceled_at"]
+    ending = ENDED_AT.get(_value(order.status))
+    if ending is not None and ending not in fields:
+        fields.append(ending)
+    if kind == "trailing_stop":
+        fields.extend(("trail_price", "trail_percent", "hwm"))
+    times_and_trail = " ".join(f"{field} {_returned(getattr(order, field))}" for field in fields)
+    owner = lineage(order.client_order_id)
+    return (
+        f"{order.symbol or NO_SYMBOL} {_value(order.side)} {_quantity_named(order)} {kind} "
+        f"status {_value(order.status)} filled_qty {_returned(order.filled_qty)} "
+        f"filled_avg_price {_returned(order.filled_avg_price)} {times_and_trail} "
+        f"{LINEAGE_NAMES.get(owner, owner)}"
+    )
+
+
+GTC_AGE_LIMIT = timedelta(days=92)
+"""How far before a trade date's start the ended-order walk reads submissions: Alpaca's 90-day GTC
+cancel (module header), plus two days for the cancel to stay pending at the venue (Canon's margin,
+not a documented figure)."""
+
+
+def ended_orders(trading: TradingClient, start: datetime, end: datetime) -> list[Order]:
+    """Closed history, paged by submission, selected by ending in [start, end).
+
+    The submission lower bound is `GTC_AGE_LIMIT` before the date, not the date's start: a stop
+    submitted before the date but sold inside it must not vanish. IDs remain only in memory to
+    deduplicate the overlapping pagination boundary.
+    """
+    after = start - GTC_AGE_LIMIT
+    until = end
+    listed: dict[str, Order] = {}
+    selected: list[Order] = []
+    edge: set[str] = set()
+    while True:
+        request = GetOrdersRequest(
+            status=QueryOrderStatus.CLOSED,
+            after=after,
+            until=until,
+            direction=Sort.DESC,
+            limit=ORDERS_PAGE_LIMIT,
+            nested=False,
+        )
+        page = _read(
+            "the ended orders", lambda request=request: trading.get_orders(request), list, Order
+        )
+        stamps = [_dated(order.submitted_at, "an ended order's submission time") for order in page]
+        if any(stamp > until or stamp < after for stamp in stamps):
+            raise ReadFailed("the ended orders page is outside its submission bound")
+        if any(later > earlier for earlier, later in pairwise(stamps)):
+            raise ReadFailed("the ended orders pages are not newest first")
+        if not edge <= {str(order.id) for order in page}:
+            raise ReadFailed("the ended orders pagination lost its overlapping boundary")
+        for order in page:
+            key = str(order.id)
+            previous = listed.get(key)
+            if previous is not None:
+                if previous != order:
+                    raise ReadFailed("an ended order changed across pages; the date is incomplete")
+                continue
+            listed[key] = order
+            ended = _ended_at(order)
+            if ended is not None and start <= ended < end:
+                selected.append(order)
+        if len(page) < ORDERS_PAGE_LIMIT:
+            return selected
+        earliest = min(stamps)
+        boundary = earliest + timedelta(microseconds=1)
+        if boundary >= until:
+            raise ReadFailed("the ended orders pagination cannot advance; the date is incomplete")
+        edge = {str(order.id) for order in page if order.submitted_at == earliest}
+        until = boundary
+        time.sleep(session_window.POLL_SECS)
+
+
+def ended_order_lines(trading: TradingClient) -> list[str]:
+    """One trade date's endings, including prior-date submissions, or one explicit empty line."""
+    clock = _read("the account clock", trading.get_clock, Clock)
+    local = _dated(clock.timestamp, "the account clock").astimezone(session_window.NEW_YORK)
+    trade_date = local.date()
+    if local.time() >= session_window.OVERNIGHT_STARTS:
+        trade_date += timedelta(days=1)
+    end = datetime.combine(trade_date, session_window.OVERNIGHT_STARTS, session_window.NEW_YORK)
+    start = end - timedelta(days=1)
+    orders = ended_orders(trading, start.astimezone(UTC), end.astimezone(UTC))
+    return [
+        f"ended orders for {trade_date} (New York trade date): {len(orders) if orders else 'none'}",
+        *(f"  {ended_order_line(order)}" for order in orders),
+    ]
+
+
 def account_lines(trading: TradingClient) -> list[str]:
-    """The account as `paper:account` prints it (module header): four reads, all GET."""
+    """The account, positions, open orders and configuration as `paper:account` prints them first:
+    all GET. `account_task` prints the trade date's ended orders after them."""
     account = _read("the account", trading.get_account, TradeAccount)
     positions = _read("the positions", trading.get_all_positions, list, Position)
     orders = open_orders(trading)
@@ -327,15 +511,26 @@ def account_task(trading: TradingClient | None = None) -> int:
     except (ReadFailed, MethodRefused) as e:
         print(f"paper:account: {e}; nothing else was read", file=sys.stderr)
         return 1
-    print("\n".join(lines))
+    print("\n".join(lines), flush=True)  # before the history walk, which a failure or timeout ends
+    try:
+        ended = ended_order_lines(trading)
+    except ReadFailed as e:
+        print(
+            f"paper:account: {e}; the account, positions, open orders and configuration above "
+            "were read",
+            file=sys.stderr,
+        )
+        return 1
+    print("\n".join(ended))
     return 0
 
 
 # ---------------------------------------------------------------------------------------------------------
 # The close-only form (module header, "The close-only form")
 
-LINEAGE_LOOKBACK = timedelta(hours=24)
-"""How far back the venue's orders are read for the quantity ours opened (module header, "Quantity")."""
+LINEAGE_LOOKBACK = timedelta(weeks=1)
+"""One trading week in New York wall time; `_lineage_start` chooses its Sunday evening boundary,
+not a rolling duration before the read (module header, "Quantity")."""
 CLOSE_WAIT_SECS = 60.0
 """How long the one close is left working before it is canceled."""
 CANCEL_WAIT_SECS = 30.0
@@ -489,7 +684,7 @@ class Holding:
     ours_open: list[Order] = field(default_factory=list)
     foreign_open: list[Order] = field(default_factory=list)
     opened: Decimal | None = None
-    """Our orders' net fill over `LINEAGE_LOOKBACK`, or None when it could not be established."""
+    """Our orders' net fill in the current trading week, or None when it could not be established."""
     frozen: list[str] = field(default_factory=list)
     """Why the symbol is frozen, by name: empty when it is ours to close."""
 
@@ -514,22 +709,73 @@ def _unattributed(symbol: str) -> str:
     return _Unread(f"an open order has no symbol, so its effect on {symbol} is not established")
 
 
+def _lineage_start(now: datetime) -> datetime:
+    """The most recent Sunday 20:00 New York, in UTC, including across a DST change."""
+    local = now.astimezone(session_window.NEW_YORK)
+    sunday = local.date() - timedelta(days=(local.weekday() + 1) % 7)
+    start = datetime.combine(sunday, session_window.OVERNIGHT_STARTS, session_window.NEW_YORK)
+    if start > local:
+        start -= LINEAGE_LOOKBACK
+    return start.astimezone(UTC)
+
+
 def _opened(trading: TradingClient, symbol: str, now: datetime) -> tuple[Decimal | None, str]:
-    """Our orders' net fill in `symbol` over `LINEAGE_LOOKBACK`, from the venue's orders (`status=all`),
-    or None and why when the listing is full, so it may not hold them all."""
-    request = GetOrdersRequest(
-        status=QueryOrderStatus.ALL,
-        symbols=[symbol],
-        after=now - LINEAGE_LOOKBACK,
-        limit=ORDERS_PAGE_LIMIT,
-        nested=False,
-    )
-    orders = _read(f"the orders in {symbol}", lambda: trading.get_orders(request), list, Order)
-    if len(orders) >= ORDERS_PAGE_LIMIT:
-        return None, (
-            f"{len(orders)} orders in {symbol} in the last {LINEAGE_LOOKBACK}, the most one listing "
-            "returns, so the quantity ours opened is not established"
+    """Our orders' net fill in `symbol` in the current trading week, over every page of the venue's
+    orders (`status=all`), or None and why when the listing cannot be established."""
+    after = _lineage_start(now)
+    until: datetime | None = None
+    listed: dict[str, Order] = {}
+    edge: set[str] = set()
+    while True:
+        request = GetOrdersRequest(
+            status=QueryOrderStatus.ALL,
+            symbols=[symbol],
+            after=after,
+            until=until,
+            direction=Sort.DESC,
+            limit=ORDERS_PAGE_LIMIT,
+            nested=False,
         )
+        page = _read(
+            f"the orders in {symbol}",
+            lambda request=request: trading.get_orders(request),
+            list,
+            Order,
+        )
+        for order in page:
+            previous = listed.get(str(order.id))
+            if previous is not None and previous != order:
+                return None, _Unread(
+                    f"an order in {symbol} changed across history pages, so the quantity ours "
+                    "opened is not established"
+                )
+            listed[str(order.id)] = order
+        if len(page) < ORDERS_PAGE_LIMIT and until is None:
+            break  # one short listing: nothing was paged, so nothing below applies
+        stamps = [order.submitted_at for order in page]
+        if any(not isinstance(stamp, datetime) or stamp.tzinfo is None for stamp in stamps):
+            return None, _Unread(
+                f"history pagination in {symbol} has no dated submission boundary, so the "
+                "quantity ours opened is not established"
+            )
+        if why := _page_out_of_order(symbol, page, stamps, after, until, edge):
+            return None, why
+        if len(page) < ORDERS_PAGE_LIMIT:
+            break
+        earliest = min(stamps)
+        edge = {str(order.id) for order in page if order.submitted_at == earliest}
+        # Alpaca's reference calls `until` exclusive; alpaca-py's docstring does not say. Overlap
+        # the whole last microsecond under either reading, at the precision of the model's datetime
+        # submission timestamps; `_page_out_of_order` checks the venue kept that precision.
+        boundary = min(stamps) + timedelta(microseconds=1)
+        if until is not None and boundary >= until:
+            return None, _Unread(
+                f"history pagination in {symbol} cannot advance past a full page, so the "
+                "quantity ours opened is not established"
+            )
+        until = boundary
+        time.sleep(session_window.POLL_SECS)
+    orders = list(listed.values())
     for order in orders:
         if what := _no_count(order):
             # ours or not: a row that shows no count says nothing sure about the symbol, and read as
@@ -543,6 +789,37 @@ def _opened(trading: TradingClient, symbol: str, now: datetime) -> tuple[Decimal
             f"the fill counts of the orders in {symbol} cannot be summed, so the quantity ours opened "
             "is not established"
         )
+
+
+def _page_out_of_order(
+    symbol: str,
+    page: list[Order],
+    stamps: list[datetime],
+    after: datetime,
+    until: datetime | None,
+    edge: set[str],
+) -> str:
+    """Why a page of a paged history cannot be trusted to continue the walk, or "". The walk holds
+    only if the venue does as asked: every row inside `after` and `until`, newest first, and the
+    orders at the last page's earliest time listed again (the boundary overlaps them under either
+    reading of `until`'s equality). A venue that answers oldest first or keeps fewer digits of
+    `until` would otherwise end the walk with orders of ours unread."""
+    if any(stamp < after or (until is not None and stamp > until) for stamp in stamps):
+        return _Unread(
+            f"a history page in {symbol} holds an order outside the time asked for, so the "
+            "quantity ours opened is not established"
+        )
+    if any(later > earlier for earlier, later in pairwise(stamps)):
+        return _Unread(
+            f"history pages in {symbol} are not newest first, so the quantity ours opened is not "
+            "established"
+        )
+    if not edge <= {str(order.id) for order in page}:
+        return _Unread(
+            f"a history page in {symbol} does not hold the orders at the edge of the page before, "
+            "so the quantity ours opened is not established"
+        )
+    return ""
 
 
 def _net_of_ours(symbol: str, orders: list[Order]) -> tuple[Decimal | None, str]:
@@ -594,8 +871,8 @@ def _net_of_ours(symbol: str, orders: list[Order]) -> tuple[Decimal | None, str]
                 if replaced is None:
                     owner = " of ours" if mine else ""
                     return None, _Unread(
-                        f"an order{owner} in {symbol} replaces one the listing of the last "
-                        f"{LINEAGE_LOOKBACK} does not hold, whose fills it carries, so the quantity "
+                        f"an order{owner} in {symbol} replaces one the listing of the current "
+                        "trading week does not hold, whose fills it carries, so the quantity "
                         "ours opened is not established"
                     )
                 earlier = _shown(replaced.filled_qty)
@@ -692,7 +969,7 @@ def read_holdings(trading: TradingClient, now: datetime) -> list[Holding]:
         elif holding.held is not None and holding.held > 0 and holding.held != holding.opened:
             holding.frozen.append(
                 f"{holding.held} {holding.symbol} held, but our orders opened {holding.opened} in the "
-                f"last {LINEAGE_LOOKBACK}"
+                "current trading week"
             )
     for holding in found.values():
         holding.frozen[:] = dict.fromkeys(

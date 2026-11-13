@@ -1234,11 +1234,13 @@ def test_an_absent_baseline_is_kept_on_the_worker_and_the_night_still_ranks(tmp_
 
 
 PRE_READ_KEY = (date(2026, 11, 12), date(2026, 11, 12))
+# a split read, so a pre-read that should be used passes reference_problem as production needs
+SPLITS_READ = movers_rank.SplitRead(PREVIOUS, PRE_READ_KEY[1], ())
 
 
 def test_a_pre_read_answers_the_actors_call_for_its_key_and_counts_what_it_missed() -> None:
     pre = actor_module.ReferenceRead(
-        PRE_READ_KEY[0], {"AAA": movers_rank.Reference(close=1.0, session=PREVIOUS)}, None, 1
+        PRE_READ_KEY[0], {"AAA": movers_rank.Reference(close=1.0, session=PREVIOUS)}, SPLITS_READ, 1
     )
     done: Future[actor_module.ReferenceRead] = Future()
     done.set_result(pre)
@@ -1275,7 +1277,9 @@ def test_a_pre_read_that_found_no_reference_is_read_again_at_the_actors_call() -
         lambda symbols, cutoff, session: actor_module.ReferenceRead(cutoff, {}, None, 4),
     )
     assert reader(["AAA"], *PRE_READ_KEY).read_ns == 4
-    assert notes == ["read at the actor's call: the pre-read found no reference"]
+    assert notes == [
+        "read at the actor's call: the pre-read was not usable (no reference close was read)"
+    ]
 
 
 def test_a_failed_pre_read_falls_back_to_a_read_at_the_actors_call_and_says_why() -> None:
@@ -1476,7 +1480,7 @@ def test_a_pre_read_that_finishes_after_its_wait_is_used_by_the_next_call() -> N
     """Review of the stall unit, finding 4: a slow pre-read is not thrown away once the wait ran out."""
     late: Future[actor_module.ReferenceRead] = Future()
     pre = actor_module.ReferenceRead(
-        PRE_READ_KEY[0], {"AAA": movers_rank.Reference(close=1.0, session=PREVIOUS)}, None, 9
+        PRE_READ_KEY[0], {"AAA": movers_rank.Reference(close=1.0, session=PREVIOUS)}, SPLITS_READ, 9
     )
     notes: list[str] = []
     reader = actor_module.prefetched_reference_reader(
@@ -1509,6 +1513,29 @@ def test_a_pre_read_that_does_not_finish_within_its_wait_is_read_afresh_and_name
     assert reader(["AAA"], *PRE_READ_KEY).read_ns == 5
     assert time.monotonic() - started < 5
     assert notes == ["read at the actor's call: the pre-read did not finish within 0.05 s"]
+
+
+def test_a_pre_read_that_finishes_late_without_splits_is_named_unusable_not_a_retry() -> None:
+    """Review of the #323 fixes, finding 5: the late path read afresh for an unusable pre-read but noted
+    it as a plain retry, so the record hid that the pre-read was set aside."""
+    pending: Future[actor_module.ReferenceRead] = Future()
+    notes: list[str] = []
+    reader = actor_module.prefetched_reference_reader(
+        pending,
+        ["AAA"],
+        PRE_READ_KEY,
+        notes,
+        lambda symbols, cutoff, session: actor_module.ReferenceRead(cutoff, {}, None, 5),
+        wait_secs=0.05,
+    )
+    reader(["AAA"], *PRE_READ_KEY)
+    found = {"AAA": movers_rank.Reference(close=1.0, session=PRE_READ_KEY[0])}
+    pending.set_result(actor_module.ReferenceRead(PRE_READ_KEY[0], found, None, 9))
+    assert reader(["AAA"], *PRE_READ_KEY).read_ns == 5
+    assert notes[1] == (
+        "read at the actor's call: the pre-read finished after its wait and was not usable "
+        "(the splits were not read)"
+    )
 
 
 def run_bounded(
@@ -1580,3 +1607,76 @@ def test_a_snapshot_request_refused_with_a_4xx_is_raised_at_once_and_not_asked_a
         read_references(client, ["UPA"], SESSION, pause=pauses.append)
     assert len(client.requests) == tries
     assert len(pauses) == tries - 1
+
+
+# A second reader of #323 (sr-c-323), P3
+@pytest.mark.parametrize("close", [float("nan"), float("inf"), float("-inf"), 0.0, -1.0])
+def test_snapshot_reference_close_must_be_finite_and_positive(close):
+    client = StubSnapshots({"UPA": [daily(PREVIOUS, close)]})
+    found = read_references(client, ["UPA"], SESSION)
+    assert found == {}
+
+
+# sr-a-323, Finding 3
+def test_transient_handles_httperror_without_response_and_does_not_retry_local_api_error() -> None:
+    import requests
+    from alpaca.common.exceptions import APIError
+
+    no_response = APIError("dropped", requests.HTTPError("no response attached"))
+
+    class NoResponseClient(StubSnapshots):
+        def get_stock_snapshot(self, request_params: StockSnapshotRequest) -> dict[str, Snapshot]:
+            self.requests.append(request_params)
+            raise no_response
+
+    lines: list[str] = []
+    pauses: list[float] = []
+    client = NoResponseClient({"UPA": [daily(PREVIOUS, 10.0)]})
+    with pytest.raises(APIError):
+        read_references(client, ["UPA"], SESSION, log=lines.append, pause=pauses.append)
+    assert len(lines) == len(client.requests) == 1
+
+    local_refusal = APIError("request refused locally")
+
+    class LocalRefusalClient(StubSnapshots):
+        def get_stock_snapshot(self, request_params: StockSnapshotRequest) -> dict[str, Snapshot]:
+            self.requests.append(request_params)
+            raise local_refusal
+
+    client2 = LocalRefusalClient({"UPA": [daily(PREVIOUS, 10.0)]})
+    pauses2: list[float] = []
+    with pytest.raises(APIError):
+        read_references(client2, ["UPA"], SESSION, pause=pauses2.append)
+    assert len(client2.requests) == 1
+    assert pauses2 == []
+
+
+# sr-a-323, Finding 5
+def test_prefetched_reference_reader_reads_afresh_when_pre_read_has_no_splits() -> None:
+    unusable: Future[actor_module.ReferenceRead] = Future()
+    unusable.set_result(
+        actor_module.ReferenceRead(
+            PRE_READ_KEY[0],
+            {"AAA": movers_rank.Reference(close=10.0, session=PREVIOUS)},
+            None,
+            7,
+        )
+    )
+    fresh_split = movers_rank.SplitRead(PREVIOUS, PRE_READ_KEY[1], ())
+    fresh = actor_module.ReferenceRead(
+        PRE_READ_KEY[0],
+        {"AAA": movers_rank.Reference(close=10.0, session=PREVIOUS)},
+        fresh_split,
+        99,
+    )
+    notes: list[str] = []
+    reader = actor_module.prefetched_reference_reader(
+        unusable,
+        ["AAA"],
+        PRE_READ_KEY,
+        notes,
+        lambda symbols, cutoff, session: fresh,
+    )
+    got = reader(["AAA"], *PRE_READ_KEY)
+    assert got is fresh
+    assert any("splits" in n for n in notes), notes

@@ -62,11 +62,14 @@ for and is not what this rests on.
 * Open: the ATR rows (OWN1, OWN3) were built for a fresh momentum entry and are one and three ATRs of
   one-minute bars; F2 is a fixed 2%. No registered row is calibrated for a standing holding; every one is
   UNCALIBRATED. A row for a holding of days closes this, with its evidence.
-* Not shown, each UNVERIFIED: what Alpaca does with a marked trailing stop for more shares than are held
-  where shorting is allowed; how a `GTC` trailing stop elects at a later open, and that it still holds
-  its shares then (ADR 0129's gap); which price Alpaca measures its smallest trail against; that Alpaca
-  takes a trailing stop's cancel outside the regular session, and what it answers to a second cancel of
-  a stop pending its first.
+* Shown on paper since, for the `DAY` form (Evidence, 2026-11-13 19:29 and 19:33 UTC): where shorting is
+  allowed, Alpaca refused a trailing stop for more shares than were free, marked or not, and refused a
+  marked one sent with no share held. The first is Alpaca's free-quantity check, the second the marking.
+* Not shown, each UNVERIFIED: those two cases for a `GTC` stop, the form this task sends; the intent on
+  the market order a triggered stop becomes; how a `GTC` trailing stop elects at a later open, and that
+  it still holds its shares then (ADR 0129's gap); which price Alpaca measures its smallest trail
+  against; that Alpaca takes a trailing stop's cancel outside the regular session, and what it answers
+  to a second cancel of a stop pending its first.
 * The ATR rows carry the cap arm `own`, which the Mover lets stand only for an entry it sizes. This task
   sizes nothing, so a distance over the 2% cap under those rows is refused by name and the long gets no
   stop under that row.
@@ -96,6 +99,20 @@ lineage, its trail 2.0083% of Alpaca's own mark; while it rested Alpaca showed n
 second run sent nothing and named the long as covered by that stop; the stop was then canceled unfilled,
 the setting read back on, the share sold and the account read flat.
 
+**Amendment, 2026-11-13 — the own cap for a found holding (the lead's ruling).** This replaces the
+own-cap refusal above: a holding found in the account has no entry size left to choose, so under an
+`own` cap arm its per-symbol distance stands, whether selected from ATR or raised to the spread floor,
+up to the inclusive `sizing.DISTANCE_CEILING` the handbook names (`src/canon_trading/sizing.py:45`;
+`docs/handbook/practices.md:38`). A distance over that ceiling, before or after the price step and
+Alpaca's smallest trail, is refused by name and gets no stop; no fixed fraction is substituted.
+The spread floor and Alpaca's smallest trail still hold (`src/canon_trading/protect.py:387`, `:424-425`).
+`Mover._entry_trail` takes a default-off `found_holding` parameter for this task alone, covering both
+own-cap branches (`src/canon_trading/mover.py:5506`, `:5541`, `:5610`); the Mover's entry still sizes
+through `size_from_budget`, with its callers unchanged. F2 keeps its existing planning; OWN3 has the
+same own-cap arm as OWN1 and retains its registered ATR multiple. Offline tests reproduce both former
+refusals, the ceiling and price-step boundaries, the plan-only source line, and the entry guards
+(`tests/test_protect.py:574`, `:592`, `:623`, `:654`, `:662`, `:681`); no paper acceptance of this amendment is claimed.
+
 ## Evidence
 
 Read 2026-11-13.
@@ -122,6 +139,17 @@ Read 2026-11-13.
   and left its one share, which was sold afterwards under a separate guard; the stop was a `DAY` stop,
   so a `GTC` stop holding its shares is shown only by this record's own paper run, and there only
   within one session — observed by the owning lane.
+* Paper, account A, 2026-11-13 19:29 UTC and 19:33 UTC, two runs of a one-off probe that is not kept in
+  the repository, the long-only setting off for each run and restored in it (ADR 0111's form), `DAY`
+  trailing stops with a 20% trail. With one share held, a stop for two shares was refused with 403, code
+  40310000, "insufficient qty available for order (requested: 2, available: 1)", marked `sell_to_close`
+  and unmarked alike. With no share held, a stop for one share marked `sell_to_close` was refused with
+  422, code 42210000, "position intent mismatch, inferred: sell_to_open, specified: sell_to_close". The
+  first run also repeated the two refused limit sells above. The account read flat and long-only by hand
+  after each run. The probe's known limits, found by an outside reader and not fixed: on a lagging or
+  incomplete read of Alpaca's it can call the setting restored when it is not, or leave a part-filled
+  position or an order of an earlier run unnamed, and it assumes no short in another symbol at its
+  start; the two reads by hand after each run cover them — observed by the owning lane.
 * ADR 0114 — account C's pair, its service, and "nothing trades on it yet" — read. ADR 0111 — a
   reduce-only sell goes to Alpaca as `sell_to_close` — read. ADR 0129 — the adapter's own venue stop,
   which keeps its long-only bound — read.

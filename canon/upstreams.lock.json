@@ -252,6 +252,15 @@
       "sha": "7d814e3def47e257de0aa4b12e2d57572eb63d6a",
       "track": "tag:v0.1.1"
     },
+    "dsh-desktop": {
+      "default_branch": "master",
+      "default_sha": "39163dd30f703a79079e2d2446545cff3c453738",
+      "ref": "refs/tags/dsh-v0.2.2-rc.2",
+      "repo": "deepseek-ai/deepseek-harness",
+      "resolved_at": "2026-11-13T17:52:15Z",
+      "sha": "ddac96760b6edf8fa0fe17cbdcf0b512f4c12b2c",
+      "track": "tag:dsh-v0.2.2-rc.2"
+    },
     "dsh-experimental-terminal-bundle": {
       "default_branch": "master",
       "default_sha": "e8f7b93a344964de3dca1ace9e72b6e4d6de87cb",

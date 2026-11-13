@@ -1,0 +1,464 @@
+#!/bin/bash
+# test-dsh-profiles — offline cases for scripts/dsh-profiles, P1 to P7.
+#
+# Every fixture is built under one folder made with mktemp: a scratch HOME, a scratch DSH_HOME and a
+# record of its own, passed with --record. No case reads the real home. One case unsets DSH_HOME so the
+# profiles are read from $HOME/.dsh. Before any case runs, every file under the fixtures is listed with
+# its cksum, and the listing is compared after the cases: that is the read-only property P6. The same
+# property puts seven stubs (dsh, dsh-tui, pnpm, npm, node, curl, git) first on PATH, each writing a
+# marker when run; no marker may appear. P7 checks the tracked record home/dsh/profiles.json and both
+# new scripts. Exit 0 if every case behaves as expected, 1 otherwise. Touches only a temp folder.
+#
+# The two new scripts must hold no absolute home path (P7), so where a path segment would spell one,
+# this file assembles it from the variable repo_home instead.
+set -uo pipefail
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+CHECK="$ROOT/scripts/dsh-profiles"
+repo_home=home
+RECORD="$ROOT/$repo_home/dsh/profiles.json"
+unset DSH_HOME   # every case but the one that reads $HOME/.dsh passes a scratch DSH_HOME
+
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/canon-test-dsh-profiles.XXXXXX") || {
+  printf 'test-dsh-profiles: could not create a temp folder under %s; nothing was written\n' "${TMPDIR:-/tmp}" >&2
+  exit 1
+}
+trap 'rm -rf "$TMP"' EXIT
+TMP=$(cd "$TMP" && pwd -P)
+
+pass=0
+fail=0
+ok() { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
+bad() { fail=$((fail + 1)); printf 'FAIL %s\n' "$1"; }
+check() {
+  local label
+  label=$1
+  shift
+  if "$@"; then ok "$label"; else bad "$label"; fi
+}
+quiet() { "$@" >/dev/null 2>&1; }
+row_of() { printf '  %-24s %-9s %s\n' "dsh profile $1" "$2" "$3"; }
+
+# OUT and RC are what the last run produced.
+expect() {   # expect <label> <wanted-rc> <wanted row>...
+  local label want_rc want
+  label=$1
+  want_rc=$2
+  shift 2
+  want=$(printf '%s\n' "$@")
+  if [ "$RC" = "$want_rc" ] && [ "$OUT" = "$want" ]; then
+    ok "$label"
+  else
+    bad "$label"
+    printf '     rc %s, wanted %s\n' "$RC" "$want_rc" >&2
+    printf '     output was:\n%s\n' "$OUT" >&2
+    printf '     wanted:\n%s\n' "$want" >&2
+  fi
+}
+
+run() {   # run <home> <dsh-home> <record> [extra args...]
+  local run_home run_dsh run_record
+  run_home=$1
+  run_dsh=$2
+  run_record=$3
+  shift 3
+  OUT=$(HOME="$run_home" DSH_HOME="$run_dsh" "$CHECK" --record "$run_record" "$@" 2>&1)
+  RC=$?
+}
+
+run_without_dsh_home() {   # run_without_dsh_home <home> <record>
+  local run_home run_record
+  run_home=$1
+  run_record=$2
+  OUT=$( (unset DSH_HOME; HOME="$run_home" "$CHECK" --record "$run_record") 2>&1 )
+  RC=$?
+}
+
+run_default_record() {   # run_default_record <home> <dsh-home>
+  local run_home run_dsh
+  run_home=$1
+  run_dsh=$2
+  OUT=$(HOME="$run_home" DSH_HOME="$run_dsh" "$REPO_COPY" 2>&1)
+  RC=$?
+}
+
+expect_usage_error() {   # expect_usage_error <label> [args...]
+  local label
+  label=$1
+  shift
+  OUT=$(HOME="$USAGE_HOME" DSH_HOME="$USAGE_DSH" "$CHECK" "$@" 2>/dev/null)
+  RC=$?
+  if [ "$RC" = 2 ] && [ -z "$OUT" ]; then
+    ok "$label"
+  else
+    bad "$label"
+    printf '     rc %s, wanted 2, and no row; output was:\n%s\n' "$RC" "$OUT" >&2
+  fi
+}
+
+fixture_home() {   # fixture_home <case>: print the case's scratch HOME, creating it
+  local dir
+  dir="$TMP/cases/$1/$repo_home"
+  mkdir -p "$dir"
+  printf '%s\n' "$dir"
+}
+fixture_profile() {   # fixture_profile <case> <profile> <package.json text>
+  local dir
+  dir="$TMP/cases/$1/dsh/profiles/$2"
+  mkdir -p "$dir"
+  printf '%s\n' "$3" > "$dir/package.json"
+}
+fixture_record() {   # fixture_record <case> <record text>
+  local dir
+  dir="$TMP/cases/$1"
+  mkdir -p "$dir"
+  printf '%s\n' "$2" > "$dir/record.json"
+}
+snapshot() {   # every fixture file with its cksum, in a stable order
+  find "$TMP/cases" "$TMP/repo" -type f -exec cksum {} + 2>/dev/null | LC_ALL=C sort
+}
+
+# --- fixtures (built before the P6 snapshot, so only the runs are measured) ---
+
+# P1 — a profile whose dependencies equal its record exactly.
+P1_HOME=$(fixture_home p1)
+fixture_profile p1 match '{"name":"match","dependencies":{"alpha":"1.0.0","beta":"github:owner/repo#0123456789abcdef0123456789abcdef01234567","gamma":"2.1.0"}}'
+fixture_record p1 '{"about":"a fixture","profiles":{"match":{"alpha":"1.0.0","beta":"github:owner/repo#0123456789abcdef0123456789abcdef01234567","gamma":"2.1.0"}}}'
+
+# P2 — one profile per difference kind, then all four kinds in package-name order.
+P2E_HOME=$(fixture_home p2-extra)
+fixture_profile p2-extra extra '{"dependencies":{"alpha":"1.0.0","zeta":"9.9.9"}}'
+fixture_record p2-extra '{"profiles":{"extra":{"alpha":"1.0.0"}}}'
+
+P2S_HOME=$(fixture_home p2-spec)
+fixture_profile p2-spec spec '{"dependencies":{"aegis":"github:owner/repo#2222222222222222222222222222222222222222","alpha":"2.0.0"}}'
+fixture_record p2-spec '{"profiles":{"spec":{"aegis":"github:owner/repo#1111111111111111111111111111111111111111","alpha":"1.0.0"}}}'
+
+P2M_HOME=$(fixture_home p2-missing)
+fixture_profile p2-missing missing '{"dependencies":{"alpha":"1.0.0"}}'
+fixture_record p2-missing '{"profiles":{"missing":{"alpha":"1.0.0","gone":"2.0.0"}}}'
+
+P2X_HOME=$(fixture_home p2-exemption)
+fixture_profile p2-exemption exemption '{"dependencies":{"alpha":"1.0.0"}}'
+fixture_record p2-exemption '{"profiles":{"exemption":{"alpha":"1.0.0"}}}'
+printf '%s\n' '{"alpha@1.0.0":["0.2.1-rc.3"],"zeta@2.0.0":["0.2.1-rc.3"]}' \
+  > "$TMP/cases/p2-exemption/dsh/profiles/exemption/compatibility.json"
+
+P2C_HOME=$(fixture_home p2-empty)
+fixture_profile p2-empty emptycompat '{"dependencies":{"alpha":"1.0.0","beta":"2.0.0"}}'
+fixture_record p2-empty '{"profiles":{"emptycompat":{"alpha":"1.0.0","beta":"2.0.0"}}}'
+printf '%s\n' '{}' > "$TMP/cases/p2-empty/dsh/profiles/emptycompat/compatibility.json"
+
+P2U_HOME=$(fixture_home p2-unreadable)
+fixture_profile p2-unreadable badarray '{"dependencies":{"alpha":"1.0.0"}}'
+fixture_profile p2-unreadable badtext '{"dependencies":{"alpha":"1.0.0"}}'
+fixture_record p2-unreadable '{"profiles":{"badarray":{"alpha":"1.0.0"},"badtext":{"alpha":"1.0.0"}}}'
+printf '%s\n' '["not","an","object"]' \
+  > "$TMP/cases/p2-unreadable/dsh/profiles/badarray/compatibility.json"
+printf '%s\n' 'not json at all' \
+  > "$TMP/cases/p2-unreadable/dsh/profiles/badtext/compatibility.json"
+
+P2O_HOME=$(fixture_home p2-order)
+fixture_profile p2-order order '{"dependencies":{"alpha":"1.0.0","beta":"1.0.0"}}'
+fixture_record p2-order '{"profiles":{"order":{"alpha":"2.0.0","gamma":"3.0.0"}}}'
+printf '%s\n' '{"delta@1.0.0":[]}' > "$TMP/cases/p2-order/dsh/profiles/order/compatibility.json"
+
+# P3 — a profile with no record.
+P3_HOME=$(fixture_home p3)
+fixture_profile p3 desktop '{"dependencies":{"one":"1.0.0","two":"2.0.0","three":"3.0.0"}}'
+fixture_record p3 '{"profiles":{}}'
+
+# P4 — recorded profiles whose folder does not exist; no profiles folder at all.
+P4_HOME=$(fixture_home p4)
+P4_DSH="$TMP/cases/p4/dsh"
+mkdir -p "$P4_DSH"
+fixture_record p4 '{"profiles":{"gone":{"alpha":"1.0.0"},"also-gone":{}}}'
+
+# P4 — DSH_HOME unset: the profiles are read from $HOME/.dsh.
+P4B_HOME=$(fixture_home p4b)
+mkdir -p "$P4B_HOME/.dsh/profiles/fromhome"
+printf '%s\n' '{"dependencies":{"alpha":"1.0.0","beta":"2.0.0"}}' \
+  > "$P4B_HOME/.dsh/profiles/fromhome/package.json"
+fixture_record p4b '{"profiles":{"fromhome":{"alpha":"1.0.0","beta":"2.0.0"}}}'
+
+# P5 — node_modules is not a profile; a broken package.json; a manifest with no dependencies.
+P5N_HOME=$(fixture_home p5-node)
+P5N_DSH="$TMP/cases/p5-node/dsh"
+mkdir -p "$P5N_DSH/profiles/node_modules/left-pad"
+printf 'x\n' > "$P5N_DSH/profiles/node_modules/left-pad/index.js"
+fixture_record p5-node '{"profiles":{}}'
+
+P5U_HOME=$(fixture_home p5-unknown)
+P5U_DSH="$TMP/cases/p5-unknown/dsh"
+mkdir -p "$P5U_DSH/profiles/broken"
+printf '{"name": "broken",\n' > "$P5U_DSH/profiles/broken/package.json"
+fixture_record p5-unknown '{"profiles":{}}'
+
+P5Z_HOME=$(fixture_home p5-zero)
+fixture_profile p5-zero zero '{"name":"zero","version":"1.0.0"}'
+fixture_record p5-zero '{"profiles":{"zero":{}}}'
+
+# P5 — files holding no JSON value or several, which no single parse reads.
+P5V_HOME=$(fixture_home p5-values)
+P5V_DSH="$TMP/cases/p5-values/dsh"
+fixture_profile p5-values twovalues '{"dependencies":{"alpha":"1.0.0"}}
+{"dependencies":{"unvetted":"9.9.9"}}'
+mkdir -p "$P5V_DSH/profiles/empty"
+: > "$P5V_DSH/profiles/empty/package.json"
+fixture_profile p5-values twocompat '{"dependencies":{"alpha":"1.0.0"}}'
+printf '%s\n' '{}' '{"unvetted@9.9.9":["0.2.1-rc.3"]}' > "$P5V_DSH/profiles/twocompat/compatibility.json"
+fixture_record p5-values '{"profiles":{"twovalues":{"alpha":"1.0.0"},"empty":{},"twocompat":{"alpha":"1.0.0"}}}'
+
+# P5 — the comparison itself failing: a jq first on PATH that fails only that call, which alone passes
+# the argument "exemptions" bare; every other call goes to the real jq.
+REAL_JQ=$(command -v jq)
+mkdir -p "$TMP/failjq"
+cat > "$TMP/failjq/jq" <<FAILJQ
+#!/bin/bash
+for a in "\$@"; do [ "\$a" != exemptions ] || exit 5; done
+exec "$REAL_JQ" "\$@"
+FAILJQ
+chmod +x "$TMP/failjq/jq"
+
+# P3 and P5 — which folders under profiles/ are profiles: dsh refuses node_modules (and ., .. and a
+# name with a backslash) as a profile name and accepts one starting with a dot (app-boot profile.ts
+# L169-176), so a dot-folder is read and node_modules is not, even with a package.json; a folder whose
+# name holds a control character cannot be printed as a row name, and is counted instead.
+P3D_HOME=$(fixture_home p3-dot)
+P3D_DSH="$TMP/cases/p3-dot/dsh"
+fixture_profile p3-dot .scratch '{"dependencies":{"unvetted":"1.0.0"}}'
+fixture_profile p3-dot node_modules '{"name":"resolution-entries","dependencies":{"left-pad":"1.3.0"}}'
+fixture_profile p3-dot "$(printf 'odd\nname')" '{"dependencies":{"alpha":"1.0.0"}}'
+fixture_record p3-dot '{"profiles":{}}'
+
+# Interface — name order across recorded and found profiles, with statuses mixed.
+MIX_HOME=$(fixture_home mixed)
+MIX_DSH="$TMP/cases/mixed/dsh"
+fixture_profile mixed mmm '{"dependencies":{"alpha":"1.0.0","beta":"2.0.0"}}'
+fixture_profile mixed zzz '{"dependencies":{"alpha":"1.0.0","beta":"2.0.0"}}'
+fixture_record mixed '{"profiles":{"aaa":{},"mmm":{"alpha":"1.0.0","beta":"2.0.0"}}}'
+
+# Interface — the record defaults to home/dsh/profiles.json in the repository the script sits in.
+DEFAULT_HOME=$(fixture_home default)
+DEFAULT_DSH="$TMP/cases/default/dsh"
+fixture_profile default okay '{"dependencies":{"alpha":"1.0.0","beta":"2.0.0"}}'
+mkdir -p "$TMP/repo/scripts" "$TMP/repo/$repo_home/dsh"
+cp "$CHECK" "$TMP/repo/scripts/dsh-profiles"
+chmod +x "$TMP/repo/scripts/dsh-profiles"
+REPO_COPY="$TMP/repo/scripts/dsh-profiles"
+printf '%s\n' '{"profiles":{"okay":{"alpha":"1.0.0","beta":"2.0.0"}}}' \
+  > "$TMP/repo/$repo_home/dsh/profiles.json"
+
+# Interface — records the check must refuse.
+USAGE_HOME=$(fixture_home usage)
+USAGE_DSH="$TMP/cases/usage/dsh"
+mkdir -p "$USAGE_DSH"
+printf 'not json\n' > "$TMP/cases/usage/bad-record.json"
+printf '{"profiles":[]}\n' > "$TMP/cases/usage/list-profiles.json"
+printf '{"profiles":{"x":{"pkg":1}}}\n' > "$TMP/cases/usage/nonstring.json"
+printf '{"other":{}}\n' > "$TMP/cases/usage/no-profiles.json"
+printf '{"profiles":{"a\\nb":{}}}\n' > "$TMP/cases/usage/newline-name.json"
+printf '{"profiles":{"node_modules":{}}}\n' > "$TMP/cases/usage/node-modules-name.json"
+printf '{"profiles":{"a\\\\b":{}}}\n' > "$TMP/cases/usage/backslash-name.json"
+
+# P6 — seven stubs, first on PATH, each writing a marker when run.
+mkdir -p "$TMP/stubs"
+for stub in dsh dsh-tui pnpm npm node curl git; do
+  cat > "$TMP/stubs/$stub" <<'STUB'
+#!/bin/bash
+printf '%s\n' "${0##*/}" >> "$MARKERS"
+STUB
+  chmod +x "$TMP/stubs/$stub"
+done
+
+# --- the cases ---
+
+BEFORE=$(snapshot)
+
+# P1
+run "$P1_HOME" "$TMP/cases/p1/dsh" "$TMP/cases/p1/record.json"
+expect "P1: an exact match reads ok with its package count" 0 \
+  "$(row_of match ok '3 packages as recorded')"
+
+# P2 — a dependency the record lacks.
+run "$P2E_HOME" "$TMP/cases/p2-extra/dsh" "$TMP/cases/p2-extra/record.json"
+expect "P2: a dependency the record lacks reads NOT RECORDED <name> <spec>" 1 \
+  "$(row_of extra DIFFERS 'NOT RECORDED zeta 9.9.9')"
+
+# P2 — another spec, a github pin differing only in the commit, in package-name order.
+run "$P2S_HOME" "$TMP/cases/p2-spec/dsh" "$TMP/cases/p2-spec/record.json"
+expect "P2: another spec reads <name> <spec>, recorded <spec>; github commits compared exactly" 1 \
+  "$(row_of spec DIFFERS 'aegis github:owner/repo#2222222222222222222222222222222222222222, recorded github:owner/repo#1111111111111111111111111111111111111111; alpha 2.0.0, recorded 1.0.0')"
+
+# P2 — a recorded package the profile lacks.
+run "$P2M_HOME" "$TMP/cases/p2-missing/dsh" "$TMP/cases/p2-missing/record.json"
+expect "P2: a recorded package the profile lacks reads MISSING <name>" 1 \
+  "$(row_of missing DIFFERS 'MISSING gone')"
+
+# P2 — compatibility.json with one key.
+run "$P2X_HOME" "$TMP/cases/p2-exemption/dsh" "$TMP/cases/p2-exemption/record.json"
+expect "P2: each compatibility.json key reads EXEMPTION <key>" 1 \
+  "$(row_of exemption DIFFERS 'EXEMPTION alpha@1.0.0; EXEMPTION zeta@2.0.0')"
+
+# P2 — an empty compatibility.json says nothing.
+run "$P2C_HOME" "$TMP/cases/p2-empty/dsh" "$TMP/cases/p2-empty/record.json"
+expect "P2: an empty compatibility.json says nothing" 0 \
+  "$(row_of emptycompat ok '2 packages as recorded')"
+
+# P2 — a compatibility.json that is not a JSON object is unreadable; each row keeps its status.
+run "$P2U_HOME" "$TMP/cases/p2-unreadable/dsh" "$TMP/cases/p2-unreadable/record.json"
+expect "P2: a compatibility.json that is not a JSON object reads EXEMPTION file unreadable" 1 \
+  "$(row_of badarray DIFFERS 'EXEMPTION file unreadable')" \
+  "$(row_of badtext DIFFERS 'EXEMPTION file unreadable')"
+
+# P2 — all four difference kinds in one row, in package-name order, separated by '; '.
+run "$P2O_HOME" "$TMP/cases/p2-order/dsh" "$TMP/cases/p2-order/record.json"
+expect "P2: every difference is one DIFFERS row, in package-name order, joined by '; '" 1 \
+  "$(row_of order DIFFERS 'alpha 1.0.0, recorded 2.0.0; NOT RECORDED beta 1.0.0; EXEMPTION delta@1.0.0; MISSING gamma')"
+
+# P3
+run "$P3_HOME" "$TMP/cases/p3/dsh" "$TMP/cases/p3/record.json"
+expect "P3: a profile with no record reads UNRECORDED with its package count" 1 \
+  "$(row_of desktop UNRECORDED '3 packages, in no record')"
+
+# P4
+run "$P4_HOME" "$P4_DSH" "$TMP/cases/p4/record.json"
+expect "P4: a recorded profile with no folder is absent, named, and does not fail the exit status" 0 \
+  "$(row_of also-gone absent "$P4_DSH/profiles/also-gone: no package.json")" \
+  "$(row_of gone absent "$P4_DSH/profiles/gone: no package.json")"
+
+# P4 — DSH_HOME unset.
+run_without_dsh_home "$P4B_HOME" "$TMP/cases/p4b/record.json"
+expect "P4: with DSH_HOME unset the profiles are read from HOME/.dsh" 0 \
+  "$(row_of fromhome ok '2 packages as recorded')"
+
+# P5 — a folder with no package.json gets no row.
+run "$P5N_HOME" "$P5N_DSH" "$TMP/cases/p5-node/record.json"
+expect "P5: a folder without package.json (node_modules) gets no row" 0
+
+# P5 — a package.json that is not JSON.
+run "$P5U_HOME" "$P5U_DSH" "$TMP/cases/p5-unknown/record.json"
+expect "P5: a package.json that is not JSON reads UNKNOWN, naming the file" 1 \
+  "$(row_of broken UNKNOWN "$P5U_DSH/profiles/broken/package.json: not JSON")"
+
+# P5 — a package.json with no dependencies key.
+run "$P5Z_HOME" "$TMP/cases/p5-zero/dsh" "$TMP/cases/p5-zero/record.json"
+expect "P5: a package.json with no dependencies key has zero packages" 0 \
+  "$(row_of zero ok '0 packages as recorded')"
+
+# P5 — no JSON value or several: UNKNOWN, never ok, and one line per row.
+run "$P5V_HOME" "$P5V_DSH" "$TMP/cases/p5-values/record.json"
+expect "P5: a package.json holding several JSON values or none reads UNKNOWN; several compatibility.json values read unreadable" 1 \
+  "$(row_of empty UNKNOWN "$P5V_DSH/profiles/empty/package.json: not one JSON value")" \
+  "$(row_of twocompat DIFFERS 'EXEMPTION file unreadable')" \
+  "$(row_of twovalues UNKNOWN "$P5V_DSH/profiles/twovalues/package.json: not one JSON value")"
+
+# P5 — a comparison that fails is UNKNOWN, not ok.
+OUT=$(HOME="$P1_HOME" DSH_HOME="$TMP/cases/p1/dsh" PATH="$TMP/failjq:$PATH" \
+  "$CHECK" --record "$TMP/cases/p1/record.json" 2>&1)
+RC=$?
+expect "P5: a comparison that fails reads UNKNOWN, naming the manifest, not ok" 1 \
+  "$(row_of match UNKNOWN "$TMP/cases/p1/dsh/profiles/match/package.json: cannot be compared with the record")"
+
+# P3 and P5 — a dot-folder is a profile, node_modules is not, a control character is counted.
+run "$P3D_HOME" "$P3D_DSH" "$TMP/cases/p3-dot/record.json"
+expect "P3: a dot-folder is a profile; node_modules is not, even with a package.json; a control character in a name is counted, not printed" 1 \
+  "$(row_of .scratch UNRECORDED '1 packages, in no record')" \
+  "$(printf '  %-24s %-9s %s\n' 'dsh profiles' UNKNOWN "folders in $P3D_DSH/profiles whose name holds a control character, not read: 1")"
+
+# Interface — one row per profile, in name order, recorded and found together.
+run "$MIX_HOME" "$MIX_DSH" "$TMP/cases/mixed/record.json"
+expect "interface: rows are one per profile, in name order, recorded and found together" 1 \
+  "$(row_of aaa absent "$MIX_DSH/profiles/aaa: no package.json")" \
+  "$(row_of mmm ok '2 packages as recorded')" \
+  "$(row_of zzz UNRECORDED '2 packages, in no record')"
+
+# Interface — the default record.
+run_default_record "$DEFAULT_HOME" "$DEFAULT_DSH"
+expect "interface: the record defaults to home/dsh/profiles.json in the script's repository" 0 \
+  "$(row_of okay ok '2 packages as recorded')"
+
+# Interface — usage and unreadable records exit 2 and print no row.
+expect_usage_error "interface: an unknown option is a usage error (exit 2)" --bogus
+expect_usage_error "interface: --record with no value is a usage error (exit 2)" --record
+expect_usage_error "interface: a record that does not exist exits 2" \
+  --record "$TMP/cases/usage/absent-record.json"
+expect_usage_error "interface: a record that is not JSON exits 2" \
+  --record "$TMP/cases/usage/bad-record.json"
+expect_usage_error "interface: a record whose .profiles is not an object exits 2" \
+  --record "$TMP/cases/usage/list-profiles.json"
+expect_usage_error "interface: a record with a non-string spec exits 2" \
+  --record "$TMP/cases/usage/nonstring.json"
+expect_usage_error "interface: a record with no .profiles exits 2" \
+  --record "$TMP/cases/usage/no-profiles.json"
+expect_usage_error "interface: a record whose profile name holds a newline exits 2" \
+  --record "$TMP/cases/usage/newline-name.json"
+expect_usage_error "interface: a record naming node_modules, which dsh refuses as a profile, exits 2" \
+  --record "$TMP/cases/usage/node-modules-name.json"
+expect_usage_error "interface: a record whose profile name holds a backslash, which dsh refuses, exits 2" \
+  --record "$TMP/cases/usage/backslash-name.json"
+
+# P6 — stubs first on PATH.
+OUT=$(HOME="$P1_HOME" DSH_HOME="$TMP/cases/p1/dsh" MARKERS="$TMP/markers" \
+  PATH="$TMP/stubs:$PATH" "$CHECK" --record "$TMP/cases/p1/record.json" 2>&1)
+RC=$?
+check "P6: none of dsh, dsh-tui, pnpm, npm, node, curl or git was run" test ! -e "$TMP/markers"
+expect "P6: stubs first on PATH do not change the rows" 0 \
+  "$(row_of match ok '3 packages as recorded')"
+
+# P6 — every fixture file is unchanged.
+AFTER=$(snapshot)
+if [ "$BEFORE" = "$AFTER" ]; then
+  ok "P6: the scratch HOME and DSH_HOME are unchanged (every file with its cksum)"
+else
+  bad "P6: the scratch HOME and DSH_HOME are unchanged (every file with its cksum)"
+  printf '%s\n' "$BEFORE" > "$TMP/before.list"
+  printf '%s\n' "$AFTER" > "$TMP/after.list"
+  diff -u "$TMP/before.list" "$TMP/after.list" >&2
+fi
+
+# P7 — the tracked record.
+check "P7: home/dsh/profiles.json parses" quiet jq -e . "$RECORD"
+check "P7: .profiles is an object of objects of strings" quiet jq -e \
+  '(.profiles | type) == "object" and all(.profiles[]; type == "object" and all(.[]; type == "string"))' \
+  "$RECORD"
+
+GIT_SPEC='^github:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9a-f]{40}$'
+VER_SPEC='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
+specs=$(jq -r '.profiles | to_entries[] | .value | to_entries[] | "\(.key)\t\(.value)"' "$RECORD")
+bad_specs=""
+spec_count=0
+while IFS=$'\t' read -r package spec; do
+  [ -n "$package" ] || continue
+  spec_count=$((spec_count + 1))
+  if [[ "$spec" == github:* ]]; then
+    if [[ ! "$spec" =~ $GIT_SPEC ]]; then bad_specs="$bad_specs$package=$spec "; fi
+  elif [[ ! "$spec" =~ $VER_SPEC ]]; then
+    bad_specs="$bad_specs$package=$spec "
+  fi
+done <<< "$specs"
+if [ -z "$bad_specs" ] && [ "$spec_count" -gt 0 ]; then
+  ok "P7: every spec is an exact version, or github:<owner>/<repo>#<40 hex> ($spec_count specs)"
+else
+  bad "P7: every spec is an exact version, or github:<owner>/<repo>#<40 hex> ($spec_count specs)"
+  printf '     not exact: %s\n' "$bad_specs" >&2
+fi
+
+# P7 — no absolute home path. The pattern is assembled so this file does not hold one itself.
+home_users=$(printf '/%s/' 'Users')
+home_linux=$(printf '/%s/' 'home')
+absolute_home=""
+for f in "$CHECK" "$ROOT/scripts/test-dsh-profiles" "$RECORD"; do
+  if grep -qF -e "$home_users" -e "$home_linux" "$f"; then
+    absolute_home="$absolute_home$f "
+  fi
+done
+if [ -z "$absolute_home" ]; then
+  ok "P7: neither new script nor the record holds an absolute home path"
+else
+  bad "P7: neither new script nor the record holds an absolute home path"
+  printf '     holding one: %s\n' "$absolute_home" >&2
+fi
+
+printf 'test-dsh-profiles: %s passed, %s failed\n' "$pass" "$fail"
+[ "$fail" -eq 0 ]

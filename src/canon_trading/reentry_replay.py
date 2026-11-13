@@ -23,7 +23,7 @@ Only development dates from the registered sessions file and their earlier lookb
 dates can be read; 2026-10-16 onward is refused before constructing a catalog.
 
 It is also the gate for the lead's three registered trail arms (F2, OWN1, OWN3) with fixed 3, 5 and
-8% columns: every entry is sized by S1 (sizing.size_for_loss) for one planned loss from the
+8% columns: every entry is sized by S1 (sizing.plan_for_loss) for one planned loss from the
 --slot-budget parameter (default 20000), and its entry and sale are charged on Alpaca's step. One
 share per entry is left only to ReplayContext's callers with no slot budget, such as the tests.
 Summed dollars without compounding, slots, tick rounding of the walk, fees, or liquidity/impact
@@ -47,6 +47,7 @@ from datetime import date
 from datetime import datetime
 from decimal import ROUND_CEILING
 from decimal import ROUND_FLOOR
+from decimal import Context
 from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -66,9 +67,9 @@ import canon_trading.sizing
 from canon_trading import early_entry_study as study
 from canon_trading.price_step import down_on_step
 from canon_trading.price_step import entry_price
-from canon_trading.price_step import stop_trigger_price
 from canon_trading.price_step import tick
-from canon_trading.sizing import size_for_loss
+from canon_trading.sizing import plan_for_loss
+from canon_trading.sizing import sized_stop
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -103,12 +104,20 @@ FLOW_SHARE, FLOW_BARS = Decimal("0.05"), 5
 GATE_LOSS_TRAIL = Decimal("0.02")
 """The lead's A/B rule: the planned loss is the slot budget's shares times entry less the stepped 2% stop."""
 CENT = Decimal("0.01")
+EXACT = Context(prec=28)
+"""The default decimal context, as the Mover's trail is formed in: 28 digits, half-even."""
+FLOOR = Context(prec=28, rounding=ROUND_FLOOR)
+"""28 digits rounded down, the context S1 computes its stop in (`sizing._STOP`)."""
 TICK_BUCKETS = ("under 3", "3 to 5", "5 to 10", "over 10")
 """The lead's overnight breakdown (2026-11-12) of the trail's distance at entry in Alpaca's ticks: under
 3, 3 to under 5, 5 to 10, over 10. An observation, not a registered row."""
 
 
 def tick_bucket(ticks: float) -> str:
+    # NaN and infinity compare false into "over 10" and nothing measures into "under 3": a trail
+    # with no finite positive width has no bucket (sr-a-329 P3-1)
+    if not math.isfinite(ticks) or ticks <= 0:
+        raise ValueError(f"a trail's ticks must be finite and positive, not {ticks}")
     if ticks < 3:
         return TICK_BUCKETS[0]
     if ticks < 5:
@@ -176,9 +185,20 @@ def population(day: study.Day, tier_cut: float = TIER_CUT) -> dict[str, Any]:
     }
 
 
+def trail_refusal(fraction: float | None) -> str | None:
+    """Name an unusable long trail before computing its guard or protection rows. S1 enforces
+    its stricter 0.10 ceiling when sizing; even the one-share diagnostic cannot trail more than
+    its entire entry, which would multiply two negative factors in the study's chase floor."""
+    if fraction is None or not math.isfinite(fraction) or fraction <= 0:
+        return "distance_unknown"
+    return "distance_over_ceiling" if fraction > 1 else None
+
+
 def plan(fraction: float) -> dict[str, float]:
     """A trail's rows as the Mover sets them: the give a quarter of the trail, and the chase the
     configured depth under a narrow trail, max(trail, chase_cap) (mover.py:2144, rule (ii))."""
+    if why := trail_refusal(fraction):
+        raise ValueError(why)
     return {
         "trail": fraction,
         "exit_through": fraction / 4,
@@ -197,9 +217,11 @@ def protection(
     rows: dict[str, float] | None = None,
 ) -> study.Exit | None:
     """The study's own walk with the trail's rows; a released limit never filled is an exit."""
-    return study.protect(
-        bars, entry, bid, costs, **(rows or plan(fraction)), adaptive=adaptive, unfilled=True
-    )
+    if rows is None:
+        rows = plan(fraction)  # plan refuses an unusable trail by name
+    elif why := trail_refusal(rows["trail"]):
+        raise ValueError(why)
+    return study.protect(bars, entry, bid, costs, **rows, adaptive=adaptive, unfilled=True)
 
 
 def atr_values(bars: Sequence[study.Minute]) -> tuple[float | None, ...]:
@@ -233,12 +255,15 @@ def trail_fraction(exit_arm: str, entry: float, atr: float | None, top: bool) ->
         return 0.002
     if atr is None:
         return 0.02
-    if atr <= 0:
+    if not math.isfinite(atr) or atr <= 0:
         return None
-    if exit_arm.startswith("own-"):
-        return int(exit_arm.removeprefix("own-")) * atr / entry
-    k = 1 if exit_arm == "tier" else int(exit_arm.removeprefix("atr-"))
-    return min(0.02, k * atr / entry)
+    own = exit_arm.startswith("own-")
+    prefix = "own-" if own else "atr-"
+    k = 1 if exit_arm == "tier" else int(exit_arm.removeprefix(prefix))
+    # Mover._entry_trail forms k * ATR / price in Decimal, in the default context. Keep exact
+    # boundaries (including 3 * 0.07 / 0.21 == 1) before handing the fraction to the float walk.
+    fraction = EXACT.divide(EXACT.multiply(k, Decimal(repr(atr))), Decimal(repr(entry)))
+    return float(fraction if own else min(Decimal("0.02"), fraction))
 
 
 def cold(exit_arm: str, atr: float | None, top: bool) -> bool:
@@ -287,15 +312,21 @@ def reentry_signal(
     eligible: Callable[[int], bool] | None = None,
 ) -> Signal | None:
     """The sale-bar close seeds the low; entries start strictly on later bar closes."""
+    if not (math.isfinite(distance) and distance > 0):
+        raise ValueError(f"a re-entry needs a positive trail to measure its fall, not {distance}")
     low, low_index, rises = bars[sold_index].close, sold_index, 0
     below = vwap is not None and bars[sold_index].close < vwap[sold_index]
     k, d = (int(x) for x in arm.split("-")[1:]) if arm.startswith("turn-") else (0, 0)
+    # Subtract prices in Decimal before dividing: at 4000.0002 a 0.0001 fall otherwise amplifies
+    # float cancellation past the walk's 1e-9 snap and misses an exact turn.
+    top, width = Decimal(repr(sale)), Decimal(repr(distance))
     for i in range(sold_index + 1, len(bars)):
         b = bars[i]
         if b.close < low:
             low, low_index = b.close, i
         rises = rises + 1 if b.close > bars[i - 1].close else 0
-        depth = study.snap(max(0.0, sale - low) / distance)  # a fall of exactly d trails is d
+        fall = max(Decimal(0), EXACT.subtract(top, Decimal(repr(low))))
+        depth = study.snap(float(EXACT.divide(fall, width)))
         enter = arm == "reclaim" and b.close > sale
         if arm.startswith("turn-"):
             enter = rises >= k and depth >= d
@@ -325,12 +356,16 @@ def opening_signal(
         return None
     first = indices[0]
     opened, low, low_i, rises = bars[first].open, bars[first].close, first, 0
+    start = Decimal(repr(opened))  # the fall is subtracted in Decimal, as in reentry_signal
     for i in indices[1:]:
         if bars[i].close < low:
             low, low_i = bars[i].close, i
         rises = rises + 1 if bars[i].close > bars[i - 1].close else 0
         distance = distances[i]
-        depth = study.snap((opened - low) / distance) if distance else 0.0
+        depth = 0.0
+        if distance:
+            fallen = EXACT.subtract(start, Decimal(repr(low)))
+            depth = study.snap(float(EXACT.divide(fallen, Decimal(repr(distance)))))
         if distance and rises >= k and depth >= fall and (eligible is None or eligible(i)):
             return Signal(i, depth, bars[low_i].start + 1 - 570, bars[i].start + 1 - 570)
     return None
@@ -408,15 +443,18 @@ class ReplayContext:
 
     def sized(self, exit_arm: str, index: int, h: int) -> tuple[int, str] | str:
         """Whole shares for an entry at bar `index`'s close plus h, or S1's refusal name. With no
-        slot budget, one share. Otherwise S1 (`size_for_loss`) sizes the entry on Alpaca's step at
+        slot budget, one share. Otherwise S1 (`plan_for_loss`) sizes the entry on Alpaca's step at
         the trail's distance, for the lead's planned loss, under main's flow cap and the budget."""
-        if self.slot_budget is None:
-            return 1, "one share"
         key = exit_arm, index, h
         if key in self._shares:
             return self._shares[key]
         b = self.bars[index]
         fraction = trail_fraction(exit_arm, b.close, self.atr[index], self.top)
+        if fraction is not None and (why := trail_refusal(fraction)):
+            self._shares[key] = why  # a trail wider than its entry, or not finite
+            return why
+        if self.slot_budget is None:
+            return 1, "one share"
         try:
             entry = ask_price(b.close, h)
         except ValueError:
@@ -424,29 +462,36 @@ class ReplayContext:
             return self._shares[key]
         try:
             loss_shares = self.slot_budget // entry
-            planned = loss_shares * (entry - stop_trigger_price(entry * (1 - GATE_LOSS_TRAIL)))
+            planned = loss_shares * (entry - sized_stop(entry, GATE_LOSS_TRAIL))
             window = self.bars[max(0, index - FLOW_BARS + 1) : index + 1]
             dollars = sum(
                 (Decimal(repr(x.close)) * Decimal(repr(x.volume)) for x in window), Decimal(0)
             )
-            distance = None if fraction is None else Decimal(repr(fraction))
+            # The trail S1 sizes is the walk's snapped dollars over the close, not the float
+            # quotient, rounded down as S1 rounds: e.g. 0.03 / 1.09 must not put an exact stepped
+            # stop a tick lower when sized_stop rounds the loss up (ADR 0030, stop_trigger_price).
+            distance = (
+                None
+                if fraction is None
+                else FLOOR.divide(
+                    Decimal(repr(study.snap(b.close * fraction))), Decimal(repr(b.close))
+                )
+            )
             planned = planned.quantize(CENT, rounding=ROUND_FLOOR)
             flow = FLOW_SHARE * dollars // entry
-            quantity = int(
-                size_for_loss(
-                    instrument=SIZED,
-                    entry=Price.from_str(str(entry)),
-                    distance=distance,
-                    planned_loss=planned,
-                    flow_cap=flow,
-                    budget=self.slot_budget,
-                ).as_decimal()
+            sized = plan_for_loss(
+                instrument=SIZED,
+                entry=Price.from_str(str(entry)),
+                distance=distance,
+                planned_loss=planned,
+                flow_cap=flow,
+                budget=self.slot_budget,
             )
-            assert distance is not None  # S1 refused a missing distance above
+            quantity = int(sized.quantity.as_decimal())
             bounds = {
                 "budget": self.slot_budget // entry,
                 "flow cap": flow,
-                "planned loss": planned // (entry - stop_trigger_price(entry * (1 - distance))),
+                "planned loss": planned // (entry - sized.stop),
             }
             self._shares[key] = quantity, "+".join(n for n, v in bounds.items() if v == quantity)
         except ValueError as error:
@@ -466,8 +511,8 @@ class ReplayContext:
         entry, bid = b.close * (1 + half), b.close * (1 - half)
         # The trail is the walk's own, sized from the tape's close; only the entry carries h.
         fraction = trail_fraction(exit_arm, b.close, self.atr[index], self.top)
-        if fraction is None:
-            return None  # readiness is handled by the signal and sale paths
+        if fraction is None or trail_refusal(fraction):
+            return None  # readiness and named trail refusals are handled by the signal and sale
         floor = study.planned_stop(entry, **self.rows(exit_arm, fraction))
         if bid >= floor:
             return None
@@ -513,7 +558,10 @@ class ReplayContext:
         out = []
         for b, atr in zip(self.bars, self.atr, strict=True):
             fraction = trail_fraction(exit_arm, b.close, atr, self.top)
-            out.append(None if fraction is None else study.snap(fraction * b.close))
+            distance = None if fraction is None else study.snap(fraction * b.close)
+            # a positive trail that snaps to nothing (a Wilder ATR decayed under 5e-10 on a flat
+            # tape) is no trail: the bar is not ready, as with a zero ATR, never a zero-width walk
+            out.append(distance if distance is not None and distance > 0 else None)
         self._distances[exit_arm] = tuple(out)
         return self._distances[exit_arm]
 
@@ -568,6 +616,8 @@ class ReplayContext:
         fraction = trail_fraction(exit_arm, close, self.atr[index], self.top)
         if fraction is None:
             return {"refusal": "atr refused: a zero ATR, and no quoted spread floor"}
+        if why := trail_refusal(fraction):
+            return {"refusal": f"trail refused: {why}"}
         out = protection(
             self.bars[index + 1 :],
             close,
@@ -940,6 +990,10 @@ def new_returns(*, histogram: bool) -> dict[str, Any]:
 
 
 def add_return(target: dict[str, Any], value: float) -> None:
+    # without bins nothing else reads the value, and a NaN would sum to a NaN mean beside a 0.0
+    # deviation (`max(0.0, nan)` is 0.0)
+    if not math.isfinite(value):
+        raise ValueError(f"a return must be finite, not {value}")
     target["returns_count"] += 1
     target["returns_bps_sum"] += value
     target["returns_bps_sumsq"] += value * value
@@ -1248,6 +1302,13 @@ def write_tick_table(out: Any, sums: dict[Key, dict[str, Any]]) -> None:
         out.write(f"| {key[0]} | {key[3]} | {key[5]} | " + " | ".join(cells) + " |\n")
 
 
+def _refuse_constant(path: Path) -> Callable[[str], Any]:
+    def refuse(constant: str) -> Any:
+        raise ValueError(f"shard {path} holds {constant}, which no figure may be")
+
+    return refuse
+
+
 def merge(paths: Sequence[Path], output: Path, name: str) -> Path:
     """One summary from shard runs: their tier aggregates and counts summed. Every shard is complete,
     the shards are exactly 0/n to n-1/n of one n, and they ran the same code on the same inputs."""
@@ -1256,16 +1317,20 @@ def merge(paths: Sequence[Path], output: Path, name: str) -> Path:
     used: dict[str, int] = defaultdict(int)
     metadata = []
     for path in paths:
-        complete = False
+        complete, described = False, 0
         with path.open() as stream:
             for line in stream:
-                record = json.loads(line)
+                # a shard written before the aggregate lines refused NaN may still hold one
+                record = json.loads(line, parse_constant=_refuse_constant(path))
                 if record["kind"] == "metadata":
                     metadata.append(record)
+                    described += 1
                 elif record["kind"] == "aggregate" and record["group"].startswith("tier:"):
                     key = tuple(record[f] for f in KEY_FIELDS)
                     sums[key].append(record)
                 elif record["kind"] == "completion":
+                    if complete:
+                        raise ValueError(f"shard {path} has more than one completion record")
                     complete = True
                     for field, value in record["counts"].items():
                         counts[field] += value
@@ -1273,6 +1338,9 @@ def merge(paths: Sequence[Path], output: Path, name: str) -> Path:
                         used[day] += value
         if not complete:
             raise ValueError(f"shard incomplete: {path}")
+        # each file names its own shard, so a file's counts are never taken on another's metadata
+        if described != 1:
+            raise ValueError(f"shard {path} has {described} metadata records, not one")
     specs = [tuple(int(x) for x in m["shard"].split("/")) for m in metadata]
     ns = {n for _, n in specs}
     if len(ns) != 1 or sorted(k for k, _ in specs) != list(range(ns.pop())):
@@ -1467,7 +1535,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             records = {key: aggregate_record(key, sums[key]) for key in mine}
             for key in mine:
                 sums.pop(key)
-                stream.write(json.dumps(records[key]) + "\n")
+                stream.write(json.dumps(records[key], allow_nan=False) + "\n")
             for key in mine:
                 if key[1] == "run-2" and key[6] == "ohlc":
                     symbol_table.write(table_row(records[key], records.get((*key[:6], "adaptive"))))
@@ -1478,7 +1546,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     flush=True,
                 )
         for key, aggregate in sorted(sums.items()):
-            stream.write(json.dumps(aggregate_record(key, aggregate)) + "\n")
+            stream.write(json.dumps(aggregate_record(key, aggregate), allow_nan=False) + "\n")
         counts["unloaded_symbol_days"] = (
             len(development) * len(symbols) - counts["loaded_symbol_days"]
         )
