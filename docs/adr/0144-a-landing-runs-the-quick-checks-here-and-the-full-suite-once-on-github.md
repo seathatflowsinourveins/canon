@@ -5,7 +5,7 @@ decision-makers: the owner (approved 2026-11-13); the lead (2026-11-13), under t
 review-by: 2026-12-13
 ---
 
-# A landing runs the quick checks here and the full suite once on GitHub
+# A landing runs the quick checks and a secret scan of the history here, and the full suite once on GitHub
 
 ## Context and Problem Statement
 
@@ -37,32 +37,39 @@ so its hosted runs are not a limit to plan around.
 Chosen: **option 3**, on the lead's instruction and the owner's approval of 2026-11-13. It applies to
 landings started after it is on `main`; it changes no landing already in flight.
 
-1. **Local landing scope.** `scripts/land` invokes `scripts/ci --staged` instead of `scripts/ci --landing`.
-   Despite its name, that mode runs the lock and environment checks, ruff, format, ty, test collection,
-   canon lint and shell checks across the tree, including the separate projects' lock, environment, ty
-   and collection checks. Landing already refuses a dirty tree, so these see the whole committed branch
-   tree, not just the last commit's files. The mode's secret scan is still staged-only: the clean index
-   has no staged diff. Full history and working-tree secret scans remain in hosted `scripts/ci`; this
-   local command does not claim to scan the branch's committed history for secrets.
-2. **Hosted scope.** The existing `checks` job runs full `scripts/ci`; its aggregating
-   `all required checks passed` job must succeed before merge. "Once" means the full required validation
-   of the pull request is hosted, with no full local copy at landing. The workflow also runs on pushes
-   to `main`, so this is not a claim that a landing causes only one workflow run overall; that trigger
-   and the reporting macOS job stay as they are.
-3. **Statuses and merge.** The `review` status keeps the same note and precedes `signoff`. The `signoff`
-   description becomes `scripts/ci --staged (quick checks) passed locally`, attached to the checked commit.
-   The review gate, address check, branch rebase/merge rule, both status contexts, required-check wait,
-   exact-head squash-merge arguments, subject and body stay as they are. Repository settings, rulesets
-   and merge queues are outside this decision and are untouched.
-4. **The lane's tests.** A lane still runs its unit's own tests before landing, and one full pytest when
+1. **Local landing scope.** `scripts/land` still invokes `scripts/ci --landing`, but that mode now runs
+   the quick set the commit hook runs (the lock and environment checks, ruff, format, ty, test collection,
+   canon lint and shell checks across the tree, including the separate projects' lock, environment, ty and
+   collection checks) and, in place of the staged-only scan, gitleaks over the whole git history and the
+   working tree. Landing refuses a dirty tree, so these see the whole committed branch, and nothing the
+   push would publish goes out unscanned for secrets. Each other check is a skip line naming the hosted
+   required check, and the verdict line says how many were left to it. `--landing` keeps the CI slot
+   reserved for landings.
+2. **No origin, no hosted run.** With no `origin` remote there is no hosted run to leave anything to, so
+   `scripts/land` runs the whole of `scripts/ci` before it fast-forwards `main`.
+3. **Hosted scope.** The existing `checks` job runs full `scripts/ci`; its aggregating
+   `all required checks passed` job must succeed before merge, and the live ruleset on `main` requires
+   it and `signoff` (read 2026-11-13). `scripts/land` already fails the land when a required check fails
+   or is cancelled during its wait, and asks for auto-merge otherwise, which GitHub only completes once
+   the required checks pass. "Once" means the full required validation of the pull request is hosted,
+   with no full local copy at landing. The workflow also runs on pushes to `main`; that trigger and the
+   reporting macOS job stay as they are.
+4. **Statuses and merge.** The `review` status keeps the same note and precedes `signoff`. The `signoff`
+   context keeps its name; its description becomes
+   `scripts/ci --landing (quick checks, secret scan of the history) passed locally`, attached to the checked
+   commit, so the status says what ran here. The wait for the merge becomes 30 minutes
+   (`LAND_WAIT_SECONDS`, default 1800), longer than the hosted full run's measured 18-26 minutes, so an
+   ordinary landing ends with `main` updated rather than with an unconfirmed merge. The review gate,
+   address check, branch rebase/merge rule, exact-head squash-merge arguments, subject and body stay as
+   they are. Repository settings, rulesets and merge queues are untouched.
+5. **The lane's tests.** A lane still runs its unit's own tests before landing, and one full pytest when
    it adds a test module. Quick checks and test collection do not replace those runs.
-5. **Records amended.** This amends only ADR 0014's requirement to repeat the full suite
-   locally at landing (rule 5, and the scope of the local pass in rules 2 and 4). It settles ADR 0138's
-   division of checks: quick at commit and at local landing, full in the required hosted run. ADR 0138's
-   unrecorded timing comparison stays UNVERIFIED; this decision does not supply it or claim seconds.
-   ADR 0014's historical rejection of a merge queue is unchanged: its six-repository survey found none,
-   and the record said it was unavailable to personal accounts. That reason was read here, not surveyed
-   again or turned into a proposal for settings changes.
+6. **Records amended.** This supersedes in part ADR 0138, whose drivers kept a full local suite at
+   landing: its commit scope stands, its landing scope is replaced here, and its unrecorded timing
+   comparison stays UNVERIFIED. It amends ADR 0013's rule 1 (what `--landing` runs) and ADR 0014's rules
+   2 and 5 (the local pass and the wait). ADR 0014's rejection of a merge queue is unchanged, and GitHub's
+   own terms still exclude one here: merge queues are for public repositories owned by an organisation,
+   and this repository's owner is a user account.
 
 Option 1 keeps the measured duplicate work. Option 2 would remove the independently required hosted
 check; that is outside the lead's decision. Option 3 keeps the existing hosted enforcement and changes
@@ -74,33 +81,32 @@ only the local scope and the text that attests to it.
   saving is the reported approximately 15-minute local pass, not a new measured speed-up.
 * Cost recorded today: about 15 minutes locally plus 18-26 minutes on GitHub per landing; three local
   landing runs failed, one real and two not (load, a damaged environment); load was 40-54 with three
-  local runs. These are the lead's 2026-11-13 measurements, independently UNVERIFIED here.
-* Bad: a failure outside the quick set may first appear on GitHub after the push. The lane's own tests
-  remain necessary. A local landing with no `origin` keeps its fast-forward behavior but now receives
-  only the quick set; it has no hosted full-suite result.
-* Bad: the staged-only secret scan adds no coverage of committed history at a clean landing. The
-  commit hook scans staged changes, and the hosted required run still scans history and the tree.
-* GitHub documents 20 concurrent standard hosted jobs on Free, with at most 5 macOS jobs; these are
-  limits, not a guarantee of immediate starts. Actual account usage and runner contention are UNVERIFIED.
-* The existing nine-minute merge-wait default is unchanged, even though the reported hosted duration
-  is longer. A timeout still reports the last observed state; an accepted auto-merge request can outlive
-  the local wait. This decision adds no new wait or retry mechanism.
-* The quick mode still prints its existing commit-oriented skip wording, and uses shared CI slots
-  rather than `--landing`'s reserved slot. This unit does not change `scripts/ci` or its mode interface.
+  local runs. These are the lead's 2026-11-13 measurements, independently UNVERIFIED here. ADR 0138
+  records two hosted runs of 18 min 46 s and 19 min 09 s.
+* Bad: a failure outside the quick set first appears on GitHub after the push. The lane's own tests
+  remain necessary.
+* Bad, a recorded limit: the self-test cases that need macOS (in `scripts/test-lanes` and
+  `scripts/test-maintenance`) were run by the full local landing run and skip on the hosted Ubuntu runner.
+  The workflow's macOS job still runs and reports them on every pull request, but it is not among the
+  required checks (ADR 0082), so they no longer block a landing. A lane that changes what they cover runs
+  them itself before landing.
+* GitHub documents 20 concurrent standard hosted jobs on Free, with at most 5 macOS jobs, and cancels a
+  job past a limit; these are limits, not a guarantee of immediate starts. Actual
+  account usage and runner contention are UNVERIFIED.
 
 ### Confirmation
 
-* `scripts/test-land`, red against the base landing implementation: the actual CI invocation must be
-  exactly one `--staged` call on a clean multi-commit branch, including the no-remote, `--pr` and dry-run
-  paths; signoff must name the quick checks and both statuses must name the checked commit.
-* The same tests retain refusals for a missing `--reviewed` note and failed local checks before any
-  status or merge; existing cases retain the address, rebase, merge-head, merge-text and wait checks.
-* `scripts/test-land-merge-budget-blind` keeps its existing six cases and seven controls unchanged.
-* Reproduced by the landing lane on 2026-11-13: with the new `scripts/test-land` and the base
-  `scripts/land`, 6 cases failed (123 passed); with this change, 129 passed and 0 failed.
-  No full local CI, actual remote landing, or new hosted timing run was performed for this record:
-  UNVERIFIED. The first landing under it is its live check. Existing hosted workflow and ruleset behavior was read from the repository and the task,
-  not tested against GitHub settings.
+* `scripts/test-ci`: `--landing` runs the quick set, scans the whole history and the working tree and no
+  staged diff, runs no self-test and no full pytest, and says what it left to the hosted run; a plain run
+  still runs everything. 389 passed on 2026-11-13.
+* `scripts/test-land`, red against the base landing implementation: exactly one `scripts/ci --landing`
+  call on a clean multi-commit branch with `origin` (including the `--pr` and dry-run paths), one plain
+  `scripts/ci` call with no `origin`; signoff names what ran and both statuses name the checked commit.
+  The same tests retain refusals for a missing `--reviewed` note and failed local checks before any status
+  or merge. 129 passed on 2026-11-13.
+* `scripts/test-land-merge-budget-blind` keeps its existing cases unchanged.
+* No actual remote landing or new hosted timing run was performed for this record: UNVERIFIED. The first
+  landing under it is its live check.
 
 ## Evidence
 
@@ -130,8 +136,16 @@ Read 2026-11-13. Sources below distinguish direct reads from the lead's supplied
   not re-read; this draft relies on the implementation read here.
 * `scripts/land` and `.github/workflows/ci.yml` (read 2026-11-13 at `41f37333`)
   — local `--landing` call, status order, exact-head merge, nine-minute wait; hosted full `scripts/ci`,
-  aggregator requiring `check` to succeed, pull-request and push-to-main triggers. Live settings were
-  not queried: UNVERIFIED beyond the repository's description and the task's stated contract.
+  aggregator requiring `check` to succeed, the non-required macOS job, pull-request and push-to-main
+  triggers.
+* The live ruleset on `main`, read with `gh api repos/{owner}/{repo}/rulesets/<id>` on 2026-11-13
+  — active; deletion, non-fast-forward, linear history, pull request, and required status checks
+  `signoff` and `all required checks passed`; no merge-queue rule. `gh api repos/{owner}/{repo}` gives the
+  owner type `User` (resolved).
+* https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue
+  and https://github.blog/changelog/2023-07-12-pull-request-merge-queue-is-now-generally-available/
+  — "Pull request merge queues are available in any public repository owned by an organization", and the
+  changelog says the same (fetched 2026-11-13).
 * Lead's assignment, dated 2026-11-13 12:54, read 2026-11-13 — the chosen split, the timing/failure/load
   figures, retained local unit tests and full pytest for a new module, and the instruction to leave
   today's in-flight landings alone. The measurement logs were not supplied or independently read:

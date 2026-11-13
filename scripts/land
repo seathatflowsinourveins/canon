@@ -9,9 +9,11 @@
 #       squash-merge exactly the commit that was checked, with the title and description that were checked.
 #   with no origin remote:  fast-forward main locally.
 #
-# Either way nothing lands unless scripts/ci --staged (the quick checks) passes on exactly what is
-# committed, on a branch that contains the current main, and a change that needs an independent review
-# carries a note (ADR 0017). With origin, GitHub's required checks run the full suite before merging.
+# Either way nothing lands unless its checks pass on exactly what is committed, on a branch that contains
+# the current main, and a change that needs an independent review carries a note (ADR 0017). With origin,
+# that is scripts/ci --landing here (the quick checks and a secret scan of the whole history, before
+# anything is pushed) and the full suite in GitHub's required check before the merge (ADR 0144); with no
+# origin there is no hosted run, so the whole of scripts/ci runs here.
 #
 # Usage: scripts/land [--body <file>] [--reviewed <note>] [--dry-run] [--pr <number>]
 #   --body <file>   pull request description (Summary / Test Plan / Evidence); default: for --pr, the pull
@@ -26,7 +28,7 @@
 # The title, which is also the squash commit's subject, is the pull request's own title for --pr, else an
 # open pull request's own title when there is one, else the last commit's subject. The squash subject
 # ends in "(#<number>)", which is added unless the title already ends with it.
-# Environment: LAND_WAIT_SECONDS (default 540) and LAND_POLL_SECONDS (default 10) bound the wait for the
+# Environment: LAND_WAIT_SECONDS (default 1800, longer than the hosted full run's 18-26 minutes) and LAND_POLL_SECONDS (default 10) bound the wait for the
 # merge. LAND_PR is set by --pr for the run inside the worktree.
 # The fix marker (ADR 0073, addition of 2026-11-11): a commit that fixes a finding names the test that failed
 # before it in a `Fails-before: <test file>::<test function>` trailer and, optionally, the finding in
@@ -493,8 +495,13 @@ finish_dry() {
   exit 0
 }
 
-note "$branch is $ahead commit(s) ahead of main. Running the quick checks locally on the committed tree."
-"$ROOT/scripts/ci" --staged || die "checks failed; nothing landed"
+if [ -n "$remote" ]; then
+  note "$branch is $ahead commit(s) ahead of main. Running the landing checks locally on the committed tree; GitHub's required check runs the rest."
+  "$ROOT/scripts/ci" --landing || die "checks failed; nothing landed"
+else
+  note "$branch is $ahead commit(s) ahead of main. Running every check (no origin remote, so no hosted run)."
+  "$ROOT/scripts/ci" || die "checks failed; nothing landed"
+fi
 
 if [ -z "$remote" ]; then
   [ "$DRY" -eq 0 ] || finish_dry "fast-forward main to $(git rev-parse --short HEAD) (no origin remote)"
@@ -535,12 +542,12 @@ refused() { answered "GitHub refused the $1 status on $url, so nothing was merge
 answer=$(gh api -X POST "repos/{owner}/{repo}/statuses/$sha" -f state=success -f context=review \
    -f description="$review_note" 2>&1 >/dev/null) || refused review "$answer"
 
-# Local sign-off. scripts/ci --staged has just passed the quick checks on exactly this commit, so record that as the
+# Local sign-off. scripts/ci --landing has just passed on exactly this commit, so record that as the
 # `signoff` commit status, which the ruleset on main requires. A status belongs to one commit, so a later
 # push needs its own sign-off. This is 37signals' local-CI practice (basecamp/gh-signoff) with the same
 # status name, done through GitHub's commit status API.
 answer=$(gh api -X POST "repos/{owner}/{repo}/statuses/$sha" -f state=success -f context=signoff \
-   -f description="scripts/ci --staged (quick checks) passed locally" 2>&1 >/dev/null) || refused signoff "$answer"
+   -f description="scripts/ci --landing (quick checks, secret scan of the history) passed locally" 2>&1 >/dev/null) || refused signoff "$answer"
 
 # The ruleset also requires the hosted workflow's aggregating job, backed by the full scripts/ci suite on
 # GitHub's runners. Both merge calls name the commit that was checked, so GitHub refuses to merge anything else,
@@ -565,7 +572,7 @@ else
 fi
 asked="the merge of $url"; [ "$auto" -eq 0 ] || asked="the auto-merge request for $url"
 seen=""; readerr=""   # the last state read that succeeded, and what gh said when one failed
-waited=0; limit="${LAND_WAIT_SECONDS:-540}"; poll="${LAND_POLL_SECONDS:-10}"
+waited=0; limit="${LAND_WAIT_SECONDS:-1800}"; poll="${LAND_POLL_SECONDS:-10}"
 # unread: a read in the wait failed. On a spent budget the merge's outcome cannot be read until the reset,
 # so the land stops and says so, rather than polling on or calling it not merged.
 unread() {

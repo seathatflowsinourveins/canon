@@ -4,7 +4,7 @@
 # at /usr/bin, as macOS has them, and which skip those cases on Ubuntu (ADR 0082).
 #
 # The ruleset on main requires this workflow's `all required checks passed` job, and the `signoff` status
-# that scripts/land posts after the same checks pass locally. Checked with actionlint.
+# that scripts/land posts after its quick checks pass locally (ADR 0144). Checked with actionlint.
 # Both actions are referenced by commit SHA; the SHAs are the ones canon/upstreams.lock.json records for
 # `actions-checkout` and `mise-action`, and `scripts/canon lint` fails if they stop matching.
 name: ci

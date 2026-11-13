@@ -44,7 +44,8 @@ Chosen: **option 2**, through `scripts/land`.
    status and the hosted workflow's `all required checks passed` job. `scripts/land` posts `signoff` for
    the exact commit it has just checked. This is local CI as 37signals practise it, with the same status
    name as their tool, plus an independent run on GitHub's runners.
-5. **The same script runs in both places.** `scripts/land` runs `scripts/ci --landing` before it pushes, so
+5. **The same script runs in both places.** (Amended by ADR 0144: `--landing` now runs the quick set and a
+   secret scan of the whole history, and only the hosted run runs every check; the wait is thirty minutes.) `scripts/land` runs `scripts/ci --landing` before it pushes, so
    a failure shows before the push (it took seconds when this was written; minutes by 2026-11-13, ADR 0138). The hosted workflow runs it again on a clean machine, and `scripts/land` waits for that run
    before it merges.
 6. **The repository is public.** GitHub's standard hosted runners are free for public repositories.
