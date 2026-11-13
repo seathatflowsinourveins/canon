@@ -2,7 +2,10 @@
 
 import hashlib
 import json
+import os
 import re
+import subprocess
+import sys
 from collections import deque
 from dataclasses import replace
 from datetime import UTC
@@ -811,14 +814,41 @@ def test_a_complete_bar_does_not_protect_a_slot_with_no_holding(monkeypatch):
     mover.Mover.on_bar(seam, bar)
 
 
+FRESH_LOGGER = "CANON_PROFILE_FRESH_LOGGER"
+"""Set in the child process that runs the native-emulator count, so that only there it runs."""
+
+
 @pytest.mark.parametrize("release_afterward", [False, True])
-def test_tightening_sends_no_trading_command_out_of_the_native_emulator(capfd, release_afterward):
+def test_tightening_sends_no_trading_command_out_of_the_native_emulator(release_afterward):
+    """The count below reads the native logger, which is set up once per process: the first engine's
+    `LoggerConfig` publishes the global sender (NautilusTrader d53849b216e2,
+    `crates/common/src/logging/logger.rs:1003-1013`), and `bypass_logging` sets a process-wide flag
+    that nothing public clears (`:1016-1017`, `logging/mod.rs:77`). An earlier test that bypassed
+    logging (`tests/test_ledger.py:279`, among others) left it blind. So it runs in a pytest process
+    of its own, as `tests/test_stream_lock_fixture.py` runs its inner case."""
+    node = f"{__file__}::test_inner_native_emulator_command_count[{release_afterward}]"
+    ran = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", node],
+        env=os.environ | {FRESH_LOGGER: "1"},
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    assert ran.returncode == 0, ran.stdout + ran.stderr
+    assert "1 passed" in ran.stdout, ran.stdout
+
+
+@pytest.mark.parametrize("release_afterward", [False, True])
+def test_inner_native_emulator_command_count(capfd, release_afterward):
     """rc8 emulator.rs:1811–1820 logs every outgoing risk/exec TradingCommand.
 
     Count those records at the native boundary, excluding data subscriptions. A later triggered
     release is the positive control: the same capture must observe its outbound SubmitOrder.
     Python MessageBus.register targets Any endpoints, so it cannot count this typed Rust route.
     """
+    if os.environ.get(FRESH_LOGGER) != "1":
+        pytest.skip("run in a process of its own by the test above")
     eng = engine()
     s = profile_strategy(atr_n=30, entries=1)
     for window in ("recent", "long"):
