@@ -39,7 +39,7 @@ puts a standing node on an account whose tests and windows assume they are alone
 | `curl -q` | The store's one request, which carries the pair on stdin, passes `-q` first, so curl reads no curlrc. That is all it does: see the limit below. |
 | `paper:check protect`, `paper:remove protect` | One service each, as for A and B; neither reads a value. |
 | `paper:account protect` | GET only (ADR 0070's data-only mode), no lock: balances, positions, open orders with their lineage, `no_shorting`; no account number or order ID. This is how a stored pair is shown to work. |
-| Everything else | `paper:test`, `paper:session`, `paper:data`, `paper:history`, `paper:long-only` and `paper:close` do not accept `protect`. The tasks that trade on C come with the standing protector and its account record, neither yet on `main`. |
+| Everything else | `paper:test`, `paper:session`, `paper:data`, `paper:history`, `paper:long-only` and `paper:close` do not accept `protect`. The tasks that trade on C come with the standing protector and its account record, neither yet on `main`; ADR 0142 (2026-11-13) admits one before them, `paper:protect protect`. |
 
 The refusal compares key IDs, as ADR 0069's does, so it catches the same pair entered twice and not two
 pairs of one account: neither the keychain nor the paper API check says which account a pair reaches
