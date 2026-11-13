@@ -649,3 +649,90 @@ def test_practices_check_refuses_an_unsourced_line() -> None:
     assert check_practices(page + "* A practice; not yet built (roadmap step 7).\n", steps) == []
     assert check_practices(page + "* A practice.\n", steps) != []
     assert check_practices(page + "* A practice; not yet built (roadmap step 9).\n", steps) != []
+
+
+LIMITS_HEADER = "| Case | Reader | Reproducing test | Received |"
+LIMIT_SEPARATOR = re.compile(r"\|(?:\s*:?-+:?\s*\|){4}")
+LIMIT_TEST = re.compile(r"`(tests/[\w/]+\.py)::(\w+)`")
+
+
+def check_limits(text: str) -> list[str]:
+    """The named limits table: one header, its separator, then rows of a case, the reader that found it,
+    the test that reproduces it (`tests/<file>.py::<function>`, which must exist) or `none`, and the ISO
+    date it was received. An empty table is a list with nothing on it; a `|` line outside it is refused."""
+    lines = text.splitlines()
+    if lines.count(LIMITS_HEADER) != 1:
+        return ["the page needs exactly one limits table header"]
+    start = lines.index(LIMITS_HEADER)
+    if start + 1 >= len(lines) or not LIMIT_SEPARATOR.fullmatch(lines[start + 1].strip()):
+        return ["the limits header has no separator line"]
+    end = start + 2
+    while end < len(lines) and lines[end].startswith("|"):
+        end += 1
+    errors = [
+        f"a table line outside the limits table: {line[:60]!r}"
+        for index, line in enumerate(lines)
+        if line.startswith("|") and not start <= index < end
+    ]
+    for line in lines[start + 2 : end]:
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if len(cells) != 4:
+            errors.append(f"{line[:60]!r}: {len(cells)} cells, not 4")
+            continue
+        case, reader, test, received = cells
+        if not case:
+            errors.append(f"{line[:60]!r}: no case")
+        if not reader:
+            errors.append(f"{case[:40]!r}: no reader")
+        if test != "none":
+            named = LIMIT_TEST.fullmatch(test)
+            path = ROOT / named.group(1) if named else None
+            if named is None or path is None:
+                errors.append(
+                    f"{case[:40]!r}: test {test!r} is not `tests/<file>.py::<function>` or none"
+                )
+            elif not path.is_file() or f"def {named.group(2)}(" not in path.read_text():
+                errors.append(f"{case[:40]!r}: test {test!r} does not exist")
+        if not iso_date(received):
+            errors.append(f"{case[:40]!r}: received {received!r} is not an ISO date")
+    return errors
+
+
+def test_limits_page_form() -> None:
+    assert check_limits((HANDBOOK / "limits.md").read_text()) == []
+
+
+LIMITS_PAGE = f"# Limits\n\n{LIMITS_HEADER}\n|---|---|---|---|\n"
+A_LIMIT = "| A case | a reader | `tests/test_handbook.py::test_limits_page_form` | 2026-11-13 |"
+
+
+def test_limits_check_takes_an_empty_list_and_a_well_formed_line() -> None:
+    assert check_limits(LIMITS_PAGE) == []
+    assert (
+        check_limits(LIMITS_PAGE + A_LIMIT + "\n| Another | a reader | none | 2026-11-13 |\n") == []
+    )
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "complaint"),
+    [
+        ("A case", "", "no case"),
+        ("a reader", "", "no reader"),
+        ("`tests/test_handbook.py::test_limits_page_form`", "a test", "is not `tests/"),
+        ("test_limits_page_form`", "test_no_such_function`", "does not exist"),
+        ("2026-11-13", "today", "not an ISO date"),
+        (" 2026-11-13 |", " 2026-11-13 | extra |", "5 cells"),
+    ],
+)
+def test_limits_check_refuses_a_malformed_line(old: str, new: str, complaint: str) -> None:
+    errors = check_limits(LIMITS_PAGE + A_LIMIT.replace(old, new, 1) + "\n")
+    assert any(complaint in error for error in errors), errors
+
+
+def test_limits_check_refuses_a_page_without_its_table_or_a_stray_line() -> None:
+    assert check_limits("# Limits\n") == ["the page needs exactly one limits table header"]
+    assert check_limits(f"# Limits\n\n{LIMITS_HEADER}\n\n") == [
+        "the limits header has no separator line"
+    ]
+    stray = LIMITS_PAGE + A_LIMIT + "\n\nText.\n\n| A stray | line | none | 2026-11-13 |\n"
+    assert any("outside the limits table" in error for error in check_limits(stray))
