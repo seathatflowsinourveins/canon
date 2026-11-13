@@ -112,6 +112,9 @@ def test_c2_host_offset_does_not_lose_the_held_low(offset: int) -> None:
     seam = VenueClockSeam(offset)
     slot = seam.open_slot()
     slot.held_since, slot.held_stop = T0 + offset, Decimal("9.80")
+    # `_hold` sets the holding's venue start from the entry's fill; this seam records none, so the
+    # start is given (code-review-high-combined/2: with no start, no print counts toward the low)
+    slot.holding_from = T0
     for event, price in ((10 * SECOND, "9.70"), (11 * SECOND, "10.10")):
         seam.quote(event)
         seam.deliver(trade(price, event, event + offset))
@@ -128,6 +131,9 @@ def test_p5_ahead_is_measured_from_quotes_not_receipt(offset: int, lead: int) ->
     seam = VenueClockSeam(offset)
     slot = seam.open_slot()
     slot.held_since, slot.held_stop = T0 + offset, Decimal("9.80")
+    # `_hold` sets the holding's venue start from the entry's fill; this seam records none, so the
+    # start is given (code-review-high-combined/2: with no start, no print counts toward the low)
+    slot.holding_from = T0
     venue_now = 10 * SECOND
     seam.quote(venue_now)
     # Receipt is the same host instant as the quote; only the print's event stamp is corrupted.
@@ -146,6 +152,9 @@ def test_p5_ahead_print_cannot_replace_the_holding_price_or_poison_later_prints(
     seam = VenueClockSeam(offset)
     slot = seam.open_slot()
     slot.held_since, slot.held_stop = T0 + offset, Decimal("9.80")
+    # `_hold` sets the holding's venue start from the entry's fill; this seam records none, so the
+    # start is given (code-review-high-combined/2: with no start, no print counts toward the low)
+    slot.holding_from = T0
     seam.quote(10 * SECOND)
     seam.deliver(trade("10.00", 10 * SECOND, 10 * SECOND + offset))
     seam.quote(11 * SECOND)

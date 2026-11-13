@@ -240,6 +240,7 @@ from decimal import localcontext
 from itertools import groupby
 from itertools import pairwise
 from pathlib import Path
+from statistics import median_high
 from statistics import median_low
 from types import NoneType
 from typing import TYPE_CHECKING
@@ -1672,8 +1673,8 @@ the value of the adapter's `STAMP_AHEAD_MOST_NS` in its late-print setting, whic
 adapter's part and measures against receipt; it is to move to this reference with it, or a host
 clock more than 5 s behind sets every print aside there. "Ahead" is measured on the venue's time as
 the stream shows it (the lead's ruling of 2026-11-13, 08:49): a print's venue time less its receipt
-here, less the same of its name's latest quotes (`Slot.quote_lag`, the highest of them, so a quote
-reported late moves nothing), so this host's clock offset cancels, whatever its size. A print further
+here, less the same of its name's latest quotes (`Slot.quote_lag`, their upper median, so one quote
+reported late or stamped ahead moves nothing), so this host's clock offset cancels, whatever its size. A print further
 ahead has no usable time: it is neither the newest nor set aside, and `prints_stamped_ahead` counts it.
 With no quote of the name yet, the venue's time cannot be had, and the print is measured against its
 receipt as before; `prints_timed_on_receipt` counts each print so judged. A name whose every latest
@@ -1686,11 +1687,10 @@ CLOCK_QUOTES = 101
 quote. Quotes, not prints: a print reported late, as off-exchange prints are, reads below the clocks'
 difference. A record only; the lead reads it past 2 s (`session_window.CLOCK_NOTE_MOST_MS`)."""
 QUOTE_REFERENCE_QUOTES = 9
-"""The latest quotes of a name whose highest venue time less receipt is its reference
-(`Slot.quote_lag`). A quote's delay only lowers that difference, so the highest is the least-delayed
-quote's, the clocks' difference less the feed's least latency; one timely quote among them is enough.
-A step of this host's clock behind is followed at once, one ahead within nine quotes, meanwhile
-reading prints as less ahead than they are. UNCALIBRATED."""
+"""The latest quotes of a name whose upper median venue time less receipt is its reference
+(`Slot.quote_lag`). A quote's delay only lowers that difference, so the upper median leans to the
+timely quotes: with two, the timely one; with nine, up to four reported late or stamped ahead move
+nothing. A step of this host's clock is followed within five quotes. UNCALIBRATED."""
 
 
 def print_time(trade: Any, reference: int | None = None) -> int | None:
@@ -1872,9 +1872,9 @@ class Slot:
 
     @property
     def quote_lag(self) -> int | None:
-        """The highest of `quote_lags` (`QUOTE_REFERENCE_QUOTES`): the reference a print is measured
+        """The upper median of `quote_lags` (`QUOTE_REFERENCE_QUOTES`): the reference a print is measured
         against (`print_time`, `stamp_of`); None before any quote of the name."""
-        return max(self.quote_lags, default=None)
+        return median_high(self.quote_lags) if self.quote_lags else None
 
 
 def l_in_force(slot: Slot, bought: Decimal) -> Decimal | None:
@@ -2388,7 +2388,7 @@ class Mover(Strategy):
     def on_quote(self, quote: Any) -> None:
         self.quotes += 1
         # the clocks' difference, in plain attributes: a handler may run while the strategy is borrowed
-        lag = int(quote.ts_event) - int(quote.ts_init)  # `quote_lag`, inline
+        lag = int(quote.ts_event) - int(quote.ts_init)  # as `quote_lag`, for a quote that is there
         self.quote_lags.append(lag)
         least, most = self.quote_lag_least, self.quote_lag_most
         self.quote_lag_least = lag if least is None else min(least, lag)
@@ -2440,10 +2440,10 @@ class Mover(Strategy):
             # `_holding_trade`) while its stop is held, whatever order the prints arrive in: one set
             # aside as late counts, though it is never the newest price nor prices a sale (the lead's
             # ruling of 2026-11-13, F1 (b)); one with no usable time has no place in that order. With
-            # no entry fill on record when the holding began cannot be read: a late print, which may
-            # be from before it, counts toward nothing, and the newest counts, as on main
+            # no entry fill on record when the holding began cannot be read, so no print counts: one
+            # from before it would stay in the low once the fill is recorded
             since = slot.holding_from
-            if (since is None and not late_print) or (since is not None and event >= since):
+            if since is not None and event >= since:
                 slot.held_low = price if slot.held_low is None else min(slot.held_low, price)
 
     def record(self) -> dict[str, Any]:
@@ -4042,12 +4042,12 @@ class Mover(Strategy):
         reported late therefore moves none of these readers. The engine's order emulator is not one
         of them: it elects an emulated trailing sell on each trade as delivered
         (crates/execution/src/order_emulator/emulator.rs:1093-1105), so a late print reaches it unless
-        the adapter sets it aside before the data engine. With no print kept and a cache trade whose
-        venue time is unusable (`print_time`), that trade stands, as the cache's last trade did."""
+        the adapter sets it aside before the data engine. A cache trade whose venue time is unusable
+        (`print_time`) is never read, kept print or not (the lead's order of 2026-11-13, 10:01)."""
         kept = slot.newest_print
         trade = self.cache.trade(slot.instrument_id)
         at = None if trade is None else print_time(trade, slot.quote_lag)
-        if trade is not None and (kept is None or (at is not None and at > kept.event_ns)):
+        if trade is not None and at is not None and (kept is None or at > kept.event_ns):
             return Print.of(trade, slot.quote_lag)
         return kept
 

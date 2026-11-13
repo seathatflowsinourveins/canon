@@ -344,20 +344,43 @@ def test_window_record_keeps_late_counts_under_run_and_names_only_positive_ahead
         assert window["run"]["prints_stamped_ahead"] == {"AAA.ALPACA": 1}
 
 
-def test_with_the_host_clock_far_behind_and_no_print_kept_the_trail_follows_the_cache() -> None:
-    """Review R3 (2026-11-13): with this host's clock more than 5 s behind the venue's, every print
-    is stamped ahead and none is kept. The trail still follows the cache's last trade, as before,
-    instead of finding no price and holding the stop to an unpriced sale."""
+def test_a_print_with_no_usable_time_is_never_followed_even_with_no_print_kept() -> None:
+    """A print more than 5 s ahead of the stream has no usable time, so no reader follows it, even
+    when no print is kept and the cache's last trade is that print (code-review-high-combined/1). The
+    lead's order of 2026-11-13, 10:01: prints are judged on venue time, and the print trigger's limit
+    for a host clock far behind is no longer needed, so the cache's ahead print no longer stands in."""
     seam = cast(Any, Seam("10.20", trigger=TriggerType.LAST_PRICE))
     slot = seam_slot(seam)
     seam.slots, seam.trades = {AAA: slot}, 0
     ahead = _print("9.70", T0 + 10 * SECOND)
-    ahead.ts_init = T0  # its own time 10 s ahead of its receipt
+    ahead.ts_init = T0  # its own time 10 s ahead of its receipt, with no quote of the name
     Mover.on_trade(seam, ahead)
     seam.cache.trade = lambda _: ahead
     assert slot.newest_print is None
-    assert seam._followed(slot) == D("9.70")
+    assert seam._followed(slot) is None
     assert seam.prints_ahead == {str(AAA): 1}
+
+
+def test_with_no_entry_fill_on_record_no_print_counts_toward_the_hold_s_low() -> None:
+    """With no entry fill on record the holding's start cannot be read, so no print counts toward the
+    hold's low, kept or late: one from before the holding would otherwise stay in the low after the
+    fill is recorded (code-review-high-combined/2 and /6). The step still reads the followed price."""
+    seam, slot, filled, last = holding(TriggerType.LAST_PRICE, bid="9.89", ask="9.91")
+    seam.slots, seam.trades = {slot.instrument_id: slot}, 0
+    last.append(stamped("10.0000", filled - SECOND, filled - SECOND))
+    seam._protect(slot, D(3), filled + SECOND)
+    assert slot.held_stop is not None
+    slot.holding_from = None  # as `_hold` reads it with no fill on record
+    trade = SimpleNamespace(
+        instrument_id=slot.instrument_id,
+        price=Price.from_str("9.0000"),
+        ts_event=filled - 5 * SECOND,
+        ts_init=filled + 2 * SECOND,
+    )
+    seam.slots[slot.instrument_id].newest_print = None
+    last.append(trade)
+    seam.on_trade(trade)
+    assert slot.held_low is None
 
 
 def test_a_print_set_aside_as_late_still_counts_toward_the_hold_s_low() -> None:

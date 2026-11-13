@@ -242,3 +242,18 @@ def test_after_one_timely_quote_a_late_one_moves_no_print_into_ahead(skew: int) 
     deliver(seam, last, received("10.2000", filled + 2 * SECOND, skew, slot.instrument_id))
     assert slot.newest_print is not None and slot.newest_print.price == D("10.20")
     assert seam.prints_ahead == {}
+
+
+def test_one_quote_stamped_far_ahead_does_not_switch_off_the_ahead_bound() -> None:
+    """The reference is the upper median of the name's latest quotes, so one quote whose venue time
+    runs 30 s ahead does not let a print 20 s ahead of the stream order (code-review-high-combined/4)."""
+    seam, slot, filled, last = held(60 * SECOND)
+    for k in range(4):
+        seam.on_quote(quoted(filled + k * 100 * MS, 60 * SECOND, slot.instrument_id))
+    bad = quoted(filled + 500 * MS, 60 * SECOND, slot.instrument_id)
+    bad.ts_event += 30 * SECOND
+    seam.on_quote(bad)
+    ahead = received("9.7000", filled + 2 * SECOND, 60 * SECOND, slot.instrument_id)
+    ahead.ts_init -= 20 * SECOND
+    deliver(seam, last, ahead)
+    assert seam.prints_ahead == {str(slot.instrument_id): 1}
