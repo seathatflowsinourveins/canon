@@ -3268,29 +3268,30 @@ class Mover(Strategy):
             # Raised from the step timer this would stop every slot; it is named and retried next step.
             self._note(slot, str(error))
             return
+        # the stop held while no price was followed, read before `_end_hold` clears it: the remade sell
+        # keeps it as it keeps a reached trigger (xr7-r-heldl, P1)
+        held_level = None if slot.held_stop is None else stop_trigger_price(slot.held_stop)
         if slot.held_since is not None:
             self._end_hold(slot, now, "trail")
         # the reached trigger on Alpaca's step, one value for the check below and for the remade sell
         reached = slot.trail_trigger
         kept = None if reached is None else stop_trigger_price(reached)
         origin = None if reached is None else f"reached {reached}"
+        met = "retained trigger"
+        if held_level is not None and (kept is None or held_level > kept):
+            kept, origin, met = held_level, f"held stop {held_level}", "held stop (retained)"
         anchor = fill_trigger(bought, slot.sized_loss)
         if anchor is not None and (kept is None or anchor > kept):
             # L under the average fill, rounded up onto the step so a share never loses more than L;
             # the emulator then moves the trigger only up from it (`crates/execution/src/trailing.rs:61`,
-            # `:100`), and a remade sell keeps the higher of it and the trigger reached
+            # `:100`), and a remade sell keeps the higher of it, the trigger reached and the held stop
             kept, origin = anchor, f"{slot.sized_loss} under the fill {bought}"
+            # with no higher retained level, the stop L under the fill is met as the sale is armed
+            met = "trailing stop (L under the fill, met when armed)"
         if kept is not None and at <= kept:
-            # the market is at the trigger the canceled sell had reached: its sale is due now
+            # the market is at the trigger the canceled sell had reached, or the stop held: the sale
+            # is due now
             slot.exiting, slot.trail_trigger, slot.trail_limit = True, None, None
-            # a reached trigger is retained; with none, or with L under the fill above it, the stop L
-            # under the fill is met as the sale is armed
-            retained = reached is not None and kept == stop_trigger_price(reached)
-            met = (
-                "retained trigger"
-                if retained
-                else "trailing stop (L under the fill, met when armed)"
-            )
             self._mark_exit(slot, now, at, met)
             self._say(
                 f"{slot.instrument_id}: at {at}, the trigger {kept} ({origin}) is met; "
@@ -3418,21 +3419,33 @@ class Mover(Strategy):
         """S2 under #320's held stop: an entry sized for L holds its stop L under the average fill,
         rounded up onto the step (`fill_trigger`), the level its trailing sell would start from, and
         follows the average as the entry fills further, as a trailing sell remade for all that is held
-        would; a trigger a trailed sale had reached still holds it up. A recorded tightening's trail, or
-        no room for L, keeps #320's level at the trail's distance (`l_in_force`)."""
+        would; a trigger a trailed sale had reached still holds it up. A recorded tightening (the
+        ratchet's, the warmed ATR's or a profile's) follows the average too, at the distance in force
+        (`offsets_in_force`: the tightened trail, never wider than L), so a later fill at a higher
+        average moves the stop (dsh-reader-337, P1). No room for L under the average keeps #320's
+        level, tightened or not."""
         if slot.sized_loss is None:
             return
         anchor = self._held_anchor(slot)
-        if anchor is None or l_in_force(slot, anchor) is None:
+        if anchor is None or fill_trigger(anchor, slot.sized_loss) is None:
             return
-        at_l = fill_trigger(anchor, slot.sized_loss)
+        distance = slot.sized_loss
+        if slot.tightened:
+            plan = slot.trail_plan
+            distance = offsets_in_force(
+                slot,
+                anchor,
+                self.settings.trail if plan is None else plan.trail,
+                self.settings.exit_through if plan is None else plan.exit_through,
+            )[0]
+        at_l = fill_trigger(anchor, distance)
         if at_l is None:
             return
         reached = None if slot.trail_trigger is None else stop_trigger_price(slot.trail_trigger)
         slot.held_stop = at_l if reached is None else max(at_l, reached)
         slot.protection_anchor = anchor
         if slot.exit_record is not None:
-            slot.exit_record.trail_distance = slot.sized_loss
+            slot.exit_record.trail_distance = distance
         if slot.entry_record is not None:
             slot.entry_record["held_stop_level"] = str(slot.held_stop)
 

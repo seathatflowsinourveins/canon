@@ -1451,3 +1451,108 @@ def test_a_tightened_sized_holdings_held_stop_is_never_wider_than_l():
     slot.closes = deque([D(11)], maxlen=4)
     seam._hold(slot, D(10), T0 + 3 * MINUTE)
     assert slot.held_stop == D("10.59")
+
+
+def test_a_tightened_sized_holdings_held_stop_follows_a_later_fill_at_the_distance_in_force():
+    """The second reader of #337 (dsh-reader-337, 2026-11-13), P1: a held stop follows the average as
+    the entry fills further, a tightened holding's too. Held at the 10.80 average L = 0.21 under it
+    (10.59); the entry then fills at a higher average, 11.00, where the tightened plan's 0.02 is 0.22,
+    over L, so the distance in force is L and the stop moves up to 10.79, in the record too."""
+    seam, slot = tightened_at_l()
+    slot.closes = deque([D(11)], maxlen=4)
+    seam._hold(slot, D(10), T0 + 3 * MINUTE)
+    assert slot.held_stop == D("10.59")
+    seam.orders["E-1"].avg_px = 11.00
+    seam.bid = "11.20"
+    slot.closes = deque([D("11.20")], maxlen=4)
+    seam._hold(slot, D(15), T0 + 3 * MINUTE + SECOND)
+    assert slot.held_stop == D("10.79")
+    assert D(slot.entry_record["held_stop_level"]) == D("10.79")
+
+
+def test_a_ratcheted_sized_holdings_held_stop_follows_a_later_fill_too():
+    """The high review of the held-stop fix, should-fix 2: a ratchet is a tightening like the others;
+    its held stop follows a later, higher average at the distance in force, L here."""
+    seam, slot = tightened_at_l()
+    slot.ratcheted = True
+    slot.closes = deque([D(11)], maxlen=4)
+    seam._hold(slot, D(10), T0 + 3 * MINUTE)
+    seam.orders["E-1"].avg_px = 11.00
+    seam.bid = "11.20"
+    slot.closes = deque([D("11.20")], maxlen=4)
+    seam._hold(slot, D(15), T0 + 3 * MINUTE + SECOND)
+    assert slot.held_stop == D("10.79")
+
+
+def test_a_tightened_holdings_held_stop_follows_a_lower_average_at_the_tightened_plans_distance():
+    """The high review of the held-stop fix, test gap: at a lower average, 9.90, the tightened plan's
+    offset is closer than L, so the stop follows at the plan's distance, and the exit record names
+    the distance used."""
+    seam, slot = tightened_at_l()
+    slot.closes = deque([D(11)], maxlen=4)
+    seam._hold(slot, D(10), T0 + 3 * MINUTE)
+    seam.orders["E-1"].avg_px = 9.90
+    slot.trail_trigger = None  # no trigger reached, so the level is the distance's alone
+    seam.bid = "10.00"
+    slot.closes = deque([D("10.00")], maxlen=4)
+    seam._hold(slot, D(15), T0 + 3 * MINUTE + SECOND)
+    distance = slot.exit_record.trail_distance
+    assert distance < slot.sized_loss
+    assert slot.held_stop == mover.fill_trigger(D("9.90"), distance)
+
+
+def test_a_tightened_holding_with_no_room_for_l_keeps_its_held_stop_as_before():
+    """The high review of the held-stop fix, should-fix 1: with no room for L under the average, a
+    tightened holding's held stop is not moved, as an untightened one's is not."""
+    seam, slot = tightened_at_l()
+    slot.closes = deque([D(11)], maxlen=4)
+    seam._hold(slot, D(10), T0 + 3 * MINUTE)
+    seam.orders["E-1"].avg_px = 0.20
+    seam._hold(slot, D(15), T0 + 3 * MINUTE + SECOND)
+    assert slot.held_stop == D("10.59")
+
+
+def held_up_to_10_92():
+    """The pre-landing reader of the held-stop fix (xr7-r-heldl), P1: a sized holding (L = 0.21) whose
+    profile tightens to 0.007, held with no followed price at the 10.80 average (10.72), then at the
+    11.00 average after a later fill, where its held stop follows to 10.92 (0.08 under it)."""
+    seam, slot = holding(sized_loss="0.21")
+    slot.run_open_ns = T0 + MINUTE
+    seam._protect(slot, D(5), T0 + 2 * MINUTE)
+    assert slot.tightened is True
+    seam.orders["E-1"].avg_px = 10.80
+    seam.bid = "0"
+    slot.closes = deque([D("11.20")], maxlen=4)
+    seam._protect(slot, D(10), T0 + 3 * MINUTE)
+    assert slot.held_stop == D("10.72")
+    seam.orders["E-1"].avg_px = 11.00
+    seam._protect(slot, D(15), T0 + 3 * MINUTE + SECOND)
+    assert slot.held_stop == D("10.92")
+    return seam, slot
+
+
+def test_a_followed_price_back_through_the_held_stop_sells_at_once_by_limit():
+    """xr7-r-heldl, P1: when the followed price returns at 10.85, under the 10.92 held stop, the
+    trailing sell is not remade from L's 10.79: the held level is kept and is already met, so the
+    holding sells by limit, as a reached trigger the market is through does."""
+    seam, slot = held_up_to_10_92()
+    sent = len(seam.sent)
+    seam.bid = "10.85"
+    seam._protect(slot, D(15), T0 + 3 * MINUTE + 2 * SECOND)
+    assert [o.kind for o in seam.sent[sent:]] == ["LIMIT"]
+    assert slot.exiting is True
+    assert slot.exit_trigger == D("10.92")
+
+
+def test_a_followed_price_above_the_held_stop_remakes_the_sell_from_the_held_level():
+    """xr7-r-heldl, P1: when the followed price returns at 11.20, over the 10.92 held stop, the
+    trailing sell remade for all that is held starts from the held level, not lower from L's 10.79,
+    since the emulator then moves the trigger only up."""
+    seam, slot = held_up_to_10_92()
+    sent = len(seam.sent)
+    seam.bid = "11.20"
+    seam._protect(slot, D(15), T0 + 3 * MINUTE + 2 * SECOND)
+    remade = seam.sent[sent:]
+    assert [o.kind for o in remade] == ["TRAILING"]
+    assert remade[0].trigger_price == Price.from_str("10.9200")
+    assert slot.exiting is False
