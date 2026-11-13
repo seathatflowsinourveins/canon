@@ -536,7 +536,7 @@ otlp_records() {
 # The program is argv[0], or for node and bun the first argument that is not a flag. A process with an
 # ancestor of the same runtime is a helper of that worker and is left out. Known limit: any program named
 # muse, agy or dsh is taken for that runtime. DeepSeek's npm target is @deepseek-ai/dsh/lib/bin.js
-# (apps/cli/package.json at dsh-v0.2.1-rc.3); dsh-TUI v0.17.0's package.json names bin/dsh-tui.js.
+# (apps/cli/package.json at dsh-v0.2.2-rc.2); dsh-TUI v0.20.0's package.json names bin/dsh-tui.js.
 # Recognise those exact package suffixes under node/bun too.
 proc_list() {
   local pid et rt cwd

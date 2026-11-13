@@ -1764,33 +1764,34 @@ old_dsh_block() {
 { echo '- id: memento'; echo '  enabled: true'; for _ in $(seq 2000); do echo '# padding line, long enough to outrun one pipe buffer'; done; } > "$DP/cordis.patch.yml"
 bs --check
 check "a dsh-tui patch with its own row first, past a pipe buffer long: conflict" \
-      grep -q "another row in $DP/cordis.patch.yml sets session-log-deepseek, memento, approval or permission" "$TMP/bs.out"
-# ADR 0136: the block also refuses approval requests, through an approval row and a permission row. The
-# block as home/dsh/review.patch.yml has it, after a row of the owner's, is ok and says so.
+      grep -q "another row in $DP/cordis.patch.yml sets session-log-deepseek, memento, approval, permission or fs-observation-policy" "$TMP/bs.out"
+# ADR 0136: the block also refuses approval requests, through an approval row and a permission row, and keeps
+# read-before-write on through an fs-observation-policy row, which dsh-v0.2.2-rc.2's dsh-base ships disabled.
+# The block as home/dsh/review.patch.yml has it, after a row of the owner's, is ok and says so.
 DSRC="$BS/home/dsh/review.patch.yml"
 { echo '- id: doublecheck-guard'; echo '  config: {}'; cat "$DSRC"; } > "$DP/cordis.patch.yml"
 bs --check
-check "the current dsh-tui block after another row: ok, approval requests refused" \
-      eval 'rowis "$TMP/bs.out" "dsh-tui review patch" ok && grep -q "dsh-memento off, approval requests refused, in $DP/cordis.patch.yml" "$TMP/bs.out"'
+check "the current dsh-tui block after another row: ok, approval requests refused, read-before-write on" \
+      eval 'rowis "$TMP/bs.out" "dsh-tui review patch" ok && grep -q "dsh-memento off, approval requests refused, read-before-write on, in $DP/cordis.patch.yml" "$TMP/bs.out"'
 # an approval row of the owner's beside the block: one would override the other, so it is merged by hand
 { echo '- id: approval'; echo '  config:'; echo '    policy: ask'; cat "$DSRC"; } > "$DP/cordis.patch.yml"
 bs --check
 check "an approval row outside the dsh-tui block: NOT SET, a conflict" \
-      eval 'rowis "$TMP/bs.out" "dsh-tui review patch" "NOT SET" && grep -q "another row in $DP/cordis.patch.yml sets session-log-deepseek, memento, approval or permission" "$TMP/bs.out"'
+      eval 'rowis "$TMP/bs.out" "dsh-tui review patch" "NOT SET" && grep -q "another row in $DP/cordis.patch.yml sets session-log-deepseek, memento, approval, permission or fs-observation-policy" "$TMP/bs.out"'
 { cat "$DSRC"; echo '- {id: "permission", config: {defaultPreset: workspace-write}}'; } > "$DP/cordis.patch.yml"
 bs --check
 check "a flow-style permission row with a quoted id after the dsh-tui block: NOT SET, a conflict" \
-      eval 'rowis "$TMP/bs.out" "dsh-tui review patch" "NOT SET" && grep -q "sets session-log-deepseek, memento, approval or permission" "$TMP/bs.out"'
+      eval 'rowis "$TMP/bs.out" "dsh-tui review patch" "NOT SET" && grep -q "sets session-log-deepseek, memento, approval, permission or fs-observation-policy" "$TMP/bs.out"'
 # a quoted key is the same row (dsh parses the patch as YAML): JSON-style flow, and a block row with a space
 # before the colon, are conflicts too (Codex pre-landing reader, P2)
 { cat "$DSRC"; echo '- {"id": "approval", "config": {"policy": "ask"}}'; } > "$DP/cordis.patch.yml"
 bs --check
 check "a flow-style approval row with a quoted key after the dsh-tui block: NOT SET, a conflict" \
-      eval 'rowis "$TMP/bs.out" "dsh-tui review patch" "NOT SET" && grep -q "sets session-log-deepseek, memento, approval or permission" "$TMP/bs.out"'
+      eval 'rowis "$TMP/bs.out" "dsh-tui review patch" "NOT SET" && grep -q "sets session-log-deepseek, memento, approval, permission or fs-observation-policy" "$TMP/bs.out"'
 { printf -- "- 'id' : permission\n  config:\n    defaultPreset: workspace-write\n"; cat "$DSRC"; } > "$DP/cordis.patch.yml"
 bs --check
 check "a permission row with a quoted key and a space before the colon, before the dsh-tui block: NOT SET, a conflict" \
-      eval 'rowis "$TMP/bs.out" "dsh-tui review patch" "NOT SET" && grep -q "sets session-log-deepseek, memento, approval or permission" "$TMP/bs.out"'
+      eval 'rowis "$TMP/bs.out" "dsh-tui review patch" "NOT SET" && grep -q "sets session-log-deepseek, memento, approval, permission or fs-observation-policy" "$TMP/bs.out"'
 # a key that only ends in id is another key, quoted or not: a row whose config has grid or uid set to one of the
 # ids leaves the block ok, after it and before it (Codex delta reader, P2)
 { cat "$DSRC"; echo '- {"id": "doublecheck-guard", "config": {"grid": "approval"}}'; } > "$DP/cordis.patch.yml"
@@ -1801,6 +1802,26 @@ check "a row whose config has a quoted grid key set to approval, after the dsh-t
 bs --check
 check "a row whose config has grid and a quoted uid set to approval and permission, before the dsh-tui block: ok" \
       rowis "$TMP/bs.out" "dsh-tui review patch" ok
+# read-before-write: the block's fs-observation-policy row sets disabled false, the fs-observation-policy
+# README's way to restore the guard (deepseek-harness dsh-v0.2.2-rc.2, packages/fs/fs-observation-policy)
+check "home/dsh/review.patch.yml keeps read-before-write on: its fs-observation-policy row sets disabled false" \
+      awk 'prev == "- id: fs-observation-policy" && $0 == "  disabled: false" { found = 1 } { prev = $0 } END { exit !found }' "$DSRC"
+# a row of the owner's for it beside the block would override the block's, or be overridden: merged by hand
+{ echo '- id: fs-observation-policy'; echo '  disabled: true'; cat "$DSRC"; } > "$DP/cordis.patch.yml"
+bs --check
+check "an fs-observation-policy row outside the dsh-tui block: NOT SET, a conflict" \
+      eval 'rowis "$TMP/bs.out" "dsh-tui review patch" "NOT SET" && grep -q "another row in $DP/cordis.patch.yml sets session-log-deepseek, memento, approval, permission or fs-observation-policy" "$TMP/bs.out"'
+{ cat "$DSRC"; echo "- {id: 'fs-observation-policy', disabled: true}"; } > "$DP/cordis.patch.yml"
+bs --check
+check "a flow-style fs-observation-policy row with a quoted id after the dsh-tui block: NOT SET, a conflict" \
+      eval 'rowis "$TMP/bs.out" "dsh-tui review patch" "NOT SET" && grep -q "sets session-log-deepseek, memento, approval, permission or fs-observation-policy" "$TMP/bs.out"'
+# the block without its fs-observation-policy row, as ADR 0136 first installed it: stale, which --install
+# replaces where it stands
+awk 'drop { drop = 0; if ($0 == "  disabled: false") next } $0 == "- id: fs-observation-policy" { drop = 1; next } { print }' \
+    "$DSRC" > "$DP/cordis.patch.yml"
+bs --check
+check "the dsh-tui block without its fs-observation-policy row: NOT SET, read as a differing block --install replaces" \
+      eval 'rowis "$TMP/bs.out" "dsh-tui review patch" "NOT SET" && grep -q "$DP/cordis.patch.yml holds a canon block that differs from home/dsh/review.patch.yml; run: scripts/bootstrap --install, which replaces it where it stands and keeps a copy" "$TMP/bs.out"'
 # the older block, session log and memento only: stale, which --install replaces where it stands
 old_dsh_block > "$DP/cordis.patch.yml"
 bs --check
@@ -3485,7 +3506,7 @@ cp "$DP/cordis.patch.yml" "$TMP/dsh.before"
 { printf -- '- id: doublecheck-guard\n  config: {}\n'; cat "$DSRC"; printf -- '- id: tui-find\n  config: {}\n'; } > "$TMP/dsh.want"
 bs --install; rc=$?
 check "install replaces the older dsh-tui block where it stands, keeping the owner's rows on both sides" \
-      eval '[ "$rc" = 0 ] && cmp -s "$DP/cordis.patch.yml" "$TMP/dsh.want" && grep -q "added      session log upload off, dsh-memento off and approval requests refused to $DP/cordis.patch.yml" "$TMP/bs.out"'
+      eval '[ "$rc" = 0 ] && cmp -s "$DP/cordis.patch.yml" "$TMP/dsh.want" && grep -q "added      session log upload off, dsh-memento off, approval requests refused and read-before-write on to $DP/cordis.patch.yml" "$TMP/bs.out"'
 check "... keeping the previous patch as a copy beside it" \
       eval 'f=$(find "$DP" -maxdepth 1 -name "cordis.patch.yml.replaced-*" | awk "NR == 1"); [ -n "$f" ] && cmp -s "$f" "$TMP/dsh.before"'
 bs --check
@@ -3499,7 +3520,7 @@ printf -- '- {"id": "approval", "config": {"policy": "ask"}}\n' > "$DP/cordis.pa
 cp "$DP/cordis.patch.yml" "$TMP/dsh.before"; rm -f "$DP/review.patch.yml.canon-proposed"
 bs --check
 check "an approval row with a quoted key and no dsh-tui block: NOT SET, a conflict, not missing rows" \
-      eval 'rowis "$TMP/bs.out" "dsh-tui review patch" "NOT SET" && grep -q "sets session-log-deepseek, memento, approval or permission" "$TMP/bs.out"'
+      eval 'rowis "$TMP/bs.out" "dsh-tui review patch" "NOT SET" && grep -q "sets session-log-deepseek, memento, approval, permission or fs-observation-policy" "$TMP/bs.out"'
 bs --install
 check "... and install leaves it as it is, writing the block beside it as review.patch.yml.canon-proposed" \
       eval 'cmp -s "$DP/cordis.patch.yml" "$TMP/dsh.before" && cmp -s "$DP/review.patch.yml.canon-proposed" "$DSRC" && grep -q "EXISTS     $DP/cordis.patch.yml already sets one of these rows" "$TMP/bs.out"'

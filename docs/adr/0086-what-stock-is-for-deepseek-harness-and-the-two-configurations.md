@@ -43,6 +43,17 @@ Chosen: **option 3**.
    the `dsh-tui` profile, at `dsh-v0.2.1-rc.3`. Stock is reproducible only by replaying that list: ADR 0045
    records that the seven plugins were installed by hand, and `scripts/bootstrap --install` writes the two
    `cordis.patch.yml` rows, not the plugins. A profile that differs from the record is a named configuration.
+   2026-11-13: at `dsh-v0.2.2-rc.2` stock is four community plugins; `dsh-advisor`, `dsh-llm-fallbacks` and
+   `dsh-github-skills` leave it, for the reasons in the registry's `deepseek-harness` entry
+   (`home/dsh/profiles.json` records the set). 2026-11-13, a recorded limit: at that pin all four worker
+   profiles compose web search, `dsh-tui` through the standard preset's own `tool-web` (`web-app`'s
+   `presets/standard.patch.yml` L123-127) and the other three through `dsh-base`'s row, and its default
+   provider is DeepSeek's Search API, which receives the query, a result count and, unless
+   `sendOriginalQuestion` is off, the latest human prompt cut to 128 characters (`web-deepseek-api` README L27,
+   L44, L75). No row turns that off. The recipient is DeepSeek, which already receives every worker turn in
+   full through the chat route (`agent-default-model`, provider `deepseek-official`, in each rehearsed
+   composition), so the prefix reaches no new party, and billing follows the conversation's route (L64). It
+   is stock engine behaviour, not an addition, so ADR 0072 rule 6 is not engaged.
 2. **The review configuration** is stock plus one addition, `@deepseek-ai/dsh-experimental-terminal-bundle`
    0.2.1-rc.3. It is chosen because its own code has no network client and its sessions are process-local, though it gives the reviewer a persistent shell, which upstream says carries weaker contracts than one-shot bash;
    whether it opens a channel to another model or to earlier sessions was NOT read in its source
@@ -51,7 +62,10 @@ Chosen: **option 3**.
    is the only mode that neither deadlocks an unattended run nor fails silently. Its `tdd` module is off
    so that no red gate applies: at `remind` the guard only emits a reminder and lets the edit proceed, and the
    gate refuses only under `warn` or `block` (read in the 0.9.30 source; the 0.9.29 guard code is identical
-   up to the projection registration).
+   up to the projection registration). 2026-11-13: at dsh-v0.2.2-rc.2 the review configuration carries no
+   terminal bundle, since its panel backend needs the Web bundle's terminal controller; it returns only through a
+   new adoption. Leaving it out removes only the bundle's own terminal tools, not `bash`, which
+   `@deepseek-ai/dsh-tool-bash` provides apart from it.
 3. **The build configuration** is `dsh --profile headless -`, a one-shot runner carrying `aegis`,
    `dsh-doublecheck` 0.9.30, `dsh-memento` 0.5.30 with `writePolicy: auto`, and
    `dsh-subagent-codex` plus `dsh-subagent-claude-code` 0.2.1-rc.3. It re-enables the `credentials` row
@@ -154,6 +168,37 @@ Read and run 2026-11-11.
 * Versions from each profile's installed `package.json`; nothing was read beyond them. Licences for the
   four new additions are `UNVERIFIED` — their licence files were not read.
 * The eval verdict for either configuration: **UNVERIFIED — no run exists.**
+* 2026-11-13, the engine pin moves to `dsh-v0.2.2-rc.2` and dsh-TUI's to `v0.20.0` (ADR 0045's Evidence). The
+  registry's `deepseek-harness` entry and `home/dsh/profiles.json` now record the `dsh-tui` profile as the
+  first-party packages at 0.2.2-rc.2, dsh-TUI 0.20.0, aegis 2.15.0 (`e5f43c548a06`), dsh-doublecheck 0.9.31,
+  dsh-memento 0.5.30 and dsh-tui-find 0.5.2. dsh-advisor, dsh-llm-fallbacks and dsh-github-skills leave stock,
+  and dsh-fail-guard, which the profile carried with no record, leaves with them, each for the reason the entry
+  gives. A rehearsal (run 2026-11-13) installed that set, and the `headless`, `review-acp` and `build-acp`
+  profiles with their first-party packages at 0.2.2-rc.2 and the rest as each real profile held it (for
+  `headless`, one package the record does not hold, `dsh-fail-guard`), each in a throwaway `DSH_HOME` with the
+  pinned pnpm 10.34.9 (exit 0), and composed each with `--dump-config` (exit 0). The `dsh-tui` composition keeps
+  `doublecheck-guard` at `intensity: remind` with `tdd` off, and 0.9.31 leaves `lib/guard/index.js` as
+  0.9.30 had it (GitHub's compare of the two releases' `gitHead` commits, fetched). The same compare changes
+  `lib/grill/index.js` (+84/-26), which `dsh-tui` runs (`grill: true`): its report's verification, on by
+  default, now reaches the workflow engine a preset mounts, so its forked checks can run where 0.9.30
+  skipped them, and a skipped run states why; it adds no network client, storage path or credential read
+  (read in the diff; not run).
+  Rule 2's terminal bundle now has `dsh-terminal-panel` as its backend in place of `dsh-terminal-bash`. The
+  panel requires the `terminalController` service, which only the `web-app` bundle composes, and the
+  rehearsal's `dsh-tui`, `review-acp` and `build-acp` compositions carry the panel without it. Read in source,
+  the panel then stays pending and the terminal tools find no backend, so rule 2's addition would lose its
+  persistent shells (resolved; no tool was called, so `UNVERIFIED`). The bundle therefore leaves all three
+  profiles (rule 2's 2026-11-13 pointer for `dsh-tui`, ADR 0095 item 4's for `review-acp` and `build-acp`;
+  `home/dsh/profiles.json`). That removes only its own terminal tools: a
+  worker's `bash` is `@deepseek-ai/dsh-tool-bash`, whose inject list names none of the bundle's services, from
+  the standard preset in `dsh-tui` and from `dsh-base`'s own row in the ACP profiles (the bundle's registry
+  entry). Those sets carried the bundle. A scripted rehearsal (run 2026-11-13, each step's exit code logged)
+  then installed and composed each of the four profiles exactly as `home/dsh/profiles.json` records it,
+  without the bundle: every install and `--dump-config` exit 0, no admission refusal, no duplicate id and no
+  `terminal_*` row. `tool-bash` is enabled in `dsh-base`'s row in `headless`, `review-acp` and `build-acp`; in
+  `dsh-tui` dsh-TUI's patch disables the host row and `bash` comes from the standard preset, which the dump
+  does not show (`UNVERIFIED` until a session starts). Rules 1 to 3 keep the versions they were decided at,
+  and no profile was started.
 
 ## Amendment — 2026-11-11: ACP profile composition
 
