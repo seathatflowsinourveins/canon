@@ -310,6 +310,25 @@ check "a directory lsof cannot read: lane ?, and a warning" \
 check "corrupt and misshapen OTLP lines counted, metrics line not" w '.otlp_unreadable_lines == 2'
 check "no attribute beyond the named ones is copied out" eval '! grep -q "someone@example.com" "$TMP/rates.json"'
 check "every runtime names its source"             w '[.sources[].runtime] == ["claude-code","codex","muse-code","antigravity","deepseek-harness"]'
+# the fleet: throughput summed over the measured workers, and one generating speed for them all, the total of
+# the timed requests' output tokens over the total of their durations (Codex reports no duration)
+check "fleet: working Claude Code sessions, every measured worker's tok/s summed, speed from the 2 timed requests" \
+      w '.fleet.working == 1 and .fleet.tok_s == ([.workers[] | select(.measured) | .tok_s] | add * 100 | round / 100) and .fleet.gen_tok_s == 200 and .fleet.gen_requests == 2'
+{
+  rec "[$(s event.name api_request),$(s session.id s-otel),$(n output_tokens intValue 600),$(n duration_ms intValue 2500)]" "$((NOW - 120))000000000"
+  rec "[$(s event.name api_request),$(s session.id s-otel),$(n output_tokens intValue 600),$(n duration_ms intValue 3500)]" "$((NOW - 60))000000000"
+  rec "[$(s event.name api_request),$(s session.id s-none),$(n output_tokens intValue 100),$(n duration_ms intValue 1000)]" "$((NOW - 50))000000000"
+  rec "[$(s event.name codex.sse_event),$(s event.kind response.completed),$(s conversation.id c-1),$(s output_token_count 1200)]" "$((NOW - 40))000000000"
+} > "$RD/otel/fleet.jsonl"
+CANON_OTLP_FILE="$RD/otel/fleet.jsonl" rates --json > "$TMP/fleet.json" 2>/dev/null
+check "fleet speed over two sessions is one ratio of sums: 1300 tokens over 7 s is 185.71, not 150 (the mean of 200 and 100) nor 192.31 (weighted by tokens)" \
+      jqt "$TMP/fleet.json" '.fleet.gen_tok_s == 185.71 and .fleet.gen_requests == 3 and .fleet.tok_s == 4.17 and ([.workers[] | select(.id == "s-none") | .gen_tok_s] == [100])'
+CANON_OTLP_FILE="$RD/otel/fleet.jsonl" rates > "$TMP/fleet.out" 2>&1
+check "... and the table ends with the fleet line, naming what the speed covers" \
+      grep -q "^Fleet: 1 Claude Code session(s) working; 4.17 tok/s output over the window, 185.71 tok/s generating over 3 timed request(s)" "$TMP/fleet.out"
+grep -v duration_ms "$RD/otel/fleet.jsonl" > "$RD/otel/fleet-untimed.jsonl"
+CANON_OTLP_FILE="$RD/otel/fleet-untimed.jsonl" rates --json > "$TMP/fleet.json" 2>/dev/null
+check "no timed request in the window: no fleet speed, not a zero" jqt "$TMP/fleet.json" '.fleet.gen_tok_s == null and .fleet.gen_requests == 0 and .fleet.tok_s == 2'
 rates > "$TMP/rates.out" 2>&1; rc=$?
 check "rates table prints, one line per worker"    eval '[ "$rc" = 0 ] && [ "$(grep -cE "^(otel|none|-|proc-[0-9]+|\?) " "$TMP/rates.out")" = 9 ] && grep -q "OFF-MODEL: gpt-x" "$TMP/rates.out"'
 CANON_OTLP_FILE="$RD/otel/absent.jsonl" rates --json > "$TMP/rates.json" 2>/dev/null; rc=$?

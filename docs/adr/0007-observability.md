@@ -333,10 +333,21 @@ sets the HUD's options at v0.15.0 (`src/config.ts`, `src/schema.ts`). The choice
   three come from the transcript like the activity lines and carry the same caveat. The account identity
   segments stay off.
 * **Shown since 2026-11-12, the owner's decision: the fleet's output speed.** The first line shows
-  `Fleet <n> tok/s · <m> working`: every
-  measured worker's output tokens per second over the last 10 minutes, summed across runtimes, and how
-  many Claude Code sessions are working, both from `scripts/lanes --rates` (installed as `canon/lanes`).
-  The HUD's own output speed is its session's latest response only. The label reaches the HUD through
+  `Fleet out <n> tok/s · <m> working`: the speed the fleet's requests were written at over the last 10
+  minutes, and how many Claude Code sessions are working, both from `scripts/lanes --rates` (installed as
+  `canon/lanes`). The speed is the report's fleet GEN, the output tokens of every timed request of the
+  measured workers over the total of those requests' durations, one ratio, so a long request weighs as long
+  as it ran. That is how the HUD's own `out:` measures its session's latest response, a response's output
+  tokens over the API time it added (`src/speed.ts` at v0.15.0), so the two read alike; both include the
+  wait for the first token, so neither is a model's streaming speed alone. Until 2026-11-13 the label
+  showed the measured workers' output tokens per second summed, `Fleet <n> tok/s`, which is the fleet's
+  work, not its speed: it grows with the sessions open, not with how fast any of them writes (at 17:31 UTC
+  that day, 636 tok/s summed while 463 timed requests ran at 103 tok/s, each session's between 81 and 120).
+  The sum stays in the report's fleet line and its JSON. Only Claude Code's requests carry a duration: Codex's `response.completed` event has
+  token counts and `ttft_ms` but no duration (`codex-rs/otel/src/events/session_telemetry.rs`,
+  `sse_event_completed`, at the pinned tag), so Codex counts in the work and not in the speed. A report
+  with no timed request in its window, or one from an installed `lanes` older than this summary, shows
+  the working sessions alone, never a zero. The label reaches the HUD through
   its `--extra-cmd`, which runs a command on every render and shows the `label` of its JSON, at most 50
   characters, only with `CLAUDE_HUD_ALLOW_EXTRA_CMD` set (README, "--extra-cmd"; `src/extra-cmd.ts` and
   `collector.mjs` at v0.15.0); `statusline.sh` sets both when `canon/fleet-rate.sh` is installed. The
@@ -348,12 +359,13 @@ sets the HUD's options at v0.15.0 (`src/config.ts`, `src/schema.ts`). The choice
   "Working" is `lanes`' state of that name; a quiet session is not counted.
   Measured 2026-11-12: a render with the label cached, about 0.3 s.
 * **Shown since 2026-11-13, the owner's decision: the session's lines changed.** The same label begins with
-  them, `+156 -23 │ Fleet 368 tok/s · 9 working`: the input's documented `cost.total_lines_added` and
+  them, `+156 -23 │ Fleet out 108 tok/s · 9 working`: the input's documented `cost.total_lines_added` and
   `cost.total_lines_removed` (statusline.md, "Lines of code changed"), which the HUD types but does not show
   at v0.15.0 (`src/types.ts`). `statusline.sh` appends both to the `--extra-cmd` string as arguments, only
   when both are whole numbers, and `fleet-rate.sh` shows them when one is above zero and each has at most
   nine digits, a count of a million or more as the HUD writes token counts (`1.2M`, `src/utils/format.ts`), so
-  the label keeps within the 50 characters the HUD shows (`src/extra-cmd.ts`; nine digits each would reach 53).
+  the label keeps within the 50 characters the HUD shows (`src/extra-cmd.ts`; nine digits each would reach 53);
+  where the lines and the fleet figure together would still pass 50, the fleet figure is shown alone.
   The ` │ ` between the two parts is the HUD's separator, so a narrow line wraps there. The
   owner asked for every documented status-line field the HUD cannot show. The others are on screen already
   or carry nothing here, so they are not duplicated: the open pull request and its review state (Claude
@@ -608,3 +620,10 @@ Read 2026-11-09 (fetched; fetches are model-summarised).
   (the refresh entry): "To keep countdowns ticking while idle, add refreshInterval (seconds) to statusLine in
   settings.json. On Windows Git Bash, short intervals with several sessions can fail with `add_item ...
   failed, errno 1`: use 30 s or more."
+* Read 2026-11-13 for the fleet's speed. Claude HUD at v0.15.0, the installed copy, `src/speed.ts`: "speed is
+  the finished response's output over the API time it added", from `context_window.current_usage.output_tokens`
+  and `cost.total_api_duration_ms`, below 500 ms of API time no reading. Codex at the pinned tag
+  (`scripts/canon src codex-cli`), `codex-rs/otel/src/events/session_telemetry.rs`: `sse_event_completed`
+  logs `codex.sse_event` with `event.kind` `response.completed`, the token counts and `ttft_ms`, and no
+  duration; the `duration_ms` other `codex.sse_event` records carry is the wait for that one stream event
+  (`log_sse_event`), not the response's.

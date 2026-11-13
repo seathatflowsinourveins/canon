@@ -57,6 +57,13 @@
 #                   Claude Code sessions come from the ledger, not from the process table.
 # TOK/S is the output tokens of the requests that finished in the window divided by the window's seconds.
 # GEN is output tokens over the requests' own durations, from the requests that carry one (Claude Code).
+# Neither is a model's speed alone: TOK/S is the work done, and GEN, like Claude HUD's "out:" (a response's
+# output tokens over the API time it added, src/speed.ts at v0.15.0), counts the wait for the first token too.
+# The fleet line (JSON: fleet) sums TOK/S over the measured workers, and takes GEN over all their timed requests
+# as one ratio, the total of those requests' output tokens over the total of their durations, so each request
+# weighs as long as it ran. Codex's response.completed carries tokens and ttft_ms but no duration
+# (codex-rs/otel/src/events/session_telemetry.rs, sse_event_completed, at the pinned tag), so its requests
+# are in TOK/S and not in GEN.
 # Claude Code rows are the ledger's sessions that are working or QUIET, or idle or unknown and heard from
 # within six hours (the abandoned threshold); a session closed without a SessionEnd shows until then.
 # A Codex conversation row means it reported events in the window, not that its process still runs.
@@ -663,7 +670,16 @@ rates_report() {
           {runtime: "deepseek-harness", source: "process table only; no documented token source",
            url: "https://github.com/deepseek-ai/deepseek-harness"}
         ]
-      }' || { rm -rf "$t"; echo "lanes: ERROR: could not build the rates manifest" >&2; return 1; }
+      }
+    | . as $rep
+    | ($rep.workers | map(select(.measured == true) | {key: .id, value: true}) | from_entries) as $listed
+    | ($w | map(select($listed[.sid] == true and .dur != null and .dur > 0))) as $timed
+    | ($timed | map(.dur) | add) as $tdur
+    | $rep + {fleet: {
+        working: ($rep.workers | map(select(.runtime == "claude-code" and .state == "working")) | length),
+        tok_s: ($rep.workers | map(select(.measured == true) | .tok_s | numbers) | add // 0 | r2),
+        gen_tok_s: (if $tdur != null then (($timed | map(.out // 0) | add) / ($tdur / 1000) | r2) else null end),
+        gen_requests: ($timed | length)}}' || { rm -rf "$t"; echo "lanes: ERROR: could not build the rates manifest" >&2; return 1; }
   rm -rf "$t"
 }
 
@@ -687,6 +703,10 @@ print_rates() {
         (if .note == "" then "-" else .note end)
       ] | @tsv'
   } | column -t -s "$(printf '\t')"
+  echo "$r" | jq -r '.fleet // empty
+    | "Fleet: \(.working) Claude Code session(s) working; \(.tok_s) tok/s output over the window"
+      + (if .gen_tok_s != null then ", \(.gen_tok_s) tok/s generating over \(.gen_requests) timed request(s) (Claude Code; Codex reports no duration)"
+         else ", no timed request in the window" end)'
   echo
   echo "Sources:"
   echo "$r" | jq -r '.sources[] | "  " + .runtime + ": " + .source + "  " + .url'
