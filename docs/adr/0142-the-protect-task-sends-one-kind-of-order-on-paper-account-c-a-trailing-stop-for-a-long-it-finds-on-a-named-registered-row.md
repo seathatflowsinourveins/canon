@@ -105,13 +105,13 @@ own-cap refusal above: a holding found in the account has no entry size left to 
 up to the inclusive `sizing.DISTANCE_CEILING` the handbook names (`src/canon_trading/sizing.py:45`;
 `docs/handbook/practices.md:38`). A distance over that ceiling, before or after the price step and
 Alpaca's smallest trail, is refused by name and gets no stop; no fixed fraction is substituted.
-The spread floor and Alpaca's smallest trail still hold (`src/canon_trading/protect.py:387`).
+The spread floor and Alpaca's smallest trail still hold (`src/canon_trading/protect.py:387`, `:424-425`).
 `Mover._entry_trail` takes a default-off `found_holding` parameter for this task alone, covering both
 own-cap branches (`src/canon_trading/mover.py:5506`, `:5541`, `:5610`); the Mover's entry still sizes
 through `size_from_budget`, with its callers unchanged. F2 keeps its existing planning; OWN3 has the
 same own-cap arm as OWN1 and retains its registered ATR multiple. Offline tests reproduce both former
 refusals, the ceiling and price-step boundaries, the plan-only source line, and the entry guards
-(`tests/test_protect.py:574`, `:592`, `:623`); no paper acceptance of this amendment is claimed.
+(`tests/test_protect.py:574`, `:592`, `:623`, `:654`, `:662`, `:681`); no paper acceptance of this amendment is claimed.
 
 ## Evidence
 
