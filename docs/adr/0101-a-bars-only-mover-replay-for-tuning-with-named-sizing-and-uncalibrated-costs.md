@@ -41,6 +41,15 @@ that a ranked key names what was replayed and the replay is not taken for the li
 
 Chosen: **option 2**, proposed, for simulation only.
 
+* **Scope: the fixed trail only.** The replay ranks the fixed trail and the clock re-entry, and nothing
+  else. It refuses by name `size_from_budget` and every `trail_mode` but `fixed`
+  (`tuning_contract.py:53-64`, which also refuses `reentry_arm`, `opening_arm` and the arming rows) and every persistence arm (`tuning_study.py:496-502`). It resets the other
+  trail rows, `trail_cap` (so `own`) and `planned_loss` among them, to fixed values before the run
+  (`tuning_contract.py:26-47`, `tuning_study.py:507`), and the key leaves them out (`ledger.py:811-812`).
+  An arm's rows are suggested with equal bounds, so within an arm only `max_move` and `trail` are searched
+  (`tuning_study.py:298,302`). Ratchet tightening, the ATR and tier distances and the `own` cap are out
+  of scope here; ADR 0133 judges F2, OWN1 and OWN3 with `reentry_replay`.
+
 * **Execution.**
   * Bars of one timestamp are taken together after delivery.
   * Entries settle at a completed bar's close.
@@ -57,7 +66,8 @@ Chosen: **option 2**, proposed, for simulation only.
     references (Evidence), which were spot-checked only: UNVERIFIED.
   * Known calendar bounds close each session against the last known book.
 * **Sizing.** Each entry is the named buying power divided by slots, in whole shares, capped by free cash and
-  by any named share cap. `FixedRiskSizer` is never called, and the live flow-share cap is not applied,
+  by `max_shares` (`tuning_study.py:792-794`). The per-name `share_caps` is not applied, though it stays
+  in the key; no trial sets it. `FixedRiskSizer` is never called, and the live flow-share cap is not applied,
   although `flow_share` stays in the key. This is the coordinator's study rule, not an
   upstream formula.
 * **Costs.** Costs are `zero-fees-bar-close`, with maker and taker rates of zero, marked **UNCALIBRATED**.
@@ -68,12 +78,13 @@ Chosen: **option 2**, proposed, for simulation only.
   held date is opened once, by a replay that succeeds, under the default ledger's `holdouts` folder, which
   the early-entry study shares whatever ledger a study writes. A subset, superset or overlap of dates
   already opened is refused, as is a list whose old marker sits beside it. A registration's held dates
-  must be the plan's own last 30%. An opening given its arms writes a manifest of them, each with its
+  must be the plan's own held dates. An opening given its arms writes a manifest of them, each with its
   registration commit, and may list an arm as "registered, replay pending"; that arm alone may replay on
   those dates, once, at that commit (ADR 0100). The tuning study's opening lists its bars arms as
   replayed and its waiting arms as pending, each at the checkout's HEAD when it opens. The manifest is
   written after the date markers and replaced whole, so the manifest never blocks the next attempt; a
-  date marker written before another failed still marks its date opened. A holdout to which arms are added after its opening is
+  date marker written before another failed still marks its date opened. The held dates are what is left
+  after rounding 70% of the dates down: 18 of 60 (`early_entry_study.py:653-663`). A holdout to which arms are added after its opening is
   this repository's own rule: no finance source found prescribes one (scout, 2026-11-12).
 * **Samples.** A slice's sample ends at its last bar when that comes before the calendar bound, so a run's
   end is booked on a day holding a bar (after-hours in EST ends at 01:00 UTC). A name with no 1-DAY bar
@@ -82,17 +93,24 @@ Chosen: **option 2**, proposed, for simulation only.
 Open, and what would close each:
 * **Quote and emulator parity:** needs quote recordings and a replay of the live `Mover` on them.
 * **Cost and spread calibration:** needs paper fills compared with replays (the nightly loop's fill reading).
-* **Sizing:** the live window's sizing differs, so a promotion is refused until it matches.
-* **Multiple testing beyond DSR:** `arch` ships `SPA` (Hansen) and `StepM` (Romano-Wolf), a later
-  candidate through `adopt-upstream`. Clustering a trial's event outcomes by day, one return a day from
+* **Sizing:** the live window's sizing differs, so a promotion should be refused until it matches. That
+  refusal is not built: nothing consumes `RankedConfiguration.decode`, and the window that would is not
+  built yet (`tuning_contract.py:103-105`).
+* **The holdout shared with ADR 0096.** `tuning_study.open_holdout` (`:166-213`) writes the same per-date
+  markers as `early_entry_study.open_holdout` and does not call `verify_freeze`; on the same 60 sessions
+  its held dates are exactly the 18 in `canon/holdout-adr0096.txt`, which ADR 0092:113 and ADR 0100
+  keep from tuning. Nothing in `src/` calls it yet. The fix belongs to the gate: until it lands, no
+  holdout is opened (the lead, 2026-11-12).
+* **Multiple testing beyond DSR:** `arch`'s `SPA` (Hansen) and `StepM` (Romano-Wolf) are already
+  adopted, beside the gate, by ADR 0104. Clustering a trial's event outcomes by day, one return a day from
   NautilusTrader's daily series for `ranking.rank`, is this repository's own rule; no source found treats
   the day as the cluster unit (scout, 2026-11-12).
 
 Limits recorded at review (2026-11-11):
 * Each trial prepares its listing frames again, and the frames scan the whole history: the cost grows with
   the square of history length and with the trial count.
-* The part bounds are written in more than one place (`session_of`, `bounds`, `BarsReplayMover._window`,
-  `tuning_contract`), so a change to one part's hours must be made in all of them.
+* The part bounds are written in more than one place (`session_of`, `bounds`, `BarsReplayMover._window`;
+  `tuning_contract` holds only the part names), so a change to one part's hours must be made in all of them.
 * After-hours in EST spans a UTC midnight, so one New York session's returns fall on two UTC days of
   NautilusTrader's daily series.
 
@@ -144,8 +162,10 @@ Read 2026-11-11.
 * https://github.com/nautechsystems/nautilus_trader/blob/d53849b216e20f2c122ca01b4dd0da377638b186/python/nautilus_trader/backtest/__init__.pyi
   lines 445-469: `add_venue` takes `fee_model` and
   `bar_execution` (default true). `resolved`, read this session.
-* `src/canon_trading/early_entry_study.py` at this change: `MAX_BASELINE` (line 98), `_listing` (322),
-  `split_dates` (576), `folds` (589) and `open_holdout` (715) are the helpers imported. Read this session.
+* `src/canon_trading/early_entry_study.py`: `MAX_BASELINE`, `_listing`, `split_dates`, `folds` and
+  `open_holdout` are the helpers imported, at lines 100, 337, 591, 604 and 916 when this record landed
+  (`04c5e00f`), 100, 337, 635, 648 and 960 at `bf5742e0`, and 100, 337, 653, 666 and 978 at `efd37edb`; the line numbers first given here were
+  wrong (evidence-verifier, 2026-11-12).
 * Same pin, `crates/common/src/timer.rs` lines 203-214: `PythonTimeEventCallback::call` "Logs and
   suppresses any exception raised by the callback." Read 2026-11-12 in the pinned copy.
 * The `upstream-scout`'s study-practice landscape (2026-11-12, saved by the lead): Optuna's `GridSampler`,
@@ -158,8 +178,17 @@ Read 2026-11-11.
 * No landscape comparison was run for "no adopted upstream supplies a bars-only Mover replay": UNVERIFIED.
 * NautilusTrader v2.0.0rc9 (after this pin) changes `trailing_stop_calculate*` errors and fixes reservations
   after rejected trailing stop-limit orders, and fixes backtest timer cancellation across data gaps and
-  tail flushes, which bears on the replay's timer-driven session closes, per its release notes. Moving
-  the pin re-checks this record.
+  tail flushes, which bears on the replay's timer-driven session closes, per its release notes. It also
+  lists "Fixed backtest liquidation on bar and trade data" (PR #5538; https://github.com/nautechsystems/nautilus_trader/releases/tag/v2.0.0rc9, fetched 2026-11-12); whether that
+  touches the replay's session-close liquidation is UNVERIFIED. Moving the pin re-checks this record.
+* Related records: ADR 0093 (`paper:history`, the bars this replays), ADR 0096 (the holdout it shares) and
+  ADR 0104 (`arch` beside the gate). ADR 0092 and ADR 0096 are both still `proposed`.
+* The evidence-verifier's pass on this record (2026-11-12, at `bf5742e0`): 22 claims held, 3 half, 1
+  failed (the helper line numbers). Its ten corrections were reproduced and are made above: the scope,
+  the shared holdout, the related records, the line numbers, `arch`'s adoption, `share_caps`, the part
+  bounds, the unbuilt promotion refusal, rc9's liquidation fix and the held dates' rounding.
+* The evidence-verifier's pass at `efd37edb` (2026-11-13): every changed claim held; four line cites,
+  right at `bf5742e0`, had moved with #337 and now give `efd37edb`'s lines.
 * The builder's report, `cx-n2-tuning/REPORT.md` (2026-11-11), gives further pinned engine, risk and matching
   line references for settlement and native trailing activation. They were not re-read here: UNVERIFIED in
   this record.
