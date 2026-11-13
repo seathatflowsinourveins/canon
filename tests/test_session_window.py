@@ -3335,7 +3335,9 @@ def test_the_windows_own_alpaca_client_sends_a_request_once(monkeypatch) -> None
     from canon_alpaca.providers import session_of
 
     slept: list[float] = []
-    monkeypatch.setattr(rest.time, "sleep", slept.append)
+    # a private clock for alpaca-py alone, so no other sleep in the process is recorded (the shared
+    # `time` module's `sleep` caught a git subprocess's waits under load)
+    monkeypatch.setattr(rest, "time", SimpleNamespace(sleep=slept.append))
     monkeypatch.setenv("ALPACA_API_KEY", "PKTEST")
     monkeypatch.setenv("ALPACA_SECRET_KEY", "secret")
     trading = session_window.paper_trading()
@@ -3351,14 +3353,27 @@ def test_the_windows_own_alpaca_client_sends_a_request_once(monkeypatch) -> None
     assert answering.sent == 1 and slept == []
 
 
-def test_the_account_check_sends_each_request_once(monkeypatch) -> None:
+def test_the_account_check_sends_each_request_once(monkeypatch, fake_time) -> None:
+    """Record SDK retries and polls without catching the report's Git subprocess waits."""
     from alpaca.common import rest
     from canon_alpaca.providers import session_of
 
     slept: list[float] = []
-    monkeypatch.setattr(rest.time, "sleep", slept.append)
-    monkeypatch.setattr(session_window, "AFTER_STOP_SECS", 0.05)
+    advance = fake_time.sleep
+
+    def record_sleep(seconds: float) -> None:
+        slept.append(seconds)
+        advance(seconds)
+
+    # Both modules use this clock; other users of the shared time module stay independent.
+    monkeypatch.setattr(fake_time, "sleep", record_sleep)
+    monkeypatch.setattr(rest, "time", fake_time)
+    # polls start at 0, 0.01, ... 0.04 on the fake clock; the deadline sits between two of them, away
+    # from a float sum landing on it
+    monkeypatch.setattr(session_window, "AFTER_STOP_SECS", 0.045)
     monkeypatch.setattr(session_window, "POLL_SECS", 0.01)
+    # the report names its commit from the environment, so it starts no git subprocess
+    monkeypatch.setenv(session_window.COMMIT_ENV, "test")
     monkeypatch.setenv("ALPACA_API_KEY", "PKTEST")
     monkeypatch.setenv("ALPACA_SECRET_KEY", "secret")
     trading = session_window.paper_trading()
@@ -3369,8 +3384,9 @@ def test_the_account_check_sends_each_request_once(monkeypatch) -> None:
     report = session_window.WindowReport("regular", "SPY", started="t")
     with pytest.raises(RuntimeError, match="could not be read"):
         session_window._flatten_after_stop(trading, WindowConfig(), report)
-    # alpaca-py's retry would wait `DEFAULT_RETRY_WAIT_SECONDS` (3) between sends; only polls waited
-    assert answering.sent >= 1 and set(slept) == {0.01}
+    # alpaca-py's retry would wait `DEFAULT_RETRY_WAIT_SECONDS` (3); only five polls waited.
+    assert slept == [0.01] * 5
+    assert answering.sent == 6  # One send per poll, then the final read after the deadline.
 
 
 class Delayed:
