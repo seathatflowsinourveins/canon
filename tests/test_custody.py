@@ -271,8 +271,8 @@ def test_a_replaced_order_that_shows_no_fill_count_freezes_the_symbol(shown) -> 
     quantity, why = opened(venue)
     assert quantity is None
     assert why == (
-        "an order of ours in SPY replaces one whose listing shows no fill count, so what it filled "
-        "beyond that one, and with it the quantity ours opened, is not established"
+        "an order in SPY shows no fill count that can be counted, so the quantity ours opened is not "
+        "established"
     )
     report = close(venue)
     assert venue.sent == []
@@ -288,8 +288,8 @@ def test_a_replaced_order_that_shows_a_negative_fill_count_freezes_the_symbol() 
     quantity, why = opened(venue)
     assert quantity is None
     assert why == (
-        "an order of ours in SPY replaces one whose listing shows no fill count, so what it filled "
-        "beyond that one, and with it the quantity ours opened, is not established"
+        "an order in SPY shows no fill count that can be counted, so the quantity ours opened is not "
+        "established"
     )
     report = close(venue)
     assert venue.sent == []
@@ -314,7 +314,7 @@ def test_an_order_of_ours_that_shows_no_fill_count_freezes_the_symbol(shown) -> 
     quantity, why = opened(venue)
     assert quantity is None
     assert why == (
-        "an order of ours in SPY is listed without a fill count, so the quantity ours opened is not "
+        "an order in SPY shows no fill count that can be counted, so the quantity ours opened is not "
         "established"
     )
     report = close(venue)
@@ -336,10 +336,75 @@ def test_an_order_of_ours_with_no_fill_count_still_has_our_open_orders_canceled(
     assert venue.canceled == [resting.client_order_id]
     assert report.frozen["SPY"] == [
         (
-            "an order of ours in SPY is listed without a fill count, so the quantity ours opened is not "
+            "an order in SPY shows no fill count that can be counted, so the quantity ours opened is not "
             "established"
         )
     ]
+
+
+@pytest.mark.parametrize("shown", NO_COUNT, ids=[repr(v) for v in NO_COUNT])
+def test_a_position_that_shows_no_count_freezes_its_symbol_and_the_rest_goes_on(shown) -> None:
+    """A position's quantity is read as a fill count is: what shows no count is not known, and its
+    symbol freezes by name. It does not end the run: our open order in it is still canceled, and the
+    long ours opened in another symbol is still closed."""
+    venue = PositionShows(REGULAR)
+    venue.shown = {"SPY": {"qty": shown}}
+    venue.hold("SPY", 1)
+    venue.hold("AAPL", 1)
+    venue.history[-1] = venue.history[-1].model_copy(
+        update={"client_order_id": OURS[1], "symbol": "AAPL"}
+    )
+    resting = venue.open(
+        client_order_id=OURS[2], symbol="SPY", side="sell", qty="1", type="limit", limit_price="999"
+    )
+    report = close(venue)
+    assert venue.canceled == [resting.client_order_id]
+    why = (
+        "the position in SPY shows no quantity that can be counted, so what is held there is not "
+        "known"
+    )
+    assert report.frozen == {"SPY": [why]}
+    (sent,) = venue.sent
+    assert (sent.symbol, sent.qty) == ("AAPL", 1)
+
+
+def test_a_short_listed_with_its_quantity_below_zero_is_still_a_short_never_bought_back() -> None:
+    """Alpaca lists a short with its quantity below zero: there, and only there, that is a count."""
+    venue = PositionShows(REGULAR)
+    venue.shown = {"SPY": {"qty": "-3", "side": "short"}}
+    venue.hold("SPY", -3, client_order_id=None)
+    report = close(venue)
+    assert venue.sent == []
+    assert report.frozen["SPY"] == ["a short of 3 SPY: never bought back here"]
+
+
+def test_an_order_placed_by_notional_names_no_quantity_and_freezes_nothing() -> None:
+    """Alpaca takes an order for a dollar amount in place of a share quantity, and lists it with no
+    quantity. That is not a quantity that cannot be counted: its fill count is still a count."""
+    venue = ReplacedNotListedOpen(REGULAR)
+    venue.hold("SPY", 2)
+    by_notional = venue.open(
+        client_order_id=str(uuid4()), symbol="SPY", filled_qty="0.5", status="canceled"
+    )
+    venue.history[-1] = by_notional.model_copy(update={"qty": None, "notional": "100"})
+    assert opened(venue) == (Decimal(2), "")
+    report = close(venue)
+    assert report.frozen == {}
+    (sent,) = venue.sent
+    assert (sent.symbol, sent.qty) == ("SPY", 2)
+
+
+def test_an_order_with_neither_a_quantity_nor_a_notional_freezes_the_symbol() -> None:
+    venue = ReplacedNotListedOpen(REGULAR)
+    venue.hold("SPY", 2)
+    neither = venue.open(client_order_id=str(uuid4()), symbol="SPY", status="canceled")
+    venue.history[-1] = neither.model_copy(update={"qty": None, "notional": None})
+    quantity, why = opened(venue)
+    assert quantity is None
+    assert why == (
+        "an order in SPY shows no quantity that can be counted, so the quantity ours opened is not "
+        "established"
+    )
 
 
 @pytest.mark.parametrize("filled", [("18", "20"), ("16", "18", "20"), ("0", "20")])
@@ -468,7 +533,10 @@ def _position(**fields: Any) -> Position:
         "lastday_price": "679.00",
         "change_today": "0.003",
     }
-    return Position.model_validate({**payload, **fields})
+    payload = {**payload, **fields}
+    # Alpaca lists what no order holds beside what is held; a test that wants it absent says so
+    payload.setdefault("qty_available", payload["qty"])
+    return Position.model_validate(payload)
 
 
 class Paper:
@@ -929,6 +997,20 @@ class ReplacedNotListedOpen(Venue):
         if filter is not None and filter.status and filter.status.value == "all":
             return found
         return [order for order in found if _value(order.status) != "replaced"]
+
+
+class PositionShows(Venue):
+    """A venue whose position in one symbol is listed with a quantity of the test's choosing."""
+
+    shown: dict[str, Any]
+
+    def get_all_positions(self):
+        return [
+            position.model_copy(update=self.shown[position.symbol])
+            if position.symbol in self.shown
+            else position
+            for position in super().get_all_positions()
+        ]
 
 
 def close(venue: Venue, data: Any = None):

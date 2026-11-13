@@ -61,9 +61,15 @@ order that replaces another counts only what it filled beyond that one: Alpaca's
 order on", its filled quantity counting the fills before it (ADR 0042, paper, 2026-11-10), so a chain of
 ours is counted once, and the fills of a foreign order in a chain stay foreign whatever replaced it. A
 replacement of ours with fills whose replaced order the listing does not hold (one working since before the
-lookback) carries fills that cannot be told apart, and freezes the symbol; so does one whose replaced
-order is listed without a fill count, and any order of ours listed without one, since what is not shown,
-is no number or is below zero is not zero; one with no fills, as a resting
+lookback) carries fills that cannot be told apart, and freezes the symbol; so does one whose replaced order the
+lookback's listing does hold but shows no count. Every quantity Alpaca lists is read one way (`_shown`): a
+count is a finite number not below zero, and what is absent, empty, no number, not finite or below zero is
+not zero but unknown. An order in the symbol's listing, ours or not, whose fill count or quantity is no
+count leaves the quantity ours opened not established (an order placed by notional names no quantity, and
+that is not a missing one); so does an open order, a position whose held or available quantity is no count
+(a short's are below zero, and count there), and a close of ours last shown without a fill count. Each
+freezes its symbol by name, and none ends the run before our open orders are canceled. A replacement with
+no fills, as a resting
 stop tightened days after it was placed, carries none and counts nothing. A long
 is ours to close only when it is exactly that net. On an account held long-only, ours at the lookback's start
 is not negative, so the net over the lookback is never more than what ours holds now, and a match never takes
@@ -288,17 +294,60 @@ HAND_CLOSE_PREFIX = f"{CHECK_CLOSE_PREFIX}hand-"
 """The client order ID prefix of a close the by-hand form sends: of our lineage (`CHECK_CLOSE_PREFIX`)."""
 
 
-def _shown(field: object) -> Decimal | None:
-    """A quantity as a listing shows it, or None when it shows none, one that is no finite number, or
-    one below zero. alpaca-py's `Order.filled_qty` is an optional string or number with no bound
-    (`alpaca/trading/models.py:283` at the pin), and what is not shown is not zero."""
+def _number(field: object) -> Decimal | None:
+    """What a listing shows as a number, or None when it shows none or one that is not finite."""
     if field in (None, ""):
         return None
     try:
         value = Decimal(str(field))
     except ArithmeticError:
         return None
-    return value if value.is_finite() and value >= 0 else None
+    return value if value.is_finite() else None
+
+
+def _shown(field: object) -> Decimal | None:
+    """The one read of a quantity Alpaca lists: a count as the listing shows it, or None when it shows
+    none, one that is no finite number, or one below zero. alpaca-py's quantities are strings or numbers
+    with no bound (`Order.filled_qty`, `alpaca/trading/models.py:283` at the pin, is optional too), and
+    what is not shown is not zero: whatever rests on a quantity that is no count is not established."""
+    value = _number(field)
+    return value if value is not None and value >= 0 else None
+
+
+def _held(trading: TradingClient) -> tuple[dict[str, Decimal], dict[str, str]]:
+    """Alpaca's signed position in each symbol, and, for each symbol whose position shows a quantity
+    that is no count, why what is held there is not known. Both of a position's quantities are read:
+    what is held (`qty`) and what no order holds (`qty_available`). Alpaca lists a short with `side`
+    short and its quantities below zero, so there, and only there, a number below zero is a count."""
+    held: dict[str, Decimal] = {}
+    unknown: dict[str, str] = {}
+    for position in _read("the positions", trading.get_all_positions, list, Position):
+        symbol = str(position.symbol)
+        short = _value(position.side) == "short"
+        counts = []
+        # read by name: a listing may leave either out altogether
+        for shown in (getattr(position, "qty", None), getattr(position, "qty_available", None)):
+            number = _number(shown)
+            counts.append(None if number is None else _shown(abs(number) if short else number))
+        if None in counts:
+            unknown[symbol] = (
+                f"the position in {symbol} shows no quantity that can be counted, so what is held "
+                "there is not known"
+            )
+            continue
+        count = counts[0]
+        assert count is not None
+        held[symbol] = -count if short else count
+    return held, unknown
+
+
+def _no_count(order: Order) -> str:
+    """ "" when both of an order's quantities are counts (`_shown`), else which is not: its fill count,
+    or its quantity. An order placed by notional names no quantity, and that is not a missing one."""
+    if _shown(order.filled_qty) is None:
+        return "fill count"
+    by_notional = order.qty in (None, "") and (_number(order.notional) or Decimal(0)) > 0
+    return "" if by_notional or _shown(order.qty) is not None else "quantity"
 
 
 def describe(order: Order) -> str:
@@ -350,18 +399,21 @@ def _opened(trading: TradingClient, symbol: str, now: datetime) -> tuple[Decimal
             f"{len(orders)} orders in {symbol} in the last {LINEAGE_LOOKBACK}, the most one listing "
             "returns, so the quantity ours opened is not established"
         )
+    for order in orders:
+        if what := _no_count(order):
+            # ours or not: a row that shows no count says nothing sure about the symbol, and read as
+            # zero a sale of ours would vanish from the net, or a hand's fills be taken for ours
+            return None, (
+                f"an order in {symbol} shows no {what} that can be counted, so the quantity ours "
+                "opened is not established"
+            )
     listed = {str(o.id): o for o in orders}
     opened = Decimal(0)
     for order in orders:
         if lineage(order.client_order_id) != OURS:
             continue
         filled = _shown(order.filled_qty)
-        if filled is None:
-            # read as zero, a sale of ours would vanish from the net and the long read as all ours
-            return None, (
-                f"an order of ours in {symbol} is listed without a fill count, so the quantity ours "
-                "opened is not established"
-            )
+        assert filled is not None  # every row was checked above
         if order.replaces is not None and filled > 0:
             # a replacement carries on the fills of the order it replaces, whoever placed that one:
             # only what it filled beyond them is its own (one with no fills carries none)
@@ -373,13 +425,7 @@ def _opened(trading: TradingClient, symbol: str, now: datetime) -> tuple[Decimal
                     "opened is not established"
                 )
             before = _shown(replaced.filled_qty)
-            if before is None:
-                # read as zero, every fill of the chain would be ours, a hand's among them
-                return None, (
-                    f"an order of ours in {symbol} replaces one whose listing shows no fill count, so "
-                    "what it filled beyond that one, and with it the quantity ours opened, is not "
-                    "established"
-                )
+            assert before is not None
             filled = max(Decimal(0), filled - before)
         opened += filled if _value(order.side) == "buy" else -filled
     return opened, ""
@@ -390,15 +436,17 @@ def read_holdings(trading: TradingClient, now: datetime) -> list[Holding]:
     unmarked order is open in it, when what Alpaca holds is short, or when it is not exactly what our orders
     opened, or when the account is not held long-only, on which the quantity rule rests (module header,
     "Quantity"). A read that fails raises `ReadFailed`."""
-    held = _read("the positions", lambda: session_window.positions(trading), dict)
+    held, unknown = _held(trading)
     orders = open_orders(trading)
     configuration = _read(
         "the account configuration", trading.get_account_configurations, AccountConfiguration
     )
     found = {
         symbol: Holding(symbol, held.get(symbol, Decimal(0)))
-        for symbol in sorted({*held, *(str(o.symbol) for o in orders if o.symbol)})
+        for symbol in sorted({*held, *unknown, *(str(o.symbol) for o in orders if o.symbol)})
     }
+    for symbol, why in unknown.items():
+        found[symbol].frozen.append(why)
     for order in orders:
         if (holding := found.get(order.symbol)) is not None:
             mine = lineage(order.client_order_id) == OURS
@@ -406,6 +454,11 @@ def read_holdings(trading: TradingClient, now: datetime) -> list[Holding]:
     full = len(orders) >= ORDERS_PAGE_LIMIT
     for holding in found.values():
         holding.frozen.extend(f"open {describe(o)}" for o in holding.foreign_open)
+        holding.frozen.extend(
+            f"an open order in {holding.symbol} shows no {what} that can be counted"
+            for o in (*holding.ours_open, *holding.foreign_open)
+            if (what := _no_count(o))
+        )
         if full:
             holding.frozen.append(f"{len(orders)} open orders, the most one listing returns")
         if holding.held < 0:
@@ -723,9 +776,19 @@ class _CloseOnly:
             except session_window.FAILED as e:
                 self.report.errors.append(f"looking up {client_order_id}: {_failure(e)}")
                 continue
-            if order is not None:
-                self.report.closes[client_order_id].append(
-                    f"last shown: {_value(order.status)}, filled {order.filled_qty}"
+            if order is None:
+                continue
+            filled = _shown(order.filled_qty)
+            self.report.closes[client_order_id].append(
+                f"last shown: {_value(order.status)}, filled "
+                f"{'not shown as a count' if filled is None else filled}"
+            )
+            if filled is None:
+                # what it sold is not known, so the symbol is not reported as closed
+                symbol = str(order.symbol)
+                self.report.frozen.setdefault(symbol, []).append(
+                    f"the close sent in {symbol} was last shown with no fill count that can be "
+                    "counted, so what it sold is not known"
                 )
 
 
