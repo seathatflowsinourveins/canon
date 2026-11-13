@@ -85,8 +85,12 @@ the engine version or which profile Orca starts.
 * Bad: a remembered `read-only` pick makes every later worker read-only, and a builder then fails at its first
   write. An owner's `sandbox-policy` row in the profile's patch sets the sandbox the presets are matched against,
   so one set to `danger-full-access` runs as rule 3 describes. A home-level `$DSH_HOME/cordis.patch.yml` would
-  outrank these rows in every profile. None of the three is on this machine, and `scripts/bootstrap --check` reads
-  none of them.
+  outrank these rows in every profile. None of the three is on this machine. Since 2026-11-13 the
+  `dsh-tui worker defaults` row of `scripts/bootstrap --check` names each of them, and a remembered `/model`,
+  `/effort`, `/preset` or `/kernel` pick: a `/kernel` pick other than `dsh` would start every worker on another
+  backend, since Orca passes no `--backend`. It also names `DSH_PERMISSION_MODE`, `DSH_TUI_PRESET` or
+  `DSH_TUI_BACKEND` set in the environment it runs in, each of which outranks the remembered pick. It cannot read
+  Orca's own environment, which the workers take.
 * Bad: the presets table is replaced as a whole. A preset that a later base bundle adds is not offered until this
   block follows it, and the next engine move re-reads the base rows.
 * Bad: `scripts/bootstrap` finds an owner's row for one of the four ids by its whole `id` key, in block or flow
