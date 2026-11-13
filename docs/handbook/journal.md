@@ -56,3 +56,55 @@ ten fields as list lines, in this order, each with a value:
 * status: open
 * supersedes: none
 * source: lead
+
+### L0002: On a wide overnight quote the spread floor, not the ATR, set the default arm's distance
+
+* area: exits
+* session: 2026-11-13
+* result: One paper window in the overnight part, arm OWN1 (ATR, k 1, cap own), from 97011e71: one entry and one sale in CBRS, flat at the end, no error and nothing left. The distance was the spread floor, two quoted spreads of 0.27 taken onto the step as 0.55 a share, over a one-minute ATR of 0.216; the ATR warmed from 14 requested bars and 1 cached bar; the entry met neither the cross-dollar case nor a cold opening. One round trip
+* evidence: window record window-20261113T070811Z, kept outside the repository; the distance rule at src/canon_trading/mover.py:4321-4327 at efd37edb
+* lesson: Where the quote is wide the floor sets the distance and the ATR does not reach it; one round trip shows the path ran and says nothing of merit
+* change: none
+* next: Count, over the next windows, how often the floor binds over the ATR, by part of the session
+* status: open
+* supersedes: none
+* source: lead
+
+### L0003: Two openings can sit under the spread floor on main
+
+* area: exits
+* session: 2026-11-13
+* result: A review of pull request 338 found two P1 findings that the lead read true: where the stop crosses one dollar, the distance rounded down onto the entry's step can fall under two quoted spreads with no refusal; and an opening entry with a cold ATR takes the fixed 0.02 and only records the floor. Whether any of tonight's entries met either case is not counted here: UNVERIFIED
+* evidence: the Antigravity reader's report on pull request 338, kept outside the repository; src/canon_trading/mover.py:3967-3973 and :4245-4258 at efd37edb
+* lesson: A bound stated once is skipped by a rounding made after it and by a fallback branch taken before it; check it at the value that is sent
+* change: none on main; the fix is in the A3+O unit, the cross-dollar case with a failing test first; the cold-opening case's test passed on that unit's tree before any fix
+* next: A new entry closes this one when A3+O is on main
+* status: open
+* supersedes: none
+* source: review
+
+### L0004: A window that enters nothing leaves its path unproven on paper
+
+* area: execution
+* session: 2026-11-13
+* result: Four proof windows tonight ended flat and clean with nothing entered: F-1's first proof, A-2/A-3 and the held stop with 0 orders, and F-2's proof with 21 of 23 slots warm and 0 entries. Of the windows that entered, one did 8 times (distance from the ATR 3 times, the floor once, the cold fallback 4 times), another twice, F-1's second run 3 times on the cold fallback (that source marked UNVERIFIED at the time), and the window of L0002 once
+* evidence: the deputy's log of 2026-11-13, kept outside the repository, which names each window's record
+* lesson: A flat, clean end is not evidence that a path ran; the path's own events have to be counted, and a unit proven by an empty window lands with that gap stated
+* change: those units land with the gap stated in their pull requests (the lead's ruling of 2026-11-13, 01:52)
+* next: A window that reaches each such path on paper, and a new entry for each
+* status: open
+* supersedes: none
+* source: lead
+
+### L0005: Readers after the required review kept finding P1s on the trading path
+
+* area: execution
+* session: 2026-11-13
+* result: Additional readers found P1 findings in many units tonight, among them a custody check whose final read was discarded, reading a false flat, and a raise before our own orders were cancelled; a held stop lost when a native trail resumed; a soft line's recent count and a re-entry's trade-date rollover; and the two of L0003; others were in batch A, the successor, the 09:30 branch and two more readers' units. Each went to its lane as a claim to reproduce; one was reproduced as a state defect the window cannot reach, and was put after 09:30
+* evidence: the readers' reports of 2026-11-13, kept outside the repository, and the deputy's log of that night
+* lesson: A finding is a claim until a failing test shows it; the count of these findings says what was found tonight, not what a second reader is worth
+* change: each finding went to its lane, in its one fix round or a later unit
+* next: A new entry with the count of findings reproduced, fixed and declined once those rounds land
+* status: open
+* supersedes: none
+* source: review
