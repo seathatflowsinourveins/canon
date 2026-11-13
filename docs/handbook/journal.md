@@ -108,3 +108,42 @@ ten fields as list lines, in this order, each with a value:
 * status: open
 * supersedes: none
 * source: review
+
+### L0006: A checker written to a contract before its writer drifted from the writer, and its clock gap was measured, not assumed
+
+* area: execution
+* session: 2026-11-13
+* result: An independent reading of the D3 checker against the Mover's writer as it stands found three things. The checker refused two re-entry refusal reasons the writer writes, and accepted a `reentry_max` row nothing writes. It left a holding sold by the in-session wind-down, which writes no sale row, incomplete. Its A3 offset check compares two fields the writer fills from one value, so it cannot fail. The reading also raised whether A5 can fail a correct window, since a host-clock decision is compared with a venue-clock fill. Over 91 real paper exits, no fill was stamped before its decision; the closest was 49.6 ms after, and the records put the venue's stamps at least about 11 ms behind host receipt. A review of the first fix found that a held stop always records its sale, so an empty sale list there is a lost row, not a holding with no sale
+* evidence: tests/test_d3_check.py; src/canon_trading/d3_check.py; paper window records kept outside the repository, for the clock measurement
+* lesson: A checker built against a prospective record has to be re-read against the writer once the writer lands: field names, reasons and empty lists are the writer's, not the plan's. An exemption is keyed to the one path that writes no row, never to a reason text alone. A check that compares a writer's value with its own copy proves consistency, not correctness. A cross-clock comparison is judged on measured records before it can trigger a revert
+* change: the checker reads the writer's two re-entry reasons and no unwritten row, and counts an in-session wind-down holding with no sale row as having no remake to check; any other empty sale list stays missing evidence. A5's two clocks and A3's self-agreement are recorded limits in the pull request
+* next: If a record ever shows a fill before its decision, A5 gets a tolerance from the record's own clock gap as its own unit; a new entry once the checker has judged real Mover windows on main
+* status: open
+* supersedes: none
+* source: review
+
+### L0007: A sizing quotient formed in floats can land just past a ceiling that the exact value meets
+
+* area: sizing
+* session: 2026-11-13
+* result: In the re-entry replay a trail of exactly one cent, divided by the close in binary floats, came out a hair over the sizing ceiling or a cent under, so whole classes of cases were refused or sized differently from the Mover. A trail fraction over 1.0 also made two stop factors negative, and their product looked like a valid stop above the entry. 26 of 32 new replay cases and both new study cases failed before the change
+* evidence: tests/test_reentry_replay.py; tests/test_early_entry_study.py; src/canon_trading/reentry_replay.py
+* lesson: A study that judges a strategy forms its quantities as the strategy does: in Decimal, in the strategy's own rounding context, from the distance it actually walks. A product of factors that can turn negative is clamped or refused by name, never trusted for its sign
+* change: the replay sizes from the walked dollar distance in Decimal and refuses a trail wider than its entry by name; the study's stop factors are clamped at zero
+* next: none planned; a new entry if a replay result moves when it is re-run on main
+* status: adopted
+* supersedes: none
+* source: review
+
+### L0008: A Decimal test passed alone and failed in the full suite, because `localcontext` copies the thread's sticky flags
+
+* area: exits
+* session: 2026-11-13
+* result: The rebuilt-level unit added two test modules. Its tests passed alone, and in a full run of 6,775 tests one failed: an earlier test had left the `Inexact` flag set on the thread, and the decimal-context case read it through `localcontext()`. Set up that way it failed alone too
+* evidence: tests/test_rebuilt_level.py; src/canon_trading/rebuilt_level.py
+* lesson: A test that reads Decimal flags clears the flags it copies, since a context taken from the thread carries every flag earlier code raised. A unit that adds test modules runs the whole suite once before it lands, because order-dependent failures show only there
+* change: the test clears its copied flags; a full suite run before landing such a unit is the practice
+* next: none
+* status: adopted
+* supersedes: none
+* source: review
