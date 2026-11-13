@@ -70,11 +70,20 @@ trading day", and outside the regular session nothing here protects a holding (A
 **Gaps, and what would close each.** The reads are taken in the regular session on a long-only paper
 account unless a gap says otherwise, then one opt-in paper test runs through the adapter.
 
-* The intent on the order a trigger creates, and a second sell for shares a resting stop holds: read
-  over REST.
+* The intent on the order a trigger creates: read over REST. (A second sell for shares a resting stop
+  holds is read: refused, next line.)
 * The long-only bound lifts on evidence only (the lead, 2026-11-12): on a paper account that allows
   shorting, a trailing stop marked `sell_to_close` for more shares than are held, and a second sell for
-  shares a resting stop holds. If Alpaca refuses both, a venue stop cannot oversell there.
+  shares a resting stop holds. If Alpaca refuses both, a venue stop cannot oversell there. Observed on
+  2026-11-13, account A with shorting allowed for each run, by a one-off probe over REST and not through
+  the adapter, each for a `DAY` stop: a second sell for shares a resting stop holds, refused with 403
+  40310000, marked and unmarked (19:29 UTC, and an earlier run that day); a marked stop for two shares
+  with one held, refused with 403 40310000, as was the unmarked one (19:29 UTC); a marked stop with no
+  share held, refused with 422 42210000, "position intent mismatch" (19:33 UTC). So the condition stated
+  here is met for the `DAY` form on paper (the lead, 2026-11-13). The setting stays off by default and
+  nothing turns it on. Still not shown: the `GTC` form of the oversized case and of the case with no
+  share held; the intent on the market order a triggered stop becomes; an unmarked trailing stop with no
+  share held, which nothing here sends. The runs are in ADR 0111's Confirmation and ADR 0142's Evidence.
 * The venue ID and order type a fill arrives under after the election: a stop with a tight trail left
   to trigger.
 * Submit, read back, a change of quantity with the offset, and cancel, through the adapter. The same
@@ -102,7 +111,8 @@ and without the cache. `packages/canon-alpaca/tests/test_replacement_client_orde
 replacement's ID on the same stand-in, which refuses a named ID an order already carries: its form and
 length, two replaces in one reading of the clock, and a restart's reports under the node's own ID;
 `tests/test_custody.py` reads such an ID as the node's and a hand's replacement as foreign. Run in
-`scripts/ci`. The paper proof's reads are added here when they exist.
+`scripts/ci`. The paper proof's reads are added here when they exist. Read so far, over REST by a
+one-off probe and not through the adapter: the three refusals named under the gaps above (2026-11-13).
 
 ## Evidence
 
