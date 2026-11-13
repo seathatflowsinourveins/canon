@@ -2548,9 +2548,11 @@ class Borrowed:
         self.opening_outcomes: dict = {}
         self.sale_rows: dict = {}
         self.sale_owner: dict = {}
+        self.sold_rows: dict = {}
         self.remakes_under_floor = 0
         self.order_refusals: list = []
         self.entries_sent: list = []
+        self.late_buys: dict = {}
 
     def __getattr__(self, name: str):
         raise RuntimeError(f"Already mutably borrowed: {name}")
@@ -2930,6 +2932,7 @@ class Seam:
         self.exits: list = []
         self.sale_rows: dict = {}
         self.sale_owner: dict = {}
+        self.sold_rows: dict = {}
         self.remakes_under_floor = 0
         self.sell_triggers: dict[str, str] = {}
         self.protection_fallbacks = {"position average price": 0, "current bid": 0}

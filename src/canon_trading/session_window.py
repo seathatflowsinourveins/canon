@@ -888,6 +888,10 @@ class WindowConfig:
                 raise ValueError(f"slots are {MOVER}'s; {self.strategy} has none")
             part_slots(self.session, self.slots)  # refuses what is not a positive whole number
         if self.strategy != MOVER:
+            if self.trail_profile_path is not None:
+                raise ValueError(
+                    f"trail_profile_path is {MOVER}'s trail input; {self.strategy} has none"
+                )
             for name, row in TRAIL_SETTINGS.items():
                 if getattr(self, name) != row["default"]:
                     raise ValueError(f"{name} is {MOVER}'s trail row; {self.strategy} has none")
@@ -5126,12 +5130,17 @@ def _main(args: argparse.Namespace) -> int:
         if args.mover and session == "extended":
             args.strategy = MOVER
         config = window_config(args, session)
-        # an auto schedule's part that runs another strategy runs none of Mover's trail flags or its
-        # trigger; it says so, rather than drop them unseen (AGENTS.md rule 5)
+        # an auto schedule's part that runs another strategy runs none of Mover's trail flags, entry
+        # arms or trigger; it says so, rather than drop them unseen (AGENTS.md rule 5)
         unrun = (
             []
             if args.strategy == MOVER
             else _trail_flags_given(args)
+            + [
+                f"--{name.replace('_', '-')} {getattr(args, name)}"
+                for name in ARM_FLAGS
+                if getattr(args, name) is not None
+            ]
             + ([] if args.trigger == WindowConfig.trigger else [f"--trigger {args.trigger}"])
             + (["--validate-trade-sequence"] if args.validate_trade_sequence else [])
         )

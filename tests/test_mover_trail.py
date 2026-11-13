@@ -673,6 +673,7 @@ def test_turn_still_yields_to_rank_eligibility_and_the_request_budget():
     s.reentry_states[AAA] = mover.ReentryState(
         T0, D("10.45"), D("0.21"), low=D(10), previous=D("10.1"), rises=2
     )
+    slot.run_closed_ns = T0 + MINUTE
     s.rank_ns, s.rank = T0 + MINUTE, [(AAA, D("0.25"))]
     ranked = {AAA: (0, D("0.25"))}
     assert s._refusal(slot, D("10.1"), ranked, 0, T0 + MINUTE) is None
@@ -977,6 +978,7 @@ def test_a_run_seen_before_the_sale_fill_is_refused_by_the_enter_step(monkeypatc
     monkeypatch.setattr(s, "_working", lambda _slot: False)
     monkeypatch.setattr(s, "_held", lambda _slot: D(0))
     slot.run_ns, slot.run_close, slot.run_seen_ns = T0, D("10.50"), T0 + MINUTE - SECOND
+    slot.run_closed_ns = T0 + MINUTE
     s._enter(T0 + MINUTE + SECOND, 0)
     assert any("preceded the sale fill" in why for why in s.dropped)
 
@@ -2210,3 +2212,57 @@ def test_the_clock_arms_flattening_clears_a_run_as_before(monkeypatch):
     assert slot.run_ns is not None
     s._flat(slot, T0 + 10 * MINUTE + SECOND // 5)
     assert (slot.run_ns, slot.run_close, slot.run_seen_ns, slot.run_closed_ns) == (None,) * 4
+
+
+# --- w1-r-a2a3 P2/P3: late and repeated intervals, and missing interval evidence ---
+
+
+def test_delayed_older_intervals_cannot_manufacture_a_turn(monkeypatch):
+    filled = T0 + 10 * MINUTE + SECOND // 2
+    s = strategy(reentry_arm="turn", turn_k=2, turn_d=D(1))
+    slot = mover.Slot(AAA, bar_type(AAA), deque(maxlen=4), deque(maxlen=5))
+    s.slots[AAA] = slot
+    s.sold[AAA] = (filled, D("10.40"))
+    s.sold_fill_ns[AAA] = filled
+    s.reentry_states[AAA] = mover.ReentryState(filled, D("10.40"), D("0.10"))
+    monkeypatch.setattr(s, "_working", lambda _slot: False)
+    monkeypatch.setattr(s, "_held", lambda _slot: D(0))
+    bought = []
+    monkeypatch.setattr(s, "_buy", lambda *args: bought.append(args))
+    received = T0 + 13 * MINUTE + SECOND
+    s.rank_ns, s.rank = received, [(AAA, D("0.25"))]
+    for offset, (minute, close) in enumerate([(12, "10.0000"), (10, "10.1000"), (11, "10.2000")]):
+        s.on_bar(
+            streamed_minute(
+                T0 + minute * MINUTE,
+                received + offset * SECOND // 10,
+                close,
+            )
+        )
+    s._enter(received + SECOND // 2, 0)
+    assert not bought, "older intervals manufactured two rises after the latest low"
+
+
+def test_a_delayed_presale_bar_cannot_erase_a_valid_reclaim(monkeypatch):
+    filled = T0 + 10 * MINUTE + SECOND // 2
+    s, _slot, bought = reclaim_after_a_sale(monkeypatch, filled)
+    received = T0 + 11 * MINUTE + SECOND
+    s.rank_ns, s.rank = received, [(AAA, D("0.25"))]
+    s.on_bar(streamed_minute(T0 + 10 * MINUTE, received, "10.1000"))
+    s.on_bar(streamed_minute(T0 + 9 * MINUTE, received + SECOND // 10, "10.2000"))
+    s._enter(received + SECOND // 2, 0)
+    assert len(bought) == 1, s.dropped
+
+
+@pytest.mark.parametrize("seen", [None, T0 + 11 * MINUTE + SECOND])
+def test_a_reclaim_requires_its_interval_end_even_when_received_after_sale(monkeypatch, seen):
+    filled = T0 + 10 * MINUTE + SECOND // 2
+    s, slot, bought = reclaim_after_a_sale(monkeypatch, filled)
+    now = T0 + 11 * MINUTE + 2 * SECOND
+    s.rank_ns, s.rank = now, [(AAA, D("0.25"))]
+    slot.run_ns = T0 + 9 * MINUTE
+    slot.run_close = D("10.1000")
+    slot.run_seen_ns = seen
+    slot.run_closed_ns = None
+    s._enter(now, 0)
+    assert not bought, "a missing interval end is not evidence of a post-sale close"

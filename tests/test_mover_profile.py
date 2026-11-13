@@ -228,6 +228,7 @@ class ProfileSeam(Seam):
         self.trail_profile = profile_document()
         self.rdc_1 = {}
         self.baseline_dollar_volume_per_minute = {}
+        self.session_vwaps = {}  # the Mover's own map; on_bar reads it for every close
 
     def _profile_tighten(self, slot, now):
         return mover.Mover._profile_tighten(cast(Any, self), slot, now)
@@ -402,6 +403,7 @@ def test_turn_measures_d_in_the_actual_profile_price_distance(monkeypatch):
     s.slots[AAA] = slot
     s.rank, s.rank_ns = [(AAA, D("0.25"))], T0 + 3 * MINUTE
     s.sold[AAA] = (T0 + 2 * MINUTE, D(10))
+    slot.run_closed_ns = T0 + 3 * MINUTE  # the qualifying close's interval ended after the sale
     state = mover.ReentryState(
         T0 + 2 * MINUTE, D(10), slot.exit_record.trail_distance, low=D("9.87"), rises=2
     )
@@ -563,8 +565,8 @@ def test_tier_does_not_open_a_profile_file(monkeypatch, tmp_path):
     assert built == [True] and s.trail_profile is None
 
 
-def test_default_profile_path_is_resolved_like_the_baseline():
-    config = WindowConfig()
+def test_default_profile_path_is_resolved_like_the_baseline(tmp_path):
+    config = WindowConfig(strategy="Mover", mover=True, log_dir=tmp_path)
     assert (
         session_window.mover_trail_profile_path(config)
         == (session_window.SOURCE_ROOT / "catalog/movers-baseline/trail-profile-v1.json").resolve()

@@ -110,6 +110,8 @@ def profile_distance(
     validate_profile_settings(profile_k, profile_pctl, profile_floor, profile_multipliers)
     if type(segment) is not int or not 0 <= segment < movers_rank.SEGMENTS:
         raise ValueError("profile segment must be an index from 0 to 95")
+    if atr is not None and (not atr.is_finite() or atr < 0):
+        raise ValueError("atr must be finite and nonnegative, or None while cold")
     ratio = None if rdc_1 is None else Decimal(str(rdc_1))
     unknown = ratio is None or not ratio.is_finite() or ratio <= 0
     bucket = 0 if unknown else sum(ratio >= edge for edge in RDC_EDGES)
