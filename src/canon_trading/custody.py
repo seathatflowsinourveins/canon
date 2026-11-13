@@ -57,16 +57,29 @@ quantity, type, limit, status and lineage.
 Quantity (`read_holdings`). Alpaca's position carries no client order ID, so the quantity ours opened is read
 from the venue's orders: the net fill (buys add, sells take away) of every order of our lineage in the
 symbol submitted in the last `LINEAGE_LOOKBACK` (`status=all`, so a partly filled open order counts). An
-order that replaces another counts only what it filled beyond that one: Alpaca's replacement "carries the
-order on", its filled quantity counting the fills before it (ADR 0042, paper, 2026-11-10), so a chain of
-ours is counted once, and the fills of a foreign order in a chain stay foreign whatever replaced it. A
-replacement of ours with fills whose replaced order the listing does not hold (one working since before the
-lookback) carries fills that cannot be told apart, and freezes the symbol; so does one whose replaced order the
-lookback's listing does hold but shows no count. Every count this module reads from an order is read one
-way (`_shown`): a count is a finite number not below zero, and what is absent, empty, no number, not finite
-or below zero is not zero but unknown. An order in the symbol's listing, ours or not, whose fill count or
-quantity is no count leaves the quantity ours opened not established; so does an open order, a close of
-ours last shown without a fill count, and counts too large to sum. An order placed by notional names no
+order that replaces another counts only what it filled beyond the earlier fills in its chain: Alpaca's
+replacement "carries the order on", its filled quantity counting the fills before it (ADR 0042, paper,
+2026-11-10, overnight; the regular session is UNVERIFIED), so a chain of ours is counted once, and the fills
+of a foreign order in a chain stay foreign whatever replaced it. Every listed positive-fill replacement,
+whoever owns it, is walked to the start through `Order.replaces` in the listing (alpaca-py at
+`c42add7c0a70`, `trading/models.py:233-241,276-283`, read 2026-11-13). Any missing ancestor, cycle,
+decrease or order replaced by more than one listed
+order freezes the symbol: its quantity is not established, never clamped to zero. A positive count after
+a zero-fill link with earlier fills is not established either: whether it carries those earlier fills
+is UNVERIFIED in that pinned model, so the lead's rule of 2026-11-13 freezes it on buy and sell chains
+alike. Zero-fill links before the chain's first fills and a zero-fill tail, whatever its status, still
+count nothing: a link that shows no fills carries none under either reading. A link with fills straight
+after one with fills is read as carrying them, which is the paper reading above and no other; on a buy
+chain a wrong reading can only freeze, but on a sell chain it would under-count the sales and let the
+close sell shares ours did not open, so a sell chain with fills on two orders running, either of them
+ours, freezes its symbol (the lead, 2026-11-13) until a regular-session paper read shows the count.
+Every count this module reads from an order is read one way (`_shown`): a count is a finite number not
+below zero, and what is absent, empty, no number, not finite
+or below zero is not zero but unknown. An order of ours whose side is not buy or sell leaves its net
+unknown too (`Order.side` is optional, `trading/models.py:251,291` at the pin, read 2026-11-13).
+An order in the symbol's listing, ours or not, whose fill count or quantity is no count leaves the
+quantity ours opened not established; so does an open order, a close of ours last shown without a fill
+count, and counts too large to sum. An order placed by notional names no
 quantity, which Alpaca lists as null beside a notional above zero, and that alone is not a missing one. A
 position's quantity is signed at Alpaca, so its rule is its own (`_held`): it must be a finite number; one
 below zero is a short, as is any position labelled short whatever it shows; what is no finite number is not
@@ -82,6 +95,11 @@ a foreign share; a lookback too short to hold our entry gives a mismatch, which 
 closing it. So the form reads Alpaca's `no_shorting` with the account, and on an account that is not held
 long-only it freezes every position. A listing that returns its maximum (`ORDERS_PAGE_LIMIT`) may not hold
 every order, so it freezes the symbol too. A short is frozen: the form never buys.
+
+An open order with no symbol is kept under `(no symbol)`, ours still canceled and any other left alone.
+Since its effect cannot be attributed, every listed symbol is frozen for that run, including a position
+first listed after the cancel. `Order.symbol` can be absent on a top-level multi-leg order
+(`trading/models.py:235-236,279,312-324` at the pin, read 2026-11-13); this form does not infer its legs.
 
 The close-only form (`close_ours`; `mise run paper:close <tests|windows>` by hand, under the account's lock).
 It reads Alpaca's clock for the part of the session (`session_window.session_part`), and the account. It
@@ -197,7 +215,7 @@ def order_line(order: Order) -> str:
     qty = _quantity_named(order)
     kind = _value(order.type if order.type is not None else order.order_type)
     return (
-        f"{order.symbol} {_value(order.side)} {qty} {kind} limit {_value(order.limit_price)} "
+        f"{order.symbol or NO_SYMBOL} {_value(order.side)} {qty} {kind} limit {_value(order.limit_price)} "
         f"status {_value(order.status)} {lineage(order.client_order_id)}"
     )
 
@@ -336,6 +354,8 @@ class _Unread(str):
 NO_COUNT = "a quantity that is no count"
 NO_NUMBER = "a quantity that is no number"
 """What a line of a report says in place of a quantity that cannot be read (`_shown`, `_number`)."""
+NO_SYMBOL = "(no symbol)"
+"""Open orders whose symbol cannot be read stay in this bucket, so ours are still canceled."""
 
 
 @dataclass(frozen=True)
@@ -422,7 +442,7 @@ def describe(order: Order) -> str:
     """An order by name for a report: ours by its client order ID, a foreign one by what it is (never its
     ID, which may be the owner's)."""
     qty = _quantity_named(order)
-    what = f"{_value(order.side)} {qty} {order.symbol} {_value(order.type or order.order_type)}"
+    what = f"{_value(order.side)} {qty} {order.symbol or NO_SYMBOL} {_value(order.type or order.order_type)}"
     if lineage(order.client_order_id) == OURS:
         return f"{order.client_order_id} ({what}, {_value(order.status)})"
     return f"a {lineage(order.client_order_id)} order: {what}, {_value(order.status)}"
@@ -460,6 +480,10 @@ def _not_counted(symbol: str, what: str) -> str:
     )
 
 
+def _unattributed(symbol: str) -> str:
+    return _Unread(f"an open order has no symbol, so its effect on {symbol} is not established")
+
+
 def _opened(trading: TradingClient, symbol: str, now: datetime) -> tuple[Decimal | None, str]:
     """Our orders' net fill in `symbol` over `LINEAGE_LOOKBACK`, from the venue's orders (`status=all`),
     or None and why when the listing is full, so it may not hold them all."""
@@ -494,28 +518,86 @@ def _opened(trading: TradingClient, symbol: str, now: datetime) -> tuple[Decimal
 def _net_of_ours(symbol: str, orders: list[Order]) -> tuple[Decimal | None, str]:
     """`_opened`'s sum over a listing whose every row shows counts (`_no_count`)."""
     listed = {str(o.id): o for o in orders}
-    opened = Decimal(0)
+    successors: dict[str, str] = {}
     for order in orders:
-        if lineage(order.client_order_id) != OURS:
-            continue
+        if order.replaces is not None:
+            previous_id = str(order.replaces)
+            successor = successors.get(previous_id)
+            if successor is not None and successor != str(order.id):
+                return None, _Unread(
+                    f"an order in {symbol} is replaced by more than one listed order, so the "
+                    "quantity ours opened is not established"
+                )
+            successors[previous_id] = str(order.id)
+    opened = Decimal(0)
+    sells_running = False
+    for order in orders:
+        mine = lineage(order.client_order_id) == OURS
+        side = _value(order.side)
+        if mine and side not in ("buy", "sell"):
+            return None, _Unread(
+                f"an order of ours in {symbol} shows no side that can be read as buy or sell, so "
+                "the quantity ours opened is not established"
+            )
         filled = _shown(order.filled_qty)
         if filled is None:
             return None, _not_counted(symbol, "fill count")
         if order.replaces is not None and filled > 0:
-            # a replacement carries on the fills of the order it replaces, whoever placed that one:
-            # only what it filled beyond them is its own (one with no fills carries none)
-            replaced = listed.get(str(order.replaces))
-            if replaced is None:
-                return None, (
-                    f"an order of ours in {symbol} replaces one the listing of the last "
-                    f"{LINEAGE_LOOKBACK} does not hold, whose fills it carries, so the quantity ours "
-                    "opened is not established"
+            # Validate foreign tails too, before attributing only our orders' deltas. What a positive
+            # count after a zero-fill link carries is UNVERIFIED in the pinned Order model: an earlier
+            # positive count makes that chain unknown, never a count to bridge over the zero.
+            link = order
+            seen = {str(order.id)}
+            before = Decimal(0)
+            later = filled
+            decreased = False
+            running = False
+            while link.replaces is not None:
+                previous_id = str(link.replaces)
+                if previous_id in seen:
+                    return None, _Unread(
+                        f"a replacement chain in {symbol} has a cycle, so the quantity ours "
+                        "opened is not established"
+                    )
+                seen.add(previous_id)
+                replaced = listed.get(previous_id)
+                if replaced is None:
+                    owner = " of ours" if mine else ""
+                    return None, _Unread(
+                        f"an order{owner} in {symbol} replaces one the listing of the last "
+                        f"{LINEAGE_LOOKBACK} does not hold, whose fills it carries, so the quantity "
+                        "ours opened is not established"
+                    )
+                earlier = _shown(replaced.filled_qty)
+                if earlier is None:
+                    return None, _not_counted(symbol, "fill count")
+                decreased |= later < earlier
+                if link is order and earlier > 0 and side == "sell":
+                    # fills on two orders running in a sell chain, either of them ours
+                    running = mine or lineage(replaced.client_order_id) == OURS
+                if before == 0:
+                    before = earlier
+                later = earlier  # zero is checked too; it cannot hide an earlier positive count
+                link = replaced
+            if decreased:
+                return None, _Unread(
+                    f"a replacement in {symbol} shows fewer fills than an earlier order "
+                    "in its chain, so the quantity ours opened is not established"
                 )
-            before = _shown(replaced.filled_qty)
-            if before is None:
-                return None, _not_counted(symbol, "fill count")
-            filled = max(Decimal(0), filled - before)
-        opened += filled if _value(order.side) == "buy" else -filled
+            sells_running |= running
+            filled -= before
+        if mine:
+            opened += filled if side == "buy" else -filled
+    if sells_running:
+        # The lead's rule of 2026-11-13, after every other chain's reason so the listing's order does
+        # not choose the text. Carried, the sales are the difference; counted alone, they are the
+        # sum, and the close would sell shares ours did not open.
+        return None, _Unread(
+            f"a sell chain of ours in {symbol} shows fills on two orders running, and whether a "
+            "replacement's count carries the earlier fills is one overnight paper observation "
+            "(ADR 0042) that Alpaca's page does not state, so the quantity ours opened is not "
+            "established; a regular-session paper read of such a chain lifts this"
+        )
     return opened, ""
 
 
@@ -523,7 +605,11 @@ def read_holdings(trading: TradingClient, now: datetime) -> list[Holding]:
     """Each symbol with a position or an open order, with its custody: a symbol is frozen when a foreign or
     unmarked order is open in it, when what Alpaca holds is short, or when it is not exactly what our orders
     opened, or when the account is not held long-only, on which the quantity rule rests, or when a
-    position, an open order or an order in the symbol's listing shows a quantity that cannot be read
+    position, an open order or an order in the symbol's listing shows a quantity that cannot be read,
+    or when a replacement chain in its listing cannot be established (a missing ancestor, a cycle, a
+    decrease, a fork, a count after a zero-fill link with earlier fills, fills on two orders running in
+    a sell chain of ours, an order of ours with no side),
+    and every symbol is frozen while an open order names no symbol
     (module header, "Quantity"). A position whose quantity is not known has `held` None, with why in
     `frozen`, and nothing is sent for it. A read that fails raises `ReadFailed`."""
     listed = _held(trading)
@@ -533,17 +619,20 @@ def read_holdings(trading: TradingClient, now: datetime) -> list[Holding]:
     )
     found = {
         symbol: Holding(symbol, listed[symbol].held if symbol in listed else Decimal(0))
-        for symbol in sorted({*listed, *(str(o.symbol) for o in orders if o.symbol)})
+        for symbol in sorted({*listed, *(str(o.symbol or NO_SYMBOL) for o in orders)})
     }
     for symbol, position in listed.items():
         if position.unknown:
             found[symbol].frozen.append(position.unknown)
     for order in orders:
-        if (holding := found.get(order.symbol)) is not None:
-            mine = lineage(order.client_order_id) == OURS
-            (holding.ours_open if mine else holding.foreign_open).append(order)
+        holding = found[str(order.symbol or NO_SYMBOL)]
+        mine = lineage(order.client_order_id) == OURS
+        (holding.ours_open if mine else holding.foreign_open).append(order)
+    unattributed = any(not order.symbol for order in orders)
     full = len(orders) >= ORDERS_PAGE_LIMIT
     for holding in found.values():
+        if unattributed:
+            holding.frozen.append(_unattributed(holding.symbol))
         holding.frozen.extend(f"open {describe(o)}" for o in holding.foreign_open)
         holding.frozen.extend(
             _Unread(f"an open order in {holding.symbol} shows no {what} that can be counted")
@@ -650,13 +739,16 @@ def _part(trading: TradingClient) -> tuple[str, str]:
 
 
 def _look_up(trading: TradingClient, client_order_id: str) -> Order | None:
+    """An Order from alpaca-py's `get_order_by_client_id` (`trading/client.py:157-174` at the pin),
+    None for HTTP 404, or a named failure when the answer is not the documented model."""
     try:
         order = trading.get_order_by_client_id(client_order_id)
     except APIError as e:
         if e.status_code == 404:
             return None
         raise
-    assert isinstance(order, Order)
+    if not isinstance(order, Order):
+        raise ReadFailed(f"the order lookup answered a {type(order).__name__}, not an Order")
     return order
 
 
@@ -702,10 +794,11 @@ class _CloseOnly:
                 # a symbol frozen only at this read (a position that cannot be counted now) is named,
                 # beside what `_run` and `_work` recorded: a frozen position is in no `ours_left`
                 known = report.frozen.setdefault(h.symbol, []) if h.frozen else []
+                named_before = bool(known)
                 known.extend(
                     f"at the end: {why}"
                     for why in h.frozen
-                    if why not in known and why not in carried
+                    if why not in known and (why not in carried or not named_before)
                 )
                 if h.frozen and h.symbol in self.closing and (h.held is None or h.held > 0):
                     # ours when the run began, and not shown closed: never reported as nothing left
@@ -771,7 +864,11 @@ class _CloseOnly:
         is listed now."""
         added: set[str] = set()
         for h in holdings:
-            for why in self.unread.get(h.symbol, ()):
+            reasons = self.unread.get(h.symbol, ())
+            if NO_SYMBOL in self.unread and not reasons:
+                # A position first listed after canceling an unattributed order is no exception.
+                reasons = [_unattributed(h.symbol)]
+            for why in reasons:
                 if why not in h.frozen:  # still unreadable now: named as it is, once
                     h.frozen.append(f"at the first read: {why}")
                     added.add(h.frozen[-1])
@@ -833,7 +930,7 @@ class _CloseOnly:
                 try:
                     if _ended(_look_up(self.trading, client_order_id)):
                         waiting.remove(client_order_id)
-                except session_window.FAILED as e:
+                except (ReadFailed, *session_window.FAILED) as e:
                     self.report.errors.append(f"looking up {client_order_id}: {_failure(e)}")
         for client_order_id in waiting:
             self.report.errors.append(
@@ -915,7 +1012,7 @@ class _CloseOnly:
             for client_order_id in list(waiting):
                 try:
                     order = _look_up(self.trading, client_order_id)
-                except session_window.FAILED as e:
+                except (ReadFailed, *session_window.FAILED) as e:
                     self.report.errors.append(f"looking up {client_order_id}: {_failure(e)}")
                     continue
                 if order is not None:
@@ -936,7 +1033,7 @@ class _CloseOnly:
                     self.trading.cancel_order_by_id(order.id)
                 self.done.add(client_order_id)
                 log.append(f"canceled after {CLOSE_WAIT_SECS:.0f} s")
-            except session_window.FAILED as e:
+            except (ReadFailed, *session_window.FAILED) as e:
                 if isinstance(e, APIError) and e.status_code == 422:
                     # Alpaca refuses a cancel of an order that has ended: it ended after the last poll
                     log.append("cancel refused (HTTP 422): it had ended; last shown below")
@@ -946,7 +1043,7 @@ class _CloseOnly:
         for client_order_id in sent:
             try:
                 order = _look_up(self.trading, client_order_id)
-            except session_window.FAILED as e:
+            except (ReadFailed, *session_window.FAILED) as e:
                 self.report.errors.append(f"looking up {client_order_id}: {_failure(e)}")
                 continue
             if order is None:

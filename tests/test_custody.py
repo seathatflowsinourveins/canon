@@ -218,12 +218,63 @@ def test_a_hands_replacement_in_the_middle_of_a_chain_takes_its_own_fills_out_of
     assert opened(venue) == (Decimal(18), "")
 
 
-def test_a_chain_of_our_sells_takes_its_fills_away_once() -> None:
+def test_a_chain_of_our_sells_with_fills_on_both_orders_is_not_counted() -> None:
+    """Turned on the lead's ruling of 2026-11-13: this case read the chain's 8 as carrying the 5 and
+    counted 12 of ours. Whether it carries them is not established, so nothing is counted."""
     venue = Venue(REGULAR)
-    venue.hold("SPY", 12)  # 20 bought by ours in the lookback, 8 of them sold by the chain
+    venue.hold("SPY", 12)  # 20 bought by ours in the lookback, 8 or 13 of them sold by the chain
     venue.history[-1] = venue.history[-1].model_copy(update={"qty": "20", "filled_qty": "20"})
     chain(venue, "5", "8", side="sell", first="O-20261111-145500-001-001-2")
-    assert opened(venue) == (Decimal(12), "")
+    quantity, why = opened(venue)
+    assert quantity is None and "two orders running" in why
+
+
+def test_a_replacement_showing_fewer_fills_than_the_order_it_replaces_freezes_the_symbol() -> None:
+    """Antigravity #345 F3: a positive per-leg count must not be clamped into a zero sale."""
+    venue = Venue(REGULAR)
+    venue.hold("SPY", 5, client_order_id=None)
+    venue.hold("SPY", 20)
+    venue.held["SPY"] = Decimal(10)  # 5 ours after selling 15, beside 5 foreign shares
+    chain(venue, "10", "5", side="sell", first="O-20261111-145500-001-001-2")
+
+    report = close(venue)
+    assert venue.sent == []
+    assert "SPY" in report.frozen
+    quantity, why = opened(venue)
+    assert quantity is None
+    assert "SPY" in why and "fewer fills" in why
+    assert isinstance(why, custody._Unread)
+
+
+@pytest.mark.parametrize("side", [None, "", "hold"])
+@pytest.mark.parametrize("filled", ["0", "5"])
+def test_an_order_of_ours_without_a_side_freezes_the_symbol_instead_of_counting_as_a_sell(
+    side: str | None, filled: str
+) -> None:
+    """Antigravity #345 F5; non-enum sides are defensive model-copy cases, not valid payloads."""
+    venue = Venue(REGULAR)
+    venue.hold("SPY", 20, client_order_id=NODE_BUY)
+    second = venue.open(
+        client_order_id="O-20261111-145200-001-001-2",
+        symbol="SPY",
+        side=None,
+        qty="5",
+        filled_qty=filled,
+        status="filled",
+        submitted_at=venue.now.isoformat(),
+    )
+    assert second.side is None
+    if side is not None:
+        venue.history[-1] = second.model_copy(update={"side": side})
+    venue.held["SPY"] = Decimal(20) - Decimal(filled)
+
+    quantity, why = opened(venue)
+    assert quantity is None
+    assert "SPY" in why and "side" in why
+    assert isinstance(why, custody._Unread)
+    report = close(venue)
+    assert venue.sent == []
+    assert "SPY" in report.frozen
 
 
 def test_an_order_of_our_form_that_replaces_a_foreign_one_counts_only_its_own_fills() -> None:
@@ -255,6 +306,236 @@ def test_a_replacement_whose_replaced_order_is_not_listed_freezes_the_symbol() -
     report = close(venue)
     assert venue.sent == []
     assert report.frozen["SPY"] == [why]
+
+
+def test_a_replace_chain_with_a_zero_fill_middle_link_walks_all_ancestors_before_closing() -> None:
+    """Antigravity #345 F4: the zero middle link cannot hide fills outside the lookback."""
+    venue = Venue(REGULAR)
+    venue.hold("SPY", 20, client_order_id=None)
+    chain(venue, "18", "0", "20", first_age=custody.LINEAGE_LOOKBACK + timedelta(hours=1))
+
+    report = close(venue)
+    assert venue.sent == []
+    assert "SPY" in report.frozen
+    quantity, why = opened(venue)
+    assert quantity is None
+    assert "SPY" in why and "listing" in why
+    assert isinstance(why, custody._Unread)
+
+
+def test_a_zero_fill_middle_link_does_not_count_earlier_fills_twice_and_sell_foreign_shares() -> (
+    None
+):
+    venue = Venue(REGULAR)
+    venue.hold("SPY", 14, client_order_id=None)  # the chain does not establish whose these are
+    chain(venue, "4", "0", "10")
+
+    report = close(venue)
+    assert venue.sent == []
+    assert "SPY" in report.frozen
+    quantity, why = opened(venue)
+    assert quantity is None
+    assert "SPY" in why and "not established" in why
+    assert isinstance(why, custody._Unread)
+    assert venue.held["SPY"] == 14
+
+
+@pytest.mark.parametrize("side", ["buy", "sell"])
+@pytest.mark.parametrize("reverse", [False, True], ids=["oldest-first", "newest-first"])
+@pytest.mark.parametrize(
+    ("filled", "by_hand", "held"),
+    [
+        (("4", "0", "10"), (), 10),
+        (("4", "6", "0", "10"), (1,), 8),
+        (("4", "0", "10"), (2,), 4),
+    ],
+    ids=["all-ours", "foreign-middle", "foreign-tail"],
+)
+def test_zero_fill_middle_links_after_earlier_fills_freeze_the_symbol(
+    side: str, reverse: bool, filled: tuple[str, ...], by_hand: tuple[int, ...], held: int
+) -> None:
+    """L8 R1: the earlier build's numeric result cannot establish the holding's owner."""
+    venue = ReplacedNotListedOpen(REGULAR)
+    if side == "sell":
+        venue.hold("SPY", 20)
+        held = 20 - held
+    chain(venue, *filled, side=side, by_hand=by_hand, first="O-20261111-145500-001-001-2")
+    venue.held["SPY"] = Decimal(held)
+    if reverse:
+        venue.history.reverse()
+
+    quantity, why = opened(venue)
+    assert quantity is None
+    assert "SPY" in why and "not established" in why
+    assert isinstance(why, custody._Unread)
+    report = close(venue)
+    assert not report.failed and not report.errors
+    assert venue.sent == [] and venue.held["SPY"] == held
+    assert "SPY" in report.frozen
+
+
+@pytest.mark.parametrize("side", ["buy", "sell"])
+@pytest.mark.parametrize("reverse", [False, True], ids=["oldest-first", "newest-first"])
+def test_a_foreign_tail_with_decreased_fills_freezes_before_closing_ours(
+    side: str, reverse: bool
+) -> None:
+    """L8 R2: a hand's smaller tail count must be checked even without our later replacement."""
+    venue = ReplacedNotListedOpen(REGULAR)
+    held = 12
+    if side == "sell":
+        venue.hold("SPY", 30)
+        held = 18
+    chain(venue, "10", "12", "5", side=side, by_hand=(2,))
+    venue.held["SPY"] = Decimal(held)
+    if reverse:
+        venue.history.reverse()
+    resting = venue.open(client_order_id=OURS[1], symbol="SPY", side="sell", limit_price="999")
+    foreign = venue.open(client_order_id=FOREIGN[0], symbol="AAPL", side="buy")
+
+    quantity, why = opened(venue)
+    assert quantity is None
+    assert "SPY" in why and "fewer fills" in why
+    assert isinstance(why, custody._Unread)
+    report = close(venue)
+    assert not report.failed and not report.errors
+    assert venue.canceled == [resting.client_order_id]
+    assert foreign.client_order_id not in venue.canceled
+    assert venue.sent == [] and venue.held["SPY"] == held
+    assert "SPY" in report.frozen
+
+
+@pytest.mark.parametrize("side", ["buy", "sell"])
+@pytest.mark.parametrize("reverse", [False, True], ids=["oldest-first", "newest-first"])
+@pytest.mark.parametrize("owners", ["ours", "mixed", "foreign"])
+@pytest.mark.parametrize("filled", [("4", "10"), ("0", "0")], ids=["filled", "unfilled"])
+def test_more_than_one_listed_replacement_freezes_whatever_their_owners(
+    side: str, reverse: bool, owners: str, filled: tuple[str, str]
+) -> None:
+    """L8 R3: two successors of the same listed order cannot each claim the same delta."""
+    venue = ReplacedNotListedOpen(REGULAR)
+    venue.hold("SPY", 20)
+    chain(venue, *filled, side=side, by_hand=(1,) if owners == "foreign" else ())
+    fork = venue.history[-1].model_copy(
+        update={
+            "id": uuid4(),
+            "client_order_id": replacement_client_order_id(NODE_BUY, STAMP + 9)
+            if owners == "ours"
+            else FOREIGN[0],
+        }
+    )
+    venue.history.append(fork)
+    if reverse:
+        venue.history.reverse()
+    resting = venue.open(client_order_id=OURS[1], symbol="SPY", side="sell", limit_price="999")
+    foreign = venue.open(client_order_id=FOREIGN[1], symbol="AAPL", side="buy")
+
+    quantity, why = opened(venue)
+    assert quantity is None
+    assert "SPY" in why and "more than one" in why
+    assert isinstance(why, custody._Unread)
+    report = close(venue)
+    assert not report.failed and not report.errors
+    assert venue.canceled == [resting.client_order_id]
+    assert foreign.client_order_id not in venue.canceled
+    assert venue.sent == [] and venue.held["SPY"] == 20
+    assert "SPY" in report.frozen
+
+
+@pytest.mark.parametrize("side", ["buy", "sell"])
+@pytest.mark.parametrize("reverse", [False, True], ids=["oldest-first", "newest-first"])
+@pytest.mark.parametrize("by_hand", [(), (1,)], ids=["all-ours", "foreign-middle"])
+@pytest.mark.parametrize(
+    ("filled", "last"),
+    [(("0", "0", "10"), "filled"), (("4", "10", "0"), "rejected")],
+    ids=["zeros-before-first-fill", "rejected-zero-tail"],
+)
+def test_zero_links_before_the_first_fill_and_a_rejected_zero_tail_keep_their_counts(
+    side: str, reverse: bool, by_hand: tuple[int, ...], filled: tuple[str, ...], last: str
+) -> None:
+    """R1's exceptions: an unfilled stop tightened before filling, and a rejected last link."""
+    venue = ReplacedNotListedOpen(REGULAR)
+    ours = 4 if by_hand and last == "rejected" else 10
+    held = ours
+    if side == "sell":
+        venue.hold("SPY", 20)
+        held = 20 - ours
+    chain(venue, *filled, side=side, by_hand=by_hand, last=last)
+    venue.held["SPY"] = Decimal(held)
+    if reverse:
+        venue.history.reverse()
+
+    if side == "sell" and last == "rejected":
+        # Turned on the lead's ruling of 2026-11-13: 4 then 10 are fills on two sells running,
+        # so the zero tail no longer has a count to keep.
+        quantity, why = opened(venue)
+        assert quantity is None and "two orders running" in why
+        return
+    assert opened(venue) == (Decimal(held), "")
+    report = close(venue)
+    assert not report.failed and not report.errors
+    assert report.frozen == {} and report.flat
+    assert [(request.symbol, request.qty) for request in venue.sent] == [("SPY", held)]
+
+
+@pytest.mark.parametrize("cycle", ["self", "whole-chain", "through-zero"])
+def test_a_replace_chain_cycle_freezes_the_symbol(cycle: str) -> None:
+    venue = ReplacedNotListedOpen(REGULAR)
+    chain(venue, "0" if cycle == "through-zero" else "4", "4", "4")
+    at = -1 if cycle == "self" else 0
+    venue.history[at] = venue.history[at].model_copy(update={"replaces": venue.history[-1].id})
+    venue.held["SPY"] = Decimal(4)
+
+    quantity, why = opened(venue)
+    assert quantity is None
+    assert "SPY" in why and "cycle" in why
+    assert isinstance(why, custody._Unread)
+    report = close(venue)
+    assert venue.sent == []
+    assert "SPY" in report.frozen
+
+
+@pytest.mark.parametrize("zero_middle", [False, True])
+def test_a_decrease_in_foreign_ancestors_leaves_our_replacements_fills_unknown(
+    zero_middle: bool,
+) -> None:
+    venue = ReplacedNotListedOpen(REGULAR)
+    if zero_middle:
+        chain(venue, "10", "0", "5", "20", by_hand=(1, 2))
+    else:
+        chain(venue, "10", "5", "20", by_hand=(1,))
+    venue.held["SPY"] = Decimal(25)
+
+    quantity, why = opened(venue)
+    assert quantity is None
+    assert "SPY" in why and "fewer fills" in why
+    report = close(venue)
+    assert venue.sent == []
+    assert "SPY" in report.frozen
+
+
+def test_a_missing_ancestor_at_the_first_read_stays_frozen_after_cancel(monkeypatch) -> None:
+    venue = ReplacedNotListedOpen(REGULAR)
+    chain(venue, "4", "0", "10")
+    venue.held["SPY"] = Decimal(10)
+    root_id = venue.history[0].id
+    resting = venue.open(client_order_id=OURS[1], symbol="SPY", side="sell", qty="1")
+    get_orders = venue.get_orders
+    history_reads = 0
+
+    def first_root_missing(filter=None):
+        nonlocal history_reads
+        found = get_orders(filter)
+        if filter is not None and filter.status.value == "all":
+            history_reads += 1
+            if history_reads == 1:
+                return [order for order in found if order.id != root_id]
+        return found
+
+    monkeypatch.setattr(venue, "get_orders", first_root_missing)
+    report = close(venue)
+    assert venue.canceled == [resting.client_order_id]
+    assert venue.sent == []
+    assert any("at the first read" in why for why in report.frozen["SPY"])
 
 
 @pytest.mark.parametrize("shown", [None, "", "many"], ids=["absent", "empty", "no number"])
@@ -905,6 +1186,86 @@ def test_a_listing_with_something_other_than_orders_is_a_named_read_failure(
     )
 
 
+@pytest.mark.parametrize("answer", [None, {"client_order_id": "foreign-id-not-to-print"}, []])
+def test_a_lookup_with_something_other_than_an_order_is_a_named_read_failure(
+    monkeypatch, answer: object
+) -> None:
+    venue = Venue(REGULAR)
+    monkeypatch.setattr(venue, "get_order_by_client_id", lambda client_id: answer)
+    with pytest.raises(custody.ReadFailed, match="the order lookup answered") as failed:
+        custody._look_up(cast(Any, venue), OURS[0])
+    assert "not an Order" in str(failed.value)
+    assert "foreign-id-not-to-print" not in str(failed.value)
+
+
+@pytest.mark.parametrize("phase", ["cancel", "close", "last-shown"])
+def test_a_malformed_lookup_is_named_and_the_remaining_polls_continue(
+    monkeypatch, phase: str
+) -> None:
+    venue = Venue(REGULAR)
+    venue.hold("SPY", 1)
+    resting = (
+        venue.open(client_order_id=OURS[1], symbol="SPY", side="sell")
+        if phase == "cancel"
+        else None
+    )
+    lookup = venue.get_order_by_client_id
+    seen: dict[str, int] = {}
+
+    def malformed_once(client_id):
+        seen[client_id] = seen.get(client_id, 0) + 1
+        target = (
+            client_id == resting.client_order_id
+            if resting
+            else client_id.startswith(custody.HAND_CLOSE_PREFIX)
+        )
+        if target and seen[client_id] == (2 if phase == "last-shown" else 1):
+            return {}
+        return lookup(client_id)
+
+    monkeypatch.setattr(venue, "get_order_by_client_id", malformed_once)
+    report = close(venue)
+    assert not report.failed
+    assert any("the order lookup" in error and "dict" in error for error in report.errors)
+    assert len(venue.sent) == 1 and report.flat
+    if resting:
+        assert venue.canceled == [resting.client_order_id]
+
+
+def test_a_malformed_lookup_at_the_close_timeout_names_the_cancel_failure(monkeypatch) -> None:
+    venue = Venue(AFTER_HOURS)
+    venue.hold("SPY", 1)
+    lookup = venue.get_order_by_client_id
+    lookups = 0
+    clocks = Clocks()
+
+    def missing_then_malformed(client_id):
+        nonlocal lookups
+        lookups += 1
+        if lookups == 1:
+            raise APIError('{"code": 40410000, "message": "order not found"}', _status(404))
+        if lookups == 2:
+            return {}
+        return lookup(client_id)
+
+    monkeypatch.setattr(venue, "get_order_by_client_id", missing_then_malformed)
+    report = custody.close_ours(
+        cast(Any, venue),
+        Quotes(bid="760.10", ask="760.20"),
+        sleep=lambda seconds: clocks.sleep(custody.CLOSE_WAIT_SECS),
+        monotonic=clocks.monotonic,
+        now=lambda: venue.now,
+    )
+    assert not report.failed
+    (sent,) = venue.sent
+    assert (
+        "cancel failed: the order lookup answered a dict, not an Order"
+        in report.closes[sent.client_order_id]
+    )
+    assert any(sent.client_order_id in left for left in report.left)
+    assert not report.flat
+
+
 # ---------------------------------------------------------------------------------------------------------
 # The close-only form, against a stand-in for Alpaca's paper Trading API and its latest quote
 
@@ -1171,6 +1532,145 @@ def test_a_foreign_open_order_freezes_its_symbol_and_is_never_touched() -> None:
         o.client_order_id == foreign.client_order_id and _value(o.status) == "new"
         for o in venue.history
     )
+
+
+@pytest.mark.parametrize("symbol", [None, ""])
+def test_an_open_order_with_no_symbol_is_still_canceled_if_ours_and_frozen_if_foreign(
+    symbol: str | None,
+) -> None:
+    """Antigravity #345 F6; alpaca-py normalizes empty strings, so also test a copied empty field."""
+    venue = Venue(REGULAR)
+    ours = venue.open(client_order_id=OURS[0], symbol=None, status="new")
+    foreign = venue.open(
+        client_order_id="manual-mleg-1", symbol=None, order_class="mleg", status="new"
+    )
+    assert ours.symbol is None and foreign.symbol is None
+    if symbol == "":
+        venue.history = [order.model_copy(update={"symbol": ""}) for order in venue.history]
+
+    report = close(venue)
+    assert venue.canceled == [OURS[0]]
+    assert report.frozen
+    assert "(no symbol)" in report.frozen
+    assert venue.sent == []
+    assert _value(venue.history[-1].status) == "new"
+    assert foreign.client_order_id not in "\n".join(report.lines())
+    assert any("(no symbol)" in line and "foreign" in line for line in report.lines())
+
+
+@pytest.mark.parametrize("mine", [True, False], ids=["ours", "foreign"])
+def test_a_read_names_an_open_order_that_has_no_symbol(mine: bool) -> None:
+    venue = Venue(REGULAR)
+    unknown = venue.open(client_order_id=OURS[0] if mine else "manual-mleg-1", symbol=None)
+
+    holdings = custody.read_holdings(cast(Any, venue), venue.now)
+    assert len(holdings) == 1
+    (holding,) = holdings
+    assert holding.symbol == "(no symbol)"
+    assert (holding.ours_open if mine else holding.foreign_open) == [unknown]
+    assert holding.opened is None
+    assert any("no symbol" in why for why in holding.frozen)
+    assert any("(no symbol)" in line for line in custody.account_lines(cast(Any, venue)))
+    assert not any(getattr(request, "symbols", None) for _, request in venue.calls)
+
+
+@pytest.mark.parametrize("mine", [True, False], ids=["ours", "foreign"])
+def test_an_unattributed_open_order_freezes_every_listed_symbol_for_the_run(mine: bool) -> None:
+    venue = Venue(REGULAR)
+    venue.hold("SPY", 1)
+    venue.hold("AAPL", 2, client_order_id=OURS[1])
+    unknown = venue.open(client_order_id=OURS[2] if mine else "manual-mleg-1", symbol=None)
+    resting = venue.open(client_order_id=OURS[0], symbol="SPY", side="sell")
+    foreign = venue.open(client_order_id="manual-qqq", symbol="QQQ", side="buy")
+
+    report = close(venue)
+    assert venue.sent == []
+    expected = (
+        [unknown.client_order_id, resting.client_order_id] if mine else [resting.client_order_id]
+    )
+    assert set(venue.canceled) == set(expected)
+    assert set(report.canceled) == set(expected)
+    assert foreign.client_order_id not in venue.canceled
+    for symbol in ("SPY", "AAPL", "QQQ", "(no symbol)"):
+        assert symbol in report.frozen
+        assert any("no symbol" in why for why in report.frozen[symbol])
+    assert report.flat and not report.failed
+    assert venue.held == {"SPY": Decimal(1), "AAPL": Decimal(2)}
+
+
+def test_an_unattributed_order_of_ours_still_open_after_cancel_is_named_as_left(
+    monkeypatch,
+) -> None:
+    venue = Venue(REGULAR)
+    ours = venue.open(client_order_id=OURS[0], symbol=None)
+
+    def refused(order_id):
+        raise APIError('{"code": 42210000, "message": "not cancelable"}', _status(422))
+
+    monkeypatch.setattr(venue, "cancel_order_by_id", refused)
+    report = close(venue)
+    assert not report.flat
+    assert any(ours.client_order_id in left and "(no symbol)" in left for left in report.left)
+    assert "(no symbol)" in report.frozen
+    assert venue.sent == []
+
+
+def test_an_unattributed_order_also_freezes_a_position_first_listed_after_cancel(
+    monkeypatch,
+) -> None:
+    venue = Venue(REGULAR)
+    ours = venue.open(client_order_id=OURS[0], symbol=None)
+    cancel = venue.cancel_order_by_id
+
+    def cancel_then_a_position_appears(order_id):
+        cancel(order_id)
+        venue.hold("SPY", 2)
+
+    monkeypatch.setattr(venue, "cancel_order_by_id", cancel_then_a_position_appears)
+    report = close(venue)
+    assert venue.canceled == [ours.client_order_id]
+    assert venue.sent == []
+    assert any("at the first read" in why for why in report.frozen["SPY"])
+    assert venue.held["SPY"] == 2
+
+
+def test_a_foreign_open_order_without_a_symbol_makes_the_close_task_report_frozen(capsys) -> None:
+    venue = Venue(REGULAR)
+    venue.open(client_order_id="manual-mleg-1", symbol=None, order_class="mleg")
+    clocks = Clocks()
+    code = custody.close_task(
+        cast(Any, venue),
+        Quotes(),
+        sleep=clocks.sleep,
+        monotonic=clocks.monotonic,
+        now=lambda: venue.now,
+    )
+    assert code == 2
+    assert "frozen (no symbol):" in capsys.readouterr().out
+    assert venue.sent == [] and venue.canceled == []
+
+
+def test_an_unattributed_order_names_a_position_first_listed_at_the_last_read(monkeypatch) -> None:
+    venue = Venue(REGULAR)
+    ours = venue.open(client_order_id=OURS[0], symbol=None)
+    get_positions = venue.get_all_positions
+    reads = 0
+
+    def position_only_at_the_end():
+        nonlocal reads
+        reads += 1
+        if reads == 3:  # initial read, after cancel, then the final read
+            venue.hold("SPY", 2)
+        return get_positions()
+
+    monkeypatch.setattr(venue, "get_all_positions", position_only_at_the_end)
+    report = close(venue)
+    assert venue.canceled == [ours.client_order_id]
+    assert venue.sent == []
+    assert any("SPY" in why and "no symbol" in why for why in report.frozen["SPY"])
+    assert any("frozen SPY:" in line for line in report.lines())
+    assert not any("SPY" in left for left in report.left)
+    assert venue.held["SPY"] == 2
 
 
 def test_a_quantity_ours_did_not_open_freezes_the_symbol() -> None:
@@ -1515,3 +2015,100 @@ def test_a_foreign_order_by_notional_is_named_by_its_notional() -> None:
     venue.open(client_order_id=FOREIGN[0], symbol="SPY", side="buy", qty=None, notional="100")
     report = close(venue)
     assert report.frozen["SPY"] == ["open a foreign order: buy notional 100 SPY limit, new"]
+
+
+# -- A sell chain of ours with fills on two consecutive links (the lead's ruling, 2026-11-13) -------
+#
+# Custody read a replacement's count as carrying its predecessor's, which one paper observation
+# showed overnight (ADR 0042) and Alpaca's page does not state. Were a replacement to count its own
+# fills only, a sell chain's sales would be under-counted and the close could sell shares ours did
+# not open. So such a chain freezes its symbol until a regular-session paper read shows the count.
+
+SELL = "O-20261111-145500-001-001-2"
+
+
+@pytest.mark.parametrize(
+    ("filled", "by_hand"),
+    [
+        (("3", "5"), ()),  # ours, then ours
+        (("3", "5"), (1,)),  # ours, then a hand's replacement
+        (("3", "5", "8"), (1,)),  # ours, a hand's, ours again
+        (("0", "3", "5"), ()),  # nothing, then fills on two links running
+        (("3", "3"), ()),  # the replacement shows no more than the order before it
+    ],
+    ids=["ours-ours", "ours-foreign", "ours-foreign-ours", "zero-then-two", "equal"],
+)
+def test_a_sell_chain_of_ours_with_fills_on_two_links_running_is_not_established(
+    filled: tuple[str, ...], by_hand: tuple[int, ...]
+) -> None:
+    venue = Venue(REGULAR)
+    venue.hold("SPY", 10)
+    chain(venue, *filled, side="sell", by_hand=by_hand, first=SELL)
+    quantity, why = opened(venue)
+    assert quantity is None, (quantity, why)
+    assert isinstance(why, custody._Unread)
+    assert "SPY" in why and "not established" in why
+    assert "two orders running" in why, why  # the reason
+    assert "ADR 0042" in why and "regular-session paper read" in why, why  # and what lifts it
+
+
+def test_the_close_sells_nothing_on_a_sell_chain_with_fills_on_two_links_running() -> None:
+    """Ours bought 10. Our sell filled 3 and its replacement shows 5. Carrying the 3, ours sold 5 and
+    holds 5; counting its own, ours sold 8 and holds 2. Five are held, three of them perhaps a
+    hand's: nothing is sold, our resting order is canceled, and the symbol is named."""
+    venue = ReplacedNotListedOpen(REGULAR)
+    venue.hold("SPY", 10)
+    venue.held["SPY"] = Decimal(5)
+    chain(venue, "3", "5", side="sell", first=SELL)
+    resting = venue.open(client_order_id=OURS[1], symbol="SPY", side="sell", limit_price="999")
+    report = close(venue)
+    assert not report.failed and not report.errors, report.lines()
+    assert venue.sent == [] and venue.held["SPY"] == Decimal(5)
+    assert venue.canceled == [resting.client_order_id]
+    assert any("two orders running" in why for why in report.frozen["SPY"]), report.lines()
+    assert report.left == []  # frozen and named, not counted as ours left
+
+
+@pytest.mark.parametrize(
+    ("filled", "side", "by_hand", "expected"),
+    [
+        (("3", "5"), "buy", (), "5"),  # a buy chain: a wrong count there only freezes
+        (("0", "5"), "sell", (), "5"),  # a replacement after an order that filled nothing
+        (("5", "0"), "sell", (), "5"),  # a zero tail carries nothing
+        (("5",), "sell", (), "5"),  # no replacement
+    ],
+    ids=["buy-chain", "sell-after-zero", "sell-zero-tail", "sell-alone"],
+)
+def test_the_chains_that_freeze_leaves_counted(
+    filled: tuple[str, ...], side: str, by_hand: tuple[int, ...], expected: str
+) -> None:
+    venue = Venue(REGULAR)
+    if side == "sell":
+        venue.hold("SPY", 10)
+        chain(venue, *filled, side="sell", by_hand=by_hand, first=SELL)
+        assert opened(venue) == (Decimal(10) - Decimal(expected), "")
+    else:
+        chain(venue, *filled, by_hand=by_hand)
+        assert opened(venue) == (Decimal(expected), "")
+
+
+def test_a_hands_own_sell_chain_with_fills_on_two_links_running_leaves_our_count() -> None:
+    """Ours bought 10. A hand's sell filled 3 and the hand's replacement shows 5: neither is ours,
+    so nothing of ours is subtracted under either reading and our 10 stay counted."""
+    venue = Venue(REGULAR)
+    venue.hold("SPY", 10)
+    first, second = str(uuid4()), str(uuid4())
+    for n, (order_id, filled) in enumerate(((first, "3"), (second, "5"))):
+        venue.open(
+            id=order_id,
+            client_order_id=FOREIGN[n],
+            symbol="SPY",
+            side="sell",
+            qty="20",
+            filled_qty=filled,
+            status="filled" if n else "replaced",
+            replaces=first if n else None,
+            replaced_by=None if n else second,
+            submitted_at=(venue.now - timedelta(minutes=10 - n)).isoformat(),
+        )
+    assert opened(venue) == (Decimal(10), "")
