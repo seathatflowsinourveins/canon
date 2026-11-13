@@ -132,7 +132,8 @@ locally on the data client's live data; nothing in `src/` builds one yet (ADR 00
   only `mise run paper:session` does, each in its own and under its own account's lock; a paper test that
   streams and a streaming `paper:data` run also take account A's stream lock, and a window account B's (`mise.toml`, ADR 0029, ADR 0044,
   ADR 0069, ADR 0070). Account C's, service `canon-alpaca-paper-protect`, is read only by
-  `mise run paper:account protect`, GET only (ADR 0114).
+  `mise run paper:account protect`, GET only, and by `mise run paper:protect protect` under C's own
+  lock, the one task that sends on C: a trailing stop for a long it finds (ADR 0114, ADR 0142).
   Each pair is checked against the paper API before it is stored (ADR 0033).
 * **A session window** holds a position of at most one share: `PositionCap` reads the portfolio every second
   inside the node and shuts the system down over it; the window starts flat, ends flat or fails, and lasts
@@ -211,9 +212,9 @@ lists; "system" is `/usr/bin` or `/bin`. Secret variables are named, never shown
 
 | Way of running | PATH starts with | `python3` | `uv`, `gh` | `jq`, `git`, `bash` | Claude config | Model and effort come from |
 |---|---|---|---|---|---|---|
-| First agent in a workspace Orca creates (`orca.yaml` setup, then Orca's startup script under `bash -lc`): Claude, Codex, Antigravity, Muse, DeepSeek Harness | `/etc/paths`, `/etc/paths.d`, then mise's | system 3.9 | mise's | system; bash 3.2 | `~/.claude` (`CLAUDE_CONFIG_DIR` unset unless Orca's profile pointer names a folder) | Claude: `--model`, `--effort` from the dispatch; the others: their own config (`~/.codex`, `~/.gemini/antigravity-cli`, `~/.dsh/profiles/dsh-tui`) and flags, Muse by flags only (ADR 0059); no model variable in any environment |
+| First agent in a workspace Orca creates (`orca.yaml` setup, then Orca's startup script under `bash -lc`): Claude, Codex, Antigravity, Muse, DeepSeek Harness | `/etc/paths`, `/etc/paths.d`, then mise's | system 3.9 | mise's | system; bash 3.2 | `~/.claude` (`CLAUDE_CONFIG_DIR` unset unless Orca's profile pointer names a folder) | Claude: `--model`, `--effort` from the dispatch, the advisor from the user settings' `advisorModel` or, for a trading-path landing lane, its workspace's `.claude/settings.local.json` (ADR 0141); the others: their own config (`~/.codex`, `~/.gemini/antigravity-cli`, `~/.dsh/profiles/dsh-tui`) and flags, Muse by flags only (ADR 0059); no model variable in any environment |
 | An agent Orca types into an existing workspace's pane, or a tab the owner opens (interactive `zsh -l`, `mise activate` in `~/.zshrc`) | mise's | mise's 3.14 | mise's | system; bash 3.2 | `~/.claude` | as above |
-| Claude Code subagent, Bash tool, hooks in `.claude/hooks/` | as its session | as its session | as its session | system | as its session | the session; settings `env` pins no alias (ADR 0059), Claude Code adds `CLAUDE_EFFORT` and `CLAUDE_CODE_*` |
+| Claude Code subagent, Bash tool, hooks in `.claude/hooks/` | as its session | as its session | as its session | system | as its session | the session, its advisor included; settings `env` pins no alias (ADR 0059), Claude Code adds `CLAUDE_EFFORT` and `CLAUDE_CODE_*` |
 | `.githooks/pre-commit`, `pre-push`, `scripts/ci` and `scripts/land` by hand | git's own `libexec/git-core` (in a hook), then the caller's; `scripts/ci` then puts mise's first for its checks | caller's; mise's inside `scripts/ci` | mise's (`land` calls `gh` through `mise exec`) | system | caller's | not used |
 | launchd agents `scripts/automation` installs: lane watchdog, OTLP collector, paper session, maintenance, OmniRoute gateway, nightly study | `/usr/bin:/bin:/usr/sbin:/sbin`, set by each script, by the gateway's and the nightly study's plists, and by the maintenance agent after mise's own folder; mise named by absolute path, and `mise run` adds its own | mise's inside `mise run paper:session` and `mise run study:nightly` | mise's, through mise | system | the watchdog's and the maintenance agent's plists set `CLAUDE_CONFIG_DIR` to the folder at install | not used |
 | Hosted workflow (`.github/workflows/ci.yml`, `ubuntu-24.04`) | mise's (mise-action adds each to `GITHUB_PATH`) | mise's 3.14 | mise's | runner's; git 2.56, bash at `/usr/bin/bash` | none | not used |

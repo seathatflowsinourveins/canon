@@ -24,11 +24,14 @@ paths:
 * Credentials come from the environment. `.env` files are denied to agents by `.claude/settings.json`.
   Account A's paper pair is in the login keychain and reaches only `mise run paper:test` (ADR 0029),
   `mise run paper:data` in data-only mode (ADR 0070), `mise run paper:long-only tests`,
-  `mise run paper:account tests` and `mise run paper:close tests`;
+  `mise run paper:account tests`, `mise run paper:close tests` and `mise run paper:protect tests`
+  (ADR 0129);
   account B's, stored beside it with `paper:store windows`, reaches only `mise run paper:session`, by hand
   or from the scheduled agent (ADR 0044, ADR 0050, ADR 0069), `mise run paper:long-only windows`,
   `mise run paper:account windows` and `mise run paper:close windows`;
-  account C's, stored with `paper:store protect`, reaches only `mise run paper:account protect` (ADR 0114).
+  account C's, stored with `paper:store protect`, reaches only `mise run paper:account protect` and
+  `mise run paper:protect protect`, the one task that sends on C: a trailing stop for a long it finds,
+  never anything else (ADR 0114, ADR 0142).
   `mise run paper:history <tests|windows>` reads either one, GET only in data-only mode, a historical
   load that neither trades nor streams (ADR 0093).
   No task reads both pairs. `paper:long-only <account> <check|on|off>` reads, or sets, Alpaca's long-only

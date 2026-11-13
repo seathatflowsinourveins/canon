@@ -68,8 +68,9 @@ The request assumed a drop by "stamp"; the evidence corrects which stamp, as abo
 * Bad: prints of one symbol from different exchanges may reach the stream slightly out of time order as a
   matter of course. How many would be set aside is not measured (UNVERIFIED).
 * Open, and what closes each: the rate of out-of-order prints on `sip` (one window's tally with the
-  setting on); a paper or sandbox window with the setting on (no node sets it yet; a node's data client
-  config must name it first); the bound of five seconds (a measured spread of own time against receipt);
+  setting on); a paper or sandbox window with the setting on (a session window now takes
+  `--validate-trade-sequence`; one run with it, read into this record); the bound of five seconds (a
+  measured spread of own time against receipt) and its move to the reference Mover measures against;
   upstream extending `validate_data_sequence` to trades, which would replace this setting.
 
 ### Confirmation
@@ -79,8 +80,34 @@ The request assumed a drop by "stamp"; the evidence corrects which stamp, as abo
   order, the count across subscriptions, the trade-condition filter's left-out prints, and the kept tally. Each rule was reverted alone and a named
   case failed.
 * `tests/test_mover_window.py`: the record carries the tally, and has no such field when it is empty.
-* The setting is off by default (`AlpacaDataClientConfig().validate_trade_sequence is False`), and no node
-  in `src/canon_trading/` builds a data client config that sets it.
+* The setting remains off by default (`AlpacaDataClientConfig().validate_trade_sequence is False`);
+  2026-11-13, the paper and sandbox node builders accept `validate_trade_sequence=True`, with blind
+  tests for unchanged plain configs when off, adapter defaults when on and non-bool refusal before a
+  build. A session window turns it on with `--validate-trade-sequence`, which is Mover's, since Mover's
+  record carries the check's tally, and says so in the record (`validate_trade_sequence`), a refused
+  window's record included (`tests/test_session_window.py`). No window runs it unless told; no task
+  passes it. A window run with it remains UNVERIFIED until one is read into this record.
+* `--validate-trade-sequence` together with `--trigger last_price` is refused by name, by the window's
+  config and when the arguments are read (the lead's ruling, 2026-11-13). Under a print trigger Mover
+  judges a late print itself: one counts toward a held stop's low though it is never the newest price
+  (`Mover.on_trade` in `src/canon_trading/mover.py`), so Mover must see every print, and this check
+  sets a late one aside before any strategy sees it. Under the default trigger no print feeds a hold's
+  low (`held_low` counts prints only under `LAST_PRICE`), which is why only a print trigger is refused.
+  The check still changes three things Mover reads there, and a window run with it is read knowing so:
+  its own tally of late prints reads without the prints set aside, which
+  `late_prints_set_aside_by_the_adapter` counts; a print set aside is in no minute bar built from ticks,
+  the bars Mover's entries, ATR and trail read; and the newest trade Mover reads where a name has no
+  bid (a held stop in `_last_known`, a sale's anchor in `_last_print`) is the same after a print that is
+  truly late, which is never the newest, but not under the limit below.
+* A limit, not closed here: the two sides measure a print's time "ahead" differently. This check
+  measures it against receipt on this host (`STAMP_AHEAD_MOST_NS`), and Mover against the venue's time
+  as its name's quotes show it, which cancels this host's clock offset (`PRINT_AHEAD_MOST_NS`, whose
+  text says this bound "is to move to this reference with it"). Until it moves, with this host's clock
+  ahead by some seconds a print stamped up to five seconds and that offset ahead of the venue's time
+  becomes the newest here, which Mover would not use, and the timely prints behind it are set aside:
+  under the default trigger a held stop or a sale with no bid then reads an older price than it would
+  with the check off. With the host more than five seconds behind, every print passes unordered and
+  the check does nothing. Moving the bound to the quote reference is the next change.
 
 ## Evidence
 

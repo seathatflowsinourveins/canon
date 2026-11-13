@@ -1583,6 +1583,17 @@ def quoted_spread(quote: Any) -> Decimal | None:
     return ask - bid if 0 < bid < ask else None
 
 
+def two_sided(quote: Any) -> bool:
+    """Whether a quote has both sides above zero, locked or crossed included: the adapter refuses only a
+    side at or under zero (`canon_alpaca.data.parse_quote`), so a quote it kept with both sides is not
+    one-sided, though it has no usable spread (`quoted_spread`)."""
+    bid_price = getattr(quote, "bid_price", None)
+    ask_price = getattr(quote, "ask_price", None)
+    if bid_price is None or ask_price is None:
+        return False
+    return bid_price.as_decimal() > 0 and ask_price.as_decimal() > 0
+
+
 def ratchet_trail(
     initial: TrailPlan,
     bought: Decimal,
@@ -1779,6 +1790,10 @@ class Slot:
     """While the stop is held, the venue time from which a print is of this holding, as the step last
     read it (`_holding_since`, in `_hold`), so the trade handler reads no engine attribute; None with
     no entry fill on record."""
+    held_average: Decimal | None = None
+    """The last average fill a hold step read (`_held_anchor`), which the exit record measures the kept
+    level from; a step that reads none keeps it, so a later kept level is still measured from an
+    average, never from a bid or a stale anchor (r-dsh-heldrec P2, P3; the fix's review, finding 1)."""
     held_at_l: Decimal | None = None
     """The highest level L under the average fill this hold has held (`_held_at_l`): a cheaper fill
     that lowers the average never lowers the held stop (the xr4 reader's F1; the lead's H3)."""
@@ -3554,7 +3569,8 @@ class Mover(Strategy):
             slot.profile_evaluated_ns = None
             slot.exit_record = None
             slot.protection_anchor = slot.held_stop = slot.held_since = None
-            slot.held_low = slot.held_at_l = slot.entry_received_ns = slot.holding_from = None
+            slot.held_low = slot.held_at_l = slot.entry_received_ns = None
+            slot.holding_from = slot.held_average = None
             slot.floor_since, slot.floor_released = None, False
             slot.trailed, slot.last_sale = False, None
 
@@ -3748,6 +3764,14 @@ class Mover(Strategy):
             # (the lead's decision (b), 2026-11-12), not a sale at once.
             self._hold(slot, held, now)
             return
+        if slot.held_since is not None:
+            # the held stop at the average as it is now, before any price is compared with it: a fill
+            # since the last hold step moves it, as each hold step would (dsh-reader-343, F1;
+            # t-heldrefresh, H1 and H2), and the exit record names the refreshed level, measured from
+            # the average it was refreshed at, as each hold step records it (the combined landing's
+            # code review, finding 1)
+            self._held_at_l(slot)
+            self._record_held_stop(slot)
         if slot.held_since is not None and slot.held_stop is not None:
             # the first followed price meets the held stop before the hold ends, under either trigger
             # (the lead's H1-H3, 2026-11-12; the xr3 fast reader's SF1 and its BID_ASK twin): at or
@@ -3778,17 +3802,16 @@ class Mover(Strategy):
         held_level = (
             None if slot.held_stop is None or slot.held_stop <= 0 else up_on_step(slot.held_stop)
         )
-        from_hold = False
-        if slot.held_since is not None:
-            # above the held stop, the trail starts from it, never lower, so the held stop goes only
-            # by a sale or by a trigger at least as high taking its place
-            self._end_hold(slot, now, "trail")
-            if held_level is not None:
-                reached = slot.trail_trigger
-                from_hold = reached is None or held_level >= stop_trigger_price(reached)
-                slot.trail_trigger = held_level if reached is None else max(reached, held_level)
+        holding = slot.held_since is not None
         # the reached trigger on Alpaca's step, one value for the check below and for the remade sell
         reached = slot.trail_trigger
+        from_hold = False
+        if holding and held_level is not None:
+            # above the held stop, the trail starts from it, never lower, so the held stop goes only
+            # by a sale or by a trigger at least as high taking its place; taken on the slot only as
+            # the hold ends below, so a hold kept for want of room keeps its start
+            from_hold = reached is None or held_level >= stop_trigger_price(reached)
+            reached = held_level if reached is None else max(reached, held_level)
         kept = None if reached is None else stop_trigger_price(reached)
         origin = None if reached is None else f"reached {reached}"
         met = "retained trigger"
@@ -3803,19 +3826,6 @@ class Mover(Strategy):
             kept, origin = anchor, f"{slot.sized_loss} under the fill {bought}"
             # with no higher retained level, the stop L under the fill is met as the sale is armed
             met = "trailing stop (L under the fill, met when armed)"
-        if kept is not None and at <= kept:
-            # the market is at the trigger the canceled sell had reached, or the stop held: the sale
-            # is due now
-            slot.exiting, slot.trail_trigger, slot.trail_limit = True, None, None
-            self._mark_exit(slot, now, at, met)
-            self._say(
-                f"{slot.instrument_id}: at {at}, the trigger {kept} ({origin}) is met; "
-                "selling by limit"
-            )
-            slot.exit_trigger = kept
-            self._limit_sell(slot, held, now, slot.floor)
-            return
-        instrument = self._instrument(slot.instrument_id)
         plan = slot.trail_plan
         trailing, limit = offsets_in_force(
             slot,
@@ -3827,6 +3837,36 @@ class Mover(Strategy):
             self.settings.exit_through if plan is None else plan.exit_through,
             self._floor_m(),
         )
+        if kept is not None and at <= kept:
+            # the market is at the trigger the canceled sell had reached, or the stop held: the sale
+            # is due now, whatever room the floor leaves a trailing sell (the landing review, P2)
+            if holding:
+                self._end_hold(slot, now, "trail")
+            slot.exiting, slot.trail_trigger, slot.trail_limit = True, None, None
+            self._mark_exit(slot, now, at, met)
+            self._say(
+                f"{slot.instrument_id}: at {at}, the trigger {kept} ({origin}) is met; "
+                "selling by limit"
+            )
+            slot.exit_trigger = kept
+            self._limit_sell(slot, held, now, slot.floor)
+            return
+        if at - max(trailing, limit) <= 0:
+            # A3+O's floor in price terms can reach the followed price: the emulator would seed the
+            # trigger at it less the offset (`crates/execution/src/trailing.rs:61`), at or under zero,
+            # and its limit with it. No such sell is sent: the stop is held, and sells through the
+            # last known price or ends in its bounded unpriced exit (xr7-r-a3o-1afe, P2). Before
+            # `_end_hold`, so the hold keeps its start. The price followed now is handed to the hold,
+            # which compares it with the stop it sets up and keeps it as the hold's low: a bid already
+            # through that stop sells in this step, and a recovery before the next one does not hide
+            # it (the combined landing's Codex second reader, P1)
+            self._hold(slot, held, now, followed=at)
+            return
+        if holding:
+            self._end_hold(slot, now, "trail")
+            # the held stop's place goes to the trigger the remade sell starts from
+            slot.trail_trigger = reached
+        instrument = self._instrument(slot.instrument_id)
         if slot.exit_record is not None:
             slot.exit_record.trail_distance = trailing
         self._say(
@@ -3889,13 +3929,15 @@ class Mover(Strategy):
         if row["under_floor"]:
             self.remakes_under_floor += 1
 
-    def _hold(self, slot: Slot, held: Decimal, now: int) -> None:
+    def _hold(self, slot: Slot, held: Decimal, now: int, followed: Decimal | None = None) -> None:
         """The lead's decision (b), 2026-11-12: with no followed price, hold a stop at the average fill,
         else the entry's limit, less the trail distance in force. It sells at once only when the last
         known price (the newest trade by venue time, else the latest minute close: `_last_known`)
         is through that level, so it does not depend on the missing side and adds no subscription.
         With no two-sided quote within `HOLD_MOST_SECS` of receiving the first fill it sells by limit
-        as an `unpriced_exit`."""
+        as an `unpriced_exit`. A hold the floor starts for want of room under a followed price is
+        handed that price (`followed`), which counts toward the hold's low, so a price already through
+        the stop it sets up sells at once."""
         if slot.held_since is None:
             received = slot.entry_received_ns
             if received is None:
@@ -3915,11 +3957,13 @@ class Mover(Strategy):
                     self.settings.exit_through if plan is None else plan.exit_through,
                     self._floor_m(),
                 )[0]
-                level = anchor - distance
-                # on Alpaca's step from the start, rounded up, the level its trailing sell would start
+                # A3+O's floor in price terms can exceed the anchor: no stop at or under zero is held,
+                # and with none the hold ends in its bounded unpriced exit (xr7-r-a3o-1afe, P2); else on
+                # Alpaca's step from the start, rounded up, the level its trailing sell would start
                 # from, so the hold's checks and its record read the stop in force (code-review-high-succ2/4)
+                level = anchor - distance
                 on_step = level if level <= 0 else up_on_step(level)
-                slot.held_stop = level if on_step == level else on_step
+                slot.held_stop = None if level <= 0 else level if on_step == level else on_step
                 slot.protection_anchor = anchor
             if slot.trail_trigger is not None:
                 # a trailed sale had reached this trigger: the hold keeps it, on Alpaca's step (#312)
@@ -3936,10 +3980,20 @@ class Mover(Strategy):
             )
         self._ensure_exit(slot, held)
         self._held_at_l(slot)
+        self._record_held_stop(slot)
         slot.holding_from = self._holding_since(slot)
+        low = slot.held_low
+        if followed is not None:
+            # a price `_trail` followed as the hold was set up, which no quote or print handler caught
+            # because the hold had not begun: it meets the stop in this step, as `_trail` compares the
+            # price it follows, and is kept as the hold's low only where `on_quote` or `on_trade` would
+            # keep it, so under a print trigger with the holding's start unknown a print from before
+            # the entry is not kept once the fill is recorded (the delta's code review, finding 1)
+            low = followed if low is None else min(low, followed)
+            if self.settings.trigger == TriggerType.BID_ASK or slot.holding_from is not None:
+                slot.held_low = low
         last, source = self._last_known(slot)
         met, by = last, source
-        low = slot.held_low
         if slot.held_stop is not None and low is not None and low <= slot.held_stop:
             # a followed price since the hold began met the stop: a met held stop is never forgotten, and
             # a later print the holding does not own (a late one stamped before the entry) must not hide
@@ -3959,7 +4013,8 @@ class Mover(Strategy):
         # two-sided quote and no print of its own waits for a print or the wind-down
         if now - slot.held_since >= HOLD_MOST_SECS * SECOND_NS and not (
             self.settings.trigger == TriggerType.LAST_PRICE
-            and quoted_spread(self.cache.quote(slot.instrument_id)) is not None
+            # a locked or crossed quote has both sides: it waits too (w3-d-succ2/P2)
+            and two_sided(self.cache.quote(slot.instrument_id))
         ):
             anchor = last if last is not None else slot.protection_anchor
             slot.exiting = True
@@ -4004,12 +4059,26 @@ class Mover(Strategy):
         slot.protection_anchor = anchor
         if slot.exit_record is not None:
             slot.exit_record.trail_distance = distance
-            # the kept level and its distance from the average, which a cheaper fill can make
-            # negative: the stop then sits over the average and the next price through it sells (H1)
-            slot.exit_record.held_stop_kept = slot.held_stop
-            slot.exit_record.held_stop_from_average = anchor - slot.held_stop
         if slot.entry_record is not None:
             slot.entry_record["held_stop_level"] = str(slot.held_stop)
+
+    def _record_held_stop(self, slot: Slot) -> None:
+        """The kept level and its distance from the average on the exit record, for every holding that
+        holds a stop, sized for L or not (w3-d-succ2/P3-1). A cheaper fill can make the distance
+        negative: the stop then sits over the average and the next price through it sells (H1)."""
+        if slot.exit_record is None or slot.held_stop is None:
+            return
+        # a step that cannot read the average (the entry gone from the cache, no position average,
+        # no limit price) measures the level in force from the last average a step read, and with none
+        # read records no distance. The protection anchor is no stand-in: it can date from the hold's
+        # first step, or be a bid (`_trail_anchor`) (r-dsh-heldrec P2, P3)
+        anchor = self._held_anchor(slot)
+        if anchor is not None:
+            slot.held_average = anchor
+        slot.exit_record.held_stop_kept = slot.held_stop
+        slot.exit_record.held_stop_from_average = (
+            None if slot.held_average is None else slot.held_average - slot.held_stop
+        )
 
     def _end_hold(self, slot: Slot, now: int, path: str) -> None:
         """Record how the held stop ended and for how long it held; clear it."""
@@ -4566,6 +4635,15 @@ class Mover(Strategy):
         )
         if stop is not None and stop <= 0:
             return f"no room for the trail under {price}"
+        floor_m = self._floor_m()
+        least = None if floor_m is None or plan.spread is None else floor_m * plan.spread
+        if stop is not None and least is not None and least >= price:
+            # the legacy path sizes no loss: a spread floor in price terms (A3+O's O3) at or over the
+            # entry leaves no room for any stop under it, which the planned stop's fraction alone
+            # would admit (w1-t-l5, P4)
+            return (
+                f"sizing refused: the spread floor {least} is at or over the entry {price}, no room"
+            )
         bid_price = getattr(quote, "bid_price", None)
         bid = None if bid_price is None else bid_price.as_decimal()
         if bid is None or bid <= 0:
@@ -4742,8 +4820,12 @@ class Mover(Strategy):
                 "sized_trail": str(sized_trail),
                 "stop": str(entry_stop),
                 "loss_shares": str(loss_shares),
+                # L, the distance the trailing sell protects at: the D3 check reads it as the
+                # opening distance (`d3_check.py`, `_opening_floor`); the loss at the sizing stop,
+                # `price - stop`, has its own key, so the row names each distance once (w1-d-351, P2)
                 "loss_per_share": str(distance),
-                "loss_at_stop": str(quantity.as_decimal() * distance),
+                "stop_loss_per_share": str(price - entry_stop),
+                "loss_at_stop": str(quantity.as_decimal() * (price - entry_stop)),
                 "binding": binding,
                 "held_by": held_by,
                 # None: no start-up roster to be in or outside of
@@ -5287,6 +5369,12 @@ class Mover(Strategy):
             return False  # retried next step
         try:
             warmed = self._entry_trail(slot, bought, quote, now=now)
+        except DistanceRefusal:
+            # the cap refuses the warmed plan: the one comparison is made and the trail in force kept,
+            # neither retried each step nor noted as not applied yet (the Antigravity reader of #351,
+            # P3-1)
+            slot.warm_checked = True
+            return False
         except ValueError as error:
             self._note(slot, f"{slot.instrument_id}: warmed ATR not applied yet: {error}")
             return False

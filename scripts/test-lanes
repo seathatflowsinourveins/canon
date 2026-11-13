@@ -190,7 +190,7 @@ export HOME="$TMP/home"; mkdir -p "$HOME"
 # a session Orca starts carries DISABLE_AUTOUPDATER (Orca 1.4.255 sets it), which bootstrap's update row reads;
 # the three dsh-TUI variables are read by its worker defaults row
 unset CLAUDE_CONFIG_DIR CANON_LEDGER_HOME AUTOMATION_SKIP_LAUNCHD CANON_LAUNCHAGENTS_DIR CODEX_HOME DSH_HOME \
-      DISABLE_AUTOUPDATER DISABLE_UPDATES CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC \
+      DISABLE_AUTOUPDATER DISABLE_UPDATES CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC CLAUDE_CODE_DISABLE_ADVISOR_TOOL \
       DSH_PERMISSION_MODE DSH_TUI_PRESET DSH_TUI_BACKEND
 PINNED=$(sed -n 's/^MISE_VERSION="v\([^"]*\)".*/\1/p' "$ROOT/scripts/bootstrap")
 echo "$PINNED macos-arm64 (stub)" > "$STUB/mise-version"
@@ -2669,6 +2669,8 @@ CLAUDE_CONFIG_DIR="$C" bs --user-config; rc=$?
 check "user-config into a directory with a space: exit 0" test "$rc" = 0
 check "... a new settings.json, with a NOTE saying what each of ADR 0139's four settings changes" \
       eval 'grep -qF "installed  $C/settings.json" "$TMP/bs.out" && [ "$(grep -c "^  NOTE       .*(ADR 0139)\$" "$TMP/bs.out")" = 4 ] && grep -q "NOTE       DO_NOT_TRACK \"0\": .*sends its usage metrics" "$TMP/bs.out" && grep -qF "moves those already synced to $C/skills/.trash/" "$TMP/bs.out"'
+check "... and a NOTE for each of ADR 0141's two: whom the advisor advises, and the retry watchdog's wait" \
+      eval '[ "$(grep -c "^  NOTE       .*(ADR 0141)\$" "$TMP/bs.out")" = 2 ] && grep -q "^  NOTE       advisorModel \"opus\": .*a Fable main model takes none" "$TMP/bs.out" && grep -q "^  NOTE       CLAUDE_CODE_RETRY_WATCHDOG \"1\": .*a spend limit or exhausted usage credits still fail at once" "$TMP/bs.out"'
 check "no Codex folder: Codex telemetry skipped, nothing created" \
       eval '[ ! -e "$HOME/.codex" ] && grep -q "skipped    Codex telemetry: no $HOME/.codex" "$TMP/bs.out"'
 bak=$(find "$C/canon" -name 'ledger.sh.replaced-*'); bak=${bak%%$'\n'*}
@@ -2733,6 +2735,8 @@ check "... and the model keys it lacks, the owner's model kept and named (ADR 00
       eval 'jqt "$C3/settings.json" ".availableModels == $(jq -c .availableModels "$ROOT/home/.claude/settings.json") and .modelPicker == $(jq -c .modelPicker "$ROOT/home/.claude/settings.json") and (.env | has(\"ANTHROPIC_DEFAULT_FABLE_MODEL\") | not)" && grep -q "KEPT .*sets model to another value than home/.claude/settings.json" "$TMP/bs.out"'
 check "... and ADR 0139's four settings, which it lacked, as the template sets them, with a NOTE for each" \
       eval 'jqt "$C3/settings.json" ".env.DO_NOT_TRACK == \"0\" and .syncClaudeAiSkills == false and .syncClaudeAiPlugins == false and .disableClaudeAiConnectors == true" && [ "$(grep -c "^  NOTE       .*(ADR 0139)\$" "$TMP/bs.out")" = 4 ]'
+check "... and ADR 0141's advisor and retry watchdog, which it lacked, as the template sets them, with a NOTE for each" \
+      eval 'jqt "$C3/settings.json" ".advisorModel == \"opus\" and .env.CLAUDE_CODE_RETRY_WATCHDOG == \"1\"" && [ "$(grep -c "^  NOTE       .*(ADR 0141)\$" "$TMP/bs.out")" = 2 ] && grep -q "added      .*advisorModel.* to $C3/settings.json (.*ADR 0141)" "$TMP/bs.out"'
 check "... leaves a value the owner set, and names it" \
       eval 'jqt "$C3/settings.json" ".env.OTEL_METRICS_EXPORTER == \"otlp\"" && grep -q "sets OTEL_METRICS_EXPORTER to another value" "$TMP/bs.out"'
 check "... keeping the previous file beside it" \
@@ -2755,7 +2759,18 @@ C7="$TMP/cfg7"; mkdir -p "$C7"
 echo '{"syncClaudeAiSkills":true,"syncClaudeAiPlugins":true,"disableClaudeAiConnectors":false,"env":{"DO_NOT_TRACK":"1"}}' > "$C7/settings.json"
 CLAUDE_CONFIG_DIR="$C7" bs --user-config
 check "the owner's skill and plugin sync, connectors and DO_NOT_TRACK are kept and named, with no NOTE (ADR 0139)" \
-      eval 'jqt "$C7/settings.json" ".syncClaudeAiSkills == true and .syncClaudeAiPlugins == true and .disableClaudeAiConnectors == false and .env.DO_NOT_TRACK == \"1\"" && grep -q "KEPT       $C7/settings.json sets DO_NOT_TRACK to another value" "$TMP/bs.out" && grep -q "KEPT       $C7/settings.json sets syncClaudeAiSkills, syncClaudeAiPlugins, disableClaudeAiConnectors to another value" "$TMP/bs.out" && ! grep -q "^  NOTE " "$TMP/bs.out"'
+      eval 'jqt "$C7/settings.json" ".syncClaudeAiSkills == true and .syncClaudeAiPlugins == true and .disableClaudeAiConnectors == false and .env.DO_NOT_TRACK == \"1\"" && grep -q "KEPT       $C7/settings.json sets DO_NOT_TRACK to another value" "$TMP/bs.out" && grep -q "KEPT       $C7/settings.json sets syncClaudeAiSkills, syncClaudeAiPlugins, disableClaudeAiConnectors to another value" "$TMP/bs.out" && ! grep -q "^  NOTE .*(ADR 0139)\$" "$TMP/bs.out"'
+# the owner's own values for ADR 0141's settings, such as a pick /advisor saved: kept and named, no NOTE for either
+C8="$TMP/cfg8"; mkdir -p "$C8"
+echo '{"advisorModel":"claude-fable-5-2","env":{"CLAUDE_CODE_RETRY_WATCHDOG":"0"}}' > "$C8/settings.json"
+CLAUDE_CONFIG_DIR="$C8" bs --user-config
+check "the owner's advisor and retry watchdog are kept and named, with no NOTE for either (ADR 0141)" \
+      eval 'jqt "$C8/settings.json" ".advisorModel == \"claude-fable-5-2\" and .env.CLAUDE_CODE_RETRY_WATCHDOG == \"0\"" && grep -q "KEPT       $C8/settings.json sets CLAUDE_CODE_RETRY_WATCHDOG to another value" "$TMP/bs.out" && grep -q "KEPT       $C8/settings.json sets advisorModel to another value" "$TMP/bs.out" && ! grep -q "^  NOTE .*(ADR 0141)\$" "$TMP/bs.out"'
+# an explicit null is unset to --user-config, which adds the template's value, as --check's NOT SET says
+echo '{"advisorModel":null,"env":{"CLAUDE_CODE_RETRY_WATCHDOG":null}}' > "$C8/settings.json"
+CLAUDE_CONFIG_DIR="$C8" bs --user-config
+check "... and an explicit null for either is filled with the template's value, with a NOTE for each" \
+      eval 'jqt "$C8/settings.json" ".advisorModel == \"opus\" and .env.CLAUDE_CODE_RETRY_WATCHDOG == \"1\"" && [ "$(grep -c "^  NOTE       .*(ADR 0141)\$" "$TMP/bs.out")" = 2 ]'
 echo '{"env":[]}' > "$C3/settings.json"; CLAUDE_CONFIG_DIR="$C3" bs --user-config; rc=$?
 check "an env that is not an object: named, the run finishes" \
       eval 'grep -q "not a JSON object with an object env" "$TMP/bs.out" && grep -q "New Claude Code sessions" "$TMP/bs.out"'
@@ -2877,6 +2892,10 @@ check "... the allowlist admits each family alias but fable, so the picker's leg
 check "the template's default model is the session_default_lane's alias" \
       eval '[ -n "$build_alias" ] && [ "$(jq -r .model "$ROOT/home/.claude/settings.json")" = "$build_alias" ]'
 check "the template names the latest channel (ADR 0065)" jqt "$ROOT/home/.claude/settings.json" '.autoUpdatesChannel == "latest"'
+check "the template's advisor is canon/models.json's routine advisor, and the template sets the retry watchdog (ADR 0141)" \
+      eval 'a=$(jq -r ".advisorModel // empty" "$ROOT/home/.claude/settings.json"); [ -n "$a" ] && [ "$a" = "$(jq -r ".claude_code.advisor.routine // empty" "$ROOT/canon/models.json")" ] && jqt "$ROOT/home/.claude/settings.json" ".env.CLAUDE_CODE_RETRY_WATCHDOG == \"1\""'
+check "... and the final-landing advisor is the orchestrator lane's model, which the allowlist admits" \
+      eval 'jq -e --arg f "$fable_id" ".claude_code.advisor.final_landing == \$f and (.claude_code.available_models | index(\$f)) != null" "$ROOT/canon/models.json" >/dev/null'
 CLAUDE_CONFIG_DIR="$C" bs --check
 check "installed settings as the template: no alias pinned, model keys ok" \
       eval 'rowis "$TMP/bs.out" "model alias pins" ok && rowis "$TMP/bs.out" "default model" ok && rowis "$TMP/bs.out" "model allowlist" ok && rowis "$TMP/bs.out" "picker rows" ok && rowis "$TMP/bs.out" "update channel" ok'
@@ -2886,6 +2905,8 @@ pin_settings '.'; rc=$?
 check "... and the whole check passes: exit 0"     test "$rc" = 0
 check "... ADR 0139's three rows ok, and the telemetry row names DO_NOT_TRACK \"0\"" \
       eval 'rowis "$TMP/bs.out" "claude.ai skill sync" ok && rowis "$TMP/bs.out" "claude.ai plugin sync" ok && rowis "$TMP/bs.out" "claude.ai connectors" ok && grep -q "^  telemetry settings .*DO_NOT_TRACK \"0\": feature flags fetched" "$TMP/bs.out"'
+check "... ADR 0141's advisor and retry watchdog rows ok, the advisor row naming what a Fable main model gets" \
+      eval 'rowis "$TMP/bs.out" "advisor model" ok && grep -q "^  advisor model .*a Fable main model takes none" "$TMP/bs.out" && rowis "$TMP/bs.out" "retry watchdog" ok'
 pin_settings 'del(.syncClaudeAiSkills, .syncClaudeAiPlugins, .disableClaudeAiConnectors)'; rc=$?
 check "ADR 0139's settings unset: each NOT SET, naming what then syncs or connects, exit 1" \
       eval 'rowis "$TMP/bs.out" "claude.ai skill sync" "NOT SET" && rowis "$TMP/bs.out" "claude.ai plugin sync" "NOT SET" && rowis "$TMP/bs.out" "claude.ai connectors" "NOT SET" && grep -q "downloads and loads its plugins" "$TMP/bs.out" && [ "$rc" != 0 ]'
@@ -2898,6 +2919,29 @@ check "... connectors alone set the other way: OWNER, not a failure" \
 pin_settings '.env.DO_NOT_TRACK = "1"'; rc=$?
 check "DO_NOT_TRACK \"1\" in the settings: the telemetry row OWNER, naming it, not a failure" \
       eval 'rowis "$TMP/bs.out" "telemetry settings" OWNER && grep -q "sets DO_NOT_TRACK to another value" "$TMP/bs.out" && [ "$rc" = 0 ]'
+pin_settings 'del(.advisorModel, .env.CLAUDE_CODE_RETRY_WATCHDOG)'; rc=$?
+check "ADR 0141's settings unset: the advisor and the retry watchdog each NOT SET, exit 1" \
+      eval 'rowis "$TMP/bs.out" "advisor model" "NOT SET" && rowis "$TMP/bs.out" "retry watchdog" "NOT SET" && [ "$rc" != 0 ]'
+pin_settings '.advisorModel = "claude-fable-5-2" | .env.CLAUDE_CODE_RETRY_WATCHDOG = "0"'; rc=$?
+check "... set otherwise, as /advisor saves a pick: each OWNER and named, not a failure" \
+      eval 'rowis "$TMP/bs.out" "advisor model" OWNER && grep -q "sets advisorModel to claude-fable-5-2" "$TMP/bs.out" && rowis "$TMP/bs.out" "retry watchdog" OWNER && grep -q "sets CLAUDE_CODE_RETRY_WATCHDOG to 0" "$TMP/bs.out" && [ "$rc" = 0 ]'
+pin_settings '.env.CLAUDE_CODE_DISABLE_ADVISOR_TOOL = "1"'; rc=$?
+check "... the advisor tool turned off by its variable: OWNER, naming it, not a failure" \
+      eval 'rowis "$TMP/bs.out" "advisor model" OWNER && grep -q "sets CLAUDE_CODE_DISABLE_ADVISOR_TOOL to 1; set to 1 it turns the advisor off" "$TMP/bs.out" && [ "$rc" = 0 ]'
+pin_settings '.advisorModel = null | .env.CLAUDE_CODE_RETRY_WATCHDOG = null'; rc=$?
+check "... an explicit null, which --user-config reads as unset and fills: each NOT SET, exit 1" \
+      eval 'rowis "$TMP/bs.out" "advisor model" "NOT SET" && rowis "$TMP/bs.out" "retry watchdog" "NOT SET" && [ "$rc" != 0 ]'
+pin_settings '.env.CLAUDE_CODE_DISABLE_ADVISOR_TOOL = "true"'; rc=$?
+check "... the advisor tool's variable set to a value other than 1: OWNER, naming the value, not a failure" \
+      eval 'rowis "$TMP/bs.out" "advisor model" OWNER && grep -q "sets CLAUDE_CODE_DISABLE_ADVISOR_TOOL to true" "$TMP/bs.out" && [ "$rc" = 0 ]'
+pin_settings '.env.CLAUDE_CODE_DISABLE_ADVISOR_TOOL = "0"'; rc=$?
+check "... and set to 0: the advisor row ok" rowis "$TMP/bs.out" "advisor model" ok
+jq . "$C/settings.json" > "$C3/settings.json"; CLAUDE_CODE_DISABLE_ADVISOR_TOOL=1 CLAUDE_CONFIG_DIR="$C3" bs --check; rc=$?
+check "... the advisor tool's variable set in the checking environment: OWNER, naming it, not a failure" \
+      eval 'rowis "$TMP/bs.out" "advisor model" OWNER && grep -q "this environment sets CLAUDE_CODE_DISABLE_ADVISOR_TOOL" "$TMP/bs.out" && [ "$rc" = 0 ]'
+pin_settings '.env = []'; rc=$?
+check "a settings file whose env is not an object: ADR 0141's rows MISSING, saying --user-config leaves such a file as it is, exit 1" \
+      eval 'rowis "$TMP/bs.out" "advisor model" MISSING && rowis "$TMP/bs.out" "retry watchdog" MISSING && grep -q "^  retry watchdog .*which scripts/bootstrap --user-config leaves as it is" "$TMP/bs.out" && [ "$rc" != 0 ]'
 pin_settings ".env.ANTHROPIC_DEFAULT_FABLE_MODEL = \"$fable_id\""; rc=$?
 check "fable pinned to canon/models.json's model: PINNED, it would not follow the vendor, exit 1" \
       eval 'rowis "$TMP/bs.out" "fable alias" PINNED && grep -q "will not follow the vendor" "$TMP/bs.out" && [ "$rc" != 0 ]'
@@ -2987,9 +3031,13 @@ check "a template with no allowlist: UNKNOWN, exit 1, not a silent pass" \
 echo '{' > "$BS/home/.claude/settings.json"; pin_settings '.'; rc=$?
 check "a template that cannot be read: ADR 0139's rows UNKNOWN, not dropped, exit 1" \
       eval 'rowis "$TMP/bs.out" "claude.ai settings" UNKNOWN && [ "$rc" != 0 ]'
+check "... and ADR 0141's rows UNKNOWN too" rowis "$TMP/bs.out" "advisor settings" UNKNOWN
 jq 'del(.env.DO_NOT_TRACK)' "$TMP/template.keep" > "$BS/home/.claude/settings.json"; pin_settings '.'; rc=$?
 check "a template without DO_NOT_TRACK: the telemetry row does not credit an installed \"0\" to ADR 0139" \
       eval 'rowis "$TMP/bs.out" "telemetry settings" ok && ! grep -q "DO_NOT_TRACK \"0\": feature flags fetched" "$TMP/bs.out"'
+jq 'del(.advisorModel, .env.CLAUDE_CODE_RETRY_WATCHDOG)' "$TMP/template.keep" > "$BS/home/.claude/settings.json"; pin_settings '.'; rc=$?
+check "a template without ADR 0141's settings: no advisor or retry watchdog row, exit 0" \
+      eval '! grep -q "^  advisor model " "$TMP/bs.out" && ! grep -q "^  retry watchdog " "$TMP/bs.out" && [ "$rc" = 0 ]'
 cp "$TMP/template.keep" "$BS/home/.claude/settings.json"
 # --user-config on settings an earlier template rendered: the values ADR 0059 and ADR 0065 retire go, the
 # owner's stay
