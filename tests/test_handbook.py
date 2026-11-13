@@ -1,8 +1,9 @@
 """The handbook's pages keep the form each page states (`docs/handbook/`).
 
-The contract is the pages' own: the rows table's columns and its two states (`rows.md`), each practice
-file under `practices/` holding one line that names a record that exists or says "not yet built" with a
-roadmap step, with `practices.md` only the introduction and the index of move folders, the
+The contract is the pages' own: the rows table's columns and its two states, one row per file under
+`rows/` with `rows.md` only the introduction and the two tables' headers, each practice file under
+`practices/` holding one line that names a record that exists or says "not yet built" with a roadmap
+step, with `practices.md` only the introduction and the index of move folders, the
 journal's ten fields and the nightly study's six (`journal.md`, `nights.md`), and both of those
 append-only, so the entries already on `main` stay as they were. No upstream reads these pages, so the
 parsing is the standard library's `re`; what is on `main` is asked of git through its own plumbing,
@@ -14,7 +15,9 @@ from __future__ import annotations
 
 import datetime
 import re
+import shutil
 import subprocess
+from collections.abc import Mapping
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -22,6 +25,8 @@ import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 HANDBOOK = ROOT / "docs" / "handbook"
+ROWS = HANDBOOK / "rows"
+ROWS_TABLES = ("settings", "window-settings")
 PRACTICES = HANDBOOK / "practices"
 MARKER = "<!-- append-only: add new entries below this line; never edit or remove one above it -->"
 ADR = re.compile(r"\bADR (\d{4})\b")
@@ -160,55 +165,42 @@ def check_nights(text: str) -> list[str]:
     return errors
 
 
-def check_rows(text: str) -> list[str]:
-    """Check every rows table with shared names, refusing pipe lines outside those tables."""
-    lines = text.splitlines()
-    if ROWS_HEADER not in lines:
-        return [f"no header {ROWS_HEADER!r}"]
+def check_rows(texts: Mapping[str, str]) -> list[str]:
+    """Each file under `rows/`, by label, holds one table line: five cells, a name in backticks, a value,
+    one of the two states, a source and an ISO date. A name may not repeat across any two files."""
     errors: list[str] = []
-    rows = []
-    table_lines: set[int] = set()
-    for index, line in enumerate(lines):
-        if line != ROWS_HEADER:
-            continue
-        table_lines.update((index, index + 1))  # the header and separator
-        separator = lines[index + 1] if index + 1 < len(lines) else ""
-        if not ROW_SEPARATOR.fullmatch(separator):
-            errors.append(f"line {index + 1}: the header has no separator row: {separator!r}")
-        before = len(rows)
-        for row_index in range(index + 2, len(lines)):
-            row = lines[row_index]
-            if not row.startswith("|") or row == ROWS_HEADER:
-                break
-            rows.append(row)
-            table_lines.add(row_index)
-        if len(rows) == before:
-            errors.append("the table has no row")
-    for index, line in enumerate(lines):
-        if line.startswith("|") and index not in table_lines:
-            errors.append(f"row outside a headered table: {line!r}")
     names: set[str] = set()
-    for line in rows:
+    rows = 0
+    for label, text in texts.items():
+        lines = [line for line in text.splitlines() if line.strip()]
+        prefix = f"{label}: " if label else ""
+        if len(lines) != 1:
+            errors.append(f"{prefix}{len(lines)} non-blank lines, expected one table line")
+            continue
+        line = lines[0]
         cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
         if len(cells) != 5:
-            errors.append(f"{len(cells)} cells, expected 5: {line!r}")
+            errors.append(f"{prefix}{len(cells)} cells, expected 5: {line!r}")
             continue
+        rows += 1
         name, value, state, source, date = cells
         if not ROW_NAME.fullmatch(name):
-            errors.append(f"name {name!r} is not an upper-case name in backticks")
+            errors.append(f"{prefix}name {name!r} is not an upper-case name in backticks")
         if name in names:
-            errors.append(f"{name}: a second row of that name")
+            errors.append(f"{prefix}{name}: a second row of that name")
         names.add(name)
         if not value:
-            errors.append(f"{name}: no value")
+            errors.append(f"{prefix}{name}: no value")
         if state not in ROW_STATES:
-            errors.append(f"{name}: state {state!r}, expected one of {sorted(ROW_STATES)}")
+            errors.append(f"{prefix}{name}: state {state!r}, expected one of {sorted(ROW_STATES)}")
         if not source:
-            errors.append(f"{name}: no source")
+            errors.append(f"{prefix}{name}: no source")
         if state == "calibrated" and not ADR.search(source):
-            errors.append(f"{name}: calibrated, but its source names no record")
+            errors.append(f"{prefix}{name}: calibrated, but its source names no record")
         if not iso_date(date):
-            errors.append(f"{name}: date {date!r} is not a date")
+            errors.append(f"{prefix}{name}: date {date!r} is not a date")
+    if not rows:
+        errors.append("no row")
     return errors
 
 
@@ -229,31 +221,42 @@ def check_practices(text: str, steps: set[str]) -> list[str]:
     return errors
 
 
+def row_fragments() -> list[Path]:
+    """Every file under `rows/`, at any depth: `test_one_row_one_file` holds each to its shape."""
+    return sorted(path for path in ROWS.rglob("*") if path.is_file())
+
+
+def row_cells(name: str) -> list[str]:
+    """The cells of one row, by its name in backticks; exactly one file under `rows/` must hold it."""
+    found = [
+        line
+        for path in row_fragments()
+        for line in path.read_text().splitlines()
+        if line.startswith(f"| `{name}` |")
+    ]
+    assert len(found) == 1, f"{name}: {len(found)} row lines under docs/handbook/rows/"
+    return [cell.strip() for cell in found[0].strip().strip("|").split("|")]
+
+
 def test_rows_table_form() -> None:
-    assert check_rows((HANDBOOK / "rows.md").read_text()) == []
+    fragments = row_fragments()
+    assert fragments, "no row files under docs/handbook/rows/"
+    texts = {path.relative_to(ROOT).as_posix(): path.read_text() for path in fragments}
+    assert check_rows(texts) == []
 
 
 def test_adoption_threshold_row_is_adr_0010s() -> None:
     """The gate's threshold is ADR 0010's; the row cannot drift from it without a record."""
-    text = (HANDBOOK / "rows.md").read_text()
-    row = next(line for line in text.splitlines() if line.startswith("| `DSR_THRESHOLD` |"))
-    cells = [cell.strip() for cell in row.strip().strip("|").split("|")]
-    assert cells[1].startswith("0.95,")
-    assert "ADR 0010" in cells[3]
-
-
-def window_row(name: str) -> list[str]:
-    """The cells of one row of the rows page, by its name in backticks."""
-    text = (HANDBOOK / "rows.md").read_text()
-    row = next(line for line in text.splitlines() if line.startswith(f"| `{name}` |"))
-    return [cell.strip() for cell in row.strip().strip("|").split("|")]
+    _, value, _, source, _ = row_cells("DSR_THRESHOLD")
+    assert value.startswith("0.95,")
+    assert "ADR 0010" in source
 
 
 def test_the_trail_cap_row_states_the_spread_floor_and_where_a_refusal_is_written() -> None:
     """The lead's O1-O3 and record rule 1 of 2026-11-12: the cap's row says every entry outside the
     fixed arm trails at least the spread floor at its step, a remade sale keeps it in price terms, and
     an entry the cap forbids is one row of the run's `refusals` by its cause."""
-    _, value, state, source, _ = window_row("TRAIL_CAP")
+    _, value, state, source, _ = row_cells("TRAIL_CAP")
     assert value.startswith("0.02 of the entry") and state == "UNCALIBRATED"
     for words in (
         "`SPREAD_FLOOR_M` at its step",
@@ -272,10 +275,89 @@ def test_a_counted_criterion_row_is_uncalibrated_and_counts_no_profit(name: str)
     """The lead's D4(i) and D5 of 2026-11-12: a tightening arm and a re-entry arm are read by a counted
     criterion from the run record, registered UNCALIBRATED before a window selects them; it ranks
     nothing and never reads profit and loss."""
-    _, value, state, source, date = window_row(name)
+    _, value, state, source, date = row_cells(name)
     assert state == "UNCALIBRATED" and iso_date(date)
     assert "never profit and loss" in value and "ranks nothing" in value
     assert "Lead's D" in source
+
+
+def test_one_row_one_file() -> None:
+    """A row is one file directly under its table's folder, named by a place and the row's name, holding
+    one line: its table line. A row's table is its folder and its name is its file's slug."""
+    fragments = row_fragments()
+    assert fragments, "no row files under docs/handbook/rows/"
+    places: dict[str, set[int]] = {}
+    for path in fragments:
+        assert path.parent.parent == ROWS, f"{path.relative_to(ROOT)} is not under one table folder"
+        table = path.parent.name
+        assert table in ROWS_TABLES, f"{table!r} is not one of {ROWS_TABLES}"
+        assert FRAGMENT.fullmatch(path.name), f"{path.name!r} is not a place, a slug and `.md`"
+        lines = [line for line in path.read_text().splitlines() if line.strip()]
+        assert len(lines) == 1, f"{path.relative_to(ROOT)}: {len(lines)} non-blank lines"
+        cells = [cell.strip() for cell in lines[0].strip().strip("|").split("|")]
+        assert len(cells) == 5, f"{path.relative_to(ROOT)}: {len(cells)} cells, expected 5"
+        name = cells[0].strip("`")
+        assert path.name == f"{path.name[:3]}-{name.lower().replace('_', '-')}.md", (
+            f"{path.relative_to(ROOT)} does not name its row {name}"
+        )
+        place = int(path.name[:3])
+        places.setdefault(table, set())
+        assert place not in places[table], f"{path.relative_to(ROOT)}: a second place {place}"
+        places[table].add(place)
+    assert sorted(places) == sorted(ROWS_TABLES), f"tables {sorted(places)}, expected {ROWS_TABLES}"
+
+
+def test_rows_page_is_an_index_and_lists_no_row() -> None:
+    """`rows.md` keeps the introduction and the two tables' headers, points at each table's folder, and
+    lists no row: adding a row is one new file in its table's folder, never an edit here."""
+    text = (HANDBOOK / "rows.md").read_text()
+    assert text.startswith("# The rows table\n")
+    assert text.count(ROWS_HEADER) == 2, "expected one header for each table"
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if line == ROWS_HEADER:
+            after = lines[index + 1] if index + 1 < len(lines) else ""
+            assert ROW_SEPARATOR.fullmatch(after), (
+                f"line {index + 1}: the header has no separator row"
+            )
+    assert [line for line in text.splitlines() if line.startswith("| `")] == []
+    for table in ROWS_TABLES:
+        assert f"(rows/{table}/)" in text, f"rows.md points at nothing for {table}"
+
+
+def test_two_row_adds_under_the_same_table_merge_clean(tmp_path: Path) -> None:
+    """Two branches that each add one row file under the same table merge without a conflict, and
+    neither touches `rows.md`."""
+    assert row_fragments(), "no row files under docs/handbook/rows/"
+    repo = tmp_path / "handbook"
+    rows_md = repo / "docs" / "handbook" / "rows.md"
+    rows_md.parent.mkdir(parents=True)
+    shutil.copyfile(HANDBOOK / "rows.md", rows_md)
+    shutil.copytree(ROWS, repo / "docs" / "handbook" / "rows")
+    assert git_in(repo, "init", "--quiet").returncode == 0
+    assert git_in(repo, "add", "-A").returncode == 0
+    assert git_in(repo, "commit", "--quiet", "-m", "the handbook").returncode == 0
+    base = git_in(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    assert base
+    adds: dict[str, Path] = {}
+    for branch, name, row in (
+        ("first-add", "480-first-add.md", "`FIRST_ADD`"),
+        ("second-add", "490-second-add.md", "`SECOND_ADD`"),
+    ):
+        assert git_in(repo, "checkout", "--quiet", base).returncode == 0
+        assert git_in(repo, "checkout", "--quiet", "-b", branch).returncode == 0
+        adds[branch] = repo / "docs" / "handbook" / "rows" / "settings" / name
+        adds[branch].write_text(f"| {row} | 1 | UNCALIBRATED | the {branch} row | 2026-11-13 |\n")
+        assert git_in(repo, "add", "-A").returncode == 0
+        assert git_in(repo, "commit", "--quiet", "-m", branch).returncode == 0
+    assert git_in(repo, "checkout", "--quiet", base).returncode == 0
+    for branch, added in adds.items():
+        merged = git_in(repo, "merge", "--quiet", "--no-edit", branch)
+        assert merged.returncode == 0, merged.stdout + merged.stderr
+        assert added.exists(), added
+    assert git_in(repo, "diff", "--quiet", base, "--", "docs/handbook/rows.md").returncode == 0
+    conflicts = [path for path in repo.rglob("*.md") if "<<<<<<<" in path.read_text()]
+    assert conflicts == []
 
 
 def practice_fragments() -> list[Path]:
@@ -543,15 +625,15 @@ def test_nights_check_takes_and_refuses() -> None:
 
 def test_rows_check_refuses_a_malformed_row() -> None:
     good = "| `MIN_MOVE` | 3 per cent | UNCALIBRATED | The owner's requirement | 2026-11-11 |"
-    table = f"{ROWS_HEADER}\n|---|---|---|---|---|\n"
-    assert check_rows(table + good) == []
-    assert any("second row" in e for e in check_rows(table + good + "\n" + good))
-    assert any("state" in e for e in check_rows(table + good.replace("UNCALIBRATED", "guessed")))
+    assert check_rows({"row": good}) == []
+    assert any("second row" in e for e in check_rows({"one": good, "two": good}))
+    assert any("state" in e for e in check_rows({"row": good.replace("UNCALIBRATED", "guessed")}))
     assert any(
         "names no record" in e
-        for e in check_rows(table + good.replace("UNCALIBRATED", "calibrated"))
+        for e in check_rows({"row": good.replace("UNCALIBRATED", "calibrated")})
     )
-    assert any("date" in e for e in check_rows(table + good.replace("2026-11-11", "today")))
+    assert any("date" in e for e in check_rows({"row": good.replace("2026-11-11", "today")}))
+    assert any("2 non-blank lines" in e for e in check_rows({"row": good + "\n" + good}))
 
 
 def test_practices_check_refuses_an_unsourced_line() -> None:
@@ -561,87 +643,3 @@ def test_practices_check_refuses_an_unsourced_line() -> None:
     assert check_practices(page + "* A practice; not yet built (roadmap step 7).\n", steps) == []
     assert check_practices(page + "* A practice.\n", steps) != []
     assert check_practices(page + "* A practice; not yet built (roadmap step 9).\n", steps) != []
-
-
-def test_check_rows_validates_every_rows_table_in_rows_md() -> None:
-    bad = (
-        HANDBOOK / "rows.md"
-    ).read_text() + "\n| `TRAIL_CAP` | duplicate | guessed | | bad-date |\n"
-    assert check_rows(bad) != []
-
-
-@pytest.mark.parametrize(
-    ("old", "new", "complaint"),
-    [
-        ("`TRAIL_CAP`", "`MIN_MOVE`", "second row"),
-        ("`TRAIL_CAP`", "trail_cap", "upper-case name"),
-        ("0.02", "", "no value"),
-        ("UNCALIBRATED", "guessed", "state"),
-        ("The owner's requirement", "", "no source"),
-        ("UNCALIBRATED", "calibrated", "names no record"),
-        ("2026-11-11", "bad-date", "not a date"),
-        ("2026-11-11", "2026-02-30", "not a date"),
-        (" | 2026-11-11", "", "expected 5"),
-    ],
-)
-def test_rows_check_validates_later_tables(old: str, new: str, complaint: str) -> None:
-    table = f"{ROWS_HEADER}\n|---|---|---|---|---|\n"
-    first = "| `MIN_MOVE` | 3 per cent | UNCALIBRATED | The owner's requirement | 2026-11-11 |"
-    second = "| `TRAIL_CAP` | 0.02 | UNCALIBRATED | The owner's requirement | 2026-11-11 |"
-    page = table + first + "\n\nWindow settings.\n\n" + table
-    assert check_rows(page + second) == []
-    errors = check_rows(page + second.replace(old, new))
-    assert any(complaint in error for error in errors), errors
-
-
-@pytest.mark.parametrize("position", ["before", "between", "after"])
-def test_rows_check_refuses_rows_outside_a_headered_table(position: str) -> None:
-    table = f"{ROWS_HEADER}\n|---|---|---|---|---|\n"
-    first = table + "| `MIN_MOVE` | 3 per cent | UNCALIBRATED | Requirement | 2026-11-11 |"
-    second = table + "| `TRAIL_CAP` | 0.02 | UNCALIBRATED | Requirement | 2026-11-11 |"
-    stray = "| `ATR_K` | 1 | UNCALIBRATED | Requirement | 2026-11-11 |"
-    pages = {
-        "before": f"{stray}\n\n{first}\n\n{second}",
-        "between": f"{first}\n\n{stray}\n\n{second}",
-        "after": f"{first}\n\n{second}\n\n{stray}",
-    }
-    errors = check_rows(pages[position])
-    assert any("outside a headered table" in error for error in errors), errors
-
-
-def test_rows_check_refuses_an_empty_later_table() -> None:
-    table = f"{ROWS_HEADER}\n|---|---|---|---|---|\n"
-    first = "| `MIN_MOVE` | 3 per cent | UNCALIBRATED | Requirement | 2026-11-11 |"
-    errors = check_rows(table + first + "\n\n" + table)
-    assert "the table has no row" in errors
-
-
-@pytest.mark.parametrize(
-    ("row", "complaint"),
-    [
-        ("| `TRAIL_CAP` | 0.02 | UNCALIBRATED | Requirement | 2026-11-12 |", "second row"),
-        ("| `LATE_ROW` | 1 | UNCALIBRATED | Requirement | bad-date |", "not a date"),
-    ],
-)
-def test_rows_md_second_table_row_is_checked_by_name(row: str, complaint: str) -> None:
-    # Code review of the rows check: the row is appended inside the last table, not after a blank
-    # line, so it is caught by its own fault rather than only as a stray row.
-    text = (HANDBOOK / "rows.md").read_text().rstrip("\n") + "\n" + row + "\n"
-    errors = check_rows(text)
-    assert any(complaint in error for error in errors), errors
-    assert not any("outside a headered table" in error for error in errors), errors
-
-
-@pytest.mark.parametrize(
-    "after_header",
-    [
-        "| `TRAIL_CAP` | | guessed | | bad-date |",
-        "| Row | Value | Status | Source or study | Date |",
-    ],
-)
-def test_rows_check_refuses_a_header_with_no_separator(after_header: str) -> None:
-    # Code review of the rows check: the line after a header was taken as its separator unread.
-    page = f"{ROWS_HEADER}\n{after_header}\n|---|---|---|---|---|\n"
-    page += "| `MIN_MOVE` | 3 per cent | UNCALIBRATED | Requirement | 2026-11-11 |\n"
-    errors = check_rows(page)
-    assert any("no separator" in error for error in errors), errors

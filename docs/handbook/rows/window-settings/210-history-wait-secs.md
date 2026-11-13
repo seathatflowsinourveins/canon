@@ -1,0 +1,1 @@
+| `HISTORY_WAIT_SECS` | 130 seconds before an unanswered warm-up is named unanswered; the slot enters on the cold path meanwhile | UNCALIBRATED | `mover.HISTORY_WAIT_SECS` (`mover.py:499`), one adapter REST call at its longest | 2026-11-13 |

@@ -1,0 +1,1 @@
+| `MIN_RECENT_SESSIONS` | 5 recent sessions in a segment before its row is used, else the symbol is thin by name | UNCALIBRATED | Source 40473e88; lead, no primary source; a constant, not a setting | 2026-11-12 |
