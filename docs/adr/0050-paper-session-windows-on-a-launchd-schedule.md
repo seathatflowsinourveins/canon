@@ -245,16 +245,21 @@ minute, skipped by name with its heartbeat written; the installed plist was stil
 **Turned on (2026-11-13).** The owner directed on 2026-11-13 that account B be in a window whenever Alpaca's
 clock says a session is open, with no lane holding a timer for it, and that a proof take its turn through
 account B's lock. Main's value is `mover` from this change, which #289 had set to `off` on 2026-11-12 until the
-universe landed. Nothing is installed with it: the plist `scripts/automation` writes already runs
-`--session auto --minutes 25 --mover --regular-strategy Mover` 600 s after each firing ends (above), so a
-window starts about every 35 minutes while a session is open, and each firing reads the switch from the main it
-clones. This change lands only after the one that makes the per-symbol trail the Mover window's default, so a
+universe landed. The plist `scripts/automation` writes runs `--session auto --minutes 25 --mover
+--regular-strategy Mover` an interval after each firing ends (above), and each firing reads the switch from the
+main it clones. The interval goes from 600 s to 70 s with this change, by the lead's ruling of 2026-11-13 that
+account B be idle about a minute between two scheduled windows, not ten: above the 60 s gap, so the firing
+after a window is not skipped. With a firing's clone, sync and imports, a window then follows the last within
+about two minutes while a session is open. The new interval reaches the machine only through the maintenance
+agent's install from main (ADR 0065), which rewrites and reloads the plist; until then the installed one keeps
+600 s. A closed session's firing then checks the clock about every 70 s, some 1,200 a day where there were
+144, each a fetch of main and one clock call holding account B's lock for a few seconds. The status row's
+overdue bound, two intervals and 300 s, becomes about 7 minutes. This change lands only after the one that makes the per-symbol trail the Mover window's default, so a
 scheduled window, which passes no trail flag, runs that default. A firing launchd starts after this landing is
 UNVERIFIED until the first one. Limits:
 
-* **Account B is idle between windows.** Of each 35 minutes, about 10 are the pause and a window's start and
-  stop; a run by hand may fill them. A shorter interval is a change to `scripts/automation` and its install,
-  not made here.
+* **Account B is idle between windows** for the interval and a firing's start-up, about two minutes. That
+  is UNVERIFIED until the first firings at 70 s have run.
 * **A proof waits at most 900 s.** A run by hand waits for account B's lock as a firing does, at most
   `lockwait` (900 s), and a scheduled window holds it for about 27 minutes. A run started early in a scheduled
   window therefore fails by name with nothing placed, and is started again after that window's end;

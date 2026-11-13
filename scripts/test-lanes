@@ -604,8 +604,8 @@ aged() { local t; t=$(tstamp $(( $(date +%s) - $1 ))) && TZ=UTC touch -t "$t" "$
 # the plist status reads (install rewrites it as it reloads the job), kept aside meanwhile if there is one
 SPP="$HOME/Library/LaunchAgents/local.canon.paper-session.plist"; mkdir -p "${SPP%/*}"; spp_kept=""
 if [ -e "$SPP" ]; then spp_kept="$TMP/spp.kept"; cp -p "$SPP" "$spp_kept"; fi
-aged 900 "$PD/latest.json" "$PD/last-firing.json" "$PD/scheduled-firing.json" "$SPP"; status
-check "the last firing 15 minutes ago, the job not running: not yet overdue (a sleep, or a reload restarting the interval)" \
+aged 300 "$PD/latest.json" "$PD/last-firing.json" "$PD/scheduled-firing.json" "$SPP"; status
+check "the last firing 5 minutes ago, the job not running: not yet overdue (a sleep, or a reload restarting the interval)" \
       eval '! grep -q "overdue" "$TMP/status.out"'
 aged 1800 "$PD/latest.json" "$PD/last-firing.json" "$PD/scheduled-firing.json" "$SPP"; status; rc=$?
 check "the last firing ended 30 minutes ago, the job not running: STALE, overdue, exit 1" \
@@ -734,12 +734,12 @@ if command -v plutil >/dev/null 2>&1; then
         eval '[ "$(git -C "$CK" rev-parse HEAD)" = "$(git -C "$O" rev-parse main)" ] && ! git -C "$CK" symbolic-ref -q HEAD >/dev/null && [ "$(git -C "$CK" config canon.paperCheckout)" = true ]'
   # launchd counts StartInterval from the end of the last firing, not its start (observed on macOS 27.2: a
   # 20 s interval and a 15 s job started every 35 s), so the interval is the pause after a firing: at least
-  # session_window.GAP_SECS, and with a 25-minute window and about two minutes of start-up and stop, a
-  # window every 35 minutes or so
+  # session_window.GAP_SECS, so the firing after a window is not skipped, and short, so account B is idle
+  # about a minute and its start-up between two windows while a session is open (ADR 0050, 2026-11-13)
   piv=$(plutil -extract StartInterval raw -o - "$PP"); pmin=$(plutil -extract ProgramArguments.8 raw -o - "$PP")
   pgap=$(sed -n 's/^GAP_SECS = \([0-9]*\).*/\1/p' "$ROOT/src/canon_trading/session_window.py")
-  check "... 10 minutes after each firing ends (${piv} s): above session_window's gap (${pgap} s), a ${pmin}-minute window about every 35 minutes" \
-        eval '[ "$piv" = 600 ] && [ -n "$pgap" ] && [ "$piv" -ge "$pgap" ] && [ $((pmin * 60 + 120 + piv)) -le 2300 ]'
+  check "... ${piv} s after each firing ends: above session_window's gap (${pgap} s) and at most 90 s, so a ${pmin}-minute window follows the last within about two minutes" \
+        eval '[ "$piv" = 70 ] && [ -n "$pgap" ] && [ "$piv" -gt "$pgap" ] && [ "$piv" -le 90 ]'
   check "... from the automation folder, not a checkout" test "$(plutil -extract WorkingDirectory raw -o - "$PP")" = "$AH/canon"
   check "... not at load"                         test "$(plutil -extract RunAtLoad raw -o - "$PP")" = false
   check "... marked as the schedule's (CANON_PAPER_SCHEDULED=1), which a run by hand is not" \
