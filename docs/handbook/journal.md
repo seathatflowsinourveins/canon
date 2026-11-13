@@ -121,3 +121,29 @@ ten fields as list lines, in this order, each with a value:
 * status: open
 * supersedes: none
 * source: lead
+
+### L0007: A name that ranked in after the start was passed over for want of its entry context
+
+* area: entries
+* session: 2026-11-13
+* result: Under the registered arm the Mover read entry contexts only for the startup roster, so every name that ranked into a slot after the node started was dropped as having no entry context supplied; in the simulation a late name with a rising tape made no entry before this change and one entry, protected by its trailing sell, after it
+* evidence: tests/test_mover.py, the cases a name loaded on demand gets an entry context and enters, is protected after its fill like a roster name, and an unreadable on-demand history names the failure and sends no order; tests/test_mover_on_demand_context.py
+* lesson: A late-ranked name passed over for lack of context is a lost entry; its context is read on demand within a bounded request budget, and a name whose context cannot be read is named and passed over
+* change: the Mover reads a late name's context on demand on one worker, at most 20 reads and 150 data requests a minute of the context client's own (not a limiter shared with the window's other data reads), joins it with the minutes the node already holds, retries a failed read after 60 s and holds a missing day until the next, in this pull request
+* next: The first registered-arm window after 04:00 New York on the next weekday reports the late name's entry or its named refusal
+* status: open
+* supersedes: none
+* source: review
+
+### L0008: A submit Alpaca never answered was rejected and its later fill booked as another's
+
+* area: execution
+* session: 2026-11-13
+* result: Under the engine's default an unanswered submit was rejected on its in-flight timeout, so a fill Alpaca made on it later was booked to an external order and the strategy could send again; the four required cases were red with the port's source and green after it, and two paper windows on account B ran with the change ending flat
+* evidence: ADR 0044 and ADR 0075; packages/canon-alpaca/tests/test_execution_client.py, the cases an order that cannot be read is withheld and read again, and a retained filled submit keeps reading past the fill retry budget
+* lesson: An order the venue never answered is not known to have failed; it is retained, its fill is named by the client order ID the venue's read of the order shows, and it is asked about again until it is named or the node stops
+* change: the paper nodes retain an unresolved submit and name its fill by the client order ID Alpaca echoes (pull request 404)
+* next: A Mover window on account B as the forward check; the lost-submit path itself is shown offline only
+* status: open
+* supersedes: none
+* source: review

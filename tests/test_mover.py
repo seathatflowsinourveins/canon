@@ -345,6 +345,431 @@ def deferred_strategy(**changes: object) -> DeferredInstruments:
     return DeferredInstruments(original.settings)
 
 
+def on_demand_entry_context(
+    delay_ns: int | None = None, *, failure: str | None = None, protect: bool = False
+) -> tuple[DeferredInstruments, list, list]:
+    """The reader report's B: BBB ranks in, its instrument arrives, then its Day arrives."""
+    s, orders, asked = on_demand_entry_orders(delay_ns, failure=failure, protect=protect)
+    return s, [o for o in orders if o.side == OrderSide.BUY], asked
+
+
+def on_demand_entry_orders(
+    delay_ns: int | None = None, *, failure: str | None = None, protect: bool = False
+) -> tuple[DeferredInstruments, list, list]:
+    """Every order of the on-demand run, in the order the strategy made them."""
+    from concurrent.futures import Future
+
+    s = deferred_strategy(
+        entry_arm="registered", protect=protect, watch=1, size_from_budget=True, share_caps={AAA: 1}
+    )
+    s.load_delay = SECOND
+    asked: list[int] = []
+    full = replace(entry_day(RISING, 1000), symbol="BBB")
+
+    def reader(instrument_id: InstrumentId, at_ns: int) -> study.Day:
+        assert instrument_id == BBB
+        if failure is not None:
+            raise TimeoutError(failure)
+        opened = datetime.fromtimestamp(at_ns // SECOND, study.NEW_YORK)
+        minute = opened.hour * 60 + opened.minute
+        return replace(
+            full, bars=tuple(b for b in full.bars if b.start < minute), covered_to=minute
+        )
+
+    pending: list = []
+
+    def submit(call):
+        asked.append(s.clock.timestamp_ns())
+        future = Future()
+        if delay_ns is None:
+            try:
+                future.set_result(call())
+            except TimeoutError as error:
+                future.set_exception(error)
+        else:
+            pending.append((asked[-1] + delay_ns, future, call))
+        return future
+
+    step = s._on_step
+
+    def stepping(event) -> None:
+        for due, future, call in list(pending):
+            if due <= event.ts_event:
+                pending.remove((due, future, call))
+                future.set_result(call())
+        step(event)
+
+    s._on_step = stepping
+    s.context_reader = reader
+    s.context_submit = submit
+    quote = QuoteTick(
+        BBB,
+        Price(9.99, 4),
+        Price(10.01, 4),
+        Quantity.from_int(10_000),
+        Quantity.from_int(10_000),
+        T0,
+        T0,
+    )
+    eng = engine()
+    orders = run(eng, s, ranker(rank((BBB, "0.4"))), [quote, *tape(BBB, [*RISING, RISING[-1]])])
+    eng.dispose()
+    return s, orders, asked
+
+
+def test_a_name_loaded_on_demand_is_protected_after_its_fill_like_a_roster_name() -> None:
+    """No position without its exit (the owner's clause 1): a late name's filled entry is followed by a
+    TRAILING_STOP_LIMIT sell of the same quantity, made by the same _protect as a roster name's.
+    This shows the exit is armed after the fill; it does not show a refusal before the send when an
+    exit cannot be armed, which no name has on main."""
+    s, orders, asked = on_demand_entry_orders(protect=True)
+    buys = [o for o in orders if o.side == OrderSide.BUY]
+    assert [o.instrument_id for o in buys] == [BBB], s.dropped
+    assert len(asked) == 1
+    assert s.record()["entries"][0]["context_source"] == "on_demand"
+    filled = buys[0].filled_qty.as_decimal()
+    assert filled > 0
+    trailing = [
+        o for o in orders if o.side == OrderSide.SELL and o.order_type.name == "TRAILING_STOP_LIMIT"
+    ]
+    assert [(o.instrument_id, o.quantity.as_decimal()) for o in trailing][:1] == [(BBB, filled)]
+    assert trailing[0].ts_init >= buys[0].ts_last
+
+
+def test_a_name_loaded_on_demand_gets_an_entry_context_and_enters() -> None:
+    s, buys, asked = on_demand_entry_context()
+    assert [o.instrument_id for o in buys] == [BBB], s.dropped
+    assert len(asked) == 1
+    entry = s.record()["entries"][0]
+    assert entry["context_source"] == "on_demand"
+    assert entry["context_seconds"] is not None and entry["context_seconds"] >= 0
+    assert not any("no entry context supplied" in why for why in s.dropped)
+    assert s.record()["on_demand_contexts"][str(BBB)]["reads"] == 1
+    assert entry["sizing"]["roster"] is False
+    assert entry["sizing"]["held_by"] in ("entry_notional", "free_balance", "flow_share")
+    assert entry["position_cap"] == "Mover sizing only; no native PositionCap"
+    assert entry["baseline_status"] == "absent: not in the startup roster"
+
+
+def test_a_context_still_being_read_refuses_by_name_with_its_seconds() -> None:
+    import re
+
+    s, _buys, asked = on_demand_entry_context(delay_ns=150 * SECOND)
+    pending = [why for why in s.dropped if "entry_context_pending" in why]
+    assert pending, s.dropped
+    assert all(
+        re.search(r"entry_context_pending: \d+\.\d s since the name was loaded", why)
+        for why in pending
+    )
+    assert not any("no entry context supplied" in why for why in s.dropped)
+    assert asked
+
+
+def test_an_unreadable_on_demand_history_names_the_failure_and_sends_no_order() -> None:
+    s, buys, asked = on_demand_entry_context(failure="SIP history unavailable")
+    assert not buys
+    assert asked
+    assert any(str(BBB) in why and "SIP history unavailable" in why for why in s.dropped)
+    row = s.record()["on_demand_contexts"][str(BBB)]
+    assert row["failures"] and "TimeoutError: SIP history unavailable" in row["failures"]
+    assert row["ready_ns"] is None
+
+
+def test_a_burst_of_context_names_is_bounded_and_the_excess_is_named() -> None:
+    from concurrent.futures import Future
+
+    s = strategy(entry_arm="registered")
+    called = []
+
+    def reader(instrument_id, at_ns):
+        called.append((instrument_id, at_ns))
+        return replace(entry_day(RISING), symbol=instrument_id.symbol.value)
+
+    def submit(call):
+        future = Future()
+        future.set_result(call())
+        return future
+
+    s.context_reader, s.context_submit = reader, submit
+    names = [InstrumentId.from_str(f"LATE{i}.ALPACA") for i in range(21)]
+    for instrument in names:
+        assert s._request_context(instrument, now=T0)
+    assert len(called) == 20
+    row = s.record()["on_demand_contexts"][str(names[-1])]
+    assert row["reads"] == 0 and "rolling minute limit of 20" in row["deferred"]
+    s._request_context(names[-1], now=T0 + MINUTE - 1)
+    assert len(called) == 20
+    s._request_context(names[-1], now=T0 + MINUTE)
+    assert len(called) == 21
+
+
+def test_a_roster_entry_is_unchanged_with_the_on_demand_reader_configured() -> None:
+    before, buys_before = registered_orders(entry_day(RISING), "registered", RISING)
+    s = strategy(entry_arm="registered", protect=False, entries=1)
+    s.entry_contexts[AAA] = entry_day(RISING)
+
+    def reader(*args):
+        pytest.fail("a complete roster context must not be read again")
+
+    s.context_reader = reader
+    eng = engine()
+    orders = run(eng, s, ranker(rank((AAA, "0.25"))), entry_tape([*RISING, RISING[-1]]))
+    eng.dispose()
+    buys = [o for o in orders if o.side == OrderSide.BUY]
+    assert [(o.quantity, o.price) for o in buys] == [(o.quantity, o.price) for o in buys_before]
+    assert s.entries_sent[0]["qualified_ns"] == before.entries_sent[0]["qualified_ns"]
+    assert s.entries_sent[0]["context_source"] == "roster"
+    assert s.entries_sent[0]["context_seconds"] is None
+    assert s.record()["on_demand_contexts"] == {}
+
+
+def test_pending_context_live_minutes_are_kept_and_need_no_second_read() -> None:
+    s, buys, asked = on_demand_entry_context(delay_ns=150 * SECOND)
+    assert buys and len(asked) == 1
+    assert {660, 661} <= {bar.start for bar in s.entry_contexts[BBB].bars}
+
+
+def late_internal_context(
+    gap: str, *, delay_ns: int = 0, gap_delay_ns: int = 0, missing: str | None = None
+) -> tuple:
+    """A late INTERNAL subscription, with the rank feed's complete minute already in the cache."""
+    from concurrent.futures import Future
+
+    s = deferred_strategy(
+        entry_arm="registered", bar_spec="1-MINUTE-LAST-INTERNAL", protect=False, entries=1
+    )
+    s.load_delay = SECOND
+    asked, pending, observed = [], [], []
+    full = replace(entry_day(RISING), symbol="BBB", reference=9.0, missing=missing)
+
+    def reader(instrument_id, at_ns):
+        asked.append((instrument_id, at_ns))
+        opened = datetime.fromtimestamp(at_ns // SECOND, study.NEW_YORK)
+        minute = opened.hour * 60 + opened.minute
+        return replace(
+            full, bars=tuple(b for b in full.bars if b.start < minute), covered_to=minute
+        )
+
+    def submit(call):
+        future = Future()
+        pending.append((s.clock.timestamp_ns() + delay_ns, future, call))
+        return future
+
+    step, registered = s._on_step, s._registered_run
+
+    def stepping(event):
+        for due, future, call in list(pending):
+            if due <= event.ts_event:
+                pending.remove((due, future, call))
+                future.set_result(call())
+        step(event)
+
+    def observing(slot, bar):
+        registered(slot, bar)
+        context = s.entry_contexts.get(BBB)
+        observed.append((bar.ts_init, context, tuple(s.notes.get(BBB, ()))))
+
+    s._on_step, s._registered_run = stepping, observing
+    s.context_reader, s.context_submit = reader, submit
+    first_quote = QuoteTick(
+        BBB,
+        Price(9.99, 4),
+        Price(10.01, 4),
+        Quantity.from_int(10_000),
+        Quantity.from_int(10_000),
+        T0,
+        T0,
+    )
+    cached = []
+    if gap != "absent":
+        opened = T0 + {"complete": 0, "other_day": -1440 * MINUTE, "future": 3 * MINUTE}[gap]
+        cached.append(
+            Bar(
+                bar_type(BBB),
+                Price(9.8, 4),
+                Price(10.0, 4),
+                Price(9.7, 4),
+                Price(10.0, 4),
+                Quantity.from_int(123_456),
+                opened,
+                T0 + MINUTE + SECOND + gap_delay_ns,
+            )
+        )
+    eng = engine()
+    orders = run(
+        eng,
+        s,
+        ranker(rank((BBB, "0.4"))),
+        [first_quote, *trade_tape(BBB, [*RISING, RISING[-1]]), *cached],
+    )
+    eng.dispose()
+    del s._on_step
+    del s._registered_run
+    s.context_submit = None
+    return s, [o for o in orders if o.side == OrderSide.BUY], asked, observed
+
+
+@pytest.mark.parametrize("delay_ns", [0, 90 * SECOND])
+def test_a_late_internal_name_has_context_on_its_first_full_bar_with_one_read(delay_ns):
+    s, buys, asked, observed = late_internal_context("complete", delay_ns=delay_ns)
+    first_ns, first_context, first_notes = observed[0]
+    assert first_ns == T0 + 2 * MINUTE
+    assert first_context is not None and first_context.covered_to == 662
+    assert first_context.bars[0] == study.Minute(660, 9.8, 10.0, 9.7, 10.0, 123_456.0)
+    assert first_context.bars[-1].start == 661
+    assert len(asked) == 1
+    # Context eligibility starts on the first full bar; the registered three-rise rule is unchanged.
+    assert s.slots[BBB].entry_start == 661
+    assert len(buys) == 1 and buys[0].init_event.ts_init == T0 + 5 * MINUTE
+    assert not any("coverage" in note for note in first_notes)
+
+
+@pytest.mark.parametrize("gap", ["absent", "other_day", "future"])
+def test_a_late_internal_name_keeps_an_unknown_gap_named_without_a_second_read(gap):
+    s, buys, asked, observed = late_internal_context(gap)
+    assert not buys
+    assert len(asked) == 1
+    assert observed[0][1].covered_to == 660
+    assert any("coverage gap" in note and "660" in note for note in s.notes[BBB])
+    assert s.entry_contexts[BBB].covered_to == 660
+
+
+def test_a_gap_filled_later_joins_buffered_full_bars_without_reading_history_again():
+    s, buys, asked, observed = late_internal_context("complete", gap_delay_ns=2 * MINUTE)
+    assert observed[0][1].covered_to == observed[1][1].covered_to == 660
+    assert observed[2][1].covered_to == 664
+    assert [bar.start for bar in observed[2][1].bars] == [660, 661, 662, 663]
+    assert len(asked) == 1 and len(buys) == 1
+    assert buys[0].init_event.ts_init == T0 + 5 * MINUTE
+    assert any("coverage gap" in note for note in s.notes[BBB])
+
+
+def test_a_missing_late_name_stays_named_once_and_never_enters_or_retries_on_live_bars():
+    reason = "no prior-session reference close"
+    s, buys, asked, _observed = late_internal_context("complete", missing=reason)
+    assert not buys and len(asked) == 1
+    assert sum(reason in note for note in s.dropped) == 1
+    row = s.record()["on_demand_contexts"][str(BBB)]
+    assert not row["pending"] and row["failures"] == [] and row["ready_ns"] is None
+
+
+@pytest.mark.parametrize(
+    "reason",
+    ["no prior-session reference close", "no earlier calendar session", "only 2 earlier sessions"],
+)
+def test_a_missing_day_is_named_once_and_only_a_new_day_permits_another_read(reason):
+    from concurrent.futures import Future
+
+    s = strategy(entry_arm="registered")
+    asked = []
+    first = replace(entry_day([]), symbol="BBB", missing=reason, reference=None)
+
+    def reader(instrument_id, at_ns):
+        asked.append((instrument_id, at_ns))
+        return replace(first, day=datetime.fromtimestamp(at_ns // SECOND, study.NEW_YORK).date())
+
+    def submit(call):
+        future = Future()
+        future.set_result(call())
+        return future
+
+    s.context_reader, s.context_submit = reader, submit
+    s._request_context(BBB, now=T0)
+    s._finish_contexts(T0 + SECOND)
+    for minutes in (1, 2, 5, 30, 59):
+        s._request_context(BBB, refresh=True, now=T0 + minutes * MINUTE)
+        s._finish_contexts(T0 + minutes * MINUTE + SECOND)
+    assert len(asked) == 1
+    row = s.record()["on_demand_contexts"][str(BBB)]
+    assert not row["pending"] and row["ready_ns"] is None and row["failures"] == []
+    assert row["last_failure"] is None
+    assert s.entry_contexts[BBB].missing == reason
+    assert sum(reason in note for note in s.dropped) == 1
+    s._request_context(BBB, refresh=True, now=T0 + 1440 * MINUTE)
+    s._finish_contexts(T0 + 1440 * MINUTE + SECOND)
+    assert len(asked) == 2
+    assert s.entry_contexts[BBB].day == first.day + timedelta(days=1)
+
+
+def test_a_context_left_at_stop_is_named_and_cannot_install_after_stop() -> None:
+    s, buys, asked = on_demand_entry_context(delay_ns=1000 * SECOND)
+    assert asked and not buys
+    row = s.record()["on_demand_contexts"][str(BBB)]
+    assert row["failures"][-1] == "cancelled at stop"
+    assert s.context_reads[BBB].future is None
+    assert BBB not in s.entry_contexts
+
+
+def test_a_context_retry_waits_from_failure_and_success_clears_only_the_active_error() -> None:
+    from concurrent.futures import Future
+
+    s = strategy(entry_arm="registered")
+    futures = []
+
+    def submit(call):
+        future = Future()
+        futures.append(future)
+        return future
+
+    s.context_reader = lambda *args: replace(entry_day(RISING), symbol="BBB")
+    s.context_submit = submit
+    s._request_context(BBB, now=T0)
+    futures[0].set_exception(OSError("history unreadable"))
+    s._finish_contexts(T0 + 120 * SECOND)
+    s._request_context(BBB, now=T0 + 179 * SECOND)
+    assert len(futures) == 1
+    s._request_context(BBB, now=T0 + 180 * SECOND)
+    assert len(futures) == 2
+    futures[1].set_result(replace(entry_day(RISING), symbol="BBB"))
+    s._finish_contexts(T0 + 181 * SECOND)
+    assert s.context_reads[BBB].last_failure is None
+    assert s.record()["on_demand_contexts"][str(BBB)]["failures"] == ["OSError: history unreadable"]
+
+
+def test_context_live_minutes_are_joined_only_on_their_day_and_coverage_stops_at_1600() -> None:
+    from concurrent.futures import Future
+
+    s = strategy(entry_arm="registered")
+    future = Future()
+    s.context_reader = lambda *args: entry_day(RISING)
+    s.context_submit = lambda call: future
+    s._request_context(BBB, now=T0)
+    read = s.context_reads[BBB]
+    day = replace(entry_day([]), symbol="BBB", covered_to=1000)
+    read.live_day = day.day - timedelta(days=1)
+    read.live = {660: study.Minute(660, 99, 99, 99, 99, 1)}
+    future.set_result(day)
+    s._finish_contexts(T0 + SECOND)
+    installed = s.entry_contexts[BBB]
+    assert installed.bars == ()
+    assert installed.covered_to == study.WINDOW_END
+
+
+def test_context_worker_is_single_and_does_not_block_the_calling_thread() -> None:
+    from threading import Event
+
+    s = strategy(entry_arm="registered")
+    entered, release, second = Event(), Event(), Event()
+
+    def first():
+        entered.set()
+        assert release.wait(5)
+
+    first_future = s._submit_context(first)
+    try:
+        assert entered.wait(5)
+        next_future = s._submit_context(second.set)
+        assert not second.wait(0.02)
+        release.set()
+        first_future.result(timeout=5)
+        next_future.result(timeout=5)
+        assert second.is_set()
+    finally:
+        release.set()
+        if s._context_executor is not None:
+            s._context_executor.shutdown(wait=True, cancel_futures=True)
+
+
 def test_an_on_demand_buy_and_sale_after_a_rise_pass_without_a_roster_engine_cap():
     # The real risk engine caps only AAA at $1; BBB must pass with its absent map entry, both ways.
     eng = engine(order_cap=Decimal(1))
@@ -925,6 +1350,9 @@ def test_a_new_day_context_starts_a_new_watch_clock() -> None:
         settings=SimpleNamespace(entry_arm="registered"),
         sold={},
         entry_contexts={AAA: old_day},
+        context_reader=None,
+        context_reads={},
+        context_sources={},
         _note=lambda _slot, _why: None,
         _say=lambda _text: None,
     )
