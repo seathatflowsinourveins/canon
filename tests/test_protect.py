@@ -1981,11 +1981,14 @@ def test_the_paper_tests_checks_of_what_is_working_leave_out_a_listed_order_that
 # The lead's rule of 2026-11-13 (order D): in any session, on any account, a position has its exit. Each
 # case below is one of the day's shapes of a long that `paper:protect` finds, and asserts that the long
 # ends the run with a working sell that covers it. The marker gathers the set across files
-# (`pytest -m no_position_without_its_exit`); a case of a gap not yet closed is xfail strict, so the
+# (`pytest -m no_position_without_its_exit`), each naming the clause of ADR 0150 it holds, and
+# `python -m canon_trading.exit_rule` prints every clause's status from them; a case of a gap not yet
+# closed is xfail strict, so the
 # set turns red when its fix lands and the mark is not lifted. A review that finds a new way a position
 # had no exit adds its case here in the same pull request. Inputs are quotes, bars and steps only.
 
-EXIT = pytest.mark.no_position_without_its_exit
+EXIT = pytest.mark.no_position_without_its_exit(clause=2)
+"""ADR 0150's clause 2: a holding the owner opens gets the same exit, by itself."""
 
 
 def _covered(paper: Paper, symbol: str, qty: int, code: int, lines: list[str]) -> None:
