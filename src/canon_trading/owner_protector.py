@@ -34,17 +34,40 @@ NautilusTrader d53849b216e2, v2.0.0rc8:
   through the normal event pipeline. Cache.positions_open (common/__init__.pyi:568-575) discovers
   those longs at start and on the one-second timer, without claiming their order/event topics.
   price_step.up_on_step uses tick_scheme.rs:555-578 to round a new level up, never looser.
+* python/nautilus_trader/model/__init__.pyi:5868: Position.avg_px_open is the holding's
+  average entry. trading/__init__.pyi:552-560: modify_order accepts a trigger and limit price.
+  crates/execution/src/order_emulator/emulator.rs:814-928 applies that update locally and
+  reindexes/matches it; trailing.rs:61-100,129-143 only raises sell triggers and limits.
+  common/__init__.pyi:1523-1550 seeds both prices when remaking a trailing_stop_limit.
+* crates/execution/src/order_emulator/emulator.rs:1720-1782: activation_price leaves the
+  trailing order inert until the bid reaches it; it cannot protect the holding before gain
+  arming. trailing.rs:59-62 seeds the trigger from the current trigger/offset, not activation.
+  The strategy therefore retains the cost floor and applies it through modify_order, with
+  observation checks and arming-time cost. :814-928 rematches a modify immediately, so a
+  raised floor above the current usable bid must wait while the existing stop stays in force.
+* U-d: crates/execution/src/order_emulator/emulator.rs:1394-1405,1447-1465,1534-1585
+  transforms the trail into a LIMIT at its retained price and publishes OrderReleased.
+  python/nautilus_trader/common/__init__.pyi:1388-1407 supplies OrderFactory.limit;
+  trading/__init__.pyi:656,668 supplies the release/fill callbacks. A rejected cancel restores
+  state (crates/model/src/orders/mod.rs:1067-1068); a new sale waits for a terminal cancel
+  (ADR 0088:61-65), never modify_order. ADR 0036 excludes extended-session broker stops;
+  canon_alpaca/execution.py:257-262 accepts a marked DAY limit (ADR 0038).
 
 Coverage follows protect.py:514-570: sum remaining shares of simple working sells; unknown cover,
 contingencies and pending changes freeze; full cover needs no sell; partial foreign cover freezes;
 otherwise protect uncovered whole shares. Order ownership must establish EXTERNAL coverage before
 node/protect lineage is counted; another strategy's position or sell freezes the instrument by name.
 Freezing retains an armed sell unless aggregate working sells could oversell the EXTERNAL long.
-Cancellation requires an exact client ID this instance sent. Re-sizing our protection is cancel,
-acknowledgement, then re-arm from the retained level; DAY expiry also permits re-arming.
+Cancellation requires an exact client ID this instance sent. Before release, re-sizing protection
+is cancel, acknowledgement, then re-arm from the retained level; DAY expiry also permits re-arming.
 
-The engine owns trailing and release after arming. Every submission is a reduce-only DAY trailing
-stop-limit, emulated on BID_ASK, with extended_hours=True. Offsets use Mover's existing
+The engine owns trailing and release after arming. Initial protection is a reduce-only DAY trailing
+stop-limit, emulated on BID_ASK, with extended_hours=True. Once released, the sale stays a marked,
+reduce-only DAY limit across cancels and expiry. U-d imports main's exit_price, chase_floor and
+registered Mover rows: a tick through the bid, down to the first sale's chase floor, released after
+FLOOR_WAIT_SECS resting there with the bid through it. A gain trigger never floors the sale (the
+lead's R3, 2026-11-13). Each sale logs its re-prices, trigger-to-fill time and floor wait; an
+acknowledgement is not a fill. Offsets use Mover's existing
 explicit-distance calculation with a dollar distance from protect.row_distance, the function used by
 protect.plan_distance (ADR 0142). The required row is OWN1 or OWN3 from protect.ROWS, without a default
 or fraction overrides; F2 is refused by name because the holding's distance must be per symbol.
@@ -93,13 +116,37 @@ the limit's sign; the two observations of the next arming (U-c) cover the electi
 (b) there is no on_resume or on_reset, so a node stopped and resumed protects nothing until it is
 started fresh, as paper:protector starts each run. A protector that cannot act on its quotes says
 so at every step.
+
+Gain lock (ADR 0083:29; handbook/philosophy.md:29; owner, 2026-11-13; the arithmetic is
+canon_trading.gain_lock, shared with the Mover): a subsequent fresh quote with bid >= average
+entry + round-trip cost + noise floor latches a floor at up_on_step(entry + cost). The entry's
+fill paid the ask and the lock reads the bid, so the spread is not counted again: the cost is fees
+per share, zero on paper until ADR 0147 (the lead's cost ruling, 2026-11-13). Noise is
+SPREAD_FLOOR_M times the arming quote's spread. Both are fixed at arming, UNCALIBRATED rows
+ROUND_TRIP_COST and NOISE_FLOOR. The level is max(retained trail, applied floor + limit_offset -
+trailing_offset), rounded up. A floor is applied only while the bid is above the trigger it would
+set, so arming or a raise never trips the sale by itself; until then the previous applied floor
+and stop are kept and the wait is named. A higher average raises the latched floor; a lower or
+unknown one never lowers either floor. Only our still-emulated sell is modified, and never in a
+step that cancels it for size. Arming needs a positive spread, an observation newer than the
+quote the level was armed on (unit 10's _after_arming) with both stamps after the arming,
+event age within protect.QUOTE_MOST, and forward skew within the UNCALIBRATED 100 ms row
+GAIN_QUOTE_FORWARD_SKEW. The exit beats the lock (the lead's R3): the lock moves the trigger and
+sets the first limit at the applied floor; it never withholds the sale, and a chase under the
+floor is a later unit's. Arming and each floor change are logged and kept in gain_lock_events,
+and each fill of a sale the armed lock protected records its result against the entry and the
+spread when it was released (gain_lock_sales), in memory for the landing lane's record writer.
+An unknown basis or quote names the unarmed lock at most once a second per holding, while the
+ordinary trail remains in force.
 """
 
 from __future__ import annotations
 
+import json
 from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass
+from dataclasses import field
 from datetime import UTC
 from datetime import datetime
 from datetime import timedelta
@@ -120,6 +167,7 @@ from nautilus_trader.model import ClientOrderId
 from nautilus_trader.model import ContingencyType
 from nautilus_trader.model import InstrumentId
 from nautilus_trader.model import OmsType
+from nautilus_trader.model import OrderReleased
 from nautilus_trader.model import OrderSide
 from nautilus_trader.model import OrderStatus
 from nautilus_trader.model import OrderType
@@ -131,18 +179,24 @@ from nautilus_trader.model import TrailingOffsetType
 from nautilus_trader.model import TriggerType
 from nautilus_trader.trading import Strategy
 
+from . import gain_lock
 from . import protect
 from .custody import OURS
 from .custody import PROTECT
 from .custody import PROTECT_PREFIX
 from .custody import lineage
 from .ma_cross import refuse_unknown_keywords
+from .mover import FLOOR_WAIT_SECS
+from .mover import SECOND_NS
+from .mover import chase_floor
 from .mover import offsets
+from .price_step import exit_price
 from .price_step import up_on_step
 
 if TYPE_CHECKING:
     from nautilus_trader.common import TimeEvent
     from nautilus_trader.model import OrderCancelRejected
+    from nautilus_trader.model import OrderFilled
 
 
 STEP_TIMER = "owner-protection"
@@ -150,6 +204,8 @@ STEP_TIMER = "owner-protection"
 REFUSED_KEPT = 64
 WAITING = "unprotected: waiting"
 
+GAIN_QUOTE_FORWARD_SKEW_NS = 100_000_000
+"""100 ms forward event/receipt tolerance; UNCALIBRATED row GAIN_QUOTE_FORWARD_SKEW."""
 EXTERNAL = StrategyId("EXTERNAL")
 SUMMABLE_TYPES = frozenset(
     {
@@ -286,6 +342,71 @@ def _ahead(tick: QuoteTick) -> str:
     )
 
 
+def _after_arming(slot: Holding, tick: QuoteTick) -> bool:
+    """Received after the level was fixed, and stamped after the quote it was fixed on (C0's venue
+    clock orders observations by stamp alone)."""
+    return (
+        slot.armed_at is not None
+        and tick.ts_init > slot.armed_at
+        and (slot.armed_event is None or tick.ts_event > slot.armed_event)
+    )
+
+
+def _gain_quote_problem(tick: QuoteTick | None, now: int, started_at: int) -> str | None:
+    """Arming needs a usable observation and receipt after protection began, within both bounds."""
+    if tick is None:
+        return "unknown quote (absent)"
+    if (
+        tick.bid_price.as_decimal() <= 0
+        or tick.bid_size.as_decimal() <= 0
+        or tick.ask_size.as_decimal() <= 0
+    ):
+        return "unknown quote (invalid prices or sizes)"
+    if tick.ask_price.as_decimal() <= tick.bid_price.as_decimal():
+        return "unknown quote (waiting for a positive spread)"
+    if max(tick.ts_event, tick.ts_init) > now + GAIN_QUOTE_FORWARD_SKEW_NS:
+        return "unknown quote (GAIN_QUOTE_FORWARD_SKEW exceeded: 100 ms)"
+    if now - tick.ts_event > int(protect.QUOTE_MOST.total_seconds()) * 10**9:
+        return "unknown quote (stale: exceeds protect.QUOTE_MOST)"
+    if min(tick.ts_event, tick.ts_init) <= started_at:
+        return "unknown quote (waiting for observation and receipt after protection began)"
+    return None
+
+
+@dataclass
+class Sale:
+    """One released sale, retained across its cancel/expiry legs until its final fill."""
+
+    trigger_ns: int
+    first_price: Decimal
+    floor: Decimal | None
+    priced_ns: int
+    last_price: Decimal
+    reprices: int = 0
+    floor_reached: bool = False
+    floor_since: int | None = None
+    floor_wait_ns: int = 0
+    floor_release_price: Decimal | None = None
+    filled_ns: int | None = None
+    order_ids: set[ClientOrderId] = field(default_factory=set)
+
+    def record(self, now: int) -> dict[str, Any]:
+        return {
+            "trigger_ns": self.trigger_ns,
+            "first_price": str(self.first_price),
+            "reprices": self.reprices,
+            "trigger_to_fill_ns": (
+                None if self.filled_ns is None else self.filled_ns - self.trigger_ns
+            ),
+            "floor_reached": self.floor_reached,
+            "floor_wait_ns": self.floor_wait_ns
+            + (0 if self.floor_since is None else max(0, now - self.floor_since)),
+            "floor_release_price": (
+                None if self.floor_release_price is None else str(self.floor_release_price)
+            ),
+        }
+
+
 @dataclass
 class Holding:
     level: Price | None
@@ -309,6 +430,17 @@ class Holding:
     # filled in part and ended (e5: the exit in progress finishes), or after a DAY expiry (e4, a
     # named limit). A sell of ours that FILLED ends the holding; its residual is a new one.
     placed: bool = False
+    gain_last_observation: int | None = None
+    gain_entry: Decimal | None = None
+    round_trip_cost: Decimal | None = None
+    noise_floor: Decimal | None = None
+    gain_armed_at: int | None = None
+    gain_floor: Price | None = None
+    gain_applied_floor: Price | None = None
+    gain_unarmed_said_at: int | None = None
+    # The spread when a sale protected by the armed lock was released (measure 1).
+    gain_release_spread: Decimal | None = None
+    sale: Sale | None = None
 
 
 class OwnerProtector(Strategy):
@@ -335,6 +467,8 @@ class OwnerProtector(Strategy):
         self.refused_stamps: dict[InstrumentId, deque[int]] = {}
         # One quote at the running maximum per instrument, independent of levels and planning.
         self.venue_quotes: dict[InstrumentId, QuoteTick] = {}
+        self.gain_lock_events: list[dict[str, Any]] = []
+        self.gain_lock_sales: list[dict[str, Any]] = []
 
     def _note(self, tick: QuoteTick | None) -> bool:
         """Record every quote; return whether it raises an already established venue clock.
@@ -523,16 +657,7 @@ class OwnerProtector(Strategy):
             )
             return
         self.levels[instrument_id] = level
-        self._seed_clock(instrument_id)
-        newest = self.venue_quotes.get(instrument_id)
-        now = self.clock.timestamp_ns()
-        self.slots[instrument_id] = Holding(
-            level,
-            position.ts_opened,
-            position.ts_init,
-            armed_at=now,
-            armed_event=None if newest is None or not _usable(newest, now) else newest.ts_event,
-        )
+        self.slots[instrument_id] = self._new_holding(instrument_id, position, level)
         self._subscribe_holding(instrument_id)
         self._manage(instrument_id)
 
@@ -555,6 +680,24 @@ class OwnerProtector(Strategy):
             )
             self.subscribed.add(instrument_id)
 
+    def _new_holding(
+        self, instrument_id: InstrumentId, position: Any, level: Price | None = None
+    ) -> Holding:
+        """A supplied level is fixed now, on the venue-maximum quote if usable; a fresh one at its
+        plan. The venue clock is seeded from the cache's history first (C0's definition)."""
+        self._seed_clock(instrument_id)
+        if level is None:
+            return Holding(None, position.ts_opened, position.ts_init, fresh=True)
+        newest = self.venue_quotes.get(instrument_id)
+        now = self.clock.timestamp_ns()
+        return Holding(
+            level,
+            position.ts_opened,
+            position.ts_init,
+            armed_at=now,
+            armed_event=None if newest is None or not _usable(newest, now) else newest.ts_event,
+        )
+
     def _discover_holdings(self) -> None:
         """Find reconciled inventory and later EXTERNAL fills without an instrument claim."""
         instruments = {
@@ -573,10 +716,7 @@ class OwnerProtector(Strategy):
                 self._name_refused(instrument_id, "its supplied level was refused")
                 continue
             self.refused.pop(instrument_id, None)
-            self._seed_clock(instrument_id)
-            self.slots[instrument_id] = Holding(
-                None, position.ts_opened, position.ts_init, fresh=True
-            )
+            self.slots[instrument_id] = self._new_holding(instrument_id, position)
             self._subscribe_holding(instrument_id)
             self._manage(instrument_id)
 
@@ -601,6 +741,55 @@ class OwnerProtector(Strategy):
         self._say(
             f"{event.instrument_id}: our cancel rejected: {event.reason}; "
             "re-evaluate on the next quote or step"
+        )
+
+    def on_order_released(self, event: OrderReleased) -> None:
+        """The released trail starts the sale's chase (U-d); a sale the applied gain lock protected
+        also keeps the spread at its release (measure 1)."""
+        slot = self.slots.get(event.instrument_id)
+        if slot is None or event.client_order_id != slot.protect_id:
+            return
+        if slot.gain_applied_floor is not None:
+            tick = self.cache.quote(event.instrument_id)
+            slot.gain_release_spread = (
+                None if tick is None else tick.ask_price.as_decimal() - tick.bid_price.as_decimal()
+            )
+        self._observe_sale(event.instrument_id, slot, self.cache.order(event.client_order_id))
+
+    def on_order_filled(self, event: OrderFilled) -> None:
+        """Measure 1 for a sale the armed lock protected, then the sale's own record (U-d)."""
+        slot = self.slots.get(event.instrument_id)
+        if slot is None or not (
+            event.client_order_id == slot.protect_id
+            or (slot.sale is not None and event.client_order_id in slot.sale.order_ids)
+        ):
+            return
+        if slot.gain_armed_at is not None and slot.gain_entry is not None:
+            self._gain_lock_sale(event, slot)
+        order = None if slot.protect_id is None else self.cache.order(slot.protect_id)
+        self._observe_sale(event.instrument_id, slot, order)
+
+    def _gain_lock_sale(self, event: OrderFilled, slot: Holding) -> None:
+        """Measure 1: each fill of a sale the armed lock protected, against the entry."""
+        assert slot.gain_entry is not None
+        price = event.last_px.as_decimal()
+        record = {
+            "instrument_id": str(event.instrument_id),
+            "at": event.ts_event,
+            "entry": str(slot.gain_entry),
+            "fill_price": str(price),
+            "quantity": str(event.last_qty.as_decimal()),
+            "result_per_share": str(price - slot.gain_entry),
+            "floor": str(slot.gain_floor),
+            "applied_floor": str(slot.gain_applied_floor),
+            "spread_at_release": (
+                None if slot.gain_release_spread is None else str(slot.gain_release_spread)
+            ),
+        }
+        self.gain_lock_sales.append(record)
+        self._say(
+            f"{event.instrument_id}: gain lock sale filled at {price} against entry "
+            f"{slot.gain_entry}; spread at release {record['spread_at_release']}"
         )
 
     def _on_step(self, event: TimeEvent) -> None:
@@ -630,6 +819,209 @@ class OwnerProtector(Strategy):
         reason = f"unprotected: supplied level refused: {reason}"
         self.frozen[instrument_id] = reason
         self._say(f"{instrument_id}: {reason}; no new sell")
+
+    def _gain_lock(
+        self,
+        instrument_id: InstrumentId,
+        slot: Holding,
+        position: Any,
+        quote: QuoteTick | None,
+        *,
+        advanced: bool = False,
+    ) -> None:
+        """Latch on a new received quote, never on a cached quote/timer or an old observation.
+
+        Under C0's venue clock a quote counts only if it raised the clock (`advanced`).
+
+        The arming quote fixes cost and noise; a changed average can only raise the cost floor.
+        No unknown input removes either the retained level or the already-armed latch.
+        """
+        entry = _quantity(getattr(position, "avg_px_open", None))
+        if entry is not None and entry <= 0:
+            entry = None
+        now = self.clock.timestamp_ns()
+        tick = quote if quote is not None else self.cache.quote(instrument_id)
+        # Protection begins when the protective level is armed (unit 10's armed_at); before that
+        # no quote counts toward the gain lock.
+        quote_problem = (
+            "unknown quote (waiting for the protective level to be armed)"
+            if slot.armed_at is None
+            else _gain_quote_problem(tick, now, slot.armed_at)
+        )
+        new_quote = (
+            quote is not None
+            and advanced
+            and quote_problem is None
+            and _after_arming(slot, quote)
+            and (slot.gain_last_observation is None or quote.ts_event > slot.gain_last_observation)
+        )
+        if new_quote:
+            assert quote is not None
+            slot.gain_last_observation = quote.ts_event
+        was_armed = slot.gain_armed_at is not None
+        previous_floor = slot.gain_floor
+        previous_applied_floor = slot.gain_applied_floor
+        if not was_armed:
+            reasons = []
+            if entry is None:
+                reasons.append("unknown cost basis")
+            if quote_problem is not None:
+                reasons.append(quote_problem)
+            if reasons:
+                said = slot.gain_unarmed_said_at
+                if said is None or now - said >= 1_000_000_000:
+                    slot.gain_unarmed_said_at = now
+                    self._say(
+                        f"{instrument_id}: gain lock unarmed: {'; '.join(reasons)}; plain trail"
+                    )
+                return
+            if not new_quote:
+                return
+            assert tick is not None and entry is not None
+            measures = gain_lock.arming_measures(
+                tick.bid_price.as_decimal(), tick.ask_price.as_decimal()
+            )
+            if measures is None:
+                return  # _gain_quote_problem already named a spread that is not positive.
+            cost, noise = measures
+            bid = tick.bid_price.as_decimal()
+            if not gain_lock.arms(bid, entry, cost, noise):
+                return
+            # Arm only where the floor can apply: a trigger at or over the bid would sell on the
+            # arming quote (emulator.rs:814-928), so the lock waits, named, until the bid clears it.
+            instrument = self.cache.instrument(instrument_id)
+            if instrument is not None:
+                trigger = self._gain_trigger(
+                    instrument, slot, instrument.make_price(gain_lock.cost_floor(entry, cost))
+                )
+                if trigger is not None and trigger.as_decimal() >= bid:
+                    said = slot.gain_unarmed_said_at
+                    if said is None or now - said >= 1_000_000_000:
+                        slot.gain_unarmed_said_at = now
+                        self._say(
+                            f"{instrument_id}: gain lock waits: bid {tick.bid_price} not above the "
+                            f"trigger {trigger} its floor sets; plain trail"
+                        )
+                    return
+        else:
+            if entry is None:
+                entry = slot.gain_entry
+            cost, noise = slot.round_trip_cost, slot.noise_floor
+        assert entry is not None and cost is not None and noise is not None
+        instrument = self.cache.instrument(instrument_id)
+        if instrument is None:
+            self._say(
+                f"{instrument_id}: gain lock floor unavailable: instrument absent; kept level"
+            )
+            return
+        required = gain_lock.cost_floor(entry, cost)
+        floor = instrument.make_price(required)
+        if floor.as_decimal() < required:
+            self._say(
+                f"{instrument_id}: gain lock floor unavailable: instrument precision; kept level"
+            )
+            return
+        slot.gain_entry, slot.round_trip_cost, slot.noise_floor = entry, cost, noise
+        if not was_armed:
+            slot.gain_armed_at = now
+        if slot.gain_floor is None or floor.as_decimal() > slot.gain_floor.as_decimal():
+            slot.gain_floor = floor
+        target = self._gain_trigger(instrument, slot, slot.gain_floor)
+        if (
+            quote_problem is None
+            and tick is not None
+            and target is not None
+            and target.as_decimal() < tick.bid_price.as_decimal()
+        ):
+            slot.gain_applied_floor = slot.gain_floor
+            self._gain_level(instrument_id, slot)
+        elif slot.gain_applied_floor != slot.gain_floor:
+            reason = quote_problem
+            if reason is None:
+                assert tick is not None
+                reason = (
+                    f"bid {tick.bid_price} not above the trigger {target} that floor "
+                    f"{slot.gain_floor} sets"
+                    if target is not None
+                    else "trigger unavailable at instrument precision"
+                )
+            self._say(
+                f"{instrument_id}: gain lock floor deferred: {reason}; kept applied floor and trail"
+            )
+        assert slot.level is not None
+        if (
+            not was_armed
+            or slot.gain_floor != previous_floor
+            or slot.gain_applied_floor != previous_applied_floor
+        ):
+            event = "raised" if was_armed else "armed"
+            record = {
+                "instrument_id": str(instrument_id),
+                "event": event,
+                "at": now,
+                "level_armed_at": slot.armed_at,
+                "entry": str(entry),
+                "round_trip_cost": str(cost),
+                "noise_floor": str(noise),
+                "armed_at": slot.gain_armed_at,
+                "floor": str(slot.gain_floor),
+                "applied_floor": str(slot.gain_applied_floor),
+                "level": str(slot.level),
+                "fees": "fees per share 0 on paper; the fee record (ADR 0147) is not on main",
+            }
+            self.gain_lock_events.append(record)
+            self._say(
+                f"{instrument_id}: gain lock {event}: entry={entry}, round_trip_cost={cost}, "
+                f"noise_floor={noise}, armed_at={slot.gain_armed_at}, floor={slot.gain_floor}, "
+                f"applied_floor={slot.gain_applied_floor}, level={slot.level}; "
+                "fees per share 0 on paper (ADR 0147 not on main)"
+            )
+
+    def _gain_trigger(self, instrument: Any, slot: Holding, floor: Price) -> Price | None:
+        """The trigger a floor sets: the floor plus the configured trigger-to-limit spacing, up."""
+        spacing = (
+            slot.limit_offset - slot.distance.distance
+            if slot.limit_offset is not None and slot.distance is not None
+            else Decimal(0)
+        )
+        required = up_on_step(floor.as_decimal() + spacing)
+        trigger = instrument.make_price(required)
+        return None if trigger.as_decimal() < required else trigger
+
+    def _gain_level(self, instrument_id: InstrumentId, slot: Holding) -> None:
+        """Keep the configured trigger-to-limit spacing when the applied floor binds."""
+        if slot.gain_applied_floor is None:
+            return
+        instrument = self.cache.instrument(instrument_id)
+        if instrument is None:
+            return
+        level = self._gain_trigger(instrument, slot, slot.gain_applied_floor)
+        if level is None:
+            self._say(f"{instrument_id}: gain lock level unavailable: instrument precision")
+            return
+        if slot.level is None or level.as_decimal() > slot.level.as_decimal():
+            slot.level = level
+
+    def _raise_gain_order(self, slot: Holding, order: Any) -> None:
+        """Only a locally emulated order can have its trigger raised; never touch a venue order."""
+        if (
+            slot.gain_applied_floor is None
+            or not order.is_emulated
+            or order.client_order_id not in self.sent_ids
+            or order.strategy_id != self.strategy_id
+            or order.side != OrderSide.SELL
+            or order.order_type != OrderType.TRAILING_STOP_LIMIT
+        ):
+            return
+        assert slot.level is not None
+        trigger = order.trigger_price
+        if trigger is None or slot.level.as_decimal() > trigger.as_decimal():
+            trigger = slot.level
+        price = order.price
+        if price is None or slot.gain_applied_floor.as_decimal() > price.as_decimal():
+            price = slot.gain_applied_floor
+        if trigger != order.trigger_price or price != order.price:
+            self.modify_order(order.client_order_id, trigger_price=trigger, price=price)
 
     def _plan_holding(self, instrument_id: InstrumentId, slot: Holding, tick: QuoteTick) -> bool:
         """One cache snapshot through paper:protect's planner; no history request or tightening.
@@ -700,6 +1092,7 @@ class OwnerProtector(Strategy):
             advanced = self._note(tick)
         slot = self.slots[instrument_id]
         order = None if slot.protect_id is None else self.cache.order(slot.protect_id)
+        self._observe_sale(instrument_id, slot, order)
         if slot.protect_id is not None and order is None:
             self._freeze(instrument_id, "our sent sell is absent from cache; awaiting its state")
             return
@@ -709,9 +1102,7 @@ class OwnerProtector(Strategy):
             position = self._external_long(instrument_id)
             if position is not None:
                 self._say(f"{instrument_id}: our sell filled; remaining shares are a new holding")
-                self.slots[instrument_id] = Holding(
-                    None, position.ts_opened, position.ts_init, fresh=True
-                )
+                self.slots[instrument_id] = self._new_holding(instrument_id, position)
                 self._manage(instrument_id, quote)
             return
         external = self.cache.positions_open(instrument_id=instrument_id, strategy_id=EXTERNAL)
@@ -738,23 +1129,48 @@ class OwnerProtector(Strategy):
                 slot.level = trigger
             if order.is_closed:
                 if order.status in (OrderStatus.DENIED, OrderStatus.REJECTED):
-                    self._freeze(
-                        instrument_id, f"our protective sell ended {order.status}; inspect it"
-                    )
-                    return
+                    if slot.sale is None:
+                        self._freeze(
+                            instrument_id, f"our protective sell ended {order.status}; inspect it"
+                        )
+                        return
+                    # As main's chase does (mover.py:4002-4007): a refused sale is sent again
+                    # once per chase interval, never left without one.
+                    waited = self.clock.timestamp_ns() - slot.sale.priced_ns
+                    if waited < protect.PLANNER.chase_secs * SECOND_NS:
+                        self._sale_stalled(
+                            instrument_id,
+                            f"our sale ended {order.status}; sent again after the chase interval",
+                        )
+                        return
+                    self._say(f"{instrument_id}: our sale ended {order.status}; sending it again")
                 self.cancel_requested.discard(order.client_order_id)
                 slot.protect_id, order = None, None
-            elif order.client_order_id in self.cancel_requested:
-                return  # No replacement until the original has a terminal acknowledgement.
+        if slot.sale is None:
+            # The lock moves the trigger of a trail not yet released; the exit beats the lock (R3).
+            self._gain_lock(instrument_id, slot, position, quote, advanced=advanced)
+        if order is not None and order.client_order_id in self.cancel_requested:
+            if slot.sale is not None:
+                self._sale_stalled(instrument_id, "awaiting our sale's terminal cancel")
+            return  # No replacement until the original has a terminal acknowledgement.
         uncovered = self._uncovered(instrument_id, position.signed_qty, slot.protect_id)
         if uncovered is None:
+            if slot.sale is not None:
+                self._say(f"{instrument_id}: sale stalled: {self.frozen[instrument_id]}")
             return
         self.frozen.pop(instrument_id, None)
         if order is not None:
             if _remaining(order) != uncovered:
-                self._cancel_own(slot)
+                self._cancel_own(slot)  # Never modified in the step that cancels it for size.
+            elif slot.sale is not None:
+                self._chase_sale(instrument_id, slot, order, quote)
+            else:
+                self._raise_gain_order(slot, order)
             return
         if uncovered <= 0:
+            return
+        if slot.sale is not None:
+            self._send_sale(instrument_id, slot, uncovered, quote)
             return
         if tick is None:
             self._record_unprotected(instrument_id, "no quote to plan protection")
@@ -784,6 +1200,7 @@ class OwnerProtector(Strategy):
             return
         if unarmed:
             advanced = False  # Planning this level is not an observation after its arming.
+        self._gain_level(instrument_id, slot)
         assert (
             slot.level is not None and slot.distance is not None and slot.limit_offset is not None
         )
@@ -825,7 +1242,7 @@ class OwnerProtector(Strategy):
             instrument_id,
             OrderSide.SELL,
             quantity,
-            None,
+            slot.gain_applied_floor,
             limit_offset=limit,
             trailing_offset=trailing,
             trailing_offset_type=TrailingOffsetType.PRICE,
@@ -845,8 +1262,166 @@ class OwnerProtector(Strategy):
         self.sent_ids.add(order.client_order_id)
         self.submit_order(order, params={"extended_hours": True})
 
+    def _observe_sale(self, instrument_id: InstrumentId, slot: Holding, order: Any) -> None:
+        """Only an owned, transformed LIMIT starts a chase; its release event supplies the clock.
+
+        Inspecting the cache also captures a release/fill between steps, or a subclass which
+        records callbacks without forwarding them. A pre-release trail never enters this path.
+        """
+        owned_limit = (
+            order is not None
+            and order.client_order_id in self.sent_ids
+            and order.strategy_id == self.strategy_id
+            and order.order_type == OrderType.LIMIT
+            and getattr(order, "price", None) is not None
+        )
+        if slot.sale is None:
+            if not owned_limit:
+                return
+            released = [event for event in order.events() if isinstance(event, OrderReleased)]
+            at = released[0].ts_event if released else self.clock.timestamp_ns()
+            first = order.price.as_decimal()
+            slot.sale = Sale(at, first, chase_floor(first, protect.PLANNER.chase_cap), at, first)
+            self._log_sale(instrument_id, slot.sale)
+        sale = slot.sale
+        if owned_limit:
+            sale.order_ids.add(order.client_order_id)
+        # A cancel acknowledgement can cross a fill. A completed earlier leg is still this
+        # sale's fill, even while its replacement is being withdrawn from the now-flat long.
+        filled = [
+            leg.ts_closed
+            for cid in sale.order_ids
+            if (leg := self.cache.order(cid)) is not None
+            and leg.status == OrderStatus.FILLED
+            and leg.ts_closed is not None
+        ]
+        if filled and sale.filled_ns is None:
+            sale.filled_ns = max(filled)
+            if sale.floor_since is not None:
+                sale.floor_wait_ns += max(0, sale.filled_ns - sale.floor_since)
+                sale.floor_since = None
+            self._log_sale(instrument_id, sale)
+
+    def _log_sale(self, instrument_id: InstrumentId, sale: Sale) -> None:
+        record = sale.record(self.clock.timestamp_ns())
+        self._say(f"{instrument_id}: sale record {json.dumps(record, sort_keys=True)}")
+
+    def _sale_stalled(self, instrument_id: InstrumentId, reason: str) -> None:
+        reason = f"sale stalled: {reason}"
+        self.frozen[instrument_id] = reason
+        self._say(f"{instrument_id}: {reason}; no new sell")
+
+    def _sale_bid(self, instrument_id: InstrumentId, quote: QuoteTick | None) -> Decimal | None:
+        tick = quote if quote is not None else self.cache.quote(instrument_id)
+        if tick is None:
+            self._sale_stalled(instrument_id, "no quote to price the sale")
+            return None
+        bid, ask = tick.bid_price.as_decimal(), tick.ask_price.as_decimal()
+        if (
+            bid <= 0
+            or ask < bid
+            or tick.bid_size.as_decimal() <= 0
+            or tick.ask_size.as_decimal() <= 0
+        ):
+            self._sale_stalled(instrument_id, "no usable bid/ask quote to price the sale")
+            return None
+        return bid
+
+    def _chase_sale(
+        self, instrument_id: InstrumentId, slot: Holding, order: Any, quote: QuoteTick | None
+    ) -> None:
+        sale = slot.sale
+        assert sale is not None
+        if not order.is_open or order.is_pending_cancel or order.is_pending_update:
+            self._sale_stalled(
+                instrument_id, f"awaiting our sale's acknowledgement ({order.status})"
+            )
+            return
+        bid = self._sale_bid(instrument_id, quote)
+        if bid is None:
+            return
+        now = self.clock.timestamp_ns()
+        through = exit_price(bid, protect.PLANNER.exit_ticks, None)
+        # The wait runs while the exit price is through the floor, as main's (mover.py:4695).
+        if (
+            sale.floor is not None
+            and order.price.as_decimal() == sale.floor
+            and through < sale.floor
+        ):
+            sale.floor_reached = True
+            if sale.floor_since is None:
+                sale.floor_since = now
+            if now - sale.floor_since >= FLOOR_WAIT_SECS * SECOND_NS:
+                sale.floor_wait_ns += now - sale.floor_since
+                sale.floor_since, sale.floor, sale.floor_release_price = None, None, through
+                self._log_sale(instrument_id, sale)
+        elif sale.floor_since is not None:
+            sale.floor_wait_ns += now - sale.floor_since
+            sale.floor_since = None
+            self._log_sale(instrument_id, sale)
+        if now - sale.priced_ns < protect.PLANNER.chase_secs * SECOND_NS:
+            return
+        price = exit_price(bid, protect.PLANNER.exit_ticks, sale.floor)
+        if price >= order.price.as_decimal():  # only downward, as main's (mover.py:4707)
+            return
+        sale.priced_ns = now
+        self._cancel_own(slot)  # A subsequent step re-reads quantity after a terminal cancel.
+
+    def _send_sale(
+        self,
+        instrument_id: InstrumentId,
+        slot: Holding,
+        uncovered: Decimal,
+        quote: QuoteTick | None,
+    ) -> None:
+        sale = slot.sale
+        assert sale is not None
+        bid = self._sale_bid(instrument_id, quote)
+        if bid is None:
+            return
+        instrument = self.cache.instrument(instrument_id)
+        if instrument is None:
+            self._sale_stalled(instrument_id, "instrument is absent from cache")
+            return
+        quantity = instrument.make_qty(uncovered)
+        if quantity.as_decimal() != uncovered:
+            self._sale_stalled(instrument_id, "uncovered shares cannot be represented exactly")
+            return
+        price = exit_price(bid, protect.PLANNER.exit_ticks, sale.floor)
+        limit = instrument.make_price(price)
+        if limit.as_decimal() != price:
+            self._sale_stalled(instrument_id, "sale price cannot be represented exactly")
+            return
+        order = self.order_factory.limit(
+            instrument_id,
+            OrderSide.SELL,
+            quantity,
+            limit,
+            time_in_force=TimeInForce.DAY,
+            reduce_only=True,
+        )
+        if self.cache.order(order.client_order_id) is not None:
+            self._sale_stalled(instrument_id, "generated client order ID already exists")
+            return
+        now = self.clock.timestamp_ns()
+        # A running floor wait carries across legs, as main's floor_since does: an expiry or a
+        # resize at the floor does not restart it; _chase_sale closes it off the floor.
+        sale.reprices += int(price != sale.last_price)
+        sale.last_price, sale.priced_ns = price, now
+        sale.floor_reached |= sale.floor is not None and price == sale.floor
+        slot.protect_id = order.client_order_id
+        self.sent_ids.add(order.client_order_id)
+        sale.order_ids.add(order.client_order_id)
+        self._log_sale(instrument_id, sale)
+        self.submit_order(order, params={"extended_hours": True})
+
     def _reset_holding(self, instrument_id: InstrumentId) -> None:
         slot = self.slots.pop(instrument_id)
+        if slot.sale is not None:  # the sale's final record, however its long ended
+            if slot.sale.floor_since is not None:
+                slot.sale.floor_wait_ns += self.clock.timestamp_ns() - slot.sale.floor_since
+                slot.sale.floor_since = None
+            self._log_sale(instrument_id, slot.sale)
         if slot.protect_id is not None:
             self.cancel_requested.discard(slot.protect_id)
         self.levels.pop(instrument_id, None)
@@ -886,6 +1461,10 @@ class OwnerProtector(Strategy):
         if self.frozen.get(instrument_id, "").startswith(WAITING):
             self.frozen.pop(instrument_id)  # A stopped instrument waits on nothing.
         if slot is not None:
+            order = None if slot.protect_id is None else self.cache.order(slot.protect_id)
+            self._observe_sale(instrument_id, slot, order)
+            if slot.sale is not None:
+                self._log_sale(instrument_id, slot.sale)
             self._cancel_own(slot)
 
     def on_stop(self) -> None:
