@@ -54,8 +54,16 @@ A composition of upstream parts (ADR 0083, ADR 0088). What each part is, at Naut
   bars. On opening, a slot warms from `Cache.bars`' newest-first cached EXTERNAL minute bars
   (`common/__init__.pyi:309`, `crates/common/src/cache/mod.rs:6276-6284`), closed in this session
   part. The adapter's `parse_bar` stamps streamed bars with receipt time, so their interval end is
-  derived from the open, as that contract requires. A cold-fallback holding may tighten once when
-  its ATR warms. The dollar-volume tier is a stand-in for size, never market capitalization. `ratchet_base`
+  derived from the open, as that contract requires. If those leave the ATR short, under a non-fixed
+  trail the opening asks once for the name's most recent minute bars of this session part (F-2, the
+  owner's plan of 2026-11-12): upstream's `Strategy.request_bars` (`trading/__init__.pyi:993`),
+  answered through `on_data_response` (`crates/common/src/python/response.rs:330-342`), as
+  `SessionMaCross` warms its averages. Both sources feed that slot's ATR only, each minute once, in
+  time order, and nothing else (`_warm`). Fewer than `atr_n` bars, a refusal or no answer keeps the
+  cold fallback, each named and counted in the record's `warm_up`. A cold-fallback holding may tighten
+  once when its ATR warms. `atr_n` 14 has two of three landscape sources; `atr_k` and the spread floor
+  have none: both UNCALIBRATED. The dollar-volume tier is a stand-in for size, never market
+  capitalization. `ratchet_base`
   pairs ratchet with plain ATR or tier: at r initial trails of gain it tightens once to g of the initial trail, subject to
   the latest spread floor, canceling and remaking the emulator order while retaining its trigger.
   All arms keep PRICE offsets frozen from entry; BASIS_POINTS is supported upstream
@@ -234,6 +242,7 @@ from canon_alpaca.providers import TRADING_API
 from canon_alpaca.providers import request_counts
 from nautilus_trader.config import StrategyConfig
 from nautilus_trader.indicators import AverageTrueRange
+from nautilus_trader.model import AggregationSource
 from nautilus_trader.model import BarType
 from nautilus_trader.model import ClientOrderId
 from nautilus_trader.model import InstrumentId
@@ -274,6 +283,8 @@ from .price_step import exit_price
 from .price_step import stop_trigger_price
 from .price_step import tick
 from .price_step import up_on_step
+from .session_ma_cross import WARM_UP_SPAN
+from .session_ma_cross import WARM_UP_SPARE_BARS
 from .sizing import REFUSALS as SIZING_REFUSALS
 from .sizing import plan_for_loss
 from .sizing import sized_stop
@@ -476,6 +487,34 @@ Asset GETs use alpaca-py's existing retry policy; every HTTP attempt is counted 
 INSTRUMENT_REQUEST_RESERVE = DEFAULT_RETRY_ATTEMPTS + 1
 """Reserve all attempts of an outstanding asset GET (alpaca-py common/constants.py:11-13)."""
 NEW_YORK = ZoneInfo("America/New_York")
+HISTORY_REQUEST_LIMIT = RANK_MOST
+"""At most one ranking's worth of ATR warm-up requests per rolling minute (20), one per slot opening under
+a non-fixed trail; an opening over it is held by name and asked again each step until the minute frees or its slot closes
+(F-2). Each is one data-API bars request, which the adapter counts per API with every other HTTP attempt
+(`canon_alpaca.providers`). It is not counted against `soft_line`, which is the trading API's budget
+(`requests_sent`): the data API is limited apart from it, and this limit is that request's own budget."""
+HISTORY_WAIT_SECS = QUERY_WAIT_SECS
+"""How long a slot's warm-up may go unanswered before it is named unanswered: one adapter REST call at its
+longest. The slot enters on the cold path meanwhile; an answer after it still warms, each minute once."""
+OVERNIGHT_HISTORY_FEED = "boats"
+"""The overnight part's feed (`session_window.MOVER_PARTS["overnight"]`)."""
+OVERNIGHT_HISTORY_DELAY = timedelta(minutes=15)
+"""Alpaca serves overnight (BOATS) history only when the request's `end` is at least 15 minutes old
+(https://docs.alpaca.markets/us/docs/245-trading.md, read 2026-11-12): an overnight warm-up asks for a
+span ending that long ago, and the first live bar's true range takes the gap from its last close, once,
+as one of the ATR's `atr_n` inputs."""
+HISTORY_REFUSED = "history request refused"
+"""How a warm-up the adapter or the strategy refused is named: a 429, a refused feed, no client."""
+HISTORY_OUTCOMES = (
+    "warm_from_cache",
+    "warm",
+    "fewer_than_atr_n",
+    "refused",
+    "held_at_limit",
+    "unanswered",
+    "slot_closed_first",
+)
+"""What became of each slot's warm-up, as the record counts them (F-2)."""
 CHASES = ("resend",)
 TRIGGERS = (TriggerType.BID_ASK, TriggerType.LAST_PRICE)
 """The triggers the local emulator accepts for an order it holds (concepts/orders/emulated)."""
@@ -870,9 +909,9 @@ class MoverConfig(StrategyConfig):
     Non-fixed entries scale exit_through to trail/4 and keep chase_cap at max(trail, chase_cap) (the
     lead's (ii), 2026-11-12), with an unavoidable spread floor (`spread_floor_m >= 1`) and 0.02 cap.
     An unusable spread selects fixed by name; no quote still refuses entry. An ATR that is not warm
-    (fewer than `atr_n` minute bars, cached from this part when the slot opened or live since) selects
-    fixed as `cold_atr_fallback` (the lead's (ii)); such a holding tightens once to its warmed ATR's plan,
-    never wider (the lead's (b)). `liquidity_tier_cut`
+    (fewer than `atr_n` minute bars of this part, cached when the slot opened, requested (F-2) or live
+    since) selects fixed as `cold_atr_fallback` (the lead's (ii)); such a holding tightens once to its
+    warmed ATR's plan, never wider (the lead's (b)). `liquidity_tier_cut`
     is baseline dollars per minute, a stand-in for size; an unknown baseline selects ATR by name.
     `ratchet_base` chooses the paired ATR or tier plan, and r/g tighten it once. All new numeric rows
     and their alternates are UNCALIBRATED. Fixed preserves explicit legacy trail/exit/chase overrides.
@@ -1322,6 +1361,20 @@ class ReentryState(TurnState):
         self.vwap, self.below_vwap, self.crossed_vwap = None, False, False
 
 
+def history_window(
+    settings: MoverConfig, feed_params: dict[str, str] | None, now: datetime
+) -> tuple[datetime, datetime | None]:
+    """The `start` and `end` of a slot's warm-up request at `now`: `WARM_UP_SPAN`, or `atr_n` plus
+    `WARM_UP_SPARE_BARS` minutes if that is longer, ending now (`end` None) or, on the overnight feed,
+    `OVERNIGHT_HISTORY_DELAY` ago. Not bounded to the session part open now, as the cached warm-up is
+    (`Mover._warm_atr`): a slot opened at a part's start is warm from the part before (the lead's
+    ruling of 2026-11-13, 00:10). The two bounds differ on purpose, UNCALIBRATED, for ADR 0133."""
+    span = max(WARM_UP_SPAN, (settings.atr_n + WARM_UP_SPARE_BARS) * timedelta(minutes=1))
+    feed = (feed_params or {}).get("feed")
+    end = now - OVERNIGHT_HISTORY_DELAY if feed == OVERNIGHT_HISTORY_FEED else None
+    return (now if end is None else end) - span, end
+
+
 def baseline_per_minute(record: dict[str, Any]) -> Decimal | None:
     """The startup ranking's existing normal / clock minutes, without another history read.
 
@@ -1421,6 +1474,49 @@ class InstrumentLoad:
 
 
 @dataclass
+class HistoryLoad:
+    """One slot opening's ATR warm-up (F-2): its bars request, and what its answers gave that slot."""
+
+    instrument_id: InstrumentId
+    requested_ns: int
+    request_id: str | None = None
+    """None when no request was sent: held at the rolling minute limit, or refused before it left."""
+    held: bool = False
+    """Held at the rolling minute limit and not sent yet: asked again each step while its slot is open."""
+    cached: int = 0
+    """Cached minute bars fed to the slot's ATR at the opening (`Mover._warm_atr`), before any answer."""
+    from_cache: bool = False
+    """The cache alone warmed the ATR at the opening, so nothing was asked."""
+    completed: bool = False
+    """The answer is complete or refused, or none was sent: a later answer for it warms nothing."""
+    bars: int = 0
+    """History bars this request fed the slot's ATR, each minute once."""
+    dropped: int = 0
+    """Bars of its answers not fed: another instrument's, a minute already fed, a minute from the slot's
+    first live bar on, or any bar of an answer repeated or come after its slot closed."""
+    late: bool = False
+    """Unanswered after `HISTORY_WAIT_SECS`; an answer after that is still taken."""
+    closed_first: bool = False
+    """Its slot closed, or closed and opened again, before the answer came: the answer fed nothing."""
+    reason: str | None = None
+    """Why the slot is not warm from history, by name; None while waiting and when warm."""
+
+    def outcome(self, atr_n: int) -> str:
+        """Its `HISTORY_OUTCOMES` name: warm when its answer and the cache gave the ATR `atr_n` bars."""
+        if self.from_cache:
+            return "warm_from_cache"
+        if self.reason is not None and self.reason.startswith(HISTORY_REFUSED):
+            return "refused"
+        if self.request_id is None:
+            return "held_at_limit"  # held to the end, or its slot closed before it was sent
+        if self.closed_first:
+            return "slot_closed_first"
+        if self.completed:
+            return "warm" if self.bars + self.cached >= atr_n else "fewer_than_atr_n"
+        return "unanswered"
+
+
+@dataclass
 class Slot:
     """What the strategy keeps for one watched name. Plain values: the cache holds the orders."""
 
@@ -1516,6 +1612,15 @@ class Slot:
     """When the slot started receiving bars; its first internal minute may be partial."""
     profile_evaluated_ns: int | None = None
     """Open of the last complete minute considered for tightening, never the one-second step."""
+    history: HistoryLoad | None = None
+    """This opening's ATR warm-up, under a non-fixed trail (F-2); None under the fixed trail."""
+    atr_minutes: set[int] = field(default_factory=set)
+    """The minute opens (`bar_opened_ns`) the ATR has been fed, from history or live: none twice."""
+    atr_bars: list[tuple[int, Bar]] = field(default_factory=list)
+    """Every bar fed to the ATR by minute open, in time order, kept only while the warm-up is waiting:
+    an answer after live bars resets the ATR and feeds it again in time order (F-2)."""
+    first_live_open: int | None = None
+    """The minute open of the slot's first live bar: history from that minute on is the live bars'."""
 
 
 def l_in_force(slot: Slot, bought: Decimal) -> Decimal | None:
@@ -1635,7 +1740,15 @@ class Mover(Strategy):
         self.live_bars = 0
         self.history_bars = 0
         self.history_dropped = 0
-        """It requests no history: a window's report reads these of every strategy."""
+        """History bars fed to the slots' ATRs and history bars not fed (`HistoryLoad.dropped`): a
+        window's report reads these of every strategy as `warm_up_bars` and `warm_up_dropped`."""
+        self.history_loads: list[HistoryLoad] = []
+        """Every slot opening's warm-up, in order (F-2)."""
+        self.history_by_request: dict[str, HistoryLoad] = {}
+        self.history_requests = 0
+        self.history_sent: deque[int] = deque()
+        self.history_responses: list[tuple[str, bool, str | None, list[Bar]]] = []
+        """Each warm-up answer since the last step, as plain values: request ID, completed, failure."""
         self.entry_contexts: dict[InstrumentId, entry_study.Day] = {}
         """Explicit per-name ADR 0092 history, supplied by composition before registered-arm entry.
 
@@ -1721,7 +1834,15 @@ class Mover(Strategy):
             )
 
     def on_data_response(self, response: Any) -> None:
-        """Only retain the response; the next step checks the cache and subscribes outside reentry."""
+        """Only retain the response; the next step checks the cache and subscribes outside reentry.
+        A warm-up's answer is kept apart, with its bars, for the step to feed (`_finish_history`)."""
+        request_id = str(response.correlation_id)
+        if request_id in self.history_by_request:
+            bars = getattr(response, "data", None) or []
+            self.history_responses.append(
+                (request_id, bool(response.completed), response.failure_reason, list(bars))
+            )
+            return
         if response.failure_reason is not None or response.completed:
             self.instrument_responses[str(response.correlation_id)] = response.failure_reason
 
@@ -1960,6 +2081,19 @@ class Mover(Strategy):
             },
             "instrument_requests": self.instrument_requests,
             "instrument_request_limit": INSTRUMENT_REQUEST_LIMIT,
+            "history_requests": self.history_requests,
+            "history_request_limit": HISTORY_REQUEST_LIMIT,
+            "warm_up": self._history_record(),
+            "entries_by_trail_source": {
+                source: sum(
+                    1
+                    for entry in self.entries_sent
+                    if (entry.get("trail_source") or "unrecorded") == source
+                )
+                for source in dict.fromkeys(
+                    entry.get("trail_source") or "unrecorded" for entry in self.entries_sent
+                )
+            },
             "instrument_request_reserve": INSTRUMENT_REQUEST_RESERVE,
             "dropped": list(self.dropped),
             "sizing_refusals": dict(self.sizing_refusals),
@@ -2015,7 +2149,14 @@ class Mover(Strategy):
             return
         self.live_bars += 1
         if slot.atr is not None:
-            slot.atr.handle_bar(bar)
+            opened = bar_opened_ns(bar)
+            if slot.first_live_open is None:
+                slot.first_live_open = opened
+            if opened not in slot.atr_minutes:  # a minute the warm-up already fed is not fed twice
+                slot.atr_minutes.add(opened)
+                if slot.history is not None and not slot.history.completed:
+                    slot.atr_bars.append((opened, bar))
+                slot.atr.handle_bar(bar)
         slot.run_open_ns = bar_opened_ns(bar)
         close = bar.close.as_decimal()
         if self.settings.opening_arm == "on":
@@ -2315,6 +2456,7 @@ class Mover(Strategy):
         self._say_ranking(now)
         recent = self.recent = self._recent_requests(now)
         self._watch(now)
+        self._finish_history(now)
         # Reserve every possible retry while the asynchronous GET is outstanding. Its actual HTTP
         # attempts already enter requests_sent through the provider's existing transport, not here.
         self.recent = recent + self._instrument_reserve()
@@ -2539,13 +2681,229 @@ class Mover(Strategy):
             # are not used: the first of each subscription is a partial minute. `Cache.bars` gives
             # None for a bar type it holds none of (crates/common/src/python/cache.rs at the pin).
             cached = self.cache.bars(BarType.from_str(f"{instrument_id}-{WARM_BAR_SPEC}"))
-            self._warm_atr(slot, cached or [], slot.subscribed_ns)
+            if self._warm_atr(slot, cached or [], slot.subscribed_ns):
+                load = slot.history = HistoryLoad(
+                    instrument_id,
+                    slot.subscribed_ns,
+                    completed=True,
+                    cached=slot.atr_warm_bars,
+                    from_cache=True,
+                )
+                self.history_loads.append(load)
         self._sync_opening(slot, slot.subscribed_ns)
         # Quotes and trades first, on the feed: the data engine hands the client only an instrument's
         # first subscription (ADR 0055), and the emulator's own subscription names no feed.
         self.subscribe_quotes(instrument_id, params=self.feed_params)
         self.subscribe_trades(instrument_id, params=self.feed_params)
         self.subscribe_bars(bar_type)
+        slot = self.slots[instrument_id]
+        if slot.atr is not None and slot.history is None:  # F-2: only when the cache left it short
+            self._request_history(slot)
+            if slot.history is not None:
+                slot.history.cached = len(slot.atr_minutes)  # what the cache fed, before any answer
+
+    # --- the ATR's warm-up (F-2) ---------------------------------------------------------------------
+
+    def _request_history(self, slot: Slot) -> None:
+        """Ask once, for this opening, for the slot's most recent complete one-minute bars: upstream's
+        `Strategy.request_bars` with a `start` and no `limit` (`trading/__init__.pyi:993-1002`), the
+        EXTERNAL form of the slot's bar type on the slot's feed, as `SessionMaCross` warms its averages.
+        The span is `WARM_UP_SPAN`, or `atr_n` plus `WARM_UP_SPARE_BARS` minutes if that is longer, since
+        a thin name has minutes with no bar. Held by name over `HISTORY_REQUEST_LIMIT` a rolling minute,
+        and sent from a later step once the minute frees (`_finish_history`).
+
+        Known limits, said so (review of 2026-11-12): the hour can reach into the session part before
+        this one, and a name's quiet minutes before it began to move, so the first ATR is the last hour's,
+        UNCALIBRATED and judged by ADR 0133's record. History bars are Alpaca's EXTERNAL bars, with no bar
+        for a minute without trades, where the live INTERNAL bars are built flat for such a minute; the
+        replay and tuning that judge `atr_k` read the same EXTERNAL minute bars
+        (`reentry_replay.py`, `tuning_study.BAR_SPEC`), so the warm-up keeps that basis."""
+        now = self.clock.timestamp_ns()
+        load = slot.history = HistoryLoad(slot.instrument_id, now)
+        self.history_loads.append(load)
+        self._send_history(slot, load, now)
+
+    def _send_history(self, slot: Slot, load: HistoryLoad, now: int) -> None:
+        """Send `load`'s request, or hold it by name while the rolling minute's limit is reached."""
+        while self.history_sent and now - self.history_sent[0] > BUDGET_SPAN_NS:
+            self.history_sent.popleft()
+        if len(self.history_sent) >= HISTORY_REQUEST_LIMIT:
+            load.held = True
+            load.reason = (
+                f"history request held at the rolling minute limit of {HISTORY_REQUEST_LIMIT}"
+            )
+            self._history_note(slot.instrument_id, load.reason)
+            return
+        load.held, load.reason, load.requested_ns = False, None, now
+        start, end = history_window(self.settings, self.feed_params, self.clock.utc_now())
+        bar_type = BarType(slot.instrument_id, slot.bar_type.spec, AggregationSource.EXTERNAL)
+        try:
+            request_id = self.request_bars(bar_type, start=start, end=end, params=self.feed_params)
+        except (RuntimeError, ValueError, TypeError) as e:
+            load.completed = True
+            load.reason = f"{HISTORY_REFUSED}: {type(e).__name__}: {e}"
+            self._history_note(slot.instrument_id, load.reason)
+            return  # refused before it left: it takes no place in the rolling minute
+        self.history_sent.append(now)
+        self.history_requests += 1
+        load.request_id = str(request_id)
+        self.history_by_request[load.request_id] = load
+
+    def _finish_history(self, now: int) -> None:
+        """Feed each warm-up answer since the last step to its own slot's ATR (`_warm`), and name each
+        warm-up that left its slot cold: refused (a 429 or a feed the adapter refuses arrives as the
+        answer's failure, `crates/live/src/python/client/mod.rs:1828-1849`), fewer than `atr_n` bars,
+        or unanswered after `HISTORY_WAIT_SECS`. An answer for a request already complete, or for an
+        opening whose slot has closed since, feeds nothing and is counted as dropped; a refusal is still
+        named a refusal. A warm-up whose slot closed unanswered is named so, and one held at the rolling
+        minute's limit is sent once the minute frees, while its slot is open."""
+        taken, self.history_responses = self.history_responses, []
+        for request_id, completed, failure, bars in taken:
+            load = self.history_by_request[request_id]
+            slot = self.slots.get(load.instrument_id)
+            if load.completed or slot is None or slot.history is not load:
+                load.dropped += len(bars)
+                self.history_dropped += len(bars)
+                if failure is not None and (load.closed_first or not load.completed):
+                    load.completed = load.closed_first = True
+                    load.reason = f"{HISTORY_REFUSED} after its slot closed: {failure}"
+                elif not load.completed and completed:
+                    load.completed = load.closed_first = True
+                    load.reason = "answered after its slot closed: nothing fed"
+                continue
+            if failure is not None:
+                load.completed = True
+                load.dropped += len(bars)
+                self.history_dropped += len(bars)
+                load.reason = f"{HISTORY_REFUSED}: {failure}"
+                self._history_note(load.instrument_id, load.reason)
+                continue
+            self._warm(slot, bars, now)
+            if not completed:
+                continue
+            load.completed = True
+            slot.atr_bars = []  # nothing more can arrive to be ordered among them
+            cached = f" and {load.cached} cached" if load.cached else ""
+            if load.bars + load.cached >= self.settings.atr_n:
+                load.reason = None
+                self._say(
+                    f"{load.instrument_id}: ATR warm from {load.bars} history bars{cached}"
+                    + (" (answered late)" if load.late else "")
+                )
+            else:
+                load.reason = (
+                    f"{load.bars} history bars{cached}, fewer than {self.settings.atr_n}: "
+                    + (
+                        "the ATR is complete with live bars"
+                        if slot.atr is not None and slot.atr.initialized
+                        else "the cold ATR fallback stays until live bars complete it"
+                    )
+                )
+                self._history_note(load.instrument_id, load.reason)
+        for load in self.history_loads:
+            if load.completed:
+                continue
+            slot = self.slots.get(load.instrument_id)
+            if slot is None or slot.history is not load:
+                load.completed = load.closed_first = True
+                load.reason = (
+                    "slot closed before the request was sent"
+                    if load.held
+                    else "slot closed before its answer: nothing fed"
+                )
+            elif load.held and (
+                self.winding_down or (slot.atr is not None and slot.atr.initialized)
+            ):
+                load.completed, load.held = True, False
+                load.reason = (
+                    "held request not sent: the window is winding down"
+                    if self.winding_down
+                    else "held request not sent: the ATR was warm before the minute freed"
+                )
+                self._history_note(load.instrument_id, load.reason)
+            elif load.held:
+                self._send_history(slot, load, now)
+        for slot in self.slots.values():
+            load = slot.history
+            if (
+                load is not None
+                and not load.completed
+                and not load.held
+                and not load.late
+                and now - load.requested_ns >= HISTORY_WAIT_SECS * SECOND_NS
+            ):
+                load.late = True
+                load.reason = f"history request unanswered after {HISTORY_WAIT_SECS} s"
+                self._history_note(load.instrument_id, load.reason)
+
+    def _warm(self, slot: Slot, bars: Sequence[Bar], now: int) -> tuple[int, int]:
+        """Feed `bars` to this slot's ATR alone, each minute once, and return how many were fed and how
+        many dropped. A bar of another instrument, of a minute already fed, of a minute from the
+        slot's first live bar on, or still forming at `now` (its `ts_init`, its close, is later) is
+        dropped. Closes, dollar flow, the entry arms and the live-bar count are the live bars' alone. If
+        live bars were fed first, the ATR is reset and fed again in time order (`Indicator.reset`, as
+        `SessionMaCross.on_historical_bars` does for its averages)."""
+        assert slot.atr is not None and slot.history is not None
+        kept: list[tuple[int, Bar]] = []
+        for bar in bars:
+            opened = bar_opened_ns(bar)
+            if (
+                bar.bar_type.instrument_id != slot.instrument_id
+                or opened in slot.atr_minutes
+                or bar.ts_init > now
+                or (slot.first_live_open is not None and opened >= slot.first_live_open)
+            ):
+                continue
+            slot.atr_minutes.add(opened)
+            kept.append((opened, bar))
+        if kept:
+            slot.atr_bars = sorted([*slot.atr_bars, *kept], key=lambda pair: pair[0])
+            slot.atr.reset()
+            for _, bar in slot.atr_bars:
+                slot.atr.handle_bar(bar)
+            slot.warm_checked = False  # a reshaped ATR: `_warm_tighten` compares once more
+        dropped = len(bars) - len(kept)
+        slot.history.bars += len(kept)
+        slot.history.dropped += dropped
+        self.history_bars += len(kept)
+        self.history_dropped += dropped
+        return len(kept), dropped
+
+    def _history_note(self, instrument_id: InstrumentId, text: str) -> None:
+        """Name a warm-up's outcome once in the name's notes and the node's log (step only)."""
+        line = f"{instrument_id}: {text}"
+        notes = self.notes.setdefault(instrument_id, [])
+        if line not in notes:
+            notes.append(line)
+            self._say(line)
+
+    def _history_record(self) -> dict[str, Any]:
+        """The warm-up's part of the record: totals, each outcome counted, and each opening's row."""
+        outcomes = dict.fromkeys(HISTORY_OUTCOMES, 0)
+        rows = []
+        for load in self.history_loads:
+            outcome = load.outcome(self.settings.atr_n)
+            outcomes[outcome] += 1
+            rows.append(
+                {
+                    "instrument_id": str(load.instrument_id),
+                    "request_id": load.request_id,
+                    "requested_ns": load.requested_ns,
+                    "completed": load.completed,
+                    "late": load.late,
+                    "bars": load.bars,
+                    "cached": load.cached,
+                    "dropped": load.dropped,
+                    "outcome": outcome,
+                    "reason": load.reason,
+                }
+            )
+        return {
+            "bars": self.history_bars,
+            "dropped": self.history_dropped,
+            "outcomes": outcomes,
+            "slots": rows,
+        }
 
     def _trail_notes(self) -> list[str]:
         """The record's limits; the state re-entry note only when a state arm runs."""
@@ -2559,7 +2917,8 @@ class Mover(Strategy):
         gap. `Cache.bars` returns the newest bar first (NautilusTrader, crates/common/src/cache/mod.rs
         at the pin). A streamed EXTERNAL bar's ts_init is its receipt time (`canon_alpaca.data.parse_bar`),
         so its interval must also have ended by `now`. With fewer than `atr_n` such bars the ATR stays
-        cold and the entry's fixed fallback applies (the lead's (ii)).
+        cold and the entry's fixed fallback applies (the lead's (ii)), and the opening asks for history
+        (F-2, `_request_history`), which completes the same series.
         """
         if slot.atr is None:
             return False
@@ -2570,11 +2929,17 @@ class Mover(Strategy):
             for bar in bars_newest_first
             if bar.ts_init <= now and since <= bar_opened_ns(bar) <= now - 60 * SECOND_NS
         ][: n + 1]
-        if len(closed) < n:
-            return False
         for bar in reversed(closed):
+            # F-2, the lead's ruling of 2026-11-13, 00:10: one series, two sources. Every cached
+            # minute is fed, even short of `atr_n`, and marked, so a requested answer neither feeds
+            # it again nor drops it when it re-feeds the series in time order (`_warm`).
+            opened = bar_opened_ns(bar)
+            slot.atr_minutes.add(opened)
+            slot.atr_bars.append((opened, bar))
             slot.atr.handle_bar(bar)
         slot.atr_warm_bars = len(closed)
+        if len(closed) < n:
+            return False
         self.notes.setdefault(slot.instrument_id, []).append(
             f"{slot.instrument_id}: ATR warmed from {len(closed)} cached one-minute bars "
             f"({closed[0].bar_type}), no request"
@@ -3920,7 +4285,9 @@ class Mover(Strategy):
                 selected, bound, source = calculation["distance"], "profile", "profile"
             elif atr is None:
                 # Coordinator's (ii), 2026-11-12: a cold ATR enters on the fixed plan, named, rather
-                # than waiting `atr_n` live minutes from the slot's opening; no history is requested.
+                # than waiting for `atr_n` minutes; the slot's opening asked for history (F-2,
+                # `_request_history`), so it is cold only when that gave fewer than `atr_n` bars, was
+                # refused, or has not been answered yet.
                 cold = f"ATR has fewer than {settings.atr_n} complete one-minute bars: fixed trail fallback"
                 if settings.trail_cap == "own" and floor > settings.trail:
                     # `own` drops the cap's refusal of a spread floor over it, so the floor still

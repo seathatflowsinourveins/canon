@@ -454,6 +454,10 @@ ADDED_SINCE_P1 = {
         "sell_triggers",
         "sizing_refusals",
         "sizing_bindings",
+        "history_requests",  # F-2's warm-up: under the fixed trail none is asked
+        "history_request_limit",
+        "warm_up",
+        "entries_by_trail_source",
     ),
     "entry": ("profile", "arming", "trail_cap", "spread_floor", "own_measure"),
     "rows": (
