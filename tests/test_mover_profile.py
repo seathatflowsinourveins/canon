@@ -7,6 +7,7 @@ import re
 import subprocess
 import sys
 from collections import deque
+from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC
 from datetime import date
@@ -818,25 +819,39 @@ FRESH_LOGGER = "CANON_PROFILE_FRESH_LOGGER"
 """Set in the child process that runs the native-emulator count, so that only there it runs."""
 
 
-@pytest.mark.parametrize("release_afterward", [False, True])
-def test_tightening_sends_no_trading_command_out_of_the_native_emulator(release_afterward):
+def fresh_logger_env(environ: Mapping[str, str]) -> dict[str, str]:
+    """The child's environment: no account credential or paper setting, as
+    `tests/test_stream_lock_fixture.py` strips them, and no `PYTEST_ADDOPTS` to change its selection."""
+    kept = {
+        k: v
+        for k, v in environ.items()
+        if not k.startswith(("ALPACA_", "APCA_", "CANON_ALPACA_", "CANON_PAPER_"))
+        and k != "PYTEST_ADDOPTS"
+    }
+    return kept | {FRESH_LOGGER: "1"}
+
+
+def test_tightening_sends_no_trading_command_out_of_the_native_emulator():
     """The count below reads the native logger, which is set up once per process: the first engine's
     `LoggerConfig` publishes the global sender (NautilusTrader d53849b216e2,
     `crates/common/src/logging/logger.rs:1003-1013`), and `bypass_logging` sets a process-wide flag
     that nothing public clears (`:1016-1017`, `logging/mod.rs:77`). An earlier test that bypassed
     logging (`tests/test_ledger.py:279`, among others) left it blind. So it runs in a pytest process
     of its own, as `tests/test_stream_lock_fixture.py` runs its inner case."""
-    node = f"{__file__}::test_inner_native_emulator_command_count[{release_afterward}]"
-    ran = subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", node],
-        env=os.environ | {FRESH_LOGGER: "1"},
-        capture_output=True,
-        text=True,
-        timeout=300,
-        check=False,
-    )
+    node = f"{__file__}::test_inner_native_emulator_command_count"
+    try:
+        ran = subprocess.run(
+            [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", node],
+            env=fresh_logger_env(os.environ),
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as late:
+        pytest.fail(f"the child pytest ran past 300 s: {late.stdout!r} {late.stderr!r}")
     assert ran.returncode == 0, ran.stdout + ran.stderr
-    assert "1 passed" in ran.stdout, ran.stdout
+    assert re.search(r"(?m)^2 passed in ", ran.stdout), ran.stdout
 
 
 @pytest.mark.parametrize("release_afterward", [False, True])
@@ -1738,3 +1753,16 @@ def test_a_profile_tighten_to_the_floor_keeps_that_floor_after_a_lower_fill():
     remade = seam.sent[-1]
     assert str(remade.quantity) == "10"
     assert remade.trailing_offset == D("0.09")
+
+
+def test_the_fresh_logger_child_gets_no_credential_and_no_pytest_options() -> None:
+    # Code review of c7293564: the child inherited the paper keys and PYTEST_ADDOPTS.
+    parent = {
+        "PATH": "/bin",
+        "ALPACA_API_KEY": "k",
+        "APCA_API_SECRET_KEY": "s",
+        "CANON_ALPACA_STREAM_LOCK": "/l",
+        "CANON_PAPER_TEST_DEADLINE": "1",
+        "PYTEST_ADDOPTS": "-k ledger",
+    }
+    assert fresh_logger_env(parent) == {"PATH": "/bin", FRESH_LOGGER: "1"}
