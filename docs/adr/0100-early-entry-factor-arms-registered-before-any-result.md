@@ -77,7 +77,9 @@ entries are replayed on their controls at the same minute, an event without one 
 **Fill and outcome.** An entry at `T` fills at `T`'s close plus the half-spread. It is held to the close of
 the first bar with `ts_init` at least 30 minutes after the entry, or the part's last bar if sooner, and sold
 there at that close less the half-spread. The net outcome is sold / entry − 1. The half-spread is one
-fractional rate per symbol, ADR 0092's, applied to both fills and keyed by symbol, never by clock minute. A
+fractional rate per symbol, applied to both fills and keyed by symbol, never by clock minute: this record's
+choice, not ADR 0092's, whose `Costs` has one rate before and one in the regular session
+(`early_entry_study.py:219-230`); ADR 0092 says only that the rate comes from `sip` quotes. A
 symbol without one, a control among them, takes the median over the unique symbols in its `tier`, with the
 tier read at the event's reference close. The donors are the symbols of the events a fold chooses on, its
 earlier blocks, for both its choice and its judged block; at a holdout opening, those of every development
@@ -106,13 +108,23 @@ arms. `--freeze OUT`, with no list of names and no catalog read, writes once: HE
 `main`; the SHA-256 at that commit of the tracked holdout list and of the tracked amendment to ADR 0096;
 the population rule by citation; each arm admitted or pending with its registration commit, and each arm
 left out with its reason; the statement that no outcome on a holdout date was read; and what read holdout
-bars (`early_entry_study.freeze_opening`). The file is committed to `main` before 09:30. The read, not
+bars (`early_entry_study.freeze_opening`). The file is committed to `main` before 09:30. Outcome: the
+freeze was written at 07:58:23 New York on 2026-11-12 (its `frozen` field), before that deadline. It lists
+`F-all` and the seven bar factor arms as registered, replay pending at `0e8542fe`, and `F-rdb5` and
+`F-vwap` as not admitted (`canon/holdout-adr0096-freeze.json`, `arms`). Each arm is defined as this
+record registered it at `0e8542fe`, `F-pmadv` included; a narrowed definition is a new arm under a new
+name with its own registration (the lead, 2026-11-12). No holdout is opened until the gate's defect, two
+openers writing the same per-date markers, is fixed (the lead, 2026-11-12). The read, not
 yet built, is to call `verify_freeze` first, which refuses unless the freeze is tracked, unchanged and
 committed once, its commits are held, and the holdout list hashes as frozen at its commit and in the
 checkout, and the amendment at its commit. `rdb5` and `vwap` go in every case, and the other
 eight if this record is not on `main` before the opening, to this record's later holdout: the first 20
-regular sessions after 2026-11-11 (the calendar UNVERIFIED), loaded as bars through `paper:history`, its
-dates entered here before any is read, and opened once for the arms that take it. It is not ADR 0096's
+regular sessions after 2026-11-11, entered on 2026-11-12 before any of their bars is loaded for this
+record: 2026-11-12, 13, 16, 17, 18, 19, 20, 23, 24, 25 and 30, and 2026-12-01, 02, 03, 04, 07, 08, 09, 10
+and 11 (NYSE's 2026 calendar; Thanksgiving 2026-11-26 is a holiday and 2026-11-27 an early close, left
+out). They are loaded as bars through `paper:history` and opened once for the arms that take it. ADR
+0133's forward set shares most of these dates; until the gate's fix, an opening of either must not
+mark the other's dates. It is not ADR 0096's
 later holdout, which is drawn from recorded sessions.
 
 **Departures**, all this record's: three parts and controls where ADR 0092 has one window; entry at `T`
@@ -120,8 +132,11 @@ with no rising run, up to three a day; a 30-minute hold and no managed exit; sel
 outcome, not ADR 0092's share entered not late; every arm replayed at its opening, not one; at ADR 0096's
 first opening, a replay after its other results are read, outside its selection, against ADR 0092's single
 opening and ADR 0096's "opens once"; `rdb5` and `vwap` sent later even if `vwap` is ready at the opening,
-against ADR 0096's "every arm whose inputs cover"; and a later holdout of this record's own, a third opening
-of bars after 2026-11-11.
+against ADR 0096's "every arm whose inputs cover"; a later holdout of this record's own, a third opening
+of bars after 2026-11-11; one half-spread per symbol where ADR 0092 has one per part (above); and F2's rule
+that all 5 earlier sessions be covered, where ADR 0092's `_listing` averages whichever exist (ADR
+0096:109-111). The population being the catalog's symbols only is not a departure: ADR 0092 itself says the
+whole-market population waits for the asset list.
 
 **What counts as a result.** For every arm on the holdout, at the half-spread and at twice it: the entries,
 the mean and median net outcome, and the median minus `F-all`'s and minus the controls'. A factor is
@@ -160,6 +175,13 @@ Read 2026-11-11. The factors' selection, cuts, tiers and the result rule are thi
 * ADR 0092 (PR #274, merged as `1e790c7`) and ADR 0096 on `main`: the registered listing condition,
   the reference close, the bar model, the costs, the split and walk-forward, the holdout and its later
   form. Read.
+* Related records: ADR 0093 (`paper:history`, accepted, which loads these bars) and ADR 0101 (proposed, which
+  shares the opening's manifest rule and cites this record). ADR 0092 and ADR 0096 are both `proposed`.
+* https://docs.alpaca.markets/us/docs/market-data-faq#how-are-bars-aggregated — which print conditions
+  count toward a bar's `vwap`, the source of `vwap`'s exclusions; cited as ADR 0096 cites it, not re-fetched.
+* https://www.nyse.com/markets/hours-calendars — the 2026 holidays and early closes behind the later
+  holdout's dates. Fetched 2026-11-12.
+* `canon/holdout-adr0096-freeze.json` at `bf5742e0` — the freeze time and each factor arm's status. Read.
 * https://docs.alpaca.markets/us/reference/stockbars — historical bars carry `vw` (vwap) and `n` (trade
   count) beside OHLCV, the inputs `rdb5` and `vwap` wait for. Fetched by the
   evidence-verifier, 2026-11-11.
@@ -175,3 +197,9 @@ Read 2026-11-11. The factors' selection, cuts, tiers and the result rule are thi
   on the code, and 6 confirms the tier rule for controls. Read.
 * evidence-verifier on those two sentences, 2026-11-11: narrowed "every count" to the factor run's counts,
   named ADR 0092's holdout dates, and corrected this bullet. Applied.
+* evidence-verifier on this record at `bf5742e0`, 2026-11-12: 16 held, 5 half, 1 failed (the half-spread
+  called ADR 0092's). Its corrections, reproduced, are made above: the half-spread as this record's choice,
+  the related records, the freeze's time and outcome, the later holdout's dates, the FAQ for `vwap` and two
+  undeclared departures (one of its two proposed departures was not one). Its finding on an unlanded edit
+  narrowing `pmadv` is answered by the lead's ruling above; the rest of that edit's disposition is its
+  owner's.
