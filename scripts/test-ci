@@ -96,7 +96,9 @@ fresh() { C="$TMP/case-$1"; cp -R "$BASE" "$C"; }
 # runci [args...]: run the copy's scripts/ci; sets OUT and RC. Temp files go to $C.tmp, checked later.
 runci() {
   mkdir -p "$C.tmp"; : >"$C.uv.log"
+  # CANON_CI_OS: Linux unless a case names Darwin, so a case reads the same on this Mac and on the runner
   OUT=$(cd "$C" && PATH="$FAKE:$PATH" TOOLS="${TOOLS:-$TMP/tools}" UV_LOG="$C.uv.log" TMPDIR="$C.tmp" \
+        CANON_CI_OS="${CI_OS:-Linux}" \
         scripts/ci "$@" 2>&1); RC=$?
 }
 # has <regex>: OUT has a line matching the extended regex (reads all of OUT)
@@ -389,6 +391,24 @@ check "and the working tree"                       has '^  ok    gitleaks \(work
 check "not only what is staged"                    test "$(printf '%s\n' "$OUT" | grep -c 'gitleaks (staged changes)')" = 0
 check "the rest is left to the hosted run"         has '^  skip  pytest \(not run here; the hosted required check runs it\)$'
 check "and its verdict says so"                    has '^ci: all landing checks passed; [0-9]+ checks NOT RUN here, left to the hosted required check'
+}
+case_landingmac() {
+fresh landingmac
+local s
+for s in test-lanes test-maintenance test-zz; do
+  printf '#!/bin/bash\n: >"%s"\n' "$C.$s.ran" >"$C/scripts/$s"; chmod +x "$C/scripts/$s"
+done
+gitq -C "$C" add -A; gitq -C "$C" commit -q -m mac
+CI_OS=Darwin runci --landing
+check "a landing on macOS passes"                  test "$RC" = 0
+check "it runs test-lanes"                         test -e "$C.test-lanes.ran"
+check "and test-maintenance"                       test -e "$C.test-maintenance.ran"
+check "and no other test script"                   test ! -e "$C.test-zz.ran"
+check "test-lanes has its ok line"                 has '^  ok    test-lanes$'
+rm -f "$C".test-*.ran
+runci --landing
+check "a landing elsewhere leaves test-lanes"      test ! -e "$C.test-lanes.ran"
+check "and test-maintenance to the hosted run"     has '^  skip  test-maintenance \(not run here; the hosted required check runs it\)$'
 }
 case_fullall() {
 fresh fullall
@@ -998,7 +1018,7 @@ done
 }
 
 # Every case above works in its own copy, so they run concurrently; their output prints in this order.
-CASES="yaml noflows shell staged untracked tests testdir testgone notes skipsum died symlink deleted deleted2 lockfail fastfirst fastorder fastnamed commitscope collectfail stagedlock stagedtool stagedapart landingall fullall apart apartlock hookenv parallel order missing pathorder strayconfig longfail slots nice priority prioritycapacity"
+CASES="yaml noflows shell staged untracked tests testdir testgone notes skipsum died symlink deleted deleted2 lockfail fastfirst fastorder fastnamed commitscope collectfail stagedlock stagedtool stagedapart landingall landingmac fullall apart apartlock hookenv parallel order missing pathorder strayconfig longfail slots nice priority prioritycapacity"
 CASES="$CASES commitfast commitmodes commitslowfailure commitfastfailure commitpytest commitcanon commitshellfailure"
 for c in $CASES; do ( "case_$c" ) >"$TMP/out.$c" 2>&1 & done
 wait

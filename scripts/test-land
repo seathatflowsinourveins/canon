@@ -193,7 +193,7 @@ t_quick_signoff() {
   why="the review or signoff status does not truthfully name what ran locally"
   [ "$rc" -eq 0 ] \
     && logged "statuses/$sha -f state=success -f context=review -f description=code-review ran, nothing found" \
-    && logged "statuses/$sha -f state=success -f context=signoff -f description=scripts/ci --landing (quick checks, secret scan of the history) passed locally"
+    && logged "statuses/$sha -f state=success -f context=signoff -f description=scripts/ci --landing (quick checks, history secret scan, macOS self-tests on macOS) passed locally"
 }
 t_quick_failure() {
   new_repo; change src/a.py; echo 1 > "$FAKE/ci_rc"

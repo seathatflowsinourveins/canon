@@ -28,7 +28,7 @@ jobs:
   check:
     name: checks
     runs-on: ubuntu-24.04
-    timeout-minutes: 30 # twice the longest of the last ten passing runs (886 s), read 2026-11-12
+    timeout-minutes: 40 # the two latest passing runs on main took 22 min 23 s and 22 min 31 s (2026-11-13); scripts/land waits 45 (ADR 0144)
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

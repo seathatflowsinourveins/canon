@@ -181,12 +181,13 @@ The owner's standing instruction (2026-11-09): work lands automatically once its
 1. One branch per change. A session that runs in parallel with another works in its own git worktree;
    two sessions never write in one checkout.
 2. Commit, then run `scripts/land`. It runs the landing checks (`scripts/ci --landing`: the quick set and a
-   secret scan of the whole history) on what is committed, on a branch that contains the current `main`,
+   secret scan of the whole history, and on macOS `scripts/test-lanes` and `scripts/test-maintenance`) on
+   what is committed, on a branch that contains the current `main`,
    and lands the branch once GitHub's required check, the full suite, passes; with no `origin` remote it
    runs every check here (ADR 0144). A branch behind `main` is rebased if it was never pushed;
    once pushed, `origin/main` is merged into it instead, since a rebase could only be pushed with force. With an `origin` remote, `gh` must be signed in, or it stops
    and lands nothing; it checks every address it would publish, pushes, opens a pull request, posts the
-   `review` and `signoff` statuses, and waits up to thirty minutes (`LAND_WAIT_SECONDS`, default 1800) for
+   `review` and `signoff` statuses, and waits up to 45 minutes (`LAND_WAIT_SECONDS`, default 2700) for
    GitHub to squash-merge exactly the checked commit with the checked subject and message. If the wait
    runs out first, it stops and says what it last read; with auto-merge requested, GitHub may still merge
    once the checks pass, so look at the pull request. With no `origin` remote

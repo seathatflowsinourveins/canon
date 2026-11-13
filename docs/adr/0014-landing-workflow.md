@@ -33,7 +33,8 @@ a pull request look like, taken from what current exemplar repositories actually
 Chosen: **option 2**, through `scripts/land`.
 
 1. **One branch per change, one worktree per parallel session.** Two sessions never write in one checkout.
-2. **`scripts/land` is the merge step.** It refuses a dirty tree or a branch not based on `main`, runs
+2. **`scripts/land` is the merge step.** (Amended by ADR 0144: the local pass is `scripts/ci --landing`, or
+   every check with no `origin`, and the wait is 45 minutes.) It refuses a dirty tree or a branch not based on `main`, runs
    `scripts/ci`, then lands: without `origin` it fast-forwards `main`; with `origin` it needs a signed-in
    `gh`, pushes, opens a pull request, posts `review` and `signoff`, and waits up to nine minutes for GitHub
    (`LAND_WAIT_SECONDS`) to squash-merge exactly the checked commit, then stops; auto-merge, if on, merges.
@@ -45,7 +46,7 @@ Chosen: **option 2**, through `scripts/land`.
    the exact commit it has just checked. This is local CI as 37signals practise it, with the same status
    name as their tool, plus an independent run on GitHub's runners.
 5. **The same script runs in both places.** (Amended by ADR 0144: `--landing` now runs the quick set and a
-   secret scan of the whole history, and only the hosted run runs every check; the wait is thirty minutes.) `scripts/land` runs `scripts/ci --landing` before it pushes, so
+   secret scan of the whole history, and only the hosted run runs every check; the wait is 45 minutes.) `scripts/land` runs `scripts/ci --landing` before it pushes, so
    a failure shows before the push (it took seconds when this was written; minutes by 2026-11-13, ADR 0138). The hosted workflow runs it again on a clean machine, and `scripts/land` waits for that run
    before it merges.
 6. **The repository is public.** GitHub's standard hosted runners are free for public repositories.

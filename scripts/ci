@@ -45,7 +45,9 @@
 #                              hosted run runs it
 #        scripts/ci --landing  scripts/land's run before a push (ADR 0144): the same quick set, with the secret
 #                              scan over the whole git history and the working tree instead, so nothing the
-#                              push would publish goes out unscanned; the rest is left to the hosted run
+#                              push would publish goes out unscanned, and on macOS scripts/test-lanes and
+#                              scripts/test-maintenance, whose macOS cases no hosted job runs; the rest is
+#                              left to the hosted run
 # A tool that is missing is a failure, never a skip. Exit 0 only if every check passes.
 # Slots: one of CANON_CI_SLOTS (default 3) machine-wide slots is held for the whole run; when N > 1,
 # slot N is reserved for --landing, which probes N down to 1; other runs share 1..N-1 (take_slot, below).
@@ -57,6 +59,7 @@ set -uo pipefail
 if [ -z "${CANON_CI_NICED:-}" ]; then CANON_CI_NICED=1 exec nice -n 5 "$0" "$@"; fi
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT" || exit 1
+OS=${CANON_CI_OS:-$(uname -s)}   # CANON_CI_OS: set by scripts/test-ci to test either side
 STAGED=0; LANDING=0; QUICK=0   # QUICK: --staged or --landing, the runs that leave the slow checks to GitHub
 case "$#:${1:-}" in
   0:) ;;
@@ -420,6 +423,10 @@ if [ "${#TESTS[@]}" -gt 0 ]; then
     elif [ "$name" = test-ci ] && [ -n "${CANON_TEST_CI:-}" ] && { [ "$QUICK" -eq 0 ] || [ "$GATED" -eq 1 ]; }; then
       # a quick run leaves test-ci to the hosted run in any case, and says so (landing_only)
       skip_line "$name (running inside scripts/test-ci)"
+    elif [ "$LANDING" -eq 1 ] && [ "$OS" = Darwin ] && { [ "$name" = test-lanes ] || [ "$name" = test-maintenance ]; }; then
+      # their macOS cases skip on the hosted Ubuntu runner and the hosted macOS job runs none of them yet
+      # (.github/workflows/ci.yml, ADR 0082), so a landing on macOS runs them here (ADR 0144)
+      job --notes "$name"                "$t"
     else
       landing_only --notes "$name"       "$t"
     fi

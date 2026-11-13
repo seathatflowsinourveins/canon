@@ -41,7 +41,8 @@ landings started after it is on `main`; it changes no landing already in flight.
    the quick set the commit hook runs (the lock and environment checks, ruff, format, ty, test collection,
    canon lint and shell checks across the tree, including the separate projects' lock, environment, ty and
    collection checks) and, in place of the staged-only scan, gitleaks over the whole git history and the
-   working tree. Landing refuses a dirty tree, so these see the whole committed branch, and nothing the
+   working tree, and on macOS `scripts/test-lanes` and `scripts/test-maintenance`, whose macOS-only cases
+   no hosted job runs (see Consequences). Landing refuses a dirty tree, so these see the whole committed branch, and nothing the
    push would publish goes out unscanned for secrets. Each other check is a skip line naming the hosted
    required check, and the verdict line says how many were left to it. `--landing` keeps the CI slot
    reserved for landings.
@@ -56,10 +57,14 @@ landings started after it is on `main`; it changes no landing already in flight.
    reporting macOS job stay as they are.
 4. **Statuses and merge.** The `review` status keeps the same note and precedes `signoff`. The `signoff`
    context keeps its name; its description becomes
-   `scripts/ci --landing (quick checks, secret scan of the history) passed locally`, attached to the checked
-   commit, so the status says what ran here. The wait for the merge becomes 30 minutes
-   (`LAND_WAIT_SECONDS`, default 1800), longer than the hosted full run's measured 18-26 minutes, so an
-   ordinary landing ends with `main` updated rather than with an unconfirmed merge. The review gate,
+   `scripts/ci --landing (quick checks, history secret scan, macOS self-tests on macOS) passed locally`,
+   attached to the checked
+   commit, so the status says what ran here. The wait for the merge becomes 45 minutes
+   (`LAND_WAIT_SECONDS`, default 2700), above the `checks` job's timeout, raised from 30 to 40 minutes
+   because the full suite now runs only there and its two latest passing runs on `main` took 22 min 23 s
+   and 22 min 31 s (read 2026-11-13 by the evidence-verifier from the workflow's run history), so a landing whose
+   hosted run finishes ends with `main` updated; queueing beyond that still ends in an unconfirmed merge,
+   reported as before. The review gate,
    address check, branch rebase/merge rule, exact-head squash-merge arguments, subject and body stay as
    they are. Repository settings, rulesets and merge queues are untouched.
 5. **The lane's tests.** A lane still runs its unit's own tests before landing, and one full pytest when
@@ -85,20 +90,21 @@ only the local scope and the text that attests to it.
   records two hosted runs of 18 min 46 s and 19 min 09 s.
 * Bad: a failure outside the quick set first appears on GitHub after the push. The lane's own tests
   remain necessary.
-* Bad, a recorded limit: the self-test cases that need macOS (in `scripts/test-lanes` and
-  `scripts/test-maintenance`) were run by the full local landing run and skip on the hosted Ubuntu runner.
-  The workflow's macOS job still runs and reports them on every pull request, but it is not among the
-  required checks (ADR 0082), so they no longer block a landing. A lane that changes what they cover runs
-  them itself before landing.
+* Cost kept: the self-test cases that need macOS (in `scripts/test-lanes` and `scripts/test-maintenance`)
+  skip on the hosted Ubuntu runner, and the workflow's macOS job runs none of them while its image lacks
+  `/usr/bin/timeout` (`.github/workflows/ci.yml`, ADR 0082). So `--landing` on macOS still runs those two
+  scripts in full; they are the slowest part of the local landing that remains. A landing from Linux
+  skips them and does not block on them.
 * GitHub documents 20 concurrent standard hosted jobs on Free, with at most 5 macOS jobs, and cancels a
   job past a limit; these are limits, not a guarantee of immediate starts. Actual
   account usage and runner contention are UNVERIFIED.
 
 ### Confirmation
 
-* `scripts/test-ci`: `--landing` runs the quick set, scans the whole history and the working tree and no
+* `scripts/test-ci`: `--landing` runs the quick set, and on macOS (`CANON_CI_OS=Darwin`) `test-lanes` and
+  `test-maintenance` and no other test script, scans the whole history and the working tree and no
   staged diff, runs no self-test and no full pytest, and says what it left to the hosted run; a plain run
-  still runs everything. 389 passed on 2026-11-13.
+  still runs everything. 396 passed on 2026-11-13; against the previous scripts/ci, the macOS landing case fails 3.
 * `scripts/test-land`, red against the base landing implementation: exactly one `scripts/ci --landing`
   call on a clean multi-commit branch with `origin` (including the `--pr` and dry-run paths), one plain
   `scripts/ci` call with no `origin`; signoff names what ran and both statuses name the checked commit.
