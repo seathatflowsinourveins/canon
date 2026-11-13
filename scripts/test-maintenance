@@ -93,11 +93,16 @@ EOF
 printf '#!/bin/bash\necho "otelcol $*" >> "$STUB/otelcol.log"\nexit 0\n' > "$STUB/otelcol"
 # takelock <file>: a stand-in window takes the paper lock and holds it until the test releases it
 # (release, below; at most 300 s), however slow the round is; returns once it is held (within 30 s)
+# The readiness probe must keep the file too (lockf(1), -k): removing it while the holder is between
+# open and lock can leave that holder locking an unlinked file, invisible to the probe and the round.
 cat > "$STUB/takelock" <<'EOF'
 #!/bin/bash
 /usr/bin/lockf -k "$1" /bin/bash -c 'for _ in $(seq 1 3000); do [ ! -f "$0/release" ] || exit 0; sleep 0.1; done' "$(dirname "$0")" >/dev/null 2>&1 &
-echo "$!" >> "$(dirname "$0")/holders"
-for _ in $(seq 1 600); do /usr/bin/lockf -t 0 "$1" true 2>/dev/null || exit 0; sleep 0.05; done
+holder=$!; echo "$holder" >> "$(dirname "$0")/holders"
+for _ in $(seq 1 600); do /usr/bin/lockf -k -t 0 "$1" true 2>/dev/null || exit 0; sleep 0.05; done
+# not held in time: stop the holder (and its command, which shares the lock) so it cannot take it later
+pkill -P "$holder" 2>/dev/null; kill "$holder" 2>/dev/null
+echo "test-maintenance: takelock: $1 was not held within 30 s" >&2
 exit 1
 EOF
 chmod +x "$STUB/takelock"
@@ -824,7 +829,7 @@ EOF
   # firing has nothing to record, so it ends idle and adds nothing to the failure count.
   rreset; rclock '2026-11-14 10:00:00'
   /usr/bin/lockf -k "$AH/canon/movers-checkout.recorder.lock" /bin/sleep 30 & lholder=$!
-  for _ in $(seq 1 100); do /usr/bin/lockf -t 0 "$AH/canon/movers-checkout.recorder.lock" /usr/bin/true || break; sleep 0.05; done
+  for _ in $(seq 1 100); do /usr/bin/lockf -k -t 0 "$AH/canon/movers-checkout.recorder.lock" /usr/bin/true 2>/dev/null || break; sleep 0.05; done
   rrun; rc=$?
   check "recorder lock held on a weekend: the firing ends idle, not failed, with no failure counted" \
         eval '[ "$rc" = 0 ] && [ ! -s "$STUB/recorder-calls" ] && jqt "$RS" '\''.outcome == "idle" and ((.consecutive_failed_firings // 0) == 0)'\'''
