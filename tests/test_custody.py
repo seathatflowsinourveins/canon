@@ -279,6 +279,69 @@ def test_a_replaced_order_that_shows_no_fill_count_freezes_the_symbol(shown) -> 
     assert report.frozen["SPY"] == [why]
 
 
+def test_a_replaced_order_that_shows_a_negative_fill_count_freezes_the_symbol() -> None:
+    """A count below zero is no count either. Taken as shown, the replacement's 20 less the hand's
+    "-18" would be 38 of ours, and with 38 held, 18 of them foreign, all would be sold."""
+    venue = ReplacedNotListedOpen(REGULAR)
+    venue.hold("SPY", 38, client_order_id=None)
+    chain(venue, "0", "-18", "20", by_hand=(1,))
+    quantity, why = opened(venue)
+    assert quantity is None
+    assert why == (
+        "an order of ours in SPY replaces one whose listing shows no fill count, so what it filled "
+        "beyond that one, and with it the quantity ours opened, is not established"
+    )
+    report = close(venue)
+    assert venue.sent == []
+    assert report.frozen["SPY"] == [why]
+
+
+NO_COUNT = [None, "", "many", "-18", "NaN", "Infinity"]
+"""What a listing may show for a fill count that is no count: alpaca-py's `Order.filled_qty` is an
+optional string or number with no bound."""
+
+
+@pytest.mark.parametrize("shown", NO_COUNT, ids=[repr(v) for v in NO_COUNT])
+def test_an_order_of_ours_that_shows_no_fill_count_freezes_the_symbol(shown) -> None:
+    """Ours bought 20. Our sell filled nothing, our replacement of it sold 18, and a hand replaced
+    that one, showing the chain's 20. Our replacement is listed without its count. Read as zero, our
+    sale of 18 vanishes, ours still reads 20, and the 20 held, of which at most 2 are ours, are sold."""
+    venue = ReplacedNotListedOpen(REGULAR)
+    venue.hold("SPY", 20)
+    chain(venue, "0", "18", "20", side="sell", by_hand=(2,), first="O-20261111-145500-001-001-2")
+    (at,) = [n for n, order in enumerate(venue.history) if order.filled_qty == "18"]
+    venue.history[at] = venue.history[at].model_copy(update={"filled_qty": shown})
+    quantity, why = opened(venue)
+    assert quantity is None
+    assert why == (
+        "an order of ours in SPY is listed without a fill count, so the quantity ours opened is not "
+        "established"
+    )
+    report = close(venue)
+    assert venue.sent == []
+    assert report.frozen["SPY"] == [why]
+
+
+def test_an_order_of_ours_with_no_fill_count_still_has_our_open_orders_canceled() -> None:
+    """The symbol freezes by name; it does not end the run. An open order of ours in it is still
+    canceled, as in any frozen symbol, where a count that is no number used to raise before that."""
+    venue = ReplacedNotListedOpen(REGULAR)
+    venue.hold("SPY", 20)
+    venue.open(client_order_id=OURS[1], side="sell", qty="1", filled_qty="many", status="canceled")
+    resting = venue.open(
+        client_order_id=OURS[2], side="sell", qty="1", type="limit", limit_price="999"
+    )
+    report = close(venue)
+    assert venue.sent == []
+    assert venue.canceled == [resting.client_order_id]
+    assert report.frozen["SPY"] == [
+        (
+            "an order of ours in SPY is listed without a fill count, so the quantity ours opened is not "
+            "established"
+        )
+    ]
+
+
 @pytest.mark.parametrize("filled", [("18", "20"), ("16", "18", "20"), ("0", "20")])
 def test_a_chain_of_our_own_replacements_counts_its_fills_once(filled) -> None:
     """Now that the adapter's replacement reads as ours, a partly filled buy and its replacement are

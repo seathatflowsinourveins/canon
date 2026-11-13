@@ -62,7 +62,8 @@ order on", its filled quantity counting the fills before it (ADR 0042, paper, 20
 ours is counted once, and the fills of a foreign order in a chain stay foreign whatever replaced it. A
 replacement of ours with fills whose replaced order the listing does not hold (one working since before the
 lookback) carries fills that cannot be told apart, and freezes the symbol; so does one whose replaced
-order is listed without a fill count, since what is not shown is not zero; one with no fills, as a resting
+order is listed without a fill count, and any order of ours listed without one, since what is not shown,
+is no number or is below zero is not zero; one with no fills, as a resting
 stop tightened days after it was placed, carries none and counts nothing. A long
 is ours to close only when it is exactly that net. On an account held long-only, ours at the lookback's start
 is not negative, so the net over the lookback is never more than what ours holds now, and a match never takes
@@ -287,21 +288,17 @@ HAND_CLOSE_PREFIX = f"{CHECK_CLOSE_PREFIX}hand-"
 """The client order ID prefix of a close the by-hand form sends: of our lineage (`CHECK_CLOSE_PREFIX`)."""
 
 
-def _qty(field: object) -> Decimal:
-    return Decimal(str(field)) if field not in (None, "") else Decimal(0)
-
-
 def _shown(field: object) -> Decimal | None:
-    """A quantity as a listing shows it, or None when it shows none or one that is no finite number.
-    alpaca-py's `Order.filled_qty` may be absent (`alpaca/trading/models.py:283` at the pin), and what
-    is not shown is not zero."""
+    """A quantity as a listing shows it, or None when it shows none, one that is no finite number, or
+    one below zero. alpaca-py's `Order.filled_qty` is an optional string or number with no bound
+    (`alpaca/trading/models.py:283` at the pin), and what is not shown is not zero."""
     if field in (None, ""):
         return None
     try:
         value = Decimal(str(field))
     except ArithmeticError:
         return None
-    return value if value.is_finite() else None
+    return value if value.is_finite() and value >= 0 else None
 
 
 def describe(order: Order) -> str:
@@ -358,7 +355,13 @@ def _opened(trading: TradingClient, symbol: str, now: datetime) -> tuple[Decimal
     for order in orders:
         if lineage(order.client_order_id) != OURS:
             continue
-        filled = _qty(order.filled_qty)
+        filled = _shown(order.filled_qty)
+        if filled is None:
+            # read as zero, a sale of ours would vanish from the net and the long read as all ours
+            return None, (
+                f"an order of ours in {symbol} is listed without a fill count, so the quantity ours "
+                "opened is not established"
+            )
         if order.replaces is not None and filled > 0:
             # a replacement carries on the fills of the order it replaces, whoever placed that one:
             # only what it filled beyond them is its own (one with no fills carries none)
