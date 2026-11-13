@@ -64,7 +64,14 @@ case "${1:-} ${2:-}" in
     if [ "$(wc -l < "$FAKE/views")" -gt 1 ]; then tail -n +2 "$FAKE/views" > "$FAKE/views.next" && mv "$FAKE/views.next" "$FAKE/views"; fi
     line=${line/HEAD/$(git rev-parse HEAD)}
     printf '%s\n' "${line/OTHER/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" ;;
-  "api -X")      ;;
+  "api rate_limit") # rate: the spent budgets, "<core|graphql> <limit> <reset>" a line, empty for none;
+                    # rate_late: the same, answered only once a status was posted
+                    if [ -f "$FAKE/rate_late" ] && grep -q statuses "$FAKE/log"; then cat "$FAKE/rate_late"; exit 0; fi
+                    [ -f "$FAKE/rate" ] || { echo "gh: HTTP 500" >&2; exit 1; }; cat "$FAKE/rate" ;;
+  "api -X")      # api_refuse: a status context (review or signoff) GitHub refuses, as a spent REST budget did
+                 if [ -f "$FAKE/api_refuse" ] && case "$*" in *"context=$(cat "$FAKE/api_refuse")"*) true ;; *) false ;; esac; then
+                   echo "gh: API rate limit exceeded for user ID 1. (HTTP 403)" >&2; exit 1
+                 fi ;;
   *) echo "fake mise: unexpected gh call: $*" >&2; exit 98 ;;
 esac
 FAKE
@@ -152,7 +159,47 @@ t_local_note() {
   [ "$rc" -eq 0 ] && has 'review note: "code-review ran, nothing found"' && has "not recorded anywhere" \
     && [ "$(git -C "$W" rev-parse main)" = "$(git -C "$W" rev-parse topic)" ]
 }
+t_status_refused() {       # t_status_refused <context>: GitHub refuses that status; the land fails by name
+  new_repo; change README.md; echo "$1" > "$FAKE/api_refuse"
+  land
+  [ "$rc" -ne 0 ] || { why="land exited 0 though the $1 status was refused"; return 1; }
+  has "the $1 status" || { why="the failure does not name the $1 status"; return 1; }
+  has "rate limit" || { why="the failure does not say what GitHub answered"; return 1; }
+  ! logged "pr merge" || { why="a merge was asked for without the statuses"; return 1; }
+}
+t_budget_spent() {         # t_budget_spent signed-in|signed-out [core|graphql]: a spent budget is named, with its reset
+  new_repo; change README.md
+  [ "$1" = signed-in ] || echo 1 > "$FAKE/auth_rc"
+  local kind=${2:-core} label=REST; [ "$kind" = graphql ] && label=GraphQL
+  echo "$kind 5000 1763002800" > "$FAKE/rate"
+  local reset; reset=$(date -r 1763002800 '+%Y-%m-%d %H:%M' 2>/dev/null || date -d @1763002800 '+%Y-%m-%d %H:%M')
+  land
+  [ "$rc" -ne 0 ] || { why="land exited 0 on a spent budget"; return 1; }
+  has "$label budget is spent" || { why="the spent $label budget is not named"; return 1; }
+  if ! has "0 of 5000" || ! has "$reset"; then why="the count or the reset time ($reset) is not given"; return 1; fi
+  ! has "not signed in" || { why="a spent budget was called signed out"; return 1; }
+  if ci_ran || pushed topic; then why="checks ran or the branch was pushed on a spent budget"; return 1; fi
+}
+t_budget_left() {          # a budget with calls left lands as before
+  new_repo; change README.md; : > "$FAKE/rate"
+  land; [ "$rc" -eq 0 ] && has "landed:"
+}
+t_status_refused_spent() { # the budget runs out after the checks: the refused status names it and its reset
+  new_repo; change README.md; : > "$FAKE/rate"; echo review > "$FAKE/api_refuse"
+  echo "core 5000 1763002800" > "$FAKE/rate_late"
+  land
+  if [ "$rc" -eq 0 ] || ! has "the review status" || ! has "REST budget is spent (0 of 5000)"; then
+    why="the refused status does not name the spent budget"; return 1
+  fi
+}
 case_ "origin and gh signed out: refused, main not moved"  t_signed_out
+case_ "a spent REST budget is named with its reset, signed in"  t_budget_spent signed-in
+case_ "a spent REST budget is named, not called signed out"  t_budget_spent signed-out
+case_ "a spent GraphQL budget is named, not called signed out"  t_budget_spent signed-out graphql
+case_ "a REST budget with calls left lands"                 t_budget_left
+case_ "a refused review status fails the land by name"     t_status_refused review
+case_ "a refused signoff status fails the land by name"    t_status_refused signoff
+case_ "a status refused on a budget spent after the checks names it"  t_status_refused_spent
 case_ "a --pr run with no origin: refused, main not moved"  t_inner_no_origin
 case_ "local path prints the review note it cannot record" t_local_note
 
