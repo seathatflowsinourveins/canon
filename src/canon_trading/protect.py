@@ -90,6 +90,7 @@ shares than are held."""
 
 from __future__ import annotations
 
+import math
 import signal
 import sys
 from collections import deque
@@ -125,6 +126,8 @@ from alpaca.trading.requests import TrailingStopOrderRequest
 from canon_alpaca.execution import DEFINITIVE_SUBMIT_REFUSALS
 from canon_alpaca.execution import ORDERS_PAGE_LIMIT
 from canon_alpaca.execution import venue_trail
+from canon_alpaca.providers import CONNECT_TIMEOUT_SECS
+from canon_alpaca.providers import READ_TIMEOUT_SECS
 from canon_alpaca.providers import counted
 from canon_alpaca.providers import not_sent
 from nautilus_trader.indicators import AverageTrueRange
@@ -190,9 +193,16 @@ def planner_config(row: str) -> mover.MoverConfig:
 
 PLANNER = planner_config(session_window.DEFAULT_ARM)
 """The rows the planning shares whatever the trail row: `atr_n`, `entry_ticks`, `spread_floor_m`."""
-CLOSE_MARGIN = timedelta(seconds=300)
-"""The least time left to the close for a run to start: the task's own bound (`paper:protect`'s
-`timeout`), so a run that began in the regular session ends in it."""
+SEND_MARGIN = timedelta(seconds=math.ceil(CONNECT_TIMEOUT_SECS + READ_TIMEOUT_SECS))
+"""The least time left to the close for one stop to be sent: the most one submit may take, the paper
+client's own (connect, read) timeout (`session_window.paper_trading` mounts `providers.with_http_timeout`,
+ADR 0039) with alpaca-py's retries off for the send (`_sending_once`). It is checked again just before
+each send, so a send that starts is answered or timed out before the close."""
+CLOSE_MARGIN = SEND_MARGIN
+"""The least time left to the close for a run to start: one send's bound, since each send checks the
+time again. It was 300 s, said to be the task's own bound, which is 10 minutes (`paper:protect`'s
+`timeout`), so it held for no reason that stood, and refused a long bought in the last minutes before
+the close (the lead's case of 2026-11-13); a run takes 2 to 4 s on paper (2026-11-13)."""
 QUOTE_MOST = timedelta(seconds=60)
 """The oldest latest quote a distance is planned on. An older one (a halt, a thin name) says nothing of
 the spread now, and the spread is the floor. UNCALIBRATED."""
@@ -460,6 +470,9 @@ class _Protect:
         self.began = 0.0
         """`monotonic()` at the clock's read: a later symbol is planned at the clock's time plus what
         the run has taken since."""
+        self.left = timedelta(0)
+        """The time to the close at the clock's read; what is left at a send is this less what the run
+        has taken since."""
         self.client: Any = None
         self.report = ProtectReport(say=say)
         self.stamp = ""
@@ -486,10 +499,11 @@ class _Protect:
             )
             return report
         left = clock.next_close - clock.timestamp
+        self.left = left
         if left < CLOSE_MARGIN:
             report.refused = (
                 f"too near the close: {left.total_seconds():.0f} s to the close, under the "
-                f"{CLOSE_MARGIN.total_seconds():.0f} s this run may take, and no stop is sent after "
+                f"{CLOSE_MARGIN.total_seconds():.0f} s one send may take, and no stop is sent after "
                 "it; nothing else was read or sent"
             )
             return report
@@ -688,6 +702,14 @@ class _Protect:
                 report.unprotected,
                 f"unprotected {symbol}: {held} held, no stop sent: {changed}; the holding or its "
                 "orders changed during the run; run again",
+            )
+            return
+        if (to_close := self.left - timedelta(seconds=monotonic() - self.began)) < SEND_MARGIN:
+            report.note(
+                report.unprotected,
+                f"unprotected {symbol}: {held} held, no stop sent: {to_close.total_seconds():.0f} s "
+                f"to the close by the send, under the {SEND_MARGIN.total_seconds():.0f} s one send may "
+                "take, and a stop Alpaca holds works only in the regular session",
             )
             return
         if (aged := book.aged()) > QUOTE_MOST:
