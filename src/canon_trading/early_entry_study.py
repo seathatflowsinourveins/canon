@@ -476,6 +476,19 @@ def refusal(
     return None
 
 
+SNAP_DIGITS = 9
+"""Decimal places the walk keeps. Its prices are floats, whose error (about 1e-15 of a price) put a
+trigger computed on a tick a hair under it (2.01 - 0.04 is 1.9699999999999998); NautilusTrader's
+prices are fixed-point (crates/model/src/types/price.rs), so a tie there is a tie. Rounding each
+computed price to 1e-9 restores the tie. It rounds away any difference under 5e-10, real ones
+included (a floor from an odd row can sit that close to a bid), which is far under the finest tick
+(1e-4)."""
+
+
+def snap(price: float) -> float:
+    return round(price, SNAP_DIGITS)
+
+
 def protect(
     bars: Sequence[Minute],
     entry: float,
@@ -500,21 +513,23 @@ def protect(
     is NautilusTrader's default bar path, open, high, low, close (docs/concepts/backtesting/
     bar-execution.md at v2.0.0rc8). `adaptive` is its other documented path,
     `bar_adaptive_high_low_ordering`: the low first unless the open is strictly nearer the high
-    (crates/execution/src/matching_engine/mod.rs:2400-2402), then the close; a sale on that low,
-    before the bar's high is reached, is why "trail-low". `unfilled` returns a
+    (crates/execution/src/matching_engine/mod.rs:2400-2402), then the close. The open still raises the
+    trigger first (`mod.rs:2085-2108`, trailing maintenance after each update at `:4635-4643`), and a
+    sale on that low, before the bar's high is reached, is why "trail-low". `unfilled` returns a
     limit still resting at the floor after the last bar as an Exit at that bar's close bid, why
     "unfilled", instead of None.
     """
     trail = TRAIL if trail is None else trail
     exit_through = EXIT_THROUGH if exit_through is None else exit_through
     chase_cap = CHASE_CAP if chase_cap is None else chase_cap
-    trailing = entry * trail
-    first = trigger = bid - trailing
+    trailing = snap(entry * trail)
+    first = trigger = snap(bid - trailing)
     raises, floor = 0, None
     bids: list[float] = []
     for bar in bars:
         half = costs.half(bar.start + 1)
-        bids = [p * (1 - half) for p in (bar.open, bar.high, bar.low, bar.close)]
+        prices = (bar.open, bar.high, bar.low, bar.close)  # a bar's own prices are exact
+        bids = [snap(p * (1 - half)) for p in prices] if half else list(prices)
         if floor is not None:  # a released limit resting at the chase's floor
             if bids[0] >= floor:
                 return Exit(bar.start + 1, bids[0], "floor", first, trigger, raises)
@@ -522,22 +537,25 @@ def protect(
                 return Exit(bar.start + 1, floor, "floor", first, trigger, raises)
             continue
         if bids[0] <= trigger:  # opened under the trigger: the limit is released into a gap
-            floor = (trigger - entry * exit_through) * (1 - chase_cap)
+            floor = snap((trigger - entry * exit_through) * (1 - chase_cap))
             if bids[0] >= floor:
                 return Exit(bar.start + 1, bids[0], "gap", first, trigger, raises)
             if bids[1] >= floor:
                 return Exit(bar.start + 1, floor, "floor", first, trigger, raises)
             continue
-        if adaptive and not bar.high - bar.open < bar.open - bar.low:  # open, low, high, close
+        if adaptive and not snap(bar.high - bar.open) < snap(bar.open - bar.low):
+            # open, low, high, close; a tie goes low first, as the pin's fixed-point comparison
+            if (up := snap(bids[0] - trailing)) > trigger:  # the trail follows the open first
+                trigger, raises = up, raises + 1
             if bids[2] <= trigger:
                 return Exit(bar.start + 1, trigger, "trail-low", first, trigger, raises)
-            if bids[1] - trailing > trigger:
-                trigger, raises = bids[1] - trailing, raises + 1
+            if (up := snap(bids[1] - trailing)) > trigger:
+                trigger, raises = up, raises + 1
             if bids[3] <= trigger:
                 return Exit(bar.start + 1, trigger, "trail", first, trigger, raises)
             continue
-        if bids[1] - trailing > trigger:
-            trigger, raises = bids[1] - trailing, raises + 1
+        if (up := snap(bids[1] - trailing)) > trigger:
+            trigger, raises = up, raises + 1
         if bids[2] <= trigger:
             return Exit(bar.start + 1, trigger, "trail", first, trigger, raises)
     if unfilled and floor is not None:

@@ -45,6 +45,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date
 from datetime import datetime
+from decimal import ROUND_CEILING
 from decimal import ROUND_FLOOR
 from decimal import Decimal
 from pathlib import Path
@@ -60,6 +61,8 @@ from nautilus_trader.model import Price
 from nautilus_trader.model import Symbol
 from nautilus_trader.persistence import ParquetDataCatalog
 
+import canon_trading.price_step
+import canon_trading.sizing
 from canon_trading import early_entry_study as study
 from canon_trading.price_step import down_on_step
 from canon_trading.price_step import entry_price
@@ -208,6 +211,15 @@ def atr_values(bars: Sequence[study.Minute]) -> tuple[float | None, ...]:
     return tuple(out)
 
 
+def ask_price(close: float, h: int) -> Decimal:
+    """The buy limit for an entry at `close` plus h bps: the cost-loaded ask in decimal, rounded up
+    exactly to Alpaca's finest step, then `entry_price` at zero ticks. Rounded first because
+    `entry_price` nudges its input down a tenth of that step for float noise on a quote, which would
+    take a real fraction of a tick, such as 0.010005, under the ask."""
+    ask = Decimal(repr(close)) * (1 + Decimal(h) / 10_000)
+    return entry_price(ask.quantize(canon_trading.price_step.SUB_DOLLAR, rounding=ROUND_CEILING), 0)
+
+
 def trail_fraction(exit_arm: str, entry: float, atr: float | None, top: bool) -> float | None:
     """The arm's trail as a fraction of `entry`. ATR arms cap at main's 0.02; `own-k` keeps its own
     width (the cap arm own, as S2 builds it, not on main until S2 lands). A cold ATR, fewer than 14
@@ -283,7 +295,7 @@ def reentry_signal(
         if b.close < low:
             low, low_index = b.close, i
         rises = rises + 1 if b.close > bars[i - 1].close else 0
-        depth = max(0.0, sale - low) / distance
+        depth = study.snap(max(0.0, sale - low) / distance)  # a fall of exactly d trails is d
         enter = arm == "reclaim" and b.close > sale
         if arm.startswith("turn-"):
             enter = rises >= k and depth >= d
@@ -318,15 +330,9 @@ def opening_signal(
             low, low_i = bars[i].close, i
         rises = rises + 1 if bars[i].close > bars[i - 1].close else 0
         distance = distances[i]
-        if (
-            distance
-            and rises >= k
-            and (opened - low) / distance >= fall
-            and (eligible is None or eligible(i))
-        ):
-            return Signal(
-                i, (opened - low) / distance, bars[low_i].start + 1 - 570, bars[i].start + 1 - 570
-            )
+        depth = study.snap((opened - low) / distance) if distance else 0.0
+        if distance and rises >= k and depth >= fall and (eligible is None or eligible(i)):
+            return Signal(i, depth, bars[low_i].start + 1 - 570, bars[i].start + 1 - 570)
     return None
 
 
@@ -412,7 +418,7 @@ class ReplayContext:
         b = self.bars[index]
         fraction = trail_fraction(exit_arm, b.close, self.atr[index], self.top)
         try:
-            entry = entry_price(Decimal(repr(b.close * (1 + h / 10_000))), 0)
+            entry = ask_price(b.close, h)
         except ValueError:
             self._shares[key] = "entry_above_top_tier"  # price_step's refusal, not S1's
             return self._shares[key]
@@ -507,7 +513,7 @@ class ReplayContext:
         out = []
         for b, atr in zip(self.bars, self.atr, strict=True):
             fraction = trail_fraction(exit_arm, b.close, atr, self.top)
-            out.append(None if fraction is None else fraction * b.close)
+            out.append(None if fraction is None else study.snap(fraction * b.close))
         self._distances[exit_arm] = tuple(out)
         return self._distances[exit_arm]
 
@@ -524,8 +530,9 @@ class ReplayContext:
             return self.entry_valid(exit_arm, index, h, skips)
 
         def opening_eligible(index: int) -> bool:
-            # An other-tier name is in the population by its listing; it is bought only while listed.
-            return (self.top or self.seen[index].listed) and eligible(index)
+            # The opening arms watch a name as every other run does (`watched`): an other-tier name
+            # only while listed, a top-tier one until it first lists and then only while listed.
+            return self.watched(index) and eligible(index)
 
         if opening:
             self.initials[key] = opening_signal(
@@ -579,20 +586,21 @@ class ReplayContext:
         )
         sold = self.bars[-1].close if out is None else out.price
         # On a gap/floor exit only the open (or resting floor) is reached before sale, and so on
-        # an adaptive low-first sale ("trail-low"). A trail exit visits its high before it sells.
+        # an adaptive low-first sale ("trail-low"). A trail exit visits its high before it sells,
+        # and so does a hold to the close under either bar order.
         peak = max([close, *(x.high for x in self.bars[index + 1 : sold_index])])
-        if sold_index > index and out is not None and out.why == "trail":
+        if sold_index > index and (out is None or out.why == "trail"):
             peak = max(peak, self.bars[sold_index].high)
         elif sold_index > index:
             peak = max(peak, self.bars[sold_index].open, sold)
         result = {
             "index": sold_index,
             "price": sold,
-            "distance": close * fraction,
-            # The walked distance in Alpaca's ticks at the entry's price (price_step.tick).
-            # In decimal, so a distance of exactly three ticks is not a float hair under three.
+            "distance": study.snap(close * fraction),
+            # The walked distance in Alpaca's ticks at the entry's price (price_step.tick): the
+            # walk's own distance, snapped as it is, so exactly three ticks is not a hair under.
             "trail_ticks": float(
-                Decimal(repr(close)) * Decimal(repr(fraction)) / tick(Decimal(repr(close)))
+                Decimal(repr(study.snap(close * fraction))) / tick(Decimal(repr(close)))
             ),
             "stop": out is not None,
             "why": "close" if out is None else out.why,
@@ -615,9 +623,11 @@ class ReplayContext:
         half = h / 10_000
         entry, sold = self.bars[index].close * (1 + half), walked["price"] * (1 - half)
         if self.slot_budget is not None:
-            # The prices an order is sent on: the buy S1 sized at, the sale on Alpaca's step under it.
-            entry = float(entry_price(Decimal(repr(entry)), 0))
-            sold = float(down_on_step(Decimal(repr(sold))))
+            # The prices an order is sent on: the buy S1 sized at, the sale on Alpaca's step under it,
+            # each after cost in decimal, so a price on the step is not a float hair off it.
+            entry = float(ask_price(self.bars[index].close, h))
+            cost = 1 - Decimal(h) / 10_000
+            sold = float(down_on_step(Decimal(repr(walked["price"])) * cost))
         return {
             **walked,
             "shares": size[0],
@@ -864,9 +874,14 @@ def load_symbol(
 
 
 def code_hashes() -> dict[str, str]:
-    """SHA-256 of every module a row's numbers come from: this replay and the study whose walk,
-    listing and costs it calls."""
-    paths = (Path(__file__), Path(str(study.__file__)))
+    """SHA-256 of every module a row's numbers come from: this replay, the study whose walk,
+    listing and costs it calls, and S1 and the price step its sizes and prices come from."""
+    paths = (
+        Path(__file__),
+        Path(str(study.__file__)),
+        Path(str(canon_trading.sizing.__file__)),
+        Path(str(canon_trading.price_step.__file__)),
+    )
     return {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}
 
 
@@ -1262,6 +1277,8 @@ def merge(paths: Sequence[Path], output: Path, name: str) -> Path:
     ns = {n for _, n in specs}
     if len(ns) != 1 or sorted(k for k, _ in specs) != list(range(ns.pop())):
         raise ValueError(f"shards {[m['shard'] for m in metadata]} are not 0/n to n-1/n once each")
+    if any(m.get("universe_sha256") is None for m in metadata):
+        raise ValueError("a shard recorded no universe_sha256 (its symbol list): rerun it")
     for field in MERGE_SAME:
         if len({json.dumps(m.get(field), sort_keys=True) for m in metadata}) != 1:
             raise ValueError(f"shards differ in {field}")
@@ -1297,6 +1314,7 @@ MERGE_SAME = (
     "development",
     "lookback",
     "catalog",
+    "universe_sha256",
     "slot_budget",
 )
 KEY_FIELDS = ("group", "initial", "exit", "reentry", "run", "half_spread_bps", "order")
@@ -1326,14 +1344,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     development, lookback = read_sessions(args.sessions)
     commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     hashes = code_hashes()
-    symbols = shard(
-        sorted(
-            p.name.removesuffix(".ALPACA-1-MINUTE-LAST-EXTERNAL")
-            for p in (args.catalog / "data" / "bars").iterdir()
-            if p.is_dir() and p.name.endswith(".ALPACA-1-MINUTE-LAST-EXTERNAL")
-        ),
-        args.shard,
+    universe = sorted(
+        p.name.removesuffix(".ALPACA-1-MINUTE-LAST-EXTERNAL")
+        for p in (args.catalog / "data" / "bars").iterdir()
+        if p.is_dir() and p.name.endswith(".ALPACA-1-MINUTE-LAST-EXTERNAL")
     )
+    symbols = shard(universe, args.shard)
     sums: dict[Key, dict[str, Any]] = {}
     used: dict[str, int] = defaultdict(int)
     counts: dict[str, int] = defaultdict(int)
@@ -1356,6 +1372,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "settings": header,
                     "slot_budget": str(args.slot_budget),
                     "catalog": str(args.catalog),
+                    # Shards merge only over one symbol list; bars changed in place are not caught.
+                    "universe_sha256": hashlib.sha256("\n".join(universe).encode()).hexdigest(),
                     "snapshot_started_utc": datetime.now(study.UTC).isoformat(),
                     "symbols": len(symbols),
                 }
