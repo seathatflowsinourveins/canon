@@ -43,8 +43,8 @@
 # table or a default that is not canon's is left alone and named (Codex: CODEX_HOME, codex-rs/utils/home-dir
 # at the pinned tag). It sets Antigravity's default model, the "model" key of
 # ~/.gemini/antigravity-cli/settings.json ("saved by its label", https://antigravity.google/docs/settings), to
-# the label canon/models.json gives when agy's folder exists and the key is unset. It replaces canon/ledger.sh and
-# canon/statusline.sh, keeping a differing previous copy beside each as <name>.replaced-<UTC time>. The
+# the label canon/models.json gives when agy's folder exists and the key is unset. It replaces canon/ledger.sh,
+# canon/statusline.sh and canon/fleet-rate.sh, keeping a differing previous copy beside each as <name>.replaced-<UTC time>. The
 # installed settings call the scripts in the config directory actually used. --check also compares the
 # installed settings.json's model keys with the template's, labels any env.ANTHROPIC_DEFAULT_<ALIAS>_MODEL
 # there PINNED (it stops the alias following the vendor; ADR 0059) or MISMATCH (another model than
@@ -1159,7 +1159,7 @@ install_user_config() {
   unquotable "$CLAUDE_HOME" && die "CLAUDE_CONFIG_DIR holds a quote, \$, backquote, backslash or newline, which the hook commands cannot quote: $CLAUDE_HOME"
   command -v jq >/dev/null 2>&1 || die "jq not found"
   mkdir -p "$CLAUDE_HOME/canon"
-  for f in ledger.sh statusline.sh; do
+  for f in ledger.sh statusline.sh fleet-rate.sh; do
     dst="$CLAUDE_HOME/canon/$f"
     if [ -e "$dst" ] && cmp -s "$src/canon/$f" "$dst"; then note "  unchanged  $dst"; continue; fi
     if [ -e "$dst" ]; then

@@ -318,6 +318,23 @@ sets the HUD's options at v0.15.0 (`src/config.ts`, `src/schema.ts`). The choice
   output speed, how long ago the last response was written, and the advisor model `/advisor` set. The last
   three come from the transcript like the activity lines and carry the same caveat. The account identity
   segments stay off.
+* **Shown since 2026-11-12, the owner's decision: usage pace and the fleet's output speed.** `usagePace`
+  colours the 5-hour and 7-day figures amber or red, marked `▲`, when the rate so far would reach 90% or
+  run out before the reset, from the documented `rate_limits` alone (`src/usage-pace.ts` at v0.15.0); it
+  is a mark on screen, never a gate. The first line also shows `Fleet <n> tok/s · <m> working`: every
+  measured worker's output tokens per second over the last 10 minutes, summed across runtimes, and how
+  many Claude Code sessions are working, both from `scripts/lanes --rates` (installed as `canon/lanes`).
+  The HUD's own output speed is its session's latest response only. The label reaches the HUD through
+  its `--extra-cmd`, which runs a command on every render and shows the `label` of its JSON, at most 50
+  characters, only with `CLAUDE_HUD_ALLOW_EXTRA_CMD` set (README, "--extra-cmd"; `src/extra-cmd.ts` and
+  `collector.mjs` at v0.15.0); `statusline.sh` sets both when `canon/fleet-rate.sh` is installed. The
+  report takes about 4 s against the command's 3 s limit, so `fleet-rate.sh` prints the summary a
+  previous run cached in `canon/fleet-rate.json` and, a minute after the last attempt, starts one
+  refresh in the background under a lock, with the report under a 50 s timeout: the figure is up to a
+  minute behind, the machine runs the report at most once a minute, failing or not, and only while a
+  status line renders, and a summary over ten minutes old or dated ahead of the clock shows nothing.
+  "Working" is `lanes`' state of that name; a quiet session is not counted.
+  Measured 2026-11-12: a render with the label cached, about 0.3 s.
 * **Off, for undocumented sources or identifiers.** The session start, from the same transcript, adds
   nothing a lane acts on. `modelSource` stays `stdin`.
 * **Shown since 2026-11-12: the prompt cache.** One line, `Cache ⏱ until 11:25 │ Cache hit 97.3%`: the clock

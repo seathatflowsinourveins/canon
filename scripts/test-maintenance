@@ -549,7 +549,7 @@ check "... named by a checksum of mise.gateway.toml, so a change to the task cha
       test "$(plutil -extract EnvironmentVariables.CANON_GATEWAY_CONFIG raw -o - "$GP")" = "$(cksum < "$A/mise.gateway.toml" | awk '{ print $1 "-" $2 }')"
 
 # differs, after that install and once the settings step is recorded: nothing
-cp "$ROOT/home/.claude/canon/ledger.sh" "$ROOT/home/.claude/canon/statusline.sh" "$AH/canon/"
+cp "$ROOT/home/.claude/canon/ledger.sh" "$ROOT/home/.claude/canon/statusline.sh" "$ROOT/home/.claude/canon/fleet-rate.sh" "$AH/canon/"
 env -i HOME="$H" PATH="$B:/usr/bin:/bin" CLAUDE_CONFIG_DIR="$AH" "$A/scripts/automation" mark-user-config >/dev/null 2>&1
 adiff AUTOMATION_SKIP_LAUNCHD=1; rc=$?
 check "differs right after install and the settings step: nothing, exit 0" eval '[ "$rc" = 0 ] && [ ! -s "$TMP/diff.out" ]'

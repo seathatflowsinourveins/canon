@@ -260,6 +260,75 @@ lanes --json > "$TMP/noledger.json"; rc=$?
 check "with no ledger --json still gives the reading and the exit stays 4" \
   '[ "$rc" = 4 ] && jq -e ".usage.readable == false" "$TMP/noledger.json" >/dev/null'
 
+# The fleet label (home/.claude/canon/fleet-rate.sh, ADR 0007): a cached summary of scripts/lanes --rates, shown
+# by the HUD through --extra-cmd. The report is a stub that counts its runs and prints a fixed --json report.
+FR="$TMP/fleet"; mkdir -p "$FR/canon"
+cp "$ROOT/home/.claude/canon/fleet-rate.sh" "$FR/canon/fleet-rate.sh"
+cat > "$TMP/lanes-stub" <<'STUB'
+#!/bin/bash
+echo run >> "$FLEET_STUB_COUNT"; sleep "${FLEET_STUB_SLEEP:-0}"
+printf '%s\n' '{"workers":[{"runtime":"claude-code","state":"working","measured":true,"tok_s":100.4},
+{"runtime":"claude-code","state":"idle","measured":true,"tok_s":20.2},{"runtime":"claude-code","state":"working","measured":false,"tok_s":null},
+{"runtime":"codex","state":"events in window","measured":true,"tok_s":5}]}'
+STUB
+chmod +x "$TMP/lanes-stub"
+fr() { CLAUDE_CONFIG_DIR="$FR" FLEET_RATE_LANES="$TMP/lanes-stub" FLEET_STUB_COUNT="$TMP/fleet.count" "$FR/canon/fleet-rate.sh"; }
+# waitfor <file>: up to 10 s for a background refresh to leave it
+waitfor() { local i; for i in $(seq 1 50); do [ -s "$1" ] && return 0; sleep 0.2; done; return 1; }
+runs() { [ -f "$TMP/fleet.count" ] && wc -l < "$TMP/fleet.count" | tr -d ' ' || echo 0; }
+# unlocked: up to 10 s for a refresh to end; a lock still held fails the next case by name
+unlocked() { local i; for i in $(seq 1 50); do [ ! -d "$FR/canon/fleet-rate.lock" ] && return 0; sleep 0.2; done; bad "a refresh still held the lock after 10 s"; return 1; }
+FNOW=$(date -u +%s)
+rm -f "$TMP/fleet.count"; out=$(fr); rc=$?
+check "fleet label, no summary yet: no label, exit 0" '[ "$rc" = 0 ] && [ -z "$out" ]'
+waitfor "$FR/canon/fleet-rate.json"
+check "... and one refresh writes the summary: measured tok/s of every runtime summed, working Claude Code sessions counted" \
+  '[ "$(jq -r .label "$FR/canon/fleet-rate.json")" = "Fleet 126 tok/s · 2 working" ] && [ "$(runs)" = 1 ]'
+unlocked
+rm -f "$TMP/fleet.count"; out=$(fr)
+check "a fresh summary: its label as the HUD's JSON, and no refresh" \
+  '[ "$out" = "{\"label\":\"Fleet 126 tok/s · 2 working\"}" ] && sleep 1 && [ "$(runs)" = 0 ]'
+printf '{"t":%s,"label":"Fleet 7 tok/s · 1 working"}' "$((FNOW - 120))" > "$FR/canon/fleet-rate.json"
+rm -f "$TMP/fleet.count" "$FR/canon/fleet-rate.tried"
+s0=$(date +%s); out=$(FLEET_STUB_SLEEP=3 fr); out2=$(FLEET_STUB_SLEEP=3 fr); s1=$(date +%s)
+check "a stale summary: shown at once by two renders while the report runs, which starts once" \
+  '[ "$out" = "{\"label\":\"Fleet 7 tok/s · 1 working\"}" ] && [ "$out2" = "$out" ] && [ $((s1 - s0)) -le 4 ] && sleep 4 && [ "$(runs)" = 1 ]'
+unlocked
+printf '{"t":%s,"label":"Fleet 7 tok/s · 1 working"}' "$((FNOW - 700))" > "$FR/canon/fleet-rate.json"
+out=$(CLAUDE_CONFIG_DIR="$FR" FLEET_RATE_LANES=/nonexistent "$FR/canon/fleet-rate.sh")
+check "a summary older than ten minutes, with no report to refresh it: no label" '[ -z "$out" ]'
+mkdir "$FR/canon/fleet-rate.lock"; touch -t 202001010000 "$FR/canon/fleet-rate.lock"; rm -f "$TMP/fleet.count" "$FR/canon/fleet-rate.tried"
+fr >/dev/null; waitfor "$TMP/fleet.count"
+check "a lock left by a stopped run is taken after two minutes" '[ "$(runs)" = 1 ]'
+unlocked
+# a report that fails: tried once a TTL, not on every render, and no temporary file left
+printf '#!/bin/bash\necho run >> "$FLEET_STUB_COUNT"; exit 1\n' > "$TMP/lanes-fail"; chmod +x "$TMP/lanes-fail"
+rm -f "$TMP/fleet.count" "$FR/canon/fleet-rate.tried" "$FR/canon/fleet-rate.json"
+for i in 1 2 3 4; do CLAUDE_CONFIG_DIR="$FR" FLEET_RATE_LANES="$TMP/lanes-fail" FLEET_STUB_COUNT="$TMP/fleet.count" "$FR/canon/fleet-rate.sh" >/dev/null; unlocked; done
+check "a report that fails runs once in a TTL however often the line renders, and leaves no temporary file" \
+  '[ "$(runs)" = 1 ] && [ -z "$(find "$FR/canon" -name "fleet-rate.??????" 2>/dev/null)" ]'
+# a report that hangs is stopped by the timeout
+printf '#!/bin/bash\nsleep 30\n' > "$TMP/lanes-hang"; chmod +x "$TMP/lanes-hang"; rm -f "$FR/canon/fleet-rate.tried"
+CLAUDE_CONFIG_DIR="$FR" FLEET_RATE_LANES="$TMP/lanes-hang" FLEET_RATE_SECS=1 "$FR/canon/fleet-rate.sh" >/dev/null
+check "a report that hangs is stopped by its timeout and frees the lock" 'sleep 1; unlocked'
+# a summary dated ahead of the clock: no label, and a refresh
+printf '{"t":%s,"label":"Fleet 7 tok/s · 1 working"}' "$((FNOW + 3600))" > "$FR/canon/fleet-rate.json"
+rm -f "$TMP/fleet.count" "$FR/canon/fleet-rate.tried"; out=$(fr); waitfor "$TMP/fleet.count"
+check "a summary dated ahead of the clock: no label, and a refresh starts" '[ -z "$out" ] && [ "$(runs)" = 1 ]'
+unlocked
+# the status line hands the HUD the label's command and the opt-in, only when fleet-rate.sh is installed
+HC="$TMP/hc"; mkdir -p "$HC/canon" "$HC/plugins/cache/mp/claude-hud/1.0.0" "$TMP/nodebin"
+printf '{"enabledPlugins":{"claude-hud@mp":true}}' > "$HC/settings.json"
+: > "$HC/plugins/cache/mp/claude-hud/1.0.0/hud.mjs"
+printf '#!/bin/bash\necho "args=${*:2} allow=${CLAUDE_HUD_ALLOW_EXTRA_CMD:-unset}"\n' > "$TMP/nodebin/node"; chmod +x "$TMP/nodebin/node"
+hsl() { printf '%s' "$(input s9 1 "" "")" | PATH="$TMP/nodebin:$PATH" CLAUDE_CONFIG_DIR="$HC" "$ROOT/home/.claude/canon/statusline.sh" 2>/dev/null; }
+out=$(hsl)
+check "no fleet-rate.sh installed: the HUD gets no --extra-cmd" 'case "$out" in "args= allow=1") true ;; *) false ;; esac'
+cp "$ROOT/home/.claude/canon/fleet-rate.sh" "$HC/canon/"
+out=$(hsl)
+check "fleet-rate.sh installed: the HUD gets --extra-cmd with its path and CLAUDE_HUD_ALLOW_EXTRA_CMD=1" \
+  '[ "$out" = "args=--extra-cmd $(printf %q "$HC/canon/fleet-rate.sh") allow=1" ] || { echo "    got: $out"; false; }'
+
 echo
 echo "test-usage: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

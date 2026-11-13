@@ -38,7 +38,7 @@
 # `automation: <what>` (scripts/automation install), `user-config: <what>` (scripts/bootstrap --user-config)
 # or `unknown: <why>` for what it could not compare, and exits 0 when nothing differs, 1 when something does,
 # 2 when something could not be compared. --user-config never overwrites settings.json (scripts/bootstrap), so
-# its part is the two scripts it installs and a checksum of the sources it reads (home/.claude but its canon/
+# its part is the three scripts it installs and a checksum of the sources it reads (home/.claude but its canon/
 # folder, home/.codex, canon/models.json and scripts/bootstrap), against the one `mark-user-config` recorded
 # after the last run the maintenance agent made. The collector is
 # the otelcol mise installed for this clone (`scripts/bootstrap --install`), named by its absolute path. The watchdog's plist sets CLAUDE_CONFIG_DIR to the directory install used.
@@ -1211,7 +1211,7 @@ do_uninstall() {
 }
 
 # uc_sources: a checksum of what scripts/bootstrap --user-config reads from this tree, by relative path, so the
-# clone's place does not change it: home/.claude but its canon/ folder (whose two scripts are compared whole),
+# clone's place does not change it: home/.claude but its canon/ folder (whose three scripts are compared whole),
 # home/.codex, canon/models.json and scripts/bootstrap itself
 # The settings step also writes only where a runtime's own folder exists (Codex's, Antigravity's, dsh-tui's
 # profile; scripts/bootstrap), so which of those exist is part of what it was run for.
@@ -1275,7 +1275,7 @@ do_differs() {
       if [ "$st" = 1 ]; then say automation "$l is not loaded"; elif [ "$st" = 2 ]; then say unknown "launchctl did not answer about $l"; fi
     done
   fi
-  for f in ledger.sh statusline.sh; do
+  for f in ledger.sh statusline.sh fleet-rate.sh; do
     cmp -s "$ROOT/home/.claude/canon/$f" "$CLAUDE_HOME/canon/$f" || say user-config "$CLAUDE_HOME/canon/$f differs from home/.claude/canon/$f"
   done
   if [ ! -f "$UC_MARK" ]; then say user-config "no record of an earlier settings step by the maintenance agent"
