@@ -1,0 +1,1 @@
+* Score: the move times the symbol's dollar-volume ratio against its own baseline for the same part of the session, with no price or market-cap floor; the requirement's tie-break, trade acceleration, is unknown on bars and breaks no tie (ADR 0087).

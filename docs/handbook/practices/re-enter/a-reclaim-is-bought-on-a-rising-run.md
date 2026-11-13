@@ -1,0 +1,1 @@
+* A reclaim is bought on a rising run that closes above the sale's price, after the cooldown (ADR 0088); the requirement's pullback, held higher low and hold, never the first print, is not yet built (roadmap step 7; ADR 0088's departures).

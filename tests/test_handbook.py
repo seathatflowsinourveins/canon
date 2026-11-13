@@ -1,7 +1,8 @@
 """The handbook's pages keep the form each page states (`docs/handbook/`).
 
-The contract is the pages' own: the rows table's columns and its two states (`rows.md`), each practices
-line naming a record that exists or saying "not yet built" with a roadmap step (`practices.md`), the
+The contract is the pages' own: the rows table's columns and its two states (`rows.md`), each practice
+file under `practices/` holding one line that names a record that exists or says "not yet built" with a
+roadmap step, with `practices.md` only the introduction and the index of move folders, the
 journal's ten fields and the nightly study's six (`journal.md`, `nights.md`), and both of those
 append-only, so the entries already on `main` stay as they were. No upstream reads these pages, so the
 parsing is the standard library's `re`; what is on `main` is asked of git through its own plumbing,
@@ -15,14 +16,19 @@ import datetime
 import re
 import subprocess
 from pathlib import Path
+from urllib.parse import unquote
 
 import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 HANDBOOK = ROOT / "docs" / "handbook"
+PRACTICES = HANDBOOK / "practices"
 MARKER = "<!-- append-only: add new entries below this line; never edit or remove one above it -->"
 ADR = re.compile(r"\bADR (\d{4})\b")
 DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
+SLUG = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+FRAGMENT = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\.md")
+LINK = re.compile(r"!?\[[^\]]*\]\(([^)\s]+)\)")
 
 ROWS_HEADER = "| Row | Value | Status | Source or study | Date |"
 ROW_NAME = re.compile(r"`[A-Z][A-Z0-9_]*`")
@@ -208,8 +214,7 @@ def check_rows(text: str) -> list[str]:
 
 def check_practices(text: str, steps: set[str]) -> list[str]:
     errors: list[str] = []
-    body = text.split("\n## ", 1)[1] if "\n## " in text else ""
-    lines = [line for line in body.splitlines() if line.startswith("* ")]
+    lines = [line for line in text.splitlines() if line.startswith("* ")]
     if not lines:
         return ["no practice lines"]
     for line in lines:
@@ -273,15 +278,154 @@ def test_a_counted_criterion_row_is_uncalibrated_and_counts_no_profit(name: str)
     assert "Lead's D" in source
 
 
+def practice_fragments() -> list[Path]:
+    """Every practice file: one Markdown file, under one folder per move, under `practices/`."""
+    return sorted(PRACTICES.glob("*/*.md"))
+
+
+def fragment_line(path: Path) -> str:
+    """The one practice line a fragment holds; any other non-blank line is refused."""
+    lines = [line for line in path.read_text().splitlines() if line.strip()]
+    assert len(lines) == 1, f"{path}: {len(lines)} non-blank lines, expected one practice line"
+    assert lines[0].startswith("* "), f"{path}: {lines[0][:60]!r} is not a `* ` practice line"
+    return lines[0]
+
+
 def test_practices_lines_name_a_record_or_a_step() -> None:
+    fragments = practice_fragments()
+    assert fragments, "no practice files under docs/handbook/practices/"
+    steps = roadmap_steps()
+    errors: list[str] = []
+    for path in fragments:
+        line = fragment_line(path)
+        errors += [f"{path.relative_to(ROOT)}: {error}" for error in check_practices(line, steps)]
+    assert errors == []
+
+
+def test_one_practice_one_file() -> None:
+    """A practice is one file under its move's folder, named by a slug, and the file holds one line."""
+    fragments = practice_fragments()
+    assert fragments, "no practice files under docs/handbook/practices/"
+    steps = roadmap_steps()
+    for path in fragments:
+        assert path.parent.parent == PRACTICES, path
+        assert SLUG.fullmatch(path.parent.name), f"{path.parent.name!r} is not a move slug"
+        assert FRAGMENT.fullmatch(path.name), f"{path.name!r} is not a practice slug and `.md`"
+        line = fragment_line(path)
+        assert check_practices(line, steps) == [], f"{path.relative_to(ROOT)}: {line[:80]!r}"
+        missing = [number for number in ADR.findall(line) if not record_exists(number)]
+        assert missing == [], f"{path.relative_to(ROOT)} cites records that do not exist: {missing}"
+
+
+def test_practices_page_is_an_index_and_lists_no_practice() -> None:
+    """`practices.md` keeps the introduction and points at each move's folder, never at a practice."""
     text = (HANDBOOK / "practices.md").read_text()
-    assert check_practices(text, roadmap_steps()) == []
+    assert [line for line in text.splitlines() if line.startswith("* ")] == []
+    folders = sorted(path.name for path in PRACTICES.iterdir() if path.is_dir())
+    assert folders, "no move folders under docs/handbook/practices/"
+    for folder in folders:
+        assert f"(practices/{folder}/)" in text, f"practices.md points at nothing for {folder}"
 
 
-@pytest.mark.parametrize("page", sorted(p.name for p in HANDBOOK.glob("*.md")))
+def test_no_handbook_page_copies_a_practice_line() -> None:
+    """A practice line lives in its own file and nowhere else: no page may list the practices again."""
+    fragments = practice_fragments()
+    assert fragments, "no practice files under docs/handbook/practices/"
+    lines = {fragment_line(path) for path in fragments}
+    copies: list[str] = []
+    for page in sorted(HANDBOOK.rglob("*.md")):
+        if PRACTICES in page.parents:
+            continue
+        text = page.read_text()
+        for line in lines:
+            if line in text:
+                copies.append(f"{page.relative_to(ROOT)} repeats a practice: {line[:60]!r}")
+    assert copies == []
+
+
+@pytest.mark.parametrize(
+    "page", sorted(path.relative_to(HANDBOOK).as_posix() for path in HANDBOOK.rglob("*.md"))
+)
 def test_every_cited_record_exists(page: str) -> None:
     cited = set(ADR.findall((HANDBOOK / page).read_text()))
     assert sorted(n for n in cited if not record_exists(n)) == []
+
+
+def git_in(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-c", "user.name=handbook", "-c", "user.email=handbook@example.com", *args],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_two_adds_under_the_same_move_merge_clean(tmp_path: Path) -> None:
+    """Two branches that each add one practice file under the same move merge without a conflict."""
+    repo = tmp_path / "handbook"
+    repo.mkdir()
+    rank = repo / "docs" / "handbook" / "practices" / "rank"
+    rank.mkdir(parents=True)
+    (repo / "docs" / "handbook" / "practices.md").write_text(
+        "# Practices\n\n- [Rank](practices/rank/)\n"
+    )
+    (rank / "one-seed.md").write_text("* A seed practice (ADR 0010).\n")
+    assert git_in(repo, "init", "--quiet").returncode == 0
+    assert git_in(repo, "add", "-A").returncode == 0
+    assert git_in(repo, "commit", "--quiet", "-m", "the handbook").returncode == 0
+    base = git_in(repo, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    assert base
+    adds: dict[str, Path] = {}
+    for branch, name in (("first-add", "two-first.md"), ("second-add", "three-second.md")):
+        assert git_in(repo, "checkout", "--quiet", base).returncode == 0
+        assert git_in(repo, "checkout", "--quiet", "-b", branch).returncode == 0
+        adds[branch] = rank / name
+        adds[branch].write_text(f"* The {branch} practice (ADR 0010).\n")
+        assert git_in(repo, "add", "-A").returncode == 0
+        assert git_in(repo, "commit", "--quiet", "-m", branch).returncode == 0
+    assert git_in(repo, "checkout", "--quiet", base).returncode == 0
+    for branch, added in adds.items():
+        merged = git_in(repo, "merge", "--quiet", "--no-edit", branch)
+        assert merged.returncode == 0, merged.stdout + merged.stderr
+        assert added.exists(), added
+    conflicts = [path for path in repo.rglob("*.md") if "<<<<<<<" in path.read_text()]
+    assert conflicts == []
+
+
+def tracked_files() -> list[Path]:
+    """Every file git tracks in this checkout, from `git ls-files`."""
+    listed = git("ls-files", "-z") or ""
+    return [ROOT / name for name in listed.split("\0") if name]
+
+
+def test_no_tracked_file_lists_a_practice_line() -> None:
+    """A practice line lives in its own file: no tracked file repeats one, so no shared list returns."""
+    fragments = practice_fragments()
+    assert fragments, "no practice files under docs/handbook/practices/"
+    lines = [fragment_line(path).encode() for path in fragments]
+    copies: list[str] = []
+    for path in tracked_files():
+        if PRACTICES in path.parents:
+            continue
+        data = path.read_bytes()
+        for line in lines:
+            if line in data:
+                copies.append(f"{path.relative_to(ROOT)}: {line[:60]!r}")
+    assert copies == []
+
+
+def test_every_relative_link_in_the_handbook_resolves() -> None:
+    """Every relative Markdown link under `docs/handbook/` names a path that exists."""
+    missing: list[str] = []
+    for page in sorted(HANDBOOK.rglob("*.md")):
+        for target in LINK.findall(page.read_text()):
+            if target.startswith(("http://", "https://", "mailto:", "#")):
+                continue
+            path = unquote(target.split("#", 1)[0])
+            if path and not (page.parent / path).exists():
+                missing.append(f"{page.relative_to(ROOT)}: {target}")
+    assert missing == []
 
 
 def test_journal_form() -> None:

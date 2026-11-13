@@ -9,7 +9,7 @@ measurement here calibrates it. A record cited beside a sentence holds the part 
 more; the rest is the requirement alone, with no record behind it yet. ADR 0083 restates the part of it
 that sets the strategy focus.
 
-The practices that carry it out are listed in [practices.md](practices.md), each with its record or
+The practices that carry it out are one file each under [practices.md](practices.md)'s move folders, each with its record or
 marked not yet built.
 
 ## The four moves
