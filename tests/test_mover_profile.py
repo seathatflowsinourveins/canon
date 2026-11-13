@@ -1352,10 +1352,10 @@ def test_under_own_a_profile_tighten_is_clamped_to_the_cap_a_known_limit():
     assert "(1) a profile re-evaluation is clamped to the cap" in cap_row_note()
 
 
-def test_under_own_an_openings_cold_atr_entry_is_not_raised_to_a_floor_over_the_cap_a_known_limit():
-    """The lead's note (2) of 2026-11-12, 21:01, pinned and not changed: under `own` a cold-ATR entry
-    outside the opening is raised to a spread floor over the fixed trail, but the opening's cold-ATR
-    path keeps the fixed 0.02 under its 0.022 floor (`mover.TRAIL_CAP_DEFAULT`'s known limit 2)."""
+def test_under_own_an_openings_cold_atr_entry_is_raised_to_a_floor_over_the_cap():
+    """The lead's O2 of 2026-11-12, which removes note (2) of 21:01: under `own` an opening's cold-ATR
+    entry is raised to its 0.022 spread floor over the fixed 0.02, as a cold-ATR entry outside the
+    opening already was, and `mover.TRAIL_CAP_DEFAULT` no longer lists it as a known limit."""
     s, slot, latest = warmed(
         "atr",
         spread="0.11",
@@ -1366,9 +1366,13 @@ def test_under_own_an_openings_cold_atr_entry_is_not_raised_to_a_floor_over_the_
     slot.atr.reset()
     slot.run_arm = "opening"
     plan = s._entry_trail(slot, D(10), latest, now=T0)
-    assert (plan.trail, plan.bound, plan.source) == (D("0.02"), "fixed", "cold_atr_fallback")
-    assert plan.floor == D("0.022") > plan.trail
-    assert "(2) an opening's cold-ATR entry is not raised" in cap_row_note()
+    assert (plan.trail, plan.bound, plan.source) == (
+        D("0.022"),
+        "spread floor",
+        "cold_atr_fallback",
+    )
+    assert plan.floor == D("0.022")
+    assert "opening's cold-ATR entry is not raised" not in cap_row_note()
 
 
 def cap_row_note() -> str:
@@ -1444,6 +1448,50 @@ def test_a_tightened_sized_sale_remade_at_a_higher_average_never_trails_wider_th
     assert slot.exit_record.trail_distance == D("0.21")
 
 
+@pytest.mark.parametrize(
+    ("ask", "floor", "under"), [("11.15", "0.30", True), ("11.005", "0.010", False)]
+)
+def test_a_remake_sent_at_l_under_the_steps_spread_floor_is_counted_and_keeps_floor_l_and_distance(
+    ask, floor, under
+):
+    """The lead's ruling (ii) on re-flooring, 2026-11-13: a remake sends L as before and is counted
+    when the spread floor at its step (`spread_floor_m` times the quoted spread then) is above the
+    distance sent; its sale row keeps that floor, L and the distance. On a quote 0.15 wide the floor
+    is 0.30, over L's 0.21; on one 0.005 wide it is 0.01, under it."""
+    seam, slot = tightened_at_l()
+    seam.cache.quote = lambda _: SimpleNamespace(
+        bid_price=Price.from_str("11.00"), ask_price=Price.from_str(ask)
+    )
+    seam._protect(slot, D(10), T0 + 2 * MINUTE + SECOND)
+    remade = seam.sent[-1]
+    assert remade.trailing_offset == D("0.21")  # (ii): what is sent does not change
+    row = seam.sale_rows[remade.client_order_id.value]
+    assert (row["remake"], row["under_floor"]) == (True, under)
+    assert (D(row["spread_floor"]), D(row["sized_loss"]), D(row["trailing_offset"])) == (
+        D(floor),
+        D("0.21"),
+        D("0.21"),
+    )
+    assert seam.remakes_under_floor == (1 if under else 0)
+    first = seam.sale_rows[seam.sent[0].client_order_id.value]
+    assert (first["remake"], first["under_floor"]) == (False, None)
+    assert "remakes_under_floor" in cap_row_note()
+
+
+def test_a_remake_that_sells_at_once_is_not_marked_a_remake():
+    """The count's high review, should-fix 2: a remake whose market is already at the kept trigger
+    sells by limit at once (`_limit_sell`); that sale has no distance and is not a remade trailing
+    sale, so its row is not marked and nothing is counted."""
+    seam, slot = tightened_at_l()
+    seam.bid = "10.40"
+    seam._protect(slot, D(10), T0 + 2 * MINUTE + SECOND)
+    sold = seam.sent[-1]
+    row = seam.sale_rows[sold.client_order_id.value]
+    assert row["kind"] == "limit"
+    assert (row["remake"], row["under_floor"]) == (False, None)
+    assert seam.remakes_under_floor == 0
+
+
 def test_a_tightened_sized_holdings_held_stop_is_never_wider_than_l():
     """The high read of the ruling's fix, item 1, for the held stop: with no followed price the hold
     of a tightened sized holding at the 10.80 average is L = 0.21 under it, not the plan's 0.22."""
@@ -1501,6 +1549,31 @@ def test_a_tightened_holdings_held_stop_follows_a_lower_average_at_the_tightened
     assert slot.held_stop == mover.fill_trigger(D("9.90"), distance)
 
 
+def test_a_tightened_holdings_held_stop_keeps_the_floor_in_price_terms_at_a_lower_average():
+    """#343's held stop under O3: at a lower average, 9.60, the tightened plan's 0.02 is 0.20, but the
+    plan was taken on a spread whose floor is 0.30 in price terms, over L's 0.21, so the remade sale
+    trails by L and the held stop follows at L too (9.39), not at the plan's 0.20 (9.40)."""
+    seam, slot = tightened_at_l()
+    slot.closes = deque([D(11)], maxlen=4)
+    seam._hold(slot, D(10), T0 + 3 * MINUTE)
+    slot.trail_plan = replace(slot.trail_plan, spread=D("0.30") / seam.settings.spread_floor_m)
+    seam.orders["E-1"].avg_px = 9.60
+    slot.trail_trigger = None  # no trigger reached, so the level is the distance's alone
+    seam.bid = "10.00"
+    slot.closes = deque([D("10.00")], maxlen=4)
+    seam._hold(slot, D(15), T0 + 3 * MINUTE + SECOND)
+    in_force = mover.offsets_in_force(
+        slot, D("9.60"), slot.trail_plan.trail, slot.trail_plan.exit_through, seam._floor_m()
+    )[0]
+    assert in_force == D("0.21")
+    assert slot.held_stop == D("9.39") == mover.fill_trigger(D("9.60"), in_force)
+    sent = len(seam.sent)
+    seam.bid = "12.50"  # a followed price over the held stop: the sale is remade for all held
+    seam._protect(slot, D(15), T0 + 3 * MINUTE + 2 * SECOND)
+    (remade,) = seam.sent[sent:]
+    assert remade.trailing_offset == in_force
+
+
 def test_a_tightened_holding_with_no_room_for_l_keeps_its_held_stop_as_before():
     """The high review of the held-stop fix, should-fix 1: with no room for L under the average, a
     tightened holding's held stop is not moved, as an untightened one's is not."""
@@ -1556,3 +1629,67 @@ def test_a_followed_price_above_the_held_stop_remakes_the_sell_from_the_held_lev
     assert [o.kind for o in remade] == ["TRAILING"]
     assert remade[0].trigger_price == Price.from_str("10.9200")
     assert slot.exiting is False
+
+
+def test_a_remake_at_a_lower_average_never_trails_under_the_floor_in_price_terms():
+    """The lead's O3 of 2026-11-12, which removes known limit (3): a tightening that took the spread
+    floor, 0.30 on a quote 0.15 wide (0.03 at 10.00), is held at 0.30 when a later fill lowers the
+    average to 9.60, where 0.03 of it is 0.288 and would send 0.29."""
+    seam, slot = holding()
+    seam.trail_profile = None  # no re-evaluation at the remake's minute
+    slot.trail_plan = replace(
+        slot.trail_plan,
+        trail=D("0.03"),
+        exit_through=D("0.0075"),
+        chase_cap=D("0.03"),
+        spread=D("0.15"),
+        bound="spread floor",
+    )
+    slot.tightened = True
+    seam.orders["E-1"].avg_px = 9.60
+    seam._protect(slot, D(10), T0 + 2 * MINUTE + SECOND)
+    remade = seam.sent[-1]
+    assert str(remade.quantity) == "10"
+    assert remade.trailing_offset == D("0.30")
+    assert slot.exit_record.trail_distance == D("0.30")
+    assert "(3) every tightening" not in cap_row_note()
+
+
+@pytest.mark.parametrize(("mode", "sent"), [("profile", "0.30"), ("fixed", "0.29")])
+def test_the_floor_in_price_terms_binds_every_arm_but_fixed(mode, sent):
+    """O3's bound is taken in every arm but fixed (a second reader's should-fix): the fixed arm's plan
+    records a spread too, and its sale remade at the 9.60 average still sends its own 0.03 of it."""
+    seam, slot = holding()
+    seam.settings.trail_mode = mode
+    seam.trail_profile = None
+    slot.trail_plan = replace(
+        slot.trail_plan,
+        trail=D("0.03"),
+        exit_through=D("0.0075"),
+        chase_cap=D("0.03"),
+        spread=D("0.15"),
+        bound="spread floor" if mode != "fixed" else "fixed",
+    )
+    slot.tightened = mode != "fixed"
+    seam.orders["E-1"].avg_px = 9.60
+    seam._protect(slot, D(10), T0 + 2 * MINUTE + SECOND)
+    assert seam.sent[-1].trailing_offset == D(sent)
+
+
+def test_a_profile_tighten_to_the_floor_keeps_that_floor_after_a_lower_fill():
+    """O3 through the profile's own tightening: a quote 0.0405 wide puts the floor at 0.081 of price,
+    sent as 0.09 at the 10.00 anchor; after a later fill at a 9.60 average the plan's 0.0081 is 0.078,
+    which would send 0.08, under the floor taken; the remade sale keeps 0.09."""
+    seam, slot = holding()
+    seam.cache.quote = lambda _: SimpleNamespace(
+        bid_price=Price.from_str("10.5000"), ask_price=Price.from_str("10.5405")
+    )
+    slot.run_open_ns = T0 + MINUTE
+    seam._protect(slot, D(5), T0 + 2 * MINUTE)
+    assert (slot.trail_plan.trail, slot.trail_plan.bound) == (D("0.0081"), "spread floor")
+    assert seam.sent[-1].trailing_offset == D("0.09")
+    seam.orders["E-1"].avg_px = 9.60
+    seam._protect(slot, D(10), T0 + 2 * MINUTE + SECOND)
+    remade = seam.sent[-1]
+    assert str(remade.quantity) == "10"
+    assert remade.trailing_offset == D("0.09")

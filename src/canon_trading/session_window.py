@@ -1790,6 +1790,10 @@ class WindowReport:
     instruments the data client loaded less 1,024."""
     warm_up_bars: int = 0
     warm_up_dropped: int = 0
+    remakes_under_floor: int = 0
+    """A Mover's trailing sales remade, for a changed holding or a tightening, under the spread floor at
+    their step (`Mover.remakes_under_floor`); each one's sale row in `mover.run` keeps that floor, L and
+    the distance sent."""
     result: str = "running"
     """`running` while the window runs, then `ok` or `failed: <why>`. A record still `running` after
     `stale_after` seconds belongs to a window that died; `scripts/automation status` reads both."""
@@ -3226,6 +3230,8 @@ def run_window(
                 report.warm_up_dropped = strategy.history_dropped
                 report.quotes, report.trades = strategy.quotes, strategy.trades
                 report.live_bars = strategy.live_bars
+                if isinstance(strategy, Mover):
+                    report.remakes_under_floor = strategy.remakes_under_floor
                 caps = cap if isinstance(cap, tuple) else (cap,)
                 report.cap_checks = sum(c.checks for c in caps)
                 report.cap_peak = str(max((c.peak for c in caps), default=Decimal(0)))

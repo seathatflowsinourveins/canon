@@ -2525,6 +2525,11 @@ class Borrowed:
         self.slots: dict = {}
         self.opening_states: dict = {}
         self.opening_outcomes: dict = {}
+        self.sale_rows: dict = {}
+        self.sale_owner: dict = {}
+        self.remakes_under_floor = 0
+        self.order_refusals: list = []
+        self.entries_sent: list = []
 
     def __getattr__(self, name: str):
         raise RuntimeError(f"Already mutably borrowed: {name}")
@@ -2852,6 +2857,7 @@ class Seam:
 
     _protect = Mover._protect
     _trail = Mover._trail
+    _remade = Mover._remade
     _persistent_trail = Mover._persistent_trail
     _followed = Mover._followed
     _limit_sell = Mover._limit_sell
@@ -2870,11 +2876,14 @@ class Seam:
     _last_print = Mover._last_print
     _position_average = Mover._position_average
     _entry_trail = Mover._entry_trail
+    _cold_plan = Mover._cold_plan
+    _floor_m = Mover._floor_m
     _warm_tighten = Mover._warm_tighten
     _tier_applies = Mover._tier_applies
     _top_tier = Mover._top_tier
     _bought = Mover._bought
     _trail_change = Mover._trail_change
+    _sale_sent = Mover._sale_sent
 
     def __init__(self, bid: str, **rows: Any) -> None:
         rows.setdefault("trail_mode", "fixed")
@@ -2890,6 +2899,9 @@ class Seam:
         self.notes: dict = {}
         self.dropped: list[str] = []
         self.exits: list = []
+        self.sale_rows: dict = {}
+        self.sale_owner: dict = {}
+        self.remakes_under_floor = 0
         self.sell_triggers: dict[str, str] = {}
         self.protection_fallbacks = {"position average price": 0, "current bid": 0}
         self.protect_paths = {"held_stop": 0, "unpriced_exit": 0, "trail": 0}
