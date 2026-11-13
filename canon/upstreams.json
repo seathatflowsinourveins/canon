@@ -262,6 +262,22 @@
       "adr": "0009"
     },
     {
+      "id": "redis",
+      "field": "trading-runtime",
+      "repo": "redis/redis",
+      "track": "tag:8.10.3",
+      "role": "tool",
+      "license": "RSALv2 OR SSPLv1 OR AGPL-3.0",
+      "why": "NautilusTrader's built-in external message bus backing at the pin (docs/concepts/message_bus.md: 'Redis is the built-in external backing'; minimum 6.2). One process publishes the live mover list onto a Redis stream on 127.0.0.1 and the nodes that trade read it, so the list crosses processes without a file handoff. Installed only on request from mise's bus config environment (mise.bus.toml), which a plain install and hosted CI never read.",
+      "evidence": [
+        "https://github.com/redis/redis/releases/tag/8.10.3",
+        "https://raw.githubusercontent.com/nautechsystems/nautilus_trader/v2.0.0rc8/docs/concepts/message_bus.md",
+        "https://raw.githubusercontent.com/nautechsystems/nautilus_trader/v2.0.0rc8/docs/getting_started/installation.md",
+        "https://mise.jdx.dev/configuration/environments.html"
+      ],
+      "adr": "0149"
+    },
+    {
       "id": "alpaca-py",
       "field": "trading-venue",
       "repo": "alpacahq/alpaca-py",

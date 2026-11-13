@@ -504,6 +504,15 @@
       "sha": "b703b2c5e704341d61e367b9b940b77ed11dded0",
       "track": "tag:v3.14.10"
     },
+    "redis": {
+      "default_branch": "unstable",
+      "default_sha": "ee8e7f70152404649ac947157fd662d11b4a00d5",
+      "ref": "refs/tags/8.10.3",
+      "repo": "redis/redis",
+      "resolved_at": "2026-11-13T21:25:08Z",
+      "sha": "1a2574ce1551d3de6e0b4a56756c0fdbc6659e4f",
+      "track": "tag:8.10.3"
+    },
     "requests": {
       "default_branch": "main",
       "default_sha": "3c7baaa05ab4aa49cc819ce3a819d260de19c157",
