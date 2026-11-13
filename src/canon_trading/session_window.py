@@ -2056,6 +2056,27 @@ def _mark_request_interrupted(report: WindowReport, error: BaseException) -> Non
         report.request_budget["measurement_status"] = "interrupted"
 
 
+CLOCK_NOTE_MOST_MS = 2_000
+"""The lead's rule of 2026-11-13, 08:40: a window whose record shows the venue's clock and this host's
+more than 2 s apart goes to the lead. Read on the median of the Mover's `host_clock`, which includes
+the feed's latency (tens of milliseconds)."""
+
+
+def clock_notes(run: dict[str, Any]) -> dict[str, Any]:
+    """Name beside the Mover's record the prints whose venue times exceeded the ahead bound, measured
+    against their name's quotes (`mover.print_time`), when any did, and the clocks' difference, when its median passes `CLOCK_NOTE_MOST_MS` either way.
+    The prints ahead could not be ordered; the difference is the one the lead reads."""
+    notes: dict[str, Any] = {}
+    ahead = run.get("prints_stamped_ahead") or {}
+    if any(count > 0 for count in ahead.values()):
+        notes["prints_stamped_ahead"] = dict(ahead)
+    clock = run.get("host_clock") or {}
+    seen = clock.get("venue_minus_receipt_ms") or {}
+    if abs(seen.get("median") or 0) > CLOCK_NOTE_MOST_MS:
+        notes["host_clock"] = dict(clock)
+    return notes
+
+
 def write_heartbeat(log_dir: Path, outcome: str) -> None:
     """Write `last-firing.json` on every run, a window or not, a run by hand included: status shows its
     outcome, and `scheduled` says whether the schedule started it (`SCHEDULED_ENV`, or the runner's
@@ -3316,6 +3337,7 @@ def run_window(
                     }
                 if isinstance(strategy, Mover):
                     report.mover["run"] = run = strategy.record()
+                    report.mover.update(clock_notes(run))
                     try:  # the lead's order of 2026-11-11; one that cannot be read is named
                         result_inputs = (
                             strategy_fills(cache, strategy_id),

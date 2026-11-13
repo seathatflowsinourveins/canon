@@ -149,7 +149,12 @@ def test_under_the_bid_a_bid_through_the_held_stop_and_back_before_the_step_sell
     seam.slots, seam.quotes = {slot.instrument_id: slot}, 0
     seam._protect(slot, Decimal(3), filled + SECOND)
     seam.on_quote(
-        SimpleNamespace(instrument_id=slot.instrument_id, bid_price=Price.from_str("9.70"))
+        SimpleNamespace(
+            instrument_id=slot.instrument_id,
+            bid_price=Price.from_str("9.70"),
+            ts_event=filled + 2 * SECOND,
+            ts_init=filled + 2 * SECOND,
+        )
     )
     seam.bid = "9.90"
     seam._protect(slot, Decimal(3), filled + 3 * SECOND)
