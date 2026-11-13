@@ -80,6 +80,20 @@ the engine version or which profile Orca starts.
 * Good: an escalation fails at once, with a tool error the worker can report. `git add` and `git commit` in a
   linked worktree are refused, so a builder's no-commit term holds by construction.
 * Bad: a command that writes outside the worktree and the temp areas fails, uv's default cache among them.
+  Amended 2026-11-13: a worker's brief therefore names each tool by its literal path in the tree's own `.venv`,
+  with no uv, which the sandbox refuses at its cache under the home folder; mise is not needed once each tool is
+  named by path. The forms, each run from the tree's root as `scripts/ci` runs its own, are
+  `<tree>/.venv/bin/pytest`, `<tree>/.venv/bin/ruff check .`, `<tree>/.venv/bin/ruff format --check .` and
+  `<tree>/.venv/bin/ty check`. For a project kept apart, such as `filings/` (ADR 0108), its `ty` and `pytest` run
+  from that folder with its own `.venv`, as `scripts/ci` runs them. pytest keeps its default temporary folder under
+  `$TMPDIR`, which the sandbox lets it write, so no test's folder lies inside a checkout (`docs/architecture.md`,
+  "A git checkout above a temp folder") and a reader's tree shows no change. The coordinator builds each `.venv`
+  before the worker starts, since the worker cannot. The shell tool makes an approval request only when the model
+  passes `sandbox_permissions` with a `justification`, as the hint after a refusal invites, and a hook's `ask`
+  decision goes to the same service; `never` rejects both before any answerer. Grants are one-shot and no row
+  allows a command shape, so this adds no row. The profile also refuses to run `/bin/ps`, which is setuid root, so
+  two cases of the whole suite fail inside it and pass outside it (in the Evidence); a brief that has a worker run
+  the whole suite names them as the sandbox's, not the worker's.
 * Bad: the owner's dsh-tui tabs lose approval prompts too, and from the source neither `/permission` nor Shift+Tab
   brings them back (not run). A tab that needs more is relaunched with `DSH_PERMISSION_MODE=danger-full-access`.
 * Bad: a remembered `read-only` pick makes every later worker read-only, and a builder then fails at its first
@@ -118,10 +132,13 @@ the engine version or which profile Orca starts.
     second run;
   * with a quoted-key `approval` row and no block, `--install` leaves the file as it is and writes the block beside
     it as `review.patch.yml.canon-proposed`.
+* A worker's brief gives each command in the literal forms above, from the tree's root, and the coordinator builds
+  each `.venv` they name before the worker starts (amended 2026-11-13).
 * The rehearsals on the installed engine, in the Evidence.
 * **The smoke test.** After `--install`, the lead's deputy starts one Orca `--agent dsh` worker in a new worktree on
-  this lane's brief. It must run a test file with `uv`, have `git add` refused with no prompt pending, have a write
-  to `~/` refused, and reach `worker_done` within 15 minutes. It is `UNVERIFIED` until run; its result goes below.
+  this lane's brief. It must run a test file in the literal form above (amended 2026-11-13; it first said with
+  `uv`), have `git add` refused with no prompt pending, have a write to `~/` refused, and reach `worker_done` within
+  15 minutes. It is `UNVERIFIED` until run; its result goes below.
 
 ## Evidence
 
@@ -180,6 +197,30 @@ dsh-TUI v0.17.0 (registry `dsh-tui`) and DeepSeek Harness `dsh-v0.2.1-rc.3` (reg
 * https://github.com/deepseek-ai/deepseek-harness/blob/1f81c047fc48fa190a683e469daa699857e9afe8/packages/bundle/headless/README.md#L55
   The shipped headless profile "disables the managed credential store"; "API-key routes use the launch
   environment, then `<invocation cwd>/.env`, then `$DSH_HOME/.env`". Resolved.
+* https://github.com/deepseek-ai/deepseek-harness/blob/1f81c047fc48fa190a683e469daa699857e9afe8/packages/shell/bash-sandbox/README.md#L78
+  The executor "awaits confinement of each command's exact `['bash', '-c', command]` argv through
+  `ctx.sandbox.confine()`, spawning the returned argv directly". Resolved; read 2026-11-13 for the amendment.
+* https://github.com/deepseek-ai/deepseek-harness/blob/1f81c047fc48fa190a683e469daa699857e9afe8/packages/sandbox/sandbox/src/roots.ts#L52-L55
+  Under `workspace-write` the writable roots are the workspace root, `/tmp` and `tmpdir()`, each canonical. With
+  `packages/sandbox/sandbox-local/src/profiles.ts` L51-58, the macOS profile is `(allow default)`,
+  `(deny file-write*)`, and file writes allowed under those roots and to `/dev/null`. Resolved; read 2026-11-13 for
+  the amendment.
+* https://github.com/deepseek-ai/deepseek-harness/blob/1f81c047fc48fa190a683e469daa699857e9afe8/packages/shell/tool-bash/src/index.ts#L482-L484
+  The shell tool asks for approval only when the model passes both `sandbox_permissions` and `justification`, on
+  any call, not only after a refusal. `packages/sandbox/sandbox/src/escalation.ts` L84-85 tells the model after a
+  refusal that it may "retry this exact ${subject} once with sandbox_permissions"; L188-195 ask "Allow this
+  operation with ${mode} permissions"; L203 answers a rejection with "it stays denied, so stop and explain instead
+  of working around it". `packages/core/tools/src/index.ts` L1735-1760 sends a hook's `ask` decision, for any
+  tool, to the same approval service. Resolved; read 2026-11-13 for the amendment.
+* https://github.com/deepseek-ai/deepseek-harness/blob/1f81c047fc48fa190a683e469daa699857e9afe8/packages/interaction/user-approval/README.md#L154
+  "Only one-shot grants exist": there is no `allow-always`, remembered rule or grant store, so no row can allow a
+  command shape. `src/index.ts` L73 is what a `never` session tells the model ("do not request sandbox
+  escalation"), and L275 returns `rejected` before any answerer. Resolved; read 2026-11-13 for the amendment.
+* https://github.com/deepseek-ai/deepseek-harness/blob/38a6a5c965aa99ab525161efb7cc5cf1fe62fced/packages/sandbox/sandbox-policy/src/index.ts#L142
+  Counter-evidence, from `dsh-v0.2.2-rc.3` (a pre-release published 2026-11-13, newer than the pin): a sandbox
+  setting, `additionalWritableRoots`, adds writable roots (`packages/sandbox/sandbox/src/roots.ts` L89), so a
+  profile row could hold uv's cache in place of the literal forms. It is not at the pin; a pin move weighs it.
+  Fetched 2026-11-13 through GitHub's contents API at the tag's commit.
 * The rehearsal (run 2026-11-12; this record's block again 2026-11-13): the installed engine (`dsh` 0.2.1-rc.3), a
   new `DSH_HOME` under the temp area, the shipped `headless` profile, no API key in the environment or either
   `.env`, task "Reply with OK". Each run stopped at `MISSING_CREDENTIAL` before any model call, and the session log
@@ -197,6 +238,30 @@ dsh-TUI v0.17.0 (registry `dsh-tui`) and DeepSeek Harness `dsh-v0.2.1-rc.3` (reg
   evidence-verifier's run of that copy did not finish within 120 s, so activation in the dsh-tui profile is
   `UNVERIFIED`. Without the plugin the two rows still give `workspace-write` and `never`, and no roster seeds a
   remembered preset.
+* The literal forms' rehearsal (run 2026-11-13, for the amendment), with no model and no dsh. Each command ran as
+  the engine runs one, `sandbox-exec -p <profile> -- bash -c <command>`
+  (`packages/sandbox/sandbox-local/src/index.ts` L339 and L351), under the profile above for `workspace-write`,
+  written out by hand from those lines, from the root of a Canon worktree whose `.venv` was built:
+  * `mise exec -- uv run --locked pytest` on `tests/test_build_cases.py`: exit 2. uv could not take its lock:
+    "Operation not permitted" at its cache under the home folder. `uv run` with no mise failed the same way, and
+    `mise exec -- true` exited 0.
+  * `<tree>/.venv/bin/pytest` on the same file, with pytest's default temporary folder: 31 passed. The locked
+    pytest, 9.2.0, puts that folder under `tempfile.gettempdir()`, here `$TMPDIR`, unless `PYTEST_DEBUG_TEMPROOT`
+    is set (`_pytest/tmpdir.py` L201-206, read in the tree's `.venv`).
+  * `ruff check .`, `ruff format --check .` and `ty check` from the tree's `.venv`, over the whole tree: each
+    exited 0, with no refusal.
+  * The whole suite in the test form, as `scripts/ci` runs it: 5800 passed, 2 failed, 61 skipped (the paper tests,
+    with no key in the environment) and 1 expected failure, in 15 minutes at a load average near 27. The two
+    failures are the `37` cases of
+    `tests/test_session_window.py::test_bounded_passes_a_stop_on_as_terminate_and_waits_its_grace_only_when_given_one`.
+    Run again, they failed inside the profile and passed outside it. Inside it, `/bin/ps`, which is setuid root,
+    is refused ("Operation not permitted", exit 126), and `bounded()` reads the empty answer as its command having
+    ended, so it kills at once instead of waiting out the grace.
+  * A write to a file in the home folder: refused, "Operation not permitted".
+  * `git status --porcelain` read the same before and after.
+
+  The run shows the sandbox's side only. What a model does after a refusal is held by `never`, through the
+  lines above.
 * ADR 0043, line 161 (Orca's dsh definition launches `dsh-tui .`) and lines 172-176 (`git add` refused outside the
   sandbox root, at a prompt nobody answers). Read.
 * This machine: `~/.dsh/profiles/dsh-tui/cordis.patch.yml`, read for row ids only, has no `approval`, `permission`
@@ -213,4 +278,9 @@ dsh-TUI v0.17.0 (registry `dsh-tui`) and DeepSeek Harness `dsh-v0.2.1-rc.3` (reg
   screen) found that the wider match also took a key that only ends in `id`, such as a quoted `grid` in a row's
   `config`, for the `id` key. The key is now matched whole, with cases beside the block and with no block. The text
   above carries each.
+  For the amendment, the evidence-verifier (Claude Opus 5.5) re-ran the rehearsal. It found that any call with
+  `sandbox_permissions` asks, not only a retry, and that no run showed mise refused, and it found the
+  counter-evidence above. `/code-review` (medium) found pytest's temporary folder put inside the tree, against the
+  hazard `docs/architecture.md` names, and asked for a literal path on every form, a working folder, a form for a
+  project kept apart and the coordinator's step in the Confirmation. The text above carries each.
 * The smoke test: **UNVERIFIED — not yet run.**
