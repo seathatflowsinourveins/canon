@@ -1,0 +1,1 @@
+* The nightly study runs each plan's registered rows again on the recorded data, ranks them through the gate and writes the night's dated entry, which a session lands in [nights.md](../../nights.md); no paper rule changes from paper profit and loss (ADR 0089).

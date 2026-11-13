@@ -1,0 +1,1 @@
+| `OPENING_F` | 1 current per-name trail distance of fall from the regular open; alternate 2 | UNCALIBRATED | `mover.TRAIL_SETTINGS` and `OPENING_LIMIT`; lead: the owner's observation, no primary source | 2026-11-13 |

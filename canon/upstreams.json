@@ -97,6 +97,35 @@
       "adr": "0004"
     },
     {
+      "id": "towncrier",
+      "field": "decision-records",
+      "repo": "twisted/towncrier",
+      "track": "tag:26.9.0",
+      "role": "reference",
+      "license": "MIT",
+      "why": "News fragments, one file per change in a directory of its own: the pattern the handbook's practice and row files follow. Read only; not installed or run, and its collecting build step is not taken.",
+      "evidence": [
+        "https://towncrier.readthedocs.io/en/stable/tutorial.html",
+        "https://github.com/twisted/towncrier"
+      ],
+      "adr": "0145"
+    },
+    {
+      "id": "changesets",
+      "field": "decision-records",
+      "repo": "changesets/changesets",
+      "track": "tag:@changesets/cli@3.0.3",
+      "line": "@changesets/cli@3.",
+      "role": "reference",
+      "license": "MIT",
+      "why": "One Markdown file per change, named so that two never collide: the pattern the handbook's practice and row files follow. Read only; not installed or run.",
+      "evidence": [
+        "https://github.com/changesets/changesets/blob/main/docs/guide/getting-started.md",
+        "https://github.com/changesets/changesets/blob/main/docs/faq.md"
+      ],
+      "adr": "0145"
+    },
+    {
       "id": "spec-kit",
       "field": "agent-extensions",
       "repo": "github/spec-kit",

@@ -1,0 +1,1 @@
+* The move is measured from the latest completed, split-adjusted official regular-session close of a session before the trade date; a previous daily bar's close is not an official close without its own authority, so whether Alpaca's daily close is one stays UNVERIFIED, and the move from the regular open is unknown until a source of the official open is named (ADR 0087).
