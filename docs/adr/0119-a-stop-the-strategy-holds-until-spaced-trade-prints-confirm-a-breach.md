@@ -66,7 +66,7 @@ The count, with `breach_count` or `high_count` above one, on trade prints only (
 | A new high | `high_count` counted prints above the confirmed high, none at or under it between them; the level rises to the lowest of them less the trail, on Alpaca's price step, never down. |
 | The level's start | The entry's average fill as it stands at the arming step, less the trail; never a cached print. The start is not re-based as a partly filled entry fills further; the trail's distance is, being taken from the current average each step. |
 | A print's time | The earlier of its event time and its receipt. A print with the last print's time may reset an arm and never counts; an older one, a late report, does neither. |
-| The sale | A DAY limit `exit_ticks` through the bid of the first step after the confirming print, so it never rests above the bid as the emulator's released limit can; then the existing chase. Its floor is `chase_cap` under a first price taken from the lower of the confirming print and the bid at that step. |
+| The sale | A DAY limit `exit_ticks` through the bid of the first step after the confirming print, so it never rests above the bid as the emulator's released limit can; then the existing chase. Its floor is `chase_cap` under a first price taken from the lower of the confirming print and the bid at that step. A one-sided quote's zero bid is no price, and neither is no quote: the last trade then stands in for the bid, for the floor and for the sale and each remake of it, so a recovery cannot lift the sale and a fall under the print is followed. The floor is set once; released after its wait, it stays released. The exit's record is marked at the confirming print's own time and price, as a stop-out. |
 | The rows | `breach_count` 1 and `high_count` 1 (both off), `confirm_gap_ms` 100. The on row is 2, 2 and 100 ms. |
 
 **Gaps, and what would close each.**
@@ -99,8 +99,9 @@ The count, with `breach_count` or `high_count` above one, on trade prints only (
   so a configuration keyed before them keeps its key. A run's record does gain `persistence_arms` and
   the three rows, on or off.
 * Bad: the sale leaves at most `STEP_SECS` (1 s) after the confirming print, where the emulator acts
-  inside the tick. Two cases are later still: with no quote in the cache nothing is sent until one
-  arrives, and a print before the arming step is never read.
+  inside the tick. A print before the arming step is never read. With no bid in the cache the sale is
+  priced from prints alone, the lower of the confirming print and the last trade; before 2026-11-12 it
+  was priced from a one-sided quote's zero bid, at the lowest tick, which no window ever ran.
 * Bad: the count and the rising level are our arithmetic, not upstream's; a pin move does not cover them,
   and the bars replay, which delivers no print, refuses an arm by name and cannot rank it.
 * Bad: no order exists anywhere while the strategy holds the stop. A dead or sleeping node protects

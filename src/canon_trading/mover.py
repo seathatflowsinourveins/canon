@@ -137,8 +137,10 @@ UNCALIBRATED (ADR 0088; the persistence rows are ADR 0119's).
    its high and its breach by their own times, not the timer's. The sale goes out in the first step
    after the confirming print, so up to `STEP_SECS` later. The floor's reference is the lower of the
    confirming print and the current bid, so a recovery in the same step cannot lift it and the sale
-   follows a fast fall below the stop the entry was sized against. `exit_ticks` prices that
-   reference and the sale; `exit_through` still shapes entry risk sizing.
+   follows a fast fall below the stop the entry was sized against. A one-sided quote's zero bid is
+   no price, and neither is no quote: the last trade then stands in for the bid, in the reference
+   and as the sale's anchor, on every remake. The floor is set once; released, it stays released.
+   `exit_ticks` prices that reference and the sale; `exit_through` still shapes entry risk sizing.
 3. *Entries.* A slot whose bars have just closed `run_bars` times in a row above the close before is a
    candidate under the explicitly selected `entry_arm="bridge"`. The default `registered` arm is
    selected from `early_entry_study.ARMS`: listing needs both move and cumulative dollar-volume
@@ -2089,15 +2091,33 @@ class Mover(Strategy):
             ):
                 return  # a sale the engine or the venue refused is sent again, every `chase_secs`
             if slot.exiting:
-                if self.persistence and slot.floor is None:
+                anchor = None
+                if self.persistence:
+                    # The lower of the confirming print and the bid. A one-sided quote's zero bid
+                    # is no price, and neither is no quote: the last trade then stands in for the
+                    # bid, so a recovery cannot lift the sale and a fall under the print is
+                    # followed, and the sale is given that basis as its anchor (`_limit_sell`).
                     quote = self.cache.quote(slot.instrument_id)
-                    if quote is not None:
-                        basis = quote.bid_price.as_decimal()
-                        if slot.breach_price is not None:
-                            basis = min(basis, slot.breach_price)
+                    basis = None if quote is None else quote.bid_price.as_decimal()
+                    quoted = basis is not None and basis > 0
+                    if not quoted:
+                        basis = self._last_known(slot)[0]
+                    if slot.breach_price is not None:
+                        basis = (
+                            slot.breach_price if basis is None else min(basis, slot.breach_price)
+                        )
+                    if not quoted and basis is not None:
+                        anchor = basis
+                        self._note(
+                            slot,
+                            f"{slot.instrument_id}: no bid at a confirmed sale; priced from the "
+                            "lower of the confirming print and the last trade",
+                        )
+                    # set once, for the first sale: a floor released after its wait stays released
+                    if basis is not None and slot.floor is None and not slot.floor_released:
                         first = exit_price(basis, self.settings.exit_ticks, None)
                         slot.floor = chase_floor(first, self.settings.chase_cap)
-                self._limit_sell(slot, held, now, slot.floor)
+                self._limit_sell(slot, held, now, slot.floor, anchor=anchor)
             else:
                 self._trail(slot, held, now)
         elif order.is_emulated:
@@ -2192,6 +2212,10 @@ class Mover(Strategy):
                     slot.breach_price = price
                     slot.exit_trigger = slot.trail_trigger
                     slot.observations.clear()
+                    # the decision to sell, at the confirming print's own time and price
+                    self._mark_exit(
+                        slot, stamp, price, "trailing stop (breach confirmed by prints)"
+                    )
                     self._say(
                         f"{slot.instrument_id}: breach confirmed at {stamp}, trigger "
                         f"{slot.trail_trigger}; selling by limit"
