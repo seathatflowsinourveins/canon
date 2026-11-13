@@ -29,7 +29,12 @@ a term. Failures of A1-A3 and A5-A7 outrank no entry. A4 is counted, never faile
 even an A4 not shown has no effect on the summary or exit code.
 Fixed-arm windows print practice; A1/A4 are not judged, while A2/A3/A5/A6/A7
 still expose findings marked fixed arm. Failed terms are named in the summary,
-for example `practice (finding: A6, A7)`, and return 5 without calling for a revert.
+for example `practice (finding: A6, A7)`, and return 5 without calling for a revert; a fixed-arm
+window whose shared evidence is not shown is `incomplete` (2), not practice. `practice` keeps exit 0
+beside `counts`, the summary line telling them apart: one new exit code (5) was allowed, no more.
+A filled BUY with no entry plan leaves A1 and A2 not shown; A1 checks the recorded floor against
+spread_floor_m * spread / entry price; A4 times a quick sale by its final fill, not its trigger; A5
+reads each fill row's five fields; A6 fails a recorded open remainder whatever `flat` says.
 A record still `running` or `stopping` fails A6: read after its window has ended, it belongs to a
 window that died before its wind-down finished (`scripts/automation status` calls it DIED once stale or
 overtaken). A window still live reads the same, so check a record only after its window has ended.
@@ -69,14 +74,18 @@ SIXTY_SECONDS_NS = 60_000_000_000
 # the paper venue's 403 text. replace: only execution.py:3071 (`_rejected_takeover` -> `_reject`,
 # an OrderRejected) reaches Mover's `refused` (mover.py:1872-1878) and the window's denials; :2965
 # and :3091 are modify rejections (`_modify_rejected`, OrderModifyRejected), which neither keeps, so
-# those texts can come only in prospective `order_refusals` rows.
+# those texts can come only in prospective `order_refusals` rows; so can :2338, the replace's
+# HTTP refusal ("Alpaca refused the replace (422): ...", REPLACE_REFUSAL at :533).
 # off_step: execution.py:1012-1020 formats this LOCAL denial. With legacy records
 # it proves no venue refusal; structured rows explicitly supply `by`.
 REFUSAL_PATTERNS = (
     ("wash_trade", r"\bpotential wash trade detected\b"),
     (
         "refused_replace",
-        r"^Alpaca rejected the (?:replace \(trade update\)|replacement order \S+(?: \(trade update\))?)$",
+        (
+            r"^Alpaca (?:rejected the (?:replace \(trade update\)|replacement order \S+"
+            r"(?: \(trade update\))?)|refused the replace \(\d{3}\): [\s\S]*)$"
+        ),
     ),
     (
         "off_step",
@@ -331,6 +340,17 @@ def _a1_entry(t: Term, entry: KeyPath) -> None:
     floor_number = t.number((*entry, "spread_floor"))
     if floor_number <= 0:
         t.unknown((*entry, "spread_floor"), "positive quoted spread floor not shown")
+    # mover.py:4252: the floor is spread_floor_m * spread / entry price, the multiplier recorded
+    # among the run's rows (mover.py:821,2037); a recorded floor that is not that is wrong.
+    derived = (
+        t.number((*RUN, "rows", "spread_floor_m")) * t.number((*entry, "spread")) / _price(t, entry)
+    )
+    if floor_number != derived:
+        t.fail(
+            (*entry, "spread_floor"),
+            f"not spread_floor_m * spread / entry price = {derived}",
+        )
+        raise _Unavailable
     if trail < floor_number:
         t.fail((*entry, "trail"), f"below spread floor {floor_number}")
     # mover.py:3600-3602,3640: L may be rounded below the fractional plan at the dollar boundary.
@@ -434,6 +454,19 @@ def _a1_refusals(t: Term) -> None:
             t.number((*refusals, name))
 
 
+def _plans_cover_buys(t: Term) -> None:
+    """Every filled BUY has the entry plan its client order ID names (mover.py:1977, entries are the
+    orders sent; :1739-1746 the fills): a filled entry whose plan is missing is not shown, never met."""
+    planned: set[str] = set()
+    for index in range(len(t.array(ENTRIES))):
+        with t.scope():
+            planned.add(t.text((*ENTRIES, index, "client_order_id")))
+    for cid, (_, path) in _buys(t).items():
+        if cid not in planned:
+            with t.scope():
+                t.unknown((*path, 0), "filled BUY has no entry plan with its client order ID")
+
+
 def _a1(t: Term) -> None:
     t.counts.update(fixed_plan_count=0, named_refusals=0, p5_tolerance_used=0)
     # mover.py:1977,3701-3733.
@@ -441,6 +474,8 @@ def _a1(t: Term) -> None:
         for index in range(len(t.array(ENTRIES))):
             with t.scope():
                 _a1_entry(t, (*ENTRIES, index))
+    with t.scope():
+        _plans_cover_buys(t)
     with t.scope():
         _a1_refusals(t)
 
@@ -532,6 +567,8 @@ def _a2(t: Term) -> None:
     for index in range(len(t.array(ENTRIES))):
         with t.scope():
             _a2_entry(t, (*ENTRIES, index))
+    with t.scope():
+        _plans_cover_buys(t)
 
 
 def _a3(t: Term) -> None:
@@ -600,9 +637,13 @@ def _a4(t: Term) -> None:
             triggered = t.stamp((*path, "trigger_ns"))
             if cid not in buys or cid not in entries:
                 t.unknown((*path, "entry_client_order_id"), "matching entry and BUY fill not shown")
-            elapsed = triggered - buys[cid][0]
+            # ADR 0106: a sale inside 60 s, timed by the sale; mover.py:1917-1920 sets
+            # final_fill_ns only once the holding is sold, so an unsold exit is no sale.
+            if t.read((*path, "final_fill_ns")) is None:
+                continue
+            elapsed = t.stamp((*path, "final_fill_ns")) - buys[cid][0]
             if elapsed < 0:
-                t.unknown((*path, "trigger_ns"), "trigger precedes first BUY fill")
+                t.unknown((*path, "final_fill_ns"), "sale precedes first BUY fill")
             if elapsed >= SIXTY_SECONDS_NS:
                 continue
             t.counts["inside_60s"] += 1
@@ -651,7 +692,26 @@ def _a4(t: Term) -> None:
                     )
 
 
+def _fill_rows(t: Term) -> None:
+    """Each fill row is the writer's five fields (mover.py:1739-1746,1860): client order ID, side,
+    a positive quantity and price, and its event clock; a short or malformed row is not shown."""
+    for index in range(len(t.array(FILLS))):
+        with t.scope():
+            row = (*FILLS, index)
+            if len(t.array(row)) != 5:
+                t.unknown(row, "fill row is not [client_order_id, side, quantity, price, ts_event]")
+            t.text((*row, 0))
+            if t.text((*row, 1)) not in {"BUY", "SELL"}:
+                t.unknown((*row, 1), "BUY/SELL side not shown")
+            for field in (2, 3):
+                if t.number((*row, field)) <= 0:
+                    t.unknown((*row, field), "positive quantity and price not shown")
+            t.stamp((*row, 4))
+
+
 def _a5(t: Term) -> None:
+    with t.scope():
+        _fill_rows(t)
     buys = _buys(t)
     represented: set[str] = set()
     identities_readable = True
@@ -774,6 +834,16 @@ def _a6(t: Term) -> None:
                 t.unknown(path, f"expected {type(expected).__name__} evidence")
             if value != expected:
                 t.fail(path, f"own wind-down requires {expected!r}")
+    # session_window.py:1135,1154: open shares and flat come from the same quantities; a recorded
+    # remainder contradicts a flat flag and is not flat.
+    by_instrument = ("mover", "result", "by_instrument")
+    with t.scope():
+        if t.optional(by_instrument) is not ABSENT:
+            for instrument in t.mapping(by_instrument):
+                with t.scope():
+                    path = (*by_instrument, instrument, "open_shares")
+                    if t.number(path) != 0:
+                        t.fail(path, "open shares recorded at the end")
 
 
 def _refusal(t: Term, path: KeyPath, by: str | None = None) -> None:
@@ -880,17 +950,29 @@ def check(record: dict[str, Any]) -> Check:
                         term.counts["fixed_arm_entries"] = len(term.array(ENTRIES))
                 else:
                     evaluate(term)
-    if fixed_arm:
-        failed = ", ".join(term.name for term in terms if term.status == "failed")
-        return Check(terms, f"practice (finding: {failed})" if failed else "practice")
     # mover.py:1977 entries are orders sent; :1739-1746 BUY fills establish actual entries.
     # Read through a term reader so the summary uses evidence printed in that term too.
-    no_entry = False
-    with terms[3].scope():
-        fills = terms[3].array(FILLS)
-        sides = [terms[3].text((*FILLS, index, 1)) for index in range(len(fills))]
+    # A SELL fill with no BUY fill is a record that lost its entry, not a window without one.
+    no_entry = unmatched_sale = False
+    reader = terms[4] if fixed_arm else terms[3]  # A4 is not evaluated on the fixed arm
+    with reader.scope():
+        fills = reader.array(FILLS)
+        sides = [reader.text((*FILLS, index, 1)) for index in range(len(fills))]
         if all(side in {"BUY", "SELL"} for side in sides):
-            no_entry = "BUY" not in sides
+            unmatched_sale = "BUY" not in sides and "SELL" in sides
+            no_entry = not sides
+    if fixed_arm:
+        failed = ", ".join(term.name for term in terms if term.status == "failed")
+        if failed:
+            return Check(terms, f"practice (finding: {failed})")
+        # With nothing bought there is no sale for A3 to judge; every other term still needs
+        # its evidence, A6's close and A7's refusals above all.
+        exempt = {"A3"} if no_entry else set()
+        if unmatched_sale or any(
+            term.status == "not shown" for term in terms if term.name not in exempt
+        ):
+            return Check(terms, "incomplete")  # shared evidence missing is not practice
+        return Check(terms, "practice")
     if any(
         term.status == "failed"
         for term in terms
@@ -899,7 +981,7 @@ def check(record: dict[str, Any]) -> Check:
         summary = "breaks"
     elif no_entry:
         summary = "no entry"
-    elif any(term.status == "not shown" for term in terms if term.name != "A4"):
+    elif unmatched_sale or any(term.status == "not shown" for term in terms if term.name != "A4"):
         summary = "incomplete"
     else:
         summary = "counts"
@@ -937,7 +1019,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         if not isinstance(record, dict):
             raise TypeError("window record must be a JSON object")
-    except (OSError, UnicodeError, ValueError, TypeError, RecursionError) as error:
+    # DecimalException: parse_float=Decimal raises it for a number Decimal cannot hold
+    except (
+        OSError,
+        UnicodeError,
+        ValueError,
+        TypeError,
+        RecursionError,
+        DecimalException,
+    ) as error:
         print(f"unreadable: {type(error).__name__}: {error}")
         return 4
     result = check(record)

@@ -48,7 +48,7 @@ def record() -> dict[str, Any]:
         "mover": {
             "result": {"flat": True, "by_instrument": {"SYN.ALPA": {"open_shares": "0"}}},
             "run": {
-                "rows": {"trail": "0.02"},
+                "rows": {"trail": "0.02", "spread_floor_m": "2"},
                 "entries": [
                     {
                         "client_order_id": "buy-1",
@@ -113,6 +113,13 @@ def record() -> dict[str, Any]:
     }
 
 
+def matched_spread(entry: dict[str, Any]) -> None:
+    """The quoted spread the writer's floor implies at spread_floor_m 2 (mover.py:4252)."""
+    sizing = entry["sizing"]
+    price = Decimal(sizing["notional"]) / Decimal(sizing["quantity"])
+    entry["spread"] = str(Decimal(entry["spread_floor"]) * price / 2)
+
+
 def change(record: dict[str, Any], path: list[Any], value: Any) -> None:
     parent: Any = record
     for key in path[:-1]:
@@ -163,6 +170,7 @@ def test_a4_opening_stop_met_when_armed_is_counted_without_a_finding(
 ):
     change(record, [*EXIT, "trigger_reason"], "trailing stop (L under the fill, met when armed)")
     change(record, [*EXIT, "trigger_ns"], 2_000_000_000)
+    change(record, [*EXIT, "final_fill_ns"], 2_000_000_000)  # sold then
     if other_evidence == "missing":
         del record["ended"]
     elif other_evidence == "failed":
@@ -267,6 +275,7 @@ def test_fixed_arm_does_not_evaluate_a1_or_a4(record):
     record["arm"] = "F2"
     del record["mover"]["run"]["entries"][0]["spread"]
     change(record, [*EXIT, "trigger_ns"], 2_000_000_000)
+    change(record, [*EXIT, "final_fill_ns"], 2_000_000_000)  # sold then
     change(record, [*EXIT, "trigger_reason"], "trailing stop (L under the fill, met when armed)")
     result = checker().check(record)
     assert (result.summary, result.exit_code) == ("practice", 0)
@@ -277,12 +286,12 @@ def test_fixed_arm_does_not_evaluate_a1_or_a4(record):
 
 
 @pytest.mark.parametrize("name,path", [("A2", [*ENTRY, "sizing"]), ("A3", [*EXIT, "sales"])])
-def test_fixed_arm_keeps_absent_shared_evidence_not_shown(record, name, path):
+def test_a_fixed_arm_with_absent_shared_evidence_is_incomplete(record, name, path):
     record["arm"] = "F2"
     change(record, path, None)
     result = checker().check(record)
     assert term(result, name).status == "not shown"
-    assert (result.summary, result.exit_code) == ("practice", 0)
+    assert (result.summary, result.exit_code) == ("incomplete", 2)
 
 
 def test_fixed_arm_without_entry_reports_failed_flatness_as_practice(record):
@@ -613,8 +622,10 @@ def test_cross_dollar_floor_tolerance_is_counted_per_entry(record, entries):
         quantity="100",
         notional="101",
     )
+    matched_spread(entry)
     record["mover"]["run"]["entries"] = [copy.deepcopy(entry) for _ in range(entries)]
     change(record, [*EXIT, "trigger_ns"], 2_000_000_000)
+    change(record, [*EXIT, "final_fill_ns"], 2_000_000_000)  # sold then
     result = checker().check(record)
     assert term(result, "A1").status == "met"
     assert term(result, "A1").counts["p5_tolerance_used"] == entries
@@ -637,10 +648,12 @@ def test_a4_counts_each_cross_dollar_tolerance_use(record, quick_exits):
         quantity="100",
         notional="101",
     )
+    matched_spread(entry)
     exits = []
     for index in range(3):
         row = copy.deepcopy(run["exits"][0])
         row["trigger_ns"] = 2_000_000_000 if index < quick_exits else 90_000_000_000
+        row["final_fill_ns"] = row["trigger_ns"]  # sold then
         exits.append(row)
     run["exits"] = exits
     result = checker().check(record)
@@ -663,6 +676,7 @@ def test_same_step_one_tick_floor_shortfall_fails(record, price, stop, distance,
     entry["sizing"].update(
         trail=floor, stop=stop, notional=str(Decimal(price) * 10), loss_per_share=distance
     )
+    matched_spread(entry)
     a1 = term(checker().check(record), "A1")
     assert a1.status == "failed"
     assert '"loss_per_share"' in a1.first_failure["path"]
@@ -788,6 +802,7 @@ def test_partial_holding_cannot_have_a_final_fill_clock(record):
 
 def test_quick_sale_above_floor_is_counted(record):
     change(record, [*EXIT, "trigger_ns"], 2_000_000_000)
+    change(record, [*EXIT, "final_fill_ns"], 2_000_000_000)  # sold then
     result = checker().check(record)
     assert term(result, "A4").status == "counted"
     assert term(result, "A4").counts["inside_60s"] == 1
@@ -795,6 +810,7 @@ def test_quick_sale_above_floor_is_counted(record):
 
 def test_exactly_sixty_seconds_is_not_inside(record):
     change(record, [*EXIT, "trigger_ns"], 61_000_000_000)
+    change(record, [*EXIT, "final_fill_ns"], 61_000_000_000)  # sold then
     change(record, [*EXIT, "trigger_reason"], "trailing stop (L under the fill, met when armed)")
     a4 = term(checker().check(record), "A4")
     assert a4.status == "counted"
@@ -803,6 +819,7 @@ def test_exactly_sixty_seconds_is_not_inside(record):
 
 def test_quick_ratchet_cannot_be_blame_assigned_to_opening_distance(record):
     change(record, [*EXIT, "trigger_ns"], 3_000_000_000)
+    change(record, [*EXIT, "final_fill_ns"], 3_000_000_000)  # sold then
     change(record, [*EXIT, "trigger_reason"], "trailing stop (L under the fill, met when armed)")
     change(record, [*ENTRY, "ratchet"], {"tightened": True, "when_ns": 2_000_000_000})
     assert term(checker().check(record), "A4").status == "not shown"
@@ -810,6 +827,7 @@ def test_quick_ratchet_cannot_be_blame_assigned_to_opening_distance(record):
 
 def test_a4_missing_attribution_does_not_make_the_window_incomplete(record, tmp_path, capsys):
     change(record, [*EXIT, "trigger_ns"], 3_000_000_000)
+    change(record, [*EXIT, "final_fill_ns"], 3_000_000_000)  # sold then
     change(record, [*EXIT, "trigger_reason"], "trailing stop (L under the fill, met when armed)")
     change(record, [*ENTRY, "ratchet"], {"tightened": True, "when_ns": 2_000_000_000})
     result = checker().check(record)
@@ -827,6 +845,7 @@ def test_a4_missing_attribution_does_not_make_the_window_incomplete(record, tmp_
 
 def test_a4_bad_sizing_is_missing_observation_not_a_failure(record):
     change(record, [*EXIT, "trigger_ns"], 2_000_000_000)
+    change(record, [*EXIT, "final_fill_ns"], 2_000_000_000)  # sold then
     change(record, [*ENTRY, "sizing", "quantity"], "0")
     result = checker().check(record)
     a4 = term(result, "A4")
@@ -1326,3 +1345,143 @@ def test_a_longer_reason_is_not_a_refused_replace(record, reason):
     record["mover"]["run"]["refused"] = [["buy-1", reason]]
     a7 = term(checker().check(record), "A7")
     assert a7.first_failure is None
+
+
+@pytest.mark.parametrize("missing", ["entry", "identity"])
+def test_a_filled_buy_needs_an_identifiable_entry_plan(record, missing):
+    run = record["mover"]["run"]
+    if missing == "entry":
+        run["entries"] = []
+    else:
+        del run["entries"][0]["client_order_id"]
+    result = checker().check(record)
+    assert (result.summary, result.exit_code) == ("incomplete", 2)
+    assert term(result, "A1").status == "not shown"
+    assert term(result, "A2").status == "not shown"
+
+
+def test_a1_checks_the_floor_against_the_recorded_spread(record):
+    run = record["mover"]["run"]
+    run["rows"]["spread_floor_m"] = "2"
+    run["entries"][0]["spread"] = "0.30"
+    result = checker().check(record)
+    assert term(result, "A1").status == "failed"
+    assert (result.summary, result.exit_code) == ("breaks", 1)
+
+
+def test_a1_names_a_missing_floor_multiplier(record):
+    del record["mover"]["run"]["rows"]["spread_floor_m"]
+    a1 = term(checker().check(record), "A1")
+    assert a1.status == "not shown"
+    assert any("spread_floor_m" in path for path in a1.missing)
+
+
+def test_a6_cannot_accept_a_flat_flag_over_a_nonzero_remainder(record):
+    run = record["mover"]["run"]
+    run["fills"][1][2] = "5"
+    run["exits"][0].update(filled_quantity="5", final_fill_ns=None)
+    record["mover"]["result"]["by_instrument"]["SYN.ALPA"]["open_shares"] = "5"
+    result = checker().check(record)
+    assert term(result, "A5").status == "met"
+    assert term(result, "A6").status == "failed"
+    assert (result.summary, result.exit_code) == ("breaks", 1)
+
+
+def test_a_quick_trigger_is_not_a_sale_inside_sixty_seconds(record):
+    record["mover"]["run"]["exits"][0]["trigger_ns"] = 2_000_000_000
+    result = checker().check(record)
+    assert term(result, "A4").counts["inside_60s"] == 0
+
+
+def test_an_unsold_exit_is_not_a_sale_inside_sixty_seconds(record):
+    run = record["mover"]["run"]
+    run["fills"] = [run["fills"][0]]
+    run["exits"][0].update(
+        trigger_ns=2_000_000_000, filled_quantity="0", final_fill_ns=None, sales=[]
+    )
+    assert term(checker().check(record), "A4").counts["inside_60s"] == 0
+
+
+def test_a_truncated_sell_fill_makes_the_record_incomplete(record):
+    record["mover"]["run"]["fills"][1] = ["sell-1", "SELL"]
+    result = checker().check(record)
+    assert (result.summary, result.exit_code) == ("incomplete", 2)
+    assert term(result, "A5").status == "not shown"
+
+
+def test_an_unrepresentable_json_number_has_an_unreadable_verdict(tmp_path, capsys):
+    path = tmp_path / "record.json"
+    path.write_text('{"x": 1e9999999999999999999}', encoding="utf-8")
+    assert checker().main([str(path)]) == 4
+    assert capsys.readouterr().out.startswith("unreadable:")
+
+
+def test_a_fixed_arm_label_alone_is_not_successful_evidence():
+    result = checker().check({"arm": "F2"})
+    assert (result.summary, result.exit_code) == ("incomplete", 2)
+
+
+@pytest.mark.parametrize("has_modify_event", [False, True])
+def test_a_documented_http_replace_refusal_breaks_a7(record, has_modify_event):
+    # execution.py:2338 at the base: the replace's HTTP refusal (422, `REPLACE_REFUSAL`).
+    record["mover"]["run"]["order_refusals"] = [
+        {
+            "client_order_id": "sell-1",
+            "by": "venue",
+            "reason": "Alpaca refused the replace (422): 42210000: order is not replaceable",
+        }
+    ]
+    if has_modify_event:
+        record["orders"]["sell-1"].insert(0, "OrderModifyRejected")
+    result = checker().check(record)
+    assert term(result, "A7").status == "failed"
+    assert (result.summary, result.exit_code) == ("breaks", 1)
+
+
+def _no_fills(record: dict[str, Any]) -> None:
+    record["arm"] = "F2"
+    for key in ("entries", "fills", "exits"):
+        record["mover"]["run"][key] = []
+    record["mover"]["result"]["by_instrument"] = {}
+
+
+def test_a_fixed_arm_without_entry_and_with_its_close_shown_is_practice(record):
+    _no_fills(record)
+    result = checker().check(record)
+    assert term(result, "A3").status == "not shown"  # nothing bought, so nothing sold to judge
+    assert (result.summary, result.exit_code) == ("practice", 0)
+
+
+def test_a_fixed_arm_without_entry_still_needs_its_close_shown(record):
+    _no_fills(record)
+    for key in ("ended", "left", "closes", "denials", "orders"):
+        record.pop(key)
+    del record["mover"]["result"]["flat"]
+    record["result"] = "error: node crashed"
+    result = checker().check(record)
+    assert term(result, "A6").status == "not shown"
+    assert (result.summary, result.exit_code) == ("incomplete", 2)
+
+
+@pytest.mark.parametrize("arm", ["F2", "OWN1"])
+def test_a_sale_with_no_buy_fill_is_not_a_window_without_entry(record, arm):
+    record["arm"] = arm
+    run = record["mover"]["run"]
+    run["fills"] = [row for row in run["fills"] if row[1] == "SELL"]
+    assert run["fills"]
+    result = checker().check(record)
+    assert (result.summary, result.exit_code) == ("incomplete", 2)
+
+
+@pytest.mark.parametrize(
+    "reason",
+    ["Alpaca refused the replace (422): ", "Alpaca refused the replace (422): line one\nline two"],
+)
+def test_an_empty_or_multiline_http_replace_refusal_breaks_a7(record, reason):
+    # execution.py:2338 joins the status and api_error_text unstripped; the text can be empty.
+    record["mover"]["run"]["order_refusals"] = [
+        {"client_order_id": "sell-1", "by": "venue", "reason": reason}
+    ]
+    result = checker().check(record)
+    assert term(result, "A7").status == "failed"
+    assert (result.summary, result.exit_code) == ("breaks", 1)

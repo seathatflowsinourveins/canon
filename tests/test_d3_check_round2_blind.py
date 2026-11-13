@@ -76,7 +76,7 @@ def record() -> Record:
         "mover": {
             "result": {"flat": True, "by_instrument": {"SYN.ALPA": {"open_shares": "0"}}},
             "run": {
-                "rows": {"trail": "0.02"},
+                "rows": {"trail": "0.02", "spread_floor_m": "2"},
                 "entries": [
                     {
                         "client_order_id": "buy-1",
@@ -166,6 +166,13 @@ def venue_refusal(cid: str, reason: Any = WASH_TRADE) -> Record:
     return {"client_order_id": cid, "by": "venue", "cause": "other", "reason": reason}
 
 
+def matched_spread(entry: dict) -> None:
+    """The quoted spread the writer's floor implies at spread_floor_m 2 (mover.py:4252)."""
+    sizing = entry["sizing"]
+    price = Decimal(sizing["notional"]) / Decimal(sizing["quantity"])
+    entry["spread"] = str(Decimal(entry["spread_floor"]) * price / 2)
+
+
 def cross_dollar(record: Record) -> None:
     run = record["mover"]["run"]
     entry = run["entries"][0]
@@ -178,6 +185,7 @@ def cross_dollar(record: Record) -> None:
         quantity="100",
         notional="101",
     )
+    matched_spread(entry)
     run["fills"][0][2:4] = ["100", "1.01"]
     run["fills"][1][2:4] = ["100", "1.00"]
     exit_row = run["exits"][0]
@@ -360,6 +368,7 @@ def test_more_than_one_tick_below_floor_still_fails(record: Record) -> None:
     entry = record["mover"]["run"]["entries"][0]
     entry.update(trail="0.025", spread_floor="0.025")
     entry["sizing"].update(trail="0.025", stop="0.9847", planned_loss="2.53")
+    matched_spread(entry)
     result = d3_check.check(record)
     a1 = term(result, "A1")
     assert a1.status == "failed"
