@@ -51,7 +51,7 @@ paper, pre-market and after-hours so far (Sessions, feeds and what paper has sho
 | Part | Setting or code | Upstream it follows |
 |---|---|---|
 | Order size and rate | ADR 0049's `risk_limits`: $1,000 per order, 50 submits and 25 modifies a minute | `LiveRiskEngineConfig` (ADR 0049) |
-| Orders and position in step with Alpaca | `open_check_interval_secs=10`, `position_check_interval_secs=60`, both off by default; the position check aligns to the adapter's position reports until `position_check_retries` (3) run out | configure_live_trading, "Continuous reconciliation": "5-10s", "30-60s" |
+| Orders and position in step with Alpaca | `open_check_interval_secs=10`, `position_check_interval_secs=60`, both off by default; the position check aligns to the adapter's position reports until `position_check_retries` (3) run out; since 2026-11-13 (claim 10, ported from PR #234), a submit never answered is retained (`submission_recovery_policy=RETAIN_UNRESOLVED`) and the adapter's fill reports name it by confirmed client order ID, so reconciliation fills the retained order; the window makes no instrument-wide claim, leaving foreign activity EXTERNAL | configure_live_trading, "Continuous reconciliation": "5-10s", "30-60s"; `crates/execution/src/engine/mod.rs:1418-1423, 1556-1565` at the pin; concepts/execution/reconciliation, "Submission recovery" |
 | Start-up reconciliation | Scoped to the symbol and one minute of history: every run starts only once it has found the account flat, so history can only mislead, and 60 minutes could hold the last window's exit without its entry; open orders and positions are reported however old | The Lighter tutorial's `reconciliation_instrument_ids`; the minute is the adapter's own paper tests' (the tutorial uses 60; the docs' tip leaves it unset) |
 | The node | `LiveNode.builder(...)`, `with_risk_engine_config`, `with_exec_engine_config`, `with_delay_post_stop_secs(5)`; a regular window 65 s, since the managed stop's market exit (60 attempts a second apart) runs only inside that delay before the node disconnects | `examples/live/sandbox/exec_tester.py`, the Lighter tutorial; `LiveNode::stop` and `process_runner_for` in `crates/live/src/node/mod.rs` at the pin |
 | Exit at wind-down and stop, in the session | `market_exit()`, and `manage_stop=True` so `stop()` runs it; `market_exit_reduce_only=False`, `market_exit_time_in_force=DAY` | concepts/strategies, "Market exit" |
@@ -323,6 +323,104 @@ self-test; the capped count and the missing wind-down are stated above; a feed c
 makes unreachable is kept as a guard. On paper: pending, the first regular window of it (ADR 0068,
 Confirmation).
 
+2026-11-13: PR #234's retention and fill-report naming are ported onto the current paper nodes, keeping
+their multi-instrument reconciliation and the window's current limit-order and managed-stop settings.
+The initially ported instrument claim is removed: a claim assigns foreign orders and fills on the
+symbol to the window too. The pin
+matches a fill's confirmed client order ID to the cached retained order before external ownership is
+considered (`crates/execution/src/engine/mod.rs:1556-1565`); no whole-symbol claim is needed for that
+recovery. An unread order's fill is withheld from the engine until its identity can be read, so a
+transient read failure cannot book it as EXTERNAL and suppress the next check. Every failed naming
+attempt is counted and logged; an unread ancestor is retried on each request too. A permanently
+unread order still leaves the original submit unresolved and shutdown failing. The tests retain both
+claimed/unclaimed controls and the successful entry/close recovery by client ID.
+
+Fill naming contains a failed order or ancestor read: only that order's reports are
+withheld and retried, identified fills are delivered, and logs use the failure class/status/code without
+raw exception text. The fill request fails its coverage while an identity is unreadable: at the pin,
+even an empty successful response permits synthetic position reconciliation, which could hide the
+discrepancy that triggers the next check (`crates/live/src/node/reconciliation.rs:458-480,860-918`).
+A refused cancel that reads a retained unanswered order FILLED passes the read to
+the existing trade-ID catch-up path; retention has stopped its automatic queries, so waiting for them
+would leave it PENDING_CANCEL. If the activities lag, that path keeps reading at the existing interval
+until the fills arrive or the node stops, counting and logging each failed attempt. ADR 0075 records
+both adapter changes. These cases remain UNVERIFIED on
+paper. The two dated entries below preserve the original branch's investigation and review history;
+their instrument-claim setting is superseded by this paragraph.
+
+2026-11-11, the session window's claim 10 (a fourth independent review, 2026-11-10): a submit Alpaca took
+whose answer and every read of the order were lost was rejected by the node itself once the in-flight
+check's queries ran out (`INFLIGHT_TIMEOUT`, `check_inflight_orders` in `crates/live/src/execution/manager.rs`
+at the pin), and the fill Alpaca made afterwards was booked to `EXTERNAL`: the adapter ignores an update for
+an order that has ended, and the position check's fill report, under an Alpaca order ID the node never
+heard, became an external reduce-only order (`materialize_external_order_from_fill`,
+`crates/execution/src/engine/mod.rs`), then the check's own `RECONCILIATION` order. `SessionMaCross` reads
+its own positions (`held`), so after a closing sell it would sell a share it no longer held, and after an
+entry buy a second. Reproduced offline on a real `LiveNode` with the adapter on ADR 0075's model and
+stand-ins for Alpaca (`packages/canon-alpaca/tests/test_execution_client.py`), for an entry and a closing
+sell, the trade update delivered or lost. Two upstream settings close it, and each is needed:
+
+* The paper nodes' engine retains such a submit (`submission_recovery_policy=RETAIN_UNRESOLVED`,
+  `paper_node.exec_engine_config`; concepts/execution/reconciliation, "Submission recovery": "Exhausted
+  unacknowledged submissions stay unresolved"), so the order stays open at the node and the strategy, which
+  sends nothing while an order works, sends no new order of its own. Claimed but resolved locally, the order was closed
+  with nothing held while Alpaca held it.
+* The window's strategy claims its instrument (`external_order_instrument_ids`; "Order ownership and tags":
+  "Claimed orders and fills use the claiming strategy ID"), as 14 of the 15 upstream
+  `examples/live/*/exec_tester.py` claim theirs (all but Interactive Brokers'). Retained but unclaimed, a lost update's fill still went to `EXTERNAL`.
+
+With both, the strategy's position was Alpaca's in all four cases. Delivered, the order filled under
+Alpaca's trade ID. Lost, it stayed submitted and the node's run ended with the error naming it ("Submission
+recovery at shutdown", concepts/live), so the window was recorded failed and its account check looked the
+order up, until the adapter's change below. An update delivered after the position check had booked the fill was not counted again (observed
+while building, not kept as a test). The window's tests of the claim and of the engine's policy
+(`tests/test_session_window.py`) failed before the change. The case needs a submit with no answer (a
+5xx or a read timeout, ADR 0039) and every read of the order failing through the in-flight check, which
+no paper run has shown: it is UNVERIFIED on paper.
+
+What the retention costs, from the code review of this change: a read that finds no order is no outcome,
+so a submit answered 5xx that Alpaca never placed is retained too, and the strategy sends nothing more for
+the rest of the window, which is then recorded failed
+(`test_a_submit_alpaca_never_placed_is_retained_too_and_nothing_is_sent_again`); Alpaca asks that a
+timed-out order not be marked canceled "until confirmed" (ADR 0039's Evidence). Any submit still
+unanswered at the end of `delay_post_stop` fails the run, its recovery budget spent or not
+("Submission recovery at shutdown"), for the EMA paper node as for the window. Retention does not stop a
+market exit: at the wind-down and again at the managed stop, `market_exit` cancels the strategy's orders
+and closes its position as the node holds it (`market_exit`, `crates/trading/src/strategy/mod.rs` at the
+pin), so a retained close whose fill the position check has not yet booked can be sent a second time, as
+a close rejected locally could before; the account check after the stop finds and closes what that
+leaves, in the regular session. Retention covers only a `SUBMITTED` order: an `ACCEPTED` one the open-order
+check does not find is still rejected by the node (`NOT_FOUND_AT_VENUE`, the missing-order resolution in
+`crates/live/src/execution/manager.rs` at the pin), and the per-client opt-in
+(`retain_unresolved_submissions`) has no Python binding, so `paper_node` sets the engine's policy. A run
+that ends with the shutdown error is recorded failed and still hands the order to the account check
+(`test_a_retained_submit_fails_the_window_and_is_handed_to_the_check`).
+
+2026-11-11, the lost update's limit closed: with the trade update lost, the retained order stayed `SUBMITTED`
+until the node stopped, which then failed with "Submission recovery incomplete at shutdown: unresolved
+client order IDs [...]" naming it. A fill activity names its Alpaca order and no client order ID, and the
+node held no Alpaca order ID for a submit never answered, so the engine matched the position check's fill
+report to nothing. The adapter now sets the node order's client order ID on such a report, from Alpaca's
+read of the order ("Get an Order by ID" returns `client_order_id`), as upstream's OKX adapter sets the one
+the venue echoes (`parse_fill_report` in `crates/adapters/okx/src/common/parse.rs` at the pin; Coinbase's
+leaves it unset because its fill records carry none). The engine matches a report by its client order ID
+first (`reconcile_fill_report`), so the fill reaches the order itself under Alpaca's trade ID and the run
+ends clean, for an entry and a closing sell, with both settings and with retention alone
+(`test_retained_a_lost_fill_reaches_the_order_by_its_client_order_id`, which failed before the change).
+The adapter reads an order for this only while the node holds an order in flight with no Alpaca order
+ID, only for a report in such an order's instrument and side, and each Alpaca order once; it names a
+report only if the order is still waiting after the read. The code review of this change (7
+findings) found an order answered during the read still named, and an order not the node's read on
+every request, each shown by a test failing before its fix
+(`test_a_submit_answered_while_its_order_is_read_is_not_named`, `test_an_order_not_the_nodes_is_read_once`),
+the branches that leave a report unnamed untested, which now have tests, and the reads the filters
+above remove. At that stage the claim stayed: when Alpaca's order cannot be read the report is not named and the engine
+books the fill as an external order, which the claim makes the strategy's. That characterization is
+superseded by the withheld-report behavior above, tested by
+`test_a_lost_fill_whose_order_cannot_be_read_keeps_retrying_without_external_booking`. The naming acts only
+on a submit never answered, which no paper run has shown: it runs offline on a real `LiveNode` with
+stand-ins for Alpaca, and on paper it is UNVERIFIED.
+
 ## Evidence
 
 Read 2026-11-10. "raw": fetched with `curl` and read whole. NautilusTrader files at the pin, `d53849b216e2`.
@@ -366,7 +464,7 @@ Read 2026-11-10. "raw": fetched with `curl` and read whole. NautilusTrader files
   by name, with the observation and its date, rather than run to fail; after-hours is such a part, on ADR
   0055's observation of 2026-11-10 (read). Offline, `tests/test_session_window.py`: an after-hours firing
   exits 0, builds no node, keeps the last result and says so in its heartbeat (run).
-* 2026-11-11, the second reader (`evidence-verifier`) of the split: corrected here the refusals listed in
+* 2026-11-11, review of the split: corrected here the refusals listed in
   Confirmation (no SIP refusal remains), the data plan behind `boats` marked UNVERIFIED, the two forms of
   the overnight attributes stated, the marking of the overnight orders read from the code, what of the
   landed code the last window ran, the lock's bounds (about 38 minutes, 50 with the start-up's sync), the
@@ -409,7 +507,7 @@ Read 2026-11-10. "raw": fetched with `curl` and read whole. NautilusTrader files
 * The offline tests and the two paper starts above (run).
 * Code review (`/code-review`, high), 2026-11-10: the naive calendar times, the ignored params, a second exit
   at stop or wind-down, a short counted as held, start-up eating the wind-down, an unwritten report;
-  all fixed above. Second reader (`evidence-verifier`), 2026-11-10: corrected the cap's timing, the node
+  all fixed above. Review, 2026-11-10: corrected the cap's timing, the node
   log, "only a strategy" and the position check's retries; all applied.
 * `crates/live/src/node/{mod,config,builder}.rs` and `crates/live/src/python/node.rs` at the pin: the
   node's stop bounds and their defaults, `with_delay_shutdown_secs` setting `timeout_shutdown`, and
@@ -437,7 +535,7 @@ Read 2026-11-10. "raw": fetched with `curl` and read whole. NautilusTrader files
   window, all reproduced offline): the decision's account check, its row in the table and the lock's arithmetic are
   rewritten above; `AFTER_END_SECS` 605 to 725, `LAST_CLOSE_SECS` 394 to 455, `END_MARGIN_SECS` 455 to
   515, `LONGEST_WINDOW_SECS` 3076 to 2955 (run).
-* 2026-11-10, second readers' sweep for silent fallbacks (Muse Code, DeepSeek Harness), each reproduced
+* 2026-11-10, review for silent fallbacks, each reproduced
   by a failing test: a calendar day without `session_close` (`Optional[str]` in alpaca-py 0.45.0's
   `Calendar`) gave an extended window a 20:00 end, and a failing `getconf` on macOS moved the records to
   `$TMPDIR`'s folder; both are now refused by name, as is a relative `--log-dir` (what `mise.toml`'s
