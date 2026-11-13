@@ -112,7 +112,8 @@ cmd="$1"; shift
 if [ "$cmd" = gh ]; then
   case "$1 $2" in
     "--version ") echo "gh 1.0 (stub)"; exit 0 ;;
-    "auth status") touch "$STUB/gh-authed"; exit "$(cat "$STUB/gh-auth-rc" 2>/dev/null || echo 0)" ;;
+    "auth status") touch "$STUB/gh-authed"; [ ! -f "$STUB/gh-auth-err" ] || cat "$STUB/gh-auth-err" >&2
+                   exit "$(cat "$STUB/gh-auth-rc" 2>/dev/null || echo 0)" ;;
     # gh-rate: "<core|graphql> <limit> <reset>", spent only; gh-rate-after-auth: the same, once gh auth status
     # ran; gh-rate-json: gh's error body on stdout with exit 1, as gh prints one (pkg/cmd/api/api_test.go:662-675)
     "api rate_limit")
@@ -644,6 +645,10 @@ check "gh's check failing on a spent REST budget: the landing row names the budg
 rm -f "$STUB/gh-rate"; status
 check "... and with no budget to read, the row still says gh is not signed in" \
       eval 'rowis "$TMP/status.out" landing OFF && grep -q "gh is not signed in" "$TMP/status.out"'
+echo "gh: API rate limit exceeded for user ID 1. (HTTP 403)" > "$STUB/gh-auth-err"; status; rc=$?
+check "rate-limit words on gh's check with no budget spent: still not signed in, OFF and failing" \
+      eval 'rowis "$TMP/status.out" landing OFF && grep -q "gh is not signed in" "$TMP/status.out" && [ "$rc" != 0 ]'
+rm -f "$STUB/gh-auth-err"
 rm -f "$STUB/gh-authed"; echo "core 5000 1763002800" > "$STUB/gh-rate-after-auth"; status
 check "a budget spent by the time of gh's own check: the landing row names it, not a sign-out" \
       eval 'rowis "$TMP/status.out" landing UNKNOWN && grep -q "REST budget is spent (0 of 5000)" "$TMP/status.out" && ! grep -q "not signed in" "$TMP/status.out"'

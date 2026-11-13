@@ -42,7 +42,7 @@ shift 3
 printf 'gh %s\n' "$*" >> "$FAKE/log"
 rc() { if [ -f "$FAKE/$1" ]; then cat "$FAKE/$1"; else echo 0; fi; }
 case "${1:-} ${2:-}" in
-  "auth status") exit "$(rc auth_rc)" ;;
+  "auth status") [ ! -f "$FAKE/auth_err" ] || cat "$FAKE/auth_err" >&2; exit "$(rc auth_rc)" ;;
   "pr list")     [ ! -f "$FAKE/pr_open" ] || cat "$FAKE/pr_open" ;;
   "pr create")   echo "7 https://github.example/o/r/pull/7" > "$FAKE/pr_open" ;;
   "pr checks")   if [ -f "$FAKE/checks_err" ]; then cat "$FAKE/checks_err" >&2; exit 1; fi
@@ -215,6 +215,24 @@ t_wait_view_spent() {      # F1: the wait's pr view meets a spent budget: named,
   [ "$rc" -ne 0 ] && has "REST budget is spent (0 of 5000)" && has "cannot be read" && ! has "has not marked it merged" \
     && [ "$(grep -c 'gh pr view 7 --json state' "$FAKE/log")" = 1 ]
 }
+t_auto_unread() {          # R3: --auto succeeded, then the wait cannot read: gh merges at once when CLEAN, so not "auto-merge is on"
+  new_repo; change README.md; : > "$FAKE/rate"; echo "core 5000 1763002800" > "$FAKE/rate_late"
+  echo 1 > "$FAKE/merge_rc"; echo "checks pending" > "$FAKE/merge_err"; echo "$RATE_WORDS" > "$FAKE/view_err"; land
+  why="an accepted auto-merge request was reported as auto-merge armed"
+  [ "$rc" -ne 0 ] && logged "--auto" && has "REST budget is spent (0 of 5000)" && ! has "auto-merge is on" \
+    && has "accepted the auto-merge request"
+}
+t_auto_timeout() {         # R3: --auto succeeded and the wait runs out: the request is named, not "auto-merge is on"
+  new_repo; change README.md; echo 1 > "$FAKE/merge_rc"; echo "checks pending" > "$FAKE/merge_err"
+  echo "OPEN HEAD" > "$FAKE/views"; land
+  why="an accepted auto-merge request was reported as auto-merge on"
+  [ "$rc" -ne 0 ] && has "is not merged after" && has "accepted the auto-merge request" && ! has "uto-merge is on"
+}
+t_auth_words_ignored() {   # R4: gh auth status fails with rate-limit words while /rate_limit shows calls left: signed out
+  new_repo; change README.md; : > "$FAKE/rate"; echo 1 > "$FAKE/auth_rc"; echo "$RATE_WORDS" > "$FAKE/auth_err"; land
+  why="words on gh auth status's stderr were read as a spent budget"
+  [ "$rc" -ne 0 ] && has "not signed in" && ! has "rate limit was exceeded" && ! has "budget is spent"
+}
 t_wait_checks_spent() {    # F1: the wait's pr checks meets a spent budget: named, not read as no failed check
   new_repo; change README.md; : > "$FAKE/rate"; echo "core 5000 1763002800" > "$FAKE/rate_late"
   echo "OPEN HEAD" > "$FAKE/views"; echo "$RATE_WORDS" > "$FAKE/checks_err"; land
@@ -280,6 +298,9 @@ case_ "a merge refused on a spent budget is not retried as auto-merge"  t_merge_
 case_ "GitHub's own rate-limit answer is named when /rate_limit disagrees"  t_rate_words_only
 case_ "a rate-limited --pr read is not called not found"   t_pr_info_rate
 case_ "a budget spent at gh's own check is not called signed out"  t_auth_spent
+case_ "an accepted auto-merge request is not reported as armed when the wait cannot read"  t_auto_unread
+case_ "an accepted auto-merge request is not reported as armed when the wait runs out"  t_auto_timeout
+case_ "rate-limit words from gh auth status are not read as a spent budget"  t_auth_words_ignored
 case_ "a secondary rate limit in the wait is not a spent budget"  t_wait_secondary
 case_ "a merge refused for another reason while REST is spent still tries auto-merge"  t_merge_core_spent
 case_ "a check named for a rate limit is not GitHub's answer"  t_check_named_rate

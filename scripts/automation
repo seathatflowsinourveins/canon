@@ -1686,7 +1686,7 @@ do_status() {
   if origin=$(git -C "$ROOT" remote get-url origin 2>/dev/null); then
     # scripts/land's spent_budget, read first as land reads it: GET /rate_limit is not counted against the
     # budget, and a spent one fails gh's own check, which would read as signed out (see scripts/land)
-    local spent="" authed=0 aerr=""
+    local spent="" authed=0
     # landing_budget: the spent budget as scripts/land's spent_budget reads it; gh prints an error body on
     # stdout and exits 1, so its exit and every field are checked before it is read as a budget
     landing_budget() {
@@ -1705,15 +1705,11 @@ do_status() {
       spent=$(landing_budget) || spent=""
       # the budget can run out between that read and gh's own check, which then fails as a sign-out would
       if [ -z "$spent" ]; then
-        if aerr=$(cd "$ROOT" && "$mise_bin" exec -- gh auth status 2>&1 >/dev/null); then authed=1
+        if (cd "$ROOT" && "$mise_bin" exec -- gh auth status >/dev/null 2>&1); then authed=1
         else
+          # only /rate_limit is read again: gh auth status prints a generic login failure, not GitHub's
+          # answer (gh at its pin, pkg/cmd/auth/status/status.go:121-150 and :500-511)
           spent=$(landing_budget) || spent=""
-          # GitHub's own answer outranks /rate_limit, as scripts/land reads it (its spent_budget)
-          if [ -z "$spent" ]; then
-            case "$aerr" in *"secondary rate limit"*) ;;
-              *"rate limit"*|*"HTTP 429"*) spent="GitHub answered gh's check that a rate limit was exceeded, and the reset is unknown" ;;
-            esac
-          fi
         fi
       fi
     fi

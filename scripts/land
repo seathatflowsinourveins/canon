@@ -125,9 +125,11 @@ if git remote get-url origin >/dev/null 2>&1; then
   remote=origin
   # a spent budget fails gh's own check too, so it is read first and named, never called a sign-out
   if spent=$(spent_budget); then die "$spent, so nothing was landed; run this again after then"; fi
-  if ! aerr=$(gh auth status 2>&1 >/dev/null); then
-    # the budget can run out between the read above and gh's own check, which then fails as a sign-out would
-    if spent=$(spent_budget "$aerr"); then die "$spent, so nothing was landed; run this again after then"; fi
+  if ! gh auth status >/dev/null 2>&1; then
+    # the budget can run out between the read above and gh's own check, which then fails as a sign-out would.
+    # Only /rate_limit is read again: gh auth status prints a generic login failure, not GitHub's answer
+    # (gh at its pin, pkg/cmd/auth/status/status.go:121-150 and :500-511), so its words are not read.
+    if spent=$(spent_budget); then die "$spent, so nothing was landed; run this again after then"; fi
     die "this repository has an origin remote, but gh is not signed in or cannot reach GitHub, so nothing was landed. Sign in with: mise exec -- gh auth login (check with: mise exec -- gh auth status), then run this again"
   fi
   GH_IN_USE=1
@@ -542,8 +544,10 @@ answer=$(gh api -X POST "repos/{owner}/{repo}/statuses/$sha" -f state=success -f
 # The ruleset also requires the hosted workflow's aggregating job, which runs the same script on GitHub's
 # runners. Both merge calls name the commit that was checked, so GitHub refuses to merge anything else,
 # and give the squash commit the subject and message checked above, so text edited on GitHub does not
-# reach main. If every requirement is already met the first one merges; otherwise auto-merge is switched
-# on. Either way this script waits until GitHub reports the pull request merged, so landing stays one
+# reach main. If every requirement is already met the first one merges; otherwise auto-merge is asked
+# for, which gh also turns into a merge at once when the pull request has meanwhile become mergeable
+# (gh at its pin, pkg/cmd/pr/merge/merge.go:593), so its zero exit shows the request accepted, not
+# auto-merge armed. Either way this script waits until GitHub reports the pull request merged, so landing stays one
 # command that ends with main updated.
 subject="$title"
 case "$title" in *" (#$num)") ;; *) subject="$title (#$num)" ;; esac
@@ -554,7 +558,7 @@ elif spent=$(spent_budget "$err" strict); then
   # a merge refused on a rate limit is not retried as auto-merge, which would meet the same limit
   GH_IN_USE=0; die "signed off, but GitHub refused the merge of $url: $err; $spent. Nothing was merged by that call, and the pull request's state was not read; run this again after the reset"
 elif err_auto=$(gh pr merge "$num" --auto "${merge[@]}" 2>&1 >/dev/null); then
-  auto=1; note "signed off; waiting for the hosted checks on $url"
+  auto=1; note "signed off; auto-merge requested; waiting for the hosted checks on $url"
 else
   die "signed off, but GitHub would neither merge nor enable auto-merge on $url. It said: ${err:-nothing} / ${err_auto:-nothing}"
 fi
@@ -566,7 +570,7 @@ unread() {
   spent=$(spent_budget "$1" strict) || return 0
   GH_IN_USE=0
   if [ "$auto" -eq 1 ]; then
-    die "auto-merge is on for $url, so GitHub merges it when the checks pass, but whether it has cannot be read: $spent. After the reset: git fetch origin main:main"
+    die "GitHub accepted the auto-merge request for $url; whether it has merged cannot be read: $spent. After the reset: git fetch origin main:main"
   fi
   die "GitHub accepted the merge of $url, but whether it is merged cannot be read: $spent. After the reset: git fetch origin main:main"
 }
@@ -586,7 +590,7 @@ while :; do
     || unread "$(cat "$tmpd/err")"
   [ -z "$failed" ] || die "a required check failed on $url: $failed. Push a fix to $branch and land again."
   if [ "$waited" -ge "$limit" ]; then
-    [ "$auto" -eq 1 ] && die "$url is not merged after ${limit}s. Auto-merge is on, so GitHub merges it when the checks pass; then run: git fetch origin main:main"
+    [ "$auto" -eq 1 ] && die "$url is not merged after ${limit}s. GitHub accepted the auto-merge request, so it merges when the checks pass; then run: git fetch origin main:main"
     die "GitHub accepted the merge of $url but has not marked it merged after ${limit}s; look at the pull request"
   fi
   sleep "$poll"; waited=$((waited + (poll > 0 ? poll : 1)))
