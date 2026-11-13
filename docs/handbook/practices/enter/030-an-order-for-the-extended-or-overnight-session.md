@@ -1,0 +1,1 @@
+* An order for the extended or overnight session is a DAY or GTC limit marked through the submit's `extended_hours` param; any other order so marked is denied, and an unmarked order waits for the next regular session (ADR 0038).

@@ -1572,7 +1572,9 @@ EOF
   # records at every run's start, before the switch is read, and records and logs after a window, whatever its
   # exit, which the task still returns. SUV is the
   # stand-in window: it notes whether an earlier record was already kept when it started, writes a record, a
-  # record by hand, a log, a record and a log over 1 MB and a heartbeat, and ends 3.
+  # record by hand, a log, a record over 1 MB, a log over 1 MB of the same error line and a heartbeat, and
+  # ends 3. A log over 1 MB is truncated, its first and last parts with a line naming the bytes and lines left
+  # out, never dropped silently; a log at or under it is kept whole (2026-11-13).
   # Its start-up step (uv's sync, `uv run ... /usr/bin/true`) takes 2 s, as a loaded machine's can: the checks
   # below hold whatever the load, under sched's start-up bound (a refusal for time is its own case, after).
   # shellcheck disable=SC2016  # the stand-in's own text, expanded when it runs
@@ -1580,16 +1582,21 @@ EOF
 while [ $# -gt 0 ]; do [ "$1" != --log-dir ] || d=$2; shift; done
 [ ! -e "$CLAUDE_CONFIG_DIR/canon/watch/windows/window-0.json" ] || echo yes > "$d/../kept-at-start"
 mkdir -p "$d/by-hand"; echo r > "$d/window-1.json"; echo h > "$d/by-hand/window-2.json"; echo l > "$d/window-1.log"; echo f > "$d/last-firing.json"
-dd if=/dev/zero of="$d/window-3.json" bs=1024 count=1100 2>/dev/null; dd if=/dev/zero of="$d/window-3.log" bs=1024 count=1100 2>/dev/null
+dd if=/dev/zero of="$d/window-3.json" bs=1024 count=1100 2>/dev/null
+seq 1 20000 | sed "s/^/ERROR start-up flood: connection reset by peer, the same line again, number /" > "$d/window-3.log"
 exit 3'
   mkdir -p "$TMP/schedule-keep/canon-paper-session"; echo o > "$TMP/schedule-keep/canon-paper-session/window-0.json"
   SUV=$win sched keep - free by-hand --session regular --minutes 25
   # shellcheck disable=SC2034  # read by the eval'd checks
   KW="$SD/config/canon/watch/windows"
+  # shellcheck disable=SC2034  # read by the eval'd checks
+  { big="$SD/canon-paper-session/window-3.log"; bsize=$(( $(wc -c < "$big") )); blines=$(( $(wc -l < "$big") )); }
   check "a window's records are kept outside the temp folder: its record, the one by hand and its log, and a record whatever its size" \
         eval '[ "$(cat "$KW/window-1.json")" = r ] && [ "$(cat "$KW/by-hand/window-2.json")" = h ] && [ "$(cat "$KW/window-1.log")" = l ] && [ "$(wc -c < "$KW/window-3.json")" -gt 1048576 ]'
-  check "... a log over 1 MB and the heartbeat are not, and the task's exit code is the window's (3)" \
-        eval '[ "$src" = 3 ] && [ ! -e "$KW/window-3.log" ] && [ ! -e "$KW/last-firing.json" ] && [ -s "$SD/canon-paper-session/window-3.log" ]'
+  check "a log over 1 MB is never dropped silently: its first and last lines are kept, under the limit, and the task's exit code is the window's (3)" \
+        eval '[ "$src" = 3 ] && [ ! -e "$KW/last-firing.json" ] && [ -s "$big" ] && [ -s "$KW/window-3.log" ] && [ "$(wc -c < "$KW/window-3.log")" -lt 1048576 ] && [ "$(head -n 1 "$KW/window-3.log")" = "$(head -n 1 "$big")" ] && [ "$(tail -n 1 "$KW/window-3.log")" = "$(tail -n 1 "$big")" ]'
+  check "... and a line between them names its bytes and lines, and the bytes and lines left out" \
+        eval 'grep -q "^paper:session: window-3.log: $bsize bytes, $blines lines; over the 1 MB limit, kept its first and last 512000 bytes, $(( bsize - 1024000 )) bytes and $(( blines - $(head -c 512000 "$big" | wc -l) - $(tail -c 512000 "$big" | wc -l) )) lines left out\$" "$KW/window-3.log" && [ "$(stat -f %Lp "$KW/window-3.log" 2>/dev/null || stat -c %a "$KW/window-3.log")" = 644 ]'
   check "... and what an earlier run left was kept before the window started" eval '[ -e "$SD/kept-at-start" ] && [ "$(cat "$KW/window-0.json")" = o ]'
   mkdir -p "$TMP/schedule-keep-off/canon-paper-session/window-0.json.d" "$TMP/schedule-keep-off/canon-paper-session/by-hand"
   echo o > "$TMP/schedule-keep-off/canon-paper-session/by-hand/window-0.json"; echo l > "$TMP/schedule-keep-off/canon-paper-session/window-0.log"
@@ -1600,6 +1607,8 @@ exit 3'
   SUV=$win sched keep-fail - free by-hand --session regular --minutes 25
   check "records that cannot be kept (no folder can be made): said by name, the exit code still the window's, the records where they were" \
         eval '[ "$src" = 3 ] && grep -q "^paper:session: the window records could not be copied to $SD/config/canon/watch/windows" "$SD/out" && [ -s "$SD/canon-paper-session/window-1.json" ]'
+  check "... and the log over 1 MB that cannot be kept is named on stderr with its size, still in the temp folder, the exit code the window's" \
+        eval '[ "$src" = 3 ] && grep -q "^paper:session: window-3.log ([0-9]* bytes) could not be kept in $SD/config/canon/watch/windows; it is still in $SD/canon-paper-session" "$SD/out" && [ -s "$SD/canon-paper-session/window-3.log" ]'
   check "from a terminal the window is still exec'd, so a signal reaches uv and the window as before the copy" \
         eval 'grep -Eq "^    exec uv run --locked .* python -m canon_trading\.session_window " <<<"$(task_part paper:session run)"'
   RUN_OUT=""  # the cases below are not sched's

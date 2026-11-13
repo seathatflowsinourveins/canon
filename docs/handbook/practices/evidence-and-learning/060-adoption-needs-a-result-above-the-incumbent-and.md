@@ -1,0 +1,1 @@
+* Adoption needs a result above the incumbent and above holding flat at doubled costs, otherwise the incumbent stays and the negative is recorded; not yet built (roadmap step 7; ADR 0083's adoption test).
