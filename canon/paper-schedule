@@ -1,4 +1,4 @@
-off
+mover
 # The paper schedule's switch (ADR 0050). The first line is the value; the rest is this note.
 #   off    a scheduled firing skips by name and places nothing
 #   mover  a scheduled firing runs only with --mover among its arguments, and is refused by name without

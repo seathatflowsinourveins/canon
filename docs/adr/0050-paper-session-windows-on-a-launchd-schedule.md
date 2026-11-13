@@ -241,6 +241,16 @@ row keeps the label of the last window's record; and a skip's heartbeat names no
 `running` reads as died only once it is stale, as after a runner's own failure.
 The first firing launchd started after the landing, at 20:52:21 UTC on 2026-11-11 from the main of that
 minute, skipped by name with its heartbeat written; the installed plist was still the one without `--mover`.
+**Turned on (2026-11-13).** The owner directed on 2026-11-13 that account B be in a window whenever Alpaca's
+clock says a session is open, with no lane holding a timer for it, and that a proof take its turn through
+account B's lock. Main's value is `mover` from this change, which #289 had set to `off` on 2026-11-12 until the
+universe landed. Nothing is installed with it: the plist `scripts/automation` writes already fires every 600 s
+with `--session auto --minutes 25 --mover --regular-strategy Mover`, and each firing reads the switch from the
+main it clones. It lands after the per-symbol trail became the Mover window's default, so a scheduled window,
+which passes no trail flag, runs that default. A run by hand waits for account B's lock as a firing does, and
+`paper:session` skips a window that would start within 60 s of the last one's end. A firing launchd starts
+after this landing is UNVERIFIED until the first one. Limit: ADR 0093's history load takes no account lock, so
+with the schedule on it runs on account A, not B.
 **The records kept (2026-11-11).** A window's records and logs are written only under the per-user temporary
 folder, which a restart empties (whether the system also clears it while running is UNVERIFIED). `paper:session`
 therefore copies them with macOS's `/usr/bin/rsync` into `<config>/canon/watch/windows/`, beside the runner's
