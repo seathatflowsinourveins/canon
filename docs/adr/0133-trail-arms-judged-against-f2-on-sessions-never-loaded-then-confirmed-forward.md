@@ -139,6 +139,13 @@ at other bars than F2, so their entries do not pair one to one. The lead accepte
   warms. A cold opening entry takes the fixed plan (`mover.py:4245-4258`); `_warm_tighten` re-selects a
   cold holding's trail once and keeps the cold plan when the re-selection is tier (`:4496-4545`, `:4523`).
   A calibration question.
+* **Open, judged by the replay** (the lead's ruling of 2026-11-13, 03:25): whether a cross-dollar entry
+  should be sized up to use the whole planned loss. An entry whose stop crosses a dollar, and whose
+  rounded-down distance L already clears the floor, is sized at the price less its sub-dollar stop but
+  protected at the shorter L on the entry's step, so it risks less than planned. Sizing up would reverse
+  the rule the A3+O unit's test pins (`test_l_is_held_on_the_entrys_step_where_the_stop_crosses_a_dollar`,
+  `tests/test_mover_sizing.py`, at `99781e0a`, not on `main` when this was written); the finding is a
+  second reader's P2 on that unit. A calibration question.
 
 ### Consequences
 
