@@ -240,6 +240,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from alpaca.common.constants import DEFAULT_RETRY_ATTEMPTS
+from canon_alpaca.data import bar_interval_ns
 from canon_alpaca.providers import TRADING_API
 from canon_alpaca.providers import request_counts
 from nautilus_trader.config import StrategyConfig
@@ -1455,6 +1456,15 @@ def bar_opened_ns(bar: Bar) -> int:
     return bar.ts_init - 60 * SECOND_NS if bar.bar_type.is_internally_aggregated() else bar.ts_event
 
 
+def bar_closed_ns(bar: Bar) -> int:
+    """When a bar's interval ended: an INTERNAL bar's ts_init, an adapter EXTERNAL bar's ts_event plus
+    its own interval (`canon_alpaca.data.parse_bar`'s rule, by `bar_interval_ns`). A streamed EXTERNAL
+    bar is received after this, so its receipt time can follow a fill its close preceded."""
+    if bar.bar_type.is_internally_aggregated():
+        return bar.ts_init
+    return bar.ts_event + bar_interval_ns(bar.bar_type)
+
+
 def opening_ended(
     states: dict[InstrumentId, OpeningState], outcomes: dict[str, int], event: Any, outcome: str
 ) -> None:
@@ -1682,6 +1692,10 @@ class Slot:
     run_seen_ns: int | None = None
     """When the node had the bar that completed the run (its `ts_init`): the qualifying market event as
     the strategy can know it, from which an entry's delay is measured (`mover_window.entry_diagnostics`)."""
+    run_closed_ns: int | None = None
+    """When the minute of the run's close ended (`bar_closed_ns`): its close is the last trade before
+    then, so a re-entry compares this, not the receipt time, with the sale fill (the batch A head
+    reader, A-2 and A-3, 2026-11-13)."""
     run_arm: str | None = None
     """Only the opening candidate sets this; the off path preserves existing records."""
     entry_id: ClientOrderId | None = None
@@ -2388,7 +2402,7 @@ class Mover(Strategy):
         if self.settings.opening_arm == "on":
             if slot.run_arm == "opening":
                 # A run not decided on before this bar stays opening-only, never a bridge run.
-                slot.run_ns = slot.run_close = slot.run_seen_ns = None
+                slot.run_ns = slot.run_close = slot.run_seen_ns = slot.run_closed_ns = None
             slot.run_arm = None
             self._sync_opening(slot, bar.ts_init)
             self._observe_opening(slot, bar)
@@ -2411,7 +2425,7 @@ class Mover(Strategy):
         row = slot.exit_record
         if (
             state is not None
-            and bar.ts_init > state.sale_ns
+            and bar_closed_ns(bar) > state.sale_ns  # a close after the sale (A-2)
             and (row is None or row.filled >= row.quantity)
         ):
             state.observe(
@@ -2427,6 +2441,7 @@ class Mover(Strategy):
             # Turn's k and VWAP's crossing replace the first entry's rising-run length; the entry
             # check still enforces state, ranking, eligibility, free slots and request budget.
             slot.run_ns, slot.run_close, slot.run_seen_ns = bar.ts_event, close, bar.ts_init
+            slot.run_closed_ns = bar_closed_ns(bar)
             self._opening_run(slot, bar)  # name sale refusals without replacing the re-entry run
             return
         rising = 0  # the closes in a row, to this one, each above the one before
@@ -2437,6 +2452,7 @@ class Mover(Strategy):
         wanted = self.settings.run_bars
         if rising >= wanted:
             slot.run_ns, slot.run_close, slot.run_seen_ns = bar.ts_event, close, bar.ts_init
+            slot.run_closed_ns = bar_closed_ns(bar)
             self._say(f"{slot.instrument_id}: run qualified, {wanted} rising closes to {close}")
         elif before is not None and rising == 0:
             self._say(f"{slot.instrument_id}: run restarted, {close} is not above {before}")
@@ -2568,13 +2584,14 @@ class Mover(Strategy):
             bar.close.as_decimal(),
             bar.ts_init,
         )
+        slot.run_closed_ns = bar_closed_ns(bar)
         slot.run_arm = "opening"
 
     def _registered_run(self, slot: Slot, bar: Bar) -> None:
         """Use the study's listing clock, rising run and extension rule on this bar's known prefix."""
         from . import early_entry_study as entry_study
 
-        slot.run_ns = slot.run_close = slot.run_seen_ns = None
+        slot.run_ns = slot.run_close = slot.run_seen_ns = slot.run_closed_ns = None
         arm = self.settings.entry_arm
         rows = entry_study.ARMS[arm]
         if slot.instrument_id in self.sold and self.settings.reentry_arm == "turn":
@@ -2648,6 +2665,7 @@ class Mover(Strategy):
                 bar.close.as_decimal(),
                 bar.ts_init,
             )
+            slot.run_closed_ns = bar_closed_ns(bar)
             self._say(f"{slot.instrument_id}: entry arm {arm}: run qualified at {slot.run_close}")
 
     def _wind_down(self, event: TimeEvent) -> None:  # the alert only marks it; the step acts
@@ -3301,7 +3319,15 @@ class Mover(Strategy):
             slot.observed_ns = 0
             slot.entry_id = slot.protect_id = None
             slot.entry_cancel_ns = slot.priced_ns = 0
-            slot.run_ns = slot.run_close = slot.run_seen_ns = None
+            if (
+                self.settings.reentry_arm == "clock"
+                or slot.run_closed_ns is None
+                or slot.run_closed_ns <= filled_ns
+            ):
+                # a state arm's run whose minute ended after the final fill is a close after the
+                # sale: it is kept for this step's entry check (the batch A head reader, A-3); the
+                # clock arm compares no close with the fill, so its run is cleared as before
+                slot.run_ns = slot.run_close = slot.run_seen_ns = slot.run_closed_ns = None
             slot.trail_plan = slot.initial_trail = None
             slot.ratcheted, slot.tightened, slot.entry_record = False, False, None
             slot.profile_evaluated_ns = None
@@ -3973,7 +3999,7 @@ class Mover(Strategy):
                 # new keyword sent through a replay subclass's _buy or _refusal override. A run is
                 # decided on once: its fields are cleared after the decision, so `_refusal` reads them.
                 slot.run_arm = None
-                slot.run_ns = slot.run_close = slot.run_seen_ns = None
+                slot.run_ns = slot.run_close = slot.run_seen_ns = slot.run_closed_ns = None
             if why is not None:
                 if not isinstance(why, Refused):  # already a row of `refusals` (record rule 1)
                     self.dropped.append(f"{slot.instrument_id}: {why}")
@@ -4024,7 +4050,10 @@ class Mover(Strategy):
                     return f"its run closed at {run_close}, not above the sale at {sold_px}"
             else:
                 filled_ns = self.sold_fill_ns.get(slot.instrument_id, sold_ns)
-                if seen is not None and seen <= filled_ns:
+                # the minute's end, not its receipt: a streamed close received after the fill can
+                # still precede it (the batch A head reader, A-2)
+                closed = slot.run_closed_ns if slot.run_closed_ns is not None else seen
+                if closed is not None and closed <= filled_ns:
                     return "its qualifying close preceded the sale fill"
                 state = self.reentry_states.get(slot.instrument_id)
                 if settings.reentry_arm == "reclaim":

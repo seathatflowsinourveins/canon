@@ -682,7 +682,7 @@ class BarsReplayMover(Mover):
             self.cancel_all_orders(identifier)
             self.close_all_positions(identifier)
         for slot in self.slots.values():
-            slot.run_ns = slot.run_close = None
+            slot.run_ns = slot.run_close = slot.run_seen_ns = slot.run_closed_ns = None
 
     def _flush_pending(self) -> None:
         if not self.pending:
