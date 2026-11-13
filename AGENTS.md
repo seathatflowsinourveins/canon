@@ -136,7 +136,8 @@ be used within these limits (ADR 0021):
   commits, lands, pushes, installs anything, runs paper tests or reads a credential; the Claude lane
   that reproduces its tests commits it, runs the review ADR 0017 requires and lands it (ADR 0079). The build eval (ADR 0057) is
   the measure that keeps or retires it. A reviewer may be Codex (`--agent codex`),
-  Muse Code (`--agent muse`) or Antigravity (`--agent antigravity`); DeepSeek Harness (`--agent dsh`) may
+  Muse Code (`--agent muse`; deferred by the owner on 2026-11-13, so none is started) or Antigravity
+  (`--agent antigravity`); DeepSeek Harness (`--agent dsh`) may
   stand in like Antigravity once `scripts/bootstrap --check` shows its review patch ok (ADR 0043, ADR 0045).
 * A reviewer reads a change and reports findings. It never edits, commits, pushes, lands, runs paper tests
   or reads a credential. Orca pre-fills a bypass flag for Codex, Muse and Antigravity, so they run with
@@ -153,7 +154,8 @@ be used within these limits (ADR 0021):
   `.claude/rules/dispatch-practices.md`). For a change on
   the paths that get `/code-review` at high effort, the coordinator creates the review as a task that
   depends on the build (`task-create --deps`) and starts it when `task-list --ready` shows it and the
-  change is on `main`: Codex and Muse there, Antigravity in place of either. The owning lane reproduces
+  change is on `main`: Codex and Muse there, Antigravity in place of either (Antigravity in Muse's place
+  while Muse is deferred, 2026-11-13). The owning lane reproduces
   each finding, by a failing test where one can show it, and fixes forward, crediting the second reader.
 * A non-Claude runtime may reach GPT and other providers through OmniRoute, a local gateway on 127.0.0.1
   installed and started on request (`mise -E gateway run omniroute:serve`); Codex through it is
