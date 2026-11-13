@@ -3268,29 +3268,30 @@ class Mover(Strategy):
             # Raised from the step timer this would stop every slot; it is named and retried next step.
             self._note(slot, str(error))
             return
+        # the stop held while no price was followed, read before `_end_hold` clears it: the remade sell
+        # keeps it as it keeps a reached trigger (xr7-r-heldl, P1)
+        held_level = None if slot.held_stop is None else stop_trigger_price(slot.held_stop)
         if slot.held_since is not None:
             self._end_hold(slot, now, "trail")
         # the reached trigger on Alpaca's step, one value for the check below and for the remade sell
         reached = slot.trail_trigger
         kept = None if reached is None else stop_trigger_price(reached)
         origin = None if reached is None else f"reached {reached}"
+        met = "retained trigger"
+        if held_level is not None and (kept is None or held_level > kept):
+            kept, origin, met = held_level, f"held stop {held_level}", "held stop (retained)"
         anchor = fill_trigger(bought, slot.sized_loss)
         if anchor is not None and (kept is None or anchor > kept):
             # L under the average fill, rounded up onto the step so a share never loses more than L;
             # the emulator then moves the trigger only up from it (`crates/execution/src/trailing.rs:61`,
-            # `:100`), and a remade sell keeps the higher of it and the trigger reached
+            # `:100`), and a remade sell keeps the higher of it, the trigger reached and the held stop
             kept, origin = anchor, f"{slot.sized_loss} under the fill {bought}"
+            # with no higher retained level, the stop L under the fill is met as the sale is armed
+            met = "trailing stop (L under the fill, met when armed)"
         if kept is not None and at <= kept:
-            # the market is at the trigger the canceled sell had reached: its sale is due now
+            # the market is at the trigger the canceled sell had reached, or the stop held: the sale
+            # is due now
             slot.exiting, slot.trail_trigger, slot.trail_limit = True, None, None
-            # a reached trigger is retained; with none, or with L under the fill above it, the stop L
-            # under the fill is met as the sale is armed
-            retained = reached is not None and kept == stop_trigger_price(reached)
-            met = (
-                "retained trigger"
-                if retained
-                else "trailing stop (L under the fill, met when armed)"
-            )
             self._mark_exit(slot, now, at, met)
             self._say(
                 f"{slot.instrument_id}: at {at}, the trigger {kept} ({origin}) is met; "
