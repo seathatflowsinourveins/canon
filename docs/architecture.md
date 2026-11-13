@@ -133,7 +133,8 @@ locally on the data client's live data; nothing in `src/` builds one yet (ADR 00
   streams and a streaming `paper:data` run also take account A's stream lock, and a window account B's (`mise.toml`, ADR 0029, ADR 0044,
   ADR 0069, ADR 0070). Account C's, service `canon-alpaca-paper-protect`, is read only by
   `mise run paper:account protect`, GET only, and by `mise run paper:protect protect` under C's own
-  lock, the one task that sends on C: a trailing stop for a long it finds (ADR 0114, ADR 0142).
+  lock, the one task that sends on C: a trailing stop for a long it finds, or with `--cancel` the
+  cancel of such a stop (ADR 0114, ADR 0142).
   Each pair is checked against the paper API before it is stored (ADR 0033).
 * **A session window** holds a position of at most one share: `PositionCap` reads the portfolio every second
   inside the node and shuts the system down over it; the window starts flat, ends flat or fails, and lasts
@@ -162,9 +163,9 @@ locally on the data client's live data; nothing in `src/` builds one yet (ADR 00
   `scripts/canon resolve` writes the commits to the lock (ADR 0001).
 * **Records.** Decisions are MADR 4.0.0 with an Evidence section and a `review-by` date, re-verified
   after it (ADR 0002); `scripts/canon lint` checks them.
-* **One check.** `scripts/ci` runs every check at landing and on GitHub; on every commit, through
-  `.githooks/pre-commit`, it runs the checks that take seconds and leaves the rest to the landing (ADR 0013,
-  ADR 0138).
+* **One check.** `scripts/ci` runs every check on GitHub; on every commit, through `.githooks/pre-commit`,
+  and at landing, before the push, it runs the checks that take seconds (at landing with a secret scan of
+  the whole history) and leaves the rest to GitHub's required check (ADR 0013, ADR 0138, ADR 0144).
 * **Landing.** `scripts/land` runs the check and squash-merges the branch; a change outside a named few
   needs a review note, recorded as the `review` status (ADR 0014, ADR 0017, ADR 0019).
   A trading path leaves the review loop after two rounds with no finding that changes behaviour (ADR 0073;

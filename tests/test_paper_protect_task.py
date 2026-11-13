@@ -4,10 +4,12 @@ What it shows (ADR 0142): with one share held and `no_shorting` false, plan-only
 row and sends nothing; the run that sends under the fixed row F2 leaves one trailing stop Alpaca holds for
 the share, `GTC`, marked `sell_to_close`, of the protect lineage, at a distance not under Alpaca's smallest
 trail; while it rests Alpaca shows no share of the holding free; a second run sends nothing and names the
-long as covered. What it does not show: a stop for more shares than are held, and how a `GTC` trailing
-stop elects, or holds its shares, at a later open.
+long as covered; the task's own cancel (`--cancel`) then names the stop plan-only, cancels it, and Alpaca
+shows the share free again. What it does not show: a stop for more shares than are held, and how a `GTC`
+trailing stop elects, or holds its shares, at a later open.
 
-ADR 0111's form: the setting goes off and comes back inside this one run, restored in a `finally`. It runs
+ADR 0111's form: the setting goes off and comes back inside this one run, restored whatever its body did
+(`_finish`). It runs
 only when a paper key pair is in the environment, `CANON_PAPER_PROTECT_TASK=1` asks for it and the paper
 runner's own marker is there, so a routine `mise run paper:test` skips it. Run it alone, in the regular
 session, on account A:
@@ -31,8 +33,8 @@ refuses a sell beyond the holding (ADR 0111), the one share is sold if it is sti
 is read flat. Each step is tried whatever the one before it did, and whatever is left is named. No order
 ID, account number or price is printed.
 
-A limit: the cleanup is a `finally`, and the paper runner ends a run past its deadline, or one it is told
-to stop, with a KILL, which runs no `finally`. The stop is `GTC` and would then stay with its share and
+A limit: the cleanup runs in this process, and the paper runner ends a run past its deadline, or one it is
+told to stop, with a KILL, which runs none of it. The stop is `GTC` and would then stay with its share and
 the setting off, and `paper:close` does not cancel a protect stop. So the test starts only with
 `DEADLINE_ROOM_SECS` left of the runner's deadline, and prints what to do by hand before its first send.
 """
@@ -112,8 +114,37 @@ def _open_orders(trading: Any) -> list[Any]:
     return list(trading.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=500)))
 
 
+def _working(trading: Any) -> list[Any]:
+    """The listed open orders whose own read does not show them ended. Alpaca's open-orders listing
+    can still show an order a second after it filled or was canceled (seen on paper, 2026-11-13: this
+    test's own filled buy), so the body's checks of what is working go by each order's own read. One
+    still listed though ended is printed with the status the listing gave it."""
+    working = []
+    for order in _open_orders(trading):
+        own = trading.get_order_by_id(order.id)
+        if _status(own) in ENDED:
+            print(
+                f"listed as open though ended: listed {_status(order)}, its own read {_status(own)}"
+            )
+        else:
+            working.append(own)
+    return working
+
+
 def _held(trading: Any) -> dict[str, Decimal]:
-    return {p.symbol: Decimal(str(p.qty)) for p in trading.get_all_positions()}
+    """Each position signed by its side (`session_window.positions`): alpaca-py's `Position` carries
+    the side apart from the count, so a short may list a positive quantity."""
+    return session_window.positions(trading)
+
+
+SENT: list[str] = []
+"""The client order ID of each order `_market` sent, kept before its submit: an interrupt during the
+submit loses the answer, and the cleanup reads each ID itself."""
+
+
+def _by_client_id(trading: Any, client_order_id: str) -> Any:
+    """The order of that ID, or None when Alpaca shows none (`custody._look_up`)."""
+    return custody._look_up(trading, client_order_id)
 
 
 def _until(read: Any, wanted: Any) -> Any:
@@ -139,28 +170,43 @@ def _market(trading: Any, side: OrderSide, label: str, intent: PositionIntent | 
         position_intent=intent,
         client_order_id=client_order_id,
     )
+    SENT.append(client_order_id)
     try:
         with custody._sending_once(trading):
             trading.submit_order(request)
     except APIError as e:
         if e.status_code in (403, 422):
+            SENT.remove(client_order_id)  # refused: there is no such order to look for
             raise AssertionError(f"{label}: refused by Alpaca, HTTP {e.status_code}") from None
         print(f"{label}: answer lost (HTTP {e.status_code}); looking the order up")
     except OSError as e:
         print(f"{label}: answer lost ({type(e).__name__}); looking the order up")
 
-    def read() -> Any:
-        try:
-            return trading.get_order_by_client_id(client_order_id)
-        except APIError as e:
-            if e.status_code == 404:
-                return None
-            raise
-
-    order = _until(read, lambda found: found is not None and _status(found) in ENDED)
+    order = _until(
+        lambda: _by_client_id(trading, client_order_id),
+        lambda found: found is not None and _status(found) in ENDED,
+    )
     assert order is not None, f"{label}: never showed at Alpaca; it may yet show working"
     print(f"{label}: {_status(order)}, filled {order.filled_qty}")
     return order
+
+
+def _cancel_and_wait(trading: Any, order: Any, problems: list[str]) -> None:
+    """One cancel, sent once, then the order's own read until it has ended."""
+    try:
+        with custody._sending_once(trading):
+            trading.cancel_order_by_id(order.id)
+    except APIError as e:
+        if e.status_code not in (404, 422):  # gone, or no longer cancelable: the read decides
+            problems.append(f"a cancel failed, HTTP {e.status_code}")
+    ended = _until(
+        lambda: trading.get_order_by_id(order.id),
+        lambda found: _status(found) in ENDED,
+    )
+    if _status(ended) not in ENDED:
+        problems.append(f"an order did not end after its cancel: {_status(ended)}")
+    else:
+        print(f"cleanup: one {_status(ended)} order, filled {ended.filled_qty}")
 
 
 def _cancel_ours(trading: Any, problems: list[str]) -> None:
@@ -174,20 +220,38 @@ def _cancel_ours(trading: Any, problems: list[str]) -> None:
         if order.symbol != SYMBOL or not ours:
             problems.append(f"an order this run did not send is open: {custody.describe(order)}")
             continue
+        _cancel_and_wait(trading, order, problems)
+
+
+def _cancel_sent(trading: Any, problems: list[str]) -> None:
+    """Each order this run sent, by the ID kept before its submit: the listing can lag an order by a
+    second, and an interrupted submit kept no answer. Each is its own attempt, whatever the listing or
+    another order did; one that could not be read or canceled is named with its ID."""
+    for client_order_id in SENT:
         try:
-            with custody._sending_once(trading):
-                trading.cancel_order_by_id(order.id)
-        except APIError as e:
-            if e.status_code not in (404, 422):  # gone, or no longer cancelable: the read decides
-                problems.append(f"a cancel failed, HTTP {e.status_code}")
-        ended = _until(
-            lambda order=order: trading.get_order_by_id(order.id),
-            lambda found: _status(found) in ENDED,
-        )
-        if _status(ended) not in ENDED:
-            problems.append(f"an order did not end after its cancel: {_status(ended)}")
-        else:
-            print(f"cleanup: one {_status(ended)} order, filled {ended.filled_qty}")
+            order = _by_client_id(trading, client_order_id)
+            if order is None:
+                problems.append(
+                    f"{client_order_id} ({SYMBOL}) does not show at Alpaca, and may yet"
+                )
+            elif _status(order) not in ENDED:
+                _cancel_and_wait(trading, order, problems)
+        except BaseException as e:  # noqa: BLE001 - the next kept ID is still tried; this one is named
+            problems.append(
+                f"{client_order_id} ({SYMBOL}) could not be read or canceled "
+                f"({type(e).__name__}); it may yet show working"
+            )
+
+
+def _bought(trading: Any) -> Decimal:
+    """The shares this run's own market orders bought less those they sold, by each order's own read."""
+    net = Decimal(0)
+    for client_order_id in SENT:
+        order = _by_client_id(trading, client_order_id)
+        if order is not None:
+            filled = Decimal(str(order.filled_qty or 0))
+            net += filled if getattr(order.side, "value", order.side) == "buy" else -filled
+    return net
 
 
 def _clean(trading: Any, problems: list[str]) -> None:
@@ -196,6 +260,9 @@ def _clean(trading: Any, problems: list[str]) -> None:
 
     def cancel() -> None:
         _cancel_ours(trading, problems)
+
+    def cancel_sent() -> None:
+        _cancel_sent(trading, problems)
 
     def restore() -> None:
         if not _set_no_shorting(trading, True) and not _set_no_shorting(trading, True):
@@ -208,7 +275,17 @@ def _clean(trading: Any, problems: list[str]) -> None:
         if not _no_shorting(trading):
             problems.append("the share is not sold: the account is not long-only, see above")
             return
-        held = _held(trading).get(SYMBOL, Decimal(0))
+        bought = _bought(trading)
+        held = _until(
+            lambda: _held(trading).get(SYMBOL, Decimal(0)),
+            lambda found: found != 0 or bought <= 0,
+        )
+        if bought > 0 and held == 0:
+            problems.append(
+                f"this run's orders filled {bought} {SYMBOL} and no position of it shows after "
+                f"{WAIT_SECS} reads (a stop that elected may have sold it): "
+                "mise run paper:account tests"
+            )
         if held < 0:
             problems.append(f"A SHORT of {-held} {SYMBOL} is open: close it by hand")
         elif held == ONE:
@@ -228,6 +305,7 @@ def _clean(trading: Any, problems: list[str]) -> None:
 
     for name, step in (
         ("the cancel of what was sent", cancel),
+        ("the cancel of this run's own orders by their kept IDs", cancel_sent),
         ("the long-only setting's restore", restore),
         ("the close of the share", close),
         ("the final read", final),
@@ -286,6 +364,8 @@ def test_paper_protect_task_on_an_account_that_allows_shorting(capsys: Any) -> N
     assert not _held(trading), "the account holds a position at the start; nothing sent"
     assert not _open_orders(trading), "the account holds an open order at the start; nothing sent"
 
+    SENT.clear()
+
     def body() -> None:
         bought = _market(trading, OrderSide.BUY, "buy", None)
         assert _status(bought) == "filled", f"the buy did not fill: {_status(bought)}"
@@ -298,14 +378,14 @@ def test_paper_protect_task_on_an_account_that_allows_shorting(capsys: Any) -> N
         assert planned.exit_code == 0 and planned.planned, planned.lines()
         named = {row for row in protect.ROWS for line in planned.said if f"under {row}:" in line}
         assert named == set(protect.ROWS), f"plan-only left a row unnamed: {sorted(named)}"
-        assert not planned.sent and not _open_orders(trading), "plan-only sent an order"
+        assert not planned.sent and not _working(trading), "plan-only sent an order"
 
         unnamed = protect.protect_longs(trading, session_window.window_data, print)
-        assert unnamed.exit_code == 3 and not _open_orders(trading), "a send with no row went out"
+        assert unnamed.exit_code == 3 and not _working(trading), "a send with no row went out"
 
         sent = protect.protect_longs(trading, session_window.window_data, print, row=ROW)
         assert sent.exit_code == 0 and len(sent.sent) == 1, sent.lines()
-        (listed,) = _open_orders(trading)
+        (listed,) = _working(trading)
         stop = _until(
             lambda: trading.get_order_by_id(listed.id), lambda found: found.hwm is not None
         )
@@ -337,7 +417,23 @@ def test_paper_protect_task_on_an_account_that_allows_shorting(capsys: Any) -> N
         again = protect.protect_longs(trading, session_window.window_data, print, row=ROW)
         assert again.exit_code == 0 and not again.sent, again.lines()
         assert len(again.left_alone) == 1 and "fully covered" in again.left_alone[0]
-        assert len(_open_orders(trading)) == 1, "the second run sent or lost an order"
+        assert len(_working(trading)) == 1, "the second run sent or lost an order"
+
+        would = protect.cancel_stops(trading, print, SYMBOL, plan_only=True)
+        assert would.exit_code == 0 and len(would.planned) == 1, would.lines()
+        (resting,) = _working(trading)
+        assert _status(trading.get_order_by_id(resting.id)) in ("new", "accepted"), (
+            "the plan-only cancel canceled"
+        )
+        taken = protect.cancel_stops(trading, print, SYMBOL)
+        assert taken.exit_code == 0 and len(taken.sent) == 1, taken.lines()
+        assert _status(trading.get_order_by_id(resting.id)) == "canceled"
+        freed = _until(
+            lambda: Decimal(str(trading.get_open_position(SYMBOL).qty_available)),
+            lambda found: found == ONE,
+        )
+        assert freed == ONE, f"Alpaca shows {freed} of the share free after the stop's cancel"
+        print("after the task's cancel, Alpaca shows the 1 share free again")
 
     with capsys.disabled():
         print(BY_HAND)

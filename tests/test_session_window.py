@@ -8127,6 +8127,182 @@ def test_the_record_counts_the_instrument_notifications_upstream_refused_apart_f
     assert json.loads(json.dumps(asdict(report)))["instrument_refusals"] == 13_389
 
 
+def test_the_record_counts_the_node_logs_error_lines_by_kind(tmp_path) -> None:
+    """The paper window of 2026-11-13 logged thousands of ERROR lines while its record's `errors` stayed
+    empty: the end read counted only the instrument refusals, under a field nobody reads as an error. It
+    counts every ERROR line by kind now (the logger component and the message with numbers and
+    identifiers removed), keeps the top kinds with their counts and the total, and notes the total in
+    `errors`, so no record field reads no errors while the log holds any. The level is the line's own
+    field, as the adapter's stream lines read it: a WARN line quoting `[ERROR]` is no error."""
+    refusal = (
+        "2026-11-12T15:56:11.000000000Z [ERROR] B-001.nautilus_live::python::client: Client ALPACA "
+        "instrument update failed: RuntimeError: Client ALPACA command queue is full"
+    )
+    connection = (
+        "2026-11-12T15:56:12.000000000Z [ERROR] B-001.AlpacaDataClient: Connection error {code} while "
+        "reading from feed sip"
+    )
+    close = (
+        "2026-11-12T15:56:13.000000000Z [ERROR] B-001.Portfolio: Failed to close order {client_order_id}: "
+        "order not found"
+    )
+    warning = (
+        "2026-11-12T15:56:14.000000000Z [WARN] B-001.AlpacaDataClient: Alpaca said [ERROR] slow "
+        "consumer, reconnecting"
+    )
+    log = tmp_path / "window.log"
+    log.write_text(
+        "\n".join(
+            [
+                *([refusal] * 13_389),
+                connection.format(code=1006),
+                connection.format(code=1011),
+                close.format(client_order_id="canon-close-1a2b3c"),
+                close.format(client_order_id="canon-close-4d5e6f"),
+                warning,
+            ]
+        )
+        + "\n"
+    )
+    report = session_window.WindowReport("regular", "LLL", started="s")
+
+    session_window._read_stream_lines(report, log)
+
+    assert report.instrument_refusals == 13_389
+    assert report.log_error_total == 13_393
+    assert report.log_error_kinds == 3
+    assert [entry["count"] for entry in report.log_errors] == [13_389, 2, 2]
+    flood = report.log_errors[0]["kind"]
+    assert "nautilus_live::python::client" in flood and "command queue is full" in flood
+    assert "B-001" not in flood
+    connection_kind = report.log_errors[1]["kind"]
+    assert "Connection error" in connection_kind
+    assert "1006" not in connection_kind and "1011" not in connection_kind
+    close_kind = report.log_errors[2]["kind"]
+    assert "Failed to close order" in close_kind
+    assert "canon-close-1a2b3c" not in close_kind
+    assert report.errors and "13393 ERROR line(s)" in report.errors[0]
+
+    assert session_window.write_record(tmp_path, report) is None
+
+    record = json.loads((tmp_path / "latest.json").read_text())
+    assert record["log_error_total"] == 13_393 and record["log_error_kinds"] == 3
+    assert record["log_errors"][0] == {"kind": flood, "count": 13_389}
+    # No field of the record may read no errors while the log holds 13,393.
+    for name, value in record.items():
+        if name == "errors" or name.startswith("log_error"):
+            assert value, f"the record's {name} reads no errors while the log holds 13,393"
+
+
+def test_the_record_keeps_the_top_error_kinds_and_the_whole_total(tmp_path) -> None:
+    """A record keeps the top kinds, not every kind a long window may log; the total is every ERROR
+    line's, and `log_error_kinds` says how many kinds stood behind the list."""
+    names = [
+        "alpha",
+        "bravo",
+        "charlie",
+        "delta",
+        "echo",
+        "foxtrot",
+        "golf",
+        "hotel",
+        "india",
+        "juliett",
+        "kilo",
+        "lima",
+    ]
+    lines = [
+        f"2026-11-12T15:56:11.000000000Z [ERROR] B-001.Component: {name} failure"
+        for name in names
+        for _ in range(len(names) - names.index(name))
+    ]
+    log = tmp_path / "window.log"
+    log.write_text("\n".join(lines) + "\n")
+    report = session_window.WindowReport("regular", "LLL", started="s")
+
+    session_window._read_stream_lines(report, log)
+
+    assert report.log_error_kinds == 12 and report.log_error_total == 78
+    assert len(report.log_errors) == session_window.MAX_LOG_ERROR_KINDS == 10
+    assert [entry["count"] for entry in report.log_errors] == list(range(12, 2, -1))
+    assert report.log_errors[0]["kind"].endswith("alpha failure")
+    assert all("lima failure" not in entry["kind"] for entry in report.log_errors)
+
+
+def test_an_error_kind_keeps_its_components_own_id(tmp_path) -> None:
+    """A component's own ID holds a digit (`SessionMaCross-001`, `PositionCap-002`): a kind keeps it
+    whole, so two components logging one message are two kinds that each name their source, and only
+    the node's trader ID before the dot is left out (`code-review` of 2939861f, finding 1)."""
+    log = tmp_path / "window.log"
+    log.write_text(
+        "2026-11-12T15:56:11.000000000Z [ERROR] CANON-PAPER-SESSION.SessionMaCross-001: Order denied: x\n"
+        "2026-11-12T15:56:12.000000000Z [ERROR] CANON-PAPER-SESSION.PositionCap-002: Order denied: x\n"
+    )
+    report = session_window.WindowReport("regular", "LLL", started="s")
+
+    session_window._read_stream_lines(report, log)
+
+    assert sorted(entry["kind"] for entry in report.log_errors) == [
+        "PositionCap-002: Order denied: x",
+        "SessionMaCross-001: Order denied: x",
+    ]
+
+
+def test_the_errors_note_names_the_most_frequent_kind_that_is_no_instrument_refusal(
+    tmp_path,
+) -> None:
+    """The instrument refusals are a known upstream limit at every whole-market start
+    (`instrument_refusals`): the note in `errors` names the most frequent other kind, so a failed close
+    under a flood of refusals is the line a reader of `errors` meets, and a log of refusals alone says
+    so (`code-review` of 2939861f, finding 3)."""
+    refusal = (
+        "2026-11-12T15:56:11.000000000Z [ERROR] B-001.nautilus_live::python::client: Client ALPACA "
+        "instrument update failed: RuntimeError: Client ALPACA command queue is full"
+    )
+    close = (
+        "2026-11-12T15:56:13.000000000Z [ERROR] B-001.Portfolio: Failed to close order: not found"
+    )
+    log = tmp_path / "window.log"
+    log.write_text("\n".join([*([refusal] * 50), close, close]) + "\n")
+    report = session_window.WindowReport("regular", "LLL", started="s")
+
+    session_window._read_stream_lines(report, log)
+
+    assert report.log_errors[0]["count"] == 50
+    assert len(report.errors) == 1
+    assert (
+        "52 ERROR line(s)" in report.errors[0]
+        and "50 of them instrument refusals" in report.errors[0]
+    )
+    assert "Portfolio: Failed to close order: not found (2)" in report.errors[0]
+    assert "command queue is full" not in report.errors[0]
+
+    log.write_text("\n".join([refusal] * 50) + "\n")
+    alone = session_window.WindowReport("regular", "LLL", started="s")
+    session_window._read_stream_lines(alone, log)
+    assert alone.errors == [
+        "the node log holds 50 ERROR line(s) in 1 kind(s), all of them instrument refusals"
+    ]
+
+
+def test_an_error_kind_is_held_to_a_fixed_width(tmp_path) -> None:
+    """A line that carries a long payload (a response body, a list of symbols) is one kind of at most
+    `MAX_LOG_ERROR_KIND_CHARS` characters, in the record and in the note (`code-review` of 2939861f,
+    finding 6)."""
+    payload = " ".join(["word"] * 400)
+    log = tmp_path / "window.log"
+    log.write_text(f"2026-11-12T15:56:11.000000000Z [ERROR] B-001.AlpacaHttp: refused: {payload}\n")
+    report = session_window.WindowReport("regular", "LLL", started="s")
+
+    session_window._read_stream_lines(report, log)
+
+    width = session_window.MAX_LOG_ERROR_KIND_CHARS
+    assert width < len(payload)
+    assert len(report.log_errors[0]["kind"]) <= width
+    assert report.log_errors[0]["kind"].startswith("AlpacaHttp: refused: word")
+    assert len(report.errors[0]) < width + 120
+
+
 def test_a_sample_whose_stream_logs_a_reconnect_fails() -> None:
     """A reconnect drops minutes of bars: the sample fails (and `choose_mover` falls back) rather than
     rank a partial dollar volume, as `movers_stream.run` fails on what alpaca-py's stream logs."""

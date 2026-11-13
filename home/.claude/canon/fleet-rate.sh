@@ -1,12 +1,19 @@
 #!/bin/bash
 # The status line's first-line label: the session's lines added and removed, when it has changed any, then the
-# fleet's output speed, every measured worker's output tokens per second summed and how many Claude Code sessions
-# are working, e.g. "+156 -23 │ Fleet 368 tok/s · 9 working" (ADR 0007).
+# fleet's output speed and how many Claude Code sessions are working, e.g. "+156 -23 │ Fleet out 108 tok/s · 9
+# working" (ADR 0007). The speed is the report's fleet GEN: the output tokens of every timed request in its window
+# over those requests' durations, the ratio Claude HUD's own "out:" takes for its session's latest response
+# (src/speed.ts at v0.15.0); the HUD folds into its baseline the API time of requests that leave its usage
+# untouched (subagents') and takes no reading under 500 ms, where the fleet counts every timed request of the
+# report's listed workers, on any model. A report with no timed request, a speed under 0.5 tok/s
+# (which would show as 0), or no such summary shows the working sessions alone. The fleet's TOK/S is its
+# work, not a speed, and stays in scripts/lanes --rates.
 # Usage: fleet-rate.sh [<lines added> <lines removed>]. statusline.sh passes the input's documented
 # cost.total_lines_added and cost.total_lines_removed (https://code.claude.com/docs/en/statusline.md); the lines
 # are shown only when both are whole numbers of at most nine digits and one is above zero, a count of a million or
-# more as the HUD writes token counts (1.2M, src/utils/format.ts at v0.15.0), so the label keeps within the HUD's 50
-# characters. The " │ " between the two parts is the HUD's own separator, so a line too narrow for both wraps there.
+# more as the HUD writes token counts (1.2M, src/utils/format.ts at v0.15.0), and only while the label keeps within
+# the HUD's 50 characters with them; past that the fleet figure is shown alone. The " │ " between the two parts is
+# the HUD's own separator, so a line too narrow for both wraps there.
 # Contract: Claude HUD's --extra-cmd (https://github.com/jarrodwatts/claude-hud README, "--extra-cmd"; at
 # v0.15.0 src/extra-cmd.ts and collector.mjs): the HUD runs this on every render when CLAUDE_HUD_ALLOW_EXTRA_CMD
 # is set, gives it 3 s, and shows the "label" of the JSON it prints (at most 50 characters) on the first line.
@@ -53,8 +60,10 @@ out=$(jq -Rrs --arg a "$a" --arg ttl "$ttl" --arg max "$max_age" --arg add "${1:
     | (if $t <= $now and $now - $t < ($max | tonumber) and ($c.label? | type) == "string" then $c.label else null end) as $fleet
     | ($add | count) as $ad | ($del | count) as $de
     | (if $ad != null and $de != null and $ad + $de > 0 then "+\($ad | short) -\($de | short)" else null end) as $lines
+    | ([$lines, $fleet] | map(select(. != null))) as $parts
+    | (if ($parts | join(" │ ") | length) > 50 and $fleet != null then [$fleet] else $parts end) as $parts
     | "\($now) \(if $now - $last >= ($ttl | tonumber) then "due" else "fresh" end)",
-      ([$lines, $fleet] | map(select(. != null)) | if length > 0 then {label: join(" │ ")} | tojson else empty end)
+      ($parts | if length > 0 then {label: join(" │ ")} | tojson else empty end)
   ' "$src" 2>/dev/null) || exit 0
 first=${out%%$'\n'*}; label=""
 [ "$first" = "$out" ] || label=${out#*$'\n'}
@@ -74,10 +83,12 @@ if [ "${first#* }" = due ] && [ -x "$lanes" ]; then
       tmp=$(mktemp "$base/fleet-rate.XXXXXX") || exit 0
       run=("$lanes"); [ ! -x /usr/bin/timeout ] || run=(/usr/bin/timeout "$secs" "$lanes")
       if "${run[@]}" --rates --json 2>/dev/null | jq -c '
-           (.workers // []) as $w
-           | ([$w[] | select(.measured == true) | .tok_s | numbers] | add // 0) as $r
-           | ([$w[] | select(.runtime == "claude-code" and .state == "working")] | length) as $n
-           | {t: (now | floor), label: "Fleet \($r | round) tok/s · \($n) working"}' > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+           (.fleet // {}) as $f
+           | (if ($f.working | type) == "number" then $f.working
+              else [(.workers // [])[] | select(.runtime == "claude-code" and .state == "working")] | length end) as $n
+           | ($f.gen_tok_s | if type == "number" and round > 0 then round else null end) as $g
+           | {t: (now | floor), label: ("Fleet " + (if $g != null then "out \($g) tok/s · " else "" end) + "\($n) working")}' \
+           > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
         mv -f "$tmp" "$cache" && tmp=""
       fi
     ) </dev/null >/dev/null 2>&1 &

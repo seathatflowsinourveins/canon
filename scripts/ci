@@ -37,12 +37,17 @@
 # Checks run without git's repository-local variables (GIT_DIR, GIT_INDEX_FILE, ...), which a commit hook
 # sets, except the staged secret scan, which needs them.
 #
-# Usage: scripts/ci            check everything; the secret scan covers the whole git history
+# Usage: scripts/ci            check everything; the secret scan covers the whole git history (the hosted
+#                              run, and scripts/land with no origin remote)
 #        scripts/ci --staged   a commit's run (used by pre-commit, ADR 0138): the canon lint, the lock check
 #                              and environment, ruff, its format, ty, pytest's collection, the shell checks
 #                              and a secret scan of what is staged; each other check is a skip line, and the
-#                              landing and the hosted run run it
-#        scripts/ci --landing  full checks, called by scripts/land
+#                              hosted run runs it
+#        scripts/ci --landing  scripts/land's run before a push (ADR 0144): the same quick set, with the secret
+#                              scan over the whole git history and the working tree instead, so nothing the
+#                              push would publish goes out unscanned, and on macOS scripts/test-lanes and
+#                              scripts/test-maintenance, whose macOS cases no hosted job runs; the rest is
+#                              left to the hosted run
 # A tool that is missing is a failure, never a skip. Exit 0 only if every check passes.
 # Slots: one of CANON_CI_SLOTS (default 3) machine-wide slots is held for the whole run; when N > 1,
 # slot N is reserved for --landing, which probes N down to 1; other runs share 1..N-1 (take_slot, below).
@@ -54,11 +59,12 @@ set -uo pipefail
 if [ -z "${CANON_CI_NICED:-}" ]; then CANON_CI_NICED=1 exec nice -n 5 "$0" "$@"; fi
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT" || exit 1
-STAGED=0; LANDING=0
+OS=${CANON_CI_OS:-$(uname -s)}   # CANON_CI_OS: set by scripts/test-ci to test either side
+STAGED=0; LANDING=0; QUICK=0   # QUICK: --staged or --landing, the runs that leave the slow checks to GitHub
 case "$#:${1:-}" in
   0:) ;;
-  1:--landing) LANDING=1 ;;
-  1:--staged) STAGED=1 ;;
+  1:--landing) LANDING=1; QUICK=1 ;;
+  1:--staged) STAGED=1; QUICK=1 ;;
   *) echo "ci: usage: scripts/ci [--staged|--landing]"; exit 1 ;;
 esac
 
@@ -230,7 +236,7 @@ skip_line() { n=$((n+1)); KIND[n]="skip"; TEXT[n]="$1"; NOTE[n]=""; }
 # (test-maintenance off macOS), so a skip inside a check stays visible.
 NOTES='^  skip  |^[a-z][a-z-]*: skip \('
 GATED=0   # 1 once a fast check has failed (below)
-LEFT=()   # checks a commit's run leaves to the landing (landing_only)
+LEFT=()   # checks a quick run leaves to the hosted run (landing_only)
 job() {
   local note="" keep=0
   while :; do
@@ -251,13 +257,13 @@ job() {
   ( [ "$keep" -eq 1 ] || without_git_env; "$@" >"$WORK/$n.out" 2>&1; echo "$?" >"$WORK/$n.rc" ) &
   PIDS+=("$!")
 }
-# landing_only [job options] <label> <command...>: a check a commit's run (--staged) leaves to the landing
-# and the hosted run, which run every check (ADR 0138); it is a skip line at commit, and a job otherwise.
-# A shut gate (a failed fast check) still prints its own reason, through job.
+# landing_only [job options] <label> <command...>: a check a quick run (--staged or --landing) leaves to the
+# hosted run, which runs every check (ADR 0138, ADR 0144); it is a skip line in a quick run, and a job
+# otherwise. A shut gate (a failed fast check) still prints its own reason, through job.
 landing_only() {
-  if [ "$STAGED" -eq 1 ] && [ "$GATED" -eq 0 ]; then
+  if [ "$QUICK" -eq 1 ] && [ "$GATED" -eq 0 ]; then
     while :; do case "$1" in --skips|--notes|--git-env) shift ;; *) break ;; esac; done
-    skip_line "$1 (not run at commit; the landing runs it)"; LEFT+=("$1")
+    skip_line "$1 (not run here; the hosted required check runs it)"; LEFT+=("$1")
   else
     job "$@"
   fi
@@ -359,7 +365,7 @@ else
 fi
 if [ "$py_ok" -eq 0 ]; then
   for label in "ruff lint" "ruff format" "ty type check"; do skip_line "$label ($why)"; done
-  [ "$STAGED" -eq 0 ] || skip_line "pytest collection ($why)"
+  [ "$QUICK" -eq 0 ] || skip_line "pytest collection ($why)"
   skip_line "pytest ($why)"
 else
   fast_from=$((n+1))
@@ -368,7 +374,7 @@ else
   job "ty type check"                    tool uv run --locked ty check
   # at commit, pytest's collection is a fast check too: every test file imports and every test is found,
   # as NautilusTrader's hook does (its python-test-collection)
-  [ "$STAGED" -eq 0 ] || job "pytest collection"  tool uv run --locked pytest --collect-only -q
+  [ "$QUICK" -eq 0 ] || job "pytest collection"  tool uv run --locked pytest --collect-only -q
   # all are reaped here, so their process IDs leave PIDS: stop_jobs must not signal a reused one
   wait "${PIDS[@]}"; PIDS=()
   for ((j = fast_from; j <= n; j++)); do [ "$(cat "$WORK/$j.rc" 2>/dev/null)" = 0 ] || py_ok=0; done
@@ -385,8 +391,8 @@ absent() { echo "$1: not found in the mise toolchain (mise.toml, mise.lock). Run
 if [ "$py_ok" -eq 0 ]; then
   GATED=1
   for t in shellcheck gitleaks actionlint; do has_tool "$t" || job "$t (not found)" absent "$t"; done
-elif [ "$STAGED" -eq 1 ]; then
-  # actionlint's own check is left to the landing, so a missing actionlint is named here
+elif [ "$QUICK" -eq 1 ]; then
+  # actionlint's own check is left to the hosted run, so a missing actionlint is named here
   has_tool actionlint || job "actionlint (not found)" absent actionlint
 fi
 
@@ -414,9 +420,13 @@ if [ "${#TESTS[@]}" -gt 0 ]; then
       job "$name (not executable)"       not_executable "$t" "${TEST_MODES[j]}"
     elif [ ! -f "$t" ]; then
       job "$name (missing)"              not_present "$t"
-    elif [ "$name" = test-ci ] && [ -n "${CANON_TEST_CI:-}" ] && { [ "$STAGED" -eq 0 ] || [ "$GATED" -eq 1 ]; }; then
-      # a commit's run leaves test-ci to the landing in any case, and says so (landing_only)
+    elif [ "$name" = test-ci ] && [ -n "${CANON_TEST_CI:-}" ] && { [ "$QUICK" -eq 0 ] || [ "$GATED" -eq 1 ]; }; then
+      # a quick run leaves test-ci to the hosted run in any case, and says so (landing_only)
       skip_line "$name (running inside scripts/test-ci)"
+    elif [ "$LANDING" -eq 1 ] && [ "$OS" = Darwin ] && { [ "$name" = test-lanes ] || [ "$name" = test-maintenance ]; }; then
+      # their macOS cases skip on the hosted Ubuntu runner and the hosted macOS job runs none of them yet
+      # (.github/workflows/ci.yml, ADR 0082), so a landing on macOS runs them here (ADR 0144)
+      job --notes "$name"                "$t"
     else
       landing_only --notes "$name"       "$t"
     fi
@@ -459,11 +469,11 @@ elif [ "${#APART[@]}" -gt 0 ]; then
     fi
     if [ -z "$why" ]; then
       job "ty type check in $p"            tool uv --directory "$p" run --locked ty check
-      [ "$STAGED" -eq 0 ] || job "pytest collection in $p"  tool uv --directory "$p" run --locked pytest --collect-only -q
+      [ "$QUICK" -eq 0 ] || job "pytest collection in $p"  tool uv --directory "$p" run --locked pytest --collect-only -q
       landing_only --skips "pytest in $p"  tool uv --directory "$p" run --locked pytest -q -rfEs --no-fold-skipped
     else
       for label in "ty type check in $p" "pytest in $p"; do skip_line "$label ($why)"; done
-      [ "$STAGED" -eq 0 ] || skip_line "pytest collection in $p ($why)"
+      [ "$QUICK" -eq 0 ] || skip_line "pytest collection in $p ($why)"
     fi
   done
 fi
@@ -536,7 +546,8 @@ if [ "${#SKIPPED[@]}" -gt 0 ]; then
   fi
   echo "ci: ${#SKIPPED[@]} self-test case(s) skipped, so NOT CHECKED here: $list"
 fi
-# A commit's run says how much it left to the landing, so its green verdict is not read as the whole suite's.
+# A quick run says how much it left to the hosted run, so its green verdict is not read as the whole suite's.
 if [ "$fail" -eq 0 ] && [ "${#LEFT[@]}" -gt 0 ]; then
-  echo "ci: all commit checks passed; ${#LEFT[@]} checks NOT RUN here, left to the landing (ADR 0138)"
+  what=commit; [ "$LANDING" -eq 0 ] || what=landing
+  echo "ci: all $what checks passed; ${#LEFT[@]} checks NOT RUN here, left to the hosted required check (ADR 0138, ADR 0144)"
 elif [ "$fail" -eq 0 ]; then echo "ci: all checks passed"; else echo "ci: FAILED"; exit 1; fi

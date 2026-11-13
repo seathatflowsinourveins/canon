@@ -96,7 +96,7 @@ Rules 4 to 7 replace ADR 0045 rule 7's "the other three stay on their defaults".
 | Codex | `gpt-6-astra` | `max` | `config.toml` `model`, `model_reasoning_effort`, `notice.hide_rate_limit_model_nudge`; `service_tier` `default`, Fast per dispatch (ADR 0005) | `--check` rows codex defaults, codex service tier; `scripts/lanes --rates` OFF-MODEL |
 | Antigravity | Gemini 4 Carbon (High) | in the label | `settings.json` `model` | `--check` row agy default model |
 | Muse Code | `muse-wonder-1.0` | `max` | launch flags | the session's model line |
-| DeepSeek Harness | `deepseek-flash` | `max` | dsh-tui bundle | `dsh --profile dsh-tui --dump-config` |
+| DeepSeek Harness | `deepseek-flash` | `max` | dsh-tui bundle | `--check` row `dsh-tui worker defaults` (no remembered pick); `dsh --profile dsh-tui --dump-config` |
 
 ### Consequences
 

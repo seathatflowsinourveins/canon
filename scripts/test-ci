@@ -96,7 +96,9 @@ fresh() { C="$TMP/case-$1"; cp -R "$BASE" "$C"; }
 # runci [args...]: run the copy's scripts/ci; sets OUT and RC. Temp files go to $C.tmp, checked later.
 runci() {
   mkdir -p "$C.tmp"; : >"$C.uv.log"
+  # CANON_CI_OS: Linux unless a case names Darwin, so a case reads the same on this Mac and on the runner
   OUT=$(cd "$C" && PATH="$FAKE:$PATH" TOOLS="${TOOLS:-$TMP/tools}" UV_LOG="$C.uv.log" TMPDIR="$C.tmp" \
+        CANON_CI_OS="${CI_OS:-Linux}" \
         scripts/ci "$@" 2>&1); RC=$?
 }
 # has <regex>: OUT has a line matching the extended regex (reads all of OUT)
@@ -336,13 +338,13 @@ check "collection has its line"                    has '^  ok    pytest collecti
 check "ruff, format and ty run"                    test "$(grep -cE '^run --locked (ruff check|ruff format|ty check)' "$C.uv.log")" = 3
 check "the canon lint runs"                        has '^  ok    canon registry, lock and ADRs$'
 check "and the shell checks"                       has '^  ok    shellcheck$'
-check "actionlint is left to the landing"          has '^  skip  actionlint .*\(not run at commit; the landing runs it\)$'
-check "so are the canon and survey self-tests"     test "$(printf '%s\n' "$OUT" | grep -cE '^  skip  (release-rule|practice survey) self-test \(not run at commit')" = 2
-check "the verdict says what was left"             has '^ci: all commit checks passed; [0-9]+ checks NOT RUN here, left to the landing'
+check "actionlint is left to the landing"          has '^  skip  actionlint .*\(not run here; the hosted required check runs it\)$'
+check "so are the canon and survey self-tests"     test "$(printf '%s\n' "$OUT" | grep -cE '^  skip  (release-rule|practice survey) self-test \(not run here')" = 2
+check "the verdict says what was left"             has '^ci: all commit checks passed; [0-9]+ checks NOT RUN here, left to the hosted required check'
 check "and is not the whole suite's verdict"       test "$(printf '%s\n' "$OUT" | grep -c '^ci: all checks passed$')" = 0
-check "a test script left to the landing says so"  has '^  skip  test-zz \(not run at commit; the landing runs it\)$'
-check "pytest too"                                 has '^  skip  pytest \(not run at commit; the landing runs it\)$'
-check "and the lane self-test"                     has '^  skip  lane report self-test \(not run at commit; the landing runs it\)$'
+check "a test script left to the landing says so"  has '^  skip  test-zz \(not run here; the hosted required check runs it\)$'
+check "pytest too"                                 has '^  skip  pytest \(not run here; the hosted required check runs it\)$'
+check "and the lane self-test"                     has '^  skip  lane report self-test \(not run here; the hosted required check runs it\)$'
 check "the staged secret scan runs"                has '^  ok    gitleaks \(staged changes\)$'
 }
 case_collectfail() {
@@ -373,17 +375,50 @@ apart_copy stagedapart
 runci --staged
 check "a project apart is collected at commit"     test "$(grep -cx -- '--directory apart run --locked pytest --collect-only -q' "$C.uv.log")" = 1
 check "with its line"                              has '^  ok    pytest collection in apart$'
-check "its full pytest is left to the landing"     has '^  skip  pytest in apart \(not run at commit; the landing runs it\)$'
+check "its full pytest is left to the landing"     has '^  skip  pytest in apart \(not run here; the hosted required check runs it\)$'
 }
 case_landingall() {
 fresh landingall
 printf '#!/bin/bash\n: >"%s"\n' "$C.lanes.ran" >"$C/scripts/lanes"
 gitq -C "$C" add -A; gitq -C "$C" commit -q -m all
 runci --landing
-check "a landing runs the self-tests"              test -e "$C.lanes.ran"
+check "a landing passes"                           test "$RC" = 0
+check "a landing runs no self-test (ADR 0144)"     test ! -e "$C.lanes.ran"
+check "and no full pytest"                         test "$(grep -cE '^run --locked pytest -q' "$C.uv.log")" = 0
+check "it collects the tests"                      test "$(grep -c '^run --locked pytest --collect-only -q' "$C.uv.log")" = 1
+check "it scans the whole git history"             has '^  ok    gitleaks \(git history\)$'
+check "and the working tree"                       has '^  ok    gitleaks \(working tree\)$'
+check "not only what is staged"                    test "$(printf '%s\n' "$OUT" | grep -c 'gitleaks (staged changes)')" = 0
+check "the rest is left to the hosted run"         has '^  skip  pytest \(not run here; the hosted required check runs it\)$'
+check "and its verdict says so"                    has '^ci: all landing checks passed; [0-9]+ checks NOT RUN here, left to the hosted required check'
+}
+case_landingmac() {
+fresh landingmac
+local s
+for s in test-lanes test-maintenance test-zz; do
+  printf '#!/bin/bash\n: >"%s"\n' "$C.$s.ran" >"$C/scripts/$s"; chmod +x "$C/scripts/$s"
+done
+gitq -C "$C" add -A; gitq -C "$C" commit -q -m mac
+CI_OS=Darwin runci --landing
+check "a landing on macOS passes"                  test "$RC" = 0
+check "it runs test-lanes"                         test -e "$C.test-lanes.ran"
+check "and test-maintenance"                       test -e "$C.test-maintenance.ran"
+check "and no other test script"                   test ! -e "$C.test-zz.ran"
+check "test-lanes has its ok line"                 has '^  ok    test-lanes$'
+rm -f "$C".test-*.ran
+runci --landing
+check "a landing elsewhere leaves test-lanes"      test ! -e "$C.test-lanes.ran"
+check "and test-maintenance to the hosted run"     has '^  skip  test-maintenance \(not run here; the hosted required check runs it\)$'
+}
+case_fullall() {
+fresh fullall
+printf '#!/bin/bash\n: >"%s"\n' "$C.lanes.ran" >"$C/scripts/lanes"
+gitq -C "$C" add -A; gitq -C "$C" commit -q -m all
+runci
+check "a full run runs the self-tests"             test -e "$C.lanes.ran"
 check "and the full pytest"                        test "$(grep -cE '^run --locked pytest -q' "$C.uv.log")" = 1
 check "and no collection run of its own"           test "$(grep -c -- '--collect-only' "$C.uv.log")" = 0
-check "nothing is left to a landing"               test "$(printf '%s\n' "$OUT" | grep -c 'not run at commit')" = 0
+check "nothing is left out"                        test "$(printf '%s\n' "$OUT" | grep -c 'not run here')" = 0
 }
 
 # --- a fast failure still names what fails at once: a test script not executable, a tool not found ---
@@ -797,21 +832,21 @@ for mode in --staged --landing plain; do
   check "P3 $mode always runs canon lint once" test "$(grep -cx lint "$C.uv.log.canon")" = 1
   for label in 'release-rule self-test' 'lane report self-test' 'practice survey self-test' pytest actionlint \
     $(git -C "$C" ls-files 'scripts/test-*' | awk '$0 !~ /^scripts\/.*\// { sub("scripts/", ""); print }'); do
-    if [ "$mode" = --staged ]; then
-      count=$(printf '%s\n' "$OUT" | grep -cE "^  skip  $label([[:space:]]|$).*not run at commit")
-      check "P2 staged names $label as not run at commit once" test "$count" = 1
+    if [ "$mode" != plain ]; then
+      count=$(printf '%s\n' "$OUT" | grep -cE "^  skip  $label([[:space:]]|$).*not run here")
+      check "P2 $mode names $label as not run here once" test "$count" = 1
     elif [ "$label" = test-ci ]; then
       check "P3 $mode retains the test-ci recursion guard" has '^  skip  test-ci [(]running inside scripts/test-ci[)]$'
     else
       check "P3 $mode runs $label" has "^  ok    $label( [(].*[)])?\$"
     fi
   done
-  count=1; [ "$mode" != --staged ] || count=0
+  count=0; [ "$mode" != plain ] || count=1
   check "P2/P3 $mode release-rule self-test invocation count" test "$(grep -cx selftest "$C.uv.log.canon")" = "$count"
   for name in lanes survey-github actionlint \
     $(git -C "$C" ls-files 'scripts/test-*' | awk '$0 !~ /^scripts\/.*\// && $0 != "scripts/test-ci" { sub("scripts/", ""); print }'); do
-    if [ "$mode" = --staged ]; then
-      check "P2 staged never invokes $name" test ! -e "$C.uv.log.$name"
+    if [ "$mode" != plain ]; then
+      check "P2 $mode never invokes $name" test ! -e "$C.uv.log.$name"
     else
       check "P3 $mode invokes $name once" test "$(wc -l <"$C.uv.log.$name" | tr -d ' ')" = 1
     fi
@@ -822,8 +857,12 @@ for mode in --staged --landing plain; do
       'gitleaks [(]git history[)]' 'gitleaks [(]working tree[)]'; do
       check "P3 $mode retains $label" has "^  ok    $label\$"
     done
+  fi
+  if [ "$mode" = plain ]; then
     check "P3 $mode invokes full pytest once" test "$(grep -c '^run --locked pytest ' "$C.uv.log")" = 1
     check "P3 $mode does not replace pytest with collection" test "$(grep -cE -- '(^| )(--collect-only|--collectonly|--co)( |$)' "$C.uv.log")" = 0
+  elif [ "$mode" = --landing ]; then
+    check "P3 --landing collects pytest only" test "$(grep -c '^run --locked pytest --collect-only -q$' "$C.uv.log")" = 1
   fi
 done
 }
@@ -846,9 +885,9 @@ EOF
   fi
   for mode in --staged --landing plain; do
     if [ "$mode" = plain ]; then runci; else runci "$mode"; fi
-    if [ "$mode" = --staged ]; then
-      check "P2 a failing $kind cannot fail staged CI" test "$RC" = 0
-      check "P2 staged explains the omitted failing $kind" has "^  skip  $label.*not run at commit"
+    if [ "$mode" != plain ]; then
+      check "P2 a failing $kind cannot fail $mode CI" test "$RC" = 0
+      check "P2 $mode explains the omitted failing $kind" has "^  skip  $label.*not run here"
     else
       check "P2/P3 the same failing $kind fails $mode" test "$RC" -ne 0
       check "P2/P3 $mode names the failing $kind" has "^  FAIL  $label\$"
@@ -911,9 +950,9 @@ EOF
 for mode in --staged --landing plain; do
   if [ "$mode" = plain ]; then TOOLS="$C.tools" runci
   else TOOLS="$C.tools" runci "$mode"; fi
-  if [ "$mode" = --staged ]; then
-    check "P4 a collected test with a failing body permits the commit" test "$RC" = 0
-    check "P4 staged never executes that test body" test "$(printf '%s\n' "$OUT" | grep -c 'test body executed')" = 0
+  if [ "$mode" != plain ]; then
+    check "P4 a collected test with a failing body permits $mode" test "$RC" = 0
+    check "P4 $mode never executes that test body" test "$(printf '%s\n' "$OUT" | grep -c 'test body executed')" = 0
   else
     check "P3/P4 $mode executes the failing test body" has 'test body executed'
     check "P3/P4 the failing test body fails $mode" test "$RC" -ne 0
@@ -979,7 +1018,7 @@ done
 }
 
 # Every case above works in its own copy, so they run concurrently; their output prints in this order.
-CASES="yaml noflows shell staged untracked tests testdir testgone notes skipsum died symlink deleted deleted2 lockfail fastfirst fastorder fastnamed commitscope collectfail stagedlock stagedtool stagedapart landingall apart apartlock hookenv parallel order missing pathorder strayconfig longfail slots nice priority prioritycapacity"
+CASES="yaml noflows shell staged untracked tests testdir testgone notes skipsum died symlink deleted deleted2 lockfail fastfirst fastorder fastnamed commitscope collectfail stagedlock stagedtool stagedapart landingall landingmac fullall apart apartlock hookenv parallel order missing pathorder strayconfig longfail slots nice priority prioritycapacity"
 CASES="$CASES commitfast commitmodes commitslowfailure commitfastfailure commitpytest commitcanon commitshellfailure"
 for c in $CASES; do ( "case_$c" ) >"$TMP/out.$c" 2>&1 & done
 wait

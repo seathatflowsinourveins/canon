@@ -768,7 +768,85 @@ Each is stated in `execution.py`'s header, with its source.
   later reads. A
   `canceled` or `expired` update or report showing more filled than the node holds brings the missing
   fills first and then ends the order, waiting with the later reads while the activities lag; after
-  them it ends with what the node holds, with an error. At start-up there is no exit to inference for
+  them it ends with what the node holds, with an error. Ending an order removes its later-read target.
+  An outstanding read remains tracked until it returns, and a sleeping retry exits when it wakes,
+  without another read or crediting a stream fill as caught up on that read; disconnect cancels any
+  still outstanding. A read that itself brought the ending fill retains its catch-up log.
+
+  An already finished order waits for actual cache closure at three sites: `_settled_report` for
+  single and bulk return hooks (including mass/open-order reports), `_query_order` for `QueryOrder`,
+  and `_send_report` for stream snapshots and companion fills. They share `_hold_report` and its
+  `HELD_REPORT_TIMEOUT_SECS` (0.5 s, an adapter choice). That bounds mapping inside the send hold,
+  cache closure, chain orders, activity pages, newer snapshot reads and the cache application of
+  recovered fills needed by return hooks. A continuous report's delivery ends its hold immediately;
+  no later cache wait can label that delivery failed. Only an actual cache wait logs an INFO
+  held/released pair, naming the order and reason. Initial query/bulk reads and mapping precede
+  settlement, outside the stream consumer. Earlier identification of an unknown replacement keeps
+  its existing chain lookup. A canceled REST await releases the consumer at the bound; its shielded
+  worker retains the REST lock until the actual call ends.
+
+  Expiry raises a named error. `_report_hold_failures` keeps the entry cache state, a monotonic retry
+  time, a log deadline and the error. `HELD_REPORT_RETRY_SECS` (5 s, an adapter choice) spaces retries
+  after a timeout on an unchanged closed order: a later update, query or report tries again after
+  that spacing even if no fills have reached the cache. Cache closure/progress can unblock it sooner.
+  A burst inside the spacing is refused immediately; the timeout names the omission and spacing,
+  and repeated refusals share that one line. If the cache never closes, no more holds start, and
+  omissions are logged at most once per spacing. Successful settlement drops the failure; disconnect
+  replaces the state so an old hold cannot restore it; completed chain reads also check their
+  session before writing the index, and settlement checks before delivery.
+
+  A stream update of a finished order whose hold fails, by a timeout, because Alpaca's activities
+  do not list the fills it shows yet, or because a read for its mapping failed (an `APIError` or an
+  `OSError`), is read again by the client itself: Alpaca sends an ended
+  order no further update, and the engine's open-order check reads open orders only by default, so
+  nothing else would. `_reread_report_later` reads the order afresh `HELD_REPORT_REREADS` (3) times
+  at most, `HELD_REPORT_RETRY_SECS` apart, through the same hold and the same delivery; one task per
+  order, canceled at disconnect. Past the last read it logs an error that leaves the order to the
+  next start-up. A re-read and a later update can each queue the same fills before the cache shows
+  them; the engine's bundle path drops a fill whose trade ID the order already holds
+  (`reconciliation/orders.rs:785-791`, called per fill at `engine/mod.rs:1769`, at `d53849b216e2`).
+  Limits: whether start-up reconciliation then brings such a fill is UNVERIFIED; an
+  update that fails while a re-read waits adds no reads; a `QueryOrder` or report hook whose hold
+  fails arms none, since the engine asks again on its own schedule; and each re-read's first
+  request to Alpaca is outside the hold's bound, in its own task, off the stream consumer.
+
+  Bulk reports omit each held order by name and return the reports available, including `[]` when
+  every candidate is held or awaiting catch-up. Listing failures still raise. The engine follows a
+  missing bulk entry with a targeted lookup (`crates/live/src/execution/manager.rs:2457-2472` at
+  `d53849b216e2`); that lookup raises for a held order, marking coverage incomplete
+  (`reconciliation.rs:530-556`). The manager then logs "Deferring" and keeps that order unresolved
+  (`manager.rs:2590-2597`), without suppressing reconciliation of every other missing order as a
+  failed bulk listing would (`manager.rs:2076-2079,2457-2466`). `QueryOrder` and a refused submit's
+  report consume an already logged hold error; the latter also logs an API mapping error once,
+  without raising it to the command worker.
+
+  `_finished` alone does not prove an end reached the engine. Additional filled shares come by real
+  trade ID from companion fills or the chain's activities. When those fills exceed a snapshot's
+  total, the order is read again; the resulting report must account for every new fill delivered.
+  If the snapshot is ahead of the activities, or remains behind them after that read, the request
+  fails by name without sending an incomplete bundle or inferring a fill. Continuous send/query
+  paths deliver the report and new fills once through `_handle_report(report, fills)`; a late
+  update showing no new shares is not forwarded to the engine. Single/bulk
+  return hooks send only the individual FillReports, wait for their cache application, then return
+  the status once. The continuous bundle path applies fills and then an authoritative snapshot,
+  which can void fills if its total is older (`crates/execution/src/engine/mod.rs:1679-1800` and
+  `crates/execution/src/reconciliation/orders.rs:117-157,596-670` at `d53849b216e2`). The model preserves
+  cancellation/expiry for a late partial fill below the order quantity
+  (`crates/model/src/orders/mod.rs:1355-1376`). The bound's suitability under paper load is
+  **UNVERIFIED**. A request that starts catch-up on an unfinished order keeps the earlier
+  suppression behavior above, even when that request itself generates the ending fill; its missing-order
+  limits below remain.
+
+  `_finished` can be populated before startup mass status when the cache already contains orders:
+  connect starts the stream consumer and resumes waiting ends before the node requests mass status
+  (`_connect_venue`, `_resume_waiting_ends`; upstream `crates/live/src/node/mod.rs:502-535,945-982`).
+  This is a source-based reachability inference, not a fresh empty-cache startup observation.
+  Startup reconciliation uses `is_snapshot=true` (`manager.rs:980-988`), so a return hook refreshes
+  a snapshot below the cache's filled total and refuses it if it remains older. It also checks the
+  total again after waiting for recovered fills; it never returns a finished snapshot below the
+  cache's then-current total.
+
+  At start-up there is no exit to inference for
   an open order the node does not hold that shows fills: its chain's fills, at any age and its older
   ones outside the engine's window included, are reported by trade ID when they add up to what its
   status report counts, or the fill reports fail by name after 3 reads (each fill reports request

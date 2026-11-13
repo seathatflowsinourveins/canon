@@ -196,9 +196,11 @@ export PATH="$B:$PATH"
 unset usage_account
 REAL_HOME="$HOME"   # the paper:store case needs the user's own login keychain, which security finds through HOME
 export HOME="$TMP/home"; mkdir -p "$HOME"
-# a session Orca starts carries DISABLE_AUTOUPDATER (Orca 1.4.255 sets it), which bootstrap's update row reads
+# a session Orca starts carries DISABLE_AUTOUPDATER (Orca 1.4.255 sets it), which bootstrap's update row reads;
+# the three dsh-TUI variables are read by its worker defaults row
 unset CLAUDE_CONFIG_DIR CANON_LEDGER_HOME AUTOMATION_SKIP_LAUNCHD CANON_LAUNCHAGENTS_DIR CODEX_HOME DSH_HOME \
-      DISABLE_AUTOUPDATER DISABLE_UPDATES CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC CLAUDE_CODE_DISABLE_ADVISOR_TOOL
+      DISABLE_AUTOUPDATER DISABLE_UPDATES CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC CLAUDE_CODE_DISABLE_ADVISOR_TOOL \
+      DSH_PERMISSION_MODE DSH_TUI_PRESET DSH_TUI_BACKEND
 PINNED=$(sed -n 's/^MISE_VERSION="v\([^"]*\)".*/\1/p' "$ROOT/scripts/bootstrap")
 echo "$PINNED macos-arm64 (stub)" > "$STUB/mise-version"
 CCPIN="2.1.321"   # the claude-code pin the bootstrap fixture's registry sets, whatever the real one is
@@ -319,6 +321,34 @@ check "a directory lsof cannot read: lane ?, and a warning" \
 check "corrupt and misshapen OTLP lines counted, metrics line not" w '.otlp_unreadable_lines == 2'
 check "no attribute beyond the named ones is copied out" eval '! grep -q "someone@example.com" "$TMP/rates.json"'
 check "every runtime names its source"             w '[.sources[].runtime] == ["claude-code","codex","muse-code","antigravity","deepseek-harness"]'
+# the fleet: the measured workers' output over the window's seconds, and one generating speed for them all, the
+# total of the timed requests' output tokens over the total of their durations (no Codex event gives both)
+check "fleet: working Claude Code sessions, every measured worker's output over the window's seconds, speed from the 2 timed requests" \
+      w '.fleet.working == 1 and .fleet.tok_s == (([.workers[] | select(.measured) | .out_tokens] | add) / (.window_min * 60) * 100 | round / 100) and .fleet.gen_tok_s == 200 and .fleet.gen_requests == 2'
+{
+  rec "[$(s event.name api_request),$(s session.id s-otel),$(n output_tokens intValue 600),$(n duration_ms intValue 2500)]" "$((NOW - 120))000000000"
+  rec "[$(s event.name api_request),$(s session.id s-otel),$(n output_tokens intValue 600),$(n duration_ms intValue 3500)]" "$((NOW - 60))000000000"
+  rec "[$(s event.name api_request),$(s session.id s-none),$(n output_tokens intValue 100),$(n duration_ms intValue 1000)]" "$((NOW - 50))000000000"
+  rec "[$(s event.name codex.sse_event),$(s event.kind response.completed),$(s conversation.id c-1),$(s output_token_count 1200)]" "$((NOW - 40))000000000"
+} > "$RD/otel/fleet.jsonl"
+CANON_OTLP_FILE="$RD/otel/fleet.jsonl" rates --json > "$TMP/fleet.json" 2>/dev/null
+check "fleet speed over two sessions is one ratio of sums: 1300 tokens over 7 s is 185.71, not 150 (the mean of 200 and 100) nor 192.31 (weighted by tokens)" \
+      jqt "$TMP/fleet.json" '.fleet.gen_tok_s == 185.71 and .fleet.gen_requests == 3 and .fleet.tok_s == 4.17 and ([.workers[] | select(.id == "s-none") | .gen_tok_s] == [100])'
+CANON_OTLP_FILE="$RD/otel/fleet.jsonl" rates > "$TMP/fleet.out" 2>&1
+check "... and the table ends with the fleet line, naming what the speed covers" \
+      grep -q "^Fleet: 1 Claude Code session(s) working; 4.17 tok/s output over the window, 185.71 tok/s generating over 3 timed request(s)" "$TMP/fleet.out"
+grep -v duration_ms "$RD/otel/fleet.jsonl" > "$RD/otel/fleet-untimed.jsonl"
+CANON_OTLP_FILE="$RD/otel/fleet-untimed.jsonl" rates --json > "$TMP/fleet.json" 2>/dev/null
+check "no timed request in the window: no fleet speed, not a zero" jqt "$TMP/fleet.json" '.fleet.gen_tok_s == null and .fleet.gen_requests == 0 and .fleet.tok_s == 2'
+# the fleet's throughput is its tokens over the window's seconds, not a sum of rows each rounded to two places
+{
+  rec "[$(s event.name api_request),$(s session.id s-otel),$(n output_tokens intValue 2),$(n duration_ms intValue 1000)]" "$((NOW - 120))000000000"
+  rec "[$(s event.name api_request),$(s session.id s-none),$(n output_tokens intValue 1)]" "$((NOW - 50))000000000"
+  rec "[$(s event.name codex.sse_event),$(s event.kind response.completed),$(s conversation.id c-1),$(s output_token_count 1)]" "$((NOW - 40))000000000"
+} > "$RD/otel/fleet-small.jsonl"
+CANON_OTLP_FILE="$RD/otel/fleet-small.jsonl" rates --json > "$TMP/fleet.json" 2>/dev/null
+check "fleet throughput from the raw tokens: 4 over 600 s is 0.01, where each row rounds to 0" \
+      jqt "$TMP/fleet.json" '.fleet.tok_s == 0.01 and ([.workers[] | select(.measured) | .tok_s] == [0, 0, 0])'
 rates > "$TMP/rates.out" 2>&1; rc=$?
 check "rates table prints, one line per worker"    eval '[ "$rc" = 0 ] && [ "$(grep -cE "^(otel|none|-|proc-[0-9]+|\?) " "$TMP/rates.out")" = 9 ] && grep -q "OFF-MODEL: gpt-x" "$TMP/rates.out"'
 CANON_OTLP_FILE="$RD/otel/absent.jsonl" rates --json > "$TMP/rates.json" 2>/dev/null; rc=$?
@@ -1764,8 +1794,117 @@ else
   chmod 000 "$DP/cordis.patch.yml"; bs --check; chmod 644 "$DP/cordis.patch.yml"
   check "an unreadable dsh-tui patch: UNKNOWN, saying it cannot be read, never a silent none" \
         eval 'rowis "$TMP/bs.out" "dsh-tui review patch" UNKNOWN && grep -q "cordis.patch.yml cannot be read" "$TMP/bs.out"'
+  check "... and the worker defaults row UNKNOWN too, never ok" rowis "$TMP/bs.out" "dsh-tui worker defaults" UNKNOWN
 fi
-rm -rf "$HOME/.dsh"
+# the dsh-tui worker defaults row (ADR 0136, ADR 0059 rule 7): a remembered pick, a home-level patch or a row
+# of the profile's patch that changes how every worker starts is named, each file read as dsh-TUI reads it
+T2="$HOME/.dsh-tui"; mkdir -p "$T2"
+{ echo '- id: doublecheck-guard'; echo '  config: {}'; cat "$DSRC"; } > "$DP/cordis.patch.yml"
+printf '%s' '{"version":1,"imported":{"from":"none","at":1}}' > "$T2/settings.json"
+bs --check
+check "no remembered pick, home-level patch or worker row: dsh-tui worker defaults ok" \
+      eval 'rowis "$TMP/bs.out" "dsh-tui worker defaults" ok && grep -q "no remembered /permission, /model, /effort or /preset pick, no /kernel pick but dsh, and no effortDefault in $T2; no $HOME/.dsh/cordis.patch.yml;" "$TMP/bs.out"'
+printf '%s' '{"permission": "read-only"}' > "$T2/permission.json"; bs --check
+check "a remembered /permission pick: OVERRIDE, naming it" \
+      eval 'rowis "$TMP/bs.out" "dsh-tui worker defaults" OVERRIDE && grep -q "$T2/permission.json remembers /permission read-only; each carries into every later dsh-tui session" "$TMP/bs.out"'
+# dsh-TUI trims the pick and keeps it only as a command token (permissionPrefs.ts L40-41, commands.ts L47-49)
+printf '%s' '{"permission": "  read-only  "}' > "$T2/permission.json"; bs --check
+check "a /permission pick with spaces around it: OVERRIDE, named trimmed, as dsh-TUI reads it" \
+      eval 'rowis "$TMP/bs.out" "dsh-tui worker defaults" OVERRIDE && grep -q "$T2/permission.json remembers /permission read-only;" "$TMP/bs.out"'
+printf '%s' '{"permission": "read only!"}' > "$T2/permission.json"; bs --check
+check "a /permission pick that is no command token, which dsh-TUI drops: ok" rowis "$TMP/bs.out" "dsh-tui worker defaults" ok
+printf '%s' '{"permission": "   "}' > "$T2/permission.json"; bs --check
+check "a /permission pick of spaces only, which dsh-TUI drops: ok" rowis "$TMP/bs.out" "dsh-tui worker defaults" ok
+rm "$T2/permission.json"
+printf '%s' '{"provider": "deepseek-official", "model": "deepseek-v4-pro"}' > "$T2/model.json"; bs --check
+check "a remembered /model pick: OVERRIDE, naming the route" \
+      eval 'rowis "$TMP/bs.out" "dsh-tui worker defaults" OVERRIDE && grep -q "$T2/model.json remembers /model deepseek-official/deepseek-v4-pro;" "$TMP/bs.out"'
+printf '%s' '{"provider": "deepseek-official"}' > "$T2/model.json"; bs --check
+check "half a /model route, which dsh-TUI ignores: ok" rowis "$TMP/bs.out" "dsh-tui worker defaults" ok
+rm "$T2/model.json"
+printf '%s' '{"effort": "high\u001b[0m"}' > "$T2/effort.json"; bs --check
+check "a remembered /effort pick: OVERRIDE, a control character in it shown as ?" \
+      eval 'rowis "$TMP/bs.out" "dsh-tui worker defaults" OVERRIDE && grep -q "$T2/effort.json remembers /effort high??0m;" "$TMP/bs.out" && ! grep -q "$(printf "\033")" "$TMP/bs.out"'
+printf '%s' '{"effort": ' > "$T2/effort.json"; bs --check
+check "a corrupt effort.json, which dsh-TUI reads as no pick: ok" rowis "$TMP/bs.out" "dsh-tui worker defaults" ok
+rm "$T2/effort.json"
+printf '%s' '{"version":1,"values":{"effortDefault":"low"}}' > "$T2/settings.json"; bs --check
+check "a /settings effortDefault: OVERRIDE, naming it" \
+      eval 'rowis "$TMP/bs.out" "dsh-tui worker defaults" OVERRIDE && grep -q "$T2/settings.json sets effortDefault low;" "$TMP/bs.out"'
+printf '%s' '{"version":1,"values":{"effortDefault":"auto"}}' > "$T2/settings.json"; bs --check
+check "an effortDefault of Auto, which is no choice: ok" rowis "$TMP/bs.out" "dsh-tui worker defaults" ok
+printf '%s' '{"preset": "code"}' > "$T2/agent-preset.json"; bs --check
+check "a remembered /preset pick: OVERRIDE, naming it" \
+      eval 'rowis "$TMP/bs.out" "dsh-tui worker defaults" OVERRIDE && grep -q "$T2/agent-preset.json remembers /preset code;" "$TMP/bs.out"'
+printf '%s' '{"preset": "Code"}' > "$T2/agent-preset.json"; bs --check
+check "a /preset id dsh-TUI refuses (capitals): ok" rowis "$TMP/bs.out" "dsh-tui worker defaults" ok
+rm "$T2/agent-preset.json"
+printf '%s' '{"backend": " Claude "}' > "$T2/kernel.json"; bs --check
+check "a remembered /kernel pick of another backend: OVERRIDE, naming it as dsh-TUI reads it" \
+      eval 'rowis "$TMP/bs.out" "dsh-tui worker defaults" OVERRIDE && grep -q "$T2/kernel.json remembers /kernel claude;" "$TMP/bs.out"'
+printf '%s' '{"backend": "dsh"}' > "$T2/kernel.json"; bs --check
+check "a remembered /kernel pick of dsh, the default: ok" rowis "$TMP/bs.out" "dsh-tui worker defaults" ok
+rm "$T2/kernel.json"
+# each of three variables outranks its remembered pick in a dsh-tui started from this environment
+# (cordis.patch.yml L179, L186, L475, L479; configuration.en.md L176, L405, L414, L419)
+DSH_PERMISSION_MODE=danger-full-access bs --check
+check "DSH_PERMISSION_MODE in this environment: OVERRIDE, naming it and its value" \
+      eval 'rowis "$TMP/bs.out" "dsh-tui worker defaults" OVERRIDE && grep -q "this environment sets DSH_PERMISSION_MODE danger-full-access, which outranks" "$TMP/bs.out"'
+DSH_TUI_PRESET=code bs --check
+check "DSH_TUI_PRESET in this environment: OVERRIDE, naming it and its value" \
+      eval 'rowis "$TMP/bs.out" "dsh-tui worker defaults" OVERRIDE && grep -q "this environment sets DSH_TUI_PRESET code, which outranks" "$TMP/bs.out"'
+DSH_TUI_BACKEND=claude bs --check
+check "DSH_TUI_BACKEND in this environment: OVERRIDE, naming it and its value" \
+      eval 'rowis "$TMP/bs.out" "dsh-tui worker defaults" OVERRIDE && grep -q "this environment sets DSH_TUI_BACKEND claude, which outranks" "$TMP/bs.out"'
+DSH_TUI_BACKEND='' bs --check
+check "an empty DSH_TUI_BACKEND, which dsh-TUI reads as unset: ok" rowis "$TMP/bs.out" "dsh-tui worker defaults" ok
+# with no settings.json, the next boot imports the dsh-tui section of the first legacy settings.yaml that has one
+# (tuiSettingsFile.ts L1-6, L141-163; tui-settings.ts L116-123)
+rm "$T2/settings.json"
+printf 'other:\n  effortDefault: max\ndsh-tui:\n  lang: en\n  effortDefault: "low" # set by hand\n' > "$HOME/.dsh/settings.yaml"; bs --check
+check "no settings.json, and a legacy settings.yaml whose dsh-tui section sets effortDefault low: OVERRIDE, naming it" \
+      eval 'rowis "$TMP/bs.out" "dsh-tui worker defaults" OVERRIDE && grep -q "no $T2/settings.json, so the next dsh-tui boot imports effortDefault low from $HOME/.dsh/settings.yaml;" "$TMP/bs.out"'
+printf 'dsh-tui:\n  lang: en\n' > "$HOME/.dsh/settings.yaml"
+printf 'dsh-tui:\n  effortDefault: low\n' > "$HOME/.dsh/settings.yaml.imported"; bs --check
+check "a legacy settings.yaml whose dsh-tui section has no effortDefault is the one imported, not the .imported after it: ok" \
+      rowis "$TMP/bs.out" "dsh-tui worker defaults" ok
+rm "$HOME/.dsh/settings.yaml"; bs --check
+check "... and with only the .imported one, its effortDefault low: OVERRIDE, naming it" \
+      eval 'rowis "$TMP/bs.out" "dsh-tui worker defaults" OVERRIDE && grep -q "imports effortDefault low from $HOME/.dsh/settings.yaml.imported;" "$TMP/bs.out"'
+printf 'dsh-tui:\n  effortDefault: auto\n' > "$HOME/.dsh/settings.yaml.imported"; bs --check
+check "a legacy effortDefault of auto, which is no choice: ok" rowis "$TMP/bs.out" "dsh-tui worker defaults" ok
+printf 'dsh-tui:\n  effortDefault: low\n' > "$HOME/.dsh/settings.yaml"
+printf '%s' '{"version":1,"imported":{"from":"none","at":1}}' > "$T2/settings.json"; bs --check
+check "a legacy settings.yaml beside a settings.json, which is never imported again: ok" rowis "$TMP/bs.out" "dsh-tui worker defaults" ok
+rm -f "$HOME/.dsh/settings.yaml" "$HOME/.dsh/settings.yaml.imported"
+: > "$HOME/.dsh/cordis.patch.yml"; bs --check
+check "a home-level DSH patch: OVERRIDE, as it outranks every profile's" \
+      eval 'rowis "$TMP/bs.out" "dsh-tui worker defaults" OVERRIDE && grep -q "$HOME/.dsh/cordis.patch.yml outranks every profile.s patch;" "$TMP/bs.out"'
+rm "$HOME/.dsh/cordis.patch.yml"
+{ cat "$DSRC"; echo '- id: sandbox-policy'; echo '  config:'; echo '    mode: danger-full-access'; echo "- {id: 'dsh-tui', config: {effort: low}}"; } > "$DP/cordis.patch.yml"
+bs --check
+check "sandbox-policy and dsh-tui rows of the owner's: OVERRIDE, naming both, and the review patch still ok" \
+      eval 'rowis "$TMP/bs.out" "dsh-tui worker defaults" OVERRIDE && grep -q "$DP/cordis.patch.yml has its own row for: dsh-tui sandbox-policy;" "$TMP/bs.out" && rowis "$TMP/bs.out" "dsh-tui review patch" ok'
+{ cat "$DSRC"; echo '- id: doublecheck-guard'; echo '  config:'; echo '    grid: dsh-tui'; echo "- {id: ui-theme, config: {uid: 'sandbox-policy'}}"; } > "$DP/cordis.patch.yml"
+bs --check
+check "a grid or uid key holding a worker row's id is no row: ok" rowis "$TMP/bs.out" "dsh-tui worker defaults" ok
+# a commented-out row is no row, for either row
+{ cat "$DSRC"; echo '# - id: sandbox-policy'; echo '#   config: {mode: danger-full-access}'; echo "  # - {id: 'dsh-tui', config: {effort: low}}"; } > "$DP/cordis.patch.yml"
+bs --check
+check "commented-out sandbox-policy and dsh-tui rows: ok" rowis "$TMP/bs.out" "dsh-tui worker defaults" ok
+{ echo '# - id: approval'; echo '#   config: {policy: ask}'; cat "$DSRC"; } > "$DP/cordis.patch.yml"
+bs --check
+check "a commented-out approval row before the dsh-tui block: review patch ok, not a conflict" \
+      rowis "$TMP/bs.out" "dsh-tui review patch" ok
+# with no dsh-tui profile, a remembered pick still carries into the first dsh-tui session once one is installed
+rm -rf "$DP"
+printf '%s' '{"backend": "codex"}' > "$T2/kernel.json"; bs --check
+check "no dsh-tui profile but a remembered /kernel pick: OVERRIDE, naming it, not absent" \
+      eval 'rowis "$TMP/bs.out" "dsh-tui worker defaults" OVERRIDE && grep -q "$T2/kernel.json remembers /kernel codex;" "$TMP/bs.out"'
+rm "$T2/kernel.json"; bs --check
+check "no dsh-tui profile and nothing to name: absent" \
+      eval 'rowis "$TMP/bs.out" "dsh-tui worker defaults" absent && grep -q "no dsh-tui profile at $DP" "$TMP/bs.out"'
+rm -rf "$HOME/.dsh" "$HOME/.dsh-tui"
 # the OmniRoute rows (ADR 0056), optional: not installed is absent and passes; installed, its version is held
 # to the registry's pin; with no database the providers row is absent, otherwise the provider_connections
 # table, read by sqlite3 under query_only, decides: a connection whose provider, name or default model says

@@ -137,7 +137,9 @@ runs only before a trade date on Alpaca's calendar, streams `boats` (`SESSION_FE
 an asset so marked and not `overnight_halted`. What reached the strategy (quotes, trades, live bars) and
 the adapter's own lines about its stream, from the node's log, go in the record; a stream that delivered
 nothing, or that the adapter logged an error for, fails the window, since the adapter reports a refused
-or ended stream only there (ADR 0055).
+or ended stream only there (ADR 0055). Every ERROR line the log holds is counted by kind too
+(`log_errors`, the total in `log_error_total`), so a record never reads no errors while its log holds
+one.
 
 A mover window (`--mover`, ADR 0083, ADR 0091) chooses its name once. In the regular session its strategy
 is the one named by the arguments: `Mover` for the schedule, or the one-share `SessionMaCross` bridge
@@ -1878,6 +1880,10 @@ class WindowReport:
     """The closes the account check sent that placed nothing: refused by Alpaca (403, 422), or never sent
     (a connect timeout); `errors` holds what each was answered."""
     errors: list[str] = field(default_factory=list)
+    """What went wrong that the window knows of: an account check that could not read or send, a call
+    left running, and the node log's ERROR lines, whose total and kinds `_read_stream_lines` notes
+    here. Empty only when the window met none and the log it read holds no ERROR line; the log is read
+    once the node has run."""
     part: str = ""
     """The part of the session the window ran in: `regular`, `pre-market`, `after-hours`, `overnight`."""
     strategy: str = DEFAULT_STRATEGY
@@ -1904,11 +1910,20 @@ class WindowReport:
     instrument_refusals: int = 0
     """The instrument notifications the node's log shows refused for a full command queue
     (`canon_alpaca.execution.INSTRUMENT_REFUSAL`): an upstream limit at a whole-market start, one line
-    for each instrument past the 1,024 the execution client's queue holds, counted here so that they are
-    one known number and not read as the window's errors. The instruments themselves are in the cache
-    (the adapter's README, "Instrument load and the command queue"). It is the whole window's count: a
-    notification refused later, while the queue held real commands, is in it too, so compare it with the
-    instruments the data client loaded less 1,024."""
+    for each instrument past the 1,024 the execution client's queue holds, counted here as one known
+    number apart from the stream lines: they are no stream error and fail no window. The instruments
+    themselves are in the cache (the adapter's README, "Instrument load and the command queue"). It is
+    the whole window's count: a notification refused later, while the queue held real commands, is in it
+    too, so compare it with the instruments the data client loaded less 1,024. Each is a log ERROR line,
+    so `log_errors` counts them too."""
+    log_errors: list[dict[str, Any]] = field(default_factory=list)
+    """The node log's ERROR lines by kind, most frequent first and at most `MAX_LOG_ERROR_KINDS`
+    (`_read_stream_lines`): the logger component as logged, less the node's trader ID, and the message
+    with numbers and identifiers removed, at most `MAX_LOG_ERROR_KIND_CHARS`, each
+    `{"kind": ..., "count": ...}`. `log_error_kinds` is how many kinds the log held and
+    `log_error_total` how many ERROR lines, so a truncated list still shows its scale."""
+    log_error_kinds: int = 0
+    log_error_total: int = 0
     warm_up_bars: int = 0
     warm_up_dropped: int = 0
     remakes_under_floor: int = 0
@@ -3785,14 +3800,62 @@ feed other than its stream's among them (`canon_alpaca.data`, ADR 0055; the pack
 LOG_LEVEL = re.compile(r"^\S+ \[(?P<level>[A-Z]+)\] ")
 """The level of a line of the node's plain-text log, `<timestamp> [LEVEL] <component>: <message>`."""
 MAX_STREAM_LINES = 20
+MAX_LOG_ERROR_KINDS = 10
+"""How many of a node log's ERROR kinds a record keeps, most frequent first; `log_error_kinds` and
+`log_error_total` say how many kinds and lines stood behind the list."""
+MAX_LOG_ERROR_KIND_CHARS = 200
+"""How long a kind may be: a line that carries a payload (a response body, a list of symbols) is cut
+there, in the record and in the note in `errors`."""
+LOG_NODE_PREFIX = re.compile(r"^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)+\.")
+"""How a node log's logger begins before its component: the node's own trader ID and a dot
+(`B-001.nautilus_live::python::client`, `CANON-PAPER-SESSION.AlpacaDataClient`). It differs between
+windows, so a kind leaves it out."""
+LOG_INSTRUMENT_ID = re.compile(r"\b[A-Z]{1,6}\.[A-Z]{2,10}\b")
+"""An instrument ID as the node logs it (`LLL.SIM`): a symbol and its venue, which a kind leaves out."""
+LOG_WORD = re.compile(r"[A-Za-z0-9_]+(?:[-.:/][A-Za-z0-9_]+)*")
+"""One word or identifier of a log line: a token holding a digit is a number or an identifier (a client
+order ID, a UUID, a timestamp, a code), which a kind leaves out."""
+
+
+def _without_variables(text: str) -> str:
+    """`text` with the numbers and identifiers a log line carries removed, so lines that differ only in
+    an order ID, a code or a time are one kind: an instrument ID goes whole, and any word holding a digit
+    with it."""
+    text = LOG_INSTRUMENT_ID.sub("", text)
+    text = LOG_WORD.sub(
+        lambda word: "" if any(c.isdigit() for c in word.group()) else word.group(), text
+    )
+    text = re.sub(r"\s+([,;:.])", r"\1", text)
+    return " ".join(text.split())
+
+
+def _error_text(line: str) -> str | None:
+    """What follows the level of an ERROR line of the node's log, `<component>: <message>`, or None when
+    the line is no ERROR line. The level is the line's own field (`LOG_LEVEL`), never an `[ERROR]` its
+    message quotes."""
+    level = LOG_LEVEL.match(line)
+    if level is None or level["level"] != "ERROR":
+        return None
+    return line[level.end() :]
+
+
+def _error_kind(text: str) -> str:
+    """An ERROR line's text after its level (`_error_text`) as a kind: its logger component as logged,
+    less the node's trader ID (`LOG_NODE_PREFIX`), so a component's own ID (`SessionMaCross-001`) stays,
+    and its message with the numbers and identifiers removed; at most `MAX_LOG_ERROR_KIND_CHARS`."""
+    component, _, message = text.partition(": ")
+    component = LOG_NODE_PREFIX.sub("", component, count=1)
+    return f"{component}: {_without_variables(message)}".strip()[:MAX_LOG_ERROR_KIND_CHARS]
 
 
 def _read_stream_lines(report: WindowReport, log: Path) -> None:
     """Copy the adapter's stream lines from the node's log (`STREAM_LINES`, at most `MAX_STREAM_LINES`,
     then a count) into `report.stream`: the log is where the adapter reports a stream Alpaca refused or
     that ended, since the subscription has returned by then (ADR 0055). Count, apart from them, the
-    instrument notifications upstream refused for a full queue (`report.instrument_refusals`). A log
-    that cannot be read is noted in `errors`."""
+    instrument notifications upstream refused for a full queue (`report.instrument_refusals`), and every
+    ERROR line the log holds by kind (`report.log_errors`, `report.log_error_kinds`,
+    `report.log_error_total`), noting the total in `report.errors`, so no record reads no errors while
+    its log holds one. A log that cannot be read is noted in `errors`."""
     # The node's logger writes on its own thread; wait until what it was sent is on disk
     # (`logging_sync_to_disk`, as the adapter's tests do).
     logging_sync_to_disk()
@@ -3808,6 +3871,35 @@ def _read_stream_lines(report: WindowReport, log: Path) -> None:
     report.stream = found[:MAX_STREAM_LINES]
     if len(found) > MAX_STREAM_LINES:
         report.stream.append(f"... and {len(found) - MAX_STREAM_LINES} more such lines")
+    # the same text once: a whole-market start logs thousands of lines that differ only in their time
+    texts = Counter(text for line in lines if (text := _error_text(line)) is not None)
+    kinds: Counter[str] = Counter()
+    others: Counter[str] = Counter()  # the kinds that are no instrument refusal
+    for text, count in texts.items():
+        kind = _error_kind(text)
+        kinds[kind] += count
+        if not all(mark in text for mark in INSTRUMENT_REFUSAL):
+            others[kind] += count
+    ranked = sorted(kinds.items(), key=lambda item: (-item[1], item[0]))
+    report.log_error_total = sum(kinds.values())
+    report.log_error_kinds = len(kinds)
+    report.log_errors = [
+        {"kind": kind, "count": count} for kind, count in ranked[:MAX_LOG_ERROR_KINDS]
+    ]
+    if not kinds:
+        return
+    # the note names the most frequent kind that is no instrument refusal, the known upstream limit at
+    # every whole-market start (`instrument_refusals`), so the line a reader of `errors` meets is the
+    # one that may matter
+    note = f"the node log holds {report.log_error_total} ERROR line(s) in {report.log_error_kinds} kind(s)"
+    refused = report.log_error_total - sum(others.values())
+    if not others:
+        _note(report, f"{note}, all of them instrument refusals")
+        return
+    if refused:
+        note += f", {refused} of them instrument refusals"
+    kind, count = min(others.items(), key=lambda item: (-item[1], item[0]))
+    _note(report, f"{note}; the most frequent{' other' if refused else ''}: {kind} ({count})")
 
 
 def _data_failure(report: WindowReport) -> str | None:
@@ -3818,11 +3910,7 @@ def _data_failure(report: WindowReport) -> str | None:
     published actor generation; with no slot ever opened that proves delivery without quote/trade
     subscriptions, otherwise an empty slot stream names all the symbols actually subscribed.
     """
-    if errors := [
-        line
-        for line in report.stream
-        if (level := LOG_LEVEL.match(line)) is not None and level["level"] == "ERROR"
-    ]:
+    if errors := [line for line in report.stream if _error_text(line) is not None]:
         return f"the {report.feed} data stream reported an error: {errors[0]}"
     if unsupported := next((line for line in report.stream if "NotImplementedError" in line), None):
         return f"an unimplemented data subscription: {unsupported}"
