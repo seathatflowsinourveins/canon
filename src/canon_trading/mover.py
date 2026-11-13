@@ -5503,11 +5503,14 @@ class Mover(Strategy):
         *,
         now: int | None = None,
         profile_price: Decimal | None = None,
+        found_holding: bool = False,
     ) -> TrailPlan:
         """Freeze T1 at entry. A spread floor or distance the cap forbids refuses the entry by name
         (`DistanceRefusal`); an unusable spread selects the configured fixed plan, and a cold ATR the
         fixed plan raised to the spread floor at the step (`_cold_plan`), by name. A held profile's
-        warm check supplies its completed close as the ATR basis, keeping `price` as its anchor."""
+        warm check supplies its completed close as the ATR basis, keeping `price` as its anchor.
+        `found_holding` lets protect retain an own-cap holding's distance without choosing an entry
+        size; that caller enforces `sizing.DISTANCE_CEILING` (ADR 0142, 2026-11-13)."""
         settings = self.settings
         if settings.trail_mode == "profile" and self.trail_profile is None:
             raise ValueError("profile document is missing; no profile entry is allowed")
@@ -5535,7 +5538,9 @@ class Mover(Strategy):
                 note="no usable quoted spread (missing/zero bid, crossed or locked): fixed trail fallback",
             )
         floor = settings.spread_floor_m * spread / price
-        if floor > TRAIL_CAP and (settings.trail_cap != "own" or not settings.size_from_budget):
+        if floor > TRAIL_CAP and (
+            settings.trail_cap != "own" or not (settings.size_from_budget or found_holding)
+        ):
             raise DistanceRefusal(
                 "floor_over_cap",
                 floor,
@@ -5602,8 +5607,8 @@ class Mover(Strategy):
         if floor >= selected:
             selected, bound = floor, "spread floor"
         if selected > TRAIL_CAP:
-            if settings.trail_cap == "own" and not settings.size_from_budget:
-                # only `plan_for_loss` carries a trail over the cap, its 0.10 ceiling refusing past it
+            if settings.trail_cap == "own" and not (settings.size_from_budget or found_holding):
+                # Entries need sizing; protect checks the ceiling for a holding already found.
                 raise DistanceRefusal(
                     "distance_over_cap",
                     selected,
