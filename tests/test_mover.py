@@ -1861,12 +1861,12 @@ def test_outside_the_session_every_order_is_marked_extended_hours() -> None:
     assert s.params == [EXTENDED_HOURS, EXTENDED_HOURS]
 
 
-def test_in_the_session_no_order_is_marked() -> None:
+def test_in_the_session_the_entry_is_unmarked_and_its_protective_sell_is_marked() -> None:
     eng = engine()
     s = strategy()
     run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, RISING + FALL))
     eng.dispose()
-    assert s.params == [None, None]
+    assert s.params == [None, EXTENDED_HOURS]
 
 
 def test_the_wind_down_outside_the_session_cancels_the_protection_and_sells_with_a_marked_limit() -> (
