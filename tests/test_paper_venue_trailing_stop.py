@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import threading
 import time
 from datetime import UTC
 from datetime import datetime
@@ -76,10 +77,11 @@ CENT = Decimal("0.01")
 READ_SECS = 20.0
 """How long one read waits for Alpaca's listing to show the stop as asked: the listing lags an order's
 events (`seam.close_held`'s last wait). UNCALIBRATED."""
-READ_FAILURES = (AssertionError, APIError, ValueError, OSError)
+READ_FAILURES = (AssertionError, APIError, ValueError, ArithmeticError, TypeError, OSError)
 """What a read may raise without ending the run: a listing that never settled, Alpaca's refusal, an answer
-that does not parse, and the network. The read is then recorded as failed and the walk goes on to its
-cancel, so the node stops by itself and the report still prints."""
+that does not parse (a number that is none is `decimal.InvalidOperation`, an `ArithmeticError`; a field
+of another type a `TypeError`), and the network. The read is then recorded as failed and the walk goes
+on to its cancel, so the node stops by itself and the report still prints."""
 
 
 def text(value: object) -> str:
@@ -109,30 +111,41 @@ def at_alpaca(trading: Any) -> dict[str, str]:
     }
 
 
-def read_stop(trading: Any, quantity: int, percent: Decimal, seconds: float = READ_SECS) -> dict:
+def read_stop(
+    trading: Any,
+    quantity: int,
+    percent: Decimal,
+    seconds: float = READ_SECS,
+    *,
+    stop: threading.Event | None = None,
+) -> dict:
     """One read of the stop, waiting up to `seconds` for the listing to show one order of the quantity
     and trail asked with its high-water mark set. What it last saw is returned either way; a read that
-    could not be made at all is returned as `{"failed": why}`, never raised."""
+    could not be made or parsed is returned as `{"failed": why}`, never raised. Once `stop` is set it
+    waits no more and returns what it has: the read runs on a worker thread, which cannot be canceled,
+    so this is how it ends with the node. A request already on its way still runs to the client's own
+    time limit."""
     deadline = time.monotonic() + seconds
     seen: dict[str, str] = {"failed": "no read was made"}
     while True:
+        settled = False
         try:
             seen = at_alpaca(trading)
-        except READ_FAILURES as e:
-            # the first line: pytest adds its own account of a failed assertion after it
-            seen = {"failed": f"{type(e).__name__}: {str(e).splitlines()[0] if str(e) else ''}"}
-        else:
             settled = (
                 Decimal(seen["quantity"]) == quantity
                 and seen["trail percent"] != "none"
                 and Decimal(seen["trail percent"]) == percent
                 and seen["high-water mark"] == "set"
             )
-            if settled:
-                return seen
-        if time.monotonic() >= deadline:
+        except READ_FAILURES as e:
+            # the first line: pytest adds its own account of a failed assertion after it
+            seen = {"failed": f"{type(e).__name__}: {str(e).splitlines()[0] if str(e) else ''}"}
+        if settled or time.monotonic() >= deadline:
             return seen
-        time.sleep(seam.STEP_SECS)
+        if stop is None:
+            time.sleep(seam.STEP_SECS)
+        elif stop.wait(seam.STEP_SECS):
+            return seen
 
 
 class Trailer(seam.Adopter):
@@ -270,18 +283,32 @@ def node_for(strategy: Any) -> LiveNode:
 
 
 async def reads(strategy: Any, trading: Any) -> None:
-    """Make the strategy's two reads when it waits for them, off the node's loop."""
+    """Make the strategy's two reads when it waits for them, off the node's loop. A read that raises
+    anything at all is given to the strategy as failed, so it cancels instead of waiting for a read
+    that will not come. When this ends, by the strategy's end or by being canceled, a read still on
+    its thread is told to stop."""
     asked = {"first": (SHARES, FIRST_BPS / 100), "second": (SHARES - 1, SECOND_BPS / 100)}
-    while strategy.phase != "done":
-        for name, (quantity, percent) in asked.items():
-            if strategy.phase == f"waiting for the {name} read" and name not in strategy.read:
-                strategy.read[name] = await asyncio.to_thread(read_stop, trading, quantity, percent)
-        await asyncio.sleep(seam.STEP_SECS)
+    stop = threading.Event()
+    try:
+        while strategy.phase != "done":
+            for name, (quantity, percent) in asked.items():
+                if strategy.phase == f"waiting for the {name} read" and name not in strategy.read:
+                    try:
+                        strategy.read[name] = await asyncio.to_thread(
+                            read_stop, trading, quantity, percent, stop=stop
+                        )
+                    except Exception as e:  # noqa: BLE001 - whatever it is, the walk must hear of it
+                        strategy.read[name] = {"failed": type(e).__name__}
+            await asyncio.sleep(seam.STEP_SECS)
+    finally:
+        stop.set()
 
 
 def run(strategy: Trailer, seconds: float, trading: Any) -> None:
     """Run the node while the test reads Alpaca's open order at the strategy's two waits. The reads
-    end when the node does, whatever ended it, so a node that stopped by itself is not waited for."""
+    end when the node does, whatever ended it, so a node that stopped by itself is not waited for; a
+    read on its thread then stops at its next wait (`read_stop`), since the run joins its threads
+    before the node is disposed."""
     node = node_for(strategy)
 
     async def hosted() -> None:

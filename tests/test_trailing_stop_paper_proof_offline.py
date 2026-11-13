@@ -9,6 +9,8 @@ What these cannot show is what the paper run is for: that Alpaca accepts, replac
 
 from __future__ import annotations
 
+import asyncio
+import threading
 import time
 from decimal import Decimal
 from types import SimpleNamespace
@@ -324,6 +326,88 @@ def test_a_read_that_never_settles_returns_what_it_last_saw_and_raises_nothing(
     listing(monkeypatch, [answer])
     read = paper.read_stop(object(), 2, Decimal(5), seconds=0.0)
     assert {name: read[name] for name in kept} == kept
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [{"qty": None}, {"hwm": ""}, {"trail_percent": "wide"}, {"stop_price": "n/a"}],
+    ids=["no-quantity", "empty-mark", "trail-not-a-number", "stop-not-a-number"],
+)
+def test_a_listing_whose_numbers_do_not_parse_is_a_failed_read_and_raises_nothing(
+    monkeypatch: pytest.MonkeyPatch, changes: dict[str, Any]
+) -> None:
+    """alpaca-py types these fields as optional text and checks no number in them: one that does not
+    parse is a read that failed, recorded like any other, so the walk goes on to its cancel."""
+    listing(monkeypatch, [[alpaca_order(**changes)]])
+    read = paper.read_stop(object(), 2, Decimal(5), seconds=0.0)
+    assert list(read) == ["failed"] and read["failed"]
+
+
+def test_a_read_that_raises_what_nobody_expected_is_recorded_for_the_strategy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Whatever a read raises, the strategy is told it failed: it then cancels the stop at once and
+    does not wait out its time limit for a read that will never come."""
+    walk: Any = working()
+
+    def broken(*_: Any, **__: Any) -> dict:
+        raise RuntimeError("not one of the failures a read names")
+
+    monkeypatch.setattr(paper, "read_stop", broken)
+
+    async def hosted() -> None:
+        reading = asyncio.ensure_future(paper.reads(walk, object()))
+        async with asyncio.timeout(5):
+            while "first" not in walk.read:
+                await asyncio.sleep(0.01)
+        walk.phase = "done"
+        await reading
+
+    asyncio.run(hosted())
+    assert walk.read == {"first": {"failed": "RuntimeError"}}
+    walk.phase = "waiting for the first read"
+    assert walk.step() == "waiting for the sell's cancel" and walk.canceled == [OURS]
+
+
+def test_a_read_in_flight_ends_with_the_node_and_does_not_hold_the_run_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A read runs on a worker thread, which nothing can cancel, and the run waits for its threads
+    before the node is disposed and the account cleaned. So the read is told when the node has
+    ended, and stops waiting for the listing."""
+    started = threading.Event()
+    told: list[bool] = []
+
+    def slow(*_: Any, stop: threading.Event | None = None, **__: Any) -> dict:
+        started.set()
+        told.append(stop is not None and stop.wait(3.0))
+        if stop is None:
+            time.sleep(3.0)
+        return {}
+
+    class EndsDuringTheRead(EndedNode):
+        async def run_async(self) -> None:
+            while not started.is_set():
+                await asyncio.sleep(0.01)
+
+    node = EndsDuringTheRead()
+    monkeypatch.setattr(paper, "node_for", lambda strategy: node)
+    monkeypatch.setattr(paper, "read_stop", slow)
+    walk: Any = working()
+    began = time.monotonic()
+    paper.run(walk, 30, object())
+    assert time.monotonic() - began < 1.5 and node.disposed
+    assert told == [True]
+
+
+def test_a_read_told_to_stop_returns_what_it_last_saw_without_another_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reads = listing(monkeypatch, [[alpaca_order(hwm=None)]])
+    stop = threading.Event()
+    stop.set()
+    read = paper.read_stop(object(), 2, Decimal(5), stop=stop)
+    assert len(reads) == 1 and read["high-water mark"] == "none"
 
 
 def test_a_refused_replace_cancels_the_stop_and_names_the_reason() -> None:
