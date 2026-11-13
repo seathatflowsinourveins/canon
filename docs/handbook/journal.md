@@ -134,16 +134,3 @@ ten fields as list lines, in this order, each with a value:
 * status: adopted
 * supersedes: none
 * source: lead
-
-### L0008: A record kept to observe a hand-over could fail the window it observed
-
-* area: execution
-* session: 2026-11-13
-* result: The first build of the feed hand-over made a window exit 1 when its stream-gap record could not be read or written, and an unreadable state file would have failed every later window until it was removed by hand; the same build accepted a carry flag the window's program does not take, so a carrying run would have taken its locks and then stopped on its arguments. Both were found by review before landing, with no paper window affected
-* evidence: tests/test_feed_handover.py, the cases a measurement failure never changes the window's exit code and a bad state file is overwritten
-* lesson: An observation is said and never decides an exit code, and plumbing for a flag lands with the program that reads the flag, not before it
-* change: the observer reports its failures on stderr only and overwrites a bad state file, it is named for what it measures (the stream gap, not the seconds a held long has no armed stop), and the carry plumbing waits for the units that bring the flag
-* next: The seconds a held long has no armed stop, from node stop to re-arm, measured beside the stream gap once the carrying node exists
-* status: open
-* supersedes: none
-* source: review
