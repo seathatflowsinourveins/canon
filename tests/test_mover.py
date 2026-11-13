@@ -2333,7 +2333,9 @@ def test_a_trailing_sell_on_the_last_trade_is_not_remade_while_only_the_bid_is_a
     None
 ):
     """With `LAST_PRICE` the sell's offsets are on the step of the last trade, so the step is judged
-    stale by the last trade too: a bid at a dollar over a last trade under it changes nothing."""
+    stale by the last trade too: a bid at a dollar over a last trade under it changes nothing. The
+    trailing sell starts from a print after the entry's fill, never one cached before it
+    (`Mover._followed`), so one print under a dollar follows the fill."""
     eng = engine()
     s = strategy(
         max_notional=Decimal(1000),
@@ -2354,6 +2356,19 @@ def test_a_trailing_sell_on_the_last_trade_is_not_remade_while_only_the_bid_is_a
         )
         for t in range(last + SECOND, last + 12 * SECOND, 2 * SECOND)
     ]
+    after = last + 2 * SECOND
+    data.append(
+        TradeTick(
+            AAA,
+            Price(0.95, 4),
+            Quantity.from_int(100),
+            AggressorSide.BUY,
+            TradeId("A"),
+            after,
+            after,
+        )
+    )
+    data.sort(key=lambda d: d.ts_init)
     orders = run(eng, s, ranker(rank((AAA, "0.25"))), data)
     trailing = [o for o in orders if o.side == OrderSide.SELL]
     eng.dispose()
@@ -2860,6 +2875,11 @@ class Seam:
     _remade = Mover._remade
     _persistent_trail = Mover._persistent_trail
     _followed = Mover._followed
+    _holding_trade = Mover._holding_trade
+    _entry_filled_ns = Mover._entry_filled_ns
+    _holding_since = Mover._holding_since
+    on_quote = Mover.on_quote
+    on_trade = Mover.on_trade
     _limit_sell = Mover._limit_sell
     _sell_out = Mover._sell_out
     _time_out = Mover._time_out

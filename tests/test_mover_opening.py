@@ -463,7 +463,7 @@ ADDED_SINCE_P1 = {
         "remakes_under_floor",
     ),
     "entry": ("profile", "arming", "trail_cap", "spread_floor", "own_measure", "entry_price"),
-    "exit": ("sales",),
+    "exit": ("sales", "held_stop_kept", "held_stop_from_average"),
     "rows": (
         "profile_k",
         "profile_pctl",
