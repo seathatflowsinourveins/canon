@@ -3418,21 +3418,33 @@ class Mover(Strategy):
         """S2 under #320's held stop: an entry sized for L holds its stop L under the average fill,
         rounded up onto the step (`fill_trigger`), the level its trailing sell would start from, and
         follows the average as the entry fills further, as a trailing sell remade for all that is held
-        would; a trigger a trailed sale had reached still holds it up. A recorded tightening's trail, or
-        no room for L, keeps #320's level at the trail's distance (`l_in_force`)."""
+        would; a trigger a trailed sale had reached still holds it up. A recorded tightening (the
+        ratchet's, the warmed ATR's or a profile's) follows the average too, at the distance in force
+        (`offsets_in_force`: the tightened trail, never wider than L), so a later fill at a higher
+        average moves the stop (dsh-reader-337, P1). No room for L under the average keeps #320's
+        level, tightened or not."""
         if slot.sized_loss is None:
             return
         anchor = self._held_anchor(slot)
-        if anchor is None or l_in_force(slot, anchor) is None:
+        if anchor is None or fill_trigger(anchor, slot.sized_loss) is None:
             return
-        at_l = fill_trigger(anchor, slot.sized_loss)
+        distance = slot.sized_loss
+        if slot.tightened:
+            plan = slot.trail_plan
+            distance = offsets_in_force(
+                slot,
+                anchor,
+                self.settings.trail if plan is None else plan.trail,
+                self.settings.exit_through if plan is None else plan.exit_through,
+            )[0]
+        at_l = fill_trigger(anchor, distance)
         if at_l is None:
             return
         reached = None if slot.trail_trigger is None else stop_trigger_price(slot.trail_trigger)
         slot.held_stop = at_l if reached is None else max(at_l, reached)
         slot.protection_anchor = anchor
         if slot.exit_record is not None:
-            slot.exit_record.trail_distance = slot.sized_loss
+            slot.exit_record.trail_distance = distance
         if slot.entry_record is not None:
             slot.entry_record["held_stop_level"] = str(slot.held_stop)
 
