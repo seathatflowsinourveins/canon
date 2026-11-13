@@ -14,6 +14,7 @@ under both levels, stands for 1 ms just after the sweep, then the bid recovers."
 
 from __future__ import annotations
 
+from collections import deque
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any
@@ -141,3 +142,87 @@ def test_a_cached_print_older_than_the_entry_is_not_followed_at_a_remake() -> No
     )
     cast(Any, seam)._protect(slot, Decimal(3), T0 + 21 * SECOND)
     assert [o.kind for o in seam.sent] == ["LIMIT"] and slot.exiting
+
+
+def holding(trigger: TriggerType, bid: str = "0", ask: str = "0") -> tuple[Any, Any, int, list]:
+    """A Seam whose entry E-1 filled 3 at 10.00, its quote `bid`/`ask`, and a cache whose last trade is
+    the last of the returned list (none at first)."""
+    seam = cast(Any, Seam(bid, trigger=trigger))
+    slot = seam_slot(seam)
+    filled = T0 + 10 * SECOND
+    seam.fills = [("E-1", OrderSide.BUY.name, "3", "10.00", filled)]
+    seam.orders["E-1"].client_order_id = slot.entry_id
+    last: list = []
+    quote = SimpleNamespace(bid_price=Price.from_str(bid), ask_price=Price.from_str(ask))
+    seam.cache = SimpleNamespace(
+        quote=lambda _id: quote, trade=lambda _id: last[-1] if last else None
+    )
+    return seam, slot, filled, last
+
+
+def stamped(price: str, event: int, received: int) -> SimpleNamespace:
+    return SimpleNamespace(price=Price.from_str(price), ts_event=event, ts_init=received)
+
+
+def test_under_the_bid_the_held_stop_reads_the_last_trade_as_on_main() -> None:
+    """A `bid_ask` window is as on main (#320): its held stop reads the cache's last trade, whatever its
+    stamp, and a trade at 9.70 under the held stop sells at once (code-review-high-trig-win/1)."""
+    seam, slot, filled, last = holding(TriggerType.BID_ASK)
+    last.append(stamped("9.7000", filled - SECOND, filled - SECOND))
+    seam._protect(slot, Decimal(3), filled + SECOND)
+    assert [o.kind for o in seam.sent] == ["LIMIT"] and slot.exiting
+    assert slot.exit_record.trigger_reason == "held stop (last trade)"
+
+
+def test_under_a_print_trigger_a_close_older_than_a_stale_print_is_no_price_either() -> None:
+    """Under `last_price` the cache's print is from before the entry, so no price of this holding is
+    known: a minute close, no newer than that print, does not sell through the held stop either
+    (code-review-high-trig-win/1)."""
+    seam, slot, filled, last = holding(TriggerType.LAST_PRICE)
+    slot.closes = deque([Decimal("9.70")], maxlen=4)
+    last.append(stamped("9.9900", filled - SECOND, filled - SECOND))
+    seam._protect(slot, Decimal(3), filled + SECOND)
+    assert seam.sent == [] and not slot.exiting and slot.held_stop is not None
+
+
+def test_under_a_print_trigger_a_two_sided_quote_holds_past_60_s_without_a_print() -> None:
+    """Under `last_price` no print since the fill is no followed price, but the quote is two-sided:
+    #320's `unpriced_exit` is for a holding with no two-sided quote, so 61 s on nothing is sold; it
+    waits for a print or the wind-down, as the handbook says (code-review-high-trig-win/2)."""
+    seam, slot, filled, _ = holding(TriggerType.LAST_PRICE, bid="10.05", ask="10.07")
+    seam._protect(slot, Decimal(3), filled + SECOND)
+    seam._protect(slot, Decimal(3), filled + 61 * SECOND)
+    assert seam.sent == [] and not slot.exiting
+
+
+def test_under_a_print_trigger_a_one_sided_quote_still_sells_after_60_s() -> None:
+    """The control: with no print and a one-sided quote, #320's `unpriced_exit` still sells at 60 s."""
+    seam, slot, filled, _ = holding(TriggerType.LAST_PRICE)
+    seam._protect(slot, Decimal(3), filled + SECOND)
+    seam._protect(slot, Decimal(3), filled + 61 * SECOND)
+    assert [o.kind for o in seam.sent] == ["LIMIT"]
+    assert slot.exit_record.trigger_reason == "unpriced_exit"
+
+
+def test_a_print_after_the_fill_by_the_venues_clock_is_followed_whatever_its_receipt() -> None:
+    """A print the venue stamped 200 ms after the fill is of this holding even if this host received it
+    at a time before the fill on its own clock: the boundary compares venue times only
+    (code-review-high-trig-win/5)."""
+    seam, slot, filled, last = holding(TriggerType.LAST_PRICE, bid="10.05", ask="10.07")
+    last.append(stamped("10.0500", filled + 200 * MS, filled - 300 * MS))
+    assert seam._followed(slot) == Decimal("10.05")
+
+
+def test_under_a_print_trigger_a_quote_turning_one_sided_mid_hold_sells_at_the_next_step() -> None:
+    """The one bound short of the wind-down on a print trigger's hold: two-sided with no print, the
+    holding is held past 60 s; once its quote reads one-sided it sells as `unpriced_exit` at the next
+    step (the lead's counted limit, 2026-11-12)."""
+    seam, slot, filled, _ = holding(TriggerType.LAST_PRICE, bid="10.05", ask="10.07")
+    seam._protect(slot, Decimal(3), filled + SECOND)
+    seam._protect(slot, Decimal(3), filled + 61 * SECOND)
+    assert seam.sent == [] and not slot.exiting
+    one_sided = SimpleNamespace(bid_price=Price.from_str("0"), ask_price=Price.from_str("10.07"))
+    seam.cache.quote = lambda _id: one_sided
+    seam._protect(slot, Decimal(3), filled + 62 * SECOND)
+    assert [o.kind for o in seam.sent] == ["LIMIT"] and slot.exiting
+    assert slot.exit_record.trigger_reason == "unpriced_exit"

@@ -3688,7 +3688,12 @@ class Mover(Strategy):
             self._end_hold(slot, now, "held_stop")
             self._limit_sell(slot, held, now, slot.floor, anchor=last)
             return
-        if now - slot.held_since >= HOLD_MOST_SECS * SECOND_NS:
+        # `unpriced_exit` is for a holding with no two-sided quote; under `LAST_PRICE` one with a
+        # two-sided quote and no print of its own waits for a print or the wind-down
+        if now - slot.held_since >= HOLD_MOST_SECS * SECOND_NS and not (
+            self.settings.trigger == TriggerType.LAST_PRICE
+            and quoted_spread(self.cache.quote(slot.instrument_id)) is not None
+        ):
             anchor = last if last is not None else slot.protection_anchor
             slot.exiting = True
             self._mark_exit(slot, now, last, "unpriced_exit")
@@ -3771,9 +3776,13 @@ class Mover(Strategy):
         return kept[1] if kept is not None else self._last_known(slot)[0]
 
     def _last_known(self, slot: Slot) -> tuple[Decimal | None, str]:
-        """The last trade of this holding (`_holding_trade`), else the latest minute close: what the held
-        stop reads."""
-        trade = self._holding_trade(slot)
+        """The last trade the cache has, else the latest minute close: what the held stop reads. Under
+        `LAST_PRICE` only a trade of this holding (`_holding_trade`): when the cache's last trade is from
+        before the entry, no minute close is newer, so nothing is known; under `BID_ASK` as #320 made it."""
+        trade = self.cache.trade(slot.instrument_id)
+        if trade is not None and self.settings.trigger == TriggerType.LAST_PRICE:
+            trade = self._holding_trade(slot)
+            return (None, "none") if trade is None else (trade.price.as_decimal(), "last trade")
         if trade is not None:
             return trade.price.as_decimal(), "last trade"
         if slot.closes:
@@ -3840,16 +3849,17 @@ class Mover(Strategy):
         return None if trade is None else trade.price.as_decimal()
 
     def _holding_trade(self, slot: Slot) -> Any:
-        """The cache's last trade, or None when it is stamped before the entry's first fill: such a print
-        is not of this holding, and one stray print would set the trigger, meet a kept one or go through
-        the held stop (`_persistent_trail` never takes the print cached before arming either). Its stamp
-        is the earlier of its event and receipt (`on_trade`)."""
+        """The cache's last trade, or None when the venue stamped it before the entry's first fill on
+        record: such a print is not of this holding, and one stray print would set the trigger, meet a
+        kept one or go through the held stop (`_persistent_trail` never takes the print cached before
+        arming either). Both times are the venue's (the print's `ts_event`, the fill's), so this host's
+        clock does not move the boundary. With no entry fill on record it is the cache's last trade."""
         trade = self.cache.trade(slot.instrument_id)
         if trade is None:
             return None
         entry = None if slot.entry_id is None else slot.entry_id.value
         filled = min((ns for cid, _, _, _, ns in self.fills if cid == entry), default=None)
-        if filled is not None and min(int(trade.ts_event), int(trade.ts_init)) < filled:
+        if filled is not None and int(trade.ts_event) < filled:
             return None
         return trade
 

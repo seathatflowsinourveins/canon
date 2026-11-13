@@ -79,6 +79,13 @@ The count, with `breach_count` or `high_count` above one, on trade prints only (
 * **No paper window has run it**, and none can: the trigger has a window flag (`--trigger`), but the
   count rows have none yet (the selection unit). Closed by that flag and a window whose record names
   the rows.
+* **No print trigger overnight.** The trade-condition filter a print trigger turns on is read for
+  sip's tapes A, B and C only, so an overnight part, which streams boats, refuses `--trigger
+  last_price` by name, and a full window on the bid is refused (the lead, 2026-11-12): account B
+  stands idle from 20:00 to 04:00. Closed by an overnight measure on paper, for the names a ranking
+  picks, of how often each prints on boats and its longest gap (a print trigger sells nothing while a
+  name does not print), of the condition codes boats prints carry and which of them Alpaca's boats
+  minute bars take, and of how often a boats quote is one-sided.
 * **The protector does not use it, and the Mover only on the fixed trail.** A trail plan's distance,
   its tighten and its chase cap (ADR 0088's `trail_mode`) are
   not carried into the held level. Closed by that change in each, with its tests.

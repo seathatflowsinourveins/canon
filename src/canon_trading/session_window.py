@@ -760,9 +760,10 @@ class WindowConfig:
     """What elects the Mover's emulated trailing sell (`MoverConfig.trigger`): `bid_ask`, the bid of
     every quote, or `last_price`, a trade print (persistence step 1, the lead's ruling of 2026-11-12).
     Chosen per window by --trigger; UNCALIBRATED. Under `last_price` a name that stops printing is not
-    sold however far its bid falls, until a print or the wind-down, the remade sell's check included
-    (`Mover._followed` reads the last trade, which can be minutes old outside the regular session, and
-    none from before the entry's fill). It turns the data client's trade-condition filter on
+    sold however far its bid falls, until a print, the wind-down, or 60 s with no two-sided quote (#320's
+    `unpriced_exit`), the remade sell's check and the held stop included (`Mover._followed` reads the last
+    trade, which can be minutes old outside the regular session, and none from before the entry's fill).
+    Overnight it is refused: the part streams boats, not sip. It turns the data client's trade-condition filter on
     (`PRINT_TRIGGERS`)."""
     spares: int = MOVER_SPARES
     """Additional qualified startup names watched by Mover, beyond its held slots."""
