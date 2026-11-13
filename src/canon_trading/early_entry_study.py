@@ -500,8 +500,9 @@ def protect(
     is NautilusTrader's default bar path, open, high, low, close (docs/concepts/backtesting/
     bar-execution.md at v2.0.0rc8). `adaptive` is its other documented path,
     `bar_adaptive_high_low_ordering`: the low first unless the open is strictly nearer the high
-    (crates/execution/src/matching_engine/mod.rs:2400-2402), then the close; a sale on that low,
-    before the bar's high is reached, is why "trail-low". `unfilled` returns a
+    (crates/execution/src/matching_engine/mod.rs:2400-2402), then the close. The open still raises the
+    trigger first (`mod.rs:2085-2108`, trailing maintenance after each update at `:4635-4643`), and a
+    sale on that low, before the bar's high is reached, is why "trail-low". `unfilled` returns a
     limit still resting at the floor after the last bar as an Exit at that bar's close bid, why
     "unfilled", instead of None.
     """
@@ -529,6 +530,8 @@ def protect(
                 return Exit(bar.start + 1, floor, "floor", first, trigger, raises)
             continue
         if adaptive and not bar.high - bar.open < bar.open - bar.low:  # open, low, high, close
+            if bids[0] - trailing > trigger:  # the open is the first price the trail follows
+                trigger, raises = bids[0] - trailing, raises + 1
             if bids[2] <= trigger:
                 return Exit(bar.start + 1, trigger, "trail-low", first, trigger, raises)
             if bids[1] - trailing > trigger:

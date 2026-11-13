@@ -497,6 +497,7 @@ def shard_file(path: Path, spec: str, **metadata) -> Path:
         "development": [str(DAY)],
         "lookback": [],
         "catalog": "c",
+        "universe_sha256": "u",
         "slot_budget": None,
         **metadata,
     }
@@ -870,3 +871,107 @@ def test_the_summary_tables_f2s_per_entry_figures_by_ticks() -> None:
     assert "F2" in text and "under 3" in text
     rows = [line for line in text.splitlines() if line.startswith("| tier:")]
     assert rows == ["| tier:other | reclaim | 0 | 1 -50.0 -50; 1 -70.0 -70 | -; - | -; - | -; - |"]
+
+
+# The second read of the gate (2026-11-12): each test names the bias it removes.
+
+
+def test_an_adaptive_walk_raises_the_stop_on_the_bars_open_before_its_low() -> None:
+    # Low-first tested the low against the trigger before the open had raised it, so a bar that
+    # opened up and fell through the raised trigger was held to the close.
+    bar = (study.Minute(600, 11.0, 12.0, 10.7, 11.9, 100),)
+    out = study.protect(bar, 10.0, 10.0, study.GROSS, adaptive=True)
+    assert out is not None and out.why == "trail-low"
+    assert out.price == pytest.approx(10.8)
+    default = study.protect(bar, 10.0, 10.0, study.GROSS)
+    assert default is not None and (default.why, default.price) == ("trail", pytest.approx(11.8))
+
+
+def test_a_top_tier_opening_entry_ends_with_the_scaffold_once_the_name_has_listed(
+    monkeypatch,
+) -> None:
+    # The opening arm let a top-tier name in on any bar, while every other run watches it only
+    # until it first lists and then only while it is listed.
+    tape = bars([10.0, 9.5, 9.6, 9.7])
+    monkeypatch.setattr(study, "listing", listed_at(tape, {570}))
+    context = r3.ReplayContext(replace(day([]), bars=tape), {}, True)
+    assert not context.watched(3)
+    assert context.initial("fixed", 2, 0, (15, 1)) is None
+    # Before its first listing the scaffold still lets the same top-tier name in.
+    monkeypatch.setattr(study, "listing", listed_at(tape, set()))
+    scaffold = r3.ReplayContext(replace(day([]), bars=tape), {}, True)
+    signal = scaffold.initial("fixed", 2, 0, (15, 1))
+    assert signal is not None and signal.index == 3
+
+
+def test_a_sale_already_on_the_step_after_cost_is_not_floored_a_cent_lower() -> None:
+    # 12.00 less 100 bps is 11.88 exactly; in floats it is 11.879999..., which the step floored to
+    # 11.87, a cent a share against the strategy times every share S1 sized.
+    from decimal import Decimal
+
+    tape = tuple(study.Minute(570 + i, 12, 12, 12, 12, 10_000_000) for i in range(2))
+    context = r3.ReplayContext(replace(day([]), bars=tape), {}, True, slot_budget=Decimal(20_000))
+    assert context.sale("fixed", 0, 100)["sold"] == pytest.approx(11.88)
+
+
+def test_a_cost_loaded_ask_between_ticks_is_rounded_up_not_down() -> None:
+    # 0.0100 plus 5 bps is 0.010005; entry_price's nudge, meant for float noise on a quote, took it
+    # to 0.0100, under the ask, and S1 sized and the entry was charged at that price.
+    from decimal import Decimal
+
+    tape = tuple(study.Minute(570 + i, 0.01, 0.01, 0.01, 0.01, 10_000_000) for i in range(2))
+    context = r3.ReplayContext(replace(day([]), bars=tape), {}, True, slot_budget=Decimal(20_000))
+    sold = context.sale("fixed", 0, 5)
+    assert sold["entry"] == pytest.approx(0.0101)
+    assert sold["shares"] == 495_049  # the flow cap, 5,000 dollars at 0.0101
+
+
+def test_a_position_held_to_the_close_gives_back_from_the_last_bars_high() -> None:
+    # The last bar's high was left out of the peak on a hold to the close, though both bar orders
+    # visit it before the close.
+    tape = (study.Minute(570, 10, 10, 10, 10, 100), study.Minute(571, 10, 10.1, 10, 10.05, 100))
+    context = r3.ReplayContext(replace(day([]), bars=tape), {}, True)
+    sold = context.sale("fixed", 0, 0)
+    assert sold["why"] == "close" and sold["peak"] == pytest.approx(10.1)
+    assert sold["given_back"] == pytest.approx(0.05)
+
+
+def test_a_merge_refuses_shards_that_partitioned_different_symbol_lists(
+    tmp_path, monkeypatch
+) -> None:
+    # Each shard listed the catalog when it ran; a symbol added between shards made B counted twice
+    # and A and C never, and the merge compared only the catalog's path.
+    root = tmp_path / "catalog" / "data" / "bars"
+    for name in ("B", "C"):
+        (root / f"{name}.ALPACA-1-MINUTE-LAST-EXTERNAL").mkdir(parents=True)
+    sessions = tmp_path / "sessions.txt"
+    sessions.write_text(f"{DAY} development\n")
+    monkeypatch.setattr(r3, "load_symbol", lambda *a: [])
+    output = tmp_path / "output"
+    common = ["--catalog", str(tmp_path / "catalog"), "--sessions", str(sessions)]
+    assert r3.main([*common, "--output", str(output), "--name", "s0", "--shard", "0/2"]) == 0
+    (root / "A.ALPACA-1-MINUTE-LAST-EXTERNAL").mkdir()
+    assert r3.main([*common, "--output", str(output), "--name", "s1", "--shard", "1/2"]) == 0
+    with pytest.raises(ValueError, match="universe"):
+        r3.merge([output / "s0.jsonl", output / "s1.jsonl"], output, "merged")
+
+
+def test_the_run_hashes_s1_and_the_price_step_its_sizes_and_prices_come_from() -> None:
+    # The hashes named the replay and the study only, so a changed sizing or step module in the
+    # working tree merged with runs of the committed one.
+    import hashlib
+
+    from canon_trading import price_step
+    from canon_trading import sizing
+
+    hashes = r3.code_hashes()
+    for module in (sizing, price_step):
+        path = Path(module.__file__)
+        assert hashes[path.name] == hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_a_merge_refuses_shards_that_recorded_no_symbol_list(tmp_path) -> None:
+    # Shards that all lacked the list's hash compared equal (None), so the list went unchecked.
+    old = [shard_file(tmp_path / f"{k}.jsonl", f"{k}/2", universe_sha256=None) for k in (0, 1)]
+    with pytest.raises(ValueError, match="universe"):
+        r3.merge(old, tmp_path, "old")
