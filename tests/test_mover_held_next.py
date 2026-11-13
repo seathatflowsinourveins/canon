@@ -206,11 +206,12 @@ def test_profile_distance_refuses_non_finite_or_negative_atr_by_value_error(bad_
 
 
 def test_the_rows_table_names_profile_and_the_opening_rows():
-    rows = (Path(__file__).parents[1] / "docs/handbook/rows.md").read_text()
-    trail_mode = next(row for row in rows.splitlines() if row.startswith("| `TRAIL_MODE`"))
+    rows = Path(__file__).parents[1] / "docs/handbook/rows"
+    lines = [row for path in rows.rglob("*.md") for row in path.read_text().splitlines()]
+    trail_mode = next(row for row in lines if row.startswith("| `TRAIL_MODE` |"))
     assert "profile" in trail_mode
     for name in ("OPENING_ARM", "OPENING_MINUTES", "OPENING_F"):
-        assert any(row.startswith(f"| `{name}`") for row in rows.splitlines()), name
+        assert any(row.startswith(f"| `{name}` |") for row in lines), name
 
 
 @pytest.mark.parametrize("refused", [True, False], ids=["refused", "closed"])

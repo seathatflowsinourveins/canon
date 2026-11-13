@@ -38,6 +38,8 @@ from nautilus_trader.model import ClientOrderId
 from nautilus_trader.model import Currency
 from nautilus_trader.model import Equity
 from nautilus_trader.model import InstrumentId
+from nautilus_trader.model import InstrumentStatus
+from nautilus_trader.model import MarketStatusAction
 from nautilus_trader.model import Money
 from nautilus_trader.model import OmsType
 from nautilus_trader.model import OrderSide
@@ -102,10 +104,16 @@ FALL = [10.46, 10.00, 9.90, 9.80]
 
 
 def engine(
-    *, order_cap: Decimal | None = None, liquid: bool = False, cash: Decimal = Decimal(100_000)
+    *,
+    order_cap: Decimal | None = None,
+    liquid: bool = False,
+    cash: Decimal = Decimal(100_000),
+    attributes: dict[InstrumentId, list[str]] | None = None,
 ) -> BacktestEngine:
     """The engine; with `order_cap`, the risk engine's per-order notional cap on AAA, as a node sets it
-    (`paper_node.risk_limits`); with `liquid`, a fill takes no more than the quote's size."""
+    (`paper_node.risk_limits`); with `liquid`, a fill takes no more than the quote's size; with
+    `attributes`, those instruments' `info` carries Alpaca's asset `attributes` list, as
+    `canon_alpaca.providers.parse_equity` always sets it (providers.py:562)."""
     risk = (
         RiskEngineConfig()
         if order_cap is None
@@ -131,7 +139,16 @@ def engine(
                 price_increment=Price.from_str("0.0001"),
                 ts_event=0,
                 ts_init=0,
-                info={"name": "Example Inc. Common Stock", "status": "active", "tradable": True},
+                info={
+                    "name": "Example Inc. Common Stock",
+                    "status": "active",
+                    "tradable": True,
+                    **(
+                        {"attributes": attributes[instrument_id]}
+                        if attributes and instrument_id in attributes
+                        else {}
+                    ),
+                },
             )
         )
     return eng
@@ -3515,3 +3532,179 @@ def test_a_name_unwatched_after_its_sale_keeps_its_sale_price_for_state_reentry(
     eng.dispose()
     assert bought == [AAA, AAA]
     assert Decimal(s.record()["entries"][1]["reentry"]["sale_price"]) == Decimal("10.45")
+
+
+# --- no position without its exit (the lead's rule) ----------------------------------------------------
+# Each gap case fails today on the assertion that states the rule; its fix is another unit's, and the
+# xfail is strict so that the fix turns it into a failure here until the mark is removed.
+
+
+@pytest.mark.no_position_without_its_exit
+@pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason="no order into a halt is not built (mover.py:240-242); its fix is a separate unit",
+)
+def test_no_entry_is_sent_into_a_name_whose_trading_is_halted() -> None:
+    """AAA's trading is halted two minutes before its run qualifies, and the halt is replayed through the
+    engine as Alpaca's status would arrive: no buy is sent into it. The simulated venue rejects such a buy;
+    how Alpaca treats one is UNVERIFIED, so the rule is held at the send.
+    Today `_buy` (mover.py:5000) reads no trading status and the strategy subscribes to none."""
+    eng = engine()
+    s = strategy()
+    halt = InstrumentStatus(AAA, MarketStatusAction.HALT, T0 + 3 * MINUTE, T0 + 3 * MINUTE)
+    orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, RISING), [halt])
+    buys = [o for o in orders if o.side == OrderSide.BUY]
+    eng.dispose()
+    assert buys == [], f"a buy was sent into the halt: {sides(buys)}"
+
+
+@pytest.mark.no_position_without_its_exit
+@pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason="overnight eligibility is read only for startup names (session_window.py:3938); "
+    "its fix for on-demand names is a separate unit",
+)
+def test_no_overnight_entry_into_an_on_demand_name_that_is_not_overnight_tradable() -> None:
+    """In the overnight part (feed `boats`, `OVERNIGHT_HISTORY_FEED`) BBB is loaded on demand and its
+    asset attributes (`Equity.info`) carry no `overnight_tradable`: no buy is sent. Today a name loaded on
+    demand (`_instrument_ready`, mover.py:3411) goes to `_buy` with no eligibility read, which
+    session_window.py:2666, :3245 and :3330 make only for the startup names. BBB's attributes are a list,
+    as a real asset's always are, without `overnight_tradable`; the overnight part is keyed by the feed,
+    since the simulated clock reads the regular session."""
+    eng = engine(attributes={BBB: []})
+    s = deferred_strategy(
+        feed=mover.OVERNIGHT_HISTORY_FEED,
+        extended_hours=True,
+        max_notional=Decimal(1000),
+        size_from_budget=True,
+        share_caps={AAA: 1},
+        watch=1,
+    )
+    loaded = eng.cache.instrument(BBB)
+    assert loaded is not None
+    info = loaded.info
+    orders = run(eng, s, ranker(rank((BBB, "0.4"))), tape(BBB, RISING))
+    buys = [o for o in orders if o.side == OrderSide.BUY]
+    eng.dispose()
+    assert [instrument for instrument, _ in s.asked] == [BBB]  # it was loaded on demand
+    assert info["attributes"] == []
+    assert buys == [], f"an overnight buy was sent on an ineligible name: {sides(buys)}"
+
+
+@pytest.mark.no_position_without_its_exit
+@pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason="no entry cutoff before the wind-down (mover.py:3137-3140); its fix is a separate unit",
+)
+def test_no_entry_is_sent_within_its_timeout_and_a_step_of_the_wind_down() -> None:
+    """An entry sent within `entry_timeout_secs` + `STEP_SECS` of `wind_down_at` can fill inside the
+    wind-down and is then never trailed: the run qualifies ten seconds before the wind-down, so no buy
+    is sent in that last stretch. Today the only cutoff is the switch from `_enter` to `_end` once
+    `winding_down` is set (mover.py:3137-3140) and `_refusal` (mover.py:4850) has no time test."""
+    eng = engine()
+    wind_down = T0 + 5 * MINUTE + 10 * SECOND  # the run qualifies on the bar closing at T0 + 5 min
+    s = strategy(extended_hours=True, wind_down_at=datetime.fromtimestamp(wind_down / 1e9, tz=UTC))
+    orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, RISING))
+    cutoff = wind_down - (s.settings.entry_timeout_secs + mover.STEP_SECS) * SECOND
+    late = [o for o in orders if o.side == OrderSide.BUY and o.ts_init >= cutoff]
+    eng.dispose()
+    assert late == [], f"a buy was sent {(wind_down - late[0].ts_init) / SECOND:.0f} s before it"
+
+
+@pytest.mark.no_position_without_its_exit
+@pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason="a late buy waits unprotected while the sold leg's cancel is pending (mover.py:3815-3822); "
+    "its fix is a separate unit",
+)
+def test_a_late_buys_shares_are_covered_by_a_sale_while_the_old_legs_cancel_stays_pending() -> None:
+    """The late-buy fixtures of `test_mover_late_buy_holding`: the holding sold in full, a canceled buy
+    of the name fills after it, and the old holding's open leg is held pending-cancel by the venue for
+    `chase_secs` steps; within that bound a sale covers the late shares. Today `_manage` returns early
+    while that leg closes (mover.py:3815-3822), with no bound if its cancel stays pending."""
+    from tests.test_mover_late_buy_holding import PendingCancelSeam
+    from tests.test_mover_late_buy_holding import protected_newer
+    from tests.test_mover_late_buy_holding import release
+    from tests.test_mover_late_buy_holding import replaced_stop
+
+    host = PendingCancelSeam()
+    _, old, _, stop = protected_newer(host)
+    replacement = replaced_stop(host, stop)
+    release(host, replacement, T0 + 4 * SECOND + 100_000_000)
+    host.fill(stop, 5, "10.3200", T0 + 4 * SECOND + 200_000_000)  # the holding sold in full
+    host.held_cancels.add(replacement.client_order_id.value)  # its open leg's cancel stays pending
+    host.bid = "10.6000"
+    host.now = T0 + 4 * SECOND + 700_000_000
+    host.fill(old, 5, "10.5000", T0 + 4 * SECOND + 500_000_000)  # the late buy
+    host.positions = [SimpleNamespace(signed_qty=Decimal(5), avg_px_open=Decimal("10.50"))]
+    before = len(host.submitted)
+    bound = host.settings.chase_secs
+    for step in range(1, bound + 1):
+        host.now = T0 + (4 + step) * SECOND
+        host.step(host.now)
+    covering = [
+        o
+        for o in host.submitted[before:]
+        if o.side == OrderSide.SELL and o.quantity == Quantity.from_int(5)
+    ]
+    assert replacement.is_pending_cancel and not replacement.is_closed
+    assert covering, f"5 late shares were held {bound} s with no sale sent for them"
+
+
+@pytest.mark.no_position_without_its_exit
+def test_a_sale_resting_above_a_gapped_bid_follows_it_within_the_floor_wait_and_two_chases() -> (
+    None
+):
+    """Bounded today: the bid gaps from 10.69 to 9.99, under the chase floor (10.22) of the released
+    limit (10.42), and a sale re-priced through the bid is sent within `FLOOR_WAIT_SECS` and two
+    `chase_secs` with their steps of the gap (`_chase`, mover.py:4671-4712). The first chase reaches the
+    floor and the floor's wait starts at the next one, so the measured bound is 72 s at `chase_secs`
+    5, past the 65 s of `FLOOR_WAIT_SECS` + `chase_secs` alone."""
+    eng = engine()
+    s = strategy(chase_secs=5)
+    orders = run(eng, s, ranker(rank((AAA, "0.25"))), tape(AAA, [*RISING, *[10.00] * 4]))
+    gap = T0 + 9 * MINUTE - 1  # the quote of the bar closing at 10.00
+    floor = Decimal("10.22")
+    followed = [
+        o
+        for o in orders
+        if o.side == OrderSide.SELL and o.price is not None and o.price.as_decimal() < floor
+    ]
+    flat = not eng.cache.positions_open(strategy_id=MOVER_ID)
+    eng.dispose()
+    bound = mover.FLOOR_WAIT_SECS + 2 * (s.settings.chase_secs + mover.STEP_SECS)
+    assert followed and followed[0].price.as_decimal() == Decimal("9.98")
+    assert followed[0].ts_init - gap <= bound * SECOND
+    assert flat
+
+
+@pytest.mark.no_position_without_its_exit
+def test_a_held_stop_with_no_two_sided_quote_sells_within_hold_most_secs_of_the_fill() -> None:
+    """Bounded today: after the entry fills every quote is one-sided (no bid), so no trailing sell can
+    be armed and the strategy holds a stop (`_hold`, mover.py:4358) above which the bars close; with no
+    two-sided quote it sends a sale for all that is held within `HOLD_MOST_SECS` and a step of the
+    fill's receipt, as an `unpriced_exit` (mover.py:4446-4455)."""
+    eng = engine()
+    s = strategy()
+    data = [
+        o
+        for o in tape(AAA, RISING)
+        if not (isinstance(o, QuoteTick) and o.ts_event > T0 + 5 * MINUTE)
+    ]
+    data += [quote(300 + sec, 0, 10.41) for sec in (1.5, 30, 90, 150)]
+    orders = run(eng, s, ranker(rank((AAA, "0.25"))), sorted(data, key=lambda d: d.ts_init))
+    entry, sells = orders[0], [o for o in orders if o.side == OrderSide.SELL]
+    received = s.slots[AAA].entry_received_ns
+    protect_path = s.record()["entries"][0]["protect_path"]
+    eng.dispose()
+    assert entry.side == OrderSide.BUY and entry.status.name == "FILLED"
+    assert protect_path == "unpriced_exit"
+    assert [(o.order_type.name, o.quantity) for o in sells] == [("LIMIT", entry.filled_qty)]
+    assert received is not None
+    assert sells[0].ts_init - received <= (mover.HOLD_MOST_SECS + mover.STEP_SECS) * SECOND
+    # The sale ends the run canceled. Whether that is the strategy's stop canceling it (case 6 of the
+    # clause-1 reading, after a node stops, the carry unit's) is UNVERIFIED here, so it is not asserted.

@@ -1,0 +1,1 @@
+* Merit on paper: a probabilistic Sharpe ratio of 0.95 or more over at least 30 independent round trips in at least 5 sessions, replay correlation 0.9 or more, slippage within 1.5 times the model; it produces a draft, never a promotion; not yet built (roadmap step 8; ADR 0083 states the round trips and the sessions, the other terms are the owner's requirement alone).

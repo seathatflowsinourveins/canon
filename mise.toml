@@ -486,11 +486,15 @@ bounded() {
 # names it): every window-*.json here and in by-hand/. With `logs`, each window-*.log of 1 MB or less too: only
 # once the window's process group has ended, at its end or after a stop (the task's EXIT trap, which runs after
 # bounded has waited for or killed the group), with account B's lock still held, so a log is copied once no
-# process writes it. Those two copies hold the lock, on a stop too, for at most 40 s more. The tool is macOS's
+# process writes it. Those two copies hold the lock, on a stop too, for at most 40 s more, and the loop after
+# them for as long as it takes to read the logs not yet kept (0.16 s for a 50 MB log, measured 2026-11-13). The tool is macOS's
 # /usr/bin/rsync (openrsync; `man rsync` here: -a, --include, --exclude, --max-size), which copies only what is
 # not there yet or has changed, so a run that ended before its copy is caught by the next; each call is held to
-# 20 s. The patterns are anchored to those two levels. A copy that fails is said on stderr
-# and changes no exit code; nothing here is read by status or by a window.
+# 20 s. The patterns are anchored to those two levels. A log that rsync leaves (over its bound, which openrsync
+# reads as 1048576 bytes, or a run that failed) is not dropped: a whole copy of at most 1024000 bytes is kept, a larger log's first and last
+# 512000 bytes with a line between them naming its bytes, its lines and those left out; when that copy cannot
+# be made, a line on stderr names the file and its size. A copy that fails is said on stderr and changes no
+# exit code; nothing here is read by status or by a window.
 kept() {
   k="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/canon/watch/windows"
   [ -d "${tmp}canon-paper-session" ] || return 0
@@ -500,6 +504,39 @@ kept() {
   [ "${1:-}" = logs ] || return 0
   /usr/bin/timeout 20 /usr/bin/rsync -a --max-size=1m --include='/window-*.log' --exclude='*' "${tmp}canon-paper-session/" "$k/" \
     || echo "paper:session: the window logs could not be copied to $k; they are still in ${tmp}canon-paper-session" >&2
+  # what that copy left is kept here: a whole log of at most 1024000 bytes, a larger one as its first and last
+  # 512000 bytes (both parts and the line between them stay under 1 MB), and a copy that cannot be made is said
+  # on stderr with the file's size. A copy already there and newer than the log (one this loop made), or as
+  # large as it (one rsync made), is not written again. A copy is made readable as rsync's are (0644, where
+  # mktemp gives 0600). A hidden part-copy a kill left is removed first; rsync's patterns never match one.
+  /bin/rm -f "$k"/.window-*.log.?????? 2>/dev/null || :
+  for f in "${tmp}canon-paper-session/"window-*.log; do
+    [ -f "$f" ] || continue
+    n=${f##*/}
+    [ ! -f "$k/$n" ] || [ ! "$k/$n" -nt "$f" ] || continue
+    # shellcheck disable=SC2046  # wc's two counts, split into words
+    set -- $(/usr/bin/wc -lc 2>/dev/null < "$f")
+    [ "$#" -eq 2 ] || { echo "paper:session: the log $n could not be read to keep it; it is still in ${tmp}canon-paper-session" >&2; continue; }
+    lines=$1; bytes=$2
+    # shellcheck disable=SC2046  # wc's two counts, split into words
+    set -- $(/usr/bin/wc -lc 2>/dev/null < "$k/$n")
+    [ "$#" -ne 2 ] || [ "$1" -ne "$lines" ] || [ "$2" -ne "$bytes" ] || continue
+    kt=""
+    if [ ! -d "$k/$n" ] && kt=$(/usr/bin/mktemp "$k/.$n.XXXXXX" 2>/dev/null) && /bin/chmod 644 "$kt"; then
+      if [ "$bytes" -gt 1024000 ]; then
+        hl=$(/usr/bin/head -c 512000 "$f" | /usr/bin/wc -l)
+        tl=$(/usr/bin/tail -c 512000 "$f" | /usr/bin/wc -l)
+        { /usr/bin/head -c 512000 "$f" \
+            && echo \
+            && echo "paper:session: $n: $bytes bytes, $lines lines; over the 1 MB limit, kept its first and last 512000 bytes, $((bytes - 1024000)) bytes and $((lines - hl - tl)) lines left out" \
+            && /usr/bin/tail -c 512000 "$f"; } > "$kt" 2>/dev/null && /bin/mv -f "$kt" "$k/$n" && continue
+      else
+        /usr/bin/head -c 1048576 "$f" > "$kt" 2>/dev/null && /bin/mv -f "$kt" "$k/$n" && continue
+      fi
+    fi
+    [ -z "$kt" ] || /bin/rm -f "$kt"
+    echo "paper:session: $n ($bytes bytes) could not be kept in $k; it is still in ${tmp}canon-paper-session" >&2
+  done
 }
 window() {
   # the switch first, then the pair and account B's lock: here, not above, because the task's arguments reach
@@ -804,10 +841,9 @@ exec /usr/bin/timeout -s KILL 600 uv run --locked python -c 'import sys; from ca
 
 # A read of one paper account (src/canon_trading/custody.py): equity, cash and buying power, each position,
 # each open order with its time in force and position intent as Alpaca returns them and whether its client
-# order ID is of our nodes' lineage or foreign, and `no_shorting`; then the New York trade date's ended orders,
-# from a closed-order history walk paged at the poll interval over submissions back to 92 days before the
-# date (Alpaca cancels a GTC order at 90 days), which can take minutes on a busy account and is printed after
-# the rest, so a failed or killed walk leaves the account read shown. GET only: the task and the module set
+# order ID is of our nodes' lineage or foreign, and `no_shorting`; then the New York trade date's ended orders
+# submitted inside that date (one submitted earlier is not listed), from a closed-order history walk paged at
+# the poll interval and printed after the rest, so a failed walk leaves the account read shown. GET only: the task and the module set
 # data-only mode (CANON_ALPACA_DATA_ONLY=1, ADR 0070), so the client refuses every other method before
 # sending. `tests` reads account A's pair and `windows` account B's (ADR 0069), as
 # paper:long-only does, into this task's environment only; neither value is printed, and no account number or
