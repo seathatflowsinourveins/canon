@@ -1942,8 +1942,8 @@ class Mover(Strategy):
         self.sent: deque[tuple[int, int]] = deque()
         """(time, the adapter's request total) at each step of the last 60 seconds."""
         self.recent = 0
-        """The adapter's requests over the last 60 seconds plus outstanding instrument-GET reserves,
-        which `soft_line` holds entries and instrument requests against."""
+        """The step's sampled adapter count over 60 seconds, plus venue commands since that sample
+        and outstanding instrument-GET reserves, held against `soft_line`."""
 
     # --- handlers that only store what they are given (module header, "Order events") ---------------
 
@@ -2678,14 +2678,14 @@ class Mover(Strategy):
 
     def _on_step(self, event: TimeEvent) -> None:
         now = event.ts_event
+        self.recent = self._recent_requests(now)
         self._ask_for_the_account()
         self._say_ranking(now)
-        recent = self.recent = self._recent_requests(now)
         self._watch(now)
         self._finish_history(now)
         # Reserve every possible retry while the asynchronous GET is outstanding. Its actual HTTP
         # attempts already enter requests_sent through the provider's existing transport, not here.
-        self.recent = recent + self._instrument_reserve()
+        self.recent += self._instrument_reserve()
         self._read_released_triggers()
         for slot in list(self.slots.values()):
             self._manage(slot, now)
@@ -3954,6 +3954,7 @@ class Mover(Strategy):
     # --- entries -------------------------------------------------------------------------------------
 
     def _enter(self, now: int, recent: int) -> None:
+        self.recent = recent
         candidates = [slot for slot in self.slots.values() if slot.run_ns is not None]
         if not candidates:
             return
@@ -3964,7 +3965,7 @@ class Mover(Strategy):
             try:
                 if slot.was_held or self._working(slot) or self._held(slot):
                     continue
-                why = self._refusal(slot, run_close, ranked, recent, now)
+                why = self._refusal(slot, run_close, ranked, self.recent, now)
                 if why is None:
                     why = self._buy(slot, ranked[slot.instrument_id][1], seen, run_close)
             finally:
@@ -4061,6 +4062,48 @@ class Mover(Strategy):
         while self.sent and now - self.sent[0][0] > BUDGET_SPAN_NS:
             self.sent.popleft()
         return total - self.sent[0][1]
+
+    # The adapter increments its count in a worker thread (execution.py:_call, providers.py:sent).
+    # Reserve each venue command here for the rest of the step; the next step samples the adapter
+    # anew. Never add a second adapter read to these reserves: a command already counted by the
+    # transport would be counted twice. Limit: a command still queued in that thread when the next
+    # step samples is in neither count until it is sent; the soft line's margin under Alpaca's
+    # limit is what absorbs it. Limit, the conservative side: a submit the risk engine denies is
+    # reserved for the rest of the step all the same, since its `OrderDenied` reaches the strategy
+    # only after the step's decisions (the xr7 reader's P2; `on_order_denied` follows them in the
+    # backtest engine too); the next step samples the adapter anew.
+    # rc8 Strategy signatures: trading/__init__.pyi:538-544, :571-576, :613-618; routing to the local
+    # emulator instead of execution: crates/trading/src/strategy/mod.rs:646-655, :2436-2442.
+    def submit_order(
+        self, order: Any, position_id: Any = None, client_id: Any = None, params: dict | None = None
+    ) -> None:
+        emulated = order.emulation_trigger is not None
+        super().submit_order(order, position_id, client_id, params)
+        # An emulated order the bid or print is already through is matched as it is submitted and
+        # released to the venue at once (emulator.rs:679-699 at the pin): a venue request too.
+        released = self._order(order.client_order_id) if emulated else None
+        if not emulated or (released is not None and not released.is_emulated):
+            self.recent += 1
+
+    def cancel_order(
+        self, client_order_id: ClientOrderId, client_id: Any = None, params: dict | None = None
+    ) -> None:
+        order = self._order(client_order_id)
+        if (
+            order is not None
+            and order.emulation_trigger is None
+            and not order.is_emulated
+            and not order.is_closed
+            and not order.is_pending_cancel
+        ):
+            self.recent += 1
+        super().cancel_order(client_order_id, client_id, params)
+
+    def query_account(
+        self, account_id: Any, client_id: Any = None, params: dict | None = None
+    ) -> None:
+        self.recent += 1
+        super().query_account(account_id, client_id, params)
 
     def _buy(
         self,
@@ -4193,6 +4236,10 @@ class Mover(Strategy):
             # a buy filled since the last report is not in the reported cash yet, and a sale's
             # proceeds count only once a report has them (the lead's ruling of 2026-11-12)
             self._ask_for_the_account()  # a fill this step, before this buy is sized
+            if self.recent >= settings.soft_line:
+                # the query just sent is a venue request too (`query_account`): `_refusal` passed
+                # this buy before it, so the soft line is read again before the buy adds one
+                return f"{self.recent} requests in the last 60 s, at the soft line of {settings.soft_line}"
             unreported = self._unreported_buys(account) if reported else Decimal(0)
             query_wait = self._query_wait_secs(account) if reported else 0.0
             spendable = free.as_decimal() - unlocked - unreported
