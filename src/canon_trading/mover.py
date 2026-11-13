@@ -72,15 +72,32 @@ A composition of upstream parts (ADR 0083, ADR 0088). What each part is, at Naut
   ADR 0096 amendment 10's `profile` uses trail.py's pure arithmetic and T5's strict document,
   retaining tier at the top liquidity cut. Once per complete slot minute it may tighten through
   the same trigger-preserving remake path as ratchet; profile and ratchet are separate arms.
-  If the entry order has no filled price, `Cache.positions_open` and `Position.avg_px_open`
-  (`common/__init__.pyi:568`, `model/__init__.pyi:5868`) supply the held position's average;
-  otherwise the current bid anchors protection. Each use is counted by name in the window record.
+  `Cache.positions_open` and `Position.avg_px_open` (`common/__init__.pyi:568`,
+  `model/__init__.pyi:5868`) supply the whole holding's average, including another entry's late fill;
+  absent that average, the entry fill anchors protection, else the current bid. Uses without a
+  filled entry are counted by name in the window record.
   Exit timing uses `OrderReleased.ts_event/released_price` and `OrderFilled.ts_event/last_qty/last_px`
   (`model/__init__.pyi:4822-4853`, `:4436-4498`). The release price is the observed bid when triggered
   (`crates/execution/src/order_emulator/emulator.rs:1424-1427`), not the sale's limit price.
+  Sale completion takes the latest fill event time, independent of delivery order (the lead,
+  2026-11-13; r-dsh-intmark/sr-a-355, P1). `OrderFilled.ts_event` is the venue event clock
+  (`crates/model/src/events/order/filled.rs:68-81`, `docs/concepts/data/index.md:453-497`, read
+  at the pin 2026-11-13); each holding keeps that maximum across its applied sale fills.
   Re-entry is the lead's state rule (owner, 2026-11-12): reclaim, turn or tape-only VWAP;
   lead, no primary source, UNCALIBRATED. No arm waits for a time cooldown. Live bars have no
   session VWAP, so that arm refuses by name unless the exact completed bar's tape supplies it.
+  Each slot accepts strictly newer interval ends before observing a live bar (the lead's R1,
+  2026-11-13). Upstream's `validate_data_sequence` defaults to false (`crates/data/src/engine/config.rs:59-61`)
+  and its bar check rejects only earlier timestamps, not equal ones (`engine/dispatch.rs:477-493`),
+  read at the pin 2026-11-13; the slot's mark also covers direct `on_bar` callers.
+  Bars and fills arrive independently (`docs/concepts/data/index.md:453-497`, same pin, read
+  2026-11-13). While a holding awaits its final fill callback, retain bounded completed-close
+  snapshots and replay only interval ends after that fill into its new state (sr-c-355, P2).
+  The clock arm keeps those snapshots until flattening creates its record state (sr-a-355, P2b),
+  without moving the cooldown's start or preserving a run across that step.
+  Interval ends require fixed time bars: upstream rejects non-time `get_interval_ns` calls
+  (`crates/model/src/python/data/bar.rs:164-174`) and MONTH/YEAR use 30/365-day proxies
+  (`crates/model/src/data/bar.rs:625-643`), read at the pin 2026-11-13 (sr-a-355, P4).
 * **Persistence**, when either arm is on, composes `Strategy.on_trade`
   (`trading/__init__.pyi:638`), the step timer and `OrderFactory.limit` / `submit_order`. The
   emulator elects on one tick
@@ -255,6 +272,7 @@ from canon_alpaca.providers import request_counts
 from nautilus_trader.config import StrategyConfig
 from nautilus_trader.indicators import AverageTrueRange
 from nautilus_trader.model import AggregationSource
+from nautilus_trader.model import BarAggregation
 from nautilus_trader.model import BarType
 from nautilus_trader.model import ClientOrderId
 from nautilus_trader.model import InstrumentId
@@ -1138,11 +1156,18 @@ class MoverConfig(StrategyConfig):
         if wind_down_at is not None and wind_down_at.tzinfo is None:
             raise ValueError("wind_down_at must be an aware datetime")
         try:
-            BarType.from_str(f"X.X-{bar_spec}")
+            specification = BarType.from_str(f"X.X-{bar_spec}").spec
         except ValueError as e:
             raise ValueError(
                 f"bar_spec {bar_spec!r} is not <step>-<aggregation>-<price>-<source>: {e}"
             ) from e
+        if not specification.is_time_aggregated() or specification.aggregation in (
+            BarAggregation.MONTH,
+            BarAggregation.YEAR,
+        ):
+            raise ValueError(
+                f"bar_spec {bar_spec!r} requires a fixed time interval (MILLISECOND through WEEK)"
+            )
         self.max_notional = max_notional
         self.max_move = max_move
         self.max_shares = max_shares
@@ -1250,6 +1275,13 @@ class TrailPlan:
     """Amendment 10's input calculation before the common bounds, including a named thin reason."""
 
 
+PENDING_REENTRY_BARS = 64
+"""Maximum completed-close snapshots per holding awaiting its fill or flat state (sr-c/a-355, P2).
+If eviction loses a post-sale close, turn and VWAP refuse that sale's incomplete history by name;
+evicted intervals ending at or before the sale do not affect its re-entry state. A memory bound,
+not a trading parameter; replay consumes the snapshots once."""
+
+
 @dataclass
 class ExitRecord:
     """One holding across every replacement sale; event clocks and bid marks, never timer estimates.
@@ -1275,6 +1307,17 @@ class ExitRecord:
     trigger_price: Decimal | None = None
     trigger_reason: str | None = None
     final_fill_ns: int | None = None
+    last_fill_ns: int | None = None
+    """Latest SELL event applied to this holding, including parts delivered before a late BUY."""
+    entry_received_ns: int | None = None
+    """First host receipt (`ts_init`) of the late entry this row was opened for while no slot owned
+    it, so its recovery restores the hold's receipt clock (r-pair-codex/P1)."""
+    pending_reentry_closes: deque[tuple[int, Decimal, Decimal | None, date]] = field(
+        default_factory=lambda: deque(maxlen=PENDING_REENTRY_BARS)
+    )
+    """Accepted interval end, close, exact-bar VWAP and session date pending this sale's state."""
+    lost_reentry_close_ns: int | None = None
+    """Newest evicted interval end: only loss strictly after the eventual final fill is incomplete."""
     wind_down_wait_ns: int | None = None
     """From the decision to sell to the wind-down, for a sale still unfilled when it began: a gap deeper
     than the chase floor rests until the wind-down's floorless sale (the coordinator, 2026-11-12)."""
@@ -1284,6 +1327,21 @@ class ExitRecord:
     """Each sale order the Mover sent for this holding, in order: the lead's D3 terms of 2026-11-12,
     A3, read from the order sent and the record at that moment (`Mover._sale_sent`); its end and any
     refusal's reason come from the order's own events."""
+
+    def take_sale(self, quantity: Decimal, price: Decimal, at: int) -> Decimal:
+        """Add a sale fill to the holding's totals, no more than it still holds: a canceled leg's late
+        fill after another leg sold it all is counted once (the pinned `crates/model/src/orders/
+        mod.rs:247`, `:295`; the Antigravity reader of #351, P2-1). Its last fill time is the latest
+        event time taken, so a fill that arrives late with an earlier time does not move it back.
+        Returns the quantity taken."""
+        take = min(quantity, max(Decimal(0), self.quantity - self.filled))
+        if take > 0:
+            self.filled += take
+            self.notional += take * price
+            self.last_fill_ns = at if self.last_fill_ns is None else max(self.last_fill_ns, at)
+            if self.filled >= self.quantity:
+                self.final_fill_ns = self.last_fill_ns
+        return take
 
     def record(self) -> dict[str, Any]:
         vwap = self.notional / self.filled if self.filled else None
@@ -1409,6 +1467,18 @@ class ReentryState(TurnState):
     below_vwap: bool = False
     crossed_vwap: bool = False
     vwap_day: date | None = None
+    history_complete: bool = True
+    """False after a pending post-sale close was evicted; turn/VWAP refuse until a new sale."""
+
+    def observe_pending(self, row: ExitRecord) -> None:
+        """Consume a holding's accepted closes exactly once, using the final fill's event clock."""
+        if row.lost_reentry_close_ns is not None and row.lost_reentry_close_ns > self.sale_ns:
+            self.history_complete = False
+        while row.pending_reentry_closes:
+            closed, close, vwap, day = row.pending_reentry_closes.popleft()
+            if closed > self.sale_ns:
+                self.observe(close, vwap, day)
+        row.lost_reentry_close_ns = None
 
     def observe(self, close: Decimal, vwap: Decimal | None, day: date) -> None:
         self.observe_turn(close)
@@ -1521,6 +1591,44 @@ def sale_ended(
     if row is not None and row["ended"] is None:
         row["ended"], row["ended_ns"], row["reason"] = ended, event.ts_event, reason
         row["cause"] = None if reason is None else refusal_cause(reason)
+
+
+def name_oversale(dropped: list[str], event: Any, excess: Decimal, held: Decimal) -> None:
+    """Name, once, a sale fill beyond what its holding held; its own row and `fills` keep it. Plain
+    values only, as the fill handler may run while the strategy is borrowed."""
+    if excess <= 0:
+        return
+    text = (
+        f"{event.instrument_id}: {event.client_order_id} sold {excess} beyond its holding's {held}"
+    )
+    if text not in dropped:
+        dropped.append(text)
+
+
+def late_receipt(row: ExitRecord, event: Any) -> None:
+    """Keep the first host receipt (`ts_init`) of a late entry fill no slot owns yet, so its
+    recovery restores the hold's receipt clock, not the venue's (r-pair-codex/P1). Plain values
+    only, as the fill handler may run while the strategy is borrowed."""
+    received = getattr(event, "ts_init", None)
+    if row.entry_received_ns is None and received is not None:
+        row.entry_received_ns = int(received)
+
+
+def resold(
+    sold: dict[InstrumentId, tuple[int, Decimal | None]],
+    sold_fill_ns: dict[InstrumentId, int],
+    reentry_states: dict[InstrumentId, ReentryState],
+    instrument_id: InstrumentId,
+    row: ExitRecord,
+) -> None:
+    """A holding `_flat` marked sold took a late sale fill: its sale is at the holding's average now,
+    from when it was marked, and its re-entry state is taken again from that sale."""
+    when, _ = sold[instrument_id]
+    price = row.notional / row.filled
+    sold[instrument_id] = (when, price)
+    filled_ns = row.last_fill_ns if row.last_fill_ns is not None else when
+    sold_fill_ns[instrument_id] = filled_ns
+    reentry_states[instrument_id] = ReentryState(filled_ns, price, row.trail_distance)
 
 
 def entry_filled(
@@ -1773,6 +1881,8 @@ class Slot:
     exit_record: ExitRecord | None = None
     last_bid: Decimal | None = None
     protection_anchor: Decimal | None = None
+    holding_average: Decimal | None = None
+    """The whole holding's valid average from `_held`, or None for a quantity-only reader."""
     held_stop: Decimal | None = None
     """With no followed price, the level a held stop sells through: the average fill, else the entry's
     limit, less the trail distance in force. Checked each step on the last trade, else the minute close."""
@@ -1805,6 +1915,8 @@ class Slot:
     """An emulated trailing sell has been placed for this holding: a later hold counts from its own start."""
     last_sale: Decimal | None = None
     """The price of this holding's last plain sale: a remake with no bid is never priced above it."""
+    last_bar_closed_ns: int | None = None
+    """The last accepted live interval end, independent of a run being consumed or a holding sold."""
     run_open_ns: int | None = None
     """Open of the complete minute, including the New York session date of a tape VWAP."""
     run_ns: int | None = None
@@ -1948,6 +2060,13 @@ class Mover(Strategy):
         self.slots: dict[InstrumentId, Slot] = {}
         self.opened_slots: set[InstrumentId] = set()
         """Every slot subscribed during the run, including names since unwatched, for stream checks."""
+        self.late_buys: dict[InstrumentId, ExitRecord] = {}
+        """Holdings awaiting attachment to their late entry, including fills received with no slot.
+        Keep their BUY and SELL totals before the next step, even if already flat by then (the
+        canceled-fill contract, `crates/model/src/orders/mod.rs:247`; w3-r-latefill, F1 and F5)."""
+        self.sold_rows: dict[InstrumentId, ExitRecord] = {}
+        """The holding each name's last sale (`sold`) was marked for, so a late fill of its sale after the
+        mark brings the sale's price up to date (`resold`; w3-t-latefill, P2)."""
         self.rank: list[tuple[InstrumentId, Decimal]] = []
         """The latest ranking, best first; empty until one arrives and after a malformed one."""
         self.instrument_loads: dict[InstrumentId, InstrumentLoad] = {}
@@ -2033,7 +2152,9 @@ class Mover(Strategy):
         """Each order refusal in `refused`, with who refused it and its cause (the D3 terms, A7)."""
         self.refusals: list[dict[str, Any]] = []
         """Each entry the trail cap forbade, once, with its cause, distance, cap and time (the lead's
-        record rule 1 of 2026-11-12); `dropped` does not repeat it."""
+        record rule 1 of 2026-11-12), or a state re-entry missing its interval end, with its cause
+        and time (R2, 2026-11-13), or missing pending post-sale history (sr-c-355, P2);
+        `dropped` does not repeat it."""
         self.opening_refused: dict[str, str] = {}
         self.opening_outcomes: dict[str, int] = {}
         """How each opening entry ended: `filled` (the opening is spent), or `denied`, `rejected`,
@@ -2205,23 +2326,55 @@ class Mover(Strategy):
                 # `crates/model/src/orders/mod.rs:247`, `:295`): filled in full, it ended filled
                 ended = sale["ended"] in (None, "canceled", "expired")
                 if ended and filled >= Decimal(sale["quantity"]):
-                    sale["ended"], sale["ended_ns"] = "filled", event.ts_event
+                    sale["ended"] = "filled"
+                    sale["ended_ns"] = max(
+                        at
+                        for cid, side, _, _, at in self.fills
+                        if cid == event.client_order_id.value and side == OrderSide.SELL.name
+                    )
 
         slot = self.slots.get(event.instrument_id)
-        current = None if slot is None else slot.exit_record
+        current = (
+            getattr(self, "late_buys", {}).get(event.instrument_id)
+            if slot is None
+            else slot.exit_record
+        )
+        if slot is None and event.order_side == OrderSide.BUY:
+            # Plain accounting only: subscriptions wait for the timer. A sale callback can arrive
+            # before that timer too, so an order ID alone would lose the intervening holding (F5).
+            row = current
+            if row is None:
+                row = ExitRecord(event.instrument_id, event.client_order_id.value, Decimal(0))
+                self.late_buys[event.instrument_id] = row
+            late_receipt(row, event)
+            row.quantity += quantity
+            row.bought_notional += quantity * event.last_px.as_decimal()
+            row.final_fill_ns = None
+            return
         if event.order_side == OrderSide.SELL and current is None:
             # no holding in the name now: the fill completes the totals of the holding that sent the
             # sale, as a record only (xr7-r-a3fix, P2); no trading state is written for a holding the
             # slot no longer has
             owner = self.sale_owner.get(event.client_order_id.value)
             if owner is not None:
-                owner.filled += quantity
-                owner.notional += quantity * event.last_px.as_decimal()
-                if owner.filled >= owner.quantity:
-                    owner.final_fill_ns = event.ts_event
-        if slot is None:
+                # The holding's totals take no more than it held (`take_sale`). The order's own row
+                # above and `fills` keep the whole fill, and the excess is named.
+                take = owner.take_sale(quantity, event.last_px.as_decimal(), event.ts_event)
+                name_oversale(self.dropped, event, quantity - take, owner.quantity)
+                if take > 0 and self.sold_rows.get(event.instrument_id) is owner:
+                    # the holding was marked sold (`_flat`) before this fill came: its sale's price
+                    # is the holding's average with it, so the above-sale rule reads the price the
+                    # shares sold at under every arm (w3-t-latefill, P2)
+                    resold(
+                        self.sold,
+                        self.sold_fill_ns,
+                        self.reentry_states,
+                        event.instrument_id,
+                        owner,
+                    )
+        if slot is None and current is None:
             return
-        if event.order_side == OrderSide.BUY:
+        if event.order_side == OrderSide.BUY and slot is not None:
             # NautilusTrader d53849b216e2: OrderFilled's venue/event and initialization clocks are
             # distinct (crates/model/src/events/order/filled.rs:78-81); the live client supplies
             # its host clock for ts_init (python/nautilus_trader/live/clients.py:585-613). Keep the
@@ -2238,9 +2391,27 @@ class Mover(Strategy):
                 if slot.exit_record is None
                 else slot.exit_record
             )
+            if slot.entry_id is None or (
+                slot.entry_id != event.client_order_id and current is None
+            ):
+                # Ranking reopened this name first, possibly with a newer unfilled entry (F1).
+                # Tie the holding to the fill now; recover its plan on the timer, without losing
+                # the newer order's cancellation tracking.
+                row.entry_client_order_id = event.client_order_id.value
+                late_receipt(row, event)
+                self.late_buys[event.instrument_id] = row
+            elif (
+                slot.entry_id == event.client_order_id
+                and slot.entry_record is not None
+                and slot.entry_record.get("client_order_id") != event.client_order_id.value
+            ):
+                # The slot's own newer entry fills after a late buy's recovery gave the slot that
+                # buy's record and plan: it takes back its own (r-latefill-delta2/F2)
+                self._take_entry_plan(slot, event.client_order_id.value)
             row.quantity += quantity
             row.bought_notional += quantity * event.last_px.as_decimal()
             row.final_fill_ns = None
+            # The same holding still includes its earlier sale fills; a new holding gets a new row.
             plan = slot.trail_plan
             # the distance the sale trails by: L's while L is in force (the high read of the
             # ruling's fix, item 2), so a sale already due at the next step keeps it in the record
@@ -2259,17 +2430,23 @@ class Mover(Strategy):
             # `_flat` read (xr7-r-a3fix, P1). The sale's own row above names the order; the earlier
             # holding's totals are not added to as well, which would count the shares twice
             row = current
-            row.filled += quantity
-            row.notional += quantity * event.last_px.as_decimal()
-            if row.filled >= row.quantity:
-                row.final_fill_ns = event.ts_event
-                if self.settings.reentry_arm != "clock":
-                    sold = row.notional / row.filled
-                    self.sold[event.instrument_id] = (event.ts_event, sold)
-                    self.sold_fill_ns[event.instrument_id] = event.ts_event
-                    self.reentry_states[event.instrument_id] = ReentryState(
-                        event.ts_event, sold, row.trail_distance
-                    )
+            # no more than the holding holds, at its latest fill time (`take_sale`): a canceled
+            # leg's late fill after another leg sold it all is not counted again (w3-t-latefill, P3)
+            take = row.take_sale(quantity, event.last_px.as_decimal(), event.ts_event)
+            name_oversale(self.dropped, event, quantity - take, row.quantity)
+            if (
+                take > 0
+                and row.filled >= row.quantity
+                and row.final_fill_ns is not None
+                and self.settings.reentry_arm != "clock"
+            ):
+                sold = row.notional / row.filled
+                self.sold[event.instrument_id] = (row.final_fill_ns, sold)
+                self.sold_fill_ns[event.instrument_id] = row.final_fill_ns
+                state = self.reentry_states[event.instrument_id] = ReentryState(
+                    row.final_fill_ns, sold, row.trail_distance
+                )
+                state.observe_pending(row)
 
     def _trading_account(self, venue: Any) -> Any:
         """The venue's account as the portfolio holds it."""
@@ -2585,6 +2762,10 @@ class Mover(Strategy):
         ):
             self._note(slot, f"{slot.instrument_id}: skipping the first partial INTERNAL minute")
             return
+        closed = bar_closed_ns(bar)
+        if slot.last_bar_closed_ns is not None and closed <= slot.last_bar_closed_ns:
+            return
+        slot.last_bar_closed_ns = closed
         self.live_bars += 1
         if slot.atr is not None:
             opened = bar_opened_ns(bar)
@@ -2621,16 +2802,16 @@ class Mover(Strategy):
                 self._protect(slot, held, bar.ts_init)
         state = self.reentry_states.get(slot.instrument_id)
         row = slot.exit_record
-        if (
-            state is not None
-            and bar_closed_ns(bar) > state.sale_ns  # a close after the sale (A-2)
-            and (row is None or row.filled >= row.quantity)
-        ):
-            state.observe(
-                close,
-                self.session_vwaps.get(slot.instrument_id, {}).get(bar.ts_init),
-                datetime.fromtimestamp(slot.run_open_ns / SECOND_NS, NEW_YORK).date(),
-            )
+        vwap = self.session_vwaps.get(slot.instrument_id, {}).get(bar.ts_init)
+        day = datetime.fromtimestamp(slot.run_open_ns / SECOND_NS, NEW_YORK).date()
+        if row is not None and (row.filled < row.quantity or self.settings.reentry_arm == "clock"):
+            # The clock arm creates its record state at _flat, even if the fill arrived first.
+            pending = row.pending_reentry_closes
+            if len(pending) == PENDING_REENTRY_BARS:
+                row.lost_reentry_close_ns = pending[0][0]
+            pending.append((closed, close, vwap, day))
+        elif state is not None and closed > state.sale_ns:  # a close after the sale (A-2)
+            state.observe(close, vwap, day)
         if self.settings.entry_arm != "bridge":
             self._registered_run(slot, bar)
             self._opening_run(slot, bar)
@@ -2639,9 +2820,11 @@ class Mover(Strategy):
             # Turn's k and VWAP's crossing replace the first entry's rising-run length; the entry
             # check still enforces state, ranking, eligibility, free slots and request budget.
             slot.run_ns, slot.run_close, slot.run_seen_ns = bar.ts_event, close, bar.ts_init
-            slot.run_closed_ns = bar_closed_ns(bar)
+            slot.run_closed_ns = closed
             self._opening_run(slot, bar)  # name sale refusals without replacing the re-entry run
             return
+        # Each accepted bar replaces the bridge candidate, as _registered_run does (sr-a-355, P3).
+        slot.run_ns = slot.run_close = slot.run_seen_ns = slot.run_closed_ns = None
         rising = 0  # the closes in a row, to this one, each above the one before
         for later, earlier in pairwise(reversed(slot.closes)):
             if not later > earlier:
@@ -2650,7 +2833,7 @@ class Mover(Strategy):
         wanted = self.settings.run_bars
         if rising >= wanted:
             slot.run_ns, slot.run_close, slot.run_seen_ns = bar.ts_event, close, bar.ts_init
-            slot.run_closed_ns = bar_closed_ns(bar)
+            slot.run_closed_ns = closed
             self._say(f"{slot.instrument_id}: run qualified, {wanted} rising closes to {close}")
         elif before is not None and rising == 0:
             self._say(f"{slot.instrument_id}: run restarted, {close} is not above {before}")
@@ -2957,16 +3140,25 @@ class Mover(Strategy):
         return instrument
 
     def _held(self, slot: Slot) -> Decimal:
-        """This strategy's signed open quantity in the slot's instrument."""
-        return sum(
-            (
-                p.signed_qty
-                for p in self.cache.positions_open(
-                    instrument_id=slot.instrument_id, strategy_id=self.strategy_id
-                )
-            ),
-            Decimal(0),
+        """Read this strategy's signed open quantity and whole-holding average together."""
+        positions = self.cache.positions_open(
+            instrument_id=slot.instrument_id, strategy_id=self.strategy_id
         )
+        quantity, notional = Decimal(0), Decimal(0)
+        valid_average = True
+        for position in positions:
+            quantity += position.signed_qty
+            average = getattr(position, "avg_px_open", None)
+            if average is None:
+                valid_average = False
+                continue
+            average = Decimal(str(average))
+            if not average.is_finite() or average <= 0 or position.signed_qty <= 0:
+                valid_average = False
+                continue
+            notional += position.signed_qty * average
+        slot.holding_average = notional / quantity if valid_average and quantity > 0 else None
+        return quantity
 
     def _working(self, slot: Slot) -> bool:
         """Whether an order of this slot is not closed: emulated, in flight or open."""
@@ -3014,11 +3206,112 @@ class Mover(Strategy):
                             self.slots[instrument_id],
                             f"{instrument_id}: entry arm {self.settings.entry_arm}: no entry context supplied",
                         )
+        self._reopen_late_buys(now)
         for instrument_id, slot in list(self.slots.items()):
             if instrument_id in top or self._working(slot) or self._held(slot) or slot.was_held:
                 continue  # `was_held`: its sale is recorded by `_flat` before the slot may go
             if self._fresh(now) or self.winding_down:  # a stale ranking unwatches nothing
                 self._close_slot(slot)
+
+    def _reopen_late_buys(self, now: int) -> None:
+        """Open a slot, in the wind-down or off the ranking too, for each name a late entry fill bought
+        with no slot to hold it, so its shares are held by a slot like any other: protected by the next
+        step's sale, in the record (`_ensure_exit`) and in the wind-down's market exit (`_end`)."""
+        for instrument_id, row in list(self.late_buys.items()):
+            del self.late_buys[instrument_id]
+            if row.entry_client_order_id is None:
+                continue
+            client_order_id = ClientOrderId(row.entry_client_order_id)
+            slot = self.slots.get(instrument_id)
+            if slot is None:
+                self._open_slot(instrument_id)
+                slot = self.slots[instrument_id]
+            entry = self._order(slot.entry_id)
+            # An order's average is unset until it fills (the pinned
+            # `crates/model/src/orders/limit.rs:414`): a newer entry with shares of its own keeps its
+            # order, its record, its plan and the loss it was sized for; the late buy's row is
+            # attached to the holding, not its plan (code-review-l5-late-fills-fix/P2).
+            own_fill = entry is not None and entry.avg_px is not None
+            if entry is None or (entry.is_closed and not own_fill):
+                slot.entry_id = client_order_id
+            if not own_fill and slot.entry_received_ns is None:
+                # The hold's clock starts at the late entry's own first receipt, as a slot that kept
+                # owning the entry would have taken it; a newer filled entry keeps its own
+                # (r-pair-codex/P1).
+                slot.entry_received_ns = row.entry_received_ns
+            # A newer working entry stays tracked until canceled/closed; the holding's own fills
+            # anchor persistence while that order has no average fill (F1).
+            slot.exit_record = row
+            if not any(kept is row for kept in self.exits):
+                self.exits.append(row)
+            if not own_fill:
+                self._take_entry_plan(slot, client_order_id.value)
+            plan = slot.trail_plan
+            row.trail_distance = offsets_in_force(
+                slot,
+                row.bought_notional / row.quantity,
+                self.settings.trail if plan is None else plan.trail,
+                self.settings.exit_through if plan is None else plan.exit_through,
+                self._floor_m(),
+            )[0]
+            if slot.protection_anchor is None:
+                # An ordinary holding enters the wind-down with its protection's anchor set, which
+                # `_limit_sell` prices from when no bid or print is known. The recovered holding
+                # takes its own average fill, so the wind-down sends its sale on that same path
+                # (r-latefill-delta2/F1).
+                slot.protection_anchor = row.bought_notional / row.quantity
+            slot.was_held = True
+            held = self._held(slot)
+            if held > 0:
+                self._ensure_exit(slot, held)
+            elif held == 0 and row.filled == row.quantity:
+                self._flat(slot, now)
+            self._note(
+                slot,
+                f"{instrument_id}: a fill of {client_order_id} came after its slot closed; "
+                f"the slot is opened again for the {held} held",
+            )
+
+    def _take_entry_plan(self, slot: Slot, client_order_id: str) -> None:
+        """Give the slot the entry's own record, its frozen trail plan and the loss it was sized
+        for, as `_buy` recorded them in `entries_sent`. Plain data only, so a fill handler may call
+        it while the strategy is borrowed."""
+        slot.entry_record = next(
+            (
+                entry_row
+                for entry_row in reversed(self.entries_sent)
+                if entry_row.get("client_order_id") == client_order_id
+            ),
+            None,
+        )
+        record = slot.entry_record
+        if record is None:
+            return
+        # These are the frozen entry fractions and L already recorded by `_buy` (F2),
+        # not a fresh selection from the reopened slot's cold indicators.
+        if record.get("trail") is not None:
+            slot.trail_plan = slot.initial_trail = TrailPlan(
+                trail=Decimal(record["trail"]),
+                exit_through=Decimal(record["exit_through"]),
+                chase_cap=Decimal(record["chase_cap"]),
+                atr=None if record.get("atr") is None else Decimal(record["atr"]),
+                spread=None if record.get("spread") is None else Decimal(record["spread"]),
+                bound=record["trail_bound"],
+                source=record.get("trail_source"),
+                floor=(
+                    None if record.get("spread_floor") is None else Decimal(record["spread_floor"])
+                ),
+                measure=(
+                    None if record.get("own_measure") is None else Decimal(record["own_measure"])
+                ),
+                profile=record.get("profile_at_entry", record.get("profile")),
+            )
+        sizing = record.get("sizing")
+        slot.sized_loss = (
+            None
+            if sizing is None or sizing.get("loss_per_share") is None
+            else Decimal(sizing["loss_per_share"])
+        )
 
     def _instrument_reserve(self) -> int:
         return INSTRUMENT_REQUEST_RESERVE * sum(
@@ -3512,18 +3805,14 @@ class Mover(Strategy):
             return
         if slot.was_held and not self._working(slot):
             row = slot.exit_record
-            price = (
-                (None if order is None or order.avg_px is None else Decimal(str(order.avg_px)))
-                if self.settings.reentry_arm == "clock"
-                else (
-                    row.notional / row.filled
-                    if row is not None and row.filled
-                    else None
-                    if order is None or order.avg_px is None
-                    else Decimal(str(order.avg_px))
-                )
-            )
+            averaged = row.notional / row.filled if row is not None and row.filled else None
+            sold_px = None if order is None or order.avg_px is None else Decimal(str(order.avg_px))
+            # The holding includes every sale leg, including canceled legs' late fills. One order's
+            # non-None average may cover only a partial sale, under the clock arm too (F3).
+            price = averaged if averaged is not None else sold_px
             self.sold[slot.instrument_id] = (now, price)
+            if row is not None:
+                self.sold_rows[slot.instrument_id] = row
             sale_fills = [
                 at
                 for cid, side, _, _, at in self.fills
@@ -3540,9 +3829,11 @@ class Mover(Strategy):
             if (
                 state := self.reentry_states.get(slot.instrument_id)
             ) is None or state.sale_ns != filled_ns:
-                self.reentry_states[slot.instrument_id] = ReentryState(
+                state = self.reentry_states[slot.instrument_id] = ReentryState(
                     filled_ns, price, None if row is None else row.trail_distance
                 )
+                if row is not None:
+                    state.observe_pending(row)
             slot.was_held = False
             slot.exiting = False
             slot.floor = slot.trail_trigger = slot.trail_limit = None
@@ -3581,6 +3872,56 @@ class Mover(Strategy):
             if not slot.exiting:
                 return
         order = self._order(slot.protect_id)
+        raised = False
+        if not slot.exiting and slot.sized_loss is not None:
+            # H1-H3 apply to the holding, including fills of another entry (lead, 2026-11-13).
+            # Read its average before either anchor is refreshed. A cheaper fill cannot lower a
+            # reached stop; if a fill brings the average from above the kept stop to at or under
+            # it, latch the sale here for both the held and emulated paths. A stop already at or
+            # above the average is a winner's stop: a lower average crosses nothing (lead's H3).
+            average = self._position_average(slot)
+            levels = [slot.held_stop, slot.trail_trigger]
+            if order is not None and order.is_emulated and order.trigger_price is not None:
+                levels.append(order.trigger_price.as_decimal())
+            reached = max(
+                (level for level in levels if level is not None and level > 0), default=None
+            )
+            kept = None if reached is None else stop_trigger_price(reached)
+            if (
+                average is not None
+                and slot.protection_anchor is not None
+                and average < slot.protection_anchor
+                and kept is not None
+                and slot.protection_anchor > kept
+                and average <= kept
+            ):
+                slot.exiting = True
+                slot.protection_anchor, slot.exit_trigger = average, kept
+                self._mark_exit(slot, now, average, "held stop (holding average)")
+                if slot.exit_record is not None:
+                    slot.exit_record.held_stop_kept = kept
+                    slot.exit_record.held_stop_from_average = average - kept
+                if slot.entry_record is not None:
+                    slot.entry_record["held_stop_level"] = str(kept)
+                    slot.entry_record["held_stop_trigger"] = "holding average"
+                self._end_hold(slot, now, "held_stop")
+            else:
+                # The average can rise with the quantity unchanged (a late fill of an earlier
+                # holding's canceled sale, then a dearer buy): the stop is remade from the new
+                # average, keeping any level reached, as a change of quantity remakes it
+                # (r-heldnext P1-2; position.rs:1050-1118 keeps the average of what is held)
+                raised = (
+                    average is not None
+                    and slot.protection_anchor is not None
+                    and average > slot.protection_anchor
+                )
+        if slot.exiting and order is not None and order.is_emulated:
+            # rc8's emulator cancels locally; confirm it ended before selling all held shares.
+            if not order.is_pending_cancel:
+                self.cancel_order(order.client_order_id)
+            order = self._order(slot.protect_id)
+            if order is not None and not order.is_closed:
+                return
         if (
             slot.exiting
             and slot.floor is None
@@ -3639,7 +3980,9 @@ class Mover(Strategy):
                 tightened = self._profile_tighten(slot, now)
             # No order is modified. A trailing sell that no longer covers what is held is canceled,
             # and one for all of it is made from the trigger this one had reached.
-            if (order.quantity.as_decimal() != held or tightened) and not order.is_pending_cancel:
+            if (
+                order.quantity.as_decimal() != held or tightened or raised
+            ) and not order.is_pending_cancel:
                 if order.trigger_price is not None:
                     reached = order.trigger_price.as_decimal()
                     slot.trail_trigger = max(reached, slot.trail_trigger or reached)
@@ -3672,22 +4015,27 @@ class Mover(Strategy):
         recoveries in this batch, and `_protect` sends the plain DAY limit in this same step.
         """
         entry = self._order(slot.entry_id)
-        if entry is None or entry.avg_px is None:
+        row = slot.exit_record
+        bought = (
+            Decimal(str(entry.avg_px))
+            if entry is not None and entry.avg_px is not None
+            else row.bought_notional / row.quantity
+            if row is not None and row.quantity > 0 and row.bought_notional > 0
+            else None
+        )
+        if bought is None:
             self._note(
                 slot,
                 f"{slot.instrument_id}: held with no filled entry of this strategy to size a "
                 "trailing sell from; not protected, and sold only at the wind-down",
             )
             return
-        trailing, _ = offsets(
-            Decimal(str(entry.avg_px)), self.settings.trail, self.settings.exit_through
-        )
+        trailing, _ = offsets(bought, self.settings.trail, self.settings.exit_through)
         if slot.trail_high is None or slot.trail_trigger is None:
             # The level starts from the entry's own average fill, the one price here that is a trade
             # of ours. A cached last print is a single observation: taken as the high, one stray
             # print above the market would put the level over it and the next ordinary prints
             # would sell. Prints after this step raise the high only as N of them confirm it.
-            bought = Decimal(str(entry.avg_px))
             slot.trail_high = bought
             slot.trail_trigger = stop_trigger_price(bought - trailing)
             # Begin after the highest stamp already received, on persistence's own stamp, not the
@@ -3745,7 +4093,7 @@ class Mover(Strategy):
                         f"{slot.instrument_id}: breach confirmed at {stamp}, trigger "
                         f"{slot.trail_trigger}; selling by limit"
                     )
-                    if not entry.is_closed:
+                    if entry is not None and not entry.is_closed:
                         self._time_out(slot, entry, now)
                     return
             else:
@@ -3851,7 +4199,14 @@ class Mover(Strategy):
             slot.exit_trigger = kept
             self._limit_sell(slot, held, now, slot.floor)
             return
-        if at - max(trailing, limit) <= 0:
+        seed = at
+        if trigger == TriggerType.LAST_PRICE:
+            # rc8's OrderEmulator seeds synchronously at submission from its last delivered trade
+            # (emulator.rs:665, :1616-1621), not the venue-newest print `_followed` reads. Check that
+            # price too: a late print must not seed a non-positive trigger or release limit (P1-1).
+            trade = self.cache.trade(slot.instrument_id)
+            seed = None if trade is None else trade.price.as_decimal()
+        if seed is None or min(at, seed) - max(trailing, limit) <= 0:
             # A3+O's floor in price terms can reach the followed price: the emulator would seed the
             # trigger at it less the offset (`crates/execution/src/trailing.rs:61`), at or under zero,
             # and its limit with it. No such sell is sent: the stop is held, and sells through the
@@ -3889,6 +4244,11 @@ class Mover(Strategy):
             if kept is None or slot.trail_limit is None
             else down_on_step(min(slot.trail_limit, kept - (limit - trailing)))
         )
+        if kept_limit is not None and kept_limit <= 0:
+            # The offset gap can exceed a small kept trigger, or its cap can round to zero (P2-1).
+            # Leave that limit unset: the seed checked above supplies a positive price, and rc8's
+            # trailing.rs:61-100 only raises sell levels afterwards, including between our steps.
+            kept_limit = None
         order = self.order_factory.trailing_stop_limit(
             slot.instrument_id,
             OrderSide.SELL,
@@ -3930,14 +4290,15 @@ class Mover(Strategy):
             self.remakes_under_floor += 1
 
     def _hold(self, slot: Slot, held: Decimal, now: int, followed: Decimal | None = None) -> None:
-        """The lead's decision (b), 2026-11-12: with no followed price, hold a stop at the average fill,
-        else the entry's limit, less the trail distance in force. It sells at once only when the last
+        """The lead's decision (b), 2026-11-12: without a safe price to arm the emulator, hold a stop
+        at the average fill, else the entry's limit, less the trail distance in force. It sells when
+        the followed price or a price received during the hold meets the stop, or when the last
         known price (the newest trade by venue time, else the latest minute close: `_last_known`)
         is through that level, so it does not depend on the missing side and adds no subscription.
         With no two-sided quote within `HOLD_MOST_SECS` of receiving the first fill it sells by limit
         as an `unpriced_exit`. A hold the floor starts for want of room under a followed price is
-        handed that price (`followed`), which counts toward the hold's low, so a price already through
-        the stop it sets up sells at once."""
+        handed that price (`followed`); with none handed the hold reads it itself (`_followed`), so
+        every caller compares it, and a price already through the stop it sets up sells at once."""
         if slot.held_since is None:
             received = slot.entry_received_ns
             if received is None:
@@ -3976,19 +4337,23 @@ class Mover(Strategy):
                 )
             self._note(
                 slot,
-                f"{slot.instrument_id}: no followed price; holding a stop at {slot.held_stop}",
+                f"{slot.instrument_id}: no safe trailing price; holding a stop at {slot.held_stop}",
             )
         self._ensure_exit(slot, held)
         self._held_at_l(slot)
         self._record_held_stop(slot)
         slot.holding_from = self._holding_since(slot)
         low = slot.held_low
-        if followed is not None:
-            # a price `_trail` followed as the hold was set up, which no quote or print handler caught
-            # because the hold had not begun: it meets the stop in this step, as `_trail` compares the
-            # price it follows, and is kept as the hold's low only where `on_quote` or `on_trade` would
-            # keep it, so under a print trigger with the holding's start unknown a print from before
-            # the entry is not kept once the fill is recorded (the delta's code review, finding 1)
+        if followed is None:
+            followed = self._followed(slot)
+        if followed is not None and followed > 0:
+            # a price followed as the hold was set up, which no quote or print handler caught because
+            # the hold had not begun: it meets the stop in this step, as `_trail` compares the price it
+            # follows, and is kept as the hold's low only where `on_quote` or `on_trade` would keep it,
+            # so under a print trigger with the holding's start unknown a print from before the entry
+            # is not kept once the fill is recorded (#367's code review, finding 1). Read here when no
+            # caller hands it, so every caller compares it; a low kept above today's stop can meet a
+            # stop a later fill raises (the closing unit's reader, limit 9)
             low = followed if low is None else min(low, followed)
             if self.settings.trigger == TriggerType.BID_ASK or slot.holding_from is not None:
                 slot.held_low = low
@@ -4092,15 +4457,15 @@ class Mover(Strategy):
         slot.holding_from = None
 
     def _held_anchor(self, slot: Slot) -> Decimal | None:
-        """The average fill (the entry's, else the cache's position average), else the entry's limit."""
+        """The whole holding's average, else the entry's average fill, else its limit."""
+        average = self._position_average(slot)
+        if average is not None:
+            return average
         entry = self._order(slot.entry_id)
         if entry is not None and entry.avg_px is not None:
             filled = Decimal(str(entry.avg_px))
             if filled.is_finite() and filled > 0:
                 return filled
-        average = self._position_average(slot)
-        if average is not None:
-            return average
         price = None if entry is None else getattr(entry, "price", None)
         return None if price is None else price.as_decimal()
 
@@ -4145,35 +4510,30 @@ class Mover(Strategy):
         return None, "none"
 
     def _position_average(self, slot: Slot) -> Decimal | None:
-        """The cache's quantity-weighted average of this strategy's open long positions, or None."""
-        positions = self.cache.positions_open(
-            instrument_id=slot.instrument_id, strategy_id=self.strategy_id
-        )
-        quantity, notional = Decimal(0), Decimal(0)
-        for position in positions:
-            average = position.avg_px_open
-            if average is None:
-                return None
-            average = Decimal(str(average))
-            if not average.is_finite() or average <= 0 or position.signed_qty <= 0:
-                return None
-            quantity += position.signed_qty
-            notional += position.signed_qty * average
-        return notional / quantity if quantity else None
+        """Refresh through the holding reader; a quantity-only seam supplies no average."""
+        slot.holding_average = None
+        held = getattr(self, "_held", None)
+        if held is not None:
+            held(slot)
+        elif hasattr(self.cache, "positions_open"):
+            # Method-only seams may borrow the protection path without the holding reader.
+            Mover._held(self, slot)
+        return slot.holding_average
 
     def _trail_anchor(self, slot: Slot) -> Decimal:
-        """Entry fill, else the cache's quantity-weighted position average, else the current bid.
+        """The cache's quantity-weighted holding average, else the entry fill, else the current bid.
 
         `Cache.positions_open(instrument_id, strategy_id)` and `Position.avg_px_open/signed_qty`
         are pinned rc8's contracts. Missing or non-positive/non-finite averages cannot anchor a sale.
         Each fallback use (including a refused remake) is counted, without changing entry gating.
         """
         entry = self._order(slot.entry_id)
+        average = self._position_average(slot)
         if entry is not None and entry.avg_px is not None:
             filled = Decimal(str(entry.avg_px))
             if filled.is_finite() and filled > 0:
-                return filled
-        average = self._position_average(slot)
+                # one entry's holding averages its own fill: the same value, kept as the fill reads
+                return filled if average is None or average == filled else average
         source = "position average price" if average is not None else "current bid"
         quote = self.cache.quote(slot.instrument_id)
         anchor = (
@@ -4435,7 +4795,6 @@ class Mover(Strategy):
                 return "the last ranking was malformed"
             return "the ranking is stale" if self.rank_ns else "no ranking yet"
         opening = slot.run_arm == "opening"
-        seen = slot.run_seen_ns
         if slot.instrument_id not in ranked:
             return "no longer ranked"
         move = ranked[slot.instrument_id][1]
@@ -4448,16 +4807,50 @@ class Mover(Strategy):
             if settings.reentry_arm == "clock":
                 if now - sold_ns < settings.cooldown_secs * SECOND_NS:
                     return "inside the cooldown after its sale"
-                if sold_px is not None and run_close is not None and run_close <= sold_px:
+                from .movers_rank_actor import trade_date
+
+                # The lead (2026-11-13): every sale has a price, so the clock arm's above-sale rule
+                # holds on the sale's own trade date only, with its 20:00 rollover, as the opening
+                # arm's `SOLD_THIS_TRADE_DATE` does; a Mover that runs a replay's whole sample does not
+                # carry one session's sale into the next, as a window's Mover never can
+                sale_date = trade_date(self.sold_fill_ns.get(slot.instrument_id, sold_ns))
+                if (
+                    sold_px is not None
+                    and run_close is not None
+                    and run_close <= sold_px
+                    and sale_date == trade_date(now)
+                ):
                     return f"its run closed at {run_close}, not above the sale at {sold_px}"
             else:
                 filled_ns = self.sold_fill_ns.get(slot.instrument_id, sold_ns)
                 # the minute's end, not its receipt: a streamed close received after the fill can
                 # still precede it (the batch A head reader, A-2)
-                closed = slot.run_closed_ns if slot.run_closed_ns is not None else seen
-                if closed is not None and closed <= filled_ns:
+                closed = slot.run_closed_ns
+                if closed is None:
+                    reason = "qualifying close interval end unavailable"
+                    self.refusals.append(
+                        {
+                            "when_ns": now,
+                            "instrument_id": str(slot.instrument_id),
+                            "reason": reason,
+                        }
+                    )
+                    return Refused(reason)
+                if closed <= filled_ns:
                     return "its qualifying close preceded the sale fill"
                 state = self.reentry_states.get(slot.instrument_id)
+                if (
+                    settings.reentry_arm in ("turn", "vwap")
+                    and state is not None
+                    and not state.history_complete
+                ):
+                    reason = (
+                        f"post-sale close history exceeded {PENDING_REENTRY_BARS} pending intervals"
+                    )
+                    self.refusals.append(
+                        {"when_ns": now, "instrument_id": str(slot.instrument_id), "reason": reason}
+                    )
+                    return Refused(reason)
                 if settings.reentry_arm == "reclaim":
                     if sold_px is None:
                         return "reclaim sale price unavailable"
@@ -5035,11 +5428,18 @@ class Mover(Strategy):
         )
 
     def _entry_trail(
-        self, slot: Slot, price: Decimal, quote: Any | None, *, now: int | None = None
+        self,
+        slot: Slot,
+        price: Decimal,
+        quote: Any | None,
+        *,
+        now: int | None = None,
+        profile_price: Decimal | None = None,
     ) -> TrailPlan:
         """Freeze T1 at entry. A spread floor or distance the cap forbids refuses the entry by name
         (`DistanceRefusal`); an unusable spread selects the configured fixed plan, and a cold ATR the
-        fixed plan raised to the spread floor at the step (`_cold_plan`), by name."""
+        fixed plan raised to the spread floor at the step (`_cold_plan`), by name. A held profile's
+        warm check supplies its completed close as the ATR basis, keeping `price` as its anchor."""
         settings = self.settings
         if settings.trail_mode == "profile" and self.trail_profile is None:
             raise ValueError("profile document is missing; no profile entry is allowed")
@@ -5110,7 +5510,9 @@ class Mover(Strategy):
                     self.trail_profile,
                     slot.instrument_id.symbol.value,
                     profile_segment(self.clock.timestamp_ns() if now is None else now),
-                    None if atr is None else atr / price,
+                    None
+                    if atr is None
+                    else atr / (price if profile_price is None else profile_price),
                     self.rdc_1.get(slot.instrument_id),
                     **{name: getattr(settings, name) for name in PROFILE_SETTINGS},
                 )
@@ -5286,8 +5688,10 @@ class Mover(Strategy):
         plan = replace(
             current,
             trail=selected,
-            exit_through=selected / 4,
-            chase_cap=max(selected, self.settings.chase_cap),
+            # Keep the bounds the warm check retained from the cold plan (sr-c-337 P2): a later
+            # profile tightening must not lower a reached limit or deepen the chase.
+            exit_through=min(selected / 4, current.exit_through),
+            chase_cap=min(max(selected, self.settings.chase_cap), current.chase_cap),
             atr=atr,
             spread=spread,
             bound=bound,
@@ -5367,15 +5771,31 @@ class Mover(Strategy):
         quote = self.cache.quote(slot.instrument_id)
         if bought is None or bought <= 0 or quote is None or quoted_spread(quote) is None:
             return False  # retried next step
+        profile_minute = slot.run_open_ns if self.settings.trail_mode == "profile" else None
+        profile_price = None
+        if profile_minute is not None:
+            # This is the complete bar's profile evaluation, even if its plan is kept: use its
+            # segment and close, as `_profile_tighten` does, and prevent a second evaluation on the
+            # next step after a warm remake (sr-a-337 F1).
+            slot.profile_evaluated_ns = profile_minute
+            profile_price = slot.closes[-1] if slot.closes else None
         try:
-            warmed = self._entry_trail(slot, bought, quote, now=now)
+            warmed = self._entry_trail(
+                slot,
+                bought,
+                quote,
+                now=now if profile_minute is None else profile_minute,
+                profile_price=profile_price,
+            )
         except DistanceRefusal:
             # the cap refuses the warmed plan: the one comparison is made and the trail in force kept,
             # neither retried each step nor noted as not applied yet (the Antigravity reader of #351,
             # P3-1)
             slot.warm_checked = True
             return False
-        except ValueError as error:
+        except (ValueError, ArithmeticError) as error:
+            # The completed close can give no usable price basis; keep the working protection and
+            # name the failure, as `_profile_tighten` does, rather than raise from the step timer.
             self._note(slot, f"{slot.instrument_id}: warmed ATR not applied yet: {error}")
             return False
         slot.warm_checked = True
