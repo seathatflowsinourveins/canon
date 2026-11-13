@@ -46,7 +46,9 @@ Rules:
 
 1. **One entry point.** `.githooks/pre-commit` runs `scripts/ci --staged`; the workflow runs `scripts/ci`
    and `scripts/land` runs `scripts/ci --landing`, which takes the last of several CI slots first, so a
-   landing starts ahead of waiting hooks (2026-11-11).
+   landing starts ahead of waiting hooks (2026-11-11). Since 2026-11-13 `--staged` is a commit's scope:
+   the checks that take seconds, each other check a skip line that the landing and the hosted run take
+   up (ADR 0138, proposed).
 2. **A missing tool is a failure**, never a skipped check.
 3. **Ruff:** its default rules plus import sorting. Line length 100 and single-line imports follow
    NautilusTrader's own config, so adapter code reads like upstream. (NautilusTrader itself selects every
@@ -59,6 +61,13 @@ Rules:
 6. **CI** (`.github/workflows/ci.yml`): both actions referenced by the commit SHA in the canon lock; token
    `contents: read`; tools installed from `mise.lock`. Checked with actionlint. It runs on every pull
    request and on `main` (ADR 0014).
+7. **Fast checks first** (2026-11-13). `scripts/ci` runs the lock check, the environment, ruff, its format
+   check and ty first, and waits for them (under a second on this Mac, warm). If one fails, nothing slower
+   starts. Each later check is a skip line saying a fast check failed, except those that fail by name at once
+   (a missing tool, a test script not executable or missing, a failed file list), so rule 2 holds. This is
+   NautilusTrader's order: its test and build jobs need its `pre-commit` job (`.github/workflows/build.yml`
+   at `d53849b216e2`, `:201-205` and `:295-300`). A run with a lint error and a failing test shows the lint
+   error first, and the test failure on the next run.
 
 Not adopted, with the reason:
 
@@ -73,7 +82,8 @@ Not adopted, with the reason:
 
 ### Consequences
 
-* Good: about seven to nine seconds, offline; shellcheck's first run found 20 style findings in this repo's
+* Good: about seven to nine seconds, offline, when written. By 2026-11-13 the hosted run took about 19
+  minutes; ADR 0138 takes the whole run out of the commit hook, and the landing and hosted runs keep it; shellcheck's first run found 20 style findings in this repo's
   scripts, all fixed or marked with a reason.
 * Bad: actionlint does not check an action's inputs when the action is referenced by SHA, so those four inputs were checked by hand against each `action.yml`.
 
