@@ -67,7 +67,9 @@ installed here, each would be the owner's install, and the sandbox runtime "is a
 4. **DeepSeek Harness** stays as it is. Its presets pair each sandbox with `approval: ask`. Its guide says
    "`approval: never` rejects approval requests; it does not auto-approve" and "Without an answerer,
    official approval fails closed". For the cockpit's `dsh-tui .` that would be a profile patch row,
-   untried; its one sandboxed trial, `read-only`, ran out its deadline with no output.
+   untried; its one sandboxed trial, `read-only`, ran out its deadline with no output. (Amended 2026-11-13
+   by ADR 0136: the dsh-tui profile refuses every approval request and offers no preset without the sandbox,
+   through an `approval` row and a `permission` row in its user patch.)
 5. **Claude Code** lanes stay under ADR 0025. Its vendor asks for a container, a VM or the sandbox
    runtime around a bypass session (option 3).
 

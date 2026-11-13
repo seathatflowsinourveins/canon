@@ -148,8 +148,12 @@ locally on the data client's live data; nothing in `src/` builds one yet (ADR 00
   "agents never read a credential" is an instruction (ADR 0029). No hook runs before a tool call
   (ADR 0020), and the sandbox is not on (ADR 0025). Codex and Muse start in their own sandboxes with
   nothing asking once the owner sets their launch arguments in Orca. Codex's sandbox stops a write to
-  `/tmp`, to its workspace's `.git` and outside its workspace; Muse's stops neither. Antigravity, DeepSeek Harness and Claude Code lanes keep
-  their bypass flags (ADR 0034). That no live key is on the machine is unverified (ADR 0025).
+  `/tmp`, to its workspace's `.git` and outside its workspace; Muse's stops neither. Once
+  `scripts/bootstrap --install` has added ADR 0136's rows to the dsh-tui profile, a DeepSeek Harness
+  worker writes only in its workspace and the temp areas, and a request for more is refused instead of
+  asked. That holds by configuration, which `DSH_PERMISSION_MODE` at launch or another row or patch
+  layer can change (ADR 0136). Antigravity and Claude Code lanes keep their bypass flags (ADR 0034).
+  That no live key is on the machine is unverified (ADR 0025).
 
 ## The harness
 

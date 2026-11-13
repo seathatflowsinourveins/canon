@@ -18,4 +18,29 @@
 - id: memento
   config:
     enabled: false
+# Approval requests refused, never asked (ADR 0136, docs/adr/0136-*.md): nobody answers a prompt in an Orca
+# worker.
+# DeepSeek Harness dsh-v0.2.1-rc.3 packages/interaction/user-approval/README.md: "`never` rejects every
+# request deterministically before interactive dispatch — the strict headless stance for CI and unattended
+# runs"; dsh-TUI v0.17.0 docs/cli.en.md: "it does not auto-approve". The sandbox stays as dsh-TUI sets it.
+- id: approval
+  config:
+    policy: never
+# The two sandboxed presets, each refusing. dsh-permission-presets pins its default preset's sandbox and
+# approval into each fresh session, infers that default from the composed sandbox (dsh-TUI's sandbox-policy
+# row) and approval (the row above), and will not load when they match no preset (its README: `defaultPreset`
+# is "required when composition defaults match no preset"); the base bundle's read-only and workspace-write
+# presets ask, so both are repeated with approval never.
+# danger-full-access is left out: dsh-TUI seeds every later session with the last preset a /permission pick
+# or Shift+Tab reached (~/.dsh-tui/permission.json) and skips one the table does not offer
+# (src/dsh-adapter/channel/mode-permission-actions.ts), so no tab can lift the sandbox for later workers.
+- id: permission
+  config:
+    presets:
+      read-only:
+        sandbox: read-only
+        approval: never
+      workspace-write:
+        sandbox: workspace-write
+        approval: never
 # end canon bootstrap: review settings

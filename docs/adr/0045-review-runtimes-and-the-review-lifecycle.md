@@ -94,7 +94,8 @@ owner's delegation of 2026-11-10.
    switch scopes it to one review. Until the owner runs `scripts/bootstrap --install` and `--check`
    shows the patch ok, the coordinator starts no DeepSeek Harness review. Each review gets a new
    workspace, as rule 1 says (the two trial attempts shared one), and its brief says to write the report
-   early, after a first attempt that stalled.
+   early, after a first attempt that stalled. (Amended 2026-11-13 by ADR 0136: a third condition, that the
+   profile refuses every approval request instead of asking, held by two more rows in the same patch.)
 7. **Codex reads on GPT-6.1 Sol at `max`** (the owner's instruction, 2026-11-10: GPT-6.1 Sol at maximum
    quality). This replaces ADR 0043 rule 5, Codex's own default model and effort; the other three stay
    on their defaults. The model is `gpt-6.1-sol` and the key `model_reasoning_effort`. The catalog
