@@ -169,6 +169,11 @@ check "the renderer's lines are shown, scrubbed of links, addresses, the owner a
   '[ "$out" = "~/x <email> ~
 line two
 rc=0" ]'
+# the HUD colours the branch, so the owner's handle follows a colour code (ESC [ 36 m) that ends in a letter
+printf '#!/bin/bash\ncat >/dev/null; printf "\\033[35mgit:(\\033[0m\\033[36mexampleowner/x\\033[0m) mexampleowner\\n"\n' > "$STUBS/coloured"; chmod +x "$STUBS/coloured"
+out=$(printf '%s' "$OWNER_IN" | CLAUDE_CONFIG_DIR="$CFG" CANON_STATUSLINE_RENDERER="$STUBS/coloured" "$ROOT/home/.claude/canon/statusline.sh" 2>/dev/null)
+check "the owner is scrubbed right after a colour code, and still not inside another word" \
+  '[ "$out" = "$(printf "\033[35mgit:(\033[0m\033[36m~/x\033[0m) mexampleowner")" ] || { echo "    got: $(printf "%s" "$out" | LC_ALL=C cat -v)"; false; }'
 out=$(printf '%s' "{$(session s9 1.234),\"workspace\":{\"current_dir\":\"/w/devtools\",\"repo\":{\"owner\":\"dev\"}}}" | HOME=/Users/dev CLAUDE_CONFIG_DIR="$CFG" "$ROOT/home/.claude/canon/statusline.sh" 2>/dev/null)
 check "the owner and the home user are scrubbed as whole words, not inside another word" '[ "$out" = "Opus · medium · ctx 12% · \$1.23 · devtools" ]'
 check "the renderer is given the model id as its display name" 'jq -e ".model.display_name == \"claude-opus-5-5\" and .model.id == \"claude-opus-5-5\"" "$STUBS/hud.in" >/dev/null'
@@ -328,6 +333,88 @@ cp "$ROOT/home/.claude/canon/fleet-rate.sh" "$HC/canon/"
 out=$(hsl)
 check "fleet-rate.sh installed: the HUD gets --extra-cmd with its path and CLAUDE_HUD_ALLOW_EXTRA_CMD=1" \
   '[ "$out" = "args=--extra-cmd $(printf %q "$HC/canon/fleet-rate.sh") allow=1" ] || { echo "    got: $out"; false; }'
+out=$(printf 'not json' | PATH="$TMP/nodebin:$PATH" CLAUDE_CONFIG_DIR="$HC" "$ROOT/home/.claude/canon/statusline.sh" 2>/dev/null)
+check "an input that is not JSON still runs the enabled HUD" \
+  '[ "$out" = "args=--extra-cmd $(printf %q "$HC/canon/fleet-rate.sh") allow=1" ] || { echo "    got: $out"; false; }'
+# the session's lines changed (cost.total_lines_added and cost.total_lines_removed, statusline.md): passed after the
+# script's path only when both are whole numbers, and shown before the fleet figure
+lsl() { printf '%s' "{$(session s9 1),\"cost\":{\"total_cost_usd\":1,$1}}" | PATH="$TMP/nodebin:$PATH" CLAUDE_CONFIG_DIR="$HC" "$ROOT/home/.claude/canon/statusline.sh" 2>/dev/null; }
+out=$(lsl '"total_lines_added":156,"total_lines_removed":23')
+check "the session's lines added and removed follow the script's path in --extra-cmd" \
+  '[ "$out" = "args=--extra-cmd $(printf %q "$HC/canon/fleet-rate.sh") 156 23 allow=1" ] || { echo "    got: $out"; false; }'
+for bad_ in '"total_lines_added":12.7,"total_lines_removed":3' '"total_lines_added":5,"total_lines_removed":-1' \
+            '"total_lines_added":"156; touch x","total_lines_removed":2' '"total_lines_added":5'; do
+  out=$(lsl "$bad_")
+  check "lines that are not two whole numbers are not passed: $bad_" \
+    '[ "$out" = "args=--extra-cmd $(printf %q "$HC/canon/fleet-rate.sh") allow=1" ] || { echo "    got: $out"; false; }'
+done
+printf '{"t":%s,"label":"Fleet 126 tok/s · 2 working"}' "$(date -u +%s)" > "$FR/canon/fleet-rate.json"
+frl() { CLAUDE_CONFIG_DIR="$FR" FLEET_RATE_LANES=/nonexistent "$FR/canon/fleet-rate.sh" "$@"; }
+check "the label: the lines changed, the HUD's separator, then the fleet figure" \
+  '[ "$(frl 156 23)" = "{\"label\":\"+156 -23 │ Fleet 126 tok/s · 2 working\"}" ]'
+FL='{"label":"Fleet 126 tok/s · 2 working"}'
+check "no lines changed, or lines that are not two whole numbers of at most nine digits: the fleet figure alone" \
+  '[ "$(frl 0 0)" = "$FL" ] && [ "$(frl 5)" = "$FL" ] && [ "$(frl "1;x" 2)" = "$FL" ] && [ "$(frl 1234567890 1)" = "$FL" ] && [ "$(frl -1 2)" = "$FL" ]'
+# the HUD cuts a label at 50 characters (src/extra-cmd.ts), so a count of a million or more is written as the HUD
+# writes token counts (src/utils/format.ts)
+printf '{"t":%s,"label":"Fleet 1234 tok/s · 12 working"}' "$(date -u +%s)" > "$FR/canon/fleet-rate.json"
+check "a million lines or more are written as the HUD writes token counts, so the label keeps within its 50 characters" \
+  '[ "$(frl 999999 1234567)" = "{\"label\":\"+999999 -1.2M │ Fleet 1234 tok/s · 12 working\"}" ] && [ "$(frl 999999999 999999999 | jq -r ".label | length")" -le 50 ] || { echo "    got: $(frl 999999 1234567)"; false; }'
+printf '{"t":%s,"label":"Fleet 7 tok/s · 1 working"}' "$(( $(date -u +%s) - 700 ))" > "$FR/canon/fleet-rate.json"
+check "a fleet summary too old to show: the lines changed alone" '[ "$(frl 0 4)" = "{\"label\":\"+0 -4\"}" ]'
+rm -f "$FR/canon/fleet-rate.json"
+check "no summary and no lines changed: nothing" '[ -z "$(frl 0 0)" ] && [ -z "$(frl)" ]'
+rm -rf "${FR:?}/canon/fleet-rate.lock"
+# Node: PATH's, unless it is a version manager's shim (or PATH has none); then the Node mise gives for the home
+# folder, looked up at most once an hour and kept in canon/hud-node with the lookup's time (none found is kept too,
+# and the shim runs), and looked up again at once when the kept Node is no longer executable
+SH="$TMP/shimcase"; mkdir -p "$SH/shims" "$SH/real" "$SH/real2" "$SH/mise" "$SH/mise2" "$SH/nomise"
+printf '#!/bin/bash\ncat >/dev/null; echo via-shim\n' > "$SH/shims/node"
+printf '#!/bin/bash\ncat >/dev/null; echo via-real\n' > "$SH/real/node"
+printf '#!/bin/bash\ncat >/dev/null; echo via-real2\n' > "$SH/real2/node"
+printf '#!/bin/bash\necho "$*" >> "%s/mise.calls"\n[ "$1 $3 $4" = "-C which node" ] && [ "$2" = "$HOME" ] && echo "%s/real/node"\n' "$SH" "$SH" > "$SH/mise/mise"
+printf '#!/bin/bash\necho "$*" >> "%s/mise.calls"\n[ "$1 $3 $4" = "-C which node" ] && [ "$2" = "$HOME" ] && echo "%s/real2/node"\n' "$SH" "$SH" > "$SH/mise2/mise"
+printf '#!/bin/bash\necho "$*" >> "%s/mise.calls"\nexit 1\n' "$SH" > "$SH/nomise/mise"
+chmod +x "$SH"/*/*
+calls() { [ -f "$SH/mise.calls" ] && wc -l < "$SH/mise.calls" | tr -d ' ' || echo 0; }
+ssl() { printf '%s' "$(input s9 1 "" "")" | PATH="$SH/shims:$1:$PATH" CLAUDE_CONFIG_DIR="$HC" "$ROOT/home/.claude/canon/statusline.sh" 2>/dev/null; }
+kept() { printf '%s\n%s\n' "$1" "$2" > "$HC/canon/hud-node"; rm -f "$SH/mise.calls"; }
+rm -f "$HC/canon/hud-node" "$SH/mise.calls"
+out=$(ssl "$SH/mise")
+check "a shim on PATH: the HUD runs on the Node mise gives for the home folder, kept with the lookup's time" \
+  '[ "$out" = "via-real" ] && [ "$(sed -n 1p "$HC/canon/hud-node")" = "$SH/real/node" ] && [ "$(calls)" = 1 ] \
+   && [ "$(sed -n 2p "$HC/canon/hud-node")" -ge "$(( $(date -u +%s) - 60 ))" ] 2>/dev/null || { echo "    got: $out, calls $(calls)"; false; }'
+out=$(ssl "$SH/nomise")
+check "the kept Node is used within the hour, with no lookup" '[ "$out" = "via-real" ] && [ "$(calls)" = 1 ]'
+chmod -x "$SH/real/node"
+out=$(ssl "$SH/nomise")
+check "a kept Node no longer executable is looked up again, and with none from mise the shim runs" \
+  '[ "$out" = "via-shim" ] && [ "$(calls)" = 2 ] || { echo "    got: $out, calls $(calls)"; false; }'
+out=$(ssl "$SH/nomise")
+check "none from mise is kept too: the shim runs, with no further lookup within the hour" \
+  '[ "$out" = "via-shim" ] && [ "$(calls)" = 2 ] || { echo "    got: $out, calls $(calls)"; false; }'
+chmod +x "$SH/real/node"
+kept "$SH/real/node" "$(( $(date -u +%s) - 3601 ))"; out=$(ssl "$SH/mise2")
+kept "$SH/real/node" "$(( $(date -u +%s) + 600 ))"; out2=$(ssl "$SH/mise2")
+check "a Node kept over an hour, or dated ahead of the clock, is looked up again, so a change in mise is followed" \
+  '[ "$out" = "via-real2" ] && [ "$out2" = "via-real2" ] && [ "$(calls)" = 1 ] && [ "$(sed -n 1p "$HC/canon/hud-node")" = "$SH/real2/node" ] \
+   || { echo "    got: $out, $out2, calls $(calls)"; false; }'
+kept "$SH/shims/node" "$(date -u +%s)"
+out=$(ssl "$SH/mise")
+check "a kept path that is itself a shim is not used" '[ "$out" = "via-real" ] && [ "$(calls)" = 1 ]'
+# a PATH of the mise stub and the folders of the tools the status line and the stub run, none holding a node
+NP="$SH/mise"
+for t_ in jq perl cat mv mkdir bash; do
+  d_=$(dirname "$(command -v "$t_")"); case ":$NP:" in *":$d_:"*) ;; *) NP="$NP:$d_" ;; esac
+done
+if (IFS=:; for d_ in $NP; do [ -e "$d_/node" ] && exit 0; done; exit 1); then
+  echo "  skip  no node on PATH: a folder holding jq, perl or the shell tools here also holds a node"
+else
+  rm -f "$HC/canon/hud-node" "$SH/mise.calls"
+  out=$(printf '%s' "$(input s9 1 "" "")" | PATH="$NP" CLAUDE_CONFIG_DIR="$HC" "$ROOT/home/.claude/canon/statusline.sh" 2>/dev/null)
+  check "no node on PATH: the Node mise gives for the home folder" '[ "$out" = "via-real" ] && [ "$(calls)" = 1 ] || { echo "    got: $out"; false; }'
+fi
+rm -f "$HC/canon/hud-node"
 
 echo
 echo "test-usage: $pass passed, $fail failed"
