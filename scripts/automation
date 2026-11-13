@@ -10,6 +10,8 @@
 #                                                            canon/paper-schedule says to (ADR 0050)
 #   movers recorder        weekdays 04:00-20:00 New York     launchd user agent: back-to-back data-only
 #                                                            movers-screener runs, at most 80 polls each
+#   movers baseline        evenings 20:15-04:00 New York    launchd user agent: next calendar session's SIP
+#                                                            baseline, private history root (ADR 0087)
 #   OTLP collector         always, Mac awake                 launchd user agent running the pinned otelcol on
 #                                                            127.0.0.1, writing ~/.claude/canon/otel/logs.jsonl
 #                                                            for scripts/lanes --rates (ADR 0007)
@@ -30,8 +32,9 @@
 # to the session boundary (home/.claude/canon/maintenance.sh, ADR 0065).
 # `install` uses no sudo and touches: this clone's git config, ~/.claude/canon/ (the paper session's
 # runner and its clone of origin's main, ~/.claude/canon/paper-checkout, the recorder's runner and main clone,
-# ~/.claude/canon/movers-checkout, the maintenance script and the collector's config included), and six files
-# in ~/Library/LaunchAgents/, seven once OmniRoute is installed. It reloads the maintenance and gateway agents only when a plist changed or
+# ~/.claude/canon/movers-checkout, the baseline's runner, helper and movers-baseline-checkout, the maintenance
+# script and the collector's config included), and seven files in ~/Library/LaunchAgents/, eight once
+# OmniRoute is installed. It reloads the maintenance and gateway agents only when a plist changed or
 # the job is not loaded, so a reinstall the maintenance agent starts does not stop that agent's own job (a new
 # script reaches its next round, which runs the file anew), and the gateway is not restarted for nothing.
 # `differs` changes nothing: it prints one line per thing an installer manages that differs from this tree,
@@ -128,6 +131,17 @@ RECORDER_LOCK_SECS=${CANON_RECORDER_LOCK_SECS:-60}     # UNCALIBRATED; wait for 
 RECORDER_HEADROOM=$((300 + 600 + 30 + 388))
 RECORDER_STOP_ROOM=60                                # staggered cleanup bounds plus launching the command
 RECORDER_SILENT=6600                                  # longest outer bound (6093), fetch (120), interval and margin
+BASELINE_LABEL="local.canon.movers-baseline"
+BASELINE_PLIST="$AGENTS_DIR/$BASELINE_LABEL.plist"
+BASELINE_RUNNER="$CANON_HOME/movers-baseline.sh"
+BASELINE_HELPER="$CANON_HOME/movers-baseline-checkout.sh"
+BASELINE_CHECKOUT="$CANON_HOME/movers-baseline-checkout"
+BASELINE_STATUS="$CANON_HOME/watch/movers-baseline.json"
+BASELINE_DIR="$CANON_HOME/movers-baseline"             # runner's --baseline-dir must name this same root
+BASELINE_CATALOG="$CANON_HOME/movers-baseline-catalog/sip"
+BASELINE_INTERVAL=900                                 # gate in New York, independent of the Mac's time zone
+BASELINE_DEADLINE=21600                               # one whole firing's tasks, six hours (UNCALIBRATED)
+BASELINE_SILENT=$((86400 + BASELINE_DEADLINE + BASELINE_INTERVAL + 300))
 STUDY_LABEL="local.canon.nightly-study"
 STUDY_PLIST="$AGENTS_DIR/$STUDY_LABEL.plist"
 STUDY_INTERVAL=1800                                   # every 30 minutes; a firing with no new night does nothing
@@ -472,6 +486,211 @@ reject_recorder_origin() {
   rm -f "$RECORDER_PLIST" || { note "  FAILED: could not remove $RECORDER_PLIST"; return 1; }
   note "  FAILED: $1 (recorder not loaded; its plist removed)"
   return 1
+}
+
+# launchd.plist(5) StartInterval and EnvironmentVariables, as the recorder above. Gate in New York in
+# the runner: 20:15 honors history_load's publication delay; waking before 04:00 can catch up. No session
+# process needs to be alive, and no person's checkout or catalog is used. SIP only; boats is still refused
+# by the existing baseline task (ADR 0087). Each successful trade date is left alone on later firings.
+write_baseline_plist() {
+  cat > "${3:-$BASELINE_PLIST}" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$BASELINE_LABEL</string>
+  <key>ProgramArguments</key><array>
+    <string>/bin/bash</string><string>$(xml "$BASELINE_RUNNER")</string>
+    <string>build-movers-baseline</string><string>$(xml "$1")</string>
+    <string>$(xml "$BASELINE_CHECKOUT")</string><string>$(xml "$2")</string>
+  </array>
+  <key>EnvironmentVariables</key><dict>
+    <key>CLAUDE_CONFIG_DIR</key><string>$(xml "$CLAUDE_HOME")</string>
+    <key>CANON_BASELINE_CODE</key><string>$(cksum < "$ROOT/scripts/automation" | awk '{ print $1 "-" $2 }')</string>
+  </dict>
+  <key>WorkingDirectory</key><string>$(xml "$CANON_HOME")</string>
+  <key>StartInterval</key><integer>$BASELINE_INTERVAL</integer>
+  <key>RunAtLoad</key><false/>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>$(xml "$CANON_HOME/watch/movers-baseline.log")</string>
+  <key>StandardErrorPath</key><string>$(xml "$CANON_HOME/watch/movers-baseline.log")</string>
+</dict></plist>
+EOF
+}
+
+install_baseline() {
+  local rc=0
+  exec 6>>"$BASELINE_CHECKOUT.baseline.lock" || { note "  FAILED: could not open the baseline install lock"; return 1; }
+  "$LOCKF" -t 0 6 2>/dev/null || rc=$?
+  case "$rc" in
+    0) install_baseline_files; rc=$? ;;
+    75) note "  deferred   movers baseline: a firing is running; retry at a later maintenance round"; rc=0 ;;
+    *) note "  FAILED: could not take the baseline install lock (exit $rc)"; rc=1 ;;
+  esac
+  exec 6>&-
+  return "$rc"
+}
+
+install_baseline_files() {
+  local m url t out rc=0
+  m=$(find_mise 2>&1) || { note "  FAILED: $m"; return 1; }
+  url=$(git -C "$ROOT" remote get-url origin 2>/dev/null) || url=""
+  case "$url" in https://*|/*) ;; *) note "  FAILED: baseline origin must be https or a local test origin"; return 1 ;; esac
+  if [[ "$url" =~ ^https://[^/?#]*@ ]] || [[ "$url" == *[?#]* ]]; then
+    note "  FAILED: baseline origin carries user information, a query or a fragment"; return 1
+  fi
+  t=$(mktemp "$AGENTS_DIR/.$BASELINE_LABEL.XXXXXX") || return 1
+  if ! write_baseline_plist "$m" "$url" "$t" || ! plutil -lint "$t" >/dev/null; then
+    rm -f "$t"; note "  FAILED: could not write $BASELINE_PLIST"; return 1
+  fi
+  if cmp -s "$ROOT/scripts/automation" "$BASELINE_RUNNER" \
+     && cmp -s "$ROOT/home/.claude/canon/paper-session.sh" "$BASELINE_HELPER" && cmp -s "$t" "$BASELINE_PLIST" \
+     && { [ "${AUTOMATION_SKIP_LAUNCHD:-0}" = 1 ] || loaded "$BASELINE_LABEL"; }; then
+    rm -f "$t"; note "  kept       $BASELINE_LABEL: runner, helper and plist unchanged"; return 0
+  fi
+  if [ "${AUTOMATION_SKIP_LAUNCHD:-0}" != 1 ]; then
+    unload "$BASELINE_LABEL" || rc=$?
+    [ "$rc" = 0 ] || { rm -f "$t"; unload_note "$BASELINE_LABEL" "$rc"; return 1; }
+  fi
+  # A task's surviving children may still hold descriptor 8 after a firing's outer lock was released.
+  if ! "$LOCKF" -k -t 0 "$BASELINE_CHECKOUT.lock" true 2>/dev/null; then
+    rm -f "$t"; note "  FAILED: baseline checkout lock is still held; installed files left alone"; return 1
+  fi
+  /usr/bin/install -m 755 "$ROOT/home/.claude/canon/paper-session.sh" "$BASELINE_HELPER" \
+    || { rm -f "$t"; note "  FAILED: could not install $BASELINE_HELPER"; return 1; }
+  if ! out=$(/bin/bash "$BASELINE_HELPER" --checkout-only "$m" "$BASELINE_CHECKOUT" "$url" 2>&1); then
+    rm -f "$t" "$BASELINE_PLIST"; note "  FAILED: baseline checkout: ${out//$'\n'/; }"; return 1
+  fi
+  if ! { /usr/bin/install -m 755 "$ROOT/scripts/automation" "$BASELINE_RUNNER" && mv -f "$t" "$BASELINE_PLIST"; }; then
+    rm -f "$t"; note "  FAILED: could not install the baseline runner or plist"; return 1
+  fi
+  note "  wrote      $BASELINE_PLIST"
+  [ "${AUTOMATION_SKIP_LAUNCHD:-0}" != 1 ] || return 0
+  boot "$BASELINE_LABEL" "$BASELINE_PLIST" "(20:15-04:00 New York; first check in $BASELINE_INTERVAL s)"
+}
+
+# A subshell releases both private clone locks on every return. The helper uses its strict fresh-main
+# mode, not the recorder's cached-main mode. History takes only its catalog lock (ADR 0093); this job
+# never holds an account lock. The existing baseline writer owns the temporary-file/rename contract.
+do_baseline_movers() (
+  local m=$1 dir=$2 url=$3 hm commit="not read" output="" rc=0 child="" stop_at last
+  local inputs="$CANON_HOME/watch/movers-baseline-inputs" trade start end deadline room
+  baseline_write() {
+    local t
+    mkdir -p "$CANON_HOME/watch" || return 1
+    t=$(mktemp "$BASELINE_STATUS.XXXXXX") || return 1
+    if ! { jq -n --argjson e "$(date +%s)" --arg o "$1" --argjson r "$2" --arg n "$3" --arg c "$commit" \
+        '{at_epoch:$e, outcome:$o, exit_code:$r, note:$n, commit:$c}' > "$t" && mv -f "$t" "$BASELINE_STATUS"; }; then
+      rm -f "$t"; return 1
+    fi
+  }
+  baseline_fail() {
+    [ -z "$output" ] || rm -f "$output"
+    echo "movers-baseline: $2" >&2
+    baseline_write failed "$1" "$2" || return 1
+    return "$1"
+  }
+  # shellcheck disable=SC2329  # called by the traps set below
+  baseline_stop() {
+    if [ -n "$child" ]; then kill -TERM "$child" 2>/dev/null; wait "$child" 2>/dev/null; fi
+    baseline_fail "$1" "interrupted: $2"
+    exit "$1"
+  }
+  baseline_task() {
+    local left=$((stop_at - SECONDS)) result=0
+    [ "$left" -gt 0 ] || return 124
+    # exec, so the child a stopped firing signals is timeout(1) itself, which passes the signal on;
+    # fd 9, the firing lock, stays with the firing (the recorder's 9>&-)
+    (cd "$dir" && exec env MISE_CEILING_PATHS="$(dirname "$dir")" MISE_TASK_RUN_AUTO_INSTALL=false \
+      /usr/bin/timeout -k 5 "$left" "$m" run --timeout "${left}s" paper:history tests "$@") 9>&- &
+    child=$!
+    wait "$child" || result=$?
+    child=""
+    return "$result"
+  }
+  hm=$(TZ=America/New_York date +%H%M) || { baseline_fail 1 "time_failed: New York clock unavailable"; return $?; }
+  [[ "$hm" =~ ^[0-9]{4}$ ]] || { baseline_fail 1 "time_failed: invalid New York clock"; return $?; }
+  # Do not overwrite a failed status with an idle daytime check.
+  if [ "$((10#$hm))" -ge 400 ] && [ "$((10#$hm))" -lt 2015 ]; then return 0; fi
+  mkdir -p "$(dirname "$dir")" || return 1
+  exec 9>>"$dir.baseline.lock" || return 1
+  # a firing or an install holds it: this check is skipped and the last status stands, as the recorder's idle
+  "$LOCKF" -t 0 9 2>/dev/null || { echo "movers-baseline: lock held by another firing or an install; skipped" >&2; return 0; }
+  # a trade date completed this evening (the gate spans under eight hours) needs no clone and no request
+  if last=$(jq -er --argjson now "$(date +%s)" 'select(.outcome == "ok" and ($now - .at_epoch) < 28800)
+      | .note | capture("^sip (?<d>[0-9]{4}-[0-9]{2}-[0-9]{2}) ").d' "$BASELINE_STATUS" 2>/dev/null) \
+     && [ -s "$BASELINE_DIR/$last/sip.json" ]; then
+    return 0
+  fi
+  baseline_write running 0 "preparing origin/main" || return 1
+  "$LOCKF" -k -t 0 "$dir.lock" true 2>/dev/null || { baseline_fail 1 "checkout_lock_held: earlier task still running"; return $?; }
+  /bin/bash "$BASELINE_HELPER" --checkout-only "$m" "$dir" "$url" 9>&- \
+    || { rc=$?; baseline_fail "$rc" "checkout_failed: origin/main could not be prepared"; return $?; }
+  exec 8>>"$dir.lock" || return 1
+  "$LOCKF" -t 0 8 2>/dev/null || { baseline_fail 1 "checkout_lock_held: clone unavailable"; return $?; }
+  commit=$(git -C "$dir" rev-parse HEAD) || { baseline_fail 1 "checkout_failed: commit unavailable"; return $?; }
+  stop_at=$((SECONDS + BASELINE_DEADLINE))
+  trap 'baseline_stop 143 TERM' TERM
+  trap 'baseline_stop 130 INT' INT
+  trap 'baseline_stop 129 HUP' HUP
+  rm -f "$inputs/plan.json"
+  baseline_task --baseline-inputs "$inputs" --catalog "$BASELINE_CATALOG" --baseline-dir "$BASELINE_DIR" \
+    || { rc=$?; baseline_fail "$rc" "inputs_failed: calendar or assets exited $rc"; return $?; }
+  if ! { trade=$(jq -er '.session | strings | select(test("^[0-9]{4}-[0-9]{2}-[0-9]{2}$"))' "$inputs/plan.json") \
+      && start=$(jq -er '.start | strings' "$inputs/plan.json") && end=$(jq -er '.end | strings' "$inputs/plan.json"); }; then
+    baseline_fail 1 "inputs_failed: incomplete calendar plan"; return $?
+  fi
+  if jq -e '.complete == true' "$inputs/plan.json" >/dev/null; then
+    baseline_write ok 0 "sip $trade already complete"; return $?
+  fi
+  output="$BASELINE_DIR/$trade/sip.json"
+  deadline=$(jq -er '.deadline_epoch | numbers | select(. == floor and . > 0)' "$inputs/plan.json") \
+    || { baseline_fail 1 "inputs_failed: no SIP opening deadline"; return $?; }
+  room=$((deadline - $(date +%s)))
+  [ "$room" -gt 0 ] || { baseline_fail 1 "deadline_failed: $trade SIP pre-market has opened"; return $?; }
+  [ "$((SECONDS + room))" -ge "$stop_at" ] || stop_at=$((SECONDS + room))
+  rm -f "$output" || { baseline_fail 1 "baseline_failed: could not remove an incomplete file"; return $?; }
+  baseline_write running 0 "loading sip history for $trade" || return 1
+  baseline_task --symbols-file "$inputs/symbols.txt" --start "$start" --end "$end" \
+    --bars 1-MINUTE --catalog "$BASELINE_CATALOG" \
+    || { rc=$?; baseline_fail "$rc" "history_failed: paper:history exited $rc"; return $?; }
+  baseline_write running 0 "writing sip $trade" || return 1
+  baseline_task baseline --session "$trade" --sessions-file "$inputs/sessions.txt" --feed sip \
+    --catalog "$BASELINE_CATALOG" --baseline-dir "$BASELINE_DIR/$trade" \
+    || { rc=$?; baseline_fail "$rc" "baseline_failed: paper:history baseline exited $rc"; return $?; }
+  [ -s "$output" ] || { baseline_fail 1 "baseline_failed: writer left no file"; return $?; }
+  # the writer has published a complete file: a late or unrecorded finish is named, the file stays for
+  # the windows still to come that day
+  output=""
+  [ "$(date +%s)" -lt "$deadline" ] || { baseline_fail 1 "deadline_failed: $trade completed after its SIP pre-market opened; file kept"; return $?; }
+  baseline_write ok 0 "sip $trade complete" || { baseline_fail 1 "status_failed: could not record completion"; return $?; }
+)
+
+show_baseline_status() {
+  local pr rc=0 label v state last sig
+  pr=$(lc print "$DOMAIN/$BASELINE_LABEL" 2>/dev/null) || rc=$?
+  if no_answer "$rc"; then check_row "movers baseline" UNKNOWN "launchctl did not answer"; return; fi
+  if [ "$rc" != 0 ]; then check_row "movers baseline" OFF "run: scripts/automation install"; return; fi
+  # shellcheck disable=SC2016  # jq program
+  v=$(jq -er --argjson now "$(date +%s)" --argjson silent "$BASELINE_SILENT" "$PAPER_COMMIT"'
+    select(type == "object" and (.at_epoch | type) == "number" and (.exit_code | type) == "number"
+      and (.outcome == "ok" or .outcome == "failed" or .outcome == "running"))
+    | (if .outcome == "failed" then "FAILED" elif $now - .at_epoch > $silent then "STALE" else "ok" end)
+      + "\t" + .outcome + "; " + (.note // "") + "; exit " + (.exit_code | tostring)
+      + "; origin/main " + (.commit | short)' "$BASELINE_STATUS" 2>/dev/null) || v=""
+  if [ -n "$v" ]; then label=${v%%$'\t'*}; v=${v#*$'\t'}
+  else label=UNKNOWN; v="no firing recorded; first eligible check 20:15-04:00 New York"; fi
+  state=$(printf '%s\n' "$pr" | awk -F' = ' '/^\tstate = / { print $2; exit }')
+  last=$(printf '%s\n' "$pr" | awk -F' = ' '/^\tlast exit code = / { print $2; exit }')
+  sig=$(lc list 2>/dev/null | awk -v l="$BASELINE_LABEL" '$3 == l { print $2; exit }')
+  case "$last" in ''|0|*[!0-9-]*) ;; *) label=FAILED; v="$v; last firing exit $last" ;; esac
+  if [[ "$sig" =~ ^-[0-9]+$ ]]; then label=FAILED; v="$v; last firing stopped by signal ${sig#-}"; fi
+  if [[ "$v" == running\;* ]] && [ "$state" != running ]; then label=FAILED; v="$v; firing stopped before completion"; fi
+  if ! cmp -s "$ROOT/scripts/automation" "$BASELINE_RUNNER" \
+     || ! cmp -s "$ROOT/home/.claude/canon/paper-session.sh" "$BASELINE_HELPER"; then
+    [ "$(paper_rank OUTDATED)" -le "$(paper_rank "$label")" ] || label=OUTDATED
+    v="$v; installed baseline runner differs: run scripts/automation install"
+  fi
+  check_row "movers baseline" "$label" "$v | log $CANON_HOME/watch/movers-baseline.log"
 }
 
 # record-movers <mise> <checkout> <origin>: the former hand-run screener loop, bounded by New York's
@@ -1064,6 +1283,8 @@ do_install() {
   fi
   note "Movers recorder:"
   install_recorder || ok=1
+  note "Movers baseline:"
+  install_baseline || ok=1
   note "OTLP collector:"
   install_otel || ok=1
   note "OmniRoute gateway:"
@@ -1097,7 +1318,7 @@ do_install() {
 # were gone (a second reader's claim), and a retry would find nothing to tell it what to unload.
 do_uninstall() {
   local left="" f l rc still="" fs
-  for l in "$MAINT_LABEL" "$LABEL" "$PAPER_LABEL" "$RECORDER_LABEL" "$OTEL_LABEL" "$GW_LABEL" "$STUDY_LABEL"; do
+  for l in "$MAINT_LABEL" "$LABEL" "$PAPER_LABEL" "$RECORDER_LABEL" "$BASELINE_LABEL" "$OTEL_LABEL" "$GW_LABEL" "$STUDY_LABEL"; do
     unload "$l"; rc=$?
     case "$rc" in
       0) if [ "$UNLOAD_ABSENT" = 1 ]; then note "  $l was not loaded"; else note "  unloaded   $l"; fi; continue ;;
@@ -1108,11 +1329,12 @@ do_uninstall() {
     still="$still $l "; left="$left
   launchd job $l"
   done
-  for l in "$MAINT_LABEL" "$LABEL" "$PAPER_LABEL" "$RECORDER_LABEL" "$OTEL_LABEL" "$GW_LABEL" "$STUDY_LABEL"; do
+  for l in "$MAINT_LABEL" "$LABEL" "$PAPER_LABEL" "$RECORDER_LABEL" "$BASELINE_LABEL" "$OTEL_LABEL" "$GW_LABEL" "$STUDY_LABEL"; do
     case "$l" in
       "$LABEL") fs="$PLIST|$CANON_HOME/lanes|$CANON_HOME/lanes-watch.sh" ;;
       "$PAPER_LABEL") fs="$PAPER_PLIST|$CANON_HOME/paper-session.sh" ;;
       "$RECORDER_LABEL") fs="$RECORDER_PLIST|$RECORDER_RUNNER|$RECORDER_HELPER" ;;
+      "$BASELINE_LABEL") fs="$BASELINE_PLIST|$BASELINE_RUNNER|$BASELINE_HELPER" ;;
       "$MAINT_LABEL") fs="$MAINT_PLIST|$CANON_HOME/maintenance.sh|$CANON_HOME/maintenance.lock" ;;
       "$GW_LABEL") fs="$GW_PLIST" ;;
       "$STUDY_LABEL") fs="$STUDY_PLIST" ;;
@@ -1198,6 +1420,29 @@ do_uninstall() {
   $RECORDER_CHECKOUT"; fi
     fi
   fi
+  # Baseline history, final baselines and status live outside its disposable clone and are retained.
+  if [ -e "$BASELINE_CHECKOUT" ]; then
+    if [[ "$still" == *" $BASELINE_LABEL "* ]] || [ ! -x "$LOCKF" ] \
+       || ! "$LOCKF" -k -t 0 "$BASELINE_CHECKOUT.baseline.lock" true 2>/dev/null \
+       || ! "$LOCKF" -k -t 0 "$BASELINE_CHECKOUT.lock" true 2>/dev/null; then
+      note "  FAILED: movers baseline may still run from $BASELINE_CHECKOUT; not removing it"; left="$left
+  $BASELINE_CHECKOUT"
+    elif ! marked "$BASELINE_CHECKOUT/.git" && ! marked "$BASELINE_CHECKOUT/.git.old" && ! marked "$BASELINE_CHECKOUT/.git.new"; then
+      note "  FAILED: $BASELINE_CHECKOUT is not the baseline's marked clone; not touching it"; left="$left
+  $BASELINE_CHECKOUT"
+    else
+      local baseline_mise
+      if [ -e "$BASELINE_CHECKOUT/mise.toml" ] && { ! baseline_mise=$(find_mise 2>&1) \
+          || ! "$baseline_mise" trust --untrust "$BASELINE_CHECKOUT/mise.toml" >/dev/null 2>&1; }; then
+        note "  FAILED: could not remove mise trust of $BASELINE_CHECKOUT/mise.toml"; left="$left
+  mise trust of $BASELINE_CHECKOUT/mise.toml"
+      fi
+      if ! rm -rf "$BASELINE_CHECKOUT" "$BASELINE_CHECKOUT.lock" "$BASELINE_CHECKOUT.baseline.lock"; then
+        note "  FAILED: could not remove $BASELINE_CHECKOUT"; left="$left
+  $BASELINE_CHECKOUT"
+      fi
+    fi
+  fi
   if [ "$(git -C "$ROOT" config --local --get core.hooksPath 2>/dev/null)" = ".githooks" ]; then
     if git -C "$ROOT" config --local --unset core.hooksPath; then note "  unset      core.hooksPath"
     else note "  FAILED: could not unset core.hooksPath"; left="$left
@@ -1244,7 +1489,8 @@ do_differs() {
   [ "$(git -C "$ROOT" config --local --get core.hooksPath 2>/dev/null)" = ".githooks" ] || say automation "commit gate: core.hooksPath is not .githooks"
   for f in "scripts/lanes:lanes" "home/.claude/canon/lanes-watch.sh:lanes-watch.sh" \
            "home/.claude/canon/paper-session.sh:paper-session.sh" "home/.claude/canon/maintenance.sh:maintenance.sh" \
-           "scripts/automation:movers-recorder.sh" "home/.claude/canon/paper-session.sh:movers-checkout.sh"; do
+           "scripts/automation:movers-recorder.sh" "home/.claude/canon/paper-session.sh:movers-checkout.sh" \
+           "scripts/automation:movers-baseline.sh" "home/.claude/canon/paper-session.sh:movers-baseline-checkout.sh"; do
     cmp -s "$ROOT/${f%%:*}" "$CANON_HOME/${f#*:}" || say automation "$CANON_HOME/${f#*:} differs from ${f%%:*}"
   done
   cmp -s "$ROOT/home/.claude/canon/otel/config.yaml" "$OTEL_DIR/config.yaml" || say automation "$OTEL_DIR/config.yaml differs from home/.claude/canon/otel/config.yaml"
@@ -1257,6 +1503,7 @@ do_differs() {
     if url=$(git -C "$ROOT" remote get-url origin 2>/dev/null) && [ -n "$url" ]; then
       write_paper_plist "$m" "$url" "$t/p" && { cmp -s "$t/p" "$PAPER_PLIST" || say automation "$PAPER_PLIST differs from what install writes"; }
       write_recorder_plist "$m" "$url" "$t/r" && { cmp -s "$t/r" "$RECORDER_PLIST" || say automation "$RECORDER_PLIST differs from what install writes"; }
+      write_baseline_plist "$m" "$url" "$t/b" && { cmp -s "$t/b" "$BASELINE_PLIST" || say automation "$BASELINE_PLIST differs from what install writes"; }
       [ "$(git -C "$ROOT" config --local --get-all credential.https://github.com.helper 2>/dev/null | tail -n 1)" = "!\"$m\" exec -- gh auth git-credential" ] \
         || say automation "landing: the git sign-in helper is not the one install sets"
     else
@@ -1276,7 +1523,7 @@ do_differs() {
   fi
   rm -rf "${t:?}"
   if [ "${AUTOMATION_SKIP_LAUNCHD:-0}" != "1" ]; then
-    for l in "$LABEL" "$PAPER_LABEL" "$RECORDER_LABEL" "$OTEL_LABEL" "$MAINT_LABEL" "$GW_LABEL" "$STUDY_LABEL"; do
+    for l in "$LABEL" "$PAPER_LABEL" "$RECORDER_LABEL" "$BASELINE_LABEL" "$OTEL_LABEL" "$MAINT_LABEL" "$GW_LABEL" "$STUDY_LABEL"; do
       [ "$l" != "$GW_LABEL" ] || [ "$gw" = 1 ] || continue
       loaded "$l"; st=$?
       if [ "$st" = 1 ]; then say automation "$l is not loaded"; elif [ "$st" = 2 ]; then say unknown "launchctl did not answer about $l"; fi
@@ -1494,6 +1741,7 @@ do_status() {
   else check_row "paper session" OFF "run: scripts/automation install"; fi
 
   show_recorder_status
+  show_baseline_status
 
   # The collector: launchd must show it running (KeepAlive restarts it); the file's age is shown, not judged,
   # since a quiet hour with no session writes nothing.
@@ -1768,6 +2016,7 @@ do_status() {
 case "${1:-}" in
   recorder-lock-path) recorder_lock_path ;;
   record-movers) shift; do_record_movers "$@" ;;
+  build-movers-baseline) shift; do_baseline_movers "$@" ;;
   status)    do_status ;;
   # the failures again after the status table, the last lines the owner sees, and the exit code with them
   install)   case "${2:-}" in --defer-paper) DEFER_PAPER=1 ;; '') ;; *) note "usage: scripts/automation install [--defer-paper]"; exit 2 ;; esac
