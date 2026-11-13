@@ -42,7 +42,7 @@
     "timeFormat": "both",
     "hourCycle": "h23",
     "showModelScopedUsage": false,
-    "usagePace": true,
+    "usagePace": false,
     "externalUsagePath": "",
     "externalUsageWritePath": "",
     "showTools": true,

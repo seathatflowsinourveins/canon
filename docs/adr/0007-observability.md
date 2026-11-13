@@ -318,10 +318,8 @@ sets the HUD's options at v0.15.0 (`src/config.ts`, `src/schema.ts`). The choice
   output speed, how long ago the last response was written, and the advisor model `/advisor` set. The last
   three come from the transcript like the activity lines and carry the same caveat. The account identity
   segments stay off.
-* **Shown since 2026-11-12, the owner's decision: usage pace and the fleet's output speed.** `usagePace`
-  colours the 5-hour and 7-day figures amber or red, marked `▲`, when the rate so far would reach 90% or
-  run out before the reset, from the documented `rate_limits` alone (`src/usage-pace.ts` at v0.15.0); it
-  is a mark on screen, never a gate. The first line also shows `Fleet <n> tok/s · <m> working`: every
+* **Shown since 2026-11-12, the owner's decision: the fleet's output speed.** The first line shows
+  `Fleet <n> tok/s · <m> working`: every
   measured worker's output tokens per second over the last 10 minutes, summed across runtimes, and how
   many Claude Code sessions are working, both from `scripts/lanes --rates` (installed as `canon/lanes`).
   The HUD's own output speed is its session's latest response only. The label reaches the HUD through
@@ -347,6 +345,8 @@ sets the HUD's options at v0.15.0 (`src/config.ts`, `src/schema.ts`). The choice
   The cache's TTL decides what a returning session pays to re-cache its context, and idle compaction
   runs just before a one-hour cache expires (settings-reference.md, `idleCompaction`), so the time is
   when an idle lane's next message gets dearer or its context gets summarised.
+* **Off, the owner's decision of 2026-11-13: usage pace.** `usagePace`, which colours the usage windows
+  when the rate so far would run them out before the reset, was on for a day and is off again.
 * **Off, for cost or space.** Memory (it runs `vm_stat`), daily and weekly cost, the token breakdown,
   config counts, output style, the custom line and jj.
 
